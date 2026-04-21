@@ -1,3 +1,14 @@
 module(name = "talos")
 
+bazel_dep(name = "apple_support", version = "2.0.0", repo_name = "build_bazel_apple_support")
 bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
+
+# Hedron's Compile Commands Extractor for Bazel
+# https://github.com/hedronvision/bazel-compile-commands-extractor
+bazel_dep(name = "hedron_compile_commands", dev_dependency = True)
+git_override(
+    module_name = "hedron_compile_commands",
+    commit = "7fe1eab26d2b8eeb5e1c6a2f38bddb001e3f9696",
+    remote = "https://github.com/hedronvision/bazel-compile-commands-extractor.git",
+)
