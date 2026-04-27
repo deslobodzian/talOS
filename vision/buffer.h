@@ -2,6 +2,7 @@
 
 #include "device.h"
 #include <memory>
+#include <sstream>
 
 class RawBuffer {
 public:
@@ -52,6 +53,12 @@ public:
             throw std::runtime_error("copy exceeds buffer size");
         }
         device_->allocator().copy_between(*allocation_, *src.allocation_, bytes);
+    }
+
+    std::string to_string() const {
+       std::stringstream ss;
+       ss << "RawBuffer:\nDevice: " << device().name() << "\nSize Bytes: " << size_bytes() << "\n";
+       return ss.str();
     }
 
 private:
