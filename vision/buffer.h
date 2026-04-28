@@ -110,6 +110,9 @@ public:
         return static_cast<T*>(raw_.data());
     }
 
+    // I dont like this:
+    // The only reason to do this is to allocate less then the capacity,
+    // will I ever do this?
     void upload(const T* src, std::size_t count) {
         if (count > count_) {
             throw std::runtime_error("upload exceeds element count");
