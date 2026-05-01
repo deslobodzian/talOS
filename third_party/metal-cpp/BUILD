@@ -6,6 +6,7 @@ cc_library(
         "**/*.hpp"
     ]),
     includes = ["."],
+    target_compatible_with = ["@platforms//os:osx"],
     linkopts = [
         "-framework Foundation",
         "-framework Metal",
