@@ -62,6 +62,7 @@ if (OperatingSystem.current().isWindows()) {
     nativeUtils.platformConfigs.named(wpi.platforms.desktop).configure {
         it.cppCompiler.args.add('/W3')
         it.cppCompiler.args.add('/WX')
+        it.linker.args.add('Ws2_32.lib')
     }
 } else {
     nativeUtils.platformConfigs.named(wpi.platforms.desktop).configure {
@@ -109,10 +110,12 @@ model {
             sources.cpp {
                 source {
                     srcDir 'src/main/cpp'
+                    srcDir '../common/protocol/src'
                     include '**/*.cpp', '**/*.cc'
                 }
                 exportedHeaders {
                     srcDir 'src/main/include'
+                    srcDir '../common/protocol/include'
                 }
             }
 
