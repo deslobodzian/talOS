@@ -1,48 +1,31 @@
 #include "frame.h"
 
 #include <cstring>
+#include <concepts>
 
 namespace talos::protocol {
 namespace {
 
-void WriteU16(uint8_t* out, uint16_t value) {
-  out[0] = static_cast<uint8_t>(value);
-  out[1] = static_cast<uint8_t>(value >> 8);
+template <std::unsigned_integral T>
+void WriteUInt(uint8_t* out, T value) {
+    std::memcpy(out, &value, sizeof(value));
 }
 
-void WriteU32(uint8_t* out, uint32_t value) {
-  for (int i = 0; i < 4; ++i) {
-    out[i] = static_cast<uint8_t>(value >> (8 * i));
-  }
-}
+/* memcpy and bit shift have same # of instructions when optimized
+ "ReadUInt<uint16_t>(unsigned char const*)":
+        movzx   eax, WORD PTR [rdi]
+        ret
+ "ReadUInt<uint16_t>memcpy(unsigned char const*)":
+        movzx   eax, WORD PTR [rdi]
+        ret
+ */
+template <std::unsigned_integral T>
+T ReadUInt(const uint8_t* in) {
+    T out;
+    std::memcpy(&out, in, sizeof(T));
+    return out;
 
-void WriteU64(uint8_t* out, uint64_t value) {
-  for (int i = 0; i < 8; ++i) {
-    out[i] = static_cast<uint8_t>(value >> (8 * i));
-  }
 }
-
-uint16_t ReadU16(const uint8_t* in) {
-  return static_cast<uint16_t>(in[0]) |
-         static_cast<uint16_t>(static_cast<uint16_t>(in[1]) << 8);
-}
-
-uint32_t ReadU32(const uint8_t* in) {
-  uint32_t value = 0;
-  for (int i = 0; i < 4; ++i) {
-    value |= static_cast<uint32_t>(in[i]) << (8 * i);
-  }
-  return value;
-}
-
-uint64_t ReadU64(const uint8_t* in) {
-  uint64_t value = 0;
-  for (int i = 0; i < 8; ++i) {
-    value |= static_cast<uint64_t>(in[i]) << (8 * i);
-  }
-  return value;
-}
-
 }  // namespace
 
 std::size_t EncodeFrame(FrameType type, uint16_t flags, uint64_t sequence,
@@ -57,15 +40,15 @@ std::size_t EncodeFrame(FrameType type, uint16_t flags, uint64_t sequence,
     return 0;
   }
 
-  WriteU64(out + 0, kFrameMagic);
-  WriteU16(out + 8, kProtocolVersion);
-  WriteU16(out + 10, static_cast<uint16_t>(kFrameHeaderSize));
-  WriteU16(out + 12, static_cast<uint16_t>(type));
-  WriteU16(out + 14, flags);
-  WriteU64(out + 16, sequence);
-  WriteU64(out + 24, monotonic_time_us);
-  WriteU32(out + 32, static_cast<uint32_t>(payload_size));
-  WriteU32(out + 36, 0);
+  WriteUInt<uint64_t>(out + 0, kFrameMagic);
+  WriteUInt<uint16_t>(out + 8, kProtocolVersion);
+  WriteUInt<uint16_t>(out + 10, static_cast<uint16_t>(kFrameHeaderSize));
+  WriteUInt<uint16_t>(out + 12, static_cast<uint16_t>(type));
+  WriteUInt<uint16_t>(out + 14, flags);
+  WriteUInt<uint64_t>(out + 16, sequence);
+  WriteUInt<uint64_t>(out + 24, monotonic_time_us);
+  WriteUInt<uint32_t>(out + 32, static_cast<uint32_t>(payload_size));
+  WriteUInt<uint32_t>(out + 36, 0);
 
   if (payload_size > 0) {
     std::memcpy(out + kFrameHeaderSize, payload, payload_size);
@@ -84,15 +67,15 @@ std::size_t EncodeFrameInPlace(FrameType type, uint16_t flags,
     return 0;
   }
 
-  WriteU64(frame + 0, kFrameMagic);
-  WriteU16(frame + 8, kProtocolVersion);
-  WriteU16(frame + 10, static_cast<uint16_t>(kFrameHeaderSize));
-  WriteU16(frame + 12, static_cast<uint16_t>(type));
-  WriteU16(frame + 14, flags);
-  WriteU64(frame + 16, sequence);
-  WriteU64(frame + 24, monotonic_time_us);
-  WriteU32(frame + 32, static_cast<uint32_t>(payload_size));
-  WriteU32(frame + 36, 0);
+  WriteUInt<uint64_t>(frame + 0, kFrameMagic);
+  WriteUInt<uint16_t>(frame + 8, kProtocolVersion);
+  WriteUInt<uint16_t>(frame + 10, static_cast<uint16_t>(kFrameHeaderSize));
+  WriteUInt<uint16_t>(frame + 12, static_cast<uint16_t>(type));
+  WriteUInt<uint16_t>(frame + 14, flags);
+  WriteUInt<uint64_t>(frame + 16, sequence);
+  WriteUInt<uint64_t>(frame + 24, monotonic_time_us);
+  WriteUInt<uint32_t>(frame + 32, static_cast<uint32_t>(payload_size));
+  WriteUInt<uint32_t>(frame + 36, 0);
 
   return kFrameHeaderSize + payload_size;
 }
@@ -107,15 +90,15 @@ DecodeStatus DecodeFrame(const uint8_t* data, std::size_t size,
   }
 
   FrameHeader header;
-  header.magic = ReadU64(data + 0);
-  header.version = ReadU16(data + 8);
-  header.header_size = ReadU16(data + 10);
-  header.type = static_cast<FrameType>(ReadU16(data + 12));
-  header.flags = ReadU16(data + 14);
-  header.sequence = ReadU64(data + 16);
-  header.monotonic_time_us = ReadU64(data + 24);
-  header.payload_size = ReadU32(data + 32);
-  header.reserved = ReadU32(data + 36);
+  header.magic = ReadUInt<uint64_t>(data + 0);
+  header.version = ReadUInt<uint16_t>(data + 8);
+  header.header_size = ReadUInt<uint16_t>(data + 10);
+  header.type = static_cast<FrameType>(ReadUInt<uint16_t>(data + 12));
+  header.flags = ReadUInt<uint16_t>(data + 14);
+  header.sequence = ReadUInt<uint64_t>(data + 16);
+  header.monotonic_time_us = ReadUInt<uint64_t>(data + 24);
+  header.payload_size = ReadUInt<uint32_t>(data + 32);
+  header.reserved = ReadUInt<uint32_t>(data + 36);
 
   if (header.magic != kFrameMagic) {
     return DecodeStatus::kBadMagic;
@@ -160,3 +143,5 @@ const char* DecodeStatusName(DecodeStatus status) {
 }
 
 }  // namespace talos::protocol
+
+
