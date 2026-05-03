@@ -2,6 +2,7 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 cc_test(
     name = "flatbuffers_message",
+    size = "small",
     srcs = ["test.cc"],
     deps = [
         "@googletest//:gtest",

@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "talos/protocol/frame.h"
+#include "frame.h"
 
 namespace talos::protocol {
 

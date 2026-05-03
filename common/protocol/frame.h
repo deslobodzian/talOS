@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "talos/protocol/types.h"
+#include "types.h"
 
 namespace talos::protocol {
 

@@ -5,13 +5,13 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 cc_library(
     name = "protocol",
     srcs = [
-        "src/frame.cc",
-        "src/runtime_udp.cc",
+        "frame.cc",
+        "udp.cc",
     ],
     hdrs = [
-        "include/talos/protocol/frame.h",
-        "include/talos/protocol/runtime_udp.h",
-        "include/talos/protocol/types.h",
+        "frame.h",
+        "udp.h",
+        "types.h",
     ],
     includes = ["include"],
     linkopts = select({
@@ -24,7 +24,7 @@ cc_library(
 cc_test(
     name = "frame_test",
     size = "small",
-    srcs = ["test/frame_test.cc"],
+    srcs = ["frame_test.cc"],
     deps = [
         ":protocol",
         "@googletest//:gtest",
@@ -33,9 +33,9 @@ cc_test(
 )
 
 cc_test(
-    name = "runtime_udp_test",
+    name = "udp_test",
     size = "small",
-    srcs = ["test/runtime_udp_test.cc"],
+    srcs = ["udp_test.cc"],
     deps = [
         ":protocol",
         "@googletest//:gtest",
@@ -45,12 +45,12 @@ cc_test(
 
 cc_binary(
     name = "udp_perf",
-    srcs = ["tools/udp_perf.cc"],
+    srcs = ["udp_perf.cc"],
     deps = [":protocol"],
 )
 
 cc_binary(
     name = "sim_udp_smoke",
-    srcs = ["tools/sim_udp_smoke.cc"],
+    srcs = ["sim_udp_smoke.cc"],
     deps = [":protocol"],
 )
