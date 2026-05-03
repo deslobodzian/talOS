@@ -1,7 +1,8 @@
 # TalOS Mac/Rio Protocol
 
-This package is the shared wire contract between the companion `rio_client`
-node and the roboRIO `systemcore-rio` gateway.
+This package is the shared wire contract between the companion `talOS`
+node and the roboRIO/systemcore/Jetson (or any realtime controller system)
+`rt-controller` gateway.
 
 ## Research:
 [Low Latency C++ for HFT](https://stacygaudreau.com/blog/cpp/low-latency-cpp-for-hft-part3-network-programming/)
@@ -15,6 +16,31 @@ All traffic uses the same fixed 40 byte frame header followed by an optional
 payload of up to 1200 bytes. Multi-byte header fields are encoded little-endian
 explicitly by `talos::protocol::EncodeFrame`; the C++ struct layout is not used
 as the wire layout.
+
+## [UDP Protocol](https://en.wikipedia.org/wiki/User_Datagram_Protocol)
+
+UDP Header format:
+
++============================================================+
+|   2 Bytes for Source Port   | 2 Bytes for Destination Port |
+|     2 Bytes for Length      |     2 Bytes for Checksum     |
+|============================================================|
+|                            Data                            |
+.                                                            .
+.                                                            .
+.                                                            .
++============================================================+
+
+## Protocol Frame
+
+What will I need to send and receive from the controller computer
+
+### Send -> rt-controller:
+- Configuration (seting up motor controller, sensors, etc)
+
+### Receive <- rt-controller:
+- Sensor signal values
+- Motor outputs (falls under signal values?)
 
 ## Startup Flow
 
@@ -38,7 +64,7 @@ manifest.
 
 ## Low-Latency UDP API
 
-`RuntimeUdpPeer` is the shared hot-path socket wrapper for both sides:
+`UdpPeer` is the shared hot-path socket wrapper for both sides:
 
 - connected UDP, so the kernel filters packets from unexpected peers;
 - non-blocking by default for control-loop polling;

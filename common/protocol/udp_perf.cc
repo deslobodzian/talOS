@@ -9,7 +9,7 @@
 #include <thread>
 #include <vector>
 
-#include "talos/protocol/runtime_udp.h"
+#include "udp.h"
 
 namespace {
 
