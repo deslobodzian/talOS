@@ -106,16 +106,18 @@ model {
             if (includeDesktopSupport) {
                 targetPlatform wpi.platforms.desktop
             }
-
             sources.cpp {
                 source {
                     srcDir 'src/main/cpp'
-                    srcDir '../common/protocol/src'
+                    srcDir '../common/protocol'
                     include '**/*.cpp', '**/*.cc'
+                    exclude '**/*_test.*', '**/*_perf.*', '**/sim_*.*'
                 }
                 exportedHeaders {
                     srcDir 'src/main/include'
-                    srcDir '../common/protocol/include'
+                    srcDir '../common/protocol'
+                    include '**/*.h', '**/*.hpp'
+                    exclude '**/*_test.*', '**/*_perf.*', '**/sim_*.*'
                 }
             }
 
