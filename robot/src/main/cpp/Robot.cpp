@@ -8,8 +8,8 @@
 #include <cstdio>
 #include <cstring>
 
-#include "talos/protocol/runtime_udp.h"
-#include "talos/protocol/types.h"
+#include "udp.h"
+#include "types.h"
 
 static_assert(talos::protocol::kProtocolVersion == 1);
 

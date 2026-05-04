@@ -2,6 +2,8 @@
 
 #include <array>
 #include <cstring>
+#include <ranges>
+#include <iostream>
 
 #include "gtest/gtest.h"
 
@@ -108,6 +110,48 @@ TEST(FrameTest, ReservedHeaderWordIsZero) {
       reinterpret_cast<const SignalValue*>(decoded.payload);
   EXPECT_EQ(decoded_value->id, 11u);
   EXPECT_EQ(decoded_value->uint64_value, 1234u);
+}
+
+TEST(FrameTest, MultiSignals) {
+  const int num_signals = 50;
+  struct Payload {
+    RuntimeValuesHeader header;
+    SignalValue values[num_signals];
+  } payload{};
+
+  payload.header.manifest_id = 77;
+  payload.header.value_count = num_signals;
+
+  for (int i : std::views::iota(0, num_signals)) {
+    payload.values[i].id = i;
+    payload.values[i].value_type = ValueType::kUint64;
+    payload.values[i].uint64_value = i;
+  }
+
+  std::array<uint8_t, kMaxFrameSize> frame{};
+  const std::size_t size =
+      EncodeFrame(FrameType::kRioCommand, kFlagNone, 9, 1000, &payload,
+                  sizeof(payload), frame.data(), frame.size());
+
+  DecodedFrame decoded;
+  ASSERT_EQ(DecodeFrame(frame.data(), size, &decoded), DecodeStatus::kOk);
+  ASSERT_EQ(decoded.payload_size, sizeof(payload));
+
+  Payload decoded_payload{};
+  std::memcpy(&decoded_payload, decoded.payload, sizeof(decoded_payload));
+  EXPECT_EQ(decoded_payload.header.manifest_id, 77u);
+  EXPECT_EQ(decoded_payload.header.value_count, 50u);
+  EXPECT_EQ(decoded_payload.values[0].id, 0u);
+  EXPECT_EQ(decoded_payload.values[0].uint64_value, 0);
+
+  std::cout << decoded_payload.values[0].id << "\n";
+  std::cout << decoded_payload.values[0].uint64_value << "\n";
+
+  EXPECT_EQ(decoded_payload.values[38].id, 38u);
+  EXPECT_EQ(decoded_payload.values[38].uint64_value, 38);
+
+  std::cout << decoded_payload.values[38].id << "\n";
+  std::cout << decoded_payload.values[38].uint64_value << "\n";
 }
 
 }  // namespace
