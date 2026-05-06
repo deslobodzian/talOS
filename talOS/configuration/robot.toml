@@ -1,0 +1,18 @@
+[robot]
+name = "test"
+
+[subsystems]
+
+[subsystems.drivetrain]
+name = "drivetrain"
+
+[motors]
+
+[motor.front_left_drive]
+type = "TalonFX"
+current_limit = 40
+
+[motor.front_left_steer]
+type = "TalonFX"
+current_limit = 20
+
