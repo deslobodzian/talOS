@@ -7,6 +7,9 @@ bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "flatbuffers", version = "25.12.19")
 bazel_dep(name = "rules_java", version = "9.6.1")
 
+# For configuration
+bazel_dep(name = "tomlplusplus", version = "3.4.0")
+
 # Hedron's Compile Commands Extractor for Bazel
 # https://github.com/hedronvision/bazel-compile-commands-extractor
 bazel_dep(name = "hedron_compile_commands", dev_dependency = True)
