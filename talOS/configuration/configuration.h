@@ -1,7 +1,7 @@
 #pragma once
 
 #include <iostream>
-#include <toml.hpp>
+#include "toml.hpp"
 
 inline void test() {
     constexpr std::string_view source = R"(
