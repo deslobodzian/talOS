@@ -12,6 +12,7 @@ cc_library(
         "frame.h",
         "udp.h",
         "types.h",
+        "network_util.h",
     ],
     includes = ["include"],
     linkopts = select({
