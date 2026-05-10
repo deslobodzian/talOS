@@ -3,7 +3,7 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 cc_library(
     name = "configuration",
-    hdrs = ["configuration.h"],
+    hdrs = ["configuration.h", "config_parser.h"],
     deps = [
         "@tomlplusplus//:toml++",
     ],
@@ -13,6 +13,7 @@ cc_test(
     name = "test",
     size = "small",
     srcs = ["config_test.cc"],
+    data = ["subsystem.toml"],
     deps = [
         ":configuration",
         "@googletest//:gtest",

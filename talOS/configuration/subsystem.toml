@@ -1,0 +1,9 @@
+[subsystem]
+name = "test"
+
+[motors]
+[motors.left_leader]
+type = "TalonFX"
+supply_current = 20
+stator_current = 20
+is_inverted = false
