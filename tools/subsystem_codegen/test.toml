@@ -1,0 +1,14 @@
+[subsystem]
+name = "test"
+id = 0
+
+[motors]
+[motors.front_left]
+type = "TalonFX"
+id = 1
+inverted = false
+
+[motors.front_right]
+type = "TalonFX"
+id = 1
+inverted = false
