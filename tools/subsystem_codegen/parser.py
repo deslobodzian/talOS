@@ -9,15 +9,21 @@ def verify_toml_subsystem(subsystem_data: dict):
     print(subsystem_data.keys())
     key_subset = set(subsystem_data.keys())
 
+    subset_diff = key_subset.difference(valid_keys)
     if not key_subset.issubset(valid_keys):
-        print(f"Subsystem toml keys not in valid keys: {valid_keys - key_subset}")
+        print(f"Subsystem toml keys not in valid keys: {subset_diff}")
+        return False
+
+    return True
 
 
+# def verify_motor(motors: list[Motor]):
 def parse_subsystem(toml_path: Path):
     with open(toml_path, "rb") as f:
         subsystem_data = tomllib.load(f)
 
-    verify_toml_subsystem(subsystem_data)
+    if not verify_toml_subsystem(subsystem_data):
+        return None
 
     subsystem = subsystem_data["subsystem"]
 
@@ -30,6 +36,7 @@ def parse_subsystem(toml_path: Path):
                 type=MotorControllerType(motor_data["type"]),
                 name=motor,
                 can_id=motor_data["id"],
+                canbus=motor_data["canbus"],
                 inverted=motor_data["inverted"],
             )
         )

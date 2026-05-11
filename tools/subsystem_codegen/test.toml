@@ -7,14 +7,14 @@ id = 0
 type = "TalonFX"
 id = 1
 inverted = false
+canbus = "canivore"
 
 [motors.front_right]
 type = "TalonFX"
 id = 1
 inverted = false
+canbus = "canivore"
 
 [sensors]
 [sensors.front_left_encoder]
 inverted = false
-
-[test]

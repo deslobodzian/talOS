@@ -12,6 +12,7 @@ class MotorControllerType(Enum):
 class Motor:
     name: str
     type: MotorControllerType
+    canbus: str
     can_id: int
     inverted: bool
 
