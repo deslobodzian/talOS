@@ -10,8 +10,8 @@ class MotorControllerType(Enum):
 
 @dataclass(frozen=True)
 class Motor:
-    type: MotorControllerType
     name: str
+    type: MotorControllerType
     can_id: int
     inverted: bool
 

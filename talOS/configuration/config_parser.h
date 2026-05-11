@@ -3,7 +3,7 @@
 #include <exception>
 #include <string>
 #include <iostream>
-#include "toml++/toml.hpp"
+#include "toml.hpp"
 
 namespace talos::config {
 
