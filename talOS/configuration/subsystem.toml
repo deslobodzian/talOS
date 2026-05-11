@@ -7,3 +7,9 @@ type = "TalonFX"
 supply_current = 20
 stator_current = 20
 is_inverted = false
+
+[motors.right_leader]
+type = "TalonFX"
+supply_current = 20
+stator_current = 20
+is_inverted = false
