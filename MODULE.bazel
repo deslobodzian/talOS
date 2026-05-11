@@ -5,7 +5,16 @@ bazel_dep(name = "rules_cc", version = "0.2.18")
 bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "flatbuffers", version = "25.12.19")
+
 bazel_dep(name = "rules_java", version = "9.6.1")
+
+bazel_dep(name = "rules_python", version = "2.0.1")
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    python_version = "3.11",
+    is_default = True,
+)
+use_repo(python, "python_3_11")
 
 # For configuration
 bazel_dep(name = "tomlplusplus", version = "3.4.0")
