@@ -12,3 +12,9 @@ inverted = false
 type = "TalonFX"
 id = 1
 inverted = false
+
+[sensors]
+[sensors.front_left_encoder]
+inverted = false
+
+[test]
