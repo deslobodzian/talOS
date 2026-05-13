@@ -5,7 +5,7 @@ id = 0
 [motors]
 [motors.front_left]
 type = "TalonFX"
-id = 1
+id = 2
 inverted = false
 canbus = "canivore"
 
