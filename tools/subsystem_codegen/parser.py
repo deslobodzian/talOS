@@ -9,6 +9,21 @@ VALID_SUBSYSTEM_KEYS = set([
     "sensors",
 ])
 
+VALID_MOTOR_KEYS = set([
+    "type",
+    "canbus",
+    "id",
+    "inverted",
+])
+
+
+def valid_keys(key_subset: set, validation_keys: set):
+    subset_diff = key_subset.difference(validation_keys)
+    if not key_subset.issubset(validation_keys):
+        print(f"Toml keys not in valid keys: {subset_diff}")
+        return False
+    return True
+
 
 def find_duplicate_motors(motors: list[Motor]):
     grouped = defaultdict(list)
@@ -25,6 +40,10 @@ def find_duplicate_motors(motors: list[Motor]):
 def extract_motor_data(subsystem_data) -> list[Motor]:
     motors = []
     for motor in subsystem_data["motors"]:
+        motor_keys_set = set(subsystem_data["motors"][motor].keys())
+        if not valid_keys(motor_keys_set, VALID_MOTOR_KEYS):
+            return None
+
         motor_data = subsystem_data["motors"][motor]
         motors.append(
             Motor(
@@ -35,41 +54,31 @@ def extract_motor_data(subsystem_data) -> list[Motor]:
                 inverted=motor_data["inverted"],
             )
         )
-    return motors
-
-
-def verify_toml_subsystem(subsystem_data: dict):
-    print(subsystem_data.keys())
-    key_subset = set(subsystem_data.keys())
-
-    subset_diff = key_subset.difference(VALID_SUBSYSTEM_KEYS)
-    if not key_subset.issubset(VALID_SUBSYSTEM_KEYS):
-        print(f"Subsystem toml keys not in valid keys: {subset_diff}")
-        return False
-
-    motors = extract_motor_data(subsystem_data)
     duplicate_motors = find_duplicate_motors(motors)
     for (canbus, id), group in duplicate_motors.items():
         print(f"Duplicate CAN device: bus={canbus}, id={id}")
         for motor in group:
             print(f" - {motor.name}, ({motor.type})")
-
-    return True
+    return motors
 
 
 def parse_subsystem(toml_path: Path):
     with open(toml_path, "rb") as f:
         subsystem_data = tomllib.load(f)
 
-    if not verify_toml_subsystem(subsystem_data):
+    if not valid_keys(set(subsystem_data.keys()), VALID_SUBSYSTEM_KEYS):
+        return None
+
+    motors = extract_motor_data(subsystem_data)
+    if not motors:
         return None
 
     subsystem = subsystem_data["subsystem"]
 
     subsystem = Subsystem(
         name=subsystem["name"],
-        subsystem_id=subsystem["id"]
+        subsystem_id=subsystem["id"],
+        motors=motors,
+        sensors=None
     )
-    print(subsystem)
-
     return subsystem

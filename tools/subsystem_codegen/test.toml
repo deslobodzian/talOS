@@ -11,10 +11,10 @@ canbus = "canivore"
 
 [motors.front_right]
 type = "TalonFX"
-id = 1
+id = 2
 inverted = false
 canbus = "canivore"
 
 [sensors]
 [sensors.front_left_encoder]
-inverted = false
+nverted = false
