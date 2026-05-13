@@ -61,6 +61,27 @@ What will I need to send and receive from the controller computer
 Runtime payloads start with `RuntimeValuesHeader`, followed by `SignalValue`
 entries. The `manifest_id` in each runtime payload must match the accepted
 manifest.
+### Motor Packet
+- voltage: float # 4 bytes
+- position: float # 4 bytes
+- velocity: float # 4 bytes
+- torque: float # 4 bytes
+- supply_current: float # 4 bytes
+- stator_current: float # 4 bytes
+- temperature: uint8_t: # 1 bytes Do I need this?
+
+Packet size: 25 bytes (6 * 4 + 1)
+Motor <-> data mapping is handled in configuration of subsystems with slots
+configured at configuration generation / verification
+
+During runtime rt-controller will a majority of the time send a large frame
+contianing all motor and sensor data for the main controller to pare.
+
+This is for simplicity,
+The max allowed motors on this system will be 21 (24 - 3)
+3 for the radio, controller, rt-controller.
+
+For 21 motors, minimum packate size of 525 bytes
 
 ## Low-Latency UDP API
 

@@ -17,7 +17,23 @@ class Motor:
     inverted: bool
 
 
+# Only using most recent sensors
+class SensorType(Enum):
+    CANCoder = "CANCoder"
+    CANRange = "CANRange"
+
+
+@dataclass(frozen=True)
+class Sensor:
+    name: str
+    type: SensorType
+    canbus: str
+    can_id: int
+
+
 @dataclass(frozen=True)
 class Subsystem:
     name: str
     subsystem_id: int
+    motors: list[Motor]
+    sensors: list[Sensor] | None
