@@ -5,16 +5,18 @@ id = 0
 [motors]
 [motors.front_left]
 type = "TalonFX"
-id = 2
+id = 1
 inverted = false
 canbus = "canivore"
+slot = 0 # Need better way than this, as will be hard to track between toml files
 
 [motors.front_right]
 type = "TalonFX"
 id = 2
 inverted = false
 canbus = "canivore"
+slot = 0
 
 [sensors]
 [sensors.front_left_encoder]
-nverted = false
+inverted = false

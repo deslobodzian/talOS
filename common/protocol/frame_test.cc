@@ -5,6 +5,8 @@
 #include <ranges>
 #include <iostream>
 
+#include "common/protocol/types.h"
+#include "motor_state.h"
 #include "gtest/gtest.h"
 
 namespace talos::protocol {
@@ -154,5 +156,52 @@ TEST(FrameTest, MultiSignals) {
   std::cout << decoded_payload.values[38].uint64_value << "\n";
 }
 
+TEST(FrameTest, MotorPayload) {
+    MotorPayload payload{};
+    for (size_t i = 0; i < kMaxMotors; i++) {
+        payload.states[i].position = static_cast<float>(i) * 0.5f;
+        payload.states[i].velocity = static_cast<float>(i) * 2.0f;
+        payload.states[i].voltage = 12.0f;
+        payload.states[i].torque_current = 3.0f;
+        payload.states[i].supply_current = 20.0f;
+        payload.states[i].stator_current = 10.0f;
+    }
+
+    std::array<uint8_t, kMaxFrameSize> frame{};
+    const std::size_t size = EncodeFrame(
+        FrameType::kRioState,
+        kFlagNone,
+        10,
+        1000,
+        &payload,
+        sizeof(payload),
+        frame.data(),
+        frame.size()
+    );
+
+    DecodedFrame decoded;
+    ASSERT_EQ(DecodeFrame(frame.data(), size, &decoded), DecodeStatus::kOk);
+    ASSERT_EQ(decoded.payload_size, sizeof(payload));
+
+    MotorPayload decoded_payload{};
+    std::memcpy(&decoded_payload, decoded.payload, sizeof(decoded_payload));
+    for (size_t i = 0; i < kMaxMotors; i++) {
+        EXPECT_DOUBLE_EQ(
+            decoded_payload.states[i].position,
+            static_cast<float>(i) * 0.5f);
+
+        EXPECT_DOUBLE_EQ(
+            decoded_payload.states[i].velocity,
+            static_cast<float>(i) * 2.0f);
+
+        EXPECT_DOUBLE_EQ(decoded_payload.states[i].voltage, 12.0f);
+        EXPECT_DOUBLE_EQ(decoded_payload.states[i].torque_current, 3.0f);
+        EXPECT_DOUBLE_EQ(decoded_payload.states[i].supply_current, 20.0f);
+        EXPECT_DOUBLE_EQ(decoded_payload.states[i].stator_current, 10.0f);
+
+    }
+}
+
 }  // namespace
 }  // namespace talos::protocol
+

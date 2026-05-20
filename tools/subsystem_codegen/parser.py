@@ -14,6 +14,7 @@ VALID_MOTOR_KEYS = set([
     "canbus",
     "id",
     "inverted",
+    "slot",
 ])
 
 
@@ -37,6 +38,18 @@ def find_duplicate_motors(motors: list[Motor]):
     }
 
 
+def find_duplicate_motor_slots(motors: list[Motor]):
+    grouped = defaultdict(list)
+    for motor in motors:
+        grouped[motor.slot].append(motor)
+
+    return {
+        key: group
+        for key, group in grouped.items()
+        if len(group) > 1
+    }
+
+
 def extract_motor_data(subsystem_data) -> list[Motor]:
     motors = []
     for motor in subsystem_data["motors"]:
@@ -52,11 +65,18 @@ def extract_motor_data(subsystem_data) -> list[Motor]:
                 can_id=motor_data["id"],
                 canbus=motor_data["canbus"],
                 inverted=motor_data["inverted"],
+                slot=motor_data["slot"],
             )
         )
     duplicate_motors = find_duplicate_motors(motors)
     for (canbus, id), group in duplicate_motors.items():
-        print(f"Duplicate CAN device: bus={canbus}, id={id}")
+        print(f"duplicate can device: bus={canbus}, id={id}")
+        for motor in group:
+            print(f" - {motor.name}, ({motor.type})")
+
+    duplicate_motor_slots = find_duplicate_motor_slots(motors)
+    for slot, group in duplicate_motor_slots.items():
+        print(f"duplicate motor slot: {slot}")
         for motor in group:
             print(f" - {motor.name}, ({motor.type})")
     return motors
