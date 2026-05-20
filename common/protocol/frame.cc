@@ -1,14 +1,14 @@
 #include "frame.h"
 
-#include <cstring>
 #include <concepts>
+#include <cstring>
 
 namespace talos::protocol {
 namespace {
 
 template <std::unsigned_integral T>
 void WriteUInt(uint8_t* out, T value) {
-    std::memcpy(out, &value, sizeof(value));
+  std::memcpy(out, &value, sizeof(value));
 }
 
 /* memcpy and bit shift have same # of instructions when optimized
@@ -21,10 +21,9 @@ void WriteUInt(uint8_t* out, T value) {
  */
 template <std::unsigned_integral T>
 T ReadUInt(const uint8_t* in) {
-    T out;
-    std::memcpy(&out, in, sizeof(T));
-    return out;
-
+  T out;
+  std::memcpy(&out, in, sizeof(T));
+  return out;
 }
 }  // namespace
 
@@ -143,5 +142,3 @@ const char* DecodeStatusName(DecodeStatus status) {
 }
 
 }  // namespace talos::protocol
-
-
