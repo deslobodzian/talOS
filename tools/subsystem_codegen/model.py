@@ -15,6 +15,7 @@ class Motor:
     canbus: str
     can_id: int
     inverted: bool
+    slot: int
 
 
 # Only using most recent sensors

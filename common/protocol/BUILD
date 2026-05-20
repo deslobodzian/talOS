@@ -13,6 +13,7 @@ cc_library(
         "udp.h",
         "types.h",
         "network_util.h",
+        "motor_state.h",
     ],
     includes = ["include"],
     linkopts = select({

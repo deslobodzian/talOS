@@ -69,19 +69,6 @@ struct ManifestHeader {
   uint32_t fault_count;
 };
 
-struct SignalDescriptor {
-  uint16_t id;
-  SignalDirection direction;
-  SignalType signal_type;
-  ValueType value_type;
-  uint8_t flags;
-  uint16_t reserved;
-  uint32_t freshness_timeout_us;
-  double min_value;
-  double max_value;
-  char name[48];
-};
-
 struct SignalValue {
   uint16_t id;
   ValueType value_type;
@@ -110,7 +97,6 @@ struct FaultPayload {
 
 static_assert(sizeof(RioHello) == 56);
 static_assert(sizeof(ManifestHeader) == 24);
-static_assert(sizeof(SignalDescriptor) == 80);
 static_assert(sizeof(SignalValue) == 16);
 static_assert(sizeof(RuntimeValuesHeader) == 16);
 static_assert(sizeof(FaultPayload) == 104);
