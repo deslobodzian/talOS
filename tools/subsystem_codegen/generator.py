@@ -5,15 +5,28 @@ from pathlib import Path
 def append_inline(type, name, value):
     if isinstance(value, str):
         value = f'"{value}"'
-    return f"inline constexpr {type} {name} = {value};\n"
+    return f"inline constexpr {type} {name} = {value};"
 
 
-def add_includes(includes: list[str]):
-    include_str = ""
-    print(includes)
+def add_includes(current_output, includes: list[str]):
     for include in includes:
-        include_str += f"#include {include}\n"
-    return include_str
+        current_output.append(f"#include <{include}>")
+    return current_output
+
+
+def add_namespace(output: list[str], subsystem_name: str):
+    namespace_str = f"namespace constants::{subsystem_name} {{"
+    for idx, line in enumerate(output):
+        if "#" not in line:
+            output.insert(idx, namespace_str)
+            break
+    output.append(f"}} /* constants::{subsystem_name} */")
+    return output
+
+
+# All this does is combine output # With a "\n"
+def finalize_output(output: list[str]) -> str:
+    return "\n".join(output)
 
 
 def create_constants_file(subsystem: Subsystem, path: Path):
@@ -21,24 +34,35 @@ def create_constants_file(subsystem: Subsystem, path: Path):
     constants_file = Path(path) / file_name
     print(constants_file)
 
+    output = []
+    includes = ["string_view", "iostream"]
+    output = add_includes(output, includes)
+
+    for motor in subsystem.motors:
+        output.append(f"\n// Motor: {motor.name}")
+        output.append(append_inline(
+            "std::string_view",
+            "kCanBus",
+            motor.canbus,
+        ))
+        output.append(append_inline(
+            "int",
+            "kCanID",
+            motor.can_id
+        ))
+        output.append(append_inline(
+            "boolean",
+            "kInverted",
+            motor.inverted
+        ))
+        output.append(append_inline(
+            "int",
+            "kSlot",
+            motor.slot
+        ))
+
+    add_namespace(output, subsystem.name)
+    output = finalize_output(output)
+
     with open(constants_file, "w") as file:
-        output = ""
-        includes = ["string_view", "iostream"]
-        output += add_includes(includes)
-
-        motors = ""
-        for motor in subsystem.motors:
-            motors += append_inline(
-                "std::string_view",
-                "kCanBus",
-                motor.canbus,
-            )
-            motors += append_inline(
-                "int",
-                "kCanID",
-                motor.can_id
-            )
-
-        output += motors
-        print(output)
         file.write(output)
