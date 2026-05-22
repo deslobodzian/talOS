@@ -1,4 +1,3 @@
-from model import Subsystem
 from parser import parse_subsystem
 from generator import create_constants_file
 
