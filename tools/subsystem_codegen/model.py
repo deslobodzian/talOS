@@ -9,12 +9,19 @@ class MotorControllerType(Enum):
 
 
 @dataclass(frozen=True)
+class MotorConfiguration:
+    stator_current_limit: float
+    supply_current_limit: float
+
+
+@dataclass(frozen=True)
 class Motor:
     name: str
     type: MotorControllerType
     canbus: str
     can_id: int
     inverted: bool
+    config: MotorConfiguration
     slot: int
 
 

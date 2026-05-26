@@ -1,6 +1,6 @@
 import tomllib
 from pathlib import Path
-from model import Subsystem, Motor, MotorControllerType
+from model import Subsystem, Motor, MotorControllerType, MotorConfiguration
 from collections import defaultdict
 
 VALID_SUBSYSTEM_KEYS = set([
@@ -15,6 +15,8 @@ VALID_MOTOR_KEYS = set([
     "id",
     "inverted",
     "slot",
+    "stator_current",
+    "supply_current",
 ])
 
 
@@ -58,6 +60,11 @@ def extract_motor_data(subsystem_data) -> list[Motor]:
             return None
 
         motor_data = subsystem_data["motors"][motor]
+
+        config = MotorConfiguration(
+            stator_current_limit=motor_data["stator_current"],
+            supply_current_limit=motor_data["supply_current"]
+        )
         motors.append(
             Motor(
                 type=MotorControllerType(motor_data["type"]),
@@ -66,6 +73,7 @@ def extract_motor_data(subsystem_data) -> list[Motor]:
                 canbus=motor_data["canbus"],
                 inverted=motor_data["inverted"],
                 slot=motor_data["slot"],
+                config=config
             )
         )
     duplicate_motors = find_duplicate_motors(motors)
