@@ -9,6 +9,8 @@ id = 1
 inverted = false
 canbus = "canivore"
 slot = 0 # Need better way than this, as will be hard to track between toml files
+stator_current = 40
+supply_current = 120
 
 [motors.front_right]
 type = "TalonFX"
@@ -16,6 +18,8 @@ id = 2
 inverted = false
 canbus = "canivore"
 slot = 0
+stator_current = 40
+supply_current = 120
 
 [sensors]
 [sensors.front_left_encoder]

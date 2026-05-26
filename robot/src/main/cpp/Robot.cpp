@@ -112,7 +112,12 @@ void DrainSimCommands() {
 
 }  // namespace
 
-Robot::Robot() : frc::TimedRobot(1_ms) {}
+Robot::Robot() : frc::TimedRobot(20_ms) {
+    motors_.push_back(SimMotor(0));
+    motors_.push_back(SimMotor(1));
+    motors_.push_back(SimMotor(2));
+    motors_.push_back(SimMotor(3));
+}
 void Robot::RobotPeriodic() {}
 
 void Robot::AutonomousInit() {}

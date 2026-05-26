@@ -60,9 +60,20 @@ def create_constants_file(subsystem: Subsystem, path: Path):
             "kSlot",
             motor.slot
         ))
+        output.append(append_inline(
+            "double",
+            "kSupplyLimit",
+            motor.config.supply_current_limit
+        ))
+        output.append(append_inline(
+            "double",
+            "kStatorLimit",
+            motor.config.stator_current_limit
+        ))
 
     add_namespace(output, subsystem.name)
     output = finalize_output(output)
+    print(output)
 
     with open(constants_file, "w") as file:
         file.write(output)

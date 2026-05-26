@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "SimMotor.h"
 #include <frc/TimedRobot.h>
 
 class Robot : public frc::TimedRobot {
@@ -25,4 +26,6 @@ class Robot : public frc::TimedRobot {
 
   void SimulationInit() override;
   void SimulationPeriodic() override;
+ private:
+    std::vector<SimMotor> motors_;
 };
