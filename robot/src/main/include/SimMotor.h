@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Constants.h"
 #include "motor.h"
 #include "motor_state.h"
 #include <frc/simulation/DCMotorSim.h>
@@ -20,7 +21,8 @@ public:
     payload_slot_(payload_slot) {};
 
     void UpdateState() {
-        motor_sim_.Update(0.02_s);
+        motor_sim_.Update(Constants::kUpdateRate);
+
         motor_state_.position = static_cast<float>(motor_sim_.GetAngularPosition().value());
         motor_state_.velocity = static_cast<float>(motor_sim_.GetAngularVelocity().value());
         motor_state_.stator_current = static_cast<float>(motor_sim_.GetCurrentDraw().value());

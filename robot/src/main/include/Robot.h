@@ -5,6 +5,7 @@
 #pragma once
 
 #include "SimMotor.h"
+#include "motor_state.h"
 #include <frc/TimedRobot.h>
 
 class Robot : public frc::TimedRobot {
@@ -28,4 +29,5 @@ class Robot : public frc::TimedRobot {
   void SimulationPeriodic() override;
  private:
     std::vector<SimMotor> motors_;
+    talos::protocol::MotorPayload payload_;
 };
