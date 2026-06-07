@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
+#include "shared_memory.h"
 
-TEST(HelloTest, Assertion) {
-  EXPECT_STRNE("hello", "world");
-  EXPECT_EQ(6 * 7, 42);
+TEST(OpenSHMMAP, SharedMemory) {
+    open_shmmap("/test", 64);
 }
