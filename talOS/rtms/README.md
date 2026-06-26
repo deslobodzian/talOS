@@ -11,3 +11,13 @@ All topics will be broadcasted under `"/dev/rtms/topic_name"`
 ## Messages
 
 All messages will use flatbuffers for serialization.
+
+## Memory
+Each ring buffer with be stored with a corresponding header, the shared memory
+layout will look like this</b>
+
+`[rmts_header][data...]`
+
+
+## Performance:
+Read this for performance increase [ideas](https://en.algorithmica.org/hpc/cpu-cache/cache-lines/)
