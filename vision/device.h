@@ -18,7 +18,7 @@ enum class MemorySource { Allocate, External };
 class Device;
 class Allocator;
 
-// BufferConfig is what the buffer looks like, who has access, etc
+// BufferDesc is what the buffer looks like, who has access, etc
 struct BufferDesc {
   std::size_t size = 0;
   MemoryLocation location = MemoryLocation::Device;
