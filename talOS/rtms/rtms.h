@@ -6,13 +6,9 @@
  * Implementaion is based on https://csg.csail.mit.edu/6.823S17/StudyMaterials/quiz3/handouts/handout13-queue.pdf
 */
 
-#include <concepts>
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
-#include <flatbuffers/flatbuffers.h>
-#include <string>
-#include <type_traits>
 #include "talOS/memory/shared_memory_ptr.h"
 
 inline constexpr size_t CACHE_LINE = 64; // C++ I think as a function for this.
@@ -50,24 +46,23 @@ struct RTMSHeader {
     Reader readers[MAX_READERS];
 };
 
-template <typename T>
-concept NotDerivedFromTable = !std::is_base_of_v<flatbuffers::Table, T>;
+//template <typename T>
+//concept NotDerivedFromTable = !std::is_base_of_v<flatbuffers::Table, T>;
 
-// Ring buffer queue,
-template <NotDerivedFromTable Message>
+// Ring buffer queue, shoudl this be set here or be generic for any dataa not just
+// flatbuffer message?
+//template <NotDerivedFromTable Message>
+
 class RTMSQueue {
 public:
-    explicit RTMSQueue(std::string_view path) :
-        path_(path),
-        message_size_(sizeof(Message)),
-        ptr_(path_.c_str(), message_size_) {
-    }
+    explicit RTMSQueue(std::string_view path, off_t message_size);
 
+    void write(const RTMSMessage& message);
     size_t message_size() const { return message_size_; }
     std::string_view path() const { return path_; }
 private:
     std::string path_;
     std::size_t message_size_;
-    RTMSHeader header_;
+    RTMSHeader* header_;
     SharedMemoryPtr ptr_;
 };

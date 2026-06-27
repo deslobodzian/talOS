@@ -28,7 +28,7 @@ TEST(RTMSMessage, RTMS) {
 
 TEST(RTMSTest, RTMS) {
     auto path = "/tmp/rtms/test";
-    RTMSQueue<Message::TestMessage> queue{path};
+    RTMSQueue queue{path, sizeof(Message::TestMessage)};
 
     EXPECT_EQ(path, queue.path());
     EXPECT_EQ(sizeof(Message::TestMessage), queue.message_size());
