@@ -35,7 +35,6 @@ struct alignas(CACHE_LINE) Writer {
 
 struct alignas(CACHE_LINE) Reader {
     std::atomic<uint64_t> sequence{};
-    std::atomic<uint64_t> slot{};
     std::atomic<ReaderStatus> status{};
 };
 
