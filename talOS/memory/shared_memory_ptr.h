@@ -22,6 +22,10 @@ public:
         std::printf("Deleted ptr_: %p\n", ptr_);
     }
 
+    void* ptr() {
+        return ptr_;
+    }
+
 private:
     int attach_ptr(const char* shm_name, off_t size) {
         shm_unlink(shm_name);

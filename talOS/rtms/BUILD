@@ -10,6 +10,7 @@ flatbuffer_cc_library(
 cc_library(
     name = "rtms",
     hdrs = ["rtms.h"],
+    srcs = ["rtms.cc"],
     deps = ["//talOS/memory:shared_memory"],
 )
 
