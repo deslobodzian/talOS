@@ -1,8 +1,6 @@
 namespace Message;
 
-table TestMessage {
+struct TestMessage {
     id:int;
-    name:string;
+    value:float;
 }
-
-root_type TestMessage;
