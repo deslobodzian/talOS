@@ -6,10 +6,13 @@
  * Implementaion is based on https://csg.csail.mit.edu/6.823S17/StudyMaterials/quiz3/handouts/handout13-queue.pdf
 */
 
+#include <concepts>
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
+#include <flatbuffers/flatbuffers.h>
 #include <string>
+#include <type_traits>
 #include "talOS/memory/shared_memory_ptr.h"
 
 inline constexpr size_t CACHE_LINE = 64; // C++ I think as a function for this.
@@ -47,16 +50,24 @@ struct RTMSHeader {
     Reader readers[MAX_READERS];
 };
 
-// Ring buffer queue,
 template <typename T>
+concept NotDerivedFromTable = !std::is_base_of_v<flatbuffers::Table, T>;
+
+// Ring buffer queue,
+template <NotDerivedFromTable Message>
 class RTMSQueue {
 public:
     explicit RTMSQueue(std::string_view path) :
         path_(path),
-        ptr_(path_.c_str(), 100) {
+        message_size_(sizeof(Message)),
+        ptr_(path_.c_str(), message_size_) {
     }
+
+    size_t message_size() const { return message_size_; }
+    std::string_view path() const { return path_; }
 private:
     std::string path_;
+    std::size_t message_size_;
     RTMSHeader header_;
     SharedMemoryPtr ptr_;
 };

@@ -11,6 +11,8 @@ All topics will be broadcasted under `"/dev/rtms/topic_name"`
 ## Messages
 
 All messages will use flatbuffers for serialization.
+Flatbuffers __MUST__ be structs! Tables will not be allowed such that size can be know at compile time,
+in the future, tables may be added for dynamic types.
 
 ## Memory
 Each ring buffer with be stored with a corresponding header, the shared memory

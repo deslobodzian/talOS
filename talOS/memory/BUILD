@@ -3,7 +3,8 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
 cc_library(
     name = "shared_memory",
-    hdrs = ["shared_memory_ptr.h"]
+    hdrs = ["shared_memory_ptr.h"],
+    visibility = ["//visibility:public"],
 )
 
 cc_test(
