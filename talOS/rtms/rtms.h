@@ -58,5 +58,5 @@ public:
 private:
     std::string path_;
     RTMSHeader header_;
-    SharedMemoryPtr<void> ptr_;
+    SharedMemoryPtr ptr_;
 };

@@ -4,6 +4,6 @@
 
 TEST(SharedMemory, SharedMemoryPtr) {
     {
-        SharedMemoryPtr<int> test("/tmp/rtms_test", 100);
+        SharedMemoryPtr test("/tmp/rtms_test", 100);
     }
 }

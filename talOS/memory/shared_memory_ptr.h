@@ -6,7 +6,6 @@
 #include <cstdio>
 #include <string>
 
-template <typename T>
 class SharedMemoryPtr {
 public:
     SharedMemoryPtr(const char* name, off_t size) : shm_name_(name), size_(size) {
@@ -51,12 +50,12 @@ private:
             std::perror("failed to close shm_fd");
             return -1;
         }
-        ptr_ = reinterpret_cast<T*>(shm_addr);
+        ptr_ = shm_addr;
 
         std::printf("Addr given to ptr_: %p\n", ptr_);
         return 0;
     }
     std::string shm_name_;
     off_t size_ = 0;
-    T* ptr_ = nullptr;
+    void* ptr_ = nullptr;
 };
