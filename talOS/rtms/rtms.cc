@@ -92,6 +92,9 @@ RTMSMessage RTMSQueue::read(std::uint64_t reader_id) {
     message.data = static_cast<std::byte*>(ptr_.ptr()) + sizeof(RTMSHeader) + offset;
     message.size = header_->message_size;
 
+    const uint64_t next_position = reader_position + message_size;
+    reader.sequence.store(next_position, std::memory_order_release);
+
     return message;
 }
 
