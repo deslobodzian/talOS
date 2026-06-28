@@ -2,14 +2,19 @@
 Named after the first automaton, talOS is a robotics control architecture aimed to work with the NI RobotRIO or SystemCore acting as a HAL layer with a seperate main computer handling logic
 
 ## Building
-Build used bazel for all projects in the repo to build all. </b> 
+Build used bazel for all projects in the repo to build all. </b>
 
-Build all: `bazle build //...`</b> 
+Build all: `bazle build //...`</b>
 
 Example for building a specific module:
 
 `bazel build //.talos`
 
+## Debugging
+To build with debug:
+`bazel build -c dbg //path/to:target`</b>
+To run:
+`lldb bazel-bin/path/to/target`</b>
 
 To generate `compile_comands.json` for clangd or other LSPs in c++: </b>
 

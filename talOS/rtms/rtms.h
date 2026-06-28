@@ -14,7 +14,7 @@
 inline constexpr size_t CACHE_LINE = 64; // C++ I think as a function for this.
 inline constexpr size_t MAX_BUFFER_SIZE = 1u << 20; // 1MiB
 inline constexpr size_t MASK = MAX_BUFFER_SIZE - 1; // Mask for fixed size
-inline constexpr size_t MAX_READERS = 8;
+inline constexpr size_t MAX_READERS = 1;
 
 // Mesages will primarity be using flatbuffers but stored this RTMSMessage object
 struct RTMSMessage {
@@ -22,7 +22,7 @@ struct RTMSMessage {
     void* data;
 };
 
-enum class ReaderStatus : std::uint64_t {
+enum class ReaderState : std::uint64_t {
     FREE,
     CLAIMING,
     ACTIVE
@@ -34,7 +34,7 @@ struct alignas(CACHE_LINE) Writer {
 
 struct alignas(CACHE_LINE) Reader {
     std::atomic<uint64_t> sequence{};
-    std::atomic<ReaderStatus> status{};
+    std::atomic<ReaderState> state{};
 };
 
 struct RTMSHeader {
@@ -49,17 +49,21 @@ struct RTMSHeader {
 //template <typename T>
 //concept NotDerivedFromTable = !std::is_base_of_v<flatbuffers::Table, T>;
 
-// Ring buffer queue, shoudl this be set here or be generic for any dataa not just
 // flatbuffer message?
 //template <NotDerivedFromTable Message>
 
+// Ring buffer queue, should flatbuffers requirement
+// be set here or be generic for any data?
 class RTMSQueue {
 public:
     explicit RTMSQueue(std::string_view path, off_t message_size);
 
+    std::uint64_t minimum_read_position() const;
     void write(const RTMSMessage& message);
+    RTMSMessage read(std::uint64_t reader_id);
     size_t message_size() const { return message_size_; }
     std::string_view path() const { return path_; }
+
 private:
     std::string path_;
     std::size_t message_size_;
