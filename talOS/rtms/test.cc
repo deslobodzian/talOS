@@ -7,22 +7,26 @@ TEST(SingleProcess, RTMS) {
     auto path = "/tmp/rtms/test";
 
     RTMSQueue queue{path, sizeof(Message::TestMessage)};
-    Message::TestMessage fb_message{10, 200};
-    RTMSMessage message{sizeof(Message::TestMessage), static_cast<void*>(&fb_message)};
-    queue.write(message);
-    queue.write(message);
-    queue.write(message);
+    auto messages = std::array{
+        Message::TestMessage{10, 200},
+        Message::TestMessage{23, 23.2},
+        Message::TestMessage{0, 0.111111},
+    };
 
-    auto new_message = queue.read(0);
-    new_message = queue.read(0);
-    new_message = queue.read(0);
-    EXPECT_EQ(new_message.size, sizeof(Message::TestMessage));
-    std::printf("new_message: %p, %zu\n", new_message.data, new_message.size);
+    for (auto& message : messages) {
+        RTMSMessage rtms_message{sizeof(Message::TestMessage), static_cast<void*>(&message)};
+        queue.write(rtms_message);
+    }
+    std::vector<RTMSMessage> new_messages;
 
-    auto new_fb = static_cast<const Message::TestMessage*>(new_message.data);
-    Message::TestMessage new_stack_fb{new_fb->id(), new_fb->value()};
-    std::printf("new_fb: %i, %f\n", new_fb->id(), new_fb->value());
-    EXPECT_EQ(new_stack_fb, fb_message);
+    for (auto& message : messages) {
+        auto new_message = queue.read(0);
+        EXPECT_EQ(new_message.size, sizeof(Message::TestMessage));
+        auto new_fb = static_cast<const Message::TestMessage*>(new_message.data);
+        Message::TestMessage new_stack_fb{new_fb->id(), new_fb->value()};
+        EXPECT_EQ(new_stack_fb, message);
+        std::printf("new_fb: %i, %f\n", new_fb->id(), new_fb->value());
+    }
 }
 
 TEST(RTMSTest, RTMS) {
