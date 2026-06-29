@@ -12,6 +12,7 @@
 #include <iostream>
 #include <span>
 #include <concepts>
+#include "talOS/memory/shared_memory_ptr.h"
 
 inline constexpr size_t CACHE_LINE = 64; // C++ I think as a function for this.
 inline constexpr size_t MAX_BUFFER_SIZE = 1u << 20; // 1MiB
