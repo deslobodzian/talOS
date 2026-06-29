@@ -65,36 +65,3 @@ void RTMSQueue::write(const RTMSMessage& message) {
     header_->writer.sequence.store(next_position, std::memory_order_release);
 }
 
-RTMSMessage RTMSQueue::read(std::uint64_t reader_id) {
-    RTMSMessage message{};
-    auto& reader = header_->readers[reader_id];
-    const std::uint64_t message_size = header_->message_size;
-
-    std::uint64_t reader_position = reader.sequence.load(std::memory_order_relaxed);
-    const std::uint64_t writer_position = header_->writer.sequence.load(std::memory_order_acquire);
-
-    if (reader_position == writer_position) {
-        std::cerr << "Reader and Writer at same position!\n";
-    }
-
-    std::uint64_t offset = reader_position & MASK;
-    const std::uint64_t remaining = header_->capacity - offset;
-
-    // handle wrap around
-    if (remaining < message_size) {
-        reader_position += message_size;
-        offset = 0;
-        reader.sequence.store(reader_position, std::memory_order_release);
-        // We need to try again since its possible that the reader == writer position
-        return read(reader_id);
-    }
-
-    message.data = static_cast<std::byte*>(ptr_.ptr()) + sizeof(RTMSHeader) + offset;
-    message.size = header_->message_size;
-
-    const uint64_t next_position = reader_position + message_size;
-    reader.sequence.store(next_position, std::memory_order_release);
-
-    return message;
-}
-

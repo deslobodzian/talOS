@@ -9,7 +9,9 @@
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
-#include "talOS/memory/shared_memory_ptr.h"
+#include <iostream>
+#include <span>
+#include <concepts>
 
 inline constexpr size_t CACHE_LINE = 64; // C++ I think as a function for this.
 inline constexpr size_t MAX_BUFFER_SIZE = 1u << 20; // 1MiB
@@ -51,6 +53,8 @@ struct RTMSHeader {
 
 // flatbuffer message?
 //template <NotDerivedFromTable Message>
+template <typename F, class T = const std::byte>
+concept TakesSpan = std::invocable<F, std::span<T>>;
 
 // Ring buffer queue, should flatbuffers requirement
 // be set here or be generic for any data?
@@ -60,7 +64,46 @@ public:
 
     std::uint64_t minimum_read_position() const;
     void write(const RTMSMessage& message);
-    RTMSMessage read(std::uint64_t reader_id);
+    // We want the option to have copy free interactions, as such we pass a functor
+    // you are able to copy the data with the functor if you want or just do a quick operation and leave.
+    // e.i schedule an action based on the results of the message.
+    template<TakesSpan Callback>
+    bool read(std::uint64_t reader_id, Callback&& callback) {
+        auto& reader = header_->readers[reader_id];
+        const std::uint64_t message_size = header_->message_size;
+
+        std::uint64_t reader_position = reader.sequence.load(std::memory_order_relaxed);
+        const std::uint64_t writer_position = header_->writer.sequence.load(std::memory_order_acquire);
+
+        if (reader_position == writer_position) {
+            std::cerr << "Reader and Writer at same position!\n";
+        }
+
+        std::uint64_t offset = reader_position & MASK;
+        const std::uint64_t remaining = header_->capacity - offset;
+
+        // handle wrap around
+        if (remaining < message_size) {
+            reader_position += message_size;
+            offset = 0;
+            reader.sequence.store(reader_position, std::memory_order_release);
+            // We need to try again since its possible that the reader == writer position
+            return read(reader_id, std::forward<Callback>(callback));
+        }
+
+        callback(
+            std::span<const std::byte>{
+                static_cast<std::byte*>(ptr_.ptr()) + sizeof(RTMSHeader) + offset,
+                header_->message_size
+            }
+        );
+
+        const uint64_t next_position = reader_position + message_size;
+        reader.sequence.store(next_position, std::memory_order_release);
+
+        return true;
+
+    }
     size_t message_size() const { return message_size_; }
     std::string_view path() const { return path_; }
 
