@@ -20,12 +20,15 @@ TEST(SingleProcess, RTMS) {
     std::vector<RTMSMessage> new_messages;
 
     for (auto& message : messages) {
-        auto new_message = queue.read(0);
-        EXPECT_EQ(new_message.size, sizeof(Message::TestMessage));
-        auto new_fb = static_cast<const Message::TestMessage*>(new_message.data);
-        Message::TestMessage new_stack_fb{new_fb->id(), new_fb->value()};
-        EXPECT_EQ(new_stack_fb, message);
-        std::printf("new_fb: %i, %f\n", new_fb->id(), new_fb->value());
+        Message::TestMessage new_fb{};
+        queue.read(
+            0,
+            [&new_fb](std::span<const std::byte> bytes) {
+                std::memcpy(&new_fb, bytes.data(), bytes.size());
+             }
+        );
+        EXPECT_EQ(new_fb, message);
+        std::printf("new_fb: %i, %f\n", new_fb.id(), new_fb.value());
     }
 }
 
