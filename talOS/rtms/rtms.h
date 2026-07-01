@@ -15,9 +15,9 @@
 #include "talOS/memory/shared_memory_ptr.h"
 
 inline constexpr size_t CACHE_LINE = 64; // C++ I think as a function for this.
-inline constexpr size_t MAX_BUFFER_SIZE = 1u << 20; // 1MiB
-inline constexpr size_t MASK = MAX_BUFFER_SIZE - 1; // Mask for fixed size
-inline constexpr size_t MAX_READERS = 1;
+inline constexpr size_t MAX_SLOTS = 1u << 10; // 1024 slots maximum
+inline constexpr size_t MASK = MAX_SLOTS - 1; // Mask for fixed size
+inline constexpr size_t MAX_READERS = 8;
 
 // Mesages will primarity be using flatbuffers but stored this RTMSMessage object
 struct RTMSMessage {
@@ -41,9 +41,8 @@ struct alignas(CACHE_LINE) Reader {
 };
 
 struct RTMSHeader {
-    // This will be here incase I want to my different sized buffers in the future
-    std::uint64_t capacity;
-    std::size_t message_size; // message size will be fixes for each buffer
+    std::uint64_t slots; // power of 2 for efficiency
+    std::size_t slot_size; // message size will be fixes for each buffer
 
     Writer writer;
     Reader readers[MAX_READERS];
@@ -61,7 +60,8 @@ concept TakesSpan = std::invocable<F, std::span<T>>;
 // be set here or be generic for any data?
 class RTMSQueue {
 public:
-    explicit RTMSQueue(std::string_view path, off_t message_size);
+    RTMSQueue(std::string_view path, off_t slots, off_t message_size);
+    RTMSQueue(std::string_view path, off_t message_size);
 
     std::uint64_t minimum_read_position() const;
     void write(const RTMSMessage& message);
@@ -71,36 +71,26 @@ public:
     template<TakesSpan Callback>
     bool read(std::uint64_t reader_id, Callback&& callback) {
         auto& reader = header_->readers[reader_id];
-        const std::uint64_t message_size = header_->message_size;
 
         std::uint64_t reader_position = reader.sequence.load(std::memory_order_relaxed);
         const std::uint64_t writer_position = header_->writer.sequence.load(std::memory_order_acquire);
 
         if (reader_position == writer_position) {
             std::cerr << "Reader and Writer at same position!\n";
+            return false;
         }
 
-        std::uint64_t offset = reader_position & MASK;
-        const std::uint64_t remaining = header_->capacity - offset;
-
-        // handle wrap around
-        if (remaining < message_size) {
-            reader_position += message_size;
-            offset = 0;
-            reader.sequence.store(reader_position, std::memory_order_release);
-            // We need to try again since its possible that the reader == writer position
-            return read(reader_id, std::forward<Callback>(callback));
-        }
+        const uint64_t mask = header_->slots - 1;
+        std::uint64_t slot_index = reader_position & mask;
 
         callback(
             std::span<const std::byte>{
-                static_cast<std::byte*>(ptr_.ptr()) + sizeof(RTMSHeader) + offset,
-                header_->message_size
+                static_cast<std::byte*>(ptr_.ptr()) + sizeof(RTMSHeader) + (slot_index * header_->slot_size),
+                header_->slot_size
             }
         );
 
-        const uint64_t next_position = reader_position + message_size;
-        reader.sequence.store(next_position, std::memory_order_release);
+        reader.sequence.store(reader_position + 1, std::memory_order_release);
 
         return true;
 
