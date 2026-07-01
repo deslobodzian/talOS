@@ -13,8 +13,7 @@ RTMSQueue::RTMSQueue(std::string_view path,
       message_size_(message_size),
       ptr_(
           path_.c_str(),
-          static_cast<off_t>(sizeof(RTMSHeader)) +
-              slots * message_size_) {
+          sizeof(RTMSHeader) + (slots * message_size_)) {
 
     header_ = reinterpret_cast<RTMSHeader*>(ptr_.ptr());
 
