@@ -1,20 +1,30 @@
 #include "rtms.h"
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 
 
-RTMSQueue::RTMSQueue(std::string_view path, off_t message_size) :
-    path_(path),
-    message_size_(message_size),
-    ptr_(
-        path_.c_str(),
-        static_cast<off_t>(sizeof(RTMSHeader)) + MAX_BUFFER_SIZE) {
-    header_ = static_cast<RTMSHeader*>(ptr_.ptr());
-    header_->capacity = MAX_BUFFER_SIZE;
-    header_->message_size = message_size_;
+
+RTMSQueue::RTMSQueue(std::string_view path,
+                     off_t slots,
+                     off_t message_size)
+    : path_(path),
+      message_size_(message_size),
+      ptr_(
+          path_.c_str(),
+          static_cast<off_t>(sizeof(RTMSHeader)) +
+              slots * message_size_) {
+
+    header_ = reinterpret_cast<RTMSHeader*>(ptr_.ptr());
+
+    header_->slots = slots;
+    header_->slot_size = message_size_;
 }
 
+RTMSQueue::RTMSQueue(std::string_view path, off_t message_size) :
+    RTMSQueue(path, MAX_SLOTS, message_size) {
+}
 
 // Need to find out where the "slowest" reader is.
 uint64_t RTMSQueue::minimum_read_position() const {
@@ -33,35 +43,34 @@ uint64_t RTMSQueue::minimum_read_position() const {
 }
 
 void RTMSQueue::write(const RTMSMessage& message) {
-    if (message.size > header_->capacity) {
-        std::cerr << "Cannot write message larger than capacity\n";
+    const std::uint64_t slot_size = header_->slot_size;
+    const std::uint64_t slots = header_->slots;
+    const std::uint64_t slot_mask = slots - 1;
+
+    if (message.size > slot_size) {
+        std::cerr << "Cannot write message larger than slot size\n";
         return;
     }
 
     uint64_t writer_position = header_->writer.sequence.load(std::memory_order_relaxed);
     std::printf("Writer position: %llu\n", writer_position);
 
-    const std::uint64_t offset = writer_position & MASK;
-    const std::uint64_t remaining = header_->capacity - offset;
-
-    const bool wraps = message.size > remaining;
-    const std::uint64_t total_space_needed =
-        wraps ? remaining + message.size : message.size;
-
     const uint64_t slowest_reader = minimum_read_position();
+    const uint64_t next_position = writer_position + 1;
 
-    // Producer cannot pass slowest reader
-    if (writer_position + total_space_needed - slowest_reader > header_->capacity) {
+    // Producer at the moment cannot pass a slow reader?
+    // example max slots is 10, min reader is at 10 and new position is wrapping to 20
+    // will cause us to be writting over the reader.
+    if (next_position - slowest_reader > slots) {
         std::cerr << "writer cannot pass the slowest reader\n"; // kill the reader?
         return;
     }
 
+    const std::uint64_t slot_index = writer_position & slot_mask;
     // Cannot add offset to void* should I just make this a std::byte* by defualt?
     // or maybe go back to template SharedMemoryPtr? TODO:?
-    auto* next_segment = static_cast<std::byte*>(ptr_.ptr()) + sizeof(RTMSHeader) + offset;
+    auto* next_segment = static_cast<std::byte*>(ptr_.ptr()) + sizeof(RTMSHeader) + (slot_index * slot_size);
     std::memcpy(next_segment, message.data, message.size);
-
-    const uint64_t next_position = writer_position + header_->message_size;
     header_->writer.sequence.store(next_position, std::memory_order_release);
 }
 
