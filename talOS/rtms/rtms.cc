@@ -3,26 +3,81 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <stdexcept>
+#include "talOS/memory/shared_memory_ptr.h"
 
+RTMSQueue::RTMSQueue(
+        std::string_view path,
+        std::size_t slots,
+        std::size_t message_size,
+        std::size_t slot_alignment,
+        SharedMemoryMode mode)
+    : path_{path},
+    slots_{slots},
+    message_size_{message_size},
+    slot_alignment_{slot_alignment},
+    data_offset_{align_up(sizeof(RTMSHeader), slot_alignment)},
+    stride_{align_up(message_size, slot_alignment)},
+    total_bytes_{data_offset_ + stride_ * slots_},
+    ptr_{mode == SharedMemoryMode::CREATE
+         ? SharedMemoryPtr::create(path_, total_bytes_)
+         : SharedMemoryPtr::attach(path_, total_bytes_)} {
+    const std::size_t data_offset = align_up(sizeof(RTMSHeader), slot_alignment);
+    const std::size_t stride = align_up(message_size, slot_alignment);
 
+    if (!is_pow_2(slots)) {
+        throw std::invalid_argument("slots is not a power of 2!");
+    }
 
-RTMSQueue::RTMSQueue(std::string_view path,
-                     off_t slots,
-                     off_t message_size)
-    : path_(path),
-      message_size_(message_size),
-      ptr_(
-          path_.c_str(),
-          sizeof(RTMSHeader) + (slots * message_size_)) {
+    const std::size_t total_size = data_offset + stride * slots;
+    header_ = static_cast<RTMSHeader*>(ptr_.ptr());
 
-    header_ = reinterpret_cast<RTMSHeader*>(ptr_.ptr());
+    if (mode == SharedMemoryMode::CREATE) {
+        // Learned about this, pretty cool, it creates the object at preallocated memory
+        header_ = std::construct_at(
+            static_cast<RTMSHeader*>(ptr_.ptr())
+        );
 
-    header_->slots = slots;
-    header_->slot_size = message_size_;
+        header_->total_bytes = total_size;
+        header_->slots = slots;
+        header_->slot_bytes = message_size;
+        header_->slot_alignment = slot_alignment;
+
+        header_->data_offset = data_offset;
+        header_->slot_stride = stride;
+
+        header_->writer.sequence.store(0, std::memory_order_relaxed);
+    } else {
+        if (header_->slots != slots_ ||
+            header_->slot_bytes != message_size_ ||
+            header_->slot_alignment != slot_alignment_ ||
+            header_->total_bytes != total_bytes_) {
+            throw std::runtime_error("RTMS shared-memory layout mismatch");
+        }
+    }
+
+    //for (auto& reader : header_->readers) {
+    //    reader.sequence.store(0, std::memory_order_relaxed);
+    //    reader.state.store(ReaderState::FREE, std::memory_order_relaxed);
+    //}
 }
 
-RTMSQueue::RTMSQueue(std::string_view path, off_t message_size) :
-    RTMSQueue(path, MAX_SLOTS, message_size) {
+
+RTMSQueue RTMSQueue::create(
+    std::string_view path,
+    std::size_t message_size,
+    std::size_t slot_alignment,
+    std::size_t slots) {
+    return RTMSQueue{path, slots, message_size, slot_alignment, SharedMemoryMode::CREATE};
+}
+
+RTMSQueue RTMSQueue::attach(
+    std::string_view path,
+    std::size_t message_size,
+    std::size_t slot_alignment,
+    std::size_t slots) {
+    return RTMSQueue{path, slots, message_size, slot_alignment, SharedMemoryMode::ATTACH};
 }
 
 // Need to find out where the "slowest" reader is.
@@ -35,18 +90,16 @@ uint64_t RTMSQueue::minimum_read_position() const {
         if (state != ReaderState::ACTIVE) {
             continue;
         }
-        const auto position = header_->readers[i].sequence.load(std::memory_order::acquire);
+        const auto position = header_->readers[i].sequence.load(std::memory_order_acquire);
         minimum = std::min(minimum, position);
     }
     return minimum;
 }
 
 void RTMSQueue::write(const RTMSMessage& message) {
-    const std::uint64_t slot_size = header_->slot_size;
-    const std::uint64_t slots = header_->slots;
-    const std::uint64_t slot_mask = slots - 1;
+    const std::uint64_t slot_mask = slots_ - 1;
 
-    if (message.size > slot_size) {
+    if (message.size > slot_alignment_) {
         std::cerr << "Cannot write message larger than slot size\n";
         return;
     }
@@ -60,7 +113,7 @@ void RTMSQueue::write(const RTMSMessage& message) {
     // Producer at the moment cannot pass a slow reader?
     // example max slots is 10, min reader is at 10 and new position is wrapping to 20
     // will cause us to be writting over the reader.
-    if (next_position - slowest_reader > slots) {
+    if (next_position - slowest_reader > slots_) {
         std::cerr << "writer cannot pass the slowest reader\n"; // kill the reader?
         return;
     }
@@ -68,8 +121,38 @@ void RTMSQueue::write(const RTMSMessage& message) {
     const std::uint64_t slot_index = writer_position & slot_mask;
     // Cannot add offset to void* should I just make this a std::byte* by defualt?
     // or maybe go back to template SharedMemoryPtr? TODO:?
-    auto* next_segment = static_cast<std::byte*>(ptr_.ptr()) + sizeof(RTMSHeader) + (slot_index * slot_size);
+    auto* next_segment = static_cast<std::byte*>(ptr_.ptr()) + sizeof(RTMSHeader) + (slot_index * slot_alignment_);
     std::memcpy(next_segment, message.data, message.size);
     header_->writer.sequence.store(next_position, std::memory_order_release);
+}
+
+std::optional<std::size_t> RTMSQueue::register_reader() {
+    for (std::size_t i = 0; i < MAX_READERS; ++i) {
+        auto& reader = header_->readers[i];
+        ReaderState expected = ReaderState::FREE;
+
+        if (!reader.state.compare_exchange_strong(
+            expected,
+            ReaderState::CLAIMING,
+            std::memory_order_acq_rel,
+            std::memory_order_relaxed
+        )) {
+            continue;
+        }
+
+        const auto current = header_->writer.sequence.load(std::memory_order_acquire);
+
+        reader.sequence.store(
+            current,
+            std::memory_order_relaxed
+        );
+
+        reader.state.store(
+            ReaderState::ACTIVE,
+            std::memory_order_release
+        );
+        return i;
+    }
+    return std::nullopt;
 }
 
