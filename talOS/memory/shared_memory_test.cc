@@ -4,6 +4,6 @@
 
 TEST(SharedMemory, SharedMemoryPtr) {
     {
-        SharedMemoryPtr test("/tmp/rtms_test", 100);
+        SharedMemoryPtr test = SharedMemoryPtr::create("/tmp/rtms_test", 100);
     }
 }
