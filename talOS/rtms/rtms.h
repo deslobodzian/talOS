@@ -13,6 +13,7 @@
 #include <span>
 #include <concepts>
 #include "talOS/memory/shared_memory_ptr.h"
+#include <optional>
 #include <cinttypes>
 
 inline constexpr size_t CACHE_LINE = 64; // C++ I think as a function for this.

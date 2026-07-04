@@ -84,7 +84,7 @@ RTMSQueue RTMSQueue::attach(
 uint64_t RTMSQueue::minimum_read_position() const {
     std::uint64_t minimum = header_->writer.sequence.load(std::memory_order_relaxed);
 
-    for (int i = 0; i < MAX_READERS; ++i) {
+    for (std::size_t i = 0; i < MAX_READERS; ++i) {
         const auto state = header_->readers[i].state.load(std::memory_order_acquire);
         // Reader hasn't started yet, so position isn't relevent
         if (state != ReaderState::ACTIVE) {

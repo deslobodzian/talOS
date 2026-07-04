@@ -8,7 +8,11 @@
 #include <thread>
 
 TEST(SingleProcess, RTMS) {
+#if defined(__linux__)
+    auto path = "/rtms_test";
+#else
     auto path = "/tmp/rtms/test";
+#endif
 
     RTMSQueue queue = RTMSQueue::create(
         path,
@@ -42,7 +46,11 @@ TEST(SingleProcess, RTMS) {
 }
 
 TEST(WrapTest, RTMS) {
+#if defined(__linux__)
+    auto path = "/rtms_test";
+#else
     auto path = "/tmp/rtms/test";
+#endif
 
     RTMSQueue queue = RTMSQueue::create(
         path,
@@ -115,7 +123,11 @@ void ReadThread(std::string_view path, int reader, int iterations) {
 
 
 TEST(MutliReader, RTMS) {
-    auto path = "/tmp/rtms/test_multi";
+#if defined(__linux__)
+    auto path = "/rtms_test";
+#else
+    auto path = "/tmp/rtms/test";
+#endif
     remove(path);
     int iterations = 1000;
     std::promise<void> ready_promise;
