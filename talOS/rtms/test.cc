@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include "rtms.h"
 #include <flatbuffers/flatbuffers.h>
+#include <sched.h>
+#include <unistd.h>
 #include "talOS/rtms/test_message_generated.h"
 #include <random>
 #include <future>
@@ -109,14 +111,14 @@ void ReadThread(std::string_view path, int reader, int iterations) {
     if (reader_id) {
         std::printf("Reader ID: %lu\n", reader_id.value());
         for (int i = 0; i < iterations; ++i) {
-            //queue.read(
-            //    reader_id.value(),
-            //    [reader](std::span<const std::byte> bytes) {
-            //        Message::TestMessage new_fb{};
-            //        std::memcpy(&new_fb, bytes.data(), bytes.size());
-            //        std::printf("reader %i: new_fb: %i, %f\n", reader, new_fb.id(), new_fb.value());
-            //     }
-            //);
+            queue.read(
+                reader_id.value(),
+                [reader](std::span<const std::byte> bytes) {
+                    Message::TestMessage new_fb{};
+                    std::memcpy(&new_fb, bytes.data(), bytes.size());
+                    std::printf("reader %i: new_fb: %i, %f\n", reader, new_fb.id(), new_fb.value());
+                 }
+            );
         }
     }
 }
@@ -147,4 +149,12 @@ TEST(MutliReader, RTMS) {
             reader.join();
         }
     }
+
+    RTMSQueue queue = RTMSQueue::attach(
+        path,
+        sizeof(Message::TestMessage),
+        align_up(sizeof(Message::TestMessage), alignof(Message::TestMessage))
+    );
+
+    queue.print_header_state();
 }
