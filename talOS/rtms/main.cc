@@ -48,7 +48,11 @@ void ReadThread(std::string_view path, int reader, int iterations) {
 
 
 int main() {
-    auto path = "/tmp/rtms/test_multi";
+#if defined(__linux__)
+    auto path = "/dev/shm/rtms_test";
+#else
+    auto path = "/tmp/rtms/test";
+#endif
     remove(path);
     int iterations = 1000;
     std::promise<void> ready_promise;

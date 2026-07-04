@@ -3,7 +3,12 @@
 #include <gtest/gtest.h>
 
 TEST(SharedMemory, SharedMemoryPtr) {
+#if defined(__linux__)
+    auto path = "rtms_test";
+#else
+    auto path = "/tmp/rtms/test";
+#endif
     {
-        SharedMemoryPtr test = SharedMemoryPtr::create("/tmp/rtms_test", 100);
+        SharedMemoryPtr test = SharedMemoryPtr::create(path, 100);
     }
 }
