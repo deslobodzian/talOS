@@ -105,7 +105,7 @@ void RTMSQueue::write(const RTMSMessage& message) {
     }
 
     uint64_t writer_position = header_->writer.sequence.load(std::memory_order_relaxed);
-    std::printf("Writer position: %llu\n", writer_position);
+    //std::printf("Writer position: %llu\n", writer_position);
 
     const uint64_t slowest_reader = minimum_read_position();
     const uint64_t next_position = writer_position + 1;
