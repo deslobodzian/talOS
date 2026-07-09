@@ -15,7 +15,7 @@ public:
             RTMSQueue::create(
                 topic,
                 sizeof(Message),
-                align_up(sizeof(Message), alignof(Message)))
+                alignof(Message))
         } {
     }
 

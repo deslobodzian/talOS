@@ -6,10 +6,10 @@
  * Implementaion is based on https://csg.csail.mit.edu/6.823S17/StudyMaterials/quiz3/handouts/handout13-queue.pdf
 */
 
+#include <iostream>
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
-#include <iostream>
 #include <span>
 #include <concepts>
 #include "talOS/memory/shared_memory_ptr.h"
@@ -69,8 +69,8 @@ struct RTMSHeader {
     std::uint64_t total_bytes{0};
 
     std::uint64_t slots{0}; // power of 2 for efficiency
-    std::uint64_t slot_bytes{0}; // message size will be fixes for each buffer
-    std::uint64_t slot_alignment{0};
+    std::uint64_t message_bytes{0}; // message size will be fixes for each buffer
+    std::uint64_t message_alignment{0};
 
     std::uint64_t data_offset{0}; // offset from header
     std::uint64_t slot_stride{0};
@@ -79,11 +79,6 @@ struct RTMSHeader {
     Reader readers[MAX_READERS];
 };
 
-//template <typepath T>
-//concept NotDerivedFromTable = !std::is_base_of_v<flatbuffers::Table, T>;
-
-// flatbuffer message?
-//template <NotDerivedFromTable Message>
 template <typename F, class T = const std::byte>
 concept TakesSpan = std::invocable<F, std::span<T>>;
 
@@ -94,14 +89,14 @@ public:
     static RTMSQueue create(
         std::string_view path,
         std::size_t message_size,
-        std::size_t slot_alignment,
+        std::size_t message_alignment,
         std::size_t slots = MAX_SLOTS
     );
 
     static RTMSQueue attach(
         std::string_view path,
         std::size_t message_size,
-        std::size_t slot_alignment,
+        std::size_t message_alignment,
         std::size_t slots = MAX_SLOTS
     );
 
@@ -113,6 +108,7 @@ public:
 
     std::uint64_t minimum_read_position() const;
     std::optional<std::size_t> register_reader();
+    void release_reader(std::size_t id);
     void write(const RTMSMessage& message);
     // We want the option to have copy free interactions, as such we pass a functor
     // you are able to copy the data with the functor if you want or just do a quick operation and leave.
@@ -122,20 +118,21 @@ public:
         auto& reader = header_->readers[reader_id];
 
         std::uint64_t reader_position = reader.sequence.load(std::memory_order_relaxed);
-        //const std::uint64_t writer_position = header_->writer.sequence.load(std::memory_order_acquire);
+        const std::uint64_t writer_position = header_->writer.sequence.load(std::memory_order_acquire);
 
-        //if (reader_position == writer_position) {
-        //    std::cerr << "Reader and Writer at same position!\n";
-        //    return false;
-        //}
+        if (reader_position == writer_position) {
+            //std::cerr << "Reader and Writer at same position!\n";
+            return false;
+        }
 
         const uint64_t mask = header_->slots - 1;
         std::uint64_t slot_index = reader_position & mask;
+        const auto* base = static_cast<std::byte*>(ptr_.ptr());
 
         callback(
             std::span<const std::byte>{
-                static_cast<std::byte*>(ptr_.ptr()) + sizeof(RTMSHeader) + (slot_index * header_->slot_alignment),
-                header_->slot_alignment
+                base + header_->data_offset + (slot_index * header_->slot_stride),
+                header_->message_bytes
             }
         );
 
@@ -185,14 +182,14 @@ private:
         std::string_view path,
         std::size_t slots,
         std::size_t message_size,
-        std::size_t slot_alignment,
+        std::size_t message_alignment,
         SharedMemoryMode mode);
 
 
     std::string path_{""};
     std::uint64_t slots_{0};
     std::uint64_t message_size_{0};
-    std::uint64_t slot_alignment_{0};
+    std::uint64_t message_alignment_{0};
     std::uint64_t data_offset_{0};
     std::uint64_t stride_{0};
     std::uint64_t total_bytes_{0};
