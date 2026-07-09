@@ -1,0 +1,11 @@
+namespace IPCMessage;
+
+struct TestMessage {
+    id:int;
+    value:float;
+}
+
+struct TimeMessage {
+    id:int;
+    value:ulong;
+}

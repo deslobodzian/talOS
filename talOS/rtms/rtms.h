@@ -33,9 +33,12 @@ static inline bool is_pow_2(std::size_t n) {
 
 
 // Mesages will primarity be using flatbuffers but stored this RTMSMessage object
+// These are just views, we essentilaly will only copy the data into the queue
+// or we will copy the view out
+// TODO: read already uses std::span<const std::byte> should just remove this
 struct RTMSMessage {
     size_t size;
-    void* data;
+    const void* data;
 };
 
 enum class ReaderState : std::uint64_t {

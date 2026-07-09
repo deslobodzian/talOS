@@ -12,6 +12,7 @@ cc_library(
     name = "rtms",
     hdrs = ["rtms.h"],
     srcs = ["rtms.cc"],
+    visibility = ["//visibility:public"],
     deps = ["//talOS/memory:shared_memory"],
 )
 
