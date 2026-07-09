@@ -3,6 +3,7 @@
 #include <string>
 #include "talOS/rtms/rtms.h"
 #include <flatbuffers/flatbuffers.h>
+#include <optional>
 #include "concepts.h"
 
 namespace ipc {
@@ -16,27 +17,42 @@ public:
             RTMSQueue::attach(
                 topic_,
                 sizeof(Message),
-                align_up(sizeof(Message), alignof(Message)))
+                alignof(Message))
         } {
         reader_id_ = queue_.register_reader();
     }
 
-    Message read() {
+    Subscriber(const Subscriber&) = delete;
+    Subscriber operator=(const Subscriber&) = delete;
+
+    Subscriber(Subscriber&&) noexcept  = default;
+    Subscriber& operator=(Subscriber&& other) noexcept = default;
+
+
+    ~Subscriber() {
+        if (reader_id_) {
+            queue_.release_reader(reader_id_.value());
+        }
+    }
+
+
+    std::optional<Message> read() {
         Message msg{};
         if (reader_id_) {
-            queue_.read(
+            if (queue_.read(
                 reader_id_.value(),
                 [&msg](std::span<const std::byte> bytes) {
                     std::memcpy(&msg, bytes.data(), bytes.size());
                 }
-            );
+            )) {
+                return msg;
+            }
         }
-        return msg;
+        return std::nullopt;
     }
 private:
     std::string topic_;
     RTMSQueue queue_;
     std::optional<std::size_t> reader_id_;
-
 };
 } /* namespace ipc */

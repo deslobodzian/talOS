@@ -12,7 +12,7 @@ void WriteThread(std::string_view path, int iterations, std::promise<void> promi
     RTMSQueue queue = RTMSQueue::create(
         path,
         sizeof(Message::TimeMessage),
-        align_up(sizeof(Message::TimeMessage), alignof(Message::TimeMessage))
+        alignof(Message::TimeMessage)
     );
 
     promise.set_value();
@@ -32,7 +32,7 @@ void ReadThread(std::string_view path, int reader, int iterations) {
     RTMSQueue queue = RTMSQueue::attach(
         path,
         sizeof(Message::TimeMessage),
-        align_up(sizeof(Message::TimeMessage), alignof(Message::TimeMessage))
+        alignof(Message::TimeMessage)
     );
     auto reader_id = queue.register_reader();
 

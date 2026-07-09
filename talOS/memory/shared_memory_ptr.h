@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <format>
 #include <sys/stat.h>
 #include <cstring>
 
@@ -32,6 +33,10 @@ public:
 
     ~SharedMemoryPtr() {
         reset();
+        // If our create ptr dies remove shared memory
+        if (mode_ == SharedMemoryMode::CREATE) {
+            shm_unlink(shm_name_.c_str());
+        }
     }
 
     SharedMemoryPtr(const SharedMemoryPtr&) = delete;
@@ -90,7 +95,7 @@ private:
                 oflag = O_CREAT | O_RDWR | O_EXCL;
                 shm_fd = shm_open(shm_name_.c_str(), oflag, 0666);
                 if (shm_fd == -1) {
-                    std::perror("shm_open failed on create");
+                    std::perror(std::format("shm_open failed on create for {}", shm_name_).c_str());
                     return -1;
                 }
 
@@ -109,7 +114,7 @@ private:
                 shm_fd = shm_open(shm_name_.c_str(), oflag, 0666);
 
                 if (shm_fd == -1) {
-                    std::perror("shm_open failed on create");
+                    std::perror(std::format("shm_open failed on attach for {}", shm_name_).c_str());
                     return -1;
                 }
 
