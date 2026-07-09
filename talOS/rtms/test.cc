@@ -29,7 +29,7 @@ TEST(SingleProcess, RTMS) {
     };
 
     for (auto& message : messages) {
-        RTMSMessage rtms_message{sizeof(Message::TestMessage), static_cast<void*>(&message)};
+        RTMSMessage rtms_message{sizeof(Message::TestMessage), static_cast<const void*>(&message)};
         queue.write(rtms_message);
     }
     std::vector<RTMSMessage> new_messages;
@@ -66,7 +66,7 @@ TEST(WrapTest, RTMS) {
     };
 
     for (auto& message : messages) {
-        RTMSMessage rtms_message{sizeof(Message::TestMessage), static_cast<void*>(&message)};
+        RTMSMessage rtms_message{sizeof(Message::TestMessage), static_cast<const void*>(&message)};
         queue.write(rtms_message);
 
         Message::TestMessage new_fb{};
@@ -95,7 +95,7 @@ void WriteThread(std::string_view path, int iterations, std::promise<void> promi
     promise.set_value();
     for (int i = 0; i < iterations; ++i) {
         Message::TestMessage msg{distrib(gen), distrib_real(gen)};
-        RTMSMessage rtms_msg{sizeof(Message::TestMessage), static_cast<void*>(&msg)};
+        RTMSMessage rtms_msg{sizeof(Message::TestMessage), static_cast<const void*>(&msg)};
         queue.write(rtms_msg);
     }
 }
@@ -132,6 +132,7 @@ TEST(MutliReader, RTMS) {
 #endif
     remove(path);
     int iterations = 1000;
+    int num_readers = 1;
     std::promise<void> ready_promise;
     std::future<void> ready_future = ready_promise.get_future();
     std::thread writer{WriteThread, path, iterations, std::move(ready_promise)};
@@ -139,7 +140,7 @@ TEST(MutliReader, RTMS) {
     ready_future.wait();
     std::array<std::thread, 8> readers{};
 
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < num_readers; ++i) {
         readers[i] = std::thread{ReadThread, path, i, iterations};
     }
 

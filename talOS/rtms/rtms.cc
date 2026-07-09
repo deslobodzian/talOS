@@ -100,7 +100,9 @@ void RTMSQueue::write(const RTMSMessage& message) {
     const std::uint64_t slot_mask = slots_ - 1;
 
     if (message.size > slot_alignment_) {
-        std::cerr << "Cannot write message larger than slot size\n";
+        std::cerr << "Cannot write message larger than slot size\n" <<
+            "slot_alignment_: " << slot_alignment_<<
+            " > message_size: " << message.size << "\n";
         return;
     }
 
