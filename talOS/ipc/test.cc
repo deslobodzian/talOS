@@ -21,3 +21,8 @@ TEST(PubSubTest, IPC) {
     EXPECT_EQ(msg, message);
 }
 
+TEST(SubThenPub, IPC) {
+    ipc::Subscriber<IPCMessage::TestMessage> sub{"/test"};
+    ipc::Publisher<IPCMessage::TestMessage> pub{"/test"};
+}
+

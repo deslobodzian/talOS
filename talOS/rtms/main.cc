@@ -9,11 +9,11 @@ void WriteThread(std::string_view path, int iterations, std::promise<void> promi
     std::random_device rd;  // a seed source for the random number engine
     std::mt19937 gen(rd()); // mersenne_twister_engine seeded with rd()
     std::uniform_int_distribution<> distrib(1, 100);
-    RTMSQueue queue = RTMSQueue::create(
+    RTMSQueue queue{
         path,
         sizeof(Message::TimeMessage),
         alignof(Message::TimeMessage)
-    );
+    };
 
     promise.set_value();
     for (int i = 0; i < iterations; ++i) {
@@ -29,11 +29,11 @@ void WriteThread(std::string_view path, int iterations, std::promise<void> promi
 }
 
 void ReadThread(std::string_view path, int reader, int iterations) {
-    RTMSQueue queue = RTMSQueue::attach(
+    RTMSQueue queue{
         path,
         sizeof(Message::TimeMessage),
         alignof(Message::TimeMessage)
-    );
+    };
     auto reader_id = queue.register_reader();
 
     if (reader_id) {

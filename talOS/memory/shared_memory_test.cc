@@ -9,6 +9,6 @@ TEST(SharedMemory, SharedMemoryPtr) {
     auto path = "/tmp/rtms/test";
 #endif
     {
-        SharedMemoryPtr test = SharedMemoryPtr::create(path, 100);
+        SharedMemoryPtr test{path, 100};
     }
 }

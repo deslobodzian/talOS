@@ -9,9 +9,10 @@
 
 #include "talOS/memory/shared_memory_ptr.h"
 
-RTMSQueue::RTMSQueue(std::string_view path, std::size_t slots,
-                     std::size_t message_size, std::size_t message_alignment,
-                     SharedMemoryMode mode)
+RTMSQueue::RTMSQueue(std::string_view path,
+                     std::size_t message_size,
+                     std::size_t message_alignment,
+                     std::size_t slots)
     : path_{path},
       slots_{slots},
       message_size_{message_size},
@@ -19,16 +20,14 @@ RTMSQueue::RTMSQueue(std::string_view path, std::size_t slots,
       data_offset_{align_up(sizeof(RTMSHeader), message_alignment)},
       stride_{align_up(message_size, message_alignment)},
       total_bytes_{data_offset_ + stride_ * slots_},
-      ptr_{mode == SharedMemoryMode::CREATE
-               ? SharedMemoryPtr::create(path_, total_bytes_)
-               : SharedMemoryPtr::attach(path_, total_bytes_)} {
+      ptr_{path_, total_bytes_} {
   if (!is_pow_2(slots)) {
     throw std::invalid_argument("slots is not a power of 2!");
   }
 
   const std::size_t total_size = data_offset_ + stride_ * slots;
 
-  if (mode == SharedMemoryMode::CREATE) {
+  if (ptr_.mode() == SharedMemoryMode::CREATE) {
     // Learned about this, pretty cool, it creates the object at preallocated
     // memory
     header_ = std::construct_at(static_cast<RTMSHeader*>(ptr_.ptr()));
@@ -54,18 +53,6 @@ RTMSQueue::RTMSQueue(std::string_view path, std::size_t slots,
       throw std::runtime_error("RTMS shared-memory layout mismatch");
     }
   }
-}
-
-RTMSQueue RTMSQueue::create(std::string_view path, std::size_t message_size,
-                            std::size_t message_alignment, std::size_t slots) {
-  return RTMSQueue{path, slots, message_size, message_alignment,
-                   SharedMemoryMode::CREATE};
-}
-
-RTMSQueue RTMSQueue::attach(std::string_view path, std::size_t message_size,
-                            std::size_t message_alignment, std::size_t slots) {
-  return RTMSQueue{path, slots, message_size, message_alignment,
-                   SharedMemoryMode::ATTACH};
 }
 
 // Need to find out where the "slowest" reader is.
@@ -146,6 +133,6 @@ std::optional<std::size_t> RTMSQueue::register_reader() {
 }
 
 void RTMSQueue::release_reader(std::size_t id) {
-    auto& reader = header_->readers[id];
-    reader.state.store(ReaderState::FREE, std::memory_order_release);
+  auto& reader = header_->readers[id];
+  reader.state.store(ReaderState::FREE, std::memory_order_release);
 }
