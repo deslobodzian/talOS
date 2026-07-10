@@ -86,14 +86,7 @@ concept TakesSpan = std::invocable<F, std::span<T>>;
 // be set here or be generic for any data?
 class RTMSQueue {
 public:
-    static RTMSQueue create(
-        std::string_view path,
-        std::size_t message_size,
-        std::size_t message_alignment,
-        std::size_t slots = MAX_SLOTS
-    );
-
-    static RTMSQueue attach(
+    RTMSQueue(
         std::string_view path,
         std::size_t message_size,
         std::size_t message_alignment,
@@ -178,14 +171,6 @@ public:
     }
 
 private:
-    RTMSQueue(
-        std::string_view path,
-        std::size_t slots,
-        std::size_t message_size,
-        std::size_t message_alignment,
-        SharedMemoryMode mode);
-
-
     std::string path_{""};
     std::uint64_t slots_{0};
     std::uint64_t message_size_{0};

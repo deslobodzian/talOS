@@ -19,8 +19,11 @@ TEST(SingleProcess, RTMS) {
     auto path = "/tmp/rtms/test";
 #endif
 
-    RTMSQueue queue = RTMSQueue::create(path, sizeof(Message::TestMessage),
-                                        alignof(Message::TestMessage));
+    RTMSQueue queue{
+        path,
+        sizeof(Message::TestMessage),
+        alignof(Message::TestMessage)
+    };
 
     auto messages = std::array{
         Message::TestMessage{10, 200},
@@ -52,8 +55,10 @@ TEST(WrapTest, RTMS) {
     auto path = "/tmp/rtms/test";
 #endif
 
-    RTMSQueue queue = RTMSQueue::create(path, sizeof(Message::TestMessage),
-                                        alignof(Message::TestMessage));
+    RTMSQueue queue{path,
+        sizeof(Message::TestMessage),
+        alignof(Message::TestMessage)
+    };
     auto messages = std::array{
         Message::TestMessage{10, 200},
         Message::TestMessage{23, 23.2},
@@ -80,8 +85,11 @@ void WriteThread(std::string_view path, int iterations,
     std::mt19937 gen(rd());  // mersenne_twister_engine seeded with rd()
     std::uniform_int_distribution<> distrib(1, 100);
     std::uniform_real_distribution<float> distrib_real(0.0, 300.0);
-    RTMSQueue queue = RTMSQueue::attach(path, sizeof(Message::TestMessage),
-                                        alignof(Message::TestMessage));
+    RTMSQueue queue{
+        path,
+        sizeof(Message::TestMessage),
+        alignof(Message::TestMessage)
+    };
 
     start_signal.wait();
     for (int i = 0; i < iterations; ++i) {
@@ -98,8 +106,11 @@ void ReadThread(
     int iterations,
     std::latch& readers_ready,
     const std::shared_future<void>& start_signal) {
-    RTMSQueue queue = RTMSQueue::attach(path, sizeof(Message::TestMessage),
-                                        alignof(Message::TestMessage));
+    RTMSQueue queue{
+        path,
+        sizeof(Message::TestMessage),
+        alignof(Message::TestMessage)
+    };
     auto reader_id = queue.register_reader();
     ASSERT_TRUE(reader_id.has_value());
     std::printf("Reader ID: %lu\n", reader_id.value());
@@ -126,8 +137,11 @@ TEST(MutliReader, RTMS) {
     constexpr int iterations = 1000;
     constexpr int num_readers = 4;
 
-    RTMSQueue owner = RTMSQueue::create(path, sizeof(Message::TestMessage),
-                                        alignof(Message::TestMessage));
+    RTMSQueue owner{
+        path,
+        sizeof(Message::TestMessage),
+        alignof(Message::TestMessage)
+    };
 
     std::latch readers_ready{num_readers};
     std::promise<void> start_promise;

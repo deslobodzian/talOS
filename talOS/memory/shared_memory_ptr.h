@@ -3,6 +3,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <cerrno>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
@@ -21,14 +22,12 @@ enum class SharedMemoryMode {
 
 class SharedMemoryPtr {
 public:
-    static SharedMemoryPtr create(std::string_view name, std::size_t size) {
-        std::printf("Creating shared memory ptr SharedMemoryMode::CREATE\n");
-        return{name, size, SharedMemoryMode::CREATE};
-    }
-
-    static SharedMemoryPtr attach(std::string_view name, std::size_t size) {
-        std::printf("Creating shared memory ptr SharedMemoryMode::ATTACH\n");
-        return{name, size, SharedMemoryMode::ATTACH};
+    SharedMemoryPtr(std::string_view name, std::size_t size) :
+        shm_name_(name),
+        size_(size) {
+        if (map_ptr() < 0) {
+            throw std::runtime_error("Failed to attach ptr!");
+        }
     }
 
     ~SharedMemoryPtr() {
@@ -63,16 +62,11 @@ public:
         return ptr_;
     }
 
-private:
-    SharedMemoryPtr(std::string_view name, std::size_t size, SharedMemoryMode mode) :
-        shm_name_(name),
-        size_(size),
-        mode_(mode) {
-        if (map_ptr() < 0) {
-            throw std::runtime_error("Failed to attach ptr!");
-        }
+    SharedMemoryMode mode() const {
+        return mode_;
     }
 
+private:
     static off_t to_off_t(std::size_t size) {
         constexpr auto max_off_t =
             static_cast<std::size_t>(std::numeric_limits<off_t>::max());
@@ -83,17 +77,33 @@ private:
 
     }
 
+    void create_or_attach_shm_map(
+        int& shm_fd,
+        SharedMemoryMode& shm_mode,
+        const char* name,
+        int oflag,
+        mode_t mode) {
+        shm_fd = shm_open(name, oflag, mode);
+        if (shm_fd == -1) {
+            if (errno == EEXIST) {
+                shm_mode = SharedMemoryMode::ATTACH;
+                create_or_attach_shm_map(shm_fd, shm_mode, name, O_RDWR, mode);
+            }
+        }
+    }
+
 
     int map_ptr() {
         int shm_fd = -1;
         int oflag = -1;
         const off_t file_size = to_off_t(size_);
 
+        oflag = O_CREAT | O_RDWR | O_EXCL;
+        create_or_attach_shm_map(shm_fd, mode_, shm_name_.c_str(), oflag, 0666);
+
+
         switch (mode_) {
             case SharedMemoryMode::CREATE:
-                shm_unlink(shm_name_.c_str());
-                oflag = O_CREAT | O_RDWR | O_EXCL;
-                shm_fd = shm_open(shm_name_.c_str(), oflag, 0666);
                 if (shm_fd == -1) {
                     std::perror(std::format("shm_open failed on create for {}", shm_name_).c_str());
                     return -1;
@@ -162,6 +172,6 @@ private:
     }
     std::string shm_name_{"error"};
     std::size_t size_{0};
-    SharedMemoryMode mode_;
+    SharedMemoryMode mode_{SharedMemoryMode::CREATE};
     void* ptr_ = nullptr;
 };

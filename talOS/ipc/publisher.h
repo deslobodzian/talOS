@@ -12,10 +12,9 @@ class Publisher {
 public:
     explicit Publisher(std::string_view topic) : topic_{topic},
         queue_{
-            RTMSQueue::create(
-                topic,
-                sizeof(Message),
-                alignof(Message))
+            topic,
+            sizeof(Message),
+            alignof(Message)
         } {
     }
 
