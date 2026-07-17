@@ -1150,7 +1150,11 @@ class Fdcanusb : public details::TimeoutTransport {
 #ifdef B4000000
       case 4000000: return B4000000;
 #endif
-      default: return B921600;
+#ifdef __APPLE__
+      default: return B115200;
+#else
+      default: return B921600; //921600 not found on macOS
+#endif
     }
   }
 
