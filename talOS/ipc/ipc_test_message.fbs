@@ -8,4 +8,5 @@ struct TestMessage {
 struct TimeMessage {
     id:int;
     value:ulong;
+    padding:[ubyte:192];
 }

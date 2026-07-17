@@ -33,6 +33,8 @@ void calculate_metrics(
 
   std::cout << "Average time (ns): " << avg_ns << '\n';
   std::cout << "Average time (s):  " << avg_s << '\n';
+  std::cout << "Message average thoughput (Gb/s): " << sizeof(IPCMessage::TimeMessage) / (avg_s * 1e9) << "\n";
+  std::cout << "Message thoughput: " << 1.0 / avg_s << "\n";
 }
 
 IPCTestParameters args_parse(int argc, char** argv) {
@@ -105,10 +107,10 @@ int main(int argc, char** argv) {
       auto latency = std::chrono::duration_cast<std::chrono::nanoseconds>(
           stop - sent_time);
 
-      //std::cout
-      //    << "Message: [" << fb_msg.id()
-      //    << "] | [" << fb_msg.value()
-      //    << "] -- Latency: [" << latency.count() << " ns]\n";
+      // std::cout
+      //     << "Message: [" << fb_msg.id()
+      //     << "] | [" << fb_msg.value()
+      //     << "] -- Latency: [" << latency.count() << " ns]\n";
 
       read_durations.push_back(read_duration);
       latencies.push_back(latency);
