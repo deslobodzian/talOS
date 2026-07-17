@@ -1116,6 +1116,9 @@ class Fdcanusb : public details::TimeoutTransport {
   }
 
   static speed_t BaudToSpeed(int baudrate) {
+#ifdef __APPLE__
+        return static_cast<speed_t>(baudrate);
+#else
     switch (baudrate) {
       case 9600: return B9600;
       case 19200: return B19200;
@@ -1156,6 +1159,7 @@ class Fdcanusb : public details::TimeoutTransport {
       default: return B921600; //921600 not found on macOS
 #endif
     }
+#endif
   }
 
   // This is set in the parent, then used in the child.
