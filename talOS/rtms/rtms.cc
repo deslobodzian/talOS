@@ -12,7 +12,9 @@
 RTMSQueue::RTMSQueue(std::string_view path,
                      std::size_t message_size,
                      std::size_t message_alignment,
-                     std::size_t slots)
+                     std::size_t slots,
+                     RTMSOptions options
+                     )
     : path_{path},
       slots_{slots},
       message_size_{message_size},
@@ -20,6 +22,7 @@ RTMSQueue::RTMSQueue(std::string_view path,
       data_offset_{align_up(sizeof(RTMSHeader), message_alignment)},
       stride_{align_up(message_size, message_alignment)},
       total_bytes_{data_offset_ + stride_ * slots_},
+      options_{options},
       ptr_{path_, total_bytes_} {
   if (!is_pow_2(slots)) {
     throw std::invalid_argument("slots is not a power of 2!");
@@ -74,14 +77,14 @@ uint64_t RTMSQueue::minimum_read_position() const {
   return minimum;
 }
 
-void RTMSQueue::write(const RTMSMessage& message) {
+WriteResult RTMSQueue::write(const RTMSMessage& message) {
   const std::uint64_t slot_mask = slots_ - 1;
 
   if (message.size > header_->message_bytes) {
     std::cerr << "Cannot write message larger than slot size\n"
               << "message_bytes: " << header_->message_bytes
               << " > message_size: " << message.size << "\n";
-    return;
+    return WriteResult::ERROR_SIZE_MISSMATCH;
   }
 
   uint64_t writer_position =
@@ -96,7 +99,7 @@ void RTMSQueue::write(const RTMSMessage& message) {
   // to 20 will cause us to be writting over the reader.
   if (next_position - slowest_reader > slots_) {
     std::cerr << "writer cannot pass the slowest reader\n";  // kill the reader?
-    return;
+    return WriteResult::BUFFER_FULL;
   }
 
   const std::uint64_t slot_index = writer_position & slot_mask;
@@ -108,6 +111,7 @@ void RTMSQueue::write(const RTMSMessage& message) {
 
   std::memcpy(next_segment, message.data, message.size);
   header_->writer.sequence.store(next_position, std::memory_order_release);
+  return WriteResult::SUCCESS;
 }
 
 std::optional<std::size_t> RTMSQueue::register_reader() {

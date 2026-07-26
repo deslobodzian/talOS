@@ -6,7 +6,6 @@
  * Implementaion is based on https://csg.csail.mit.edu/6.823S17/StudyMaterials/quiz3/handouts/handout13-queue.pdf
 */
 
-#include <iostream>
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
@@ -45,6 +44,30 @@ enum class ReaderState : std::uint64_t {
     FREE,
     CLAIMING,
     ACTIVE
+};
+
+enum class WriteResult {
+    SUCCESS,
+    FAILURE,
+    BUFFER_FULL,
+    ERROR_SIZE_MISSMATCH,
+};
+
+// For when a reader becomes too slow and our buffer is full
+enum class OverflowPolicy {
+    DROP_NEWEST,
+    OVERWRITE_OLDEST,
+    REMOVE_SLOWEST_READER
+};
+
+enum class ReadMode {
+    LATEST,
+    SEQUENCE,
+};
+
+struct RTMSOptions {
+    OverflowPolicy overflow_policy{OverflowPolicy::OVERWRITE_OLDEST};
+    ReadMode read_mode{ReadMode::LATEST};
 };
 
 constexpr const char* to_string(ReaderState state) noexcept {
@@ -90,7 +113,8 @@ public:
         std::string_view path,
         std::size_t message_size,
         std::size_t message_alignment,
-        std::size_t slots = MAX_SLOTS
+        std::size_t slots = MAX_SLOTS,
+        RTMSOptions options = RTMSOptions{}
     );
 
     RTMSQueue(RTMSQueue&&) noexcept = default;
@@ -102,38 +126,64 @@ public:
     std::uint64_t minimum_read_position() const;
     std::optional<std::size_t> register_reader();
     void release_reader(std::size_t id);
-    void write(const RTMSMessage& message);
+    WriteResult write(const RTMSMessage& message);
     // We want the option to have copy free interactions, as such we pass a functor
     // you are able to copy the data with the functor if you want or just do a quick operation and leave.
     // e.i schedule an action based on the results of the message.
     template<TakesSpan Callback>
     bool read(std::uint64_t reader_id, Callback&& callback) {
-        auto& reader = header_->readers[reader_id];
-
-        std::uint64_t reader_position = reader.sequence.load(std::memory_order_relaxed);
-        const std::uint64_t writer_position = header_->writer.sequence.load(std::memory_order_acquire);
-
-        if (reader_position == writer_position) {
-            //std::cerr << "Reader and Writer at same position!\n";
+        if (reader_id >= MAX_READERS) {
             return false;
         }
 
-        const uint64_t mask = header_->slots - 1;
-        std::uint64_t slot_index = reader_position & mask;
-        const auto* base = static_cast<std::byte*>(ptr_.ptr());
+        auto& reader = header_->readers[reader_id];
+
+        if (reader.state.load(std::memory_order_acquire) !=
+            ReaderState::ACTIVE) {
+            return false;
+        }
+
+        std::uint64_t reader_position =
+            reader.sequence.load(std::memory_order_relaxed);
+
+        const std::uint64_t writer_position =
+            header_->writer.sequence.load(std::memory_order_acquire);
+
+        // reader.sequence and writer.sequence both refer to the next sequence.
+        if (reader_position == writer_position) {
+            return false;
+        }
+
+        const std::uint64_t mask = header_->slots - 1;
+
+        std::uint64_t message_sequence = reader_position;
+
+        if (options_.read_mode == ReadMode::LATEST) {
+            message_sequence = writer_position - 1;
+        }
+
+        const std::uint64_t slot_index =
+            message_sequence & mask;
+
+        const auto* base =
+            static_cast<const std::byte*>(ptr_.ptr());
 
         callback(
             std::span<const std::byte>{
-                base + header_->data_offset + (slot_index * header_->slot_stride),
+                base +
+                    header_->data_offset +
+                    slot_index * header_->slot_stride,
                 header_->message_bytes
-            }
-        );
+            });
 
-        reader.sequence.store(reader_position + 1, std::memory_order_release);
+        // The cursor always points to the next sequence to consume.
+        reader.sequence.store(
+            message_sequence + 1,
+            std::memory_order_release);
 
         return true;
-
     }
+
     size_t message_size() const { return message_size_; }
     std::string_view path() const { return path_; }
 
@@ -178,6 +228,8 @@ private:
     std::uint64_t data_offset_{0};
     std::uint64_t stride_{0};
     std::uint64_t total_bytes_{0};
+
+    RTMSOptions options_{};
 
     RTMSHeader* header_{nullptr};
     SharedMemoryPtr ptr_;

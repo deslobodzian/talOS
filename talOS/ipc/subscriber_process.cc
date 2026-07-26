@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
   auto params = args_parse(argc, argv);
   using Clock = std::chrono::steady_clock;
 
-  std::printf("Running publisher process:\n  Time: %ld\n  Topic: %s\n",
+  std::printf("Running subscriber process:\n  Time: %ld\n  Topic: %s\n",
               params.duration.count(), params.topic.c_str());
 
   ipc::Subscriber<IPCMessage::TimeMessage> sub{params.topic};
