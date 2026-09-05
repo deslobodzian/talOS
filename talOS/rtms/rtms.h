@@ -53,6 +53,39 @@ enum class WriteResult {
     ERROR_SIZE_MISSMATCH,
 };
 
+// Result of a write plus the sequence the message was published under.
+// `sequence` is only meaningful when `result == WriteResult::SUCCESS`.
+// Implicitly converts to WriteResult so existing call sites keep working.
+struct WriteStatus {
+    WriteResult result{WriteResult::FAILURE};
+    std::uint64_t sequence{0};
+
+    explicit constexpr operator WriteResult() const noexcept { return result; }
+
+    friend constexpr bool operator==(
+        const WriteStatus& status,
+        WriteResult result) noexcept {
+        return status.result == result;
+    }
+};
+
+enum class ReadResult {
+    OK,
+    EMPTY,        // Caught up with the writer, nothing new.
+    INACTIVE,     // Reader slot is not registered.
+    INVALID,      // Reader id out of range or destination too small.
+    TORN,         // Writer lapped us mid-copy too many times to recover.
+};
+
+// Metadata that accompanies a message handed to a reader.
+// `dropped` counts messages the reader skipped past without observing, either
+// because the writer lapped it (OVERWRITE_OLDEST) or because ReadMode::LATEST
+// intentionally jumps to the newest message.
+struct MessageInfo {
+    std::uint64_t sequence{0};
+    std::uint64_t dropped{0};
+};
+
 // For when a reader becomes too slow and our buffer is full
 enum class OverflowPolicy {
     DROP_NEWEST,
@@ -126,10 +159,43 @@ public:
     std::uint64_t minimum_read_position() const;
     std::optional<std::size_t> register_reader();
     void release_reader(std::size_t id);
-    WriteResult write(const RTMSMessage& message);
+    WriteStatus write(const RTMSMessage& message);
+
+    // Copies the next message for `reader_id` into `destination` and reports
+    // its sequence plus how many messages were skipped to get there.
+    //
+    // Unlike read(), this is safe against a writer that laps the reader: the
+    // slot is copied first and the copy is only accepted if the writer did not
+    // reach it during the copy (a seqlock, using the writer sequence that the
+    // frozen shared-memory layout already provides).
+    ReadResult read_next(
+        std::uint64_t reader_id,
+        std::span<std::byte> destination,
+        MessageInfo& info);
+
+    std::uint64_t writer_sequence() const {
+        return header_->writer.sequence.load(std::memory_order_acquire);
+    }
+
+    std::uint64_t reader_sequence(std::uint64_t reader_id) const {
+        return header_->readers[reader_id].sequence.load(
+            std::memory_order_acquire);
+    }
+
+    std::uint64_t slots() const { return slots_; }
     // We want the option to have copy free interactions, as such we pass a functor
     // you are able to copy the data with the functor if you want or just do a quick operation and leave.
     // e.i schedule an action based on the results of the message.
+    // Zero-copy read. The callback is handed a view directly into shared
+    // memory, so with OverflowPolicy::OVERWRITE_OLDEST the writer may lap the
+    // reader while the callback runs. The overwrite is detected afterwards and
+    // the callback is retried, so:
+    //
+    //   the callback MUST NOT commit side effects; only data copied out of a
+    //   read() that returned true is valid.
+    //
+    // read_next() has no such caveat and reports dropped messages, so prefer
+    // it unless the copy genuinely matters.
     template<TakesSpan Callback>
     bool read(std::uint64_t reader_id, Callback&& callback) {
         if (reader_id >= MAX_READERS) {
@@ -143,45 +209,32 @@ public:
             return false;
         }
 
-        std::uint64_t reader_position =
-            reader.sequence.load(std::memory_order_relaxed);
+        for (int attempt = 0; attempt < MAX_READ_ATTEMPTS; ++attempt) {
+            MessageInfo info{};
 
-        const std::uint64_t writer_position =
-            header_->writer.sequence.load(std::memory_order_acquire);
+            if (!select_sequence(reader, info)) {
+                return false;
+            }
 
-        // reader.sequence and writer.sequence both refer to the next sequence.
-        if (reader_position == writer_position) {
-            return false;
+            callback(
+                std::span<const std::byte>{
+                    slot_address(info.sequence),
+                    header_->message_bytes
+                });
+
+            if (!slot_still_valid(info.sequence)) {
+                continue;
+            }
+
+            // The cursor always points to the next sequence to consume.
+            reader.sequence.store(
+                info.sequence + 1,
+                std::memory_order_release);
+
+            return true;
         }
 
-        const std::uint64_t mask = header_->slots - 1;
-
-        std::uint64_t message_sequence = reader_position;
-
-        if (options_.read_mode == ReadMode::LATEST) {
-            message_sequence = writer_position - 1;
-        }
-
-        const std::uint64_t slot_index =
-            message_sequence & mask;
-
-        const auto* base =
-            static_cast<const std::byte*>(ptr_.ptr());
-
-        callback(
-            std::span<const std::byte>{
-                base +
-                    header_->data_offset +
-                    slot_index * header_->slot_stride,
-                header_->message_bytes
-            });
-
-        // The cursor always points to the next sequence to consume.
-        reader.sequence.store(
-            message_sequence + 1,
-            std::memory_order_release);
-
-        return true;
+        return false;
     }
 
     size_t message_size() const { return message_size_; }
@@ -221,6 +274,20 @@ public:
     }
 
 private:
+    // Number of times a read retries when the writer laps it mid-read.
+    static constexpr int MAX_READ_ATTEMPTS = 8;
+
+    // Chooses the sequence this reader should observe next and fills in how
+    // many messages were skipped to reach it. Returns false when the reader is
+    // caught up with the writer.
+    bool select_sequence(const Reader& reader, MessageInfo& info) const;
+
+    // True when the writer has not yet reached the slot backing
+    // `message_sequence`, i.e. the bytes just read were not overwritten.
+    bool slot_still_valid(std::uint64_t message_sequence) const;
+
+    const std::byte* slot_address(std::uint64_t message_sequence) const;
+
     std::string path_{""};
     std::uint64_t slots_{0};
     std::uint64_t message_size_{0};

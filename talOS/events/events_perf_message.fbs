@@ -1,0 +1,9 @@
+namespace EventsPerf;
+
+// Carries the publish timestamp so a subscriber can measure end-to-end
+// transport latency against its own reading of the same monotonic clock.
+struct PerfMessage {
+    sequence:ulong;
+    sent_ns:long;
+    payload:[ubyte:64];
+}

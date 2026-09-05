@@ -1,0 +1,21 @@
+namespace EventsTest;
+
+// Sensor reading published into the loop under test.
+struct SensorMessage {
+    id:int;
+    position:float;
+    velocity:float;
+}
+
+// Operator setpoint, read with a fetcher (latest value wins).
+struct SetpointMessage {
+    id:int;
+    target:float;
+}
+
+// What the control loop produces. Replay compares these byte for byte.
+struct CommandMessage {
+    id:int;
+    effort:float;
+    cycle:ulong;
+}

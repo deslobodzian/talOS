@@ -41,17 +41,24 @@ public:
     SharedMemoryPtr(const SharedMemoryPtr&) = delete;
     SharedMemoryPtr& operator=(const SharedMemoryPtr&) = delete;
 
+    // The moved-from object is left as an ATTACH so that its destructor does
+    // not unlink the shared memory the moved-to object now owns.
     SharedMemoryPtr(SharedMemoryPtr&& other) noexcept
         : shm_name_(std::move(other.shm_name_)),
         size_(std::exchange(other.size_, 0)),
+        mode_(std::exchange(other.mode_, SharedMemoryMode::ATTACH)),
         ptr_(std::exchange(other.ptr_, nullptr)) {
     }
 
     SharedMemoryPtr& operator=(SharedMemoryPtr&& other) noexcept {
         if (this != &other) {
             reset();
+            if (mode_ == SharedMemoryMode::CREATE) {
+                shm_unlink(shm_name_.c_str());
+            }
             shm_name_ = std::move(other.shm_name_);
             size_ = std::exchange(other.size_, 0);
+            mode_ = std::exchange(other.mode_, SharedMemoryMode::ATTACH);
             ptr_ = std::exchange(other.ptr_, nullptr);
         }
         return *this;
@@ -59,6 +66,10 @@ public:
 
 
     void* ptr() {
+        return ptr_;
+    }
+
+    const void* ptr() const {
         return ptr_;
     }
 
@@ -120,17 +131,33 @@ private:
 
                 break;
             case SharedMemoryMode::ATTACH:
-                oflag = O_RDWR;
-                shm_fd = shm_open(shm_name_.c_str(), oflag, 0666);
+                // create_or_attach_shm_map already opened the object on the
+                // EEXIST path; only open again if it did not.
+                if (shm_fd == -1) {
+                    oflag = O_RDWR;
+                    shm_fd = shm_open(shm_name_.c_str(), oflag, 0666);
+                }
 
                 if (shm_fd == -1) {
                     std::perror(std::format("shm_open failed on attach for {}", shm_name_).c_str());
                     return -1;
                 }
 
+                // Mapping more than the creator allocated faults on access,
+                // so refuse instead of handing back a landmine.
                 struct stat st;
                 if (fstat(shm_fd, &st) < 0) {
                     std::perror("fstat failed");
+                    close(shm_fd);
+                    return -1;
+                }
+
+                if (static_cast<std::size_t>(st.st_size) < size_) {
+                    std::fprintf(stderr,
+                        "shared memory %s is %lld bytes, need %zu\n",
+                        shm_name_.c_str(),
+                        static_cast<long long>(st.st_size),
+                        size_);
                     close(shm_fd);
                     return -1;
                 }
@@ -155,14 +182,11 @@ private:
             return -1;
         }
 
-        std::printf("Addr given: %p\n", shm_addr);
         ptr_ = shm_addr;
-        std::printf("Addr given to ptr_: %p\n", ptr_);
         return 0;
     }
 
     void reset() noexcept {
-        std::printf("Resetting ptr_: %p\n", ptr_);
         if (ptr_ != nullptr) {
             if (munmap(ptr_, size_) == -1) {
                 std::perror("munmap failed");
