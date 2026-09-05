@@ -28,6 +28,11 @@ RTMSQueue::RTMSQueue(std::string_view path,
     throw std::invalid_argument("slots is not a power of 2!");
   }
 
+  // Lap recovery needs at least one slot the writer is not currently in.
+  if (slots < 2) {
+    throw std::invalid_argument("slots must be at least 2");
+  }
+
   const std::size_t total_size = data_offset_ + stride_ * slots;
 
   if (ptr_.mode() == SharedMemoryMode::CREATE) {
@@ -77,29 +82,34 @@ uint64_t RTMSQueue::minimum_read_position() const {
   return minimum;
 }
 
-WriteResult RTMSQueue::write(const RTMSMessage& message) {
+WriteStatus RTMSQueue::write(const RTMSMessage& message) {
   const std::uint64_t slot_mask = slots_ - 1;
 
   if (message.size > header_->message_bytes) {
     std::cerr << "Cannot write message larger than slot size\n"
               << "message_bytes: " << header_->message_bytes
               << " > message_size: " << message.size << "\n";
-    return WriteResult::ERROR_SIZE_MISSMATCH;
+    return {WriteResult::ERROR_SIZE_MISSMATCH, 0};
   }
 
-  uint64_t writer_position =
+  const uint64_t writer_position =
       header_->writer.sequence.load(std::memory_order_relaxed);
-  // std::printf("Writer position: %llu\n", writer_position);
 
-  const uint64_t slowest_reader = minimum_read_position();
   const uint64_t next_position = writer_position + 1;
 
-  // Producer at the moment cannot pass a slow reader?
-  // example max slots is 10, min reader is at 10 and new position is wrapping
-  // to 20 will cause us to be writting over the reader.
-  if (next_position - slowest_reader > slots_) {
-    std::cerr << "writer cannot pass the slowest reader\n";  // kill the reader?
-    return WriteResult::BUFFER_FULL;
+  // DROP_NEWEST is the reliable mode: the writer refuses to pass the slowest
+  // reader, so no reader ever misses a message. Every other policy keeps the
+  // writer running at the cost of lapping slow readers, which read_next()
+  // reports back to them as dropped messages. A stuck subscriber must never
+  // be able to stall a control loop.
+  if (options_.overflow_policy == OverflowPolicy::DROP_NEWEST) {
+    const uint64_t slowest_reader = minimum_read_position();
+
+    // example max slots is 10, min reader is at 10 and new position is wrapping
+    // to 20 will cause us to be writting over the reader.
+    if (next_position - slowest_reader > slots_) {
+      return {WriteResult::BUFFER_FULL, 0};
+    }
   }
 
   const std::uint64_t slot_index = writer_position & slot_mask;
@@ -111,7 +121,109 @@ WriteResult RTMSQueue::write(const RTMSMessage& message) {
 
   std::memcpy(next_segment, message.data, message.size);
   header_->writer.sequence.store(next_position, std::memory_order_release);
-  return WriteResult::SUCCESS;
+  return {WriteResult::SUCCESS, writer_position};
+}
+
+const std::byte* RTMSQueue::slot_address(
+    std::uint64_t message_sequence) const {
+  const std::uint64_t slot_index = message_sequence & (header_->slots - 1);
+
+  return static_cast<const std::byte*>(ptr_.ptr()) + header_->data_offset +
+         (slot_index * header_->slot_stride);
+}
+
+bool RTMSQueue::select_sequence(const Reader& reader, MessageInfo& info) const {
+  const std::uint64_t reader_position =
+      reader.sequence.load(std::memory_order_relaxed);
+
+  const std::uint64_t writer_position =
+      header_->writer.sequence.load(std::memory_order_acquire);
+
+  // reader.sequence and writer.sequence both refer to the next sequence.
+  if (reader_position >= writer_position) {
+    return false;
+  }
+
+  std::uint64_t message_sequence = reader_position;
+
+  // Under DROP_NEWEST the writer refuses to pass the slowest reader, so no
+  // unread slot can ever be overwritten and nothing may be skipped. Skipping
+  // here would silently break the guarantee that makes that mode worth having.
+  //
+  // Under an overwriting policy the writer is free to lap us. Only the last
+  // `slots` sequences are still intact, and the oldest of those lives in the
+  // slot the writer is about to reuse, so recovery targets the one after it.
+  if (options_.overflow_policy != OverflowPolicy::DROP_NEWEST &&
+      writer_position - message_sequence >= header_->slots) {
+    message_sequence = writer_position - header_->slots + 1;
+  }
+
+  if (options_.read_mode == ReadMode::LATEST) {
+    message_sequence = writer_position - 1;
+  }
+
+  info.sequence = message_sequence;
+  info.dropped = message_sequence - reader_position;
+  return true;
+}
+
+bool RTMSQueue::slot_still_valid(std::uint64_t message_sequence) const {
+  // A writer that cannot pass the slowest reader cannot have been writing the
+  // slot we just read, so there is nothing to re-check.
+  if (options_.overflow_policy == OverflowPolicy::DROP_NEWEST) {
+    return true;
+  }
+
+  // Pairs with the writer's release store. Everything read out of the slot
+  // must be ordered before this load, or the check proves nothing.
+  std::atomic_thread_fence(std::memory_order_acquire);
+
+  const std::uint64_t writer_position =
+      header_->writer.sequence.load(std::memory_order_relaxed);
+
+  // The writer reaches our slot again at message_sequence + slots. If its next
+  // write is at or past that point, it may have been writing while we read.
+  return writer_position - message_sequence < header_->slots;
+}
+
+ReadResult RTMSQueue::read_next(std::uint64_t reader_id,
+                                std::span<std::byte> destination,
+                                MessageInfo& info) {
+  info = MessageInfo{};
+
+  if (reader_id >= MAX_READERS ||
+      destination.size() < header_->message_bytes) {
+    return ReadResult::INVALID;
+  }
+
+  auto& reader = header_->readers[reader_id];
+
+  if (reader.state.load(std::memory_order_acquire) != ReaderState::ACTIVE) {
+    return ReadResult::INACTIVE;
+  }
+
+  for (int attempt = 0; attempt < MAX_READ_ATTEMPTS; ++attempt) {
+    MessageInfo candidate{};
+
+    if (!select_sequence(reader, candidate)) {
+      return ReadResult::EMPTY;
+    }
+
+    std::memcpy(destination.data(), slot_address(candidate.sequence),
+                header_->message_bytes);
+
+    if (!slot_still_valid(candidate.sequence)) {
+      continue;
+    }
+
+    // The cursor always points to the next sequence to consume.
+    reader.sequence.store(candidate.sequence + 1, std::memory_order_release);
+
+    info = candidate;
+    return ReadResult::OK;
+  }
+
+  return ReadResult::TORN;
 }
 
 std::optional<std::size_t> RTMSQueue::register_reader() {

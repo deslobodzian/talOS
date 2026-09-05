@@ -1,20 +1,25 @@
 #include <chrono>
 #include <iostream>
 #include <cmath>
+#include <memory>
 #include <numbers>
 #include <thread>
 
 #include "third_party/mjbots/moteus/moteus.h"
 #include "third_party/mjbots/moteus/moteus_protocol.h"
+#include "third_party/mjbots/moteus/moteus_transport.h"
 
 namespace moteus = mjbots::moteus;
 
 int main() {
+    auto transport = std::make_shared<moteus::Fdcanusb>("/dev/cu.usbmodem462C28621");
+
     using Clock = std::chrono::steady_clock;
     using namespace std::chrono_literals;
 
     moteus::Controller::Options options;
     options.id = 1;
+    options.transport = transport;
 
     moteus::Controller motor{options};
     moteus::PositionMode::Command command;

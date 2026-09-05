@@ -13,14 +13,17 @@ public:
     explicit RawPublisher(
         std::string_view topic,
         size_t size,
-        size_t alignment)
-        : topic_{topic}, queue_{topic, size, alignment}
+        size_t alignment,
+        RTMSOptions options = RTMSOptions{})
+        : topic_{topic}, queue_{topic, size, alignment, MAX_SLOTS, options}
     {
 
     }
-    void write(const RTMSMessage& message) {
-        queue_.write(message);
+    WriteStatus write(const RTMSMessage& message) {
+        return queue_.write(message);
     }
+
+    RTMSQueue& queue() { return queue_; }
 private:
     std::string topic_;
     RTMSQueue queue_;
@@ -29,14 +32,21 @@ private:
 template <NotDerivedFromFlatbufferTable Message>
 class Publisher {
 public:
-    explicit Publisher(std::string_view topic) :
-        publisher_{topic, sizeof(Message), alignof(Message)}
+    // Defaults to the policy that keeps the publisher running: a subscriber
+    // that stops reading gets lapped instead of stalling this process.
+    explicit Publisher(
+        std::string_view topic,
+        RTMSOptions options = RTMSOptions{
+            .overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+            .read_mode = ReadMode::SEQUENCE,
+        })
+        : publisher_{topic, sizeof(Message), alignof(Message), options}
         {
     }
 
-    void write(const Message& message) {
+    WriteStatus write(const Message& message) {
         RTMSMessage rtms_message{sizeof(Message), static_cast<const void*>(&message)};
-        publisher_.write(rtms_message);
+        return publisher_.write(rtms_message);
     }
 
 private:
