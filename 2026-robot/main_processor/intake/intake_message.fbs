@@ -1,0 +1,14 @@
+namespace talos.intake;
+
+struct IntakeTarget {
+  issued_ns:ulong;
+  enabled:bool;
+  roller_velocity_rps:float;
+}
+
+struct IntakeState {
+  issued_ns:ulong;
+  enabled:bool;
+  roller_velocity_rps:float;
+  beam_broken:bool;
+}
