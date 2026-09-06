@@ -24,9 +24,9 @@ cc_library(
 cc_binary(
     name = "node",
     srcs = ["main.cc"],
-    # The robot config, so `bazel run` (and `--describe` in particular) can
-    # read it when it is passed as --config.
-    data = ["//2026-robot/main_processor/configuration:robot.toml"],
+    # The whole robot config (manifest plus subsystem files), so `bazel run`
+    # (and `--describe` in particular) can read it when passed as --config.
+    data = ["//2026-robot/main_processor/configuration:robot_config"],
     deps = [
         ":node_lib",
         "//talOS/introspection:describe",
@@ -37,7 +37,7 @@ cc_binary(
 cc_binary(
     name = "hardware_node",
     srcs = ["main.cc"],
-    data = ["//2026-robot/main_processor/configuration:robot.toml"],
+    data = ["//2026-robot/main_processor/configuration:robot_config"],
     deps = [
         ":node_lib",
         "//talOS/introspection:describe",

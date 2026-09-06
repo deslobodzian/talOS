@@ -1,0 +1,11 @@
+# Publishes Studio telemetry frames on `topic`, which must stay
+# /talos/telemetry: the reserved `talos` owner because the feed belongs to no
+# subsystem, and role `telemetry` because it is for recording and display only.
+# It is the only producer there, which the Studio bridge requires: that topic
+# uses DROP_NEWEST so a full queue drops a frame instead of overwriting bytes
+# the bridge is still sending.
+[subsystem]
+name = "telemetry"
+node = "//2026-robot/main_processor/telemetry:node"
+period_us = 10000
+topic = "/talos/telemetry"

@@ -3,7 +3,7 @@ name = "test"
 node = "//2026-robot/main_processor/test:node"
 period_us = 5000
 
-[subsystem.motors.front_left]
+[motors.front_left]
 type = "TalonFX"
 bus = "canivore"
 can_id = 1
@@ -12,7 +12,7 @@ supply_limit_a = 40
 stator_limit_a = 80
 slot0 = { p = 0.1, i = 0.0, d = 0.0, v = 0.12 }
 
-[subsystem.motors.front_right]
+[motors.front_right]
 type = "TalonFX"
 bus = "canivore"
 can_id = 2
@@ -21,7 +21,7 @@ supply_limit_a = 40
 stator_limit_a = 80
 slot0 = { p = 0.1, i = 0.0, d = 0.0, v = 0.12 }
 
-[subsystem.sensors.front_left_encoder]
+[sensors.front_left_encoder]
 type = "CANcoder"
 bus = "canivore"
 can_id = 20

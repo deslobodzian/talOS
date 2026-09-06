@@ -1,0 +1,8 @@
+# Decodes the Driver Station packet and republishes it; holds no policy. Owns no
+# actuators, so the hardware node keeps no request tracker for it. period_us is
+# the Driver Station sample rate (50 Hz), which must stay in sync with
+# driver_station::kSamplePeriodUs on the Rio side.
+[subsystem]
+name = "driver_station"
+node = "//2026-robot/main_processor/driver_station:node"
+period_us = 20000
