@@ -6,6 +6,8 @@
 #include "2026-robot/main_processor/driver_station/packet.h"
 #include "2026-robot/main_processor/drivetrain/drive_message_generated.h"
 #include "2026-robot/main_processor/drivetrain/packet.h"
+#include "2026-robot/main_processor/intake/intake_message_generated.h"
+#include "2026-robot/main_processor/intake/packet.h"
 #include "2026-robot/main_processor/shooter/packet.h"
 #include "2026-robot/main_processor/shooter/shooter_message_generated.h"
 #include "talOS/driver_station/driver_station.h"
@@ -25,6 +27,8 @@ inline constexpr const char* kTeleopChassisTopic =
     talos::drive::kTeleopTargetTopic;
 inline constexpr const char* kTeleopShooterTopic =
     talos::shooter::kTeleopShooterTargetTopic;
+inline constexpr const char* kTeleopIntakeTopic =
+    talos::intake::kTeleopIntakeTargetTopic;
 
 // The two `auto` topics have no publisher, and will not until autonomous is
 // written. The subscriptions stay so the wiring is already right on the day it
@@ -34,6 +38,8 @@ inline constexpr const char* kTeleopShooterTopic =
 inline constexpr const char* kAutoChassisTopic = talos::drive::kAutoTargetTopic;
 inline constexpr const char* kAutoShooterTopic =
     talos::shooter::kAutoShooterTargetTopic;
+inline constexpr const char* kAutoIntakeTopic =
+    talos::intake::kAutoIntakeTargetTopic;
 
 enum class Source : uint8_t { kNone, kTeleop, kAutonomous };
 
@@ -55,7 +61,9 @@ class ArbiterNode {
       : chassis_{event::make_sender<talos::drive::ChassisTarget>(
             loop, talos::drive::kTargetTopic)},
         shooter_{event::make_sender<talos::shooter::ShooterTarget>(
-            loop, talos::shooter::kShooterTargetTopic)} {
+            loop, talos::shooter::kShooterTargetTopic)},
+        intake_{event::make_sender<talos::intake::IntakeTarget>(
+            loop, talos::intake::kTargetTopic)} {
     event::watch<driver_station::DriverStationState, &ArbiterNode::OnDsState>(
         loop, driver_station::kDsStateTopic, this);
     event::watch<talos::drive::ChassisTarget, &ArbiterNode::OnTeleopChassis>(
@@ -66,6 +74,10 @@ class ArbiterNode {
         loop, kTeleopShooterTopic, this);
     event::watch<talos::shooter::ShooterTarget, &ArbiterNode::OnAutoShooter>(
         loop, kAutoShooterTopic, this);
+    event::watch<talos::intake::IntakeTarget, &ArbiterNode::OnTeleopIntake>(
+        loop, kTeleopIntakeTopic, this);
+    event::watch<talos::intake::IntakeTarget, &ArbiterNode::OnAutoIntake>(
+        loop, kAutoIntakeTopic, this);
   }
 
   void Start(event::MonotonicTime = {}) {}
@@ -86,6 +98,8 @@ class ArbiterNode {
     chassis_.send(
         talos::drive::ChassisTarget{0.0, 0.0, 0.0, ctx.now.nanos(), false});
     shooter_.send(talos::shooter::ShooterTarget{0.0, ctx.now.nanos(), false});
+    intake_.send(talos::intake::IntakeTarget{
+        static_cast<uint64_t>(ctx.now.nanos()), false, 0.0f});
   }
 
   void OnTeleopChassis(const event::Context&,
@@ -104,10 +118,19 @@ class ArbiterNode {
                      const talos::shooter::ShooterTarget& target) {
     if (source_ == Source::kAutonomous) shooter_.send(target);
   }
+  void OnTeleopIntake(const event::Context&,
+                      const talos::intake::IntakeTarget& target) {
+    if (source_ == Source::kTeleop) intake_.send(target);
+  }
+  void OnAutoIntake(const event::Context&,
+                    const talos::intake::IntakeTarget& target) {
+    if (source_ == Source::kAutonomous) intake_.send(target);
+  }
 
   Source source_{Source::kNone};
   event::Sender<Loop, talos::drive::ChassisTarget> chassis_;
   event::Sender<Loop, talos::shooter::ShooterTarget> shooter_;
+  event::Sender<Loop, talos::intake::IntakeTarget> intake_;
 };
 
 }  // namespace talos::arbiter

@@ -19,6 +19,7 @@ using namespace std::chrono_literals;
 using driver_station::DriverStationState;
 using driver_station::FmsState;
 using talos::drive::ChassisTarget;
+using talos::intake::IntakeTarget;
 using talos::shooter::ShooterTarget;
 
 DriverStationState DsState(uint32_t flags) {
@@ -50,6 +51,10 @@ class Harness {
     loop_.inject(topic, target);
     loop_.run_for(10ms);
   }
+  void Send(const char* topic, const IntakeTarget& target) {
+    loop_.inject(topic, target);
+    loop_.run_for(10ms);
+  }
 
   uint64_t chassis_count() {
     return env_.channel(talos::drive::kTargetTopic, sizeof(ChassisTarget))
@@ -58,6 +63,11 @@ class Harness {
   uint64_t shooter_count() {
     return env_
         .channel(talos::shooter::kShooterTargetTopic, sizeof(ShooterTarget))
+        .next_sequence();
+  }
+  uint64_t intake_count() {
+    return env_
+        .channel(talos::intake::kTargetTopic, sizeof(IntakeTarget))
         .next_sequence();
   }
   ChassisTarget last_chassis() {
@@ -74,6 +84,16 @@ class Harness {
     auto& channel = env_.channel(talos::shooter::kShooterTargetTopic,
                                  sizeof(ShooterTarget));
     ShooterTarget target{};
+    EXPECT_GT(channel.next_sequence(), 0u);
+    if (channel.next_sequence() == 0) return target;
+    channel.copy_to(channel.next_sequence() - 1,
+                    {reinterpret_cast<std::byte*>(&target), sizeof(target)});
+    return target;
+  }
+  IntakeTarget last_intake() {
+    auto& channel = env_.channel(talos::intake::kTargetTopic,
+                                 sizeof(IntakeTarget));
+    IntakeTarget target{};
     EXPECT_GT(channel.next_sequence(), 0u);
     if (channel.next_sequence() == 0) return target;
     channel.copy_to(channel.next_sequence() - 1,
@@ -122,6 +142,8 @@ TEST(Arbiter, StopsOnceOnEveryModeChangeSoNoTargetOutlivesItsMode) {
   const auto before = harness.chassis_count();
   harness.Mode(kTeleopEnabled);
   EXPECT_EQ(harness.chassis_count(), before + 1);
+  const auto released_intake = harness.last_intake();
+  EXPECT_FALSE(released_intake.enabled());
   const auto released = harness.last_chassis();
   EXPECT_FALSE(released.enabled());
   EXPECT_NEAR(released.vx_mps(), 0.0, 1e-12);
@@ -169,6 +191,17 @@ TEST(Arbiter, RoutesShooterTargetsOnTheSameSelection) {
   harness.Send(kTeleopShooterTopic, ShooterTarget{60.0, 0, true});
   EXPECT_EQ(harness.shooter_count(), before + 1);
   EXPECT_NEAR(harness.last_shooter().target_velocity_rps(), 60.0, 1e-12);
+}
+
+TEST(Arbiter, RoutesIntakeTargetsOnTheSameSelection) {
+  Harness harness;
+  harness.Mode(kTeleopEnabled);
+  const auto before = harness.intake_count();
+  harness.Send(kAutoIntakeTopic, IntakeTarget{0, true, 99.0f});
+  EXPECT_EQ(harness.intake_count(), before);
+  harness.Send(kTeleopIntakeTopic, IntakeTarget{0, true, 30.0f});
+  EXPECT_EQ(harness.intake_count(), before + 1);
+  EXPECT_NEAR(harness.last_intake().roller_velocity_rps(), 30.0, 1e-6);
 }
 
 // A minimal enabled-teleop packet with the stick pushed straight downfield.

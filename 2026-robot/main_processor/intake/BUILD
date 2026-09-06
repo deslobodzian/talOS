@@ -9,6 +9,19 @@ flatbuffer_cc_library(
     srcs = ["intake_message.fbs"],
     visibility = ["//visibility:public"],
 )
+
+# C++ side of the package: topic constants for producer/arbiter nodes.
+# The Python node carries its own copy in packet.py; the spelling is pinned
+# by the launcher lint, not by a shared header.
+cc_library(
+    name = "intake",
+    hdrs = ["packet.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":intake_message",
+        "//talOS/hardware:hardware",
+    ],
+)
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 # Python intake node (PLAN rev 2, units 3-4). Additive only: the C++

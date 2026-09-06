@@ -11,6 +11,7 @@ cc_library(
     deps = [
         "//2026-robot/main_processor/driver_station:driver_station",
         "//2026-robot/main_processor/drivetrain:drivetrain",
+        "//2026-robot/main_processor/intake:intake",
         "//2026-robot/main_processor/shooter:shooter",
         "//talOS/driver_station:driver_station",
         "//talOS/events:events",

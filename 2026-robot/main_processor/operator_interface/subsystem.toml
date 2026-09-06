@@ -14,3 +14,6 @@ shooter_target_rps = 60.0
 field_oriented = true
 # Bit 0 is button 1.
 shoot_button_mask = 1
+intake_target_rps = 30.0
+# Bit 1 is button 2.
+intake_button_mask = 2
