@@ -84,9 +84,24 @@ class ReplayEventLoop : public EventLoopBase<ReplayEventLoop<Recorder, Metrics>,
 
   MonotonicTime now_impl() const { return now_; }
 
-  // Timers are not scheduled during replay; their firings are in the log.
-  void arm_timer(std::uint16_t, MonotonicTime, Duration) {}
-  void disarm_timer(std::uint16_t) {}
+  // Firings come from the log, but the program must reproduce timer changes.
+  void arm_timer(std::uint16_t id, MonotonicTime deadline, Duration period) {
+    if (!this->timer_change_is_recorded(id, true, deadline, period)) return;
+    std::span<const std::byte> payload;
+    const auto* header = take(EventKind::ARM_TIMER, id, payload);
+    if (header &&
+        (header->event_time_ns != deadline.nanos() ||
+         header->sequence != static_cast<std::uint64_t>(period.count()))) {
+      report(Divergence{active_dispatch_, id, "timer schedule changed"});
+    }
+    this->record_operation(EventKind::ARM_TIMER, id, deadline, period);
+  }
+  void disarm_timer(std::uint16_t id) {
+    if (!this->timer_change_is_recorded(id, false, {}, {})) return;
+    std::span<const std::byte> payload;
+    take(EventKind::DISARM_TIMER, id, payload);
+    this->record_operation(EventKind::DISARM_TIMER, id);
+  }
 
   const std::vector<Divergence>& divergences() const { return divergences_; }
   bool diverged() const { return !divergences_.empty(); }
@@ -101,8 +116,9 @@ class ReplayEventLoop : public EventLoopBase<ReplayEventLoop<Recorder, Metrics>,
       throw ReplayError("log does not match this program: " + *mismatch);
     }
 
+    typename Base::RunScope in_run{*this};
     now_ = reader_->start_time();
-    this->begin_run(now_);
+    this->begin_run();
 
     while (cursor_ < records_.size()) {
       const log::RecordHeader& header = records_[cursor_].header;
@@ -115,7 +131,13 @@ class ReplayEventLoop : public EventLoopBase<ReplayEventLoop<Recorder, Metrics>,
         break;
       }
 
-      if (kind == EventKind::FETCH || kind == EventKind::SEND) {
+      if (!this->running()) {
+        report(Divergence{header.dispatch_index, header.source_id,
+                          "program exited before the recorded run"});
+        break;
+      }
+
+      if (is_operation(kind)) {
         // Reached at top level, so the handler that originally performed it
         // did not perform it this time.
         report(Divergence{header.dispatch_index, header.source_id,
@@ -134,6 +156,13 @@ class ReplayEventLoop : public EventLoopBase<ReplayEventLoop<Recorder, Metrics>,
 
  private:
   void load(log::LogReader& reader) {
+    // Adopting the recorded origin before any registration is what lets the
+    // replayed program build its initial schedule the same way the recorded
+    // one did, out of monotonic_now(), instead of being handed the original
+    // run's absolute deadlines by the caller.
+    now_ = reader.start_time();
+    this->set_start_time(now_);
+
     log::LogReader::Record record{};
     reader.rewind();
     while (reader.next(record)) {
@@ -143,6 +172,16 @@ class ReplayEventLoop : public EventLoopBase<ReplayEventLoop<Recorder, Metrics>,
 
   void on_register(const Registration&) {}
   void on_exit_requested() {}
+  void on_handler_exit() {
+    std::span<const std::byte> payload;
+    take(EventKind::HANDLER_EXIT, this->context().source_id, payload);
+  }
+
+  static bool is_operation(EventKind kind) {
+    return kind == EventKind::FETCH || kind == EventKind::SEND ||
+           kind == EventKind::ARM_TIMER || kind == EventKind::DISARM_TIMER ||
+           kind == EventKind::HANDLER_EXIT;
+  }
 
   std::string source_name(std::uint16_t id) const {
     const Manifest& manifest = this->manifest();
@@ -191,8 +230,7 @@ class ReplayEventLoop : public EventLoopBase<ReplayEventLoop<Recorder, Metrics>,
       const log::RecordHeader& next = records_[cursor_].header;
       const auto kind = static_cast<EventKind>(next.kind);
 
-      if ((kind != EventKind::FETCH && kind != EventKind::SEND) ||
-          next.dispatch_index != header.dispatch_index) {
+      if (!is_operation(kind) || next.dispatch_index != header.dispatch_index) {
         break;
       }
 

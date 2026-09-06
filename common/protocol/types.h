@@ -21,6 +21,10 @@ enum class FrameType : uint16_t {
   kHeartbeat = 12,
   kFault = 13,
   kConfigError = 14,
+  kHardwareState = 20,
+  kHardwareCommand = 21,
+  kHardwareConfig = 22,
+  kHardwareConfigAck = 23,
 };
 
 enum FrameFlags : uint16_t {

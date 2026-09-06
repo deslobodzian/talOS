@@ -20,7 +20,7 @@ std::span<const std::byte> as_bytes(const void* data, std::size_t size) {
 }  // namespace
 
 LogWriter::LogWriter(std::string_view path, std::string_view process_name,
-                     Options options)
+                     Options options, std::uint64_t session_id)
     : state_{std::make_unique<State>()} {
   if (options.chunk_bytes == 0) {
     options.chunk_bytes = DEFAULT_CHUNK_BYTES;
@@ -30,16 +30,15 @@ LogWriter::LogWriter(std::string_view path, std::string_view process_name,
   }
 
   state_->process_name = std::string{process_name};
+  state_->session_id = session_id;
   state_->options = options;
 
   state_->pool.resize(options.chunk_count);
   for (Chunk& chunk : state_->pool) {
     chunk.data.resize(options.chunk_bytes);
-    state_->free_chunks.push_back(&chunk);
   }
 
-  state_->active = state_->free_chunks.front();
-  state_->free_chunks.pop_front();
+  state_->active = &state_->pool.front();
 
   state_->fd =
       ::open(std::string{path}.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -51,30 +50,22 @@ LogWriter::LogWriter(std::string_view path, std::string_view process_name,
 }
 
 LogWriter::LogWriter(std::string_view path, std::string_view process_name,
-                     std::size_t buffer_bytes)
+                     std::size_t buffer_bytes, std::uint64_t session_id)
     : LogWriter{path, process_name,
-                Options{buffer_bytes, 1, /*background=*/false}} {}
+                Options{buffer_bytes, 1, /*background=*/false}, session_id} {}
 
 LogWriter::~LogWriter() = default;
 
+std::uint64_t LogWriter::session_id() const noexcept {
+  return state_ ? state_->session_id : 0;
+}
+
 LogWriter::State::~State() {
-  // The public destructor runs this after flush() has already drained, but a
-  // State destroyed on an error path may still hold data worth keeping.
+  // Explicit flush is optional; destruction drains the accepted prefix too.
   if (active != nullptr && active->used > 0) {
     submit_active();
   }
   stop_writer();
-
-  {
-    std::unique_lock lock{mutex};
-    while (!pending.empty()) {
-      Chunk* chunk = pending.front();
-      pending.pop_front();
-      lock.unlock();
-      write_chunk(*chunk);
-      lock.lock();
-    }
-  }
 
   if (fd >= 0) {
     ::close(fd);
@@ -113,12 +104,7 @@ void LogWriter::State::write_chunk(Chunk& chunk) noexcept {
   const std::size_t size = chunk.used;
   chunk.used = 0;
 
-  {
-    std::lock_guard lock{mutex};
-    if (failed || size == 0) {
-      return;
-    }
-  }
+  if (failed || size == 0) return;
 
   std::size_t written = 0;
   while (written < size) {
@@ -149,45 +135,30 @@ void LogWriter::State::submit_active() noexcept {
     return;
   }
 
-  {
-    std::lock_guard lock{mutex};
-    pending.push_back(chunk);
-  }
-  pending_ready.notify_one();
+  // Publishes both the chunk bytes and used count to the writer.
+  submitted.fetch_add(1, std::memory_order_release);
 }
 
-// Takes the next free chunk, waiting if the writer has fallen a whole pool
-// behind. The wait is the honest outcome: the alternative is losing records,
-// which would make the log unreplayable.
+// Only the producer selects free chunks. The consumer returns ownership by
+// advancing completed after finishing the write.
 void LogWriter::State::acquire_chunk() noexcept {
   if (active != nullptr) {
     return;
   }
 
-  std::unique_lock lock{mutex};
-
-  if (free_chunks.empty()) {
-    ++stalls;
-    chunk_ready.wait(lock, [this] { return !free_chunks.empty() || failed; });
+  const auto next = submitted.load(std::memory_order_relaxed);
+  if (next - completed.load(std::memory_order_acquire) >= pool.size()) {
+    capture_error.store(CaptureError::POOL_FULL);
+    return;
   }
 
-  if (free_chunks.empty()) {
-    return;  // failed; records are discarded from here on
-  }
-
-  active = free_chunks.front();
-  free_chunks.pop_front();
+  active = &pool[next % pool.size()];
   active->used = 0;
 }
 
 void LogWriter::State::append(RecordHeader header,
                               std::span<const std::byte> payload) noexcept {
-  {
-    std::lock_guard lock{mutex};
-    if (failed) {
-      return;
-    }
-  }
+  if (failed || capture_error.load() != CaptureError::NONE) return;
 
   header.magic = RECORD_MAGIC;
   header.payload_bytes = static_cast<std::uint32_t>(payload.size());
@@ -216,16 +187,11 @@ void LogWriter::State::append(RecordHeader header,
     }
   }
 
-  // A single record larger than a whole chunk. Grow this one chunk to fit; it
-  // keeps the larger capacity afterwards, so this happens at most once per
-  // chunk per record size.
+  // Capacity is fixed before dispatch begins. Preserve the accepted prefix
+  // and make failure visible instead of allocating or leaving a hole.
   if (total > active->data.size()) {
-    try {
-      active->data.resize(total);
-    } catch (const std::exception& e) {
-      set_error(std::string{"LogWriter: buffer growth failed: "} + e.what());
-      return;
-    }
+    capture_error.store(CaptureError::RECORD_TOO_LARGE);
+    return;
   }
 
   std::memcpy(active->data.data() + active->used, &header, sizeof(header));
@@ -238,7 +204,6 @@ void LogWriter::State::append(RecordHeader header,
 
 void LogWriter::State::drain() noexcept {
   submit_active();
-  acquire_chunk();
 
   if (!options.background) {
     return;
@@ -246,7 +211,8 @@ void LogWriter::State::drain() noexcept {
 
   std::unique_lock lock{mutex};
   pending_ready.notify_all();
-  chunk_ready.wait(lock, [this] { return (pending.empty() && !writing); });
+  chunk_ready.wait(lock,
+                   [this] { return completed.load() == submitted.load(); });
 }
 
 void LogWriter::State::stop_writer() noexcept {
@@ -266,6 +232,13 @@ void LogWriter::State::stop_writer() noexcept {
 void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
   State& state = *state_;
 
+  std::size_t capacity =
+      std::max(state.options.chunk_bytes, sizeof(RecordHeader));
+  for (const auto& reg : manifest) {
+    capacity = std::max(capacity, sizeof(RecordHeader) + reg.message_bytes);
+  }
+  for (auto& chunk : state.pool) chunk.data.resize(capacity);
+
   std::vector<ManifestEntry> entries;
   entries.reserve(manifest.size());
   for (const auto& reg : manifest) {
@@ -274,7 +247,7 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
     entry.kind = static_cast<std::uint16_t>(reg.kind);
     entry.message_bytes = reg.message_bytes;
     entry.alignment = reg.alignment;
-    entry.reserved = 0;
+    entry.armed = reg.armed;
     entry.period_ns = reg.period_ns;
     entry.offset_ns = reg.offset_ns;
     write_name(entry.name, reg.name);
@@ -288,6 +261,7 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
   std::memcpy(header.magic, FILE_MAGIC, sizeof(header.magic));
   header.version = FORMAT_VERSION;
   header.header_bytes = sizeof(FileHeader);
+  header.session_id = state.session_id;
   header.start_monotonic_ns = start_time.nanos();
   header.start_wall_ns =
       std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -313,19 +287,21 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
     std::unique_lock lock{raw->mutex};
 
     for (;;) {
-      raw->pending_ready.wait(
-          lock, [raw] { return !raw->pending.empty() || raw->stopping; });
+      // Polling keeps notifications and mutex acquisition off the producer
+      // path. flush()/destruction notify immediately and may wait for disk.
+      raw->pending_ready.wait_for(lock, std::chrono::milliseconds{1}, [raw] {
+        return raw->completed.load() != raw->submitted.load() || raw->stopping;
+      });
 
-      if (raw->pending.empty()) {
+      const auto next = raw->completed.load(std::memory_order_relaxed);
+      if (next == raw->submitted.load(std::memory_order_acquire)) {
         if (raw->stopping) {
           return;
         }
         continue;
       }
 
-      Chunk* chunk = raw->pending.front();
-      raw->pending.pop_front();
-      raw->writing = true;
+      Chunk* chunk = &raw->pool[next % raw->pool.size()];
 
       // The mutex is never held across the write, so a slow disk cannot make
       // the loop thread's hand-off block behind it.
@@ -333,8 +309,7 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
       raw->write_chunk(*chunk);
       lock.lock();
 
-      raw->writing = false;
-      raw->free_chunks.push_back(chunk);
+      raw->completed.store(next + 1, std::memory_order_release);
       raw->chunk_ready.notify_all();
     }
   }};
@@ -403,18 +378,25 @@ void LogWriter::finish(const Context& context) noexcept {
 void LogWriter::flush() noexcept { state_->drain(); }
 
 bool LogWriter::failed() const noexcept {
-  std::lock_guard lock{state_->mutex};
-  return state_->failed;
+  return state_->failed ||
+         state_->capture_error.load() != State::CaptureError::NONE;
 }
 
 std::string LogWriter::error() const {
+  switch (state_->capture_error.load()) {
+    case State::CaptureError::POOL_FULL:
+      return "LogWriter: buffer pool exhausted; capture stopped";
+    case State::CaptureError::RECORD_TOO_LARGE:
+      return "LogWriter: record exceeds preallocated capacity; capture stopped";
+    case State::CaptureError::NONE:
+      break;
+  }
   std::lock_guard lock{state_->mutex};
   return state_->error;
 }
 
-std::uint64_t LogWriter::stalls() const noexcept {
-  std::lock_guard lock{state_->mutex};
-  return state_->stalls;
+bool LogWriter::capture_stopped() const noexcept {
+  return state_->capture_error.load() != State::CaptureError::NONE;
 }
 
 }  // namespace talos::event::log

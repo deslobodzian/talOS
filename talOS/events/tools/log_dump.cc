@@ -54,6 +54,8 @@ int main(int argc, char** argv) {
 
   std::printf("process: %s\n", reader->process_name().c_str());
   std::printf("format version: %u\n", reader->format_version());
+  std::printf("session id: %llu\n",
+              static_cast<unsigned long long>(reader->session_id()));
   std::printf("start monotonic: %lld ns\n", static_cast<long long>(start_ns));
   std::printf("start wall: %lld ns\n",
               static_cast<long long>(reader->start_wall_ns()));

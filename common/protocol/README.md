@@ -99,9 +99,10 @@ path. That lets the caller build the payload directly inside the outgoing UDP
 datagram buffer, avoiding an extra userspace payload copy. `SendFrame()` remains
 available for tests, config, and lower-rate convenience paths.
 
-## WPILib Simulation Smoke Test
+## Hardware Gateway and Simulation
 
-The robot simulation opens a small UDP endpoint in `SimulationInit()`:
+The RoboRIO program now runs the hardware gateway in `common/hardware`.
+Its simulation uses these endpoints:
 
 - simulated Rio side: `127.0.0.1:5802`
 - TalOS side: `127.0.0.1:5803`
@@ -112,16 +113,24 @@ Run the WPILib simulation from the `robot/` directory:
 ./gradlew simulateNative
 ```
 
-Then, in another terminal from the repo root, run:
+From the repository root, build the companion programs:
 
 ```sh
-bazel run //common/protocol:sim_udp_smoke -- --iterations=100
+bazel build //talOS/drivetrain:all
 ```
 
-The TalOS smoke tool sends `RioCommand` frames and expects `RioState` replies
-from the WPILib simulation. This verifies that the shared UDP protocol works
-between the simulated Rio process and a TalOS-side process before real hardware
-is involved.
+Run the bridge and drivetrain node as described in
+`talOS/drivetrain/README.md`. For an automated loopback test without WPILib,
+run `python3 tools/test_drivetrain.py`; add `--wpilib` to drive the real robot
+program under WPILib simulation instead of the stand-in gateway. Both verify
+separate processes, motion, command expiry, and deterministic replay. The older
+`sim_udp_smoke` binary uses the legacy RioCommand/RioState payload and does not
+target this gateway.
+
+The hardware gateway uses new frame kinds HardwareState (20) and HardwareCommand
+(21), with configuration IDs, boot/epoch IDs, and canonical payload codecs.
+The startup TCP negotiation described above remains a planned protocol; the
+implemented gateway uses a shared C++ configuration compiled into both ends.
 
 ## Safety Boundary
 

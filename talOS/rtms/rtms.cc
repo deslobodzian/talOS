@@ -9,13 +9,28 @@
 
 #include "talOS/memory/shared_memory_ptr.h"
 
+namespace {
+std::string_view ValidatePath(std::string_view path) {
+  std::string_view name = path;
+  if (name.starts_with('/')) {
+    name.remove_prefix(1);
+  }
+  if (name.size() > 30) {
+    throw std::invalid_argument(
+        "Topic name '" + std::string(path) +
+        "' exceeds limit of 30 characters after leading slash");
+  }
+  return path;
+}
+}  // namespace
+
 RTMSQueue::RTMSQueue(std::string_view path,
                      std::size_t message_size,
                      std::size_t message_alignment,
                      std::size_t slots,
                      RTMSOptions options
                      )
-    : path_{path},
+    : path_{ValidatePath(path)},
       slots_{slots},
       message_size_{message_size},
       message_alignment_{message_alignment},

@@ -35,7 +35,7 @@ gave them. Seven rules make that true:
    results including "there was nothing", the start time and the exit.
 4. **Every output is recorded.** Each `send` is logged with its bytes, the
    transport's verdict and the sequence it got, tagged with the dispatch that
-   produced it.
+   produced it. Timer setup/disable and handler-requested exit are validated too.
 5. **Stable identities.** Sources are numbered in registration order, and the
    log header carries a manifest of them. Replay refuses a log whose manifest
    does not match the program.
@@ -49,7 +49,24 @@ gave them. Seven rules make that true:
 Point 7 is also a latency requirement. The loops are CRTP, the recorder is a
 template policy (`NullRecorder` compiles to nothing), the platform backend is
 chosen at compile time, and callbacks are `{object, thunk}` pairs rather than
-`std::function`. Nothing allocates after `run()` starts.
+`std::function`. The realtime scheduler and background recorder preallocate
+before dispatch begins. User callbacks must manage their own allocation budget;
+simulation and replay are not allocation-free.
+
+Register and configure sources before starting the loop. A timer change made
+while the loop is running must come from inside a callback: anything else is
+another thread, which races the scheduler and has no reproducible position in
+the log, so it throws `std::logic_error`. To change a schedule from outside,
+send the loop a message and change it in the handler, where it is recorded.
+
+A loop that is stopped is not running, so the harness may re-arm timers on a
+`SimulatedEventLoop` between `run_for` calls. That is the outside world acting,
+exactly like `inject()`, and it is deliberately not recorded: its only effect is
+the firings it produces, and those are recorded.
+
+`exit()` and `running()` are thread-safe; other API calls and lifecycle
+operations require external serialization. `exit()` is not a signal-handler API.
+Realtime and replay loop instances run once.
 
 ## The three loops
 
@@ -77,9 +94,11 @@ class Arm {
     control_ = make_timer<&Arm::on_control>(loop, "control", this);
   }
 
-  void start(MonotonicTime now) {
-    control_.setup_periodic(now + 1ms, 1ms);
+  void start(MonotonicTime first_deadline) {
+    control_.setup_periodic(first_deadline, 1ms);
   }
+
+  std::uint16_t control_id() const { return control_.id(); }
 
  private:
   void on_sensor(const Context& context, const SensorMessage& message) {
@@ -101,7 +120,7 @@ lines invalidates existing logs.
 ```cpp
 RealtimeEventLoop<log::LogWriter> loop{log::LogWriter{"/tmp/run.tlog", "arm"}};
 Arm<decltype(loop)> arm{loop, 2.0F};
-arm.start(Poller::now());
+arm.start(loop.monotonic_now() + 1ms);
 loop.run();
 ```
 
@@ -109,6 +128,7 @@ loop.run();
 log::LogReader reader{"/tmp/run.tlog"};
 ReplayEventLoop<> replay{reader};
 Arm<decltype(replay)> arm{replay, 2.0F};
+arm.start(replay.monotonic_now() + 1ms);  // the identical setup line
 replay.run();
 
 if (replay.diverged()) { /* the program no longer does what it did */ }
@@ -118,6 +138,36 @@ Replay verifies as it goes. Every send must match the recorded bytes, in order.
 A changed gain, a reordered branch or a missing send is reported as a
 divergence naming the dispatch and the topic. Set `Options{false}` to collect
 every divergence in one pass instead of throwing at the first.
+
+Note that both snippets set the schedule up the same way. `monotonic_now()`
+before `run()` returns the loop's *origin*, which the realtime loop fixes at
+construction and the replay loop takes from the log, so a program that builds
+its initial schedule out of the loop's clock lands on the same numbers in both.
+The manifest stores each timer's initial armed state, period and first deadline
+**relative to that origin**, never an absolute one: an absolute deadline is a
+fact about when the machine booted, and recording one would force every replay
+to be handed the original run's numbers by hand. Missing setup, or a changed
+period or phase, is rejected before any dispatch.
+
+After `run()` starts, `monotonic_now()` outside a dispatch returns the loop's
+current time instead, so a harness stepping a simulation sees time where it left
+it. Inside a dispatch it is always the frozen recorded `now`, which is the only
+form handlers ever see.
+
+One consequence worth knowing: the realtime loop's origin is the moment the loop
+object is constructed, so a first deadline of `monotonic_now() + 1ms` is one
+millisecond after *construction*, not after `run()`. If setup between the two
+takes longer than that, the first cycle is already late and fires once with a
+cycle count instead of bursting. That is deterministic and it replays, but if
+you want the first tick to land a period after the run begins, either construct
+the loop last or arm the timer inside the first dispatch. A benchmark that is
+never replayed can simply arm off `Poller::now()` immediately before `run()`,
+which is what `tools/loop_perf.cc` does.
+
+During callbacks, `ARM_TIMER` and `DISARM_TIMER` records validate scheduling
+calls and `HANDLER_EXIT` validates explicit shutdown. An early shutdown stops
+further dispatch even when collecting divergences. External shutdown is
+represented by the terminal `EXIT` record.
 
 Inspect a log with `bazel run //talOS/events:log_dump -- /tmp/run.tlog`.
 
@@ -131,13 +181,27 @@ whose checksum is wrong *is* corruption and is refused.
 
 Format details live in `log/format.h`. The version field is checked on read;
 readers reject a version they do not know rather than guessing.
+The current format is version 2; version 1 logs are rejected because they do
+not contain the timer and shutdown information needed by these checks.
 
-Records are copied into a preallocated chunk and written by a background
-thread, so the loop thread pays a memcpy and never a syscall. A full write can
-block for milliseconds, which a 1 kHz loop cannot absorb. If the disk falls a
-whole buffer pool behind, the loop thread waits rather than dropping records,
-because a log with holes is not replayable. `LogWriter::stalls()` counts those
-waits; anything but zero means logging is competing with control.
+Records are copied into preallocated chunks and handed to a background thread
+through an atomic ring. Dispatch does not lock, wait for disk, or resize buffers.
+The writer checks for new chunks every millisecond. If the pool is exhausted,
+capture stops permanently: `failed()` becomes true and `error()` explains why.
+Previously accepted records are drained in order, leaving a prefix without a
+clean `EXIT`, rather than a log with holes.
+
+Capture never resumes, because resuming would put a hole in the middle of the
+log and replay would skip it without saying so. **Treat `failed()` as a robot
+fault**, next to a brownout or a lost CAN device: it means the rest of the match
+is not replayable. `error()` says why, and `capture_stopped()` distinguishes
+"the loop outran the writer" from a disk error. `//talOS/drivetrain:node` exits
+non-zero and prints the reason; do the same in any process you add.
+
+`start()` sizes every chunk for the manifest's largest payload. A record larger
+than that capacity also stops capture without allocating. Header writing at
+startup, explicit `flush()`, shutdown, and the opt-in synchronous writer can
+still block on disk; do not call `flush()` from a control callback.
 
 ## Measuring latency and jitter
 
@@ -246,5 +310,6 @@ never be able to freeze a control loop. Readers find out through
 `Context::dropped`, which counts messages that were skipped, not merely
 delayed. Treat a non-zero value as a fault.
 
-Use `DROP_NEWEST` for a topic that genuinely must not lose messages, and accept
-that the writer blocks when a reader falls behind.
+At the RTMS layer, `DROP_NEWEST` refuses a write with `BUFFER_FULL` when a reader
+falls behind; it does not block or retry. The application must handle that
+outcome. Realtime loop topics use `OVERWRITE_OLDEST`.

@@ -1,0 +1,13 @@
+namespace talos.odometry;
+
+struct OdometryState {
+  timestamp_ns:ulong;
+  x_m:double;
+  y_m:double;
+  yaw_rot:double;
+  vx_mps:double;
+  vy_mps:double;
+  omega_radps:double;
+  flywheel_rps:double;
+  beam_broken:bool;
+}

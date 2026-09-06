@@ -35,6 +35,7 @@ class LogReader {
   std::string process_name() const { return process_name_; }
   std::int64_t start_wall_ns() const noexcept { return start_wall_ns_; }
   std::uint32_t format_version() const noexcept { return format_version_; }
+  std::uint64_t session_id() const noexcept { return session_id_; }
 
   // Advances to the next record. Returns false once there is nothing left to
   // read, whether that is a clean end of file or a file that ends mid
@@ -60,6 +61,7 @@ class LogReader {
   MonotonicTime start_time_;
   std::int64_t start_wall_ns_{0};
   std::uint32_t format_version_{0};
+  std::uint64_t session_id_{0};
   std::string process_name_;
   std::size_t records_offset_{0};
   std::size_t cursor_{0};

@@ -106,12 +106,14 @@ LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
     reg.alignment = entry.alignment;
     reg.period_ns = entry.period_ns;
     reg.offset_ns = entry.offset_ns;
+    reg.armed = entry.armed != 0;
     manifest_.push_back(std::move(reg));
   }
 
   start_time_ = MonotonicTime::from_nanos(header.start_monotonic_ns);
   start_wall_ns_ = header.start_wall_ns;
   format_version_ = header.version;
+  session_id_ = header.session_id;
   process_name_ = read_name(header.process_name);
 
   records_offset_ = manifest_offset + manifest_bytes_size;

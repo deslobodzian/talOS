@@ -44,6 +44,7 @@ struct Registration {
   std::uint32_t alignment{0};
   std::int64_t period_ns{0};
   std::int64_t offset_ns{0};
+  bool armed{false};  // offset_ns is the initial absolute monotonic deadline.
 
   bool operator==(const Registration&) const = default;
 };
@@ -69,7 +70,9 @@ inline std::optional<std::string> compare_manifests(const Manifest& recorded,
     const auto describe = [](const Registration& r) {
       return std::string{to_string(r.kind)} + " '" + r.name + "' (" +
              std::to_string(r.message_bytes) + " bytes, period " +
-             std::to_string(r.period_ns) + "ns)";
+             std::to_string(r.period_ns) + "ns, deadline " +
+             std::to_string(r.offset_ns) + "ns, armed " +
+             (r.armed ? "true" : "false") + ")";
     };
 
     return "source " + std::to_string(i) + " differs: log has " +

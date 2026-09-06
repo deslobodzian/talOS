@@ -24,7 +24,7 @@
 namespace talos::event::log {
 
 inline constexpr char FILE_MAGIC[8] = {'T', 'A', 'L', 'O', 'S', 'L', 'O', 'G'};
-inline constexpr std::uint32_t FORMAT_VERSION = 1;
+inline constexpr std::uint32_t FORMAT_VERSION = 3;
 
 // Marks the start of every record so a damaged log can be resynchronised.
 inline constexpr std::uint32_t RECORD_MAGIC = 0x54524543;  // "TREC"
@@ -35,6 +35,7 @@ struct FileHeader {
   char magic[8];
   std::uint32_t version;
   std::uint32_t header_bytes;       // sizeof(FileHeader), for forward compat
+  std::uint64_t session_id;
   std::int64_t start_monotonic_ns;  // loop start on the recording timeline
   std::int64_t start_wall_ns;       // informational only, ignored by replay
   std::uint32_t manifest_count;
@@ -47,7 +48,7 @@ struct ManifestEntry {
   std::uint16_t kind;  // SourceKind
   std::uint32_t message_bytes;
   std::uint32_t alignment;
-  std::uint32_t reserved;
+  std::uint32_t armed;
   std::int64_t period_ns;
   std::int64_t offset_ns;
   char name[64];
@@ -69,7 +70,7 @@ struct RecordHeader {
 
 #pragma pack(pop)
 
-static_assert(sizeof(FileHeader) == 104);
+static_assert(sizeof(FileHeader) == 112);
 static_assert(sizeof(ManifestEntry) == 96);
 static_assert(sizeof(RecordHeader) == 56);
 

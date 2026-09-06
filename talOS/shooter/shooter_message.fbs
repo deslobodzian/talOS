@@ -1,0 +1,16 @@
+namespace talos.shooter;
+
+struct ShooterTarget {
+  target_velocity_rps:double;
+  issued_ns:long;
+  enabled:bool;
+}
+
+struct ShooterState {
+  timestamp_ns:ulong;
+  flywheel_velocity_rps:double;
+  target_velocity_rps:double;
+  at_speed:bool;
+  beam_broken:bool;
+  enabled:bool;
+}

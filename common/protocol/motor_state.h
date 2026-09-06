@@ -1,11 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include "types.h"
 
 namespace talos::protocol {
 
-constexpr size_t kMaxMotors = 21; // 24 - 3 (rio, radio, mac power ports)
+constexpr std::size_t kMaxMotors = 21; // 24 - 3 (rio, radio, mac power ports)
 
 struct MotorState {
     float position;
