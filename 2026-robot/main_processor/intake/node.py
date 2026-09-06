@@ -65,11 +65,15 @@ def describe_sources():
     message_bytes are sizeof(T) as registered via handles.h:133-150.
     """
     return [
-        (node_api.TIMER, "intake", 0),
-        (node_api.WATCHER, packet.HW_STATE_TOPIC, packet.PACKET_SIZE),
-        (node_api.WATCHER, packet.TARGET_TOPIC, packet.TARGET_SIZE),
-        (node_api.SENDER, packet.REQUEST_TOPIC, packet.PACKET_SIZE),
-        (node_api.SENDER, packet.STATE_TOPIC, packet.STATE_SIZE),
+        (node_api.TIMER, "intake", 0, False, False),
+        (node_api.WATCHER, packet.HW_STATE_TOPIC, packet.PACKET_SIZE,
+         False, False),
+        (node_api.WATCHER, packet.TARGET_TOPIC, packet.TARGET_SIZE,
+         False, False),
+        (node_api.SENDER, packet.REQUEST_TOPIC, packet.PACKET_SIZE,
+         False, False),
+        (node_api.SENDER, packet.STATE_TOPIC, packet.STATE_SIZE,
+         False, False),
     ]
 
 
@@ -164,7 +168,7 @@ def _devices_of(sub_toml):
 
 
 def resolve_ids(config_path, subsystem="intake", roller="roller",
-                beam_break="beam_break"):
+                beam_break="intake_beam"):
     """Resolve global logical IDs by mirroring the C++ parser.
 
     config_parser.h:629-633 sorts every device by (subsystem, device) and

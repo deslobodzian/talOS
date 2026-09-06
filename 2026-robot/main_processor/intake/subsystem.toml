@@ -11,5 +11,5 @@ type = "TalonFX"
 bus = "rio"
 can_id = 10
 
-[digital_inputs.beam_break]
+[digital_inputs.intake_beam]
 dio = 1

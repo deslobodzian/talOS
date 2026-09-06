@@ -32,11 +32,14 @@ extern "C" {
 #endif
 
 // Bumped on every additive ABI change. Starts at 1.
-#define TALOS_NODE_ABI_VERSION 1u
+#define TALOS_NODE_ABI_VERSION 2u
 
 // Opaque handles. NULL means "open failed; see talos_last_error()".
 typedef struct TalosPublisher TalosPublisher;
 typedef struct TalosSubscriber TalosSubscriber;
+// Owns one registry slot (released on close). NULL means the registry was
+// unavailable; the caller keeps running degraded, like the C++ Reporter.
+typedef struct TalosNode TalosNode;
 
 // Source kinds. Values mirror talos::event::SourceKind on purpose
 // (TIMER=1, WATCHER=2, FETCHER=3, SENDER=4) so the mapping is mechanical.
@@ -117,6 +120,28 @@ int32_t talos_describe_emit(const char* node_name, const char* target,
                             const TalosSource* sources, uint32_t num_sources,
                             char* out_json, uint32_t out_capacity,
                             uint32_t* out_written);
+
+// Claim a registry slot for (name, target, session_id, flags) so Studio's
+// live graph sees this node. flags mirrors the C++ Reporter bits
+// (bit 0 simulation, bit 1 replay). Publishes nothing yet; call
+// talos_node_publish once with the same sources --describe reports.
+// Returns NULL (with last_error set) when the registry is unavailable --
+// keep running degraded, do not abort the node.
+TalosNode* talos_node_register(const char* name, const char* target,
+                              uint64_t session_id, uint32_t flags);
+
+// Publish the node's source manifest into its slot. Same sources array shape
+// as talos_describe_emit. Call once, after registration.
+int32_t talos_node_publish(TalosNode* node, const TalosSource* sources,
+                          uint32_t num_sources);
+
+// One refresh sample: heartbeat, dispatch count and (zeroed) source counters
+// move together behind the registry seqlock. Call once per loop tick with a
+// monotonically increasing dispatches count.
+int32_t talos_node_heartbeat(TalosNode* node, uint64_t dispatches);
+
+// Release the slot. NULL is a no-op. Never throws.
+void talos_node_close(TalosNode* node);
 
 #ifdef __cplusplus
 }  // extern "C"

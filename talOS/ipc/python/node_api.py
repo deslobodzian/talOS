@@ -2,7 +2,7 @@
 
 This module is the ONLY Python door into the RTMS transport and the
 describe envelope. It binds the exact ABI declared in
-``talOS/node_api/node_api.h`` (``TALOS_NODE_ABI_VERSION == 1``) and never
+``talOS/node_api/node_api.h`` (``TALOS_NODE_ABI_VERSION == 2``) and never
 reimplements transport or envelope logic in Python:
 
 * publish / subscribe go through ``talos_topic_open_publisher`` /
@@ -27,8 +27,13 @@ older than the version this module was built against.
 
 import ctypes
 import os
+import sys
 
-TALOS_NODE_ABI_VERSION = 1
+TALOS_NODE_ABI_VERSION = 2
+
+# Reporter flag bits (talOS/introspection/registry.h kFlagSimulation/Replay).
+FLAG_SIMULATION = 1 << 0
+FLAG_REPLAY = 1 << 1
 
 TALOS_OK = 0
 TALOS_EMPTY = 1
@@ -187,6 +192,16 @@ def _bind(lib):
         ctypes.c_char_p, ctypes.c_uint32,
         ctypes.POINTER(ctypes.c_uint32)]
     lib.talos_describe_emit.restype = ctypes.c_int32
+    lib.talos_node_register.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint32]
+    lib.talos_node_register.restype = ctypes.c_void_p
+    lib.talos_node_publish.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(TalosSource), ctypes.c_uint32]
+    lib.talos_node_publish.restype = ctypes.c_int32
+    lib.talos_node_heartbeat.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+    lib.talos_node_heartbeat.restype = ctypes.c_int32
+    lib.talos_node_close.argtypes = [ctypes.c_void_p]
+    lib.talos_node_close.restype = None
 
 
 def _check_version(lib):
@@ -237,17 +252,10 @@ def _validate_topic(topic):
     return topic.encode()
 
 
-def describe_json(name, target, sources):
-    """Emit the --describe envelope via talos_describe_emit.
-
-    ``sources`` is a list of ``(kind_int, topic, message_bytes, external,
-    optional)`` tuples where ``kind_int`` is 1..4 (TIMER/WATCHER/FETCHER/
-    SENDER) and ``external``/``optional`` are bools mapped to the
-    naming-protocol flag bits. Returns the JSON string.
+def _encode_sources(sources):
+    """Validate (kind, topic, bytes, external, optional) rows into a ctypes
+    array. Returns (arr, count, keepalive); arr is None when empty.
     """
-    lib = _load()
-    if not isinstance(name, str) or not isinstance(target, str):
-        raise ValueError("name and target must be strings")
     rows = list(sources) if sources else []
     encoded = []
     for row in rows:
@@ -261,33 +269,96 @@ def describe_json(name, target, sources):
         flags = ((SOURCE_FLAG_EXTERNAL if external else 0)
                  | (SOURCE_FLAG_OPTIONAL if optional else 0))
         encoded.append((kind, topic.encode(), message_bytes, flags))
-    if encoded:
-        arr = (TalosSource * len(encoded))()
-        for i, (kind, topic_b, message_bytes, flags) in enumerate(encoded):
-            arr[i].kind = kind
-            arr[i].topic = topic_b
-            arr[i].message_bytes = message_bytes
-            arr[i].flags = flags
-        # Keep topic bytes alive across both calls.
-        keepalive = (arr, encoded)
-    else:
-        arr = None
-        keepalive = None
+    if not encoded:
+        return (None, 0, None)
+    arr = (TalosSource * len(encoded))()
+    for i, (kind, topic_b, message_bytes, flags) in enumerate(encoded):
+        arr[i].kind = kind
+        arr[i].topic = topic_b
+        arr[i].message_bytes = message_bytes
+        arr[i].flags = flags
+    # Keep topic bytes alive across the call.
+    return (arr, len(encoded), (arr, encoded))
+
+
+def describe_json(name, target, sources):
+    """Emit the --describe envelope via talos_describe_emit.
+
+    ``sources`` is a list of ``(kind_int, topic, message_bytes, external,
+    optional)`` tuples where ``kind_int`` is 1..4 (TIMER/WATCHER/FETCHER/
+    SENDER) and ``external``/``optional`` are bools mapped to the
+    naming-protocol flag bits. Returns the JSON string.
+    """
+    lib = _load()
+    if not isinstance(name, str) or not isinstance(target, str):
+        raise ValueError("name and target must be strings")
+    arr, count, keepalive = _encode_sources(sources)
     need = ctypes.c_uint32(0)
     rc = lib.talos_describe_emit(
-        name.encode(), target.encode(), arr, len(encoded),
+        name.encode(), target.encode(), arr, count,
         None, 0, ctypes.byref(need))
     if rc != TALOS_ERR_SMALL:
         raise TalosError("describe emit failed: %s" % _err(lib))
     buf = ctypes.create_string_buffer(need.value + 1)
     written = ctypes.c_uint32(0)
     rc = lib.talos_describe_emit(
-        name.encode(), target.encode(), arr, len(encoded),
+        name.encode(), target.encode(), arr, count,
         buf, need.value + 1, ctypes.byref(written))
     del keepalive
     if rc != TALOS_OK:
         raise TalosError("describe emit failed: %s" % _err(lib))
     return buf.value.decode("utf-8")
+
+
+class Node:
+    """One registry claim: publish the manifest once, heartbeat per tick.
+
+    Degraded-ok: when the registry is unavailable the handle is None and
+    heartbeat() is a silent no-op, mirroring the C++ Reporter.
+    """
+
+    def __init__(self, name, target, session_id=0, flags=0, sources=()):
+        lib = _load()
+        if not isinstance(name, str) or not name:
+            raise ValueError("name must be a non-empty string")
+        if not isinstance(target, str) or not target:
+            raise ValueError("target must be a non-empty string")
+        self._lib = lib
+        self._degraded = False
+        self._handle = lib.talos_node_register(
+            name.encode(), target.encode(), int(session_id), int(flags))
+        if not self._handle:
+            sys.stderr.write("node_api: registry unavailable (%s); "
+                             "running without heartbeat\n" % _err(lib))
+            self._degraded = True
+            self._keepalive = None
+            return
+        arr, count, self._keepalive = _encode_sources(sources)
+        rc = lib.talos_node_publish(self._handle, arr, count)
+        if rc != TALOS_OK:
+            err = _err(lib)
+            lib.talos_node_close(self._handle)
+            self._handle = None
+            raise TalosError("node publish failed: %s" % err)
+
+    def heartbeat(self, dispatches):
+        """One refresh sample with a monotonically increasing count."""
+        if self._handle is None:
+            return
+        rc = self._lib.talos_node_heartbeat(self._handle, int(dispatches))
+        if rc != TALOS_OK:
+            raise TalosError("node heartbeat failed: %s" % _err(self._lib))
+
+    def close(self):
+        handle, self._handle = self._handle, None
+        if handle:
+            self._lib.talos_node_close(handle)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 class Publisher:
