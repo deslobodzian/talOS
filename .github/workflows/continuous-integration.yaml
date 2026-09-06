@@ -152,6 +152,14 @@ jobs:
         patchelf \
         clang-tidy-18
 
+    - name: Build first so generated headers exist
+      # clang-tidy resolves headers through bazel-out/external, including
+      # generated ones (e.g. flatbuffers virtual includes). refresh_all only
+      # extracts commands, so without a prior build the database points at
+      # headers that were never materialized and every TU including them
+      # fails with a compiler error. The shared disk cache keeps this fast.
+      run: bazel build //... --noshow_progress
+
     - name: Refresh compilation database
       # Hedron's Compile Commands Extractor (already a dev_dependency in
       # MODULE.bazel) generates compile_commands.json for clang-tidy.
