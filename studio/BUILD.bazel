@@ -1,0 +1,82 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_library", "js_run_binary", "js_test")
+load("@studio_npm//:defs.bzl", "npm_link_all_packages")
+load("@studio_npm//studio:vite/package_json.bzl", vite_bin = "bin")
+load("@studio_npm//studio:typescript/package_json.bzl", tsc_bin = "bin")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["package.json", "pnpm-lock.yaml"])
+
+npm_link_all_packages(name = "node_modules")
+
+# One schema and the monorepo's flatc tool generate both C++ and TS bindings.
+genrule(
+    name = "telemetry_ts",
+    srcs = ["//studio/schema:telemetry.fbs"],
+    outs = [
+        "src/generated/talos/telemetry.ts",
+        "src/generated/talos/telemetry/channel.ts",
+        "src/generated/talos/telemetry/frame.ts",
+        "src/generated/talos/telemetry/ghost.ts",
+        "src/generated/talos/telemetry/pose.ts",
+        "src/generated/talos/telemetry/target.ts",
+    ],
+    tools = ["@flatbuffers//:flatc"],
+    cmd = "$(location @flatbuffers//:flatc) --ts -o $(RULEDIR)/src/generated $(location //studio/schema:telemetry.fbs)",
+)
+
+js_library(
+    name = "sources",
+    srcs = glob(["src/**/*.ts", "src/**/*.tsx", "src/**/*.css", "tests/*.ts", "agent/*.ts", "agent/*.mjs", "tests/*.mjs"]) + [":telemetry_ts", "index.html", "package.json", "tsconfig.json"],
+    deps = [":node_modules"],
+)
+
+vite_bin.vite_binary(name = "vite", chdir = "studio")
+
+tsc_bin.tsc_test(
+    name = "typecheck",
+    args = ["--noEmit", "--project", "tsconfig.json"],
+    chdir = "studio",
+    data = [":sources"],
+)
+
+js_run_binary(
+    name = "web_dist",
+    tool = ":vite",
+    srcs = [":sources"],
+    args = ["build", "--outDir", "dist"],
+    out_dirs = ["dist"],
+    chdir = "studio",
+)
+
+vite_bin.vite_binary(
+    name = "dev",
+    data = [":sources"],
+    chdir = "studio",
+    fixed_args = ["--host", "127.0.0.1"],
+)
+
+js_binary(
+    name = "agent",
+    entry_point = "agent/run.mjs",
+    data = [":sources"],
+    chdir = "studio",
+)
+
+js_test(
+    name = "core_test",
+    entry_point = "tests/run.mjs",
+    data = [":sources"],
+    chdir = "studio",
+    fixed_args = ["core.test.ts"],
+)
+
+js_test(
+    name = "agent_test",
+    entry_point = "tests/run.mjs",
+    data = [":sources"],
+    chdir = "studio",
+    fixed_args = ["agent.test.ts"],
+)
+
+test_suite(name = "tests", tests = [":core_test", ":agent_test", ":typecheck", "//studio/bridge:wire_test"])

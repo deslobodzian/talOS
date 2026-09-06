@@ -17,7 +17,6 @@ cc_library(
         "//talOS/driver_station:driver_station",
         "//2026-robot/main_processor/drivetrain:drivetrain",
         "//talOS/events:events",
-        "//2026-robot/main_processor/shooter:shooter",
     ],
     visibility = ["//visibility:public"],
 )
@@ -28,15 +27,28 @@ cc_binary(
     deps = [
         ":driver_station",
         "//talOS/configuration:configuration",
+        "//talOS/process:process",
     ],
     visibility = ["//visibility:public"],
+)
+
+cc_binary(
+    name = "send_joystick",
+    srcs = ["send_joystick.cc"],
+    deps = [
+        ":driver_station",
+        "//talOS/ipc:ipc",
+        "//talOS/process:process",
+    ],
 )
 
 cc_test(
     name = "node_test",
     size = "small",
     srcs = ["node_test.cc"],
+    data = ["//2026-robot/main_processor/configuration:robot.toml"],
     deps = [
+        "//talOS/configuration:configuration",
         ":driver_station",
         "@googletest//:gtest_main",
     ],

@@ -101,6 +101,14 @@ enum class ReadMode {
 struct RTMSOptions {
     OverflowPolicy overflow_policy{OverflowPolicy::OVERWRITE_OLDEST};
     ReadMode read_mode{ReadMode::LATEST};
+
+    // Set by the publisher, which owns a topic's layout. A segment left behind
+    // by a killed process from an older build has the wrong shape, and every
+    // process that follows would fail to attach to it until someone unlinked
+    // it by hand. The owner reclaims such a segment instead. Readers leave it
+    // false: a reader disagreeing with a live publisher is a version skew that
+    // must be reported, not papered over.
+    bool reclaim_mismatched_segment{false};
 };
 
 constexpr const char* to_string(ReaderState state) noexcept {

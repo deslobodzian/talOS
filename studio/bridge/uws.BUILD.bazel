@@ -1,0 +1,9 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+cc_library(
+    name = "uws",
+    hdrs = glob(["src/*.h"]),
+    includes = ["src"],
+    defines = ["UWS_NO_ZLIB"],
+    deps = ["@studio_usockets//:usockets"],
+    visibility = ["//visibility:public"],
+)

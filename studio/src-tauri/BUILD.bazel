@@ -1,0 +1,58 @@
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("@studio_crates//:defs.bzl", "all_crate_deps", "aliases")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml", "Cargo.lock"])
+
+cargo_build_script(
+    name = "desktop_build_script",
+    srcs = ["build.rs"],
+    crate_name = "build_script_build",
+    pkg_name = "talos-studio",
+    edition = "2021",
+    version = "0.1.0",
+    data = glob(["capabilities/**", "icons/**", "src/**"]) + [
+        "Cargo.lock",
+        "Cargo.toml",
+        "tauri.conf.json",
+        "//studio:web_dist",
+    ],
+    build_script_env = {
+        "STUDIO_FRONTEND_DIST": "$(execpath //studio:web_dist)",
+    },
+    aliases = aliases(build = True),
+    deps = all_crate_deps(build = True),
+    link_deps = all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(build_proc_macro = True),
+)
+
+rust_binary(
+    name = "desktop",
+    srcs = ["src/main.rs"],
+    crate_name = "talos_studio",
+    edition = "2021",
+    version = "0.1.0",
+    rustc_env = {
+        "CARGO_PKG_AUTHORS": "",
+        "CARGO_PKG_DESCRIPTION": "Deterministic robotics telemetry studio",
+        "CARGO_PKG_NAME": "talos-studio",
+    },
+    rustc_flags = select({
+        "@platforms//os:macos": [
+            "-C", "link-arg=-framework",
+            "-C", "link-arg=AppKit",
+            "-C", "link-arg=-framework",
+            "-C", "link-arg=WebKit",
+            "-C", "link-arg=-framework",
+            "-C", "link-arg=CoreFoundation",
+            "-C", "link-arg=-framework",
+            "-C", "link-arg=Security",
+        ],
+        "//conditions:default": [],
+    }),
+    aliases = aliases(normal = True),
+    deps = [":desktop_build_script"] + all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)

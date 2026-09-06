@@ -8,8 +8,15 @@
 namespace talos::protocol {
 
 constexpr std::size_t kFrameHeaderSize = 40;
-constexpr std::size_t kMaxPayloadSize = 1200;
+// Sized so a full frame stays inside one unfragmented datagram on a standard
+// 1500-byte Ethernet MTU: 1500 - 20 (IPv4) - 8 (UDP) = 1472 bytes available,
+// and kMaxFrameSize is 1440. The slack absorbs the largest hardware::State,
+// whose device caps in hardware/config.h are asserted against this in
+// hardware/messages.cc.
+constexpr std::size_t kMaxPayloadSize = 1400;
 constexpr std::size_t kMaxFrameSize = kFrameHeaderSize + kMaxPayloadSize;
+static_assert(kMaxFrameSize <= 1472,
+              "frame must fit one 1500-byte MTU datagram");
 
 enum class DecodeStatus : uint8_t {
   kOk = 0,

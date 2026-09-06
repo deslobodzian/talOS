@@ -16,12 +16,12 @@
 #include <string>
 #include <thread>
 
-#include "talOS/hardware/messages.h"
 #include "2026-robot/main_processor/drivetrain/drive_message_generated.h"
+#include "2026-robot/main_processor/drivetrain/geometry.h"
 #include "2026-robot/main_processor/drivetrain/packet.h"
-#include "talOS/process/process.h"
-#include "2026-robot/main_processor/drivetrain/swerve.h"
+#include "talOS/hardware/messages.h"
 #include "talOS/ipc/subscriber.h"
+#include "talOS/process/process.h"
 
 namespace {
 
@@ -142,7 +142,8 @@ const talos::hardware::MotorRequest* FindRequest(
   return nullptr;
 }
 
-void PrintModules(const talos::hardware::State& state, bool have_state,
+void PrintModules(const talos::drive::SwerveGeometry& geometry,
+                  const talos::hardware::State& state, bool have_state,
                   const talos::hardware::Command& command, bool have_command,
                   const Freshness& command_freshness, Clock::time_point now) {
   std::printf("command   age %s   %.0f Hz   seq %llu\n\n",
@@ -155,8 +156,8 @@ void PrintModules(const talos::hardware::State& state, bool have_state,
   std::printf("%-13s %11s %11s %13s %13s %11s\n", "", "rot", "rot", "rot/s",
               "rot/s", "rot");
 
-  for (const auto& module : talos::drive::kSwerveModules) {
-    std::printf("%-13s", module.name);
+  for (const auto& module : geometry.modules) {
+    std::printf("%-13s", module.name.data());
 
     const auto* steer_request =
         have_command ? FindRequest(command, module.steer_id) : nullptr;
@@ -200,15 +201,19 @@ int main(int argc, char** argv) {
   try {
     int duration_s = 0;
     double rate_hz = 10;
+    std::string config_path =
+        "2026-robot/main_processor/configuration/robot.toml";
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       if (arg == "--duration-s" && i + 1 < argc) {
         duration_s = std::stoi(argv[++i]);
       } else if (arg == "--rate-hz" && i + 1 < argc) {
         rate_hz = std::stod(argv[++i]);
+      } else if (arg == "--config" && i + 1 < argc) {
+        config_path = argv[++i];
       } else {
         throw std::invalid_argument(
-            "usage: monitor [--duration-s N] [--rate-hz N]");
+            "usage: monitor [--duration-s N] [--rate-hz N] [--config PATH]");
       }
     }
     if (duration_s < 0) {
@@ -217,6 +222,11 @@ int main(int argc, char** argv) {
     if (rate_hz <= 0 || rate_hz > 100) {
       throw std::invalid_argument("rate must be between 0 and 100 Hz");
     }
+
+    // Module names and ids come from the same configuration the drivetrain
+    // node runs on, so the table cannot drift from what is being commanded.
+    const auto geometry = talos::drive::BuildSwerveGeometry(
+        talos::config::ParseRobotConfig(config_path));
 
     talos::process::InstallStopHandlers();
 
@@ -274,7 +284,8 @@ int main(int argc, char** argv) {
       std::printf("talOS drivetrain monitor        Ctrl-C to stop\n\n");
       PrintGateway(state, have_state, state_seen, now);
       PrintTarget(target, have_target, target_seen, now);
-      PrintModules(state, have_state, command, have_command, command_seen, now);
+      PrintModules(geometry, state, have_state, command, have_command,
+                   command_seen, now);
       std::fflush(stdout);
 
       next += period;

@@ -48,6 +48,11 @@ class Scenario:
     def __init__(self, root, output):
         self.root = root
         self.binaries = root / "bazel-bin/2026-robot/main_processor/drivetrain"
+        # The bridge is framework code and lives under talOS, not with the
+        # robot's drivetrain. Pointing this at the drivetrain package silently
+        # picks up a stale binary left over from before the split instead of
+        # failing, so it is spelled out separately.
+        self.bridge = root / "bazel-bin/talOS/bridge/hardware_node"
         self.output = output
         self.children = []
         self.files = []
@@ -101,7 +106,7 @@ class Scenario:
         raise RuntimeError(f"Gateway never started; see {self.output}")
 
     def drive(self, log_path, bridge_seconds, node_seconds):
-        self.start("bridge", [str(self.binaries / "bridge"),
+        self.start("bridge", [str(self.bridge),
                               "--duration-s", str(bridge_seconds)])
         self.start("node", [str(self.binaries / "node"), "--sim",
                             "--duration-s", str(node_seconds),
@@ -238,12 +243,15 @@ def main():
     root = Path(__file__).resolve().parents[1]
     binaries = root / "bazel-bin/2026-robot/main_processor/drivetrain"
 
-    needed = ["bridge", "node", "send_target"]
+    needed = [binaries / "node", binaries / "send_target",
+              root / "bazel-bin/talOS/bridge/hardware_node"]
     if not args.wpilib:
-        needed.append("sim_gateway")
-    for name in needed:
-        if not (binaries / name).is_file():
-            raise RuntimeError("Build //2026-robot/main_processor/drivetrain:all first")
+        needed.append(binaries / "sim_gateway")
+    for path in needed:
+        if not path.is_file():
+            raise RuntimeError(
+                "Build //2026-robot/main_processor/drivetrain:all and "
+                "//talOS/bridge:hardware_node first")
 
     check_ports()
     output = run_driving_scenario(root, args.wpilib)

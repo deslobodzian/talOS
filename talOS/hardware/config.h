@@ -8,7 +8,7 @@
 namespace talos::hardware {
 
 inline constexpr std::size_t kMaxMotors = 16;
-inline constexpr std::size_t kMaxSensors = 6;
+inline constexpr std::size_t kMaxSensors = 12;
 inline constexpr std::size_t kMaxDigitalInputs = 8;
 inline constexpr std::size_t kMaxDigitalOutputs = 4;
 inline constexpr std::size_t kMaxAnalogInputs = 4;

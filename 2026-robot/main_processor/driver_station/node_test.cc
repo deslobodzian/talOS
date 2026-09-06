@@ -5,11 +5,8 @@
 #include <chrono>
 
 #include "2026-robot/main_processor/driver_station/driver_station_message_generated.h"
-#include "2026-robot/main_processor/drivetrain/drive_message_generated.h"
 #include "2026-robot/main_processor/drivetrain/packet.h"
 #include "talOS/events/simulated_event_loop.h"
-#include "2026-robot/main_processor/shooter/packet.h"
-#include "2026-robot/main_processor/shooter/shooter_message_generated.h"
 
 namespace talos::driver_station {
 namespace {
@@ -23,7 +20,7 @@ Packet CreatePacket(const DriverStationData& data) {
   return pkt;
 }
 
-TEST(DriverStationNodeTest, DecodesPacketAndPublishesStateAndTargets) {
+TEST(DriverStationNodeTest, DecodesPacketAndRepublishesItVerbatim) {
   event::SimulationEnvironment env;
   event::SimulatedEventLoop<> loop{env};
   DriverStationNode node{loop};
@@ -89,108 +86,8 @@ TEST(DriverStationNodeTest, DecodesPacketAndPublishesStateAndTargets) {
   EXPECT_TRUE(ds_state.stick1().connected());
   EXPECT_EQ(ds_state.stick1().buttons(), 4u);
 
-  // 2. Verify ChassisTarget on /drivetrain/tgt
-  auto& drive_channel = env.channel(talos::drive::kTargetTopic,
-                                    sizeof(talos::drive::ChassisTarget));
-  ASSERT_GT(drive_channel.next_sequence(), 0u);
-  talos::drive::ChassisTarget chassis_tgt{};
-  drive_channel.copy_to(drive_channel.next_sequence() - 1,
-                        {reinterpret_cast<std::byte*>(&chassis_tgt),
-                         sizeof(chassis_tgt)});
-
-  // Magnitudes are rescaled past the 0.05 deadband: (|raw| - 0.05) / 0.95.
-  // raw_vx = -(-0.75) = 0.75 -> 0.70 / 0.95 * 4.0
-  // raw_vy = -(0.5) = -0.5 -> -(0.45 / 0.95) * 4.0
-  // raw_omega = -(0.25) = -0.25 -> -(0.20 / 0.95) * 6.0
-  EXPECT_NEAR(chassis_tgt.vx_mps(), 0.70 / 0.95 * 4.0, 1e-9);
-  EXPECT_NEAR(chassis_tgt.vy_mps(), -(0.45 / 0.95) * 4.0, 1e-9);
-  EXPECT_NEAR(chassis_tgt.omega_radps(), -(0.20 / 0.95) * 6.0, 1e-9);
-  EXPECT_TRUE(chassis_tgt.enabled());
-
-  // 3. Verify ShooterTarget on the topic ShooterNode actually watches
-  auto& shoot_channel = env.channel(talos::shooter::kShooterTargetTopic,
-                                    sizeof(talos::shooter::ShooterTarget));
-  ASSERT_GT(shoot_channel.next_sequence(), 0u);
-  talos::shooter::ShooterTarget shoot_tgt{};
-  shoot_channel.copy_to(shoot_channel.next_sequence() - 1,
-                        {reinterpret_cast<std::byte*>(&shoot_tgt),
-                         sizeof(shoot_tgt)});
-
-  EXPECT_DOUBLE_EQ(shoot_tgt.target_velocity_rps(), 60.0);
-  EXPECT_TRUE(shoot_tgt.enabled());
-}
-
-TEST(DriverStationNodeTest, AppliesDeadbandAndButtonRelease) {
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  DriverStationNode node{loop};
-
-  DriverStationData data{};
-  data.fms.flags = kEnabled | kTeleop;
-  data.joysticks[0].connected = true;
-  data.joysticks[0].axis_count = 4;
-  // Axes within 0.05 deadband
-  data.joysticks[0].axes[0] = 0.03f;
-  data.joysticks[0].axes[1] = -0.04f;
-  data.joysticks[0].axes[2] = 0.01f;
-  data.joysticks[0].buttons = 0;  // Button not pressed
-
-  loop.inject(kHwDsTopic, CreatePacket(data));
-  loop.run_for(10ms);
-
-  auto& drive_channel = env.channel(talos::drive::kTargetTopic,
-                                    sizeof(talos::drive::ChassisTarget));
-  ASSERT_GT(drive_channel.next_sequence(), 0u);
-  talos::drive::ChassisTarget chassis_tgt{};
-  drive_channel.copy_to(drive_channel.next_sequence() - 1,
-                        {reinterpret_cast<std::byte*>(&chassis_tgt),
-                         sizeof(chassis_tgt)});
-
-  EXPECT_DOUBLE_EQ(chassis_tgt.vx_mps(), 0.0);
-  EXPECT_DOUBLE_EQ(chassis_tgt.vy_mps(), 0.0);
-  EXPECT_DOUBLE_EQ(chassis_tgt.omega_radps(), 0.0);
-  EXPECT_TRUE(chassis_tgt.enabled());
-
-  auto& shoot_channel = env.channel(talos::shooter::kShooterTargetTopic,
-                                    sizeof(talos::shooter::ShooterTarget));
-  ASSERT_GT(shoot_channel.next_sequence(), 0u);
-  talos::shooter::ShooterTarget shoot_tgt{};
-  shoot_channel.copy_to(shoot_channel.next_sequence() - 1,
-                        {reinterpret_cast<std::byte*>(&shoot_tgt),
-                         sizeof(shoot_tgt)});
-
-  EXPECT_DOUBLE_EQ(shoot_tgt.target_velocity_rps(), 0.0);
-  EXPECT_FALSE(shoot_tgt.enabled());
-}
-
-TEST(DriverStationNodeTest, DeadbandIsContinuousAtTheThreshold) {
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  DriverStationNode node{loop};
-
-  DriverStationData data{};
-  data.fms.flags = kEnabled | kTeleop;
-  data.joysticks[0].connected = true;
-  data.joysticks[0].axis_count = 4;
-  // Just outside the 0.05 deadband.
-  data.joysticks[0].axes[1] = -0.06f;
-
-  loop.inject(kHwDsTopic, CreatePacket(data));
-  loop.run_for(10ms);
-
-  auto& drive_channel = env.channel(talos::drive::kTargetTopic,
-                                    sizeof(talos::drive::ChassisTarget));
-  ASSERT_GT(drive_channel.next_sequence(), 0u);
-  talos::drive::ChassisTarget chassis_tgt{};
-  drive_channel.copy_to(drive_channel.next_sequence() - 1,
-                        {reinterpret_cast<std::byte*>(&chassis_tgt),
-                         sizeof(chassis_tgt)});
-
-  // Rescaled: (0.06 - 0.05) / 0.95 * 4.0, not the 0.24 an unscaled deadband
-  // would step to.
-  EXPECT_NEAR(chassis_tgt.vx_mps(), 0.01 / 0.95 * 4.0, 1e-6);
-  EXPECT_LT(chassis_tgt.vx_mps(), 0.05);
-  EXPECT_GT(chassis_tgt.vx_mps(), 0.0);
+  // Requests are not this node's business; see the operator_interface
+  // tests for the mapping that turns this state into targets.
 }
 
 TEST(DriverStationNodeTest, PublishesOnlyTheFirstTwoJoysticks) {
@@ -232,70 +129,7 @@ TEST(DriverStationNodeTest, PublishesOnlyTheFirstTwoJoysticks) {
   EXPECT_FLOAT_EQ(ds_state.stick0().axis1(), -0.1f);
   EXPECT_FLOAT_EQ(ds_state.stick1().axis1(), -0.2f);
 
-  // Targets follow stick 0 alone.
-  auto& drive_channel = env.channel(talos::drive::kTargetTopic,
-                                    sizeof(talos::drive::ChassisTarget));
-  ASSERT_GT(drive_channel.next_sequence(), 0u);
-  talos::drive::ChassisTarget chassis_tgt{};
-  drive_channel.copy_to(drive_channel.next_sequence() - 1,
-                        {reinterpret_cast<std::byte*>(&chassis_tgt),
-                         sizeof(chassis_tgt)});
-  EXPECT_NEAR(chassis_tgt.vx_mps(), (0.1 - 0.05) / 0.95 * 4.0, 1e-6);
-}
-
-TEST(DriverStationNodeTest, NoTargetsWhenDisabledOrAutonomous) {
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  DriverStationNode node{loop};
-
-  DriverStationData data{};
-  data.fms.flags = kAutonomous | kEnabled;  // Enabled but Autonomous, not Teleop
-  data.joysticks[0].connected = true;
-  data.joysticks[0].axes[1] = -0.5f;
-
-  loop.inject(kHwDsTopic, CreatePacket(data));
-  loop.run_for(10ms);
-
-  // State should be published
-  auto& ds_channel =
-      env.channel(kDsStateTopic, sizeof(DriverStationState));
-  EXPECT_GT(ds_channel.next_sequence(), 0u);
-
-  // But no targets should be sent
-  auto& drive_channel = env.channel(talos::drive::kTargetTopic,
-                                    sizeof(talos::drive::ChassisTarget));
-  EXPECT_EQ(drive_channel.next_sequence(), 0u);
-
-  auto& shoot_channel = env.channel(talos::shooter::kShooterTargetTopic,
-                                    sizeof(talos::shooter::ShooterTarget));
-  EXPECT_EQ(shoot_channel.next_sequence(), 0u);
-}
-
-TEST(DriverStationNodeTest, NoTargetsWhenJoystick0Disconnected) {
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  DriverStationNode node{loop};
-
-  DriverStationData data{};
-  data.fms.flags = kEnabled | kTeleop;
-  data.joysticks[0].connected = false;
-
-  loop.inject(kHwDsTopic, CreatePacket(data));
-  loop.run_for(10ms);
-
-  // State published
-  auto& ds_channel =
-      env.channel(kDsStateTopic, sizeof(DriverStationState));
-  EXPECT_GT(ds_channel.next_sequence(), 0u);
-
-  // No targets
-  auto& drive_channel = env.channel(talos::drive::kTargetTopic,
-                                    sizeof(talos::drive::ChassisTarget));
-  EXPECT_EQ(drive_channel.next_sequence(), 0u);
-
-  auto& shoot_channel = env.channel(talos::shooter::kShooterTargetTopic,
-                                    sizeof(talos::shooter::ShooterTarget));
-  EXPECT_EQ(shoot_channel.next_sequence(), 0u);
+  // What those sticks should mean is the operator interface's business.
 }
 
 TEST(DriverStationNodeTest, CorruptPacketIgnored) {

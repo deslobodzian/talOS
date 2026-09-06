@@ -1,0 +1,15 @@
+# Local headless JSON-RPC
+
+Run `bazel run //studio:agent` from the repository root alongside the bridge. `TELEMETRY_URL` defaults to `ws://127.0.0.1:5800/telemetry`; `AGENT_PORT` defaults to 5802. This is a JSON-RPC 2.0 service, not an MCP implementation. It consumes the same binary decoder, jitter buffer, and bounded timeline as the UI, independently of any browser window. WebSocket reconnects every second. Producer restarts require restarting the agent until a stream epoch is added to the protocol.
+
+POST JSON-RPC requests to `http://127.0.0.1:5802/rpc`, or send them on `ws://127.0.0.1:5802/rpc`. Batches and notifications are supported. Browser Origin headers and non-local Host headers are rejected; the socket binds only to loopback. Request size is limited to 64 KiB. GET `/health` reports upstream connectivity, retained frame count, and jitter statistics.
+
+- `get_schema_tree`, params `{}`: returns observed leaf topics and JavaScript value types, retained timestamp bounds, frame count, and timestamp encoding. `channels` entries also have direct topic aliases. Schema discovery describes retained data, not fields never received.
+- `query_state_at`, params `{"timestamp_ns":"123","topics":["chassis.x","motor.current"],"mode":"exact"}`: returns a complete snapshot when topics are omitted; otherwise a timestamped topic map. Nanoseconds are decimal strings to preserve uint64 precision. Exact is the default and returns error `-32001` if no retained sample has that timestamp. Explicit `at_or_before` selects the preceding sample. No interpolation is introduced into agent results.
+- `scan_channel_events`, params `{"topic":"motor.current","condition":{"op":"gt","value":40},"start_ns":"0","end_ns":"999999999999"}`: returns contiguous matching **sample** ranges with inclusive endpoints and sample counts. Missing packets are not inferred to match. Operators: `gt`, `gte`, `lt`, `lte`, `eq`, `ne`, `changed`, `rising`, `falling`. Edge comparisons use the preceding retained sample even if it precedes start_ns. No arbitrary code or expression evaluation is accepted.
+
+The sample `bazel run //studio/scripts:detect_divergence` obtains the latest exact snapshot, compares RawOdometry with FusedPose (falling back to chassis), and scans a producer divergence channel when present. Output is deterministic for identical retained frames. This is a bounded live window, not a persistent archive.
+
+Desktop UDP uses Tauri v2 `Channel<Response>` binary IPC, avoiding JSON/base64 event payloads. The frontend must acknowledge each payload with `invoke('ack_udp')`; 32 unacknowledged packets is the hard in-flight limit. Overload drops fresh datagrams until capacity returns. A 50 ms socket timeout bounds shutdown. `stop_udp` closes the socket and joins the native listener; closing the application drops managed state and stops it. A new `start_udp` restarts the listener. The schema must fit in one UDP datagram; the bridge should enforce the stricter configured MTU payload budget.
+
+References: [Tauri binary command responses](https://v2.tauri.app/develop/calling-rust/) and [Tauri channels](https://v2.tauri.app/develop/calling-frontend/).

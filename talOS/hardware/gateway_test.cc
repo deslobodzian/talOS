@@ -227,7 +227,7 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   Gateway g{SwerveConfig(true), backend, 1};
   g.Tick(1000, true);
   const auto c = Request(g);
-  std::array<uint8_t, 1200> bytes{};
+  std::array<uint8_t, protocol::kMaxPayloadSize> bytes{};
   const auto size = Encode(c, bytes);
   Command decoded;
   ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), size}, decoded));
@@ -271,7 +271,7 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   }
   const auto full_cmd_size = Encode(full_cmd, bytes);
   ASSERT_GT(full_cmd_size, 0u);
-  ASSERT_LE(full_cmd_size, 1200u);
+  ASSERT_LE(full_cmd_size, protocol::kMaxPayloadSize);
   Command decoded_full_cmd;
   ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), full_cmd_size}, decoded_full_cmd));
   EXPECT_EQ(decoded_full_cmd.count, kMaxMotors);
@@ -327,7 +327,14 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   }
 
   const auto state_size = Encode(state, bytes);
-  ASSERT_EQ(state_size, 1152u);
+  // The same per-device widths the payload-budget static_asserts in messages.cc
+  // are built from, so raising a device cap moves both together or neither.
+  constexpr std::size_t kWidestState =
+      44 + 14 + kMaxMotors * 43 + kMaxSensors * 27 + kMaxDigitalInputs * 4 +
+      kMaxDigitalOutputs * 4 + kMaxAnalogInputs * 15 + kMaxEncoders * 23 +
+      kMaxPwmOutputs * 11;
+  ASSERT_EQ(state_size, kWidestState);
+  ASSERT_LE(state_size, protocol::kMaxPayloadSize);
   State copy;
   ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), state_size}, copy));
   EXPECT_EQ(copy.motors[0].position_age_us, 123u);
@@ -400,7 +407,7 @@ TEST(ConfigWire, ChunksAndAssemblesConfigLosslessly) {
   auto chunks = CreateConfigChunks(cfg);
   EXPECT_GT(chunks.size(), 0u);
   for (const auto& ch : chunks) {
-    EXPECT_LE(ch.size(), 1200u);
+    EXPECT_LE(ch.size(), protocol::kMaxPayloadSize);
   }
 
   ConfigAssembler assembler;

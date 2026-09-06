@@ -4,6 +4,8 @@
 #include <cmath>
 #include <limits>
 
+#include "../protocol/frame.h"
+
 namespace talos::hardware {
 static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559);
 namespace {
@@ -293,9 +295,15 @@ bool Decode(std::span<const uint8_t> data, State& out) {
   out = s;
   return true;
 }
-static_assert(32 + 6 + kMaxMotors * 20 + kMaxDigitalOutputs * 3 + kMaxPwmOutputs * 10 <= 1200);
+// The device caps in config.h are only legal while the widest encoding of each
+// message still fits one frame payload. Raising a cap without headroom here
+// fails the build rather than truncating a State on the wire at runtime.
+static_assert(32 + 6 + kMaxMotors * 20 + kMaxDigitalOutputs * 3 +
+                  kMaxPwmOutputs * 10 <=
+              protocol::kMaxPayloadSize);
 static_assert(44 + 14 + kMaxMotors * 43 + kMaxSensors * 27 +
-              kMaxDigitalInputs * 4 + kMaxDigitalOutputs * 4 +
-              kMaxAnalogInputs * 15 + kMaxEncoders * 23 +
-              kMaxPwmOutputs * 11 <= 1200);
+                  kMaxDigitalInputs * 4 + kMaxDigitalOutputs * 4 +
+                  kMaxAnalogInputs * 15 + kMaxEncoders * 23 +
+                  kMaxPwmOutputs * 11 <=
+              protocol::kMaxPayloadSize);
 }  // namespace talos::hardware

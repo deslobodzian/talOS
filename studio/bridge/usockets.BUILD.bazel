@@ -1,0 +1,9 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+cc_library(
+    name = "usockets",
+    srcs = glob(["src/*.c", "src/eventing/*.c"]),
+    hdrs = glob(["src/**/*.h"]),
+    includes = ["src"],
+    defines = ["LIBUS_NO_SSL"],
+    visibility = ["//visibility:public"],
+)

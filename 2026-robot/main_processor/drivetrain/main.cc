@@ -3,13 +3,14 @@
 #include <string>
 #include <thread>
 
-#include "talOS/configuration/config_parser.h"
+#include "2026-robot/main_processor/drivetrain/geometry.h"
 #include "2026-robot/main_processor/drivetrain/node.h"
-#include "talOS/process/process.h"
+#include "talOS/configuration/config_parser.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/realtime_event_loop.h"
 #include "talOS/events/replay_event_loop.h"
+#include "talOS/process/process.h"
 
 int main(int argc, char** argv) {
   try {
@@ -46,10 +47,12 @@ int main(int argc, char** argv) {
     const auto* dev_ptr = robot_config.GetDevices("drivetrain");
     talos::hardware::Devices devices = dev_ptr ? *dev_ptr : talos::hardware::Devices{};
     auto config = robot_config.hardware;
+    const auto geometry = talos::drive::BuildSwerveGeometry(robot_config);
     if (!replay_path.empty()) {
       talos::event::log::LogReader reader{replay_path};
       talos::event::ReplayEventLoop<> loop{reader};
-      talos::drive::DrivetrainNode node{loop, config, devices};
+      talos::drive::DrivetrainNode node{loop, config, geometry, devices,
+                                        simulation};
       // Identical to the live setup below: the replay loop's clock already
       // reads the recorded origin, so the same line produces the recorded
       // schedule.
@@ -64,7 +67,8 @@ int main(int argc, char** argv) {
         talos::event::log::LogWriter{log_path, "drivetrain",
                                      talos::event::log::LogWriterOptions{},
                                      session_id}};
-    talos::drive::DrivetrainNode node{loop, config, devices};
+    talos::drive::DrivetrainNode node{loop, config, geometry, devices,
+                                      simulation};
     node.Start(loop.monotonic_now() +
                std::chrono::microseconds{config.period_us});
     talos::process::InstallStopHandlers();

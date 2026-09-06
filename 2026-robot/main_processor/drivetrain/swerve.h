@@ -11,24 +11,35 @@
 
 namespace talos::drive {
 
+inline constexpr std::size_t kSwerveModuleCount = 4;
+
+// Resolved module geometry. The ids are logical device ids, which the config
+// parser assigns by sorting on (subsystem name, device name) and numbering from
+// one -- so they shift whenever a device is added or renamed anywhere in the
+// robot. Never write them as literals; resolve them from device names through
+// BuildSwerveGeometry in geometry.h.
+inline constexpr std::size_t kMaxSwerveModuleName = 24;
+
 struct SwerveModuleGeometry {
-  const char* name;
-  uint16_t drive_id, steer_id, encoder_id;
-  double x_m, y_m;
-  double wheel_radius_m;
-  double drive_max_velocity_rps{20.0};
+  // Fixed buffer rather than std::string: this struct is walked twice per
+  // control tick, so it stays trivially copyable and allocation-free. The
+  // builder rejects an over-long name instead of truncating it.
+  std::array<char, kMaxSwerveModuleName> name{};
+  uint16_t drive_id{}, steer_id{}, encoder_id{};
+  double x_m{}, y_m{};
+  double wheel_radius_m{};
+  bool operator==(const SwerveModuleGeometry&) const = default;
 };
 
-inline constexpr std::array<SwerveModuleGeometry, 4> kSwerveModules{{
-    {"back_left", 1, 3, 2, -0.30, 0.30, 0.0508, 20.0},
-    {"back_right", 4, 6, 5, -0.30, -0.30, 0.0508, 20.0},
-    {"front_left", 8, 10, 9, 0.30, 0.30, 0.0508, 20.0},
-    {"front_right", 11, 13, 12, 0.30, -0.30, 0.0508, 20.0},
-}};
+struct SwerveGeometry {
+  std::array<SwerveModuleGeometry, kSwerveModuleCount> modules{};
+  bool operator==(const SwerveGeometry&) const = default;
+};
 
-inline void ValidateSwerve(const hardware::Config& config) {
+inline void ValidateSwerve(const hardware::Config& config,
+                           const SwerveGeometry& geometry) {
   hardware::Validate(config);
-  for (const auto& module : kSwerveModules) {
+  for (const auto& module : geometry.modules) {
     if (!std::isfinite(module.x_m) || !std::isfinite(module.y_m) ||
         !std::isfinite(module.wheel_radius_m) || module.wheel_radius_m <= 0)
       throw std::invalid_argument("invalid swerve geometry");
@@ -46,6 +57,7 @@ inline void ValidateSwerve(const hardware::Config& config) {
 // Computes robot-relative inverse kinematics and takes the shorter steering
 // path. Device-side ratios make position/velocity units mechanism rotations.
 inline hardware::Command SwerveCommand(const hardware::Config& config,
+                                       const SwerveGeometry& geometry,
                                        const hardware::State& state, double vx,
                                        double vy, double omega) {
   hardware::Command out{};
@@ -62,10 +74,10 @@ inline hardware::Command SwerveCommand(const hardware::Config& config,
   if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(omega))
     return out;
   constexpr double tau = 2 * std::numbers::pi;
-  std::array<double, 4> speeds{}, angles{};
+  std::array<double, kSwerveModuleCount> speeds{}, angles{};
   double scale = 1;
-  for (std::size_t i = 0; i < kSwerveModules.size(); ++i) {
-    const auto& module = kSwerveModules[i];
+  for (std::size_t i = 0; i < geometry.modules.size(); ++i) {
+    const auto& module = geometry.modules[i];
     const double x = vx - omega * module.y_m;
     const double y = vy + omega * module.x_m;
     speeds[i] = std::hypot(x, y) / (tau * module.wheel_radius_m);
@@ -76,8 +88,8 @@ inline hardware::Command SwerveCommand(const hardware::Config& config,
         scale = std::min(scale, motor.max_velocity_rps / speeds[i]);
     }
   }
-  for (std::size_t i = 0; i < kSwerveModules.size(); ++i) {
-    const auto& module = kSwerveModules[i];
+  for (std::size_t i = 0; i < geometry.modules.size(); ++i) {
+    const auto& module = geometry.modules[i];
     double current{};
     bool found = false;
     for (std::size_t j = 0; j < state.motor_count; ++j) {
@@ -108,13 +120,14 @@ inline hardware::Command SwerveCommand(const hardware::Config& config,
   return out;
 }
 
-inline void ComputeForwardKinematics(const hardware::State& state,
-                                     double& vx, double& vy, double& omega) {
+inline void ComputeForwardKinematics(const SwerveGeometry& geometry,
+                                     const hardware::State& state, double& vx,
+                                     double& vy, double& omega) {
   constexpr double tau = 2 * std::numbers::pi;
   double sum_vx = 0, sum_vy = 0, sum_omega = 0;
   int valid_modules = 0;
 
-  for (const auto& module : kSwerveModules) {
+  for (const auto& module : geometry.modules) {
     double steer_angle_rad = 0;
     double drive_rps = 0;
     bool has_steer = false, has_drive = false;
