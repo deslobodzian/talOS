@@ -45,8 +45,8 @@ inline hardware::Config ReferenceSwerveConfig(bool simulation = false) {
     drive.inverted = module.drive_inverted;
     drive.sensor_to_mechanism_ratio = 6.75;
     drive.max_velocity_rps = 20;
-    drive.slots[0].p = 0;
-    drive.slots[0].v = 0;
+    drive.slots[0].p = 0.1;
+    drive.slots[0].v = 0.12;
     c.motors.push_back(drive);
     hardware::MotorConfig steer;
     steer.id = module.steer_id;
@@ -62,7 +62,8 @@ inline hardware::Config ReferenceSwerveConfig(bool simulation = false) {
     steer.stator_limit_a = 40;
     steer.cruise_velocity_rps = 5;
     steer.acceleration_rps2 = 20;
-    steer.slots[0].p = 0;
+    steer.slots[0].p = 24.0;
+    steer.slots[0].d = 0.5;
     c.motors.push_back(steer);
   }
   c.sensors.push_back({7, "drivetrain_imu", hardware::SensorKind::kPigeon2, 30, "rio"});

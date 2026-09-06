@@ -9,7 +9,6 @@
 #include <thread>
 
 #include "PhoenixBackend.h"
-#include "hardware/sim_backend.h"
 
 #ifndef __FRC_ROBORIO__
 #include <frc/simulation/DriverStationSim.h>
@@ -111,11 +110,7 @@ class SimDriverStation {
 }  // namespace
 
 void Robot::StartCompetition() {
-  if (IsSimulation()) {
-    backend_ = std::make_unique<talos::hardware::SimBackend>();
-  } else {
-    backend_ = std::make_unique<PhoenixBackend>();
-  }
+  backend_ = std::make_unique<PhoenixBackend>(IsSimulation());
 
   // A fresh boot id every start, so a command built against a previous boot's
   // state can never be accepted after a code restart.
