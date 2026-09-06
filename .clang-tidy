@@ -15,5 +15,5 @@ Checks: >
   -performance-enum-size,
   -portability-avoid-pragma-once
 WarningsAsErrors: '*'
-HeaderFilterRegex: '^(common/protocol)[/\\].*'
+HeaderFilterRegex: '^(talOS/protocol)[/\\].*'
 FormatStyle: file

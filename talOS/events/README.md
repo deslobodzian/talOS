@@ -195,7 +195,7 @@ Capture never resumes, because resuming would put a hole in the middle of the
 log and replay would skip it without saying so. **Treat `failed()` as a robot
 fault**, next to a brownout or a lost CAN device: it means the rest of the match
 is not replayable. `error()` says why, and `capture_stopped()` distinguishes
-"the loop outran the writer" from a disk error. `//talOS/drivetrain:node` exits
+"the loop outran the writer" from a disk error. `//2026-robot/main_processor/drivetrain:node` exits
 non-zero and prints the reason; do the same in any process you add.
 
 `start()` sizes every chunk for the manifest's largest payload. A record larger

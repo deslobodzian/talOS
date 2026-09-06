@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include "common/hardware/config.h"
+#include "talOS/hardware/config.h"
 #include "toml.hpp"
 
 namespace talos::config {
