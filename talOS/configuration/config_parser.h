@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <optional>
@@ -132,6 +133,8 @@ inline std::string ReadString(const toml::table& tbl, const char* key,
 
 }  // namespace detail
 
+inline RobotConfig ParseRobotConfigTable(toml::table tbl);
+
 inline RobotConfig ParseRobotConfigString(std::string_view toml_content) {
   toml::table tbl;
   try {
@@ -139,7 +142,15 @@ inline RobotConfig ParseRobotConfigString(std::string_view toml_content) {
   } catch (const toml::parse_error& err) {
     throw std::invalid_argument(std::string("TOML parse error: ") + err.what());
   }
+  return ParseRobotConfigTable(std::move(tbl));
+}
 
+// The whole single-file validation: ownership, ids, ranges, cross-checks.
+// Takes the canonical view — either one file's [subsystems] table, or the
+// merged view ExpandManifest assembles — so splitting files cannot weaken a
+// check. toml_data keeps the merged table, which is what GetSubsystemTable
+// answers from.
+inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
   RobotConfig result;
   result.toml_data = tbl;
 
@@ -781,14 +792,90 @@ inline RobotConfig ParseRobotConfigString(std::string_view toml_content) {
   return result;
 }
 
-inline RobotConfig ParseRobotConfig(const std::string& path) {
+namespace detail {
+
+// Read and parse one TOML file; every error names the file.
+inline toml::table ParseTomlFile(const std::string& path) {
   std::ifstream f(path);
   if (!f.is_open()) {
     throw std::invalid_argument("cannot open file: " + path);
   }
   std::stringstream ss;
   ss << f.rdbuf();
-  return ParseRobotConfigString(ss.str());
+  try {
+    return toml::parse(ss.str());
+  } catch (const toml::parse_error& err) {
+    throw std::invalid_argument("TOML parse error in " + path + ": " + err.what());
+  }
+}
+
+inline void CopyTableInto(toml::table& dst, const toml::table& src) {
+  for (auto&& [k, v] : src) {
+    dst.insert_or_assign(std::string(k.str()), toml::node{v});
+  }
+}
+
+}  // namespace detail
+
+inline RobotConfig ParseRobotConfig(const std::string& path) {
+  namespace fs = std::filesystem;
+  toml::table tbl = detail::ParseTomlFile(path);
+
+  // Manifest mode: [[subsystems]] names one file per subsystem. Each file is
+  // merged into the canonical single-file view before validating: the
+  // subsystem's view is its [subsystem] scalars (minus the name) plus every
+  // other top-level table, exactly the old [subsystems.<name>] shape.
+  if (auto* manifest = tbl["subsystems"].as_array()) {
+    const fs::path base = fs::path(path).parent_path();
+    toml::table subs_view;
+    for (auto&& entry_node : *manifest) {
+      auto* entry = entry_node.as_table();
+      if (!entry) {
+        throw std::invalid_argument("invalid [[subsystems]] entry in " + path + ": must be a table");
+      }
+      auto name_view = (*entry)["name"].value<std::string_view>();
+      auto rel_view = (*entry)["path"].value<std::string_view>();
+      if (!name_view || !rel_view) {
+        throw std::invalid_argument("invalid [[subsystems]] entry in " + path + ": needs 'name' and 'path'");
+      }
+      const std::string name(*name_view);
+      fs::path file(std::string(*rel_view));
+      if (file.is_relative()) file = base / file;
+      toml::table sub_file = detail::ParseTomlFile(file.string());
+
+      auto* header = sub_file["subsystem"].as_table();
+      if (!header) {
+        throw std::invalid_argument(file.string() + ": missing [subsystem] table");
+      }
+      auto file_name = (*header)["name"].value<std::string_view>();
+      if (!file_name || *file_name != name) {
+        throw std::invalid_argument(file.string() + ": [subsystem].name must match manifest entry '" + name + "'");
+      }
+      if (subs_view.contains(name)) {
+        throw std::invalid_argument("duplicate [[subsystems]] entry in " + path + ": '" + name + "'");
+      }
+      toml::table view;
+      for (auto&& [k, v] : *header) {
+        if (k.str() == "name") continue;
+        view.insert_or_assign(std::string(k.str()), toml::node{v});
+      }
+      for (auto&& [k, v] : sub_file) {
+        if (k.str() == "subsystem") continue;
+        view.insert_or_assign(std::string(k.str()), toml::node{v});
+      }
+      subs_view.insert_or_assign(name, std::move(view));
+    }
+    toml::table merged;
+    if (auto* robot_tbl = tbl["robot"].as_table()) {
+      toml::table robot_copy;
+      detail::CopyTableInto(robot_copy, *robot_tbl);
+      merged.insert_or_assign("robot", std::move(robot_copy));
+    }
+    merged.insert_or_assign("subsystems", std::move(subs_view));
+    return ParseRobotConfigTable(std::move(merged));
+  }
+
+  return ParseRobotConfigTable(std::move(tbl));
 }
 
 }  // namespace talos::config

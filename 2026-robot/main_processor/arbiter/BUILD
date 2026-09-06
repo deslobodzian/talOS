@@ -1,5 +1,8 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+
+# The subsystem's own config file, so the robot manifest filegroup can ship it.
+exports_files(["subsystem.toml"])
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 cc_library(
@@ -35,7 +38,7 @@ cc_test(
     name = "node_test",
     size = "small",
     srcs = ["node_test.cc"],
-    data = ["//2026-robot/main_processor/configuration:robot.toml"],
+    data = ["//2026-robot/main_processor/configuration:robot_config"],
     deps = [
         ":arbiter",
         "//2026-robot/main_processor/operator_interface:operator_interface",

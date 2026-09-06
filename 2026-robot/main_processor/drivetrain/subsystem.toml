@@ -1,0 +1,230 @@
+# Drivetrain subsystem. Parsed via the [[subsystems]] manifest in
+# 2026-robot/main_processor/configuration/robot.toml and merged with the other
+# subsystem files into one canonical view before validation.
+[subsystem]
+name = "drivetrain"
+node = "//2026-robot/main_processor/drivetrain:node"
+period_us = 5000
+
+[motors.back_left_drive]
+type = "TalonFX"
+bus = "rio"
+can_id = 5
+inverted = false
+brake = true
+supply_limit_a = 40.0
+stator_limit_a = 80.0
+max_voltage = 12.0
+feedback = "Rotor"
+rotor_to_sensor_ratio = 1.0
+sensor_to_mechanism_ratio = 6.75
+continuous_wrap = false
+soft_limits = false
+reverse_limit_rot = -1.0
+forward_limit_rot = 1.0
+max_velocity_rps = 20.0
+cruise_velocity_rps = 20.0
+acceleration_rps2 = 40.0
+jerk_rps3 = 0.0
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
+
+[motors.back_left_steer]
+type = "TalonFX"
+bus = "rio"
+can_id = 6
+inverted = false
+brake = true
+supply_limit_a = 20.0
+stator_limit_a = 40.0
+max_voltage = 12.0
+feedback = "RemoteCANcoder"
+feedback_sensor = "back_left_encoder"
+rotor_to_sensor_ratio = 12.8
+sensor_to_mechanism_ratio = 1.0
+continuous_wrap = true
+soft_limits = false
+reverse_limit_rot = -1.0
+forward_limit_rot = 1.0
+max_velocity_rps = 100.0
+cruise_velocity_rps = 5.0
+acceleration_rps2 = 20.0
+jerk_rps3 = 0.0
+slot0 = { p = 24.0, i = 0.0, d = 0.5, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[sensors.back_left_encoder]
+type = "CANcoder"
+bus = "rio"
+can_id = 22
+offset_rot = 0.0
+inverted = false
+
+[motors.back_right_drive]
+type = "TalonFX"
+bus = "rio"
+can_id = 7
+inverted = false
+brake = true
+supply_limit_a = 40.0
+stator_limit_a = 80.0
+max_voltage = 12.0
+feedback = "Rotor"
+rotor_to_sensor_ratio = 1.0
+sensor_to_mechanism_ratio = 6.75
+continuous_wrap = false
+soft_limits = false
+reverse_limit_rot = -1.0
+forward_limit_rot = 1.0
+max_velocity_rps = 20.0
+cruise_velocity_rps = 20.0
+acceleration_rps2 = 40.0
+jerk_rps3 = 0.0
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
+
+[motors.back_right_steer]
+type = "TalonFX"
+bus = "rio"
+can_id = 8
+inverted = false
+brake = true
+supply_limit_a = 20.0
+stator_limit_a = 40.0
+max_voltage = 12.0
+feedback = "RemoteCANcoder"
+feedback_sensor = "back_right_encoder"
+rotor_to_sensor_ratio = 12.8
+sensor_to_mechanism_ratio = 1.0
+continuous_wrap = true
+soft_limits = false
+reverse_limit_rot = -1.0
+forward_limit_rot = 1.0
+max_velocity_rps = 100.0
+cruise_velocity_rps = 5.0
+acceleration_rps2 = 20.0
+jerk_rps3 = 0.0
+slot0 = { p = 24.0, i = 0.0, d = 0.5, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[sensors.back_right_encoder]
+type = "CANcoder"
+bus = "rio"
+can_id = 23
+offset_rot = 0.0
+inverted = false
+
+[sensors.drivetrain_imu]
+type = "Pigeon2"
+bus = "rio"
+can_id = 30
+
+[motors.front_left_drive]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+inverted = false
+brake = true
+supply_limit_a = 40.0
+stator_limit_a = 80.0
+max_voltage = 12.0
+feedback = "Rotor"
+rotor_to_sensor_ratio = 1.0
+sensor_to_mechanism_ratio = 6.75
+continuous_wrap = false
+soft_limits = false
+reverse_limit_rot = -1.0
+forward_limit_rot = 1.0
+max_velocity_rps = 20.0
+cruise_velocity_rps = 20.0
+acceleration_rps2 = 40.0
+jerk_rps3 = 0.0
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
+
+[motors.front_left_steer]
+type = "TalonFX"
+bus = "rio"
+can_id = 2
+inverted = false
+brake = true
+supply_limit_a = 20.0
+stator_limit_a = 40.0
+max_voltage = 12.0
+feedback = "RemoteCANcoder"
+feedback_sensor = "front_left_encoder"
+rotor_to_sensor_ratio = 12.8
+sensor_to_mechanism_ratio = 1.0
+continuous_wrap = true
+soft_limits = false
+reverse_limit_rot = -1.0
+forward_limit_rot = 1.0
+max_velocity_rps = 100.0
+cruise_velocity_rps = 5.0
+acceleration_rps2 = 20.0
+jerk_rps3 = 0.0
+slot0 = { p = 24.0, i = 0.0, d = 0.5, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[sensors.front_left_encoder]
+type = "CANcoder"
+bus = "rio"
+can_id = 20
+offset_rot = 0.0
+inverted = false
+
+[motors.front_right_drive]
+type = "TalonFX"
+bus = "rio"
+can_id = 3
+inverted = false
+brake = true
+supply_limit_a = 40.0
+stator_limit_a = 80.0
+max_voltage = 12.0
+feedback = "Rotor"
+rotor_to_sensor_ratio = 1.0
+sensor_to_mechanism_ratio = 6.75
+continuous_wrap = false
+soft_limits = false
+reverse_limit_rot = -1.0
+forward_limit_rot = 1.0
+max_velocity_rps = 20.0
+cruise_velocity_rps = 20.0
+acceleration_rps2 = 40.0
+jerk_rps3 = 0.0
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
+
+[motors.front_right_steer]
+type = "TalonFX"
+bus = "rio"
+can_id = 4
+inverted = false
+brake = true
+supply_limit_a = 20.0
+stator_limit_a = 40.0
+max_voltage = 12.0
+feedback = "RemoteCANcoder"
+feedback_sensor = "front_right_encoder"
+rotor_to_sensor_ratio = 12.8
+sensor_to_mechanism_ratio = 1.0
+continuous_wrap = true
+soft_limits = false
+reverse_limit_rot = -1.0
+forward_limit_rot = 1.0
+max_velocity_rps = 100.0
+cruise_velocity_rps = 5.0
+acceleration_rps2 = 20.0
+jerk_rps3 = 0.0
+slot0 = { p = 24.0, i = 0.0, d = 0.5, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[sensors.front_right_encoder]
+type = "CANcoder"
+bus = "rio"
+can_id = 21
+offset_rot = 0.0
+inverted = false
+
+# Subsystem-specific values the node needs but the RIO does not.
+[geometry]
+wheel_radius_m = 0.0508
+modules = [
+  { name = "back_left", x_m = -0.30, y_m = 0.30, drive = "back_left_drive", steer = "back_left_steer", encoder = "back_left_encoder" },
+  { name = "back_right", x_m = -0.30, y_m = -0.30, drive = "back_right_drive", steer = "back_right_steer", encoder = "back_right_encoder" },
+  { name = "front_left", x_m = 0.30, y_m = 0.30, drive = "front_left_drive", steer = "front_left_steer", encoder = "front_left_encoder" },
+  { name = "front_right", x_m = 0.30, y_m = -0.30, drive = "front_right_drive", steer = "front_right_steer", encoder = "front_right_encoder" },
+]

@@ -7,19 +7,21 @@ NEW split format (PLAN.md section 7, one file per subsystem)::
     node = "//2026-robot/main_processor/intake:node"
     period_us = 5000
 
-    [subsystem.motors.roller]
+    [motors.roller]
     type = "TalonFX"
     bus = "rio"
     can_id = 9
     ...
 
-    [subsystem.sensors.beam]
+    [sensors.beam]
     type = "CANcoder"
     bus = "rio"
     can_id = 20
     ...
 
-Any other [subsystem.<kind>.<device>] table is preserved verbatim. Motor and
+Device tables are top-level ([<kind>.<device>]); the [subsystem] header holds
+only name/node/period_us scalars. Any other [<kind>.<device>] table is
+preserved verbatim. Motor and
 sensor tables additionally require type/bus/can_id (legacy aliases
 canbus->bus, id->can_id accepted) and share the robot-wide exclusivity rule:
 no two devices on one (bus, can_id).
@@ -85,13 +87,18 @@ def parse_subsystem(toml_path: Path | str) -> Subsystem:
     if "subsystem" not in data or not isinstance(data["subsystem"], dict):
         raise ValueError(f"{toml_path}: missing [subsystem] table")
     header = data["subsystem"]
-    scalar = {k: v for k, v in header.items() if not isinstance(v, dict)}
-    unknown = set(scalar) - VALID_SUBSYSTEM_KEYS
-    if unknown:
-        raise ValueError(f"{toml_path}: [subsystem] has unknown keys: {sorted(unknown)}")
+    nested = [k for k, v in header.items() if isinstance(v, dict)]
+    if nested:
+        raise ValueError(
+            f"{toml_path}: [subsystem] contains tables {sorted(nested)}; "
+            "device tables are top-level ([<kind>.<device>]), not nested"
+        )
+    scalar = dict(header)
     for key in ("name", "node", "period_us"):
         if key not in scalar:
             raise ValueError(f"{toml_path}: [subsystem] is missing '{key}'")
+    header_extra = {k: v for k, v in scalar.items()
+                    if k not in VALID_SUBSYSTEM_KEYS}
 
     name = scalar["name"]
     if not NODE_NAME_RE.fullmatch(name) or "__" in name or name.endswith("_"):
@@ -107,16 +114,27 @@ def parse_subsystem(toml_path: Path | str) -> Subsystem:
         raise ValueError(f"{toml_path}: period_us must be a positive integer")
 
     devices: list[Device] = []
+    extra: dict[str, dict] = {}
     seen_device_names: set[str] = set()
-    for kind, table in header.items():
+    for kind, table in data.items():
+        if kind == "subsystem":
+            continue
         if not isinstance(table, dict):
+            raise ValueError(
+                f"{toml_path}: unexpected top-level key '{kind}'; "
+                "device tables are [<kind>.<device>]"
+            )
+        if any(not isinstance(v, dict) for v in table.values()):
+            # Node-private section ([geometry], ...): not devices, kept
+            # verbatim for round-trip. A device table is all tables.
+            extra[kind] = table
             continue
         for dev_name, attrs in table.items():
             if not isinstance(attrs, dict):
                 raise ValueError(
-                    f"{toml_path}: [subsystem.{kind}.{dev_name}] must be a table"
+                    f"{toml_path}: [{kind}.{dev_name}] must be a table"
                 )
-            label = f"[subsystem.{kind}.{dev_name}]"
+            label = f"[{kind}.{dev_name}]"
             if dev_name in seen_device_names:
                 raise ValueError(f"{toml_path}: duplicate device name '{dev_name}'")
             seen_device_names.add(dev_name)
@@ -151,4 +169,5 @@ def parse_subsystem(toml_path: Path | str) -> Subsystem:
             )
 
     return Subsystem(name=name, node_target=scalar["node"],
-                     period_us=period_us, devices=devices)
+                     period_us=period_us, devices=devices, extra=extra,
+                     header_extra=header_extra)

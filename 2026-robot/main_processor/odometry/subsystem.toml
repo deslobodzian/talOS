@@ -1,0 +1,6 @@
+# Fuses drivetrain and shooter state into a field pose on /odometry/state. Owns
+# no actuators.
+[subsystem]
+name = "odometry"
+node = "//2026-robot/main_processor/odometry:node"
+period_us = 5000

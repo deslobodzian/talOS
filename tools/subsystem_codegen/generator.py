@@ -46,15 +46,22 @@ def render_subsystem_toml(subsystem: Subsystem) -> str:
         f'node = "{subsystem.node_target}"',
         f"period_us = {subsystem.period_us}",
     ]
+    for key, value in subsystem.header_extra.items():
+        lines.append(f"{key} = {_toml_value(value)}")
     kinds: dict[str, list] = {}
     for dev in subsystem.devices:
         kinds.setdefault(dev.kind, []).append(dev)
     for kind, devs in kinds.items():
         for dev in devs:
             lines.append("")
-            lines.append(f"[subsystem.{kind}.{dev.name}]")
+            lines.append(f"[{kind}.{dev.name}]")
             for key, value in dev.attrs.items():
                 lines.append(f"{key} = {_toml_value(value)}")
+    for section, table in subsystem.extra.items():
+        lines.append("")
+        lines.append(f"[{section}]")
+        for key, value in table.items():
+            lines.append(f"{key} = {_toml_value(value)}")
     return "\n".join(lines) + "\n"
 
 
@@ -499,22 +506,16 @@ def render_build(subsystem: Subsystem) -> str:
     )
 
 
-def robot_stanza(subsystem: Subsystem) -> str:
+def robot_stanza(subsystem: Subsystem, toml_relpath: str | None = None) -> str:
     """Step 1: the manifest block to merge into robot.toml. Printed, never
     auto-applied: adding a device renumbers logical ids, so the config golden
     test must be updated alongside by a human."""
-    lines = [
-        f"[subsystems.{subsystem.name}]",
-        f'node = "{subsystem.node_target}"',
-        f"period_us = {subsystem.period_us}",
-        "",
-    ]
-    for dev in subsystem.devices:
-        lines.append(f"[subsystems.{subsystem.name}.{dev.kind}.{dev.name}]")
-        for key, value in dev.attrs.items():
-            lines.append(f"{key} = {_toml_value(value)}")
-        lines.append("")
-    return "\n".join(lines).rstrip("\n") + "\n"
+    rel = toml_relpath or f"../{subsystem.name}/subsystem.toml"
+    return (
+        "[[subsystems]]\n"
+        f'name = "{subsystem.name}"\n'
+        f'path = "{rel}"\n'
+    )
 
 
 def generate(subsystem: Subsystem, out_dir: Path | str) -> list[Path]:

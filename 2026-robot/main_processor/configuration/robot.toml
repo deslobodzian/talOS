@@ -6,299 +6,35 @@ status_hz = 200.0
 commissioned = false
 sim_gateway = "//2026-robot/main_processor/drivetrain:sim_gateway"
 
-[subsystems.drivetrain]
-node = "//2026-robot/main_processor/drivetrain:node"
-period_us = 5000
+# Subsystem manifest. Each entry names one subsystem node and the file holding
+# its config, pathed relative to this file. The parser merges every listed
+# file into one canonical view BEFORE validating, so exclusive-ownership and
+# deterministic (subsystem, device) id ordering behave exactly as one file.
+# Manifest order is irrelevant: logical ids sort by (subsystem, device) name.
+[[subsystems]]
+name = "arbiter"
+path = "../arbiter/subsystem.toml"
 
-[subsystems.drivetrain.motors.back_left_drive]
-type = "TalonFX"
-bus = "rio"
-can_id = 5
-inverted = false
-brake = true
-supply_limit_a = 40.0
-stator_limit_a = 80.0
-max_voltage = 12.0
-feedback = "Rotor"
-rotor_to_sensor_ratio = 1.0
-sensor_to_mechanism_ratio = 6.75
-continuous_wrap = false
-soft_limits = false
-reverse_limit_rot = -1.0
-forward_limit_rot = 1.0
-max_velocity_rps = 20.0
-cruise_velocity_rps = 20.0
-acceleration_rps2 = 40.0
-jerk_rps3 = 0.0
-slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
+[[subsystems]]
+name = "drivetrain"
+path = "../drivetrain/subsystem.toml"
 
-[subsystems.drivetrain.motors.back_left_steer]
-type = "TalonFX"
-bus = "rio"
-can_id = 6
-inverted = false
-brake = true
-supply_limit_a = 20.0
-stator_limit_a = 40.0
-max_voltage = 12.0
-feedback = "RemoteCANcoder"
-feedback_sensor = "back_left_encoder"
-rotor_to_sensor_ratio = 12.8
-sensor_to_mechanism_ratio = 1.0
-continuous_wrap = true
-soft_limits = false
-reverse_limit_rot = -1.0
-forward_limit_rot = 1.0
-max_velocity_rps = 100.0
-cruise_velocity_rps = 5.0
-acceleration_rps2 = 20.0
-jerk_rps3 = 0.0
-slot0 = { p = 24.0, i = 0.0, d = 0.5, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+[[subsystems]]
+name = "driver_station"
+path = "../driver_station/subsystem.toml"
 
-[subsystems.drivetrain.sensors.back_left_encoder]
-type = "CANcoder"
-bus = "rio"
-can_id = 22
-offset_rot = 0.0
-inverted = false
+[[subsystems]]
+name = "odometry"
+path = "../odometry/subsystem.toml"
 
-[subsystems.drivetrain.motors.back_right_drive]
-type = "TalonFX"
-bus = "rio"
-can_id = 7
-inverted = false
-brake = true
-supply_limit_a = 40.0
-stator_limit_a = 80.0
-max_voltage = 12.0
-feedback = "Rotor"
-rotor_to_sensor_ratio = 1.0
-sensor_to_mechanism_ratio = 6.75
-continuous_wrap = false
-soft_limits = false
-reverse_limit_rot = -1.0
-forward_limit_rot = 1.0
-max_velocity_rps = 20.0
-cruise_velocity_rps = 20.0
-acceleration_rps2 = 40.0
-jerk_rps3 = 0.0
-slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
+[[subsystems]]
+name = "operator_interface"
+path = "../operator_interface/subsystem.toml"
 
-[subsystems.drivetrain.motors.back_right_steer]
-type = "TalonFX"
-bus = "rio"
-can_id = 8
-inverted = false
-brake = true
-supply_limit_a = 20.0
-stator_limit_a = 40.0
-max_voltage = 12.0
-feedback = "RemoteCANcoder"
-feedback_sensor = "back_right_encoder"
-rotor_to_sensor_ratio = 12.8
-sensor_to_mechanism_ratio = 1.0
-continuous_wrap = true
-soft_limits = false
-reverse_limit_rot = -1.0
-forward_limit_rot = 1.0
-max_velocity_rps = 100.0
-cruise_velocity_rps = 5.0
-acceleration_rps2 = 20.0
-jerk_rps3 = 0.0
-slot0 = { p = 24.0, i = 0.0, d = 0.5, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+[[subsystems]]
+name = "shooter"
+path = "../shooter/subsystem.toml"
 
-[subsystems.drivetrain.sensors.back_right_encoder]
-type = "CANcoder"
-bus = "rio"
-can_id = 23
-offset_rot = 0.0
-inverted = false
-
-[subsystems.drivetrain.sensors.drivetrain_imu]
-type = "Pigeon2"
-bus = "rio"
-can_id = 30
-
-[subsystems.drivetrain.motors.front_left_drive]
-type = "TalonFX"
-bus = "rio"
-can_id = 1
-inverted = false
-brake = true
-supply_limit_a = 40.0
-stator_limit_a = 80.0
-max_voltage = 12.0
-feedback = "Rotor"
-rotor_to_sensor_ratio = 1.0
-sensor_to_mechanism_ratio = 6.75
-continuous_wrap = false
-soft_limits = false
-reverse_limit_rot = -1.0
-forward_limit_rot = 1.0
-max_velocity_rps = 20.0
-cruise_velocity_rps = 20.0
-acceleration_rps2 = 40.0
-jerk_rps3 = 0.0
-slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
-
-[subsystems.drivetrain.motors.front_left_steer]
-type = "TalonFX"
-bus = "rio"
-can_id = 2
-inverted = false
-brake = true
-supply_limit_a = 20.0
-stator_limit_a = 40.0
-max_voltage = 12.0
-feedback = "RemoteCANcoder"
-feedback_sensor = "front_left_encoder"
-rotor_to_sensor_ratio = 12.8
-sensor_to_mechanism_ratio = 1.0
-continuous_wrap = true
-soft_limits = false
-reverse_limit_rot = -1.0
-forward_limit_rot = 1.0
-max_velocity_rps = 100.0
-cruise_velocity_rps = 5.0
-acceleration_rps2 = 20.0
-jerk_rps3 = 0.0
-slot0 = { p = 24.0, i = 0.0, d = 0.5, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
-
-[subsystems.drivetrain.sensors.front_left_encoder]
-type = "CANcoder"
-bus = "rio"
-can_id = 20
-offset_rot = 0.0
-inverted = false
-
-[subsystems.drivetrain.motors.front_right_drive]
-type = "TalonFX"
-bus = "rio"
-can_id = 3
-inverted = false
-brake = true
-supply_limit_a = 40.0
-stator_limit_a = 80.0
-max_voltage = 12.0
-feedback = "Rotor"
-rotor_to_sensor_ratio = 1.0
-sensor_to_mechanism_ratio = 6.75
-continuous_wrap = false
-soft_limits = false
-reverse_limit_rot = -1.0
-forward_limit_rot = 1.0
-max_velocity_rps = 20.0
-cruise_velocity_rps = 20.0
-acceleration_rps2 = 40.0
-jerk_rps3 = 0.0
-slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
-
-[subsystems.drivetrain.motors.front_right_steer]
-type = "TalonFX"
-bus = "rio"
-can_id = 4
-inverted = false
-brake = true
-supply_limit_a = 20.0
-stator_limit_a = 40.0
-max_voltage = 12.0
-feedback = "RemoteCANcoder"
-feedback_sensor = "front_right_encoder"
-rotor_to_sensor_ratio = 12.8
-sensor_to_mechanism_ratio = 1.0
-continuous_wrap = true
-soft_limits = false
-reverse_limit_rot = -1.0
-forward_limit_rot = 1.0
-max_velocity_rps = 100.0
-cruise_velocity_rps = 5.0
-acceleration_rps2 = 20.0
-jerk_rps3 = 0.0
-slot0 = { p = 24.0, i = 0.0, d = 0.5, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
-
-[subsystems.drivetrain.sensors.front_right_encoder]
-type = "CANcoder"
-bus = "rio"
-can_id = 21
-offset_rot = 0.0
-inverted = false
-
-# Subsystem-specific values the node needs but the RIO does not.
-[subsystems.drivetrain.geometry]
-wheel_radius_m = 0.0508
-modules = [
-  { name = "back_left", x_m = -0.30, y_m = 0.30, drive = "back_left_drive", steer = "back_left_steer", encoder = "back_left_encoder" },
-  { name = "back_right", x_m = -0.30, y_m = -0.30, drive = "back_right_drive", steer = "back_right_steer", encoder = "back_right_encoder" },
-  { name = "front_left", x_m = 0.30, y_m = 0.30, drive = "front_left_drive", steer = "front_left_steer", encoder = "front_left_encoder" },
-  { name = "front_right", x_m = 0.30, y_m = -0.30, drive = "front_right_drive", steer = "front_right_steer", encoder = "front_right_encoder" },
-]
-
-# Sole writer of /drivetrain/target and /shooter/target. Owns no actuators, so
-# like the driver station it is input-only and the bridge keeps no request
-# tracker for it.
-[subsystems.arbiter]
-node = "//2026-robot/main_processor/arbiter:node"
-period_us = 20000
-
-# Fuses drivetrain and shooter state into a field pose on /odometry/state. Owns
-# no actuators.
-[subsystems.odometry]
-node = "//2026-robot/main_processor/odometry:node"
-period_us = 5000
-
-[subsystems.shooter]
-node = "//2026-robot/main_processor/shooter:node"
-period_us = 5000
-
-[subsystems.shooter.motors.flywheel]
-type = "TalonFX"
-bus = "rio"
-can_id = 9
-inverted = false
-brake = false
-supply_limit_a = 40.0
-stator_limit_a = 80.0
-max_voltage = 12.0
-sensor_to_mechanism_ratio = 1.0
-max_velocity_rps = 100.0
-cruise_velocity_rps = 80.0
-acceleration_rps2 = 160.0
-slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
-
-[subsystems.shooter.digital_inputs.beam_break]
-dio = 0
-
-# Decodes the Driver Station packet and republishes it; holds no policy. Owns no
-# actuators, so the hardware node keeps no request tracker for it. period_us is
-# the Driver Station sample rate (50 Hz), which must stay in sync with
-# driver_station::kSamplePeriodUs on the Rio side.
-[subsystems.driver_station]
-node = "//2026-robot/main_processor/driver_station:node"
-period_us = 20000
-
-# What the driver's inputs mean: scaling, deadband and button bindings. This is
-# game logic and is expected to change through a season, which is why it is not
-# in the driver_station node.
-[subsystems.operator_interface]
-node = "//2026-robot/main_processor/operator_interface:node"
-period_us = 20000
-max_linear_mps = 4.0
-max_angular_radps = 6.0
-deadband = 0.05
-shooter_target_rps = 60.0
-# Stick is field-relative; falls back to robot-relative until the drivetrain
-# publishes a heading on /drivetrain/state.
-field_oriented = true
-# Bit 0 is button 1.
-shoot_button_mask = 1
-
-# Publishes Studio telemetry frames on `topic`, which must stay
-# /talos/telemetry: the reserved `talos` owner because the feed belongs to no
-# subsystem, and role `telemetry` because it is for recording and display only.
-# It is the only producer there, which the Studio bridge requires: that topic
-# uses DROP_NEWEST so a full queue drops a frame instead of overwriting bytes
-# the bridge is still sending.
-[subsystems.telemetry]
-node = "//2026-robot/main_processor/telemetry:node"
-period_us = 10000
-topic = "/talos/telemetry"
+[[subsystems]]
+name = "telemetry"
+path = "../telemetry/subsystem.toml"

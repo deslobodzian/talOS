@@ -1,0 +1,16 @@
+# What the driver's inputs mean: scaling, deadband and button bindings. This is
+# game logic and is expected to change through a season, which is why it is not
+# in the driver_station node.
+[subsystem]
+name = "operator_interface"
+node = "//2026-robot/main_processor/operator_interface:node"
+period_us = 20000
+max_linear_mps = 4.0
+max_angular_radps = 6.0
+deadband = 0.05
+shooter_target_rps = 60.0
+# Stick is field-relative; falls back to robot-relative until the drivetrain
+# publishes a heading on /drivetrain/state.
+field_oriented = true
+# Bit 0 is button 1.
+shoot_button_mask = 1

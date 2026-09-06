@@ -1,0 +1,7 @@
+# Sole writer of /drivetrain/target and /shooter/target. Owns no actuators, so
+# like the driver station it is input-only and the bridge keeps no request
+# tracker for it.
+[subsystem]
+name = "arbiter"
+node = "//2026-robot/main_processor/arbiter:node"
+period_us = 20000
