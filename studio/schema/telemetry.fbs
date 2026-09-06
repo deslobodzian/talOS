@@ -1,0 +1,18 @@
+namespace Talos.Telemetry;
+struct Pose { x:double; y:double; z:double; roll:double; pitch:double; yaw:double; }
+table Ghost { name:string (required); pose:Pose; }
+table Channel { name:string (required); value:double; unit:string; }
+table Target { id:uint; pose:Pose; }
+table Frame {
+  timestamp_ns:ulong;
+  sequence_id:ulong;
+  chassis:Pose;
+  ghosts:[Ghost];
+  channels:[Channel];
+  targets:[Target];
+  elevator_m:double;
+  arm_rad:double;
+  camera:Pose;
+}
+root_type Frame;
+file_identifier "TLMS";

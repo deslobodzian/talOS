@@ -10,7 +10,7 @@ flatbuffer_cc_library(
 )
 cc_library(
     name = "drivetrain",
-    hdrs = ["packet.h", "swerve.h", "node.h"],
+    hdrs = ["packet.h", "swerve.h", "geometry.h", "node.h"],
     deps = [
         ":drive_message",
         "//talOS/hardware:hardware",
@@ -24,7 +24,12 @@ cc_library(
 cc_binary(name = "node", srcs = ["main.cc"], deps = [":drivetrain"])
 cc_binary(name = "sim_gateway", srcs = ["sim_gateway.cc"], deps = [":drivetrain", "//talOS/hardware:hardware"])
 cc_binary(name = "send_target", srcs = ["send_target.cc"], deps = [":drivetrain", "//talOS/ipc:ipc"])
-cc_binary(name = "monitor", srcs = ["monitor.cc"], deps = [":drivetrain", "//talOS/ipc:ipc"])
+cc_binary(
+    name = "monitor",
+    srcs = ["monitor.cc"],
+    data = ["//2026-robot/main_processor/configuration:robot.toml"],
+    deps = [":drivetrain", "//talOS/ipc:ipc"],
+)
 
 cc_test(
     name = "node_test",

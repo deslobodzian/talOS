@@ -1,0 +1,10 @@
+{
+  "identifier": "main",
+  "description": "Local studio window",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default"
+  ]
+}

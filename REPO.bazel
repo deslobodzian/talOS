@@ -1,0 +1,2 @@
+# Source package managers and native build caches are not Bazel packages.
+ignore_directories(["**/node_modules", "studio/src-tauri/target", "studio/build"])

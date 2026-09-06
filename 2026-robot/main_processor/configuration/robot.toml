@@ -233,6 +233,19 @@ modules = [
   { name = "front_right", x_m = 0.30, y_m = -0.30, drive = "front_right_drive", steer = "front_right_steer", encoder = "front_right_encoder" },
 ]
 
+# Sole writer of /drivetrain/tgt and /shooter/tgt. Owns no actuators, so like
+# the driver station it is input-only and the bridge keeps no request tracker
+# for it.
+[subsystems.arbiter]
+node = "//2026-robot/main_processor/arbiter:node"
+period_us = 20000
+
+# Fuses drivetrain and shooter state into a field pose on /odometry. Owns no
+# actuators.
+[subsystems.odometry]
+node = "//2026-robot/main_processor/odometry:node"
+period_us = 5000
+
 [subsystems.shooter]
 node = "//2026-robot/main_processor/shooter:node"
 period_us = 5000
@@ -255,14 +268,34 @@ slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
 [subsystems.shooter.digital_inputs.beam_break]
 dio = 0
 
-# Input-only subsystem: owns no actuators, so the hardware node keeps no
-# request tracker for it. period_us is the Driver Station sample rate (50 Hz),
-# which must stay in sync with driver_station::kSamplePeriodUs on the Rio side.
+# Decodes the Driver Station packet and republishes it; holds no policy. Owns no
+# actuators, so the hardware node keeps no request tracker for it. period_us is
+# the Driver Station sample rate (50 Hz), which must stay in sync with
+# driver_station::kSamplePeriodUs on the Rio side.
 [subsystems.driver_station]
 node = "//2026-robot/main_processor/driver_station:node"
+period_us = 20000
+
+# What the driver's inputs mean: scaling, deadband and button bindings. This is
+# game logic and is expected to change through a season, which is why it is not
+# in the driver_station node.
+[subsystems.operator_interface]
+node = "//2026-robot/main_processor/operator_interface:node"
 period_us = 20000
 max_linear_mps = 4.0
 max_angular_radps = 6.0
 deadband = 0.05
 shooter_target_rps = 60.0
+# Stick is field-relative; falls back to robot-relative until the drivetrain
+# publishes a heading on /drivetrain/state.
+field_oriented = true
+# Bit 0 is button 1.
+shoot_button_mask = 1
 
+# Publishes Studio telemetry frames on `topic`. It is the only producer there,
+# which the Studio bridge requires: that topic uses DROP_NEWEST so a full queue
+# drops a frame instead of overwriting bytes the bridge is still sending.
+[subsystems.telemetry]
+node = "//2026-robot/main_processor/telemetry:node"
+period_us = 10000
+topic = "/talos_studio"

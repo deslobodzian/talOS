@@ -1,7 +1,13 @@
 #include "rtms.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -22,14 +28,64 @@ std::string_view ValidatePath(std::string_view path) {
   }
   return path;
 }
+// Unlinks an existing segment whose layout does not match what the caller is
+// about to create, so the next shm_open makes a fresh one. Only the topic's
+// publisher passes allowed=true. Unlinking does not disturb a process that
+// still has the old segment mapped; it only removes the name, so a straggler
+// from the previous build keeps running against memory nobody new can reach.
+const std::string& ReclaimMismatchedSegment(const std::string& path,
+                                            std::uint64_t total_bytes,
+                                            std::uint64_t slots,
+                                            std::uint64_t message_bytes,
+                                            std::uint64_t message_alignment,
+                                            bool allowed) {
+  if (!allowed) {
+    return path;
+  }
+  const int fd = shm_open(path.c_str(), O_RDWR, 0666);
+  if (fd == -1) {
+    return path;  // Nothing there, which is the normal case.
+  }
+
+  // The header the creator wrote is the authority on layout. The file size is
+  // not: shm objects are rounded up to a page, so an intact segment routinely
+  // measures larger than it was asked for, and comparing sizes would condemn
+  // healthy segments and unlink them out from under live readers.
+  bool mismatched = false;
+  struct stat info{};
+  if (fstat(fd, &info) < 0 ||
+      static_cast<std::uint64_t>(info.st_size) < sizeof(RTMSHeader)) {
+    mismatched = true;  // Too small to even carry a header.
+  } else {
+    void* mapped =
+        mmap(nullptr, sizeof(RTMSHeader), PROT_READ, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+      mismatched = true;
+    } else {
+      const auto* header = static_cast<const RTMSHeader*>(mapped);
+      mismatched = header->total_bytes != total_bytes ||
+                   header->slots != slots ||
+                   header->message_bytes != message_bytes ||
+                   header->message_alignment != message_alignment;
+      munmap(mapped, sizeof(RTMSHeader));
+    }
+  }
+  close(fd);
+
+  if (mismatched) {
+    std::fprintf(stderr,
+                 "rtms: reclaiming stale shared memory %s, its layout does not "
+                 "match this build\n",
+                 path.c_str());
+    shm_unlink(path.c_str());
+  }
+  return path;
+}
 }  // namespace
 
-RTMSQueue::RTMSQueue(std::string_view path,
-                     std::size_t message_size,
-                     std::size_t message_alignment,
-                     std::size_t slots,
-                     RTMSOptions options
-                     )
+RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
+                     std::size_t message_alignment, std::size_t slots,
+                     RTMSOptions options)
     : path_{ValidatePath(path)},
       slots_{slots},
       message_size_{message_size},
@@ -38,7 +94,10 @@ RTMSQueue::RTMSQueue(std::string_view path,
       stride_{align_up(message_size, message_alignment)},
       total_bytes_{data_offset_ + stride_ * slots_},
       options_{options},
-      ptr_{path_, total_bytes_} {
+      ptr_{ReclaimMismatchedSegment(path_, total_bytes_, slots_, message_size_,
+                                    message_alignment_,
+                                    options_.reclaim_mismatched_segment),
+           total_bytes_} {
   if (!is_pow_2(slots)) {
     throw std::invalid_argument("slots is not a power of 2!");
   }
@@ -73,7 +132,10 @@ RTMSQueue::RTMSQueue(std::string_view path,
     if (header_->slots != slots_ || header_->message_bytes != message_size_ ||
         header_->message_alignment != message_alignment_ ||
         header_->total_bytes != total_bytes_) {
-      throw std::runtime_error("RTMS shared-memory layout mismatch");
+      throw std::runtime_error(
+          "RTMS shared-memory layout mismatch on " + path_ +
+          ": this process was built against a different message layout than "
+          "the publisher that created the segment");
     }
   }
 }

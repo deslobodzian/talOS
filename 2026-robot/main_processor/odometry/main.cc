@@ -28,9 +28,19 @@ int main(int argc, char** argv) {
   try {
     std::string log_path = "/tmp/odometry.tlog", replay_path;
     int duration_s = 0;
+    uint64_t session_id = 0;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
-      if (arg == "--log" && i + 1 < argc)
+      // The launcher passes the same flags to every node it starts. This one
+      // reads no hardware and no configuration, so --sim and --config are
+      // accepted and ignored rather than refused.
+      if (arg == "--sim")
+        continue;
+      else if (arg == "--config" && i + 1 < argc)
+        ++i;
+      else if (arg == "--session-id" && i + 1 < argc)
+        session_id = std::stoull(argv[++i]);
+      else if (arg == "--log" && i + 1 < argc)
         log_path = argv[++i];
       else if (arg == "--replay" && i + 1 < argc)
         replay_path = argv[++i];
@@ -38,7 +48,8 @@ int main(int argc, char** argv) {
         duration_s = std::stoi(argv[++i]);
       else
         throw std::invalid_argument(
-            "usage: node [--duration-s N] [--log PATH] [--replay PATH]");
+            "usage: node [--sim] [--duration-s N] [--log PATH] "
+            "[--session-id ID] [--config PATH] [--replay PATH]");
     }
     if (duration_s < 0)
       throw std::invalid_argument("duration must be nonnegative");
@@ -54,7 +65,9 @@ int main(int argc, char** argv) {
     }
 
     talos::event::RealtimeEventLoop<talos::event::log::LogWriter> loop{
-        talos::event::log::LogWriter{log_path, "odometry"}};
+        talos::event::log::LogWriter{log_path, "odometry",
+                                     talos::event::log::LogWriterOptions{},
+                                     session_id}};
     talos::odometry::OdometryNode node{loop};
     talos::odometry::InstallStopHandlers();
     std::jthread stopper{[&](std::stop_token stop) {

@@ -260,8 +260,17 @@ class Launcher {
     try {
       robot_config = config::ParseRobotConfig(options_.config_path);
     } catch (const std::exception& e) {
+      // A relative config path is resolved against the working directory, so
+      // naming it is the difference between "the file is missing" and "you are
+      // standing somewhere else".
       std::cerr << "launcher: failed to load config from "
                 << options_.config_path << ": " << e.what() << "\n";
+      if (std::filesystem::path{options_.config_path}.is_relative()) {
+        std::cerr << "launcher: working directory is "
+                  << std::filesystem::current_path()
+                  << "; run from the repository root or pass an absolute "
+                     "--config path\n";
+      }
       return 1;
     }
 

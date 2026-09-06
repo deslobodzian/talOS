@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 
+#include "../protocol/frame.h"
 #include "config.h"
 
 namespace talos::hardware {
@@ -352,7 +353,7 @@ static_assert(sizeof(ConfigChunkHeader) == 24);
 static_assert(sizeof(ConfigAckPayload) == 73);
 
 inline std::vector<std::vector<uint8_t>> CreateConfigChunks(
-    const Config& config, std::size_t max_payload = 1200) {
+    const Config& config, std::size_t max_payload = protocol::kMaxPayloadSize) {
   const auto serialized = SerializeConfig(config);
   const uint64_t config_id = ConfigurationId(config);
   const uint32_t total_crc32 = ComputeCrc32(serialized);

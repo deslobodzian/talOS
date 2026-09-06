@@ -10,21 +10,22 @@
 namespace ipc {
 class RawPublisher {
 public:
-    explicit RawPublisher(
-        std::string_view topic,
-        size_t size,
-        size_t alignment,
-        RTMSOptions options = RTMSOptions{})
-        : topic_{topic}, queue_{topic, size, alignment, MAX_SLOTS, options}
-    {
+ explicit RawPublisher(std::string_view topic, size_t size, size_t alignment,
+                       RTMSOptions options = RTMSOptions{})
+     : topic_{topic},
+       queue_{topic, size, alignment, MAX_SLOTS, owning(options)} {}
+ WriteStatus write(const RTMSMessage& message) { return queue_.write(message); }
 
-    }
-    WriteStatus write(const RTMSMessage& message) {
-        return queue_.write(message);
-    }
+ RTMSQueue& queue() { return queue_; }
 
-    RTMSQueue& queue() { return queue_; }
 private:
+ // A publisher owns its topic's layout, so it is the one allowed to clear a
+ // segment left behind by an older build. See RTMSOptions.
+ static RTMSOptions owning(RTMSOptions options) {
+   options.reclaim_mismatched_segment = true;
+   return options;
+ }
+
     std::string topic_;
     RTMSQueue queue_;
 };

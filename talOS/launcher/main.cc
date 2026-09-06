@@ -1,11 +1,33 @@
+#include <unistd.h>
+
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 
 #include "talOS/launcher/launcher.h"
 
+namespace {
+
+// Node targets resolve to bazel-bin/... paths, and the default configuration
+// path is workspace-relative, so the launcher only makes sense with the
+// workspace as its working directory. `bazel run` starts a binary in its
+// runfiles tree instead, where neither resolves -- but it exports the
+// workspace it was invoked from, so honour that and behave the same either way.
+void EnterWorkspaceDirectory() {
+  const char* workspace = std::getenv("BUILD_WORKSPACE_DIRECTORY");
+  if (workspace == nullptr || *workspace == '\0') return;
+  if (chdir(workspace) != 0) {
+    std::cerr << "launcher: cannot enter workspace directory " << workspace
+              << "\n";
+  }
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
   try {
+    EnterWorkspaceDirectory();
     talos::launcher::LauncherOptions options;
 
     for (int i = 1; i < argc; ++i) {

@@ -1,5 +1,7 @@
+#include <fcntl.h>
 #include <flatbuffers/flatbuffers.h>
 #include <gtest/gtest.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <array>
@@ -1191,4 +1193,95 @@ TEST(RTMSQueue, RejectsTopicNamesLongerThan30CharsAfterLeadingSlash) {
     EXPECT_NO_THROW({
         RTMSQueue q(capped_30, sizeof(Message::TestMessage), alignof(Message::TestMessage));
     });
+}
+
+// A process killed before it could unlink leaves its segment behind. When the
+// next build changes a message's size, that leftover has the wrong shape and
+// nothing can attach to it, so the publisher -- which owns the topic's layout
+// -- clears it instead of every node failing to start until someone unlinks it
+// by hand.
+namespace {
+
+RTMSOptions publisher_options() {
+  RTMSOptions options = sequence_options();
+  options.reclaim_mismatched_segment = true;
+  return options;
+}
+
+// Leaves a segment of `bytes` behind at `path` with no live owner, the way a
+// SIGKILLed process does.
+void leak_segment(const std::string& path, std::size_t bytes) {
+  const int fd = shm_open(path.c_str(), O_CREAT | O_RDWR, 0666);
+  ASSERT_NE(fd, -1);
+  ASSERT_EQ(ftruncate(fd, static_cast<off_t>(bytes)), 0);
+  ASSERT_EQ(close(fd), 0);
+}
+
+}  // namespace
+
+TEST(RTMSStaleSegment, PublisherReclaimsALeftoverOfTheWrongShape) {
+  const std::string path = make_test_path("stale_reclaim");
+  shm_unlink(path.c_str());
+  leak_segment(path, 4096);
+
+  // Without the reclaim the leftover wins and construction fails outright.
+  EXPECT_THROW(RTMSQueue(path, sizeof(Message::TestMessage),
+                         alignof(Message::TestMessage), 64, sequence_options()),
+               std::runtime_error);
+
+  RTMSQueue queue{path, sizeof(Message::TestMessage),
+                  alignof(Message::TestMessage), 64, publisher_options()};
+  const Message::TestMessage message{7, 1.5F};
+  EXPECT_EQ(WriteResult(queue.write(RTMSMessage{sizeof(message), &message})),
+            WriteResult::SUCCESS);
+  shm_unlink(path.c_str());
+}
+
+TEST(RTMSStaleSegment, ReaderReportsSkewInsteadOfClearingTheSegment) {
+  const std::string path = make_test_path("stale_reader");
+  shm_unlink(path.c_str());
+  leak_segment(path, 4096);
+
+  // A reader that disagrees with a live publisher is a version skew, so it
+  // must say so rather than delete the topic out from under that publisher.
+  EXPECT_THROW(RTMSQueue(path, sizeof(Message::TestMessage),
+                         alignof(Message::TestMessage), 64, sequence_options()),
+               std::runtime_error);
+
+  // The segment is still there for the owner to deal with.
+  const int fd = shm_open(path.c_str(), O_RDWR, 0666);
+  EXPECT_NE(fd, -1);
+  if (fd != -1) close(fd);
+  shm_unlink(path.c_str());
+}
+
+TEST(RTMSStaleSegment, PublisherLeavesAHealthySegmentAloneUnderALiveReader) {
+  const std::string path = make_test_path("stale_healthy");
+  shm_unlink(path.c_str());
+
+  // A reader gets there first and takes a slot. The publisher that follows
+  // has an identical layout, so there is nothing to reclaim -- and unlinking
+  // here would strand this reader on memory no one else can reach. The shm
+  // object is page-rounded, so its measured size is larger than the layout
+  // asked for: only the recorded header can decide whether it matches.
+  RTMSQueue reader{path, sizeof(Message::TestMessage),
+                   alignof(Message::TestMessage), 64, sequence_options()};
+  const auto reader_id = reader.register_reader();
+  ASSERT_TRUE(reader_id.has_value());
+
+  RTMSQueue writer{path, sizeof(Message::TestMessage),
+                   alignof(Message::TestMessage), 64, publisher_options()};
+  const Message::TestMessage sent{42, 3.25F};
+  ASSERT_EQ(WriteResult(writer.write(RTMSMessage{sizeof(sent), &sent})),
+            WriteResult::SUCCESS);
+
+  Message::TestMessage received{};
+  MessageInfo info{};
+  ASSERT_EQ(
+      reader.read_next(
+          *reader_id,
+          {reinterpret_cast<std::byte*>(&received), sizeof(received)}, info),
+      ReadResult::OK);
+  EXPECT_EQ(received.id(), sent.id());
+  shm_unlink(path.c_str());
 }

@@ -27,3 +27,54 @@ git_override(
     commit = "7fe1eab26d2b8eeb5e1c6a2f38bddb001e3f9696",
     remote = "https://github.com/hedronvision/bazel-compile-commands-extractor.git",
 )
+
+# Studio frontend: Bazel owns the Node runtime and the locked npm dependency graph.
+bazel_dep(name = "aspect_rules_js", version = "2.8.2")
+bazel_dep(name = "rules_nodejs", version = "6.6.2")
+node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node")
+node.toolchain(node_version = "22.14.0")
+
+pnpm = use_extension("@aspect_rules_js//npm:extensions.bzl", "pnpm")
+pnpm.pnpm(pnpm_version = "9.15.9")
+use_repo(pnpm, "pnpm")
+
+studio_npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+studio_npm.npm_translate_lock(
+    name = "studio_npm",
+    pnpm_lock = "//studio:pnpm-lock.yaml",
+)
+use_repo(studio_npm, "studio_npm")
+
+# Studio network bridge: immutable uWebSockets v20.51.0 and its uSockets gitlink.
+studio_http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+studio_http_archive(
+    name = "studio_uws",
+    urls = ["https://codeload.github.com/uNetworking/uWebSockets/tar.gz/53e835c1fa71ea64303b48418fec46533318bf91"],
+    type = "tar.gz",
+    sha256 = "8d50fae3aee565ec58d4b999ff44ce8bb0b78665fff7f5861528fcd4b1385e8a",
+    strip_prefix = "uWebSockets-53e835c1fa71ea64303b48418fec46533318bf91",
+    build_file = "//studio/bridge:uws.BUILD.bazel",
+)
+studio_http_archive(
+    name = "studio_usockets",
+    urls = ["https://codeload.github.com/uNetworking/uSockets/tar.gz/8cd4cb66eb061b2594ca114b9ea1ead64613ad4b"],
+    type = "tar.gz",
+    sha256 = "a45cd5c1a94122ac7f302c19e36b19a01c33676c1a83cd6923f59bc8b6aaed01",
+    strip_prefix = "uSockets-8cd4cb66eb061b2594ca114b9ea1ead64613ad4b",
+    build_file = "//studio/bridge:usockets.BUILD.bazel",
+)
+
+# Desktop shell: native Rust compilation and locked crates are Bazel actions.
+bazel_dep(name = "rules_rust", version = "0.74.0")
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(edition = "2021", versions = ["1.94.1"])
+use_repo(rust, "rust_toolchains")
+register_toolchains("@rust_toolchains//:all")
+
+studio_crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+studio_crate.from_cargo(
+    name = "studio_crates",
+    cargo_lockfile = "//studio/src-tauri:Cargo.lock",
+    manifests = ["//studio/src-tauri:Cargo.toml"],
+)
+use_repo(studio_crate, "studio_crates")

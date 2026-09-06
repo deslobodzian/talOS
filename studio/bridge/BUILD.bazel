@@ -1,0 +1,27 @@
+load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+exports_files(["uws.BUILD.bazel", "usockets.BUILD.bazel"])
+# The slot geometry is a contract between the bridge and whatever produces
+# telemetry, so producers outside this package need it too.
+cc_library(name = "wire", hdrs = ["wire.h"], visibility = ["//visibility:public"])
+cc_test(name = "wire_test", srcs = ["tests/wire_test.cc"], deps = [":wire"])
+cc_binary(
+    name = "studio_mock",
+    srcs = ["mock.cc"],
+    deps = [":wire", "//talOS/rtms:rtms", "//studio/schema:telemetry_cc", "@flatbuffers//:flatbuffers"],
+)
+cc_binary(
+    name = "studio_bridge",
+    srcs = ["main.cc"],
+    deps = [":wire", "//talOS/rtms:rtms", "@studio_uws//:uws"],
+)
+
+py_test(
+    name = "integration_test",
+    srcs = ["integration_test.py"],
+    data = [":studio_bridge", ":studio_mock"],
+    tags = ["local"],
+)
