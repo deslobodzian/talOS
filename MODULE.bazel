@@ -78,3 +78,13 @@ studio_crate.from_cargo(
     manifests = ["//studio/src-tauri:Cargo.toml"],
 )
 use_repo(studio_crate, "studio_crates")
+
+# Python RTMS client (//talOS/ipc/python) needs the flatbuffers runtime for
+# the flatc --python bindings. Pinned to the same version as the C++ dep above.
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "pypi",
+    python_version = "3.11",
+    requirements_lock = "//talOS/ipc/python:requirements.txt",
+)
+use_repo(pip, "pypi")
