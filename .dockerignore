@@ -1,0 +1,7 @@
+.git
+.cache
+bazel-*
+node_modules
+studio/src-tauri/target
+compile_commands.json
+*.log
