@@ -179,7 +179,7 @@ required flag on both binaries that take one (`talOS/launcher` and
 the binaries work against any config path, and no default names one.
 
 **2. talOS never depends on studio; a robot may.**
-`//2026-robot/main_processor/telemetry` depends on `//studio/bridge:wire` and
+`//2026-robot/main_processor/telemetry` depends on `//studio/schema:wire` and
 `//studio/schema:telemetry_cc`, because the slot geometry and the frame schema
 are a contract between a producer and the bridge and there should be exactly
 one copy of each. The edge runs robot → studio and never the other way.

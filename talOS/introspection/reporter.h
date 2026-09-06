@@ -198,6 +198,10 @@ class Reporter {
 
   template <typename Loop>
   void sample(Loop& loop, NodeRegistration& registration) {
+    // One sample: the heartbeat, the dispatch count and every source move
+    // together behind sample_seq, so a reader never pairs a fresh heartbeat
+    // with the previous refresh's counts.
+    registration.begin_sample();
     registration.heartbeat();
     registration.set_dispatch_count(loop.dispatch_count());
 
@@ -224,6 +228,7 @@ class Reporter {
                               /*last_monotonic_ns=*/0, /*last_latency_ns=*/0,
                               /*max_latency_ns=*/0);
     }
+    registration.end_sample();
   }
 
   Options options_;

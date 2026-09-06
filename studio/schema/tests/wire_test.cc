@@ -1,4 +1,4 @@
-#include "../wire.h"
+#include "studio/schema/wire.h"
 
 #include <array>
 #include <cstdlib>

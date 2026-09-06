@@ -108,4 +108,4 @@ js_test(
     fixed_args = ["declared.test.ts"],
 )
 
-test_suite(name = "tests", tests = [":core_test", ":agent_test", ":declared_test", ":system_test", ":view_test", ":typecheck", "//studio/bridge:wire_test", "//studio/bridge:system_test"])
+test_suite(name = "tests", tests = [":core_test", ":agent_test", ":declared_test", ":system_test", ":view_test", ":typecheck", "//studio/schema:wire_test", "//studio/bridge:system_test"])

@@ -24,6 +24,15 @@
  * runs is a lock-free atomic, and identity fields are fenced behind a
  * generation counter, so reading requires no cooperation from the nodes and
  * cannot block them.
+ *
+ * The counters move together behind a sample sequence (see NodeRecord): the
+ * reporting thread brackets each refresh, and a reader that copies a slot
+ * mid-sample retries a bounded number of times before accepting the plain copy
+ * an older reader would have taken. A torn snapshot is re-read, never waited
+ * on, so a writer that dies mid-sample cannot wedge a viewer. The residual
+ * staleness is bounded by one refresh period, which no consumer branches on:
+ * liveness reads the heartbeat alone against a 5 s timeout, and health
+ * aggregates cumulative gauges.
  */
 
 #include <fcntl.h>
@@ -62,6 +71,12 @@ namespace talos::introspect {
 // agree. Bumping would have bought nothing and cost a flag day, because the
 // version is in the segment name: a viewer would stop seeing every node that
 // had not been rebuilt yet.
+//
+// The sample sequence did not bump it either, for the same reason: it reuses
+// NodeRecord::reserved, a word every build which has ever written this layout
+// wrote as zero, which reads as "no sample in progress" -- the correct answer
+// for a writer that predates the guard, whose stores land around reads of an
+// undisturbed zero.
 inline constexpr std::uint32_t kRegistryVersion = 1;
 inline constexpr const char* kRegistryPath = "/talos_registry.1";
 
@@ -149,7 +164,15 @@ struct alignas(64) NodeRecord {
   // How many sources the node registered, which exceeds source_count when it
   // registered more than this segment can hold.
   std::atomic<std::uint32_t> declared_source_count;
-  std::uint32_t reserved;
+
+  // Seqlock for one refresh: the writer brackets the heartbeat, dispatch and
+  // per-source counter stores with begin_sample/end_sample (odd while a sample
+  // is landing, even when the slot is stable), and the reader retries a copy
+  // taken across a change. This reuses the word `reserved` held, so the layout
+  // does not move and the version stays at 1; see kRegistryVersion for why
+  // that reuse is sound. Claim resets it: a recycled slot may hold an odd
+  // sequence from a writer that died mid-sample.
+  std::atomic<std::uint32_t> sample_seq;
 
   std::int64_t start_wall_ns;
   std::uint64_t pid;
@@ -191,6 +214,14 @@ static_assert(std::is_standard_layout_v<RegistryHeader>);
 static_assert(std::is_standard_layout_v<SourceRecord>);
 static_assert(offsetof(SourceRecord, flags) ==
               offsetof(SourceRecord, alignment) + sizeof(std::uint32_t));
+
+// `sample_seq` reuses a plain word, so it must not grow or move the record.
+static_assert(sizeof(std::atomic<std::uint32_t>) == sizeof(std::uint32_t));
+static_assert(offsetof(NodeRecord, sample_seq) ==
+              offsetof(NodeRecord, declared_source_count) +
+                  sizeof(std::uint32_t));
+static_assert(offsetof(NodeRecord, start_wall_ns) ==
+              offsetof(NodeRecord, sample_seq) + sizeof(std::uint32_t));
 
 inline std::int64_t wall_now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -406,6 +437,21 @@ class NodeRegistration {
     });
   }
 
+  // Opens one refresh sample. Bracket the heartbeat, dispatch and
+  // per-source counter stores so a reader sees the whole sample or retries:
+  // begin_sample, the stores, then end_sample. Adjacent samples must not
+  // overlap; the reporting thread is the only writer, so plain bracketing is
+  // enough, with no RAII and no nesting.
+  void begin_sample() {
+    record_->sample_seq.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void end_sample() {
+    // Release: every counter store above must be visible to a reader that
+    // observes the closing even sequence.
+    record_->sample_seq.fetch_add(1, std::memory_order_release);
+  }
+
   void heartbeat() {
     record_->heartbeat_wall_ns.store(wall_now_ns(), std::memory_order_relaxed);
   }
@@ -537,6 +583,9 @@ class NodeRegistration {
     record->source_count.store(0, std::memory_order_relaxed);
     record->declared_source_count.store(0, std::memory_order_relaxed);
     record->dispatch_count.store(0, std::memory_order_relaxed);
+    // A recycled slot may hold an odd sequence from a writer that died
+    // mid-sample; a fresh claim is quiescent by definition.
+    record->sample_seq.store(0, std::memory_order_relaxed);
     record->heartbeat_wall_ns.store(wall_now_ns(), std::memory_order_relaxed);
 
     // A reader that saw the previous occupant must observe a different
@@ -664,7 +713,7 @@ class RegistryReader {
       for (int attempt = 0; attempt < 2; ++attempt) {
         const std::uint64_t generation =
             record.generation.load(std::memory_order_acquire);
-        NodeSnapshot node = copy(record, i);
+        NodeSnapshot node = copy_stable(record, i);
         if (record.generation.load(std::memory_order_acquire) != generation &&
             attempt == 0) {
           continue;
@@ -679,6 +728,27 @@ class RegistryReader {
   }
 
  private:
+  // Seqlock read of one slot: an odd sequence means a refresh is landing, and
+  // a sequence that moved across the copy means one landed mid-copy. Either
+  // way the copy is retried, bounded so a writer that died mid-sample -- or a
+  // refresh that never quiesces -- degrades to one plain copy instead of a
+  // wedged viewer. That fallback is exactly what a reader without the guard
+  // takes every time, so it is no worse than the status quo ante.
+  static NodeSnapshot copy_stable(const NodeRecord& record, std::size_t slot) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      const std::uint32_t before =
+          record.sample_seq.load(std::memory_order_acquire);
+      if ((before & 1u) != 0u) {
+        continue;
+      }
+      NodeSnapshot node = copy(record, slot);
+      if (record.sample_seq.load(std::memory_order_acquire) == before) {
+        return node;
+      }
+    }
+    return copy(record, slot);
+  }
+
   static NodeSnapshot copy(const NodeRecord& record, std::size_t slot) {
     NodeSnapshot node;
     node.slot = slot;
