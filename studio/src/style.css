@@ -101,3 +101,29 @@ code{font:inherit;font-family:'JetBrains Mono',monospace;color:#a8c4d4}
 
 @media(max-width:1100px){.system{grid-template-columns:1fr;grid-template-rows:auto auto auto auto 1fr}.system>.declared{grid-row:2}.system>.nodes{grid-row:3}.system>.wiring-panel{grid-row:4}.system>.topics{grid-row:5}.agent{grid-template-columns:1fr}}
 @media(max-width:900px){main{padding:0 14px 16px}.tabs{padding:0 14px}.tab-metrics{display:none}}
+
+/* Graph tabs. The base .tabs button stacks label over hint in a column, so the
+   close control is positioned rather than placed in that flow. */
+.tabs button.graph-tab{position:relative;padding-right:27px}
+.tab-close{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:16px;height:16px;line-height:15px;text-align:center;border-radius:3px;color:#5f7488;font-size:13px;cursor:pointer}
+.tabs button.graph-tab:hover .tab-close{color:#c3d4e4}
+.tab-close:hover{background:#3a4a5c;color:#fff}
+.tabs button.tab-add{align-self:center;color:#5f7488;font-size:17px;line-height:1;padding:10px 13px;margin:0 2px}
+.tabs button.tab-add:hover{color:#48e1cf;background:#141f2d}
+.tab-rename{width:110px;background:#0b131e;border:1px solid #48e1cf;border-radius:3px;color:#e2edf7;font-size:12px;padding:2px 5px}
+main.tab-graph>.panel{flex:1;min-height:380px}
+
+/* The shell is a flex column, but `.app` carried only a min-height, so it had
+   no definite height for `main`'s `flex:1` to resolve against. With nothing to
+   divide up, main took its own content height instead of the space left over
+   -- 1067px inside a 762px slot -- and the page grew a scrollbar while every
+   view sized itself against that runaway box rather than the window. A
+   definite height gives the column something to distribute; main scrolls when
+   a view really does need more room than there is.
+
+   `align-items:start` is left from when main was a grid, where it meant "do
+   not stretch the rows". Under a flex column it means "do not stretch the
+   panel to the width of the window", which is what left the field and the
+   spatial viewport in a ~330px column with the rest of the window empty. */
+.app{height:100vh}
+main{align-items:stretch;overflow:auto}

@@ -11,6 +11,7 @@ import {
   MAX_SYSTEM_BYTES,
   parseDeclaredGraph,
   parseSystemGraph,
+  RateWindow,
   type SystemGraph,
 } from '../src/system';
 
@@ -31,11 +32,12 @@ export function startAgent(
   const timeline = new Timeline();
   const jitter = new JitterBuffer(10);
 
-  // Two graphs, because a rate needs a previous sample. The bridge refreshes
-  // a few times a second, so `previousSystem` is the sample just before this
-  // one rather than an arbitrarily old one.
+  // `previousSystem` is the sample just before this one: what changed since
+  // the last refresh. Rates need a wider baseline than that -- one refresh
+  // apart quantises them into ~4 Hz steps -- so they come from the window.
   let system: SystemGraph|null = null;
   let previousSystem: SystemGraph|null = null;
+  const rateWindow = new RateWindow();
   const graphs = {received: 0, invalid: 0};
 
   // What the launcher declared before it spawned anything. Fetched over HTTP
@@ -46,7 +48,7 @@ export function startAgent(
   let declaredError = '';
 
   const context = (): RpcContext =>
-      ({timeline, system, previousSystem, declared});
+      ({timeline, system, previousSystem, rateWindow, declared});
 
   // A malformed document is reported and dropped, keeping the last good graph:
   // the same rule the live graph follows, for the same reason.
@@ -92,6 +94,7 @@ export function startAgent(
       const parsed = parseSystemGraph(text);
       previousSystem = system;
       system = parsed;
+      rateWindow.push(parsed);
       graphs.received++;
     } catch {
       // A malformed document is counted and dropped. Blanking the last good

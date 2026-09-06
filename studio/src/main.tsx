@@ -9,7 +9,7 @@ import 'uplot/dist/uPlot.min.css';
 
 import type {Pose, Snapshot} from './core';
 import './style.css';
-import {isTabId, TABS, type TabId} from './tabs';
+import {type GraphTab, isGraphTabId, isTabId, newGraphTab, parseGraphTabs, TABS, type TabId, type ViewId} from './tabs';
 import {
   AgentTab,
   Empty,
@@ -258,16 +258,30 @@ function Spatial({s}: {s: Snapshot|null}) {
   </>;
 }
 
-function Plot({view, onSeek}: {view: View; onSeek: (s: string) => void}) {
+// `channels`/`onChannels` make the selection controlled, which is what lets a
+// graph tab own its own set and keep it across a reload. Left off -- as the
+// built-in Signals tab leaves it -- the selection lives in the component and
+// defaults to the first two channels, exactly as it did before.
+function Plot({view, onSeek, channels, onChannels}: {
+  view: View;
+  onSeek: (s: string) => void;
+  channels?: string[];
+  onChannels?: (next: string[]) => void;
+}) {
   const root = useRef<HTMLDivElement>(null), chart = useRef<uPlot|null>(null);
   const latest = useRef({view, onSeek});
   latest.current = {view, onSeek};
   const plotted = useRef<Snapshot[]>([]);
   const [chosen, setChosen] = useState<string[]|null>(null),
         [delta, setDelta] = useState<number|null>(null);
-  const anchor = useRef<number|null>(null), origin = useRef<bigint|null>(null);
-  const keys = Object.keys(view.snapshot?.channels ?? {}),
-        selected = chosen ?? keys.slice(0, 2);
+  const anchor = useRef<bigint|null>(null), origin = useRef<bigint|null>(null);
+  const keys = Object.keys(view.snapshot?.channels ?? {});
+  const controlled = channels != null;
+  const selected = controlled ? channels : (chosen ?? keys.slice(0, 2));
+  const choose = (next: string[]) => {
+    if (controlled) onChannels?.(next);
+    else setChosen(next);
+  };
   useEffect(() => {
     if (!root.current) return;
     const container = root.current;
@@ -289,10 +303,15 @@ function Plot({view, onSeek}: {view: View; onSeek: (s: string) => void}) {
           ],
           hooks: {
             setCursor: [u => {
-              if (u.cursor.idx != null && anchor.current != null) {
-                const t = u.data[0][u.cursor.idx];
-                setDelta(t - anchor.current);
-              }
+              const index = u.cursor.idx;
+              if (index == null || anchor.current == null) return;
+              // Measured against the sample's own timestamp rather than the
+              // plotted x value: x is rebased whenever the window scrolls, so
+              // a difference taken there would jump every time it moved.
+              const sample = plotted.current[index];
+              if (sample)
+                setDelta(
+                    Number(BigInt(sample.timestamp_ns) - anchor.current) / 1e9);
             }]
           }
         },
@@ -302,7 +321,7 @@ function Plot({view, onSeek}: {view: View; onSeek: (s: string) => void}) {
       if (plot.cursor.idx != null) {
         const s = plotted.current[plot.cursor.idx];
         if (s) {
-          anchor.current = plot.data[0][plot.cursor.idx];
+          anchor.current = BigInt(s.timestamp_ns);
           latest.current.onSeek(s.timestamp_ns);
         }
       }
@@ -342,8 +361,13 @@ function Plot({view, onSeek}: {view: View; onSeek: (s: string) => void}) {
       anchor.current = null;
       return;
     }
-    const first = BigInt(view.history[0].timestamp_ns);
-    if (origin.current == null || first < origin.current) origin.current = first;
+    // Rebased on the window rather than pinned to the first frame ever seen.
+    // History is a sliding window, so its first timestamp keeps advancing
+    // while a session-start origin never did: the plotted x values grew for as
+    // long as the session ran, until the axis was labelled in thousands of
+    // seconds and uPlot was ranging over a span with no relation to what was
+    // actually on screen.
+    origin.current = BigInt(view.history[0].timestamp_ns);
     const times = view.history.map(
         s => Number(BigInt(s.timestamp_ns) - origin.current!) / 1e9);
     plot.setData(
@@ -361,7 +385,7 @@ function Plot({view, onSeek}: {view: View; onSeek: (s: string) => void}) {
     <div className="channel-picker">{keys.map(
         key => <label key={key}>
           <input type="checkbox" checked={selected.includes(key)}
-                 onChange={() => setChosen(
+                 onChange={() => choose(
                      selected.includes(key) ?
                          selected.filter(k => k !== key) :
                          [...selected, key])}/>
@@ -392,10 +416,27 @@ function Tree({value, name = 'state'}: {value: unknown; name?: string}) {
 
 // --- shell ------------------------------------------------------------------
 
-function savedTab(): TabId {
+const GRAPHS_KEY = 'talos-studio-graphs';
+
+function savedGraphs(): GraphTab[] {
+  try {
+    const raw = localStorage.getItem(GRAPHS_KEY);
+    return raw ? parseGraphTabs(JSON.parse(raw)) : [];
+  } catch {
+    // Unreadable storage or unparseable JSON both mean the same thing here:
+    // there are no graphs to restore. Starting with none is a working Studio.
+    return [];
+  }
+}
+
+function savedTab(graphs: readonly GraphTab[]): ViewId {
   try {
     const value = localStorage.getItem('talos-studio-tab');
     if (isTabId(value)) return value;
+    // A remembered graph tab is only selectable if it still exists; one whose
+    // graph was closed in another window would leave an empty panel selected
+    // with no tab highlighted.
+    if (isGraphTabId(value) && graphs.some(g => g.id === value)) return value;
   } catch {
     // A browser with site data blocked throws on read; the default tab is a
     // fine answer and not worth failing startup over.
@@ -406,7 +447,9 @@ function savedTab(): TabId {
 function App() {
   const [view, setView] = useState<View>(initialView);
   const [system, setSystem] = useState<SystemState>(initialSystem);
-  const [tab, setTab] = useState<TabId>(savedTab);
+  const [graphs, setGraphs] = useState<GraphTab[]>(savedGraphs);
+  const [tab, setTab] = useState<ViewId>(() => savedTab(graphs));
+  const [renaming, setRenaming] = useState<string|null>(null);
   const [url, setUrl] = useState(
       `${location.protocol === 'https:' ? 'wss' : 'ws'}://${
           location.hostname || 'localhost'}:${
@@ -428,6 +471,44 @@ function App() {
     } catch {
     }
   }, [tab]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(GRAPHS_KEY, JSON.stringify(graphs));
+    } catch {
+      // Storage full or blocked. The graphs still work for this session; only
+      // remembering them across a reload is lost, which is not worth an error.
+    }
+  }, [graphs]);
+
+  const addGraph = () => {
+    const created = newGraphTab(graphs);
+    setGraphs([...graphs, created]);
+    setTab(created.id);
+  };
+
+  const closeGraph = (id: string) => {
+    const index = graphs.findIndex(g => g.id === id);
+    if (index < 0) return;
+    const remaining = graphs.filter(g => g.id !== id);
+    setGraphs(remaining);
+    if (renaming === id) setRenaming(null);
+    // Only move if the tab being closed is the one on screen; closing a
+    // background tab should not yank the user out of what they were reading.
+    if (tab === id)
+      setTab(remaining.length ? remaining[Math.max(0, index - 1)].id : 'signals');
+  };
+
+  const setGraphChannels = (id: string, channels: string[]) =>
+      setGraphs(graphs.map(g => g.id === id ? {...g, channels} : g));
+
+  const renameGraph = (id: string, label: string) => {
+    const trimmed = label.trim().slice(0, 40);
+    if (trimmed) setGraphs(graphs.map(g => g.id === id ? {...g, label: trimmed} : g));
+    setRenaming(null);
+  };
+
+  const activeGraph = graphs.find(g => g.id === tab) ?? null;
 
   useEffect(() => {
     worker.onmessage = e => {
@@ -558,6 +639,39 @@ function App() {
                   `${liveNodes}/${totalNodes}` :
                   entry.hint}</em>
        </button>)}
+      {graphs.map(
+          graph => <button key={graph.id} role="tab"
+                           aria-selected={tab === graph.id}
+                           className={
+                               'graph-tab' +
+                               (tab === graph.id ? ' selected' : '')}
+                           onClick={() => setTab(graph.id)}
+                           onDoubleClick={() => setRenaming(graph.id)}>
+            {renaming === graph.id ?
+                 <input className="tab-rename" autoFocus defaultValue={graph.label}
+                        aria-label="Rename graph"
+                        onClick={e => e.stopPropagation()}
+                        onBlur={e => renameGraph(graph.id, e.target.value)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter')
+                            renameGraph(graph.id, e.currentTarget.value);
+                          if (e.key === 'Escape') setRenaming(null);
+                        }}/> :
+                 <>
+                   {graph.label}
+                   <em>{graph.channels.length ?
+                            `${graph.channels.length} CH` :
+                            'EMPTY'}</em>
+                 </>}
+            <span className="tab-close" role="button" aria-label={
+                    `Close ${graph.label}`}
+                  onClick={e => {
+                    e.stopPropagation();
+                    closeGraph(graph.id);
+                  }}>×</span>
+          </button>)}
+      <button className="tab-add" onClick={addGraph} aria-label="Add a graph"
+              title="Add a graph">+</button>
       <div className="tab-spacer"/>
       <div className="tab-metrics">
         <div><small>SEQUENCE</small><b>{view.snapshot?.sequence_id ?? '—'}</b></div>
@@ -567,7 +681,10 @@ function App() {
       </div>
     </nav>
 
-    <main className={'tab-' + tab} role="tabpanel">
+    {/* Graph tabs share one layout class: their ids are generated, and a
+        `tab-graph:k3f9` class would be both unstyleable and invalid. */}
+    <main className={'tab-' + (isGraphTabId(tab) ? 'graph' : tab)}
+          role="tabpanel">
       {tab === 'overview' && <OverviewTab view={view} system={system} onOpen={setTab}/>}
       {tab === 'system' && <SystemTab system={system}/>}
       {tab === 'timing' && <TimingTab system={system}/>}
@@ -583,6 +700,16 @@ function App() {
       {tab === 'signals' && <section className="panel">
         <div className="panel-heading"><h2>Signal analysis</h2><span>CHANNELS</span></div>
         <Plot view={view} onSeek={seek}/>
+      </section>}
+      {activeGraph && <section className="panel">
+        <div className="panel-heading">
+          <h2>{activeGraph.label}</h2><span>GRAPH</span>
+        </div>
+        {/* Keyed on the graph, so switching tabs builds a new uPlot rather
+            than re-pointing the old one at a different set of series. */}
+        <Plot key={activeGraph.id} view={view} onSeek={seek}
+              channels={activeGraph.channels}
+              onChannels={next => setGraphChannels(activeGraph.id, next)}/>
       </section>}
       {tab === 'state' && <section className="panel">
         <div className="panel-heading">
