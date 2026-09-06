@@ -279,22 +279,40 @@ the state message to "optimize" it.
 
 ## 7. Config format
 
-One `robot.toml` on the companion. `talOS/configuration/` already vendors
+One `robot.toml` on the companion, one `subsystem.toml` per subsystem beside
+its node. `robot.toml` holds `[robot]` and the manifest — the list of
+subsystem files — and nothing else per subsystem; each
+`2026-robot/main_processor/<name>/subsystem.toml` holds that subsystem's
+`[subsystem]` block, its devices, and its node-private values. A 250-line
+single file already hides cross-subsystem mistakes; per-subsystem files make
+ownership visible and let a subsystem move to its own repository carrying its
+config with it. `talOS/configuration/` already vendors
 `toml++` and holds sketch files (`robot.toml`, `subsystem.toml`,
 `config_parser.h`) — grow those rather than starting a new module.
 
 ```toml
+# robot.toml
 [robot]
 name = "comp"
 period_us = 5000              # RIO loop period
 command_timeout_us = 100000   # command lease
 commissioned = false          # set true only after tuning on real hardware
 
-[subsystems.drivetrain]
+[[subsystems]]
+path = "../drivetrain/subsystem.toml"
+
+[[subsystems]]
+path = "../shooter/subsystem.toml"
+```
+
+```toml
+# 2026-robot/main_processor/drivetrain/subsystem.toml
+[subsystem]
+name = "drivetrain"
 node = "//2026-robot/main_processor/drivetrain:node"
 period_us = 5000
 
-[subsystems.drivetrain.motors.front_left_drive]
+[motors.front_left_drive]
 type = "TalonFX"
 bus = "canivore"
 can_id = 1
@@ -305,14 +323,14 @@ sensor_to_mechanism_ratio = 6.75
 max_velocity_rps = 20
 slot0 = { p = 0.0, i = 0.0, d = 0.0, v = 0.0 }
 
-[subsystems.drivetrain.sensors.front_left_encoder]
+[sensors.front_left_encoder]
 type = "CANcoder"
 bus = "canivore"
 can_id = 20
 offset_rot = 0.0
 
 # Subsystem-specific values the node needs but the RIO does not.
-[subsystems.drivetrain.geometry]
+[geometry]
 wheel_radius_m = 0.0508
 modules = [
   { name = "front_left", x_m = 0.30, y_m = 0.30,
@@ -322,6 +340,11 @@ modules = [
 
 Rules for the parser:
 
+- **Files merge into one canonical view before anything validates.** The
+  parser loads `robot.toml`, follows the manifest, and merges every
+  `subsystem.toml` as if it were one `[subsystems.*]` tree. Every rule below
+  applies to the merged view, so splitting files cannot weaken a check — and
+  the golden test parses the split files, not a hand-merged copy.
 - **Logical device ids are assigned by the parser, deterministically**: sort by
   subsystem name, then device name, and number from 1. Never hand-written. Both
   ends must agree, and replay requires a stable ordering.
@@ -431,12 +454,59 @@ Rules for the parser:
 
 ## 9. How to add a subsystem, once this is done
 
-1. Add `[subsystems.<name>]` to `robot.toml` with its motors and sensors.
-2. Write `talOS/<name>/node.h`: subscribe `/hw/state`, publish
-   `/hw/request/<name>` and `/<name>/state`, put the control logic in a timer.
-3. Add it to the launcher's node list (same file).
-4. Run. Nothing else changes.
+1. Create `2026-robot/main_processor/<name>/subsystem.toml` with its
+   `[subsystem]` block, motors and sensors, and name its path in the
+   `robot.toml` manifest.
+2. Write `2026-robot/main_processor/<name>/node.h`: subscribe `/hw/state`,
+   publish `/hw/request/<name>` and `/<name>/state`, put the control logic in
+   a timer — plus `packet.h`, `<name>_message.fbs`, `main.cc`, `node_test.cc`
+   and `BUILD` per `ARCHITECTURE.md`'s package layout.
+3. Run. Nothing else changes — no launcher edit, since the manifest names the
+   new file.
 
 If a step ever requires editing the RoboRIO program, `hardware_node`, or another
 subsystem, stop and fix the design instead — that is the invariant this plan
 exists to protect.
+
+---
+
+## 10. End goal: subsystem packages, then more languages
+
+The package layout in §9 is deliberately ROS-shaped: a directory with a
+standard layout, a manifest entry, and topic/message contracts — carrying its
+own config file — is a unit that can move to its own repository unchanged,
+because `node =` is already an arbitrary Bazel label. That move is the point:
+a team should be able to take a subsystem, or publish one, without forking the
+robot. And once the package boundary is a repo boundary, it can become a
+language boundary: the contract a node holds with the rest of the robot is its
+`.fbs` schemas and its topic strings, both language-neutral, over an RTMS
+shared-memory layout that is frozen (§3.4).
+
+Staging, in order — each step is usable alone:
+
+1. **Split config (§7).** Per-subsystem files, merged-view parser, same golden
+   output. The package carries its config from here on.
+2. **Standard package + codegen.** `tools/subsystem_codegen` emits the §9
+   layout. A package that does not match the layout is not a package.
+3. **Separate repos.** A subsystem in another repo registers as
+   `node = "@repo//:node"` with its `subsystem.toml` in the manifest. No
+   launcher change; prove it by moving one real subsystem out and back.
+   **Accept:** `bazel build //...` and the full test suite green with the
+   subsystem external, golden config output byte-identical.
+4. **Python observation.** Already exists: `studio/agent`'s JSON-RPC serves the
+   system graph and telemetry to any language today. Document it as the
+   supported Python surface, with examples.
+5. **Python pub/sub.** A Python RTMS client (`mmap` + the frozen slot layout,
+   generated bindings from the same `.fbs` via `flatc --python`; the
+   `rules_python` toolchain is already in `MODULE.bazel`). A Python process
+   that publishes `/shooter/target` is a subsystem with training wheels.
+   **Accept:** round-trip test against a C++ subscriber, same payload bytes.
+6. **Python nodes.** A `py_node` shim with timer/watcher ergonomics mirroring
+   the C++ loop. Documented as second-tier from birth: no allocation-free
+   claim, no byte-identical replay — tested on I/O at the topic boundary
+   (ARCHITECTURE.md says so normatively). Revisit only if a Python subsystem
+   proves itself indispensable in steps 4–5.
+
+What never crosses the language boundary: the RIO program, the hardware
+gateway transaction, and the dispatch log format. A Python node talks topics;
+it never touches devices, and it never defines the record.
