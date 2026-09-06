@@ -103,7 +103,7 @@ uint32_t talos_rtms_layout(TalosRtmsLayout* out) {
 }
 
 int64_t talos_monotonic_ns(void) {
-  struct timespec ts{};
+  struct timespec ts {};
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
@@ -143,6 +143,10 @@ int32_t talos_publish(TalosPublisher* publisher, const void* data,
       SetError("publisher and data must be non-NULL");
       return TALOS_ERR_ARG;
     }
+    if (!publisher->inner) {
+      SetError("publisher has no transport");
+      return TALOS_ERR;
+    }
     if (size != publisher->message_bytes) {
       SetError("payload size must equal message_bytes given at open");
       return TALOS_ERR_ARG;
@@ -168,6 +172,7 @@ void talos_publisher_close(TalosPublisher* publisher) {
   try {
     delete publisher;
   } catch (...) {
+    SetError("unknown publisher-close failure");
   }
 }
 
@@ -220,6 +225,10 @@ int32_t talos_poll_next(TalosSubscriber* subscriber, void* out_data,
       SetError("subscriber has no reader slot");
       return TALOS_ERR;
     }
+    if (!subscriber->queue) {
+      SetError("subscriber has no transport");
+      return TALOS_ERR;
+    }
     MessageInfo info{};
     const ReadResult result = subscriber->queue->read_next(
         subscriber->reader_id.value(),
@@ -261,6 +270,7 @@ void talos_subscriber_close(TalosSubscriber* subscriber) {
     }
     delete subscriber;
   } catch (...) {
+    SetError("unknown subscriber-close failure");
   }
 }
 
@@ -282,8 +292,8 @@ int32_t talos_describe_emit(const char* node_name, const char* target,
     if (!BuildManifest(sources, num_sources, manifest)) return TALOS_ERR_ARG;
     std::vector<talos::introspect::EndpointAttribute> attrs;
     BuildAttributes(sources, num_sources, attrs);
-    talos::introspect::Description desc = talos::introspect::DescribeManifest(
-        node_name, target, manifest, attrs);
+    talos::introspect::Description desc =
+        talos::introspect::DescribeManifest(node_name, target, manifest, attrs);
     const std::string json = talos::introspect::DescribeToJson(desc);
     const uint32_t need = static_cast<uint32_t>(json.size());
     if (out_written != nullptr) *out_written = need;
@@ -307,7 +317,7 @@ struct TalosNode {
 };
 
 TalosNode* talos_node_register(const char* name, const char* target,
-                              uint64_t session_id, uint32_t flags) {
+                               uint64_t session_id, uint32_t flags) {
   ClearError();
   try {
     if (name == nullptr || name[0] == '\0' || target == nullptr ||
@@ -317,10 +327,11 @@ TalosNode* talos_node_register(const char* name, const char* target,
     }
     auto* out = new TalosNode{};
     try {
-      out->registration.emplace(
-          talos::introspect::NodeRegistration::Identity{
-              .name = name, .target = target, .session_id = session_id,
-              .flags = flags});
+      out->registration.emplace(talos::introspect::NodeRegistration::Identity{
+          .name = name,
+          .target = target,
+          .session_id = session_id,
+          .flags = flags});
     } catch (...) {
       delete out;
       throw;
@@ -335,7 +346,7 @@ TalosNode* talos_node_register(const char* name, const char* target,
 }
 
 int32_t talos_node_publish(TalosNode* node, const TalosSource* sources,
-                          uint32_t num_sources) {
+                           uint32_t num_sources) {
   ClearError();
   try {
     if (node == nullptr || !node->registration) {
@@ -386,5 +397,6 @@ void talos_node_close(TalosNode* node) {
   try {
     delete node;
   } catch (...) {
+    SetError("unknown node-close failure");
   }
 }

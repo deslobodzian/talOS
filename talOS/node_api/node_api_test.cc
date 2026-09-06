@@ -1,11 +1,11 @@
 #include "talOS/node_api/node_api.h"
 
+#include <gtest/gtest.h>
+
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
-
-#include <gtest/gtest.h>
 
 namespace {
 
@@ -76,14 +76,15 @@ TEST(NodeApi, DescribeEmitMatchesGroundTruth) {
   uint32_t need = 0;
   // Size probe first.
   EXPECT_EQ(talos_describe_emit("mynode", "//pkg:mynode", sources, 2, nullptr,
-                               0, &need),
+                                0, &need),
             TALOS_ERR_SMALL);
   ASSERT_GT(need, 0u);
   std::vector<char> buf(need + 1);
   uint32_t written = 0;
-  EXPECT_EQ(talos_describe_emit("mynode", "//pkg:mynode", sources, 2, buf.data(),
-                               static_cast<uint32_t>(buf.size()), &written),
-            TALOS_OK);
+  EXPECT_EQ(
+      talos_describe_emit("mynode", "//pkg:mynode", sources, 2, buf.data(),
+                          static_cast<uint32_t>(buf.size()), &written),
+      TALOS_OK);
   EXPECT_EQ(written, need);
   const std::string json(buf.data());
   EXPECT_NE(json.find("\"name\": \"mynode\""), std::string::npos);
@@ -94,15 +95,16 @@ TEST(NodeApi, DescribeEmitMatchesGroundTruth) {
   // Too-small buffer reports need.
   std::vector<char> tiny(4);
   uint32_t need2 = 0;
-  EXPECT_EQ(talos_describe_emit("mynode", "//pkg:mynode", sources, 2, tiny.data(),
-                               static_cast<uint32_t>(tiny.size()), &need2),
-            TALOS_ERR_SMALL);
+  EXPECT_EQ(
+      talos_describe_emit("mynode", "//pkg:mynode", sources, 2, tiny.data(),
+                          static_cast<uint32_t>(tiny.size()), &need2),
+      TALOS_ERR_SMALL);
   EXPECT_EQ(need2, need);
 
   // Bad kind rejected; Python never formats the envelope itself.
   const TalosSource bad[] = {{99, "/test/state/z", 8, 0}};
   EXPECT_EQ(talos_describe_emit("mynode", "//pkg:mynode", bad, 1, buf.data(),
-                               static_cast<uint32_t>(buf.size()), nullptr),
+                                static_cast<uint32_t>(buf.size()), nullptr),
             TALOS_ERR_ARG);
 }
 
@@ -113,9 +115,8 @@ TEST(NodeApi, RegisterPublishHeartbeatClose) {
   EXPECT_EQ(talos_node_heartbeat(nullptr, 0), TALOS_ERR_ARG);
   talos_node_close(nullptr);
 
-  TalosNode* node =
-      talos_node_register("node_api_test", "//talOS/node_api:node_api_test",
-                          4242u, 1u);
+  TalosNode* node = talos_node_register(
+      "node_api_test", "//talOS/node_api:node_api_test", 4242u, 1u);
   ASSERT_NE(node, nullptr) << talos_last_error();
   const TalosSource sources[] = {
       {TALOS_SOURCE_TIMER, "tick", 0, 0},
