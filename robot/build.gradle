@@ -123,12 +123,14 @@ model {
                     srcDir 'src/main/cpp'
                     srcDir '../common/protocol'
                     srcDir '../common/hardware'
+                    srcDir '../common/driver_station'
                     include '**/*.cpp', '**/*.cc'
                     exclude '**/*_test.*', '**/*_perf.*', '**/sim_*.*'
                 }
                 exportedHeaders {
                     srcDir 'src/main/include'
                     srcDir '../common/protocol'
+                    srcDir '../common/driver_station'
                     srcDir '../common'
                     include '**/*.h', '**/*.hpp'
                     exclude '**/*_test.*', '**/*_perf.*', '**/sim_*.*'

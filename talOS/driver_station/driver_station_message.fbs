@@ -1,0 +1,35 @@
+namespace talos.driver_station;
+
+struct FmsState {
+  flags:uint;
+  alliance:ubyte;
+  station:ubyte;
+  match_type:ubyte;
+  match_number:ushort;
+  replay_number:ubyte;
+  match_time_s:float;
+}
+
+struct JoystickState {
+  connected:bool;
+  axis_count:ubyte;
+  button_count:ubyte;
+  pov_count:ubyte;
+  buttons:uint;
+  axis0:float;
+  axis1:float;
+  axis2:float;
+  axis3:float;
+  pov0:short;
+}
+
+// timestamp_ns is the event loop monotonic clock, the same origin every other
+// node stamps with. rio_sample_time_us is the Rio-side sample stamp carried
+// through from the driver station packet, and is 0 when the packet had none.
+struct DriverStationState {
+  timestamp_ns:ulong;
+  rio_sample_time_us:ulong;
+  fms:FmsState;
+  stick0:JoystickState;
+  stick1:JoystickState;
+}

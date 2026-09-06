@@ -82,6 +82,7 @@ TEST(LauncherTest, DiscoverNodesFromRobotToml) {
   bool found_hw = false;
   bool found_drivetrain = false;
   bool found_shooter = false;
+  bool found_driver_station = false;
 
   for (const auto& n : nodes) {
     if (n.name == "hardware_node") {
@@ -93,12 +94,16 @@ TEST(LauncherTest, DiscoverNodesFromRobotToml) {
     } else if (n.name == "shooter") {
       found_shooter = true;
       EXPECT_EQ(n.target, "//talOS/shooter:node");
+    } else if (n.name == "driver_station") {
+      found_driver_station = true;
+      EXPECT_EQ(n.target, "//talOS/driver_station:node");
     }
   }
 
   EXPECT_TRUE(found_hw);
   EXPECT_TRUE(found_drivetrain);
   EXPECT_TRUE(found_shooter);
+  EXPECT_TRUE(found_driver_station);
 }
 
 TEST(LauncherTest, MergedLogsMonotonicOrder) {
@@ -202,6 +207,7 @@ TEST(LauncherTest, RunsChildProcessesAndWritesManifest) {
   options.binary_overrides["//talOS/hardware:hardware_node"] = mock_bin;
   options.binary_overrides["//talOS/drivetrain:node"] = mock_bin;
   options.binary_overrides["//talOS/shooter:node"] = mock_bin;
+  options.binary_overrides["//talOS/driver_station:node"] = mock_bin;
 
   Launcher launcher{options};
   int code = launcher.Run();

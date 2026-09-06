@@ -1,5 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <cstring>
+#include <thread>
+#include <vector>
+
 #include "node.h"
 
 namespace talos::hardware {
@@ -25,6 +30,16 @@ period_us = 10000
 type = "TalonFX"
 bus = "rio"
 can_id = 2
+
+[subsystems.driver_station]
+node = "//talOS/driver_station:node"
+period_us = 20000
+
+[subsystems.beam_break]
+period_us = 5000
+
+[subsystems.beam_break.digital_inputs.gate]
+dio = 3
 )";
 
 TEST(HardwareNodeTest, MergesSubsystemRequestsAndIsolatesTimeouts) {
@@ -109,6 +124,54 @@ TEST(HardwareNodeTest, MergesSubsystemRequestsAndIsolatesTimeouts) {
   const auto& cmd3 = node.current_command();
   EXPECT_EQ(cmd3.motors[0].mode, Mode::kVelocity);
   EXPECT_DOUBLE_EQ(cmd3.motors[0].demand, 15.0);
+}
+
+TEST(HardwareNodeTest, ActuatorLessSubsystemsGetNoTracker) {
+  auto cfg = talos::config::ParseRobotConfigString(kTestToml);
+  ASSERT_TRUE(cfg.subsystems.contains("driver_station"));
+  ASSERT_TRUE(cfg.subsystems.contains("beam_break"));
+  ASSERT_TRUE(cfg.subsystems.at("driver_station").motors.empty());
+  ASSERT_EQ(cfg.subsystems.at("beam_break").digital_inputs.size(), 1u);
+
+  HardwareNode node{cfg, "127.0.0.1", 25806, 25807, true};
+  ASSERT_TRUE(node.Open());
+
+  // Nothing publishes any request, so every tracked subsystem times out.
+  node.Tick(1000000);
+
+  EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_TRUE(node.is_subsystem_timed_out("shooter"));
+  EXPECT_FALSE(node.is_subsystem_timed_out("driver_station"));
+  EXPECT_FALSE(node.is_subsystem_timed_out("beam_break"));
+}
+
+TEST(HardwareNodeTest, ForwardsDriverStationPacketsToIpc) {
+  auto cfg = talos::config::ParseRobotConfigString(kTestToml);
+  HardwareNode node{cfg, "127.0.0.1", 25804, 25805, true};
+  ASSERT_TRUE(node.Open());
+
+  protocol::RuntimeUdpPeer gateway_peer;
+  ASSERT_EQ(gateway_peer.Open("127.0.0.1", 25804, "127.0.0.1", 25805),
+            protocol::UdpStatus::kOk);
+
+  ipc::Subscriber<talos::drive::Packet> ds_sub{"/hw/ds"};
+
+  std::vector<uint8_t> dummy_payload = {0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc};
+  ASSERT_EQ(gateway_peer.SendFrame(protocol::FrameType::kDriverStation, 1, 1000,
+                                   dummy_payload.data(), dummy_payload.size()),
+            protocol::UdpStatus::kOk);
+
+  for (int i = 0; i < 20; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    node.Tick(2000 + i * 1000);
+    if (node.driver_station_packets_received() > 0) break;
+  }
+
+  EXPECT_EQ(node.driver_station_packets_received(), 1u);
+  auto pkt = ds_sub.read();
+  ASSERT_TRUE(pkt.has_value());
+  EXPECT_EQ(pkt->size, dummy_payload.size());
+  EXPECT_EQ(std::memcmp(pkt->data.data(), dummy_payload.data(), pkt->size), 0);
 }
 
 }  // namespace

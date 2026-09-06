@@ -45,6 +45,9 @@ class HardwareNode {
   bool is_configured() const { return is_configured_; }
   uint64_t states_received() const { return states_received_; }
   uint64_t commands_sent() const { return commands_sent_; }
+  uint64_t driver_station_packets_received() const {
+    return driver_station_packets_received_;
+  }
   bool is_subsystem_timed_out(const std::string& name) const {
     auto it = subsystems_.find(name);
     return it != subsystems_.end() && it->second.timed_out;
@@ -65,6 +68,7 @@ class HardwareNode {
   protocol::RuntimeUdpPeer peer_;
   std::unique_ptr<ipc::Publisher<talos::drive::Packet>> state_pub_;
   std::unique_ptr<ipc::Publisher<talos::drive::Packet>> cmd_pub_;
+  std::unique_ptr<ipc::Publisher<talos::drive::Packet>> ds_pub_;
   std::unique_ptr<ipc::Subscriber<talos::drive::Packet>> legacy_cmd_sub_;
 
   std::map<std::string, SubsystemTracker> subsystems_;
@@ -77,6 +81,7 @@ class HardwareNode {
   uint32_t last_state_flags_{0};
   uint64_t states_received_{0};
   uint64_t commands_sent_{0};
+  uint64_t driver_station_packets_received_{0};
   uint64_t cmd_sequence_{0};
   uint64_t last_push_time_us_{0};
 };
