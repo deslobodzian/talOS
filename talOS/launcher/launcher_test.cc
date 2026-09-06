@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -17,6 +18,40 @@ namespace {
 std::string TempPath(std::string_view name) {
   return ::testing::TempDir() + "/talos_launcher_test_" +
          std::to_string(::getpid()) + "_" + std::string{name};
+}
+
+// A framework-owned fixture: the launcher's discovery logic is robot-agnostic,
+// so its tests must not read any particular robot's configuration.
+constexpr std::string_view kFixtureToml = R"(
+[robot]
+name = "launcher_fixture"
+period_us = 5000
+sim_gateway = "//example/sim:gateway"
+
+[subsystems.alpha]
+node = "//example/alpha:node"
+period_us = 5000
+
+[subsystems.alpha.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+
+[subsystems.beta]
+node = "//example/beta:node"
+period_us = 10000
+
+[subsystems.beta.motors.m2]
+type = "TalonFX"
+bus = "rio"
+can_id = 2
+)";
+
+inline std::string WriteFixtureToml() {
+  const std::string path = TempPath("launcher_fixture_toml") + ".toml";
+  std::ofstream out{path};
+  out << kFixtureToml;
+  return path;
 }
 
 event::Manifest MakeTestManifest(std::string_view name) {
@@ -73,37 +108,62 @@ TEST(LauncherTest, SessionIdGenerationIsUniqueAndNonZero) {
 }
 
 TEST(LauncherTest, DiscoverNodesFromRobotToml) {
-  const auto robot_cfg = config::ParseRobotConfig("talOS/configuration/robot.toml");
+  const auto robot_cfg = config::ParseRobotConfigString(kFixtureToml);
   LauncherOptions options;
   auto nodes = DiscoverNodes(robot_cfg, options);
 
   ASSERT_GE(nodes.size(), 2u);
 
   bool found_hw = false;
-  bool found_drivetrain = false;
-  bool found_shooter = false;
-  bool found_driver_station = false;
+  bool found_alpha = false;
+  bool found_beta = false;
 
   for (const auto& n : nodes) {
     if (n.name == "hardware_node") {
       found_hw = true;
-      EXPECT_EQ(n.target, "//talOS/hardware:hardware_node");
-    } else if (n.name == "drivetrain") {
-      found_drivetrain = true;
-      EXPECT_EQ(n.target, "//talOS/drivetrain:node");
-    } else if (n.name == "shooter") {
-      found_shooter = true;
-      EXPECT_EQ(n.target, "//talOS/shooter:node");
-    } else if (n.name == "driver_station") {
-      found_driver_station = true;
-      EXPECT_EQ(n.target, "//talOS/driver_station:node");
+      EXPECT_EQ(n.target, "//talOS/bridge:hardware_node");
+    } else if (n.name == "alpha") {
+      found_alpha = true;
+      EXPECT_EQ(n.target, "//example/alpha:node");
+    } else if (n.name == "beta") {
+      found_beta = true;
+      EXPECT_EQ(n.target, "//example/beta:node");
     }
   }
 
   EXPECT_TRUE(found_hw);
-  EXPECT_TRUE(found_drivetrain);
-  EXPECT_TRUE(found_shooter);
-  EXPECT_TRUE(found_driver_station);
+  EXPECT_TRUE(found_alpha);
+  EXPECT_TRUE(found_beta);
+}
+
+TEST(LauncherTest, SimGatewayComesFromRobotConfigNotTheFramework) {
+  LauncherOptions options;
+  options.simulation = true;
+  options.start_sim_gateway = true;
+
+  auto with_gw = DiscoverNodes(config::ParseRobotConfigString(kFixtureToml), options);
+  EXPECT_EQ(std::count_if(with_gw.begin(), with_gw.end(),
+                          [](const NodeSpec& n) { return n.name == "sim_gateway"; }),
+            1);
+
+  // No [robot] sim_gateway key: the launcher must not invent a robot target.
+  constexpr std::string_view kNoGateway = R"(
+[robot]
+name = "no_gateway"
+period_us = 5000
+
+[subsystems.alpha]
+node = "//example/alpha:node"
+
+[subsystems.alpha.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+)";
+  auto without_gw = DiscoverNodes(config::ParseRobotConfigString(kNoGateway), options);
+  EXPECT_EQ(std::count_if(without_gw.begin(), without_gw.end(),
+                          [](const NodeSpec& n) { return n.name == "sim_gateway"; }),
+            0);
 }
 
 TEST(LauncherTest, MergedLogsMonotonicOrder) {
@@ -167,7 +227,7 @@ TEST(LauncherTest, MergedLogsRejectsSessionIdMismatch) {
 TEST(LauncherTest, SessionManifestJsonFormatting) {
   SessionManifest manifest;
   manifest.session_id = 987654321ULL;
-  manifest.config_path = "talOS/configuration/robot.toml";
+  manifest.config_path = "2026-robot/main_processor/configuration/robot.toml";
   manifest.output_dir = "/tmp/test_dir";
   manifest.simulation = true;
   manifest.start_wall_ns = 1'000'000'000LL;
@@ -175,8 +235,8 @@ TEST(LauncherTest, SessionManifestJsonFormatting) {
 
   NodeProcessInfo node1;
   node1.name = "drivetrain";
-  node1.target = "//talOS/drivetrain:node";
-  node1.binary_path = "bazel-bin/talOS/drivetrain/node";
+  node1.target = "//2026-robot/main_processor/drivetrain:node";
+  node1.binary_path = "bazel-bin/2026-robot/main_processor/drivetrain/node";
   node1.log_path = "/tmp/test_dir/drivetrain.tlog";
   node1.pid = 1234;
   node1.exit_code = 0;
@@ -204,10 +264,10 @@ TEST(LauncherTest, RunsChildProcessesAndWritesManifest) {
 
   // Use /usr/bin/true (or /bin/echo) for all nodes so the test executes instantly and cleanly
   std::string mock_bin = ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
-  options.binary_overrides["//talOS/hardware:hardware_node"] = mock_bin;
-  options.binary_overrides["//talOS/drivetrain:node"] = mock_bin;
-  options.binary_overrides["//talOS/shooter:node"] = mock_bin;
-  options.binary_overrides["//talOS/driver_station:node"] = mock_bin;
+  options.config_path = WriteFixtureToml();
+  options.binary_overrides["//talOS/bridge:hardware_node"] = mock_bin;
+  options.binary_overrides["//example/alpha:node"] = mock_bin;
+  options.binary_overrides["//example/beta:node"] = mock_bin;
 
   Launcher launcher{options};
   int code = launcher.Run();

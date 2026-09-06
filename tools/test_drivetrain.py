@@ -3,7 +3,7 @@
 Two gateways can stand at the RoboRIO end of the UDP link, and both are tested
 the same way because both run the same `talos::hardware::Gateway`:
 
-    python3 tools/test_drivetrain.py            # //talOS/drivetrain:sim_gateway
+    python3 tools/test_drivetrain.py            # //2026-robot/main_processor/drivetrain:sim_gateway
     python3 tools/test_drivetrain.py --wpilib   # robot/, under WPILib simulation
 
 The second one is the real RoboRIO program. It is slower to start, because it
@@ -12,7 +12,7 @@ Driver Station enable path, so it also runs a second scenario that the
 stand-alone gateway cannot: with the Driver Station never enabled, the
 drivetrain must not move at all.
 
-First build: bazel build //talOS/drivetrain:all
+First build: bazel build //2026-robot/main_processor/drivetrain:all
              (for --wpilib, Gradle builds the robot program itself)
 Run from any directory.
 """
@@ -47,7 +47,7 @@ class Scenario:
 
     def __init__(self, root, output):
         self.root = root
-        self.binaries = root / "bazel-bin/talOS/drivetrain"
+        self.binaries = root / "bazel-bin/2026-robot/main_processor/drivetrain"
         self.output = output
         self.children = []
         self.files = []
@@ -236,14 +236,14 @@ def main():
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
-    binaries = root / "bazel-bin/talOS/drivetrain"
+    binaries = root / "bazel-bin/2026-robot/main_processor/drivetrain"
 
     needed = ["bridge", "node", "send_target"]
     if not args.wpilib:
         needed.append("sim_gateway")
     for name in needed:
         if not (binaries / name).is_file():
-            raise RuntimeError("Build //talOS/drivetrain:all first")
+            raise RuntimeError("Build //2026-robot/main_processor/drivetrain:all first")
 
     check_ports()
     output = run_driving_scenario(root, args.wpilib)

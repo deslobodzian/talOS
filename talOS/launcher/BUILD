@@ -34,7 +34,6 @@ cc_test(
     name = "launcher_test",
     size = "small",
     srcs = ["launcher_test.cc"],
-    data = ["//talOS/configuration:robot.toml"],
     deps = [
         ":launcher_lib",
         "//talOS/events:events_log",

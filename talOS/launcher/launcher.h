@@ -39,7 +39,7 @@ inline uint64_t GenerateSessionId() {
 
 struct NodeSpec {
   std::string name;
-  std::string target;       // e.g. "//talOS/drivetrain:node"
+  std::string target;       // e.g. "//2026-robot/main_processor/drivetrain:node"
   std::string binary_path;  // Resolved executable path
   std::vector<std::string> extra_args;
 };
@@ -95,7 +95,7 @@ struct SessionManifest {
 };
 
 struct LauncherOptions {
-  std::string config_path{"talOS/configuration/robot.toml"};
+  std::string config_path{"2026-robot/main_processor/configuration/robot.toml"};
   std::string output_dir;
   uint64_t session_id{0};
   bool simulation{false};
@@ -120,7 +120,7 @@ inline std::string ResolveBinary(const std::string& target_or_path,
     }
   }
 
-  // Convert "//talOS/drivetrain:node" -> "talOS/drivetrain/node"
+  // Convert "//2026-robot/main_processor/drivetrain:node" -> "2026-robot/main_processor/drivetrain/node"
   std::string subpath = target_or_path;
   if (subpath.starts_with("//")) {
     subpath = subpath.substr(2);
@@ -177,7 +177,7 @@ inline std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_conf
   std::vector<NodeSpec> specs;
 
   // 1. Hardware node (bridge)
-  std::string hw_target = "//talOS/hardware:hardware_node";
+  std::string hw_target = "//talOS/bridge:hardware_node";
   if (auto* robot_tbl = robot_config.toml_data["robot"].as_table()) {
     if (auto node_field = (*robot_tbl)["hardware_node"]) {
       if (auto val = node_field.value<std::string_view>()) {
@@ -210,14 +210,25 @@ inline std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_conf
     }
   }
 
-  // 3. Optional sim_gateway
+  // 3. Optional sim_gateway. The gateway stands in for a controller processor,
+  // so which binary that is belongs to the robot, not to the framework.
   if (options.start_sim_gateway && options.simulation) {
-    NodeSpec gw_spec;
-    gw_spec.name = "sim_gateway";
-    gw_spec.target = "//talOS/drivetrain:sim_gateway";
-    gw_spec.binary_path =
-        ResolveBinary(gw_spec.target, options.binary_overrides);
-    specs.push_back(gw_spec);
+    std::string gw_target;
+    if (auto* robot_tbl = robot_config.toml_data["robot"].as_table()) {
+      if (auto gw_field = (*robot_tbl)["sim_gateway"]) {
+        if (auto val = gw_field.value<std::string_view>()) {
+          gw_target = std::string(*val);
+        }
+      }
+    }
+    if (!gw_target.empty()) {
+      NodeSpec gw_spec;
+      gw_spec.name = "sim_gateway";
+      gw_spec.target = gw_target;
+      gw_spec.binary_path =
+          ResolveBinary(gw_target, options.binary_overrides);
+      specs.push_back(gw_spec);
+    }
   }
 
   return specs;

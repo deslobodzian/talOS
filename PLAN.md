@@ -2,8 +2,8 @@
 
 **Status: not started.** This describes the target design and the order to build
 it in. It is written for an implementing agent who has not seen this repository
-before. Read `talOS/events/README.md`, `common/hardware/README.md` and
-`talOS/drivetrain/README.md` first; they describe what exists today.
+before. Read `talOS/events/README.md`, `talOS/hardware/README.md` and
+`2026-robot/main_processor/drivetrain/README.md` first; they describe what exists today.
 
 Every step below has an acceptance test. Do not mark a step done without it.
 
@@ -18,7 +18,7 @@ no protocol changes, no changes to any other node.**
 ```toml
 # robot.toml
 [subsystems.shooter]
-node = "//talOS/shooter:node"
+node = "//2026-robot/main_processor/shooter:node"
 period_us = 5000
 
 [subsystems.shooter.motors.flywheel_leader]
@@ -34,7 +34,7 @@ dio = 0
 ```
 
 ```cpp
-// talOS/shooter/node.h — the whole subsystem
+// 2026-robot/main_processor/shooter/node.h — the whole subsystem
 template <typename Loop>
 class ShooterNode {
  public:
@@ -97,10 +97,10 @@ robot.toml ── parsed once on the companion, the single source of truth
                  /odometry
 ```
 
-`hardware_node` replaces today's `talOS/drivetrain/bridge.cc`. It is the only
+`hardware_node` replaces today's `2026-robot/main_processor/drivetrain/bridge.cc`. It is the only
 process that talks to the RIO and the only publisher of `/hw/cmd`, because the
 gateway validates and applies a command as one whole-robot transaction
-(`common/hardware/gateway.cc:53`). Merging is not arbitration: device ownership
+(`talOS/hardware/gateway.cc:53`). Merging is not arbitration: device ownership
 is settled at parse time, and two subsystems claiming one device is a config
 error, never a runtime race.
 
@@ -160,7 +160,7 @@ config it did not write:
   bug must not be able to over-current a motor. This is new work in step 3 and
   it is the single most important thing in this plan.
 - `commissioned` stays a RIO-side gate; commands are refused until it is set.
-- The Driver Station enable gate stays. `//talOS/drivetrain:monitor` shows it,
+- The Driver Station enable gate stays. `//2026-robot/main_processor/drivetrain:monitor` shows it,
   and `tools/test_drivetrain.py --wpilib` asserts a disabled robot does not move.
 - Command lease expiry still neutralizes; enable transitions still bump `epoch`
   and invalidate outstanding commands.
@@ -182,7 +182,7 @@ config it did not write:
   on Linux. Step 0 adds the guard.
   Budget accordingly: `/hw/req/drivetrain` is 18, `/drivetrain/state` is 17.
   Prefer short, abbreviated topic names over descriptive ones.
-- `common/protocol/frame.h` caps a UDP payload at `kMaxPayloadSize = 1200`
+- `talOS/protocol/frame.h` caps a UDP payload at `kMaxPayloadSize = 1200`
   bytes. A full robot config will not fit in one datagram; step 3 chunks it.
 - `MAX_READERS = 8` per RTMS topic (`talOS/rtms/rtms.h`). `/hw/state` will have
   one reader per subsystem node plus the monitor. If a robot needs more than
@@ -238,7 +238,7 @@ Extend `hardware::State` and `hardware::Command` with fixed-size arrays for the
 new families, alongside the existing `motors[]` and `sensors[]`:
 `digital_inputs[]`, `analog_inputs[]`, `encoders[]`, `pwm_outputs[]`,
 `digital_outputs[]`. Keep them typed rather than collapsing into one untyped
-`DeviceSample` array — the encode/decode in `common/hardware/messages.cc` is
+`DeviceSample` array — the encode/decode in `talOS/hardware/messages.cc` is
 explicit little-endian by hand, and a tagged union makes that harder to review
 for no gain.
 
@@ -262,7 +262,7 @@ command_timeout_us = 100000   # command lease
 commissioned = false          # set true only after tuning on real hardware
 
 [subsystems.drivetrain]
-node = "//talOS/drivetrain:node"
+node = "//2026-robot/main_processor/drivetrain:node"
 period_us = 5000
 
 [subsystems.drivetrain.motors.front_left_drive]
@@ -306,7 +306,7 @@ Rules for the parser:
 - The parser output is the existing `hardware::Config` plus a
   `hardware::Devices` view per subsystem (the ids that subsystem owns).
   `ConfigurationId(config)` keeps working unchanged.
-- **`common/hardware/swerve_config.h` is deleted at the end of step 5.** It is
+- **`talOS/hardware/swerve_config.h` is deleted at the end of step 5.** It is
   the compiled-in config that this plan exists to remove. Do not extend it.
 
 ---
@@ -331,14 +331,14 @@ Rules for the parser:
 
 ### Step 2 — device taxonomy
 - Extend `hardware::Config`, `State`, `Command` and the codecs in
-  `common/hardware/messages.cc` for every kind in §6.
+  `talOS/hardware/messages.cc` for every kind in §6.
 - Extend `SimBackend` to model the new kinds ideally (a `DigitalInput` reads
   back what a test sets; a `PWM` output reads back what was applied).
-- **Accept:** `//common/hardware:gateway_test` covers encode/decode round trips
+- **Accept:** `//talOS/hardware:gateway_test` covers encode/decode round trips
   for every device kind, including the empty and full array cases.
 
 ### Step 3 — config push, and the RIO becomes final
-- New frame kinds in `common/protocol/types.h`: `kHardwareConfig = 22`,
+- New frame kinds in `talOS/protocol/types.h`: `kHardwareConfig = 22`,
   `kHardwareConfigAck = 23`.
 - Chunked because of the 1200-byte payload cap: each chunk carries
   `(index, count, config_id)`; the RIO buffers, and applies only when all chunks
@@ -357,7 +357,7 @@ Rules for the parser:
   program mid-run re-pushes automatically with no human action.
 
 ### Step 4 — `hardware_node`
-- Replace `talOS/drivetrain/bridge.cc` with `talOS/hardware/node.cc`: pushes
+- Replace `2026-robot/main_processor/drivetrain/bridge.cc` with `talOS/bridge/node.cc`: pushes
   config, republishes `/hw/state`, subscribes every `/hw/req/<sub>`, merges into
   one `/hw/cmd`.
 - Merge rules: a device nobody claimed, or whose owner's request is older than
@@ -370,13 +370,13 @@ Rules for the parser:
 ### Step 5 — convert the drivetrain
 - `DrivetrainNode` takes its `hardware::Devices` from config, subscribes
   `/hw/state`, publishes `/hw/req/drive` and a new `/drivetrain/state`.
-- Delete `common/hardware/swerve_config.h`.
+- Delete `talOS/hardware/swerve_config.h`.
 - **Accept:** `tools/test_drivetrain.py` and `--wpilib` both pass unchanged in
   behaviour; the drivetrain still replays with `diverged=0`.
 
 ### Step 6 — a shooter, as proof
 - Add `[subsystems.shooter]` to `robot.toml` with a flywheel `TalonFX` and a
-  `DigitalInput` beam break. Write `talOS/shooter/node.h` — a timer, a target
+  `DigitalInput` beam break. Write `2026-robot/main_processor/shooter/node.h` — a timer, a target
   watcher, velocity control, `/shooter/state`.
 - **Accept:** the flywheel spins in simulation **with no change to any RoboRIO
   file, to `hardware_node`, or to the drivetrain.** A diff touching those files

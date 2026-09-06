@@ -70,7 +70,7 @@ def main() -> int:
         print("Generate it first with the existing Gradle/Bazel workflow.")
         return 0
 
-    tidy_files = collect_files(root, ("common/protocol",), TIDY_SUFFIXES)
+    tidy_files = collect_files(root, ("talOS/protocol",), TIDY_SUFFIXES)
     print("Running clang-tidy...")
     for path in tidy_files:
         run(["clang-tidy", str(path), "-p", str(root)], root)

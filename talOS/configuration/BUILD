@@ -1,8 +1,6 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
-exports_files(["robot.toml", "subsystem.toml"])
-
 cc_library(
     name = "configuration",
     hdrs = [
@@ -11,7 +9,7 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "//common/hardware:config",
+        "//talOS/hardware:config",
         "@tomlplusplus//:toml++",
     ],
 )
@@ -20,13 +18,9 @@ cc_test(
     name = "test",
     size = "small",
     srcs = ["config_test.cc"],
-    data = [
-        "robot.toml",
-        "subsystem.toml",
-    ],
     deps = [
         ":configuration",
-        "//common/hardware:config",
+        "//talOS/hardware:config",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],

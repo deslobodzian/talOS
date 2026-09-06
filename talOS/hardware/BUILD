@@ -1,44 +1,27 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
-load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
-exports_files(["main.cc"])
+cc_library(
+    name = "config",
+    srcs = ["config.cc"],
+    hdrs = ["config.h"],
+    visibility = ["//visibility:public"],
+)
 
 cc_library(
-    name = "node_lib",
-    srcs = ["node.cc"],
-    hdrs = ["node.h"],
+    name = "hardware",
+    srcs = ["messages.cc", "gateway.cc"],
+    hdrs = ["config.h", "config_wire.h", "messages.h", "gateway.h", "endpoint.h", "sim_backend.h", "packet.h"],
     deps = [
-        "//common/hardware:hardware",
-        "//common/protocol:protocol",
-        "//talOS/configuration:configuration",
-        "//talOS/drivetrain:drivetrain",
-        "//talOS/ipc:ipc",
+        ":config",
+        "//talOS/protocol:protocol",
     ],
-    visibility = ["//visibility:public"],
-)
-
-cc_binary(
-    name = "node",
-    srcs = ["main.cc"],
-    deps = [":node_lib"],
-    visibility = ["//visibility:public"],
-)
-
-cc_binary(
-    name = "hardware_node",
-    srcs = ["main.cc"],
-    deps = [":node_lib"],
     visibility = ["//visibility:public"],
 )
 
 cc_test(
-    name = "node_test",
+    name = "gateway_test",
     size = "small",
-    srcs = ["hardware_node_test.cc"],
-    deps = [
-        ":node_lib",
-        "@googletest//:gtest",
-        "@googletest//:gtest_main",
-    ],
+    srcs = ["gateway_test.cc"],
+    deps = [":hardware", "@googletest//:gtest_main"],
 )
