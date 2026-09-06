@@ -323,10 +323,16 @@ Everything is in one place, and nothing else changes. If a step here requires
 editing the RoboRIO program, the hardware bridge, or another node, stop: that
 is the invariant the whole design exists to protect.
 
-1. `2026-robot/main_processor/configuration/robot.toml`: a
-   `[subsystems.<name>]` block with `node = "//2026-robot/main_processor/<name>:node"`,
-   `period_us`, and its devices under `[subsystems.<name>.motors.*]` and
-   `[subsystems.<name>.sensors.*]`.
+1. `2026-robot/main_processor/<name>/subsystem.toml`: a `[subsystem]` block
+   with `node = "//2026-robot/main_processor/<name>:node"`, `period_us`, its
+   devices under `[motors.*]`, `[sensors.*]` and friends, and node-private
+   values the RIO never sees. `2026-robot/main_processor/configuration/robot.toml`
+   keeps `[robot]` and the subsystem manifest — the list of subsystem files —
+   and nothing else per subsystem. The parser merges every file into one
+   canonical view before validating, so exclusive ownership and the
+   deterministic (subsystem, device) id ordering behave exactly as if it were
+   one file: a second subsystem claiming one device is a parse-time error no
+   matter which file the claim is written in.
 2. `2026-robot/main_processor/<name>/packet.h`: the topic constants it owns,
    `inline constexpr const char* kStateTopic = "/<name>/state";` and so on.
    One declaration per topic, in the owning package.
@@ -355,10 +361,26 @@ robot on (subsystem, device) and numbers from one — so
 its reference table is updated. That failure is the feature: it is how an
 accidental edit to the hardware declaration gets caught.
 
-A node that owns no hardware declares no devices, only the
-`[subsystems.<name>]` block with a `node` target and a period. It subscribes to
+A node that owns no hardware declares no devices, only a `subsystem.toml`
+with a `node` target and a period. It subscribes to
 the *semantic* state topics that subsystem nodes publish and never to
 `/hw/state`. `odometry/` and `arbiter/` are the worked examples.
+
+Steps 1–7 are the subsystem package, and the package is the future repo
+boundary: `node =` is already an arbitrary Bazel label, so a subsystem that
+lives in another repository registers the same way
+(`node = "@intake//:node"`, its `subsystem.toml` named in the manifest) with
+no launcher change. Keep the layout standard — a second repo that renames
+`packet.h` or folds `main.cc` into `node.h` is a fork, not a package.
+
+The cross-language contract is the message schema, not the node. A subsystem
+written in another language is a future package whose `.fbs` generates both
+bindings and whose node speaks RTMS against the frozen shared-memory layout.
+Until a non-C++ RTMS client exists, other languages reach the robot through
+`studio/agent`'s JSON-RPC, which is observation only. Non-C++ nodes are
+second-tier by construction: they cannot make the no-allocation and
+byte-identical-replay claims, so a non-C++ node is tested on its I/O at the
+topic boundary and is never counted toward a replay-equality claim.
 
 ### A new topic
 

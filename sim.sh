@@ -144,7 +144,7 @@ fi
 
 # --- 2. the node graph ------------------------------------------------------
 say "starting node graph (log: $LOG_DIR/launcher.log)"
-LAUNCH_ARGS="--sim --session-id $SESSION_ID --output-dir $OUT_DIR"
+LAUNCH_ARGS="--config 2026-robot/main_processor/configuration/robot.toml --sim --session-id $SESSION_ID --output-dir $OUT_DIR"
 [ -n "$DURATION" ] && LAUNCH_ARGS="$LAUNCH_ARGS --duration-s $DURATION"
 # shellcheck disable=SC2086
 ./bazel-bin/talOS/launcher/launcher $LAUNCH_ARGS > "$LOG_DIR/launcher.log" 2>&1 &

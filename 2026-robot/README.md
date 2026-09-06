@@ -70,7 +70,7 @@ Drive the whole chain without a Driver Station or a controller processor:
 bazel build //talOS/bridge:hardware_node //2026-robot/main_processor/...
 
 bazel-bin/2026-robot/main_processor/drivetrain/sim_gateway --duration-s 16 &
-bazel-bin/talOS/bridge/hardware_node --duration-s 14 &
+bazel-bin/talOS/bridge/hardware_node --config 2026-robot/main_processor/configuration/robot.toml --duration-s 14 &
 bazel-bin/2026-robot/main_processor/drivetrain/node --sim --duration-s 13 &
 bazel-bin/2026-robot/main_processor/driver_station/node --duration-s 13 &
 bazel-bin/2026-robot/main_processor/arbiter/node --duration-s 13 &
@@ -124,7 +124,7 @@ cd 2026-robot/controller_processor/rio && ./gradlew simulateNative
 
 # 2. Every node in robot.toml, plus the hardware bridge. No --start-sim-gateway:
 #    the simulated Rio is the gateway.
-bazel run //talOS/launcher:launcher -- --sim
+bazel run //talOS/launcher:launcher -- --config 2026-robot/main_processor/configuration/robot.toml --sim
 
 # 3. Studio.
 bazel build //studio/bridge:studio_bridge //studio:web_dist
