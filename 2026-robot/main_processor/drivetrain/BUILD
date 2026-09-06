@@ -32,6 +32,7 @@ cc_binary(
         "//talOS/events:events",
         "//talOS/introspection:describe",
         "//talOS/introspection:reporter",
+        "//talOS/process:node_main",
     ],
 )
 cc_binary(name = "sim_gateway", srcs = ["sim_gateway.cc"], deps = [":drivetrain", "//talOS/hardware:hardware"])

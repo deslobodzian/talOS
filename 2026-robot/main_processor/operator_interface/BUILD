@@ -27,7 +27,7 @@ cc_binary(
         "//talOS/events:events",
         "//talOS/introspection:describe",
         "//talOS/introspection:reporter",
-        "//talOS/process:process",
+        "//talOS/process:node_main",
     ],
     visibility = ["//visibility:public"],
 )
