@@ -29,6 +29,10 @@ int main(int argc, char** argv) {
       oi.field_oriented = (*tbl)["field_oriented"].value_or(oi.field_oriented);
       oi.shoot_button_mask =
           (*tbl)["shoot_button_mask"].value_or(oi.shoot_button_mask);
+      oi.intake_target_rps =
+          (*tbl)["intake_target_rps"].value_or(oi.intake_target_rps);
+      oi.intake_button_mask =
+          (*tbl)["intake_button_mask"].value_or(oi.intake_button_mask);
     }
     return talos::oi::OperatorInterfaceNode{loop, oi};
   };

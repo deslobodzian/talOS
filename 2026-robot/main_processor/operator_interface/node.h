@@ -8,6 +8,8 @@
 #include "2026-robot/main_processor/driver_station/packet.h"
 #include "2026-robot/main_processor/drivetrain/drive_message_generated.h"
 #include "2026-robot/main_processor/drivetrain/packet.h"
+#include "2026-robot/main_processor/intake/intake_message_generated.h"
+#include "2026-robot/main_processor/intake/packet.h"
 #include "2026-robot/main_processor/shooter/packet.h"
 #include "2026-robot/main_processor/shooter/shooter_message_generated.h"
 #include "talOS/driver_station/driver_station.h"
@@ -29,11 +31,13 @@ struct OperatorInterfaceConfig {
   double max_angular_radps{6.0};
   double deadband{0.05};
   double shooter_target_rps{60.0};
+  double intake_target_rps{30.0};
   // Field-oriented driving needs a heading, so it stays off until the
   // drivetrain has published one; see OnDrivetrainState.
   bool field_oriented{true};
   // Bit 0 is button 1, matching the Driver Station's numbering.
   uint32_t shoot_button_mask{1u << 0};
+  uint32_t intake_button_mask{1u << 1};
 };
 
 template <typename Loop>
@@ -45,7 +49,9 @@ class OperatorInterfaceNode {
         chassis_target_{event::make_sender<talos::drive::ChassisTarget>(
             loop, talos::drive::kTeleopTargetTopic)},
         shooter_target_{event::make_sender<talos::shooter::ShooterTarget>(
-            loop, talos::shooter::kTeleopShooterTargetTopic)} {
+            loop, talos::shooter::kTeleopShooterTargetTopic)},
+        intake_target_{event::make_sender<talos::intake::IntakeTarget>(
+            loop, talos::intake::kTeleopIntakeTargetTopic)} {
     event::watch<driver_station::DriverStationState,
                  &OperatorInterfaceNode::OnDriverStation>(
         loop, driver_station::kDsStateTopic, this);
@@ -103,6 +109,8 @@ class OperatorInterfaceNode {
         talos::drive::ChassisTarget{0.0, 0.0, 0.0, ctx.now.nanos(), false});
     shooter_target_.send(
         talos::shooter::ShooterTarget{0.0, ctx.now.nanos(), false});
+    intake_target_.send(talos::intake::IntakeTarget{
+        static_cast<uint64_t>(ctx.now.nanos()), false, 0.0f});
   }
 
   void OnDriverStation(const event::Context& ctx,
@@ -135,11 +143,18 @@ class OperatorInterfaceNode {
     const bool shoot = (stick.buttons() & config_.shoot_button_mask) != 0;
     shooter_target_.send(talos::shooter::ShooterTarget{
         shoot ? config_.shooter_target_rps : 0.0, ctx.now.nanos(), shoot});
+
+    const bool intake =
+        (stick.buttons() & config_.intake_button_mask) != 0;
+    intake_target_.send(talos::intake::IntakeTarget{
+        static_cast<uint64_t>(ctx.now.nanos()), intake,
+        intake ? static_cast<float>(config_.intake_target_rps) : 0.0f});
   }
 
   OperatorInterfaceConfig config_;
   event::Sender<Loop, talos::drive::ChassisTarget> chassis_target_;
   event::Sender<Loop, talos::shooter::ShooterTarget> shooter_target_;
+  event::Sender<Loop, talos::intake::IntakeTarget> intake_target_;
 
   double yaw_rot_{0.0};
   bool have_heading_{false};

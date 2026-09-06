@@ -19,6 +19,8 @@ const std::vector<talos::introspect::EndpointAttribute> kEndpoints = {
      talos::introspect::naming::kSourceFlagOptional},
     {talos::arbiter::kAutoShooterTopic,
      talos::introspect::naming::kSourceFlagOptional},
+    {talos::arbiter::kAutoIntakeTopic,
+     talos::introspect::naming::kSourceFlagOptional},
 };
 }  // namespace
 

@@ -83,6 +83,16 @@ class Harness {
                     {reinterpret_cast<std::byte*>(&target), sizeof(target)});
     return target;
   }
+  talos::intake::IntakeTarget last_intake() {
+    auto& channel = env_.channel(talos::intake::kTeleopIntakeTargetTopic,
+                                 sizeof(talos::intake::IntakeTarget));
+    talos::intake::IntakeTarget target{};
+    EXPECT_GT(channel.next_sequence(), 0u);
+    if (channel.next_sequence() == 0) return target;
+    channel.copy_to(channel.next_sequence() - 1,
+                    {reinterpret_cast<std::byte*>(&target), sizeof(target)});
+    return target;
+  }
   OperatorInterfaceNode<event::SimulatedEventLoop<>>& node() { return node_; }
 
  private:
@@ -131,6 +141,23 @@ TEST(OperatorInterface, ReleasesTheShootButton) {
   harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/0)));
   EXPECT_FALSE(harness.last_shooter().enabled());
   EXPECT_NEAR(harness.last_shooter().target_velocity_rps(), 0.0, 1e-12);
+}
+
+TEST(OperatorInterface, RunsTheIntakeOnButtonTwo) {
+  Harness harness{NoDeadband(false)};
+  // Button 1 alone: shooter runs, intake stays off.
+  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/1)));
+  EXPECT_FALSE(harness.last_intake().enabled());
+  // Button 2: intake runs at the configured velocity.
+  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/2)));
+  const OperatorInterfaceConfig defaults{};
+  EXPECT_TRUE(harness.last_intake().enabled());
+  EXPECT_NEAR(harness.last_intake().roller_velocity_rps(),
+              defaults.intake_target_rps, 1e-6);
+  // Release: one explicit disabled request.
+  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/0)));
+  EXPECT_FALSE(harness.last_intake().enabled());
+  EXPECT_NEAR(harness.last_intake().roller_velocity_rps(), 0.0, 1e-12);
 }
 
 TEST(OperatorInterface, FieldOrientedRotatesTheRequestByDrivetrainHeading) {
