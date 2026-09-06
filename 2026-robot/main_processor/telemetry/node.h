@@ -12,7 +12,7 @@
 #include "2026-robot/main_processor/drivetrain/drive_message_generated.h"
 #include "2026-robot/main_processor/odometry/odometry_message_generated.h"
 #include "2026-robot/main_processor/odometry/packet.h"
-#include "studio/bridge/wire.h"
+#include "studio/schema/wire.h"
 #include "studio/schema/telemetry_generated.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/handles.h"

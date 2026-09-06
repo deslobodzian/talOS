@@ -9,7 +9,7 @@ cc_library(
         "//2026-robot/main_processor/driver_station:driver_station",
         "//2026-robot/main_processor/drivetrain:drivetrain",
         "//2026-robot/main_processor/odometry:odometry",
-        "//studio/bridge:wire",
+        "//studio/schema:wire",
         "//studio/schema:telemetry_cc",
         "//talOS/driver_station:driver_station",
         "//talOS/events:events",

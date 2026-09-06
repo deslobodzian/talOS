@@ -164,6 +164,8 @@ void HardwareNode::PublishIntrospection() {
     return;
   }
 
+  // One sample; see NodeRegistration::begin_sample.
+  registration_->begin_sample();
   registration_->heartbeat();
 
   // Every message this node moved, which is the sum of its per-topic counters.
@@ -191,6 +193,7 @@ void HardwareNode::PublishIntrospection() {
   for (const auto& [name, tracker] : subsystems_) {
     set(tracker.source_index, tracker.requests);
   }
+  registration_->end_sample();
 }
 
 void HardwareNode::PushConfig(uint64_t now_us) {

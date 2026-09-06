@@ -4,7 +4,7 @@ Build from the monorepo root using Bazel:
 
 ```sh
 bazel build //studio/bridge:studio_bridge //studio/bridge:studio_mock
-bazel test //studio/bridge:wire_test //studio/bridge:system_test \
+bazel test //studio/schema:wire_test //studio/bridge:system_test \
   //studio/bridge:integration_test
 ```
 

@@ -15,7 +15,7 @@
 #include "system.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/rtms/rtms.h"
-#include "wire.h"
+#include "studio/schema/wire.h"
 namespace fs = std::filesystem;
 namespace {
 volatile std::sig_atomic_t stop = 0;

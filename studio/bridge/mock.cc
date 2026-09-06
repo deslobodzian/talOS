@@ -7,7 +7,7 @@
 
 #include "studio/schema/telemetry_generated.h"
 #include "talOS/rtms/rtms.h"
-#include "wire.h"
+#include "studio/schema/wire.h"
 namespace {
 volatile std::sig_atomic_t stop = 0;
 void signal_handler(int) { stop = 1; }

@@ -403,5 +403,96 @@ TEST_F(Registry, AMisnamedTopicIsWarnedAboutAndStillPublished) {
   EXPECT_EQ(nodes.front().sources[1].name, "/hw/cmd");
 }
 
+// The heartbeat, the dispatch count and the per-source counters move as one
+// sample: a reader that arrives between samples sees the whole sample, never
+// a fresh heartbeat paired with the previous refresh's counts.
+TEST_F(Registry, WholeSamplesReadWhole) {
+  NodeRegistration registration{{.name = "seamed"}, path_};
+  registration.publish(sample_manifest());
+
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+
+  for (std::uint64_t i = 1; i <= 20; ++i) {
+    registration.begin_sample();
+    registration.heartbeat();
+    registration.set_dispatch_count(i);
+    registration.set_source(2, /*events=*/i, /*dropped=*/0, /*sequence=*/i,
+                            /*last_monotonic_ns=*/0, /*last_latency_ns=*/0,
+                            /*max_latency_ns=*/0);
+    registration.end_sample();
+
+    const auto nodes = reader->nodes();
+    ASSERT_EQ(nodes.size(), 1u);
+    EXPECT_EQ(nodes.front().dispatch_count, i);
+    ASSERT_EQ(nodes.front().sources.size(), 3u);
+    EXPECT_EQ(nodes.front().sources[2].events, i);
+    EXPECT_EQ(nodes.front().sources[2].sequence, i);
+  }
+}
+
+// A sample parked open -- the heartbeat advanced but the sample never closed
+// -- must not wedge or drop the reader. The bounded retries give up and return
+// the plain copy an older reader would have taken; once the sample closes,
+// the whole new sample is visible at once.
+TEST_F(Registry, ReaderMakesProgressWhileASampleIsOpen) {
+  NodeRegistration registration{{.name = "parked"}, path_};
+  registration.publish(sample_manifest());
+  registration.set_dispatch_count(7);
+  registration.set_source(2, /*events=*/7, /*dropped=*/0, /*sequence=*/7,
+                          /*last_monotonic_ns=*/0, /*last_latency_ns=*/0,
+                          /*max_latency_ns=*/0);
+
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+
+  registration.begin_sample();
+  registration.heartbeat();
+
+  // The sequence stays odd for as long as the sample stays open; the reader
+  // still terminates and still reports the node.
+  const auto mid = reader->nodes();
+  ASSERT_EQ(mid.size(), 1u);
+  EXPECT_EQ(mid.front().name, "parked");
+
+  registration.set_dispatch_count(8);
+  registration.set_source(2, /*events=*/8, /*dropped=*/0, /*sequence=*/8,
+                          /*last_monotonic_ns=*/0, /*last_latency_ns=*/0,
+                          /*max_latency_ns=*/0);
+  registration.end_sample();
+
+  const auto after = reader->nodes();
+  ASSERT_EQ(after.size(), 1u);
+  EXPECT_EQ(after.front().dispatch_count, 8u);
+  ASSERT_EQ(after.front().sources.size(), 3u);
+  EXPECT_EQ(after.front().sources[2].events, 8u);
+}
+
+// A writer that predates the guard never touches the sequence word, which
+// reads back as the zero its segment was created with: undisturbed zero is
+// even, so old writers unconditionally read as stable.
+TEST_F(Registry, WriterWithoutTheGuardReadsAsStable) {
+  NodeRegistration registration{{.name = "legacy"}, path_};
+  registration.publish(sample_manifest());
+
+  // Bypass the guard exactly as an older build does: store the counters and
+  // the heartbeat straight into the slot, leaving the sequence word alone.
+  RegistryMapping mapping{path_};
+  NodeRecord& record = mapping.header()->nodes[registration.slot()];
+  record.dispatch_count.store(41, std::memory_order_relaxed);
+  record.sources[2].events.store(41, std::memory_order_relaxed);
+  record.heartbeat_wall_ns.store(wall_now_ns(), std::memory_order_relaxed);
+  EXPECT_EQ(record.sample_seq.load(std::memory_order_relaxed), 0u);
+
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto nodes = reader->nodes();
+  ASSERT_EQ(nodes.size(), 1u);
+  EXPECT_EQ(nodes.front().dispatch_count, 41u);
+  ASSERT_EQ(nodes.front().sources.size(), 3u);
+  EXPECT_EQ(nodes.front().sources[2].events, 41u);
+  EXPECT_TRUE(nodes.front().alive);
+}
+
 }  // namespace
 }  // namespace talos::introspect
