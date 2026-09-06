@@ -6,6 +6,7 @@ load("@rules_python//python:defs.bzl", "py_library", "py_test")
 
 py_library(
     name = "rtms_py",
+    visibility = ["//visibility:public"],
     srcs = [
         "IPCMessage/TestMessage.py",
         "IPCMessage/TimeMessage.py",

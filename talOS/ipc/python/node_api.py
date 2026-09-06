@@ -41,6 +41,13 @@ TALOS_SOURCE_WATCHER = 2
 TALOS_SOURCE_FETCHER = 3
 TALOS_SOURCE_SENDER = 4
 
+# Bare aliases matching event::SourceKind names; describe rows read better
+# with them than with the prefixed constants.
+TIMER = TALOS_SOURCE_TIMER
+WATCHER = TALOS_SOURCE_WATCHER
+FETCHER = TALOS_SOURCE_FETCHER
+SENDER = TALOS_SOURCE_SENDER
+
 SOURCE_FLAG_EXTERNAL = 1 << 0
 SOURCE_FLAG_OPTIONAL = 1 << 1
 
@@ -116,6 +123,14 @@ def _candidate_paths():
     root = _workspace_root(here)
     if root:
         yield os.path.join(root, "bazel-bin", "talOS", "node_api", _LIB_NAME)
+
+
+def find_lib():
+    """First existing libtalos_node.so candidate, or None without loading."""
+    for path in _candidate_paths():
+        if path and os.path.isfile(path):
+            return path
+    return None
 
 
 def _load():
