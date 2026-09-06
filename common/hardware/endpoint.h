@@ -72,6 +72,12 @@ class Endpoint {
     return peer_.SendFrame(protocol::FrameType::kHardwareState, 0, now_us,
                            buffer_.data(), size);
   }
+  // Payload-agnostic passthrough for frames this endpoint does not own, so
+  // their encoding stays with the caller rather than in the gateway layer.
+  protocol::UdpStatus SendFrame(protocol::FrameType type, uint64_t now_us,
+                                const void* payload, std::size_t payload_size) {
+    return peer_.SendFrame(type, 0, now_us, payload, payload_size);
+  }
 
  private:
   Gateway& gateway_;

@@ -3,11 +3,13 @@
 #include <frc/DriverStation.h>
 #include <hal/DriverStation.h>
 
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <random>
 #include <thread>
 
+#include "DriverStationReader.h"
 #include "PhoenixBackend.h"
 
 #ifndef __FRC_ROBORIO__
@@ -78,6 +80,9 @@ class SimDriverStation {
     frc::sim::DriverStationSim::SetAutonomous(false);
     frc::sim::DriverStationSim::SetTest(false);
     frc::sim::DriverStationSim::SetDsAttached(true);
+    frc::sim::DriverStationSim::SetJoystickAxisCount(0, 4);
+    frc::sim::DriverStationSim::SetJoystickButtonCount(0, 10);
+    frc::sim::DriverStationSim::SetJoystickPOVCount(0, 1);
     Publish();
   }
 
@@ -153,6 +158,9 @@ void Robot::StartCompetition() {
   uint64_t active_ticks = 0;
 #endif
 
+  std::array<uint8_t, talos::protocol::kMaxPayloadSize> ds_buffer{};
+  uint64_t last_ds_sample_us = 0;
+
   while (running_.load(std::memory_order_relaxed)) {
     if (gateway_->configured()) {
       period = std::chrono::microseconds{gateway_->config().period_us};
@@ -171,9 +179,25 @@ void Robot::StartCompetition() {
     frc::DriverStation::RefreshData();
     ObserveMode();
 
+    const uint64_t now_us = NowUs();
     if (endpoint_) {
-      endpoint_->Tick(NowUs(), frc::DriverStation::IsEnabled() &&
-                                   !frc::DriverStation::IsEStopped());
+      endpoint_->Tick(now_us, frc::DriverStation::IsEnabled() &&
+                                  !frc::DriverStation::IsEStopped());
+
+      // The Driver Station only produces new data at 50 Hz, so sampling it on
+      // every hardware tick would put three duplicate packets on the link, and
+      // in the dispatch log downstream, for every real one.
+      if (now_us - last_ds_sample_us >=
+          talos::driver_station::kSamplePeriodUs) {
+        last_ds_sample_us = now_us;
+        const auto ds = talos::driver_station::SampleDriverStation(now_us);
+        // Encode() returns 0 if the payload will not fit; send nothing rather
+        // than an empty frame the receiver would forward as a decode failure.
+        if (const auto ds_size = talos::driver_station::Encode(ds, ds_buffer)) {
+          endpoint_->SendFrame(talos::protocol::FrameType::kDriverStation,
+                               now_us, ds_buffer.data(), ds_size);
+        }
+      }
     } else {
       backend_->Neutral();
     }

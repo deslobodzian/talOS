@@ -25,6 +25,7 @@ enum class FrameType : uint16_t {
   kHardwareCommand = 21,
   kHardwareConfig = 22,
   kHardwareConfigAck = 23,
+  kDriverStation = 24,
 };
 
 enum FrameFlags : uint16_t {

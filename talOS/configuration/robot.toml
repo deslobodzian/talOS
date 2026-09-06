@@ -253,3 +253,15 @@ slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
 
 [subsystems.shooter.digital_inputs.beam_break]
 dio = 0
+
+# Input-only subsystem: owns no actuators, so the hardware node keeps no
+# request tracker for it. period_us is the Driver Station sample rate (50 Hz),
+# which must stay in sync with driver_station::kSamplePeriodUs on the Rio side.
+[subsystems.driver_station]
+node = "//talOS/driver_station:node"
+period_us = 20000
+max_linear_mps = 4.0
+max_angular_radps = 6.0
+deadband = 0.05
+shooter_target_rps = 60.0
+

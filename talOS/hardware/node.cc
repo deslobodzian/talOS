@@ -1,6 +1,8 @@
 #include "node.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <utility>
 
@@ -44,8 +46,13 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
     full_cmd_.pwm_outputs[i].output = 0.0;
   }
 
-  // Setup subsystem trackers
+  // Setup subsystem trackers. Input-only subsystems own no actuators, so they
+  // never publish an /hw/req/ request and have nothing to neutralize.
   for (const auto& [name, devs] : robot_config_.subsystems) {
+    if (devs.motors.empty() && devs.digital_outputs.empty() &&
+        devs.pwm_outputs.empty()) {
+      continue;
+    }
     SubsystemTracker tracker;
     tracker.name = name;
     tracker.devices = devs;
@@ -65,6 +72,7 @@ bool HardwareNode::Open() {
 
   state_pub_ = std::make_unique<ipc::Publisher<talos::drive::Packet>>("/hw/state");
   cmd_pub_ = std::make_unique<ipc::Publisher<talos::drive::Packet>>("/hw/cmd");
+  ds_pub_ = std::make_unique<ipc::Publisher<talos::drive::Packet>>("/hw/ds");
 
   for (auto& [name, tracker] : subsystems_) {
     std::string topic = "/hw/req/" + name;
@@ -132,6 +140,18 @@ void HardwareNode::Tick(uint64_t now_us) {
       talos::drive::Packet pkt{};
       pkt.size = static_cast<uint32_t>(Encode(state, pkt.data));
       if (state_pub_) state_pub_->write(pkt);
+      continue;
+    }
+
+    if (frame.header.type == protocol::FrameType::kDriverStation) {
+      talos::drive::Packet pkt{};
+      const std::size_t n =
+          std::min<std::size_t>(frame.payload_size, pkt.data.size());
+      pkt.size = static_cast<uint32_t>(n);
+      std::memcpy(pkt.data.data(), frame.payload, n);
+      if (ds_pub_) ds_pub_->write(pkt);
+      ++driver_station_packets_received_;
+      continue;
     }
   }
 
