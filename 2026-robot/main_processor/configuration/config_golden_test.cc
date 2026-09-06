@@ -75,14 +75,38 @@ inline hardware::Config ReferenceSwerveConfig(bool simulation = false) {
   std::sort(c.motors.begin(), c.motors.end(),
             [](const auto& a, const auto& b) { return a.name < b.name; });
 
+  // "intake" sorts between "driver_station" and "odometry", so its devices
+  // take ids 14-15 and the shooter pair shifts to 16-17.
+  hardware::DigitalInputConfig intake_beam;
+  intake_beam.id = 14;
+  intake_beam.name = "intake_beam";
+  intake_beam.dio = 1;
+  c.digital_inputs.push_back(intake_beam);
+
+  hardware::MotorConfig roller;
+  roller.id = 15;
+  roller.name = "roller";
+  roller.can_id = 10;
+  roller.bus = "rio";
+  roller.inverted = false;
+  roller.brake = true;
+  roller.supply_limit_a = 40.0;
+  roller.stator_limit_a = 80.0;
+  roller.max_velocity_rps = 100.0;
+  roller.feedback = hardware::Feedback::kRotor;
+  roller.feedback_sensor_id = 0;
+  roller.rotor_to_sensor_ratio = 1.0;
+  roller.sensor_to_mechanism_ratio = 1.0;
+  c.motors.push_back(roller);
+
   hardware::DigitalInputConfig beam_break;
-  beam_break.id = 14;
+  beam_break.id = 16;
   beam_break.name = "beam_break";
   beam_break.dio = 0;
   c.digital_inputs.push_back(beam_break);
 
   hardware::MotorConfig flywheel;
-  flywheel.id = 15;
+  flywheel.id = 17;
   flywheel.name = "flywheel";
   flywheel.can_id = 9;
   flywheel.bus = "rio";
@@ -135,15 +159,23 @@ TEST(ConfigTest, GoldenTestParsesSwerveRobotTomlEqualToSwerveConfig) {
   EXPECT_EQ(shooter_devs->motors.size(), 1);
   EXPECT_EQ(shooter_devs->digital_inputs.size(), 1);
 
-  // Logical IDs are 1..15 assigned deterministically
+  const auto* intake_devs = config.GetDevices("intake");
+  ASSERT_NE(intake_devs, nullptr);
+  EXPECT_EQ(intake_devs->subsystem, "intake");
+  EXPECT_EQ(intake_devs->motors.size(), 1);
+  EXPECT_EQ(intake_devs->digital_inputs.size(), 1);
+
+  // Logical IDs are 1..17 assigned deterministically
   for (size_t i = 0; i < devs->motors.size(); ++i) {
     EXPECT_EQ(config.hardware.motors[i].id, devs->motors[i]);
   }
-  EXPECT_EQ(config.hardware.motors[8].id, shooter_devs->motors[0]);
+  EXPECT_EQ(config.hardware.motors[8].id, intake_devs->motors[0]);
+  EXPECT_EQ(config.hardware.motors[9].id, shooter_devs->motors[0]);
   for (size_t i = 0; i < devs->sensors.size(); ++i) {
     EXPECT_EQ(config.hardware.sensors[i].id, devs->sensors[i]);
   }
-  EXPECT_EQ(config.hardware.digital_inputs[0].id, shooter_devs->digital_inputs[0]);
+  EXPECT_EQ(config.hardware.digital_inputs[0].id, intake_devs->digital_inputs[0]);
+  EXPECT_EQ(config.hardware.digital_inputs[1].id, shooter_devs->digital_inputs[0]);
 
   // Verify access to subsystem-specific table: [subsystems.drivetrain.geometry]
   const auto* geom = config.GetSubsystemTable("drivetrain", "geometry");

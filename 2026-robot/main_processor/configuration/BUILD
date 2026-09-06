@@ -14,6 +14,7 @@ filegroup(
         "//2026-robot/main_processor/arbiter:subsystem.toml",
         "//2026-robot/main_processor/driver_station:subsystem.toml",
         "//2026-robot/main_processor/drivetrain:subsystem.toml",
+        "//2026-robot/main_processor/intake:subsystem.toml",
         "//2026-robot/main_processor/odometry:subsystem.toml",
         "//2026-robot/main_processor/operator_interface:subsystem.toml",
         "//2026-robot/main_processor/shooter:subsystem.toml",

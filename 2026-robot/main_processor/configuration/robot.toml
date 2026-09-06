@@ -24,6 +24,10 @@ name = "driver_station"
 path = "../driver_station/subsystem.toml"
 
 [[subsystems]]
+name = "intake"
+path = "../intake/subsystem.toml"
+
+[[subsystems]]
 name = "odometry"
 path = "../odometry/subsystem.toml"
 
