@@ -10,7 +10,7 @@
 #include <string>
 #include <thread>
 
-#include "2026-robot/main_processor/driver_station/node.h"
+#include "2026-robot/main_processor/driver_station/packet.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/os/poller.h"
 #include "talOS/ipc/publisher.h"
@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
       throw std::invalid_argument("duration must be positive");
 
     talos::process::InstallStopHandlers();
-    ipc::Publisher<talos::drive::Packet> publisher{
+    ipc::Publisher<talos::driver_station::Packet> publisher{
         talos::driver_station::kHwDsTopic};
 
     talos::driver_station::DriverStationData ds{};
@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
            std::chrono::steady_clock::now() < end) {
       ds.sample_time_us =
           static_cast<uint64_t>(talos::event::Poller::now().nanos() / 1000);
-      talos::drive::Packet packet{};
+      talos::driver_station::Packet packet{};
       packet.size =
           static_cast<uint32_t>(talos::driver_station::Encode(ds, packet.data));
       if (packet.size) {
@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
     ds.fms.flags = talos::driver_station::kDsAttached;
     ds.sample_time_us =
         static_cast<uint64_t>(talos::event::Poller::now().nanos() / 1000);
-    talos::drive::Packet packet{};
+    talos::driver_station::Packet packet{};
     packet.size =
         static_cast<uint32_t>(talos::driver_station::Encode(ds, packet.data));
     if (packet.size) publisher.write(packet);

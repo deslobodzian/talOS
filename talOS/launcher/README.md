@@ -128,7 +128,7 @@ comes back a different number, and an id that changes is not an id.
 
 ```sh
 bazel test //talOS/launcher/...
-bazel run //talOS/launcher:launcher -- --describe-only
+bazel run //talOS/launcher:launcher -- --config <path-to>/robot.toml --describe-only
 ```
 
 The launcher resolves node targets to `bazel-bin/...` paths and reads a

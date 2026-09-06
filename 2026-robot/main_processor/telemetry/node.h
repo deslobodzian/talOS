@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "2026-robot/main_processor/driver_station/driver_station_message_generated.h"
-#include "2026-robot/main_processor/driver_station/node.h"
+#include "2026-robot/main_processor/driver_station/packet.h"
 #include "2026-robot/main_processor/drivetrain/drive_message_generated.h"
 #include "2026-robot/main_processor/odometry/odometry_message_generated.h"
 #include "2026-robot/main_processor/odometry/packet.h"

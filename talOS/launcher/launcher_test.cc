@@ -237,7 +237,7 @@ TEST(LauncherTest, MergedLogsRejectsSessionIdMismatch) {
 TEST(LauncherTest, SessionManifestJsonFormatting) {
   SessionManifest manifest;
   manifest.session_id = 987654321ULL;
-  manifest.config_path = "2026-robot/main_processor/configuration/robot.toml";
+  manifest.config_path = "fixture/robot.toml";
   manifest.output_dir = "/tmp/test_dir";
   manifest.simulation = true;
   manifest.start_wall_ns = 1'000'000'000LL;

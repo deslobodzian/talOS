@@ -24,8 +24,8 @@ cc_library(
 cc_binary(
     name = "node",
     srcs = ["main.cc"],
-    # The default --config path, so `bazel run` (and `--describe` in
-    # particular) works without being told where the robot lives.
+    # The robot config, so `bazel run` (and `--describe` in particular) can
+    # read it when it is passed as --config.
     data = ["//2026-robot/main_processor/configuration:robot.toml"],
     deps = [
         ":node_lib",

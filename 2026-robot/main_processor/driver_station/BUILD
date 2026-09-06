@@ -11,11 +11,11 @@ flatbuffer_cc_library(
 
 cc_library(
     name = "driver_station",
-    hdrs = ["node.h"],
+    hdrs = ["node.h", "packet.h"],
     deps = [
         ":driver_station_message",
         "//talOS/driver_station:driver_station",
-        "//2026-robot/main_processor/drivetrain:drivetrain",
+        "//talOS/hardware:hardware",
         "//talOS/events:events",
     ],
     visibility = ["//visibility:public"],
