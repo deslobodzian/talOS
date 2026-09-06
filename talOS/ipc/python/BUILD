@@ -11,6 +11,7 @@ py_library(
         "IPCMessage/TimeMessage.py",
         "IPCMessage/__init__.py",
         "messages.py",
+        "node_api.py",
         "rtms.py",
     ],
     deps = ["@pypi//flatbuffers"],
@@ -31,7 +32,10 @@ py_test(
     name = "rtms_roundtrip_test",
     size = "small",
     srcs = ["rtms_roundtrip_test.py"],
-    data = [":peer"],
+    data = [
+        ":peer",
+        "//talOS/node_api:libtalos_node.so",
+    ],
     tags = ["local"],
     deps = [":rtms_py"],
 )
