@@ -1,8 +1,16 @@
 #pragma once
 
+#include <poll.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -16,14 +24,10 @@
 #include <thread>
 #include <vector>
 
-#include <csignal>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/log/log_reader.h"
+#include "talOS/introspection/describe.h"
+#include "talOS/introspection/names.h"
 
 namespace talos::launcher {
 
@@ -39,7 +43,7 @@ inline uint64_t GenerateSessionId() {
 
 struct NodeSpec {
   std::string name;
-  std::string target;       // e.g. "//2026-robot/main_processor/drivetrain:node"
+  std::string target;  // e.g. "//2026-robot/main_processor/drivetrain:node"
   std::string binary_path;  // Resolved executable path
   std::vector<std::string> extra_args;
 };
@@ -54,6 +58,10 @@ struct NodeProcessInfo {
   bool exited{false};
   bool failed{false};
   uint64_t record_count{0};
+
+  // Whether this binary answered --describe. Recorded because a session whose
+  // graph was never checked reads exactly like one whose graph passed.
+  bool described{false};
 };
 
 struct SessionManifest {
@@ -63,6 +71,7 @@ struct SessionManifest {
   bool simulation{false};
   int64_t start_wall_ns{0};
   int64_t end_wall_ns{0};
+  std::size_t declared_topics{0};
   std::vector<NodeProcessInfo> nodes;
 
   std::string ToJson() const {
@@ -84,7 +93,10 @@ struct SessionManifest {
       ss << "      \"log_path\": \"" << n.log_path << "\",\n";
       ss << "      \"pid\": " << n.pid << ",\n";
       ss << "      \"exit_code\": " << n.exit_code << ",\n";
-      ss << "      \"recorder_failed\": " << (n.failed ? "true" : "false") << ",\n";
+      ss << "      \"recorder_failed\": " << (n.failed ? "true" : "false")
+         << ",\n";
+      ss << "      \"described\": " << (n.described ? "true" : "false")
+         << ",\n";
       ss << "      \"record_count\": " << n.record_count << "\n";
       ss << "    }" << (i + 1 < nodes.size() ? "," : "") << "\n";
     }
@@ -102,12 +114,28 @@ struct LauncherOptions {
   int duration_s{0};
   bool start_sim_gateway{false};
 
+  // Launch a graph the linter called broken anyway. The default is refusal,
+  // because what the lint catches -- a publisher and a subscriber on two
+  // spellings of one name -- is silent at runtime: both ends work perfectly and
+  // never meet, so nothing downstream will ever say so. But a robot in a
+  // competition queue must be able to run past a lint failure, so there is a
+  // way to say that out loud rather than by editing the launcher.
+  bool allow_graph_errors{false};
+
+  // Probe and lint without spawning anything, as a pre-flight check.
+  bool describe_only{false};
+
+  // How long one binary gets to answer --describe. A node that hangs there must
+  // cost the launch this much and no more.
+  int describe_timeout_ms{5000};
+
   // Map of target/name -> binary override, useful for testing
   std::map<std::string, std::string> binary_overrides;
 };
 
-inline std::string ResolveBinary(const std::string& target_or_path,
-                                 const std::map<std::string, std::string>& overrides = {}) {
+inline std::string ResolveBinary(
+    const std::string& target_or_path,
+    const std::map<std::string, std::string>& overrides = {}) {
   auto it = overrides.find(target_or_path);
   if (it != overrides.end()) {
     return it->second;
@@ -120,7 +148,8 @@ inline std::string ResolveBinary(const std::string& target_or_path,
     }
   }
 
-  // Convert "//2026-robot/main_processor/drivetrain:node" -> "2026-robot/main_processor/drivetrain/node"
+  // Convert "//2026-robot/main_processor/drivetrain:node" ->
+  // "2026-robot/main_processor/drivetrain/node"
   std::string subpath = target_or_path;
   if (subpath.starts_with("//")) {
     subpath = subpath.substr(2);
@@ -154,13 +183,10 @@ inline std::string ResolveBinary(const std::string& target_or_path,
 
   // If subpath ends with "hardware_node", also check "node"
   if (subpath.ends_with("hardware_node")) {
-    std::string alt_subpath =
-        subpath.substr(0, subpath.size() - 13) + "node";
-    std::vector<std::string> alt_candidates = {
-        "bazel-bin/" + alt_subpath,
-        alt_subpath,
-        "./" + alt_subpath,
-        "../" + alt_subpath};
+    std::string alt_subpath = subpath.substr(0, subpath.size() - 13) + "node";
+    std::vector<std::string> alt_candidates = {"bazel-bin/" + alt_subpath,
+                                               alt_subpath, "./" + alt_subpath,
+                                               "../" + alt_subpath};
     for (const auto& path : alt_candidates) {
       if (::access(path.c_str(), X_OK) == 0) {
         return path;
@@ -172,8 +198,8 @@ inline std::string ResolveBinary(const std::string& target_or_path,
   return candidates.front();
 }
 
-inline std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
-                                          const LauncherOptions& options) {
+inline std::vector<NodeSpec> DiscoverNodes(
+    const config::RobotConfig& robot_config, const LauncherOptions& options) {
   std::vector<NodeSpec> specs;
 
   // 1. Hardware node (bridge)
@@ -225,8 +251,7 @@ inline std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_conf
       NodeSpec gw_spec;
       gw_spec.name = "sim_gateway";
       gw_spec.target = gw_target;
-      gw_spec.binary_path =
-          ResolveBinary(gw_target, options.binary_overrides);
+      gw_spec.binary_path = ResolveBinary(gw_target, options.binary_overrides);
       specs.push_back(gw_spec);
     }
   }
@@ -234,10 +259,288 @@ inline std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_conf
   return specs;
 }
 
+// The launcher works in the vocabulary of the naming protocol, not its own.
+namespace naming = introspect::naming;
+
+// What one binary answered when it was asked what it is.
+struct NodeDescription {
+  std::string roster_name;  // The `[subsystems.<name>]` key from the config.
+  std::string target;
+  std::string binary_path;
+  bool answered{false};
+  std::string error;  // Why not, when it did not answer.
+  introspect::Description declared;
+};
+
+// Runs `binary --describe`, captures its stdout and parses the manifest out of
+// it.
+//
+// fork/execv with a pipe rather than popen, to match the spawn path below and
+// because popen goes through a shell: a binary path with a space in it, or a
+// node that inherits a shell's signal disposition, is not a thing to debug at a
+// competition. The timeout is the point of the whole function -- a node that
+// blocks in its constructor costs the launch a second, not the session.
+inline bool ProbeDescribe(const std::string& binary_path,
+                          const std::vector<std::string>& args,
+                          std::chrono::milliseconds timeout,
+                          introspect::Description& out, std::string& error) {
+  error.clear();
+  if (::access(binary_path.c_str(), X_OK) != 0) {
+    error = "no executable at " + binary_path;
+    return false;
+  }
+
+  int fds[2];
+  if (::pipe(fds) != 0) {
+    error = std::string{"pipe() failed: "} + std::strerror(errno);
+    return false;
+  }
+
+  std::vector<std::string> owned = args;
+  std::vector<char*> c_args;
+  c_args.reserve(owned.size() + 1);
+  for (auto& arg : owned) {
+    c_args.push_back(arg.data());
+  }
+  c_args.push_back(nullptr);
+
+  const pid_t pid = ::fork();
+  if (pid < 0) {
+    error = std::string{"fork() failed: "} + std::strerror(errno);
+    ::close(fds[0]);
+    ::close(fds[1]);
+    return false;
+  }
+  if (pid == 0) {
+    ::close(fds[0]);
+    ::dup2(fds[1], STDOUT_FILENO);
+    ::close(fds[1]);
+    // stderr is left alone on purpose: a node that throws on --describe should
+    // say so where the person launching can see it.
+    ::execv(binary_path.c_str(), c_args.data());
+    ::_exit(127);
+  }
+  ::close(fds[1]);
+
+  std::string text;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  bool timed_out = false;
+  for (;;) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (left.count() <= 0) {
+      timed_out = true;
+      break;
+    }
+    ::pollfd waiting{fds[0], POLLIN, 0};
+    const int ready = ::poll(&waiting, 1, static_cast<int>(left.count()));
+    if (ready < 0) {
+      if (errno == EINTR) continue;
+      error = std::string{"poll() failed: "} + std::strerror(errno);
+      break;
+    }
+    if (ready == 0) {
+      timed_out = true;
+      break;
+    }
+    char buffer[4096];
+    const ssize_t got = ::read(fds[0], buffer, sizeof(buffer));
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      error = std::string{"read() failed: "} + std::strerror(errno);
+      break;
+    }
+    if (got == 0) break;  // EOF: the child closed stdout, so it is finished.
+    text.append(buffer, static_cast<std::size_t>(got));
+  }
+  ::close(fds[0]);
+
+  // SIGKILL rather than SIGINT: this process was asked a question, not given
+  // work, so there is nothing for it to shut down cleanly.
+  if (timed_out || !error.empty()) ::kill(pid, SIGKILL);
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+
+  if (timed_out) {
+    error = "no answer within " + std::to_string(timeout.count()) +
+            "ms; the probe was killed";
+    return false;
+  }
+  if (!error.empty()) return false;
+
+  std::string parse_error;
+  if (!introspect::DescribeReader::Parse(text, out, parse_error)) {
+    error = parse_error;
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+      error += "; exit code " + std::to_string(WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+      error += "; killed by signal " + std::to_string(WTERMSIG(status));
+    }
+    return false;
+  }
+  return true;
+}
+
+// Phase one of a launch: ask every binary in the roster what it is, assemble
+// the graph they describe, and lint it.
+//
+// The descriptions come from the binaries rather than from the config because
+// the config would be a second declaration of the topology, and a second
+// declaration is a thing to forget to update -- which produces exactly the
+// failure the lint exists to catch.
+inline std::vector<naming::Diagnostic> DescribeGraph(
+    const std::vector<NodeSpec>& specs, const LauncherOptions& options,
+    std::vector<NodeDescription>& out) {
+  out.clear();
+  out.reserve(specs.size());
+
+  std::vector<naming::NodeShape> shapes;
+  std::vector<naming::Diagnostic> probe_findings;
+
+  for (const auto& spec : specs) {
+    NodeDescription described;
+    described.roster_name = spec.name;
+    described.target = spec.target;
+    described.binary_path = spec.binary_path;
+
+    // The same flags the spawn below passes, minus the ones about running:
+    // a node whose topics depend on its configuration must describe the
+    // configuration this session will actually use.
+    std::vector<std::string> args{spec.binary_path, "--describe", "--config",
+                                  options.config_path};
+    if (options.simulation) args.push_back("--sim");
+
+    described.answered =
+        ProbeDescribe(spec.binary_path, args,
+                      std::chrono::milliseconds{options.describe_timeout_ms},
+                      described.declared, described.error);
+
+    if (described.answered) {
+      // Timers are left out of the graph handed to the linter. A timer is an
+      // event source but not a topic: nothing can be at the other end of one,
+      // and its name is a label -- "swerve" -- rather than a path, so checking
+      // it against the topic grammar reports every periodic node as broken.
+      // graph.json still carries them, because a viewer wants the whole shape.
+      naming::NodeShape shape{
+          described.declared.name, described.declared.target, {}};
+      for (const auto& source : described.declared.sources) {
+        if (source.kind != event::SourceKind::TIMER) {
+          shape.sources.push_back(source);
+        }
+      }
+      shapes.push_back(std::move(shape));
+      if (described.declared.name != spec.name) {
+        // A warning and not an error: the two names disagreeing makes the log
+        // file and the registry row hard to line up, which is a confusing
+        // session rather than a broken one.
+        probe_findings.push_back({naming::Severity::WARNING, spec.name,
+                                  "the config calls this node '" + spec.name +
+                                      "' but the binary describes itself as '" +
+                                      described.declared.name + "'"});
+      }
+    } else {
+      // Also a warning. A node someone is halfway through writing has to stay
+      // launchable: a framework that refuses to start what it cannot describe
+      // is a framework people work around, and then nothing is described.
+      probe_findings.push_back(
+          {naming::Severity::WARNING, spec.name,
+           "did not answer --describe (" + described.error +
+               "), so its topics are missing from the declared graph"});
+    }
+    out.push_back(std::move(described));
+  }
+
+  auto diagnostics = naming::LintGraph(shapes);
+  diagnostics.insert(diagnostics.end(), probe_findings.begin(),
+                     probe_findings.end());
+  return diagnostics;
+}
+
+// Distinct topics in a declared graph. Timers are event sources but not
+// topics -- nothing can be at the other end of one -- so they do not count.
+inline std::size_t CountDeclaredTopics(
+    const std::vector<NodeDescription>& described) {
+  std::vector<std::string> topics;
+  for (const auto& node : described) {
+    for (const auto& source : node.declared.sources) {
+      if (source.kind == event::SourceKind::TIMER) continue;
+      if (std::find(topics.begin(), topics.end(), source.name) ==
+          topics.end()) {
+        topics.push_back(source.name);
+      }
+    }
+  }
+  return topics.size();
+}
+
+// The declared graph on disk, beside the session's manifest.
+//
+// uint64 values are written as decimal strings, which is the rule everywhere in
+// this repo that emits JSON: a JSON number is a double, so a session id past
+// 2^53 comes back a different number, and an id that changes is not an id.
+inline std::string GraphToJson(
+    uint64_t session_id, const std::string& config_path,
+    const std::vector<NodeDescription>& described,
+    const std::vector<naming::Diagnostic>& diagnostics) {
+  const auto quoted = [](std::string_view value) {
+    std::string out;
+    introspect::AppendJsonString(out, value);
+    return out;
+  };
+
+  std::ostringstream ss;
+  ss << "{\n";
+  ss << "  \"describe_version\": " << introspect::kDescribeVersion << ",\n";
+  ss << "  \"session_id\": \"" << session_id << "\",\n";
+  ss << "  \"config_path\": " << quoted(config_path) << ",\n";
+  ss << "  \"nodes\": [\n";
+  for (std::size_t i = 0; i < described.size(); ++i) {
+    const auto& node = described[i];
+    ss << "    {\n";
+    ss << "      \"name\": "
+       << quoted(node.answered ? node.declared.name : node.roster_name)
+       << ",\n";
+    ss << "      \"target\": "
+       << quoted(node.answered ? node.declared.target : node.target) << ",\n";
+    ss << "      \"described\": " << (node.answered ? "true" : "false")
+       << ",\n";
+    if (!node.answered) {
+      ss << "      \"describe_error\": " << quoted(node.error) << ",\n";
+    }
+    ss << "      \"sources\": [";
+    for (std::size_t j = 0; j < node.declared.sources.size(); ++j) {
+      const auto& source = node.declared.sources[j];
+      ss << (j ? ",\n        {" : "\n        {");
+      ss << "\"kind\": " << quoted(event::to_string(source.kind));
+      ss << ", \"name\": " << quoted(source.name);
+      ss << ", \"message_bytes\": " << source.message_bytes;
+      ss << ", \"external\": " << (source.external() ? "true" : "false");
+      ss << ", \"optional\": " << (source.optional() ? "true" : "false");
+      ss << "}";
+    }
+    ss << (node.declared.sources.empty() ? "]\n" : "\n      ]\n");
+    ss << "    }" << (i + 1 < described.size() ? "," : "") << "\n";
+  }
+  ss << "  ],\n";
+  ss << "  \"diagnostics\": [\n";
+  for (std::size_t i = 0; i < diagnostics.size(); ++i) {
+    const auto& diagnostic = diagnostics[i];
+    ss << "    {\"severity\": "
+       << quoted(diagnostic.severity == naming::Severity::ERROR ? "error"
+                                                                : "warning")
+       << ", \"subject\": " << quoted(diagnostic.subject)
+       << ", \"message\": " << quoted(diagnostic.message) << "}"
+       << (i + 1 < diagnostics.size() ? "," : "") << "\n";
+  }
+  ss << "  ]\n";
+  ss << "}\n";
+  return ss.str();
+}
+
 class Launcher {
  public:
-  explicit Launcher(LauncherOptions options)
-      : options_{std::move(options)} {
+  explicit Launcher(LauncherOptions options) : options_{std::move(options)} {
     if (options_.session_id == 0) {
       options_.session_id = GenerateSessionId();
     }
@@ -251,8 +554,8 @@ class Launcher {
   uint64_t session_id() const noexcept { return options_.session_id; }
   const std::string& output_dir() const noexcept { return options_.output_dir; }
 
-  // Runs the declared nodes, waits for completion/signals, and produces manifest.
-  // Returns 0 on success, or non-zero if any critical node failed.
+  // Runs the declared nodes, waits for completion/signals, and produces
+  // manifest. Returns 0 on success, or non-zero if any critical node failed.
   int Run() {
     std::filesystem::create_directories(options_.output_dir);
 
@@ -280,6 +583,34 @@ class Launcher {
       return 1;
     }
 
+    // Phase one. Every binary is asked what it is before any of them is
+    // started, because the launcher is the only place that knows the whole
+    // roster before it exists -- and a topic whose two ends are spelled
+    // differently cannot be seen from inside either node.
+    std::vector<NodeDescription> described;
+    const auto diagnostics = DescribeGraph(node_specs, options_, described);
+    const std::size_t declared_topics = CountDeclaredTopics(described);
+
+    const std::string graph_path = options_.output_dir + "/graph.json";
+    std::ofstream graph_file(graph_path);
+    if (graph_file.is_open()) {
+      graph_file << GraphToJson(options_.session_id, options_.config_path,
+                                described, diagnostics);
+      graph_file.close();
+    }
+    PrintDeclaredGraph(described, diagnostics, declared_topics, graph_path);
+
+    if (naming::HasError(diagnostics) && !options_.allow_graph_errors) {
+      std::cerr << "launcher: the declared graph has errors; refusing to "
+                   "start. Fix the names above, or pass --allow-graph-errors "
+                   "to launch anyway.\n";
+      return 1;
+    }
+    if (options_.describe_only) {
+      std::cout << "[launcher] describe-only: nothing was started\n";
+      return 0;
+    }
+
     SessionManifest manifest;
     manifest.session_id = options_.session_id;
     manifest.config_path = options_.config_path;
@@ -293,12 +624,14 @@ class Launcher {
     std::vector<NodeProcessInfo> procs;
     procs.reserve(node_specs.size());
 
-    for (const auto& spec : node_specs) {
+    for (std::size_t i = 0; i < node_specs.size(); ++i) {
+      const auto& spec = node_specs[i];
       NodeProcessInfo pinfo;
       pinfo.name = spec.name;
       pinfo.target = spec.target;
       pinfo.binary_path = spec.binary_path;
       pinfo.log_path = options_.output_dir + "/" + spec.name + ".tlog";
+      pinfo.described = described[i].answered;
       procs.push_back(pinfo);
     }
 
@@ -336,8 +669,7 @@ class Launcher {
 
       pid_t pid = ::fork();
       if (pid < 0) {
-        std::cerr << "[launcher] fork() failed for node " << pinfo.name
-                  << "\n";
+        std::cerr << "[launcher] fork() failed for node " << pinfo.name << "\n";
         pinfo.failed = true;
         continue;
       }
@@ -364,12 +696,12 @@ class Launcher {
                 << ", target " << pinfo.target << ")\n";
     }
 
-    // Wait loop: wait until all children terminate or duration/signal triggers stop
-    const auto deadline =
-        options_.duration_s > 0
-            ? std::chrono::steady_clock::now() +
-                  std::chrono::seconds(options_.duration_s)
-            : std::chrono::steady_clock::time_point::max();
+    // Wait loop: wait until all children terminate or duration/signal triggers
+    // stop
+    const auto deadline = options_.duration_s > 0
+                              ? std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(options_.duration_s)
+                              : std::chrono::steady_clock::time_point::max();
 
     bool stop_sent = false;
     for (;;) {
@@ -395,7 +727,8 @@ class Launcher {
         break;
       }
 
-      if (!stop_sent && (stop_requested_ || std::chrono::steady_clock::now() >= deadline)) {
+      if (!stop_sent &&
+          (stop_requested_ || std::chrono::steady_clock::now() >= deadline)) {
         stop_sent = true;
         std::cout << "[launcher] Stopping children...\n";
         for (const auto& pinfo : procs) {
@@ -420,7 +753,8 @@ class Launcher {
         try {
           event::log::LogReader reader{pinfo.log_path};
           event::log::LogReader::Record rec;
-          while (reader.next(rec)) {}
+          while (reader.next(rec)) {
+          }
           pinfo.record_count = reader.record_count();
           pinfo.failed = reader.truncated();
         } catch (...) {
@@ -432,6 +766,7 @@ class Launcher {
       }
     }
     manifest.nodes = procs;
+    manifest.declared_topics = declared_topics;
 
     // Write manifest to disk
     const std::string manifest_path = options_.output_dir + "/manifest.json";
@@ -455,15 +790,60 @@ class Launcher {
     std::signal(SIGTERM, [](int) { stop_requested_ = true; });
   }
 
+  // Phase one's report. Printed in full, warnings included: a diagnostic
+  // nobody reads is the same as no diagnostic, and the ones about a node that
+  // could not be described are how a stale binary is noticed.
+  void PrintDeclaredGraph(const std::vector<NodeDescription>& described,
+                          const std::vector<naming::Diagnostic>& diagnostics,
+                          std::size_t declared_topics,
+                          const std::string& graph_path) {
+    std::size_t answered = 0;
+    for (const auto& node : described) answered += node.answered ? 1 : 0;
+
+    std::cout << "\n================ Declared Graph ==================\n";
+    std::cout << "Nodes described: " << answered << "/" << described.size()
+              << ", topics: " << declared_topics << "\n";
+    for (const auto& node : described) {
+      std::cout << "  " << (node.answered ? "\u2022" : "?") << " "
+                << node.roster_name;
+      if (node.answered) {
+        std::cout << " (" << node.declared.sources.size() << " sources)";
+      } else {
+        std::cout << " (not described)";
+      }
+      std::cout << "\n";
+    }
+    for (const auto& diagnostic : diagnostics) {
+      auto& out = diagnostic.severity == naming::Severity::ERROR ? std::cerr
+                                                                 : std::cout;
+      out << "  " << diagnostic.ToString() << "\n";
+    }
+    std::cout << "Graph written to: " << graph_path << "\n";
+    std::cout << "==================================================\n";
+  }
+
   void PrintManifest(const SessionManifest& manifest) {
+    std::size_t described = 0;
+    std::string roster;
+    for (const auto& n : manifest.nodes) {
+      if (!n.described) continue;
+      ++described;
+      if (!roster.empty()) roster += ", ";
+      roster += n.name;
+    }
+
     std::cout << "\n================ Session Manifest ================\n";
     std::cout << "Session ID: " << manifest.session_id << "\n";
     std::cout << "Output Dir: " << manifest.output_dir << "\n";
+    std::cout << "Declared: " << described << "/" << manifest.nodes.size()
+              << " nodes answered --describe, " << manifest.declared_topics
+              << " topics\n";
+    std::cout << "Declared nodes: " << (roster.empty() ? "none" : roster)
+              << "\n";
     std::cout << "Nodes (" << manifest.nodes.size() << "):\n";
     for (const auto& n : manifest.nodes) {
       std::cout << "  • " << n.name << " (pid=" << n.pid
-                << ", exit=" << n.exit_code
-                << ", records=" << n.record_count
+                << ", exit=" << n.exit_code << ", records=" << n.record_count
                 << ", failed=" << (n.failed ? "yes" : "no")
                 << ", log=" << n.log_path << ")\n";
     }
@@ -578,7 +958,8 @@ inline bool MergeLogs(const std::vector<std::string>& log_paths,
     states.push_back(std::move(s));
   }
 
-  // Multi-way merge by event_time_ns (with now_ns and dispatch_index tie-breaker)
+  // Multi-way merge by event_time_ns (with now_ns and dispatch_index
+  // tie-breaker)
   for (;;) {
     int best_index = -1;
     for (std::size_t i = 0; i < states.size(); ++i) {

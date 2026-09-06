@@ -4,3 +4,100 @@
 .panel{display:flex;flex-direction:column;height:365px}.panel-heading,.panel-footer,.legend,.channel-picker{flex-shrink:0}.field{flex:1;min-height:150px;height:auto}.spatial{flex:1;min-height:180px;height:auto}.plot{flex:1;min-height:170px;overflow:hidden}.tree{flex:1;height:auto;min-height:180px}.legend{flex-wrap:wrap}.panel-footer{flex-wrap:wrap}.connection{min-width:0}.connection>span:nth-child(2){max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid #48e1cf;outline-offset:3px}@media(max-width:600px){.connection{flex-wrap:wrap;width:100%}.workspace-heading{align-items:flex-start;gap:14px;flex-direction:column}.metrics{width:100%;justify-content:space-between}main{grid-template-columns:minmax(0,1fr)}.panel{min-width:0}.timeline>.button,.timeline>button{flex:1}.scrub{order:2;flex-basis:100%}}
 
 .precision{display:flex;flex-direction:column;gap:5px;font-size:9px;color:#90a7ba}.precision form,.precision label{display:flex;align-items:center;gap:5px}.precision input{width:140px;min-width:0;background:#0b131e;border:1px solid #354253;border-radius:4px;color:#bdd0e0;padding:5px;font:10px monospace}.precision button{padding:4px 7px}.precision label input{width:115px;margin-left:auto}button:disabled{opacity:.4;cursor:default}.timeline{flex-wrap:wrap}.scrub{min-width:210px}
+
+/* Tabbed shell. The four-panel grid became one view per tab, so main is a
+   flex column that hands its height to whichever panel is showing. */
+.app{min-height:100vh;display:flex;flex-direction:column}main{flex:1;display:flex;flex-direction:column;min-height:0;gap:16px;padding:0 28px 24px}main>.panel{flex:1;min-height:380px;height:auto;resize:none}
+.tabs{display:flex;align-items:stretch;gap:2px;padding:0 28px;border-bottom:1px solid #273341;background:#0e1723;position:sticky;top:0;z-index:4;overflow-x:auto}
+.tabs button{background:none;border:none;border-bottom:2px solid transparent;border-radius:0;padding:14px 15px 12px;color:#8497aa;display:flex;flex-direction:column;gap:4px;align-items:flex-start;font-size:12px;line-height:1.1}
+.tabs button:hover{background:#141f2d;color:#cadaea}.tabs button.selected{color:#e2edf7;border-bottom-color:#48e1cf;background:#141f2d}
+.tabs button em{font-style:normal;font-size:7.5px;letter-spacing:1.3px;color:#5f7488}.tabs button.selected em{color:#4fbdb1}
+.tab-spacer{flex:1;min-width:12px}.tab-metrics{display:flex;gap:26px;align-items:center;padding:0 4px 0 16px}
+.tab-metrics small{display:block;font-size:7.5px;letter-spacing:1.3px;color:#738799}.tab-metrics b{display:block;font:15px 'JetBrains Mono',monospace;margin-top:5px;font-weight:400;color:#cadaea}.tab-metrics b span{color:#60768c}
+
+/* Shared table, chip, badge and search primitives used by System and Timing. */
+.search{flex:1;min-width:180px;max-width:420px;background:#0b131e;border:1px solid #2a394a;border-radius:4px;color:#c2d4e4;padding:8px 10px;font-size:12px}
+.table-scroll{flex:1;min-height:0;overflow:auto}
+table.grid{width:100%;border-collapse:collapse;font:10.5px 'JetBrains Mono',monospace}
+table.grid th{position:sticky;top:0;background:#152130;text-align:left;padding:9px 12px;font-weight:500;font-size:8px;letter-spacing:1.2px;color:#879cb0;border-bottom:1px solid #2a3a4a;white-space:nowrap;z-index:1}
+table.grid td{padding:7px 12px;border-bottom:1px solid #1c2836;vertical-align:top;color:#bacbdb}
+table.grid tbody tr:hover td{background:#16222f}table.grid .right{text-align:right}table.grid tr.dead td{opacity:.5}
+th.sortable{cursor:pointer;user-select:none}th.sortable:hover{color:#cddced}th.sorted{color:#48e1cf}th.sortable i{font-style:normal;margin-left:4px}
+code{font:inherit;font-family:'JetBrains Mono',monospace;color:#a8c4d4}
+.warn{color:#ff9db0}.link{background:none;border:none;padding:0 6px 0 0;color:#7fd8ca;font:inherit;text-decoration:underline dotted;cursor:pointer}.link:hover{background:none;color:#a8f0e4}
+.chips{display:flex;gap:6px;flex-wrap:wrap;padding:12px 14px;border-bottom:1px solid #223040}
+.chip{font-size:9px;letter-spacing:.9px;text-transform:uppercase;padding:5px 9px;display:flex;gap:6px;align-items:center;border-radius:999px}
+.chip em{font-style:normal;color:#7f95a9}.chip.selected{border-color:#48e1cf;color:#cbeee8}
+.badge{font-style:normal;font-size:7.5px;letter-spacing:1.1px;padding:2px 5px;border-radius:3px;border:1px solid #3c4d61;color:#93a9bd}
+.badge.sim{border-color:#7a6bd0;color:#c4b8ff}.badge.dead{border-color:#8a4a58;color:#ffb3c1}
+.health{font-size:7.5px;letter-spacing:1.1px;text-transform:uppercase;margin-left:8px;padding:1px 5px;border-radius:3px;border:1px solid}
+.health.ok{border-color:#2f6f68;color:#6fd8c9}.health.orphaned{border-color:#8a4a58;color:#ff9db0}.health.unread{border-color:#7d6438;color:#ffce8f}.health.lossy{border-color:#8a5c3f;color:#ffb182}.health.idle{border-color:#3f4c5c;color:#8fa1b3}.health.bridged{border-color:#3d5c86;color:#9dc2f5}.health.unconnected{border-color:#4b4670;color:#b0a8e0}
+.kind{font-style:normal;font-size:8px;letter-spacing:1.1px;padding:2px 5px;border-radius:3px;border:1px solid #35465a;color:#8fa4b8}
+.kind.SENDER{border-color:#2f6f68;color:#6fd8c9}.kind.WATCHER{border-color:#5f52a3;color:#bcaeff}.kind.FETCHER{border-color:#3d5c86;color:#9dc2f5}.kind.TIMER{border-color:#7d6438;color:#ffce8f}
+
+/* System tab: nodes beside one node's wiring, with every topic underneath.
+   The wiring view is the one that answers "who is this process talking to",
+   which a flat topic table cannot. */
+.system{flex:1;min-height:0;display:grid;gap:16px;grid-template-columns:minmax(300px,1fr) minmax(320px,1.15fr);grid-template-rows:auto auto minmax(240px,auto) minmax(260px,1fr)}
+.system-toolbar{grid-column:1/-1;display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.system-counts{display:flex;gap:18px;flex-wrap:wrap;font-size:10px;color:#8497aa}
+.system>.declared{grid-column:1/-1;grid-row:2;min-height:0}
+.system>.nodes{grid-row:3;min-height:0}.system>.wiring-panel{grid-row:3;min-height:0}.system>.topics{grid-column:1/-1;grid-row:4;min-height:0}
+.declared-counts{padding:12px 15px;border-bottom:1px solid #223040}
+.declared-body{flex:1;min-height:0;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
+.declared-nodes,.diagnostics{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.declared-nodes li,.diagnostics li{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;border:1px solid #22303f;border-left:2px solid #3f4c5c;border-radius:4px;padding:8px 10px;font-size:11px;background:#131f2c}
+.declared-nodes li.warn,.diagnostics li.error{border-left-color:#8a4a58}
+.diagnostics li.warning{border-left-color:#7d6438}
+.declared-nodes li b,.diagnostics li em{font-style:normal;font-weight:500;color:#e0ebf5}
+.diagnostics li em{font-size:8px;letter-spacing:1.1px;text-transform:uppercase;color:#93a9bd}
+.declared-nodes li span,.diagnostics li span{color:#8fa4b8;flex:1;min-width:180px}
+.declared-error{margin:0;padding:0 15px 12px;font-size:11px}
+.system>.panel{display:flex;flex-direction:column;overflow:hidden;resize:none;height:auto;min-height:0}
+.node-grid{flex:1;min-height:0;overflow:auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px;padding:12px}
+.node-card{text-align:left;display:flex;flex-direction:column;gap:7px;padding:11px 12px;background:#152130;align-items:stretch}
+.node-card.selected{border-color:#48e1cf;background:#172a34}.node-card.dead{opacity:.62}
+.node-card-head{display:flex;align-items:center;gap:7px}.node-card-head b{font-size:12px;color:#e0ebf5;font-weight:500;margin-right:auto}
+.node-card code{font-size:8.5px;color:#6d8497;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.node-card dl{margin:0;display:grid;grid-template-columns:1fr 1fr;gap:3px 10px;font:9px 'JetBrains Mono',monospace}
+.node-card dl div{display:flex;justify-content:space-between;gap:6px}.node-card dt{color:#7c92a7}.node-card dd{margin:0;color:#bacbdb}
+.node-card small.warn{font-size:8.5px;line-height:1.4}
+
+.wiring{flex:1;min-height:0;display:grid;grid-template-rows:1fr auto 1fr;gap:10px;padding:12px;overflow:auto}
+.wiring section{min-height:0;display:flex;flex-direction:column}
+.wiring h4{margin:0 0 7px;font-size:8px;letter-spacing:1.3px;color:#879cb0;font-weight:500;text-transform:uppercase}
+.wiring h4 small{margin-left:7px;color:#5f7488}
+.wiring ul{list-style:none;margin:0;padding:0;overflow:auto;display:flex;flex-direction:column;gap:5px}
+.wiring li{border:1px solid #22303f;border-left:2px solid #2f6f68;border-radius:4px;padding:6px 9px;background:#131f2c}
+.wiring li.dangling{border-left-color:#8a4a58}
+.edge-topic{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+.edge-topic code{font-size:10px}.edge-rate{font:9px 'JetBrains Mono',monospace;color:#6fd8c9}
+.edge-meta{display:flex;gap:10px;font-size:8.5px;color:#7f95a9;margin-top:3px;flex-wrap:wrap}.edge-meta em{font-style:normal;color:#5f7488;letter-spacing:.8px;text-transform:uppercase}
+.wiring-node{display:flex;align-items:center;gap:9px;justify-content:center;border:1px solid #3a5c6b;border-radius:5px;background:#172a34;padding:9px}
+.wiring-node b{font-size:13px;color:#e2edf7;font-weight:500}.wiring-node small{font-size:8.5px;color:#7f95a9}
+
+/* Overview: what the stream is doing, what the system looks like, and the
+   short list of things actually worth a person's attention. */
+.overview{flex:1;min-height:0;display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));align-content:start}
+.overview>.panel{display:flex;flex-direction:column;height:auto;min-height:220px;resize:none;overflow:hidden}
+.overview>.panel.wide{grid-column:1/-1}
+.stat-list{margin:0;padding:12px 15px;display:flex;flex-direction:column;gap:8px;font:10.5px 'JetBrains Mono',monospace;overflow:auto}
+.stat-list div{display:flex;justify-content:space-between;gap:14px;align-items:baseline}
+.stat-list dt{color:#7f95a9}.stat-list dd{margin:0;color:#cadaea;text-align:right;overflow:hidden;text-overflow:ellipsis}
+.attention{list-style:none;margin:0;padding:12px;display:flex;flex-direction:column;gap:6px;overflow:auto}
+.attention li{display:flex;gap:12px;align-items:baseline;justify-content:space-between;border:1px solid #22303f;border-left:2px solid #7d6438;border-radius:4px;padding:8px 10px;font-size:11px;background:#131f2c;color:#c3d4e3}
+.attention li.warn{border-left-color:#8a4a58;color:#ffd4dc}
+
+/* Agent tab: the request an agent would send, and the bytes it would get
+   back, through the same dispatch the headless server uses. */
+.agent{flex:1;min-height:0;display:grid;gap:16px;grid-template-columns:minmax(280px,.8fr) minmax(320px,1.2fr)}
+.agent>.panel{display:flex;flex-direction:column;height:auto;min-height:0;resize:none;overflow:hidden}
+.agent-form{padding:14px;display:flex;flex-direction:column;gap:10px;font-size:11px;color:#8fa7ba;overflow:auto}
+.agent-form label{display:flex;flex-direction:column;gap:5px}
+.agent-form select,.agent-form textarea{background:#0b131e;border:1px solid #2a394a;border-radius:4px;color:#c2d4e4;padding:8px;font:11px 'JetBrains Mono',monospace}
+.agent-form textarea{resize:vertical;min-height:110px}
+.agent-form small{color:#7f95a9;line-height:1.5}
+.agent-result{flex:1;min-height:0;overflow:auto;margin:0;padding:14px;font:10.5px 'JetBrains Mono',monospace;color:#bacbdb;white-space:pre-wrap;word-break:break-word}
+
+@media(max-width:1100px){.system{grid-template-columns:1fr;grid-template-rows:auto auto auto auto 1fr}.system>.declared{grid-row:2}.system>.nodes{grid-row:3}.system>.wiring-panel{grid-row:4}.system>.topics{grid-row:5}.agent{grid-template-columns:1fr}}
+@media(max-width:900px){main{padding:0 14px 16px}.tabs{padding:0 14px}.tab-metrics{display:none}}

@@ -15,10 +15,16 @@ namespace {
 
 using namespace std::chrono_literals;
 
-// Real shared memory, so each run needs its own name. RTMS caps a topic at 30
-// characters after the leading slash.
+// Real shared memory, so each run needs its own name, and the `test` owner is
+// reserved for exactly this: the launcher refuses to spawn a node that uses it,
+// so a fixture name can never be mistaken for a topic the robot runs on.
+//
+// RTMS caps a topic at 30 characters after the leading slash and
+// `test/telemetry/` spends 15 of them, which is why the suffixes here are short
+// enough to leave room for a long pid.
 std::string TestTopic(const char* suffix) {
-  return "/tlm_" + std::string{suffix} + "_" + std::to_string(::getpid());
+  return "/test/telemetry/" + std::string{suffix} + "_" +
+         std::to_string(::getpid());
 }
 
 TelemetryConfig TestConfig(const std::string& topic) {
@@ -128,7 +134,7 @@ TEST(Telemetry, PublishesNothingUntilAPoseExists) {
 }
 
 TEST(Telemetry, DropsAFrameWhoseValuesWouldFailStudioValidation) {
-  const auto topic = TestTopic("nonfinite");
+  const auto topic = TestTopic("nan");
   event::SimulationEnvironment env;
   event::SimulatedEventLoop<> loop{env};
   TelemetryNode node{loop, TestConfig(topic)};

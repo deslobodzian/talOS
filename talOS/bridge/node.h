@@ -4,19 +4,28 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "talOS/configuration/config_parser.h"
 #include "talOS/hardware/config.h"
 #include "talOS/hardware/config_wire.h"
 #include "talOS/hardware/messages.h"
-#include "talOS/protocol/udp.h"
-#include "talOS/configuration/config_parser.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/introspection/describe.h"
+#include "talOS/introspection/registry.h"
 #include "talOS/ipc/publisher.h"
 #include "talOS/ipc/subscriber.h"
+#include "talOS/protocol/udp.h"
 
 namespace talos::hardware {
+
+// This node's identity, in one place: the registry row, the `--describe`
+// output and the launcher's config all have to agree on both strings, and a
+// second copy of either is a second thing to forget.
+inline constexpr const char* kNodeName = "hardware_node";
+inline constexpr const char* kNodeTarget = "//talOS/bridge:hardware_node";
 
 struct SubsystemTracker {
   std::string name;
@@ -25,16 +34,21 @@ struct SubsystemTracker {
   uint64_t last_seen_us{0};
   bool timed_out{true};
   std::unique_ptr<ipc::Subscriber<talos::hardware::Packet>> subscriber;
-  std::unique_ptr<ipc::Subscriber<talos::hardware::Packet>> alt_subscriber;
+
+  // Requests actually decoded off this subsystem's topic, and where that topic
+  // sits in the introspection manifest. Kept here because the registry reports
+  // per-topic traffic, and a subsystem that has gone quiet is the single most
+  // useful thing to see when actuators stop responding.
+  uint64_t requests{0};
+  std::size_t source_index{0};
 };
 
 class HardwareNode {
  public:
   explicit HardwareNode(config::RobotConfig robot_config,
                         std::string remote_ip = "127.0.0.1",
-                        uint16_t remote_port = 5802,
-                        uint16_t local_port = 5803,
-                        bool simulation = false);
+                        uint16_t remote_port = 5802, uint16_t local_port = 5803,
+                        bool simulation = false, uint64_t session_id = 0);
 
   ~HardwareNode() = default;
 
@@ -56,7 +70,30 @@ class HardwareNode {
 
   void PushConfig(uint64_t now_us);
 
+  // The shape this node would take, answered without opening a socket, a
+  // shared-memory segment or any hardware. `--describe` prints this; the
+  // launcher assembles the declared graph out of it before it spawns anything.
+  // It comes from the same BuildIntrospectionManifest() that Open() registers,
+  // so the declared graph and the running one differ only when the node does.
+  introspect::Description Describe();
+
+  // Copies the counters above into this node's registry slot. Called from
+  // Run(); exposed so a test can drive it without a real event loop.
+  void PublishIntrospection();
+
  private:
+  // Describes this node to the live registry. The hardware node predates the
+  // event loop and drives its own tick, so it has no manifest to hand over --
+  // it declares one, in the order Open() creates the transports.
+  void BuildIntrospectionManifest();
+
+  // How this node's ends behave, by topic. The manifest cannot say it: to the
+  // loop, /hw/command is a sender like any other and /hw/command/override is a
+  // fetcher like any other. Without these the graph reports the RoboRIO link
+  // and an unused debug hook as two broken topics, which is how a report stops
+  // being read.
+  static const std::vector<introspect::EndpointAttribute>& EndpointAttributes();
+
   config::RobotConfig robot_config_;
   Config config_;
   uint64_t config_id_{0};
@@ -73,6 +110,12 @@ class HardwareNode {
 
   std::map<std::string, SubsystemTracker> subsystems_;
   Command full_cmd_{};
+
+  event::Manifest introspection_manifest_;
+  std::optional<introspect::NodeRegistration> registration_;
+  uint64_t session_id_{0};
+  uint64_t legacy_commands_{0};
+  std::chrono::steady_clock::time_point next_introspection_{};
 
   bool is_configured_{false};
   uint64_t last_boot_id_{0};

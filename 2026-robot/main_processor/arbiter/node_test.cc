@@ -187,11 +187,12 @@ talos::drive::Packet CreatePacket(const driver_station::DriverStationData& d) {
   return packet;
 }
 
-// The whole teleop path in one loop: a joystick packet lands on /hw/ds, the
-// driver station node decodes it, the operator interface maps it to a request,
-// the arbiter admits it because the mode says teleop, and the drivetrain
-// resolves it into per-module swerve requests on /hw/req/drive. Nothing here is
-// stubbed -- these are the same four nodes the launcher starts.
+// The whole teleop path in one loop: a joystick packet lands on
+// /hw/state/driver_station, the driver station node decodes it, the operator
+// interface maps it to a request, the arbiter admits it because the mode says
+// teleop, and the drivetrain resolves it into per-module swerve requests on
+// /hw/request/drivetrain. Nothing here is stubbed -- these are the same four
+// nodes the launcher starts.
 class TeleopChain {
  public:
   TeleopChain()

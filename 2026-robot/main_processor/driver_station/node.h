@@ -6,6 +6,7 @@
 #include "2026-robot/main_processor/drivetrain/packet.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/handles.h"
+#include "talOS/hardware/packet.h"
 
 // Decodes the Driver Station packet the bridge forwards from the controller
 // processor and republishes it verbatim. Nothing here decides what the robot
@@ -14,7 +15,10 @@
 // reader and the game logic can change without touching it.
 namespace talos::driver_station {
 
-inline constexpr const char* kHwDsTopic = "/hw/ds";
+// `/hw/state/driver_station`, and an alias rather than a second spelling of it:
+// the bridge owns that name and this node is only the first reader, so the two
+// ends cannot drift the way `/hw/req/drive` drifted from `/hw/req/drivetrain`.
+inline constexpr const char* kHwDsTopic = hardware::kDriverStationTopic;
 inline constexpr const char* kDsStateTopic = "/driver_station/state";
 
 template <typename Loop>

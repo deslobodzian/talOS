@@ -1,8 +1,8 @@
-// Publishes synthetic Driver Station packets onto /hw/ds at the real 50 Hz
-// sample rate, so the teleop path -- joystick axes to ChassisTarget to swerve
-// motor requests -- can be driven and watched without a Driver Station or a
-// controller processor attached. The payload is the same wire encoding the Rio
-// sends, so nodes downstream cannot tell the difference.
+// Publishes synthetic Driver Station packets onto /hw/state/driver_station at
+// the real 50 Hz sample rate, so the teleop path -- joystick axes to
+// ChassisTarget to swerve motor requests -- can be driven and watched without a
+// Driver Station or a controller processor attached. The payload is the same
+// wire encoding the Rio sends, so nodes downstream cannot tell the difference.
 #include <chrono>
 #include <cmath>
 #include <cstdio>

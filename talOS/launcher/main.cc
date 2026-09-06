@@ -44,10 +44,24 @@ int main(int argc, char** argv) {
         options.simulation = true;
       } else if (arg == "--start-sim-gateway") {
         options.start_sim_gateway = true;
+      } else if (arg == "--allow-graph-errors") {
+        options.allow_graph_errors = true;
+      } else if (arg == "--describe-only") {
+        options.describe_only = true;
+      } else if (arg == "--describe-timeout-ms" && i + 1 < argc) {
+        options.describe_timeout_ms = std::stoi(argv[++i]);
       } else if (arg == "--help" || arg == "-h") {
         std::cout << "usage: launcher [--config PATH] [--output-dir PATH] "
                      "[--duration-s N] [--session-id ID] [--sim] "
-                     "[--start-sim-gateway]\n";
+                     "[--start-sim-gateway] [--describe-only] "
+                     "[--allow-graph-errors] [--describe-timeout-ms MS]\n"
+                     "\n"
+                     "  --describe-only        ask every node in the config "
+                     "what it is, lint the\n"
+                     "                         graph they describe, and exit "
+                     "without starting a robot\n"
+                     "  --allow-graph-errors   start anyway when the declared "
+                     "graph has errors\n";
         return 0;
       } else {
         throw std::invalid_argument("unknown argument: " + arg);

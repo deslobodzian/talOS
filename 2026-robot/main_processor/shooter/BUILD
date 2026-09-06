@@ -22,7 +22,16 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
-cc_binary(name = "node", srcs = ["main.cc"], deps = [":shooter"])
+cc_binary(
+    name = "node",
+    srcs = ["main.cc"],
+    deps = [
+        ":shooter",
+        "//talOS/events:events",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:reporter",
+    ],
+)
 
 cc_test(
     name = "node_test",

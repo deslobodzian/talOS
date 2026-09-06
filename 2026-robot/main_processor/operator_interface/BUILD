@@ -21,6 +21,9 @@ cc_binary(
     deps = [
         ":operator_interface",
         "//talOS/configuration:configuration",
+        "//talOS/events:events",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:reporter",
         "//talOS/process:process",
     ],
     visibility = ["//visibility:public"],

@@ -27,6 +27,9 @@ cc_binary(
     deps = [
         ":driver_station",
         "//talOS/configuration:configuration",
+        "//talOS/events:events",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:reporter",
         "//talOS/process:process",
     ],
     visibility = ["//visibility:public"],

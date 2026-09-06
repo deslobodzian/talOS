@@ -12,8 +12,12 @@ node and the roboRIO/systemcore/Jetson (or any realtime controller system)
 - TCP port `5801`: startup/config negotiation.
 - UDP port `5802`: runtime state, commands, heartbeats, and faults.
 
-All traffic uses the same fixed 40 byte frame header followed by an optional
-payload of up to 1200 bytes. Multi-byte header fields are encoded little-endian
+All traffic uses the same fixed 40 byte frame header (`kFrameHeaderSize`)
+followed by an optional payload of up to `kMaxPayloadSize` bytes, which is
+1400: a 1440-byte frame fits inside the 1472 bytes a 1500-byte Ethernet MTU
+leaves after the IPv4 and UDP headers, and `frame.h` has a static assertion to
+that effect. Quote the constant rather than the number -- this line said 1200
+for a while after the constant did not. Multi-byte header fields are encoded little-endian
 explicitly by `talos::protocol::EncodeFrame`; the C++ struct layout is not used
 as the wire layout.
 

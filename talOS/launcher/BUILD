@@ -10,6 +10,8 @@ cc_library(
         "//talOS/configuration:configuration",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:names",
     ],
 )
 
@@ -37,6 +39,8 @@ cc_test(
     deps = [
         ":launcher_lib",
         "//talOS/events:events_log",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:names",
         "@googletest//:gtest_main",
     ],
 )

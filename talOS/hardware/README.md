@@ -65,7 +65,9 @@ Phoenix 6 is pinned to 26.3.0 in `robot/vendordeps/Phoenix6.json`.
 New frame types `kHardwareState` (20) and `kHardwareCommand` (21) use the existing
 versioned UDP frame transport. Their payload codecs explicitly encode
 little-endian integers and IEEE-754 doubles, with exact length checks. Native
-C++ object layout is never the network format. Maximum payload is 1168 bytes.
+C++ object layout is never the network format. The payload limit is
+`protocol::kMaxPayloadSize`, currently 1400 bytes; `Packet` and the endpoint
+buffer are both sized from that constant rather than from a literal.
 
 The gateway publishes its configuration ID, boot ID, control epoch, monotonic
 poll timestamp, last accepted command sequence, enable/configuration/fault

@@ -31,12 +31,13 @@ those names to ids at startup.
 Every topic the drivetrain and shooter consume has exactly **one** writer:
 `arbiter/`. Producers publish to their own topic and never coordinate; the
 arbiter picks which one reaches the actuators, based on the match mode the FMS
-reports on `/driver_station/state`.
+reports on `/driver_station/state`. That rule, and the grammar every name here
+follows, are normative in `talOS/NAMING.md`.
 
 ```
-/drivetrain/tgt/teleop --.
-/drivetrain/tgt/auto ----+--> [arbiter] --> /drivetrain/tgt --> [drivetrain]
-/driver_station/state --'
+/drivetrain/target/teleop --.
+/drivetrain/target/auto ----+--> [arbiter] --> /drivetrain/target --> [drivetrain]
+/driver_station/state ------'
 ```
 
 Two writers on one topic would resolve differently on replay than they did on
@@ -53,7 +54,7 @@ Two nodes, split along "what the hardware said" versus "what we want it to do":
 | | does | changes when |
 |---|---|---|
 | `driver_station/` | decodes the Driver Station packet and republishes it on `/driver_station/state` | the wire format does |
-| `operator_interface/` | stick mapping, scaling, deadband, button bindings; publishes `/drivetrain/tgt/teleop` and `/shooter/tgt/teleop` | the game does |
+| `operator_interface/` | stick mapping, scaling, deadband, button bindings; publishes `/drivetrain/target/teleop` and `/shooter/target/teleop` | the game does |
 
 `[subsystems.operator_interface]` holds the mapping policy: speed ceilings,
 `deadband`, `shoot_button_mask`, and `field_oriented`. Field-oriented rotates
@@ -101,13 +102,13 @@ bazel run //talOS/launcher:launcher -- --sim
 # 3. Studio.
 bazel build //studio/bridge:studio_bridge //studio:web_dist
 bazel-bin/studio/bridge/studio_bridge --drop-newest-publisher \
-    /talos_studio 127.0.0.1 5801 5800 bazel-bin/studio/dist
+    /talos/telemetry 127.0.0.1 5801 5800 bazel-bin/studio/dist
 # http://localhost:5800
 ```
 
-`telemetry/` is what makes the robot visible there: it turns `/odometry`,
+`telemetry/` is what makes the robot visible there: it turns `/odometry/state`,
 `/drivetrain/state` and `/driver_station/state` into Studio frames on
-`/talos_studio`. It is the only producer on that topic, which the bridge
+`/talos/telemetry`. It is the only producer on that topic, which the bridge
 requires -- see `studio/bridge/README.md` for why that topic must use
 DROP_NEWEST and must never be an existing control-loop topic.
 

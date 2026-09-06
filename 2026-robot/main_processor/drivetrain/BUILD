@@ -21,7 +21,16 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
 )
-cc_binary(name = "node", srcs = ["main.cc"], deps = [":drivetrain"])
+cc_binary(
+    name = "node",
+    srcs = ["main.cc"],
+    deps = [
+        ":drivetrain",
+        "//talOS/events:events",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:reporter",
+    ],
+)
 cc_binary(name = "sim_gateway", srcs = ["sim_gateway.cc"], deps = [":drivetrain", "//talOS/hardware:hardware"])
 cc_binary(name = "send_target", srcs = ["send_target.cc"], deps = [":drivetrain", "//talOS/ipc:ipc"])
 cc_binary(
