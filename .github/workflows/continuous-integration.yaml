@@ -48,3 +48,151 @@ jobs:
 
     - name: Test
       run: bazel test //... --noshow_progress --test_output=errors
+
+  buildifier:
+    name: Buildifier (changed BUILD files)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+      with:
+        # Full history is needed to diff against the PR base / push base.
+        fetch-depth: 0
+
+    - name: Install buildifier
+      run: |
+        BUILDIFIER_VERSION=8.2.1
+        curl -sSL -o /usr/local/bin/buildifier \
+          "https://github.com/bazelbuild/buildtools/releases/download/v${BUILDIFIER_VERSION}/buildifier-linux-amd64"
+        chmod +x /usr/local/bin/buildifier
+        buildifier --version
+
+    - name: Check changed BUILD files
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          BASE="${{ github.event.pull_request.base.sha }}"
+        else
+          BASE="${{ github.event.before }}"
+        fi
+        case "$BASE" in
+          ""|"0000000000000000000000000000000000000000") BASE="HEAD~1" ;;
+        esac
+        echo "Diff base: $BASE"
+        # Check mode only: never rewrites files. Scoped to files changed in
+        # this PR/push so pre-existing tree state stays untouched.
+        git diff --name-only -z "$BASE" HEAD -- \
+          'BUILD' 'BUILD.bazel' '*/BUILD' '*/BUILD.bazel' \
+          | xargs -0 -r buildifier --mode=check --lint=warn
+
+  clang-format:
+    name: clang-format (changed C++ files)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - name: Install clang-format
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-format-18
+
+    - name: Check changed C/C++ files
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          BASE="${{ github.event.pull_request.base.sha }}"
+        else
+          BASE="${{ github.event.before }}"
+        fi
+        case "$BASE" in
+          ""|"0000000000000000000000000000000000000000") BASE="HEAD~1" ;;
+        esac
+        echo "Diff base: $BASE"
+        # --dry-run --Werror: check only, never reformats. .clang-format at
+        # the repo root is picked up automatically. Vendored third_party code
+        # (Apple metal-cpp, mjbots) keeps its upstream style and is excluded.
+        git diff --name-only -z "$BASE" HEAD -- \
+          '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' \
+          ':!third_party' \
+          | xargs -0 -r clang-format-18 --dry-run --Werror
+
+  clang-tidy:
+    name: clang-tidy (changed C++ files)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - name: Setup bazel-action
+      uses: bazel-contrib/setup-bazel@0.19.0
+      with:
+        # Avoid downloading Bazel every time.
+        bazelisk-cache: true
+        # Store build cache per workflow.
+        disk-cache: ${{ github.workflow }}
+        # Share repository cache between workflows.
+        repository-cache: true
+
+    - name: Install Linux dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+        pkg-config \
+        libdbus-1-dev \
+        libglib2.0-dev \
+        libgtk-3-dev \
+        libwebkit2gtk-4.1-dev \
+        libayatana-appindicator3-dev \
+        librsvg2-dev \
+        libssl-dev \
+        libxdo-dev \
+        patchelf \
+        clang-tidy-18
+
+    - name: Refresh compilation database
+      # Hedron's Compile Commands Extractor (already a dev_dependency in
+      # MODULE.bazel) generates compile_commands.json for clang-tidy.
+      run: bazel run @hedron_compile_commands//:refresh_all --noshow_progress
+
+    - name: Run clang-tidy on changed sources
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          BASE="${{ github.event.pull_request.base.sha }}"
+        else
+          BASE="${{ github.event.before }}"
+        fi
+        case "$BASE" in
+          ""|"0000000000000000000000000000000000000000") BASE="HEAD~1" ;;
+        esac
+        echo "Diff base: $BASE"
+        # .clang-tidy at the repo root is picked up automatically (checks,
+        # WarningsAsErrors, HeaderFilterRegex). Only .c/.cc/.cpp translation
+        # units present in compile_commands.json are analyzed; headers are
+        # covered through their including TUs. Vendored third_party code and
+        # files outside the Bazel graph are skipped.
+        CHANGED=$(git diff --name-only "$BASE" HEAD -- \
+          '*.c' '*.cc' '*.cpp' ':!third_party')
+        python3 - "$BASE" $CHANGED <<'PYEOF'
+        import json, os, subprocess, sys
+        with open('compile_commands.json') as f:
+            db = json.load(f)
+        known = {os.path.realpath(e['file']) for e in db}
+        root = os.path.realpath(os.getcwd())
+        targets = []
+        for rel in sys.argv[2:]:
+            if not rel:
+                continue
+            abs_path = os.path.realpath(os.path.join(root, rel))
+            if abs_path in known:
+                targets.append(rel)
+            else:
+                print(f'skip (no compilation database entry): {rel}')
+        if not targets:
+            print('No changed sources with compilation database entries; skipping.')
+            sys.exit(0)
+        r = subprocess.run(['clang-tidy-18', '-p', '.', *targets])
+        sys.exit(r.returncode)
+        PYEOF
