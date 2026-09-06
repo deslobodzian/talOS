@@ -258,6 +258,23 @@ callbacks are `{object, thunk}` pairs rather than `std::function`.
 `simulated_event_loop_test.cc` asserts `!std::is_polymorphic_v<>` on every
 loop; add the same assertion for anything new on the hot path.
 
+**10. Fundamental mechanisms are implemented once, in C++; other languages
+bind, never reimplement.** Transport, node lifecycle, registry/heartbeat, and
+the shared-memory layout exist exactly once, under `talOS/`, behind the
+`talos_*` C ABI (`talOS/node_api/node_api.h`). A wrapper language (Python
+today: `talOS/ipc/python/node_api.py` as the binding, `rtms.py` as
+ergonomics) may hold handles, translate errors, validate early, and offer
+nicer classes — it may not reimplement a wire format, a layout, or a
+protocol. User logic (a state machine in Python, Lua, whatever comes next)
+sits on top of the wrappers and never touches the mechanism directly. Test
+doubles are the one exception: they must be marked test-only, live beside
+the test, and never touch real shared memory. A new language is a new
+binding file against the same ABI, not a new implementation — so an internal
+C++ change must never require a wrapper to be rewritten, which is what the
+additive-only ABI policy is for (never renumber, remove, or re-signature an
+export; only add). Reviewer check: no `mmap`/`struct` slot arithmetic outside
+`talOS/rtms`, `talOS/memory`, and marked test doubles.
+
 ## The three loops
 
 | Loop | Clock | Transport |

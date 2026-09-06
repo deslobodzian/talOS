@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 // Bumped on every additive ABI change. Starts at 1.
-#define TALOS_NODE_ABI_VERSION 2u
+#define TALOS_NODE_ABI_VERSION 3u
 
 // Opaque handles. NULL means "open failed; see talos_last_error()".
 typedef struct TalosPublisher TalosPublisher;
@@ -142,6 +142,20 @@ int32_t talos_node_heartbeat(TalosNode* node, uint64_t dispatches);
 
 // Release the slot. NULL is a no-op. Never throws.
 void talos_node_close(TalosNode* node);
+
+// Frozen RTMS shared-memory geometry, probed from the ground-truth structs
+// with sizeof/offsetof (never copied by hand). Added in ABI 3 so wrapper
+// languages read the layout instead of restating it.
+typedef struct TalosRtmsLayout {
+  uint32_t header_size;    // sizeof(RTMSHeader)
+  uint32_t off_writer_seq;  // writer.sequence offset within the segment
+  uint32_t off_readers;     // readers[] offset within the segment
+  uint32_t reader_stride;   // sizeof one Reader slot
+} TalosRtmsLayout;
+
+// Fill *out with the frozen geometry. Returns bytes written (nonzero) or 0
+// when out is NULL. Never throws.
+uint32_t talos_rtms_layout(TalosRtmsLayout* out);
 
 #ifdef __cplusplus
 }  // extern "C"

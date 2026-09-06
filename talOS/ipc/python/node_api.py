@@ -2,7 +2,7 @@
 
 This module is the ONLY Python door into the RTMS transport and the
 describe envelope. It binds the exact ABI declared in
-``talOS/node_api/node_api.h`` (``TALOS_NODE_ABI_VERSION == 2``) and never
+``talOS/node_api/node_api.h`` (``TALOS_NODE_ABI_VERSION == 3``) and never
 reimplements transport or envelope logic in Python:
 
 * publish / subscribe go through ``talos_topic_open_publisher`` /
@@ -29,7 +29,7 @@ import ctypes
 import os
 import sys
 
-TALOS_NODE_ABI_VERSION = 2
+TALOS_NODE_ABI_VERSION = 3
 
 # Reporter flag bits (talOS/introspection/registry.h kFlagSimulation/Replay).
 FLAG_SIMULATION = 1 << 0
@@ -77,6 +77,16 @@ class TalosSource(ctypes.Structure):
         ("topic", ctypes.c_char_p),
         ("message_bytes", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
+    ]
+
+
+class TalosRtmsLayout(ctypes.Structure):
+    """Frozen RTMS geometry probed from the C++ structs (ABI 3)."""
+    _fields_ = [
+        ("header_size", ctypes.c_uint32),
+        ("off_writer_seq", ctypes.c_uint32),
+        ("off_readers", ctypes.c_uint32),
+        ("reader_stride", ctypes.c_uint32),
     ]
 
 
@@ -202,6 +212,8 @@ def _bind(lib):
     lib.talos_node_heartbeat.restype = ctypes.c_int32
     lib.talos_node_close.argtypes = [ctypes.c_void_p]
     lib.talos_node_close.restype = None
+    lib.talos_rtms_layout.argtypes = [ctypes.POINTER(TalosRtmsLayout)]
+    lib.talos_rtms_layout.restype = ctypes.c_uint32
 
 
 def _check_version(lib):
@@ -231,6 +243,24 @@ def monotonic_ns():
 def last_error():
     """Last error on this thread reported by the library."""
     return _err(_load())
+
+
+_layout = None
+
+
+def rtms_layout():
+    """Frozen RTMS geometry read from the library (cached).
+
+    Importing this module never touches the ``.so``; the first call loads
+    it. Callers that only need pure helpers stay ``.so``-free.
+    """
+    global _layout
+    if _layout is None:
+        layout = TalosRtmsLayout()
+        if not _load().talos_rtms_layout(ctypes.byref(layout)):
+            raise TalosError("talos_rtms_layout failed: %s" % last_error())
+        _layout = layout
+    return _layout
 
 
 def _validate_layout(message_bytes, alignment):

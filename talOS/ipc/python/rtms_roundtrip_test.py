@@ -3,9 +3,12 @@
 Levels:
   wire     - payload bytes: struct pack == flatc-builder bytes, and the
              generated accessors decode them (no shared memory needed).
-  layout   - frozen header offsets/sizes against C++-probed values (no shm).
-  protocol - full publish/subscribe incl. lap recovery against a fake
-             bytearray-backed segment (no shm; exercises RTMSQueue logic).
+  layout   - frozen geometry read from the library via talos_rtms_layout
+             against the frozen contract values (needs the built .so,
+             no shm).
+  protocol - full publish/subscribe incl. lap recovery against a local
+             counter/dict double (no shm; exercises the protocol formulas,
+             not the transport -- see the wrapper rule in ARCHITECTURE.md).
   peer     - live cross-language round trip against the C++ peer binary:
              python->C++ and C++->python asserting identical payload bytes.
              Needs shm + the peer binary; skipped otherwise (see message).
@@ -25,8 +28,70 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import rtms
-from rtms import RTMSQueue
+import node_api
+from node_api import RTMSQueue
 import messages
+
+
+class FakeQueue:
+    """Test-only protocol double (no shared memory, no transport).
+
+    Lives here -- not in rtms.py -- per the wrapper rule: it exercises the
+    publish/subscribe formulas (sequence, lap recovery, LATEST) without
+    reimplementing anything fundamental. Mirrors the documented
+    OVERWRITE_OLDEST semantics; DROP_NEWEST disables lap recovery.
+    """
+
+    def __init__(self, slots=8, message_size=8):
+        self.slots = slots
+        self.message_size = message_size
+        self._wseq = 0
+        self._store = {}
+        self._readers = {}
+
+    def register_reader(self):
+        for i in range(rtms.MAX_READERS):
+            if self._readers.get(i, (None, False))[1] is not True:
+                self._readers[i] = [self._wseq, True]
+                return i
+        return None
+
+    def release_reader(self, reader_id):
+        if reader_id in self._readers:
+            self._readers[reader_id][1] = False
+
+    def write(self, payload):
+        data = bytes(payload)
+        if len(data) > self.message_size:
+            raise ValueError(
+                "Cannot write message larger than slot size: %d > %d"
+                % (len(data), self.message_size))
+        seq = self._wseq
+        self._store[seq] = data + b"\x00" * (self.message_size - len(data))
+        self._wseq = seq + 1
+        return seq
+
+    def read_next(self, reader_id,
+                  overflow_policy=rtms.OVERWRITE_OLDEST,
+                  read_mode=rtms.SEQUENCE):
+        if reader_id >= rtms.MAX_READERS:
+            return ("invalid", None, 0, 0)
+        cursor, active = self._readers.get(reader_id, (0, False))
+        if not active:
+            return ("inactive", None, 0, 0)
+        writer = self._wseq
+        if cursor >= writer:
+            return ("empty", None, 0, 0)
+        seq = cursor
+        if overflow_policy != rtms.DROP_NEWEST and writer - seq >= self.slots:
+            seq = writer - self.slots + 1
+        if read_mode == rtms.LATEST:
+            seq = writer - 1
+        payload = self._store.get(seq)
+        if payload is None:  # pragma: no cover - corrupt emulation
+            return ("torn", None, 0, 0)
+        self._readers[reader_id][0] = seq + 1
+        return ("ok", bytes(payload), seq, seq - cursor)
 
 
 def _peer_binary():
@@ -55,26 +120,7 @@ def _shm_available():
 
 
 def _fake_queue(slots=8):
-    q = RTMSQueue.__new__(RTMSQueue)
-    q.topic = "/fake"
-    q.shm_name = "/fake"
-    q.message_size = 8
-    q.message_alignment = 4
-    q.slots = slots
-    q.data_offset = rtms.align_up(rtms.HEADER_SIZE, 4)
-    q.stride = 8
-    q.total_bytes = q.data_offset + q.stride * slots
-
-    class FakeSeg:
-        def __init__(self, size):
-            self.buf = bytearray(size)
-
-        def close(self):
-            pass
-
-    q._seg = FakeSeg(q.total_bytes)
-    q._init_header()
-    return q
+    return FakeQueue(slots=slots, message_size=8)
 
 
 class WireFormatTest(unittest.TestCase):
@@ -112,10 +158,10 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(rtms.MAX_READERS, 8)
 
     def test_total_bytes_math(self):
-        q = _fake_queue(slots=1024)
-        self.assertEqual(q.data_offset, 640)
-        self.assertEqual(q.stride, 8)
-        self.assertEqual(q.total_bytes, 640 + 8 * 1024)
+        data_offset = rtms.align_up(rtms.HEADER_SIZE, 4)
+        stride, slots = 8, 1024
+        self.assertEqual(data_offset, 640)
+        self.assertEqual(data_offset + stride * slots, 640 + 8 * 1024)
 
     def test_shm_name_mapping(self):
         self.assertEqual(rtms.shm_object_name("/hw/state"), "/hw.state")

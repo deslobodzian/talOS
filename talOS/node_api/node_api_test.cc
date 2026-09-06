@@ -13,7 +13,18 @@ constexpr const char* kTopic = "/test/state/node_api";
 constexpr uint32_t kBytes = 8;
 constexpr uint32_t kAlign = 4;
 
-TEST(NodeApi, AbiVersion) { EXPECT_EQ(talos_abi_version(), 2u); }
+TEST(NodeApi, AbiVersion) { EXPECT_EQ(talos_abi_version(), 3u); }
+
+TEST(NodeApi, RtmsLayoutMatchesFrozenGeometry) {
+  EXPECT_EQ(talos_rtms_layout(nullptr), 0u);
+  TalosRtmsLayout layout{};
+  EXPECT_EQ(talos_rtms_layout(&layout), sizeof(TalosRtmsLayout));
+  // Frozen contract: sizeof(RTMSHeader)==640, writer@64, readers@128/64.
+  EXPECT_EQ(layout.header_size, 640u);
+  EXPECT_EQ(layout.off_writer_seq, 64u);
+  EXPECT_EQ(layout.off_readers, 128u);
+  EXPECT_EQ(layout.reader_stride, 64u);
+}
 
 TEST(NodeApi, MonotonicIncreases) {
   const int64_t a = talos_monotonic_ns();

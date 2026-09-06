@@ -219,7 +219,7 @@ class IntakeNode:
         self.policy = IntakePolicy(roller_id, beam_break_id, period_us,
                                    command_timeout_us, config_id)
         # Publisher owns its layout (reclaims stale segments); Subscriber
-        # never does -- the rtms.py contract (RTMSQueue docstring).
+        # never does -- the rtms.Publisher/rtms.Subscriber contract.
         self.hw_sub = rtms.Subscriber(packet.HW_STATE_TOPIC,
                                       packet.PACKET_SIZE, packet.PACKET_ALIGN)
         self.target_sub = rtms.Subscriber(packet.TARGET_TOPIC,
