@@ -202,7 +202,7 @@ class ConfigTest(unittest.TestCase):
     def test_resolve_standalone_subsystem(self):
         path = os.path.join(_HERE, "subsystem.toml")
         roller_id, beam_id, period_us = node.resolve_ids(path)
-        # Sorted (subsystem, device): beam_break < roller -> 1, 2.
+        # Sorted (subsystem, device): intake_beam < roller -> 1, 2.
         self.assertEqual((roller_id, beam_id, period_us), (2, 1, 20000))
 
 
@@ -268,6 +268,25 @@ class DescribeTest(unittest.TestCase):
             for field in ("kind", "name", "message_bytes", "external",
                           "optional"):
                 self.assertIn(field, source)
+
+
+class RegistryTest(unittest.TestCase):
+    def test_register_publish_heartbeat_close(self):
+        if node_api.find_lib() is None and not os.environ.get(
+                "TALOS_NODE_LIB"):
+            self.skipTest("libtalos_node.so not built; set TALOS_NODE_LIB")
+        rows = [(node_api.TIMER, "tick", 0, False, False)]
+        try:
+            reg = node_api.Node("intake_test", "//pkg:intake_test", 999, 0,
+                                rows)
+        except node_api.TalosError as exc:
+            self.skipTest("registry unavailable: %s" % (exc,))
+        try:
+            reg.heartbeat(1)
+            reg.heartbeat(2)
+        finally:
+            reg.close()
+        reg.close()  # double close is safe.
 
 
 if __name__ == "__main__":

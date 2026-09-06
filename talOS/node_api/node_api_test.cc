@@ -13,7 +13,7 @@ constexpr const char* kTopic = "/test/state/node_api";
 constexpr uint32_t kBytes = 8;
 constexpr uint32_t kAlign = 4;
 
-TEST(NodeApi, AbiVersion) { EXPECT_EQ(talos_abi_version(), 1u); }
+TEST(NodeApi, AbiVersion) { EXPECT_EQ(talos_abi_version(), 2u); }
 
 TEST(NodeApi, MonotonicIncreases) {
   const int64_t a = talos_monotonic_ns();
@@ -93,6 +93,28 @@ TEST(NodeApi, DescribeEmitMatchesGroundTruth) {
   EXPECT_EQ(talos_describe_emit("mynode", "//pkg:mynode", bad, 1, buf.data(),
                                static_cast<uint32_t>(buf.size()), nullptr),
             TALOS_ERR_ARG);
+}
+
+TEST(NodeApi, RegisterPublishHeartbeatClose) {
+  EXPECT_TRUE(talos_node_register(nullptr, "//pkg:mynode", 0, 0) == nullptr);
+  EXPECT_TRUE(talos_node_register("", "//pkg:mynode", 0, 0) == nullptr);
+  EXPECT_EQ(talos_node_publish(nullptr, nullptr, 0), TALOS_ERR_ARG);
+  EXPECT_EQ(talos_node_heartbeat(nullptr, 0), TALOS_ERR_ARG);
+  talos_node_close(nullptr);
+
+  TalosNode* node =
+      talos_node_register("node_api_test", "//talOS/node_api:node_api_test",
+                          4242u, 1u);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  const TalosSource sources[] = {
+      {TALOS_SOURCE_TIMER, "tick", 0, 0},
+      {TALOS_SOURCE_SENDER, "/test/state/node_api_reg", 8, 0},
+  };
+  EXPECT_EQ(talos_node_publish(node, sources, 2), TALOS_OK);
+  EXPECT_EQ(talos_node_publish(node, nullptr, 1), TALOS_ERR_ARG);
+  EXPECT_EQ(talos_node_heartbeat(node, 1), TALOS_OK);
+  EXPECT_EQ(talos_node_heartbeat(node, 2), TALOS_OK);
+  talos_node_close(node);
 }
 
 }  // namespace

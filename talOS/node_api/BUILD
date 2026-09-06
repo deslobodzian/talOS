@@ -13,6 +13,7 @@ cc_library(
     deps = [
         "//talOS/events:events_core",
         "//talOS/introspection:describe",
+        "//talOS/introspection:registry",
         "//talOS/ipc:ipc",
         "//talOS/rtms:rtms",
     ],
@@ -29,6 +30,7 @@ cc_binary(
     deps = [
         "//talOS/events:events_core",
         "//talOS/introspection:describe",
+        "//talOS/introspection:registry",
         "//talOS/ipc:ipc",
         "//talOS/rtms:rtms",
     ],

@@ -16,6 +16,16 @@ import signal
 import sys
 import time
 
+_HERE = os.path.abspath(os.path.dirname(__file__))
+# Same navigation as node_test.py: Bazel `imports` resolve package-relative
+# and cannot express "the wrapper's directory", so locate it from __file__.
+# Works in the source tree, runfiles, and installed layouts alike.
+for _extra in (_HERE,
+               os.path.normpath(os.path.join(_HERE, "..", "..", "..",
+                                              "talOS", "ipc", "python"))):
+    if os.path.isdir(_extra) and _extra not in sys.path:
+        sys.path.insert(0, _extra)
+
 import packet
 import node_api
 
@@ -43,11 +53,15 @@ def parse_args(argv):
 def describe_source_rows():
     """Import-light source table. Must match node.describe_sources()."""
     return [
-        (node_api.TIMER, "intake", 0),
-        (node_api.WATCHER, packet.HW_STATE_TOPIC, packet.PACKET_SIZE),
-        (node_api.WATCHER, packet.TARGET_TOPIC, packet.TARGET_SIZE),
-        (node_api.SENDER, packet.REQUEST_TOPIC, packet.PACKET_SIZE),
-        (node_api.SENDER, packet.STATE_TOPIC, packet.STATE_SIZE),
+        (node_api.TIMER, "intake", 0, False, False),
+        (node_api.WATCHER, packet.HW_STATE_TOPIC, packet.PACKET_SIZE,
+         False, False),
+        (node_api.WATCHER, packet.TARGET_TOPIC, packet.TARGET_SIZE,
+         False, False),
+        (node_api.SENDER, packet.REQUEST_TOPIC, packet.PACKET_SIZE,
+         False, False),
+        (node_api.SENDER, packet.STATE_TOPIC, packet.STATE_SIZE,
+         False, False),
     ]
 
 
@@ -78,6 +92,13 @@ def run_node(args):
         pass
 
     node = intake_node.IntakeNode(roller_id, beam_id, period_us)
+    # Registry claim: the same sources --describe reports, so Studio's live
+    # graph sees this node. Degraded-ok inside Node (a missing registry
+    # costs the heartbeat, never the node).
+    flags = node_api.FLAG_SIMULATION if args.sim else 0
+    registry = node_api.Node(packet.NODE_NAME, packet.NODE_TARGET,
+                             int(args.session_id), flags,
+                             describe_source_rows())
     log_handle = None
     if args.log:
         log_handle = open(args.log, "a", encoding="utf-8")
@@ -99,9 +120,11 @@ def run_node(args):
             tick_start = now_ns
             node.poll_once(now_ns)
             dispatches += 1
+            registry.heartbeat(dispatches)
             elapsed_s = (time.monotonic_ns() - tick_start) / 1e9
             time.sleep(max(0.0, period_s - elapsed_s))  # 20ms poll loop.
     finally:
+        registry.close()
         node.close()
         if log_handle is not None:
             log_handle.write(json.dumps({"event": "stop",

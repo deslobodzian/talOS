@@ -7,10 +7,9 @@ are the ground truth. Python must not duplicate any of them.
 
 * `node_api.py` is the only Python door into the transport. It is a `ctypes`
   binding over the exact `extern "C"` ABI in `talOS/node_api/node_api.h`
-  (10 exports: `talos_abi_version`, `talos_monotonic_ns`, `talos_last_error`,
-  `talos_topic_open_publisher`, `talos_publish`, `talos_publisher_close`,
-  `talos_topic_open_subscriber`, `talos_poll_next`,
-  `talos_subscriber_close`, `talos_describe_emit`). It loads
+  (14 exports: the 10 transport/describe functions plus
+  `talos_node_register`, `talos_node_publish`, `talos_node_heartbeat`,
+  `talos_node_close`). It loads
   `bazel-bin/talOS/node_api/libtalos_node.so` (override with `TALOS_NODE_LIB`,
   or via test runfiles).
 * `rtms.py` keeps the historic public names (`Publisher`, `Subscriber`,
@@ -24,6 +23,13 @@ are the ground truth. Python must not duplicate any of them.
   the JSON string from `talos_describe_emit`. Python never hand-formats the
   envelope, so a schema change lands in C++ once. This signature is a
   cross-track contract: do not drift.
+* `Node(name, target, session_id, flags, sources)` claims a registry slot
+  via `talos_node_register`, publishes the same rows via
+  `talos_node_publish`, and `heartbeat(dispatches)` samples once per tick —
+  the same begin/heartbeat/dispatch/end bracketing as the C++ Reporter, so
+  Studio's live graph sees Python nodes through the identical reader path.
+  Unavailable registry degrades to heartbeat no-ops (stderr once), never an
+  abort. `FLAG_SIMULATION`/`FLAG_REPLAY` mirror the Reporter bits.
 
 ## Additive-only ABI policy
 

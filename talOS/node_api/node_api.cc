@@ -10,6 +10,7 @@
 
 #include "talOS/events/manifest.h"
 #include "talOS/introspection/describe.h"
+#include "talOS/introspection/registry.h"
 #include "talOS/ipc/publisher.h"
 #include "talOS/rtms/rtms.h"
 
@@ -26,6 +27,53 @@ bool ValidLayout(uint32_t message_bytes, uint32_t alignment) {
   if (message_bytes == 0 || alignment == 0) return false;
   // Power of two alignment, as RTMS aligns slots by it.
   return (alignment & (alignment - 1)) == 0;
+}
+
+// Shared by describe_emit and node_publish: the manifest is built from raw
+// caller arrays in exactly one place, so --describe and the registry row can
+// never disagree about what a node owns.
+bool BuildManifest(const TalosSource* sources, uint32_t num_sources,
+                   talos::event::Manifest& manifest) {
+  manifest.clear();
+  manifest.reserve(num_sources);
+  for (uint32_t i = 0; i < num_sources; ++i) {
+    if (sources[i].topic == nullptr) {
+      SetError("source topic must be non-NULL");
+      return false;
+    }
+    talos::event::Registration reg{};
+    reg.id = static_cast<uint16_t>(i);
+    switch (sources[i].kind) {
+      case TALOS_SOURCE_TIMER:
+        reg.kind = talos::event::SourceKind::TIMER;
+        break;
+      case TALOS_SOURCE_WATCHER:
+        reg.kind = talos::event::SourceKind::WATCHER;
+        break;
+      case TALOS_SOURCE_FETCHER:
+        reg.kind = talos::event::SourceKind::FETCHER;
+        break;
+      case TALOS_SOURCE_SENDER:
+        reg.kind = talos::event::SourceKind::SENDER;
+        break;
+      default:
+        SetError("unknown source kind (want 1..4)");
+        return false;
+    }
+    reg.name = sources[i].topic;
+    reg.message_bytes = sources[i].message_bytes;
+    manifest.push_back(std::move(reg));
+  }
+  return true;
+}
+
+void BuildAttributes(const TalosSource* sources, uint32_t num_sources,
+                     std::vector<talos::introspect::EndpointAttribute>& attrs) {
+  attrs.clear();
+  attrs.reserve(num_sources);
+  for (uint32_t i = 0; i < num_sources; ++i) {
+    attrs.push_back({std::string_view(sources[i].topic), sources[i].flags});
+  }
 }
 
 }  // namespace
@@ -220,40 +268,9 @@ int32_t talos_describe_emit(const char* node_name, const char* target,
       return TALOS_ERR_ARG;
     }
     talos::event::Manifest manifest;
-    manifest.reserve(num_sources);
-    for (uint32_t i = 0; i < num_sources; ++i) {
-      if (sources[i].topic == nullptr) {
-        SetError("source topic must be non-NULL");
-        return TALOS_ERR_ARG;
-      }
-      talos::event::Registration reg{};
-      reg.id = static_cast<uint16_t>(i);
-      switch (sources[i].kind) {
-        case TALOS_SOURCE_TIMER:
-          reg.kind = talos::event::SourceKind::TIMER;
-          break;
-        case TALOS_SOURCE_WATCHER:
-          reg.kind = talos::event::SourceKind::WATCHER;
-          break;
-        case TALOS_SOURCE_FETCHER:
-          reg.kind = talos::event::SourceKind::FETCHER;
-          break;
-        case TALOS_SOURCE_SENDER:
-          reg.kind = talos::event::SourceKind::SENDER;
-          break;
-        default:
-          SetError("unknown source kind (want 1..4)");
-          return TALOS_ERR_ARG;
-      }
-      reg.name = sources[i].topic;
-      reg.message_bytes = sources[i].message_bytes;
-      manifest.push_back(std::move(reg));
-    }
+    if (!BuildManifest(sources, num_sources, manifest)) return TALOS_ERR_ARG;
     std::vector<talos::introspect::EndpointAttribute> attrs;
-    attrs.reserve(num_sources);
-    for (uint32_t i = 0; i < num_sources; ++i) {
-      attrs.push_back({std::string_view(sources[i].topic), sources[i].flags});
-    }
+    BuildAttributes(sources, num_sources, attrs);
     talos::introspect::Description desc = talos::introspect::DescribeManifest(
         node_name, target, manifest, attrs);
     const std::string json = talos::introspect::DescribeToJson(desc);
@@ -272,4 +289,91 @@ int32_t talos_describe_emit(const char* node_name, const char* target,
     SetError("unknown describe failure");
   }
   return TALOS_ERR;
+}
+
+struct TalosNode {
+  std::optional<talos::introspect::NodeRegistration> registration;
+};
+
+TalosNode* talos_node_register(const char* name, const char* target,
+                              uint64_t session_id, uint32_t flags) {
+  ClearError();
+  try {
+    if (name == nullptr || name[0] == '\0' || target == nullptr ||
+        target[0] == '\0') {
+      SetError("name and target must be non-empty strings");
+      return nullptr;
+    }
+    auto* out = new TalosNode{};
+    try {
+      out->registration.emplace(
+          talos::introspect::NodeRegistration::Identity{
+              .name = name, .target = target, .session_id = session_id,
+              .flags = flags});
+    } catch (...) {
+      delete out;
+      throw;
+    }
+    return out;
+  } catch (const std::exception& e) {
+    SetErrorStr(e.what());
+  } catch (...) {
+    SetError("unknown register failure");
+  }
+  return nullptr;
+}
+
+int32_t talos_node_publish(TalosNode* node, const TalosSource* sources,
+                          uint32_t num_sources) {
+  ClearError();
+  try {
+    if (node == nullptr || !node->registration) {
+      SetError("node must be a registered handle");
+      return TALOS_ERR_ARG;
+    }
+    if (num_sources > 0 && sources == nullptr) {
+      SetError("sources must be non-NULL when num_sources > 0");
+      return TALOS_ERR_ARG;
+    }
+    talos::event::Manifest manifest;
+    if (!BuildManifest(sources, num_sources, manifest)) return TALOS_ERR_ARG;
+    std::vector<talos::introspect::EndpointAttribute> attrs;
+    BuildAttributes(sources, num_sources, attrs);
+    node->registration->publish(manifest, attrs);
+    return TALOS_OK;
+  } catch (const std::exception& e) {
+    SetErrorStr(e.what());
+  } catch (...) {
+    SetError("unknown publish failure");
+  }
+  return TALOS_ERR;
+}
+
+int32_t talos_node_heartbeat(TalosNode* node, uint64_t dispatches) {
+  ClearError();
+  try {
+    if (node == nullptr || !node->registration) {
+      SetError("node must be a registered handle");
+      return TALOS_ERR_ARG;
+    }
+    // One refresh sample, mirroring Reporter::sample: heartbeat, dispatch
+    // count and source counters move together behind the seqlock.
+    node->registration->begin_sample();
+    node->registration->heartbeat();
+    node->registration->set_dispatch_count(dispatches);
+    node->registration->end_sample();
+    return TALOS_OK;
+  } catch (const std::exception& e) {
+    SetErrorStr(e.what());
+  } catch (...) {
+    SetError("unknown heartbeat failure");
+  }
+  return TALOS_ERR;
+}
+
+void talos_node_close(TalosNode* node) {
+  try {
+    delete node;
+  } catch (...) {
+  }
 }
