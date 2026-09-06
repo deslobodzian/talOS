@@ -16,7 +16,7 @@
 #include "talOS/memory/shared_memory_ptr.h"
 
 namespace {
-std::string_view ValidatePath(std::string_view path) {
+std::string ValidatePath(std::string_view path) {
   std::string_view name = path;
   if (name.starts_with('/')) {
     name.remove_prefix(1);
@@ -26,7 +26,13 @@ std::string_view ValidatePath(std::string_view path) {
         "Topic name '" + std::string(path) +
         "' exceeds limit of 30 characters after leading slash");
   }
-  return path;
+  std::string normalized;
+  normalized.reserve(name.size() + 1);
+  normalized.push_back('/');
+  for (char c : name) {
+    normalized.push_back(c == '/' ? '_' : c);
+  }
+  return normalized;
 }
 // Unlinks an existing segment whose layout does not match what the caller is
 // about to create, so the next shm_open makes a fresh one. Only the topic's

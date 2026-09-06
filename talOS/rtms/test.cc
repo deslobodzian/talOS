@@ -24,17 +24,10 @@ using namespace std::chrono_literals;
 constexpr auto kTestTimeout = 5s;
 
 std::string make_test_path(std::string_view test_name) {
-#if defined(__linux__)
     return "/rtms_" +
            std::string{test_name} +
            "_" +
            std::to_string(::getpid());
-#else
-    return "/tmp/rtms/" +
-           std::string{test_name} +
-           "_" +
-           std::to_string(::getpid());
-#endif
 }
 
 RTMSOptions sequence_options() {

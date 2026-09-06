@@ -1,0 +1,44 @@
+services:
+  test-ubuntu-24:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ubuntu:24.04
+    image: talos-test:ubuntu-24.04
+    shm_size: '2gb'
+    volumes:
+      - .:/workspace
+      - talos-bazel-cache-ubuntu-24:/root/.cache
+    command: ["test", "//...", "--test_output=errors"]
+
+  test-ubuntu-22:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ubuntu:22.04
+    image: talos-test:ubuntu-22.04
+    shm_size: '2gb'
+    volumes:
+      - .:/workspace
+      - talos-bazel-cache-ubuntu-22:/root/.cache
+    command: ["test", "//...", "--test_output=errors"]
+
+  test-debian-12:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: debian:bookworm
+    image: talos-test:debian-12
+    shm_size: '2gb'
+    volumes:
+      - .:/workspace
+      - talos-bazel-cache-debian-12:/root/.cache
+    command: ["test", "//...", "--test_output=errors"]
+
+volumes:
+  talos-bazel-cache-ubuntu-24:
+  talos-bazel-cache-ubuntu-22:
+  talos-bazel-cache-debian-12:
