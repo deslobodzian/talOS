@@ -2,6 +2,7 @@
 
 #include <time.h>
 
+#include <cstddef>
 #include <cstring>
 #include <exception>
 #include <optional>
@@ -90,6 +91,16 @@ struct TalosSubscriber {
 };
 
 uint32_t talos_abi_version(void) { return TALOS_NODE_ABI_VERSION; }
+
+uint32_t talos_rtms_layout(TalosRtmsLayout* out) {
+  if (out == nullptr) return 0;
+  out->header_size = static_cast<uint32_t>(sizeof(RTMSHeader));
+  out->off_writer_seq = static_cast<uint32_t>(offsetof(RTMSHeader, writer) +
+                                              offsetof(Writer, sequence));
+  out->off_readers = static_cast<uint32_t>(offsetof(RTMSHeader, readers));
+  out->reader_stride = static_cast<uint32_t>(sizeof(Reader));
+  return static_cast<uint32_t>(sizeof(TalosRtmsLayout));
+}
 
 int64_t talos_monotonic_ns(void) {
   struct timespec ts{};
