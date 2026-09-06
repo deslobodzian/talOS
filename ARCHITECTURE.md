@@ -164,7 +164,8 @@ would drift.
 Three directories are in the tree and not in this stack. `vision/` is a
 device/buffer abstraction with no node on it yet. `leg_robot/` is a standalone
 moteus experiment, not a talOS robot. `tools/subsystem_codegen/` is a
-`py_binary` named `test` that nothing else builds against. Do not treat any of
+`py_binary` named `subsystem_codegen` (`//tools/subsystem_codegen:subsystem_codegen`)
+that nothing else builds against. Do not treat any of
 them as an example of the architecture.
 
 ## Dependency rules
