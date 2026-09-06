@@ -8,6 +8,34 @@ exports_files(["uws.BUILD.bazel", "usockets.BUILD.bazel"])
 # telemetry, so producers outside this package need it too.
 cc_library(name = "wire", hdrs = ["wire.h"], visibility = ["//visibility:public"])
 cc_test(name = "wire_test", srcs = ["tests/wire_test.cc"], deps = [":wire"])
+
+# The system graph: what the live registry holds, as the JSON document Studio
+# and agents consume. Separate from the bridge binary so it can be tested
+# without a socket.
+cc_library(
+    name = "system",
+    hdrs = ["system.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//talOS/introspection:names",
+        "//talOS/introspection:registry",
+    ],
+)
+
+cc_test(
+    name = "system_test",
+    size = "small",
+    srcs = ["tests/system_test.cc"],
+    deps = [
+        ":system",
+        # The `/hw/*` topic names, so a test that asserts on them cannot drift
+        # from the strings the hardware bridge actually opens.
+        "//talOS/hardware:hardware",
+        "//talOS/introspection:names",
+        "//talOS/introspection:registry",
+        "@googletest//:gtest_main",
+    ],
+)
 cc_binary(
     name = "studio_mock",
     srcs = ["mock.cc"],
@@ -16,7 +44,13 @@ cc_binary(
 cc_binary(
     name = "studio_bridge",
     srcs = ["main.cc"],
-    deps = [":wire", "//talOS/rtms:rtms", "@studio_uws//:uws"],
+    deps = [
+        ":system",
+        ":wire",
+        "//talOS/introspection:registry",
+        "//talOS/rtms:rtms",
+        "@studio_uws//:uws",
+    ],
 )
 
 py_test(

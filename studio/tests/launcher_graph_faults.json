@@ -1,0 +1,334 @@
+{
+  "describe_version": 1,
+  "session_id": "12345678901234567890",
+  "config_path": "2026-robot/main_processor/configuration/robot.toml",
+  "nodes": [
+    {
+      "name": "hardware_node",
+      "target": "//talOS/bridge:hardware_node",
+      "described": true,
+      "sources": [
+        {
+          "kind": "SENDER",
+          "name": "/hw/state",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "SENDER",
+          "name": "/hw/command",
+          "message_bytes": 1404,
+          "external": true,
+          "optional": false
+        },
+        {
+          "kind": "SENDER",
+          "name": "/hw/state/driver_station",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "FETCHER",
+          "name": "/hw/command/override",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": true
+        },
+        {
+          "kind": "FETCHER",
+          "name": "/hw/request/drivetrain",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "FETCHER",
+          "name": "/hw/request/shooter",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "arbiter",
+      "target": "//2026-robot/main_processor/arbiter:node",
+      "described": true,
+      "sources": [
+        {
+          "kind": "SENDER",
+          "name": "/drivetrain/target",
+          "message_bytes": 40,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "SENDER",
+          "name": "/shooter/target",
+          "message_bytes": 24,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/driver_station/state",
+          "message_bytes": 88,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/drivetrain/target/teleop",
+          "message_bytes": 40,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/drivetrain/target/auto",
+          "message_bytes": 40,
+          "external": false,
+          "optional": true
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/shooter/target/teleop",
+          "message_bytes": 24,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/shooter/target/auto",
+          "message_bytes": 24,
+          "external": false,
+          "optional": true
+        }
+      ]
+    },
+    {
+      "name": "driver_station",
+      "target": "//2026-robot/main_processor/driver_station:node",
+      "described": true,
+      "sources": [
+        {
+          "kind": "SENDER",
+          "name": "/driver_station/state",
+          "message_bytes": 88,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/hw/state/driver_station",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "drivetrain",
+      "target": "//2026-robot/main_processor/drivetrain:node",
+      "described": true,
+      "sources": [
+        {
+          "kind": "WATCHER",
+          "name": "/hw/state",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/drivetrain/target",
+          "message_bytes": 40,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "SENDER",
+          "name": "/hw/req/drive",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "SENDER",
+          "name": "/drivetrain/state",
+          "message_bytes": 56,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "TIMER",
+          "name": "swerve",
+          "message_bytes": 0,
+          "external": false,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "odometry",
+      "target": "//2026-robot/main_processor/odometry:node",
+      "described": true,
+      "sources": [
+        {
+          "kind": "WATCHER",
+          "name": "/drivetrain/state",
+          "message_bytes": 56,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/shooter/state",
+          "message_bytes": 32,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "SENDER",
+          "name": "/odometry/state",
+          "message_bytes": 72,
+          "external": false,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "operator_interface",
+      "target": "//2026-robot/main_processor/operator_interface:node",
+      "described": true,
+      "sources": [
+        {
+          "kind": "SENDER",
+          "name": "/drivetrain/target/teleop",
+          "message_bytes": 40,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "SENDER",
+          "name": "/shooter/target/teleop",
+          "message_bytes": 24,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/driver_station/state",
+          "message_bytes": 88,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/drivetrain/state",
+          "message_bytes": 56,
+          "external": false,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "shooter",
+      "target": "//2026-robot/main_processor/shooter:node",
+      "described": true,
+      "sources": [
+        {
+          "kind": "WATCHER",
+          "name": "/hw/state",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/shooter/target",
+          "message_bytes": 24,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "SENDER",
+          "name": "/hw/request/shooter",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "SENDER",
+          "name": "/shooter/state",
+          "message_bytes": 32,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "TIMER",
+          "name": "shooter",
+          "message_bytes": 0,
+          "external": false,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "telemetry",
+      "target": "//2026-robot/main_processor/telemetry:node",
+      "described": true,
+      "sources": [
+        {
+          "kind": "WATCHER",
+          "name": "/odometry/state",
+          "message_bytes": 72,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/drivetrain/state",
+          "message_bytes": 56,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/driver_station/state",
+          "message_bytes": 88,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "TIMER",
+          "name": "telemetry",
+          "message_bytes": 0,
+          "external": false,
+          "optional": false
+        },
+        {
+          "kind": "SENDER",
+          "name": "/talos/telemetry",
+          "message_bytes": 65536,
+          "external": true,
+          "optional": false
+        }
+      ]
+    }
+  ],
+  "diagnostics": [
+    {
+      "severity": "error",
+      "subject": "/hw/req/drive",
+      "message": "topic '/hw/req/drive': role 'req' is an abbreviation; use 'request' (declared by drivetrain)"
+    },
+    {
+      "severity": "error",
+      "subject": "/hw/request/drivetrain",
+      "message": "is read by hardware_node but nothing publishes it; either the writer is missing or the two ends are spelled differently"
+    }
+  ]
+}

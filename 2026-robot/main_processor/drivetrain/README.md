@@ -19,21 +19,33 @@ controller; pose estimation and vision are separate future nodes.
 
 ## Local Topics
 
+Names follow `talOS/NAMING.md`, which is normative for their grammar and for
+which end of a topic is allowed to publish it.
+
 | Topic | Single publisher | Payload |
 |---|---|---|
-| `/drivetrain/tgt` | Planner/operator process | FlatBuffer `ChassisTarget` |
-| `/hw/state` | Bridge | Canonical hardware state in fixed `Packet` |
-| `/hw/cmd` | Drivetrain | Canonical hardware command in fixed `Packet` |
+| `/drivetrain/target` | `arbiter` node | FlatBuffer `ChassisTarget` |
+| `/hw/state` | Hardware bridge | Canonical hardware state in fixed `Packet` |
+| `/hw/request/drivetrain` | Drivetrain | Partial command, this subsystem's devices only, in fixed `Packet` |
+| `/hw/command` | Hardware bridge | Canonical hardware command in fixed `Packet` |
+
+The node subscribes to one target topic however many producers exist:
+`operator_interface` publishes `/drivetrain/target/teleop`, an auto routine
+`/drivetrain/target/auto`, and the `arbiter` node forwards exactly one of them
+to `/drivetrain/target`.
 
 Chassis units are meters/second and radians/second. Axes are forward X, left Y,
 CCW yaw. Targets carry the companion `Poller::now()` timestamp and an enable
 flag. Stale targets or stale/invalid/disabled hardware state produce neutral
 requests. Messages are bounded and go through the event loop recorder.
 
-The bridge carries packet bytes without changing command timestamps or session
-tokens. It never refreshes an old command's lease. Another local process, such
-as drive estimation, can subscribe to the state topic. A separate remote
-observer service is not part of this change.
+The bridge merges each subsystem's request into the one whole-robot command,
+stamping it with the epoch and observed time from the last state the controller
+processor reported, so a command can never claim to answer a sample nobody saw.
+It never refreshes a lease on a subsystem's behalf: a request that stops
+arriving neutralizes that subsystem's devices and nothing else's. Another local
+process, such as drive estimation, can subscribe to the state topic. A separate
+remote observer service is not part of this change.
 
 ## Run the Simulation
 
@@ -94,9 +106,9 @@ bridge; that line means its socket is open.
 
 ### Watching it work
 
-`monitor` subscribes to the same three topics and redraws them a few times a
-second. It publishes nothing and holds no hardware, so it is safe to start and
-stop at any time, against a simulation or a real robot:
+`monitor` subscribes to the target, state and command topics above and redraws
+them a few times a second. It publishes nothing and holds no hardware, so it is
+safe to start and stop at any time, against a simulation or a real robot:
 
 ```sh
 bazel run //2026-robot/main_processor/drivetrain:monitor

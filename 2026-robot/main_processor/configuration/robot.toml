@@ -233,15 +233,15 @@ modules = [
   { name = "front_right", x_m = 0.30, y_m = -0.30, drive = "front_right_drive", steer = "front_right_steer", encoder = "front_right_encoder" },
 ]
 
-# Sole writer of /drivetrain/tgt and /shooter/tgt. Owns no actuators, so like
-# the driver station it is input-only and the bridge keeps no request tracker
-# for it.
+# Sole writer of /drivetrain/target and /shooter/target. Owns no actuators, so
+# like the driver station it is input-only and the bridge keeps no request
+# tracker for it.
 [subsystems.arbiter]
 node = "//2026-robot/main_processor/arbiter:node"
 period_us = 20000
 
-# Fuses drivetrain and shooter state into a field pose on /odometry. Owns no
-# actuators.
+# Fuses drivetrain and shooter state into a field pose on /odometry/state. Owns
+# no actuators.
 [subsystems.odometry]
 node = "//2026-robot/main_processor/odometry:node"
 period_us = 5000
@@ -292,10 +292,13 @@ field_oriented = true
 # Bit 0 is button 1.
 shoot_button_mask = 1
 
-# Publishes Studio telemetry frames on `topic`. It is the only producer there,
-# which the Studio bridge requires: that topic uses DROP_NEWEST so a full queue
-# drops a frame instead of overwriting bytes the bridge is still sending.
+# Publishes Studio telemetry frames on `topic`, which must stay
+# /talos/telemetry: the reserved `talos` owner because the feed belongs to no
+# subsystem, and role `telemetry` because it is for recording and display only.
+# It is the only producer there, which the Studio bridge requires: that topic
+# uses DROP_NEWEST so a full queue drops a frame instead of overwriting bytes
+# the bridge is still sending.
 [subsystems.telemetry]
 node = "//2026-robot/main_processor/telemetry:node"
 period_us = 10000
-topic = "/talos_studio"
+topic = "/talos/telemetry"

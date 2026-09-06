@@ -9,21 +9,41 @@
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/realtime_event_loop.h"
 #include "talOS/events/replay_event_loop.h"
+#include "talOS/events/simulated_event_loop.h"
+#include "talOS/introspection/describe.h"
+#include "talOS/introspection/reporter.h"
 #include "talOS/process/process.h"
+
+namespace {
+// This node's identity, written once. `--describe` and the live registry row
+// have to name the same node and the same build target, or a viewer cannot tell
+// a graph that changed from a graph it is reading two different names for.
+constexpr const char* kNodeName = "driver_station";
+constexpr const char* kNodeTarget =
+    "//2026-robot/main_processor/driver_station:node";
+}  // namespace
 
 int main(int argc, char** argv) {
   try {
     std::string log_path = "/tmp/driver_station.tlog", replay_path;
-    std::string config_path = "2026-robot/main_processor/configuration/robot.toml";
+    std::string config_path =
+        "2026-robot/main_processor/configuration/robot.toml";
     int duration_s = 0;
     uint64_t session_id = 0;
+    bool simulation = false;
+    bool describe = false;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       // --sim only gates hardware commissioning, and this node owns no
-      // hardware, so the launcher's flag is accepted and ignored.
-      if (arg == "--sim")
+      // hardware, so the launcher's flag changes nothing here beyond telling
+      // the registry which mode the session is running in.
+      if (arg == "--sim") {
+        simulation = true;
         continue;
-      else if (arg == "--log" && i + 1 < argc)
+      } else if (arg == "--describe") {
+        describe = true;
+        continue;
+      } else if (arg == "--log" && i + 1 < argc)
         log_path = argv[++i];
       else if (arg == "--session-id" && i + 1 < argc)
         session_id = std::stoull(argv[++i]);
@@ -35,14 +55,30 @@ int main(int argc, char** argv) {
         duration_s = std::stoi(argv[++i]);
       else
         throw std::invalid_argument(
-            "usage: node [--sim] [--duration-s N] [--log PATH] [--session-id ID] [--config PATH] [--replay "
-            "PATH]");
+            "usage: node [--sim] [--describe] [--duration-s N] [--log PATH] "
+            "[--session-id ID] [--config PATH] [--replay PATH]");
     }
     if (duration_s < 0)
       throw std::invalid_argument("duration must be nonnegative");
     // Parsed only to fail fast on a broken configuration; this node holds no
     // policy of its own.
     (void)talos::config::ParseRobotConfig(config_path);
+    // --describe builds the node for real and prints what its constructor
+    // registered. The loop is the only difference: a simulated loop's channels
+    // live in this process, so no shared memory, no hardware and no network is
+    // touched, and the launcher can ask what a node is without starting a
+    // robot. Describing from the same constructor is the point -- a topology
+    // written down a second time is a topology to forget to update.
+    if (describe) {
+      talos::event::SimulationEnvironment environment;
+      talos::event::SimulatedEventLoop<> loop{environment};
+      talos::driver_station::DriverStationNode node{loop};
+      std::printf("%s", talos::introspect::DescribeToJson(
+                            talos::introspect::DescribeManifest(
+                                kNodeName, kNodeTarget, loop.manifest()))
+                            .c_str());
+      return 0;
+    }
     if (!replay_path.empty()) {
       talos::event::log::LogReader reader{replay_path};
       talos::event::ReplayEventLoop<> loop{reader};
@@ -60,6 +96,16 @@ int main(int argc, char** argv) {
     talos::driver_station::DriverStationNode node{loop};
     node.Start(loop.monotonic_now());
     talos::process::InstallStopHandlers();
+    // Publishes this node's topics and activity into the live registry, so
+    // Studio and any agent can see what is running without being told.
+    // Declared after the loop: reverse destruction order joins its thread
+    // before the counters it samples are destroyed.
+    talos::introspect::Reporter reporter{loop,
+                                         {.name = kNodeName,
+                                          .target = kNodeTarget,
+                                          .session_id = session_id,
+                                          .simulation = simulation}};
+
     std::jthread stopper{[&](std::stop_token stop) {
       while (!stop.stop_requested()) {
         if (talos::process::stop_requested.load() && loop.running()) {

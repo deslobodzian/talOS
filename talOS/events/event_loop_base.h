@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -35,6 +36,36 @@ enum class SendStatus : std::uint32_t {
 class RegistrationError : public std::logic_error {
  public:
   using std::logic_error::logic_error;
+};
+
+// Live activity for one event source, published for anything outside the loop
+// that wants to know what the program is actually doing: a heartbeat, a
+// telemetry viewer, an agent asking which topics are moving.
+//
+// Separate from LoopMetrics, and not a substitute for it. LoopMetrics keeps
+// whole latency distributions in plain arrays for the owning thread to report
+// at the end of a run; these are lock-free atomics precisely so another thread
+// can read them mid-run without a data race. Six relaxed stores per dispatch,
+// no clock reads beyond the ones the dispatch already made -- cheap enough to
+// leave on in a 1 kHz loop, which is the point: observability that has to be
+// switched on is observability you do not have when you need it.
+struct SourceCounters {
+  // Timer or watcher dispatches, messages published by a sender, values
+  // actually received by a fetcher. In each case: how often this source did
+  // its job.
+  std::atomic<std::uint64_t> events{0};
+
+  // Messages the transport lapped before this source read them, plus publishes
+  // the transport refused.
+  std::atomic<std::uint64_t> dropped{0};
+
+  // Last transport sequence this source observed, which is what makes a
+  // subscriber's lag measurable against its publisher.
+  std::atomic<std::uint64_t> sequence{0};
+
+  std::atomic<std::int64_t> last_now_ns{0};
+  std::atomic<std::int64_t> last_latency_ns{0};
+  std::atomic<std::int64_t> max_latency_ns{0};
 };
 
 // Shared machinery for every loop: source registration, id assignment, the
@@ -80,6 +111,16 @@ class EventLoopBase {
   Metrics& metrics() { return metrics_; }
   const Metrics& metrics() const { return metrics_; }
   const Manifest& manifest() const { return manifest_; }
+
+  // Non-null from begin_run() until destruction, and never reallocated, so a
+  // reporting thread may hold the pointer for the life of the run. Null before
+  // the run starts, because registration is still open and the array is sized
+  // from the finished manifest.
+  const SourceCounters* source_counters() const { return counters_.get(); }
+
+  std::size_t source_counter_count() const {
+    return counters_ ? manifest_.size() : 0;
+  }
 
   // The only clock a handler may read. Frozen for the duration of a dispatch
   // so that two reads inside one callback cannot disagree, which is what makes
@@ -144,6 +185,17 @@ class EventLoopBase {
     recorder_.send(context_, id, bytes,
                    static_cast<std::uint32_t>(outcome.status),
                    outcome.sequence);
+
+    if (SourceCounters* counters = counter(id)) {
+      if (outcome.status == SendStatus::OK) {
+        counters->events.fetch_add(1, std::memory_order_relaxed);
+        counters->sequence.store(outcome.sequence, std::memory_order_relaxed);
+        counters->last_now_ns.store(context_.now.nanos(),
+                                    std::memory_order_relaxed);
+      } else {
+        counters->dropped.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
     return outcome.status == SendStatus::OK;
   }
 
@@ -158,6 +210,20 @@ class EventLoopBase {
                     has_value ? std::span<const std::byte>{destination}
                               : std::span<const std::byte>{},
                     result.sequence, result.dropped);
+
+    if (SourceCounters* counters = counter(id)) {
+      // An empty fetch is not an event: a handler that samples a topic every
+      // cycle would otherwise report traffic that never arrived.
+      if (has_value) {
+        counters->events.fetch_add(1, std::memory_order_relaxed);
+        counters->sequence.store(result.sequence, std::memory_order_relaxed);
+        counters->last_now_ns.store(context_.now.nanos(),
+                                    std::memory_order_relaxed);
+      }
+      if (result.dropped != 0) {
+        counters->dropped.fetch_add(result.dropped, std::memory_order_relaxed);
+      }
+    }
 
     return has_value;
   }
@@ -278,6 +344,12 @@ class EventLoopBase {
     }
     const MonotonicTime start = start_time_;
     registration_closed_ = true;
+
+    // Sized from the finished manifest and never resized, so the pointer a
+    // reporting thread reads stays valid for the whole run. std::atomic is not
+    // movable, which rules out growing a vector of these as sources register.
+    counters_ = std::make_unique<SourceCounters[]>(manifest_.size());
+
     running_ = true;
     dispatch_index_ = 0;
     context_ = Context{};
@@ -346,6 +418,21 @@ class EventLoopBase {
     context_ = context;
     recorder_.dispatch(context, payload);
 
+    if (SourceCounters* counters = counter(context.source_id)) {
+      const std::int64_t latency = context.latency().count();
+      counters->events.fetch_add(1, std::memory_order_relaxed);
+      counters->sequence.store(context.sequence, std::memory_order_relaxed);
+      counters->last_now_ns.store(context.now.nanos(),
+                                  std::memory_order_relaxed);
+      counters->last_latency_ns.store(latency, std::memory_order_relaxed);
+      if (latency > counters->max_latency_ns.load(std::memory_order_relaxed)) {
+        counters->max_latency_ns.store(latency, std::memory_order_relaxed);
+      }
+      if (context.dropped != 0) {
+        counters->dropped.fetch_add(context.dropped, std::memory_order_relaxed);
+      }
+    }
+
     const Thunk& callback = sources_[context.source_id].callback;
 
     // The clock reads exist only when a metrics policy wants them, so an
@@ -409,8 +496,19 @@ class EventLoopBase {
     return registration.id;
   }
 
+  // Null until begin_run(), and bounds-checked because record_operation()
+  // passes ids that belong to the source space while INTERNAL_POLL_TIMER_ID
+  // deliberately does not.
+  SourceCounters* counter(std::uint16_t id) {
+    if (!counters_ || id >= manifest_.size()) {
+      return nullptr;
+    }
+    return &counters_[id];
+  }
+
   std::vector<Source> sources_;
   Manifest manifest_;
+  std::unique_ptr<SourceCounters[]> counters_;
   Recorder recorder_{};
   Metrics metrics_{};
 

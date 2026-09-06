@@ -15,8 +15,8 @@ void signal_handler(int) { stop = 1; }
 int main(int argc, char** argv) try {
   std::signal(SIGINT, signal_handler);
   std::signal(SIGTERM, signal_handler);
-  RTMSQueue queue(argc > 1 ? argv[1] : "/talos_studio", studio::slot_bytes, 8,
-                  studio::slot_count,
+  RTMSQueue queue(argc > 1 ? argv[1] : "/talos/telemetry", studio::slot_bytes,
+                  8, studio::slot_count,
                   {OverflowPolicy::DROP_NEWEST, ReadMode::SEQUENCE});
   std::array<std::byte, studio::slot_bytes> slot{};
   auto next = std::chrono::steady_clock::now();

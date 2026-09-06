@@ -25,7 +25,10 @@
 // at a control-loop topic, which uses OVERWRITE_OLDEST.
 namespace talos::telemetry {
 
-inline constexpr const char* kStudioTopic = "/talos_studio";
+// The reserved `talos` owner because this feed belongs to no subsystem, and
+// role `telemetry` because it is an observation feed: recording and display
+// only, never an input to a control path.
+inline constexpr const char* kStudioTopic = "/talos/telemetry";
 
 struct TelemetryConfig {
   uint32_t period_us{10000};  // 100 Hz. Telemetry, not a control loop.

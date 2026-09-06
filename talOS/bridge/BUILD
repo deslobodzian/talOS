@@ -10,6 +10,9 @@ cc_library(
     hdrs = ["node.h"],
     deps = [
         "//talOS/hardware:hardware",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:names",
+        "//talOS/introspection:registry",
         "//talOS/protocol:protocol",
         "//talOS/configuration:configuration",
         "//talOS/ipc:ipc",
@@ -21,14 +24,24 @@ cc_library(
 cc_binary(
     name = "node",
     srcs = ["main.cc"],
-    deps = [":node_lib"],
+    # The default --config path, so `bazel run` (and `--describe` in
+    # particular) works without being told where the robot lives.
+    data = ["//2026-robot/main_processor/configuration:robot.toml"],
+    deps = [
+        ":node_lib",
+        "//talOS/introspection:describe",
+    ],
     visibility = ["//visibility:public"],
 )
 
 cc_binary(
     name = "hardware_node",
     srcs = ["main.cc"],
-    deps = [":node_lib"],
+    data = ["//2026-robot/main_processor/configuration:robot.toml"],
+    deps = [
+        ":node_lib",
+        "//talOS/introspection:describe",
+    ],
     visibility = ["//visibility:public"],
 )
 
@@ -38,6 +51,8 @@ cc_test(
     srcs = ["hardware_node_test.cc"],
     deps = [
         ":node_lib",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:names",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],

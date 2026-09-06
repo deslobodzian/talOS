@@ -3,15 +3,19 @@
 #include <string>
 
 #include "node.h"
+#include "talOS/introspection/describe.h"
 
 int main(int argc, char** argv) {
   try {
-    std::string config_path = "2026-robot/main_processor/configuration/robot.toml";
+    std::string config_path =
+        "2026-robot/main_processor/configuration/robot.toml";
     std::string remote_ip = "127.0.0.1";
     uint16_t remote_port = 5802;
     uint16_t local_port = 5803;
     int duration_s = 0;
     bool simulation = false;
+    uint64_t session_id = 0;
+    bool describe = false;
 
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
@@ -27,21 +31,42 @@ int main(int argc, char** argv) {
         duration_s = std::stoi(argv[++i]);
       } else if (arg == "--sim") {
         simulation = true;
+      } else if (arg == "--describe") {
+        describe = true;
       } else if (arg == "--log" && i + 1 < argc) {
         ++i;  // Optional log path
       } else if (arg == "--session-id" && i + 1 < argc) {
-        ++i;  // Session ID
+        session_id = std::stoull(argv[++i]);
       } else {
         throw std::invalid_argument(
-            "usage: hardware_node [--config PATH] [--remote IP] [--duration-s N] [--sim] [--log PATH] [--session-id ID]");
+            "usage: hardware_node [--config PATH] [--remote IP] "
+            "[--duration-s N] [--sim] [--log PATH] [--session-id ID] "
+            "[--describe]");
       }
     }
 
     auto robot_config = talos::config::ParseRobotConfig(config_path);
-    talos::hardware::HardwareNode node{std::move(robot_config), remote_ip,
-                                       remote_port, local_port, simulation};
+    talos::hardware::HardwareNode node{std::move(robot_config),
+                                       remote_ip,
+                                       remote_port,
+                                       local_port,
+                                       simulation,
+                                       session_id};
+
+    // --describe answers out of the constructor alone: no socket, no shared
+    // memory, no registry slot, nothing the real node holds. That is what lets
+    // the launcher ask every binary in a config what it would connect to
+    // before it has started any of them, and refuse a graph whose ends do not
+    // meet rather than discover it from a robot that does not move.
+    if (describe) {
+      std::fputs(talos::introspect::DescribeToJson(node.Describe()).c_str(),
+                 stdout);
+      return 0;
+    }
+
     if (!node.Open()) {
-      throw std::runtime_error("failed to open hardware node network/ipc resources");
+      throw std::runtime_error(
+          "failed to open hardware node network/ipc resources");
     }
 
     return node.Run(duration_s);

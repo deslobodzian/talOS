@@ -5,36 +5,47 @@
 #include <string>
 #include <thread>
 
+#include "2026-robot/main_processor/shooter/node.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/realtime_event_loop.h"
 #include "talOS/events/replay_event_loop.h"
-#include "2026-robot/main_processor/shooter/node.h"
+#include "talOS/events/simulated_event_loop.h"
+#include "talOS/introspection/describe.h"
+#include "talOS/introspection/reporter.h"
 
 namespace {
 std::atomic<bool> stop_requested{false};
 static_assert(std::atomic<bool>::is_always_lock_free);
-void RequestStop(int) {
-  stop_requested.store(true, std::memory_order_relaxed);
-}
+void RequestStop(int) { stop_requested.store(true, std::memory_order_relaxed); }
 void InstallStopHandlers() {
   std::signal(SIGINT, RequestStop);
   std::signal(SIGTERM, RequestStop);
 }
+
+// This node's identity, written once. `--describe` and the live registry row
+// have to name the same node and the same build target, or a viewer cannot tell
+// a graph that changed from a graph it is reading two different names for.
+constexpr const char* kNodeName = "shooter";
+constexpr const char* kNodeTarget = "//2026-robot/main_processor/shooter:node";
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
     bool simulation = false;
+    bool describe = false;
     std::string log_path = "/tmp/shooter.tlog", replay_path;
-    std::string config_path = "2026-robot/main_processor/configuration/robot.toml";
+    std::string config_path =
+        "2026-robot/main_processor/configuration/robot.toml";
     int duration_s = 0;
     uint64_t session_id = 0;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       if (arg == "--sim")
         simulation = true;
+      else if (arg == "--describe")
+        describe = true;
       else if (arg == "--log" && i + 1 < argc)
         log_path = argv[++i];
       else if (arg == "--session-id" && i + 1 < argc)
@@ -47,8 +58,8 @@ int main(int argc, char** argv) {
         duration_s = std::stoi(argv[++i]);
       else
         throw std::invalid_argument(
-            "usage: node [--sim] [--duration-s N] [--log PATH] [--session-id ID] [--config PATH] [--replay "
-            "PATH]");
+            "usage: node [--sim] [--describe] [--duration-s N] [--log PATH] "
+            "[--session-id ID] [--config PATH] [--replay PATH]");
     }
     if (duration_s < 0)
       throw std::invalid_argument("duration must be nonnegative");
@@ -57,8 +68,25 @@ int main(int argc, char** argv) {
       robot_config.hardware.commissioned = true;
     }
     const auto* dev_ptr = robot_config.GetDevices("shooter");
-    talos::hardware::Devices devices = dev_ptr ? *dev_ptr : talos::hardware::Devices{};
+    talos::hardware::Devices devices =
+        dev_ptr ? *dev_ptr : talos::hardware::Devices{};
     auto config = robot_config.hardware;
+    // --describe builds the node for real and prints what its constructor
+    // registered. The loop is the only difference: a simulated loop's channels
+    // live in this process, so no shared memory, no hardware and no network is
+    // touched, and the launcher can ask what a node is without starting a
+    // robot. Describing from the same constructor is the point -- a topology
+    // written down a second time is a topology to forget to update.
+    if (describe) {
+      talos::event::SimulationEnvironment environment;
+      talos::event::SimulatedEventLoop<> loop{environment};
+      talos::shooter::ShooterNode node{loop, config, devices};
+      std::printf("%s", talos::introspect::DescribeToJson(
+                            talos::introspect::DescribeManifest(
+                                kNodeName, kNodeTarget, loop.manifest()))
+                            .c_str());
+      return 0;
+    }
     if (!replay_path.empty()) {
       talos::event::log::LogReader reader{replay_path};
       talos::event::ReplayEventLoop<> loop{reader};
@@ -81,6 +109,16 @@ int main(int argc, char** argv) {
     node.Start(loop.monotonic_now() +
                std::chrono::microseconds{config.period_us});
     InstallStopHandlers();
+    // Publishes this node's topics and activity into the live registry, so
+    // Studio and any agent can see what is running without being told.
+    // Declared after the loop: reverse destruction order joins its thread
+    // before the counters it samples are destroyed.
+    talos::introspect::Reporter reporter{loop,
+                                         {.name = kNodeName,
+                                          .target = kNodeTarget,
+                                          .session_id = session_id,
+                                          .simulation = simulation}};
+
     std::jthread stopper{[&](std::stop_token stop) {
       while (!stop.stop_requested()) {
         if (stop_requested.load() && loop.running()) {

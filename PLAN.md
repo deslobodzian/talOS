@@ -4,6 +4,8 @@
 it in. It is written for an implementing agent who has not seen this repository
 before. Read `talOS/events/README.md`, `talOS/hardware/README.md` and
 `2026-robot/main_processor/drivetrain/README.md` first; they describe what exists today.
+Every topic name below is governed by `talOS/NAMING.md`; consult it rather than
+inferring the rules from the examples here.
 
 Every step below has an acceptance test. Do not mark a step done without it.
 
@@ -41,14 +43,14 @@ class ShooterNode {
   ShooterNode(Loop& loop, const hardware::Devices& mine)
       : mine_{mine} {
     event::watch<Packet, &ShooterNode::OnState>(loop, kHwStateTopic, this);
-    event::watch<ShooterTarget, &ShooterNode::OnTarget>(loop, "/shooter/tgt",
+    event::watch<ShooterTarget, &ShooterNode::OnTarget>(loop, "/shooter/target",
                                                         this);
-    request_ = event::make_sender<Packet>(loop, "/hw/req/shooter");
+    request_ = event::make_sender<Packet>(loop, "/hw/request/shooter");
     state_ = event::make_sender<ShooterState>(loop, "/shooter/state");
     timer_ = event::make_timer<&ShooterNode::Tick>(loop, "shooter", this);
   }
   // ... Tick() computes a flywheel velocity request and publishes both
-  // /hw/req/shooter (actuator request) and /shooter/state (semantic state).
+  // /hw/request/shooter (actuator request) and /shooter/state (semantic state).
 };
 ```
 
@@ -82,25 +84,25 @@ robot.toml ── parsed once on the companion, the single source of truth
 │  • republishes  │                   └──────────────────────────────┘
 │    /hw/state    │
 │  • merges       │
-│    /hw/req/*    │
+│    /hw/request/*│
 └────────┬────────┘
          │ /hw/state (one message, every device on the robot)
-         ├──────────────────────┬──────────────────────┐
-         ▼                      ▼                      ▼
-  drivetrain node         shooter node           (more subsystems)
-   /hw/req/drive           /hw/req/shooter
-   /drivetrain/state       /shooter/state
-         │                      │
-         └──────────┬───────────┘
-                    ▼
-             state estimation node  ── owns no hardware
-                 /odometry
+         ├────────────────────────┬──────────────────────┐
+         ▼                        ▼                      ▼
+  drivetrain node           shooter node           (more subsystems)
+   /hw/request/drivetrain    /hw/request/shooter
+   /drivetrain/state         /shooter/state
+         │                        │
+         └───────────┬────────────┘
+                     ▼
+              state estimation node  ── owns no hardware
+                  /odometry/state
 ```
 
 `hardware_node` replaces today's `2026-robot/main_processor/drivetrain/bridge.cc`. It is the only
-process that talks to the RIO and the only publisher of `/hw/cmd`, because the
-gateway validates and applies a command as one whole-robot transaction
-(`talOS/hardware/gateway.cc:53`). Merging is not arbitration: device ownership
+process that talks to the RIO and the only publisher of `/hw/command`, because
+the gateway validates and applies a command as one whole-robot transaction
+(`talOS/hardware/gateway.cc:119`). Merging is not arbitration: device ownership
 is settled at parse time, and two subsystems claiming one device is a config
 error, never a runtime race.
 
@@ -177,13 +179,32 @@ config it did not write:
 ## 4. Platform constraints to respect
 
 - **macOS caps POSIX shared-memory names at 31 characters including the leading
-  slash** (`PSHMNAMLEN`). Topic names are `shm_open` names. There is currently
-  **no guard** for this — a long topic name fails at runtime on macOS and works
-  on Linux. Step 0 adds the guard.
-  Budget accordingly: `/hw/req/drivetrain` is 18, `/drivetrain/state` is 17.
-  Prefer short, abbreviated topic names over descriptive ones.
-- `talOS/protocol/frame.h` caps a UDP payload at `kMaxPayloadSize = 1200`
-  bytes. A full robot config will not fit in one datagram; step 3 chunks it.
+  slash** (`PSHMNAMLEN`), and `rtms::ValidatePath` (`talOS/rtms/rtms.cc:24`)
+  throws above 30 after the slash, so an over-long name fails at construction
+  on either platform rather than at runtime on one of them.
+- **A topic name is not the shared-memory name.** POSIX allows exactly one
+  slash in an shm name, at the front, and glibc returns `EINVAL` for an
+  interior one; macOS's flat namespace accepts it. Every topic here has two or
+  three segments, so `ShmObjectName` (`talOS/memory/shared_memory_ptr.h`) maps
+  the interior slashes to `.` at the one boundary that opens a segment. The
+  separator is `.` and not `_` because segments may contain underscores, and
+  `/hw/state/driver_station` colliding with `/hw/state_driver/station` would
+  join two unrelated streams while both ends reported success. Length is
+  preserved, so the cap above means the same thing on both sides.
+  Budget accordingly: `/hw/request/drivetrain` is 22, `/drivetrain/state` is
+  17, and the longest name on the robot, `/drivetrain/target/teleop`, is 25 —
+  six characters of headroom. `naming::kMaxTopicBytes` is set to the same 31
+  and `kMaxSegmentBytes` to 24, so the linter refuses an over-long name before
+  a process runs; it was briefly the event loop's 63, which meant a name could
+  lint clean and then throw inside a node's constructor. The room is not in
+  abbreviating —
+  `talOS/NAMING.md` rejects `tgt`, `cmd` and `req`, because the long form stays
+  available to whoever writes the other end — but in segment count and owner
+  length: a four-segment `/<owner>/target/teleop` leaves the owner 16
+  characters.
+- `talOS/protocol/frame.h` caps a UDP payload at `protocol::kMaxPayloadSize`,
+  sized so a whole frame fits one unfragmented datagram on a 1500-byte MTU. A
+  full robot config will not fit in one; step 3 chunks it.
 - `MAX_READERS = 8` per RTMS topic (`talOS/rtms/rtms.h`). `/hw/state` will have
   one reader per subsystem node plus the monitor. If a robot needs more than
   eight, that is a real design change, not a constant bump — say so rather than
@@ -196,14 +217,17 @@ config it did not write:
 | Topic | Publisher | Payload | Read mode |
 |---|---|---|---|
 | `/hw/state` | `hardware_node` | `Packet` (encoded `hardware::State`) | LATEST |
-| `/hw/cmd` | `hardware_node` | `Packet` (encoded `hardware::Command`) | LATEST |
-| `/hw/req/<sub>` | subsystem node `<sub>` | `Packet` (partial `Command`) | LATEST |
+| `/hw/command` | `hardware_node` | `Packet` (encoded `hardware::Command`) | LATEST |
+| `/hw/request/<sub>` | subsystem node `<sub>` | `Packet` (partial `Command`) | LATEST |
 | `/<sub>/state` | subsystem node `<sub>` | subsystem-defined struct | SEQUENCE |
-| `/<sub>/tgt` | whoever commands it | subsystem-defined struct | LATEST |
+| `/<sub>/target` | the subsystem's arbiter | subsystem-defined struct | LATEST |
 
 Rules:
 
-- **Exactly one publisher per topic.** RTMS is single-producer.
+- **Exactly one publisher per topic.** RTMS is single-producer. Fan-in is
+  spelled with an arbiter and a prefix family: each producer publishes
+  `/<sub>/target/<producer>`, one arbiter reads them all, and only the winner
+  reaches `/<sub>/target`.
 - Hardware topics use LATEST: a stale sample is worthless, and a node must never
   fall behind on them.
 - Semantic state topics default to SEQUENCE so a consumer sees every sample.
@@ -211,6 +235,11 @@ Rules:
 - Every message carries what a consumer needs to judge staleness. Follow
   `ChassisTarget`: an `issued_ns` from the publisher's loop clock and an
   `enabled` flag. Consumers must treat a stale message as absent, not as zero.
+
+The launcher probes every binary with `--describe` and lints the assembled graph
+before it spawns anything, so two spellings of one topic fail the launch with
+both named, rather than becoming a publisher nobody reads for the length of a
+match.
 
 ---
 
@@ -340,7 +369,7 @@ Rules for the parser:
 ### Step 3 — config push, and the RIO becomes final
 - New frame kinds in `talOS/protocol/types.h`: `kHardwareConfig = 22`,
   `kHardwareConfigAck = 23`.
-- Chunked because of the 1200-byte payload cap: each chunk carries
+- Chunked because of `protocol::kMaxPayloadSize`: each chunk carries
   `(index, count, config_id)`; the RIO buffers, and applies only when all chunks
   have arrived and the assembled CRC matches. A partial config is discarded, and
   never applied.
@@ -358,8 +387,8 @@ Rules for the parser:
 
 ### Step 4 — `hardware_node`
 - Replace `2026-robot/main_processor/drivetrain/bridge.cc` with `talOS/bridge/node.cc`: pushes
-  config, republishes `/hw/state`, subscribes every `/hw/req/<sub>`, merges into
-  one `/hw/cmd`.
+  config, republishes `/hw/state`, subscribes every `/hw/request/<sub>`, merges
+  into one `/hw/command`.
 - Merge rules: a device nobody claimed, or whose owner's request is older than
   `command_timeout_us`, is neutral. Requests are merged in a fixed order
   (subsystem name) so the output is a deterministic function of the inputs.
@@ -369,7 +398,7 @@ Rules for the parser:
 
 ### Step 5 — convert the drivetrain
 - `DrivetrainNode` takes its `hardware::Devices` from config, subscribes
-  `/hw/state`, publishes `/hw/req/drive` and a new `/drivetrain/state`.
+  `/hw/state`, publishes `/hw/request/drivetrain` and a new `/drivetrain/state`.
 - Delete `talOS/hardware/swerve_config.h`.
 - **Accept:** `tools/test_drivetrain.py` and `--wpilib` both pass unchanged in
   behaviour; the drivetrain still replays with `diverged=0`.
@@ -385,7 +414,7 @@ Rules for the parser:
 
 ### Step 7 — a consumer node
 - A state-estimation node that declares no hardware and subscribes to
-  `/drivetrain/state` and `/shooter/state`, publishing `/odometry`.
+  `/drivetrain/state` and `/shooter/state`, publishing `/odometry/state`.
 - **Accept:** it builds and replays without any hardware config entry at all.
 
 ### Step 8 — the launcher
@@ -404,7 +433,7 @@ Rules for the parser:
 
 1. Add `[subsystems.<name>]` to `robot.toml` with its motors and sensors.
 2. Write `talOS/<name>/node.h`: subscribe `/hw/state`, publish
-   `/hw/req/<name>` and `/<name>/state`, put the control logic in a timer.
+   `/hw/request/<name>` and `/<name>/state`, put the control logic in a timer.
 3. Add it to the launcher's node list (same file).
 4. Run. Nothing else changes.
 

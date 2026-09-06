@@ -2,212 +2,25 @@ import {createServer} from 'node:http';
 import {pathToFileURL} from 'node:url';
 import {WebSocket, WebSocketServer} from 'ws';
 
-import {decode, JitterBuffer, type Snapshot, Timeline} from '../src/core';
+import {decode, JitterBuffer, Timeline} from '../src/core';
+import {
+  type DeclaredGraph,
+  declaredStatus,
+  declaredUrl,
+  MAX_DECLARED_BYTES,
+  MAX_SYSTEM_BYTES,
+  parseDeclaredGraph,
+  parseSystemGraph,
+  type SystemGraph,
+} from '../src/system';
 
-export class RpcFault extends Error {
-  constructor(public code: number, message: string) {
-    super(message);
-  }
-}
-type Params = Record<string, unknown>;
-const invalid = (message: string): never => {
-  throw new RpcFault(-32602, message);
-};
-function timestamp(value: unknown): bigint {
-  if (typeof value !== 'string' || !/^\d+$/.test(value))
-    return invalid('timestamp_ns must be a decimal string');
-  const parsed = BigInt(value);
-  if (parsed > 18446744073709551615n)
-    return invalid('timestamp_ns exceeds uint64');
-  return parsed;
-}
-function topicValue(frame: Snapshot, topic: string): unknown {
-  if (Object.hasOwn(frame.channels, topic)) return frame.channels[topic];
-  let value: unknown = frame;
-  for (const part of topic.split('.')) {
-    if (['__proto__', 'prototype', 'constructor'].includes(part) || !value ||
-        typeof value !== 'object' || !Object.hasOwn(value, part))
-      return undefined;
-    value = (value as Record<string, unknown>)[part];
-  }
-  return value;
-}
-function topicList(value: unknown): string[] {
-  if (!Array.isArray(value) || value.some(t => typeof t !== 'string') ||
-      value.length > 256)
-    return invalid('topics must be an array of at most 256 strings');
-  return value as string[];
-}
+import {handleRpc, type RpcContext} from './rpc';
 
-export function dispatch(
-    timeline: Timeline, method: string, params: Params = {}): unknown {
-  if (method === 'get_schema_tree') {
-    const topics: Record<string, string> = {};
-    function walk(value: unknown, prefix: string) {
-      if (value !== null && typeof value === 'object') {
-        for (const [key, child] of Object.entries(value))
-          walk(child, prefix ? `${prefix}.${key}` : key);
-      } else
-        topics[prefix] = typeof value;
-    }
-    for (const frame of timeline.frames) {
-      walk(frame, '');
-      for (const name of Object.keys(frame.channels)) topics[name] = 'number';
-    }
-    return {
-      topics,
-      timestamp_bounds: timeline.bounds(),
-      frames: timeline.frames.length,
-      timestamp_encoding: 'uint64 decimal string',
-      snapshot_policy: 'exact'
-    };
-  }
-  if (method === 'query_state_at') {
-    const t = timestamp(params.timestamp_ns);
-    if (params.mode !== undefined && params.mode !== 'exact' &&
-        params.mode !== 'at_or_before')
-      invalid('mode must be exact or at_or_before');
-    const frame = timeline.at(t);
-    if (!frame ||
-        (params.mode !== 'at_or_before' && BigInt(frame.timestamp_ns) !== t))
-      throw new RpcFault(-32001, 'No retained sample at requested timestamp');
-    if (params.topics === undefined) return frame;
-    const values: Record<string, unknown> = {};
-    for (const topic of topicList(params.topics)) {
-      const value = topicValue(frame, topic);
-      if (value === undefined) invalid(`Unknown topic: ${topic}`);
-      Object.defineProperty(values, topic, {value, enumerable: true});
-    }
-    return {
-      timestamp_ns: frame.timestamp_ns,
-      sequence_id: frame.sequence_id,
-      topics: values
-    };
-  }
-  if (method === 'scan_channel_events') {
-    if (typeof params.topic !== 'string') invalid('topic is required');
-    const topic = params.topic as string;
-    const condition = params.condition as Params | undefined;
-    if (!condition || typeof condition !== 'object')
-      invalid('condition must be an object');
-    const op = condition!.op;
-    const ops =
-        ['gt', 'gte', 'lt', 'lte', 'eq', 'ne', 'changed', 'rising', 'falling'];
-    if (typeof op !== 'string' || !ops.includes(op))
-      invalid(`condition.op must be ${ops.join(', ')}`);
-    if (['gt', 'gte', 'lt', 'lte'].includes(op as string) &&
-        (typeof condition!.value !== 'number' ||
-         !Number.isFinite(condition!.value)))
-      invalid('Numeric comparison requires finite condition.value');
-    if (['eq', 'ne'].includes(op as string) &&
-        !['number', 'boolean', 'string'].includes(typeof condition!.value))
-      invalid('Equality requires scalar condition.value');
-    const start =
-        params.start_ns === undefined ? null : timestamp(params.start_ns);
-    const end = params.end_ns === undefined ? null : timestamp(params.end_ns);
-    if (start !== null && end !== null && start > end)
-      invalid('start_ns must be <= end_ns');
-    const ranges: {start_ns: string; end_ns: string; samples: number}[] = [];
-    let active: typeof ranges[number]|null = null;
-    let previous: unknown;
-    let seen = false;
-    let found = false;
-    for (const frame of timeline.frames) {
-      const t = BigInt(frame.timestamp_ns);
-      const value = topicValue(frame, topic);
-      if (value !== undefined) found = true;
-      const inBounds =
-          (start === null || t >= start) && (end === null || t <= end);
-      let matches = false;
-      const limit = condition!.value;
-      if (value !== undefined && inBounds) {
-        switch (op) {
-          case 'gt':
-            matches = typeof value === 'number' && value > (limit as number);
-            break;
-          case 'gte':
-            matches = typeof value === 'number' && value >= (limit as number);
-            break;
-          case 'lt':
-            matches = typeof value === 'number' && value < (limit as number);
-            break;
-          case 'lte':
-            matches = typeof value === 'number' && value <= (limit as number);
-            break;
-          case 'eq':
-            matches = value === limit;
-            break;
-          case 'ne':
-            matches = value !== limit;
-            break;
-          case 'changed':
-            matches = seen && value !== previous;
-            break;
-          case 'rising':
-            matches = seen && !previous && Boolean(value);
-            break;
-          case 'falling':
-            matches = seen && Boolean(previous) && !value;
-            break;
-        }
-      }
-      if (matches) {
-        if (!active) {
-          active = {
-            start_ns: frame.timestamp_ns,
-            end_ns: frame.timestamp_ns,
-            samples: 0
-          };
-          ranges.push(active);
-        }
-        active.end_ns = frame.timestamp_ns;
-        active.samples++;
-      } else
-        active = null;
-      previous = value;
-      seen = value !== undefined;
-    }
-    if (!found && timeline.frames.length) invalid(`Unknown topic: ${topic}`);
-    return {topic, condition, ranges, timestamp_bounds: timeline.bounds()};
-  }
-  throw new RpcFault(-32601, 'Method not found');
-}
-
-export function handleRpc(timeline: Timeline, input: unknown): unknown|
-    undefined {
-  if (!input || typeof input !== 'object' || Array.isArray(input))
-    return {
-      jsonrpc: '2.0',
-      id: null,
-      error: {code: -32600, message: 'Invalid Request'}
-    };
-  const request = input as Params;
-  const id = request.id ?? null;
-  if (request.jsonrpc !== '2.0' || typeof request.method !== 'string' ||
-      (request.id !== undefined && request.id !== null &&
-       typeof request.id !== 'number' && typeof request.id !== 'string') ||
-      (request.params !== undefined &&
-       (!request.params || typeof request.params !== 'object' ||
-        Array.isArray(request.params))))
-    return {
-      jsonrpc: '2.0',
-      id: null,
-      error: {code: -32600, message: 'Invalid Request'}
-    };
-  try {
-    const result = dispatch(timeline, request.method, request.params as Params);
-    return request.id === undefined ? undefined : {jsonrpc: '2.0', id, result};
-  } catch (e) {
-    return request.id === undefined ? undefined : {
-      jsonrpc: '2.0',
-      id,
-      error: {
-        code: e instanceof RpcFault ? e.code : -32603,
-        message: e instanceof RpcFault ? e.message : 'Internal error'
-      }
-    };
-  }
-}
+// The query surface itself lives in ./rpc so the browser can run it too. These
+// re-exports keep the older import path working, and keep `agent/server` the
+// one name a caller has to know.
+export {dispatch, handleRpc, RPC_METHODS, RpcFault} from './rpc';
+export type {Params, RpcContext} from './rpc';
 
 export function startAgent(
     port = Number(process.env.AGENT_PORT ?? 5802),
@@ -217,6 +30,77 @@ export function startAgent(
       !!host && /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host);
   const timeline = new Timeline();
   const jitter = new JitterBuffer(10);
+
+  // Two graphs, because a rate needs a previous sample. The bridge refreshes
+  // a few times a second, so `previousSystem` is the sample just before this
+  // one rather than an arbitrarily old one.
+  let system: SystemGraph|null = null;
+  let previousSystem: SystemGraph|null = null;
+  const graphs = {received: 0, invalid: 0};
+
+  // What the launcher declared before it spawned anything. Fetched over HTTP
+  // from the same origin as the telemetry socket rather than pushed: the
+  // launcher writes it once, before the session starts, so it does not change
+  // while one runs.
+  let declared: DeclaredGraph|null = null;
+  let declaredError = '';
+
+  const context = (): RpcContext =>
+      ({timeline, system, previousSystem, declared});
+
+  // A malformed document is reported and dropped, keeping the last good graph:
+  // the same rule the live graph follows, for the same reason.
+  const ingestDeclaredGraph = (text: string) => {
+    try {
+      declared = parseDeclaredGraph(text);
+      declaredError = '';
+    } catch (e) {
+      declaredError = String(e);
+    }
+  };
+
+  // A 404 is the ordinary answer -- `--declared` is optional -- and so is a
+  // refused connection, which only repeats what the socket already reports.
+  // Neither is recorded as an error, so `get_declared_graph` keeps saying "no
+  // declared graph received yet" rather than inventing a reason.
+  const fetchDeclaredGraph = async () => {
+    const target = declaredUrl(upstream);
+    if (!target) return;
+    try {
+      const response = await fetch(target, {cache: 'no-store'});
+      if (response.status === 404) return;
+      if (!response.ok) {
+        declaredError = `Declared graph unavailable: HTTP ${response.status}`;
+        return;
+      }
+      // Advisory, and checked before the body is read rather than after: the
+      // parser enforces the real bound, but there is no reason to hold a
+      // gigabyte in memory first to find out it was too big.
+      const declaredSize = Number(response.headers.get('content-length') ?? 0);
+      if (declaredSize > MAX_DECLARED_BYTES) {
+        declaredError = 'Invalid declared graph: document too large';
+        return;
+      }
+      ingestDeclaredGraph(await response.text());
+    } catch {
+      // Unreachable bridge; the upstream socket is the thing that reports that.
+    }
+  };
+
+  const ingestSystemGraph = (text: string) => {
+    try {
+      const parsed = parseSystemGraph(text);
+      previousSystem = system;
+      system = parsed;
+      graphs.received++;
+    } catch {
+      // A malformed document is counted and dropped. Blanking the last good
+      // graph would turn one bad frame into "nothing is running", which is a
+      // worse answer than a slightly stale one.
+      graphs.invalid++;
+    }
+  };
+
   const parse = (text: string) => {
     try {
       const input: unknown = JSON.parse(text);
@@ -227,11 +111,14 @@ export function startAgent(
             id: null,
             error: {code: -32600, message: 'Empty batch'}
           };
-        const results = input.map(req => handleRpc(timeline, req))
+        // One context for the whole batch, so every request in it sees the
+        // same system state.
+        const shared = context();
+        const results = input.map(req => handleRpc(shared, req))
                             .filter(value => value !== undefined);
         return results.length ? results : undefined;
       }
-      return handleRpc(timeline, input);
+      return handleRpc(context(), input);
     } catch {
       return {
         jsonrpc: '2.0',
@@ -252,7 +139,30 @@ export function startAgent(
       res.end(JSON.stringify({
         connected: socket?.readyState === WebSocket.OPEN,
         frames: timeline.frames.length,
-        stats: jitter.stats
+        stats: jitter.stats,
+        // Whether the shape of the system is known, separately from whether
+        // telemetry is arriving: a node can be publishing frames while the
+        // registry is unreadable, and the reverse.
+        system: {
+          received: graphs.received > 0,
+          graphs: graphs.received,
+          invalid: graphs.invalid,
+          nodes: system?.nodes.length ?? 0,
+          nodes_alive: system?.nodes.filter(node => node.alive).length ?? 0,
+          topics: system?.topics.length ?? 0,
+          registry_available: system?.registry.available ?? false
+        },
+        // Reported separately again, and null rather than zero when the bridge
+        // was started without --declared: "nobody declared anything" and "no
+        // declared graph was offered" are different answers.
+        declared: declared ? {
+          received: true,
+          nodes: declared.nodes.length,
+          diagnostics: declared.diagnostics.length,
+          registered: declaredStatus(declared, system)?.registered ?? null,
+          missing: declaredStatus(declared, system)?.missing.length ?? null
+        } :
+                             {received: false, error: declaredError || null}
       }));
       return;
     }
@@ -297,9 +207,18 @@ export function startAgent(
   let retry: NodeJS.Timeout|undefined;
   let stopped = false;
   function connect() {
-    socket = new WebSocket(upstream, {maxPayload: 65507});
+    // The upstream carries two message families now. A telemetry frame fits in
+    // one datagram, but a system graph describing every node on every topic is
+    // far larger, and a payload cap below it would drop the connection instead
+    // of the message. parseSystemGraph enforces the real bound.
+    socket = new WebSocket(upstream, {maxPayload: MAX_SYSTEM_BYTES});
     socket.on('message', (raw, binary) => {
-      if (!binary) return;
+      // Binary is telemetry; text is the system graph. The frame type carries
+      // the distinction, so neither side has to sniff the bytes.
+      if (!binary) {
+        ingestSystemGraph(raw.toString());
+        return;
+      }
       try {
         const bytes = Array.isArray(raw) ? Buffer.concat(raw) :
             raw instanceof ArrayBuffer   ? new Uint8Array(raw) :
@@ -308,6 +227,11 @@ export function startAgent(
       } catch {
         jitter.stats.invalid++;
       }
+    });
+    socket.on('open', () => {
+      // Asked for on every open: the bridge may have started after this
+      // process did, and the first attempt would have had nothing to answer it.
+      void fetchDeclaredGraph();
     });
     socket.on('error', () => {});
     socket.on('close', () => {
@@ -331,7 +255,17 @@ export function startAgent(
     ws.close();
     server.close();
   };
-  return {server, timeline, close};
+  return {
+    server,
+    timeline,
+    close,
+    graphs,
+    // Exposed so a caller can inject a graph or read the current one without
+    // standing up a bridge.
+    context,
+    ingestSystemGraph,
+    ingestDeclaredGraph
+  };
 }
 if (process.argv[1] &&
     import.meta.url === pathToFileURL(process.argv[1]).href) {

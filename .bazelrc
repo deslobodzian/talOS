@@ -4,6 +4,14 @@ build --enable_platform_specific_config
 
 build:linux --cxxopt=-std=c++20 --cxxopt=-O3
 build:macos --cxxopt=-std=c++20 --cxxopt=-O3
+# Two things Apple's libc++ needs before talOS compiles on macOS at all.
+#
+# std::jthread and std::stop_token, which every node's shutdown path uses, are
+# still behind -fexperimental-library, and both are annotated as available only
+# from macOS 11; std::format's floating-point path (reached from
+# shared_memory_ptr.h) needs 13.4. Bazel's default deployment target is older
+# than both, so without these the whole C++ tree fails to build here while
+# building fine on Linux CI.
+build:macos --cxxopt=-fexperimental-library --linkopt=-fexperimental-library
+build:macos --macos_minimum_os=13.4
 build:windows --cxxopt=/std:c++20 --cxxopt=-O3
-
-build:

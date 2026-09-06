@@ -23,9 +23,15 @@ namespace talos::arbiter {
 // producers cannot drift onto differently spelled strings.
 inline constexpr const char* kTeleopChassisTopic =
     talos::drive::kTeleopTargetTopic;
-inline constexpr const char* kAutoChassisTopic = talos::drive::kAutoTargetTopic;
 inline constexpr const char* kTeleopShooterTopic =
     talos::shooter::kTeleopShooterTargetTopic;
+
+// The two `auto` topics have no publisher, and will not until autonomous is
+// written. The subscriptions stay so the wiring is already right on the day it
+// is, and main.cc declares both sources with naming::kSourceFlagOptional -- a
+// graph that reports an unwritten feature the same way it reports a genuinely
+// broken link teaches people to skip the report.
+inline constexpr const char* kAutoChassisTopic = talos::drive::kAutoTargetTopic;
 inline constexpr const char* kAutoShooterTopic =
     talos::shooter::kAutoShooterTargetTopic;
 

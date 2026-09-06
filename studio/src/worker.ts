@@ -1,6 +1,9 @@
 /// <reference lib="webworker" />
+import {handleRpc} from '../agent/rpc';
+
 import {Coordinator, decode, JitterBuffer, Timeline} from './core';
-import {demoPacket} from './demo';
+import {demoDeclaredGraph, demoPacket, demoSystemGraph} from './demo';
+import {type DeclaredGraph, declaredUrl, eventRates, MAX_DECLARED_BYTES, parseDeclaredGraph, parseSystemGraph, SystemAssembler, systemChunk, type SystemGraph} from './system';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
 let coordinator = new Coordinator(), jitter = new JitterBuffer(10);
@@ -11,11 +14,122 @@ let packets = new Map<string, Uint8Array>(),
 let nextDemo = 0, lastTick = performance.now(), lastView = 0;
 let retry: ReturnType<typeof setTimeout>|undefined;
 let generation = 0;
+
+// The last two graphs, because a rate needs a previous sample: the registry
+// reports cumulative counters, not rates.
+let system: SystemGraph|null = null, previousSystem: SystemGraph|null = null;
+let systemError = '';
+let nextDemoSystem = 0;
+
+// The declared graph, fetched over HTTP rather than pushed: the launcher writes
+// it once before it spawns anything, so it does not change while a session
+// runs, and asking for it once per connection costs less than carrying it on a
+// stream that refreshes four times a second.
+let declared: DeclaredGraph|null = null;
+let declaredError = '';
+
+// Reassembles graphs arriving over UDP, which the platform's maximum datagram
+// forces the bridge to split. The WebSocket path needs none of this: a text
+// frame carries the whole document.
+const assembler = new SystemAssembler();
+
+// Posted only when the graph changes, not on every telemetry tick: it is a few
+// tens of kilobytes and structure changes at 4 Hz, not 30.
+function postSystem() {
+  const rates: Record<string, number> = {};
+  if (system) {
+    for (const [key, value] of eventRates(system, previousSystem)) {
+      rates[key] = value;
+    }
+  }
+  ctx.postMessage({
+    type: 'system',
+    graph: system,
+    rates,
+    error: systemError,
+    declared,
+    declaredError
+  });
+}
+
+// GET /declared.json from the same origin as the telemetry socket.
+//
+// A 404 is the ordinary answer: `--declared` is optional, and a bridge started
+// without it says so this way. That is not an error to report -- there is
+// nothing wrong and nothing for a person to do -- so it leaves the viewer
+// exactly as it was before there was a declared graph to ask for. A network
+// failure is equally quiet, because the connection status already says the
+// bridge is unreachable. A document that arrives and does not parse is the one
+// case worth a sentence on screen.
+async function fetchDeclared(url: string, gen: number) {
+  const target = declaredUrl(url);
+  if (!target) return;
+  let text: string;
+  try {
+    const response = await fetch(target, {cache: 'no-store'});
+    if (gen !== generation) return;
+    if (response.status === 404) return;
+    if (!response.ok) {
+      declaredError = `Declared graph unavailable: HTTP ${response.status}`;
+      postSystem();
+      return;
+    }
+    // Advisory, and checked before the body is read rather than after: the
+    // parser enforces the real bound, but there is no reason to hold a
+    // gigabyte in memory first to find out it was too big.
+    const declaredSize = Number(response.headers.get('content-length') ?? 0);
+    if (declaredSize > MAX_DECLARED_BYTES) {
+      declaredError = 'Invalid declared graph: document too large';
+      postSystem();
+      return;
+    }
+    text = await response.text();
+  } catch {
+    return;
+  }
+  if (gen !== generation) return;
+  ingestDeclared(text);
+  postSystem();
+}
+
+// One malformed document must not blank a working view, the same rule the live
+// graph follows: keep the last good declared graph and say why this one was
+// refused.
+function ingestDeclared(text: string) {
+  try {
+    declared = parseDeclaredGraph(text);
+    declaredError = '';
+  } catch (e) {
+    declaredError = String(e);
+  }
+}
+
+function ingestSystem(text: string) {
+  try {
+    const graph = parseSystemGraph(text);
+    previousSystem = system;
+    system = graph;
+    systemError = '';
+  } catch (e) {
+    // One malformed document must not blank a working view. Keep the last good
+    // graph and say why the new one was refused.
+    systemError = String(e);
+  }
+  postSystem();
+}
 function reset() {
   coordinator = new Coordinator();
   jitter = new JitterBuffer(10);
   packets.clear();
   pendingBytes.clear();
+  // Whatever is being connected to next is a different system, so the old
+  // topology is not evidence about it.
+  system = null;
+  previousSystem = null;
+  systemError = '';
+  declared = null;
+  declaredError = '';
+  postSystem();
 }
 function close() {
   generation++;
@@ -48,10 +162,18 @@ function connect(url: string, gen: number) {
     status = 'Connecting';
     socket.onopen = () => {
       status = 'WebSocket connected';
+      // Asked for on every open, not once per session: the bridge may have been
+      // started after Studio was, and the first attempt would have found
+      // nothing to answer it.
+      void fetchDeclared(url, gen);
     };
     socket.onmessage = e => {
+      // Binary is telemetry, text is the system graph. The bridge picks the
+      // frame type, so neither side has to sniff the payload.
       if (e.data instanceof ArrayBuffer)
         ingest(new Uint8Array(e.data), performance.now());
+      else if (typeof e.data === 'string')
+        ingestSystem(e.data);
     };
     socket.onclose = () => {
       status = 'Disconnected · retrying';
@@ -78,16 +200,54 @@ ctx.onmessage = ({data}) => {
         demo = true;
         sequence = 0n;
         nextDemo = performance.now();
+        nextDemoSystem = performance.now() + 250;
+        // The demo's declared graph names one node the live graph does not, so
+        // the declared-against-actual views are explorable with no robot and no
+        // launcher attached.
+        ingestDeclared(demoDeclaredGraph());
+        ingestSystem(demoSystemGraph(sequence));
         status = 'Deterministic demo · 50 Hz';
         break;
-      case 'packet':
+      case 'packet': {
+        const bytes = new Uint8Array(data.buffer);
+        // Recognised before anything else: a system graph is not a frame, and
+        // it is not a reason to tear down the transport already running. It
+        // also spans several datagrams, so a chunk that does not complete a
+        // document still must not fall through to the telemetry decoder.
+        if (systemChunk(bytes)) {
+          const graph = assembler.push(bytes);
+          if (graph !== null) ingestSystem(graph);
+          break;
+        }
         if (demo || socket) {
           close();
           reset();
         }
         status = 'Desktop UDP';
-        ingest(new Uint8Array(data.buffer), performance.now());
+        ingest(bytes, performance.now());
         break;
+      }
+      case 'rpc': {
+        // The same query surface the headless JSON-RPC server exposes, run
+        // against this worker's own timeline, so the Agent tab shows what an
+        // agent would actually get back rather than a second implementation.
+        let response: unknown;
+        try {
+          response = handleRpc(
+              {timeline: coordinator.timeline, system, previousSystem, declared},
+              data.request);
+        } catch (e) {
+          response = {
+            jsonrpc: '2.0',
+            id: data.request?.id ?? null,
+            error: {code: -32603, message: String(e)}
+          };
+        }
+        // Posted even when undefined -- a notification has no response, and a
+        // caller waiting on this id still has to be released.
+        ctx.postMessage({type: 'rpc', id: data.id, response});
+        break;
+      }
       case 'mode':
         if (['PAUSED', 'LIVE_STREAMING', 'REPLAY_PLAYING'].includes(data.mode))
           coordinator.mode = data.mode;
@@ -154,6 +314,12 @@ setInterval(() => {
     while (now >= nextDemo && n++ < 10) {
       ingest(demoPacket(sequence++), now);
       nextDemo += 20;
+    }
+    // The bridge refreshes the graph four times a second; matching that keeps
+    // the demo's rate columns populated instead of permanently unmeasured.
+    if (now >= nextDemoSystem) {
+      ingestSystem(demoSystemGraph(sequence));
+      nextDemoSystem = now + 250;
     }
   }
   for (const f of jitter.flush(now)) {

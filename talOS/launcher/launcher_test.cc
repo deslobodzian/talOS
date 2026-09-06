@@ -1,6 +1,7 @@
 #include "talOS/launcher/launcher.h"
 
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -11,6 +12,8 @@
 #include <vector>
 
 #include "talOS/events/log/log_writer.h"
+#include "talOS/introspection/describe.h"
+#include "talOS/introspection/names.h"
 
 namespace talos::launcher {
 namespace {
@@ -73,7 +76,9 @@ void WriteTestLog(const std::string& path, const std::string& process_name,
       path, process_name,
       event::log::LogWriterOptions{4096, 1, /*background=*/false}, session_id};
   const auto manifest = MakeTestManifest(process_name + "_src");
-  writer.start(manifest, event::MonotonicTime::from_nanos(event_times_ns.empty() ? 0 : event_times_ns.front()));
+  writer.start(manifest,
+               event::MonotonicTime::from_nanos(
+                   event_times_ns.empty() ? 0 : event_times_ns.front()));
 
   for (std::size_t i = 0; i < event_times_ns.size(); ++i) {
     event::Context ctx{};
@@ -85,7 +90,8 @@ void WriteTestLog(const std::string& path, const std::string& process_name,
     ctx.sequence = i + 1;
 
     uint64_t payload_val = i;
-    std::span<const std::byte> payload{reinterpret_cast<const std::byte*>(&payload_val), sizeof(payload_val)};
+    std::span<const std::byte> payload{
+        reinterpret_cast<const std::byte*>(&payload_val), sizeof(payload_val)};
     writer.dispatch(ctx, payload);
   }
 
@@ -141,10 +147,12 @@ TEST(LauncherTest, SimGatewayComesFromRobotConfigNotTheFramework) {
   options.simulation = true;
   options.start_sim_gateway = true;
 
-  auto with_gw = DiscoverNodes(config::ParseRobotConfigString(kFixtureToml), options);
-  EXPECT_EQ(std::count_if(with_gw.begin(), with_gw.end(),
-                          [](const NodeSpec& n) { return n.name == "sim_gateway"; }),
-            1);
+  auto with_gw =
+      DiscoverNodes(config::ParseRobotConfigString(kFixtureToml), options);
+  EXPECT_EQ(
+      std::count_if(with_gw.begin(), with_gw.end(),
+                    [](const NodeSpec& n) { return n.name == "sim_gateway"; }),
+      1);
 
   // No [robot] sim_gateway key: the launcher must not invent a robot target.
   constexpr std::string_view kNoGateway = R"(
@@ -160,10 +168,12 @@ type = "TalonFX"
 bus = "rio"
 can_id = 1
 )";
-  auto without_gw = DiscoverNodes(config::ParseRobotConfigString(kNoGateway), options);
-  EXPECT_EQ(std::count_if(without_gw.begin(), without_gw.end(),
-                          [](const NodeSpec& n) { return n.name == "sim_gateway"; }),
-            0);
+  auto without_gw =
+      DiscoverNodes(config::ParseRobotConfigString(kNoGateway), options);
+  EXPECT_EQ(
+      std::count_if(without_gw.begin(), without_gw.end(),
+                    [](const NodeSpec& n) { return n.name == "sim_gateway"; }),
+      0);
 }
 
 TEST(LauncherTest, MergedLogsMonotonicOrder) {
@@ -262,8 +272,10 @@ TEST(LauncherTest, RunsChildProcessesAndWritesManifest) {
   options.session_id = 0x55555555ULL;
   options.duration_s = 1;
 
-  // Use /usr/bin/true (or /bin/echo) for all nodes so the test executes instantly and cleanly
-  std::string mock_bin = ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
+  // Use /usr/bin/true (or /bin/echo) for all nodes so the test executes
+  // instantly and cleanly
+  std::string mock_bin =
+      ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
   options.config_path = WriteFixtureToml();
   options.binary_overrides["//talOS/bridge:hardware_node"] = mock_bin;
   options.binary_overrides["//example/alpha:node"] = mock_bin;
@@ -283,6 +295,277 @@ TEST(LauncherTest, RunsChildProcessesAndWritesManifest) {
   EXPECT_NE(content.find("\"nodes\":"), std::string::npos);
 
   std::filesystem::remove_all(out_dir);
+}
+
+// A stand-in for a node binary.
+//
+// What the launcher wants from a binary is what it prints when asked what it
+// is, so a script that prints it is a complete node for this purpose -- and the
+// graph under test stays in the test instead of in some other package's source,
+// where it would drift.
+std::string WriteStubNode(std::string_view name, std::string_view script) {
+  const std::string path = TempPath(name);
+  {
+    std::ofstream out{path};
+    out << script;
+  }
+  ::chmod(path.c_str(), 0755);
+  return path;
+}
+
+// The JSON a real node prints, written by the real writer: a stub that answered
+// with hand-typed JSON would pass the day describe.h changed shape.
+std::string DescribeJson(
+    std::string_view node, std::string_view target,
+    const std::vector<introspect::naming::SourceShape>& sources) {
+  introspect::Description description;
+  description.name = std::string{node};
+  description.target = std::string{target};
+  description.sources = sources;
+  return introspect::DescribeToJson(description);
+}
+
+std::string DescribingStub(
+    std::string_view node, std::string_view target,
+    const std::vector<introspect::naming::SourceShape>& sources) {
+  return std::string{"#!/bin/sh\n"} +
+         "for arg in \"$@\"; do\n"
+         "  if [ \"$arg\" = \"--describe\" ]; then\n"
+         "    cat <<'TALOS_DESCRIBE'\n" +
+         DescribeJson(node, target, sources) +
+         "TALOS_DESCRIBE\n"
+         "    exit 0\n"
+         "  fi\n"
+         "done\n"
+         "exit 0\n";
+}
+
+// A node written before --describe existed, or one halfway through being
+// written: it rejects the flag the way every node used to.
+constexpr std::string_view kStubWithoutDescribe =
+    "#!/bin/sh\n"
+    "for arg in \"$@\"; do\n"
+    "  if [ \"$arg\" = \"--describe\" ]; then\n"
+    "    echo \"usage: node [--sim] [--log PATH]\" >&2\n"
+    "    exit 1\n"
+    "  fi\n"
+    "done\n"
+    "exit 0\n";
+
+// exec so the pid the launcher kills is the one that is sleeping; a shell that
+// forked the sleep would report the kill and leave the sleep behind.
+constexpr std::string_view kStubThatHangsOnDescribe =
+    "#!/bin/sh\n"
+    "for arg in \"$@\"; do\n"
+    "  if [ \"$arg\" = \"--describe\" ]; then\n"
+    "    exec sleep 30\n"
+    "  fi\n"
+    "done\n"
+    "exit 0\n";
+
+introspect::naming::SourceShape Sender(std::string topic,
+                                       std::uint32_t bytes = 48) {
+  return {event::SourceKind::SENDER, std::move(topic), bytes, 0};
+}
+introspect::naming::SourceShape Watcher(std::string topic,
+                                        std::uint32_t bytes = 48) {
+  return {event::SourceKind::WATCHER, std::move(topic), bytes, 0};
+}
+
+std::string ReadFile(const std::string& path) {
+  std::ifstream in{path};
+  return std::string{std::istreambuf_iterator<char>(in),
+                     std::istreambuf_iterator<char>()};
+}
+
+// Two stubs and a hardware node that says nothing, wired to the fixture config.
+struct GraphFixture {
+  LauncherOptions options;
+  std::string out_dir;
+
+  GraphFixture(std::string_view tag, std::string_view alpha_script,
+               std::string_view beta_script) {
+    out_dir = TempPath(std::string{tag} + "_out");
+    std::filesystem::create_directories(out_dir);
+    options.output_dir = out_dir;
+    options.session_id = 0x0123456789ABCDEFULL;
+    options.config_path = WriteFixtureToml();
+    options.describe_timeout_ms = 4000;
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
+    options.binary_overrides["//example/alpha:node"] =
+        WriteStubNode(std::string{tag} + "_alpha", alpha_script);
+    options.binary_overrides["//example/beta:node"] =
+        WriteStubNode(std::string{tag} + "_beta", beta_script);
+  }
+
+  ~GraphFixture() { std::filesystem::remove_all(out_dir); }
+
+  std::string graph_json() const { return ReadFile(out_dir + "/graph.json"); }
+  bool has_manifest() const {
+    return std::filesystem::exists(out_dir + "/manifest.json");
+  }
+};
+
+TEST(LauncherGraphTest, ProbesEveryBinaryAndPutsWhatItSaysInTheGraph) {
+  GraphFixture fixture{
+      "meets",
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")}),
+      DescribingStub("beta", "//example/beta:node", {Watcher("/alpha/state")})};
+
+  Launcher launcher{fixture.options};
+  EXPECT_EQ(launcher.Run(), 0);
+
+  const std::string graph = fixture.graph_json();
+  EXPECT_NE(graph.find("\"session_id\": \"81985529216486895\""),
+            std::string::npos)
+      << graph;
+  EXPECT_NE(graph.find("\"name\": \"alpha\""), std::string::npos) << graph;
+  EXPECT_NE(graph.find("\"kind\": \"SENDER\", \"name\": \"/alpha/state\""),
+            std::string::npos)
+      << graph;
+  EXPECT_NE(graph.find("\"kind\": \"WATCHER\", \"name\": \"/alpha/state\""),
+            std::string::npos)
+      << graph;
+  // A topic with both ends declared is the case nothing should be said about.
+  EXPECT_EQ(graph.find("\"severity\": \"error\""), std::string::npos) << graph;
+
+  ASSERT_TRUE(fixture.has_manifest());
+  const std::string manifest = ReadFile(fixture.out_dir + "/manifest.json");
+  EXPECT_NE(manifest.find("\"described\": true"), std::string::npos)
+      << manifest;
+}
+
+TEST(LauncherGraphTest, RefusesToSpawnWhenTheTwoEndsAreSpelledDifferently) {
+  GraphFixture fixture{
+      "differs",
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")}),
+      DescribingStub("beta", "//example/beta:node",
+                     {Watcher("/alpha/status")})};
+
+  Launcher launcher{fixture.options};
+  EXPECT_NE(launcher.Run(), 0);
+
+  const std::string graph = fixture.graph_json();
+  EXPECT_NE(graph.find("nothing publishes it"), std::string::npos) << graph;
+  EXPECT_NE(graph.find("\"severity\": \"error\""), std::string::npos) << graph;
+
+  // Nothing was started, so there is no session: the manifest is the evidence.
+  EXPECT_FALSE(fixture.has_manifest());
+}
+
+TEST(LauncherGraphTest, AllowGraphErrorsLaunchesTheBrokenGraphAnyway) {
+  GraphFixture fixture{
+      "allowed",
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")}),
+      DescribingStub("beta", "//example/beta:node",
+                     {Watcher("/alpha/status")})};
+  fixture.options.allow_graph_errors = true;
+
+  Launcher launcher{fixture.options};
+  EXPECT_EQ(launcher.Run(), 0);
+  EXPECT_TRUE(fixture.has_manifest());
+  EXPECT_NE(fixture.graph_json().find("\"severity\": \"error\""),
+            std::string::npos);
+}
+
+TEST(LauncherGraphTest, ABinaryThatIgnoresDescribeIsAWarningAndStillLaunches) {
+  GraphFixture fixture{"silent", kStubWithoutDescribe, kStubWithoutDescribe};
+
+  Launcher launcher{fixture.options};
+  EXPECT_EQ(launcher.Run(), 0);
+  EXPECT_TRUE(fixture.has_manifest());
+
+  const std::string graph = fixture.graph_json();
+  EXPECT_NE(graph.find("\"described\": false"), std::string::npos) << graph;
+  EXPECT_NE(graph.find("did not answer --describe"), std::string::npos)
+      << graph;
+  EXPECT_NE(graph.find("\"severity\": \"warning\""), std::string::npos)
+      << graph;
+  EXPECT_EQ(graph.find("\"severity\": \"error\""), std::string::npos) << graph;
+}
+
+TEST(LauncherGraphTest, ANodeThatHangsOnDescribeDoesNotHangTheLaunch) {
+  GraphFixture fixture{
+      "hangs", kStubThatHangsOnDescribe,
+      DescribingStub("beta", "//example/beta:node", {Sender("/beta/state")})};
+  fixture.options.describe_timeout_ms = 250;
+
+  const auto started = std::chrono::steady_clock::now();
+  Launcher launcher{fixture.options};
+  EXPECT_EQ(launcher.Run(), 0);
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
+            10);
+
+  EXPECT_NE(fixture.graph_json().find("no answer within 250ms"),
+            std::string::npos)
+      << fixture.graph_json();
+}
+
+TEST(LauncherGraphTest, DescribeOnlyLintsWithoutStartingAnything) {
+  GraphFixture fixture{
+      "preflight",
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")}),
+      DescribingStub("beta", "//example/beta:node", {Watcher("/alpha/state")})};
+  fixture.options.describe_only = true;
+
+  Launcher launcher{fixture.options};
+  EXPECT_EQ(launcher.Run(), 0);
+  EXPECT_FALSE(fixture.has_manifest());
+  EXPECT_NE(fixture.graph_json().find("\"name\": \"beta\""), std::string::npos);
+}
+
+TEST(LauncherGraphTest, DescribeOnlyReportsABrokenGraphAsAFailure) {
+  GraphFixture fixture{
+      "preflight_broken",
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")}),
+      DescribingStub("beta", "//example/beta:node",
+                     {Watcher("/alpha/status")})};
+  fixture.options.describe_only = true;
+
+  Launcher launcher{fixture.options};
+  EXPECT_NE(launcher.Run(), 0);
+  EXPECT_FALSE(fixture.has_manifest());
+}
+
+TEST(LauncherGraphTest, WarnsWhenABinaryDisagreesWithTheConfigAboutItsName) {
+  NodeSpec spec;
+  spec.name = "alpha";
+  spec.target = "//example/alpha:node";
+  spec.binary_path =
+      WriteStubNode("renamed", DescribingStub("gamma", "//example/gamma:node",
+                                              {Sender("/gamma/state")}));
+
+  LauncherOptions options;
+  options.describe_timeout_ms = 4000;
+  std::vector<NodeDescription> described;
+  const auto diagnostics = DescribeGraph({spec}, options, described);
+
+  ASSERT_EQ(described.size(), 1u);
+  ASSERT_TRUE(described[0].answered) << described[0].error;
+  EXPECT_EQ(described[0].declared.name, "gamma");
+  EXPECT_EQ(described[0].roster_name, "alpha");
+
+  const bool warned = std::any_of(
+      diagnostics.begin(), diagnostics.end(),
+      [](const introspect::naming::Diagnostic& d) {
+        return d.severity == introspect::naming::Severity::WARNING &&
+               d.message.find("describes itself as 'gamma'") !=
+                   std::string::npos;
+      });
+  EXPECT_TRUE(warned) << "diagnostics did not mention the disagreement";
+
+  std::remove(spec.binary_path.c_str());
+}
+
+TEST(LauncherGraphTest, ProbeReportsABinaryThatIsNotThere) {
+  introspect::Description out;
+  std::string error;
+  EXPECT_FALSE(ProbeDescribe("/nonexistent/talos_node",
+                             {"/nonexistent/talos_node", "--describe"},
+                             std::chrono::milliseconds{500}, out, error));
+  EXPECT_NE(error.find("no executable"), std::string::npos) << error;
 }
 
 }  // namespace

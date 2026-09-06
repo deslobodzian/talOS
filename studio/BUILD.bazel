@@ -27,7 +27,7 @@ genrule(
 
 js_library(
     name = "sources",
-    srcs = glob(["src/**/*.ts", "src/**/*.tsx", "src/**/*.css", "tests/*.ts", "agent/*.ts", "agent/*.mjs", "tests/*.mjs"]) + [":telemetry_ts", "index.html", "package.json", "tsconfig.json"],
+    srcs = glob(["src/**/*.ts", "src/**/*.tsx", "src/**/*.css", "tests/*.ts", "tests/*.tsx", "tests/*.json", "agent/*.ts", "agent/*.mjs", "tests/*.mjs"]) + [":telemetry_ts", "index.html", "package.json", "tsconfig.json"],
     deps = [":node_modules"],
 )
 
@@ -79,4 +79,33 @@ js_test(
     fixed_args = ["agent.test.ts"],
 )
 
-test_suite(name = "tests", tests = [":core_test", ":agent_test", ":typecheck", "//studio/bridge:wire_test"])
+# Renders the system-graph views with react-dom/server. A typecheck and a
+# successful bundle prove the code compiles; this proves it runs.
+js_test(
+    name = "view_test",
+    entry_point = "tests/run.mjs",
+    data = [":sources"],
+    chdir = "studio",
+    fixed_args = ["view.test.tsx"],
+)
+
+js_test(
+    name = "system_test",
+    entry_point = "tests/run.mjs",
+    data = [":sources"],
+    chdir = "studio",
+    fixed_args = ["system.test.ts"],
+)
+
+# The launcher writes the declared graph in C++ and system.ts parses it in
+# TypeScript; neither language can check the other. This parses a document the
+# launcher really produced, so a change to its envelope fails here.
+js_test(
+    name = "declared_test",
+    entry_point = "tests/run.mjs",
+    data = [":sources"],
+    chdir = "studio",
+    fixed_args = ["declared.test.ts"],
+)
+
+test_suite(name = "tests", tests = [":core_test", ":agent_test", ":declared_test", ":system_test", ":view_test", ":typecheck", "//studio/bridge:wire_test", "//studio/bridge:system_test"])

@@ -25,6 +25,10 @@ cc_binary(
     deps = [
         ":telemetry",
         "//talOS/configuration:configuration",
+        "//talOS/events:events",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:names",
+        "//talOS/introspection:reporter",
         "//talOS/process:process",
     ],
     visibility = ["//visibility:public"],

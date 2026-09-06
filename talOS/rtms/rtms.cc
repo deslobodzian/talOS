@@ -26,13 +26,11 @@ std::string ValidatePath(std::string_view path) {
         "Topic name '" + std::string(path) +
         "' exceeds limit of 30 characters after leading slash");
   }
-  std::string normalized;
-  normalized.reserve(name.size() + 1);
-  normalized.push_back('/');
-  for (char c : name) {
-    normalized.push_back(c == '/' ? '_' : c);
-  }
-  return normalized;
+  // One definition of the mapping, in shared_memory_ptr.h, so this and
+  // SharedMemoryPtr cannot drift onto different segment names for one topic.
+  // ReclaimMismatchedSegment below opens a segment directly, which is why RTMS
+  // needs the mapped name here and not just inside SharedMemoryPtr.
+  return ShmObjectName(path);
 }
 // Unlinks an existing segment whose layout does not match what the caller is
 // about to create, so the next shm_open makes a fresh one. Only the topic's
@@ -207,8 +205,7 @@ WriteStatus RTMSQueue::write(const RTMSMessage& message) {
   return {WriteResult::SUCCESS, writer_position};
 }
 
-const std::byte* RTMSQueue::slot_address(
-    std::uint64_t message_sequence) const {
+const std::byte* RTMSQueue::slot_address(std::uint64_t message_sequence) const {
   const std::uint64_t slot_index = message_sequence & (header_->slots - 1);
 
   return static_cast<const std::byte*>(ptr_.ptr()) + header_->data_offset +
@@ -274,8 +271,7 @@ ReadResult RTMSQueue::read_next(std::uint64_t reader_id,
                                 MessageInfo& info) {
   info = MessageInfo{};
 
-  if (reader_id >= MAX_READERS ||
-      destination.size() < header_->message_bytes) {
+  if (reader_id >= MAX_READERS || destination.size() < header_->message_bytes) {
     return ReadResult::INVALID;
   }
 
