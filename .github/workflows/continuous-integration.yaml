@@ -28,6 +28,10 @@ jobs:
         # Share repository cache between workflows.
         repository-cache: true
 
+    - name: Install DBus and Pkg-Config
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libdbus-1-dev pkg-config
     - name: Build
       run: bazel build //... --noshow_progress --test_output=errors
 
