@@ -633,33 +633,119 @@ export const isSubscriber = (kind: SourceKind) =>
 
 export const rateKey = (node: string, sourceId: number) => `${node} ${sourceId}`;
 
-// Events per second per source, from two graphs and the wall clock between
-// them. Counters are cumulative, so a rate needs a previous sample; without
-// one this reports nothing rather than zero, because "not measured yet" and
-// "not moving" are different answers.
+// Events per second per source, from two graphs. Counters are cumulative, so a
+// rate needs a previous sample; without one this reports nothing rather than
+// zero, because "not measured yet" and "not moving" are different answers.
+//
+// Divided by the delta of the node's own `heartbeat_wall_ns`, not of the
+// graph's `wall_ns`. Those are two different clocks readings and using the
+// wrong one was the whole artifact: a node refreshes its registry slot on its
+// own timer (Reporter::Options::period, 250 ms) and the bridge rebuilds the
+// graph on another (kSystemRefreshTicks, also 250 ms), free-running with no
+// phase relationship between them. So the counter the bridge reads was written
+// at some point up to a full reporter period before the graph was stamped, and
+// by a varying amount each time -- which showed up as a 200 Hz loop reported
+// anywhere from 0 to double, depending only on where the two grids happened to
+// be relative to each other.
+//
+// `heartbeat()` stamps that field immediately before the same `sample()` call
+// writes the counters, so dividing by it pairs each count with the moment it
+// was actually taken and the phase cancels out. What remains is the microsecond
+// window between those two writes, which the reader does not lock against.
+//
+// It also separates two answers that both used to read as zero: a source whose
+// counter is flat while its node keeps checking in really is idle and is
+// reported as 0, while a node that has not re-sampled at all has no measurable
+// interval and is omitted.
 export function eventRates(current: SystemGraph,
                            previous: SystemGraph|null): Map<string, number> {
   const rates = new Map<string, number>();
   if (!previous) return rates;
-  const seconds =
-      Number(BigInt(current.wall_ns) - BigInt(previous.wall_ns)) / 1e9;
-  if (!(seconds > 0)) return rates;
 
-  const before = new Map<string, bigint>();
-  for (const node of previous.nodes)
-    for (const source of node.sources)
-      before.set(rateKey(node.name, source.id), BigInt(source.events));
+  const before = new Map<string, {events: bigint; sampled: bigint}>();
+  for (const node of previous.nodes) {
+    const sampled = BigInt(node.heartbeat_wall_ns);
+    for (const source of node.sources) {
+      before.set(rateKey(node.name, source.id),
+                 {events: BigInt(source.events), sampled});
+    }
+  }
 
   for (const node of current.nodes) {
+    const sampled = BigInt(node.heartbeat_wall_ns);
     for (const source of node.sources) {
       const key = rateKey(node.name, source.id);
       const start = before.get(key);
       if (start === undefined) continue;
-      const delta = BigInt(source.events) - start;
+      const seconds = Number(sampled - start.sampled) / 1e9;
+      if (!(seconds > 0)) continue;
+      const delta = BigInt(source.events) - start.events;
       // A restarted node resets its counters. A negative delta is that, not a
       // rate, so it is dropped rather than reported as a large negative number.
       if (delta >= 0n) rates.set(key, Number(delta) / seconds);
     }
   }
   return rates;
+}
+
+// How far apart the two counter samples are decides the answer's resolution,
+// and one bridge refresh apart is not far enough. `events` is an integer and
+// the bridge refreshes four times a second, so a baseline one graph back can
+// only ever yield a multiple of ~4 Hz: a 200 Hz source reads 200 or 204
+// depending on which side of the refresh its 50th event happened to land, and
+// a source whose reporter did not update between two refreshes reads 0. Both
+// are artifacts of the measurement, not facts about the robot, and the 0 is
+// the worse of the two because "not moving" is a fault and this invents one.
+//
+// So measure against the oldest sample still inside a window instead. The
+// window sets the resolution -- 1/window Hz, so the default 2 s resolves
+// 0.5 Hz where a single refresh resolved 4 -- while graphs keep arriving at
+// the bridge's rate, so a rate still updates as often as it ever did and is
+// simply averaged over more of them.
+//
+// This bounds the error of a stalled reporter rather than removing it. A
+// baseline that lands on a sample whose counter had not moved still counts the
+// following catch-up without the time it belonged to, but that is worth one
+// refresh of events spread across the window -- 25 Hz on a 200 Hz source at
+// the default -- where against a single refresh the same stall was worth the
+// entire rate, reading 0 on one side and double on the other.
+export class RateWindow {
+  private samples: SystemGraph[] = [];
+
+  constructor(readonly seconds = 2, readonly capacity = 32) {
+    if (!(seconds > 0)) throw Error('Invalid rate window');
+    if (!Number.isInteger(capacity) || capacity < 2)
+      throw Error('Invalid rate window capacity');
+  }
+
+  push(graph: SystemGraph) {
+    this.samples.push(graph);
+    const newest = BigInt(graph.wall_ns);
+    const span = BigInt(Math.round(this.seconds * 1e9));
+    // Drop a sample only when the one behind it is still old enough to be a
+    // baseline, so `samples[0]` ends up the newest sample that is at least a
+    // full window old -- or the oldest one there is, before the window fills.
+    while (this.samples.length > 2 &&
+           newest - BigInt(this.samples[1].wall_ns) >= span) {
+      this.samples.shift();
+    }
+    if (this.samples.length > this.capacity)
+      this.samples.splice(0, this.samples.length - this.capacity);
+  }
+
+  // Whatever is being connected to next is a different system, and its
+  // counters start over; a baseline from the old one would read as a huge
+  // negative delta and be dropped, which is a silence rather than an answer.
+  reset() {
+    this.samples = [];
+  }
+
+  get size() {
+    return this.samples.length;
+  }
+
+  rates(): Map<string, number> {
+    if (this.samples.length < 2) return new Map();
+    return eventRates(this.samples[this.samples.length - 1], this.samples[0]);
+  }
 }

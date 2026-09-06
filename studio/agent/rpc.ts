@@ -11,6 +11,7 @@ import {
   declaredStatus,
   endpointAttributesKnown,
   eventRates,
+  RateWindow,
   rateKey,
   type SystemGraph,
   TOPIC_HEALTH,
@@ -33,6 +34,13 @@ export type RpcContext = {
   system: SystemGraph|null;
   previousSystem?: SystemGraph|null;
 
+  // A window of graphs to measure rates over. Preferred over `previousSystem`
+  // when present, because a single refresh apart quantises a rate into ~4 Hz
+  // steps and reports 0 for a source that did not advance across it. Optional
+  // so a caller holding only two graphs still gets the old answer rather than
+  // no answer.
+  rateWindow?: RateWindow|null;
+
   // What the launcher declared before it spawned anything, when the bridge was
   // started with `--declared`. A third source of truth: not what is running and
   // not what it measured, but what was supposed to be running -- which is the
@@ -40,6 +48,12 @@ export type RpcContext = {
   // asked for.
   declared?: DeclaredGraph|null;
 };
+
+// Rates come from the window when the caller keeps one, and from the single
+// previous graph otherwise.
+const ratesFor = (context: RpcContext, system: SystemGraph) =>
+    context.rateWindow ? context.rateWindow.rates() :
+                         eventRates(system, context.previousSystem ?? null);
 
 const invalid = (message: string): never => {
   throw new RpcFault(-32602, message);
@@ -236,7 +250,7 @@ export function dispatch(
   // one node chose to publish, not the shape of the system that produced it.
   if (method === 'get_system_graph') {
     const system = requireSystem(context);
-    const rates = eventRates(system, context.previousSystem ?? null);
+    const rates = ratesFor(context, system);
     const health = topicHealthOf(system);
     // One tally per state, so an agent does not have to know which of them are
     // faults to count the faults: `bridged` and `unconnected` are half-wired
@@ -290,7 +304,7 @@ export function dispatch(
     const topic = system.topics.find(t => t.name === name);
     if (!topic) invalid(`Unknown topic: ${name}`);
 
-    const rates = eventRates(system, context.previousSystem ?? null);
+    const rates = ratesFor(context, system);
     const ends: unknown[] = [];
     for (const node of system.nodes) {
       for (const source of node.sources) {

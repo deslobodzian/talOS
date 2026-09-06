@@ -3,7 +3,7 @@ import {handleRpc} from '../agent/rpc';
 
 import {Coordinator, decode, JitterBuffer, Timeline} from './core';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from './demo';
-import {type DeclaredGraph, declaredUrl, eventRates, MAX_DECLARED_BYTES, parseDeclaredGraph, parseSystemGraph, SystemAssembler, systemChunk, type SystemGraph} from './system';
+import {type DeclaredGraph, declaredUrl, MAX_DECLARED_BYTES, parseDeclaredGraph, parseSystemGraph, RateWindow, SystemAssembler, systemChunk, type SystemGraph} from './system';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
 let coordinator = new Coordinator(), jitter = new JitterBuffer(10);
@@ -15,9 +15,13 @@ let nextDemo = 0, lastTick = performance.now(), lastView = 0;
 let retry: ReturnType<typeof setTimeout>|undefined;
 let generation = 0;
 
-// The last two graphs, because a rate needs a previous sample: the registry
-// reports cumulative counters, not rates.
+// The registry reports cumulative counters, not rates, so a rate needs an
+// older sample to measure against. `previousSystem` is the one immediately
+// before this graph, which the system view uses to show what changed;
+// `rateWindow` holds enough of them to measure a rate over a window wide
+// enough not to quantise it -- see RateWindow.
 let system: SystemGraph|null = null, previousSystem: SystemGraph|null = null;
+const rateWindow = new RateWindow();
 let systemError = '';
 let nextDemoSystem = 0;
 
@@ -37,10 +41,8 @@ const assembler = new SystemAssembler();
 // tens of kilobytes and structure changes at 4 Hz, not 30.
 function postSystem() {
   const rates: Record<string, number> = {};
-  if (system) {
-    for (const [key, value] of eventRates(system, previousSystem)) {
-      rates[key] = value;
-    }
+  for (const [key, value] of rateWindow.rates()) {
+    rates[key] = value;
   }
   ctx.postMessage({
     type: 'system',
@@ -109,6 +111,7 @@ function ingestSystem(text: string) {
     const graph = parseSystemGraph(text);
     previousSystem = system;
     system = graph;
+    rateWindow.push(graph);
     systemError = '';
   } catch (e) {
     // One malformed document must not blank a working view. Keep the last good
@@ -126,6 +129,7 @@ function reset() {
   // topology is not evidence about it.
   system = null;
   previousSystem = null;
+  rateWindow.reset();
   systemError = '';
   declared = null;
   declaredError = '';

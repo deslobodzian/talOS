@@ -88,11 +88,38 @@ deflection produces zero wheel travel.
 ## Running the robot against Studio
 
 The WPILib simulation stands in for the RoboRIO, the launcher starts the node
-graph, and the Studio bridge serves the telemetry. Three terminals:
+graph, and the Studio bridge serves the telemetry. One command from the
+repository root starts all three and opens Studio:
 
 ```sh
-# 1. Controller processor. The simulation GUI is the Driver Station: enable it
-#    and pick Teleoperated there, and its joystick reaches the node graph.
+./sim.sh
+```
+
+Then enable the robot and pick Teleoperated in the sim GUI, which is the Driver
+Station: its joystick reaches the node graph. Ctrl-C stops everything.
+
+```sh
+./sim.sh --headless       # no sim GUI; teleop through TALOS_SIM_DS instead
+./sim.sh --no-studio      # robot only, no bridge and no browser
+./sim.sh --no-rio         # node graph only, against a simulation already up
+./sim.sh --duration-s 30  # stop the node graph after 30 seconds
+```
+
+The ordering is not cosmetic. The simulated Rio is the sim gateway, so the
+hardware bridge fails immediately if the node graph starts first; and the
+Studio bridge refuses to start until the telemetry node is publishing, rather
+than create an empty ring. `sim.sh` waits for each in turn, and passes the
+launcher's `graph.json` to the bridge as `--declared`, so Studio can compare
+what was declared against what actually registered.
+
+Logs for a session land in `/tmp/talos_logs/<session-id>/`, with the three
+process logs under `sim/`.
+
+To drive one piece on its own -- debugging the bridge, or running the graph
+under a debugger -- the underlying commands are:
+
+```sh
+# 1. Controller processor.
 cd 2026-robot/controller_processor/rio && ./gradlew simulateNative
 
 # 2. Every node in robot.toml, plus the hardware bridge. No --start-sim-gateway:

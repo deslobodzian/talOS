@@ -15,6 +15,7 @@ import {
   parseDeclaredGraph,
   parseSystemGraph,
   rateKey,
+  RateWindow,
   SYSTEM_GRAPH_VERSION,
   SYSTEM_HEADER_BYTES,
   SYSTEM_TAG,
@@ -445,8 +446,14 @@ test('the demo graph is a document the parser actually accepts', () => {
 });
 
 test('event rates need two samples and ignore counter resets', () => {
-  const at = (wall: string, events: string, id = 0): SystemGraph =>
-      parse({wall_ns: wall, nodes: [node({sources: [source({id, events})]})]});
+  // `wall_ns` is deliberately the same in every graph here: a rate comes from
+  // the node's own sample time, so if it ever came from the graph clock again
+  // every case below would divide by zero and report nothing.
+  const at = (sampled: string, events: string, id = 0): SystemGraph => parse({
+    wall_ns: '5000000000',
+    nodes:
+        [node({heartbeat_wall_ns: sampled, sources: [source({id, events})]})]
+  });
   const key = rateKey('odometry', 0);
 
   // No previous sample is "not measured yet", which must not read as zero.
@@ -473,6 +480,107 @@ test('event rates need two samples and ignore counter resets', () => {
   const big = eventRates(
       at('2000000000', '9007199254740993'), at('1000000000', '9007199254740992'));
   assert.equal(big.get(key), 1);
+});
+
+test('a rate is measured on the node clock, not the graph clock', () => {
+  const key = rateKey('odometry', 0);
+  const ms = (n: number) => BigInt(n) * 1_000_000n;
+  const obs = (graphWall: bigint, sampled: bigint,
+               events: number): SystemGraph => parse({
+    wall_ns: String(graphWall),
+    nodes: [node({
+      heartbeat_wall_ns: String(sampled),
+      sources: [source({id: 0, events: String(events)})]
+    })]
+  });
+
+  // The bridge rebuilds the graph every 250 ms; each node refreshes its own
+  // slot every 250 ms on an unrelated timer. Here the bridge's next read lands
+  // before the node re-sampled, so it sees the previous sample twice -- same
+  // heartbeat, same counter -- and the node's following sample then covers
+  // 500 ms of events at once. The source held a steady 200 Hz throughout.
+  const a = obs(ms(1750), ms(1700), 1150);
+  const stalled = obs(ms(2000), ms(1700), 1150);
+  const b = obs(ms(2250), ms(2200), 1250);
+
+  // Divided by the graph clock, that reads 0 across the stall and double
+  // after it. Neither number happened.
+  const onGraphClock = (from: SystemGraph, to: SystemGraph) =>
+      Number(BigInt(to.nodes[0].sources[0].events) -
+             BigInt(from.nodes[0].sources[0].events)) /
+      (Number(BigInt(to.wall_ns) - BigInt(from.wall_ns)) / 1e9);
+  assert.equal(onGraphClock(a, stalled), 0);
+  assert.equal(onGraphClock(stalled, b), 400);
+
+  // Divided by the node's own sample time, the stalled read has no interval to
+  // measure and is omitted, and the pair spanning the catch-up is exact.
+  assert.equal(eventRates(stalled, a).size, 0);
+  assert.equal(eventRates(b, stalled).get(key), 200);
+});
+
+test('a rate window resolves finer than one integer count per refresh', () => {
+  const key = rateKey('odometry', 0);
+  const graph = (sampled: bigint, events: number): SystemGraph => parse({
+    wall_ns: String(sampled),
+    nodes: [node({
+      heartbeat_wall_ns: String(sampled),
+      sources: [source({id: 0, events: String(events)})]
+    })]
+  });
+
+  // A ~201.7 Hz source sampled every 250 ms. `events` is an integer, so each
+  // refresh catches 50 or 51 -- and against a single refresh that is the only
+  // pair of answers available: 200 or 204, never anything between.
+  const perRefresh = [50, 51, 50, 51, 50, 51, 50, 51, 50, 50, 51, 50];
+  const step = 250_000_000n;
+
+  const samples: SystemGraph[] = [];
+  let events = 1000, sampled = 1_000_000_000n;
+  samples.push(graph(sampled, events));
+  for (const advance of perRefresh) {
+    sampled += step;
+    events += advance;
+    samples.push(graph(sampled, events));
+  }
+
+  const pairwise = samples.slice(1).map(
+      (current, i) => eventRates(current, samples[i]).get(key));
+  assert.deepEqual([...new Set(pairwise)].sort((x, y) => x! - y!), [200, 204]);
+
+  // Through a window the same samples resolve the rate between those steps.
+  const window = new RateWindow(2);
+  const observed: {rate: number; filled: boolean}[] = [];
+  samples.forEach((sample, i) => {
+    window.push(sample);
+    const rate = window.rates().get(key);
+    if (rate !== undefined) observed.push({rate, filled: i >= 8});
+  });
+  assert.ok(observed.some(o => o.filled), 'the window never filled');
+  for (const {rate, filled} of observed)
+    if (filled) assert.ok(rate > 200 && rate < 204, `window reported ${rate}`);
+  assert.ok(observed.some(o => o.filled && o.rate !== 200 && o.rate !== 204),
+            'the window resolved nothing a single refresh could not');
+
+  // Once filled it holds a window's worth of samples, not the whole session.
+  assert.ok(window.size >= 2 && window.size <= 12, `held ${window.size}`);
+
+  window.reset();
+  assert.equal(window.size, 0);
+  assert.equal(window.rates().size, 0);
+});
+
+test('a rate window needs two samples and rejects a nonsense span', () => {
+  assert.throws(() => new RateWindow(0), /Invalid rate window/);
+  assert.throws(() => new RateWindow(2, 1), /capacity/);
+
+  const window = new RateWindow(2);
+  // One sample is "not measured yet", which must not read as zero.
+  assert.equal(window.rates().size, 0);
+  window.push(parse({
+    wall_ns: '1000000000',
+    nodes: [node({sources: [source({id: 0, events: '10'})]})]
+  }));
+  assert.equal(window.rates().size, 0);
 });
 
 // --- the declared graph -----------------------------------------------------

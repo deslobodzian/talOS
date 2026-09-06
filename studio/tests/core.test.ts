@@ -3,6 +3,13 @@ import {test} from 'node:test';
 
 import {Coordinator, decode, JitterBuffer, Timeline} from '../src/core';
 import {demoPacket} from '../src/demo';
+import {
+  type GraphTab,
+  isGraphTabId,
+  isTabId,
+  newGraphTab,
+  parseGraphTabs,
+} from '../src/tabs';
 
 const frame = (i: number) => decode(demoPacket(BigInt(i)));
 test(
@@ -77,3 +84,66 @@ test(
             a.at(1000000000n + BigInt(i) * 20000000n),
             b.at(1000000000n + BigInt(i) * 20000000n));
     });
+
+
+// --- graph tabs -------------------------------------------------------------
+
+test('a graph tab id is distinguishable from a built-in view id', () => {
+  const created = newGraphTab([]);
+  assert.ok(isGraphTabId(created.id));
+  assert.ok(!isTabId(created.id));
+  // The built-in ids must not be mistaken for graphs, or selecting one would
+  // render an empty graph panel instead of the view.
+  for (const id of ['overview', 'system', 'signals', 'field'])
+    assert.ok(!isGraphTabId(id), id);
+  // A bare prefix names no graph.
+  assert.ok(!isGraphTabId('graph:'));
+});
+
+test('graph tabs are numbered from the labels in use, not the count', () => {
+  let tabs: GraphTab[] = [];
+  tabs = [...tabs, newGraphTab(tabs)];
+  tabs = [...tabs, newGraphTab(tabs)];
+  assert.deepEqual(tabs.map(t => t.label), ['Graph 1', 'Graph 2']);
+  assert.notEqual(tabs[0].id, tabs[1].id);
+
+  // Closing the first and adding another must not produce a second "Graph 2".
+  const after = tabs.filter(t => t.label !== 'Graph 1');
+  const next = newGraphTab(after);
+  assert.equal(next.label, 'Graph 3');
+
+  // A renamed tab does not constrain the numbering.
+  assert.equal(newGraphTab([{id: 'graph:a', label: 'Shooter', channels: []}]).label,
+               'Graph 1');
+});
+
+test('stored graph tabs are validated, because they come back as unknown JSON',
+     () => {
+       assert.deepEqual(parseGraphTabs(null), []);
+       assert.deepEqual(parseGraphTabs('not an array'), []);
+       assert.deepEqual(parseGraphTabs([1, null, 'x']), []);
+
+       // A tab with no usable id could be neither selected nor closed, which
+       // would strand the user on a panel with no way out.
+       assert.deepEqual(parseGraphTabs([{id: 'nope', label: 'A'}]), []);
+       assert.deepEqual(parseGraphTabs([{id: 'graph:a', label: ''}]), []);
+
+       // Duplicate ids would give two tabs one identity: closing one would
+       // close both, and React would warn on the repeated key.
+       assert.equal(
+           parseGraphTabs([
+             {id: 'graph:a', label: 'A', channels: []},
+             {id: 'graph:a', label: 'B', channels: []}
+           ]).length,
+           1);
+
+       // Channels are filtered rather than trusted; a non-string would reach
+       // uPlot as a series label and render as "[object Object]".
+       assert.deepEqual(
+           parseGraphTabs([{id: 'graph:a', label: 'A', channels: ['x', 2, null]}]),
+           [{id: 'graph:a', label: 'A', channels: ['x']}]);
+
+       // A missing channels list is an empty graph, not a broken one.
+       assert.deepEqual(parseGraphTabs([{id: 'graph:a', label: 'A'}]),
+                        [{id: 'graph:a', label: 'A', channels: []}]);
+     });
