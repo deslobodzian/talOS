@@ -62,10 +62,10 @@ typedef struct TalosSource {
 
 // Status codes shared by the int-returning entry points.
 enum {
-  TALOS_OK = 0,        // Success (publish ok, describe written).
-  TALOS_EMPTY = 1,     // poll_next: caught up, nothing new.
-  TALOS_ERR = -1,      // Generic failure; see talos_last_error().
-  TALOS_ERR_ARG = -2,  // Bad argument (NULL, empty topic, bad size/align...).
+  TALOS_OK = 0,         // Success (publish ok, describe written).
+  TALOS_EMPTY = 1,      // poll_next: caught up, nothing new.
+  TALOS_ERR = -1,       // Generic failure; see talos_last_error().
+  TALOS_ERR_ARG = -2,   // Bad argument (NULL, empty topic, bad size/align...).
   TALOS_ERR_SMALL = -3  // Describe buffer too small; out_written has need.
 };
 
@@ -128,12 +128,12 @@ int32_t talos_describe_emit(const char* node_name, const char* target,
 // Returns NULL (with last_error set) when the registry is unavailable --
 // keep running degraded, do not abort the node.
 TalosNode* talos_node_register(const char* name, const char* target,
-                              uint64_t session_id, uint32_t flags);
+                               uint64_t session_id, uint32_t flags);
 
 // Publish the node's source manifest into its slot. Same sources array shape
 // as talos_describe_emit. Call once, after registration.
 int32_t talos_node_publish(TalosNode* node, const TalosSource* sources,
-                          uint32_t num_sources);
+                           uint32_t num_sources);
 
 // One refresh sample: heartbeat, dispatch count and (zeroed) source counters
 // move together behind the registry seqlock. Call once per loop tick with a
@@ -147,7 +147,7 @@ void talos_node_close(TalosNode* node);
 // with sizeof/offsetof (never copied by hand). Added in ABI 3 so wrapper
 // languages read the layout instead of restating it.
 typedef struct TalosRtmsLayout {
-  uint32_t header_size;    // sizeof(RTMSHeader)
+  uint32_t header_size;     // sizeof(RTMSHeader)
   uint32_t off_writer_seq;  // writer.sequence offset within the segment
   uint32_t off_readers;     // readers[] offset within the segment
   uint32_t reader_stride;   // sizeof one Reader slot
