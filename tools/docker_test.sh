@@ -14,7 +14,7 @@ print_usage() {
 talOS Linux Docker Test Runner
 
 Usage:
-  ./docker_test.sh [options] [--] [bazel args...]
+  tools/docker_test.sh [options] [--] [bazel args...]
 
 Options:
   --os <image>     Base Linux image to test (e.g., ubuntu:24.04, ubuntu:22.04, debian:bookworm)
@@ -25,19 +25,19 @@ Options:
 
 Examples:
   # Run full test suite on Ubuntu 24.04
-  ./docker_test.sh
+  tools/docker_test.sh
 
   # Run full test suite on Ubuntu 22.04
-  ./docker_test.sh --os ubuntu:22.04
+  tools/docker_test.sh --os ubuntu:22.04
 
   # Run a specific test target
-  ./docker_test.sh test //talOS/bridge:node_test
+  tools/docker_test.sh test //talOS/bridge:node_test
 
   # Run with custom bazel flags
-  ./docker_test.sh test //... --test_output=streamed
+  tools/docker_test.sh test //... --test_output=streamed
 
   # Interactive shell for debugging
-  ./docker_test.sh --shell
+  tools/docker_test.sh --shell
 USAGE
 }
 
