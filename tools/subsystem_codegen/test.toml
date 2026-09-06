@@ -1,26 +1,28 @@
 [subsystem]
 name = "test"
-id = 0
+node = "//2026-robot/main_processor/test:node"
+period_us = 5000
 
-[motors]
-[motors.front_left]
+[subsystem.motors.front_left]
 type = "TalonFX"
-id = 1
+bus = "canivore"
+can_id = 1
 inverted = false
-canbus = "canivore"
-slot = 0 # Need better way than this, as will be hard to track between toml files
-stator_current = 40
-supply_current = 120
+supply_limit_a = 40
+stator_limit_a = 80
+slot0 = { p = 0.1, i = 0.0, d = 0.0, v = 0.12 }
 
-[motors.front_right]
+[subsystem.motors.front_right]
 type = "TalonFX"
-id = 2
+bus = "canivore"
+can_id = 2
 inverted = false
-canbus = "canivore"
-slot = 0
-stator_current = 40
-supply_current = 120
+supply_limit_a = 40
+stator_limit_a = 80
+slot0 = { p = 0.1, i = 0.0, d = 0.0, v = 0.12 }
 
-[sensors]
-[sensors.front_left_encoder]
-inverted = false
+[subsystem.sensors.front_left_encoder]
+type = "CANcoder"
+bus = "canivore"
+can_id = 20
+offset_rot = 0.0
