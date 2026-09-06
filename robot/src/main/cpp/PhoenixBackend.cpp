@@ -1,5 +1,6 @@
 #include "PhoenixBackend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <ctre/phoenix6/controls/DutyCycleOut.hpp>
 #include <ctre/phoenix6/controls/MotionMagicVoltage.hpp>
@@ -36,6 +37,8 @@ uint32_t Age(const ph::BaseStatusSignal& signal) {
 }
 }  // namespace
 
+PhoenixBackend::PhoenixBackend(bool is_simulation) : is_simulation_{is_simulation} {}
+
 bool PhoenixBackend::Configure(const hw::Config& c) {
   hw::Validate(c);
   config_ = c;
@@ -47,6 +50,13 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   analog_inputs_.clear();
   encoders_.clear();
   pwm_outputs_.clear();
+
+  sim_rotor_velocity_.fill(0.0);
+  sim_rotor_position_.fill(0.0);
+  motor_to_sensor_map_.fill(-1);
+  last_commands_.fill(hw::MotorRequest{});
+  sim_yaw_deg_ = 0.0;
+  last_sim_time_ = std::nullopt;
 
   for (const auto& d : c.digital_inputs) {
     digital_inputs_.push_back(std::make_unique<frc::DigitalInput>(d.dio));
@@ -142,12 +152,56 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     signals_.push_back(&motor->GetStatorCurrent(false));
     motors_.push_back(std::move(motor));
   }
+
+  if (is_simulation_) {
+    for (auto& motor : motors_) {
+      auto& sim = motor->GetSimState();
+      sim.SetSupplyVoltage(12_V);
+      sim.SetRawRotorPosition(0_tr);
+      sim.SetRotorVelocity(0_tps);
+    }
+    for (auto& device : sensors_) {
+      if (device.encoder) {
+        auto& sim = device.encoder->GetSimState();
+        sim.SetSupplyVoltage(12_V);
+        sim.SetRawPosition(0_tr);
+        sim.SetVelocity(0_tps);
+      } else if (device.imu) {
+        auto& sim = device.imu->GetSimState();
+        sim.SetSupplyVoltage(12_V);
+        sim.SetRawYaw(0_deg);
+      }
+    }
+    for (std::size_t m_idx = 0;
+         m_idx < c.motors.size() && m_idx < motor_to_sensor_map_.size();
+         ++m_idx) {
+      const auto& m = c.motors[m_idx];
+      if (m.feedback == hw::Feedback::kRemoteCANcoder) {
+        for (std::size_t s_idx = 0; s_idx < c.sensors.size(); ++s_idx) {
+          if (c.sensors[s_idx].id == m.feedback_sensor_id) {
+            motor_to_sensor_map_[m_idx] = static_cast<int>(s_idx);
+            break;
+          }
+        }
+      }
+    }
+  }
+
   for (auto* signal : signals_)
     ok &= signal->SetUpdateFrequency(units::hertz_t{c.status_hz}).IsOK();
   return ok;
 }
 
 bool PhoenixBackend::Read(hw::State& s) {
+  if (is_simulation_) {
+    const auto now = std::chrono::steady_clock::now();
+    double dt = last_sim_time_
+                    ? std::chrono::duration<double>(now - *last_sim_time_).count()
+                    : 0.005;
+    if (dt <= 0.0 || dt > 0.05) dt = 0.005;
+    last_sim_time_ = now;
+    UpdateSimulation(dt);
+  }
   ph::BaseStatusSignal::RefreshAll(
       false, std::span<ph::BaseStatusSignal* const>{signals_});
   bool healthy = true;
@@ -236,6 +290,12 @@ bool PhoenixBackend::Read(hw::State& s) {
 }
 bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
   if (commands.size() != motors_.size()) return false;
+  if (is_simulation_) {
+    for (std::size_t i = 0; i < commands.size() && i < last_commands_.size();
+         ++i) {
+      last_commands_[i] = commands[i];
+    }
+  }
   for (std::size_t i = 0; i < commands.size(); ++i) {
     const auto& r = commands[i];
     auto& m = *motors_[i];
@@ -305,4 +365,59 @@ void PhoenixBackend::Neutral() {
   for (auto& motor : motors_)
     motor->SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
   for (auto& pwm : pwm_outputs_) pwm->SetSpeed(0.0);
+  if (is_simulation_) {
+    for (auto& cmd : last_commands_) cmd = hw::MotorRequest{};
+    for (std::size_t i = 0; i < motors_.size(); ++i) {
+      sim_rotor_velocity_[i] = 0.0;
+      motors_[i]->GetSimState().SetRotorVelocity(0_tps);
+    }
+  }
+}
+
+void PhoenixBackend::UpdateSimulation(double dt) {
+  for (std::size_t i = 0; i < motors_.size(); ++i) {
+    const auto& m_cfg = config_.motors[i];
+    auto& sim = motors_[i]->GetSimState();
+    double gear_ratio =
+        m_cfg.rotor_to_sensor_ratio * m_cfg.sensor_to_mechanism_ratio;
+    if (gear_ratio <= 0.0) gear_ratio = 1.0;
+
+    double volts = sim.GetMotorVoltage().value();
+    if (std::abs(volts) > 1e-3) {
+      // Kraken X60 free speed: 100 rps at 12V
+      double target_rotor_rps = (volts / 12.0) * 100.0;
+      double alpha = std::min(1.0, dt / 0.01);
+      sim_rotor_velocity_[i] +=
+          (target_rotor_rps - sim_rotor_velocity_[i]) * alpha;
+    } else if (last_commands_[i].mode == hw::Mode::kVelocity &&
+               std::abs(last_commands_[i].demand) > 1e-6) {
+      // Fallback if closed-loop gains are zero in slot0
+      double target_rotor_rps = last_commands_[i].demand * gear_ratio;
+      sim_rotor_velocity_[i] = target_rotor_rps;
+    } else if ((last_commands_[i].mode == hw::Mode::kPosition ||
+                last_commands_[i].mode == hw::Mode::kMotionMagic) &&
+               std::abs(last_commands_[i].demand) > 1e-6) {
+      sim_rotor_position_[i] = last_commands_[i].demand * gear_ratio;
+      sim_rotor_velocity_[i] = 0.0;
+    } else {
+      sim_rotor_velocity_[i] = 0.0;
+    }
+
+    sim_rotor_position_[i] += sim_rotor_velocity_[i] * dt;
+    sim.SetRotorVelocity(units::turns_per_second_t{sim_rotor_velocity_[i]});
+    sim.SetRawRotorPosition(units::turn_t{sim_rotor_position_[i]});
+
+    // Sync remote CANcoder if mapped
+    int sensor_idx = motor_to_sensor_map_[i];
+    if (sensor_idx >= 0 &&
+        static_cast<std::size_t>(sensor_idx) < sensors_.size() &&
+        sensors_[sensor_idx].encoder) {
+      double mech_rot = sim_rotor_position_[i] / gear_ratio;
+      double mech_rps = sim_rotor_velocity_[i] / gear_ratio;
+      sensors_[sensor_idx].encoder->GetSimState().SetRawPosition(
+          units::turn_t{mech_rot});
+      sensors_[sensor_idx].encoder->GetSimState().SetVelocity(
+          units::turns_per_second_t{mech_rps});
+    }
+  }
 }

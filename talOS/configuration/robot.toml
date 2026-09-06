@@ -29,7 +29,7 @@ max_velocity_rps = 20.0
 cruise_velocity_rps = 20.0
 acceleration_rps2 = 40.0
 jerk_rps3 = 0.0
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
 
 [subsystems.drivetrain.motors.back_left_steer]
 type = "TalonFX"
@@ -52,7 +52,7 @@ max_velocity_rps = 100.0
 cruise_velocity_rps = 5.0
 acceleration_rps2 = 20.0
 jerk_rps3 = 0.0
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+slot0 = { p = 24.0, i = 0.0, d = 0.5, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
 [subsystems.drivetrain.sensors.back_left_encoder]
 type = "CANcoder"
@@ -81,7 +81,7 @@ max_velocity_rps = 20.0
 cruise_velocity_rps = 20.0
 acceleration_rps2 = 40.0
 jerk_rps3 = 0.0
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
 
 [subsystems.drivetrain.motors.back_right_steer]
 type = "TalonFX"
@@ -104,7 +104,7 @@ max_velocity_rps = 100.0
 cruise_velocity_rps = 5.0
 acceleration_rps2 = 20.0
 jerk_rps3 = 0.0
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+slot0 = { p = 24.0, i = 0.0, d = 0.5, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
 [subsystems.drivetrain.sensors.back_right_encoder]
 type = "CANcoder"
@@ -138,7 +138,7 @@ max_velocity_rps = 20.0
 cruise_velocity_rps = 20.0
 acceleration_rps2 = 40.0
 jerk_rps3 = 0.0
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
 
 [subsystems.drivetrain.motors.front_left_steer]
 type = "TalonFX"
@@ -161,7 +161,7 @@ max_velocity_rps = 100.0
 cruise_velocity_rps = 5.0
 acceleration_rps2 = 20.0
 jerk_rps3 = 0.0
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+slot0 = { p = 24.0, i = 0.0, d = 0.5, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
 [subsystems.drivetrain.sensors.front_left_encoder]
 type = "CANcoder"
@@ -190,7 +190,7 @@ max_velocity_rps = 20.0
 cruise_velocity_rps = 20.0
 acceleration_rps2 = 40.0
 jerk_rps3 = 0.0
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
 
 [subsystems.drivetrain.motors.front_right_steer]
 type = "TalonFX"
@@ -213,7 +213,7 @@ max_velocity_rps = 100.0
 cruise_velocity_rps = 5.0
 acceleration_rps2 = 20.0
 jerk_rps3 = 0.0
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+slot0 = { p = 24.0, i = 0.0, d = 0.5, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
 [subsystems.drivetrain.sensors.front_right_encoder]
 type = "CANcoder"
