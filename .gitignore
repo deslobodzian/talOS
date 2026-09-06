@@ -47,3 +47,6 @@ bazel-*
 # Python bytecode
 __pycache__/
 *.py[cod]
+
+# Agent scratch (plans, session notes)
+.agents/
