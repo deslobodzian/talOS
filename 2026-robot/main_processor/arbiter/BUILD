@@ -29,7 +29,7 @@ cc_binary(
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/introspection:reporter",
-        "//talOS/process:process",
+        "//talOS/process:node_main",
     ],
     visibility = ["//visibility:public"],
 )

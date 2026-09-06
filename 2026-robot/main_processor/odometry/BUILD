@@ -40,6 +40,7 @@ cc_binary(
         "//talOS/events:events",
         "//talOS/introspection:describe",
         "//talOS/introspection:reporter",
+        "//talOS/process:node_main",
     ],
 )
 
