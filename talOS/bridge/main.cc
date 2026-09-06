@@ -7,8 +7,9 @@
 
 int main(int argc, char** argv) {
   try {
-    std::string config_path =
-        "2026-robot/main_processor/configuration/robot.toml";
+    // No default: the framework names no robot (ARCHITECTURE.md Rule 1), so
+    // --config is required. Empty means missing.
+    std::string config_path;
     std::string remote_ip = "127.0.0.1";
     uint16_t remote_port = 5802;
     uint16_t local_port = 5803;
@@ -39,10 +40,17 @@ int main(int argc, char** argv) {
         session_id = std::stoull(argv[++i]);
       } else {
         throw std::invalid_argument(
-            "usage: hardware_node [--config PATH] [--remote IP] "
+            "usage: hardware_node --config PATH [--remote IP] "
             "[--duration-s N] [--sim] [--log PATH] [--session-id ID] "
             "[--describe]");
       }
+    }
+
+    if (config_path.empty()) {
+      throw std::invalid_argument(
+          "usage: hardware_node --config PATH [--remote IP] "
+          "[--duration-s N] [--sim] [--log PATH] [--session-id ID] "
+          "[--describe]");
     }
 
     auto robot_config = talos::config::ParseRobotConfig(config_path);

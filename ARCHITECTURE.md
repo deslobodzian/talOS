@@ -175,12 +175,10 @@ BUILD files alone.
 
 **1. talOS never depends on a robot.** No target under `talOS/` may name a
 target under `2026-robot/`, and none does. A second robot is therefore a new
-sibling of `2026-robot/`, not a fork of the framework. The one wrinkle, and it
-is a real one: `talOS/launcher/launcher.h` and `talOS/bridge/main.cc` carry
-`"2026-robot/main_processor/configuration/robot.toml"` as the default value of
-`--config`. That is a string, not a build edge — the binaries work against any
-config path — but it is the only place the framework mentions a robot at all,
-and a second robot in this repo is the moment to make it a required flag.
+sibling of `2026-robot/`, not a fork of the framework. `--config` is a
+required flag on both binaries that take one (`talOS/launcher` and
+`talOS/bridge`), precisely so the framework never mentions a robot at all:
+the binaries work against any config path, and no default names one.
 
 **2. talOS never depends on studio; a robot may.**
 `//2026-robot/main_processor/telemetry` depends on `//studio/bridge:wire` and

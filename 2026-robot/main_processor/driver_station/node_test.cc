@@ -5,14 +5,13 @@
 #include <chrono>
 
 #include "2026-robot/main_processor/driver_station/driver_station_message_generated.h"
-#include "2026-robot/main_processor/drivetrain/packet.h"
+#include "2026-robot/main_processor/driver_station/packet.h"
 #include "talOS/events/simulated_event_loop.h"
 
 namespace talos::driver_station {
 namespace {
 
 using namespace std::chrono_literals;
-using talos::drive::Packet;
 
 Packet CreatePacket(const DriverStationData& data) {
   Packet pkt{};

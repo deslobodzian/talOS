@@ -1,4 +1,5 @@
 #include "2026-robot/main_processor/arbiter/node.h"
+#include "2026-robot/main_processor/driver_station/node.h"
 
 #include <gtest/gtest.h>
 

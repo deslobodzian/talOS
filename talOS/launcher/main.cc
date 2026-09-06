@@ -9,8 +9,8 @@
 
 namespace {
 
-// Node targets resolve to bazel-bin/... paths, and the default configuration
-// path is workspace-relative, so the launcher only makes sense with the
+// Node targets resolve to bazel-bin/... paths, and a relative --config path
+// is workspace-relative, so the launcher only makes sense with the
 // workspace as its working directory. `bazel run` starts a binary in its
 // runfiles tree instead, where neither resolves -- but it exports the
 // workspace it was invoked from, so honour that and behave the same either way.
@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
       } else if (arg == "--describe-timeout-ms" && i + 1 < argc) {
         options.describe_timeout_ms = std::stoi(argv[++i]);
       } else if (arg == "--help" || arg == "-h") {
-        std::cout << "usage: launcher [--config PATH] [--output-dir PATH] "
+        std::cout << "usage: launcher --config PATH [--output-dir PATH] "
                      "[--duration-s N] [--session-id ID] [--sim] "
                      "[--start-sim-gateway] [--describe-only] "
                      "[--allow-graph-errors] [--describe-timeout-ms MS]\n"

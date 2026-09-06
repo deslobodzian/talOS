@@ -107,7 +107,9 @@ struct SessionManifest {
 };
 
 struct LauncherOptions {
-  std::string config_path{"2026-robot/main_processor/configuration/robot.toml"};
+  // No default: the framework names no robot (ARCHITECTURE.md Rule 1), so
+  // the caller must say which config to launch. Empty means missing.
+  std::string config_path;
   std::string output_dir;
   uint64_t session_id{0};
   bool simulation{false};
@@ -557,6 +559,10 @@ class Launcher {
   // Runs the declared nodes, waits for completion/signals, and produces
   // manifest. Returns 0 on success, or non-zero if any critical node failed.
   int Run() {
+    if (options_.config_path.empty()) {
+      std::cerr << "launcher: --config PATH is required\n";
+      return 1;
+    }
     std::filesystem::create_directories(options_.output_dir);
 
     config::RobotConfig robot_config;
