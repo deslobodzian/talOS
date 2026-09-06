@@ -43,3 +43,7 @@
 # Bazel stuff
 bazel-*
 *MODULE.bazel.lock
+
+# Python bytecode
+__pycache__/
+*.py[cod]
