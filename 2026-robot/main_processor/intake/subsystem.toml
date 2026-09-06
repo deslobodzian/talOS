@@ -1,0 +1,15 @@
+# Intake subsystem. Parsed via the [[subsystems]] manifest in
+# 2026-robot/main_processor/configuration/robot.toml and merged with the other
+# subsystem files into one canonical view before validation.
+[subsystem]
+name = "intake"
+node = "//2026-robot/main_processor/intake:node"
+period_us = 20000
+
+[motors.roller]
+type = "TalonFX"
+bus = "rio"
+can_id = 10
+
+[digital_inputs.beam_break]
+dio = 1
