@@ -23,7 +23,7 @@ enum class SharedMemoryMode {
 class SharedMemoryPtr {
 public:
     SharedMemoryPtr(std::string_view name, std::size_t size) :
-        shm_name_(name),
+        shm_name_(normalize_name(name)),
         size_(size) {
         if (map_ptr() < 0) {
             throw std::runtime_error("Failed to attach ptr!");
@@ -78,11 +78,25 @@ public:
     }
 
 private:
- // Bounded so a real mismatch is still reported promptly: 200 x 250us.
- static constexpr int kAttachAttempts = 200;
- static constexpr useconds_t kAttachRetryUs = 250;
+  // Bounded so a real mismatch is still reported promptly: 200 x 250us.
+  static constexpr int kAttachAttempts = 200;
+  static constexpr useconds_t kAttachRetryUs = 250;
 
- static off_t to_off_t(std::size_t size) {
+  static std::string normalize_name(std::string_view name) {
+    std::string_view stripped = name;
+    while (stripped.starts_with('/')) {
+      stripped.remove_prefix(1);
+    }
+    std::string result;
+    result.reserve(stripped.size() + 1);
+    result.push_back('/');
+    for (char c : stripped) {
+      result.push_back(c == '/' ? '_' : c);
+    }
+    return result;
+  }
+
+  static off_t to_off_t(std::size_t size) {
    constexpr auto max_off_t =
        static_cast<std::size_t>(std::numeric_limits<off_t>::max());
    if (size > max_off_t) {
