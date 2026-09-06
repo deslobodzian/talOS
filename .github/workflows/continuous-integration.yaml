@@ -28,10 +28,21 @@ jobs:
         # Share repository cache between workflows.
         repository-cache: true
 
-    - name: Install DBus and Pkg-Config
+    - name: Install Linux dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libdbus-1-dev pkg-config
+        sudo apt-get install -y \
+        pkg-config \
+        libdbus-1-dev \
+        libglib2.0-dev \
+        libgtk-3-dev \
+        libwebkit2gtk-4.1-dev \
+        libayatana-appindicator3-dev \
+        librsvg2-dev \
+        libssl-dev \
+        libxdo-dev \
+        patchelf
+        
     - name: Build
       run: bazel build //... --noshow_progress --test_output=errors
 
