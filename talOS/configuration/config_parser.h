@@ -809,9 +809,11 @@ inline toml::table ParseTomlFile(const std::string& path) {
   }
 }
 
+// Nodes copy through insert_or_assign (make_node deep-copies via visit);
+// never name toml::node as a value type, it is an abstract base.
 inline void CopyTableInto(toml::table& dst, const toml::table& src) {
   for (auto&& [k, v] : src) {
-    dst.insert_or_assign(std::string(k.str()), toml::node{v});
+    dst.insert_or_assign(std::string(k.str()), v);
   }
 }
 
@@ -839,8 +841,8 @@ inline RobotConfig ParseRobotConfig(const std::string& path) {
         throw std::invalid_argument("invalid [[subsystems]] entry in " + path + ": needs 'name' and 'path'");
       }
       const std::string name(*name_view);
-      fs::path file(std::string(*rel_view));
-      if (file.is_relative()) file = base / file;
+      const fs::path rel{std::string(*rel_view)};
+      const fs::path file = rel.is_absolute() ? rel : base / rel;
       toml::table sub_file = detail::ParseTomlFile(file.string());
 
       auto* header = sub_file["subsystem"].as_table();
@@ -857,11 +859,11 @@ inline RobotConfig ParseRobotConfig(const std::string& path) {
       toml::table view;
       for (auto&& [k, v] : *header) {
         if (k.str() == "name") continue;
-        view.insert_or_assign(std::string(k.str()), toml::node{v});
+        view.insert_or_assign(std::string(k.str()), v);
       }
       for (auto&& [k, v] : sub_file) {
         if (k.str() == "subsystem") continue;
-        view.insert_or_assign(std::string(k.str()), toml::node{v});
+        view.insert_or_assign(std::string(k.str()), v);
       }
       subs_view.insert_or_assign(name, std::move(view));
     }

@@ -6,6 +6,9 @@ load("@flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")
 flatbuffer_cc_library(
     name = "ipc_test_message",
     srcs = ["ipc_test_message.fbs"],
+    # The Python round-trip peer is the only external consumer of this test
+    # message; it stays package-private otherwise.
+    visibility = ["//talOS/ipc/python:__pkg__"],
 )
 
 cc_library(

@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <filesystem>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -93,29 +94,98 @@ TEST(Swerve, RotationDesaturationAndInvalidInput) {
 // Writes robot.toml with an extra subsystem spliced in. Logical ids are handed
 // out by sorting on (subsystem name, device name) across the whole robot, so a
 // subsystem sorting before "drivetrain" renumbers every swerve device.
-std::string WriteConfigWithExtraSubsystem(const char* subsystem_name) {
-  std::string toml;
-  {
-    FILE* in =
-        std::fopen("2026-robot/main_processor/configuration/robot.toml", "rb");
-    EXPECT_NE(in, nullptr);
-    char buffer[4096];
-    std::size_t n;
-    while ((n = std::fread(buffer, 1, sizeof(buffer), in)) > 0)
-      toml.append(buffer, n);
-    std::fclose(in);
-  }
-  toml += std::string{"\n[subsystems."} + subsystem_name +
-          "]\nnode = \"//example/x:node\"\nperiod_us = 5000\n\n" +
-          "[subsystems." + subsystem_name +
-          ".motors.joint]\ntype = \"TalonFX\"\nbus = \"rio\"\ncan_id = 40\n";
+std::string ReadTestFile(const std::string& path) {
+  std::string out;
+  FILE* in = std::fopen(path.c_str(), "rb");
+  EXPECT_NE(in, nullptr);
+  if (in == nullptr) return out;
+  char buffer[4096];
+  std::size_t n;
+  while ((n = std::fread(buffer, 1, sizeof(buffer), in)) > 0)
+    out.append(buffer, n);
+  std::fclose(in);
+  return out;
+}
 
-  std::string path = std::string{"/tmp/talos_geometry_"} + subsystem_name +
-                     "_" + std::to_string(getpid()) + ".toml";
+void WriteTestFile(const std::string& path, const std::string& content) {
   FILE* out = std::fopen(path.c_str(), "wb");
   EXPECT_NE(out, nullptr);
-  std::fwrite(toml.data(), 1, toml.size(), out);
+  if (out == nullptr) return;
+  std::fwrite(content.data(), 1, content.size(), out);
   std::fclose(out);
+}
+
+std::string WriteConfigWithExtraSubsystem(const char* subsystem_name) {
+  // Manifest mode: stage a self-consistent config dir holding a manifest
+  // copy plus every subsystem file it names, all by absolute path, so
+  // sibling resolution never depends on where the source tree lives.
+  const std::string dir = std::string{"/tmp/talos_geometry_"} +
+                          subsystem_name + "_" + std::to_string(getpid());
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  EXPECT_FALSE(ec);
+
+  const std::string src_cfg = "2026-robot/main_processor/configuration";
+  std::string toml = ReadTestFile(src_cfg + "/robot.toml");
+
+  toml::table manifest_tbl;
+  try {
+    manifest_tbl = toml::parse(toml);
+  } catch (const toml::parse_error& err) {
+    ADD_FAILURE() << "cannot parse robot.toml: " << err.what();
+    return "";
+  }
+  auto* manifest = manifest_tbl["subsystems"].as_array();
+  if (manifest == nullptr) {
+    ADD_FAILURE() << "robot.toml has no [[subsystems]] manifest";
+    return "";
+  }
+  for (auto&& entry_node : *manifest) {
+    auto* entry = entry_node.as_table();
+    if (entry == nullptr) {
+      ADD_FAILURE() << "manifest entry is not a table";
+      return "";
+    }
+    const auto name_view = (*entry)["name"].value<std::string_view>();
+    const auto rel_view = (*entry)["path"].value<std::string_view>();
+    if (!name_view || !rel_view) {
+      ADD_FAILURE() << "manifest entry needs 'name' and 'path'";
+      return "";
+    }
+    const std::string name(*name_view);
+    const std::string rel(*rel_view);
+    if (rel.rfind("../", 0) != 0) {
+      ADD_FAILURE() << "manifest path is not tree-relative: " << rel;
+      return "";
+    }
+    // Source by subsystem name, not by the manifest's ../-relative path: the
+    // sandbox matches literal paths, so .. segments deny an otherwise allowed
+    // open. The parser still resolves the manifest's own rel path, which is
+    // what this test exercises.
+    const std::string dst = dir + "/" + name + ".toml";
+    WriteTestFile(dst,
+                  ReadTestFile("2026-robot/main_processor/" + name + "/subsystem.toml"));
+    const std::string needle = "path = \"" + rel + "\"";
+    const auto pos = toml.find(needle);
+    if (pos == std::string::npos) {
+      ADD_FAILURE() << "manifest text missing entry for " << name;
+      return "";
+    }
+    toml.replace(pos, needle.size(), "path = \"" + dst + "\"");
+  }
+
+  // The extra subsystem under test, exercising multi-file merge: "arm" sorts
+  // before "drivetrain", so every drivetrain id shifts by one.
+  const std::string arm_path = dir + "/" + subsystem_name + ".toml";
+  WriteTestFile(arm_path,
+                std::string{"[subsystem]\nname = \""} + subsystem_name +
+                    "\"\nnode = \"//example/x:node\"\nperiod_us = 5000\n\n" +
+                    "[motors.joint]\ntype = \"TalonFX\"\nbus = \"rio\"\ncan_id = 40\n");
+  toml += std::string{"\n[[subsystems]]\nname = \""} + subsystem_name +
+          "\"\npath = \"" + arm_path + "\"\n";
+
+  const std::string path = dir + "/robot.toml";
+  WriteTestFile(path, toml);
   return path;
 }
 
@@ -133,7 +203,9 @@ TEST(SwerveGeometry, FollowsDeviceRenumberingCausedByAnUnrelatedSubsystem) {
   // "arm" sorts before "drivetrain", so every drivetrain id shifts by one.
   const auto path = WriteConfigWithExtraSubsystem("arm");
   const auto shifted = config::ParseRobotConfig(path);
-  std::remove(path.c_str());
+  std::error_code rm_ec;
+  std::filesystem::remove_all(
+      std::filesystem::path(path).parent_path(), rm_ec);
   const auto shifted_geometry = BuildSwerveGeometry(shifted);
 
   ASSERT_NE(MotorIdNamed(baseline.hardware, "front_left_drive"),
