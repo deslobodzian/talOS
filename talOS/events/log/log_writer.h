@@ -1,9 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -24,14 +24,10 @@ namespace talos::event::log {
 //
 // Records are copied into a preallocated chunk and only reach the file when
 // that chunk is full, so a loop that logs every dispatch pays one memcpy per
-// record and no syscall at all. By default a background thread performs the
-// actual writes: a full 1 MiB write can block for milliseconds, which a 1 kHz
-// control loop cannot absorb, so the loop thread only ever hands off a pointer
-// under a mutex it holds for a few instructions.
-//
-// The loop thread blocks only if every chunk is in flight, meaning the disk
-// has fallen a whole pool behind. That is a real stall and is counted, not
-// hidden: dropping records instead would silently break replay.
+// record and no syscall at all. A single-producer/single-consumer ring hands
+// chunks to the background writer without locking or waiting on the producer.
+// If the pool fills, capture stops permanently and failed() becomes true.
+// Previously accepted chunks are drained, preserving a prefix without holes.
 //
 // dispatch()/fetch()/send()/finish() never throw: a full disk or a transient
 // EIO must not bring down a control loop that is otherwise healthy. Such
@@ -40,10 +36,11 @@ inline constexpr std::size_t DEFAULT_CHUNK_BYTES = 256u << 10;
 inline constexpr std::size_t DEFAULT_CHUNK_COUNT = 4;
 
 struct LogWriterOptions {
-  // Size of one buffer. A record larger than this grows its chunk once.
+  // Minimum buffer size. start() grows all chunks to fit the manifest's largest
+  // message; records exceeding that capacity fail capture without allocating.
   std::size_t chunk_bytes{DEFAULT_CHUNK_BYTES};
 
-  // How many buffers may be in flight before the loop thread has to wait.
+  // How many buffers may be in flight before capture fails.
   std::size_t chunk_count{DEFAULT_CHUNK_COUNT};
 
   // Write from a background thread. Turn off for tests that want writes to
@@ -61,11 +58,13 @@ class LogWriter {
   // copied into the file header, truncated to MAX_SOURCE_NAME characters.
   // Throws std::system_error if the file cannot be opened.
   explicit LogWriter(std::string_view path, std::string_view process_name,
-                     Options options = Options{});
+                     Options options = Options{},
+                     std::uint64_t session_id = 0);
 
   // Convenience overload: one chunk of `buffer_bytes`, written synchronously.
   LogWriter(std::string_view path, std::string_view process_name,
-            std::size_t buffer_bytes);
+            std::size_t buffer_bytes,
+            std::uint64_t session_id = 0);
 
   ~LogWriter();
 
@@ -92,12 +91,21 @@ class LogWriter {
   // Safe to call repeatedly, including after a failure.
   void flush() noexcept;
 
+  // True once anything has gone wrong: the disk refused a write, or capture
+  // stopped. Treat it as a fault on the robot; a log that stops early is a log
+  // you cannot replay the rest of the match from.
   bool failed() const noexcept;
   std::string error() const;
 
-  // Number of times the loop thread had to wait for a free buffer. Anything
-  // other than zero means logging is competing with the control loop.
-  std::uint64_t stalls() const noexcept;
+  // True when the loop outran the writer and capture was abandoned, as opposed
+  // to a disk error. Sticky, because capture never resumes: doing so would
+  // leave a hole in the middle of the log and replay would silently skip it.
+  //
+  // This never waits and the producer never blocks on it, which is the whole
+  // point: a control loop must not stall behind a slow disk.
+  bool capture_stopped() const noexcept;
+
+  std::uint64_t session_id() const noexcept;
 
  private:
   struct Chunk {
@@ -122,22 +130,24 @@ class LogWriter {
 
     int fd{-1};
     std::string process_name;
+    std::uint64_t session_id{0};
     Options options;
 
     std::vector<Chunk> pool;
-    std::deque<Chunk*> free_chunks;
-    std::deque<Chunk*> pending;
     Chunk* active{nullptr};
+    std::atomic<std::uint64_t> submitted{0};
+    std::atomic<std::uint64_t> completed{0};
+
+    enum class CaptureError { NONE, POOL_FULL, RECORD_TOO_LARGE };
+    std::atomic<CaptureError> capture_error{CaptureError::NONE};
 
     mutable std::mutex mutex;
     std::condition_variable pending_ready;
     std::condition_variable chunk_ready;
     std::thread writer;
-    bool writing{false};
     bool stopping{false};
-    bool failed{false};
+    std::atomic<bool> failed{false};  // Disk failure, independent of capture.
     std::string error;
-    std::uint64_t stalls{0};
   };
 
   std::unique_ptr<State> state_;

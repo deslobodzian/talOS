@@ -14,6 +14,9 @@ enum class EventKind : std::uint16_t {
   FETCH = 3,
   SEND = 4,
   EXIT = 5,
+  ARM_TIMER = 6,
+  DISARM_TIMER = 7,
+  HANDLER_EXIT = 8,
 };
 
 constexpr const char* to_string(EventKind kind) {
@@ -28,6 +31,12 @@ constexpr const char* to_string(EventKind kind) {
       return "SEND";
     case EventKind::EXIT:
       return "EXIT";
+    case EventKind::ARM_TIMER:
+      return "ARM_TIMER";
+    case EventKind::DISARM_TIMER:
+      return "DISARM_TIMER";
+    case EventKind::HANDLER_EXIT:
+      return "HANDLER_EXIT";
   }
   return "UNKNOWN";
 }

@@ -104,10 +104,19 @@ class SimulatedEventLoop
   MonotonicTime now_impl() const { return now_; }
 
   void arm_timer(std::uint16_t id, MonotonicTime deadline, Duration period) {
+    const bool record = this->timer_change_is_recorded(id, true, deadline,
+                                                       period);
     scheduler_.schedule(id, deadline, period);
+    if (record) {
+      this->record_operation(EventKind::ARM_TIMER, id, deadline, period);
+    }
   }
 
-  void disarm_timer(std::uint16_t id) { scheduler_.disable(id); }
+  void disarm_timer(std::uint16_t id) {
+    const bool record = this->timer_change_is_recorded(id, false, {}, {});
+    scheduler_.disable(id);
+    if (record) this->record_operation(EventKind::DISARM_TIMER, id);
+  }
 
   // Publishes onto a topic from outside any loop, as a sensor or another
   // process would.
@@ -121,9 +130,15 @@ class SimulatedEventLoop
 
   void run_for(Duration duration) { run_until(now_ + duration); }
 
+  // Runs to `end` and returns. The loop is quiescent between calls, which is
+  // what makes stepping useful: the test can inject messages and re-arm timers
+  // in between, exactly as the outside world would.
   void run_until(MonotonicTime end) {
+    typename Base::RunScope in_run{*this};
+
     if (!started_) {
-      this->begin_run(now_);
+      scheduler_.reserve(this->manifest().size() + 1);
+      this->begin_run();
       scheduler_.schedule(INTERNAL_POLL_TIMER_ID, now_ + options_.tick_period,
                           options_.tick_period);
       started_ = true;
@@ -188,6 +203,7 @@ class SimulatedEventLoop
   }
 
   void on_exit_requested() {}
+  void on_handler_exit() {}
 
   SendOutcome send_impl(std::uint16_t id, std::span<const std::byte> bytes) {
     Cursor& cursor = cursors_[id];

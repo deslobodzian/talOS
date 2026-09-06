@@ -41,8 +41,8 @@ Thunk make_message_thunk(Class* instance) {
 }
 
 // A registered timer. Arming and disarming go through the loop so that the
-// realtime and simulated loops share one scheduler, and replay can ignore them
-// entirely: on replay the firings come from the log, not from the schedule.
+// realtime and simulated loops share one scheduler. Replay validates scheduling
+// operations while taking the actual firings from the log.
 template <typename Loop>
 class Timer {
  public:

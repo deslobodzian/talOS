@@ -1,0 +1,21 @@
+namespace talos.drive;
+
+// Robot-relative chassis request. x forward, y left, yaw CCW.
+// issued_ns uses the companion event Poller monotonic clock.
+struct ChassisTarget {
+  vx_mps:double;
+  vy_mps:double;
+  omega_radps:double;
+  issued_ns:long;
+  enabled:bool;
+}
+
+struct DrivetrainState {
+  timestamp_ns:ulong;
+  enabled:bool;
+  vx_mps:double;
+  vy_mps:double;
+  omega_radps:double;
+  yaw_rot:double;
+  yaw_rate_rps:double;
+}

@@ -48,10 +48,17 @@ class RealtimeEventLoop
     std::size_t slots{MAX_SLOTS};
   };
 
-  explicit RealtimeEventLoop(Options options = Options{}) : options_{options} {}
+  // The origin is fixed here rather than in run(), so that a program can build
+  // its initial schedule out of monotonic_now() during setup and have replay
+  // arrive at the same numbers.
+  explicit RealtimeEventLoop(Options options = Options{}) : options_{options} {
+    this->set_start_time(Poller::now());
+  }
 
   explicit RealtimeEventLoop(Recorder recorder, Options options = Options{})
-      : Base{std::move(recorder)}, options_{options} {}
+      : Base{std::move(recorder)}, options_{options} {
+    this->set_start_time(Poller::now());
+  }
 
   using SendOutcome = typename Base::SendOutcome;
   using FetchResult = typename Base::FetchResult;
@@ -59,19 +66,19 @@ class RealtimeEventLoop
   MonotonicTime now_impl() const { return Poller::now(); }
 
   void arm_timer(std::uint16_t id, MonotonicTime deadline, Duration period) {
+    const bool record = this->timer_change_is_recorded(id, true, deadline,
+                                                       period);
     scheduler_.schedule(id, deadline, period);
-
-    // Waking is a syscall, and it is pointless in the two common cases: before
-    // the loop starts, and from inside a dispatch, where the loop is not
-    // waiting and re-reads the schedule the moment the handler returns. That
-    // leaves only the case that needs it, an arm from another thread while the
-    // loop sleeps.
-    if (this->running() && !this->in_dispatch()) {
-      poller_.wake();
+    if (record) {
+      this->record_operation(EventKind::ARM_TIMER, id, deadline, period);
     }
   }
 
-  void disarm_timer(std::uint16_t id) { scheduler_.disable(id); }
+  void disarm_timer(std::uint16_t id) {
+    const bool record = this->timer_change_is_recorded(id, false, {}, {});
+    scheduler_.disable(id);
+    if (record) this->record_operation(EventKind::DISARM_TIMER, id);
+  }
 
   // Runs until exit() is called.
   void run() { run_until(MonotonicTime::max()); }
@@ -79,9 +86,14 @@ class RealtimeEventLoop
   void run_for(Duration duration) { run_until(Poller::now() + duration); }
 
   void run_until(MonotonicTime end) {
-    MonotonicTime now = Poller::now();
-    this->begin_run(now);
+    if (options_.tick_period <= Duration::zero()) {
+      throw std::invalid_argument("tick period must be positive");
+    }
+    scheduler_.reserve(this->manifest().size() + 1);
+    typename Base::RunScope in_run{*this};
+    this->begin_run();
 
+    MonotonicTime now = Poller::now();
     scheduler_.schedule(INTERNAL_POLL_TIMER_ID, now + options_.tick_period,
                         options_.tick_period);
 
@@ -116,6 +128,25 @@ class RealtimeEventLoop
 
  private:
   struct Transport {
+    Transport() = default;
+    Transport(const Transport&) = delete;
+    Transport& operator=(const Transport&) = delete;
+    Transport(Transport&& other) noexcept
+        : queue{std::move(other.queue)},
+          reader_id{std::exchange(other.reader_id, std::nullopt)} {}
+    Transport& operator=(Transport&& other) noexcept {
+      if (this != &other) {
+        release();
+        queue = std::move(other.queue);
+        reader_id = std::exchange(other.reader_id, std::nullopt);
+      }
+      return *this;
+    }
+    ~Transport() { release(); }
+    void release() {
+      if (reader_id) queue->release_reader(*reader_id);
+      reader_id.reset();
+    }
     std::optional<RTMSQueue> queue;
     std::optional<std::size_t> reader_id;
   };
@@ -144,6 +175,10 @@ class RealtimeEventLoop
 
     if (registration.kind != SourceKind::SENDER) {
       transport.reader_id = transport.queue->register_reader();
+      if (!transport.reader_id) {
+        throw RegistrationError("no reader slots available for '" +
+                                registration.name + "'");
+      }
     }
 
     if (registration.kind == SourceKind::WATCHER) {
@@ -156,6 +191,7 @@ class RealtimeEventLoop
   }
 
   void on_exit_requested() { poller_.wake(); }
+  void on_handler_exit() {}
 
   SendOutcome send_impl(std::uint16_t id, std::span<const std::byte> bytes) {
     RTMSQueue& queue = *transports_[id].queue;

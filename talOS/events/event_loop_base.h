@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -84,12 +85,23 @@ class EventLoopBase {
   // so that two reads inside one callback cannot disagree, which is what makes
   // the recorded value sufficient to reproduce the run.
   MonotonicTime monotonic_now() const {
-    return in_dispatch() ? context_.now : start_time_;
+    if (in_dispatch()) {
+      return context_.now;
+    }
+
+    // Before the run: the loop's origin, which is fixed at construction and is
+    // therefore the same number when recording and when replaying. A program
+    // building its initial schedule out of this gets a manifest that matches.
+    //
+    // Once the run has started: the loop's own clock, so a harness stepping a
+    // simulation between run_for calls sees time where it left it rather than
+    // back at the origin.
+    return registration_closed_ ? derived().now_impl() : start_time_;
   }
 
   MonotonicTime start_time() const { return start_time_; }
   const Context& context() const { return context_; }
-  bool in_dispatch() const { return context_.dispatch_index != 0; }
+  bool in_dispatch() const { return active_loop_ == this; }
   bool running() const { return running_; }
 
   std::uint64_t dispatch_count() const { return dispatch_index_; }
@@ -150,10 +162,13 @@ class EventLoopBase {
     return has_value;
   }
 
-  // Stops the loop after the current dispatch completes. Safe to call from a
-  // handler; derived loops that block must also make it safe from a signal
-  // handler or another thread.
+  // Safe from a handler or another thread, but not from a signal handler.
+  // Other operations and lifecycle calls require external serialization.
   void exit() {
+    if (in_dispatch()) {
+      derived().on_handler_exit();
+      record_operation(EventKind::HANDLER_EXIT, context_.source_id);
+    }
     running_ = false;
     derived().on_exit_requested();
   }
@@ -175,12 +190,95 @@ class EventLoopBase {
 
   Source& source(std::uint16_t id) { return sources_[id]; }
 
+  void record_operation(EventKind kind, std::uint16_t id,
+                        MonotonicTime deadline = {}, Duration period = {}) {
+    Context operation = context_;
+    operation.kind = kind;
+    operation.source_id = id;
+    operation.event_time = deadline;
+    operation.sequence = static_cast<std::uint64_t>(period.count());
+    operation.dropped = 0;
+    recorder_.dispatch(operation, {});
+  }
+
+  // Classifies a timer change and returns true when it has to appear in the
+  // log.
+  //
+  // Three cases, and the difference between them is who caused the change:
+  //  - inside a dispatch: the recorded program did it, so it is an output and
+  //    replay must see the program do it again. Recorded.
+  //  - before the run: it is part of the program's shape, so it goes in the
+  //    manifest and replay is rejected outright if it differs.
+  //  - while the loop is stopped between runs: the harness did it from
+  //    outside, exactly like injecting a message. Not recorded, because its
+  //    only effect is the firings it produces, and those are recorded.
+  //
+  // A change while the loop is actually running and not dispatching can only
+  // come from another thread. That is rejected before any loop-owned state is
+  // touched, because the scheduler is not thread-safe and because such a
+  // change has no reproducible position in the log.
+  bool timer_change_is_recorded(std::uint16_t id, bool armed,
+                                MonotonicTime deadline, Duration period) {
+    if (in_run_ && !in_dispatch()) {
+      throw std::logic_error(
+          "timer changes while the loop is running require a loop callback");
+    }
+    if (id >= manifest_.size() || manifest_[id].kind != SourceKind::TIMER) {
+      throw std::invalid_argument("invalid timer id");
+    }
+    if (period < Duration::zero()) {
+      throw std::invalid_argument("timer period must not be negative");
+    }
+    if (in_dispatch()) return true;
+
+    if (!registration_closed_) {
+      // Stored relative to the loop's origin. An absolute deadline is a
+      // property of when the machine happened to boot, so recording one would
+      // make every realtime log unreplayable unless the caller carried the
+      // number across by hand.
+      auto& reg = manifest_[id];
+      reg.armed = armed;
+      reg.offset_ns = armed ? (deadline - start_time_).count() : 0;
+      reg.period_ns = armed ? period.count() : 0;
+    }
+    return false;
+  }
+
+  // Fixes the loop's origin. Called by the derived loop before any
+  // registration, so that monotonic_now() is meaningful during setup and the
+  // manifest's timer offsets mean the same thing on record and on replay.
+  void set_start_time(MonotonicTime start) {
+    if (registration_closed_) {
+      throw std::logic_error("the loop origin is fixed once the run starts");
+    }
+    start_time_ = start;
+  }
+
+  // Marks the loop as being inside its run function, which is what makes a
+  // timer change from another thread detectable.
+  class RunScope {
+   public:
+    explicit RunScope(EventLoopBase& loop) : loop_{loop} {
+      loop_.in_run_ = true;
+    }
+    ~RunScope() { loop_.in_run_ = false; }
+
+    RunScope(const RunScope&) = delete;
+    RunScope& operator=(const RunScope&) = delete;
+
+   private:
+    EventLoopBase& loop_;
+  };
+
   // Freezes registration and opens the log. Every loop calls this once, first
-  // thing in run().
-  void begin_run(MonotonicTime start) {
+  // thing in run(), after set_start_time().
+  void begin_run() {
+    if (registration_closed_) {
+      throw std::logic_error("event loop cannot be restarted");
+    }
+    const MonotonicTime start = start_time_;
     registration_closed_ = true;
     running_ = true;
-    start_time_ = start;
     dispatch_index_ = 0;
     context_ = Context{};
     recorder_.start(manifest_, start);
@@ -236,6 +334,15 @@ class EventLoopBase {
   // The dispatch record is written before the handler runs so that the sends
   // and fetches it performs are ordered after their parent in the log.
   void invoke(const Context& context, std::span<const std::byte> payload) {
+    struct DispatchScope {
+      EventLoopBase& loop;
+      EventLoopBase* previous;
+      ~DispatchScope() {
+        active_loop_ = previous;
+        loop.context_ = Context{};
+      }
+    } scope{*this, active_loop_};
+    active_loop_ = this;
     context_ = context;
     recorder_.dispatch(context, payload);
 
@@ -292,7 +399,13 @@ class EventLoopBase {
     sources_.push_back(std::move(source));
     manifest_.push_back(registration);
 
-    derived().on_register(manifest_.back());
+    try {
+      derived().on_register(manifest_.back());
+    } catch (...) {
+      manifest_.pop_back();
+      sources_.pop_back();
+      throw;
+    }
     return registration.id;
   }
 
@@ -304,7 +417,9 @@ class EventLoopBase {
   Context context_{};
   std::uint64_t dispatch_index_{0};
   MonotonicTime start_time_{};
-  bool running_{false};
+  inline static thread_local EventLoopBase* active_loop_{nullptr};
+  std::atomic<bool> running_{false};
+  std::atomic<bool> in_run_{false};
   bool registration_closed_{false};
 };
 

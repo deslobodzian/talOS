@@ -408,8 +408,16 @@ int RunBenchmark(const Config& config,
   if constexpr (std::is_same_v<Recorder, LogWriter>) {
     std::printf("=== logging overhead ===\n");
     std::printf("  logging:  on (%s)\n", config.log_path.c_str());
-    std::printf("  stalls:   %llu (loop thread waits for a free chunk)\n",
-                static_cast<unsigned long long>(loop.recorder().stalls()));
+
+    // A run that lost capture measured something other than what it claims to
+    // have measured, so say so loudly rather than printing a tidy table.
+    if (loop.recorder().failed()) {
+      std::printf("  CAPTURE FAILED: %s\n", loop.recorder().error().c_str());
+      std::printf("  the log is a prefix; the numbers above still stand but\n");
+      std::printf("  the run is not replayable end to end\n");
+    } else {
+      std::printf("  capture:  complete\n");
+    }
     std::printf("\n");
   } else {
     std::printf("=== logging overhead ===\n");

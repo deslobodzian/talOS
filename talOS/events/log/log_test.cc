@@ -1,11 +1,15 @@
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -220,16 +224,34 @@ TEST(LogRoundTrip, AllFieldsAndManifestMatch) {
   EXPECT_EQ(index, expected.size());
   EXPECT_EQ(reader.record_count(), expected.size());
   EXPECT_FALSE(reader.truncated());
+  EXPECT_EQ(reader.format_version(), 3u);
+  EXPECT_EQ(reader.session_id(), 0u);
 
   ::unlink(path.c_str());
 }
 
-TEST(LogRoundTrip, SmallBufferForcesFlushAndGrowth) {
+TEST(LogRoundTrip, SessionIdPreserved) {
+  const std::string path = TempPath("session_id");
+  const std::uint64_t expected_session = 0x123456789ABCDEF0ULL;
+  {
+    LogWriter writer{path, "session_test", LogWriter::Options{}, expected_session};
+    EXPECT_EQ(writer.session_id(), expected_session);
+    writer.start(MakeManifest(), MonotonicTime::from_nanos(100));
+    writer.flush();
+  }
+  LogReader reader{path};
+  EXPECT_EQ(reader.session_id(), expected_session);
+  EXPECT_EQ(reader.format_version(), 3u);
+  ::unlink(path.c_str());
+}
+
+TEST(LogRoundTrip, ManifestPreallocatesLargeMessages) {
   const std::string path = TempPath("smallbuffer");
   // 512 bytes is smaller than the manifest block plus several records, and
   // one fetch payload below is chosen to exceed it outright.
   LogWriter writer{path, "small_buffer_writer", 512};
-  const Manifest manifest = MakeManifest();
+  Manifest manifest = MakeManifest();
+  manifest[0].message_bytes = 1000;
   writer.start(manifest, MonotonicTime::from_nanos(7));
 
   std::vector<ExpectedRecord> expected;
@@ -382,7 +404,7 @@ TEST(LogFormatErrors, BadVersionThrows) {
 TEST(LogBackgroundWriter, RoundTripsThroughTheWriterThread) {
   const std::string path = TempPath("background_round_trip");
   const std::vector<ExpectedRecord> expected = WriteFixtureWithOptions(
-      path, LogWriter::Options{256, 3, /*background=*/true});
+      path, LogWriter::Options{256, 64, /*background=*/true});
 
   LogReader reader{path};
   LogReader::Record record;
@@ -399,12 +421,12 @@ TEST(LogBackgroundWriter, RoundTripsThroughTheWriterThread) {
   std::remove(path.c_str());
 }
 
-// A pool far too small for the write rate must stall the producer rather than
-// drop records: an incomplete log cannot be replayed.
-TEST(LogBackgroundWriter, StallingNeverLosesRecords) {
+// Enough preallocated chunks retain a burst even if the writer is not
+// scheduled.
+TEST(LogBackgroundWriter, BufferedBurstPreservesRecords) {
   const std::string path = TempPath("background_stall");
   const std::vector<ExpectedRecord> expected = WriteFixtureWithOptions(
-      path, LogWriter::Options{128, 2, /*background=*/true});
+      path, LogWriter::Options{128, 100, /*background=*/true});
 
   LogReader reader{path};
   LogReader::Record record;
@@ -458,6 +480,106 @@ TEST(LogBackgroundWriter, FlushWaitsForTheWriterThread) {
   EXPECT_FALSE(reader.truncated());
 
   std::remove(path.c_str());
+}
+
+TEST(LogBackgroundWriter, BlockedDiskStopsCaptureWithoutBlockingProducer) {
+  const auto path = TempPath("blocked_fifo");
+  ASSERT_EQ(::mkfifo(path.c_str(), 0600), 0);
+  std::atomic<bool> allow_read{false};
+  std::vector<std::byte> bytes;
+  std::thread consumer{[&] {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    std::byte header[sizeof(FileHeader)];
+    std::size_t seen = 0;
+    while (seen < sizeof(header)) {
+      const auto n = ::read(fd, header + seen, sizeof(header) - seen);
+      if (n <= 0) break;
+      seen += static_cast<std::size_t>(n);
+    }
+    bytes.insert(bytes.end(), header, header + seen);
+    // The writer cannot complete a 1 MiB chunk until this reader resumes.
+    while (!allow_read.load()) std::this_thread::yield();
+    std::byte buffer[4096];
+    for (;;) {
+      const auto n = ::read(fd, buffer, sizeof(buffer));
+      if (n <= 0) break;
+      bytes.insert(bytes.end(), buffer, buffer + n);
+    }
+    ::close(fd);
+  }};
+  constexpr std::size_t payload_size = 1u << 20;
+  {
+    LogWriter writer{
+        path, "blocked",
+        LogWriter::Options{payload_size + sizeof(RecordHeader), 1, true}};
+    writer.start({}, {});
+    const auto payload = MakePayload(payload_size, 7);
+    Context context{};
+    context.dispatch_index = 1;
+    writer.dispatch(context, payload);
+    context.dispatch_index = 2;
+    writer.dispatch(context, payload);
+    EXPECT_TRUE(writer.failed());
+    EXPECT_TRUE(writer.capture_stopped());
+    EXPECT_NE(writer.error().find("pool exhausted"), std::string::npos);
+    writer.finish(context);  // Failure must not leave a misleading clean EXIT.
+    allow_read.store(true);
+    writer.flush();
+    writer.flush();
+  }
+  consumer.join();
+  ASSERT_EQ(bytes.size(),
+            sizeof(FileHeader) + sizeof(RecordHeader) + payload_size);
+  RecordHeader record{};
+  std::memcpy(&record, bytes.data() + sizeof(FileHeader), sizeof(record));
+  EXPECT_EQ(record.dispatch_index, 1);
+  EXPECT_EQ(record.payload_bytes, payload_size);
+  ::unlink(path.c_str());
+}
+
+TEST(LogCapture, OversizedRecordStopsCaptureAndPreservesPrefix) {
+  const auto path = TempPath("oversized");
+  LogWriter writer{path, "oversized", 512};
+  writer.start(MakeManifest(), {});
+  Context context{};
+  context.dispatch_index = 1;
+  writer.dispatch(context, MakePayload(20, 1));
+  writer.dispatch(context, MakePayload(1024, 2));
+  EXPECT_TRUE(writer.failed());
+  EXPECT_NE(writer.error().find("preallocated capacity"), std::string::npos);
+  writer.dispatch(context, {});
+  writer.finish(context);
+  writer.flush();
+  LogReader reader{path};
+  LogReader::Record record{};
+  ASSERT_TRUE(reader.next(record));
+  EXPECT_EQ(record.payload.size(), 20);
+  EXPECT_FALSE(reader.next(record));
+  ::unlink(path.c_str());
+}
+
+TEST(LogBackgroundWriter, RepeatedFlushReusesChunksInOrder) {
+  const auto path = TempPath("reuse_chunks");
+  LogWriter writer{path, "reuse", LogWriter::Options{256, 4, true}};
+  writer.start({}, {});
+  for (std::uint64_t batch = 0; batch < 20; ++batch) {
+    for (std::uint64_t i = 0; i < 8; ++i) {
+      Context context{};
+      context.dispatch_index = batch * 8 + i + 1;
+      writer.dispatch(context, MakePayload(16, static_cast<int>(i)));
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+  LogReader reader{path};
+  LogReader::Record record{};
+  for (std::uint64_t i = 1; i <= 160; ++i) {
+    ASSERT_TRUE(reader.next(record));
+    EXPECT_EQ(record.header.dispatch_index, i);
+    EXPECT_EQ(record.payload.size(), 16);
+  }
+  EXPECT_FALSE(reader.next(record));
+  ::unlink(path.c_str());
 }
 
 }  // namespace

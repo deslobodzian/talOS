@@ -155,6 +155,64 @@ TEST(RealtimeEventLoop, WatcherReceivesPublishedMessages) {
   EXPECT_GT(robot.control_count(), 0u);
 }
 
+TEST(RealtimeEventLoop, RejectsTimerChangesFromAnotherThread) {
+  RealtimeEventLoop<> loop;
+  std::atomic<bool> started{false};
+  auto handler = [&](const Context&) { started.store(true); };
+  const auto id = loop.register_timer("tick", make_thunk(&handler));
+  loop.arm_timer(id, loop.monotonic_now() + 1ms, 1ms);
+  std::thread other{[&] {
+    // Bounded, so a loop that never dispatches fails the test instead of
+    // hanging until the harness kills it.
+    const auto give_up = std::chrono::steady_clock::now() + 5s;
+    while (!started.load() && std::chrono::steady_clock::now() < give_up) {
+      std::this_thread::yield();
+    }
+    EXPECT_TRUE(started.load()) << "the timer never fired";
+    EXPECT_THROW(loop.arm_timer(id, Poller::now(), 1ms), std::logic_error);
+    EXPECT_THROW(loop.disarm_timer(id), std::logic_error);
+    loop.exit();
+  }};
+  loop.run_for(1s);
+  other.join();
+}
+
+TEST(RealtimeEventLoop, ReleasesReadersWhenLoopIsDestroyed) {
+  const std::string topic = "/reuse_" + std::to_string(::getpid());
+  RTMSQueue keeper{topic, sizeof(EventsTest::SensorMessage),
+                   alignof(EventsTest::SensorMessage), MAX_SLOTS};
+  for (std::size_t i = 0; i < MAX_READERS * 2; ++i) {
+    RealtimeEventLoop<> loop;
+    EXPECT_NO_THROW(make_fetcher<EventsTest::SensorMessage>(loop, topic));
+  }
+}
+
+TEST(RealtimeEventLoop, ReaderExhaustionFailsRegistrationAndAllowsRetry) {
+  const std::string topic = "/full_" + std::to_string(::getpid());
+  RTMSQueue keeper{topic, sizeof(EventsTest::SensorMessage),
+                   alignof(EventsTest::SensorMessage), MAX_SLOTS};
+  std::vector<std::size_t> readers;
+  for (std::size_t i = 0; i < MAX_READERS; ++i) {
+    auto reader = keeper.register_reader();
+    ASSERT_TRUE(reader);
+    readers.push_back(*reader);
+  }
+  {
+    RealtimeEventLoop<> loop;
+    EXPECT_THROW(make_fetcher<EventsTest::SensorMessage>(loop, topic),
+                 RegistrationError);
+    EXPECT_TRUE(loop.manifest().empty());
+    keeper.release_reader(readers.back());
+    readers.pop_back();
+    auto fetcher = make_fetcher<EventsTest::SensorMessage>(loop, topic);
+    EXPECT_EQ(fetcher.id(), 0);
+  }
+  const auto recycled = keeper.register_reader();
+  ASSERT_TRUE(recycled);
+  keeper.release_reader(*recycled);
+  for (auto reader : readers) keeper.release_reader(reader);
+}
+
 // The point of the whole design: the realtime run is full of jitter, dropped
 // messages and scheduling noise, and replaying its log still reproduces every
 // output exactly.
@@ -170,7 +228,9 @@ TEST(RealtimeEventLoop, ReplayOfARealtimeRunDoesNotDiverge) {
     RecordingLoop loop{log::LogWriter{path, "realtime_robot"}};
     TestRobot<RecordingLoop> robot{loop, topics, 3.0F};
 
-    robot.control_timer().setup_periodic(Poller::now() + 1ms, 2ms);
+    // Derived from the loop's clock, not the OS clock, which is what lets the
+    // replay below set up identically without being handed this number.
+    robot.control_timer().setup_periodic(loop.monotonic_now() + 1ms, 2ms);
 
     std::atomic<bool> stop{false};
 
@@ -215,6 +275,11 @@ TEST(RealtimeEventLoop, ReplayOfARealtimeRunDoesNotDiverge) {
   log::LogReader reader{path};
   ReplayEventLoop<> replay{reader};
   TestRobot<ReplayEventLoop<>> replayed_robot{replay, topics, 3.0F};
+
+  // The identical setup line, with no knowledge of the recording run: the
+  // replay loop's clock already reads the recorded origin.
+  replayed_robot.control_timer().setup_periodic(replay.monotonic_now() + 1ms,
+                                                2ms);
 
   replay.run();
 

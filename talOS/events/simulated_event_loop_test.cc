@@ -2,6 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -79,6 +83,57 @@ TEST(SimulatedEventLoop, PeriodicTimerFiresOnSchedule) {
   for (const float effort : robot.efforts()) {
     EXPECT_FALSE(std::isnan(effort));
   }
+}
+
+// The simulated loop is quiescent between run_for calls, so the harness may
+// re-arm a timer there in the same way it injects a message: it is the outside
+// world acting, not the program, and only the resulting firings are recorded.
+TEST(SimulatedEventLoop, StepsAllowTimerChangesBetweenRuns) {
+  SimulationEnvironment environment;
+  SimulatedEventLoop<> loop{environment};
+  TestRobot<SimulatedEventLoop<>> robot{loop, simulated_topics(), 1.0F};
+
+  robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
+                                       1ms);
+  loop.run_for(5ms);
+  EXPECT_EQ(robot.control_count(), 5u);
+
+  // Slow the timer down from outside, then step again.
+  robot.control_timer().setup_periodic(loop.monotonic_now() + 2ms, 2ms);
+  loop.run_for(10ms);
+  EXPECT_EQ(robot.control_count(), 10u);
+
+  robot.control_timer().disable();
+  loop.run_for(10ms);
+  EXPECT_EQ(robot.control_count(), 10u);
+}
+
+// A timer change from another thread has no reproducible position in the log
+// and races the scheduler, so it is refused rather than silently accepted.
+TEST(SimulatedEventLoop, TimerChangeFromAHandlerlessThreadDuringRunIsRejected) {
+  SimulationEnvironment environment;
+  SimulatedEventLoop<> loop{environment};
+
+  std::optional<std::logic_error> caught;
+  auto handler = [&](const Context&) {
+    std::thread other{[&] {
+      try {
+        loop.arm_timer(0, loop.monotonic_now() + 1ms, 1ms);
+      } catch (const std::logic_error& error) {
+        caught.emplace(error);
+      }
+    }};
+    other.join();
+    loop.exit();
+  };
+
+  const auto id = loop.register_timer("tick", make_thunk(&handler));
+  loop.arm_timer(id, MonotonicTime::from_nanos(1'000'000), 1ms);
+  loop.run_for(5ms);
+
+  ASSERT_TRUE(caught.has_value());
+  EXPECT_NE(std::string{caught->what()}.find("loop callback"),
+            std::string::npos);
 }
 
 TEST(SimulatedEventLoop, WatcherReceivesEveryInjectedMessage) {

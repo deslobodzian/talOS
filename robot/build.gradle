@@ -1,8 +1,15 @@
 import org.gradle.internal.os.OperatingSystem
 
+// The RoboRIO program is deliberately small: a Driver Station loop and the
+// hardware gateway. Everything else in talOS builds with Bazel, and the tests
+// for the gateway live there (//common/hardware:gateway_test), so this project
+// carries no test suite and no command-based framework.
+//
+// TODO(build): replace GradleRIO with a direct cross-compile of this one
+// executable against the WPILib/HAL and Phoenix 6 native libraries, so the
+// whole repository builds from Bazel in seconds rather than through Gradle.
 plugins {
     id "cpp"
-    id "google-test-test-suite"
     id "edu.wpi.first.GradleRIO" version "2026.2.1"
 }
 
@@ -45,9 +52,14 @@ def includeDesktopSupport = true
 // Set to true to run simulation in debug mode
 wpi.cpp.debugSimulation = false
 
-// Default enable simgui
-wpi.sim.addGui().defaultEnabled = true
-// Enable DS but not by default
+// The simulation GUI is the only way to enable the robot and choose Teleoperated
+// when no real Driver Station is attached, so an interactive `simulateNative`
+// gets it. Automated runs pass -Pheadless and drive the Driver Station through
+// the TALOS_SIM_DS environment variables instead; see
+// talOS/drivetrain/README.md.
+if (!project.hasProperty("headless")) {
+    wpi.sim.addGui().defaultEnabled = true
+}
 wpi.sim.addDriverstation()
 
 nativeUtils.platformConfigs.named("linuxathena").configure {
@@ -110,12 +122,14 @@ model {
                 source {
                     srcDir 'src/main/cpp'
                     srcDir '../common/protocol'
+                    srcDir '../common/hardware'
                     include '**/*.cpp', '**/*.cc'
                     exclude '**/*_test.*', '**/*_perf.*', '**/sim_*.*'
                 }
                 exportedHeaders {
                     srcDir 'src/main/include'
                     srcDir '../common/protocol'
+                    srcDir '../common'
                     include '**/*.h', '**/*.hpp'
                     exclude '**/*_test.*', '**/*_perf.*', '**/sim_*.*'
                 }
@@ -132,25 +146,6 @@ model {
             // Defining my dependencies. In this case, WPILib (+ friends), and vendor libraries.
             wpi.cpp.vendor.cpp(it)
             wpi.cpp.deps.wpilib(it)
-        }
-    }
-    testSuites {
-        frcUserProgramTest(GoogleTestTestSuiteSpec) {
-            testing $.components.frcUserProgram
-
-            sources.cpp {
-                source {
-                    srcDir 'src/test/cpp'
-                    include '**/*.cpp'
-                }
-            }
-
-            // Enable run tasks for this component
-            wpi.cpp.enableExternalTasks(it)
-
-            wpi.cpp.vendor.cpp(it)
-            wpi.cpp.deps.wpilib(it)
-            wpi.cpp.deps.googleTest(it)
         }
     }
 }

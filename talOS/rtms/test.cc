@@ -1177,3 +1177,18 @@ TEST(Concurrency, OverwriteOldestNoTornReadsMultiReader) {
 
     EXPECT_GT(total_dropped, 0u);
 }
+
+TEST(RTMSQueue, RejectsTopicNamesLongerThan30CharsAfterLeadingSlash) {
+    // 31 characters after leading slash
+    const std::string too_long = "/1234567890123456789012345678901";
+    EXPECT_THROW(
+        RTMSQueue(too_long, sizeof(Message::TestMessage), alignof(Message::TestMessage)),
+        std::invalid_argument);
+
+    // Exactly 30 characters after leading slash should not throw invalid_argument
+    const std::string exactly_30 = make_test_path("123456789012345678901234567890");
+    const std::string capped_30 = exactly_30.substr(0, 31);  // '/' + 30 chars
+    EXPECT_NO_THROW({
+        RTMSQueue q(capped_30, sizeof(Message::TestMessage), alignof(Message::TestMessage));
+    });
+}
