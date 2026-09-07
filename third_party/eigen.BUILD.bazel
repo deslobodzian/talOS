@@ -1,0 +1,15 @@
+# Eigen build shim for the http_archive in MODULE.bazel. Header-only: one
+# cc_library over the Eigen headers, consumed as @eigen//:eigen with
+# `#include <Eigen/Dense>`.
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "eigen",
+    hdrs = glob([
+        "Eigen/**",
+        "unsupported/Eigen/**",
+    ]),
+    includes = ["."],
+)

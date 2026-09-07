@@ -30,6 +30,7 @@ talOS/                     the framework. Knows nothing about any robot.
   hardware/                hardware wire contract: config, messages, gateway,
                            endpoint, and the Packet IPC envelope
   driver_station/          Driver Station wire codec
+  geometry/                header-only Lie groups (SO2/SE2/SO3/SE3) on Eigen
   bridge/                  the IPC <-> UDP node that fronts a controller
   configuration/           robot.toml parser and schema
   launcher/                spawns a robot's nodes from its config
