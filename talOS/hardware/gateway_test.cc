@@ -4,7 +4,9 @@
 
 #include <chrono>
 #include <limits>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "config_wire.h"
 #include "endpoint.h"
@@ -81,7 +83,11 @@ inline Config SwerveConfig(bool simulation = false) {
 }
 class FakeBackend : public Backend {
  public:
-  bool Configure(const Config&) override { return configure_ok; }
+  bool Configure(const Config&) override {
+    ++configure_calls;
+    events.push_back("configure");
+    return configure_ok;
+  }
   bool Read(State& s) override {
     for (auto& m : s.motors) m.valid = healthy;
     return healthy;
@@ -90,9 +96,13 @@ class FakeBackend : public Backend {
     ++applied;
     return apply_ok;
   }
-  void Neutral() override { ++neutral; }
+  void Neutral() override {
+    ++neutral;
+    events.push_back("neutral");
+  }
   bool configure_ok{true}, healthy{true}, apply_ok{true};
-  int applied{}, neutral{};
+  int applied{}, neutral{}, configure_calls{};
+  std::vector<std::string> events{};
 };
 Command Request(const Gateway& g) {
   const auto s = g.snapshot();
@@ -210,6 +220,76 @@ TEST(Gateway, RejectsWholeTransactionBeforeApplyingAnyMotor) {
     EXPECT_FALSE(g.Accept(c, 1, 1000));
   }
   EXPECT_EQ(backend.applied, 0);
+}
+TEST(Gateway, NeutralizesOutputsBeforeReconfiguringDevices) {
+  FakeBackend backend;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, false);
+  backend.events.clear();  // Tick neutralizes while disabled; isolate Reconfigure.
+  auto cfg = SwerveConfig(true);
+  cfg.motors[0].slots[0].p = 1.0;  // Genuine change, not an idempotent push.
+  ASSERT_TRUE(g.Reconfigure(cfg));
+  ASSERT_GE(backend.events.size(), 2u);
+  EXPECT_EQ(backend.events[0], "neutral");
+  EXPECT_EQ(backend.events[1], "configure");
+  // A failed backend configuration neutralizes again, so no stale drive
+  // persists after the failed device change.
+  backend.configure_ok = false;
+  backend.events.clear();
+  auto bad = cfg;
+  bad.motors[0].slots[0].p = 2.0;
+  EXPECT_FALSE(g.Reconfigure(bad));
+  ASSERT_GE(backend.events.size(), 3u);
+  EXPECT_EQ(backend.events[0], "neutral");
+  EXPECT_EQ(backend.events[1], "configure");
+  EXPECT_EQ(backend.events[2], "neutral");
+}
+TEST(Gateway, RepeatedConfigurationPushIsIdempotent) {
+  FakeBackend backend;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, false);
+  const int configures = backend.configure_calls;
+  const int neutrals = backend.neutral;
+  const auto epoch = g.snapshot().epoch;
+  const auto config_id = g.snapshot().config_id;
+  // Identical push: succeeds with no device traffic and no epoch change, so a
+  // retried push never re-blocks on Phoenix configuration calls.
+  EXPECT_TRUE(g.Reconfigure(SwerveConfig(true)));
+  EXPECT_EQ(backend.configure_calls, configures);
+  EXPECT_EQ(backend.neutral, neutrals);
+  EXPECT_EQ(g.snapshot().epoch, epoch);
+  EXPECT_EQ(g.snapshot().config_id, config_id);
+  EXPECT_TRUE(g.configured());
+  // A genuine change still applies exactly once and invalidates commands.
+  auto changed = SwerveConfig(true);
+  changed.motors[0].slots[0].p = 1.0;
+  EXPECT_TRUE(g.Reconfigure(changed));
+  EXPECT_EQ(backend.configure_calls, configures + 1);
+  EXPECT_NE(g.snapshot().epoch, epoch);
+}
+TEST(Gateway, ReconfigurationRequiresDisabledOperation) {
+  FakeBackend backend;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, true);  // Enabled: hardware configuration is refused.
+  auto changed = SwerveConfig(true);
+  changed.motors[0].slots[0].p = 1.0;
+  const int configures = backend.configure_calls;
+  const int neutrals = backend.neutral;
+  const std::size_t events = backend.events.size();
+  const auto epoch = g.snapshot().epoch;
+  EXPECT_FALSE(g.Reconfigure(changed));
+  // The refused interlock touches nothing: no device traffic, no neutralize
+  // glitch on live outputs, no epoch or fault/configured change.
+  EXPECT_EQ(backend.configure_calls, configures);
+  EXPECT_EQ(backend.neutral, neutrals);
+  EXPECT_EQ(backend.events.size(), events);
+  EXPECT_EQ(g.snapshot().epoch, epoch);
+  EXPECT_TRUE(g.configured());
+  EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+  // Disabled, the same push applies.
+  g.Tick(2000, false);
+  EXPECT_TRUE(g.Reconfigure(changed));
+  EXPECT_EQ(backend.configure_calls, configures + 1);
 }
 TEST(Gateway, ApplyFailureLatchesNeutral) {
   FakeBackend backend;
@@ -449,17 +529,24 @@ TEST(Gateway, StartsUnconfiguredAndRefusesEnableUntilReconfigured) {
   EXPECT_FALSE(g.snapshot().flags & kConfigured);
   EXPECT_FALSE(g.snapshot().flags & kEnabled);
 
+  // Hardware configuration requires disabled: refused while enabled, with no
+  // state change.
+  auto valid_cfg = SwerveConfig(true);
+  EXPECT_FALSE(g.Reconfigure(valid_cfg));
+  EXPECT_FALSE(g.configured());
+
+  g.Tick(1500, false);
+
   // Ceiling violation rejected
   auto invalid_cfg = SwerveConfig(true);
   invalid_cfg.motors[0].stator_limit_a = 150.0;
   EXPECT_FALSE(g.Reconfigure(invalid_cfg));
   EXPECT_FALSE(g.configured());
 
-  g.Tick(2000, true);
+  g.Tick(2000, false);
   EXPECT_TRUE(g.snapshot().flags & kHardwareFault);
 
   // Valid config accepted
-  auto valid_cfg = SwerveConfig(true);
   EXPECT_TRUE(g.Reconfigure(valid_cfg));
   EXPECT_TRUE(g.configured());
 
@@ -507,9 +594,10 @@ TEST(Endpoint, PushesConfigOverUdpAndHandlesEpochChangeOnRestart) {
               protocol::UdpStatus::kOk);
   }
 
-  // 3. Endpoint ticks, processes chunks, sends ACK
+  // 3. Endpoint ticks, processes chunks, sends ACK. Hardware configuration
+  // requires disabled operation, so the config push is serviced disabled.
   std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  endpoint.Tick(2000, true);
+  endpoint.Tick(2000, false);
   EXPECT_TRUE(gateway.configured());
 
   // 4. Companion receives ACK
@@ -529,6 +617,110 @@ TEST(Endpoint, PushesConfigOverUdpAndHandlesEpochChangeOnRestart) {
   ASSERT_TRUE(Decode({state_frame.payload, state_frame.payload_size}, state));
   EXPECT_EQ(state.config_id, ConfigurationId(cfg));
   EXPECT_TRUE(state.flags & kConfigured);
+}
+
+TEST(SimBackend, NeutralTurnsOffEveryOutputOnDisableTimeoutAndFailure) {
+  // SimBackend is final, so failure injection delegates to an owned
+  // SimBackend; Neutral() under test is still SimBackend::Neutral().
+  struct FailableSim : Backend {
+    bool Configure(const Config& config) override {
+      return sim.Configure(config);
+    }
+    bool Read(State& state) override {
+      if (fail_read) return false;
+      return sim.Read(state);
+    }
+    bool Apply(std::span<const MotorRequest> commands) override {
+      return sim.Apply(commands);
+    }
+    bool ApplyOutputs(std::span<const DigitalOutputRequest> digital,
+                      std::span<const PwmRequest> pwm) override {
+      return sim.ApplyOutputs(digital, pwm);
+    }
+    void Neutral() override { sim.Neutral(); }
+    bool fail_read{false};
+    SimBackend sim;
+  };
+  auto make_config = [] {
+    Config config;
+    config.commissioned = true;
+    config.command_timeout_us = 100000;
+    config.motors.push_back({1, "motor1", 1, "rio"});
+    config.digital_outputs.push_back({4, "solenoid", 1});
+    config.pwm_outputs.push_back({7, "servo", 0});
+    return config;
+  };
+  auto drive_all = [](Gateway& gateway) {
+    const State s = gateway.snapshot();
+    Command cmd{};
+    cmd.config_id = s.config_id;
+    cmd.boot_id = s.boot_id;
+    cmd.epoch = s.epoch;
+    cmd.observed_time_us = s.sample_time_us;
+    cmd.count = 1;
+    cmd.motors[0] = {1, Mode::kVelocity, 0, 10.0, 0};
+    cmd.digital_output_count = 1;
+    cmd.digital_outputs[0] = {4, true};
+    cmd.pwm_output_count = 1;
+    cmd.pwm_outputs[0] = {7, 0.85};
+    return cmd;
+  };
+  auto expect_driven = [](FailableSim& backend, const State& s) {
+    EXPECT_TRUE(backend.sim.GetDigitalOutput(4));
+    EXPECT_DOUBLE_EQ(backend.sim.GetPwm(7), 0.85);
+    ASSERT_GT(s.motor_count, 0u);
+    EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 10.0);
+    EXPECT_EQ(s.digital_outputs[0].value, true);
+    EXPECT_DOUBLE_EQ(s.pwm_outputs[0].output, 0.85);
+  };
+  auto expect_safe_backends = [](FailableSim& backend) {
+    EXPECT_FALSE(backend.sim.GetDigitalOutput(4));
+    EXPECT_DOUBLE_EQ(backend.sim.GetPwm(7), 0.0);
+  };
+  auto expect_safe_state = [](const State& s) {
+    ASSERT_GT(s.motor_count, 0u);
+    EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 0.0);
+    EXPECT_DOUBLE_EQ(s.motors[0].voltage, 0.0);
+    EXPECT_EQ(s.digital_outputs[0].value, false);
+    EXPECT_DOUBLE_EQ(s.pwm_outputs[0].output, 0.0);
+  };
+
+  FailableSim backend;
+  Gateway gateway{make_config(), backend, 10};
+
+  // Disable transition neutralizes every output type.
+  gateway.Tick(1000, true);
+  ASSERT_TRUE(gateway.Accept(drive_all(gateway), 1, 1000));
+  gateway.Tick(6000, true);
+  expect_driven(backend, gateway.snapshot());
+  gateway.Tick(7000, false);
+  expect_safe_backends(backend);
+  expect_safe_state(gateway.snapshot());
+
+  // Timeout transition neutralizes every output type.
+  gateway.Tick(8000, true);
+  ASSERT_TRUE(gateway.Accept(drive_all(gateway), 0, 8000));
+  gateway.Tick(9000, true);
+  expect_driven(backend, gateway.snapshot());
+  gateway.Tick(9000 + 100000, true);
+  expect_safe_backends(backend);
+  expect_safe_state(gateway.snapshot());
+
+  // Failure transition neutralizes backend outputs and latches the fault.
+  // State keeps its last good samples while reads fail, so the motor safe
+  // state is observed on the first successful read after recovery.
+  gateway.Tick(200000, true);
+  ASSERT_TRUE(gateway.Accept(drive_all(gateway), 0, 200000));
+  gateway.Tick(201000, true);
+  expect_driven(backend, gateway.snapshot());
+  backend.fail_read = true;
+  gateway.Tick(202000, true);
+  expect_safe_backends(backend);
+  EXPECT_TRUE(gateway.snapshot().flags & kHardwareFault);
+  backend.fail_read = false;
+  gateway.Tick(203000, true);
+  expect_safe_backends(backend);
+  expect_safe_state(gateway.snapshot());
 }
 
 }  // namespace

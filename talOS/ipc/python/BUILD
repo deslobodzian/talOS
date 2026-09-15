@@ -12,10 +12,25 @@ py_library(
         "IPCMessage/TimeMessage.py",
         "IPCMessage/__init__.py",
         "messages.py",
-        "node_api.py",
-        "rtms.py",
+        "talos_runtime/__init__.py",
+        "talos_runtime/hardware_node.py",
+        "talos_runtime/node_api.py",
+        "talos_runtime/rtms.py",
+        "talos_runtime/runner.py",
     ],
-    deps = ["@pypi//flatbuffers"],
+    imports = ["."],
+    data = [":native_runtime"],
+    deps = [
+        "@pypi//flatbuffers",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+genrule(
+    name = "native_runtime",
+    srcs = ["//talOS/node_api:libtalos_node.so"],
+    outs = ["talos_runtime/libtalos_node.so"],
+    cmd = "cp $(location //talOS/node_api:libtalos_node.so) $@",
 )
 
 # C++ peer for the byte-identical round-trip test. Additive target in this

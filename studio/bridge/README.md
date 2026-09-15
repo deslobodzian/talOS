@@ -124,6 +124,11 @@ start. With no `--declared`, or with a file that could not be read,
 `GET /declared.json` is **404** — an empty document would say the session has no
 nodes in it, which is a different and false statement.
 
+Sim sessions normally get this for free: the launcher's `--start-studio-bridge`
+(which `sim.sh` passes unless `--no-studio`) declares the bridge in `graph.json`
+and starts it supervised with that graph as `--declared`. A manually started
+bridge is undeclared unless `--declared` points at the session's `graph.json`.
+
 ## Dedicated DROP_NEWEST publisher contract
 
 Use a **dedicated telemetry topic**, with exactly one producer, 256 slots of

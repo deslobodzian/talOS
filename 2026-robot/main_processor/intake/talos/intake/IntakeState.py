@@ -11,7 +11,7 @@ class IntakeState(object):
 
     @classmethod
     def SizeOf(cls):
-        return 24
+        return 32
 
     # IntakeState
     def Init(self, buf, pos):
@@ -25,10 +25,17 @@ class IntakeState(object):
     def RollerVelocityRps(self): return self._tab.Get(flatbuffers.number_types.Float32Flags, self._tab.Pos + flatbuffers.number_types.UOffsetTFlags.py_type(12))
     # IntakeState
     def BeamBroken(self): return self._tab.Get(flatbuffers.number_types.BoolFlags, self._tab.Pos + flatbuffers.number_types.UOffsetTFlags.py_type(16))
+    # IntakeState
+    def RequestedVelocityRps(self): return self._tab.Get(flatbuffers.number_types.Float32Flags, self._tab.Pos + flatbuffers.number_types.UOffsetTFlags.py_type(20))
+    # IntakeState
+    def Inhibit(self): return self._tab.Get(flatbuffers.number_types.Uint8Flags, self._tab.Pos + flatbuffers.number_types.UOffsetTFlags.py_type(24))
 
-def CreateIntakeState(builder, issuedNs, enabled, rollerVelocityRps, beamBroken):
-    builder.Prep(8, 24)
+def CreateIntakeState(builder, issuedNs, enabled, rollerVelocityRps, beamBroken, requestedVelocityRps, inhibit):
+    builder.Prep(8, 32)
     builder.Pad(7)
+    builder.PrependUint8(inhibit)
+    builder.PrependFloat32(requestedVelocityRps)
+    builder.Pad(3)
     builder.PrependBool(beamBroken)
     builder.PrependFloat32(rollerVelocityRps)
     builder.Pad(3)

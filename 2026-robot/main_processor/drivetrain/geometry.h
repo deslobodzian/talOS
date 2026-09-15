@@ -7,7 +7,7 @@
 #include <string>
 #include <string_view>
 
-#include "2026-robot/main_processor/drivetrain/swerve.h"
+#include "talos_nodes/drivetrain/swerve.h"
 #include "talOS/configuration/config_parser.h"
 
 // Builds SwerveGeometry from [subsystems.<name>.geometry] in the robot

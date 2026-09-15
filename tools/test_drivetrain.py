@@ -3,8 +3,8 @@
 Two gateways can stand at the RoboRIO end of the UDP link, and both are tested
 the same way because both run the same `talos::hardware::Gateway`:
 
-    python3 tools/test_drivetrain.py            # //2026-robot/main_processor/drivetrain:sim_gateway
-    python3 tools/test_drivetrain.py --wpilib   # robot/, under WPILib simulation
+    python3 tools/test_drivetrain.py            # //2026-robot/main_processor/simulation:sim_gateway
+    python3 tools/test_drivetrain.py --wpilib   # 2026-robot/controller_processor/rio/, under WPILib simulation
 
 The second one is the real RoboRIO program. It is slower to start, because it
 goes through Gradle, but it exercises the actual `Robot` loop and the actual
@@ -12,7 +12,9 @@ Driver Station enable path, so it also runs a second scenario that the
 stand-alone gateway cannot: with the Driver Station never enabled, the
 drivetrain must not move at all.
 
-First build: bazel build //2026-robot/main_processor/drivetrain:all
+First build: bazel build //2026-robot/main_processor/drivetrain:all \
+                         //2026-robot/main_processor/simulation:sim_gateway \
+                         //talOS/bridge:hardware_node
              (for --wpilib, Gradle builds the robot program itself)
 Run from any directory.
 """
@@ -48,11 +50,19 @@ class Scenario:
     def __init__(self, root, output):
         self.root = root
         self.binaries = root / "bazel-bin/2026-robot/main_processor/drivetrain"
+        # sim_gateway moved out of the drivetrain package into simulation, so
+        # it is spelled out separately: pointing it at the drivetrain package
+        # silently picks up a stale binary left over from before the split
+        # instead of failing.
+        self.sim_gateway = (
+            root / "bazel-bin/2026-robot/main_processor/simulation/sim_gateway")
         # The bridge is framework code and lives under talOS, not with the
         # robot's drivetrain. Pointing this at the drivetrain package silently
         # picks up a stale binary left over from before the split instead of
         # failing, so it is spelled out separately.
         self.bridge = root / "bazel-bin/talOS/bridge/hardware_node"
+        self.config = (
+            root / "2026-robot/main_processor/configuration/robot.toml")
         self.output = output
         self.children = []
         self.files = []
@@ -70,7 +80,7 @@ class Scenario:
         return process
 
     def start_sim_gateway(self, seconds):
-        self.start("gateway", [str(self.binaries / "sim_gateway"),
+        self.start("gateway", [str(self.sim_gateway),
                                "--duration-s", str(seconds)])
 
     def start_wpilib_gateway(self, seconds, enabled=True, disable_after_ms=None):
@@ -85,10 +95,14 @@ class Scenario:
         gateway = self.start(
             "gateway",
             # -Pheadless keeps the simulation GUI out of an automated run; the
-            # TALOS_SIM_DS variables above stand in for it.
+            # TALOS_SIM_DS variables above stand in for it. The task is the
+            # plain simulateNative the rest of the repo uses (sim.sh and the
+            # drivetrain/hardware/protocol READMEs), run from the Gradle
+            # project that owns the RoboRIO program.
             ["./gradlew", "--offline", "--quiet", "-Pheadless",
-             "simulateNativeRelease"],
-            cwd=self.root / "robot", env=environment,
+             "simulateNative"],
+            cwd=self.root / "2026-robot/controller_processor/rio",
+            env=environment,
         )
         # The robot prints this once its gateway socket is open, which is the
         # only moment it is safe to start the bridge.
@@ -106,9 +120,14 @@ class Scenario:
         raise RuntimeError(f"Gateway never started; see {self.output}")
 
     def drive(self, log_path, bridge_seconds, node_seconds):
+        # --config is required: without it the bridge exits with a usage error
+        # before any simulation traffic exists.
         self.start("bridge", [str(self.bridge),
+                              "--config", str(self.config),
                               "--duration-s", str(bridge_seconds)])
+        # The node requires --config like the bridge does.
         self.start("node", [str(self.binaries / "node"), "--sim",
+                            "--config", str(self.config),
                             "--duration-s", str(node_seconds),
                             "--log", str(log_path)])
         time.sleep(0.5)
@@ -130,7 +149,8 @@ class Scenario:
 
     def replay(self, log_path):
         return subprocess.run(
-            [str(self.binaries / "node"), "--sim", "--replay", str(log_path)],
+            [str(self.binaries / "node"), "--sim",
+             "--config", str(self.config), "--replay", str(log_path)],
             capture_output=True, text=True, timeout=15, check=True,
         ).stdout.strip()
 
@@ -242,16 +262,25 @@ def main():
 
     root = Path(__file__).resolve().parents[1]
     binaries = root / "bazel-bin/2026-robot/main_processor/drivetrain"
+    sim_gateway = (
+        root / "bazel-bin/2026-robot/main_processor/simulation/sim_gateway")
 
     needed = [binaries / "node", binaries / "send_target",
-              root / "bazel-bin/talOS/bridge/hardware_node"]
+              root / "bazel-bin/talOS/bridge/hardware_node",
+              root / "2026-robot/main_processor/configuration/robot.toml"]
     if not args.wpilib:
-        needed.append(binaries / "sim_gateway")
+        needed.append(sim_gateway)
     for path in needed:
         if not path.is_file():
             raise RuntimeError(
-                "Build //2026-robot/main_processor/drivetrain:all and "
+                "Build //2026-robot/main_processor/drivetrain:all, "
+                "//2026-robot/main_processor/simulation:sim_gateway, and "
                 "//talOS/bridge:hardware_node first")
+
+    if args.wpilib:
+        gradlew = root / "2026-robot/controller_processor/rio/gradlew"
+        if not gradlew.is_file():
+            raise RuntimeError(f"No Gradle wrapper at {gradlew}")
 
     check_ports()
     output = run_driving_scenario(root, args.wpilib)

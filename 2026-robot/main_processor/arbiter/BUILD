@@ -8,11 +8,13 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 cc_library(
     name = "arbiter",
     hdrs = ["node.h"],
+    strip_include_prefix = ".",
+    include_prefix = "talos_nodes/arbiter",
     deps = [
-        "//2026-robot/main_processor/driver_station:driver_station",
-        "//2026-robot/main_processor/drivetrain:drivetrain",
-        "//2026-robot/main_processor/intake:intake",
-        "//2026-robot/main_processor/shooter:shooter",
+        "@talos_driver_station//:contract",
+        "//2026-robot/main_processor/drivetrain:messages_cc",
+        "//2026-robot/main_processor/intake:messages_cc",
+        "//2026-robot/main_processor/shooter:messages_cc",
         "//talOS/driver_station:driver_station",
         "//talOS/events:events",
     ],
@@ -24,7 +26,7 @@ cc_binary(
     srcs = ["main.cc"],
     deps = [
         ":arbiter",
-        "//2026-robot/main_processor/operator_interface:operator_interface",
+        "@talos_operator_interface//:operator_interface",
         "//talOS/configuration:configuration",
         "//talOS/events:events",
         "//talOS/introspection:describe",
@@ -42,7 +44,9 @@ cc_test(
     data = ["//2026-robot/main_processor/configuration:robot_config"],
     deps = [
         ":arbiter",
-        "//2026-robot/main_processor/operator_interface:operator_interface",
+        "@talos_driver_station//:driver_station",
+        "//2026-robot/main_processor/drivetrain:integration_test_support",
+        "@talos_operator_interface//:operator_interface",
         "//talOS/configuration:configuration",
         "@googletest//:gtest_main",
     ],

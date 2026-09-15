@@ -1,0 +1,11 @@
+# Local four-module fixture. Device IDs are assigned by the normal parser.
+[robot]
+name = "swerve_test"
+period_us = 5000
+command_timeout_us = 100000
+status_hz = 200.0
+commissioned = false
+
+[[subsystems]]
+name = "drivetrain"
+path = "drivetrain.toml"

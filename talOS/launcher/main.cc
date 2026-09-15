@@ -34,8 +34,16 @@ int main(int argc, char** argv) {
       const std::string arg = argv[i];
       if (arg == "--config" && i + 1 < argc) {
         options.config_path = argv[++i];
+      } else if (arg == "--bundle" && i + 1 < argc) {
+        options.bundle_dir = argv[++i];
       } else if (arg == "--output-dir" && i + 1 < argc) {
         options.output_dir = argv[++i];
+      } else if (arg == "--remote" && i + 1 < argc) {
+        options.remote = argv[++i];
+      } else if (arg == "--remote-port" && i + 1 < argc) {
+        options.remote_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+      } else if (arg == "--local-port" && i + 1 < argc) {
+        options.local_port = static_cast<uint16_t>(std::stoi(argv[++i]));
       } else if (arg == "--duration-s" && i + 1 < argc) {
         options.duration_s = std::stoi(argv[++i]);
       } else if (arg == "--session-id" && i + 1 < argc) {
@@ -44,6 +52,10 @@ int main(int argc, char** argv) {
         options.simulation = true;
       } else if (arg == "--start-sim-gateway") {
         options.start_sim_gateway = true;
+      } else if (arg == "--start-studio-bridge") {
+        options.start_studio_bridge = true;
+      } else if (arg == "--studio-http-port" && i + 1 < argc) {
+        options.studio_http_port = static_cast<uint16_t>(std::stoi(argv[++i]));
       } else if (arg == "--allow-graph-errors") {
         options.allow_graph_errors = true;
       } else if (arg == "--describe-only") {
@@ -51,11 +63,17 @@ int main(int argc, char** argv) {
       } else if (arg == "--describe-timeout-ms" && i + 1 < argc) {
         options.describe_timeout_ms = std::stoi(argv[++i]);
       } else if (arg == "--help" || arg == "-h") {
-        std::cout << "usage: launcher --config PATH [--output-dir PATH] "
+        std::cout << "usage: launcher (--config PATH | --bundle PATH) [--output-dir PATH] "
                      "[--duration-s N] [--session-id ID] [--sim] "
-                     "[--start-sim-gateway] [--describe-only] "
-                     "[--allow-graph-errors] [--describe-timeout-ms MS]\n"
+                     "[--start-sim-gateway] [--start-studio-bridge] "
+                     "[--studio-http-port PORT] [--describe-only] "
+                     "[--allow-graph-errors] [--describe-timeout-ms MS] "
+                     "[--remote IP] [--remote-port PORT] [--local-port PORT]\n"
                      "\n"
+                     "  --bundle PATH          launch from a bundle directory (assembled by talos_bundle)\n"
+                     "  --remote IP            controller address; overrides [robot] controller_address\n"
+                     "  --remote-port PORT     controller port; overrides [robot] controller_port (default 5802)\n"
+                     "  --local-port PORT      local bind port; overrides [robot] local_port (default 5803)\n"
                      "  --describe-only        ask every node in the config "
                      "what it is, lint the\n"
                      "                         graph they describe, and exit "
@@ -75,3 +93,4 @@ int main(int argc, char** argv) {
     return 1;
   }
 }
+// rebuild

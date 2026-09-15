@@ -31,6 +31,15 @@ forgotten is a rule that gets relaxed.
                      +--> studio/agent                      (JSON-RPC)
 ```
 
+The diagram names the runtime graph, not where each node lives. Under the
+hybrid policy drivetrain, intake, shooter, and arbiter are year-local nodes in
+`2026-robot/main_processor/`; driver_station, odometry, telemetry, and the
+operator_interface chassis core are standalone platform modules
+(`talos-driver_station`, `talos-odometry`, `talos-telemetry`,
+`talos-operator_interface`), with operator_interface running through the year
+wrapper in `2026-robot/main_processor/operator_interface/` that adds the
+year's shooter/intake bindings.
+
 A robot is two processors and one wire contract between them. The main
 processor holds all the logic and runs on talOS. The controller processor is
 the HAL: it owns the actuators, and it is the only thing on the robot that
@@ -147,7 +156,16 @@ hand in `HardwareNode::BuildIntrospectionManifest`.
 `robot.toml`, resolves each declared node's target to a binary, spawns them all
 with a shared session id, and writes `manifest.json` naming every log.
 `:log_dump` merges a session's logs into one time-ordered stream, refusing a set
-whose session ids disagree.
+whose session ids disagree. Before spawning, the launcher lints the
+`--describe` graph and refuses to start on contract incompatibility — two ends
+using one topic with different message sizes — unless `--allow-graph-errors`.
+`manifest.json` carries provenance, not proof: `config_sha256` (the robot
+config plus every subsystem file) and each node's bundle contract label.
+Revisions trace a session to its build; they do not establish wire
+compatibility. A size match is not a compatibility proof either — a schema can
+change without changing size — so fixed-size messages have no evolution
+policy: any schema change is a new contract, pinned and rolled back as a whole
+bundle.
 
 **`2026-robot/main_processor/` — `//2026-robot/main_processor/<name>:node`.**
 One process per subsystem. Subsystem nodes own devices and turn hardware into
@@ -179,10 +197,13 @@ required flag on both binaries that take one (`talOS/launcher` and
 the binaries work against any config path, and no default names one.
 
 **2. talOS never depends on studio; a robot may.**
-`//2026-robot/main_processor/telemetry` depends on `//studio/schema:wire` and
-`//studio/schema:telemetry_cc`, because the slot geometry and the frame schema
+The standalone `talos-telemetry` module depends on `@studio_schema//:wire`
+and `@studio_schema//:schema`, because the slot geometry and the frame schema
 are a contract between a producer and the bridge and there should be exactly
-one copy of each. The edge runs robot → studio and never the other way.
+one copy of each: `studio-schema/` is the single home (the old in-tree
+`//studio/schema` copy is deleted; in-tree consumers reference the schema
+through `@studio_schema`). The edge runs robot → studio and never the other
+way.
 
 **3. studio never depends on a robot.** `//studio/bridge:system` depends on
 `//talOS/introspection:registry` and `:names`, and on nothing else; the viewer
@@ -204,14 +225,21 @@ reason — a reader never needs it.
 **5. A node never depends on another node's internals.** It may depend on
 another node's *published* topic constants and message types, and on nothing
 else. `//2026-robot/main_processor/arbiter` depending on
-`//2026-robot/main_processor/drivetrain` is correct: it reads
+`//2026-robot/main_processor/drivetrain:messages_cc` is correct: it reads
 `talos::drive::kTargetTopic` and `talos::drive::ChassisTarget` so the two ends
 of the topic cannot drift onto differently spelled strings. Reaching into
 `DrivetrainNode` itself would not be, and neither would calling a method on
 another node — the only thing that crosses between nodes is a message.
 
+Drivetrain and intake expose `:messages_cc` as the public C++ contract;
+intake also exposes `:messages_py` without its node/runtime implementation.
+Drivetrain's implementation target is private. The existing arbiter teleop
+integration test has explicit test-only access through
+`drivetrain:integration_test_support`; production code cannot take that edge.
+The remaining migration is tracked in `NODE_REPOSITORIES_PLAN.md`.
+
 Put those constants in a small header (`<name>/packet.h`) rather than in
-`node.h`. `2026-robot/main_processor/driver_station` puts them in `node.h`,
+`node.h`. The standalone `talos-driver_station` module puts them in `node.h`,
 which is why every consumer of `/driver_station/state` includes the node class
 to get a topic string. That is the shape to avoid.
 
@@ -274,6 +302,68 @@ C++ change must never require a wrapper to be rewritten, which is what the
 additive-only ABI policy is for (never renumber, remove, or re-signature an
 export; only add). Reviewer check: no `mmap`/`struct` slot arithmetic outside
 `talOS/rtms`, `talOS/memory`, and marked test doubles.
+
+**Python Execution, Native Dispatch, and Replay (ABI v6+):**
+Python nodes execute directly on the C++ native event loop (`talOS::event::EventLoopBase`)
+via `TalosLoop` rather than maintaining a custom Python scheduler or log format:
+- **Registration & Dispatch**: Nodes declare ordered timers, watchers, and senders
+  via `talos_loop_register_*`. Event dispatches invoke C callback thunks (`TalosDispatchFn`),
+  passing frozen context timestamps (`now_ns`, `event_time_ns`), sequence counters, and
+  payload spans into Python handlers.
+- **GIL & Callback Lifecycles**: C++ dispatches to Python through `ctypes.CFUNCTYPE`,
+  which automatically acquires the GIL upon entry. Handler references and thunks are retained
+  on the loop instance to guarantee callback lifetimes.
+- **Buffer & Memory Ownership**: Watcher payloads are passed into callbacks as read-only
+  buffers. Python decodes or copies into owned types during callback execution before the C
+  stack frame unwinds. Output is published exclusively through `talos_loop_send`, ensuring
+  sends are recorded as child operations of the active dispatch in the log.
+- **Exception Propagation**: Any unhandled Python exception in a dispatch callback is
+  trapped at the thunk boundary, triggers `talos_loop_exit()` for clean shutdown, and is
+  re-raised when `loop.run()` returns to Python caller frames.
+- **Deterministic Simulation & Replay Parity**: Python nodes execute under `SimulatedEventLoop`
+  (virtual clock, channel injection) and `ReplayEventLoop` (reading `.tlog` files). Replay
+  verifies identical input ordering and asserts zero output byte divergence against recorded logs.
+- **Performance Trade-Offs**: Python dispatch overhead is ~10-40 µs per dispatch, suitable
+  for 20-50 Hz mechanism policies (e.g., intake, rollers, shooter state machines). High-rate
+  250-1000 Hz real-time loops (e.g., swerve drivetrain kinematics) remain in C++.
+
+**11. One idea, one spelling.** A second copy of a topic string, a gating
+predicate, or a node-main branch is a defect even when it is spelled
+correctly, because the copies drift apart silently. The bridge once carried
+an `if (name == "drivetrain")` to paper over `/hw/req/drive` against
+`/hw/req/drivetrain` (see `talOS/NAMING.md`);
+`hardware::RequestTopic()` exists as the one place the request topic is
+spelled, yet every subsystem `packet.h` re-spells the literal beside a
+comment describing the derivation instead of calling it;
+`2026-robot/main_processor/shooter/main.cc` and
+`2026-robot/main_processor/arbiter/main.cc` differ only in includes, the node
+name, the device lookup, and the geometry line (drivetrain has no handwritten
+`main.cc`: its entry point is generated by `talos_cc_node`); and `intake/node.py`
+documents itself as mirroring `shooter/node.h` Tick. Each is a second place
+to forget to update. Prefer the shared helper, the table, or the generator
+over the second copy: the request-topic derivation belongs behind
+`RequestTopic`, the hardware-subsystem factory and the period-offset starter
+belong in one helper beside `talos::process::RunNode`, the state-gating
+predicates — the `config_id` match, the staleness check, the gateway flags,
+the freshness timeout — belong as pure functions in `talOS/hardware` where a
+loop-free test can pin them, and a new subsystem starts from
+`tools/subsystem_codegen` rather than from a copied sibling. Reviewer check:
+search the literal. A topic string, timeout, or tolerance with two owning
+locations fails review; the surviving copy lives in the lowest layer that can
+hold it, as its own target with its own test, like any new framework
+primitive.
+
+Three things this rule does not mean. It does not mean folding registrations
+into a shared helper that reorders `watch`/`make_sender`/`make_timer` calls:
+registration order defines source ids, so a shared constructor helper is only
+safe if every node using it registers the same sources in the same order —
+otherwise the dedup itself invalidates existing logs. It does not mean
+generic serialization or shared wire structs: per-message explicit layouts
+and little-endian codecs stay spelled out, because replay compares payloads
+byte for byte. And it does not move code sideways: a node may depend on
+another node's published topic constants and message types, and on nothing
+else (rule 5), so shared code moves down into `talOS/`, never into a sibling
+node's headers.
 
 ## The three loops
 
@@ -352,17 +442,25 @@ is the invariant the whole design exists to protect.
    matter which file the claim is written in.
 2. `2026-robot/main_processor/<name>/packet.h`: the topic constants it owns,
    `inline constexpr const char* kStateTopic = "/<name>/state";` and so on.
-   One declaration per topic, in the owning package.
+   One declaration per topic, in the owning package. The request topic is the
+   exception: it is `hardware::RequestTopic("<name>")`, never a second copy
+   of the string.
 3. `2026-robot/main_processor/<name>/<name>_message.fbs`: its message structs.
 4. `2026-robot/main_processor/<name>/node.h`: `template <typename Loop> class
    <Name>Node`, registering its watchers, senders and timer in the constructor.
+   The state-gating preamble is not written per node: `AcceptState`,
+   `GatewayReady`, `TargetFresh`, `FindMotor`, and `NeutralCommand` from
+   `talOS/hardware/gate.h` are the shared spelling.
 5. `2026-robot/main_processor/<name>/main.cc`: `kNodeName` and `kNodeTarget` as
-   file-local constants written once, argument parsing, the three branches
-   (`--describe` on a `SimulatedEventLoop`, `--replay` on a `ReplayEventLoop`,
-   otherwise the realtime loop), `process::InstallStopHandlers()`, and an
-   `introspect::Reporter` constructed **after** the loop so reverse destruction
-   order joins its thread before the counters it samples.
-   `2026-robot/main_processor/arbiter/main.cc` is the worked example.
+   file-local constants written once, then `process::RunHardwareNode` for a
+   node that owns hardware or `process::RunNode` otherwise — the flag parsing,
+   the three branches, the stop handlers, and the `introspect::Reporter` live
+   in the runner, not in the main. Log identity derives from the node name, so
+   a main that repeats `log_stream` or `default_log_path` is a main that
+   drifts. `2026-robot/main_processor/shooter/main.cc` is the worked example
+   for a hardware node, `2026-robot/main_processor/arbiter/main.cc` otherwise.
+   Prefer generating steps 2–5 with `tools/subsystem_codegen` over copying a
+   sibling package.
 6. `2026-robot/main_processor/<name>/node_test.cc`: the node on a
    `SimulatedEventLoop`.
 7. `2026-robot/main_processor/<name>/BUILD`: a `flatbuffer_cc_library`, a
@@ -473,7 +571,7 @@ to over-current a motor. That is the safety boundary; review it as one.
 
 If it is a simulation stand-in rather than real hardware, it belongs to the
 robot and not to the framework: name it in `[robot].sim_gateway` in
-`robot.toml`, as `//2026-robot/main_processor/drivetrain:sim_gateway` is today.
+`robot.toml`, as `//2026-robot/main_processor/simulation:sim_gateway` is today.
 
 ## Naming
 

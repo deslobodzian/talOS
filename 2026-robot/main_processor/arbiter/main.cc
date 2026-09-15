@@ -1,12 +1,11 @@
-#include "2026-robot/main_processor/arbiter/node.h"
+#include "talos_nodes/arbiter/node.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/introspection/names.h"
 #include "talOS/process/node_main.h"
 
 namespace {
-// This node's identity, written once. `--describe` and the live registry row
-// have to name the same node and the same build target, or a viewer cannot tell
-// a graph that changed from a graph it is reading two different names for.
+// Identity: the registry row and --describe name the same node and target;
+// log identity derives from the name (see talos::process::NodeSpec).
 constexpr const char* kNodeName = "arbiter";
 constexpr const char* kNodeTarget = "//2026-robot/main_processor/arbiter:node";
 
@@ -34,12 +33,9 @@ int main(int argc, char** argv) {
     (void)talos::config::ParseRobotConfig(flags.config_path);
     return talos::arbiter::ArbiterNode{loop};
   };
-  return talos::process::RunNode(
-      argc, argv,
-      {.node_name = kNodeName,
-       .node_target = kNodeTarget,
-       .log_stream = "arbiter",
-       .default_log_path = "/tmp/arbiter.tlog",
-       .endpoints = kEndpoints},
-      factory);
+  return talos::process::RunNode(argc, argv,
+                                 {.node_name = kNodeName,
+                                  .node_target = kNodeTarget,
+                                  .endpoints = kEndpoints},
+                                 factory);
 }

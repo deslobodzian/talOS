@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -176,6 +177,344 @@ can_id = 1
       0);
 }
 
+TEST(LauncherTest, StudioBridgeNeedsFlagAndSim) {
+  const auto has_bridge = [](const std::vector<NodeSpec>& nodes) {
+    return std::count_if(nodes.begin(), nodes.end(), [](const NodeSpec& n) {
+      return n.name == "studio_bridge";
+    });
+  };
+  // Neither flag nor sim: the bridge stays outside the session, as before.
+  EXPECT_EQ(has_bridge(DiscoverNodes(
+                config::ParseRobotConfigString(kFixtureToml), LauncherOptions{})),
+            0);
+  // Flag without sim (a deployed session): no webroot, no browser, no bridge.
+  LauncherOptions flag_only;
+  flag_only.start_studio_bridge = true;
+  EXPECT_EQ(has_bridge(DiscoverNodes(
+                config::ParseRobotConfigString(kFixtureToml), flag_only)),
+            0);
+  // Sim without the flag (--no-studio): the session runs headless.
+  LauncherOptions sim_only;
+  sim_only.simulation = true;
+  EXPECT_EQ(has_bridge(DiscoverNodes(
+                config::ParseRobotConfigString(kFixtureToml), sim_only)),
+            0);
+  // Both: declared with the framework default target.
+  LauncherOptions both;
+  both.simulation = true;
+  both.start_studio_bridge = true;
+  auto nodes =
+      DiscoverNodes(config::ParseRobotConfigString(kFixtureToml), both);
+  ASSERT_EQ(has_bridge(nodes), 1);
+  for (const auto& n : nodes) {
+    if (n.name == "studio_bridge") {
+      EXPECT_EQ(n.target, "//studio/bridge:studio_bridge");
+    }
+  }
+}
+
+TEST(LauncherTest, StudioBridgeTargetFromStudioTable) {
+  constexpr std::string_view kCustomStudio = R"(
+[robot]
+name = "custom_studio"
+period_us = 5000
+
+[studio]
+bridge = "//example/studio:bridge"
+http_port = 8080
+
+[subsystems.alpha]
+node = "//example/alpha:node"
+
+[subsystems.alpha.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+)";
+  LauncherOptions options;
+  options.simulation = true;
+  options.start_studio_bridge = true;
+  auto nodes =
+      DiscoverNodes(config::ParseRobotConfigString(kCustomStudio), options);
+  ASSERT_EQ(std::count_if(nodes.begin(), nodes.end(), [](const NodeSpec& n) {
+              return n.name == "studio_bridge";
+            }),
+            1);
+  for (const auto& n : nodes) {
+    if (n.name == "studio_bridge") {
+      EXPECT_EQ(n.target, "//example/studio:bridge");
+    }
+  }
+  EXPECT_EQ(EffectiveStudioHttpPort(
+                config::ParseRobotConfigString(kCustomStudio), options),
+            8080);
+  LauncherOptions override;
+  override.studio_http_port = 9090;
+  EXPECT_EQ(EffectiveStudioHttpPort(
+                config::ParseRobotConfigString(kCustomStudio), override),
+            9090);
+}
+
+TEST(LauncherTest, FindStudioBridgeIndex) {
+  LauncherOptions options;
+  options.simulation = true;
+  options.start_studio_bridge = true;
+  auto with =
+      DiscoverNodes(config::ParseRobotConfigString(kFixtureToml), options);
+  const std::size_t found = FindStudioBridgeIndex(with);
+  ASSERT_NE(found, with.size());
+  EXPECT_EQ(with[found].name, "studio_bridge");
+
+  auto without = DiscoverNodes(config::ParseRobotConfigString(kFixtureToml),
+                               LauncherOptions{});
+  EXPECT_EQ(FindStudioBridgeIndex(without), without.size());
+}
+
+TEST(LauncherTest, StudioBridgeWatchTopicFollowsDescribe) {
+  // No description: the pinned fallback.
+  EXPECT_EQ(StudioBridgeWatchTopic({}), "/talos/telemetry");
+
+  // The bridge's own WATCHER wins, tracking a topic override.
+  NodeDescription bridge;
+  bridge.roster_name = "studio_bridge";
+  bridge.answered = true;
+  bridge.declared.name = "studio_bridge";
+  introspect::naming::SourceShape watcher{event::SourceKind::WATCHER,
+                                          "/custom/telemetry", 48, 0};
+  bridge.declared.sources.push_back(watcher);
+  EXPECT_EQ(StudioBridgeWatchTopic({bridge}), "/custom/telemetry");
+
+  // Other nodes never steer the bridge's subscription.
+  NodeDescription alpha;
+  alpha.roster_name = "alpha";
+  alpha.answered = true;
+  alpha.declared.name = "alpha";
+  introspect::naming::SourceShape sender{event::SourceKind::SENDER,
+                                         "/alpha/state", 48, 0};
+  alpha.declared.sources.push_back(sender);
+  EXPECT_EQ(StudioBridgeWatchTopic({alpha}), "/talos/telemetry");
+}
+
+TEST(LauncherTest, ShouldRetryStudioBridgePredicate) {
+  using clock = std::chrono::steady_clock;
+  const auto now = clock::now();
+  const auto first = now - std::chrono::seconds(5);
+  const auto last = now - std::chrono::seconds(2);
+  // Budget remains and the last spawn is paced: retry.
+  EXPECT_TRUE(
+      ShouldRetryStudioBridge(1, first, last, now, false, false));
+  // Pacing: a spawn less than one interval ago is not retried yet.
+  EXPECT_FALSE(ShouldRetryStudioBridge(1, first, now, now, false, false));
+  // Attempts exhausted.
+  EXPECT_TRUE(kStudioBridgeMaxAttempts > 1);
+  EXPECT_FALSE(ShouldRetryStudioBridge(kStudioBridgeMaxAttempts, first, last,
+                                       now, false, false));
+  // Window exhausted.
+  EXPECT_FALSE(ShouldRetryStudioBridge(
+      1, now - kStudioBridgeStartupWindow - std::chrono::seconds(1), last, now,
+      false, false));
+  // A stop or a past deadline ends the retry, never extends it.
+  EXPECT_FALSE(
+      ShouldRetryStudioBridge(1, first, last, now, true, false));
+  EXPECT_FALSE(
+      ShouldRetryStudioBridge(1, first, last, now, false, true));
+  // Stability is the one-interval survival the retry exists to detect.
+  EXPECT_FALSE(IsStudioBridgeStable(now, now));
+  EXPECT_TRUE(IsStudioBridgeStable(now - std::chrono::seconds(2), now));
+}
+
+// Forward declarations for helpers defined with the graph tests below.
+std::string WriteStubNode(std::string_view name, std::string_view script);
+std::string DescribeJson(
+    std::string_view node, std::string_view target,
+    const std::vector<introspect::naming::SourceShape>& sources);
+introspect::naming::SourceShape Sender(std::string topic,
+                                       std::uint32_t bytes = 48);
+introspect::naming::SourceShape Watcher(std::string topic,
+                                        std::uint32_t bytes = 48);
+std::string ReadFile(const std::string& path);
+
+// A bridge stub for supervision tests: answers --describe like a viewer, then
+// either fails (telemetry never arrives) or sleeps (viewer stays up).
+std::string BridgeDescribeThen(std::string_view runtime) {
+  return std::string{"#!/bin/sh\n"} +
+         "for arg in \"$@\"; do\n"
+         "  if [ \"$arg\" = \"--describe\" ]; then\n"
+         "    cat <<'TALOS_DESCRIBE'\n" +
+         DescribeJson("studio_bridge", "//studio/bridge:studio_bridge",
+                      {Watcher("/alpha/state")}) +
+         "TALOS_DESCRIBE\n"
+         "    exit 0\n"
+         "  fi\n"
+         "done\n" +
+         std::string{runtime};
+}
+
+std::string NodeDescribeThenSleep(std::string_view node,
+                                  std::string_view target,
+                                  const std::vector<
+                                      introspect::naming::SourceShape>& sources,
+                                  int sleep_s) {
+  return std::string{"#!/bin/sh\n"} +
+         "for arg in \"$@\"; do\n"
+         "  if [ \"$arg\" = \"--describe\" ]; then\n"
+         "    cat <<'TALOS_DESCRIBE'\n" +
+         DescribeJson(node, target, sources) +
+         "TALOS_DESCRIBE\n"
+         "    exit 0\n"
+         "  fi\n"
+         "done\n"
+         "exec sleep " +
+         std::to_string(sleep_s) + "\n";
+}
+
+// A failing bridge must not delay the session: the first attempt spawns with
+// the nodes and retries happen inside the supervision loop while the session
+// runs. The counter proves a retry fired; the elapsed bound proves nothing
+// blocked for the old ~60s startup wait.
+TEST(LauncherTest, FailingBridgeRetriesInLoopWithoutBlockingSession) {
+  const std::string tag = "bridge_nonblock";
+  const std::string out_dir = TempPath(tag + "_out");
+  std::filesystem::create_directories(out_dir);
+  const std::string counter = TempPath(tag + "_counter");
+  ::remove(counter.c_str());
+
+  LauncherOptions options;
+  options.output_dir = out_dir;
+  options.session_id = 0xB81D9EULL;
+  options.simulation = true;
+  options.start_studio_bridge = true;
+  options.describe_timeout_ms = 4000;
+  options.config_path = WriteFixtureToml();
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
+  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+      tag + "_alpha",
+      NodeDescribeThenSleep("alpha", "//example/alpha:node",
+                            {Sender("/alpha/state")}, 3));
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      tag + "_beta",
+      NodeDescribeThenSleep("beta", "//example/beta:node",
+                            {Watcher("/alpha/state")}, 3));
+  options.binary_overrides["//studio/bridge:studio_bridge"] = WriteStubNode(
+      tag + "_bridge",
+      BridgeDescribeThen("echo x >> " + counter + "\nexit 1\n"));
+
+  const auto started = std::chrono::steady_clock::now();
+  Launcher launcher{options};
+  launcher.Run();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
+            20)
+      << "a failing bridge must not cost the old ~60s startup wait";
+  EXPECT_TRUE(std::filesystem::exists(out_dir + "/manifest.json"));
+  const std::string manifest = ReadFile(out_dir + "/manifest.json");
+  EXPECT_NE(manifest.find("\"name\": \"studio_bridge\""), std::string::npos)
+      << manifest;
+  // Exhaustion is degraded, not broken: the bridge is failed, the session ran.
+  EXPECT_NE(manifest.find("\"recorder_failed\": true"), std::string::npos)
+      << manifest;
+
+  std::ifstream count_in{counter};
+  std::size_t attempts = 0;
+  std::string line;
+  while (std::getline(count_in, line)) ++attempts;
+  EXPECT_GE(attempts, 2u) << "retries must fire inside the supervision loop";
+
+  std::filesystem::remove_all(out_dir);
+  ::remove(counter.c_str());
+}
+
+// The duration deadline starts with the session, not after the viewer: a
+// failing bridge plus long-lived nodes must still end near --duration-s.
+TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
+  const std::string tag = "bridge_deadline";
+  const std::string out_dir = TempPath(tag + "_out");
+  std::filesystem::create_directories(out_dir);
+
+  LauncherOptions options;
+  options.output_dir = out_dir;
+  options.session_id = 0xDEAD1100ULL;
+  options.simulation = true;
+  options.start_studio_bridge = true;
+  options.describe_timeout_ms = 4000;
+  options.duration_s = 2;
+  options.config_path = WriteFixtureToml();
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
+  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+      tag + "_alpha",
+      NodeDescribeThenSleep("alpha", "//example/alpha:node",
+                            {Sender("/alpha/state")}, 30));
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      tag + "_beta",
+      NodeDescribeThenSleep("beta", "//example/beta:node",
+                            {Watcher("/alpha/state")}, 30));
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStubNode(tag + "_bridge", BridgeDescribeThen("exit 1\n"));
+
+  const auto started = std::chrono::steady_clock::now();
+  Launcher launcher{options};
+  launcher.Run();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
+            20)
+      << "deadline must fire without waiting out the bridge window";
+  EXPECT_TRUE(std::filesystem::exists(out_dir + "/manifest.json"));
+
+  std::filesystem::remove_all(out_dir);
+}
+
+// A bridge that survives its grace second joins the session: it is not failed
+// and the session runs to the deadline with it.
+TEST(LauncherTest, StableBridgeJoinsSessionUntilDeadline) {
+  const std::string tag = "bridge_stable";
+  const std::string out_dir = TempPath(tag + "_out");
+  std::filesystem::create_directories(out_dir);
+
+  LauncherOptions options;
+  options.output_dir = out_dir;
+  options.session_id = 0x57AB1EULL;
+  options.simulation = true;
+  options.start_studio_bridge = true;
+  options.describe_timeout_ms = 4000;
+  options.duration_s = 3;
+  options.config_path = WriteFixtureToml();
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
+  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+      tag + "_alpha",
+      NodeDescribeThenSleep("alpha", "//example/alpha:node",
+                            {Sender("/alpha/state")}, 30));
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      tag + "_beta",
+      NodeDescribeThenSleep("beta", "//example/beta:node",
+                            {Watcher("/alpha/state")}, 30));
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStubNode(tag + "_bridge", BridgeDescribeThen("exec sleep 30\n"));
+
+  const auto started = std::chrono::steady_clock::now();
+  Launcher launcher{options};
+  launcher.Run();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  const auto elapsed_s =
+      std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+
+  EXPECT_GE(elapsed_s, 2) << "session must run to the deadline with Studio";
+  EXPECT_LT(elapsed_s, 20) << "session must end at the deadline";
+  ASSERT_TRUE(std::filesystem::exists(out_dir + "/manifest.json"));
+  const std::string manifest = ReadFile(out_dir + "/manifest.json");
+  EXPECT_NE(manifest.find("\"name\": \"studio_bridge\""), std::string::npos)
+      << manifest;
+  // A stable viewer is a session member, not a failure.
+  EXPECT_EQ(manifest.find("\"recorder_failed\": true"), std::string::npos)
+      << manifest;
+
+  std::filesystem::remove_all(out_dir);
+}
+
 TEST(LauncherTest, MergedLogsMonotonicOrder) {
   const std::string path_a = TempPath("log_a.tlog");
   const std::string path_b = TempPath("log_b.tlog");
@@ -253,6 +592,8 @@ TEST(LauncherTest, SessionManifestJsonFormatting) {
   node1.record_count = 50;
   node1.failed = false;
 
+  manifest.config_sha256 = "deadbeef";
+  node1.contract = "@talos_drivetrain//:contract";
   manifest.nodes.push_back(node1);
 
   std::string json = manifest.ToJson();
@@ -261,6 +602,9 @@ TEST(LauncherTest, SessionManifestJsonFormatting) {
   EXPECT_NE(json.find("\"pid\": 1234"), std::string::npos);
   EXPECT_NE(json.find("\"exit_code\": 0"), std::string::npos);
   EXPECT_NE(json.find("\"record_count\": 50"), std::string::npos);
+  EXPECT_NE(json.find("\"config_sha256\": \"deadbeef\""), std::string::npos);
+  EXPECT_NE(json.find("\"contract\": \"@talos_drivetrain//:contract\""),
+            std::string::npos);
 }
 
 TEST(LauncherTest, RunsChildProcessesAndWritesManifest) {
@@ -364,11 +708,11 @@ constexpr std::string_view kStubThatHangsOnDescribe =
     "exit 0\n";
 
 introspect::naming::SourceShape Sender(std::string topic,
-                                       std::uint32_t bytes = 48) {
+                                       std::uint32_t bytes) {
   return {event::SourceKind::SENDER, std::move(topic), bytes, 0};
 }
 introspect::naming::SourceShape Watcher(std::string topic,
-                                        std::uint32_t bytes = 48) {
+                                        std::uint32_t bytes) {
   return {event::SourceKind::WATCHER, std::move(topic), bytes, 0};
 }
 
@@ -568,5 +912,193 @@ TEST(LauncherGraphTest, ProbeReportsABinaryThatIsNotThere) {
   EXPECT_NE(error.find("no executable"), std::string::npos) << error;
 }
 
+TEST(LauncherBundleTest, ResolveBinaryHandlesExternalRepoLabels) {
+  std::map<std::string, std::string> overrides;
+  overrides["@custom_repo//sub:target"] = "/bin/custom_target";
+  EXPECT_EQ(ResolveBinary("@custom_repo//sub:target", overrides),
+            "/bin/custom_target");
+
+  std::string fallback = ResolveBinary("@robot//main_processor/drivetrain:node");
+  EXPECT_FALSE(fallback.empty());
+}
+
+TEST(LauncherBundleTest, ResolveBinaryFindsBzlmodCanonicalExternalDirs) {
+  // Bzlmod materializes an apparent "@talos_shooter" under a trailing-plus
+  // directory (bazel-bin/external/talos_shooter+/). The candidates are
+  // relative, so resolve them from inside a scratch tree.
+  const std::string root = TempPath("bzlmod_canonical");
+  std::filesystem::create_directories(root + "/bazel-bin/external/talos_shooter+");
+  {
+    std::ofstream b(root + "/bazel-bin/external/talos_shooter+/node");
+    b << "#!/bin/sh\nexit 0\n";
+  }
+  ::chmod((root + "/bazel-bin/external/talos_shooter+/node").c_str(), 0755);
+
+  char saved[4096];
+  ASSERT_NE(::getcwd(saved, sizeof(saved)), nullptr);
+  ASSERT_EQ(::chdir(root.c_str()), 0);
+  const std::string resolved =
+      ResolveBinary("@talos_shooter//:node", {});
+  const int restore = ::chdir(saved);
+  ASSERT_EQ(restore, 0);
+  EXPECT_EQ(resolved, "bazel-bin/external/talos_shooter+//node");
+}
+
+TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
+  const std::string bundle_dir = TempPath("test_bundle_dir");
+  std::filesystem::create_directories(bundle_dir + "/config");
+  std::filesystem::create_directories(bundle_dir + "/bin");
+  std::filesystem::create_directories(bundle_dir + "/lib");
+
+  const std::string cfg_path = bundle_dir + "/config/robot.toml";
+  {
+    std::ofstream cfg(cfg_path);
+    cfg << "[robot]\nname = \"bundle_bot\"\nperiod_us = 5000\n";
+  }
+
+  const std::string manifest_path = bundle_dir + "/bundle_manifest.json";
+  {
+    std::ofstream mf(manifest_path);
+    mf << "{\n"
+       << "  \"bundle_version\": 1,\n"
+       << "  \"config_path\": \"config/robot.toml\",\n"
+       << "  \"config_sha256\": \"abc123\",\n"
+       << "  \"nodes\": [\n"
+       << "    {\n"
+       << "      \"name\": \"alpha\",\n"
+       << "      \"target\": \"//example/alpha:node\",\n"
+       << "      \"binary_path\": \"bin/alpha\",\n"
+       << "      \"language\": \"cpp\",\n"
+       << "      \"contract\": \"@example_alpha//:contract\"\n"
+       << "    }\n"
+       << "  ]\n"
+       << "}\n";
+  }
+
+  {
+    std::ofstream b(bundle_dir + "/bin/alpha");
+    b << "#!/bin/sh\nexit 0\n";
+  }
+  ::chmod((bundle_dir + "/bin/alpha").c_str(), 0755);
+  {
+    std::ofstream l(bundle_dir + "/lib/libtalos_node.so");
+    l << "mock_so";
+  }
+
+  LauncherOptions options;
+  options.bundle_dir = bundle_dir;
+
+  std::string error;
+  EXPECT_TRUE(LoadBundle(options, error)) << error;
+  EXPECT_EQ(options.config_path, cfg_path);
+  EXPECT_EQ(options.binary_overrides["//example/alpha:node"],
+            bundle_dir + "/bin/alpha");
+  EXPECT_EQ(options.binary_overrides["alpha"], bundle_dir + "/bin/alpha");
+  EXPECT_EQ(options.bundle_config_sha256, "abc123");
+  EXPECT_EQ(options.bundle_contracts["//example/alpha:node"],
+            "@example_alpha//:contract");
+  EXPECT_EQ(options.bundle_contracts["alpha"], "@example_alpha//:contract");
+
+  std::filesystem::remove_all(bundle_dir);
+}
+
+TEST(LauncherBundleTest, LauncherRunsFromBundleDirectoryWithDescribeOnly) {
+  const std::string bundle_dir = TempPath("test_bundle_run");
+  std::filesystem::create_directories(bundle_dir + "/config");
+  std::filesystem::create_directories(bundle_dir + "/bin");
+
+  const std::string cfg_path = bundle_dir + "/config/robot.toml";
+  {
+    std::ofstream cfg(cfg_path);
+    cfg << "[robot]\nname = \"bundle_robot\"\nperiod_us = 5000\n"
+        << "[subsystems.alpha]\nnode = \"//bundle/alpha:node\"\nperiod_us = "
+           "5000\n"
+        << "[subsystems.alpha.motors.m1]\ntype = \"TalonFX\"\nbus = "
+           "\"rio\"\ncan_id = 1\n";
+  }
+
+  const std::string alpha_bin = bundle_dir + "/bin/alpha";
+  {
+    std::ofstream out{alpha_bin};
+    out << DescribingStub("alpha", "//bundle/alpha:node",
+                          {Sender("/alpha/state")});
+  }
+  ::chmod(alpha_bin.c_str(), 0755);
+
+  const std::string hw_bin = bundle_dir + "/bin/hardware_node";
+  {
+    std::ofstream out{hw_bin};
+    out << DescribingStub("hardware_node", "//talOS/bridge:hardware_node",
+                          {Watcher("/alpha/state")});
+  }
+  ::chmod(hw_bin.c_str(), 0755);
+
+  {
+    std::ofstream mf(bundle_dir + "/bundle_manifest.json");
+    mf << "{\n"
+       << "  \"bundle_version\": 1,\n"
+       << "  \"config_path\": \"config/robot.toml\",\n"
+       << "  \"nodes\": [\n"
+       << "    {\"name\": \"hardware_node\", \"target\": "
+          "\"//talOS/bridge:hardware_node\", \"binary_path\": "
+          "\"bin/hardware_node\", \"language\": \"cpp\"},\n"
+       << "    {\"name\": \"alpha\", \"target\": \"//bundle/alpha:node\", "
+          "\"binary_path\": \"bin/alpha\", \"language\": \"cpp\"}\n"
+       << "  ]\n"
+       << "}\n";
+  }
+
+  LauncherOptions options;
+  options.bundle_dir = bundle_dir;
+  options.describe_only = true;
+  options.output_dir = bundle_dir + "/logs";
+
+  Launcher launcher{options};
+  EXPECT_EQ(launcher.Run(), 0);
+  EXPECT_TRUE(std::filesystem::exists(bundle_dir + "/logs/graph.json"));
+
+  std::filesystem::remove_all(bundle_dir);
+}
+
+TEST(LauncherRemoteTest, EffectiveAddressComesFromDeploymentConfig) {
+  constexpr std::string_view kToml = R"(
+[robot]
+name = "remote_fixture"
+period_us = 5000
+controller_address = "10.56.87.2"
+
+[subsystems.alpha]
+node = "//example/alpha:node"
+
+[subsystems.alpha.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+)";
+  const auto robot_cfg = config::ParseRobotConfigString(kToml);
+
+  LauncherOptions from_config;
+  EXPECT_EQ(EffectiveRemoteAddress(robot_cfg, from_config), "10.56.87.2");
+  EXPECT_EQ(EffectiveRemotePort(robot_cfg, from_config), 5802);
+  EXPECT_EQ(EffectiveLocalPort(robot_cfg, from_config), 5803);
+
+  LauncherOptions cli_override;
+  cli_override.remote = "10.0.0.9";
+  cli_override.remote_port = 5900;
+  cli_override.local_port = 5901;
+  EXPECT_EQ(EffectiveRemoteAddress(robot_cfg, cli_override), "10.0.0.9");
+  EXPECT_EQ(EffectiveRemotePort(robot_cfg, cli_override), 5900);
+  EXPECT_EQ(EffectiveLocalPort(robot_cfg, cli_override), 5901);
+}
+
+TEST(LauncherRemoteTest, EffectiveAddressDefaultsToLoopback) {
+  const auto robot_cfg = config::ParseRobotConfigString(kFixtureToml);
+  LauncherOptions options;
+  EXPECT_EQ(EffectiveRemoteAddress(robot_cfg, options), "127.0.0.1");
+  EXPECT_EQ(EffectiveRemotePort(robot_cfg, options), 5802);
+  EXPECT_EQ(EffectiveLocalPort(robot_cfg, options), 5803);
+}
+
 }  // namespace
 }  // namespace talos::launcher
+

@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "system.h"
+#include "talOS/configuration/config_parser.h"
+#include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/rtms/rtms.h"
 #include "studio/schema/wire.h"
@@ -173,6 +175,50 @@ std::string mime(const fs::path& p) {
 }
 }  // namespace
 int main(int argc, char** argv) try {
+  // `--describe`: answer what this process is without touching shared memory,
+  // sockets, or the HTTP port, so the launcher can probe this binary like any
+  // other node and carry it in the declared graph. `--config` and `--sim` are
+  // accepted and otherwise ignored, because the launcher probes every binary
+  // with the same flags.
+  for (int i = 1; i < argc; ++i) {
+    if (std::string_view(argv[i]) != "--describe") continue;
+    const char* config_path = nullptr;
+    for (int j = 1; j + 1 < argc; ++j) {
+      if (std::string_view(argv[j]) == "--config") config_path = argv[j + 1];
+    }
+    // The watched topic is the telemetry node's own configuration, read from
+    // the same key it reads ([subsystems.telemetry] topic), so the two ends
+    // cannot drift apart. The fallback pins talos-telemetry/node.h
+    // kStudioTopic by value (the launcher lint pins it in practice: a drifted
+    // default fails the launch with "read by studio_bridge but nothing
+    // publishes it").
+    std::string topic = "/talos/telemetry";
+    if (config_path != nullptr) {
+      try {
+        const auto robot = talos::config::ParseRobotConfig(config_path);
+        if (const auto* tbl = robot.GetSubsystemTable("telemetry")) {
+          if (auto node = (*tbl)["topic"]) {
+            if (auto val = node.value<std::string_view>();
+                val && !val->empty()) {
+              topic = std::string(*val);
+            }
+          }
+        }
+      } catch (const std::exception& e) {
+        std::cerr << "studio_bridge --describe: cannot parse " << config_path
+                  << " (" << e.what() << "); describing the default topic\n";
+      }
+    }
+    talos::introspect::Description description;
+    description.name = "studio_bridge";
+    description.target = "//studio/bridge:studio_bridge";
+    description.sources.push_back({talos::event::SourceKind::WATCHER, topic,
+                                   static_cast<std::uint32_t>(
+                                       studio::slot_bytes),
+                                   0});
+    std::cout << talos::introspect::DescribeToJson(description);
+    return 0;
+  }
   // `--declared` is lifted out before anything reads a position, so it can be
   // passed anywhere on the line without shifting the positional arguments that
   // every existing script and the launcher already pass.
@@ -202,6 +248,7 @@ int main(int argc, char** argv) try {
            "[IP=127.0.0.1] [UDP=5801] [HTTP=5800] [webroot=studio/dist]\n"
            "       [--declared PATH]   the launcher's graph.json, served at "
            "/declared.json\n"
+           "       [--describe]          print the --describe envelope and exit\n"
            "The publisher MUST use DROP_NEWEST; RTMS does not store this "
            "policy in shared memory.\n";
     return 2;

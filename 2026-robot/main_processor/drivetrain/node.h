@@ -1,13 +1,18 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <numbers>
+#include <span>
 
-#include "2026-robot/main_processor/drivetrain/drive_message_generated.h"
-#include "2026-robot/main_processor/drivetrain/packet.h"
-#include "2026-robot/main_processor/drivetrain/swerve.h"
+#include "talos_nodes/drivetrain/drive_message_generated.h"
+#include "talos_nodes/drivetrain/geometry.h"
+#include "talos_nodes/drivetrain/packet.h"
+#include "talos_nodes/drivetrain/swerve.h"
 #include "talOS/events/handles.h"
+#include "talOS/hardware/gate.h"
 #include "talOS/hardware/messages.h"
+#include "talOS/process/hardware_main.h"
 
 namespace talos::drive {
 template <typename Loop>
@@ -52,10 +57,9 @@ class DrivetrainNode {
   void OnState(const event::Context& context, const Packet& packet) {
     hardware::State state;
     if (!hardware::Decode(packet.bytes(), state)) return;
-    if (config_id_ != 0 && state.config_id != config_id_) return;
-    if (have_state_ && state.boot_id == state_.boot_id &&
-        state.sample_time_us <= state_.sample_time_us)
-      return;
+    if (!hardware::AcceptState(have_state_, state_, config_id_, state)) return;
+    // Node policy, not transport gating: this subsystem needs every one of
+    // its motors present in the sample before it drives any of them.
     for (uint16_t id : devices_.motors) {
       bool found = false;
       for (std::size_t i = 0; i < state.motor_count; ++i) {
@@ -77,13 +81,9 @@ class DrivetrainNode {
     if (!have_state_) return;
     const auto timeout = std::chrono::microseconds{config_.command_timeout_us};
     const auto issued = event::MonotonicTime::from_nanos(target_.issued_ns());
-    bool valid =
-        target_.enabled() && issued <= context.now &&
-        context.now - issued < timeout &&
-        context.now - state_received_ < timeout &&
-        (state_.flags & (hardware::kConfigured | hardware::kEnabled)) ==
-            (hardware::kConfigured | hardware::kEnabled) &&
-        !(state_.flags & hardware::kHardwareFault);
+    bool valid = hardware::TargetFresh(context.now, issued, target_.enabled(),
+                                       state_received_, timeout) &&
+                 hardware::GatewayReady(state_);
     for (uint16_t id : devices_.motors) {
       for (std::size_t i = 0; i < state_.motor_count; ++i) {
         if (state_.motors[i].id == id) {
@@ -97,13 +97,14 @@ class DrivetrainNode {
       command = SwerveCommand(config_, geometry_, state_, target_.vx_mps(),
                               target_.vy_mps(), target_.omega_radps());
     else {
-      command.config_id = state_.config_id;
-      command.boot_id = state_.boot_id;
-      command.epoch = state_.epoch;
-      command.observed_time_us = state_.sample_time_us;
-      command.count = static_cast<uint16_t>(config_.motors.size());
-      for (std::size_t i = 0; i < config_.motors.size(); ++i)
-        command.motors[i].id = config_.motors[i].id;
+      std::array<uint16_t, hardware::kMaxMotors> ids{};
+      std::size_t n = 0;
+      for (const auto& motor : config_.motors) {
+        if (n >= ids.size()) break;
+        ids[n++] = motor.id;
+      }
+      command = hardware::NeutralCommand(
+          state_, std::span<const uint16_t>{ids.data(), n});
     }
     Packet packet{};
     packet.size = hardware::Encode(command, packet.data);
@@ -172,4 +173,13 @@ class DrivetrainNode {
   event::Sender<Loop, DrivetrainState> drive_state_;
   event::Timer<Loop> timer_;
 };
+
+inline auto CreateNode(auto& loop, const talos::process::HardwareSubsystem& sub,
+                       bool simulation) {
+  const auto geometry = BuildSwerveGeometry(sub.robot);
+  return DrivetrainNode{loop, sub.robot.hardware, geometry, sub.devices,
+                        simulation};
+}
+
 }  // namespace talos::drive
+

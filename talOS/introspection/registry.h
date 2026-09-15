@@ -393,6 +393,7 @@ class NodeRegistration {
           "registry is full: " + std::to_string(kMaxNodes) +
           " nodes are already registered");
     }
+    generation_ = record_->generation.load(std::memory_order_acquire);
   }
 
   ~NodeRegistration() { release(); }
@@ -556,16 +557,64 @@ class NodeRegistration {
 
   void release() {
     if (record_ != nullptr) {
-      record_->source_count.store(0, std::memory_order_relaxed);
-      record_->state.store(static_cast<std::uint64_t>(SlotState::FREE),
-                           std::memory_order_release);
+      // Only free what is still ours: the slot may have been swept and
+      // reclaimed after this owner went quiet (see sweep_stale), and freeing
+      // it then would yank the new owner's row out from under it.
+      if (record_->generation.load(std::memory_order_acquire) == generation_) {
+        record_->source_count.store(0, std::memory_order_relaxed);
+        record_->state.store(static_cast<std::uint64_t>(SlotState::FREE),
+                             std::memory_order_release);
+      }
       record_ = nullptr;
     }
   }
 
+  // Frees every slot whose owner stopped heartbeating long enough ago to be
+  // considered gone, so crash residue from an earlier session never lingers
+  // as a permanent "stopped heartbeating" row in the viewer. Runs on every
+  // claim -- a fresh session starts one claim per node, which sweeps the
+  // previous session's ghosts -- and only touches slots the liveness check
+  // already treats as dead.
+  static void sweep_stale(RegistryHeader* header) {
+    const std::int64_t now = wall_now_ns();
+    const std::int64_t timeout =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
+            .count();
+    for (std::size_t i = 0; i < kMaxNodes; ++i) {
+      NodeRecord& record = header->nodes[i];
+      if (record.state.load(std::memory_order_acquire) !=
+          static_cast<std::uint64_t>(SlotState::ACTIVE)) {
+        continue;
+      }
+      if (now - record.heartbeat_wall_ns.load(std::memory_order_relaxed) <
+          timeout) {
+        continue;
+      }
+      // Take the slot before deciding, so two nodes starting at once cannot
+      // free the same row twice; hand it back when the owner heartbeated
+      // while we were deciding.
+      std::uint64_t expected = static_cast<std::uint64_t>(SlotState::ACTIVE);
+      if (!record.state.compare_exchange_strong(
+              expected, static_cast<std::uint64_t>(SlotState::CLAIMING),
+              std::memory_order_acq_rel)) {
+        continue;
+      }
+      const bool still_stale =
+          now - record.heartbeat_wall_ns.load(std::memory_order_relaxed) >=
+          timeout;
+      record.state.store(still_stale
+                             ? static_cast<std::uint64_t>(SlotState::FREE)
+                             : static_cast<std::uint64_t>(SlotState::ACTIVE),
+                         std::memory_order_release);
+    }
+  }
+
   // Takes a free slot, or -- only when none is free -- one whose owner stopped
-  // heartbeating long enough ago to be considered gone.
+  // heartbeating long enough ago to be considered gone. Stale rows are swept
+  // first (see sweep_stale), so the fallback below only fires for a slot that
+  // went quiet between the sweep and the claim.
   static NodeRecord* claim(RegistryHeader* header, const Identity& identity) {
+    sweep_stale(header);
     NodeRecord* record = claim_where(header, SlotState::FREE, false);
     if (record == nullptr) {
       record = claim_where(header, SlotState::ACTIVE, true);
@@ -625,6 +674,9 @@ class NodeRegistration {
   RegistryMapping mapping_;
   Identity identity_;
   NodeRecord* record_{nullptr};
+  // Generation of record_ when claimed. Guards release() against freeing a
+  // slot that was swept and reclaimed after this owner went quiet.
+  std::uint64_t generation_{0};
   bool names_checked_{false};
 };
 

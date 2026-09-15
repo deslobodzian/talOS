@@ -2,6 +2,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -15,6 +16,7 @@
 #include <frc/AnalogInput.h>
 #include <frc/DigitalInput.h>
 #include <frc/DigitalOutput.h>
+#include <frc/DutyCycleEncoder.h>
 #include <frc/Encoder.h>
 #include <frc/PWM.h>
 
@@ -30,6 +32,15 @@ class PhoenixBackend final : public talos::hardware::Backend {
   bool ApplyOutputs(std::span<const talos::hardware::DigitalOutputRequest> digital_outputs,
                     std::span<const talos::hardware::PwmRequest> pwm_outputs) override;
   void Neutral() override;
+  // Item 35: precise failure behind the last false Configure().
+  std::optional<talos::hardware::ConfigError> last_config_error() const override;
+  // Item 36: per-device reset detection (HasResetOccurred) and restore.
+  bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override;
+  bool RestoreAfterReset() override;
+  // Item 38: declares the mechanism currently at home_position_rot.
+  bool ZeroPosition(uint16_t motor_id, double home_position_rot) override;
+  // Item 39: supply rail measured off the first motor's supply signal.
+  talos::hardware::HealthSnapshot GetHealth() override;
 
  private:
   void UpdateSimulation(double dt);
@@ -45,8 +56,19 @@ class PhoenixBackend final : public talos::hardware::Backend {
   std::vector<std::unique_ptr<frc::DigitalInput>> digital_inputs_;
   std::vector<std::unique_ptr<frc::DigitalOutput>> digital_outputs_;
   std::vector<std::unique_ptr<frc::AnalogInput>> analog_inputs_;
-  std::vector<std::unique_ptr<frc::Encoder>> encoders_;
+  struct RioEncoder {
+    talos::hardware::EncoderConfig config{};
+    std::unique_ptr<frc::Encoder> quadrature;
+    std::unique_ptr<frc::DutyCycleEncoder> duty_cycle;
+    // Duty-cycle devices report absolute position only; velocity is the
+    // finite difference of offset-corrected position across Reads.
+    double last_position_rot{0.0};
+    std::optional<std::chrono::steady_clock::time_point> last_time;
+  };
+  std::vector<RioEncoder> rio_encoders_;
   std::vector<std::unique_ptr<frc::PWM>> pwm_outputs_;
+
+  std::optional<talos::hardware::ConfigError> last_error_;
 
   bool is_simulation_{false};
   std::optional<std::chrono::steady_clock::time_point> last_sim_time_;

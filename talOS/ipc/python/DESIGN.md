@@ -7,9 +7,11 @@ are the ground truth. Python must not duplicate any of them.
 
 * `node_api.py` is the only Python door into the transport. It is a `ctypes`
   binding over the exact `extern "C"` ABI in `talOS/node_api/node_api.h`
-  (15 exports: the 10 transport/describe functions plus
+  (18 exports: the 10 transport/describe functions plus
   `talos_node_register`, `talos_node_publish`, `talos_node_heartbeat`,
-  `talos_node_close`, and `talos_rtms_layout`). It loads
+  `talos_node_close`, `talos_rtms_layout`, and the three ABI-4 gate
+  predicates `talos_accept_state`, `talos_gateway_ready`,
+  `talos_target_fresh_ns`). It loads
   `bazel-bin/talOS/node_api/libtalos_node.so` (override with `TALOS_NODE_LIB`,
   or via test runfiles). Importing it never touches the `.so`; the first
   call that needs the library loads it.
@@ -30,6 +32,16 @@ are the ground truth. Python must not duplicate any of them.
   the JSON string from `talos_describe_emit`. Python never hand-formats the
   envelope, so a schema change lands in C++ once. This signature is a
   cross-track contract: do not drift.
+* State gating binds, never mirrors. The config match, the staleness check,
+  the gateway flags, and the freshness timeout live exactly once, as pure
+  functions in `talOS/hardware/gate.h`; `node_api.py` exposes them as
+  `accept_state` / `gateway_ready` / `target_fresh_ns` over the ABI-4
+  exports, and node code calls those. No `packet.py`-level predicate may
+  re-spell them: a second copy -- even a correct one -- drifts silently
+  (ARCHITECTURE.md rule 11), and rule 10 says a wrapper binds, never
+  reimplements. The per-message explicit codecs (`encode_command`, the
+  flatbuffer structs) stay spelled out per message, as rule 11 requires;
+  only the decisions move behind the ABI.
 * `Node(name, target, session_id, flags, sources)` claims a registry slot
   via `talos_node_register`, publishes the same rows via
   `talos_node_publish`, and `heartbeat(dispatches)` samples once per tick —

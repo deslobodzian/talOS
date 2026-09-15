@@ -111,6 +111,65 @@ The probe has a short timeout — five seconds by default,
 reported. A node that blocks in its constructor waiting for a device is a bug
 worth seeing, and it must cost the launch a few seconds rather than the session.
 
+## Controller addressing
+
+The hardware bridge talks to the controller processor over UDP, so a real-robot
+launch has to say where that processor is. The address lives in the deployment
+configuration, with a CLI override for one-off runs:
+
+```toml
+[robot]
+controller_address = "10.56.87.2"  # RoboRIO as seen from this companion
+controller_port = 5802             # gateway port on the controller
+local_port = 5803                  # bind port on the companion
+```
+
+`controller_address` is canonical; `remote_address` and `remote_ip` are
+accepted as aliases, and `remote_port` aliases `controller_port`. All three
+default to the loopback contract (`127.0.0.1:5802`, local `5803`), so
+simulation and loopback tests need no extra configuration.
+
+```sh
+bazel run //talOS/launcher:launcher -- --config 2026-robot/main_processor/configuration/robot.toml
+bazel run //talOS/launcher:launcher -- --config 2026-robot/main_processor/configuration/robot.toml --remote 10.56.87.2
+```
+
+`--remote` overrides `[robot] controller_address`; `--remote-port` and
+`--local-port` override their config counterparts the same way. The launcher
+resolves the effective endpoint once per launch, prints it
+(`[launcher] Controller <addr>:<port> ...`), and always starts
+`hardware_node` with an explicit `--remote/--remote-port/--local-port` triple.
+Running the bridge standalone resolves identically: its own `--remote` wins,
+otherwise its `--config` supplies the address. No `--sim` on a real robot;
+under `--sim` (or against loopback) the bridge treats the config as
+commissioned, while on hardware the config's `commissioned` flag gates
+commands.
+
+## Studio bridge
+
+Sim sessions can put the Studio viewer bridge under launcher supervision with
+`--start-studio-bridge` (what `sim.sh` passes unless `--no-studio`), so the
+bridge is a declared node in `graph.json` instead of a process running behind
+the launcher's back:
+
+```toml
+[studio]
+bridge = "//studio/bridge:studio_bridge"  # binary target to supervise
+http_port = 5800                          # HTTP/WebSocket port
+udp_port = 5801                           # desktop UDP path
+webroot = "bazel-bin/studio/dist"         # static web directory, relative to the launcher's working directory
+```
+
+Every key is optional; an absent `[studio]` table leaves these defaults. The
+watched topic is not repeated here: it comes from `[subsystems.telemetry]`
+topic, the same key the telemetry node reads. `--studio-http-port PORT`
+overrides `[studio] http_port` for one run. Supervision is sim-only: without
+`--sim` the flag has no effect, since a deployed session has no build tree
+serving the webroot and no browser to open. The bridge answers `--describe`
+like any other node, and the launcher starts it with the session's `graph.json`
+as `--declared`; its stdout lands in `<output_dir>/studio_bridge.log`
+(plaintext, not a `.tlog`) beside the manifest.
+
 ## graph.json
 
 Phase one writes `<output_dir>/graph.json` beside the session's

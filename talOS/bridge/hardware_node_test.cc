@@ -46,6 +46,14 @@ period_us = 5000
 dio = 3
 )";
 
+// The config id the node itself computes: simulation forces commissioned,
+// which is part of the hash, so hashing the parsed config as-is mismatches.
+uint64_t NodeConfigId(const talos::config::RobotConfig& cfg) {
+  Config hw = cfg.hardware;
+  hw.commissioned = true;
+  return ConfigurationId(hw);
+}
+
 TEST(HardwareNodeTest, MergesSubsystemRequestsAndIsolatesTimeouts) {
   auto cfg = talos::config::ParseRobotConfigString(kTestToml);
   ASSERT_EQ(cfg.hardware.motors.size(), 2u);
@@ -61,7 +69,7 @@ TEST(HardwareNodeTest, MergesSubsystemRequestsAndIsolatesTimeouts) {
 
   // Simulate gateway state arriving
   State fake_state{};
-  fake_state.config_id = ConfigurationId(cfg.hardware);
+  fake_state.config_id = NodeConfigId(cfg);
   fake_state.boot_id = 999;
   fake_state.epoch = 1;
   fake_state.sample_time_us = 1000;
@@ -76,8 +84,12 @@ TEST(HardwareNodeTest, MergesSubsystemRequestsAndIsolatesTimeouts) {
   ipc::Publisher<talos::hardware::Packet> hw_state_pub{kStateTopic};
   hw_state_pub.write(state_pkt);
 
-  // 1. Both subsystems publish active commands
+  // 1. Both subsystems publish active commands. No controller state has arrived
+  // over UDP yet, so the bridge's last-observed identity is (config, 0, 0, 0):
+  // well-formed requests stamp exactly that.
+  const uint64_t config_id = NodeConfigId(cfg);
   Command drive_cmd{};
+  drive_cmd.config_id = config_id;
   drive_cmd.count = 1;
   drive_cmd.motors[0] = {cfg.hardware.motors[0].id, Mode::kVelocity, 0, 15.0,
                          1.2};
@@ -86,6 +98,7 @@ TEST(HardwareNodeTest, MergesSubsystemRequestsAndIsolatesTimeouts) {
   drive_pub.write(drive_pkt);
 
   Command shooter_cmd{};
+  shooter_cmd.config_id = config_id;
   shooter_cmd.count = 1;
   shooter_cmd.motors[0] = {cfg.hardware.motors[1].id, Mode::kVelocity, 0, 50.0,
                            2.5};
@@ -182,6 +195,401 @@ TEST(HardwareNodeTest, ForwardsDriverStationPacketsToIpc) {
   ASSERT_TRUE(pkt.has_value());
   EXPECT_EQ(pkt->size, dummy_payload.size());
   EXPECT_EQ(std::memcmp(pkt->data.data(), dummy_payload.data(), pkt->size), 0);
+}
+
+constexpr std::string_view kTrustToml = R"(
+[robot]
+name = "trust_robot"
+period_us = 5000
+
+[subsystems.drivetrain]
+period_us = 5000
+
+[subsystems.drivetrain.motors.drive]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+
+[subsystems.intake]
+period_us = 5000
+
+[subsystems.intake.motors.roller]
+type = "TalonFX"
+bus = "rio"
+can_id = 2
+
+[subsystems.intake.digital_outputs.beacon]
+dio = 1
+
+[subsystems.intake.pwm_outputs.strip]
+channel = 0
+)";
+
+void PublishCommand(ipc::Publisher<talos::hardware::Packet>& pub,
+                    const Command& cmd) {
+  talos::hardware::Packet pkt{};
+  pkt.size = static_cast<uint32_t>(Encode(cmd, pkt.data));
+  pub.write(pkt);
+}
+
+// Sends one controller state frame from a fake gateway, then ticks until the
+// node ingests it. False means the state never arrived (a test failure, not a
+// hang).
+bool InjectState(HardwareNode& node, protocol::RuntimeUdpPeer& gateway,
+                 const State& state, uint64_t now_us) {
+  talos::hardware::Packet buf{};
+  buf.size = static_cast<uint32_t>(Encode(state, buf.data));
+  if (gateway.SendFrame(protocol::FrameType::kHardwareState, 1, now_us,
+                        buf.data.data(), buf.size) !=
+      protocol::UdpStatus::kOk) {
+    return false;
+  }
+  const uint64_t before = node.states_received();
+  for (int i = 0; i < 200; ++i) {
+    node.Tick(now_us);
+    if (node.states_received() > before) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return false;
+}
+
+State TrustState(uint64_t config_id, uint64_t boot_id, uint64_t epoch,
+                 uint64_t sample_time_us) {
+  State state{};
+  state.config_id = config_id;
+  state.boot_id = boot_id;
+  state.epoch = epoch;
+  state.sample_time_us = sample_time_us;
+  state.flags = kConfigured | kEnabled;
+  return state;
+}
+
+TEST(HardwareNodeTest, RejectsRequestsForDevicesOwnedByAnotherSubsystem) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  ASSERT_EQ(cfg.hardware.motors.size(), 2u);
+  ASSERT_EQ(cfg.hardware.digital_outputs.size(), 1u);
+  ASSERT_EQ(cfg.hardware.pwm_outputs.size(), 1u);
+  const uint16_t drive = cfg.hardware.motors[0].id;
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint16_t beacon = cfg.hardware.digital_outputs[0].id;
+  const uint16_t strip = cfg.hardware.pwm_outputs[0].id;
+  ASSERT_TRUE(cfg.subsystems.at("drivetrain").motors.size() == 1u &&
+              cfg.subsystems.at("drivetrain").motors[0] == drive);
+  ASSERT_TRUE(cfg.subsystems.at("intake").motors.size() == 1u &&
+              cfg.subsystems.at("intake").motors[0] == roller);
+
+  HardwareNode node{cfg, "127.0.0.1", 25812, 25813, true};
+  ASSERT_TRUE(node.Open());
+  node.Tick(999000);  // Drain any stale packet a previous test left behind.
+
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(gateway.Open("127.0.0.1", 25812, "127.0.0.1", 25813),
+            protocol::UdpStatus::kOk);
+  const uint64_t config_id = NodeConfigId(cfg);
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 1000), 1000000));
+
+  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
+  ipc::Publisher<talos::hardware::Packet> drive_pub{RequestTopic("drivetrain")};
+
+  // An intake request that accidentally addresses the drivetrain motor: the
+  // whole request is rejected, so neither the stray drive demand nor the
+  // intake's own roller demand merges.
+  Command cross{};
+  cross.config_id = config_id;
+  cross.boot_id = 11;
+  cross.epoch = 1;
+  cross.observed_time_us = 1000;
+  cross.count = 2;
+  cross.motors[0] = {roller, Mode::kVelocity, 0, 30.0, 0.0};
+  cross.motors[1] = {drive, Mode::kVelocity, 0, 99.0, 0.0};
+  PublishCommand(intake_pub, cross);
+  node.Tick(1001000);
+
+  EXPECT_EQ(node.ownership_rejected(), 1u);
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
+  const Command& cmd1 = node.current_command();
+  EXPECT_EQ(cmd1.motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(cmd1.motors[1].mode, Mode::kNeutral);
+
+  // Same for the other actuator kinds: drivetrain must not drive the intake's
+  // digital output or PWM channel.
+  Command cross_do{};
+  cross_do.config_id = config_id;
+  cross_do.boot_id = 11;
+  cross_do.epoch = 1;
+  cross_do.observed_time_us = 1000;
+  cross_do.count = 1;
+  cross_do.motors[0] = {drive, Mode::kVelocity, 0, 15.0, 0.0};
+  cross_do.digital_output_count = 1;
+  cross_do.digital_outputs[0] = {beacon, true};
+  PublishCommand(drive_pub, cross_do);
+  node.Tick(1002000);
+
+  EXPECT_EQ(node.ownership_rejected(), 2u);
+  EXPECT_EQ(cmd1.motors[0].mode, Mode::kNeutral);
+  EXPECT_FALSE(node.current_command().digital_outputs[0].value);
+
+  Command cross_pwm{};
+  cross_pwm.config_id = config_id;
+  cross_pwm.boot_id = 11;
+  cross_pwm.epoch = 1;
+  cross_pwm.observed_time_us = 1000;
+  cross_pwm.count = 1;
+  cross_pwm.motors[0] = {drive, Mode::kVelocity, 0, 15.0, 0.0};
+  cross_pwm.pwm_output_count = 1;
+  cross_pwm.pwm_outputs[0] = {strip, 0.9};
+  PublishCommand(drive_pub, cross_pwm);
+  node.Tick(1003000);
+
+  EXPECT_EQ(node.ownership_rejected(), 3u);
+  EXPECT_DOUBLE_EQ(node.current_command().pwm_outputs[0].output, 0.0);
+
+  // Positive control: requests that stay inside their own ownership still
+  // merge.
+  Command intake_ok{};
+  intake_ok.config_id = config_id;
+  intake_ok.boot_id = 11;
+  intake_ok.epoch = 1;
+  intake_ok.observed_time_us = 1000;
+  intake_ok.count = 1;
+  intake_ok.motors[0] = {roller, Mode::kVelocity, 0, 30.0, 0.0};
+  intake_ok.digital_output_count = 1;
+  intake_ok.digital_outputs[0] = {beacon, true};
+  intake_ok.pwm_output_count = 1;
+  intake_ok.pwm_outputs[0] = {strip, 0.5};
+  PublishCommand(intake_pub, intake_ok);
+  Command drive_ok{};
+  drive_ok.config_id = config_id;
+  drive_ok.boot_id = 11;
+  drive_ok.epoch = 1;
+  drive_ok.observed_time_us = 1000;
+  drive_ok.count = 1;
+  drive_ok.motors[0] = {drive, Mode::kVelocity, 0, 15.0, 0.0};
+  PublishCommand(drive_pub, drive_ok);
+  node.Tick(1004000);
+
+  EXPECT_EQ(node.ownership_rejected(), 3u);
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+  const Command& cmd2 = node.current_command();
+  EXPECT_DOUBLE_EQ(cmd2.motors[0].demand, 15.0);
+  EXPECT_DOUBLE_EQ(cmd2.motors[1].demand, 30.0);
+  EXPECT_TRUE(cmd2.digital_outputs[0].value);
+  EXPECT_DOUBLE_EQ(cmd2.pwm_outputs[0].output, 0.5);
+}
+
+TEST(HardwareNodeTest, RejectsRequestsWithStaleIdentity) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint64_t config_id = NodeConfigId(cfg);
+
+  HardwareNode node{cfg, "127.0.0.1", 25814, 25815, true};
+  ASSERT_TRUE(node.Open());
+  node.Tick(999000);
+
+  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
+
+  // No controller state has arrived, so the current identity is
+  // (config, 0, 0, 0). Each wrong word is rejected on its own.
+  Command base{};
+  base.config_id = config_id;
+  base.count = 1;
+  base.motors[0] = {roller, Mode::kVelocity, 0, 30.0, 0.0};
+
+  Command bad_config = base;
+  bad_config.config_id = config_id + 1;
+  PublishCommand(intake_pub, bad_config);
+  node.Tick(1000000);
+
+  Command bad_boot = base;
+  bad_boot.boot_id = 7;
+  PublishCommand(intake_pub, bad_boot);
+  node.Tick(1001000);
+
+  Command bad_epoch = base;
+  bad_epoch.epoch = 2;
+  PublishCommand(intake_pub, bad_epoch);
+  node.Tick(1002000);
+
+  Command bad_observed = base;
+  bad_observed.observed_time_us = 5;
+  PublishCommand(intake_pub, bad_observed);
+  node.Tick(1003000);
+
+  EXPECT_EQ(node.identity_rejected(), 4u);
+  EXPECT_EQ(node.ownership_rejected(), 0u);
+  // Rejections prove nothing: the subsystem is still timed out and its demand
+  // never merged.
+  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(node.current_command().motors[1].mode, Mode::kNeutral);
+
+  PublishCommand(intake_pub, base);
+  node.Tick(1004000);
+  EXPECT_EQ(node.identity_rejected(), 4u);
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
+}
+
+TEST(HardwareNodeTest, ObsoleteRequestsNeverLookCurrent) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint64_t config_id = NodeConfigId(cfg);
+
+  HardwareNode node{cfg, "127.0.0.1", 25816, 25817, true};
+  ASSERT_TRUE(node.Open());
+  node.Tick(999000);
+
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(gateway.Open("127.0.0.1", 25816, "127.0.0.1", 25817),
+            protocol::UdpStatus::kOk);
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 5000), 1000000));
+
+  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
+  Command fresh{};
+  fresh.config_id = config_id;
+  fresh.boot_id = 11;
+  fresh.epoch = 1;
+  fresh.observed_time_us = 5000;
+  fresh.count = 1;
+  fresh.motors[0] = {roller, Mode::kVelocity, 0, 30.0, 0.0};
+  PublishCommand(intake_pub, fresh);
+  node.Tick(1001000);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
+  EXPECT_EQ(node.current_command().observed_time_us, 5000u);
+
+  // A newer sample arrives (same boot and epoch: not a transition, so the
+  // cached merge survives). Replaying the request built from the older sample
+  // is rejected, and the merge keeps the older observation instead of being
+  // re-stamped with the new one: stale stays visibly stale.
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 6000), 1002000));
+  PublishCommand(intake_pub, fresh);
+  node.Tick(1002500);
+
+  EXPECT_EQ(node.identity_rejected(), 1u);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
+  EXPECT_EQ(node.current_command().observed_time_us, 5000u);
+}
+
+TEST(HardwareNodeTest, RequiresFreshRequestsAfterControllerTransitions) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  const uint16_t drive = cfg.hardware.motors[0].id;
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint64_t config_id = NodeConfigId(cfg);
+
+  HardwareNode node{cfg, "127.0.0.1", 25818, 25819, true};
+  ASSERT_TRUE(node.Open());
+  node.Tick(999000);
+
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(gateway.Open("127.0.0.1", 25818, "127.0.0.1", 25819),
+            protocol::UdpStatus::kOk);
+  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
+  ipc::Publisher<talos::hardware::Packet> drive_pub{RequestTopic("drivetrain")};
+
+  const auto publish_valid = [&](uint64_t boot, uint64_t epoch,
+                                 uint64_t observed, double drive_demand,
+                                 double roller_demand) {
+    Command d{};
+    d.config_id = config_id;
+    d.boot_id = boot;
+    d.epoch = epoch;
+    d.observed_time_us = observed;
+    d.count = 1;
+    d.motors[0] = {drive, Mode::kVelocity, 0, drive_demand, 0.0};
+    PublishCommand(drive_pub, d);
+    Command r{};
+    r.config_id = config_id;
+    r.boot_id = boot;
+    r.epoch = epoch;
+    r.observed_time_us = observed;
+    r.count = 1;
+    r.motors[0] = {roller, Mode::kVelocity, 0, roller_demand, 0.0};
+    PublishCommand(intake_pub, r);
+  };
+
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 1000), 1000000));
+  publish_valid(11, 1, 1000, 15.0, 30.0);
+  node.Tick(1001000);
+  EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 15.0);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
+  // Single tick, single send. Later phases capture the counter instead: the
+  // inject loop above may itself tick-and-send while polling for the frame.
+  const uint64_t sent_after_first_merge = node.commands_sent();
+  EXPECT_EQ(sent_after_first_merge, 1u);
+
+  // Reboot: new boot id. Without fresh requests nothing merges and nothing is
+  // sent; the cached demands are neutralized.
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 12, 1, 2000), 1002000));
+  const uint64_t sent_after_reboot = node.commands_sent();
+  node.Tick(1003000);
+  EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(node.current_command().motors[1].mode, Mode::kNeutral);
+  EXPECT_EQ(node.commands_sent(), sent_after_reboot);
+
+  // Fresh requests stamped with the new identity resume motion.
+  publish_valid(12, 1, 2000, 16.0, 31.0);
+  node.Tick(1004000);
+  EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 16.0);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 31.0);
+  const uint64_t sent_after_resume = node.commands_sent();
+  EXPECT_EQ(sent_after_resume, sent_after_reboot + 1);
+
+  // Disable/re-enable surfaces as an epoch bump: same treatment.
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 12, 2, 3000), 1005000));
+  const uint64_t sent_after_epoch = node.commands_sent();
+  node.Tick(1006000);
+  EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(node.commands_sent(), sent_after_epoch);
+
+  publish_valid(12, 2, 3000, 17.0, 32.0);
+  node.Tick(1007000);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 17.0);
+  const uint64_t sent_after_second_resume = node.commands_sent();
+  EXPECT_EQ(sent_after_second_resume, sent_after_epoch + 1);
+
+  // A bare enabled->disabled edge invalidates even when the epoch has not
+  // moved yet.
+  State disabled = TrustState(config_id, 12, 2, 4000);
+  disabled.flags = kConfigured;
+  ASSERT_TRUE(InjectState(node, gateway, disabled, 1008000));
+  const uint64_t sent_after_disable = node.commands_sent();
+  node.Tick(1009000);
+  EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(node.commands_sent(), sent_after_disable);
+
+  // Fault recovery (fault bit clears, epoch advances) needs fresh requests too.
+  State recovered = TrustState(config_id, 12, 3, 5000);
+  ASSERT_TRUE(InjectState(node, gateway, recovered, 1010000));
+  const uint64_t sent_after_recovery = node.commands_sent();
+  node.Tick(1011000);
+  EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_EQ(node.commands_sent(), sent_after_recovery);
+
+  publish_valid(12, 3, 5000, 18.0, 33.0);
+  node.Tick(1012000);
+  EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 18.0);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 33.0);
+  EXPECT_EQ(node.commands_sent(), sent_after_recovery + 1);
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_EQ(node.ownership_rejected(), 0u);
 }
 
 // Describe() must answer without a socket, a shared-memory segment or a

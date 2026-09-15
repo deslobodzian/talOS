@@ -1,11 +1,15 @@
-#include "2026-robot/main_processor/shooter/node.h"
+#include "talos_nodes/shooter/node.h"
 
 #include <gtest/gtest.h>
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <stdexcept>
 #include <string>
 
+#include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/hardware/sim_backend.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/log/log_reader.h"
@@ -17,8 +21,20 @@ namespace talos::shooter {
 namespace {
 using namespace std::chrono_literals;
 
+std::string TestConfigPath() {
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(
+          BAZEL_CURRENT_REPOSITORY, &error));
+  const char* location = std::getenv("TALOS_TEST_CONFIG");
+  if (!runfiles || !location) {
+    throw std::runtime_error("test config runfiles unavailable: " + error);
+  }
+  return runfiles->Rlocation(location);
+}
+
 config::RobotConfig TestRobotConfig() {
-  auto cfg = config::ParseRobotConfig("2026-robot/main_processor/configuration/robot.toml");
+  auto cfg = config::ParseRobotConfig(TestConfigPath());
   cfg.hardware.commissioned = true;
   return cfg;
 }

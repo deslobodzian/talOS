@@ -20,3 +20,15 @@ cc_library(
         "//talOS/introspection:reporter",
     ],
 )
+
+# Shared main for hardware-owning subsystem nodes: the config parse, the
+# device lookup, and the period-offset starter that every such main repeats.
+cc_library(
+    name = "hardware_main",
+    hdrs = ["hardware_main.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":node_main",
+        "//talOS/configuration:configuration",
+    ],
+)

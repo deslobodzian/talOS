@@ -1,11 +1,9 @@
 # talOS subsystem architecture — implementation plan
 
-**Status: not started.** This describes the target design and the order to build
-it in. It is written for an implementing agent who has not seen this repository
-before. Read `talOS/events/README.md`, `talOS/hardware/README.md` and
-`2026-robot/main_processor/drivetrain/README.md` first; they describe what exists today.
-Every topic name below is governed by `talOS/NAMING.md`; consult it rather than
-inferring the rules from the examples here.
+**Status: Steps 0–8 complete.** The subsystem architecture, device taxonomy,
+split TOML parser, hardware gateway, and launcher are built and verified. For the
+active multi-repository migration, external SDK packaging, and language parity
+work (extending §10), see [NODE_REPOSITORIES_PLAN.md](file:///Users/deslobodzian/Documents/Projects/talOS/NODE_REPOSITORIES_PLAN.md).
 
 Every step below has an acceptance test. Do not mark a step done without it.
 
@@ -471,6 +469,16 @@ exists to protect.
 ---
 
 ## 10. End goal: subsystem packages, then more languages
+ 
+> [!NOTE]
+> The roadmap below is superseded and detailed by [NODE_REPOSITORIES_PLAN.md](NODE_REPOSITORIES_PLAN.md).
+> Phases 0 through 7 of that plan are complete under the hybrid policy
+> recorded there (2026-09-11): only the stable platform nodes stay standalone
+> (`talos-driver_station`, `talos-operator_interface`, `talos-odometry`,
+> `talos-telemetry`, plus `studio-schema`); the year-specific mechanisms
+> (drivetrain, intake, shooter, arbiter) live in
+> `2026-robot/main_processor/` and the robot assembles both together
+> (`test/fixtures/robot_assembly` pins the platform modules).
 
 The package layout in §9 is deliberately ROS-shaped: a directory with a
 standard layout, a manifest entry, and topic/message contracts — carrying its
@@ -488,11 +496,15 @@ Staging, in order — each step is usable alone:
    output. The package carries its config from here on.
 2. **Standard package + codegen.** `tools/subsystem_codegen` emits the §9
    layout. A package that does not match the layout is not a package.
+   (Superseded: `tools/node_scaffold` replaces `subsystem_codegen` for new
+   standalone nodes — see Phase 6 in NODE_REPOSITORIES_PLAN.md.)
 3. **Separate repos.** A subsystem in another repo registers as
    `node = "@repo//:node"` with its `subsystem.toml` in the manifest. No
    launcher change; prove it by moving one real subsystem out and back.
    **Accept:** `bazel build //...` and the full test suite green with the
    subsystem external, golden config output byte-identical.
+   (Superseded by the hybrid policy: only stable platform nodes stay
+   standalone; year mechanisms live in `2026-robot/main_processor/`.)
 4. **Python observation.** Already exists: `studio/agent`'s JSON-RPC serves the
    system graph and telemetry to any language today. Document it as the
    supported Python surface, with examples.
@@ -506,6 +518,8 @@ Staging, in order — each step is usable alone:
    claim, no byte-identical replay — tested on I/O at the topic boundary
    (ARCHITECTURE.md says so normatively). Revisit only if a Python subsystem
    proves itself indispensable in steps 4–5.
+   (Superseded: Phase 4 delivered native Python dispatch with byte-exact
+   replay — see the Phase 4 record in NODE_REPOSITORIES_PLAN.md.)
 
 What never crosses the language boundary: the RIO program, the hardware
 gateway transaction, and the dispatch log format. A Python node talks topics;

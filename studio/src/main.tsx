@@ -43,21 +43,38 @@ const initialSystem: SystemState =
 
 // --- field, spatial, plot, tree ---------------------------------------------
 
-function Field({view}: {view: View}) {
+// The telemetry core publishes mechanism-only frames with a zeroed chassis
+// and `pose/valid` 0: chassis is a required struct, so zeros plus this flag
+// are the only encodable "no pose". The field view must gate drawing on it,
+// or a live mechanism with no localization yet renders a fictitious robot at
+// the origin. Frames without the flag (demo data, old logs) predate it and
+// always carried a real pose, so a missing flag means valid.
+export function poseValid(s: Snapshot|null|undefined): boolean {
+  if (!s) return false;
+  const v: number|undefined = s.channels['pose/valid'];
+  if (v === undefined) return true;
+  return v === 1;
+}
+
+export function Field({view}: {view: View}) {
   const s = view.snapshot;
-  const prior = s ? view.history
-                        .filter(
-                            h => BigInt(h.timestamp_ns) <
-                                BigInt(s.timestamp_ns))
-                        .at(-1) :
-                    null;
-  const velocity = prior && s ? {
+  const poseOk = poseValid(s);
+  // Only valid poses draw a trail: joining mechanism-only zeros into the
+  // polyline would drag a line from the origin no measurement ever reported.
+  const trail = view.history.filter(
+      h => poseValid(h) &&
+          (!s || BigInt(h.timestamp_ns) <= BigInt(s.timestamp_ns)));
+  const prior = s && poseOk ?
+      trail.filter(h => BigInt(h.timestamp_ns) < BigInt(s.timestamp_ns))
+          .at(-1) :
+      null;
+  const velocity = prior && s && poseOk ? {
     x: (s.chassis.x - prior.chassis.x) /
         (Number(BigInt(s.timestamp_ns) - BigInt(prior.timestamp_ns)) / 1e9),
     y: (s.chassis.y - prior.chassis.y) /
         (Number(BigInt(s.timestamp_ns) - BigInt(prior.timestamp_ns)) / 1e9)
   } :
-                                null;
+                                         null;
   const point = (p: Pose) => `${p.x * 50},${410 - p.y * 50}`;
   const robot = (p: Pose, color: string, name: string) => (
       <g key={name}
@@ -76,6 +93,10 @@ function Field({view}: {view: View}) {
                                 {g.name}
                               </span>)}
     </div>
+    {s && !poseOk &&
+     <div className="empty" role="status">
+       Awaiting pose — mechanism data only. The field view waits for a valid pose.
+     </div>}
     <svg className="field" viewBox="-25 -25 875 475"
          aria-label="FRC field, blue alliance origin, X away from blue wall and Y left">
       <defs>
@@ -90,12 +111,7 @@ function Field({view}: {view: View}) {
       <path d="M 825 0 H 740 V 410 H 825" fill="#f66a6618" stroke="#f66a66"/>
       <path d="M 412.5 0 V 410" stroke="#7c8998" strokeDasharray="5 9"/>
       <polyline
-          points={view.history
-                      .filter(
-                          h => !s ||
-                              BigInt(h.timestamp_ns) <= BigInt(s.timestamp_ns))
-                      .map(h => point(h.chassis))
-                      .join(' ')}
+          points={trail.map(h => point(h.chassis)).join(' ')}
           fill="none" stroke={palette[0]} strokeOpacity=".55" strokeWidth="2"/>
       {s?.targets.map(t => <g key={t.id}>
          <line x1={s.chassis.x * 50} y1={410 - s.chassis.y * 50}
@@ -107,8 +123,8 @@ function Field({view}: {view: View}) {
                fontSize="10">{t.id}</text>
        </g>)}
       {s?.ghosts.map((g, i) => robot(g.pose, palette[(i + 1) % 4], g.name))}
-      {s && robot(s.chassis, palette[0], 'chassis')}
-      {s && velocity &&
+      {poseOk && s && robot(s.chassis, palette[0], 'chassis')}
+      {poseOk && s && velocity &&
        <line x1={s.chassis.x * 50} y1={410 - s.chassis.y * 50}
              x2={(s.chassis.x + velocity.x) * 50}
              y2={410 - (s.chassis.y + velocity.y) * 50} stroke="#ffbd69"
@@ -120,9 +136,10 @@ function Field({view}: {view: View}) {
     <div className="panel-footer">
       BLUE ORIGIN · WPILIB NWU
       <span>{
-          s ? `X ${s.chassis.x.toFixed(3)} m   Y ${s.chassis.y.toFixed(3)} m   θ ${
+          poseOk && s ? `X ${s.chassis.x.toFixed(3)} m   Y ${s.chassis.y.toFixed(3)} m   θ ${
                   (s.chassis.yaw * 180 / Math.PI).toFixed(1)}°` :
-              'Awaiting telemetry'}</span>
+              s ? 'Awaiting pose' :
+                  'Awaiting telemetry'}</span>
     </div>
   </>;
 }

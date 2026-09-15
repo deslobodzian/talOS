@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "config_wire.h"
+#include "homing.h"
 
 namespace talos::hardware {
 Gateway::Gateway(Config config, Backend& backend, uint64_t boot_id)
@@ -37,6 +38,7 @@ Gateway::Gateway(Config config, Backend& backend, uint64_t boot_id)
     state_.pwm_outputs[i].id = config_.pwm_outputs[i].id;
   configured_ = backend_.Configure(config_);
   fault_ = !configured_;
+  if (!configured_) config_error_ = backend_.last_config_error();
   backend_.Neutral();
 }
 Gateway::Gateway(Backend& backend, uint64_t boot_id)
@@ -50,6 +52,15 @@ Gateway::Gateway(Backend& backend, uint64_t boot_id)
   backend_.Neutral();
 }
 bool Gateway::Reconfigure(const Config& config) {
+  // Safety interlock: hardware configuration requires disabled operation.
+  // Phoenix configurator Apply calls are synchronous CAN transactions that can
+  // block long enough to stall Driver Station servicing, and changing devices
+  // under load risks unpredictable output changes. Refuse without touching
+  // devices or latched fault/configured state.
+  if (enabled_) return false;
+  // Idempotent fast path: a repeated push of the active configuration is a
+  // no-op — no (potentially blocking) device traffic, no epoch change.
+  if (configured_ && config == config_) return true;
   try {
     Validate(config);
   } catch (...) {
@@ -61,9 +72,13 @@ bool Gateway::Reconfigure(const Config& config) {
     fault_ = true;
     return false;
   }
+  // Neutralize outputs BEFORE changing devices so no stale setpoint survives
+  // across the device change. Neutral is a nonblocking one-shot.
+  backend_.Neutral();
   if (!backend_.Configure(config)) {
     configured_ = false;
     fault_ = true;
+    config_error_ = backend_.last_config_error();
     backend_.Neutral();
     return false;
   }
@@ -92,6 +107,7 @@ bool Gateway::Reconfigure(const Config& config) {
     state_.pwm_outputs[i].id = config_.pwm_outputs[i].id;
   configured_ = true;
   fault_ = false;
+  config_error_.reset();
   Invalidate();
   return true;
 }
@@ -101,6 +117,21 @@ void Gateway::Invalidate() {
   ++state_.epoch;
   backend_.Neutral();
 }
+void Gateway::PollResets() {
+  // Item 36: an individual device reset re-applies configuration and
+  // invalidates outstanding commands via Invalidate() (epoch bump plus
+  // Neutral), so the restored device never resumes an obsolete demand.
+  if (!configured_) return;
+  std::vector<uint16_t> reset_ids;
+  if (!backend_.PollDeviceResets(reset_ids) || reset_ids.empty()) return;
+  reset_count_ += reset_ids.size();
+  if (!backend_.RestoreAfterReset()) {
+    fault_ = true;
+    config_error_ = backend_.last_config_error();
+  }
+  Invalidate();
+}
+
 void Gateway::Tick(uint64_t now, bool enabled) {
   if (enabled != enabled_) {
     enabled_ = enabled;
@@ -113,8 +144,44 @@ void Gateway::Tick(uint64_t now, bool enabled) {
   state_.sample_time_us = now;
   healthy_ = configured_ && backend_.Read(state_);
   if (!healthy_ && active_) Invalidate();
+  PollResets();
   if (!enabled_ || !config_.commissioned || fault_ || !healthy_ || !configured_)
     backend_.Neutral();
+}
+
+bool Gateway::Zero(uint16_t motor_id, double home_position_rot,
+                   uint64_t observed_time_us, uint64_t now_us,
+                   std::string* reason) {
+  const auto reject = [&](ZeroRejectReason r) {
+    if (reason != nullptr) *reason = ZeroRejectName(r);
+    return false;
+  };
+  if (!configured_) return reject(ZeroRejectReason::kNotConfigured);
+  if (active_) return reject(ZeroRejectReason::kCommandActive);
+  const ZeroRejectReason valid =
+      ValidateZeroRequest(config_, motor_id, home_position_rot);
+  if (valid != ZeroRejectReason::kOk) return reject(valid);
+  if (observed_time_us > state_.sample_time_us || observed_time_us > now_us ||
+      now_us - observed_time_us >= config_.command_timeout_us)
+    return reject(ZeroRejectReason::kStaleObservation);
+  if (!backend_.ZeroPosition(motor_id, home_position_rot)) {
+    fault_ = true;
+    return reject(ZeroRejectReason::kBackendFailed);
+  }
+  // The offset changes what every future demand means: outstanding commands
+  // are invalidated so nothing resumes against the old frame.
+  Invalidate();
+  if (reason != nullptr) *reason = ZeroRejectName(ZeroRejectReason::kOk);
+  return true;
+}
+
+HealthSnapshot Gateway::health() {
+  HealthSnapshot snapshot = backend_.GetHealth();
+  snapshot.reset_count = reset_count_;
+  snapshot.fault_latched = fault_;
+  snapshot.configured = configured_ && config_.commissioned;
+  snapshot.enabled = configured_ && enabled_;
+  return snapshot;
 }
 bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   if (!configured_ || !config_.commissioned || !enabled_ || fault_ ||
