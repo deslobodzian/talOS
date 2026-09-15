@@ -62,15 +62,21 @@ inline hardware::Command SwerveCommand(const hardware::Config& config,
                                        double vy, double omega) {
   hardware::Command out{};
   if (config.motors.size() > hardware::kMaxMotors ||
-      state.motor_count > hardware::kMaxMotors)
+      state.motor_count > hardware::kMaxMotors ||
+      2 * geometry.modules.size() > hardware::kMaxMotors)
     return out;
   out.config_id = state.config_id;
   out.boot_id = state.boot_id;
   out.epoch = state.epoch;
   out.observed_time_us = state.sample_time_us;
-  out.count = static_cast<uint16_t>(config.motors.size());
-  for (std::size_t i = 0; i < config.motors.size(); ++i)
-    out.motors[i].id = config.motors[i].id;
+  // Partial command: the module motors only, drive then steer per module. The
+  // bridge rejects any motor the subsystem does not own, so a whole-robot id
+  // list (config.motors covers every subsystem) would never merge.
+  out.count = static_cast<uint16_t>(2 * geometry.modules.size());
+  for (std::size_t i = 0; i < geometry.modules.size(); ++i) {
+    out.motors[2 * i].id = geometry.modules[i].drive_id;
+    out.motors[2 * i + 1].id = geometry.modules[i].steer_id;
+  }
   if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(omega))
     return out;
   constexpr double tau = 2 * std::numbers::pi;
@@ -105,17 +111,12 @@ inline hardware::Command SwerveCommand(const hardware::Config& config,
       speeds[i] = -speeds[i];
     }
     if (std::abs(speeds[i]) < 1e-6) delta = 0;
-    for (std::size_t j = 0; j < config.motors.size(); ++j) {
-      auto& r = out.motors[j];
-      if (r.id == module.drive_id) {
-        r.mode = hardware::Mode::kVelocity;
-        r.demand = speeds[i] * scale;
-      }
-      if (r.id == module.steer_id) {
-        r.mode = hardware::Mode::kPosition;
-        r.demand = current + delta;
-      }
-    }
+    auto& drive = out.motors[2 * i];
+    drive.mode = hardware::Mode::kVelocity;
+    drive.demand = speeds[i] * scale;
+    auto& steer = out.motors[2 * i + 1];
+    steer.mode = hardware::Mode::kPosition;
+    steer.demand = current + delta;
   }
   return out;
 }

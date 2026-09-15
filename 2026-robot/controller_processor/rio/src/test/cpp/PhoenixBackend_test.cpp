@@ -16,6 +16,7 @@
 #include <hal/HAL.h>
 
 #include "PhoenixBackend.h"
+#include "hardware/fault_scope.h"
 #include "hardware/gateway.h"
 
 namespace hw = talos::hardware;
@@ -174,6 +175,10 @@ TEST(PhoenixBackendEncoders, DutyCycleReportsOffsetCorrectedPosition) {
 
 TEST(PhoenixBackendEncoders, DutyCycleDisconnectInvalidatesSample) {
   EnsureHal();
+  // fault_scope.h is authoritative: a bad RIO encoder is Mechanism scope, so
+  // the backend must stay healthy and only that sample goes invalid.
+  EXPECT_EQ(hw::ClassifyFailure(hw::FailureKind::kEncoderInvalid),
+            hw::FaultScope::kMechanism);
   hw::Config c;
   c.motors.push_back(TestMotor(1, "m1", 1));
   c.encoders.push_back(DutyEncoder(11, "duty", 2, 0.0));
@@ -182,13 +187,62 @@ TEST(PhoenixBackendEncoders, DutyCycleDisconnectInvalidatesSample) {
   ASSERT_TRUE(backend.Configure(c));
 
   frc::sim::DutyCycleEncoderSim sim(2);
-  sim.SetConnected(false);
+  sim.SetConnected(true);
+  sim.Set(0.5);
 
   hw::State s;
-  EXPECT_FALSE(backend.Read(s));
+  ASSERT_TRUE(backend.Read(s));
+  ASSERT_TRUE(s.encoders[0].valid);
+
+  // Disconnect: the owning mechanism observes an invalid, zeroed sample ...
+  sim.SetConnected(false);
+
+  EXPECT_TRUE(backend.Read(s));
   EXPECT_FALSE(s.encoders[0].valid);
   EXPECT_DOUBLE_EQ(s.encoders[0].position_rot, 0.0);
   EXPECT_DOUBLE_EQ(s.encoders[0].velocity_rps, 0.0);
+  // ... while the rest of the robot keeps driving.
+  EXPECT_TRUE(s.motors[0].valid);
+}
+
+TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndZeroesPwm) {
+  EnsureHal();
+  hw::Config c;
+  c.motors.push_back(TestMotor(1, "m1", 1));
+  hw::DigitalOutputConfig d;
+  d.id = 20;
+  d.name = "solenoid";
+  d.dio = 5;
+  c.digital_outputs.push_back(d);
+  hw::PwmConfig p;
+  p.id = 30;
+  p.name = "servo";
+  p.channel = 0;
+  c.pwm_outputs.push_back(p);
+
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(c));
+
+  const std::array<hw::DigitalOutputRequest, 1> dos{
+      hw::DigitalOutputRequest{20, true}};
+  const std::array<hw::PwmRequest, 1> pwms{hw::PwmRequest{30, 0.75}};
+  ASSERT_TRUE(backend.ApplyOutputs(dos, pwms));
+
+  // Read back through the real HAL adapter path: outputs are driven.
+  hw::State s;
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_TRUE(s.digital_outputs[0].valid);
+  EXPECT_TRUE(s.digital_outputs[0].value);
+  EXPECT_TRUE(s.pwm_outputs[0].valid);
+  EXPECT_GT(s.pwm_outputs[0].output, 0.5);
+
+  backend.Neutral();
+
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_TRUE(s.digital_outputs[0].valid);
+  EXPECT_FALSE(s.digital_outputs[0].value);
+  EXPECT_TRUE(s.pwm_outputs[0].valid);
+  EXPECT_DOUBLE_EQ(s.pwm_outputs[0].output, 0.0);
 }
 
 TEST(PhoenixBackendSim, ZeroVoltageVelocityRequestDoesNotSupplyDemand) {

@@ -436,6 +436,7 @@ TEST(HardwareNodeTest, ObsoleteRequestsNeverLookCurrent) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
   const uint16_t roller = cfg.hardware.motors[1].id;
   const uint64_t config_id = NodeConfigId(cfg);
+  const uint64_t timeout_us = cfg.hardware.command_timeout_us;
 
   HardwareNode node{cfg, "127.0.0.1", 25816, 25817, true};
   ASSERT_TRUE(node.Open());
@@ -460,16 +461,260 @@ TEST(HardwareNodeTest, ObsoleteRequestsNeverLookCurrent) {
   EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
   EXPECT_EQ(node.current_command().observed_time_us, 5000u);
 
-  // A newer sample arrives (same boot and epoch: not a transition, so the
-  // cached merge survives). Replaying the request built from the older sample
-  // is rejected, and the merge keeps the older observation instead of being
-  // re-stamped with the new one: stale stays visibly stale.
+  // A much newer sample arrives (same boot and epoch: not a transition, so
+  // the cached merge survives). Replaying the request built from the older
+  // sample is now beyond the age bound (last_sample - observed >=
+  // command_timeout), so it is rejected, and the merge keeps the older
+  // observation instead of being re-stamped: stale stays visibly stale.
+  const uint64_t stale_sample = 5000 + timeout_us + 1000;
+  ASSERT_TRUE(InjectState(node, gateway,
+                          TrustState(config_id, 11, 1, stale_sample), 1002000));
+  PublishCommand(intake_pub, fresh);
+  node.Tick(1002500);
+
+  EXPECT_EQ(node.identity_rejected(), 1u);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
+  EXPECT_EQ(node.current_command().observed_time_us, 5000u);
+}
+
+TEST(HardwareNodeTest, AcceptsRequestsWithinFreshnessBound) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint64_t config_id = NodeConfigId(cfg);
+
+  HardwareNode node{cfg, "127.0.0.1", 25820, 25821, true};
+  ASSERT_TRUE(node.Open());
+  node.Tick(999000);
+
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(gateway.Open("127.0.0.1", 25820, "127.0.0.1", 25821),
+            protocol::UdpStatus::kOk);
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 5000), 1000000));
+
+  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
+  Command fresh{};
+  fresh.config_id = config_id;
+  fresh.boot_id = 11;
+  fresh.epoch = 1;
+  fresh.observed_time_us = 5000;
+  fresh.count = 1;
+  fresh.motors[0] = {roller, Mode::kVelocity, 0, 30.0, 0.0};
+  PublishCommand(intake_pub, fresh);
+  node.Tick(1001000);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
+  EXPECT_EQ(node.current_command().observed_time_us, 5000u);
+
+  // A newer sample arrives (same boot and epoch: not a transition). A request
+  // computed from sample N is still acceptable after N+1 arrives while its
+  // gateway-clock age (last_sample - observed) stays below the command
+  // timeout. The merge keeps the older observation rather than re-stamping.
   ASSERT_TRUE(
       InjectState(node, gateway, TrustState(config_id, 11, 1, 6000), 1002000));
   PublishCommand(intake_pub, fresh);
   node.Tick(1002500);
 
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
+  EXPECT_EQ(node.current_command().observed_time_us, 5000u);
+
+  // A request built from the newest sample advances the merge.
+  Command newer = fresh;
+  newer.observed_time_us = 6000;
+  newer.motors[0].demand = 31.0;
+  PublishCommand(intake_pub, newer);
+  node.Tick(1003000);
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 31.0);
+  EXPECT_EQ(node.current_command().observed_time_us, 6000u);
+}
+
+TEST(HardwareNodeTest, RejectsReplayOlderThanLastAccepted) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint64_t config_id = NodeConfigId(cfg);
+
+  HardwareNode node{cfg, "127.0.0.1", 25822, 25823, true};
+  ASSERT_TRUE(node.Open());
+  node.Tick(999000);
+
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(gateway.Open("127.0.0.1", 25822, "127.0.0.1", 25823),
+            protocol::UdpStatus::kOk);
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 5000), 1000000));
+
+  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
+  Command first{};
+  first.config_id = config_id;
+  first.boot_id = 11;
+  first.epoch = 1;
+  first.observed_time_us = 5000;
+  first.count = 1;
+  first.motors[0] = {roller, Mode::kVelocity, 0, 30.0, 0.0};
+  PublishCommand(intake_pub, first);
+  node.Tick(1001000);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
+
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 6000), 1002000));
+  Command second = first;
+  second.observed_time_us = 6000;
+  second.motors[0].demand = 31.0;
+  PublishCommand(intake_pub, second);
+  node.Tick(1002500);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 31.0);
+  EXPECT_EQ(node.current_command().observed_time_us, 6000u);
+
+  // Replaying the older demand is within the age bound (6000 - 5000) but
+  // older than this subsystem's last accepted observation, so it is
+  // rejected and the merge is untouched.
+  PublishCommand(intake_pub, first);
+  node.Tick(1003000);
+
   EXPECT_EQ(node.identity_rejected(), 1u);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 31.0);
+  EXPECT_EQ(node.current_command().observed_time_us, 6000u);
+}
+
+TEST(HardwareNodeTest, FreshSubsystemCannotRefreshStaleSubsystem) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  const uint16_t drive = cfg.hardware.motors[0].id;
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint64_t config_id = NodeConfigId(cfg);
+
+  HardwareNode node{cfg, "127.0.0.1", 25824, 25825, true};
+  ASSERT_TRUE(node.Open());
+  node.Tick(999000);
+
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(gateway.Open("127.0.0.1", 25824, "127.0.0.1", 25825),
+            protocol::UdpStatus::kOk);
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 5000), 1000000));
+
+  ipc::Publisher<talos::hardware::Packet> drive_pub{RequestTopic("drivetrain")};
+  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
+
+  Command d{};
+  d.config_id = config_id;
+  d.boot_id = 11;
+  d.epoch = 1;
+  d.observed_time_us = 5000;
+  d.count = 1;
+  d.motors[0] = {drive, Mode::kVelocity, 0, 15.0, 0.0};
+  Command r{};
+  r.config_id = config_id;
+  r.boot_id = 11;
+  r.epoch = 1;
+  r.observed_time_us = 5000;
+  r.count = 1;
+  r.motors[0] = {roller, Mode::kVelocity, 0, 30.0, 0.0};
+  PublishCommand(drive_pub, d);
+  PublishCommand(intake_pub, r);
+  node.Tick(1001000);
+  EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(node.current_command().observed_time_us, 5000u);
+
+  // A newer sample arrives. Only drivetrain publishes from it; intake stays
+  // quiet but within its bridge liveness timeout, so its cached demand still
+  // drives the merge. The merged observation must stay at intake's 5000:
+  // drivetrain's freshness must not refresh intake's stale demand.
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 6000), 1002000));
+  Command d_new = d;
+  d_new.observed_time_us = 6000;
+  d_new.motors[0].demand = 16.0;
+  PublishCommand(drive_pub, d_new);
+  node.Tick(1002500);
+
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 16.0);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
+  EXPECT_EQ(node.current_command().observed_time_us, 5000u);
+
+  // Intake catches up from the newer sample; now both agree and the merge
+  // advances.
+  Command r_new = r;
+  r_new.observed_time_us = 6000;
+  r_new.motors[0].demand = 31.0;
+  PublishCommand(intake_pub, r_new);
+  node.Tick(1003000);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 31.0);
+  EXPECT_EQ(node.current_command().observed_time_us, 6000u);
+
+  // Monotonicity is per subsystem: drivetrain replaying its own older demand
+  // is rejected without disturbing intake's merged demand.
+  Command d_replay = d;
+  d_replay.motors[0].demand = 99.0;
+  PublishCommand(drive_pub, d_replay);
+  node.Tick(1003500);
+  EXPECT_EQ(node.identity_rejected(), 1u);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 16.0);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 31.0);
+  EXPECT_EQ(node.current_command().observed_time_us, 6000u);
+}
+
+TEST(HardwareNodeTest, RejectsWrongIdentityWordsEvenWithinBound) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint64_t config_id = NodeConfigId(cfg);
+
+  HardwareNode node{cfg, "127.0.0.1", 25826, 25827, true};
+  ASSERT_TRUE(node.Open());
+  node.Tick(999000);
+
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(gateway.Open("127.0.0.1", 25826, "127.0.0.1", 25827),
+            protocol::UdpStatus::kOk);
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 5000), 1000000));
+
+  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
+
+  // Age zero (observed == last_sample): freshness passes, so each rejection
+  // below proves the config/boot/epoch words are still exact-match, and a
+  // future observation is still rejected.
+  Command base{};
+  base.config_id = config_id;
+  base.boot_id = 11;
+  base.epoch = 1;
+  base.observed_time_us = 5000;
+  base.count = 1;
+  base.motors[0] = {roller, Mode::kVelocity, 0, 30.0, 0.0};
+
+  Command bad_config = base;
+  bad_config.config_id = config_id + 1;
+  PublishCommand(intake_pub, bad_config);
+  node.Tick(1001000);
+
+  Command bad_boot = base;
+  bad_boot.boot_id = 12;
+  PublishCommand(intake_pub, bad_boot);
+  node.Tick(1002000);
+
+  Command bad_epoch = base;
+  bad_epoch.epoch = 2;
+  PublishCommand(intake_pub, bad_epoch);
+  node.Tick(1003000);
+
+  Command bad_future = base;
+  bad_future.observed_time_us = 6000;
+  PublishCommand(intake_pub, bad_future);
+  node.Tick(1004000);
+
+  EXPECT_EQ(node.identity_rejected(), 4u);
+  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(node.current_command().motors[1].mode, Mode::kNeutral);
+
+  PublishCommand(intake_pub, base);
+  node.Tick(1005000);
+  EXPECT_EQ(node.identity_rejected(), 4u);
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
   EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
   EXPECT_EQ(node.current_command().observed_time_us, 5000u);
 }

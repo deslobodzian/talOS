@@ -34,6 +34,11 @@ struct SubsystemTracker {
   uint32_t period_us{5000};
   uint64_t last_seen_us{0};
   bool timed_out{true};
+  // Last accepted Command::observed_time_us for this subsystem (gateway
+  // clock). Monotonic per subsystem: a request older than this is a replay
+  // and is rejected even when it is still within the age bound. Reset to 0
+  // on every controller transition alongside last_seen_us.
+  uint64_t last_observed_time_us{0};
   std::unique_ptr<ipc::Subscriber<talos::hardware::Packet>> subscriber;
 
   // Requests actually decoded off this subsystem's topic, and where that topic
@@ -106,11 +111,15 @@ class HardwareNode {
   // being read.
   static const std::vector<introspect::EndpointAttribute>& EndpointAttributes();
 
-  // Whether a subsystem request was built from the controller state this node
-  // last observed: same configuration, same boot, same epoch, same sample. An
-  // obsolete request must never merge, because the send path forwards headers
-  // untouched and the gateway would otherwise accept it as fresh.
-  bool HasRequestIdentity(const Command& partial) const;
+  // Whether a subsystem request may merge: same configuration, boot, and
+  // epoch as last observed (exact match), plus a bounded-age freshness check
+  // on the gateway clock: last_sample_time_us_ - observed_time_us must be
+  // below command_timeout_us (future observations rejected). Monotonic per
+  // subsystem: observed_time_us below the tracker's last accepted value is a
+  // replay and is rejected. The gateway re-enforces the age bound, so it
+  // remains the safety backstop.
+  bool HasRequestIdentity(const SubsystemTracker& tracker,
+                          const Command& partial) const;
   // Whether every actuator a request addresses belongs to the subsystem that
   // published it. One stray id rejects the whole request: a partial merge
   // would let a buggy subsystem drive hardware it does not own.

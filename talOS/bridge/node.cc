@@ -312,7 +312,7 @@ void HardwareNode::Tick(uint64_t now_us) {
         // and a current one must still own every device it addresses. Either
         // rejection drops the whole request without proving liveness, so a
         // stream of bad requests still times the subsystem out.
-        if (!HasRequestIdentity(partial)) {
+        if (!HasRequestIdentity(tracker, partial)) {
           ++identity_rejected_;
         } else if (!OwnsRequestDevices(tracker, partial)) {
           ++ownership_rejected_;
@@ -349,11 +349,14 @@ void HardwareNode::Tick(uint64_t now_us) {
           }
           // Adopt the request's identity words. The outgoing command carries
           // the observation its content was built from, never a fresher one.
+          // The merged observed header is the minimum over active subsystems
+          // (recomputed below), so one subsystem cannot refresh another's
+          // stale demand.
           full_cmd_.config_id = partial.config_id;
           full_cmd_.boot_id = partial.boot_id;
           full_cmd_.epoch = partial.epoch;
-          full_cmd_.observed_time_us = partial.observed_time_us;
           tracker.last_seen_us = now_us;
+          tracker.last_observed_time_us = partial.observed_time_us;
           tracker.timed_out = false;
         }
       }
@@ -393,6 +396,27 @@ void HardwareNode::Tick(uint64_t now_us) {
       }
     } else {
       any_subsystem_active = true;
+    }
+  }
+
+  // The merged observation is the oldest demand still driving the command:
+  // the minimum accepted observed_time_us over live subsystems. A fresh
+  // subsystem must not make a quiet one's cached demand look current, and a
+  // timed-out subsystem stops pinning the merge once neutralized.
+  {
+    bool have_active_observed = false;
+    uint64_t min_observed_us = 0;
+    for (const auto& [name, tracker] : subsystems_) {
+      if (!tracker.timed_out) {
+        if (!have_active_observed ||
+            tracker.last_observed_time_us < min_observed_us) {
+          min_observed_us = tracker.last_observed_time_us;
+          have_active_observed = true;
+        }
+      }
+    }
+    if (have_active_observed) {
+      full_cmd_.observed_time_us = min_observed_us;
     }
   }
 
@@ -492,14 +516,38 @@ int HardwareNode::Run(int duration_s) {
   std::printf("hardware_node: states=%llu commands=%llu\n",
               static_cast<unsigned long long>(states_received_),
               static_cast<unsigned long long>(commands_sent_));
+  std::printf("hardware_node: identity_rejected=%llu ownership_rejected=%llu\n",
+              static_cast<unsigned long long>(identity_rejected_),
+              static_cast<unsigned long long>(ownership_rejected_));
+  for (const auto& [name, tracker] : subsystems_) {
+    std::printf("hardware_node: sub=%s requests=%llu timed_out=%d\n",
+                name.c_str(), static_cast<unsigned long long>(tracker.requests),
+                tracker.timed_out ? 1 : 0);
+  }
   return states_received_ > 0 ? 0 : 1;
 }
 
-bool HardwareNode::HasRequestIdentity(const Command& partial) const {
-  return partial.config_id == config_id_ &&
-         partial.boot_id == last_boot_id_ &&
-         partial.epoch == last_epoch_ &&
-         partial.observed_time_us == last_sample_time_us_;
+bool HardwareNode::HasRequestIdentity(const SubsystemTracker& tracker,
+                                      const Command& partial) const {
+  if (partial.config_id != config_id_ || partial.boot_id != last_boot_id_ ||
+      partial.epoch != last_epoch_) {
+    return false;
+  }
+  // Gateway-clock age bound (see command_path_metrics.h clock rule): both
+  // stamps are gateway clock, never differenced against bridge now_us. A
+  // request computed from sample N stays acceptable while newer samples
+  // arrive, until its age reaches the command timeout. The gateway
+  // re-enforces the same bound against its own now, so it stays the safety
+  // backstop.
+  if (partial.observed_time_us > last_sample_time_us_) return false;
+  if (last_sample_time_us_ - partial.observed_time_us >=
+      config_.command_timeout_us) {
+    return false;
+  }
+  // Per-subsystem monotonic acceptance: old demands cannot replay, even
+  // within the age bound. Equal re-publishes from the same sample are fine.
+  if (partial.observed_time_us < tracker.last_observed_time_us) return false;
+  return true;
 }
 
 bool HardwareNode::OwnsRequestDevices(const SubsystemTracker& tracker,
@@ -540,6 +588,7 @@ void HardwareNode::InvalidateRequests() {
   NeutralizeAll();
   for (auto& [name, tracker] : subsystems_) {
     tracker.last_seen_us = 0;
+    tracker.last_observed_time_us = 0;
     tracker.timed_out = true;
   }
   // Force the next merged command onto the wire even if its demands happen

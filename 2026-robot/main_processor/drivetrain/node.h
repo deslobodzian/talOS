@@ -97,14 +97,11 @@ class DrivetrainNode {
       command = SwerveCommand(config_, geometry_, state_, target_.vx_mps(),
                               target_.vy_mps(), target_.omega_radps());
     else {
-      std::array<uint16_t, hardware::kMaxMotors> ids{};
-      std::size_t n = 0;
-      for (const auto& motor : config_.motors) {
-        if (n >= ids.size()) break;
-        ids[n++] = motor.id;
-      }
+      // Own motors only: the bridge rejects any motor this subsystem does not
+      // own, so a whole-robot id list would never merge.
       command = hardware::NeutralCommand(
-          state_, std::span<const uint16_t>{ids.data(), n});
+          state_, std::span<const uint16_t>{devices_.motors.data(),
+                                            devices_.motors.size()});
     }
     Packet packet{};
     packet.size = hardware::Encode(command, packet.data);
