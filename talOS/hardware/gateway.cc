@@ -118,18 +118,25 @@ void Gateway::Invalidate() {
   backend_.Neutral();
 }
 void Gateway::PollResets() {
-  // Item 36: an individual device reset re-applies configuration and
-  // invalidates outstanding commands via Invalidate() (epoch bump plus
-  // Neutral), so the restored device never resumes an obsolete demand.
+  // Item 36: an individual device reset re-applies configuration. Enter the
+  // safe state FIRST — Invalidate() (epoch bump, outstanding commands
+  // dropped, outputs neutralized) — BEFORE the synchronous restore traffic,
+  // mirroring Reconfigure. Unlike Reconfigure the restore cannot wait for
+  // disabled: the device has already reset to defaults, so leaving it
+  // unrestored while enabled is worse than the blocking restore. Recovery
+  // therefore proceeds even while enabled, but from the safe state with a
+  // bumped epoch, and a failed restore latches a fault and neutralizes
+  // again like a failed Reconfigure.
   if (!configured_) return;
   std::vector<uint16_t> reset_ids;
   if (!backend_.PollDeviceResets(reset_ids) || reset_ids.empty()) return;
   reset_count_ += reset_ids.size();
+  Invalidate();
   if (!backend_.RestoreAfterReset()) {
     fault_ = true;
     config_error_ = backend_.last_config_error();
+    backend_.Neutral();
   }
-  Invalidate();
 }
 
 void Gateway::Tick(uint64_t now, bool enabled) {

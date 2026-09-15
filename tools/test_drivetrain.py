@@ -80,14 +80,25 @@ class Scenario:
         return process
 
     def start_sim_gateway(self, seconds):
+        # --config is required: without it sim_gateway exits with a usage
+        # error before any simulation traffic exists.
         self.start("gateway", [str(self.sim_gateway),
+                               "--config", str(self.config),
                                "--duration-s", str(seconds)])
 
-    def start_wpilib_gateway(self, seconds, enabled=True, disable_after_ms=None):
+    def start_wpilib_gateway(self, seconds, enabled=True, disable_after_ms=None,
+                             enable_when_configured=False):
         environment = dict(os.environ)
         # The simulated robot has no Driver Station of its own, and it must stop
         # on its own rather than be killed, so that its summary line is written.
-        environment["TALOS_SIM_DS"] = "1" if enabled else "0"
+        if enable_when_configured:
+            # The gateway refuses hardware configuration while enabled, so an
+            # enabled-at-startup robot wedges: the bridge's config push is
+            # refused forever and no command is ever accepted. Start disabled
+            # and let the robot enable once the push lands instead.
+            environment["TALOS_SIM_DS"] = "auto"
+        else:
+            environment["TALOS_SIM_DS"] = "1" if enabled else "0"
         environment["TALOS_SIM_RUN_MS"] = str(seconds * 1000)
         if disable_after_ms is not None:
             environment["TALOS_SIM_DS_DISABLE_AFTER_MS"] = str(disable_after_ms)
@@ -107,6 +118,7 @@ class Scenario:
         # The robot prints this once its gateway socket is open, which is the
         # only moment it is safe to start the bridge.
         self.wait_for("hardware gateway config=", gateway)
+        return gateway
 
     def wait_for(self, needle, process):
         path = self.output / "gateway.txt"
@@ -120,11 +132,17 @@ class Scenario:
         raise RuntimeError(f"Gateway never started; see {self.output}")
 
     def drive(self, log_path, bridge_seconds, node_seconds):
+        self.start_bridge(bridge_seconds)
+        self.start_node(log_path, node_seconds)
+
+    def start_bridge(self, bridge_seconds):
         # --config is required: without it the bridge exits with a usage error
         # before any simulation traffic exists.
         self.start("bridge", [str(self.bridge),
                               "--config", str(self.config),
                               "--duration-s", str(bridge_seconds)])
+
+    def start_node(self, log_path, node_seconds):
         # The node requires --config like the bridge does.
         self.start("node", [str(self.binaries / "node"), "--sim",
                             "--config", str(self.config),
@@ -141,11 +159,15 @@ class Scenario:
 
     def summary(self):
         text = (self.output / "gateway.txt").read_text()
-        found = SUMMARY.search(text)
+        # The last match: sim_gateway prints a startup line ("backend=...") in
+        # the same "sim_gateway:" shape before its exit summary, so the first
+        # match is not the summary. A gateway that dies mid-run exits nonzero
+        # and is already rejected by wait() before this runs.
+        found = SUMMARY.findall(text)
         if not found:
             raise RuntimeError(f"The gateway printed no summary; see "
                                f"{self.output}")
-        return found[0].strip()
+        return found[-1].strip()
 
     def replay(self, log_path):
         return subprocess.run(
@@ -203,11 +225,22 @@ def run_driving_scenario(root, wpilib):
 
     with Scenario(root, output) as scenario:
         if wpilib:
-            scenario.start_wpilib_gateway(GATEWAY_SECONDS)
+            # Explicit bring-up order: the robot starts disabled, the bridge's
+            # config push lands while it is disabled, and only then does the
+            # robot enable. Driving starts after the enable print so the
+            # two-second drive window falls inside enabled time, and the robot
+            # disables itself near the end so the summary below also covers
+            # the Driver Station disable path.
+            gateway = scenario.start_wpilib_gateway(
+                GATEWAY_SECONDS, enable_when_configured=True,
+                disable_after_ms=(GATEWAY_SECONDS - 1) * 1000)
+            scenario.start_bridge(BRIDGE_SECONDS)
+            scenario.wait_for("simulated Driver Station: enabling", gateway)
+            scenario.start_node(log_path, NODE_SECONDS)
         else:
             scenario.start_sim_gateway(GATEWAY_SECONDS)
+            scenario.drive(log_path, BRIDGE_SECONDS, NODE_SECONDS)
 
-        scenario.drive(log_path, BRIDGE_SECONDS, NODE_SECONDS)
         scenario.wait()
 
         print(scenario.replay(log_path))

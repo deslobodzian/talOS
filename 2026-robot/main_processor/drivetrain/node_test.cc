@@ -9,6 +9,7 @@
 #include <stdexcept>
 
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include <algorithm>
 #include <filesystem>
 #include <limits>
 #include <string>
@@ -231,6 +232,38 @@ TEST(SwerveGeometry, FollowsDeviceRenumberingCausedByAnUnrelatedSubsystem) {
       EXPECT_EQ(module.drive_id, MotorIdNamed(config, name + "_drive"));
       EXPECT_EQ(module.steer_id, MotorIdNamed(config, name + "_steer"));
     }
+  }
+}
+
+TEST(Swerve, CommandAddressesOnlyItsOwnModuleMotors) {
+  // Whole-robot config with an unrelated subsystem spliced in: the command
+  // must still address exactly the drivetrain's module motors. The bridge's
+  // ownership gate rejects a request naming any motor the subsystem does not
+  // own, so a whole-robot id list merges nothing and the robot never moves.
+  const auto path = WriteConfigWithExtraSubsystem("arm");
+  const auto robot_cfg = config::ParseRobotConfig(path);
+  std::error_code rm_ec;
+  std::filesystem::remove_all(std::filesystem::path(path).parent_path(), rm_ec);
+  const auto geometry = BuildSwerveGeometry(robot_cfg);
+  hardware::SimBackend backend;
+  hardware::Gateway gateway{robot_cfg.hardware, backend, 42};
+  gateway.Tick(1000, true);
+  const auto state = gateway.snapshot();
+
+  const auto* devs = robot_cfg.GetDevices("drivetrain");
+  ASSERT_NE(devs, nullptr);
+  ASSERT_GT(robot_cfg.hardware.motors.size(), devs->motors.size())
+      << "test is vacuous unless another subsystem owns motors";
+  const uint16_t arm_id = MotorIdNamed(robot_cfg.hardware, "joint");
+
+  const auto c = SwerveCommand(robot_cfg.hardware, geometry, state, 1, 0, 0);
+  EXPECT_EQ(c.count, devs->motors.size());
+  for (std::size_t i = 0; i < c.count; ++i) {
+    EXPECT_NE(c.motors[i].id, arm_id);
+    EXPECT_NE(
+        std::find(devs->motors.begin(), devs->motors.end(), c.motors[i].id),
+        devs->motors.end())
+        << "command addresses unowned motor id " << c.motors[i].id;
   }
 }
 

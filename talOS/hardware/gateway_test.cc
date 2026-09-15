@@ -3,7 +3,9 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -100,9 +102,23 @@ class FakeBackend : public Backend {
     ++neutral;
     events.push_back("neutral");
   }
-  bool configure_ok{true}, healthy{true}, apply_ok{true};
+  std::optional<ConfigError> last_config_error() const override {
+    return config_error;
+  }
+  bool PollDeviceResets(std::vector<uint16_t>& ids) override {
+    ids = resets;
+    resets.clear();
+    return !ids.empty();
+  }
+  bool RestoreAfterReset() override {
+    events.push_back("restore");
+    return restore_ok;
+  }
+  bool configure_ok{true}, healthy{true}, apply_ok{true}, restore_ok{true};
   int applied{}, neutral{}, configure_calls{};
   std::vector<std::string> events{};
+  std::vector<uint16_t> resets{};
+  std::optional<ConfigError> config_error{};
 };
 Command Request(const Gateway& g) {
   const auto s = g.snapshot();
@@ -721,6 +737,122 @@ TEST(SimBackend, NeutralTurnsOffEveryOutputOnDisableTimeoutAndFailure) {
   gateway.Tick(203000, true);
   expect_safe_backends(backend);
   expect_safe_state(gateway.snapshot());
+}
+
+TEST(Gateway, ResetWhileEnabledNeutralizesBeforeRestore) {
+  FakeBackend backend;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, true);
+  auto stale = Request(g);
+  ASSERT_TRUE(g.Accept(stale, 1, 1000));
+  const auto epoch = g.snapshot().epoch;
+  backend.events.clear();
+  backend.resets.push_back(1);
+  // Enabled: reset recovery still runs — the device is already at defaults —
+  // but from the safe state, not around live demand.
+  g.Tick(2000, true);
+  ASSERT_GE(backend.events.size(), 2u);
+  EXPECT_EQ(backend.events[0], "neutral");
+  EXPECT_EQ(backend.events[1], "restore");
+  EXPECT_NE(g.snapshot().epoch, epoch);
+  EXPECT_FALSE(g.snapshot().flags & kCommandActive);
+  EXPECT_FALSE(g.Accept(stale, 2, 2000));
+  EXPECT_EQ(g.health().reset_count, 1u);
+  EXPECT_TRUE(g.Accept(Request(g), 0, 2000));
+}
+
+TEST(Gateway, FailedResetRestoreLatchesFaultAndReneutralizes) {
+  FakeBackend backend;
+  backend.restore_ok = false;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, true);
+  auto stale = Request(g);
+  ASSERT_TRUE(g.Accept(stale, 1, 1000));
+  backend.resets.push_back(1);
+  backend.events.clear();
+  g.Tick(2000, true);
+  // Neutralize before the restore and again after the failed device change,
+  // mirroring Reconfigure (plus the Tick-end neutral while faulted).
+  ASSERT_GE(backend.events.size(), 3u);
+  EXPECT_EQ(backend.events[0], "neutral");
+  EXPECT_EQ(backend.events[1], "restore");
+  EXPECT_EQ(backend.events[2], "neutral");
+  EXPECT_TRUE(g.snapshot().flags & kHardwareFault);
+  EXPECT_FALSE(g.Accept(stale, 2, 2000));
+}
+
+std::optional<ConfigAckPayload> PushConfigAndAwaitAck(
+    Endpoint& endpoint, protocol::RuntimeUdpPeer& companion,
+    const Config& cfg) {
+  auto chunks = CreateConfigChunks(cfg);
+  for (std::size_t i = 0; i < chunks.size(); ++i) {
+    EXPECT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig, i + 1,
+                                  1000, chunks[i].data(), chunks[i].size()),
+              protocol::UdpStatus::kOk);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  endpoint.Tick(2000, false);  // Disabled: Reconfigure reaches the backend.
+  for (int i = 0; i < 100; ++i) {
+    protocol::DecodedFrame frame;
+    if (companion.TryReceive(&frame) != protocol::UdpStatus::kOk) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+    if (frame.header.type != protocol::FrameType::kHardwareConfigAck) continue;
+    ConfigAckPayload ack{};
+    EXPECT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, ack));
+    return ack;
+  }
+  return std::nullopt;
+}
+
+TEST(Endpoint, ConfigAckReasonCarriesFailingDeviceAndCause) {
+  FakeBackend backend;
+  backend.configure_ok = false;
+  ConfigError err;
+  err.device_name = "front_left_drive";
+  err.bus = "rio";
+  err.can_id = 3;
+  err.operation = "apply_talonfx_config";
+  err.vendor_status = -1;
+  err.message = "timeout waiting for device response; retries exhausted";
+  backend.config_error = err;
+  Gateway gateway{backend, 3003};
+  Endpoint endpoint{gateway};
+  ASSERT_EQ(endpoint.Open("127.0.0.1", 15804, "127.0.0.1", 15805),
+            protocol::UdpStatus::kOk);
+  protocol::RuntimeUdpPeer companion;
+  ASSERT_EQ(companion.Open("127.0.0.1", 15805, "127.0.0.1", 15804),
+            protocol::UdpStatus::kOk);
+  const auto ack =
+      PushConfigAndAwaitAck(endpoint, companion, SwerveConfig(true));
+  ASSERT_TRUE(ack.has_value());
+  EXPECT_EQ(ack->status, ConfigAckStatus::kBackendFailed);
+  const std::string reason(ack->reason);
+  EXPECT_NE(reason.find("front_left_drive"), std::string::npos);
+  EXPECT_NE(reason.find("timeout"), std::string::npos);
+  // Truncated to the 64-byte field, always NUL-terminated. The long cause
+  // caps the reason at 63 chars.
+  EXPECT_LT(reason.size(), sizeof(ack->reason));
+  EXPECT_EQ(reason.size(), sizeof(ack->reason) - 1);
+  EXPECT_EQ(ack->reason[sizeof(ack->reason) - 1], '\0');
+}
+
+TEST(Endpoint, ConfigAckReasonFallsBackWithoutDetailedError) {
+  FakeBackend backend;
+  backend.configure_ok = false;  // No config_error: backend said nothing more.
+  Gateway gateway{backend, 3004};
+  Endpoint endpoint{gateway};
+  ASSERT_EQ(endpoint.Open("127.0.0.1", 15806, "127.0.0.1", 15807),
+            protocol::UdpStatus::kOk);
+  protocol::RuntimeUdpPeer companion;
+  ASSERT_EQ(companion.Open("127.0.0.1", 15807, "127.0.0.1", 15806),
+            protocol::UdpStatus::kOk);
+  const auto ack =
+      PushConfigAndAwaitAck(endpoint, companion, SwerveConfig(true));
+  ASSERT_TRUE(ack.has_value());
+  EXPECT_EQ(ack->status, ConfigAckStatus::kBackendFailed);
+  EXPECT_EQ(std::string(ack->reason), "Backend configuration failed");
 }
 
 }  // namespace

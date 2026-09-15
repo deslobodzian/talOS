@@ -54,6 +54,8 @@ void ObserveMode() {
 //
 //   TALOS_SIM_DS=1                        enable in teleop at startup
 //   TALOS_SIM_DS=0                        attach a Driver Station, stay disabled
+//   TALOS_SIM_DS=auto                     stay disabled until the gateway is
+//                                         configured, then enable in teleop
 //   TALOS_SIM_DS_DISABLE_AFTER_MS=2000    ... then disable two seconds in
 //   TALOS_SIM_RUN_MS=10000                stop after ten seconds and report
 //
@@ -61,14 +63,26 @@ void ObserveMode() {
 // from the real Driver Station and nothing here can forge it.
 class SimDriverStation {
  public:
-  SimDriverStation() {
+  explicit SimDriverStation(const talos::hardware::Gateway& gateway)
+      : gateway_(gateway) {
     const char* requested = std::getenv("TALOS_SIM_DS");
     if (requested == nullptr) {
       return;  // Leave the Driver Station to the GUI or to a real one.
     }
 
     active_ = true;
-    enabled_ = std::string_view{requested} != "0";
+    const std::string_view mode{requested};
+    if (mode == "auto") {
+      // Stay disabled until the bridge's config push lands. The gateway
+      // refuses hardware configuration while enabled, so enabling at
+      // startup would wedge the run: states flow but no command is ever
+      // accepted. configured() flips on the same Reconfigure success the
+      // acknowledgement reports, so polling it awaits the ack.
+      enabled_ = false;
+      enable_when_configured_ = true;
+    } else {
+      enabled_ = mode != "0";
+    }
 
     if (const char* after = std::getenv("TALOS_SIM_DS_DISABLE_AFTER_MS")) {
       disable_after_ = std::chrono::milliseconds{std::atoi(after)};
@@ -87,7 +101,15 @@ class SimDriverStation {
   }
 
   void Update() {
-    if (!active_ || !enabled_ || !disable_after_) {
+    if (!active_) {
+      return;
+    }
+    if (enable_when_configured_ && !enabled_ && gateway_.configured()) {
+      std::printf("simulated Driver Station: enabling (gateway configured)\n");
+      enabled_ = true;
+      Publish();
+    }
+    if (!enabled_ || !disable_after_) {
       return;
     }
     if (std::chrono::steady_clock::now() - started_ < *disable_after_) {
@@ -104,8 +126,10 @@ class SimDriverStation {
     frc::sim::DriverStationSim::NotifyNewData();
   }
 
+  const talos::hardware::Gateway& gateway_;
   bool active_{false};
   bool enabled_{false};
+  bool enable_when_configured_{false};
   std::optional<std::chrono::milliseconds> disable_after_;
   std::chrono::steady_clock::time_point started_{
       std::chrono::steady_clock::now()};
@@ -147,7 +171,7 @@ void Robot::StartCompetition() {
   auto next = std::chrono::steady_clock::now();
 
 #ifndef __FRC_ROBORIO__
-  SimDriverStation simulated_driver_station;
+  SimDriverStation simulated_driver_station{*gateway_};
 
   // A bounded simulation run, so an automated test does not have to race a
   // kill signal to get a clean summary out.

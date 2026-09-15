@@ -177,6 +177,22 @@ tasks.register("buildRio") {
     dependsOn 'frcUserProgramLinuxathenaReleaseExecutable'
 }
 
+// Stable entry point for the PhoenixBackend desktop simulation regressions in
+// src/test/cpp. The google-test plugin creates one RunTestExecutable task per
+// desktop variant (runFrcUserProgramTest<Platform><BuildType>GoogleTestExe),
+// so CI pins this aggregator instead of a platform-specific variant name.
+tasks.register("phoenixTest") {
+    description = 'Run the PhoenixBackend desktop simulation tests'
+    group = 'verification'
+    def runTasks = tasks.matching { it.name.startsWith('runFrcUserProgramTest') }
+    dependsOn runTasks
+    doFirst {
+        if (runTasks.empty) {
+            throw new RuntimeException('phoenixTest: no frcUserProgramTest run tasks found')
+        }
+    }
+}
+
 tasks.register("setupCompileCommands") {
     description = 'Generate and copy compile_commands.json to project root'
     group = 'ide'

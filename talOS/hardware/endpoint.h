@@ -38,7 +38,19 @@ class Endpoint {
             ack.status = ConfigAckStatus::kOk;
           } else {
             ack.status = ConfigAckStatus::kBackendFailed;
-            std::snprintf(ack.reason, sizeof(ack.reason), "Backend configuration failed");
+            // Item 6a: report the failing device and cause instead of the
+            // generic string. Compact "device: cause" summary so both survive
+            // truncation to the 64-byte reason; snprintf always
+            // NUL-terminates.
+            const auto config_error = gateway_.config_error();
+            if (config_error.has_value()) {
+              std::snprintf(ack.reason, sizeof(ack.reason), "%s: %s",
+                            config_error->device_name.c_str(),
+                            config_error->message.c_str());
+            } else {
+              std::snprintf(ack.reason, sizeof(ack.reason),
+                            "Backend configuration failed");
+            }
           }
           std::array<uint8_t, 128> ack_buf{};
           const auto ack_size = EncodeConfigAck(ack, ack_buf);

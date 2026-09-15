@@ -478,6 +478,8 @@ void PhoenixBackend::Neutral() {
   for (auto& motor : motors_)
     motor->SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
   for (auto& pwm : pwm_outputs_) pwm->SetSpeed(0.0);
+  // Support matrix: DIO outputs de-energize on every safe-state transition.
+  for (auto& dio : digital_outputs_) dio->Set(false);
   if (is_simulation_) {
     for (auto& cmd : last_commands_) cmd = hw::MotorRequest{};
     for (std::size_t i = 0; i < motors_.size(); ++i) {

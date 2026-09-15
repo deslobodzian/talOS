@@ -11,7 +11,7 @@
 #   previous -> bundles/<stamp>  rollback target
 #
 #   ./tools/delivery/deploy.sh install <bundle> [--prefix DIR]
-#   ./tools/delivery/deploy.sh check-network [--controller ADDR] [--port N]
+#   ./tools/delivery/deploy.sh check-network [--controller ADDR] [--port N] [--local-port N]
 #   ./tools/delivery/deploy.sh enable-boot [--prefix DIR] [--dry-run]
 #   ./tools/delivery/deploy.sh logs [--prefix DIR]
 #   ./tools/delivery/deploy.sh rollback [--prefix DIR]
@@ -57,25 +57,76 @@ cmd_install() {
 }
 
 # --- check-network ----------------------------------------------------------
-# The only network touch in this script: a 3s TCP probe of the controller
-# gateway port (default 5802, the runtime contract). Everything else here
-# and in run.sh works with the cable unplugged.
+# The only network touch in this script: a UDP frame exchange with the
+# controller gateway (default 5802, the runtime contract). Sends one
+# Heartbeat frame and waits up to 3s for a valid frame back, validated
+# against the wire contract in talOS/protocol (40-byte header, magic,
+# version). Everything else here and in run.sh works with the cable unplugged.
+# The gateway's socket is connected to the companion port (default 5803),
+# so probing a real controller needs that local port free; pass
+# --local-port 0 for an ephemeral port (test doubles answer from any port).
 cmd_check_network() {
-  local addr="10.56.87.2" port="5802"
+  local addr="10.56.87.2" port="5802" local_port="5803"
   while [ $# -gt 0 ]; do
     case "$1" in
       --controller) addr="$2"; shift 2 ;;
       --port) port="$2"; shift 2 ;;
-      *) die "usage: deploy.sh check-network [--controller ADDR] [--port N]" ;;
+      --local-port) local_port="$2"; shift 2 ;;
+      *) die "usage: deploy.sh check-network [--controller ADDR] [--port N] [--local-port N]" ;;
     esac
   done
-  say "probing controller $addr:$port"
-  python3 - "$addr" "$port" <<'EOF'
-import socket, sys
-addr, port = sys.argv[1], int(sys.argv[2])
-s = socket.create_connection((addr, port), timeout=3)
-s.close()
-print(f"deploy: controller reachable at {addr}:{port}")
+  say "probing controller $addr:$port over UDP (local port $local_port)"
+  python3 - "$addr" "$port" "$local_port" <<'EOF'
+import socket, struct, sys, time
+addr, port, local_port = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+
+# Wire contract from talOS/protocol (types.h, frame.h): little-endian
+# 40-byte header; the probe is a Heartbeat (12) with an empty payload.
+MAGIC = 0x4F4952534F4C4154
+VERSION = 1
+HEADER_SIZE = 40
+TYPE_HEARTBEAT = 12
+FLAG_ACK_REQUESTED = 1
+MAX_PAYLOAD = 1400
+
+frame = struct.pack('<QHHHHQQII', MAGIC, VERSION, HEADER_SIZE,
+                    TYPE_HEARTBEAT, FLAG_ACK_REQUESTED, 1,
+                    time.monotonic_ns() // 1000, 0, 0)
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.bind(('0.0.0.0', local_port))
+except OSError as e:
+    sys.exit(f"deploy: error: cannot bind local UDP port {local_port}: {e} "
+             f"(stop the process holding it, or pass --local-port 0)")
+try:
+    s.connect((addr, port))
+except OSError as e:
+    sys.exit(f"deploy: error: controller unreachable at {addr}:{port}: {e}")
+s.send(frame)
+deadline = time.monotonic() + 3
+while True:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        sys.exit(f"deploy: error: no valid frame from {addr}:{port} within 3s")
+    s.settimeout(remaining)
+    try:
+        data = s.recv(2048)
+    except socket.timeout:
+        sys.exit(f"deploy: error: no valid frame from {addr}:{port} within 3s")
+    except ConnectionRefusedError:
+        sys.exit(f"deploy: error: controller refused UDP at {addr}:{port}")
+    if len(data) < HEADER_SIZE:
+        continue
+    magic, version, header_size, ftype, flags, seq, ts, payload_size, _ = \
+        struct.unpack('<QHHHHQQII', data[:HEADER_SIZE])
+    if magic != MAGIC or version != VERSION or header_size != HEADER_SIZE:
+        continue
+    if payload_size > MAX_PAYLOAD or len(data) < HEADER_SIZE + payload_size:
+        continue
+    print(f"deploy: controller reachable at {addr}:{port} "
+          f"(frame type={ftype} seq={seq})")
+    break
 EOF
 }
 
@@ -154,9 +205,11 @@ cmd_rollback() {
 }
 
 # --- verify-offline ----------------------------------------------------------
-# Proves the installed bundle starts from its own files: refuses when any
+# Proves a relocated bundle starts from its own files: refuses when any
 # run.sh/launcher path references the network (curl/wget) or the build tree
-# (bazel-bin), then does a manifest --check offline.
+# (bazel-bin), checks the manifest, then copies the bundle to a temp dir and
+# launches the copy briefly (a bounded sim session), failing unless every
+# node process comes up and exits cleanly. The temp copy is removed afterwards.
 cmd_verify_offline() {
   local bundle="${1:?usage: deploy.sh verify-offline <bundle>}"
   [ -f "$bundle/bundle_manifest.json" ] || die "not a bundle: $bundle"
@@ -167,7 +220,48 @@ cmd_verify_offline() {
   say "no network/build-tree references in the launch path"
   python3 "$(repo_root)/tools/delivery/compat_record.py" \
     --bundle "$bundle" --check || die "bundle verification failed"
-  say "offline startup verified: install, then $bundle/run.sh --sim"
+  [ -x "$bundle/run.sh" ] || die "bundle has no executable run.sh"
+  local tmp; tmp="$(mktemp -d)"
+  trap "rm -rf \"$tmp\"" EXIT
+  say "copying bundle to $tmp for a relocated launch"
+  cp -r "$bundle" "$tmp/bundle"
+  chmod -R u+w "$tmp/bundle"
+  say "launching relocated bundle (bounded sim session)"
+  python3 - "$tmp/bundle" "$tmp/session" <<'EOF'
+import json, os, signal, subprocess, sys
+bundle, session_dir = sys.argv[1], sys.argv[2]
+proc = subprocess.Popen(
+    ["./run.sh", "--sim", "--start-sim-gateway",
+     "--duration-s", "10", "--output-dir", session_dir],
+    cwd=bundle, start_new_session=True)
+try:
+    rc = proc.wait(timeout=120)
+except subprocess.TimeoutExpired:
+    os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        rc = proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        rc = proc.wait()
+    sys.exit("deploy: error: relocated bundle did not stop within 120s")
+if rc != 0:
+    sys.exit(f"deploy: error: relocated bundle exited with code {rc}")
+manifest_path = os.path.join(session_dir, "manifest.json")
+try:
+    nodes = json.load(open(manifest_path))["nodes"]
+except (OSError, ValueError, KeyError) as e:
+    sys.exit(f"deploy: error: no session manifest at {manifest_path}: {e}")
+if not nodes:
+    sys.exit("deploy: error: session started no nodes")
+bad = [n for n in nodes
+       if n.get("pid", 0) <= 0 or n.get("exit_code", -1) != 0]
+if bad:
+    detail = ", ".join(f"{n.get('name')}(pid={n.get('pid')} "
+                       f"exit={n.get('exit_code')})" for n in bad)
+    sys.exit(f"deploy: error: nodes failed to come up cleanly: {detail}")
+print(f"deploy: {len(nodes)} processes came up and exited cleanly")
+EOF
+  say "offline startup verified: relocated bundle launched, all nodes clean"
 }
 
 usage() { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
@@ -175,7 +269,8 @@ usage() { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 main() {
   local cmd="${1:-}"; shift || true
   # Global flags ride anywhere on the command line; subcommand flags
-  # (--controller, --port, --user) are consumed by each subcommand below.
+  # (--controller, --port, --local-port, --user) are consumed by each
+  # subcommand below.
   local rest=()
   while [ $# -gt 0 ]; do
     case "$1" in

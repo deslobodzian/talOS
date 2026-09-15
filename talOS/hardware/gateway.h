@@ -32,13 +32,16 @@ class Backend {
   }
   // Item 36: individual device resets. Returns true and fills reset_ids with
   // the logical IDs of devices that reset since the last poll. The gateway
-  // restores configuration and invalidates outstanding commands, so no
-  // obsolete demand resumes on a freshly reset device.
+  // invalidates outstanding commands (epoch bump plus Neutral) BEFORE
+  // restoring configuration, so no obsolete demand resumes on a freshly
+  // reset device.
   virtual bool PollDeviceResets(std::vector<uint16_t>& reset_ids) {
     reset_ids.clear();
     return false;
   }
-  // Re-applies configuration after a reset. Returns false on failure.
+  // Re-applies configuration after a reset. Returns false on failure. The
+  // gateway neutralizes and invalidates before calling; on false it latches
+  // a fault and neutralizes again.
   virtual bool RestoreAfterReset() { return true; }
   // Item 38: declares the mechanism currently at `home_position_rot`.
   virtual bool ZeroPosition(uint16_t /*motor_id*/,

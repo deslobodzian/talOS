@@ -35,7 +35,7 @@ usage() {
   cat <<'USAGE'
 
 Options:
-  --headless        run the WPILib sim without its GUI (sets TALOS_SIM_DS=1)
+  --headless        run the WPILib sim without its GUI (sets TALOS_SIM_DS=auto)
   --no-studio       skip the Studio bridge and the browser
   --no-rio          use an existing controller (skip WPILib sim and gateway)
   --sim-gateway     start the lightweight simulator instead of WPILib
@@ -138,8 +138,8 @@ if [ "$WANT_RIO" = "1" ]; then
   [ "$HEADLESS" = "1" ] && GRADLE_ARGS="$GRADLE_ARGS -Pheadless"
   say "starting WPILib simulation (log: $LOG_DIR/rio.log)"
   if [ "$HEADLESS" = "1" ]; then
-    say "  headless: enabling teleop through TALOS_SIM_DS=1"
-    ( cd "$RIO_DIR" && TALOS_SIM_DS=1 ./gradlew $GRADLE_ARGS ) \
+    say "  headless: enabling teleop through TALOS_SIM_DS=auto (once configured)"
+    ( cd "$RIO_DIR" && TALOS_SIM_DS=auto ./gradlew $GRADLE_ARGS ) \
       > "$LOG_DIR/rio.log" 2>&1 &
   else
     ( cd "$RIO_DIR" && ./gradlew $GRADLE_ARGS ) > "$LOG_DIR/rio.log" 2>&1 &

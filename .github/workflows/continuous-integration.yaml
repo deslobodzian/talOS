@@ -71,9 +71,10 @@ jobs:
     - name: Desktop adapter test
       # PhoenixBackend encoder + sim-honesty regressions in src/test/cpp:
       # the actual adapter code, compiled and run on desktop through the
-      # WPILib simulation HAL. (`test` is the google-test suite task the
-      # build.gradle testSuites block wires up.)
-      run: ./gradlew test
+      # WPILib simulation HAL. (phoenixTest is the stable aggregator the
+      # build.gradle registers over the per-variant google-test run tasks
+      # the testSuites block wires up.)
+      run: ./gradlew phoenixTest
 
     - name: RoboRIO target build
       # Cross-compile the deployed frcUserProgram for linuxathena. This is
