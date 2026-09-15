@@ -1,0 +1,12 @@
+module(name = "talos_chassis_contracts", version = "0.1.0")
+bazel_dep(name = "rules_cc", version = "0.2.18")
+bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
+bazel_dep(name = "flatbuffers", version = "25.12.19")
+bazel_dep(name = "talos", version = "0.1.0")
+local_path_override(
+    module_name = "talos",
+    path = "..",
+)
+# No sibling platform deps: this contract module only builds on the talos
+# SDK. (The SDK lists platform modules as dev-only assembly deps, so they
+# never enter this checkout's module graph.)

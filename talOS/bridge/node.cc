@@ -1,6 +1,7 @@
 #include "node.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <thread>
@@ -25,6 +26,12 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
     config_.commissioned = true;
   }
   config_id_ = ConfigurationId(config_);
+  // Heartbeat keeps a live-but-unchanged merge refreshing the gateway at 5x
+  // margin inside the command timeout, whatever the config chose. The clamp
+  // keeps steady-state traffic near the slowest actuator period (20 ms)
+  // without ever approaching the timeout floor (2x period).
+  heartbeat_us_ = std::clamp(config_.command_timeout_us / 5, uint32_t{5000},
+                             uint32_t{20000});
 
   // Initialize full_cmd_ layout based on config_
   full_cmd_.config_id = config_id_;
@@ -207,7 +214,12 @@ void HardwareNode::PushConfig(uint64_t now_us) {
 }
 
 void HardwareNode::Tick(uint64_t now_us) {
-  // 1. Process incoming UDP frames from Gateway
+  // Wall-clock processing time on the bridge clock only (perf item 42). The
+  // now_us argument is the same clock, so no cross-clock subtraction happens.
+  const auto tick_start = std::chrono::steady_clock::now();
+  // 1. Process incoming UDP frames from Gateway. Bounded receive budget
+  // (perf item 45): at most 32 frames per tick, so a burst under overload
+  // delays rather than stalls the merge below.
   for (int i = 0; i < 32; ++i) {
     protocol::DecodedFrame frame;
     const auto status = peer_.TryReceive(&frame);
@@ -229,12 +241,37 @@ void HardwareNode::Tick(uint64_t now_us) {
       if (!Decode({frame.payload, frame.payload_size}, state)) continue;
 
       ++states_received_;
+      // Bridge-clock inter-arrival only. The state's sample_time_us is the
+      // gateway clock: it is adopted into requests verbatim, never
+      // differenced against now_us. Phoenix per-signal ages are already
+      // durations at poll time, so recording them is not a cross-clock
+      // subtraction either.
+      metrics_.OnStateReceived(now_us);
+      for (uint16_t i = 0; i < state.motor_count; ++i) {
+        if (state.motors[i].valid) {
+          metrics_.RecordSignalAge(state.motors[i].position_age_us);
+          metrics_.RecordSignalAge(state.motors[i].velocity_age_us);
+        }
+      }
       if (state.boot_id != last_boot_id_ || state.config_id != config_id_ ||
           !is_configured_) {
         if (now_us - last_push_time_us_ >= 50000 ||
             state.boot_id != last_boot_id_) {
           PushConfig(now_us);
         }
+      }
+
+      // Controller transition: reboot, reconfiguration, epoch bump, or an
+      // enabled/fault edge (the gateway invalidates its epoch on disable,
+      // re-enable, and fault recovery, so the edge check is belt and braces).
+      // Every cached merge dies here: motion resumes only on fresh subsystem
+      // requests stamped with the new identity.
+      const bool transition =
+          (state.boot_id != last_boot_id_) ||
+          (state.config_id != config_id_) || (state.epoch != last_epoch_) ||
+          ((state.flags ^ last_state_flags_) & (kEnabled | kHardwareFault));
+      if (transition) {
+        InvalidateRequests();
       }
 
       last_boot_id_ = state.boot_id;
@@ -270,38 +307,55 @@ void HardwareNode::Tick(uint64_t now_us) {
       ++tracker.requests;
       Command partial{};
       if (Decode(pkt->bytes(), partial)) {
-        // Apply motors belonging to this subsystem
-        for (std::size_t i = 0; i < partial.count; ++i) {
-          const auto& pm = partial.motors[i];
-          for (std::size_t j = 0; j < full_cmd_.count; ++j) {
-            if (full_cmd_.motors[j].id == pm.id) {
-              full_cmd_.motors[j] = pm;
-              break;
+        metrics_.OnRequestReceived(now_us);
+        // Trust gates, in this order: an obsolete request must never merge,
+        // and a current one must still own every device it addresses. Either
+        // rejection drops the whole request without proving liveness, so a
+        // stream of bad requests still times the subsystem out.
+        if (!HasRequestIdentity(partial)) {
+          ++identity_rejected_;
+        } else if (!OwnsRequestDevices(tracker, partial)) {
+          ++ownership_rejected_;
+        } else {
+          // Apply motors belonging to this subsystem
+          for (std::size_t i = 0; i < partial.count; ++i) {
+            const auto& pm = partial.motors[i];
+            for (std::size_t j = 0; j < full_cmd_.count; ++j) {
+              if (full_cmd_.motors[j].id == pm.id) {
+                full_cmd_.motors[j] = pm;
+                break;
+              }
             }
           }
-        }
-        // Apply digital outputs
-        for (std::size_t i = 0; i < partial.digital_output_count; ++i) {
-          const auto& pd = partial.digital_outputs[i];
-          for (std::size_t j = 0; j < full_cmd_.digital_output_count; ++j) {
-            if (full_cmd_.digital_outputs[j].id == pd.id) {
-              full_cmd_.digital_outputs[j] = pd;
-              break;
+          // Apply digital outputs
+          for (std::size_t i = 0; i < partial.digital_output_count; ++i) {
+            const auto& pd = partial.digital_outputs[i];
+            for (std::size_t j = 0; j < full_cmd_.digital_output_count; ++j) {
+              if (full_cmd_.digital_outputs[j].id == pd.id) {
+                full_cmd_.digital_outputs[j] = pd;
+                break;
+              }
             }
           }
-        }
-        // Apply PWM outputs
-        for (std::size_t i = 0; i < partial.pwm_output_count; ++i) {
-          const auto& pp = partial.pwm_outputs[i];
-          for (std::size_t j = 0; j < full_cmd_.pwm_output_count; ++j) {
-            if (full_cmd_.pwm_outputs[j].id == pp.id) {
-              full_cmd_.pwm_outputs[j] = pp;
-              break;
+          // Apply PWM outputs
+          for (std::size_t i = 0; i < partial.pwm_output_count; ++i) {
+            const auto& pp = partial.pwm_outputs[i];
+            for (std::size_t j = 0; j < full_cmd_.pwm_output_count; ++j) {
+              if (full_cmd_.pwm_outputs[j].id == pp.id) {
+                full_cmd_.pwm_outputs[j] = pp;
+                break;
+              }
             }
           }
+          // Adopt the request's identity words. The outgoing command carries
+          // the observation its content was built from, never a fresher one.
+          full_cmd_.config_id = partial.config_id;
+          full_cmd_.boot_id = partial.boot_id;
+          full_cmd_.epoch = partial.epoch;
+          full_cmd_.observed_time_us = partial.observed_time_us;
+          tracker.last_seen_us = now_us;
+          tracker.timed_out = false;
         }
-        tracker.last_seen_us = now_us;
-        tracker.timed_out = false;
       }
     }
 
@@ -354,23 +408,46 @@ void HardwareNode::Tick(uint64_t now_us) {
     }
   }
 
-  // 3. Send unified command if we have observed state
+  // 3. Send unified command if we have observed state. The headers travel
+  // untouched from the subsystem requests that built the merge: stamping the
+  // current state here would make an obsolete request look current, and the
+  // gateway would accept it as fresh. Publication is change-driven with a
+  // bounded heartbeat (perf item 43): each new sample changes the merge's
+  // observation headers, so a live 200 Hz link sends at the 200 Hz sample
+  // rate instead of the 1 kHz tick rate, and an unchanged merge resends only
+  // when the heartbeat elapses. The gateway's 100 ms timeout keeps 5x margin
+  // over the heartbeat. Subsystem timeouts still neutralize through the
+  // merge, and a changed merge always sends immediately.
   if (last_boot_id_ != 0 && any_subsystem_active) {
-    full_cmd_.config_id = config_id_;
-    full_cmd_.boot_id = last_boot_id_;
-    full_cmd_.epoch = last_epoch_;
-    full_cmd_.observed_time_us = last_sample_time_us_;
-
-    talos::hardware::Packet cmd_pkt{};
-    cmd_pkt.size = static_cast<uint32_t>(Encode(full_cmd_, cmd_pkt.data));
-    if (cmd_pkt.size > 0) {
-      if (cmd_pub_) cmd_pub_->write(cmd_pkt);
-      peer_.SendFrame(protocol::FrameType::kHardwareCommand,
-                      static_cast<uint16_t>(++cmd_sequence_), now_us,
-                      cmd_pkt.data.data(), cmd_pkt.size);
-      ++commands_sent_;
+    if (ShouldSendCommand(now_us)) {
+      talos::hardware::Packet cmd_pkt{};
+      cmd_pkt.size = static_cast<uint32_t>(Encode(full_cmd_, cmd_pkt.data));
+      if (cmd_pkt.size > 0) {
+        if (cmd_pub_) cmd_pub_->write(cmd_pkt);
+        peer_.SendFrame(protocol::FrameType::kHardwareCommand,
+                        static_cast<uint16_t>(++cmd_sequence_), now_us,
+                        cmd_pkt.data.data(), cmd_pkt.size);
+        ++commands_sent_;
+        last_sent_cmd_ = full_cmd_;
+        last_send_us_ = now_us;
+        have_last_sent_ = true;
+        metrics_.OnCommandSent(now_us);
+      }
+    } else {
+      metrics_.RecordSuppressedSend();
     }
   }
+
+  const auto tick_end = std::chrono::steady_clock::now();
+  metrics_.OnTickDone(static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(tick_end -
+                                                            tick_start)
+          .count()));
+}
+
+bool HardwareNode::ShouldSendCommand(uint64_t now_us) {
+  if (!have_last_sent_ || full_cmd_ != last_sent_cmd_) return true;
+  return now_us - last_send_us_ >= heartbeat_us_;
 }
 
 int HardwareNode::Run(int duration_s) {
@@ -378,6 +455,12 @@ int HardwareNode::Run(int duration_s) {
   const auto end =
       std::chrono::steady_clock::now() + std::chrono::seconds{duration_s};
 
+  // Explicit periodic scheduling (perf item 43): each tick has a deadline
+  // one period after the previous, so work time does not accumulate drift
+  // the way work-then-sleep(1 ms) does. An overrun skips the sleep once and
+  // re-anchors the deadline instead of queuing catch-up ticks; overruns are
+  // counted (see tick_overruns() and metrics) rather than hidden.
+  auto next_tick = std::chrono::steady_clock::now();
   while (!talos::process::stop_requested.load() &&
          (!duration_s || std::chrono::steady_clock::now() < end)) {
     const auto now_us = static_cast<uint64_t>(
@@ -394,7 +477,14 @@ int HardwareNode::Run(int duration_s) {
       next_introspection_ = steady_now + std::chrono::milliseconds{250};
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    next_tick += std::chrono::microseconds{kTickPeriodUs};
+    if (next_tick > std::chrono::steady_clock::now()) {
+      std::this_thread::sleep_until(next_tick);
+    } else {
+      ++tick_overruns_;
+      metrics_.RecordMissedDeadline();
+      next_tick = std::chrono::steady_clock::now();
+    }
   }
 
   PublishIntrospection();
@@ -403,6 +493,59 @@ int HardwareNode::Run(int duration_s) {
               static_cast<unsigned long long>(states_received_),
               static_cast<unsigned long long>(commands_sent_));
   return states_received_ > 0 ? 0 : 1;
+}
+
+bool HardwareNode::HasRequestIdentity(const Command& partial) const {
+  return partial.config_id == config_id_ &&
+         partial.boot_id == last_boot_id_ &&
+         partial.epoch == last_epoch_ &&
+         partial.observed_time_us == last_sample_time_us_;
+}
+
+bool HardwareNode::OwnsRequestDevices(const SubsystemTracker& tracker,
+                                      const Command& partial) const {
+  const auto owns = [](const auto& owned, uint16_t id) {
+    return std::find(owned.begin(), owned.end(), id) != owned.end();
+  };
+  for (std::size_t i = 0; i < partial.count; ++i) {
+    if (!owns(tracker.devices.motors, partial.motors[i].id)) return false;
+  }
+  for (std::size_t i = 0; i < partial.digital_output_count; ++i) {
+    if (!owns(tracker.devices.digital_outputs,
+              partial.digital_outputs[i].id))
+      return false;
+  }
+  for (std::size_t i = 0; i < partial.pwm_output_count; ++i) {
+    if (!owns(tracker.devices.pwm_outputs, partial.pwm_outputs[i].id))
+      return false;
+  }
+  return true;
+}
+
+void HardwareNode::NeutralizeAll() {
+  for (std::size_t j = 0; j < full_cmd_.count; ++j) {
+    full_cmd_.motors[j].mode = Mode::kNeutral;
+    full_cmd_.motors[j].demand = 0.0;
+    full_cmd_.motors[j].feedforward_v = 0.0;
+  }
+  for (std::size_t j = 0; j < full_cmd_.digital_output_count; ++j) {
+    full_cmd_.digital_outputs[j].value = false;
+  }
+  for (std::size_t j = 0; j < full_cmd_.pwm_output_count; ++j) {
+    full_cmd_.pwm_outputs[j].output = 0.0;
+  }
+}
+
+void HardwareNode::InvalidateRequests() {
+  NeutralizeAll();
+  for (auto& [name, tracker] : subsystems_) {
+    tracker.last_seen_us = 0;
+    tracker.timed_out = true;
+  }
+  // Force the next merged command onto the wire even if its demands happen
+  // to equal the pre-transition ones: the identity headers differ, but the
+  // heartbeat timer must not get a vote on the first post-transition send.
+  have_last_sent_ = false;
 }
 
 }  // namespace talos::hardware

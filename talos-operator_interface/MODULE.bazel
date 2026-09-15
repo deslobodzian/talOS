@@ -1,0 +1,21 @@
+module(name = "talos_operator_interface", version = "0.1.0")
+bazel_dep(name = "rules_cc", version = "0.2.18")
+bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
+bazel_dep(name = "flatbuffers", version = "25.12.19")
+bazel_dep(name = "talos", version = "0.1.0")
+local_path_override(
+    module_name = "talos",
+    path = "..",
+)
+bazel_dep(name = "talos_driver_station", version = "0.1.0")
+local_path_override(
+    module_name = "talos_driver_station",
+    path = "../talos-driver_station",
+)
+# Neutral chassis frame contract (replaces the former year-local drivetrain
+# messages edge): the chassis core maps sticks to chassis requests.
+bazel_dep(name = "talos_chassis_contracts", version = "0.1.0")
+local_path_override(
+    module_name = "talos_chassis_contracts",
+    path = "../talos-chassis_contracts",
+)

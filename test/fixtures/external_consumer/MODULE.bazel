@@ -1,0 +1,32 @@
+module(name = "external_consumer_fixture")
+
+# Minimal SDK consumer: only the talos SDK plus the core toolchain pins.
+# Platform nodes (talos_driver_station, talos_operator_interface,
+# talos_odometry, talos_telemetry, talos_chassis_contracts, studio_schema)
+# are dev-only assembly deps of the SDK and never enter this graph; an
+# assembly that launches them (see test/fixtures/robot_assembly/MODULE.bazel)
+# declares exactly the ones it uses.
+bazel_dep(name = "talos")
+local_path_override(
+    module_name = "talos",
+    path = "../../..",
+)
+
+bazel_dep(name = "apple_support", version = "2.0.0", repo_name = "build_bazel_apple_support")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_cc", version = "0.2.18")
+bazel_dep(name = "rules_python", version = "2.0.1")
+bazel_dep(name = "flatbuffers", version = "25.12.19")
+bazel_dep(name = "rules_foreign_cc", version = "0.14.0")
+bazel_dep(name = "aspect_bazel_lib", version = "2.22.5")
+# No aspect_rules_esbuild: unused here, and 0.27.0 requires aspect_rules_js
+# 3.x, whose npm tag dropped the root_package attribute flatbuffers passes.
+bazel_dep(name = "rules_go", version = "0.63.0", repo_name = "io_bazel_rules_go")
+bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    python_version = "3.11",
+    is_default = True,
+)
+use_repo(python, "python_3_11")

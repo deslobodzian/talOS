@@ -296,21 +296,55 @@ inline std::optional<std::string> CheckTopicName(std::string_view topic) {
 // there the rule is the other one available: the rule name after the colon.
 inline std::optional<std::string> CheckNodeTarget(std::string_view name,
                                                   std::string_view target) {
-  if (!target.starts_with("//"))
+  std::string_view rest = target;
+  std::string_view repo;
+  if (rest.starts_with("@@")) {
+    rest.remove_prefix(2);
+    auto slash = rest.find("//");
+    if (slash != std::string_view::npos) {
+      repo = rest.substr(0, slash);
+      rest.remove_prefix(slash);
+    }
+  } else if (rest.starts_with("@")) {
+    rest.remove_prefix(1);
+    auto slash = rest.find("//");
+    if (slash != std::string_view::npos) {
+      repo = rest.substr(0, slash);
+      rest.remove_prefix(slash);
+    }
+  }
+
+  if (!repo.empty()) {
+    auto plus = repo.find('+');
+    if (plus != std::string_view::npos) {
+      repo = repo.substr(0, plus);
+    }
+    if (repo.starts_with("talos_")) {
+      repo.remove_prefix(6);
+    } else if (repo.starts_with("talos-")) {
+      repo.remove_prefix(6);
+    }
+    if (repo == name) {
+      return std::nullopt;
+    }
+  }
+
+  if (!rest.starts_with("//"))
     return "target '" + std::string{target} + "' for node '" +
            std::string{name} + "' must be an absolute Bazel label";
-  const std::size_t colon = target.find(':');
+  const std::size_t colon = rest.find(':');
   if (colon == std::string_view::npos)
     return "target '" + std::string{target} + "' for node '" +
            std::string{name} + "' must name a rule, as //package:rule";
 
-  const std::string_view package = target.substr(2, colon - 2);
-  const std::string_view rule = target.substr(colon + 1);
+  const std::string_view package = rest.substr(2, colon - 2);
+  const std::string_view rule = rest.substr(colon + 1);
   const std::size_t slash = package.rfind('/');
   const std::string_view leaf =
       slash == std::string_view::npos ? package : package.substr(slash + 1);
 
-  if (leaf == name || rule == name) return std::nullopt;
+  if (leaf == name || rule == name || (package.empty() && rule == "node"))
+    return std::nullopt;
   return "node '" + std::string{name} + "' is built by '" +
          std::string{target} +
          "'; the name must match either the package leaf ('" +

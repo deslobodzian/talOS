@@ -1,0 +1,44 @@
+# Intake subsystem. Parsed via the [[subsystems]] manifest in
+# 2026-robot/main_processor/configuration/robot.toml and merged with the other
+# subsystem files into one canonical view before validation.
+#
+# STUDENT NOTE -- where the motor's behavior lives:
+#   speeds (intake / eject / stop) .... talos_nodes/intake/node.py top block
+#   gains + limits (below) ............ this file ([motors.roller])
+# The node asks for velocity and the motor's onboard PID closes the loop, so
+# these gains decide whether the wheel actually reaches the asked speed.
+[subsystem]
+name = "intake"
+node = "//2026-robot/main_processor/intake:node"
+period_us = 20000
+
+[motors.roller]
+type = "TalonFX"
+bus = "rio"
+can_id = 10
+# Direction + stopping: flip `inverted` if positive demand ejects instead of
+# intaking; `brake` holds the wheel at stop, coast lets it spin down freely.
+inverted = false
+brake = true
+# Current limits (amps): the first things to lower if the mechanism stalls
+# and browns out, the last things to raise for more pushing power.
+supply_limit_a = 40.0
+stator_limit_a = 80.0
+# Electrical + mechanical scaling. sensor_to_mechanism_ratio converts rotor
+# revs to wheel revs (1.0 = direct drive); max_velocity_rps caps what the
+# node may ask for no matter what the arbiter sends.
+max_voltage = 12.0
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 100.0
+# Velocity-loop gains (slot 0, selected by SLOT in node.py). ALL ZERO means
+# UNTUNED: with no feedforward the wheel lags its demand and Studio's
+# requested-vs-measured rows split apart. Tune in order:
+#   v (kV, rps -> volt): raise until steady-state measured ~= requested;
+#   p: raise until the step response stops lagging, back off at oscillation;
+#   s (static friction, volt): smallest value that breaks the wheel loose;
+#   i, d: leave zero until v+p+s cannot hold speed under load.
+# Compare [motors.flywheel] in the shooter config for a tuned example.
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[digital_inputs.intake_beam]
+dio = 1

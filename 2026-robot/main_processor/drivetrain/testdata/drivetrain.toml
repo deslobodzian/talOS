@@ -1,0 +1,98 @@
+# Minimal swerve devices and geometry for unit tests, not deployment tuning.
+[subsystem]
+name = "drivetrain"
+period_us = 5000
+
+[motors.back_left_drive]
+type = "TalonFX"
+bus = "test"
+can_id = 1
+max_velocity_rps = 20.0
+
+[motors.back_left_steer]
+type = "TalonFX"
+bus = "test"
+can_id = 2
+feedback = "RemoteCANcoder"
+feedback_sensor = "back_left_encoder"
+continuous_wrap = true
+max_velocity_rps = 100.0
+
+[sensors.back_left_encoder]
+type = "CANcoder"
+bus = "test"
+can_id = 21
+
+[motors.back_right_drive]
+type = "TalonFX"
+bus = "test"
+can_id = 3
+max_velocity_rps = 20.0
+
+[motors.back_right_steer]
+type = "TalonFX"
+bus = "test"
+can_id = 4
+feedback = "RemoteCANcoder"
+feedback_sensor = "back_right_encoder"
+continuous_wrap = true
+max_velocity_rps = 100.0
+
+[sensors.back_right_encoder]
+type = "CANcoder"
+bus = "test"
+can_id = 22
+
+[motors.front_left_drive]
+type = "TalonFX"
+bus = "test"
+can_id = 5
+max_velocity_rps = 20.0
+
+[motors.front_left_steer]
+type = "TalonFX"
+bus = "test"
+can_id = 6
+feedback = "RemoteCANcoder"
+feedback_sensor = "front_left_encoder"
+continuous_wrap = true
+max_velocity_rps = 100.0
+
+[sensors.front_left_encoder]
+type = "CANcoder"
+bus = "test"
+can_id = 23
+
+[motors.front_right_drive]
+type = "TalonFX"
+bus = "test"
+can_id = 7
+max_velocity_rps = 20.0
+
+[motors.front_right_steer]
+type = "TalonFX"
+bus = "test"
+can_id = 8
+feedback = "RemoteCANcoder"
+feedback_sensor = "front_right_encoder"
+continuous_wrap = true
+max_velocity_rps = 100.0
+
+[sensors.front_right_encoder]
+type = "CANcoder"
+bus = "test"
+can_id = 24
+
+[sensors.drivetrain_imu]
+type = "Pigeon2"
+bus = "test"
+can_id = 30
+
+[geometry]
+wheel_radius_m = 0.0508
+modules = [
+  { name = "back_left", x_m = -0.3, y_m = 0.3, drive = "back_left_drive", steer = "back_left_steer", encoder = "back_left_encoder" },
+  { name = "back_right", x_m = -0.3, y_m = -0.3, drive = "back_right_drive", steer = "back_right_steer", encoder = "back_right_encoder" },
+  { name = "front_left", x_m = 0.3, y_m = 0.3, drive = "front_left_drive", steer = "front_left_steer", encoder = "front_left_encoder" },
+  { name = "front_right", x_m = 0.3, y_m = -0.3, drive = "front_right_drive", steer = "front_right_steer", encoder = "front_right_encoder" },
+]

@@ -25,6 +25,31 @@ struct RobotConfig {
   std::map<std::string, hardware::Devices> subsystems;
   toml::table toml_data;
 
+  // Deployment addressing: where the controller processor (RoboRIO gateway)
+  // lives as seen from this companion. Loopback by default, so simulation and
+  // loopback tests work with no extra configuration. Set to the RIO address
+  // (e.g. "10.56.87.2") for a real robot, either here or via --remote.
+  std::string controller_address{"127.0.0.1"};
+  uint16_t controller_port{5802};
+  uint16_t local_port{5803};
+
+  // Sim-session viewer. Studio's bridge is a host-side process, not a robot
+  // node, so it is not a [[subsystems]] entry; this table carries what the
+  // launcher needs to start and supervise it in sim sessions
+  // (--start-studio-bridge, which sim.sh passes unless --no-studio). The
+  // watched topic is NOT repeated here: it is read from
+  // [subsystems.telemetry] topic at describe/spawn time, the same key the
+  // telemetry node itself reads, so the two ends cannot drift apart.
+  struct StudioConfig {
+    std::string bridge{"//studio/bridge:studio_bridge"};
+    uint16_t http_port{5800};
+    uint16_t udp_port{5801};
+    // Relative to the launcher's working directory (the workspace root when
+    // launched from sim.sh).
+    std::string webroot{"bazel-bin/studio/dist"};
+  };
+  StudioConfig studio;
+
   const hardware::Devices* GetDevices(const std::string& subsystem) const {
     auto it = subsystems.find(subsystem);
     if (it != subsystems.end()) return &it->second;
@@ -133,6 +158,26 @@ inline std::string ReadString(const toml::table& tbl, const char* key,
 
 }  // namespace detail
 
+// Effective controller endpoint: an explicit CLI value wins, otherwise the
+// deployment configuration. A zero CLI port means "not given".
+inline std::string ResolveControllerAddress(const RobotConfig& config,
+                                            const std::string& cli_override) {
+  if (!cli_override.empty()) return cli_override;
+  return config.controller_address;
+}
+
+inline uint16_t ResolveControllerPort(const RobotConfig& config,
+                                      uint16_t cli_override) {
+  if (cli_override != 0) return cli_override;
+  return config.controller_port;
+}
+
+inline uint16_t ResolveLocalPort(const RobotConfig& config,
+                                 uint16_t cli_override) {
+  if (cli_override != 0) return cli_override;
+  return config.local_port;
+}
+
 inline RobotConfig ParseRobotConfigTable(toml::table tbl);
 
 inline RobotConfig ParseRobotConfigString(std::string_view toml_content) {
@@ -159,6 +204,9 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
   uint32_t command_timeout_us = 100000;
   double status_hz = 200.0;
   bool commissioned = false;
+  std::string controller_address = "127.0.0.1";
+  uint16_t controller_port = 5802;
+  uint16_t local_port = 5803;
 
   if (auto* robot_tbl = tbl["robot"].as_table()) {
     if (auto node = (*robot_tbl)["period_us"]) {
@@ -188,12 +236,88 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
       status_hz = *val;
     }
     commissioned = (*robot_tbl)["commissioned"].value_or(false);
+
+    // Deployment addressing: where the controller processor lives as seen
+    // from this companion. `controller_address` is canonical;
+    // `remote_address`/`remote_ip` are accepted as aliases. Ports default to
+    // the runtime contract: 5802 on the gateway, 5803 on the companion.
+    auto read_address = [&](const char* key) -> std::optional<std::string> {
+      if (auto node = (*robot_tbl)[key]) {
+        auto val = node.value<std::string_view>();
+        if (!val || val->empty()) {
+          throw std::invalid_argument(std::string("field '") + key +
+                                      "' must be a non-empty string");
+        }
+        return std::string(*val);
+      }
+      return std::nullopt;
+    };
+    if (auto addr = read_address("controller_address")) {
+      controller_address = *addr;
+    } else if (auto addr = read_address("remote_address")) {
+      controller_address = *addr;
+    } else if (auto addr = read_address("remote_ip")) {
+      controller_address = *addr;
+    }
+    auto read_port = [&](const char* key, uint16_t fallback) {
+      if (auto node = (*robot_tbl)[key]) {
+        auto val = node.value<int64_t>();
+        if (!val || *val < 1 || *val > 65535) {
+          throw std::invalid_argument(std::string("field '") + key +
+                                      "' must be a port in [1, 65535]");
+        }
+        return static_cast<uint16_t>(*val);
+      }
+      return fallback;
+    };
+    controller_port = read_port("controller_port", controller_port);
+    controller_port = read_port("remote_port", controller_port);
+    local_port = read_port("local_port", local_port);
   }
 
   result.hardware.period_us = period_us;
   result.hardware.command_timeout_us = command_timeout_us;
   result.hardware.status_hz = status_hz;
   result.hardware.commissioned = commissioned;
+  result.controller_address = controller_address;
+  result.controller_port = controller_port;
+  result.local_port = local_port;
+
+  // 1b. Parse [studio] table. Every key is optional; an absent table leaves
+  // the sim-session defaults above, so assemblies written before this table
+  // existed launch unchanged.
+  if (auto* studio_tbl = tbl["studio"].as_table()) {
+    auto read_studio_string = [&](const char* key, std::string fallback) {
+      if (auto node = (*studio_tbl)[key]) {
+        auto val = node.value<std::string_view>();
+        if (!val || val->empty()) {
+          throw std::invalid_argument(std::string("[studio] field '") + key +
+                                      "' must be a non-empty string");
+        }
+        return std::string(*val);
+      }
+      return fallback;
+    };
+    auto read_studio_port = [&](const char* key, uint16_t fallback) {
+      if (auto node = (*studio_tbl)[key]) {
+        auto val = node.value<int64_t>();
+        if (!val || *val < 1 || *val > 65535) {
+          throw std::invalid_argument(std::string("[studio] field '") + key +
+                                      "' must be a port in [1, 65535]");
+        }
+        return static_cast<uint16_t>(*val);
+      }
+      return fallback;
+    };
+    result.studio.bridge =
+        read_studio_string("bridge", result.studio.bridge);
+    result.studio.webroot =
+        read_studio_string("webroot", result.studio.webroot);
+    result.studio.http_port =
+        read_studio_port("http_port", result.studio.http_port);
+    result.studio.udp_port =
+        read_studio_port("udp_port", result.studio.udp_port);
+  }
 
   auto* subsystems_tbl = tbl["subsystems"].as_table();
   if (!subsystems_tbl) {
@@ -872,6 +996,32 @@ inline RobotConfig ParseRobotConfig(const std::string& path) {
       toml::table robot_copy;
       detail::CopyTableInto(robot_copy, *robot_tbl);
       merged.insert_or_assign("robot", std::move(robot_copy));
+    }
+    merged.insert_or_assign("subsystems", std::move(subs_view));
+    return ParseRobotConfigTable(std::move(merged));
+  }
+
+  // Standalone subsystem mode: a single subsystem.toml containing [subsystem]
+  // and device tables directly.
+  if (auto* header = tbl["subsystem"].as_table()) {
+    auto name_view = (*header)["name"].value<std::string_view>();
+    std::string name = name_view ? std::string(*name_view) : "default";
+    toml::table view;
+    for (auto&& [k, v] : *header) {
+      if (k.str() == "name") continue;
+      view.insert_or_assign(std::string(k.str()), v);
+    }
+    for (auto&& [k, v] : tbl) {
+      if (k.str() == "subsystem") continue;
+      view.insert_or_assign(std::string(k.str()), v);
+    }
+    toml::table subs_view;
+    subs_view.insert_or_assign(name, std::move(view));
+    toml::table merged;
+    if (header->contains("period_us")) {
+      toml::table robot_tbl;
+      robot_tbl.insert_or_assign("period_us", (*header)["period_us"]);
+      merged.insert_or_assign("robot", std::move(robot_tbl));
     }
     merged.insert_or_assign("subsystems", std::move(subs_view));
     return ParseRobotConfigTable(std::move(merged));

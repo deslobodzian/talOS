@@ -39,8 +39,30 @@ uint32_t Age(const ph::BaseStatusSignal& signal) {
 
 PhoenixBackend::PhoenixBackend(bool is_simulation) : is_simulation_{is_simulation} {}
 
+std::optional<hw::ConfigError> PhoenixBackend::last_config_error() const {
+  return last_error_;
+}
+
 bool PhoenixBackend::Configure(const hw::Config& c) {
   hw::Validate(c);
+  last_error_.reset();
+  // Item 35: the first failed device apply wins the precise error: device
+  // name, bus, CAN ID, operation, and the raw vendor status value.
+  const auto note_failure = [this](const std::string& name,
+                                   const std::string& bus, int can_id,
+                                   const std::string& operation,
+                                   const ctre::phoenix::StatusCode& code) {
+    if (code.IsOK() || last_error_.has_value()) return code.IsOK();
+    hw::ConfigError err;
+    err.device_name = name;
+    err.bus = bus;
+    err.can_id = can_id;
+    err.operation = operation;
+    err.vendor_status = static_cast<int>(code);
+    err.message = code.GetName();
+    last_error_ = err;
+    return false;
+  };
   config_ = c;
   signals_.clear();
   motors_.clear();
@@ -48,7 +70,7 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   digital_inputs_.clear();
   digital_outputs_.clear();
   analog_inputs_.clear();
-  encoders_.clear();
+  rio_encoders_.clear();
   pwm_outputs_.clear();
 
   sim_rotor_velocity_.fill(0.0);
@@ -68,11 +90,19 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     analog_inputs_.push_back(std::make_unique<frc::AnalogInput>(a.channel));
   }
   for (const auto& e : c.encoders) {
-    if (e.dio_b >= 0) {
-      encoders_.push_back(std::make_unique<frc::Encoder>(e.dio_a, e.dio_b));
+    RioEncoder dev;
+    dev.config = e;
+    if (e.kind == hw::EncoderKind::kDutyCycle) {
+      // Single-channel ctor reports fullRange 1, so Get() is raw rotations.
+      dev.duty_cycle = std::make_unique<frc::DutyCycleEncoder>(e.dio_a);
     } else {
-      encoders_.push_back(std::make_unique<frc::Encoder>(e.dio_a, e.dio_a));
+      dev.quadrature =
+          std::make_unique<frc::Encoder>(e.dio_a, e.dio_b);
+      // Default k4X decoding counts every edge, and counts_per_rev is edges
+      // per rev, so this reports rotations (Validate guarantees cpr > 0).
+      dev.quadrature->SetDistancePerPulse(1.0 / e.counts_per_rev);
     }
+    rio_encoders_.push_back(std::move(dev));
   }
   for (const auto& p : c.pwm_outputs) {
     pwm_outputs_.push_back(std::make_unique<frc::PWM>(p.channel));
@@ -91,14 +121,16 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
           s.inverted
               ? ph::signals::SensorDirectionValue::Clockwise_Positive
               : ph::signals::SensorDirectionValue::CounterClockwise_Positive;
-      ok &= device.encoder->GetConfigurator().Apply(cfg).IsOK();
+      ok &= note_failure(s.name, s.bus, s.can_id, "apply_cancoder_config",
+                           device.encoder->GetConfigurator().Apply(cfg));
       signals_.push_back(&device.encoder->GetAbsolutePosition(false));
       signals_.push_back(&device.encoder->GetVelocity(false));
     } else {
       device.imu =
           std::make_unique<ph::hardware::Pigeon2>(s.can_id, ph::CANBus{s.bus});
       ph::configs::Pigeon2Configuration cfg;
-      ok &= device.imu->GetConfigurator().Apply(cfg).IsOK();
+      ok &= note_failure(s.name, s.bus, s.can_id, "apply_pigeon2_config",
+                         device.imu->GetConfigurator().Apply(cfg));
       signals_.push_back(&device.imu->GetYaw(false));
       signals_.push_back(&device.imu->GetAngularVelocityZWorld(false));
     }
@@ -145,7 +177,8 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     SetGains(cfg.Slot0, m.slots[0]);
     SetGains(cfg.Slot1, m.slots[1]);
     SetGains(cfg.Slot2, m.slots[2]);
-    ok &= motor->GetConfigurator().Apply(cfg).IsOK();
+    ok &= note_failure(m.name, m.bus, m.can_id, "apply_talonfx_config",
+                       motor->GetConfigurator().Apply(cfg));
     signals_.push_back(&motor->GetPosition(false));
     signals_.push_back(&motor->GetVelocity(false));
     signals_.push_back(&motor->GetMotorVoltage(false));
@@ -187,9 +220,56 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     }
   }
 
-  for (auto* signal : signals_)
-    ok &= signal->SetUpdateFrequency(units::hertz_t{c.status_hz}).IsOK();
+  for (auto* signal : signals_) {
+    const auto code = signal->SetUpdateFrequency(units::hertz_t{c.status_hz});
+    ok &= note_failure("signal_rates", "", -1, "set_signal_frequency", code);
+  }
   return ok;
+}
+
+bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
+  // Item 36: HasResetOccurred reports (and clears) one device's reset latch.
+  reset_ids.clear();
+  for (std::size_t i = 0; i < motors_.size() && i < config_.motors.size(); ++i) {
+    if (motors_[i]->HasResetOccurred()) reset_ids.push_back(config_.motors[i].id);
+  }
+  for (std::size_t i = 0; i < sensors_.size() && i < config_.sensors.size(); ++i) {
+    const bool reset = sensors_[i].encoder
+                           ? sensors_[i].encoder->HasResetOccurred()
+                           : sensors_[i].imu->HasResetOccurred();
+    if (reset) reset_ids.push_back(config_.sensors[i].id);
+  }
+  return !reset_ids.empty();
+}
+
+bool PhoenixBackend::RestoreAfterReset() {
+  // A reset drops device-side configuration: re-apply everything from the
+  // last good manifest. The gateway separately neutralizes outputs and bumps
+  // the epoch, so no obsolete demand resumes on the restored devices.
+  return Configure(config_);
+}
+
+bool PhoenixBackend::ZeroPosition(uint16_t motor_id, double home_position_rot) {
+  // Item 38: mechanism rotations; the device divides out its gearing.
+  for (std::size_t i = 0; i < motors_.size() && i < config_.motors.size(); ++i) {
+    if (config_.motors[i].id != motor_id) continue;
+    return motors_[i]->SetPosition(units::turn_t{home_position_rot}).IsOK();
+  }
+  return false;
+}
+
+hw::HealthSnapshot PhoenixBackend::GetHealth() {
+  // Item 39: the rail off the first motor's supply signal. Refreshed here, so
+  // poll at low rate, never on the Driver Station fast path.
+  hw::HealthSnapshot snapshot;
+  if (!motors_.empty()) {
+    auto& supply = motors_.front()->GetSupplyVoltage(true);
+    const double volts = supply.GetValue().value();
+    snapshot.supply_valid =
+        supply.GetStatus().IsOK() && std::isfinite(volts);
+    snapshot.supply_voltage_v = snapshot.supply_valid ? volts : 0.0;
+  }
+  return snapshot;
 }
 
 bool PhoenixBackend::Read(hw::State& s) {
@@ -216,12 +296,16 @@ bool PhoenixBackend::Read(hw::State& s) {
     out.velocity_rps = v.GetValue().value();
     out.position_age_us = Age(p);
     out.velocity_age_us = Age(v);
-    out.voltage = volts.GetValue().value();
-    out.stator_current_a = amps.GetValue().value();
-    out.valid = Fresh(p) && Fresh(v) && Fresh(volts) && Fresh(amps) &&
-                std::isfinite(out.position_rot) &&
-                std::isfinite(out.velocity_rps) && std::isfinite(out.voltage) &&
-                std::isfinite(out.stator_current_a);
+    // Item 37: stale current/voltage is telemetry-only degradation. The
+    // effort fields zero but the sample stays valid and the backend stays
+    // healthy; only lost motion feedback sinks the robot.
+    const bool effort_ok = Fresh(volts) && Fresh(amps) &&
+                           std::isfinite(volts.GetValue().value()) &&
+                           std::isfinite(amps.GetValue().value());
+    out.voltage = effort_ok ? volts.GetValue().value() : 0.0;
+    out.stator_current_a = effort_ok ? amps.GetValue().value() : 0.0;
+    out.valid = Fresh(p) && Fresh(v) && std::isfinite(out.position_rot) &&
+                std::isfinite(out.velocity_rps);
     healthy &= out.valid;
     if (!out.valid) {
       out.position_rot = 0;
@@ -274,12 +358,41 @@ bool PhoenixBackend::Read(hw::State& s) {
     out.valid = true;
     out.age_us = 0;
   }
-  for (std::size_t i = 0; i < encoders_.size(); ++i) {
+  for (std::size_t i = 0; i < rio_encoders_.size(); ++i) {
     auto& out = s.encoders[i];
-    out.position_rot = encoders_[i]->GetDistance();
-    out.velocity_rps = encoders_[i]->GetRate();
-    out.valid = true;
-    out.age_us = 0;
+    auto& dev = rio_encoders_[i];
+    if (dev.duty_cycle) {
+      const double pos = dev.duty_cycle->Get() - dev.config.offset_rot;
+      double vel = 0.0;
+      const auto now = std::chrono::steady_clock::now();
+      if (dev.last_time && now > *dev.last_time) {
+        const double dt =
+            std::chrono::duration<double>(now - *dev.last_time).count();
+        if (dt > 0.0) vel = (pos - dev.last_position_rot) / dt;
+      }
+      dev.last_position_rot = pos;
+      dev.last_time = now;
+      out.position_rot = pos;
+      out.velocity_rps = vel;
+      out.valid = dev.duty_cycle->IsConnected() &&
+                  std::isfinite(pos) && std::isfinite(vel);
+      out.age_us = 0;
+    } else {
+      const double pos =
+          dev.quadrature->GetDistance() - dev.config.offset_rot;
+      const double vel = dev.quadrature->GetRate();
+      out.position_rot = pos;
+      out.velocity_rps = vel;
+      out.valid = std::isfinite(pos) && std::isfinite(vel);
+      out.age_us = 0;
+    }
+    // Item 37: RIO encoders are auxiliary feedback (TalonFX loops use
+    // rotor/RemoteCANcoder), so an invalid encoder marks only its own sample:
+    // mechanism scope, never a whole-robot stop.
+    if (!out.valid) {
+      out.position_rot = 0;
+      out.velocity_rps = 0;
+    }
   }
   for (std::size_t i = 0; i < pwm_outputs_.size(); ++i) {
     auto& out = s.pwm_outputs[i];
@@ -382,26 +495,15 @@ void PhoenixBackend::UpdateSimulation(double dt) {
         m_cfg.rotor_to_sensor_ratio * m_cfg.sensor_to_mechanism_ratio;
     if (gear_ratio <= 0.0) gear_ratio = 1.0;
 
-    double volts = sim.GetMotorVoltage().value();
-    if (std::abs(volts) > 1e-3) {
-      // Kraken X60 free speed: 100 rps at 12V
-      double target_rotor_rps = (volts / 12.0) * 100.0;
-      double alpha = std::min(1.0, dt / 0.01);
-      sim_rotor_velocity_[i] +=
-          (target_rotor_rps - sim_rotor_velocity_[i]) * alpha;
-    } else if (last_commands_[i].mode == hw::Mode::kVelocity &&
-               std::abs(last_commands_[i].demand) > 1e-6) {
-      // Fallback if closed-loop gains are zero in slot0
-      double target_rotor_rps = last_commands_[i].demand * gear_ratio;
-      sim_rotor_velocity_[i] = target_rotor_rps;
-    } else if ((last_commands_[i].mode == hw::Mode::kPosition ||
-                last_commands_[i].mode == hw::Mode::kMotionMagic) &&
-               std::abs(last_commands_[i].demand) > 1e-6) {
-      sim_rotor_position_[i] = last_commands_[i].demand * gear_ratio;
-      sim_rotor_velocity_[i] = 0.0;
-    } else {
-      sim_rotor_velocity_[i] = 0.0;
-    }
+    // Voltage is the only driver (Kraken X60 free speed: 100 rps at 12 V).
+    // A closed-loop request with missing gains produces ~0 V, so the rotor
+    // coasts to a stop here instead of jumping to the requested demand. Never
+    // consult last_commands_ for physics: that shortcut hides bad tuning.
+    const double volts = sim.GetMotorVoltage().value();
+    const double target_rotor_rps = (volts / 12.0) * 100.0;
+    const double alpha = std::min(1.0, dt / 0.01);
+    sim_rotor_velocity_[i] +=
+        (target_rotor_rps - sim_rotor_velocity_[i]) * alpha;
 
     sim_rotor_position_[i] += sim_rotor_velocity_[i] * dt;
     sim.SetRotorVelocity(units::turns_per_second_t{sim_rotor_velocity_[i]});

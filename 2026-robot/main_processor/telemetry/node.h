@@ -1,172 +1,151 @@
 #pragma once
 
-#include <cmath>
+#include <chrono>
 #include <cstdint>
-#include <cstring>
-#include <numbers>
 #include <string>
 #include <vector>
 
-#include "2026-robot/main_processor/driver_station/driver_station_message_generated.h"
-#include "2026-robot/main_processor/driver_station/packet.h"
-#include "2026-robot/main_processor/drivetrain/drive_message_generated.h"
-#include "2026-robot/main_processor/odometry/odometry_message_generated.h"
-#include "2026-robot/main_processor/odometry/packet.h"
-#include "studio/schema/wire.h"
-#include "studio/schema/telemetry_generated.h"
-#include "talOS/driver_station/driver_station.h"
+#include "talOS/configuration/config_parser.h"
 #include "talOS/events/handles.h"
-#include "talOS/rtms/rtms.h"
+#include "talOS/process/node_main.h"
+#include "talos_nodes/intake/intake_message_generated.h"
+#include "talos_nodes/intake/packet.h"
+#include "talos_nodes/shooter/packet.h"
+#include "talos_nodes/shooter/shooter_message_generated.h"
+#include "talos_nodes/telemetry/node.h"
 
-// Publishes the robot's state as Studio telemetry frames. This is the only
-// producer on the Studio topic, which the bridge requires: that topic carries
-// DROP_NEWEST, so a full queue drops the newest frame instead of letting a
-// producer overwrite bytes the bridge is still sending. Never point the bridge
-// at a control-loop topic, which uses OVERWRITE_OLDEST.
-namespace talos::telemetry {
-
-// The reserved `talos` owner because this feed belongs to no subsystem, and
-// role `telemetry` because it is an observation feed: recording and display
-// only, never an input to a control path.
-inline constexpr const char* kStudioTopic = "/talos/telemetry";
-
-struct TelemetryConfig {
-  uint32_t period_us{10000};  // 100 Hz. Telemetry, not a control loop.
-  std::string topic{kStudioTopic};
-};
+// Year-local telemetry mechanism bindings for the 2026 game. Composes the
+// reusable platform core (talos-telemetry) for pose, chassis, and driver
+// station channels and adds the year's mechanism channels, which change each
+// season. The platform core owns the frame, the timer, and the Studio feed;
+// this wrapper owns one watcher per year mechanism topic and forwards display
+// values through the core's SetMechanismChannels, so a disabled robot or a
+// missing mechanism publisher simply leaves those channels out of the frame.
+namespace talos::telemetry::year2026 {
 
 template <typename Loop>
-class TelemetryNode {
+class YearTelemetryNode {
  public:
-  explicit TelemetryNode(Loop& loop, TelemetryConfig config = {})
-      : period_us_{config.period_us},
-        queue_{config.topic, studio::slot_bytes, 8, studio::slot_count,
-               RTMSOptions{OverflowPolicy::DROP_NEWEST, ReadMode::SEQUENCE,
-                           /*reclaim_mismatched_segment=*/true}} {
-    event::watch<odometry::OdometryState, &TelemetryNode::OnOdometry>(
-        loop, odometry::kOdometryTopic, this);
-    event::watch<talos::drive::DrivetrainState, &TelemetryNode::OnDrivetrain>(
-        loop, talos::drive::kDrivetrainStateTopic, this);
-    event::watch<driver_station::DriverStationState,
-                 &TelemetryNode::OnDriverStation>(
-        loop, driver_station::kDsStateTopic, this);
-    timer_ = event::make_timer<&TelemetryNode::Tick>(loop, "telemetry", this);
+  explicit YearTelemetryNode(Loop& loop, TelemetryConfig config = {})
+      : stale_timeout_us_{config.stale_timeout_us}, core_{loop, config} {
+    event::watch<talos::shooter::ShooterState, &YearTelemetryNode::OnShooter>(
+        loop, talos::shooter::kShooterStateTopic, this);
+    event::watch<talos::intake::IntakeState, &YearTelemetryNode::OnIntake>(
+        loop, talos::intake::kIntakeStateTopic, this);
   }
 
-  void Start(event::MonotonicTime first) {
-    timer_.setup_periodic(first, std::chrono::microseconds{period_us_});
-  }
+  void Start(event::MonotonicTime first) { core_.Start(first); }
 
-  uint64_t frames_published() const { return published_; }
-  uint64_t frames_dropped() const { return dropped_; }
-  uint64_t frames_rejected() const { return rejected_; }
+  uint64_t frames_published() const { return core_.frames_published(); }
+  uint64_t frames_dropped() const { return core_.frames_dropped(); }
+  uint64_t frames_rejected() const { return core_.frames_rejected(); }
 
  private:
-  void OnOdometry(const event::Context&, const odometry::OdometryState& state) {
-    odometry_ = state;
-    have_odometry_ = true;
-  }
-  void OnDrivetrain(const event::Context&,
-                    const talos::drive::DrivetrainState& state) {
-    drivetrain_ = state;
-    have_drivetrain_ = true;
-  }
-  void OnDriverStation(const event::Context&,
-                       const driver_station::DriverStationState& state) {
-    driver_station_ = state;
-    have_driver_station_ = true;
+  void OnShooter(const event::Context& context,
+                 const talos::shooter::ShooterState& state) {
+    shooter_ = state;
+    have_shooter_ = true;
+    last_shooter_ = context.now;
+    RefreshChannels(context.now);
   }
 
-  void Tick(const event::Context& context) {
-    // chassis is a required field, and Studio rejects a frame without it. No
-    // pose yet means nothing worth drawing, so publish nothing rather than
-    // put the origin on the field as though the robot were sitting there.
-    if (!have_odometry_) return;
+  void OnIntake(const event::Context& context,
+                const talos::intake::IntakeState& state) {
+    intake_ = state;
+    have_intake_ = true;
+    last_intake_ = context.now;
+    RefreshChannels(context.now);
+  }
 
-    const double yaw_rad = odometry_.yaw_rot() * 2.0 * std::numbers::pi;
-    if (!Finite({odometry_.x_m(), odometry_.y_m(), yaw_rad})) {
-      ++rejected_;
-      return;
+  // Human-readable intake inhibit reason for the `intake/inhibit` unit.
+  // The numeric value stays the wire code (talos::intake::kInhibit* in
+  // talos_nodes/intake/packet.h, append-only); the unit names it so Studio
+  // -- which renders each channel's unit next to its value -- reads
+  // "TARGET_STALE" instead of a bare 3.
+  static const char* InhibitReason(uint8_t inhibit) {
+    switch (inhibit) {
+      case talos::intake::kInhibitDrive:
+        return "DRIVE";
+      case talos::intake::kInhibitGateway:
+        return "GATEWAY_NOT_READY";
+      case talos::intake::kInhibitTargetDisabled:
+        return "TARGET_DISABLED";
+      case talos::intake::kInhibitTargetStale:
+        return "TARGET_STALE";
+      case talos::intake::kInhibitFeedbackInvalid:
+        return "FEEDBACK_INVALID";
+      case talos::intake::kInhibitDemandNonfinite:
+        return "DEMAND_NONFINITE";
+      default:
+        return "UNKNOWN";
     }
+  }
 
-    flatbuffers::FlatBufferBuilder builder;
-    std::vector<flatbuffers::Offset<Talos::Telemetry::Channel>> channels;
-    auto channel = [&](const char* name, double value, const char* unit) {
-      if (!std::isfinite(value)) return;
-      channels.push_back(
-          Talos::Telemetry::CreateChannel(builder, builder.CreateString(name),
-                                          value, builder.CreateString(unit)));
+  // One combined channel list: each mechanism contributes only after its
+  // first state arrives, so a missing publisher leaves its rows out rather
+  // than holding the whole frame. Each mechanism's rows are also dropped
+  // once that mechanism goes quiet past the staleness horizon, with a
+  // `<mechanism>/stale` marker left behind: re-evaluated on every mechanism
+  // message, so a dead shooter beside a live intake shows stale shooter
+  // rows instead of frozen shooter numbers, and a fully quiet wrapper ages
+  // out as one group in the core. Intake rows are the node's Studio view:
+  // requested speed (the demand acted on), measured speed (wheel feedback),
+  // and the inhibit code naming why the wheel is not driving.
+  void RefreshChannels(event::MonotonicTime now) {
+    const event::Duration timeout{std::chrono::microseconds{stale_timeout_us_}};
+    const auto fresh = [&](event::MonotonicTime last) {
+      return stale_timeout_us_ == 0 || (now - last) <= timeout;
     };
-
-    channel("odometry/vx", odometry_.vx_mps(), "m/s");
-    channel("odometry/vy", odometry_.vy_mps(), "m/s");
-    channel("odometry/omega", odometry_.omega_radps(), "rad/s");
-    channel("shooter/flywheel", odometry_.flywheel_rps(), "rev/s");
-    channel("shooter/beam_broken", odometry_.beam_broken() ? 1.0 : 0.0, "");
-    if (have_drivetrain_) {
-      channel("drivetrain/vx", drivetrain_.vx_mps(), "m/s");
-      channel("drivetrain/vy", drivetrain_.vy_mps(), "m/s");
-      channel("drivetrain/omega", drivetrain_.omega_radps(), "rad/s");
-      channel("drivetrain/yaw_rate", drivetrain_.yaw_rate_rps(), "rev/s");
-      channel("drivetrain/enabled", drivetrain_.enabled() ? 1.0 : 0.0, "");
+    std::vector<MechanismChannel> channels;
+    if (have_shooter_) {
+      const bool ok = fresh(last_shooter_);
+      if (ok) {
+        channels.push_back(
+            {"shooter/flywheel", shooter_.flywheel_velocity_rps(), "rev/s"});
+        channels.push_back(
+            {"shooter/beam_broken", shooter_.beam_broken() ? 1.0 : 0.0, ""});
+      }
+      channels.push_back({"shooter/stale", ok ? 0.0 : 1.0, ""});
     }
-    if (have_driver_station_) {
-      const uint32_t flags = driver_station_.fms().flags();
-      channel("ds/enabled", (flags & driver_station::kEnabled) ? 1.0 : 0.0, "");
-      channel("ds/teleop", (flags & driver_station::kTeleop) ? 1.0 : 0.0, "");
-      channel("ds/autonomous",
-              (flags & driver_station::kAutonomous) ? 1.0 : 0.0, "");
-      channel("ds/match_time",
-              static_cast<double>(driver_station_.fms().match_time_s()), "s");
+    if (have_intake_) {
+      const bool ok = fresh(last_intake_);
+      if (ok) {
+        channels.push_back(
+            {"intake/requested", intake_.requested_velocity_rps(), "rev/s"});
+        channels.push_back(
+            {"intake/measured", intake_.roller_velocity_rps(), "rev/s"});
+        channels.push_back({"intake/inhibit",
+                            static_cast<double>(intake_.inhibit()),
+                            InhibitReason(intake_.inhibit())});
+      }
+      channels.push_back({"intake/stale", ok ? 0.0 : 1.0, ""});
     }
-
-    const auto channel_vector = builder.CreateVector(channels);
-    const Talos::Telemetry::Pose chassis{
-        odometry_.x_m(), odometry_.y_m(), 0.0, 0.0, 0.0, yaw_rad};
-    const auto frame = Talos::Telemetry::CreateFrame(
-        builder, static_cast<uint64_t>(context.now.nanos()), sequence_,
-        &chassis, /*ghosts=*/0, channel_vector, /*targets=*/0,
-        /*elevator_m=*/0.0, /*arm_rad=*/0.0, /*camera=*/nullptr);
-    Talos::Telemetry::FinishFrameBuffer(builder, frame);
-
-    const auto size = builder.GetSize();
-    if (size > slot_.size() - 4) {
-      ++rejected_;
-      return;
-    }
-    for (unsigned i = 0; i < 4; ++i)
-      slot_[i] = std::byte((size >> (8 * i)) & 255);
-    std::memcpy(slot_.data() + 4, builder.GetBufferPointer(), size);
-
-    // A full queue means the bridge is behind. Telemetry is droppable by
-    // design; the sequence id still advances so the gap is visible downstream.
-    if (WriteResult(queue_.write({slot_.size(), slot_.data()})) ==
-        WriteResult::SUCCESS) {
-      ++published_;
-    } else {
-      ++dropped_;
-    }
-    ++sequence_;
+    core_.SetMechanismChannels(std::move(channels));
   }
 
-  static bool Finite(std::initializer_list<double> values) {
-    for (double value : values)
-      if (!std::isfinite(value)) return false;
-    return true;
-  }
+  talos::shooter::ShooterState shooter_{};
+  talos::intake::IntakeState intake_{};
+  bool have_shooter_ = false;
+  bool have_intake_ = false;
+  event::MonotonicTime last_shooter_{}, last_intake_{};
+  uint64_t stale_timeout_us_;
 
-  uint32_t period_us_;
-  RTMSQueue queue_;
-  std::array<std::byte, studio::slot_bytes> slot_{};
-
-  odometry::OdometryState odometry_{};
-  talos::drive::DrivetrainState drivetrain_{};
-  driver_station::DriverStationState driver_station_{};
-  bool have_odometry_{false}, have_drivetrain_{false},
-      have_driver_station_{false};
-
-  uint64_t sequence_{0}, published_{0}, dropped_{0}, rejected_{0};
-  event::Timer<Loop> timer_;
+  TelemetryNode<Loop> core_;
 };
 
-}  // namespace talos::telemetry
+// Factory for the year node: period and topic come from the telemetry
+// subsystem table, with the core's compiled defaults as fallback. Shooter
+// channels need no tuning.
+inline auto CreateNode(auto& loop, const talos::process::NodeFlags& flags) {
+  const auto robot_config = talos::config::ParseRobotConfig(flags.config_path);
+  TelemetryConfig config{};
+  if (const auto* tbl = robot_config.GetSubsystemTable("telemetry")) {
+    config.period_us = (*tbl)["period_us"].value_or(config.period_us);
+    config.topic = (*tbl)["topic"].value_or(config.topic);
+    config.stale_timeout_us =
+        (*tbl)["stale_timeout_us"].value_or(config.stale_timeout_us);
+  }
+  return YearTelemetryNode{loop, config};
+}
+
+}  // namespace talos::telemetry::year2026

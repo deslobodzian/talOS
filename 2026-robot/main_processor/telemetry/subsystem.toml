@@ -1,9 +1,8 @@
-# Publishes Studio telemetry frames on `topic`, which must stay
-# /talos/telemetry: the reserved `talos` owner because the feed belongs to no
-# subsystem, and role `telemetry` because it is for recording and display only.
-# It is the only producer there, which the Studio bridge requires: that topic
-# uses DROP_NEWEST so a full queue drops a frame instead of overwriting bytes
-# the bridge is still sending.
+# 2026-game telemetry mechanism channels: shooter state plus the intake
+# Studio view (requested speed, measured speed, inhibit reason) forwarded
+# into the platform core's Studio frame. Pose/chassis/driver-station
+# channels and the feed topic live in the platform core (talos-telemetry/);
+# game logic lives here, not in the telemetry core.
 [subsystem]
 name = "telemetry"
 node = "//2026-robot/main_processor/telemetry:node"

@@ -1,0 +1,25 @@
+# Shooter subsystem. Parsed via the [[subsystems]] manifest in
+# 2026-robot/main_processor/configuration/robot.toml and merged with the other
+# subsystem files into one canonical view before validation.
+[subsystem]
+name = "shooter"
+node = "//2026-robot/main_processor/shooter:node"
+period_us = 5000
+
+[motors.flywheel]
+type = "TalonFX"
+bus = "rio"
+can_id = 9
+inverted = false
+brake = false
+supply_limit_a = 40.0
+stator_limit_a = 80.0
+max_voltage = 12.0
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 100.0
+cruise_velocity_rps = 80.0
+acceleration_rps2 = 160.0
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
+
+[digital_inputs.beam_break]
+dio = 0

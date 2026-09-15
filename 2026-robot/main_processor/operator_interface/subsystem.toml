@@ -1,6 +1,6 @@
-# What the driver's inputs mean: scaling, deadband and button bindings. This is
-# game logic and is expected to change through a season, which is why it is not
-# in the driver_station node.
+# 2026-game teleop mechanism bindings: button masks and setpoints. Chassis
+# scaling/deadband/field-oriented keys are shared with the platform core and
+# parsed by both the core and this wrapper from the same table.
 [subsystem]
 name = "operator_interface"
 node = "//2026-robot/main_processor/operator_interface:node"

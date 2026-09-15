@@ -1,0 +1,38 @@
+# Flywheel spin-up subsystem. Closed-loop velocity for one shooter wheel.
+#
+# STUDENT NOTE -- where the flywheel's behavior lives:
+#   cruise ask ..................... example_flywheel/flywheel_example.py
+#   velocity -> command bytes ...... flywheel_example.encode_velocity
+#   gains + limits (below) ......... this file ([motors.flywheel])
+# The node asks for mechanism rev/s and the Talon's onboard PID (slot 0)
+# closes the loop at 1 kHz, so these gains decide whether cruise is real.
+[subsystem]
+name = "flywheel_spinup"
+node = "//2026-robot/main_processor/example_flywheel:flywheel_example"
+period_us = 5000
+
+[motors.flywheel]
+type = "TalonFX"
+bus = "rio"
+can_id = 9
+# Direction: flip `inverted` if positive demand spins the wheel backwards.
+inverted = false
+# A flywheel must coast down, never brake-stop: braking a spinning wheel
+# browns out the bus for no reason.
+brake = false
+# Current limits (amps): spin-up that trips these never reaches cruise --
+# fix the limits/gains, never just raise the timeout.
+supply_limit_a = 40.0
+stator_limit_a = 80.0
+max_voltage = 12.0
+# Direct drive (compare the 25:1 ratio in ../example_position).
+sensor_to_mechanism_ratio = 1.0
+# max_velocity_rps clamps every velocity demand (sign kept); cruise and
+# the ramp rate below must both fit under it.
+max_velocity_rps = 100.0
+cruise_velocity_rps = 80.0
+acceleration_rps2 = 160.0
+# TUNED velocity loop (slot 0, selected by SLOT in the example): v holds
+# steady-state speed under load, p trims the step lag. Tune v first until
+# measured ~= requested, then a touch of p; back p off at oscillation.
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }

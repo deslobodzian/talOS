@@ -35,14 +35,16 @@ cc_test(
 cc_binary(
     name = "studio_mock",
     srcs = ["mock.cc"],
-    deps = ["//studio/schema:wire", "//talOS/rtms:rtms", "//studio/schema:telemetry_cc", "@flatbuffers//:flatbuffers"],
+    deps = ["@studio_schema//:wire", "//talOS/rtms:rtms", "@studio_schema//:schema", "@flatbuffers//:flatbuffers"],
 )
 cc_binary(
     name = "studio_bridge",
     srcs = ["main.cc"],
     deps = [
         ":system",
-        "//studio/schema:wire",
+        "@studio_schema//:wire",
+        "//talOS/configuration:configuration",
+        "//talOS/introspection:describe",
         "//talOS/introspection:registry",
         "//talOS/rtms:rtms",
         "@studio_uws//:uws",
@@ -54,4 +56,14 @@ py_test(
     srcs = ["integration_test.py"],
     data = [":studio_bridge", ":studio_mock"],
     tags = ["local"],
+)
+
+# --describe answers with no ports, shm, or robot, so this stays hermetic.
+py_test(
+    name = "describe_test",
+    srcs = ["describe_test.py"],
+    data = [
+        ":studio_bridge",
+        "testdata/robot.toml",
+    ],
 )

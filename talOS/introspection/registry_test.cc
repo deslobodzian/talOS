@@ -124,6 +124,46 @@ TEST_F(Registry, ReaderReportsNothingBeforeAnyNodeStarts) {
   EXPECT_FALSE(RegistryReader::open(temp_registry("none")).has_value());
 }
 
+TEST_F(Registry, ANewClaimSweepsSlotsLeftBehindByACrashedNode) {
+  // A node that died without releasing (SIGKILL, crash) leaves an ACTIVE
+  // slot whose heartbeat ages out. The next session's first claim must sweep
+  // it, or the viewer reports it as "stopped heartbeating" forever.
+  auto ghost = std::make_unique<NodeRegistration>(
+      NodeRegistration::Identity{.name = "intake", .session_id = 777}, path_);
+  ghost->publish(sample_manifest());
+
+  // Age the ghost past the liveness timeout without releasing its slot.
+  const std::int64_t timeout_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
+          .count();
+  RegistryMapping mapping{path_};
+  mapping.header()->nodes[ghost->slot()].heartbeat_wall_ns.store(
+      wall_now_ns() - timeout_ns - 1, std::memory_order_relaxed);
+
+  {
+    auto stale = RegistryReader::open(path_);
+    ASSERT_TRUE(stale.has_value());
+    ASSERT_EQ(stale->nodes().size(), 1u);
+    EXPECT_FALSE(stale->nodes().front().alive);
+  }
+
+  NodeRegistration newcomer({.name = "intake", .session_id = 1788}, path_);
+  newcomer.publish(sample_manifest());
+
+  auto view = RegistryReader::open(path_);
+  ASSERT_TRUE(view.has_value());
+  const auto nodes = view->nodes();
+  ASSERT_EQ(nodes.size(), 1u);
+  EXPECT_EQ(nodes.front().session_id, 1788u);
+  EXPECT_TRUE(nodes.front().alive);
+
+  // Destroying the swept owner must not yank the new owner's row.
+  ghost.reset();
+  const auto after = view->nodes();
+  ASSERT_EQ(after.size(), 1u);
+  EXPECT_EQ(after.front().session_id, 1788u);
+}
+
 TEST_F(Registry, SourcesBeyondCapacityAreCountedButNotStored) {
   event::Manifest manifest;
   for (std::size_t i = 0; i < kMaxSourcesPerNode + 5; ++i) {

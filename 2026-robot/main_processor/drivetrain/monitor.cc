@@ -16,9 +16,9 @@
 #include <string>
 #include <thread>
 
-#include "2026-robot/main_processor/drivetrain/drive_message_generated.h"
-#include "2026-robot/main_processor/drivetrain/geometry.h"
-#include "2026-robot/main_processor/drivetrain/packet.h"
+#include "talos_nodes/drivetrain/drive_message_generated.h"
+#include "talos_nodes/drivetrain/geometry.h"
+#include "talos_nodes/drivetrain/packet.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/ipc/subscriber.h"
 #include "talOS/process/process.h"

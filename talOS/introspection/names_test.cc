@@ -460,6 +460,33 @@ TEST(LintGraph, TimerLabelsAreNotTopics) {
         << label << " would pass as a topic, so this test proves nothing";
 }
 
+// Contract compatibility is enforced on byte size: two ends that disagree on
+// the size of one topic cannot be wire-compatible, so the linter rejects the
+// graph before launch. A size match is not a compatibility proof -- a schema
+// can change without changing size -- which is why provenance records contract
+// labels without trusting them.
+TEST(LintGraph, TwoSizesOnOneTopicIsAnErrorAndBothEndsAreNamed) {
+  const std::vector<NodeShape> nodes = {
+      {"shooter",
+       "//2026-robot/main_processor/shooter:node",
+       {Sender("/shooter/state", 24)}},
+      {"odometry",
+       "//2026-robot/main_processor/odometry:node",
+       {Watcher("/shooter/state", 32)}},
+  };
+  const auto diagnostics = LintGraph(nodes);
+  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/state",
+                       "two message sizes"))
+      << Describe(diagnostics);
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/state",
+                       "shooter"))
+      << Describe(diagnostics);
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/state",
+                       "odometry"))
+      << Describe(diagnostics);
+}
+
 TEST(LintGraph, UnreadTopicIsAWarningNotAnError) {
   const std::vector<NodeShape> nodes = {
       {"telemetry",

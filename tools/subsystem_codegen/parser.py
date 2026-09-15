@@ -27,7 +27,10 @@ canbus->bus, id->can_id accepted) and share the robot-wide exclusivity rule:
 no two devices on one (bus, can_id).
 """
 import re
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 from pathlib import Path
 
 from model import Device, Subsystem

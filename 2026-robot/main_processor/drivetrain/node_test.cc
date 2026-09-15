@@ -1,16 +1,21 @@
-#include "2026-robot/main_processor/drivetrain/node.h"
+#include "talos_nodes/drivetrain/node.h"
 
 #include <gtest/gtest.h>
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <stdexcept>
+
+#include "rules_cc/cc/runfiles/runfiles.h"
 #include <filesystem>
 #include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
 
-#include "2026-robot/main_processor/drivetrain/geometry.h"
+#include "talos_nodes/drivetrain/geometry.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
@@ -22,9 +27,20 @@ namespace talos::drive {
 namespace {
 using namespace std::chrono_literals;
 
+std::string TestConfigPath() {
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(
+          BAZEL_CURRENT_REPOSITORY, &error));
+  const char* location = std::getenv("TALOS_TEST_CONFIG");
+  if (!runfiles || !location) {
+    throw std::runtime_error("test config runfiles unavailable: " + error);
+  }
+  return runfiles->Rlocation(location);
+}
+
 config::RobotConfig TestRobotConfig() {
-  auto cfg = config::ParseRobotConfig(
-      "2026-robot/main_processor/configuration/robot.toml");
+  auto cfg = config::ParseRobotConfig(TestConfigPath());
   cfg.hardware.commissioned = true;
   return cfg;
 }
@@ -125,8 +141,8 @@ std::string WriteConfigWithExtraSubsystem(const char* subsystem_name) {
   std::filesystem::create_directories(dir, ec);
   EXPECT_FALSE(ec);
 
-  const std::string src_cfg = "2026-robot/main_processor/configuration";
-  std::string toml = ReadTestFile(src_cfg + "/robot.toml");
+  const auto src_cfg = std::filesystem::path(TestConfigPath()).parent_path();
+  std::string toml = ReadTestFile(TestConfigPath());
 
   toml::table manifest_tbl;
   try {
@@ -154,17 +170,8 @@ std::string WriteConfigWithExtraSubsystem(const char* subsystem_name) {
     }
     const std::string name(*name_view);
     const std::string rel(*rel_view);
-    if (rel.rfind("../", 0) != 0) {
-      ADD_FAILURE() << "manifest path is not tree-relative: " << rel;
-      return "";
-    }
-    // Source by subsystem name, not by the manifest's ../-relative path: the
-    // sandbox matches literal paths, so .. segments deny an otherwise allowed
-    // open. The parser still resolves the manifest's own rel path, which is
-    // what this test exercises.
     const std::string dst = dir + "/" + name + ".toml";
-    WriteTestFile(dst,
-                  ReadTestFile("2026-robot/main_processor/" + name + "/subsystem.toml"));
+    WriteTestFile(dst, ReadTestFile((src_cfg / rel).string()));
     const std::string needle = "path = \"" + rel + "\"";
     const auto pos = toml.find(needle);
     if (pos == std::string::npos) {

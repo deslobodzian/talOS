@@ -1,0 +1,21 @@
+{
+  "generator": "tools/delivery/gen_goldens.py",
+  "bindings": "2026-robot/main_processor/drivetrain/talos/drive/*.py (flatc output, checked in)",
+  "schema": "talos-chassis_contracts/drive_message.fbs",
+  "chassis_target": {
+    "vx_mps": 1.5,
+    "vy_mps": -0.5,
+    "omega_radps": 3.141592653589793,
+    "issued_ns": 123456789,
+    "enabled": true
+  },
+  "drivetrain_state": {
+    "timestamp_ns": 987654321,
+    "enabled": true,
+    "vx_mps": 2.0,
+    "vy_mps": -1.0,
+    "omega_radps": 0.5,
+    "yaw_rot": 1.25,
+    "yaw_rate_rps": -0.2
+  }
+}

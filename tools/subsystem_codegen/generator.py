@@ -70,6 +70,8 @@ def render_packet_h(subsystem: Subsystem) -> str:
     return (
         "#pragma once\n"
         "\n"
+        '#include <string>\n'
+        "\n"
         '#include "talOS/hardware/packet.h"\n'
         "\n"
         f"namespace talos::{name} {{\n"
@@ -81,9 +83,10 @@ def render_packet_h(subsystem: Subsystem) -> str:
         f'inline constexpr const char* kTargetTopic = "/{name}/target";\n'
         f'inline constexpr const char* kTeleopTargetTopic = "/{name}/target/teleop";\n'
         f'inline constexpr const char* kAutoTargetTopic = "/{name}/target/auto";\n'
-        f"// hardware::kRequestTopicPrefix followed by the `[subsystems.{name}]` key,\n"
-        "// which is how the bridge spells its end of the same topic.\n"
-        f'inline constexpr const char* kRequestTopic = "/hw/request/{name}";\n'
+        "// Spelled once, behind hardware::RequestTopic: the bridge derives the same\n"
+        f"// string from the `[subsystems.{name}]` key in the config.\n"
+        "inline const std::string kRequestTopic =\n"
+        f'    hardware::RequestTopic("{name}");\n'
         f"}}  // namespace talos::{name}\n"
     )
 
@@ -122,12 +125,14 @@ def render_node_h(subsystem: Subsystem) -> str:
         "#include <chrono>\n"
         "#include <cmath>\n"
         "#include <cstdint>\n"
+        "#include <span>\n"
         "#include <utility>\n"
         "\n"
-        '#include "talOS/hardware/messages.h"\n'
         '#include "talOS/events/handles.h"\n'
-        f'#include "{pkg}/packet.h"\n'
-        f'#include "{pkg}/{name}_message_generated.h"\n'
+        '#include "talOS/hardware/gate.h"\n'
+        '#include "talOS/hardware/messages.h"\n'
+        f'#include "talos_nodes/{name}/packet.h"\n'
+        f'#include "talos_nodes/{name}/{name}_message_generated.h"\n'
         "\n"
         f"namespace talos::{name} {{\n"
         "\n"
@@ -170,11 +175,8 @@ def render_node_h(subsystem: Subsystem) -> str:
         "  void OnState(const event::Context& context, const Packet& packet) {\n"
         "    hardware::State state;\n"
         "    if (!hardware::Decode(packet.bytes(), state)) return;\n"
-        "    if (config_id_ != 0 && state.config_id != config_id_) return;\n"
-        "    if (have_state_ && state.boot_id == state_.boot_id &&\n"
-        "        state.sample_time_us <= state_.sample_time_us) {\n"
+        "    if (!hardware::AcceptState(have_state_, state_, config_id_, state))\n"
         "      return;\n"
-        "    }\n"
         "    state_ = state;\n"
         "    state_received_ = context.now;\n"
         "    have_state_ = true;\n"
@@ -190,35 +192,24 @@ def render_node_h(subsystem: Subsystem) -> str:
         "    const auto timeout = std::chrono::microseconds{config_.command_timeout_us};\n"
         "    const auto issued = event::MonotonicTime::from_nanos(target_.issued_ns());\n"
         "\n"
-        "    const bool gateway_ok =\n"
-        "        (state_.flags & (hardware::kConfigured | hardware::kEnabled)) ==\n"
-        "            (hardware::kConfigured | hardware::kEnabled) &&\n"
-        "        !(state_.flags & hardware::kHardwareFault);\n"
+        "    const bool gateway_ok = hardware::GatewayReady(state_);\n"
         "\n"
-        "    const bool target_fresh = target_.enabled() && issued <= context.now &&\n"
-        "                              context.now - issued < timeout &&\n"
-        "                              context.now - state_received_ < timeout;\n"
+        "    const bool target_fresh = hardware::TargetFresh(\n"
+        "        context.now, issued, target_.enabled(), state_received_, timeout);\n"
         "\n"
         "    double leader_velocity_rps = 0.0;\n"
         "    bool leader_sample_valid = false;\n"
-        "    for (std::size_t i = 0; i < state_.motor_count; ++i) {\n"
-        "      if (state_.motors[i].id == leader_id_) {\n"
-        "        leader_sample_valid = state_.motors[i].valid;\n"
-        "        leader_velocity_rps = state_.motors[i].velocity_rps;\n"
-        "        break;\n"
-        "      }\n"
+        "    if (const hardware::MotorSample* sample =\n"
+        "            hardware::FindMotor(state_, leader_id_)) {\n"
+        "      leader_sample_valid = sample->valid;\n"
+        "      leader_velocity_rps = sample->velocity_rps;\n"
         "    }\n"
         "\n"
         "    const bool valid = gateway_ok && target_fresh && leader_sample_valid &&\n"
         "                       std::isfinite(target_.target_velocity_rps());\n"
         "\n"
-        "    hardware::Command command;\n"
-        "    command.config_id = state_.config_id;\n"
-        "    command.boot_id = state_.boot_id;\n"
-        "    command.epoch = state_.epoch;\n"
-        "    command.observed_time_us = state_.sample_time_us;\n"
-        "    command.count = 1;\n"
-        "    command.motors[0].id = leader_id_;\n"
+        "    hardware::Command command = hardware::NeutralCommand(\n"
+        "        state_, std::span<const uint16_t>(&leader_id_, 1));\n"
         "    command.motors[0].slot = 0;\n"
         "    if (valid) {\n"
         "      command.motors[0].mode = hardware::Mode::kVelocity;\n"
@@ -271,142 +262,24 @@ def render_node_h(subsystem: Subsystem) -> str:
 def render_main_cc(subsystem: Subsystem) -> str:
     name = subsystem.name
     cls = class_name(name)
-    pkg = package_dir(subsystem)
     return (
-        "#include <cstdio>\n"
-        "#include <stdexcept>\n"
-        "#include <string>\n"
-        "#include <thread>\n"
-        "\n"
-        f'#include "{pkg}/node.h"\n'
-        '#include "talOS/configuration/config_parser.h"\n'
-        '#include "talOS/events/log/log_reader.h"\n'
-        '#include "talOS/events/log/log_writer.h"\n'
-        '#include "talOS/events/realtime_event_loop.h"\n'
-        '#include "talOS/events/replay_event_loop.h"\n'
-        '#include "talOS/events/simulated_event_loop.h"\n'
-        '#include "talOS/introspection/describe.h"\n'
-        '#include "talOS/introspection/reporter.h"\n'
-        '#include "talOS/process/process.h"\n'
+        f'#include "talos_nodes/{name}/node.h"\n'
+        '#include "talOS/process/hardware_main.h"\n'
         "\n"
         "namespace {\n"
-        "// This node's identity, written once. `--describe` and the live registry row\n"
-        "// have to name the same node and the same build target, or a viewer cannot tell\n"
-        "// a graph that changed from a graph it is reading two different names for.\n"
+        "// Identity: the registry row and --describe name the same node and\n"
+        "// target; log identity derives from the name (NodeSpec).\n"
         f'constexpr const char* kNodeName = "{name}";\n'
         f'constexpr const char* kNodeTarget = "{subsystem.node_target}";\n'
         "}  // namespace\n"
         "\n"
         "int main(int argc, char** argv) {\n"
-        "  try {\n"
-        "    bool simulation = false;\n"
-        "    bool describe = false;\n"
-        f'    std::string log_path = "/tmp/{name}.tlog", replay_path;\n'
-        "    std::string config_path =\n"
-        '        "2026-robot/main_processor/configuration/robot.toml";\n'
-        "    int duration_s = 0;\n"
-        "    uint64_t session_id = 0;\n"
-        "    for (int i = 1; i < argc; ++i) {\n"
-        "      const std::string arg = argv[i];\n"
-        '      if (arg == "--sim")\n'
-        "        simulation = true;\n"
-        '      else if (arg == "--describe")\n'
-        "        describe = true;\n"
-        '      else if (arg == "--log" && i + 1 < argc)\n'
-        "        log_path = argv[++i];\n"
-        '      else if (arg == "--session-id" && i + 1 < argc)\n'
-        "        session_id = std::stoull(argv[++i]);\n"
-        '      else if (arg == "--config" && i + 1 < argc)\n'
-        "        config_path = argv[++i];\n"
-        '      else if (arg == "--replay" && i + 1 < argc)\n'
-        "        replay_path = argv[++i];\n"
-        '      else if (arg == "--duration-s" && i + 1 < argc)\n'
-        "        duration_s = std::stoi(argv[++i]);\n"
-        "      else\n"
-        "        throw std::invalid_argument(\n"
-        '            "usage: node [--sim] [--describe] [--duration-s N] [--log PATH] "\n'
-        '            "[--session-id ID] [--config PATH] [--replay PATH]");\n'
-        "    }\n"
-        "    if (duration_s < 0)\n"
-        '      throw std::invalid_argument("duration must be nonnegative");\n'
-        "    auto robot_config = talos::config::ParseRobotConfig(config_path);\n"
-        "    if (simulation) {\n"
-        "      robot_config.hardware.commissioned = true;\n"
-        "    }\n"
-        f'    const auto* dev_ptr = robot_config.GetDevices("{name}");\n'
-        "    talos::hardware::Devices devices =\n"
-        "        dev_ptr ? *dev_ptr : talos::hardware::Devices{};\n"
-        "    auto config = robot_config.hardware;\n"
-        "    // --describe builds the node for real and prints what its constructor\n"
-        "    // registered. The loop is the only difference: a simulated loop's channels\n"
-        "    // live in this process, so no shared memory, no hardware and no network is\n"
-        "    // touched, and the launcher can ask what a node is without starting a\n"
-        "    // robot. Describing from the same constructor is the point -- a topology\n"
-        "    // written down a second time is a topology to forget to update.\n"
-        "    if (describe) {\n"
-        "      talos::event::SimulationEnvironment environment;\n"
-        "      talos::event::SimulatedEventLoop<> loop{environment};\n"
-        f"      talos::{name}::{cls}Node node{{loop, config, devices}};\n"
-        '      std::printf("%s", talos::introspect::DescribeToJson(\n'
-        "                            talos::introspect::DescribeManifest(\n"
-        "                                kNodeName, kNodeTarget, loop.manifest()))\n"
-        "                            .c_str());\n"
-        "      return 0;\n"
-        "    }\n"
-        "    if (!replay_path.empty()) {\n"
-        "      talos::event::log::LogReader reader{replay_path};\n"
-        "      talos::event::ReplayEventLoop<> loop{reader};\n"
-        f"      talos::{name}::{cls}Node node{{loop, config, devices}};\n"
-        "      node.Start(loop.monotonic_now() +\n"
-        "                 std::chrono::microseconds{config.period_us});\n"
-        "      loop.run();\n"
-        '      std::printf("replay: diverged=%d clean_exit=%d\\n", loop.diverged(),\n'
-        "                  loop.reached_exit());\n"
-        "      return loop.diverged() || !loop.reached_exit() ? 1 : 0;\n"
-        "    }\n"
-        "    talos::event::RealtimeEventLoop<talos::event::log::LogWriter> loop{\n"
-        f'        talos::event::log::LogWriter{{log_path, "{name}",\n'
-        "                                     talos::event::log::LogWriterOptions{},\n"
-        "                                     session_id}}};\n"
-        f"    talos::{name}::{cls}Node node{{loop, config, devices}};\n"
-        "    node.Start(loop.monotonic_now() +\n"
-        "               std::chrono::microseconds{config.period_us});\n"
-        "    talos::process::InstallStopHandlers();\n"
-        "    // Publishes this node's topics and activity into the live registry, so\n"
-        "    // Studio and any agent can see what is running without being told.\n"
-        "    // Declared after the loop: reverse destruction order joins its thread\n"
-        "    // before the counters it samples are destroyed.\n"
-        "    talos::introspect::Reporter reporter{loop,\n"
-        "                                         {.name = kNodeName,\n"
-        "                                          .target = kNodeTarget,\n"
-        "                                          .session_id = session_id,\n"
-        "                                          .simulation = simulation}};\n"
-        "    std::jthread stopper{[&](std::stop_token stop) {\n"
-        "      while (!stop.stop_requested()) {\n"
-        "        if (talos::process::stop_requested.load() && loop.running()) {\n"
-        "          loop.exit();\n"
-        "          return;\n"
-        "        }\n"
-        "        std::this_thread::sleep_for(std::chrono::milliseconds{20});\n"
-        "      }\n"
-        "    }};\n"
-        "    if (duration_s)\n"
-        "      loop.run_for(std::chrono::seconds{duration_s});\n"
-        "    else\n"
-        "      loop.run();\n"
-        "    stopper.request_stop();\n"
-        f'    std::printf("{name}: dispatches=%llu recording_failed=%d\\n",\n'
-        "                static_cast<unsigned long long>(loop.dispatch_count()),\n"
-        "                loop.recorder().failed());\n"
-        "    if (loop.recorder().failed()) {\n"
-        '      std::fprintf(stderr, "%s\\n", loop.recorder().error().c_str());\n'
-        "      return 1;\n"
-        "    }\n"
-        "    return 0;\n"
-        "  } catch (const std::exception& e) {\n"
-        '    std::fprintf(stderr, "%s\\n", e.what());\n'
-        "    return 1;\n"
-        "  }\n"
+        "  return talos::process::RunHardwareNode(\n"
+        "      argc, argv, kNodeName, kNodeTarget,\n"
+        "      [&](auto& loop, const talos::process::HardwareSubsystem& sub,\n"
+        "          bool /*simulation*/) {\n"
+        f"        return talos::{name}::{cls}Node{{loop, sub.robot.hardware, sub.devices}};\n"
+        "      });\n"
         "}\n"
     )
 
@@ -414,12 +287,17 @@ def render_main_cc(subsystem: Subsystem) -> str:
 def render_node_test_cc(subsystem: Subsystem) -> str:
     name = subsystem.name
     cls = class_name(name)
-    pkg = package_dir(subsystem)
     return (
-        f'#include "{pkg}/node.h"\n'
+        f'#include "talos_nodes/{name}/node.h"\n'
         "\n"
         "#include <gtest/gtest.h>\n"
         "\n"
+        "#include <cstdlib>\n"
+        "#include <memory>\n"
+        "#include <stdexcept>\n"
+        "#include <string>\n"
+        "\n"
+        '#include "rules_cc/cc/runfiles/runfiles.h"\n'
         '#include "talOS/configuration/config_parser.h"\n'
         '#include "talOS/events/simulated_event_loop.h"\n'
         '#include "talOS/hardware/sim_backend.h"\n'
@@ -428,9 +306,20 @@ def render_node_test_cc(subsystem: Subsystem) -> str:
         "namespace {\n"
         "using namespace std::chrono_literals;\n"
         "\n"
+        "std::string TestConfigPath() {\n"
+        "  std::string error;\n"
+        "  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(\n"
+        "      rules_cc::cc::runfiles::Runfiles::CreateForTest(\n"
+        "          BAZEL_CURRENT_REPOSITORY, &error));\n"
+        '  const char* location = std::getenv("TALOS_TEST_CONFIG");\n'
+        "  if (!runfiles || !location) {\n"
+        '    throw std::runtime_error("test config runfiles unavailable: " + error);\n'
+        "  }\n"
+        "  return runfiles->Rlocation(location);\n"
+        "}\n"
+        "\n"
         "config::RobotConfig TestRobotConfig() {\n"
-        "  auto cfg = config::ParseRobotConfig(\n"
-        '      "2026-robot/main_processor/configuration/robot.toml");\n'
+        "  auto cfg = config::ParseRobotConfig(TestConfigPath());\n"
         "  cfg.hardware.commissioned = true;\n"
         "  return cfg;\n"
         "}\n"
@@ -460,6 +349,8 @@ def render_build(subsystem: Subsystem) -> str:
         'load("@rules_cc//cc:cc_test.bzl", "cc_test")\n'
         'load("@flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")\n'
         "\n"
+        'exports_files(["subsystem.toml"])\n'
+        "\n"
         "flatbuffer_cc_library(\n"
         f'    name = "{name}_message",\n'
         f'    srcs = ["{name}_message.fbs"],\n'
@@ -467,29 +358,40 @@ def render_build(subsystem: Subsystem) -> str:
         ")\n"
         "\n"
         "cc_library(\n"
-        f'    name = "{name}",\n'
-        '    hdrs = ["packet.h", "node.h"],\n'
-        "    deps = [\n"
+        '    name = "messages_cc",\n'
+        f'    hdrs = ["packet.h", ":{name}_message_srcs"],\n'
+        '    strip_include_prefix = ".",\n'
+        f'    include_prefix = "talos_nodes/{name}",\n'
+        '    visibility = ["//visibility:public"],\n'
+        '    deps = [\n'
         f'        ":{name}_message",\n'
         '        "//talOS/hardware:hardware",\n'
+        '    ],\n'
+        ")\n"
+        "\n"
+        "cc_library(\n"
+        f'    name = "{name}",\n'
+        '    hdrs = ["node.h"],\n'
+        '    strip_include_prefix = ".",\n'
+        f'    include_prefix = "talos_nodes/{name}",\n'
+        '    deps = [\n'
+        '        ":messages_cc",\n'
+        '        "//talOS/hardware:hardware",\n'
+        '        "//talOS/hardware:gate",\n'
+        '        "//talOS/protocol:protocol",\n'
         '        "//talOS/configuration:configuration",\n'
         '        "//talOS/events:events",\n'
-        "    ],\n"
-        '    visibility = ["//visibility:public"],\n'
+        '    ],\n'
+        '    visibility = ["//visibility:private"],\n'
         ")\n"
         "\n"
         "cc_binary(\n"
         '    name = "node",\n'
         '    srcs = ["main.cc"],\n'
-        "    deps = [\n"
+        '    deps = [\n'
         f'        ":{name}",\n'
-        '        "//talOS/configuration:configuration",\n'
-        '        "//talOS/events:events",\n'
-        '        "//talOS/introspection:describe",\n'
-        '        "//talOS/introspection:names",\n'
-        '        "//talOS/introspection:reporter",\n'
-        '        "//talOS/process:process",\n'
-        "    ],\n"
+        '        "//talOS/process:hardware_main",\n'
+        '    ],\n'
         '    visibility = ["//visibility:public"],\n'
         ")\n"
         "\n"
@@ -497,12 +399,31 @@ def render_build(subsystem: Subsystem) -> str:
         '    name = "node_test",\n'
         '    size = "small",\n'
         '    srcs = ["node_test.cc"],\n'
-        '    data = ["//2026-robot/main_processor/configuration:robot.toml"],\n'
-        "    deps = [\n"
+        f'    data = ["testdata/robot.toml", "testdata/{name}.toml"],\n'
+        '    env = {{"TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)"}},\n'
+        '    deps = [\n'
         f'        ":{name}",\n'
         '        "@googletest//:gtest_main",\n'
-        "    ],\n"
+        '        "@rules_cc//cc/runfiles",\n'
+        '    ],\n'
         ")\n"
+    )
+
+
+def render_test_robot_toml(subsystem: Subsystem) -> str:
+    name = subsystem.name
+    return (
+        f"# Local test fixture for {name}.\n"
+        "[robot]\n"
+        f'name = "{name}_test"\n'
+        f"period_us = {subsystem.period_us}\n"
+        "command_timeout_us = 100000\n"
+        "status_hz = 200.0\n"
+        "commissioned = false\n"
+        "\n"
+        "[[subsystems]]\n"
+        f'name = "{name}"\n'
+        f'path = "{name}.toml"\n'
     )
 
 
@@ -521,7 +442,9 @@ def robot_stanza(subsystem: Subsystem, toml_relpath: str | None = None) -> str:
 def generate(subsystem: Subsystem, out_dir: Path | str) -> list[Path]:
     """Write the package; return every file written, in ARCHITECTURE.md order."""
     dest = Path(out_dir) / subsystem.name
+    testdata_dir = dest / "testdata"
     dest.mkdir(parents=True, exist_ok=True)
+    testdata_dir.mkdir(parents=True, exist_ok=True)
     files = {
         "subsystem.toml": render_subsystem_toml(subsystem),
         "packet.h": render_packet_h(subsystem),
@@ -530,6 +453,8 @@ def generate(subsystem: Subsystem, out_dir: Path | str) -> list[Path]:
         "main.cc": render_main_cc(subsystem),
         "node_test.cc": render_node_test_cc(subsystem),
         "BUILD": render_build(subsystem),
+        f"testdata/robot.toml": render_test_robot_toml(subsystem),
+        f"testdata/{subsystem.name}.toml": render_subsystem_toml(subsystem),
     }
     written = []
     for filename, content in files.items():

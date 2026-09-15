@@ -1,13 +1,13 @@
-#include "2026-robot/main_processor/arbiter/node.h"
-#include "2026-robot/main_processor/driver_station/node.h"
+#include "talos_nodes/arbiter/node.h"
+#include "talos_nodes/driver_station/node.h"
 
 #include <gtest/gtest.h>
 
 #include <chrono>
 
-#include "2026-robot/main_processor/drivetrain/geometry.h"
-#include "2026-robot/main_processor/drivetrain/node.h"
-#include "2026-robot/main_processor/operator_interface/node.h"
+#include "talos_nodes/drivetrain/geometry.h"
+#include "talos_nodes/drivetrain/node.h"
+#include "talos_nodes/operator_interface/node.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/simulated_event_loop.h"
 #include "talOS/hardware/sim_backend.h"

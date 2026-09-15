@@ -3,12 +3,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <span>
 #include <utility>
 
-#include "talOS/hardware/messages.h"
+#include "talos_nodes/shooter/packet.h"
+#include "talos_nodes/shooter/shooter_message_generated.h"
 #include "talOS/events/handles.h"
-#include "2026-robot/main_processor/shooter/packet.h"
-#include "2026-robot/main_processor/shooter/shooter_message_generated.h"
+#include "talOS/hardware/gate.h"
+#include "talOS/hardware/messages.h"
 
 namespace talos::shooter {
 
@@ -49,8 +51,8 @@ class ShooterNode {
     }
 
     event::watch<Packet, &ShooterNode::OnState>(loop, kHwStateTopic, this);
-    event::watch<ShooterTarget, &ShooterNode::OnTarget>(loop, kShooterTargetTopic,
-                                                       this);
+    event::watch<ShooterTarget, &ShooterNode::OnTarget>(
+        loop, kShooterTargetTopic, this);
     request_ = event::make_sender<Packet>(loop, kShooterRequestTopic);
     shooter_state_ = event::make_sender<ShooterState>(loop, kShooterStateTopic);
     timer_ = event::make_timer<&ShooterNode::Tick>(loop, "shooter", this);
@@ -68,11 +70,7 @@ class ShooterNode {
   void OnState(const event::Context& context, const Packet& packet) {
     hardware::State state;
     if (!hardware::Decode(packet.bytes(), state)) return;
-    if (config_id_ != 0 && state.config_id != config_id_) return;
-    if (have_state_ && state.boot_id == state_.boot_id &&
-        state.sample_time_us <= state_.sample_time_us) {
-      return;
-    }
+    if (!hardware::AcceptState(have_state_, state_, config_id_, state)) return;
     state_ = state;
     state_received_ = context.now;
     have_state_ = true;
@@ -88,24 +86,18 @@ class ShooterNode {
     const auto timeout = std::chrono::microseconds{config_.command_timeout_us};
     const auto issued = event::MonotonicTime::from_nanos(target_.issued_ns());
 
-    bool gateway_ok =
-        (state_.flags & (hardware::kConfigured | hardware::kEnabled)) ==
-            (hardware::kConfigured | hardware::kEnabled) &&
-        !(state_.flags & hardware::kHardwareFault);
+    const bool gateway_ok = hardware::GatewayReady(state_);
 
-    bool target_fresh = target_.enabled() && issued <= context.now &&
-                        context.now - issued < timeout &&
-                        context.now - state_received_ < timeout;
+    const bool target_fresh = hardware::TargetFresh(
+        context.now, issued, target_.enabled(), state_received_, timeout);
 
     // Find flywheel sample in state_
     bool flywheel_sample_valid = false;
     double flywheel_velocity_rps = 0.0;
-    for (std::size_t i = 0; i < state_.motor_count; ++i) {
-      if (state_.motors[i].id == flywheel_id_) {
-        flywheel_sample_valid = state_.motors[i].valid;
-        flywheel_velocity_rps = state_.motors[i].velocity_rps;
-        break;
-      }
+    if (const hardware::MotorSample* sample =
+            hardware::FindMotor(state_, flywheel_id_)) {
+      flywheel_sample_valid = sample->valid;
+      flywheel_velocity_rps = sample->velocity_rps;
     }
 
     // Find beam break value in state_
@@ -121,13 +113,8 @@ class ShooterNode {
                  std::isfinite(target_.target_velocity_rps());
 
     // Build command slice for flywheel
-    hardware::Command command;
-    command.config_id = state_.config_id;
-    command.boot_id = state_.boot_id;
-    command.epoch = state_.epoch;
-    command.observed_time_us = state_.sample_time_us;
-    command.count = 1;
-    command.motors[0].id = flywheel_id_;
+    hardware::Command command = hardware::NeutralCommand(
+        state_, std::span<const uint16_t>(&flywheel_id_, 1));
     command.motors[0].slot = 0;
     if (valid) {
       command.motors[0].mode = hardware::Mode::kVelocity;
@@ -148,13 +135,17 @@ class ShooterNode {
     // Publish ShooterState
     double target_vel = valid ? target_.target_velocity_rps() : 0.0;
     constexpr double kAtSpeedToleranceRps = 2.0;
-    bool at_speed = valid && std::abs(target_.target_velocity_rps()) > 1e-3 &&
-                    std::abs(flywheel_velocity_rps - target_.target_velocity_rps()) <= kAtSpeedToleranceRps;
-    bool enabled = (state_.flags & (hardware::kConfigured | hardware::kEnabled)) ==
-                   (hardware::kConfigured | hardware::kEnabled);
+    bool at_speed =
+        valid && std::abs(target_.target_velocity_rps()) > 1e-3 &&
+        std::abs(flywheel_velocity_rps - target_.target_velocity_rps()) <=
+            kAtSpeedToleranceRps;
+    bool enabled =
+        (state_.flags & (hardware::kConfigured | hardware::kEnabled)) ==
+        (hardware::kConfigured | hardware::kEnabled);
     uint64_t ts_ns = state_.sample_time_us * 1000;
 
-    ShooterState shooter_st{ts_ns, flywheel_velocity_rps, target_vel, at_speed, beam_broken, enabled};
+    ShooterState shooter_st{ts_ns,    flywheel_velocity_rps, target_vel,
+                            at_speed, beam_broken,           enabled};
     shooter_state_.send(shooter_st);
   }
 

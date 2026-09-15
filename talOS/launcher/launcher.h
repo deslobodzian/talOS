@@ -9,12 +9,14 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <random>
@@ -52,6 +54,10 @@ struct NodeProcessInfo {
   std::string name;
   std::string target;
   std::string binary_path;
+  // Contract label recorded in the bundle manifest (e.g.
+  // "@talos_shooter//:contract"). Traceability, not a compatibility proof:
+  // a matching label does not establish wire compatibility.
+  std::string contract;
   std::string log_path;
   pid_t pid{-1};
   int exit_code{-1};
@@ -67,6 +73,9 @@ struct NodeProcessInfo {
 struct SessionManifest {
   uint64_t session_id{0};
   std::string config_path;
+  // sha256 over the robot config plus every subsystem file, as recorded in
+  // the bundle manifest. Empty for non-bundle launches.
+  std::string config_sha256;
   std::string output_dir;
   bool simulation{false};
   int64_t start_wall_ns{0};
@@ -79,6 +88,7 @@ struct SessionManifest {
     ss << "{\n";
     ss << "  \"session_id\": " << session_id << ",\n";
     ss << "  \"config_path\": \"" << config_path << "\",\n";
+    ss << "  \"config_sha256\": \"" << config_sha256 << "\",\n";
     ss << "  \"output_dir\": \"" << output_dir << "\",\n";
     ss << "  \"simulation\": " << (simulation ? "true" : "false") << ",\n";
     ss << "  \"start_wall_ns\": " << start_wall_ns << ",\n";
@@ -90,6 +100,7 @@ struct SessionManifest {
       ss << "      \"name\": \"" << n.name << "\",\n";
       ss << "      \"target\": \"" << n.target << "\",\n";
       ss << "      \"binary_path\": \"" << n.binary_path << "\",\n";
+      ss << "      \"contract\": \"" << n.contract << "\",\n";
       ss << "      \"log_path\": \"" << n.log_path << "\",\n";
       ss << "      \"pid\": " << n.pid << ",\n";
       ss << "      \"exit_code\": " << n.exit_code << ",\n";
@@ -115,6 +126,21 @@ struct LauncherOptions {
   bool simulation{false};
   int duration_s{0};
   bool start_sim_gateway{false};
+  // Studio viewer bridge (sim sessions only): --start-studio-bridge starts
+  // //studio/bridge:studio_bridge under launcher supervision, so the bridge
+  // is a declared node in graph.json instead of a process sim.sh runs behind
+  // the launcher's back. See [studio] in the robot config for ports/webroot.
+  bool start_studio_bridge{false};
+
+  // Controller addressing. Empty/zero means "take it from the robot config":
+  // --remote overrides [robot] controller_address, --remote-port overrides
+  // [robot] controller_port, --local-port overrides [robot] local_port.
+  std::string remote;
+  uint16_t remote_port{0};
+  uint16_t local_port{0};
+
+  // Studio HTTP port override. Zero means "take [studio] http_port".
+  uint16_t studio_http_port{0};
 
   // Launch a graph the linter called broken anyway. The default is refusal,
   // because what the lint catches -- a publisher and a subscriber on two
@@ -131,43 +157,303 @@ struct LauncherOptions {
   // cost the launch this much and no more.
   int describe_timeout_ms{5000};
 
+  // Path to a bundle directory assembled by talos_bundle
+  std::string bundle_dir;
+
+  // Provenance read from bundle_manifest.json by LoadBundle: the config
+  // identity hash and the per-node contract labels (keyed by target, with a
+  // name fallback). Carried into the session manifest, never trusted as a
+  // compatibility proof.
+  std::string bundle_config_sha256;
+  std::map<std::string, std::string> bundle_contracts;
+
   // Map of target/name -> binary override, useful for testing
   std::map<std::string, std::string> binary_overrides;
 };
 
+inline bool LoadBundle(LauncherOptions& options, std::string& error) {
+  if (options.bundle_dir.empty()) {
+    if (std::filesystem::exists("bundle_manifest.json")) {
+      options.bundle_dir = ".";
+    } else {
+      return true;
+    }
+  }
+
+  std::filesystem::path bpath(options.bundle_dir);
+  if (!std::filesystem::exists(bpath)) {
+    error = "bundle directory does not exist: " + options.bundle_dir;
+    return false;
+  }
+
+  // Set library search paths so child processes find bundled libraries
+  std::string lib_dir = (bpath / "lib").string();
+  if (std::filesystem::exists(lib_dir)) {
+    const char* old_ld = std::getenv("LD_LIBRARY_PATH");
+    std::string new_ld =
+        lib_dir + (old_ld && *old_ld ? std::string(":") + old_ld : "");
+    ::setenv("LD_LIBRARY_PATH", new_ld.c_str(), 1);
+
+    const char* old_dyld = std::getenv("DYLD_LIBRARY_PATH");
+    std::string new_dyld =
+        lib_dir + (old_dyld && *old_dyld ? std::string(":") + old_dyld : "");
+    ::setenv("DYLD_LIBRARY_PATH", new_dyld.c_str(), 1);
+
+    if (std::getenv("TALOS_NODE_LIB") == nullptr) {
+      std::string node_so = lib_dir + "/libtalos_node.so";
+      if (std::filesystem::exists(node_so)) {
+        ::setenv("TALOS_NODE_LIB", node_so.c_str(), 1);
+      }
+    }
+  }
+
+  // Parse bundle_manifest.json if present
+  std::string manifest_file = (bpath / "bundle_manifest.json").string();
+  if (std::filesystem::exists(manifest_file)) {
+    std::ifstream mf(manifest_file);
+    std::string content((std::istreambuf_iterator<char>(mf)),
+                        std::istreambuf_iterator<char>());
+
+    if (options.config_path.empty()) {
+      auto pos = content.find("\"config_path\": \"");
+      if (pos != std::string::npos) {
+        auto start = pos + 16;
+        auto end = content.find("\"", start);
+        if (end != std::string::npos) {
+          options.config_path =
+              (bpath / content.substr(start, end - start)).string();
+        }
+      }
+    }
+
+    {
+      auto pos = content.find("\"config_sha256\": \"");
+      if (pos != std::string::npos) {
+        auto start = pos + 18;
+        auto end = content.find("\"", start);
+        if (end != std::string::npos) {
+          options.bundle_config_sha256 = content.substr(start, end - start);
+        }
+      }
+    }
+
+    std::size_t search_pos = 0;
+    while ((search_pos = content.find("\"name\": \"", search_pos)) !=
+           std::string::npos) {
+      auto name_start = search_pos + 9;
+      auto name_end = content.find("\"", name_start);
+      if (name_end == std::string::npos) break;
+      std::string node_name =
+          content.substr(name_start, name_end - name_start);
+
+      std::string node_target;
+      auto target_pos = content.find("\"target\": \"", name_end);
+      if (target_pos != std::string::npos &&
+          target_pos < content.find("}", name_end)) {
+        auto t_start = target_pos + 11;
+        auto t_end = content.find("\"", t_start);
+        if (t_end != std::string::npos) {
+          node_target = content.substr(t_start, t_end - t_start);
+        }
+      }
+
+      std::string binary_path;
+      auto bin_pos = content.find("\"binary_path\": \"", name_end);
+      if (bin_pos != std::string::npos &&
+          bin_pos < content.find("}", name_end)) {
+        auto b_start = bin_pos + 16;
+        auto b_end = content.find("\"", b_start);
+        if (b_end != std::string::npos) {
+          binary_path = content.substr(b_start, b_end - b_start);
+        }
+      }
+
+      std::string node_contract;
+      auto contract_pos = content.find("\"contract\": \"", name_end);
+      if (contract_pos != std::string::npos &&
+          contract_pos < content.find("}", name_end)) {
+        auto c_start = contract_pos + 13;
+        auto c_end = content.find("\"", c_start);
+        if (c_end != std::string::npos) {
+          node_contract = content.substr(c_start, c_end - c_start);
+        }
+      }
+      if (!node_contract.empty()) {
+        if (!node_target.empty()) {
+          options.bundle_contracts[node_target] = node_contract;
+        }
+        options.bundle_contracts[node_name] = node_contract;
+      }
+
+      if (!binary_path.empty()) {
+        std::string full_bin = (bpath / binary_path).string();
+        if (!node_target.empty()) {
+          options.binary_overrides[node_target] = full_bin;
+          if (node_target.find('+') != std::string::npos) {
+            std::string no_plus = node_target;
+            no_plus.erase(std::remove(no_plus.begin(), no_plus.end(), '+'), no_plus.end());
+            options.binary_overrides[no_plus] = full_bin;
+          }
+        }
+        options.binary_overrides[node_name] = full_bin;
+      }
+
+      search_pos = name_end + 1;
+    }
+  }
+
+  if (options.config_path.empty()) {
+    std::string default_cfg = (bpath / "config" / "robot.toml").string();
+    if (std::filesystem::exists(default_cfg)) {
+      options.config_path = default_cfg;
+    }
+  }
+
+  return true;
+}
+
 inline std::string ResolveBinary(
     const std::string& target_or_path,
-    const std::map<std::string, std::string>& overrides = {}) {
+    const std::map<std::string, std::string>& overrides = {},
+    const std::string& bundle_dir = "") {
   auto it = overrides.find(target_or_path);
   if (it != overrides.end()) {
     return it->second;
   }
 
+  if (target_or_path.find('+') != std::string::npos) {
+    std::string no_plus = target_or_path;
+    no_plus.erase(std::remove(no_plus.begin(), no_plus.end(), '+'), no_plus.end());
+    it = overrides.find(no_plus);
+    if (it != overrides.end()) return it->second;
+  } else if (target_or_path.starts_with("@")) {
+    auto slash2 = target_or_path.find("//");
+    if (slash2 != std::string::npos) {
+      std::string with_plus = target_or_path.substr(0, slash2) + "+" + target_or_path.substr(slash2);
+      it = overrides.find(with_plus);
+      if (it != overrides.end()) return it->second;
+    }
+  }
+
   // If already a regular file path (or exists as executable), check it
-  if (!target_or_path.starts_with("//")) {
+  if (!target_or_path.starts_with("//") && !target_or_path.starts_with("@")) {
     if (::access(target_or_path.c_str(), X_OK) == 0) {
       return target_or_path;
     }
   }
 
-  // Convert "//2026-robot/main_processor/drivetrain:node" ->
-  // "2026-robot/main_processor/drivetrain/node"
-  std::string subpath = target_or_path;
-  if (subpath.starts_with("//")) {
-    subpath = subpath.substr(2);
+  // Parse repo and package/target subpath
+  std::string repo_part;
+  std::string subpath;
+
+  auto slash_pos = target_or_path.find("//");
+  if (slash_pos != std::string::npos) {
+    repo_part = target_or_path.substr(0, slash_pos);
+    subpath = target_or_path.substr(slash_pos + 2);
+    while (!repo_part.empty() && repo_part.front() == '@') {
+      repo_part.erase(0, 1);
+    }
+  } else {
+    subpath = target_or_path;
+    if (subpath.starts_with("//")) {
+      subpath = subpath.substr(2);
+    }
   }
+
   for (char& c : subpath) {
     if (c == ':') c = '/';
   }
 
-  // Check possible locations
+  std::string target_name = subpath;
+  auto last_slash = target_name.rfind('/');
+  if (last_slash != std::string::npos) {
+    target_name = target_name.substr(last_slash + 1);
+  }
+  std::string pkg_name;
+  if (last_slash != std::string::npos && last_slash > 0) {
+    auto second_last = subpath.rfind('/', last_slash - 1);
+    if (second_last != std::string::npos) {
+      pkg_name = subpath.substr(second_last + 1, last_slash - second_last - 1);
+    } else {
+      pkg_name = subpath.substr(0, last_slash);
+    }
+  }
+
+  if (!target_name.empty() && target_name != "node") {
+    it = overrides.find(target_name);
+    if (it != overrides.end()) return it->second;
+  }
+  if (!repo_part.empty()) {
+    std::string clean_repo = repo_part;
+    if (clean_repo.ends_with("+")) clean_repo.pop_back();
+    it = overrides.find(clean_repo);
+    if (it != overrides.end()) return it->second;
+    if (clean_repo.starts_with("talos_")) clean_repo = clean_repo.substr(6);
+    else if (clean_repo.starts_with("talos-")) clean_repo = clean_repo.substr(6);
+    it = overrides.find(clean_repo);
+    if (it != overrides.end()) return it->second;
+  }
+  if (!pkg_name.empty()) {
+    it = overrides.find(pkg_name);
+    if (it != overrides.end()) return it->second;
+  }
+
   std::vector<std::string> candidates;
-  if (const char* test_srcdir = std::getenv("TEST_SRCDIR")) {
+
+  // Bundle candidates if bundle_dir is provided
+  if (!bundle_dir.empty()) {
+    if (!pkg_name.empty() && target_name == "node") {
+      candidates.push_back(bundle_dir + "/bin/" + pkg_name);
+    }
+    if (!repo_part.empty() && target_name == "node") {
+      candidates.push_back(bundle_dir + "/bin/" + repo_part);
+      if (repo_part.starts_with("talos_")) {
+        candidates.push_back(bundle_dir + "/bin/" + repo_part.substr(6));
+      }
+    }
+    candidates.push_back(bundle_dir + "/bin/" + target_name);
+    candidates.push_back(bundle_dir + "/" + subpath);
+    candidates.push_back(bundle_dir + "/bazel-bin/" + subpath);
+  }
+
+  const char* test_srcdir = std::getenv("TEST_SRCDIR");
+  const char* runfiles = std::getenv("RUNFILES_DIR");
+
+  // External repository candidates
+  if (!repo_part.empty()) {
+    if (test_srcdir) {
+      candidates.push_back(std::string(test_srcdir) + "/" + repo_part + "/" +
+                           subpath);
+      candidates.push_back(std::string(test_srcdir) + "/_main/external/" +
+                           repo_part + "/" + subpath);
+      candidates.push_back(std::string(test_srcdir) + "/_main/external/+" +
+                           repo_part + "/" + subpath);
+    }
+    if (runfiles) {
+      candidates.push_back(std::string(runfiles) + "/" + repo_part + "/" +
+                           subpath);
+      candidates.push_back(std::string(runfiles) + "/_main/external/" +
+                           repo_part + "/" + subpath);
+      candidates.push_back(std::string(runfiles) + "/_main/external/+" +
+                           repo_part + "/" + subpath);
+    }
+    candidates.push_back("bazel-bin/external/" + repo_part + "/" + subpath);
+    candidates.push_back("bazel-bin/external/+" + repo_part + "/" + subpath);
+    // Bzlmod canonical layout for registry/override modules (e.g. an
+    // apparent "@talos_shooter" lives at bazel-bin/external/talos_shooter+/).
+    candidates.push_back("bazel-bin/external/" + repo_part + "+/" + subpath);
+    candidates.push_back("external/" + repo_part + "/" + subpath);
+    candidates.push_back("external/+" + repo_part + "/" + subpath);
+    candidates.push_back("external/" + repo_part + "+/" + subpath);
+  }
+
+  // Standard development / local candidates
+  if (test_srcdir) {
     candidates.push_back(std::string(test_srcdir) + "/_main/" + subpath);
     candidates.push_back(std::string(test_srcdir) + "/talos/" + subpath);
     candidates.push_back(std::string(test_srcdir) + "/" + subpath);
   }
-  if (const char* runfiles = std::getenv("RUNFILES_DIR")) {
+  if (runfiles) {
     candidates.push_back(std::string(runfiles) + "/_main/" + subpath);
     candidates.push_back(std::string(runfiles) + "/talos/" + subpath);
     candidates.push_back(std::string(runfiles) + "/" + subpath);
@@ -177,26 +463,34 @@ inline std::string ResolveBinary(
   candidates.push_back("./" + subpath);
   candidates.push_back("../" + subpath);
 
+  // If subpath ends with "hardware_node", also check "node"
+  if (subpath.ends_with("hardware_node")) {
+    std::string alt_subpath = subpath.substr(0, subpath.size() - 13) + "node";
+    candidates.push_back("bazel-bin/" + alt_subpath);
+    candidates.push_back(alt_subpath);
+    candidates.push_back("./" + alt_subpath);
+    candidates.push_back("../" + alt_subpath);
+  }
+
+  // sim_gateway alternative path
+  if (subpath.ends_with("drivetrain/sim_gateway")) {
+    std::string alt =
+        subpath.substr(0, subpath.size() - 22) + "simulation/sim_gateway";
+    candidates.push_back("bazel-bin/" + alt);
+    candidates.push_back(alt);
+  } else if (subpath.ends_with("simulation/sim_gateway")) {
+    std::string alt =
+        subpath.substr(0, subpath.size() - 22) + "drivetrain/sim_gateway";
+    candidates.push_back("bazel-bin/" + alt);
+    candidates.push_back(alt);
+  }
+
   for (const auto& path : candidates) {
     if (::access(path.c_str(), X_OK) == 0) {
       return path;
     }
   }
 
-  // If subpath ends with "hardware_node", also check "node"
-  if (subpath.ends_with("hardware_node")) {
-    std::string alt_subpath = subpath.substr(0, subpath.size() - 13) + "node";
-    std::vector<std::string> alt_candidates = {"bazel-bin/" + alt_subpath,
-                                               alt_subpath, "./" + alt_subpath,
-                                               "../" + alt_subpath};
-    for (const auto& path : alt_candidates) {
-      if (::access(path.c_str(), X_OK) == 0) {
-        return path;
-      }
-    }
-  }
-
-  // Fallback to the subpath itself
   return candidates.front();
 }
 
@@ -216,7 +510,15 @@ inline std::vector<NodeSpec> DiscoverNodes(
   NodeSpec hw_spec;
   hw_spec.name = "hardware_node";
   hw_spec.target = hw_target;
-  hw_spec.binary_path = ResolveBinary(hw_target, options.binary_overrides);
+  std::string hw_resolved =
+      ResolveBinary(hw_target, options.binary_overrides, options.bundle_dir);
+  if (hw_resolved.empty() || ::access(hw_resolved.c_str(), X_OK) != 0) {
+    auto it_hw = options.binary_overrides.find("hardware_node");
+    if (it_hw != options.binary_overrides.end()) {
+      hw_resolved = it_hw->second;
+    }
+  }
+  hw_spec.binary_path = hw_resolved;
   specs.push_back(hw_spec);
 
   // 2. Subsystems
@@ -230,7 +532,15 @@ inline std::vector<NodeSpec> DiscoverNodes(
             NodeSpec spec;
             spec.name = sub_name;
             spec.target = target;
-            spec.binary_path = ResolveBinary(target, options.binary_overrides);
+            std::string resolved =
+                ResolveBinary(target, options.binary_overrides, options.bundle_dir);
+            if (resolved.empty() || ::access(resolved.c_str(), X_OK) != 0) {
+              auto it_sub = options.binary_overrides.find(sub_name);
+              if (it_sub != options.binary_overrides.end()) {
+                resolved = it_sub->second;
+              }
+            }
+            spec.binary_path = resolved;
             specs.push_back(spec);
           }
         }
@@ -253,12 +563,97 @@ inline std::vector<NodeSpec> DiscoverNodes(
       NodeSpec gw_spec;
       gw_spec.name = "sim_gateway";
       gw_spec.target = gw_target;
-      gw_spec.binary_path = ResolveBinary(gw_target, options.binary_overrides);
+      gw_spec.binary_path =
+          ResolveBinary(gw_target, options.binary_overrides, options.bundle_dir);
       specs.push_back(gw_spec);
     }
   }
 
+  // 4. Optional Studio bridge. A host-side viewer, not a robot node, so it is
+  // not a [[subsystems]] entry; the [studio] table names the binary (defaulting
+  // to the framework's own bridge, so unlike the gateway there is no
+  // per-robot target to require). Sim sessions only: in a deployed session
+  // there is no build tree serving the webroot and no browser to open.
+  if (options.start_studio_bridge && options.simulation) {
+    NodeSpec studio_spec;
+    studio_spec.name = "studio_bridge";
+    studio_spec.target = robot_config.studio.bridge;
+    studio_spec.binary_path = ResolveBinary(
+        studio_spec.target, options.binary_overrides, options.bundle_dir);
+    specs.push_back(studio_spec);
+  }
+
   return specs;
+}
+
+// Effective controller endpoint for a launch: an explicit CLI flag wins,
+// otherwise the deployment configuration in [robot]. A zero CLI port means
+// "not given".
+inline std::string EffectiveRemoteAddress(const config::RobotConfig& config,
+                                          const LauncherOptions& options) {
+  return config::ResolveControllerAddress(config, options.remote);
+}
+
+inline uint16_t EffectiveRemotePort(const config::RobotConfig& config,
+                                    const LauncherOptions& options) {
+  return config::ResolveControllerPort(config, options.remote_port);
+}
+
+inline uint16_t EffectiveLocalPort(const config::RobotConfig& config,
+                                   const LauncherOptions& options) {
+  return config::ResolveLocalPort(config, options.local_port);
+}
+
+// Effective Studio HTTP endpoint for a launch: an explicit CLI flag wins,
+// otherwise the [studio] deployment configuration. A zero CLI port means
+// "not given".
+inline uint16_t EffectiveStudioHttpPort(const config::RobotConfig& config,
+                                        const LauncherOptions& options) {
+  return options.studio_http_port != 0 ? options.studio_http_port
+                                       : config.studio.http_port;
+}
+
+// Studio bridge supervision budget. The bridge refuses to start before the
+// telemetry publisher exists, so it gets a bounded startup window of
+// 1s-spaced attempts. The window is paced, not just counted: retries happen
+// at most once per second so a bridge that exits instantly still waits out
+// telemetry's startup rather than burning all attempts in a tight loop.
+inline constexpr int kStudioBridgeMaxAttempts = 60;
+inline constexpr std::chrono::seconds kStudioBridgeRetryInterval{1};
+inline constexpr std::chrono::seconds kStudioBridgeStartupWindow{60};
+
+inline std::size_t FindStudioBridgeIndex(
+    const std::vector<NodeSpec>& specs) {
+  for (std::size_t i = 0; i < specs.size(); ++i) {
+    if (specs[i].name == "studio_bridge") return i;
+  }
+  return specs.size();
+}
+
+// Pure retry predicate, unit-testable without forking. True while the bridge
+// still owns startup budget: attempts and window remain, the last spawn is at
+// least one retry interval old (pacing), and the session itself is not
+// shutting down (signal or duration deadline).
+inline bool ShouldRetryStudioBridge(
+    int attempts_made,
+    std::chrono::steady_clock::time_point first_attempt,
+    std::chrono::steady_clock::time_point last_spawn,
+    std::chrono::steady_clock::time_point now, bool stop_requested,
+    bool past_deadline) {
+  if (stop_requested || past_deadline) return false;
+  if (attempts_made >= kStudioBridgeMaxAttempts) return false;
+  if (now - first_attempt >= kStudioBridgeStartupWindow) return false;
+  if (now - last_spawn < kStudioBridgeRetryInterval) return false;
+  return true;
+}
+
+// A bridge that is still alive after one retry interval survived the startup
+// race the retries exist for; afterwards it is supervised like any other
+// node and a later exit is terminal, not a startup failure.
+inline bool IsStudioBridgeStable(
+    std::chrono::steady_clock::time_point last_spawn,
+    std::chrono::steady_clock::time_point now) {
+  return now - last_spawn >= kStudioBridgeRetryInterval;
 }
 
 // The launcher works in the vocabulary of the naming protocol, not its own.
@@ -476,6 +871,27 @@ inline std::size_t CountDeclaredTopics(
   return topics.size();
 }
 
+// What the bridge itself described is what it watches: its --describe reads
+// the same [subsystems.telemetry] topic key the telemetry node reads, so this
+// follows a topic override with no second spelling of it. The fallback pins
+// talos-telemetry/node.h kStudioTopic by value; the graph lint pins the copy,
+// failing the launch with "read by studio_bridge but nothing publishes it" if
+// it ever drifts.
+inline std::string StudioBridgeWatchTopic(
+    const std::vector<NodeDescription>& described) {
+  std::string topic = "/talos/telemetry";
+  for (const auto& node : described) {
+    if (node.answered && node.declared.name == "studio_bridge") {
+      for (const auto& source : node.declared.sources) {
+        if (source.kind == event::SourceKind::WATCHER && !source.name.empty()) {
+          topic = source.name;
+        }
+      }
+    }
+  }
+  return topic;
+}
+
 // The declared graph on disk, beside the session's manifest.
 //
 // uint64 values are written as decimal strings, which is the rule everywhere in
@@ -484,7 +900,8 @@ inline std::size_t CountDeclaredTopics(
 inline std::string GraphToJson(
     uint64_t session_id, const std::string& config_path,
     const std::vector<NodeDescription>& described,
-    const std::vector<naming::Diagnostic>& diagnostics) {
+    const std::vector<naming::Diagnostic>& diagnostics,
+    const std::string& config_sha256 = "") {
   const auto quoted = [](std::string_view value) {
     std::string out;
     introspect::AppendJsonString(out, value);
@@ -496,6 +913,7 @@ inline std::string GraphToJson(
   ss << "  \"describe_version\": " << introspect::kDescribeVersion << ",\n";
   ss << "  \"session_id\": \"" << session_id << "\",\n";
   ss << "  \"config_path\": " << quoted(config_path) << ",\n";
+  ss << "  \"config_sha256\": " << quoted(config_sha256) << ",\n";
   ss << "  \"nodes\": [\n";
   for (std::size_t i = 0; i < described.size(); ++i) {
     const auto& node = described[i];
@@ -543,6 +961,8 @@ inline std::string GraphToJson(
 class Launcher {
  public:
   explicit Launcher(LauncherOptions options) : options_{std::move(options)} {
+    std::string bundle_err;
+    LoadBundle(options_, bundle_err);
     if (options_.session_id == 0) {
       options_.session_id = GenerateSessionId();
     }
@@ -559,8 +979,14 @@ class Launcher {
   // Runs the declared nodes, waits for completion/signals, and produces
   // manifest. Returns 0 on success, or non-zero if any critical node failed.
   int Run() {
+    std::string bundle_err;
+    if (!LoadBundle(options_, bundle_err)) {
+      std::cerr << "launcher: " << bundle_err << "\n";
+      return 1;
+    }
+
     if (options_.config_path.empty()) {
-      std::cerr << "launcher: --config PATH is required\n";
+      std::cerr << "launcher: --config PATH or --bundle PATH is required\n";
       return 1;
     }
     std::filesystem::create_directories(options_.output_dir);
@@ -589,6 +1015,16 @@ class Launcher {
       return 1;
     }
 
+    // Controller addressing is config-driven with a CLI override: the same
+    // resolution the bridge applies on its own, computed here so the
+    // hardware node is always started with an explicit endpoint.
+    const std::string effective_remote =
+        EffectiveRemoteAddress(robot_config, options_);
+    const uint16_t effective_remote_port =
+        EffectiveRemotePort(robot_config, options_);
+    const uint16_t effective_local_port =
+        EffectiveLocalPort(robot_config, options_);
+
     // Phase one. Every binary is asked what it is before any of them is
     // started, because the launcher is the only place that knows the whole
     // roster before it exists -- and a topic whose two ends are spelled
@@ -601,7 +1037,8 @@ class Launcher {
     std::ofstream graph_file(graph_path);
     if (graph_file.is_open()) {
       graph_file << GraphToJson(options_.session_id, options_.config_path,
-                                described, diagnostics);
+                                described, diagnostics,
+                                options_.bundle_config_sha256);
       graph_file.close();
     }
     PrintDeclaredGraph(described, diagnostics, declared_topics, graph_path);
@@ -620,6 +1057,7 @@ class Launcher {
     SessionManifest manifest;
     manifest.session_id = options_.session_id;
     manifest.config_path = options_.config_path;
+    manifest.config_sha256 = options_.bundle_config_sha256;
     manifest.output_dir = options_.output_dir;
     manifest.simulation = options_.simulation;
     manifest.start_wall_ns =
@@ -636,7 +1074,20 @@ class Launcher {
       pinfo.name = spec.name;
       pinfo.target = spec.target;
       pinfo.binary_path = spec.binary_path;
+      auto contract_it = options_.bundle_contracts.find(spec.target);
+      if (contract_it == options_.bundle_contracts.end()) {
+        contract_it = options_.bundle_contracts.find(spec.name);
+      }
+      if (contract_it != options_.bundle_contracts.end()) {
+        pinfo.contract = contract_it->second;
+      }
       pinfo.log_path = options_.output_dir + "/" + spec.name + ".tlog";
+      if (spec.name == "studio_bridge") {
+        // Plaintext HTTP log, not an event recording: leave the .tlog slot
+        // empty so the manifest pass does not try to parse it as one. The
+        // bridge's stdout lands in studio_bridge.log (see Run's bridge state).
+        pinfo.log_path = "";
+      }
       pinfo.described = described[i].answered;
       procs.push_back(pinfo);
     }
@@ -644,16 +1095,37 @@ class Launcher {
     // Install stop handlers
     InstallSignals();
 
+    // The duration deadline is established BEFORE spawning, so a bridge that
+    // never comes up cannot push the session's end out: the clock that bounds
+    // the session starts with the session, not after the viewer.
+    const auto session_start = std::chrono::steady_clock::now();
+    const auto deadline = options_.duration_s > 0
+                              ? session_start +
+                                    std::chrono::seconds(options_.duration_s)
+                              : std::chrono::steady_clock::time_point::max();
+
     std::cout << "[launcher] Starting session " << options_.session_id
               << " with " << procs.size() << " nodes...\n";
+    std::cout << "[launcher] Controller " << effective_remote << ":"
+              << effective_remote_port << " (local port "
+              << effective_local_port << ")\n";
 
-    // Spawn each node process
+    // Spawn each node process (the Studio bridge starts below, once the
+    // declared graph it serves exists on disk).
     for (std::size_t i = 0; i < procs.size(); ++i) {
       const auto& spec = node_specs[i];
       auto& pinfo = procs[i];
+      if (spec.name == "studio_bridge") continue;
 
       std::vector<std::string> args;
       args.push_back(spec.binary_path);
+      if (spec.name == "sim_gateway") {
+        // The gateway needs the robot manifest to stamp a real config_id:
+        // unconfigured it stamps 0, which every mechanism's AcceptState
+        // gate rejects, leaving the whole graph motionless but green.
+        args.push_back("--config");
+        args.push_back(options_.config_path);
+      }
       if (spec.name != "sim_gateway") {
         args.push_back("--session-id");
         args.push_back(std::to_string(options_.session_id));
@@ -663,6 +1135,14 @@ class Launcher {
         args.push_back(options_.config_path);
         if (options_.simulation) {
           args.push_back("--sim");
+        }
+        if (spec.name == "hardware_node") {
+          args.push_back("--remote");
+          args.push_back(effective_remote);
+          args.push_back("--remote-port");
+          args.push_back(std::to_string(effective_remote_port));
+          args.push_back("--local-port");
+          args.push_back(std::to_string(effective_local_port));
         }
       }
       if (options_.duration_s > 0) {
@@ -702,16 +1182,100 @@ class Launcher {
                 << ", target " << pinfo.target << ")\n";
     }
 
-    // Wait loop: wait until all children terminate or duration/signal triggers
-    // stop
-    const auto deadline = options_.duration_s > 0
-                              ? std::chrono::steady_clock::now() +
-                                    std::chrono::seconds(options_.duration_s)
-                              : std::chrono::steady_clock::time_point::max();
+    // The Studio bridge serves the graph written above and refuses to start
+    // before the telemetry publisher exists. Its first attempt spawns here,
+    // alongside every other node, without waiting: the bounded retry across
+    // telemetry's startup window happens INSIDE the supervision loop below,
+    // so a failing viewer never delays child monitoring or the duration
+    // deadline established above.
+    struct StudioBridgeState {
+      std::size_t index = std::numeric_limits<std::size_t>::max();
+      std::vector<std::string> args;
+      std::string binary;
+      std::string log_path;
+      uint16_t http_port{0};
+      int attempts{0};
+      std::chrono::steady_clock::time_point first_attempt{};
+      std::chrono::steady_clock::time_point last_spawn{};
+      bool active{false};
+      bool stable{false};
+    };
+    StudioBridgeState bridge;
+    // Nonblocking spawn: fork/exec only, no sleep, no wait. Returns the child
+    // pid, or -1 on fork failure.
+    const auto spawn_bridge_once = [&]() -> pid_t {
+      const pid_t pid = ::fork();
+      if (pid < 0) return -1;
+      if (pid == 0) {
+        // The bridge has no --log flag; collect its stdout/stderr here so
+        // the session log keeps one file per process.
+        std::freopen(bridge.log_path.c_str(), "a", stdout);
+        std::freopen(bridge.log_path.c_str(), "a", stderr);
+        std::vector<char*> c_args;
+        c_args.reserve(bridge.args.size() + 1);
+        for (auto& a : bridge.args) c_args.push_back(a.data());
+        c_args.push_back(nullptr);
+        ::execv(bridge.binary.c_str(), c_args.data());
+        std::fprintf(stderr,
+                     "[launcher] execv failed for studio_bridge (%s): %s\n",
+                     bridge.binary.c_str(), std::strerror(errno));
+        ::_exit(127);
+      }
+      return pid;
+    };
+    {
+      const std::size_t bi = FindStudioBridgeIndex(node_specs);
+      if (bi != node_specs.size()) {
+        bridge.index = bi;
+        auto& pinfo = procs[bi];
+        const std::string& binary = node_specs[bi].binary_path;
+        if (binary.empty() || ::access(binary.c_str(), X_OK) != 0) {
+          std::cerr << "[launcher] studio_bridge not executable at '"
+                    << (binary.empty() ? node_specs[bi].target : binary)
+                    << "'; session runs without Studio\n";
+          pinfo.failed = true;
+        } else {
+          bridge.binary = binary;
+          bridge.log_path = options_.output_dir + "/studio_bridge.log";
+          bridge.http_port = EffectiveStudioHttpPort(robot_config, options_);
+          const std::string topic = StudioBridgeWatchTopic(described);
+          bridge.args = {bridge.binary,
+                         "--drop-newest-publisher",
+                         topic,
+                         "127.0.0.1",
+                         std::to_string(robot_config.studio.udp_port),
+                         std::to_string(bridge.http_port),
+                         robot_config.studio.webroot,
+                         "--declared",
+                         graph_path};
+          std::cout << "[launcher] Starting studio_bridge (target "
+                    << node_specs[bi].target << ")...\n";
+          const pid_t pid = spawn_bridge_once();
+          if (pid < 0) {
+            std::cerr << "[launcher] fork() failed for studio_bridge\n";
+            pinfo.failed = true;
+          } else {
+            const auto now = std::chrono::steady_clock::now();
+            pinfo.pid = pid;
+            bridge.attempts = 1;
+            bridge.first_attempt = now;
+            bridge.last_spawn = now;
+            bridge.active = true;
+          }
+        }
+      }
+    }
 
+    // Wait loop: wait until all children terminate or duration/signal triggers
+    // stop. Bridge retries live here: a bridge that exits inside its grace
+    // second lost the telemetry race and is respawned while startup budget
+    // (attempts, window) and session time (deadline, no stop) remain. A bridge
+    // that survives one interval is stable and supervised like any other node;
+    // exhaustion marks it failed and the session runs on without Studio.
     bool stop_sent = false;
     for (;;) {
-      bool all_done = true;
+      const auto now = std::chrono::steady_clock::now();
+      const bool past_deadline = (now >= deadline);
       for (auto& pinfo : procs) {
         if (pinfo.pid <= 0) continue;
         if (!pinfo.exited) {
@@ -720,21 +1284,111 @@ class Launcher {
           if (res == pinfo.pid) {
             pinfo.exited = true;
             pinfo.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-            std::cout << "[launcher] Process " << pinfo.name << " (pid "
-                      << pinfo.pid << ") exited with code " << pinfo.exit_code
-                      << "\n";
-          } else {
-            all_done = false;
+            const bool is_bridge =
+                (bridge.active && !bridge.stable &&
+                 &pinfo == &procs[bridge.index]);
+            if (!is_bridge) {
+              std::cout << "[launcher] Process " << pinfo.name << " (pid "
+                        << pinfo.pid << ") exited with code " << pinfo.exit_code
+                        << "\n";
+            }
           }
         }
       }
 
-      if (all_done) {
+      // Bridge supervision: stabilize survivors, respawn startup failures.
+      if (bridge.active && !bridge.stable) {
+        auto& bpinfo = procs[bridge.index];
+        const bool alive = (bpinfo.pid > 0 && !bpinfo.exited);
+        if (alive) {
+          if (IsStudioBridgeStable(bridge.last_spawn, now)) {
+            bridge.stable = true;
+            std::cout << "[launcher] Started studio_bridge (pid " << bpinfo.pid
+                      << ") on http://localhost:" << bridge.http_port << "\n";
+          }
+        } else if (ShouldRetryStudioBridge(bridge.attempts,
+                                           bridge.first_attempt,
+                                           bridge.last_spawn, now,
+                                           stop_requested_ != 0,
+                                           past_deadline || stop_sent)) {
+          const int last_code = bpinfo.exit_code;
+          const pid_t pid = spawn_bridge_once();
+          if (pid < 0) {
+            std::cerr << "[launcher] fork() failed for studio_bridge\n";
+            bpinfo.failed = true;
+            bpinfo.exit_code = -1;
+            bridge.active = false;
+          } else {
+            if (bridge.attempts == 1 || bridge.attempts % 15 == 0) {
+              std::cout << "[launcher] studio_bridge not up yet (exit "
+                        << last_code
+                        << "); waiting for the telemetry publisher...\n";
+            }
+            bpinfo.pid = pid;
+            bpinfo.exited = false;
+            bpinfo.exit_code = -1;
+            ++bridge.attempts;
+            bridge.last_spawn = now;
+          }
+        } else if (now - bridge.last_spawn >= kStudioBridgeRetryInterval) {
+          // Grace elapsed and no retry budget (or the session is shutting
+          // down): give up without blocking the session. A stop-driven
+          // abandon is not a bridge failure; exhaustion is.
+          bridge.active = false;
+          if (stop_requested_ != 0 || stop_sent || past_deadline) {
+            // Interrupted startup: leave failed/exit_code for the manifest
+            // pass as-is and shut down with the session.
+          } else {
+            std::cerr << "[launcher] studio_bridge never came up; session runs "
+                         "without Studio (see "
+                      << bridge.log_path << ")\n";
+            bpinfo.failed = true;
+            // Discard the last startup-race code the way the blocking retry
+            // did: exhaustion is reported as failed, not as that code.
+            bpinfo.exit_code = -1;
+          }
+        }
+      }
+
+      // A bridge still in its startup race does not hold the session open:
+      // the session ends when the robot nodes (or the deadline) say so, with
+      // or without Studio. Only a stable bridge keeps running as a session
+      // member.
+      bool all_done = true;
+      for (std::size_t i = 0; i < procs.size(); ++i) {
+        const auto& pinfo = procs[i];
+        if (pinfo.pid <= 0) continue;
+        if (pinfo.exited) continue;
+        if (bridge.index != std::numeric_limits<std::size_t>::max() && i == bridge.index &&
+            !bridge.stable) {
+          continue;
+        }
+        all_done = false;
         break;
       }
 
-      if (!stop_sent &&
-          (stop_requested_ || std::chrono::steady_clock::now() >= deadline)) {
+      if (all_done) {
+        // A session that ends while the bridge is still racing never got
+        // Studio: record the exhaustion the blocking retry would have, unless
+        // the ending is a stop (whose path never marked the bridge failed).
+        if (bridge.active && !bridge.stable && stop_requested_ == 0) {
+          auto& bpinfo = procs[bridge.index];
+          // Reap a just-spawned child that outlived the session so it does
+          // not escape supervision.
+          if (bpinfo.pid > 0 && !bpinfo.exited) {
+            ::kill(bpinfo.pid, SIGINT);
+            int status = 0;
+            ::waitpid(bpinfo.pid, &status, WNOHANG);
+            bpinfo.exited = true;
+          }
+          bpinfo.failed = true;
+          bpinfo.exit_code = -1;
+          bridge.active = false;
+        }
+        break;
+      }
+
+      if (!stop_sent && (stop_requested_ || past_deadline)) {
         stop_sent = true;
         std::cout << "[launcher] Stopping children...\n";
         for (const auto& pinfo : procs) {
@@ -755,7 +1409,7 @@ class Launcher {
     // Inspect logs and populate manifest
     int exit_status = 0;
     for (auto& pinfo : procs) {
-      if (std::filesystem::exists(pinfo.log_path)) {
+      if (!pinfo.log_path.empty() && std::filesystem::exists(pinfo.log_path)) {
         try {
           event::log::LogReader reader{pinfo.log_path};
           event::log::LogReader::Record rec;
@@ -787,6 +1441,13 @@ class Launcher {
     return exit_status;
   }
 
+  // Bridge spawn notes (see Run): the bridge takes positional wire args, not
+  // the --config/--session-id flags robot nodes take, so it gets its own
+  // spawn path; and it refuses to start before the telemetry publisher
+  // exists, which needs its own startup window, so the first attempt usually
+  // loses that race and a bounded retry inside the supervision loop follows.
+  // A viewer that never comes up is a degraded session, not a broken robot:
+  // exhaustion marks the node failed and the session runs on without Studio.
   static void RequestStop() { stop_requested_ = true; }
 
  private:

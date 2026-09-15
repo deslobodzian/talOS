@@ -25,11 +25,8 @@ import subprocess
 import sys
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import rtms
-import node_api
-from node_api import RTMSQueue
+from talos_runtime import rtms, node_api, runner
+from talos_runtime.node_api import RTMSQueue
 import messages
 
 
@@ -288,6 +285,273 @@ class CppPeerRoundTripTest(unittest.TestCase):
         self.assertEqual((seq, dropped), (0, 0))
         self.assertEqual(payload, expected)
         self.assertEqual(messages.decode(payload), (7, 42.5))
+
+
+class ConfigBindingTest(unittest.TestCase):
+    def test_abi_version_is_6(self):
+        self.assertEqual(node_api.TALOS_NODE_ABI_VERSION, 6)
+        self.assertEqual(node_api.abi_version(), 6)
+
+    def test_bad_path_raises_talos_error(self):
+        with self.assertRaises(node_api.TalosError):
+            node_api.load_config("/nonexistent/file.toml")
+
+    def test_config_lifecycle_and_queries(self):
+        import tempfile
+        toml_content = b"""
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.drive.motors.front_left]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+
+[subsystems.drive.sensors.pigeon]
+type = "Pigeon2"
+bus = "rio"
+can_id = 2
+
+[subsystems.intake.digital_inputs.limit_switch]
+dio = 3
+
+[subsystems.intake.digital_outputs.solenoid]
+dio = 4
+
+[subsystems.intake.analog_inputs.pressure]
+analog = 0
+
+[subsystems.intake.encoders.quad]
+type = "QuadratureEncoder"
+dio_a = 5
+dio_b = 6
+
+[subsystems.intake.pwm_outputs.servo]
+channel = 1
+"""
+        with tempfile.NamedTemporaryFile(suffix=".toml", delete=False) as f:
+            f.write(toml_content)
+            temp_path = f.name
+
+        try:
+            with node_api.load_config(temp_path, simulation=False) as cfg:
+                self.assertEqual(cfg.period_us, 5000)
+                self.assertEqual(cfg.command_timeout_us, 100000)
+                self.assertGreater(cfg.config_id, 0)
+
+                # Test get_device_id across device kinds
+                self.assertGreater(cfg.get_device_id("drive", "front_left"), 0)
+                self.assertGreater(cfg.get_device_id("drive", "pigeon"), 0)
+                self.assertGreater(cfg.get_device_id("intake", "limit_switch"), 0)
+                self.assertGreater(cfg.get_device_id("intake", "solenoid"), 0)
+                self.assertGreater(cfg.get_device_id("intake", "pressure"), 0)
+                self.assertGreater(cfg.get_device_id("intake", "quad"), 0)
+                self.assertGreater(cfg.get_device_id("intake", "servo"), 0)
+
+                # Missing device returns 0
+                self.assertEqual(cfg.get_device_id("drive", "nonexistent"), 0)
+                self.assertEqual(cfg.get_device_id("nonexistent", "front_left"), 0)
+
+                live_id = cfg.config_id
+
+            # Manual close and closed check
+            cfg2 = node_api.load_config(temp_path)
+            cfg2.close()
+            with self.assertRaises(node_api.TalosError):
+                cfg2.get_device_id("drive", "front_left")
+
+            # Simulation flag changes config ID
+            with node_api.load_config(temp_path, simulation=True) as sim_cfg:
+                self.assertNotEqual(sim_cfg.config_id, live_id)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+
+class NativeLoopTest(unittest.TestCase):
+    def test_simulated_loop_timer_and_sender(self):
+        with node_api.Loop.create_simulated() as loop:
+            sender_id = loop.register_sender("/test/sim_loop/cmd", 8, 4)
+            self.assertNotEqual(sender_id, 0xFFFF)
+            ticks = []
+
+            def on_timer(ctx):
+                ticks.append(ctx.dispatch_index)
+                payload = struct.pack("<Q", 0x12345678)
+                loop.send(sender_id, payload)
+
+            timer_id = loop.register_timer("timer", 5_000_000, 5_000_000, on_timer)
+            self.assertNotEqual(timer_id, 0xFFFF)
+            loop.run_for(12_000_000)
+            self.assertGreater(loop.dispatch_count, 0)
+            self.assertEqual(len(ticks), 2)
+
+    def test_simulated_loop_sim_inject(self):
+        with node_api.Loop.create_simulated() as loop:
+            received = []
+
+            def on_msg(ctx, data):
+                self.assertIsInstance(ctx, node_api.DispatchContext)
+                self.assertEqual(ctx.kind, node_api.WATCHER)
+                self.assertGreaterEqual(ctx.now_ns, ctx.event_time_ns)
+                self.assertEqual(ctx.latency_ns, ctx.now_ns - ctx.event_time_ns)
+                received.append(data)
+
+            watcher_id = loop.register_watcher("/test/sim/sensor", 8, 4, on_msg)
+            self.assertNotEqual(watcher_id, 0xFFFF)
+            test_payload = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+            loop.sim_inject("/test/sim/sensor", test_payload)
+            loop.run_for(10_000_000)
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0], test_payload)
+
+    def test_replay_loop_determinism(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".tlog", delete=False) as f:
+            tlog_path = f.name
+        try:
+            # 1. Record simulated loop run
+            with node_api.Loop.create_simulated(log_path=tlog_path, stream_name="sim_stream") as sim_loop:
+                sender_id = sim_loop.register_sender("/test/sim/cmd", 4, 4)
+                self.assertNotEqual(sender_id, 0xFFFF)
+
+                def on_sensor(ctx, data):
+                    (val,) = struct.unpack("<I", data)
+                    out = struct.pack("<I", val * 2)
+                    sim_loop.send(sender_id, out)
+
+                sim_loop.register_watcher("/test/sim/sensor", 4, 4, on_sensor)
+                sim_loop.register_timer("sim_timer", 10_000_000, 10_000_000, lambda ctx: None)
+
+                sim_loop.sim_inject("/test/sim/sensor", struct.pack("<I", 21))
+                sim_loop.run_for(25_000_000)
+                sim_loop.sim_inject("/test/sim/sensor", struct.pack("<I", 50))
+                sim_loop.run_for(10_000_000)
+
+            self.assertTrue(os.path.exists(tlog_path))
+            self.assertGreater(os.path.getsize(tlog_path), 0)
+
+            # 2. Replay loop execution
+            with node_api.Loop.create_replay(tlog_path) as replay_loop:
+                sender_id = replay_loop.register_sender("/test/sim/cmd", 4, 4)
+                self.assertNotEqual(sender_id, 0xFFFF)
+                replay_sensor_vals = []
+
+                def replay_on_sensor(ctx, data):
+                    (val,) = struct.unpack("<I", data)
+                    replay_sensor_vals.append(val)
+                    out = struct.pack("<I", val * 2)
+                    replay_loop.send(sender_id, out)
+
+                replay_loop.register_watcher("/test/sim/sensor", 4, 4, replay_on_sensor)
+                replay_loop.register_timer("sim_timer", 10_000_000, 10_000_000, lambda ctx: None)
+
+                replay_loop.run()
+                self.assertFalse(replay_loop.diverged)
+                self.assertTrue(replay_loop.reached_exit)
+                self.assertEqual(replay_sensor_vals, [21, 50])
+        finally:
+            if os.path.exists(tlog_path):
+                os.unlink(tlog_path)
+
+    def test_exception_handling(self):
+        with node_api.Loop.create_simulated() as loop:
+            def failing_callback(ctx):
+                raise RuntimeError("clean callback exception")
+
+            loop.register_timer("fail_timer", 5_000_000, 5_000_000, failing_callback)
+            with self.assertRaises(RuntimeError) as cm:
+                loop.run_for(10_000_000)
+            self.assertIn("clean callback exception", str(cm.exception))
+
+    def test_arm_disarm_timer(self):
+        with node_api.Loop.create_simulated() as loop:
+            ticks = []
+            timer_id = loop.register_timer("t", 0, 0, lambda ctx: ticks.append(1))
+            loop.run_for(10_000_000)
+            self.assertEqual(len(ticks), 0)
+            loop.arm_timer(timer_id, 5_000_000, 5_000_000)
+            loop.run_for(12_000_000)
+            self.assertEqual(len(ticks), 2)
+            loop.disarm_timer(timer_id)
+            loop.run_for(20_000_000)
+            self.assertEqual(len(ticks), 2)
+
+    def test_scheduling_overhead_measurement(self):
+        import time
+        with node_api.Loop.create_simulated() as loop:
+            dispatches = 0
+            latencies = []
+
+            def on_timer(ctx):
+                nonlocal dispatches
+                dispatches += 1
+                latencies.append(ctx.latency_ns)
+
+            loop.register_timer("perf_timer", 1_000_000, 1_000_000, on_timer)
+            # Warmup
+            loop.run_for(10_000_000)
+            self.assertEqual(dispatches, 10)
+            self.assertTrue(all(lat == 0 for lat in latencies))
+
+            # Measure dispatch overhead
+            t0 = time.perf_counter_ns()
+            loop.run_for(100_000_000)  # 100 dispatches
+            t1 = time.perf_counter_ns()
+            elapsed_ns = t1 - t0
+            avg_overhead_us = (elapsed_ns / 100) / 1000.0
+            # Ensure C++ to Python ctypes dispatch overhead is reasonable (< 500 us per dispatch on mac)
+            self.assertLess(avg_overhead_us, 500.0)
+
+
+class SampleNativeNode:
+    """Test node for runner native loop execution and replay."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.ticks = 0
+        self.sender_id = None
+
+    def register_sources(self, loop):
+        self.sender_id = loop.register_sender("/test/runner/cmd", 4, 4)
+        loop.register_timer("runner_timer", 5_000_000, 5_000_000, self.on_timer)
+
+    def on_timer(self, ctx):
+        self.ticks += 1
+        self.ctx.loop.send(self.sender_id, struct.pack("<I", self.ticks))
+        if self.ticks >= 3:
+            self.ctx.loop.exit()
+
+
+class RunnerNativeLoopTest(unittest.TestCase):
+    def test_runner_native_loop_and_replay(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".tlog", delete=False) as f:
+            tlog_path = f.name
+        try:
+            # 1. Run under simulation with logging
+            sim_rc = runner.run_node_main(
+                node_name="test_runner_node",
+                node_target="//test:target",
+                entry_point="rtms_roundtrip_test:SampleNativeNode",
+                argv=["--sim", "--log", tlog_path],
+            )
+            self.assertEqual(sim_rc, 0)
+            self.assertTrue(os.path.exists(tlog_path))
+            self.assertGreater(os.path.getsize(tlog_path), 0)
+
+            # 2. Run under replay
+            replay_rc = runner.run_node_main(
+                node_name="test_runner_node",
+                node_target="//test:target",
+                entry_point="rtms_roundtrip_test:SampleNativeNode",
+                argv=["--replay", tlog_path],
+            )
+            self.assertEqual(replay_rc, 0)
+        finally:
+            if os.path.exists(tlog_path):
+                os.unlink(tlog_path)
 
 
 if __name__ == "__main__":

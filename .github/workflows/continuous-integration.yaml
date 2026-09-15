@@ -49,6 +49,101 @@ jobs:
     - name: Test
       run: bazel test //... --noshow_progress --test_output=errors
 
+  rio-adapter:
+    name: RIO adapter (GradleRIO)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: 2026-robot/controller_processor/rio
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+
+    - name: Setup Java (GradleRIO needs a JDK; the wrapper itself is pinned)
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
+
+    - name: Setup Gradle cache
+      uses: gradle/actions/setup-gradle@v4
+
+    - name: Desktop adapter test
+      # PhoenixBackend encoder + sim-honesty regressions in src/test/cpp:
+      # the actual adapter code, compiled and run on desktop through the
+      # WPILib simulation HAL. (`test` is the google-test suite task the
+      # build.gradle testSuites block wires up.)
+      run: ./gradlew test
+
+    - name: RoboRIO target build
+      # Cross-compile the deployed frcUserProgram for linuxathena. This is
+      # the artifact `deploy` ships; it never runs in CI, it must compile.
+      run: ./gradlew buildRio
+
+  standalone-modules:
+    name: Standalone modules (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir:
+          - talos-driver_station
+          - talos-odometry
+          - talos-operator_interface
+          - talos-telemetry
+          - talos-chassis_contracts
+          - studio-schema
+          - test/fixtures/robot_assembly
+          - test/fixtures/external_consumer
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+
+    - name: Setup bazel-action
+      uses: bazel-contrib/setup-bazel@0.19.0
+      with:
+        # Avoid downloading Bazel every time.
+        bazelisk-cache: true
+        # Store build cache per workflow.
+        disk-cache: ${{ github.workflow }}
+        # Share repository cache between workflows.
+        repository-cache: true
+
+    - name: Install Linux dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+        pkg-config \
+        libdbus-1-dev \
+        libglib2.0-dev \
+        libgtk-3-dev \
+        libwebkit2gtk-4.1-dev \
+        libayatana-appindicator3-dev \
+        librsvg2-dev \
+        libssl-dev \
+        libxdo-dev \
+        patchelf
+
+    # Root `bazel build //...` / `bazel test //...` respects `.bazelignore`,
+    # so the 7 standalone Bazel projects above are silently skipped there.
+    # Each entry runs from a full checkout because the `local_path_override`
+    # relative paths require the repo-root layout. Locally:
+    #   cd <dir> && bazel build //... --noshow_progress --test_output=errors
+    #   cd <dir> && bazel test //... --noshow_progress --test_output=errors
+    - name: Build (${{ matrix.dir }})
+      working-directory: ${{ matrix.dir }}
+      run: bazel build //... --noshow_progress --test_output=errors
+
+    - name: Test (${{ matrix.dir }})
+      # robot_assembly is a bundle-only fixture with no test targets
+      # (`bazel test //...` exits 4 there); its Build step is the check.
+      # external_consumer is the minimal-SDK-consumer check: only talos plus
+      # the core toolchain pins, no platform siblings (those are dev-only
+      # assembly deps of the SDK).
+      if: matrix.dir != 'test/fixtures/robot_assembly'
+      working-directory: ${{ matrix.dir }}
+      run: bazel test //... --noshow_progress --test_output=errors
+
   buildifier:
     name: Buildifier (changed BUILD files)
     runs-on: ubuntu-latest

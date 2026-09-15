@@ -2,14 +2,16 @@ import org.gradle.internal.os.OperatingSystem
 
 // The RoboRIO program is deliberately small: a Driver Station loop and the
 // hardware gateway. Everything else in talOS builds with Bazel, and the tests
-// for the gateway live there (//talOS/hardware:gateway_test), so this project
-// carries no test suite and no command-based framework.
+// for the gateway live there (//talOS/hardware:gateway_test). The only
+// GradleRIO tests are desktop simulation regressions for the Phoenix
+// backend itself (src/test/cpp); there is no command-based framework.
 //
 // TODO(build): replace GradleRIO with a direct cross-compile of this one
 // executable against the WPILib/HAL and Phoenix 6 native libraries, so the
 // whole repository builds from Bazel in seconds rather than through Gradle.
 plugins {
     id "cpp"
+    id "google-test"
     id "edu.wpi.first.GradleRIO" version "2026.2.1"
 }
 
@@ -148,6 +150,23 @@ model {
             // Defining my dependencies. In this case, WPILib (+ friends), and vendor libraries.
             wpi.cpp.vendor.cpp(it)
             wpi.cpp.deps.wpilib(it)
+        }
+    }
+    testSuites {
+        // Desktop simulation tests for the hardware gateway backend
+        // (PhoenixBackend encoder + sim honesty regressions in src/test/cpp).
+        // The suite itself is auto-created per component by the google-test
+        // plugin; this only points it at our sources and dependencies.
+        frcUserProgramTest {
+            sources.cpp {
+                source {
+                    srcDir 'src/test/cpp'
+                    include '**/*.cpp'
+                }
+            }
+            wpi.cpp.vendor.cpp(it)
+            wpi.cpp.deps.wpilib(it)
+            wpi.cpp.deps.googleTest(it)
         }
     }
 }

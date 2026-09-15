@@ -503,5 +503,156 @@ can_id = 4
   EXPECT_TRUE(devs_z->sensors.empty());
 }
 
+TEST(ConfigTest, ControllerAddressDefaultsToLoopbackContract) {
+  constexpr std::string_view kToml = R"(
+[robot]
+period_us = 5000
+
+[subsystems.test.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+)";
+  auto config = ParseRobotConfigString(kToml);
+  EXPECT_EQ(config.controller_address, "127.0.0.1");
+  EXPECT_EQ(config.controller_port, 5802);
+  EXPECT_EQ(config.local_port, 5803);
+}
+
+TEST(ConfigTest, ControllerAddressFromDeploymentConfig) {
+  constexpr std::string_view kToml = R"(
+[robot]
+period_us = 5000
+controller_address = "10.56.87.2"
+controller_port = 5802
+local_port = 5803
+
+[subsystems.test.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+)";
+  auto config = ParseRobotConfigString(kToml);
+  EXPECT_EQ(config.controller_address, "10.56.87.2");
+  EXPECT_EQ(config.controller_port, 5802);
+  EXPECT_EQ(config.local_port, 5803);
+
+  // CLI override wins over the deployment configuration.
+  EXPECT_EQ(ResolveControllerAddress(config, "10.0.0.5"), "10.0.0.5");
+  EXPECT_EQ(ResolveControllerAddress(config, ""), "10.56.87.2");
+  EXPECT_EQ(ResolveControllerPort(config, 5900), 5900);
+  EXPECT_EQ(ResolveControllerPort(config, 0), 5802);
+  EXPECT_EQ(ResolveLocalPort(config, 5901), 5901);
+  EXPECT_EQ(ResolveLocalPort(config, 0), 5803);
+}
+
+TEST(ConfigTest, ControllerAddressAliasAndPortValidation) {
+  constexpr std::string_view kAlias = R"(
+[robot]
+period_us = 5000
+remote_address = "10.56.87.2"
+
+[subsystems.test.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+)";
+  EXPECT_EQ(ParseRobotConfigString(kAlias).controller_address, "10.56.87.2");
+
+  constexpr std::string_view kBadPort = R"(
+[robot]
+period_us = 5000
+controller_port = 0
+
+[subsystems.test.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+)";
+  EXPECT_THROW(ParseRobotConfigString(kBadPort), std::invalid_argument);
+
+  constexpr std::string_view kEmptyAddr = R"(
+[robot]
+period_us = 5000
+controller_address = ""
+
+[subsystems.test.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+)";
+  EXPECT_THROW(ParseRobotConfigString(kEmptyAddr), std::invalid_argument);
+}
+
+TEST(ConfigTest, StudioTableDefaultsWhenAbsent) {
+  constexpr std::string_view kToml = R"(
+[robot]
+period_us = 5000
+
+[subsystems.test.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+)";
+  const auto cfg = ParseRobotConfigString(kToml);
+  EXPECT_EQ(cfg.studio.bridge, "//studio/bridge:studio_bridge");
+  EXPECT_EQ(cfg.studio.http_port, 5800);
+  EXPECT_EQ(cfg.studio.udp_port, 5801);
+  EXPECT_EQ(cfg.studio.webroot, "bazel-bin/studio/dist");
+}
+
+TEST(ConfigTest, StudioTableFullOverride) {
+  constexpr std::string_view kToml = R"(
+[robot]
+period_us = 5000
+
+[studio]
+bridge = "//custom/studio:bridge"
+http_port = 8080
+udp_port = 8081
+webroot = "custom/dist"
+
+[subsystems.test.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+)";
+  const auto cfg = ParseRobotConfigString(kToml);
+  EXPECT_EQ(cfg.studio.bridge, "//custom/studio:bridge");
+  EXPECT_EQ(cfg.studio.http_port, 8080);
+  EXPECT_EQ(cfg.studio.udp_port, 8081);
+  EXPECT_EQ(cfg.studio.webroot, "custom/dist");
+}
+
+TEST(ConfigTest, StudioTableRejectsBadValues) {
+  constexpr std::string_view kBadPort = R"(
+[robot]
+period_us = 5000
+
+[studio]
+http_port = 70000
+
+[subsystems.test.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+)";
+  EXPECT_THROW(ParseRobotConfigString(kBadPort), std::invalid_argument);
+
+  constexpr std::string_view kEmptyBridge = R"(
+[robot]
+period_us = 5000
+
+[studio]
+bridge = ""
+
+[subsystems.test.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+)";
+  EXPECT_THROW(ParseRobotConfigString(kEmptyBridge), std::invalid_argument);
+}
+
 }  // namespace
 }  // namespace talos::config

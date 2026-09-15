@@ -2,15 +2,14 @@
 #include <cstdint>
 #include <cstdio>
 
-#include "2026-robot/main_processor/telemetry/node.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/introspection/names.h"
 #include "talOS/process/node_main.h"
+#include "talos_nodes/year2026_telemetry/node.h"
 
 namespace {
-// This node's identity, written once. `--describe` and the live registry row
-// have to name the same node and the same build target, or a viewer cannot tell
-// a graph that changed from a graph it is reading two different names for.
+// Identity: the registry row and --describe name the same node and target;
+// log identity derives from the name (see talos::process::NodeSpec).
 constexpr const char* kNodeName = "telemetry";
 constexpr const char* kNodeTarget =
     "//2026-robot/main_processor/telemetry:node";
@@ -23,16 +22,20 @@ int main(int argc, char** argv) {
   //
   // The config, read by the factory. Exactly one runner branch executes per
   // process, so the hooks below always observe the value the factory stored.
+  // Hooks mirror talos-telemetry/main.cc: the year wrapper owns the process,
+  // so it must declare the same first-tick starter, Studio source, Reporter
+  // row, and exit summary around the composed core.
   talos::telemetry::TelemetryConfig telemetry{};
   auto factory = [&](auto& loop, const talos::process::NodeFlags& flags) {
     const auto robot_config =
         talos::config::ParseRobotConfig(flags.config_path);
     if (const auto* tbl = robot_config.GetSubsystemTable("telemetry")) {
-      telemetry.period_us =
-          (*tbl)["period_us"].value_or(telemetry.period_us);
+      telemetry.period_us = (*tbl)["period_us"].value_or(telemetry.period_us);
       telemetry.topic = (*tbl)["topic"].value_or(telemetry.topic);
+      telemetry.stale_timeout_us =
+          (*tbl)["stale_timeout_us"].value_or(telemetry.stale_timeout_us);
     }
-    return talos::telemetry::TelemetryNode{loop, telemetry};
+    return talos::telemetry::year2026::YearTelemetryNode{loop, telemetry};
   };
   auto starter = [&](auto& node, auto& loop) {
     node.Start(loop.monotonic_now() +
@@ -44,8 +47,7 @@ int main(int argc, char** argv) {
   // reason: a graph missing it reports the feed as published by nobody, and
   // the declared graph would then disagree with the running one about a topic
   // that is fine.
-  auto describe_hook = [&](talos::introspect::Description& description,
-                           auto&) {
+  auto describe_hook = [&](talos::introspect::Description& description, auto&) {
     description.sources.push_back(
         {talos::event::SourceKind::SENDER, telemetry.topic,
          static_cast<std::uint32_t>(studio::slot_bytes),
@@ -80,10 +82,6 @@ int main(int argc, char** argv) {
         loop.recorder().failed());
   };
   return talos::process::RunNode(
-      argc, argv,
-      {.node_name = kNodeName,
-       .node_target = kNodeTarget,
-       .log_stream = "telemetry",
-       .default_log_path = "/tmp/telemetry.tlog"},
-      factory, starter, describe_hook, extra_hook, summary);
+      argc, argv, {.node_name = kNodeName, .node_target = kNodeTarget}, factory,
+      starter, describe_hook, extra_hook, summary);
 }

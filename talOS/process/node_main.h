@@ -71,13 +71,20 @@ struct NodeFlags {
 // Per-node identity. Endpoints are copied, not referenced, but the underlying
 // topic views must outlive the run -- string literals and topic constants at
 // the node's main, which is where these are written.
+//
+// log_stream and default_log_path derive from the node name (the stream and
+// /tmp/<name>.tlog) when null: every node in the tree used exactly those
+// spellings, so they are derived rather than repeated per main. Set them only
+// for the node that genuinely logs elsewhere.
 struct NodeSpec {
   const char* node_name = nullptr;
   const char* node_target = nullptr;
   const char* log_stream = nullptr;
   const char* default_log_path = nullptr;
-  const char* default_config_path =
-      "2026-robot/main_processor/configuration/robot.toml";
+  // No framework default: the caller must say which config to load (empty
+  // means missing, mirroring LauncherOptions). Standalone modules that want
+  // a convenience default pass default_config_path explicitly.
+  const char* default_config_path = nullptr;
   std::vector<introspect::EndpointAttribute> endpoints;
   // Nodes that read neither hardware nor configuration accept --config and
   // discard it, so the launcher can pass one flag set to every binary.
@@ -86,8 +93,13 @@ struct NodeSpec {
 
 inline NodeFlags ParseNodeFlags(int argc, char** argv, const NodeSpec& spec) {
   NodeFlags flags;
-  flags.log_path = spec.default_log_path;
-  flags.config_path = spec.default_config_path;
+  if (spec.default_log_path != nullptr && *spec.default_log_path != '\0') {
+    flags.log_path = spec.default_log_path;
+  } else {
+    flags.log_path = std::string{"/tmp/"} + spec.node_name + ".tlog";
+  }
+  flags.config_path =
+      spec.default_config_path ? spec.default_config_path : "";
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--sim") {
@@ -118,6 +130,8 @@ inline NodeFlags ParseNodeFlags(int argc, char** argv, const NodeSpec& spec) {
   }
   if (flags.duration_s < 0)
     throw std::invalid_argument("duration must be nonnegative");
+  if (!spec.ignore_config_value && flags.config_path.empty())
+    throw std::invalid_argument("missing --config PATH");
   return flags;
 }
 
@@ -154,7 +168,8 @@ struct DefaultSummary {};
 
 template <typename Factory, typename Starter = StartNow,
           typename DescribeHook = NoDescribeHook,
-          typename ExtraHook = NoExtraSources, typename Summary = DefaultSummary>
+          typename ExtraHook = NoExtraSources,
+          typename Summary = DefaultSummary>
 int RunNode(int argc, char** argv, NodeSpec spec, Factory factory,
             Starter starter = {}, DescribeHook describe_hook = {},
             ExtraHook extra_hook = {}, Summary summary = {}) {
@@ -186,10 +201,13 @@ int RunNode(int argc, char** argv, NodeSpec spec, Factory factory,
                   loop.reached_exit());
       return loop.diverged() || !loop.reached_exit() ? 1 : 0;
     }
-    event::RealtimeEventLoop<event::log::LogWriter> loop{
-        event::log::LogWriter{flags.log_path, spec.log_stream,
-                              event::log::LogWriterOptions{},
-                              flags.session_id}};
+    const char* log_stream =
+        (spec.log_stream != nullptr && *spec.log_stream != '\0')
+            ? spec.log_stream
+            : spec.node_name;
+    event::RealtimeEventLoop<event::log::LogWriter> loop{event::log::LogWriter{
+        flags.log_path, log_stream, event::log::LogWriterOptions{},
+        flags.session_id}};
     auto node = factory(loop, flags);
     starter(node, loop);
     InstallStopHandlers();

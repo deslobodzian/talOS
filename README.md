@@ -38,9 +38,29 @@ talOS/                     the framework. Knows nothing about any robot.
 2026-robot/                one robot.
   main_processor/          the node graph that runs talOS
     configuration/         robot.toml: this robot's hardware and subsystems
-    drivetrain/ shooter/ odometry/ driver_station/
+    drivetrain/ intake/ shooter/ arbiter/
+                           year-local mechanisms, rewritten each season
+    operator_interface/    year wrapper composing the platform chassis core
+                           with the year's shooter/intake bindings
+    simulation/            sim_gateway stand-in for hardware
   controller_processor/
     rio/                   RoboRIO program (GradleRIO/WPILib)
+
+talos-driver_station/
+talos-operator_interface/ talos-odometry/ talos-telemetry/
+talos-chassis_contracts/
+                           standalone platform node repositories (hybrid
+                           policy): each builds and tests in its own checkout
+                           against the talOS SDK (`local_path_override`) and
+                           is pinned by `test/fixtures/robot_assembly`, which
+                           launches them together. `talos-chassis_contracts/`
+                           is the neutral chassis frame contract every season
+                           reuses (request + drivetrain state) — the one
+                           definition of each frame type. `studio-schema/` is
+                           the standalone Studio telemetry-frame contract
+                           (schema + slot geometry) with no
+                           frontend/bridge/Rust toolchain — the single home
+                           of the frame schema and slot geometry.
 ```
 
 `main_processor` and `controller_processor` are the two halves of one robot:
@@ -63,7 +83,15 @@ the agent JSON-RPC service. Nothing else answers this: a telemetry frame shows
 what one node chose to publish, not the shape of the system that produced it.
 
 ## Building
-Build used bazel for all projects in the repo to build all. </b>
+Bazel builds all projects in the repo. From the repo root, `bazel build //...`
+covers the root module; the standalone platform modules are excluded from
+that traversal by `.bazelignore` (`talos-driver_station`,
+`talos-operator_interface`, `talos-odometry`, `talos-telemetry`,
+`talos-chassis_contracts`, `studio-schema`,
+`test/fixtures/robot_assembly`,
+`test/fixtures/external_consumer`), so build and test each of those from
+inside its own directory (`cd <dir> && bazel build //... &&
+bazel test //...`).
 
 The one exception is `2026-robot/controller_processor/rio/`, the RoboRIO program, which still builds through
 GradleRIO because that is what supplies the WPILib and Phoenix 6 native
@@ -77,11 +105,11 @@ repository builds with one tool, in seconds. The robot program was cut down to
 the bare minimum specifically to make this a small job.
 
 
-Build all: `bazle build //...`</b>
+Build all: `bazel build //...`
 
 Example for building a specific module:
 
-`bazel build //.talos`
+`bazel build //talOS/...`
 
 ## Building on macOS
 
@@ -106,10 +134,10 @@ same code fails as unavailable rather than missing.
 
 ## Debugging
 To build with debug:
-`bazel build -c dbg //path/to:target`</b>
+`bazel build -c dbg //path/to:target`
 To run:
-`lldb bazel-bin/path/to/target`</b>
+`lldb bazel-bin/path/to/target`
 
-To generate `compile_comands.json` for clangd or other LSPs in c++: </b>
+To generate `compile_commands.json` for clangd or other LSPs in c++:
 
 `bazel run @hedron_compile_commands//:refresh_all`

@@ -1,0 +1,12 @@
+[robot]
+period_us = 5000
+
+# A non-default Studio topic, so the describe test proves the bridge reports
+# the session's topic rather than a hardcoded one.
+[subsystems.telemetry]
+topic = "/custom/studio_feed"
+
+[subsystems.alpha.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1

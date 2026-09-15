@@ -4,8 +4,8 @@
 #include <string>
 #include <thread>
 
-#include "2026-robot/main_processor/drivetrain/drive_message_generated.h"
-#include "2026-robot/main_processor/drivetrain/packet.h"
+#include "talos_nodes/drivetrain/drive_message_generated.h"
+#include "talos_nodes/drivetrain/packet.h"
 #include "talOS/events/os/poller.h"
 #include "talOS/ipc/publisher.h"
 

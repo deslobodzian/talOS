@@ -1,23 +1,22 @@
-load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 # The subsystem's own config file, so the robot manifest filegroup can ship it.
 exports_files(["subsystem.toml"])
-load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 cc_library(
     name = "telemetry",
     hdrs = ["node.h"],
+    strip_include_prefix = ".",
+    include_prefix = "talos_nodes/year2026_telemetry",
     deps = [
-        "//2026-robot/main_processor/driver_station:driver_station",
-        "//2026-robot/main_processor/drivetrain:drivetrain",
-        "//2026-robot/main_processor/odometry:odometry",
-        "//studio/schema:wire",
-        "//studio/schema:telemetry_cc",
-        "//talOS/driver_station:driver_station",
+        "@talos_telemetry//:telemetry",
+        "//2026-robot/main_processor/intake:messages_cc",
+        "//2026-robot/main_processor/shooter:messages_cc",
+        "//talOS/configuration:configuration",
         "//talOS/events:events",
-        "//talOS/rtms:rtms",
-        "@flatbuffers//:flatbuffers",
+        "//talOS/process:node_main",
     ],
     visibility = ["//visibility:public"],
 )

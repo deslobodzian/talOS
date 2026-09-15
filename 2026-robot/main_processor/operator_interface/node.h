@@ -1,112 +1,61 @@
 #pragma once
 
-#include <cmath>
 #include <cstdint>
-#include <numbers>
 
-#include "2026-robot/main_processor/driver_station/driver_station_message_generated.h"
-#include "2026-robot/main_processor/driver_station/packet.h"
-#include "2026-robot/main_processor/drivetrain/drive_message_generated.h"
-#include "2026-robot/main_processor/drivetrain/packet.h"
-#include "2026-robot/main_processor/intake/intake_message_generated.h"
-#include "2026-robot/main_processor/intake/packet.h"
-#include "2026-robot/main_processor/shooter/packet.h"
-#include "2026-robot/main_processor/shooter/shooter_message_generated.h"
+#include "talos_nodes/driver_station/driver_station_message_generated.h"
+#include "talos_nodes/driver_station/packet.h"
+#include "talos_nodes/intake/intake_message_generated.h"
+#include "talos_nodes/intake/packet.h"
+#include "talos_nodes/operator_interface/node.h"
+#include "talos_nodes/shooter/packet.h"
+#include "talos_nodes/shooter/shooter_message_generated.h"
+#include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/handles.h"
+#include "talOS/process/node_main.h"
 
-// The operator interface: what the driver's inputs mean. It consumes the
-// decoded Driver Station state and produces requests -- stick mapping, scaling,
-// deadband, button bindings. It is one producer among several, not the
-// authority: the arbiter decides whether teleop is the mode currently driving
-// and is the sole writer of the topics the subsystems consume.
-//
-// Everything here is game logic and is expected to change through a season.
-// Keeping it out of the driver_station node means the wire format has one
-// reader that never changes with it.
-namespace talos::oi {
+// Year-local teleop mechanism bindings for the 2026 game. Composes the
+// reusable platform chassis core (talos-operator_interface) for stick mapping
+// and adds shooter/intake senders, button masks, and setpoints that change
+// each season. The platform core owns the chassis enable/teleop/connected gate
+// and its own falling-edge Release; this wrapper owns a parallel gate for the
+// mechanism targets so a disabled/teleop-exit still tells the shooter and
+// intake to stop.
+namespace talos::oi::year2026 {
 
-struct OperatorInterfaceConfig {
-  double max_linear_mps{4.0};
-  double max_angular_radps{6.0};
-  double deadband{0.05};
+struct YearOperatorInterfaceConfig {
+  OperatorInterfaceConfig chassis{};
   double shooter_target_rps{60.0};
   double intake_target_rps{30.0};
-  // Field-oriented driving needs a heading, so it stays off until the
-  // drivetrain has published one; see OnDrivetrainState.
-  bool field_oriented{true};
-  // Bit 0 is button 1, matching the Driver Station's numbering.
+  // Bit 0 is button 1, bit 1 is button 2, matching Driver Station numbering.
   uint32_t shoot_button_mask{1u << 0};
   uint32_t intake_button_mask{1u << 1};
 };
 
 template <typename Loop>
-class OperatorInterfaceNode {
+class YearOperatorInterfaceNode {
  public:
-  explicit OperatorInterfaceNode(Loop& loop,
-                                 OperatorInterfaceConfig config = {})
+  explicit YearOperatorInterfaceNode(Loop& loop,
+                                     YearOperatorInterfaceConfig config = {})
       : config_{config},
-        chassis_target_{event::make_sender<talos::drive::ChassisTarget>(
-            loop, talos::drive::kTeleopTargetTopic)},
+        chassis_{loop, config_.chassis},
         shooter_target_{event::make_sender<talos::shooter::ShooterTarget>(
             loop, talos::shooter::kTeleopShooterTargetTopic)},
         intake_target_{event::make_sender<talos::intake::IntakeTarget>(
             loop, talos::intake::kTeleopIntakeTargetTopic)} {
     event::watch<driver_station::DriverStationState,
-                 &OperatorInterfaceNode::OnDriverStation>(
+                 &YearOperatorInterfaceNode::OnDriverStation>(
         loop, driver_station::kDsStateTopic, this);
-    event::watch<talos::drive::DrivetrainState,
-                 &OperatorInterfaceNode::OnDrivetrainState>(
-        loop, talos::drive::kDrivetrainStateTopic, this);
   }
 
   void Start(event::MonotonicTime = {}) {}
 
-  bool field_oriented_active() const {
-    return config_.field_oriented && have_heading_;
-  }
   bool commanding() const { return commanding_; }
 
  private:
-  // Zero inside the deadband, then rescaled so the output ramps from 0 at the
-  // threshold to full scale at 1.0 instead of stepping.
-  double Deadband(double value) const {
-    const double magnitude = std::abs(value);
-    if (magnitude <= config_.deadband || config_.deadband >= 1.0) return 0.0;
-    const double scaled =
-        (magnitude - config_.deadband) / (1.0 - config_.deadband);
-    return std::copysign(scaled, value);
-  }
-
-  // Heading for field-oriented driving. The drivetrain owns the yaw, so this
-  // node consumes it rather than reading the gyro a second time.
-  void OnDrivetrainState(const event::Context&,
-                         const talos::drive::DrivetrainState& state) {
-    yaw_rot_ = state.yaw_rot();
-    have_heading_ = true;
-  }
-
-  // Rotates a field-relative request into the robot frame. Field-oriented is
-  // skipped entirely until a heading has arrived, so a missing drivetrain
-  // publisher degrades to robot-relative rather than to driving on yaw 0 --
-  // which would look correct only while the robot happens to face forward.
-  void ToRobotFrame(double& vx, double& vy) const {
-    if (!field_oriented_active()) return;
-    const double yaw_rad = yaw_rot_ * 2.0 * std::numbers::pi;
-    const double cos_yaw = std::cos(yaw_rad), sin_yaw = std::sin(yaw_rad);
-    const double robot_vx = vx * cos_yaw + vy * sin_yaw;
-    const double robot_vy = -vx * sin_yaw + vy * cos_yaw;
-    vx = robot_vx;
-    vy = robot_vy;
-  }
-
-  // One explicit disabled request on the falling edge, so the subsystems are
-  // told to stop rather than being left to time the last request out.
   void Release(const event::Context& ctx) {
     if (!commanding_) return;
     commanding_ = false;
-    chassis_target_.send(
-        talos::drive::ChassisTarget{0.0, 0.0, 0.0, ctx.now.nanos(), false});
     shooter_target_.send(
         talos::shooter::ShooterTarget{0.0, ctx.now.nanos(), false});
     intake_target_.send(talos::intake::IntakeTarget{
@@ -119,26 +68,10 @@ class OperatorInterfaceNode {
     const bool enabled = (flags & driver_station::kEnabled) != 0;
     const bool teleop = (flags & driver_station::kTeleop) != 0;
     const auto& stick = state.stick0();
-
-    // The arbiter also gates on mode, but a producer that keeps talking while
-    // disabled would still be publishing live requests onto its own topic.
     if (!enabled || !teleop || !stick.connected()) {
       Release(ctx);
       return;
     }
-
-    const double raw_vx = -static_cast<double>(stick.axis1());
-    const double raw_vy = -static_cast<double>(stick.axis0());
-    const double raw_omega = -static_cast<double>(stick.axis2());
-
-    double vx = Deadband(raw_vx) * config_.max_linear_mps;
-    double vy = Deadband(raw_vy) * config_.max_linear_mps;
-    const double omega = Deadband(raw_omega) * config_.max_angular_radps;
-    ToRobotFrame(vx, vy);
-
-    commanding_ = true;
-    chassis_target_.send(
-        talos::drive::ChassisTarget{vx, vy, omega, ctx.now.nanos(), true});
 
     const bool shoot = (stick.buttons() & config_.shoot_button_mask) != 0;
     shooter_target_.send(talos::shooter::ShooterTarget{
@@ -149,16 +82,40 @@ class OperatorInterfaceNode {
     intake_target_.send(talos::intake::IntakeTarget{
         static_cast<uint64_t>(ctx.now.nanos()), intake,
         intake ? static_cast<float>(config_.intake_target_rps) : 0.0f});
+    commanding_ = true;
   }
 
-  OperatorInterfaceConfig config_;
-  event::Sender<Loop, talos::drive::ChassisTarget> chassis_target_;
+  YearOperatorInterfaceConfig config_;
+  OperatorInterfaceNode<Loop> chassis_;
   event::Sender<Loop, talos::shooter::ShooterTarget> shooter_target_;
   event::Sender<Loop, talos::intake::IntakeTarget> intake_target_;
-
-  double yaw_rot_{0.0};
-  bool have_heading_{false};
   bool commanding_{false};
 };
 
-}  // namespace talos::oi
+// Factory for talos_cc_node: chassis tuning plus year mechanism bindings come
+// from the operator_interface subsystem table, with compiled defaults.
+inline auto CreateNode(auto& loop, const talos::process::NodeFlags& flags) {
+  const auto robot_config = talos::config::ParseRobotConfig(flags.config_path);
+  YearOperatorInterfaceConfig cfg{};
+  if (const auto* tbl = robot_config.GetSubsystemTable("operator_interface")) {
+    cfg.chassis.max_linear_mps =
+        (*tbl)["max_linear_mps"].value_or(cfg.chassis.max_linear_mps);
+    cfg.chassis.max_angular_radps = (*tbl)["max_angular_radps"].value_or(
+        cfg.chassis.max_angular_radps);
+    cfg.chassis.deadband =
+        (*tbl)["deadband"].value_or(cfg.chassis.deadband);
+    cfg.chassis.field_oriented =
+        (*tbl)["field_oriented"].value_or(cfg.chassis.field_oriented);
+    cfg.shooter_target_rps =
+        (*tbl)["shooter_target_rps"].value_or(cfg.shooter_target_rps);
+    cfg.shoot_button_mask =
+        (*tbl)["shoot_button_mask"].value_or(cfg.shoot_button_mask);
+    cfg.intake_target_rps =
+        (*tbl)["intake_target_rps"].value_or(cfg.intake_target_rps);
+    cfg.intake_button_mask =
+        (*tbl)["intake_button_mask"].value_or(cfg.intake_button_mask);
+  }
+  return YearOperatorInterfaceNode{loop, cfg};
+}
+
+}  // namespace talos::oi::year2026

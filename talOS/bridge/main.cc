@@ -8,11 +8,13 @@
 int main(int argc, char** argv) {
   try {
     // No default: the framework names no robot (ARCHITECTURE.md Rule 1), so
-    // --config is required. Empty means missing.
+    // --config is required. Empty means missing. Controller addressing is
+    // config-driven: an explicit CLI flag wins, otherwise [robot]
+    // controller_address / controller_port / local_port apply.
     std::string config_path;
-    std::string remote_ip = "127.0.0.1";
-    uint16_t remote_port = 5802;
-    uint16_t local_port = 5803;
+    std::string remote_cli;
+    uint16_t remote_port_cli = 0;
+    uint16_t local_port_cli = 0;
     int duration_s = 0;
     bool simulation = false;
     uint64_t session_id = 0;
@@ -23,11 +25,11 @@ int main(int argc, char** argv) {
       if (arg == "--config" && i + 1 < argc) {
         config_path = argv[++i];
       } else if (arg == "--remote" && i + 1 < argc) {
-        remote_ip = argv[++i];
+        remote_cli = argv[++i];
       } else if (arg == "--remote-port" && i + 1 < argc) {
-        remote_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        remote_port_cli = static_cast<uint16_t>(std::stoi(argv[++i]));
       } else if (arg == "--local-port" && i + 1 < argc) {
-        local_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        local_port_cli = static_cast<uint16_t>(std::stoi(argv[++i]));
       } else if (arg == "--duration-s" && i + 1 < argc) {
         duration_s = std::stoi(argv[++i]);
       } else if (arg == "--sim") {
@@ -41,19 +43,25 @@ int main(int argc, char** argv) {
       } else {
         throw std::invalid_argument(
             "usage: hardware_node --config PATH [--remote IP] "
-            "[--duration-s N] [--sim] [--log PATH] [--session-id ID] "
-            "[--describe]");
+            "[--remote-port PORT] [--local-port PORT] [--duration-s N] "
+            "[--sim] [--log PATH] [--session-id ID] [--describe]");
       }
     }
 
     if (config_path.empty()) {
       throw std::invalid_argument(
           "usage: hardware_node --config PATH [--remote IP] "
-          "[--duration-s N] [--sim] [--log PATH] [--session-id ID] "
-          "[--describe]");
+          "[--remote-port PORT] [--local-port PORT] [--duration-s N] "
+          "[--sim] [--log PATH] [--session-id ID] [--describe]");
     }
 
     auto robot_config = talos::config::ParseRobotConfig(config_path);
+    const std::string remote_ip =
+        talos::config::ResolveControllerAddress(robot_config, remote_cli);
+    const uint16_t remote_port =
+        talos::config::ResolveControllerPort(robot_config, remote_port_cli);
+    const uint16_t local_port =
+        talos::config::ResolveLocalPort(robot_config, local_port_cli);
     talos::hardware::HardwareNode node{std::move(robot_config),
                                        remote_ip,
                                        remote_port,
