@@ -1,146 +1,56 @@
-# talOS deployment guide
+# Deployment
 
-Ship a whole robot as one directory: binaries, configuration, and the
-provenance that says which is which. Deployments roll forward and back as
-whole bundles with their matching configuration and runtime, never by
-mixing node versions across bundles.
+The main processor runs a **bundle**: one directory with every node binary, the
+launcher, the config and the runtime libraries. `tools/deploy.sh` installs
+bundles, starts one on boot, shows logs and rolls back.
 
-All commands below are executed by `tools/delivery/walkthrough_test.py`
-(scaffold/launcher flags against the real `--help` output, deploy/readiness
-flags against the real CLIs), so a stale command fails the build, not the
-pit crew.
+## Build a bundle
 
-## Example vs competition configuration
-
-Two configuration kinds appear in this repo; they are not interchangeable:
-
-- **Example config** (scaffolded `subsystem.toml`, `testdata/robot.toml` in a
-  fresh `tools/node_scaffold` project, `test/fixtures/*`): nonzero placeholder
-  device IDs for local `bazel test //...`. Never deploy these.
-- **Competition config** (`2026-robot/main_processor/configuration/robot.toml`
-  plus `subsystems/*.toml`): the physical CAN IDs, buses, inversions, gear
-  ratios, and gains of the real robot. Only bundles assembled from this tree
-  go on the companion.
-
-Every `subsystem.toml` snippet in this guide is marked. Unmarked TOML is an
-example.
-
-## 1. Assemble the bundle (competition config)
-
-```bash
+```sh
 bazel build //2026-robot/main_processor:robot_bundle
 ```
 
-The `talos_bundle` rule stages the launcher, every node binary with its
-runtime closure, the competition `robot.toml` plus each `subsystems/*.toml`,
-and writes `bundle_manifest.json`: per-node target/binary/contract labels
-and `config_sha256` over the robot config plus every subsystem file (names
-mixed in, so a rename is an identity change).
+`talos_bundle` (`talOS/build/contract.bzl`) takes `nodes`, `config`
+(`robot.toml`) and `subsystems` (the `subsystems/*.toml` files) and writes
+`bazel-bin/2026-robot/main_processor/robot_bundle/`:
 
-Record the deployment (item 57) alongside the bundle:
+| Entry | What |
+|---|---|
+| `run.sh` | runs `./launcher --bundle <dir> --config config/robot.toml "$@"` |
+| `launcher` | `//talOS/launcher` |
+| `bin/` | node binaries and their runfiles |
+| `lib/libtalos_node.so` | runtime for Python nodes |
+| `config/` | `robot.toml` plus one `<name>.toml` per subsystem |
+| `bundle_manifest.json` | node names, targets, languages, config SHA-256 |
 
-```bash
-python3 tools/delivery/compat_record.py --bundle bazel-bin/2026-robot/main_processor/robot_bundle \
-    --out deploy_record.json --vendor vendor_expectations.json
-python3 tools/delivery/compat_record.py --bundle bazel-bin/2026-robot/main_processor/robot_bundle --check
+Before deploying, set `[robot] controller_address` in the config to the RoboRIO
+(the shipped value is loopback for simulation) and `commissioned = true` once
+the hardware is checked; or pass `--remote <ip>` to `run.sh`.
+
+## On the main processor
+
+```sh
+./tools/deploy.sh install <bundle> [--prefix /opt/talos]
+./tools/deploy.sh enable-boot [--prefix /opt/talos] [--user talos] [--dry-run]
+./tools/deploy.sh logs [--prefix /opt/talos] [dir]
+./tools/deploy.sh rollback [--prefix /opt/talos]
 ```
 
-`--check` refuses a bundle whose configuration was hand-edited after
-assembly (hash mismatch), that lost a node binary, or that runs an unknown
-`bundle_version`. A missing contract label is a warning, and only valid for
-schema-less nodes (e.g. the arbiter): provenance is traceability, not a
-compatibility proof.
+- **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only),
+  moves `current` to `previous`, and points `current` at the new one.
+- **enable-boot** writes `/etc/systemd/system/talos.service` running
+  `<prefix>/current/run.sh` (restart on failure) and enables it. `--dry-run`, or
+  macOS, prints the unit instead.
+- **logs** prints the session manifest (session id, config path and hash, each
+  node's exit code and log path) found under `current` (or `dir`), or lists the
+  directory if there is none.
+- **rollback** swaps `current` and `previous`: the whole previous bundle, with
+  its own config.
 
-## 2. Install
+Run by hand: `/opt/talos/current/run.sh --duration-s 30`.
 
-```bash
-./tools/delivery/deploy.sh install <bundle> --prefix /opt/talos
-```
+## RoboRIO
 
-Verifies the manifest hash first, copies the bundle to
-`/opt/talos/bundles/<timestamp>/`, and flips the `current` symlink,
-keeping `previous` for rollback. `--dry-run` prints every step instead.
-
-## 3. Networking
-
-The companion talks to the RoboRIO gateway over UDP (5802 on the gateway,
-5803 on the companion). The only network touch in the tooling is this probe:
-
-```bash
-./tools/delivery/deploy.sh check-network --controller 10.56.87.2 --port 5802
-```
-
-Everything else — install, verify, run — works with the cable unplugged.
-The launch itself takes the endpoint from the competition config
-(`[robot] controller_address`, overrides `--remote`, `--remote-port`,
-`--local-port`):
-
-```toml
-# competition config: 2026-robot/main_processor/configuration/robot.toml
-[robot]
-controller_address = "10.56.87.2"
-controller_port = 5802
-local_port = 5803
-```
-
-## 4. Boot start
-
-```bash
-./tools/delivery/deploy.sh enable-boot --prefix /opt/talos
-```
-
-Installs a systemd unit that runs `/opt/talos/current/run.sh` on boot with
-restart-on-failure. `--dry-run` prints the unit; on macOS (no systemd) the
-`ExecStart` line goes into a launchd plist instead.
-
-## 5. Run and inspect logs
-
-```bash
-/opt/talos/current/run.sh
-/opt/talos/current/run.sh -- --duration-s 30
-./tools/delivery/deploy.sh logs --prefix /opt/talos
-```
-
-`logs` prints the session manifest first (session id, config path and hash),
-then each node's exit code, failure flag, and record count with its log
-path — the same fields the readiness report consumes.
-
-## 6. Roll back
-
-```bash
-./tools/delivery/deploy.sh rollback --prefix /opt/talos
-```
-
-Swaps `current` back to `previous`: the whole previous bundle with its
-matching configuration and runtime. Diagnose from the kept logs, fix by
-rebuilding the bundle, never by mixing node versions.
-
-## 7. Offline startup (item 58)
-
-```bash
-./tools/delivery/deploy.sh verify-offline <bundle>
-```
-
-Fails when the launch path references the network (`curl`/`wget`) or the
-build tree (`bazel-bin`), then re-runs the manifest `--check`. An installed
-bundle starts from its own files: `run.sh` sets `LD_LIBRARY_PATH` and
-`TALOS_NODE_LIB` from the bundle's `lib/` and needs no network, no Bazel,
-no source checkout. For air-gapped event builds, vendor the module closure
-first (`bazel vendor --vendor_dir=vendor`, then
-`bazel build --vendor_dir=vendor //2026-robot/main_processor:robot_bundle`).
-
-## 8. Pre-flight and readiness
-
-```bash
-bazel run //talOS/launcher:launcher -- --config 2026-robot/main_processor/configuration/robot.toml --describe-only
-python3 tools/delivery/readiness.py --config 2026-robot/main_processor/configuration/robot.toml \
-    --bundle /opt/talos/current --vendor vendor_expectations.json
-```
-
-`--describe-only` asks every binary what it is, lints the declared graph,
-and refuses on errors unless `--allow-graph-errors` (competition-queue
-override: printed errors, human decision). `readiness.py` reports the four
-dimensions — processes, hardware, config, feedback — plus vendor/firmware,
-each with specific inhibit reasons; exit 0 is READY, exit 1 names what
-blocks. `docs/READINESS.md` is captured output of this tool; regenerate it,
-never hand-edit it.
+`2026-robot/controller_processor/rio` is deployed with GradleRIO
+(`./gradlew deploy` in that directory). Set `kCompanionAddress` in
+`src/main/cpp/Robot.cpp` to the main processor's address first.

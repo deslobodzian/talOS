@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -55,8 +56,9 @@ struct NodeProcessInfo {
   std::string target;
   std::string binary_path;
   // Contract label recorded in the bundle manifest (e.g.
-  // "@talos_shooter//:contract"). Traceability, not a compatibility proof:
-  // a matching label does not establish wire compatibility.
+  // "//2026-robot/main_processor/drivetrain:contract"). Traceability, not a
+  // compatibility proof: a matching label does not establish wire
+  // compatibility.
   std::string contract;
   std::string log_path;
   pid_t pid{-1};
@@ -289,11 +291,6 @@ inline bool LoadBundle(LauncherOptions& options, std::string& error) {
         std::string full_bin = (bpath / binary_path).string();
         if (!node_target.empty()) {
           options.binary_overrides[node_target] = full_bin;
-          if (node_target.find('+') != std::string::npos) {
-            std::string no_plus = node_target;
-            no_plus.erase(std::remove(no_plus.begin(), no_plus.end(), '+'), no_plus.end());
-            options.binary_overrides[no_plus] = full_bin;
-          }
         }
         options.binary_overrides[node_name] = full_bin;
       }
@@ -312,186 +309,34 @@ inline bool LoadBundle(LauncherOptions& options, std::string& error) {
   return true;
 }
 
+// Resolves a node target to an executable path: an explicit override (bundle
+// manifest or test) wins, then the target's bazel-bin output relative to the
+// workspace. Anything that is not a `//pkg:target` label is taken as a path.
 inline std::string ResolveBinary(
     const std::string& target_or_path,
-    const std::map<std::string, std::string>& overrides = {},
-    const std::string& bundle_dir = "") {
-  auto it = overrides.find(target_or_path);
-  if (it != overrides.end()) {
+    const std::map<std::string, std::string>& overrides = {}) {
+  if (auto it = overrides.find(target_or_path); it != overrides.end()) {
     return it->second;
   }
+  if (!target_or_path.starts_with("//")) return target_or_path;
+  std::string subpath = target_or_path.substr(2);
+  std::replace(subpath.begin(), subpath.end(), ':', '/');
+  return "bazel-bin/" + subpath;
+}
 
-  if (target_or_path.find('+') != std::string::npos) {
-    std::string no_plus = target_or_path;
-    no_plus.erase(std::remove(no_plus.begin(), no_plus.end(), '+'), no_plus.end());
-    it = overrides.find(no_plus);
-    if (it != overrides.end()) return it->second;
-  } else if (target_or_path.starts_with("@")) {
-    auto slash2 = target_or_path.find("//");
-    if (slash2 != std::string::npos) {
-      std::string with_plus = target_or_path.substr(0, slash2) + "+" + target_or_path.substr(slash2);
-      it = overrides.find(with_plus);
-      if (it != overrides.end()) return it->second;
-    }
+// ResolveBinary, falling back to an override keyed by the node's name (a
+// bundle manifest records both) when the target does not resolve.
+inline NodeSpec MakeNodeSpec(const std::string& name, const std::string& target,
+                             const LauncherOptions& options) {
+  NodeSpec spec;
+  spec.name = name;
+  spec.target = target;
+  spec.binary_path = ResolveBinary(target, options.binary_overrides);
+  if (::access(spec.binary_path.c_str(), X_OK) != 0) {
+    auto it = options.binary_overrides.find(name);
+    if (it != options.binary_overrides.end()) spec.binary_path = it->second;
   }
-
-  // If already a regular file path (or exists as executable), check it
-  if (!target_or_path.starts_with("//") && !target_or_path.starts_with("@")) {
-    if (::access(target_or_path.c_str(), X_OK) == 0) {
-      return target_or_path;
-    }
-  }
-
-  // Parse repo and package/target subpath
-  std::string repo_part;
-  std::string subpath;
-
-  auto slash_pos = target_or_path.find("//");
-  if (slash_pos != std::string::npos) {
-    repo_part = target_or_path.substr(0, slash_pos);
-    subpath = target_or_path.substr(slash_pos + 2);
-    while (!repo_part.empty() && repo_part.front() == '@') {
-      repo_part.erase(0, 1);
-    }
-  } else {
-    subpath = target_or_path;
-    if (subpath.starts_with("//")) {
-      subpath = subpath.substr(2);
-    }
-  }
-
-  for (char& c : subpath) {
-    if (c == ':') c = '/';
-  }
-
-  std::string target_name = subpath;
-  auto last_slash = target_name.rfind('/');
-  if (last_slash != std::string::npos) {
-    target_name = target_name.substr(last_slash + 1);
-  }
-  std::string pkg_name;
-  if (last_slash != std::string::npos && last_slash > 0) {
-    auto second_last = subpath.rfind('/', last_slash - 1);
-    if (second_last != std::string::npos) {
-      pkg_name = subpath.substr(second_last + 1, last_slash - second_last - 1);
-    } else {
-      pkg_name = subpath.substr(0, last_slash);
-    }
-  }
-
-  if (!target_name.empty() && target_name != "node") {
-    it = overrides.find(target_name);
-    if (it != overrides.end()) return it->second;
-  }
-  if (!repo_part.empty()) {
-    std::string clean_repo = repo_part;
-    if (clean_repo.ends_with("+")) clean_repo.pop_back();
-    it = overrides.find(clean_repo);
-    if (it != overrides.end()) return it->second;
-    if (clean_repo.starts_with("talos_")) clean_repo = clean_repo.substr(6);
-    else if (clean_repo.starts_with("talos-")) clean_repo = clean_repo.substr(6);
-    it = overrides.find(clean_repo);
-    if (it != overrides.end()) return it->second;
-  }
-  if (!pkg_name.empty()) {
-    it = overrides.find(pkg_name);
-    if (it != overrides.end()) return it->second;
-  }
-
-  std::vector<std::string> candidates;
-
-  // Bundle candidates if bundle_dir is provided
-  if (!bundle_dir.empty()) {
-    if (!pkg_name.empty() && target_name == "node") {
-      candidates.push_back(bundle_dir + "/bin/" + pkg_name);
-    }
-    if (!repo_part.empty() && target_name == "node") {
-      candidates.push_back(bundle_dir + "/bin/" + repo_part);
-      if (repo_part.starts_with("talos_")) {
-        candidates.push_back(bundle_dir + "/bin/" + repo_part.substr(6));
-      }
-    }
-    candidates.push_back(bundle_dir + "/bin/" + target_name);
-    candidates.push_back(bundle_dir + "/" + subpath);
-    candidates.push_back(bundle_dir + "/bazel-bin/" + subpath);
-  }
-
-  const char* test_srcdir = std::getenv("TEST_SRCDIR");
-  const char* runfiles = std::getenv("RUNFILES_DIR");
-
-  // External repository candidates
-  if (!repo_part.empty()) {
-    if (test_srcdir) {
-      candidates.push_back(std::string(test_srcdir) + "/" + repo_part + "/" +
-                           subpath);
-      candidates.push_back(std::string(test_srcdir) + "/_main/external/" +
-                           repo_part + "/" + subpath);
-      candidates.push_back(std::string(test_srcdir) + "/_main/external/+" +
-                           repo_part + "/" + subpath);
-    }
-    if (runfiles) {
-      candidates.push_back(std::string(runfiles) + "/" + repo_part + "/" +
-                           subpath);
-      candidates.push_back(std::string(runfiles) + "/_main/external/" +
-                           repo_part + "/" + subpath);
-      candidates.push_back(std::string(runfiles) + "/_main/external/+" +
-                           repo_part + "/" + subpath);
-    }
-    candidates.push_back("bazel-bin/external/" + repo_part + "/" + subpath);
-    candidates.push_back("bazel-bin/external/+" + repo_part + "/" + subpath);
-    // Bzlmod canonical layout for registry/override modules (e.g. an
-    // apparent "@talos_shooter" lives at bazel-bin/external/talos_shooter+/).
-    candidates.push_back("bazel-bin/external/" + repo_part + "+/" + subpath);
-    candidates.push_back("external/" + repo_part + "/" + subpath);
-    candidates.push_back("external/+" + repo_part + "/" + subpath);
-    candidates.push_back("external/" + repo_part + "+/" + subpath);
-  }
-
-  // Standard development / local candidates
-  if (test_srcdir) {
-    candidates.push_back(std::string(test_srcdir) + "/_main/" + subpath);
-    candidates.push_back(std::string(test_srcdir) + "/talos/" + subpath);
-    candidates.push_back(std::string(test_srcdir) + "/" + subpath);
-  }
-  if (runfiles) {
-    candidates.push_back(std::string(runfiles) + "/_main/" + subpath);
-    candidates.push_back(std::string(runfiles) + "/talos/" + subpath);
-    candidates.push_back(std::string(runfiles) + "/" + subpath);
-  }
-  candidates.push_back("bazel-bin/" + subpath);
-  candidates.push_back(subpath);
-  candidates.push_back("./" + subpath);
-  candidates.push_back("../" + subpath);
-
-  // If subpath ends with "hardware_node", also check "node"
-  if (subpath.ends_with("hardware_node")) {
-    std::string alt_subpath = subpath.substr(0, subpath.size() - 13) + "node";
-    candidates.push_back("bazel-bin/" + alt_subpath);
-    candidates.push_back(alt_subpath);
-    candidates.push_back("./" + alt_subpath);
-    candidates.push_back("../" + alt_subpath);
-  }
-
-  // sim_gateway alternative path
-  if (subpath.ends_with("drivetrain/sim_gateway")) {
-    std::string alt =
-        subpath.substr(0, subpath.size() - 22) + "simulation/sim_gateway";
-    candidates.push_back("bazel-bin/" + alt);
-    candidates.push_back(alt);
-  } else if (subpath.ends_with("simulation/sim_gateway")) {
-    std::string alt =
-        subpath.substr(0, subpath.size() - 22) + "drivetrain/sim_gateway";
-    candidates.push_back("bazel-bin/" + alt);
-    candidates.push_back(alt);
-  }
-
-  for (const auto& path : candidates) {
-    if (::access(path.c_str(), X_OK) == 0) {
-      return path;
-    }
-  }
-
-  return candidates.front();
+  return spec;
 }
 
 inline std::vector<NodeSpec> DiscoverNodes(
@@ -507,41 +352,16 @@ inline std::vector<NodeSpec> DiscoverNodes(
       }
     }
   }
-  NodeSpec hw_spec;
-  hw_spec.name = "hardware_node";
-  hw_spec.target = hw_target;
-  std::string hw_resolved =
-      ResolveBinary(hw_target, options.binary_overrides, options.bundle_dir);
-  if (hw_resolved.empty() || ::access(hw_resolved.c_str(), X_OK) != 0) {
-    auto it_hw = options.binary_overrides.find("hardware_node");
-    if (it_hw != options.binary_overrides.end()) {
-      hw_resolved = it_hw->second;
-    }
-  }
-  hw_spec.binary_path = hw_resolved;
-  specs.push_back(hw_spec);
+  specs.push_back(MakeNodeSpec("hardware_node", hw_target, options));
 
   // 2. Subsystems
   if (auto* subs = robot_config.toml_data["subsystems"].as_table()) {
     for (auto&& [sub_key, sub_val] : *subs) {
-      std::string sub_name = std::string(sub_key.str());
       if (auto* sub_tbl = sub_val.as_table()) {
         if (auto node_field = (*sub_tbl)["node"]) {
           if (auto node_val = node_field.value<std::string_view>()) {
-            std::string target = std::string(*node_val);
-            NodeSpec spec;
-            spec.name = sub_name;
-            spec.target = target;
-            std::string resolved =
-                ResolveBinary(target, options.binary_overrides, options.bundle_dir);
-            if (resolved.empty() || ::access(resolved.c_str(), X_OK) != 0) {
-              auto it_sub = options.binary_overrides.find(sub_name);
-              if (it_sub != options.binary_overrides.end()) {
-                resolved = it_sub->second;
-              }
-            }
-            spec.binary_path = resolved;
-            specs.push_back(spec);
+            specs.push_back(MakeNodeSpec(std::string(sub_key.str()),
+                                         std::string(*node_val), options));
           }
         }
       }
@@ -560,12 +380,7 @@ inline std::vector<NodeSpec> DiscoverNodes(
       }
     }
     if (!gw_target.empty()) {
-      NodeSpec gw_spec;
-      gw_spec.name = "sim_gateway";
-      gw_spec.target = gw_target;
-      gw_spec.binary_path =
-          ResolveBinary(gw_target, options.binary_overrides, options.bundle_dir);
-      specs.push_back(gw_spec);
+      specs.push_back(MakeNodeSpec("sim_gateway", gw_target, options));
     }
   }
 
@@ -575,12 +390,8 @@ inline std::vector<NodeSpec> DiscoverNodes(
   // per-robot target to require). Sim sessions only: in a deployed session
   // there is no build tree serving the webroot and no browser to open.
   if (options.start_studio_bridge && options.simulation) {
-    NodeSpec studio_spec;
-    studio_spec.name = "studio_bridge";
-    studio_spec.target = robot_config.studio.bridge;
-    studio_spec.binary_path = ResolveBinary(
-        studio_spec.target, options.binary_overrides, options.bundle_dir);
-    specs.push_back(studio_spec);
+    specs.push_back(
+        MakeNodeSpec("studio_bridge", robot_config.studio.bridge, options));
   }
 
   return specs;
@@ -874,9 +685,9 @@ inline std::size_t CountDeclaredTopics(
 // What the bridge itself described is what it watches: its --describe reads
 // the same [subsystems.telemetry] topic key the telemetry node reads, so this
 // follows a topic override with no second spelling of it. The fallback pins
-// talos-telemetry/node.h kStudioTopic by value; the graph lint pins the copy,
-// failing the launch with "read by studio_bridge but nothing publishes it" if
-// it ever drifts.
+// 2026-robot/main_processor/telemetry/node.h kStudioTopic by value; the graph
+// lint pins the copy, failing the launch with "read by studio_bridge but
+// nothing publishes it" if it ever drifts.
 inline std::string StudioBridgeWatchTopic(
     const std::vector<NodeDescription>& described) {
   std::string topic = "/talos/telemetry";

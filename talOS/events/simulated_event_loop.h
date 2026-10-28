@@ -10,7 +10,6 @@
 
 #include "talOS/events/event_loop_base.h"
 #include "talOS/events/handles.h"
-#include "talOS/events/metrics.h"
 #include "talOS/events/recorder.h"
 #include "talOS/events/scheduler.h"
 #include "talOS/events/time.h"
@@ -73,13 +72,10 @@ class SimulationEnvironment {
 // program over the same injected inputs produce identical logs. That makes it
 // the right place to test the determinism contract itself, with the realtime
 // loop then proving the same contract holds when timing is messy.
-template <RecorderPolicy Recorder = NullRecorder,
-          MetricsPolicy Metrics = NullMetrics>
+template <RecorderPolicy Recorder = NullRecorder>
 class SimulatedEventLoop
-    : public EventLoopBase<SimulatedEventLoop<Recorder, Metrics>, Recorder,
-                           Metrics> {
-  using Base =
-      EventLoopBase<SimulatedEventLoop<Recorder, Metrics>, Recorder, Metrics>;
+    : public EventLoopBase<SimulatedEventLoop<Recorder>, Recorder> {
+  using Base = EventLoopBase<SimulatedEventLoop<Recorder>, Recorder>;
   friend Base;
 
  public:
@@ -99,7 +95,6 @@ class SimulatedEventLoop
         options_{options} {}
 
   using SendOutcome = typename Base::SendOutcome;
-  using FetchResult = typename Base::FetchResult;
 
   MonotonicTime now_impl() const { return now_; }
 
@@ -208,23 +203,6 @@ class SimulatedEventLoop
   SendOutcome send_impl(std::uint16_t id, std::span<const std::byte> bytes) {
     Cursor& cursor = cursors_[id];
     return SendOutcome{SendStatus::OK, cursor.channel->publish(bytes)};
-  }
-
-  FetchResult fetch_impl(std::uint16_t id, std::span<std::byte> destination) {
-    Cursor& cursor = cursors_[id];
-    const std::uint64_t available = cursor.channel->next_sequence();
-
-    if (cursor.sequence >= available) {
-      return FetchResult{FetchOutcome::EMPTY, 0, 0};
-    }
-
-    const std::uint64_t sequence = available - 1;
-    const std::uint64_t dropped = sequence - cursor.sequence;
-
-    cursor.channel->copy_to(sequence, destination);
-    cursor.sequence = sequence + 1;
-
-    return FetchResult{FetchOutcome::VALUE, sequence, dropped};
   }
 
   // Virtual time always lands exactly on the deadline, so a message's

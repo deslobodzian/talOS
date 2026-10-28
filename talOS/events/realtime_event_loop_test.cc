@@ -39,6 +39,12 @@ std::string temp_path(std::string_view name) {
 
 using RecordingLoop = RealtimeEventLoop<log::LogWriter>;
 
+std::uint16_t register_sensor_watcher(RealtimeEventLoop<>& loop,
+                                      const std::string& topic) {
+  return loop.register_watcher(topic, sizeof(EventsTest::SensorMessage),
+                               alignof(EventsTest::SensorMessage), Thunk{});
+}
+
 TEST(RealtimeEventLoop, PeriodicTimerRunsAtRate) {
   RealtimeEventLoop<> loop;
 
@@ -66,40 +72,6 @@ TEST(RealtimeEventLoop, PeriodicTimerRunsAtRate) {
   // collapsed into an overrun.
   EXPECT_GE(total_cycles, fired);
   EXPECT_LE(total_cycles, 220u);
-}
-
-// Instrumentation has to work on the loop that actually has jitter to report.
-TEST(RealtimeEventLoop, MetricsMeasureLatencyAndJitter) {
-  RealtimeEventLoop<NullRecorder, LoopMetrics> loop;
-
-  auto handler = [](const Context&) {};
-  const std::uint16_t id = loop.register_timer("tick", make_thunk(&handler));
-  Timer<RealtimeEventLoop<NullRecorder, LoopMetrics>> timer{&loop, id};
-  timer.setup_periodic(Poller::now() + 1ms, 1ms);
-
-  loop.run_for(200ms);
-
-  const SourceMetrics& metrics = loop.metrics().source(id);
-
-  ASSERT_GT(metrics.dispatches, 10u);
-  EXPECT_EQ(metrics.dispatches, metrics.latency.count());
-
-  // A real loop is always at least slightly late, and never early: the
-  // dispatch happens after the deadline by definition.
-  EXPECT_GE(metrics.latency.min_ns(), 0);
-  EXPECT_GE(metrics.latency.max_ns(), metrics.latency.min_ns());
-  EXPECT_GE(metrics.latency.percentile_ns(0.99), metrics.latency.mean_ns() / 2);
-
-  // Intervals cluster around the 1 ms period.
-  ASSERT_GT(metrics.interval.count(), 0u);
-  EXPECT_GT(metrics.interval.percentile_ns(0.50), 500'000);
-  EXPECT_LT(metrics.interval.percentile_ns(0.50), 3'000'000);
-
-  // An empty handler is fast, and utilization is therefore tiny.
-  EXPECT_LT(metrics.handler_time.percentile_ns(0.50), 100'000);
-  EXPECT_LT(loop.metrics().utilization(), 0.5);
-
-  EXPECT_FALSE(loop.metrics().report(loop.manifest()).empty());
 }
 
 TEST(RealtimeEventLoop, ExitFromAnotherThreadReturnsPromptly) {
@@ -183,7 +155,7 @@ TEST(RealtimeEventLoop, ReleasesReadersWhenLoopIsDestroyed) {
                    alignof(EventsTest::SensorMessage), MAX_SLOTS};
   for (std::size_t i = 0; i < MAX_READERS * 2; ++i) {
     RealtimeEventLoop<> loop;
-    EXPECT_NO_THROW(make_fetcher<EventsTest::SensorMessage>(loop, topic));
+    EXPECT_NO_THROW(register_sensor_watcher(loop, topic));
   }
 }
 
@@ -199,13 +171,11 @@ TEST(RealtimeEventLoop, ReaderExhaustionFailsRegistrationAndAllowsRetry) {
   }
   {
     RealtimeEventLoop<> loop;
-    EXPECT_THROW(make_fetcher<EventsTest::SensorMessage>(loop, topic),
-                 RegistrationError);
+    EXPECT_THROW(register_sensor_watcher(loop, topic), RegistrationError);
     EXPECT_TRUE(loop.manifest().empty());
     keeper.release_reader(readers.back());
     readers.pop_back();
-    auto fetcher = make_fetcher<EventsTest::SensorMessage>(loop, topic);
-    EXPECT_EQ(fetcher.id(), 0);
+    EXPECT_EQ(register_sensor_watcher(loop, topic), 0);
   }
   const auto recycled = keeper.register_reader();
   ASSERT_TRUE(recycled);

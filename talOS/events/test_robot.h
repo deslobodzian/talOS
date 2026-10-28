@@ -20,8 +20,8 @@ struct Topics {
 };
 
 // A minimal robot exercising every kind of event source: a periodic control
-// timer, a watcher that must not miss a message, a fetcher that samples the
-// newest value, and a sender whose output is what replay verifies.
+// timer, watchers for sensor readings and the operator setpoint (latest value
+// wins), and a sender whose output is what replay verifies.
 //
 // Templated on the loop rather than taking an interface, so the identical
 // handler code runs on the realtime, simulated and replay loops with no
@@ -36,8 +36,8 @@ class TestRobot {
     // log. Keep it stable.
     watch<EventsTest::SensorMessage, &TestRobot::on_sensor>(loop, topics.sensor,
                                                             this);
-    setpoint_ =
-        make_fetcher<EventsTest::SetpointMessage>(loop, topics.setpoint);
+    watch<EventsTest::SetpointMessage, &TestRobot::on_setpoint>(
+        loop, topics.setpoint, this);
     command_ = make_sender<EventsTest::CommandMessage>(loop, topics.command);
     control_ = make_timer<&TestRobot::on_control>(loop, "control", this);
   }
@@ -61,12 +61,12 @@ class TestRobot {
     ++sensor_count_;
   }
 
+  void on_setpoint(const Context&, const EventsTest::SetpointMessage& message) {
+    target_ = message.target();
+  }
+
   void on_control(const Context& context) {
     ++control_count_;
-
-    if (const auto setpoint = setpoint_.fetch()) {
-      target_ = setpoint->target();
-    }
 
     // Deliberately reads the clock through the loop: on replay this returns
     // the recorded time, so the output stays a function of the log.
@@ -84,7 +84,6 @@ class TestRobot {
   Loop* loop_;
   float gain_;
 
-  Fetcher<Loop, EventsTest::SetpointMessage> setpoint_{};
   Sender<Loop, EventsTest::CommandMessage> command_{};
   Timer<Loop> control_{};
 

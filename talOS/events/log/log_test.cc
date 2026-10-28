@@ -37,16 +37,16 @@ Manifest MakeManifest() {
   timer.offset_ns = 0;
   manifest.push_back(timer);
 
-  Registration fetcher;
-  fetcher.id = 1;
-  fetcher.kind = SourceKind::FETCHER;
+  Registration watcher;
+  watcher.id = 1;
+  watcher.kind = SourceKind::WATCHER;
   // Exactly MAX_SOURCE_NAME characters: must survive round trip untruncated.
-  fetcher.name = std::string(MAX_SOURCE_NAME, 'q');
-  fetcher.message_bytes = 128;
-  fetcher.alignment = 4;
-  fetcher.period_ns = 0;
-  fetcher.offset_ns = 0;
-  manifest.push_back(fetcher);
+  watcher.name = std::string(MAX_SOURCE_NAME, 'q');
+  watcher.message_bytes = 128;
+  watcher.alignment = 4;
+  watcher.period_ns = 0;
+  watcher.offset_ns = 0;
+  manifest.push_back(watcher);
 
   Registration sender;
   sender.id = 2;
@@ -95,7 +95,7 @@ void ExpectRecordEquals(const ExpectedRecord& expected,
 }
 
 // Writes the round-trip fixture used by several tests: a manifest, ~50
-// TIMER/MESSAGE/FETCH/SEND records with varying payload sizes (including
+// TIMER/MESSAGE/SEND records with varying payload sizes (including
 // zero-length ones), and a final EXIT. Returns the expected records in
 // on-disk order so callers can verify the reader against them.
 std::vector<ExpectedRecord> WriteFixtureWithOptions(
@@ -127,33 +127,7 @@ std::vector<ExpectedRecord> WriteFixtureWithOptions(
                         context.now.nanos(), context.sequence,
                         static_cast<std::uint32_t>(context.dropped), payload});
 
-    if (i % 5 == 0) {
-      // A fetch that found nothing: payload must be dropped even though we
-      // hand one in, exercising LogWriter's own empty-on-EMPTY guarantee.
-      const std::vector<std::byte> ignored = MakePayload(5, i);
-      writer.fetch(context, source_id, FetchOutcome::EMPTY, ignored,
-                   /*sequence=*/1000 + i, /*dropped=*/0);
-      expected.push_back({static_cast<std::uint16_t>(EventKind::FETCH),
-                          source_id,
-                          context.dispatch_index,
-                          context.event_time.nanos(),
-                          context.now.nanos(),
-                          static_cast<std::uint64_t>(1000 + i),
-                          static_cast<std::uint32_t>(FetchOutcome::EMPTY),
-                          {}});
-    } else if (i % 5 == 1) {
-      const std::size_t fetch_payload_size =
-          static_cast<std::size_t>((i * 3) % 19);
-      const std::vector<std::byte> fetch_payload =
-          MakePayload(fetch_payload_size, i + 1);
-      writer.fetch(context, source_id, FetchOutcome::VALUE, fetch_payload,
-                   /*sequence=*/2000 + i, /*dropped=*/0);
-      expected.push_back(
-          {static_cast<std::uint16_t>(EventKind::FETCH), source_id,
-           context.dispatch_index, context.event_time.nanos(),
-           context.now.nanos(), static_cast<std::uint64_t>(2000 + i),
-           static_cast<std::uint32_t>(FetchOutcome::VALUE), fetch_payload});
-    } else if (i % 5 == 2) {
+    if (i % 5 == 2) {
       const std::size_t send_payload_size =
           static_cast<std::size_t>((i * 11) % 41);
       const std::vector<std::byte> send_payload =
@@ -248,7 +222,7 @@ TEST(LogRoundTrip, SessionIdPreserved) {
 TEST(LogRoundTrip, ManifestPreallocatesLargeMessages) {
   const std::string path = TempPath("smallbuffer");
   // 512 bytes is smaller than the manifest block plus several records, and
-  // one fetch payload below is chosen to exceed it outright.
+  // one payload below is chosen to exceed it outright.
   LogWriter writer{path, "small_buffer_writer", 512};
   Manifest manifest = MakeManifest();
   manifest[0].message_bytes = 1000;

@@ -17,6 +17,22 @@ wrapping. The hardware API also supports Motion Magic when a subsystem needs
 profiled positions. This is not yet a trajectory follower or field-relative
 controller; pose estimation and vision are separate future nodes.
 
+## Code
+
+- `drivetrain.h`: the node, a `talos::Node` class with eight `talos::Motor`s
+  and the Pigeon (`drivetrain_imu`); `drivetrain.cc` is `TALOS_NODE`.
+- `swerve.h`: the kinematics, plain math on the module geometry.
+- `geometry.h`: the geometry, read from `[subsystems.drivetrain.geometry]`;
+  each module names its drive, steer and encoder devices, checked against
+  this subsystem's devices at startup.
+- `drive_message.fbs` + `topics.h`: `drivetrain::ChassisTarget` and
+  `drivetrain::DrivetrainState`, `//2026-robot/main_processor/drivetrain:messages`.
+
+The heading on `/drivetrain/state` is the Pigeon's yaw. Under `--sim` it is
+instead integrated from the rotation the modules measure, because a simulated
+Pigeon reads a valid, permanently zero yaw; `integrate_heading = true|false`
+in `[subsystem]` overrides that choice.
+
 ## Local Topics
 
 Names follow `talOS/NAMING.md`, which is normative for their grammar and for
@@ -35,9 +51,10 @@ The node subscribes to one target topic however many producers exist:
 to `/drivetrain/target`.
 
 Chassis units are meters/second and radians/second. Axes are forward X, left Y,
-CCW yaw. Targets carry the companion `Poller::now()` timestamp and an enable
-flag. Stale targets or stale/invalid/disabled hardware state produce neutral
-requests. Messages are bounded and go through the event loop recorder.
+CCW yaw. Targets carry an enable flag; a target older than the robot's
+`command_timeout_us` (by receive time), stale/invalid/disabled hardware state,
+or any module motor missing from the state produce neutral requests. Messages
+are bounded and go through the event loop recorder.
 
 The bridge merges each subsystem's request into the one whole-robot command,
 stamping it with the epoch and observed time from the last state the controller
@@ -95,8 +112,8 @@ real Driver Station and nothing in the program can forge it.
 Start each command in a separate terminal:
 
 ```sh
-bazel run //2026-robot/main_processor/drivetrain:sim_gateway    # or, in robot/: ./gradlew simulateNative
-bazel run //2026-robot/main_processor/drivetrain:bridge
+bazel run //2026-robot/main_processor/simulation:sim_gateway    # or, in robot/: ./gradlew simulateNative
+bazel run //talOS/bridge:hardware_node
 bazel run //2026-robot/main_processor/drivetrain:node -- --sim --log /tmp/drivetrain.tlog
 bazel run //2026-robot/main_processor/drivetrain:send_target -- 1 0 0 2
 ```
@@ -170,7 +187,7 @@ Configure and build the shared hardware manifest first, following
 address and start the node without `--sim`:
 
 ```sh
-bazel run //2026-robot/main_processor/drivetrain:bridge -- --remote 10.56.87.2
+bazel run //talOS/bridge:hardware_node -- --remote 10.56.87.2
 bazel run //2026-robot/main_processor/drivetrain:node -- --log /tmp/drivetrain.tlog
 ```
 

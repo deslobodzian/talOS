@@ -1,35 +1,37 @@
 #pragma once
 
-// Shared runner for talOS loop-node binaries.
+// Shared runner for talOS loop-node binaries: the internals of talos::Run
+// (talOS/node), and the main of the one node not written on talos::Node
+// (2026-robot telemetry, whose Studio feed bypasses the loop).
 //
 // Every node main parses the same flags (--sim/--describe/--log/--session-id/
 // --config/--replay/--duration-s), then takes one of three branches: describe
 // (build the node on a simulated loop and print its manifest), replay (drive
 // the node from a log), or realtime (drive it live with a Reporter and a stop
-// handler). Only node construction varies -- some nodes build from the loop
-// alone, others also take config, geometry, or doubles -- so the runner is
-// parameterized by a factory lambda invoked once per branch:
+// handler). The node is built by a factory invoked once per branch:
 //
 //   auto factory = [&](auto& loop, const talos::process::NodeFlags& flags) {
-//     return talos::drive::DrivetrainNode{loop, config, geometry, devices,
-//                                         flags.simulation};
+//     return MyNode{loop, config::ParseRobotConfig(flags.config_path)};
 //   };
 //
-// The remaining per-node differences are secondary hooks with defaults:
-//   - Starter: how the node is started (StartNow by default; NoStart for nodes
-//     with no Start call; a lambda adding a period offset otherwise).
+// The remaining per-node differences are hooks with no-op defaults:
+//   - Starter: what starts the node once built (talos::Run starts inside the
+//     factory; telemetry arms its timer one period out).
 //   - DescribeHook: extra manifest entries for --describe (telemetry's Studio
 //     feed, which bypasses the loop and so is absent from the manifest).
 //   - ExtraHook: extra live-registry sources for the Reporter (same feed).
 //   - Summary: the exit line (DefaultSummary prints dispatches/recording
 //     state; telemetry prints its frame counters instead).
+//   - EndpointHook: endpoint attributes known only once the node is built
+//     (talos::Node's optional subscriptions), for both --describe and the
+//     Reporter.
 //
 // Construction order inside the realtime branch is load-bearing and preserved
 // here: the node starts, stop handlers install, then the Reporter is declared
 // after the loop so reverse destruction order joins its thread before the
 // counters it samples are destroyed. The stopper thread polls
-// talos::process::stop_requested, which is why every node -- including ones
-// that once defined their own stop flag -- must use InstallStopHandlers.
+// talos::process::stop_requested, which is why every node must use
+// InstallStopHandlers.
 //
 // talOS/bridge and talOS/launcher mains are intentionally excluded: they are
 // not loop nodes and share none of this shape.
@@ -57,7 +59,7 @@
 namespace talos::process {
 
 // Flags every node binary accepts. Parsed once, then handed to the factory so
-// node construction (config loading, geometry, doubles) can use them.
+// node construction (config loading) can use them.
 struct NodeFlags {
   std::string log_path;
   std::string replay_path;
@@ -68,38 +70,17 @@ struct NodeFlags {
   bool describe = false;
 };
 
-// Per-node identity. Endpoints are copied, not referenced, but the underlying
-// topic views must outlive the run -- string literals and topic constants at
-// the node's main, which is where these are written.
-//
-// log_stream and default_log_path derive from the node name (the stream and
-// /tmp/<name>.tlog) when null: every node in the tree used exactly those
-// spellings, so they are derived rather than repeated per main. Set them only
-// for the node that genuinely logs elsewhere.
+// Per-node identity: the registry row and --describe name this node and
+// target, and the log stream and default /tmp/<name>.tlog derive from the
+// name.
 struct NodeSpec {
   const char* node_name = nullptr;
   const char* node_target = nullptr;
-  const char* log_stream = nullptr;
-  const char* default_log_path = nullptr;
-  // No framework default: the caller must say which config to load (empty
-  // means missing, mirroring LauncherOptions). Standalone modules that want
-  // a convenience default pass default_config_path explicitly.
-  const char* default_config_path = nullptr;
-  std::vector<introspect::EndpointAttribute> endpoints;
-  // Nodes that read neither hardware nor configuration accept --config and
-  // discard it, so the launcher can pass one flag set to every binary.
-  bool ignore_config_value = false;
 };
 
 inline NodeFlags ParseNodeFlags(int argc, char** argv, const NodeSpec& spec) {
   NodeFlags flags;
-  if (spec.default_log_path != nullptr && *spec.default_log_path != '\0') {
-    flags.log_path = spec.default_log_path;
-  } else {
-    flags.log_path = std::string{"/tmp/"} + spec.node_name + ".tlog";
-  }
-  flags.config_path =
-      spec.default_config_path ? spec.default_config_path : "";
+  flags.log_path = std::string{"/tmp/"} + spec.node_name + ".tlog";
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--sim") {
@@ -113,11 +94,7 @@ inline NodeFlags ParseNodeFlags(int argc, char** argv, const NodeSpec& spec) {
     } else if (arg == "--session-id" && i + 1 < argc) {
       flags.session_id = std::stoull(argv[++i]);
     } else if (arg == "--config" && i + 1 < argc) {
-      if (spec.ignore_config_value) {
-        ++i;
-      } else {
-        flags.config_path = argv[++i];
-      }
+      flags.config_path = argv[++i];
     } else if (arg == "--replay" && i + 1 < argc) {
       flags.replay_path = argv[++i];
     } else if (arg == "--duration-s" && i + 1 < argc) {
@@ -130,20 +107,12 @@ inline NodeFlags ParseNodeFlags(int argc, char** argv, const NodeSpec& spec) {
   }
   if (flags.duration_s < 0)
     throw std::invalid_argument("duration must be nonnegative");
-  if (!spec.ignore_config_value && flags.config_path.empty())
+  if (flags.config_path.empty())
     throw std::invalid_argument("missing --config PATH");
   return flags;
 }
 
-// Starts the node at the loop's current time.
-struct StartNow {
-  template <typename Node, typename Loop>
-  void operator()(Node& node, Loop& loop) const {
-    node.Start(loop.monotonic_now());
-  }
-};
-
-// For nodes with no Start call (odometry): construction is the whole setup.
+// Default starter: the factory left the node ready to run.
 struct NoStart {
   template <typename Node, typename Loop>
   void operator()(Node&, Loop&) const {}
@@ -166,13 +135,22 @@ struct NoExtraSources {
 // Default exit line: dispatches plus the recorder state.
 struct DefaultSummary {};
 
-template <typename Factory, typename Starter = StartNow,
-          typename DescribeHook = NoDescribeHook,
-          typename ExtraHook = NoExtraSources,
-          typename Summary = DefaultSummary>
+// Default endpoint hook: no endpoint attributes.
+struct NoEndpointHook {
+  template <typename Node>
+  std::vector<introspect::EndpointAttribute> operator()(Node&) const {
+    return {};
+  }
+};
+
+template <
+    typename Factory, typename Starter = NoStart,
+    typename DescribeHook = NoDescribeHook, typename ExtraHook = NoExtraSources,
+    typename Summary = DefaultSummary, typename EndpointHook = NoEndpointHook>
 int RunNode(int argc, char** argv, NodeSpec spec, Factory factory,
             Starter starter = {}, DescribeHook describe_hook = {},
-            ExtraHook extra_hook = {}, Summary summary = {}) {
+            ExtraHook extra_hook = {}, Summary summary = {},
+            EndpointHook endpoint_hook = {}) {
   try {
     const NodeFlags flags = ParseNodeFlags(argc, argv, spec);
     // --describe builds the node for real and prints what its constructor
@@ -185,8 +163,9 @@ int RunNode(int argc, char** argv, NodeSpec spec, Factory factory,
       event::SimulationEnvironment environment;
       event::SimulatedEventLoop<> loop{environment};
       auto node = factory(loop, flags);
-      auto description = introspect::DescribeManifest(
-          spec.node_name, spec.node_target, loop.manifest(), spec.endpoints);
+      auto description =
+          introspect::DescribeManifest(spec.node_name, spec.node_target,
+                                       loop.manifest(), endpoint_hook(node));
       describe_hook(description, node);
       std::printf("%s", introspect::DescribeToJson(description).c_str());
       return 0;
@@ -201,12 +180,8 @@ int RunNode(int argc, char** argv, NodeSpec spec, Factory factory,
                   loop.reached_exit());
       return loop.diverged() || !loop.reached_exit() ? 1 : 0;
     }
-    const char* log_stream =
-        (spec.log_stream != nullptr && *spec.log_stream != '\0')
-            ? spec.log_stream
-            : spec.node_name;
     event::RealtimeEventLoop<event::log::LogWriter> loop{event::log::LogWriter{
-        flags.log_path, log_stream, event::log::LogWriterOptions{},
+        flags.log_path, spec.node_name, event::log::LogWriterOptions{},
         flags.session_id}};
     auto node = factory(loop, flags);
     starter(node, loop);
@@ -221,7 +196,7 @@ int RunNode(int argc, char** argv, NodeSpec spec, Factory factory,
                                    .session_id = flags.session_id,
                                    .simulation = flags.simulation,
                                    .extra = extra_hook(node),
-                                   .endpoints = spec.endpoints}};
+                                   .endpoints = endpoint_hook(node)}};
 
     std::jthread stopper{[&](std::stop_token stop) {
       while (!stop.stop_requested()) {

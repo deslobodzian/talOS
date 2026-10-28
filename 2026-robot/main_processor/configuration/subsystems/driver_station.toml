@@ -4,5 +4,5 @@
 # driver_station::kSamplePeriodUs on the Rio side.
 [subsystem]
 name = "driver_station"
-node = "@talos_driver_station//:node"
+node = "//talOS/driver_station:node"
 period_us = 20000

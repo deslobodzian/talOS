@@ -1,477 +1,325 @@
-#include "talos_nodes/drivetrain/node.h"
-
 #include <gtest/gtest.h>
-#include <unistd.h>
+#include <sys/wait.h>
 
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <memory>
-#include <stdexcept>
-
-#include "rules_cc/cc/runfiles/runfiles.h"
-#include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <limits>
+#include <memory>
+#include <numbers>
+#include <sstream>
+#include <stdexcept>
 #include <string>
-#include <string_view>
-#include <utility>
 
-#include "talos_nodes/drivetrain/geometry.h"
+#include "drivetrain/drivetrain.h"
+#include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/configuration/config_parser.h"
-#include "talOS/events/log/log_reader.h"
-#include "talOS/events/log/log_writer.h"
-#include "talOS/events/replay_event_loop.h"
-#include "talOS/events/simulated_event_loop.h"
-#include "talOS/hardware/sim_backend.h"
+#include "talOS/devices/testing.h"
+#include "talOS/node/testing.h"
 
-namespace talos::drive {
+namespace drivetrain {
 namespace {
-using namespace std::chrono_literals;
 
-std::string TestConfigPath() {
+using namespace std::chrono_literals;
+using talos::hardware::Mode;
+using talos::testing::Sim;
+using talos::testing::SimHardware;
+
+constexpr double kTau = 2 * std::numbers::pi;
+
+std::string Runfile(const char* env) {
   std::string error;
   std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
-      rules_cc::cc::runfiles::Runfiles::CreateForTest(
-          BAZEL_CURRENT_REPOSITORY, &error));
-  const char* location = std::getenv("TALOS_TEST_CONFIG");
-  if (!runfiles || !location) {
-    throw std::runtime_error("test config runfiles unavailable: " + error);
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error));
+  const char* location = std::getenv(env);
+  if (!runfiles || location == nullptr) {
+    throw std::runtime_error(std::string{"runfile unavailable: "} + env + " " +
+                             error);
   }
   return runfiles->Rlocation(location);
 }
 
-config::RobotConfig TestRobotConfig() {
-  auto cfg = config::ParseRobotConfig(TestConfigPath());
-  cfg.hardware.commissioned = true;
-  return cfg;
+std::string ConfigPath() { return Runfile("TALOS_TEST_CONFIG"); }
+
+talos::config::RobotConfig Config() {
+  return talos::config::ParseRobotConfig(ConfigPath());
 }
 
-SwerveGeometry TestGeometry() { return BuildSwerveGeometry(TestRobotConfig()); }
+SwerveGeometry Geometry() { return BuildSwerveGeometry(Config(), "drivetrain"); }
 
-hardware::State InitialState() {
-  hardware::SimBackend backend;
-  auto robot_cfg = TestRobotConfig();
-  hardware::Gateway gateway{robot_cfg.hardware, backend, 42};
-  gateway.Tick(1000, true);
-  return gateway.snapshot();
-}
-Packet StatePacket(const hardware::State& state) {
-  Packet p{};
-  p.size = hardware::Encode(state, p.data);
-  return p;
-}
-hardware::Command LastCommand(event::SimulationEnvironment& env) {
-  auto& channel = env.channel(kDriveRequestTopic, sizeof(Packet));
-  EXPECT_GT(channel.next_sequence(), 0);
-  Packet p{};
-  if (!channel.next_sequence()) return {};
-  channel.copy_to(channel.next_sequence() - 1,
-                  {reinterpret_cast<std::byte*>(&p), sizeof(p)});
-  hardware::Command command;
-  EXPECT_TRUE(hardware::Decode(p.bytes(), command));
-  return command;
-}
-TEST(Swerve, TranslationAndReverseUseShortestSteeringPath) {
-  const auto robot_cfg = TestRobotConfig();
-  const auto& config = robot_cfg.hardware;
-  const auto state = InitialState();
-  const auto geometry = TestGeometry();
-  const double rps =
-      1.0 / (2 * std::numbers::pi * geometry.modules[0].wheel_radius_m);
-  for (double vx : {1.0, -1.0}) {
-    const auto c = SwerveCommand(config, geometry, state, vx, 0, 0);
-    ASSERT_EQ(c.count, static_cast<uint16_t>(config.motors.size()));
-    for (int i = 0; i < 4; ++i) {
-      EXPECT_EQ(c.motors[2 * i].mode, hardware::Mode::kVelocity);
-      EXPECT_NEAR(c.motors[2 * i].demand, vx * rps, 1e-12);
-      EXPECT_NEAR(c.motors[2 * i + 1].demand, 0, 1e-12);
+// --- kinematics ----------------------------------------------------------
+
+TEST(Swerve, TranslationAndReverseTakeTheShorterSteeringPath) {
+  const SwerveGeometry geometry = Geometry();
+  const double rps = 1.0 / (kTau * geometry.modules[0].wheel_radius_m);
+  for (const double vx : {1.0, -1.0}) {
+    const auto modules = ToModuleStates(geometry, {vx, 0, 0}, {});
+    ASSERT_TRUE(modules);
+    for (const ModuleState& m : *modules) {
+      EXPECT_NEAR(m.drive_rps, vx * rps, 1e-12);  // reversed, not turned
+      EXPECT_NEAR(m.steer_rot, 0, 1e-12);
     }
   }
-  const auto c = SwerveCommand(config, geometry, state, 0, 1, 0);
-  for (int i = 0; i < 4; ++i)
-    EXPECT_NEAR(c.motors[2 * i + 1].demand, 0.25, 1e-12);
+  const auto sideways = ToModuleStates(geometry, {0, 1, 0}, {});
+  ASSERT_TRUE(sideways);
+  for (const ModuleState& m : *sideways) EXPECT_NEAR(m.steer_rot, 0.25, 1e-12);
 }
+
 TEST(Swerve, RotationDesaturationAndInvalidInput) {
-  const auto robot_cfg = TestRobotConfig();
-  const auto& config = robot_cfg.hardware;
-  const auto state = InitialState();
-  const auto geometry = TestGeometry();
-  auto c = SwerveCommand(config, geometry, state, 0, 0, 1);
-  EXPECT_LT(c.motors[0].demand, 0);
-  EXPECT_GT(c.motors[2].demand, 0);
-  EXPECT_NEAR(c.motors[1].demand, 0.125, 1e-12);
-  EXPECT_NEAR(c.motors[3].demand, -0.125, 1e-12);
-  c = SwerveCommand(config, geometry, state, 100, 0, 0);
-  for (int i = 0; i < 4; ++i) EXPECT_NEAR(c.motors[2 * i].demand, 20, 1e-12);
-  c = SwerveCommand(config, geometry, state,
-                    std::numeric_limits<double>::quiet_NaN(), 0, 0);
-  for (int i = 0; i < 8; ++i)
-    EXPECT_EQ(c.motors[i].mode, hardware::Mode::kNeutral);
-}
-// Writes robot.toml with an extra subsystem spliced in. Logical ids are handed
-// out by sorting on (subsystem name, device name) across the whole robot, so a
-// subsystem sorting before "drivetrain" renumbers every swerve device.
-std::string ReadTestFile(const std::string& path) {
-  std::string out;
-  FILE* in = std::fopen(path.c_str(), "rb");
-  EXPECT_NE(in, nullptr);
-  if (in == nullptr) return out;
-  char buffer[4096];
-  std::size_t n;
-  while ((n = std::fread(buffer, 1, sizeof(buffer), in)) > 0)
-    out.append(buffer, n);
-  std::fclose(in);
-  return out;
+  const SwerveGeometry geometry = Geometry();
+  const auto spin = ToModuleStates(geometry, {0, 0, 1}, {});
+  ASSERT_TRUE(spin);
+  EXPECT_LT((*spin)[0].drive_rps, 0);  // back_left
+  EXPECT_NEAR((*spin)[0].steer_rot, 0.125, 1e-12);
+  EXPECT_GT((*spin)[1].drive_rps, 0);  // back_right
+  EXPECT_NEAR((*spin)[1].steer_rot, -0.125, 1e-12);
+
+  const auto fast = ToModuleStates(geometry, {100, 0, 0}, {});
+  ASSERT_TRUE(fast);
+  for (const ModuleState& m : *fast) EXPECT_NEAR(m.drive_rps, 20, 1e-12);
+
+  EXPECT_FALSE(ToModuleStates(
+      geometry, {std::numeric_limits<double>::quiet_NaN(), 0, 0}, {}));
 }
 
-void WriteTestFile(const std::string& path, const std::string& content) {
-  FILE* out = std::fopen(path.c_str(), "wb");
-  EXPECT_NE(out, nullptr);
-  if (out == nullptr) return;
-  std::fwrite(content.data(), 1, content.size(), out);
-  std::fclose(out);
+TEST(Swerve, ForwardKinematicsInvertsInverseKinematics) {
+  const SwerveGeometry geometry = Geometry();
+  const auto modules = ToModuleStates(geometry, {1.0, -0.5, 0.8}, {});
+  ASSERT_TRUE(modules);
+  const ChassisSpeeds speeds = ToChassisSpeeds(geometry, *modules);
+  EXPECT_NEAR(speeds.vx_mps, 1.0, 1e-9);
+  EXPECT_NEAR(speeds.vy_mps, -0.5, 1e-9);
+  EXPECT_NEAR(speeds.omega_radps, 0.8, 1e-9);
 }
 
-std::string WriteConfigWithExtraSubsystem(const char* subsystem_name) {
-  // Manifest mode: stage a self-consistent config dir holding a manifest
-  // copy plus every subsystem file it names, all by absolute path, so
-  // sibling resolution never depends on where the source tree lives.
-  const std::string dir = std::string{"/tmp/talos_geometry_"} +
-                          subsystem_name + "_" + std::to_string(getpid());
-  std::error_code ec;
-  std::filesystem::create_directories(dir, ec);
-  EXPECT_FALSE(ec);
+// --- geometry from config ------------------------------------------------
 
-  const auto src_cfg = std::filesystem::path(TestConfigPath()).parent_path();
-  std::string toml = ReadTestFile(TestConfigPath());
-
-  toml::table manifest_tbl;
-  try {
-    manifest_tbl = toml::parse(toml);
-  } catch (const toml::parse_error& err) {
-    ADD_FAILURE() << "cannot parse robot.toml: " << err.what();
-    return "";
-  }
-  auto* manifest = manifest_tbl["subsystems"].as_array();
-  if (manifest == nullptr) {
-    ADD_FAILURE() << "robot.toml has no [[subsystems]] manifest";
-    return "";
-  }
-  for (auto&& entry_node : *manifest) {
-    auto* entry = entry_node.as_table();
-    if (entry == nullptr) {
-      ADD_FAILURE() << "manifest entry is not a table";
-      return "";
-    }
-    const auto name_view = (*entry)["name"].value<std::string_view>();
-    const auto rel_view = (*entry)["path"].value<std::string_view>();
-    if (!name_view || !rel_view) {
-      ADD_FAILURE() << "manifest entry needs 'name' and 'path'";
-      return "";
-    }
-    const std::string name(*name_view);
-    const std::string rel(*rel_view);
-    const std::string dst = dir + "/" + name + ".toml";
-    WriteTestFile(dst, ReadTestFile((src_cfg / rel).string()));
-    const std::string needle = "path = \"" + rel + "\"";
-    const auto pos = toml.find(needle);
-    if (pos == std::string::npos) {
-      ADD_FAILURE() << "manifest text missing entry for " << name;
-      return "";
-    }
-    toml.replace(pos, needle.size(), "path = \"" + dst + "\"");
-  }
-
-  // The extra subsystem under test, exercising multi-file merge: "arm" sorts
-  // before "drivetrain", so every drivetrain id shifts by one.
-  const std::string arm_path = dir + "/" + subsystem_name + ".toml";
-  WriteTestFile(arm_path,
-                std::string{"[subsystem]\nname = \""} + subsystem_name +
-                    "\"\nnode = \"//example/x:node\"\nperiod_us = 5000\n\n" +
-                    "[motors.joint]\ntype = \"TalonFX\"\nbus = \"rio\"\ncan_id = 40\n");
-  toml += std::string{"\n[[subsystems]]\nname = \""} + subsystem_name +
-          "\"\npath = \"" + arm_path + "\"\n";
-
-  const std::string path = dir + "/robot.toml";
-  WriteTestFile(path, toml);
-  return path;
-}
-
-uint16_t MotorIdNamed(const hardware::Config& config, std::string_view name) {
-  for (const auto& motor : config.motors)
-    if (motor.name == name) return motor.id;
-  ADD_FAILURE() << "no motor named " << name;
-  return 0;
-}
-
-TEST(SwerveGeometry, FollowsDeviceRenumberingCausedByAnUnrelatedSubsystem) {
-  const auto baseline = TestRobotConfig();
-  const auto baseline_geometry = BuildSwerveGeometry(baseline);
-
-  // "arm" sorts before "drivetrain", so every drivetrain id shifts by one.
-  const auto path = WriteConfigWithExtraSubsystem("arm");
-  const auto shifted = config::ParseRobotConfig(path);
-  std::error_code rm_ec;
-  std::filesystem::remove_all(
-      std::filesystem::path(path).parent_path(), rm_ec);
-  const auto shifted_geometry = BuildSwerveGeometry(shifted);
-
-  ASSERT_NE(MotorIdNamed(baseline.hardware, "front_left_drive"),
-            MotorIdNamed(shifted.hardware, "front_left_drive"))
-      << "test is vacuous unless the extra subsystem actually renumbers ids";
-  EXPECT_NE(baseline_geometry, shifted_geometry);
-
-  // Whatever the numbering, every module still points at the device the
-  // configuration named for it.
-  const std::pair<const SwerveGeometry&, const hardware::Config&> cases[]{
-      {baseline_geometry, baseline.hardware},
-      {shifted_geometry, shifted.hardware}};
-  for (const auto& [geometry, config] : cases) {
-    for (const auto& module : geometry.modules) {
-      const std::string name{module.name.data()};
-      EXPECT_EQ(module.drive_id, MotorIdNamed(config, name + "_drive"));
-      EXPECT_EQ(module.steer_id, MotorIdNamed(config, name + "_steer"));
-    }
-  }
-}
-
-TEST(Swerve, CommandAddressesOnlyItsOwnModuleMotors) {
-  // Whole-robot config with an unrelated subsystem spliced in: the command
-  // must still address exactly the drivetrain's module motors. The bridge's
-  // ownership gate rejects a request naming any motor the subsystem does not
-  // own, so a whole-robot id list merges nothing and the robot never moves.
-  const auto path = WriteConfigWithExtraSubsystem("arm");
-  const auto robot_cfg = config::ParseRobotConfig(path);
-  std::error_code rm_ec;
-  std::filesystem::remove_all(std::filesystem::path(path).parent_path(), rm_ec);
-  const auto geometry = BuildSwerveGeometry(robot_cfg);
-  hardware::SimBackend backend;
-  hardware::Gateway gateway{robot_cfg.hardware, backend, 42};
-  gateway.Tick(1000, true);
-  const auto state = gateway.snapshot();
-
-  const auto* devs = robot_cfg.GetDevices("drivetrain");
-  ASSERT_NE(devs, nullptr);
-  ASSERT_GT(robot_cfg.hardware.motors.size(), devs->motors.size())
-      << "test is vacuous unless another subsystem owns motors";
-  const uint16_t arm_id = MotorIdNamed(robot_cfg.hardware, "joint");
-
-  const auto c = SwerveCommand(robot_cfg.hardware, geometry, state, 1, 0, 0);
-  EXPECT_EQ(c.count, devs->motors.size());
-  for (std::size_t i = 0; i < c.count; ++i) {
-    EXPECT_NE(c.motors[i].id, arm_id);
-    EXPECT_NE(
-        std::find(devs->motors.begin(), devs->motors.end(), c.motors[i].id),
-        devs->motors.end())
-        << "command addresses unowned motor id " << c.motors[i].id;
-  }
+TEST(SwerveGeometry, NamesEachModulesDevices) {
+  const SwerveGeometry geometry = Geometry();
+  EXPECT_EQ(geometry.modules[2].name, "front_left");
+  EXPECT_EQ(geometry.modules[2].drive, "front_left_drive");
+  EXPECT_EQ(geometry.modules[2].steer, "front_left_steer");
+  EXPECT_DOUBLE_EQ(geometry.modules[2].x_m, 0.3);
+  EXPECT_DOUBLE_EQ(geometry.modules[2].max_drive_rps, 20.0);
 }
 
 TEST(SwerveGeometry, RejectsUnknownAndCrossedDeviceReferences) {
-  const auto robot_cfg = TestRobotConfig();
-  const auto* geometry = robot_cfg.GetSubsystemTable("drivetrain", "geometry");
+  const auto config = Config();
+  const toml::table* geometry =
+      config.GetSubsystemTable("drivetrain", "geometry");
   ASSERT_NE(geometry, nullptr);
 
   auto mutated = *geometry;
-  auto* modules = mutated["modules"].as_array();
-  ASSERT_NE(modules, nullptr);
-  auto* first = modules->get(0)->as_table();
-  ASSERT_NE(first, nullptr);
-
-  first->insert_or_assign("drive", "no_such_motor");
-  EXPECT_THROW(BuildSwerveGeometry(robot_cfg.hardware, mutated),
+  mutated["modules"].as_array()->get(0)->as_table()->insert_or_assign(
+      "drive", "no_such_motor");
+  EXPECT_THROW(BuildSwerveGeometry(config, "drivetrain", mutated),
                std::invalid_argument);
 
-  // Point a module at another module's encoder: the steer motor's configured
-  // feedback sensor no longer matches, which must not be silently accepted.
+  // Another module's encoder: the steer motor's feedback sensor no longer
+  // matches, which must not be silently accepted.
   mutated = *geometry;
-  modules = mutated["modules"].as_array();
-  first = modules->get(0)->as_table();
-  first->insert_or_assign("encoder", "front_right_encoder");
-  EXPECT_THROW(BuildSwerveGeometry(robot_cfg.hardware, mutated),
+  mutated["modules"].as_array()->get(0)->as_table()->insert_or_assign(
+      "encoder", "front_right_encoder");
+  EXPECT_THROW(BuildSwerveGeometry(config, "drivetrain", mutated),
+               std::invalid_argument);
+
+  // A drive motor used as a steer motor (no continuous wrap).
+  mutated = *geometry;
+  mutated["modules"].as_array()->get(0)->as_table()->insert_or_assign(
+      "steer", "front_left_drive");
+  EXPECT_THROW(BuildSwerveGeometry(config, "drivetrain", mutated),
                std::invalid_argument);
 }
 
 TEST(SwerveGeometry, RequiresExactlyFourModulesAndAPositiveWheelRadius) {
-  const auto robot_cfg = TestRobotConfig();
-  const auto* geometry = robot_cfg.GetSubsystemTable("drivetrain", "geometry");
+  const auto config = Config();
+  const toml::table* geometry =
+      config.GetSubsystemTable("drivetrain", "geometry");
   ASSERT_NE(geometry, nullptr);
 
   auto short_table = *geometry;
   short_table["modules"].as_array()->pop_back();
-  EXPECT_THROW(BuildSwerveGeometry(robot_cfg.hardware, short_table),
+  EXPECT_THROW(BuildSwerveGeometry(config, "drivetrain", short_table),
                std::invalid_argument);
 
   auto bad_radius = *geometry;
   bad_radius.insert_or_assign("wheel_radius_m", 0.0);
-  EXPECT_THROW(BuildSwerveGeometry(robot_cfg.hardware, bad_radius),
+  EXPECT_THROW(BuildSwerveGeometry(config, "drivetrain", bad_radius),
                std::invalid_argument);
 }
 
-TEST(Drivetrain, StaleTargetAndDisabledGatewayNeutralizeAllMotors) {
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  const auto robot_cfg = TestRobotConfig();
-  const auto* devs = robot_cfg.GetDevices("drivetrain");
-  DrivetrainNode node{loop, robot_cfg.hardware, TestGeometry(),
-                      devs ? *devs : hardware::Devices{}};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
-  auto state = InitialState();
-  loop.inject(kStateTopic, StatePacket(state));
-  loop.inject(kTargetTopic, ChassisTarget{1, 0, 0, 0, true});
-  loop.run_for(10ms);
-  EXPECT_EQ(LastCommand(env).motors[0].mode, hardware::Mode::kVelocity);
-  loop.run_for(110ms);
-  auto c = LastCommand(env);
-  for (int i = 0; i < 8; ++i)
-    EXPECT_EQ(c.motors[i].mode, hardware::Mode::kNeutral);
-  state.sample_time_us += 1000;
-  state.flags &= ~hardware::kEnabled;
-  loop.inject(kStateTopic, StatePacket(state));
-  loop.inject(kTargetTopic, ChassisTarget{1, 0, 0, 120'000'000, true});
-  loop.run_for(10ms);
-  EXPECT_EQ(LastCommand(env).motors[0].mode, hardware::Mode::kNeutral);
-}
-TEST(Drivetrain, HeadingComesFromTheImuNotWhicheverSensorSortsFirst) {
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  const auto robot_cfg = TestRobotConfig();
-  const auto* devs = robot_cfg.GetDevices("drivetrain");
-  DrivetrainNode node{loop, robot_cfg.hardware, TestGeometry(),
-                      devs ? *devs : hardware::Devices{}};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
+// --- the node ------------------------------------------------------------
 
-  uint16_t imu_id = 0, encoder_id = 0;
-  for (const auto& sensor : robot_cfg.hardware.sensors) {
-    if (sensor.kind == hardware::SensorKind::kPigeon2)
-      imu_id = sensor.id;
-    else if (encoder_id == 0)
-      encoder_id = sensor.id;
-  }
-  ASSERT_NE(imu_id, 0);
-  ASSERT_NE(encoder_id, 0);
-  // The steer encoder sorts ahead of the IMU by device name, so a node reading
-  // "the first valid sensor" publishes a module azimuth as the robot heading.
-  ASSERT_LT(encoder_id, imu_id);
-
-  auto state = InitialState();
-  for (std::size_t i = 0; i < state.sensor_count; ++i) {
-    if (state.sensors[i].id == encoder_id)
-      state.sensors[i] = {encoder_id, true, 0.375, 2.0, 0, 0};
-    if (state.sensors[i].id == imu_id)
-      state.sensors[i] = {imu_id, true, 0.125, 0.5, 0, 0};
-  }
-  loop.inject(kStateTopic, StatePacket(state));
-  loop.inject(kTargetTopic, ChassisTarget{0, 0, 0, 0, true});
-  loop.run_for(20ms);
-
-  auto& channel = env.channel(kDrivetrainStateTopic, sizeof(DrivetrainState));
-  ASSERT_GT(channel.next_sequence(), 0u);
-  DrivetrainState published{};
-  channel.copy_to(
-      channel.next_sequence() - 1,
-      {reinterpret_cast<std::byte*>(&published), sizeof(published)});
-  EXPECT_NEAR(published.yaw_rot(), 0.125, 1e-12);
-  EXPECT_NEAR(published.yaw_rate_rps(), 0.5, 1e-12);
+// The test config with `extra` appended to the drivetrain's [subsystem]
+// table, written under TEST_TMPDIR.
+std::string ConfigWith(const std::string& extra) {
+  const std::filesystem::path source = ConfigPath();
+  const std::filesystem::path dir =
+      std::filesystem::path{std::getenv("TEST_TMPDIR")} / "drivetrain_config";
+  std::filesystem::create_directories(dir);
+  std::filesystem::copy_file(source, dir / "robot.toml",
+                             std::filesystem::copy_options::overwrite_existing);
+  std::stringstream text;
+  text << std::ifstream{source.parent_path() / "drivetrain.toml"}.rdbuf();
+  std::string toml = text.str();
+  const std::string table = "[subsystem]\n";
+  toml.insert(toml.find(table) + table.size(), extra + "\n");
+  std::ofstream{dir / "drivetrain.toml"} << toml;
+  return (dir / "robot.toml").string();
 }
 
-// Builds module states for a pure chassis rotation of `omega` rad/s: each
-// module's wheel points tangentially and turns at omega * |r|.
-hardware::State RotatingState(const SwerveGeometry& geometry, double omega) {
-  auto state = InitialState();
-  constexpr double kTau = 2 * std::numbers::pi;
-  for (const auto& module : geometry.modules) {
-    const double vx = -omega * module.y_m, vy = omega * module.x_m;
-    const double speed_rps =
-        std::hypot(vx, vy) / (kTau * module.wheel_radius_m);
-    const double angle_rot = std::atan2(vy, vx) / kTau;
-    for (std::size_t i = 0; i < state.motor_count; ++i) {
-      if (state.motors[i].id == module.drive_id) {
-        state.motors[i].velocity_rps = speed_rps;
-      } else if (state.motors[i].id == module.steer_id) {
-        state.motors[i].position_rot = angle_rot;
-      }
+class DrivetrainTest : public ::testing::Test {
+ protected:
+  explicit DrivetrainTest(std::string config = ConfigPath())
+      : sim{std::move(config)} {}
+
+  // Holds a target the way the arbiter does: republished every 20 ms.
+  void Hold(const ChassisTarget& target, std::chrono::milliseconds duration) {
+    for (auto t = 0ms; t < duration; t += 20ms) {
+      sim.publish(kTargetTopic, target);
+      sim.step(20ms);
     }
   }
-  return state;
-}
-
-double LastPublishedYawRot(event::SimulationEnvironment& env) {
-  auto& channel = env.channel(kDrivetrainStateTopic, sizeof(DrivetrainState));
-  EXPECT_GT(channel.next_sequence(), 0u);
-  DrivetrainState published{};
-  if (channel.next_sequence() == 0) return 0;
-  channel.copy_to(
-      channel.next_sequence() - 1,
-      {reinterpret_cast<std::byte*>(&published), sizeof(published)});
-  return published.yaw_rot();
-}
-
-TEST(Drivetrain, SimulatedHeadingIntegratesTheRotationTheModulesProduce) {
-  const auto robot_cfg = TestRobotConfig();
-  const auto* devs = robot_cfg.GetDevices("drivetrain");
-  const auto geometry = TestGeometry();
-  constexpr double kOmega = 1.0;  // rad/s
-  constexpr double kTau = 2 * std::numbers::pi;
-
-  // Simulation backends leave the gyro valid and permanently zero, so the
-  // sensor path cannot tell "facing downfield, not turning" from "no gyro".
-  {
-    event::SimulationEnvironment env;
-    event::SimulatedEventLoop<> loop{env};
-    DrivetrainNode node{loop, robot_cfg.hardware, geometry,
-                        devs ? *devs : hardware::Devices{},
-                        /*simulate_heading=*/false};
-    node.Start(event::MonotonicTime::from_nanos(1'000'000));
-    loop.inject(kStateTopic, StatePacket(RotatingState(geometry, kOmega)));
-    loop.run_for(200ms);
-    EXPECT_NEAR(LastPublishedYawRot(env), 0.0, 1e-12);
+  DrivetrainState State() const {
+    const auto state = sim.latest<DrivetrainState>(kStateTopic);
+    EXPECT_TRUE(state.has_value());
+    return state.value_or(DrivetrainState{});
+  }
+  talos::hardware::MotorRequest Request(const std::string& device) const {
+    return hw.motor_request("drivetrain", device);
   }
 
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  DrivetrainNode node{loop, robot_cfg.hardware, geometry,
-                      devs ? *devs : hardware::Devices{},
-                      /*simulate_heading=*/true};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
-  loop.inject(kStateTopic, StatePacket(RotatingState(geometry, kOmega)));
-  loop.run_for(200ms);
+  Sim sim;
+  Drivetrain& drivetrain = sim.add<Drivetrain>("drivetrain");
+  SimHardware hw{sim};
+  const SwerveGeometry geometry = Geometry();
+};
 
-  // ~200 ms of rotation at 1 rad/s, less the first tick which has no interval.
-  const double expected_rot = kOmega / kTau * 0.2;
-  const double actual = LastPublishedYawRot(env);
-  EXPECT_GT(actual, expected_rot * 0.9);
-  EXPECT_LT(actual, expected_rot * 1.02);
-}
-
-TEST(Drivetrain, RecordedNetworkInputsReplayWithoutHardware) {
-  const std::string path =
-      ::testing::TempDir() + "/drive_" + std::to_string(::getpid()) + ".tlog";
-  const auto robot_cfg = TestRobotConfig();
-  const auto* devs = robot_cfg.GetDevices("drivetrain");
-  {
-    event::SimulationEnvironment env;
-    event::SimulatedEventLoop<event::log::LogWriter> loop{
-        env, event::log::LogWriter{path, "drivetrain"}};
-    DrivetrainNode node{loop, robot_cfg.hardware, TestGeometry(),
-                        devs ? *devs : hardware::Devices{}};
-    node.Start(event::MonotonicTime::from_nanos(1'000'000));
-    loop.inject(kStateTopic, StatePacket(InitialState()));
-    loop.inject(kTargetTopic, ChassisTarget{1, 0.2, 0.1, 0, true});
-    loop.run_for(20ms);
-    loop.finish();
-    ASSERT_FALSE(loop.recorder().failed());
-    EXPECT_EQ(LastCommand(env).motors[0].mode, hardware::Mode::kVelocity);
+TEST_F(DrivetrainTest, DrivesEveryModuleToAFreshTarget) {
+  hw.enable();
+  Hold(ChassisTarget{1.0, 0, 0, 0, true}, 40ms);
+  const double rps = 1.0 / (kTau * geometry.modules[0].wheel_radius_m);
+  for (const SwerveModule& module : geometry.modules) {
+    EXPECT_EQ(Request(module.drive).mode, Mode::kVelocity) << module.name;
+    EXPECT_NEAR(Request(module.drive).demand, rps, 1e-9) << module.name;
+    EXPECT_EQ(Request(module.steer).mode, Mode::kPosition) << module.name;
+    EXPECT_NEAR(Request(module.steer).demand, 0.0, 1e-9) << module.name;
   }
-  event::log::LogReader reader{path};
-  event::ReplayEventLoop<> replay{reader};
-  DrivetrainNode node{replay, robot_cfg.hardware, TestGeometry(),
-                      devs ? *devs : hardware::Devices{}};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
-  EXPECT_NO_THROW(replay.run());
-  EXPECT_FALSE(replay.diverged());
-  EXPECT_TRUE(replay.reached_exit());
-  std::remove(path.c_str());
+  EXPECT_TRUE(State().enabled());
 }
+
+TEST_F(DrivetrainTest, StaleTargetDisabledTargetOrDisabledRobotGoNeutral) {
+  hw.enable();
+  Hold(ChassisTarget{1.0, 0, 0, 0, true}, 40ms);
+  ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+
+  sim.step(150ms);  // the arbiter went quiet: the target is stale
+  for (const SwerveModule& module : geometry.modules) {
+    EXPECT_EQ(Request(module.drive).mode, Mode::kNeutral) << module.name;
+    EXPECT_EQ(Request(module.steer).mode, Mode::kNeutral) << module.name;
+  }
+
+  Hold(ChassisTarget{1.0, 0, 0, 0, false}, 40ms);
+  EXPECT_EQ(Request("front_left_drive").mode, Mode::kNeutral);
+
+  hw.enable(false);
+  Hold(ChassisTarget{1.0, 0, 0, 0, true}, 40ms);
+  EXPECT_EQ(Request("front_left_drive").mode, Mode::kNeutral);
+  EXPECT_FALSE(State().enabled());
+}
+
+TEST_F(DrivetrainTest, ReportsTheChassisMotionTheModulesMeasure) {
+  // Every wheel pointing 90 degrees left at 2 rps.
+  for (const SwerveModule& module : geometry.modules) {
+    hw.set_motor("drivetrain", module.drive, 0.0, 2.0);
+    hw.set_motor("drivetrain", module.steer, 0.25, 0.0);
+  }
+  sim.step(20ms);
+  const DrivetrainState state = State();
+  EXPECT_NEAR(state.vx_mps(), 0.0, 1e-9);
+  EXPECT_NEAR(state.vy_mps(), 2.0 * kTau * 0.0508, 1e-9);
+  EXPECT_NEAR(state.omega_radps(), 0.0, 1e-9);
+}
+
+// Pure chassis rotation at `omega` rad/s: each wheel tangential, turning at
+// omega * |r|.
+void SetRotating(SimHardware& hw, const SwerveGeometry& geometry,
+                 double omega) {
+  for (const SwerveModule& module : geometry.modules) {
+    const double vx = -omega * module.y_m, vy = omega * module.x_m;
+    hw.set_motor("drivetrain", module.drive, 0.0,
+                 std::hypot(vx, vy) / (kTau * module.wheel_radius_m));
+    hw.set_motor("drivetrain", module.steer, std::atan2(vy, vx) / kTau, 0.0);
+  }
+}
+
+TEST_F(DrivetrainTest, SimulatedHeadingIntegratesTheRotationTheModulesMeasure) {
+  // Under --sim (as here) the Pigeon's permanent zero is not believed.
+  SetRotating(hw, geometry, 1.0);
+  sim.step(200ms);
+  const double expected_rot = 1.0 / kTau * 0.2;
+  EXPECT_GT(State().yaw_rot(), expected_rot * 0.9);
+  EXPECT_LT(State().yaw_rot(), expected_rot * 1.02);
+  EXPECT_NEAR(State().yaw_rate_rps(), 1.0 / kTau, 1e-9);
+}
+
+class DrivetrainOnImuTest : public DrivetrainTest {
+ protected:
+  DrivetrainOnImuTest() : DrivetrainTest{ConfigWith("integrate_heading = false")} {}
+};
+
+TEST_F(DrivetrainOnImuTest, HeadingComesFromTheImuNotASteerEncoder) {
+  SetRotating(hw, geometry, 1.0);
+  hw.set_cancoder("drivetrain", "back_left_encoder", 0.375, 2.0);
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0.5);
+  sim.step(200ms);
+  EXPECT_NEAR(State().yaw_rot(), 0.125, 1e-12);
+  EXPECT_NEAR(State().yaw_rate_rps(), 0.5, 1e-12);
+}
+
+// --- wire and binary -----------------------------------------------------
+
+// These structs cross every chassis topic on the robot, so a layout change
+// is a new contract (whole-bundle rollback), never a silent edit.
+TEST(Messages, WireSizesAreFrozen) {
+  EXPECT_EQ(sizeof(ChassisTarget), 40u);
+  EXPECT_EQ(sizeof(DrivetrainState), 56u);
+}
+
+struct Result {
+  int status;
+  std::string output;
+};
+
+Result RunNode(const std::string& args) {
+  const std::string command = "'" + Runfile("TALOS_TEST_NODE") + "' " + args +
+                              " --config '" + ConfigPath() + "' 2>&1";
+  FILE* pipe = ::popen(command.c_str(), "r");
+  if (pipe == nullptr) throw std::runtime_error("popen failed");
+  Result result{0, {}};
+  char buffer[4096];
+  while (const std::size_t n = std::fread(buffer, 1, sizeof buffer, pipe)) {
+    result.output.append(buffer, n);
+  }
+  const int status = ::pclose(pipe);
+  result.status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  return result;
+}
+
+TEST(DrivetrainBinary, LoggedSimRunReplaysWithoutDivergence) {
+  const std::string log =
+      std::string{std::getenv("TEST_TMPDIR")} + "/drivetrain_test.tlog";
+  const Result run = RunNode("--sim --duration-s 1 --log '" + log + "'");
+  ASSERT_EQ(run.status, 0) << run.output;
+  const Result replay = RunNode("--sim --replay '" + log + "'");
+  EXPECT_EQ(replay.status, 0) << replay.output;
+  EXPECT_NE(replay.output.find("diverged=0 clean_exit=1"), std::string::npos)
+      << replay.output;
+}
+
 }  // namespace
-}  // namespace talos::drive
+}  // namespace drivetrain

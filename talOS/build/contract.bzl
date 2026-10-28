@@ -4,138 +4,110 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("@rules_python//python:py_info.bzl", "PyInfo")
 
-def flatbuffer_py_library(
+def _flatc_py_tree_impl(ctx):
+    # One directory output, so the generated modules (one per struct, plus a
+    # package __init__.py per namespace) need not be listed: what flatc emits
+    # is decided by the schema, which a macro cannot read.
+    out = ctx.actions.declare_directory(ctx.label.name)
+    ctx.actions.run_shell(
+        inputs = ctx.files.srcs,
+        tools = [ctx.executable._flatc],
+        outputs = [out],
+        command = '"$1" -p -o "$2" "${@:3}"',
+        arguments = [ctx.executable._flatc.path, out.path] +
+                    [f.path for f in ctx.files.srcs],
+        mnemonic = "FlatcPython",
+        progress_message = "Generating Python flatbuffers for %{label}",
+    )
+    import_path = ctx.workspace_name + "/" + out.short_path
+    if out.short_path.startswith("../"):
+        import_path = out.short_path[3:]
+    return [
+        DefaultInfo(files = depset([out]), runfiles = ctx.runfiles(files = [out])),
+        PyInfo(
+            transitive_sources = depset([out]),
+            imports = depset([import_path]),
+        ),
+    ]
+
+_flatc_py_tree = rule(
+    implementation = _flatc_py_tree_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = [".fbs"], mandatory = True),
+        "_flatc": attr.label(
+            default = Label("@flatbuffers//:flatc"),
+            executable = True,
+            cfg = "exec",
+        ),
+    },
+)
+
+def talos_messages(
     name,
     srcs,
-    outs = [],
-    visibility = None,
-    deps = None,
-):
-    """Compiles FlatBuffers schemas to Python bindings using flatc and exports them as a py_library."""
-    if not outs:
-        inferred = []
-        for s in srcs:
-            s_base = s.split("/")[-1]
-            if "intake" in s_base:
-                inferred.extend([
-                    "talos/intake/__init__.py",
-                    "talos/intake/IntakeTarget.py",
-                    "talos/intake/IntakeState.py",
-                ])
-            elif "drive" in s_base:
-                inferred.extend([
-                    "talos/drive/__init__.py",
-                    "talos/drive/ChassisTarget.py",
-                    "talos/drive/DrivetrainState.py",
-                ])
-        outs = inferred
+    hdrs = [],
+    include_prefix = None,
+    deps = [],
+    visibility = ["//visibility:public"]):
+    """A package's FlatBuffers messages, for C++ and Python.
 
-    if deps == None:
-        deps = [Label("//talOS/ipc/python:rtms_py")]
+    Provides:
+      :<name>     cc_library. #include "<prefix>/<fbs_basename>_generated.h",
+                  plus any `hdrs` (topic constants) as "<prefix>/<hdr>".
+                  <prefix> defaults to the package's basename.
+      :<name>_py  py_library whose modules import as <namespace>.<Struct>.
 
-    genrule_name = name + "_flatc"
-    native.genrule(
-        name = genrule_name,
+    Messages are .fbs structs with `namespace <package>;` -- never talos.*,
+    which would collide with the `talos` framework package in Python.
+
+    Args:
+      name: the cc_library; the py_library is name + "_py".
+      srcs: .fbs schemas.
+      hdrs: extra C++ headers shipped with the messages (topic names).
+      include_prefix: overrides the include prefix.
+      deps: extra cc deps for `hdrs`.
+      visibility: of both libraries.
+    """
+    if include_prefix == None:
+        include_prefix = native.package_name().split("/")[-1]
+    fbs_name = name + "_fbs"
+    flatbuffer_cc_library(
+        name = fbs_name,
         srcs = srcs,
-        outs = outs,
-        tools = ["@flatbuffers//:flatc"],
-        cmd = "$(location @flatbuffers//:flatc) -p -o $(@D) $(SRCS) && rm -f $(@D)/talos/__init__.py",
+        # flatbuffers' DEFAULT_FLATC_ARGS plus --scoped-enums: a schema enum
+        # `enum IntakeCommand : ubyte { Idle, Intake }` is a C++ enum class,
+        # spelled IntakeCommand::Intake.
+        flatc_args = [
+            "--gen-object-api",
+            "--gen-compare",
+            "--no-includes",
+            "--gen-mutable",
+            "--reflect-names",
+            "--cpp-ptr-type flatbuffers::unique_ptr",
+            "--scoped-enums",
+        ],
+        visibility = ["//visibility:private"],
+    )
+    cc_library(
+        name = name,
+        hdrs = hdrs + [":" + fbs_name + "_srcs"],
+        strip_include_prefix = ".",
+        include_prefix = include_prefix,
+        deps = [":" + fbs_name] + deps,
+        visibility = visibility,
+    )
+    _flatc_py_tree(
+        name = name + "_py_gen",
+        srcs = srcs,
         visibility = ["//visibility:private"],
     )
     py_library(
-        name = name,
-        srcs = [":" + genrule_name],
-        imports = ["."],
-        deps = deps,
+        name = name + "_py",
+        deps = [":" + name + "_py_gen", "@pypi//flatbuffers"],
         visibility = visibility,
     )
-
-def talos_contract_cc(
-    name = "contract",
-    node_name = None,
-    schema = None,
-    fbs_srcs = [],
-    headers = [],
-    packet_hdr = None,
-    extra_deps = [],
-    visibility = ["//visibility:public"],
-    **kwargs
-):
-    """Standard C++ contract / messages_cc library for a talOS node."""
-    all_fbs = list(fbs_srcs)
-    if schema:
-        if type(schema) == "list":
-            all_fbs.extend(schema)
-        else:
-            all_fbs.append(schema)
-
-    all_hdrs = list(headers)
-    if packet_hdr:
-        if packet_hdr not in all_hdrs:
-            all_hdrs.append(packet_hdr)
-    if not all_hdrs:
-        all_hdrs = ["packet.h"]
-
-    if not node_name:
-        pkg = native.package_name()
-        if pkg:
-            node_name = pkg.split("/")[-1]
-        elif all_fbs:
-            first_fbs = all_fbs[0]
-            base = first_fbs.split("/")[-1]
-            for suffix in ["_message.fbs", "-message.fbs", ".fbs"]:
-                if base.endswith(suffix):
-                    base = base[:-len(suffix)]
-                    break
-            node_name = base
-        else:
-            node_name = name
-
-    fbs_target_name = name + "_fbs"
-    if all_fbs:
-        flatbuffer_cc_library(
-            name = fbs_target_name,
-            srcs = all_fbs,
-            visibility = ["//visibility:public"],
-        )
-        cc_library(
-            name = name,
-            hdrs = all_hdrs + [":" + fbs_target_name + "_srcs"],
-            strip_include_prefix = ".",
-            include_prefix = "talos_nodes/" + node_name,
-            deps = [
-                ":" + fbs_target_name,
-                Label("//talOS/hardware:hardware"),
-            ] + extra_deps,
-            visibility = visibility,
-            **kwargs
-        )
-    else:
-        cc_library(
-            name = name,
-            hdrs = all_hdrs,
-            strip_include_prefix = ".",
-            include_prefix = "talos_nodes/" + node_name,
-            deps = [
-                Label("//talOS/hardware:hardware"),
-            ] + extra_deps,
-            visibility = visibility,
-            **kwargs
-        )
-
-    if name != "messages_cc":
-        native.alias(
-            name = "messages_cc",
-            actual = ":" + name,
-            visibility = visibility,
-        )
-    if name != "contract":
-        native.alias(
-            name = "contract",
-            actual = ":" + name,
-            visibility = visibility,
-        )
 
 TalosNodeInfo = provider(
     doc = "Talos node metadata and runtime information",
@@ -192,259 +164,103 @@ talos_node = rule(
 
 def talos_cc_node(
     name,
-    node_name = None,
-    factory = None,
-    hdrs = [],
-    contract = None,
+    node_name,
+    srcs,
     deps = [],
-    hardware = True,
     node_target = None,
     visibility = None,
-    optional_sources = [],
-    default_config_path = None,
     **kwargs
 ):
-    """Standard C++ entry point macro for a talOS node.
+    """A C++ talOS node: sources ending in TALOS_NODE(Class).
 
-    Generates a main C++ source file using a genrule and defines a cc_binary.
+    TALOS_NODE_NAME and TALOS_NODE_TARGET reach the sources as string-literal
+    local_defines, so the node's identity is spelled once, here. The binary
+    depends on //talOS/node and is wrapped in talos_node (TalosNodeInfo) for
+    bundles.
 
-    optional_sources lists C++ topic expressions (e.g.
-    "talos::arbiter::kAutoChassisTopic") declared as optional graph endpoints:
-    the linter stays silent about their missing publisher. Only hardware-free
-    nodes support it; the hardware runner takes no endpoint attributes.
-    default_config_path provides a default --config for standalone modules.
-    NodeSpec carries no framework default (empty means missing), so nodes
-    without one fail fast unless the caller passes --config.
+    Args:
+      name: target name; the talos_node rule. The binary is name + "_bin".
+      node_name: the node's subsystem name (its [subsystems.<name>] key).
+      srcs: C++ sources, one of which uses TALOS_NODE.
+      deps: libraries the sources use (messages, talOS/devices, ...).
+      node_target: defaults to this label.
+      visibility: of the talos_node target (public by default).
+      **kwargs: passed to the cc_binary.
     """
-    if not node_name:
-        node_name = name
     if not node_target:
         node_target = "//" + native.package_name() + ":" + name
-    if not factory:
-        fail("factory must be specified for talos_cc_node")
-    if not hdrs:
-        hdrs = ["node.h"]
-    if optional_sources and hardware:
-        fail("optional_sources is only supported for hardware-free nodes")
-
-    main_cc = name + "_main.cc"
-    genrule_name = name + "_main_gen"
-
-    includes = []
-    for h in hdrs:
-        hdr_path = h[1:] if h.startswith(":") else h
-        if hdr_path.startswith("<") or hdr_path.startswith('"'):
-            includes.append("#include " + hdr_path)
-        else:
-            includes.append('#include "%s"' % hdr_path)
-
-    includes_str = "\n".join(includes)
-    if includes_str:
-        includes_str += "\n"
-
-    if hardware:
-        # RunHardwareNode takes no NodeSpec, so a standalone default config
-        # is appended to a copy of argv: every original flag is preserved and
-        # an explicit --config still wins because the default is only added
-        # when no --config flag is present.
-        hw_default = ""
-        if default_config_path != None:
-            hw_default = (
-                '  bool has_config = false;\n' +
-                '  for (int i = 1; i < argc; ++i) {\n' +
-                '    if (std::string{argv[i]} == "--config") { has_config = true; break; }\n' +
-                '  }\n' +
-                '  std::vector<std::string> default_arg_storage;\n' +
-                '  std::vector<char*> default_args;\n' +
-                '  int use_argc = argc;\n' +
-                '  char** use_argv = argv;\n' +
-                '  if (!has_config) {\n' +
-                '    default_arg_storage.reserve(static_cast<std::size_t>(argc) + 2);\n' +
-                '    for (int i = 0; i < argc; ++i) default_arg_storage.emplace_back(argv[i]);\n' +
-                '    default_arg_storage.emplace_back("--config");\n' +
-                '    default_arg_storage.emplace_back("%s");\n' % default_config_path +
-                '    for (auto& s : default_arg_storage) default_args.push_back(s.data());\n' +
-                '    default_args.push_back(nullptr);\n' +
-                '    use_argc = static_cast<int>(default_args.size()) - 1;\n' +
-                '    use_argv = default_args.data();\n' +
-                '  }\n'
-            )
-        hw_argv = "use_argv" if default_config_path != None else "argv"
-        hw_argc = "use_argc" if default_config_path != None else "argc"
-        hw_extra_include = '#include <vector>\n' if default_config_path != None else ""
-        content = (
-            includes_str +
-            '#include <string>\n' + hw_extra_include +
-            '#include "talOS/process/hardware_main.h"\n\n' +
-            'using namespace talos;\n\n' +
-            'int main(int argc, char** argv) {\n' +
-            hw_default +
-            '  return talos::process::RunHardwareNode(\n' +
-            '      %s, %s, "%s", "%s",\n' % (hw_argc, hw_argv, node_name, node_target) +
-            '      [](auto& loop, const talos::process::HardwareSubsystem& sub, bool simulation) {\n' +
-            '        return %s(loop, sub, simulation);\n' % factory +
-            '      });\n' +
-            '}\n'
-        )
-    else:
-        endpoints_decl = ""
-        endpoints_arg = ""
-        names_include = ""
-        if optional_sources:
-            names_include = '#include "talOS/introspection/names.h"\n'
-            endpoint_rows = "\n".join(
-                ["    {%s, talos::introspect::naming::kSourceFlagOptional}," % e
-                 for e in optional_sources],
-            )
-            endpoints_decl = (
-                "const std::vector<talos::introspect::EndpointAttribute> " +
-                "kTalosOptionalEndpoints = {\n" + endpoint_rows + "\n};\n"
-            )
-            endpoints_arg = "\n          .endpoints = kTalosOptionalEndpoints,"
-        default_config_arg = ""
-        if default_config_path != None:
-            default_config_arg = (
-                '\n          .default_config_path = "%s",' % default_config_path
-            )
-        content = (
-            includes_str +
-            '#include "talOS/process/node_main.h"\n' +
-            names_include + '\n' +
-            'using namespace talos;\n\n' +
-            endpoints_decl + '\n' +
-            'int main(int argc, char** argv) {\n' +
-            '  return talos::process::RunNode(\n' +
-            '      argc, argv,\n' +
-            '      {.node_name = "%s", .node_target = "%s",%s%s},\n'
-            % (node_name, node_target, endpoints_arg, default_config_arg) +
-            '      [](auto& loop, const talos::process::NodeFlags& flags) {\n' +
-            '        return %s(loop, flags);\n' % factory +
-            '      });\n' +
-            '}\n'
-        )
-
-    native.genrule(
-        name = genrule_name,
-        outs = [main_cc],
-        cmd = "cat << 'EOF' > $@\n" + content + "EOF\n",
-        visibility = ["//visibility:private"],
-    )
-
-    all_deps = list(deps)
-    if contract:
-        all_deps.append(contract)
-    runner_dep = "@talos//talOS/process:hardware_main" if hardware else "@talos//talOS/process:node_main"
-    if runner_dep not in all_deps and runner_dep.replace("@talos//", "//") not in all_deps:
-        all_deps.append(runner_dep)
-    if optional_sources:
-        names_dep = "@talos//talOS/introspection:names"
-        if names_dep not in all_deps and "//talOS/introspection:names" not in all_deps:
-            all_deps.append(names_dep)
-
+    node_dep = Label("//talOS/node")
     bin_name = name + "_bin"
     cc_binary(
         name = bin_name,
-        srcs = [main_cc] + hdrs,
-        deps = all_deps,
-        includes = ["."] if native.package_name() else [],
+        srcs = srcs,
+        deps = deps + [node_dep],
+        local_defines = [
+            'TALOS_NODE_NAME=\\"%s\\"' % node_name,
+            'TALOS_NODE_TARGET=\\"%s\\"' % node_target,
+        ],
         visibility = ["//visibility:private"],
         **kwargs
     )
-
     talos_node(
         name = name,
         binary = ":" + bin_name,
         node_name = node_name,
         node_target = node_target,
         language = "cpp",
-        contract = contract,
         visibility = visibility if visibility != None else ["//visibility:public"],
     )
 
 def talos_py_node(
     name,
-    node_name = None,
-    entry_point = None,
-    srcs = [],
-    contract = None,
-    describe_sources = None,
-    default_config = None,
+    node_name,
+    main,
+    class_name,
     deps = [],
     data = [],
     node_target = None,
     visibility = None,
     **kwargs
 ):
-    """Standard Python entry point macro for a talOS node.
+    """A Python talOS node: class `class_name` of the file `main`.
 
-    Generates a runner script via genrule and defines a py_binary.
+    Generates the runner that calls talos.run(Class), as a py_binary wrapped
+    in talos_node (TalosNodeInfo) for bundles. The file is loaded by path
+    (talos.load), so it may share its name with its message package.
+
+    Args:
+      name: target name; the talos_node rule. The binary is name + "_bin".
+      node_name: the node's subsystem name (its [subsystems.<name>] key).
+      main: the node's .py file, relative to this package.
+      class_name: the node class in `main`.
+      deps: libraries `main` imports (messages_py, ...).
+      data: runtime files.
+      node_target: defaults to this label.
+      visibility: of the talos_node target (public by default).
+      **kwargs: passed to the py_binary.
     """
-    if not node_name:
-        node_name = name
     if not node_target:
         node_target = "//" + native.package_name() + ":" + name
-    if not entry_point:
-        fail("entry_point must be specified for talos_py_node")
-
     runner_py = name + "_runner.py"
-    genrule_name = name + "_runner_gen"
-
-    describe_import = ""
-    describe_expr = "None"
-    if describe_sources:
-        if ":" in describe_sources:
-            mod_part, fn_part = describe_sources.split(":")
-            describe_import = "from %s import %s as _describe_sources_fn\n" % (mod_part, fn_part)
-            describe_expr = "_describe_sources_fn"
-        elif "." in describe_sources:
-            mod_part, fn_part = describe_sources.rsplit(".", 1)
-            describe_import = "from %s import %s as _describe_sources_fn\n" % (mod_part, fn_part)
-            describe_expr = "_describe_sources_fn"
-        else:
-            describe_expr = describe_sources
-
-    default_cfg_expr = '""'
-    if default_config:
-        default_cfg_expr = '"%s"' % default_config
-
     content = (
-        'from talos_runtime import runner\n' +
-        describe_import +
-        'import sys\n\n' +
-        'def main(argv=None):\n' +
-        '    return runner.run_node_main(\n' +
-        '        node_name = "%s",\n' % node_name +
-        '        node_target = "%s",\n' % node_target +
-        '        entry_point = "%s",\n' % entry_point +
-        '        describe_sources_fn = %s,\n' % describe_expr +
-        '        default_config = %s,\n' % default_cfg_expr +
-        '        argv = argv,\n' +
-        '    )\n\n' +
-        'if __name__ == "__main__":\n' +
-        '    sys.exit(main())\n'
+        "import os, sys, talos\n" +
+        "node = talos.load(os.path.join(os.path.dirname(__file__), \"%s\"))\n" % main +
+        "sys.exit(talos.run(node.%s, \"%s\", \"%s\"))\n" % (class_name, node_name, node_target)
     )
-
     native.genrule(
-        name = genrule_name,
+        name = name + "_runner_gen",
         outs = [runner_py],
         cmd = "cat << 'EOF' > $@\n" + content + "EOF\n",
         visibility = ["//visibility:private"],
     )
 
-    all_deps = list(deps)
-    if contract:
-        all_deps.append(contract)
-    runtime_dep = "@talos//talOS/ipc/python:rtms_py"
-    if runtime_dep not in all_deps and runtime_dep.replace("@talos//", "//") not in all_deps:
-        all_deps.append(runtime_dep)
-
     bin_name = name + "_bin"
     py_binary(
         name = bin_name,
-        srcs = [runner_py] + srcs,
+        srcs = [runner_py, main],
         main = runner_py,
         legacy_create_init = False,
-        deps = all_deps,
+        deps = deps + [Label("//talOS/python:talos")],
         data = data,
         visibility = ["//visibility:private"],
         **kwargs
@@ -456,7 +272,6 @@ def talos_py_node(
         node_name = node_name,
         node_target = node_target,
         language = "python",
-        contract = contract,
         visibility = visibility if visibility != None else ["//visibility:public"],
     )
 
@@ -522,8 +337,6 @@ def _talos_bundle_impl(ctx):
             clean_label = clean_label[2:]
         elif clean_label.startswith("@//"):
             clean_label = clean_label[1:]
-        elif clean_label.startswith("@@"):
-            clean_label = "@" + clean_label[2:]
 
         nodes_spec.append({
             "name": n_name,
@@ -537,9 +350,7 @@ def _talos_bundle_impl(ctx):
 
     subsystems_spec = []
     for sub in ctx.files.subsystems:
-        if sub.basename == "subsystem.toml":
-            sub_name = sub.short_path.split("/")[-2]
-        elif sub.basename.endswith(".toml"):
+        if sub.basename.endswith(".toml"):
             sub_name = sub.basename[:-5]
         else:
             sub_name = sub.basename

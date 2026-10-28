@@ -214,12 +214,9 @@ void HardwareNode::PushConfig(uint64_t now_us) {
 }
 
 void HardwareNode::Tick(uint64_t now_us) {
-  // Wall-clock processing time on the bridge clock only (perf item 42). The
-  // now_us argument is the same clock, so no cross-clock subtraction happens.
-  const auto tick_start = std::chrono::steady_clock::now();
-  // 1. Process incoming UDP frames from Gateway. Bounded receive budget
-  // (perf item 45): at most 32 frames per tick, so a burst under overload
-  // delays rather than stalls the merge below.
+  // 1. Process incoming UDP frames from Gateway. Bounded receive budget:
+  // at most 32 frames per tick, so a burst under overload delays rather than
+  // stalls the merge below.
   for (int i = 0; i < 32; ++i) {
     protocol::DecodedFrame frame;
     const auto status = peer_.TryReceive(&frame);
@@ -241,18 +238,6 @@ void HardwareNode::Tick(uint64_t now_us) {
       if (!Decode({frame.payload, frame.payload_size}, state)) continue;
 
       ++states_received_;
-      // Bridge-clock inter-arrival only. The state's sample_time_us is the
-      // gateway clock: it is adopted into requests verbatim, never
-      // differenced against now_us. Phoenix per-signal ages are already
-      // durations at poll time, so recording them is not a cross-clock
-      // subtraction either.
-      metrics_.OnStateReceived(now_us);
-      for (uint16_t i = 0; i < state.motor_count; ++i) {
-        if (state.motors[i].valid) {
-          metrics_.RecordSignalAge(state.motors[i].position_age_us);
-          metrics_.RecordSignalAge(state.motors[i].velocity_age_us);
-        }
-      }
       if (state.boot_id != last_boot_id_ || state.config_id != config_id_ ||
           !is_configured_) {
         if (now_us - last_push_time_us_ >= 50000 ||
@@ -307,7 +292,6 @@ void HardwareNode::Tick(uint64_t now_us) {
       ++tracker.requests;
       Command partial{};
       if (Decode(pkt->bytes(), partial)) {
-        metrics_.OnRequestReceived(now_us);
         // Trust gates, in this order: an obsolete request must never merge,
         // and a current one must still own every device it addresses. Either
         // rejection drops the whole request without proving liveness, so a
@@ -436,7 +420,7 @@ void HardwareNode::Tick(uint64_t now_us) {
   // untouched from the subsystem requests that built the merge: stamping the
   // current state here would make an obsolete request look current, and the
   // gateway would accept it as fresh. Publication is change-driven with a
-  // bounded heartbeat (perf item 43): each new sample changes the merge's
+  // bounded heartbeat: each new sample changes the merge's
   // observation headers, so a live 200 Hz link sends at the 200 Hz sample
   // rate instead of the 1 kHz tick rate, and an unchanged merge resends only
   // when the heartbeat elapses. The gateway's 100 ms timeout keeps 5x margin
@@ -455,18 +439,9 @@ void HardwareNode::Tick(uint64_t now_us) {
         last_sent_cmd_ = full_cmd_;
         last_send_us_ = now_us;
         have_last_sent_ = true;
-        metrics_.OnCommandSent(now_us);
       }
-    } else {
-      metrics_.RecordSuppressedSend();
     }
   }
-
-  const auto tick_end = std::chrono::steady_clock::now();
-  metrics_.OnTickDone(static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::microseconds>(tick_end -
-                                                            tick_start)
-          .count()));
 }
 
 bool HardwareNode::ShouldSendCommand(uint64_t now_us) {
@@ -479,11 +454,10 @@ int HardwareNode::Run(int duration_s) {
   const auto end =
       std::chrono::steady_clock::now() + std::chrono::seconds{duration_s};
 
-  // Explicit periodic scheduling (perf item 43): each tick has a deadline
+  // Explicit periodic scheduling: each tick has a deadline
   // one period after the previous, so work time does not accumulate drift
   // the way work-then-sleep(1 ms) does. An overrun skips the sleep once and
-  // re-anchors the deadline instead of queuing catch-up ticks; overruns are
-  // counted (see tick_overruns() and metrics) rather than hidden.
+  // re-anchors the deadline instead of queuing catch-up ticks.
   auto next_tick = std::chrono::steady_clock::now();
   while (!talos::process::stop_requested.load() &&
          (!duration_s || std::chrono::steady_clock::now() < end)) {
@@ -505,8 +479,6 @@ int HardwareNode::Run(int duration_s) {
     if (next_tick > std::chrono::steady_clock::now()) {
       std::this_thread::sleep_until(next_tick);
     } else {
-      ++tick_overruns_;
-      metrics_.RecordMissedDeadline();
       next_tick = std::chrono::steady_clock::now();
     }
   }
@@ -533,8 +505,8 @@ bool HardwareNode::HasRequestIdentity(const SubsystemTracker& tracker,
       partial.epoch != last_epoch_) {
     return false;
   }
-  // Gateway-clock age bound (see command_path_metrics.h clock rule): both
-  // stamps are gateway clock, never differenced against bridge now_us. A
+  // Gateway-clock age bound: both stamps are gateway clock, never
+  // differenced against bridge now_us. A
   // request computed from sample N stays acceptable while newer samples
   // arrive, until its age reaches the command timeout. The gateway
   // re-enforces the same bound against its own now, so it stays the safety

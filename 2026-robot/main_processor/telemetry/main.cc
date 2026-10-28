@@ -5,7 +5,7 @@
 #include "talOS/configuration/config_parser.h"
 #include "talOS/introspection/names.h"
 #include "talOS/process/node_main.h"
-#include "talos_nodes/year2026_telemetry/node.h"
+#include "telemetry/node.h"
 
 namespace {
 // Identity: the registry row and --describe name the same node and target;
@@ -22,9 +22,6 @@ int main(int argc, char** argv) {
   //
   // The config, read by the factory. Exactly one runner branch executes per
   // process, so the hooks below always observe the value the factory stored.
-  // Hooks mirror talos-telemetry/main.cc: the year wrapper owns the process,
-  // so it must declare the same first-tick starter, Studio source, Reporter
-  // row, and exit summary around the composed core.
   talos::telemetry::TelemetryConfig telemetry{};
   auto factory = [&](auto& loop, const talos::process::NodeFlags& flags) {
     const auto robot_config =
@@ -35,7 +32,7 @@ int main(int argc, char** argv) {
       telemetry.stale_timeout_us =
           (*tbl)["stale_timeout_us"].value_or(telemetry.stale_timeout_us);
     }
-    return talos::telemetry::year2026::YearTelemetryNode{loop, telemetry};
+    return talos::telemetry::TelemetryNode{loop, telemetry};
   };
   auto starter = [&](auto& node, auto& loop) {
     node.Start(loop.monotonic_now() +

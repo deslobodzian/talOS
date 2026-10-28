@@ -2,11 +2,3 @@
 # must never be traversed by `bazel build //...` (their BUILD files resolve
 # against the wrong output base and fail package loading).
 .muse
-test/fixtures/external_consumer
-talos-driver_station
-talos-operator_interface
-talos-odometry
-talos-telemetry
-talos-chassis_contracts
-studio-schema
-test/fixtures/robot_assembly

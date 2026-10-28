@@ -27,7 +27,10 @@ def safe_copy(src, dest):
     parent = os.path.dirname(dest)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    shutil.copy2(src, dest, follow_symlinks=True)
+    if os.path.isdir(src):  # a tree artifact, e.g. talos_messages' Python
+        shutil.copytree(src, dest)
+    else:
+        shutil.copy2(src, dest, follow_symlinks=True)
 
 
 def safe_symlink(target, link_path):
@@ -120,30 +123,6 @@ def main():
         safe_copy(src_path, bin_dest)
         make_executable(bin_dest)
 
-        # Create target subpath symlink for launcher ResolveBinary
-        target_sub = target
-        while target_sub.startswith("@") or target_sub.startswith("/"):
-            target_sub = target_sub[1:]
-        target_sub = target_sub.replace(":", "/").lstrip("/")
-        if target_sub and target_sub != "node":
-            target_link = os.path.join(out_dir, target_sub)
-            rel_to_bin = os.path.relpath(bin_dest, os.path.dirname(target_link))
-            safe_symlink(rel_to_bin, target_link)
-
-            if target_sub.endswith("hardware_node"):
-                alt_link = target_link[:-13] + "node"
-                safe_symlink(rel_to_bin, alt_link)
-            if target_sub.endswith("simulation/sim_gateway"):
-                alt_sub = target_sub[: -len("simulation/sim_gateway")] + "drivetrain/sim_gateway"
-                alt_link = os.path.join(out_dir, alt_sub)
-                rel_alt = os.path.relpath(bin_dest, os.path.dirname(alt_link))
-                safe_symlink(rel_alt, alt_link)
-            if target_sub.endswith("drivetrain/sim_gateway"):
-                alt_sub = target_sub[: -len("drivetrain/sim_gateway")] + "simulation/sim_gateway"
-                alt_link = os.path.join(out_dir, alt_sub)
-                rel_alt = os.path.relpath(bin_dest, os.path.dirname(alt_link))
-                safe_symlink(rel_alt, alt_link)
-
         # Runfiles
         rf_entries = node.get("runfiles", [])
         if rf_entries:
@@ -204,8 +183,6 @@ def main():
             for lib_path in spec.get("shared_lib_paths", []):
                 lib_name = os.path.basename(lib_path)
                 for candidate in [
-                    f"talos/talOS/ipc/python/talos_runtime/{lib_name}",
-                    f"_main/talOS/ipc/python/talos_runtime/{lib_name}",
                     f"talos/talOS/node_api/{lib_name}",
                     f"_main/talOS/node_api/{lib_name}",
                 ]:
@@ -233,25 +210,14 @@ def main():
                 "contract": node_contract,
             })
         label = node.get("label")
-        if label:
-            targets_to_add = {label}
-            if label.startswith("@@"):
-                targets_to_add.add(label[1:])
-                targets_to_add.add(label[2:])
-            elif label.startswith("@"):
-                targets_to_add.add("@" + label)
-                targets_to_add.add(label[1:])
-            for t in list(targets_to_add):
-                if "+" in t:
-                    targets_to_add.add(t.replace("+", ""))
-            for t in targets_to_add:
-                manifest_nodes.append({
-                    "name": name,
-                    "target": t,
-                    "binary_path": bin_rel,
-                    "language": lang,
-                    "contract": node_contract,
-                })
+        if label and label != target:
+            manifest_nodes.append({
+                "name": name,
+                "target": label,
+                "binary_path": bin_rel,
+                "language": lang,
+                "contract": node_contract,
+            })
 
     # 6. bundle_manifest.json
     manifest = {

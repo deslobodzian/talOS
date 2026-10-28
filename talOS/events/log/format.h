@@ -62,7 +62,7 @@ struct RecordHeader {
   std::int64_t event_time_ns;
   std::int64_t now_ns;
   std::uint64_t sequence;
-  std::uint32_t aux;  // dropped count, FetchOutcome, WriteResult
+  std::uint32_t aux;  // dropped count, WriteResult
   std::uint32_t payload_bytes;
   std::uint32_t crc32;  // header with crc32 zeroed, then payload
   std::uint32_t reserved;

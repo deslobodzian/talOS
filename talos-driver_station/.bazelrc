@@ -1,9 +1,0 @@
-common --enable_bzlmod
-
-build --enable_platform_specific_config
-
-build:linux --cxxopt=-std=c++23 --cxxopt=-O3
-build:macos --cxxopt=-std=c++23 --cxxopt=-O3
-build:macos --cxxopt=-fexperimental-library --linkopt=-fexperimental-library
-build:macos --macos_minimum_os=13.4
-build:windows --cxxopt=/std:c++23 --cxxopt=-O3

@@ -593,7 +593,7 @@ TEST(LauncherTest, SessionManifestJsonFormatting) {
   node1.failed = false;
 
   manifest.config_sha256 = "deadbeef";
-  node1.contract = "@talos_drivetrain//:contract";
+  node1.contract = "//2026-robot/main_processor/drivetrain:contract";
   manifest.nodes.push_back(node1);
 
   std::string json = manifest.ToJson();
@@ -603,7 +603,8 @@ TEST(LauncherTest, SessionManifestJsonFormatting) {
   EXPECT_NE(json.find("\"exit_code\": 0"), std::string::npos);
   EXPECT_NE(json.find("\"record_count\": 50"), std::string::npos);
   EXPECT_NE(json.find("\"config_sha256\": \"deadbeef\""), std::string::npos);
-  EXPECT_NE(json.find("\"contract\": \"@talos_drivetrain//:contract\""),
+  EXPECT_NE(json.find("\"contract\": "
+                      "\"//2026-robot/main_processor/drivetrain:contract\""),
             std::string::npos);
 }
 
@@ -912,36 +913,13 @@ TEST(LauncherGraphTest, ProbeReportsABinaryThatIsNotThere) {
   EXPECT_NE(error.find("no executable"), std::string::npos) << error;
 }
 
-TEST(LauncherBundleTest, ResolveBinaryHandlesExternalRepoLabels) {
+TEST(LauncherBundleTest, ResolveBinaryPrefersOverrideThenBazelBin) {
   std::map<std::string, std::string> overrides;
-  overrides["@custom_repo//sub:target"] = "/bin/custom_target";
-  EXPECT_EQ(ResolveBinary("@custom_repo//sub:target", overrides),
-            "/bin/custom_target");
-
-  std::string fallback = ResolveBinary("@robot//main_processor/drivetrain:node");
-  EXPECT_FALSE(fallback.empty());
-}
-
-TEST(LauncherBundleTest, ResolveBinaryFindsBzlmodCanonicalExternalDirs) {
-  // Bzlmod materializes an apparent "@talos_shooter" under a trailing-plus
-  // directory (bazel-bin/external/talos_shooter+/). The candidates are
-  // relative, so resolve them from inside a scratch tree.
-  const std::string root = TempPath("bzlmod_canonical");
-  std::filesystem::create_directories(root + "/bazel-bin/external/talos_shooter+");
-  {
-    std::ofstream b(root + "/bazel-bin/external/talos_shooter+/node");
-    b << "#!/bin/sh\nexit 0\n";
-  }
-  ::chmod((root + "/bazel-bin/external/talos_shooter+/node").c_str(), 0755);
-
-  char saved[4096];
-  ASSERT_NE(::getcwd(saved, sizeof(saved)), nullptr);
-  ASSERT_EQ(::chdir(root.c_str()), 0);
-  const std::string resolved =
-      ResolveBinary("@talos_shooter//:node", {});
-  const int restore = ::chdir(saved);
-  ASSERT_EQ(restore, 0);
-  EXPECT_EQ(resolved, "bazel-bin/external/talos_shooter+//node");
+  overrides["//example/alpha:node"] = "/bin/alpha";
+  EXPECT_EQ(ResolveBinary("//example/alpha:node", overrides), "/bin/alpha");
+  EXPECT_EQ(ResolveBinary("//example/beta:node", overrides),
+            "bazel-bin/example/beta/node");
+  EXPECT_EQ(ResolveBinary("/opt/talos/bin/beta"), "/opt/talos/bin/beta");
 }
 
 TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
@@ -969,7 +947,7 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
        << "      \"target\": \"//example/alpha:node\",\n"
        << "      \"binary_path\": \"bin/alpha\",\n"
        << "      \"language\": \"cpp\",\n"
-       << "      \"contract\": \"@example_alpha//:contract\"\n"
+       << "      \"contract\": \"//example/alpha:contract\"\n"
        << "    }\n"
        << "  ]\n"
        << "}\n";
@@ -996,8 +974,8 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   EXPECT_EQ(options.binary_overrides["alpha"], bundle_dir + "/bin/alpha");
   EXPECT_EQ(options.bundle_config_sha256, "abc123");
   EXPECT_EQ(options.bundle_contracts["//example/alpha:node"],
-            "@example_alpha//:contract");
-  EXPECT_EQ(options.bundle_contracts["alpha"], "@example_alpha//:contract");
+            "//example/alpha:contract");
+  EXPECT_EQ(options.bundle_contracts["alpha"], "//example/alpha:contract");
 
   std::filesystem::remove_all(bundle_dir);
 }

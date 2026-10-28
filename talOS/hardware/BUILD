@@ -11,19 +11,12 @@ cc_library(
 cc_library(
     name = "hardware",
     srcs = ["messages.cc", "gateway.cc"],
-    hdrs = ["config.h", "config_wire.h", "messages.h", "gateway.h", "endpoint.h", "sim_backend.h", "sim_physics.h", "packet.h", "config_error.h", "health.h", "support_matrix.h", "commissioning.h", "fault_scope.h", "homing.h", "characterization.h"],
+    hdrs = ["config.h", "config_wire.h", "messages.h", "gateway.h", "endpoint.h", "sim_backend.h", "sim_physics.h", "packet.h", "config_error.h"],
     deps = [
         ":config",
         "//talOS/protocol:protocol",
     ],
     visibility = ["//visibility:public"],
-)
-
-cc_test(
-    name = "hardware_ops_test",
-    size = "small",
-    srcs = ["hardware_ops_test.cc"],
-    deps = [":hardware", "@googletest//:gtest_main"],
 )
 
 cc_test(

@@ -2,7 +2,7 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["robot.toml", "subsystem.toml"])
+exports_files(["robot.toml"])
 exports_files(glob(["subsystems/*.toml"]))
 
 # The whole robot config: the manifest plus every subsystem file. Any test
@@ -19,10 +19,7 @@ cc_test(
     name = "config_golden_test",
     size = "small",
     srcs = ["config_golden_test.cc"],
-    data = [
-        ":robot_config",
-        "subsystem.toml",
-    ],
+    data = [":robot_config"],
     deps = [
         "//talOS/configuration:configuration",
         "//talOS/hardware:config",

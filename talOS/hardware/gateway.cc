@@ -5,7 +5,6 @@
 #include <utility>
 
 #include "config_wire.h"
-#include "homing.h"
 
 namespace talos::hardware {
 Gateway::Gateway(Config config, Backend& backend, uint64_t boot_id)
@@ -118,7 +117,7 @@ void Gateway::Invalidate() {
   backend_.Neutral();
 }
 void Gateway::PollResets() {
-  // Item 36: an individual device reset re-applies configuration. Enter the
+  // An individual device reset re-applies configuration. Enter the
   // safe state FIRST — Invalidate() (epoch bump, outstanding commands
   // dropped, outputs neutralized) — BEFORE the synchronous restore traffic,
   // mirroring Reconfigure. Unlike Reconfigure the restore cannot wait for
@@ -130,7 +129,6 @@ void Gateway::PollResets() {
   if (!configured_) return;
   std::vector<uint16_t> reset_ids;
   if (!backend_.PollDeviceResets(reset_ids) || reset_ids.empty()) return;
-  reset_count_ += reset_ids.size();
   Invalidate();
   if (!backend_.RestoreAfterReset()) {
     fault_ = true;
@@ -156,40 +154,6 @@ void Gateway::Tick(uint64_t now, bool enabled) {
     backend_.Neutral();
 }
 
-bool Gateway::Zero(uint16_t motor_id, double home_position_rot,
-                   uint64_t observed_time_us, uint64_t now_us,
-                   std::string* reason) {
-  const auto reject = [&](ZeroRejectReason r) {
-    if (reason != nullptr) *reason = ZeroRejectName(r);
-    return false;
-  };
-  if (!configured_) return reject(ZeroRejectReason::kNotConfigured);
-  if (active_) return reject(ZeroRejectReason::kCommandActive);
-  const ZeroRejectReason valid =
-      ValidateZeroRequest(config_, motor_id, home_position_rot);
-  if (valid != ZeroRejectReason::kOk) return reject(valid);
-  if (observed_time_us > state_.sample_time_us || observed_time_us > now_us ||
-      now_us - observed_time_us >= config_.command_timeout_us)
-    return reject(ZeroRejectReason::kStaleObservation);
-  if (!backend_.ZeroPosition(motor_id, home_position_rot)) {
-    fault_ = true;
-    return reject(ZeroRejectReason::kBackendFailed);
-  }
-  // The offset changes what every future demand means: outstanding commands
-  // are invalidated so nothing resumes against the old frame.
-  Invalidate();
-  if (reason != nullptr) *reason = ZeroRejectName(ZeroRejectReason::kOk);
-  return true;
-}
-
-HealthSnapshot Gateway::health() {
-  HealthSnapshot snapshot = backend_.GetHealth();
-  snapshot.reset_count = reset_count_;
-  snapshot.fault_latched = fault_;
-  snapshot.configured = configured_ && config_.commissioned;
-  snapshot.enabled = configured_ && enabled_;
-  return snapshot;
-}
 bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   if (!configured_ || !config_.commissioned || !enabled_ || fault_ ||
       !healthy_ || c.config_id != state_.config_id ||

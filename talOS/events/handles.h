@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstring>
-#include <optional>
 #include <span>
 #include <string_view>
 #include <type_traits>
@@ -88,36 +87,6 @@ class Sender {
   std::uint16_t id_{0};
 };
 
-// Reads the newest value on a topic on demand, skipping anything older. Use a
-// fetcher for state a handler samples (a setpoint, a mode) and a watcher for
-// events it must not miss.
-template <typename Loop, LoopMessage Message>
-class Fetcher {
- public:
-  Fetcher() = default;
-  Fetcher(Loop* loop, std::uint16_t id) : loop_{loop}, id_{id} {}
-
-  std::optional<Message> fetch() {
-    Message message{};
-
-    const bool has_value = loop_->fetch_message(
-        id_, std::span<std::byte>{reinterpret_cast<std::byte*>(&message),
-                                  sizeof(Message)});
-
-    if (!has_value) {
-      return std::nullopt;
-    }
-    return message;
-  }
-
-  std::uint16_t id() const { return id_; }
-  bool valid() const { return loop_ != nullptr; }
-
- private:
-  Loop* loop_{nullptr};
-  std::uint16_t id_{0};
-};
-
 // --- registration helpers ---------------------------------------------------
 
 template <auto Method, typename Loop, typename Class>
@@ -132,14 +101,6 @@ std::uint16_t watch(Loop& loop, std::string_view topic, Class* instance) {
                                static_cast<std::uint32_t>(sizeof(Message)),
                                static_cast<std::uint32_t>(alignof(Message)),
                                make_message_thunk<Message, Method>(instance));
-}
-
-template <LoopMessage Message, typename Loop>
-Fetcher<Loop, Message> make_fetcher(Loop& loop, std::string_view topic) {
-  return Fetcher<Loop, Message>{
-      &loop,
-      loop.register_fetcher(topic, static_cast<std::uint32_t>(sizeof(Message)),
-                            static_cast<std::uint32_t>(alignof(Message)))};
 }
 
 template <LoopMessage Message, typename Loop>

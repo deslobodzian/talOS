@@ -31,8 +31,8 @@ gave them. Seven rules make that true:
    dispatch and frozen for the whole callback, so two reads inside one handler
    cannot disagree. Handlers never touch `std::chrono` clocks directly.
 3. **Every input is recorded.** Timer firings (deadline plus how many periods
-   elapsed), message payloads with their sequence and drop count, fetch
-   results including "there was nothing", the start time and the exit.
+   elapsed), message payloads with their sequence and drop count, the start
+   time and the exit.
 4. **Every output is recorded.** Each `send` is logged with its bytes, the
    transport's verdict and the sequence it got, tagged with the dispatch that
    produced it. Timer setup/disable and handler-requested exit are validated too.
@@ -160,16 +160,14 @@ millisecond after *construction*, not after `run()`. If setup between the two
 takes longer than that, the first cycle is already late and fires once with a
 cycle count instead of bursting. That is deterministic and it replays, but if
 you want the first tick to land a period after the run begins, either construct
-the loop last or arm the timer inside the first dispatch. A benchmark that is
-never replayed can simply arm off `Poller::now()` immediately before `run()`,
-which is what `tools/loop_perf.cc` does.
+the loop last or arm the timer inside the first dispatch.
 
 During callbacks, `ARM_TIMER` and `DISARM_TIMER` records validate scheduling
 calls and `HANDLER_EXIT` validates explicit shutdown. An early shutdown stops
 further dispatch even when collecting divergences. External shutdown is
 represented by the terminal `EXIT` record.
 
-Inspect a log with `bazel run //talOS/events:log_dump -- /tmp/run.tlog`.
+Inspect a log with `bazel run //talOS/launcher:log_dump -- /tmp/run.tlog`.
 
 ## Log format
 
@@ -203,98 +201,19 @@ than that capacity also stops capture without allocating. Header writing at
 startup, explicit `flush()`, shutdown, and the opt-in synchronous writer can
 still block on disk; do not call `flush()` from a control callback.
 
-## Measuring latency and jitter
+## Lateness
 
-A realtime claim you cannot measure is a guess. Any loop can be instrumented by
-naming a metrics policy, which is a second template parameter alongside the
-recorder:
+A handler can react to its own lateness straight from its context:
+`context.latency()` is how late the dispatch ran, `context.sequence > 1` on a
+timer means periods were missed, and `context.dropped > 0` on a message means
+data was lost rather than merely delayed. Treat both as faults.
 
-```cpp
-RealtimeEventLoop<NullRecorder, LoopMetrics> loop;
-...
-loop.run_for(10s);
-std::printf("%s", loop.metrics().report(loop.manifest()).c_str());
-```
+Message latency is bounded by the drain tick: worst case one tick, mean half a
+tick. Shorten the tick to trade CPU for message latency.
 
-Per source it records three distributions, each as a full histogram rather than
-an average, because the tail is the part that hurts:
-
-* **dispatch latency**, `now - event_time`. How late the loop was to service
-  the event. For a periodic timer this is the wake-up delay, and its spread is
-  what a control engineer means by jitter. For a message it is how late the
-  drain tick ran, not the age of the message: the shared-memory layout carries
-  no publish timestamp, so end-to-end transport latency has to be measured by
-  stamping the send time into the message, which is what `loop_perf` does.
-* **interval**, the wall gap between consecutive dispatches. For a 1 kHz timer
-  this should sit on 1 ms; drift or spread means the loop is not holding rate.
-* **handler time**, how long the callback ran. This is the budget. When it
-  approaches the period, overruns are about to start.
-
-Plus counters for **overruns** (periods that elapsed unserviced) and **dropped
-messages**, and a loop-wide **utilization** figure: the share of wall time
-spent inside handlers.
-
-`LoopMetrics` costs two clock reads and a few histogram increments per
-dispatch, measured at 40 ns on an M-series Mac, which is 0.004% of a 1 ms
-cycle. `NullMetrics` is the default and compiles away completely, clock reads
-included, so an uninstrumented loop pays nothing at all.
-
-The histogram is fixed-size and allocation-free: logarithmic buckets with 16
-linear steps per octave, exact below 16 ns and 6.25% worst-case error above it,
-covering nanoseconds to centuries in 4 KiB. Percentiles report the bucket's
-upper bound, so a reported latency is never optimistic. Count, minimum, maximum
-and mean are tracked exactly alongside it, so bucketing only ever affects
-percentiles.
-
-A handler can also react to its own lateness without any of this, straight from
-its context: `context.sequence > 1` on a timer means periods were missed, and
-`context.dropped > 0` on a message means data was lost rather than merely
-delayed. Treat both as faults.
-
-To benchmark rather than monitor, use the bundled tool:
-
-```
-bazel run //talOS/events:loop_perf -- --rate-hz 1000 --duration-ms 5000
-```
-
-It reports the loop-side distributions above plus end-to-end IPC latency,
-measured by stamping the publish time into the message and comparing it against
-the subscriber's reading of the same clock. Run it with and without `--log` to
-price the logging.
-
-### What the numbers mean
-
-Read a measurement against the platform's floor, not against zero. On a
-development Mac a bare `kevent` asked to wait 1 ms returns about 140 us late at
-the median, and the loop measures roughly the same, so the loop is adding
-essentially nothing on top of the kernel. macOS coalesces timers aggressively;
-the Linux target with `timerfd` does considerably better, and that is the number
-that matters for the robot.
-
-Two macOS-specific notes, both measured rather than assumed. `SCHED_FIFO` makes
-no difference. The mach time-constraint policy leaves the median alone but cuts
-the tail hard, taking the worst case of a 1 ms wait from 1475 us to 219 us. If
-development-machine tail latency ever starts mattering, that is the lever, and
-it is not wired up today.
-
-End-to-end IPC latency is bounded by the drain tick: worst case one tick, mean
-half a tick. Measured on an idle Mac, publishing at 777 Hz so the rates do not
-divide evenly:
-
-| tick | mean | p99 | max |
-|---|---|---|---|
-| 1000 us | 494 us | 1016 us | 1098 us |
-| 500 us | 261 us | 524 us | 597 us |
-| 200 us | 104 us | 221 us | 220 us |
-
-Shorten the tick to trade CPU for message latency; the relationship is linear
-and holds to within a couple of percent.
-
-Watch out for harmonic rates. Publishing at 1000 Hz against a 1000 us tick
-phase-locks the two grids, and the mean rises from the expected 494 us to
-835 us because the phase offset never averages out. A mean near a full tick in
-the report is that, not a slow transport. Benchmark with rates that do not
-divide evenly, or you will measure the phase rather than the system.
+Each source also keeps lock-free `SourceCounters` (events, drops, last
+sequence, last and max latency) that the introspection reporter publishes
+while the loop runs.
 
 ## Message rules
 

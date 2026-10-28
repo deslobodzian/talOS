@@ -1,0 +1,16 @@
+namespace demo;
+
+enum IntakeCommand : ubyte { IDLE, INTAKE, EJECT }
+
+enum IntakeState : ubyte { IDLE, INTAKING, HOLDING, EJECTING }
+
+// What the superstructure asks of the intake, on /intake/target.
+struct IntakeGoal {
+  command:IntakeCommand;
+}
+
+// What the intake is doing, on /intake/state. has_piece is the beam break.
+struct IntakeStatus {
+  state:IntakeState;
+  has_piece:bool;
+}

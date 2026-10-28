@@ -17,20 +17,3 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
-
-cc_library(
-    name = "ring_buffer",
-    hdrs = ["ring_buffer.h"],
-)
-
-
-cc_test(
-    name = "ring_buffer_test",
-    size = "small",
-    srcs = ["ring_buffer_test.cc"],
-    deps = [
-        ":ring_buffer",
-        "@googletest//:gtest",
-        "@googletest//:gtest_main",
-    ],
-)

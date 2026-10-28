@@ -45,7 +45,7 @@ TEST(SimulatedEventLoop, RegistrationAssignsIdsInOrder) {
 
   EXPECT_EQ(manifest[0].kind, SourceKind::WATCHER);
   EXPECT_EQ(manifest[0].name, "/sim/sensor");
-  EXPECT_EQ(manifest[1].kind, SourceKind::FETCHER);
+  EXPECT_EQ(manifest[1].kind, SourceKind::WATCHER);
   EXPECT_EQ(manifest[2].kind, SourceKind::SENDER);
   EXPECT_EQ(manifest[3].kind, SourceKind::TIMER);
   EXPECT_EQ(manifest[3].name, "control");
@@ -156,7 +156,7 @@ TEST(SimulatedEventLoop, WatcherReceivesEveryInjectedMessage) {
   EXPECT_EQ(robot.dropped_sensors(), 0u);
 }
 
-TEST(SimulatedEventLoop, FetcherTakesTheNewestValueOnly) {
+TEST(SimulatedEventLoop, SetpointWatcherKeepsTheNewestValue) {
   SimulationEnvironment environment;
   SimulatedEventLoop<> loop{environment};
   TestRobot<SimulatedEventLoop<>> robot{loop, simulated_topics(), 1.0F};
@@ -173,9 +173,9 @@ TEST(SimulatedEventLoop, FetcherTakesTheNewestValueOnly) {
 
   ASSERT_FALSE(robot.efforts().empty());
 
-  // Position is zero and no sensor arrived, so effort is gain * target. The
-  // fetcher must have skipped straight to the last setpoint, 5.
-  EXPECT_FLOAT_EQ(robot.efforts().front(), 5.0F);
+  // Position is zero and no sensor arrived, so effort is gain * target, and
+  // the target is the last setpoint delivered, 5.
+  EXPECT_FLOAT_EQ(robot.efforts().back(), 5.0F);
 }
 
 TEST(SimulatedEventLoop, ExitStopsTheLoop) {
@@ -196,48 +196,6 @@ TEST(SimulatedEventLoop, ExitStopsTheLoop) {
 
   loop.run_for(100ms);
   EXPECT_EQ(calls, 3);
-}
-
-// On the virtual clock every deadline is met exactly, which makes this the one
-// place the metrics can be asserted against known-good numbers instead of
-// whatever the machine happened to do.
-TEST(SimulatedEventLoop, MetricsRecordAnIdealSchedule) {
-  using Loop = SimulatedEventLoop<NullRecorder, LoopMetrics>;
-
-  SimulationEnvironment environment;
-  Loop loop{environment};
-  TestRobot<Loop> robot{loop, simulated_topics(), 1.0F};
-
-  robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
-                                       1ms);
-
-  for (int i = 0; i < 20; ++i) {
-    loop.inject(simulated_topics().sensor,
-                EventsTest::SensorMessage{i, static_cast<float>(i), 0.0F});
-    loop.run_for(1ms);
-  }
-  loop.finish();
-
-  const std::uint16_t timer_id = robot.control_timer().id();
-  const SourceMetrics& timer = loop.metrics().source(timer_id);
-
-  EXPECT_EQ(timer.dispatches, 20u);
-
-  // Virtual time jumps exactly to each deadline, so there is no latency and no
-  // jitter at all. Any non-zero value here would mean the simulated clock had
-  // developed an opinion of its own.
-  EXPECT_EQ(timer.latency.max_ns(), 0);
-  EXPECT_EQ(timer.latency.jitter_ns(), 0);
-  EXPECT_EQ(timer.overruns, 0u);
-
-  // Intervals are exactly the 1 ms period, one fewer sample than dispatches.
-  EXPECT_EQ(timer.interval.count(), timer.dispatches - 1);
-  EXPECT_EQ(timer.interval.min_ns(), 1'000'000);
-  EXPECT_EQ(timer.interval.max_ns(), 1'000'000);
-
-  const SourceMetrics& watcher = loop.metrics().source(0);
-  EXPECT_EQ(watcher.dispatches, 20u);
-  EXPECT_EQ(watcher.dropped, 0u);
 }
 
 // Same program, same injected inputs, same everything. This is the property

@@ -27,17 +27,6 @@ use_repo(python, "python_3_11")
 # For configuration
 bazel_dep(name = "tomlplusplus", version = "3.4.0")
 
-# Linear algebra (Lie groups, estimation, optimization). Eigen 3.4.0,
-# header-only. Hash verified against the upstream tarball at add time.
-eigen_http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-eigen_http_archive(
-    name = "eigen",
-    urls = ["https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz"],
-    sha256 = "8586084f71f9bde545ee7fa6d00288b264a2b7ac3607b974e54d13e7162c1c72",
-    strip_prefix = "eigen-3.4.0",
-    build_file = "//third_party:eigen.BUILD.bazel",
-)
-
 # Hedron's Compile Commands Extractor for Bazel
 # https://github.com/hedronvision/bazel-compile-commands-extractor
 bazel_dep(name = "hedron_compile_commands", dev_dependency = True)
@@ -98,65 +87,12 @@ studio_crate.from_cargo(
 )
 use_repo(studio_crate, "studio_crates")
 
-# Python RTMS client (//talOS/ipc/python) needs the flatbuffers runtime for
+# The Python node package (//talOS/python) needs the flatbuffers runtime for
 # the flatc --python bindings. Pinned to the same version as the C++ dep above.
 pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
 pip.parse(
     hub_name = "pypi",
     python_version = "3.11",
-    requirements_lock = "//talOS/ipc/python:requirements.txt",
+    requirements_lock = "//talOS/python:requirements.txt",
 )
 use_repo(pip, "pypi")
-
-# Hybrid node policy: only stable platform nodes are standalone modules.
-# Year-specific mechanisms (drivetrain, intake, shooter, arbiter) live in
-# the year folder (2026-robot/main_processor/) and are rewritten each season.
-#
-# Assembly deps, not SDK deps: nothing under talOS/ imports these modules;
-# only the in-repo example assembly (2026-robot/) launches their nodes.
-# They are dev-only so downstream consumers that bazel_dep on talos never
-# see them: a minimal consumer MODULE needs just talos plus the core
-# toolchain pins (see tools/node_scaffold/templates.py render_module_bazel
-# and test/fixtures/external_consumer/MODULE.bazel). A downstream assembly
-# that launches platform nodes declares exactly the ones it uses, with its
-# own local_path_override entries during development (same pattern as
-# test/fixtures/robot_assembly/MODULE.bazel); releases replace those with
-# immutable git_override/archive_override pins. Bzlmod honors only
-# root-module overrides, so each standalone checkout carries overrides for
-# the platform modules it directly depends on (see talos-*/MODULE.bazel),
-# otherwise its resolution falls back to the registry and fails.
-bazel_dep(name = "talos_driver_station", version = "0.1.0", dev_dependency = True)
-local_path_override(
-    module_name = "talos_driver_station",
-    path = "talos-driver_station",
-)
-
-bazel_dep(name = "talos_operator_interface", version = "0.1.0", dev_dependency = True)
-local_path_override(
-    module_name = "talos_operator_interface",
-    path = "talos-operator_interface",
-)
-
-bazel_dep(name = "talos_odometry", version = "0.1.0", dev_dependency = True)
-local_path_override(
-    module_name = "talos_odometry",
-    path = "talos-odometry",
-)
-
-bazel_dep(name = "talos_telemetry", version = "0.1.0", dev_dependency = True)
-local_path_override(
-    module_name = "talos_telemetry",
-    path = "talos-telemetry",
-)
-
-bazel_dep(name = "talos_chassis_contracts", version = "0.1.0", dev_dependency = True)
-local_path_override(
-    module_name = "talos_chassis_contracts",
-    path = "talos-chassis_contracts",
-)
-
-bazel_dep(name = "studio_schema", version = "0.1.0", dev_dependency = True)
-local_path_override(
-    module_name = "studio_schema",
-    path = "studio-schema",
-)

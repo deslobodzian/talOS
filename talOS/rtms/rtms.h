@@ -13,7 +13,6 @@
 #include <concepts>
 #include "talOS/memory/shared_memory_ptr.h"
 #include <optional>
-#include <cinttypes>
 
 inline constexpr size_t CACHE_LINE = 64; // C++ I think as a function for this.
 inline constexpr size_t MAX_SLOTS = 1u << 10; // 1024 slots maximum
@@ -90,7 +89,6 @@ struct MessageInfo {
 enum class OverflowPolicy {
     DROP_NEWEST,
     OVERWRITE_OLDEST,
-    REMOVE_SLOWEST_READER
 };
 
 enum class ReadMode {
@@ -110,15 +108,6 @@ struct RTMSOptions {
     // must be reported, not papered over.
     bool reclaim_mismatched_segment{false};
 };
-
-constexpr const char* to_string(ReaderState state) noexcept {
-    switch (state) {
-        case ReaderState::FREE:     return "FREE";
-        case ReaderState::CLAIMING: return "CLAIMING";
-        case ReaderState::ACTIVE:   return "ACTIVE";
-    }
-    return "UNKNOWN";
-}
 
 struct alignas(CACHE_LINE) Writer {
     std::atomic<uint64_t> sequence{};
@@ -247,39 +236,6 @@ public:
 
     size_t message_size() const { return message_size_; }
     std::string_view path() const { return path_; }
-
-    void print_header_state() const {
-        if (header_ == nullptr) {
-            std::printf("RTMS header is not mapped\n");
-            return;
-        }
-
-        std::printf("========================================\n");
-        std::printf(
-            "Writer Sequence: %" PRIu64 "\n",
-            header_->writer.sequence.load(std::memory_order_relaxed)
-        );
-
-        std::printf("----------------------------------------\n");
-        std::printf("Readers:\n");
-
-        for (std::size_t i = 0; i < MAX_READERS; ++i) {
-            const std::uint64_t seq =
-                header_->readers[i].sequence.load(std::memory_order_relaxed);
-
-            const ReaderState state =
-                header_->readers[i].state.load(std::memory_order_relaxed);
-
-            std::printf(
-                "  [%zu] Seq: %" PRIu64 " | State: %s\n",
-                i,
-                seq,
-                to_string(state)
-            );
-        }
-
-        std::printf("========================================\n");
-    }
 
 private:
     // Number of times a read retries when the writer laps it mid-read.

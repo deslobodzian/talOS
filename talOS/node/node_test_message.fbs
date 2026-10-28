@@ -1,0 +1,6 @@
+namespace node_test;
+
+struct Count {
+  value:long;
+  stamp_ns:long;
+}

@@ -2,10 +2,9 @@
 #
 # One command to run this robot in simulation.
 #
-# Replaces the three-terminal sequence in 2026-robot/README.md: the WPILib
-# simulation (which stands in for the RoboRIO and is the Driver Station), the
-# talOS node graph, and Studio. Everything starts in dependency order and
-# everything dies together on Ctrl-C.
+# Starts the WPILib simulation (which stands in for the RoboRIO and is the
+# Driver Station), the talOS node graph, and Studio, in dependency order.
+# Everything dies together on Ctrl-C.
 #
 #   ./sim.sh                 WPILib GUI simulation + node graph + Studio
 #   ./sim.sh --headless      no sim GUI; teleop enabled via TALOS_SIM_DS
@@ -117,13 +116,7 @@ die() { printf '\033[1;31msim.sh:\033[0m %s\n' "$*" >&2; exit 1; }
 # One bazel invocation for everything, so a compile error stops the run before
 # any process starts rather than halfway through bringing the system up.
 say "building"
-# The platform subsystem configs name standalone @talos_*//:node targets, so
-# those externals must be built into bazel-bin/external/talos_*+/ for the
-# launcher's dev-mode resolution to find them. Mechanisms build in-tree via
-# //2026-robot/main_processor/... (hybrid policy: mechanisms live per year).
-BUILD_TARGETS="//talOS/launcher:launcher //talOS/bridge:hardware_node //2026-robot/main_processor/..."
-BUILD_TARGETS="$BUILD_TARGETS @talos_driver_station//:node @talos_operator_interface//:node"
-BUILD_TARGETS="$BUILD_TARGETS @talos_odometry//:node @talos_telemetry//:node"
+BUILD_TARGETS="//talOS/launcher:launcher //talOS/bridge:hardware_node //talOS/driver_station:node //2026-robot/main_processor/..."
 if [ "$WANT_STUDIO" = "1" ]; then
   BUILD_TARGETS="$BUILD_TARGETS //studio/bridge:studio_bridge //studio:web_dist"
 fi

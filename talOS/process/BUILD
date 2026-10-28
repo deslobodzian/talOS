@@ -6,9 +6,9 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
-# Shared runner for loop-node binaries. Header-only; parameterized by a
-# factory lambda because node constructors vary. talOS/bridge and
-# talOS/launcher mains are excluded (not loop nodes).
+# Shared runner for loop-node binaries: talos::Run's internals and the
+# telemetry node's main. Header-only; parameterized by a factory lambda.
+# talOS/bridge and talOS/launcher mains are excluded (not loop nodes).
 cc_library(
     name = "node_main",
     hdrs = ["node_main.h"],
@@ -18,17 +18,5 @@ cc_library(
         "//talOS/events:events",
         "//talOS/introspection:describe",
         "//talOS/introspection:reporter",
-    ],
-)
-
-# Shared main for hardware-owning subsystem nodes: the config parse, the
-# device lookup, and the period-offset starter that every such main repeats.
-cc_library(
-    name = "hardware_main",
-    hdrs = ["hardware_main.h"],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":node_main",
-        "//talOS/configuration:configuration",
     ],
 )

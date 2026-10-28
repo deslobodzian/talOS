@@ -1,18 +1,34 @@
 #pragma once
 
+// Robot configuration: TOML -> hardware::Config plus per-subsystem ownership.
+//
+// Two file layouts, both reduced to one canonical view before parsing:
+//   - Manifest: robot.toml holds [robot], optional [studio], and
+//     [[subsystems]] entries { name, path }. Each path (relative to robot.toml)
+//     names a file with a [subsystem] header (whose `name` must match the
+//     entry) and that subsystem's device and custom tables at top level.
+//   - Single file: everything inline under [subsystems.<name>].
+//
+// Device tables per subsystem: motors (type "TalonFX"), sensors (type
+// "CANcoder" or "Pigeon2"), digital_inputs, digital_outputs, analog_inputs,
+// encoders (type "QuadratureEncoder" or "DutyCycleEncoder"), pwm_outputs.
+// Logical ids are assigned 1..N sorted by (subsystem, device name). Ranges,
+// uniqueness, and exclusive ownership are enforced by hardware::Validate; the
+// parser only checks what Validate cannot see (types, names, references).
+
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <optional>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "talOS/hardware/config.h"
@@ -34,18 +50,15 @@ struct RobotConfig {
   uint16_t local_port{5803};
 
   // Sim-session viewer. Studio's bridge is a host-side process, not a robot
-  // node, so it is not a [[subsystems]] entry; this table carries what the
-  // launcher needs to start and supervise it in sim sessions
-  // (--start-studio-bridge, which sim.sh passes unless --no-studio). The
-  // watched topic is NOT repeated here: it is read from
-  // [subsystems.telemetry] topic at describe/spawn time, the same key the
-  // telemetry node itself reads, so the two ends cannot drift apart.
+  // node, so it is not a subsystem; this table carries what the launcher
+  // needs to start and supervise it in sim sessions. The watched topic is
+  // read from [subsystems.telemetry] topic, the same key the telemetry node
+  // reads, so the two ends cannot drift apart.
   struct StudioConfig {
     std::string bridge{"//studio/bridge:studio_bridge"};
     uint16_t http_port{5800};
     uint16_t udp_port{5801};
-    // Relative to the launcher's working directory (the workspace root when
-    // launched from sim.sh).
+    // Relative to the launcher's working directory.
     std::string webroot{"bazel-bin/studio/dist"};
   };
   StudioConfig studio;
@@ -57,7 +70,7 @@ struct RobotConfig {
   }
 
   const toml::table* GetSubsystemTable(const std::string& subsystem,
-                                      const std::string& section = "") const {
+                                       const std::string& section = "") const {
     if (auto* subs = toml_data["subsystems"].as_table()) {
       if (auto* sub = (*subs)[subsystem].as_table()) {
         if (section.empty()) return sub;
@@ -70,90 +83,175 @@ struct RobotConfig {
 
 namespace detail {
 
-inline bool Positive(double x) { return std::isfinite(x) && x > 0; }
-inline bool NonNegative(double x) { return std::isfinite(x) && x >= 0; }
+// Reads an optional typed field; a present field of the wrong type (or an
+// integer that does not fit T) is an error, never silently defaulted.
+template <typename T>
+T Read(const toml::table& tbl, std::string_view key, T def) {
+  auto node = tbl[key];
+  if (!node) return def;
+  const std::string field = "field '" + std::string(key) + "'";
+  if constexpr (std::is_same_v<T, bool>) {
+    if (auto v = node.value<bool>()) return *v;
+    throw std::invalid_argument(field + " must be a boolean");
+  } else if constexpr (std::is_integral_v<T>) {
+    if (auto v = node.value<int64_t>(); v && std::in_range<T>(*v)) {
+      return static_cast<T>(*v);
+    }
+    throw std::invalid_argument(field + " must be an integer in range");
+  } else if constexpr (std::is_floating_point_v<T>) {
+    if (auto v = node.value<double>()) return *v;
+    throw std::invalid_argument(field + " must be a number");
+  } else {
+    if (auto v = node.value<std::string_view>()) return std::string(*v);
+    throw std::invalid_argument(field + " must be a string");
+  }
+}
 
-enum class DeviceKind {
-  kMotor,
-  kCANcoder,
-  kPigeon2,
-  kDigitalInput,
-  kDigitalOutput,
-  kAnalogInput,
-  kEncoder,
-  kPwm,
-};
+template <typename T>
+T ReadRequired(const toml::table& tbl, const char* key,
+               const std::string& device) {
+  if (!tbl.contains(key)) {
+    throw std::invalid_argument(std::string("missing '") + key + "' for " +
+                                device);
+  }
+  return Read<T>(tbl, key, T{});
+}
+
+inline std::string ReadNonEmpty(const toml::table& tbl, const char* key,
+                                std::string def, const char* table_name) {
+  std::string v = Read<std::string>(tbl, key, def);
+  if (v.empty()) {
+    throw std::invalid_argument(std::string(table_name) + " field '" + key +
+                                "' must be a non-empty string");
+  }
+  return v;
+}
+
+inline uint16_t ReadPort(const toml::table& tbl, const char* key,
+                         uint16_t def, const char* table_name) {
+  if (!tbl.contains(key)) return def;
+  auto v = tbl[key].value<int64_t>();
+  if (!v || *v < 1 || *v > 65535) {
+    throw std::invalid_argument(std::string(table_name) + " field '" + key +
+                                "' must be a port in [1, 65535]");
+  }
+  return static_cast<uint16_t>(*v);
+}
+
+using DeviceConfig =
+    std::variant<hardware::MotorConfig, hardware::SensorConfig,
+                 hardware::DigitalInputConfig, hardware::DigitalOutputConfig,
+                 hardware::AnalogInputConfig, hardware::EncoderConfig,
+                 hardware::PwmConfig>;
 
 struct RawDevice {
   std::string subsystem;
   std::string name;
-  DeviceKind kind;
-
-  hardware::MotorConfig motor{};
-  hardware::SensorConfig sensor{};
-  hardware::DigitalInputConfig digital_input{};
-  hardware::DigitalOutputConfig digital_output{};
-  hardware::AnalogInputConfig analog_input{};
-  hardware::EncoderConfig encoder{};
-  hardware::PwmConfig pwm{};
-
-  std::string feedback_sensor_name;
-  bool feedback_is_remote{false};
+  DeviceConfig config;
+  std::string feedback_sensor;  // Motors with RemoteCANcoder feedback only.
 };
 
-inline double ReadNumber(const toml::table& tbl, const char* key, double def,
-                         bool (*check_fn)(double) = nullptr,
-                         const char* err_msg = "invalid numeric value") {
-  if (auto node = tbl[key]) {
-    if (auto val = node.value<double>()) {
-      if (check_fn && !check_fn(*val)) {
-        throw std::invalid_argument(err_msg);
-      }
-      return *val;
-    } else {
-      throw std::invalid_argument(std::string("field '") + key + "' must be a number");
-    }
-  }
-  return def;
+inline bool IsCANcoder(const RawDevice& d) {
+  auto* s = std::get_if<hardware::SensorConfig>(&d.config);
+  return s && s->kind == hardware::SensorKind::kCANcoder;
 }
 
-inline int64_t ReadInteger(const toml::table& tbl, const char* key, int64_t def,
-                           bool (*check_fn)(int64_t) = nullptr,
-                           const char* err_msg = "invalid integer value") {
-  if (auto node = tbl[key]) {
-    if (auto val = node.value<int64_t>()) {
-      if (check_fn && !check_fn(*val)) {
-        throw std::invalid_argument(err_msg);
-      }
-      return *val;
-    } else {
-      throw std::invalid_argument(std::string("field '") + key + "' must be an integer");
+inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
+  if (Read<std::string>(t, "type", "TalonFX") != "TalonFX") {
+    throw std::invalid_argument("unknown motor type for " + name);
+  }
+  hardware::MotorConfig m;
+  m.bus = Read(t, "bus", m.bus);
+  m.can_id = ReadRequired<int>(t, "can_id", name);
+  m.inverted = Read(t, "inverted", m.inverted);
+  m.brake = Read(t, "brake", m.brake);
+  m.supply_limit_a = Read(t, "supply_limit_a", m.supply_limit_a);
+  m.stator_limit_a = Read(t, "stator_limit_a", m.stator_limit_a);
+  m.max_voltage = Read(t, "max_voltage", m.max_voltage);
+  m.rotor_to_sensor_ratio =
+      Read(t, "rotor_to_sensor_ratio", m.rotor_to_sensor_ratio);
+  m.sensor_to_mechanism_ratio =
+      Read(t, "sensor_to_mechanism_ratio", m.sensor_to_mechanism_ratio);
+  m.continuous_wrap = Read(t, "continuous_wrap", m.continuous_wrap);
+  m.soft_limits = Read(t, "soft_limits", m.soft_limits);
+  m.reverse_limit_rot = Read(t, "reverse_limit_rot", m.reverse_limit_rot);
+  m.forward_limit_rot = Read(t, "forward_limit_rot", m.forward_limit_rot);
+  m.max_velocity_rps = Read(t, "max_velocity_rps", m.max_velocity_rps);
+  m.cruise_velocity_rps = Read(t, "cruise_velocity_rps",
+                               std::min(20.0, m.max_velocity_rps));
+  m.acceleration_rps2 = Read(t, "acceleration_rps2", m.acceleration_rps2);
+  m.jerk_rps3 = Read(t, "jerk_rps3", m.jerk_rps3);
+  for (int s = 0; s < 3; ++s) {
+    if (auto* slot = t["slot" + std::to_string(s)].as_table()) {
+      auto& g = m.slots[s];
+      g.p = Read(*slot, "p", g.p);
+      g.i = Read(*slot, "i", g.i);
+      g.d = Read(*slot, "d", g.d);
+      g.s = Read(*slot, "s", g.s);
+      g.v = Read(*slot, "v", g.v);
+      g.a = Read(*slot, "a", g.a);
+      g.g = Read(*slot, "g", g.g);
     }
   }
-  return def;
+
+  // The sensor is resolved to a logical id after numbering, so Validate
+  // never sees the name; the parser checks the pairing.
+  RawDevice raw{.name = name};
+  const std::string feedback = Read<std::string>(t, "feedback", "Rotor");
+  raw.feedback_sensor = Read<std::string>(t, "feedback_sensor", "");
+  if (feedback == "RemoteCANcoder") {
+    m.feedback = hardware::Feedback::kRemoteCANcoder;
+    if (raw.feedback_sensor.empty()) {
+      throw std::invalid_argument(
+          "remote feedback requires feedback_sensor for " + name);
+    }
+  } else if (feedback == "Rotor") {
+    if (!raw.feedback_sensor.empty()) {
+      throw std::invalid_argument(
+          "rotor feedback cannot reference a remote sensor: " + name);
+    }
+  } else {
+    throw std::invalid_argument("unknown feedback source: " + feedback);
+  }
+  raw.config = std::move(m);
+  return raw;
 }
 
-inline bool ReadBool(const toml::table& tbl, const char* key, bool def) {
-  if (auto node = tbl[key]) {
-    if (auto val = node.value<bool>()) {
-      return *val;
-    } else {
-      throw std::invalid_argument(std::string("field '") + key + "' must be a boolean");
-    }
+inline RawDevice ParseSensor(const toml::table& t, const std::string& name) {
+  hardware::SensorConfig s;
+  const std::string type = Read<std::string>(t, "type", "CANcoder");
+  if (type == "CANcoder") {
+    s.kind = hardware::SensorKind::kCANcoder;
+  } else if (type == "Pigeon2") {
+    s.kind = hardware::SensorKind::kPigeon2;
+  } else {
+    throw std::invalid_argument("unknown sensor type '" + type + "' for " +
+                                name);
   }
-  return def;
+  s.bus = Read(t, "bus", s.bus);
+  s.can_id = ReadRequired<int>(t, "can_id", name);
+  s.inverted = Read(t, "inverted", s.inverted);
+  s.offset_rot = Read(t, "offset_rot", s.offset_rot);
+  return {.name = name, .config = std::move(s)};
 }
 
-inline std::string ReadString(const toml::table& tbl, const char* key,
-                             const std::string& def = "") {
-  if (auto node = tbl[key]) {
-    if (auto val = node.value<std::string_view>()) {
-      return std::string(*val);
-    } else {
-      throw std::invalid_argument(std::string("field '") + key + "' must be a string");
-    }
+inline RawDevice ParseEncoder(const toml::table& t, const std::string& name) {
+  hardware::EncoderConfig e;
+  const std::string type = Read<std::string>(t, "type", "QuadratureEncoder");
+  if (type == "QuadratureEncoder") {
+    e.kind = hardware::EncoderKind::kQuadrature;
+    e.dio_a = ReadRequired<int>(t, "dio_a", name);
+    e.dio_b = ReadRequired<int>(t, "dio_b", name);
+    e.counts_per_rev = Read(t, "counts_per_rev", e.counts_per_rev);
+  } else if (type == "DutyCycleEncoder") {
+    e.kind = hardware::EncoderKind::kDutyCycle;
+    e.dio_a = ReadRequired<int>(t, "dio", name);
+    e.offset_rot = Read(t, "offset_rot", e.offset_rot);
+  } else {
+    throw std::invalid_argument("unknown encoder type '" + type + "' for " +
+                                name);
   }
-  return def;
+  return {.name = name, .config = std::move(e)};
 }
 
 }  // namespace detail
@@ -178,145 +276,35 @@ inline uint16_t ResolveLocalPort(const RobotConfig& config,
   return config.local_port;
 }
 
-inline RobotConfig ParseRobotConfigTable(toml::table tbl);
-
-inline RobotConfig ParseRobotConfigString(std::string_view toml_content) {
-  toml::table tbl;
-  try {
-    tbl = toml::parse(toml_content);
-  } catch (const toml::parse_error& err) {
-    throw std::invalid_argument(std::string("TOML parse error: ") + err.what());
-  }
-  return ParseRobotConfigTable(std::move(tbl));
-}
-
-// The whole single-file validation: ownership, ids, ranges, cross-checks.
-// Takes the canonical view — either one file's [subsystems] table, or the
-// merged view ExpandManifest assembles — so splitting files cannot weaken a
-// check. toml_data keeps the merged table, which is what GetSubsystemTable
-// answers from.
+// Parses the canonical single-file view. toml_data keeps the table, which is
+// what GetSubsystemTable answers from.
 inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
+  using detail::Read;
+  using detail::ReadRequired;
   RobotConfig result;
   result.toml_data = tbl;
+  auto& hw = result.hardware;
 
-  // 1. Parse [robot] table
-  uint32_t period_us = 5000;
-  uint32_t command_timeout_us = 100000;
-  double status_hz = 200.0;
-  bool commissioned = false;
-  std::string controller_address = "127.0.0.1";
-  uint16_t controller_port = 5802;
-  uint16_t local_port = 5803;
-
-  if (auto* robot_tbl = tbl["robot"].as_table()) {
-    if (auto node = (*robot_tbl)["period_us"]) {
-      auto val = node.value<int64_t>();
-      if (!val || *val < 1000 || *val > 20000) {
-        throw std::invalid_argument("invalid gateway period or command timeout: period_us must be in [1000, 20000]");
-      }
-      period_us = static_cast<uint32_t>(*val);
-    }
-    if (auto node = (*robot_tbl)["command_timeout_us"]) {
-      auto val = node.value<int64_t>();
-      if (!val || *val < 2 * period_us || *val > 500000) {
-        throw std::invalid_argument("invalid gateway period or command timeout: command_timeout_us must be in [2 * period_us, 500000]");
-      }
-      command_timeout_us = static_cast<uint32_t>(*val);
-    } else {
-      // Default timeout check against period_us
-      if (command_timeout_us < 2 * period_us) {
-        command_timeout_us = 2 * period_us;
-      }
-    }
-    if (auto node = (*robot_tbl)["status_hz"]) {
-      auto val = node.value<double>();
-      if (!val || !detail::Positive(*val) || *val > 1000) {
-        throw std::invalid_argument("invalid status frequency: status_hz must be in (0, 1000]");
-      }
-      status_hz = *val;
-    }
-    commissioned = (*robot_tbl)["commissioned"].value_or(false);
-
-    // Deployment addressing: where the controller processor lives as seen
-    // from this companion. `controller_address` is canonical;
-    // `remote_address`/`remote_ip` are accepted as aliases. Ports default to
-    // the runtime contract: 5802 on the gateway, 5803 on the companion.
-    auto read_address = [&](const char* key) -> std::optional<std::string> {
-      if (auto node = (*robot_tbl)[key]) {
-        auto val = node.value<std::string_view>();
-        if (!val || val->empty()) {
-          throw std::invalid_argument(std::string("field '") + key +
-                                      "' must be a non-empty string");
-        }
-        return std::string(*val);
-      }
-      return std::nullopt;
-    };
-    if (auto addr = read_address("controller_address")) {
-      controller_address = *addr;
-    } else if (auto addr = read_address("remote_address")) {
-      controller_address = *addr;
-    } else if (auto addr = read_address("remote_ip")) {
-      controller_address = *addr;
-    }
-    auto read_port = [&](const char* key, uint16_t fallback) {
-      if (auto node = (*robot_tbl)[key]) {
-        auto val = node.value<int64_t>();
-        if (!val || *val < 1 || *val > 65535) {
-          throw std::invalid_argument(std::string("field '") + key +
-                                      "' must be a port in [1, 65535]");
-        }
-        return static_cast<uint16_t>(*val);
-      }
-      return fallback;
-    };
-    controller_port = read_port("controller_port", controller_port);
-    controller_port = read_port("remote_port", controller_port);
-    local_port = read_port("local_port", local_port);
+  if (auto* robot = tbl["robot"].as_table()) {
+    hw.period_us = Read(*robot, "period_us", hw.period_us);
+    hw.command_timeout_us =
+        Read(*robot, "command_timeout_us", hw.command_timeout_us);
+    hw.status_hz = Read(*robot, "status_hz", hw.status_hz);
+    hw.commissioned = Read(*robot, "commissioned", hw.commissioned);
+    result.controller_address = detail::ReadNonEmpty(
+        *robot, "controller_address", result.controller_address, "[robot]");
+    result.controller_port = detail::ReadPort(
+        *robot, "controller_port", result.controller_port, "[robot]");
+    result.local_port =
+        detail::ReadPort(*robot, "local_port", result.local_port, "[robot]");
   }
 
-  result.hardware.period_us = period_us;
-  result.hardware.command_timeout_us = command_timeout_us;
-  result.hardware.status_hz = status_hz;
-  result.hardware.commissioned = commissioned;
-  result.controller_address = controller_address;
-  result.controller_port = controller_port;
-  result.local_port = local_port;
-
-  // 1b. Parse [studio] table. Every key is optional; an absent table leaves
-  // the sim-session defaults above, so assemblies written before this table
-  // existed launch unchanged.
-  if (auto* studio_tbl = tbl["studio"].as_table()) {
-    auto read_studio_string = [&](const char* key, std::string fallback) {
-      if (auto node = (*studio_tbl)[key]) {
-        auto val = node.value<std::string_view>();
-        if (!val || val->empty()) {
-          throw std::invalid_argument(std::string("[studio] field '") + key +
-                                      "' must be a non-empty string");
-        }
-        return std::string(*val);
-      }
-      return fallback;
-    };
-    auto read_studio_port = [&](const char* key, uint16_t fallback) {
-      if (auto node = (*studio_tbl)[key]) {
-        auto val = node.value<int64_t>();
-        if (!val || *val < 1 || *val > 65535) {
-          throw std::invalid_argument(std::string("[studio] field '") + key +
-                                      "' must be a port in [1, 65535]");
-        }
-        return static_cast<uint16_t>(*val);
-      }
-      return fallback;
-    };
-    result.studio.bridge =
-        read_studio_string("bridge", result.studio.bridge);
-    result.studio.webroot =
-        read_studio_string("webroot", result.studio.webroot);
-    result.studio.http_port =
-        read_studio_port("http_port", result.studio.http_port);
-    result.studio.udp_port =
-        read_studio_port("udp_port", result.studio.udp_port);
+  if (auto* studio = tbl["studio"].as_table()) {
+    auto& s = result.studio;
+    s.bridge = detail::ReadNonEmpty(*studio, "bridge", s.bridge, "[studio]");
+    s.webroot = detail::ReadNonEmpty(*studio, "webroot", s.webroot, "[studio]");
+    s.http_port = detail::ReadPort(*studio, "http_port", s.http_port, "[studio]");
+    s.udp_port = detail::ReadPort(*studio, "udp_port", s.udp_port, "[studio]");
   }
 
   auto* subsystems_tbl = tbl["subsystems"].as_table();
@@ -324,596 +312,172 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     throw std::invalid_argument("missing [subsystems] table");
   }
 
-  std::map<std::string, std::set<std::string>> subsystem_device_names;
   std::vector<detail::RawDevice> raw_devices;
-
-  auto validate_device_name = [&](const std::string& subsystem, const std::string& name) {
-    if (name.empty() || name.size() > 63) {
-      throw std::invalid_argument("invalid or empty device name: '" + name + "'");
-    }
-    if (!subsystem_device_names[subsystem].insert(name).second) {
-      throw std::invalid_argument("duplicate device name within subsystem '" + subsystem + "': " + name);
-    }
-  };
-
   for (auto&& [sub_key, sub_val] : *subsystems_tbl) {
-    std::string sub_name = std::string(sub_key.str());
+    const std::string sub_name(sub_key.str());
     auto* sub_tbl = sub_val.as_table();
     if (!sub_tbl) continue;
-
-    // Ensure subsystem entry exists in result
     result.subsystems[sub_name].subsystem = sub_name;
 
-    // Parse motors
-    if (auto* motors_tbl = (*sub_tbl)["motors"].as_table()) {
-      for (auto&& [dev_key, dev_val] : *motors_tbl) {
-        std::string dev_name = std::string(dev_key.str());
-        validate_device_name(sub_name, dev_name);
-        auto* motor_tbl = dev_val.as_table();
-        if (!motor_tbl) {
-          throw std::invalid_argument("motor '" + dev_name + "' must be a table");
+    auto each = [&](const char* section, auto parse) {
+      auto* devices = (*sub_tbl)[section].as_table();
+      if (!devices) return;
+      for (auto&& [dev_key, dev_val] : *devices) {
+        const std::string name(dev_key.str());
+        auto* dev_tbl = dev_val.as_table();
+        if (!dev_tbl) {
+          throw std::invalid_argument(std::string(section) + " entry '" +
+                                      name + "' must be a table");
         }
-
-        std::string type = detail::ReadString(*motor_tbl, "type", "TalonFX");
-        if (type != "TalonFX") {
-          throw std::invalid_argument("unknown motor type: '" + type + "' for " + dev_name);
-        }
-
-        detail::RawDevice raw;
+        detail::RawDevice raw = parse(*dev_tbl, name);
         raw.subsystem = sub_name;
-        raw.name = dev_name;
-        raw.kind = detail::DeviceKind::kMotor;
-
-        raw.motor.bus = detail::ReadString(*motor_tbl, "bus", "rio");
-        if (raw.motor.bus.empty() || raw.motor.bus.size() > 63) {
-          throw std::invalid_argument("invalid CAN address: empty or too long bus name for " + dev_name);
-        }
-
-        if (!(*motor_tbl)["can_id"]) {
-          throw std::invalid_argument("missing can_id for motor: " + dev_name);
-        }
-        raw.motor.can_id = static_cast<int>(detail::ReadInteger(
-            *motor_tbl, "can_id", -1,
-            [](int64_t v) { return v >= 0 && v <= 62; },
-            "invalid CAN address: can_id must be in [0, 62]"));
-
-        raw.motor.inverted = detail::ReadBool(*motor_tbl, "inverted", false);
-        raw.motor.brake = detail::ReadBool(*motor_tbl, "brake", true);
-
-        raw.motor.supply_limit_a = detail::ReadNumber(
-            *motor_tbl, "supply_limit_a", 40.0,
-            detail::Positive, "invalid motor limits: supply_limit_a must be positive");
-        raw.motor.stator_limit_a = detail::ReadNumber(
-            *motor_tbl, "stator_limit_a", 80.0,
-            detail::Positive, "invalid motor limits: stator_limit_a must be positive");
-        raw.motor.max_voltage = detail::ReadNumber(
-            *motor_tbl, "max_voltage", 12.0,
-            [](double v) { return detail::Positive(v) && v <= 12.0; },
-            "invalid motor limits: max_voltage must be positive and <= 12");
-
-        raw.motor.rotor_to_sensor_ratio = detail::ReadNumber(
-            *motor_tbl, "rotor_to_sensor_ratio", 1.0,
-            detail::Positive, "invalid gearing: rotor_to_sensor_ratio must be positive");
-        raw.motor.sensor_to_mechanism_ratio = detail::ReadNumber(
-            *motor_tbl, "sensor_to_mechanism_ratio", 1.0,
-            detail::Positive, "invalid gearing: sensor_to_mechanism_ratio must be positive");
-
-        raw.motor.continuous_wrap = detail::ReadBool(*motor_tbl, "continuous_wrap", false);
-        raw.motor.soft_limits = detail::ReadBool(*motor_tbl, "soft_limits", false);
-
-        raw.motor.reverse_limit_rot = detail::ReadNumber(
-            *motor_tbl, "reverse_limit_rot", -1.0,
-            [](double v) { return std::isfinite(v); }, "invalid soft limits: reverse_limit_rot must be finite");
-        raw.motor.forward_limit_rot = detail::ReadNumber(
-            *motor_tbl, "forward_limit_rot", 1.0,
-            [](double v) { return std::isfinite(v); }, "invalid soft limits: forward_limit_rot must be finite");
-
-        if (raw.motor.reverse_limit_rot >= raw.motor.forward_limit_rot) {
-          throw std::invalid_argument("invalid soft limits: reverse_limit_rot must be < forward_limit_rot");
-        }
-
-        raw.motor.max_velocity_rps = detail::ReadNumber(
-            *motor_tbl, "max_velocity_rps", 100.0,
-            detail::Positive, "invalid motion profile: max_velocity_rps must be positive");
-
-        double default_cruise = std::min(20.0, raw.motor.max_velocity_rps);
-        if (auto node = (*motor_tbl)["cruise_velocity_rps"]) {
-          if (auto val = node.value<double>()) {
-            if (!detail::Positive(*val) || *val > raw.motor.max_velocity_rps) {
-              throw std::invalid_argument("invalid motion profile: cruise_velocity_rps must be positive and <= max_velocity_rps");
-            }
-            raw.motor.cruise_velocity_rps = *val;
-          } else {
-            throw std::invalid_argument("cruise_velocity_rps must be a number");
-          }
-        } else {
-          raw.motor.cruise_velocity_rps = default_cruise;
-        }
-
-        raw.motor.acceleration_rps2 = detail::ReadNumber(
-            *motor_tbl, "acceleration_rps2", 40.0,
-            detail::Positive, "invalid motion profile: acceleration_rps2 must be positive");
-        raw.motor.jerk_rps3 = detail::ReadNumber(
-            *motor_tbl, "jerk_rps3", 0.0,
-            detail::NonNegative, "invalid motion profile: jerk_rps3 must be non-negative");
-
-        // Parse gains slots
-        for (int s = 0; s < 3; ++s) {
-          std::string slot_key = "slot" + std::to_string(s);
-          if (auto* slot_tbl = (*motor_tbl)[slot_key].as_table()) {
-            auto parse_gain = [&](const char* name, double& dest) {
-              if (auto node = (*slot_tbl)[name]) {
-                if (auto val = node.value<double>()) {
-                  if (!detail::NonNegative(*val)) {
-                    throw std::invalid_argument(std::string("invalid gain '") + name + "' in " + slot_key);
-                  }
-                  dest = *val;
-                } else {
-                  throw std::invalid_argument(std::string("gain '") + name + "' in " + slot_key + " must be a number");
-                }
-              }
-            };
-            parse_gain("p", raw.motor.slots[s].p);
-            parse_gain("i", raw.motor.slots[s].i);
-            parse_gain("d", raw.motor.slots[s].d);
-            parse_gain("s", raw.motor.slots[s].s);
-            parse_gain("v", raw.motor.slots[s].v);
-            parse_gain("a", raw.motor.slots[s].a);
-            parse_gain("g", raw.motor.slots[s].g);
-          }
-        }
-
-        // Feedback
-        std::string fb_str = detail::ReadString(*motor_tbl, "feedback", "");
-        std::string fb_sensor = detail::ReadString(*motor_tbl, "feedback_sensor", "");
-        if (fb_sensor.empty()) {
-          fb_sensor = detail::ReadString(*motor_tbl, "feedback_sensor_name", "");
-        }
-        if (fb_sensor.empty() && (*motor_tbl)["feedback_sensor_id"]) {
-          if (auto str_val = (*motor_tbl)["feedback_sensor_id"].value<std::string_view>()) {
-            fb_sensor = std::string(*str_val);
-          }
-        }
-
-        if (fb_str == "RemoteCANcoder" || fb_str == "kRemoteCANcoder" || fb_str == "cancoder") {
-          raw.feedback_is_remote = true;
-        } else if (fb_str == "Rotor" || fb_str == "kRotor" || fb_str == "rotor") {
-          raw.feedback_is_remote = false;
-        } else if (!fb_str.empty()) {
-          throw std::invalid_argument("unknown feedback source: " + fb_str);
-        } else {
-          // If feedback wasn't specified but feedback_sensor was, infer RemoteCANcoder
-          raw.feedback_is_remote = !fb_sensor.empty();
-        }
-
-        if (!raw.feedback_is_remote && !fb_sensor.empty()) {
-          throw std::invalid_argument("rotor feedback cannot reference a remote sensor");
-        }
-        if (raw.feedback_is_remote && fb_sensor.empty()) {
-          throw std::invalid_argument("remote feedback requires feedback_sensor to be specified");
-        }
-        raw.feedback_sensor_name = fb_sensor;
-
+        raw.name = name;
         raw_devices.push_back(std::move(raw));
       }
-    }
-
-    // Parse sensors
-    if (auto* sensors_tbl = (*sub_tbl)["sensors"].as_table()) {
-      for (auto&& [dev_key, dev_val] : *sensors_tbl) {
-        std::string dev_name = std::string(dev_key.str());
-        validate_device_name(sub_name, dev_name);
-        auto* sensor_tbl = dev_val.as_table();
-        if (!sensor_tbl) {
-          throw std::invalid_argument("sensor '" + dev_name + "' must be a table");
-        }
-
-        std::string type = detail::ReadString(*sensor_tbl, "type", "CANcoder");
-        detail::RawDevice raw;
-        raw.subsystem = sub_name;
-        raw.name = dev_name;
-
-        if (type == "CANcoder" || type == "kCANcoder") {
-          raw.kind = detail::DeviceKind::kCANcoder;
-          raw.sensor.kind = hardware::SensorKind::kCANcoder;
-          raw.sensor.bus = detail::ReadString(*sensor_tbl, "bus", "rio");
-          if (raw.sensor.bus.empty() || raw.sensor.bus.size() > 63) {
-            throw std::invalid_argument("invalid CAN address: empty or too long bus name for " + dev_name);
-          }
-          if (!(*sensor_tbl)["can_id"]) {
-            throw std::invalid_argument("missing can_id for sensor: " + dev_name);
-          }
-          raw.sensor.can_id = static_cast<int>(detail::ReadInteger(
-              *sensor_tbl, "can_id", -1,
-              [](int64_t v) { return v >= 0 && v <= 62; },
-              "invalid CAN address: can_id must be in [0, 62]"));
-          raw.sensor.inverted = detail::ReadBool(*sensor_tbl, "inverted", false);
-          raw.sensor.offset_rot = detail::ReadNumber(
-              *sensor_tbl, "offset_rot", 0.0,
-              [](double v) { return std::isfinite(v) && v >= -0.5 && v < 0.5; },
-              "invalid encoder offset: offset_rot must be in [-0.5, 0.5)");
-        } else if (type == "Pigeon2" || type == "kPigeon2") {
-          raw.kind = detail::DeviceKind::kPigeon2;
-          raw.sensor.kind = hardware::SensorKind::kPigeon2;
-          raw.sensor.bus = detail::ReadString(*sensor_tbl, "bus", "rio");
-          if (raw.sensor.bus.empty() || raw.sensor.bus.size() > 63) {
-            throw std::invalid_argument("invalid CAN address: empty or too long bus name for " + dev_name);
-          }
-          if (!(*sensor_tbl)["can_id"]) {
-            throw std::invalid_argument("missing can_id for sensor: " + dev_name);
-          }
-          raw.sensor.can_id = static_cast<int>(detail::ReadInteger(
-              *sensor_tbl, "can_id", -1,
-              [](int64_t v) { return v >= 0 && v <= 62; },
-              "invalid CAN address: can_id must be in [0, 62]"));
-          raw.sensor.inverted = detail::ReadBool(*sensor_tbl, "inverted", false);
-          raw.sensor.offset_rot = detail::ReadNumber(*sensor_tbl, "offset_rot", 0.0);
-          if (raw.sensor.inverted || raw.sensor.offset_rot != 0.0) {
-            throw std::invalid_argument("Pigeon mounting must use its native frame");
-          }
-        } else if (type == "DigitalInput") {
-          raw.kind = detail::DeviceKind::kDigitalInput;
-          if (!(*sensor_tbl)["dio"]) throw std::invalid_argument("missing dio channel for DigitalInput " + dev_name);
-          raw.digital_input.dio = static_cast<int>(detail::ReadInteger(
-              *sensor_tbl, "dio", -1, [](int64_t v) { return v >= 0 && v <= 31; },
-              "invalid dio channel: dio must be in [0, 31]"));
-        } else if (type == "AnalogInput") {
-          raw.kind = detail::DeviceKind::kAnalogInput;
-          const char* ch_key = (*sensor_tbl)["analog"] ? "analog" : "channel";
-          if (!(*sensor_tbl)[ch_key]) throw std::invalid_argument("missing analog channel for AnalogInput " + dev_name);
-          raw.analog_input.channel = static_cast<int>(detail::ReadInteger(
-              *sensor_tbl, ch_key, -1, [](int64_t v) { return v >= 0 && v <= 7; },
-              "invalid analog channel: channel must be in [0, 7]"));
-        } else if (type == "QuadratureEncoder" || type == "DutyCycleEncoder") {
-          raw.kind = detail::DeviceKind::kEncoder;
-          if (type == "QuadratureEncoder") {
-            raw.encoder.kind = hardware::EncoderKind::kQuadrature;
-            if (!(*sensor_tbl)["dio_a"]) throw std::invalid_argument("missing dio_a for QuadratureEncoder " + dev_name);
-            raw.encoder.dio_a = static_cast<int>(detail::ReadInteger(
-                *sensor_tbl, "dio_a", -1, [](int64_t v) { return v >= 0 && v <= 31; },
-                "invalid dio_a channel"));
-            raw.encoder.dio_b = static_cast<int>(detail::ReadInteger(
-                *sensor_tbl, "dio_b", -1, [](int64_t v) { return v >= -1 && v <= 31; },
-                "invalid dio_b channel"));
-            raw.encoder.counts_per_rev = detail::ReadNumber(
-                *sensor_tbl, "counts_per_rev", 2048.0, detail::Positive,
-                "counts_per_rev must be positive");
-          } else {
-            raw.encoder.kind = hardware::EncoderKind::kDutyCycle;
-            if (!(*sensor_tbl)["dio"]) throw std::invalid_argument("missing dio for DutyCycleEncoder " + dev_name);
-            raw.encoder.dio_a = static_cast<int>(detail::ReadInteger(
-                *sensor_tbl, "dio", -1, [](int64_t v) { return v >= 0 && v <= 31; },
-                "invalid dio channel"));
-            raw.encoder.offset_rot = detail::ReadNumber(*sensor_tbl, "offset_rot", 0.0);
-          }
-        } else {
-          throw std::invalid_argument("unknown sensor type: '" + type + "' for " + dev_name);
-        }
-
-        raw_devices.push_back(std::move(raw));
-      }
-    }
-
-    // Parse digital_inputs
-    if (auto* dis_tbl = (*sub_tbl)["digital_inputs"].as_table()) {
-      for (auto&& [dev_key, dev_val] : *dis_tbl) {
-        std::string dev_name = std::string(dev_key.str());
-        validate_device_name(sub_name, dev_name);
-        auto* di_tbl = dev_val.as_table();
-        if (!di_tbl) throw std::invalid_argument("digital input '" + dev_name + "' must be a table");
-        if (!(*di_tbl)["dio"]) throw std::invalid_argument("missing dio channel for " + dev_name);
-        detail::RawDevice raw;
-        raw.subsystem = sub_name;
-        raw.name = dev_name;
-        raw.kind = detail::DeviceKind::kDigitalInput;
-        raw.digital_input.dio = static_cast<int>(detail::ReadInteger(
-            *di_tbl, "dio", -1, [](int64_t v) { return v >= 0 && v <= 31; }, "invalid dio channel"));
-        raw_devices.push_back(std::move(raw));
-      }
-    }
-
-    // Parse digital_outputs
-    if (auto* dos_tbl = (*sub_tbl)["digital_outputs"].as_table()) {
-      for (auto&& [dev_key, dev_val] : *dos_tbl) {
-        std::string dev_name = std::string(dev_key.str());
-        validate_device_name(sub_name, dev_name);
-        auto* do_tbl = dev_val.as_table();
-        if (!do_tbl) throw std::invalid_argument("digital output '" + dev_name + "' must be a table");
-        if (!(*do_tbl)["dio"]) throw std::invalid_argument("missing dio channel for " + dev_name);
-        detail::RawDevice raw;
-        raw.subsystem = sub_name;
-        raw.name = dev_name;
-        raw.kind = detail::DeviceKind::kDigitalOutput;
-        raw.digital_output.dio = static_cast<int>(detail::ReadInteger(
-            *do_tbl, "dio", -1, [](int64_t v) { return v >= 0 && v <= 31; }, "invalid dio channel"));
-        raw_devices.push_back(std::move(raw));
-      }
-    }
-
-    // Parse analog_inputs
-    if (auto* ais_tbl = (*sub_tbl)["analog_inputs"].as_table()) {
-      for (auto&& [dev_key, dev_val] : *ais_tbl) {
-        std::string dev_name = std::string(dev_key.str());
-        validate_device_name(sub_name, dev_name);
-        auto* ai_tbl = dev_val.as_table();
-        if (!ai_tbl) throw std::invalid_argument("analog input '" + dev_name + "' must be a table");
-        const char* ch_key = (*ai_tbl)["analog"] ? "analog" : "channel";
-        if (!(*ai_tbl)[ch_key]) throw std::invalid_argument("missing analog channel for " + dev_name);
-        detail::RawDevice raw;
-        raw.subsystem = sub_name;
-        raw.name = dev_name;
-        raw.kind = detail::DeviceKind::kAnalogInput;
-        raw.analog_input.channel = static_cast<int>(detail::ReadInteger(
-            *ai_tbl, ch_key, -1, [](int64_t v) { return v >= 0 && v <= 7; }, "invalid analog channel"));
-        raw_devices.push_back(std::move(raw));
-      }
-    }
-
-    // Parse encoders
-    if (auto* encs_tbl = (*sub_tbl)["encoders"].as_table()) {
-      for (auto&& [dev_key, dev_val] : *encs_tbl) {
-        std::string dev_name = std::string(dev_key.str());
-        validate_device_name(sub_name, dev_name);
-        auto* enc_tbl = dev_val.as_table();
-        if (!enc_tbl) throw std::invalid_argument("encoder '" + dev_name + "' must be a table");
-        std::string type = detail::ReadString(*enc_tbl, "type", "QuadratureEncoder");
-        detail::RawDevice raw;
-        raw.subsystem = sub_name;
-        raw.name = dev_name;
-        raw.kind = detail::DeviceKind::kEncoder;
-        if (type == "QuadratureEncoder" || type == "Quadrature") {
-          raw.encoder.kind = hardware::EncoderKind::kQuadrature;
-          if (!(*enc_tbl)["dio_a"]) throw std::invalid_argument("missing dio_a for " + dev_name);
-          raw.encoder.dio_a = static_cast<int>(detail::ReadInteger(
-              *enc_tbl, "dio_a", -1, [](int64_t v) { return v >= 0 && v <= 31; }, "invalid dio_a channel"));
-          raw.encoder.dio_b = static_cast<int>(detail::ReadInteger(
-              *enc_tbl, "dio_b", -1, [](int64_t v) { return v >= -1 && v <= 31; }, "invalid dio_b channel"));
-          raw.encoder.counts_per_rev = detail::ReadNumber(
-              *enc_tbl, "counts_per_rev", 2048.0, detail::Positive, "counts_per_rev must be positive");
-        } else if (type == "DutyCycleEncoder" || type == "DutyCycle") {
-          raw.encoder.kind = hardware::EncoderKind::kDutyCycle;
-          if (!(*enc_tbl)["dio"]) throw std::invalid_argument("missing dio for " + dev_name);
-          raw.encoder.dio_a = static_cast<int>(detail::ReadInteger(
-              *enc_tbl, "dio", -1, [](int64_t v) { return v >= 0 && v <= 31; }, "invalid dio channel"));
-          raw.encoder.offset_rot = detail::ReadNumber(*enc_tbl, "offset_rot", 0.0);
-        } else {
-          throw std::invalid_argument("unknown encoder type: " + type);
-        }
-        raw_devices.push_back(std::move(raw));
-      }
-    }
-
-    // Parse pwm_outputs / pwms
-    auto* pwms_tbl = (*sub_tbl)["pwm_outputs"].as_table();
-    if (!pwms_tbl) pwms_tbl = (*sub_tbl)["pwms"].as_table();
-    if (pwms_tbl) {
-      for (auto&& [dev_key, dev_val] : *pwms_tbl) {
-        std::string dev_name = std::string(dev_key.str());
-        validate_device_name(sub_name, dev_name);
-        auto* pwm_tbl = dev_val.as_table();
-        if (!pwm_tbl) throw std::invalid_argument("pwm '" + dev_name + "' must be a table");
-        const char* ch_key = (*pwm_tbl)["pwm"] ? "pwm" : "channel";
-        if (!(*pwm_tbl)[ch_key]) throw std::invalid_argument("missing channel for " + dev_name);
-        detail::RawDevice raw;
-        raw.subsystem = sub_name;
-        raw.name = dev_name;
-        raw.kind = detail::DeviceKind::kPwm;
-        raw.pwm.channel = static_cast<int>(detail::ReadInteger(
-            *pwm_tbl, ch_key, -1, [](int64_t v) { return v >= 0 && v <= 19; }, "invalid PWM channel"));
-        raw_devices.push_back(std::move(raw));
-      }
-    }
+    };
+    each("motors", detail::ParseMotor);
+    each("sensors", detail::ParseSensor);
+    each("encoders", detail::ParseEncoder);
+    each("digital_inputs", [](const toml::table& t, const std::string& n) {
+      return detail::RawDevice{
+          .config = hardware::DigitalInputConfig{
+              .dio = ReadRequired<int>(t, "dio", n)}};
+    });
+    each("digital_outputs", [](const toml::table& t, const std::string& n) {
+      return detail::RawDevice{
+          .config = hardware::DigitalOutputConfig{
+              .dio = ReadRequired<int>(t, "dio", n)}};
+    });
+    each("analog_inputs", [](const toml::table& t, const std::string& n) {
+      return detail::RawDevice{
+          .config = hardware::AnalogInputConfig{
+              .channel = ReadRequired<int>(t, "channel", n)}};
+    });
+    each("pwm_outputs", [](const toml::table& t, const std::string& n) {
+      return detail::RawDevice{
+          .config = hardware::PwmConfig{
+              .channel = ReadRequired<int>(t, "channel", n)}};
+    });
   }
 
-  // 2. Exclusive ownership checks: Duplicate addresses / channels
-  std::set<std::pair<std::string, int>> can_addresses;
-  std::set<int> dio_channels;
-  std::set<int> pwm_channels;
-  std::set<int> analog_channels;
-
-  for (const auto& dev : raw_devices) {
-    if (dev.kind == detail::DeviceKind::kMotor) {
-      if (!can_addresses.emplace(dev.motor.bus, dev.motor.can_id).second) {
-        throw std::invalid_argument("duplicate CAN address on a bus: (" + dev.motor.bus + ", " +
-                                    std::to_string(dev.motor.can_id) + ")");
-      }
-    } else if (dev.kind == detail::DeviceKind::kCANcoder || dev.kind == detail::DeviceKind::kPigeon2) {
-      if (!can_addresses.emplace(dev.sensor.bus, dev.sensor.can_id).second) {
-        throw std::invalid_argument("duplicate CAN address on a bus: (" + dev.sensor.bus + ", " +
-                                    std::to_string(dev.sensor.can_id) + ")");
-      }
-    } else if (dev.kind == detail::DeviceKind::kDigitalInput) {
-      if (!dio_channels.insert(dev.digital_input.dio).second) {
-        throw std::invalid_argument("duplicate DIO channel: " + std::to_string(dev.digital_input.dio));
-      }
-    } else if (dev.kind == detail::DeviceKind::kDigitalOutput) {
-      if (!dio_channels.insert(dev.digital_output.dio).second) {
-        throw std::invalid_argument("duplicate DIO channel: " + std::to_string(dev.digital_output.dio));
-      }
-    } else if (dev.kind == detail::DeviceKind::kEncoder) {
-      if (!dio_channels.insert(dev.encoder.dio_a).second) {
-        throw std::invalid_argument("duplicate DIO channel: " + std::to_string(dev.encoder.dio_a));
-      }
-      if (dev.encoder.dio_b >= 0) {
-        if (!dio_channels.insert(dev.encoder.dio_b).second) {
-          throw std::invalid_argument("duplicate DIO channel: " + std::to_string(dev.encoder.dio_b));
-        }
-      }
-    } else if (dev.kind == detail::DeviceKind::kAnalogInput) {
-      if (!analog_channels.insert(dev.analog_input.channel).second) {
-        throw std::invalid_argument("duplicate analog channel: " + std::to_string(dev.analog_input.channel));
-      }
-    } else if (dev.kind == detail::DeviceKind::kPwm) {
-      if (!pwm_channels.insert(dev.pwm.channel).second) {
-        throw std::invalid_argument("duplicate PWM channel: " + std::to_string(dev.pwm.channel));
-      }
-    }
-  }
-
-  // 3. Deterministic sorting: sort by subsystem name, then device name, and number from 1
+  // Deterministic logical ids: sort by (subsystem, device), number from 1.
   std::sort(raw_devices.begin(), raw_devices.end(),
             [](const detail::RawDevice& a, const detail::RawDevice& b) {
               if (a.subsystem != b.subsystem) return a.subsystem < b.subsystem;
               return a.name < b.name;
             });
-
   uint16_t next_id = 1;
   for (auto& dev : raw_devices) {
-    uint16_t id = next_id++;
-    switch (dev.kind) {
-      case detail::DeviceKind::kMotor:
-        dev.motor.id = id;
-        dev.motor.name = dev.name;
-        break;
-      case detail::DeviceKind::kCANcoder:
-      case detail::DeviceKind::kPigeon2:
-        dev.sensor.id = id;
-        dev.sensor.name = dev.name;
-        break;
-      case detail::DeviceKind::kDigitalInput:
-        dev.digital_input.id = id;
-        dev.digital_input.name = dev.name;
-        break;
-      case detail::DeviceKind::kDigitalOutput:
-        dev.digital_output.id = id;
-        dev.digital_output.name = dev.name;
-        break;
-      case detail::DeviceKind::kAnalogInput:
-        dev.analog_input.id = id;
-        dev.analog_input.name = dev.name;
-        break;
-      case detail::DeviceKind::kEncoder:
-        dev.encoder.id = id;
-        dev.encoder.name = dev.name;
-        break;
-      case detail::DeviceKind::kPwm:
-        dev.pwm.id = id;
-        dev.pwm.name = dev.name;
-        break;
-    }
+    std::visit(
+        [&](auto& c) {
+          c.id = next_id++;
+          c.name = dev.name;
+        },
+        dev.config);
   }
 
-  // 4. Resolve feedback sensors and validate feedback references
+  auto find = [&](const std::string& name) -> const detail::RawDevice* {
+    for (const auto& d : raw_devices) {
+      if (d.name == name) return &d;
+    }
+    return nullptr;
+  };
+  auto require_same_subsystem = [](const detail::RawDevice& target,
+                                   const std::string& subsystem,
+                                   const std::string& claimant) {
+    if (target.subsystem != subsystem) {
+      throw std::invalid_argument(
+          "cross-subsystem device claim: '" + claimant + "' in subsystem '" +
+          subsystem + "' references '" + target.name + "' in subsystem '" +
+          target.subsystem + "'");
+    }
+  };
+
+  // Remote feedback: name -> logical id. Validate checks kind and bus.
   for (auto& dev : raw_devices) {
-    if (dev.kind != detail::DeviceKind::kMotor) continue;
-
-    if (dev.feedback_is_remote) {
-      const detail::RawDevice* target_sensor = nullptr;
-      for (const auto& other : raw_devices) {
-        if (other.name == dev.feedback_sensor_name) {
-          target_sensor = &other;
-          break;
-        }
-      }
-
-      if (!target_sensor) {
-        throw std::invalid_argument("remote feedback sensor not found: " + dev.feedback_sensor_name);
-      }
-      if (target_sensor->subsystem != dev.subsystem) {
-        throw std::invalid_argument("cross-subsystem device claim: motor '" + dev.name + "' in subsystem '" +
-                                    dev.subsystem + "' references sensor '" + target_sensor->name +
-                                    "' in subsystem '" + target_sensor->subsystem + "'");
-      }
-      if (target_sensor->kind != detail::DeviceKind::kCANcoder) {
-        throw std::invalid_argument("remote feedback sensor must be a CANcoder: " + target_sensor->name);
-      }
-      if (target_sensor->sensor.bus != dev.motor.bus) {
-        throw std::invalid_argument("remote CANcoder must exist on the motor's CAN bus: " + target_sensor->name);
-      }
-
-      dev.motor.feedback = hardware::Feedback::kRemoteCANcoder;
-      dev.motor.feedback_sensor_id = target_sensor->sensor.id;
-    } else {
-      dev.motor.feedback = hardware::Feedback::kRotor;
-      dev.motor.feedback_sensor_id = 0;
+    auto* motor = std::get_if<hardware::MotorConfig>(&dev.config);
+    if (!motor || dev.feedback_sensor.empty()) continue;
+    const auto* sensor = find(dev.feedback_sensor);
+    if (!sensor) {
+      throw std::invalid_argument("remote feedback sensor not found: " +
+                                  dev.feedback_sensor);
     }
+    require_same_subsystem(*sensor, dev.subsystem, dev.name);
+    motor->feedback_sensor_id =
+        std::visit([](const auto& c) { return c.id; }, sensor->config);
   }
 
-  // 5. Check subsystem custom tables (e.g. geometry) for cross-subsystem claims
+  // Swerve geometry module references must name this subsystem's devices.
   for (auto&& [sub_key, sub_val] : *subsystems_tbl) {
-    std::string sub_name = std::string(sub_key.str());
+    const std::string sub_name(sub_key.str());
     auto* sub_tbl = sub_val.as_table();
-    if (!sub_tbl) continue;
-
-    if (auto* geom_tbl = (*sub_tbl)["geometry"].as_table()) {
-      if (auto* modules_arr = (*geom_tbl)["modules"].as_array()) {
-        for (auto&& mod_node : *modules_arr) {
-          if (auto* mod_tbl = mod_node.as_table()) {
-            auto check_ref = [&](const char* field, detail::DeviceKind expected_kind) {
-              if (auto node = (*mod_tbl)[field]) {
-                if (auto name_view = node.value<std::string_view>()) {
-                  std::string ref_name = std::string(*name_view);
-                  const detail::RawDevice* found = nullptr;
-                  for (const auto& d : raw_devices) {
-                    if (d.name == ref_name) {
-                      found = &d;
-                      break;
-                    }
-                  }
-                  if (!found) {
-                    throw std::invalid_argument("geometry module references unknown device: " + ref_name);
-                  }
-                  if (found->subsystem != sub_name) {
-                    throw std::invalid_argument("subsystem '" + sub_name + "' claims device '" + ref_name +
-                                                "' declared under subsystem '" + found->subsystem + "'");
-                  }
-                  if (found->kind != expected_kind) {
-                    throw std::invalid_argument("device '" + ref_name + "' has unexpected type in geometry");
-                  }
-                }
-              }
-            };
-            check_ref("drive", detail::DeviceKind::kMotor);
-            check_ref("steer", detail::DeviceKind::kMotor);
-            if ((*mod_tbl)["encoder"]) {
-              check_ref("encoder", detail::DeviceKind::kCANcoder);
-            }
-          }
+    auto* modules =
+        sub_tbl ? (*sub_tbl)["geometry"]["modules"].as_array() : nullptr;
+    if (!modules) continue;
+    for (auto&& mod_node : *modules) {
+      auto* mod = mod_node.as_table();
+      if (!mod) continue;
+      auto check_ref = [&](const char* field, bool (*is_kind)(const detail::RawDevice&)) {
+        auto ref = (*mod)[field].value<std::string_view>();
+        if (!ref) return;
+        const auto* found = find(std::string(*ref));
+        if (!found) {
+          throw std::invalid_argument(
+              "geometry module references unknown device: " + std::string(*ref));
         }
-      }
+        require_same_subsystem(*found, sub_name, "geometry");
+        if (!is_kind(*found)) {
+          throw std::invalid_argument("device '" + found->name +
+                                      "' has unexpected type in geometry");
+        }
+      };
+      auto is_motor = [](const detail::RawDevice& d) {
+        return std::holds_alternative<hardware::MotorConfig>(d.config);
+      };
+      check_ref("drive", is_motor);
+      check_ref("steer", is_motor);
+      check_ref("encoder", detail::IsCANcoder);
     }
   }
 
-  // 6. Populate hardware::Config and subsystem Devices
   for (const auto& dev : raw_devices) {
-    auto& sub_devs = result.subsystems[dev.subsystem];
-    switch (dev.kind) {
-      case detail::DeviceKind::kMotor:
-        result.hardware.motors.push_back(dev.motor);
-        sub_devs.motors.push_back(dev.motor.id);
-        break;
-      case detail::DeviceKind::kCANcoder:
-      case detail::DeviceKind::kPigeon2:
-        result.hardware.sensors.push_back(dev.sensor);
-        sub_devs.sensors.push_back(dev.sensor.id);
-        break;
-      case detail::DeviceKind::kDigitalInput:
-        result.hardware.digital_inputs.push_back(dev.digital_input);
-        sub_devs.digital_inputs.push_back(dev.digital_input.id);
-        break;
-      case detail::DeviceKind::kDigitalOutput:
-        result.hardware.digital_outputs.push_back(dev.digital_output);
-        sub_devs.digital_outputs.push_back(dev.digital_output.id);
-        break;
-      case detail::DeviceKind::kAnalogInput:
-        result.hardware.analog_inputs.push_back(dev.analog_input);
-        sub_devs.analog_inputs.push_back(dev.analog_input.id);
-        break;
-      case detail::DeviceKind::kEncoder:
-        result.hardware.encoders.push_back(dev.encoder);
-        sub_devs.encoders.push_back(dev.encoder.id);
-        break;
-      case detail::DeviceKind::kPwm:
-        result.hardware.pwm_outputs.push_back(dev.pwm);
-        sub_devs.pwm_outputs.push_back(dev.pwm.id);
-        break;
-    }
+    auto& owned = result.subsystems[dev.subsystem];
+    std::visit(
+        [&](const auto& c) {
+          using T = std::decay_t<decltype(c)>;
+          auto add = [&](auto& all, auto& ids) {
+            all.push_back(c);
+            ids.push_back(c.id);
+          };
+          if constexpr (std::is_same_v<T, hardware::MotorConfig>) {
+            add(hw.motors, owned.motors);
+          } else if constexpr (std::is_same_v<T, hardware::SensorConfig>) {
+            add(hw.sensors, owned.sensors);
+          } else if constexpr (std::is_same_v<T, hardware::DigitalInputConfig>) {
+            add(hw.digital_inputs, owned.digital_inputs);
+          } else if constexpr (std::is_same_v<T, hardware::DigitalOutputConfig>) {
+            add(hw.digital_outputs, owned.digital_outputs);
+          } else if constexpr (std::is_same_v<T, hardware::AnalogInputConfig>) {
+            add(hw.analog_inputs, owned.analog_inputs);
+          } else if constexpr (std::is_same_v<T, hardware::EncoderConfig>) {
+            add(hw.encoders, owned.encoders);
+          } else {
+            add(hw.pwm_outputs, owned.pwm_outputs);
+          }
+        },
+        dev.config);
   }
 
-  // 7. Validate full hardware config
-  hardware::Validate(result.hardware);
-
+  hardware::Validate(hw);
   return result;
+}
+
+inline RobotConfig ParseRobotConfigString(std::string_view toml_content) {
+  try {
+    return ParseRobotConfigTable(toml::parse(toml_content));
+  } catch (const toml::parse_error& err) {
+    throw std::invalid_argument(std::string("TOML parse error: ") + err.what());
+  }
 }
 
 namespace detail {
@@ -929,104 +493,61 @@ inline toml::table ParseTomlFile(const std::string& path) {
   try {
     return toml::parse(ss.str());
   } catch (const toml::parse_error& err) {
-    throw std::invalid_argument("TOML parse error in " + path + ": " + err.what());
+    throw std::invalid_argument("TOML parse error in " + path + ": " +
+                                err.what());
   }
 }
 
-// Nodes copy through insert_or_assign (make_node deep-copies via visit);
-// never name toml::node as a value type, it is an abstract base.
-inline void CopyTableInto(toml::table& dst, const toml::table& src) {
-  for (auto&& [k, v] : src) {
-    dst.insert_or_assign(std::string(k.str()), v);
+// Replaces a [[subsystems]] manifest with the canonical [subsystems.<name>]
+// view: each listed file's [subsystem] scalars (minus the name) plus its
+// other top-level tables. Validation then runs once over the merged view, so
+// splitting files cannot weaken a check.
+inline toml::table ExpandManifest(const toml::array& manifest,
+                                  const std::string& path) {
+  namespace fs = std::filesystem;
+  const fs::path base = fs::path(path).parent_path();
+  toml::table subs_view;
+  for (auto&& entry_node : manifest) {
+    auto* entry = entry_node.as_table();
+    auto name_view = entry ? (*entry)["name"].value<std::string_view>() : std::nullopt;
+    auto rel_view = entry ? (*entry)["path"].value<std::string_view>() : std::nullopt;
+    if (!name_view || !rel_view) {
+      throw std::invalid_argument("invalid [[subsystems]] entry in " + path +
+                                  ": needs 'name' and 'path'");
+    }
+    const std::string name(*name_view);
+    const fs::path rel{std::string(*rel_view)};
+    const std::string file = (rel.is_absolute() ? rel : base / rel).string();
+    toml::table sub_file = ParseTomlFile(file);
+
+    auto* header = sub_file["subsystem"].as_table();
+    if (!header || (*header)["name"].value<std::string_view>() != name) {
+      throw std::invalid_argument(
+          file + ": [subsystem].name must match manifest entry '" + name + "'");
+    }
+    if (subs_view.contains(name)) {
+      throw std::invalid_argument("duplicate [[subsystems]] entry in " + path +
+                                  ": '" + name + "'");
+    }
+    toml::table view;
+    for (auto&& [k, v] : *header) {
+      if (k.str() != "name") view.insert_or_assign(std::string(k.str()), v);
+    }
+    for (auto&& [k, v] : sub_file) {
+      if (k.str() != "subsystem") view.insert_or_assign(std::string(k.str()), v);
+    }
+    subs_view.insert_or_assign(name, std::move(view));
   }
+  return subs_view;
 }
 
 }  // namespace detail
 
 inline RobotConfig ParseRobotConfig(const std::string& path) {
-  namespace fs = std::filesystem;
   toml::table tbl = detail::ParseTomlFile(path);
-
-  // Manifest mode: [[subsystems]] names one file per subsystem. Each file is
-  // merged into the canonical single-file view before validating: the
-  // subsystem's view is its [subsystem] scalars (minus the name) plus every
-  // other top-level table, exactly the old [subsystems.<name>] shape.
   if (auto* manifest = tbl["subsystems"].as_array()) {
-    const fs::path base = fs::path(path).parent_path();
-    toml::table subs_view;
-    for (auto&& entry_node : *manifest) {
-      auto* entry = entry_node.as_table();
-      if (!entry) {
-        throw std::invalid_argument("invalid [[subsystems]] entry in " + path + ": must be a table");
-      }
-      auto name_view = (*entry)["name"].value<std::string_view>();
-      auto rel_view = (*entry)["path"].value<std::string_view>();
-      if (!name_view || !rel_view) {
-        throw std::invalid_argument("invalid [[subsystems]] entry in " + path + ": needs 'name' and 'path'");
-      }
-      const std::string name(*name_view);
-      const fs::path rel{std::string(*rel_view)};
-      const fs::path file = rel.is_absolute() ? rel : base / rel;
-      toml::table sub_file = detail::ParseTomlFile(file.string());
-
-      auto* header = sub_file["subsystem"].as_table();
-      if (!header) {
-        throw std::invalid_argument(file.string() + ": missing [subsystem] table");
-      }
-      auto file_name = (*header)["name"].value<std::string_view>();
-      if (!file_name || *file_name != name) {
-        throw std::invalid_argument(file.string() + ": [subsystem].name must match manifest entry '" + name + "'");
-      }
-      if (subs_view.contains(name)) {
-        throw std::invalid_argument("duplicate [[subsystems]] entry in " + path + ": '" + name + "'");
-      }
-      toml::table view;
-      for (auto&& [k, v] : *header) {
-        if (k.str() == "name") continue;
-        view.insert_or_assign(std::string(k.str()), v);
-      }
-      for (auto&& [k, v] : sub_file) {
-        if (k.str() == "subsystem") continue;
-        view.insert_or_assign(std::string(k.str()), v);
-      }
-      subs_view.insert_or_assign(name, std::move(view));
-    }
-    toml::table merged;
-    if (auto* robot_tbl = tbl["robot"].as_table()) {
-      toml::table robot_copy;
-      detail::CopyTableInto(robot_copy, *robot_tbl);
-      merged.insert_or_assign("robot", std::move(robot_copy));
-    }
-    merged.insert_or_assign("subsystems", std::move(subs_view));
-    return ParseRobotConfigTable(std::move(merged));
+    tbl.insert_or_assign("subsystems", detail::ExpandManifest(*manifest, path));
   }
-
-  // Standalone subsystem mode: a single subsystem.toml containing [subsystem]
-  // and device tables directly.
-  if (auto* header = tbl["subsystem"].as_table()) {
-    auto name_view = (*header)["name"].value<std::string_view>();
-    std::string name = name_view ? std::string(*name_view) : "default";
-    toml::table view;
-    for (auto&& [k, v] : *header) {
-      if (k.str() == "name") continue;
-      view.insert_or_assign(std::string(k.str()), v);
-    }
-    for (auto&& [k, v] : tbl) {
-      if (k.str() == "subsystem") continue;
-      view.insert_or_assign(std::string(k.str()), v);
-    }
-    toml::table subs_view;
-    subs_view.insert_or_assign(name, std::move(view));
-    toml::table merged;
-    if (header->contains("period_us")) {
-      toml::table robot_tbl;
-      robot_tbl.insert_or_assign("period_us", (*header)["period_us"]);
-      merged.insert_or_assign("robot", std::move(robot_tbl));
-    }
-    merged.insert_or_assign("subsystems", std::move(subs_view));
-    return ParseRobotConfigTable(std::move(merged));
-  }
-
   return ParseRobotConfigTable(std::move(tbl));
 }
 

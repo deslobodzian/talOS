@@ -46,7 +46,7 @@ std::optional<hw::ConfigError> PhoenixBackend::last_config_error() const {
 bool PhoenixBackend::Configure(const hw::Config& c) {
   hw::Validate(c);
   last_error_.reset();
-  // Item 35: the first failed device apply wins the precise error: device
+  // The first failed device apply wins the precise error: device
   // name, bus, CAN ID, operation, and the raw vendor status value.
   const auto note_failure = [this](const std::string& name,
                                    const std::string& bus, int can_id,
@@ -228,7 +228,7 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
 }
 
 bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
-  // Item 36: HasResetOccurred reports (and clears) one device's reset latch.
+  // HasResetOccurred reports (and clears) one device's reset latch.
   reset_ids.clear();
   for (std::size_t i = 0; i < motors_.size() && i < config_.motors.size(); ++i) {
     if (motors_[i]->HasResetOccurred()) reset_ids.push_back(config_.motors[i].id);
@@ -247,29 +247,6 @@ bool PhoenixBackend::RestoreAfterReset() {
   // last good manifest. The gateway separately neutralizes outputs and bumps
   // the epoch, so no obsolete demand resumes on the restored devices.
   return Configure(config_);
-}
-
-bool PhoenixBackend::ZeroPosition(uint16_t motor_id, double home_position_rot) {
-  // Item 38: mechanism rotations; the device divides out its gearing.
-  for (std::size_t i = 0; i < motors_.size() && i < config_.motors.size(); ++i) {
-    if (config_.motors[i].id != motor_id) continue;
-    return motors_[i]->SetPosition(units::turn_t{home_position_rot}).IsOK();
-  }
-  return false;
-}
-
-hw::HealthSnapshot PhoenixBackend::GetHealth() {
-  // Item 39: the rail off the first motor's supply signal. Refreshed here, so
-  // poll at low rate, never on the Driver Station fast path.
-  hw::HealthSnapshot snapshot;
-  if (!motors_.empty()) {
-    auto& supply = motors_.front()->GetSupplyVoltage(true);
-    const double volts = supply.GetValue().value();
-    snapshot.supply_valid =
-        supply.GetStatus().IsOK() && std::isfinite(volts);
-    snapshot.supply_voltage_v = snapshot.supply_valid ? volts : 0.0;
-  }
-  return snapshot;
 }
 
 bool PhoenixBackend::Read(hw::State& s) {
@@ -296,7 +273,7 @@ bool PhoenixBackend::Read(hw::State& s) {
     out.velocity_rps = v.GetValue().value();
     out.position_age_us = Age(p);
     out.velocity_age_us = Age(v);
-    // Item 37: stale current/voltage is telemetry-only degradation. The
+    // Stale current/voltage is telemetry-only degradation. The
     // effort fields zero but the sample stays valid and the backend stays
     // healthy; only lost motion feedback sinks the robot.
     const bool effort_ok = Fresh(volts) && Fresh(amps) &&
@@ -386,7 +363,7 @@ bool PhoenixBackend::Read(hw::State& s) {
       out.valid = std::isfinite(pos) && std::isfinite(vel);
       out.age_us = 0;
     }
-    // Item 37: RIO encoders are auxiliary feedback (TalonFX loops use
+    // RIO encoders are auxiliary feedback (TalonFX loops use
     // rotor/RemoteCANcoder), so an invalid encoder marks only its own sample:
     // mechanism scope, never a whole-robot stop.
     if (!out.valid) {

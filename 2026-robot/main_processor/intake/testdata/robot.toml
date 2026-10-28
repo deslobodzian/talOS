@@ -1,0 +1,15 @@
+# Intake test robot: one subsystem. Ids sort by (subsystem, device):
+# intake_beam = 1, roller = 2.
+[robot]
+name = "intake_test"
+period_us = 20000
+command_timeout_us = 100000
+
+[subsystems.intake.motors.roller]
+type = "TalonFX"
+bus = "test"
+can_id = 1
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[subsystems.intake.digital_inputs.intake_beam]
+dio = 0

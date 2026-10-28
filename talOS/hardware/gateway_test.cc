@@ -757,7 +757,6 @@ TEST(Gateway, ResetWhileEnabledNeutralizesBeforeRestore) {
   EXPECT_NE(g.snapshot().epoch, epoch);
   EXPECT_FALSE(g.snapshot().flags & kCommandActive);
   EXPECT_FALSE(g.Accept(stale, 2, 2000));
-  EXPECT_EQ(g.health().reset_count, 1u);
   EXPECT_TRUE(g.Accept(Request(g), 0, 2000));
 }
 

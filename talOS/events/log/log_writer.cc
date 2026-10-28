@@ -328,27 +328,6 @@ void LogWriter::dispatch(const Context& context,
   state_->append(header, payload);
 }
 
-void LogWriter::fetch(const Context& parent, std::uint16_t source_id,
-                      FetchOutcome outcome, std::span<const std::byte> payload,
-                      std::uint64_t sequence,
-                      [[maybe_unused]] std::uint64_t dropped) noexcept {
-  RecordHeader header{};
-  header.kind = static_cast<std::uint16_t>(EventKind::FETCH);
-  header.source_id = source_id;
-  header.dispatch_index = parent.dispatch_index;
-  header.event_time_ns = parent.event_time.nanos();
-  header.now_ns = parent.now.nanos();
-  header.sequence = sequence;
-  header.aux = static_cast<std::uint32_t>(outcome);
-
-  // A fetch that saw nothing has nothing to replay; force the payload empty
-  // regardless of what the caller passed, so the on-disk record always
-  // agrees with its own outcome.
-  const std::span<const std::byte> recorded_payload =
-      outcome == FetchOutcome::EMPTY ? std::span<const std::byte>{} : payload;
-  state_->append(header, recorded_payload);
-}
-
 void LogWriter::send(const Context& parent, std::uint16_t source_id,
                      std::span<const std::byte> payload, std::uint32_t status,
                      std::uint64_t sequence) noexcept {

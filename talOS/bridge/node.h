@@ -8,7 +8,6 @@
 #include <string>
 #include <vector>
 
-#include "command_path_metrics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/hardware/config.h"
 #include "talOS/hardware/config_wire.h"
@@ -75,11 +74,6 @@ class HardwareNode {
   const Command& current_command() const { return full_cmd_; }
   uint64_t identity_rejected() const { return identity_rejected_; }
   uint64_t ownership_rejected() const { return ownership_rejected_; }
-  // Command-path evidence (perf item 42): monotonic bridge-clock histograms
-  // plus missed-deadline / suppressed-send counters. See
-  // command_path_metrics.h for the cross-clock rule.
-  const CommandPathMetrics& metrics() const { return metrics_; }
-  uint64_t tick_overruns() const { return tick_overruns_; }
   // Bounded-heartbeat interval for unchanged merges. Derived from the
   // configured command timeout (timeout/5, clamped to [5, 20] ms) so a live
   // merge always refreshes the gateway well before it expires.
@@ -132,7 +126,7 @@ class HardwareNode {
   // or enabled/fault edge).
   void InvalidateRequests();
   void NeutralizeAll();
-  // Change-driven publication (perf item 43): send when the merge differs
+  // Change-driven publication: send when the merge differs
   // from the last send, otherwise only on the bounded heartbeat. Timeout
   // neutralization changes the merge, so it always sends immediately.
   bool ShouldSendCommand(uint64_t now_us);
@@ -173,15 +167,13 @@ class HardwareNode {
   uint64_t cmd_sequence_{0};
   uint64_t last_push_time_us_{0};
 
-  // Explicit periodic scheduling (perf item 43): 1 kHz tick period as a
+  // Explicit periodic scheduling: 1 kHz tick period as a
   // named deadline, not an implicit sleep constant.
   static constexpr uint64_t kTickPeriodUs = 1000;
   uint64_t heartbeat_us_{20000};
   Command last_sent_cmd_{};
   uint64_t last_send_us_{0};
   bool have_last_sent_{false};
-  uint64_t tick_overruns_{0};
-  CommandPathMetrics metrics_;
 };
 
 }  // namespace talos::hardware
