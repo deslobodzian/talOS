@@ -38,7 +38,7 @@ class Endpoint {
             ack.status = ConfigAckStatus::kOk;
           } else {
             ack.status = ConfigAckStatus::kBackendFailed;
-            // Item 6a: report the failing device and cause instead of the
+            // Report the failing device and cause instead of the
             // generic string. Compact "device: cause" summary so both survive
             // truncation to the 64-byte reason; snprintf always
             // NUL-terminates.

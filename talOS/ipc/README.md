@@ -32,15 +32,7 @@ broadcast under `/dev/rtms/<topic_name>`).
 
 - `//talOS/bridge` (`talOS/bridge/node.h`) — node graph transport.
 - `//talOS/events` — realtime event loop publishing.
-- `//2026-robot/main_processor/...` — `driver_station/send_joystick`,
-  `drivetrain/send_target` publish; `drivetrain/monitor` subscribes.
-- Local demos: `:pub_process` / `:sub_process` binaries, exercised by
-  `tools/test_ipc.sh`; unit coverage in `:ipc_test`.
-
-## Fold decision
-
-`//talOS/ipc` stays a separate package: it is the *typed* layer,
-`//talOS/rtms` the untyped transport. If the two ever merge, the
-`Publisher`/`Subscriber` templates move into the `rtms` package and
-this directory goes away. No fold is scheduled — this note replaces
-the old "will likely move to RTMS" stub.
+- `//talOS/driver_station:send_joystick` and
+  `//2026-robot/main_processor/drivetrain:send_target` publish;
+  `drivetrain:monitor` subscribes.
+- Unit coverage in `:ipc_test`.

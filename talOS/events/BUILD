@@ -1,6 +1,5 @@
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
-load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")
 
 # Types shared by every loop: time, dispatch context, callbacks, the source
@@ -10,25 +9,12 @@ cc_library(
     hdrs = [
         "callback.h",
         "context.h",
-        "latency_stats.h",
         "manifest.h",
-        "metrics.h",
         "recorder.h",
         "scheduler.h",
         "time.h",
     ],
     visibility = ["//visibility:public"],
-)
-
-cc_test(
-    name = "metrics_test",
-    size = "small",
-    srcs = ["metrics_test.cc"],
-    deps = [
-        ":events_core",
-        "@googletest//:gtest",
-        "@googletest//:gtest_main",
-    ],
 )
 
 cc_test(
@@ -102,11 +88,6 @@ flatbuffer_cc_library(
     srcs = ["events_test_message.fbs"],
 )
 
-flatbuffer_cc_library(
-    name = "events_perf_message",
-    srcs = ["events_perf_message.fbs"],
-)
-
 # The loops themselves.
 cc_library(
     name = "events",
@@ -176,21 +157,4 @@ cc_test(
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
-)
-
-cc_binary(
-    name = "loop_perf",
-    srcs = ["tools/loop_perf.cc"],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":events",
-        ":events_perf_message",
-    ],
-)
-
-cc_binary(
-    name = "log_dump",
-    srcs = ["tools/log_dump.cc"],
-    visibility = ["//visibility:public"],
-    deps = [":events_log"],
 )

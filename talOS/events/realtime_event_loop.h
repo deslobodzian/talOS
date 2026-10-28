@@ -8,7 +8,6 @@
 
 #include "talOS/events/event_loop_base.h"
 #include "talOS/events/handles.h"
-#include "talOS/events/metrics.h"
 #include "talOS/events/os/poller.h"
 #include "talOS/events/recorder.h"
 #include "talOS/events/scheduler.h"
@@ -25,13 +24,10 @@ namespace talos::event {
 // The tick therefore bounds message latency, and every drained message is
 // timestamped with the tick that observed it, which is exactly what replay
 // needs to reproduce.
-template <RecorderPolicy Recorder = NullRecorder,
-          MetricsPolicy Metrics = NullMetrics>
+template <RecorderPolicy Recorder = NullRecorder>
 class RealtimeEventLoop
-    : public EventLoopBase<RealtimeEventLoop<Recorder, Metrics>, Recorder,
-                           Metrics> {
-  using Base =
-      EventLoopBase<RealtimeEventLoop<Recorder, Metrics>, Recorder, Metrics>;
+    : public EventLoopBase<RealtimeEventLoop<Recorder>, Recorder> {
+  using Base = EventLoopBase<RealtimeEventLoop<Recorder>, Recorder>;
   friend Base;
 
  public:
@@ -61,7 +57,6 @@ class RealtimeEventLoop
   }
 
   using SendOutcome = typename Base::SendOutcome;
-  using FetchResult = typename Base::FetchResult;
 
   MonotonicTime now_impl() const { return Poller::now(); }
 
@@ -158,14 +153,12 @@ class RealtimeEventLoop
       return;
     }
 
-    // Watchers must see every message in order; fetchers only ever want the
-    // newest. Both let the writer overwrite rather than block, so a subscriber
-    // that falls behind cannot stall the publishing process.
+    // Watchers must see every message in order. The writer overwrites rather
+    // than blocks, so a subscriber that falls behind cannot stall the
+    // publishing process.
     const RTMSOptions rtms_options{
         .overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
-        .read_mode = registration.kind == SourceKind::FETCHER
-                         ? ReadMode::LATEST
-                         : ReadMode::SEQUENCE,
+        .read_mode = ReadMode::SEQUENCE,
     };
 
     Transport transport{};
@@ -173,15 +166,12 @@ class RealtimeEventLoop
                             registration.alignment, options_.slots,
                             rtms_options);
 
-    if (registration.kind != SourceKind::SENDER) {
+    if (registration.kind == SourceKind::WATCHER) {
       transport.reader_id = transport.queue->register_reader();
       if (!transport.reader_id) {
         throw RegistrationError("no reader slots available for '" +
                                 registration.name + "'");
       }
-    }
-
-    if (registration.kind == SourceKind::WATCHER) {
       // Collected once so the drain runs over just the watchers instead of
       // re-scanning every source on every tick.
       watchers_.push_back(registration.id);
@@ -209,29 +199,11 @@ class RealtimeEventLoop
     }
   }
 
-  FetchResult fetch_impl(std::uint16_t id, std::span<std::byte> destination) {
-    Transport& transport = transports_[id];
-
-    if (!transport.reader_id) {
-      return FetchResult{FetchOutcome::EMPTY, 0, 0};
-    }
-
-    MessageInfo info{};
-    const ReadResult result =
-        transport.queue->read_next(*transport.reader_id, destination, info);
-
-    if (result != ReadResult::OK) {
-      return FetchResult{FetchOutcome::EMPTY, 0, 0};
-    }
-
-    return FetchResult{FetchOutcome::VALUE, info.sequence, info.dropped};
-  }
-
   // `tick_deadline` is when this drain was supposed to happen and `now` is when
   // it did. Stamping messages with both makes a watcher's dispatch latency mean
   // something: how late the loop was to deliver. It cannot mean time since
   // publication, because the frozen shared-memory layout carries no publish
-  // timestamp; measure that end to end with tools/loop_perf.cc instead.
+  // timestamp.
   void drain_messages(MonotonicTime tick_deadline, MonotonicTime now) {
     auto& sources = this->sources();
 

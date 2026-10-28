@@ -26,8 +26,7 @@ The launcher parses those manifests, assembles the graph they describe, and runs
 error, nothing is spawned and the launcher exits non-zero.
 
 **Phase two starts.** Only then does the launcher fork the roster, wait for it,
-read back the dispatch logs and write the session manifest, exactly as it did
-before.
+read back the dispatch logs and write the session manifest.
 
 `--describe-only` stops after phase one, which makes the check useful on its own
 — in CI, in a pit before a match, or after a rename that touched two packages.
@@ -124,10 +123,8 @@ controller_port = 5802             # gateway port on the controller
 local_port = 5803                  # bind port on the companion
 ```
 
-`controller_address` is canonical; `remote_address` and `remote_ip` are
-accepted as aliases, and `remote_port` aliases `controller_port`. All three
-default to the loopback contract (`127.0.0.1:5802`, local `5803`), so
-simulation and loopback tests need no extra configuration.
+All three keys default to the loopback contract (`127.0.0.1:5802`, local
+`5803`), so simulation and loopback tests need no extra configuration.
 
 ```sh
 bazel run //talOS/launcher:launcher -- --config 2026-robot/main_processor/configuration/robot.toml
@@ -190,11 +187,13 @@ bazel test //talOS/launcher/...
 bazel run //talOS/launcher:launcher -- --config <path-to>/robot.toml --describe-only
 ```
 
-The launcher resolves node targets to `bazel-bin/...` paths and reads a
-workspace-relative config, so it only makes sense with the workspace as its
-working directory; `bazel run` starts a binary in its runfiles tree instead, and
-`main.cc` chases `BUILD_WORKSPACE_DIRECTORY` back so both spellings behave the
-same.
+Node targets resolve to `bazel-bin/<package>/<target>`, unless an override
+names the binary: a bundle's `bundle_manifest.json` (loaded by `--bundle`, or
+found in the working directory) maps each node's target and name to its
+`bin/` copy. The launcher also reads a workspace-relative config, so outside a
+bundle it only makes sense with the workspace as its working directory;
+`bazel run` starts a binary in its runfiles tree instead, and `main.cc` chases
+`BUILD_WORKSPACE_DIRECTORY` back so both spellings behave the same.
 
 `:launcher_lib` depends on `//talOS/introspection:describe` and `:names` — the
 format and the naming rules, neither of which pulls in an event loop or shared

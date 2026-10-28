@@ -1,0 +1,73 @@
+# The superstructure example robot: an intake, an elevator, and the
+# superstructure node that coordinates them over topics. Single-file layout:
+# every subsystem is inline under [subsystems.<name>], next to the custom keys
+# its node reads with node.param<T>("key").
+[robot]
+name = "superstructure_example"
+period_us = 5000
+command_timeout_us = 100000
+status_hz = 200.0
+commissioned = false
+sim_gateway = "//2026-robot/main_processor/simulation:sim_gateway"
+controller_address = "127.0.0.1"
+controller_port = 5802
+local_port = 5803
+
+# Roller + beam break. IDLE -> INTAKING -> HOLDING (beam broken) -> EJECTING.
+[subsystems.intake]
+node = "//examples/superstructure/cpp:intake"
+period_us = 20000
+intake_volts = 8.0   # roller voltage while intaking
+hold_volts = 1.0     # keeps a held piece seated
+eject_volts = -10.0  # reverse, to spit the piece out
+eject_ms = 500       # how long EJECTING runs before IDLE
+
+[subsystems.intake.motors.roller]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+inverted = false
+brake = true
+supply_limit_a = 30.0
+stator_limit_a = 60.0
+max_voltage = 12.0
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 100.0
+
+# true while a game piece breaks the beam.
+[subsystems.intake.digital_inputs.beam_break]
+dio = 0
+
+# One motion-magic TalonFX. Positions are drum rotations
+# (sensor_to_mechanism_ratio applies the gearbox on the controller).
+[subsystems.elevator]
+node = "//examples/superstructure/cpp:elevator"
+period_us = 10000
+tolerance_rot = 0.1  # at_goal when within this of the goal
+
+[subsystems.elevator.motors.lift]
+type = "TalonFX"
+bus = "rio"
+can_id = 2
+inverted = false
+brake = true
+supply_limit_a = 40.0
+stator_limit_a = 80.0
+max_voltage = 12.0
+sensor_to_mechanism_ratio = 9.0
+max_velocity_rps = 12.0
+cruise_velocity_rps = 8.0
+acceleration_rps2 = 24.0
+jerk_rps3 = 0.0
+soft_limits = true
+reverse_limit_rot = 0.0
+forward_limit_rot = 12.0
+# kG holds the carriage against gravity; kV/kA feed the motion-magic profile.
+slot0 = { p = 4.0, i = 0.0, d = 0.1, s = 0.1, v = 1.1, a = 0.02, g = 0.35 }
+
+# No hardware: reads /superstructure/target and the mechanism states, writes
+# the mechanism targets.
+[subsystems.superstructure]
+node = "//examples/superstructure/cpp:superstructure"
+period_us = 20000
+high_rot = 10.0  # elevator height for SCORE_HIGH, within the lift's soft limits

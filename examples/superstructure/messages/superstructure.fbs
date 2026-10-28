@@ -1,0 +1,17 @@
+namespace demo;
+
+enum SuperstructureCommand : ubyte { STOW, INTAKE, SCORE_HIGH }
+
+enum SuperstructureState : ubyte { STOWED, INTAKING, HOLDING, RAISING, SCORING }
+
+// What the driver (or autonomous) asks for, on /superstructure/target.
+// Republish it every period: a goal older than [robot] command_timeout_us
+// counts as STOW.
+struct SuperstructureGoal {
+  command:SuperstructureCommand;
+}
+
+// The sequence step, on /superstructure/state.
+struct SuperstructureStatus {
+  state:SuperstructureState;
+}

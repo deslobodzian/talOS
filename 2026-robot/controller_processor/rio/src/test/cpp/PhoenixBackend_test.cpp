@@ -1,5 +1,5 @@
-// Regression tests for PhoenixBackend encoder handling (item 6) and
-// simulation honesty (item 8): quadrature scaling from counts_per_rev,
+// Regression tests for PhoenixBackend encoder handling and simulation
+// honesty: quadrature scaling from counts_per_rev,
 // duty-cycle device support with offsets and connection validity, and no
 // demand teleport when controller voltage is zero (missing gains exposed).
 #include <gtest/gtest.h>
@@ -16,7 +16,6 @@
 #include <hal/HAL.h>
 
 #include "PhoenixBackend.h"
-#include "hardware/fault_scope.h"
 #include "hardware/gateway.h"
 
 namespace hw = talos::hardware;
@@ -175,10 +174,8 @@ TEST(PhoenixBackendEncoders, DutyCycleReportsOffsetCorrectedPosition) {
 
 TEST(PhoenixBackendEncoders, DutyCycleDisconnectInvalidatesSample) {
   EnsureHal();
-  // fault_scope.h is authoritative: a bad RIO encoder is Mechanism scope, so
-  // the backend must stay healthy and only that sample goes invalid.
-  EXPECT_EQ(hw::ClassifyFailure(hw::FailureKind::kEncoderInvalid),
-            hw::FaultScope::kMechanism);
+  // A bad RIO encoder is mechanism scope: the backend must stay healthy and
+  // only that sample goes invalid.
   hw::Config c;
   c.motors.push_back(TestMotor(1, "m1", 1));
   c.encoders.push_back(DutyEncoder(11, "duty", 2, 0.0));

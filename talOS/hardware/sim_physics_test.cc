@@ -54,7 +54,7 @@ void StepBackend(Backend& backend, State& s, uint64_t& now_us, uint64_t step_us,
   }
 }
 
-// (13) The ideal backend is for fast logic tests: demands apply instantly,
+// The ideal backend is for fast logic tests: demands apply instantly,
 // even with zero gains. The physics backend must NOT behave this way.
 TEST(SimBelievability, IdealTeleportsWhilePhysicsRamps) {
   State s{};
@@ -94,7 +94,7 @@ TEST(SimBelievability, IdealTeleportsWhilePhysicsRamps) {
   }
 }
 
-// (15) Voltage drives the mechanism; position integrates velocity.
+// Voltage drives the mechanism; position integrates velocity.
 TEST(SimBelievability, VoltageDrivesMechanismAndPositionIntegrates) {
   PhysicsSimBackend backend;
   ASSERT_TRUE(backend.Configure(SingleMotorConfig()));
@@ -114,7 +114,7 @@ TEST(SimBelievability, VoltageDrivesMechanismAndPositionIntegrates) {
   EXPECT_NEAR(s.motors[0].voltage, 6.0, 1e-9);
 }
 
-// (15) Honesty: zero gains yield ~0 V, so velocity/position demands stall.
+// Honesty: zero gains yield ~0 V, so velocity/position demands stall.
 TEST(SimBelievability, ZeroGainsStallInsteadOfTeleporting) {
   for (const auto mode : {Mode::kVelocity, Mode::kPosition}) {
     PhysicsSimBackend backend;
@@ -131,7 +131,7 @@ TEST(SimBelievability, ZeroGainsStallInsteadOfTeleporting) {
   }
 }
 
-// (13) With tuned gains the loop tracks: the physics backend is usable for
+// With tuned gains the loop tracks: the physics backend is usable for
 // PID checks, the ideal backend would pass regardless of gains.
 TEST(SimBelievability, TunedVelocityLoopTracksDemand) {
   Config c = SingleMotorConfig();
@@ -216,7 +216,7 @@ TEST(SimBelievability, GearingDirectionAndLimits) {
   }
 }
 
-// (16) Pigeon yaw comes from simulated chassis motion through the boundary.
+// Pigeon yaw comes from simulated chassis motion through the boundary.
 TEST(SimBelievability, PigeonYawFollowsChassisMotion) {
   Config c = SingleMotorConfig();
   c.sensors.push_back({9, "imu", SensorKind::kPigeon2, 30, "rio"});
@@ -233,7 +233,7 @@ TEST(SimBelievability, PigeonYawFollowsChassisMotion) {
   EXPECT_NEAR(s.sensors[0].velocity_rps, 0.25, 1e-9);
 }
 
-// (16) CANcoders mirror the linked mechanism through the boundary.
+// CANcoders mirror the linked mechanism through the boundary.
 TEST(SimBelievability, CancoderMirrorsLinkedMechanism) {
   Config c = SingleMotorConfig();
   c.sensors.push_back({2, "encoder", SensorKind::kCANcoder, 20, "rio"});
@@ -253,7 +253,7 @@ TEST(SimBelievability, CancoderMirrorsLinkedMechanism) {
   EXPECT_NEAR(s.sensors[0].velocity_rps, s.motors[0].velocity_rps, 1e-9);
 }
 
-// (17) Commanded neutral coasts/brakes per model; it never teleports to a
+// Commanded neutral coasts/brakes per model; it never teleports to a
 // stop. A zero-velocity demand instead holds an active standstill.
 TEST(SimBelievability, NeutralDecaysPerBrakeWhileZeroVelocityHolds) {
   auto spin_up = [](bool brake) {
@@ -309,7 +309,7 @@ TEST(SimBelievability, NeutralDecaysPerBrakeWhileZeroVelocityHolds) {
   }
 }
 
-// (17) Through the Gateway: disable neutralizes drive but the rotor decays,
+// Through the Gateway: disable neutralizes drive but the rotor decays,
 // it does not snap to zero.
 TEST(SimBelievability, GatewayDisableDecaysRatherThanSnaps) {
   PhysicsSimBackend backend;
@@ -344,7 +344,7 @@ TEST(SimBelievability, GatewayDisableDecaysRatherThanSnaps) {
   EXPECT_DOUBLE_EQ(g.snapshot().motors[0].velocity_rps, 0.0);
 }
 
-// (18) Controlled inputs: beam breaks read back through the boundary.
+// Controlled inputs: beam breaks read back through the boundary.
 TEST(SimBelievability, BeamBreakInputReadsBack) {
   Config c = SingleMotorConfig();
   c.digital_inputs.push_back({3, "beam_break", 0});
@@ -361,7 +361,7 @@ TEST(SimBelievability, BeamBreakInputReadsBack) {
   EXPECT_FALSE(s.digital_inputs[0].value);
 }
 
-// (18) Frozen feedback holds stale samples while physics keeps moving.
+// Frozen feedback holds stale samples while physics keeps moving.
 TEST(SimBelievability, FrozenFeedbackHoldsStaleSamples) {
   PhysicsSimBackend backend;
   ASSERT_TRUE(backend.Configure(SingleMotorConfig()));
@@ -381,7 +381,7 @@ TEST(SimBelievability, FrozenFeedbackHoldsStaleSamples) {
   EXPECT_GT(s.motors[0].position_rot, held_pos);
 }
 
-// (18) Disconnect invalidates the sample and fails the read (gateway fault
+// Disconnect invalidates the sample and fails the read (gateway fault
 // path); reconnect recovers. Sensors behave the same way.
 TEST(SimBelievability, DisconnectFailsReadsAndReconnectRecovers) {
   Config c = SingleMotorConfig();
@@ -408,7 +408,7 @@ TEST(SimBelievability, DisconnectFailsReadsAndReconnectRecovers) {
   EXPECT_TRUE(backend.Read(s));
 }
 
-// (18) Supply-voltage change scales the available speed; restart zeroes
+// Supply-voltage change scales the available speed; restart zeroes
 // motion but keeps the configuration.
 TEST(SimBelievability, SupplyVoltageScalesSpeedAndRestartZeroesMotion) {
   PhysicsSimBackend low, high;
@@ -440,7 +440,7 @@ TEST(SimBelievability, SupplyVoltageScalesSpeedAndRestartZeroesMotion) {
   EXPECT_DOUBLE_EQ(sh.motors[0].velocity_rps, 0.0);
 }
 
-// (19) Deterministic stepping: the same timestamps always give the same
+// Deterministic stepping: the same timestamps always give the same
 // state, and a lone Step() matches timestamp-driven Reads.
 TEST(SimBelievability, SteppingIsDeterministic) {
   auto run = [] {

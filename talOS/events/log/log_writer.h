@@ -29,7 +29,7 @@ namespace talos::event::log {
 // If the pool fills, capture stops permanently and failed() becomes true.
 // Previously accepted chunks are drained, preserving a prefix without holes.
 //
-// dispatch()/fetch()/send()/finish() never throw: a full disk or a transient
+// dispatch()/send()/finish() never throw: a full disk or a transient
 // EIO must not bring down a control loop that is otherwise healthy. Such
 // failures are sticky and surfaced through failed()/error() instead.
 inline constexpr std::size_t DEFAULT_CHUNK_BYTES = 256u << 10;
@@ -79,9 +79,6 @@ class LogWriter {
 
   void dispatch(const Context& context,
                 std::span<const std::byte> payload) noexcept;
-  void fetch(const Context& parent, std::uint16_t source_id,
-             FetchOutcome outcome, std::span<const std::byte> payload,
-             std::uint64_t sequence, std::uint64_t dropped) noexcept;
   void send(const Context& parent, std::uint16_t source_id,
             std::span<const std::byte> payload, std::uint32_t status,
             std::uint64_t sequence) noexcept;

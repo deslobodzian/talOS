@@ -11,7 +11,6 @@ namespace talos::event {
 enum class EventKind : std::uint16_t {
   TIMER = 1,
   MESSAGE = 2,
-  FETCH = 3,
   SEND = 4,
   EXIT = 5,
   ARM_TIMER = 6,
@@ -25,8 +24,6 @@ constexpr const char* to_string(EventKind kind) {
       return "TIMER";
     case EventKind::MESSAGE:
       return "MESSAGE";
-    case EventKind::FETCH:
-      return "FETCH";
     case EventKind::SEND:
       return "SEND";
     case EventKind::EXIT:

@@ -157,15 +157,15 @@ out so the last cycle's counts are not lost.
 
 It must be constructed after the loop so that reverse destruction order joins
 the thread before the counters it samples are destroyed. Every node main follows
-that order:
+that order (`talos::process::RunNode` does it for you):
 
 ```cpp
 talos::event::RealtimeEventLoop<talos::event::log::LogWriter> loop{...};
-talos::odometry::OdometryNode node{loop};
+talos::telemetry::TelemetryNode node{loop, ...};
 talos::introspect::Reporter reporter{
     loop,
-    {.name = "odometry",
-     .target = "//2026-robot/main_processor/odometry:node",
+    {.name = "telemetry",
+     .target = "//2026-robot/main_processor/telemetry:node",
      .session_id = session_id,
      .simulation = simulation}};
 loop.run();
@@ -177,26 +177,21 @@ telemetry viewer might not see it would be a worse failure than not being seen.
 
 ## The counters
 
-`EventLoopBase` gained a `SourceCounters` array, one entry per registered
+`EventLoopBase` keeps a `SourceCounters` array, one entry per registered
 source, allocated when registration closes and never reallocated — so the
 reporter can hold the pointer for the life of the run. Each entry tracks events,
 dropped messages, the last transport sequence, the last dispatch time, the last
 dispatch latency and the worst latency seen.
 
 "Events" means whatever that source doing its job looks like: dispatches for a
-timer or a watcher, messages accepted by the transport for a sender, and values
-actually received for a fetcher. An empty fetch is not an event, or a handler
-that samples a topic every cycle would report traffic that never arrived.
+timer or a watcher, and messages accepted by the transport for a sender.
 Publishes the transport refused count as dropped, alongside messages a writer
 lapped before a subscriber read them.
 
-This is not a replacement for `LoopMetrics`. That keeps whole latency
-distributions in plain arrays for the owning thread to report at the end of a
-run; these are atomics specifically so another thread can read them mid-run
-without a data race. The cost is six relaxed stores per dispatch and no clock
-reads beyond the ones the dispatch had already made, which is cheap enough to
-leave on in a 1 kHz loop — and leaving it on is the point, because observability
-that has to be switched on is observability you do not have when you need it.
+These are atomics so another thread can read them mid-run without a data race.
+The cost is six relaxed stores per dispatch and no clock reads beyond the ones
+the dispatch had already made, which is cheap enough to leave on in a 1 kHz
+loop.
 
 ## Limits
 

@@ -7,7 +7,7 @@ struct SensorMessage {
     velocity:float;
 }
 
-// Operator setpoint, read with a fetcher (latest value wins).
+// Operator setpoint; the robot keeps the latest one.
 struct SetpointMessage {
     id:int;
     target:float;

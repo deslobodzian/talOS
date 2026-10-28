@@ -15,11 +15,13 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
-#include "talos_nodes/drivetrain/drive_message_generated.h"
-#include "talos_nodes/drivetrain/geometry.h"
-#include "talos_nodes/drivetrain/packet.h"
+#include "drivetrain/drive_message_generated.h"
+#include "drivetrain/geometry.h"
+#include "drivetrain/topics.h"
 #include "talOS/hardware/messages.h"
+#include "talOS/hardware/packet.h"
 #include "talOS/ipc/subscriber.h"
 #include "talOS/process/process.h"
 
@@ -106,7 +108,7 @@ void PrintGateway(const talos::hardware::State& state, bool have_state,
               static_cast<unsigned long long>(freshness.sequence));
 }
 
-void PrintTarget(const talos::drive::ChassisTarget& target, bool have_target,
+void PrintTarget(const drivetrain::ChassisTarget& target, bool have_target,
                  const Freshness& freshness, Clock::time_point now) {
   std::printf("target    ");
   if (!have_target) {
@@ -142,7 +144,26 @@ const talos::hardware::MotorRequest* FindRequest(
   return nullptr;
 }
 
-void PrintModules(const talos::drive::SwerveGeometry& geometry,
+// A module's motors by logical id, which is how state and command name them.
+struct ModuleIds {
+  std::string name;
+  std::uint16_t drive_id;
+  std::uint16_t steer_id;
+};
+
+std::vector<ModuleIds> ResolveModules(const talos::config::RobotConfig& config) {
+  std::vector<ModuleIds> modules;
+  for (const auto& module :
+       drivetrain::BuildSwerveGeometry(config, "drivetrain").modules) {
+    modules.push_back(
+        {module.name,
+         drivetrain::SubsystemMotor(config, "drivetrain", module.drive).id,
+         drivetrain::SubsystemMotor(config, "drivetrain", module.steer).id});
+  }
+  return modules;
+}
+
+void PrintModules(const std::vector<ModuleIds>& modules,
                   const talos::hardware::State& state, bool have_state,
                   const talos::hardware::Command& command, bool have_command,
                   const Freshness& command_freshness, Clock::time_point now) {
@@ -156,8 +177,8 @@ void PrintModules(const talos::drive::SwerveGeometry& geometry,
   std::printf("%-13s %11s %11s %13s %13s %11s\n", "", "rot", "rot", "rot/s",
               "rot/s", "rot");
 
-  for (const auto& module : geometry.modules) {
-    std::printf("%-13s", module.name.data());
+  for (const auto& module : modules) {
+    std::printf("%-13s", module.name.c_str());
 
     const auto* steer_request =
         have_command ? FindRequest(command, module.steer_id) : nullptr;
@@ -225,19 +246,18 @@ int main(int argc, char** argv) {
 
     // Module names and ids come from the same configuration the drivetrain
     // node runs on, so the table cannot drift from what is being commanded.
-    const auto geometry = talos::drive::BuildSwerveGeometry(
-        talos::config::ParseRobotConfig(config_path));
+    const auto modules =
+        ResolveModules(talos::config::ParseRobotConfig(config_path));
 
     talos::process::InstallStopHandlers();
 
     const RTMSOptions latest{OverflowPolicy::OVERWRITE_OLDEST,
                              ReadMode::LATEST};
-    ipc::Subscriber<talos::drive::Packet> states{talos::drive::kStateTopic,
-                                                 latest};
-    ipc::Subscriber<talos::drive::Packet> commands{talos::drive::kCommandTopic,
-                                                   latest};
-    ipc::Subscriber<talos::drive::ChassisTarget> targets{
-        talos::drive::kTargetTopic, latest};
+    using Packet = talos::hardware::Packet;
+    ipc::Subscriber<Packet> states{talos::hardware::kStateTopic, latest};
+    ipc::Subscriber<Packet> commands{talos::hardware::kCommandTopic, latest};
+    ipc::Subscriber<drivetrain::ChassisTarget> targets{drivetrain::kTargetTopic,
+                                                       latest};
 
     if (!states.registered() || !commands.registered() ||
         !targets.registered()) {
@@ -246,7 +266,7 @@ int main(int argc, char** argv) {
 
     talos::hardware::State state{};
     talos::hardware::Command command{};
-    talos::drive::ChassisTarget target{};
+    drivetrain::ChassisTarget target{};
     bool have_state = false, have_command = false, have_target = false;
     Freshness state_seen, command_seen, target_seen;
 
@@ -284,7 +304,7 @@ int main(int argc, char** argv) {
       std::printf("talOS drivetrain monitor        Ctrl-C to stop\n\n");
       PrintGateway(state, have_state, state_seen, now);
       PrintTarget(target, have_target, target_seen, now);
-      PrintModules(geometry, state, have_state, command, have_command,
+      PrintModules(modules, state, have_state, command, have_command,
                    command_seen, now);
       std::fflush(stdout);
 

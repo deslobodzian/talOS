@@ -1,4 +1,4 @@
-namespace talos.intake;
+namespace intake;
 
 struct IntakeTarget {
   issued_ns:ulong;
@@ -11,7 +11,7 @@ struct IntakeTarget {
 // requested_velocity_rps echoes the demand the policy acted on this tick
 // (0 when no fresh enabled target), roller_velocity_rps is the measured
 // wheel speed, and inhibit names why the wheel is NOT driving. Inhibit
-// codes (shared with talos_nodes/intake/packet.py + packet.h):
+// codes (intake::kInhibit* in topics.h, shared with the Python node):
 //   0 = DRIVE (wheel follows requested), 1 = GATEWAY_NOT_READY,
 //   2 = TARGET_DISABLED, 3 = TARGET_STALE, 4 = FEEDBACK_INVALID,
 //   5 = DEMAND_NONFINITE. Appended, never reordered: flatbuffers structs

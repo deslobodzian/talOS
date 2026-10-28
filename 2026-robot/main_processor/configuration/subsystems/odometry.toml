@@ -2,5 +2,5 @@
 # no actuators. Pose-only: shooter state stays on /shooter/state for direct consumers.
 [subsystem]
 name = "odometry"
-node = "@talos_odometry//:node"
+node = "//2026-robot/main_processor/odometry:node"
 period_us = 5000

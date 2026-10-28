@@ -1,0 +1,440 @@
+#include "talOS/node/node.h"
+
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "talOS/configuration/config_parser.h"
+#include "talOS/events/context.h"
+#include "talOS/introspection/describe.h"
+#include "talOS/introspection/names.h"
+#include "talOS/node/internal.h"
+#include "talOS/process/node_main.h"
+
+namespace talos {
+
+struct Node::Impl {
+  struct SubscriptionSlot {
+    std::string topic;
+    std::size_t bytes;
+    std::unique_ptr<std::byte[]> data;  // operator new[]: aligned for M
+    bool optional;
+    detail::MessageCallback on_message;
+    bool has_value = false;
+    Time received{};
+    bool pending = false;  // arrived since the last update() began
+    bool updated = false;  // what update() sees: pending at its start
+  };
+  struct PublisherSlot {
+    std::uint16_t id;
+    std::size_t bytes;
+  };
+  struct TimerSlot {
+    std::function<void()> fn;
+  };
+
+  std::string name;
+  std::string config_path;
+  std::shared_ptr<const config::RobotConfig> config;
+  bool simulation = false;
+  detail::LoopPort* loop = nullptr;
+  Duration period{};
+  Duration timeout{};
+
+  std::vector<std::unique_ptr<SubscriptionSlot>> subscriptions;
+  std::vector<PublisherSlot> publishers;
+  std::vector<std::unique_ptr<TimerSlot>> timers;
+  std::vector<std::pair<std::type_index, std::shared_ptr<void>>> extensions;
+
+  std::function<void()> update;
+  std::vector<std::function<void()>> after_update;
+  bool started = false;
+  bool in_update = false;
+  std::uint64_t ticks = 0;
+
+  const SubscriptionSlot& SubscriptionAt(std::size_t index) const {
+    if (index >= subscriptions.size()) {
+      throw std::out_of_range(name + ": no subscription at index " +
+                              std::to_string(index));
+    }
+    return *subscriptions[index];
+  }
+
+  void CheckOpen(const char* what) const {
+    if (started) {
+      throw std::logic_error(name + ": " + what +
+                             " must be called in the constructor");
+    }
+  }
+
+  const toml::table* Table() const { return config->GetSubsystemTable(name); }
+  toml::node_view<const toml::node> Param(std::string_view key) const {
+    const toml::table* table = Table();
+    if (table == nullptr) return {};
+    return table->at_path(key);
+  }
+
+  static void OnMessage(void* object, const event::Context& context,
+                        std::span<const std::byte> payload) {
+    auto* slot = static_cast<SubscriptionSlot*>(object);
+    const std::size_t copied = std::min(payload.size(), slot->bytes);
+    std::memcpy(slot->data.get(), payload.data(), copied);
+    std::memset(slot->data.get() + copied, 0, slot->bytes - copied);
+    slot->has_value = true;
+    slot->received = context.now;
+    slot->pending = true;
+    if (slot->on_message) slot->on_message(slot->data.get());
+  }
+
+  static void OnTimer(void* object, const event::Context&,
+                      std::span<const std::byte>) {
+    static_cast<TimerSlot*>(object)->fn();
+  }
+
+  static void OnTick(void* object, const event::Context&,
+                     std::span<const std::byte>) {
+    auto* impl = static_cast<Impl*>(object);
+    for (auto& slot : impl->subscriptions) {
+      slot->updated = slot->pending;
+      slot->pending = false;
+    }
+    if (impl->update) {
+      struct InUpdate {
+        bool& flag;
+        explicit InUpdate(bool& f) : flag{f} { flag = true; }
+        ~InUpdate() { flag = false; }
+      } in_update{impl->in_update};
+      impl->update();
+    }
+    ++impl->ticks;
+    for (const auto& hook : impl->after_update) hook();
+  }
+};
+
+Node::Node(detail::NodeSetup setup) : impl_{std::make_unique<Impl>()} {
+  if (setup.loop == nullptr || setup.config == nullptr) {
+    throw std::invalid_argument("talos::Node needs a loop and a config");
+  }
+  Impl& impl = *impl_;
+  impl.name = std::move(setup.name);
+  impl.config_path = std::move(setup.config_path);
+  impl.config = std::move(setup.config);
+  impl.simulation = setup.simulation;
+  impl.loop = setup.loop;
+  impl.timeout =
+      std::chrono::microseconds{impl.config->hardware.command_timeout_us};
+
+  std::int64_t period_us = impl.config->hardware.period_us;
+  if (const toml::table* table = impl.Table()) {
+    if (const auto node = (*table)["period_us"]) {
+      const auto value = node.value_exact<std::int64_t>();
+      if (!value) {
+        throw std::invalid_argument(impl.name +
+                                    ": period_us must be an integer");
+      }
+      period_us = *value;
+    }
+  }
+  if (period_us <= 0) {
+    throw std::invalid_argument(impl.name + ": period_us must be positive");
+  }
+  impl.period = std::chrono::microseconds{period_us};
+}
+
+// Extensions hold references into this node, so they go first, newest first.
+Node::~Node() {
+  while (!impl_->extensions.empty()) impl_->extensions.pop_back();
+}
+
+std::string_view Node::name() const { return impl_->name; }
+bool Node::simulation() const { return impl_->simulation; }
+Time Node::now() const { return impl_->loop->now(); }
+std::uint64_t Node::tick() const { return impl_->ticks; }
+Duration Node::period() const { return impl_->period; }
+const std::string& Node::config_path() const { return impl_->config_path; }
+
+void Node::after_update(std::function<void()> fn) {
+  impl_->CheckOpen("after_update");
+  if (!fn) throw std::invalid_argument(impl_->name + ": empty after_update");
+  impl_->after_update.push_back(std::move(fn));
+}
+
+void Node::every(Duration period, std::function<void()> fn) {
+  if (period <= Duration::zero()) {
+    throw std::invalid_argument(impl_->name +
+                                ": every() needs a positive period");
+  }
+  if (!fn) {
+    throw std::invalid_argument(impl_->name + ": every() needs a function");
+  }
+  auto slot = std::make_unique<Impl::TimerSlot>(Impl::TimerSlot{std::move(fn)});
+  const std::string label =
+      impl_->name + "/every/" + std::to_string(impl_->timers.size());
+  const std::uint16_t id = impl_->loop->register_timer(
+      label, event::Thunk{slot.get(), &Impl::OnTimer});
+  impl_->timers.push_back(std::move(slot));
+  impl_->loop->arm_timer(id, now() + period, period);
+}
+
+// --- framework plumbing ------------------------------------------------------
+
+namespace detail {
+
+std::unique_ptr<Node> NodeAccess::create(NodeSetup setup) {
+  return std::unique_ptr<Node>{new Node{std::move(setup)}};
+}
+
+void NodeAccess::set_update(Node& node, std::function<void()> update) {
+  node.impl_->CheckOpen("set_update");
+  node.impl_->update = std::move(update);
+}
+
+void NodeAccess::start(Node& node) {
+  Node::Impl& impl = *node.impl_;
+  if (impl.started) throw std::logic_error(impl.name + ": started twice");
+  impl.started = true;
+  if (!impl.update && impl.after_update.empty()) return;
+  const std::uint16_t id = impl.loop->register_timer(
+      impl.name, event::Thunk{&impl, &Node::Impl::OnTick});
+  impl.loop->arm_timer(id, node.now() + impl.period, impl.period);
+}
+
+std::uint64_t NodeAccess::next_update(const Node& node) {
+  return node.impl_->in_update ? node.impl_->ticks + 1 : node.impl_->ticks;
+}
+
+Duration NodeAccess::freshness_timeout(const Node& node) {
+  return node.impl_->timeout;
+}
+
+std::vector<std::string_view> NodeAccess::optional_topics(const Node& node) {
+  std::vector<std::string_view> topics;
+  for (const auto& slot : node.impl_->subscriptions) {
+    if (slot->optional) topics.push_back(slot->topic);
+  }
+  return topics;
+}
+
+void* NodeAccess::find_extension(const Node& node, std::type_index type) {
+  for (const auto& [key, object] : node.impl_->extensions) {
+    if (key == type) return object.get();
+  }
+  return nullptr;
+}
+
+void NodeAccess::add_extension(Node& node, std::type_index type,
+                               std::shared_ptr<void> object) {
+  if (find_extension(node, type) != nullptr) {
+    throw std::logic_error(node.impl_->name + ": extension added twice");
+  }
+  node.impl_->extensions.emplace_back(type, std::move(object));
+}
+
+// --- params ------------------------------------------------------------------
+
+std::optional<bool> NodeAccess::find_bool(const Node& node,
+                                          std::string_view key) {
+  const auto value = node.impl_->Param(key);
+  if (!value) return std::nullopt;
+  if (auto b = value.value_exact<bool>()) return *b;
+  param_error(node, key, "must be a boolean");
+}
+
+std::optional<std::int64_t> NodeAccess::find_int(const Node& node,
+                                                 std::string_view key) {
+  const auto value = node.impl_->Param(key);
+  if (!value) return std::nullopt;
+  if (auto i = value.value_exact<std::int64_t>()) return *i;
+  param_error(node, key, "must be an integer");
+}
+
+std::optional<double> NodeAccess::find_double(const Node& node,
+                                              std::string_view key) {
+  const auto value = node.impl_->Param(key);
+  if (!value) return std::nullopt;
+  if (value.is_floating_point() || value.is_integer()) {
+    if (auto d = value.value<double>()) return *d;
+  }
+  param_error(node, key, "must be a number");
+}
+
+std::optional<std::string> NodeAccess::find_string(const Node& node,
+                                                   std::string_view key) {
+  const auto value = node.impl_->Param(key);
+  if (!value) return std::nullopt;
+  if (auto s = value.value_exact<std::string>()) return *std::move(s);
+  param_error(node, key, "must be a string");
+}
+
+std::optional<ParamValue> NodeAccess::find_param(const Node& node,
+                                                 std::string_view key) {
+  const auto value = node.impl_->Param(key);
+  if (!value) return std::nullopt;
+  if (value.is_boolean()) return ParamValue{*value.value_exact<bool>()};
+  if (value.is_integer()) {
+    return ParamValue{*value.value_exact<std::int64_t>()};
+  }
+  if (value.is_floating_point()) return ParamValue{*value.value<double>()};
+  if (value.is_string()) return ParamValue{*value.value_exact<std::string>()};
+  param_error(node, key, "must be a boolean, number or string");
+}
+
+void NodeAccess::param_error(const Node& node, std::string_view key,
+                             std::string_view problem) {
+  const std::string& name = node.impl_->name;
+  throw std::invalid_argument(name + ": parameter '" + std::string{key} +
+                              "' " + std::string{problem} + " in [subsystems." +
+                              name + "]");
+}
+
+// --- topics ------------------------------------------------------------------
+
+namespace {
+
+void CheckLayout(const std::string& node, std::string_view topic,
+                 std::size_t bytes, std::size_t alignment) {
+  if (bytes == 0 || bytes > std::numeric_limits<std::uint32_t>::max() ||
+      alignment == 0 || alignment > kMessageAlignment ||
+      (alignment & (alignment - 1)) != 0) {
+    throw std::invalid_argument(node + ": bad message layout for '" +
+                                std::string{topic} + "'");
+  }
+}
+
+}  // namespace
+
+std::size_t NodeAccess::add_subscription(Node& node, std::string_view topic,
+                                         std::size_t bytes,
+                                         std::size_t alignment, bool optional,
+                                         MessageCallback on_message) {
+  Node::Impl& impl = *node.impl_;
+  CheckLayout(impl.name, topic, bytes, alignment);
+  auto slot =
+      std::make_unique<Node::Impl::SubscriptionSlot>(Node::Impl::SubscriptionSlot{
+          .topic = std::string{topic},
+          .bytes = bytes,
+          .data = std::make_unique<std::byte[]>(bytes),
+          .optional = optional,
+          .on_message = std::move(on_message),
+      });
+  impl.loop->register_watcher(
+      topic, static_cast<std::uint32_t>(bytes),
+      static_cast<std::uint32_t>(alignment),
+      event::Thunk{slot.get(), &Node::Impl::OnMessage});
+  impl.subscriptions.push_back(std::move(slot));
+  return impl.subscriptions.size() - 1;
+}
+
+const void* NodeAccess::subscription_value(const Node& node,
+                                           std::size_t index) {
+  return node.impl_->SubscriptionAt(index).data.get();
+}
+
+bool NodeAccess::subscription_has_value(const Node& node, std::size_t index) {
+  return node.impl_->SubscriptionAt(index).has_value;
+}
+
+Duration NodeAccess::subscription_age(const Node& node, std::size_t index) {
+  const auto& slot = node.impl_->SubscriptionAt(index);
+  if (!slot.has_value) return Duration::max();
+  return node.now() - slot.received;
+}
+
+bool NodeAccess::subscription_fresh(const Node& node, std::size_t index,
+                                    Duration max_age) {
+  return subscription_has_value(node, index) &&
+         subscription_age(node, index) < max_age;
+}
+
+bool NodeAccess::subscription_updated(const Node& node, std::size_t index) {
+  return node.impl_->SubscriptionAt(index).updated;
+}
+
+std::size_t NodeAccess::add_publisher(Node& node, std::string_view topic,
+                                      std::size_t bytes,
+                                      std::size_t alignment) {
+  Node::Impl& impl = *node.impl_;
+  CheckLayout(impl.name, topic, bytes, alignment);
+  const std::uint16_t id =
+      impl.loop->register_sender(topic, static_cast<std::uint32_t>(bytes),
+                                 static_cast<std::uint32_t>(alignment));
+  impl.publishers.push_back({id, bytes});
+  return impl.publishers.size() - 1;
+}
+
+bool NodeAccess::publisher_send(Node& node, std::size_t index,
+                                const void* data, std::size_t bytes) {
+  Node::Impl& impl = *node.impl_;
+  if (index >= impl.publishers.size()) {
+    throw std::out_of_range(impl.name + ": no publisher at index " +
+                            std::to_string(index));
+  }
+  const auto& publisher = impl.publishers[index];
+  if (bytes != publisher.bytes) {
+    throw std::invalid_argument(
+        impl.name + ": sent " + std::to_string(bytes) + " bytes on a " +
+        std::to_string(publisher.bytes) + "-byte topic");
+  }
+  return impl.loop->send(
+      publisher.id,
+      std::span<const std::byte>{static_cast<const std::byte*>(data), bytes});
+}
+
+}  // namespace detail
+
+// --- the binary --------------------------------------------------------------
+
+namespace detail {
+namespace {
+
+// One node as the runner holds it. Members destroy in reverse: the user's
+// object, then the Node its handles point into, then the loop port.
+struct Hosted {
+  std::unique_ptr<LoopPort> port;
+  std::unique_ptr<Node> node;
+  Instance user;
+};
+
+}  // namespace
+
+int RunMain(int argc, char** argv, const char* node_name,
+            const char* node_target, const InstanceFactory& make) {
+  // Built the same way on all three loops, so --describe reports, and replay
+  // checks, exactly what the live constructor registers.
+  auto factory = [&](auto& loop, const process::NodeFlags& flags) {
+    using Loop = std::remove_reference_t<decltype(loop)>;
+    auto hosted = std::make_unique<Hosted>();
+    hosted->port = std::make_unique<LoopPortFor<Loop>>(loop);
+    hosted->node = NodeAccess::create(NodeSetup{
+        .name = node_name,
+        .config_path = flags.config_path,
+        .config = std::make_shared<const config::RobotConfig>(
+            config::ParseRobotConfig(flags.config_path)),
+        .simulation = flags.simulation,
+        .loop = hosted->port.get(),
+    });
+    hosted->user = make(*hosted->node);
+    NodeAccess::start(*hosted->node);
+    return hosted;
+  };
+  auto endpoints = [](const std::unique_ptr<Hosted>& hosted) {
+    std::vector<introspect::EndpointAttribute> attributes;
+    for (const std::string_view topic :
+         NodeAccess::optional_topics(*hosted->node)) {
+      attributes.push_back({topic, introspect::naming::kSourceFlagOptional});
+    }
+    return attributes;
+  };
+  return process::RunNode(
+      argc, argv, {.node_name = node_name, .node_target = node_target}, factory,
+      process::NoStart{}, process::NoDescribeHook{}, process::NoExtraSources{},
+      process::DefaultSummary{}, endpoints);
+}
+
+}  // namespace detail
+}  // namespace talos

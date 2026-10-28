@@ -3,10 +3,7 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 cc_library(
     name = "configuration",
-    hdrs = [
-        "config_parser.h",
-        "configuration.h",
-    ],
+    hdrs = ["config_parser.h"],
     visibility = ["//visibility:public"],
     deps = [
         "//talOS/hardware:config",

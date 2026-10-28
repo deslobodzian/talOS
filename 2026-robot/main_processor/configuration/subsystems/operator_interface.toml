@@ -1,6 +1,5 @@
-# 2026-game teleop bindings: the year wrapper composes the platform chassis
-# core and adds shooter/intake button mappings. Game logic lives here, not in
-# the driver_station node.
+# Teleop bindings: chassis stick scaling plus shooter/intake button mappings.
+# Game logic lives here, not in the driver_station node.
 [subsystem]
 name = "operator_interface"
 node = "//2026-robot/main_processor/operator_interface:node"

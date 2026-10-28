@@ -1,41 +1,29 @@
-load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-
-# The subsystem's own config file, so the robot manifest filegroup can ship it.
-exports_files(["subsystem.toml"])
+load("//talOS/build:contract.bzl", "talos_cc_node")
 
 cc_library(
     name = "operator_interface",
-    hdrs = ["node.h"],
+    hdrs = ["operator_interface.h"],
     strip_include_prefix = ".",
-    include_prefix = "talos_nodes/year2026_operator_interface",
+    include_prefix = "operator_interface",
     deps = [
-        "@talos_driver_station//:contract",
-        "@talos_operator_interface//:operator_interface",
-        "//2026-robot/main_processor/intake:messages_cc",
-        "//2026-robot/main_processor/shooter:messages_cc",
-        "//talOS/configuration:configuration",
-        "//talOS/driver_station:driver_station",
-        "//talOS/events:events",
-        "//talOS/process:node_main",
+        "//2026-robot/main_processor/drivetrain:messages",
+        "//2026-robot/main_processor/intake:messages",
+        "//2026-robot/main_processor/shooter:messages",
+        "//talOS/driver_station",
+        "//talOS/driver_station:messages",
+        "//talOS/node",
     ],
-    visibility = ["//visibility:public"],
+    # The arbiter's teleop-chain test runs the real operator interface.
+    visibility = ["//2026-robot/main_processor/arbiter:__pkg__"],
 )
 
-cc_binary(
+talos_cc_node(
     name = "node",
-    srcs = ["main.cc"],
-    deps = [
-        ":operator_interface",
-        "//talOS/configuration:configuration",
-        "//talOS/events:events",
-        "//talOS/introspection:describe",
-        "//talOS/introspection:names",
-        "//talOS/introspection:reporter",
-        "//talOS/process:node_main",
-    ],
-    visibility = ["//visibility:public"],
+    node_name = "operator_interface",
+    srcs = ["operator_interface.cc"],
+    deps = [":operator_interface"],
 )
 
 cc_test(
@@ -44,6 +32,7 @@ cc_test(
     srcs = ["node_test.cc"],
     deps = [
         ":operator_interface",
+        "//talOS/node:testing",
         "@googletest//:gtest_main",
     ],
 )

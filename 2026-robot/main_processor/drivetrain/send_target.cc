@@ -4,8 +4,8 @@
 #include <string>
 #include <thread>
 
-#include "talos_nodes/drivetrain/drive_message_generated.h"
-#include "talos_nodes/drivetrain/packet.h"
+#include "drivetrain/drive_message_generated.h"
+#include "drivetrain/topics.h"
 #include "talOS/events/os/poller.h"
 #include "talOS/ipc/publisher.h"
 
@@ -20,16 +20,16 @@ int main(int argc, char** argv) {
     if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(omega) ||
         seconds <= 0)
       throw std::invalid_argument("invalid target");
-    ipc::Publisher<talos::drive::ChassisTarget> publisher{
-        talos::drive::kTargetTopic};
+    ipc::Publisher<drivetrain::ChassisTarget> publisher{
+        drivetrain::kTargetTopic};
     const auto end =
         std::chrono::steady_clock::now() + std::chrono::seconds{seconds};
     while (std::chrono::steady_clock::now() < end) {
-      publisher.write(talos::drive::ChassisTarget{
+      publisher.write(drivetrain::ChassisTarget{
           vx, vy, omega, talos::event::Poller::now().nanos(), true});
       std::this_thread::sleep_for(std::chrono::milliseconds{20});
     }
-    publisher.write(talos::drive::ChassisTarget{
+    publisher.write(drivetrain::ChassisTarget{
         0, 0, 0, talos::event::Poller::now().nanos(), false});
     return 0;
   } catch (const std::exception& e) {

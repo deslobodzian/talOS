@@ -93,7 +93,7 @@ class SimBackend final : public Backend {
     pwm_outputs_ = {};
   }
 
-  // Item 36: fault injection for reset handling. The next Tick reports the
+  // Fault injection for reset handling. The next Tick reports the
   // device as reset; the gateway restores configuration and drops obsolete
   // demand. Restore clears latched commands without zeroing mechanism
   // positions (documented ideal-fake limit: positions re-acquire from the
@@ -107,26 +107,6 @@ class SimBackend final : public Backend {
   bool RestoreAfterReset() override {
     commands_ = {};
     return true;
-  }
-  // Item 38: declares the mechanism currently at `home_position_rot`.
-  bool ZeroPosition(uint16_t motor_id, double home_position_rot) override {
-    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-      if (config_.motors[i].id == motor_id) {
-        samples_[i].position_rot = home_position_rot;
-        samples_[i].id = motor_id;
-        samples_[i].valid = true;
-        return true;
-      }
-    }
-    return false;
-  }
-  // Item 39: the ideal fake measures a settable rail, nothing else.
-  void SetSupplyVoltage(double volts) { supply_v_ = volts; }
-  HealthSnapshot GetHealth() override {
-    HealthSnapshot snapshot;
-    snapshot.supply_voltage_v = supply_v_;
-    snapshot.supply_valid = true;
-    return snapshot;
   }
 
   void SetDigitalInput(uint16_t id, bool value) { digital_inputs_[id] = value; }
@@ -150,7 +130,6 @@ class SimBackend final : public Backend {
   };
   Config config_;
   uint64_t previous_time_{};
-  double supply_v_{12.0};
   std::vector<uint16_t> pending_resets_;
   std::array<MotorRequest, kMaxMotors> commands_{};
   std::array<MotorSample, kMaxMotors> samples_{};

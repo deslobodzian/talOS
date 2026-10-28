@@ -35,14 +35,14 @@ cc_test(
 cc_binary(
     name = "studio_mock",
     srcs = ["mock.cc"],
-    deps = ["@studio_schema//:wire", "//talOS/rtms:rtms", "@studio_schema//:schema", "@flatbuffers//:flatbuffers"],
+    deps = ["//studio/schema:wire", "//talOS/rtms:rtms", "//studio/schema", "@flatbuffers//:flatbuffers"],
 )
 cc_binary(
     name = "studio_bridge",
     srcs = ["main.cc"],
     deps = [
         ":system",
-        "@studio_schema//:wire",
+        "//studio/schema:wire",
         "//talOS/configuration:configuration",
         "//talOS/introspection:describe",
         "//talOS/introspection:registry",

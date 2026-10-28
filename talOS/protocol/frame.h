@@ -32,7 +32,7 @@ struct FrameHeader {
   uint64_t magic = kFrameMagic;
   uint16_t version = kProtocolVersion;
   uint16_t header_size = kFrameHeaderSize;
-  FrameType type = FrameType::kHeartbeat;
+  FrameType type{};
   uint16_t flags = 0;
   uint64_t sequence = 0;
   uint64_t monotonic_time_us = 0;

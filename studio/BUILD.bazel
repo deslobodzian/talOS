@@ -10,11 +10,10 @@ exports_files(["package.json", "pnpm-lock.yaml"])
 npm_link_all_packages(name = "node_modules")
 
 # One schema and the monorepo's flatc tool generate both C++ and TS bindings.
-# Single contract home: the standalone studio-schema module owns telemetry.fbs;
-# in-tree consumers reference it via @studio_schema.
+# Single contract home: //studio/schema owns telemetry.fbs.
 genrule(
     name = "telemetry_ts",
-    srcs = ["@studio_schema//:telemetry.fbs"],
+    srcs = ["//studio/schema:telemetry.fbs"],
     outs = [
         "src/generated/talos/telemetry.ts",
         "src/generated/talos/telemetry/channel.ts",
@@ -24,7 +23,7 @@ genrule(
         "src/generated/talos/telemetry/target.ts",
     ],
     tools = ["@flatbuffers//:flatc"],
-    cmd = "$(location @flatbuffers//:flatc) --ts -o $(RULEDIR)/src/generated $(location @studio_schema//:telemetry.fbs)",
+    cmd = "$(location @flatbuffers//:flatc) --ts -o $(RULEDIR)/src/generated $(location //studio/schema:telemetry.fbs)",
 )
 
 js_library(
@@ -110,4 +109,4 @@ js_test(
     fixed_args = ["declared.test.ts"],
 )
 
-test_suite(name = "tests", tests = [":core_test", ":agent_test", ":declared_test", ":system_test", ":view_test", ":typecheck", "@studio_schema//:wire_test", "//studio/bridge:system_test"])
+test_suite(name = "tests", tests = [":core_test", ":agent_test", ":declared_test", ":system_test", ":view_test", ":typecheck", "//studio/schema:wire_test", "//studio/bridge:system_test"])

@@ -1,0 +1,14 @@
+// Messages for //talOS/python:talos_test.
+namespace demo;
+
+struct Goal {
+  height_rot:double;
+  enabled:bool;
+  count:int;
+}
+
+struct Status {
+  height_rot:double;
+  at_goal:bool;
+  tick:ulong;
+}

@@ -3,12 +3,10 @@
 #include <cstdint>
 #include <optional>
 #include <span>
-#include <string>
 #include <vector>
 
 #include "config.h"
 #include "config_error.h"
-#include "health.h"
 #include "messages.h"
 
 namespace talos::hardware {
@@ -25,12 +23,12 @@ class Backend {
     return true;
   }
   virtual void Neutral() = 0;
-  // Item 35: precise failure behind the last false Configure(). Absent when
+  // Precise failure behind the last false Configure(). Absent when
   // the backend cannot say more than "it failed".
   virtual std::optional<ConfigError> last_config_error() const {
     return std::nullopt;
   }
-  // Item 36: individual device resets. Returns true and fills reset_ids with
+  // Individual device resets. Returns true and fills reset_ids with
   // the logical IDs of devices that reset since the last poll. The gateway
   // invalidates outstanding commands (epoch bump plus Neutral) BEFORE
   // restoring configuration, so no obsolete demand resumes on a freshly
@@ -43,16 +41,6 @@ class Backend {
   // gateway neutralizes and invalidates before calling; on false it latches
   // a fault and neutralizes again.
   virtual bool RestoreAfterReset() { return true; }
-  // Item 38: declares the mechanism currently at `home_position_rot`.
-  virtual bool ZeroPosition(uint16_t /*motor_id*/,
-                            double /*home_position_rot*/) {
-    return false;
-  }
-  // Item 39: supply rail and backend-measured health. Unknowns stay
-  // invalid/zero; gateway-owned counters are overlaid by Gateway::health().
-  // Non-const: backends may refresh a cached signal, so poll at low rate,
-  // never on the Driver Station fast path.
-  virtual HealthSnapshot GetHealth() { return {}; }
 };
 
 class Gateway {
@@ -76,15 +64,10 @@ class Gateway {
   bool Reconfigure(const Config& config);
   void Tick(uint64_t now_us, bool driver_station_enabled);
   bool Accept(const Command& command, uint64_t sequence, uint64_t now_us);
-  // Item 38: capture phase of homing. See homing.h for the full semantics.
-  // Returns true on completion; on false, `reason` names the rejection.
-  bool Zero(uint16_t motor_id, double home_position_rot,
-            uint64_t observed_time_us, uint64_t now_us, std::string* reason);
   State snapshot() const;
-  HealthSnapshot health();
   const Config& config() const { return config_; }
   bool configured() const { return configured_; }
-  // Item 35: precise failure behind the last rejected configuration, if the
+  // Precise failure behind the last rejected configuration, if the
   // backend could say more than "it failed".
   std::optional<ConfigError> config_error() const { return config_error_; }
 
@@ -98,7 +81,6 @@ class Gateway {
   bool have_sequence_{false};
   bool healthy_{false};
   uint64_t accepted_at_{}, observed_at_{};
-  uint64_t reset_count_{0};
   std::optional<ConfigError> config_error_;
 };
 }  // namespace talos::hardware

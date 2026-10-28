@@ -4,46 +4,66 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# Shared ground-truth library for non-C++ nodes. New package only; no
-# existing target is modified.
+cc_library(
+    name = "internal",
+    hdrs = ["internal.h"],
+    deps = [
+        ":node_api_h",
+        "//talOS/node",
+    ],
+    visibility = ["//visibility:private"],
+)
+
+cc_library(
+    name = "node_api_h",
+    hdrs = ["node_api.h"],
+    visibility = ["//visibility:private"],
+)
+
+# C ABI over talos::Node and the devices layer, for nodes written in other
+# languages (//talOS/python:talos).
 cc_library(
     name = "node_api",
     srcs = ["node_api.cc"],
     hdrs = ["node_api.h"],
+    # Every exported symbol must reach the shared objects below, even though
+    # nothing in them references them.
+    alwayslink = True,
     deps = [
-        "//talOS/configuration:configuration",
-        "//talOS/events:events",
-        "//talOS/events:events_core",
-        "//talOS/events:events_log",
-        "//talOS/hardware:gate",
-        "//talOS/introspection:describe",
-        "//talOS/introspection:registry",
-        "//talOS/introspection:reporter",
-        "//talOS/ipc:ipc",
-        "//talOS/rtms:rtms",
+        ":internal",
+        "//talOS/devices",
+        "//talOS/hardware:hardware",
+        "//talOS/node",
     ],
 )
 
-# Shared object loaded via ctypes/cffi. linkshared produces libtalos_node.so.
+# The Sim / SimHardware section of node_api.h.
+cc_library(
+    name = "node_api_testing",
+    testonly = True,
+    srcs = ["node_api_testing.cc"],
+    alwayslink = True,
+    deps = [
+        ":internal",
+        ":node_api",
+        "//talOS/devices:testing",
+        "//talOS/hardware:hardware",
+        "//talOS/node:testing",
+    ],
+)
+
+# Loaded via ctypes by the `talos` Python package.
 cc_binary(
     name = "libtalos_node.so",
-    srcs = [
-        "node_api.cc",
-        "node_api.h",
-    ],
     linkshared = True,
-    deps = [
-        "//talOS/configuration:configuration",
-        "//talOS/events:events",
-        "//talOS/events:events_core",
-        "//talOS/events:events_log",
-        "//talOS/hardware:gate",
-        "//talOS/introspection:describe",
-        "//talOS/introspection:registry",
-        "//talOS/introspection:reporter",
-        "//talOS/ipc:ipc",
-        "//talOS/rtms:rtms",
-    ],
+    deps = [":node_api"],
+)
+
+cc_binary(
+    name = "libtalos_node_testing.so",
+    testonly = True,
+    linkshared = True,
+    deps = [":node_api_testing"],
 )
 
 cc_test(
@@ -51,8 +71,7 @@ cc_test(
     size = "small",
     srcs = ["node_api_test.cc"],
     deps = [
-        ":node_api",
-        "@googletest//:gtest",
+        ":node_api_testing",
         "@googletest//:gtest_main",
     ],
 )

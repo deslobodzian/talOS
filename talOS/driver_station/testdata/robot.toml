@@ -1,0 +1,12 @@
+# Config for the driver station node's tests. Single-file layout. The node
+# owns no hardware; the robot config still needs one motor somewhere to
+# validate, so a neighbouring subsystem has it.
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.driver_station]
+period_us = 20000
+
+[subsystems.mechanism.motors.unused]
+can_id = 1

@@ -10,7 +10,6 @@
 #include "talOS/events/handles.h"
 #include "talOS/events/log/format.h"
 #include "talOS/events/log/log_reader.h"
-#include "talOS/events/metrics.h"
 #include "talOS/events/recorder.h"
 #include "talOS/events/time.h"
 
@@ -45,17 +44,15 @@ class ReplayDivergence : public std::runtime_error {
 
 // Re-runs a recorded program from its dispatch log.
 //
-// Nothing is re-derived. Timer firings, message payloads and fetch results all
-// come from the log in recorded order, so the handlers see byte-identical
-// inputs at identical times no matter how the original run was scheduled. The
-// loop then checks what the handlers produce against what they produced
-// originally: every send must match, in order, byte for byte.
-template <RecorderPolicy Recorder = NullRecorder,
-          MetricsPolicy Metrics = NullMetrics>
-class ReplayEventLoop : public EventLoopBase<ReplayEventLoop<Recorder, Metrics>,
-                                             Recorder, Metrics> {
-  using Base =
-      EventLoopBase<ReplayEventLoop<Recorder, Metrics>, Recorder, Metrics>;
+// Nothing is re-derived. Timer firings and message payloads come from the log
+// in recorded order, so the handlers see byte-identical inputs at identical
+// times no matter how the original run was scheduled. The loop then checks
+// what the handlers produce against what they produced originally: every send
+// must match, in order, byte for byte.
+template <RecorderPolicy Recorder = NullRecorder>
+class ReplayEventLoop
+    : public EventLoopBase<ReplayEventLoop<Recorder>, Recorder> {
+  using Base = EventLoopBase<ReplayEventLoop<Recorder>, Recorder>;
   friend Base;
 
  public:
@@ -80,7 +77,6 @@ class ReplayEventLoop : public EventLoopBase<ReplayEventLoop<Recorder, Metrics>,
   }
 
   using SendOutcome = typename Base::SendOutcome;
-  using FetchResult = typename Base::FetchResult;
 
   MonotonicTime now_impl() const { return now_; }
 
@@ -178,9 +174,8 @@ class ReplayEventLoop : public EventLoopBase<ReplayEventLoop<Recorder, Metrics>,
   }
 
   static bool is_operation(EventKind kind) {
-    return kind == EventKind::FETCH || kind == EventKind::SEND ||
-           kind == EventKind::ARM_TIMER || kind == EventKind::DISARM_TIMER ||
-           kind == EventKind::HANDLER_EXIT;
+    return kind == EventKind::SEND || kind == EventKind::ARM_TIMER ||
+           kind == EventKind::DISARM_TIMER || kind == EventKind::HANDLER_EXIT;
   }
 
   std::string source_name(std::uint16_t id) const {
@@ -288,24 +283,6 @@ class ReplayEventLoop : public EventLoopBase<ReplayEventLoop<Recorder, Metrics>,
     // Report the recorded outcome so a re-recorded replay reproduces the
     // original log exactly rather than the transport's current state.
     return SendOutcome{static_cast<SendStatus>(header->aux), header->sequence};
-  }
-
-  FetchResult fetch_impl(std::uint16_t id, std::span<std::byte> destination) {
-    std::span<const std::byte> recorded{};
-    const log::RecordHeader* header = take(EventKind::FETCH, id, recorded);
-
-    if (header == nullptr) {
-      return FetchResult{FetchOutcome::EMPTY, 0, 0};
-    }
-
-    const auto outcome = static_cast<FetchOutcome>(header->aux);
-
-    if (outcome == FetchOutcome::VALUE && !recorded.empty()) {
-      std::memcpy(destination.data(), recorded.data(),
-                  std::min(destination.size(), recorded.size()));
-    }
-
-    return FetchResult{outcome, header->sequence, 0};
   }
 
   log::LogReader* reader_;

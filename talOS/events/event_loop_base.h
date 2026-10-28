@@ -13,7 +13,6 @@
 #include "talOS/events/callback.h"
 #include "talOS/events/context.h"
 #include "talOS/events/manifest.h"
-#include "talOS/events/metrics.h"
 #include "talOS/events/recorder.h"
 #include "talOS/events/time.h"
 
@@ -40,19 +39,13 @@ class RegistrationError : public std::logic_error {
 
 // Live activity for one event source, published for anything outside the loop
 // that wants to know what the program is actually doing: a heartbeat, a
-// telemetry viewer, an agent asking which topics are moving.
-//
-// Separate from LoopMetrics, and not a substitute for it. LoopMetrics keeps
-// whole latency distributions in plain arrays for the owning thread to report
-// at the end of a run; these are lock-free atomics precisely so another thread
-// can read them mid-run without a data race. Six relaxed stores per dispatch,
-// no clock reads beyond the ones the dispatch already made -- cheap enough to
-// leave on in a 1 kHz loop, which is the point: observability that has to be
-// switched on is observability you do not have when you need it.
+// telemetry viewer, an agent asking which topics are moving. Lock-free atomics
+// so another thread can read them mid-run without a data race. Six relaxed
+// stores per dispatch, no clock reads beyond the ones the dispatch already
+// made -- cheap enough to leave on in a 1 kHz loop.
 struct SourceCounters {
-  // Timer or watcher dispatches, messages published by a sender, values
-  // actually received by a fetcher. In each case: how often this source did
-  // its job.
+  // Timer or watcher dispatches, or messages published by a sender: how often
+  // this source did its job.
   std::atomic<std::uint64_t> events{0};
 
   // Messages the transport lapped before this source read them, plus publishes
@@ -70,27 +63,19 @@ struct SourceCounters {
 
 // Shared machinery for every loop: source registration, id assignment, the
 // dispatch entry point that freezes time and drives the recorder, and the
-// send/fetch paths that funnel handler output through the same recorder.
+// send path that funnels handler output through the same recorder.
 //
 // CRTP, not inheritance with virtuals. The derived loop supplies:
 //   MonotonicTime now_impl() const
 //   void on_register(const Registration&)          (optional side table setup)
 //   SendOutcome send_impl(uint16_t id, std::span<const std::byte>)
-//   FetchOutcomeBytes fetch_impl(uint16_t id, std::span<std::byte> destination)
 //   void on_exit_requested()                        (wake a blocked wait)
-template <typename Derived, RecorderPolicy Recorder,
-          MetricsPolicy Metrics = NullMetrics>
+template <typename Derived, RecorderPolicy Recorder>
 class EventLoopBase {
  public:
   struct SendOutcome {
     SendStatus status{SendStatus::OK};
     std::uint64_t sequence{0};
-  };
-
-  struct FetchResult {
-    FetchOutcome outcome{FetchOutcome::EMPTY};
-    std::uint64_t sequence{0};
-    std::uint64_t dropped{0};
   };
 
   EventLoopBase() = default;
@@ -108,8 +93,6 @@ class EventLoopBase {
   EventLoopBase& operator=(EventLoopBase&&) = delete;
 
   Recorder& recorder() { return recorder_; }
-  Metrics& metrics() { return metrics_; }
-  const Metrics& metrics() const { return metrics_; }
   const Manifest& manifest() const { return manifest_; }
 
   // Non-null from begin_run() until destruction, and never reallocated, so a
@@ -162,13 +145,6 @@ class EventLoopBase {
                       callback);
   }
 
-  std::uint16_t register_fetcher(std::string_view topic,
-                                 std::uint32_t message_bytes,
-                                 std::uint32_t alignment) {
-    return add_source(SourceKind::FETCHER, topic, message_bytes, alignment,
-                      Thunk{});
-  }
-
   std::uint16_t register_sender(std::string_view topic,
                                 std::uint32_t message_bytes,
                                 std::uint32_t alignment) {
@@ -199,35 +175,6 @@ class EventLoopBase {
     return outcome.status == SendStatus::OK;
   }
 
-  // Reads the newest value on a fetcher's topic into `destination`, recording
-  // the result including the "there was nothing" case: a handler that saw no
-  // value must see no value on replay too.
-  bool fetch_message(std::uint16_t id, std::span<std::byte> destination) {
-    const FetchResult result = derived().fetch_impl(id, destination);
-    const bool has_value = result.outcome == FetchOutcome::VALUE;
-
-    recorder_.fetch(context_, id, result.outcome,
-                    has_value ? std::span<const std::byte>{destination}
-                              : std::span<const std::byte>{},
-                    result.sequence, result.dropped);
-
-    if (SourceCounters* counters = counter(id)) {
-      // An empty fetch is not an event: a handler that samples a topic every
-      // cycle would otherwise report traffic that never arrived.
-      if (has_value) {
-        counters->events.fetch_add(1, std::memory_order_relaxed);
-        counters->sequence.store(result.sequence, std::memory_order_relaxed);
-        counters->last_now_ns.store(context_.now.nanos(),
-                                    std::memory_order_relaxed);
-      }
-      if (result.dropped != 0) {
-        counters->dropped.fetch_add(result.dropped, std::memory_order_relaxed);
-      }
-    }
-
-    return has_value;
-  }
-
   // Safe from a handler or another thread, but not from a signal handler.
   // Other operations and lifecycle calls require external serialization.
   void exit() {
@@ -248,7 +195,7 @@ class EventLoopBase {
   struct Source {
     Registration registration;
     Thunk callback;
-    std::vector<std::byte> buffer;  // staging for watcher and fetcher payloads
+    std::vector<std::byte> buffer;  // staging for watcher payloads
   };
 
   std::vector<Source>& sources() { return sources_; }
@@ -354,8 +301,6 @@ class EventLoopBase {
     dispatch_index_ = 0;
     context_ = Context{};
     recorder_.start(manifest_, start);
-    metrics_.configure(manifest_);
-    metrics_.begin_run(steady_now());
   }
 
   void end_run(MonotonicTime now) {
@@ -369,7 +314,6 @@ class EventLoopBase {
 
     recorder_.finish(exit_context);
     recorder_.flush();
-    metrics_.end_run(steady_now());
     context_ = Context{};
   }
 
@@ -404,7 +348,7 @@ class EventLoopBase {
 
  private:
   // The dispatch record is written before the handler runs so that the sends
-  // and fetches it performs are ordered after their parent in the log.
+  // it performs are ordered after their parent in the log.
   void invoke(const Context& context, std::span<const std::byte> payload) {
     struct DispatchScope {
       EventLoopBase& loop;
@@ -434,19 +378,8 @@ class EventLoopBase {
     }
 
     const Thunk& callback = sources_[context.source_id].callback;
-
-    // The clock reads exist only when a metrics policy wants them, so an
-    // uninstrumented loop does not pay for measurement it never reads.
-    if constexpr (Metrics::ENABLED) {
-      const MonotonicTime begin = steady_now();
-      if (callback.valid()) {
-        callback(context, payload);
-      }
-      metrics_.record(context, steady_now() - begin);
-    } else {
-      if (callback.valid()) {
-        callback(context, payload);
-      }
+    if (callback.valid()) {
+      callback(context, payload);
     }
 
     context_ = Context{};
@@ -510,7 +443,6 @@ class EventLoopBase {
   Manifest manifest_;
   std::unique_ptr<SourceCounters[]> counters_;
   Recorder recorder_{};
-  Metrics metrics_{};
 
   Context context_{};
   std::uint64_t dispatch_index_{0};
@@ -526,12 +458,10 @@ class EventLoopBase {
 // compile against the realtime, simulated and replay loops.
 template <typename T>
 concept EventLoopLike =
-    requires(T loop, std::uint16_t id, std::span<const std::byte> bytes,
-             std::span<std::byte> destination) {
+    requires(T loop, std::uint16_t id, std::span<const std::byte> bytes) {
       { loop.monotonic_now() } -> std::same_as<MonotonicTime>;
       { loop.context() } -> std::same_as<const Context&>;
       { loop.send_message(id, bytes) } -> std::same_as<bool>;
-      { loop.fetch_message(id, destination) } -> std::same_as<bool>;
       { loop.exit() } -> std::same_as<void>;
     };
 

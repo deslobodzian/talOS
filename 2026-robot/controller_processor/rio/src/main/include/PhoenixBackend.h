@@ -32,15 +32,11 @@ class PhoenixBackend final : public talos::hardware::Backend {
   bool ApplyOutputs(std::span<const talos::hardware::DigitalOutputRequest> digital_outputs,
                     std::span<const talos::hardware::PwmRequest> pwm_outputs) override;
   void Neutral() override;
-  // Item 35: precise failure behind the last false Configure().
+  // Precise failure behind the last false Configure().
   std::optional<talos::hardware::ConfigError> last_config_error() const override;
-  // Item 36: per-device reset detection (HasResetOccurred) and restore.
+  // Per-device reset detection (HasResetOccurred) and restore.
   bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override;
   bool RestoreAfterReset() override;
-  // Item 38: declares the mechanism currently at home_position_rot.
-  bool ZeroPosition(uint16_t motor_id, double home_position_rot) override;
-  // Item 39: supply rail measured off the first motor's supply signal.
-  talos::hardware::HealthSnapshot GetHealth() override;
 
  private:
   void UpdateSimulation(double dt);

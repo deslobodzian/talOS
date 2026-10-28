@@ -1,13 +1,9 @@
 #pragma once
 
-// Item 35: precise configuration failures.
-//
-// Backend::Configure() historically returned a bare bool, so a failed CAN
-// apply surfaced only as a latched gateway fault with no indication of which
-// device, bus, address, operation, or vendor status caused it. Backends that
-// can say more return it here; Gateway latches the most recent failure and
-// exposes it via Gateway::config_error() until the next successful
-// configuration clears it.
+// Precise configuration failures. Backends that can name the device, bus,
+// address, operation, and vendor status behind a failed Configure() return it
+// here; Gateway latches the most recent failure and exposes it via
+// Gateway::config_error() until the next successful configuration clears it.
 
 #include <optional>
 #include <string>

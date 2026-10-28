@@ -2,7 +2,7 @@
 
 // Physics-backed simulation backend for software tests.
 //
-// Two backends, two jobs (item 13):
+// Two backends, two jobs:
 //   SimBackend (sim_backend.h) ....... ideal actuators for fast logic tests.
 //     Velocity/position demands apply instantly; zero gains still move.
 //   PhysicsSimBackend (this file) .... believability for PID, gearing,
@@ -10,34 +10,34 @@
 //     controller voltage first; zero gains yield ~0 V and a stalled rotor,
 //     and nothing teleports.
 //
-// The motor/mechanism model below (item 14) is the one reusable model: motor
+// The motor/mechanism model below is the one reusable model: motor
 // type, gear ratio, inertia, friction, and load (roller/flywheel first). The
 // RoboRIO PhoenixBackend keeps its own first-order Kraken model (same 100 rps
-// at 12 V family); porting it onto this header is a follow-up, since the
-// GradleRIO build currently excludes sim_* headers (see build.gradle).
+// at 12 V family); the GradleRIO build excludes sim_* headers (see
+// build.gradle).
 //
-// Item 15: physics is driven by controller voltage output. Closed-loop modes
+// Physics is driven by controller voltage output. Closed-loop modes
 // emulate a TalonFX-style P+FF loop producing volts from the configured gain
 // slot; the volts then drive the rotor, whose position/velocity are written
 // back as mechanism units (rotor / gear ratio), per CTRE sim guidance that
 // sim state is fed from the device's voltage output, not from the demand.
 //
-// Item 16: sensors cross the hardware boundary. CANcoder samples mirror the
+// Sensors cross the hardware boundary. CANcoder samples mirror the
 // linked mechanism (motor.feedback_sensor_id); Pigeon yaw integrates the
 // chassis yaw rate set via SetChassisYawRate. Full swerve-chassis coupling is
 // future work; roller/flywheel mechanisms come first.
 //
-// Item 17: stopping is consistent. Commanded neutral (Mode::kNeutral, and
+// Stopping is consistent. Commanded neutral (Mode::kNeutral, and
 // Neutral() on disable/timeout/failure) removes drive and lets the rotor
 // decay per the motor's brake flag: brake stops quickly, coast rolls on. A
 // zero-velocity demand is instead an active standstill hold (when gains are
 // tuned); with zero gains it honestly cannot hold and coasts.
 //
-// Item 18: controlled inputs/faults. Beam breaks and limit-switch inputs via
+// Controlled inputs/faults. Beam breaks and limit-switch inputs via
 // SetDigitalInput, soft limits from MotorConfig enforced in physics, frozen
 // feedback, per-device disconnect, supply-voltage change, controller restart.
 //
-// Item 19: explicit sim clock, deterministic stepping. Read() derives dt from
+// Explicit sim clock, deterministic stepping. Read() derives dt from
 // state.sample_time_us deltas, so Gateway ticks with explicit timestamps are
 // exactly reproducible; Step() advances the models without a Gateway. No
 // wall-clock or randomness is consulted anywhere here. Scheduling and UDP
@@ -56,7 +56,7 @@
 
 namespace talos::hardware::sim {
 
-// (14) One reusable motor/mechanism model.
+// One reusable motor/mechanism model.
 enum class MotorType : uint8_t { kKrakenX60 = 0, kKrakenX44, kFalcon500, kGeneric };
 
 // Load reflected onto the rotor shaft. Roller/flywheel first; arm/elevator
@@ -89,7 +89,7 @@ struct MechanismModel {
   bool brake{true};
 };
 
-// Explicit sim clock (item 19). Tests advance this instead of sleeping.
+// Explicit sim clock. Tests advance this instead of sleeping.
 struct SimClock {
   uint64_t now_us{0};
   void Advance(uint64_t dt_us) { now_us += dt_us; }
@@ -144,7 +144,7 @@ inline AxisState StepAxis(const MotorModel& motor, const MechanismModel& mech,
   return out;
 }
 
-// Emulated controller voltage (item 15). Closed-loop modes run a P+FF loop on
+// Emulated controller voltage. Closed-loop modes run a P+FF loop on
 // the configured gain slot and clamp to the motor's voltage ceiling, so
 // missing gains honestly produce ~0 V. Returns false for commanded neutral
 // (unpowered); otherwise writes volts.
@@ -287,7 +287,7 @@ class PhysicsSimBackend final : public Backend {
         continue;
       }
       if (s.kind == SensorKind::kPigeon2) {
-        // Pigeon yaw comes from simulated chassis motion (item 16), never
+        // Pigeon yaw comes from simulated chassis motion, never
         // from a motor demand directly.
         out.valid = true;
         out.position_rot = yaw_rot_;
@@ -364,7 +364,7 @@ class PhysicsSimBackend final : public Backend {
   // Safe-state policy mirrors SimBackend: every output type turns off on
   // disable, command timeout, and failure (motors to kNeutral, PWM to 0,
   // digital outputs de-energized). Neutral removes drive but does NOT zero
-  // the rotors: they decay per brake/coast (item 17). Use RestartController
+  // the rotors: they decay per brake/coast. Use RestartController
   // to zero motion state.
   void Neutral() override {
     commands_ = {};
@@ -374,11 +374,11 @@ class PhysicsSimBackend final : public Backend {
     pwm_outputs_.clear();
   }
 
-  // Deterministic stepping without a Gateway (item 19): advances the models
+  // Deterministic stepping without a Gateway: advances the models
   // by dt_s under the currently applied commands.
   void Step(double dt_s) { StepModels(dt_s); }
 
-  // Controlled inputs/faults (item 18).
+  // Controlled inputs/faults.
   void SetDigitalInput(uint16_t id, bool value) { digital_inputs_[id] = value; }
   void SetAnalogInput(uint16_t id, double voltage) {
     analog_inputs_[id] = voltage;
@@ -386,7 +386,7 @@ class PhysicsSimBackend final : public Backend {
   void SetEncoder(uint16_t id, double position_rot, double velocity_rps) {
     encoders_[id] = {position_rot, velocity_rps};
   }
-  // Item 36: fault injection for reset handling. The next gateway Tick
+  // Fault injection for reset handling. The next gateway Tick
   // reports these logical IDs as reset; RestoreAfterReset re-applies the
   // motor-to-sensor mapping and zeroes rotor states, mirroring a device that
   // lost its configuration and position across the reset. The gateway drops
@@ -413,22 +413,6 @@ class PhysicsSimBackend final : public Backend {
     return !restore_fails_;
   }
   void SetRestoreFails(bool fails) { restore_fails_ = fails; }
-  // Item 38: declares the mechanism currently at `home_position_rot` by
-  // shifting the rotor state under the configured gearing.
-  bool ZeroPosition(uint16_t motor_id, double home_position_rot) override {
-    const int i = MotorIndex(motor_id);
-    if (i < 0) return false;
-    axes_[i].rotor_position_rot = home_position_rot * Gear(i);
-    axes_[i].rotor_velocity_rps = 0.0;
-    return true;
-  }
-  // Item 39: the physics fake measures the settable supply rail.
-  HealthSnapshot GetHealth() override {
-    HealthSnapshot snapshot;
-    snapshot.supply_voltage_v = supply_v_;
-    snapshot.supply_valid = true;
-    return snapshot;
-  }
   void FreezeFeedback(uint16_t motor_id) {
     if (const int i = MotorIndex(motor_id); i >= 0) frozen_[i] = true;
   }
@@ -461,7 +445,7 @@ class PhysicsSimBackend final : public Backend {
     yaw_rot_ = 0.0;
     yaw_rate_rps_ = 0.0;
   }
-  // Chassis motion driving the Pigeon (item 16), in mechanism rotations/s.
+  // Chassis motion driving the Pigeon, in mechanism rotations/s.
   void SetChassisYawRate(double yaw_rate_rps) { yaw_rate_rps_ = yaw_rate_rps; }
   double chassis_yaw_rot() const { return yaw_rot_; }
   double applied_voltage(std::size_t motor_index) const {

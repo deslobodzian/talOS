@@ -1,4 +1,4 @@
-namespace talos.shooter;
+namespace shooter;
 
 struct ShooterTarget {
   target_velocity_rps:double;
