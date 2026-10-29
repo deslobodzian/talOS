@@ -20,22 +20,22 @@ cc_library(
 
 talos_cc_node(
     name = "intake",
-    node_name = "intake",
     srcs = ["intake.cc"],
+    node_name = "intake",
     deps = [":mechanisms"],
 )
 
 talos_cc_node(
     name = "elevator",
-    node_name = "elevator",
     srcs = ["elevator.cc"],
+    node_name = "elevator",
     deps = [":mechanisms"],
 )
 
 talos_cc_node(
     name = "superstructure",
-    node_name = "superstructure",
     srcs = ["superstructure.cc"],
+    node_name = "superstructure",
     deps = [":mechanisms"],
 )
 
@@ -43,7 +43,10 @@ cc_test(
     name = "superstructure_test",
     size = "small",
     srcs = ["superstructure_test.cc"],
-    data = ["//examples/superstructure/config:robot.toml"],
+    data = [
+        "//examples/superstructure/config:robot.toml",
+        "//examples/superstructure/config:subsystems",
+    ],
     env = {"TALOS_TEST_CONFIG": "$(rlocationpath //examples/superstructure/config:robot.toml)"},
     deps = [
         ":mechanisms",

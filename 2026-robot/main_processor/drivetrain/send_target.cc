@@ -11,17 +11,19 @@
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 5)
+    if (argc != 5) {
       throw std::invalid_argument(
           "usage: send_target VX_MPS VY_MPS OMEGA_RADPS DURATION_S");
+    }
     const double vx = std::stod(argv[1]), vy = std::stod(argv[2]),
                  omega = std::stod(argv[3]);
     const int seconds = std::stoi(argv[4]);
     if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(omega) ||
-        seconds <= 0)
+        seconds <= 0) {
       throw std::invalid_argument("invalid target");
+    }
     ipc::Publisher<drivetrain::ChassisTarget> publisher{
-        drivetrain::kTargetTopic};
+        drivetrain::topics::kTarget};
     const auto end =
         std::chrono::steady_clock::now() + std::chrono::seconds{seconds};
     while (std::chrono::steady_clock::now() < end) {

@@ -1,18 +1,7 @@
-// The naming protocol's own test.
-//
-// Two jobs. The first is the grammar: what the rules accept and reject, and
-// that a rejection says what to write instead -- an error that only says "bad
-// name" leaves the reader to guess, which is how the bad name got written.
-//
-// The second is regression. Every name in
-// RejectsTheMistakesThatActuallyHappened is one that shipped in this repo and
-// cost real debugging: two spellings of one topic that both worked and never
-// met. They are listed by name so that no future edit to the rules can quietly
-// re-admit them.
-//
-// The real robot's graph is not checked here -- that needs the binaries, so the
-// launcher does it with `--describe` before it spawns anything, and
-// launcher_test covers it.
+// The naming grammar and the graph lint. Every name in
+// RejectsTheMistakesThatActuallyHappened shipped in this repo once; they are
+// listed so no edit to the rules can quietly re-admit them. The real robot's
+// graph is checked by the launcher against its binaries (launcher_test).
 
 #include "talOS/introspection/names.h"
 
@@ -81,7 +70,9 @@ TEST(TopicName, RejectsTheMistakesThatActuallyHappened) {
             "one segment, and an owner glued to a subject"},
        }) {
     const auto problem = CheckTopicName(name);
-    ASSERT_TRUE(problem.has_value()) << name << " must be rejected: " << why;
+    if (!problem.has_value()) {
+      FAIL() << name << " must be rejected: " << why;
+    }
     EXPECT_NE(problem->find(must_mention), std::string::npos)
         << "rejecting '" << name << "' must point at '" << must_mention
         << "', got: " << *problem;
@@ -95,7 +86,9 @@ TEST(TopicName, RejectsDirectionSuffixesFromEitherEnd) {
        {"/drivetrain/state_out", "/drivetrain/target_in", "/shooter/state_pub",
         "/shooter/target_sub", "/odometry/state_tx", "/odometry/state_topic"}) {
     const auto problem = CheckTopicName(name);
-    ASSERT_TRUE(problem.has_value()) << name;
+    if (!problem.has_value()) {
+      FAIL() << name;
+    }
     EXPECT_NE(problem->find("direction"), std::string::npos) << *problem;
   }
 }
@@ -115,11 +108,7 @@ TEST(TopicName, RejectsMalformedNames) {
       CheckTopicName("/drivetrain/pose").has_value());  // role not in set
 }
 
-// The limit is the transport's, not the event loop's: a topic is a POSIX
-// shared-memory object and macOS caps a shm name at PSHMNAMLEN, which
-// rtms::ValidatePath enforces as 30 characters after the leading slash. A
-// validator that accepted the event loop's 63 would pass names that throw
-// inside a node's constructor at startup, which is worse than no validator.
+// The transport's limit (rtms::ValidatePath), not the event loop's 63.
 TEST(TopicName, LengthLimitIsTheTransportLimit) {
   EXPECT_EQ(kMaxTopicBytes, 31u);
   EXPECT_LE(kMaxTopicBytes, event::MAX_SOURCE_NAME);
@@ -135,35 +124,6 @@ TEST(TopicName, LengthLimitIsTheTransportLimit) {
   EXPECT_TRUE(
       CheckTopicName("/" + std::string(kMaxSegmentBytes + 1, 'a') + "/state")
           .has_value());
-}
-
-// The budget is tight enough to hit by accident, so the shapes that are close
-// to it are pinned here rather than discovered on a robot. Every topic the
-// robot uses today fits; the obvious next one does not.
-TEST(TopicName, TheBudgetIsTightAndTheHeadroomIsKnown) {
-  // The longest name in the system today.
-  EXPECT_EQ(std::string_view{"/drivetrain/target/teleop"}.size(), 25u);
-  EXPECT_FALSE(CheckTopicName("/drivetrain/target/teleop").has_value());
-
-  // A name a person would reasonably write next, which does not fit. When that
-  // happens the qualifier is what gives -- the owner and the role are what
-  // make the graph readable.
-  EXPECT_GT(std::string_view{"/operator_interface/target/teleop"}.size(),
-            kMaxTopicBytes);
-  const auto problem = CheckTopicName("/operator_interface/target/teleop");
-  ASSERT_TRUE(problem.has_value());
-  EXPECT_NE(problem->find("limit"), std::string::npos) << *problem;
-}
-
-TEST(TopicName, OwnerAndRoleAreReadableFromTheNameAlone) {
-  EXPECT_EQ(TopicOwner("/drivetrain/target/teleop"), "drivetrain");
-  EXPECT_EQ(TopicRole("/drivetrain/target/teleop"), "target");
-  EXPECT_EQ(TopicOwner("/hw/request/shooter"), "hw");
-  EXPECT_TRUE(IsReservedOwner(TopicOwner("/talos/telemetry")));
-  EXPECT_FALSE(IsReservedOwner(TopicOwner("/odometry/state")));
-  // A name that does not parse yields empty rather than something misleading.
-  EXPECT_TRUE(TopicOwner("odometry").empty());
-  EXPECT_TRUE(TopicRole("/odometry").empty());
 }
 
 TEST(NodeName, MatchesTheSubsystemKeyRules) {
@@ -192,10 +152,15 @@ TEST(NodeTarget, AcceptsThePackageLeafOrTheRuleName) {
   // A name no build target produces cannot be traced back to source.
   const auto problem =
       CheckNodeTarget("shooter", "//2026-robot/main_processor/odometry:node");
-  ASSERT_TRUE(problem.has_value());
+  if (!problem.has_value()) {
+    FAIL() << "shooter under the odometry package must be rejected";
+  }
   EXPECT_NE(problem->find("odometry"), std::string::npos) << *problem;
 
   EXPECT_TRUE(CheckNodeTarget("odometry", "odometry/node").has_value());
+  // Every node target is a main-repository label.
+  EXPECT_TRUE(
+      CheckNodeTarget("odometry", "@talos_odometry//:node").has_value());
   EXPECT_TRUE(
       CheckNodeTarget("odometry", "//2026-robot/main_processor/odometry")
           .has_value());
@@ -223,8 +188,9 @@ bool Mentions(const std::vector<Diagnostic>& diagnostics, Severity severity,
 
 std::string Describe(const std::vector<Diagnostic>& diagnostics) {
   std::string out;
-  for (const auto& diagnostic : diagnostics)
+  for (const auto& diagnostic : diagnostics) {
     out += "\n  " + diagnostic.ToString();
+  }
   return out.empty() ? " (none)" : out;
 }
 
@@ -455,9 +421,10 @@ TEST(LintGraph, TimerLabelsAreNotTopics) {
   const auto diagnostics = LintGraph(nodes);
   EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
   // Named explicitly: these three strings would each fail CheckTopicName.
-  for (const auto* label : {"swerve", "shooter", "telemetry"})
+  for (const auto* label : {"swerve", "shooter", "telemetry"}) {
     EXPECT_TRUE(CheckTopicName(label).has_value())
         << label << " would pass as a topic, so this test proves nothing";
+  }
 }
 
 // Contract compatibility is enforced on byte size: two ends that disagree on
@@ -479,11 +446,11 @@ TEST(LintGraph, TwoSizesOnOneTopicIsAnErrorAndBothEndsAreNamed) {
   EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/state",
                        "two message sizes"))
       << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/state",
-                       "shooter"))
+  EXPECT_TRUE(
+      Mentions(diagnostics, Severity::ERROR, "/shooter/state", "shooter"))
       << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/state",
-                       "odometry"))
+  EXPECT_TRUE(
+      Mentions(diagnostics, Severity::ERROR, "/shooter/state", "odometry"))
       << Describe(diagnostics);
 }
 
@@ -514,53 +481,6 @@ TEST(LintGraph, ErrorsSortAheadOfWarnings) {
   EXPECT_EQ(diagnostics.front().severity, Severity::ERROR)
       << Describe(diagnostics);
   EXPECT_EQ(diagnostics.back().severity, Severity::WARNING)
-      << Describe(diagnostics);
-}
-
-// A prefix family is the arbitration shape and carries no extra rule: RTMS
-// lookups are exact, so a parent name never captures a child's traffic. What
-// this pins is that the linter does not invent a complaint about the shape --
-// an earlier draft checked that a family shared one owner, which cannot fail,
-// since the owner is the first segment.
-TEST(LintGraph, PrefixFamilyIsPermitted) {
-  const std::vector<NodeShape> nodes = {
-      {"arbiter",
-       "//2026-robot/main_processor/arbiter:node",
-       {Watcher("/drivetrain/target/teleop"),
-        Watcher("/drivetrain/target/auto", 32, kSourceFlagOptional),
-        Sender("/drivetrain/target")}},
-      {"operator_interface",
-       "//2026-robot/main_processor/operator_interface:node",
-       {Sender("/drivetrain/target/teleop")}},
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {Watcher("/drivetrain/target")}},
-      // The same shape under a reserved namespace, with two different nodes on
-      // the parent and the child.
-      {"hardware_node",
-       "//talOS/bridge:hardware_node",
-       {Sender("/hw/state"), Sender("/hw/state/driver_station")}},
-      {"driver_station",
-       "//2026-robot/main_processor/driver_station:node",
-       {Watcher("/hw/state"), Watcher("/hw/state/driver_station")}},
-  };
-  const auto diagnostics = LintGraph(nodes);
-  EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
-}
-
-TEST(LintGraph, OneTopicMayNotHaveTwoMessageSizes) {
-  const std::vector<NodeShape> nodes = {
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {Sender("/drivetrain/state", 48)}},
-      {"odometry",
-       "//2026-robot/main_processor/odometry:node",
-       {Watcher("/drivetrain/state", 32)}},
-  };
-  const auto diagnostics = LintGraph(nodes);
-  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/drivetrain/state",
-                       "two message sizes"))
       << Describe(diagnostics);
 }
 

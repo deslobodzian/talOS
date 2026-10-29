@@ -18,8 +18,9 @@ class Backend {
   virtual bool Configure(const Config&) = 0;
   virtual bool Read(State&) = 0;
   virtual bool Apply(std::span<const MotorRequest>) = 0;
-  virtual bool ApplyOutputs(std::span<const DigitalOutputRequest> /*digital_outputs*/,
-                            std::span<const PwmRequest> /*pwm_outputs*/) {
+  virtual bool ApplyOutputs(
+      std::span<const DigitalOutputRequest> /*digital_outputs*/,
+      std::span<const PwmRequest> /*pwm_outputs*/) {
     return true;
   }
   virtual void Neutral() = 0;

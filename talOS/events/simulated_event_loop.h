@@ -99,8 +99,8 @@ class SimulatedEventLoop
   MonotonicTime now_impl() const { return now_; }
 
   void arm_timer(std::uint16_t id, MonotonicTime deadline, Duration period) {
-    const bool record = this->timer_change_is_recorded(id, true, deadline,
-                                                       period);
+    const bool record =
+        this->timer_change_is_recorded(id, true, deadline, period);
     scheduler_.schedule(id, deadline, period);
     if (record) {
       this->record_operation(EventKind::ARM_TIMER, id, deadline, period);

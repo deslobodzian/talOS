@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -131,7 +132,9 @@ TEST(SimulatedEventLoop, TimerChangeFromAHandlerlessThreadDuringRunIsRejected) {
   loop.arm_timer(id, MonotonicTime::from_nanos(1'000'000), 1ms);
   loop.run_for(5ms);
 
-  ASSERT_TRUE(caught.has_value());
+  if (!caught.has_value()) {
+    FAIL() << "no logic_error caught";
+  }
   EXPECT_NE(std::string{caught->what()}.find("loop callback"),
             std::string::npos);
 }

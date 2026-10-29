@@ -1,6 +1,6 @@
-load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 # Types shared by every loop: time, dispatch context, callbacks, the source
 # manifest, the timer queue and the recorder policy. Header only, no OS calls.
@@ -103,8 +103,8 @@ cc_library(
         ":events_core",
         ":events_log",
         ":events_os",
-        "//talOS/ipc:ipc",
-        "//talOS/rtms:rtms",
+        "//talOS/ipc",
+        "//talOS/rtms",
         "@flatbuffers",
     ],
 )

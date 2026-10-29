@@ -21,7 +21,7 @@
 namespace talos::protocol {
 namespace {
 
-#if defined (_WIN32)
+#if defined(_WIN32)
 constexpr uintptr_t kInvalidSocket = static_cast<uintptr_t>(INVALID_SOCKET);
 using NativeSocket = SOCKET;
 

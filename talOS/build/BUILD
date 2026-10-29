@@ -1,1 +1,4 @@
-exports_files(["contract.bzl", "bundle_builder.py"])
+exports_files([
+    "contract.bzl",
+    "bundle_builder.py",
+])

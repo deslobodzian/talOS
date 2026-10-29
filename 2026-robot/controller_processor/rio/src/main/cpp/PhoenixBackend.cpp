@@ -37,7 +37,8 @@ uint32_t Age(const ph::BaseStatusSignal& signal) {
 }
 }  // namespace
 
-PhoenixBackend::PhoenixBackend(bool is_simulation) : is_simulation_{is_simulation} {}
+PhoenixBackend::PhoenixBackend(bool is_simulation)
+    : is_simulation_{is_simulation} {}
 
 std::optional<hw::ConfigError> PhoenixBackend::last_config_error() const {
   return last_error_;
@@ -96,8 +97,7 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       // Single-channel ctor reports fullRange 1, so Get() is raw rotations.
       dev.duty_cycle = std::make_unique<frc::DutyCycleEncoder>(e.dio_a);
     } else {
-      dev.quadrature =
-          std::make_unique<frc::Encoder>(e.dio_a, e.dio_b);
+      dev.quadrature = std::make_unique<frc::Encoder>(e.dio_a, e.dio_b);
       // Default k4X decoding counts every edge, and counts_per_rev is edges
       // per rev, so this reports rotations (Validate guarantees cpr > 0).
       dev.quadrature->SetDistancePerPulse(1.0 / e.counts_per_rev);
@@ -122,7 +122,7 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
               ? ph::signals::SensorDirectionValue::Clockwise_Positive
               : ph::signals::SensorDirectionValue::CounterClockwise_Positive;
       ok &= note_failure(s.name, s.bus, s.can_id, "apply_cancoder_config",
-                           device.encoder->GetConfigurator().Apply(cfg));
+                         device.encoder->GetConfigurator().Apply(cfg));
       signals_.push_back(&device.encoder->GetAbsolutePosition(false));
       signals_.push_back(&device.encoder->GetVelocity(false));
     } else {
@@ -230,10 +230,13 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
 bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
   // HasResetOccurred reports (and clears) one device's reset latch.
   reset_ids.clear();
-  for (std::size_t i = 0; i < motors_.size() && i < config_.motors.size(); ++i) {
-    if (motors_[i]->HasResetOccurred()) reset_ids.push_back(config_.motors[i].id);
+  for (std::size_t i = 0; i < motors_.size() && i < config_.motors.size();
+       ++i) {
+    if (motors_[i]->HasResetOccurred())
+      reset_ids.push_back(config_.motors[i].id);
   }
-  for (std::size_t i = 0; i < sensors_.size() && i < config_.sensors.size(); ++i) {
+  for (std::size_t i = 0; i < sensors_.size() && i < config_.sensors.size();
+       ++i) {
     const bool reset = sensors_[i].encoder
                            ? sensors_[i].encoder->HasResetOccurred()
                            : sensors_[i].imu->HasResetOccurred();
@@ -252,9 +255,10 @@ bool PhoenixBackend::RestoreAfterReset() {
 bool PhoenixBackend::Read(hw::State& s) {
   if (is_simulation_) {
     const auto now = std::chrono::steady_clock::now();
-    double dt = last_sim_time_
-                    ? std::chrono::duration<double>(now - *last_sim_time_).count()
-                    : 0.005;
+    double dt =
+        last_sim_time_
+            ? std::chrono::duration<double>(now - *last_sim_time_).count()
+            : 0.005;
     if (dt <= 0.0 || dt > 0.05) dt = 0.005;
     last_sim_time_ = now;
     UpdateSimulation(dt);
@@ -351,12 +355,11 @@ bool PhoenixBackend::Read(hw::State& s) {
       dev.last_time = now;
       out.position_rot = pos;
       out.velocity_rps = vel;
-      out.valid = dev.duty_cycle->IsConnected() &&
-                  std::isfinite(pos) && std::isfinite(vel);
+      out.valid = dev.duty_cycle->IsConnected() && std::isfinite(pos) &&
+                  std::isfinite(vel);
       out.age_us = 0;
     } else {
-      const double pos =
-          dev.quadrature->GetDistance() - dev.config.offset_rot;
+      const double pos = dev.quadrature->GetDistance() - dev.config.offset_rot;
       const double vel = dev.quadrature->GetRate();
       out.position_rot = pos;
       out.velocity_rps = vel;

@@ -1,6 +1,8 @@
 // Messages for //talOS/python:talos_test.
 namespace demo;
 
+enum Phase : ubyte { IDLE, MOVING, HOLDING = 5 }
+
 struct Goal {
   height_rot:double;
   enabled:bool;
@@ -11,4 +13,9 @@ struct Status {
   height_rot:double;
   at_goal:bool;
   tick:ulong;
+}
+
+struct Report {
+  phase:Phase;
+  height_rot:double;
 }

@@ -29,8 +29,9 @@ TEST(FrameTest, EncodesAndDecodesHeader) {
 
 TEST(FrameTest, RoundTripsPayloadBytes) {
   std::array<uint8_t, kMaxPayloadSize> payload{};
-  for (std::size_t i = 0; i < payload.size(); ++i)
+  for (std::size_t i = 0; i < payload.size(); ++i) {
     payload[i] = static_cast<uint8_t>(i * 7);
+  }
 
   std::array<uint8_t, kMaxFrameSize> frame{};
   const std::size_t size =
@@ -49,10 +50,10 @@ TEST(FrameTest, RejectsOversizePayload) {
   std::array<uint8_t, kMaxPayloadSize + 1> payload{};
   std::array<uint8_t, kMaxFrameSize + 1> frame{};
 
-  EXPECT_EQ(EncodeFrame(FrameType::kHardwareState, kFlagNone, 1, 2,
-                        payload.data(), payload.size(), frame.data(),
-                        frame.size()),
-            0u);
+  EXPECT_EQ(
+      EncodeFrame(FrameType::kHardwareState, kFlagNone, 1, 2, payload.data(),
+                  payload.size(), frame.data(), frame.size()),
+      0u);
 }
 
 TEST(FrameTest, EncodesInPlaceWithoutPayloadCopy) {

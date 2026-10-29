@@ -1,0 +1,26 @@
+# One motion-magic TalonFX. Positions are drum rotations
+# (sensor_to_mechanism_ratio applies the gearbox on the controller).
+[subsystem]
+name = "elevator"
+period_us = 10000
+tolerance_rot = 0.1  # at_goal when within this of the goal
+
+[motors.lift]
+type = "TalonFX"
+bus = "rio"
+can_id = 2
+inverted = false
+brake = true
+supply_limit_a = 40.0
+stator_limit_a = 80.0
+max_voltage = 12.0
+sensor_to_mechanism_ratio = 9.0
+max_velocity_rps = 12.0
+cruise_velocity_rps = 8.0
+acceleration_rps2 = 24.0
+jerk_rps3 = 0.0
+soft_limits = true
+reverse_limit_rot = 0.0
+forward_limit_rot = 12.0
+# kG holds the carriage against gravity; kV/kA feed the motion-magic profile.
+slot0 = { p = 4.0, i = 0.0, d = 0.1, s = 0.1, v = 1.1, a = 0.02, g = 0.35 }

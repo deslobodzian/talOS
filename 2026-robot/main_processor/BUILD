@@ -4,6 +4,7 @@ package(default_visibility = ["//visibility:public"])
 
 talos_bundle(
     name = "robot_bundle",
+    config = "//2026-robot/main_processor/configuration:robot.toml",
     nodes = [
         "//talOS/bridge:hardware_node",
         "//2026-robot/main_processor/arbiter:node",
@@ -16,7 +17,6 @@ talos_bundle(
         "//2026-robot/main_processor/telemetry:node",
         "//2026-robot/main_processor/simulation:sim_gateway",
     ],
-    config = "//2026-robot/main_processor/configuration:robot.toml",
     subsystems = [
         "//2026-robot/main_processor/configuration:subsystems/arbiter.toml",
         "//2026-robot/main_processor/configuration:subsystems/driver_station.toml",

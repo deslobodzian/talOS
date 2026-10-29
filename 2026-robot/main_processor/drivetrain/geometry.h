@@ -87,7 +87,8 @@ inline const talos::hardware::SensorConfig& SubsystemCANcoder(
   const auto* sensor =
       owned ? detail::Owned(config.hardware.sensors, owned->sensors, name)
             : nullptr;
-  if (sensor == nullptr || sensor->kind != talos::hardware::SensorKind::kCANcoder)
+  if (sensor == nullptr ||
+      sensor->kind != talos::hardware::SensorKind::kCANcoder)
     throw std::invalid_argument(std::string{subsystem} +
                                 ": no CANcoder named '" + std::string{name} +
                                 "'");
@@ -132,7 +133,8 @@ inline SwerveGeometry BuildSwerveGeometry(
             : default_radius_m;
     module.drive = detail::RequiredString(*entry, "drive", where);
     module.steer = detail::RequiredString(*entry, "steer", where);
-    const std::string encoder = detail::RequiredString(*entry, "encoder", where);
+    const std::string encoder =
+        detail::RequiredString(*entry, "encoder", where);
 
     const auto& drive = SubsystemMotor(config, subsystem, module.drive);
     const auto& steer = SubsystemMotor(config, subsystem, module.steer);
@@ -148,7 +150,8 @@ inline SwerveGeometry BuildSwerveGeometry(
     if (steer.feedback == talos::hardware::Feedback::kRemoteCANcoder &&
         steer.feedback_sensor_id != cancoder.id)
       throw std::invalid_argument(
-          where + ": steer motor's feedback sensor is not this module's encoder");
+          where +
+          ": steer motor's feedback sensor is not this module's encoder");
   }
   return out;
 }
@@ -158,8 +161,8 @@ inline SwerveGeometry BuildSwerveGeometry(
   const std::string name{subsystem};
   const toml::table* geometry = config.GetSubsystemTable(name, "geometry");
   if (!geometry)
-    throw std::invalid_argument("configuration is missing [subsystems." +
-                                name + ".geometry]");
+    throw std::invalid_argument("configuration is missing [subsystems." + name +
+                                ".geometry]");
   return BuildSwerveGeometry(config, subsystem, *geometry);
 }
 

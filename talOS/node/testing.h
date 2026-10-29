@@ -22,6 +22,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "talOS/node/node.h"
 #include "talOS/node/sim_access.h"
@@ -61,6 +62,9 @@ class Sim {
     detail::SimAccess::read_raw(*this, topic, sizeof(M), count - 1, &message);
     return message;
   }
+  // The newest message a node sent with publish_bytes on `topic`, as sent.
+  std::optional<std::vector<std::byte>> latest_bytes(
+      std::string_view topic) const;
 
   Node& node(std::string_view node_name);
 

@@ -160,10 +160,16 @@ void LogWriter::State::append(RecordHeader header,
                               std::span<const std::byte> payload) noexcept {
   if (failed || capture_error.load() != CaptureError::NONE) return;
 
+  // Fixed-size messages are mostly trailing padding. Only the bytes up to the
+  // last non-zero one are stored; the reader restores the rest.
+  std::size_t stored = payload.size();
+  while (stored > 0 && payload[stored - 1] == std::byte{0}) --stored;
+
   header.magic = RECORD_MAGIC;
   header.payload_bytes = static_cast<std::uint32_t>(payload.size());
-  header.reserved = 0;
+  header.stored_bytes = static_cast<std::uint32_t>(stored);
   header.crc32 = 0;
+  payload = payload.first(stored);
 
   const std::uint32_t crc_after_header =
       crc32(as_bytes(&header, sizeof(header)));

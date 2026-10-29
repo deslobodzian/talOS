@@ -1,6 +1,7 @@
 #pragma once
 
-#include <cstring>
+#include <algorithm>
+#include <cstddef>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -83,19 +84,17 @@ class ReplayEventLoop
   // Firings come from the log, but the program must reproduce timer changes.
   void arm_timer(std::uint16_t id, MonotonicTime deadline, Duration period) {
     if (!this->timer_change_is_recorded(id, true, deadline, period)) return;
-    std::span<const std::byte> payload;
-    const auto* header = take(EventKind::ARM_TIMER, id, payload);
-    if (header &&
-        (header->event_time_ns != deadline.nanos() ||
-         header->sequence != static_cast<std::uint64_t>(period.count()))) {
+    const Recorded* recorded = take(EventKind::ARM_TIMER, id);
+    if (recorded && (recorded->header.event_time_ns != deadline.nanos() ||
+                     recorded->header.sequence !=
+                         static_cast<std::uint64_t>(period.count()))) {
       report(Divergence{active_dispatch_, id, "timer schedule changed"});
     }
     this->record_operation(EventKind::ARM_TIMER, id, deadline, period);
   }
   void disarm_timer(std::uint16_t id) {
     if (!this->timer_change_is_recorded(id, false, {}, {})) return;
-    std::span<const std::byte> payload;
-    take(EventKind::DISARM_TIMER, id, payload);
+    take(EventKind::DISARM_TIMER, id);
     this->record_operation(EventKind::DISARM_TIMER, id);
   }
 
@@ -159,18 +158,38 @@ class ReplayEventLoop
     now_ = reader.start_time();
     this->set_start_time(now_);
 
+    // Keep only the stored bytes: the zero tail is restored where a payload
+    // is used, so a long replay holds what the file holds, not the padding.
     log::LogReader::Record record{};
     reader.rewind();
     while (reader.next(record)) {
-      records_.push_back(record);
+      records_.push_back(Recorded{record.header, stored_.size()});
+      const auto bytes = record.payload.first(record.header.stored_bytes);
+      stored_.insert(stored_.end(), bytes.begin(), bytes.end());
     }
+  }
+
+  struct Recorded {
+    log::RecordHeader header;
+    std::size_t offset;  // of its stored bytes in stored_
+  };
+
+  std::span<const std::byte> stored(const Recorded& record) const {
+    return {stored_.data() + record.offset, record.header.stored_bytes};
+  }
+
+  // The recorded payload at full size. Valid until the next call.
+  std::span<const std::byte> full_payload(const Recorded& record) {
+    const std::span<const std::byte> bytes = stored(record);
+    payload_.assign(record.header.payload_bytes, std::byte{0});
+    std::copy(bytes.begin(), bytes.end(), payload_.begin());
+    return payload_;
   }
 
   void on_register(const Registration&) {}
   void on_exit_requested() {}
   void on_handler_exit() {
-    std::span<const std::byte> payload;
-    take(EventKind::HANDLER_EXIT, this->context().source_id, payload);
+    take(EventKind::HANDLER_EXIT, this->context().source_id);
   }
 
   static bool is_operation(EventKind kind) {
@@ -194,8 +213,8 @@ class ReplayEventLoop
   }
 
   void replay_dispatch() {
-    const log::RecordHeader header = records_[cursor_].header;
-    const std::span<const std::byte> payload = records_[cursor_].payload;
+    const Recorded& record = records_[cursor_];
+    const log::RecordHeader header = record.header;
     ++cursor_;
 
     now_ = MonotonicTime::from_nanos(header.now_ns);
@@ -214,7 +233,7 @@ class ReplayEventLoop
       this->dispatch_timer(header.source_id, event_time, now_, header.sequence);
     } else {
       this->dispatch_message(header.source_id, event_time, now_,
-                             header.sequence, header.aux, payload);
+                             header.sequence, header.aux, full_payload(record));
     }
 
     active_dispatch_ = 0;
@@ -239,8 +258,7 @@ class ReplayEventLoop
 
   // Consumes the record a handler operation must correspond to, or reports the
   // mismatch. Returns nullptr when there is nothing usable.
-  const log::RecordHeader* take(EventKind expected, std::uint16_t source_id,
-                                std::span<const std::byte>& payload) {
+  const Recorded* take(EventKind expected, std::uint16_t source_id) {
     if (cursor_ >= records_.size()) {
       report(Divergence{active_dispatch_, source_id,
                         std::string{"program performed an extra "} +
@@ -261,33 +279,39 @@ class ReplayEventLoop
       return nullptr;
     }
 
-    payload = records_[cursor_].payload;
-    ++cursor_;
-    return &header;
+    return &records_[cursor_++];
   }
 
   SendOutcome send_impl(std::uint16_t id, std::span<const std::byte> bytes) {
-    std::span<const std::byte> recorded{};
-    const log::RecordHeader* header = take(EventKind::SEND, id, recorded);
+    const Recorded* recorded = take(EventKind::SEND, id);
 
-    if (header == nullptr) {
+    if (recorded == nullptr) {
       return SendOutcome{SendStatus::FAILED, 0};
     }
 
-    if (recorded.size() != bytes.size() ||
-        std::memcmp(recorded.data(), bytes.data(), bytes.size()) != 0) {
+    // Compared against the stored bytes plus the zero tail they stand for,
+    // without expanding them.
+    const log::RecordHeader& header = recorded->header;
+    const std::span<const std::byte> prefix = stored(*recorded);
+    if (bytes.size() != header.payload_bytes ||
+        !std::equal(prefix.begin(), prefix.end(), bytes.begin()) ||
+        std::any_of(bytes.begin() + static_cast<std::ptrdiff_t>(prefix.size()),
+                    bytes.end(),
+                    [](std::byte b) { return b != std::byte{0}; })) {
       report(Divergence{active_dispatch_, id,
                         "sent different bytes on source " + source_name(id)});
     }
 
     // Report the recorded outcome so a re-recorded replay reproduces the
     // original log exactly rather than the transport's current state.
-    return SendOutcome{static_cast<SendStatus>(header->aux), header->sequence};
+    return SendOutcome{static_cast<SendStatus>(header.aux), header.sequence};
   }
 
   log::LogReader* reader_;
   Options options_;
-  std::vector<log::LogReader::Record> records_;
+  std::vector<Recorded> records_;
+  std::vector<std::byte> stored_;   // every record's stored bytes, in order
+  std::vector<std::byte> payload_;  // the dispatch payload being replayed
   std::vector<Divergence> divergences_;
   std::size_t cursor_{0};
   std::uint64_t active_dispatch_{0};

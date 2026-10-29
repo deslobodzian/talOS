@@ -29,6 +29,12 @@ _NS = 1e9
 MotorRequest = collections.namedtuple("MotorRequest",
                                       "mode demand ff_volts slot")
 
+# One joystick for SimHardware.set_driver_station: axes in [-1, 1], the
+# pressed buttons by their 1-based numbers (button_count defaults to the
+# highest), and POV angles (-1 centred).
+Stick = collections.namedtuple("Stick", "axes buttons povs name button_count",
+                               defaults=((), (), (), "", None))
+
 
 class Sim:
     """One simulated clock hosting several nodes; topics are in memory."""
@@ -126,6 +132,41 @@ class SimHardware:
     def set_gyro(self, node, device, yaw, yaw_rate):
         self._set(lib.talos_sim_hardware_set_gyro, node, device, yaw, yaw_rate)
 
+    def set_connected(self, node, device, connected):
+        """A disconnected device reports connected False (a motor's sample
+        is invalid) and reads 0; every device of `node` named `device`."""
+        self._set(lib.talos_sim_hardware_set_connected, node, device,
+                  bool(connected))
+
+    def set_driver_station(self, *, enabled=False, autonomous=False,
+                           teleop=False, test=False, estop=False,
+                           attached=True, fms_attached=False,
+                           alliance=talos.Alliance.UNKNOWN, station=0,
+                           match_time=0.0, joysticks=()):
+        """The Driver Station packet to forward every period from now on.
+
+            hw.set_driver_station(enabled=True, teleop=True,
+                                  joysticks=[Stick(axes=(0.0, -1.0),
+                                                   buttons=(1,))])
+        """
+        if len(joysticks) > _abi.DS_MAX_JOYSTICKS:
+            raise ValueError(f"at most {_abi.DS_MAX_JOYSTICKS} joysticks")
+        flags = 0
+        for on, flag in ((attached, _abi.DS_ATTACHED),
+                         (fms_attached, _abi.DS_FMS_ATTACHED),
+                         (enabled, _abi.DS_ENABLED),
+                         (autonomous, _abi.DS_AUTONOMOUS),
+                         (teleop, _abi.DS_TELEOP), (test, _abi.DS_TEST),
+                         (estop, _abi.DS_ESTOP)):
+            flags |= flag if on else 0
+        packet = _abi.DriverStationPacket(flags=flags, alliance=int(alliance),
+                                          station=station,
+                                          match_time_s=match_time)
+        for port, stick in enumerate(joysticks):
+            packet.joysticks[port] = _joystick(stick)
+        _abi.ok(lib.talos_sim_hardware_set_driver_station(self._handle,
+                                                          packet))
+
     def motor_request(self, node, device):
         """The last request `node` flushed for `device` (neutral before any):
         (mode, demand, ff_volts, slot)."""
@@ -148,3 +189,21 @@ class SimHardware:
     def _set(self, function, node, device, *values):
         _abi.ok(function(self._handle, _abi.encode(node), _abi.encode(device),
                          *values))
+
+
+def _joystick(stick):
+    axes, buttons, povs = tuple(stick.axes), tuple(stick.buttons), tuple(
+        stick.povs)
+    if (len(axes) > _abi.DS_MAX_AXES or len(povs) > _abi.DS_MAX_POVS
+            or not all(1 <= b <= 32 for b in buttons)):
+        raise ValueError(f"{stick}: at most {_abi.DS_MAX_AXES} axes and "
+                         f"{_abi.DS_MAX_POVS} POVs, buttons 1-32")
+    out = _abi.Joystick(
+        connected=1, axis_count=len(axes), pov_count=len(povs),
+        button_count=(stick.button_count if stick.button_count is not None
+                      else max(buttons, default=0)),
+        buttons=sum(1 << (b - 1) for b in set(buttons)),
+        name=stick.name.encode()[:_abi.DS_NAME_LENGTH])
+    out.axes[:len(axes)] = axes
+    out.povs[:len(povs)] = povs
+    return out

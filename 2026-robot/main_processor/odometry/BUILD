@@ -2,31 +2,31 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
 
-# OdometryState (namespace odometry) and the odometry topic. Telemetry
-# consumes it.
+# OdometryState (namespace odometry) and the odometry topic: the fused field
+# pose is odometry's own state. Telemetry consumes it.
 talos_messages(
     name = "messages",
     srcs = ["odometry_message.fbs"],
-    hdrs = ["topics.h"],
+    topics = {"state": "/odometry/state"},
 )
 
 cc_library(
     name = "odometry",
     hdrs = ["odometry.h"],
-    strip_include_prefix = ".",
     include_prefix = "odometry",
+    strip_include_prefix = ".",
+    visibility = ["//visibility:private"],
     deps = [
         ":messages",
         "//2026-robot/main_processor/drivetrain:messages",
         "//talOS/node",
     ],
-    visibility = ["//visibility:private"],
 )
 
 talos_cc_node(
     name = "node",
-    node_name = "odometry",
     srcs = ["odometry.cc"],
+    node_name = "odometry",
     deps = [":odometry"],
 )
 

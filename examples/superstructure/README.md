@@ -48,11 +48,11 @@ same C++ code, so both languages behave identically.
 ```
 messages/          shared by the C++ and Python nodes
   intake.fbs  elevator.fbs  superstructure.fbs   namespace demo; structs + enums
-  topics.h                                       topic names
-  BUILD                                          talos_messages(include_prefix = "demo")
+  BUILD                                          talos_messages(topics = {...}, include_prefix = "demo")
 config/
-  robot.toml       the example robot (single-file layout), launching cpp/
-  robot_py.toml    the same robot, launching py/ (only the `node =` lines differ)
+  subsystems/      intake.toml  elevator.toml  superstructure.toml: devices + params
+  robot.toml       the example robot's manifest, launching cpp/
+  robot_py.toml    the same manifest, launching py/ (only the `node =` lines differ)
 cpp/               the C++ nodes and their test
 py/                the Python nodes and their test
 ```
@@ -71,8 +71,7 @@ break, and it checks the roller voltages, the elevator's motion-magic demand,
 the robot neutralizes every motor while every state machine keeps its state,
 and that stale mechanism states never advance the superstructure.
 `py/superstructure_test.py` runs the same scenarios on the Python nodes with
-`talos.testing.Sim`. `config/config_test.py` checks that the two config files
-differ only in their `node =` lines.
+`talos.testing.Sim` and `config/robot_py.toml`.
 
 ## Run it in simulation
 
@@ -121,8 +120,10 @@ Take a wrist that goes to an angle as an example.
    Use structs only, with no tables or strings. C++ gets
    `#include "demo/wrist_generated.h"` and `demo::WristGoal`, with enums
    spelled `WristState::MOVING`. Python gets `from demo.WristGoal import
-   WristGoal`. Add the topic names (`/wrist/target`, `/wrist/state`) to
-   `messages/topics.h`.
+   WristGoal`. Add the topic names to `topics` in `messages/BUILD`:
+   `"wrist_goal": "/wrist/target", "wrist_status": "/wrist/state"`. C++ reads
+   them as `topics::kWristGoal` (`#include "demo/topics.h"`), Python as
+   `topics.WRIST_GOAL` (`from demo import topics`).
 2. **The class** (`cpp/wrist.h`):
    ```cpp
    class Wrist {
@@ -130,8 +131,8 @@ Take a wrist that goes to an angle as an example.
      using State = WristState;
      explicit Wrist(talos::Node& node)
          : motor_{node, "motor"},
-           goal_{node.subscribe<WristGoal>(kWristGoalTopic)},
-           status_{node.publish<WristStatus>(kWristStatusTopic)},
+           goal_{node.subscribe<WristGoal>(topics::kWristGoal)},
+           status_{node.publish<WristStatus>(topics::kWristStatus)},
            sm_{node, State::STOWED},
            tolerance_rot_{node.param<double>("tolerance_rot")} {}
      void update() {
@@ -165,22 +166,30 @@ Take a wrist that goes to an angle as an example.
    talos_py_node(name = "wrist", node_name = "wrist", main = "wrist.py", class_name = "Wrist",
                  deps = ["//examples/superstructure/messages:messages_py"])
    ```
-4. **Config** (`config/robot.toml`, and the same block in `robot_py.toml`
-   with `node = "//examples/superstructure/py:wrist"`):
+4. **Config.** Add `config/subsystems/wrist.toml`:
    ```toml
-   [subsystems.wrist]
-   node = "//examples/superstructure/cpp:wrist"
+   [subsystem]
+   name = "wrist"
    period_us = 10000
    tolerance_rot = 0.02
 
-   [subsystems.wrist.motors.motor]
+   [motors.motor]
    type = "TalonFX"
    can_id = 3
    cruise_velocity_rps = 2.0
    acceleration_rps2 = 8.0
    slot0 = { p = 30.0, i = 0.0, d = 0.5, s = 0.1, v = 0.0, a = 0.0, g = 0.2 }
    ```
-   The device key (`motors.motor`) is the name you give the handle.
+   and list it in `config/robot.toml`:
+   ```toml
+   [[subsystems]]
+   name = "wrist"
+   path = "subsystems/wrist.toml"
+   node = "//examples/superstructure/cpp:wrist"
+   ```
+   `robot_py.toml` gets the same entry with
+   `node = "//examples/superstructure/py:wrist"`. The device key
+   (`motors.motor`) is the name you give the handle.
 5. **Test** it in `cpp/superstructure_test.cc` or a test of its own (Python:
    the same calls on `talos.testing.Sim`, with durations in seconds):
    ```cpp
@@ -189,10 +198,10 @@ Take a wrist that goes to an angle as an example.
    SimHardware hw{sim};
    hw.enable();
    hw.ideal_motors();
-   sim.publish(kWristGoalTopic, WristGoal{0.25});
+   sim.publish(topics::kWristGoal, WristGoal{0.25});
    sim.step(50ms);
    EXPECT_EQ(hw.motor_request("wrist", "motor").mode, Mode::kMotionMagic);
-   EXPECT_TRUE(sim.latest<WristStatus>(kWristStatusTopic)->at_goal());
+   EXPECT_TRUE(sim.latest<WristStatus>(topics::kWristStatus)->at_goal());
    ```
 
 ## Python twin
@@ -215,9 +224,9 @@ class Elevator {
   explicit Elevator(talos::Node& node)
       : lift_{node, "lift"},
         goal_{node.subscribe<ElevatorGoal>(
-            kElevatorGoalTopic)},
+            topics::kElevatorGoal)},
         status_{node.publish<ElevatorStatus>(
-            kElevatorStatusTopic)},
+            topics::kElevatorStatus)},
         sm_{node, State::STOWED},
         tolerance_rot_{
             node.param<double>("tolerance_rot")} {}
@@ -253,16 +262,17 @@ TALOS_NODE(demo::Elevator)  // elevator.cc
 </td><td>
 
 ```python
+from demo import topics
 from demo.ElevatorState import ElevatorState as State
 
 class Elevator:
     def __init__(self, node):
         self.lift = talos.Motor(node, "lift")
         self.goal = node.subscribe(
-            ElevatorGoal, "/elevator/target")
+            ElevatorGoal, topics.ELEVATOR_GOAL)
         self.status = node.publish(
-            ElevatorStatus, "/elevator/state")
-        self.sm = talos.StateMachine(node, State.STOWED)
+            ElevatorStatus, topics.ELEVATOR_STATUS)
+        self.sm = talos.StateMachine(node, State.STOWED, states=State)
         self.tolerance_rot = node.param("tolerance_rot")
         self.goal_rot = 0.0
 
@@ -297,5 +307,5 @@ Python reads message fields as snake_case attributes named as in the .fbs
 (`goal.value.height_rot`), and `send(**fields)` takes the same names; any
 field you leave out is 0. A schema enum is a flatc class of int constants
 (`from demo.IntakeCommand import IntakeCommand`, then `IntakeCommand.EJECT`).
-Python has no topics module, so the topic names are written out; they match
-`messages/topics.h`.
+Topic names come from the same `topics` dict as C++'s: `topics.ELEVATOR_GOAL`
+is `topics::kElevatorGoal`.

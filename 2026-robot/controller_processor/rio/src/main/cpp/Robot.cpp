@@ -53,8 +53,9 @@ void ObserveMode() {
 // disabled and you enable it and pick Teleoperated in the simulation GUI.
 //
 //   TALOS_SIM_DS=1                        enable in teleop at startup
-//   TALOS_SIM_DS=0                        attach a Driver Station, stay disabled
-//   TALOS_SIM_DS=auto                     stay disabled until the gateway is
+//   TALOS_SIM_DS=0                        attach a Driver Station, stay
+//   disabled TALOS_SIM_DS=auto                     stay disabled until the
+//   gateway is
 //                                         configured, then enable in teleop
 //   TALOS_SIM_DS_DISABLE_AFTER_MS=2000    ... then disable two seconds in
 //   TALOS_SIM_RUN_MS=10000                stop after ten seconds and report
@@ -158,9 +159,11 @@ void Robot::StartCompetition() {
     endpoint_.reset();
   }
 
-  std::printf("hardware gateway config=%llu commissioned=%d (waiting for config push)\n",
-              static_cast<unsigned long long>(gateway_->snapshot().config_id),
-              gateway_->configured() ? gateway_->config().commissioned : 0);
+  std::printf(
+      "hardware gateway config=%llu commissioned=%d (waiting for config "
+      "push)\n",
+      static_cast<unsigned long long>(gateway_->snapshot().config_id),
+      gateway_->configured() ? gateway_->config().commissioned : 0);
 
   // Tells the Driver Station that robot code is up. Everything that can block
   // for a long time, in particular configuring devices over CAN, has happened
@@ -249,6 +252,14 @@ void Robot::StartCompetition() {
       (final_state.flags & talos::hardware::kCommandActive) != 0);
   std::fflush(stdout);
 #endif
+
+  // WPILib keeps the robot in a function-local static, so anything still held
+  // here would be destroyed during static destruction at exit, racing the
+  // Phoenix and HAL statics it depends on ("mutex lock failed" aborts). Release
+  // the hardware while those libraries are still alive.
+  endpoint_.reset();
+  gateway_.reset();
+  backend_.reset();
 }
 
 void Robot::EndCompetition() {

@@ -5,16 +5,30 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string_view>
 
 #include "talOS/events/callback.h"
 #include "talOS/events/time.h"
 
+namespace talos {
+struct BytePublishOptions;
+}  // namespace talos
+
 namespace talos::detail {
 
 using Time = event::MonotonicTime;
 using Duration = event::Duration;
+
+// Where Node::publish_bytes writes: a topic outside the loop.
+class ByteTopic {
+ public:
+  virtual ~ByteTopic() = default;
+  // False when the message was not published (a drop_newest queue was full).
+  // The caller has checked the length against max_bytes.
+  virtual bool write(std::span<const std::byte> message) = 0;
+};
 
 // The loop a Node is registered on, with the loop type erased. The three loop
 // types share a CRTP base rather than a virtual interface, because a handler
@@ -36,10 +50,18 @@ class LoopPort {
   virtual void arm_timer(std::uint16_t id, Time first, Duration period) = 0;
   virtual bool send(std::uint16_t id, std::span<const std::byte> bytes) = 0;
   virtual Time now() const = 0;
+
+  // The world outside the loop: a byte topic, which the loop neither
+  // dispatches nor logs. By default an RTMS queue created on the first write,
+  // so building a node (as --describe does) opens no shared memory;
+  // testing::Sim keeps byte topics in memory instead.
+  virtual std::unique_ptr<ByteTopic> open_byte_topic(
+      std::string_view topic, std::size_t max_bytes,
+      const BytePublishOptions& options);
 };
 
 template <class Loop>
-class LoopPortFor final : public LoopPort {
+class LoopPortFor : public LoopPort {
  public:
   explicit LoopPortFor(Loop& loop) : loop_{loop} {}
 

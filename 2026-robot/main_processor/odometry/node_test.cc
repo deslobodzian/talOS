@@ -35,9 +35,9 @@ std::string Runfile(const char* env) {
 class OdometryTest : public ::testing::Test {
  protected:
   OdometryState Drive(const DrivetrainState& state) {
-    sim.publish(drivetrain::kStateTopic, state);
+    sim.publish(drivetrain::topics::kState, state);
     sim.step(10ms);
-    const auto pose = sim.latest<OdometryState>(kStateTopic);
+    const auto pose = sim.latest<OdometryState>(topics::kState);
     EXPECT_TRUE(pose.has_value());
     return pose.value_or(OdometryState{});
   }

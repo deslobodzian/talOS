@@ -1,12 +1,16 @@
 // The test-harness section of node_api.h: talos::testing::Sim and
 // SimHardware. Linked only into libtalos_node_testing.so.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 
 #include "talOS/devices/testing.h"
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/node/sim_access.h"
 #include "talOS/node/testing.h"
@@ -101,8 +105,8 @@ int32_t talos_sim_publish_raw(TalosSim* sim, const char* topic,
   });
 }
 
-int32_t talos_sim_latest_raw(const TalosSim* sim, const char* topic,
-                             void* out, uint32_t size) {
+int32_t talos_sim_latest_raw(const TalosSim* sim, const char* topic, void* out,
+                             uint32_t size) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     const Sim& s = AsSim(sim);
     const char* t = NonNull(topic, "topic");
@@ -178,15 +182,15 @@ int32_t talos_sim_hardware_set_encoder(TalosSimHardware* hw, const char* node,
                                        const char* device, double position,
                                        double velocity) {
   return Guard<int32_t>(TALOS_ERR, [&] {
-    AsHardware(hw).set_encoder(NonNull(node, "node"),
-                               NonNull(device, "device"), position, velocity);
+    AsHardware(hw).set_encoder(NonNull(node, "node"), NonNull(device, "device"),
+                               position, velocity);
     return TALOS_OK;
   });
 }
 
-int32_t talos_sim_hardware_set_cancoder(TalosSimHardware* hw,
-                                        const char* node, const char* device,
-                                        double position, double velocity) {
+int32_t talos_sim_hardware_set_cancoder(TalosSimHardware* hw, const char* node,
+                                        const char* device, double position,
+                                        double velocity) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     AsHardware(hw).set_cancoder(NonNull(node, "node"),
                                 NonNull(device, "device"), position, velocity);
@@ -200,6 +204,50 @@ int32_t talos_sim_hardware_set_gyro(TalosSimHardware* hw, const char* node,
   return Guard<int32_t>(TALOS_ERR, [&] {
     AsHardware(hw).set_gyro(NonNull(node, "node"), NonNull(device, "device"),
                             yaw, yaw_rate);
+    return TALOS_OK;
+  });
+}
+
+int32_t talos_sim_hardware_set_connected(TalosSimHardware* hw, const char* node,
+                                         const char* device,
+                                         int32_t connected) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    AsHardware(hw).set_connected(NonNull(node, "node"),
+                                 NonNull(device, "device"), connected != 0);
+    return TALOS_OK;
+  });
+}
+
+int32_t talos_sim_hardware_set_driver_station(
+    TalosSimHardware* hw, const TalosDriverStationPacket* packet) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (packet == nullptr) {
+      throw std::invalid_argument("null TalosDriverStationPacket");
+    }
+    namespace ds = talos::driver_station;
+    ds::DriverStationData data{};
+    data.fms.flags = packet->flags;
+    data.fms.alliance = static_cast<ds::Alliance>(packet->alliance);
+    data.fms.station = static_cast<std::uint8_t>(packet->station);
+    data.fms.match_time_s = packet->match_time_s;
+    for (std::size_t port = 0; port < ds::kMaxJoysticks; ++port) {
+      const TalosJoystick& in = packet->joysticks[port];
+      ds::JoystickData& out = data.joysticks[port];
+      out.connected = in.connected != 0;
+      out.axis_count = static_cast<std::uint8_t>(
+          std::clamp<int32_t>(in.axis_count, 0, ds::kMaxAxes));
+      out.button_count = static_cast<std::uint8_t>(
+          std::clamp<int32_t>(in.button_count, 0, 32));
+      out.pov_count = static_cast<std::uint8_t>(
+          std::clamp<int32_t>(in.pov_count, 0, ds::kMaxPovs));
+      out.buttons = in.buttons;
+      std::copy(std::begin(in.axes), std::end(in.axes), out.axes.begin());
+      std::transform(
+          std::begin(in.povs), std::end(in.povs), out.povs.begin(),
+          [](int32_t pov) { return static_cast<std::int16_t>(pov); });
+      std::memcpy(out.name, in.name, sizeof out.name);
+    }
+    AsHardware(hw).set_driver_station(data);
     return TALOS_OK;
   });
 }

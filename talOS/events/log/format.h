@@ -15,7 +15,10 @@
 //
 //   [FileHeader][ManifestEntry * manifest_count][Record ...]
 //
-// where a Record is a RecordHeader followed by payload_bytes of message bytes.
+// where a Record is a RecordHeader followed by stored_bytes of message bytes.
+// A payload is stored without its trailing zero bytes, which for fixed-size
+// messages is mostly padding; readers zero-fill it back to payload_bytes, so
+// what they hand out is byte-identical to what was recorded.
 // Everything is fixed-size and little-endian, so the file can be mapped and
 // walked without a parser, and a truncated tail costs at most one record.
 //
@@ -24,7 +27,7 @@
 namespace talos::event::log {
 
 inline constexpr char FILE_MAGIC[8] = {'T', 'A', 'L', 'O', 'S', 'L', 'O', 'G'};
-inline constexpr std::uint32_t FORMAT_VERSION = 3;
+inline constexpr std::uint32_t FORMAT_VERSION = 4;
 
 // Marks the start of every record so a damaged log can be resynchronised.
 inline constexpr std::uint32_t RECORD_MAGIC = 0x54524543;  // "TREC"
@@ -34,7 +37,7 @@ inline constexpr std::uint32_t RECORD_MAGIC = 0x54524543;  // "TREC"
 struct FileHeader {
   char magic[8];
   std::uint32_t version;
-  std::uint32_t header_bytes;       // sizeof(FileHeader), for forward compat
+  std::uint32_t header_bytes;  // sizeof(FileHeader), for forward compat
   std::uint64_t session_id;
   std::int64_t start_monotonic_ns;  // loop start on the recording timeline
   std::int64_t start_wall_ns;       // informational only, ignored by replay
@@ -62,10 +65,10 @@ struct RecordHeader {
   std::int64_t event_time_ns;
   std::int64_t now_ns;
   std::uint64_t sequence;
-  std::uint32_t aux;  // dropped count, WriteResult
-  std::uint32_t payload_bytes;
-  std::uint32_t crc32;  // header with crc32 zeroed, then payload
-  std::uint32_t reserved;
+  std::uint32_t aux;            // dropped count, WriteResult
+  std::uint32_t payload_bytes;  // message size as recorded
+  std::uint32_t crc32;          // header with crc32 zeroed, then stored bytes
+  std::uint32_t stored_bytes;   // payload_bytes minus its trailing zero bytes
 };
 
 #pragma pack(pop)

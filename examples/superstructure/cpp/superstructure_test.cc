@@ -1,6 +1,9 @@
 // The whole example robot in one simulated process: the intake, elevator and
 // superstructure nodes talking over their real topics, with SimHardware in
-// place of the bridge, all configured by config/robot.toml.
+// place of the bridge, all configured by config/robot.toml and
+// config/subsystems/.
+
+#include "examples/superstructure/cpp/superstructure.h"
 
 #include <gtest/gtest.h>
 
@@ -13,7 +16,6 @@
 
 #include "examples/superstructure/cpp/elevator.h"
 #include "examples/superstructure/cpp/intake.h"
-#include "examples/superstructure/cpp/superstructure.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/devices/testing.h"
 #include "talOS/node/testing.h"
@@ -38,7 +40,7 @@ std::string RobotConfig() {
   return runfiles->Rlocation(location);
 }
 
-// The values in config/robot.toml.
+// The values in config/subsystems/*.toml.
 constexpr double kIntakeVolts = 8.0;
 constexpr double kHoldVolts = 1.0;
 constexpr double kEjectVolts = -10.0;
@@ -50,7 +52,7 @@ class SuperstructureTest : public ::testing::Test {
   // 20 ms.
   void Hold(SuperstructureCommand command, std::chrono::milliseconds duration) {
     for (auto t = 0ms; t < duration; t += 20ms) {
-      sim.publish(kSuperstructureGoalTopic, SuperstructureGoal{command});
+      sim.publish(topics::kSuperstructureGoal, SuperstructureGoal{command});
       sim.step(20ms);
     }
   }
@@ -59,13 +61,13 @@ class SuperstructureTest : public ::testing::Test {
   }
 
   SuperstructureState SuperstructureNow() const {
-    return Latest<SuperstructureStatus>(kSuperstructureStatusTopic).state();
+    return Latest<SuperstructureStatus>(topics::kSuperstructureStatus).state();
   }
   IntakeStatus IntakeNow() const {
-    return Latest<IntakeStatus>(kIntakeStatusTopic);
+    return Latest<IntakeStatus>(topics::kIntakeStatus);
   }
   ElevatorStatus ElevatorNow() const {
-    return Latest<ElevatorStatus>(kElevatorStatusTopic);
+    return Latest<ElevatorStatus>(topics::kElevatorStatus);
   }
   talos::hardware::MotorRequest RollerRequest() const {
     return hw.motor_request("intake", "roller");
@@ -134,7 +136,8 @@ TEST_F(SuperstructureTest, IntakesRaisesScoresAndStows) {
   EXPECT_DOUBLE_EQ(LiftRequest().demand, kHighRot);
   EXPECT_EQ(ElevatorNow().state(), ElevatorState::MOVING);
   EXPECT_FALSE(ElevatorNow().at_goal());
-  EXPECT_DOUBLE_EQ(RollerRequest().demand, kHoldVolts);  // still holding the piece
+  EXPECT_DOUBLE_EQ(RollerRequest().demand,
+                   kHoldVolts);  // still holding the piece
 
   // The lift arrives: at_goal, then SCORING ejects.
   hw.ideal_motors();
@@ -194,21 +197,20 @@ class SuperstructureAlone : public ::testing::Test {
  protected:
   // One 20 ms period: the driver's command, plus whichever mechanism states
   // are still being reported.
-  void Tick(SuperstructureCommand command,
-            std::optional<IntakeStatus> intake,
+  void Tick(SuperstructureCommand command, std::optional<IntakeStatus> intake,
             std::optional<ElevatorStatus> elevator) {
-    sim.publish(kSuperstructureGoalTopic, SuperstructureGoal{command});
-    if (intake) sim.publish(kIntakeStatusTopic, *intake);
-    if (elevator) sim.publish(kElevatorStatusTopic, *elevator);
+    sim.publish(topics::kSuperstructureGoal, SuperstructureGoal{command});
+    if (intake) sim.publish(topics::kIntakeStatus, *intake);
+    if (elevator) sim.publish(topics::kElevatorStatus, *elevator);
     sim.step(20ms);
   }
   SuperstructureState State() const {
-    return sim.latest<SuperstructureStatus>(kSuperstructureStatusTopic)
+    return sim.latest<SuperstructureStatus>(topics::kSuperstructureStatus)
         .value_or(SuperstructureStatus{})
         .state();
   }
   double ElevatorGoalRot() const {
-    return sim.latest<ElevatorGoal>(kElevatorGoalTopic)
+    return sim.latest<ElevatorGoal>(topics::kElevatorGoal)
         .value_or(ElevatorGoal{})
         .height_rot();
   }
@@ -223,7 +225,9 @@ class SuperstructureAlone : public ::testing::Test {
 };
 
 TEST_F(SuperstructureAlone, StaleStatusHoldsTheStateAndDoesNotAdvance) {
-  for (int i = 0; i < 5; ++i) Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+  for (int i = 0; i < 5; ++i) {
+    Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+  }
   ASSERT_EQ(State(), SuperstructureState::HOLDING);
 
   // The intake goes quiet for longer than command_timeout_us (100 ms).
@@ -237,8 +241,11 @@ TEST_F(SuperstructureAlone, StaleStatusHoldsTheStateAndDoesNotAdvance) {
   }
   EXPECT_EQ(State(), SuperstructureState::HOLDING);
   EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
-  EXPECT_EQ(sim.latest<IntakeGoal>(kIntakeGoalTopic)->command(),
-            IntakeCommand::IDLE);
+  const auto intake_goal = sim.latest<IntakeGoal>(topics::kIntakeGoal);
+  if (!intake_goal.has_value()) {
+    FAIL() << "no intake goal";
+  }
+  EXPECT_EQ(intake_goal->command(), IntakeCommand::IDLE);
 
   // It reports again: RAISING.
   Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
@@ -265,7 +272,9 @@ TEST_F(SuperstructureAlone, StaleStatusHoldsTheStateAndDoesNotAdvance) {
 }
 
 TEST_F(SuperstructureAlone, AtGoalForAnEarlierHeightDoesNotCount) {
-  for (int i = 0; i < 5; ++i) Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+  for (int i = 0; i < 5; ++i) {
+    Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+  }
   // The elevator is at_goal, but for 0: RAISING waits for its own height.
   for (int i = 0; i < 10; ++i) {
     Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
@@ -279,12 +288,15 @@ TEST(ElevatorAlone, HoldsItsLastGoalWhenTheTargetGoesStale) {
   SimHardware hw{sim};
   hw.enable();
   hw.ideal_motors();
-  sim.publish(kElevatorGoalTopic, ElevatorGoal{kHighRot});
+  sim.publish(topics::kElevatorGoal, ElevatorGoal{kHighRot});
   sim.step(300ms);  // the target is long stale (command_timeout_us = 100 ms)
   EXPECT_EQ(hw.motor_request("elevator", "lift").mode, Mode::kMotionMagic);
   EXPECT_DOUBLE_EQ(hw.motor_request("elevator", "lift").demand, kHighRot);
-  EXPECT_EQ(sim.latest<ElevatorStatus>(kElevatorStatusTopic)->state(),
-            ElevatorState::AT_GOAL);
+  const auto status = sim.latest<ElevatorStatus>(topics::kElevatorStatus);
+  if (!status.has_value()) {
+    FAIL() << "no elevator status";
+  }
+  EXPECT_EQ(status->state(), ElevatorState::AT_GOAL);
 }
 
 }  // namespace

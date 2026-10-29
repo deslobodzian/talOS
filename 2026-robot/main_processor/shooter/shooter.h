@@ -20,8 +20,8 @@ class Shooter {
       : node_{node},
         flywheel_{node, "flywheel"},
         beam_break_{node, "beam_break"},
-        target_{node.subscribe<ShooterTarget>(kTargetTopic)},
-        state_{node.publish<ShooterState>(kStateTopic)} {}
+        target_{node.subscribe<ShooterTarget>(topics::kTarget)},
+        state_{node.publish<ShooterState>(topics::kState)} {}
 
   void update() {
     const bool enabled = talos::robot_enabled(node_);

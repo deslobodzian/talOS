@@ -15,13 +15,16 @@
 // publishes one /hw/state holding every device in the config: the feedback
 // set here, this config's id (commissioned, as the bridge treats it under
 // --sim), and flags configured|enabled (configured only while disabled, the
-// default). Construct it before the first step to have a state at time 0;
-// later, the first state goes out at that moment. Devices are keyed by
-// (node, device) exactly as the node names them.
+// default). Once set_driver_station() has been called it also forwards that
+// Driver Station packet on /hw/state/driver_station every period. Construct
+// it before the first step to have a state at time 0; later, the first state
+// goes out at that moment. Devices are keyed by (node, device) exactly as the
+// node names them.
 
 #include <memory>
 #include <string_view>
 
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/node/testing.h"
 
@@ -52,6 +55,16 @@ class SimHardware {
                     double position, double velocity);
   void set_gyro(std::string_view node, std::string_view device, double yaw,
                 double yaw_rate);
+  // A disconnected device keeps its slot in /hw/state with valid == false
+  // and zero values, so its handle reads connected() == false. Every device
+  // of that node named `device` is affected, whatever its kind; an unknown
+  // name throws std::invalid_argument.
+  void set_connected(std::string_view node, std::string_view device,
+                     bool connected);
+
+  // The Driver Station packet to forward from now on, stamped with the sim
+  // time as the Rio stamps it.
+  void set_driver_station(const driver_station::DriverStationData& data);
 
   // Outputs: the last request flushed by that node for that device (neutral,
   // false and 0 before any).

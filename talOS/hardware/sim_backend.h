@@ -110,7 +110,9 @@ class SimBackend final : public Backend {
   }
 
   void SetDigitalInput(uint16_t id, bool value) { digital_inputs_[id] = value; }
-  void SetAnalogInput(uint16_t id, double voltage) { analog_inputs_[id] = voltage; }
+  void SetAnalogInput(uint16_t id, double voltage) {
+    analog_inputs_[id] = voltage;
+  }
   void SetEncoder(uint16_t id, double position_rot, double velocity_rps) {
     encoders_[id] = {position_rot, velocity_rps};
   }

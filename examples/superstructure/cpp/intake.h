@@ -18,8 +18,8 @@ class Intake {
   explicit Intake(talos::Node& node)
       : roller_{node, "roller"},
         beam_break_{node, "beam_break"},
-        goal_{node.subscribe<IntakeGoal>(kIntakeGoalTopic)},
-        status_{node.publish<IntakeStatus>(kIntakeStatusTopic)},
+        goal_{node.subscribe<IntakeGoal>(topics::kIntakeGoal)},
+        status_{node.publish<IntakeStatus>(topics::kIntakeStatus)},
         sm_{node, State::IDLE},
         intake_volts_{node.param<double>("intake_volts")},
         hold_volts_{node.param<double>("hold_volts")},
@@ -38,14 +38,19 @@ class Intake {
         break;
       case State::INTAKING:
         roller_.set_voltage(intake_volts_);
-        if (has_piece) sm_.go(State::HOLDING);
-        else if (command == IntakeCommand::IDLE) sm_.go(State::IDLE);
-        else if (command == IntakeCommand::EJECT) sm_.go(State::EJECTING);
+        if (has_piece)
+          sm_.go(State::HOLDING);
+        else if (command == IntakeCommand::IDLE)
+          sm_.go(State::IDLE);
+        else if (command == IntakeCommand::EJECT)
+          sm_.go(State::EJECTING);
         break;
       case State::HOLDING:
         roller_.set_voltage(hold_volts_);
-        if (command == IntakeCommand::EJECT) sm_.go(State::EJECTING);
-        else if (!has_piece) sm_.go(State::IDLE);  // dropped it
+        if (command == IntakeCommand::EJECT)
+          sm_.go(State::EJECTING);
+        else if (!has_piece)
+          sm_.go(State::IDLE);  // dropped it
         break;
       case State::EJECTING:
         roller_.set_voltage(eject_volts_);

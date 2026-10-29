@@ -4,7 +4,11 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <optional>
+#include <set>
+#include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
@@ -13,14 +17,17 @@
 namespace talos::testing {
 namespace {
 
-using hardware::Packet;
 using detail::SimAccess;
+using hardware::Packet;
 using Kind = detail::DeviceKind;
 
 struct Axis {
   double position = 0;
   double velocity = 0;
 };
+
+// CANcoders and gyros share the sensors table, and so its ids.
+Kind TableOf(Kind kind) { return kind == Kind::kGyro ? Kind::kCANcoder : kind; }
 
 template <class Map>
 auto ValueOr(const Map& map, std::uint16_t id,
@@ -47,12 +54,17 @@ struct SimHardware::Impl {
   std::map<std::uint16_t, bool> digital_outputs;
   std::map<std::uint16_t, double> pwm_outputs;
   std::map<std::string, std::uint64_t> cursors;  // per request topic
+  std::set<std::pair<Kind, std::uint16_t>> disconnected;
+  std::optional<driver_station::DriverStationData> ds_packet;
 
   explicit Impl(Sim& s) : sim{s} {}
 
   std::uint16_t Id(std::string_view node, Kind kind,
                    std::string_view device) const {
     return detail::HardwareAccess::device_id(config, node, kind, device);
+  }
+  bool Connected(Kind kind, std::uint16_t id) const {
+    return !disconnected.contains({TableOf(kind), id});
   }
 
   // Every request each subsystem flushed since the last look, in order.
@@ -67,14 +79,17 @@ struct SimHardware::Impl {
         SimAccess::read_raw(sim, topic, sizeof packet, cursor, &packet);
         hardware::Command command{};
         if (!hardware::Decode(packet.bytes(), command)) continue;
-        for (std::size_t i = 0; i < command.count; ++i)
+        for (std::size_t i = 0; i < command.count; ++i) {
           motor_requests[command.motors[i].id] = command.motors[i];
-        for (std::size_t i = 0; i < command.digital_output_count; ++i)
+        }
+        for (std::size_t i = 0; i < command.digital_output_count; ++i) {
           digital_outputs[command.digital_outputs[i].id] =
               command.digital_outputs[i].value;
-        for (std::size_t i = 0; i < command.pwm_output_count; ++i)
+        }
+        for (std::size_t i = 0; i < command.pwm_output_count; ++i) {
           pwm_outputs[command.pwm_outputs[i].id] =
               command.pwm_outputs[i].output;
+        }
       }
     }
   }
@@ -114,10 +129,14 @@ struct SimHardware::Impl {
                    auto sample_of) {
       count =
           static_cast<std::uint16_t>(std::min(configs.size(), samples.size()));
-      for (std::size_t i = 0; i < count; ++i)
+      for (std::size_t i = 0; i < count; ++i) {
         samples[i] = sample_of(configs[i]);
+      }
     };
     fill(state.motors, state.motor_count, hw.motors, [&](const auto& c) {
+      if (!Connected(Kind::kMotor, c.id)) {
+        return hardware::MotorSample{.id = c.id};
+      }
       const Axis axis = ValueOr(motors, c.id, Axis{});
       return hardware::MotorSample{.id = c.id,
                                    .valid = true,
@@ -125,6 +144,9 @@ struct SimHardware::Impl {
                                    .velocity_rps = axis.velocity};
     });
     fill(state.sensors, state.sensor_count, hw.sensors, [&](const auto& c) {
+      if (!Connected(Kind::kCANcoder, c.id)) {
+        return hardware::SensorSample{.id = c.id};
+      }
       const Axis axis = ValueOr(sensors, c.id, Axis{});
       return hardware::SensorSample{.id = c.id,
                                     .valid = true,
@@ -133,22 +155,34 @@ struct SimHardware::Impl {
     });
     fill(state.digital_inputs, state.digital_input_count, hw.digital_inputs,
          [&](const auto& c) {
+           if (!Connected(Kind::kDigitalInput, c.id)) {
+             return hardware::DigitalInputSample{c.id, false, false};
+           }
            return hardware::DigitalInputSample{
                c.id, true, ValueOr(digital_inputs, c.id, false)};
          });
     fill(state.digital_outputs, state.digital_output_count, hw.digital_outputs,
          [&](const auto& c) {
+           if (!Connected(Kind::kDigitalOutput, c.id)) {
+             return hardware::DigitalOutputSample{c.id, false, false};
+           }
            return hardware::DigitalOutputSample{
                c.id, true, ValueOr(digital_outputs, c.id, false)};
          });
     fill(state.analog_inputs, state.analog_input_count, hw.analog_inputs,
          [&](const auto& c) {
+           if (!Connected(Kind::kAnalogInput, c.id)) {
+             return hardware::AnalogInputSample{.id = c.id};
+           }
            return hardware::AnalogInputSample{
                .id = c.id,
                .valid = true,
                .voltage = ValueOr(analog_inputs, c.id, 0.0)};
          });
     fill(state.encoders, state.encoder_count, hw.encoders, [&](const auto& c) {
+      if (!Connected(Kind::kEncoder, c.id)) {
+        return hardware::EncoderSample{.id = c.id};
+      }
       const Axis axis = ValueOr(encoders, c.id, Axis{});
       return hardware::EncoderSample{.id = c.id,
                                      .valid = true,
@@ -157,6 +191,9 @@ struct SimHardware::Impl {
     });
     fill(state.pwm_outputs, state.pwm_output_count, hw.pwm_outputs,
          [&](const auto& c) {
+           if (!Connected(Kind::kPwm, c.id)) {
+             return hardware::PwmSample{c.id, false, 0.0};
+           }
            return hardware::PwmSample{c.id, true,
                                       ValueOr(pwm_outputs, c.id, 0.0)};
          });
@@ -165,6 +202,19 @@ struct SimHardware::Impl {
     packet.size =
         static_cast<std::uint32_t>(hardware::Encode(state, packet.data));
     sim.publish(hardware::kStateTopic, packet);
+    if (ds_packet) PublishDriverStation(*ds_packet);
+  }
+
+  void PublishDriverStation(driver_station::DriverStationData data) const {
+    data.sample_time_us = static_cast<std::uint64_t>(sim.now().nanos() / 1000);
+    Packet packet{};
+    packet.size =
+        static_cast<std::uint32_t>(driver_station::Encode(data, packet.data));
+    if (packet.size == 0) {
+      throw std::invalid_argument(
+          "SimHardware: the Driver Station packet does not encode");
+    }
+    sim.publish(hardware::kDriverStationTopic, packet);
   }
 };
 
@@ -217,6 +267,38 @@ void SimHardware::set_cancoder(std::string_view node, std::string_view device,
 void SimHardware::set_gyro(std::string_view node, std::string_view device,
                            double yaw, double yaw_rate) {
   impl_->sensors[impl_->Id(node, Kind::kGyro, device)] = {yaw, yaw_rate};
+}
+
+void SimHardware::set_connected(std::string_view node, std::string_view device,
+                                bool connected) {
+  bool found = false;
+  for (const Kind kind :
+       {Kind::kMotor, Kind::kCANcoder, Kind::kGyro, Kind::kDigitalInput,
+        Kind::kDigitalOutput, Kind::kAnalogInput, Kind::kEncoder, Kind::kPwm}) {
+    std::uint16_t id = 0;
+    try {
+      id = impl_->Id(node, kind, device);
+    } catch (const std::invalid_argument&) {
+      continue;  // not a device of this kind
+    }
+    found = true;
+    const std::pair key{TableOf(kind), id};
+    if (connected) {
+      impl_->disconnected.erase(key);
+    } else {
+      impl_->disconnected.insert(key);
+    }
+  }
+  if (!found) {
+    throw std::invalid_argument(std::string{node} + ": no device named '" +
+                                std::string{device} + "' in subsystem '" +
+                                std::string{node} + "'");
+  }
+}
+
+void SimHardware::set_driver_station(
+    const driver_station::DriverStationData& data) {
+  impl_->ds_packet = data;
 }
 
 hardware::MotorRequest SimHardware::motor_request(

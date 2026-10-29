@@ -22,31 +22,32 @@ cc_test(
     ],
 )
 
-# DriverStationState (namespace driver_station) and its topic. The operator
-# interface, the arbiter and telemetry consume it.
+# DriverStationState (namespace driver_station) and its topic: the decoded
+# Driver Station state, republished from the bridge's /hw/state/driver_station.
+# The operator interface, the arbiter and telemetry consume it.
 talos_messages(
     name = "messages",
     srcs = ["driver_station_message.fbs"],
-    hdrs = ["topics.h"],
+    topics = {"state": "/driver_station/state"},
 )
 
 cc_library(
     name = "driver_station_node",
     hdrs = ["driver_station_node.h"],
+    # The arbiter's teleop-chain test runs the real driver station node.
+    visibility = ["//2026-robot/main_processor/arbiter:__pkg__"],
     deps = [
         ":driver_station",
         ":messages",
-        "//talOS/hardware",
+        "//talOS/devices",
         "//talOS/node",
     ],
-    # The arbiter's teleop-chain test runs the real driver station node.
-    visibility = ["//2026-robot/main_processor/arbiter:__pkg__"],
 )
 
 talos_cc_node(
     name = "node",
-    node_name = "driver_station",
     srcs = ["driver_station_node.cc"],
+    node_name = "driver_station",
     deps = [":driver_station_node"],
 )
 
@@ -76,6 +77,7 @@ cc_test(
     },
     deps = [
         ":driver_station_node",
+        "//talOS/hardware",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

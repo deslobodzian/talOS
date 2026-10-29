@@ -1,24 +1,24 @@
 #pragma once
 
-#include <array>
-#include <chrono>
-#include <cstdint>
-#include <memory>
-#include <optional>
-#include <vector>
-
-#include <ctre/phoenix6/CANcoder.hpp>
-#include <ctre/phoenix6/Pigeon2.hpp>
-#include <ctre/phoenix6/TalonFX.hpp>
-#include <ctre/phoenix6/sim/CANcoderSimState.hpp>
-#include <ctre/phoenix6/sim/Pigeon2SimState.hpp>
-#include <ctre/phoenix6/sim/TalonFXSimState.hpp>
 #include <frc/AnalogInput.h>
 #include <frc/DigitalInput.h>
 #include <frc/DigitalOutput.h>
 #include <frc/DutyCycleEncoder.h>
 #include <frc/Encoder.h>
 #include <frc/PWM.h>
+
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <ctre/phoenix6/CANcoder.hpp>
+#include <ctre/phoenix6/Pigeon2.hpp>
+#include <ctre/phoenix6/TalonFX.hpp>
+#include <ctre/phoenix6/sim/CANcoderSimState.hpp>
+#include <ctre/phoenix6/sim/Pigeon2SimState.hpp>
+#include <ctre/phoenix6/sim/TalonFXSimState.hpp>
+#include <memory>
+#include <optional>
+#include <vector>
 
 #include "hardware/gateway.h"
 
@@ -29,11 +29,13 @@ class PhoenixBackend final : public talos::hardware::Backend {
   bool Configure(const talos::hardware::Config&) override;
   bool Read(talos::hardware::State&) override;
   bool Apply(std::span<const talos::hardware::MotorRequest>) override;
-  bool ApplyOutputs(std::span<const talos::hardware::DigitalOutputRequest> digital_outputs,
-                    std::span<const talos::hardware::PwmRequest> pwm_outputs) override;
+  bool ApplyOutputs(
+      std::span<const talos::hardware::DigitalOutputRequest> digital_outputs,
+      std::span<const talos::hardware::PwmRequest> pwm_outputs) override;
   void Neutral() override;
   // Precise failure behind the last false Configure().
-  std::optional<talos::hardware::ConfigError> last_config_error() const override;
+  std::optional<talos::hardware::ConfigError> last_config_error()
+      const override;
   // Per-device reset detection (HasResetOccurred) and restore.
   bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override;
   bool RestoreAfterReset() override;
@@ -71,6 +73,7 @@ class PhoenixBackend final : public talos::hardware::Backend {
   std::array<double, talos::hardware::kMaxMotors> sim_rotor_velocity_{};
   std::array<double, talos::hardware::kMaxMotors> sim_rotor_position_{};
   std::array<int, talos::hardware::kMaxMotors> motor_to_sensor_map_{};
-  std::array<talos::hardware::MotorRequest, talos::hardware::kMaxMotors> last_commands_{};
+  std::array<talos::hardware::MotorRequest, talos::hardware::kMaxMotors>
+      last_commands_{};
   double sim_yaw_deg_{0.0};
 };

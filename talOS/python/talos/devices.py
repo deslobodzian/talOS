@@ -2,6 +2,7 @@
 
     self.roller = talos.Motor(node, "roller")    # [motors.roller]
     self.beam = talos.DigitalInput(node, "beam")  # [digital_inputs.beam]
+    self.ds = talos.DriverStation(node)          # what the bridge forwards
 
 Take handles in __init__. Commands apply to the next flush after update();
 a motor not commanded by then is neutral, and every motor is neutral while
@@ -166,3 +167,95 @@ class PwmOutput(_Device):
 
     def set(self, output):
         _abi.ok(lib.talos_pwm_set(self._node, self._index, output))
+
+
+class Alliance(enum.IntEnum):
+    """talos::driver_station::Alliance."""
+    UNKNOWN = 0
+    RED = 1
+    BLUE = 2
+
+
+class Joystick:
+    """One Driver Station joystick as a DriverStation saw it; a snapshot."""
+
+    def __init__(self, data):
+        self._data = data  # an _abi.Joystick
+
+    @property
+    def connected(self):
+        return bool(self._data.connected)
+
+    @property
+    def axis_count(self):
+        return self._data.axis_count
+
+    @property
+    def button_count(self):
+        return self._data.button_count
+
+    @property
+    def pov_count(self):
+        return self._data.pov_count
+
+    @property
+    def name(self):
+        return self._data.name.decode(errors="replace")
+
+    def axis(self, index):
+        """[-1, 1]; 0 past axis_count."""
+        return self._data.axes[index] if 0 <= index < _abi.DS_MAX_AXES else 0.0
+
+    def button(self, number):
+        """1-based, as the Driver Station numbers them."""
+        if not 1 <= number <= 32:
+            return False
+        return bool(self._data.buttons >> (number - 1) & 1)
+
+    def pov(self, index=0):
+        """Degrees clockwise from up; -1 centred or absent."""
+        return self._data.povs[index] if 0 <= index < _abi.DS_MAX_POVS else -1
+
+
+class DriverStation:
+    """The Driver Station packet the bridge forwards, decoded and latched.
+
+        self.ds = talos.DriverStation(node)
+        ...
+        if self.ds.teleop and self.ds.joystick(0).button(1): ...
+
+    Mode properties are False unless connected (a packet younger than
+    [robot] command_timeout_us says the DS is attached), and joystick() is
+    disconnected, so a silent Driver Station reads as disabled.
+    on_packet() runs as each packet arrives.
+    """
+
+    def __init__(self, node, on_packet=None):
+        self._node = node._handle
+        callback = _abi.CALLBACK()
+        if on_packet is not None:
+            callback = node._keep(_abi.CALLBACK(
+                _abi.callback(lambda _: on_packet())))
+        _abi.ok(lib.talos_driver_station(self._node, callback, None))
+
+    def _read(self):
+        out = _abi.DriverStation()
+        _abi.ok(lib.talos_driver_station_read(self._node, out))
+        return out
+
+    connected = property(lambda self: bool(self._read().connected))
+    enabled = property(lambda self: bool(self._read().enabled))
+    autonomous = property(lambda self: bool(self._read().autonomous))
+    teleop = property(lambda self: bool(self._read().teleop))
+    test = property(lambda self: bool(self._read().test))
+    estop = property(lambda self: bool(self._read().estop))
+    fms_attached = property(lambda self: bool(self._read().fms_attached))
+    alliance = property(lambda self: Alliance(self._read().alliance))
+    station = property(lambda self: self._read().station)  # 1-3; 0 unknown
+    match_time = property(lambda self: self._read().match_time_s)  # seconds
+
+    def joystick(self, port):
+        if not 0 <= port < _abi.DS_MAX_JOYSTICKS:
+            raise IndexError(f"no Driver Station joystick port {port} "
+                             f"(ports are 0-{_abi.DS_MAX_JOYSTICKS - 1})")
+        return Joystick(self._read().joysticks[port])

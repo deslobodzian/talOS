@@ -4,9 +4,12 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <functional>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "talOS/configuration/config_parser.h"
@@ -16,8 +19,8 @@
 namespace talos {
 namespace {
 
-using hardware::Packet;
 using detail::HardwareAccess;
+using hardware::Packet;
 using Kind = detail::DeviceKind;
 
 bool IsOutput(Kind kind) {
@@ -80,8 +83,8 @@ Sample FindSample(const std::array<Sample, N>& samples, std::size_t count,
 }  // namespace
 
 std::uint16_t HardwareAccess::device_id(const config::RobotConfig& config,
-                                        std::string_view subsystem,
-                                        Kind kind, std::string_view name) {
+                                        std::string_view subsystem, Kind kind,
+                                        std::string_view name) {
   const hardware::Devices* owned = config.GetDevices(std::string{subsystem});
   const hardware::Config& hw = config.hardware;
   std::string have;
@@ -188,8 +191,9 @@ struct HardwareLink::Impl {
   }
   const Device& SensorAt(std::size_t index) const {
     if (index < devices.size() && (devices[index].kind == Kind::kGyro ||
-                                   devices[index].kind == Kind::kCANcoder))
+                                   devices[index].kind == Kind::kCANcoder)) {
       return devices[index];
+    }
     throw std::out_of_range(std::string{node.name()} +
                             ": no sensor handle at index " +
                             std::to_string(index));
@@ -492,6 +496,128 @@ PwmOutput::PwmOutput(Node& node, std::string_view name)
       index_{HardwareAccess::add_device(*link_, Kind::kPwm, name)} {}
 void PwmOutput::set(double output) {
   HardwareAccess::pwm_set(*link_, index_, output);
+}
+
+// --- Driver Station ----------------------------------------------------------
+
+namespace detail {
+
+// One node's subscription to the forwarded Driver Station packet, shared by
+// its DriverStation handles. The bridge owns the topic's layout
+// (hardware::Packet, aligned as the bridge registers it), so it is
+// subscribed raw rather than as a talos message.
+class DriverStationLink {
+ public:
+  explicit DriverStationLink(Node& node) : node_{node} {
+    NodeAccess::add_subscription(
+        node, hardware::kDriverStationTopic, sizeof(Packet), alignof(Packet),
+        /*optional=*/false, [this](const void* data) { OnPacket(data); });
+  }
+
+  void Listen(std::function<void()> on_packet) {
+    listeners_.push_back(std::move(on_packet));
+  }
+
+  bool Connected() const {
+    return have_ && (data_.fms.flags & driver_station::kDsAttached) != 0 &&
+           node_.now() - received_ < NodeAccess::freshness_timeout(node_);
+  }
+  const driver_station::DriverStationData& data() const { return data_; }
+
+ private:
+  void OnPacket(const void* data) {
+    Packet packet{};
+    std::memcpy(&packet, data, sizeof packet);
+    driver_station::DriverStationData next{};
+    if (!driver_station::Decode(packet.bytes(), next)) return;
+    data_ = next;
+    have_ = true;
+    received_ = node_.now();
+    for (const auto& listener : listeners_) listener();
+  }
+
+  Node& node_;
+  driver_station::DriverStationData data_{};
+  bool have_ = false;
+  Time received_{};
+  std::vector<std::function<void()>> listeners_;
+};
+
+}  // namespace detail
+
+double Joystick::axis(int index) const {
+  if (index < 0 ||
+      index >= std::min<int>(data_.axis_count, driver_station::kMaxAxes)) {
+    return 0.0;
+  }
+  return data_.axes[static_cast<std::size_t>(index)];
+}
+
+bool Joystick::button(int number) const {
+  if (number < 1 || number > std::min<int>(data_.button_count, 32)) {
+    return false;
+  }
+  return ((data_.buttons >> (number - 1)) & 1u) != 0;
+}
+
+int Joystick::pov(int index) const {
+  if (index < 0 ||
+      index >= std::min<int>(data_.pov_count, driver_station::kMaxPovs)) {
+    return -1;
+  }
+  return data_.povs[static_cast<std::size_t>(index)];
+}
+
+std::string_view Joystick::name() const {
+  const char* end =
+      std::find(std::begin(data_.name), std::end(data_.name), '\0');
+  return {data_.name, static_cast<std::size_t>(end - data_.name)};
+}
+
+DriverStation::DriverStation(Node& node)
+    : link_{&node.extension<detail::DriverStationLink>()} {}
+
+DriverStation::DriverStation(Node& node, std::function<void()> on_packet)
+    : DriverStation{node} {
+  if (on_packet) link_->Listen(std::move(on_packet));
+}
+
+bool DriverStation::connected() const { return link_->Connected(); }
+bool DriverStation::flag(driver_station::DsFlags flag) const {
+  return connected() && (link_->data().fms.flags & flag) != 0;
+}
+bool DriverStation::enabled() const { return flag(driver_station::kEnabled); }
+bool DriverStation::autonomous() const {
+  return flag(driver_station::kAutonomous);
+}
+bool DriverStation::teleop() const { return flag(driver_station::kTeleop); }
+bool DriverStation::test() const { return flag(driver_station::kTest); }
+bool DriverStation::estop() const { return flag(driver_station::kEStop); }
+bool DriverStation::fms_attached() const {
+  return flag(driver_station::kFmsAttached);
+}
+
+driver_station::Alliance DriverStation::alliance() const {
+  return link_->data().fms.alliance;
+}
+int DriverStation::station() const { return link_->data().fms.station; }
+double DriverStation::match_time() const {
+  return link_->data().fms.match_time_s;
+}
+
+Joystick DriverStation::joystick(std::size_t port) const {
+  if (port >= driver_station::kMaxJoysticks) {
+    throw std::out_of_range("no Driver Station joystick port " +
+                            std::to_string(port) + " (ports are 0-" +
+                            std::to_string(driver_station::kMaxJoysticks - 1) +
+                            ")");
+  }
+  if (!connected()) return Joystick{};
+  return Joystick{link_->data().joysticks[port]};
+}
+
+const driver_station::DriverStationData& DriverStation::data() const {
+  return link_->data();
 }
 
 }  // namespace talos

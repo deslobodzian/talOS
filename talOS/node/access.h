@@ -10,8 +10,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <typeindex>
@@ -20,6 +20,7 @@
 
 namespace talos {
 class Node;
+struct BytePublishOptions;
 namespace config {
 struct RobotConfig;
 }  // namespace config
@@ -47,7 +48,7 @@ template <class T>
 InstanceFactory MakeInstance();  // node.h
 
 // The binary's main: flags, describe/replay/realtime, logging, the live
-// registry. Built on talos::process::RunNode.
+// registry.
 int RunMain(int argc, char** argv, const char* node_name,
             const char* node_target, const InstanceFactory& make);
 
@@ -103,6 +104,25 @@ struct NodeAccess {
                                    std::size_t bytes, std::size_t alignment);
   static bool publisher_send(Node& node, std::size_t index, const void* data,
                              std::size_t bytes);
+
+  static std::size_t add_byte_publisher(Node& node, std::string_view topic,
+                                        std::size_t max_bytes,
+                                        const BytePublishOptions& options);
+  static bool byte_publisher_send(Node& node, std::size_t index,
+                                  std::span<const std::byte> message);
+  // Byte topics in registration order, for describe and the registry: they
+  // bypass the loop, so its manifest does not list them.
+  struct ByteTopicShape {
+    std::string_view topic;
+    std::size_t max_bytes;
+    bool external;
+  };
+  static std::vector<ByteTopicShape> byte_topics(const Node& node);
+  // Messages send() published, and refused, on byte topic `index`. Safe to
+  // call from any thread.
+  static std::uint64_t byte_topic_published(const Node& node,
+                                            std::size_t index);
+  static std::uint64_t byte_topic_dropped(const Node& node, std::size_t index);
 
   static void* find_extension(const Node& node, std::type_index type);
   static void add_extension(Node& node, std::type_index type,

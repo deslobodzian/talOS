@@ -6,8 +6,8 @@
 #include <thread>
 
 #include "studio/schema/telemetry_generated.h"
-#include "talOS/rtms/rtms.h"
 #include "studio/schema/wire.h"
+#include "talOS/rtms/rtms.h"
 namespace {
 volatile std::sig_atomic_t stop = 0;
 void signal_handler(int) { stop = 1; }
@@ -18,11 +18,13 @@ int main(int argc, char** argv) try {
   RTMSQueue queue(argc > 1 ? argv[1] : "/talos/telemetry", studio::slot_bytes,
                   8, studio::slot_count,
                   {OverflowPolicy::DROP_NEWEST, ReadMode::SEQUENCE});
+  // The segment exists now; tests wait for this line before starting a bridge.
+  std::cout << "ready\n" << std::flush;
   std::array<std::byte, studio::slot_bytes> slot{};
   auto next = std::chrono::steady_clock::now();
   for (std::uint64_t seq = 0; !stop; ++seq) {
     flatbuffers::FlatBufferBuilder b;
-    const double t = seq * 0.005;
+    const double t = static_cast<double>(seq) * 0.005;
     Talos::Telemetry::Pose pose(8 + 3 * std::cos(t * .25),
                                 4 + 2 * std::sin(t * .25), 0, 0, 0,
                                 t * .25 + 1.5707963267948966);
@@ -40,8 +42,9 @@ int main(int argc, char** argv) try {
     Talos::Telemetry::FinishFrameBuffer(b, frame);
     auto size = b.GetSize();
     if (size > slot.size() - 4) throw std::runtime_error("frame exceeds slot");
-    for (unsigned i = 0; i < 4; ++i)
+    for (unsigned i = 0; i < 4; ++i) {
       slot[i] = std::byte((size >> (8 * i)) & 255);
+    }
     std::memcpy(slot.data() + 4, b.GetBufferPointer(), size);
     queue.write({slot.size(), slot.data()});
     next += std::chrono::milliseconds(5);

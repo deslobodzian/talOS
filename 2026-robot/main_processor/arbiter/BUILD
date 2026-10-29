@@ -5,8 +5,9 @@ load("//talOS/build:contract.bzl", "talos_cc_node")
 cc_library(
     name = "arbiter",
     hdrs = ["arbiter.h"],
-    strip_include_prefix = ".",
     include_prefix = "arbiter",
+    strip_include_prefix = ".",
+    visibility = ["//visibility:private"],
     deps = [
         "//2026-robot/main_processor/drivetrain:messages",
         "//2026-robot/main_processor/intake:messages",
@@ -15,13 +16,12 @@ cc_library(
         "//talOS/driver_station:messages",
         "//talOS/node",
     ],
-    visibility = ["//visibility:private"],
 )
 
 talos_cc_node(
     name = "node",
-    node_name = "arbiter",
     srcs = ["arbiter.cc"],
+    node_name = "arbiter",
     deps = [":arbiter"],
 )
 

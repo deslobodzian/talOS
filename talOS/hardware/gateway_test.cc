@@ -128,8 +128,9 @@ Command Request(const Gateway& g) {
   c.epoch = s.epoch;
   c.observed_time_us = s.sample_time_us;
   c.count = s.motor_count;
-  for (std::size_t i = 0; i < c.count; ++i)
+  for (std::size_t i = 0; i < c.count; ++i) {
     c.motors[i] = {s.motors[i].id, Mode::kVelocity, 0, 1, 0};
+  }
   return c;
 }
 TEST(Config, RejectsAmbiguousHardwareAndInvalidFeedback) {
@@ -241,7 +242,8 @@ TEST(Gateway, NeutralizesOutputsBeforeReconfiguringDevices) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
   g.Tick(1000, false);
-  backend.events.clear();  // Tick neutralizes while disabled; isolate Reconfigure.
+  backend.events
+      .clear();  // Tick neutralizes while disabled; isolate Reconfigure.
   auto cfg = SwerveConfig(true);
   cfg.motors[0].slots[0].p = 1.0;  // Genuine change, not an idempotent push.
   ASSERT_TRUE(g.Reconfigure(cfg));
@@ -330,8 +332,9 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   EXPECT_EQ(decoded.count, c.count);
   EXPECT_EQ(decoded.boot_id, c.boot_id);
   EXPECT_DOUBLE_EQ(decoded.motors[0].demand, 1);
-  for (std::size_t i = 0; i < size; ++i)
+  for (std::size_t i = 0; i < size; ++i) {
     EXPECT_FALSE(Decode(std::span<const uint8_t>{bytes.data(), i}, decoded));
+  }
   EXPECT_FALSE(
       Decode(std::span<const uint8_t>{bytes.data(), size + 1}, decoded));
   bytes[32] = 255;
@@ -342,7 +345,8 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   const auto empty_cmd_size = Encode(empty_cmd, bytes);
   ASSERT_GT(empty_cmd_size, 0u);
   Command decoded_empty_cmd;
-  ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), empty_cmd_size}, decoded_empty_cmd));
+  ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), empty_cmd_size},
+                     decoded_empty_cmd));
   EXPECT_EQ(decoded_empty_cmd.count, 0u);
   EXPECT_EQ(decoded_empty_cmd.digital_output_count, 0u);
   EXPECT_EQ(decoded_empty_cmd.pwm_output_count, 0u);
@@ -357,19 +361,23 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   full_cmd.digital_output_count = kMaxDigitalOutputs;
   full_cmd.pwm_output_count = kMaxPwmOutputs;
   for (std::size_t i = 0; i < kMaxMotors; ++i) {
-    full_cmd.motors[i] = {static_cast<uint16_t>(i + 1), Mode::kVelocity, 1, 15.5 + i, 1.2};
+    full_cmd.motors[i] = {static_cast<uint16_t>(i + 1), Mode::kVelocity, 1,
+                          15.5 + static_cast<double>(i), 1.2};
   }
   for (std::size_t i = 0; i < kMaxDigitalOutputs; ++i) {
-    full_cmd.digital_outputs[i] = {static_cast<uint16_t>(100 + i), (i % 2) == 1};
+    full_cmd.digital_outputs[i] = {static_cast<uint16_t>(100 + i),
+                                   (i % 2) == 1};
   }
   for (std::size_t i = 0; i < kMaxPwmOutputs; ++i) {
-    full_cmd.pwm_outputs[i] = {static_cast<uint16_t>(200 + i), 0.5 - 0.1 * i};
+    full_cmd.pwm_outputs[i] = {static_cast<uint16_t>(200 + i),
+                               0.5 - 0.1 * static_cast<double>(i)};
   }
   const auto full_cmd_size = Encode(full_cmd, bytes);
   ASSERT_GT(full_cmd_size, 0u);
   ASSERT_LE(full_cmd_size, protocol::kMaxPayloadSize);
   Command decoded_full_cmd;
-  ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), full_cmd_size}, decoded_full_cmd));
+  ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), full_cmd_size},
+                     decoded_full_cmd));
   EXPECT_EQ(decoded_full_cmd.count, kMaxMotors);
   EXPECT_EQ(decoded_full_cmd.digital_output_count, kMaxDigitalOutputs);
   EXPECT_EQ(decoded_full_cmd.pwm_output_count, kMaxPwmOutputs);
@@ -381,7 +389,8 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   const auto empty_state_size = Encode(empty_state, bytes);
   ASSERT_GT(empty_state_size, 0u);
   State decoded_empty_state;
-  ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), empty_state_size}, decoded_empty_state));
+  ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), empty_state_size},
+                     decoded_empty_state));
   EXPECT_EQ(decoded_empty_state.motor_count, 0u);
   EXPECT_EQ(decoded_empty_state.sensor_count, 0u);
   EXPECT_EQ(decoded_empty_state.digital_input_count, 0u);
@@ -401,22 +410,34 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   state.pwm_output_count = kMaxPwmOutputs;
 
   for (std::size_t i = 0; i < kMaxMotors; ++i) {
-    state.motors[i] = {static_cast<uint16_t>(i + 1), true, 1.0 + i, 2.0 + i, 11.5, 25.0, 123 + static_cast<uint32_t>(i), 456};
+    const auto x = static_cast<double>(i);
+    state.motors[i] = {
+        static_cast<uint16_t>(i + 1),   true, 1.0 + x, 2.0 + x, 11.5, 25.0,
+        123 + static_cast<uint32_t>(i), 456};
   }
   for (std::size_t i = 0; i < kMaxSensors; ++i) {
-    state.sensors[i] = {static_cast<uint16_t>(50 + i), true, 0.25 * i, 1.5, 789, 1011};
+    state.sensors[i] = {static_cast<uint16_t>(50 + i),
+                        true,
+                        0.25 * static_cast<double>(i),
+                        1.5,
+                        789,
+                        1011};
   }
   for (std::size_t i = 0; i < kMaxDigitalInputs; ++i) {
-    state.digital_inputs[i] = {static_cast<uint16_t>(100 + i), true, (i % 2) == 0};
+    state.digital_inputs[i] = {static_cast<uint16_t>(100 + i), true,
+                               (i % 2) == 0};
   }
   for (std::size_t i = 0; i < kMaxDigitalOutputs; ++i) {
-    state.digital_outputs[i] = {static_cast<uint16_t>(150 + i), true, (i % 2) == 1};
+    state.digital_outputs[i] = {static_cast<uint16_t>(150 + i), true,
+                                (i % 2) == 1};
   }
   for (std::size_t i = 0; i < kMaxAnalogInputs; ++i) {
-    state.analog_inputs[i] = {static_cast<uint16_t>(200 + i), true, 3.3 * i, 50};
+    state.analog_inputs[i] = {static_cast<uint16_t>(200 + i), true,
+                              3.3 * static_cast<double>(i), 50};
   }
   for (std::size_t i = 0; i < kMaxEncoders; ++i) {
-    state.encoders[i] = {static_cast<uint16_t>(250 + i), true, 10.0 * i, 5.0, 60};
+    state.encoders[i] = {static_cast<uint16_t>(250 + i), true,
+                         10.0 * static_cast<double>(i), 5.0, 60};
   }
   for (std::size_t i = 0; i < kMaxPwmOutputs; ++i) {
     state.pwm_outputs[i] = {static_cast<uint16_t>(300 + i), true, 0.75};
@@ -441,19 +462,25 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   EXPECT_DOUBLE_EQ(copy.encoders[2].position_rot, 20.0);
   EXPECT_DOUBLE_EQ(copy.pwm_outputs[3].output, 0.75);
 
-  for (std::size_t i = 0; i < state_size; ++i)
+  for (std::size_t i = 0; i < state_size; ++i) {
     EXPECT_FALSE(Decode(std::span<const uint8_t>{bytes.data(), i}, copy));
+  }
 }
 
 TEST(SimBackend, ModelsAllDeviceKindsIdeally) {
   Config config;
   config.commissioned = true;
-  config.motors.push_back({1, "motor1", 1, "rio", false, true, 40, 80, 12, Feedback::kRotor, 0, 1, 1, false, false, -1, 1, 100, 20, 40, 0});
-  config.sensors.push_back({2, "sensor1", SensorKind::kCANcoder, 2, "rio", false, 0});
+  config.motors.push_back(
+      {1, "motor1", 1, "rio", false, true, 40, 80,  12, Feedback::kRotor,
+       0, 1,        1, false, false, -1,   1,  100, 20, 40,
+       0});
+  config.sensors.push_back(
+      {2, "sensor1", SensorKind::kCANcoder, 2, "rio", false, 0});
   config.digital_inputs.push_back({3, "beam_break", 0});
   config.digital_outputs.push_back({4, "solenoid", 1});
   config.analog_inputs.push_back({5, "pressure", 0});
-  config.encoders.push_back({6, "quad_enc", EncoderKind::kQuadrature, 2, 3, 2048, 0});
+  config.encoders.push_back(
+      {6, "quad_enc", EncoderKind::kQuadrature, 2, 3, 2048, 0});
   config.pwm_outputs.push_back({7, "servo", 0});
 
   SimBackend backend;
@@ -576,12 +603,15 @@ TEST(Endpoint, PushesConfigOverUdpAndHandlesEpochChangeOnRestart) {
   SimBackend backend;
   Gateway gateway{backend, 2002};
   Endpoint endpoint{gateway};
-  ASSERT_EQ(endpoint.Open("127.0.0.1", 15802, "127.0.0.1", 15803), protocol::UdpStatus::kOk);
+  ASSERT_EQ(endpoint.Open("127.0.0.1", 15802, "127.0.0.1", 15803),
+            protocol::UdpStatus::kOk);
 
   protocol::RuntimeUdpPeer companion;
-  ASSERT_EQ(companion.Open("127.0.0.1", 15803, "127.0.0.1", 15802), protocol::UdpStatus::kOk);
+  ASSERT_EQ(companion.Open("127.0.0.1", 15803, "127.0.0.1", 15802),
+            protocol::UdpStatus::kOk);
 
-  auto poll_receive = [](protocol::RuntimeUdpPeer& peer, protocol::DecodedFrame* out) {
+  auto poll_receive = [](protocol::RuntimeUdpPeer& peer,
+                         protocol::DecodedFrame* out) {
     for (int i = 0; i < 50; ++i) {
       auto status = peer.TryReceive(out);
       if (status == protocol::UdpStatus::kOk) return status;
@@ -605,8 +635,8 @@ TEST(Endpoint, PushesConfigOverUdpAndHandlesEpochChangeOnRestart) {
   auto cfg = SwerveConfig(true);
   auto chunks = CreateConfigChunks(cfg);
   for (std::size_t i = 0; i < chunks.size(); ++i) {
-    ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig, i + 1, 1000,
-                                  chunks[i].data(), chunks[i].size()),
+    ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig, i + 1,
+                                  1000, chunks[i].data(), chunks[i].size()),
               protocol::UdpStatus::kOk);
   }
 
@@ -621,7 +651,8 @@ TEST(Endpoint, PushesConfigOverUdpAndHandlesEpochChangeOnRestart) {
   ASSERT_EQ(poll_receive(companion, &ack_frame), protocol::UdpStatus::kOk);
   EXPECT_EQ(ack_frame.header.type, protocol::FrameType::kHardwareConfigAck);
   ConfigAckPayload ack{};
-  ASSERT_TRUE(DecodeConfigAck({ack_frame.payload, ack_frame.payload_size}, ack));
+  ASSERT_TRUE(
+      DecodeConfigAck({ack_frame.payload, ack_frame.payload_size}, ack));
   EXPECT_EQ(ack.status, ConfigAckStatus::kOk);
   EXPECT_EQ(ack.config_id, ConfigurationId(cfg));
 
@@ -825,7 +856,9 @@ TEST(Endpoint, ConfigAckReasonCarriesFailingDeviceAndCause) {
             protocol::UdpStatus::kOk);
   const auto ack =
       PushConfigAndAwaitAck(endpoint, companion, SwerveConfig(true));
-  ASSERT_TRUE(ack.has_value());
+  if (!ack.has_value()) {
+    FAIL() << "no config ack";
+  }
   EXPECT_EQ(ack->status, ConfigAckStatus::kBackendFailed);
   const std::string reason(ack->reason);
   EXPECT_NE(reason.find("front_left_drive"), std::string::npos);
@@ -849,7 +882,9 @@ TEST(Endpoint, ConfigAckReasonFallsBackWithoutDetailedError) {
             protocol::UdpStatus::kOk);
   const auto ack =
       PushConfigAndAwaitAck(endpoint, companion, SwerveConfig(true));
-  ASSERT_TRUE(ack.has_value());
+  if (!ack.has_value()) {
+    FAIL() << "no config ack";
+  }
   EXPECT_EQ(ack->status, ConfigAckStatus::kBackendFailed);
   EXPECT_EQ(std::string(ack->reason), "Backend configuration failed");
 }

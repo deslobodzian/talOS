@@ -22,6 +22,7 @@ seconds.
 """
 
 import ctypes
+import enum
 import importlib.util
 import math
 import os
@@ -29,16 +30,16 @@ import sys
 
 from talos import _abi
 from talos._abi import TalosError, lib
-from talos._messages import Message, message_type
-from talos.devices import (AnalogInput, CANcoder, DigitalInput, DigitalOutput,
-                           Encoder, Gyro, Mode, Motor, PwmOutput,
-                           robot_enabled)
+from talos._messages import Message, enum_names, message_type
+from talos.devices import (Alliance, AnalogInput, CANcoder, DigitalInput,
+                           DigitalOutput, DriverStation, Encoder, Gyro,
+                           Joystick, Mode, Motor, PwmOutput, robot_enabled)
 
 __all__ = [
-    "AnalogInput", "CANcoder", "DigitalInput", "DigitalOutput", "Encoder",
-    "Gyro", "Message", "Mode", "Motor", "Node", "Publisher", "PwmOutput",
-    "StateMachine", "Subscription", "TalosError", "load",
-    "robot_enabled", "run",
+    "Alliance", "AnalogInput", "CANcoder", "DigitalInput", "DigitalOutput",
+    "DriverStation", "Encoder", "Gyro", "Joystick", "Message", "Mode",
+    "Motor", "Node", "Publisher", "PwmOutput", "StateMachine",
+    "Subscription", "TalosError", "load", "robot_enabled", "run",
 ]
 
 _NS = 1e9
@@ -179,9 +180,23 @@ class Publisher:
 
 
 class StateMachine:
-    """A state plus when it was entered, ticking with the node."""
+    """A state plus when it was entered, ticking with the node.
 
-    def __init__(self, node, initial):
+    States are enum.Enum members, or the int values of a flatc enum class
+    given as `states`:
+
+        self.sm = talos.StateMachine(node, State.STOWED, states=State)
+
+    With either, repr names the states and go() refuses a value that is not
+    one of them.
+    """
+
+    def __init__(self, node, initial, states=None):
+        if states is None and isinstance(initial, enum.Enum):
+            states = type(initial)
+        self._states = states
+        self._names = enum_names(states) if states is not None else None
+        self._check(initial)
         self._node = node
         self._state = self._previous = initial
         self._entered_update = lib.talos_node_next_update(node._handle)
@@ -200,12 +215,29 @@ class StateMachine:
 
     def go(self, state):
         """Switch to `state`; a no-op when already in it."""
+        self._check(state)
         if state == self._state:
             return
         self._previous, self._state = self._state, state
         self._entered_at = self._node.now
         # Entered during update() k: the first update to start in it is k + 1.
         self._entered_update = lib.talos_node_next_update(self._node._handle)
+
+    def __repr__(self):
+        return (f"StateMachine({self._name(self._state)}, "
+                f"previous={self._name(self._previous)}, "
+                f"time_in_state={self.time_in_state:g}s)")
+
+    def _name(self, state):
+        if self._names is not None and state in self._names:
+            return self._names[state]
+        return repr(state)
+
+    def _check(self, state):
+        if self._names is not None and state not in self._names:
+            raise ValueError(f"{self._states.__qualname__} has no state "
+                             f"{state!r}; it has "
+                             f"{', '.join(self._names.values())}")
 
     @property
     def time_in_state(self):

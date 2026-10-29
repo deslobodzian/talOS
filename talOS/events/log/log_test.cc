@@ -2,12 +2,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -69,6 +71,13 @@ std::vector<std::byte> MakePayload(std::size_t size, int seed) {
   return payload;
 }
 
+// What the writer stores of a payload: everything up to its last non-zero byte.
+std::size_t StoredSize(const std::vector<std::byte>& payload) {
+  std::size_t size = payload.size();
+  while (size > 0 && payload[size - 1] == std::byte{0}) --size;
+  return size;
+}
+
 struct ExpectedRecord {
   std::uint16_t kind{};
   std::uint16_t source_id{};
@@ -116,7 +125,8 @@ std::vector<ExpectedRecord> WriteFixtureWithOptions(
     context.kind = (i % 2 == 0) ? EventKind::TIMER : EventKind::MESSAGE;
     context.source_id = source_id;
     context.dispatch_index = static_cast<std::uint64_t>(i);
-    context.event_time = MonotonicTime::from_nanos(i * 1000);
+    context.event_time =
+        MonotonicTime::from_nanos(static_cast<std::int64_t>(i) * 1000);
     context.now = MonotonicTime::from_nanos(i * 1000 + (i % 5) * 10);
     context.sequence = static_cast<std::uint64_t>(i);
     context.dropped = static_cast<std::uint64_t>(i % 3);
@@ -198,7 +208,7 @@ TEST(LogRoundTrip, AllFieldsAndManifestMatch) {
   EXPECT_EQ(index, expected.size());
   EXPECT_EQ(reader.record_count(), expected.size());
   EXPECT_FALSE(reader.truncated());
-  EXPECT_EQ(reader.format_version(), 3u);
+  EXPECT_EQ(reader.format_version(), 4u);
   EXPECT_EQ(reader.session_id(), 0u);
 
   ::unlink(path.c_str());
@@ -208,14 +218,15 @@ TEST(LogRoundTrip, SessionIdPreserved) {
   const std::string path = TempPath("session_id");
   const std::uint64_t expected_session = 0x123456789ABCDEF0ULL;
   {
-    LogWriter writer{path, "session_test", LogWriter::Options{}, expected_session};
+    LogWriter writer{path, "session_test", LogWriter::Options{},
+                     expected_session};
     EXPECT_EQ(writer.session_id(), expected_session);
     writer.start(MakeManifest(), MonotonicTime::from_nanos(100));
     writer.flush();
   }
   LogReader reader{path};
   EXPECT_EQ(reader.session_id(), expected_session);
-  EXPECT_EQ(reader.format_version(), 3u);
+  EXPECT_EQ(reader.format_version(), 4u);
   ::unlink(path.c_str());
 }
 
@@ -234,7 +245,8 @@ TEST(LogRoundTrip, ManifestPreallocatesLargeMessages) {
     context.kind = EventKind::TIMER;
     context.source_id = 0;
     context.dispatch_index = static_cast<std::uint64_t>(i);
-    context.event_time = MonotonicTime::from_nanos(i * 100);
+    context.event_time =
+        MonotonicTime::from_nanos(static_cast<std::int64_t>(i) * 100);
     context.now = MonotonicTime::from_nanos(i * 100 + 5);
     context.sequence = static_cast<std::uint64_t>(i);
     context.dropped = 0;
@@ -282,22 +294,115 @@ std::size_t FileSize(const std::string& path) {
   return static_cast<std::size_t>(file.tellg());
 }
 
+// A fixed-size message is mostly trailing zero padding. The file stores each
+// payload only up to its last non-zero byte, and the reader hands back the
+// full recorded size, so nothing downstream can tell.
+TEST(LogPadding, TrailingZerosAreNotStoredButReadBack) {
+  const std::string path = TempPath("padding");
+  constexpr std::size_t kBytes = 128;  // the watcher's message size
+
+  std::vector<std::byte> sparse(kBytes);  // an interior zero, then padding
+  sparse[0] = std::byte{1};
+  sparse[2] = std::byte{3};
+  const std::vector<std::byte> empty(kBytes);
+  const std::vector<std::byte> dense = MakePayload(kBytes, 1);
+  ASSERT_NE(dense.back(), std::byte{0});
+  const std::vector<std::vector<std::byte>> payloads{sparse, empty, dense};
+
+  {
+    LogWriter writer{path, "padding", LogWriter::kDefaultBufferBytes};
+    writer.start(MakeManifest(), MonotonicTime::from_nanos(1));
+    for (std::size_t i = 0; i < payloads.size(); ++i) {
+      Context context;
+      context.kind = EventKind::MESSAGE;
+      context.source_id = 1;
+      context.dispatch_index = i + 1;
+      writer.dispatch(context, payloads[i]);
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+
+  EXPECT_EQ(FileSize(path), sizeof(FileHeader) + 3 * sizeof(ManifestEntry) +
+                                3 * sizeof(RecordHeader) + 3 + 0 + kBytes);
+
+  LogReader reader{path};
+  LogReader::Record record;
+  const std::uint32_t stored[] = {3, 0, kBytes};
+  for (std::size_t i = 0; i < payloads.size(); ++i) {
+    ASSERT_TRUE(reader.next(record)) << "record " << i;
+    EXPECT_EQ(record.header.payload_bytes, kBytes);
+    EXPECT_EQ(record.header.stored_bytes, stored[i]);
+    ASSERT_EQ(record.payload.size(), kBytes);
+    EXPECT_TRUE(std::equal(record.payload.begin(), record.payload.end(),
+                           payloads[i].begin()))
+        << "record " << i;
+  }
+  EXPECT_FALSE(reader.next(record));
+  EXPECT_FALSE(reader.truncated());
+
+  ::unlink(path.c_str());
+}
+
+// A header whose checksum is right but which claims to store more bytes than
+// its payload holds came from a broken writer; the reader must not guess.
+TEST(LogPadding, StoredBytesBeyondThePayloadThrow) {
+  const std::string path = TempPath("overstored");
+  {
+    LogWriter writer{path, "overstored", LogWriter::kDefaultBufferBytes};
+    writer.start(MakeManifest(), MonotonicTime::from_nanos(1));
+    Context context;
+    context.kind = EventKind::MESSAGE;
+    context.source_id = 1;
+    context.dispatch_index = 1;
+    writer.dispatch(context, MakePayload(8, 1));
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+
+  const std::size_t offset = sizeof(FileHeader) + 3 * sizeof(ManifestEntry);
+  std::fstream file{path, std::ios::in | std::ios::out | std::ios::binary};
+  ASSERT_TRUE(file.is_open());
+  RecordHeader header{};
+  std::vector<std::byte> stored(8);
+  file.seekg(static_cast<std::streamoff>(offset));
+  file.read(reinterpret_cast<char*>(&header), sizeof(header));
+  file.read(reinterpret_cast<char*>(stored.data()),
+            static_cast<std::streamsize>(stored.size()));
+  ASSERT_EQ(header.stored_bytes, 8u);
+
+  header.payload_bytes = 4;
+  header.crc32 = 0;
+  const std::span<const std::byte> header_bytes{
+      reinterpret_cast<const std::byte*>(&header), sizeof(header)};
+  header.crc32 = crc32(stored, crc32(header_bytes));
+  file.seekp(static_cast<std::streamoff>(offset));
+  file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+  file.close();
+
+  LogReader reader{path};
+  LogReader::Record record;
+  EXPECT_THROW(reader.next(record), std::runtime_error);
+
+  ::unlink(path.c_str());
+}
+
 TEST(LogCorruption, PayloadCrcMismatchThrows) {
   const std::string path = TempPath("payload_corrupt");
   const std::vector<ExpectedRecord> expected =
       WriteFixture(path, LogWriter::kDefaultBufferBytes);
 
   // The manifest block ends where the first record begins. Walk forward
-  // (skipping the zero-length payloads at the start of the fixture) to find
-  // the first record that actually has a payload to corrupt.
+  // (skipping the records that store no bytes at the start of the fixture) to
+  // find the first record that actually has stored bytes to corrupt.
   ASSERT_FALSE(expected.empty());
   std::size_t offset = sizeof(FileHeader) + 3 * sizeof(ManifestEntry);
   std::size_t target_index = 0;
   for (; target_index < expected.size(); ++target_index) {
-    if (!expected[target_index].payload.empty()) {
+    if (StoredSize(expected[target_index].payload) != 0) {
       break;
     }
-    offset += sizeof(RecordHeader) + expected[target_index].payload.size();
+    offset += sizeof(RecordHeader) + StoredSize(expected[target_index].payload);
   }
   ASSERT_LT(target_index, expected.size())
       << "fixture has no record with a payload";
@@ -430,9 +535,11 @@ TEST(LogBackgroundWriter, FlushWaitsForTheWriterThread) {
     Context context;
     context.kind = EventKind::TIMER;
     context.source_id = 0;
-    context.dispatch_index = static_cast<std::uint64_t>(i + 1);
-    context.event_time = MonotonicTime::from_nanos(i * 1000);
-    context.now = MonotonicTime::from_nanos(i * 1000);
+    context.dispatch_index = static_cast<std::uint64_t>(i) + 1;
+    context.event_time =
+        MonotonicTime::from_nanos(static_cast<std::int64_t>(i) * 1000);
+    context.now =
+        MonotonicTime::from_nanos(static_cast<std::int64_t>(i) * 1000);
     context.sequence = static_cast<std::uint64_t>(i);
     writer.dispatch(context, MakePayload(16, i));
   }
@@ -508,6 +615,7 @@ TEST(LogBackgroundWriter, BlockedDiskStopsCaptureWithoutBlockingProducer) {
   std::memcpy(&record, bytes.data() + sizeof(FileHeader), sizeof(record));
   EXPECT_EQ(record.dispatch_index, 1);
   EXPECT_EQ(record.payload_bytes, payload_size);
+  EXPECT_EQ(record.stored_bytes, payload_size);
   ::unlink(path.c_str());
 }
 

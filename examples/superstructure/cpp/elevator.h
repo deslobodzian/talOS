@@ -18,8 +18,8 @@ class Elevator {
 
   explicit Elevator(talos::Node& node)
       : lift_{node, "lift"},
-        goal_{node.subscribe<ElevatorGoal>(kElevatorGoalTopic)},
-        status_{node.publish<ElevatorStatus>(kElevatorStatusTopic)},
+        goal_{node.subscribe<ElevatorGoal>(topics::kElevatorGoal)},
+        status_{node.publish<ElevatorStatus>(topics::kElevatorStatus)},
         sm_{node, State::STOWED},
         tolerance_rot_{node.param<double>("tolerance_rot")} {}
 
@@ -32,9 +32,12 @@ class Elevator {
     const double height = lift_.position();
     const bool at_goal =
         lift_.connected() && std::abs(height - goal_rot_) <= tolerance_rot_;
-    if (!at_goal) sm_.go(State::MOVING);
-    else if (goal_rot_ == 0.0) sm_.go(State::STOWED);
-    else sm_.go(State::AT_GOAL);
+    if (!at_goal)
+      sm_.go(State::MOVING);
+    else if (goal_rot_ == 0.0)
+      sm_.go(State::STOWED);
+    else
+      sm_.go(State::AT_GOAL);
 
     status_.send(ElevatorStatus{sm_.state(), height, goal_rot_, at_goal});
   }

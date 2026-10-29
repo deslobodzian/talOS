@@ -47,12 +47,11 @@ class Lane {
     });
     // Autonomous is not written yet, so this lane has no publisher. That is
     // the design, not a broken link, and the graph lint is told so.
-    node.subscribe<M>(
-        autonomous,
-        [this, &source](const M& message) {
-          if (source == Source::kAutonomous) out_.send(message);
-        },
-        {.optional = true});
+    node.subscribe<M>(autonomous,
+                      [this, &source](const M& message) {
+                        if (source == Source::kAutonomous) out_.send(message);
+                      },
+                      {.optional = true});
   }
 
   void Send(const M& message) { out_.send(message); }
@@ -70,16 +69,17 @@ class Arbiter {
         // station state that enables teleop also admits the teleop target
         // the operator interface derived from it.
         mode_{node.subscribe<driver_station::DriverStationState>(
-            driver_station::kStateTopic,
+            driver_station::topics::kState,
             [this](const driver_station::DriverStationState& state) {
               OnMode(SourceFor(state.fms().flags()));
             })},
-        chassis_{node, source_, drivetrain::kTargetTopic,
-                 drivetrain::kTeleopTargetTopic, drivetrain::kAutoTargetTopic},
-        shooter_{node, source_, shooter::kTargetTopic,
-                 shooter::kTeleopTargetTopic, shooter::kAutoTargetTopic},
-        intake_{node, source_, intake::kTargetTopic, intake::kTeleopTargetTopic,
-                intake::kAutoTargetTopic} {}
+        chassis_{node, source_, drivetrain::topics::kTarget,
+                 drivetrain::topics::kTeleopTarget,
+                 drivetrain::topics::kAutoTarget},
+        shooter_{node, source_, shooter::topics::kTarget,
+                 shooter::topics::kTeleopTarget, shooter::topics::kAutoTarget},
+        intake_{node, source_, intake::topics::kTarget,
+                intake::topics::kTeleopTarget, intake::topics::kAutoTarget} {}
 
  private:
   void OnMode(Source next) {

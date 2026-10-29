@@ -10,6 +10,7 @@
 
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/driver_station/driver_station_node.h"
+#include "talOS/hardware/packet.h"
 #include "talOS/node/testing.h"
 
 namespace driver_station {
@@ -47,7 +48,7 @@ class DriverStationTest : public ::testing::Test {
   }
   ::driver_station::DriverStationState State() const {
     const auto state =
-        sim.latest<::driver_station::DriverStationState>(kStateTopic);
+        sim.latest<::driver_station::DriverStationState>(topics::kState);
     EXPECT_TRUE(state.has_value());
     return state.value_or(::driver_station::DriverStationState{});
   }
@@ -133,7 +134,7 @@ TEST_F(DriverStationTest, IgnoresACorruptPacket) {
   corrupt.data[1] = 0xFF;
   Send(corrupt);
   EXPECT_FALSE(
-      sim.latest<::driver_station::DriverStationState>(kStateTopic));
+      sim.latest<::driver_station::DriverStationState>(topics::kState));
 }
 
 struct Result {

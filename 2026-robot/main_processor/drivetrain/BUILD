@@ -5,11 +5,17 @@ load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
 
 # ChassisTarget / DrivetrainState (namespace drivetrain) and the drivetrain's
 # topics. Odometry, the operator interface, telemetry and the arbiter consume
-# them.
+# them. /drivetrain/target has one writer, the arbiter; teleop and autonomous
+# publish on their own lanes and the arbiter picks one.
 talos_messages(
     name = "messages",
     srcs = ["drive_message.fbs"],
-    hdrs = ["topics.h"],
+    topics = {
+        "state": "/drivetrain/state",
+        "target": "/drivetrain/target",
+        "teleop_target": "/drivetrain/target/teleop",
+        "auto_target": "/drivetrain/target/auto",
+    },
 )
 
 # The swerve kinematics and the geometry they run on, read from config.
@@ -19,35 +25,35 @@ cc_library(
         "geometry.h",
         "swerve.h",
     ],
-    strip_include_prefix = ".",
     include_prefix = "drivetrain",
+    strip_include_prefix = ".",
+    visibility = ["//visibility:private"],
     deps = [
-        "//talOS/configuration:configuration",
+        "//talOS/configuration",
         "//talOS/devices",
         "//talOS/node",
     ],
-    visibility = ["//visibility:private"],
 )
 
 cc_library(
     name = "drivetrain",
     hdrs = ["drivetrain.h"],
-    strip_include_prefix = ".",
     include_prefix = "drivetrain",
+    strip_include_prefix = ".",
+    # The arbiter's teleop-chain test runs the real drivetrain.
+    visibility = ["//2026-robot/main_processor/arbiter:__pkg__"],
     deps = [
         ":messages",
         ":swerve",
         "//talOS/devices",
         "//talOS/node",
     ],
-    # The arbiter's teleop-chain test runs the real drivetrain.
-    visibility = ["//2026-robot/main_processor/arbiter:__pkg__"],
 )
 
 talos_cc_node(
     name = "node",
-    node_name = "drivetrain",
     srcs = ["drivetrain.cc"],
+    node_name = "drivetrain",
     deps = [":drivetrain"],
 )
 
@@ -90,7 +96,7 @@ cc_test(
     },
     deps = [
         ":drivetrain",
-        "//talOS/configuration:configuration",
+        "//talOS/configuration",
         "//talOS/devices:testing",
         "//talOS/node:testing",
         "@googletest//:gtest_main",

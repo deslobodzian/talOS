@@ -3,6 +3,7 @@ reports whether it has arrived. The profile (cruise, acceleration), gains and
 soft limits are the motor's, in the robot config."""
 
 import talos
+from demo import topics
 from demo.ElevatorGoal import ElevatorGoal
 from demo.ElevatorState import ElevatorState as State
 from demo.ElevatorStatus import ElevatorStatus
@@ -11,9 +12,9 @@ from demo.ElevatorStatus import ElevatorStatus
 class Elevator:
     def __init__(self, node):
         self.lift = talos.Motor(node, "lift")
-        self.goal = node.subscribe(ElevatorGoal, "/elevator/target")
-        self.status = node.publish(ElevatorStatus, "/elevator/state")
-        self.sm = talos.StateMachine(node, State.STOWED)
+        self.goal = node.subscribe(ElevatorGoal, topics.ELEVATOR_GOAL)
+        self.status = node.publish(ElevatorStatus, topics.ELEVATOR_STATUS)
+        self.sm = talos.StateMachine(node, State.STOWED, states=State)
         self.tolerance_rot = node.param("tolerance_rot")
         self.goal_rot = 0.0  # stowed
 

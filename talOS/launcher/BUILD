@@ -7,11 +7,12 @@ cc_library(
     hdrs = ["launcher.h"],
     visibility = ["//visibility:public"],
     deps = [
-        "//talOS/configuration:configuration",
+        "//talOS/configuration",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
+        "@tomlplusplus//:toml++",
     ],
 )
 
@@ -41,6 +42,16 @@ cc_test(
         "//talOS/events:events_log",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "supervision_test",
+    size = "small",
+    srcs = ["supervision_test.cc"],
+    deps = [
+        ":launcher_lib",
         "@googletest//:gtest_main",
     ],
 )
