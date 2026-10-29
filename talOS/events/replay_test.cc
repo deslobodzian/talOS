@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <array>
+#include <cstddef>
 #include <cstdio>
 #include <fstream>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -404,6 +407,103 @@ TEST(Replay, ReplaysTheCompletePrefixOfATruncatedLog) {
 
   std::remove(path.c_str());
   std::remove(truncated_path.c_str());
+}
+
+// Mostly trailing zeros, like a hardware packet: the log stores only the
+// leading bytes of each one.
+struct Padded {
+  std::array<std::byte, 256> bytes{};
+};
+
+// Echoes every message it receives, with `mark` in the last byte.
+template <typename Loop>
+struct PaddedEcho {
+  Loop& loop;
+  std::byte mark{0};
+  std::uint16_t sender{0};
+  std::vector<std::vector<std::byte>> received;
+
+  explicit PaddedEcho(Loop& event_loop) : loop{event_loop} {
+    loop.register_watcher("/replay/padded_in", sizeof(Padded), alignof(Padded),
+                          make_thunk<&PaddedEcho::echo>(this));
+    sender = loop.register_sender("/replay/padded_out", sizeof(Padded),
+                                  alignof(Padded));
+  }
+
+  void echo(const Context&, std::span<const std::byte> payload) {
+    received.emplace_back(payload.begin(), payload.end());
+    std::vector<std::byte> out{payload.begin(), payload.end()};
+    out.back() = mark;
+    loop.send_message(sender, out);
+  }
+};
+
+// Replay restores the padding the log left out: handlers see the full
+// recorded bytes, sends are checked against all of them, and the replay
+// re-records the identical log.
+TEST(Replay, RestoresTrailingZerosTheLogDoesNotStore) {
+  const auto original_path = temp_path("padded_a");
+  const auto replayed_path = temp_path("padded_b");
+
+  std::vector<std::vector<std::byte>> recorded;
+  {
+    SimulationEnvironment environment;
+    SimulatedEventLoop<log::LogWriter> loop{
+        environment, log::LogWriter{original_path, "padded"}};
+    PaddedEcho echo{loop};
+    for (int i = 0; i < 4; ++i) {
+      Padded message{};
+      message.bytes[0] = static_cast<std::byte>(i);  // a leading zero at i == 0
+      message.bytes[2] = std::byte{9};
+      if (i == 3) message.bytes[200] = std::byte{7};
+      loop.inject("/replay/padded_in", message);
+      loop.run_for(1ms);
+    }
+    loop.finish();
+    ASSERT_FALSE(loop.recorder().failed()) << loop.recorder().error();
+    recorded = echo.received;
+  }
+  ASSERT_EQ(recorded.size(), 4u);
+
+  {
+    log::LogReader reader{original_path};
+    log::LogReader::Record record;
+    std::size_t trimmed = 0;
+    while (reader.next(record)) {
+      if (record.header.stored_bytes < record.header.payload_bytes) ++trimmed;
+    }
+    EXPECT_EQ(trimmed, 8u) << "every message and echo should drop padding";
+  }
+
+  {
+    log::LogReader reader{original_path};
+    ReplayEventLoop<log::LogWriter> loop{
+        reader, log::LogWriter{replayed_path, "padded"}};
+    PaddedEcho echo{loop};
+    loop.run();
+    EXPECT_FALSE(loop.diverged());
+    EXPECT_EQ(echo.received, recorded);
+  }
+
+  auto original = read_file(original_path);
+  auto replayed = read_file(replayed_path);
+  ASSERT_EQ(original.size(), replayed.size());
+  for (std::size_t i = 0; i < WALL_CLOCK_BYTES; ++i) {
+    original[WALL_CLOCK_OFFSET + i] = 0;
+    replayed[WALL_CLOCK_OFFSET + i] = 0;
+  }
+  EXPECT_EQ(original, replayed);
+
+  // A byte the log left out is still compared: writing into the padding is a
+  // different send.
+  log::LogReader reader{original_path};
+  ReplayEventLoop<> loop{reader};
+  PaddedEcho echo{loop};
+  echo.mark = std::byte{1};
+  EXPECT_THROW(loop.run(), ReplayDivergence);
+
+  std::remove(original_path.c_str());
+  std::remove(replayed_path.c_str());
 }
 
 }  // namespace

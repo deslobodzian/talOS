@@ -9,8 +9,8 @@ cc_library(
     ],
     hdrs = [
         "frame.h",
-        "udp.h",
         "types.h",
+        "udp.h",
     ],
     linkopts = select({
         "@platforms//os:windows": ["ws2_32.lib"],

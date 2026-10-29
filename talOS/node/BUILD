@@ -6,8 +6,8 @@ load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
 cc_library(
     name = "loop_port",
     hdrs = ["internal.h"],
-    deps = ["//talOS/events:events_core"],
     visibility = ["//visibility:private"],
+    deps = ["//talOS/events:events_core"],
 )
 
 # The node authoring API: talos::Node, Subscription, Publisher, StateMachine,
@@ -19,17 +19,19 @@ cc_library(
         "access.h",
         "node.h",
     ],
+    visibility = ["//visibility:public"],
     deps = [
         ":loop_port",
-        "//talOS/configuration:configuration",
-        "//talOS/events:events",
+        "//talOS/configuration",
+        "//talOS/events",
         "//talOS/events:events_core",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
-        "//talOS/ipc:ipc",
-        "//talOS/process:node_main",
+        "//talOS/introspection:reporter",
+        "//talOS/ipc",
+        "//talOS/process",
+        "//talOS/rtms",
     ],
-    visibility = ["//visibility:public"],
 )
 
 # talos::testing::Sim: several nodes on one virtual clock.
@@ -41,13 +43,13 @@ cc_library(
         "sim_access.h",
         "testing.h",
     ],
+    visibility = ["//visibility:public"],
     deps = [
         ":loop_port",
         ":node",
-        "//talOS/configuration:configuration",
-        "//talOS/events:events",
+        "//talOS/configuration",
+        "//talOS/events",
     ],
-    visibility = ["//visibility:public"],
 )
 
 talos_messages(
@@ -60,10 +62,10 @@ talos_messages(
 # A small real node binary, for the --describe and log/replay tests.
 talos_cc_node(
     name = "test_node",
-    node_name = "test_node",
     srcs = ["testdata/test_node.cc"],
-    deps = [":test_messages"],
+    node_name = "test_node",
     visibility = ["//visibility:private"],
+    deps = [":test_messages"],
 )
 
 cc_test(
@@ -79,9 +81,14 @@ cc_test(
         "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
     },
     deps = [
+        ":loop_port",
         ":node",
         ":test_messages",
         ":testing",
+        "//talOS/configuration",
+        "//talOS/events",
+        "//talOS/memory:shared_memory",
+        "//talOS/rtms",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],

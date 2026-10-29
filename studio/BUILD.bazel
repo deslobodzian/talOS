@@ -1,11 +1,14 @@
 load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_library", "js_run_binary", "js_test")
 load("@studio_npm//:defs.bzl", "npm_link_all_packages")
-load("@studio_npm//studio:vite/package_json.bzl", vite_bin = "bin")
 load("@studio_npm//studio:typescript/package_json.bzl", tsc_bin = "bin")
+load("@studio_npm//studio:vite/package_json.bzl", vite_bin = "bin")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["package.json", "pnpm-lock.yaml"])
+exports_files([
+    "package.json",
+    "pnpm-lock.yaml",
+])
 
 npm_link_all_packages(name = "node_modules")
 
@@ -22,61 +25,90 @@ genrule(
         "src/generated/talos/telemetry/pose.ts",
         "src/generated/talos/telemetry/target.ts",
     ],
-    tools = ["@flatbuffers//:flatc"],
     cmd = "$(location @flatbuffers//:flatc) --ts -o $(RULEDIR)/src/generated $(location //studio/schema:telemetry.fbs)",
+    tools = ["@flatbuffers//:flatc"],
 )
 
 js_library(
     name = "sources",
-    srcs = glob(["src/**/*.ts", "src/**/*.tsx", "src/**/*.css", "tests/*.ts", "tests/*.tsx", "tests/*.json", "agent/*.ts", "agent/*.mjs", "tests/*.mjs"]) + [":telemetry_ts", "index.html", "package.json", "tsconfig.json"],
+    srcs = glob([
+        "src/**/*.ts",
+        "src/**/*.tsx",
+        "src/**/*.css",
+        "tests/*.ts",
+        "tests/*.tsx",
+        "tests/*.json",
+        "agent/*.ts",
+        "agent/*.mjs",
+        "tests/*.mjs",
+    ]) + [
+        "index.html",
+        "package.json",
+        "tsconfig.json",
+        ":telemetry_ts",
+    ],
     deps = [":node_modules"],
 )
 
-vite_bin.vite_binary(name = "vite", chdir = "studio")
+vite_bin.vite_binary(
+    name = "vite",
+    chdir = "studio",
+)
 
 tsc_bin.tsc_test(
     name = "typecheck",
-    args = ["--noEmit", "--project", "tsconfig.json"],
+    args = [
+        "--noEmit",
+        "--project",
+        "tsconfig.json",
+    ],
     chdir = "studio",
     data = [":sources"],
 )
 
 js_run_binary(
     name = "web_dist",
-    tool = ":vite",
     srcs = [":sources"],
-    args = ["build", "--outDir", "dist"],
-    out_dirs = ["dist"],
+    args = [
+        "build",
+        "--outDir",
+        "dist",
+    ],
     chdir = "studio",
+    out_dirs = ["dist"],
+    tool = ":vite",
 )
 
 vite_bin.vite_binary(
     name = "dev",
-    data = [":sources"],
     chdir = "studio",
-    fixed_args = ["--host", "127.0.0.1"],
+    data = [":sources"],
+    fixed_args = [
+        "--host",
+        "127.0.0.1",
+    ],
 )
 
 js_binary(
     name = "agent",
-    entry_point = "agent/run.mjs",
-    data = [":sources"],
     chdir = "studio",
+    data = [":sources"],
+    entry_point = "agent/run.mjs",
 )
 
 js_test(
     name = "core_test",
-    entry_point = "tests/run.mjs",
-    data = [":sources"],
     chdir = "studio",
+    data = [":sources"],
+    entry_point = "tests/run.mjs",
     fixed_args = ["core.test.ts"],
 )
 
 js_test(
     name = "agent_test",
-    entry_point = "tests/run.mjs",
-    data = [":sources"],
     chdir = "studio",
+    data = [":sources"],
+    entry_point = "tests/run.mjs",
     fixed_args = ["agent.test.ts"],
 )
 
@@ -84,17 +116,17 @@ js_test(
 # successful bundle prove the code compiles; this proves it runs.
 js_test(
     name = "view_test",
-    entry_point = "tests/run.mjs",
-    data = [":sources"],
     chdir = "studio",
+    data = [":sources"],
+    entry_point = "tests/run.mjs",
     fixed_args = ["view.test.tsx"],
 )
 
 js_test(
     name = "system_test",
-    entry_point = "tests/run.mjs",
-    data = [":sources"],
     chdir = "studio",
+    data = [":sources"],
+    entry_point = "tests/run.mjs",
     fixed_args = ["system.test.ts"],
 )
 
@@ -103,10 +135,22 @@ js_test(
 # launcher really produced, so a change to its envelope fails here.
 js_test(
     name = "declared_test",
-    entry_point = "tests/run.mjs",
-    data = [":sources"],
     chdir = "studio",
+    data = [":sources"],
+    entry_point = "tests/run.mjs",
     fixed_args = ["declared.test.ts"],
 )
 
-test_suite(name = "tests", tests = [":core_test", ":agent_test", ":declared_test", ":system_test", ":view_test", ":typecheck", "//studio/schema:wire_test", "//studio/bridge:system_test"])
+test_suite(
+    name = "tests",
+    tests = [
+        ":agent_test",
+        ":core_test",
+        ":declared_test",
+        ":system_test",
+        ":typecheck",
+        ":view_test",
+        "//studio/bridge:system_test",
+        "//studio/schema:wire_test",
+    ],
+)

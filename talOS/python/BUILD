@@ -11,10 +11,10 @@ py_library(
         "talos/_messages.py",
         "talos/devices.py",
     ],
-    imports = ["."],
     data = ["//talOS/node_api:libtalos_node.so"],
-    deps = ["@pypi//flatbuffers"],
+    imports = ["."],
     visibility = ["//visibility:public"],
+    deps = ["@pypi//flatbuffers"],
 )
 
 # `talos.testing`: Sim and SimHardware.
@@ -22,10 +22,10 @@ py_library(
     name = "testing",
     testonly = True,
     srcs = ["talos/testing.py"],
-    imports = ["."],
     data = ["//talOS/node_api:libtalos_node_testing.so"],
-    deps = [":talos"],
+    imports = ["."],
     visibility = ["//visibility:public"],
+    deps = [":talos"],
 )
 
 talos_messages(

@@ -233,7 +233,12 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
     m.supply_limit_a = r.Real();
     m.stator_limit_a = r.Real();
     m.max_voltage = r.Real();
-    m.feedback = static_cast<Feedback>(r.Int(1));
+    const auto feedback = r.Int(1);
+    if (feedback != static_cast<uint8_t>(Feedback::kRotor) &&
+        feedback != static_cast<uint8_t>(Feedback::kRemoteCANcoder)) {
+      return false;
+    }
+    m.feedback = static_cast<Feedback>(feedback);
     m.feedback_sensor_id = r.Int(2);
     m.rotor_to_sensor_ratio = r.Real();
     m.sensor_to_mechanism_ratio = r.Real();
@@ -263,7 +268,12 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
     auto& s = c.sensors[i];
     s.id = r.Int(2);
     s.name = r.Text();
-    s.kind = static_cast<SensorKind>(r.Int(1));
+    const auto kind = r.Int(1);
+    if (kind != static_cast<uint8_t>(SensorKind::kCANcoder) &&
+        kind != static_cast<uint8_t>(SensorKind::kPigeon2)) {
+      return false;
+    }
+    s.kind = static_cast<SensorKind>(kind);
     s.can_id = r.Int(4);
     s.bus = r.Text();
     s.inverted = (r.Int(1) == 1);
@@ -303,7 +313,12 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
   for (std::size_t i = 0; i < enc_count; ++i) {
     c.encoders[i].id = r.Int(2);
     c.encoders[i].name = r.Text();
-    c.encoders[i].kind = static_cast<EncoderKind>(r.Int(1));
+    const auto kind = r.Int(1);
+    if (kind != static_cast<uint8_t>(EncoderKind::kQuadrature) &&
+        kind != static_cast<uint8_t>(EncoderKind::kDutyCycle)) {
+      return false;
+    }
+    c.encoders[i].kind = static_cast<EncoderKind>(kind);
     c.encoders[i].dio_a = r.Int(4);
     c.encoders[i].dio_b = r.Int(4);
     c.encoders[i].counts_per_rev = r.Real();
@@ -428,8 +443,7 @@ class ConfigAssembler {
       assembled_buffer_.assign(total_bytes_, 0);
       received_count_ = 0;
     } else {
-      if (hdr.total_bytes != total_bytes_ ||
-          hdr.total_crc32 != total_crc32_ ||
+      if (hdr.total_bytes != total_bytes_ || hdr.total_crc32 != total_crc32_ ||
           hdr.chunk_count != chunk_count_) {
         error_reason = "inconsistent chunk metadata";
         Reset();

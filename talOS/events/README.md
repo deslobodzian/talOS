@@ -173,14 +173,17 @@ Inspect a log with `bazel run //talOS/launcher:log_dump -- /tmp/run.tlog`.
 
 `[FileHeader][ManifestEntry × n][Record ...]`, little-endian, append-only, with
 a CRC on the manifest block and on every record. A record is a 56-byte header
-plus its payload. A log that ends mid-record is not corruption: everything
-before the cut still replays, which matters when a robot loses power. A record
-whose checksum is wrong *is* corruption and is refused.
+plus its payload up to the last non-zero byte: fixed-size messages are mostly
+trailing zero padding, so the header keeps the payload's full size and the
+reader zero-fills it back, handing out exactly the bytes that were recorded. A
+log that ends mid-record is not corruption: everything before the cut still
+replays, which matters when a robot loses power. A record whose checksum is
+wrong *is* corruption and is refused.
 
 Format details live in `log/format.h`. The version field is checked on read;
 readers reject a version they do not know rather than guessing.
-The current format is version 2; version 1 logs are rejected because they do
-not contain the timer and shutdown information needed by these checks.
+The current format is version 4, which added the trailing-zero trimming;
+earlier logs are rejected.
 
 Records are copied into preallocated chunks and handed to a background thread
 through an atomic ring. Dispatch does not lock, wait for disk, or resize buffers.

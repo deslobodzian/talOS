@@ -59,10 +59,8 @@ def main():
 
     bin_dir = os.path.join(out_dir, "bin")
     config_dir = os.path.join(out_dir, "config")
-    lib_dir = os.path.join(out_dir, "lib")
     os.makedirs(bin_dir, exist_ok=True)
     os.makedirs(config_dir, exist_ok=True)
-    os.makedirs(lib_dir, exist_ok=True)
 
     # 1. Launcher binary
     launcher_src = spec["launcher_path"]
@@ -75,13 +73,7 @@ def main():
         os.makedirs(named_launcher_dir, exist_ok=True)
         safe_symlink("../launcher", os.path.join(named_launcher_dir, "launcher"))
 
-    # 2. Shared libraries
-    for lib_path in spec.get("shared_lib_paths", []):
-        dest = os.path.join(lib_dir, os.path.basename(lib_path))
-        safe_copy(lib_path, dest)
-        make_executable(dest)
-
-    # 3. Config
+    # 2. Config
     config_src = spec["config_path"]
     config_basename = os.path.basename(config_src)
     config_dest = os.path.join(config_dir, config_basename)
@@ -95,7 +87,7 @@ def main():
         config_hash.update(f.read())
     subsystem_bytes = {}
 
-    # 4. Subsystems
+    # 3. Subsystems
     for sub in spec.get("subsystems", []):
         sub_src = sub["src_path"]
         sub_name = sub["name"]
@@ -111,7 +103,8 @@ def main():
         config_hash.update(subsystem_bytes[sub_name])
     config_sha256 = config_hash.hexdigest()
 
-    # 5. Nodes
+    # 4. Nodes. A Python node's runfiles carry libtalos_node.so (a data
+    # dependency of //talOS/python:talos), which talos._abi finds beside itself.
     manifest_nodes = []
     for node in spec.get("nodes", []):
         name = node["name"]
@@ -180,19 +173,6 @@ def main():
                         os.symlink(rel_py, dest)
                         make_executable(dest)
 
-            for lib_path in spec.get("shared_lib_paths", []):
-                lib_name = os.path.basename(lib_path)
-                for candidate in [
-                    f"talos/talOS/node_api/{lib_name}",
-                    f"_main/talOS/node_api/{lib_name}",
-                ]:
-                    lib_dest = os.path.join(rf_dir, candidate)
-                    try:
-                        safe_copy(lib_path, lib_dest)
-                    except Exception:
-                        pass
-                    manifest_lines.append(f"{candidate} {lib_dest}\n")
-
             with open(os.path.join(rf_dir, "MANIFEST"), "w") as mf:
                 mf.writelines(manifest_lines)
 
@@ -200,46 +180,40 @@ def main():
                 safe_copy(repo_mapping_src, os.path.join(rf_dir, "_repo_mapping"))
                 safe_copy(repo_mapping_src, os.path.join(bin_dir, f"{name}.repo_mapping"))
 
-        node_contract = node.get("contract", "")
-        if target and target != "//:node":
-            manifest_nodes.append({
-                "name": name,
-                "target": target,
-                "binary_path": bin_rel,
-                "language": lang,
-                "contract": node_contract,
-            })
-        label = node.get("label")
-        if label and label != target:
-            manifest_nodes.append({
-                "name": name,
-                "target": label,
-                "binary_path": bin_rel,
-                "language": lang,
-                "contract": node_contract,
-            })
+        # Every label the robot config may name this node by.
+        targets = [t for t in (target, node.get("label")) if t]
+        manifest_nodes.append({
+            "name": name,
+            "targets": list(dict.fromkeys(targets)),
+            "binary": bin_rel,
+            "language": lang,
+        })
 
-    # 6. bundle_manifest.json
-    manifest = {
-        "bundle_version": 1,
-        "config_path": f"config/{config_basename}",
-        "config_sha256": config_sha256,
-        "nodes": manifest_nodes,
-    }
-    manifest_path = os.path.join(out_dir, "bundle_manifest.json")
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-        f.write("\n")
+    # 5. bundle_manifest.toml, read by the launcher's LoadBundle. A JSON string
+    # literal (ASCII, \uXXXX escapes) is also a valid TOML basic string.
+    lines = [
+        "bundle_version = 1",
+        f"config_path = {json.dumps(f'config/{config_basename}')}",
+        f"config_sha256 = {json.dumps(config_sha256)}",
+    ]
+    for entry in manifest_nodes:
+        lines += [
+            "",
+            "[[nodes]]",
+            f"name = {json.dumps(entry['name'])}",
+            f"targets = [{', '.join(json.dumps(t) for t in entry['targets'])}]",
+            f"binary = {json.dumps(entry['binary'])}",
+            f"language = {json.dumps(entry['language'])}",
+        ]
+    with open(os.path.join(out_dir, "bundle_manifest.toml"), "w") as f:
+        f.write("\n".join(lines) + "\n")
 
-    # 7. run.sh
+    # 6. run.sh
     run_sh_path = os.path.join(out_dir, "run.sh")
     with open(run_sh_path, "w") as f:
         f.write(f"""#!/usr/bin/env bash
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
-export LD_LIBRARY_PATH="${{SCRIPT_DIR}}/lib:${{LD_LIBRARY_PATH:-}}"
-export DYLD_LIBRARY_PATH="${{SCRIPT_DIR}}/lib:${{DYLD_LIBRARY_PATH:-}}"
-export TALOS_NODE_LIB="${{SCRIPT_DIR}}/lib/libtalos_node.so"
 export PATH="${{SCRIPT_DIR}}/bin:${{PATH}}"
 
 unset BUILD_WORKSPACE_DIRECTORY

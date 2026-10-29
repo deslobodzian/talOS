@@ -2,7 +2,13 @@
 // honesty: quadrature scaling from counts_per_rev,
 // duty-cycle device support with offsets and connection validity, and no
 // demand teleport when controller voltage is zero (missing gains exposed).
+#include "PhoenixBackend.h"
+
+#include <frc/simulation/DriverStationSim.h>
+#include <frc/simulation/DutyCycleEncoderSim.h>
+#include <frc/simulation/EncoderSim.h>
 #include <gtest/gtest.h>
+#include <hal/HAL.h>
 
 #include <array>
 #include <chrono>
@@ -10,12 +16,6 @@
 #include <span>
 #include <thread>
 
-#include <frc/simulation/DriverStationSim.h>
-#include <frc/simulation/DutyCycleEncoderSim.h>
-#include <frc/simulation/EncoderSim.h>
-#include <hal/HAL.h>
-
-#include "PhoenixBackend.h"
 #include "hardware/gateway.h"
 
 namespace hw = talos::hardware;
@@ -251,7 +251,8 @@ TEST(PhoenixBackendSim, ZeroVoltageVelocityRequestDoesNotSupplyDemand) {
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(c));
 
-  const std::array<hw::MotorRequest, 1> cmd{Request(1, hw::Mode::kVelocity, 10.0)};
+  const std::array<hw::MotorRequest, 1> cmd{
+      Request(1, hw::Mode::kVelocity, 10.0)};
   ASSERT_TRUE(backend.Apply(cmd));
 
   hw::State s;
@@ -270,7 +271,8 @@ TEST(PhoenixBackendSim, ZeroVoltagePositionRequestDoesNotTeleport) {
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(c));
 
-  const std::array<hw::MotorRequest, 1> cmd{Request(1, hw::Mode::kPosition, 5.0)};
+  const std::array<hw::MotorRequest, 1> cmd{
+      Request(1, hw::Mode::kPosition, 5.0)};
   ASSERT_TRUE(backend.Apply(cmd));
 
   hw::State s;
@@ -289,7 +291,8 @@ TEST(PhoenixBackendSim, VoltageStillDrivesMotor) {
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(c));
 
-  const std::array<hw::MotorRequest, 1> cmd{Request(1, hw::Mode::kDutyCycle, 0.5)};
+  const std::array<hw::MotorRequest, 1> cmd{
+      Request(1, hw::Mode::kDutyCycle, 0.5)};
   ASSERT_TRUE(backend.Apply(cmd));
 
   hw::State s;

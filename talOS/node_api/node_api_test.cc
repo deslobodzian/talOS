@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 namespace {
@@ -229,6 +230,94 @@ TEST_F(NodeApi, UnknownDeviceIsNamed) {
   EXPECT_LT(talos_device(node, TALOS_DEVICE_MOTOR, "flywheel"), 0);
   EXPECT_NE(std::string{talos_last_error()}.find("'flywheel'"),
             std::string::npos);
+}
+
+TEST_F(NodeApi, DisconnectedDeviceSampleIsInvalid) {
+  Roller roller;
+  TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3.0, 1.5),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_connected(hw, "roller", "wheel", 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 15 * kMs), TALOS_OK) << talos_last_error();
+
+  TalosSample wheel{};
+  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &wheel), TALOS_OK);
+  EXPECT_EQ(wheel.valid, 0);
+  EXPECT_EQ(wheel.position, 0.0);
+  TalosSample beam{};
+  ASSERT_EQ(talos_digital_input_sample(node, roller.beam, &beam), TALOS_OK);
+  EXPECT_EQ(beam.valid, 1);
+
+  EXPECT_EQ(talos_sim_hardware_set_connected(hw, "roller", "flywheel", 0),
+            TALOS_ERR);
+  EXPECT_NE(std::string{talos_last_error()}.find("'flywheel'"),
+            std::string::npos);
+  talos_sim_hardware_destroy(hw);
+}
+
+// --- Driver Station ------------------------------------------------------
+
+int32_t BuildPilot(TalosNode* node, void* user) {
+  auto count = [](void* packets) -> int32_t {
+    ++*static_cast<int*>(packets);
+    return 0;
+  };
+  return talos_driver_station(node, count, user);
+}
+
+TEST_F(NodeApi, DriverStationReadsWhatSimHardwareForwards) {
+  int packets = 0;
+  TalosNode* node = talos_sim_add(sim_, "relay", &BuildPilot, &packets);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+
+  TalosDriverStationPacket packet{};
+  packet.flags = TALOS_DS_ATTACHED | TALOS_DS_ENABLED | TALOS_DS_AUTONOMOUS;
+  packet.alliance = 1;  // red
+  packet.station = 2;
+  packet.match_time_s = 7.5f;
+  TalosJoystick& stick = packet.joysticks[0];
+  stick.connected = 1;
+  stick.axis_count = 2;
+  stick.axes[0] = 0.25f;
+  stick.axes[1] = -0.5f;
+  stick.axes[2] = 0.75f;  // past axis_count
+  stick.button_count = 3;
+  stick.buttons = 0b101;
+  stick.pov_count = 1;
+  stick.povs[0] = 180;
+  std::strncpy(stick.name, "pad", sizeof stick.name);
+  ASSERT_EQ(talos_sim_hardware_set_driver_station(hw, &packet), TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 25 * kMs), TALOS_OK) << talos_last_error();
+
+  EXPECT_GT(packets, 0);
+  TalosDriverStation ds{};
+  ASSERT_EQ(talos_driver_station_read(node, &ds), TALOS_OK);
+  EXPECT_EQ(ds.connected, 1);
+  EXPECT_EQ(ds.enabled, 1);
+  EXPECT_EQ(ds.autonomous, 1);
+  EXPECT_EQ(ds.teleop, 0);
+  EXPECT_EQ(ds.alliance, 1);
+  EXPECT_EQ(ds.station, 2);
+  EXPECT_DOUBLE_EQ(ds.match_time_s, 7.5);
+  const TalosJoystick& read = ds.joysticks[0];
+  EXPECT_EQ(read.connected, 1);
+  EXPECT_EQ(read.axis_count, 2);
+  EXPECT_FLOAT_EQ(read.axes[1], -0.5f);
+  EXPECT_EQ(read.axes[2], 0.0f);  // as Joystick::axis reads it
+  EXPECT_EQ(read.buttons, 0b101u);
+  EXPECT_EQ(read.povs[0], 180);
+  EXPECT_EQ(read.povs[1], -1);
+  EXPECT_STREQ(read.name, "pad");
+  EXPECT_EQ(ds.joysticks[1].connected, 0);
+
+  EXPECT_EQ(talos_driver_station_read(node, nullptr), TALOS_ERR);
+  talos_sim_hardware_destroy(hw);
 }
 
 }  // namespace

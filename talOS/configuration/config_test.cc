@@ -58,7 +58,8 @@ channel = 0
   ASSERT_EQ(hw.encoders.size(), 2u);
   EXPECT_EQ(hw.pwm_outputs.size(), 1u);
 
-  // Sorted by name: abs, beam, enc, imu, light, m1, pressure, quad, servo, steer.
+  // Sorted by name: abs, beam, enc, imu, light, m1, pressure, quad, servo,
+  // steer.
   EXPECT_EQ(hw.encoders[0].kind, hardware::EncoderKind::kDutyCycle);
   EXPECT_EQ(hw.encoders[0].dio_a, 4);
   EXPECT_EQ(hw.sensors[1].kind, hardware::SensorKind::kPigeon2);
@@ -98,14 +99,21 @@ can_id = 4
 TEST(ConfigTest, RejectsParserOwnedErrors) {
   ExpectRejected("[subsystems.test.motors.m2]\nbus = \"rio\"\n");  // no can_id
   ExpectRejected("[subsystems.test.motors.m2]\ncan_id = \"2\"\n");
-  ExpectRejected("[subsystems.test.motors.m2]\ncan_id = 2\ntype = \"SparkMax\"\n");
-  ExpectRejected("[subsystems.test.sensors.s]\ncan_id = 2\ntype = \"kCANcoder\"\n");
-  ExpectRejected("[subsystems.test.encoders.e]\ntype = \"Quadrature\"\ndio_a = 0\ndio_b = 1\n");
+  ExpectRejected(
+      "[subsystems.test.motors.m2]\ncan_id = 2\ntype = \"SparkMax\"\n");
+  ExpectRejected(
+      "[subsystems.test.sensors.s]\ncan_id = 2\ntype = \"kCANcoder\"\n");
+  ExpectRejected(
+      "[subsystems.test.encoders.e]\ntype = \"Quadrature\"\ndio_a = 0\ndio_b = "
+      "1\n");
   ExpectRejected("[subsystems.test.encoders.e]\ndio_a = 0\n");  // no dio_b
   ExpectRejected("[subsystems.test.analog_inputs.a]\nanalog = 0\n");
   ExpectRejected("[subsystems.test.pwm_outputs.p]\npwm = 0\n");
-  ExpectRejected("[subsystems.test.motors.m2]\ncan_id = 2\nfeedback = \"rotor\"\n");
-  ExpectRejected("[subsystems.test.motors.m2]\ncan_id = 2\nfeedback = \"RemoteCANcoder\"\n");
+  ExpectRejected(
+      "[subsystems.test.motors.m2]\ncan_id = 2\nfeedback = \"rotor\"\n");
+  ExpectRejected(
+      "[subsystems.test.motors.m2]\ncan_id = 2\nfeedback = "
+      "\"RemoteCANcoder\"\n");
   ExpectRejected(R"(
 [subsystems.test.sensors.enc]
 can_id = 2
@@ -157,8 +165,10 @@ dio_b = 4
 )");
   ExpectRejected("[robot]\nperiod_us = 500\n");
   ExpectRejected("[robot]\ncommand_timeout_us = 6000\n");
-  ExpectRejected("[subsystems.test.sensors.s]\ncan_id = 20\noffset_rot = 0.5\n");
-  ExpectRejected("[subsystems.test.motors.m2]\ncan_id = 2\nslot0 = { p = -0.5 }\n");
+  ExpectRejected(
+      "[subsystems.test.sensors.s]\ncan_id = 20\noffset_rot = 0.5\n");
+  ExpectRejected(
+      "[subsystems.test.motors.m2]\ncan_id = 2\nslot0 = { p = -0.5 }\n");
   ExpectRejected(R"(
 [subsystems.test.sensors.imu]
 type = "Pigeon2"
@@ -168,8 +178,9 @@ can_id = 2
 feedback = "RemoteCANcoder"
 feedback_sensor = "imu"
 )");
-  EXPECT_THROW(ParseRobotConfigString("[subsystems.test.sensors.s]\ncan_id = 1\n"),
-               std::invalid_argument);  // No motors.
+  EXPECT_THROW(
+      ParseRobotConfigString("[subsystems.test.sensors.s]\ncan_id = 1\n"),
+      std::invalid_argument);  // No motors.
 }
 
 TEST(ConfigTest, ControllerAddressDefaultsAndOverrides) {
@@ -275,11 +286,60 @@ can_id = 1
   EXPECT_FALSE(shooter->contains("name"));
 }
 
-TEST_F(ManifestTest, RejectsBadEntries) {
-  Write("subsystems/a.toml", "[subsystem]\nname = \"a\"\n[motors.m]\ncan_id = 1\n");
+TEST_F(ManifestTest, EntryNodeOverridesSubsystemFileNode) {
+  Write("subsystems/intake.toml", R"(
+[subsystem]
+name = "intake"
+node = "//cpp:intake"
+period_us = 20000
+[motors.roller]
+can_id = 1
+)");
+  Write("subsystems/planner.toml", R"(
+[subsystem]
+name = "planner"
+gain = 2.0
+)");
+  Write("robot.toml", R"(
+[[subsystems]]
+name = "intake"
+path = "subsystems/intake.toml"
+node = "//py:intake"
+[[subsystems]]
+name = "planner"
+path = "subsystems/planner.toml"
+node = "//py:planner"
+)");
+  const auto cfg = ParseRobotConfig(Robot());
+  const auto* intake = cfg.GetSubsystemTable("intake");
+  ASSERT_NE(intake, nullptr);
+  EXPECT_EQ((*intake)["node"].value_or(std::string{}), "//py:intake");
+  EXPECT_EQ((*intake)["period_us"].value_or(0), 20000);
+  EXPECT_EQ(cfg.GetDevices("intake")->motors, (std::vector<uint16_t>{1}));
+  // The file has no `node`; the entry supplies it.
+  const auto* planner = cfg.GetSubsystemTable("planner");
+  ASSERT_NE(planner, nullptr);
+  EXPECT_EQ((*planner)["node"].value_or(std::string{}), "//py:planner");
+  EXPECT_EQ((*planner)["gain"].value_or(0.0), 2.0);
 
-  Write("robot.toml", "[[subsystems]]\nname = \"b\"\npath = \"subsystems/a.toml\"\n");
-  EXPECT_THROW(ParseRobotConfig(Robot()), std::invalid_argument);  // name mismatch
+  // Without the override the file's own label stands.
+  Write(
+      "robot.toml",
+      "[[subsystems]]\nname = \"intake\"\npath = \"subsystems/intake.toml\"\n");
+  EXPECT_EQ(
+      (*ParseRobotConfig(Robot()).GetSubsystemTable("intake"))["node"].value_or(
+          std::string{}),
+      "//cpp:intake");
+}
+
+TEST_F(ManifestTest, RejectsBadEntries) {
+  Write("subsystems/a.toml",
+        "[subsystem]\nname = \"a\"\n[motors.m]\ncan_id = 1\n");
+
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"b\"\npath = \"subsystems/a.toml\"\n");
+  EXPECT_THROW(ParseRobotConfig(Robot()),
+               std::invalid_argument);  // name mismatch
 
   Write("robot.toml",
         "[[subsystems]]\nname = \"a\"\npath = \"subsystems/a.toml\"\n"
@@ -289,8 +349,26 @@ TEST_F(ManifestTest, RejectsBadEntries) {
   Write("robot.toml", "[[subsystems]]\nname = \"a\"\n");
   EXPECT_THROW(ParseRobotConfig(Robot()), std::invalid_argument);  // no path
 
-  Write("robot.toml", "[[subsystems]]\nname = \"a\"\npath = \"missing.toml\"\n");
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"a\"\npath = \"missing.toml\"\n");
   EXPECT_THROW(ParseRobotConfig(Robot()), std::invalid_argument);
+
+  // Entries take only name, path and node; anything else is a typo.
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"a\"\npath = \"subsystems/a.toml\"\n"
+        "nod = \"//py:a\"\n");
+  EXPECT_THROW(ParseRobotConfig(Robot()), std::invalid_argument);
+
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"a\"\npath = \"subsystems/a.toml\"\nnode = "
+        "\"\"\n");
+  EXPECT_THROW(ParseRobotConfig(Robot()), std::invalid_argument);  // empty node
+
+  Write(
+      "robot.toml",
+      "[[subsystems]]\nname = \"a\"\npath = \"subsystems/a.toml\"\nnode = 1\n");
+  EXPECT_THROW(ParseRobotConfig(Robot()),
+               std::invalid_argument);  // not a string
 }
 
 }  // namespace

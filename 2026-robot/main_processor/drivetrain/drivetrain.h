@@ -28,8 +28,8 @@ class Drivetrain {
         // on a robot: an integrated heading drifts with no absolute reference.
         integrate_heading_{
             node.param<bool>("integrate_heading", node.simulation())},
-        target_{node.subscribe<ChassisTarget>(kTargetTopic)},
-        state_{node.publish<DrivetrainState>(kStateTopic)} {
+        target_{node.subscribe<ChassisTarget>(topics::kTarget)},
+        state_{node.publish<DrivetrainState>(topics::kState)} {
     for (std::size_t i = 0; i < kModuleCount; ++i) {
       drive_[i] = talos::Motor{node, geometry_.modules[i].drive};
       steer_[i] = talos::Motor{node, geometry_.modules[i].steer};

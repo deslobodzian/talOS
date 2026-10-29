@@ -71,10 +71,10 @@ struct Freshness {
     if (!last) {
       return "never";
     }
-    const auto ms = std::chrono::duration_cast<std::chrono::duration<double>>(
-                        now - *last)
-                        .count() *
-                    1e3;
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::duration<double>>(now - *last)
+            .count() *
+        1e3;
     char text[32];
     std::snprintf(text, sizeof(text), "%.0f ms", ms);
     return text;
@@ -112,8 +112,10 @@ void PrintTarget(const drivetrain::ChassisTarget& target, bool have_target,
                  const Freshness& freshness, Clock::time_point now) {
   std::printf("target    ");
   if (!have_target) {
-    std::printf("none. Try: bazel run //2026-robot/main_processor/drivetrain:send_target -- "
-                "1 0 0 5\n\n");
+    std::printf(
+        "none. Try: bazel run "
+        "//2026-robot/main_processor/drivetrain:send_target -- "
+        "1 0 0 5\n\n");
     return;
   }
   std::printf(
@@ -151,7 +153,8 @@ struct ModuleIds {
   std::uint16_t steer_id;
 };
 
-std::vector<ModuleIds> ResolveModules(const talos::config::RobotConfig& config) {
+std::vector<ModuleIds> ResolveModules(
+    const talos::config::RobotConfig& config) {
   std::vector<ModuleIds> modules;
   for (const auto& module :
        drivetrain::BuildSwerveGeometry(config, "drivetrain").modules) {
@@ -256,8 +259,8 @@ int main(int argc, char** argv) {
     using Packet = talos::hardware::Packet;
     ipc::Subscriber<Packet> states{talos::hardware::kStateTopic, latest};
     ipc::Subscriber<Packet> commands{talos::hardware::kCommandTopic, latest};
-    ipc::Subscriber<drivetrain::ChassisTarget> targets{drivetrain::kTargetTopic,
-                                                       latest};
+    ipc::Subscriber<drivetrain::ChassisTarget> targets{
+        drivetrain::topics::kTarget, latest};
 
     if (!states.registered() || !commands.registered() ||
         !targets.registered()) {

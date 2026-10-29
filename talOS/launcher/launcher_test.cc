@@ -184,9 +184,10 @@ TEST(LauncherTest, StudioBridgeNeedsFlagAndSim) {
     });
   };
   // Neither flag nor sim: the bridge stays outside the session, as before.
-  EXPECT_EQ(has_bridge(DiscoverNodes(
-                config::ParseRobotConfigString(kFixtureToml), LauncherOptions{})),
-            0);
+  EXPECT_EQ(
+      has_bridge(DiscoverNodes(config::ParseRobotConfigString(kFixtureToml),
+                               LauncherOptions{})),
+      0);
   // Flag without sim (a deployed session): no webroot, no browser, no bridge.
   LauncherOptions flag_only;
   flag_only.start_studio_bridge = true;
@@ -236,9 +237,9 @@ can_id = 1
   options.start_studio_bridge = true;
   auto nodes =
       DiscoverNodes(config::ParseRobotConfigString(kCustomStudio), options);
-  ASSERT_EQ(std::count_if(nodes.begin(), nodes.end(), [](const NodeSpec& n) {
-              return n.name == "studio_bridge";
-            }),
+  ASSERT_EQ(std::count_if(
+                nodes.begin(), nodes.end(),
+                [](const NodeSpec& n) { return n.name == "studio_bridge"; }),
             1);
   for (const auto& n : nodes) {
     if (n.name == "studio_bridge") {
@@ -255,24 +256,13 @@ can_id = 1
             9090);
 }
 
-TEST(LauncherTest, FindStudioBridgeIndex) {
-  LauncherOptions options;
-  options.simulation = true;
-  options.start_studio_bridge = true;
-  auto with =
-      DiscoverNodes(config::ParseRobotConfigString(kFixtureToml), options);
-  const std::size_t found = FindStudioBridgeIndex(with);
-  ASSERT_NE(found, with.size());
-  EXPECT_EQ(with[found].name, "studio_bridge");
-
-  auto without = DiscoverNodes(config::ParseRobotConfigString(kFixtureToml),
-                               LauncherOptions{});
-  EXPECT_EQ(FindStudioBridgeIndex(without), without.size());
-}
-
 TEST(LauncherTest, StudioBridgeWatchTopicFollowsDescribe) {
-  // No description: the pinned fallback.
-  EXPECT_EQ(StudioBridgeWatchTopic({}), "/talos/telemetry");
+  // No description: the config's telemetry topic, else the default.
+  config::RobotConfig robot;
+  EXPECT_EQ(StudioBridgeWatchTopic({}, robot), "/talos/telemetry");
+  robot.toml_data =
+      toml::parse("[subsystems.telemetry]\ntopic = \"/config/telemetry\"\n");
+  EXPECT_EQ(StudioBridgeWatchTopic({}, robot), "/config/telemetry");
 
   // The bridge's own WATCHER wins, tracking a topic override.
   NodeDescription bridge;
@@ -282,7 +272,7 @@ TEST(LauncherTest, StudioBridgeWatchTopicFollowsDescribe) {
   introspect::naming::SourceShape watcher{event::SourceKind::WATCHER,
                                           "/custom/telemetry", 48, 0};
   bridge.declared.sources.push_back(watcher);
-  EXPECT_EQ(StudioBridgeWatchTopic({bridge}), "/custom/telemetry");
+  EXPECT_EQ(StudioBridgeWatchTopic({bridge}, robot), "/custom/telemetry");
 
   // Other nodes never steer the bridge's subscription.
   NodeDescription alpha;
@@ -292,7 +282,7 @@ TEST(LauncherTest, StudioBridgeWatchTopicFollowsDescribe) {
   introspect::naming::SourceShape sender{event::SourceKind::SENDER,
                                          "/alpha/state", 48, 0};
   alpha.declared.sources.push_back(sender);
-  EXPECT_EQ(StudioBridgeWatchTopic({alpha}), "/talos/telemetry");
+  EXPECT_EQ(StudioBridgeWatchTopic({alpha}, robot), "/config/telemetry");
 }
 
 TEST(LauncherTest, ShouldRetryStudioBridgePredicate) {
@@ -301,26 +291,19 @@ TEST(LauncherTest, ShouldRetryStudioBridgePredicate) {
   const auto first = now - std::chrono::seconds(5);
   const auto last = now - std::chrono::seconds(2);
   // Budget remains and the last spawn is paced: retry.
-  EXPECT_TRUE(
-      ShouldRetryStudioBridge(1, first, last, now, false, false));
+  EXPECT_TRUE(ShouldRetryStudioBridge(1, first, last, now, false));
   // Pacing: a spawn less than one interval ago is not retried yet.
-  EXPECT_FALSE(ShouldRetryStudioBridge(1, first, now, now, false, false));
+  EXPECT_FALSE(ShouldRetryStudioBridge(1, first, now, now, false));
   // Attempts exhausted.
   EXPECT_TRUE(kStudioBridgeMaxAttempts > 1);
   EXPECT_FALSE(ShouldRetryStudioBridge(kStudioBridgeMaxAttempts, first, last,
-                                       now, false, false));
+                                       now, false));
   // Window exhausted.
   EXPECT_FALSE(ShouldRetryStudioBridge(
       1, now - kStudioBridgeStartupWindow - std::chrono::seconds(1), last, now,
-      false, false));
-  // A stop or a past deadline ends the retry, never extends it.
-  EXPECT_FALSE(
-      ShouldRetryStudioBridge(1, first, last, now, true, false));
-  EXPECT_FALSE(
-      ShouldRetryStudioBridge(1, first, last, now, false, true));
-  // Stability is the one-interval survival the retry exists to detect.
-  EXPECT_FALSE(IsStudioBridgeStable(now, now));
-  EXPECT_TRUE(IsStudioBridgeStable(now - std::chrono::seconds(2), now));
+      false));
+  // A stopping session (signal or deadline) ends the retry, never extends it.
+  EXPECT_FALSE(ShouldRetryStudioBridge(1, first, last, now, true));
 }
 
 // Forward declarations for helpers defined with the graph tests below.
@@ -350,11 +333,9 @@ std::string BridgeDescribeThen(std::string_view runtime) {
          std::string{runtime};
 }
 
-std::string NodeDescribeThenSleep(std::string_view node,
-                                  std::string_view target,
-                                  const std::vector<
-                                      introspect::naming::SourceShape>& sources,
-                                  int sleep_s) {
+std::string NodeDescribeThenSleep(
+    std::string_view node, std::string_view target,
+    const std::vector<introspect::naming::SourceShape>& sources, int sleep_s) {
   return std::string{"#!/bin/sh\n"} +
          "for arg in \"$@\"; do\n"
          "  if [ \"$arg\" = \"--describe\" ]; then\n"
@@ -389,16 +370,14 @@ TEST(LauncherTest, FailingBridgeRetriesInLoopWithoutBlockingSession) {
   options.binary_overrides["//talOS/bridge:hardware_node"] =
       ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
   options.binary_overrides["//example/alpha:node"] = WriteStubNode(
-      tag + "_alpha",
-      NodeDescribeThenSleep("alpha", "//example/alpha:node",
-                            {Sender("/alpha/state")}, 3));
+      tag + "_alpha", NodeDescribeThenSleep("alpha", "//example/alpha:node",
+                                            {Sender("/alpha/state")}, 3));
   options.binary_overrides["//example/beta:node"] = WriteStubNode(
-      tag + "_beta",
-      NodeDescribeThenSleep("beta", "//example/beta:node",
-                            {Watcher("/alpha/state")}, 3));
-  options.binary_overrides["//studio/bridge:studio_bridge"] = WriteStubNode(
-      tag + "_bridge",
-      BridgeDescribeThen("echo x >> " + counter + "\nexit 1\n"));
+      tag + "_beta", NodeDescribeThenSleep("beta", "//example/beta:node",
+                                           {Watcher("/alpha/state")}, 3));
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStubNode(tag + "_bridge",
+                    BridgeDescribeThen("echo x >> " + counter + "\nexit 1\n"));
 
   const auto started = std::chrono::steady_clock::now();
   Launcher launcher{options};
@@ -444,13 +423,11 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   options.binary_overrides["//talOS/bridge:hardware_node"] =
       ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
   options.binary_overrides["//example/alpha:node"] = WriteStubNode(
-      tag + "_alpha",
-      NodeDescribeThenSleep("alpha", "//example/alpha:node",
-                            {Sender("/alpha/state")}, 30));
+      tag + "_alpha", NodeDescribeThenSleep("alpha", "//example/alpha:node",
+                                            {Sender("/alpha/state")}, 30));
   options.binary_overrides["//example/beta:node"] = WriteStubNode(
-      tag + "_beta",
-      NodeDescribeThenSleep("beta", "//example/beta:node",
-                            {Watcher("/alpha/state")}, 30));
+      tag + "_beta", NodeDescribeThenSleep("beta", "//example/beta:node",
+                                           {Watcher("/alpha/state")}, 30));
   options.binary_overrides["//studio/bridge:studio_bridge"] =
       WriteStubNode(tag + "_bridge", BridgeDescribeThen("exit 1\n"));
 
@@ -485,13 +462,11 @@ TEST(LauncherTest, StableBridgeJoinsSessionUntilDeadline) {
   options.binary_overrides["//talOS/bridge:hardware_node"] =
       ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
   options.binary_overrides["//example/alpha:node"] = WriteStubNode(
-      tag + "_alpha",
-      NodeDescribeThenSleep("alpha", "//example/alpha:node",
-                            {Sender("/alpha/state")}, 30));
+      tag + "_alpha", NodeDescribeThenSleep("alpha", "//example/alpha:node",
+                                            {Sender("/alpha/state")}, 30));
   options.binary_overrides["//example/beta:node"] = WriteStubNode(
-      tag + "_beta",
-      NodeDescribeThenSleep("beta", "//example/beta:node",
-                            {Watcher("/alpha/state")}, 30));
+      tag + "_beta", NodeDescribeThenSleep("beta", "//example/beta:node",
+                                           {Watcher("/alpha/state")}, 30));
   options.binary_overrides["//studio/bridge:studio_bridge"] =
       WriteStubNode(tag + "_bridge", BridgeDescribeThen("exec sleep 30\n"));
 
@@ -593,7 +568,6 @@ TEST(LauncherTest, SessionManifestJsonFormatting) {
   node1.failed = false;
 
   manifest.config_sha256 = "deadbeef";
-  node1.contract = "//2026-robot/main_processor/drivetrain:contract";
   manifest.nodes.push_back(node1);
 
   std::string json = manifest.ToJson();
@@ -603,9 +577,6 @@ TEST(LauncherTest, SessionManifestJsonFormatting) {
   EXPECT_NE(json.find("\"exit_code\": 0"), std::string::npos);
   EXPECT_NE(json.find("\"record_count\": 50"), std::string::npos);
   EXPECT_NE(json.find("\"config_sha256\": \"deadbeef\""), std::string::npos);
-  EXPECT_NE(json.find("\"contract\": "
-                      "\"//2026-robot/main_processor/drivetrain:contract\""),
-            std::string::npos);
 }
 
 TEST(LauncherTest, RunsChildProcessesAndWritesManifest) {
@@ -708,8 +679,7 @@ constexpr std::string_view kStubThatHangsOnDescribe =
     "done\n"
     "exit 0\n";
 
-introspect::naming::SourceShape Sender(std::string topic,
-                                       std::uint32_t bytes) {
+introspect::naming::SourceShape Sender(std::string topic, std::uint32_t bytes) {
   return {event::SourceKind::SENDER, std::move(topic), bytes, 0};
 }
 introspect::naming::SourceShape Watcher(std::string topic,
@@ -926,7 +896,6 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   const std::string bundle_dir = TempPath("test_bundle_dir");
   std::filesystem::create_directories(bundle_dir + "/config");
   std::filesystem::create_directories(bundle_dir + "/bin");
-  std::filesystem::create_directories(bundle_dir + "/lib");
 
   const std::string cfg_path = bundle_dir + "/config/robot.toml";
   {
@@ -934,23 +903,16 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
     cfg << "[robot]\nname = \"bundle_bot\"\nperiod_us = 5000\n";
   }
 
-  const std::string manifest_path = bundle_dir + "/bundle_manifest.json";
   {
-    std::ofstream mf(manifest_path);
-    mf << "{\n"
-       << "  \"bundle_version\": 1,\n"
-       << "  \"config_path\": \"config/robot.toml\",\n"
-       << "  \"config_sha256\": \"abc123\",\n"
-       << "  \"nodes\": [\n"
-       << "    {\n"
-       << "      \"name\": \"alpha\",\n"
-       << "      \"target\": \"//example/alpha:node\",\n"
-       << "      \"binary_path\": \"bin/alpha\",\n"
-       << "      \"language\": \"cpp\",\n"
-       << "      \"contract\": \"//example/alpha:contract\"\n"
-       << "    }\n"
-       << "  ]\n"
-       << "}\n";
+    std::ofstream mf(bundle_dir + "/bundle_manifest.toml");
+    mf << "bundle_version = 1\n"
+       << "config_path = \"config/robot.toml\"\n"
+       << "config_sha256 = \"abc123\"\n"
+       << "\n[[nodes]]\n"
+       << "name = \"alpha\"\n"
+       << "targets = [\"//example/alpha:node\", \"//example/alpha:alias\"]\n"
+       << "binary = \"bin/alpha\"\n"
+       << "language = \"cpp\"\n";
   }
 
   {
@@ -958,10 +920,6 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
     b << "#!/bin/sh\nexit 0\n";
   }
   ::chmod((bundle_dir + "/bin/alpha").c_str(), 0755);
-  {
-    std::ofstream l(bundle_dir + "/lib/libtalos_node.so");
-    l << "mock_so";
-  }
 
   LauncherOptions options;
   options.bundle_dir = bundle_dir;
@@ -972,10 +930,16 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   EXPECT_EQ(options.binary_overrides["//example/alpha:node"],
             bundle_dir + "/bin/alpha");
   EXPECT_EQ(options.binary_overrides["alpha"], bundle_dir + "/bin/alpha");
+  EXPECT_EQ(options.binary_overrides["//example/alpha:alias"],
+            bundle_dir + "/bin/alpha");
   EXPECT_EQ(options.bundle_config_sha256, "abc123");
-  EXPECT_EQ(options.bundle_contracts["//example/alpha:node"],
-            "//example/alpha:contract");
-  EXPECT_EQ(options.bundle_contracts["alpha"], "//example/alpha:contract");
+
+  // A manifest that is not TOML is an error, not a silently empty bundle.
+  { std::ofstream{bundle_dir + "/bundle_manifest.toml"} << "nodes = [\n"; }
+  LauncherOptions broken;
+  broken.bundle_dir = bundle_dir;
+  EXPECT_FALSE(LoadBundle(broken, error));
+  EXPECT_NE(error.find("bundle_manifest.toml"), std::string::npos) << error;
 
   std::filesystem::remove_all(bundle_dir);
 }
@@ -1012,18 +976,15 @@ TEST(LauncherBundleTest, LauncherRunsFromBundleDirectoryWithDescribeOnly) {
   ::chmod(hw_bin.c_str(), 0755);
 
   {
-    std::ofstream mf(bundle_dir + "/bundle_manifest.json");
-    mf << "{\n"
-       << "  \"bundle_version\": 1,\n"
-       << "  \"config_path\": \"config/robot.toml\",\n"
-       << "  \"nodes\": [\n"
-       << "    {\"name\": \"hardware_node\", \"target\": "
-          "\"//talOS/bridge:hardware_node\", \"binary_path\": "
-          "\"bin/hardware_node\", \"language\": \"cpp\"},\n"
-       << "    {\"name\": \"alpha\", \"target\": \"//bundle/alpha:node\", "
-          "\"binary_path\": \"bin/alpha\", \"language\": \"cpp\"}\n"
-       << "  ]\n"
-       << "}\n";
+    std::ofstream mf(bundle_dir + "/bundle_manifest.toml");
+    mf << "bundle_version = 1\n"
+       << "config_path = \"config/robot.toml\"\n"
+       << "\n[[nodes]]\nname = \"hardware_node\"\n"
+       << "targets = [\"//talOS/bridge:hardware_node\"]\n"
+       << "binary = \"bin/hardware_node\"\nlanguage = \"cpp\"\n"
+       << "\n[[nodes]]\nname = \"alpha\"\n"
+       << "targets = [\"//bundle/alpha:node\"]\n"
+       << "binary = \"bin/alpha\"\nlanguage = \"cpp\"\n";
   }
 
   LauncherOptions options;
@@ -1079,4 +1040,3 @@ TEST(LauncherRemoteTest, EffectiveAddressDefaultsToLoopback) {
 
 }  // namespace
 }  // namespace talos::launcher
-

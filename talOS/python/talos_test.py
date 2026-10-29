@@ -4,8 +4,10 @@ import enum
 import unittest
 
 import talos
-from talos.testing import Sim, SimHardware
+from talos.testing import Sim, SimHardware, Stick
 from demo.Goal import Goal
+from demo.Phase import Phase
+from demo.Report import Report
 from demo.Status import Status
 
 ROBOT_TOML = """
@@ -134,6 +136,91 @@ class DevicesTest(unittest.TestCase):
         with self.assertRaisesRegex(talos.TalosError, "'elbow'"):
             sim.add(Wrong, "lift")
 
+    def test_disconnected_device_reports_it(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        lift = sim.add(Lift, "lift")
+        hw = SimHardware(sim)
+        hw.set_motor("lift", "lift", 0.75, 2.0)
+        hw.set_connected("lift", "lift", False)
+        sim.step(0.02)
+        self.assertFalse(lift.lift.connected)
+        self.assertEqual((lift.lift.position, lift.lift.velocity), (0.0, 0.0))
+
+        hw.set_connected("lift", "lift", True)
+        sim.step(0.02)
+        self.assertTrue(lift.lift.connected)
+        self.assertEqual(lift.lift.position, 0.75)
+        with self.assertRaisesRegex(talos.TalosError, "'elbow'"):
+            hw.set_connected("lift", "elbow", False)
+
+
+class Pilot:
+    """Reads the Driver Station, counting packets."""
+
+    def __init__(self, node):
+        self.packets = 0
+        self.ds = talos.DriverStation(node, on_packet=self.count)
+
+    def count(self):
+        self.packets += 1
+
+
+class DriverStationTest(unittest.TestCase):
+    def test_reads_what_sim_hardware_forwards(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        pilot = sim.add(Pilot, "planner")
+        hw = SimHardware(sim)
+        sim.step(0.02)
+        ds = pilot.ds
+        self.assertEqual(pilot.packets, 0)  # nothing set: nothing forwarded
+        self.assertFalse(ds.connected)
+        self.assertFalse(ds.joystick(0).connected)
+
+        hw.set_driver_station(
+            enabled=True, teleop=True, alliance=talos.Alliance.RED,
+            station=2, match_time=12.5,
+            joysticks=[Stick(axes=(0.5, -0.25), buttons=(1, 3), povs=(90,),
+                             name="pad")])
+        sim.step(0.02)
+        self.assertGreater(pilot.packets, 0)
+        self.assertTrue(ds.connected)
+        self.assertTrue(ds.enabled)
+        self.assertTrue(ds.teleop)
+        self.assertFalse(ds.autonomous or ds.test or ds.estop)
+        self.assertFalse(ds.fms_attached)
+        self.assertEqual(ds.alliance, talos.Alliance.RED)
+        self.assertEqual(ds.station, 2)
+        self.assertEqual(ds.match_time, 12.5)
+        stick = ds.joystick(0)
+        self.assertTrue(stick.connected)
+        self.assertEqual((stick.axis_count, stick.button_count,
+                          stick.pov_count), (2, 3, 1))
+        self.assertEqual((stick.axis(0), stick.axis(1), stick.axis(2)),
+                         (0.5, -0.25, 0.0))
+        self.assertEqual([stick.button(n) for n in range(0, 5)],
+                         [False, True, False, True, False])
+        self.assertEqual((stick.pov(), stick.pov(1)), (90, -1))
+        self.assertEqual(stick.name, "pad")
+        self.assertFalse(ds.joystick(1).connected)
+        with self.assertRaises(IndexError):
+            ds.joystick(6)
+
+        # A DS that is not attached reads as disabled, whatever it says.
+        hw.set_driver_station(enabled=True, teleop=True, attached=False,
+                              joysticks=[Stick(axes=(1.0,))])
+        sim.step(0.02)
+        self.assertFalse(ds.connected or ds.enabled or ds.teleop)
+        self.assertFalse(ds.joystick(0).connected)
+        self.assertEqual(ds.joystick(0).axis(0), 0.0)
+
+        # Nor does a silent one stay enabled.
+        hw.set_driver_station(enabled=True, teleop=True)
+        sim.step(0.02)
+        self.assertTrue(ds.enabled)
+        del hw
+        sim.step(0.15)  # past [robot] command_timeout_us
+        self.assertFalse(ds.connected or ds.enabled)
+
 
 class StateMachineTest(unittest.TestCase):
     def test_just_entered_and_time_in_state(self):
@@ -148,6 +235,35 @@ class StateMachineTest(unittest.TestCase):
         self.assertTrue(stepper.sm.is_(moving))
         # Entered at the 30 ms tick; now is 45 ms.
         self.assertAlmostEqual(stepper.sm.time_in_state, 0.015)
+        self.assertRegex(repr(stepper.sm),
+                         r"^StateMachine\(MOVING, previous=IDLE, "
+                         r"time_in_state=0\.015\d*s\)$")
+        with self.assertRaisesRegex(ValueError,
+                                    "Stepper.State has no state 2; it has "
+                                    "IDLE, MOVING"):
+            stepper.sm.go(2)
+
+    def test_flatc_enum_states_are_named(self):
+        class Mover:
+            def __init__(self, node):
+                self.sm = talos.StateMachine(node, Phase.IDLE, states=Phase)
+
+            def update(self):
+                self.sm.go(Phase.HOLDING)
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        mover = sim.add(Mover, "planner")
+        sim.step(0.015)
+        self.assertEqual(mover.sm.state, Phase.HOLDING)
+        self.assertIs(type(mover.sm.state), int)  # flatc values stay ints
+        self.assertRegex(repr(mover.sm),
+                         r"^StateMachine\(HOLDING, previous=IDLE, ")
+        with self.assertRaisesRegex(
+                ValueError, "Phase has no state 3; it has IDLE, MOVING, "
+                            "HOLDING"):
+            mover.sm.go(3)
+        with self.assertRaisesRegex(ValueError, "Phase has no state 7"):
+            talos.StateMachine(sim.node("planner"), 7, states=Phase)
 
 
 class ParamTest(unittest.TestCase):
@@ -209,6 +325,17 @@ class MessageTest(unittest.TestCase):
             goal.height
         with self.assertRaisesRegex(TypeError, "no field heigth_rot"):
             sim.publish(Goal, "/echo/in", heigth_rot=1.0)
+
+    def test_enum_fields_read_as_ints_and_repr_as_names(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        sim.publish(Report, "/report", phase=Phase.HOLDING, height_rot=1.5)
+        report = sim.latest(Report, "/report")
+        self.assertEqual(report.phase, Phase.HOLDING)
+        self.assertIs(type(report.phase), int)
+        self.assertEqual(repr(report), "Report(phase=HOLDING, height_rot=1.5)")
+        sim.publish(Report, "/report", phase=9)  # not a Phase
+        self.assertEqual(repr(sim.latest(Report, "/report")),
+                         "Report(phase=9, height_rot=0.0)")
 
 
 if __name__ == "__main__":

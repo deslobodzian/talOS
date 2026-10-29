@@ -7,12 +7,13 @@ raise, with the C++ message, or with the Python exception a callback raised.
 import ctypes
 import os
 
-ABI_VERSION = 8
+ABI_VERSION = 9
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
     ctypes.c_int32, ctypes.c_int64, ctypes.c_uint32, ctypes.c_uint64)
-c_double, c_char_p, c_void_p = ctypes.c_double, ctypes.c_char_p, ctypes.c_void_p
+c_double, c_float, c_char_p, c_void_p = (
+    ctypes.c_double, ctypes.c_float, ctypes.c_char_p, ctypes.c_void_p)
 
 CALLBACK = ctypes.CFUNCTYPE(c_int32, c_void_p)
 MESSAGE_CALLBACK = ctypes.CFUNCTYPE(c_int32, c_void_p, c_uint32, c_void_p)
@@ -22,6 +23,9 @@ PARAM_ANY, PARAM_BOOL, PARAM_INT, PARAM_DOUBLE, PARAM_STRING = range(5)
 (DEVICE_MOTOR, DEVICE_CANCODER, DEVICE_GYRO, DEVICE_DIGITAL_INPUT,
  DEVICE_DIGITAL_OUTPUT, DEVICE_ANALOG_INPUT, DEVICE_ENCODER,
  DEVICE_PWM) = range(8)
+DS_MAX_JOYSTICKS, DS_MAX_AXES, DS_MAX_POVS, DS_NAME_LENGTH = 6, 12, 4, 32
+(DS_ATTACHED, DS_FMS_ATTACHED, DS_ENABLED, DS_AUTONOMOUS, DS_TELEOP, DS_TEST,
+ DS_ESTOP) = (1 << bit for bit in range(7))
 
 
 class TalosError(RuntimeError):
@@ -42,6 +46,29 @@ class Sample(ctypes.Structure):
 class MotorRequest(ctypes.Structure):
     _fields_ = [("mode", c_int32), ("slot", c_int32), ("demand", c_double),
                 ("ff_volts", c_double)]
+
+
+class Joystick(ctypes.Structure):
+    _fields_ = [("connected", c_int32), ("axis_count", c_int32),
+                ("button_count", c_int32), ("pov_count", c_int32),
+                ("buttons", c_uint32), ("axes", c_float * DS_MAX_AXES),
+                ("povs", c_int32 * DS_MAX_POVS),
+                ("name", ctypes.c_char * DS_NAME_LENGTH)]
+
+
+class DriverStation(ctypes.Structure):
+    _fields_ = [("connected", c_int32), ("enabled", c_int32),
+                ("autonomous", c_int32), ("teleop", c_int32),
+                ("test", c_int32), ("estop", c_int32),
+                ("fms_attached", c_int32), ("alliance", c_int32),
+                ("station", c_int32), ("match_time_s", c_double),
+                ("joysticks", Joystick * DS_MAX_JOYSTICKS)]
+
+
+class DriverStationPacket(ctypes.Structure):
+    _fields_ = [("flags", c_uint32), ("alliance", c_int32),
+                ("station", c_int32), ("match_time_s", c_float),
+                ("joysticks", Joystick * DS_MAX_JOYSTICKS)]
 
 
 _P = ctypes.POINTER
@@ -81,6 +108,8 @@ _SIGNATURES = {
     "talos_digital_input_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
     "talos_analog_input_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
     "talos_encoder_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
+    "talos_driver_station": (c_int32, [c_void_p, CALLBACK, c_void_p]),
+    "talos_driver_station_read": (c_int32, [c_void_p, _P(DriverStation)]),
 }
 _TESTING_SIGNATURES = {
     "talos_sim_create": (c_void_p, [c_char_p]),
@@ -111,6 +140,10 @@ _TESTING_SIGNATURES = {
                                                   c_double]),
     "talos_sim_hardware_set_gyro": (c_int32, [c_void_p, c_char_p, c_char_p,
                                               c_double, c_double]),
+    "talos_sim_hardware_set_connected": (c_int32, [c_void_p, c_char_p,
+                                                   c_char_p, c_int32]),
+    "talos_sim_hardware_set_driver_station": (
+        c_int32, [c_void_p, _P(DriverStationPacket)]),
     "talos_sim_hardware_motor_request": (c_int32, [c_void_p, c_char_p,
                                                    c_char_p,
                                                    _P(MotorRequest)]),

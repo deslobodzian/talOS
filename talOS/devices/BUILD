@@ -2,7 +2,8 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 # Robot hardware for talos::Node: Motor, CANcoder, Gyro, digital/analog I/O,
-# encoders and PWM through the bridge, attached as a Node extension.
+# encoders and PWM through the bridge, attached as a Node extension, and the
+# Driver Station the bridge forwards.
 cc_library(
     name = "devices",
     srcs = ["devices.cc"],
@@ -10,13 +11,14 @@ cc_library(
         "access.h",
         "devices.h",
     ],
+    visibility = ["//visibility:public"],
     deps = [
-        "//talOS/configuration:configuration",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/hardware",
         "//talOS/hardware:gate",
-        "//talOS/hardware:hardware",
         "//talOS/node",
     ],
-    visibility = ["//visibility:public"],
 )
 
 # talos::testing::SimHardware: plays the bridge for a testing::Sim.
@@ -25,13 +27,14 @@ cc_library(
     testonly = True,
     srcs = ["testing.cc"],
     hdrs = ["testing.h"],
+    visibility = ["//visibility:public"],
     deps = [
         ":devices",
-        "//talOS/configuration:configuration",
-        "//talOS/hardware:hardware",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/hardware",
         "//talOS/node:testing",
     ],
-    visibility = ["//visibility:public"],
 )
 
 cc_test(
@@ -41,7 +44,8 @@ cc_test(
     deps = [
         ":devices",
         ":testing",
-        "//talOS/hardware:hardware",
+        "//talOS/driver_station",
+        "//talOS/hardware",
         "@googletest//:gtest_main",
     ],
 )

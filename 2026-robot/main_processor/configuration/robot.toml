@@ -27,9 +27,10 @@ http_port = 5800
 udp_port = 5801
 webroot = "bazel-bin/studio/dist"
 
-# Subsystem manifest. Each entry names one subsystem node and the file holding
-# its config, pathed relative to this file. The parser merges every listed
-# file into one canonical view BEFORE validating, so exclusive-ownership and
+# Subsystem manifest. Each entry names one subsystem and the file holding its
+# config, pathed relative to this file; an optional `node = "//pkg:target"`
+# overrides the file's own `node` label. The parser merges every listed file
+# into one canonical view BEFORE validating, so exclusive-ownership and
 # deterministic (subsystem, device) id ordering behave exactly as one file.
 # Manifest order is irrelevant: logical ids sort by (subsystem, device) name.
 [[subsystems]]

@@ -1,12 +1,13 @@
-load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//talOS/build:contract.bzl", "talos_cc_node")
 
 cc_library(
     name = "telemetry",
     hdrs = ["node.h"],
-    strip_include_prefix = ".",
     include_prefix = "telemetry",
+    strip_include_prefix = ".",
+    visibility = ["//visibility:private"],
     deps = [
         "//2026-robot/main_processor/drivetrain:messages",
         "//2026-robot/main_processor/intake:messages",
@@ -14,40 +15,38 @@ cc_library(
         "//2026-robot/main_processor/shooter:messages",
         "//studio/schema",
         "//studio/schema:wire",
+        "//talOS/driver_station",
         "//talOS/driver_station:messages",
-        "//talOS/driver_station:driver_station",
-        "//talOS/events:events",
-        "//talOS/rtms:rtms",
-        "@flatbuffers//:flatbuffers",
+        "//talOS/node",
+        "@flatbuffers",
     ],
-    visibility = ["//visibility:public"],
 )
 
-# The one node on talos::process::RunNode rather than talos_cc_node: its
-# Studio feed bypasses the loop, so main.cc declares it as an external source
-# in --describe and the live Reporter (see node.h).
-cc_binary(
+talos_cc_node(
     name = "node",
-    srcs = ["main.cc"],
-    deps = [
-        ":telemetry",
-        "//talOS/configuration:configuration",
-        "//talOS/events:events",
-        "//talOS/introspection:describe",
-        "//talOS/introspection:names",
-        "//talOS/introspection:reporter",
-        "//talOS/process:node_main",
-    ],
-    visibility = ["//visibility:public"],
+    srcs = ["node.cc"],
+    node_name = "telemetry",
+    deps = [":telemetry"],
 )
 
 cc_test(
     name = "node_test",
     size = "small",
     srcs = ["node_test.cc"],
+    data = [
+        ":node",
+        "//2026-robot/main_processor/configuration:robot.toml",
+        "//2026-robot/main_processor/configuration:robot_config",
+    ],
+    env = {
+        "TALOS_TEST_CONFIG": "$(rlocationpath //2026-robot/main_processor/configuration:robot.toml)",
+        "TALOS_TEST_NODE": "$(rlocationpath :node)",
+    },
     deps = [
         ":telemetry",
-        "//talOS/memory:shared_memory",
+        "//studio/schema:wire",
+        "//talOS/node:testing",
         "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
 )

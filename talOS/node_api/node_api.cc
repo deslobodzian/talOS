@@ -1,7 +1,9 @@
 #include "talOS/node_api/node_api.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -33,8 +35,7 @@ std::size_t Index(std::int64_t index) {
   return static_cast<std::size_t>(index);
 }
 
-std::function<void()> Callback(TalosCallback fn, void* user,
-                               const char* what) {
+std::function<void()> Callback(TalosCallback fn, void* user, const char* what) {
   if (fn == nullptr) {
     throw std::invalid_argument(std::string{what} + " is NULL");
   }
@@ -62,6 +63,39 @@ hardware::Mode MotorMode(std::int32_t mode) {
 TalosSample* Out(TalosSample* out) {
   if (out == nullptr) throw std::invalid_argument("null TalosSample");
   *out = TalosSample{};
+  return out;
+}
+
+static_assert(TALOS_DS_MAX_JOYSTICKS == driver_station::kMaxJoysticks);
+static_assert(TALOS_DS_MAX_AXES == driver_station::kMaxAxes);
+static_assert(TALOS_DS_MAX_POVS == driver_station::kMaxPovs);
+static_assert(TALOS_DS_NAME_LENGTH == driver_station::kMaxNameLength);
+constexpr bool SameFlag(std::uint32_t abi, driver_station::DsFlags flag) {
+  return abi == static_cast<std::uint32_t>(flag);
+}
+static_assert(SameFlag(TALOS_DS_ATTACHED, driver_station::kDsAttached) &&
+              SameFlag(TALOS_DS_FMS_ATTACHED, driver_station::kFmsAttached) &&
+              SameFlag(TALOS_DS_ENABLED, driver_station::kEnabled) &&
+              SameFlag(TALOS_DS_AUTONOMOUS, driver_station::kAutonomous) &&
+              SameFlag(TALOS_DS_TELEOP, driver_station::kTeleop) &&
+              SameFlag(TALOS_DS_TEST, driver_station::kTest) &&
+              SameFlag(TALOS_DS_ESTOP, driver_station::kEStop));
+
+TalosJoystick JoystickOf(const Joystick& joystick) {
+  TalosJoystick out{};
+  out.connected = joystick.connected();
+  out.axis_count = joystick.axis_count();
+  out.button_count = joystick.button_count();
+  out.pov_count = joystick.pov_count();
+  for (int n = 1; n <= 32; ++n) {
+    if (joystick.button(n)) out.buttons |= 1u << (n - 1);
+  }
+  for (int i = 0; i < TALOS_DS_MAX_AXES; ++i) {
+    out.axes[i] = static_cast<float>(joystick.axis(i));
+  }
+  for (int i = 0; i < TALOS_DS_MAX_POVS; ++i) out.povs[i] = joystick.pov(i);
+  const std::string_view name = joystick.name();
+  std::memcpy(out.name, name.data(), std::min(name.size(), sizeof out.name));
   return out;
 }
 
@@ -105,8 +139,10 @@ std::optional<detail::ParamValue> FindParam(const Node& node,
       return wrap(NodeAccess::find_double(node, key));
     case TALOS_PARAM_STRING:
       return wrap(NodeAccess::find_string(node, key));
+    default:
+      throw std::invalid_argument("unknown parameter kind " +
+                                  std::to_string(kind));
   }
-  throw std::invalid_argument("unknown parameter kind " + std::to_string(kind));
 }
 
 }  // namespace
@@ -129,8 +165,7 @@ const char* talos_last_error(void) { return g_last_error.c_str(); }
 int32_t talos_run(int32_t argc, char** argv, const char* node_name,
                   const char* node_target, TalosFactory factory, void* user) {
   return Guard<int32_t>(1, [&] {
-    return talos::detail::RunMain(argc, argv,
-                                  NonNull(node_name, "node_name"),
+    return talos::detail::RunMain(argc, argv, NonNull(node_name, "node_name"),
                                   NonNull(node_target, "node_target"),
                                   MakeFactory(factory, user));
   });
@@ -166,8 +201,8 @@ int64_t talos_node_period_ns(const TalosNode* node) {
 }
 
 const char* talos_node_config_path(const TalosNode* node) {
-  return Guard<const char*>(
-      "", [&] { return AsNode(node).config_path().c_str(); });
+  return Guard<const char*>("",
+                            [&] { return AsNode(node).config_path().c_str(); });
 }
 
 int32_t talos_node_param(const TalosNode* node, const char* key, int32_t kind,
@@ -359,14 +394,52 @@ int32_t talos_analog_input_sample(TalosNode* node, int64_t index,
   });
 }
 
-int32_t talos_encoder_sample(TalosNode* node, int64_t index,
-                             TalosSample* out) {
+int32_t talos_encoder_sample(TalosNode* node, int64_t index, TalosSample* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     TalosSample& o = *Out(out);
     const auto s = HardwareAccess::encoder_sample(Link(node), Index(index));
     o.valid = s.valid;
     o.position = s.position_rot;
     o.velocity = s.velocity_rps;
+    return TALOS_OK;
+  });
+}
+
+// --- Driver Station ----------------------------------------------------------
+
+int32_t talos_driver_station(TalosNode* node, TalosCallback on_packet,
+                             void* user) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    std::function<void()> callback;
+    if (on_packet != nullptr) {
+      callback = Callback(on_packet, user, "Driver Station callback");
+    }
+    // The handle is a view; the subscription and the callback live on the
+    // node.
+    talos::DriverStation{AsNode(node), std::move(callback)};
+    return TALOS_OK;
+  });
+}
+
+int32_t talos_driver_station_read(TalosNode* node, TalosDriverStation* out) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out == nullptr) throw std::invalid_argument("null TalosDriverStation");
+    const talos::DriverStation ds{AsNode(node)};
+    *out = TalosDriverStation{
+        .connected = ds.connected(),
+        .enabled = ds.enabled(),
+        .autonomous = ds.autonomous(),
+        .teleop = ds.teleop(),
+        .test = ds.test(),
+        .estop = ds.estop(),
+        .fms_attached = ds.fms_attached(),
+        .alliance = static_cast<int32_t>(ds.alliance()),
+        .station = ds.station(),
+        .match_time_s = ds.match_time(),
+    };
+    for (std::size_t port = 0; port < TALOS_DS_MAX_JOYSTICKS; ++port) {
+      out->joysticks[port] = JoystickOf(ds.joystick(port));
+    }
     return TALOS_OK;
   });
 }

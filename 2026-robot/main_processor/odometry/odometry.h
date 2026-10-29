@@ -17,9 +17,9 @@ namespace odometry {
 class Odometry {
  public:
   explicit Odometry(talos::Node& node)
-      : pose_{node.publish<OdometryState>(kStateTopic)} {
+      : pose_{node.publish<OdometryState>(topics::kState)} {
     node.subscribe<drivetrain::DrivetrainState>(
-        drivetrain::kStateTopic,
+        drivetrain::topics::kState,
         [this](const drivetrain::DrivetrainState& s) { Integrate(s); });
   }
 
@@ -35,10 +35,12 @@ class Odometry {
     last_ns_ = state.timestamp_ns();
 
     const double theta = state.yaw_rot() * 2.0 * std::numbers::pi;
-    x_m_ += (state.vx_mps() * std::cos(theta) -
-             state.vy_mps() * std::sin(theta)) * dt_s;
-    y_m_ += (state.vx_mps() * std::sin(theta) +
-             state.vy_mps() * std::cos(theta)) * dt_s;
+    x_m_ +=
+        (state.vx_mps() * std::cos(theta) - state.vy_mps() * std::sin(theta)) *
+        dt_s;
+    y_m_ +=
+        (state.vx_mps() * std::sin(theta) + state.vy_mps() * std::cos(theta)) *
+        dt_s;
     pose_.send(OdometryState{state.timestamp_ns(), x_m_, y_m_, state.yaw_rot(),
                              state.vx_mps(), state.vy_mps(),
                              state.omega_radps()});

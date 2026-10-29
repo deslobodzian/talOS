@@ -167,6 +167,15 @@ like any other node, and the launcher starts it with the session's `graph.json`
 as `--declared`; its stdout lands in `<output_dir>/studio_bridge.log`
 (plaintext, not a `.tlog`) beside the manifest.
 
+The bridge refuses to start before the telemetry publisher exists, so it is the
+one roster member supervised differently (`StudioBridge` in `launcher.h`). Its
+first attempt spawns with the nodes; a quick exit is retried at most once a
+second for up to 60 seconds, inside the supervision loop, so it never delays the
+session or its `--duration-s` deadline. While it is still starting it does not
+hold the session open. Once it has survived a second it is supervised like any
+node. If it never comes up it is marked failed in the manifest and the session
+runs on without Studio.
+
 ## graph.json
 
 Phase one writes `<output_dir>/graph.json` beside the session's
@@ -188,12 +197,14 @@ bazel run //talOS/launcher:launcher -- --config <path-to>/robot.toml --describe-
 ```
 
 Node targets resolve to `bazel-bin/<package>/<target>`, unless an override
-names the binary: a bundle's `bundle_manifest.json` (loaded by `--bundle`, or
-found in the working directory) maps each node's target and name to its
-`bin/` copy. The launcher also reads a workspace-relative config, so outside a
-bundle it only makes sense with the workspace as its working directory;
-`bazel run` starts a binary in its runfiles tree instead, and `main.cc` chases
-`BUILD_WORKSPACE_DIRECTORY` back so both spellings behave the same.
+names the binary. A bundle's `bundle_manifest.toml` (written by
+`talOS/build/bundle_builder.py`, loaded by `--bundle` or found in the working
+directory) lists each node's name, targets, `bin/` copy and language,
+plus the config path and its SHA-256. The launcher also reads a
+workspace-relative config, so outside a bundle it only makes sense with the
+workspace as its working directory; `bazel run` starts a binary in its
+runfiles tree instead, and `main.cc` chases `BUILD_WORKSPACE_DIRECTORY` back so
+both spellings behave the same.
 
 `:launcher_lib` depends on `//talOS/introspection:describe` and `:names` — the
 format and the naming rules, neither of which pulls in an event loop or shared

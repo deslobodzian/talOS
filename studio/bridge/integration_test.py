@@ -99,10 +99,12 @@ class BridgeIntegration(unittest.TestCase):
                 reservation.bind(("127.0.0.1", 0))
                 bare_port = reservation.getsockname()[1]
             try:
-                mock = subprocess.Popen([str(binaries / "studio_mock"), topic])
+                mock = subprocess.Popen([str(binaries / "studio_mock"), topic],
+                                        stdout=subprocess.PIPE, text=True)
                 processes.append(mock)
-                # Creation of the shared-memory header precedes the first HTTP bind.
-                time.sleep(0.2)
+                # The bridge refuses to start before the publisher's segment
+                # exists; the mock prints "ready" once it has created it.
+                self.assertEqual(mock.stdout.readline().strip(), "ready")
                 bridge = subprocess.Popen([str(binaries / "studio_bridge"), "--drop-newest-publisher", topic,
                                            "127.0.0.1", str(udp.getsockname()[1]), str(http_port), webroot,
                                            "--declared", str(declared)])
@@ -113,18 +115,24 @@ class BridgeIntegration(unittest.TestCase):
                 bare = subprocess.Popen([str(binaries / "studio_bridge"), "--drop-newest-publisher", topic,
                                          "127.0.0.1", str(quiet_udp.getsockname()[1]), str(bare_port), webroot])
                 processes.append(bare)
+                # Wait until both bridges listen. A bridge signalled before it
+                # is listening has not installed its SIGTERM handler yet and
+                # dies with -15 instead of exiting 0.
                 deadline = time.monotonic() + 10
-                while True:
-                    self.assertIsNone(mock.poll(), "mock exited")
-                    self.assertIsNone(bridge.poll(), "bridge exited")
-                    self.assertIsNone(bare.poll(), "bridge without --declared exited")
-                    try:
-                        ws = socket.create_connection(("127.0.0.1", http_port), timeout=1)
-                        break
-                    except OSError:
-                        if time.monotonic() > deadline:
-                            raise
-                        time.sleep(0.02)
+                for port in (bare_port, http_port):
+                    while True:
+                        self.assertIsNone(mock.poll(), "mock exited")
+                        self.assertIsNone(bridge.poll(), "bridge exited")
+                        self.assertIsNone(bare.poll(), "bridge without --declared exited")
+                        try:
+                            ws = socket.create_connection(("127.0.0.1", port), timeout=1)
+                            break
+                        except OSError:
+                            if time.monotonic() > deadline:
+                                raise
+                            time.sleep(0.02)
+                    if port == bare_port:
+                        ws.close()
                 with urllib.request.urlopen(f"http://127.0.0.1:{http_port}/", timeout=3) as response:
                     self.assertEqual(response.read(), b"studio integration")
                 with ws:

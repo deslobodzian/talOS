@@ -47,7 +47,7 @@ Beside the stack:
 | `talOS/driver_station` | Driver Station codec and `:node` |
 | `talOS/launcher` | spawns and supervises the nodes in a config; `--describe-only` lints the graph |
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |
-| `talOS/process` | `RunNode`, the low-level node main (used by `telemetry` only) |
+| `talOS/process` | `InstallStopHandlers`: SIGINT/SIGTERM handling for node binaries |
 | `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle` |
 
 ## The tick
@@ -92,8 +92,11 @@ configuration/subsystems/*.toml [subsystem] name, node = "//...:node", period_us
                                 custom keys (node.param), [motors.*] and other devices
 ```
 
-A single-file `robot.toml` with `[subsystems.<name>]` tables also works (see
-`examples/superstructure/config/robot.toml`). Devices are addressed by name.
+A manifest entry may also set `node = "//...:target"`, which overrides the
+subsystem file's `node`, so one set of subsystem files can serve two manifests
+(see `examples/superstructure/config/`). A single-file `robot.toml` with
+`[subsystems.<name>]` tables also works; most test configs use it. Devices are
+addressed by name.
 Example configs carry placeholder CAN ids; the robot's config carries the
 physical ones and sets `commissioned = true` only after checking them.
 

@@ -3,6 +3,7 @@
 #include <sys/socket.h>
 
 #include <csignal>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -12,12 +13,12 @@
 #include <unordered_set>
 #include <vector>
 
+#include "studio/schema/wire.h"
 #include "system.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/rtms/rtms.h"
-#include "studio/schema/wire.h"
 namespace fs = std::filesystem;
 namespace {
 volatile std::sig_atomic_t stop = 0;
@@ -148,18 +149,21 @@ struct Bridge {
             ++forwarded;
             if (sendto(udp, bytes.data(), bytes.size(), 0,
                        reinterpret_cast<sockaddr*>(&destination),
-                       sizeof(destination)) < 0)
+                       sizeof(destination)) < 0) {
               ++udp_drops;
+            }
             for (auto* client : clients) {
               if (client->getBufferedAmount() > 256 * 1024) {
                 ++ws_drops;
                 continue;
               }
-              if (client->send(bytes, uWS::OpCode::BINARY) == Socket::DROPPED)
+              if (client->send(bytes, uWS::OpCode::BINARY) == Socket::DROPPED) {
                 ++ws_drops;
+              }
             }
-          }))
+          })) {
         break;
+      }
     }
   }
 };
@@ -188,10 +192,9 @@ int main(int argc, char** argv) try {
     }
     // The watched topic is the telemetry node's own configuration, read from
     // the same key it reads ([subsystems.telemetry] topic), so the two ends
-    // cannot drift apart. The fallback pins talos-telemetry/node.h
-    // kStudioTopic by value (the launcher lint pins it in practice: a drifted
-    // default fails the launch with "read by studio_bridge but nothing
-    // publishes it").
+    // cannot drift apart. The fallback is the topic the robot's telemetry.toml
+    // sets (the launcher lint pins it in practice: a drifted default fails the
+    // launch with "read by studio_bridge but nothing publishes it").
     std::string topic = "/talos/telemetry";
     if (config_path != nullptr) {
       try {
@@ -212,10 +215,9 @@ int main(int argc, char** argv) try {
     talos::introspect::Description description;
     description.name = "studio_bridge";
     description.target = "//studio/bridge:studio_bridge";
-    description.sources.push_back({talos::event::SourceKind::WATCHER, topic,
-                                   static_cast<std::uint32_t>(
-                                       studio::slot_bytes),
-                                   0});
+    description.sources.push_back(
+        {talos::event::SourceKind::WATCHER, topic,
+         static_cast<std::uint32_t>(studio::slot_bytes), 0});
     std::cout << talos::introspect::DescribeToJson(description);
     return 0;
   }
@@ -248,7 +250,8 @@ int main(int argc, char** argv) try {
            "[IP=127.0.0.1] [UDP=5801] [HTTP=5800] [webroot=studio/dist]\n"
            "       [--declared PATH]   the launcher's graph.json, served at "
            "/declared.json\n"
-           "       [--describe]          print the --describe envelope and exit\n"
+           "       [--describe]          print the --describe envelope and "
+           "exit\n"
            "The publisher MUST use DROP_NEWEST; RTMS does not store this "
            "policy in shared memory.\n";
     return 2;
@@ -293,8 +296,9 @@ int main(int argc, char** argv) try {
   // failed only once the mapping was introduced.
   const std::string segment = ShmObjectName(topic);
   int existing = shm_open(segment.c_str(), O_RDWR, 0);
-  if (existing < 0)
+  if (existing < 0) {
     throw std::runtime_error("start the telemetry publisher before the bridge");
+  }
   close(existing);
   RTMSQueue queue(topic, studio::slot_bytes, 8, studio::slot_count,
                   {OverflowPolicy::DROP_NEWEST, ReadMode::SEQUENCE});
@@ -305,20 +309,23 @@ int main(int argc, char** argv) try {
   if (udp < 0) throw std::runtime_error("UDP socket failed");
   FileDescriptor udp_owner{udp};
   const int flags = fcntl(udp, F_GETFL, 0);
-  if (flags < 0 || fcntl(udp, F_SETFL, flags | O_NONBLOCK) < 0)
+  if (flags < 0 || fcntl(udp, F_SETFL, flags | O_NONBLOCK) < 0) {
     throw std::runtime_error("UDP nonblocking setup failed");
+  }
   int broadcast = 1;
   setsockopt(udp, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
   auto port = [](const char* s) {
     auto p = std::stoul(s);
     if (p == 0 || p > 65535) throw std::runtime_error("invalid port");
-    return static_cast<unsigned short>(p);
+    return static_cast<std::uint16_t>(p);
   };
   sockaddr_in dest{};
   dest.sin_family = AF_INET;
   dest.sin_port = htons(count > 4 ? port(at(4)) : 5801);
-  if (inet_pton(AF_INET, count > 3 ? at(3) : "127.0.0.1", &dest.sin_addr) != 1)
+  if (inet_pton(AF_INET, count > 3 ? at(3) : "127.0.0.1", &dest.sin_addr) !=
+      1) {
     throw std::runtime_error("invalid IPv4 address");
+  }
   const auto root = fs::canonical(count > 6 ? at(6) : "studio/dist");
   Bridge bridge{queue, *reader, udp, dest, topic};
   uWS::App app;
@@ -373,7 +380,8 @@ int main(int argc, char** argv) try {
       return;
     }
     // Files are bounded; uWS owns buffered response bytes after end().
-    if (fs::file_size(file, error) > 32 * 1024 * 1024) {
+    if (fs::file_size(file, error) >
+        static_cast<std::uintmax_t>(32) * 1024 * 1024) {
       res->writeStatus("413 Content Too Large")->end();
       return;
     }

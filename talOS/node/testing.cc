@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <map>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -40,6 +42,40 @@ std::string WriteTempConfig(std::string_view toml) {
   return pattern;
 }
 
+// Byte topics by name: the newest message on each, once there is one.
+using ByteTopics =
+    std::map<std::string, std::optional<std::vector<std::byte>>, std::less<>>;
+
+class LatestBytes final : public detail::ByteTopic {
+ public:
+  explicit LatestBytes(std::optional<std::vector<std::byte>>& latest)
+      : latest_{latest} {}
+  bool write(std::span<const std::byte> message) override {
+    latest_.emplace(message.begin(), message.end());
+    return true;
+  }
+
+ private:
+  std::optional<std::vector<std::byte>>& latest_;
+};
+
+// A node's port in the Sim: byte topics stay in memory, where latest_bytes
+// reads them, rather than in shared memory.
+class SimPort final : public detail::LoopPortFor<event::SimulatedEventLoop<>> {
+ public:
+  SimPort(event::SimulatedEventLoop<>& loop, ByteTopics& byte_topics)
+      : LoopPortFor{loop}, byte_topics_{byte_topics} {}
+
+  std::unique_ptr<detail::ByteTopic> open_byte_topic(
+      std::string_view topic, std::size_t, const BytePublishOptions&) override {
+    return std::make_unique<LatestBytes>(
+        byte_topics_.try_emplace(std::string{topic}).first->second);
+  }
+
+ private:
+  ByteTopics& byte_topics_;
+};
+
 }  // namespace
 
 struct Sim::Impl {
@@ -63,8 +99,10 @@ struct Sim::Impl {
   std::string config_path;
   bool owns_config_file = false;
   std::shared_ptr<const config::RobotConfig> config;
-  // Declared before the nodes: their loops read it until they are gone.
+  // Declared before the nodes: their loops and byte topics write here until
+  // they are gone.
   event::SimulationEnvironment environment;
+  ByteTopics byte_topics;
   std::vector<std::unique_ptr<Hosted>> nodes;
   std::vector<Periodic> periodic;
   Duration now{0};
@@ -123,6 +161,13 @@ Node& Sim::node(std::string_view node_name) {
                               "'");
 }
 
+std::optional<std::vector<std::byte>> Sim::latest_bytes(
+    std::string_view topic) const {
+  const auto found = impl_->byte_topics.find(topic);
+  if (found == impl_->byte_topics.end()) return std::nullopt;
+  return found->second;
+}
+
 void Sim::step(Duration d) {
   if (d < Duration::zero()) throw std::invalid_argument("Sim: negative step");
   Impl& impl = *impl_;
@@ -162,8 +207,7 @@ void* SimAccess::add_instance(Sim& sim, std::string_view node_name,
   hosted->loop =
       std::make_unique<event::SimulatedEventLoop<>>(impl.environment);
   hosted->port =
-      std::make_unique<detail::LoopPortFor<event::SimulatedEventLoop<>>>(
-          *hosted->loop);
+      std::make_unique<testing::SimPort>(*hosted->loop, impl.byte_topics);
   hosted->node = NodeAccess::create(NodeSetup{
       .name = hosted->name,
       .config_path = impl.config_path,
@@ -189,8 +233,8 @@ void SimAccess::every(Sim& sim, Duration period, std::function<bool()> fn) {
   sim.impl_->periodic.push_back({period, sim.impl_->now, std::move(fn)});
 }
 
-void SimAccess::publish_raw(Sim& sim, std::string_view topic,
-                            const void* data, std::size_t bytes) {
+void SimAccess::publish_raw(Sim& sim, std::string_view topic, const void* data,
+                            std::size_t bytes) {
   sim.impl_->environment.channel(topic, static_cast<std::uint32_t>(bytes))
       .publish(std::span<const std::byte>{static_cast<const std::byte*>(data),
                                           bytes});

@@ -1,6 +1,6 @@
 """The whole example robot in one simulated process: the intake, elevator and
 superstructure nodes talking over their real topics, with SimHardware in
-place of the bridge, all configured by config/robot_py.toml. The same
+place of the bridge, all configured by config/robot_py.toml and config/subsystems/. The same
 scenarios as cpp/superstructure_test.cc."""
 
 import os
@@ -27,7 +27,7 @@ intake = talos.load(os.path.join(HERE, "intake.py"))
 elevator = talos.load(os.path.join(HERE, "elevator.py"))
 superstructure = talos.load(os.path.join(HERE, "superstructure.py"))
 
-# The values in config/robot_py.toml.
+# The values in config/subsystems/*.toml.
 INTAKE_VOLTS = 8.0
 HOLD_VOLTS = 1.0
 EJECT_VOLTS = -10.0

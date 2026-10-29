@@ -49,7 +49,9 @@ talos::config::RobotConfig Config() {
   return talos::config::ParseRobotConfig(ConfigPath());
 }
 
-SwerveGeometry Geometry() { return BuildSwerveGeometry(Config(), "drivetrain"); }
+SwerveGeometry Geometry() {
+  return BuildSwerveGeometry(Config(), "drivetrain");
+}
 
 // --- kinematics ----------------------------------------------------------
 
@@ -58,28 +60,36 @@ TEST(Swerve, TranslationAndReverseTakeTheShorterSteeringPath) {
   const double rps = 1.0 / (kTau * geometry.modules[0].wheel_radius_m);
   for (const double vx : {1.0, -1.0}) {
     const auto modules = ToModuleStates(geometry, {vx, 0, 0}, {});
-    ASSERT_TRUE(modules);
+    if (!modules.has_value()) {
+      FAIL() << "ToModuleStates returned nullopt";
+    }
     for (const ModuleState& m : *modules) {
       EXPECT_NEAR(m.drive_rps, vx * rps, 1e-12);  // reversed, not turned
       EXPECT_NEAR(m.steer_rot, 0, 1e-12);
     }
   }
   const auto sideways = ToModuleStates(geometry, {0, 1, 0}, {});
-  ASSERT_TRUE(sideways);
+  if (!sideways.has_value()) {
+    FAIL() << "ToModuleStates returned nullopt";
+  }
   for (const ModuleState& m : *sideways) EXPECT_NEAR(m.steer_rot, 0.25, 1e-12);
 }
 
 TEST(Swerve, RotationDesaturationAndInvalidInput) {
   const SwerveGeometry geometry = Geometry();
   const auto spin = ToModuleStates(geometry, {0, 0, 1}, {});
-  ASSERT_TRUE(spin);
+  if (!spin.has_value()) {
+    FAIL() << "ToModuleStates returned nullopt";
+  }
   EXPECT_LT((*spin)[0].drive_rps, 0);  // back_left
   EXPECT_NEAR((*spin)[0].steer_rot, 0.125, 1e-12);
   EXPECT_GT((*spin)[1].drive_rps, 0);  // back_right
   EXPECT_NEAR((*spin)[1].steer_rot, -0.125, 1e-12);
 
   const auto fast = ToModuleStates(geometry, {100, 0, 0}, {});
-  ASSERT_TRUE(fast);
+  if (!fast.has_value()) {
+    FAIL() << "ToModuleStates returned nullopt";
+  }
   for (const ModuleState& m : *fast) EXPECT_NEAR(m.drive_rps, 20, 1e-12);
 
   EXPECT_FALSE(ToModuleStates(
@@ -89,7 +99,9 @@ TEST(Swerve, RotationDesaturationAndInvalidInput) {
 TEST(Swerve, ForwardKinematicsInvertsInverseKinematics) {
   const SwerveGeometry geometry = Geometry();
   const auto modules = ToModuleStates(geometry, {1.0, -0.5, 0.8}, {});
-  ASSERT_TRUE(modules);
+  if (!modules.has_value()) {
+    FAIL() << "ToModuleStates returned nullopt";
+  }
   const ChassisSpeeds speeds = ToChassisSpeeds(geometry, *modules);
   EXPECT_NEAR(speeds.vx_mps, 1.0, 1e-9);
   EXPECT_NEAR(speeds.vy_mps, -0.5, 1e-9);
@@ -180,12 +192,12 @@ class DrivetrainTest : public ::testing::Test {
   // Holds a target the way the arbiter does: republished every 20 ms.
   void Hold(const ChassisTarget& target, std::chrono::milliseconds duration) {
     for (auto t = 0ms; t < duration; t += 20ms) {
-      sim.publish(kTargetTopic, target);
+      sim.publish(topics::kTarget, target);
       sim.step(20ms);
     }
   }
   DrivetrainState State() const {
-    const auto state = sim.latest<DrivetrainState>(kStateTopic);
+    const auto state = sim.latest<DrivetrainState>(topics::kState);
     EXPECT_TRUE(state.has_value());
     return state.value_or(DrivetrainState{});
   }
@@ -269,7 +281,8 @@ TEST_F(DrivetrainTest, SimulatedHeadingIntegratesTheRotationTheModulesMeasure) {
 
 class DrivetrainOnImuTest : public DrivetrainTest {
  protected:
-  DrivetrainOnImuTest() : DrivetrainTest{ConfigWith("integrate_heading = false")} {}
+  DrivetrainOnImuTest()
+      : DrivetrainTest{ConfigWith("integrate_heading = false")} {}
 };
 
 TEST_F(DrivetrainOnImuTest, HeadingComesFromTheImuNotASteerEncoder) {

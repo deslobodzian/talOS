@@ -38,17 +38,19 @@ class OperatorInterface {
         shoot_mask_{node.param<std::uint32_t>("shoot_button_mask", 1u << 0)},
         intake_mask_{node.param<std::uint32_t>("intake_button_mask", 1u << 1)},
         chassis_{node.publish<drivetrain::ChassisTarget>(
-            drivetrain::kTeleopTargetTopic)},
+            drivetrain::topics::kTeleopTarget)},
         shooter_{node.publish<shooter::ShooterTarget>(
-            shooter::kTeleopTargetTopic)},
-        intake_{node.publish<intake::IntakeTarget>(intake::kTeleopTargetTopic)} {
+            shooter::topics::kTeleopTarget)},
+        intake_{
+            node.publish<intake::IntakeTarget>(intake::topics::kTeleopTarget)} {
     node.subscribe<driver_station::DriverStationState>(
-        driver_station::kStateTopic,
+        driver_station::topics::kState,
         [this](const driver_station::DriverStationState& s) { OnDriver(s); });
     // The drivetrain owns the yaw. A non-finite one carries no direction, so
     // it is dropped and the previous heading keeps aging toward stale.
     node.subscribe<drivetrain::DrivetrainState>(
-        drivetrain::kStateTopic, [this](const drivetrain::DrivetrainState& s) {
+        drivetrain::topics::kState,
+        [this](const drivetrain::DrivetrainState& s) {
           if (!std::isfinite(s.yaw_rot())) return;
           yaw_rot_ = s.yaw_rot();
           heading_at_ = node_.now();
@@ -111,11 +113,12 @@ class OperatorInterface {
     chassis_.send(drivetrain::ChassisTarget{vx, vy, omega, now, true});
 
     const bool shoot = (stick.buttons() & shoot_mask_) != 0;
-    shooter_.send(shooter::ShooterTarget{shoot ? shooter_rps_ : 0.0, now, shoot});
+    shooter_.send(
+        shooter::ShooterTarget{shoot ? shooter_rps_ : 0.0, now, shoot});
     const bool take = (stick.buttons() & intake_mask_) != 0;
-    intake_.send(intake::IntakeTarget{
-        static_cast<std::uint64_t>(now), take,
-        take ? static_cast<float>(intake_rps_) : 0.0f});
+    intake_.send(
+        intake::IntakeTarget{static_cast<std::uint64_t>(now), take,
+                             take ? static_cast<float>(intake_rps_) : 0.0f});
   }
 
   talos::Node& node_;

@@ -18,10 +18,9 @@ bazel build //2026-robot/main_processor:robot_bundle
 |---|---|
 | `run.sh` | runs `./launcher --bundle <dir> --config config/robot.toml "$@"` |
 | `launcher` | `//talOS/launcher` |
-| `bin/` | node binaries and their runfiles |
-| `lib/libtalos_node.so` | runtime for Python nodes |
+| `bin/` | node binaries and their runfiles (a Python node's carry `libtalos_node.so`) |
 | `config/` | `robot.toml` plus one `<name>.toml` per subsystem |
-| `bundle_manifest.json` | node names, targets, languages, config SHA-256 |
+| `bundle_manifest.toml` | node names, targets, binaries, languages, config SHA-256 |
 
 Before deploying, set `[robot] controller_address` in the config to the RoboRIO
 (the shipped value is loopback for simulation) and `commissioned = true` once

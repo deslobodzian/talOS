@@ -33,6 +33,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -72,6 +73,21 @@ struct SubscribeOptions {
   bool optional = false;  // the graph lint tolerates no publisher
 };
 
+// Node::publish_bytes options.
+struct BytePublishOptions {
+  // Ring slots; a power of two, at most 1024 (what loop topics use). Every
+  // process on the topic must agree.
+  std::size_t slots = 1024;
+  // A full queue refuses the newest message instead of overwriting the oldest
+  // unread one, so a reader may keep using a slot while it holds it.
+  bool drop_newest = false;
+  // The reader is outside the session (a viewer, not a node): the graph lint
+  // expects no subscriber.
+  bool external = false;
+};
+
+class BytePublisher;
+
 template <Message M>
 class Subscription;
 template <Message M>
@@ -109,6 +125,14 @@ class Node {
                             SubscribeOptions options = {});
   template <Message M>
   Publisher<M> publish(std::string_view topic);
+  // A topic of variable-length messages, each at most max_bytes, for a feed
+  // no fixed-size Message can carry. It bypasses the loop: not logged, not
+  // replayed. A slot does not record the message's length, so the message
+  // must carry its own (a size-prefixed flatbuffer does). Nothing is opened
+  // until the first send(), so building the node touches no shared memory.
+  using BytePublishOptions = talos::BytePublishOptions;
+  BytePublisher publish_bytes(std::string_view topic, std::size_t max_bytes,
+                              BytePublishOptions options = {});
 
   void every(Duration period, std::function<void()> fn);  // extra timer
 
@@ -162,6 +186,22 @@ class Publisher {
  private:
   friend class Node;
   Publisher(Node* node, std::size_t index) : node_{node}, index_{index} {}
+  Node* node_{nullptr};
+  std::size_t index_{0};
+};
+
+// A variable-length message topic; see Node::publish_bytes.
+class BytePublisher {
+ public:
+  BytePublisher() = default;
+
+  // False when the message was not published: longer than max_bytes, or a
+  // drop_newest queue was full.
+  bool send(std::span<const std::byte> message);
+
+ private:
+  friend class Node;
+  BytePublisher(Node* node, std::size_t index) : node_{node}, index_{index} {}
   Node* node_{nullptr};
   std::size_t index_{0};
 };
@@ -252,23 +292,21 @@ T Node::param(std::string_view key) const {
 template <Message M>
 Subscription<M> Node::subscribe(std::string_view topic,
                                 SubscribeOptions options) {
-  return Subscription<M>{
-      this, detail::NodeAccess::add_subscription(
-                *this, topic, sizeof(M), kMessageAlignment, options.optional,
-                {})};
+  return Subscription<M>{this, detail::NodeAccess::add_subscription(
+                                   *this, topic, sizeof(M), kMessageAlignment,
+                                   options.optional, {})};
 }
 
 template <Message M, std::invocable<const M&> F>
 Subscription<M> Node::subscribe(std::string_view topic, F on_message,
                                 SubscribeOptions options) {
-  detail::MessageCallback callback = [fn = std::move(on_message)](
-                                         const void* data) {
-    fn(*static_cast<const M*>(data));
-  };
-  return Subscription<M>{
-      this, detail::NodeAccess::add_subscription(
-                *this, topic, sizeof(M), kMessageAlignment, options.optional,
-                std::move(callback))};
+  detail::MessageCallback callback =
+      [fn = std::move(on_message)](const void* data) {
+        fn(*static_cast<const M*>(data));
+      };
+  return Subscription<M>{this, detail::NodeAccess::add_subscription(
+                                   *this, topic, sizeof(M), kMessageAlignment,
+                                   options.optional, std::move(callback))};
 }
 
 template <Message M>
@@ -319,6 +357,10 @@ template <Message M>
 bool Publisher<M>::send(const M& message) {
   return detail::NodeAccess::publisher_send(*node_, index_, &message,
                                             sizeof(M));
+}
+
+inline bool BytePublisher::send(std::span<const std::byte> message) {
+  return detail::NodeAccess::byte_publisher_send(*node_, index_, message);
 }
 
 template <class S>

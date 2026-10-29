@@ -2,6 +2,8 @@
 // the fast logic fake, while PhysicsSimBackend (sim_physics.h) earns trust
 // for PID tuning, gearing, direction, and limits. All tests step an explicit
 // sim clock; no wall-clock, no sockets, no live sim.
+#include "sim_physics.h"
+
 #include <gtest/gtest.h>
 
 #include <array>
@@ -11,7 +13,6 @@
 
 #include "gateway.h"
 #include "sim_backend.h"
-#include "sim_physics.h"
 
 namespace talos::hardware {
 namespace {
@@ -87,7 +88,7 @@ TEST(SimBelievability, IdealTeleportsWhilePhysicsRamps) {
     // advances one effective 5 ms step.
     StepBackend(physics, s, now_us, 5000, 2);
     EXPECT_GT(s.motors[0].velocity_rps, 0.0);
-    EXPECT_LT(s.motors[0].velocity_rps, 50.0);  // Far from the ~50 rps target.
+    EXPECT_LT(s.motors[0].velocity_rps, 50.0);   // Far from the ~50 rps target.
     StepBackend(physics, s, now_us, 5000, 400);  // 2 s more.
     EXPECT_GT(s.motors[0].velocity_rps, 40.0);
     EXPECT_GT(s.motors[0].position_rot, 0.0);

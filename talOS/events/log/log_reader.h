@@ -22,6 +22,8 @@ class LogReader {
  public:
   struct Record {
     RecordHeader header{};
+    // The full header.payload_bytes, zero-filled past what the file stores.
+    // Owned by the reader: valid until the next call to next() or rewind().
     std::span<const std::byte> payload;
   };
 
@@ -57,6 +59,7 @@ class LogReader {
 
  private:
   std::vector<std::byte> data_;
+  std::vector<std::byte> payload_;  // zero-filled copy of the last payload
   Manifest manifest_;
   MonotonicTime start_time_;
   std::int64_t start_wall_ns_{0};

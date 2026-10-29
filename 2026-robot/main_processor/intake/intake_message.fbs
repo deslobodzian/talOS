@@ -6,21 +6,30 @@ struct IntakeTarget {
   roller_velocity_rps:float;
 }
 
+// Why the wheel is NOT driving; DRIVE means it follows the request. The
+// first failing reason wins. Append-only, never renumbered: these are wire
+// values.
+enum Inhibit : ubyte {
+  DRIVE,
+  GATEWAY_NOT_READY,
+  TARGET_DISABLED,
+  TARGET_STALE,
+  FEEDBACK_INVALID,
+  DEMAND_NONFINITE,
+}
+
 // Studio view fields (2026-robot/main_processor/telemetry/node.h forwards
 // them as mechanism channels, mirroring ShooterState.target_velocity_rps):
 // requested_velocity_rps echoes the demand the policy acted on this tick
 // (0 when no fresh enabled target), roller_velocity_rps is the measured
-// wheel speed, and inhibit names why the wheel is NOT driving. Inhibit
-// codes (intake::kInhibit* in topics.h, shared with the Python node):
-//   0 = DRIVE (wheel follows requested), 1 = GATEWAY_NOT_READY,
-//   2 = TARGET_DISABLED, 3 = TARGET_STALE, 4 = FEEDBACK_INVALID,
-//   5 = DEMAND_NONFINITE. Appended, never reordered: flatbuffers structs
-// are fixed-size, so field order is the wire order.
+// wheel speed, and inhibit names why the wheel is NOT driving. Appended,
+// never reordered: flatbuffers structs are fixed-size, so field order is the
+// wire order.
 struct IntakeState {
   issued_ns:ulong;
   enabled:bool;
   roller_velocity_rps:float;
   beam_broken:bool;
   requested_velocity_rps:float;
-  inhibit:ubyte;
+  inhibit:Inhibit;
 }

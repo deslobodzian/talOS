@@ -2,6 +2,7 @@
 spits it out for a fixed time when asked."""
 
 import talos
+from demo import topics
 from demo.IntakeCommand import IntakeCommand
 from demo.IntakeGoal import IntakeGoal
 from demo.IntakeState import IntakeState as State
@@ -12,9 +13,9 @@ class Intake:
     def __init__(self, node):
         self.roller = talos.Motor(node, "roller")
         self.beam_break = talos.DigitalInput(node, "beam_break")
-        self.goal = node.subscribe(IntakeGoal, "/intake/target")
-        self.status = node.publish(IntakeStatus, "/intake/state")
-        self.sm = talos.StateMachine(node, State.IDLE)
+        self.goal = node.subscribe(IntakeGoal, topics.INTAKE_GOAL)
+        self.status = node.publish(IntakeStatus, topics.INTAKE_STATUS)
+        self.sm = talos.StateMachine(node, State.IDLE, states=State)
         self.intake_volts = node.param("intake_volts")
         self.hold_volts = node.param("hold_volts")
         self.eject_volts = node.param("eject_volts")

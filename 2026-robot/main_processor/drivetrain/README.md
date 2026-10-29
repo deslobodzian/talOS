@@ -25,8 +25,9 @@ controller; pose estimation and vision are separate future nodes.
 - `geometry.h`: the geometry, read from `[subsystems.drivetrain.geometry]`;
   each module names its drive, steer and encoder devices, checked against
   this subsystem's devices at startup.
-- `drive_message.fbs` + `topics.h`: `drivetrain::ChassisTarget` and
-  `drivetrain::DrivetrainState`, `//2026-robot/main_processor/drivetrain:messages`.
+- `drive_message.fbs` and the `topics` in `BUILD`: `drivetrain::ChassisTarget`,
+  `drivetrain::DrivetrainState` and `drivetrain::topics::k*`,
+  `//2026-robot/main_processor/drivetrain:messages`.
 
 The heading on `/drivetrain/state` is the Pigeon's yaw. Under `--sim` it is
 instead integrated from the rotation the modules measure, because a simulated

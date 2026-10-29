@@ -7,11 +7,11 @@ package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "internal",
     hdrs = ["internal.h"],
+    visibility = ["//visibility:private"],
     deps = [
         ":node_api_h",
         "//talOS/node",
     ],
-    visibility = ["//visibility:private"],
 )
 
 cc_library(
@@ -26,15 +26,16 @@ cc_library(
     name = "node_api",
     srcs = ["node_api.cc"],
     hdrs = ["node_api.h"],
-    # Every exported symbol must reach the shared objects below, even though
-    # nothing in them references them.
-    alwayslink = True,
     deps = [
         ":internal",
         "//talOS/devices",
-        "//talOS/hardware:hardware",
+        "//talOS/driver_station",
+        "//talOS/hardware",
         "//talOS/node",
     ],
+    # Every exported symbol must reach the shared objects below, even though
+    # nothing in them references them.
+    alwayslink = True,
 )
 
 # The Sim / SimHardware section of node_api.h.
@@ -42,14 +43,15 @@ cc_library(
     name = "node_api_testing",
     testonly = True,
     srcs = ["node_api_testing.cc"],
-    alwayslink = True,
     deps = [
         ":internal",
         ":node_api",
         "//talOS/devices:testing",
-        "//talOS/hardware:hardware",
+        "//talOS/driver_station",
+        "//talOS/hardware",
         "//talOS/node:testing",
     ],
+    alwayslink = True,
 )
 
 # Loaded via ctypes by the `talos` Python package.

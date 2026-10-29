@@ -20,13 +20,14 @@ class Superstructure {
   explicit Superstructure(talos::Node& node)
       // Nothing in this example publishes the goal (a driver or autonomous
       // node would), so it is optional to the launcher's graph check.
-      : goal_{node.subscribe<SuperstructureGoal>(kSuperstructureGoalTopic,
+      : goal_{node.subscribe<SuperstructureGoal>(topics::kSuperstructureGoal,
                                                  {.optional = true})},
-        intake_{node.subscribe<IntakeStatus>(kIntakeStatusTopic)},
-        elevator_{node.subscribe<ElevatorStatus>(kElevatorStatusTopic)},
-        intake_goal_{node.publish<IntakeGoal>(kIntakeGoalTopic)},
-        elevator_goal_{node.publish<ElevatorGoal>(kElevatorGoalTopic)},
-        status_{node.publish<SuperstructureStatus>(kSuperstructureStatusTopic)},
+        intake_{node.subscribe<IntakeStatus>(topics::kIntakeStatus)},
+        elevator_{node.subscribe<ElevatorStatus>(topics::kElevatorStatus)},
+        intake_goal_{node.publish<IntakeGoal>(topics::kIntakeGoal)},
+        elevator_goal_{node.publish<ElevatorGoal>(topics::kElevatorGoal)},
+        status_{
+            node.publish<SuperstructureStatus>(topics::kSuperstructureStatus)},
         sm_{node, State::STOWED},
         high_rot_{node.param<double>("high_rot")} {}
 
@@ -39,10 +40,18 @@ class Superstructure {
 
     switch (sm_.state()) {
       case State::STOWED:
-      case State::HOLDING:  send(IntakeCommand::IDLE, 0.0); break;
-      case State::INTAKING: send(IntakeCommand::INTAKE, 0.0); break;
-      case State::RAISING:  send(IntakeCommand::IDLE, high_rot_); break;
-      case State::SCORING:  send(IntakeCommand::EJECT, high_rot_); break;
+      case State::HOLDING:
+        send(IntakeCommand::IDLE, 0.0);
+        break;
+      case State::INTAKING:
+        send(IntakeCommand::INTAKE, 0.0);
+        break;
+      case State::RAISING:
+        send(IntakeCommand::IDLE, high_rot_);
+        break;
+      case State::SCORING:
+        send(IntakeCommand::EJECT, high_rot_);
+        break;
     }
     status_.send(SuperstructureStatus{sm_.state()});
   }
@@ -52,20 +61,28 @@ class Superstructure {
     const bool has_piece = intake_->has_piece();
     switch (sm_.state()) {
       case State::STOWED:
-        if (has_piece) sm_.go(State::HOLDING);
-        else if (command == SuperstructureCommand::INTAKE) sm_.go(State::INTAKING);
+        if (has_piece)
+          sm_.go(State::HOLDING);
+        else if (command == SuperstructureCommand::INTAKE)
+          sm_.go(State::INTAKING);
         break;
       case State::INTAKING:
-        if (has_piece) sm_.go(State::HOLDING);
-        else if (command == SuperstructureCommand::STOW) sm_.go(State::STOWED);
+        if (has_piece)
+          sm_.go(State::HOLDING);
+        else if (command == SuperstructureCommand::STOW)
+          sm_.go(State::STOWED);
         break;
       case State::HOLDING:
-        if (!has_piece) sm_.go(State::STOWED);
-        else if (command == SuperstructureCommand::SCORE_HIGH) sm_.go(State::RAISING);
+        if (!has_piece)
+          sm_.go(State::STOWED);
+        else if (command == SuperstructureCommand::SCORE_HIGH)
+          sm_.go(State::RAISING);
         break;
       case State::RAISING:
-        if (elevator_at(high_rot_)) sm_.go(State::SCORING);
-        else if (command == SuperstructureCommand::STOW) sm_.go(State::HOLDING);
+        if (elevator_at(high_rot_))
+          sm_.go(State::SCORING);
+        else if (command == SuperstructureCommand::STOW)
+          sm_.go(State::HOLDING);
         break;
       case State::SCORING:
         if (!has_piece) sm_.go(State::STOWED);

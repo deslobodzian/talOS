@@ -1,0 +1,24 @@
+# Roller + beam break. IDLE -> INTAKING -> HOLDING (beam broken) -> EJECTING.
+[subsystem]
+name = "intake"
+period_us = 20000
+intake_volts = 8.0   # roller voltage while intaking
+hold_volts = 1.0     # keeps a held piece seated
+eject_volts = -10.0  # reverse, to spit the piece out
+eject_ms = 500       # how long EJECTING runs before IDLE
+
+[motors.roller]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+inverted = false
+brake = true
+supply_limit_a = 30.0
+stator_limit_a = 60.0
+max_voltage = 12.0
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 100.0
+
+# true while a game piece breaks the beam.
+[digital_inputs.beam_break]
+dio = 0

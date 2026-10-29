@@ -58,18 +58,21 @@ TEST(RuntimeUdpTest, SendsBufferedPayloadWithoutExtraCopy) {
   constexpr std::size_t kSize = 16;
   uint8_t* payload = mac.MutablePayloadBuffer(kSize);
   ASSERT_NE(payload, nullptr);
-  for (std::size_t i = 0; i < kSize; ++i) payload[i] = static_cast<uint8_t>(99 + i);
+  for (std::size_t i = 0; i < kSize; ++i) {
+    payload[i] = static_cast<uint8_t>(99 + i);
+  }
 
-  ASSERT_EQ(mac.SendBufferedFrame(FrameType::kHardwareState, kFlagNone, 22,
-                                  kSize),
-            UdpStatus::kOk);
+  ASSERT_EQ(
+      mac.SendBufferedFrame(FrameType::kHardwareState, kFlagNone, 22, kSize),
+      UdpStatus::kOk);
 
   DecodedFrame received;
   ASSERT_EQ(rio.TryReceive(&received), UdpStatus::kOk);
   EXPECT_EQ(received.header.type, FrameType::kHardwareState);
   ASSERT_EQ(received.payload_size, kSize);
-  for (std::size_t i = 0; i < kSize; ++i)
+  for (std::size_t i = 0; i < kSize; ++i) {
     EXPECT_EQ(received.payload[i], static_cast<uint8_t>(99 + i));
+  }
 }
 
 }  // namespace

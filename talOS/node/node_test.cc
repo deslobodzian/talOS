@@ -1,19 +1,30 @@
 #include "talOS/node/node.h"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "node_test/node_test_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "talOS/configuration/config_parser.h"
+#include "talOS/events/realtime_event_loop.h"
+#include "talOS/memory/shared_memory_ptr.h"
+#include "talOS/node/internal.h"
 #include "talOS/node/testing.h"
+#include "talOS/rtms/rtms.h"
 
 namespace talos {
 namespace {
@@ -122,7 +133,9 @@ TEST(Node, TwoNodesTalkOverATopicInOneSim) {
   EXPECT_EQ(listener.in->value(), 4);
   EXPECT_GE(listener.latest_in_update, 3);
   const auto latest = sim.latest<Count>("/talker/state");
-  ASSERT_TRUE(latest.has_value());
+  if (!latest.has_value()) {
+    FAIL() << "nothing published on /talker/state";
+  }
   EXPECT_EQ(latest->value(), 4);
 }
 
@@ -298,6 +311,67 @@ TEST(Node, RegistrationOutsideTheConstructorThrows) {
   EXPECT_THROW(sim.node("listener").after_update([] {}), std::logic_error);
 }
 
+// --- byte topics -----------------------------------------------------------
+
+struct Framer {
+  explicit Framer(Node& n)
+      : node{n}, out{n.publish_bytes("/framer/frames", 8)} {}
+  // Tick k sends k + 1 bytes of value k: the length varies per message.
+  void update() {
+    const std::vector<std::byte> frame(node.tick() + 1,
+                                       static_cast<std::byte>(node.tick()));
+    sent.push_back(out.send(frame));
+  }
+  Node& node;
+  BytePublisher out;
+  std::vector<bool> sent;
+};
+
+TEST(BytePublisher, SimKeepsTheNewestMessageAsSentAndRefusesOversize) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& framer = sim.add<Framer>("talker");  // 10 ms period
+  EXPECT_FALSE(sim.latest_bytes("/framer/frames").has_value());
+
+  sim.step(35ms);  // ticks 0..2
+  auto latest = sim.latest_bytes("/framer/frames");
+  if (!latest.has_value()) {
+    FAIL() << "nothing published on /framer/frames";
+  }
+  EXPECT_EQ(*latest, std::vector<std::byte>(3, std::byte{2}));
+
+  sim.step(100ms);  // ticks 3..12; from tick 8 the frame exceeds 8 bytes
+  latest = sim.latest_bytes("/framer/frames");
+  if (!latest.has_value()) {
+    FAIL() << "nothing published on /framer/frames";
+  }
+  EXPECT_EQ(*latest, std::vector<std::byte>(8, std::byte{7}));
+  ASSERT_EQ(framer.sent.size(), 13u);
+  for (std::size_t k = 0; k < framer.sent.size(); ++k) {
+    EXPECT_EQ(framer.sent[k], k < 8) << k;
+  }
+  const Node& node = sim.node("talker");
+  EXPECT_EQ(detail::NodeAccess::byte_topic_published(node, 0), 8u);
+  EXPECT_EQ(detail::NodeAccess::byte_topic_dropped(node, 0), 5u);
+}
+
+struct BadFramer {
+  explicit BadFramer(Node& n) {
+    EXPECT_THROW((void)n.publish_bytes("/bad/frames", 0),
+                 std::invalid_argument);
+    EXPECT_THROW((void)n.publish_bytes("/bad/frames", 8, {.slots = 3}),
+                 std::invalid_argument);
+    EXPECT_THROW((void)n.publish_bytes("/bad/frames", 8, {.slots = 2048}),
+                 std::invalid_argument);
+  }
+};
+
+TEST(BytePublisher, RejectsBadLayoutsAndLateRegistration) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<BadFramer>("listener");
+  EXPECT_THROW((void)sim.node("listener").publish_bytes("/late/frames", 8),
+               std::logic_error);
+}
+
 // --- the binary
 // ----------------------------------------------------------------
 
@@ -356,6 +430,11 @@ TEST(Binary, DescribeListsEveryEndpointIncludingOptionalOnes) {
           R"({"kind": "SENDER", "name": "/test_node/state", "message_bytes": 16, "external": false, "optional": false})"),
       std::string::npos)
       << result.output;
+  EXPECT_NE(
+      result.output.find(
+          R"({"kind": "SENDER", "name": "/test_node/frames", "message_bytes": 64, "external": true, "optional": false})"),
+      std::string::npos)
+      << result.output;
   EXPECT_NE(result.output.find(R"({"kind": "TIMER", "name": "test_node")"),
             std::string::npos)
       << result.output;
@@ -374,6 +453,67 @@ TEST(Binary, LoggedSimRunReplaysWithoutDivergence) {
   EXPECT_EQ(replay.status, 0) << replay.output;
   EXPECT_NE(replay.output.find("diverged=0 clean_exit=1"), std::string::npos)
       << replay.output;
+  // Both runs wrote the node's byte topic to shared memory.
+  ::shm_unlink(ShmObjectName("/test_node/frames").c_str());
+}
+
+bool ShmSegmentExists(const std::string& topic) {
+  const int fd = ::shm_open(ShmObjectName(topic).c_str(), O_RDWR, 0666);
+  if (fd == -1) return false;
+  ::close(fd);
+  return true;
+}
+
+// Outside the Sim a byte topic is an RTMS queue, opened by the first send:
+// building the node (as --describe does) leaves no segment behind.
+TEST(BytePublisher, OpensRtmsOnFirstSendAndDropsNewestWhenFull) {
+  const std::string topic = "/test/node_bytes/p" + std::to_string(::getpid());
+  const std::string config_path = Runfile("TALOS_TEST_CONFIG");
+  event::RealtimeEventLoop<> loop;
+  detail::LoopPortFor<event::RealtimeEventLoop<>> port{loop};
+  const auto node = detail::NodeAccess::create(detail::NodeSetup{
+      .name = "test_node",
+      .config_path = config_path,
+      .config = std::make_shared<const config::RobotConfig>(
+          config::ParseRobotConfig(config_path)),
+      .loop = &port,
+  });
+  BytePublisher out = node->publish_bytes(
+      topic, 64, {.slots = 4, .drop_newest = true, .external = true});
+  detail::NodeAccess::start(*node);
+  EXPECT_FALSE(ShmSegmentExists(topic));
+
+  const std::vector<std::byte> first(5, std::byte{1});
+  EXPECT_TRUE(out.send(first));
+  ASSERT_TRUE(ShmSegmentExists(topic));
+
+  RTMSQueue reader_queue{
+      topic, 64, kMessageAlignment, 4,
+      RTMSOptions{.overflow_policy = OverflowPolicy::DROP_NEWEST,
+                  .read_mode = ReadMode::SEQUENCE}};
+  const auto reader = reader_queue.register_reader();
+  if (!reader.has_value()) {
+    FAIL() << "RTMS reader slots exhausted";
+  }
+
+  const std::vector<std::byte> second(9, std::byte{2});
+  EXPECT_TRUE(out.send(second));
+  std::vector<std::byte> slot(64);
+  MessageInfo info{};
+  ASSERT_EQ(reader_queue.read_next(*reader, slot, info), ReadResult::OK);
+  EXPECT_EQ(info.sequence, 1u);
+  EXPECT_EQ(std::vector<std::byte>(slot.begin(), slot.begin() + 9), second);
+
+  // Four slots and one reader caught up: four more fit, the fifth is
+  // refused rather than written over unread bytes.
+  for (int i = 0; i < 4; ++i) EXPECT_TRUE(out.send(first)) << i;
+  EXPECT_FALSE(out.send(first));
+  EXPECT_FALSE(out.send(std::vector<std::byte>(65)));  // longer than max_bytes
+  EXPECT_EQ(detail::NodeAccess::byte_topic_published(*node, 0), 6u);
+  EXPECT_EQ(detail::NodeAccess::byte_topic_dropped(*node, 0), 2u);
+
+  reader_queue.release_reader(*reader);
+  ::shm_unlink(ShmObjectName(topic).c_str());
 }
 
 }  // namespace

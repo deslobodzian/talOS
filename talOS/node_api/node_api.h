@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 8u
+#define TALOS_NODE_ABI_VERSION 9u
 
 enum {
   TALOS_OK = 0,
@@ -77,7 +77,7 @@ enum {
   TALOS_PARAM_STRING = 4,
 };
 typedef struct TalosParam {
-  int32_t kind;        // what was found
+  int32_t kind;  // what was found
   int32_t boolean;
   int64_t integer;
   double number;
@@ -96,8 +96,8 @@ int64_t talos_node_subscribe(TalosNode* node, const char* topic,
                              TalosMessageCallback on_message, void* user);
 int64_t talos_node_publish(TalosNode* node, const char* topic,
                            uint32_t message_bytes);
-int32_t talos_node_every(TalosNode* node, int64_t period_ns,
-                         TalosCallback fn, void* user);
+int32_t talos_node_every(TalosNode* node, int64_t period_ns, TalosCallback fn,
+                         void* user);
 // The update() the framework calls every period.
 int32_t talos_node_set_update(TalosNode* node, TalosCallback fn, void* user);
 
@@ -142,8 +142,7 @@ int32_t talos_robot_enabled(TalosNode* node);
 // One motor command for the next flush (Motor::set_* / stop).
 int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
                         double demand, double ff_volts, int32_t slot);
-int32_t talos_digital_output_set(TalosNode* node, int64_t index,
-                                 int32_t value);
+int32_t talos_digital_output_set(TalosNode* node, int64_t index, int32_t value);
 int32_t talos_pwm_set(TalosNode* node, int64_t index, double output);
 
 // The latched feedback of device `index`, zeros (valid == 0) until an
@@ -165,6 +164,58 @@ int32_t talos_analog_input_sample(TalosNode* node, int64_t index,
                                   TalosSample* out);
 int32_t talos_encoder_sample(TalosNode* node, int64_t index, TalosSample* out);
 
+// --- Driver Station --------------------------------------------------------
+
+#define TALOS_DS_MAX_JOYSTICKS 6
+#define TALOS_DS_MAX_AXES 12
+#define TALOS_DS_MAX_POVS 4
+#define TALOS_DS_NAME_LENGTH 32
+
+enum {  // talos::driver_station::DsFlags
+  TALOS_DS_ATTACHED = 1 << 0,
+  TALOS_DS_FMS_ATTACHED = 1 << 1,
+  TALOS_DS_ENABLED = 1 << 2,
+  TALOS_DS_AUTONOMOUS = 1 << 3,
+  TALOS_DS_TELEOP = 1 << 4,
+  TALOS_DS_TEST = 1 << 5,
+  TALOS_DS_ESTOP = 1 << 6,
+};
+
+// One joystick port, as talos::Joystick reads it: axes past axis_count are
+// 0, povs past pov_count are -1, and bit n-1 of `buttons` is button n.
+typedef struct TalosJoystick {
+  int32_t connected;
+  int32_t axis_count;
+  int32_t button_count;
+  int32_t pov_count;
+  uint32_t buttons;
+  float axes[TALOS_DS_MAX_AXES];
+  int32_t povs[TALOS_DS_MAX_POVS];
+  char name[TALOS_DS_NAME_LENGTH];  // NUL-terminated unless full
+} TalosJoystick;
+
+// What a talos::DriverStation handle reports.
+typedef struct TalosDriverStation {
+  int32_t connected;
+  int32_t enabled;
+  int32_t autonomous;
+  int32_t teleop;
+  int32_t test;
+  int32_t estop;
+  int32_t fms_attached;
+  int32_t alliance;  // talos::driver_station::Alliance
+  int32_t station;
+  double match_time_s;
+  TalosJoystick joysticks[TALOS_DS_MAX_JOYSTICKS];
+} TalosDriverStation;
+
+// Takes a DriverStation handle on `node`: call while the factory runs.
+// `on_packet`, when not NULL, runs as each packet arrives.
+int32_t talos_driver_station(TalosNode* node, TalosCallback on_packet,
+                             void* user);
+// Fills `out` from the node's DriverStation, taken by talos_driver_station.
+int32_t talos_driver_station_read(TalosNode* node, TalosDriverStation* out);
+
 // --- test harness (libtalos_node_testing.so only) ------------------------
 
 TalosSim* talos_sim_create(const char* config_path);
@@ -179,8 +230,8 @@ int64_t talos_sim_now_ns(const TalosSim* sim);
 int32_t talos_sim_publish_raw(TalosSim* sim, const char* topic,
                               const void* data, uint32_t size);
 // Copies the newest message on `topic` into `out`: 1 copied, 0 none yet.
-int32_t talos_sim_latest_raw(const TalosSim* sim, const char* topic,
-                             void* out, uint32_t size);
+int32_t talos_sim_latest_raw(const TalosSim* sim, const char* topic, void* out,
+                             uint32_t size);
 
 TalosSimHardware* talos_sim_hardware_create(TalosSim* sim);
 void talos_sim_hardware_destroy(TalosSimHardware* hw);
@@ -192,20 +243,34 @@ int32_t talos_sim_hardware_set_motor(TalosSimHardware* hw, const char* node,
                                      double velocity);
 int32_t talos_sim_hardware_set_digital_input(TalosSimHardware* hw,
                                              const char* node,
-                                             const char* device,
-                                             int32_t value);
+                                             const char* device, int32_t value);
 int32_t talos_sim_hardware_set_analog_input(TalosSimHardware* hw,
                                             const char* node,
                                             const char* device, double volts);
 int32_t talos_sim_hardware_set_encoder(TalosSimHardware* hw, const char* node,
                                        const char* device, double position,
                                        double velocity);
-int32_t talos_sim_hardware_set_cancoder(TalosSimHardware* hw,
-                                        const char* node, const char* device,
-                                        double position, double velocity);
+int32_t talos_sim_hardware_set_cancoder(TalosSimHardware* hw, const char* node,
+                                        const char* device, double position,
+                                        double velocity);
 int32_t talos_sim_hardware_set_gyro(TalosSimHardware* hw, const char* node,
                                     const char* device, double yaw,
                                     double yaw_rate);
+// Marks every device of `node` named `device` (dis)connected
+// (SimHardware::set_connected).
+int32_t talos_sim_hardware_set_connected(TalosSimHardware* hw, const char* node,
+                                         const char* device, int32_t connected);
+// The Driver Station packet to forward from now on
+// (SimHardware::set_driver_station); the rest of the packet is zero.
+typedef struct TalosDriverStationPacket {
+  uint32_t flags;    // TALOS_DS_*
+  int32_t alliance;  // talos::driver_station::Alliance
+  int32_t station;
+  float match_time_s;
+  TalosJoystick joysticks[TALOS_DS_MAX_JOYSTICKS];
+} TalosDriverStationPacket;
+int32_t talos_sim_hardware_set_driver_station(
+    TalosSimHardware* hw, const TalosDriverStationPacket* packet);
 // The last request flushed by `node` for `device`.
 typedef struct TalosMotorRequest {
   int32_t mode;  // TALOS_MODE_*
@@ -218,8 +283,7 @@ int32_t talos_sim_hardware_motor_request(const TalosSimHardware* hw,
                                          TalosMotorRequest* out);
 // Returns 0/1, or TALOS_ERR.
 int32_t talos_sim_hardware_digital_output(const TalosSimHardware* hw,
-                                          const char* node,
-                                          const char* device);
+                                          const char* node, const char* device);
 int32_t talos_sim_hardware_pwm(const TalosSimHardware* hw, const char* node,
                                const char* device, double* out);
 

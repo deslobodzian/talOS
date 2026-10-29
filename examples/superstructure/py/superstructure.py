@@ -6,6 +6,7 @@ reads their states and writes their goals.
 """
 
 import talos
+from demo import topics
 from demo.ElevatorGoal import ElevatorGoal
 from demo.ElevatorStatus import ElevatorStatus
 from demo.IntakeCommand import IntakeCommand
@@ -21,14 +22,15 @@ class Superstructure:
     def __init__(self, node):
         # Nothing in this example publishes the goal (a driver or autonomous
         # node would), so it is optional to the launcher's graph check.
-        self.goal = node.subscribe(SuperstructureGoal, "/superstructure/target",
+        self.goal = node.subscribe(SuperstructureGoal, topics.SUPERSTRUCTURE_GOAL,
                                    optional=True)
-        self.intake = node.subscribe(IntakeStatus, "/intake/state")
-        self.elevator = node.subscribe(ElevatorStatus, "/elevator/state")
-        self.intake_goal = node.publish(IntakeGoal, "/intake/target")
-        self.elevator_goal = node.publish(ElevatorGoal, "/elevator/target")
-        self.status = node.publish(SuperstructureStatus, "/superstructure/state")
-        self.sm = talos.StateMachine(node, State.STOWED)
+        self.intake = node.subscribe(IntakeStatus, topics.INTAKE_STATUS)
+        self.elevator = node.subscribe(ElevatorStatus, topics.ELEVATOR_STATUS)
+        self.intake_goal = node.publish(IntakeGoal, topics.INTAKE_GOAL)
+        self.elevator_goal = node.publish(ElevatorGoal, topics.ELEVATOR_GOAL)
+        self.status = node.publish(SuperstructureStatus,
+                                   topics.SUPERSTRUCTURE_STATUS)
+        self.sm = talos.StateMachine(node, State.STOWED, states=State)
         self.high_rot = node.param("high_rot")
 
     def update(self):

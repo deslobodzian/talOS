@@ -41,7 +41,7 @@ constexpr std::uint32_t kTeleopEnabled =
 struct Probe {
   explicit Probe(talos::Node& node) {
     node.subscribe<drivetrain::ChassisTarget>(
-        drivetrain::kTeleopTargetTopic,
+        drivetrain::topics::kTeleopTarget,
         [this](const drivetrain::ChassisTarget&) { ++chassis; });
   }
   int chassis = 0;
@@ -65,24 +65,24 @@ period_us = 20000
 )"} + std::string{keys})} {}
 
   void Push(const DriverStationState& state) {
-    sim_.publish(driver_station::kStateTopic, state);
+    sim_.publish(driver_station::topics::kState, state);
     sim_.step(10ms);
   }
   void PublishHeading(double yaw_rot) {
-    sim_.publish(drivetrain::kStateTopic,
+    sim_.publish(drivetrain::topics::kState,
                  drivetrain::DrivetrainState{0, true, 0, 0, 0, yaw_rot, 0});
     sim_.step(10ms);
   }
   void Advance(talos::Duration d) { sim_.step(d); }
   int chassis_count() const { return probe_.chassis; }
   drivetrain::ChassisTarget chassis() const {
-    return Last<drivetrain::ChassisTarget>(drivetrain::kTeleopTargetTopic);
+    return Last<drivetrain::ChassisTarget>(drivetrain::topics::kTeleopTarget);
   }
   shooter::ShooterTarget shooter() const {
-    return Last<shooter::ShooterTarget>(shooter::kTeleopTargetTopic);
+    return Last<shooter::ShooterTarget>(shooter::topics::kTeleopTarget);
   }
   intake::IntakeTarget intake() const {
-    return Last<intake::IntakeTarget>(intake::kTeleopTargetTopic);
+    return Last<intake::IntakeTarget>(intake::topics::kTeleopTarget);
   }
 
  private:

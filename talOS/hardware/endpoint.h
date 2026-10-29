@@ -28,8 +28,8 @@ class Endpoint {
 
       if (frame.header.type == protocol::FrameType::kHardwareConfig) {
         std::string err;
-        auto status = assembler_.AddChunk(
-            {frame.payload, frame.payload_size}, err);
+        auto status =
+            assembler_.AddChunk({frame.payload, frame.payload_size}, err);
         if (status == ConfigAssembler::Status::kComplete) {
           bool ok = gateway_.Reconfigure(assembler_.config());
           ConfigAckPayload ack{};
@@ -55,7 +55,8 @@ class Endpoint {
           std::array<uint8_t, 128> ack_buf{};
           const auto ack_size = EncodeConfigAck(ack, ack_buf);
           peer_.SendFrame(protocol::FrameType::kHardwareConfigAck,
-                          frame.header.sequence, now_us, ack_buf.data(), ack_size);
+                          frame.header.sequence, now_us, ack_buf.data(),
+                          ack_size);
         } else if (status != ConfigAssembler::Status::kIncomplete) {
           ConfigAckPayload ack{};
           ack.config_id = assembler_.config_id();
@@ -70,7 +71,8 @@ class Endpoint {
           std::array<uint8_t, 128> ack_buf{};
           const auto ack_size = EncodeConfigAck(ack, ack_buf);
           peer_.SendFrame(protocol::FrameType::kHardwareConfigAck,
-                          frame.header.sequence, now_us, ack_buf.data(), ack_size);
+                          frame.header.sequence, now_us, ack_buf.data(),
+                          ack_size);
         }
         continue;
       }

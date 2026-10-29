@@ -156,20 +156,8 @@ node which exits leaves the viewer promptly, and takes a final sample on the way
 out so the last cycle's counts are not lost.
 
 It must be constructed after the loop so that reverse destruction order joins
-the thread before the counters it samples are destroyed. Every node main follows
-that order (`talos::process::RunNode` does it for you):
-
-```cpp
-talos::event::RealtimeEventLoop<talos::event::log::LogWriter> loop{...};
-talos::telemetry::TelemetryNode node{loop, ...};
-talos::introspect::Reporter reporter{
-    loop,
-    {.name = "telemetry",
-     .target = "//2026-robot/main_processor/telemetry:node",
-     .session_id = session_id,
-     .simulation = simulation}};
-loop.run();
-```
+the thread before the counters it samples are destroyed. `talos::Run`
+(`talOS/node`) does this for every node.
 
 A registry that cannot be opened is printed to stderr once and then ignored, and
 `Reporter::error()` keeps the message. A node that refused to run because a
@@ -218,10 +206,19 @@ Nothing here is authenticated or access-controlled. The segment is world-
 readable and world-writable, on the assumption already made everywhere else in
 this tree: the robot and the development machine are a trusted local network.
 
+## Naming rules
+
+`names.h` is the topic grammar (`/owner/role[/qualifier[/qualifier]]`, 31
+bytes, lowercase segments, no abbreviations or direction suffixes), the closed
+role vocabulary and which side of its owner each role flows, the node-name and
+node-target checks (a target is a main-repository label, `//package:rule`, whose
+package leaf or rule is the node's name), and `LintGraph`, the whole-graph check
+the launcher runs before it spawns anything. NAMING.md is the prose.
+
 ## Building
 
 ```sh
-bazel test //talOS/introspection:registry_test
+bazel test //talOS/introspection/...
 ```
 
 `:registry` is the segment and both ends of it, and depends only on

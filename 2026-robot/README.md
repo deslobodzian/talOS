@@ -15,13 +15,11 @@
 | `arbiter` | C++ | picks teleop or auto per match mode; the one writer of each target | `/driver_station/state`, `/<sub>/target/teleop`, `/<sub>/target/auto` | `/drivetrain/target`, `/shooter/target`, `/intake/target` |
 | `operator_interface` | C++ | sticks and buttons to targets | `/driver_station/state`, `/drivetrain/state` | `/drivetrain/target/teleop`, `/shooter/target/teleop`, `/intake/target/teleop` |
 | `odometry` | C++ | pose from drivetrain state | `/drivetrain/state` | `/odometry/state` |
-| `telemetry` | C++ (`process::RunNode`) | Studio frames | the state topics | `/talos/telemetry` |
+| `telemetry` | C++ | Studio frames | the state topics | `/talos/telemetry` |
 | `driver_station` (`//talOS/driver_station:node`) | C++ | decodes the Driver Station packet | `/hw/state/driver_station` | `/driver_station/state` |
 | `hardware_node` (`//talOS/bridge`) | C++ | UDP courier to the RoboRIO | `/hw/request/<node>` | `/hw/state` |
 
 Simulation stands in for the RoboRIO with `main_processor/simulation:sim_gateway`.
-`telemetry` is the one node still on the low-level `talos::process::RunNode`
-because it writes its Studio feed straight to RTMS.
 
 ## Config
 
@@ -49,7 +47,7 @@ Logs land in `/tmp/talos_logs/<session-id>/`. Deploying:
 ## Add a subsystem
 
 Follow [examples/superstructure/README.md](../examples/superstructure/README.md):
-messages + `topics.h` with `talos_messages`, a class built with `talos_cc_node`
+messages and their `topics` with `talos_messages`, a class built with `talos_cc_node`
 or `talos_py_node` in `main_processor/<name>/`, then a `[[subsystems]]` entry in
 `robot.toml` and `subsystems/<name>.toml` with
 `node = "//2026-robot/main_processor/<name>:node"`, and the node in

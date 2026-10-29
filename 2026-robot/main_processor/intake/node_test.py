@@ -8,6 +8,8 @@ import tempfile
 import unittest
 
 import talos
+from intake import topics
+from intake.Inhibit import Inhibit
 from intake.IntakeState import IntakeState
 from intake.IntakeTarget import IntakeTarget
 from python.runfiles import runfiles
@@ -20,19 +22,20 @@ intake = talos.load(os.path.join(HERE, "intake.py"))
 
 class IntakeTest(unittest.TestCase):
     def run_intake(self, ask, enabled=True, beam=False, target_enabled=True,
-                   seconds=0.05):
+                   seconds=0.05, roller_connected=True):
         """Publishes one target at t0, runs, returns (request, last state)."""
         sim = Sim(CONFIG)
         sim.add(intake.Intake, "intake")
         hw = SimHardware(sim)
         hw.enable(enabled)
         hw.set_motor("intake", "roller", 0.0, 12.5)
+        hw.set_connected("intake", "roller", roller_connected)
         hw.set_digital_input("intake", "intake_beam", beam)
-        sim.publish(IntakeTarget, "/intake/target", enabled=target_enabled,
+        sim.publish(IntakeTarget, topics.TARGET, enabled=target_enabled,
                     roller_velocity_rps=ask)
         sim.step(seconds)
         return (hw.motor_request("intake", "roller"),
-                sim.latest(IntakeState, "/intake/state"))
+                sim.latest(IntakeState, topics.STATE))
 
     def test_ask_maps_to_velocity_command(self):
         cases = [
@@ -47,16 +50,18 @@ class IntakeTest(unittest.TestCase):
                 self.assertEqual(request.mode, talos.Mode.VELOCITY)
                 self.assertEqual(request.demand, demand)
                 self.assertEqual(request.slot, 0)
-                self.assertEqual(state.inhibit, intake.DRIVE)
+                self.assertEqual(state.inhibit, Inhibit.DRIVE)
                 self.assertEqual(state.requested_velocity_rps, demand)
 
     def test_failed_gate_sends_neutral_and_names_it(self):
         cases = [
-            ("disabled robot", dict(ask=25.0, enabled=False), intake.GATEWAY),
+            ("disabled robot", dict(ask=25.0, enabled=False),
+             Inhibit.GATEWAY_NOT_READY),
             ("disabled target", dict(ask=25.0, target_enabled=False),
-             intake.TARGET_DISABLED),
-            ("stale target", dict(ask=25.0, seconds=0.3), intake.TARGET_STALE),
-            ("nonfinite ask", dict(ask=math.nan), intake.DEMAND_NONFINITE),
+             Inhibit.TARGET_DISABLED),
+            ("stale target", dict(ask=25.0, seconds=0.3),
+             Inhibit.TARGET_STALE),
+            ("nonfinite ask", dict(ask=math.nan), Inhibit.DEMAND_NONFINITE),
         ]
         for name, inputs, inhibit in cases:
             with self.subTest(name):
@@ -66,6 +71,14 @@ class IntakeTest(unittest.TestCase):
         # Only a live, finite ask is echoed as requested.
         _, state = self.run_intake(25.0, target_enabled=False)
         self.assertEqual(state.requested_velocity_rps, 0.0)
+
+    def test_disconnected_roller_reports_feedback_invalid(self):
+        request, state = self.run_intake(25.0, roller_connected=False)
+        self.assertEqual(request.mode, talos.Mode.NEUTRAL)
+        self.assertEqual(state.inhibit, Inhibit.FEEDBACK_INVALID)
+        self.assertIn("inhibit=FEEDBACK_INVALID", repr(state))
+        self.assertEqual(state.roller_velocity_rps, 0.0)  # no sample
+        self.assertTrue(state.enabled)
 
     def test_state_reports_feedback(self):
         _, state = self.run_intake(0.0, beam=True)
@@ -98,9 +111,9 @@ class BinaryTest(unittest.TestCase):
                    for s in doc["sources"]),
             sorted([("TIMER", "intake", 0),
                     ("WATCHER", "/hw/state", 1404),
-                    ("WATCHER", "/intake/target", IntakeTarget.SizeOf()),
+                    ("WATCHER", topics.TARGET, IntakeTarget.SizeOf()),
                     ("SENDER", "/hw/request/intake", 1404),
-                    ("SENDER", "/intake/state", IntakeState.SizeOf())]))
+                    ("SENDER", topics.STATE, IntakeState.SizeOf())]))
 
     def test_sim_run_replays_without_divergence(self):
         with tempfile.TemporaryDirectory() as tmp:

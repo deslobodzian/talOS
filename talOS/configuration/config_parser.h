@@ -2,12 +2,10 @@
 
 // Robot configuration: TOML -> hardware::Config plus per-subsystem ownership.
 //
-// Two file layouts, both reduced to one canonical view before parsing:
-//   - Manifest: robot.toml holds [robot], optional [studio], and
-//     [[subsystems]] entries { name, path }. Each path (relative to robot.toml)
-//     names a file with a [subsystem] header (whose `name` must match the
-//     entry) and that subsystem's device and custom tables at top level.
-//   - Single file: everything inline under [subsystems.<name>].
+// One layout: [robot], optional [studio], and [subsystems.<name>] tables.
+// [[subsystems]] { name, path, node? } entries are an include over it: each
+// file (path relative to robot.toml) maps its [subsystem] header and tables to
+// [subsystems.<name>], the entry's `node` winning; then it parses as one file.
 //
 // Device tables per subsystem: motors (type "TalonFX"), sensors (type
 // "CANcoder" or "Pigeon2"), digital_inputs, digital_outputs, analog_inputs,
@@ -127,8 +125,8 @@ inline std::string ReadNonEmpty(const toml::table& tbl, const char* key,
   return v;
 }
 
-inline uint16_t ReadPort(const toml::table& tbl, const char* key,
-                         uint16_t def, const char* table_name) {
+inline uint16_t ReadPort(const toml::table& tbl, const char* key, uint16_t def,
+                         const char* table_name) {
   if (!tbl.contains(key)) return def;
   auto v = tbl[key].value<int64_t>();
   if (!v || *v < 1 || *v > 65535) {
@@ -177,8 +175,8 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   m.reverse_limit_rot = Read(t, "reverse_limit_rot", m.reverse_limit_rot);
   m.forward_limit_rot = Read(t, "forward_limit_rot", m.forward_limit_rot);
   m.max_velocity_rps = Read(t, "max_velocity_rps", m.max_velocity_rps);
-  m.cruise_velocity_rps = Read(t, "cruise_velocity_rps",
-                               std::min(20.0, m.max_velocity_rps));
+  m.cruise_velocity_rps =
+      Read(t, "cruise_velocity_rps", std::min(20.0, m.max_velocity_rps));
   m.acceleration_rps2 = Read(t, "acceleration_rps2", m.acceleration_rps2);
   m.jerk_rps3 = Read(t, "jerk_rps3", m.jerk_rps3);
   for (int s = 0; s < 3; ++s) {
@@ -303,7 +301,8 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     auto& s = result.studio;
     s.bridge = detail::ReadNonEmpty(*studio, "bridge", s.bridge, "[studio]");
     s.webroot = detail::ReadNonEmpty(*studio, "webroot", s.webroot, "[studio]");
-    s.http_port = detail::ReadPort(*studio, "http_port", s.http_port, "[studio]");
+    s.http_port =
+        detail::ReadPort(*studio, "http_port", s.http_port, "[studio]");
     s.udp_port = detail::ReadPort(*studio, "udp_port", s.udp_port, "[studio]");
   }
 
@@ -326,8 +325,8 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
         const std::string name(dev_key.str());
         auto* dev_tbl = dev_val.as_table();
         if (!dev_tbl) {
-          throw std::invalid_argument(std::string(section) + " entry '" +
-                                      name + "' must be a table");
+          throw std::invalid_argument(std::string(section) + " entry '" + name +
+                                      "' must be a table");
         }
         detail::RawDevice raw = parse(*dev_tbl, name);
         raw.subsystem = sub_name;
@@ -339,14 +338,12 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     each("sensors", detail::ParseSensor);
     each("encoders", detail::ParseEncoder);
     each("digital_inputs", [](const toml::table& t, const std::string& n) {
-      return detail::RawDevice{
-          .config = hardware::DigitalInputConfig{
-              .dio = ReadRequired<int>(t, "dio", n)}};
+      return detail::RawDevice{.config = hardware::DigitalInputConfig{
+                                   .dio = ReadRequired<int>(t, "dio", n)}};
     });
     each("digital_outputs", [](const toml::table& t, const std::string& n) {
-      return detail::RawDevice{
-          .config = hardware::DigitalOutputConfig{
-              .dio = ReadRequired<int>(t, "dio", n)}};
+      return detail::RawDevice{.config = hardware::DigitalOutputConfig{
+                                   .dio = ReadRequired<int>(t, "dio", n)}};
     });
     each("analog_inputs", [](const toml::table& t, const std::string& n) {
       return detail::RawDevice{
@@ -386,10 +383,10 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
                                    const std::string& subsystem,
                                    const std::string& claimant) {
     if (target.subsystem != subsystem) {
-      throw std::invalid_argument(
-          "cross-subsystem device claim: '" + claimant + "' in subsystem '" +
-          subsystem + "' references '" + target.name + "' in subsystem '" +
-          target.subsystem + "'");
+      throw std::invalid_argument("cross-subsystem device claim: '" + claimant +
+                                  "' in subsystem '" + subsystem +
+                                  "' references '" + target.name +
+                                  "' in subsystem '" + target.subsystem + "'");
     }
   };
 
@@ -417,13 +414,15 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     for (auto&& mod_node : *modules) {
       auto* mod = mod_node.as_table();
       if (!mod) continue;
-      auto check_ref = [&](const char* field, bool (*is_kind)(const detail::RawDevice&)) {
+      auto check_ref = [&](const char* field,
+                           bool (*is_kind)(const detail::RawDevice&)) {
         auto ref = (*mod)[field].value<std::string_view>();
         if (!ref) return;
         const auto* found = find(std::string(*ref));
         if (!found) {
           throw std::invalid_argument(
-              "geometry module references unknown device: " + std::string(*ref));
+              "geometry module references unknown device: " +
+              std::string(*ref));
         }
         require_same_subsystem(*found, sub_name, "geometry");
         if (!is_kind(*found)) {
@@ -453,9 +452,11 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
             add(hw.motors, owned.motors);
           } else if constexpr (std::is_same_v<T, hardware::SensorConfig>) {
             add(hw.sensors, owned.sensors);
-          } else if constexpr (std::is_same_v<T, hardware::DigitalInputConfig>) {
+          } else if constexpr (std::is_same_v<T,
+                                              hardware::DigitalInputConfig>) {
             add(hw.digital_inputs, owned.digital_inputs);
-          } else if constexpr (std::is_same_v<T, hardware::DigitalOutputConfig>) {
+          } else if constexpr (std::is_same_v<T,
+                                              hardware::DigitalOutputConfig>) {
             add(hw.digital_outputs, owned.digital_outputs);
           } else if constexpr (std::is_same_v<T, hardware::AnalogInputConfig>) {
             add(hw.analog_inputs, owned.analog_inputs);
@@ -500,8 +501,9 @@ inline toml::table ParseTomlFile(const std::string& path) {
 
 // Replaces a [[subsystems]] manifest with the canonical [subsystems.<name>]
 // view: each listed file's [subsystem] scalars (minus the name) plus its
-// other top-level tables. Validation then runs once over the merged view, so
-// splitting files cannot weaken a check.
+// other top-level tables, then the entry's optional `node` over the file's.
+// Validation then runs once over the merged view, so splitting files cannot
+// weaken a check.
 inline toml::table ExpandManifest(const toml::array& manifest,
                                   const std::string& path) {
   namespace fs = std::filesystem;
@@ -509,13 +511,27 @@ inline toml::table ExpandManifest(const toml::array& manifest,
   toml::table subs_view;
   for (auto&& entry_node : manifest) {
     auto* entry = entry_node.as_table();
-    auto name_view = entry ? (*entry)["name"].value<std::string_view>() : std::nullopt;
-    auto rel_view = entry ? (*entry)["path"].value<std::string_view>() : std::nullopt;
+    auto name_view =
+        entry ? (*entry)["name"].value<std::string_view>() : std::nullopt;
+    auto rel_view =
+        entry ? (*entry)["path"].value<std::string_view>() : std::nullopt;
     if (!name_view || !rel_view) {
       throw std::invalid_argument("invalid [[subsystems]] entry in " + path +
                                   ": needs 'name' and 'path'");
     }
     const std::string name(*name_view);
+    for (auto&& [k, v] : *entry) {
+      if (k.str() != "name" && k.str() != "path" && k.str() != "node") {
+        throw std::invalid_argument("unknown key '" + std::string(k.str()) +
+                                    "' in [[subsystems]] entry '" + name +
+                                    "' in " + path +
+                                    " (expected name, path, node)");
+      }
+    }
+    std::optional<std::string> node;
+    if (entry->contains("node")) {
+      node = ReadNonEmpty(*entry, "node", "", "[[subsystems]] entry");
+    }
     const fs::path rel{std::string(*rel_view)};
     const std::string file = (rel.is_absolute() ? rel : base / rel).string();
     toml::table sub_file = ParseTomlFile(file);
@@ -534,8 +550,10 @@ inline toml::table ExpandManifest(const toml::array& manifest,
       if (k.str() != "name") view.insert_or_assign(std::string(k.str()), v);
     }
     for (auto&& [k, v] : sub_file) {
-      if (k.str() != "subsystem") view.insert_or_assign(std::string(k.str()), v);
+      if (k.str() != "subsystem")
+        view.insert_or_assign(std::string(k.str()), v);
     }
+    if (node) view.insert_or_assign("node", *node);
     subs_view.insert_or_assign(name, std::move(view));
   }
   return subs_view;

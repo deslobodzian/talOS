@@ -1,0 +1,6 @@
+# No hardware: reads /superstructure/target and the mechanism states, writes
+# the mechanism targets.
+[subsystem]
+name = "superstructure"
+period_us = 20000
+high_rot = 10.0  # elevator height for SCORE_HIGH, within the lift's soft limits

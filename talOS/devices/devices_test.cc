@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -13,6 +14,7 @@
 
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/testing.h"
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/node/testing.h"
 
@@ -133,7 +135,9 @@ TEST(Devices, MotorsAreNeutralUntilEnabledAndEchoTheStateIdentity) {
   EXPECT_FALSE(mech.enabled_in_update);
   EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kNeutral);
   const auto command = LastCommand(sim);
-  ASSERT_TRUE(command);
+  if (!command.has_value()) {
+    FAIL() << "no command sent";
+  }
   EXPECT_EQ(command->count, 2);  // every owned motor, every flush
   EXPECT_EQ(command->boot_id, 1u);
   EXPECT_EQ(command->epoch, 1u);
@@ -170,7 +174,11 @@ TEST(Devices, StaleStateForcesNeutralButKeepsFlushing) {
   hw->enable();
   mech.a_velocity = 20;
   sim.step(20ms);
-  ASSERT_EQ(LastCommand(sim)->motors[0].mode, Mode::kVelocity);
+  const auto first = LastCommand(sim);
+  if (!first.has_value()) {
+    FAIL() << "no command sent";
+  }
+  ASSERT_EQ(first->motors[0].mode, Mode::kVelocity);
 
   hw.reset();       // the bridge goes silent
   sim.step(150ms);  // past [robot] command_timeout_us
@@ -179,7 +187,9 @@ TEST(Devices, StaleStateForcesNeutralButKeepsFlushing) {
   sim.step(10ms);
   EXPECT_EQ(Sent(sim), sent + 2);
   const auto command = LastCommand(sim);
-  ASSERT_TRUE(command);
+  if (!command.has_value()) {
+    FAIL() << "no command sent";
+  }
   EXPECT_EQ(command->motors[0].mode, Mode::kNeutral);
   EXPECT_EQ(command->motors[0].demand, 0.0);
 }
@@ -196,7 +206,9 @@ TEST(Devices, DigitalAndPwmOutputsRideAlongOnlyWhenSet) {
   EXPECT_TRUE(hw.digital_output("mech", "led"));
   EXPECT_DOUBLE_EQ(hw.pwm("mech", "servo"), 0.25);
   auto command = LastCommand(sim);
-  ASSERT_TRUE(command);
+  if (!command.has_value()) {
+    FAIL() << "no command sent";
+  }
   EXPECT_EQ(command->digital_output_count, 1);
   EXPECT_EQ(command->pwm_output_count, 1);
   EXPECT_DOUBLE_EQ(command->pwm_outputs[0].output, 0.25);
@@ -205,6 +217,9 @@ TEST(Devices, DigitalAndPwmOutputsRideAlongOnlyWhenSet) {
   mech.servo_out.reset();
   sim.step(10ms);
   command = LastCommand(sim);
+  if (!command.has_value()) {
+    FAIL() << "no command sent";
+  }
   EXPECT_EQ(command->digital_output_count, 0);
   EXPECT_EQ(command->pwm_output_count, 0);
 }
@@ -331,6 +346,152 @@ TEST(Devices, UnknownDeviceThrowsNamingIt) {
   }
   EXPECT_THROW(SimHardware{sim}.motor_request("mech", "c"),
                std::invalid_argument);
+}
+
+TEST(Devices, DisconnectedDevicesReadInvalidAndZero) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  SimHardware hw{sim};
+  hw.set_motor("mech", "a", 1.5, -2.0);
+  hw.set_motor("mech", "b", 0.5, 0.0);
+  hw.set_cancoder("mech", "cc", 0.2, 0.3);
+  hw.set_gyro("mech", "gyro", 0.125, -0.5);
+  hw.set_connected("mech", "a", false);
+  hw.set_connected("mech", "cc", false);
+  hw.set_connected("mech", "beam", false);
+  sim.step(10ms);
+
+  EXPECT_FALSE(mech.a.connected());
+  EXPECT_EQ(mech.a.position(), 0.0);
+  EXPECT_EQ(mech.a.velocity(), 0.0);
+  EXPECT_TRUE(mech.b.connected());
+  EXPECT_DOUBLE_EQ(mech.b.position(), 0.5);
+  EXPECT_FALSE(mech.cc.connected());
+  EXPECT_EQ(mech.cc.position(), 0.0);
+  EXPECT_TRUE(mech.gyro.connected());  // the same sensors table, its own id
+  EXPECT_DOUBLE_EQ(mech.gyro.yaw(), 0.125);
+  EXPECT_FALSE(mech.beam.connected());
+  EXPECT_TRUE(mech.pressure.connected());
+
+  hw.set_connected("mech", "a", true);
+  sim.step(10ms);
+  EXPECT_TRUE(mech.a.connected());
+  EXPECT_DOUBLE_EQ(mech.a.position(), 1.5);
+
+  try {
+    hw.set_connected("mech", "c", false);
+    FAIL() << "an unknown device must throw";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string{e.what()}.find("'c'"), std::string::npos) << e.what();
+  }
+}
+
+// Two handles on one node share its subscription and both hear each packet.
+struct Pilot {
+  explicit Pilot(Node& n)
+      : ds{n, [this] { ++packets; }}, second{n, [this] { ++second_packets; }} {}
+  DriverStation ds;
+  DriverStation second;
+  int packets = 0;
+  int second_packets = 0;
+};
+
+driver_station::DriverStationData TeleopStick() {
+  driver_station::DriverStationData data{};
+  data.fms.flags = driver_station::kDsAttached | driver_station::kEnabled |
+                   driver_station::kTeleop;
+  data.fms.alliance = driver_station::Alliance::kBlue;
+  data.fms.station = 3;
+  data.fms.match_time_s = 42.5f;
+  auto& stick = data.joysticks[1];
+  stick.connected = true;
+  stick.axis_count = 2;
+  stick.axes = {0.5f, -1.0f, 0.75f};  // the third is past axis_count
+  stick.button_count = 4;
+  stick.buttons = 0b1001;  // buttons 1 and 4
+  stick.pov_count = 1;
+  stick.povs[0] = 270;
+  std::strncpy(stick.name, "Xbox", sizeof stick.name);
+  return data;
+}
+
+TEST(Devices, DriverStationReadsTheForwardedPacket) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& pilot = sim.add<Pilot>("watcher");
+  auto hw = std::make_unique<SimHardware>(sim);
+  sim.step(10ms);
+  const DriverStation& ds = pilot.ds;
+  EXPECT_EQ(pilot.packets, 0);  // nothing set: nothing forwarded
+  EXPECT_FALSE(ds.connected());
+  EXPECT_FALSE(ds.enabled());
+  EXPECT_EQ(ds.alliance(), driver_station::Alliance::kUnknown);
+
+  hw->set_driver_station(TeleopStick());
+  sim.step(10ms);
+  EXPECT_GT(pilot.packets, 0);
+  EXPECT_EQ(pilot.second_packets, pilot.packets);
+  EXPECT_TRUE(ds.connected());
+  EXPECT_TRUE(ds.enabled());
+  EXPECT_TRUE(ds.teleop());
+  EXPECT_FALSE(ds.autonomous());
+  EXPECT_FALSE(ds.test());
+  EXPECT_FALSE(ds.estop());
+  EXPECT_FALSE(ds.fms_attached());
+  EXPECT_EQ(ds.alliance(), driver_station::Alliance::kBlue);
+  EXPECT_EQ(ds.station(), 3);
+  EXPECT_DOUBLE_EQ(ds.match_time(), 42.5);
+  EXPECT_GT(ds.data().sample_time_us, 0u);  // stamped like the Rio's
+
+  EXPECT_FALSE(ds.joystick(0).connected());
+  const Joystick stick = ds.joystick(1);
+  EXPECT_TRUE(stick.connected());
+  EXPECT_EQ(stick.axis_count(), 2);
+  EXPECT_DOUBLE_EQ(stick.axis(0), 0.5);
+  EXPECT_DOUBLE_EQ(stick.axis(1), -1.0);
+  EXPECT_EQ(stick.axis(2), 0.0);
+  EXPECT_EQ(stick.axis(-1), 0.0);
+  EXPECT_FALSE(stick.button(0));
+  EXPECT_TRUE(stick.button(1));
+  EXPECT_FALSE(stick.button(2));
+  EXPECT_TRUE(stick.button(4));
+  EXPECT_FALSE(stick.button(5));
+  EXPECT_EQ(stick.pov(), 270);
+  EXPECT_EQ(stick.pov(1), -1);
+  EXPECT_EQ(stick.name(), "Xbox");
+  EXPECT_THROW(ds.joystick(driver_station::kMaxJoysticks), std::out_of_range);
+
+  // A Driver Station that is not attached reads as disabled, sticks and all.
+  auto detached = TeleopStick();
+  detached.fms.flags &= ~driver_station::kDsAttached;
+  hw->set_driver_station(detached);
+  sim.step(10ms);
+  EXPECT_FALSE(ds.connected());
+  EXPECT_FALSE(ds.enabled());
+  EXPECT_FALSE(ds.joystick(1).connected());
+  EXPECT_EQ(ds.joystick(1).axis(0), 0.0);
+
+  // Nor does a silent one stay enabled.
+  hw->set_driver_station(TeleopStick());
+  sim.step(10ms);
+  ASSERT_TRUE(ds.enabled());
+  hw.reset();
+  sim.step(150ms);  // past [robot] command_timeout_us
+  EXPECT_FALSE(ds.connected());
+  EXPECT_FALSE(ds.enabled());
+  EXPECT_FALSE(ds.teleop());
+  EXPECT_EQ(ds.data().fms.alliance, driver_station::Alliance::kBlue);  // kept
+}
+
+TEST(Devices, DriverStationDropsACorruptPacket) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& pilot = sim.add<Pilot>("watcher");
+  Packet corrupt{};
+  corrupt.size = 2;  // too small to decode
+  corrupt.data[0] = 0xFF;
+  sim.publish(hardware::kDriverStationTopic, corrupt);
+  sim.step(10ms);
+  EXPECT_EQ(pilot.packets, 0);
+  EXPECT_FALSE(pilot.ds.connected());
 }
 
 }  // namespace

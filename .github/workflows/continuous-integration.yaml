@@ -68,6 +68,11 @@ jobs:
     - name: Setup Gradle cache
       uses: gradle/actions/setup-gradle@v4
 
+    - name: Install RoboRIO toolchain
+      # buildRio cross-compiles for linuxathena, and GradleRIO refuses to
+      # configure the project at all until the toolchain is installed.
+      run: ./gradlew installRoboRioToolchain
+
     - name: Desktop adapter test
       # PhoenixBackend encoder + sim-honesty regressions in src/test/cpp:
       # the actual adapter code, compiled and run on desktop through the
@@ -112,7 +117,7 @@ jobs:
         echo "Diff base: $BASE"
         # Check mode only: never rewrites files. Scoped to files changed in
         # this PR/push so pre-existing tree state stays untouched.
-        git diff --name-only -z "$BASE" HEAD -- \
+        git diff --name-only --diff-filter=d -z "$BASE" HEAD -- \
           'BUILD' 'BUILD.bazel' '*/BUILD' '*/BUILD.bazel' \
           | xargs -0 -r buildifier --mode=check --lint=warn
 
@@ -143,7 +148,7 @@ jobs:
         echo "Diff base: $BASE"
         # --dry-run --Werror: check only, never reformats. .clang-format at
         # the repo root is picked up automatically.
-        git diff --name-only -z "$BASE" HEAD -- \
+        git diff --name-only --diff-filter=d -z "$BASE" HEAD -- \
           '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' \
           | xargs -0 -r clang-format-18 --dry-run --Werror
 
@@ -211,7 +216,7 @@ jobs:
         # units present in compile_commands.json are analyzed; headers are
         # covered through their including TUs. Files outside the Bazel graph
         # are skipped.
-        CHANGED=$(git diff --name-only "$BASE" HEAD -- \
+        CHANGED=$(git diff --name-only --diff-filter=d "$BASE" HEAD -- \
           '*.c' '*.cc' '*.cpp')
         python3 - "$BASE" $CHANGED <<'PYEOF'
         import json, os, subprocess, sys

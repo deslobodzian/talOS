@@ -1,40 +1,44 @@
 #include "telemetry/node.h"
 
-#include <fcntl.h>
 #include <gtest/gtest.h>
-#include <unistd.h>
+#include <sys/wait.h>
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <map>
+#include <memory>
 #include <numbers>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
-#include "talOS/events/simulated_event_loop.h"
-#include "talOS/memory/shared_memory_ptr.h"
+#include "rules_cc/cc/runfiles/runfiles.h"
+#include "studio/schema/wire.h"
+#include "talOS/node/testing.h"
 
 namespace talos::telemetry {
 namespace {
 
 using namespace std::chrono_literals;
+using Talos::Telemetry::Frame;
+using testing::Sim;
 
-// Real shared memory, so each run needs its own name, and the `test` owner is
-// reserved for exactly this: the launcher refuses to spawn a node that uses it,
-// so a fixture name can never be mistaken for a topic the robot runs on.
-//
-// RTMS caps a topic at 30 characters after the leading slash and
-// `test/telemetry/` spends 15 of them, which is why the suffixes here are short
-// enough to leave room for a long pid.
-std::string TestTopic(const char* suffix) {
-  return "/test/telemetry/" + std::string{suffix} + "_" +
-         std::to_string(::getpid());
-}
-
-TelemetryConfig TestConfig(const std::string& topic) {
-  TelemetryConfig config{};
-  config.topic = topic;
-  config.period_us = 10000;
-  return config;
+std::string Runfile(const char* env) {
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error));
+  const char* location = std::getenv(env);
+  if (!runfiles || location == nullptr) {
+    throw std::runtime_error(std::string{"runfile unavailable: "} + env + " " +
+                             error);
+  }
+  return runfiles->Rlocation(location);
 }
 
 odometry::OdometryState Odometry(double x, double y, double yaw_rot) {
@@ -45,398 +49,258 @@ shooter::ShooterState Shooter() {
   return shooter::ShooterState{0, 42.0, 42.0, true, true, true};
 }
 
-// Attaches as a second reader on the node's topic and decodes the newest frame.
-class Consumer {
- public:
-  explicit Consumer(const std::string& topic)
-      : queue_{topic, studio::slot_bytes, 8, studio::slot_count,
-               RTMSOptions{OverflowPolicy::DROP_NEWEST, ReadMode::SEQUENCE}},
-        reader_{queue_.register_reader()} {
-    EXPECT_TRUE(reader_.has_value());
-  }
-
-  // Returns the last frame available, or nullopt when nothing was published.
-  std::optional<std::vector<std::byte>> Drain() {
-    std::optional<std::vector<std::byte>> latest;
-    std::vector<std::byte> slot(studio::slot_bytes);
-    MessageInfo info{};
-    while (queue_.read_next(*reader_, slot, info) == ReadResult::OK) {
-      latest = slot;
-    }
-    return latest;
-  }
-
- private:
-  RTMSQueue queue_;
-  std::optional<std::size_t> reader_;
-};
-
-const Talos::Telemetry::Frame* Decode(const std::vector<std::byte>& slot) {
-  const auto payload = studio::payload(slot);
-  EXPECT_FALSE(payload.empty());
-  if (payload.empty()) return nullptr;
-  // The bridge forwards prefix plus buffer; Studio parses it size-prefixed.
-  return flatbuffers::GetSizePrefixedRoot<Talos::Telemetry::Frame>(
-      payload.data());
+intake::IntakeState Intake(intake::Inhibit inhibit) {
+  return intake::IntakeState{0, true, 20.0, false, 0.0, inhibit};
 }
 
-TEST(Telemetry, PublishesChassisPoseAndChannelsFromOdometry) {
-  const auto topic = TestTopic("pose");
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  TelemetryNode node{loop, TestConfig(topic)};
-  Consumer consumer{topic};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
+class TelemetryTest : public ::testing::Test {
+ protected:
+  // The newest frame on the Studio topic, checked the way the bridge and
+  // Studio read it; nullptr when none was published.
+  const Frame* Latest() {
+    latest_ =
+        sim.latest_bytes(sim.node("telemetry").param<std::string>("topic"));
+    if (!latest_) return nullptr;
+    // The bridge forwards prefix plus buffer; Studio parses it size-prefixed.
+    const auto payload = studio::payload(*latest_);
+    EXPECT_EQ(payload.size(), latest_->size());
+    flatbuffers::Verifier verifier{
+        reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()};
+    EXPECT_TRUE(Talos::Telemetry::VerifySizePrefixedFrameBuffer(verifier));
+    return Talos::Telemetry::GetSizePrefixedFrame(latest_->data());
+  }
 
-  loop.inject(odometry::kStateTopic, Odometry(3.25, 1.5, 0.25));
-  loop.inject(drivetrain::kStateTopic,
+  std::map<std::string, double> Channels() {
+    const Frame* frame = Latest();
+    std::map<std::string, double> channels;
+    if (frame == nullptr || frame->channels() == nullptr) return channels;
+    for (const auto* channel : *frame->channels()) {
+      EXPECT_TRUE(
+          channels.emplace(channel->name()->str(), channel->value()).second)
+          << "Studio rejects a frame with a duplicate channel name";
+    }
+    return channels;
+  }
+
+  Sim sim{Runfile("TALOS_TEST_CONFIG")};
+  Telemetry& telemetry = sim.add<Telemetry>("telemetry");
+
+ private:
+  std::optional<std::vector<std::byte>> latest_;
+};
+
+TEST_F(TelemetryTest, PublishesChassisPoseAndChannelsFromOdometry) {
+  sim.publish(odometry::topics::kState, Odometry(3.25, 1.5, 0.25));
+  sim.publish(drivetrain::topics::kState,
               drivetrain::DrivetrainState{0, true, 1.5, -0.5, 0.25, 0.25, 0.1});
-  loop.run_for(50ms);
+  sim.step(50ms);
 
-  ASSERT_GT(node.frames_published(), 0u);
-  EXPECT_EQ(node.frames_rejected(), 0u);
-
-  const auto slot = consumer.Drain();
-  ASSERT_TRUE(slot.has_value());
-  const auto* frame = Decode(*slot);
+  const Frame* frame = Latest();
   ASSERT_NE(frame, nullptr);
-
   ASSERT_NE(frame->chassis(), nullptr);
   EXPECT_NEAR(frame->chassis()->x(), 3.25, 1e-12);
   EXPECT_NEAR(frame->chassis()->y(), 1.5, 1e-12);
   // yaw_rot is rotations on the robot's wire; Studio poses are radians.
   EXPECT_NEAR(frame->chassis()->yaw(), 0.25 * 2 * std::numbers::pi, 1e-12);
+  // 10 ms ticks from 10 ms: the frame at 50 ms is the fifth.
+  EXPECT_EQ(frame->sequence_id(), 4u);
 
-  ASSERT_NE(frame->channels(), nullptr);
-  std::map<std::string, double> channels;
-  for (const auto* channel : *frame->channels()) {
-    ASSERT_NE(channel->name(), nullptr);
-    EXPECT_TRUE(
-        channels.emplace(channel->name()->str(), channel->value()).second)
-        << "Studio rejects a frame with a duplicate channel name";
-  }
+  const auto channels = Channels();
+  EXPECT_NEAR(channels.at("pose/valid"), 1.0, 1e-12);
   EXPECT_NEAR(channels.at("odometry/vx"), 1.5, 1e-12);
   EXPECT_NEAR(channels.at("odometry/omega"), 0.25, 1e-12);
   // No shooter publisher: its rows stay out rather than holding the frame.
   EXPECT_EQ(channels.count("shooter/flywheel"), 0u);
   EXPECT_NEAR(channels.at("drivetrain/vx"), 1.5, 1e-12);
+  EXPECT_NEAR(channels.at("drivetrain/enabled"), 1.0, 1e-12);
 }
 
-// The Studio segment opens on the first publishable frame, not in the
-// constructor and not in Start: --describe builds the node on a simulated
-// loop and never ticks, so describing (or merely constructing) the node must
-// leave no shared-memory segment behind. shm_open with O_RDWR attaches
-// without creating, so ENOENT proves absence.
-bool ShmSegmentExists(const std::string& topic) {
-  const int fd = ::shm_open(ShmObjectName(topic).c_str(), O_RDWR, 0666);
-  if (fd == -1) return false;
-  ::close(fd);
-  return true;
-}
-
-TEST(Telemetry, ConstructorAndStartCreateNoSharedMemory) {
-  const auto topic = TestTopic("defer");
-  EXPECT_FALSE(ShmSegmentExists(topic));
-
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  TelemetryNode node{loop, TestConfig(topic)};
-  EXPECT_FALSE(ShmSegmentExists(topic));
-
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
-  // Ticks fire with no pose: nothing publishable, still no segment.
-  loop.run_for(50ms);
-  EXPECT_EQ(node.frames_published(), 0u);
-  EXPECT_FALSE(ShmSegmentExists(topic));
-
-  // First pose publishes, opening the segment on first use.
-  loop.inject(odometry::kStateTopic, Odometry(1.0, 2.0, 0.0));
-  loop.run_for(50ms);
-  EXPECT_GT(node.frames_published(), 0u);
-  EXPECT_TRUE(ShmSegmentExists(topic));
-}
-
-TEST(Telemetry, PublishesNothingUntilAPoseExists) {
-  const auto topic = TestTopic("nopose");
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  TelemetryNode node{loop, TestConfig(topic)};
-  Consumer consumer{topic};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
-
-  // Driver station and drivetrain alone carry no field position. Publishing
-  // here would draw the robot at the origin as though that were measured.
-  loop.inject(drivetrain::kStateTopic,
+TEST_F(TelemetryTest, PublishesNothingUntilAPoseExists) {
+  // Drivetrain alone carries no field position. Publishing here would draw
+  // the robot at the origin as though that were measured.
+  sim.publish(drivetrain::topics::kState,
               drivetrain::DrivetrainState{0, true, 1, 0, 0, 0, 0});
-  loop.run_for(50ms);
-  EXPECT_EQ(node.frames_published(), 0u);
-  EXPECT_FALSE(consumer.Drain().has_value());
+  sim.step(50ms);
+  EXPECT_EQ(Latest(), nullptr);
 }
 
-std::map<std::string, double> Channels(const Talos::Telemetry::Frame* frame) {
-  std::map<std::string, double> channels;
-  for (const auto* channel : *frame->channels()) {
-    EXPECT_TRUE(
-        channels.emplace(channel->name()->str(), channel->value()).second)
-        << "Studio rejects a frame with a duplicate channel name";
-  }
-  return channels;
-}
-
-TEST(Telemetry, PublishesMechanismChannelsWithoutOdometry) {
-  const auto topic = TestTopic("mechonly");
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  TelemetryNode node{loop, TestConfig(topic)};
-  Consumer consumer{topic};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
-
+TEST_F(TelemetryTest, PublishesMechanismChannelsWithoutOdometry) {
   // Mechanism rows publish with no pose at all: the operator sees the
   // shooter spinning up while localization is still converging.
-  loop.inject(shooter::kStateTopic, Shooter());
-  loop.run_for(50ms);
+  sim.publish(shooter::topics::kState, Shooter());
+  sim.step(50ms);
 
-  ASSERT_GT(node.frames_published(), 0u);
-  const auto slot = consumer.Drain();
-  ASSERT_TRUE(slot.has_value());
-  const auto* frame = Decode(*slot);
-  ASSERT_NE(frame, nullptr);
-  ASSERT_NE(frame->channels(), nullptr);
-
-  const auto channels = Channels(frame);
+  const auto channels = Channels();
   EXPECT_NEAR(channels.at("shooter/flywheel"), 42.0, 1e-12);
   EXPECT_NEAR(channels.at("pose/valid"), 0.0, 1e-12);
   EXPECT_NEAR(channels.at("mechanism/stale"), 0.0, 1e-12);
   EXPECT_EQ(channels.count("odometry/vx"), 0u);
   // Chassis is zeros by contract until pose/valid reads 1; the field view
   // must gate drawing on that flag rather than on the struct's presence.
+  const Frame* frame = Latest();
+  ASSERT_NE(frame, nullptr);
   ASSERT_NE(frame->chassis(), nullptr);
   EXPECT_EQ(frame->chassis()->x(), 0.0);
   EXPECT_EQ(frame->chassis()->y(), 0.0);
   EXPECT_EQ(frame->chassis()->yaw(), 0.0);
 }
 
-TEST(Telemetry, PoseValidTracksFreshPose) {
-  const auto topic = TestTopic("posevalid");
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  TelemetryNode node{loop, TestConfig(topic)};
-  Consumer consumer{topic};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
+TEST_F(TelemetryTest, PoseValidTracksFreshPose) {
+  sim.publish(shooter::topics::kState, Shooter());
+  sim.step(20ms);
+  EXPECT_NEAR(Channels().at("pose/valid"), 0.0, 1e-12);
 
-  loop.inject(shooter::kStateTopic, Shooter());
-  loop.run_for(20ms);
-  ASSERT_GT(node.frames_published(), 0u);
-  const auto first_slot = consumer.Drain();
-  ASSERT_TRUE(first_slot.has_value());
-  const auto* first_frame = Decode(*first_slot);
-  ASSERT_NE(first_frame, nullptr);
-  EXPECT_NEAR(Channels(first_frame).at("pose/valid"), 0.0, 1e-12);
-
-  loop.inject(odometry::kStateTopic, Odometry(3.25, 1.5, 0.25));
-  loop.run_for(20ms);
-  const auto slot = consumer.Drain();
-  ASSERT_TRUE(slot.has_value());
-  const auto* frame = Decode(*slot);
+  sim.publish(odometry::topics::kState, Odometry(3.25, 1.5, 0.25));
+  sim.step(20ms);
+  EXPECT_NEAR(Channels().at("pose/valid"), 1.0, 1e-12);
+  const Frame* frame = Latest();
   ASSERT_NE(frame, nullptr);
-  EXPECT_NEAR(Channels(frame).at("pose/valid"), 1.0, 1e-12);
   EXPECT_NEAR(frame->chassis()->x(), 3.25, 1e-12);
 }
 
-TEST(Telemetry, OmitsStaleMechanismRowsButKeepsPublishingPose) {
-  const auto topic = TestTopic("mechstale");
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  TelemetryNode node{loop, TestConfig(topic)};
-  Consumer consumer{topic};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
-
-  loop.inject(shooter::kStateTopic, Shooter());
-  loop.inject(odometry::kStateTopic, Odometry(1.0, 2.0, 0.0));
-  loop.run_for(50ms);
-  ASSERT_GT(node.frames_published(), 0u);
-  const auto fresh_slot = consumer.Drain();
-  ASSERT_TRUE(fresh_slot.has_value());
-  const auto* fresh_frame = Decode(*fresh_slot);
-  ASSERT_NE(fresh_frame, nullptr);
-  EXPECT_GT(Channels(fresh_frame).count("shooter/flywheel"), 0u);
+TEST_F(TelemetryTest, OmitsStaleMechanismRowsButKeepsPublishingPose) {
+  sim.publish(shooter::topics::kState, Shooter());
+  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  sim.step(50ms);
+  EXPECT_GT(Channels().count("shooter/flywheel"), 0u);
 
   // Both sources age out past the 100 ms horizon; then odometry alone
   // recovers. The frame must carry the live pose without the frozen
   // shooter row, and say so in-stream.
-  loop.run_for(150ms);
-  (void)consumer.Drain();
-  loop.inject(odometry::kStateTopic, Odometry(1.0, 2.0, 0.0));
-  loop.run_for(30ms);
-  const auto slot = consumer.Drain();
-  ASSERT_TRUE(slot.has_value());
-  const auto* frame = Decode(*slot);
-  ASSERT_NE(frame, nullptr);
-  const auto channels = Channels(frame);
+  sim.step(150ms);
+  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  sim.step(30ms);
+  const auto channels = Channels();
   EXPECT_EQ(channels.count("shooter/flywheel"), 0u);
   EXPECT_NEAR(channels.at("mechanism/stale"), 1.0, 1e-12);
   EXPECT_NEAR(channels.at("pose/valid"), 1.0, 1e-12);
   EXPECT_NEAR(channels.at("odometry/vx"), 1.5, 1e-12);
 }
 
-TEST(Telemetry, MarksStaleOdometryAndHoldsFieldView) {
-  const auto topic = TestTopic("odomstale");
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  TelemetryNode node{loop, TestConfig(topic)};
-  Consumer consumer{topic};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
-
-  loop.inject(odometry::kStateTopic, Odometry(1.0, 2.0, 0.0));
-  loop.run_for(50ms);
-  ASSERT_GT(node.frames_published(), 0u);
-  (void)consumer.Drain();
+TEST_F(TelemetryTest, MarksStaleOdometryAndHoldsFieldView) {
+  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  sim.step(50ms);
+  ASSERT_NE(Latest(), nullptr);
 
   // Odometry ages out; a fresh mechanism push keeps frames flowing, but the
   // field view must wait: pose/valid drops, odometry rows go missing, and
   // chassis holds zeros rather than a frozen pose drawn as live.
-  loop.run_for(150ms);
-  loop.inject(shooter::kStateTopic, Shooter());
-  loop.run_for(30ms);
-  const auto slot = consumer.Drain();
-  ASSERT_TRUE(slot.has_value());
-  const auto* frame = Decode(*slot);
-  ASSERT_NE(frame, nullptr);
-  const auto channels = Channels(frame);
+  sim.step(150ms);
+  sim.publish(shooter::topics::kState, Shooter());
+  sim.step(30ms);
+  const auto channels = Channels();
   EXPECT_NEAR(channels.at("pose/valid"), 0.0, 1e-12);
   EXPECT_NEAR(channels.at("odometry/stale"), 1.0, 1e-12);
   EXPECT_EQ(channels.count("odometry/vx"), 0u);
   EXPECT_NEAR(channels.at("shooter/flywheel"), 42.0, 1e-12);
+  const Frame* frame = Latest();
+  ASSERT_NE(frame, nullptr);
   EXPECT_EQ(frame->chassis()->x(), 0.0);
   EXPECT_EQ(frame->chassis()->y(), 0.0);
 }
 
-TEST(Telemetry, DropsAFrameWhoseValuesWouldFailStudioValidation) {
-  const auto topic = TestTopic("nan");
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  TelemetryNode node{loop, TestConfig(topic)};
-  Consumer consumer{topic};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
-
+TEST_F(TelemetryTest, DropsAFrameWhoseValuesWouldFailStudioValidation) {
   // Studio throws on a non-finite number and discards the whole frame, so a
   // NaN pose must be dropped here rather than shipped.
-  loop.inject(odometry::kStateTopic,
+  sim.publish(odometry::topics::kState,
               Odometry(std::numeric_limits<double>::quiet_NaN(), 0, 0));
-  loop.run_for(50ms);
-  EXPECT_EQ(node.frames_published(), 0u);
-  EXPECT_GT(node.frames_rejected(), 0u);
+  sim.step(50ms);
+  EXPECT_EQ(Latest(), nullptr);
 
-  loop.inject(odometry::kStateTopic, Odometry(1.0, 2.0, 0.0));
-  loop.run_for(50ms);
-  EXPECT_GT(node.frames_published(), 0u);
+  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  sim.step(50ms);
+  EXPECT_NEAR(Channels().at("pose/valid"), 1.0, 1e-12);
 }
 
-TEST(Telemetry, ForwardsShooterStateIntoMechanismChannels) {
-  const auto topic = TestTopic("shoot");
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  TelemetryNode node{loop, TestConfig(topic)};
-  Consumer consumer{topic};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
+TEST_F(TelemetryTest, ForwardsShooterStateIntoMechanismChannels) {
+  sim.publish(odometry::topics::kState, Odometry(3.25, 1.5, 0.25));
+  sim.publish(shooter::topics::kState, Shooter());
+  sim.step(50ms);
 
-  loop.inject(odometry::kStateTopic, Odometry(3.25, 1.5, 0.25));
-  loop.inject(shooter::kStateTopic, Shooter());
-  loop.run_for(50ms);
-
-  ASSERT_GT(node.frames_published(), 0u);
-  const auto slot = consumer.Drain();
-  ASSERT_TRUE(slot.has_value());
-  const auto* frame = Decode(*slot);
-  ASSERT_NE(frame, nullptr);
-  ASSERT_NE(frame->channels(), nullptr);
-
-  const auto channels = Channels(frame);
+  const auto channels = Channels();
   EXPECT_NEAR(channels.at("shooter/flywheel"), 42.0, 1e-12);
   EXPECT_NEAR(channels.at("shooter/beam_broken"), 1.0, 1e-12);
-  EXPECT_NEAR(frame->chassis()->x(), 3.25, 1e-12);
   EXPECT_NEAR(channels.at("odometry/vx"), 1.5, 1e-12);
+  const Frame* frame = Latest();
+  ASSERT_NE(frame, nullptr);
+  EXPECT_NEAR(frame->chassis()->x(), 3.25, 1e-12);
 }
 
-TEST(Telemetry, ForwardsIntakeStudioViewWithReadableInhibit) {
-  const auto topic = TestTopic("intake");
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  TelemetryNode node{loop, TestConfig(topic)};
-  Consumer consumer{topic};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
+TEST_F(TelemetryTest, ForwardsIntakeStudioViewWithReadableInhibit) {
+  sim.publish(odometry::topics::kState, Odometry(3.25, 1.5, 0.25));
+  // Inhibited (stale target): measured 20, requested 0.
+  sim.publish(intake::topics::kState, Intake(intake::Inhibit::TARGET_STALE));
+  sim.step(50ms);
 
-  loop.inject(odometry::kStateTopic, Odometry(3.25, 1.5, 0.25));
-  // inhibited here (stale target): measured 20, requested 0, reason 3.
-  loop.inject(intake::kStateTopic,
-              intake::IntakeState{0, true, 20.0, false, 0.0,
-                                  intake::kInhibitTargetStale});
-  loop.run_for(50ms);
-
-  ASSERT_GT(node.frames_published(), 0u);
-  const auto slot = consumer.Drain();
-  ASSERT_TRUE(slot.has_value());
-  const auto* frame = Decode(*slot);
-  ASSERT_NE(frame, nullptr);
-  ASSERT_NE(frame->channels(), nullptr);
-
-  const auto channels = Channels(frame);
+  const auto channels = Channels();
   EXPECT_NEAR(channels.at("intake/requested"), 0.0, 1e-6);
   EXPECT_NEAR(channels.at("intake/measured"), 20.0, 1e-6);
   // The numeric code stays the wire contract; the unit names it for Studio,
   // which renders each channel's unit next to its value.
+  const Frame* frame = Latest();
+  ASSERT_NE(frame, nullptr);
   bool found = false;
   for (const auto* channel : *frame->channels()) {
-    if (channel->name()->str() == "intake/inhibit") {
-      found = true;
-      EXPECT_NEAR(channel->value(),
-                  static_cast<double>(intake::kInhibitTargetStale),
-                  1e-12);
-      ASSERT_NE(channel->unit(), nullptr);
-      EXPECT_EQ(channel->unit()->str(), "TARGET_STALE");
-    }
+    if (channel->name()->str() != "intake/inhibit") continue;
+    found = true;
+    EXPECT_NEAR(channel->value(),
+                static_cast<double>(intake::Inhibit::TARGET_STALE), 1e-12);
+    ASSERT_NE(channel->unit(), nullptr);
+    EXPECT_EQ(channel->unit()->str(), "TARGET_STALE");
   }
   EXPECT_TRUE(found);
 }
 
-TEST(Telemetry, DropsStaleShooterWhileIntakeStaysLive) {
-  const auto topic = TestTopic("split");
-  event::SimulationEnvironment env;
-  event::SimulatedEventLoop<> loop{env};
-  TelemetryNode node{loop, TestConfig(topic)};
-  Consumer consumer{topic};
-  node.Start(event::MonotonicTime::from_nanos(1'000'000));
-
+TEST_F(TelemetryTest, DropsStaleShooterWhileIntakeStaysLive) {
   // Shooter speaks once; intake keeps reporting every 20 ms. Past the
   // 100 ms horizon the shooter rows must vanish -- frozen flywheel numbers
   // beside a live intake would read as healthy -- with a stale marker in
-  // their place. No odometry is injected: mechanism traffic alone publishes.
-  loop.inject(shooter::kStateTopic, Shooter());
+  // their place. No odometry: mechanism traffic alone publishes.
+  sim.publish(shooter::topics::kState, Shooter());
   for (int i = 0; i < 8; ++i) {
-    loop.inject(intake::kStateTopic,
-                intake::IntakeState{0, true, 20.0, false, 0.0,
-                                    intake::kInhibitDrive});
-    loop.run_for(20ms);
-    // The test queue holds 8 frames; drain as we go so the newest frame is
-    // never the one DROP_NEWEST discards. Keep the last iteration's frames
-    // for the assertions below.
-    if (i + 1 < 8) (void)consumer.Drain();
+    sim.publish(intake::topics::kState, Intake(intake::Inhibit::DRIVE));
+    sim.step(20ms);
   }
 
-  ASSERT_GT(node.frames_published(), 0u);
-  const auto slot = consumer.Drain();
-  ASSERT_TRUE(slot.has_value());
-  const auto* frame = Decode(*slot);
-  ASSERT_NE(frame, nullptr);
-  ASSERT_NE(frame->channels(), nullptr);
-
-  const auto channels = Channels(frame);
+  const auto channels = Channels();
   EXPECT_EQ(channels.count("shooter/flywheel"), 0u);
   EXPECT_NEAR(channels.at("shooter/stale"), 1.0, 1e-12);
   EXPECT_NEAR(channels.at("intake/measured"), 20.0, 1e-6);
   EXPECT_NEAR(channels.at("intake/stale"), 0.0, 1e-12);
   EXPECT_NEAR(channels.at("mechanism/stale"), 0.0, 1e-12);
   EXPECT_NEAR(channels.at("pose/valid"), 0.0, 1e-12);
+}
+
+// The Studio feed bypasses the loop, so --describe must still declare it:
+// the bridge reads it, and a graph without it reports the bridge's input as
+// published by nobody.
+TEST(Binary, DescribeDeclaresTheStudioFeedAsAnExternalSender) {
+  const std::string command = "'" + Runfile("TALOS_TEST_NODE") +
+                              "' --describe --config '" +
+                              Runfile("TALOS_TEST_CONFIG") + "' 2>&1";
+  FILE* pipe = ::popen(command.c_str(), "r");
+  ASSERT_NE(pipe, nullptr);
+  std::string output;
+  char buffer[4096];
+  while (const std::size_t n = std::fread(buffer, 1, sizeof buffer, pipe)) {
+    output.append(buffer, n);
+  }
+  const int status = ::pclose(pipe);
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << output;
+  EXPECT_NE(
+      output.find(
+          R"({"kind": "SENDER", "name": "/talos/telemetry", "message_bytes": 65536, "external": true, "optional": false})"),
+      std::string::npos)
+      << output;
+  for (const char* watched :
+       {"/odometry/state", "/drivetrain/state", "/driver_station/state",
+        "/shooter/state", "/intake/state"}) {
+    EXPECT_NE(output.find(std::string{R"({"kind": "WATCHER", "name": ")"} +
+                          watched + "\""),
+              std::string::npos)
+        << watched << "\n"
+        << output;
+  }
 }
 
 }  // namespace

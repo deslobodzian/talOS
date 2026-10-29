@@ -58,13 +58,11 @@ class LogWriter {
   // copied into the file header, truncated to MAX_SOURCE_NAME characters.
   // Throws std::system_error if the file cannot be opened.
   explicit LogWriter(std::string_view path, std::string_view process_name,
-                     Options options = Options{},
-                     std::uint64_t session_id = 0);
+                     Options options = Options{}, std::uint64_t session_id = 0);
 
   // Convenience overload: one chunk of `buffer_bytes`, written synchronously.
   LogWriter(std::string_view path, std::string_view process_name,
-            std::size_t buffer_bytes,
-            std::uint64_t session_id = 0);
+            std::size_t buffer_bytes, std::uint64_t session_id = 0);
 
   ~LogWriter();
 

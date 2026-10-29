@@ -20,7 +20,7 @@ std::vector<std::byte> read_whole_file(std::string_view path) {
                             "LogReader: open failed for " + std::string{path});
   }
 
-  struct stat st{};
+  struct stat st {};
   if (::fstat(fd, &st) != 0) {
     const int saved_errno = errno;
     ::close(fd);
@@ -143,31 +143,44 @@ bool LogReader::next(Record& out) {
                              std::to_string(record_count_) + ": bad magic");
   }
 
-  const std::size_t total = sizeof(RecordHeader) + header.payload_bytes;
+  const std::size_t total = sizeof(RecordHeader) + header.stored_bytes;
   if (remaining < total) {
     truncated_ = true;
     return false;
   }
 
-  const std::span<const std::byte> payload{
-      data_.data() + cursor_ + sizeof(RecordHeader), header.payload_bytes};
+  const std::span<const std::byte> stored{
+      data_.data() + cursor_ + sizeof(RecordHeader), header.stored_bytes};
 
   RecordHeader header_for_crc = header;
   header_for_crc.crc32 = 0;
   std::uint32_t crc = crc32(std::span<const std::byte>{
       reinterpret_cast<const std::byte*>(&header_for_crc),
       sizeof(header_for_crc)});
-  if (!payload.empty()) {
-    crc = crc32(payload, crc);
+  if (!stored.empty()) {
+    crc = crc32(stored, crc);
   }
   if (crc != header.crc32) {
     throw std::runtime_error("LogReader: record " +
                              std::to_string(record_count_) +
                              ": checksum mismatch");
   }
+  if (header.stored_bytes > header.payload_bytes) {
+    throw std::runtime_error("LogReader: record " +
+                             std::to_string(record_count_) +
+                             ": stores more bytes than its payload");
+  }
 
   out.header = header;
-  out.payload = payload;
+  if (header.stored_bytes == header.payload_bytes) {
+    out.payload = stored;
+  } else {
+    payload_.assign(header.payload_bytes, std::byte{0});
+    if (!stored.empty()) {
+      std::memcpy(payload_.data(), stored.data(), stored.size());
+    }
+    out.payload = payload_;
+  }
   cursor_ += total;
   ++record_count_;
   return true;

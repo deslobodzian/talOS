@@ -57,7 +57,12 @@
 namespace talos::hardware::sim {
 
 // One reusable motor/mechanism model.
-enum class MotorType : uint8_t { kKrakenX60 = 0, kKrakenX44, kFalcon500, kGeneric };
+enum class MotorType : uint8_t {
+  kKrakenX60 = 0,
+  kKrakenX44,
+  kFalcon500,
+  kGeneric
+};
 
 // Load reflected onto the rotor shaft. Roller/flywheel first; arm/elevator
 // gravity loads are future work.
@@ -120,18 +125,17 @@ inline AxisState StepAxis(const MotorModel& motor, const MechanismModel& mech,
     const double bemf_slope = free_rotor > 0.0 ? supply / free_rotor : 0.0;
     const double damping_v_per_rps =
         bemf_slope + motor.viscous_friction_vs_per_rps;
-    target = damping_v_per_rps > 0.0
-                 ? volts / damping_v_per_rps
-                 : (volts / supply) * free_rotor;
+    target = damping_v_per_rps > 0.0 ? volts / damping_v_per_rps
+                                     : (volts / supply) * free_rotor;
     if (std::abs(out.rotor_velocity_rps) < 1e-9 &&
         std::abs(volts) < motor.static_friction_v)
       target = 0.0;
   } else {
     // Unpowered decay: brake shorts the motor (fast stop), coast lets the
     // load roll. Flywheels carry more energy, so they coast longer.
-    tau = mech.brake ? std::min(tau, 0.02)
-                     : std::max(tau, mech.load == LoadKind::kFlywheel ? 1.5
-                                                                      : 0.6);
+    tau = mech.brake
+              ? std::min(tau, 0.02)
+              : std::max(tau, mech.load == LoadKind::kFlywheel ? 1.5 : 0.6);
   }
   const double alpha = std::min(1.0, dt_s / std::max(tau, 1e-4));
   out.rotor_velocity_rps += (target - out.rotor_velocity_rps) * alpha;
@@ -151,8 +155,9 @@ inline AxisState StepAxis(const MotorModel& motor, const MechanismModel& mech,
 inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
                          double mech_pos, double mech_vel, double supply_v,
                          double& volts_out) {
-  const double ceiling = std::min(cfg.max_voltage > 0.0 ? cfg.max_voltage : 12.0,
-                                  supply_v > 0.0 ? supply_v : 12.0);
+  const double ceiling =
+      std::min(cfg.max_voltage > 0.0 ? cfg.max_voltage : 12.0,
+               supply_v > 0.0 ? supply_v : 12.0);
   const auto clamp = [](double v, double lim) {
     return std::clamp(v, -lim, lim);
   };
@@ -182,8 +187,8 @@ inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
       // through voltage rather than teleporting.
       const auto& gains = cfg.slots[req.slot < 3 ? req.slot : 0];
       const double error = req.demand - mech_pos;
-      volts_out = clamp(req.feedforward_v + gains.p * error - gains.d * mech_vel,
-                        ceiling);
+      volts_out = clamp(
+          req.feedforward_v + gains.p * error - gains.d * mech_vel, ceiling);
       return true;
     }
   }
@@ -268,8 +273,7 @@ class PhysicsSimBackend final : public Backend {
       out.velocity_rps = mech_vel;
       out.voltage = powered_[i] ? applied_volts_[i] : 0.0;
       // Placeholder current proportional to effort; not a winding model.
-      out.stator_current_a =
-          std::abs(out.voltage) / 12.0 * m.stator_limit_a;
+      out.stator_current_a = std::abs(out.voltage) / 12.0 * m.stator_limit_a;
       EnforceSoftLimits(m, out, i);
       held_[i] = out;
     }
@@ -315,23 +319,20 @@ class PhysicsSimBackend final : public Backend {
     for (std::size_t i = 0; i < config_.digital_inputs.size(); ++i) {
       const auto id = config_.digital_inputs[i].id;
       const auto it = digital_inputs_.find(id);
-      state.digital_inputs[i] = {id, true, it != digital_inputs_.end()
-                                             ? it->second
-                                             : false};
+      state.digital_inputs[i] = {
+          id, true, it != digital_inputs_.end() ? it->second : false};
     }
     for (std::size_t i = 0; i < config_.digital_outputs.size(); ++i) {
       const auto id = config_.digital_outputs[i].id;
       const auto it = digital_outputs_.find(id);
-      state.digital_outputs[i] = {id, true, it != digital_outputs_.end()
-                                               ? it->second
-                                               : false};
+      state.digital_outputs[i] = {
+          id, true, it != digital_outputs_.end() ? it->second : false};
     }
     for (std::size_t i = 0; i < config_.analog_inputs.size(); ++i) {
       const auto id = config_.analog_inputs[i].id;
       const auto it = analog_inputs_.find(id);
-      state.analog_inputs[i] = {id, true,
-                                it != analog_inputs_.end() ? it->second : 0.0,
-                                0};
+      state.analog_inputs[i] = {
+          id, true, it != analog_inputs_.end() ? it->second : 0.0, 0};
     }
     for (std::size_t i = 0; i < config_.encoders.size(); ++i) {
       const auto id = config_.encoders[i].id;
@@ -420,7 +421,8 @@ class PhysicsSimBackend final : public Backend {
     if (const int i = MotorIndex(motor_id); i >= 0) frozen_[i] = false;
   }
   void SetMotorConnected(uint16_t motor_id, bool connected) {
-    if (const int i = MotorIndex(motor_id); i >= 0) motor_connected_[i] = connected;
+    if (const int i = MotorIndex(motor_id); i >= 0)
+      motor_connected_[i] = connected;
   }
   void SetSensorConnected(uint16_t sensor_id, bool connected) {
     for (std::size_t i = 0; i < config_.sensors.size(); ++i) {

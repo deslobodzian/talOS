@@ -103,13 +103,14 @@ bool HardwareNode::Open() {
   // A registry that cannot be opened must not stop the robot: not being
   // visible in a viewer is a far smaller failure than not driving.
   try {
-    registration_.emplace(introspect::NodeRegistration::Identity{
-        .name = kNodeName,
-        .target = kNodeTarget,
-        .session_id = session_id_,
-        .flags = simulation_ ? introspect::kFlagSimulation : 0u,
-    });
-    registration_->publish(introspection_manifest_, EndpointAttributes());
+    auto& registration =
+        registration_.emplace(introspect::NodeRegistration::Identity{
+            .name = kNodeName,
+            .target = kNodeTarget,
+            .session_id = session_id_,
+            .flags = simulation_ ? introspect::kFlagSimulation : 0u,
+        });
+    registration.publish(introspection_manifest_, EndpointAttributes());
   } catch (const std::exception& e) {
     std::fprintf(stderr, "hardware_node: node registry unavailable: %s\n",
                  e.what());
@@ -252,8 +253,8 @@ void HardwareNode::Tick(uint64_t now_us) {
       // Every cached merge dies here: motion resumes only on fresh subsystem
       // requests stamped with the new identity.
       const bool transition =
-          (state.boot_id != last_boot_id_) ||
-          (state.config_id != config_id_) || (state.epoch != last_epoch_) ||
+          (state.boot_id != last_boot_id_) || (state.config_id != config_id_) ||
+          (state.epoch != last_epoch_) ||
           ((state.flags ^ last_state_flags_) & (kEnabled | kHardwareFault));
       if (transition) {
         InvalidateRequests();
@@ -347,7 +348,7 @@ void HardwareNode::Tick(uint64_t now_us) {
     }
 
     // Check timeout: > 2x period
-    const uint64_t timeout_us = 2 * tracker.period_us;
+    const uint64_t timeout_us = 2 * static_cast<uint64_t>(tracker.period_us);
     if (tracker.last_seen_us == 0 ||
         (now_us - tracker.last_seen_us > timeout_us)) {
       tracker.timed_out = true;
@@ -531,13 +532,14 @@ bool HardwareNode::OwnsRequestDevices(const SubsystemTracker& tracker,
     if (!owns(tracker.devices.motors, partial.motors[i].id)) return false;
   }
   for (std::size_t i = 0; i < partial.digital_output_count; ++i) {
-    if (!owns(tracker.devices.digital_outputs,
-              partial.digital_outputs[i].id))
+    if (!owns(tracker.devices.digital_outputs, partial.digital_outputs[i].id)) {
       return false;
+    }
   }
   for (std::size_t i = 0; i < partial.pwm_output_count; ++i) {
-    if (!owns(tracker.devices.pwm_outputs, partial.pwm_outputs[i].id))
+    if (!owns(tracker.devices.pwm_outputs, partial.pwm_outputs[i].id)) {
       return false;
+    }
   }
   return true;
 }
