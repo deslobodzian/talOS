@@ -35,6 +35,19 @@ uint32_t Age(const ph::BaseStatusSignal& signal) {
     return std::numeric_limits<uint32_t>::max();
   return static_cast<uint32_t>(std::max(0.0, std::ceil(age)));
 }
+
+// A config apply or a signal-rate change can miss its reply window while a
+// device is still booting, or in simulation while a re-created sim device comes
+// up. CTRE's guidance is to retry; five tries bound each call to about half a
+// second.
+template <typename Call>
+ctre::phoenix::StatusCode Retry(Call call) {
+  ctre::phoenix::StatusCode status = call();
+  for (int attempt = 1; attempt < 5 && !status.IsOK(); ++attempt) {
+    status = call();
+  }
+  return status;
+}
 }  // namespace
 
 PhoenixBackend::PhoenixBackend(bool is_simulation)
@@ -121,16 +134,18 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
           s.inverted
               ? ph::signals::SensorDirectionValue::Clockwise_Positive
               : ph::signals::SensorDirectionValue::CounterClockwise_Positive;
-      ok &= note_failure(s.name, s.bus, s.can_id, "apply_cancoder_config",
-                         device.encoder->GetConfigurator().Apply(cfg));
+      ok &= note_failure(
+          s.name, s.bus, s.can_id, "apply_cancoder_config",
+          Retry([&] { return device.encoder->GetConfigurator().Apply(cfg); }));
       signals_.push_back(&device.encoder->GetAbsolutePosition(false));
       signals_.push_back(&device.encoder->GetVelocity(false));
     } else {
       device.imu =
           std::make_unique<ph::hardware::Pigeon2>(s.can_id, ph::CANBus{s.bus});
       ph::configs::Pigeon2Configuration cfg;
-      ok &= note_failure(s.name, s.bus, s.can_id, "apply_pigeon2_config",
-                         device.imu->GetConfigurator().Apply(cfg));
+      ok &= note_failure(
+          s.name, s.bus, s.can_id, "apply_pigeon2_config",
+          Retry([&] { return device.imu->GetConfigurator().Apply(cfg); }));
       signals_.push_back(&device.imu->GetYaw(false));
       signals_.push_back(&device.imu->GetAngularVelocityZWorld(false));
     }
@@ -177,8 +192,9 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     SetGains(cfg.Slot0, m.slots[0]);
     SetGains(cfg.Slot1, m.slots[1]);
     SetGains(cfg.Slot2, m.slots[2]);
-    ok &= note_failure(m.name, m.bus, m.can_id, "apply_talonfx_config",
-                       motor->GetConfigurator().Apply(cfg));
+    ok &= note_failure(
+        m.name, m.bus, m.can_id, "apply_talonfx_config",
+        Retry([&] { return motor->GetConfigurator().Apply(cfg); }));
     signals_.push_back(&motor->GetPosition(false));
     signals_.push_back(&motor->GetVelocity(false));
     signals_.push_back(&motor->GetMotorVoltage(false));
@@ -221,7 +237,9 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   }
 
   for (auto* signal : signals_) {
-    const auto code = signal->SetUpdateFrequency(units::hertz_t{c.status_hz});
+    const auto code = Retry([&] {
+      return signal->SetUpdateFrequency(units::hertz_t{c.status_hz});
+    });
     ok &= note_failure("signal_rates", "", -1, "set_signal_frequency", code);
   }
   return ok;
