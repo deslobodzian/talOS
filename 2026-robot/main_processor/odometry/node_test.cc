@@ -108,8 +108,9 @@ Result RunNode(const std::string& args) {
 }
 
 TEST(OdometryBinary, LoggedSimRunReplaysWithoutDivergence) {
+  const char* tmp = std::getenv("TEST_TMPDIR");
   const std::string log =
-      std::string{std::getenv("TEST_TMPDIR")} + "/odometry_test.tlog";
+      std::string{tmp != nullptr ? tmp : "/tmp"} + "/odometry_test.tlog";
   const Result run = RunNode("--sim --duration-s 1 --log '" + log + "'");
   ASSERT_EQ(run.status, 0) << run.output;
   const Result replay = RunNode("--replay '" + log + "'");

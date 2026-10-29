@@ -358,14 +358,12 @@ std::size_t NodeAccess::add_subscription(Node& node, std::string_view topic,
                                          MessageCallback on_message) {
   Node::Impl& impl = *node.impl_;
   CheckLayout(impl.name, topic, bytes, alignment);
-  auto slot = std::make_unique<Node::Impl::SubscriptionSlot>(
-      Node::Impl::SubscriptionSlot{
-          .topic = std::string{topic},
-          .bytes = bytes,
-          .data = std::make_unique<std::byte[]>(bytes),
-          .optional = optional,
-          .on_message = std::move(on_message),
-      });
+  auto slot = std::make_unique<Node::Impl::SubscriptionSlot>();
+  slot->topic = std::string{topic};
+  slot->bytes = bytes;
+  slot->data = std::make_unique<std::byte[]>(bytes);
+  slot->optional = optional;
+  slot->on_message = std::move(on_message);
   impl.loop->register_watcher(topic, static_cast<std::uint32_t>(bytes),
                               static_cast<std::uint32_t>(alignment),
                               event::Thunk{slot.get(), &Node::Impl::OnMessage});

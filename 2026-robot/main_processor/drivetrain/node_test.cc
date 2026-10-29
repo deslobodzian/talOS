@@ -170,8 +170,10 @@ TEST(SwerveGeometry, RequiresExactlyFourModulesAndAPositiveWheelRadius) {
 // table, written under TEST_TMPDIR.
 std::string ConfigWith(const std::string& extra) {
   const std::filesystem::path source = ConfigPath();
+  const char* tmp = std::getenv("TEST_TMPDIR");
   const std::filesystem::path dir =
-      std::filesystem::path{std::getenv("TEST_TMPDIR")} / "drivetrain_config";
+      std::filesystem::path{tmp != nullptr ? tmp : "/tmp"} /
+      "drivetrain_config";
   std::filesystem::create_directories(dir);
   std::filesystem::copy_file(source, dir / "robot.toml",
                              std::filesystem::copy_options::overwrite_existing);
@@ -324,8 +326,9 @@ Result RunNode(const std::string& args) {
 }
 
 TEST(DrivetrainBinary, LoggedSimRunReplaysWithoutDivergence) {
+  const char* tmp = std::getenv("TEST_TMPDIR");
   const std::string log =
-      std::string{std::getenv("TEST_TMPDIR")} + "/drivetrain_test.tlog";
+      std::string{tmp != nullptr ? tmp : "/tmp"} + "/drivetrain_test.tlog";
   const Result run = RunNode("--sim --duration-s 1 --log '" + log + "'");
   ASSERT_EQ(run.status, 0) << run.output;
   const Result replay = RunNode("--sim --replay '" + log + "'");
