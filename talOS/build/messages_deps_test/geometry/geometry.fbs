@@ -1,0 +1,8 @@
+namespace deps_geometry;
+
+// Shared 2D pose used through `deps` by consumer schemas.
+struct Pose2d {
+  x:double;
+  y:double;
+  heading_rad:double;
+}

@@ -1,0 +1,11 @@
+include "deps_geometry/geometry.fbs";
+
+namespace deps_consumer;
+
+// State embedding a struct from another package (see deps in BUILD).
+// Field order is the wire order: pose, velocity, enabled.
+struct ConsumerState {
+  pose:deps_geometry.Pose2d;
+  velocity_rps:double;
+  enabled:bool;
+}

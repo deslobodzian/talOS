@@ -62,6 +62,12 @@ talos_py_node(name = "node", node_name = "intake", main = "intake.py",
 with `topics`, it must be the schema's namespace. Topic keys are
 lower_snake_case: `"teleop_target"` is `kTeleopTarget` in C++ and
 `TELEOP_TARGET` in Python.
+To use another package's types, list its `talos_messages` target in `deps`
+and include its schema by the dep's include prefix:
+`deps = ["//shared/geometry:messages"]` with
+`include "geometry/geometry.fbs";` in the `.fbs`, then C++ includes
+`"geometry/geometry_generated.h"`. Deps are transitive. At a repository root
+the package path is empty, so pass `include_prefix` explicitly there.
 The node's name comes from `node_name`; add the node to the robot config as
 `node = "//path:node"`.
 
