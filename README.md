@@ -81,6 +81,11 @@ Layers and rules: [ARCHITECTURE.md](ARCHITECTURE.md). Names:
 | `studio/` | the telemetry viewer |
 | `sim.sh`, `tools/deploy.sh`, `tools/test_drivetrain.py` | run in sim, deploy, drivetrain smoke test |
 
+## Install
+
+Linux/macOS: `./tools/setup.sh`. Windows: `powershell -ExecutionPolicy Bypass -File tools\setup.ps1`
+(talOS builds inside WSL2). Details, flags and troubleshooting: [docs/INSTALL.md](docs/INSTALL.md).
+
 ## Build and test
 
 ```sh

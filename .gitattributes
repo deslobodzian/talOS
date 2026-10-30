@@ -1,0 +1,20 @@
+* text=auto
+
+# Shell scripts must keep LF or bash (incl. WSL) fails with $'\r'.
+*.sh text eol=lf
+gradlew text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary
+*.jar binary
+*.so binary
+*.dylib binary
+*.dll binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
