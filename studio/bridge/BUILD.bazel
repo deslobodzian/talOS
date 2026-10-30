@@ -66,9 +66,9 @@ cc_binary(
     name = "studio_mock",
     srcs = ["mock.cc"],
     deps = [
+        "//talOS/rtms",
         "//talOS/telemetry:schema",
         "//talOS/telemetry:wire",
-        "//talOS/rtms",
         "@flatbuffers",
     ],
 )
@@ -79,12 +79,12 @@ cc_binary(
     deps = [
         ":system",
         ":telemetry",
-        "//talOS/telemetry:schema",
-        "//talOS/telemetry:wire",
         "//talOS/configuration",
         "//talOS/introspection:describe",
         "//talOS/introspection:registry",
         "//talOS/rtms",
+        "//talOS/telemetry:schema",
+        "//talOS/telemetry:wire",
         "@flatbuffers",
         "@studio_uws//:uws",
     ],
