@@ -86,7 +86,6 @@ class IntakeTest(unittest.TestCase):
         self.assertEqual(state.roller_velocity_rps, 12.5)
         self.assertTrue(state.beam_broken)
         self.assertEqual(state.requested_velocity_rps, 0.0)
-        self.assertGreater(state.issued_ns, 0)
         _, state = self.run_intake(0.0, enabled=False)
         self.assertFalse(state.enabled)
 

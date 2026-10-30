@@ -1,4 +1,4 @@
-"""Exercise real IPC -> UDP/WebSocket bytes without a third-party WS client."""
+"""Exercise real IPC -> WebSocket bytes with a minimal stdlib WebSocket client."""
 import base64
 import json
 import os
@@ -33,6 +33,8 @@ TEXT, BINARY = 0x81, 0x82
 def frame(sock):
     first, length = receive(sock, 2)
     assert first in (TEXT, BINARY), first
+    # A server never masks its frames (RFC 6455 section 5.1).
+    assert not length & 0x80, "server frame is masked"
     length &= 127
     if length == 126:
         length = struct.unpack("!H", receive(sock, 2))[0]
@@ -66,8 +68,7 @@ class BridgeIntegration(unittest.TestCase):
         topic = f"/test/telemetry/p{os.getpid()}"
         processes = []
         with tempfile.TemporaryDirectory() as webroot, \
-                tempfile.TemporaryDirectory() as outputs, \
-                socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+                tempfile.TemporaryDirectory() as outputs:
             Path(webroot, "index.html").write_text("studio integration")
             # The launcher's declared graph, deliberately outside the webroot:
             # a copy inside it would be served by the static file handler at the
@@ -84,14 +85,6 @@ class BridgeIntegration(unittest.TestCase):
                               b'"message_bytes":48,"external":false,"optional":false}]}],'
                               b'"diagnostics":[]}')
             declared.write_bytes(declared_bytes)
-            udp.bind(("127.0.0.1", 0))
-            udp.settimeout(5)
-            # A second destination nobody reads, for the bridge that runs
-            # without --declared: two bridges aiming at one port would
-            # interleave chunks of two documents that share a document id, and
-            # the reassembly below would splice them into nonsense.
-            quiet_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            quiet_udp.bind(("127.0.0.1", 0))
             with socket.socket() as reservation:
                 reservation.bind(("127.0.0.1", 0))
                 http_port = reservation.getsockname()[1]
@@ -106,14 +99,13 @@ class BridgeIntegration(unittest.TestCase):
                 # exists; the mock prints "ready" once it has created it.
                 self.assertEqual(mock.stdout.readline().strip(), "ready")
                 bridge = subprocess.Popen([str(binaries / "studio_bridge"), "--drop-newest-publisher", topic,
-                                           "127.0.0.1", str(udp.getsockname()[1]), str(http_port), webroot,
-                                           "--declared", str(declared)])
+                                           str(http_port), webroot, "--declared", str(declared)])
                 processes.append(bridge)
                 # The same bridge with no declared graph, to pin down what
                 # /declared.json does then. Started here so both are up while
                 # the deadline loop below waits.
                 bare = subprocess.Popen([str(binaries / "studio_bridge"), "--drop-newest-publisher", topic,
-                                         "127.0.0.1", str(quiet_udp.getsockname()[1]), str(bare_port), webroot])
+                                         str(bare_port), webroot])
                 processes.append(bare)
                 # Wait until both bridges listen. A bridge signalled before it
                 # is listening has not installed its SIGTERM handler yet and
@@ -156,37 +148,57 @@ class BridgeIntegration(unittest.TestCase):
                     self.assertIn("studio_bridge", [n["name"] for n in graph["nodes"]])
                     self.assertIn(topic, [t["name"] for t in graph["topics"]])
 
+                    # The first binary frame is the dictionary: the bridge
+                    # hands a new client its cached dictionary frame on
+                    # open, so values are decodable from the start.
                     packet = frame_of(ws, BINARY)
                     self.assertEqual(struct.unpack_from("<I", packet)[0], len(packet) - 4)
-                    self.assertEqual(packet[8:12], b"TLMS")
+                    self.assertEqual(packet[8:12], b"TLM2")
+                    self.assertIn(b"drive/velocity", packet)
+                    self.assertIn(b"intake/inhibit", packet)
+                    # Value frames decode against that dictionary: they
+                    # carry no channel names and are far smaller.
+                    following = frame_of(ws, BINARY)
+                    self.assertEqual(following[8:12], b"TLM2")
+                    self.assertNotIn(b"drive/velocity", following)
+                    self.assertLess(len(following), len(packet))
+                    self.assertNotEqual(following, packet)
 
-                    # UDP may contain older packets captured before the WS
-                    # upgrade, and now also carries system-graph chunks.
-                    chunks = {}
-                    seen_frame = False
-                    for _ in range(500):
-                        datagram = udp.recv(65536)
-                        if datagram.startswith(b"TSYS"):
-                            # tag(4) + document id(2) + index(1) + count(1).
-                            document = datagram[4] | (datagram[5] << 8)
-                            chunks.setdefault(document, {})[datagram[6]] = datagram[8:]
-                            continue
-                        if datagram == packet:
-                            seen_frame = True
-                            break
-                    self.assertTrue(seen_frame,
-                                    "identical WebSocket frame absent from UDP stream")
+                    # The self-describing JSON views of the same feed.
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{http_port}/channels.json", timeout=3) as response:
+                        channels_doc = json.loads(response.read())
+                    self.assertEqual(channels_doc["kind"], "talos.telemetry.channels")
+                    self.assertEqual(channels_doc["version"], 2)
+                    names = [c["name"] for c in channels_doc["channels"]]
+                    self.assertIn("drive/velocity", names)
+                    inhibit = next(c for c in channels_doc["channels"]
+                                   if c["name"] == "intake/inhibit")
+                    self.assertIn("TARGET_STALE", inhibit["labels"])
 
-                    # A graph too large for one datagram is split, so the
-                    # desktop transport has to reassemble; check the framing
-                    # over the real socket rather than only in a unit test.
-                    complete = [parts for parts in chunks.values()
-                                if parts and len(parts) == max(parts) + 1]
-                    self.assertTrue(complete, "no system graph on the UDP stream")
-                    document = b"".join(
-                        parts[i] for parts in complete[:1] for i in sorted(parts))
-                    self.assertEqual(
-                        json.loads(document.decode())["kind"], "talos.system_graph")
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{http_port}/telemetry.json", timeout=3) as response:
+                        telemetry_doc = json.loads(response.read())
+                    self.assertEqual(telemetry_doc["kind"], "talos.telemetry")
+                    self.assertEqual(telemetry_doc["version"], 2)
+                    # uint64 leaves as decimal strings (JSON numbers are
+                    # doubles and would lose precision past 2^53).
+                    self.assertIsInstance(telemetry_doc["stream_id"], str)
+                    self.assertIsInstance(telemetry_doc["sequence_id"], str)
+                    self.assertIsInstance(telemetry_doc["timestamp_ns"], str)
+                    self.assertIn("age_ms", telemetry_doc)
+                    by_name = {c["name"]: c for c in telemetry_doc["channels"]}
+                    self.assertIn("value", by_name["drive/velocity"])
+                    self.assertEqual(by_name["drive/velocity"]["unit"], "m/s")
+
+                    # The graph is refreshed on the open socket every 250 ms,
+                    # not only sent on connect, and it counts the frames the
+                    # bridge has forwarded by then. At the mock's 200 Hz that
+                    # is roughly 50 telemetry frames to skip.
+                    refreshed = json.loads(frame_of(ws, TEXT, limit=2000).decode())
+                    self.assertEqual(refreshed["kind"], "talos.system_graph")
+                    self.assertGreater(int(refreshed["bridge"]["frames_forwarded"]), 0)
+                    self.assertEqual(refreshed["bridge"]["clients"], 1)
 
                 with urllib.request.urlopen(
                         f"http://127.0.0.1:{http_port}/system.json", timeout=3) as response:
@@ -236,7 +248,6 @@ class BridgeIntegration(unittest.TestCase):
                             process.wait()
                 for process in processes:
                     self.assertEqual(process.returncode, 0)
-                quiet_udp.close()
 
 
 if __name__ == "__main__":

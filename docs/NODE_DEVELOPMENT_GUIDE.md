@@ -20,11 +20,41 @@ the constructor; `update()` runs every period.
 | `sub.fresh()`, `fresh(max_age)`, `age()`, `updated()` | `sub.fresh()`, `fresh(max_age)`, `age`, `updated` | fresh: younger than `[robot] command_timeout_us` |
 | `pub.send(M{...})` | `pub.send(field=value, ...)` or `send(message)` | |
 | `StateMachine<S> sm{node, S::A}`: `state()`, `is()`, `go()`, `previous()`, `time_in_state()`, `just_entered()` | `talos.StateMachine(node, A, states=S)`: same, `is_()`; `states=` (optional) makes reprs and errors show names | |
-| `node.publish_bytes(topic, max_bytes, {.drop_newest, .external})` → `send(span<const byte>)` | — | variable-length feed outside the loop (not logged); used by telemetry |
+| `node.publish_bytes(topic, max_bytes, {.drop_newest, .external})` → `send(span<const byte>)` | `node.publish_bytes(topic, max_bytes, drop_newest=..., external=...)` → `send(bytes)` | variable-length feed outside the loop (not logged); used by telemetry |
 | `TALOS_NODE(Class)` in one `.cc` | `talos_py_node(class_name = ...)` | |
 
 Messages are FlatBuffers **structs** (no tables or strings), at most 8-byte
-aligned.
+aligned. A relative topic name (`"state"`, `"target/teleop"`) expands to
+`"/<name>/<topic>"`; `[subsystems.<name>.remap]` can redirect relative or
+absolute topics without changing node code.
+
+### When messages arrive
+
+A subscription is updated when the node's loop drains its topics, and the
+drain point depends on the node:
+
+- A node with no message callback (no `subscribe(topic, fn)`, no
+  `DriverStation(node, on_packet)` listener) drains right before each of its
+  own timers, `update()` or `every()`. Every message published before that
+  timer is visible inside it, and the process sleeps between timers instead of
+  waking every millisecond.
+- A node with any message callback, or with no timer at all, drains every
+  1 ms, so a callback runs within 1 ms of the message.
+
+`age()` and `fresh()` count from the drain that delivered the message, not
+from its publication: under the first rule a message can be up to one node
+period older than its `age()` says, so a target is judged stale at most one
+period after `[robot] command_timeout_us`. `testing::Sim` applies the same
+rules, so a test sees a message at the tick the robot would.
+
+### Realtime scheduling
+
+On the robot (not `--sim`, `--describe` or `--replay`) a node binary runs its
+loop thread under `SCHED_FIFO` priority 50 with its memory locked (`mlockall`)
+on Linux, or under the Mach time-constraint policy for its period on macOS
+(which has no working `mlockall`); the bridge's loop runs at priority 60. When
+the OS refuses (no privilege, a memlock limit) the node prints one line to
+stderr and runs anyway. `TALOS_REALTIME=0` in the environment turns this off.
 
 ## Hardware
 
@@ -96,5 +126,5 @@ sim.latest<ShooterState>(topics::kState);     // std::optional
 
 Python: `from talos.testing import Sim, SimHardware` (`//talOS/python:testing`),
 the same methods (`Sim.from_toml`, `sim.step(seconds)`,
-`sim.publish(M, topic, **fields)`, `sim.latest(M, topic)`). See
-`2026-robot/main_processor/intake/node_test.py`.
+`sim.publish(M, topic, **fields)`, `sim.latest(M, topic)`,
+`sim.latest_bytes(topic)`). See `2026-robot/main_processor/intake/node_test.py`.

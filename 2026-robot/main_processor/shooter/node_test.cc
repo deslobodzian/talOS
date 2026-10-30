@@ -39,7 +39,7 @@ class ShooterTest : public ::testing::Test {
   // Holds a target the way the arbiter does: republished every 20 ms.
   void Hold(double rps, std::chrono::milliseconds duration) {
     for (auto t = 0ms; t < duration; t += 20ms) {
-      sim.publish(topics::kTarget, ShooterTarget{rps, 0, true});
+      sim.publish(topics::kTarget, ShooterTarget{rps, true});
       sim.step(20ms);
     }
   }

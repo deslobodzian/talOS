@@ -36,10 +36,10 @@ test('the parser accepts what the launcher actually writes', () => {
   const graph = parseDeclaredGraph(fixture);
 
   // The roster, as `--describe` found it.
-  assert.equal(graph.nodes.length, 8);
+  assert.equal(graph.nodes.length, 7);
   assert.deepEqual(graph.nodes.map(n => n.name).sort(), [
-    'arbiter', 'driver_station', 'drivetrain', 'hardware_node', 'odometry',
-    'operator_interface', 'shooter', 'telemetry'
+    'arbiter', 'drivetrain', 'hardware_node', 'odometry', 'operator_interface',
+    'shooter', 'telemetry'
   ]);
   for (const node of graph.nodes) {
     assert.ok(node.target.startsWith('//'), `${node.name} has no build target`);
@@ -58,19 +58,18 @@ test('endpoint attributes survive the crossing', () => {
   const ends = graph.nodes.flatMap(
       node => node.sources.map(source => ({node: node.name, ...source})));
 
-  // The five ends that used to read as faults. Named individually rather than
+  // The four ends that used to read as faults. Named individually rather than
   // counted, because the point of the flags is which ones carry them.
   const external = ends.filter(e => e.external).map(e => e.name).sort();
   assert.deepEqual(external, ['/hw/command', '/talos/telemetry']);
 
   const optional = ends.filter(e => e.optional).map(e => e.name).sort();
   assert.deepEqual(
-      optional,
-      ['/drivetrain/target/auto', '/hw/command/override', '/shooter/target/auto']);
+      optional, ['/drivetrain/target/auto', '/shooter/target/auto']);
 
   // Everything else is an ordinary end, not an unset field read as false.
   assert.equal(ends.filter(e => !e.external && !e.optional).length,
-               ends.length - 5);
+               ends.length - 4);
 });
 
 test('every declared topic name conforms to the naming protocol', () => {
@@ -102,7 +101,7 @@ test('a node that never registered is named, with its cause', () => {
   const live = parseSystemGraph(demoSystemGraph(1500n));
   const status = declaredStatus(declared, live);
   assert.ok(status, 'declaredStatus returned null for two present graphs');
-  assert.equal(status!.declared, 8);
+  assert.equal(status!.declared, 7);
   assert.ok(status!.missing.length > 0,
             'the demo live graph declares every fixture node, so this proves nothing');
   for (const node of status!.missing)

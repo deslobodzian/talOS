@@ -3,7 +3,7 @@
 # subsystem files into one canonical view before validation.
 #
 # STUDENT NOTE -- where the motor's behavior lives:
-#   speeds (intake / eject / stop) .... talos_nodes/intake/node.py top block
+#   speeds (intake / eject / stop) .... main_processor/intake/intake.py top block
 #   gains + limits (below) ............ this file ([motors.roller])
 # The node asks for velocity and the motor's onboard PID closes the loop, so
 # these gains decide whether the wheel actually reaches the asked speed.
@@ -30,7 +30,7 @@ stator_limit_a = 80.0
 max_voltage = 12.0
 sensor_to_mechanism_ratio = 1.0
 max_velocity_rps = 100.0
-# Velocity-loop gains (slot 0, selected by SLOT in node.py). ALL ZERO means
+# Velocity-loop gains (slot 0, selected by intake.py). ALL ZERO means
 # UNTUNED: with no feedforward the wheel lags its demand and Studio's
 # requested-vs-measured rows split apart. Tune in order:
 #   v (kV, rps -> volt): raise until steady-state measured ~= requested;

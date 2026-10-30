@@ -1,0 +1,27 @@
+namespace Talos.Telemetry;
+
+struct Pose { x:double; y:double; z:double; roll:double; pitch:double; yaw:double; }
+
+// One dictionary entry: values[i] in every Frame is this channel's sample.
+// unit is "" for unitless channels. labels, when non-empty, names the
+// integral values of an enum channel (labels[value]); an empty labels list
+// means the channel is a plain number.
+table ChannelInfo { name:string (required); unit:string; labels:[string]; }
+
+// One telemetry sample. values aligns index-for-index with the dictionary
+// named by dictionary_id; NaN means the source was absent or stale this
+// tick. dictionary is present only on dictionary frames (the first frame
+// of a stream and every 100th after it); value-only frames carry no
+// dictionary and stay under talos::telemetry_wire::kMaxValueFrameBytes.
+table Frame {
+  stream_id:ulong;
+  sequence_id:ulong;
+  timestamp_ns:ulong;
+  dictionary_id:uint;
+  chassis:Pose;
+  values:[double];
+  dictionary:[ChannelInfo];
+}
+
+root_type Frame;
+file_identifier "TLM2";

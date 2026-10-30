@@ -1,48 +1,49 @@
 #!/usr/bin/env python3
-"""What was measured: schema bounds, latest snapshot, one threshold scan.
+"""What was measured right now, straight from the bridge.
 
-Calls get_schema_tree, query_state_at, and scan_channel_events.
+Reads GET /telemetry.json and /channels.json (stdlib only, no agent):
+the latest sample's channels with their units and enum labels.
 """
 import argparse
 import json
+import urllib.request
 
-from rpc_client import RpcError, rpc
+
+def get(base, path):
+    with urllib.request.urlopen(base + path, timeout=5) as response:
+        return json.load(response)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default="http://127.0.0.1:5802/rpc")
-    parser.add_argument("--topic", default=None,
-                        help="Numeric topic to scan (default: first number topic)")
-    parser.add_argument("--above", type=float, default=40.0)
+    parser.add_argument("--bridge", default="http://127.0.0.1:5800",
+                        help="Bridge origin serving /telemetry.json")
     args = parser.parse_args()
 
-    schema = rpc(args.url, "get_schema_tree")
-    bounds = schema["timestamp_bounds"]
-    if not bounds:
-        raise SystemExit("No retained telemetry; start the bridge first.")
-    print(json.dumps({"frames": schema["frames"], "bounds": bounds}, indent=2))
-
     try:
-        state = rpc(args.url, "query_state_at",
-                    {"timestamp_ns": bounds["end"], "mode": "at_or_before"})
-    except RpcError as e:
-        if e.code == -32001:
-            raise SystemExit("No retained sample at the latest bound.")
-        raise
-    print(json.dumps({"timestamp_ns": state["timestamp_ns"],
-                      "sequence_id": state.get("sequence_id"),
-                      "channels": list(state.get("channels", {}))[:10]}, indent=2))
+        latest = get(args.bridge, "/telemetry.json")
+        channels = get(args.bridge, "/channels.json")
+    except OSError as e:
+        raise SystemExit(f"Bridge unreachable at {args.bridge}: {e}")
 
-    topic = args.topic or next(
-        (t for t, ty in schema["topics"].items() if ty == "number"), None)
-    if topic is None:
-        print("No numeric topic retained; skipping scan.")
-        return
-    print(json.dumps(rpc(args.url, "scan_channel_events",
-                         {"topic": topic,
-                          "condition": {"op": "gt", "value": args.above}}),
-                     indent=2))
+    units = latest.get("units") or {
+        c["name"]: c.get("unit", "") for c in channels.get("channels", [])}
+    labels = latest.get("labels") or {
+        c["name"]: c["labels"] for c in channels.get("channels", [])
+        if c.get("labels")}
+
+    values = {}
+    for name, value in sorted(latest.get("channels", {}).items()):
+        names = labels.get(name)
+        shown = names[int(value)] if names and float(value).is_integer() \
+            and 0 <= int(value) < len(names) else value
+        values[name] = {"value": shown, "unit": units.get(name, "")}
+    print(json.dumps({
+        "stream_id": latest.get("stream_id"),
+        "sequence_id": latest.get("sequence_id"),
+        "timestamp_ns": latest.get("timestamp_ns"),
+        "channels": values,
+    }, indent=2))
 
 
 if __name__ == "__main__":

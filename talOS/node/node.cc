@@ -64,6 +64,12 @@ struct Node::Impl {
   struct TimerSlot {
     std::function<void()> fn;
   };
+  struct StateMachineSlot {
+    std::int64_t state;
+    std::int64_t previous;
+    std::uint64_t entered_update;
+    Time entered_at;
+  };
 
   std::string name;
   std::string config_path;
@@ -77,11 +83,13 @@ struct Node::Impl {
   std::vector<PublisherSlot> publishers;
   std::vector<std::unique_ptr<BytePublisherSlot>> byte_publishers;
   std::vector<std::unique_ptr<TimerSlot>> timers;
+  std::vector<StateMachineSlot> state_machines;
   std::vector<std::pair<std::type_index, std::shared_ptr<void>>> extensions;
 
   std::function<void()> update;
   std::vector<std::function<void()>> after_update;
   bool started = false;
+  bool immediate_delivery = false;
   bool in_update = false;
   std::uint64_t ticks = 0;
 
@@ -101,6 +109,21 @@ struct Node::Impl {
     return *byte_publishers[index];
   }
 
+  StateMachineSlot& StateMachineAt(std::size_t index) {
+    if (index >= state_machines.size()) {
+      throw std::out_of_range(name + ": no state machine at index " +
+                              std::to_string(index));
+    }
+    return state_machines[index];
+  }
+  const StateMachineSlot& StateMachineAt(std::size_t index) const {
+    if (index >= state_machines.size()) {
+      throw std::out_of_range(name + ": no state machine at index " +
+                              std::to_string(index));
+    }
+    return state_machines[index];
+  }
+
   void CheckOpen(const char* what) const {
     if (started) {
       throw std::logic_error(name + ": " + what +
@@ -113,6 +136,35 @@ struct Node::Impl {
     const toml::table* table = Table();
     if (table == nullptr) return {};
     return table->at_path(key);
+  }
+
+  std::string ResolveTopic(std::string_view topic) const {
+    const toml::table* table = Table();
+    const toml::table* remap =
+        table != nullptr ? (*table)["remap"].as_table() : nullptr;
+    auto lookup = [&](std::string_view key) -> std::optional<std::string> {
+      if (remap == nullptr) return std::nullopt;
+      const auto entry = (*remap)[key];
+      if (!entry) return std::nullopt;
+      if (auto s = entry.value_exact<std::string>()) return *s;
+      throw std::invalid_argument(name + ": remap entry for '" +
+                                  std::string{topic} + "' must be a string");
+    };
+    const auto direct = lookup(topic);
+    std::string resolved = direct ? *direct : std::string{topic};
+    const bool expanded = !resolved.empty() && resolved.front() != '/';
+    if (expanded) {
+      resolved = "/" + name + "/" + resolved;
+    }
+    if (!direct && expanded) {
+      if (auto remapped = lookup(resolved)) {
+        resolved = *std::move(remapped);
+        if (!resolved.empty() && resolved.front() != '/') {
+          resolved = "/" + name + "/" + resolved;
+        }
+      }
+    }
+    return resolved;
   }
 
   static void OnMessage(void* object, const event::Context& context,
@@ -240,10 +292,26 @@ void NodeAccess::start(Node& node) {
   Node::Impl& impl = *node.impl_;
   if (impl.started) throw std::logic_error(impl.name + ": started twice");
   impl.started = true;
-  if (!impl.update && impl.after_update.empty()) return;
+  // Draining before timers needs a timer: a node with none (it only lets
+  // its extensions latch values for someone else to read) keeps the tick.
+  const bool has_tick = impl.update || !impl.after_update.empty();
+  const bool timed = has_tick || !impl.timers.empty();
+  impl.loop->set_delivery(impl.immediate_delivery || !timed
+                              ? event::Delivery::POLL
+                              : event::Delivery::BEFORE_TIMERS);
+  if (!has_tick) return;
   const std::uint16_t id = impl.loop->register_timer(
       impl.name, event::Thunk{&impl, &Node::Impl::OnTick});
   impl.loop->arm_timer(id, node.now() + impl.period, impl.period);
+}
+
+void NodeAccess::require_immediate_delivery(Node& node) {
+  node.impl_->CheckOpen("subscribe with a callback");
+  node.impl_->immediate_delivery = true;
+}
+
+bool NodeAccess::immediate_delivery(const Node& node) {
+  return node.impl_->immediate_delivery;
 }
 
 std::uint64_t NodeAccess::next_update(const Node& node) {
@@ -260,6 +328,47 @@ std::vector<std::string_view> NodeAccess::optional_topics(const Node& node) {
     if (slot->optional) topics.push_back(slot->topic);
   }
   return topics;
+}
+
+std::size_t NodeAccess::add_state_machine(Node& node, std::int64_t initial) {
+  node.impl_->state_machines.push_back(Node::Impl::StateMachineSlot{
+      .state = initial,
+      .previous = initial,
+      .entered_update = next_update(node),
+      .entered_at = node.now(),
+  });
+  return node.impl_->state_machines.size() - 1;
+}
+
+std::int64_t NodeAccess::state_machine_state(const Node& node,
+                                             std::size_t index) {
+  return node.impl_->StateMachineAt(index).state;
+}
+
+std::int64_t NodeAccess::state_machine_previous(const Node& node,
+                                                std::size_t index) {
+  return node.impl_->StateMachineAt(index).previous;
+}
+
+void NodeAccess::state_machine_go(Node& node, std::size_t index,
+                                  std::int64_t next) {
+  auto& slot = node.impl_->StateMachineAt(index);
+  if (next == slot.state) return;
+  slot.previous = slot.state;
+  slot.state = next;
+  slot.entered_at = node.now();
+  // Entered during update() k: the first update to start in it is k + 1.
+  slot.entered_update = next_update(node);
+}
+
+Duration NodeAccess::state_machine_time_in_state(const Node& node,
+                                                 std::size_t index) {
+  return node.now() - node.impl_->StateMachineAt(index).entered_at;
+}
+
+bool NodeAccess::state_machine_just_entered(const Node& node,
+                                            std::size_t index) {
+  return node.tick() == node.impl_->StateMachineAt(index).entered_update;
 }
 
 void* NodeAccess::find_extension(const Node& node, std::type_index type) {
@@ -357,14 +466,15 @@ std::size_t NodeAccess::add_subscription(Node& node, std::string_view topic,
                                          std::size_t alignment, bool optional,
                                          MessageCallback on_message) {
   Node::Impl& impl = *node.impl_;
-  CheckLayout(impl.name, topic, bytes, alignment);
+  std::string resolved = impl.ResolveTopic(topic);
+  CheckLayout(impl.name, resolved, bytes, alignment);
   auto slot = std::make_unique<Node::Impl::SubscriptionSlot>();
-  slot->topic = std::string{topic};
+  slot->topic = std::move(resolved);
   slot->bytes = bytes;
   slot->data = std::make_unique<std::byte[]>(bytes);
   slot->optional = optional;
   slot->on_message = std::move(on_message);
-  impl.loop->register_watcher(topic, static_cast<std::uint32_t>(bytes),
+  impl.loop->register_watcher(slot->topic, static_cast<std::uint32_t>(bytes),
                               static_cast<std::uint32_t>(alignment),
                               event::Thunk{slot.get(), &Node::Impl::OnMessage});
   impl.subscriptions.push_back(std::move(slot));
@@ -400,9 +510,10 @@ std::size_t NodeAccess::add_publisher(Node& node, std::string_view topic,
                                       std::size_t bytes,
                                       std::size_t alignment) {
   Node::Impl& impl = *node.impl_;
-  CheckLayout(impl.name, topic, bytes, alignment);
+  const std::string resolved = impl.ResolveTopic(topic);
+  CheckLayout(impl.name, resolved, bytes, alignment);
   const std::uint16_t id =
-      impl.loop->register_sender(topic, static_cast<std::uint32_t>(bytes),
+      impl.loop->register_sender(resolved, static_cast<std::uint32_t>(bytes),
                                  static_cast<std::uint32_t>(alignment));
   impl.publishers.push_back({id, bytes});
   return impl.publishers.size() - 1;
@@ -449,8 +560,7 @@ class SharedByteTopic final : public ByteTopic {
                                  .read_mode = ReadMode::SEQUENCE,
                                  .reclaim_mismatched_segment = true});
     }
-    return queue_->write(RTMSMessage{message.size(), message.data()}) ==
-           WriteResult::SUCCESS;
+    return queue_->write(message) == WriteResult::SUCCESS;
   }
 
  private:
@@ -475,17 +585,18 @@ std::size_t NodeAccess::add_byte_publisher(Node& node, std::string_view topic,
                                            const BytePublishOptions& options) {
   Node::Impl& impl = *node.impl_;
   impl.CheckOpen("publish_bytes");
-  CheckLayout(impl.name, topic, max_bytes, kMessageAlignment);
+  std::string resolved = impl.ResolveTopic(topic);
+  CheckLayout(impl.name, resolved, max_bytes, kMessageAlignment);
   if (!is_pow_2(options.slots) || options.slots > MAX_SLOTS) {
-    throw std::invalid_argument(
-        impl.name + ": byte topic '" + std::string{topic} +
-        "' needs a power-of-two slot count up to " + std::to_string(MAX_SLOTS));
+    throw std::invalid_argument(impl.name + ": byte topic '" + resolved +
+                                "' needs a power-of-two slot count up to " +
+                                std::to_string(MAX_SLOTS));
   }
   auto slot = std::make_unique<Node::Impl::BytePublisherSlot>();
-  slot->topic = std::string{topic};
+  slot->topic = std::move(resolved);
   slot->max_bytes = max_bytes;
   slot->external = options.external;
-  slot->sink = impl.loop->open_byte_topic(topic, max_bytes, options);
+  slot->sink = impl.loop->open_byte_topic(slot->topic, max_bytes, options);
   impl.byte_publishers.push_back(std::move(slot));
   return impl.byte_publishers.size() - 1;
 }
@@ -696,6 +807,12 @@ int RunMain(int argc, char** argv, const char* node_name,
         std::this_thread::sleep_for(std::chrono::milliseconds{20});
       }
     }};
+    // Last, from this thread: the reporter and the stopper above are
+    // bookkeeping and must not inherit the loop's realtime policy.
+    if (!flags.simulation) {
+      process::ConfigureRealtime(
+          {.period = hosted.node->period(), .priority = 50});
+    }
     if (flags.duration_s) {
       loop.run_for(std::chrono::seconds{flags.duration_s});
     } else {

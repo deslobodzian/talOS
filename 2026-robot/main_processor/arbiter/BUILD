@@ -12,8 +12,8 @@ cc_library(
         "//2026-robot/main_processor/drivetrain:messages",
         "//2026-robot/main_processor/intake:messages",
         "//2026-robot/main_processor/shooter:messages",
-        "//talOS/driver_station",
-        "//talOS/driver_station:messages",
+        "//talOS/configuration",
+        "//talOS/devices",
         "//talOS/node",
     ],
 )
@@ -43,7 +43,6 @@ cc_test(
         "//2026-robot/main_processor/drivetrain",
         "//2026-robot/main_processor/operator_interface",
         "//talOS/devices:testing",
-        "//talOS/driver_station:driver_station_node",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

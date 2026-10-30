@@ -82,7 +82,13 @@ class SimulatedEventLoop
   struct Options {
     Duration tick_period{std::chrono::milliseconds{1}};
     std::size_t max_messages_per_tick{64};
+    // As on the realtime loop, so a simulation delivers when the robot would.
+    Delivery delivery{Delivery::POLL};
   };
+
+  // How often the loop has drained its watched topics, as on the realtime
+  // loop.
+  std::uint64_t drains() const { return drains_; }
 
   explicit SimulatedEventLoop(SimulationEnvironment& environment,
                               Options options = Options{})
@@ -93,6 +99,15 @@ class SimulatedEventLoop
       : Base{std::move(recorder)},
         environment_{&environment},
         options_{options} {}
+
+  // Fixed before the first run, like the realtime loop's.
+  void set_delivery(Delivery delivery) {
+    if (this->registration_closed()) {
+      throw std::logic_error("delivery is fixed once the run starts");
+    }
+    options_.delivery = delivery;
+  }
+  Delivery delivery() const { return options_.delivery; }
 
   using SendOutcome = typename Base::SendOutcome;
 
@@ -134,8 +149,10 @@ class SimulatedEventLoop
     if (!started_) {
       scheduler_.reserve(this->manifest().size() + 1);
       this->begin_run();
-      scheduler_.schedule(INTERNAL_POLL_TIMER_ID, now_ + options_.tick_period,
-                          options_.tick_period);
+      if (options_.delivery == Delivery::POLL) {
+        scheduler_.schedule(INTERNAL_POLL_TIMER_ID, now_ + options_.tick_period,
+                            options_.tick_period);
+      }
       started_ = true;
     }
 
@@ -152,10 +169,14 @@ class SimulatedEventLoop
              scheduler_.pop_expired(now_, expiration)) {
         if (expiration.id == INTERNAL_POLL_TIMER_ID) {
           drain_messages(expiration.deadline);
-        } else {
-          this->dispatch_timer(expiration.id, expiration.deadline, now_,
-                               expiration.cycles);
+          continue;
         }
+        if (options_.delivery == Delivery::BEFORE_TIMERS) {
+          drain_messages(expiration.deadline);
+          if (!this->running_state()) break;
+        }
+        this->dispatch_timer(expiration.id, expiration.deadline, now_,
+                             expiration.cycles);
       }
     }
 
@@ -209,6 +230,7 @@ class SimulatedEventLoop
   // event_time and observation time coincide and the measured latency is zero.
   // That is the point of the simulated clock, not an omission.
   void drain_messages(MonotonicTime tick_deadline) {
+    ++drains_;
     auto& sources = this->sources();
 
     for (std::size_t id = 0; id < sources.size(); ++id) {
@@ -243,6 +265,7 @@ class SimulatedEventLoop
   MonotonicTime now_{};
   bool started_{false};
   bool finished_{false};
+  std::uint64_t drains_{0};
 };
 
 }  // namespace talos::event

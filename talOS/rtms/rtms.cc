@@ -56,7 +56,7 @@ const std::string& ReclaimMismatchedSegment(const std::string& path,
   // measures larger than it was asked for, and comparing sizes would condemn
   // healthy segments and unlink them out from under live readers.
   bool mismatched = false;
-  struct stat info{};
+  struct stat info {};
   if (fstat(fd, &info) < 0 ||
       static_cast<std::uint64_t>(info.st_size) < sizeof(RTMSHeader)) {
     mismatched = true;  // Too small to even carry a header.
@@ -163,13 +163,13 @@ uint64_t RTMSQueue::minimum_read_position() const {
   return minimum;
 }
 
-WriteStatus RTMSQueue::write(const RTMSMessage& message) {
+WriteStatus RTMSQueue::write(std::span<const std::byte> message) {
   const std::uint64_t slot_mask = slots_ - 1;
 
-  if (message.size > header_->message_bytes) {
+  if (message.size() > header_->message_bytes) {
     std::cerr << "Cannot write message larger than slot size\n"
               << "message_bytes: " << header_->message_bytes
-              << " > message_size: " << message.size << "\n";
+              << " > message_size: " << message.size() << "\n";
     return {WriteResult::ERROR_SIZE_MISSMATCH, 0};
   }
 
@@ -194,13 +194,11 @@ WriteStatus RTMSQueue::write(const RTMSMessage& message) {
   }
 
   const std::uint64_t slot_index = writer_position & slot_mask;
-  // Cannot add offset to void* should I just make this a std::byte* by defualt?
-  // or maybe go back to template SharedMemoryPtr? TODO:?
   auto* base = static_cast<std::byte*>(ptr_.ptr());
   auto* next_segment =
       base + header_->data_offset + (slot_index * header_->slot_stride);
 
-  std::memcpy(next_segment, message.data, message.size);
+  std::memcpy(next_segment, message.data(), message.size());
   header_->writer.sequence.store(next_position, std::memory_order_release);
   return {WriteResult::SUCCESS, writer_position};
 }

@@ -2,7 +2,6 @@ namespace shooter;
 
 struct ShooterTarget {
   target_velocity_rps:double;
-  issued_ns:long;
   enabled:bool;
 }
 

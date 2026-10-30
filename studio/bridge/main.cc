@@ -1,6 +1,7 @@
 #include <App.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <csignal>
 #include <cstdint>
@@ -13,12 +14,13 @@
 #include <unordered_set>
 #include <vector>
 
-#include "studio/schema/wire.h"
 #include "system.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/rtms/rtms.h"
+#include "talOS/telemetry/wire.h"
+#include "telemetry.h"
 namespace fs = std::filesystem;
 namespace {
 volatile std::sig_atomic_t stop = 0;
@@ -29,33 +31,25 @@ struct ReaderLease {
   std::size_t id;
   ~ReaderLease() { queue.release_reader(id); }
 };
-struct FileDescriptor {
-  int value;
-  ~FileDescriptor() {
-    if (value >= 0) close(value);
-  }
-};
 using Socket = uWS::WebSocket<false, true, Client>;
 struct Bridge {
   RTMSQueue& queue;
   std::size_t reader;
-  int udp;
-  sockaddr_in destination;
   std::string topic;
   std::unordered_set<Socket*> clients;
   us_listen_socket_t* listener = nullptr;
-  std::uint64_t invalid = 0, udp_drops = 0, ws_drops = 0, forwarded = 0;
+  std::uint64_t invalid = 0, ws_drops = 0, forwarded = 0;
+
+  // The decoded v2 feed: latest dictionary and latest aligned frame,
+  // backing /telemetry.json, /channels.json and the dictionary a newly
+  // connected WebSocket client is handed on open.
+  studio::TelemetryState telemetry_state;
 
   // Opened lazily: the bridge may well start before any node, and a viewer
   // that refuses to run until the robot is up is a viewer you cannot use to
   // watch the robot come up.
   std::optional<talos::introspect::RegistryReader> registry;
   std::string system_json = "{}";
-
-  // Identifies one document across its chunks, so a receiver never splices
-  // halves of two different refreshes together.
-  std::uint16_t system_document = 0;
-
   std::int64_t started_wall_ns = talos::introspect::wall_now_ns();
 
   void refresh_system() {
@@ -68,7 +62,6 @@ struct Bridge {
                     .clients = clients.size(),
                     .frames_forwarded = forwarded,
                     .invalid = invalid,
-                    .udp_drops = udp_drops,
                     .ws_drops = ws_drops};
     input.wall_ns = talos::introspect::wall_now_ns();
     if (registry) {
@@ -87,8 +80,7 @@ struct Bridge {
     system_json = studio::SystemGraphJson(input);
 
     // Text on the WebSocket, so a client tells the two message families apart
-    // by frame type and needs no sniffing. The UDP path has no such framing,
-    // hence the explicit tag.
+    // by frame type and needs no sniffing.
     for (auto* client : clients) {
       if (client->getBufferedAmount() > 256 * 1024) {
         ++ws_drops;
@@ -96,17 +88,6 @@ struct Bridge {
       }
       if (client->send(system_json, uWS::OpCode::TEXT) == Socket::DROPPED) {
         ++ws_drops;
-      }
-    }
-
-    // Chunked: a whole graph exceeds the platform's maximum datagram. See
-    // SystemDatagrams for why sending it whole fails invisibly.
-    for (const std::string& datagram :
-         studio::SystemDatagrams(system_json, ++system_document)) {
-      if (sendto(udp, datagram.data(), datagram.size(), 0,
-                 reinterpret_cast<sockaddr*>(&destination),
-                 sizeof(destination)) < 0) {
-        ++udp_drops;
       }
     }
   }
@@ -129,9 +110,10 @@ struct Bridge {
     // newest.
     source.kind = talos::event::SourceKind::WATCHER;
     source.name = topic;
-    source.message_bytes = static_cast<std::uint32_t>(studio::slot_bytes);
+    source.message_bytes =
+        static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes);
     source.events = forwarded;
-    source.dropped = ws_drops + udp_drops;
+    source.dropped = ws_drops;
     source.sequence = queue.writer_sequence();
     node.sources.push_back(std::move(source));
     return node;
@@ -141,17 +123,31 @@ struct Bridge {
     // Bound work so HTTP and client socket processing cannot starve.
     for (unsigned count = 0; count < 256; ++count) {
       if (!queue.read(reader, [&](std::span<const std::byte> slot) {
-            auto bytes = studio::payload(slot);
+            auto bytes = talos::telemetry_wire::payload(slot);
             if (bytes.empty()) {
               ++invalid;
               return;
             }
-            ++forwarded;
-            if (sendto(udp, bytes.data(), bytes.size(), 0,
-                       reinterpret_cast<sockaddr*>(&destination),
-                       sizeof(destination)) < 0) {
-              ++udp_drops;
+            if (!studio::IngestTelemetry(telemetry_state, bytes,
+                                         talos::introspect::wall_now_ns())) {
+              ++invalid;
+              return;
             }
+            ++forwarded;
+            // Forward only frames a client can decode: one aligned with
+            // the cached dictionary (a dictionary frame aligns with
+            // itself). A value frame that arrives before any dictionary
+            // is ingested above but not sent, so the first binary frame
+            // every client sees is a dictionary frame.
+            const auto* decoded =
+                Talos::Telemetry::GetSizePrefixedFrame(bytes.data());
+            const bool aligned =
+                telemetry_state.has_dictionary && decoded != nullptr &&
+                decoded->stream_id() == telemetry_state.stream_id &&
+                decoded->dictionary_id() == telemetry_state.dictionary_id &&
+                decoded->values() != nullptr &&
+                decoded->values()->size() == telemetry_state.dictionary.size();
+            if (!aligned) return;
             for (auto* client : clients) {
               if (client->getBufferedAmount() > 256 * 1024) {
                 ++ws_drops;
@@ -217,13 +213,12 @@ int main(int argc, char** argv) try {
     description.target = "//studio/bridge:studio_bridge";
     description.sources.push_back(
         {talos::event::SourceKind::WATCHER, topic,
-         static_cast<std::uint32_t>(studio::slot_bytes), 0});
+         static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes), 0});
     std::cout << talos::introspect::DescribeToJson(description);
     return 0;
   }
   // `--declared` is lifted out before anything reads a position, so it can be
-  // passed anywhere on the line without shifting the positional arguments that
-  // every existing script and the launcher already pass.
+  // passed anywhere on the line without shifting the positional arguments.
   std::vector<const char*> args;
   std::string declared_path;
   for (int i = 0; i < argc; ++i) {
@@ -246,8 +241,7 @@ int main(int argc, char** argv) try {
   if (count < 2 || std::string_view(at(1)) != "--drop-newest-publisher") {
     std::cerr
         << "Usage: studio_bridge --drop-newest-publisher "
-           "[topic=/talos/telemetry] "
-           "[IP=127.0.0.1] [UDP=5801] [HTTP=5800] [webroot=studio/dist]\n"
+           "[topic=/talos/telemetry] [HTTP=5800] [webroot=studio/dist]\n"
            "       [--declared PATH]   the launcher's graph.json, served at "
            "/declared.json\n"
            "       [--describe]          print the --describe envelope and "
@@ -300,34 +294,19 @@ int main(int argc, char** argv) try {
     throw std::runtime_error("start the telemetry publisher before the bridge");
   }
   close(existing);
-  RTMSQueue queue(topic, studio::slot_bytes, 8, studio::slot_count,
+  RTMSQueue queue(topic, talos::telemetry_wire::slot_bytes, 8,
+                  talos::telemetry_wire::slot_count,
                   {OverflowPolicy::DROP_NEWEST, ReadMode::SEQUENCE});
   auto reader = queue.register_reader();
   if (!reader) throw std::runtime_error("RTMS reader slots exhausted");
   ReaderLease lease{queue, *reader};
-  int udp = socket(AF_INET, SOCK_DGRAM, 0);
-  if (udp < 0) throw std::runtime_error("UDP socket failed");
-  FileDescriptor udp_owner{udp};
-  const int flags = fcntl(udp, F_GETFL, 0);
-  if (flags < 0 || fcntl(udp, F_SETFL, flags | O_NONBLOCK) < 0) {
-    throw std::runtime_error("UDP nonblocking setup failed");
-  }
-  int broadcast = 1;
-  setsockopt(udp, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
   auto port = [](const char* s) {
     auto p = std::stoul(s);
     if (p == 0 || p > 65535) throw std::runtime_error("invalid port");
     return static_cast<std::uint16_t>(p);
   };
-  sockaddr_in dest{};
-  dest.sin_family = AF_INET;
-  dest.sin_port = htons(count > 4 ? port(at(4)) : 5801);
-  if (inet_pton(AF_INET, count > 3 ? at(3) : "127.0.0.1", &dest.sin_addr) !=
-      1) {
-    throw std::runtime_error("invalid IPv4 address");
-  }
-  const auto root = fs::canonical(count > 6 ? at(6) : "studio/dist");
-  Bridge bridge{queue, *reader, udp, dest, topic};
+  const auto root = fs::canonical(count > 4 ? at(4) : "studio/dist");
+  Bridge bridge{queue, *reader, topic};
   uWS::App app;
   uWS::App::WebSocketBehavior<Client> behavior{};
   behavior.maxPayloadLength = 1024;
@@ -337,11 +316,40 @@ int main(int argc, char** argv) try {
     // Send the current graph immediately: a client that has to wait for the
     // next refresh opens on an empty system view.
     ws->send(bridge.system_json, uWS::OpCode::TEXT);
+    // Then the cached dictionary frame, so the client's first value frame
+    // is already decodable instead of waiting up to a second for the next
+    // dictionary the producer schedules.
+    if (bridge.telemetry_state.has_dictionary) {
+      ws->send(bridge.telemetry_state.dictionary_frame, uWS::OpCode::BINARY);
+    }
   };
   behavior.close = [&](auto* ws, int, std::string_view) {
     bridge.clients.erase(ws);
   };
   app.ws<Client>("/telemetry", std::move(behavior));
+  app.get("/telemetry.json", [&](auto* res, auto*) {
+    // 503 until a dictionary and an aligned frame have both arrived: an
+    // empty or half-described document would read as "the robot is doing
+    // nothing", which is a different statement from "not known yet".
+    if (!bridge.telemetry_state.has_dictionary ||
+        !bridge.telemetry_state.has_frame) {
+      res->writeStatus("503 Service Unavailable")->end();
+      return;
+    }
+    res->writeHeader("Content-Type", "application/json")
+        ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->end(studio::TelemetryJson(bridge.telemetry_state,
+                                    talos::introspect::wall_now_ns()));
+  });
+  app.get("/channels.json", [&](auto* res, auto*) {
+    if (!bridge.telemetry_state.has_dictionary) {
+      res->writeStatus("503 Service Unavailable")->end();
+      return;
+    }
+    res->writeHeader("Content-Type", "application/json")
+        ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->end(studio::ChannelsJson(bridge.telemetry_state));
+  });
   app.get("/system.json", [&](auto* res, auto*) {
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
@@ -396,7 +404,7 @@ int main(int argc, char** argv) try {
         ->end(body);
   });
   bool listening = false;
-  app.listen(count > 5 ? port(at(5)) : 5800, [&](auto* token) {
+  app.listen(count > 3 ? port(at(3)) : 5800, [&](auto* token) {
     listening = token != nullptr;
     bridge.listener = token;
   });
@@ -432,7 +440,6 @@ int main(int argc, char** argv) try {
   // running loop.
   app.run();
   std::cerr << "forwarded=" << bridge.forwarded << " invalid=" << bridge.invalid
-            << " udp_drops=" << bridge.udp_drops
             << " ws_drops=" << bridge.ws_drops << '\n';
 } catch (const std::exception& e) {
   std::cerr << e.what() << '\n';

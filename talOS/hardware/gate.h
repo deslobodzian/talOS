@@ -13,12 +13,10 @@
 // What stays in the node: device presence (which samples a subsystem needs is
 // node policy), the command law itself, and the state it publishes.
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <span>
 
-#include "talOS/events/time.h"
 #include "talOS/hardware/messages.h"
 
 namespace talos::hardware {
@@ -41,25 +39,6 @@ inline bool AcceptState(bool have_prev, const State& prev, uint64_t config_id,
 inline bool GatewayReady(const State& state) {
   return (state.flags & (kConfigured | kEnabled)) == (kConfigured | kEnabled) &&
          !(state.flags & kHardwareFault);
-}
-
-// Whether a latched target may drive: enabled, issued no later than now, and
-// both the target and the last accepted state younger than the timeout. A
-// consumer treats a stale target as absent rather than as zero, so the check
-// is strict (`<`, not `<=`): a target exactly one timeout old is already gone.
-inline bool TargetFresh(event::MonotonicTime now, event::MonotonicTime issued,
-                        bool enabled, event::MonotonicTime state_received,
-                        std::chrono::microseconds timeout) {
-  return enabled && issued <= now && now - issued < timeout &&
-         now - state_received < timeout;
-}
-
-// The sample for one device id, or nullptr when the state carries none.
-inline const MotorSample* FindMotor(const State& state, uint16_t id) {
-  for (std::size_t i = 0; i < state.motor_count; ++i) {
-    if (state.motors[i].id == id) return &state.motors[i];
-  }
-  return nullptr;
 }
 
 // The neutral fallback: a command that echoes the state's identity words and

@@ -113,6 +113,26 @@ export function dispatch(
     context: RpcContext, method: string, params: Params = {}): unknown {
   const {timeline} = context;
 
+  // The newest retained sample, with its dictionary context. The zero-history
+  // question ("what is it doing right now?") without a timestamp to guess:
+  // units and labels travel with it because a bare number without either is
+  // only half an answer, and age says how stale "latest" is.
+  if (method === 'get_latest') {
+    const frame = timeline.latest();
+    if (!frame)
+      throw new RpcFault(
+          -32002, 'No telemetry received yet; is the Studio bridge connected?');
+    const ageMs = timeline.lastArrivalMs ?
+        Math.max(0, Date.now() - timeline.lastArrivalMs) :
+        null;
+    return {
+      ...frame,
+      snapshot: frame,
+      age_ms: ageMs,
+      age_ns: ageMs === null ? null : String(Math.round(ageMs * 1e6))
+    };
+  }
+
   if (method === 'get_schema_tree') {
     const topics: Record<string, string> = {};
     function walk(value: unknown, prefix: string) {
@@ -407,6 +427,6 @@ export function handleRpc(context: RpcContext, input: unknown): unknown|
 // Every method name, for the Agent tab's picker and for documentation that
 // cannot fall out of step with the implementation.
 export const RPC_METHODS = [
-  'get_schema_tree', 'query_state_at', 'scan_channel_events',
+  'get_latest', 'get_schema_tree', 'query_state_at', 'scan_channel_events',
   'get_system_graph', 'describe_topic', 'get_declared_graph'
 ] as const;

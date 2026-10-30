@@ -2,3 +2,5 @@
 # must never be traversed by `bazel build //...` (their BUILD files resolve
 # against the wrong output base and fail package loading).
 .muse
+.claude
+.agents

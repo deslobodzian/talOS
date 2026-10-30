@@ -28,8 +28,9 @@
 //     them neutral whenever robot_enabled() is false;
 //   - digital/PWM outputs set since the last flush included as set.
 // Incoming states pass hardware::AcceptState for this config's id and are
-// latched with their receive time; getters read the latched state, and read
-// 0 with connected() == false until the first one.
+// latched with their receive time; getters read the latched state (0 before
+// the first one), while connected() requires both a valid sample and a
+// hardware state younger than [robot] command_timeout_us.
 
 #include <cstddef>
 #include <functional>
@@ -58,6 +59,10 @@ class HardwareLink {
   // Accepted hardware state, gateway configured and enabled with no fault,
   // and that state younger than [robot] command_timeout_us.
   bool enabled() const;
+  // Accepted hardware state younger than [robot] command_timeout_us.
+  bool fresh() const;
+  // Age of the last accepted hardware state (Duration::max() if none).
+  Duration age() const;
   const config::RobotConfig& config() const;  // parsed node.config_path()
 
  private:
@@ -90,7 +95,7 @@ class Motor {
   double velocity() const;  // rotations/s
   double voltage() const;   // applied volts
   double current() const;   // stator amps
-  bool connected() const;   // sample present and valid
+  bool connected() const;   // sample valid and hardware state fresh
 
  private:
   HardwareLink* link_{nullptr};
@@ -103,7 +108,7 @@ class CANcoder {
   CANcoder(Node& node, std::string_view name);
   double position() const;  // rotations
   double velocity() const;  // rotations/s
-  bool connected() const;
+  bool connected() const;   // sample valid and hardware state fresh
 
  private:
   HardwareLink* link_{nullptr};
@@ -116,7 +121,7 @@ class Gyro {  // Pigeon2
   Gyro(Node& node, std::string_view name);
   double yaw() const;       // rotations, CCW+
   double yaw_rate() const;  // rotations/s, CCW+
-  bool connected() const;
+  bool connected() const;   // sample valid and hardware state fresh
 
  private:
   HardwareLink* link_{nullptr};
@@ -128,7 +133,7 @@ class DigitalInput {
   DigitalInput() = default;
   DigitalInput(Node& node, std::string_view name);
   bool get() const;
-  bool connected() const;
+  bool connected() const;  // sample valid and hardware state fresh
 
  private:
   HardwareLink* link_{nullptr};
@@ -151,7 +156,7 @@ class AnalogInput {
   AnalogInput() = default;
   AnalogInput(Node& node, std::string_view name);
   double voltage() const;
-  bool connected() const;
+  bool connected() const;  // sample valid and hardware state fresh
 
  private:
   HardwareLink* link_{nullptr};
@@ -164,7 +169,7 @@ class Encoder {
   Encoder(Node& node, std::string_view name);
   double position() const;  // rotations
   double velocity() const;  // rotations/s
-  bool connected() const;
+  bool connected() const;   // sample valid and hardware state fresh
 
  private:
   HardwareLink* link_{nullptr};

@@ -36,10 +36,10 @@ from talos.devices import (Alliance, AnalogInput, CANcoder, DigitalInput,
                            Joystick, Mode, Motor, PwmOutput, robot_enabled)
 
 __all__ = [
-    "Alliance", "AnalogInput", "CANcoder", "DigitalInput", "DigitalOutput",
-    "DriverStation", "Encoder", "Gyro", "Joystick", "Message", "Mode",
-    "Motor", "Node", "Publisher", "PwmOutput", "StateMachine",
-    "Subscription", "TalosError", "load", "robot_enabled", "run",
+    "Alliance", "AnalogInput", "BytePublisher", "CANcoder", "DigitalInput",
+    "DigitalOutput", "DriverStation", "Encoder", "Gyro", "Joystick", "Message",
+    "Mode", "Motor", "Node", "Publisher", "PwmOutput", "StateMachine",
+    "Subscription", "TalosError", "cpp_node", "load", "robot_enabled", "run",
 ]
 
 _NS = 1e9
@@ -120,6 +120,14 @@ class Node:
             self._handle, _abi.encode(topic), mtype.size))
         return Publisher(self, mtype, index)
 
+    def publish_bytes(self, topic, max_bytes, *, slots=1024,
+                      drop_newest=False, external=False):
+        """A topic of variable-length messages, each at most `max_bytes`."""
+        index = _abi.index(lib.talos_node_publish_bytes(
+            self._handle, _abi.encode(topic), max(0, max_bytes),
+            max(0, slots), bool(drop_newest), bool(external)))
+        return BytePublisher(self, index)
+
     def every(self, period, fn):
         """Calls fn() every `period` seconds, besides update()."""
         _abi.ok(lib.talos_node_every(
@@ -179,6 +187,23 @@ class Publisher:
             self._node, self._index, data, len(data))))
 
 
+class BytePublisher:
+    """A variable-length message topic; see Node.publish_bytes."""
+
+    def __init__(self, node, index):
+        self._node, self._index = node._handle, index
+
+    def send(self, data):
+        """Publishes `data` (bytes, bytearray, or memoryview); False when
+        dropped or longer than max_bytes."""
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError(f"expected bytes-like object, got "
+                            f"{type(data).__name__}")
+        raw = bytes(data)
+        return bool(_abi.ok(lib.talos_byte_publisher_send(
+            self._node, self._index, raw, len(raw))))
+
+
 class StateMachine:
     """A state plus when it was entered, ticking with the node.
 
@@ -197,35 +222,39 @@ class StateMachine:
         self._states = states
         self._names = enum_names(states) if states is not None else None
         self._check(initial)
-        self._node = node
-        self._state = self._previous = initial
-        self._entered_update = lib.talos_node_next_update(node._handle)
-        self._entered_at = node.now
+        self._node = node._handle
+        self._enum_type = type(initial) if isinstance(initial, enum.Enum) else None
+        self._index = _abi.index(lib.talos_state_machine_create(
+            self._node, self._to_int(initial)))
+
+    def _to_int(self, state):
+        return int(state.value if isinstance(state, enum.Enum) else state)
+
+    def _from_int(self, raw):
+        return self._enum_type(raw) if self._enum_type is not None else int(raw)
 
     @property
     def state(self):
-        return self._state
+        return self._from_int(
+            lib.talos_state_machine_state(self._node, self._index))
 
     @property
     def previous(self):
-        return self._previous
+        return self._from_int(
+            lib.talos_state_machine_previous(self._node, self._index))
 
     def is_(self, state):
-        return self._state == state
+        return self.state == state
 
     def go(self, state):
         """Switch to `state`; a no-op when already in it."""
         self._check(state)
-        if state == self._state:
-            return
-        self._previous, self._state = self._state, state
-        self._entered_at = self._node.now
-        # Entered during update() k: the first update to start in it is k + 1.
-        self._entered_update = lib.talos_node_next_update(self._node._handle)
+        _abi.ok(lib.talos_state_machine_go(
+            self._node, self._index, self._to_int(state)))
 
     def __repr__(self):
-        return (f"StateMachine({self._name(self._state)}, "
-                f"previous={self._name(self._previous)}, "
+        return (f"StateMachine({self._name(self.state)}, "
+                f"previous={self._name(self.previous)}, "
                 f"time_in_state={self.time_in_state:g}s)")
 
     def _name(self, state):
@@ -241,13 +270,14 @@ class StateMachine:
 
     @property
     def time_in_state(self):
-        return self._node.now - self._entered_at
+        return lib.talos_state_machine_time_in_state_ns(
+            self._node, self._index) / _NS
 
     @property
     def just_entered(self):
         """True during the first update() tick that starts in this state."""
-        return self._node.tick == self._entered_update
-
+        return bool(lib.talos_state_machine_just_entered(
+            self._node, self._index))
 
 def _factory(cls, built):
     """A C factory: builds cls on a new Node and installs its update().
@@ -302,3 +332,38 @@ def load(path):
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _resolve_library(library_path):
+    candidates = [library_path]
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    candidates.append(os.path.join(repo_root, library_path))
+    runfiles_dir = os.environ.get("RUNFILES_DIR")
+    if runfiles_dir:
+        candidates.append(os.path.join(runfiles_dir, "_main", library_path))
+        candidates.append(os.path.join(runfiles_dir, library_path))
+    if sys.argv and sys.argv[0]:
+        candidates.append(
+            os.path.join(f"{sys.argv[0]}.runfiles", "_main", library_path))
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    raise TalosError(f"C++ node library not found: {library_path}")
+
+
+def cpp_node(library_path, name="main"):
+    """Wraps a C++ node exported with TALOS_EXPORT_NODE(name, Class) as a
+    Python node class."""
+    resolved = _resolve_library(library_path)
+    cdll = ctypes.CDLL(resolved)
+    fn = getattr(cdll, f"talos_cpp_node_{name}")
+    fn.argtypes = [_abi.c_void_p, _abi.c_void_p]
+    fn.restype = _abi.c_int32
+
+    class CppNode:
+        def __init__(self, node):
+            if fn(node._handle, None) < 0:
+                raise TalosError("C++ node initialization failed")
+
+    return CppNode

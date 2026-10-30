@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Composed check: is node N alive, what does it publish, latest values?
 
-Combines get_declared_graph, get_system_graph, describe_topic,
-get_schema_tree, and query_state_at into the one report an agent or a
-student actually runs first when something looks wrong.
+Combines get_declared_graph, get_system_graph, describe_topic, and
+get_latest into the one report an agent or a student actually runs first
+when something looks wrong.
 """
 import argparse
 import json
@@ -44,18 +44,16 @@ def main():
                   s["name"]: s.get("events_per_second")
                   for s in live["sources"]},
               "publishes": {}}
-    schema = rpc(args.url, "get_schema_tree")
-    bounds = schema["timestamp_bounds"]
-    latest = None
-    if bounds and published:
-        latest = rpc(args.url, "query_state_at",
-                     {"timestamp_ns": bounds["end"],
-                      "topics": [t for t in published if t in schema["topics"]],
-                      "mode": "at_or_before"}) if any(
-            t in schema["topics"] for t in published) else None
+    try:
+        latest = rpc(args.url, "get_latest")
+    except RpcError as e:
+        if e.code != -32002:
+            raise
+        latest = None
+    channels = (latest or {}).get("channels", {})
     for topic in published:
         detail = rpc(args.url, "describe_topic", {"topic": topic})
-        value = (latest or {}).get("topics", {}).get(topic, "<not retained>")
+        value = channels.get(topic, "<not retained>")
         report["publishes"][topic] = {"health": detail["health"], "latest": value}
     print(json.dumps(report, indent=2, default=str))
 

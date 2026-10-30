@@ -44,9 +44,15 @@
 bazel-*
 *MODULE.bazel.lock
 
+# hedron_compile_commands output
+compile_commands.json
+/external
+
 # Python bytecode
 __pycache__/
 *.py[cod]
 
 # Agent scratch (plans, session notes)
 .agents/
+.claude/
+.muse/

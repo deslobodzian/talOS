@@ -7,7 +7,7 @@ raise, with the C++ message, or with the Python exception a callback raised.
 import ctypes
 import os
 
-ABI_VERSION = 9
+ABI_VERSION = 11
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -89,6 +89,8 @@ _SIGNATURES = {
     "talos_node_subscribe": (c_int64, [c_void_p, c_char_p, c_uint32, c_int32,
                                        MESSAGE_CALLBACK, c_void_p]),
     "talos_node_publish": (c_int64, [c_void_p, c_char_p, c_uint32]),
+    "talos_node_publish_bytes": (c_int64, [c_void_p, c_char_p, c_uint32,
+                                           c_uint32, c_int32, c_int32]),
     "talos_node_every": (c_int32, [c_void_p, c_int64, CALLBACK, c_void_p]),
     "talos_node_set_update": (c_int32, [c_void_p, CALLBACK, c_void_p]),
     "talos_subscription_value": (c_void_p, [c_void_p, c_int64]),
@@ -97,6 +99,14 @@ _SIGNATURES = {
     "talos_subscription_fresh": (c_int32, [c_void_p, c_int64, c_int64]),
     "talos_subscription_updated": (c_int32, [c_void_p, c_int64]),
     "talos_publisher_send": (c_int32, [c_void_p, c_int64, c_char_p, c_uint32]),
+    "talos_byte_publisher_send": (c_int32, [c_void_p, c_int64, c_char_p,
+                                            c_uint32]),
+    "talos_state_machine_create": (c_int64, [c_void_p, c_int64]),
+    "talos_state_machine_state": (c_int64, [c_void_p, c_int64]),
+    "talos_state_machine_previous": (c_int64, [c_void_p, c_int64]),
+    "talos_state_machine_go": (c_int32, [c_void_p, c_int64, c_int64]),
+    "talos_state_machine_time_in_state_ns": (c_int64, [c_void_p, c_int64]),
+    "talos_state_machine_just_entered": (c_int32, [c_void_p, c_int64]),
     "talos_device": (c_int64, [c_void_p, c_int32, c_char_p]),
     "talos_robot_enabled": (c_int32, [c_void_p]),
     "talos_motor_set": (c_int32, [c_void_p, c_int64, c_int32, c_double,
@@ -123,6 +133,8 @@ _TESTING_SIGNATURES = {
                                         c_uint32]),
     "talos_sim_latest_raw": (c_int32, [c_void_p, c_char_p, c_void_p,
                                        c_uint32]),
+    "talos_sim_latest_bytes": (c_int32, [c_void_p, c_char_p, c_void_p,
+                                         c_uint32, _P(c_uint32)]),
     "talos_sim_hardware_create": (c_void_p, [c_void_p]),
     "talos_sim_hardware_destroy": (None, [c_void_p]),
     "talos_sim_hardware_enable": (c_int32, [c_void_p, c_int32]),

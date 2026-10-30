@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 9u
+#define TALOS_NODE_ABI_VERSION 11u
 
 enum {
   TALOS_OK = 0,
@@ -96,6 +96,9 @@ int64_t talos_node_subscribe(TalosNode* node, const char* topic,
                              TalosMessageCallback on_message, void* user);
 int64_t talos_node_publish(TalosNode* node, const char* topic,
                            uint32_t message_bytes);
+int64_t talos_node_publish_bytes(TalosNode* node, const char* topic,
+                                 uint32_t max_bytes, uint32_t slots,
+                                 int32_t drop_newest, int32_t external);
 int32_t talos_node_every(TalosNode* node, int64_t period_ns, TalosCallback fn,
                          void* user);
 // The update() the framework calls every period.
@@ -112,6 +115,18 @@ int32_t talos_subscription_updated(const TalosNode* node, int64_t index);
 // Returns 1 sent, 0 dropped by the transport, TALOS_ERR.
 int32_t talos_publisher_send(TalosNode* node, int64_t index, const void* data,
                              uint32_t size);
+// Returns 1 sent, 0 dropped or longer than max_bytes, TALOS_ERR.
+int32_t talos_byte_publisher_send(TalosNode* node, int64_t index,
+                                  const void* data, uint32_t size);
+
+// StateMachine `index`, created with an integer initial state.
+int64_t talos_state_machine_create(TalosNode* node, int64_t initial);
+int64_t talos_state_machine_state(const TalosNode* node, int64_t index);
+int64_t talos_state_machine_previous(const TalosNode* node, int64_t index);
+int32_t talos_state_machine_go(TalosNode* node, int64_t index, int64_t next);
+int64_t talos_state_machine_time_in_state_ns(const TalosNode* node,
+                                             int64_t index);
+int32_t talos_state_machine_just_entered(const TalosNode* node, int64_t index);
 
 // --- devices -------------------------------------------------------------
 
@@ -232,6 +247,12 @@ int32_t talos_sim_publish_raw(TalosSim* sim, const char* topic,
 // Copies the newest message on `topic` into `out`: 1 copied, 0 none yet.
 int32_t talos_sim_latest_raw(const TalosSim* sim, const char* topic, void* out,
                              uint32_t size);
+// Queries or copies the newest byte message on `topic`: sets *out_size to its
+// length (0 when none), copies into `out` when non-NULL (error if capacity is
+// smaller), and returns 1 when present, 0 when none yet, TALOS_ERR on error.
+int32_t talos_sim_latest_bytes(const TalosSim* sim, const char* topic,
+                               void* out, uint32_t capacity,
+                               uint32_t* out_size);
 
 TalosSimHardware* talos_sim_hardware_create(TalosSim* sim);
 void talos_sim_hardware_destroy(TalosSimHardware* hw);

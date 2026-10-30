@@ -1,0 +1,42 @@
+namespace control;
+
+// Standard velocity command for rollers, flywheels, and conveyor mechanisms.
+struct VelocityTarget {
+  velocity_rps:double;
+  feedforward_v:double;
+  enabled:bool;
+}
+
+// Standard velocity feedback published by velocity-controlled mechanisms.
+struct VelocityState {
+  velocity_rps:double;
+  requested_rps:double;
+  current_a:double;
+  enabled:bool;
+  connected:bool;
+}
+
+// Standard position/motion-magic command for wrists, elevators, and turrets.
+struct PositionTarget {
+  position_rot:double;
+  feedforward_v:double;
+  enabled:bool;
+}
+
+// Standard position feedback with goal echo and tolerance indicator.
+struct PositionState {
+  position_rot:double;
+  velocity_rps:double;
+  goal_rot:double;
+  enabled:bool;
+  at_goal:bool;
+  connected:bool;
+}
+
+// Standard planar chassis velocity command for swerve or differential drives.
+struct ChassisTarget {
+  vx_mps:double;
+  vy_mps:double;
+  omega_radps:double;
+  enabled:bool;
+}

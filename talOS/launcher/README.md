@@ -153,7 +153,6 @@ the launcher's back:
 [studio]
 bridge = "//studio/bridge:studio_bridge"  # binary target to supervise
 http_port = 5800                          # HTTP/WebSocket port
-udp_port = 5801                           # desktop UDP path
 webroot = "bazel-bin/studio/dist"         # static web directory, relative to the launcher's working directory
 ```
 
@@ -173,8 +172,38 @@ first attempt spawns with the nodes; a quick exit is retried at most once a
 second for up to 60 seconds, inside the supervision loop, so it never delays the
 session or its `--duration-s` deadline. While it is still starting it does not
 hold the session open. Once it has survived a second it is supervised like any
-node. If it never comes up it is marked failed in the manifest and the session
-runs on without Studio.
+node, except that it is never restarted under the policy below. If it never
+comes up it is marked failed in the manifest and the session runs on without
+Studio.
+
+## Restarts
+
+A roster member — `hardware_node`, every subsystem node, `sim_gateway` — that
+exits with a nonzero status or by a signal while the session is not stopping is
+restarted. The first restart waits 50 ms, each later one twice as long, capped
+at 1 s, and a node is restarted at most `max_restarts` times:
+
+```toml
+[robot]
+max_restarts = 5  # per node; 0 disables restarts
+```
+
+The key is optional (default 5) and must be an integer >= 0; `--max-restarts N`
+overrides it for one run. A clean exit (status 0) is a node that finished and
+is never restarted, and nothing is restarted once a signal or the
+`--duration-s` deadline has started stopping the session. The backoff is
+scheduled inside the supervision loop, like the Studio bridge's retries, so a
+restarting node never delays another node or the deadline. Each restart prints
+one line:
+
+    [launcher] alpha exited (signal 11); restart 1/5 in 50 ms
+
+Every run writes its own event log rather than truncating the last one: the
+first run `<name>.tlog`, restart `k` `<name>.restart<k>.tlog`. The session
+manifest records each node's `restart_count` and every log in `log_paths`
+(`log_path` stays the first run's), and its `record_count` sums all of them.
+`log_dump` on the session directory merges every `*.tlog`, restarts included.
+A node's `exit_code` and `pid` are its last run's.
 
 ## graph.json
 

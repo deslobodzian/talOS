@@ -3,16 +3,11 @@
 #include <gtest/gtest.h>
 
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <vector>
 
-#include "talOS/events/time.h"
-
 namespace talos::hardware {
 namespace {
-
-using namespace std::chrono_literals;
 
 State TestState() {
   State state;
@@ -79,28 +74,6 @@ TEST(GateTest, GatewayReadyNeedsConfiguredAndEnabledWithoutFault) {
   faulted.flags |= kHardwareFault;
   EXPECT_FALSE(GatewayReady(faulted));
   EXPECT_FALSE(GatewayReady(State{}));
-}
-
-TEST(GateTest, TargetFreshPinsBothTimeouts) {
-  const auto now = event::MonotonicTime::from_nanos(5'000'000'000);
-  const auto issued = event::MonotonicTime::from_nanos(4'999'000'000);
-  const auto received = event::MonotonicTime::from_nanos(4'999'500'000);
-  EXPECT_TRUE(TargetFresh(now, issued, true, received, 100ms));
-  EXPECT_FALSE(TargetFresh(now, issued, false, received, 100ms));
-  // Issued in the future is not fresh: clocks disagree, so drive nothing.
-  EXPECT_FALSE(TargetFresh(now, event::MonotonicTime::from_nanos(5'001'000'000),
-                           true, received, 100ms));
-  // A target exactly one timeout old is already gone (strict <).
-  EXPECT_FALSE(TargetFresh(now, now - 100ms, true, received, 100ms));
-  EXPECT_FALSE(TargetFresh(now, issued, true, now - 100ms - 1ms, 100ms));
-}
-
-TEST(GateTest, FindMotorById) {
-  const State state = TestState();
-  const MotorSample* found = FindMotor(state, 2);
-  ASSERT_NE(found, nullptr);
-  EXPECT_TRUE(found->valid);
-  EXPECT_EQ(FindMotor(state, 9), nullptr);
 }
 
 TEST(GateTest, NeutralCommandEchoesStateAndCoasts) {

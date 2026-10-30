@@ -32,7 +32,11 @@ Allowed dependencies:
   (`extension<T>()`, `after_update()`).
 - `talOS/` never depends on a robot, an example or `studio/`.
 - Python reaches talOS only through the C ABI in `talOS/node_api`; it does not
-  reimplement a wire format or a memory layout.
+  reimplement a wire format, a memory layout, a state machine, or a C++ node
+  (C++ nodes exposed to Python use `TALOS_EXPORT_NODE` and `talos.cpp_node`).
+- Adding a node in one language never requires modifying code in another
+  language: cross-cutting robot wiring (`arbiter`, `operator_interface`,
+  `telemetry`) is driven by the subsystem's TOML configuration.
 - Nodes share only messages and topic names (`talos_messages`), never each
   other's classes.
 
@@ -43,12 +47,14 @@ Beside the stack:
 | `talOS/configuration` | parses `robot.toml` and the subsystem files |
 | `talOS/hardware` | hardware config, request/state messages, the gateway the RoboRIO and sim run |
 | `talOS/protocol` | frame and UDP wire format |
-| `talOS/bridge` | `:hardware_node` |
-| `talOS/driver_station` | Driver Station codec and `:node` |
-| `talOS/launcher` | spawns and supervises the nodes in a config; `--describe-only` lints the graph |
+| `talOS/bridge` | `:hardware_node`; publishes link health on `/hw/status` (`bridge::BridgeStatus`) |
+| `talOS/driver_station` | Driver Station codec |
+| `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed nodes up to `[robot] max_restarts`); `--describe-only` lints the graph |
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |
-| `talOS/process` | `InstallStopHandlers`: SIGINT/SIGTERM handling for node binaries |
-| `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle` |
+| `talOS/process` | stop handlers and `ConfigureRealtime` for node binaries |
+| `talOS/msgs` | shared geometry and control message structs |
+| `talOS/telemetry` | the Studio telemetry frame schema and byte-topic wire format |
+| `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle`, `talos_graph_test` |
 
 ## The tick
 
@@ -63,6 +69,17 @@ After each tick the devices layer flushes one hardware request for the node:
 
 A subscription's `fresh()` means a value younger than `command_timeout_us`, so
 a node that stops hearing its target goes neutral on its own.
+
+Messages reach a node when its loop drains its topics. A node without message
+callbacks drains right before each of its own timers (`update()`, `every()`)
+and otherwise sleeps; a node with a `subscribe` callback or a Driver Station
+listener, or with no timer, drains every 1 ms. Ages count from the drain, so
+for the first kind a message can be up to one period older than `age()`
+reports, and a silent target is judged stale at most one period after
+`command_timeout_us`. The simulated loop uses the same rule, and replay
+reproduces either from the log. Off-simulation the loop thread runs under
+`SCHED_FIFO` (Linux) or the Mach time-constraint policy (macOS) with memory
+locked, best effort (`talOS/process`).
 
 ## Topics and messages
 

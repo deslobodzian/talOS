@@ -8,12 +8,10 @@
     "build": "tsc --noEmit && vite build",
     "test": "tsx --test tests/*.test.ts",
     "agent": "tsx agent/server.ts",
-    "generate": "bazel run @flatbuffers//:flatc -- --ts -o \"$PWD/src/generated\" \"$PWD/schema/telemetry.fbs\"",
-    "tauri": "tauri"
+    "generate": "bazel run @flatbuffers//:flatc -- --ts -o \"$PWD/src/generated\" \"$PWD/../talOS/telemetry/telemetry.fbs\""
   },
   "dependencies": {
     "@react-three/fiber": "^9.0.0",
-    "@tauri-apps/api": "^2.0.0",
     "flatbuffers": "23.5.26",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -22,7 +20,6 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.0.0",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",

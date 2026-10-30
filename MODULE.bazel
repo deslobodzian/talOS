@@ -72,21 +72,6 @@ studio_http_archive(
     build_file = "//studio/bridge:usockets.BUILD.bazel",
 )
 
-# Desktop shell: native Rust compilation and locked crates are Bazel actions.
-bazel_dep(name = "rules_rust", version = "0.74.0", dev_dependency = True)
-rust = use_extension("@rules_rust//rust:extensions.bzl", "rust", dev_dependency = True)
-rust.toolchain(edition = "2021", versions = ["1.94.1"])
-use_repo(rust, "rust_toolchains")
-register_toolchains("@rust_toolchains//:all", dev_dependency = True)
-
-studio_crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate", dev_dependency = True)
-studio_crate.from_cargo(
-    name = "studio_crates",
-    cargo_lockfile = "//studio/src-tauri:Cargo.lock",
-    manifests = ["//studio/src-tauri:Cargo.toml"],
-)
-use_repo(studio_crate, "studio_crates")
-
 # The Python node package (//talOS/python) needs the flatbuffers runtime for
 # the flatc --python bindings. Pinned to the same version as the C++ dep above.
 pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")

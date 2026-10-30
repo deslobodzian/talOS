@@ -4,23 +4,36 @@
 #include <cmath>
 #include <cstdint>
 #include <numbers>
+#include <string>
+#include <string_view>
+#include <vector>
 
-#include "driver_station/driver_station_message_generated.h"
-#include "driver_station/topics.h"
 #include "drivetrain/drive_message_generated.h"
 #include "drivetrain/topics.h"
 #include "intake/intake_message_generated.h"
 #include "intake/topics.h"
 #include "shooter/shooter_message_generated.h"
 #include "shooter/topics.h"
-#include "talOS/driver_station/driver_station.h"
+#include "talOS/configuration/config_parser.h"
+#include "talOS/devices/devices.h"
 #include "talOS/node/node.h"
 
 namespace operator_interface {
 
-// Maps each Driver Station state to teleop requests as it arrives: stick
-// scaling, deadband and field-oriented rotation for the chassis, button masks
-// and setpoints for the shooter and intake. One producer among several, not
+// Wire-compatible with the Target struct of any single-demand mechanism
+// scaffolded by tools/new_subsystem.py (enabled:bool + 7 pad + demand:double).
+struct alignas(8) GenericTarget {
+  std::uint8_t enabled{0};
+  std::uint8_t pad[7]{};
+  double demand{0.0};
+};
+static_assert(sizeof(GenericTarget) == 16);
+static_assert(talos::Message<GenericTarget>);
+
+// Maps each Driver Station packet (/hw/state/driver_station, through
+// talos::DriverStation) to teleop requests as it arrives: stick scaling,
+// deadband and field-oriented rotation for the chassis, buttons and setpoints
+// for the shooter and intake. One producer among several, not
 // the authority: the arbiter decides whether teleop is driving and is the
 // sole writer of the topics the subsystems consume.
 class OperatorInterface {
@@ -34,18 +47,16 @@ class OperatorInterface {
         heading_timeout_{HeadingTimeout(node)},
         shooter_rps_{node.param("shooter_target_rps", 60.0)},
         intake_rps_{node.param("intake_target_rps", 30.0)},
-        // Bit 0 is button 1, matching Driver Station numbering.
-        shoot_mask_{node.param<std::uint32_t>("shoot_button_mask", 1u << 0)},
-        intake_mask_{node.param<std::uint32_t>("intake_button_mask", 1u << 1)},
+        // 1-based, matching Driver Station numbering.
+        shoot_button_{node.param<int>("shoot_button", 1)},
+        intake_button_{node.param<int>("intake_button", 2)},
         chassis_{node.publish<drivetrain::ChassisTarget>(
             drivetrain::topics::kTeleopTarget)},
         shooter_{node.publish<shooter::ShooterTarget>(
             shooter::topics::kTeleopTarget)},
         intake_{
-            node.publish<intake::IntakeTarget>(intake::topics::kTeleopTarget)} {
-    node.subscribe<driver_station::DriverStationState>(
-        driver_station::topics::kState,
-        [this](const driver_station::DriverStationState& s) { OnDriver(s); });
+            node.publish<intake::IntakeTarget>(intake::topics::kTeleopTarget)},
+        ds_{node, [this] { OnDriver(); }} {
     // The drivetrain owns the yaw. A non-finite one carries no direction, so
     // it is dropped and the previous heading keeps aging toward stale.
     node.subscribe<drivetrain::DrivetrainState>(
@@ -56,11 +67,38 @@ class OperatorInterface {
           heading_at_ = node_.now();
           have_heading_ = true;
         });
+    if (!node.config_path().empty()) {
+      const auto cfg = talos::config::ParseRobotConfig(node.config_path());
+      if (const auto* subs = cfg.toml_data["subsystems"].as_table()) {
+        for (const auto& [key, val] : *subs) {
+          const std::string_view sub_name = key.str();
+          if (sub_name == "drivetrain" || sub_name == "shooter" ||
+              sub_name == "intake") {
+            continue;
+          }
+          const auto* tbl = val.as_table();
+          if (tbl == nullptr) continue;
+          const std::int64_t button =
+              (*tbl)["teleop_button"].value_or(std::int64_t{0});
+          if (button < 1 || button > 32) continue;
+          const double demand = (*tbl)["teleop_demand"].value_or(0.0);
+          const std::string topic =
+              "/" + std::string{sub_name} + "/target/teleop";
+          extra_bindings_.push_back(
+              ExtraBinding{static_cast<int>(button), demand,
+                           node.publish<GenericTarget>(topic)});
+        }
+      }
+    }
+  }
+
+  // A Driver Station that stops talking gets the same one stop per target
+  // as a disable, instead of the last request aging out downstream.
+  void update() {
+    if (!ds_.connected()) Stop();
   }
 
  private:
-  using Flags = talos::driver_station::DsFlags;
-
   // Five 20 ms periods by default, so one or two dropped packets do not flap
   // the frame. A non-positive or non-finite value keeps the default.
   static talos::Duration HeadingTimeout(const talos::Node& node) {
@@ -77,29 +115,32 @@ class OperatorInterface {
     return std::copysign((magnitude - deadband_) / (1.0 - deadband_), value);
   }
 
-  void OnDriver(const driver_station::DriverStationState& state) {
-    const std::int64_t now = node_.now().nanos();
-    const std::uint32_t flags = state.fms().flags();
-    const auto& stick = state.stick0();
+  // One explicit stop per target on the falling edge, so each subsystem is
+  // told to stop rather than left to time the last request out.
+  void Stop() {
+    if (!commanding_) return;
+    commanding_ = false;
+    chassis_.send(drivetrain::ChassisTarget{0, 0, 0, false});
+    shooter_.send(shooter::ShooterTarget{0, false});
+    intake_.send(intake::IntakeTarget{false, 0});
+    for (auto& binding : extra_bindings_) {
+      binding.publisher.send(GenericTarget{0, {}, 0.0});
+    }
+  }
+
+  void OnDriver() {
+    const talos::Joystick stick = ds_.joystick(0);
     // The arbiter also gates on mode, but a producer that keeps talking while
     // disabled would still be publishing live requests onto its own topics.
-    if (!(flags & Flags::kEnabled) || !(flags & Flags::kTeleop) ||
-        !stick.connected()) {
-      // One explicit stop per target on the falling edge, so each subsystem
-      // is told to stop rather than left to time the last request out.
-      if (commanding_) {
-        commanding_ = false;
-        chassis_.send(drivetrain::ChassisTarget{0, 0, 0, now, false});
-        shooter_.send(shooter::ShooterTarget{0, now, false});
-        intake_.send(
-            intake::IntakeTarget{static_cast<std::uint64_t>(now), false, 0});
-      }
+    // enabled() and teleop() already read false for a stale or detached DS.
+    if (!ds_.enabled() || !ds_.teleop() || !stick.connected()) {
+      Stop();
       return;
     }
 
-    double vx = Deadband(-stick.axis1()) * max_linear_mps_;
-    double vy = Deadband(-stick.axis0()) * max_linear_mps_;
-    const double omega = Deadband(-stick.axis2()) * max_angular_radps_;
+    double vx = Deadband(-stick.axis(1)) * max_linear_mps_;
+    double vy = Deadband(-stick.axis(0)) * max_linear_mps_;
+    const double omega = Deadband(-stick.axis(2)) * max_angular_radps_;
     // Field-relative sticks need a fresh heading; without one, drive
     // robot-relative rather than on a stale or assumed yaw.
     if (field_oriented_ && have_heading_ &&
@@ -110,15 +151,20 @@ class OperatorInterface {
       vx = robot_vx;
     }
     commanding_ = true;
-    chassis_.send(drivetrain::ChassisTarget{vx, vy, omega, now, true});
+    chassis_.send(drivetrain::ChassisTarget{vx, vy, omega, true});
 
-    const bool shoot = (stick.buttons() & shoot_mask_) != 0;
-    shooter_.send(
-        shooter::ShooterTarget{shoot ? shooter_rps_ : 0.0, now, shoot});
-    const bool take = (stick.buttons() & intake_mask_) != 0;
-    intake_.send(
-        intake::IntakeTarget{static_cast<std::uint64_t>(now), take,
-                             take ? static_cast<float>(intake_rps_) : 0.0f});
+    const bool shoot = stick.button(shoot_button_);
+    shooter_.send(shooter::ShooterTarget{shoot ? shooter_rps_ : 0.0, shoot});
+    const bool take = stick.button(intake_button_);
+    intake_.send(intake::IntakeTarget{
+        take, take ? static_cast<float>(intake_rps_) : 0.0f});
+    for (auto& binding : extra_bindings_) {
+      const bool pressed = stick.button(binding.button);
+      binding.publisher.send(
+          GenericTarget{pressed ? std::uint8_t{1} : std::uint8_t{0},
+                        {},
+                        pressed ? binding.demand : 0.0});
+    }
   }
 
   talos::Node& node_;
@@ -129,11 +175,18 @@ class OperatorInterface {
   talos::Duration heading_timeout_;
   double shooter_rps_;
   double intake_rps_;
-  std::uint32_t shoot_mask_;
-  std::uint32_t intake_mask_;
+  int shoot_button_;
+  int intake_button_;
   talos::Publisher<drivetrain::ChassisTarget> chassis_;
   talos::Publisher<shooter::ShooterTarget> shooter_;
   talos::Publisher<intake::IntakeTarget> intake_;
+  talos::DriverStation ds_;
+  struct ExtraBinding {
+    int button;  // 1-based
+    double demand;
+    talos::Publisher<GenericTarget> publisher;
+  };
+  std::vector<ExtraBinding> extra_bindings_;
   double yaw_rot_ = 0;
   talos::Time heading_at_{};
   bool have_heading_ = false;

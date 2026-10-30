@@ -71,11 +71,19 @@ const char* KindTable(Kind kind) {
   return "devices";
 }
 
+// The sample for `id`, trying the slot it was found in last time first, so a
+// state that keeps its devices in the same order from frame to frame costs one
+// comparison per read instead of a scan.
 template <class Sample, std::size_t N>
 Sample FindSample(const std::array<Sample, N>& samples, std::size_t count,
-                  std::uint16_t id) {
-  for (std::size_t i = 0; i < std::min(count, N); ++i) {
-    if (samples[i].id == id) return samples[i];
+                  std::uint16_t id, std::size_t& cached) {
+  const std::size_t valid = std::min(count, N);
+  if (cached < valid && samples[cached].id == id) return samples[cached];
+  for (std::size_t i = 0; i < valid; ++i) {
+    if (samples[i].id == id) {
+      cached = i;
+      return samples[i];
+    }
   }
   return Sample{};
 }
@@ -154,6 +162,9 @@ struct HardwareLink::Impl {
     hardware::MotorRequest motor{};
     bool digital = false;
     double pwm = 0;
+    // Where this device's sample was in the state arrays last time it was
+    // read; a hint only, checked against the id on every read.
+    mutable std::size_t sample_index = 0;
   };
 
   Node& node;
@@ -173,10 +184,13 @@ struct HardwareLink::Impl {
 
   explicit Impl(Node& n) : node{n} {}
 
-  bool Enabled() const {
-    return have_state && hardware::GatewayReady(state) &&
-           node.now() - state_received < timeout;
+  bool Fresh() const {
+    return have_state && node.now() - state_received < timeout;
   }
+  Duration Age() const {
+    return have_state ? node.now() - state_received : Duration::max();
+  }
+  bool Enabled() const { return Fresh() && hardware::GatewayReady(state); }
 
   Device& At(std::size_t index, Kind kind) {
     if (index >= devices.size() || devices[index].kind != kind) {
@@ -262,6 +276,10 @@ HardwareLink::~HardwareLink() = default;
 
 bool HardwareLink::enabled() const { return impl_->Enabled(); }
 
+bool HardwareLink::fresh() const { return impl_->Fresh(); }
+
+Duration HardwareLink::age() const { return impl_->Age(); }
+
 const config::RobotConfig& HardwareLink::config() const {
   return impl_->config;
 }
@@ -328,37 +346,52 @@ hardware::MotorSample HardwareAccess::motor_sample(const HardwareLink& link,
                                                    std::size_t index) {
   const auto& impl = *link.impl_;
   const auto& device = impl.At(index, Kind::kMotor);
-  return FindSample(impl.state.motors, impl.state.motor_count, device.id);
+  auto sample = FindSample(impl.state.motors, impl.state.motor_count, device.id,
+                           device.sample_index);
+  if (!impl.Fresh()) sample.valid = false;
+  return sample;
 }
 
 hardware::SensorSample HardwareAccess::sensor_sample(const HardwareLink& link,
                                                      std::size_t index) {
   const auto& impl = *link.impl_;
   const auto& device = impl.SensorAt(index);
-  return FindSample(impl.state.sensors, impl.state.sensor_count, device.id);
+  auto sample = FindSample(impl.state.sensors, impl.state.sensor_count,
+                           device.id, device.sample_index);
+  if (!impl.Fresh()) sample.valid = false;
+  return sample;
 }
 
 hardware::DigitalInputSample HardwareAccess::digital_input_sample(
     const HardwareLink& link, std::size_t index) {
   const auto& impl = *link.impl_;
   const auto& device = impl.At(index, Kind::kDigitalInput);
-  return FindSample(impl.state.digital_inputs, impl.state.digital_input_count,
-                    device.id);
+  auto sample =
+      FindSample(impl.state.digital_inputs, impl.state.digital_input_count,
+                 device.id, device.sample_index);
+  if (!impl.Fresh()) sample.valid = false;
+  return sample;
 }
 
 hardware::AnalogInputSample HardwareAccess::analog_input_sample(
     const HardwareLink& link, std::size_t index) {
   const auto& impl = *link.impl_;
   const auto& device = impl.At(index, Kind::kAnalogInput);
-  return FindSample(impl.state.analog_inputs, impl.state.analog_input_count,
-                    device.id);
+  auto sample =
+      FindSample(impl.state.analog_inputs, impl.state.analog_input_count,
+                 device.id, device.sample_index);
+  if (!impl.Fresh()) sample.valid = false;
+  return sample;
 }
 
 hardware::EncoderSample HardwareAccess::encoder_sample(const HardwareLink& link,
                                                        std::size_t index) {
   const auto& impl = *link.impl_;
   const auto& device = impl.At(index, Kind::kEncoder);
-  return FindSample(impl.state.encoders, impl.state.encoder_count, device.id);
+  auto sample = FindSample(impl.state.encoders, impl.state.encoder_count,
+                           device.id, device.sample_index);
+  if (!impl.Fresh()) sample.valid = false;
+  return sample;
 }
 
 void HardwareAccess::digital_output_set(HardwareLink& link, std::size_t index,
@@ -514,7 +547,9 @@ class DriverStationLink {
         /*optional=*/false, [this](const void* data) { OnPacket(data); });
   }
 
+  // A listener runs as each packet arrives, so its node drains every tick.
   void Listen(std::function<void()> on_packet) {
+    NodeAccess::require_immediate_delivery(node_);
     listeners_.push_back(std::move(on_packet));
   }
 

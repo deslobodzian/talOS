@@ -13,19 +13,17 @@
 #include "operator_interface/operator_interface.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/devices/testing.h"
-#include "talOS/driver_station/driver_station_node.h"
 #include "talOS/node/testing.h"
 
 namespace arbiter {
 namespace {
 
 using namespace std::chrono_literals;
-using driver_station::DriverStationState;
-using driver_station::FmsState;
 using drivetrain::ChassisTarget;
 using intake::IntakeTarget;
 using shooter::ShooterTarget;
 using talos::testing::Sim;
+using talos::testing::SimHardware;
 namespace ds = talos::driver_station;
 
 std::string RobotConfig() {
@@ -40,16 +38,19 @@ std::string RobotConfig() {
   return runfiles->Rlocation(location);
 }
 
-DriverStationState DsState(std::uint32_t flags) {
-  return DriverStationState{0, 0, FmsState{flags, 0, 0, 0, 0, 0, 0.0f},
-                            driver_station::JoystickState{},
-                            driver_station::JoystickState{}};
+// The packet the bridge forwards on /hw/state/driver_station.
+ds::DriverStationData DsState(std::uint32_t flags) {
+  ds::DriverStationData data{};
+  data.fms.flags = flags;
+  return data;
 }
 
-constexpr std::uint32_t kTeleopEnabled = ds::kEnabled | ds::kTeleop;
-constexpr std::uint32_t kAutoEnabled = ds::kEnabled | ds::kAutonomous;
+constexpr std::uint32_t kTeleopEnabled =
+    ds::kEnabled | ds::kTeleop | ds::kDsAttached;
+constexpr std::uint32_t kAutoEnabled =
+    ds::kEnabled | ds::kAutonomous | ds::kDsAttached;
 
-ChassisTarget Chassis(double vx) { return ChassisTarget{vx, 0, 0, 0, true}; }
+ChassisTarget Chassis(double vx) { return ChassisTarget{vx, 0, 0, true}; }
 
 // Counts what the arbiter writes on each subsystem's single target topic.
 struct Probe {
@@ -68,8 +69,10 @@ struct Probe {
 
 class ArbiterTest : public ::testing::Test {
  protected:
+  // SimHardware forwards this packet every robot period from now on.
   void Mode(std::uint32_t flags) {
-    Send(driver_station::topics::kState, DsState(flags));
+    hw->set_driver_station(DsState(flags));
+    sim.step(10ms);
   }
   template <talos::Message M>
   void Send(const char* topic, const M& message) {
@@ -86,6 +89,7 @@ class ArbiterTest : public ::testing::Test {
   Sim sim{RobotConfig()};
   Arbiter& arbiter = sim.add<Arbiter>("arbiter");
   Probe& out = sim.add<Probe>("probe");
+  std::unique_ptr<SimHardware> hw = std::make_unique<SimHardware>(sim);
 };
 
 TEST_F(ArbiterTest, ForwardsOnlyTheProducerTheMatchModeSelects) {
@@ -136,7 +140,7 @@ TEST_F(ArbiterTest, StopsOnceOnEveryModeChangeSoNoTargetOutlivesItsMode) {
 TEST_F(ArbiterTest, ForwardsNothingBeforeTheFirstDriverStationPacket) {
   Send(drivetrain::topics::kTeleopTarget, Chassis(1.0));
   Send(drivetrain::topics::kAutoTarget, Chassis(1.0));
-  Send(shooter::topics::kTeleopTarget, ShooterTarget{60.0, 0, true});
+  Send(shooter::topics::kTeleopTarget, ShooterTarget{60.0, true});
   EXPECT_EQ(out.chassis, 0);
   EXPECT_EQ(out.shooter, 0);
 }
@@ -144,9 +148,9 @@ TEST_F(ArbiterTest, ForwardsNothingBeforeTheFirstDriverStationPacket) {
 TEST_F(ArbiterTest, RoutesShooterTargetsOnTheSameSelection) {
   Mode(kTeleopEnabled);
   const int before = out.shooter;
-  Send(shooter::topics::kAutoTarget, ShooterTarget{99.0, 0, true});
+  Send(shooter::topics::kAutoTarget, ShooterTarget{99.0, true});
   EXPECT_EQ(out.shooter, before);
-  Send(shooter::topics::kTeleopTarget, ShooterTarget{60.0, 0, true});
+  Send(shooter::topics::kTeleopTarget, ShooterTarget{60.0, true});
   EXPECT_EQ(out.shooter, before + 1);
   EXPECT_NEAR(
       Last<ShooterTarget>(shooter::topics::kTarget).target_velocity_rps(), 60.0,
@@ -156,23 +160,48 @@ TEST_F(ArbiterTest, RoutesShooterTargetsOnTheSameSelection) {
 TEST_F(ArbiterTest, RoutesIntakeTargetsOnTheSameSelection) {
   Mode(kTeleopEnabled);
   const int before = out.intake;
-  Send(intake::topics::kAutoTarget, IntakeTarget{0, true, 99.0f});
+  Send(intake::topics::kAutoTarget, IntakeTarget{true, 99.0f});
   EXPECT_EQ(out.intake, before);
-  Send(intake::topics::kTeleopTarget, IntakeTarget{0, true, 30.0f});
+  Send(intake::topics::kTeleopTarget, IntakeTarget{true, 30.0f});
   EXPECT_EQ(out.intake, before + 1);
   EXPECT_NEAR(Last<IntakeTarget>(intake::topics::kTarget).roller_velocity_rps(),
               30.0, 1e-6);
 }
 
-TEST(Arbiter, DisabledEStopAndTestDriveNothing) {
+TEST_F(ArbiterTest, SelectsNothingOnceTheDriverStationGoesSilent) {
+  Mode(kTeleopEnabled);
+  Send(drivetrain::topics::kTeleopTarget, Chassis(1.5));
+  ASSERT_TRUE(Last<ChassisTarget>(drivetrain::topics::kTarget).enabled());
+
+  // The bridge stops forwarding packets. No packet says "disabled", but the
+  // last one ages past the command timeout, so update() drops to kNone and
+  // stops every lane once.
+  hw.reset();
+  const int before = out.chassis;
+  sim.step(300ms);
+  EXPECT_EQ(out.chassis, before + 1);
+  EXPECT_FALSE(Last<ChassisTarget>(drivetrain::topics::kTarget).enabled());
+  EXPECT_FALSE(Last<ShooterTarget>(shooter::topics::kTarget).enabled());
+  EXPECT_FALSE(Last<IntakeTarget>(intake::topics::kTarget).enabled());
+
+  // The teleop producer keeps talking; none of it gets out.
+  Send(drivetrain::topics::kTeleopTarget, Chassis(1.5));
+  EXPECT_EQ(out.chassis, before + 1);
+}
+
+TEST(Arbiter, DisabledEStopTestAndDetachedDriveNothing) {
   for (const std::uint32_t flags :
        {std::uint32_t{ds::kDsAttached},
-        std::uint32_t{ds::kEnabled | ds::kTeleop | ds::kEStop},
-        std::uint32_t{ds::kEnabled | ds::kTest}}) {
+        std::uint32_t{ds::kEnabled | ds::kTeleop | ds::kEStop |
+                      ds::kDsAttached},
+        std::uint32_t{ds::kEnabled | ds::kTest | ds::kDsAttached},
+        // Enabled teleop from a packet that does not say the DS is attached.
+        std::uint32_t{ds::kEnabled | ds::kTeleop}}) {
     Sim sim{RobotConfig()};
     sim.add<Arbiter>("arbiter");
     Probe& out = sim.add<Probe>("probe");
-    sim.publish(driver_station::topics::kState, DsState(flags));
+    SimHardware hw{sim};
+    hw.set_driver_station(DsState(flags));
     sim.step(10ms);
     sim.publish(drivetrain::topics::kTeleopTarget, Chassis(1.0));
     sim.publish(drivetrain::topics::kAutoTarget, Chassis(1.0));
@@ -181,12 +210,11 @@ TEST(Arbiter, DisabledEStopAndTestDriveNothing) {
   }
 }
 
-// The whole teleop path, with the same four nodes the launcher starts and
+// The whole teleop path, with the same nodes the launcher starts and
 // nothing stubbed: a joystick packet lands on /hw/state/driver_station (sent
-// by SimHardware, as the bridge forwards it), the driver station node decodes
-// it, the operator interface maps it to a request, the arbiter admits it
-// because the mode says teleop, and the drivetrain resolves it into
-// per-module swerve requests.
+// by SimHardware, as the bridge forwards it), the operator interface maps it
+// to a request, the arbiter admits it because the mode says teleop, and the
+// drivetrain resolves it into per-module swerve requests.
 class TeleopChain : public ::testing::Test {
  protected:
   void Push(const ds::DriverStationData& data) {
@@ -203,8 +231,6 @@ class TeleopChain : public ::testing::Test {
   }
 
   Sim sim{RobotConfig()};
-  driver_station::DriverStation& driver_station_node =
-      sim.add<driver_station::DriverStation>("driver_station");
   operator_interface::OperatorInterface& operator_interface_node =
       sim.add<operator_interface::OperatorInterface>("operator_interface");
   Arbiter& arbiter_node = sim.add<Arbiter>("arbiter");
@@ -243,6 +269,60 @@ TEST_F(TeleopChain, ReleasingTheStickStopsTheModulesWithoutWaitingForTimeout) {
     EXPECT_NEAR(hw.motor_request("drivetrain", module.drive).demand, 0.0, 1e-9)
         << module.name;
   }
+}
+
+TEST(Arbiter, RoutesTomlConfiguredSubsystemFromOperatorInterfaceToTarget) {
+  Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.arbiter]
+period_us = 20000
+
+[subsystems.operator_interface]
+period_us = 20000
+
+[subsystems.wrist]
+period_us = 20000
+teleop_button = 3
+teleop_demand = 25.0
+telemetry = true
+
+[subsystems.wrist.motors.wrist_motor]
+can_id = 1
+)");
+  sim.add<operator_interface::OperatorInterface>("operator_interface");
+  sim.add<Arbiter>("arbiter");
+  SimHardware hw{sim};
+
+  ds::DriverStationData pressed = DsState(kTeleopEnabled);
+  pressed.joysticks[0].connected = true;
+  pressed.joysticks[0].axis_count = 4;
+  pressed.joysticks[0].button_count = 12;
+  pressed.joysticks[0].buttons = 1u << 2;  // button 3
+  hw.set_driver_station(pressed);
+  sim.step(10ms);
+
+  const auto teleop = sim.latest<GenericTarget>("/wrist/target");
+  ASSERT_TRUE(teleop.has_value());
+  EXPECT_EQ(teleop->enabled, 1u);
+  EXPECT_DOUBLE_EQ(teleop->demand, 25.0);
+
+  // Mode switch to autonomous emits a stop on /wrist/target before auto speaks.
+  hw.set_driver_station(DsState(kAutoEnabled));
+  sim.step(10ms);
+  const auto stopped = sim.latest<GenericTarget>("/wrist/target");
+  ASSERT_TRUE(stopped.has_value());
+  EXPECT_EQ(stopped->enabled, 0u);
+  EXPECT_DOUBLE_EQ(stopped->demand, 0.0);
+
+  sim.publish("/wrist/target/auto", GenericTarget{1, {}, -12.5});
+  sim.step(10ms);
+  const auto auto_target = sim.latest<GenericTarget>("/wrist/target");
+  ASSERT_TRUE(auto_target.has_value());
+  EXPECT_EQ(auto_target->enabled, 1u);
+  EXPECT_DOUBLE_EQ(auto_target->demand, -12.5);
 }
 
 }  // namespace
