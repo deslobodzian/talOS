@@ -45,9 +45,9 @@ cc_test(
     deps = [
         ":telemetry",
         "//talOS/devices:testing",
+        "//talOS/node:testing",
         "//talOS/telemetry:schema",
         "//talOS/telemetry:wire",
-        "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],
