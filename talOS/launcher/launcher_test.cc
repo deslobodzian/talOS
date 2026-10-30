@@ -886,10 +886,27 @@ TEST(LauncherGraphTest, ProbeReportsABinaryThatIsNotThere) {
 TEST(LauncherBundleTest, ResolveBinaryPrefersOverrideThenBazelBin) {
   std::map<std::string, std::string> overrides;
   overrides["//example/alpha:node"] = "/bin/alpha";
+  overrides["@override_mod//:node"] = "/bin/override_mod";
   EXPECT_EQ(ResolveBinary("//example/alpha:node", overrides), "/bin/alpha");
+  EXPECT_EQ(ResolveBinary("@override_mod//:node", overrides),
+            "/bin/override_mod");
   EXPECT_EQ(ResolveBinary("//example/beta:node", overrides),
             "bazel-bin/example/beta/node");
-  EXPECT_EQ(ResolveBinary("/opt/talos/bin/beta"), "/opt/talos/bin/beta");
+  EXPECT_EQ(ResolveBinary("@wrist//:node", overrides),
+            "bazel-bin/external/wrist+/node");
+  EXPECT_EQ(ResolveBinary("@wrist//pkg:node", overrides),
+            "bazel-bin/external/wrist+/pkg/node");
+  EXPECT_EQ(ResolveBinary("@@wrist+//:node", overrides),
+            "bazel-bin/external/wrist+/node");
+  EXPECT_EQ(ResolveBinary("@@wrist+//pkg:node", overrides),
+            "bazel-bin/external/wrist+/pkg/node");
+  // The bundle manifest spells the baked (canonical) label while the robot
+  // config spells the apparent one; the override still wins either way.
+  overrides["@@wrist+//:node"] = "/opt/talos/bundles/current/bin/wrist";
+  EXPECT_EQ(ResolveBinary("@wrist//:node", overrides),
+            "/opt/talos/bundles/current/bin/wrist");
+  EXPECT_EQ(ResolveBinary("@@wrist+//:node", overrides),
+            "/opt/talos/bundles/current/bin/wrist");
 }
 
 TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
