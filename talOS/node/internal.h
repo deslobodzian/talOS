@@ -10,6 +10,7 @@
 #include <string_view>
 
 #include "talOS/events/callback.h"
+#include "talOS/events/delivery.h"
 #include "talOS/events/time.h"
 
 namespace talos {
@@ -50,6 +51,9 @@ class LoopPort {
   virtual void arm_timer(std::uint16_t id, Time first, Duration period) = 0;
   virtual bool send(std::uint16_t id, std::span<const std::byte> bytes) = 0;
   virtual Time now() const = 0;
+  // Chosen by NodeAccess::start, once the node has registered everything.
+  // A loop that has no choice (replay delivers what the log says) ignores it.
+  virtual void set_delivery(event::Delivery delivery) = 0;
 
   // The world outside the loop: a byte topic, which the loop neither
   // dispatches nor logs. By default an RTMS queue created on the first write,
@@ -87,6 +91,11 @@ class LoopPortFor : public LoopPort {
     return loop_.send_message(id, bytes);
   }
   Time now() const override { return loop_.monotonic_now(); }
+  void set_delivery(event::Delivery delivery) override {
+    if constexpr (requires { loop_.set_delivery(delivery); }) {
+      loop_.set_delivery(delivery);
+    }
+  }
 
  private:
   Loop& loop_;

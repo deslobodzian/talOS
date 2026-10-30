@@ -10,8 +10,7 @@
 #   --check      report every component; install nothing; exit 1 if a
 #                required one is missing or the wrong version
 #   --yes        no prompts (passes -y / --noconfirm to the package manager)
-#   --no-studio  skip Node 22 + pnpm (Studio's pnpm loop); Tauri's system
-#                libs stay, since `bazel build //...` builds the shell
+#   --no-studio  skip Node 22 + pnpm (Studio's pnpm loop)
 #   --no-rio     skip JDK 17 and ./gradlew installRoboRioToolchain
 #   --no-lint    skip clang-format-18, clang-tidy-18, buildifier
 #   --verify     afterwards build the launcher and the robot's nodes, then run
@@ -27,8 +26,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RIO_DIR="$ROOT/2026-robot/controller_processor/rio"
 ROBOT_CONFIG="2026-robot/main_processor/configuration/robot.toml"
 
-# Pins. Bazel itself, Python 3.11, Node 22.14.0, pnpm and Rust inside Bazel
-# are hermetic (MODULE.bazel); these are the tools that live outside it.
+# Pins. Bazel itself, Python 3.11, Node 22.14.0 and pnpm inside Bazel are
+# hermetic (MODULE.bazel); these are the tools that live outside it.
 BAZELISK_VERSION="v1.30.0"
 BUILDIFIER_VERSION="8.2.1"
 # sha256 of the GitHub release assets, checked before anything is installed.
@@ -66,7 +65,6 @@ STATES=()
 NOTES=()
 HINTS=()
 DETAIL=""
-MISSING_PKGS=""
 
 say() { printf 'setup: %s\n' "$*"; }
 warn() { printf 'setup: warning: %s\n' "$*" >&2; }
@@ -151,7 +149,7 @@ detect_os() {
         *" ubuntu "*|*" debian "*) PM=apt; YFLAG="-y" ;;
         *" fedora "*) PM=dnf; YFLAG="-y" ;;
         *" arch "*) PM=pacman; YFLAG="--noconfirm" ;;
-        *) die "unsupported distribution: $DISTRO. Supported: Ubuntu 24.04+, Debian 13+, Fedora 39+, Arch (apt/dnf/pacman), macOS (brew). Elsewhere install by hand: git curl unzip zip, g++ >= $GCC_MIN, python3, bazelisk as 'bazel', Tauri's GTK/WebKit2GTK 4.1 dev libs, Node $NODE_MAJOR + pnpm $PNPM_VERSION (corepack), JDK $JDK_MAJOR, clang-format/clang-tidy $LLVM_MAJOR, buildifier $BUILDIFIER_VERSION — see docs/INSTALL.md" ;;
+        *) die "unsupported distribution: $DISTRO. Supported: Ubuntu 24.04+, Debian 13+, Fedora 39+, Arch (apt/dnf/pacman), macOS (brew). Elsewhere install by hand: git curl unzip zip, g++ >= $GCC_MIN, python3, bazelisk as 'bazel', Node $NODE_MAJOR + pnpm $PNPM_VERSION (corepack), JDK $JDK_MAJOR, clang-format/clang-tidy $LLVM_MAJOR, buildifier $BUILDIFIER_VERSION — see docs/INSTALL.md" ;;
       esac
       ;;
     *) die "unsupported OS: $(uname -s). Windows: run tools/setup.ps1 (sets up WSL2)" ;;
@@ -160,24 +158,6 @@ detect_os() {
 }
 
 # --- package manager ---------------------------------------------------------
-pkg_has() {
-  case "$PM" in
-    apt) dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed' ;;
-    dnf) rpm -q --whatprovides "$1" >/dev/null 2>&1 ;;
-    pacman) pacman -Qi "$1" >/dev/null 2>&1 || pacman -Qg "$1" >/dev/null 2>&1 ;;
-    brew) have brew && brew list --versions "$1" >/dev/null 2>&1 ;;
-  esac
-}
-
-# Sets MISSING_PKGS to the subset of "$@" not installed; returns 1 if any.
-pkgs_missing() {
-  local p
-  MISSING_PKGS=""
-  for p in "$@"; do pkg_has "$p" || MISSING_PKGS="$MISSING_PKGS $p"; done
-  MISSING_PKGS="${MISSING_PKGS# }"
-  [ -z "$MISSING_PKGS" ]
-}
-
 pkg_install() {
   case "$PM" in
     apt)
@@ -392,28 +372,7 @@ install_bazel() {
   [ "$p" = "$dest" ] || hint "'bazel' resolves to $p ahead of $dest; remove it or fix PATH"
 }
 
-# --- tauri libs (Linux), studio: node, pnpm ---------------------------------
-tauri_pkgs() {
-  case "$PM" in
-    apt) printf '%s\n' pkg-config libdbus-1-dev libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
-      libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf ;;
-    dnf) printf '%s\n' pkgconf-pkg-config webkit2gtk4.1-devel gtk3-devel libappindicator-gtk3-devel \
-      librsvg2-devel openssl-devel libxdo-devel dbus-devel patchelf ;;
-    pacman) printf '%s\n' pkgconf webkit2gtk-4.1 gtk3 libappindicator-gtk3 librsvg openssl \
-      xdotool dbus patchelf base-devel ;;
-  esac
-}
-detect_tauri() {
-  # shellcheck disable=SC2046
-  if pkgs_missing $(tauri_pkgs); then DETAIL="$(tauri_pkgs | wc -l | tr -d ' ') packages present"; return 0; fi
-  DETAIL="missing: $MISSING_PKGS"
-  return 1
-}
-install_tauri() {
-  # shellcheck disable=SC2086
-  pkg_install $MISSING_PKGS
-}
-
+# --- studio: node, pnpm -------------------------------------------------------
 # brew's node@22 is keg-only; use it for this run and tell the user.
 use_node_keg() {
   [ "$OS" = macos ] && have brew || return 0
@@ -686,8 +645,6 @@ fi
 component "python3" detect_python install_python
 component "bazel (bazelisk)" detect_bazel install_bazel
 
-# Linux always: //studio/src-tauri:desktop is part of `bazel build //...`.
-[ "$OS" = linux ] && component "tauri system libs" detect_tauri install_tauri
 if [ "$STUDIO" = 1 ]; then
   component "node $NODE_MAJOR" detect_node install_node
   component "pnpm $PNPM_VERSION" detect_pnpm install_pnpm

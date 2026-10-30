@@ -181,6 +181,39 @@ TEST(SimulatedEventLoop, SetpointWatcherKeepsTheNewestValue) {
   EXPECT_FLOAT_EQ(robot.efforts().back(), 5.0F);
 }
 
+// Under BEFORE_TIMERS a message injected before a timer's deadline reaches
+// the handler that timer runs, and nothing drains in between; under POLL the
+// timer at the same instant runs first and the drain follows it.
+TEST(SimulatedEventLoop, BeforeTimersDrainsRightBeforeEachTimer) {
+  const auto first_effort = [](Delivery delivery) {
+    SimulationEnvironment environment;
+    SimulatedEventLoop<> loop{environment};
+    loop.set_delivery(delivery);
+    TestRobot<SimulatedEventLoop<>> robot{loop, simulated_topics(), 1.0F};
+    robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
+                                         10ms);
+    loop.inject(simulated_topics().setpoint,
+                EventsTest::SetpointMessage{1, 5.0F});
+    loop.run_for(25ms);
+    EXPECT_EQ(robot.control_count(), 3u);
+    if (delivery == Delivery::BEFORE_TIMERS) {
+      EXPECT_EQ(loop.drains(), robot.control_count());
+    } else {
+      EXPECT_EQ(loop.drains(), 25u);
+    }
+    return robot.efforts().front();
+  };
+  EXPECT_FLOAT_EQ(first_effort(Delivery::BEFORE_TIMERS), 5.0F);
+  EXPECT_FLOAT_EQ(first_effort(Delivery::POLL), 0.0F);
+}
+
+TEST(SimulatedEventLoop, DeliveryIsFixedOnceTheRunStarts) {
+  SimulationEnvironment environment;
+  SimulatedEventLoop<> loop{environment};
+  loop.run_for(1ms);
+  EXPECT_THROW(loop.set_delivery(Delivery::BEFORE_TIMERS), std::logic_error);
+}
+
 TEST(SimulatedEventLoop, ExitStopsTheLoop) {
   SimulationEnvironment environment;
   SimulatedEventLoop<> loop{environment};

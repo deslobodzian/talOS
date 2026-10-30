@@ -13,19 +13,17 @@ exports_files([
 npm_link_all_packages(name = "node_modules")
 
 # One schema and the monorepo's flatc tool generate both C++ and TS bindings.
-# Single contract home: //studio/schema owns telemetry.fbs.
+# Single contract home: //talOS/telemetry owns telemetry.fbs.
 genrule(
     name = "telemetry_ts",
-    srcs = ["//studio/schema:telemetry.fbs"],
+    srcs = ["//talOS/telemetry:telemetry.fbs"],
     outs = [
         "src/generated/talos/telemetry.ts",
-        "src/generated/talos/telemetry/channel.ts",
+        "src/generated/talos/telemetry/channel-info.ts",
         "src/generated/talos/telemetry/frame.ts",
-        "src/generated/talos/telemetry/ghost.ts",
         "src/generated/talos/telemetry/pose.ts",
-        "src/generated/talos/telemetry/target.ts",
     ],
-    cmd = "$(location @flatbuffers//:flatc) --ts -o $(RULEDIR)/src/generated $(location //studio/schema:telemetry.fbs)",
+    cmd = "$(location @flatbuffers//:flatc) --ts -o $(RULEDIR)/src/generated $(location //talOS/telemetry:telemetry.fbs)",
     tools = ["@flatbuffers//:flatc"],
 )
 
@@ -151,6 +149,6 @@ test_suite(
         ":typecheck",
         ":view_test",
         "//studio/bridge:system_test",
-        "//studio/schema:wire_test",
+        "//talOS/telemetry:wire_test",
     ],
 )

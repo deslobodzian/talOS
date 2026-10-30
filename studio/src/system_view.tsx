@@ -48,9 +48,9 @@ export type SystemState = {
 
   // What the launcher declared before it spawned anything, when the bridge was
   // given it. Null is the ordinary case rather than an error: `--declared` is
-  // optional, and the desktop UDP path has no HTTP endpoint to ask. Every view
-  // here reads null as "not offered" and shows nothing at all, because an empty
-  // panel and a count of zero would both be claims nobody made.
+  // optional. Every view here reads null as "not offered" and shows nothing at
+  // all, because an empty panel and a count of zero would both be claims
+  // nobody made.
   declared: DeclaredGraph|null;
   declaredError: string;
 };
@@ -800,6 +800,7 @@ export function OverviewTab(
 // --- agent ------------------------------------------------------------------
 
 const METHOD_HELP: Record<string, string> = {
+  get_latest: 'Newest retained sample with units, labels, sequence and age.',
   get_schema_tree: 'Leaf topics observed in retained telemetry, with types.',
   query_state_at: 'A snapshot at an exact timestamp, or the one before it.',
   scan_channel_events: 'Sample ranges where a channel satisfies a condition.',
@@ -810,6 +811,7 @@ const METHOD_HELP: Record<string, string> = {
 };
 
 const METHOD_TEMPLATE: Record<string, string> = {
+  get_latest: '{}',
   get_schema_tree: '{}',
   query_state_at: '{\n  "timestamp_ns": "0",\n  "mode": "at_or_before"\n}',
   scan_channel_events:

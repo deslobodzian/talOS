@@ -26,8 +26,9 @@ Every tunable (voltages, eject time, tolerance, height) is a parameter read
 from the robot config: `node.param<T>("key")` in C++, `node.param("key")` in
 Python.
 
-The nodes exist twice, in C++ (`cpp/`) and in Python (`py/`), with the same
-states, topics, parameters and tests. Either set runs the same robot.
+The nodes are implemented once in C++ (`cpp/`) and wrapped in Python (`py/`)
+via `TALOS_EXPORT_NODE` and `talos.cpp_node`, so both sets of binaries and
+tests run the exact same implementation without duplicating logic.
 
 ## Three layers
 
@@ -53,8 +54,8 @@ config/
   subsystems/      intake.toml  elevator.toml  superstructure.toml: devices + params
   robot.toml       the example robot's manifest, launching cpp/
   robot_py.toml    the same manifest, launching py/ (only the `node =` lines differ)
-cpp/               the C++ nodes and their test
-py/                the Python nodes and their test
+cpp/               the C++ node implementations, shared library, and test
+py/                Python wrappers (via talos.cpp_node) and Python Sim test
 ```
 
 ## Test it
@@ -101,9 +102,10 @@ Nothing in the example publishes `/superstructure/target`; a driver or
 autonomous node would. So the live graph comes up, sits STOWED, and holds the
 elevator at 0. The subscription is declared `{.optional = true}`, so the
 graph check accepts it having no publisher. The check reports no errors and
-two expected warnings: `/hw/state/driver_station` and `/superstructure/state`
-are published but nothing reads them, because the example has no driver
-node. On a real robot, a driver node reads the driver station, publishes
+three expected warnings: `/hw/state/driver_station`, `/hw/status` and
+`/superstructure/state` are published but nothing reads them, because the
+example has no driver or telemetry node. On a real robot, a driver node reads
+the driver station, publishes
 `/superstructure/target` and watches `/superstructure/state`.
 
 ## Write your own mechanism
@@ -214,104 +216,30 @@ each generated piece, taking a wrist that goes to an angle as an example.
    EXPECT_TRUE(sim.latest<WristStatus>(topics::kWristStatus)->at_goal());
    ```
 
-## Python twin
+## Wrapping C++ nodes in Python (`py/`)
 
-`py/intake.py`, `py/elevator.py` and `py/superstructure.py` are the same
-nodes on `import talos`. They use the same messages (`:messages_py`) and the
-same robot (`config/robot_py.toml`), and `py/superstructure_test.py` holds
-the same tests. Here is the elevator side by side; the code differs only in
-syntax.
-
-<table>
-<tr><th>C++ (<code>cpp/elevator.h</code>)</th><th>Python (<code>py/elevator.py</code>)</th></tr>
-<tr><td>
+Instead of maintaining a duplicate Python implementation of the C++ mechanisms,
+`cpp/mechanisms_abi.cc` exports the C++ classes with `TALOS_EXPORT_NODE`:
 
 ```cpp
-class Elevator {
- public:
-  using State = ElevatorState;
-
-  explicit Elevator(talos::Node& node)
-      : lift_{node, "lift"},
-        goal_{node.subscribe<ElevatorGoal>(
-            topics::kElevatorGoal)},
-        status_{node.publish<ElevatorStatus>(
-            topics::kElevatorStatus)},
-        sm_{node, State::STOWED},
-        tolerance_rot_{
-            node.param<double>("tolerance_rot")} {}
-
-  void update() {
-    if (goal_.fresh()) goal_rot_ = goal_->height_rot();
-    lift_.set_motion_magic(goal_rot_);
-
-    const double height = lift_.position();
-    const bool at_goal =
-        lift_.connected() &&
-        std::abs(height - goal_rot_) <= tolerance_rot_;
-    if (!at_goal) sm_.go(State::MOVING);
-    else if (goal_rot_ == 0.0) sm_.go(State::STOWED);
-    else sm_.go(State::AT_GOAL);
-
-    status_.send(ElevatorStatus{
-        sm_.state(), height, goal_rot_, at_goal});
-  }
-
- private:
-  talos::Motor lift_;
-  talos::Subscription<ElevatorGoal> goal_;
-  talos::Publisher<ElevatorStatus> status_;
-  talos::StateMachine<State> sm_;
-  double tolerance_rot_;
-  double goal_rot_ = 0.0;
-};
-
-TALOS_NODE(demo::Elevator)  // elevator.cc
+TALOS_EXPORT_NODE(intake, demo::Intake)
+TALOS_EXPORT_NODE(elevator, demo::Elevator)
+TALOS_EXPORT_NODE(superstructure, demo::Superstructure)
 ```
 
-</td><td>
+and `py/intake.py`, `py/elevator.py` and `py/superstructure.py` wrap them with
+`talos.cpp_node`:
 
 ```python
-from demo import topics
-from demo.ElevatorState import ElevatorState as State
+import talos
 
-class Elevator:
-    def __init__(self, node):
-        self.lift = talos.Motor(node, "lift")
-        self.goal = node.subscribe(
-            ElevatorGoal, topics.ELEVATOR_GOAL)
-        self.status = node.publish(
-            ElevatorStatus, topics.ELEVATOR_STATUS)
-        self.sm = talos.StateMachine(node, State.STOWED, states=State)
-        self.tolerance_rot = node.param("tolerance_rot")
-        self.goal_rot = 0.0
-
-    def update(self):
-        if self.goal.fresh():
-            self.goal_rot = self.goal.value.height_rot
-        self.lift.set_motion_magic(self.goal_rot)
-
-        height = self.lift.position
-        at_goal = (self.lift.connected and
-                   abs(height - self.goal_rot)
-                   <= self.tolerance_rot)
-        if not at_goal:
-            self.sm.go(State.MOVING)
-        elif self.goal_rot == 0.0:
-            self.sm.go(State.STOWED)
-        else:
-            self.sm.go(State.AT_GOAL)
-
-        self.status.send(
-            state=self.sm.state, height_rot=height,
-            goal_rot=self.goal_rot, at_goal=at_goal)
-
-
-# talos_py_node(class_name = "Elevator") makes main
+Elevator = talos.cpp_node(
+    "examples/superstructure/cpp/libmechanisms.so", "elevator")
 ```
 
-</td></tr>
-</table>
+When a subsystem is written directly in Python, it uses the same `talos.Node`,
+`talos.Motor`, and `talos.StateMachine` concepts (all backed by the single C++
+implementation through `talOS/node_api`).
 
 Python reads message fields as snake_case attributes named as in the .fbs
 (`goal.value.height_rot`), and `send(**fields)` takes the same names; any

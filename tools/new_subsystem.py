@@ -157,18 +157,38 @@ struct @PASCAL@State {
 }
 """
 
+POSITION_FBS = """\
+namespace @NAME@;
+
+// What /@NAME@/target asks for. The node drives the motor with Motion Magic
+// only while the robot is enabled and this is fresh and enabled.
+struct @PASCAL@Target {
+  enabled:bool;
+  position_rot:double;
+}
+
+// What the @NAME@ is doing, published every tick.
+struct @PASCAL@State {
+  enabled:bool;
+  position_rot:double;
+  connected:bool;
+  at_goal:bool;
+}
+"""
+
 MESSAGES_BUILD = """\
 # @PASCAL@Target / @PASCAL@State (namespace @NAME@) and the @NAME@'s topics.
-# /@NAME@/target has one writer. Nothing publishes it yet: give each producer
-# its own lane here ("teleop_target": "/@NAME@/target/teleop") and a line in
-# the arbiter that picks one and republishes it on /@NAME@/target.
+# /@NAME@/target has one writer (the arbiter); teleop and autonomous producers
+# publish on their own lanes (/target/teleop, /target/auto).
 talos_messages(
     name = "messages",
     srcs = ["@NAME@_message.fbs"],
     include_prefix = "@NAME@",
     topics = {
+        "auto_target": "/@NAME@/target/auto",
         "state": "/@NAME@/state",
         "target": "/@NAME@/target",
+        "teleop_target": "/@NAME@/target/teleop",
     },
 )
 """
@@ -262,6 +282,53 @@ class @PASCAL@ {
 
 }  // namespace @NAME@
 """
+CC_POSITION_HEADER = """\
+#pragma once
+
+#include <cmath>
+
+@INCLUDES@
+
+namespace @NAME@ {
+
+// Drives the motor to the position /@NAME@/target asks for with Motion Magic
+// and reports what it did on /@NAME@/state.
+class @PASCAL@ {
+ public:
+  using Target = @PASCAL@Target;
+  using State = @PASCAL@State;
+
+  explicit @PASCAL@(talos::Node& node)
+      : node_{node},
+        motor_{node, "@NAME@_motor"},
+        tolerance_rot_{node.param<double>("tolerance_rot", 0.05)},
+        target_{node.subscribe<Target>(topics::kTarget, {.optional = true})},
+        state_{node.publish<State>(topics::kState)} {}
+
+  void update() {
+    const bool enabled = talos::robot_enabled(node_);
+    const bool active = enabled && target_.fresh() && target_->enabled();
+    if (active) {
+      goal_rot_ = target_->position_rot();
+      motor_.set_motion_magic(goal_rot_);
+    }
+    const double pos = motor_.position();
+    const bool at_goal = active && std::abs(pos - goal_rot_) <= tolerance_rot_;
+    state_.send(State{enabled, pos, motor_.connected(), at_goal});
+  }
+
+ private:
+  talos::Node& node_;
+  talos::Motor motor_;
+  double tolerance_rot_;
+  double goal_rot_ = 0.0;
+  talos::Subscription<Target> target_;
+  talos::Publisher<State> state_;
+};
+
+}  // namespace @NAME@
+"""
+
 
 CC_SOURCE = """\
 #include "@NAME@/@NAME@.h"
@@ -493,6 +560,38 @@ class @PASCAL@:
                         connected=self.motor.connected)
 '''
 
+PY_POSITION_NODE = '''\
+"""@PASCAL@: one motor driven to the position /@NAME@/target asks for."""
+
+import talos
+from @NAME@ import topics
+from @NAME@.@PASCAL@State import @PASCAL@State
+from @NAME@.@PASCAL@Target import @PASCAL@Target
+
+
+class @PASCAL@:
+    def __init__(self, node):
+        self.node = node
+        self.motor = talos.Motor(node, "@NAME@_motor")
+        self.tolerance_rot = node.param("tolerance_rot", 0.05)
+        self.goal_rot = 0.0
+        self.target = node.subscribe(@PASCAL@Target, topics.TARGET,
+                                     optional=True)
+        self.state = node.publish(@PASCAL@State, topics.STATE)
+
+    def update(self):
+        enabled = talos.robot_enabled(self.node)
+        target = self.target.value
+        active = enabled and self.target.fresh() and target.enabled
+        if active:
+            self.goal_rot = target.position_rot
+            self.motor.set_motion_magic(self.goal_rot)
+        pos = self.motor.position
+        at_goal = active and abs(pos - self.goal_rot) <= self.tolerance_rot
+        self.state.send(enabled=enabled, position_rot=pos,
+                        connected=self.motor.connected, at_goal=at_goal)
+'''
+
 PY_TEST = '''\
 """Node tests: the class on talos.testing.Sim, and the binary."""
 
@@ -592,7 +691,13 @@ SUBSYSTEM_TOML = """\
 name = "@NAME@"
 node = "//@PACKAGE@:node"
 period_us = @PERIOD@
-
+# Zero-code robot wiring: uncomment to arbitrate /@NAME@/target, bind a Driver
+# Station button on /@NAME@/target/teleop, and stream /@NAME@/state to Studio
+# without editing any C++ or Python files in other packages.
+# arbitrate = true
+# teleop_button = 3
+# teleop_demand = 20.0
+# telemetry = true
 # Device names are robot-wide, so the key carries the subsystem's name.
 [motors.@NAME@_motor]
 type = "TalonFX"
@@ -622,14 +727,43 @@ name = "@NAME@"
 path = "subsystems/@NAME@.toml"
 """
 
+STANDALONE_MODULE = """\
+module(name = "@NAME@", version = "0.1.0")
+
+bazel_dep(name = "talos", version = "0.1.0")
+@EXTRA_DEPS@"""
+
+STANDALONE_DEFAULTS_TOML = """\
+# @PASCAL@ subsystem defaults, shipped by the @@NAME@ repository.
+# A robot manifest layers its own overrides (physical CAN ids, inversions, and
+# tuned slot0 gains) on top of this file via `defaults = ...`.
+[subsystem]
+name = "@NAME@"
+node = "@@NAME@//:node"
+period_us = @PERIOD@
+
+[motors.@NAME@_motor]
+type = "TalonFX"
+bus = "rio"
+inverted = false
+brake = true
+supply_limit_a = 40.0
+stator_limit_a = 80.0
+max_voltage = 12.0
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 100.0
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+"""
+
 
 # ---------------------------------------------------------------- generation
 
-def package_files(name, lang):
+def package_files(name, lang, standalone=False, kind="velocity"):
     """{relative path: content} of the new package."""
     values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US)
     messages = fill(MESSAGES_BUILD, **values)
-    files = {f"{name}_message.fbs": fill(FBS, **values)}
+    fbs_template = POSITION_FBS if kind == "position" else FBS
+    files = {f"{name}_message.fbs": fill(fbs_template, **values)}
     if lang == "cpp":
         node_includes = [f"{name}/topics.h",
                          f"{name}/{name}_message_generated.h",
@@ -638,14 +772,23 @@ def package_files(name, lang):
                          f"{name}/{name}.h", "talOS/devices/testing.h",
                          "talOS/node/testing.h"]
         data = ["testdata/robot.toml", f"testdata/{name}.toml", ":node"]
+        build = fill(CC_BUILD, MESSAGES=messages,
+                     DATA="[\n" + string_list(data, 4), **values)
+        if standalone:
+            build = build.replace('"//talOS/', '"@talos//talOS/')
+            build = ('exports_files(["defaults.toml"])\n\n' + build)
+        hdr_template = CC_POSITION_HEADER if kind == "position" else CC_HEADER
+        cc_test = fill(CC_TEST, INCLUDES=includes(test_includes), **values)
+        if kind == "position":
+            cc_test = (cc_test
+                       .replace("Mode::kVelocity", "Mode::kMotionMagic")
+                       .replace("velocity_rps()", "position_rot()"))
         files.update({
-            "BUILD": fill(CC_BUILD, MESSAGES=messages,
-                          DATA="[\n" + string_list(data, 4), **values),
-            f"{name}.h": fill(CC_HEADER, INCLUDES=includes(node_includes),
+            "BUILD": build,
+            f"{name}.h": fill(hdr_template, INCLUDES=includes(node_includes),
                               **values),
             f"{name}.cc": fill(CC_SOURCE, **values),
-            "node_test.cc": fill(CC_TEST, INCLUDES=includes(test_includes),
-                                 **values),
+            "node_test.cc": cc_test,
             "testdata/robot.toml": fill(CC_TESTDATA_ROBOT, **values),
             f"testdata/{name}.toml": fill(CC_TESTDATA_SUBSYSTEM, **values),
         })
@@ -663,14 +806,34 @@ def package_files(name, lang):
         from_imports = "\n".join(
             f"from {module} import {imports[module]}"
             for module in sorted(imports, key=str.lower))
+        build = fill(PY_BUILD, MESSAGES=messages,
+                     DATA="[\n" + string_list(data, 4), **values)
+        if standalone:
+            build = build.replace('"//talOS/', '"@talos//talOS/')
+            build = ('exports_files(["defaults.toml"])\n\n' + build)
+        node_template = PY_POSITION_NODE if kind == "position" else PY_NODE
+        py_test = fill(PY_TEST, FROM_IMPORTS=from_imports, **values)
+        if kind == "position":
+            py_test = (py_test
+                       .replace("velocity_rps=30.0", "position_rot=30.0")
+                       .replace("talos.Mode.VELOCITY", "talos.Mode.MOTION_MAGIC")
+                       .replace("state.velocity_rps, 12.5", "state.position_rot, 0.0"))
         files.update({
-            "BUILD": fill(PY_BUILD, MESSAGES=messages,
-                          DATA="[\n" + string_list(data, 4), **values),
-            f"{name}.py": fill(PY_NODE, **values),
-            "node_test.py": fill(PY_TEST, FROM_IMPORTS=from_imports,
-                                 **values),
+            "BUILD": build,
+            f"{name}.py": fill(node_template, **values),
+            "node_test.py": py_test,
             "testdata/robot.toml": fill(PY_TESTDATA_ROBOT, **values),
         })
+    if standalone:
+        extra_deps = (
+            'bazel_dep(name = "rules_cc", version = "0.2.18")\n'
+            'bazel_dep(name = "googletest", version = "1.17.0.bcr.2")\n'
+            if lang == "cpp" else
+            'bazel_dep(name = "rules_python", version = "2.0.1")\n'
+        )
+        files["MODULE.bazel"] = fill(
+            STANDALONE_MODULE, EXTRA_DEPS=extra_deps, **values)
+        files["defaults.toml"] = fill(STANDALONE_DEFAULTS_TOML, **values)
     return files
 
 
@@ -705,16 +868,16 @@ def used_can_ids(configuration):
     return ids
 
 
-def insert_label(text, attribute, label, peers, path):
-    """`text` with `label` added to the `attribute = [...]` list of the
-    talos_bundle, beside the entries matching `peers` in sorted position."""
-    bundle = re.search(r"^talos_bundle\(\n", text, re.M)
+def insert_label(text, attribute, label, peers, path, rule_name="talos_bundle"):
+    """`text` with `label` added to the `attribute = [...]` list of `rule_name`,
+    beside the entries matching `peers` in sorted position."""
+    bundle = re.search(rf"^{re.escape(rule_name)}\(\n", text, re.M)
     if not bundle:
-        raise Refused(f"{path}: no talos_bundle( call to add the node to")
+        raise Refused(f"{path}: no {rule_name}( call to add the node to")
     match = re.compile(rf"^( +){attribute} = \[\n((?:\1 +\"[^\"\n]*\",\n)*)\1\],\n",
                        re.M).search(text, bundle.end())
     if not match:
-        raise Refused(f"{path}: talos_bundle has no one-label-per-line "
+        raise Refused(f"{path}: {rule_name} has no one-label-per-line "
                       f"`{attribute} = [...]` list; add {label} by hand")
     lines = match.group(2).splitlines(keepends=True)
     indent = (re.match(r" *", lines[0]).group(0) if lines
@@ -739,7 +902,7 @@ def manifest_names(robot_toml):
     return {entry.get("name") for entry in subsystems}
 
 
-def plan(root, robot, name, lang):
+def plan(root, robot, name, lang, kind="velocity"):
     """([(path, old content or None, new content)], placeholder CAN id)."""
     if problem := check_name(name):
         raise Refused(problem)
@@ -770,7 +933,7 @@ def plan(root, robot, name, lang):
     config_label = f"{label_prefix}configuration"
     toml_label = f"{config_label}:subsystems/{name}.toml"
     writes = [(os.path.join(package, path), None, content)
-              for path, content in package_files(name, lang).items()]
+              for path, content in package_files(name, lang, kind=kind).items()]
     writes.append((subsystem_toml, None, fill(
         SUBSYSTEM_TOML, NAME=name, PASCAL=pascal(name), ROBOT=robot,
         PACKAGE=f"{robot}/main_processor/{name}", PERIOD=PERIOD_US,
@@ -793,13 +956,35 @@ def plan(root, robot, name, lang):
     # export it unless a glob already does.
     config_build = os.path.join(configuration, "BUILD")
     old = read(config_build) if os.path.isfile(config_build) else ""
-    exported = f'"subsystems/{name}.toml"' in old or re.search(
-        r"exports_files\(\s*glob\(\s*\[\s*\"subsystems/\*\.toml\"", old)
+    new_cfg_build = old
+    exported = f'"subsystems/{name}.toml"' in new_cfg_build or re.search(
+        r"exports_files\(\s*glob\(\s*\[\s*\"subsystems/\*\.toml\"", new_cfg_build)
     if not exported:
-        writes.append((config_build, old or None, old + (
-            "\n" if old else "") +
-            f'exports_files(["subsystems/{name}.toml"])\n'))
+        new_cfg_build = new_cfg_build + ("\n" if new_cfg_build else "") + (
+            f'exports_files(["subsystems/{name}.toml"])\n')
+    if re.search(r"^talos_graph_test\(\n", new_cfg_build, re.M):
+        new_cfg_build = insert_label(
+            new_cfg_build, "nodes", node_label,
+            lambda x: x.startswith(label_prefix) and x.endswith(":node"),
+            rel(root, config_build), rule_name="talos_graph_test")
+    if new_cfg_build != old:
+        writes.append((config_build, old or None, new_cfg_build))
     return writes, can_id
+
+
+def plan_standalone(target_dir, name, lang, kind="velocity"):
+    """[(path, None, content)] for a standalone Bzlmod subsystem repository."""
+    if problem := check_name(name):
+        raise Refused(problem)
+    if os.path.exists(target_dir) and os.listdir(target_dir):
+        raise Refused(f"{target_dir} already exists and is not empty")
+    return [
+        (os.path.join(target_dir, path), None, content)
+        for path, content in package_files(
+            name, lang, standalone=True, kind=kind).items()
+    ]
+
+
 
 
 # Line ending of each file read, so an edit keeps a CRLF checkout's style.
@@ -843,40 +1028,70 @@ Next:
     pins the hardware config: update it once a human has checked the CAN id."""
 
 
+def standalone_next_steps(target_dir, name):
+    return f"""\
+Next (standalone subsystem repo at {target_dir}):
+  1. In {target_dir}/MODULE.bazel, point @talos at your talOS checkout or registry:
+       local_path_override(module_name = "talos", path = "../talOS")
+  2. Run tests inside {target_dir}:
+       bazel test //:all
+  3. Consume from a robot repo's MODULE.bazel:
+       bazel_dep(name = "{name}", version = "0.1.0")
+     and layer physical CAN ids + gains over {target_dir}/defaults.toml."""
+
+
 def main(argv):
     parser = argparse.ArgumentParser(
         prog="bazel run //tools:new_subsystem --",
         description="Scaffold a talos subsystem node package and wire it into "
-        "a robot.")
+        "a robot, or generate a standalone Bzlmod subsystem repository.")
     parser.add_argument("name", help="node name, e.g. wrist (talOS/NAMING.md)")
     parser.add_argument("--lang", choices=("cpp", "py"), required=True)
+    parser.add_argument("--type", dest="kind", choices=("velocity", "position"),
+                        default="velocity",
+                        help="control archetype (default: %(default)s)")
     parser.add_argument("--robot", default="2026-robot",
                         help="robot directory (default: %(default)s)")
+    parser.add_argument("--standalone", metavar="DIR",
+                        help="scaffold a standalone Bzlmod subsystem repo in DIR "
+                        "instead of wiring into --robot")
     parser.add_argument("--dry-run", action="store_true",
                         help="print every file and edit without writing")
     args = parser.parse_args(argv)
 
     root = os.environ.get("BUILD_WORKSPACE_DIRECTORY")
-    if not root:
+    if not root and not args.standalone:
         print("new_subsystem: BUILD_WORKSPACE_DIRECTORY is unset; run it with "
               "`bazel run //tools:new_subsystem -- ...`", file=sys.stderr)
         return 2
+    base = root or os.getcwd()
     try:
-        writes, can_id = plan(root, args.robot, args.name, args.lang)
+        if args.standalone:
+            target_dir = (args.standalone if os.path.isabs(args.standalone)
+                          else os.path.join(base, args.standalone))
+            writes = plan_standalone(target_dir, args.name, args.lang,
+                                     kind=args.kind)
+            can_id = None
+        else:
+            writes, can_id = plan(root, args.robot, args.name, args.lang,
+                                  kind=args.kind)
     except Refused as refused:
         print(f"new_subsystem: refused: {refused}", file=sys.stderr)
         return 1
 
     if args.dry_run:
-        show(root, writes)
+        show(base, writes)
     else:
         for path, _, content in writes:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8",
                       newline=NEWLINES.get(path, "\n")) as f:
                 f.write(content)
-            print(f"wrote {rel(root, path)}")
-    print(next_steps(args.robot, args.name, can_id))
+            print(f"wrote {rel(base, path)}")
+    if args.standalone:
+        print(standalone_next_steps(rel(base, target_dir), args.name))
+    else:
+        print(next_steps(args.robot, args.name, can_id))
     return 0
 
 

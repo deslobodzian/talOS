@@ -118,6 +118,25 @@ int32_t talos_sim_latest_raw(const TalosSim* sim, const char* topic, void* out,
   });
 }
 
+int32_t talos_sim_latest_bytes(const TalosSim* sim, const char* topic,
+                               void* out, uint32_t capacity,
+                               uint32_t* out_size) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out_size == nullptr) throw std::invalid_argument("null out_size");
+    *out_size = 0;
+    const auto bytes = AsSim(sim).latest_bytes(NonNull(topic, "topic"));
+    if (!bytes) return 0;
+    *out_size = static_cast<uint32_t>(bytes->size());
+    if (out != nullptr) {
+      if (capacity < bytes->size()) {
+        throw std::invalid_argument("output buffer too small");
+      }
+      if (!bytes->empty()) std::memcpy(out, bytes->data(), bytes->size());
+    }
+    return 1;
+  });
+}
+
 // --- SimHardware -------------------------------------------------------------
 
 TalosSimHardware* talos_sim_hardware_create(TalosSim* sim) {

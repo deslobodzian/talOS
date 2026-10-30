@@ -4,6 +4,7 @@ load("//talOS/build:contract.bzl", "talos_py_node")
 talos_py_node(
     name = "intake",
     class_name = "Intake",
+    data = ["//examples/superstructure/cpp:libmechanisms.so"],
     main = "intake.py",
     node_name = "intake",
     deps = ["//examples/superstructure/messages:messages_py"],
@@ -12,6 +13,7 @@ talos_py_node(
 talos_py_node(
     name = "elevator",
     class_name = "Elevator",
+    data = ["//examples/superstructure/cpp:libmechanisms.so"],
     main = "elevator.py",
     node_name = "elevator",
     deps = ["//examples/superstructure/messages:messages_py"],
@@ -20,6 +22,7 @@ talos_py_node(
 talos_py_node(
     name = "superstructure",
     class_name = "Superstructure",
+    data = ["//examples/superstructure/cpp:libmechanisms.so"],
     main = "superstructure.py",
     node_name = "superstructure",
     deps = ["//examples/superstructure/messages:messages_py"],
@@ -33,8 +36,10 @@ py_test(
         "elevator.py",
         "intake.py",
         "superstructure.py",
+        "//examples/superstructure/config:robot.toml",
         "//examples/superstructure/config:robot_py.toml",
         "//examples/superstructure/config:subsystems",
+        "//examples/superstructure/cpp:libmechanisms.so",
     ],
     env = {"TALOS_TEST_CONFIG": "$(rlocationpath //examples/superstructure/config:robot_py.toml)"},
     legacy_create_init = False,

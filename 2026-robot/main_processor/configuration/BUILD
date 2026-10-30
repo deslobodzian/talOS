@@ -1,4 +1,5 @@
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//talOS/build:contract.bzl", "talos_graph_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -26,5 +27,20 @@ cc_test(
         "//talOS/hardware:config",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
+    ],
+)
+
+talos_graph_test(
+    name = "graph_test",
+    config = "robot.toml",
+    data = [":robot_config"],
+    nodes = [
+        "//2026-robot/main_processor/arbiter:node",
+        "//2026-robot/main_processor/drivetrain:node",
+        "//2026-robot/main_processor/intake:node",
+        "//2026-robot/main_processor/odometry:node",
+        "//2026-robot/main_processor/operator_interface:node",
+        "//2026-robot/main_processor/shooter:node",
+        "//2026-robot/main_processor/telemetry:node",
     ],
 )

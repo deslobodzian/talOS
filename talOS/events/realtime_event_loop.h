@@ -18,12 +18,14 @@ namespace talos::event {
 
 // The loop that runs on the robot.
 //
-// Timers come from the OS clock through the poller; messages are drained on a
-// fixed tick rather than woken by the transport, because RTMS carries no
-// notification channel and adding one would change the shared-memory layout.
-// The tick therefore bounds message latency, and every drained message is
-// timestamped with the tick that observed it, which is exactly what replay
-// needs to reproduce.
+// Timers come from the OS clock through the poller; messages are drained
+// rather than woken by the transport, because RTMS carries no notification
+// channel and adding one would change the shared-memory layout. Under
+// Delivery::POLL the drain runs on a fixed tick, which bounds message latency;
+// under Delivery::BEFORE_TIMERS it runs right before each timer dispatch, so a
+// periodic program wakes once per period instead of once per tick. Either way
+// every drained message is timestamped with the drain that observed it, which
+// is exactly what replay needs to reproduce.
 template <RecorderPolicy Recorder = NullRecorder>
 class RealtimeEventLoop
     : public EventLoopBase<RealtimeEventLoop<Recorder>, Recorder> {
@@ -32,16 +34,25 @@ class RealtimeEventLoop
 
  public:
   struct Options {
-    // How often watched topics are drained. 1 ms bounds message latency at one
-    // control cycle for a 1 kHz loop.
+    // How often watched topics are drained under Delivery::POLL. 1 ms bounds
+    // message latency at one control cycle for a 1 kHz loop.
     Duration tick_period{std::chrono::milliseconds{1}};
 
-    // Cap on messages drained per topic per tick, so one flooded topic cannot
-    // starve the timers.
+    // Cap on messages drained per topic per drain, so one flooded topic
+    // cannot starve the timers.
     std::size_t max_messages_per_tick{64};
 
     // Ring slots per topic. Every process on a topic must agree.
     std::size_t slots{MAX_SLOTS};
+
+    Delivery delivery{Delivery::POLL};
+  };
+
+  // How often the loop has done each thing so far, for measuring what a
+  // delivery policy costs. Read between runs or from a dispatch.
+  struct Activity {
+    std::uint64_t wakeups{0};  // returns from the poller's wait
+    std::uint64_t drains{0};   // passes over the watched topics
   };
 
   // The origin is fixed here rather than in run(), so that a program can build
@@ -55,6 +66,18 @@ class RealtimeEventLoop
       : Base{std::move(recorder)}, options_{options} {
     this->set_start_time(Poller::now());
   }
+
+  // Chosen once the program has registered everything and before run(): the
+  // node layer only knows whether a handler needs messages promptly after
+  // the program's constructor has run.
+  void set_delivery(Delivery delivery) {
+    if (this->registration_closed()) {
+      throw std::logic_error("delivery is fixed once the run starts");
+    }
+    options_.delivery = delivery;
+  }
+  Delivery delivery() const { return options_.delivery; }
+  const Activity& activity() const { return activity_; }
 
   using SendOutcome = typename Base::SendOutcome;
 
@@ -89,8 +112,11 @@ class RealtimeEventLoop
     this->begin_run();
 
     MonotonicTime now = Poller::now();
-    scheduler_.schedule(INTERNAL_POLL_TIMER_ID, now + options_.tick_period,
-                        options_.tick_period);
+    const bool poll = options_.delivery == Delivery::POLL;
+    if (poll) {
+      scheduler_.schedule(INTERNAL_POLL_TIMER_ID, now + options_.tick_period,
+                          options_.tick_period);
+    }
 
     while (this->running()) {
       now = Poller::now();
@@ -103,10 +129,14 @@ class RealtimeEventLoop
       while (this->running() && scheduler_.pop_expired(now, expiration)) {
         if (expiration.id == INTERNAL_POLL_TIMER_ID) {
           drain_messages(expiration.deadline, now);
-        } else {
-          this->dispatch_timer(expiration.id, expiration.deadline, now,
-                               expiration.cycles);
+          continue;
         }
+        if (!poll) {
+          drain_messages(expiration.deadline, now);
+          if (!this->running()) break;
+        }
+        this->dispatch_timer(expiration.id, expiration.deadline, now,
+                             expiration.cycles);
       }
 
       if (!this->running()) {
@@ -116,6 +146,7 @@ class RealtimeEventLoop
       const MonotonicTime deadline = std::min(scheduler_.next_deadline(), end);
 
       poller_.wait_until(deadline);
+      ++activity_.wakeups;
     }
 
     this->end_run(Poller::now());
@@ -186,8 +217,7 @@ class RealtimeEventLoop
   SendOutcome send_impl(std::uint16_t id, std::span<const std::byte> bytes) {
     RTMSQueue& queue = *transports_[id].queue;
 
-    const WriteStatus status =
-        queue.write(RTMSMessage{bytes.size(), bytes.data()});
+    const WriteStatus status = queue.write(bytes);
 
     switch (status.result) {
       case WriteResult::SUCCESS:
@@ -205,6 +235,7 @@ class RealtimeEventLoop
   // publication, because the frozen shared-memory layout carries no publish
   // timestamp.
   void drain_messages(MonotonicTime tick_deadline, MonotonicTime now) {
+    ++activity_.drains;
     auto& sources = this->sources();
 
     // Registration order, which is the order the log records and replay
@@ -242,6 +273,7 @@ class RealtimeEventLoop
   Scheduler scheduler_;
   std::vector<Transport> transports_;
   std::vector<std::uint16_t> watchers_;
+  Activity activity_;
 };
 
 }  // namespace talos::event

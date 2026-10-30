@@ -15,7 +15,7 @@ Each run ends with a summary table and next-step commands.
 ## What Bazel provides vs what the host needs
 
 Hermetic (downloaded by Bazel, see `MODULE.bazel`): Python 3.11, Node 22.14.0,
-pnpm 9.15.9, Rust 1.94.1, all C++/Rust/JS dependencies. Bazel itself is pinned
+pnpm 9.15.9, all C++/JS dependencies. Bazel itself is pinned
 by `.bazelversion` (8.6.0) and fetched by bazelisk.
 
 | Component | Why | Linux | macOS | Windows |
@@ -27,13 +27,8 @@ by `.bazelversion` (8.6.0) and fetched by bazelisk.
 | JDK 17 (Temurin) | RoboRIO Gradle project, `./sim.sh` WPILib sim | package | brew | in WSL + `EclipseAdoptium.Temurin.17.JDK` |
 | Node 22 + pnpm 9.15.9 (corepack) | Studio dev loop outside Bazel | package | brew | in WSL + `OpenJS.NodeJS.22` |
 | `flatc` | none: `pnpm generate` runs Bazel's pinned `@flatbuffers//:flatc` (same as the `//studio:telemetry_ts` genrule) | – | – | run `pnpm generate` in WSL |
-| Tauri system libs | `//studio/src-tauri:desktop` is part of `bazel build //...` | always, see below | none | in WSL |
 | clang-format-18, clang-tidy-18, buildifier 8.2.1 | lint, matches CI | package / GitHub release (sha256-verified) | brew / GitHub release | in WSL |
 | WPILib 2026 | Glass, AdvantageScope, sim GUI | optional | optional | manual installer (not on winget) |
-
-Linux Tauri libs (from CI): `pkg-config libdbus-1-dev libglib2.0-dev libgtk-3-dev
-libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf`
-(apt names; the script maps them for dnf/pacman).
 
 ## Flags
 
@@ -41,7 +36,7 @@ libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxd
 |---|---|---|
 | `--check` | `-Check` | report each component ok/missing/wrong-version; install nothing; exit 1 if anything required is missing |
 | `--yes` | `-Yes` | non-interactive: answers prompts (incl. Homebrew install on macOS), passes `-y` to package managers |
-| `--no-studio` | `-NoStudio` | skip Node 22/pnpm (Tauri libs are still installed on Linux) |
+| `--no-studio` | `-NoStudio` | skip Node 22/pnpm |
 | `--no-rio` | `-NoRio` | skip JDK 17 and `./gradlew installRoboRioToolchain` |
 | `--no-lint` | `-NoLint` | skip clang-format-18, clang-tidy-18, buildifier |
 | `--verify` | `-Verify` | build the launcher, `//talOS/bridge:hardware_node` and every node the 2026 config names, then run `--describe-only` on it |

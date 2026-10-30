@@ -6,8 +6,10 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include "bridge/bridge_status_generated.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/hardware/config.h"
 #include "talOS/hardware/config_wire.h"
@@ -46,6 +48,13 @@ struct SubsystemTracker {
   // useful thing to see when actuators stop responding.
   uint64_t requests{0};
   std::size_t source_index{0};
+
+  // Positions in the merged command of the actuators this subsystem owns,
+  // resolved from `devices` by HardwareNode::IndexActuators so a timeout
+  // neutralizes without searching. Ids absent from the merge are left out.
+  std::vector<uint16_t> motor_slots;
+  std::vector<uint16_t> digital_output_slots;
+  std::vector<uint16_t> pwm_output_slots;
 };
 
 class HardwareNode {
@@ -79,6 +88,10 @@ class HardwareNode {
   // merge always refreshes the gateway well before it expires.
   uint64_t heartbeat_us() const { return heartbeat_us_; }
 
+  // The /hw/status message as of `now_us` (the bridge's monotonic clock, the
+  // same one Tick() receives). Tick() publishes it every kStatusPeriodUs.
+  bridge::BridgeStatus Status(uint64_t now_us) const;
+
   void PushConfig(uint64_t now_us);
 
   // The shape this node would take, answered without opening a socket, a
@@ -99,9 +112,8 @@ class HardwareNode {
   void BuildIntrospectionManifest();
 
   // How this node's ends behave, by topic. The manifest cannot say it: to the
-  // loop, /hw/command is a sender like any other and /hw/command/override is a
-  // fetcher like any other. Without these the graph reports the RoboRIO link
-  // and an unused debug hook as two broken topics, which is how a report stops
+  // loop, /hw/command is a sender like any other. Without this the graph
+  // reports the RoboRIO link as a broken topic, which is how a report stops
   // being read.
   static const std::vector<introspect::EndpointAttribute>& EndpointAttributes();
 
@@ -126,6 +138,10 @@ class HardwareNode {
   // or enabled/fault edge).
   void InvalidateRequests();
   void NeutralizeAll();
+  // Rebuilds the id -> position tables below and every tracker's slots from
+  // full_cmd_'s actuator layout. The first occurrence of an id wins, matching
+  // a front-to-back search.
+  void IndexActuators();
   // Change-driven publication: send when the merge differs
   // from the last send, otherwise only on the bounded heartbeat. Timeout
   // neutralization changes the merge, so it always sends immediately.
@@ -143,15 +159,19 @@ class HardwareNode {
   std::unique_ptr<ipc::Publisher<talos::hardware::Packet>> state_pub_;
   std::unique_ptr<ipc::Publisher<talos::hardware::Packet>> cmd_pub_;
   std::unique_ptr<ipc::Publisher<talos::hardware::Packet>> ds_pub_;
-  std::unique_ptr<ipc::Subscriber<talos::hardware::Packet>> legacy_cmd_sub_;
+  std::unique_ptr<ipc::Publisher<bridge::BridgeStatus>> status_pub_;
 
   std::map<std::string, SubsystemTracker> subsystems_;
   Command full_cmd_{};
+  // Where each actuator id sits in full_cmd_, so merging a request is one
+  // lookup per addressed actuator. Ids not in the table are ignored.
+  std::unordered_map<uint16_t, uint16_t> motor_index_;
+  std::unordered_map<uint16_t, uint16_t> digital_output_index_;
+  std::unordered_map<uint16_t, uint16_t> pwm_output_index_;
 
   event::Manifest introspection_manifest_;
   std::optional<introspect::NodeRegistration> registration_;
   uint64_t session_id_{0};
-  uint64_t legacy_commands_{0};
   std::chrono::steady_clock::time_point next_introspection_{};
 
   bool is_configured_{false};
@@ -164,12 +184,18 @@ class HardwareNode {
   uint64_t ownership_rejected_{0};
   uint64_t commands_sent_{0};
   uint64_t driver_station_packets_received_{0};
+  // Bridge-clock receipt time of the last /hw/state frame; meaningful once
+  // states_received_ is non-zero.
+  uint64_t last_state_receipt_us_{0};
+  uint64_t statuses_published_{0};
+  uint64_t last_status_us_{0};
   uint64_t cmd_sequence_{0};
   uint64_t last_push_time_us_{0};
 
   // Explicit periodic scheduling: 1 kHz tick period as a
   // named deadline, not an implicit sleep constant.
   static constexpr uint64_t kTickPeriodUs = 1000;
+  static constexpr uint64_t kStatusPeriodUs = 20000;
   uint64_t heartbeat_us_{20000};
   Command last_sent_cmd_{};
   uint64_t last_send_us_{0};

@@ -24,9 +24,9 @@ WANT_RIO=1
 WANT_GATEWAY=0
 WANT_OPEN=1
 DURATION=""
-# HTTP port only: the telemetry topic and UDP port live in the robot config
-# ([subsystems.telemetry] topic, [studio] udp_port), read by the nodes that
-# own each end, so this script never spells them twice.
+# HTTP port only: the telemetry topic lives in the robot config
+# ([subsystems.telemetry] topic), read by the nodes that own each end, so this
+# script never spells it twice.
 HTTP_PORT=5800
 
 usage() {
@@ -116,7 +116,7 @@ die() { printf '\033[1;31msim.sh:\033[0m %s\n' "$*" >&2; exit 1; }
 # One bazel invocation for everything, so a compile error stops the run before
 # any process starts rather than halfway through bringing the system up.
 say "building"
-BUILD_TARGETS="//talOS/launcher:launcher //talOS/bridge:hardware_node //talOS/driver_station:node //2026-robot/main_processor/..."
+BUILD_TARGETS="//talOS/launcher:launcher //talOS/bridge:hardware_node //2026-robot/main_processor/..."
 if [ "$WANT_STUDIO" = "1" ]; then
   BUILD_TARGETS="$BUILD_TARGETS //studio/bridge:studio_bridge //studio:web_dist"
 fi

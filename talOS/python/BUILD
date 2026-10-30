@@ -44,3 +44,19 @@ py_test(
         ":testing",
     ],
 )
+
+# The struct.Struct message codec against flatbuffers.Builder: identical
+# bytes, round trips, the Builder fallback, and the speedup.
+py_test(
+    name = "messages_test",
+    size = "small",
+    srcs = ["messages_test.py"],
+    legacy_create_init = False,
+    deps = [
+        ":talos",
+        ":test_messages_py",
+        "//talOS/msgs:control_py",
+        "//talOS/msgs:geometry_py",
+        "@pypi//flatbuffers",
+    ],
+)

@@ -12,12 +12,11 @@
 | `drivetrain` | C++ | swerve kinematics and module control | `/drivetrain/target` | `/drivetrain/state` |
 | `shooter` | C++ | flywheel to target speed, beam break | `/shooter/target` | `/shooter/state` |
 | `intake` | Python | roller and beam break | `/intake/target` | `/intake/state` |
-| `arbiter` | C++ | picks teleop or auto per match mode; the one writer of each target | `/driver_station/state`, `/<sub>/target/teleop`, `/<sub>/target/auto` | `/drivetrain/target`, `/shooter/target`, `/intake/target` |
-| `operator_interface` | C++ | sticks and buttons to targets | `/driver_station/state`, `/drivetrain/state` | `/drivetrain/target/teleop`, `/shooter/target/teleop`, `/intake/target/teleop` |
+| `arbiter` | C++ | picks teleop or auto per match mode (none once the Driver Station is silent or detached); the one writer of each target | `/hw/state/driver_station`, `/<sub>/target/teleop`, `/<sub>/target/auto` | `/drivetrain/target`, `/shooter/target`, `/intake/target` |
+| `operator_interface` | C++ | joystick 0 sticks and buttons (`shoot_button`, `intake_button`, per-subsystem `teleop_button`, 1-based) to targets | `/hw/state/driver_station`, `/drivetrain/state` | `/drivetrain/target/teleop`, `/shooter/target/teleop`, `/intake/target/teleop` |
 | `odometry` | C++ | pose from drivetrain state | `/drivetrain/state` | `/odometry/state` |
-| `telemetry` | C++ | Studio frames | the state topics | `/talos/telemetry` |
-| `driver_station` (`//talOS/driver_station:node`) | C++ | decodes the Driver Station packet | `/hw/state/driver_station` | `/driver_station/state` |
-| `hardware_node` (`//talOS/bridge`) | C++ | UDP courier to the RoboRIO | `/hw/request/<node>` | `/hw/state` |
+| `telemetry` | C++ | Studio frames | the state topics, `/hw/state/driver_station`, `/hw/status` | `/talos/telemetry` |
+| `hardware_node` (`//talOS/bridge`) | C++ | UDP courier to the RoboRIO | `/hw/request/<node>` | `/hw/state`, `/hw/status` |
 
 Simulation stands in for the RoboRIO with `main_processor/simulation:sim_gateway`.
 

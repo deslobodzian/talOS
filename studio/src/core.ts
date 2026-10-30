@@ -7,20 +7,32 @@ export type Pose = {
   x: number; y: number; z: number; roll: number; pitch: number; yaw: number
 };
 export type Snapshot = {
-  timestamp_ns: string; sequence_id: string; chassis: Pose;
-  ghosts: {name: string; pose: Pose}[];
+  stream_id: string;
+  sequence_id: string;
+  timestamp_ns: string;
+  dictionary_id: number;
+  chassis: Pose;
   channels: Record<string, number>;
   units: Record<string, string>;
-  targets: {id: number; pose: Pose}[];
-  elevator_m: number;
-  arm_rad: number;
-  camera: Pose
+  labels: Record<string, string[]>
 };
 export type Mode = 'PAUSED'|'LIVE_STREAMING'|'REPLAY_PLAYING';
-export const MAX_FRAME_BYTES = 65507;
+export const MAX_FRAME_BYTES = 16384;
+
+// The display string for a channel value: the enum label when the channel
+// declared labels and the value is a valid index, else the number itself.
+export function channelDisplay(s: Snapshot, name: string): string {
+  const value = s.channels[name];
+  if (value === undefined) return '';
+  const labels = s.labels[name];
+  if (labels && labels.length && Number.isInteger(value) && value >= 0 &&
+      value < labels.length)
+    return labels[value];
+  return String(value);
+}
 
 // JS generated accessors do not verify untrusted offsets. Verify this schema
-// before constructing views; all offsets below are relative to the datagram.
+// before constructing views; all offsets below are relative to the frame.
 function verify(bytes: Uint8Array) {
   const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const check = (p: number, n: number) => {
@@ -41,7 +53,7 @@ function verify(bytes: Uint8Array) {
   if (bytes.length < 16 || bytes.length > MAX_FRAME_BYTES ||
       u32(0) !== bytes.length - 4)
     throw Error('Invalid size prefix');
-  if (String.fromCharCode(...bytes.subarray(8, 12)) !== 'TLMS')
+  if (String.fromCharCode(...bytes.subarray(8, 12)) !== 'TLM2')
     throw Error('Invalid identifier');
   const table = (p: number, widths: number[]) => {
     check(p, 4);
@@ -67,22 +79,31 @@ function verify(bytes: Uint8Array) {
     check(q + 4, n + 1);
     if (v.getUint8(q + 4 + n) !== 0) throw Error('Invalid string');
   };
-  const vector = (p: number, widths: number[], kind: string) => {
+  const stringVector = (p: number) => {
     if (!p) return;
     const q = ref(p), n = u32(q);
-    if (n > 256) throw Error('Too many fields');
+    if (n > 64) throw Error('Too many labels');
+    check(q + 4, n * 4);
+    for (let i = 0; i < n; i++) string(q + 4 + i * 4);
+  };
+  const f = table(ref(4), [8, 8, 8, 4, 48, 4, 4]);
+  if (!f[4]) throw Error('Missing chassis');
+  if (f[5]) {
+    const q = ref(f[5]), n = u32(q);
+    if (n > 4096) throw Error('Too many values');
+    check(q + 4, n * 8);
+  }
+  if (f[6]) {
+    const q = ref(f[6]), n = u32(q);
+    if (n > 1024) throw Error('Too many channels');
     check(q + 4, n * 4);
     for (let i = 0; i < n; i++) {
-      const f = table(ref(q + 4 + i * 4), widths);
-      if (kind !== 'target') string(f[0]);
-      if (kind === 'channel' && f[2]) string(f[2]);
+      const entry = table(ref(q + 4 + i * 4), [4, 4, 4]);
+      string(entry[0]);
+      if (entry[1]) string(entry[1]);
+      stringVector(entry[2]);
     }
-  };
-  const f = table(ref(4), [8, 8, 48, 4, 4, 4, 8, 8, 48]);
-  if (!f[2]) throw Error('Missing chassis');
-  vector(f[3], [4, 48], 'ghost');
-  vector(f[4], [4, 8, 4], 'channel');
-  vector(f[5], [4, 48], 'target');
+  }
 }
 const finite = (n: number) => {
   if (!Number.isFinite(n)) throw Error('Non-finite telemetry');
@@ -99,41 +120,127 @@ const pose = (p: WirePose|null): Pose => {
     yaw: finite(p.yaw())
   };
 };
-export function decode(bytes: Uint8Array): Snapshot {
-  verify(bytes);
-  const f = Frame.getSizePrefixedRootAsFrame(new ByteBuffer(bytes));
-  const channels: Record < string, number >= Object.create(null),
-      units: Record < string, string >= Object.create(null);
-  for (let i = 0; i < f.channelsLength(); i++) {
-    const c = f.channels(i)!;
-    const name = c.name()!;
-    if (Object.hasOwn(channels, name)) throw Error('Duplicate channel');
-    channels[name] = finite(c.value());
-    units[name] = c.unit() ?? '';
+
+type Dictionary = {name: string; unit: string; labels: string[]}[];
+
+// Stateful v2 decoder. The wire carries a channel dictionary once (keyed by
+// dictionary_id) and bare value vectors after that, so a value frame whose
+// dictionary has not arrived yet cannot be named: it is held, not dropped and
+// not fatal, and resolves when the dictionary frame lands. Dictionaries are
+// per-stream; a new stream_id invalidates every dictionary and held frame
+// from the old one, since ids are only unique within a stream.
+export class TelemetryDecoder {
+  private dictionaries = new Map<number, Dictionary>();
+  private held: Uint8Array[] = [];
+  private stream: string|null = null;
+  heldCount = 0;
+
+  reset() {
+    this.dictionaries.clear();
+    this.held = [];
+    this.stream = null;
+    this.heldCount = 0;
   }
-  const chassis = pose(f.chassis());
-  return {
-    timestamp_ns: f.timestampNs().toString(),
-    sequence_id: f.sequenceId().toString(),
-    chassis,
-    ghosts: Array.from(
-        {length: f.ghostsLength()},
-        (_, i) => {
-          const g = f.ghosts(i)!;
-          return {name: g.name()!, pose: pose(g.pose())};
-        }),
-    channels,
-    units,
-    targets: Array.from(
-        {length: f.targetsLength()},
-        (_, i) => {
-          const t = f.targets(i)!;
-          return {id: t.id(), pose: pose(t.pose())};
-        }),
-    elevator_m: finite(f.elevatorM()),
-    arm_rad: finite(f.armRad()),
-    camera: f.camera() ? pose(f.camera()) : chassis
-  };
+
+  // Snapshots for frames held earlier that this dictionary unblocked, each
+  // with the raw bytes it arrived as (a log export needs them back).
+  private drainHeld(): {frame: Snapshot; raw: Uint8Array}[] {
+    if (!this.held.length) return [];
+    const pending = this.held;
+    this.held = [];
+    const out: {frame: Snapshot; raw: Uint8Array}[] = [];
+    for (const bytes of pending) {
+      const snapshot = this.decode(bytes);
+      if (snapshot) out.push({frame: snapshot, raw: bytes});
+    }
+    this.heldCount = this.held.length;
+    return out;
+  }
+
+  // Every snapshot this byte frame produces: itself (once its dictionary is
+  // known), plus any held frames the dictionary it carried unblocks.
+  decodeAll(bytes: Uint8Array): Snapshot[] {
+    return this.decodeFrames(bytes).map(entry => entry.frame);
+  }
+
+  decodeFrames(bytes: Uint8Array): {frame: Snapshot; raw: Uint8Array}[] {
+    const snapshot = this.decode(bytes);
+    if (!snapshot) return [];
+    const out = [{frame: snapshot, raw: bytes}, ...this.drainHeld()];
+    this.heldCount = this.held.length;
+    return out;
+  }
+
+  decode(bytes: Uint8Array): Snapshot|null {
+    verify(bytes);
+    const f = Frame.getSizePrefixedRootAsFrame(new ByteBuffer(bytes));
+    const streamId = f.streamId().toString();
+    if (this.stream !== null && streamId !== this.stream) {
+      this.dictionaries.clear();
+      this.held = [];
+    }
+    this.stream = streamId;
+    const dictionaryId = f.dictionaryId();
+    let dictionary: Dictionary|undefined = this.dictionaries.get(dictionaryId);
+    if (f.dictionaryLength() > 0) {
+      const parsed: Dictionary = [];
+      const seen = new Set<string>();
+      for (let i = 0; i < f.dictionaryLength(); i++) {
+        const info = f.dictionary(i)!;
+        const name = info.name()!;
+        if (seen.has(name)) throw Error('Duplicate channel');
+        seen.add(name);
+        const labels: string[] = [];
+        for (let j = 0; j < info.labelsLength(); j++)
+          labels.push(info.labels(j) as string);
+        parsed.push({name, unit: info.unit() ?? '', labels});
+      }
+      dictionary = parsed;
+      this.dictionaries.set(dictionaryId, parsed);
+    }
+    if (!dictionary) {
+      if (this.held.length < 4096) this.held.push(bytes.slice());
+      this.heldCount = this.held.length;
+      return null;
+    }
+    if (f.valuesLength() > dictionary.length)
+      throw Error('More values than dictionary channels');
+    const channels: Record<string, number> = Object.create(null),
+          units: Record<string, string> = Object.create(null),
+          labels: Record<string, string[]> = Object.create(null);
+    for (let i = 0; i < dictionary.length; i++) {
+      const entry = dictionary[i];
+      units[entry.name] = entry.unit;
+      if (entry.labels.length) labels[entry.name] = entry.labels;
+      if (i >= f.valuesLength()) continue;
+      const value = f.values(i)!;
+      // A NaN sample is a channel with no reading this tick, not a poisoned
+      // frame: omit it so plots and agents see absence, not a fake zero.
+      if (Number.isNaN(value)) continue;
+      channels[entry.name] = finite(value);
+    }
+    return {
+      stream_id: streamId,
+      sequence_id: f.sequenceId().toString(),
+      timestamp_ns: f.timestampNs().toString(),
+      dictionary_id: dictionaryId,
+      chassis: pose(f.chassis()),
+      channels,
+      units,
+      labels
+    };
+  }
+}
+
+// Shared decoder for callers that decode an ordered stream (tests, log
+// import). Stateful on purpose: bare value frames need the dictionary that
+// preceded them.
+const sharedDecoder = new TelemetryDecoder();
+export function decode(bytes: Uint8Array): Snapshot|null {
+  return sharedDecoder.decode(bytes);
+}
+export function resetSharedDecoder() {
+  sharedDecoder.reset();
 }
 
 export class JitterBuffer {
@@ -182,17 +289,27 @@ export class JitterBuffer {
 
 export class Timeline {
   frames: Snapshot[] = [];
+  lastArrivalMs = 0;
   constructor(public capacity = 30000) {
     if (!Number.isInteger(capacity) || capacity < 1)
       throw Error('Invalid capacity');
   }
-  append(frame: Snapshot): boolean {
+  clear() {
+    this.frames = [];
+    this.lastArrivalMs = 0;
+  }
+  latest(): Snapshot|null {
+    return this.frames.at(-1) ?? null;
+  }
+  append(frame: Snapshot, nowMs = Date.now()): boolean {
     const last = this.frames.at(-1);
+    if (last && last.stream_id !== frame.stream_id) return false;
     if (last &&
         (BigInt(frame.timestamp_ns) <= BigInt(last.timestamp_ns) ||
          BigInt(frame.sequence_id) <= BigInt(last.sequence_id)))
       return false;
     this.frames.push(frame);
+    this.lastArrivalMs = nowMs;
     if (this.frames.length > this.capacity)
       this.frames.splice(0, this.frames.length - this.capacity);
     return true;

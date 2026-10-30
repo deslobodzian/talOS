@@ -47,7 +47,6 @@ class Intake:
         if inhibit == Inhibit.DRIVE:
             self.roller.set_velocity(demand)  # otherwise the flush sends neutral
         self.state.send(
-            issued_ns=round(self.node.now * 1e9),
             enabled=talos.robot_enabled(self.node),
             roller_velocity_rps=self.roller.velocity,
             beam_broken=self.beam.value,

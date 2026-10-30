@@ -215,7 +215,7 @@ class DrivetrainTest : public ::testing::Test {
 
 TEST_F(DrivetrainTest, DrivesEveryModuleToAFreshTarget) {
   hw.enable();
-  Hold(ChassisTarget{1.0, 0, 0, 0, true}, 40ms);
+  Hold(ChassisTarget{1.0, 0, 0, true}, 40ms);
   const double rps = 1.0 / (kTau * geometry.modules[0].wheel_radius_m);
   for (const SwerveModule& module : geometry.modules) {
     EXPECT_EQ(Request(module.drive).mode, Mode::kVelocity) << module.name;
@@ -228,7 +228,7 @@ TEST_F(DrivetrainTest, DrivesEveryModuleToAFreshTarget) {
 
 TEST_F(DrivetrainTest, StaleTargetDisabledTargetOrDisabledRobotGoNeutral) {
   hw.enable();
-  Hold(ChassisTarget{1.0, 0, 0, 0, true}, 40ms);
+  Hold(ChassisTarget{1.0, 0, 0, true}, 40ms);
   ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
 
   sim.step(150ms);  // the arbiter went quiet: the target is stale
@@ -237,11 +237,11 @@ TEST_F(DrivetrainTest, StaleTargetDisabledTargetOrDisabledRobotGoNeutral) {
     EXPECT_EQ(Request(module.steer).mode, Mode::kNeutral) << module.name;
   }
 
-  Hold(ChassisTarget{1.0, 0, 0, 0, false}, 40ms);
+  Hold(ChassisTarget{1.0, 0, 0, false}, 40ms);
   EXPECT_EQ(Request("front_left_drive").mode, Mode::kNeutral);
 
   hw.enable(false);
-  Hold(ChassisTarget{1.0, 0, 0, 0, true}, 40ms);
+  Hold(ChassisTarget{1.0, 0, 0, true}, 40ms);
   EXPECT_EQ(Request("front_left_drive").mode, Mode::kNeutral);
   EXPECT_FALSE(State().enabled());
 }
@@ -296,12 +296,52 @@ TEST_F(DrivetrainOnImuTest, HeadingComesFromTheImuNotASteerEncoder) {
   EXPECT_NEAR(State().yaw_rate_rps(), 0.5, 1e-12);
 }
 
+TEST(Drivetrain, LinkDropStopsPublishingStateAndHoldsOdometry) {
+  Sim sim{ConfigPath()};
+  sim.add<Drivetrain>("drivetrain");
+  auto hw = std::make_unique<SimHardware>(sim);
+  hw->enable();
+  hw->ideal_motors();
+
+  for (auto t = 0ms; t < 60ms; t += 20ms) {
+    sim.publish(topics::kTarget, ChassisTarget{1.0, 0, 1.0, true});
+    sim.step(20ms);
+  }
+  const auto before_drop = sim.latest<DrivetrainState>(topics::kState);
+  ASSERT_TRUE(before_drop.has_value());
+  EXPECT_GT(before_drop->vx_mps(), 0.0);
+  EXPECT_GT(before_drop->omega_radps(), 0.0);
+
+  hw.reset();
+  for (auto t = 0ms; t < 160ms; t += 20ms) {
+    sim.publish(topics::kTarget, ChassisTarget{1.0, 0, 1.0, true});
+    sim.step(20ms);
+  }
+
+  const std::uint64_t count_after_timeout =
+      talos::detail::SimAccess::message_count(sim, topics::kState,
+                                              sizeof(DrivetrainState));
+  const auto at_timeout = sim.latest<DrivetrainState>(topics::kState);
+  ASSERT_TRUE(at_timeout.has_value());
+
+  for (auto t = 0ms; t < 60ms; t += 20ms) {
+    sim.publish(topics::kTarget, ChassisTarget{1.0, 0, 1.0, true});
+    sim.step(20ms);
+  }
+  EXPECT_EQ(talos::detail::SimAccess::message_count(sim, topics::kState,
+                                                    sizeof(DrivetrainState)),
+            count_after_timeout);
+  const auto after_extra = sim.latest<DrivetrainState>(topics::kState);
+  ASSERT_TRUE(after_extra.has_value());
+  EXPECT_DOUBLE_EQ(after_extra->yaw_rot(), at_timeout->yaw_rot());
+}
+
 // --- wire and binary -----------------------------------------------------
 
 // These structs cross every chassis topic on the robot, so a layout change
 // is a new contract (whole-bundle rollback), never a silent edit.
 TEST(Messages, WireSizesAreFrozen) {
-  EXPECT_EQ(sizeof(ChassisTarget), 40u);
+  EXPECT_EQ(sizeof(ChassisTarget), 32u);
   EXPECT_EQ(sizeof(DrivetrainState), 56u);
 }
 

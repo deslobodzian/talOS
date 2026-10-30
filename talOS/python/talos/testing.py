@@ -89,6 +89,19 @@ class Sim:
             self._handle, _abi.encode(topic), buffer, mtype.size))
         return mtype.decode(buffer.raw) if found else None
 
+    def latest_bytes(self, topic):
+        """The newest byte message on `topic`, or None."""
+        topic_bytes = _abi.encode(topic)
+        size = ctypes.c_uint32()
+        found = _abi.ok(lib.talos_sim_latest_bytes(
+            self._handle, topic_bytes, None, 0, size))
+        if not found:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        _abi.ok(lib.talos_sim_latest_bytes(
+            self._handle, topic_bytes, buffer, size.value, size))
+        return buffer.raw
+
 
 class SimHardware:
     """Plays the bridge for a Sim: publishes /hw/state every robot period

@@ -21,6 +21,7 @@
 namespace talos {
 class Node;
 struct BytePublishOptions;
+using Duration = std::chrono::nanoseconds;
 namespace config {
 struct RobotConfig;
 }  // namespace config
@@ -61,9 +62,18 @@ struct NodeAccess {
   // Called on every tick before the after_update hooks. Set before start().
   static void set_update(Node& node, std::function<void()> update);
   // Registers the tick timer (when there is an update() or an after_update
-  // hook) and arms it one period after now. Called once, after the user's
-  // object is built.
+  // hook), arms it one period after now, and picks the loop's delivery: see
+  // require_immediate_delivery. Called once, after the user's object is
+  // built.
   static void start(Node& node);
+  // Some handler must see each message as it arrives (a subscribe callback,
+  // a Driver Station listener), so the loop drains every tick. Without it,
+  // a node with a timer (update(), an after_update hook or every()) drains
+  // only right before its own timers, which is all a node that reads latched
+  // values there needs; a node with no timer drains every tick regardless.
+  // Call before start().
+  static void require_immediate_delivery(Node& node);
+  static bool immediate_delivery(const Node& node);
   // Index of the update() currently running, or of the next one between
   // ticks. State machines stamp transitions with it.
   static std::uint64_t next_update(const Node& node);
@@ -124,6 +134,15 @@ struct NodeAccess {
                                             std::size_t index);
   static std::uint64_t byte_topic_dropped(const Node& node, std::size_t index);
 
+  static std::size_t add_state_machine(Node& node, std::int64_t initial);
+  static std::int64_t state_machine_state(const Node& node, std::size_t index);
+  static std::int64_t state_machine_previous(const Node& node,
+                                             std::size_t index);
+  static void state_machine_go(Node& node, std::size_t index,
+                               std::int64_t next);
+  static Duration state_machine_time_in_state(const Node& node,
+                                              std::size_t index);
+  static bool state_machine_just_entered(const Node& node, std::size_t index);
   static void* find_extension(const Node& node, std::type_index type);
   static void add_extension(Node& node, std::type_index type,
                             std::shared_ptr<void> object);

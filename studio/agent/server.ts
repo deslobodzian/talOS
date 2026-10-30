@@ -2,7 +2,7 @@ import {createServer} from 'node:http';
 import {pathToFileURL} from 'node:url';
 import {WebSocket, WebSocketServer} from 'ws';
 
-import {decode, JitterBuffer, Timeline} from '../src/core';
+import {JitterBuffer, TelemetryDecoder, Timeline} from '../src/core';
 import {
   type DeclaredGraph,
   declaredStatus,
@@ -17,12 +17,6 @@ import {
 
 import {handleRpc, type RpcContext} from './rpc';
 
-// The query surface itself lives in ./rpc so the browser can run it too. These
-// re-exports keep the older import path working, and keep `agent/server` the
-// one name a caller has to know.
-export {dispatch, handleRpc, RPC_METHODS, RpcFault} from './rpc';
-export type {Params, RpcContext} from './rpc';
-
 export function startAgent(
     port = Number(process.env.AGENT_PORT ?? 5802),
     upstream = process.env.TELEMETRY_URL ?? 'ws://127.0.0.1:5800/telemetry') {
@@ -30,7 +24,9 @@ export function startAgent(
   const allowedHost = (host: string|undefined) =>
       !!host && /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host);
   const timeline = new Timeline();
-  const jitter = new JitterBuffer(10);
+  let jitter = new JitterBuffer(10);
+  const decoder = new TelemetryDecoder();
+  let streamId: string|null = null;
 
   // `previousSystem` is the sample just before this one: what changed since
   // the last refresh. Rates need a wider baseline than that -- one refresh
@@ -210,10 +206,11 @@ export function startAgent(
   let retry: NodeJS.Timeout|undefined;
   let stopped = false;
   function connect() {
-    // The upstream carries two message families now. A telemetry frame fits in
-    // one datagram, but a system graph describing every node on every topic is
-    // far larger, and a payload cap below it would drop the connection instead
-    // of the message. parseSystemGraph enforces the real bound.
+    // The upstream carries two message families now. A telemetry frame is at
+    // most 16,384 bytes, but a system graph describing every node on every
+    // topic is far larger, and a payload cap below it would drop the
+    // connection instead of the message. parseSystemGraph enforces the real
+    // bound.
     socket = new WebSocket(upstream, {maxPayload: MAX_SYSTEM_BYTES});
     socket.on('message', (raw, binary) => {
       // Binary is telemetry; text is the system graph. The frame type carries
@@ -226,7 +223,16 @@ export function startAgent(
         const bytes = Array.isArray(raw) ? Buffer.concat(raw) :
             raw instanceof ArrayBuffer   ? new Uint8Array(raw) :
                                            raw;
-        jitter.push(decode(bytes), performance.now());
+        for (const frame of decoder.decodeAll(bytes)) {
+          // A new stream restarts sequence and timestamp, so retained history
+          // from the old producer would reject every new frame. Drop it.
+          if (streamId !== null && frame.stream_id !== streamId) {
+            timeline.clear();
+            jitter = new JitterBuffer(10);
+          }
+          streamId = frame.stream_id;
+          jitter.push(frame, performance.now());
+        }
       } catch {
         jitter.stats.invalid++;
       }
