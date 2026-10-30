@@ -157,8 +157,16 @@ TEST(NodeTarget, AcceptsThePackageLeafOrTheRuleName) {
   }
   EXPECT_NE(problem->find("odometry"), std::string::npos) << *problem;
 
+  // External repository labels: root package matches the repo name, otherwise
+  // package leaf or rule name as in the main repository.
+  EXPECT_FALSE(CheckNodeTarget("wrist", "@wrist//:node").has_value());
+  EXPECT_FALSE(CheckNodeTarget("node", "@wrist//pkg:node").has_value());
+  EXPECT_FALSE(CheckNodeTarget("canon", "@@canon//:node").has_value());
+  EXPECT_FALSE(CheckNodeTarget("wrist", "@@wrist+//:node").has_value());
+  EXPECT_TRUE(CheckNodeTarget("wrist", "@wrist//pkg:other").has_value());
+  EXPECT_TRUE(CheckNodeTarget("wrist", "wrist//:node").has_value());
+
   EXPECT_TRUE(CheckNodeTarget("odometry", "odometry/node").has_value());
-  // Every node target is a main-repository label.
   EXPECT_TRUE(
       CheckNodeTarget("odometry", "@talos_odometry//:node").has_value());
   EXPECT_TRUE(

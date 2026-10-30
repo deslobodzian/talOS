@@ -245,16 +245,71 @@ inline constexpr std::string_view kStudioBridgeName = "studio_bridge";
 
 // Resolves a node target to an executable path: an override (bundle manifest
 // or test) wins, then the target's bazel-bin output relative to the
-// workspace. Anything that is not a `//pkg:target` label is taken as a path.
+// workspace. Anything that is not a `//pkg:target` or `@repo//pkg:target`
+// label is taken as a path.
+//
+// One node has two label spellings: apparent `@repo//pkg:rule` (as a robot
+// config spells it) and canonical `@@repo+//pkg:rule` (as a baked
+// TALOS_NODE_TARGET and the bundle manifest spell it). Module names never
+// contain '+', so for an override lookup both spellings normalize the repo
+// to the part before the first '+': `@wrist`, `@@wrist+` and `@@wrist`
+// compare equal, while `//pkg:rule`, paths and node names compare literally.
+inline std::string NormalizeTargetKey(std::string_view target) {
+  std::string_view rest = target;
+  if (rest.starts_with("@@")) {
+    rest.remove_prefix(2);
+  } else if (rest.starts_with("@")) {
+    rest.remove_prefix(1);
+  } else {
+    return std::string{target};
+  }
+  const std::size_t slashes = rest.find("//");
+  if (slashes == std::string_view::npos) return std::string{target};
+  std::string_view repo = rest.substr(0, slashes);
+  if (const std::size_t plus = repo.find('+'); plus != std::string_view::npos)
+    repo = repo.substr(0, plus);
+  if (repo.empty() || repo.find_first_of("@/:") != std::string_view::npos)
+    return std::string{target};
+  return std::string{repo} + "//" + std::string{rest.substr(slashes + 2)};
+}
+
 inline std::string ResolveBinary(
     const std::string& target_or_path,
     const std::map<std::string, std::string>& overrides = {}) {
-  if (auto it = overrides.find(target_or_path); it != overrides.end()) {
-    return it->second;
+  const std::string want = NormalizeTargetKey(target_or_path);
+  for (const auto& [key, path] : overrides) {
+    if (NormalizeTargetKey(key) == want) return path;
+  }
+  if (target_or_path.starts_with("@")) {
+    const bool canonical = target_or_path.starts_with("@@");
+    const std::size_t repo_start = canonical ? 2 : 1;
+    const std::size_t slashes = target_or_path.find("//", repo_start);
+    const std::size_t colon = slashes == std::string::npos
+                                  ? std::string::npos
+                                  : target_or_path.find(':', slashes + 2);
+    if (slashes == std::string::npos || colon == std::string::npos ||
+        slashes == repo_start) {
+      return target_or_path;
+    }
+    std::string repo = target_or_path.substr(repo_start, slashes - repo_start);
+    // Bazel 8 Bzlmod places apparent @repo under bazel-bin/external/<repo>+/,
+    // while canonical @@wrist+ already carries the trailing '+'.
+    if (!canonical && !repo.ends_with('+')) repo += '+';
+    std::string subpath = target_or_path.substr(slashes + 2);
+    if (subpath.starts_with(':')) {
+      subpath.erase(0, 1);
+    } else {
+      std::replace(subpath.begin(), subpath.end(), ':', '/');
+    }
+    return "bazel-bin/external/" + repo + "/" + subpath;
   }
   if (!target_or_path.starts_with("//")) return target_or_path;
   std::string subpath = target_or_path.substr(2);
-  std::replace(subpath.begin(), subpath.end(), ':', '/');
+  if (subpath.starts_with(':')) {
+    subpath.erase(0, 1);
+  } else {
+    std::replace(subpath.begin(), subpath.end(), ':', '/');
+  }
   return "bazel-bin/" + subpath;
 }
 

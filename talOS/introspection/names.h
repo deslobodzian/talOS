@@ -181,28 +181,53 @@ inline std::optional<std::string> CheckTopicName(std::string_view topic) {
 }
 
 // The node name must match the target's package leaf
-// (`//2026-robot/main_processor/odometry:node`) or its rule name
+// (`//2026-robot/main_processor/odometry:node`), its repository when at the
+// repository root (`@wrist//:node`), or its rule name
 // (`//talOS/bridge:hardware_node`), so a name in a viewer traces to source.
 inline std::optional<std::string> CheckNodeTarget(std::string_view name,
                                                   std::string_view target) {
   const std::string context = "target '" + std::string{target} +
                               "' for node '" + std::string{name} + "'";
-  if (!target.starts_with("//"))
-    return context + " must be an absolute Bazel label";
-  const std::size_t colon = target.find(':');
+  std::string_view repo;
+  std::string_view rest = target;
+  if (rest.starts_with("@")) {
+    const std::size_t at_count = rest.starts_with("@@") ? 2 : 1;
+    const std::size_t slashes = rest.find("//", at_count);
+    if (slashes == std::string_view::npos)
+      return context +
+             " must be an absolute Bazel label (//package:rule or "
+             "@repo//package:rule)";
+    repo = rest.substr(at_count, slashes - at_count);
+    while (!repo.empty() && repo.back() == '+') repo.remove_suffix(1);
+    if (repo.empty() || repo.find_first_of("@/:") != std::string_view::npos)
+      return context +
+             " must be an absolute Bazel label (//package:rule or "
+             "@repo//package:rule)";
+    rest.remove_prefix(slashes);
+  } else if (!rest.starts_with("//")) {
+    return context +
+           " must be an absolute Bazel label (//package:rule or "
+           "@repo//package:rule)";
+  }
+  const std::size_t colon = rest.find(':');
   if (colon == std::string_view::npos)
-    return context + " must name a rule, as //package:rule";
+    return context +
+           " must name a rule, as //package:rule or @repo//package:rule";
 
-  const std::string_view package = target.substr(2, colon - 2);
-  const std::string_view rule = target.substr(colon + 1);
+  const std::string_view package = rest.substr(2, colon - 2);
+  const std::string_view rule = rest.substr(colon + 1);
   const std::size_t slash = package.rfind('/');
-  const std::string_view leaf =
-      slash == std::string_view::npos ? package : package.substr(slash + 1);
+  const std::string_view leaf = package.empty() ? repo
+                                : slash == std::string_view::npos
+                                    ? package
+                                    : package.substr(slash + 1);
   if (leaf == name || rule == name) return std::nullopt;
+  const char* what =
+      package.empty() && !repo.empty() ? "repository" : "package leaf";
   return "node '" + std::string{name} + "' is built by '" +
-         std::string{target} +
-         "'; the name must match either the package leaf ('" +
-         std::string{leaf} + "') or the rule ('" + std::string{rule} + "')";
+         std::string{target} + "'; the name must match either the " + what +
+         " ('" + std::string{leaf} + "') or the rule ('" + std::string{rule} +
+         "')";
 }
 
 // One end of one topic, as its node declared it. A `--describe` and a running
