@@ -2,28 +2,68 @@
 
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
-load("@flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")
+load("@flatbuffers//:build_defs.bzl", "DEFAULT_INCLUDE_PATHS", "flatbuffer_cc_library")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library")
 load("@rules_python//python:py_info.bzl", "PyInfo")
+
+_TalosMessagesInfo = provider(
+    doc = "The schema include tree of a talos_messages target.",
+    fields = {
+        "tree": "directory holding <include_prefix>/<file>.fbs for the target and all its deps",
+    },
+)
+
+def _talos_schemas_impl(ctx):
+    # One include root for the whole closure: each tree copies its deps'
+    # trees, so `include "<prefix>/<file>.fbs";` resolves with a single -I and
+    # a macro never has to name a transitive dep's output path.
+    tree = ctx.actions.declare_directory(ctx.label.name)
+    dep_trees = [dep[_TalosMessagesInfo].tree for dep in ctx.attr.deps]
+    ctx.actions.run_shell(
+        inputs = ctx.files.srcs + dep_trees,
+        outputs = [tree],
+        # chmod: copied trees are read-only, and a diamond copies a file twice.
+        command = (
+            'out="$1"; prefix="$2"; n="$3"; shift 3; ' +
+            'for dep in "${@:1:$n}"; do ' +
+            'cp -R "$dep/." "$out" && chmod -R u+w "$out" || exit 1; done; ' +
+            'shift "$n"; mkdir -p "$out/$prefix" && cp "$@" "$out/$prefix"'
+        ),
+        arguments = [tree.path, ctx.attr.include_prefix, str(len(dep_trees))] +
+                    [t.path for t in dep_trees] + [f.path for f in ctx.files.srcs],
+        mnemonic = "TalosSchemas",
+        progress_message = "Laying out schemas of %{label}",
+    )
+    return [DefaultInfo(files = depset([tree])), _TalosMessagesInfo(tree = tree)]
+
+_talos_schemas = rule(
+    implementation = _talos_schemas_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = [".fbs"], mandatory = True),
+        "include_prefix": attr.string(mandatory = True),
+        "deps": attr.label_list(providers = [_TalosMessagesInfo]),
+    },
+)
 
 def _flatc_py_tree_impl(ctx):
     # One directory output, so the generated modules (one per struct, plus a
     # package __init__.py per namespace) need not be listed: what flatc emits
     # is decided by the schema, which a macro cannot read.
     out = ctx.actions.declare_directory(ctx.label.name)
-    inputs = list(ctx.files.srcs)
-    command = '"$1" -p --python-typing -o "$2" "${@:3}"'
-    arguments = [ctx.executable._flatc.path, out.path]
+    schemas = ctx.attr.schemas[_TalosMessagesInfo].tree
+    inputs = ctx.files.srcs + [schemas]
+    command = '"$1" -p --python-typing -I "$3" -o "$2" "${@:4}"'
+    arguments = [ctx.executable._flatc.path, out.path, schemas.path]
     if ctx.file.topics:
         # topics.py joins the namespace's package, so it imports beside the
         # structs: `from <namespace> import topics`.
         inputs.append(ctx.file.topics)
         command = (
-            '"$1" -p --python-typing -o "$2" "${@:5}" && ' +
-            'if [ ! -f "$2/$3/__init__.py" ]; then ' +
+            '"$1" -p --python-typing -I "$3" -o "$2" "${@:6}" && ' +
+            'if [ ! -f "$2/$4/__init__.py" ]; then ' +
             'echo "talos_messages: topics need the schema namespace to be ' +
-            'the include prefix, $3" >&2; exit 1; fi && ' +
-            'cp "$4" "$2/$3/topics.py"'
+            'the include prefix, $4" >&2; exit 1; fi && ' +
+            'cp "$5" "$2/$4/topics.py"'
         )
         arguments += [ctx.attr.namespace, ctx.file.topics.path]
     ctx.actions.run_shell(
@@ -50,6 +90,7 @@ _flatc_py_tree = rule(
     implementation = _flatc_py_tree_impl,
     attrs = {
         "srcs": attr.label_list(allow_files = [".fbs"], mandatory = True),
+        "schemas": attr.label(mandatory = True, providers = [_TalosMessagesInfo]),
         "topics": attr.label(allow_single_file = [".py"]),
         "namespace": attr.string(),
         "_flatc": attr.label(
@@ -75,11 +116,20 @@ def _heredoc_genrule(name, out, content):
         visibility = ["//visibility:private"],
     )
 
+def _dep_target(dep, suffix):
+    # Maps a talos_messages label to a sibling target in the same package:
+    # "//a/b:messages" + "_py" -> "//a/b:messages_py", ":messages" likewise.
+    # A bare "//a/b" means target "b".
+    if ":" in dep:
+        return dep + suffix
+    return dep + ":" + dep.split("/")[-1] + suffix
+
 def talos_messages(
     name,
     srcs,
     topics = {},
     include_prefix = None,
+    deps = [],
     visibility = ["//visibility:public"]):
     """A package's FlatBuffers messages and topic names, for C++ and Python.
 
@@ -100,17 +150,33 @@ def talos_messages(
     The topics namespace is the include prefix, which must then be the
     schema's namespace. One topics dict per package.
 
+    A schema can use another package's types: list that package's
+    talos_messages target in `deps` and write
+    `include "<dep_prefix>/<file>.fbs";` in the .fbs, where <dep_prefix> is
+    the dependency's include prefix. C++ then includes
+    "<dep_prefix>/<file>_generated.h" (resolved through the dep's cc_library)
+    and Python imports the dep's namespace (resolved through its _py library).
+    Deps are transitive.
+
+    At a repository root the package path is empty, so pass `include_prefix`
+    explicitly there (the scaffolder always does).
+
     Args:
       name: the cc_library; the py_library is name + "_py".
       srcs: .fbs schemas.
       topics: lower_snake_case name -> topic.
       include_prefix: overrides the include prefix.
+      deps: other talos_messages targets this package's schemas include.
       visibility: of both libraries.
     """
     if include_prefix == None:
         include_prefix = native.package_name().split("/")[-1]
+    if not include_prefix:
+        fail("talos_messages: cannot default include_prefix at a repository " +
+             "root (empty package path); pass include_prefix explicitly, " +
+             "usually the subsystem name")
     _check_topics(topics)
-    label = "//%s:%s" % (native.package_name(), name)
+    label = str(native.package_relative_label(name))
     hdrs = []
     topics_py = None
     if topics:
@@ -133,13 +199,30 @@ def talos_messages(
         hdrs = [":topics.h"]
         topics_py = name + "_topics.py"
         _heredoc_genrule(name + "_topics_py", topics_py, "\n".join(py_lines) + "\n")
-    fbs_name = name + "_fbs"
-    flatbuffer_cc_library(
-        name = fbs_name,
+    schemas_name = name + "_schemas"
+    _talos_schemas(
+        name = schemas_name,
         srcs = srcs,
-        # flatbuffers' DEFAULT_FLATC_ARGS plus --scoped-enums: a schema enum
-        # `enum IntakeCommand : ubyte { Idle, Intake }` is a C++ enum class,
-        # spelled IntakeCommand::Intake.
+        include_prefix = include_prefix,
+        deps = [_dep_target(dep, "_schemas") for dep in deps],
+        visibility = visibility,
+    )
+    fbs_name = name + "_fbs"
+    # --no-includes suppresses #include of dep schemas; drop it once this
+    # package has deps, and keep each include's prefix so the generated
+    # #include names the dep's include prefix (resolved through its cc_library).
+    # Packages without deps keep the old flags, so their generated headers are
+    # byte-identical.
+    flatc_args = [
+        "--gen-object-api",
+        "--gen-compare",
+        "--gen-mutable",
+        "--reflect-names",
+        "--cpp-ptr-type flatbuffers::unique_ptr",
+        "--scoped-enums",
+        "--keep-prefix",
+    ]
+    if not deps:
         flatc_args = [
             "--gen-object-api",
             "--gen-compare",
@@ -148,7 +231,16 @@ def talos_messages(
             "--reflect-names",
             "--cpp-ptr-type flatbuffers::unique_ptr",
             "--scoped-enums",
-        ],
+        ]
+    flatbuffer_cc_library(
+        name = fbs_name,
+        srcs = srcs,
+        includes = [":" + schemas_name] if deps else [],
+        include_paths = DEFAULT_INCLUDE_PATHS + ["$(location :%s)" % schemas_name] if deps else None,
+        # flatbuffers' DEFAULT_FLATC_ARGS plus --scoped-enums: a schema enum
+        # `enum IntakeCommand : ubyte { Idle, Intake }` is a C++ enum class,
+        # spelled IntakeCommand::Intake.
+        flatc_args = flatc_args,
         visibility = ["//visibility:private"],
     )
     cc_library(
@@ -156,19 +248,20 @@ def talos_messages(
         hdrs = hdrs + [":" + fbs_name + "_srcs"],
         strip_include_prefix = ".",
         include_prefix = include_prefix,
-        deps = [":" + fbs_name],
+        deps = [":" + fbs_name] + list(deps),
         visibility = visibility,
     )
     _flatc_py_tree(
         name = name + "_py_gen",
         srcs = srcs,
+        schemas = ":" + schemas_name,
         topics = topics_py,
         namespace = include_prefix,
         visibility = ["//visibility:private"],
     )
     py_library(
         name = name + "_py",
-        deps = [":" + name + "_py_gen", "@pypi//flatbuffers"],
+        deps = [":" + name + "_py_gen", "@pypi//flatbuffers"] + [_dep_target(dep, "_py") for dep in deps],
         visibility = visibility,
     )
 
@@ -248,7 +341,9 @@ def talos_cc_node(
       **kwargs: passed to the cc_binary.
     """
     if not node_target:
-        node_target = "//" + native.package_name() + ":" + name
+        node_target = str(native.package_relative_label(name))
+        if node_target.startswith("@@//"):
+            node_target = node_target[2:]
     node_dep = Label("//talOS/node")
     bin_name = name + "_bin"
     cc_binary(
@@ -300,7 +395,9 @@ def talos_py_node(
       **kwargs: passed to the py_binary.
     """
     if not node_target:
-        node_target = "//" + native.package_name() + ":" + name
+        node_target = str(native.package_relative_label(name))
+        if node_target.startswith("@@//"):
+            node_target = node_target[2:]
     runner_py = name + "_runner.py"
     content = (
         "import os, sys, talos\n" +

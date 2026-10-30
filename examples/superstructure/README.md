@@ -108,7 +108,17 @@ node. On a real robot, a driver node reads the driver station, publishes
 
 ## Write your own mechanism
 
-Take a wrist that goes to an angle as an example.
+The fast path is the scaffolder, from the repo root:
+
+```sh
+bazel run //tools:new_subsystem -- wrist --lang cpp   # or --lang py
+```
+
+It writes `<robot>/main_processor/wrist/` (messages with an explicit
+`include_prefix`, the node, a Sim test covering the disabled and stale-target
+cases), the subsystem TOML with the lowest free CAN id marked as a
+placeholder, the manifest entry and the bundle lists. What follows explains
+each generated piece, taking a wrist that goes to an angle as an example.
 
 1. **Messages.** Add `messages/wrist.fbs` and list it in `messages/BUILD`:
    ```

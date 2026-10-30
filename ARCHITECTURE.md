@@ -104,7 +104,7 @@ physical ones and sets `commissioned = true` only after checking them.
 
 | New thing | Where |
 |---|---|
-| a mechanism | a node package under `<robot>/main_processor/<name>/`, plus a subsystem file; walkthrough in [examples/superstructure](examples/superstructure/README.md) |
+| a mechanism | a node package under `<robot>/main_processor/<name>/`, plus a subsystem file; generate it with `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` (walkthrough in [examples/superstructure](examples/superstructure/README.md)) |
 | a message or topic | the owning package's `.fbs` and `topics.h` |
 | a producer of an existing target | a `/<sub>/target/<source>` topic and a line in the arbiter |
 | a device type | `talOS/hardware` (config + wire), `talOS/devices`, `talOS/python/talos/devices.py`, and the RoboRIO program |
