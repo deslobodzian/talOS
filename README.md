@@ -73,7 +73,9 @@ Layers and rules: [ARCHITECTURE.md](ARCHITECTURE.md). Names:
 | `talOS/python/talos` | the same API in Python (ctypes over `talOS/node_api`) |
 | `talOS/events`, `rtms`, `memory`, `ipc`, `process` | event loop, log/replay, shared-memory topics, process plumbing |
 | `talOS/hardware`, `protocol`, `bridge` | hardware wire contract, UDP framing, `:hardware_node` (the courier to the RoboRIO) |
-| `talOS/driver_station` | Driver Station codec and node |
+| `talOS/driver_station` | Driver Station codec |
+| `talOS/msgs` | shared geometry and control message structs |
+| `talOS/telemetry` | the Studio telemetry frame schema and byte-topic wire format |
 | `talOS/configuration`, `launcher`, `introspection` | `robot.toml` parser, the launcher, graph description and names |
 | `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle` |
 | `2026-robot/` | this season's robot ([README](2026-robot/README.md)) |

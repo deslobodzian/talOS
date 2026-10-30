@@ -68,10 +68,7 @@ cc_library(
     name = "gate",
     hdrs = ["gate.h"],
     visibility = ["//visibility:public"],
-    deps = [
-        ":hardware",
-        "//talOS/events:events_core",
-    ],
+    deps = [":hardware"],
 )
 
 cc_test(

@@ -1,12 +1,14 @@
 /// <reference lib="webworker" />
 import {handleRpc} from '../agent/rpc';
 
-import {Coordinator, decode, JitterBuffer, Timeline} from './core';
+import {Coordinator, JitterBuffer, TelemetryDecoder, Timeline} from './core';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from './demo';
-import {type DeclaredGraph, declaredUrl, MAX_DECLARED_BYTES, parseDeclaredGraph, parseSystemGraph, RateWindow, SystemAssembler, systemChunk, type SystemGraph} from './system';
+import {type DeclaredGraph, declaredUrl, MAX_DECLARED_BYTES, parseDeclaredGraph, parseSystemGraph, RateWindow, type SystemGraph} from './system';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
 let coordinator = new Coordinator(), jitter = new JitterBuffer(10);
+let decoder = new TelemetryDecoder();
+let streamId: string|null = null;
 let socket: WebSocket|null = null, demo = false, sequence = 0n,
             status = 'Disconnected';
 let packets = new Map<string, Uint8Array>(),
@@ -32,13 +34,8 @@ let nextDemoSystem = 0;
 let declared: DeclaredGraph|null = null;
 let declaredError = '';
 
-// Reassembles graphs arriving over UDP, which the platform's maximum datagram
-// forces the bridge to split. The WebSocket path needs none of this: a text
-// frame carries the whole document.
-const assembler = new SystemAssembler();
-
 // Posted only when the graph changes, not on every telemetry tick: it is a few
-// tens of kilobytes and structure changes at 4 Hz, not 30.
+// tens of kilobytes and structure changes at 4 Hz, not at the 100 Hz frame rate.
 function postSystem() {
   const rates: Record<string, number> = {};
   for (const [key, value] of rateWindow.rates()) {
@@ -120,9 +117,21 @@ function ingestSystem(text: string) {
   }
   postSystem();
 }
+// A new stream_id means the producer restarted: sequence and timestamp
+// restart with it, so the old timeline and jitter state would reject or
+// misorder every frame of the new stream. Dictionaries are per-stream too.
+function resetStream(next: string) {
+  streamId = next;
+  coordinator = new Coordinator();
+  jitter = new JitterBuffer(10);
+  packets.clear();
+  pendingBytes.clear();
+}
 function reset() {
   coordinator = new Coordinator();
   jitter = new JitterBuffer(10);
+  decoder = new TelemetryDecoder();
+  streamId = null;
   packets.clear();
   pendingBytes.clear();
   // Whatever is being connected to next is a different system, so the old
@@ -147,11 +156,19 @@ function close() {
 }
 function ingest(bytes: Uint8Array, now: number) {
   try {
-    const frame = decode(bytes);
-    jitter.push(frame, now);
-    pendingBytes.set(frame.sequence_id, bytes);
-    if (pendingBytes.size > 4096)
-      pendingBytes.delete(pendingBytes.keys().next().value!);
+    // A value frame whose dictionary has not arrived decodes to nothing yet;
+    // the decoder holds it and decodeAll returns it with the dictionary frame
+    // that names its channels. Held is not invalid.
+    for (const {frame, raw} of decoder.decodeFrames(bytes)) {
+      if (streamId !== null && frame.stream_id !== streamId)
+        resetStream(frame.stream_id);
+      else
+        streamId = frame.stream_id;
+      jitter.push(frame, now);
+      pendingBytes.set(frame.sequence_id, raw);
+      if (pendingBytes.size > 4096)
+        pendingBytes.delete(pendingBytes.keys().next().value!);
+    }
   } catch {
     jitter.stats.invalid++;
   }
@@ -212,25 +229,6 @@ ctx.onmessage = ({data}) => {
         ingestSystem(demoSystemGraph(sequence));
         status = 'Deterministic demo · 50 Hz';
         break;
-      case 'packet': {
-        const bytes = new Uint8Array(data.buffer);
-        // Recognised before anything else: a system graph is not a frame, and
-        // it is not a reason to tear down the transport already running. It
-        // also spans several datagrams, so a chunk that does not complete a
-        // document still must not fall through to the telemetry decoder.
-        if (systemChunk(bytes)) {
-          const graph = assembler.push(bytes);
-          if (graph !== null) ingestSystem(graph);
-          break;
-        }
-        if (demo || socket) {
-          close();
-          reset();
-        }
-        status = 'Desktop UDP';
-        ingest(bytes, performance.now());
-        break;
-      }
       case 'rpc': {
         // The same query surface the headless JSON-RPC server exposes, run
         // against this worker's own timeline, so the Agent tab shows what an
@@ -281,6 +279,7 @@ ctx.onmessage = ({data}) => {
           throw Error('Log exceeds 256 MiB');
         const imported = new Timeline();
         const raw = new Map<string, Uint8Array>();
+        const importDecoder = new TelemetryDecoder();
         let p = 0;
         while (p < bytes.length) {
           if (p + 4 > bytes.length) throw Error('Truncated log');
@@ -290,12 +289,16 @@ ctx.onmessage = ({data}) => {
           if (size < 16 || p + size > bytes.length)
             throw Error('Truncated log frame');
           const chunk = bytes.slice(p, p + size);
-          const f = decode(chunk);
-          if (!imported.append(f))
-            throw Error('Log sequence/timestamps must strictly increase');
-          raw.set(f.sequence_id, chunk);
+          for (const {frame: f, raw: frameRaw} of
+               importDecoder.decodeFrames(chunk)) {
+            if (!imported.append(f))
+              throw Error('Log sequence/timestamps must strictly increase');
+            raw.set(f.sequence_id, frameRaw);
+          }
           p += size;
         }
+        if (importDecoder.heldCount > 0)
+          throw Error('Log ends before its channel dictionary');
         // Commit only after the entire log validates. Deterministic import
         // ignores arrival time.
         close();

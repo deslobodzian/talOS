@@ -2,7 +2,6 @@
 
 #include <gtest/gtest.h>
 
-#include <iostream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -71,13 +70,12 @@ introspect::NodeSnapshot Telemetry() {
 }
 
 // The hardware bridge, as talOS/bridge/node.cc actually declares itself: it
-// publishes `/hw/command` for a consumer that lives across a UDP link, and it
-// fetches `/hw/command/override`, which nothing in the tree publishes.
+// publishes `/hw/command` for a consumer that lives across a UDP link.
 introspect::NodeSnapshot HardwareBridge() {
   introspect::NodeSnapshot node;
   node.name = "hardware_bridge";
   node.alive = true;
-  node.declared_source_count = 3;
+  node.declared_source_count = 2;
   node.sources = {
       {.id = 0,
        .kind = event::SourceKind::SENDER,
@@ -92,12 +90,6 @@ introspect::NodeSnapshot HardwareBridge() {
        .alignment = 8,
        .flags = naming::kSourceFlagExternal,
        .events = 12},
-      {.id = 2,
-       .kind = event::SourceKind::FETCHER,
-       .name = talos::hardware::kCommandOverrideTopic,
-       .message_bytes = 1032,
-       .alignment = 8,
-       .flags = naming::kSourceFlagOptional},
   };
   return node;
 }
@@ -170,46 +162,6 @@ TEST(SystemGraph, ReportsAnAbsentRegistryRatherThanFailing) {
   EXPECT_NE(json.find("\"topics\":[]"), std::string::npos);
 }
 
-TEST(SystemDatagrams, SplitsDocumentsTooLargeForOneDatagram) {
-  // macOS caps a datagram at 9216 bytes, so a graph for a real robot has to be
-  // split. Getting this wrong is silent: the desktop viewer's System tab would
-  // just stay empty while the WebSocket client worked.
-  const std::string small(100, 'a');
-  const auto one = SystemDatagrams(small, 0x1234);
-  ASSERT_EQ(one.size(), 1u);
-  EXPECT_EQ(one[0].size(), kSystemHeaderBytes + small.size());
-  EXPECT_EQ(one[0].compare(0, 4, "TSYS"), 0);
-  EXPECT_EQ(static_cast<unsigned char>(one[0][4]), 0x34u);
-  EXPECT_EQ(static_cast<unsigned char>(one[0][5]), 0x12u);
-  EXPECT_EQ(static_cast<unsigned char>(one[0][6]), 0u);
-  EXPECT_EQ(static_cast<unsigned char>(one[0][7]), 1u);
-  EXPECT_EQ(one[0].substr(kSystemHeaderBytes), small);
-
-  const std::string large(kSystemChunkBytes * 2 + 7, 'b');
-  const auto many = SystemDatagrams(large, 9);
-  ASSERT_EQ(many.size(), 3u);
-
-  std::string rejoined;
-  for (std::size_t i = 0; i < many.size(); ++i) {
-    // Every chunk stays inside the platform's limit, carries the same document
-    // id, and knows its place in the sequence.
-    EXPECT_LE(many[i].size(), kSystemChunkBytes + kSystemHeaderBytes);
-    EXPECT_EQ(static_cast<unsigned char>(many[i][4]), 9u);
-    EXPECT_EQ(static_cast<unsigned char>(many[i][6]), i);
-    EXPECT_EQ(static_cast<unsigned char>(many[i][7]), many.size());
-    rejoined += many[i].substr(kSystemHeaderBytes);
-  }
-  EXPECT_EQ(rejoined, large);
-}
-
-TEST(SystemDatagrams, RefusesADocumentItCannotAddress) {
-  // Unreachable with the registry's own capacities, but a document silently
-  // truncated to 255 chunks would reassemble into plausible-looking nonsense.
-  EXPECT_TRUE(SystemDatagrams(
-                  std::string(kSystemChunkBytes * kMaxSystemChunks + 1, 'c'), 1)
-                  .empty());
-}
-
 TEST(SystemGraph, EscapesNamesThatWouldOtherwiseBreakTheDocument) {
   introspect::NodeSnapshot node;
   node.name = "odd\"name\\with\ttabs";
@@ -260,14 +212,11 @@ TEST(TopicHealth, SeparatesADesignedDeadEndFromABrokenOne) {
   EXPECT_STREQ(HealthName(HealthOf(*command)), "bridged");
 
   // Subscribed with no publisher, and declared that way on purpose.
-  for (const char* name :
-       {talos::hardware::kCommandOverrideTopic, "/drivetrain/target/auto"}) {
-    const TopicRow* row = Row(topics, name);
-    ASSERT_NE(row, nullptr) << name;
-    EXPECT_TRUE(row->optional) << name;
-    EXPECT_EQ(HealthOf(*row), TopicHealth::UNCONNECTED) << name;
-    EXPECT_STREQ(HealthName(HealthOf(*row)), "unconnected");
-  }
+  const TopicRow* automatic = Row(topics, "/drivetrain/target/auto");
+  ASSERT_NE(automatic, nullptr);
+  EXPECT_TRUE(automatic->optional);
+  EXPECT_EQ(HealthOf(*automatic), TopicHealth::UNCONNECTED);
+  EXPECT_STREQ(HealthName(HealthOf(*automatic)), "unconnected");
 
   // The same two shapes with no declaration keep the verdicts they had. A
   // release that quietly reclassified these would be worse than no report.
@@ -335,7 +284,15 @@ TEST(TopicHealth, KeepsTheVerdictsThatAlreadyWorkedForConnectedTopics) {
 
 TEST(SystemGraph, CarriesEndpointAttributesOnEverySourceAndTopic) {
   SystemGraphInput input;
-  input.nodes = {HardwareBridge()};
+  introspect::NodeSnapshot drivetrain;
+  drivetrain.name = "drivetrain";
+  drivetrain.alive = true;
+  drivetrain.sources = {{.id = 0,
+                         .kind = event::SourceKind::FETCHER,
+                         .name = "/drivetrain/target/auto",
+                         .message_bytes = 32,
+                         .flags = naming::kSourceFlagOptional}};
+  input.nodes = {HardwareBridge(), drivetrain};
   input.registry_available = true;
 
   const std::string json = SystemGraphJson(input);
@@ -353,8 +310,8 @@ TEST(SystemGraph, CarriesEndpointAttributesOnEverySourceAndTopic) {
                       "\"alignment\":8,\"external\":false,\"optional\":false"),
             std::string::npos);
   EXPECT_NE(
-      json.find("\"name\":\"/hw/command/override\",\"message_bytes\":1032,"
-                "\"alignment\":8,\"external\":false,\"optional\":true"),
+      json.find("\"name\":\"/drivetrain/target/auto\",\"message_bytes\":"
+                "32,\"alignment\":0,\"external\":false,\"optional\":true"),
       std::string::npos);
 
   // And per topic, with the verdict, so `curl` alone answers the question.
@@ -368,58 +325,6 @@ TEST(SystemGraph, CarriesEndpointAttributesOnEverySourceAndTopic) {
                       "\"health\":\"unconnected\""),
             std::string::npos);
   EXPECT_NE(json.find("\"health\":\"unread\""), std::string::npos);
-}
-
-TEST(SystemDatagrams, StillAddressesAFullRegistryNowTheDocumentIsLarger) {
-  // The endpoint booleans and the health string made every source and topic
-  // row longer, and the framing can only address kMaxSystemChunks chunks.
-  // Overflowing it does not corrupt anything -- SystemDatagrams returns
-  // nothing -- but the System tab would then stay empty forever on the desktop
-  // transport while the WebSocket client worked, which is the failure this
-  // whole chunking scheme exists to avoid. So bound the worst case the
-  // registry can physically hold.
-  SystemGraphInput input;
-  input.registry_available = true;
-  input.node_capacity = introspect::kMaxNodes;
-  input.source_capacity = introspect::kMaxSourcesPerNode;
-  for (std::size_t n = 0; n < introspect::kMaxNodes; ++n) {
-    introspect::NodeSnapshot node;
-    node.slot = n;
-    node.name = std::string(naming::kMaxSegmentBytes, 'n');
-    node.target = std::string(introspect::kMaxTargetBytes - 1, 't');
-    node.session_id = 18446744073709551615ull;
-    node.dispatch_count = 18446744073709551615ull;
-    node.alive = true;
-    for (std::size_t i = 0; i < introspect::kMaxSourcesPerNode; ++i) {
-      introspect::SourceSnapshot source;
-      source.id = static_cast<std::uint16_t>(i);
-      source.kind = event::SourceKind::SENDER;
-      // Unique per source, so the topic table is as long as the node table --
-      // shared names would collapse rows and understate the document.
-      source.name = "/" + std::to_string(n) + "/" + std::to_string(i) +
-                    std::string(event::MAX_SOURCE_NAME, 'q');
-      source.name.resize(event::MAX_SOURCE_NAME);
-      source.message_bytes = 65536;
-      source.flags = naming::kSourceFlagExternal | naming::kSourceFlagOptional;
-      source.events = 18446744073709551615ull;
-      source.dropped = 18446744073709551615ull;
-      source.sequence = 18446744073709551615ull;
-      source.last_monotonic_ns = 9223372036854775807ll;
-      source.last_latency_ns = 9223372036854775807ll;
-      source.max_latency_ns = 9223372036854775807ll;
-      node.sources.push_back(std::move(source));
-    }
-    input.nodes.push_back(std::move(node));
-  }
-
-  const std::string json = SystemGraphJson(input);
-  const auto datagrams = SystemDatagrams(json, 1);
-  ASSERT_FALSE(datagrams.empty())
-      << "a full registry no longer fits " << kMaxSystemChunks
-      << " chunks: " << json.size() << " bytes";
-  EXPECT_LT(datagrams.size(), kMaxSystemChunks);
-  std::cerr << "worst-case graph: " << json.size() << " bytes, "
-            << datagrams.size() << " of " << kMaxSystemChunks << " chunks\n";
 }
 
 }  // namespace

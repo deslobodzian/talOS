@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -7,6 +8,8 @@
 #include <thread>
 #include <vector>
 
+#include "bridge/bridge_status_generated.h"
+#include "bridge/topics.h"
 #include "node.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
@@ -35,8 +38,7 @@ type = "TalonFX"
 bus = "rio"
 can_id = 2
 
-[subsystems.driver_station]
-node = "//2026-robot/main_processor/driver_station:node"
+[subsystems.operator_interface]
 period_us = 20000
 
 [subsystems.beam_break]
@@ -151,9 +153,9 @@ TEST(HardwareNodeTest, MergesSubsystemRequestsAndIsolatesTimeouts) {
 
 TEST(HardwareNodeTest, ActuatorLessSubsystemsGetNoTracker) {
   auto cfg = talos::config::ParseRobotConfigString(kTestToml);
-  ASSERT_TRUE(cfg.subsystems.contains("driver_station"));
+  ASSERT_TRUE(cfg.subsystems.contains("operator_interface"));
   ASSERT_TRUE(cfg.subsystems.contains("beam_break"));
-  ASSERT_TRUE(cfg.subsystems.at("driver_station").motors.empty());
+  ASSERT_TRUE(cfg.subsystems.at("operator_interface").motors.empty());
   ASSERT_EQ(cfg.subsystems.at("beam_break").digital_inputs.size(), 1u);
 
   HardwareNode node{cfg, "127.0.0.1", 25806, 25807, true};
@@ -164,7 +166,7 @@ TEST(HardwareNodeTest, ActuatorLessSubsystemsGetNoTracker) {
 
   EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
   EXPECT_TRUE(node.is_subsystem_timed_out("shooter"));
-  EXPECT_FALSE(node.is_subsystem_timed_out("driver_station"));
+  EXPECT_FALSE(node.is_subsystem_timed_out("operator_interface"));
   EXPECT_FALSE(node.is_subsystem_timed_out("beam_break"));
 }
 
@@ -240,8 +242,8 @@ bool InjectState(HardwareNode& node, protocol::RuntimeUdpPeer& gateway,
   talos::hardware::Packet buf{};
   buf.size = static_cast<uint32_t>(Encode(state, buf.data));
   if (gateway.SendFrame(protocol::FrameType::kHardwareState, 1, now_us,
-                        buf.data.data(), buf.size) !=
-      protocol::UdpStatus::kOk) {
+                        buf.data.data(),
+                        buf.size) != protocol::UdpStatus::kOk) {
     return false;
   }
   const uint64_t before = node.states_received();
@@ -861,7 +863,9 @@ TEST(HardwareNodeTest, DescribesItselfWithoutOpeningAnything) {
   for (const auto& source : description.sources) {
     const auto problem = introspect::naming::CheckTopicName(source.name);
     EXPECT_FALSE(problem.has_value()) << (problem ? *problem : std::string{});
-    EXPECT_EQ(source.message_bytes, sizeof(Packet));
+    EXPECT_EQ(source.message_bytes, source.name == bridge::topics::kStatus
+                                        ? sizeof(bridge::BridgeStatus)
+                                        : sizeof(Packet));
     by_name[source.name] = source;
   }
 
@@ -871,24 +875,26 @@ TEST(HardwareNodeTest, DescribesItselfWithoutOpeningAnything) {
   ASSERT_TRUE(by_name.contains(kStateTopic));
   ASSERT_TRUE(by_name.contains(kCommandTopic));
   ASSERT_TRUE(by_name.contains(kDriverStationTopic));
-  ASSERT_TRUE(by_name.contains(kCommandOverrideTopic));
+  ASSERT_TRUE(by_name.contains(bridge::topics::kStatus));
   ASSERT_TRUE(by_name.contains(RequestTopic("drivetrain")));
   ASSERT_TRUE(by_name.contains(RequestTopic("shooter")));
-  EXPECT_FALSE(by_name.contains(RequestTopic("driver_station")));
+  EXPECT_FALSE(by_name.contains(RequestTopic("operator_interface")));
   EXPECT_FALSE(by_name.contains(RequestTopic("beam_break")));
 
   EXPECT_EQ(by_name[kStateTopic].kind, event::SourceKind::SENDER);
   EXPECT_EQ(by_name[kCommandTopic].kind, event::SourceKind::SENDER);
   EXPECT_EQ(by_name[kDriverStationTopic].kind, event::SourceKind::SENDER);
-  EXPECT_EQ(by_name[kCommandOverrideTopic].kind, event::SourceKind::FETCHER);
+  EXPECT_EQ(by_name[bridge::topics::kStatus].kind, event::SourceKind::SENDER);
+  EXPECT_FALSE(by_name[bridge::topics::kStatus].external());
+  EXPECT_FALSE(by_name[bridge::topics::kStatus].optional());
   EXPECT_EQ(by_name[RequestTopic("drivetrain")].kind,
             event::SourceKind::FETCHER);
 
-  // The two attributes that keep a working graph from reading as a broken one:
-  // the command goes to the RoboRIO over UDP and will never have a
-  // shared-memory subscriber, and nothing in the tree publishes the override.
+  // The attribute that keeps a working graph from reading as a broken one: the
+  // command goes to the RoboRIO over UDP and will never have a shared-memory
+  // subscriber.
   EXPECT_TRUE(by_name[kCommandTopic].external());
-  EXPECT_TRUE(by_name[kCommandOverrideTopic].optional());
+  EXPECT_FALSE(by_name[kCommandTopic].optional());
   EXPECT_FALSE(by_name[kStateTopic].external());
   EXPECT_FALSE(by_name[kStateTopic].optional());
   EXPECT_FALSE(by_name[RequestTopic("drivetrain")].external());
@@ -924,6 +930,192 @@ TEST(HardwareNodeTest, IgnoresTheRetiredDriveAlias) {
 
   EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
   EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
+}
+
+// /hw/status carries the bridge's counters, the age of the last controller
+// state on the bridge clock, which actuator subsystems have gone quiet and
+// whether the RoboRIO accepted the configuration.
+TEST(HardwareNodeTest, PublishesBridgeStatus) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  const uint16_t drive = cfg.hardware.motors[0].id;
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  HardwareNode node{cfg, "127.0.0.1", 25828, 25829, true};
+  ASSERT_TRUE(node.Open());
+  ipc::Subscriber<bridge::BridgeStatus> status_sub{
+      bridge::topics::kStatus,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+
+  // The first tick publishes. Nothing has arrived from the controller, and
+  // both actuator subsystems (drivetrain bit 0, intake bit 1: sorted name
+  // order) are timed out.
+  node.Tick(999000);
+  const bridge::BridgeStatus initial = node.Status(999000);
+  EXPECT_EQ(initial.states_received(), 0u);
+  EXPECT_EQ(initial.state_age_us(), 0u);
+  EXPECT_EQ(initial.subsystem_count(), 2u);
+  EXPECT_EQ(initial.timed_out_mask(), 0b11u);
+  EXPECT_FALSE(initial.configured());
+  auto published = status_sub.read();
+  ASSERT_TRUE(published.has_value());
+  EXPECT_TRUE(*published == initial);
+
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(gateway.Open("127.0.0.1", 25828, "127.0.0.1", 25829),
+            protocol::UdpStatus::kOk);
+  const uint64_t config_id = NodeConfigId(cfg);
+
+  // The RoboRIO acknowledges this configuration.
+  ConfigAckPayload ack{};
+  ack.config_id = config_id;
+  std::array<uint8_t, sizeof(ConfigAckPayload)> ack_bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, ack_bytes), sizeof(ConfigAckPayload));
+  ASSERT_EQ(gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 1,
+                              999500, ack_bytes.data(), ack_bytes.size()),
+            protocol::UdpStatus::kOk);
+  for (int i = 0; i < 200 && !node.is_configured(); ++i) {
+    node.Tick(999500);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(node.is_configured());
+  EXPECT_TRUE(node.Status(999500).configured());
+
+  // State age runs on the bridge clock from the frame's receipt.
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 1000), 1000000));
+  EXPECT_EQ(node.Status(1000000).states_received(), 1u);
+  EXPECT_EQ(node.Status(1000000).state_age_us(), 0u);
+  EXPECT_EQ(node.Status(1003500).state_age_us(), 3500u);
+
+  // Only the drivetrain publishes: the silent intake keeps its bit.
+  ipc::Publisher<talos::hardware::Packet> drive_pub{RequestTopic("drivetrain")};
+  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
+  Command drive_ok{};
+  drive_ok.config_id = config_id;
+  drive_ok.boot_id = 11;
+  drive_ok.epoch = 1;
+  drive_ok.observed_time_us = 1000;
+  drive_ok.count = 1;
+  drive_ok.motors[0] = {drive, Mode::kVelocity, 0, 15.0, 0.0};
+  PublishCommand(drive_pub, drive_ok);
+  node.Tick(1001000);
+  ASSERT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+  ASSERT_TRUE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(node.Status(1001000).timed_out_mask(), 0b10u);
+  EXPECT_EQ(node.Status(1001000).commands_sent(), 1u);
+
+  // A request from the wrong boot and one that addresses another subsystem's
+  // motor each count once.
+  const uint64_t identity_before = node.identity_rejected();
+  const uint64_t ownership_before = node.ownership_rejected();
+  Command stale = drive_ok;
+  stale.boot_id = 10;
+  PublishCommand(drive_pub, stale);
+  node.Tick(1002000);
+  Command cross{};
+  cross.config_id = config_id;
+  cross.boot_id = 11;
+  cross.epoch = 1;
+  cross.observed_time_us = 1000;
+  cross.count = 2;
+  cross.motors[0] = {roller, Mode::kVelocity, 0, 30.0, 0.0};
+  cross.motors[1] = {drive, Mode::kVelocity, 0, 99.0, 0.0};
+  PublishCommand(intake_pub, cross);
+  node.Tick(1003000);
+  const bridge::BridgeStatus counted = node.Status(1003000);
+  EXPECT_EQ(counted.identity_rejected(), identity_before + 1);
+  EXPECT_EQ(counted.ownership_rejected(), ownership_before + 1);
+  EXPECT_EQ(counted.identity_rejected(), node.identity_rejected());
+  EXPECT_EQ(counted.ownership_rejected(), node.ownership_rejected());
+  EXPECT_EQ(counted.driver_station_packets(),
+            node.driver_station_packets_received());
+  EXPECT_EQ(counted.state_age_us(), 3000u);
+  EXPECT_EQ(counted.timed_out_mask(), 0b10u);
+
+  // Every 20 ms of bridge time, not every tick: the last publication was the
+  // first tick at 999000.
+  EXPECT_FALSE(status_sub.read().has_value());
+  node.Tick(1018999);
+  EXPECT_FALSE(status_sub.read().has_value());
+  node.Tick(1019000);
+  published = status_sub.read();
+  ASSERT_TRUE(published.has_value());
+  EXPECT_TRUE(*published == node.Status(1019000));
+  // By now the drivetrain has been quiet past twice its period as well.
+  EXPECT_EQ(published->timed_out_mask(), 0b11u);
+  EXPECT_EQ(published->state_age_us(), 19000u);
+  EXPECT_TRUE(published->configured());
+}
+
+// A timed-out subsystem neutralizes exactly its own motors, digital outputs
+// and PWM channels; another subsystem's merged demand stays in place.
+TEST(HardwareNodeTest, TimeoutNeutralizesOnlyTheSilentSubsystemsActuators) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  const uint16_t drive = cfg.hardware.motors[0].id;
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint16_t beacon = cfg.hardware.digital_outputs[0].id;
+  const uint16_t strip = cfg.hardware.pwm_outputs[0].id;
+  HardwareNode node{cfg, "127.0.0.1", 25830, 25831, true};
+  ASSERT_TRUE(node.Open());
+  node.Tick(999000);
+
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(gateway.Open("127.0.0.1", 25830, "127.0.0.1", 25831),
+            protocol::UdpStatus::kOk);
+  const uint64_t config_id = NodeConfigId(cfg);
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 1000), 1000000));
+
+  ipc::Publisher<talos::hardware::Packet> drive_pub{RequestTopic("drivetrain")};
+  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
+  Command drive_ok{};
+  drive_ok.config_id = config_id;
+  drive_ok.boot_id = 11;
+  drive_ok.epoch = 1;
+  drive_ok.observed_time_us = 1000;
+  drive_ok.count = 1;
+  drive_ok.motors[0] = {drive, Mode::kVelocity, 0, 15.0, 0.0};
+  Command intake_ok = drive_ok;
+  intake_ok.motors[0] = {roller, Mode::kDutyCycle, 0, 0.4, 0.0};
+  intake_ok.digital_output_count = 1;
+  intake_ok.digital_outputs[0] = {beacon, true};
+  intake_ok.pwm_output_count = 1;
+  intake_ok.pwm_outputs[0] = {strip, 0.5};
+  PublishCommand(drive_pub, drive_ok);
+  PublishCommand(intake_pub, intake_ok);
+  node.Tick(1001000);
+
+  const Command& merged = node.current_command();
+  ASSERT_EQ(merged.count, 2u);
+  EXPECT_EQ(merged.motors[0].id, drive);
+  EXPECT_EQ(merged.motors[0].mode, Mode::kVelocity);
+  EXPECT_DOUBLE_EQ(merged.motors[0].demand, 15.0);
+  EXPECT_EQ(merged.motors[1].id, roller);
+  EXPECT_EQ(merged.motors[1].mode, Mode::kDutyCycle);
+  EXPECT_DOUBLE_EQ(merged.motors[1].demand, 0.4);
+  EXPECT_TRUE(merged.digital_outputs[0].value);
+  EXPECT_DOUBLE_EQ(merged.pwm_outputs[0].output, 0.5);
+
+  // The intake goes quiet past twice its 5 ms period; the drivetrain keeps
+  // publishing.
+  PublishCommand(drive_pub, drive_ok);
+  node.Tick(1006000);
+  PublishCommand(drive_pub, drive_ok);
+  node.Tick(1011001);
+
+  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
+  EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+  const Command& neutral = node.current_command();
+  EXPECT_EQ(neutral.motors[0].id, drive);
+  EXPECT_EQ(neutral.motors[0].mode, Mode::kVelocity);
+  EXPECT_DOUBLE_EQ(neutral.motors[0].demand, 15.0);
+  EXPECT_EQ(neutral.motors[1].id, roller);
+  EXPECT_EQ(neutral.motors[1].mode, Mode::kNeutral);
+  EXPECT_DOUBLE_EQ(neutral.motors[1].demand, 0.0);
+  EXPECT_EQ(neutral.digital_outputs[0].id, beacon);
+  EXPECT_FALSE(neutral.digital_outputs[0].value);
+  EXPECT_EQ(neutral.pwm_outputs[0].id, strip);
+  EXPECT_DOUBLE_EQ(neutral.pwm_outputs[0].output, 0.0);
+  EXPECT_EQ(node.Status(1011001).timed_out_mask(), 0b10u);
 }
 
 }  // namespace

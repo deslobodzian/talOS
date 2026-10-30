@@ -29,7 +29,7 @@ bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configurat
 - RoboRIO program (`2026-robot/controller_processor/rio`) builds with GradleRIO,
   not Bazel: `./gradlew phoenixTest` and `./gradlew buildRio` from that directory.
 - Studio (`studio/`): `pnpm test`, `pnpm build` (runs `tsc --noEmit`);
-  regenerate TS bindings with `pnpm generate` after editing `schema/telemetry.fbs`.
+  regenerate TS bindings with `pnpm generate` after editing `talOS/telemetry/telemetry.fbs`.
 - CI also checks changed files with `clang-format-18 --dry-run --Werror`,
   `clang-tidy-18` (repo `.clang-format` / `.clang-tidy`), and
   `buildifier --mode=check --lint=warn` on changed BUILD files. Match them.

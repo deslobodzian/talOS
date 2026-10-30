@@ -18,19 +18,41 @@ def make_executable(path):
         pass
 
 
+def make_writable(path):
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
+            for root, dirs, files in os.walk(path):
+                for d in dirs:
+                    p = os.path.join(root, d)
+                    os.chmod(p, os.stat(p).st_mode | stat.S_IWUSR)
+                for f in files:
+                    p = os.path.join(root, f)
+                    if not os.path.islink(p):
+                        os.chmod(p, os.stat(p).st_mode | stat.S_IWUSR)
+        elif os.path.exists(path) and not os.path.islink(path):
+            os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
+    except Exception:
+        pass
+
+
 def safe_copy(src, dest):
+    parent = os.path.dirname(dest)
+    if parent and os.path.exists(parent):
+        make_writable(parent)
     if os.path.islink(dest) or os.path.exists(dest):
+        make_writable(dest)
         if os.path.isdir(dest) and not os.path.islink(dest):
             shutil.rmtree(dest)
         else:
             os.remove(dest)
-    parent = os.path.dirname(dest)
     if parent:
         os.makedirs(parent, exist_ok=True)
     if os.path.isdir(src):  # a tree artifact, e.g. talos_messages' Python
-        shutil.copytree(src, dest)
+        shutil.copytree(src, dest, symlinks=False)
     else:
         shutil.copy2(src, dest, follow_symlinks=True)
+    make_writable(dest)
 
 
 def safe_symlink(target, link_path):
@@ -121,7 +143,6 @@ def main():
         if rf_entries:
             rf_dir = os.path.join(bin_dir, f"{name}.runfiles")
             os.makedirs(rf_dir, exist_ok=True)
-            manifest_lines = []
             repo_mapping_src = None
             python_bin_path = None
 
@@ -135,26 +156,13 @@ def main():
 
                 if rf_rel.endswith("bin/python3") and ".venv" in rf_rel:
                     # Defer venv python3 until target hermetic python binary is copied
-                    pass
-                else:
-                    if os.path.exists(rf_src):
-                        try:
-                            safe_copy(rf_src, dest)
-                        except Exception:
-                            if os.path.islink(rf_src):
-                                link_target = os.readlink(rf_src)
-                                if os.path.islink(dest) or os.path.exists(dest):
-                                    os.remove(dest)
-                                os.symlink(link_target, dest)
-                    elif os.path.islink(rf_src):
-                        link_target = os.readlink(rf_src)
-                        if os.path.islink(dest) or os.path.exists(dest):
-                            os.remove(dest)
-                        os.symlink(link_target, dest)
+                    continue
 
-                if rf_rel.endswith("bin/python3") and "rules_python" in rf_rel and not ".venv" in rf_rel:
+                if os.path.exists(rf_src):
+                    safe_copy(rf_src, dest)
+
+                if rf_rel.endswith("bin/python3") and "rules_python" in rf_rel and ".venv" not in rf_rel:
                     python_bin_path = dest
-                manifest_lines.append(f"{rf_rel} {dest}\n")
                 if rf_rel.endswith(".repo_mapping") or rf_rel == "_repo_mapping":
                     repo_mapping_src = rf_src
 
@@ -173,13 +181,9 @@ def main():
                         os.symlink(rel_py, dest)
                         make_executable(dest)
 
-            with open(os.path.join(rf_dir, "MANIFEST"), "w") as mf:
-                mf.writelines(manifest_lines)
-
             if repo_mapping_src and os.path.exists(repo_mapping_src):
                 safe_copy(repo_mapping_src, os.path.join(rf_dir, "_repo_mapping"))
                 safe_copy(repo_mapping_src, os.path.join(bin_dir, f"{name}.repo_mapping"))
-
         # Every label the robot config may name this node by.
         targets = [t for t in (target, node.get("label")) if t]
         manifest_nodes.append({
@@ -217,21 +221,27 @@ SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 export PATH="${{SCRIPT_DIR}}/bin:${{PATH}}"
 
 unset BUILD_WORKSPACE_DIRECTORY
+unset RUNFILES_DIR RUNFILES_MANIFEST_FILE JAVA_RUNFILES PYTHON_RUNFILES PYTHONPATH VIRTUAL_ENV PYTHONHOME
 cd "${{SCRIPT_DIR}}"
 
 has_config=false
+has_output_dir=false
 for arg in "$@"; do
-  if [[ "$arg" == "--config" ]]; then
-    has_config=true
-    break
-  fi
+  case "$arg" in
+    --config|--config=*) has_config=true ;;
+    --output-dir|--output-dir=*) has_output_dir=true ;;
+  esac
 done
 
-if [[ "$has_config" == "true" ]]; then
-  exec "./launcher" --bundle "${{SCRIPT_DIR}}" "$@"
-else
-  exec "./launcher" --bundle "${{SCRIPT_DIR}}" --config "config/{config_basename}" "$@"
+extra_args=()
+if [[ "$has_config" == "false" ]]; then
+  extra_args+=(--config "config/{config_basename}")
 fi
+if [[ "$has_output_dir" == "false" && -n "${{TALOS_LOG_DIR:-}}" ]]; then
+  extra_args+=(--output-dir "${{TALOS_LOG_DIR}}")
+fi
+
+exec "./launcher" --bundle "${{SCRIPT_DIR}}" ${{extra_args[@]+"${{extra_args[@]}}"}} "$@"
 """)
     make_executable(run_sh_path)
 

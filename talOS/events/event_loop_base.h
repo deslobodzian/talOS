@@ -12,6 +12,7 @@
 
 #include "talOS/events/callback.h"
 #include "talOS/events/context.h"
+#include "talOS/events/delivery.h"
 #include "talOS/events/manifest.h"
 #include "talOS/events/recorder.h"
 #include "talOS/events/time.h"
@@ -266,6 +267,8 @@ class EventLoopBase {
     }
     start_time_ = start;
   }
+
+  bool registration_closed() const { return registration_closed_; }
 
   // Marks the loop as being inside its run function, which is what makes a
   // timer change from another thread detectable.

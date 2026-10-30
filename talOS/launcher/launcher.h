@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -64,7 +65,11 @@ struct NodeProcessInfo {
   std::string name;
   std::string target;
   std::string binary_path;
-  std::string log_path;  // Empty for a process that writes no event log.
+  std::string log_path;  // First run's event log; empty for none.
+  // Every event log the node wrote, first run first: log_path, then
+  // `<name>.restart<k>.tlog` for restart k. Empty when log_path is.
+  std::vector<std::string> log_paths;
+  int restart_count{0};
   pid_t pid{-1};
   int exit_code{-1};
   bool exited{false};
@@ -106,8 +111,14 @@ struct SessionManifest {
       ss << "      \"target\": " << Quoted(n.target) << ",\n";
       ss << "      \"binary_path\": " << Quoted(n.binary_path) << ",\n";
       ss << "      \"log_path\": " << Quoted(n.log_path) << ",\n";
+      ss << "      \"log_paths\": [";
+      for (std::size_t j = 0; j < n.log_paths.size(); ++j) {
+        ss << (j ? ", " : "") << Quoted(n.log_paths[j]);
+      }
+      ss << "],\n";
       ss << "      \"pid\": " << n.pid << ",\n";
       ss << "      \"exit_code\": " << n.exit_code << ",\n";
+      ss << "      \"restart_count\": " << n.restart_count << ",\n";
       ss << "      \"recorder_failed\": " << (n.failed ? "true" : "false")
          << ",\n";
       ss << "      \"described\": " << (n.described ? "true" : "false")
@@ -141,6 +152,9 @@ struct LauncherOptions {
 
   // Studio HTTP port override. Zero means "take [studio] http_port".
   uint16_t studio_http_port{0};
+
+  // Restart budget per crashed node. Unset means "take [robot] max_restarts".
+  std::optional<int> max_restarts;
 
   // Launch a graph the linter called broken anyway. The default is refusal:
   // two spellings of one topic are silent at runtime.
@@ -654,15 +668,89 @@ inline std::string GraphToJson(
 }
 
 // ---------------------------------------------------------------------------
+// Restarts
+//
+// A roster member other than the Studio bridge that crashes -- exits nonzero
+// or by a signal -- while the session is not stopping is respawned after a
+// backoff of 50 ms, doubling per restart, capped at 1 s, at most max_restarts
+// times. A clean exit is a node that finished and stays finished. The backoff
+// is scheduled inside the supervision loop, so a restarting node never delays
+// another node or the session deadline. Every run writes its own event log.
+// ---------------------------------------------------------------------------
+
+inline constexpr int kDefaultMaxRestarts = 5;
+inline constexpr std::chrono::milliseconds kRestartInitialBackoff{50};
+inline constexpr std::chrono::milliseconds kRestartMaxBackoff{1000};
+
+// The wait before restart `restart` (1 for the first).
+inline std::chrono::milliseconds RestartBackoff(int restart) {
+  std::chrono::milliseconds backoff = kRestartInitialBackoff;
+  for (int i = 1; i < restart && backoff < kRestartMaxBackoff; ++i) {
+    backoff *= 2;
+  }
+  return std::min(backoff, kRestartMaxBackoff);
+}
+
+// A node's event log for run `restart` (0 for the first run): `<name>.tlog`,
+// then `<name>.restart<k>.tlog`, so a restart never truncates an earlier run.
+inline std::string NodeLogPath(const std::string& output_dir,
+                               std::string_view name, int restart) {
+  std::string path = output_dir + "/" + std::string{name};
+  if (restart > 0) path += ".restart" + std::to_string(restart);
+  return path + ".tlog";
+}
+
+// True for a crash the budget still covers in a session that is not stopping.
+inline bool ShouldRestartNode(bool clean_exit, int restarts_made,
+                              int max_restarts, bool stopping) {
+  return !clean_exit && !stopping && restarts_made < max_restarts;
+}
+
+// `--max-restarts` wins, then `[robot] max_restarts`, then the default.
+inline bool ResolveMaxRestarts(const config::RobotConfig& robot_config,
+                               const LauncherOptions& options, int& out,
+                               std::string& error) {
+  if (options.max_restarts) {
+    if (*options.max_restarts < 0) {
+      error = "--max-restarts must be >= 0";
+      return false;
+    }
+    out = *options.max_restarts;
+    return true;
+  }
+  const auto node = robot_config.toml_data["robot"]["max_restarts"];
+  if (!node) {
+    out = kDefaultMaxRestarts;
+    return true;
+  }
+  const auto* value = node.as_integer();
+  if (value == nullptr || value->get() < 0 ||
+      value->get() > std::numeric_limits<int>::max()) {
+    error = "[robot] max_restarts must be an integer >= 0";
+    return false;
+  }
+  out = static_cast<int>(value->get());
+  return true;
+}
+
+// "exit code N" or "signal N", from a waitpid status.
+inline std::string ExitReason(int status) {
+  if (WIFSIGNALED(status)) return "signal " + std::to_string(WTERMSIG(status));
+  return "exit code " +
+         std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+}
+
+// ---------------------------------------------------------------------------
 // Studio bridge
 //
-// The one roster member supervised differently. It takes positional wire args
+// The one roster member supervised differently. It takes positional args
 // rather than the node flags, logs plaintext to studio_bridge.log rather than
 // a .tlog, and refuses to start before the telemetry publisher exists -- so
 // its first attempts usually lose that race. It is retried at most once per
 // interval, inside the supervision loop, within a bounded window; while it is
 // still starting it neither holds the session open nor reports its exits. A
-// bridge that survives one interval is stable and supervised like any node.
+// bridge that survives one interval is stable and supervised like any node,
+// except that a crash is not restarted (see Restarts above).
 // One that never comes up is a degraded session, not a broken robot: it is
 // marked failed and the session runs on without Studio.
 // ---------------------------------------------------------------------------
@@ -720,8 +808,6 @@ class StudioBridge {
         args_{spec.binary_path,
               "--drop-newest-publisher",
               StudioBridgeWatchTopic(described, robot_config),
-              "127.0.0.1",
-              std::to_string(robot_config.studio.udp_port),
               std::to_string(http_port_),
               robot_config.studio.webroot,
               "--declared",
@@ -878,6 +964,12 @@ class Launcher {
       }
       return 1;
     }
+    std::string restart_error;
+    if (!ResolveMaxRestarts(robot_config, options_, max_restarts_,
+                            restart_error)) {
+      std::cerr << "launcher: " << restart_error << "\n";
+      return 1;
+    }
 
     const auto node_specs = DiscoverNodes(robot_config, options_);
     if (node_specs.empty()) {
@@ -926,12 +1018,16 @@ class Launcher {
       proc.name = spec.name;
       proc.target = spec.target;
       proc.binary_path = spec.binary_path;
-      proc.log_path = options_.output_dir + "/" + spec.name + ".tlog";
+      // The gateway is started without --log, so it writes no event log.
+      if (spec.name != kSimGatewayName) {
+        proc.log_path = NodeLogPath(options_.output_dir, spec.name, 0);
+      }
       proc.described = described[i].answered;
       if (spec.name == kStudioBridgeName) {
         studio.emplace(i, spec, proc, robot_config, options_, described,
                        graph_path);
       }
+      if (!proc.log_path.empty()) proc.log_paths.push_back(proc.log_path);
     }
 
     InstallSignals();
@@ -951,18 +1047,22 @@ class Launcher {
     std::cout << "[launcher] Controller " << remote << ":" << remote_port
               << " (local port " << local_port << ")\n";
 
+    std::vector<NodeLaunch> launches(procs.size());
     for (std::size_t i = 0; i < procs.size(); ++i) {
       if (studio && i == studio->index()) continue;
       auto& proc = procs[i];
-      std::vector<std::string> args{node_specs[i].binary_path};
+      auto& args = launches[i].args;
+      args.push_back(node_specs[i].binary_path);
       if (proc.name == kSimGatewayName) {
         // The gateway stamps the config's config_id; unconfigured it stamps
         // 0, which every mechanism rejects.
         args.insert(args.end(), {"--config", options_.config_path});
       } else {
+        args.insert(args.end(), {"--session-id",
+                                 std::to_string(options_.session_id), "--log"});
+        launches[i].log_arg = args.size();
         args.insert(args.end(),
-                    {"--session-id", std::to_string(options_.session_id),
-                     "--log", proc.log_path, "--config", options_.config_path});
+                    {proc.log_path, "--config", options_.config_path});
         if (options_.simulation) args.push_back("--sim");
         if (proc.name == kHardwareNodeName) {
           args.insert(args.end(), {"--remote", remote, "--remote-port",
@@ -975,7 +1075,7 @@ class Launcher {
                     {"--duration-s", std::to_string(options_.duration_s)});
       }
 
-      const pid_t pid = SpawnProcess(std::move(args));
+      const pid_t pid = SpawnProcess(args);
       if (pid < 0) {
         std::cerr << "[launcher] fork() failed for node " << proc.name << "\n";
         proc.failed = true;
@@ -987,19 +1087,21 @@ class Launcher {
     }
     if (studio) studio->Start(procs[studio->index()]);
 
-    Supervise(procs, studio, deadline);
+    Supervise(procs, launches, studio, deadline);
     manifest.end_wall_ns = WallNanos();
 
     int exit_status = 0;
     for (auto& proc : procs) {
-      if (!proc.log_path.empty() && std::filesystem::exists(proc.log_path)) {
+      // Every run's log: a restarted node's records are the sum of its runs.
+      for (const auto& path : proc.log_paths) {
+        if (!std::filesystem::exists(path)) continue;
         try {
-          event::log::LogReader reader{proc.log_path};
+          event::log::LogReader reader{path};
           event::log::LogReader::Record record;
           while (reader.next(record)) {
           }
-          proc.record_count = reader.record_count();
-          proc.failed = reader.truncated();
+          proc.record_count += reader.record_count();
+          if (reader.truncated()) proc.failed = true;
         } catch (...) {
           proc.failed = true;
         }
@@ -1014,6 +1116,14 @@ class Launcher {
   }
 
  private:
+  // How one roster member is spawned, and its pending restart.
+  struct NodeLaunch {
+    std::vector<std::string> args;
+    std::size_t log_arg{0};  // Index of the --log value in args; 0 for none.
+    bool restart_pending{false};
+    std::chrono::steady_clock::time_point restart_at{};
+  };
+
   static int64_t WallNanos() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -1026,36 +1136,90 @@ class Launcher {
     std::signal(SIGTERM, [](int) { stop_requested_ = true; });
   }
 
+  // Respawns a crashed node into a fresh event log.
+  void Restart(NodeProcessInfo& proc, NodeLaunch& launch) {
+    launch.restart_pending = false;
+    const int restart = proc.restart_count + 1;
+    if (launch.log_arg != 0) {
+      launch.args[launch.log_arg] =
+          NodeLogPath(options_.output_dir, proc.name, restart);
+    }
+    const pid_t pid = SpawnProcess(launch.args);
+    if (pid < 0) {
+      std::cerr << "[launcher] fork() failed restarting node " << proc.name
+                << "\n";
+      proc.failed = true;
+      return;
+    }
+    if (launch.log_arg != 0)
+      proc.log_paths.push_back(launch.args[launch.log_arg]);
+    proc.restart_count = restart;
+    proc.pid = pid;
+    proc.exited = false;
+    proc.exit_code = -1;
+  }
+
   // Waits until every node has exited, SIGINTing them all once on a signal or
-  // at the deadline. A bridge that is still starting does not hold it open.
+  // at the deadline. A crashed node is restarted per the policy above without
+  // blocking the loop; a pending restart holds the session open until it
+  // fires or the session stops. A bridge that is still starting does not hold
+  // it open.
   void Supervise(std::vector<NodeProcessInfo>& procs,
+                 std::vector<NodeLaunch>& launches,
                  std::optional<StudioBridge>& studio,
                  std::chrono::steady_clock::time_point deadline) {
     bool stop_sent = false;
     for (;;) {
       const auto now = std::chrono::steady_clock::now();
       const bool past_deadline = now >= deadline;
-      bool all_done = true;
+      const bool stopping = stop_requested_ != 0 || stop_sent || past_deadline;
       for (std::size_t i = 0; i < procs.size(); ++i) {
         auto& proc = procs[i];
         if (proc.pid <= 0 || proc.exited) continue;
         int status = 0;
-        if (::waitpid(proc.pid, &status, WNOHANG) == proc.pid) {
-          proc.exited = true;
-          proc.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-          if (!(studio && studio->Starting(i))) {
-            std::cout << "[launcher] Process " << proc.name << " (pid "
-                      << proc.pid << ") exited with code " << proc.exit_code
-                      << "\n";
-          }
+        if (::waitpid(proc.pid, &status, WNOHANG) != proc.pid) continue;
+        proc.exited = true;
+        proc.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        const bool is_bridge = studio && i == studio->index();
+        if (is_bridge && studio->Starting(i)) continue;
+        const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        if (!is_bridge && ShouldRestartNode(clean, proc.restart_count,
+                                            max_restarts_, stopping)) {
+          const int restart = proc.restart_count + 1;
+          const auto backoff = RestartBackoff(restart);
+          launches[i].restart_pending = true;
+          launches[i].restart_at = now + backoff;
+          std::cout << "[launcher] " << proc.name << " exited ("
+                    << ExitReason(status) << "); restart " << restart << "/"
+                    << max_restarts_ << " in " << backoff.count() << " ms\n";
+          continue;
         }
-      }
-      if (studio) {
-        studio->Supervise(procs[studio->index()], now,
-                          stop_requested_ != 0 || stop_sent || past_deadline);
+        std::cout << "[launcher] Process " << proc.name << " (pid " << proc.pid
+                  << ") exited with code " << proc.exit_code;
+        if (!is_bridge && !clean && !stopping && max_restarts_ > 0) {
+          std::cout << "; restart limit (" << max_restarts_ << ") reached";
+        }
+        std::cout << "\n";
       }
       for (std::size_t i = 0; i < procs.size(); ++i) {
+        auto& launch = launches[i];
+        if (!launch.restart_pending) continue;
+        // A stopping session ends with the crash as the node's last word.
+        if (stopping) {
+          launch.restart_pending = false;
+        } else if (now >= launch.restart_at) {
+          Restart(procs[i], launch);
+        }
+      }
+      if (studio) studio->Supervise(procs[studio->index()], now, stopping);
+
+      bool all_done = true;
+      for (std::size_t i = 0; i < procs.size(); ++i) {
         const auto& proc = procs[i];
+        if (launches[i].restart_pending) {
+          all_done = false;
+          break;
+        }
         if (proc.pid <= 0 || proc.exited) continue;
         if (studio && studio->Starting(i)) continue;
         all_done = false;
@@ -1131,6 +1295,7 @@ class Launcher {
     for (const auto& n : manifest.nodes) {
       std::cout << "  \u2022 " << n.name << " (pid=" << n.pid
                 << ", exit=" << n.exit_code << ", records=" << n.record_count
+                << ", restarts=" << n.restart_count
                 << ", failed=" << (n.failed ? "yes" : "no")
                 << ", log=" << n.log_path << ")\n";
     }
@@ -1140,6 +1305,7 @@ class Launcher {
   }
 
   LauncherOptions options_;
+  int max_restarts_{kDefaultMaxRestarts};
   static inline volatile std::sig_atomic_t stop_requested_{false};
 };
 

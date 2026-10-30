@@ -185,8 +185,8 @@ TEST(RealtimeEventLoop, ReaderExhaustionFailsRegistrationAndAllowsRetry) {
 
 // The point of the whole design: the realtime run is full of jitter, dropped
 // messages and scheduling noise, and replaying its log still reproduces every
-// output exactly.
-TEST(RealtimeEventLoop, ReplayOfARealtimeRunDoesNotDiverge) {
+// output exactly, whichever way the run delivered its messages.
+void ExpectRealtimeRunReplays(Delivery delivery) {
   const Topics topics = realtime_topics();
   const std::string path = temp_path("run");
 
@@ -196,6 +196,7 @@ TEST(RealtimeEventLoop, ReplayOfARealtimeRunDoesNotDiverge) {
 
   {
     RecordingLoop loop{log::LogWriter{path, "realtime_robot"}};
+    loop.set_delivery(delivery);
     TestRobot<RecordingLoop> robot{loop, topics, 3.0F};
 
     // Derived from the loop's clock, not the OS clock, which is what lets the
@@ -262,6 +263,74 @@ TEST(RealtimeEventLoop, ReplayOfARealtimeRunDoesNotDiverge) {
   EXPECT_EQ(replayed_robot.dropped_sensors(), dropped);
 
   std::remove(path.c_str());
+}
+
+TEST(RealtimeEventLoop, ReplayOfARealtimeRunDoesNotDiverge) {
+  ExpectRealtimeRunReplays(Delivery::POLL);
+}
+
+TEST(RealtimeEventLoop, ReplayOfABeforeTimersRunDoesNotDiverge) {
+  ExpectRealtimeRunReplays(Delivery::BEFORE_TIMERS);
+}
+
+struct Wakeups {
+  std::uint64_t fired{0};
+  RealtimeEventLoop<>::Activity activity{};
+};
+
+// A 100 Hz program with one watched topic, run for 200 ms.
+Wakeups RunPeriodicProgram(Delivery delivery, const std::string& topic) {
+  RealtimeEventLoop<> loop;
+  loop.set_delivery(delivery);
+  register_sensor_watcher(loop, topic);
+  Wakeups result;
+  auto handler = [&result](const Context&) { ++result.fired; };
+  const std::uint16_t id = loop.register_timer("tick", make_thunk(&handler));
+  Timer<RealtimeEventLoop<>> timer{&loop, id};
+  timer.setup_periodic(loop.monotonic_now() + 10ms, 10ms);
+  loop.run_for(200ms);
+  result.activity = loop.activity();
+  return result;
+}
+
+// What the delivery policy is for: a periodic program that only reads its
+// topics at its own tick sleeps between ticks instead of waking every
+// millisecond to drain.
+TEST(RealtimeEventLoop, BeforeTimersWakesOnlyForTimers) {
+  const std::string pid = std::to_string(::getpid());
+  const Wakeups poll = RunPeriodicProgram(Delivery::POLL, "/twp_" + pid);
+  const Wakeups before =
+      RunPeriodicProgram(Delivery::BEFORE_TIMERS, "/twb_" + pid);
+  std::printf(
+      "100 Hz program over 200 ms: POLL %llu wakeups, %llu drains; "
+      "BEFORE_TIMERS %llu wakeups, %llu drains, %llu timer firings\n",
+      static_cast<unsigned long long>(poll.activity.wakeups),
+      static_cast<unsigned long long>(poll.activity.drains),
+      static_cast<unsigned long long>(before.activity.wakeups),
+      static_cast<unsigned long long>(before.activity.drains),
+      static_cast<unsigned long long>(before.fired));
+
+  // Loaded CI steals time, so these bound shapes rather than exact counts.
+  EXPECT_GT(poll.activity.drains, 50u);
+  EXPECT_GT(poll.activity.wakeups, 50u);
+
+  EXPECT_GT(before.fired, 0u);
+  EXPECT_EQ(before.activity.drains, before.fired);  // one per timer dispatch
+  EXPECT_LE(before.activity.wakeups, 2 * before.fired + 2);
+  EXPECT_LT(before.activity.wakeups, 50u);
+}
+
+TEST(RealtimeEventLoop, DeliveryIsFixedOnceTheRunStarts) {
+  RealtimeEventLoop<> loop;
+  auto handler = [&loop](const Context&) {
+    EXPECT_THROW(loop.set_delivery(Delivery::POLL), std::logic_error);
+    loop.exit();
+  };
+  const std::uint16_t id = loop.register_timer("tick", make_thunk(&handler));
+  loop.arm_timer(id, loop.monotonic_now() + 1ms, Duration::zero());
+  loop.set_delivery(Delivery::BEFORE_TIMERS);
+  loop.run_for(1s);
+  EXPECT_EQ(loop.delivery(), Delivery::BEFORE_TIMERS);
 }
 
 }  // namespace

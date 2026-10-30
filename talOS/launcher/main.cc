@@ -62,6 +62,11 @@ int main(int argc, char** argv) {
         options.describe_only = true;
       } else if (arg == "--describe-timeout-ms" && i + 1 < argc) {
         options.describe_timeout_ms = std::stoi(argv[++i]);
+      } else if (arg == "--max-restarts" && i + 1 < argc) {
+        options.max_restarts = std::stoi(argv[++i]);
+        if (*options.max_restarts < 0) {
+          throw std::invalid_argument("--max-restarts must be >= 0");
+        }
       } else if (arg == "--help" || arg == "-h") {
         std::cout << "usage: launcher (--config PATH | --bundle PATH) "
                      "[--output-dir PATH] "
@@ -69,6 +74,7 @@ int main(int argc, char** argv) {
                      "[--start-sim-gateway] [--start-studio-bridge] "
                      "[--studio-http-port PORT] [--describe-only] "
                      "[--allow-graph-errors] [--describe-timeout-ms MS] "
+                     "[--max-restarts N] "
                      "[--remote IP] [--remote-port PORT] [--local-port PORT]\n"
                      "\n"
                      "  --bundle PATH          launch from a bundle directory "
@@ -84,7 +90,10 @@ int main(int argc, char** argv) {
                      "                         graph they describe, and exit "
                      "without starting a robot\n"
                      "  --allow-graph-errors   start anyway when the declared "
-                     "graph has errors\n";
+                     "graph has errors\n"
+                     "  --max-restarts N       restarts per crashed node; "
+                     "overrides [robot] max_restarts\n"
+                     "                         (default 5, 0 disables)\n";
         return 0;
       } else {
         throw std::invalid_argument("unknown argument: " + arg);

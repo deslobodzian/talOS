@@ -47,7 +47,6 @@ struct BridgeStats {
   std::size_t clients{0};
   std::uint64_t frames_forwarded{0};
   std::uint64_t invalid{0};
-  std::uint64_t udp_drops{0};
   std::uint64_t ws_drops{0};
 };
 
@@ -361,8 +360,6 @@ inline std::string SystemGraphJson(const SystemGraphInput& input) {
   AppendU64(out, input.bridge.frames_forwarded);
   out += ",\"invalid\":";
   AppendU64(out, input.bridge.invalid);
-  out += ",\"udp_drops\":";
-  AppendU64(out, input.bridge.udp_drops);
   out += ",\"ws_drops\":";
   AppendU64(out, input.bridge.ws_drops);
   out += '}';
@@ -382,64 +379,6 @@ inline std::string SystemGraphJson(const SystemGraphInput& input) {
   }
   out += "]}";
 
-  return out;
-}
-
-// --- datagram framing ------------------------------------------------------
-//
-// The UDP path carries both message families, so a datagram has to say which
-// one it is. Telemetry frames start with a FlatBuffers size prefix, so system
-// graphs get an explicit tag instead of relying on the shape of the bytes.
-//
-// It also has to be chunked. macOS caps a UDP datagram at net.inet.udp.maxdgram
-// (9216 bytes by default, and raising it needs root), while a graph for a real
-// robot runs to tens of kilobytes -- seven nodes already produce 11 KB, and the
-// endpoint attributes added since cost roughly 60 bytes per source. Sending it
-// whole fails with EMSGSIZE, which is silent from the desktop app's side: the
-// System tab would simply stay empty forever while the WebSocket client worked
-// fine. So the document is split, and the receiver reassembles.
-inline constexpr std::string_view kSystemDatagramTag = "TSYS";
-
-// tag(4) + document id(2, little-endian) + chunk index(1) + chunk count(1).
-inline constexpr std::size_t kSystemHeaderBytes = 8;
-
-// Comfortably inside the 9216-byte cap with room for the header and for a
-// smaller limit on some other host.
-inline constexpr std::size_t kSystemChunkBytes = 8000;
-
-// One byte of header addresses the chunk index, so this is a hard ceiling, not
-// a tuning knob. A registry filled to its own capacity -- 32 nodes of 64
-// sources, longest names, saturated counters -- produces 1.4 MB and 180 chunks,
-// which system_test asserts on and prints: the margin is real but it is not
-// large, and widening a row is now a decision that has to look at that number.
-inline constexpr std::size_t kMaxSystemChunks = 255;
-
-// Splits `json` into datagrams. Returns empty when the document needs more
-// chunks than the framing can address, which the registry's own capacities put
-// far out of reach: reporting nothing is better than sending a document the
-// receiver would silently assemble wrong.
-inline std::vector<std::string> SystemDatagrams(std::string_view json,
-                                                std::uint16_t document_id) {
-  const std::size_t chunks =
-      json.empty() ? 1
-                   : (json.size() + kSystemChunkBytes - 1) / kSystemChunkBytes;
-  if (chunks > kMaxSystemChunks) {
-    return {};
-  }
-
-  std::vector<std::string> out;
-  out.reserve(chunks);
-  for (std::size_t i = 0; i < chunks; ++i) {
-    std::string datagram;
-    datagram.reserve(kSystemHeaderBytes + kSystemChunkBytes);
-    datagram += kSystemDatagramTag;
-    datagram += static_cast<char>(document_id & 0xFF);
-    datagram += static_cast<char>((document_id >> 8) & 0xFF);
-    datagram += static_cast<char>(i);
-    datagram += static_cast<char>(chunks);
-    datagram += json.substr(i * kSystemChunkBytes, kSystemChunkBytes);
-    out.push_back(std::move(datagram));
-  }
   return out;
 }
 

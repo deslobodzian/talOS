@@ -337,6 +337,65 @@ class MessageTest(unittest.TestCase):
         self.assertEqual(repr(sim.latest(Report, "/report")),
                          "Report(phase=9, height_rot=0.0)")
 
+    def test_byte_topics_and_relative_topic_remapping(self):
+        class Telemeter:
+            def __init__(self, node):
+                self.node = node
+                self.goal = node.subscribe(Goal, "goal")
+                self.status = node.publish(Status, "status")
+                self.frames = node.publish_bytes("frames", 6, slots=16,
+                                                 drop_newest=True,
+                                                 external=True)
+                self.sent = []
+
+            def update(self):
+                if self.goal.has_value:
+                    self.status.send(height_rot=self.goal.value.height_rot,
+                                     at_goal=True, tick=self.node.tick)
+                payload = bytearray(range(self.node.tick + 1))
+                self.sent.append(self.frames.send(memoryview(payload)))
+
+        sim = Sim.from_toml("""
+[robot]
+period_us = 10000
+command_timeout_us = 100000
+
+[subsystems.planner.motors.m]
+can_id = 1
+
+[subsystems.follower.remap]
+goal = "/planner/goal"
+"/follower/status" = "/remapped/status"
+frames = "/remapped/frames"
+""")
+        telemeter = sim.add(Telemeter, "planner")
+        remapped = sim.add(Telemeter, "follower")
+        self.assertIsNone(sim.latest_bytes("/planner/frames"))
+
+        sim.publish(Goal, "/planner/goal", height_rot=3.5)
+        sim.step(0.035)  # ticks 0, 1, 2
+        self.assertEqual(sim.latest(Status, "/planner/status").height_rot, 3.5)
+        self.assertEqual(sim.latest(Status, "/remapped/status").height_rot, 3.5)
+        self.assertEqual(sim.latest_bytes("/planner/frames"), b"\x00\x01\x02")
+        self.assertEqual(sim.latest_bytes("/remapped/frames"), b"\x00\x01\x02")
+        self.assertEqual(telemeter.sent, [True, True, True])
+
+        # Oversize returns False and preserves the last valid frame; empty works.
+        self.assertFalse(telemeter.frames.send(b"1234567"))
+        self.assertEqual(sim.latest_bytes("/planner/frames"), b"\x00\x01\x02")
+        self.assertTrue(telemeter.frames.send(b""))
+        self.assertEqual(sim.latest_bytes("/planner/frames"), b"")
+        self.assertIsNotNone(remapped)
+        with self.assertRaises(TypeError):
+            telemeter.frames.send("not bytes")
+
+        class BadBytes:
+            def __init__(self, node):
+                node.publish_bytes("frames", 0)
+
+        with self.assertRaises(talos.TalosError):
+            sim.add(BadBytes, "planner")
+
 
 if __name__ == "__main__":
     unittest.main()

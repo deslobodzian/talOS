@@ -4,27 +4,42 @@ Build from the monorepo root using Bazel:
 
 ```sh
 bazel build //studio/bridge:studio_bridge //studio/bridge:studio_mock
-bazel test //studio/schema:wire_test //studio/bridge:system_test \
-  //studio/bridge:integration_test
+bazel test //talOS/telemetry:wire_test //studio/bridge:system_test \
+  //studio/bridge:telemetry_test //studio/bridge:integration_test
 ```
 
 The monorepo pins FlatBuffers, uWebSockets v20.51.0 and its uSockets
 submodule. SSL and WebSocket compression are disabled for this local bridge.
-The bridge itself never parses FlatBuffers.
+The bridge forwards frames without parsing them; it also decodes the v2
+feed to keep the latest dictionary and frame for the JSON views below.
 
 Build `studio/dist` using the frontend instructions. In separate terminals:
 
 ```sh
 bazel-bin/studio/bridge/studio_mock /talos/telemetry
-bazel-bin/studio/bridge/studio_bridge --drop-newest-publisher /talos/telemetry 127.0.0.1 5801 5800 studio/dist
+bazel-bin/studio/bridge/studio_bridge --drop-newest-publisher /talos/telemetry 5800 studio/dist
 ```
 
-The positional arguments are topic, destination IPv4 address, UDP destination
-port, HTTP/WebSocket port and static web directory. `--declared PATH` may appear
-anywhere on the line and does not shift them. Open `http://localhost:5800`;
-binary frames arrive at `/telemetry`. The mock emits deterministic 200 Hz data
-with nanosecond timestamps and source sequence IDs. Sequence IDs advance even
-when a full queue rejects a frame, exposing the gap downstream.
+The positional arguments are topic, HTTP/WebSocket port and static web
+directory. `--declared PATH` may appear anywhere on the line and does not shift
+them. Open `http://localhost:5800`; binary frames arrive at `/telemetry`. The
+frame schema and slot geometry live in `//talOS/telemetry` (`telemetry.fbs`,
+`wire.h`). The mock emits v2 frames at 200 Hz — a dictionary frame first and
+every 100th frame after it, value-only frames between — with nanosecond
+timestamps and source sequence IDs. Sequence IDs advance even when a full
+queue rejects a frame, exposing the gap downstream.
+
+On connect, a WebSocket client gets the system graph as a text frame and then
+the bridge's cached dictionary frame as a binary frame, so its first value
+frame is already decodable. Two HTTP views describe the same feed as JSON:
+`GET /channels.json` returns the dictionary document
+(`talos.telemetry.channels`, version 2), and `GET /telemetry.json` returns
+the latest frame self-described (`talos.telemetry`, version 2) — channel
+names, units and enum labels joined in, uint64 as decimal strings, `NaN`
+(absent or stale on the wire) as `null`, an enum `label` only for in-range
+values, and `age_ms` since the bridge received the frame. Both answer **503**
+until a dictionary (and, for `/telemetry.json`, an aligned frame) has
+arrived: "not known yet" is not "the robot is doing nothing".
 
 ## The system graph
 
@@ -32,13 +47,11 @@ Telemetry says what one node chose to publish. It does not say what is running,
 and a subscriber waiting on a topic nothing publishes looks identical from the
 inside to a healthy one. So the bridge also serves the live node registry: it
 maps `/talos_registry.1` read-only, rebuilds a JSON document from it every 250
-ms, and sends that document three ways. WebSocket clients on `/telemetry` get it
+ms, and sends that document two ways. WebSocket clients on `/telemetry` get it
 as a **text** frame, so a client tells the two message families apart by frame
-type rather than by sniffing bytes. The desktop UDP path has no such framing, so
-there it is a datagram prefixed with the four bytes `TSYS`; telemetry frames
-begin with a FlatBuffers size prefix and are sent unchanged. `GET /system.json`
-returns the same document, which is what makes `curl localhost:5800/system.json`
-a complete answer to "what is running" with no build step and no client.
+type rather than by sniffing bytes. `GET /system.json` returns the same
+document, which is what makes `curl localhost:5800/system.json` a complete
+answer to "what is running" with no build step and no client.
 
 The registry is opened lazily and reopened on each refresh until it appears, so
 the bridge can be started before the robot — a viewer that refuses to run until
@@ -66,8 +79,8 @@ capacities and client counts, stay numbers so a reader does not have to parse
 them. This is the same rule the telemetry timestamps already follow.
 
 The bridge reports itself in the document as well: its topic, connected client
-count, frames forwarded, and the malformed envelopes and rejected UDP and
-WebSocket sends from its shutdown summary. It holds a reader slot on the
+count, frames forwarded, and the malformed envelopes and rejected WebSocket
+sends from its shutdown summary. It holds a reader slot on the
 telemetry topic and it is where frames go missing when a client cannot keep up,
 so it is a participant in the system rather than a neutral observer of it.
 
@@ -90,8 +103,7 @@ tried:
 
 `bridged` and `unconnected` exist because the two states below them used to
 absorb topics that were never broken. `/hw/command` is consumed by the RoboRIO
-across the UDP link and will never have a shared-memory subscriber;
-`/hw/command/override` is a debug hook nothing publishes. Reporting a designed
+across the UDP link and will never have a shared-memory subscriber. Reporting a designed
 dead-end as a fault trains people to ignore the report, which is worse than not
 having one — so those get their own names and `orphaned` and `unread` keep
 meaning exactly what they meant. `external` outranks `optional` when a source
@@ -131,12 +143,13 @@ bridge is undeclared unless `--declared` points at the session's `graph.json`.
 
 ## Dedicated DROP_NEWEST publisher contract
 
-Use a **dedicated telemetry topic**, with exactly one producer, 256 slots of
-65,536 bytes, alignment 8, and `OverflowPolicy::DROP_NEWEST`. Each slot starts
-with a four-byte little-endian FlatBuffers size prefix, followed by the `TLMS`
+Use a **dedicated telemetry topic**, with exactly one producer, 64 slots of
+16,384 bytes, alignment 8, and `OverflowPolicy::DROP_NEWEST`. Each slot starts
+with a four-byte little-endian FlatBuffers size prefix, followed by the `TLM2`
 FlatBuffer. The bridge transmits prefix plus payload, excluding slot padding.
-Datagrams are limited to 65,507 bytes including the prefix. Smaller frames are
-recommended because large UDP datagrams fragment and loss discards the frame.
+Value-only frames are limited to 1,200 bytes including the prefix (the radio
+budget in `talOS/telemetry/README.md`); dictionary frames may use the whole
+slot.
 
 The required `--drop-newest-publisher` argument acknowledges a contract that
 RTMS cannot verify: the overflow policy is not stored in shared memory. Merely
@@ -158,10 +171,9 @@ the reader slot; a SIGKILL/crash can strand a reader and cause subsequent writes
 to be dropped. Restart both processes after such a crash. Shared-memory names
 are local and limited by RTMS to 30 characters after the initial slash.
 
-UDP is nonblocking. Slow WebSocket clients skip new frames once buffered bytes
-exceed 256 KiB, with a 512 KiB uWebSockets backpressure cap. The shutdown summary
-reports malformed envelopes and rejected UDP/WebSocket sends. HTTP static file
-reads are synchronous and capped at 32 MiB per file; serving large assets during
-streaming can increase jitter. The server has no authentication or TLS and is
-intended for the local robot/development network. The current POSIX daemon runs
-on Linux/macOS; the desktop frontend has a separate cross-platform Rust path.
+Slow WebSocket clients skip new frames once buffered bytes exceed 256 KiB, with
+a 512 KiB uWebSockets backpressure cap. The shutdown summary reports malformed
+envelopes and rejected WebSocket sends. HTTP static file reads are synchronous
+and capped at 32 MiB per file; serving large assets during streaming can
+increase jitter. The server has no authentication or TLS and is intended for
+the local robot/development network. The bridge runs on Linux and macOS.

@@ -1,7 +1,6 @@
 namespace intake;
 
 struct IntakeTarget {
-  issued_ns:ulong;
   enabled:bool;
   roller_velocity_rps:float;
 }
@@ -26,7 +25,6 @@ enum Inhibit : ubyte {
 // never reordered: flatbuffers structs are fixed-size, so field order is the
 // wire order.
 struct IntakeState {
-  issued_ns:ulong;
   enabled:bool;
   roller_velocity_rps:float;
   beam_broken:bool;

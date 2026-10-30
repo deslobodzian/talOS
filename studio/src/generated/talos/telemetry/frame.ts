@@ -2,216 +2,154 @@
 
 import * as flatbuffers from 'flatbuffers';
 
-import {Channel} from '../../talos/telemetry/channel.js';
-import {Ghost} from '../../talos/telemetry/ghost.js';
-import {Pose} from '../../talos/telemetry/pose.js';
-import {Target} from '../../talos/telemetry/target.js';
+import { ChannelInfo } from '../../talos/telemetry/channel-info.js';
+import { Pose } from '../../talos/telemetry/pose.js';
 
 
 export class Frame {
   bb: flatbuffers.ByteBuffer|null = null;
   bb_pos = 0;
-  __init(i: number, bb: flatbuffers.ByteBuffer): Frame {
-    this.bb_pos = i;
-    this.bb = bb;
-    return this;
-  }
+  __init(i:number, bb:flatbuffers.ByteBuffer):Frame {
+  this.bb_pos = i;
+  this.bb = bb;
+  return this;
+}
 
-  static getRootAsFrame(bb: flatbuffers.ByteBuffer, obj?: Frame): Frame {
-    return (obj || new Frame())
-        .__init(bb.readInt32(bb.position()) + bb.position(), bb);
-  }
+static getRootAsFrame(bb:flatbuffers.ByteBuffer, obj?:Frame):Frame {
+  return (obj || new Frame()).__init(bb.readInt32(bb.position()) + bb.position(), bb);
+}
 
-  static getSizePrefixedRootAsFrame(bb: flatbuffers.ByteBuffer, obj?: Frame):
-      Frame {
-    bb.setPosition(bb.position() + flatbuffers.SIZE_PREFIX_LENGTH);
-    return (obj || new Frame())
-        .__init(bb.readInt32(bb.position()) + bb.position(), bb);
-  }
+static getSizePrefixedRootAsFrame(bb:flatbuffers.ByteBuffer, obj?:Frame):Frame {
+  bb.setPosition(bb.position() + flatbuffers.SIZE_PREFIX_LENGTH);
+  return (obj || new Frame()).__init(bb.readInt32(bb.position()) + bb.position(), bb);
+}
 
-  static bufferHasIdentifier(bb: flatbuffers.ByteBuffer): boolean {
-    return bb.__has_identifier('TLMS');
-  }
+static bufferHasIdentifier(bb:flatbuffers.ByteBuffer):boolean {
+  return bb.__has_identifier('TLM2');
+}
 
-  timestampNs(): bigint {
-    const offset = this.bb!.__offset(this.bb_pos, 4);
-    return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
-  }
+streamId():bigint {
+  const offset = this.bb!.__offset(this.bb_pos, 4);
+  return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
+}
 
-  sequenceId(): bigint {
-    const offset = this.bb!.__offset(this.bb_pos, 6);
-    return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
-  }
+sequenceId():bigint {
+  const offset = this.bb!.__offset(this.bb_pos, 6);
+  return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
+}
 
-  chassis(obj?: Pose): Pose|null {
-    const offset = this.bb!.__offset(this.bb_pos, 8);
-    return offset ? (obj || new Pose()).__init(this.bb_pos + offset, this.bb!) :
-                    null;
-  }
+timestampNs():bigint {
+  const offset = this.bb!.__offset(this.bb_pos, 8);
+  return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
+}
 
-  ghosts(index: number, obj?: Ghost): Ghost|null {
-    const offset = this.bb!.__offset(this.bb_pos, 10);
-    return offset ?
-        (obj || new Ghost())
-            .__init(
-                this.bb!.__indirect(
-                    this.bb!.__vector(this.bb_pos + offset) + index * 4),
-                this.bb!) :
-        null;
-  }
+dictionaryId():number {
+  const offset = this.bb!.__offset(this.bb_pos, 10);
+  return offset ? this.bb!.readUint32(this.bb_pos + offset) : 0;
+}
 
-  ghostsLength(): number {
-    const offset = this.bb!.__offset(this.bb_pos, 10);
-    return offset ? this.bb!.__vector_len(this.bb_pos + offset) : 0;
-  }
+chassis(obj?:Pose):Pose|null {
+  const offset = this.bb!.__offset(this.bb_pos, 12);
+  return offset ? (obj || new Pose()).__init(this.bb_pos + offset, this.bb!) : null;
+}
 
-  channels(index: number, obj?: Channel): Channel|null {
-    const offset = this.bb!.__offset(this.bb_pos, 12);
-    return offset ?
-        (obj || new Channel())
-            .__init(
-                this.bb!.__indirect(
-                    this.bb!.__vector(this.bb_pos + offset) + index * 4),
-                this.bb!) :
-        null;
-  }
+values(index: number):number|null {
+  const offset = this.bb!.__offset(this.bb_pos, 14);
+  return offset ? this.bb!.readFloat64(this.bb!.__vector(this.bb_pos + offset) + index * 8) : 0;
+}
 
-  channelsLength(): number {
-    const offset = this.bb!.__offset(this.bb_pos, 12);
-    return offset ? this.bb!.__vector_len(this.bb_pos + offset) : 0;
-  }
+valuesLength():number {
+  const offset = this.bb!.__offset(this.bb_pos, 14);
+  return offset ? this.bb!.__vector_len(this.bb_pos + offset) : 0;
+}
 
-  targets(index: number, obj?: Target): Target|null {
-    const offset = this.bb!.__offset(this.bb_pos, 14);
-    return offset ?
-        (obj || new Target())
-            .__init(
-                this.bb!.__indirect(
-                    this.bb!.__vector(this.bb_pos + offset) + index * 4),
-                this.bb!) :
-        null;
-  }
+valuesArray():Float64Array|null {
+  const offset = this.bb!.__offset(this.bb_pos, 14);
+  return offset ? new Float64Array(this.bb!.bytes().buffer, this.bb!.bytes().byteOffset + this.bb!.__vector(this.bb_pos + offset), this.bb!.__vector_len(this.bb_pos + offset)) : null;
+}
 
-  targetsLength(): number {
-    const offset = this.bb!.__offset(this.bb_pos, 14);
-    return offset ? this.bb!.__vector_len(this.bb_pos + offset) : 0;
-  }
+dictionary(index: number, obj?:ChannelInfo):ChannelInfo|null {
+  const offset = this.bb!.__offset(this.bb_pos, 16);
+  return offset ? (obj || new ChannelInfo()).__init(this.bb!.__indirect(this.bb!.__vector(this.bb_pos + offset) + index * 4), this.bb!) : null;
+}
 
-  elevatorM(): number {
-    const offset = this.bb!.__offset(this.bb_pos, 16);
-    return offset ? this.bb!.readFloat64(this.bb_pos + offset) : 0.0;
-  }
+dictionaryLength():number {
+  const offset = this.bb!.__offset(this.bb_pos, 16);
+  return offset ? this.bb!.__vector_len(this.bb_pos + offset) : 0;
+}
 
-  armRad(): number {
-    const offset = this.bb!.__offset(this.bb_pos, 18);
-    return offset ? this.bb!.readFloat64(this.bb_pos + offset) : 0.0;
-  }
+static startFrame(builder:flatbuffers.Builder) {
+  builder.startObject(7);
+}
 
-  camera(obj?: Pose): Pose|null {
-    const offset = this.bb!.__offset(this.bb_pos, 20);
-    return offset ? (obj || new Pose()).__init(this.bb_pos + offset, this.bb!) :
-                    null;
-  }
+static addStreamId(builder:flatbuffers.Builder, streamId:bigint) {
+  builder.addFieldInt64(0, streamId, BigInt('0'));
+}
 
-  static startFrame(builder: flatbuffers.Builder) {
-    builder.startObject(9);
-  }
+static addSequenceId(builder:flatbuffers.Builder, sequenceId:bigint) {
+  builder.addFieldInt64(1, sequenceId, BigInt('0'));
+}
 
-  static addTimestampNs(builder: flatbuffers.Builder, timestampNs: bigint) {
-    builder.addFieldInt64(0, timestampNs, BigInt('0'));
-  }
+static addTimestampNs(builder:flatbuffers.Builder, timestampNs:bigint) {
+  builder.addFieldInt64(2, timestampNs, BigInt('0'));
+}
 
-  static addSequenceId(builder: flatbuffers.Builder, sequenceId: bigint) {
-    builder.addFieldInt64(1, sequenceId, BigInt('0'));
-  }
+static addDictionaryId(builder:flatbuffers.Builder, dictionaryId:number) {
+  builder.addFieldInt32(3, dictionaryId, 0);
+}
 
-  static addChassis(
-      builder: flatbuffers.Builder, chassisOffset: flatbuffers.Offset) {
-    builder.addFieldStruct(2, chassisOffset, 0);
-  }
+static addChassis(builder:flatbuffers.Builder, chassisOffset:flatbuffers.Offset) {
+  builder.addFieldStruct(4, chassisOffset, 0);
+}
 
-  static addGhosts(
-      builder: flatbuffers.Builder, ghostsOffset: flatbuffers.Offset) {
-    builder.addFieldOffset(3, ghostsOffset, 0);
-  }
+static addValues(builder:flatbuffers.Builder, valuesOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(5, valuesOffset, 0);
+}
 
-  static createGhostsVector(
-      builder: flatbuffers.Builder,
-      data: flatbuffers.Offset[]): flatbuffers.Offset {
-    builder.startVector(4, data.length, 4);
-    for (let i = data.length - 1; i >= 0; i--) {
-      builder.addOffset(data[i]!);
-    }
-    return builder.endVector();
+static createValuesVector(builder:flatbuffers.Builder, data:number[]|Float64Array):flatbuffers.Offset;
+/**
+ * @deprecated This Uint8Array overload will be removed in the future.
+ */
+static createValuesVector(builder:flatbuffers.Builder, data:number[]|Uint8Array):flatbuffers.Offset;
+static createValuesVector(builder:flatbuffers.Builder, data:number[]|Float64Array|Uint8Array):flatbuffers.Offset {
+  builder.startVector(8, data.length, 8);
+  for (let i = data.length - 1; i >= 0; i--) {
+    builder.addFloat64(data[i]!);
   }
+  return builder.endVector();
+}
 
-  static startGhostsVector(builder: flatbuffers.Builder, numElems: number) {
-    builder.startVector(4, numElems, 4);
-  }
+static startValuesVector(builder:flatbuffers.Builder, numElems:number) {
+  builder.startVector(8, numElems, 8);
+}
 
-  static addChannels(
-      builder: flatbuffers.Builder, channelsOffset: flatbuffers.Offset) {
-    builder.addFieldOffset(4, channelsOffset, 0);
-  }
+static addDictionary(builder:flatbuffers.Builder, dictionaryOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(6, dictionaryOffset, 0);
+}
 
-  static createChannelsVector(
-      builder: flatbuffers.Builder,
-      data: flatbuffers.Offset[]): flatbuffers.Offset {
-    builder.startVector(4, data.length, 4);
-    for (let i = data.length - 1; i >= 0; i--) {
-      builder.addOffset(data[i]!);
-    }
-    return builder.endVector();
+static createDictionaryVector(builder:flatbuffers.Builder, data:flatbuffers.Offset[]):flatbuffers.Offset {
+  builder.startVector(4, data.length, 4);
+  for (let i = data.length - 1; i >= 0; i--) {
+    builder.addOffset(data[i]!);
   }
+  return builder.endVector();
+}
 
-  static startChannelsVector(builder: flatbuffers.Builder, numElems: number) {
-    builder.startVector(4, numElems, 4);
-  }
+static startDictionaryVector(builder:flatbuffers.Builder, numElems:number) {
+  builder.startVector(4, numElems, 4);
+}
 
-  static addTargets(
-      builder: flatbuffers.Builder, targetsOffset: flatbuffers.Offset) {
-    builder.addFieldOffset(5, targetsOffset, 0);
-  }
+static endFrame(builder:flatbuffers.Builder):flatbuffers.Offset {
+  const offset = builder.endObject();
+  return offset;
+}
 
-  static createTargetsVector(
-      builder: flatbuffers.Builder,
-      data: flatbuffers.Offset[]): flatbuffers.Offset {
-    builder.startVector(4, data.length, 4);
-    for (let i = data.length - 1; i >= 0; i--) {
-      builder.addOffset(data[i]!);
-    }
-    return builder.endVector();
-  }
+static finishFrameBuffer(builder:flatbuffers.Builder, offset:flatbuffers.Offset) {
+  builder.finish(offset, 'TLM2');
+}
 
-  static startTargetsVector(builder: flatbuffers.Builder, numElems: number) {
-    builder.startVector(4, numElems, 4);
-  }
+static finishSizePrefixedFrameBuffer(builder:flatbuffers.Builder, offset:flatbuffers.Offset) {
+  builder.finish(offset, 'TLM2', true);
+}
 
-  static addElevatorM(builder: flatbuffers.Builder, elevatorM: number) {
-    builder.addFieldFloat64(6, elevatorM, 0.0);
-  }
-
-  static addArmRad(builder: flatbuffers.Builder, armRad: number) {
-    builder.addFieldFloat64(7, armRad, 0.0);
-  }
-
-  static addCamera(
-      builder: flatbuffers.Builder, cameraOffset: flatbuffers.Offset) {
-    builder.addFieldStruct(8, cameraOffset, 0);
-  }
-
-  static endFrame(builder: flatbuffers.Builder): flatbuffers.Offset {
-    const offset = builder.endObject();
-    return offset;
-  }
-
-  static finishFrameBuffer(
-      builder: flatbuffers.Builder, offset: flatbuffers.Offset) {
-    builder.finish(offset, 'TLMS');
-  }
-
-  static finishSizePrefixedFrameBuffer(
-      builder: flatbuffers.Builder, offset: flatbuffers.Offset) {
-    builder.finish(offset, 'TLMS', true);
-  }
 }

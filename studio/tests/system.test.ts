@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
-import {demoDeclaredGraph, demoPacket, demoSystemGraph} from '../src/demo';
+import {demoDeclaredGraph, demoSystemGraph} from '../src/demo';
 import {
   DECLARED_VERSION,
   type DeclaredGraph,
@@ -17,10 +17,6 @@ import {
   rateKey,
   RateWindow,
   SYSTEM_GRAPH_VERSION,
-  SYSTEM_HEADER_BYTES,
-  SYSTEM_TAG,
-  SystemAssembler,
-  systemChunk,
   type SystemGraph,
   type SystemTopic,
   TOPIC_HEALTH,
@@ -90,7 +86,6 @@ const document = (over: Json = {}): Json => ({
     clients: 1,
     frames_forwarded: '7',
     invalid: '0',
-    udp_drops: '0',
     ws_drops: '0'
   },
   nodes: [node()],
@@ -206,85 +201,6 @@ test('an oversized document is rejected before it is parsed', () => {
   assert.throws(() => parseSystemGraph('x'.repeat(MAX_SYSTEM_BYTES + 1)),
                 /document too large/);
 });
-
-// Mirrors SystemDatagrams() in studio/bridge/system.h: tag, little-endian
-// document id, chunk index, chunk count, then the slice.
-function datagram(text: string, documentId: number, index: number,
-                  count: number): Uint8Array {
-  const payload = new TextEncoder().encode(text);
-  const out = new Uint8Array(SYSTEM_HEADER_BYTES + payload.length);
-  for (let i = 0; i < SYSTEM_TAG.length; i++) out[i] = SYSTEM_TAG.charCodeAt(i);
-  out[4] = documentId & 0xff;
-  out[5] = (documentId >> 8) & 0xff;
-  out[6] = index;
-  out[7] = count;
-  out.set(payload, SYSTEM_HEADER_BYTES);
-  return out;
-}
-
-test('a tagged datagram yields its JSON and nothing else does', () => {
-  const text = JSON.stringify(document());
-  assert.deepEqual(systemChunk(datagram(text, 7, 0, 1)), {
-    documentId: 7,
-    index: 0,
-    count: 1,
-    payload: new TextEncoder().encode(text)
-  });
-  assert.equal(new SystemAssembler().push(datagram(text, 7, 0, 1)), text);
-  assert.deepEqual(
-      parseSystemGraph(new SystemAssembler().push(datagram(text, 7, 0, 1))!),
-      parse());
-
-  // A real telemetry frame must never be mistaken for a system graph: both
-  // families share the UDP socket and only the tag separates them.
-  assert.equal(systemChunk(demoPacket(0n)), null);
-  assert.equal(systemChunk(new TextEncoder().encode(SYSTEM_TAG)), null);
-  assert.equal(systemChunk(new TextEncoder().encode('TSY{')), null);
-  assert.equal(systemChunk(new TextEncoder().encode('XSYS{}')), null);
-  assert.equal(systemChunk(new Uint8Array(0)), null);
-
-  // A header with no payload, and an index outside its own count, are both
-  // malformed rather than empty.
-  assert.equal(systemChunk(datagram('', 1, 0, 1)), null);
-  assert.equal(systemChunk(datagram('x', 1, 3, 2)), null);
-  assert.equal(systemChunk(datagram('x', 1, 0, 0)), null);
-
-  const oversized = new Uint8Array(MAX_SYSTEM_BYTES + 1);
-  for (let i = 0; i < SYSTEM_TAG.length; i++)
-    oversized[i] = SYSTEM_TAG.charCodeAt(i);
-  assert.equal(systemChunk(oversized), null);
-});
-
-test('a split document reassembles, in any order, and survives a lost chunk',
-     () => {
-       const text = JSON.stringify(document());
-       const half = Math.ceil(text.length / 2);
-       const parts = [text.slice(0, half), text.slice(half)];
-
-       // In order.
-       const forward = new SystemAssembler();
-       assert.equal(forward.push(datagram(parts[0], 9, 0, 2)), null);
-       assert.equal(forward.push(datagram(parts[1], 9, 1, 2)), text);
-
-       // UDP does not promise order, so the last chunk to arrive completes it
-       // whichever one that is.
-       const reversed = new SystemAssembler();
-       assert.equal(reversed.push(datagram(parts[1], 9, 1, 2)), null);
-       assert.equal(reversed.push(datagram(parts[0], 9, 0, 2)), text);
-
-       // A duplicate must not be counted twice and complete the document early.
-       const duplicated = new SystemAssembler();
-       assert.equal(duplicated.push(datagram(parts[0], 9, 0, 2)), null);
-       assert.equal(duplicated.push(datagram(parts[0], 9, 0, 2)), null);
-       assert.equal(duplicated.push(datagram(parts[1], 9, 1, 2)), text);
-
-       // A document that lost a chunk is abandoned when the next one starts,
-       // rather than waiting forever or splicing two generations together.
-       const lossy = new SystemAssembler();
-       assert.equal(lossy.push(datagram(parts[0], 9, 0, 2)), null);
-       assert.equal(lossy.push(datagram(parts[0], 10, 0, 2)), null);
-       assert.equal(lossy.push(datagram(parts[1], 10, 1, 2)), text);
-     });
 
 // topicHealthOf hands back a classifier, so a caller with a row in hand cannot
 // be given undefined for a topic that is in the graph. These tests want to name
@@ -617,7 +533,7 @@ test('a declared graph parses into nodes, ends and the launcher\'s lint', () => 
       sources: [
         declaredSource({name: '/hw/command', external: true}),
         declaredSource(
-            {kind: 'FETCHER', name: '/hw/command/override', optional: true}),
+            {kind: 'FETCHER', name: '/drivetrain/target/auto', optional: true}),
         declaredSource({kind: 'TIMER', name: 'tick', message_bytes: 0})
       ]
     })]
@@ -704,9 +620,9 @@ test('the declared graph is asked for at the origin that served the stream', () 
   assert.equal(declaredUrl('ws://127.0.0.1:5173/telemetry#live'),
                'http://127.0.0.1:5173/declared.json');
 
-  // Nowhere to ask is not an error: the desktop UDP transport has no origin,
-  // and Studio has to keep working without a declared graph anyway.
-  assert.equal(declaredUrl('udp://127.0.0.1:5801'), null);
+  // Nowhere to ask is not an error: a URL that is not a WebSocket has no
+  // bridge origin, and Studio has to keep working without a declared graph.
+  assert.equal(declaredUrl('tcp://127.0.0.1:5800'), null);
   assert.equal(declaredUrl('http://127.0.0.1:5800/telemetry'), null);
   assert.equal(declaredUrl('not a url'), null);
   assert.equal(declaredUrl(''), null);
@@ -757,7 +673,6 @@ test('the demo reaches every health state a viewer can render', () => {
   assert.equal(running.get('/shooter/target'), 'unread');
   assert.equal(running.get('/talos/telemetry'), 'unread');
   assert.equal(running.get('/hw/command'), 'bridged');
-  assert.equal(running.get('/hw/command/override'), 'unconnected');
   assert.equal(running.get('/drivetrain/target/auto'), 'unconnected');
   assert.equal(running.get('/shooter/target/auto'), 'unconnected');
   assert.equal(running.get('/hw/state'), 'lossy');

@@ -88,7 +88,7 @@ actual robot program instead, under WPILib simulation:
 python3 tools/test_drivetrain.py --wpilib
 ```
 
-This swaps `sim_gateway` for `./gradlew simulateNativeRelease` in `robot/` and
+This swaps `sim_gateway` for `./gradlew simulateNative` in `2026-robot/controller_processor/rio/` and
 makes the same assertions, because both run the same
 `talos::hardware::Gateway`. It also runs a second scenario the stand-in cannot:
 with the Driver Station never enabled, the drivetrain must not move at all.
@@ -113,7 +113,7 @@ real Driver Station and nothing in the program can forge it.
 Start each command in a separate terminal:
 
 ```sh
-bazel run //2026-robot/main_processor/simulation:sim_gateway    # or, in robot/: ./gradlew simulateNative
+bazel run //2026-robot/main_processor/simulation:sim_gateway    # or, in 2026-robot/controller_processor/rio/: ./gradlew simulateNative
 bazel run //talOS/bridge:hardware_node
 bazel run //2026-robot/main_processor/drivetrain:node -- --sim --log /tmp/drivetrain.tlog
 bazel run //2026-robot/main_processor/drivetrain:send_target -- 1 0 0 2
@@ -192,7 +192,7 @@ bazel run //talOS/bridge:hardware_node -- --remote 10.56.87.2
 bazel run //2026-robot/main_processor/drivetrain:node -- --log /tmp/drivetrain.tlog
 ```
 
-The hardware gateway is configured locally at startup; there is no network
-configuration upload. The supplied addresses, geometry, offsets and gains are
+The companion bridge pushes the parsed hardware configuration to the gateway
+over UDP (`talOS/hardware/README.md`). The supplied addresses, geometry, offsets and gains are
 examples. A successful build and simulated replay do not validate physical
 inversion, steering alignment, gearing, PID tuning, or CAN timing.

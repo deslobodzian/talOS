@@ -1,0 +1,22 @@
+namespace bridge;
+
+// The hardware bridge's health, published by hardware_node on /hw/status every
+// 20 ms. The counters are cumulative since the bridge started.
+//
+// state_age_us is the bridge's monotonic now minus the moment it received the
+// last /hw/state frame from the RoboRIO (bridge clock on both sides), and 0
+// before the first frame. timed_out_mask has bit i set when the i-th
+// actuator-owning subsystem, in sorted name order, has timed out; only the
+// first 32 fit. subsystem_count is the number of those subsystems.
+// configured is whether the RoboRIO acknowledged this bridge's configuration.
+struct BridgeStatus {
+  states_received:uint64;
+  commands_sent:uint64;
+  identity_rejected:uint64;
+  ownership_rejected:uint64;
+  driver_station_packets:uint64;
+  state_age_us:uint64;
+  timed_out_mask:uint32;
+  subsystem_count:uint32;
+  configured:bool;
+}

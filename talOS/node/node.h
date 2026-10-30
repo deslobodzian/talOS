@@ -30,6 +30,8 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -115,7 +117,12 @@ class Node {
   T param(std::string_view key) const;  // throws if missing
 
   // Topics. Call in the constructor: registration order is what replay
-  // checks a log against.
+  // checks a log against. A relative topic ("state", "target/teleop") expands
+  // to "/<name>/<topic>"; [subsystems.<name>.remap] can redirect any topic.
+  // A node without message callbacks receives messages right before each of
+  // its timers (update(), every()); passing `on_message` to any subscription
+  // makes the node drain every 1 ms instead, so the callback runs promptly.
+  // age() counts from that delivery.
   using SubscribeOptions = talos::SubscribeOptions;
   template <Message M>
   Subscription<M> subscribe(std::string_view topic,
@@ -213,20 +220,27 @@ class StateMachine {
  public:
   StateMachine(Node& node, S initial);
 
-  S state() const { return state_; }
-  bool is(S s) const { return state_ == s; }
-  S previous() const { return previous_; }
+  S state() const {
+    return static_cast<S>(
+        detail::NodeAccess::state_machine_state(*node_, index_));
+  }
+  bool is(S s) const { return state() == s; }
+  S previous() const {
+    return static_cast<S>(
+        detail::NodeAccess::state_machine_previous(*node_, index_));
+  }
   void go(S next);  // no-op when next == state()
-  Duration time_in_state() const { return node_->now() - entered_at_; }
+  Duration time_in_state() const {
+    return detail::NodeAccess::state_machine_time_in_state(*node_, index_);
+  }
   // True during the first update() tick that starts in this state.
-  bool just_entered() const { return node_->tick() == entered_update_; }
+  bool just_entered() const {
+    return detail::NodeAccess::state_machine_just_entered(*node_, index_);
+  }
 
  private:
-  const Node* node_;
-  S state_;
-  S previous_;
-  std::uint64_t entered_update_;
-  Time entered_at_;
+  Node* node_{nullptr};
+  std::size_t index_{0};
 };
 
 // Runs T as this binary's node; TALOS_NODE(T) calls it.
@@ -274,6 +288,22 @@ InstanceFactory MakeInstance() {
   };
 }
 
+template <class T>
+std::int32_t HostCppNode(void* raw_node) noexcept {
+  try {
+    if (raw_node == nullptr) return -1;
+    auto& node = *static_cast<Node*>(raw_node);
+    auto instance = MakeInstance<T>()(node);
+    NodeAccess::add_extension(node, typeid(T), std::move(instance));
+    return 0;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "HostCppNode: %s\n", e.what());
+    return -1;
+  } catch (...) {
+    return -1;
+  }
+}
+
 }  // namespace detail
 
 template <class T>
@@ -304,9 +334,11 @@ Subscription<M> Node::subscribe(std::string_view topic, F on_message,
       [fn = std::move(on_message)](const void* data) {
         fn(*static_cast<const M*>(data));
       };
-  return Subscription<M>{this, detail::NodeAccess::add_subscription(
-                                   *this, topic, sizeof(M), kMessageAlignment,
-                                   options.optional, std::move(callback))};
+  const std::size_t index = detail::NodeAccess::add_subscription(
+      *this, topic, sizeof(M), kMessageAlignment, options.optional,
+      std::move(callback));
+  detail::NodeAccess::require_immediate_delivery(*this);
+  return Subscription<M>{this, index};
 }
 
 template <Message M>
@@ -367,20 +399,14 @@ template <class S>
   requires std::is_enum_v<S>
 StateMachine<S>::StateMachine(Node& node, S initial)
     : node_{&node},
-      state_{initial},
-      previous_{initial},
-      entered_update_{detail::NodeAccess::next_update(node)},
-      entered_at_{node.now()} {}
+      index_{detail::NodeAccess::add_state_machine(
+          node, static_cast<std::int64_t>(initial))} {}
 
 template <class S>
   requires std::is_enum_v<S>
 void StateMachine<S>::go(S next) {
-  if (next == state_) return;
-  previous_ = state_;
-  state_ = next;
-  entered_at_ = node_->now();
-  // Entered during update() k: the first update to start in it is k + 1.
-  entered_update_ = detail::NodeAccess::next_update(*node_);
+  detail::NodeAccess::state_machine_go(*node_, index_,
+                                       static_cast<std::int64_t>(next));
 }
 
 // The name and target come from the talos_cc_node macro (TALOS_NODE_NAME /
@@ -400,6 +426,12 @@ int Run(int argc, char** argv) {
 
 }  // namespace talos
 
+#define TALOS_EXPORT_NODE(Name, Class)                               \
+  extern "C" std::int32_t talos_cpp_node_##Name(void* node, void*) { \
+    return ::talos::detail::HostCppNode<Class>(node);                \
+  }
+
 // Defines main() for a node class.
-#define TALOS_NODE(Class) \
+#define TALOS_NODE(Class)        \
+  TALOS_EXPORT_NODE(main, Class) \
   int main(int argc, char** argv) { return ::talos::Run<Class>(argc, argv); }

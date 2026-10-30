@@ -77,10 +77,22 @@ Realtime and replay loop instances run once.
 | `ReplayEventLoop` | Timestamps from the log | The log itself | Reproducing a run |
 
 `RealtimeEventLoop` waits on kqueue (macOS) or epoll plus an absolute-deadline
-timerfd (Linux). Message delivery is a fixed-rate drain, 1 ms by default, rather
-than a wakeup from the transport: RTMS carries no notification channel and
-adding one would change its shared-memory layout. The tick therefore bounds
-message latency, and each drained message is stamped with the tick that saw it.
+timerfd (Linux). Messages are drained rather than woken by the transport: RTMS
+carries no notification channel and adding one would change its shared-memory
+layout. `Options::delivery` (or `set_delivery()` before the run) picks when:
+
+- `Delivery::POLL` (the default) drains on a fixed tick, 1 ms by default, so
+  the tick bounds message latency.
+- `Delivery::BEFORE_TIMERS` arms no poll timer and drains immediately before
+  each timer dispatch, so a loop with only periodic work wakes once per period.
+  `activity()` counts wakeups and drains; at 100 Hz that is about 20 of each
+  over 200 ms against about 200 under `POLL`
+  (`RealtimeEventLoop.BeforeTimersWakesOnlyForTimers`).
+
+Each drained message is stamped with the drain that saw it, and the log
+records the resulting dispatch order, so replay reproduces either policy.
+`SimulatedEventLoop` takes the same option. The node layer chooses for each
+node: see `NodeAccess::require_immediate_delivery` in `talOS/node/access.h`.
 
 ## Writing a handler
 

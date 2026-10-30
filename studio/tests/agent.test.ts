@@ -11,8 +11,8 @@ import {
   RPC_METHODS,
   type RpcContext,
   RpcFault,
-  startAgent,
-} from '../agent/server';
+} from '../agent/rpc';
+import {startAgent} from '../agent/server';
 import {decode, Timeline} from '../src/core';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from '../src/demo';
 import {
@@ -25,7 +25,7 @@ import {
 function history() {
   const timeline = new Timeline();
   [0, 4, 5, 0, 7].forEach((current, i) => {
-    const frame = decode(demoPacket(BigInt(i)));
+    const frame = decode(demoPacket(BigInt(i)))!;
     frame.channels['motor.current'] = current;
     timeline.append(frame);
   });
@@ -207,7 +207,7 @@ test('the system graph reports every node, both ends of every topic, and health'
        // states are unreachable and their topics read as faults.
        assert.equal(result.version, 2);
        assert.equal(result.summary.endpoint_attributes, true);
-       assert.ok(result.summary.unconnected_topics >= 3);
+       assert.ok(result.summary.unconnected_topics >= 2);
        assert.equal(
            Object.values(result.summary.topics_by_health)
                .reduce((total: number, n: any) => total + Number(n), 0),
@@ -350,6 +350,21 @@ test('the declared graph answers what was supposed to be running', () => {
   assert.equal(alone.nodes.length, declared.nodes.length);
 });
 
+test('get_latest returns the newest sample with its dictionary and age', () => {
+  assert.throws(
+      () => dispatch(ctx(new Timeline()), 'get_latest', {}),
+      (e: unknown) => e instanceof RpcFault && e.code === -32002);
+  const timeline = history();
+  const latest = dispatch(ctx(timeline), 'get_latest', {}) as any;
+  assert.equal(latest.sequence_id, '4');
+  assert.equal(latest.stream_id, '42');
+  assert.equal(latest.snapshot.sequence_id, '4');
+  assert.equal(latest.units.velocity, 'm/s');
+  assert.deepEqual(latest.labels.mode, ['disabled', 'teleop', 'auto']);
+  assert.equal(typeof latest.age_ms, 'number');
+  assert.ok(latest.age_ms >= 0);
+});
+
 test('every advertised method exists, and nothing else does', () => {
   // RPC_METHODS is what the Agent tab and the README list, so a name in it that
   // dispatch does not answer is a picker entry that fails on click.
@@ -422,7 +437,7 @@ test('the agent fetches the declared graph from the bridge it follows',
                       'the agent never fetched /declared.json');
          const result =
              dispatch(agent.context(), 'get_declared_graph', {}) as any;
-         assert.equal(result.nodes.length, 8);
+         assert.equal(result.nodes.length, 7);
          assert.ok(result.nodes.some((n: any) => n.name === 'shooter'));
          // No system graph on this connection, so there is nothing to compare
          // the declared nodes against and it says so instead of guessing.
@@ -454,7 +469,7 @@ test('a bridge started without --declared leaves everything else working',
          agent.ingestSystemGraph(demoSystemGraph(500n));
          const graph =
              dispatch(agent.context(), 'get_system_graph', {}) as any;
-         assert.equal(graph.summary.nodes, 7);
+         assert.equal(graph.summary.nodes, 6);
        } finally {
          agent.close();
          bridge.close();

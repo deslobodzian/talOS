@@ -148,6 +148,112 @@ TEST_F(NodeApi, RegistrationFailureFailsTheAdd) {
   EXPECT_NE(std::string{talos_last_error()}.find("factory"), std::string::npos);
 }
 
+struct ByteSender {
+  TalosNode* node = nullptr;
+  int64_t out = -1;
+  int32_t last_sent = -1;
+};
+
+int32_t BuildByteSender(TalosNode* node, void* user) {
+  auto& b = *static_cast<ByteSender*>(user);
+  b.node = node;
+  b.out = talos_node_publish_bytes(node, "frames", 4, 16, 1, 1);
+  if (b.out < 0) return 1;
+  return talos_node_set_update(
+      node,
+      [](void* u) -> int32_t {
+        auto& sender = *static_cast<ByteSender*>(u);
+        const uint8_t payload[3] = {
+            1, 2, static_cast<uint8_t>(talos_node_tick(sender.node))};
+        sender.last_sent = talos_byte_publisher_send(sender.node, sender.out,
+                                                     payload, sizeof payload);
+        return sender.last_sent < 0 ? 1 : 0;
+      },
+      &b);
+}
+
+TEST_F(NodeApi, PublishesVariableLengthBytesAndQueriesLatest) {
+  ByteSender sender;
+  TalosNode* node = talos_sim_add(sim_, "relay", &BuildByteSender, &sender);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+
+  uint32_t size = 99;
+  EXPECT_EQ(talos_sim_latest_bytes(sim_, "/relay/frames", nullptr, 0, &size),
+            0);
+  EXPECT_EQ(size, 0u);
+
+  ASSERT_EQ(talos_sim_step(sim_, 25 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(sender.last_sent, 1);
+
+  ASSERT_EQ(talos_sim_latest_bytes(sim_, "/relay/frames", nullptr, 0, &size),
+            1);
+  EXPECT_EQ(size, 3u);
+  uint8_t out[4] = {};
+  EXPECT_EQ(talos_sim_latest_bytes(sim_, "/relay/frames", out, 2, &size),
+            TALOS_ERR);
+  ASSERT_EQ(
+      talos_sim_latest_bytes(sim_, "/relay/frames", out, sizeof out, &size), 1);
+  EXPECT_EQ(size, 3u);
+  EXPECT_EQ(out[0], 1u);
+  EXPECT_EQ(out[1], 2u);
+  EXPECT_EQ(out[2], 1u);  // tick 1 at 20 ms
+
+  // Oversize returns 0 (dropped), empty payload is allowed.
+  const uint8_t oversize[5] = {9, 9, 9, 9, 9};
+  EXPECT_EQ(talos_byte_publisher_send(node, sender.out, oversize, 5), 0);
+  EXPECT_EQ(talos_byte_publisher_send(node, sender.out, nullptr, 0), 1);
+  ASSERT_EQ(
+      talos_sim_latest_bytes(sim_, "/relay/frames", out, sizeof out, &size), 1);
+  EXPECT_EQ(size, 0u);
+  EXPECT_EQ(talos_byte_publisher_send(node, sender.out, nullptr, 1), TALOS_ERR);
+}
+
+struct Stepper {
+  TalosNode* node = nullptr;
+  int64_t sm = -1;
+  int32_t just_entered_at_0 = -1;
+  int32_t just_entered_at_1 = -1;
+  int32_t just_entered_at_3 = -1;
+};
+
+int32_t BuildStepper(TalosNode* node, void* user) {
+  auto& s = *static_cast<Stepper*>(user);
+  s.node = node;
+  s.sm = talos_state_machine_create(node, 10);
+  if (s.sm < 0) return 1;
+  return talos_node_set_update(
+      node,
+      [](void* u) -> int32_t {
+        auto& st = *static_cast<Stepper*>(u);
+        const uint64_t tick = talos_node_tick(st.node);
+        const int32_t je = talos_state_machine_just_entered(st.node, st.sm);
+        if (tick == 0) st.just_entered_at_0 = je;
+        if (tick == 1) st.just_entered_at_1 = je;
+        if (tick == 2) {
+          if (talos_state_machine_go(st.node, st.sm, 20) != TALOS_OK) return 1;
+        }
+        if (tick == 3) st.just_entered_at_3 = je;
+        return 0;
+      },
+      &s);
+}
+
+TEST_F(NodeApi, StateMachineTracksTransitionsAndTiming) {
+  Stepper stepper;
+  TalosNode* node = talos_sim_add(sim_, "relay", &BuildStepper, &stepper);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  EXPECT_EQ(talos_state_machine_state(node, stepper.sm), 10);
+  EXPECT_EQ(talos_state_machine_previous(node, stepper.sm), 10);
+
+  ASSERT_EQ(talos_sim_step(sim_, 45 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(stepper.just_entered_at_0, 1);
+  EXPECT_EQ(stepper.just_entered_at_1, 0);
+  EXPECT_EQ(stepper.just_entered_at_3, 1);
+  EXPECT_EQ(talos_state_machine_state(node, stepper.sm), 20);
+  EXPECT_EQ(talos_state_machine_previous(node, stepper.sm), 10);
+  EXPECT_EQ(talos_state_machine_time_in_state_ns(node, stepper.sm), 15 * kMs);
+}
+
 // --- devices -------------------------------------------------------------
 
 struct Roller {

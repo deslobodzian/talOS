@@ -1,0 +1,33 @@
+namespace geometry;
+
+// Planar translation in meters (field or robot frame).
+struct Translation2d {
+  x_m:double;
+  y_m:double;
+}
+
+// Planar heading in rotations (CCW+, matching CANcoder and Pigeon2).
+struct Rotation2d {
+  yaw_rot:double;
+}
+
+// Planar pose in meters and rotations (CCW+).
+struct Pose2d {
+  x_m:double;
+  y_m:double;
+  yaw_rot:double;
+}
+
+// Planar linear and angular velocity in m/s and rad/s (CCW+).
+struct Twist2d {
+  vx_mps:double;
+  vy_mps:double;
+  omega_radps:double;
+}
+
+// Stamped pose and velocity for odometry and localization feeds.
+struct OdometrySample {
+  timestamp_ns:uint64;
+  pose:Pose2d;
+  velocity:Twist2d;
+}

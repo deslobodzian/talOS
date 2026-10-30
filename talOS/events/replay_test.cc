@@ -46,10 +46,12 @@ constexpr std::size_t WALL_CLOCK_BYTES = 8;
 
 // Drives a robot through a fixed script of inputs. Everything the handlers see
 // is injected here, so the run is reproducible by construction.
-std::vector<float> record_run(const std::string& path, float gain) {
+std::vector<float> record_run(const std::string& path, float gain,
+                              Delivery delivery = Delivery::POLL) {
   SimulationEnvironment environment;
   SimulatedEventLoop<log::LogWriter> loop{environment,
                                           log::LogWriter{path, "test_robot"}};
+  loop.set_delivery(delivery);
 
   TestRobot<SimulatedEventLoop<log::LogWriter>> robot{loop, test_topics(),
                                                       gain};
@@ -98,12 +100,14 @@ TEST(Replay, ReproducesRecordedBehaviour) {
 
 // The core guarantee: replaying a log and recording that replay produces the
 // same log again, byte for byte. If any input were left out of the log, or any
-// handler read something the loop did not record, this test would fail.
-TEST(Replay, ReRecordingIsByteIdentical) {
+// handler read something the loop did not record, this test would fail. The
+// delivery policy only moves where the drains fall in the recorded run, so it
+// must not matter.
+void ExpectReRecordingIsByteIdentical(Delivery delivery) {
   const std::string original_path = temp_path("identical_a");
   const std::string replayed_path = temp_path("identical_b");
 
-  record_run(original_path, 1.75F);
+  record_run(original_path, 1.75F, delivery);
 
   {
     log::LogReader reader{original_path};
@@ -134,6 +138,14 @@ TEST(Replay, ReRecordingIsByteIdentical) {
 
   std::remove(original_path.c_str());
   std::remove(replayed_path.c_str());
+}
+
+TEST(Replay, ReRecordingIsByteIdentical) {
+  ExpectReRecordingIsByteIdentical(Delivery::POLL);
+}
+
+TEST(Replay, ReRecordingABeforeTimersRunIsByteIdentical) {
+  ExpectReRecordingIsByteIdentical(Delivery::BEFORE_TIMERS);
 }
 
 TEST(Replay, DetectsChangedBehaviour) {

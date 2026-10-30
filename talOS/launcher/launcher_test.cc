@@ -562,6 +562,8 @@ TEST(LauncherTest, SessionManifestJsonFormatting) {
   node1.target = "//2026-robot/main_processor/drivetrain:node";
   node1.binary_path = "bazel-bin/2026-robot/main_processor/drivetrain/node";
   node1.log_path = "/tmp/test_dir/drivetrain.tlog";
+  node1.log_paths = {node1.log_path, "/tmp/test_dir/drivetrain.restart1.tlog"};
+  node1.restart_count = 1;
   node1.pid = 1234;
   node1.exit_code = 0;
   node1.record_count = 50;
@@ -577,6 +579,76 @@ TEST(LauncherTest, SessionManifestJsonFormatting) {
   EXPECT_NE(json.find("\"exit_code\": 0"), std::string::npos);
   EXPECT_NE(json.find("\"record_count\": 50"), std::string::npos);
   EXPECT_NE(json.find("\"config_sha256\": \"deadbeef\""), std::string::npos);
+  EXPECT_NE(json.find("\"log_path\": \"/tmp/test_dir/drivetrain.tlog\""),
+            std::string::npos)
+      << json;
+  EXPECT_NE(json.find("\"log_paths\": [\"/tmp/test_dir/drivetrain.tlog\", "
+                      "\"/tmp/test_dir/drivetrain.restart1.tlog\"]"),
+            std::string::npos)
+      << json;
+  EXPECT_NE(json.find("\"restart_count\": 1"), std::string::npos) << json;
+}
+
+TEST(LauncherTest, RestartBackoffDoublesFrom50msCappedAt1s) {
+  using std::chrono::milliseconds;
+  EXPECT_EQ(RestartBackoff(1), milliseconds{50});
+  EXPECT_EQ(RestartBackoff(2), milliseconds{100});
+  EXPECT_EQ(RestartBackoff(3), milliseconds{200});
+  EXPECT_EQ(RestartBackoff(4), milliseconds{400});
+  EXPECT_EQ(RestartBackoff(5), milliseconds{800});
+  EXPECT_EQ(RestartBackoff(6), milliseconds{1000});
+  EXPECT_EQ(RestartBackoff(1000), milliseconds{1000});
+}
+
+TEST(LauncherTest, EachRunGetsItsOwnLogPath) {
+  EXPECT_EQ(NodeLogPath("/out", "alpha", 0), "/out/alpha.tlog");
+  EXPECT_EQ(NodeLogPath("/out", "alpha", 1), "/out/alpha.restart1.tlog");
+  EXPECT_EQ(NodeLogPath("/out", "alpha", 12), "/out/alpha.restart12.tlog");
+}
+
+TEST(LauncherTest, ShouldRestartNodePredicate) {
+  EXPECT_TRUE(ShouldRestartNode(false, 0, 5, false));
+  EXPECT_TRUE(ShouldRestartNode(false, 4, 5, false));
+  // A clean exit finished; it is not a crash.
+  EXPECT_FALSE(ShouldRestartNode(true, 0, 5, false));
+  // Budget spent, or none at all.
+  EXPECT_FALSE(ShouldRestartNode(false, 5, 5, false));
+  EXPECT_FALSE(ShouldRestartNode(false, 0, 0, false));
+  // A stopping session (signal or deadline) restarts nothing.
+  EXPECT_FALSE(ShouldRestartNode(false, 0, 5, true));
+}
+
+TEST(LauncherTest, MaxRestartsComesFromFlagThenConfigThenDefault) {
+  const auto with_robot_keys = [](std::string_view keys) {
+    std::string toml{kFixtureToml};
+    const std::string header = "[robot]\n";
+    toml.insert(toml.find(header) + header.size(), keys);
+    return config::ParseRobotConfigString(toml);
+  };
+  int max = -1;
+  std::string error;
+
+  EXPECT_TRUE(ResolveMaxRestarts(with_robot_keys(""), {}, max, error));
+  EXPECT_EQ(max, kDefaultMaxRestarts);
+  EXPECT_EQ(kDefaultMaxRestarts, 5);
+
+  EXPECT_TRUE(ResolveMaxRestarts(with_robot_keys("max_restarts = 2\n"), {}, max,
+                                 error));
+  EXPECT_EQ(max, 2);
+
+  LauncherOptions flag;
+  flag.max_restarts = 0;
+  EXPECT_TRUE(ResolveMaxRestarts(with_robot_keys("max_restarts = 2\n"), flag,
+                                 max, error));
+  EXPECT_EQ(max, 0);
+
+  EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = -1\n"), {},
+                                  max, error));
+  EXPECT_NE(error.find("max_restarts"), std::string::npos) << error;
+  EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = 1.5\n"), {},
+                                  max, error));
+  EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = \"3\"\n"), {},
+                                  max, error));
 }
 
 TEST(LauncherTest, RunsChildProcessesAndWritesManifest) {

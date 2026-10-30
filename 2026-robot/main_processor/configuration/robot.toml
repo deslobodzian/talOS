@@ -24,7 +24,6 @@ local_port = 5803
 [studio]
 bridge = "//studio/bridge:studio_bridge"
 http_port = 5800
-udp_port = 5801
 webroot = "bazel-bin/studio/dist"
 
 # Subsystem manifest. Each entry names one subsystem and the file holding its
@@ -40,10 +39,6 @@ path = "subsystems/arbiter.toml"
 [[subsystems]]
 name = "drivetrain"
 path = "subsystems/drivetrain.toml"
-
-[[subsystems]]
-name = "driver_station"
-path = "subsystems/driver_station.toml"
 
 [[subsystems]]
 name = "intake"

@@ -22,7 +22,6 @@ TEST(TopicName, AcceptsTheShapesTheRobotUses) {
   for (const auto* name : {
            "/hw/state",
            "/hw/command",
-           "/hw/command/override",
            "/hw/state/driver_station",
            "/hw/request/drivetrain",
            "/hw/request/shooter",
@@ -32,7 +31,6 @@ TEST(TopicName, AcceptsTheShapesTheRobotUses) {
            "/drivetrain/target/auto",
            "/shooter/state",
            "/shooter/target",
-           "/driver_station/state",
            "/odometry/state",
            "/talos/telemetry",
        }) {
@@ -327,16 +325,14 @@ TEST(LintGraph, ReservedNamespacesAreExemptFromTheOwnerRule) {
   const std::vector<NodeShape> nodes = {
       {"hardware_node",
        "//talOS/bridge:hardware_node",
-       {Sender("/hw/state"), Watcher("/hw/request/drivetrain")}},
-      {"driver_station",
-       "//2026-robot/main_processor/driver_station:node",
-       {Watcher("/hw/state"), Sender("/driver_station/state")}},
+       {Sender("/hw/state"), Sender("/hw/state/driver_station"),
+        Watcher("/hw/request/drivetrain")}},
       {"drivetrain",
        "//2026-robot/main_processor/drivetrain:node",
        {Sender("/hw/request/drivetrain"), Watcher("/hw/state")}},
       {"arbiter",
        "//2026-robot/main_processor/arbiter:node",
-       {Watcher("/driver_station/state")}},
+       {Watcher("/hw/state/driver_station")}},
   };
   EXPECT_TRUE(LintGraph(nodes).empty()) << Describe(LintGraph(nodes));
 }
@@ -383,8 +379,6 @@ TEST(LintGraph, ExternalAndOptionalEndsAreNotFaults) {
        {
            // Consumed by the RoboRIO over UDP; no shared-memory peer exists.
            Sender("/hw/command", 32, kSourceFlagExternal),
-           // A debug hook with no in-tree publisher.
-           Watcher("/hw/command/override", 32, kSourceFlagOptional),
        }},
       {"arbiter",
        "//2026-robot/main_processor/arbiter:node",
@@ -401,7 +395,6 @@ TEST(LintGraph, ExternalAndOptionalEndsAreNotFaults) {
   EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
   for (const auto& diagnostic : diagnostics) {
     EXPECT_NE(diagnostic.subject, "/hw/command");
-    EXPECT_NE(diagnostic.subject, "/hw/command/override");
     EXPECT_NE(diagnostic.subject, "/drivetrain/target/auto");
   }
 }

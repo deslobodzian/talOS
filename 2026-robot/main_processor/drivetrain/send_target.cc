@@ -6,7 +6,6 @@
 
 #include "drivetrain/drive_message_generated.h"
 #include "drivetrain/topics.h"
-#include "talOS/events/os/poller.h"
 #include "talOS/ipc/publisher.h"
 
 int main(int argc, char** argv) {
@@ -27,12 +26,10 @@ int main(int argc, char** argv) {
     const auto end =
         std::chrono::steady_clock::now() + std::chrono::seconds{seconds};
     while (std::chrono::steady_clock::now() < end) {
-      publisher.write(drivetrain::ChassisTarget{
-          vx, vy, omega, talos::event::Poller::now().nanos(), true});
+      publisher.write(drivetrain::ChassisTarget{vx, vy, omega, true});
       std::this_thread::sleep_for(std::chrono::milliseconds{20});
     }
-    publisher.write(drivetrain::ChassisTarget{
-        0, 0, 0, talos::event::Poller::now().nanos(), false});
+    publisher.write(drivetrain::ChassisTarget{0, 0, 0, false});
     return 0;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());

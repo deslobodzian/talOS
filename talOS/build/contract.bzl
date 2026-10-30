@@ -3,7 +3,7 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@flatbuffers//:build_defs.bzl", "DEFAULT_INCLUDE_PATHS", "flatbuffer_cc_library")
-load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("@rules_python//python:py_info.bzl", "PyInfo")
 
 _TalosMessagesInfo = provider(
@@ -633,5 +633,96 @@ talos_bundle = rule(
         ),
     },
 )
+
+def talos_graph_test(
+    name,
+    config,
+    nodes,
+    data = [],
+    **kwargs
+):
+    """Probes every node in `config` with `launcher --describe-only` and lints the graph.
+
+    Args:
+      name: test target name.
+      config: the robot.toml file or label.
+      nodes: the node binaries `config` names.
+      data: additional runtime files (e.g., subsystem .toml files or filegroups).
+      **kwargs: passed to py_test.
+    """
+    config_label = native.package_relative_label(config)
+    config_rel = (config_label.package + "/" + config_label.name) if config_label.package else config_label.name
+    runner_py = name + "_graph_test.py"
+    content = (
+        "import json\n" +
+        "import os\n" +
+        "import subprocess\n" +
+        "import tempfile\n" +
+        "import unittest\n" +
+        "from python.runfiles import runfiles\n\n\n" +
+        "class GraphTest(unittest.TestCase):\n" +
+        "    def test_graph(self):\n" +
+        "        r = runfiles.Create()\n" +
+        "        launcher = r.Rlocation(\"_main/talOS/launcher/launcher\")\n" +
+        "        self.assertTrue(launcher and os.path.exists(launcher), f\"missing launcher: {launcher}\")\n" +
+        "        runfiles_root = os.environ.get(\"RUNFILES_DIR\")\n" +
+        "        if not runfiles_root or not os.path.isdir(os.path.join(runfiles_root, \"_main\")):\n" +
+        "            runfiles_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(launcher))))\n" +
+        "        main_dir = os.path.join(runfiles_root, \"_main\")\n\n" +
+        "        with tempfile.TemporaryDirectory() as tmp:\n" +
+        "            work_dir = os.path.join(tmp, \"ws\")\n" +
+        "            out_dir = os.path.join(tmp, \"out\")\n" +
+        "            os.makedirs(work_dir)\n" +
+        "            os.makedirs(out_dir)\n" +
+        "            bazel_bin = os.path.join(work_dir, \"bazel-bin\")\n" +
+        "            os.makedirs(bazel_bin)\n" +
+        "            for entry in os.listdir(main_dir):\n" +
+        "                src = os.path.join(main_dir, entry)\n" +
+        "                os.symlink(src, os.path.join(work_dir, entry))\n" +
+        "                os.symlink(src, os.path.join(bazel_bin, entry))\n" +
+        "            if not os.path.exists(os.path.join(bazel_bin, \"external\")):\n" +
+        "                os.symlink(runfiles_root, os.path.join(bazel_bin, \"external\"))\n\n" +
+        "            env = dict(os.environ, **r.EnvVars())\n" +
+        "            env[\"RUNFILES_DIR\"] = runfiles_root\n" +
+        "            env.pop(\"PYTHONPATH\", None)\n" +
+        "            env.pop(\"BUILD_WORKSPACE_DIRECTORY\", None)\n\n" +
+        "            proc = subprocess.run(\n" +
+        "                [launcher, \"--config\", \"%s\", \"--describe-only\", \"--output-dir\", out_dir],\n" % config_rel +
+        "                cwd=work_dir,\n" +
+        "                env=env,\n" +
+        "                capture_output=True,\n" +
+        "                text=True,\n" +
+        "                timeout=120,\n" +
+        "            )\n" +
+        "            self.assertEqual(proc.returncode, 0, proc.stdout + \"\\n\" + proc.stderr)\n" +
+        "            with open(os.path.join(out_dir, \"graph.json\"), \"r\") as f:\n" +
+        "                graph = json.load(f)\n" +
+        "            for node in graph.get(\"nodes\", []):\n" +
+        "                self.assertTrue(\n" +
+        "                    node.get(\"described\"),\n" +
+        "                    f\"node {node.get('name')} ({node.get('target')}) failed --describe: {node.get('describe_error')}\",\n" +
+        "                )\n\n\n" +
+        "if __name__ == \"__main__\":\n" +
+        "    unittest.main()\n"
+    )
+    _heredoc_genrule(name + "_runner_gen", runner_py, content)
+    seen = {}
+    all_data = []
+    for item in [config, "//talOS/launcher:launcher", "//talOS/bridge:hardware_node"] + list(nodes) + list(data):
+        lbl = native.package_relative_label(item)
+        if lbl not in seen:
+            seen[lbl] = True
+            all_data.append(lbl)
+    size = kwargs.pop("size", "small")
+    py_test(
+        name = name,
+        size = size,
+        srcs = [runner_py],
+        main = runner_py,
+        data = all_data,
+        legacy_create_init = False,
+        deps = [Label("@rules_python//python/runfiles")],
+        **kwargs
+    )
 
 

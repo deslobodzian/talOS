@@ -7,9 +7,15 @@
 #include <thread>
 #include <utility>
 
+#include "bridge/topics.h"
 #include "talOS/process/process.h"
 
 namespace talos::hardware {
+
+// /hw/status is read by talos::Node subscribers, which open every slot at
+// 8-byte alignment (talos::kMessageAlignment). ipc::Publisher lays the slot out
+// at alignof(Message), so the two agree only while this holds.
+static_assert(alignof(bridge::BridgeStatus) == 8);
 
 HardwareNode::HardwareNode(config::RobotConfig robot_config,
                            std::string remote_ip, uint16_t remote_port,
@@ -72,6 +78,34 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
     }
     subsystems_[name] = std::move(tracker);
   }
+  IndexActuators();
+}
+
+void HardwareNode::IndexActuators() {
+  const auto index = [](auto& table, const auto& entries, uint16_t count) {
+    table.clear();
+    for (uint16_t j = 0; j < count; ++j) table.try_emplace(entries[j].id, j);
+  };
+  index(motor_index_, full_cmd_.motors, full_cmd_.count);
+  index(digital_output_index_, full_cmd_.digital_outputs,
+        full_cmd_.digital_output_count);
+  index(pwm_output_index_, full_cmd_.pwm_outputs, full_cmd_.pwm_output_count);
+
+  const auto slots = [](std::vector<uint16_t>& out, const auto& table,
+                        const std::vector<uint16_t>& ids) {
+    out.clear();
+    for (auto id : ids) {
+      if (auto it = table.find(id); it != table.end())
+        out.push_back(it->second);
+    }
+  };
+  for (auto& [name, tracker] : subsystems_) {
+    slots(tracker.motor_slots, motor_index_, tracker.devices.motors);
+    slots(tracker.digital_output_slots, digital_output_index_,
+          tracker.devices.digital_outputs);
+    slots(tracker.pwm_output_slots, pwm_output_index_,
+          tracker.devices.pwm_outputs);
+  }
 }
 
 bool HardwareNode::Open() {
@@ -86,6 +120,8 @@ bool HardwareNode::Open() {
       std::make_unique<ipc::Publisher<talos::hardware::Packet>>(kCommandTopic);
   ds_pub_ = std::make_unique<ipc::Publisher<talos::hardware::Packet>>(
       kDriverStationTopic);
+  status_pub_ = std::make_unique<ipc::Publisher<bridge::BridgeStatus>>(
+      bridge::topics::kStatus);
 
   for (auto& [name, tracker] : subsystems_) {
     tracker.subscriber =
@@ -93,10 +129,6 @@ bool HardwareNode::Open() {
             RequestTopic(name),
             RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST});
   }
-
-  legacy_cmd_sub_ = std::make_unique<ipc::Subscriber<talos::hardware::Packet>>(
-      kCommandOverrideTopic,
-      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST});
 
   BuildIntrospectionManifest();
 
@@ -127,9 +159,6 @@ HardwareNode::EndpointAttributes() {
       // the command is delivered, and nothing in shared memory ever subscribes
       // to it.
       {kCommandTopic, introspect::naming::kSourceFlagExternal},
-      // Nothing in the tree publishes the override. Reporting it as a topic
-      // with no writer would be reporting a hook as a fault.
-      {kCommandOverrideTopic, introspect::naming::kSourceFlagOptional},
   };
   return kAttributes;
 }
@@ -143,27 +172,33 @@ introspect::Description HardwareNode::Describe() {
 void HardwareNode::BuildIntrospectionManifest() {
   introspection_manifest_.clear();
 
-  const auto add = [this](event::SourceKind kind, std::string name) {
+  const auto add = [this](event::SourceKind kind, std::string name,
+                          std::size_t bytes, std::size_t alignment) {
     const auto id = static_cast<std::uint16_t>(introspection_manifest_.size());
     introspection_manifest_.push_back({
         .id = id,
         .kind = kind,
         .name = std::move(name),
-        .message_bytes = static_cast<std::uint32_t>(sizeof(Packet)),
-        .alignment = static_cast<std::uint32_t>(alignof(Packet)),
+        .message_bytes = static_cast<std::uint32_t>(bytes),
+        .alignment = static_cast<std::uint32_t>(alignment),
     });
     return static_cast<std::size_t>(id);
   };
+  const auto add_packet = [&add](event::SourceKind kind, std::string name) {
+    return add(kind, std::move(name), sizeof(Packet), alignof(Packet));
+  };
 
-  // Same order as Open() creates them, so the ids stay stable across runs of
-  // the same configuration.
-  add(event::SourceKind::SENDER, kStateTopic);
-  add(event::SourceKind::SENDER, kCommandTopic);
-  add(event::SourceKind::SENDER, kDriverStationTopic);
-  add(event::SourceKind::FETCHER, kCommandOverrideTopic);
+  // The fixed ends first, then one request per subsystem, so the fixed ids
+  // (PublishIntrospection's 0..3) do not depend on the configuration.
+  add_packet(event::SourceKind::SENDER, kStateTopic);
+  add_packet(event::SourceKind::SENDER, kCommandTopic);
+  add_packet(event::SourceKind::SENDER, kDriverStationTopic);
+  add(event::SourceKind::SENDER, bridge::topics::kStatus,
+      sizeof(bridge::BridgeStatus), alignof(bridge::BridgeStatus));
 
   for (auto& [name, tracker] : subsystems_) {
-    tracker.source_index = add(event::SourceKind::FETCHER, RequestTopic(name));
+    tracker.source_index =
+        add_packet(event::SourceKind::FETCHER, RequestTopic(name));
   }
 }
 
@@ -181,7 +216,7 @@ void HardwareNode::PublishIntrospection() {
   // /hw/req/drive traffic go uncounted for as long as it did.
   std::uint64_t dispatches = states_received_ + commands_sent_ +
                              driver_station_packets_received_ +
-                             legacy_commands_;
+                             statuses_published_;
   for (const auto& [name, tracker] : subsystems_) {
     dispatches += tracker.requests;
   }
@@ -197,7 +232,7 @@ void HardwareNode::PublishIntrospection() {
   set(0, states_received_);
   set(1, commands_sent_);
   set(2, driver_station_packets_received_);
-  set(3, legacy_commands_);
+  set(3, statuses_published_);
   for (const auto& [name, tracker] : subsystems_) {
     set(tracker.source_index, tracker.requests);
   }
@@ -239,6 +274,7 @@ void HardwareNode::Tick(uint64_t now_us) {
       if (!Decode({frame.payload, frame.payload_size}, state)) continue;
 
       ++states_received_;
+      last_state_receipt_us_ = now_us;
       if (state.boot_id != last_boot_id_ || state.config_id != config_id_ ||
           !is_configured_) {
         if (now_us - last_push_time_us_ >= 50000 ||
@@ -302,34 +338,26 @@ void HardwareNode::Tick(uint64_t now_us) {
         } else if (!OwnsRequestDevices(tracker, partial)) {
           ++ownership_rejected_;
         } else {
-          // Apply motors belonging to this subsystem
+          // Apply the addressed actuators; ids absent from the merge are
+          // ignored.
           for (std::size_t i = 0; i < partial.count; ++i) {
             const auto& pm = partial.motors[i];
-            for (std::size_t j = 0; j < full_cmd_.count; ++j) {
-              if (full_cmd_.motors[j].id == pm.id) {
-                full_cmd_.motors[j] = pm;
-                break;
-              }
+            if (auto it = motor_index_.find(pm.id); it != motor_index_.end()) {
+              full_cmd_.motors[it->second] = pm;
             }
           }
-          // Apply digital outputs
           for (std::size_t i = 0; i < partial.digital_output_count; ++i) {
             const auto& pd = partial.digital_outputs[i];
-            for (std::size_t j = 0; j < full_cmd_.digital_output_count; ++j) {
-              if (full_cmd_.digital_outputs[j].id == pd.id) {
-                full_cmd_.digital_outputs[j] = pd;
-                break;
-              }
+            if (auto it = digital_output_index_.find(pd.id);
+                it != digital_output_index_.end()) {
+              full_cmd_.digital_outputs[it->second] = pd;
             }
           }
-          // Apply PWM outputs
           for (std::size_t i = 0; i < partial.pwm_output_count; ++i) {
             const auto& pp = partial.pwm_outputs[i];
-            for (std::size_t j = 0; j < full_cmd_.pwm_output_count; ++j) {
-              if (full_cmd_.pwm_outputs[j].id == pp.id) {
-                full_cmd_.pwm_outputs[j] = pp;
-                break;
-              }
+            if (auto it = pwm_output_index_.find(pp.id);
+                it != pwm_output_index_.end()) {
+              full_cmd_.pwm_outputs[it->second] = pp;
             }
           }
           // Adopt the request's identity words. The outgoing command carries
@@ -353,31 +381,16 @@ void HardwareNode::Tick(uint64_t now_us) {
         (now_us - tracker.last_seen_us > timeout_us)) {
       tracker.timed_out = true;
       // Neutralize actuators owned by this subsystem
-      for (auto id : tracker.devices.motors) {
-        for (std::size_t j = 0; j < full_cmd_.count; ++j) {
-          if (full_cmd_.motors[j].id == id) {
-            full_cmd_.motors[j].mode = Mode::kNeutral;
-            full_cmd_.motors[j].demand = 0.0;
-            full_cmd_.motors[j].feedforward_v = 0.0;
-            break;
-          }
-        }
+      for (auto j : tracker.motor_slots) {
+        full_cmd_.motors[j].mode = Mode::kNeutral;
+        full_cmd_.motors[j].demand = 0.0;
+        full_cmd_.motors[j].feedforward_v = 0.0;
       }
-      for (auto id : tracker.devices.digital_outputs) {
-        for (std::size_t j = 0; j < full_cmd_.digital_output_count; ++j) {
-          if (full_cmd_.digital_outputs[j].id == id) {
-            full_cmd_.digital_outputs[j].value = false;
-            break;
-          }
-        }
+      for (auto j : tracker.digital_output_slots) {
+        full_cmd_.digital_outputs[j].value = false;
       }
-      for (auto id : tracker.devices.pwm_outputs) {
-        for (std::size_t j = 0; j < full_cmd_.pwm_output_count; ++j) {
-          if (full_cmd_.pwm_outputs[j].id == id) {
-            full_cmd_.pwm_outputs[j].output = 0.0;
-            break;
-          }
-        }
+      for (auto j : tracker.pwm_output_slots) {
+        full_cmd_.pwm_outputs[j].output = 0.0;
       }
     } else {
       any_subsystem_active = true;
@@ -402,18 +415,6 @@ void HardwareNode::Tick(uint64_t now_us) {
     }
     if (have_active_observed) {
       full_cmd_.observed_time_us = min_observed_us;
-    }
-  }
-
-  // Also check the whole-command override, which replaces the merge outright
-  if (legacy_cmd_sub_) {
-    if (auto pkt = legacy_cmd_sub_->read()) {
-      ++legacy_commands_;
-      Command direct{};
-      if (Decode(pkt->bytes(), direct)) {
-        full_cmd_ = direct;
-        any_subsystem_active = true;
-      }
     }
   }
 
@@ -443,6 +444,39 @@ void HardwareNode::Tick(uint64_t now_us) {
       }
     }
   }
+
+  // 4. Bridge health, on the bridge clock.
+  if (status_pub_ && (statuses_published_ == 0 ||
+                      now_us - last_status_us_ >= kStatusPeriodUs)) {
+    status_pub_->write(Status(now_us));
+    ++statuses_published_;
+    last_status_us_ = now_us;
+  }
+}
+
+bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
+  uint32_t timed_out_mask = 0;
+  uint32_t bit = 0;
+  // subsystems_ is a std::map, so this walks the names in sorted order.
+  for (const auto& [name, tracker] : subsystems_) {
+    if (bit < 32 && tracker.timed_out) timed_out_mask |= uint32_t{1} << bit;
+    ++bit;
+  }
+  const uint64_t state_age_us =
+      states_received_ > 0 && now_us > last_state_receipt_us_
+          ? now_us - last_state_receipt_us_
+          : 0;
+  return bridge::BridgeStatus{
+      states_received_,
+      commands_sent_,
+      identity_rejected_,
+      ownership_rejected_,
+      driver_station_packets_received_,
+      state_age_us,
+      timed_out_mask,
+      static_cast<uint32_t>(subsystems_.size()),
+      is_configured_,
+  };
 }
 
 bool HardwareNode::ShouldSendCommand(uint64_t now_us) {
@@ -452,6 +486,14 @@ bool HardwareNode::ShouldSendCommand(uint64_t now_us) {
 
 int HardwareNode::Run(int duration_s) {
   talos::process::InstallStopHandlers();
+  // The 1 kHz merge runs above the nodes (priority 50) so a busy node cannot
+  // delay the command the RoboRIO is waiting for. Best effort: a refusal is
+  // reported once and the bridge runs unprivileged. Simulation stays an
+  // ordinary process.
+  if (!simulation_) {
+    talos::process::ConfigureRealtime(
+        {.period = std::chrono::microseconds{kTickPeriodUs}, .priority = 60});
+  }
   const auto end =
       std::chrono::steady_clock::now() + std::chrono::seconds{duration_s};
 

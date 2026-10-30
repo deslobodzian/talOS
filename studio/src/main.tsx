@@ -7,7 +7,7 @@ import {GLTFLoader} from 'three/examples/jsm/loaders/GLTFLoader.js';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 
-import type {Pose, Snapshot} from './core';
+import {channelDisplay, type Pose, type Snapshot} from './core';
 import './style.css';
 import {type GraphTab, isGraphTabId, isTabId, newGraphTab, parseGraphTabs, TABS, type TabId, type ViewId} from './tabs';
 import {
@@ -87,11 +87,7 @@ export function Field({view}: {view: View}) {
       </g>);
   return <>
     <div className="legend">
-      <span><i style={{background: palette[0]}}/>Fused pose</span>
-      {s?.ghosts.map((g, i) => <span key={g.name}>
-                                <i style={{background: palette[(i + 1) % 4]}}/>
-                                {g.name}
-                              </span>)}
+      <span><i style={{background: palette[0]}}/>Chassis pose</span>
     </div>
     {s && !poseOk &&
      <div className="empty" role="status">
@@ -113,16 +109,6 @@ export function Field({view}: {view: View}) {
       <polyline
           points={trail.map(h => point(h.chassis)).join(' ')}
           fill="none" stroke={palette[0]} strokeOpacity=".55" strokeWidth="2"/>
-      {s?.targets.map(t => <g key={t.id}>
-         <line x1={s.chassis.x * 50} y1={410 - s.chassis.y * 50}
-               x2={t.pose.x * 50} y2={410 - t.pose.y * 50} stroke="#b59bff"
-               strokeDasharray="3 6" opacity=".6"/>
-         <rect x={t.pose.x * 50 - 5} y={410 - t.pose.y * 50 - 5} width="10"
-               height="10" fill="#b59bff"/>
-         <text x={t.pose.x * 50 + 9} y={410 - t.pose.y * 50 + 4} fill="#b59bff"
-               fontSize="10">{t.id}</text>
-       </g>)}
-      {s?.ghosts.map((g, i) => robot(g.pose, palette[(i + 1) % 4], g.name))}
       {poseOk && s && robot(s.chassis, palette[0], 'chassis')}
       {poseOk && s && velocity &&
        <line x1={s.chassis.x * 50} y1={410 - s.chassis.y * 50}
@@ -166,18 +152,6 @@ function OrbitNavigation() {
 function Spatial({s}: {s: Snapshot|null}) {
   const [model, setModel] = useState<THREE.Group|null>(null);
   const [error, setError] = useState('');
-  const camera = useRef<THREE.PerspectiveCamera>(null);
-  const [helper, setHelper] = useState<THREE.CameraHelper|null>(null);
-  useEffect(() => {
-    if (camera.current) {
-      const h = new THREE.CameraHelper(camera.current);
-      setHelper(h);
-      return () => h.dispose();
-    }
-  }, [!!s]);
-  useEffect(() => {
-    helper?.update();
-  }, [s, helper]);
   useEffect(() => () => {
     model?.traverse(object => {
       if (object instanceof THREE.Mesh) {
@@ -205,49 +179,14 @@ function Spatial({s}: {s: Snapshot|null}) {
         <gridHelper args={[18, 18, '#486676', '#29424e']}
                     rotation={[Math.PI / 2, 0, 0]} position={[8.25, 4.1, 0]}/>
         {model && <primitive object={model}/>}
-        {s && <>
-          <group position={[s.chassis.x, s.chassis.y, s.chassis.z + .2]}
-                 rotation={[s.chassis.roll, s.chassis.pitch, s.chassis.yaw,
-                            'ZYX']}>
-            <mesh>
-              <boxGeometry args={[.8, .7, .4]}/>
-              <meshStandardMaterial color="#48e1cf"/>
-            </mesh>
-            <mesh position={[0, 0, .4 + s.elevator_m / 2]}>
-              <boxGeometry args={[.13, .3, Math.max(.1, s.elevator_m)]}/>
-              <meshStandardMaterial color="#b6c9d2"/>
-            </mesh>
-            <group position={[0, 0, .4 + s.elevator_m]}
-                   rotation={[0, -s.arm_rad, 0]}>
-              <mesh position={[.45, 0, 0]}>
-                <boxGeometry args={[.9, .12, .12]}/>
-                <meshStandardMaterial color="#ffbd69"/>
-              </mesh>
-            </group>
-          </group>
-          <perspectiveCamera
-              ref={camera} position={[s.camera.x, s.camera.y, s.camera.z]}
-              quaternion={new THREE.Quaternion()
-                              .setFromEuler(new THREE.Euler(
-                                  s.camera.roll, s.camera.pitch, s.camera.yaw,
-                                  'ZYX'))
-                              .multiply(
-                                  new THREE.Quaternion().setFromRotationMatrix(
-                                      new THREE.Matrix4().makeBasis(
-                                          new THREE.Vector3(0, -1, 0),
-                                          new THREE.Vector3(0, 0, 1),
-                                          new THREE.Vector3(-1, 0, 0))))}
-              fov={65} aspect={1.6} near={.1} far={3}/>
-          {helper && <primitive object={helper}/>}
-          {s.targets.map(
-              t => <mesh key={t.id}
-                         position={[t.pose.x, t.pose.y, t.pose.z]}
-                         rotation={[t.pose.roll, t.pose.pitch, t.pose.yaw,
-                                    'ZYX']}>
-                <boxGeometry args={[.03, .3, .3]}/>
-                <meshStandardMaterial color="#b59bff"/>
-              </mesh>)}
-        </>}
+        {s && <group position={[s.chassis.x, s.chassis.y, s.chassis.z + .2]}
+                     rotation={[s.chassis.roll, s.chassis.pitch, s.chassis.yaw,
+                                'ZYX']}>
+          <mesh>
+            <boxGeometry args={[.8, .7, .4]}/>
+            <meshStandardMaterial color="#48e1cf"/>
+          </mesh>
+        </group>}
       </Canvas>
     </div>
     <div className="panel-footer">
@@ -407,6 +346,8 @@ function Plot({view, onSeek, channels, onChannels}: {
                          selected.filter(k => k !== key) :
                          [...selected, key])}/>
           {key}<em>{view.snapshot?.units[key]}</em>
+          {view.snapshot?.labels[key] &&
+           <em>{channelDisplay(view.snapshot, key)}</em>}
         </label>)}</div>
     <div className="plot" ref={root}/>
     <div className="panel-footer">
@@ -475,7 +416,6 @@ function App() {
   const [exactTimestamp, setExactTimestamp] = useState('');
   const [stepNs, setStepNs] = useState('20000000');
   const [transportError, setTransportError] = useState('');
-  const udpActive = useRef(false);
 
   // One promise per in-flight RPC. The worker owns the timeline and the graph,
   // so the Agent tab has to ask it rather than keeping a second copy.
@@ -574,43 +514,9 @@ function App() {
         });
       });
 
-  const stopDesktop = async () => {
-    udpActive.current = false;
-    if ('__TAURI_INTERNALS__' in window) {
-      try {
-        const {invoke} = await import('@tauri-apps/api/core');
-        await invoke('stop_udp');
-        return true;
-      } catch (e) {
-        setTransportError(String(e));
-        return false;
-      }
-    }
-    return true;
-  };
-
-  const start = async () => {
+  const start = () => {
     setTransportError('');
-    if ('__TAURI_INTERNALS__' in window) {
-      try {
-        const {invoke, Channel} = await import('@tauri-apps/api/core');
-        const channel = new Channel<ArrayBuffer>();
-        channel.onmessage = buffer => {
-          try {
-            if (udpActive.current)
-              worker.postMessage({type: 'packet', buffer}, [buffer]);
-          } finally {
-            void invoke('ack_udp').catch(e => setTransportError(String(e)));
-          }
-        };
-        udpActive.current = true;
-        await invoke('start_udp', {bind: '0.0.0.0:5801', onPacket: channel});
-        send({type: 'mode', mode: 'LIVE_STREAMING'});
-      } catch (e) {
-        setTransportError(String(e));
-      }
-    } else
-      send({type: 'connect', url});
+    send({type: 'connect', url});
   };
 
   const startNs = BigInt(view.bounds?.start ?? 0),
@@ -639,9 +545,7 @@ function App() {
                onChange={e => setUrl(e.target.value)}/>
         <button className="primary" onClick={start}>Connect</button>
       </div>
-      <button onClick={async () => {
-        if (await stopDesktop()) send({type: 'demo'});
-      }}>Demo data</button>
+      <button onClick={() => send({type: 'demo'})}>Demo data</button>
     </header>
 
     {transportError && <div className="error">{transportError}</div>}
@@ -810,7 +714,7 @@ function App() {
         <input aria-label="Import telemetry log" type="file" accept=".tlog"
                onChange={async (e) => {
                  const f = e.target.files?.[0];
-                 if (f && await stopDesktop()) {
+                 if (f) {
                    const buffer = await f.arrayBuffer();
                    worker.postMessage({type: 'import', buffer}, [buffer]);
                  }

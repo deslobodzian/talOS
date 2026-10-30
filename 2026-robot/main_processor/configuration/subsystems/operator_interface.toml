@@ -11,8 +11,7 @@ shooter_target_rps = 60.0
 # Stick is field-relative; falls back to robot-relative until the drivetrain
 # publishes a heading on /drivetrain/state.
 field_oriented = true
-# Bit 0 is button 1.
-shoot_button_mask = 1
+# Joystick 0 buttons, 1-based as the Driver Station numbers them.
+shoot_button = 1
 intake_target_rps = 30.0
-# Bit 1 is button 2.
-intake_button_mask = 2
+intake_button = 2

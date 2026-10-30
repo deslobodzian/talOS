@@ -31,13 +31,6 @@
         },
         {
           "kind": "FETCHER",
-          "name": "/hw/command/override",
-          "message_bytes": 1404,
-          "external": false,
-          "optional": true
-        },
-        {
-          "kind": "FETCHER",
           "name": "/hw/request/drivetrain",
           "message_bytes": 1404,
           "external": false,
@@ -73,8 +66,8 @@
         },
         {
           "kind": "WATCHER",
-          "name": "/driver_station/state",
-          "message_bytes": 88,
+          "name": "/hw/state/driver_station",
+          "message_bytes": 1404,
           "external": false,
           "optional": false
         },
@@ -105,27 +98,6 @@
           "message_bytes": 24,
           "external": false,
           "optional": true
-        }
-      ]
-    },
-    {
-      "name": "driver_station",
-      "target": "//2026-robot/main_processor/driver_station:node",
-      "described": true,
-      "sources": [
-        {
-          "kind": "SENDER",
-          "name": "/driver_station/state",
-          "message_bytes": 88,
-          "external": false,
-          "optional": false
-        },
-        {
-          "kind": "WATCHER",
-          "name": "/hw/state/driver_station",
-          "message_bytes": 1404,
-          "external": false,
-          "optional": false
         }
       ]
     },
@@ -220,8 +192,8 @@
         },
         {
           "kind": "WATCHER",
-          "name": "/driver_station/state",
-          "message_bytes": 88,
+          "name": "/hw/state/driver_station",
+          "message_bytes": 1404,
           "external": false,
           "optional": false
         },
@@ -297,8 +269,8 @@
         },
         {
           "kind": "WATCHER",
-          "name": "/driver_station/state",
-          "message_bytes": 88,
+          "name": "/hw/state/driver_station",
+          "message_bytes": 1404,
           "external": false,
           "optional": false
         },

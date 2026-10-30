@@ -29,6 +29,7 @@ import {
   type SystemState,
   TimingTab,
   type View,
+  Wiring,
 } from '../src/system_view';
 
 const emptyView: View = {
@@ -98,9 +99,10 @@ test('the system view surfaces the faults the demo deliberately carries', () => 
 
 test('a half-wired topic its own node declared is not shown as a fault', () => {
   const html = render(<SystemTab system={state()}/>);
-  // /hw/command's consumer is the RoboRIO across UDP and /hw/command/override
-  // has no publisher by design. Both are half-wired, neither is broken, and a
-  // viewer that calls them broken is why nobody reads the fault list.
+  // /hw/command's consumer is the RoboRIO across UDP and
+  // /drivetrain/target/auto has no publisher by design. Both are half-wired,
+  // neither is broken, and a viewer that calls them broken is why nobody
+  // reads the fault list.
   assert.ok(html.includes('no shared-memory peer will appear'),
             'an external end was not labelled bridged');
   assert.ok(html.includes('declared optional; no peer yet'),
@@ -109,10 +111,15 @@ test('a half-wired topic its own node declared is not shown as a fault', () => {
   assert.ok(html.includes('>unconnected<'), 'no unconnected badge in the table');
 
   // And the wiring view agrees with the table about the same two ends, rather
-  // than drawing them as broken wires.
+  // than drawing them as broken wires. The external end is on the default
+  // (first) node; the optional ends are on the arbiter, so render its wiring.
   assert.ok(html.includes('outside talOS'),
             'wiring calls an external end a missing peer');
-  assert.ok(html.includes('optional — no peer yet'),
+  const system = state();
+  const arbiter = system.graph!.nodes.find(n => n.name === 'arbiter')!;
+  const wiring = render(<Wiring graph={system.graph!} node={arbiter}
+                                rates={system.rates}/>);
+  assert.ok(wiring.includes('optional — no peer yet'),
             'wiring calls an optional end a missing peer');
 });
 
@@ -215,15 +222,15 @@ test('the system tab reports what was declared against what registered', () => {
   // The demo declares a node that never claimed a registry slot. Which node,
   // what would have built it, and why it matters are all on screen: the live
   // graph alone can only be silent about it.
-  assert.ok(html.includes('8 nodes declared'), 'declared count missing');
-  assert.ok(html.includes('7 registered'), 'registered count missing');
+  assert.ok(html.includes('7 nodes declared'), 'declared count missing');
+  assert.ok(html.includes('6 registered'), 'registered count missing');
   assert.ok(html.includes('1 never appeared'), 'no missing-node count');
   assert.ok(html.includes('declared, never registered'),
             'the missing node is not explained');
   assert.ok(html.includes('shooter'));
   assert.ok(html.includes('//2026-robot/main_processor/shooter:node'),
             'the missing node does not say what would have built it');
-  assert.ok(html.includes('8 declared'), 'the toolbar count is missing');
+  assert.ok(html.includes('7 declared'), 'the toolbar count is missing');
 
   // The launcher's own sentence, not the viewer's paraphrase of it.
   assert.ok(html.includes('is published but nothing subscribes to it'),
@@ -256,9 +263,8 @@ test('a declared graph with nothing to report says so rather than nothing', () =
 });
 
 test('with no declared graph every view is exactly what it was before', () => {
-  // The bridge may be run without --declared, and the desktop UDP path has no
-  // HTTP endpoint to ask. Neither is a fault, so neither may produce an empty
-  // panel or a count of zero that nobody claimed.
+  // The bridge may be run without --declared. That is not a fault, so it may
+  // not produce an empty panel or a count of zero that nobody claimed.
   const system = state();
   assert.equal(system.declared, null);
   for (const [name, html] of [
@@ -314,7 +320,7 @@ test('the overview reads declared against live, and names what never appeared',
        const html = render(<OverviewTab view={emptyView} system={state(true)}
                                         onOpen={() => {}}/>);
        assert.ok(html.includes('Declared'), 'no declared row');
-       assert.ok(html.includes('8 nodes, 7 live'), 'declared vs live not shown');
+       assert.ok(html.includes('7 nodes, 6 live'), 'declared vs live not shown');
        assert.ok(html.includes('Never appeared'));
        assert.ok(html.includes('shooter'));
        assert.ok(html.includes('0 errors, 1 warnings'), 'no lint tally');
@@ -335,8 +341,8 @@ test('the attention list flags real orphans and leaves the design alone', () => 
   // The two topics that are half-wired by declaration must not be in it. That
   // is the whole point: a list that reports the design is a list people learn
   // to skip, and then it is not there for the orphan above.
-  for (const quiet of ['/hw/command is', '/hw/command/override',
-                       '/drivetrain/target/auto', '/shooter/target/auto'])
+  for (const quiet of ['/hw/command is', '/drivetrain/target/auto',
+                       '/shooter/target/auto'])
     assert.ok(!html.includes(quiet), `${quiet} was flagged as a fault`);
 
   // And a topic the launcher already spoke about is raised in the launcher's

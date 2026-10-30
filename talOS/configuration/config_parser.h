@@ -2,10 +2,12 @@
 
 // Robot configuration: TOML -> hardware::Config plus per-subsystem ownership.
 //
-// One layout: [robot], optional [studio], and [subsystems.<name>] tables.
-// [[subsystems]] { name, path, node? } entries are an include over it: each
-// file (path relative to robot.toml) maps its [subsystem] header and tables to
-// [subsystems.<name>], the entry's `node` winning; then it parses as one file.
+// One layout: optional `include = "base.toml"`, [robot], optional [studio],
+// and [subsystems.<name>] tables. [[subsystems]] { name, path, node?,
+// defaults? } entries are an include over it: each file (path relative to
+// robot.toml) maps its [subsystem] header and tables to [subsystems.<name>],
+// optionally layered over a `defaults` TOML file, the entry's `node` winning;
+// then it parses as one file.
 //
 // Device tables per subsystem: motors (type "TalonFX"), sensors (type
 // "CANcoder" or "Pigeon2"), digital_inputs, digital_outputs, analog_inputs,
@@ -55,7 +57,6 @@ struct RobotConfig {
   struct StudioConfig {
     std::string bridge{"//studio/bridge:studio_bridge"};
     uint16_t http_port{5800};
-    uint16_t udp_port{5801};
     // Relative to the launcher's working directory.
     std::string webroot{"bazel-bin/studio/dist"};
   };
@@ -134,6 +135,28 @@ inline uint16_t ReadPort(const toml::table& tbl, const char* key, uint16_t def,
                                 "' must be a port in [1, 65535]");
   }
   return static_cast<uint16_t>(*v);
+}
+
+inline void CheckTopLevelKeys(const toml::table& tbl) {
+  for (auto&& [k, v] : tbl) {
+    if (k.str() != "include" && k.str() != "robot" && k.str() != "studio" &&
+        k.str() != "subsystems") {
+      throw std::invalid_argument("unknown top-level key '" +
+                                  std::string(k.str()) + "'");
+    }
+  }
+}
+
+inline void MergeTables(toml::table& base, const toml::table& over) {
+  for (auto&& [k, v] : over) {
+    if (auto* over_sub = v.as_table()) {
+      if (auto* base_sub = base[k.str()].as_table()) {
+        MergeTables(*base_sub, *over_sub);
+        continue;
+      }
+    }
+    base.insert_or_assign(std::string(k.str()), v);
+  }
 }
 
 using DeviceConfig =
@@ -279,6 +302,7 @@ inline uint16_t ResolveLocalPort(const RobotConfig& config,
 inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
   using detail::Read;
   using detail::ReadRequired;
+  detail::CheckTopLevelKeys(tbl);
   RobotConfig result;
   result.toml_data = tbl;
   auto& hw = result.hardware;
@@ -303,7 +327,6 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     s.webroot = detail::ReadNonEmpty(*studio, "webroot", s.webroot, "[studio]");
     s.http_port =
         detail::ReadPort(*studio, "http_port", s.http_port, "[studio]");
-    s.udp_port = detail::ReadPort(*studio, "udp_port", s.udp_port, "[studio]");
   }
 
   auto* subsystems_tbl = tbl["subsystems"].as_table();
@@ -504,10 +527,76 @@ inline toml::table ParseTomlFile(const std::string& path) {
 // other top-level tables, then the entry's optional `node` over the file's.
 // Validation then runs once over the merged view, so splitting files cannot
 // weaken a check.
+inline void NormalizeManifestPaths(toml::array& manifest,
+                                   const std::string& file_path) {
+  namespace fs = std::filesystem;
+  const fs::path base = fs::path(file_path).parent_path();
+  if (base.empty()) return;
+  for (auto&& entry_node : manifest) {
+    auto* entry = entry_node.as_table();
+    if (!entry) continue;
+    for (const char* key : {"path", "defaults"}) {
+      if (auto val = (*entry)[key].value<std::string_view>();
+          val && !val->empty()) {
+        const fs::path rel{std::string(*val)};
+        if (!rel.is_absolute()) {
+          entry->insert_or_assign(key, (base / rel).string());
+        }
+      }
+    }
+  }
+}
+
+inline void MergeManifests(toml::array& base_arr, const toml::array& child_arr,
+                           const std::string& child_path) {
+  toml::table seen_in_child;
+  for (auto&& child_node : child_arr) {
+    auto* child_entry = child_node.as_table();
+    auto name_view = child_entry
+                         ? (*child_entry)["name"].value<std::string_view>()
+                         : std::nullopt;
+    if (!name_view || name_view->empty()) {
+      throw std::invalid_argument("invalid [[subsystems]] entry in " +
+                                  child_path + ": needs 'name'");
+    }
+    const std::string name(*name_view);
+    if (seen_in_child.contains(name)) {
+      throw std::invalid_argument("duplicate [[subsystems]] entry in " +
+                                  child_path + ": '" + name + "'");
+    }
+    seen_in_child.insert_or_assign(name, true);
+
+    toml::table* matched = nullptr;
+    for (auto&& base_node : base_arr) {
+      auto* base_entry = base_node.as_table();
+      if (base_entry &&
+          (*base_entry)["name"].value<std::string_view>() == name) {
+        matched = base_entry;
+        break;
+      }
+    }
+    if (matched) {
+      for (auto&& [k, v] : *child_entry) {
+        matched->insert_or_assign(std::string(k.str()), v);
+      }
+    } else {
+      base_arr.push_back(*child_entry);
+    }
+  }
+}
+
 inline toml::table ExpandManifest(const toml::array& manifest,
-                                  const std::string& path) {
+                                  const std::string& path,
+                                  bool paths_normalized = false) {
   namespace fs = std::filesystem;
   const fs::path base = fs::path(path).parent_path();
+  auto resolve_entry_path = [&](std::string_view p) {
+    const fs::path rel{std::string(p)};
+    if (paths_normalized || rel.is_absolute() || base.empty()) {
+      return rel.string();
+    }
+    return (base / rel).string();
+  };
   toml::table subs_view;
   for (auto&& entry_node : manifest) {
     auto* entry = entry_node.as_table();
@@ -515,25 +604,30 @@ inline toml::table ExpandManifest(const toml::array& manifest,
         entry ? (*entry)["name"].value<std::string_view>() : std::nullopt;
     auto rel_view =
         entry ? (*entry)["path"].value<std::string_view>() : std::nullopt;
-    if (!name_view || !rel_view) {
+    if (!name_view || !rel_view || name_view->empty() || rel_view->empty()) {
       throw std::invalid_argument("invalid [[subsystems]] entry in " + path +
                                   ": needs 'name' and 'path'");
     }
     const std::string name(*name_view);
     for (auto&& [k, v] : *entry) {
-      if (k.str() != "name" && k.str() != "path" && k.str() != "node") {
+      if (k.str() != "name" && k.str() != "path" && k.str() != "node" &&
+          k.str() != "defaults") {
         throw std::invalid_argument("unknown key '" + std::string(k.str()) +
                                     "' in [[subsystems]] entry '" + name +
                                     "' in " + path +
-                                    " (expected name, path, node)");
+                                    " (expected name, path, node, defaults)");
       }
     }
     std::optional<std::string> node;
     if (entry->contains("node")) {
       node = ReadNonEmpty(*entry, "node", "", "[[subsystems]] entry");
     }
-    const fs::path rel{std::string(*rel_view)};
-    const std::string file = (rel.is_absolute() ? rel : base / rel).string();
+    std::optional<std::string> entry_defaults;
+    if (entry->contains("defaults")) {
+      entry_defaults = resolve_entry_path(
+          ReadNonEmpty(*entry, "defaults", "", "[[subsystems]] entry"));
+    }
+    const std::string file = resolve_entry_path(*rel_view);
     toml::table sub_file = ParseTomlFile(file);
 
     auto* header = sub_file["subsystem"].as_table();
@@ -545,9 +639,30 @@ inline toml::table ExpandManifest(const toml::array& manifest,
       throw std::invalid_argument("duplicate [[subsystems]] entry in " + path +
                                   ": '" + name + "'");
     }
+    std::optional<std::string> defaults_file;
+    if (header->contains("defaults")) {
+      const fs::path sub_base = fs::path(file).parent_path();
+      const fs::path def_rel{
+          ReadNonEmpty(*header, "defaults", "", "[subsystem]")};
+      defaults_file =
+          (def_rel.is_absolute() || sub_base.empty() ? def_rel
+                                                     : sub_base / def_rel)
+              .string();
+    }
+    if (entry_defaults) {
+      defaults_file = *entry_defaults;
+    }
+    if (defaults_file) {
+      toml::table merged = ParseTomlFile(*defaults_file);
+      MergeTables(merged, sub_file);
+      sub_file = std::move(merged);
+      header = sub_file["subsystem"].as_table();
+    }
     toml::table view;
     for (auto&& [k, v] : *header) {
-      if (k.str() != "name") view.insert_or_assign(std::string(k.str()), v);
+      if (k.str() != "name" && k.str() != "defaults") {
+        view.insert_or_assign(std::string(k.str()), v);
+      }
     }
     for (auto&& [k, v] : sub_file) {
       if (k.str() != "subsystem")
@@ -562,9 +677,48 @@ inline toml::table ExpandManifest(const toml::array& manifest,
 }  // namespace detail
 
 inline RobotConfig ParseRobotConfig(const std::string& path) {
+  namespace fs = std::filesystem;
   toml::table tbl = detail::ParseTomlFile(path);
+  detail::CheckTopLevelKeys(tbl);
   if (auto* manifest = tbl["subsystems"].as_array()) {
-    tbl.insert_or_assign("subsystems", detail::ExpandManifest(*manifest, path));
+    detail::NormalizeManifestPaths(*manifest, path);
+  }
+  if (tbl.contains("include")) {
+    const std::string inc_str =
+        detail::ReadNonEmpty(tbl, "include", "", "top-level");
+    const fs::path base_dir = fs::path(path).parent_path();
+    const fs::path inc_rel{inc_str};
+    const std::string inc_file =
+        (inc_rel.is_absolute() || base_dir.empty() ? inc_rel
+                                                   : base_dir / inc_rel)
+            .string();
+    toml::table base = detail::ParseTomlFile(inc_file);
+    detail::CheckTopLevelKeys(base);
+    if (base.contains("include")) {
+      throw std::invalid_argument("nested 'include' is not supported in " +
+                                  inc_file);
+    }
+    if (auto* base_manifest = base["subsystems"].as_array()) {
+      detail::NormalizeManifestPaths(*base_manifest, inc_file);
+    }
+    tbl.erase("include");
+    if (auto* base_subs = base["subsystems"].as_array()) {
+      if (auto* child_subs = tbl["subsystems"].as_array()) {
+        detail::MergeManifests(*base_subs, *child_subs, path);
+        tbl.erase("subsystems");
+      } else if (tbl.contains("subsystems")) {
+        base.insert_or_assign(
+            "subsystems", detail::ExpandManifest(*base_subs, inc_file,
+                                                 /*paths_normalized=*/true));
+      }
+    }
+    detail::MergeTables(base, tbl);
+    tbl = std::move(base);
+  }
+  if (auto* manifest = tbl["subsystems"].as_array()) {
+    tbl.insert_or_assign(
+        "subsystems",
+        detail::ExpandManifest(*manifest, path, /*paths_normalized=*/true));
   }
   return ParseRobotConfigTable(std::move(tbl));
 }

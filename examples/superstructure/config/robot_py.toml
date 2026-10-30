@@ -1,27 +1,15 @@
 # The superstructure example robot, launching the py/ nodes. Same robot and
 # subsystem files as robot.toml; only the `node =` lines differ.
-[robot]
-name = "superstructure_example"
-period_us = 5000
-command_timeout_us = 100000
-status_hz = 200.0
-commissioned = false
-sim_gateway = "//2026-robot/main_processor/simulation:sim_gateway"
-controller_address = "127.0.0.1"
-controller_port = 5802
-local_port = 5803
+include = "robot.toml"
 
 [[subsystems]]
 name = "intake"
-path = "subsystems/intake.toml"
 node = "//examples/superstructure/py:intake"
 
 [[subsystems]]
 name = "elevator"
-path = "subsystems/elevator.toml"
 node = "//examples/superstructure/py:elevator"
 
 [[subsystems]]
 name = "superstructure"
-path = "subsystems/superstructure.toml"
 node = "//examples/superstructure/py:superstructure"

@@ -1,10 +1,8 @@
 import {Builder} from 'flatbuffers';
 
-import {Channel} from './generated/talos/telemetry/channel';
+import {ChannelInfo} from './generated/talos/telemetry/channel-info';
 import {Frame} from './generated/talos/telemetry/frame';
-import {Ghost} from './generated/talos/telemetry/ghost';
 import {Pose} from './generated/talos/telemetry/pose';
-import {Target} from './generated/talos/telemetry/target';
 import {
   type DeclaredGraph,
   type DeclaredNode,
@@ -16,55 +14,59 @@ import {
   type SystemTopic,
 } from './system';
 
+// One stream for the whole demo run; a bridge restart would pick a new one,
+// which is how the viewer knows to throw the old timeline away.
+export const DEMO_STREAM_ID = 42n;
+export const DEMO_DICTIONARY_ID = 1;
+
+const DEMO_CHANNELS: {name: string; unit: string; labels?: string[]}[] = [
+  {name: 'velocity', unit: 'm/s'},
+  {name: 'heading', unit: 'rad'},
+  {name: 'voltage', unit: 'V'},
+  {name: 'setpoint', unit: 'm/s'},
+  {name: 'error', unit: 'm/s'},
+  {name: 'vx', unit: 'm/s'},
+  {name: 'vy', unit: 'm/s'},
+  {name: 'mode', unit: '', labels: ['disabled', 'teleop', 'auto']},
+];
+
 export function demoPacket(sequence: bigint): Uint8Array {
   const b = new Builder(2048);
   const t = Number(sequence % 100000n) * .02;
   const x = 8 + 5 * Math.cos(t * .35), y = 4 + 2.5 * Math.sin(t * .35),
         yaw = t * .35 + Math.PI / 2;
-  const ghosts =
-      ['RawOdometry', 'VisionEstimate', 'FusedPose'].map((name, i) => {
-        const s = b.createString(name);
-        Ghost.startGhost(b);
-        Ghost.addName(b, s);
-        Ghost.addPose(
-            b,
-            Pose.createPose(
-                b,
-                x +
-                    (i === 0     ? .15 * Math.sin(t) :
-                         i === 1 ? .05 :
-                                   0),
-                y + (i === 0 ? .12 : 0), 0, 0, 0, yaw));
-        return Ghost.endGhost(b);
-      });
-  const gv = Frame.createGhostsVector(b, ghosts);
-  const channels =
-      [
-        ['velocity', 1.75, 'm/s'], ['heading', yaw, 'rad'],
-        ['voltage', 12.4 - .8 * Math.sin(t * .7), 'V'], ['setpoint', 2, 'm/s'],
-        ['error', .2 * Math.sin(t * 2), 'm/s'],
-        ['vx', -1.75 * Math.sin(t * .35), 'm/s'],
-        ['vy', .875 * Math.cos(t * .35), 'm/s']
-      ]
-          .map(
-              ([name, value, unit]) => Channel.createChannel(
-                  b, b.createString(String(name)), Number(value),
-                  b.createString(String(unit))));
-  const cv = Frame.createChannelsVector(b, channels);
-  Target.startTarget(b);
-  Target.addId(b, 1);
-  Target.addPose(b, Pose.createPose(b, 1, 1, 1.4, 0, 0, 0));
-  const target = Target.endTarget(b);
-  const tv = Frame.createTargetsVector(b, [target]);
+  // The dictionary rides the first frame of each hundred, as the bridge's
+  // cached dictionary frame does on connect; the rest are bare values.
+  let dictionary: ReturnType<typeof Frame.createDictionaryVector>|undefined;
+  if (sequence % 100n === 0n) {
+    const entries = DEMO_CHANNELS.map(channel => {
+      // Strings and vectors first: nothing may be built while a table is open.
+      const name = b.createString(channel.name);
+      const unit = channel.unit ? b.createString(channel.unit) : undefined;
+      const labels = channel.labels ?
+          ChannelInfo.createLabelsVector(
+              b, channel.labels.map(label => b.createString(label))) :
+          undefined;
+      ChannelInfo.startChannelInfo(b);
+      ChannelInfo.addName(b, name);
+      if (unit !== undefined) ChannelInfo.addUnit(b, unit);
+      if (labels !== undefined) ChannelInfo.addLabels(b, labels);
+      return ChannelInfo.endChannelInfo(b);
+    });
+    dictionary = Frame.createDictionaryVector(b, entries);
+  }
+  const values = Frame.createValuesVector(b, [
+    1.75, yaw, 12.4 - .8 * Math.sin(t * .7), 2, .2 * Math.sin(t * 2),
+    -1.75 * Math.sin(t * .35), .875 * Math.cos(t * .35),
+    Number(sequence / 50n % 3n)
+  ]);
   Frame.startFrame(b);
-  Frame.addTimestampNs(b, 1000000000n + sequence * 20000000n);
+  Frame.addStreamId(b, DEMO_STREAM_ID);
   Frame.addSequenceId(b, sequence);
-  Frame.addGhosts(b, gv);
-  Frame.addChannels(b, cv);
-  Frame.addTargets(b, tv);
-  Frame.addElevatorM(b, .6 + .4 * Math.sin(t));
-  Frame.addArmRad(b, .5 * Math.sin(t));
-  Frame.addCamera(b, Pose.createPose(b, x, y, .7, 0, 0, yaw));
+  Frame.addTimestampNs(b, 1000000000n + sequence * 20000000n);
+  Frame.addDictionaryId(b, DEMO_DICTIONARY_ID);
+  Frame.addValues(b, values);
+  if (dictionary !== undefined) Frame.addDictionary(b, dictionary);
   Frame.addChassis(b, Pose.createPose(b, x, y, .15, 0, 0, yaw));
   Frame.finishSizePrefixedFrameBuffer(b, Frame.endFrame(b));
   return b.asUint8Array();
@@ -133,7 +135,7 @@ const runtimeOf = (node: DemoNode, elapsed: number) =>
 // hardware::Packet is one fixed slot regardless of payload; the rest are the
 // flatbuffer structs the nodes exchange.
 const HW_PACKET = 4104;
-const STUDIO_SLOT = 65536;
+const STUDIO_SLOT = 16384;
 
 // The demo carries a fault of every kind the viewer can name, on purpose.
 // Every health state has to be reachable without breaking a robot to see it,
@@ -156,10 +158,9 @@ const STUDIO_SLOT = 65536;
 //                link, so a shared-memory subscriber will never exist. The
 //                hardware node declares that end external, and the viewer says
 //                so rather than counting it as unread.
-//   unconnected  /drivetrain/target/auto, /shooter/target/auto and
-//                /hw/command/override -- ends declared optional. Autonomous is
-//                not written and nothing in the tree publishes the override, so
-//                a missing peer is the design rather than a fault.
+//   unconnected  /drivetrain/target/auto and /shooter/target/auto -- ends
+//                declared optional. Autonomous is not written, so a missing
+//                peer is the design rather than a fault.
 //   lossy        /hw/state -- a 200 Hz consumer occasionally lapped by a 200 Hz
 //                producer.
 //   idle         every topic, in the first moments of a session: both ends
@@ -178,7 +179,7 @@ const DEMO_NODES: DemoNode[] = [
     // other node it declares no timer source.
     periodUs: 1000,
     // Same order as the node's own manifest: state, command, driver station,
-    // the override hook, then one request topic per subsystem.
+    // then one request topic per subsystem.
     sources: [
       {kind: 'SENDER', name: '/hw/state', bytes: HW_PACKET, hz: 200},
       {
@@ -193,13 +194,6 @@ const DEMO_NODES: DemoNode[] = [
         name: '/hw/state/driver_station',
         bytes: HW_PACKET,
         hz: 50
-      },
-      {
-        kind: 'FETCHER',
-        name: '/hw/command/override',
-        bytes: HW_PACKET,
-        hz: 0,
-        optional: true
       },
       {kind: 'FETCHER', name: '/hw/request/drivetrain', bytes: HW_PACKET, hz: 200},
       // The shooter never started, so nothing arrives on its request topic.
@@ -288,22 +282,6 @@ const DEMO_NODES: DemoNode[] = [
     ]
   },
   {
-    name: 'driver_station',
-    target: '//2026-robot/main_processor/driver_station:node',
-    pid: 4136,
-    periodUs: 20000,
-    sources: [
-      {kind: 'TIMER', name: 'driver_station', bytes: 0, hz: 50},
-      {
-        kind: 'WATCHER',
-        name: '/hw/state/driver_station',
-        bytes: HW_PACKET,
-        hz: 50
-      },
-      {kind: 'SENDER', name: '/driver_station/state', bytes: 96, hz: 50}
-    ]
-  },
-  {
     name: 'operator_interface',
     target: '//2026-robot/main_processor/operator_interface:node',
     pid: 4137,
@@ -311,7 +289,7 @@ const DEMO_NODES: DemoNode[] = [
     stopsAfterSeconds: 2,
     sources: [
       {kind: 'TIMER', name: 'operator_interface', bytes: 0, hz: 50},
-      {kind: 'FETCHER', name: '/driver_station/state', bytes: 96, hz: 50},
+      {kind: 'WATCHER', name: '/hw/state/driver_station', bytes: HW_PACKET, hz: 50},
       {kind: 'FETCHER', name: '/drivetrain/state', bytes: 48, hz: 50},
       {kind: 'SENDER', name: '/drivetrain/target/teleop', bytes: 32, hz: 50},
       {kind: 'SENDER', name: '/shooter/target/teleop', bytes: 16, hz: 50}
@@ -326,7 +304,7 @@ const DEMO_NODES: DemoNode[] = [
       {kind: 'TIMER', name: 'telemetry', bytes: 0, hz: 100},
       {kind: 'WATCHER', name: '/odometry/state', bytes: 64, hz: 200},
       {kind: 'WATCHER', name: '/drivetrain/state', bytes: 48, hz: 200},
-      {kind: 'WATCHER', name: '/driver_station/state', bytes: 96, hz: 50},
+      {kind: 'WATCHER', name: '/hw/state/driver_station', bytes: HW_PACKET, hz: 50},
       {kind: 'SENDER', name: '/talos/telemetry', bytes: STUDIO_SLOT, hz: 100}
     ]
   }
@@ -474,7 +452,6 @@ export function demoSystemGraph(sequence: bigint = 0n): string {
       clients: 1,
       frames_forwarded: String(Math.floor(elapsed * 100)),
       invalid: '0',
-      udp_drops: '0',
       ws_drops: '0'
     },
     nodes,

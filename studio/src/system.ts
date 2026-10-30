@@ -1,7 +1,7 @@
 // The system graph: every node, every topic, and who is on which end.
 //
-// The bridge sends this as JSON a few times a second, on the same transport as
-// telemetry frames -- a WebSocket text frame, or a UDP datagram behind a tag.
+// The bridge sends this as JSON a few times a second, as WebSocket text frames
+// beside the binary telemetry frames.
 // It arrives from the same untrusted place as everything else, so nothing here
 // trusts its shape: every field is checked and every collection is bounded.
 // JSON.parse cannot be fooled by an offset the way the generated FlatBuffers
@@ -12,7 +12,6 @@
 // already follow: a JSON number is a double, and a sequence counter or a
 // nanosecond timestamp loses precision past 2^53.
 
-export const SYSTEM_TAG = 'TSYS';
 export const MAX_SYSTEM_BYTES = 1 << 20;
 
 // studio/bridge/system.h's kSystemGraphVersion. Version 2 is where a source
@@ -29,9 +28,6 @@ export const SYSTEM_GRAPH_VERSION = 2;
 
 export const endpointAttributesKnown = (graph: SystemGraph) =>
     graph.version >= SYSTEM_GRAPH_VERSION;
-
-// tag(4) + document id(2, little-endian) + chunk index(1) + chunk count(1).
-export const SYSTEM_HEADER_BYTES = 8;
 
 export type SourceKind = 'TIMER'|'WATCHER'|'FETCHER'|'SENDER';
 const KINDS: SourceKind[] = ['TIMER', 'WATCHER', 'FETCHER', 'SENDER'];
@@ -86,7 +82,6 @@ export type SystemGraph = {
   };
   bridge: {
     topic: string; clients: number; frames_forwarded: string; invalid: string;
-    udp_drops: string;
     ws_drops: string;
   };
   nodes: SystemNode[];
@@ -270,7 +265,6 @@ export function parseSystemGraph(text: string): SystemGraph {
         clients: num(bridge, 'clients'),
         frames_forwarded: u64(bridge, 'frames_forwarded'),
         invalid: u64(bridge, 'invalid'),
-        udp_drops: u64(bridge, 'udp_drops'),
         ws_drops: u64(bridge, 'ws_drops')
       },
       nodes: list(root, 'nodes', MAX_NODES)
@@ -375,8 +369,8 @@ function parseDiagnostic(value: unknown, where: string): DeclaredDiagnostic {
 //
 // The bridge serves both from one origin, so anything that was told how to
 // reach the stream has already been told how to reach this. Null when the URL
-// is not one this can reason about -- the desktop UDP path has no origin at all
-// -- which is not an error but an absence of anywhere to ask.
+// is not a WebSocket URL, which is not an error but an absence of anywhere to
+// ask.
 export function declaredUrl(socketUrl: string): string|null {
   try {
     const target = new URL(socketUrl);
@@ -419,95 +413,6 @@ export function parseDeclaredGraph(text: string): DeclaredGraph {
               .map((entry, i) => parseDiagnostic(entry, `diagnostics[${i}]`))
     };
   });
-}
-
-// --- datagram framing ------------------------------------------------------
-//
-// The UDP path carries both message families with no framing to tell them
-// apart, so system graphs arrive behind a tag. Telemetry frames begin with a
-// FlatBuffers size prefix and are left alone.
-//
-// They also arrive in pieces. macOS caps a datagram at 9216 bytes and a real
-// robot's graph is several times that, so the bridge splits the document and
-// this puts it back together. Getting that wrong is invisible rather than
-// noisy: the System tab would just stay empty.
-
-export type SystemChunk = {
-  documentId: number; index: number; count: number; payload: Uint8Array;
-};
-
-export function systemChunk(bytes: Uint8Array): SystemChunk|null {
-  if (bytes.length <= SYSTEM_HEADER_BYTES || bytes.length > MAX_SYSTEM_BYTES)
-    return null;
-  for (let i = 0; i < SYSTEM_TAG.length; i++)
-    if (bytes[i] !== SYSTEM_TAG.charCodeAt(i)) return null;
-
-  const count = bytes[7];
-  const index = bytes[6];
-  if (count === 0 || index >= count) return null;
-  return {
-    documentId: bytes[4] | (bytes[5] << 8),
-    index,
-    count,
-    payload: bytes.subarray(SYSTEM_HEADER_BYTES)
-  };
-}
-
-// Collects the chunks of one document. Only the newest document is held: a
-// refresh arrives four times a second, so a graph that lost a chunk is not
-// worth waiting for when a complete one is 250 ms behind it.
-export class SystemAssembler {
-  private documentId = -1;
-  private chunks: (Uint8Array|undefined)[] = [];
-  private received = 0;
-  private bytes = 0;
-
-  // Returns the assembled JSON once the last missing chunk arrives, and null
-  // for a datagram that is not a system chunk or does not complete one.
-  push(datagram: Uint8Array): string|null {
-    const chunk = systemChunk(datagram);
-    if (!chunk) return null;
-
-    if (chunk.documentId !== this.documentId) {
-      this.documentId = chunk.documentId;
-      this.chunks = new Array(chunk.count);
-      this.received = 0;
-      this.bytes = 0;
-    }
-    // A count that disagrees with the rest of the document means two
-    // generations collided on one id; start over from this chunk.
-    if (this.chunks.length !== chunk.count) {
-      this.chunks = new Array(chunk.count);
-      this.received = 0;
-      this.bytes = 0;
-    }
-    if (this.chunks[chunk.index]) return null;
-
-    this.chunks[chunk.index] = chunk.payload;
-    this.received++;
-    this.bytes += chunk.payload.length;
-    if (this.bytes > MAX_SYSTEM_BYTES) {
-      this.reset();
-      return null;
-    }
-    if (this.received !== chunk.count) return null;
-
-    const whole = new Uint8Array(this.bytes);
-    let at = 0;
-    for (const part of this.chunks) {
-      whole.set(part!, at);
-      at += part!.length;
-    }
-    this.reset();
-    return new TextDecoder().decode(whole);
-  }
-
-  private reset() {
-    this.documentId = -1;
-    this.chunks = [];
-    this.received = 0;
-    this.bytes = 0;
-  }
 }
 
 // --- derived views ---------------------------------------------------------

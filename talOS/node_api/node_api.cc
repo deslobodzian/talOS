@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -226,15 +228,18 @@ int64_t talos_node_subscribe(TalosNode* node, const char* topic,
                              uint32_t message_bytes, int32_t optional,
                              TalosMessageCallback on_message, void* user) {
   return Guard<int64_t>(-1, [&] {
+    talos::Node& n = AsNode(node);
     talos::detail::MessageCallback callback;
     if (on_message != nullptr) {
       callback = [on_message, user, message_bytes](const void* data) {
         Check(on_message(data, message_bytes, user), "message callback");
       };
     }
-    return static_cast<int64_t>(NodeAccess::add_subscription(
-        AsNode(node), NonNull(topic, "topic"), message_bytes,
-        talos::kMessageAlignment, optional != 0, std::move(callback)));
+    const std::size_t index = NodeAccess::add_subscription(
+        n, NonNull(topic, "topic"), message_bytes, talos::kMessageAlignment,
+        optional != 0, std::move(callback));
+    if (on_message != nullptr) NodeAccess::require_immediate_delivery(n);
+    return static_cast<int64_t>(index);
   });
 }
 
@@ -244,6 +249,20 @@ int64_t talos_node_publish(TalosNode* node, const char* topic,
     return static_cast<int64_t>(
         NodeAccess::add_publisher(AsNode(node), NonNull(topic, "topic"),
                                   message_bytes, talos::kMessageAlignment));
+  });
+}
+
+int64_t talos_node_publish_bytes(TalosNode* node, const char* topic,
+                                 uint32_t max_bytes, uint32_t slots,
+                                 int32_t drop_newest, int32_t external) {
+  return Guard<int64_t>(-1, [&] {
+    return static_cast<int64_t>(NodeAccess::add_byte_publisher(
+        AsNode(node), NonNull(topic, "topic"), max_bytes,
+        talos::BytePublishOptions{
+            .slots = slots,
+            .drop_newest = drop_newest != 0,
+            .external = external != 0,
+        }));
   });
 }
 
@@ -303,6 +322,63 @@ int32_t talos_publisher_send(TalosNode* node, int64_t index, const void* data,
   return Guard<int32_t>(TALOS_ERR, [&] {
     if (data == nullptr) throw std::invalid_argument("null message");
     return NodeAccess::publisher_send(AsNode(node), Index(index), data, size)
+               ? 1
+               : 0;
+  });
+}
+
+int32_t talos_byte_publisher_send(TalosNode* node, int64_t index,
+                                  const void* data, uint32_t size) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (data == nullptr && size != 0) {
+      throw std::invalid_argument("null message");
+    }
+    const auto* bytes = static_cast<const std::byte*>(data);
+    return NodeAccess::byte_publisher_send(
+               AsNode(node), Index(index),
+               std::span<const std::byte>{bytes, size})
+               ? 1
+               : 0;
+  });
+}
+
+int64_t talos_state_machine_create(TalosNode* node, int64_t initial) {
+  return Guard<int64_t>(-1, [&] {
+    return static_cast<int64_t>(
+        NodeAccess::add_state_machine(AsNode(node), initial));
+  });
+}
+
+int64_t talos_state_machine_state(const TalosNode* node, int64_t index) {
+  return Guard<int64_t>(0, [&] {
+    return NodeAccess::state_machine_state(AsNode(node), Index(index));
+  });
+}
+
+int64_t talos_state_machine_previous(const TalosNode* node, int64_t index) {
+  return Guard<int64_t>(0, [&] {
+    return NodeAccess::state_machine_previous(AsNode(node), Index(index));
+  });
+}
+
+int32_t talos_state_machine_go(TalosNode* node, int64_t index, int64_t next) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    NodeAccess::state_machine_go(AsNode(node), Index(index), next);
+    return TALOS_OK;
+  });
+}
+
+int64_t talos_state_machine_time_in_state_ns(const TalosNode* node,
+                                             int64_t index) {
+  return Guard<int64_t>(0, [&] {
+    return NodeAccess::state_machine_time_in_state(AsNode(node), Index(index))
+        .count();
+  });
+}
+
+int32_t talos_state_machine_just_entered(const TalosNode* node, int64_t index) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    return NodeAccess::state_machine_just_entered(AsNode(node), Index(index))
                ? 1
                : 0;
   });

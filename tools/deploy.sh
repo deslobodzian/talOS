@@ -59,6 +59,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$user
+Environment=\"TALOS_LOG_DIR=$PREFIX/logs\"
 ExecStart=$PREFIX/current/run.sh
 Restart=on-failure
 RestartSec=2
@@ -66,11 +67,45 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 "
-  if [ "$DRY_RUN" = "1" ] || [ "$(uname -s)" = "Darwin" ]; then
+  if [ "$(uname -s)" = "Darwin" ]; then
+    local plist="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+  <key>Label</key>
+  <string>org.talos.robot</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$PREFIX/current/run.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TALOS_LOG_DIR</key>
+    <string>$PREFIX/logs</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>
+"
+    if [ "$DRY_RUN" = "1" ]; then
+      printf '%s\n' "$unit"
+      printf '%s\n' "$plist"
+      return 0
+    fi
+    local plist_dest="$HOME/Library/LaunchAgents/org.talos.robot.plist"
+    mkdir -p "$(dirname "$plist_dest")"
+    printf '%s' "$plist" > "$plist_dest"
+    launchctl unload "$plist_dest" 2>/dev/null || true
+    launchctl load "$plist_dest"
+    say "boot start enabled ($plist_dest)"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
     printf '%s\n' "$unit"
-    [ "$(uname -s)" = "Darwin" ] && \
-      say "macOS has no systemd: copy the ExecStart line into a launchd plist"
-    [ "$DRY_RUN" = "1" ] && return 0
+    return 0
   fi
   echo "$unit" | sudo tee /etc/systemd/system/talos.service >/dev/null
   sudo systemctl daemon-reload
@@ -85,7 +120,28 @@ cmd_logs() {
   local dir="$PREFIX/current"
   [ $# -gt 0 ] && dir="$1"
   [ -e "$dir" ] || die "nothing installed at $dir"
-  local manifest; manifest="$(find -L "$dir" -maxdepth 3 -name manifest.json 2>/dev/null | head -1)"
+  local manifest; manifest="$(python3 - "$PREFIX/logs" "$dir" "/tmp/talos_logs" <<'EOF'
+import os, sys
+best_path, best_mtime = "", -1.0
+for root_dir in sys.argv[1:]:
+    if not os.path.exists(root_dir):
+        continue
+    for cur, dirs, files in os.walk(root_dir, followlinks=True):
+        depth = cur[len(root_dir):].count(os.sep)
+        if depth >= 3:
+            dirs[:] = []
+        if "manifest.json" in files:
+            p = os.path.join(cur, "manifest.json")
+            try:
+                mt = os.path.getmtime(p)
+                if mt > best_mtime:
+                    best_mtime, best_path = mt, p
+            except OSError:
+                pass
+if best_path:
+    print(best_path)
+EOF
+)"
   if [ -n "$manifest" ]; then
     say "session manifest: $manifest"
     python3 - "$manifest" <<'EOF'

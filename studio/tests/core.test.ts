@@ -1,8 +1,20 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
-import {Coordinator, decode, JitterBuffer, Timeline} from '../src/core';
+import {Builder} from 'flatbuffers';
+
+import {
+  channelDisplay,
+  Coordinator,
+  decode,
+  JitterBuffer,
+  MAX_FRAME_BYTES,
+  TelemetryDecoder,
+  Timeline,
+} from '../src/core';
 import {demoPacket} from '../src/demo';
+import {Frame} from '../src/generated/talos/telemetry/frame';
+import {Pose} from '../src/generated/talos/telemetry/pose';
 import {
   type GraphTab,
   isGraphTabId,
@@ -11,19 +23,77 @@ import {
   parseGraphTabs,
 } from '../src/tabs';
 
-const frame = (i: number) => decode(demoPacket(BigInt(i)));
+// Prime the shared decoder with the dictionary frame, as a bridge does on
+// connect, so bare value frames below can be named.
+decode(demoPacket(0n));
+const frame = (i: number) => decode(demoPacket(BigInt(i)))!;
+
+// A bare value frame (no dictionary) for `dictionaryId`, built the way a
+// producer that already sent its dictionary builds every later frame.
+function valueFrame(sequence: bigint, dictionaryId: number,
+                    values: number[], streamId = 42n): Uint8Array {
+  const b = new Builder(256);
+  const vector = Frame.createValuesVector(b, values);
+  Frame.startFrame(b);
+  Frame.addStreamId(b, streamId);
+  Frame.addSequenceId(b, sequence);
+  Frame.addTimestampNs(b, 1000000000n + sequence * 20000000n);
+  Frame.addDictionaryId(b, dictionaryId);
+  Frame.addValues(b, vector);
+  Frame.addChassis(b, Pose.createPose(b, 1, 2, 0, 0, 0, 0));
+  Frame.finishSizePrefixedFrameBuffer(b, Frame.endFrame(b));
+  return b.asUint8Array();
+}
+
 test(
     'size-prefixed generated FlatBuffer roundtrip preserves uint64 timestamps',
     () => {
-      const f = decode(demoPacket(9007199254740993n));
+      const decoder = new TelemetryDecoder();
+      assert.ok(decoder.decode(demoPacket(0n)));
+      const f = decoder.decode(valueFrame(
+          9007199254740993n, 1,
+          [1.75, 0, 12, 2, 0, 0, 0, 1]))!;
       assert.equal(f.sequence_id, '9007199254740993');
+      assert.equal(f.stream_id, '42');
+      assert.equal(f.dictionary_id, 1);
       assert.equal(
           f.timestamp_ns,
           BigInt.asUintN(64, 1000000000n + 9007199254740993n * 20000000n)
               .toString());
-      assert.equal(f.ghosts.length, 3);
       assert.equal(f.channels.velocity, 1.75);
+      assert.equal(f.units.velocity, 'm/s');
+      assert.deepEqual(f.labels.mode, ['disabled', 'teleop', 'auto']);
+      assert.equal(channelDisplay(f, 'mode'), 'teleop');
     });
+test('a value frame with an unknown dictionary is held, not fatal', () => {
+  const decoder = new TelemetryDecoder();
+  assert.equal(decoder.decode(valueFrame(5n, 9, [3])), null);
+  assert.equal(decoder.heldCount, 1);
+  const resolved = decoder.decodeAll(demoPacket(0n));
+  // demoPacket(0) uses dictionary 1, so the held frame for 9 stays held.
+  assert.equal(resolved.length, 1);
+  const other = new TelemetryDecoder();
+  assert.equal(other.decode(valueFrame(5n, 1, [3, 0, 12, 2, 0, 0, 0, 0])), null);
+  const unblocked = other.decodeAll(demoPacket(0n));
+  assert.equal(unblocked.length, 2);
+  assert.equal(unblocked[1].sequence_id, '5');
+  assert.equal(unblocked[1].channels.velocity, 3);
+});
+test('NaN samples are omitted and oversize frames are refused', () => {
+  const decoder = new TelemetryDecoder();
+  decoder.decode(demoPacket(0n));
+  const f = decoder.decode(
+      valueFrame(1n, 1, [Number.NaN, 0, 12, 2, 0, 0, 0, 0]))!;
+  assert.equal('velocity' in f.channels, false);
+  assert.equal(f.channels.voltage, 12);
+  assert.equal(MAX_FRAME_BYTES, 16384);
+  assert.throws(() => decoder.decode(new Uint8Array(16385)));
+});
+test('a new stream invalidates the old dictionary', () => {
+  const decoder = new TelemetryDecoder();
+  decoder.decode(demoPacket(0n));
+  assert.equal(decoder.decode(valueFrame(0n, 1, [1], 77n)), null);
+});
 test('jitter sorts, deduplicates, counts gaps and rejects late packets', () => {
   const j = new JitterBuffer(10);
   j.push(frame(2), 0);

@@ -1,3 +1,4 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_cc_node")
@@ -16,6 +17,14 @@ cc_library(
         "//talOS/devices",
         "//talOS/node",
     ],
+)
+
+cc_binary(
+    name = "libmechanisms.so",
+    srcs = ["mechanisms_abi.cc"],
+    linkshared = True,
+    visibility = ["//examples/superstructure/py:__pkg__"],
+    deps = [":mechanisms"],
 )
 
 talos_cc_node(

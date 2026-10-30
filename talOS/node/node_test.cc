@@ -21,6 +21,7 @@
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/realtime_event_loop.h"
+#include "talOS/events/simulated_event_loop.h"
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/node/internal.h"
 #include "talOS/node/testing.h"
@@ -166,15 +167,17 @@ TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   EXPECT_FALSE(watcher.updated[0]);
   EXPECT_FALSE(watcher.fresh[0]);
 
-  sim.publish("/watch/target", Count{7, 0});  // delivered at 6 ms
-  sim.step(5ms);                              // tick 1 at 10 ms
+  // No callback, so the node drains right before its tick: the message
+  // arrives at tick 1 itself and its age counts from there.
+  sim.publish("/watch/target", Count{7, 0});
+  sim.step(5ms);  // tick 1 at 10 ms
   sim.step(5ms);  // tick 2 at 15 ms: nothing new since tick 1 began
   ASSERT_EQ(watcher.updated.size(), 3u);
   EXPECT_TRUE(watcher.updated[1]);
   EXPECT_FALSE(watcher.updated[2]);
   EXPECT_TRUE(watcher.fresh[1]);
-  EXPECT_EQ(watcher.ages[1], 4ms);
-  EXPECT_EQ(watcher.ages[2], 9ms);
+  EXPECT_EQ(watcher.ages[1], 0ms);
+  EXPECT_EQ(watcher.ages[2], 5ms);
   EXPECT_EQ(watcher.in->value(), 7);
 
   sim.step(100ms);  // past [robot] command_timeout_us
@@ -182,6 +185,84 @@ TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   EXPECT_FALSE(watcher.in.fresh());
   EXPECT_TRUE(watcher.in.fresh(1s));
   EXPECT_TRUE(watcher.in.has_value());
+}
+
+struct RelativeWrist {
+  explicit RelativeWrist(Node& n)
+      : target{n.subscribe<Count>("target/teleop")},
+        external{n.subscribe<Count>("/arm/state", {.optional = true})},
+        state{n.publish<Count>("state")},
+        frames{n.publish_bytes("frames", 8)} {}
+  void update() {
+    if (target.has_value()) {
+      state.send(Count{target->value() + external->value(), 0});
+      const std::byte b{static_cast<unsigned char>(target->value())};
+      frames.send(std::span<const std::byte>{&b, 1});
+    }
+  }
+  Subscription<Count> target;
+  Subscription<Count> external;
+  Publisher<Count> state;
+  BytePublisher frames;
+};
+
+TEST(Node, RelativeTopicsExpandAndRemapRedirectsRelativeAndAbsoluteTopics) {
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.wrist.motors.m]
+can_id = 1
+
+[subsystems.left_wrist.remap]
+"target/teleop" = "/teleop/left_wrist"
+"/left_wrist/state" = "/wrist/left_state"
+"/arm/state" = "/left_arm/state"
+"frames" = "/left_wrist/raw_frames"
+)");
+  sim.add<RelativeWrist>("wrist");
+  sim.add<RelativeWrist>("left_wrist");
+
+  sim.publish("/wrist/target/teleop", Count{3, 0});
+  sim.publish("/arm/state", Count{10, 0});
+  sim.publish("/teleop/left_wrist", Count{7, 0});
+  sim.publish("/left_arm/state", Count{20, 0});
+  sim.step(10ms);
+
+  const auto wrist_state = sim.latest<Count>("/wrist/state");
+  ASSERT_TRUE(wrist_state.has_value());
+  EXPECT_EQ(wrist_state->value(), 13);
+  const auto wrist_frames = sim.latest_bytes("/wrist/frames");
+  ASSERT_TRUE(wrist_frames.has_value());
+  EXPECT_EQ(*wrist_frames, std::vector<std::byte>{std::byte{3}});
+
+  const auto left_state = sim.latest<Count>("/wrist/left_state");
+  ASSERT_TRUE(left_state.has_value());
+  EXPECT_EQ(left_state->value(), 27);
+  const auto left_frames = sim.latest_bytes("/left_wrist/raw_frames");
+  ASSERT_TRUE(left_frames.has_value());
+  EXPECT_EQ(*left_frames, std::vector<std::byte>{std::byte{7}});
+}
+
+TEST(Node, NonStringRemapEntryThrows) {
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.wrist.motors.m]
+can_id = 1
+[subsystems.wrist.remap]
+state = 42
+)");
+  try {
+    sim.add<RelativeWrist>("wrist");
+    FAIL() << "a non-string remap entry must throw";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string{e.what()}.find("wrist: remap entry for 'state'"),
+              std::string::npos);
+  }
 }
 
 // --- state machines --------------------------------------------------------
@@ -296,6 +377,43 @@ TEST(Node, EveryRunsAnExtraTimer) {
   auto& node = sim.add<Beats>("listener");
   sim.step(30ms);
   EXPECT_EQ(node.beats, 10);
+}
+
+struct Silent {
+  explicit Silent(Node& n) : in{n.subscribe<Count>("/watch/target")} {}
+  Subscription<Count> in;
+};
+
+// The loop's delivery as NodeAccess::start picks it for T on node
+// "listener".
+template <class T>
+event::Delivery DeliveryFor() {
+  auto sim = Sim::FromToml(kRobotToml);
+  const std::string& config_path = detail::SimAccess::config_path(sim);
+  event::SimulationEnvironment environment;
+  event::SimulatedEventLoop<> loop{environment};
+  detail::LoopPortFor<event::SimulatedEventLoop<>> port{loop};
+  const auto node = detail::NodeAccess::create(detail::NodeSetup{
+      .name = "listener",
+      .config_path = config_path,
+      .config = std::make_shared<const config::RobotConfig>(
+          config::ParseRobotConfig(config_path)),
+      .simulation = true,
+      .loop = &port,
+  });
+  const detail::Instance user = detail::MakeInstance<T>()(*node);
+  detail::NodeAccess::start(*node);
+  return loop.delivery();
+}
+
+// A node that only reads latched values at its own timers drains right
+// before them; a message callback, or having no timer to drain before, keeps
+// the 1 ms drain.
+TEST(Node, DeliveryWaitsForTimersUnlessAHandlerNeedsEveryMessage) {
+  EXPECT_EQ(DeliveryFor<Watcher>(), event::Delivery::BEFORE_TIMERS);
+  EXPECT_EQ(DeliveryFor<Beats>(), event::Delivery::BEFORE_TIMERS);
+  EXPECT_EQ(DeliveryFor<Listener>(), event::Delivery::POLL);
+  EXPECT_EQ(DeliveryFor<Silent>(), event::Delivery::POLL);
 }
 
 struct LateSubscriber {

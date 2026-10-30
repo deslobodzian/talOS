@@ -1,7 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <string>
+#include <string_view>
+#include <utility>
 
 #include "talOS/configuration/config_parser.h"
 #include "talOS/hardware/config.h"
@@ -69,7 +73,8 @@ inline hardware::Config ReferenceSwerveConfig(bool simulation = false) {
     steer.slots[0].d = 0.5;
     c.motors.push_back(steer);
   }
-  c.sensors.push_back({7, "drivetrain_imu", hardware::SensorKind::kPigeon2, 30, "rio"});
+  c.sensors.push_back(
+      {7, "drivetrain_imu", hardware::SensorKind::kPigeon2, 30, "rio"});
   std::sort(c.sensors.begin(), c.sensors.end(),
             [](const auto& a, const auto& b) { return a.name < b.name; });
   std::sort(c.motors.begin(), c.motors.end(),
@@ -134,48 +139,175 @@ inline hardware::Config ReferenceSwerveConfig(bool simulation = false) {
   return c;
 }
 
-TEST(ConfigTest, GoldenTestParsesSwerveRobotTomlEqualToSwerveConfig) {
-  auto config = ParseRobotConfig("2026-robot/main_processor/configuration/robot.toml");
-  auto expected = ReferenceSwerveConfig(false);
+const hardware::MotorConfig* FindMotor(const hardware::Config& hw,
+                                       std::string_view name) {
+  auto it = std::find_if(hw.motors.begin(), hw.motors.end(),
+                         [&](const auto& m) { return m.name == name; });
+  return it != hw.motors.end() ? &*it : nullptr;
+}
+
+const hardware::SensorConfig* FindSensor(const hardware::Config& hw,
+                                         std::string_view name) {
+  auto it = std::find_if(hw.sensors.begin(), hw.sensors.end(),
+                         [&](const auto& s) { return s.name == name; });
+  return it != hw.sensors.end() ? &*it : nullptr;
+}
+
+const hardware::DigitalInputConfig* FindDigitalInput(const hardware::Config& hw,
+                                                     std::string_view name) {
+  auto it = std::find_if(hw.digital_inputs.begin(), hw.digital_inputs.end(),
+                         [&](const auto& d) { return d.name == name; });
+  return it != hw.digital_inputs.end() ? &*it : nullptr;
+}
+
+void VerifyReferenceRobotConfig(const RobotConfig& config,
+                                const hardware::Config& expected) {
+  const auto& actual = config.hardware;
 
   // Validate passes
-  EXPECT_NO_THROW(hardware::Validate(config.hardware));
+  EXPECT_NO_THROW(hardware::Validate(actual));
 
-  // Assert hardware::Config equality
-  EXPECT_EQ(config.hardware, expected);
-  EXPECT_EQ(hardware::ConfigurationId(config.hardware),
-            hardware::ConfigurationId(expected));
+  // Global robot settings and Studio / deployment addressing
+  EXPECT_EQ(actual.period_us, expected.period_us);
+  EXPECT_EQ(actual.command_timeout_us, expected.command_timeout_us);
+  EXPECT_DOUBLE_EQ(actual.status_hz, expected.status_hz);
+  EXPECT_EQ(actual.commissioned, expected.commissioned);
+  EXPECT_EQ(config.controller_address, "127.0.0.1");
+  EXPECT_EQ(config.controller_port, 5802);
+  EXPECT_EQ(config.local_port, 5803);
+  EXPECT_EQ(config.studio.bridge, "//studio/bridge:studio_bridge");
+  EXPECT_EQ(config.studio.http_port, 5800);
+  EXPECT_EQ(config.studio.webroot, "bazel-bin/studio/dist");
 
-  // Verify subsystem device ownership
+  // Verify every reference sensor by name
+  for (const auto& exp_sensor : expected.sensors) {
+    const auto* act_sensor = FindSensor(actual, exp_sensor.name);
+    ASSERT_NE(act_sensor, nullptr) << exp_sensor.name;
+    EXPECT_GT(act_sensor->id, 0u) << exp_sensor.name;
+    EXPECT_EQ(act_sensor->kind, exp_sensor.kind) << exp_sensor.name;
+    EXPECT_EQ(act_sensor->can_id, exp_sensor.can_id) << exp_sensor.name;
+    EXPECT_EQ(act_sensor->bus, exp_sensor.bus) << exp_sensor.name;
+    EXPECT_EQ(act_sensor->inverted, exp_sensor.inverted) << exp_sensor.name;
+    EXPECT_DOUBLE_EQ(act_sensor->offset_rot, exp_sensor.offset_rot)
+        << exp_sensor.name;
+    hardware::SensorConfig normalized = *act_sensor;
+    normalized.id = exp_sensor.id;
+    EXPECT_EQ(normalized, exp_sensor) << exp_sensor.name;
+  }
+
+  // Verify every reference motor by name, including feedback_sensor_id
+  // resolution
+  for (const auto& exp_motor : expected.motors) {
+    const auto* act_motor = FindMotor(actual, exp_motor.name);
+    ASSERT_NE(act_motor, nullptr) << exp_motor.name;
+    EXPECT_GT(act_motor->id, 0u) << exp_motor.name;
+    EXPECT_EQ(act_motor->can_id, exp_motor.can_id) << exp_motor.name;
+    EXPECT_EQ(act_motor->bus, exp_motor.bus) << exp_motor.name;
+    EXPECT_EQ(act_motor->inverted, exp_motor.inverted) << exp_motor.name;
+    EXPECT_EQ(act_motor->brake, exp_motor.brake) << exp_motor.name;
+    EXPECT_DOUBLE_EQ(act_motor->supply_limit_a, exp_motor.supply_limit_a)
+        << exp_motor.name;
+    EXPECT_DOUBLE_EQ(act_motor->stator_limit_a, exp_motor.stator_limit_a)
+        << exp_motor.name;
+    EXPECT_DOUBLE_EQ(act_motor->max_voltage, exp_motor.max_voltage)
+        << exp_motor.name;
+    EXPECT_EQ(act_motor->feedback, exp_motor.feedback) << exp_motor.name;
+    EXPECT_DOUBLE_EQ(act_motor->rotor_to_sensor_ratio,
+                     exp_motor.rotor_to_sensor_ratio)
+        << exp_motor.name;
+    EXPECT_DOUBLE_EQ(act_motor->sensor_to_mechanism_ratio,
+                     exp_motor.sensor_to_mechanism_ratio)
+        << exp_motor.name;
+    EXPECT_EQ(act_motor->continuous_wrap, exp_motor.continuous_wrap)
+        << exp_motor.name;
+    EXPECT_EQ(act_motor->soft_limits, exp_motor.soft_limits) << exp_motor.name;
+    EXPECT_DOUBLE_EQ(act_motor->reverse_limit_rot, exp_motor.reverse_limit_rot)
+        << exp_motor.name;
+    EXPECT_DOUBLE_EQ(act_motor->forward_limit_rot, exp_motor.forward_limit_rot)
+        << exp_motor.name;
+    EXPECT_DOUBLE_EQ(act_motor->max_velocity_rps, exp_motor.max_velocity_rps)
+        << exp_motor.name;
+    EXPECT_DOUBLE_EQ(act_motor->cruise_velocity_rps,
+                     exp_motor.cruise_velocity_rps)
+        << exp_motor.name;
+    EXPECT_DOUBLE_EQ(act_motor->acceleration_rps2, exp_motor.acceleration_rps2)
+        << exp_motor.name;
+    EXPECT_DOUBLE_EQ(act_motor->jerk_rps3, exp_motor.jerk_rps3)
+        << exp_motor.name;
+    EXPECT_EQ(act_motor->slots, exp_motor.slots) << exp_motor.name;
+
+    if (exp_motor.feedback_sensor_id == 0) {
+      EXPECT_EQ(act_motor->feedback_sensor_id, 0u) << exp_motor.name;
+    } else {
+      auto exp_sensor_it = std::find_if(
+          expected.sensors.begin(), expected.sensors.end(),
+          [&](const auto& s) { return s.id == exp_motor.feedback_sensor_id; });
+      ASSERT_NE(exp_sensor_it, expected.sensors.end()) << exp_motor.name;
+      const auto* act_sensor = FindSensor(actual, exp_sensor_it->name);
+      ASSERT_NE(act_sensor, nullptr) << exp_sensor_it->name;
+      EXPECT_EQ(act_motor->feedback_sensor_id, act_sensor->id)
+          << exp_motor.name;
+    }
+
+    hardware::MotorConfig normalized = *act_motor;
+    normalized.id = exp_motor.id;
+    normalized.feedback_sensor_id = exp_motor.feedback_sensor_id;
+    EXPECT_EQ(normalized, exp_motor) << exp_motor.name;
+  }
+
+  // Verify every reference digital input by name
+  for (const auto& exp_di : expected.digital_inputs) {
+    const auto* act_di = FindDigitalInput(actual, exp_di.name);
+    ASSERT_NE(act_di, nullptr) << exp_di.name;
+    EXPECT_GT(act_di->id, 0u) << exp_di.name;
+    EXPECT_EQ(act_di->dio, exp_di.dio) << exp_di.name;
+    hardware::DigitalInputConfig normalized = *act_di;
+    normalized.id = exp_di.id;
+    EXPECT_EQ(normalized, exp_di) << exp_di.name;
+  }
+
+  // Verify subsystem device ownership by resolving names to actual logical IDs
   const auto* devs = config.GetDevices("drivetrain");
   ASSERT_NE(devs, nullptr);
   EXPECT_EQ(devs->subsystem, "drivetrain");
-  EXPECT_EQ(devs->motors.size(), 8);
-  EXPECT_EQ(devs->sensors.size(), 5);
+  EXPECT_EQ(devs->motors.size(), 8u);
+  EXPECT_EQ(devs->sensors.size(), 5u);
+  for (const auto& module : kReferenceSwerveModules) {
+    const auto* drive = FindMotor(actual, std::string{module.name} + "_drive");
+    const auto* steer = FindMotor(actual, std::string{module.name} + "_steer");
+    const auto* enc = FindSensor(actual, std::string{module.name} + "_encoder");
+    ASSERT_NE(drive, nullptr);
+    ASSERT_NE(steer, nullptr);
+    ASSERT_NE(enc, nullptr);
+    EXPECT_NE(std::find(devs->motors.begin(), devs->motors.end(), drive->id),
+              devs->motors.end());
+    EXPECT_NE(std::find(devs->motors.begin(), devs->motors.end(), steer->id),
+              devs->motors.end());
+    EXPECT_NE(std::find(devs->sensors.begin(), devs->sensors.end(), enc->id),
+              devs->sensors.end());
+  }
+  const auto* imu = FindSensor(actual, "drivetrain_imu");
+  ASSERT_NE(imu, nullptr);
+  EXPECT_NE(std::find(devs->sensors.begin(), devs->sensors.end(), imu->id),
+            devs->sensors.end());
 
   const auto* shooter_devs = config.GetDevices("shooter");
   ASSERT_NE(shooter_devs, nullptr);
   EXPECT_EQ(shooter_devs->subsystem, "shooter");
-  EXPECT_EQ(shooter_devs->motors.size(), 1);
-  EXPECT_EQ(shooter_devs->digital_inputs.size(), 1);
+  ASSERT_EQ(shooter_devs->motors.size(), 1u);
+  ASSERT_EQ(shooter_devs->digital_inputs.size(), 1u);
+  EXPECT_EQ(shooter_devs->motors[0], FindMotor(actual, "flywheel")->id);
+  EXPECT_EQ(shooter_devs->digital_inputs[0],
+            FindDigitalInput(actual, "beam_break")->id);
 
   const auto* intake_devs = config.GetDevices("intake");
   ASSERT_NE(intake_devs, nullptr);
   EXPECT_EQ(intake_devs->subsystem, "intake");
-  EXPECT_EQ(intake_devs->motors.size(), 1);
-  EXPECT_EQ(intake_devs->digital_inputs.size(), 1);
-
-  // Logical IDs are 1..17 assigned deterministically
-  for (size_t i = 0; i < devs->motors.size(); ++i) {
-    EXPECT_EQ(config.hardware.motors[i].id, devs->motors[i]);
-  }
-  EXPECT_EQ(config.hardware.motors[8].id, intake_devs->motors[0]);
-  EXPECT_EQ(config.hardware.motors[9].id, shooter_devs->motors[0]);
-  for (size_t i = 0; i < devs->sensors.size(); ++i) {
-    EXPECT_EQ(config.hardware.sensors[i].id, devs->sensors[i]);
-  }
-  EXPECT_EQ(config.hardware.digital_inputs[0].id, intake_devs->digital_inputs[0]);
-  EXPECT_EQ(config.hardware.digital_inputs[1].id, shooter_devs->digital_inputs[0]);
+  ASSERT_EQ(intake_devs->motors.size(), 1u);
+  ASSERT_EQ(intake_devs->digital_inputs.size(), 1u);
+  EXPECT_EQ(intake_devs->motors[0], FindMotor(actual, "roller")->id);
+  EXPECT_EQ(intake_devs->digital_inputs[0],
+            FindDigitalInput(actual, "intake_beam")->id);
 
   // Verify access to subsystem-specific table: [subsystems.drivetrain.geometry]
   const auto* geom = config.GetSubsystemTable("drivetrain", "geometry");
@@ -183,7 +315,42 @@ TEST(ConfigTest, GoldenTestParsesSwerveRobotTomlEqualToSwerveConfig) {
   EXPECT_DOUBLE_EQ((*geom)["wheel_radius_m"].value_or(0.0), 0.0508);
   auto* modules = (*geom)["modules"].as_array();
   ASSERT_NE(modules, nullptr);
-  EXPECT_EQ(modules->size(), 4);
+  EXPECT_EQ(modules->size(), 4u);
+}
+
+TEST(ConfigTest, GoldenTestParsesSwerveRobotTomlEqualToSwerveConfig) {
+  const auto config =
+      ParseRobotConfig("2026-robot/main_processor/configuration/robot.toml");
+  const auto expected = ReferenceSwerveConfig(false);
+  VerifyReferenceRobotConfig(config, expected);
+}
+
+TEST(ConfigTest, ExtraSubsystemShiftingLogicalIdsStillMatchesReferenceDevices) {
+  auto base =
+      ParseRobotConfig("2026-robot/main_processor/configuration/robot.toml");
+  toml::table tbl = base.toml_data;
+  auto* subs = tbl["subsystems"].as_table();
+  ASSERT_NE(subs, nullptr);
+
+  // "climber" sorts before "drivetrain", shifting every reference logical ID.
+  toml::table climber_motor;
+  climber_motor.insert_or_assign("type", "TalonFX");
+  climber_motor.insert_or_assign("bus", "rio");
+  climber_motor.insert_or_assign("can_id", 15);
+  toml::table climber_motors;
+  climber_motors.insert_or_assign("climber_motor", std::move(climber_motor));
+  toml::table climber;
+  climber.insert_or_assign("period_us", 20000);
+  climber.insert_or_assign("motors", std::move(climber_motors));
+  subs->insert_or_assign("climber", std::move(climber));
+
+  const auto with_climber = ParseRobotConfigTable(std::move(tbl));
+  const auto* climber_dev = FindMotor(with_climber.hardware, "climber_motor");
+  ASSERT_NE(climber_dev, nullptr);
+  EXPECT_EQ(climber_dev->id, 1u);
+
+  const auto expected = ReferenceSwerveConfig(false);
+  VerifyReferenceRobotConfig(with_climber, expected);
 }
 
 }  // namespace

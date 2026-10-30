@@ -47,9 +47,4 @@ inline constexpr const char* kRequestTopicPrefix = "/hw/request/";
 inline std::string RequestTopic(std::string_view subsystem) {
   return std::string{kRequestTopicPrefix} + std::string{subsystem};
 }
-
-// A debug and legacy hook: a whole pre-merged Command, applied as-is, bypassing
-// per-subsystem arbitration and timeout neutralization. Nothing in the tree
-// publishes it, so the bridge's end of it is declared optional.
-inline constexpr const char* kCommandOverrideTopic = "/hw/command/override";
 }  // namespace talos::hardware

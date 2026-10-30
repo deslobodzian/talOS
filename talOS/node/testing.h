@@ -11,10 +11,11 @@
 //   EXPECT_TRUE(sim.latest<elevator::ElevatorStatus>("/elevator/status"));
 //
 // Each node runs on its own simulated loop, exactly as it would in its own
-// process; the topics between them are in memory. Time is virtual and
-// advances in 1 ms slices, the loops' message tick, so a message published at
-// one slice reaches every subscriber by the next. Hardware is a layer on top:
-// talOS/devices/testing.h plays the bridge.
+// process, with the same delivery policy (see Node::subscribe); the topics
+// between them are in memory. Time is virtual and advances in 1 ms slices, the
+// loops' message tick: a node with a message callback sees a message by the
+// next slice, any other node at its next update() or every(). Hardware is a
+// layer on top: talOS/devices/testing.h plays the bridge.
 
 #include <cstddef>
 #include <cstdint>

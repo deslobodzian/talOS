@@ -30,15 +30,6 @@ static inline bool is_pow_2(std::size_t n) {
   return (n > 0) && (n & (n - 1)) == 0;
 }
 
-// Mesages will primarity be using flatbuffers but stored this RTMSMessage
-// object These are just views, we essentilaly will only copy the data into the
-// queue or we will copy the view out
-// TODO: read already uses std::span<const std::byte> should just remove this
-struct RTMSMessage {
-  size_t size;
-  const void* data;
-};
-
 enum class ReaderState : std::uint64_t { FREE, CLAIMING, ACTIVE };
 
 enum class WriteResult {
@@ -147,7 +138,7 @@ class RTMSQueue {
   std::uint64_t minimum_read_position() const;
   std::optional<std::size_t> register_reader();
   void release_reader(std::size_t id);
-  WriteStatus write(const RTMSMessage& message);
+  WriteStatus write(std::span<const std::byte> message);
 
   // Copies the next message for `reader_id` into `destination` and reports
   // its sequence plus how many messages were skipped to get there.
