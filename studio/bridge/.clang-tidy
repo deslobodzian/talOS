@@ -1,8 +1,11 @@
-# The bridge instantiates vendored uWebSockets templates (App.h, TopicTree.h).
-# The static analyzer follows those paths and reports NewDelete and enum-cast
-# findings inside the vendored headers, which clang-tidy 18 cannot exclude by
-# path. Only those two analyzer checks are off, and only here.
+# The bridge instantiates vendored uWebSockets templates (App.h, TopicTree.h,
+# WebSocket.h). The static analyzer follows those paths and reports NewDelete,
+# enum-cast and nonnull findings inside the vendored headers (the last from
+# WebSocket::send on libstdc++, which it assumes may pass a null data()),
+# which clang-tidy 18 cannot exclude by path. Only those analyzer checks are
+# off, and only here.
 InheritParentConfig: true
 Checks: >
   -clang-analyzer-cplusplus.NewDelete,
-  -clang-analyzer-optin.core.EnumCastOutOfRange
+  -clang-analyzer-optin.core.EnumCastOutOfRange,
+  -clang-analyzer-core.NonNullParamChecker
