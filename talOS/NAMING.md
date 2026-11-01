@@ -37,7 +37,7 @@ message sizes. A topic nobody reads, or whose owner is not a node in the
 session, is a warning.
 
 Examples: `/drivetrain/state`, `/drivetrain/target` (written by the arbiter),
-`/drivetrain/target/teleop`, `/driver_station/state`, `/hw/state`,
+`/drivetrain/target/teleop`, `/hw/state`, `/hw/state/driver_station`,
 `/hw/request/<node>`, `/talos/telemetry`.
 
 ## Nodes

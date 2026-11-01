@@ -9,9 +9,9 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <vector>
 
 #include "system.h"
@@ -36,7 +36,7 @@ struct Bridge {
   RTMSQueue& queue;
   std::size_t reader;
   std::string topic;
-  std::unordered_set<Socket*> clients;
+  std::set<Socket*> clients;
   us_listen_socket_t* listener = nullptr;
   std::uint64_t invalid = 0, ws_drops = 0, forwarded = 0;
 

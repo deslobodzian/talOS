@@ -309,8 +309,9 @@ TEST(Drivetrain, LinkDropStopsPublishingStateAndHoldsOdometry) {
   }
   const auto before_drop = sim.latest<DrivetrainState>(topics::kState);
   ASSERT_TRUE(before_drop.has_value());
-  EXPECT_GT(before_drop->vx_mps(), 0.0);
-  EXPECT_GT(before_drop->omega_radps(), 0.0);
+  const DrivetrainState before_value = before_drop.value_or(DrivetrainState{});
+  EXPECT_GT(before_value.vx_mps(), 0.0);
+  EXPECT_GT(before_value.omega_radps(), 0.0);
 
   hw.reset();
   for (auto t = 0ms; t < 160ms; t += 20ms) {
@@ -323,6 +324,8 @@ TEST(Drivetrain, LinkDropStopsPublishingStateAndHoldsOdometry) {
                                               sizeof(DrivetrainState));
   const auto at_timeout = sim.latest<DrivetrainState>(topics::kState);
   ASSERT_TRUE(at_timeout.has_value());
+  const DrivetrainState at_timeout_value =
+      at_timeout.value_or(DrivetrainState{});
 
   for (auto t = 0ms; t < 60ms; t += 20ms) {
     sim.publish(topics::kTarget, ChassisTarget{1.0, 0, 1.0, true});
@@ -333,7 +336,8 @@ TEST(Drivetrain, LinkDropStopsPublishingStateAndHoldsOdometry) {
             count_after_timeout);
   const auto after_extra = sim.latest<DrivetrainState>(topics::kState);
   ASSERT_TRUE(after_extra.has_value());
-  EXPECT_DOUBLE_EQ(after_extra->yaw_rot(), at_timeout->yaw_rot());
+  const DrivetrainState after_value = after_extra.value_or(DrivetrainState{});
+  EXPECT_DOUBLE_EQ(after_value.yaw_rot(), at_timeout_value.yaw_rot());
 }
 
 // --- wire and binary -----------------------------------------------------

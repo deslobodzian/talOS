@@ -146,7 +146,7 @@ struct Node::Impl {
       if (remap == nullptr) return std::nullopt;
       const auto entry = (*remap)[key];
       if (!entry) return std::nullopt;
-      if (auto s = entry.value_exact<std::string>()) return *s;
+      if (auto s = entry.value_exact<std::string>()) return s;
       throw std::invalid_argument(name + ": remap entry for '" +
                                   std::string{topic} + "' must be a string");
     };
@@ -730,6 +730,7 @@ std::vector<introspect::Reporter::ExtraSource> ByteTopicSources(
     const Node& node) {
   std::vector<introspect::Reporter::ExtraSource> sources;
   const auto topics = NodeAccess::byte_topics(node);
+  sources.reserve(topics.size());
   for (std::size_t i = 0; i < topics.size(); ++i) {
     sources.push_back({
         .kind = event::SourceKind::SENDER,

@@ -163,21 +163,21 @@ inline std::string TelemetryJson(const TelemetryState& state,
   out += std::to_string(age_ms);
   out += ",\"chassis\":";
   AppendPose(out, state.chassis);
-  out += ",\"channels\":[";
+  // Keyed by name (unique by the producer's construction-time check) so a
+  // reader goes straight to doc["channels"]["odometry/vx"]["value"]; members
+  // stay in dictionary order.
+  out += ",\"channels\":{";
   for (std::size_t i = 0; i < state.dictionary.size(); ++i) {
     if (i != 0) out += ',';
     const TelemetryChannelInfo& channel = state.dictionary[i];
     const double value = i < state.values.size()
                              ? state.values[i]
                              : std::numeric_limits<double>::quiet_NaN();
-    out += "{\"name\":";
     AppendEscaped(out, channel.name);
-    out += ",\"value\":";
+    out += ":{\"value\":";
     AppendTelemetryDouble(out, value);
-    if (!channel.unit.empty()) {
-      out += ",\"unit\":";
-      AppendEscaped(out, channel.unit);
-    }
+    out += ",\"unit\":";
+    AppendEscaped(out, channel.unit);
     // Enum channels name their value, but only in range: an out-of-range
     // code is a number, not a label waiting to be invented.
     if (!channel.labels.empty() && std::isfinite(value) &&
@@ -188,7 +188,7 @@ inline std::string TelemetryJson(const TelemetryState& state,
     }
     out += '}';
   }
-  out += "]}";
+  out += "}}";
   return out;
 }
 

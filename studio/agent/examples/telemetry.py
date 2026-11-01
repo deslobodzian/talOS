@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """What was measured right now, straight from the bridge.
 
-Reads GET /telemetry.json and /channels.json (stdlib only, no agent):
-the latest sample's channels with their units and enum labels.
+Reads GET /telemetry.json (stdlib only, no agent): every channel's latest
+value, or its enum label, with its unit.
 """
 import argparse
 import json
@@ -22,26 +22,20 @@ def main():
 
     try:
         latest = get(args.bridge, "/telemetry.json")
-        channels = get(args.bridge, "/channels.json")
     except OSError as e:
         raise SystemExit(f"Bridge unreachable at {args.bridge}: {e}")
 
-    units = latest.get("units") or {
-        c["name"]: c.get("unit", "") for c in channels.get("channels", [])}
-    labels = latest.get("labels") or {
-        c["name"]: c["labels"] for c in channels.get("channels", [])
-        if c.get("labels")}
-
-    values = {}
-    for name, value in sorted(latest.get("channels", {}).items()):
-        names = labels.get(name)
-        shown = names[int(value)] if names and float(value).is_integer() \
-            and 0 <= int(value) < len(names) else value
-        values[name] = {"value": shown, "unit": units.get(name, "")}
+    # channels is keyed by name; value is null when the channel had no fresh
+    # reading, and enum channels carry their label alongside the number.
+    values = {
+        name: {"value": entry.get("label", entry["value"]),
+               "unit": entry["unit"]}
+        for name, entry in sorted(latest["channels"].items())
+    }
     print(json.dumps({
-        "stream_id": latest.get("stream_id"),
-        "sequence_id": latest.get("sequence_id"),
-        "timestamp_ns": latest.get("timestamp_ns"),
+        "stream_id": latest["stream_id"],
+        "sequence_id": latest["sequence_id"],
+        "timestamp_ns": latest["timestamp_ns"],
         "channels": values,
     }, indent=2))
 

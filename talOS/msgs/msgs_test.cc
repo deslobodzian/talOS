@@ -62,19 +62,22 @@ TEST(StandardMessages, RoundTripControlAndGeometryStructsOnSim) {
 
   const auto pos = sim.latest<control::PositionState>("/wrist/state");
   ASSERT_TRUE(pos.has_value());
-  EXPECT_TRUE(pos->enabled());
-  EXPECT_TRUE(pos->at_goal());
-  EXPECT_DOUBLE_EQ(pos->position_rot(), 0.375);
-  EXPECT_DOUBLE_EQ(pos->goal_rot(), 0.375);
+  const control::PositionState p = pos.value_or(control::PositionState{});
+  EXPECT_TRUE(p.enabled());
+  EXPECT_TRUE(p.at_goal());
+  EXPECT_DOUBLE_EQ(p.position_rot(), 0.375);
+  EXPECT_DOUBLE_EQ(p.goal_rot(), 0.375);
 
   const auto sample = sim.latest<geometry::OdometrySample>("/wrist/telemetry");
   ASSERT_TRUE(sample.has_value());
-  EXPECT_EQ(sample->timestamp_ns(), 100u);
-  EXPECT_DOUBLE_EQ(sample->pose().x_m(), 1.5);
-  EXPECT_DOUBLE_EQ(sample->pose().y_m(), -2.5);
-  EXPECT_DOUBLE_EQ(sample->pose().yaw_rot(), 0.25);
-  EXPECT_DOUBLE_EQ(sample->velocity().vx_mps(), 3.0);
-  EXPECT_DOUBLE_EQ(sample->velocity().omega_radps(), 0.5);
+  const geometry::OdometrySample s =
+      sample.value_or(geometry::OdometrySample{});
+  EXPECT_EQ(s.timestamp_ns(), 100u);
+  EXPECT_DOUBLE_EQ(s.pose().x_m(), 1.5);
+  EXPECT_DOUBLE_EQ(s.pose().y_m(), -2.5);
+  EXPECT_DOUBLE_EQ(s.pose().yaw_rot(), 0.25);
+  EXPECT_DOUBLE_EQ(s.velocity().vx_mps(), 3.0);
+  EXPECT_DOUBLE_EQ(s.velocity().omega_radps(), 0.5);
 }
 
 }  // namespace

@@ -321,30 +321,35 @@ can_id = 1
   sim.step(10ms);
   auto target = sim.latest<GenericTarget>("/wrist/target/teleop");
   ASSERT_TRUE(target.has_value());
-  EXPECT_EQ(target->enabled, 1u);
-  EXPECT_DOUBLE_EQ(target->demand, 25.0);
+  const GenericTarget pressed = target.value_or(GenericTarget{});
+  EXPECT_EQ(pressed.enabled, 1u);
+  EXPECT_DOUBLE_EQ(pressed.demand, 25.0);
 
   // Button 3 released -> disabled with demand 0.0.
   hw.set_driver_station(DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/0)));
   sim.step(10ms);
   target = sim.latest<GenericTarget>("/wrist/target/teleop");
   ASSERT_TRUE(target.has_value());
-  EXPECT_EQ(target->enabled, 0u);
-  EXPECT_DOUBLE_EQ(target->demand, 0.0);
+  const GenericTarget released = target.value_or(GenericTarget{});
+  EXPECT_EQ(released.enabled, 0u);
+  EXPECT_DOUBLE_EQ(released.demand, 0.0);
 
   // Press button 3 again, then disable robot -> falling-edge stop emitted.
   hw.set_driver_station(
       DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/1u << 2)));
   sim.step(10ms);
-  ASSERT_EQ(sim.latest<GenericTarget>("/wrist/target/teleop")->enabled, 1u);
+  const auto repressed = sim.latest<GenericTarget>("/wrist/target/teleop");
+  ASSERT_TRUE(repressed.has_value());
+  ASSERT_EQ(repressed.value_or(GenericTarget{}).enabled, 1u);
 
   hw.set_driver_station(
       DsState(ds::kDsAttached, Stick(0, 0, 0, /*buttons=*/1u << 2)));
   sim.step(10ms);
   target = sim.latest<GenericTarget>("/wrist/target/teleop");
   ASSERT_TRUE(target.has_value());
-  EXPECT_EQ(target->enabled, 0u);
-  EXPECT_DOUBLE_EQ(target->demand, 0.0);
+  const GenericTarget disabled = target.value_or(GenericTarget{});
+  EXPECT_EQ(disabled.enabled, 0u);
+  EXPECT_DOUBLE_EQ(disabled.demand, 0.0);
 }
 
 }  // namespace

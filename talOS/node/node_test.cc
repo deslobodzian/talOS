@@ -232,17 +232,23 @@ can_id = 1
 
   const auto wrist_state = sim.latest<Count>("/wrist/state");
   ASSERT_TRUE(wrist_state.has_value());
-  EXPECT_EQ(wrist_state->value(), 13);
+  const Count wrist = wrist_state.value_or(Count{});
+  EXPECT_EQ(wrist.value(), 13);
   const auto wrist_frames = sim.latest_bytes("/wrist/frames");
   ASSERT_TRUE(wrist_frames.has_value());
-  EXPECT_EQ(*wrist_frames, std::vector<std::byte>{std::byte{3}});
+  const std::vector<std::byte> wframes =
+      wrist_frames.value_or(std::vector<std::byte>{});
+  EXPECT_EQ(wframes, std::vector<std::byte>{std::byte{3}});
 
   const auto left_state = sim.latest<Count>("/wrist/left_state");
   ASSERT_TRUE(left_state.has_value());
-  EXPECT_EQ(left_state->value(), 27);
+  const Count left = left_state.value_or(Count{});
+  EXPECT_EQ(left.value(), 27);
   const auto left_frames = sim.latest_bytes("/left_wrist/raw_frames");
   ASSERT_TRUE(left_frames.has_value());
-  EXPECT_EQ(*left_frames, std::vector<std::byte>{std::byte{7}});
+  const std::vector<std::byte> lframes =
+      left_frames.value_or(std::vector<std::byte>{});
+  EXPECT_EQ(lframes, std::vector<std::byte>{std::byte{7}});
 }
 
 TEST(Node, NonStringRemapEntryThrows) {
