@@ -80,11 +80,10 @@ class Lane {
 class Arbiter {
  public:
   explicit Arbiter(talos::Node& node)
-      : node_{node},
-        // Subscribed before the lanes, so a mode change and a producer's
-        // target that arrive together are taken mode first: the driver
-        // station packet that enables teleop also admits the teleop target
-        // the operator interface derived from it.
+      :  // Subscribed before the lanes, so a mode change and a producer's
+         // target that arrive together are taken mode first: the driver
+         // station packet that enables teleop also admits the teleop target
+         // the operator interface derived from it.
         ds_{node, [this] { OnMode(SourceFor(ds_)); }},
         chassis_{node, source_, drivetrain::topics::kTarget,
                  drivetrain::topics::kTeleopTarget,
@@ -137,7 +136,6 @@ class Arbiter {
     }
   }
 
-  talos::Node& node_;
   Source source_ = Source::kNone;
   talos::DriverStation ds_;
   Lane<drivetrain::ChassisTarget> chassis_;

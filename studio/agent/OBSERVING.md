@@ -9,11 +9,12 @@ curl localhost:5800/channels.json    # channel dictionary: names, units, enum la
 curl localhost:5800/system.json      # nodes, topics, health
 ```
 
-`/telemetry.json` carries `channels` (name → number; a channel with no
-reading is absent, never zero-filled), `units`, `labels` (for enum channels
-the value is an index into this list), `chassis`, `stream_id`,
-`sequence_id`, and `timestamp_ns`. A new `stream_id` means the producer
-restarted; sequence and timestamp restart with it.
+`/telemetry.json` is keyed by channel name: `channels["odometry/vx"]` is
+`{"value": 1.2, "unit": "m/s"}`, `value` is `null` when there was no fresh
+reading (never zero-filled), `unit` is always present, and enum channels add
+an in-range `label`. Beside it: `chassis`, `stream_id`, `sequence_id`,
+`timestamp_ns`, `age_ms`. A new `stream_id` means the producer restarted;
+sequence and timestamp restart with it.
 
 Use the Studio agent's JSON-RPC service, implemented in `rpc.ts` and served
 by `server.ts`, when you need history: retained samples, lookup by
@@ -26,8 +27,9 @@ reference; this note is the short Python path.
   (requests without `id`) work; notifications get no reply (`204`).
 - `GET /health` reports upstream connectivity, retained frame count,
   jitter stats, and `system` / `declared` blocks. Poll it first.
-- `get_latest` is the RPC form of `/telemetry.json`: the newest retained
-  sample with its `units`, `labels`, `sequence_id`, `stream_id`, and age.
+- `get_latest` is the newest retained sample in the agent's snapshot shape:
+  `channels` (name → number, no-reading channels omitted), `units`,
+  `labels`, `sequence_id`, `stream_id`, and age.
 - Timestamps are **uint64 decimal strings** (never JSON numbers, which
   lose precision). `query_state_at` defaults to `mode: "exact"`;
   pass `"at_or_before"` for the preceding retained sample.
@@ -50,8 +52,8 @@ reference; this note is the short Python path.
 ## Examples (stdlib only: `urllib` + `json`)
 
 - `examples/telemetry.py` — what was measured right now: reads
-  `/telemetry.json` and `/channels.json` from the bridge directly and
-  prints each channel's value with its unit or enum label.
+  `/telemetry.json` from the bridge directly and prints each channel's
+  value (or enum label) with its unit.
 - `examples/system_graph.py` — who is running: node counts, topic
   health tally, per-topic ends via `describe_topic`, declared-vs-live
   comparison via `get_declared_graph`.

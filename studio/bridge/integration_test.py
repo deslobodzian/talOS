@@ -187,9 +187,9 @@ class BridgeIntegration(unittest.TestCase):
                     self.assertIsInstance(telemetry_doc["sequence_id"], str)
                     self.assertIsInstance(telemetry_doc["timestamp_ns"], str)
                     self.assertIn("age_ms", telemetry_doc)
-                    by_name = {c["name"]: c for c in telemetry_doc["channels"]}
-                    self.assertIn("value", by_name["drive/velocity"])
-                    self.assertEqual(by_name["drive/velocity"]["unit"], "m/s")
+                    channels_now = telemetry_doc["channels"]
+                    self.assertIn("value", channels_now["drive/velocity"])
+                    self.assertEqual(channels_now["drive/velocity"]["unit"], "m/s")
 
                     # The graph is refreshed on the open socket every 250 ms,
                     # not only sent on connect, and it counts the frames the

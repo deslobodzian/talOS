@@ -37,12 +37,12 @@ std::string ValidatePath(std::string_view path) {
 // publisher passes allowed=true. Unlinking does not disturb a process that
 // still has the old segment mapped; it only removes the name, so a straggler
 // from the previous build keeps running against memory nobody new can reach.
-const std::string& ReclaimMismatchedSegment(const std::string& path,
-                                            std::uint64_t total_bytes,
-                                            std::uint64_t slots,
-                                            std::uint64_t message_bytes,
-                                            std::uint64_t message_alignment,
-                                            bool allowed) {
+std::string ReclaimMismatchedSegment(const std::string& path,
+                                     std::uint64_t total_bytes,
+                                     std::uint64_t slots,
+                                     std::uint64_t message_bytes,
+                                     std::uint64_t message_alignment,
+                                     bool allowed) {
   if (!allowed) {
     return path;
   }

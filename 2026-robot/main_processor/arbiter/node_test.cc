@@ -306,23 +306,26 @@ can_id = 1
 
   const auto teleop = sim.latest<GenericTarget>("/wrist/target");
   ASSERT_TRUE(teleop.has_value());
-  EXPECT_EQ(teleop->enabled, 1u);
-  EXPECT_DOUBLE_EQ(teleop->demand, 25.0);
+  const GenericTarget teleop_value = teleop.value_or(GenericTarget{});
+  EXPECT_EQ(teleop_value.enabled, 1u);
+  EXPECT_DOUBLE_EQ(teleop_value.demand, 25.0);
 
   // Mode switch to autonomous emits a stop on /wrist/target before auto speaks.
   hw.set_driver_station(DsState(kAutoEnabled));
   sim.step(10ms);
   const auto stopped = sim.latest<GenericTarget>("/wrist/target");
   ASSERT_TRUE(stopped.has_value());
-  EXPECT_EQ(stopped->enabled, 0u);
-  EXPECT_DOUBLE_EQ(stopped->demand, 0.0);
+  const GenericTarget stopped_value = stopped.value_or(GenericTarget{});
+  EXPECT_EQ(stopped_value.enabled, 0u);
+  EXPECT_DOUBLE_EQ(stopped_value.demand, 0.0);
 
   sim.publish("/wrist/target/auto", GenericTarget{1, {}, -12.5});
   sim.step(10ms);
   const auto auto_target = sim.latest<GenericTarget>("/wrist/target");
   ASSERT_TRUE(auto_target.has_value());
-  EXPECT_EQ(auto_target->enabled, 1u);
-  EXPECT_DOUBLE_EQ(auto_target->demand, -12.5);
+  const GenericTarget auto_value = auto_target.value_or(GenericTarget{});
+  EXPECT_EQ(auto_value.enabled, 1u);
+  EXPECT_DOUBLE_EQ(auto_value.demand, -12.5);
 }
 
 }  // namespace

@@ -58,9 +58,11 @@ TEST(TelemetryJson, SelfDescribesTheLatestFrame) {
   EXPECT_NE(json.find("\"dictionary_id\":4242"), std::string::npos);
   EXPECT_NE(json.find("\"age_ms\":250"), std::string::npos);
   EXPECT_NE(json.find("\"x\":1.5"), std::string::npos);
-  EXPECT_NE(
-      json.find("\"name\":\"drive/velocity\",\"value\":0.75,\"unit\":\"m/s\""),
-      std::string::npos);
+  EXPECT_NE(json.find("\"drive/velocity\":{\"value\":0.75,\"unit\":\"m/s\"}"),
+            std::string::npos);
+  // A unitless channel still carries "unit", so readers never branch on it.
+  EXPECT_NE(json.find("\"pose/valid\":{\"value\":1,\"unit\":\"\"}"),
+            std::string::npos);
 }
 
 TEST(TelemetryJson, NaNLeavesAsNullAndEnumLabelsOnlyInRange) {
@@ -68,15 +70,17 @@ TEST(TelemetryJson, NaNLeavesAsNullAndEnumLabelsOnlyInRange) {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   ASSERT_TRUE(IngestTelemetry(state, FrameBytes(true, nan, 1.0), 0));
   std::string json = TelemetryJson(state, 0);
-  EXPECT_NE(json.find("\"name\":\"drive/velocity\",\"value\":null"),
+  EXPECT_NE(json.find("\"drive/velocity\":{\"value\":null,"),
             std::string::npos);
-  EXPECT_NE(json.find("\"label\":\"TARGET_STALE\""), std::string::npos);
+  EXPECT_NE(json.find("\"intake/inhibit\":{\"value\":1,\"unit\":\"\","
+                      "\"label\":\"TARGET_STALE\"}"),
+            std::string::npos);
 
   // Out of range: a number with no invented label.
   TelemetryState out_of_range;
   ASSERT_TRUE(IngestTelemetry(out_of_range, FrameBytes(true, 1.0, 9.0), 0));
   json = TelemetryJson(out_of_range, 0);
-  EXPECT_NE(json.find("\"name\":\"intake/inhibit\",\"value\":9"),
+  EXPECT_NE(json.find("\"intake/inhibit\":{\"value\":9,\"unit\":\"\"}"),
             std::string::npos);
   EXPECT_EQ(json.find("\"label\""), std::string::npos);
 }

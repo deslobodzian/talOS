@@ -195,8 +195,11 @@ TEST(HardwareNodeTest, ForwardsDriverStationPacketsToIpc) {
   EXPECT_EQ(node.driver_station_packets_received(), 1u);
   auto pkt = ds_sub.read();
   ASSERT_TRUE(pkt.has_value());
-  EXPECT_EQ(pkt->size, dummy_payload.size());
-  EXPECT_EQ(std::memcmp(pkt->data.data(), dummy_payload.data(), pkt->size), 0);
+  const talos::hardware::Packet packet =
+      pkt.value_or(talos::hardware::Packet{});
+  EXPECT_EQ(packet.size, dummy_payload.size());
+  EXPECT_EQ(std::memcmp(packet.data.data(), dummy_payload.data(), packet.size),
+            0);
 }
 
 constexpr std::string_view kTrustToml = R"(
@@ -957,7 +960,8 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   EXPECT_FALSE(initial.configured());
   auto published = status_sub.read();
   ASSERT_TRUE(published.has_value());
-  EXPECT_TRUE(*published == initial);
+  const bridge::BridgeStatus first = published.value_or(bridge::BridgeStatus{});
+  EXPECT_TRUE(first == initial);
 
   protocol::RuntimeUdpPeer gateway;
   ASSERT_EQ(gateway.Open("127.0.0.1", 25828, "127.0.0.1", 25829),
@@ -1039,11 +1043,12 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   node.Tick(1019000);
   published = status_sub.read();
   ASSERT_TRUE(published.has_value());
-  EXPECT_TRUE(*published == node.Status(1019000));
+  const bridge::BridgeStatus later = published.value_or(bridge::BridgeStatus{});
+  EXPECT_TRUE(later == node.Status(1019000));
   // By now the drivetrain has been quiet past twice its period as well.
-  EXPECT_EQ(published->timed_out_mask(), 0b11u);
-  EXPECT_EQ(published->state_age_us(), 19000u);
-  EXPECT_TRUE(published->configured());
+  EXPECT_EQ(later.timed_out_mask(), 0b11u);
+  EXPECT_EQ(later.state_age_us(), 19000u);
+  EXPECT_TRUE(later.configured());
 }
 
 // A timed-out subsystem neutralizes exactly its own motors, digital outputs

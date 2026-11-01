@@ -67,6 +67,7 @@ TEST(SingleProcess, RTMSSequence) {
   // Readers must be registered before messages are published.
   const auto reader_id = queue.register_reader();
   ASSERT_TRUE(reader_id.has_value());
+  const std::size_t id = reader_id.value_or(std::size_t{0});
 
   const auto messages = std::array{
       Message::TestMessage{10, 200.0F},
@@ -84,7 +85,7 @@ TEST(SingleProcess, RTMSSequence) {
     Message::TestMessage received{};
 
     const bool did_read =
-        queue.read(*reader_id, [&received](std::span<const std::byte> bytes) {
+        queue.read(id, [&received](std::span<const std::byte> bytes) {
           std::memcpy(&received, bytes.data(), sizeof(received));
         });
 
@@ -93,9 +94,9 @@ TEST(SingleProcess, RTMSSequence) {
   }
 
   // The reader cursor should now equal writer.sequence.
-  EXPECT_FALSE(queue.read(*reader_id, [](std::span<const std::byte>) {}));
+  EXPECT_FALSE(queue.read(id, [](std::span<const std::byte>) {}));
 
-  queue.release_reader(*reader_id);
+  queue.release_reader(id);
 }
 
 TEST(SingleProcess, RTMSLatest) {
@@ -111,6 +112,7 @@ TEST(SingleProcess, RTMSLatest) {
 
   const auto reader_id = queue.register_reader();
   ASSERT_TRUE(reader_id.has_value());
+  const std::size_t id = reader_id.value_or(std::size_t{0});
 
   const auto messages = std::array{
       Message::TestMessage{10, 200.0F},
@@ -126,19 +128,18 @@ TEST(SingleProcess, RTMSLatest) {
 
   Message::TestMessage received{};
 
-  ASSERT_TRUE(
-      queue.read(*reader_id, [&received](std::span<const std::byte> bytes) {
-        std::memcpy(&received, bytes.data(), sizeof(received));
-      }));
+  ASSERT_TRUE(queue.read(id, [&received](std::span<const std::byte> bytes) {
+    std::memcpy(&received, bytes.data(), sizeof(received));
+  }));
 
   // LATEST skips the first two unread messages.
   EXPECT_EQ(received, messages.back());
 
   // The reader cursor should now equal writer.sequence.
   // The latest message must not be returned repeatedly.
-  EXPECT_FALSE(queue.read(*reader_id, [](std::span<const std::byte>) {}));
+  EXPECT_FALSE(queue.read(id, [](std::span<const std::byte>) {}));
 
-  queue.release_reader(*reader_id);
+  queue.release_reader(id);
 }
 
 TEST(WrapTest, RTMSSequenceWrapsSlots) {
@@ -154,6 +155,7 @@ TEST(WrapTest, RTMSSequenceWrapsSlots) {
 
   const auto reader_id = queue.register_reader();
   ASSERT_TRUE(reader_id.has_value());
+  const std::size_t id = reader_id.value_or(std::size_t{0});
 
   for (int i = 0; i < iterations; ++i) {
     const Message::TestMessage expected{
@@ -167,17 +169,16 @@ TEST(WrapTest, RTMSSequenceWrapsSlots) {
 
     Message::TestMessage received{};
 
-    ASSERT_TRUE(
-        queue.read(*reader_id, [&received](std::span<const std::byte> bytes) {
-          std::memcpy(&received, bytes.data(), sizeof(received));
-        }));
+    ASSERT_TRUE(queue.read(id, [&received](std::span<const std::byte> bytes) {
+      std::memcpy(&received, bytes.data(), sizeof(received));
+    }));
 
     EXPECT_EQ(received, expected);
   }
 
-  EXPECT_FALSE(queue.read(*reader_id, [](std::span<const std::byte>) {}));
+  EXPECT_FALSE(queue.read(id, [](std::span<const std::byte>) {}));
 
-  queue.release_reader(*reader_id);
+  queue.release_reader(id);
 }
 
 TEST(SingleProcess, WriteSequenceIncrementsMonotonically) {
@@ -218,6 +219,7 @@ TEST(SingleProcess, ReadNextSequenceNoDropsWhileCaughtUp) {
 
   const auto reader_id = queue.register_reader();
   ASSERT_TRUE(reader_id.has_value());
+  const std::size_t id = reader_id.value_or(std::size_t{0});
 
   std::array<std::byte, sizeof(Message::TestMessage)> buffer{};
 
@@ -230,7 +232,7 @@ TEST(SingleProcess, ReadNextSequenceNoDropsWhileCaughtUp) {
 
     MessageInfo info{};
     const ReadResult result =
-        queue.read_next(*reader_id, std::span<std::byte>(buffer), info);
+        queue.read_next(id, std::span<std::byte>(buffer), info);
 
     ASSERT_EQ(result, ReadResult::OK);
     EXPECT_EQ(info.sequence, static_cast<std::uint64_t>(i));
@@ -241,7 +243,7 @@ TEST(SingleProcess, ReadNextSequenceNoDropsWhileCaughtUp) {
     EXPECT_EQ(received, message);
   }
 
-  queue.release_reader(*reader_id);
+  queue.release_reader(id);
 }
 
 TEST(SingleProcess, ReadNextEmptyAndInvalidCases) {
@@ -254,23 +256,24 @@ TEST(SingleProcess, ReadNextEmptyAndInvalidCases) {
 
   const auto reader_id = queue.register_reader();
   ASSERT_TRUE(reader_id.has_value());
+  const std::size_t id = reader_id.value_or(std::size_t{0});
 
   std::array<std::byte, sizeof(Message::TestMessage)> buffer{};
   MessageInfo info{};
 
   // Nothing published yet: EMPTY, not OK.
-  EXPECT_EQ(queue.read_next(*reader_id, std::span<std::byte>(buffer), info),
+  EXPECT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
             ReadResult::EMPTY);
 
   const Message::TestMessage message{7, 7.0F};
   const auto rtms_message = BytesOf(message);
   ASSERT_EQ(queue.write(rtms_message).result, WriteResult::SUCCESS);
 
-  ASSERT_EQ(queue.read_next(*reader_id, std::span<std::byte>(buffer), info),
+  ASSERT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
             ReadResult::OK);
 
   // Caught up again: EMPTY, and the same message must not repeat.
-  EXPECT_EQ(queue.read_next(*reader_id, std::span<std::byte>(buffer), info),
+  EXPECT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
             ReadResult::EMPTY);
 
   // Out-of-range reader ids are INVALID, not INACTIVE.
@@ -283,11 +286,10 @@ TEST(SingleProcess, ReadNextEmptyAndInvalidCases) {
   // A destination smaller than the message is INVALID.
   ASSERT_EQ(queue.write(rtms_message).result, WriteResult::SUCCESS);
   std::array<std::byte, sizeof(Message::TestMessage) - 1> small_buffer{};
-  EXPECT_EQ(
-      queue.read_next(*reader_id, std::span<std::byte>(small_buffer), info),
-      ReadResult::INVALID);
+  EXPECT_EQ(queue.read_next(id, std::span<std::byte>(small_buffer), info),
+            ReadResult::INVALID);
 
-  queue.release_reader(*reader_id);
+  queue.release_reader(id);
 }
 
 TEST(SingleProcess, ReadNextInactiveAfterRelease) {
@@ -300,13 +302,14 @@ TEST(SingleProcess, ReadNextInactiveAfterRelease) {
 
   const auto reader_id = queue.register_reader();
   ASSERT_TRUE(reader_id.has_value());
+  const std::size_t id = reader_id.value_or(std::size_t{0});
 
-  queue.release_reader(*reader_id);
+  queue.release_reader(id);
 
   std::array<std::byte, sizeof(Message::TestMessage)> buffer{};
   MessageInfo info{};
 
-  EXPECT_EQ(queue.read_next(*reader_id, std::span<std::byte>(buffer), info),
+  EXPECT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
             ReadResult::INACTIVE);
 }
 
@@ -325,6 +328,7 @@ TEST(SingleProcess, ReadNextLapsUsingDocumentedFormula) {
   // entire run below laps it.
   const auto reader_id = queue.register_reader();
   ASSERT_TRUE(reader_id.has_value());
+  const std::size_t id = reader_id.value_or(std::size_t{0});
 
   for (std::uint64_t i = 0; i < writes; ++i) {
     const Message::TestMessage message{
@@ -348,7 +352,7 @@ TEST(SingleProcess, ReadNextLapsUsingDocumentedFormula) {
   std::array<std::byte, sizeof(Message::TestMessage)> buffer{};
   MessageInfo info{};
 
-  ASSERT_EQ(queue.read_next(*reader_id, std::span<std::byte>(buffer), info),
+  ASSERT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
             ReadResult::OK);
   EXPECT_EQ(info.sequence, expected_first);
   EXPECT_EQ(info.dropped, expected_first);
@@ -361,7 +365,7 @@ TEST(SingleProcess, ReadNextLapsUsingDocumentedFormula) {
 
   for (std::uint64_t expected = expected_first + 1; expected < writes;
        ++expected) {
-    ASSERT_EQ(queue.read_next(*reader_id, std::span<std::byte>(buffer), info),
+    ASSERT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
               ReadResult::OK);
 
     // Strictly increasing: the reader must never re-observe a sequence.
@@ -372,10 +376,10 @@ TEST(SingleProcess, ReadNextLapsUsingDocumentedFormula) {
     last_sequence = info.sequence;
   }
 
-  EXPECT_EQ(queue.read_next(*reader_id, std::span<std::byte>(buffer), info),
+  EXPECT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
             ReadResult::EMPTY);
 
-  queue.release_reader(*reader_id);
+  queue.release_reader(id);
 }
 
 TEST(SingleProcess, ReadNextLatestReportsDroppedThenEmpty) {
@@ -393,6 +397,7 @@ TEST(SingleProcess, ReadNextLatestReportsDroppedThenEmpty) {
 
   const auto reader_id = queue.register_reader();
   ASSERT_TRUE(reader_id.has_value());
+  const std::size_t id = reader_id.value_or(std::size_t{0});
 
   for (int i = 0; i < writes; ++i) {
     const Message::TestMessage message{i, static_cast<float>(i)};
@@ -405,7 +410,7 @@ TEST(SingleProcess, ReadNextLatestReportsDroppedThenEmpty) {
   std::array<std::byte, sizeof(Message::TestMessage)> buffer{};
   MessageInfo info{};
 
-  ASSERT_EQ(queue.read_next(*reader_id, std::span<std::byte>(buffer), info),
+  ASSERT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
             ReadResult::OK);
 
   EXPECT_EQ(info.sequence, static_cast<std::uint64_t>(writes - 1));
@@ -417,10 +422,10 @@ TEST(SingleProcess, ReadNextLatestReportsDroppedThenEmpty) {
 
   // No intervening write: a second read must be EMPTY, not a repeat of
   // the latest message.
-  EXPECT_EQ(queue.read_next(*reader_id, std::span<std::byte>(buffer), info),
+  EXPECT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
             ReadResult::EMPTY);
 
-  queue.release_reader(*reader_id);
+  queue.release_reader(id);
 }
 
 TEST(SingleProcess, DropNewestBufferFullThenRecovers) {
@@ -435,6 +440,7 @@ TEST(SingleProcess, DropNewestBufferFullThenRecovers) {
 
   const auto reader_id = queue.register_reader();
   ASSERT_TRUE(reader_id.has_value());
+  const std::size_t id = reader_id.value_or(std::size_t{0});
 
   // Fill every slot without reading; the reader is fully stalled.
   for (std::uint64_t i = 0; i < slots; ++i) {
@@ -461,7 +467,7 @@ TEST(SingleProcess, DropNewestBufferFullThenRecovers) {
   MessageInfo info{};
   std::uint64_t drained = 0;
 
-  while (queue.read_next(*reader_id, std::span<std::byte>(buffer), info) ==
+  while (queue.read_next(id, std::span<std::byte>(buffer), info) ==
          ReadResult::OK) {
     EXPECT_EQ(info.sequence, drained);
     EXPECT_EQ(info.dropped, 0u);
@@ -485,7 +491,7 @@ TEST(SingleProcess, DropNewestBufferFullThenRecovers) {
   EXPECT_EQ(recovered_status.result, WriteResult::SUCCESS);
   EXPECT_EQ(recovered_status.sequence, slots);
 
-  queue.release_reader(*reader_id);
+  queue.release_reader(id);
 }
 
 // DROP_NEWEST fills to exactly `slots` before refusing a write, and at that
@@ -512,6 +518,7 @@ TEST(SingleProcess, DropNewestKeepsOldestMessageAtExactCapacity) {
 
   const auto reader_id = queue.register_reader();
   ASSERT_TRUE(reader_id.has_value());
+  const std::size_t id = reader_id.value_or(std::size_t{0});
 
   // Fill the queue to exactly capacity. write() itself treats this as
   // completely safe: BUFFER_FULL only triggers on the *next* write.
@@ -529,13 +536,13 @@ TEST(SingleProcess, DropNewestKeepsOldestMessageAtExactCapacity) {
   std::array<std::byte, sizeof(Message::TestMessage)> buffer{};
   MessageInfo info{};
 
-  ASSERT_EQ(queue.read_next(*reader_id, std::span<std::byte>(buffer), info),
+  ASSERT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
             ReadResult::OK);
 
   EXPECT_EQ(info.sequence, 0u);
   EXPECT_EQ(info.dropped, 0u);
 
-  queue.release_reader(*reader_id);
+  queue.release_reader(id);
 }
 
 namespace {
@@ -1086,6 +1093,7 @@ TEST(RTMSStaleSegment, PublisherLeavesAHealthySegmentAloneUnderALiveReader) {
                    alignof(Message::TestMessage), 64, sequence_options()};
   const auto reader_id = reader.register_reader();
   ASSERT_TRUE(reader_id.has_value());
+  const std::size_t id = reader_id.value_or(std::size_t{0});
 
   RTMSQueue writer{path, sizeof(Message::TestMessage),
                    alignof(Message::TestMessage), 64, publisher_options()};
@@ -1094,11 +1102,10 @@ TEST(RTMSStaleSegment, PublisherLeavesAHealthySegmentAloneUnderALiveReader) {
 
   Message::TestMessage received{};
   MessageInfo info{};
-  ASSERT_EQ(
-      reader.read_next(
-          *reader_id,
-          {reinterpret_cast<std::byte*>(&received), sizeof(received)}, info),
-      ReadResult::OK);
+  ASSERT_EQ(reader.read_next(
+                id, {reinterpret_cast<std::byte*>(&received), sizeof(received)},
+                info),
+            ReadResult::OK);
   EXPECT_EQ(received.id(), sent.id());
   shm_unlink(path.c_str());
 }

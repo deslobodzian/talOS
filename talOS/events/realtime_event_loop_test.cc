@@ -167,7 +167,7 @@ TEST(RealtimeEventLoop, ReaderExhaustionFailsRegistrationAndAllowsRetry) {
   for (std::size_t i = 0; i < MAX_READERS; ++i) {
     auto reader = keeper.register_reader();
     ASSERT_TRUE(reader);
-    readers.push_back(*reader);
+    readers.push_back(reader.value_or(std::size_t{0}));
   }
   {
     RealtimeEventLoop<> loop;
@@ -179,7 +179,7 @@ TEST(RealtimeEventLoop, ReaderExhaustionFailsRegistrationAndAllowsRetry) {
   }
   const auto recycled = keeper.register_reader();
   ASSERT_TRUE(recycled);
-  keeper.release_reader(*recycled);
+  keeper.release_reader(recycled.value_or(std::size_t{0}));
   for (auto reader : readers) keeper.release_reader(reader);
 }
 

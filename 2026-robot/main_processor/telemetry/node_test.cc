@@ -299,7 +299,9 @@ TEST_F(TelemetryTest, ForwardsBridgeHealthAndMarksItStale) {
   EXPECT_NEAR(channels.at("bridge/stale"), 0.0, 1e-12);
   // Units live in the dictionary now.
   for (const ChannelDef& channel : telemetry.dictionary()) {
-    if (channel.name == "bridge/state_age_us") EXPECT_EQ(channel.unit, "us");
+    if (channel.name == "bridge/state_age_us") {
+      EXPECT_EQ(channel.unit, "us");
+    }
   }
 
   for (int i = 0; i < 8; ++i) {
@@ -445,7 +447,10 @@ can_id = 1
 
   const auto latest = sim.latest_bytes("/talos/telemetry");
   ASSERT_TRUE(latest.has_value());
-  const Frame* frame = Talos::Telemetry::GetSizePrefixedFrame(latest->data());
+  const std::vector<std::byte> latest_value =
+      latest.value_or(std::vector<std::byte>{});
+  const Frame* frame =
+      Talos::Telemetry::GetSizePrefixedFrame(latest_value.data());
   ASSERT_NE(frame, nullptr);
   ASSERT_NE(frame->dictionary(), nullptr);
   ASSERT_NE(frame->values(), nullptr);
@@ -456,8 +461,9 @@ can_id = 1
   for (std::size_t i = 0; i < frame->dictionary()->size(); ++i) {
     const auto* info = frame->dictionary()->Get(i);
     const double value = frame->values()->Get(i);
-    if (info->unit() != nullptr)
+    if (info->unit() != nullptr) {
       units[info->name()->str()] = info->unit()->str();
+    }
     if (!std::isnan(value)) channels[info->name()->str()] = value;
   }
   EXPECT_NEAR(channels.at("wrist/value"), 25.0, 1e-12);
@@ -473,8 +479,10 @@ can_id = 1
 
   const auto stale_bytes = sim.latest_bytes("/talos/telemetry");
   ASSERT_TRUE(stale_bytes.has_value());
+  const std::vector<std::byte> stale_value =
+      stale_bytes.value_or(std::vector<std::byte>{});
   const Frame* stale_frame =
-      Talos::Telemetry::GetSizePrefixedFrame(stale_bytes->data());
+      Talos::Telemetry::GetSizePrefixedFrame(stale_value.data());
   ASSERT_NE(stale_frame, nullptr);
   std::map<std::string, double> stale_channels;
   const auto& dictionary = telemetry.dictionary();
@@ -485,6 +493,30 @@ can_id = 1
   EXPECT_EQ(stale_channels.count("wrist/value"), 0u);
   EXPECT_NEAR(stale_channels.at("wrist/stale"), 1.0, 1e-12);
   EXPECT_NEAR(stale_channels.at("mechanism/stale"), 1.0, 1e-12);
+}
+
+// Channel names are the keys of /telemetry.json and Studio's decoder. A
+// TOML subsystem named after a fixed channel group would emit a second
+// "bridge/stale" and hide one of them, so the dictionary refuses it.
+TEST(Telemetry, RefusesAConfiguredSubsystemThatDuplicatesAChannel) {
+  Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.telemetry]
+period_us = 10000
+topic = "/talos/telemetry"
+stale_timeout_us = 100000
+
+[subsystems.bridge]
+period_us = 20000
+telemetry = true
+
+[subsystems.bridge.motors.bridge_motor]
+can_id = 1
+)");
+  EXPECT_THROW(sim.add<Telemetry>("telemetry"), std::invalid_argument);
 }
 
 // The Studio feed bypasses the loop, so --describe must still declare it.

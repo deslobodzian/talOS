@@ -34,10 +34,10 @@ the bridge's cached dictionary frame as a binary frame, so its first value
 frame is already decodable. Two HTTP views describe the same feed as JSON:
 `GET /channels.json` returns the dictionary document
 (`talos.telemetry.channels`, version 2), and `GET /telemetry.json` returns
-the latest frame self-described (`talos.telemetry`, version 2) — channel
-names, units and enum labels joined in, uint64 as decimal strings, `NaN`
-(absent or stale on the wire) as `null`, an enum `label` only for in-range
-values, and `age_ms` since the bridge received the frame. Both answer **503**
+the latest frame self-described (`talos.telemetry`, version 2) — `channels`
+is an object keyed by channel name, each `{"value", "unit"}` plus `label` for
+an in-range enum value; uint64 as decimal strings, `NaN` (absent or stale on
+the wire) as `null`, and `age_ms` since the bridge received the frame. Both answer **503**
 until a dictionary (and, for `/telemetry.json`, an aligned frame) has
 arrived: "not known yet" is not "the robot is doing nothing".
 

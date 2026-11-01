@@ -93,8 +93,10 @@ int main(int argc, char** argv) try {
     // Dictionary on the first frame and every 100th, never otherwise.
     if (seq % 100 == 0) {
       std::vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>> entries;
+      entries.reserve(dictionary.size());
       for (const ChannelDef& channel : dictionary) {
         std::vector<flatbuffers::Offset<flatbuffers::String>> labels;
+        labels.reserve(channel.labels.size());
         for (const std::string& label : channel.labels) {
           labels.push_back(builder.CreateString(label));
         }

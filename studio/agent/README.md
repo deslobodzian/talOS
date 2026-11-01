@@ -9,11 +9,13 @@ curl localhost:5800/channels.json    # the channel dictionary (names, units, enu
 curl localhost:5800/system.json      # who is running: nodes, topics, health
 ```
 
-`/telemetry.json` is the newest retained frame: `channels` (name → number,
-NaN readings omitted), `units`, `labels` (enum channels carry their label
-list; the value is the index), `chassis`, `stream_id`, `sequence_id`,
-`timestamp_ns`, and the frame's `dictionary_id`. `/channels.json` is the
-dictionary those values index into. The WebSocket feed at
+`/telemetry.json` is the newest frame, keyed by channel name:
+`channels["odometry/vx"]` is `{"value": 1.2, "unit": "m/s"}`; `value` is
+`null` when the channel had no fresh reading, `unit` is always present (`""`
+when unitless), and enum channels add `label` (e.g. `"TARGET_STALE"`) for an
+in-range value. Beside `channels`: `chassis`, `stream_id`, `sequence_id`,
+`timestamp_ns` (uint64 as decimal strings), `dictionary_id` and `age_ms`.
+`/channels.json` lists the dictionary (name, unit, enum labels). The WebSocket feed at
 `ws://127.0.0.1:5800/telemetry` carries the same data as binary telemetry
 wire v2 frames (system graph text frame first, then the cached dictionary
 frame, then value frames); you only need it for a live stream.

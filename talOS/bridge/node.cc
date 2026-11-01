@@ -95,8 +95,9 @@ void HardwareNode::IndexActuators() {
                         const std::vector<uint16_t>& ids) {
     out.clear();
     for (auto id : ids) {
-      if (auto it = table.find(id); it != table.end())
+      if (auto it = table.find(id); it != table.end()) {
         out.push_back(it->second);
+      }
     }
   };
   for (auto& [name, tracker] : subsystems_) {

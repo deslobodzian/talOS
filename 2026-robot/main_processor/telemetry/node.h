@@ -304,8 +304,19 @@ class Telemetry {
     return id != 0 ? id : 1;
   }
 
+  // Names are the keys a consumer looks channels up by (/telemetry.json,
+  // Studio's decoder), so two entries with one name would make one of them
+  // unreachable. A TOML-configured mechanism whose name collides with a
+  // fixed channel fails here, at construction, like the size budget.
   std::size_t AddChannel(std::string name, std::string unit = "",
                          std::vector<std::string> labels = {}) {
+    for (const ChannelDef& existing : dictionary_) {
+      if (existing.name == name) {
+        throw std::invalid_argument("telemetry: duplicate channel '" + name +
+                                    "'; rename the subsystem or turn off its "
+                                    "telemetry");
+      }
+    }
     dictionary_.push_back(
         ChannelDef{std::move(name), std::move(unit), std::move(labels)});
     return dictionary_.size() - 1;
@@ -341,8 +352,8 @@ class Telemetry {
         for (const auto& [key, val] : *subs) {
           const std::string_view sub_name = key.str();
           if (sub_name == "odometry" || sub_name == "drivetrain" ||
-              sub_name == "driver_station" || sub_name == "shooter" ||
-              sub_name == "intake" || sub_name == "telemetry") {
+              sub_name == "shooter" || sub_name == "intake" ||
+              sub_name == "telemetry") {
             continue;
           }
           const auto* tbl = val.as_table();
