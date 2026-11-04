@@ -42,13 +42,14 @@ beyond reading descriptors.
 
 ## D1. Target lanes, resolved inside the consumer (replaces the arbiter)
 
-**Status: substantially implemented; integration and acceptance incomplete.**
+**Status: implemented; the safety contract holds in tests and in a live sim.**
 `talos::Target`/`TargetLane`/`TargetEnvelope` exist in `talOS/devices/target.h`,
-with C ABI version 12, Python wrappers, test helpers, configuration policy,
-and graph lane checks. The arbiter is deleted. Each Target's selected source
-is reported in its node's registry row and shown in Studio's system view.
-Mode-transition ordering and current-tree/live verification remain open; see
-[the handoff](HANDOFF_AUTOMATIC_WIRING.md).
+with C ABI version 13, Python wrappers, test helpers, configuration policy,
+and graph lane checks. The arbiter is deleted. Envelopes carry the Driver
+Station mode generation (below), so a target from an earlier enable or mode
+never actuates. Each Target's selected source is reported in its node's
+registry row and shown in Studio's system view. The operator-interface
+`GenericTarget` remains until D4; see [the handoff](HANDOFF_AUTOMATIC_WIRING.md).
 
 The pattern is ROS's `twist_mux`: several input lanes, a priority order, a
 timeout on each lane, and the highest-priority live lane wins. Here it is
