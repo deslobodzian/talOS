@@ -253,6 +253,15 @@ Rules:
   (`UpdateWithTime`/`updateWithTime`), never `Update()`/`update()`, which read
   WPILib's own clock. **[review]**
 - No randomness in decisions. Telemetry stream ids are the one exception. **[review]**
+- **Tune offline on recorded inputs.** A node's output is a function of its
+  inputs and their times, so a new or changed node (an estimator, a vision
+  filter) is tuned against a recorded match with
+  `launcher --config <robot.toml> --replay-inputs <session dir> --only <node>`:
+  every topic it subscribes to that the session logged arrives at its recorded
+  time, its outputs go to a new log, and two runs write identical logs. A topic
+  recorded with another schema fails naming both types; topics nothing
+  recorded are listed (`talOS/launcher/README.md`). **[enforced:
+  `input_replay_test`, `replay_inputs_test`]**
 - **Restart safety.** A node can be restarted mid-match (`max_restarts`). Its
   initial state must be safe with every input present, so a state machine
   starts in its idle state and re-derives progress from observations

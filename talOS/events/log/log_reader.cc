@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <system_error>
 
@@ -22,7 +23,7 @@ std::vector<std::byte> read_whole_file(std::string_view path) {
                             "LogReader: open failed for " + std::string{path});
   }
 
-  struct stat st {};
+  struct stat st{};
   if (::fstat(fd, &st) != 0) {
     const int saved_errno = errno;
     ::close(fd);
@@ -67,8 +68,7 @@ LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
   }
 
   FileHeader header{};
-  std::memcpy(&header, data_.data(),
-              std::min(data_.size(), sizeof(header)));
+  std::memcpy(&header, data_.data(), std::min(data_.size(), sizeof(header)));
 
   if (std::memcmp(header.magic, FILE_MAGIC, sizeof(header.magic)) != 0) {
     throw std::runtime_error("LogReader: bad file magic");
@@ -221,6 +221,20 @@ bool LogReader::next(Record& out) {
   cursor_ += total;
   ++record_count_;
   return true;
+}
+
+std::vector<std::string> FindLogFiles(const std::string& path_or_dir) {
+  std::error_code ec;
+  if (!std::filesystem::is_directory(path_or_dir, ec)) return {path_or_dir};
+  std::vector<std::string> result;
+  for (const auto& entry :
+       std::filesystem::directory_iterator(path_or_dir, ec)) {
+    if (entry.path().extension() == ".tlog") {
+      result.push_back(entry.path().string());
+    }
+  }
+  std::sort(result.begin(), result.end());
+  return result;
 }
 
 }  // namespace talos::event::log

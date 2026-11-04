@@ -1,0 +1,21 @@
+// replay_inputs_test's topics.
+namespace replay_inputs_test;
+
+// /replay_source/state: one reading per tick.
+struct Reading {
+  reading_index:uint;
+  position_m:float;
+}
+
+// Reading's size and layout under another name: a reader of
+// /replay_source/state that expects it is refused.
+struct Impostor {
+  reading_index:uint;
+  distance_m:float;
+}
+
+// /replay_consumer/state: what the consumer made of every reading so far.
+struct Summary {
+  reading_count:uint;
+  total_m:float;
+}

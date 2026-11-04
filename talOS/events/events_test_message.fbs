@@ -7,6 +7,14 @@ struct SensorMessage {
     velocity_rps:float;
 }
 
+// SensorMessage's size and layout under another name and field: input replay
+// must refuse it on a topic recorded as SensorMessage.
+struct OtherSensorMessage {
+    sensor_id:int;
+    position_rot:float;
+    speed_rps:float;
+}
+
 // Operator setpoint; the robot keeps the latest one.
 struct SetpointMessage {
     setpoint_id:int;

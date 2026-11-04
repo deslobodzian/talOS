@@ -237,3 +237,9 @@ observation once (`updated`). Rules every estimator keeps:
 odometry plus cameras, with `backend = "kalman"` (wpimath
 `SwerveDrive4PoseEstimator`) or `"factor_graph"` (a GTSAM fixed-lag
 smoother), and tests that run every scenario against both.
+
+Tune or verify offline with `launcher --replay-inputs <session> --only <node>`.
+The node runs on a simulated loop fed recorded inputs from the session origin
+(monotonic t = 0), including messages missed during live startup. Two replays
+of a session yield bit-identical records; pass `--session-id <id>` if you need
+to pin the header session ID as well.

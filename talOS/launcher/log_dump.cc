@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "talOS/events/context.h"
+#include "talOS/events/log/log_reader.h"
 #include "talOS/launcher/launcher.h"
 #include "talOS/schema/decode.h"
 
@@ -32,7 +33,7 @@ int main(int argc, char** argv) {
 
   std::vector<std::string> log_files;
   for (int i = 1; i < argc; ++i) {
-    auto found = talos::launcher::FindLogFiles(argv[i]);
+    auto found = talos::event::log::FindLogFiles(argv[i]);
     log_files.insert(log_files.end(), found.begin(), found.end());
   }
 
@@ -92,9 +93,9 @@ int main(int argc, char** argv) {
     // every payload decodes without the build that recorded it.
     if (r.source != nullptr && !r.source->schema.name.empty() &&
         !r.payload.empty()) {
-      std::printf("      %s %s\n", r.source->schema.name.c_str(),
-                  talos::schema::DecodeToText(r.source->schema, r.payload)
-                      .c_str());
+      std::printf(
+          "      %s %s\n", r.source->schema.name.c_str(),
+          talos::schema::DecodeToText(r.source->schema, r.payload).c_str());
     }
   }
 

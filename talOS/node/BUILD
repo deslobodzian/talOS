@@ -28,6 +28,7 @@ cc_library(
         "//talOS/configuration",
         "//talOS/events",
         "//talOS/events:events_core",
+        "//talOS/events:input_replay",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/introspection:reporter",

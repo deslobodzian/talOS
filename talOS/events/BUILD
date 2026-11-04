@@ -116,6 +116,36 @@ cc_library(
     ],
 )
 
+# Drives a program that was not in a recorded session from that session's
+# logged topics, on a simulated loop (input_replay.h).
+cc_library(
+    name = "input_replay",
+    srcs = ["input_replay.cc"],
+    hdrs = ["input_replay.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":events",
+        ":events_core",
+        ":events_log",
+        "//talOS/schema:identity",
+    ],
+)
+
+cc_test(
+    name = "input_replay_test",
+    size = "small",
+    srcs = ["input_replay_test.cc"],
+    deps = [
+        ":events",
+        ":events_log",
+        ":events_test_message",
+        ":input_replay",
+        ":test_robot",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # A tiny robot built on the loop API, shared by the determinism tests.
 cc_library(
     name = "test_robot",

@@ -72,4 +72,9 @@ class LogReader {
   std::size_t record_count_{0};
 };
 
+// A session directory's event logs: every `*.tlog` in it (the launcher
+// writes one per node run, restarts included), sorted by path. A path that is
+// not a directory is returned as the one log it names.
+std::vector<std::string> FindLogFiles(const std::string& path_or_dir);
+
 }  // namespace talos::event::log
