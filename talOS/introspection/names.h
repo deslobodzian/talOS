@@ -239,12 +239,19 @@ inline std::optional<std::string> CheckNodeTarget(std::string_view name,
 }
 
 // One end of one topic, as its node declared it. A `--describe` and a running
-// registry are checked through the same shape.
+// registry are checked through the same shape. The schema and layout fields
+// are what a `--describe` reports (zero/empty from the registry, which does
+// not carry them): the topic's schema identity (talOS/schema/identity.h) and
+// its ring layout, which the launcher creates the segment with.
 struct SourceShape {
   event::SourceKind kind{event::SourceKind::SENDER};
   std::string name;
   std::uint32_t message_bytes{0};
   std::uint32_t flags{0};
+  std::string schema;
+  std::uint64_t schema_hash{0};
+  std::uint32_t alignment{0};
+  std::uint32_t slots{0};
 
   bool external() const { return (flags & kSourceFlagExternal) != 0; }
   bool optional() const { return (flags & kSourceFlagOptional) != 0; }
@@ -283,7 +290,8 @@ inline bool IsTargetLane(std::string_view topic) {
 // Everything checkable about a whole graph, errors first.
 //
 // Errors cannot be correct in any configuration (two writers, a reader with no
-// writer, two message sizes, a malformed name, a lane its subsystem never
+// writer, two schemas or message sizes or ring layouts on one topic, a
+// malformed name, a lane its subsystem never
 // reads). Warnings are normal during development or in a partial launch (an
 // unread topic, an owner not in this session, a policy lane nobody writes yet).
 // Timers are skipped: their names are labels, not topics. `target_sources`
@@ -310,6 +318,12 @@ inline std::vector<Diagnostic> LintGraph(
     bool exempt{false};  // Any end declared external or optional.
     std::uint32_t message_bytes{0};
     std::string first_size_from;
+    std::string schema;  // the first end's that declared one
+    std::uint64_t schema_hash{0};
+    std::string first_schema_from;
+    std::uint32_t alignment{0};
+    std::uint32_t slots{0};
+    std::string first_layout_from;
   };
   std::vector<TopicFacts> topics;  // Declaration order, for stable output.
   const auto facts = [&topics](const std::string& name) -> TopicFacts& {
@@ -382,17 +396,55 @@ inline std::vector<Diagnostic> LintGraph(
         topic.readers.push_back(node.name);
       }
 
+      // Two types on one topic: named by schema identity, which also catches
+      // two same-size types a size check cannot tell apart. A shape without
+      // a schema (a registry snapshot) falls back to its size alone.
+      bool schema_conflict = false;
+      if (!source.schema.empty()) {
+        if (topic.schema.empty()) {
+          topic.schema = source.schema;
+          topic.schema_hash = source.schema_hash;
+          topic.first_schema_from = node.name;
+        } else if (topic.schema != source.schema ||
+                   topic.schema_hash != source.schema_hash) {
+          schema_conflict = true;
+          add(Severity::ERROR, source.name,
+              "used with two schemas: " +
+                  schema::Describe(topic.schema, topic.schema_hash) + " by " +
+                  topic.first_schema_from + ", " +
+                  schema::Describe(source.schema, source.schema_hash) +
+                  " by " + node.name);
+        }
+      }
       if (source.message_bytes != 0) {
         if (topic.message_bytes == 0) {
           topic.message_bytes = source.message_bytes;
           topic.first_size_from = node.name;
-        } else if (topic.message_bytes != source.message_bytes) {
+        } else if (topic.message_bytes != source.message_bytes &&
+                   !schema_conflict) {
           add(Severity::ERROR, source.name,
               "used with two message sizes: " +
                   std::to_string(topic.message_bytes) + " bytes by " +
                   topic.first_size_from + ", " +
                   std::to_string(source.message_bytes) + " bytes by " +
                   node.name);
+        }
+      }
+      // Every end opens the segment the launcher creates with the first
+      // end's ring layout, so another layout could not attach to it.
+      if (source.slots != 0 && !schema_conflict) {
+        if (topic.slots == 0) {
+          topic.alignment = source.alignment;
+          topic.slots = source.slots;
+          topic.first_layout_from = node.name;
+        } else if (topic.slots != source.slots ||
+                   topic.alignment != source.alignment) {
+          add(Severity::ERROR, source.name,
+              "used with two ring layouts: " + std::to_string(topic.slots) +
+                  " slots aligned to " + std::to_string(topic.alignment) +
+                  " by " + topic.first_layout_from + ", " +
+                  std::to_string(source.slots) + " slots aligned to " +
+                  std::to_string(source.alignment) + " by " + node.name);
         }
       }
     }

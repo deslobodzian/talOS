@@ -40,10 +40,18 @@ class SimulatedChannel {
                 message_bytes_);
   }
 
+  // The schema of the first endpoint registered on this topic, which every
+  // later one must match, as an RTMS segment's header enforces.
+  const schema::Identity& schema() const { return schema_; }
+  void set_schema(const schema::Identity& schema) {
+    schema_ = schema::Identity{schema.name, schema.hash, {}};
+  }
+
  private:
   std::uint32_t message_bytes_;
   std::uint64_t count_{0};
   std::vector<std::byte> data_;
+  schema::Identity schema_;
 };
 
 // Topics shared between simulated loops in one test.
@@ -59,6 +67,22 @@ class SimulationEnvironment {
                                "' used with two different message sizes");
     }
     return it->second;
+  }
+
+  // The channel for an endpoint of `schema`: an endpoint of another schema
+  // is refused, naming both, like an RTMS attach.
+  SimulatedChannel& channel(std::string_view name, std::uint32_t message_bytes,
+                            const schema::Identity& schema) {
+    SimulatedChannel& found = channel(name, message_bytes);
+    if (found.schema().name.empty()) {
+      found.set_schema(schema);
+    } else if (!(found.schema() == schema)) {
+      throw RegistrationError("topic '" + std::string{name} + "' carries " +
+                              schema::Describe(found.schema()) +
+                              "; this endpoint uses " +
+                              schema::Describe(schema));
+    }
+    return found;
   }
 
  private:
@@ -130,7 +154,10 @@ class SimulatedEventLoop
 
   // Publishes onto a topic from outside any loop, as a sensor or another
   // process would.
-  template <LoopMessage Message>
+  // Harness input, like a byte topic's write: it carries no schema, so any
+  // trivially copyable message of the topic's size goes.
+  template <typename Message>
+    requires std::is_trivially_copyable_v<Message>
   std::uint64_t inject(std::string_view topic, const Message& message) {
     return environment_
         ->channel(topic, static_cast<std::uint32_t>(sizeof(Message)))
@@ -210,8 +237,8 @@ class SimulatedEventLoop
       return;
     }
 
-    SimulatedChannel& channel =
-        environment_->channel(registration.name, registration.message_bytes);
+    SimulatedChannel& channel = environment_->channel(
+        registration.name, registration.message_bytes, registration.schema);
 
     // A reader starts at the newest message: it is not entitled to history
     // published before it existed.

@@ -25,7 +25,11 @@
 
 namespace talos {
 
-// Specialized by talos_messages only; never by hand.
+// Specialized by talos_messages for every struct a schema declares, and by
+// the framework, next to the type, for its own fixed layouts:
+// hardware::Packet (talOS/hardware/packet.h) and TargetEnvelope<M>
+// (talOS/devices/target.h), named and hashed as identity.h defines, with the
+// bfbs of the struct they carry (none for a packet). Never by node code.
 template <class M>
 struct Descriptor;
 

@@ -12,21 +12,27 @@ broadcast under `/dev/rtms/<topic_name>`).
   `sizeof(Message)` x `MAX_SLOTS`.
 - `Message` must be a trivially copyable flatbuffer **struct**
   (enforced by `concepts.h`: `NotDerivedFromFlatbufferTable` plus
-  `static_assert(is_trivially_copyable)`). Tables are rejected so the
-  slot size is known at compile time.
+  `static_assert(is_trivially_copyable)`) with a schema descriptor
+  (`talos::Described<Message>`: a `talos_messages` struct, or a framework
+  layout such as `hardware::Packet` or `TargetEnvelope<M>`). Tables are
+  rejected so the slot size is known at compile time. The segment records
+  the creator's schema name and hash; an endpoint of another schema fails
+  to attach, naming both types (talOS/rtms/rtms.h).
 - Default policy is `OVERWRITE_OLDEST` with `SEQUENCE` reads: a
   subscriber that stops reading gets lapped instead of stalling the
   publisher. `Subscriber::read_next()` returns
   `Received<Message>{message, sequence, dropped}` so consumers can
   detect laps and replay deterministically; `read()` is the plain
   latest-value shortcut.
-- The publisher owns the topic layout: it passes
-  `reclaim_mismatched_segment = true`, so it clears a segment left
-  behind by an older binary. Each `Subscriber` registers one
-  shared-memory reader slot, is move-only (copying would double-release
-  the slot), and releases it on destruction.
-- Flatbuffer `.fbs` schemas live next to their users (e.g.
-  `ipc_test_message.fbs` for tests).
+- The publisher owns the topic layout outside a launcher session: it
+  passes `RTMSOptions::publisher`, so it reclaims a segment of another
+  build or schema that no live process holds. Each `Subscriber` registers
+  one shared-memory reader slot, is move-only (copying would
+  double-release the slot), and releases it on destruction; a slot whose
+  process died is reclaimed. Segment lifetime (launcher-owned, or the last
+  holder unlinks) is RTMS's: see `talOS/rtms/rtms.h`.
+- Test schemas live next to their users (e.g. `ipc_test_message.fbs`,
+  built with `talos_messages`).
 
 ## Who uses it
 

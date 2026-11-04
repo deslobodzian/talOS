@@ -74,6 +74,14 @@ inline void AppendJsonString(std::string& out, std::string_view value) {
   out += '"';
 }
 
+// "0x" and 16 lowercase hex digits: how describe writes a schema hash.
+inline std::string HexHash(std::uint64_t hash) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string out = "0x";
+  for (int shift = 60; shift >= 0; shift -= 4) out += kHex[(hash >> shift) & 0xF];
+  return out;
+}
+
 inline std::string DescribeToJson(const Description& description) {
   std::string out;
   out += "{\n  \"describe_version\": " + std::to_string(kDescribeVersion) +
@@ -94,15 +102,24 @@ inline std::string DescribeToJson(const Description& description) {
     out += source.external() ? "true" : "false";
     out += ", \"optional\": ";
     out += source.optional() ? "true" : "false";
+    if (source.kind != event::SourceKind::TIMER) {
+      // The hash as a hex string: a JSON number is a double.
+      out += ", \"schema\": ";
+      AppendJsonString(out, source.schema);
+      out += ", \"schema_hash\": \"" + HexHash(source.schema_hash) + "\"";
+      out += ", \"alignment\": " + std::to_string(source.alignment);
+      out += ", \"slots\": " + std::to_string(source.slots);
+    }
     out += "}";
   }
   out += description.sources.empty() ? "]\n}\n" : "\n  ]\n}\n";
   return out;
 }
 
-// Builds a description from a loop's manifest. Endpoint attributes are not
-// something the loop knows -- `/hw/command` looks like any other sender to it
-// -- so the node supplies them by topic name.
+// Builds a description from a loop's manifest, whose topics are rings of
+// `slots` slots. Endpoint attributes are not something the loop knows --
+// `/hw/command` looks like any other sender to it -- so the node supplies
+// them by topic name.
 struct EndpointAttribute {
   std::string_view topic;
   std::uint32_t flags{0};
@@ -110,6 +127,7 @@ struct EndpointAttribute {
 
 inline Description DescribeManifest(
     std::string name, std::string target, const event::Manifest& manifest,
+    std::uint32_t slots,
     const std::vector<EndpointAttribute>& attributes = {}) {
   Description description{std::move(name), std::move(target), {}};
   for (const auto& registration : manifest) {
@@ -117,8 +135,15 @@ inline Description DescribeManifest(
     for (const auto& attribute : attributes) {
       if (attribute.topic == registration.name) flags |= attribute.flags;
     }
-    description.sources.push_back({registration.kind, registration.name,
-                                   registration.message_bytes, flags});
+    naming::SourceShape source{registration.kind, registration.name,
+                               registration.message_bytes, flags};
+    if (registration.kind != event::SourceKind::TIMER) {
+      source.schema = registration.schema.name;
+      source.schema_hash = registration.schema.hash;
+      source.alignment = registration.alignment;
+      source.slots = slots;
+    }
+    description.sources.push_back(std::move(source));
   }
   return description;
 }
@@ -214,8 +239,7 @@ class DescribeReader {
       }
       source.message_bytes = static_cast<std::uint32_t>(Number(entry, field));
 
-      // Absent attributes mean "neither", so these are the only optional
-      // fields: a describe output from a build that predates them still reads.
+      // Absent attributes mean "neither".
       std::size_t attribute = 0;
       if (Field(entry, "external", attribute) && Boolean(entry, attribute))
         source.flags |= naming::kSourceFlagExternal;
@@ -223,7 +247,52 @@ class DescribeReader {
       if (Field(entry, "optional", attribute) && Boolean(entry, attribute))
         source.flags |= naming::kSourceFlagOptional;
 
+      // Every topic end names its schema and ring layout: the launcher
+      // creates the segment from them.
+      if (source.kind != event::SourceKind::TIMER) {
+        std::size_t at_schema = 0;
+        if (!Field(entry, "schema", at_schema) ||
+            !String(entry, at_schema, source.schema) || source.schema.empty()) {
+          error = "source '" + source.name + "' has no schema";
+          return false;
+        }
+        std::string hash;
+        std::size_t at_hash = 0;
+        if (!Field(entry, "schema_hash", at_hash) ||
+            !String(entry, at_hash, hash) || !ParseHex(hash, source.schema_hash)) {
+          error = "source '" + source.name + "' has no schema_hash";
+          return false;
+        }
+        std::size_t at_alignment = 0;
+        std::size_t at_slots = 0;
+        if (!Field(entry, "alignment", at_alignment) ||
+            !Field(entry, "slots", at_slots)) {
+          error = "source '" + source.name + "' has no ring layout";
+          return false;
+        }
+        source.alignment =
+            static_cast<std::uint32_t>(Number(entry, at_alignment));
+        source.slots = static_cast<std::uint32_t>(Number(entry, at_slots));
+      }
+
       out.sources.push_back(std::move(source));
+    }
+    return true;
+  }
+
+  // "0x" and 16 lowercase hex digits, as HexHash writes.
+  static bool ParseHex(std::string_view text, std::uint64_t& out) {
+    if (text.size() != 18 || !text.starts_with("0x")) return false;
+    out = 0;
+    for (const char c : text.substr(2)) {
+      out <<= 4;
+      if (c >= '0' && c <= '9') {
+        out |= static_cast<std::uint64_t>(c - '0');
+      } else if (c >= 'a' && c <= 'f') {
+        out |= static_cast<std::uint64_t>(c - 'a' + 10);
+      } else {
+        return false;
+      }
     }
     return true;
   }

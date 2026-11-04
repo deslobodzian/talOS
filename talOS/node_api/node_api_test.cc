@@ -33,6 +33,11 @@ struct Value {
   int64_t stamp;
 };
 
+// Value's schema identity, as a binding passes its message class's.
+constexpr TalosSchema kValueSchema{"node_api_test.Value", 0x0123456789abcdefULL,
+                                   nullptr, 0};
+constexpr TalosSchema kFloatSchema{"node_api_test.Speed", 0x5eedULL, nullptr, 0};
+
 // Relays /relay/in to /relay/out, scaled by its `gain` parameter.
 struct Relay {
   TalosNode* node = nullptr;
@@ -68,9 +73,9 @@ int32_t BuildRelay(TalosNode* node, void* user) {
     return 1;
   }
   r.gain = gain.number;
-  r.in = talos_node_subscribe(node, "/relay/in", sizeof(Value), 0,
-                              &RelayMessage, &r);
-  r.out = talos_node_publish(node, "/relay/out", sizeof(Value));
+  r.in = talos_node_subscribe(node, "/relay/in", sizeof(Value), &kValueSchema,
+                              0, &RelayMessage, &r);
+  r.out = talos_node_publish(node, "/relay/out", sizeof(Value), &kValueSchema);
   if (r.in < 0 || r.out < 0) return 1;
   return talos_node_set_update(node, &RelayUpdate, &r);
 }
@@ -113,6 +118,31 @@ TEST_F(NodeApi, NodeSubscribesPublishesAndTicks) {
   EXPECT_DOUBLE_EQ(out.x, 10.0);
   EXPECT_EQ(out.stamp, 20 * kMs);
   EXPECT_EQ(talos_sim_now_ns(sim_), 25 * kMs);
+}
+
+// A second node on /relay/out with a same-size type of another schema.
+struct Impostor {
+  int64_t in = -1;
+};
+
+int32_t BuildImpostor(TalosNode* node, void* user) {
+  constexpr TalosSchema kOther{"node_api_test.Other", 0xbadULL, nullptr, 0};
+  auto& i = *static_cast<Impostor*>(user);
+  i.in = talos_node_subscribe(node, "/relay/out", sizeof(Value), &kOther, 0,
+                              nullptr, nullptr);
+  return i.in < 0 ? 1 : 0;
+}
+
+TEST_F(NodeApi, ATopicRefusesAnEndpointOfAnotherSchemaNamingBoth) {
+  Relay relay;
+  ASSERT_NE(talos_sim_add(sim_, "relay", &BuildRelay, &relay), nullptr);
+  Impostor impostor;
+  EXPECT_EQ(talos_sim_add(sim_, "impostor", &BuildImpostor, &impostor),
+            nullptr);
+  const std::string error = talos_last_error();
+  EXPECT_NE(error.find("node_api_test.Value"), std::string::npos) << error;
+  EXPECT_NE(error.find("node_api_test.Other"), std::string::npos) << error;
+  EXPECT_EQ(talos_node_publish(nullptr, "/x/state", 8, nullptr), -1);
 }
 
 TEST_F(NodeApi, ParamsFallBackOrReportTheMissingKey) {
@@ -433,11 +463,12 @@ struct Lanes {
 
 int32_t BuildLanes(TalosNode* node, void* user) {
   auto& l = *static_cast<Lanes*>(user);
-  l.target = talos_target_open(node, sizeof(float), alignof(float));
+  l.target = talos_target_open(node, sizeof(float), alignof(float),
+                               &kFloatSchema);
   // The roller writes its own subsystem's lane only in this test; the lint,
   // not the API, refuses that in a session.
   l.lane = talos_target_lane_open(node, "roller", "teleop", sizeof(float),
-                                  alignof(float));
+                                  alignof(float), &kFloatSchema);
   return l.target < 0 || l.lane < 0 ? 1 : 0;
 }
 
@@ -499,7 +530,7 @@ TEST_F(NodeApi, TargetSelectsTheTeleopLaneAndLanesRelease) {
 
   // Wrong sizes and alignments are refused, naming the problem.
   EXPECT_EQ(talos_target_lane_send(node, lanes.lane, &speed, 8), TALOS_ERR);
-  EXPECT_EQ(talos_target_open(node, 12, 8), -1);
+  EXPECT_EQ(talos_target_open(node, 12, 8, &kFloatSchema), -1);
   EXPECT_NE(std::string{talos_last_error()}.find("alignment"),
             std::string::npos);
   EXPECT_EQ(talos_target_source_name(node, lanes.target, 5), nullptr);

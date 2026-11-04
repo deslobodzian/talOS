@@ -112,14 +112,15 @@ class Node:
                 lambda data, size, _: callback(
                     mtype.decode(ctypes.string_at(data, size))))))
         index = _abi.index(lib.talos_node_subscribe(
-            self._handle, _abi.encode(topic), mtype.size, bool(optional),
-            on_message, None))
+            self._handle, _abi.encode(topic), mtype.size,
+            _abi.schema_of(mtype), bool(optional), on_message, None))
         return Subscription(self, mtype, index)
 
     def publish(self, msg, topic):
         mtype = message_type(msg)
         index = _abi.index(lib.talos_node_publish(
-            self._handle, _abi.encode(topic), mtype.size))
+            self._handle, _abi.encode(topic), mtype.size,
+            _abi.schema_of(mtype)))
         return Publisher(self, mtype, index)
 
     def publish_bytes(self, topic, max_bytes, *, slots=1024,

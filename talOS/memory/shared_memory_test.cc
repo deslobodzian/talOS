@@ -11,9 +11,21 @@ TEST(SharedMemory, SharedMemoryPtr) {
     // one boundary that opens the segment, so the difference no longer leaks
     // into every caller.
     auto path = "/rtms/test";
+    shm_unlink(ShmObjectName(path).c_str());  // a crashed earlier run's
     {
         SharedMemoryPtr test{path, 100};
+        EXPECT_NE(test.ptr(), nullptr);
+        EXPECT_EQ(test.mode(), SharedMemoryMode::CREATE);
+        // A second mapping of the same name attaches to it.
+        SharedMemoryPtr again{path, 100};
+        EXPECT_EQ(again.mode(), SharedMemoryMode::ATTACH);
     }
+    // A mapping never unlinks its name: the segment outlives both mappings
+    // until its owner (RTMS's lifetime rules) removes it.
+    const int fd = shm_open(ShmObjectName(path).c_str(), O_RDWR, 0666);
+    EXPECT_NE(fd, -1);
+    if (fd != -1) close(fd);
+    shm_unlink(ShmObjectName(path).c_str());
 }
 
 // Every talOS topic has two or three segments, so this mapping is on the path

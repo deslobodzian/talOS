@@ -11,15 +11,17 @@
 #include "talOS/events/event_loop_base.h"
 #include "talOS/events/time.h"
 #include "talOS/ipc/concepts.h"
+#include "talOS/schema/identity.h"
 
 namespace talos::event {
 
-// Messages crossing a loop boundary are fixed-size flatbuffer structs. Tables
-// have no compile-time size, so a slot could not hold them and replay could
-// not compare them byte for byte.
+// Messages crossing a loop boundary are fixed-size flatbuffer structs with a
+// schema descriptor. Tables have no compile-time size, so a slot could not
+// hold them and replay could not compare them byte for byte.
 template <typename Message>
 concept LoopMessage = std::is_trivially_copyable_v<Message> &&
-                      ipc::NotDerivedFromFlatbufferTable<Message>;
+                      ipc::NotDerivedFromFlatbufferTable<Message> &&
+                      Described<Message>;
 
 // Adapts a byte payload to a typed handler.
 //
@@ -100,6 +102,7 @@ std::uint16_t watch(Loop& loop, std::string_view topic, Class* instance) {
   return loop.register_watcher(topic,
                                static_cast<std::uint32_t>(sizeof(Message)),
                                static_cast<std::uint32_t>(alignof(Message)),
+                               schema::Of<Message>(),
                                make_message_thunk<Message, Method>(instance));
 }
 
@@ -108,7 +111,8 @@ Sender<Loop, Message> make_sender(Loop& loop, std::string_view topic) {
   return Sender<Loop, Message>{
       &loop,
       loop.register_sender(topic, static_cast<std::uint32_t>(sizeof(Message)),
-                           static_cast<std::uint32_t>(alignof(Message)))};
+                           static_cast<std::uint32_t>(alignof(Message)),
+                           schema::Of<Message>())};
 }
 
 }  // namespace talos::event

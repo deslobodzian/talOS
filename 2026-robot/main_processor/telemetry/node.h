@@ -45,19 +45,6 @@
 // vector are members reused every tick.
 namespace talos::telemetry {
 
-// Wire-compatible with the State struct of any single-demand mechanism
-// scaffolded by tools/new_subsystem.py (enabled:bool + 7 pad + value:double +
-// connected:bool + 7 pad).
-struct alignas(8) GenericState {
-  std::uint8_t enabled{0};
-  std::uint8_t pad[7]{};
-  double value{0.0};
-  std::uint8_t connected{0};
-  std::uint8_t pad2[7]{};
-};
-static_assert(sizeof(GenericState) == 24);
-static_assert(talos::Message<GenericState>);
-
 // One dictionary entry, in wire order.
 struct ChannelDef {
   std::string name;
@@ -161,13 +148,7 @@ class Telemetry {
                          std::isfinite(yaw_rad);
     const bool shooter_ok = Fresh(shooter_);
     const bool intake_ok = Fresh(intake_);
-    bool extra_ok = false;
-    bool extra_has_value = false;
-    for (const auto& mech : extra_mechanisms_) {
-      if (mech.state.has_value()) extra_has_value = true;
-      if (Fresh(mech.state)) extra_ok = true;
-    }
-    const bool mech_ok = shooter_ok || intake_ok || extra_ok;
+    const bool mech_ok = shooter_ok || intake_ok;
     // A live mechanism is worth showing before (and without) any pose; the
     // drivetrain and driver station alone carry neither, so they never
     // trigger a frame on their own.
@@ -189,7 +170,7 @@ class Telemetry {
     if (drivetrain_.has_value())
       set(idx_drivetrain_stale_, Fresh(drivetrain_) ? 0.0 : 1.0);
     set(idx_ds_stale_, ds_.connected() ? 0.0 : 1.0);
-    if (shooter_.has_value() || intake_.has_value() || extra_has_value)
+    if (shooter_.has_value() || intake_.has_value())
       set(idx_mechanism_stale_, mech_ok ? 0.0 : 1.0);
 
     if (odom_ok) {
@@ -211,16 +192,6 @@ class Telemetry {
         set(idx_intake_inhibit_, static_cast<double>(intake_->inhibit()));
       }
       set(idx_intake_stale_, intake_ok ? 0.0 : 1.0);
-    }
-    for (const auto& mech : extra_mechanisms_) {
-      if (mech.state.has_value()) {
-        const bool ok = Fresh(mech.state);
-        if (ok) {
-          set(mech.value_index, mech.state->value);
-          set(mech.connected_index, mech.state->connected != 0 ? 1.0 : 0.0);
-        }
-        set(mech.stale_index, ok ? 0.0 : 1.0);
-      }
     }
     if (Fresh(drivetrain_)) {
       set(idx_drivetrain_vx_, drivetrain_->vx_mps());
@@ -345,36 +316,6 @@ class Telemetry {
         AddChannel("intake/inhibit", "", std::move(inhibit_labels));
     idx_intake_stale_ = AddChannel("intake/stale");
 
-    // TOML-configured extra mechanisms (telemetry = true subsystems).
-    if (!node.config_path().empty()) {
-      const auto cfg = config::ParseRobotConfig(node.config_path());
-      if (const auto* subs = cfg.toml_data["subsystems"].as_table()) {
-        for (const auto& [key, val] : *subs) {
-          const std::string_view sub_name = key.str();
-          if (sub_name == "odometry" || sub_name == "drivetrain" ||
-              sub_name == "shooter" || sub_name == "intake" ||
-              sub_name == "telemetry") {
-            continue;
-          }
-          const auto* tbl = val.as_table();
-          if (tbl == nullptr) continue;
-          const bool enabled = (*tbl)["telemetry"].value_or(false);
-          const auto unit_opt =
-              (*tbl)["telemetry_unit"].value<std::string_view>();
-          if (!enabled && !unit_opt.has_value()) continue;
-          const std::string name{sub_name};
-          const std::string unit{unit_opt.value_or("rev/s")};
-          ExtraMechanism mech;
-          mech.state = node.subscribe<GenericState>("/" + name + "/state",
-                                                    {.optional = true});
-          mech.value_index = AddChannel(name + "/value", unit);
-          mech.connected_index = AddChannel(name + "/connected");
-          mech.stale_index = AddChannel(name + "/stale");
-          extra_mechanisms_.push_back(std::move(mech));
-        }
-      }
-    }
-
     idx_drivetrain_vx_ = AddChannel("drivetrain/vx", "m/s");
     idx_drivetrain_vy_ = AddChannel("drivetrain/vy", "m/s");
     idx_drivetrain_omega_ = AddChannel("drivetrain/omega", "rad/s");
@@ -406,13 +347,6 @@ class Telemetry {
   Subscription<::intake::IntakeState> intake_;
   Subscription<::bridge::BridgeStatus> bridge_;
   talos::DriverStation ds_;
-  struct ExtraMechanism {
-    Subscription<GenericState> state;
-    std::size_t value_index{0};
-    std::size_t connected_index{0};
-    std::size_t stale_index{0};
-  };
-  std::vector<ExtraMechanism> extra_mechanisms_;
   BytePublisher studio_;
   std::vector<ChannelDef> dictionary_;
   std::uint32_t dictionary_id_{0};

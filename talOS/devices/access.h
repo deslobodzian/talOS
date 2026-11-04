@@ -13,6 +13,7 @@
 
 #include "talOS/events/time.h"
 #include "talOS/hardware/messages.h"
+#include "talOS/schema/identity.h"
 
 namespace talos {
 class DriverStation;
@@ -85,9 +86,11 @@ struct DriverStationAccess {
 // the same code. Indexes address this node's targets and lanes.
 struct TargetAccess {
   // Subscribes to every lane of the node's policy and the Driver Station.
-  // `bytes` and `alignment` are the message's (sizeof, alignof).
+  // `bytes` and `alignment` are the message's (sizeof, alignof) and
+  // `message` its schema: the lanes carry schema::Envelope(message).
   static std::size_t open_target(Node& node, std::size_t bytes,
-                                 std::size_t alignment);
+                                 std::size_t alignment,
+                                 const schema::Identity& message);
   // The selected message (`bytes` long), or null; `source` is the selected
   // source's index in target_sources, or -1.
   static const void* target_get(Node& node, std::size_t target,
@@ -101,7 +104,8 @@ struct TargetAccess {
   // Subscribes to the Driver Station, whose generation lane_send stamps.
   static std::size_t open_lane(Node& node, std::string_view subsystem,
                                std::string_view source, std::size_t bytes,
-                               std::size_t alignment);
+                               std::size_t alignment,
+                               const schema::Identity& message);
   static bool lane_send(Node& node, std::size_t lane, const void* message,
                         std::size_t bytes);
   static bool lane_release(Node& node, std::size_t lane);

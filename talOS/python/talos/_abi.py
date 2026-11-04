@@ -7,7 +7,7 @@ raise, with the C++ message, or with the Python exception a callback raised.
 import ctypes
 import os
 
-ABI_VERSION = 13
+ABI_VERSION = 14
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -71,6 +71,18 @@ class DriverStationPacket(ctypes.Structure):
                 ("joysticks", Joystick * DS_MAX_JOYSTICKS)]
 
 
+class Schema(ctypes.Structure):
+    """TalosSchema: a message class's TALOS_SCHEMA_NAME/HASH/BFBS."""
+    _fields_ = [("name", c_char_p), ("hash", c_uint64), ("bfbs", c_char_p),
+                ("bfbs_size", c_uint32)]
+
+
+def schema_of(mtype):
+    """The TalosSchema of a talos._messages.MessageType."""
+    bfbs = mtype.cls.TALOS_SCHEMA_BFBS
+    return Schema(mtype.schema_name.encode(), mtype.schema_hash, bfbs,
+                  len(bfbs))
+
 _P = ctypes.POINTER
 _SIGNATURES = {
     "talos_abi_version": (c_uint32, []),
@@ -86,9 +98,11 @@ _SIGNATURES = {
     "talos_node_config_path": (c_char_p, [c_void_p]),
     "talos_node_param": (c_int32, [c_void_p, c_char_p, c_int32, c_int32,
                                    _P(Param)]),
-    "talos_node_subscribe": (c_int64, [c_void_p, c_char_p, c_uint32, c_int32,
-                                       MESSAGE_CALLBACK, c_void_p]),
-    "talos_node_publish": (c_int64, [c_void_p, c_char_p, c_uint32]),
+    "talos_node_subscribe": (c_int64, [c_void_p, c_char_p, c_uint32,
+                                       _P(Schema), c_int32, MESSAGE_CALLBACK,
+                                       c_void_p]),
+    "talos_node_publish": (c_int64, [c_void_p, c_char_p, c_uint32,
+                                     _P(Schema)]),
     "talos_node_publish_bytes": (c_int64, [c_void_p, c_char_p, c_uint32,
                                            c_uint32, c_int32, c_int32]),
     "talos_node_every": (c_int32, [c_void_p, c_int64, CALLBACK, c_void_p]),
@@ -120,12 +134,13 @@ _SIGNATURES = {
     "talos_encoder_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
     "talos_driver_station": (c_int32, [c_void_p, CALLBACK, c_void_p]),
     "talos_driver_station_read": (c_int32, [c_void_p, _P(DriverStation)]),
-    "talos_target_open": (c_int64, [c_void_p, c_uint32, c_uint32]),
+    "talos_target_open": (c_int64, [c_void_p, c_uint32, c_uint32,
+                                    _P(Schema)]),
     "talos_target_get": (c_int32, [c_void_p, c_int64, c_void_p,
                                    _P(c_int32)]),
     "talos_target_source_name": (c_char_p, [c_void_p, c_int64, c_int32]),
     "talos_target_lane_open": (c_int64, [c_void_p, c_char_p, c_char_p,
-                                         c_uint32, c_uint32]),
+                                         c_uint32, c_uint32, _P(Schema)]),
     "talos_target_lane_send": (c_int32, [c_void_p, c_int64, c_char_p,
                                          c_uint32]),
     "talos_target_lane_release": (c_int32, [c_void_p, c_int64]),

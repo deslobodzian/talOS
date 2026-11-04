@@ -7,7 +7,10 @@ cc_library(
     name = "loop_port",
     hdrs = ["internal.h"],
     visibility = ["//visibility:private"],
-    deps = ["//talOS/events:events_core"],
+    deps = [
+        "//talOS/events:events_core",
+        "//talOS/schema:identity",
+    ],
 )
 
 # The node authoring API: talos::Node, Subscription, Publisher, StateMachine,
@@ -31,6 +34,7 @@ cc_library(
         "//talOS/ipc",
         "//talOS/process",
         "//talOS/rtms",
+        "//talOS/schema:identity",
     ],
 )
 

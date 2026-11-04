@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,6 +29,9 @@ using namespace std::chrono_literals;
 std::string temp_registry(std::string_view tag) {
   return "/tr_" + std::string{tag} + "_" + std::to_string(::getpid());
 }
+
+// The schema the raw 8-byte test topics register under.
+const schema::Identity kCountSchema{"registry_test.Count", 0xc0};
 
 class Registry : public ::testing::Test {
  protected:
@@ -290,8 +294,8 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
 
   auto timer =
       event::make_timer<&Handler::OnTick>(loop, "introspect_tick", &handler);
-  const std::uint16_t sender =
-      loop.register_sender(topic, /*message_bytes=*/8, /*alignment=*/8);
+  const std::uint16_t sender = loop.register_sender(
+      topic, /*message_bytes=*/8, /*alignment=*/8, kCountSchema);
   const std::size_t sources_before = loop.manifest().size();
   // What the node's Target last selected: index 1, "auto".
   std::atomic<std::int32_t> selected{1};
@@ -369,14 +373,19 @@ TEST_F(Registry, LoopCountsPublishesAndTimerDispatchesPerSource) {
   event::RealtimeEventLoop<> loop;
 
   struct Publisher {
-    event::Sender<event::RealtimeEventLoop<>, std::uint64_t> sender;
+    event::RealtimeEventLoop<>* loop{nullptr};
+    std::uint16_t sender{0};
     std::uint64_t sent{0};
     void OnTick(const event::Context&) {
-      if (sender.send(sent)) ++sent;
+      if (loop->send_message(sender, std::as_bytes(std::span{&sent, 1}))) {
+        ++sent;
+      }
     }
   } publisher;
 
-  publisher.sender = event::make_sender<std::uint64_t>(loop, topic);
+  publisher.loop = &loop;
+  publisher.sender = loop.register_sender(topic, sizeof(std::uint64_t),
+                                          alignof(std::uint64_t), kCountSchema);
   auto timer = event::make_timer<&Publisher::OnTick>(loop, "pub", &publisher);
   timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
   loop.run_for(120ms);

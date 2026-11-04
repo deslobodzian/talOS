@@ -55,6 +55,7 @@ struct Node::Impl {
   struct BytePublisherSlot {
     std::string topic;
     std::size_t max_bytes;
+    std::size_t slots;
     bool external;
     std::unique_ptr<detail::ByteTopic> sink;
     // Read by the registry's thread.
@@ -478,7 +479,9 @@ void CheckLayout(const std::string& node, std::string_view topic,
 
 std::size_t NodeAccess::add_subscription(Node& node, std::string_view topic,
                                          std::size_t bytes,
-                                         std::size_t alignment, bool optional,
+                                         std::size_t alignment,
+                                         const schema::Identity& schema,
+                                         bool optional,
                                          MessageCallback on_message) {
   Node::Impl& impl = *node.impl_;
   std::string resolved = impl.ResolveTopic(topic);
@@ -490,7 +493,7 @@ std::size_t NodeAccess::add_subscription(Node& node, std::string_view topic,
   slot->optional = optional;
   slot->on_message = std::move(on_message);
   impl.loop->register_watcher(slot->topic, static_cast<std::uint32_t>(bytes),
-                              static_cast<std::uint32_t>(alignment),
+                              static_cast<std::uint32_t>(alignment), schema,
                               event::Thunk{slot.get(), &Node::Impl::OnMessage});
   impl.subscriptions.push_back(std::move(slot));
   return impl.subscriptions.size() - 1;
@@ -522,14 +525,14 @@ bool NodeAccess::subscription_updated(const Node& node, std::size_t index) {
 }
 
 std::size_t NodeAccess::add_publisher(Node& node, std::string_view topic,
-                                      std::size_t bytes,
-                                      std::size_t alignment) {
+                                      std::size_t bytes, std::size_t alignment,
+                                      const schema::Identity& schema) {
   Node::Impl& impl = *node.impl_;
   const std::string resolved = impl.ResolveTopic(topic);
   CheckLayout(impl.name, resolved, bytes, alignment);
-  const std::uint16_t id =
-      impl.loop->register_sender(resolved, static_cast<std::uint32_t>(bytes),
-                                 static_cast<std::uint32_t>(alignment));
+  const std::uint16_t id = impl.loop->register_sender(
+      resolved, static_cast<std::uint32_t>(bytes),
+      static_cast<std::uint32_t>(alignment), schema);
   impl.publishers.push_back({id, bytes});
   return impl.publishers.size() - 1;
 }
@@ -556,8 +559,8 @@ bool NodeAccess::publisher_send(Node& node, std::size_t index, const void* data,
 
 namespace {
 
-// A byte topic on RTMS. This node is its only producer and owns its layout,
-// so it reclaims a stale segment left by an older build.
+// A byte topic on RTMS (schema talos.Bytes). This node is its only producer
+// and owns its layout, so it reclaims a stale segment no live process holds.
 class SharedByteTopic final : public ByteTopic {
  public:
   SharedByteTopic(std::string_view topic, std::size_t max_bytes,
@@ -570,10 +573,11 @@ class SharedByteTopic final : public ByteTopic {
 
   bool write(std::span<const std::byte> message) override {
     if (!queue_) {
-      queue_.emplace(topic_, max_bytes_, kMessageAlignment, slots_,
+      queue_.emplace(topic_, max_bytes_, kMessageAlignment, schema::Bytes(),
+                     slots_,
                      RTMSOptions{.overflow_policy = policy_,
                                  .read_mode = ReadMode::SEQUENCE,
-                                 .reclaim_mismatched_segment = true});
+                                 .publisher = true});
     }
     return queue_->write(message) == WriteResult::SUCCESS;
   }
@@ -610,6 +614,7 @@ std::size_t NodeAccess::add_byte_publisher(Node& node, std::string_view topic,
   auto slot = std::make_unique<Node::Impl::BytePublisherSlot>();
   slot->topic = std::move(resolved);
   slot->max_bytes = max_bytes;
+  slot->slots = options.slots;
   slot->external = options.external;
   slot->sink = impl.loop->open_byte_topic(slot->topic, max_bytes, options);
   impl.byte_publishers.push_back(std::move(slot));
@@ -631,7 +636,7 @@ std::vector<NodeAccess::ByteTopicShape> NodeAccess::byte_topics(
     const Node& node) {
   std::vector<ByteTopicShape> topics;
   for (const auto& slot : node.impl_->byte_publishers) {
-    topics.push_back({slot->topic, slot->max_bytes, slot->external});
+    topics.push_back({slot->topic, slot->max_bytes, slot->slots, slot->external});
   }
   return topics;
 }
@@ -826,12 +831,19 @@ int RunMain(int argc, char** argv, const char* node_name,
       event::SimulatedEventLoop<> loop{environment};
       const Hosted hosted = Host(loop, node_name, flags, make);
       auto description = introspect::DescribeManifest(
-          node_name, node_target, loop.manifest(), Endpoints(*hosted.node));
+          node_name, node_target, loop.manifest(),
+          static_cast<std::uint32_t>(event::RealtimeEventLoop<>::Options{}.slots),
+          Endpoints(*hosted.node));
+      const schema::Identity bytes = schema::Bytes();
       for (const auto& topic : NodeAccess::byte_topics(*hosted.node)) {
-        description.sources.push_back(
-            {event::SourceKind::SENDER, std::string{topic.topic},
-             static_cast<std::uint32_t>(topic.max_bytes),
-             ByteTopicFlags(topic)});
+        introspect::naming::SourceShape source{
+            event::SourceKind::SENDER, std::string{topic.topic},
+            static_cast<std::uint32_t>(topic.max_bytes), ByteTopicFlags(topic)};
+        source.schema = bytes.name;
+        source.schema_hash = bytes.hash;
+        source.alignment = static_cast<std::uint32_t>(kMessageAlignment);
+        source.slots = static_cast<std::uint32_t>(topic.slots);
+        description.sources.push_back(std::move(source));
       }
       std::printf("%s", introspect::DescribeToJson(description).c_str());
       return 0;

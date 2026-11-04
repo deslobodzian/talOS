@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "talOS/events/events_test_message_generated.h"
+#include "events_test/events_test_message_generated.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/replay_event_loop.h"
@@ -422,10 +422,13 @@ TEST(Replay, ReplaysTheCompletePrefixOfATruncatedLog) {
 }
 
 // Mostly trailing zeros, like a hardware packet: the log stores only the
-// leading bytes of each one.
+// leading bytes of each one. A framework-style byte layout, so it carries a
+// hand-made identity rather than a generated descriptor.
 struct Padded {
   std::array<std::byte, 256> bytes{};
 };
+
+const talos::schema::Identity kPaddedSchema{"replay_test.Padded", 0x9add};
 
 // Echoes every message it receives, with `mark` in the last byte.
 template <typename Loop>
@@ -437,9 +440,9 @@ struct PaddedEcho {
 
   explicit PaddedEcho(Loop& event_loop) : loop{event_loop} {
     loop.register_watcher("/replay/padded_in", sizeof(Padded), alignof(Padded),
-                          make_thunk<&PaddedEcho::echo>(this));
+                          kPaddedSchema, make_thunk<&PaddedEcho::echo>(this));
     sender = loop.register_sender("/replay/padded_out", sizeof(Padded),
-                                  alignof(Padded));
+                                  alignof(Padded), kPaddedSchema);
   }
 
   void echo(const Context&, std::span<const std::byte> payload) {

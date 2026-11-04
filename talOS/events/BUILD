@@ -1,6 +1,6 @@
-load("@flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//talOS/build:contract.bzl", "talos_messages")
 
 # Types shared by every loop: time, dispatch context, callbacks, the source
 # manifest, the timer queue, the recorder policy and the delivery policy.
@@ -17,6 +17,7 @@ cc_library(
         "time.h",
     ],
     visibility = ["//visibility:public"],
+    deps = ["//talOS/schema:identity"],
 )
 
 cc_test(
@@ -85,9 +86,13 @@ cc_test(
     ],
 )
 
-flatbuffer_cc_library(
+# Loop messages carry a schema descriptor, so the test messages come from
+# talos_messages like every node's.
+talos_messages(
     name = "events_test_message",
     srcs = ["events_test_message.fbs"],
+    include_prefix = "events_test",
+    visibility = ["//visibility:private"],
 )
 
 # The loops themselves.

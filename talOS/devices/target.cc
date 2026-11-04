@@ -116,8 +116,10 @@ TargetEnvelopeHeader DecodeTargetEnvelopeHeader(const std::byte* envelope) {
 }
 
 std::size_t TargetAccess::open_target(Node& node, std::size_t bytes,
-                                      std::size_t alignment) {
+                                      std::size_t alignment,
+                                      const schema::Identity& message) {
   const std::size_t envelope = TargetEnvelopeBytes(bytes, alignment);
+  const schema::Identity lane = schema::Envelope(message);
   // Attaches the hardware link (robot_enabled) and the Driver Station in the
   // constructor, where registration belongs.
   const config::TargetPolicy& policy =
@@ -131,7 +133,7 @@ std::size_t TargetAccess::open_target(Node& node, std::size_t bytes,
     // no producer is normal (the graph lint warns), and no callback keeps
     // the node draining right before its timer.
     state.subscriptions.push_back(NodeAccess::add_subscription(
-        node, "target/" + source, envelope, kMessageAlignment,
+        node, "target/" + source, envelope, kMessageAlignment, lane,
         /*optional=*/true, {}));
   }
   const auto indexes = [&state](const std::vector<std::string>& mode) {
@@ -207,7 +209,8 @@ std::size_t TargetAccess::target_bytes(Node& node, std::size_t target) {
 
 std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
                                     std::string_view source, std::size_t bytes,
-                                    std::size_t alignment) {
+                                    std::size_t alignment,
+                                    const schema::Identity& message) {
   const std::size_t envelope = TargetEnvelopeBytes(bytes, alignment);
   for (const auto& [segment, what] :
        {std::pair{subsystem, "target lane subsystem"},
@@ -220,8 +223,9 @@ std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
       "/" + std::string{subsystem} + "/target/" + std::string{source};
   auto& lanes = node.extension<Targets>().lanes;
   lanes.push_back(LaneState{
-      .publisher =
-          NodeAccess::add_publisher(node, topic, envelope, kMessageAlignment),
+      .publisher = NodeAccess::add_publisher(node, topic, envelope,
+                                             kMessageAlignment,
+                                             schema::Envelope(message)),
       .bytes = bytes,
       .alignment = alignment,
       // Subscribed here, so the producer drains the Driver Station right

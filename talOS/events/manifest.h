@@ -6,6 +6,8 @@
 #include <string_view>
 #include <vector>
 
+#include "talOS/schema/identity.h"
+
 namespace talos::event {
 
 // Maximum characters in a source name (topic path or timer label). Fixed so
@@ -45,6 +47,9 @@ struct Registration {
   std::int64_t period_ns{0};
   std::int64_t offset_ns{0};
   bool armed{false};  // offset_ns is the initial absolute monotonic deadline.
+  // The topic's schema (talOS/schema/identity.h); empty for a timer. Its
+  // name and hash take part in ==, its bfbs bytes do not.
+  schema::Identity schema;
 
   bool operator==(const Registration&) const = default;
 };
@@ -68,11 +73,15 @@ inline std::optional<std::string> compare_manifests(const Manifest& recorded,
     }
 
     const auto describe = [](const Registration& r) {
-      return std::string{to_string(r.kind)} + " '" + r.name + "' (" +
-             std::to_string(r.message_bytes) + " bytes, period " +
-             std::to_string(r.period_ns) + "ns, deadline " +
-             std::to_string(r.offset_ns) + "ns, armed " +
-             (r.armed ? "true" : "false") + ")";
+      std::string text = std::string{to_string(r.kind)} + " '" + r.name +
+                         "' (" + std::to_string(r.message_bytes) +
+                         " bytes, period " + std::to_string(r.period_ns) +
+                         "ns, deadline " + std::to_string(r.offset_ns) +
+                         "ns, armed " + (r.armed ? "true" : "false");
+      if (r.kind != SourceKind::TIMER) {
+        text += ", schema " + schema::Describe(r.schema);
+      }
+      return text + ")";
     };
 
     return "source " + std::to_string(i) + " differs: log has " +

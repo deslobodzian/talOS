@@ -112,7 +112,9 @@ _talos_bfbs = rule(
 
 def _talos_cc_descriptors_impl(ctx):
     # <stem>_descriptor.h beside flatc's <stem>_generated.h, so both include
-    # as "<prefix>/<stem>_...h" through the talos_messages cc_library.
+    # as "<prefix>/<stem>_...h" through the talos_messages cc_library; flatc
+    # writes `#include "<prefix>/<stem>_descriptor.h"` into every generated
+    # header (--cpp-include), so a struct's user always sees Descriptor<M>.
     headers = []
     for schema in ctx.attr.bfbs[_TalosBfbsInfo].schemas:
         out = ctx.actions.declare_file(schema.stem + "_descriptor.h")
@@ -125,7 +127,6 @@ def _talos_cc_descriptors_impl(ctx):
                 schema.bfbs.path,
                 schema.file,
                 out.path,
-                "%s/%s_generated.h" % (ctx.attr.include_prefix, schema.stem),
                 ctx.attr.messages_label,
             ],
             mnemonic = "TalosDescriptorCc",
@@ -138,7 +139,6 @@ _talos_cc_descriptors = rule(
     implementation = _talos_cc_descriptors_impl,
     attrs = {
         "bfbs": attr.label(mandatory = True, providers = [_TalosBfbsInfo]),
-        "include_prefix": attr.string(mandatory = True),
         "messages_label": attr.string(mandatory = True),
         "_gen": attr.label(default = _DESCRIPTOR_GEN, executable = True, cfg = "exec"),
     },
@@ -340,8 +340,15 @@ def talos_messages(
     # --no-includes suppresses #include of dep schemas; drop it once this
     # package has deps, and keep each include's prefix so the generated
     # #include names the dep's include prefix (resolved through its cc_library).
-    # Packages without deps keep the old flags, so their generated headers are
-    # byte-identical.
+    # Every generated header includes the package's descriptor headers, which
+    # only forward-declare the structs they describe.
+    descriptor_includes = [
+        "--cpp-include %s/%s_descriptor.h" % (
+            include_prefix,
+            src.split("/")[-1].split(":")[-1].removesuffix(".fbs"),
+        )
+        for src in srcs
+    ]
     flatc_args = [
         "--gen-object-api",
         "--gen-compare",
@@ -350,7 +357,7 @@ def talos_messages(
         "--cpp-ptr-type flatbuffers::unique_ptr",
         "--scoped-enums",
         "--keep-prefix",
-    ]
+    ] + descriptor_includes
     if not deps:
         flatc_args = [
             "--gen-object-api",
@@ -360,7 +367,7 @@ def talos_messages(
             "--reflect-names",
             "--cpp-ptr-type flatbuffers::unique_ptr",
             "--scoped-enums",
-        ]
+        ] + descriptor_includes
     flatbuffer_cc_library(
         name = fbs_name,
         srcs = srcs,
@@ -383,7 +390,6 @@ def talos_messages(
     _talos_cc_descriptors(
         name = name + "_descriptors",
         bfbs = ":" + bfbs_name,
-        include_prefix = include_prefix,
         messages_label = label,
         visibility = ["//visibility:private"],
     )

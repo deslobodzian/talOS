@@ -2,20 +2,20 @@ namespace EventsTest;
 
 // Sensor reading published into the loop under test.
 struct SensorMessage {
-    id:int;
-    position:float;
-    velocity:float;
+    sensor_id:int;
+    position_rot:float;
+    velocity_rps:float;
 }
 
 // Operator setpoint; the robot keeps the latest one.
 struct SetpointMessage {
-    id:int;
-    target:float;
+    setpoint_id:int;
+    target_rot:float;
 }
 
 // What the control loop produces. Replay compares these byte for byte.
 struct CommandMessage {
-    id:int;
-    effort:float;
-    cycle:ulong;
+    command_id:int;
+    effort_v:float;
+    cycle_count:ulong;
 }

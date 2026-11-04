@@ -18,6 +18,8 @@
 #include <variant>
 #include <vector>
 
+#include "talOS/schema/identity.h"
+
 namespace talos {
 class Node;
 struct BytePublishOptions;
@@ -98,8 +100,11 @@ struct NodeAccess {
   [[noreturn]] static void param_error(const Node& node, std::string_view key,
                                        std::string_view problem);
 
+  // `schema` is the topic's identity (talOS/schema/identity.h): what the
+  // segment checks at attach, describe reports and the log records.
   static std::size_t add_subscription(Node& node, std::string_view topic,
                                       std::size_t bytes, std::size_t alignment,
+                                      const schema::Identity& schema,
                                       bool optional,
                                       MessageCallback on_message);
   static const void* subscription_value(const Node& node, std::size_t index);
@@ -111,7 +116,8 @@ struct NodeAccess {
   static bool subscription_updated(const Node& node, std::size_t index);
 
   static std::size_t add_publisher(Node& node, std::string_view topic,
-                                   std::size_t bytes, std::size_t alignment);
+                                   std::size_t bytes, std::size_t alignment,
+                                   const schema::Identity& schema);
   static bool publisher_send(Node& node, std::size_t index, const void* data,
                              std::size_t bytes);
 
@@ -121,10 +127,12 @@ struct NodeAccess {
   static bool byte_publisher_send(Node& node, std::size_t index,
                                   std::span<const std::byte> message);
   // Byte topics in registration order, for describe and the registry: they
-  // bypass the loop, so its manifest does not list them.
+  // bypass the loop, so its manifest does not list them. Their schema is
+  // schema::Bytes().
   struct ByteTopicShape {
     std::string_view topic;
     std::size_t max_bytes;
+    std::size_t slots;
     bool external;
   };
   static std::vector<ByteTopicShape> byte_topics(const Node& node);

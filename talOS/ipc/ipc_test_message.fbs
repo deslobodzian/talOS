@@ -1,6 +1,6 @@
 namespace IPCMessage;
 
 struct TestMessage {
-    id:int;
-    value:float;
+    message_id:int;
+    value_frac:float;
 }

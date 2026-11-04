@@ -5,7 +5,7 @@
 #include <vector>
 
 #include "talOS/events/context.h"
-#include "talOS/events/events_test_message_generated.h"
+#include "events_test/events_test_message_generated.h"
 #include "talOS/events/handles.h"
 #include "talOS/events/time.h"
 
@@ -54,15 +54,15 @@ class TestRobot {
  private:
   void on_sensor(const Context& context,
                  const EventsTest::SensorMessage& message) {
-    position_ = message.position();
-    velocity_ = message.velocity();
-    last_sensor_id_ = message.id();
+    position_ = message.position_rot();
+    velocity_ = message.velocity_rps();
+    last_sensor_id_ = message.sensor_id();
     dropped_sensors_ += context.dropped;
     ++sensor_count_;
   }
 
   void on_setpoint(const Context&, const EventsTest::SetpointMessage& message) {
-    target_ = message.target();
+    target_ = message.target_rot();
   }
 
   void on_control(const Context& context) {

@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "talOS/protocol/frame.h"
+#include "talOS/schema/identity.h"
 
 namespace talos::hardware {
 // Fixed-size local IPC envelope containing canonical hardware wire bytes.
@@ -48,3 +49,13 @@ inline std::string RequestTopic(std::string_view subsystem) {
   return std::string{kRequestTopicPrefix} + std::string{subsystem};
 }
 }  // namespace talos::hardware
+
+// The packet topics' schema identity (talOS/schema/identity.h): a framework
+// layout with no FlatBuffers schema, so log_dump shows its bytes.
+template <>
+struct talos::Descriptor<talos::hardware::Packet> {
+  static constexpr std::string_view kName = schema::kPacketName;
+  static constexpr std::uint64_t kHash =
+      schema::PacketHash(sizeof(hardware::Packet));
+  static constexpr std::span<const std::uint8_t> kBfbs{};
+};

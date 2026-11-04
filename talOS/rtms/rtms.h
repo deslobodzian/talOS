@@ -15,6 +15,7 @@
 #include <span>
 
 #include "talOS/memory/shared_memory_ptr.h"
+#include "talOS/schema/identity.h"
 
 inline constexpr size_t CACHE_LINE = 64;  // C++ I think as a function for this.
 inline constexpr size_t MAX_SLOTS = 1u << 10;  // 1024 slots maximum
@@ -30,6 +31,10 @@ static inline bool is_pow_2(std::size_t n) {
   return (n > 0) && (n & (n - 1)) == 0;
 }
 
+// A reader slot's state word holds the state in its low two bits and the
+// pid of the process that claimed it above them, so a slot whose process
+// died -- killed mid-read, or exited without releasing -- can be recognised
+// and freed (see RTMSQueue::reclaim_dead_readers). FREE is the word 0.
 enum class ReaderState : std::uint64_t { FREE, CLAIMING, ACTIVE };
 
 enum class WriteResult {
@@ -86,25 +91,51 @@ struct RTMSOptions {
   OverflowPolicy overflow_policy{OverflowPolicy::OVERWRITE_OLDEST};
   ReadMode read_mode{ReadMode::LATEST};
 
-  // Set by the publisher, which owns a topic's layout. A segment left behind
-  // by a killed process from an older build has the wrong shape, and every
-  // process that follows would fail to attach to it until someone unlinked
-  // it by hand. The owner reclaims such a segment instead. Readers leave it
-  // false: a reader disagreeing with a live publisher is a version skew that
-  // must be reported, not papered over.
-  bool reclaim_mismatched_segment{false};
+  // This end writes the topic. A publisher records its pid in the segment
+  // and owns the topic's layout outside a session: a segment it cannot use
+  // -- one from an older build, or of another schema -- that is not
+  // session-owned and that no live process holds (no live writer, no live
+  // reader) is unlinked and recreated rather than failing every process that
+  // follows until someone removes it by hand. Readers leave it false: a
+  // reader disagreeing with a segment is a version skew that must be
+  // reported, not papered over.
+  bool publisher{false};
+
+  // This queue creates the segment for a session and is the only one that
+  // removes it (the launcher; see "Segment lifetime" below). It replaces
+  // whatever segment had the name, and its destructor unlinks the segment.
+  bool session_owner{false};
 };
+
+// The segment format, checked before any other header field is trusted.
+inline constexpr std::uint64_t kRtmsMagic = 0x32534D54534F4C41ULL;  // "ALOSTMS2"
+inline constexpr std::uint64_t kRtmsVersion = 3;
+
+// RTMSHeader::lifetime: a session-owned flag, a closing flag, and the count
+// of queues attached to a segment that is not session-owned.
+inline constexpr std::uint64_t kLifetimeSessionOwned = 1ULL << 63;
+inline constexpr std::uint64_t kLifetimeClosing = 1ULL << 62;
+inline constexpr std::uint64_t kLifetimeCountMask = (1ULL << 32) - 1;
 
 struct alignas(CACHE_LINE) Writer {
   std::atomic<uint64_t> sequence{};
+  // pid of the publisher that attached last, 0 when none is attached.
+  std::atomic<uint64_t> owner_pid{};
 };
 
 struct alignas(CACHE_LINE) Reader {
   std::atomic<uint64_t> sequence{};
-  std::atomic<ReaderState> state{};
+  std::atomic<uint64_t> state{};  // (pid << 2) | ReaderState
 };
 
 struct RTMSHeader {
+  // kRtmsMagic, stored last (release) by the creator: an attacher trusts no
+  // other field until it reads this.
+  std::atomic<std::uint64_t> magic{0};
+  std::uint64_t version{0};
+  // Random at creation: tells this segment from a later one under the name.
+  std::uint64_t segment_id{0};
+
   std::uint64_t total_bytes{0};
 
   std::uint64_t slots{0};          // power of 2 for efficiency
@@ -114,6 +145,13 @@ struct RTMSHeader {
   std::uint64_t data_offset{0};  // offset from header
   std::uint64_t slot_stride{0};
 
+  // The creator's schema identity (talOS/schema/identity.h). Every attach
+  // compares its own against it, so two same-size types cannot share a topic.
+  std::uint64_t schema_hash{0};
+  char schema_name[talos::schema::kMaxSchemaName + 1]{};
+
+  std::atomic<std::uint64_t> lifetime{0};
+
   Writer writer;
   Reader readers[MAX_READERS];
 };
@@ -121,23 +159,44 @@ struct RTMSHeader {
 template <typename F, class T = const std::byte>
 concept TakesSpan = std::invocable<F, std::span<T>>;
 
-// Ring buffer queue, should flatbuffers requirement
-// be set here or be generic for any data?
+// Ring buffer queue over one named shared-memory segment.
+//
+// Schema identity. The creator writes its schema name and hash into the
+// header; every later attach with a different hash throws, naming both
+// types, even when the sizes agree.
+//
+// Segment lifetime. Under the launcher a session owns every declared topic:
+// the launcher creates each segment (session_owner) before it spawns a node
+// and unlinks it when the session ends, so nodes only attach, a node that
+// exits or is killed and restarted leaves its topics in place, and a
+// publisher's clean exit never severs its subscribers. Without a launcher
+// (a node run directly, Sim-less tools such as send_target or monitor,
+// tests) the first queue to open a name creates the segment and the last
+// one to close it unlinks it; a segment whose last holder was killed stays
+// until a publisher reclaims it, a launcher session replaces it, or the
+// machine restarts, and is reused meanwhile.
 class RTMSQueue {
  public:
   RTMSQueue(std::string_view path, std::size_t message_size,
-            std::size_t message_alignment, std::size_t slots = MAX_SLOTS,
-            RTMSOptions options = RTMSOptions{});
+            std::size_t message_alignment,
+            const talos::schema::Identity& schema,
+            std::size_t slots = MAX_SLOTS, RTMSOptions options = RTMSOptions{});
 
-  RTMSQueue(RTMSQueue&&) noexcept = default;
-  RTMSQueue& operator=(RTMSQueue&&) noexcept = default;
+  RTMSQueue(RTMSQueue&& other) noexcept;
+  RTMSQueue& operator=(RTMSQueue&& other) noexcept;
+  ~RTMSQueue();
 
   RTMSQueue(const RTMSQueue&) = delete;
   RTMSQueue& operator=(const RTMSQueue&) = delete;
 
   std::uint64_t minimum_read_position() const;
+  // Claims a reader slot for this process. When none is free, slots held by
+  // processes that no longer exist are freed first.
   std::optional<std::size_t> register_reader();
   void release_reader(std::size_t id);
+  // Frees every reader slot whose claiming process has died. Returns how
+  // many it freed.
+  std::size_t reclaim_dead_readers();
   WriteStatus write(std::span<const std::byte> message);
 
   // Copies the next message for `reader_id` into `destination` and reports
@@ -180,7 +239,7 @@ class RTMSQueue {
 
     auto& reader = header_->readers[reader_id];
 
-    if (reader.state.load(std::memory_order_acquire) != ReaderState::ACTIVE) {
+    if (!is_active(reader)) {
       return false;
     }
 
@@ -209,10 +268,30 @@ class RTMSQueue {
 
   size_t message_size() const { return message_size_; }
   std::string_view path() const { return path_; }
+  // The schema the segment's creator recorded.
+  std::string_view schema_name() const;
+  std::uint64_t schema_hash() const { return header_->schema_hash; }
+  bool session_owned() const {
+    return (header_->lifetime.load(std::memory_order_acquire) &
+            kLifetimeSessionOwned) != 0;
+  }
 
  private:
   // Number of times a read retries when the writer laps it mid-read.
   static constexpr int MAX_READ_ATTEMPTS = 8;
+
+  static bool is_active(const Reader& reader) {
+    return (reader.state.load(std::memory_order_acquire) & 3) ==
+           static_cast<std::uint64_t>(ReaderState::ACTIVE);
+  }
+
+  // Maps the segment (creating it when absent), initializes or validates the
+  // header, and joins its lifetime. Retries while a closing segment is being
+  // unlinked.
+  void open(const talos::schema::Identity& schema);
+  // Leaves the segment's lifetime: the last queue of a segment that is not
+  // session-owned, or the session owner, unlinks it.
+  void close() noexcept;
 
   // Chooses the sequence this reader should observe next and fills in how
   // many messages were skipped to reach it. Returns false when the reader is
@@ -237,4 +316,5 @@ class RTMSQueue {
 
   RTMSHeader* header_{nullptr};
   SharedMemoryPtr ptr_;
+  bool counted_{false};  // this queue holds one count of header_->lifetime
 };

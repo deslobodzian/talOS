@@ -136,21 +136,27 @@ class EventLoopBase {
   // and become the log's identifiers for these sources.
 
   std::uint16_t register_timer(std::string_view name, Thunk callback) {
-    return add_source(SourceKind::TIMER, name, 0, 0, callback);
+    return add_source(SourceKind::TIMER, name, 0, 0, {}, callback);
   }
 
+  // `schema` is the topic's identity (talOS/schema/identity.h): the
+  // realtime loop's segment refuses one of another type, and the log
+  // records it so a payload can be decoded.
   std::uint16_t register_watcher(std::string_view topic,
                                  std::uint32_t message_bytes,
-                                 std::uint32_t alignment, Thunk callback) {
+                                 std::uint32_t alignment,
+                                 const schema::Identity& schema,
+                                 Thunk callback) {
     return add_source(SourceKind::WATCHER, topic, message_bytes, alignment,
-                      callback);
+                      schema, callback);
   }
 
   std::uint16_t register_sender(std::string_view topic,
                                 std::uint32_t message_bytes,
-                                std::uint32_t alignment) {
+                                std::uint32_t alignment,
+                                const schema::Identity& schema) {
     return add_source(SourceKind::SENDER, topic, message_bytes, alignment,
-                      Thunk{});
+                      schema, Thunk{});
   }
 
   // --- handler-facing operations ------------------------------------------
@@ -390,7 +396,7 @@ class EventLoopBase {
 
   std::uint16_t add_source(SourceKind kind, std::string_view name,
                            std::uint32_t message_bytes, std::uint32_t alignment,
-                           Thunk callback) {
+                           const schema::Identity& schema, Thunk callback) {
     if (registration_closed_) {
       throw RegistrationError(
           "event sources must be registered before run(): '" +
@@ -407,12 +413,21 @@ class EventLoopBase {
                               " characters: '" + std::string{name} + "'");
     }
 
+    if (kind != SourceKind::TIMER &&
+        (schema.name.empty() || schema.name.size() > schema::kMaxSchemaName)) {
+      throw RegistrationError("topic '" + std::string{name} +
+                              "' needs a schema name of 1 to " +
+                              std::to_string(schema::kMaxSchemaName) +
+                              " characters, got '" + schema.name + "'");
+    }
+
     Registration registration{};
     registration.id = static_cast<std::uint16_t>(sources_.size());
     registration.kind = kind;
     registration.name = std::string{name};
     registration.message_bytes = message_bytes;
     registration.alignment = alignment;
+    registration.schema = schema;
 
     Source source{};
     source.registration = registration;

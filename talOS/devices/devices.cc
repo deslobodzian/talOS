@@ -269,7 +269,8 @@ HardwareLink::HardwareLink(Node& node) : impl_{std::make_unique<Impl>(node)} {
       std::chrono::microseconds{impl.config.hardware.command_timeout_us};
   detail::NodeAccess::add_subscription(
       node, hardware::kStateTopic, sizeof(Packet), alignof(Packet),
-      /*optional=*/false, [&impl](const void* data) { impl.OnState(data); });
+      schema::Of<Packet>(), /*optional=*/false,
+      [&impl](const void* data) { impl.OnState(data); });
 }
 
 HardwareLink::~HardwareLink() = default;
@@ -305,7 +306,7 @@ std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
   if (IsOutput(kind) && !impl.has_outputs) {
     impl.request = detail::NodeAccess::add_publisher(
         impl.node, hardware::RequestTopic(impl.node.name()), sizeof(Packet),
-        alignof(Packet));
+        alignof(Packet), schema::Of<Packet>());
     impl.node.after_update([&impl] { impl.Flush(); });
     impl.has_outputs = true;
   }
@@ -544,7 +545,8 @@ class DriverStationLink {
   explicit DriverStationLink(Node& node) : node_{node} {
     NodeAccess::add_subscription(
         node, hardware::kDriverStationTopic, sizeof(Packet), alignof(Packet),
-        /*optional=*/false, [this](const void* data) { OnPacket(data); });
+        schema::Of<Packet>(), /*optional=*/false,
+        [this](const void* data) { OnPacket(data); });
   }
 
   // A listener runs as each packet arrives, so its node drains every tick.

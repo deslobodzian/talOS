@@ -1,10 +1,14 @@
-load("@flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//talOS/build:contract.bzl", "talos_messages")
 
-flatbuffer_cc_library(
+# Typed endpoints need a schema descriptor, so the test message comes from
+# talos_messages like every node's.
+talos_messages(
     name = "ipc_test_message",
     srcs = ["ipc_test_message.fbs"],
+    include_prefix = "ipc_test",
+    visibility = ["//visibility:private"],
 )
 
 cc_library(
@@ -17,6 +21,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//talOS/rtms",
+        "//talOS/schema:identity",
         "@flatbuffers",
     ],
 )

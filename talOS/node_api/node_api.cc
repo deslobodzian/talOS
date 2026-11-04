@@ -226,9 +226,23 @@ int32_t talos_node_param(const TalosNode* node, const char* key, int32_t kind,
   });
 }
 
+// A TalosSchema as the identity the C++ registration takes.
+static talos::schema::Identity Schema(const TalosSchema* schema) {
+  if (schema == nullptr || schema->name == nullptr) {
+    throw std::invalid_argument("null TalosSchema");
+  }
+  if (schema->bfbs == nullptr && schema->bfbs_size != 0) {
+    throw std::invalid_argument("TalosSchema bfbs is null");
+  }
+  return talos::schema::Identity{
+      schema->name, schema->hash,
+      std::string{static_cast<const char*>(schema->bfbs), schema->bfbs_size}};
+}
+
 int64_t talos_node_subscribe(TalosNode* node, const char* topic,
-                             uint32_t message_bytes, int32_t optional,
-                             TalosMessageCallback on_message, void* user) {
+                             uint32_t message_bytes, const TalosSchema* schema,
+                             int32_t optional, TalosMessageCallback on_message,
+                             void* user) {
   return Guard<int64_t>(-1, [&] {
     talos::Node& n = AsNode(node);
     talos::detail::MessageCallback callback;
@@ -239,18 +253,18 @@ int64_t talos_node_subscribe(TalosNode* node, const char* topic,
     }
     const std::size_t index = NodeAccess::add_subscription(
         n, NonNull(topic, "topic"), message_bytes, talos::kMessageAlignment,
-        optional != 0, std::move(callback));
+        Schema(schema), optional != 0, std::move(callback));
     if (on_message != nullptr) NodeAccess::require_immediate_delivery(n);
     return static_cast<int64_t>(index);
   });
 }
 
 int64_t talos_node_publish(TalosNode* node, const char* topic,
-                           uint32_t message_bytes) {
+                           uint32_t message_bytes, const TalosSchema* schema) {
   return Guard<int64_t>(-1, [&] {
-    return static_cast<int64_t>(
-        NodeAccess::add_publisher(AsNode(node), NonNull(topic, "topic"),
-                                  message_bytes, talos::kMessageAlignment));
+    return static_cast<int64_t>(NodeAccess::add_publisher(
+        AsNode(node), NonNull(topic, "topic"), message_bytes,
+        talos::kMessageAlignment, Schema(schema)));
   });
 }
 
@@ -525,10 +539,10 @@ int32_t talos_driver_station_read(TalosNode* node, TalosDriverStation* out) {
 // --- target lanes ------------------------------------------------------------
 
 int64_t talos_target_open(TalosNode* node, uint32_t message_bytes,
-                          uint32_t alignment) {
+                          uint32_t alignment, const TalosSchema* schema) {
   return Guard<int64_t>(-1, [&] {
-    return static_cast<int64_t>(
-        TargetAccess::open_target(AsNode(node), message_bytes, alignment));
+    return static_cast<int64_t>(TargetAccess::open_target(
+        AsNode(node), message_bytes, alignment, Schema(schema)));
   });
 }
 
@@ -563,11 +577,11 @@ const char* talos_target_source_name(TalosNode* node, int64_t target,
 
 int64_t talos_target_lane_open(TalosNode* node, const char* subsystem,
                                const char* source, uint32_t message_bytes,
-                               uint32_t alignment) {
+                               uint32_t alignment, const TalosSchema* schema) {
   return Guard<int64_t>(-1, [&] {
     return static_cast<int64_t>(TargetAccess::open_lane(
         AsNode(node), NonNull(subsystem, "subsystem"),
-        NonNull(source, "source"), message_bytes, alignment));
+        NonNull(source, "source"), message_bytes, alignment, Schema(schema)));
   });
 }
 

@@ -1,0 +1,10 @@
+namespace target_test;
+
+// A double-aligned message and a 4-byte one, so both alignments run.
+struct Goal {
+  position_rot:double;
+}
+
+struct Small {
+  speed_rps:float;
+}

@@ -1,21 +1,35 @@
 #include "rtms.h"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
 #include "talOS/memory/shared_memory_ptr.h"
 
 namespace {
+
+// Bounded like SharedMemoryPtr's size wait: a creator initializes a header
+// within microseconds, so 50 ms separates "still being created" from "never
+// will be" without masking either.
+constexpr int kInitAttempts = 200;
+constexpr useconds_t kInitRetryUs = 250;
+// How often open() retries a segment that its last holder is unlinking.
+constexpr int kOpenAttempts = 200;
+
 std::string ValidatePath(std::string_view path) {
   std::string_view name = path;
   if (name.starts_with('/')) {
@@ -28,67 +42,115 @@ std::string ValidatePath(std::string_view path) {
   }
   // One definition of the mapping, in shared_memory_ptr.h, so this and
   // SharedMemoryPtr cannot drift onto different segment names for one topic.
-  // ReclaimMismatchedSegment below opens a segment directly, which is why RTMS
-  // needs the mapped name here and not just inside SharedMemoryPtr.
+  // The reclaim and unlink helpers below open a segment directly, which is
+  // why RTMS needs the mapped name here and not just inside SharedMemoryPtr.
   return ShmObjectName(path);
 }
-// Unlinks an existing segment whose layout does not match what the caller is
-// about to create, so the next shm_open makes a fresh one. Only the topic's
-// publisher passes allowed=true. Unlinking does not disturb a process that
-// still has the old segment mapped; it only removes the name, so a straggler
-// from the previous build keeps running against memory nobody new can reach.
-std::string ReclaimMismatchedSegment(const std::string& path,
-                                     std::uint64_t total_bytes,
-                                     std::uint64_t slots,
-                                     std::uint64_t message_bytes,
-                                     std::uint64_t message_alignment,
-                                     bool allowed) {
-  if (!allowed) {
-    return path;
-  }
-  const int fd = shm_open(path.c_str(), O_RDWR, 0666);
-  if (fd == -1) {
-    return path;  // Nothing there, which is the normal case.
-  }
 
-  // The header the creator wrote is the authority on layout. The file size is
-  // not: shm objects are rounded up to a page, so an intact segment routinely
-  // measures larger than it was asked for, and comparing sizes would condemn
-  // healthy segments and unlink them out from under live readers.
-  bool mismatched = false;
-  struct stat info {};
-  if (fstat(fd, &info) < 0 ||
-      static_cast<std::uint64_t>(info.st_size) < sizeof(RTMSHeader)) {
-    mismatched = true;  // Too small to even carry a header.
-  } else {
-    void* mapped =
-        mmap(nullptr, sizeof(RTMSHeader), PROT_READ, MAP_SHARED, fd, 0);
-    if (mapped == MAP_FAILED) {
-      mismatched = true;
-    } else {
-      const auto* header = static_cast<const RTMSHeader*>(mapped);
-      mismatched = header->total_bytes != total_bytes ||
-                   header->slots != slots ||
-                   header->message_bytes != message_bytes ||
-                   header->message_alignment != message_alignment;
-      munmap(mapped, sizeof(RTMSHeader));
+bool ProcessAlive(std::uint64_t pid) {
+  if (pid == 0 || pid > static_cast<std::uint64_t>(INT32_MAX)) return false;
+  return ::kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM;
+}
+
+std::uint64_t OwnPid() { return static_cast<std::uint64_t>(::getpid()); }
+
+std::uint64_t ReaderWord(ReaderState state) {
+  return (OwnPid() << 2) | static_cast<std::uint64_t>(state);
+}
+
+std::string SchemaOf(const RTMSHeader& header) {
+  const std::size_t length =
+      ::strnlen(header.schema_name, sizeof(header.schema_name));
+  return talos::schema::Describe(std::string_view{header.schema_name, length},
+                                 header.schema_hash);
+}
+
+bool WaitInitialized(const RTMSHeader& header) {
+  for (int attempt = 0; attempt < kInitAttempts; ++attempt) {
+    if (header.magic.load(std::memory_order_acquire) == kRtmsMagic) return true;
+    ::usleep(kInitRetryUs);
+  }
+  return false;
+}
+
+// A read-only mapping of the header of an existing segment, or nothing when
+// the name is absent or too small to hold a header within the wait.
+class HeaderView {
+ public:
+  explicit HeaderView(const std::string& path) {
+    const int fd = ::shm_open(path.c_str(), O_RDONLY, 0666);
+    if (fd == -1) return;
+    struct stat info {};
+    bool sized = false;
+    for (int attempt = 0; attempt < kInitAttempts; ++attempt) {
+      if (::fstat(fd, &info) < 0) break;
+      if (static_cast<std::uint64_t>(info.st_size) >= sizeof(RTMSHeader)) {
+        sized = true;
+        break;
+      }
+      ::usleep(kInitRetryUs);
+    }
+    exists_ = true;
+    if (sized) {
+      void* mapped =
+          ::mmap(nullptr, sizeof(RTMSHeader), PROT_READ, MAP_SHARED, fd, 0);
+      if (mapped != MAP_FAILED) header_ = static_cast<const RTMSHeader*>(mapped);
+    }
+    ::close(fd);
+  }
+  ~HeaderView() {
+    if (header_ != nullptr) {
+      ::munmap(const_cast<RTMSHeader*>(header_), sizeof(RTMSHeader));
     }
   }
-  close(fd);
+  HeaderView(const HeaderView&) = delete;
+  HeaderView& operator=(const HeaderView&) = delete;
 
-  if (mismatched) {
-    std::fprintf(stderr,
-                 "rtms: reclaiming stale shared memory %s, its layout does not "
-                 "match this build\n",
-                 path.c_str());
-    shm_unlink(path.c_str());
+  bool exists() const { return exists_; }
+  // Null when the segment is too small to be an RTMS segment.
+  const RTMSHeader* header() const { return header_; }
+
+ private:
+  bool exists_{false};
+  const RTMSHeader* header_{nullptr};
+};
+
+// Unlinks `path` only while it still names the segment `segment_id`: a
+// publisher may have reclaimed the name, or a session replaced it, since
+// this process mapped it, and that newer segment is not ours to remove.
+void UnlinkIfSame(const std::string& path, std::uint64_t segment_id) {
+  bool same = false;
+  {
+    const HeaderView view{path};
+    same = view.header() != nullptr &&
+           view.header()->magic.load(std::memory_order_acquire) == kRtmsMagic &&
+           view.header()->segment_id == segment_id;
   }
-  return path;
+  if (same) ::shm_unlink(path.c_str());
 }
+
+std::uint64_t NewSegmentId() {
+  std::random_device random;
+  return (static_cast<std::uint64_t>(random()) << 32) ^ random() ^
+         (OwnPid() << 16);
+}
+
+bool HeldByLiveProcess(const RTMSHeader& header) {
+  if (ProcessAlive(header.writer.owner_pid.load(std::memory_order_acquire))) {
+    return true;
+  }
+  for (const Reader& reader : header.readers) {
+    const std::uint64_t word = reader.state.load(std::memory_order_acquire);
+    if (word != 0 && ProcessAlive(word >> 2)) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
-                     std::size_t message_alignment, std::size_t slots,
+                     std::size_t message_alignment,
+                     const talos::schema::Identity& schema, std::size_t slots,
                      RTMSOptions options)
     : path_{ValidatePath(path)},
       slots_{slots},
@@ -97,11 +159,7 @@ RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
       data_offset_{align_up(sizeof(RTMSHeader), message_alignment)},
       stride_{align_up(message_size, message_alignment)},
       total_bytes_{data_offset_ + stride_ * slots_},
-      options_{options},
-      ptr_{ReclaimMismatchedSegment(path_, total_bytes_, slots_, message_size_,
-                                    message_alignment_,
-                                    options_.reclaim_mismatched_segment),
-           total_bytes_} {
+      options_{options} {
   if (!is_pow_2(slots)) {
     throw std::invalid_argument("slots is not a power of 2!");
   }
@@ -111,37 +169,231 @@ RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
     throw std::invalid_argument("slots must be at least 2");
   }
 
-  const std::size_t total_size = data_offset_ + stride_ * slots;
+  if (schema.name.empty() || schema.name.size() > talos::schema::kMaxSchemaName) {
+    throw std::invalid_argument("RTMS topic " + std::string{path} +
+                                " needs a schema name of 1 to " +
+                                std::to_string(talos::schema::kMaxSchemaName) +
+                                " characters");
+  }
 
-  if (ptr_.mode() == SharedMemoryMode::CREATE) {
-    // Learned about this, pretty cool, it creates the object at preallocated
-    // memory
-    header_ = std::construct_at(static_cast<RTMSHeader*>(ptr_.ptr()));
+  open(schema);
+}
 
-    header_->total_bytes = total_size;
-    header_->slots = slots;
-    header_->message_bytes = message_size;
-    header_->message_alignment = message_alignment;
+void RTMSQueue::open(const talos::schema::Identity& schema) {
+  const auto layout_matches = [this](const RTMSHeader& header) {
+    return header.version == kRtmsVersion && header.slots == slots_ &&
+           header.message_bytes == message_size_ &&
+           header.message_alignment == message_alignment_ &&
+           header.total_bytes == total_bytes_;
+  };
+  const auto schema_matches = [&schema](const RTMSHeader& header) {
+    return header.schema_hash == schema.hash &&
+           std::string_view{header.schema_name,
+                            ::strnlen(header.schema_name,
+                                      sizeof(header.schema_name))} ==
+               schema.name;
+  };
 
-    header_->data_offset = data_offset_;
-    header_->slot_stride = stride_;
+  if (options_.session_owner) {
+    // A new session replaces whatever the name held: a segment of a
+    // previous session that ended without cleaning up, or a standalone run's.
+    ::shm_unlink(path_.c_str());
+  }
 
-    header_->writer.sequence.store(0, std::memory_order_relaxed);
-    for (auto& reader : header_->readers) {
-      reader.sequence.store(0, std::memory_order_relaxed);
-      reader.state.store(ReaderState::FREE, std::memory_order_relaxed);
+  for (int attempt = 0; attempt < kOpenAttempts; ++attempt) {
+    if (options_.publisher && !options_.session_owner) {
+      // Reclaims a segment this publisher cannot use, when nothing could be
+      // harmed by removing it: not session-owned and held by no live process.
+      // Unlinking does not disturb a process that still has the old segment
+      // mapped; it only removes the name.
+      bool reclaim = false;
+      {
+        const HeaderView view{path_};
+        if (view.exists()) {
+          const RTMSHeader* header = view.header();
+          if (header == nullptr || !WaitInitialized(*header) ||
+              header->version != kRtmsVersion) {
+            reclaim = true;  // another build's format, or never initialized
+          } else if (!layout_matches(*header) || !schema_matches(*header)) {
+            reclaim = (header->lifetime.load(std::memory_order_acquire) &
+                       kLifetimeSessionOwned) == 0 &&
+                      !HeldByLiveProcess(*header);
+          }
+        }
+      }
+      if (reclaim) {
+        std::fprintf(stderr,
+                     "rtms: reclaiming stale shared memory %s, which this "
+                     "build cannot use and no live process holds\n",
+                     path_.c_str());
+        ::shm_unlink(path_.c_str());
+      }
     }
-  } else {
-    header_ = static_cast<RTMSHeader*>(ptr_.ptr());
-    if (header_->slots != slots_ || header_->message_bytes != message_size_ ||
-        header_->message_alignment != message_alignment_ ||
-        header_->total_bytes != total_bytes_) {
+
+    SharedMemoryPtr ptr{path_, total_bytes_};
+    auto* header = static_cast<RTMSHeader*>(ptr.ptr());
+
+    if (ptr.mode() == SharedMemoryMode::CREATE) {
+      // Learned about this, pretty cool, it creates the object at
+      // preallocated memory
+      header = std::construct_at(header);
+      header->version = kRtmsVersion;
+      header->segment_id = NewSegmentId();
+      header->total_bytes = total_bytes_;
+      header->slots = slots_;
+      header->message_bytes = message_size_;
+      header->message_alignment = message_alignment_;
+      header->data_offset = data_offset_;
+      header->slot_stride = stride_;
+      header->schema_hash = schema.hash;
+      std::memcpy(header->schema_name, schema.name.data(), schema.name.size());
+      header->lifetime.store(options_.session_owner ? kLifetimeSessionOwned : 1,
+                             std::memory_order_relaxed);
+      counted_ = !options_.session_owner;
+      header->writer.sequence.store(0, std::memory_order_relaxed);
+      header->writer.owner_pid.store(options_.publisher ? OwnPid() : 0,
+                                     std::memory_order_relaxed);
+      for (auto& reader : header->readers) {
+        reader.sequence.store(0, std::memory_order_relaxed);
+        reader.state.store(0, std::memory_order_relaxed);
+      }
+      // Last, so an attacher that sees the magic sees everything above.
+      header->magic.store(kRtmsMagic, std::memory_order_release);
+      ptr_ = std::move(ptr);
+      header_ = header;
+      return;
+    }
+
+    if (options_.session_owner) {
+      throw std::runtime_error("RTMS: another process created " + path_ +
+                               " while the session was creating it");
+    }
+    if (!WaitInitialized(*header)) {
+      throw std::runtime_error(
+          "RTMS shared memory " + path_ +
+          " is not a talOS segment of this build's format (or its creator "
+          "died initializing it); stop the processes using it, or remove it "
+          "with shm_unlink, and restart");
+    }
+    if (!layout_matches(*header)) {
       throw std::runtime_error(
           "RTMS shared-memory layout mismatch on " + path_ +
           ": this process was built against a different message layout than "
-          "the publisher that created the segment");
+          "the segment's creator (" +
+          std::to_string(header->message_bytes) + " bytes, " +
+          std::to_string(header->slots) + " slots, here " +
+          std::to_string(message_size_) + " bytes, " + std::to_string(slots_) +
+          " slots)");
+    }
+    if (!schema_matches(*header)) {
+      throw std::runtime_error("RTMS schema mismatch on " + path_ +
+                               ": the segment carries " + SchemaOf(*header) +
+                               ", this process uses " +
+                               talos::schema::Describe(schema));
+    }
+
+    bool closing = false;
+    std::uint64_t word = header->lifetime.load(std::memory_order_acquire);
+    for (;;) {
+      if ((word & kLifetimeSessionOwned) != 0) {
+        counted_ = false;
+        break;
+      }
+      if ((word & kLifetimeClosing) != 0) {
+        closing = true;
+        break;
+      }
+      if (header->lifetime.compare_exchange_weak(word, word + 1,
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
+        counted_ = true;
+        break;
+      }
+    }
+    if (closing) {
+      // Its last holder is unlinking it; the next shm_open creates a fresh
+      // segment once the name is gone.
+      ::usleep(kInitRetryUs);
+      continue;
+    }
+    if (options_.publisher) {
+      header->writer.owner_pid.store(OwnPid(), std::memory_order_release);
+    }
+    ptr_ = std::move(ptr);
+    header_ = header;
+    return;
+  }
+  throw std::runtime_error("RTMS: " + path_ +
+                           " stayed closing; its last holder never unlinked it");
+}
+
+void RTMSQueue::close() noexcept {
+  if (header_ == nullptr) return;
+  if (options_.publisher) {
+    std::uint64_t expected = OwnPid();
+    header_->writer.owner_pid.compare_exchange_strong(
+        expected, 0, std::memory_order_acq_rel);
+  }
+  const std::uint64_t segment_id = header_->segment_id;
+  bool unlink = options_.session_owner;
+  if (counted_) {
+    std::uint64_t word = header_->lifetime.load(std::memory_order_acquire);
+    for (;;) {
+      const std::uint64_t count = word & kLifetimeCountMask;
+      const std::uint64_t next =
+          count <= 1 ? ((word & ~kLifetimeCountMask) | kLifetimeClosing)
+                     : word - 1;
+      if (header_->lifetime.compare_exchange_weak(word, next,
+                                                  std::memory_order_acq_rel,
+                                                  std::memory_order_acquire)) {
+        unlink = count <= 1;
+        break;
+      }
     }
   }
+  header_ = nullptr;
+  counted_ = false;
+  ptr_ = SharedMemoryPtr{};
+  if (unlink) UnlinkIfSame(path_, segment_id);
+}
+
+RTMSQueue::RTMSQueue(RTMSQueue&& other) noexcept
+    : path_{std::move(other.path_)},
+      slots_{other.slots_},
+      message_size_{other.message_size_},
+      message_alignment_{other.message_alignment_},
+      data_offset_{other.data_offset_},
+      stride_{other.stride_},
+      total_bytes_{other.total_bytes_},
+      options_{other.options_},
+      header_{std::exchange(other.header_, nullptr)},
+      ptr_{std::move(other.ptr_)},
+      counted_{std::exchange(other.counted_, false)} {}
+
+RTMSQueue& RTMSQueue::operator=(RTMSQueue&& other) noexcept {
+  if (this != &other) {
+    close();
+    path_ = std::move(other.path_);
+    slots_ = other.slots_;
+    message_size_ = other.message_size_;
+    message_alignment_ = other.message_alignment_;
+    data_offset_ = other.data_offset_;
+    stride_ = other.stride_;
+    total_bytes_ = other.total_bytes_;
+    options_ = other.options_;
+    header_ = std::exchange(other.header_, nullptr);
+    ptr_ = std::move(other.ptr_);
+    counted_ = std::exchange(other.counted_, false);
+  }
+  return *this;
+}
+
+RTMSQueue::~RTMSQueue() { close(); }
+
+std::string_view RTMSQueue::schema_name() const {
+  return std::string_view{
+      header_->schema_name,
+      ::strnlen(header_->schema_name, sizeof(header_->schema_name))};
 }
 
 // Need to find out where the "slowest" reader is.
@@ -150,10 +402,8 @@ uint64_t RTMSQueue::minimum_read_position() const {
       header_->writer.sequence.load(std::memory_order_relaxed);
 
   for (std::size_t i = 0; i < MAX_READERS; ++i) {
-    const auto state =
-        header_->readers[i].state.load(std::memory_order_acquire);
     // Reader hasn't started yet, so position isn't relevent
-    if (state != ReaderState::ACTIVE) {
+    if (!is_active(header_->readers[i])) {
       continue;
     }
     const auto position =
@@ -161,6 +411,19 @@ uint64_t RTMSQueue::minimum_read_position() const {
     minimum = std::min(minimum, position);
   }
   return minimum;
+}
+
+std::size_t RTMSQueue::reclaim_dead_readers() {
+  std::size_t freed = 0;
+  for (auto& reader : header_->readers) {
+    std::uint64_t word = reader.state.load(std::memory_order_acquire);
+    if (word == 0 || ProcessAlive(word >> 2)) continue;
+    if (reader.state.compare_exchange_strong(word, 0,
+                                             std::memory_order_acq_rel)) {
+      ++freed;
+    }
+  }
+  return freed;
 }
 
 WriteStatus RTMSQueue::write(std::span<const std::byte> message) {
@@ -184,11 +447,15 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message) {
   // reports back to them as dropped messages. A stuck subscriber must never
   // be able to stall a control loop.
   if (options_.overflow_policy == OverflowPolicy::DROP_NEWEST) {
-    const uint64_t slowest_reader = minimum_read_position();
-
     // example max slots is 10, min reader is at 10 and new position is wrapping
     // to 20 will cause us to be writting over the reader.
-    if (next_position - slowest_reader > slots_) {
+    //
+    // A reader whose process died holds its position forever, which would
+    // wedge this writer for good; it is freed before the write is refused.
+    // Only on the full path, so the steady state makes no system call.
+    if (next_position - minimum_read_position() > slots_ &&
+        (reclaim_dead_readers() == 0 ||
+         next_position - minimum_read_position() > slots_)) {
       return {WriteResult::BUFFER_FULL, 0};
     }
   }
@@ -275,7 +542,7 @@ ReadResult RTMSQueue::read_next(std::uint64_t reader_id,
 
   auto& reader = header_->readers[reader_id];
 
-  if (reader.state.load(std::memory_order_acquire) != ReaderState::ACTIVE) {
+  if (!is_active(reader)) {
     return ReadResult::INACTIVE;
   }
 
@@ -304,28 +571,35 @@ ReadResult RTMSQueue::read_next(std::uint64_t reader_id,
 }
 
 std::optional<std::size_t> RTMSQueue::register_reader() {
-  for (std::size_t i = 0; i < MAX_READERS; ++i) {
-    auto& reader = header_->readers[i];
-    ReaderState expected = ReaderState::FREE;
+  for (int pass = 0; pass < 2; ++pass) {
+    for (std::size_t i = 0; i < MAX_READERS; ++i) {
+      auto& reader = header_->readers[i];
+      std::uint64_t expected = 0;
 
-    if (!reader.state.compare_exchange_strong(expected, ReaderState::CLAIMING,
-                                              std::memory_order_acq_rel,
-                                              std::memory_order_relaxed)) {
-      continue;
+      // The claim carries this process's pid, so a claimant that dies at any
+      // point after it -- even before it marks the slot active -- leaves a
+      // slot reclaim_dead_readers() can free.
+      if (!reader.state.compare_exchange_strong(
+              expected, ReaderWord(ReaderState::CLAIMING),
+              std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        continue;
+      }
+
+      const auto current =
+          header_->writer.sequence.load(std::memory_order_acquire);
+
+      reader.sequence.store(current, std::memory_order_relaxed);
+
+      reader.state.store(ReaderWord(ReaderState::ACTIVE),
+                         std::memory_order_release);
+      return i;
     }
-
-    const auto current =
-        header_->writer.sequence.load(std::memory_order_acquire);
-
-    reader.sequence.store(current, std::memory_order_relaxed);
-
-    reader.state.store(ReaderState::ACTIVE, std::memory_order_release);
-    return i;
+    if (reclaim_dead_readers() == 0) break;
   }
   return std::nullopt;
 }
 
 void RTMSQueue::release_reader(std::size_t id) {
   auto& reader = header_->readers[id];
-  reader.state.store(ReaderState::FREE, std::memory_order_release);
+  reader.state.store(0, std::memory_order_release);
 }

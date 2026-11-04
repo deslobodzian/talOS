@@ -10,6 +10,7 @@
 namespace talos::introspect {
 namespace {
 
+constexpr std::uint32_t kSlots = 1024;
 event::Manifest sample_manifest() {
   event::Manifest manifest;
   manifest.push_back({.id = 0,
@@ -20,17 +21,21 @@ event::Manifest sample_manifest() {
                       .kind = event::SourceKind::WATCHER,
                       .name = "/drivetrain/target",
                       .message_bytes = 48,
-                      .alignment = 8});
+                      .alignment = 8,
+                      .schema = {"drivetrain.ChassisTarget",
+                                 0xfedcba9876543210ULL}});
   manifest.push_back({.id = 2,
                       .kind = event::SourceKind::FETCHER,
                       .name = "/driver_station/state",
                       .message_bytes = 32,
-                      .alignment = 8});
+                      .alignment = 4,
+                      .schema = {"talos.hardware.Packet", 0x1ULL}});
   manifest.push_back({.id = 3,
                       .kind = event::SourceKind::SENDER,
                       .name = "/hw/request/drivetrain",
                       .message_bytes = 256,
-                      .alignment = 8});
+                      .alignment = 8,
+                      .schema = {"talos.TargetEnvelope<a.B>", 0x8000ULL}});
   return manifest;
 }
 
@@ -51,13 +56,22 @@ void ExpectSameDescription(const Description& written,
     EXPECT_EQ(b.external(), a.external()) << "source " << i;
     EXPECT_EQ(b.optional(), a.optional()) << "source " << i;
     EXPECT_EQ(b.flags, a.flags) << "source " << i;
+    EXPECT_EQ(b.schema, a.schema) << "source " << i;
+    EXPECT_EQ(b.schema_hash, a.schema_hash) << "source " << i;
+    EXPECT_EQ(b.alignment, a.alignment) << "source " << i;
+    EXPECT_EQ(b.slots, a.slots) << "source " << i;
   }
 }
 
 TEST(Describe, RoundTripsEverySourceKind) {
   const Description written = DescribeManifest(
       "drivetrain", "//2026-robot/main_processor/drivetrain:node",
-      sample_manifest());
+      sample_manifest(), kSlots);
+  ASSERT_EQ(written.sources.size(), 4u);
+  EXPECT_TRUE(written.sources[0].schema.empty());  // a timer has none
+  EXPECT_EQ(written.sources[1].schema, "drivetrain.ChassisTarget");
+  EXPECT_EQ(written.sources[2].alignment, 4u);
+  EXPECT_EQ(written.sources[3].slots, kSlots);
 
   Description read;
   std::string error;
@@ -65,6 +79,20 @@ TEST(Describe, RoundTripsEverySourceKind) {
       << error;
   EXPECT_TRUE(error.empty());
   ExpectSameDescription(written, read);
+  // The full 64 bits survive: JSON carries the hash as a string.
+  EXPECT_EQ(read.sources[1].schema_hash, 0xfedcba9876543210ULL);
+}
+
+TEST(Describe, RejectsATopicWithoutASchema) {
+  event::Manifest manifest = sample_manifest();
+  manifest[3].schema = {};
+  Description read;
+  std::string error;
+  EXPECT_FALSE(DescribeReader::Parse(
+      DescribeToJson(DescribeManifest("d", "//d:d", manifest, kSlots)), read,
+      error));
+  EXPECT_NE(error.find("/hw/request/drivetrain"), std::string::npos) << error;
+  EXPECT_NE(error.find("schema"), std::string::npos) << error;
 }
 
 TEST(Describe, RoundTripsEndpointFlags) {
@@ -74,6 +102,7 @@ TEST(Describe, RoundTripsEndpointFlags) {
   const Description written = DescribeManifest(
       "operator_interface",
       "//2026-robot/main_processor/operator_interface:node", sample_manifest(),
+      kSlots,
       {{"/hw/request/drivetrain",
         naming::kSourceFlagExternal | naming::kSourceFlagOptional},
        {"/drivetrain/target", naming::kSourceFlagOptional}});
@@ -93,7 +122,8 @@ TEST(Describe, RoundTripsEndpointFlags) {
 
 TEST(Describe, RoundTripsANodeThatRegisteredNothing) {
   const Description written =
-      DescribeManifest("empty", "//example/empty:node", event::Manifest{});
+      DescribeManifest("empty", "//example/empty:node", event::Manifest{},
+                       kSlots);
 
   Description read;
   std::string error;
@@ -108,9 +138,10 @@ TEST(Describe, RoundTripsNamesThatNeedEscaping) {
   manifest.push_back({.id = 0,
                       .kind = event::SourceKind::SENDER,
                       .name = R"(/odd/state/"quoted\path)",
-                      .message_bytes = 8});
+                      .message_bytes = 8,
+                      .schema = {R"(odd."quoted)", 2}});
   const Description written =
-      DescribeManifest(R"(od"d)", R"(//example/od\d:node)", manifest);
+      DescribeManifest(R"(od"d)", R"(//example/od\d:node)", manifest, kSlots);
 
   Description read;
   std::string error;
@@ -123,7 +154,7 @@ TEST(Describe, WritesTheKindNamesTheRegistryUses) {
   // Not a formatting preference: the registry and the log print kinds with
   // event::to_string, and a viewer joining declared to running matches on them.
   const std::string json = DescribeToJson(
-      DescribeManifest("drivetrain", "//x:drivetrain", sample_manifest()));
+      DescribeManifest("drivetrain", "//x:drivetrain", sample_manifest(), kSlots));
   EXPECT_NE(json.find("\"kind\": \"TIMER\""), std::string::npos);
   EXPECT_NE(json.find("\"kind\": \"WATCHER\""), std::string::npos);
   EXPECT_NE(json.find("\"kind\": \"FETCHER\""), std::string::npos);
@@ -166,7 +197,7 @@ TEST(Describe, RejectsEmptyOutput) {
 
 TEST(Describe, RejectsAVersionItCannotRead) {
   std::string json = DescribeToJson(
-      DescribeManifest("odometry", "//x:odometry", sample_manifest()));
+      DescribeManifest("odometry", "//x:odometry", sample_manifest(), kSlots));
   const std::size_t at = json.find("\"describe_version\": 1");
   ASSERT_NE(at, std::string::npos);
   json.replace(at, 21, "\"describe_version\": 2");
@@ -182,7 +213,7 @@ TEST(Describe, RejectsAnUnterminatedSourcesArray) {
   // A node killed mid-print: the JSON starts out well-formed, so a reader that
   // only checked the prefix would report a truncated graph as a complete one.
   std::string json = DescribeToJson(
-      DescribeManifest("odometry", "//x:odometry", sample_manifest()));
+      DescribeManifest("odometry", "//x:odometry", sample_manifest(), kSlots));
   json.resize(json.find("\"/driver_station/state\""));
 
   Description out;
@@ -193,7 +224,7 @@ TEST(Describe, RejectsAnUnterminatedSourcesArray) {
 
 TEST(Describe, RejectsAnUnknownSourceKind) {
   std::string json = DescribeToJson(
-      DescribeManifest("odometry", "//x:odometry", sample_manifest()));
+      DescribeManifest("odometry", "//x:odometry", sample_manifest(), kSlots));
   const std::size_t at = json.find("\"WATCHER\"");
   ASSERT_NE(at, std::string::npos);
   json.replace(at, 9, "\"LISTENER\"");
@@ -210,8 +241,7 @@ TEST(Describe, ReadsThroughOutputPrintedAheadOfTheJson) {
   // sloppiness: the alternative is a launch that reports a node as
   // undescribable because a library it links said hello.
   const Description written =
-      DescribeManifest("odometry", "//2026-robot/main_processor/odometry:node",
-                       sample_manifest());
+      DescribeManifest("odometry", "//2026-robot/main_processor/odometry:node", sample_manifest(), kSlots);
 
   Description read;
   std::string error;

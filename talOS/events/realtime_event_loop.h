@@ -186,16 +186,17 @@ class RealtimeEventLoop
 
     // Watchers must see every message in order. The writer overwrites rather
     // than blocks, so a subscriber that falls behind cannot stall the
-    // publishing process.
+    // publishing process. The segment refuses an endpoint of another schema.
     const RTMSOptions rtms_options{
         .overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
         .read_mode = ReadMode::SEQUENCE,
+        .publisher = registration.kind == SourceKind::SENDER,
     };
 
     Transport transport{};
     transport.queue.emplace(registration.name, registration.message_bytes,
-                            registration.alignment, options_.slots,
-                            rtms_options);
+                            registration.alignment, registration.schema,
+                            options_.slots, rtms_options);
 
     if (registration.kind == SourceKind::WATCHER) {
       transport.reader_id = transport.queue->register_reader();

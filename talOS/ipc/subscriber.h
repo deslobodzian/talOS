@@ -11,6 +11,7 @@
 
 #include "concepts.h"
 #include "talOS/rtms/rtms.h"
+#include "talOS/schema/identity.h"
 
 namespace ipc {
 
@@ -24,6 +25,7 @@ struct Received {
 };
 
 template <ipc::NotDerivedFromFlatbufferTable Message>
+  requires talos::Described<Message>
 class Subscriber {
   static_assert(std::is_trivially_copyable_v<Message>,
                 "RTMS messages must be flatbuffer structs, not tables");
@@ -36,13 +38,12 @@ class Subscriber {
           .read_mode = ReadMode::SEQUENCE,
       })
       : topic_{topic},
-        queue_{
-            topic_,
-            sizeof(Message),
-            alignof(Message),
-            MAX_SLOTS,
-            options
-        } {
+        queue_{topic_,
+               sizeof(Message),
+               alignof(Message),
+               talos::schema::Of<Message>(),
+               MAX_SLOTS,
+               options} {
     reader_id_ = queue_.register_reader();
   }
 

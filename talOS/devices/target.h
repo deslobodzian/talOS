@@ -76,6 +76,17 @@ struct TargetEnvelope {
   }
 };
 
+// A lane's schema identity (talOS/schema/identity.h): talos.TargetEnvelope<M>
+// with M's schema bytes, so a lane of another message type is refused at
+// attach and log_dump decodes the header and then M.
+template <Message M>
+struct Descriptor<TargetEnvelope<M>> {
+  static constexpr std::string_view kName = schema::EnvelopeName<M>::kValue;
+  static constexpr std::uint64_t kHash =
+      schema::EnvelopeHash(Descriptor<M>::kHash);
+  static constexpr std::span<const std::uint8_t> kBfbs = Descriptor<M>::kBfbs;
+};
+
 namespace detail {
 inline constexpr std::size_t kTargetEnvelopeHeaderBytes = 16;
 // What TargetAccess assumes of the envelope, checked by Target and
@@ -98,7 +109,8 @@ class Target {
   Target() = default;
   explicit Target(Node& node)
       : node_{&node},
-        index_{detail::TargetAccess::open_target(node, sizeof(M), alignof(M))} {
+        index_{detail::TargetAccess::open_target(node, sizeof(M), alignof(M),
+                                                 schema::Of<M>())} {
   }
 
   // The selected lane's message, or null: robot disabled, Driver Station
@@ -134,7 +146,8 @@ class TargetLane {
   TargetLane(Node& node, std::string_view subsystem, std::string_view source)
       : node_{&node},
         index_{detail::TargetAccess::open_lane(node, subsystem, source,
-                                               sizeof(M), alignof(M))} {}
+                                               sizeof(M), alignof(M),
+                                               schema::Of<M>())} {}
 
   // Asks for `message` (active = 1) under the mode generation this node's
   // Driver Station shows now (0, which no consumer accepts, while it shows

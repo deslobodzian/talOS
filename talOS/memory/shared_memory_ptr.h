@@ -56,8 +56,14 @@ enum class SharedMemoryMode {
 };
 
 
+// A mapping of one named segment: created when the name is absent, attached
+// otherwise (mode() says which). It never unlinks the name: who removes a
+// segment is a lifetime policy of the segment's contents (RTMSQueue's
+// session and attach-count rules in talOS/rtms/rtms.h), not of one mapping.
 class SharedMemoryPtr {
 public:
+    SharedMemoryPtr() = default;  // maps nothing; ptr() is null
+
     SharedMemoryPtr(std::string_view name, std::size_t size) :
         shm_name_(ShmObjectName(name)),
         size_(size) {
@@ -66,19 +72,11 @@ public:
         }
     }
 
-    ~SharedMemoryPtr() {
-        reset();
-        // If our create ptr dies remove shared memory
-        if (mode_ == SharedMemoryMode::CREATE) {
-            shm_unlink(shm_name_.c_str());
-        }
-    }
+    ~SharedMemoryPtr() { reset(); }
 
     SharedMemoryPtr(const SharedMemoryPtr&) = delete;
     SharedMemoryPtr& operator=(const SharedMemoryPtr&) = delete;
 
-    // The moved-from object is left as an ATTACH so that its destructor does
-    // not unlink the shared memory the moved-to object now owns.
     SharedMemoryPtr(SharedMemoryPtr&& other) noexcept
         : shm_name_(std::move(other.shm_name_)),
         size_(std::exchange(other.size_, 0)),
@@ -89,9 +87,6 @@ public:
     SharedMemoryPtr& operator=(SharedMemoryPtr&& other) noexcept {
         if (this != &other) {
             reset();
-            if (mode_ == SharedMemoryMode::CREATE) {
-                shm_unlink(shm_name_.c_str());
-            }
             shm_name_ = std::move(other.shm_name_);
             size_ = std::exchange(other.size_, 0);
             mode_ = std::exchange(other.mode_, SharedMemoryMode::ATTACH);
@@ -99,6 +94,9 @@ public:
         }
         return *this;
     }
+
+    // The segment's name in the shared-memory namespace (ShmObjectName).
+    const std::string& name() const { return shm_name_; }
 
 
     void* ptr() {

@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 13u
+#define TALOS_NODE_ABI_VERSION 14u
 
 enum {
   TALOS_OK = 0,
@@ -44,6 +44,16 @@ typedef int32_t (*TalosMessageCallback)(const void* data, uint32_t size,
 // Builds the user's object on `node` (subscribing, publishing, taking
 // handles, calling talos_node_set_update).
 typedef int32_t (*TalosFactory)(TalosNode* node, void* user);
+
+// A message type's schema identity (talOS/schema/identity.h): Python's
+// <Struct>.TALOS_SCHEMA_NAME, TALOS_SCHEMA_HASH and TALOS_SCHEMA_BFBS, as
+// C++'s talos::Descriptor<M>. The bytes are copied during the call.
+typedef struct TalosSchema {
+  const char* name;
+  uint64_t hash;
+  const void* bfbs;
+  uint32_t bfbs_size;
+} TalosSchema;
 
 uint32_t talos_abi_version(void);
 // Last error on this thread; valid until the next call. Never NULL.
@@ -90,12 +100,13 @@ int32_t talos_node_param(const TalosNode* node, const char* key, int32_t kind,
                          int32_t required, TalosParam* out);
 
 // Registration: call while the factory runs. Indexes are >= 0; -1 is an
-// error.
+// error. `schema` names the message type; the topic refuses another.
 int64_t talos_node_subscribe(TalosNode* node, const char* topic,
-                             uint32_t message_bytes, int32_t optional,
-                             TalosMessageCallback on_message, void* user);
+                             uint32_t message_bytes, const TalosSchema* schema,
+                             int32_t optional, TalosMessageCallback on_message,
+                             void* user);
 int64_t talos_node_publish(TalosNode* node, const char* topic,
-                           uint32_t message_bytes);
+                           uint32_t message_bytes, const TalosSchema* schema);
 int64_t talos_node_publish_bytes(TalosNode* node, const char* topic,
                                  uint32_t max_bytes, uint32_t slots,
                                  int32_t drop_newest, int32_t external);
@@ -234,11 +245,11 @@ int32_t talos_driver_station_read(TalosNode* node, TalosDriverStation* out);
 // --- target lanes (talos::Target, talos::TargetLane) ----------------------
 
 // Opens this node's Target for a message of `message_bytes` aligned to
-// `alignment` (the struct's minimum alignment, a power of two <= 8): one
-// lane per source of the node's target policy, plus the Driver Station.
-// Call while the factory runs. Returns its index.
+// `alignment` (the struct's minimum alignment, a power of two <= 8) and of
+// `schema`: one lane per source of the node's target policy, plus the
+// Driver Station. Call while the factory runs. Returns its index.
 int64_t talos_target_open(TalosNode* node, uint32_t message_bytes,
-                          uint32_t alignment);
+                          uint32_t alignment, const TalosSchema* schema);
 // Target::get(): returns 1 and copies the selected message into `out` (when
 // not NULL), or 0 when nothing is selected. `*source_index` (when not NULL)
 // is the selected source, or -1.
@@ -251,7 +262,7 @@ const char* talos_target_source_name(TalosNode* node, int64_t target,
 // Opens the lane /<subsystem>/target/<source>. Call while the factory runs.
 int64_t talos_target_lane_open(TalosNode* node, const char* subsystem,
                                const char* source, uint32_t message_bytes,
-                               uint32_t alignment);
+                               uint32_t alignment, const TalosSchema* schema);
 // TargetLane::send (active = 1, stamped with this node's Driver Station mode
 // generation) and release (active = 0). Return 1 sent, 0 dropped by the
 // transport, TALOS_ERR.

@@ -2,29 +2,16 @@
 
 #include <chrono>
 #include <cmath>
-#include <cstdint>
 #include <numbers>
-#include <string>
-#include <string_view>
-#include <vector>
 
 #include "drivetrain/drive_message_generated.h"
 #include "drivetrain/topics.h"
 #include "intake/intake_message_generated.h"
 #include "shooter/shooter_message_generated.h"
-#include "talOS/configuration/config_parser.h"
 #include "talOS/devices/devices.h"
 #include "talOS/node/node.h"
 
 namespace operator_interface {
-
-// Wire-compatible with the Target struct of any single-demand mechanism
-// scaffolded by tools/new_subsystem.py ({demand:double}).
-struct alignas(8) GenericTarget {
-  double demand{0.0};
-};
-static_assert(sizeof(GenericTarget) == 8);
-static_assert(talos::Message<GenericTarget>);
 
 // Maps each Driver Station packet (/hw/state/driver_station, through
 // talos::DriverStation) to teleop requests as it arrives: stick scaling,
@@ -60,27 +47,6 @@ class OperatorInterface {
           heading_at_ = node_.now();
           have_heading_ = true;
         });
-    if (!node.config_path().empty()) {
-      const auto cfg = talos::config::ParseRobotConfig(node.config_path());
-      if (const auto* subs = cfg.toml_data["subsystems"].as_table()) {
-        for (const auto& [key, val] : *subs) {
-          const std::string_view sub_name = key.str();
-          if (sub_name == "drivetrain" || sub_name == "shooter" ||
-              sub_name == "intake") {
-            continue;
-          }
-          const auto* tbl = val.as_table();
-          if (tbl == nullptr) continue;
-          const std::int64_t button =
-              (*tbl)["teleop_button"].value_or(std::int64_t{0});
-          if (button < 1 || button > 32) continue;
-          const double demand = (*tbl)["teleop_demand"].value_or(0.0);
-          extra_bindings_.push_back(ExtraBinding{
-              static_cast<int>(button), demand,
-              talos::TargetLane<GenericTarget>{node, sub_name, "teleop"}});
-        }
-      }
-    }
   }
 
   // A Driver Station that stops talking gets the same one release per lane
@@ -114,7 +80,6 @@ class OperatorInterface {
     chassis_.release();
     shooter_.release();
     intake_.release();
-    for (auto& binding : extra_bindings_) binding.lane.release();
   }
 
   void OnDriver() {
@@ -153,13 +118,6 @@ class OperatorInterface {
     } else {
       intake_.release();
     }
-    for (auto& binding : extra_bindings_) {
-      if (stick.button(binding.button)) {
-        binding.lane.send(GenericTarget{binding.demand});
-      } else {
-        binding.lane.release();
-      }
-    }
   }
 
   talos::Node& node_;
@@ -176,12 +134,6 @@ class OperatorInterface {
   talos::TargetLane<shooter::ShooterTarget> shooter_;
   talos::TargetLane<intake::IntakeTarget> intake_;
   talos::DriverStation ds_;
-  struct ExtraBinding {
-    int button;  // 1-based
-    double demand;
-    talos::TargetLane<GenericTarget> lane;
-  };
-  std::vector<ExtraBinding> extra_bindings_;
   double yaw_rot_ = 0;
   talos::Time heading_at_{};
   bool have_heading_ = false;

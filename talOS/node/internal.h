@@ -12,6 +12,7 @@
 #include "talOS/events/callback.h"
 #include "talOS/events/delivery.h"
 #include "talOS/events/time.h"
+#include "talOS/schema/identity.h"
 
 namespace talos {
 struct BytePublishOptions;
@@ -44,10 +45,12 @@ class LoopPort {
   virtual std::uint16_t register_watcher(std::string_view topic,
                                          std::uint32_t message_bytes,
                                          std::uint32_t alignment,
+                                         const schema::Identity& schema,
                                          event::Thunk callback) = 0;
   virtual std::uint16_t register_sender(std::string_view topic,
                                         std::uint32_t message_bytes,
-                                        std::uint32_t alignment) = 0;
+                                        std::uint32_t alignment,
+                                        const schema::Identity& schema) = 0;
   virtual void arm_timer(std::uint16_t id, Time first, Duration period) = 0;
   virtual bool send(std::uint16_t id, std::span<const std::byte> bytes) = 0;
   virtual Time now() const = 0;
@@ -76,13 +79,16 @@ class LoopPortFor : public LoopPort {
   std::uint16_t register_watcher(std::string_view topic,
                                  std::uint32_t message_bytes,
                                  std::uint32_t alignment,
+                                 const schema::Identity& schema,
                                  event::Thunk callback) override {
-    return loop_.register_watcher(topic, message_bytes, alignment, callback);
+    return loop_.register_watcher(topic, message_bytes, alignment, schema,
+                                  callback);
   }
   std::uint16_t register_sender(std::string_view topic,
                                 std::uint32_t message_bytes,
-                                std::uint32_t alignment) override {
-    return loop_.register_sender(topic, message_bytes, alignment);
+                                std::uint32_t alignment,
+                                const schema::Identity& schema) override {
+    return loop_.register_sender(topic, message_bytes, alignment, schema);
   }
   void arm_timer(std::uint16_t id, Time first, Duration period) override {
     loop_.arm_timer(id, first, period);

@@ -10,7 +10,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "talOS/events/events_test_message_generated.h"
+#include "events_test/events_test_message_generated.h"
 #include "talOS/events/realtime_event_loop.h"
 #include "talOS/events/replay_event_loop.h"
 #include "talOS/events/test_robot.h"

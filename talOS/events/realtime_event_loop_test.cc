@@ -11,7 +11,7 @@
 #include <thread>
 #include <vector>
 
-#include "talOS/events/events_test_message_generated.h"
+#include "events_test/events_test_message_generated.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/replay_event_loop.h"
@@ -42,7 +42,9 @@ using RecordingLoop = RealtimeEventLoop<log::LogWriter>;
 std::uint16_t register_sensor_watcher(RealtimeEventLoop<>& loop,
                                       const std::string& topic) {
   return loop.register_watcher(topic, sizeof(EventsTest::SensorMessage),
-                               alignof(EventsTest::SensorMessage), Thunk{});
+                               alignof(EventsTest::SensorMessage),
+                               talos::schema::Of<EventsTest::SensorMessage>(),
+                               Thunk{});
 }
 
 TEST(RealtimeEventLoop, PeriodicTimerRunsAtRate) {
@@ -152,7 +154,8 @@ TEST(RealtimeEventLoop, RejectsTimerChangesFromAnotherThread) {
 TEST(RealtimeEventLoop, ReleasesReadersWhenLoopIsDestroyed) {
   const std::string topic = "/reuse_" + std::to_string(::getpid());
   RTMSQueue keeper{topic, sizeof(EventsTest::SensorMessage),
-                   alignof(EventsTest::SensorMessage), MAX_SLOTS};
+                   alignof(EventsTest::SensorMessage),
+                   talos::schema::Of<EventsTest::SensorMessage>(), MAX_SLOTS};
   for (std::size_t i = 0; i < MAX_READERS * 2; ++i) {
     RealtimeEventLoop<> loop;
     EXPECT_NO_THROW(register_sensor_watcher(loop, topic));
@@ -162,7 +165,8 @@ TEST(RealtimeEventLoop, ReleasesReadersWhenLoopIsDestroyed) {
 TEST(RealtimeEventLoop, ReaderExhaustionFailsRegistrationAndAllowsRetry) {
   const std::string topic = "/full_" + std::to_string(::getpid());
   RTMSQueue keeper{topic, sizeof(EventsTest::SensorMessage),
-                   alignof(EventsTest::SensorMessage), MAX_SLOTS};
+                   alignof(EventsTest::SensorMessage),
+                   talos::schema::Of<EventsTest::SensorMessage>(), MAX_SLOTS};
   std::vector<std::size_t> readers;
   for (std::size_t i = 0; i < MAX_READERS; ++i) {
     auto reader = keeper.register_reader();

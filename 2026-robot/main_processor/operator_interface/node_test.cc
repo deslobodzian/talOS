@@ -298,59 +298,6 @@ TEST(OperatorInterface, RunsShooterOnButtonOneAndIntakeOnButtonTwo) {
   EXPECT_NEAR(harness.intake().roller_velocity_rps(), 30.0, 1e-6);
 }
 
-TEST(OperatorInterface, PublishesTomlConfiguredSubsystemTeleopTarget) {
-  Sim sim = Sim::FromToml(R"(
-[robot]
-period_us = 5000
-command_timeout_us = 100000
-
-[subsystems.operator_interface]
-period_us = 20000
-
-[subsystems.wrist]
-period_us = 20000
-teleop_button = 3
-teleop_demand = 25.0
-telemetry = true
-
-[subsystems.wrist.motors.wrist_motor]
-can_id = 1
-)");
-  sim.add<OperatorInterface>("operator_interface");
-  SimHardware hw{sim};
-
-  const auto wrist = [&sim] {
-    return LatestTarget<GenericTarget>(sim, "wrist", "teleop");
-  };
-
-  // Button 3 (bit 2) pressed in teleop -> the lane asks for 25.0.
-  hw.set_driver_station(
-      DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/1u << 2)));
-  sim.step(10ms);
-  ASSERT_TRUE(wrist().has_value());
-  EXPECT_EQ(wrist()->active, 1u);
-  EXPECT_DOUBLE_EQ(wrist()->message.demand, 25.0);
-
-  // Button 3 released -> the lane is released.
-  hw.set_driver_station(DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/0)));
-  sim.step(10ms);
-  ASSERT_TRUE(wrist().has_value());
-  EXPECT_EQ(wrist()->active, 0u);
-
-  // Press button 3 again, then disable the robot -> released on the edge.
-  hw.set_driver_station(
-      DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/1u << 2)));
-  sim.step(10ms);
-  ASSERT_TRUE(wrist().has_value());
-  ASSERT_EQ(wrist()->active, 1u);
-
-  hw.set_driver_station(
-      DsState(ds::kDsAttached, Stick(0, 0, 0, /*buttons=*/1u << 2)));
-  sim.step(10ms);
-  ASSERT_TRUE(wrist().has_value());
-  EXPECT_EQ(wrist()->active, 0u);
-}
-
 // --- the teleop chain on the real robot config ---------------------------
 
 std::string RobotConfig() {

@@ -46,6 +46,7 @@
 #include "talOS/events/time.h"
 #include "talOS/ipc/concepts.h"
 #include "talOS/node/access.h"
+#include "talOS/schema/identity.h"
 
 namespace talos {
 
@@ -64,11 +65,14 @@ using Duration = std::chrono::nanoseconds;
 inline constexpr std::size_t kMessageAlignment = 8;
 
 // A message that can cross a topic: a fixed-size flatbuffer struct (tables
-// have no size) that fits the fixed slot alignment.
+// have no size) that fits the fixed slot alignment and has a schema
+// descriptor, which talos_messages generates for every struct. The topic
+// records the descriptor's name and hash; an endpoint of another schema is
+// refused.
 template <class M>
 concept Message =
     std::is_trivially_copyable_v<M> && ipc::NotDerivedFromFlatbufferTable<M> &&
-    alignof(M) <= kMessageAlignment;
+    alignof(M) <= kMessageAlignment && Described<M>;
 
 // Node::subscribe options.
 struct SubscribeOptions {
@@ -324,7 +328,7 @@ Subscription<M> Node::subscribe(std::string_view topic,
                                 SubscribeOptions options) {
   return Subscription<M>{this, detail::NodeAccess::add_subscription(
                                    *this, topic, sizeof(M), kMessageAlignment,
-                                   options.optional, {})};
+                                   schema::Of<M>(), options.optional, {})};
 }
 
 template <Message M, std::invocable<const M&> F>
@@ -335,8 +339,8 @@ Subscription<M> Node::subscribe(std::string_view topic, F on_message,
         fn(*static_cast<const M*>(data));
       };
   const std::size_t index = detail::NodeAccess::add_subscription(
-      *this, topic, sizeof(M), kMessageAlignment, options.optional,
-      std::move(callback));
+      *this, topic, sizeof(M), kMessageAlignment, schema::Of<M>(),
+      options.optional, std::move(callback));
   detail::NodeAccess::require_immediate_delivery(*this);
   return Subscription<M>{this, index};
 }
@@ -344,7 +348,8 @@ Subscription<M> Node::subscribe(std::string_view topic, F on_message,
 template <Message M>
 Publisher<M> Node::publish(std::string_view topic) {
   return Publisher<M>{this, detail::NodeAccess::add_publisher(
-                                *this, topic, sizeof(M), kMessageAlignment)};
+                                *this, topic, sizeof(M), kMessageAlignment,
+                                schema::Of<M>())};
 }
 
 template <class T>

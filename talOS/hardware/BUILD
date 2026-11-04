@@ -29,6 +29,7 @@ cc_library(
     deps = [
         ":config",
         "//talOS/protocol",
+        "//talOS/schema:identity",
     ],
 )
 

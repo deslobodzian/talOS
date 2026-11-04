@@ -284,7 +284,8 @@ class Target:
         self._node = node._handle
         self._type = message_type(msg)
         self._index = _abi.index(lib.talos_target_open(
-            self._node, self._type.size, self._type.alignment))
+            self._node, self._type.size, self._type.alignment,
+            _abi.schema_of(self._type)))
         self._buffer = ctypes.create_string_buffer(self._type.size)
         self._source = ctypes.c_int32(-1)
 
@@ -321,7 +322,7 @@ class TargetLane:
         self._type = message_type(msg)
         self._index = _abi.index(lib.talos_target_lane_open(
             self._node, _abi.encode(subsystem), _abi.encode(source),
-            self._type.size, self._type.alignment))
+            self._type.size, self._type.alignment, _abi.schema_of(self._type)))
 
     def send(self, message=None, **fields):
         """send(field=value, ...) with the .fbs field names, or send(message)

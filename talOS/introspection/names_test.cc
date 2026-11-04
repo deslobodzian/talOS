@@ -5,6 +5,7 @@
 
 #include "talOS/introspection/names.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -465,11 +466,9 @@ TEST(LintGraph, TimerLabelsAreNotTopics) {
   }
 }
 
-// Contract compatibility is enforced on byte size: two ends that disagree on
-// the size of one topic cannot be wire-compatible, so the linter rejects the
-// graph before launch. A size match is not a compatibility proof -- a schema
-// can change without changing size -- which is why provenance records contract
-// labels without trusting them.
+// A shape without a schema (a registry snapshot) is still checked on byte
+// size: two ends that disagree on the size of one topic cannot be
+// wire-compatible.
 TEST(LintGraph, TwoSizesOnOneTopicIsAnErrorAndBothEndsAreNamed) {
   const std::vector<NodeShape> nodes = {
       {"shooter",
@@ -490,6 +489,75 @@ TEST(LintGraph, TwoSizesOnOneTopicIsAnErrorAndBothEndsAreNamed) {
   EXPECT_TRUE(
       Mentions(diagnostics, Severity::ERROR, "/shooter/state", "odometry"))
       << Describe(diagnostics);
+}
+
+SourceShape Typed(SourceShape shape, std::string schema, std::uint64_t hash,
+                  std::uint32_t slots = 1024) {
+  shape.schema = std::move(schema);
+  shape.schema_hash = hash;
+  shape.alignment = 8;
+  shape.slots = slots;
+  return shape;
+}
+
+// A size match is not a compatibility proof: a field can change type without
+// changing size. Describe reports each end's schema identity, and two
+// schemas on one topic are an error naming both types and both nodes.
+TEST(LintGraph, TwoSchemasOfTheSameSizeOnOneTopicIsAnErrorNamingBothTypes) {
+  const std::vector<NodeShape> nodes = {
+      {"shooter",
+       "//2026-robot/main_processor/shooter:node",
+       {Typed(Sender("/shooter/state", 24), "shooter.State", 0x1)}},
+      {"odometry",
+       "//2026-robot/main_processor/odometry:node",
+       {Typed(Watcher("/shooter/state", 24), "shooter.OldState", 0x2)}},
+  };
+  const auto diagnostics = LintGraph(nodes);
+  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/state",
+                       "two schemas"))
+      << Describe(diagnostics);
+  for (const auto* named : {"shooter.State (0x0000000000000001)",
+                            "shooter.OldState (0x0000000000000002)",
+                            "by shooter", "by odometry"}) {
+    EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/state", named))
+        << named << "\n"
+        << Describe(diagnostics);
+  }
+  // One finding: the schema error explains the topic.
+  EXPECT_EQ(std::count_if(diagnostics.begin(), diagnostics.end(),
+                          [](const Diagnostic& d) {
+                            return d.severity == Severity::ERROR;
+                          }),
+            1);
+}
+
+TEST(LintGraph, ASameNamedSchemaWithAnotherHashIsAnError) {
+  const std::vector<NodeShape> nodes = {
+      {"shooter",
+       "//2026-robot/main_processor/shooter:node",
+       {Typed(Sender("/shooter/state", 24), "shooter.State", 0x1)}},
+      {"odometry",
+       "//2026-robot/main_processor/odometry:node",
+       {Typed(Watcher("/shooter/state", 24), "shooter.State", 0x3)}},
+  };
+  EXPECT_TRUE(Mentions(LintGraph(nodes), Severity::ERROR, "/shooter/state",
+                       "two schemas"));
+}
+
+TEST(LintGraph, MatchingSchemasPassAndDifferentRingLayoutsDoNot) {
+  std::vector<NodeShape> nodes = {
+      {"shooter",
+       "//2026-robot/main_processor/shooter:node",
+       {Typed(Sender("/shooter/state", 24), "shooter.State", 0x1)}},
+      {"odometry",
+       "//2026-robot/main_processor/odometry:node",
+       {Typed(Watcher("/shooter/state", 24), "shooter.State", 0x1)}},
+  };
+  EXPECT_FALSE(HasError(LintGraph(nodes))) << Describe(LintGraph(nodes));
+  nodes[1].sources[0].slots = 64;
+  EXPECT_TRUE(Mentions(LintGraph(nodes), Severity::ERROR, "/shooter/state",
+                       "two ring layouts"));
 }
 
 TEST(LintGraph, UnreadTopicIsAWarningNotAnError) {

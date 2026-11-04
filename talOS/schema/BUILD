@@ -11,6 +11,15 @@ cc_library(
     hdrs = ["descriptor.h"],
 )
 
+# talos::schema::Identity: a topic's schema name, hash and .bfbs, plus the
+# framework layouts' identities (talos.Bytes, talos.hardware.Packet,
+# talos.TargetEnvelope<M>).
+cc_library(
+    name = "identity",
+    hdrs = ["identity.h"],
+    deps = [":descriptor"],
+)
+
 # The METHODOLOGY §6 unit suffixes the field-name lint checks against.
 cc_library(
     name = "unit_suffix",
@@ -98,7 +107,8 @@ genrule(
     outs = ["variants/%s.bfbs" % v for v in _VARIANTS],
     cmd = "$(execpath @flatbuffers//:flatc) --binary --schema -o $(RULEDIR)/variants $(SRCS)",
     tools = ["@flatbuffers//:flatc"],
-    visibility = ["//visibility:private"],
+    # rtms_test attaches the float/int variants to prove the attach check.
+    visibility = ["//talOS/rtms:__pkg__"],
 )
 
 # TALOS_VARIANT_<NAME>: the runfile of variants/<name>.bfbs.
