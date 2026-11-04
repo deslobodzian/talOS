@@ -110,6 +110,7 @@ struct NodeAccess {
   // graph.
   static const DeclaredGraph* declared_graph(Node& node);
   static bool reads_graph(const Node& node);
+  static const config::RobotConfig& robot_config(const Node& node);
 
   // A parameter of this node's subsystem table, or nullopt when absent. A
   // present key of another type throws, naming it.

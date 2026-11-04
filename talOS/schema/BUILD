@@ -119,7 +119,10 @@ talos_messages(
     name = "test_messages",
     srcs = ["testdata/shapes.fbs"],
     include_prefix = "schema_test",
-    visibility = ["//talOS/python:__pkg__"],
+    visibility = [
+        "//talOS/python:__pkg__",
+        "//talOS/telemetry:__pkg__",
+    ],
 )
 
 # schema_variant (an enum, a struct using it, a struct nesting that) in five

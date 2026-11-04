@@ -372,6 +372,10 @@ bool NodeAccess::reads_graph(const Node& node) {
   return node.impl_->reads_graph;
 }
 
+const config::RobotConfig& NodeAccess::robot_config(const Node& node) {
+  return *node.impl_->config;
+}
+
 std::size_t NodeAccess::add_state_machine(Node& node, std::int64_t initial) {
   node.impl_->state_machines.push_back(Node::Impl::StateMachineSlot{
       .state = initial,
@@ -1091,10 +1095,10 @@ int RunMain(int argc, char** argv, const char* node_name,
       event::SimulationEnvironment environment;
       event::SimulatedEventLoop<> loop{environment};
       const Hosted hosted = Host(loop, node_name, flags, make);
-      std::printf("%s", introspect::DescribeToJson(
-                            DescribeNode(*hosted.node, node_target,
-                                         loop.manifest()))
-                            .c_str());
+      std::printf("%s",
+                  introspect::DescribeToJson(
+                      DescribeNode(*hosted.node, node_target, loop.manifest()))
+                      .c_str());
       return 0;
     }
     if (!flags.replay_path.empty()) {

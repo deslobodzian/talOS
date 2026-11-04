@@ -1,6 +1,7 @@
 load("@flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//talOS/build:contract.bzl", "talos_cc_node")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -26,4 +27,45 @@ cc_test(
     name = "wire_test",
     srcs = ["tests/wire_test.cc"],
     deps = [":wire"],
+)
+
+cc_library(
+    name = "telemetry",
+    hdrs = ["node.h"],
+    deps = [
+        ":schema",
+        ":wire",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/hardware",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:names",
+        "//talOS/node",
+        "//talOS/schema:identity",
+        "//talOS/schema:unit_suffix",
+        "@flatbuffers//:runtime_cc",
+    ],
+)
+
+talos_cc_node(
+    name = "node",
+    srcs = ["node.cc"],
+    node_name = "telemetry",
+    deps = [":telemetry"],
+)
+
+cc_test(
+    name = "node_test",
+    size = "small",
+    srcs = ["node_test.cc"],
+    deps = [
+        ":telemetry",
+        ":wire",
+        "//talOS/driver_station",
+        "//talOS/hardware",
+        "//talOS/msgs:geometry",
+        "//talOS/node:testing",
+        "//talOS/schema:test_messages",
+        "@googletest//:gtest_main",
+    ],
 )
