@@ -1,6 +1,9 @@
 [subsystems.a]
 node = "//a:node"
 
+[subsystems.a.motors.m]
+can_id = 1
+
 [[subsystems.a.teleop.bindings]]
 axis = 1
 field = "vel"
