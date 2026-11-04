@@ -24,9 +24,9 @@ older than it by more than max_observation_age_us.
 """
 
 import collections
+import importlib
 import math
 
-import gtsam
 import numpy as np
 from drivetrain import topics as drivetrain_topics
 from drivetrain.DrivetrainState import DrivetrainState
@@ -132,15 +132,19 @@ class FactorGraphBackend:
     """
 
     def __init__(self, node, kinematics, lag_s):
+        # Loaded here, for this backend only: gtsam is 150 MB of native code
+        # that takes seconds to load on a cold start, longer than the
+        # launcher's --describe probe allows.
+        self.gtsam = importlib.import_module("gtsam")
         self.kinematics = kinematics
         self.lag_s = lag_s
-        self.odometry_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array(
+        self.odometry_noise = self.gtsam.noiseModel.Diagonal.Sigmas(np.array(
             _std_devs(node, "factor_graph", "odometry_std",
                       (0.01, 0.01, 0.005))))
-        self.prior_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array(
+        self.prior_noise = self.gtsam.noiseModel.Diagonal.Sigmas(np.array(
             _std_devs(node, "factor_graph", "prior_std", (1.0, 1.0, 0.5))))
-        self.smoother = gtsam.IncrementalFixedLagSmoother(
-            lag_s, gtsam.ISAM2Params())
+        self.smoother = self.gtsam.IncrementalFixedLagSmoother(
+            lag_s, self.gtsam.ISAM2Params())
         # The samples whose keys are still in the smoother, plus the newest
         # marginalized one as the interpolation anchor just past the window.
         self.samples = collections.deque()
@@ -151,9 +155,9 @@ class FactorGraphBackend:
 
     def start(self, time_s, yaw, positions):
         origin = Pose2d(0.0, 0.0, yaw)
-        graph = gtsam.NonlinearFactorGraph()
-        graph.add(gtsam.PriorFactorPose2(0, _gtsam_pose(origin),
-                                         self.prior_noise))
+        graph = self.gtsam.NonlinearFactorGraph()
+        graph.add(self.gtsam.PriorFactorPose2(0, self._pose2(origin),
+                                              self.prior_noise))
         self._add_sample(graph, time_s, origin, origin)
         self.yaw, self.positions = yaw, positions
 
@@ -165,10 +169,10 @@ class FactorGraphBackend:
                         (yaw - self.yaw).radians())
         step = Pose2d().exp(twist)
         previous = self.samples[-1]
-        graph = gtsam.NonlinearFactorGraph()
-        graph.add(gtsam.BetweenFactorPose2(previous.key, self.next_key,
-                                           _gtsam_pose(step),
-                                           self.odometry_noise))
+        graph = self.gtsam.NonlinearFactorGraph()
+        graph.add(self.gtsam.BetweenFactorPose2(
+            previous.key, self.next_key, self._pose2(step),
+            self.odometry_noise))
         self._add_sample(graph, time_s, previous.odometry.exp(twist),
                          self.estimate.exp(twist))
         self.yaw, self.positions = yaw, positions
@@ -178,21 +182,24 @@ class FactorGraphBackend:
         # The observed pose moved by the odometry from time_s to the sample.
         moved = pose.transformBy(
             Transform2d(self._odometry_at(time_s), sample.odometry))
-        graph = gtsam.NonlinearFactorGraph()
-        graph.add(gtsam.PriorFactorPose2(
-            sample.key, _gtsam_pose(moved),
-            gtsam.noiseModel.Diagonal.Sigmas(np.array(std_devs))))
-        self.smoother.update(graph, gtsam.Values(),
-                             gtsam.FixedLagSmootherKeyTimestampMap())
+        graph = self.gtsam.NonlinearFactorGraph()
+        graph.add(self.gtsam.PriorFactorPose2(
+            sample.key, self._pose2(moved),
+            self.gtsam.noiseModel.Diagonal.Sigmas(np.array(std_devs))))
+        self.smoother.update(graph, self.gtsam.Values(),
+                             self.gtsam.FixedLagSmootherKeyTimestampMap())
         self._read_estimate()
 
     def pose(self):
         return self.estimate
 
+    def _pose2(self, pose):
+        return self.gtsam.Pose2(pose.X(), pose.Y(), pose.rotation().radians())
+
     def _add_sample(self, graph, time_s, odometry, guess):
-        values = gtsam.Values()
-        values.insert(self.next_key, _gtsam_pose(guess))
-        stamps = gtsam.FixedLagSmootherKeyTimestampMap()
+        values = self.gtsam.Values()
+        values.insert(self.next_key, self._pose2(guess))
+        stamps = self.gtsam.FixedLagSmootherKeyTimestampMap()
         stamps.insert((self.next_key, time_s))
         self.smoother.update(graph, values, stamps)
         self.samples.append(_Sample(self.next_key, time_s, odometry))
@@ -235,10 +242,6 @@ class FactorGraphBackend:
         latest = self.smoother.calculateEstimatePose2(self.samples[-1].key)
         self.estimate = Pose2d(latest.x(), latest.y(),
                                Rotation2d(latest.theta()))
-
-
-def _gtsam_pose(pose):
-    return gtsam.Pose2(pose.X(), pose.Y(), pose.rotation().radians())
 
 
 class PoseEstimator:

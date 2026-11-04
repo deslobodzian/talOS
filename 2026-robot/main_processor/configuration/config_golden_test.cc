@@ -81,8 +81,8 @@ inline hardware::Config ReferenceSwerveConfig(bool simulation = false) {
   std::sort(c.motors.begin(), c.motors.end(),
             [](const auto& a, const auto& b) { return a.name < b.name; });
 
-  // "intake" sorts between "driver_station" and "odometry", so its devices
-  // take ids 14-15 and the shooter pair shifts to 16-17.
+  // "intake" sorts between "driver_station" and "operator_interface", so its
+  // devices take ids 14-15 and the shooter pair shifts to 16-17.
   hardware::DigitalInputConfig intake_beam;
   intake_beam.id = 14;
   intake_beam.name = "intake_beam";
@@ -338,6 +338,35 @@ TEST(ConfigTest, TargetPolicyIsTheDefaultForEveryActuatedSubsystem) {
     EXPECT_EQ(policy.teleop, std::vector<std::string>{"teleop"}) << name;
     EXPECT_EQ(policy.autonomous, std::vector<std::string>{"auto"}) << name;
     EXPECT_TRUE(policy.test.empty()) << name;
+  }
+}
+
+// The pose estimator's kinematics repeat the drivetrain's module offsets (it
+// reads its own table only); this keeps the copy from drifting.
+TEST(ConfigTest, PoseEstimatorModuleOffsetsMatchDrivetrainGeometry) {
+  const auto config =
+      ParseRobotConfig("2026-robot/main_processor/configuration/robot.toml");
+  const toml::table& root = config.toml_data;
+  const auto* modules =
+      root.at_path("subsystems.drivetrain.geometry.modules").as_array();
+  const auto* xs =
+      root.at_path("subsystems.pose_estimator.module_x_m").as_array();
+  const auto* ys =
+      root.at_path("subsystems.pose_estimator.module_y_m").as_array();
+  ASSERT_NE(modules, nullptr);
+  ASSERT_NE(xs, nullptr);
+  ASSERT_NE(ys, nullptr);
+  ASSERT_EQ(modules->size(), 4u);
+  ASSERT_EQ(xs->size(), modules->size());
+  ASSERT_EQ(ys->size(), modules->size());
+  for (std::size_t i = 0; i < modules->size(); ++i) {
+    const auto* module = (*modules)[i].as_table();
+    ASSERT_NE(module, nullptr) << i;
+    const std::string name{(*module)["name"].value_or(std::string_view{})};
+    EXPECT_EQ((*xs)[i].value<double>(), (*module)["x_m"].value<double>())
+        << "module_x_m[" << i << "] vs " << name;
+    EXPECT_EQ((*ys)[i].value<double>(), (*module)["y_m"].value<double>())
+        << "module_y_m[" << i << "] vs " << name;
   }
 }
 
