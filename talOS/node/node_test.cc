@@ -49,6 +49,10 @@ whole = 3
 big = 300
 tag = "left"
 inverted = true
+cameras = ["front", "back"]
+offsets_m = [0.5, 1, -2.25]
+none = []
+mixed = [1.0, "back"]
 [subsystems.listener.limits]
 max = 4.0
 
@@ -91,6 +95,51 @@ TEST(Node, ReadsParamsWithFallbacksAndRejectsMissingOrMistyped) {
   EXPECT_THROW((void)node.param<int>("gain", 0), std::invalid_argument);
   EXPECT_EQ(node.param<std::uint8_t>("whole"), 3);
   EXPECT_THROW((void)node.param<std::uint8_t>("big"), std::invalid_argument);
+}
+
+TEST(Node, ReadsArrayParamsAndNamesTheOffendingElement) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Empty>("listener");
+  const Node& node = sim.node("listener");
+  using Strings = std::vector<std::string>;
+  using Doubles = std::vector<double>;
+
+  EXPECT_EQ(node.param<Strings>("cameras"), (Strings{"front", "back"}));
+  EXPECT_EQ(node.param<Doubles>("offsets_m"), (Doubles{0.5, 1.0, -2.25}));
+  EXPECT_EQ(node.param<Strings>("none"), Strings{});
+  EXPECT_EQ(node.param<Doubles>("none"), Doubles{});
+  // A present array wins over the fallback, even an empty one.
+  EXPECT_EQ(node.param<Strings>("cameras", {"x"}), (Strings{"front", "back"}));
+  EXPECT_EQ(node.param<Doubles>("none", {9.0}), Doubles{});
+  EXPECT_EQ(node.param<Strings>("absent", {"x"}), Strings{"x"});
+  EXPECT_EQ(node.param<Doubles>("absent", {}), Doubles{});
+
+  auto error = [&](auto read) -> std::string {
+    try {
+      read();
+    } catch (const std::invalid_argument& e) {
+      return e.what();
+    }
+    return "no error";
+  };
+  EXPECT_EQ(error([&] { (void)node.param<Strings>("absent"); }),
+            "listener: parameter 'absent' is missing in [subsystems.listener]");
+  EXPECT_EQ(error([&] { (void)node.param<Doubles>("cameras"); }),
+            "listener: parameter 'cameras' must be an array of numbers; "
+            "element 0 is a string in [subsystems.listener]");
+  EXPECT_EQ(error([&] { (void)node.param<Strings>("offsets_m", {}); }),
+            "listener: parameter 'offsets_m' must be an array of strings; "
+            "element 0 is a float in [subsystems.listener]");
+  EXPECT_EQ(error([&] { (void)node.param<Doubles>("mixed"); }),
+            "listener: parameter 'mixed' must be an array of numbers; "
+            "element 1 is a string in [subsystems.listener]");
+  EXPECT_EQ(error([&] { (void)node.param<Strings>("tag"); }),
+            "listener: parameter 'tag' must be an array of strings in "
+            "[subsystems.listener]");
+  EXPECT_EQ(error([&] { (void)node.param<Doubles>("limits", {}); }),
+            "listener: parameter 'limits' must be an array of numbers in "
+            "[subsystems.listener]");
+  EXPECT_THROW((void)node.param<std::string>("cameras"), std::invalid_argument);
 }
 
 TEST(Node, PeriodComesFromTheSubsystemElseTheRobot) {

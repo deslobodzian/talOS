@@ -56,7 +56,8 @@ int RunMain(int argc, char** argv, const char* node_name,
             const char* node_target, const InstanceFactory& make);
 
 using MessageCallback = std::function<void(const void*)>;
-using ParamValue = std::variant<bool, std::int64_t, double, std::string>;
+using ParamValue = std::variant<bool, std::int64_t, double, std::string,
+                                std::vector<std::string>, std::vector<double>>;
 
 struct NodeAccess {
   static std::unique_ptr<Node> create(NodeSetup setup);
@@ -93,7 +94,15 @@ struct NodeAccess {
                                            std::string_view key);
   static std::optional<std::string> find_string(const Node& node,
                                                 std::string_view key);
-  // Whatever type the key has (bool, integer, float or string).
+  // A TOML array: of strings, or of numbers (integers convert). An empty
+  // array is valid. A non-array, or an element of another type, throws
+  // naming the element's index and type.
+  static std::optional<std::vector<std::string>> find_string_list(
+      const Node& node, std::string_view key);
+  static std::optional<std::vector<double>> find_double_list(
+      const Node& node, std::string_view key);
+  // Whatever type the key has (bool, integer, float, string, or an array of
+  // strings or of numbers; an empty array is an empty double list).
   static std::optional<ParamValue> find_param(const Node& node,
                                               std::string_view key);
   // Throws std::invalid_argument naming the node, the key and the problem.

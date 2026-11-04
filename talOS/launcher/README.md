@@ -108,10 +108,13 @@ which is recorded per node in `graph.json` and in the session manifest, so a
 graph that passed because half of it went unread does not look like a graph that
 passed.
 
-The probe has a short timeout — five seconds by default,
+The probe has a timeout — fifteen seconds by default,
 `--describe-timeout-ms` to change it — after which the probe is killed and
 reported. A node that blocks in its constructor waiting for a device is a bug
-worth seeing, and it must cost the launch a few seconds rather than the session.
+worth seeing, and it must cost the launch seconds rather than the session. The
+default leaves room for a Python node's first run from a freshly deployed
+bundle, when macOS checks each native library a wheel brings (several seconds
+for `robotpy-wpimath`; under one second afterwards).
 
 ## Controller addressing
 

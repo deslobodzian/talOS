@@ -132,6 +132,11 @@ def main():
     # 4. Nodes. A Python node's runfiles carry libtalos_node.so (a data
     # dependency of //talOS/python:talos), which talos._abi finds beside itself.
     manifest_nodes = []
+    # lib/: the shared libraries C++ nodes link (talos_cc_node's rpath is
+    # ../lib from bin/). One file per name; two nodes may carry the same
+    # library, but never two different libraries under one name.
+    lib_dir = os.path.join(out_dir, "lib")
+    staged_libs = {}
     for node in spec.get("nodes", []):
         name = node["name"]
         target = node["target"]
@@ -188,6 +193,17 @@ def main():
             if repo_mapping_src and os.path.exists(repo_mapping_src):
                 safe_copy(repo_mapping_src, os.path.join(rf_dir, "_repo_mapping"))
                 safe_copy(repo_mapping_src, os.path.join(bin_dir, f"{name}.repo_mapping"))
+        for lib in node.get("shared_libs", []):
+            with open(lib["src_path"], "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            seen = staged_libs.get(lib["name"])
+            if seen is None:
+                os.makedirs(lib_dir, exist_ok=True)
+                safe_copy(lib["src_path"], os.path.join(lib_dir, lib["name"]))
+                staged_libs[lib["name"]] = (digest, name)
+            elif seen[0] != digest:
+                sys.exit(f"bundle: nodes '{seen[1]}' and '{name}' link different "
+                         f"shared libraries named {lib['name']}")
         # Every label the robot config may name this node by.
         targets = [t for t in (target, node.get("label")) if t]
         manifest_nodes.append({

@@ -1,14 +1,26 @@
 #pragma once
 
-// Swerve kinematics: plain math on module geometry, no hardware and no
-// framework. Units: metres, radians/s for the chassis, rotations and
-// rotations/s (mechanism units) for the modules.
+// Swerve kinematics on wpimath's SwerveDriveKinematics<4>: no hardware and no
+// framework. Units: meters and radians/s for the chassis, rotations and
+// rotations/s (mechanism units, `_rot`/`_rps`) for the modules. The functions
+// under "unit boundary" are the only place the drivetrain turns one into the
+// other.
+
+#include <frc/geometry/Rotation2d.h>
+#include <frc/geometry/Translation2d.h>
+#include <frc/kinematics/ChassisSpeeds.h>
+#include <frc/kinematics/SwerveDriveKinematics.h>
+#include <frc/kinematics/SwerveModuleState.h>
+#include <units/angle.h>
+#include <units/angular_velocity.h>
+#include <units/length.h>
+#include <units/velocity.h>
+#include <wpi/array.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
-#include <numbers>
 #include <optional>
 #include <string>
 
@@ -46,64 +58,107 @@ struct ModuleState {
   double steer_rot{};
 };
 
-// Inverse kinematics: the module states that produce `speeds`. Each module
-// steers the shorter way from its current azimuth (`current[i].steer_rot`),
-// reversing the wheel rather than turning past a quarter rotation, and every
-// wheel is scaled by the same factor so none exceeds its drive's maximum.
-// nullopt for non-finite input.
-inline std::optional<std::array<ModuleState, kModuleCount>> ToModuleStates(
-    const SwerveGeometry& geometry, const ChassisSpeeds& speeds,
-    const std::array<ModuleState, kModuleCount>& current) {
-  constexpr double kTau = 2 * std::numbers::pi;
-  if (!std::isfinite(speeds.vx_mps) || !std::isfinite(speeds.vy_mps) ||
-      !std::isfinite(speeds.omega_radps))
-    return std::nullopt;
-  std::array<ModuleState, kModuleCount> out{};
-  double scale = 1;
-  for (std::size_t i = 0; i < kModuleCount; ++i) {
-    const SwerveModule& module = geometry.modules[i];
-    const double x = speeds.vx_mps - speeds.omega_radps * module.y_m;
-    const double y = speeds.vy_mps + speeds.omega_radps * module.x_m;
-    out[i].drive_rps = std::hypot(x, y) / (kTau * module.wheel_radius_m);
-    if (!std::isfinite(out[i].drive_rps)) return std::nullopt;
-    out[i].steer_rot = std::atan2(y, x) / kTau;
-    if (out[i].drive_rps > module.max_drive_rps)
-      scale = std::min(scale, module.max_drive_rps / out[i].drive_rps);
-  }
-  for (std::size_t i = 0; i < kModuleCount; ++i) {
-    double delta = std::remainder(out[i].steer_rot - current[i].steer_rot, 1.0);
-    if (std::abs(delta) > 0.25) {
-      delta -= std::copysign(0.5, delta);
-      out[i].drive_rps = -out[i].drive_rps;
-    }
-    if (std::abs(out[i].drive_rps) < 1e-6) delta = 0;  // a stopped wheel holds
-    out[i].drive_rps *= scale;
-    out[i].steer_rot = current[i].steer_rot + delta;
-  }
-  return out;
+// --- unit boundary ----------------------------------------------------------
+
+// A shaft or gyro angle in rotations as a frame angle.
+inline units::radian_t ToRadians(double rot) { return units::turn_t{rot}; }
+inline double ToRotations(units::radian_t angle) {
+  return units::turn_t{angle}.value();
+}
+// Arc length the wheel rolls through: radians times radius.
+inline units::meter_t WheelTravel(double rot, double wheel_radius_m) {
+  return units::meter_t{ToRadians(rot).value() * wheel_radius_m};
+}
+inline units::meters_per_second_t WheelSpeed(double rps,
+                                             double wheel_radius_m) {
+  return units::meters_per_second_t{
+      units::radians_per_second_t{units::turns_per_second_t{rps}}.value() *
+      wheel_radius_m};
+}
+inline double WheelRps(units::meters_per_second_t speed,
+                       double wheel_radius_m) {
+  return units::turns_per_second_t{
+      units::radians_per_second_t{speed.value() / wheel_radius_m}}
+      .value();
 }
 
-// Forward kinematics: the chassis motion the measured module states imply,
-// averaged over the modules.
-inline ChassisSpeeds ToChassisSpeeds(
-    const SwerveGeometry& geometry,
-    const std::array<ModuleState, kModuleCount>& measured) {
-  constexpr double kTau = 2 * std::numbers::pi;
-  ChassisSpeeds sum{};
-  for (std::size_t i = 0; i < kModuleCount; ++i) {
-    const SwerveModule& module = geometry.modules[i];
-    const double wheel_mps =
-        measured[i].drive_rps * kTau * module.wheel_radius_m;
-    const double angle_rad = measured[i].steer_rot * kTau;
-    const double vx = wheel_mps * std::cos(angle_rad);
-    const double vy = wheel_mps * std::sin(angle_rad);
-    sum.vx_mps += vx;
-    sum.vy_mps += vy;
-    const double r2 = module.x_m * module.x_m + module.y_m * module.y_m;
-    if (r2 > 1e-6) sum.omega_radps += (-module.y_m * vx + module.x_m * vy) / r2;
+// ----------------------------------------------------------------------------
+
+class SwerveKinematics {
+ public:
+  explicit SwerveKinematics(const SwerveGeometry& geometry)
+      : geometry_{geometry}, kinematics_{Translations(geometry)} {}
+
+  // Inverse kinematics: the module states that produce `speeds`. Each module
+  // steers the shorter way from its current azimuth (`current[i].steer_rot`),
+  // reversing the wheel rather than turning past a quarter rotation; a
+  // stopped wheel holds its azimuth; every wheel is scaled by the same factor
+  // so none exceeds its own drive's maximum. nullopt for non-finite input.
+  //
+  // The scaling is not SwerveDriveKinematics::DesaturateWheelSpeeds: that
+  // takes one attainable speed for every module, and here each module has
+  // its own wheel radius and drive max_velocity_rps.
+  std::optional<std::array<ModuleState, kModuleCount>> ToModuleStates(
+      const ChassisSpeeds& speeds,
+      const std::array<ModuleState, kModuleCount>& current) {
+    if (!std::isfinite(speeds.vx_mps) || !std::isfinite(speeds.vy_mps) ||
+        !std::isfinite(speeds.omega_radps))
+      return std::nullopt;
+    wpi::array<frc::Rotation2d, kModuleCount> headings(wpi::empty_array);
+    for (std::size_t i = 0; i < kModuleCount; ++i)
+      headings[i] = frc::Rotation2d{ToRadians(current[i].steer_rot)};
+    // A module with no speed comes back on its remembered heading: the one it
+    // has now.
+    kinematics_.ResetHeadings(headings);
+    const auto states = kinematics_.ToSwerveModuleStates(
+        frc::ChassisSpeeds{units::meters_per_second_t{speeds.vx_mps},
+                           units::meters_per_second_t{speeds.vy_mps},
+                           units::radians_per_second_t{speeds.omega_radps}});
+    std::array<ModuleState, kModuleCount> out{};
+    double scale = 1;
+    for (std::size_t i = 0; i < kModuleCount; ++i) {
+      const SwerveModule& module = geometry_.modules[i];
+      frc::SwerveModuleState state = states[i];
+      state.Optimize(headings[i]);
+      out[i].drive_rps = WheelRps(state.speed, module.wheel_radius_m);
+      if (!std::isfinite(out[i].drive_rps)) return std::nullopt;
+      out[i].steer_rot = current[i].steer_rot +
+                         ToRotations((state.angle - headings[i]).Radians());
+      if (std::abs(out[i].drive_rps) > module.max_drive_rps)
+        scale =
+            std::min(scale, module.max_drive_rps / std::abs(out[i].drive_rps));
+    }
+    for (ModuleState& m : out) m.drive_rps *= scale;
+    return out;
   }
-  constexpr double n = kModuleCount;
-  return {sum.vx_mps / n, sum.vy_mps / n, sum.omega_radps / n};
-}
+
+  // Forward kinematics: the chassis motion the measured module states imply
+  // (least squares over the modules).
+  ChassisSpeeds ToChassisSpeeds(
+      const std::array<ModuleState, kModuleCount>& measured) const {
+    wpi::array<frc::SwerveModuleState, kModuleCount> states(wpi::empty_array);
+    for (std::size_t i = 0; i < kModuleCount; ++i) {
+      states[i] = {WheelSpeed(measured[i].drive_rps,
+                              geometry_.modules[i].wheel_radius_m),
+                   frc::Rotation2d{ToRadians(measured[i].steer_rot)}};
+    }
+    const frc::ChassisSpeeds speeds = kinematics_.ToChassisSpeeds(states);
+    return {speeds.vx.value(), speeds.vy.value(), speeds.omega.value()};
+  }
+
+ private:
+  static wpi::array<frc::Translation2d, kModuleCount> Translations(
+      const SwerveGeometry& geometry) {
+    wpi::array<frc::Translation2d, kModuleCount> out(wpi::empty_array);
+    for (std::size_t i = 0; i < kModuleCount; ++i) {
+      out[i] = frc::Translation2d{units::meter_t{geometry.modules[i].x_m},
+                                  units::meter_t{geometry.modules[i].y_m}};
+    }
+    return out;
+  }
+
+  SwerveGeometry geometry_;
+  frc::SwerveDriveKinematics<kModuleCount> kinematics_;
+};
 
 }  // namespace drivetrain

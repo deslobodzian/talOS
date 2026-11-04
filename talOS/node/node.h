@@ -42,6 +42,7 @@
 #include <typeindex>
 #include <typeinfo>
 #include <utility>
+#include <vector>
 
 #include "talOS/events/time.h"
 #include "talOS/ipc/concepts.h"
@@ -114,7 +115,10 @@ class Node {
 
   // Custom keys of this subsystem's TOML table. Dotted keys reach nested
   // tables ("geometry.wheelbase_m"). T: bool, int64_t/int, double,
-  // std::string. A present key of the wrong type throws.
+  // std::string, or a TOML array as std::vector<std::string> or
+  // std::vector<double> (integer elements convert; an empty array is valid).
+  // A present key of the wrong type, or an array element of the wrong type,
+  // throws.
   template <class T>
   T param(std::string_view key, T fallback) const;
   template <class T>
@@ -272,10 +276,14 @@ std::optional<T> FindParam(const Node& node, std::string_view key) {
     return static_cast<T>(*value);
   } else if constexpr (std::is_same_v<T, std::string>) {
     return NodeAccess::find_string(node, key);
+  } else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
+    return NodeAccess::find_string_list(node, key);
+  } else if constexpr (std::is_same_v<T, std::vector<double>>) {
+    return NodeAccess::find_double_list(node, key);
   } else {
-    static_assert(
-        sizeof(T) == 0,
-        "param<T>: T must be bool, an integer, double or std::string");
+    static_assert(sizeof(T) == 0,
+                  "param<T>: T must be bool, an integer, double, std::string, "
+                  "std::vector<std::string> or std::vector<double>");
   }
 }
 

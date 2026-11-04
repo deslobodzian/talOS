@@ -160,7 +160,7 @@ test('a node card says who drives its subsystem, and none when nobody does',
        const idle = card(250n, 'drivetrain');
        assert.match(idle, /<dt>driven by<\/dt><dd class="idle">none<\/dd>/);
        // A node with no Target drives nothing, and says nothing about it.
-       assert.ok(!card(50n, 'odometry').includes('driven by'));
+       assert.ok(!card(50n, 'pose_estimator').includes('driven by'));
 
        // The wiring view of the selected node agrees with its card.
        const graph = parseSystemGraph(demoSystemGraph(50n));
@@ -362,7 +362,7 @@ test('the attention list flags real orphans and leaves the design alone', () => 
   const html = render(<OverviewTab view={emptyView} system={state(true)}
                                    onOpen={() => {}}/>);
   // The orphan the demo carries reaches the list, named with its readers.
-  assert.ok(html.includes('/shooter/state is read by odometry'),
+  assert.ok(html.includes('/shooter/state is read by telemetry'),
             'a real orphan was not flagged');
   assert.ok(html.includes('lapped'), 'the lossy topic was not flagged');
 

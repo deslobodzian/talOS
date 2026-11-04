@@ -81,3 +81,23 @@ pip.parse(
     requirements_lock = "//talOS/python:requirements.txt",
 )
 use_repo(pip, "pypi")
+
+# wpimath (C++): WPILib's own Maven artifacts for the release GradleRIO pins
+# (2026-robot/controller_processor/rio/build.gradle). allwpilib 2026.x has no
+# MODULE.bazel and is not in the BCR; see third_party/wpilib/extensions.bzl.
+# Python uses the same native build through robotpy-native-wpimath in
+# //talOS/python:requirements.txt;
+# //2026-robot/controller_processor/rio:wpilib_lockstep_test keeps the three
+# pins on one release.
+wpilib = use_extension("//third_party/wpilib:extensions.bzl", "wpilib")
+use_repo(
+    wpilib,
+    "wpilib_wpimath_headers",
+    "wpilib_wpimath_linuxarm64",
+    "wpilib_wpimath_linuxx86_64",
+    "wpilib_wpimath_osxuniversal",
+    "wpilib_wpiutil_headers",
+    "wpilib_wpiutil_linuxarm64",
+    "wpilib_wpiutil_linuxx86_64",
+    "wpilib_wpiutil_osxuniversal",
+)

@@ -1,18 +1,28 @@
 #include <gtest/gtest.h>
 #include <sys/wait.h>
 
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
+
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <numbers>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "drivetrain/drivetrain.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
@@ -30,6 +40,10 @@ using talos::testing::SimHardware;
 namespace ds = talos::driver_station;
 
 constexpr double kTau = 2 * std::numbers::pi;
+// Long enough for the bridge's clock mapping (8 hardware states at 5 ms) to
+// converge, after which hardware sample times, and so the measurement
+// flags, are valid.
+constexpr auto kConverged = std::chrono::milliseconds{60};
 
 std::string Runfile(const char* env) {
   std::string error;
@@ -58,9 +72,10 @@ SwerveGeometry Geometry() {
 
 TEST(Swerve, TranslationAndReverseTakeTheShorterSteeringPath) {
   const SwerveGeometry geometry = Geometry();
+  SwerveKinematics kinematics{geometry};
   const double rps = 1.0 / (kTau * geometry.modules[0].wheel_radius_m);
   for (const double vx : {1.0, -1.0}) {
-    const auto modules = ToModuleStates(geometry, {vx, 0, 0}, {});
+    const auto modules = kinematics.ToModuleStates({vx, 0, 0}, {});
     if (!modules.has_value()) {
       FAIL() << "ToModuleStates returned nullopt";
     }
@@ -69,16 +84,47 @@ TEST(Swerve, TranslationAndReverseTakeTheShorterSteeringPath) {
       EXPECT_NEAR(m.steer_rot, 0, 1e-12);
     }
   }
-  const auto sideways = ToModuleStates(geometry, {0, 1, 0}, {});
+  const auto sideways = kinematics.ToModuleStates({0, 1, 0}, {});
   if (!sideways.has_value()) {
     FAIL() << "ToModuleStates returned nullopt";
   }
   for (const ModuleState& m : *sideways) EXPECT_NEAR(m.steer_rot, 0.25, 1e-12);
 }
 
+TEST(Swerve, SteersFromTheCurrentAzimuthAndAStoppedWheelHolds) {
+  const SwerveGeometry geometry = Geometry();
+  SwerveKinematics kinematics{geometry};
+  // Wound up 3 turns: forward is reached without unwinding.
+  std::array<ModuleState, kModuleCount> current{};
+  for (ModuleState& m : current) m.steer_rot = 3.0;
+  const auto forward = kinematics.ToModuleStates({1, 0, 0}, current);
+  ASSERT_TRUE(forward.has_value());
+  for (const ModuleState& m : *forward) {
+    EXPECT_GT(m.drive_rps, 0);
+    EXPECT_NEAR(m.steer_rot, 3.0, 1e-12);
+  }
+  // 0.4 rotations off forward: reverse and turn 0.1 rather than 0.4.
+  for (ModuleState& m : current) m.steer_rot = 0.4;
+  const auto reversed = kinematics.ToModuleStates({1, 0, 0}, current);
+  ASSERT_TRUE(reversed.has_value());
+  for (const ModuleState& m : *reversed) {
+    EXPECT_LT(m.drive_rps, 0);
+    EXPECT_NEAR(m.steer_rot, 0.5, 1e-12);
+  }
+  // No motion: every wheel stays where it points.
+  for (std::size_t i = 0; i < kModuleCount; ++i) current[i].steer_rot = 0.1 * i;
+  const auto stopped = kinematics.ToModuleStates({0, 0, 0}, current);
+  ASSERT_TRUE(stopped.has_value());
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    EXPECT_EQ((*stopped)[i].drive_rps, 0);
+    EXPECT_NEAR((*stopped)[i].steer_rot, 0.1 * i, 1e-12);
+  }
+}
+
 TEST(Swerve, RotationDesaturationAndInvalidInput) {
   const SwerveGeometry geometry = Geometry();
-  const auto spin = ToModuleStates(geometry, {0, 0, 1}, {});
+  SwerveKinematics kinematics{geometry};
+  const auto spin = kinematics.ToModuleStates({0, 0, 1}, {});
   if (!spin.has_value()) {
     FAIL() << "ToModuleStates returned nullopt";
   }
@@ -87,26 +133,52 @@ TEST(Swerve, RotationDesaturationAndInvalidInput) {
   EXPECT_GT((*spin)[1].drive_rps, 0);  // back_right
   EXPECT_NEAR((*spin)[1].steer_rot, -0.125, 1e-12);
 
-  const auto fast = ToModuleStates(geometry, {100, 0, 0}, {});
+  const auto fast = kinematics.ToModuleStates({100, 0, 0}, {});
   if (!fast.has_value()) {
     FAIL() << "ToModuleStates returned nullopt";
   }
   for (const ModuleState& m : *fast) EXPECT_NEAR(m.drive_rps, 20, 1e-12);
 
-  EXPECT_FALSE(ToModuleStates(
-      geometry, {std::numeric_limits<double>::quiet_NaN(), 0, 0}, {}));
+  EXPECT_FALSE(kinematics.ToModuleStates(
+      {std::numeric_limits<double>::quiet_NaN(), 0, 0}, {}));
+  EXPECT_FALSE(kinematics.ToModuleStates(
+      {0, 0, std::numeric_limits<double>::infinity()}, {}));
+}
+
+TEST(Swerve, EachModuleIsLimitedByItsOwnDriveAndWheel) {
+  // One module with a slower drive and one with a bigger wheel: the same
+  // factor scales every wheel until the tightest reaches its own maximum.
+  SwerveGeometry geometry = Geometry();
+  geometry.modules[1].max_drive_rps = 10;
+  geometry.modules[2].wheel_radius_m *= 2;
+  SwerveKinematics kinematics{geometry};
+  const auto fast = kinematics.ToModuleStates({100, 0, 0}, {});
+  ASSERT_TRUE(fast.has_value());
+  EXPECT_NEAR((*fast)[1].drive_rps, 10, 1e-9);
+  EXPECT_NEAR((*fast)[0].drive_rps, 10, 1e-9);
+  EXPECT_NEAR((*fast)[3].drive_rps, 10, 1e-9);
+  EXPECT_NEAR((*fast)[2].drive_rps, 5, 1e-9);  // same ground speed
 }
 
 TEST(Swerve, ForwardKinematicsInvertsInverseKinematics) {
   const SwerveGeometry geometry = Geometry();
-  const auto modules = ToModuleStates(geometry, {1.0, -0.5, 0.8}, {});
+  SwerveKinematics kinematics{geometry};
+  const auto modules = kinematics.ToModuleStates({1.0, -0.5, 0.8}, {});
   if (!modules.has_value()) {
     FAIL() << "ToModuleStates returned nullopt";
   }
-  const ChassisSpeeds speeds = ToChassisSpeeds(geometry, *modules);
+  const ChassisSpeeds speeds = kinematics.ToChassisSpeeds(*modules);
   EXPECT_NEAR(speeds.vx_mps, 1.0, 1e-9);
   EXPECT_NEAR(speeds.vy_mps, -0.5, 1e-9);
   EXPECT_NEAR(speeds.omega_radps, 0.8, 1e-9);
+}
+
+TEST(Swerve, UnitBoundary) {
+  EXPECT_NEAR(ToRadians(0.125).value(), std::numbers::pi / 4, 1e-15);
+  EXPECT_NEAR(ToRotations(units::radian_t{std::numbers::pi}), 0.5, 1e-15);
+  EXPECT_NEAR(WheelTravel(2.0, 0.05).value(), 2.0 * kTau * 0.05, 1e-15);
+  EXPECT_NEAR(WheelSpeed(3.0, 0.05).value(), 3.0 * kTau * 0.05, 1e-15);
+  EXPECT_NEAR(WheelRps(WheelSpeed(3.0, 0.05), 0.05), 3.0, 1e-12);
 }
 
 // --- geometry from config ------------------------------------------------
@@ -220,6 +292,17 @@ class DrivetrainTest : public ::testing::Test {
       EXPECT_EQ(Request(module.steer).mode, Mode::kNeutral) << module.name;
     }
   }
+  // DrivetrainState messages published so far.
+  std::uint64_t StateCount() const {
+    return talos::detail::SimAccess::message_count(sim, topics::kState,
+                                                   sizeof(DrivetrainState));
+  }
+  // One state per drivetrain tick (5 ms in testdata) across `duration`.
+  void ExpectPublishedEveryTick(std::uint64_t before,
+                                std::chrono::milliseconds duration) const {
+    EXPECT_EQ(StateCount() - before,
+              static_cast<std::uint64_t>(duration / 5ms));
+  }
 
   Sim sim;
   Drivetrain& drivetrain = sim.add<Drivetrain>("drivetrain");
@@ -251,8 +334,11 @@ TEST_F(DrivetrainTest, StaleLaneGoesNeutral) {
   Teleop();
   Hold(ChassisTarget{1.0, 0, 0}, 40ms);
   ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+  const std::uint64_t before = StateCount();
   sim.step(150ms);  // the producer went quiet: the lane is stale
   ExpectNeutral();
+  ExpectPublishedEveryTick(before, 150ms);
+  EXPECT_TRUE(State().modules_valid());
 }
 
 TEST_F(DrivetrainTest, ReleasedLaneGoesNeutralAtOnce) {
@@ -264,12 +350,16 @@ TEST_F(DrivetrainTest, ReleasedLaneGoesNeutralAtOnce) {
   ExpectNeutral();
 }
 
-TEST_F(DrivetrainTest, DisabledRobotGoesNeutral) {
+TEST_F(DrivetrainTest, DisabledRobotGoesNeutralAndStillReportsValidModules) {
   Teleop();
   hw.enable(false);
+  const std::uint64_t before = StateCount();
   Hold(ChassisTarget{1.0, 0, 0}, 40ms);
   ExpectNeutral();
+  ExpectPublishedEveryTick(before, 40ms);
   EXPECT_FALSE(State().enabled());
+  EXPECT_TRUE(State().modules_valid());
+  EXPECT_TRUE(State().yaw_valid());
 }
 
 TEST_F(DrivetrainTest, DriverStationLossOrOtherModeLaneGoesNeutral) {
@@ -298,11 +388,114 @@ TEST_F(DrivetrainTest, ReportsTheChassisMotionTheModulesMeasure) {
     hw.set_motor("drivetrain", module.drive, 0.0, 2.0);
     hw.set_motor("drivetrain", module.steer, 0.25, 0.0);
   }
-  sim.step(20ms);
+  sim.step(kConverged);
   const DrivetrainState state = State();
+  EXPECT_TRUE(state.modules_valid());
   EXPECT_NEAR(state.vx_mps(), 0.0, 1e-9);
   EXPECT_NEAR(state.vy_mps(), 2.0 * kTau * 0.0508, 1e-9);
   EXPECT_NEAR(state.omega_radps(), 0.0, 1e-9);
+}
+
+geometry::SwerveModulePosition Module(const DrivetrainState& state,
+                                      std::size_t i) {
+  switch (i) {
+    case 0:
+      return state.module0();
+    case 1:
+      return state.module1();
+    case 2:
+      return state.module2();
+    default:
+      return state.module3();
+  }
+}
+
+TEST_F(DrivetrainTest, ModulePositionsComeFromTheDriveAndSteerMotors) {
+  // Different values per module, so a module reported in another's slot or
+  // a drive/steer swap shows.
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    hw.set_motor("drivetrain", geometry.modules[i].drive, 1.0 + i, 0.0);
+    hw.set_motor("drivetrain", geometry.modules[i].steer, -0.1 * i, 0.0);
+  }
+  sim.step(kConverged);
+  const DrivetrainState state = State();
+  ASSERT_TRUE(state.modules_valid());
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    const geometry::SwerveModulePosition m = Module(state, i);
+    EXPECT_NEAR(m.distance_m(),
+                (1.0 + i) * kTau * geometry.modules[i].wheel_radius_m, 1e-12)
+        << geometry.modules[i].name;
+    EXPECT_NEAR(m.angle_rad(), -0.1 * i * kTau, 1e-12)
+        << geometry.modules[i].name;
+  }
+}
+
+TEST_F(DrivetrainTest, DrivesBeforeTheClockMappingConvergesButReportsNoSample) {
+  // Four hardware states in: the bridge's offset filter needs eight, so no
+  // sample time is known yet. The modules are measured and driven anyway;
+  // only the published measurement is not believed.
+  Teleop();  // the lane must be published inside the teleop generation
+  talos::testing::PublishTarget(sim, "drivetrain", "teleop",
+                                ChassisTarget{1.0, 0, 0});
+  sim.step(10ms);
+  const DrivetrainState early = State();
+  EXPECT_FALSE(early.modules_valid());
+  EXPECT_FALSE(early.yaw_valid());
+  EXPECT_EQ(early.sample_time_ns(), 0u);
+  EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+
+  Hold(ChassisTarget{1.0, 0, 0}, 60ms);
+  EXPECT_TRUE(State().modules_valid());
+  EXPECT_TRUE(State().yaw_valid());
+}
+
+TEST_F(DrivetrainTest, SampleTimeIsTheMappedHardwareSampleTimeNotTheTickTime) {
+  // 1 ms link latency while the filter converges, then 4 ms: the minimum
+  // stays 1 ms for the window, so each state maps 3 ms before it arrived.
+  // A drivetrain stamping its own tick time would read within a tick of now.
+  hw.set_gateway_clock(std::chrono::seconds{1000}, 1ms);
+  Teleop();
+  sim.step(kConverged);
+  ASSERT_TRUE(State().modules_valid());
+  hw.set_gateway_clock(std::chrono::seconds{1000}, 4ms);
+  sim.step(20ms);
+  const DrivetrainState state = State();
+  ASSERT_TRUE(state.modules_valid());
+  const std::int64_t lag_ns =
+      sim.now().nanos() - static_cast<std::int64_t>(state.sample_time_ns());
+  EXPECT_GE(lag_ns, std::chrono::nanoseconds{3ms}.count());
+  EXPECT_LE(lag_ns, std::chrono::nanoseconds{3ms + 5ms}.count());
+}
+
+TEST_F(DrivetrainTest, ADisconnectedMotorStillPublishesButDrivesNothing) {
+  Teleop();
+  for (std::size_t i = 0; i < kModuleCount; ++i)
+    hw.set_motor("drivetrain", geometry.modules[i].drive, 1.0 + i, 0.0);
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+  const double yaw_before = State().yaw_rad();
+  const DrivetrainState valid = State();
+
+  hw.set_connected("drivetrain", "front_left_steer", false);
+  const std::uint64_t before = StateCount();
+  Hold(ChassisTarget{1.0, 0, 0}, 60ms);  // a fresh target the whole time
+  ExpectNeutral();                       // every module, not just front_left
+  ExpectPublishedEveryTick(before, 60ms);
+  const DrivetrainState state = State();
+  EXPECT_TRUE(state.enabled());
+  EXPECT_FALSE(state.modules_valid());
+  // Under --sim the heading integrates from the modules, so it goes too.
+  EXPECT_FALSE(state.yaw_valid());
+  EXPECT_EQ(state.yaw_rad(), yaw_before);
+  EXPECT_EQ(state.vx_mps(), 0.0);
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    EXPECT_EQ(Module(state, i).distance_m(), Module(valid, i).distance_m());
+  }
+
+  hw.set_connected("drivetrain", "front_left_steer", true);
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  EXPECT_TRUE(State().modules_valid());
+  EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
 }
 
 // Pure chassis rotation at `omega` rad/s: each wheel tangential, turning at
@@ -321,10 +514,11 @@ TEST_F(DrivetrainTest, SimulatedHeadingIntegratesTheRotationTheModulesMeasure) {
   // Under --sim (as here) the Pigeon's permanent zero is not believed.
   SetRotating(hw, geometry, 1.0);
   sim.step(200ms);
-  const double expected_rot = 1.0 / kTau * 0.2;
-  EXPECT_GT(State().yaw_rot(), expected_rot * 0.9);
-  EXPECT_LT(State().yaw_rot(), expected_rot * 1.02);
-  EXPECT_NEAR(State().yaw_rate_rps(), 1.0 / kTau, 1e-9);
+  const double expected_rad = 1.0 * 0.2;
+  EXPECT_TRUE(State().yaw_valid());
+  EXPECT_GT(State().yaw_rad(), expected_rad * 0.9);
+  EXPECT_LT(State().yaw_rad(), expected_rad * 1.02);
+  EXPECT_NEAR(State().omega_radps(), 1.0, 1e-9);
 }
 
 class DrivetrainOnImuTest : public DrivetrainTest {
@@ -333,16 +527,45 @@ class DrivetrainOnImuTest : public DrivetrainTest {
       : DrivetrainTest{ConfigWith("integrate_heading = false")} {}
 };
 
-TEST_F(DrivetrainOnImuTest, HeadingComesFromTheImuNotASteerEncoder) {
+TEST_F(DrivetrainOnImuTest, HeadingIsThePigeonYawInRadians) {
   SetRotating(hw, geometry, 1.0);
   hw.set_cancoder("drivetrain", "back_left_encoder", 0.375, 2.0);
-  hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0.5);
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0.5);  // rotations
   sim.step(200ms);
-  EXPECT_NEAR(State().yaw_rot(), 0.125, 1e-12);
-  EXPECT_NEAR(State().yaw_rate_rps(), 0.5, 1e-12);
+  EXPECT_TRUE(State().yaw_valid());
+  EXPECT_NEAR(State().yaw_rad(), std::numbers::pi / 4, 1e-12);
+  // The chassis rate is the modules', not the Pigeon's.
+  EXPECT_NEAR(State().omega_radps(), 1.0, 1e-9);
 }
 
-TEST(Drivetrain, LinkDropStopsPublishingStateAndHoldsOdometry) {
+TEST_F(DrivetrainOnImuTest, ADisconnectedGyroIsInvalidAndHoldsTheLastHeading) {
+  Teleop();
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0.0);
+  sim.step(kConverged);
+  ASSERT_TRUE(State().yaw_valid());
+
+  hw.set_connected("drivetrain", "drivetrain_imu", false);
+  const std::uint64_t before = StateCount();
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  ExpectPublishedEveryTick(before, 40ms);
+  const DrivetrainState state = State();
+  EXPECT_FALSE(state.yaw_valid());
+  EXPECT_NEAR(state.yaw_rad(), std::numbers::pi / 4, 1e-12);
+  // The modules do not need the heading: still valid, still driven.
+  EXPECT_TRUE(state.modules_valid());
+  EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+}
+
+TEST_F(DrivetrainOnImuTest, AGyroThatNeverReportedReadsAnInvalidZero) {
+  hw.set_connected("drivetrain", "drivetrain_imu", false);
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0.0);
+  sim.step(kConverged);
+  EXPECT_FALSE(State().yaw_valid());
+  EXPECT_EQ(State().yaw_rad(), 0.0);
+  EXPECT_TRUE(State().modules_valid());
+}
+
+TEST(Drivetrain, LinkDropKeepsPublishingInvalidStateAndHoldsPositions) {
   Sim sim{ConfigPath()};
   sim.add<Drivetrain>("drivetrain");
   auto hw = std::make_unique<SimHardware>(sim);
@@ -352,44 +575,143 @@ TEST(Drivetrain, LinkDropStopsPublishingStateAndHoldsOdometry) {
       talos::driver_station::kEnabled | talos::driver_station::kTeleop));
   sim.step(10ms);
 
-  for (auto t = 0ms; t < 60ms; t += 20ms) {
-    talos::testing::PublishTarget(sim, "drivetrain", "teleop",
-                                  ChassisTarget{1.0, 0, 1.0});
-    sim.step(20ms);
-  }
-  const auto before_drop = sim.latest<DrivetrainState>(topics::kState);
-  ASSERT_TRUE(before_drop.has_value());
-  const DrivetrainState before_value = before_drop.value_or(DrivetrainState{});
-  EXPECT_GT(before_value.vx_mps(), 0.0);
-  EXPECT_GT(before_value.omega_radps(), 0.0);
+  const auto drive = [&](std::chrono::milliseconds duration) {
+    for (auto t = 0ms; t < duration; t += 20ms) {
+      talos::testing::PublishTarget(sim, "drivetrain", "teleop",
+                                    ChassisTarget{1.0, 0, 1.0});
+      sim.step(20ms);
+    }
+  };
+  const auto latest = [&] {
+    const auto state = sim.latest<DrivetrainState>(topics::kState);
+    EXPECT_TRUE(state.has_value());
+    return state.value_or(DrivetrainState{});
+  };
+  const auto count = [&] {
+    return talos::detail::SimAccess::message_count(sim, topics::kState,
+                                                   sizeof(DrivetrainState));
+  };
 
+  drive(60ms);
+  const DrivetrainState before_drop = latest();
+  EXPECT_TRUE(before_drop.modules_valid());
+  EXPECT_TRUE(before_drop.yaw_valid());
+  EXPECT_GT(before_drop.vx_mps(), 0.0);
+  EXPECT_GT(before_drop.omega_radps(), 0.0);
+  EXPECT_GT(before_drop.yaw_rad(), 0.0);
+  EXPECT_GT(before_drop.module0().distance_m(), 0.0);
+
+  // The bridge goes away: once /hw/state ages out, every device reads
+  // disconnected.
   hw.reset();
-  for (auto t = 0ms; t < 160ms; t += 20ms) {
-    talos::testing::PublishTarget(sim, "drivetrain", "teleop",
-                                  ChassisTarget{1.0, 0, 1.0});
-    sim.step(20ms);
-  }
+  drive(160ms);
+  const DrivetrainState at_timeout = latest();
+  EXPECT_FALSE(at_timeout.modules_valid());
+  EXPECT_FALSE(at_timeout.yaw_valid());
+  EXPECT_EQ(at_timeout.vx_mps(), 0.0);
+  EXPECT_EQ(at_timeout.omega_radps(), 0.0);
 
-  const std::uint64_t count_after_timeout =
-      talos::detail::SimAccess::message_count(sim, topics::kState,
-                                              sizeof(DrivetrainState));
-  const auto at_timeout = sim.latest<DrivetrainState>(topics::kState);
-  ASSERT_TRUE(at_timeout.has_value());
-  const DrivetrainState at_timeout_value =
-      at_timeout.value_or(DrivetrainState{});
+  // Still one state per tick, and nothing it holds moves.
+  const std::uint64_t count_at_timeout = count();
+  drive(60ms);
+  EXPECT_EQ(count() - count_at_timeout, std::uint64_t{60ms / 5ms});
+  const DrivetrainState after = latest();
+  EXPECT_FALSE(after.modules_valid());
+  EXPECT_FALSE(after.yaw_valid());
+  EXPECT_EQ(after.yaw_rad(), at_timeout.yaw_rad());
+  EXPECT_EQ(after.module0().distance_m(), at_timeout.module0().distance_m());
+  EXPECT_EQ(after.module0().angle_rad(), at_timeout.module0().angle_rad());
+}
 
-  for (auto t = 0ms; t < 60ms; t += 20ms) {
-    talos::testing::PublishTarget(sim, "drivetrain", "teleop",
-                                  ChassisTarget{1.0, 0, 1.0});
-    sim.step(20ms);
+// --- allocation ------------------------------------------------------------
+
+#if defined(__APPLE__)
+// Every malloc in the process, including those made inside libwpimath (whose
+// operator new binds to libc++, not to this binary). libsystem_malloc calls
+// malloc_logger, when set, on every allocation; each one's stack is kept
+// (backtrace() does not allocate) and symbolized afterwards.
+using MallocLogger = void(std::uint32_t, std::uintptr_t, std::uintptr_t,
+                          std::uintptr_t, std::uintptr_t, std::uint32_t);
+extern "C" MallocLogger* malloc_logger;
+
+struct Allocation {
+  void* frames[48];
+  int depth;
+};
+constexpr std::size_t kMaxRecorded = 64;
+Allocation g_recorded[kMaxRecorded];
+std::atomic<std::uint64_t> g_allocations{0};
+
+void RecordAllocation(std::uint32_t type, std::uintptr_t, std::uintptr_t,
+                      std::uintptr_t, std::uintptr_t, std::uint32_t) {
+  constexpr std::uint32_t kAllocate = 2;  // MALLOC_LOG_TYPE_ALLOCATE
+  if ((type & kAllocate) == 0) return;
+  const std::uint64_t n = g_allocations.fetch_add(1, std::memory_order_relaxed);
+  if (n < kMaxRecorded) {
+    Allocation& a = g_recorded[n];
+    a.depth = ::backtrace(a.frames, static_cast<int>(std::size(a.frames)));
   }
-  EXPECT_EQ(talos::detail::SimAccess::message_count(sim, topics::kState,
-                                                    sizeof(DrivetrainState)),
-            count_after_timeout);
-  const auto after_extra = sim.latest<DrivetrainState>(topics::kState);
-  ASSERT_TRUE(after_extra.has_value());
-  const DrivetrainState after_value = after_extra.value_or(DrivetrainState{});
-  EXPECT_DOUBLE_EQ(after_value.yaw_rot(), at_timeout_value.yaw_rot());
+}
+
+// The Sim's in-memory topics keep every message ever published
+// (talOS/events/simulated_event_loop.h), so their storage grows
+// geometrically under any publisher. That is the test transport's
+// allocation, not the node's; the real transport is a preallocated ring.
+bool InSimTransport(const Allocation& a) {
+  for (int i = 0; i < a.depth; ++i) {
+    Dl_info info;
+    if (::dladdr(a.frames[i], &info) != 0 && info.dli_sname != nullptr &&
+        std::string_view{info.dli_sname}.find("SimulatedChannel") !=
+            std::string_view::npos)
+      return true;
+  }
+  return false;
+}
+#endif
+
+TEST_F(DrivetrainTest, UpdateDoesNotAllocate) {
+#if defined(__APPLE__)
+  Teleop();
+  SetRotating(hw, geometry, 1.0);
+  Hold(ChassisTarget{1.0, -0.5, 0.8}, 40ms);
+  ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+  ASSERT_TRUE(State().modules_valid());
+  // Both kinematics directions, the unit boundary, the target read, the
+  // motor requests and the publish, as on every tick the node runs.
+  g_allocations = 0;
+  malloc_logger = RecordAllocation;
+  for (int i = 0; i < 200; ++i) drivetrain.update();
+  malloc_logger = nullptr;
+
+  const std::uint64_t total = g_allocations.load();
+  ASSERT_LE(total, kMaxRecorded) << "far more than transport growth";
+  std::uint64_t outside_transport = 0;
+  for (std::uint64_t n = 0; n < total; ++n) {
+    if (InSimTransport(g_recorded[n])) continue;
+    ++outside_transport;
+    ::backtrace_symbols_fd(g_recorded[n].frames, g_recorded[n].depth, 2);
+  }
+  EXPECT_EQ(outside_transport, 0u);
+  EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+#else
+  GTEST_SKIP() << "process-wide malloc counting uses macOS malloc_logger; "
+                  "glibc has had no allocation hook since 2.34";
+#endif
+}
+
+TEST_F(DrivetrainTest, TheAllocationProbeSeesAllocations) {
+#if defined(__APPLE__)
+  // Guards the test above against a probe that silently counts nothing.
+  g_allocations = 0;
+  malloc_logger = RecordAllocation;
+  auto* volatile probe = new std::array<double, 64>{};
+  malloc_logger = nullptr;
+  delete probe;
+  ASSERT_GE(g_allocations.load(), 1u);
+  EXPECT_FALSE(InSimTransport(g_recorded[0]));
+#else
+  GTEST_SKIP() << "process-wide malloc counting uses macOS malloc_logger";
+#endif
 }
 
 // --- wire and binary -----------------------------------------------------
@@ -398,7 +720,7 @@ TEST(Drivetrain, LinkDropStopsPublishingStateAndHoldsOdometry) {
 // is a new contract (whole-bundle rollback), never a silent edit.
 TEST(Messages, WireSizesAreFrozen) {
   EXPECT_EQ(sizeof(ChassisTarget), 24u);
-  EXPECT_EQ(sizeof(DrivetrainState), 56u);
+  EXPECT_EQ(sizeof(DrivetrainState), 112u);
 }
 
 struct Result {

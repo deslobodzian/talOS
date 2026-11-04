@@ -38,8 +38,8 @@ test('the parser accepts what the launcher actually writes', () => {
   // The roster, as `--describe` found it.
   assert.equal(graph.nodes.length, 7);
   assert.deepEqual(graph.nodes.map(n => n.name).sort(), [
-    'drivetrain', 'hardware_node', 'intake', 'odometry', 'operator_interface',
-    'shooter', 'telemetry'
+    'drivetrain', 'hardware_node', 'intake', 'operator_interface',
+    'pose_estimator', 'shooter', 'telemetry'
   ]);
   for (const node of graph.nodes) {
     assert.ok(node.target.startsWith('//'), `${node.name} has no build target`);

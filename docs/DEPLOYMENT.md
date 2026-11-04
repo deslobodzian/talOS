@@ -20,7 +20,8 @@ bazel build //2026-robot/main_processor:robot_bundle
 |---|---|
 | `run.sh` | runs `./launcher --bundle <dir> --config config/robot.toml "$@"` |
 | `launcher` | `//talOS/launcher` |
-| `bin/` | node binaries and their runfiles (a Python node's carry `libtalos_node.so`) |
+| `bin/` | node binaries; a Python node's runfiles beside it (its wheels, e.g. `robotpy-wpimath` and `gtsam`, and `libtalos_node.so`) |
+| `lib/` | the shared libraries C++ nodes link (`libwpimath`, `libwpiutil`), one copy per name; `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
 | `config/` | `robot.toml` and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
 | `bundle_manifest.toml` | node names, targets, binaries, languages, config SHA-256 |
 

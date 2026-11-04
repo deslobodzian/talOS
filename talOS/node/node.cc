@@ -438,6 +438,88 @@ std::optional<std::string> NodeAccess::find_string(const Node& node,
   param_error(node, key, "must be a string");
 }
 
+namespace {
+
+std::string_view TypeName(const toml::node& value) {
+  switch (value.type()) {
+    case toml::node_type::string:
+      return "a string";
+    case toml::node_type::integer:
+      return "an integer";
+    case toml::node_type::floating_point:
+      return "a float";
+    case toml::node_type::boolean:
+      return "a boolean";
+    case toml::node_type::array:
+      return "an array";
+    case toml::node_type::table:
+      return "a table";
+    default:
+      return "a date or time";
+  }
+}
+
+[[noreturn]] void ElementError(const Node& node, std::string_view key,
+                               std::string_view expected, std::size_t index,
+                               const toml::node& element) {
+  NodeAccess::param_error(node, key,
+                          std::string{expected} + "; element " +
+                              std::to_string(index) + " is " +
+                              std::string{TypeName(element)});
+}
+
+std::vector<std::string> StringList(const Node& node, std::string_view key,
+                                    const toml::array& array,
+                                    std::string_view expected) {
+  std::vector<std::string> out;
+  out.reserve(array.size());
+  for (std::size_t i = 0; i < array.size(); ++i) {
+    const toml::value<std::string>* s = array[i].as_string();
+    if (s == nullptr) ElementError(node, key, expected, i, array[i]);
+    out.push_back(s->get());
+  }
+  return out;
+}
+
+std::vector<double> DoubleList(const Node& node, std::string_view key,
+                               const toml::array& array,
+                               std::string_view expected) {
+  std::vector<double> out;
+  out.reserve(array.size());
+  for (std::size_t i = 0; i < array.size(); ++i) {
+    const toml::node& element = array[i];
+    std::optional<double> d;
+    if (element.is_floating_point() || element.is_integer()) {
+      d = element.value<double>();
+    }
+    if (!d) ElementError(node, key, expected, i, element);
+    out.push_back(*d);
+  }
+  return out;
+}
+
+}  // namespace
+
+std::optional<std::vector<std::string>> NodeAccess::find_string_list(
+    const Node& node, std::string_view key) {
+  constexpr std::string_view kExpected = "must be an array of strings";
+  const auto value = node.impl_->Param(key);
+  if (!value) return std::nullopt;
+  const toml::array* array = value.as_array();
+  if (array == nullptr) param_error(node, key, kExpected);
+  return StringList(node, key, *array, kExpected);
+}
+
+std::optional<std::vector<double>> NodeAccess::find_double_list(
+    const Node& node, std::string_view key) {
+  constexpr std::string_view kExpected = "must be an array of numbers";
+  const auto value = node.impl_->Param(key);
+  if (!value) return std::nullopt;
+  const toml::array* array = value.as_array();
+  if (array == nullptr) param_error(node, key, kExpected);
+  return DoubleList(node, key, *array, kExpected);
+}
+
 std::optional<ParamValue> NodeAccess::find_param(const Node& node,
                                                  std::string_view key) {
   const auto value = node.impl_->Param(key);
@@ -450,7 +532,15 @@ std::optional<ParamValue> NodeAccess::find_param(const Node& node,
   if (auto s = value.value_exact<std::string>()) {
     return ParamValue{*std::move(s)};
   }
-  param_error(node, key, "must be a boolean, number or string");
+  if (const toml::array* array = value.as_array()) {
+    constexpr std::string_view kExpected =
+        "must be an array of strings or of numbers";
+    if (!array->empty() && array->front().is_string()) {
+      return ParamValue{StringList(node, key, *array, kExpected)};
+    }
+    return ParamValue{DoubleList(node, key, *array, kExpected)};
+  }
+  param_error(node, key, "must be a boolean, number, string or array");
 }
 
 void NodeAccess::param_error(const Node& node, std::string_view key,

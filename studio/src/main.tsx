@@ -611,7 +611,7 @@ function App() {
       {tab === 'timing' && <TimingTab system={system}/>}
       {tab === 'agent' && <AgentTab call={call}/>}
       {tab === 'field' && <section className="panel">
-        <div className="panel-heading"><h2>Field odometry</h2><span>2D</span></div>
+        <div className="panel-heading"><h2>Field pose</h2><span>2D</span></div>
         <Field view={view}/>
       </section>}
       {tab === 'pose' && <section className="panel">

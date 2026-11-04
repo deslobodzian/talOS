@@ -183,7 +183,10 @@ class NewSubsystemTest(unittest.TestCase):
         # tested by `bazel test //...`: the templates compile and their
         # tests pass only while this equality holds. Each golden BUILD adds
         # one filegroup, which hands the files to this test.
-        for name, lang in (("gripper", "cpp"), ("scaffold_py", "py")):
+        for name, lang, kind in (("gripper", "cpp", "velocity"),
+                                 ("scaffold_py", "py", "velocity"),
+                                 ("localizer", "cpp", "estimator"),
+                                 ("py_localizer", "py", "estimator")):
             golden = os.path.join("tools", "scaffold_testdata", name)
             on_disk = {}
             for directory, _, files in os.walk(golden):
@@ -192,7 +195,7 @@ class NewSubsystemTest(unittest.TestCase):
                     with open(path, encoding="utf-8") as text:
                         on_disk[os.path.relpath(path, golden).replace(
                             os.sep, "/")] = text.read()
-            generated = new_subsystem.package_files(name, lang)
+            generated = new_subsystem.package_files(name, lang, kind=kind)
             generated["BUILD"] += GOLDEN_FILEGROUP
             with self.subTest(name):
                 self.assertEqual(sorted(on_disk), sorted(generated))
@@ -201,7 +204,8 @@ class NewSubsystemTest(unittest.TestCase):
                         on_disk[path], content,
                         f"{golden}/{path} differs from the generator's "
                         f"output, new_subsystem.package_files({name!r}, "
-                        f"{lang!r}) (plus the golden filegroup in BUILD)")
+                        f"{lang!r}, kind={kind!r}) (plus the golden "
+                        f"filegroup in BUILD)")
 
     def test_position_archetype_generates_motion_magic_for_cpp_and_python(self):
         cpp_files = new_subsystem.package_files("wrist", "cpp", kind="position")
@@ -245,6 +249,53 @@ class NewSubsystemTest(unittest.TestCase):
                 for files in (cpp, py):
                     for content in files.values():
                         self.assertNotIn("arbiter", content)
+
+    def test_estimator_archetype_is_hardware_free_and_reads_its_cameras(self):
+        for lang, node, test in (("cpp", "localizer.h", "node_test.cc"),
+                                 ("py", "localizer.py", "node_test.py")):
+            with self.subTest(lang):
+                files = new_subsystem.package_files("localizer", lang,
+                                                    kind="estimator")
+                # No schema of its own: the shared geometry messages.
+                self.assertNotIn("localizer_message.fbs", files)
+                self.assertIn("srcs = [],", files["BUILD"])
+                self.assertIn('"//talOS/msgs:geometry"', files["BUILD"])
+                self.assertIn('"state": "/localizer/state"', files["BUILD"])
+                self.assertIn("PoseEstimate", files[node])
+                self.assertIn('"cameras"', files[node])
+                for word in ("Motor", "Target", "robot_enabled"):
+                    self.assertNotIn(word, files[node])
+                self.assertIn("optional", files[node])
+                self.assertRegex(files[test], r"(?i)disabled")
+                self.assertRegex(files[test], r"(?i)stale")
+
+    def test_plan_wires_an_estimator_without_a_can_id(self):
+        with tempfile.TemporaryDirectory() as root:
+            configuration = os.path.join(root, "bot", "main_processor",
+                                         "configuration")
+            os.makedirs(os.path.join(configuration, "subsystems"))
+            with open(os.path.join(configuration, "robot.toml"), "w") as f:
+                f.write('[robot]\nname = "bot"\nperiod_us = 5000\n'
+                        'command_timeout_us = 100000\n\n[[subsystems]]\n'
+                        'name = "drivetrain"\n'
+                        'path = "subsystems/drivetrain.toml"\n')
+            with open(os.path.join(configuration, "subsystems",
+                                   "drivetrain.toml"), "w") as f:
+                f.write('[subsystem]\nname = "drivetrain"\n\n'
+                        '[motors.drive]\ntype = "TalonFX"\nbus = "rio"\n'
+                        'can_id = 1\n')
+            open(os.path.join(configuration, "BUILD"), "w").close()
+            writes, can_id = new_subsystem.plan(root, "bot", "localizer", "py",
+                                                kind="estimator")
+            self.assertIsNone(can_id)
+            by_rel = {os.path.relpath(path, root): new
+                      for path, _, new in writes}
+            subsystem = by_rel[
+                "bot/main_processor/configuration/subsystems/localizer.toml"]
+            self.assertIn("cameras = []", subsystem)
+            self.assertNotIn("can_id", subsystem)
+            self.assertIn('name = "localizer"', by_rel[
+                "bot/main_processor/configuration/robot.toml"])
 
 
 if __name__ == "__main__":

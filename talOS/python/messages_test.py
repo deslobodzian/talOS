@@ -208,12 +208,12 @@ class StructCodecTest(unittest.TestCase):
     def test_nested_struct_fields_flatten(self):
         mtype = message_type(OdometrySample)
         self.assertEqual(mtype.fields, (
-            "timestamp_ns", "pose_x_m", "pose_y_m", "pose_yaw_rot",
+            "sample_time_ns", "pose_x_m", "pose_y_m", "pose_yaw_rad",
             "velocity_vx_mps", "velocity_vy_mps", "velocity_omega_radps"))
-        data = mtype.encode({"timestamp_ns": 42, "pose_x_m": 1.25,
+        data = mtype.encode({"sample_time_ns": 42, "pose_x_m": 1.25,
                              "velocity_omega_radps": 0.25})
         sample = mtype.decode(data)
-        self.assertEqual(sample.timestamp_ns, 42)
+        self.assertEqual(sample.sample_time_ns, 42)
         self.assertEqual(sample.pose_x_m, 1.25)
         self.assertEqual(sample.pose_y_m, 0.0)
         self.assertEqual(sample.velocity_omega_radps, 0.25)

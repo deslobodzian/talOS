@@ -22,6 +22,9 @@ static_assert(Message<geometry::Rotation2d>);
 static_assert(Message<geometry::Pose2d>);
 static_assert(Message<geometry::Twist2d>);
 static_assert(Message<geometry::OdometrySample>);
+static_assert(Message<geometry::SwerveModulePosition>);
+static_assert(Message<geometry::PoseObservation>);
+static_assert(Message<geometry::PoseEstimate>);
 static_assert(Message<control::VelocityTarget>);
 static_assert(Message<control::VelocityState>);
 static_assert(Message<control::PositionTarget>);
@@ -81,10 +84,10 @@ TEST(StandardMessages, RoundTripControlAndGeometryStructsOnSim) {
   ASSERT_TRUE(sample.has_value());
   const geometry::OdometrySample s =
       sample.value_or(geometry::OdometrySample{});
-  EXPECT_EQ(s.timestamp_ns(), 100u);
+  EXPECT_EQ(s.sample_time_ns(), 100u);
   EXPECT_DOUBLE_EQ(s.pose().x_m(), 1.5);
   EXPECT_DOUBLE_EQ(s.pose().y_m(), -2.5);
-  EXPECT_DOUBLE_EQ(s.pose().yaw_rot(), 0.25);
+  EXPECT_DOUBLE_EQ(s.pose().yaw_rad(), 0.25);
   EXPECT_DOUBLE_EQ(s.velocity().vx_mps(), 3.0);
   EXPECT_DOUBLE_EQ(s.velocity().omega_radps(), 0.5);
 }

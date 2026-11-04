@@ -30,6 +30,7 @@ namespace ds = talos::driver_station;
 
 constexpr double kMaxLinear = 4.0;  // the compiled defaults
 constexpr double kMaxAngular = 6.0;
+constexpr double kQuarterTurnRad = std::numbers::pi / 2;
 
 ds::JoystickData Stick(float axis0, float axis1, float axis2,
                        std::uint32_t buttons = 0, bool connected = true) {
@@ -81,9 +82,11 @@ period_us = 20000
   }
   // The bridge goes silent: no more Driver Station packets.
   void Silence() { hw_.reset(); }
-  void PublishHeading(double yaw_rot) {
-    sim_.publish(drivetrain::topics::kState,
-                 drivetrain::DrivetrainState{0, true, 0, 0, 0, yaw_rot, 0});
+  void PublishHeading(double yaw_rad, bool yaw_valid = true) {
+    sim_.publish(
+        drivetrain::topics::kState,
+        drivetrain::DrivetrainState{
+            0, true, true, yaw_valid, 0, 0, 0, yaw_rad, {}, {}, {}, {}});
     sim_.step(10ms);
   }
   void Advance(talos::Duration d) { sim_.step(d); }
@@ -172,7 +175,7 @@ TEST(OperatorInterface, TuningAndBindingsComeFromTheSubsystemTable) {
 
 TEST(OperatorInterface, FieldOrientedRotatesTheRequestByDrivetrainHeading) {
   Harness harness{kNoDeadbandFieldOriented};
-  harness.PublishHeading(0.25);  // a quarter turn CCW: nose to field +y
+  harness.PublishHeading(kQuarterTurnRad);  // CCW: nose to field +y
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
   // Driving downfield while facing left means strafing to the robot's right.
   EXPECT_NEAR(harness.chassis().vx_mps(), 0.0, 1e-9);
@@ -181,7 +184,7 @@ TEST(OperatorInterface, FieldOrientedRotatesTheRequestByDrivetrainHeading) {
 
 TEST(OperatorInterface, HeadingWithinTimeoutStaysFieldOriented) {
   Harness harness{kNoDeadbandFieldOriented};
-  harness.PublishHeading(0.25);
+  harness.PublishHeading(kQuarterTurnRad);
   harness.Advance(20ms);  // one dropped packet is not a stale publisher
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
   EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
@@ -201,7 +204,7 @@ TEST(OperatorInterface, WithoutAFreshFiniteHeadingDrivesRobotRelative) {
   }
   {
     Harness stale{kNoDeadbandFieldOriented};
-    stale.PublishHeading(0.25);
+    stale.PublishHeading(kQuarterTurnRad);
     stale.Advance(1s);
     robot_relative(stale);
   }
@@ -211,17 +214,34 @@ TEST(OperatorInterface, WithoutAFreshFiniteHeadingDrivesRobotRelative) {
     robot_relative(nan);
   }
   {
+    // The drivetrain publishes every tick; one whose gyro is gone says so.
+    Harness no_gyro{kNoDeadbandFieldOriented};
+    no_gyro.PublishHeading(kQuarterTurnRad, /*yaw_valid=*/false);
+    robot_relative(no_gyro);
+  }
+  {
     Harness off{kNoDeadbandRobotRelative};
-    off.PublishHeading(0.25);
+    off.PublishHeading(kQuarterTurnRad);
     robot_relative(off);
   }
 }
 
+TEST(OperatorInterface, InvalidHeadingsDoNotKeepAnOldOneFresh) {
+  // A valid heading, then the gyro drops while the drivetrain keeps
+  // publishing: the last valid heading ages out rather than being renewed.
+  Harness harness{kNoDeadbandFieldOriented};
+  harness.PublishHeading(kQuarterTurnRad);
+  for (int i = 0; i < 20; ++i) harness.PublishHeading(0.0, false);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
+  EXPECT_NEAR(harness.chassis().vx_mps(), kMaxLinear, 1e-9);
+  EXPECT_NEAR(harness.chassis().vy_mps(), 0.0, 1e-9);
+}
+
 TEST(OperatorInterface, AFreshHeadingResumesFieldOrientedAfterStale) {
   Harness harness{kNoDeadbandFieldOriented};
-  harness.PublishHeading(0.25);
+  harness.PublishHeading(kQuarterTurnRad);
   harness.Advance(1s);
-  harness.PublishHeading(0.25);
+  harness.PublishHeading(kQuarterTurnRad);
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
   EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
 }

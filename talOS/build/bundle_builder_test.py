@@ -1,4 +1,5 @@
-"""Tests bundle_builder.py's config staging: relative layout and identity."""
+"""Tests bundle_builder.py's config staging (relative layout and identity)
+and its lib/ staging of C++ nodes' shared libraries."""
 
 import json
 import os
@@ -17,8 +18,10 @@ def put(path, text):
 
 
 class BundleBuilderTest(unittest.TestCase):
-    def build(self, tmp, files):
-        """Bundles `files` ({short_path: text}); the first is the config."""
+    def build(self, tmp, files, nodes=(), check=True):
+        """Bundles `files` ({short_path: text}); the first is the config.
+        `nodes`: {name: {library basename: bytes}} C++ nodes and the shared
+        libraries each links."""
         src = os.path.join(tmp, "src")
         entries = []
         for short_path, text in files.items():
@@ -27,15 +30,30 @@ class BundleBuilderTest(unittest.TestCase):
                             "short_path": short_path})
         launcher = os.path.join(src, "launcher")
         put(launcher, "")
+        node_specs = []
+        for name, libs in dict(nodes).items():
+            binary = os.path.join(src, "bin", name)
+            put(binary, "")
+            shared = []
+            for lib, text in libs.items():
+                path = os.path.join(src, "solib", name, lib)
+                put(path, text)
+                shared.append({"src_path": path, "name": lib})
+            node_specs.append({"name": name, "target": f"//{name}:node",
+                               "language": "cpp", "src_path": binary,
+                               "runfiles": [], "shared_libs": shared})
         spec = os.path.join(tmp, "spec.json")
         with open(spec, "w", encoding="utf-8") as f:
             json.dump({"bundle_name": "b", "launcher_path": launcher,
                        "config": entries[0], "config_files": entries[1:],
-                       "nodes": []}, f)
+                       "nodes": node_specs}, f)
         out = os.path.join(tmp, "out")
         builder = runfiles.Create().Rlocation("_main/talOS/build/bundle_builder.py")
-        subprocess.run([sys.executable, builder, "--spec", spec, "--out", out],
-                       check=True)
+        proc = subprocess.run([sys.executable, builder, "--spec", spec,
+                               "--out", out], capture_output=True, text=True)
+        if not check:
+            return proc
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         with open(os.path.join(out, "bundle_manifest.toml"), encoding="utf-8") as f:
             manifest = f.read()
         return out, manifest
@@ -91,6 +109,29 @@ class BundleBuilderTest(unittest.TestCase):
                 {"c/robot.toml": "[robot]\nx\n", "c/subsystems/a.toml": ""}):
             with self.subTest(changed):
                 self.assertNotEqual(sha(base), sha(changed))
+
+    def test_cpp_nodes_shared_libraries_land_once_in_lib(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out, _ = self.build(tmp, {"c/robot.toml": "[robot]\n"}, nodes={
+                "drivetrain": {"libwpimath.dylib": "math", "libwpiutil.dylib": "util"},
+                "estimator": {"libwpimath.dylib": "math"},
+                "shooter": {},
+            })
+            self.assertEqual(sorted(os.listdir(os.path.join(out, "lib"))),
+                             ["libwpimath.dylib", "libwpiutil.dylib"])
+            with open(os.path.join(out, "lib", "libwpimath.dylib"),
+                      encoding="utf-8") as f:
+                self.assertEqual(f.read(), "math")
+
+    def test_two_different_libraries_under_one_name_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.build(tmp, {"c/robot.toml": "[robot]\n"}, nodes={
+                "a": {"libwpimath.so": "2026.2.1"},
+                "b": {"libwpimath.so": "2027.0.0"},
+            }, check=False)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("libwpimath.so", proc.stderr)
+            self.assertIn("'a'", proc.stderr)
 
 
 if __name__ == "__main__":

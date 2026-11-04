@@ -3,6 +3,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <string>
 #include <thread>
@@ -1049,6 +1050,71 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   EXPECT_EQ(later.timed_out_mask(), 0b11u);
   EXPECT_EQ(later.state_age_us(), 19000u);
   EXPECT_TRUE(later.configured());
+}
+
+// /hw/status maps the gateway's sample clock into the bridge's: the minimum
+// one-way delay over the received states, valid once enough states of one
+// gateway boot have arrived, blind to a frame the gateway clock says is not
+// new, and restarted by a gateway reboot.
+TEST(HardwareNodeTest, PublishesTheGatewayClockMapping) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  HardwareNode node{cfg, "127.0.0.1", 25832, 25833, true};
+  ASSERT_TRUE(node.Open());
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(gateway.Open("127.0.0.1", 25832, "127.0.0.1", 25833),
+            protocol::UdpStatus::kOk);
+  const uint64_t config_id = NodeConfigId(cfg);
+
+  const bridge::BridgeStatus before = node.Status(1000);
+  EXPECT_FALSE(before.clock_offset_valid());
+  EXPECT_EQ(before.clock_boot_id(), 0u);
+  EXPECT_EQ(before.clock_window_count(), 0u);
+
+  // Gateway time 1000 + 5000 i arrives at bridge time 2 s + 5000 i plus a
+  // latency between 400 and 1100 us.
+  constexpr uint64_t kLatencyUs[] = {700, 400, 900, 400, 650, 500, 1100, 450};
+  static_assert(std::size(kLatencyUs) ==
+                ClockOffsetEstimator::kConvergedSamples);
+  uint64_t now_us = 2'000'000;
+  for (std::size_t i = 0; i < std::size(kLatencyUs); ++i) {
+    EXPECT_FALSE(node.Status(now_us).clock_offset_valid())
+        << "valid after " << i << " states";
+    now_us = 2'000'000 + 5000 * i + kLatencyUs[i];
+    ASSERT_TRUE(InjectState(
+        node, gateway, TrustState(config_id, 11, 1, 1000 + 5000 * i), now_us));
+  }
+  bridge::BridgeStatus status = node.Status(now_us);
+  EXPECT_TRUE(status.clock_offset_valid());
+  EXPECT_EQ(status.clock_boot_id(), 11u);
+  EXPECT_EQ(status.clock_offset_us(), 2'000'000 - 1000 + 400);
+  EXPECT_EQ(status.clock_offset_spread_us(), 1100u - 400u);
+  EXPECT_EQ(status.clock_window_count(),
+            ClockOffsetEstimator::kConvergedSamples);
+  EXPECT_EQ(status.clock_resets_count(), 0u);
+  EXPECT_EQ(status.clock_ignored_count(), 0u);
+
+  // The last state again, 5 ms late: counted as received, kept out of the
+  // mapping (taken in, it would widen the spread to 5050 us).
+  const uint64_t states_before = node.states_received();
+  ASSERT_TRUE(InjectState(node, gateway,
+                          TrustState(config_id, 11, 1, 1000 + 5000 * 7),
+                          now_us + 5000));
+  EXPECT_EQ(node.states_received(), states_before + 1);
+  status = node.Status(now_us + 5000);
+  EXPECT_EQ(status.clock_ignored_count(), 1u);
+  EXPECT_EQ(status.clock_window_count(), 8u);
+  EXPECT_EQ(status.clock_offset_spread_us(), 700u);
+  EXPECT_TRUE(status.clock_offset_valid());
+
+  // The gateway reboots: its clock restarts, and so does the mapping.
+  ASSERT_TRUE(InjectState(node, gateway, TrustState(config_id, 12, 1, 1000),
+                          5'000'300));
+  status = node.Status(5'000'300);
+  EXPECT_FALSE(status.clock_offset_valid());
+  EXPECT_EQ(status.clock_boot_id(), 12u);
+  EXPECT_EQ(status.clock_resets_count(), 1u);
+  EXPECT_EQ(status.clock_window_count(), 1u);
+  EXPECT_EQ(status.clock_offset_us(), 5'000'300 - 1000);
 }
 
 // A timed-out subsystem neutralizes exactly its own motors, digital outputs

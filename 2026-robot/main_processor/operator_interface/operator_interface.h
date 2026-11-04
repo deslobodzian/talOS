@@ -2,7 +2,6 @@
 
 #include <chrono>
 #include <cmath>
-#include <numbers>
 
 #include "drivetrain/drive_message_generated.h"
 #include "drivetrain/topics.h"
@@ -37,13 +36,14 @@ class OperatorInterface {
         shooter_{node, "shooter", "teleop"},
         intake_{node, "intake", "teleop"},
         ds_{node, [this] { OnDriver(); }} {
-    // The drivetrain owns the yaw. A non-finite one carries no direction, so
-    // it is dropped and the previous heading keeps aging toward stale.
+    // The drivetrain owns the heading. One it marks invalid (no gyro) or a
+    // non-finite one carries no direction, so it is dropped and the previous
+    // heading keeps aging toward stale.
     node.subscribe<drivetrain::DrivetrainState>(
         drivetrain::topics::kState,
         [this](const drivetrain::DrivetrainState& s) {
-          if (!std::isfinite(s.yaw_rot())) return;
-          yaw_rot_ = s.yaw_rot();
+          if (!s.yaw_valid() || !std::isfinite(s.yaw_rad())) return;
+          yaw_rad_ = s.yaw_rad();
           heading_at_ = node_.now();
           have_heading_ = true;
         });
@@ -99,7 +99,7 @@ class OperatorInterface {
     // robot-relative rather than on a stale or assumed yaw.
     if (field_oriented_ && have_heading_ &&
         node_.now() - heading_at_ < heading_timeout_) {
-      const double yaw = yaw_rot_ * 2.0 * std::numbers::pi;
+      const double yaw = yaw_rad_;
       const double robot_vx = vx * std::cos(yaw) + vy * std::sin(yaw);
       vy = -vx * std::sin(yaw) + vy * std::cos(yaw);
       vx = robot_vx;
@@ -134,7 +134,7 @@ class OperatorInterface {
   talos::TargetLane<shooter::ShooterTarget> shooter_;
   talos::TargetLane<intake::IntakeTarget> intake_;
   talos::DriverStation ds_;
-  double yaw_rot_ = 0;
+  double yaw_rad_ = 0;
   talos::Time heading_at_{};
   bool have_heading_ = false;
   bool commanding_ = false;
