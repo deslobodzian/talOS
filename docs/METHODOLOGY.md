@@ -340,9 +340,11 @@ A dependency is adopted when it meets all of these:
 2. It is maintained, and it builds on every target platform: macOS arm64 (the
    Mini and laptops), Linux x86_64/arm64 (CI) and, if it runs there, the RoboRIO.
 3. Bazel consumes it through the Bazel Central Registry (`bazel_dep`), an
-   upstream `MODULE.bazel` (`archive_override`/`git_override`), or the pinned
-   pip lock (`//talOS/python:requirements.txt`). It is never vendored by copy
-   unless upstream has no build we can use.
+   upstream `MODULE.bazel` (`archive_override`/`git_override`), the pinned
+   pip lock (`//talOS/python:requirements.txt`, every distribution hashed),
+   or, when upstream publishes no Bazel module, its own sha256-pinned release
+   artifacts fetched by a module extension (`third_party/<name>`). It is
+   never vendored by copy unless upstream has no build we can use.
 4. It stays off the hot path unless it meets §10 (no allocation per tick in
    `update()`).
 5. It is added in one change, with the reason, to this table.
@@ -352,7 +354,8 @@ A dependency is adopted when it meets all of these:
 | Serialization, schemas, reflection | FlatBuffers (structs, and `reflection.fbs`/`.bfbs` for runtime schemas) | in use; `.bfbs` descriptors and schema hashes in use (D2 stage 1); hash-checked attach, descriptor-bearing logs and the reflection codec planned (D2) |
 | Config | TOML: toml++ (C++), `tomllib` (Python stdlib) | in use |
 | Tests | googletest, `unittest` | in use |
-| Geometry, kinematics, pose estimation, trajectories, profiles, PID, filters | wpimath (C++, from allwpilib's upstream Bazel build; Python: `robotpy-wpimath` on PyPI) | planned (D6); Bazel integration on macOS arm64 still to be verified |
+| Geometry, kinematics, pose estimation, trajectories, profiles, PID, filters | wpimath 2026.2.1 (C++: WPILib's Maven release artifacts through `third_party/wpilib`, `//third_party/wpilib:wpimath`, shared libraries staged in a bundle's `lib/`; Python: `robotpy-wpimath` 2026.2.1.1 on the same native build). allwpilib 2026 has no `MODULE.bazel` and no BCR entry. `//2026-robot/controller_processor/rio:wpilib_lockstep_test` keeps the Maven pin, the `robotpy-native-wpimath` pin and GradleRIO on one release | in use (D6): drivetrain `units::` boundary conversions, the pose estimator's `kalman` backend (`SwerveDrive4PoseEstimator`); macOS arm64 built and run, Linux artifacts fetched and hash-checked but not run |
+| Smoothing and mapping (factor graphs) | GTSAM 4.3.0 (`gtsam` wheel on PyPI, BSD) | in use (D6): the pose estimator's `factor_graph` backend (`IncrementalFixedLagSmoother`). Python only: GTSAM has no Bazel module, and its C++ build is CMake with a large dependency surface |
 | Vision: AprilTag pose observations | PhotonVision on the camera coprocessor; `photonlibpy`/photonlib, or `apriltag`/`robotpy-apriltag` for an in-process pipeline | candidate (D6) |
 | Autonomous paths | Choreo or PathPlanner trajectories, followed with wpimath controllers | candidate |
 | Log viewing | export `.tlog` to MCAP (Foxglove) or WPILOG (AdvantageScope) rather than building more viewer features | candidate |
