@@ -163,8 +163,10 @@ struct LauncherOptions {
   // Probe and lint without spawning anything, as a pre-flight check.
   bool describe_only{false};
 
-  // How long one binary gets to answer --describe.
-  int describe_timeout_ms{5000};
+  // How long one binary gets to answer --describe. A Python node importing
+  // native wheels (robotpy-wpimath) needs several seconds on its first run
+  // from a freshly copied bundle, while macOS checks every new library.
+  int describe_timeout_ms{15000};
 
   // Bundle directory assembled by talos_bundle.
   std::string bundle_dir;
