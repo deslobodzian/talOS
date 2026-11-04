@@ -140,7 +140,7 @@ test('system methods distinguish an unknown system from an empty one', () => {
   // running" from "nobody has told me what is running yet".
   for (const method of ['get_system_graph', 'describe_topic']) {
     assert.throws(
-        () => dispatch(systemContext(null), method, {topic: '/odometry/state'}),
+        () => dispatch(systemContext(null), method, {topic: '/pose_estimator/state'}),
         (e: unknown) => e instanceof RpcFault && e.code === -32002);
   }
   // The declared graph is the same distinction one step earlier: the bridge may
@@ -374,7 +374,7 @@ test('every advertised method exists, and nothing else does', () => {
     const response = handleRpc(
                          {...context, timeline: history()},
                          {jsonrpc: '2.0', id: 1, method, params: {
-                           topic: '/odometry/state',
+                           topic: '/pose_estimator/state',
                            timestamp_ns: '1000000000',
                            condition: {op: 'gt', value: 0}
                          }}) as any;

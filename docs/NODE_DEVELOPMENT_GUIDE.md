@@ -152,6 +152,10 @@ and include its schema by the dep's include prefix:
 `include "geometry/geometry.fbs";` in the `.fbs`, then C++ includes
 `"geometry/geometry_generated.h"`. Deps are transitive. At a repository root
 the package path is empty, so pass `include_prefix` explicitly there.
+A package whose messages all come from `deps` declares only its topics:
+`talos_messages(name = "messages", srcs = [], topics = {"state":
+"/pose_estimator/state"}, deps = ["//talOS/msgs:geometry"])` gives
+`<prefix>/topics.h` and `<prefix>.topics` plus the dep's types.
 Every numeric struct field must end in a unit suffix from
 [METHODOLOGY.md §6](METHODOLOGY.md#6-units) (`_rps`, `_m`, `_count`, ...);
 bools, enums and structs need none. A field without one fails the build,
@@ -197,3 +201,39 @@ the same methods (`Sim.from_toml`, `sim.step(seconds)`,
 source)`, `sim.latest_target(M, sub, source)`, `hw.set_driver_station(enabled=True,
 teleop=True)`, `hw.stop_driver_station()`, `sim.latest_bytes(topic)`). See
 `2026-robot/main_processor/intake/node_test.py`.
+
+## Adding a pose estimator
+
+An estimator is a hardware-free node: it reads state topics and publishes a
+`geometry.PoseEstimate` (`//talOS/msgs:geometry`) on its own `/<name>/state`
+every tick, with `valid`. Absolute measurements arrive as
+`geometry.PoseObservation` (`sample_time_ns`, `pose`, `x_std_m`, `y_std_m`,
+`yaw_std_rad`, `valid`) on each camera node's `/<camera>/state`.
+
+```sh
+bazel run //tools:new_subsystem -- localizer --lang py --type estimator   # or --lang cpp
+```
+
+writes the package (topics-only `talos_messages`, the node, a Sim test of the
+disabled and stale cases), `subsystems/localizer.toml` with `cameras = []`,
+the `[[subsystems]]` entry and the manifests. The generated node subscribes
+to `/<camera>/state` for each name in `cameras` with `optional = true`, so a
+robot without that camera still passes the graph lint, and reads each
+observation once (`updated`). Rules every estimator keeps:
+
+- Never gate on `robot_enabled`: it writes no actuator, and the pose must be
+  right before the match is enabled.
+- Time everything by sample time (`DrivetrainState.sample_time_ns`,
+  `PoseObservation.sample_time_ns`), never by arrival or `node.now`; with
+  wpimath call `updateWithTime(sample_time_ns / 1e9, ...)`, never `update()`.
+- Reject an observation that is invalid, non-finite, has a non-positive
+  standard deviation, or is older or newer than the estimator can place, and
+  count it; hold the pose and publish `valid = false` while the inputs are
+  stale.
+- Name the pose in consumers by config only:
+  `[subsystems.telemetry] pose_topic = "/localizer/state"`.
+
+`2026-robot/main_processor/pose_estimator` is the full example: swerve
+odometry plus cameras, with `backend = "kalman"` (wpimath
+`SwerveDrive4PoseEstimator`) or `"factor_graph"` (a GTSAM fixed-lag
+smoother), and tests that run every scenario against both.

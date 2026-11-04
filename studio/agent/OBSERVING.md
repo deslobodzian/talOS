@@ -9,7 +9,7 @@ curl localhost:5800/channels.json    # channel dictionary: names, units, enum la
 curl localhost:5800/system.json      # nodes, topics, health
 ```
 
-`/telemetry.json` is keyed by channel name: `channels["odometry/vx"]` is
+`/telemetry.json` is keyed by channel name: `channels["pose/vx"]` is
 `{"value": 1.2, "unit": "m/s"}`, `value` is `null` when there was no fresh
 reading (never zero-filled), `unit` is always present, and enum channels add
 an in-range `label`. Beside it: `chassis`, `stream_id`, `sequence_id`,

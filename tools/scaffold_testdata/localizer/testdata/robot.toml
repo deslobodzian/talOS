@@ -1,0 +1,18 @@
+# Localizer test robot: the estimator and two cameras (the tests publish
+# their observations).
+[robot]
+name = "localizer_test"
+period_us = 20000
+command_timeout_us = 100000
+
+[subsystems.localizer]
+period_us = 20000
+cameras = ["front_camera", "back_camera"]
+observation_timeout_us = 500000
+
+# A robot config needs one motor; this stands in for the robot the
+# estimator rides on.
+[subsystems.chassis.motors.chassis_motor]
+type = "TalonFX"
+bus = "test"
+can_id = 1

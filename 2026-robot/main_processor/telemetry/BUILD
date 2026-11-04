@@ -11,10 +11,10 @@ cc_library(
     deps = [
         "//2026-robot/main_processor/drivetrain:messages",
         "//2026-robot/main_processor/intake:messages",
-        "//2026-robot/main_processor/odometry:messages",
         "//2026-robot/main_processor/shooter:messages",
         "//talOS/bridge:messages",
         "//talOS/devices",
+        "//talOS/msgs:geometry",
         "//talOS/node",
         "//talOS/telemetry:schema",
         "//talOS/telemetry:wire",

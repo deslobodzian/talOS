@@ -1,10 +1,13 @@
 """Scaffolds a talos subsystem: a node package plus its robot wiring.
 
     bazel run //tools:new_subsystem -- <name> --lang cpp|py \\
-        [--robot 2026-robot] [--standalone DIR] [--dry-run]
+        [--type velocity|position|estimator] [--robot 2026-robot] \\
+        [--standalone DIR] [--dry-run]
 
 Writes <robot>/main_processor/<name>/ (messages, node, Sim test, testdata),
-modelled on that robot's shooter (C++) and intake (Python) packages, then adds
+modelled on that robot's shooter (C++) and intake (Python) packages, or for
+--type estimator a hardware-free node publishing geometry.PoseEstimate from
+the PoseObservations of its `cameras`, then adds
 configuration/subsystems/<name>.toml and its [[subsystems]] entry in
 configuration/robot.toml, and regenerates configuration/robot_manifest.bzl
 (//tools:sync_manifest), which the bundle and graph test read, plus the
@@ -863,11 +866,560 @@ max_velocity_rps = 100.0
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 """
 
+# ---------------------------------------------------- estimator archetype
+
+ESTIMATOR_MESSAGES_BUILD = """\
+# The @NAME@'s topic. Its state is the shared geometry.PoseEstimate and its
+# camera inputs are geometry.PoseObservation (//talOS/msgs:geometry), so the
+# package declares no schema of its own. Consumers find the pose through
+# config (telemetry's pose_topic), not through this package.
+talos_messages(
+    name = "messages",
+    srcs = [],
+    include_prefix = "@NAME@",
+    topics = {
+        "state": "/@NAME@/state",
+    },
+    deps = ["//talOS/msgs:geometry"],
+)
+"""
+
+ESTIMATOR_DOC = """\
+Reads geometry.PoseObservation from each camera node listed in `cameras`
+(/<camera>/state) and publishes geometry.PoseEstimate on its own state
+topic every tick. As generated it follows the newest usable observation
+(the most certain one when several arrive in one tick) and is valid while
+one arrived within observation_timeout_us; fuse odometry here (see
+2026-robot/main_processor/pose_estimator, which runs wpimath's
+SwerveDrive4PoseEstimator or a GTSAM smoother). It drives nothing, so it
+runs whether the robot is enabled or not."""
+
+CC_ESTIMATOR_HEADER = """\
+#pragma once
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
+
+@INCLUDES@
+
+namespace @NAME@ {
+
+// A pose estimator.
+@DOC@
+class @PASCAL@ {
+ public:
+  using State = geometry::PoseEstimate;
+  using Observation = geometry::PoseObservation;
+
+  explicit @PASCAL@(talos::Node& node)
+      : node_{node},
+        timeout_{std::chrono::microseconds{
+            node.param<std::int64_t>("observation_timeout_us", 500'000)}},
+        state_{node.publish<State>(topics::kState)} {
+    for (const std::string& camera :
+         node.param<std::vector<std::string>>("cameras")) {
+      cameras_.push_back(node.subscribe<Observation>("/" + camera + "/state",
+                                                     {.optional = true}));
+    }
+  }
+
+  void update() {
+    const Observation* best = nullptr;
+    for (const auto& camera : cameras_) {
+      if (!camera.updated()) continue;  // each observation counts once
+      const Observation& o = camera.value();
+      if (!Usable(o)) {
+        ++rejected_;
+        continue;
+      }
+      ++accepted_;
+      if (best == nullptr ||
+          o.x_std_m() + o.y_std_m() < best->x_std_m() + best->y_std_m()) {
+        best = &o;
+      }
+    }
+    if (best != nullptr) {
+      pose_ = best->pose();
+      sample_time_ns_ = best->sample_time_ns();
+      last_accepted_ = node_.now();
+    }
+    const bool valid =
+        last_accepted_.has_value() && node_.now() - *last_accepted_ <= timeout_;
+    state_.send(State{sample_time_ns_, pose_, geometry::Twist2d{}, valid,
+                      accepted_, rejected_});
+  }
+
+ private:
+  static bool Usable(const Observation& o) {
+    for (const double v : {o.pose().x_m(), o.pose().y_m(), o.pose().yaw_rad(),
+                           o.x_std_m(), o.y_std_m(), o.yaw_std_rad()}) {
+      if (!std::isfinite(v)) return false;
+    }
+    return o.valid() && o.sample_time_ns() > 0 && o.x_std_m() > 0 &&
+           o.y_std_m() > 0 && o.yaw_std_rad() > 0;
+  }
+
+  talos::Node& node_;
+  talos::Duration timeout_;
+  std::vector<talos::Subscription<Observation>> cameras_;
+  talos::Publisher<State> state_;
+  geometry::Pose2d pose_{};  // held while no usable observation arrives
+  std::uint64_t sample_time_ns_{0};
+  std::optional<talos::Time> last_accepted_;
+  std::uint32_t accepted_{0};
+  std::uint32_t rejected_{0};
+};
+
+}  // namespace @NAME@
+"""
+
+CC_ESTIMATOR_TEST = """\
+#include <gtest/gtest.h>
+#include <sys/wait.h>
+
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+@INCLUDES@
+
+namespace @NAME@ {
+namespace {
+
+using namespace std::chrono_literals;
+using talos::testing::Sim;
+using talos::testing::SimHardware;
+
+std::string Runfile(const char* env) {
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error));
+  const char* location = std::getenv(env);
+  if (!runfiles || location == nullptr) {
+    throw std::runtime_error(std::string{"runfile unavailable: "} + env + " " +
+                             error);
+  }
+  return runfiles->Rlocation(location);
+}
+
+class @PASCAL@Test : public ::testing::Test {
+ protected:
+  using State = @PASCAL@::State;
+  using Observation = @PASCAL@::Observation;
+
+  // A camera's observation of (x, y), taken now.
+  void Observe(const char* camera, double x, double y, bool valid = true,
+               double std_m = 0.1) {
+    sim.publish(
+        std::string{"/"} + camera + "/state",
+        Observation{static_cast<std::uint64_t>(sim.now().nanos()),
+                    geometry::Pose2d{x, y, 0.5}, std_m, std_m, 0.05, 2, valid});
+  }
+  State Latest() const {
+    const auto state = sim.latest<State>(topics::kState);
+    EXPECT_TRUE(state.has_value());
+    return state.value_or(State{});
+  }
+
+  Sim sim{Runfile("TALOS_TEST_CONFIG")};
+  @PASCAL@& node = sim.add<@PASCAL@>("@NAME@");
+  SimHardware hw{sim};
+};
+
+TEST_F(@PASCAL@Test, FollowsAUsableObservation) {
+  sim.step(20ms);
+  Observe("front_camera", 1.0, 2.0);
+  sim.step(40ms);
+  const State state = Latest();
+  EXPECT_TRUE(state.valid());
+  EXPECT_DOUBLE_EQ(state.pose().x_m(), 1.0);
+  EXPECT_DOUBLE_EQ(state.pose().y_m(), 2.0);
+  EXPECT_EQ(state.observation_accepted_count(), 1u);  // counted once
+}
+
+TEST_F(@PASCAL@Test, EstimatesWhileTheRobotIsDisabled) {
+  hw.enable(false);  // nothing here is actuation-gated
+  sim.step(20ms);
+  Observe("back_camera", 3.0, 1.0);
+  sim.step(40ms);
+  EXPECT_TRUE(Latest().valid());
+  EXPECT_DOUBLE_EQ(Latest().pose().x_m(), 3.0);
+}
+
+TEST_F(@PASCAL@Test, StaleInputIsInvalidAndHoldsThePose) {
+  sim.step(20ms);
+  Observe("front_camera", 1.0, 2.0);
+  sim.step(40ms);
+  ASSERT_TRUE(Latest().valid());
+  sim.step(600ms);  // past observation_timeout_us
+  const State state = Latest();
+  EXPECT_FALSE(state.valid());
+  EXPECT_DOUBLE_EQ(state.pose().x_m(), 1.0);
+}
+
+TEST_F(@PASCAL@Test, RejectsUnusableObservations) {
+  sim.step(20ms);
+  Observe("front_camera", 1.0, 2.0, /*valid=*/false);
+  sim.step(40ms);
+  Observe("front_camera", 1.0, 2.0, true,
+          std::numeric_limits<double>::quiet_NaN());
+  sim.step(40ms);
+  const State state = Latest();
+  EXPECT_FALSE(state.valid());
+  EXPECT_EQ(state.observation_rejected_count(), 2u);
+  EXPECT_EQ(state.observation_accepted_count(), 0u);
+}
+
+TEST_F(@PASCAL@Test, ReadsOnlyTheListedCameras) {
+  sim.step(20ms);
+  Observe("side_camera", 1.0, 2.0);  // not in `cameras`
+  sim.step(40ms);
+  EXPECT_FALSE(Latest().valid());
+  EXPECT_EQ(Latest().observation_accepted_count(), 0u);
+}
+
+struct Result {
+  int status;
+  std::string output;
+};
+
+Result RunNode(const std::string& args) {
+  const std::string command = "'" + Runfile("TALOS_TEST_NODE") + "' " + args +
+                              " --config '" + Runfile("TALOS_TEST_CONFIG") +
+                              "' 2>&1";
+  FILE* pipe = ::popen(command.c_str(), "r");
+  if (pipe == nullptr) throw std::runtime_error("popen failed");
+  Result result{0, {}};
+  char buffer[4096];
+  while (const std::size_t n = std::fread(buffer, 1, sizeof buffer, pipe)) {
+    result.output.append(buffer, n);
+  }
+  const int status = ::pclose(pipe);
+  result.status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  return result;
+}
+
+TEST(@PASCAL@Binary, LoggedSimRunReplaysWithoutDivergence) {
+  const char* tmp = std::getenv("TEST_TMPDIR");
+  const std::string log =
+      std::string{tmp != nullptr ? tmp : "/tmp"} + "/node_test.tlog";
+  const Result run = RunNode("--sim --duration-s 1 --log '" + log + "'");
+  ASSERT_EQ(run.status, 0) << run.output;
+  const Result replay = RunNode("--replay '" + log + "'");
+  EXPECT_EQ(replay.status, 0) << replay.output;
+  EXPECT_NE(replay.output.find("diverged=0 clean_exit=1"), std::string::npos)
+      << replay.output;
+}
+
+}  // namespace
+}  // namespace @NAME@
+"""
+
+PY_ESTIMATOR_NODE = '''\
+"""@PASCAL@: a pose estimator.
+
+@DOC@
+"""
+
+import math
+
+from @NAME@ import topics
+from geometry.PoseEstimate import PoseEstimate
+from geometry.PoseObservation import PoseObservation
+
+
+def usable(o):
+    values = (o.pose_x_m, o.pose_y_m, o.pose_yaw_rad, o.x_std_m, o.y_std_m,
+              o.yaw_std_rad)
+    return (o.valid and o.sample_time_ns > 0
+            and all(map(math.isfinite, values))
+            and min(o.x_std_m, o.y_std_m, o.yaw_std_rad) > 0)
+
+
+class @PASCAL@:
+    def __init__(self, node):
+        self.node = node
+        cameras = node.param("cameras")
+        if (not isinstance(cameras, list)
+                or not all(isinstance(c, str) and c for c in cameras)):
+            raise ValueError(f"@NAME@: cameras must list camera node names, "
+                             f"got {cameras!r}")
+        self.cameras = [
+            node.subscribe(PoseObservation, f"/{camera}/state", optional=True)
+            for camera in cameras]
+        self.timeout_s = node.param("observation_timeout_us", 500_000) / 1e6
+        self.state = node.publish(PoseEstimate, topics.STATE)
+        self.pose = (0.0, 0.0, 0.0)  # held while no usable observation arrives
+        self.sample_time_ns = 0
+        self.last_accepted_s = None
+        self.accepted = self.rejected = 0
+
+    def update(self):
+        best = None
+        for camera in self.cameras:
+            if not camera.updated:  # each observation counts once
+                continue
+            o = camera.value
+            if not usable(o):
+                self.rejected += 1
+                continue
+            self.accepted += 1
+            if best is None or (o.x_std_m + o.y_std_m
+                                < best.x_std_m + best.y_std_m):
+                best = o
+        if best is not None:
+            self.pose = (best.pose_x_m, best.pose_y_m, best.pose_yaw_rad)
+            self.sample_time_ns = best.sample_time_ns
+            self.last_accepted_s = self.node.now
+        valid = (self.last_accepted_s is not None
+                 and self.node.now - self.last_accepted_s <= self.timeout_s)
+        x, y, yaw = self.pose
+        self.state.send(sample_time_ns=self.sample_time_ns, pose_x_m=x,
+                        pose_y_m=y, pose_yaw_rad=yaw, valid=valid,
+                        observation_accepted_count=self.accepted,
+                        observation_rejected_count=self.rejected)
+'''
+
+PY_ESTIMATOR_TEST = '''\
+"""Node tests: the class on talos.testing.Sim, and the binary."""
+
+import math
+import os
+import subprocess
+import tempfile
+import unittest
+
+import talos
+@FROM_IMPORTS@
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG = os.path.join(HERE, "testdata", "robot.toml")
+node_py = talos.load(os.path.join(HERE, "@NAME@.py"))
+
+
+class @PASCAL@Test(unittest.TestCase):
+    def setUp(self):
+        self.sim = Sim(CONFIG)
+        self.sim.add(node_py.@PASCAL@, "@NAME@")
+        self.hw = SimHardware(self.sim)
+
+    def observe(self, camera, x, y, valid=True, std_m=0.1):
+        """A camera's observation of (x, y), taken now."""
+        self.sim.publish(
+            PoseObservation, f"/{camera}/state",
+            sample_time_ns=round(self.sim.now * 1e9), pose_x_m=x, pose_y_m=y,
+            pose_yaw_rad=0.5, x_std_m=std_m, y_std_m=std_m, yaw_std_rad=0.05,
+            tag_count=2, valid=valid)
+
+    def state(self):
+        return self.sim.latest(PoseEstimate, topics.STATE)
+
+    def test_follows_a_usable_observation(self):
+        self.sim.step(0.02)
+        self.observe("front_camera", 1.0, 2.0)
+        self.sim.step(0.04)
+        state = self.state()
+        self.assertTrue(state.valid)
+        self.assertEqual((state.pose_x_m, state.pose_y_m), (1.0, 2.0))
+        self.assertEqual(state.observation_accepted_count, 1)  # counted once
+
+    def test_estimates_while_the_robot_is_disabled(self):
+        self.hw.enable(False)  # nothing here is actuation-gated
+        self.sim.step(0.02)
+        self.observe("back_camera", 3.0, 1.0)
+        self.sim.step(0.04)
+        self.assertTrue(self.state().valid)
+        self.assertEqual(self.state().pose_x_m, 3.0)
+
+    def test_stale_input_is_invalid_and_holds_the_pose(self):
+        self.sim.step(0.02)
+        self.observe("front_camera", 1.0, 2.0)
+        self.sim.step(0.04)
+        self.assertTrue(self.state().valid)
+        self.sim.step(0.6)  # past observation_timeout_us
+        self.assertFalse(self.state().valid)
+        self.assertEqual(self.state().pose_x_m, 1.0)
+
+    def test_rejects_unusable_observations(self):
+        self.sim.step(0.02)
+        self.observe("front_camera", 1.0, 2.0, valid=False)
+        self.sim.step(0.04)
+        self.observe("front_camera", 1.0, 2.0, std_m=math.nan)
+        self.sim.step(0.04)
+        state = self.state()
+        self.assertFalse(state.valid)
+        self.assertEqual((state.observation_accepted_count,
+                          state.observation_rejected_count), (0, 2))
+
+    def test_reads_only_the_listed_cameras(self):
+        self.sim.step(0.02)
+        self.observe("side_camera", 1.0, 2.0)  # not in `cameras`
+        self.sim.step(0.04)
+        self.assertFalse(self.state().valid)
+        self.assertEqual(self.state().observation_accepted_count, 0)
+
+
+class BinaryTest(unittest.TestCase):
+    def run_binary(self, *argv):
+        resolver = runfiles.Create()
+        binary = resolver.Rlocation(os.environ["NODE_BINARY"])
+        env = dict(os.environ, **resolver.EnvVars())
+        env.pop("PYTHONPATH", None)
+        with tempfile.TemporaryDirectory() as cwd:
+            proc = subprocess.run([binary, *argv], cwd=cwd, env=env,
+                                  capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_sim_run_replays_without_divergence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "node_test.tlog")
+            self.run_binary("--sim", "--duration-s", "1", "--config", CONFIG,
+                            "--log", log)
+            self.run_binary("--replay", log, "--config", CONFIG)
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+
+ESTIMATOR_TESTDATA_ROBOT = """\
+# @PASCAL@ test robot: the estimator and two cameras (the tests publish
+# their observations).
+[robot]
+name = "@NAME@_test"
+period_us = @PERIOD@
+command_timeout_us = 100000
+
+[subsystems.@NAME@]
+period_us = @PERIOD@
+cameras = ["front_camera", "back_camera"]
+observation_timeout_us = 500000
+
+# A robot config needs one motor; this stands in for the robot the
+# estimator rides on.
+[subsystems.chassis.motors.chassis_motor]
+type = "TalonFX"
+bus = "test"
+can_id = 1
+"""
+
+ESTIMATOR_SUBSYSTEM_TOML = """\
+# @PASCAL@ pose estimator, generated by //tools:new_subsystem. Parsed via the
+# [[subsystems]] manifest in @ROBOT@/main_processor/configuration/robot.toml.
+# It owns no devices. Point consumers at it with config only, e.g.
+# [subsystems.telemetry] pose_topic = "/@NAME@/state".
+[subsystem]
+name = "@NAME@"
+node = "//@PACKAGE@:node"
+period_us = @PERIOD@
+# Camera nodes, each publishing geometry.PoseObservation on /<name>/state.
+cameras = []
+# The estimate is invalid once no usable observation arrived for this long.
+observation_timeout_us = 500000
+"""
+
+STANDALONE_ESTIMATOR_DEFAULTS_TOML = """\
+# @PASCAL@ pose estimator defaults, shipped by the @@NAME@ repository.
+[subsystem]
+name = "@NAME@"
+node = "@@NAME@//:node"
+period_us = @PERIOD@
+cameras = []
+observation_timeout_us = 500000
+"""
+
+
+def estimator_files(name, lang):
+    """{relative path: content} of an estimator package."""
+    values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US)
+    doc = fill(ESTIMATOR_DOC, **values)
+    messages = fill(ESTIMATOR_MESSAGES_BUILD, **values)
+    files = {"testdata/robot.toml": fill(ESTIMATOR_TESTDATA_ROBOT, **values)}
+    if lang == "cpp":
+        node_includes = [f"{name}/topics.h", "geometry/geometry_generated.h",
+                         "talOS/node/node.h"]
+        test_includes = ["rules_cc/cc/runfiles/runfiles.h",
+                         f"{name}/{name}.h", "talOS/devices/testing.h",
+                         "talOS/node/testing.h"]
+        build = fill(CC_BUILD, MESSAGES=messages,
+                     DATA="[\n" + string_list(["testdata/robot.toml", ":node"],
+                                              4), **values)
+        # The node reads no devices; only its test drives SimHardware.
+        build = build.replace('        "//talOS/devices",\n', "", 1)
+        files.update({
+            "BUILD": build,
+            f"{name}.h": fill(CC_ESTIMATOR_HEADER,
+                              INCLUDES=includes(node_includes),
+                              DOC="\n".join("// " + line for line in
+                                            doc.splitlines()), **values),
+            f"{name}.cc": fill(CC_SOURCE, **values),
+            "node_test.cc": fill(CC_ESTIMATOR_TEST,
+                                 INCLUDES=includes(test_includes), **values),
+        })
+    else:
+        imports = {
+            name: "topics",
+            "geometry.PoseEstimate": "PoseEstimate",
+            "geometry.PoseObservation": "PoseObservation",
+            "python.runfiles": "runfiles",
+            "talos.testing": "Sim, SimHardware",
+        }
+        from_imports = "\n".join(
+            f"from {module} import {imports[module]}"
+            for module in sorted(imports, key=str.lower))
+        files.update({
+            "BUILD": fill(PY_BUILD, MESSAGES=messages,
+                          DATA="[\n" + string_list(
+                              [f"{name}.py", "testdata/robot.toml", ":node"],
+                              4), **values),
+            f"{name}.py": fill(PY_ESTIMATOR_NODE, DOC=doc, **values),
+            "node_test.py": fill(PY_ESTIMATOR_TEST, FROM_IMPORTS=from_imports,
+                                 **values),
+        })
+    return files
+
 
 # ---------------------------------------------------------------- generation
 
 def package_files(name, lang, standalone=False, kind="velocity"):
     """{relative path: content} of the new package."""
+    values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US)
+    files = (estimator_files(name, lang) if kind == "estimator"
+             else mechanism_files(name, lang, kind))
+    if standalone:
+        # talOS labels name the @talos module; the repo root is the package,
+        # so defaults.toml is exported after the loads.
+        loads, _, rest = files["BUILD"].replace(
+            '"//talOS/', '"@talos//talOS/').partition("\n\n")
+        files["BUILD"] = (loads + '\n\nexports_files(["defaults.toml"])\n\n'
+                          + rest)
+        extra_deps = (
+            'bazel_dep(name = "rules_cc", version = "0.2.18")\n'
+            'bazel_dep(name = "googletest", version = "1.17.0.bcr.2")\n'
+            if lang == "cpp" else
+            'bazel_dep(name = "rules_python", version = "2.0.1")\n'
+        )
+        files["MODULE.bazel"] = fill(
+            STANDALONE_MODULE, EXTRA_DEPS=extra_deps, **values)
+        files["defaults.toml"] = fill(
+            STANDALONE_ESTIMATOR_DEFAULTS_TOML if kind == "estimator"
+            else STANDALONE_DEFAULTS_TOML, **values)
+    return files
+
+
+def mechanism_files(name, lang, kind):
+    """{relative path: content} of a one-motor velocity/position package."""
     values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US)
     messages = fill(MESSAGES_BUILD, **values)
     fbs_template = POSITION_FBS if kind == "position" else FBS
@@ -926,22 +1478,6 @@ def package_files(name, lang, standalone=False, kind="velocity"):
             "node_test.py": py_test,
             "testdata/robot.toml": fill(PY_TESTDATA_ROBOT, **values),
         })
-    if standalone:
-        # talOS labels name the @talos module; the repo root is the package,
-        # so defaults.toml is exported after the loads.
-        loads, _, rest = files["BUILD"].replace(
-            '"//talOS/', '"@talos//talOS/').partition("\n\n")
-        files["BUILD"] = (loads + '\n\nexports_files(["defaults.toml"])\n\n'
-                          + rest)
-        extra_deps = (
-            'bazel_dep(name = "rules_cc", version = "0.2.18")\n'
-            'bazel_dep(name = "googletest", version = "1.17.0.bcr.2")\n'
-            if lang == "cpp" else
-            'bazel_dep(name = "rules_python", version = "2.0.1")\n'
-        )
-        files["MODULE.bazel"] = fill(
-            STANDALONE_MODULE, EXTRA_DEPS=extra_deps, **values)
-        files["defaults.toml"] = fill(STANDALONE_DEFAULTS_TOML, **values)
     return files
 
 
@@ -971,7 +1507,8 @@ def used_can_ids(subsystems):
 
 
 def plan(root, robot, name, lang, kind="velocity"):
-    """([(path, old content or None, new content)], placeholder CAN id)."""
+    """([(path, old content or None, new content)], placeholder CAN id, or
+    None for an estimator, which owns no devices)."""
     if problem := check_name(name):
         raise Refused(problem)
     processor = os.path.join(root, robot, "main_processor")
@@ -993,16 +1530,20 @@ def plan(root, robot, name, lang, kind="velocity"):
     if name in subsystems:
         raise Refused(f"{config} already has subsystem '{name}'")
 
-    used = used_can_ids(subsystems)
-    can_id = next((i for i in range(1, MAX_CAN_ID + 1) if i not in used), None)
-    if can_id is None:
-        raise Refused(f"every CAN id 1..{MAX_CAN_ID} is taken in "
-                      f"{rel(root, configuration)}")
+    can_id = None
+    if kind != "estimator":
+        used = used_can_ids(subsystems)
+        can_id = next((i for i in range(1, MAX_CAN_ID + 1) if i not in used),
+                      None)
+        if can_id is None:
+            raise Refused(f"every CAN id 1..{MAX_CAN_ID} is taken in "
+                          f"{rel(root, configuration)}")
 
     writes = [(os.path.join(package, path), None, content)
               for path, content in package_files(name, lang, kind=kind).items()]
     subsystem = fill(
-        SUBSYSTEM_TOML, NAME=name, PASCAL=pascal(name), ROBOT=robot,
+        ESTIMATOR_SUBSYSTEM_TOML if kind == "estimator" else SUBSYSTEM_TOML,
+        NAME=name, PASCAL=pascal(name), ROBOT=robot,
         PACKAGE=f"{robot}/main_processor/{name}", PERIOD=PERIOD_US,
         CAN_ID=can_id)
     writes.append((subsystem_toml, None, subsystem))
@@ -1100,19 +1641,26 @@ def show(root, writes):
 def next_steps(robot, name, can_id):
     package = f"//{robot}/main_processor/{name}"
     configuration = f"{robot}/main_processor/configuration"
-    return f"""\
+    common = f"""\
 Next:
   bazel test {package}:all
   bazel build //talOS/launcher //talOS/bridge:hardware_node //{robot}/main_processor/...
   bazel run //talOS/launcher -- --config $PWD/{configuration}/robot.toml --describe-only
-  {configuration}/subsystems/{name}.toml
+  {configuration}/subsystems/{name}.toml"""
+    if can_id is None:  # an estimator
+        return common + f"""
+    List the camera nodes in `cameras`; point telemetry at the pose with
+    [subsystems.telemetry] pose_topic = "/{name}/state"."""
+    return common + f"""
     can_id = {can_id} is a placeholder: replace it with the motor's physical id.
     The gains are zero (untuned): tune slot0 there.
   {configuration}/config_golden_test.cc
     pins the hardware config: update it once a human has checked the CAN id."""
 
 
-def standalone_next_steps(target_dir, name):
+def standalone_next_steps(target_dir, name, kind="velocity"):
+    edit = ("list its camera nodes in `cameras`" if kind == "estimator"
+            else "add the motor's physical can_id")
     return f"""\
 Next (standalone subsystem repo at {target_dir}):
   1. Run its tests (MODULE.bazel overrides @talos with this checkout):
@@ -1121,7 +1669,7 @@ Next (standalone subsystem repo at {target_dir}):
        bazel_dep(name = "{name}", version = "0.1.0")
        local_path_override(module_name = "{name}", path = "{target_dir}")
   3. Copy {target_dir}/defaults.toml to the robot's
-     configuration/subsystems/{name}.toml, add the motor's physical can_id,
+     configuration/subsystems/{name}.toml, {edit},
      list it in robot.toml ([[subsystems]] name = "{name}",
      path = "subsystems/{name}.toml") and regenerate the manifest:
        bazel run //tools:sync_manifest -- <robot.toml>"""
@@ -1140,9 +1688,11 @@ def main(argv):
         "a robot, or generate a standalone Bzlmod subsystem repository.")
     parser.add_argument("name", help="node name, e.g. wrist (talOS/NAMING.md)")
     parser.add_argument("--lang", choices=("cpp", "py"), required=True)
-    parser.add_argument("--type", dest="kind", choices=("velocity", "position"),
+    parser.add_argument("--type", dest="kind",
+                        choices=("velocity", "position", "estimator"),
                         default="velocity",
-                        help="control archetype (default: %(default)s)")
+                        help="archetype: a velocity or position mechanism, or "
+                        "a hardware-free pose estimator (default: %(default)s)")
     parser.add_argument("--robot", default="2026-robot",
                         help="robot directory (default: %(default)s)")
     parser.add_argument("--standalone", metavar="DIR",
@@ -1180,7 +1730,8 @@ def main(argv):
                 f.write(content)
             print(f"wrote {shown(root, path)}")
     if args.standalone:
-        print(standalone_next_steps(shown(root, target_dir), args.name))
+        print(standalone_next_steps(shown(root, target_dir), args.name,
+                                    args.kind))
     else:
         print(next_steps(args.robot, args.name, can_id))
     return 0

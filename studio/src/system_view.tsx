@@ -826,7 +826,7 @@ const METHOD_TEMPLATE: Record<string, string> = {
   scan_channel_events:
       '{\n  "topic": "velocity",\n  "condition": {"op": "gt", "value": 1}\n}',
   get_system_graph: '{}',
-  describe_topic: '{\n  "topic": "/odometry/state"\n}',
+  describe_topic: '{\n  "topic": "/pose_estimator/state"\n}',
   get_declared_graph: '{}'
 };
 
