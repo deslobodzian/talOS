@@ -3,10 +3,8 @@
 Status: partially implemented checkpoint, not acceptance-complete. See
 [HANDOFF_AUTOMATIC_WIRING.md](HANDOFF_AUTOMATIC_WIRING.md) for current evidence,
 remaining work, and completion order. The rules it serves are in
-[METHODOLOGY.md](METHODOLOGY.md). D2 has its first stage (build-level
-descriptors and the field-name lint). D6 is implemented except
-`--replay-inputs`, which waits for D2's descriptor-bearing logs. The rest of
-D2, and D3 and D4, remain proposals.
+[METHODOLOGY.md](METHODOLOGY.md). D2 is implemented. D6 is implemented except
+`--replay-inputs`. D3 and D4 remain proposals.
 
 ## Problem
 
@@ -255,7 +253,7 @@ own reflection:
 - **Attach checks a schema hash** (the hash of the struct's reflection
   object), not just size. A mismatch fails, naming both types.
 - **`.tlog` files carry descriptors** at session start, so `log_dump` can
-  decode payloads (an open TODO) and the `.tlog` → MCAP export can emit typed
+  decode payloads and the `.tlog` → MCAP export can emit typed
   channels.
 - **The Python codec** (`_messages.py`) reads layout from reflection instead of
   recording `Create<Struct>` calls. The recorder heuristic is deleted.

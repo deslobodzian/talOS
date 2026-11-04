@@ -205,11 +205,12 @@ Rules:
 - Look in `talOS/msgs` (`geometry`, `control`) before writing a new struct.
   Reuse beats a near-duplicate. **[review]**
 - Messages are FlatBuffers structs owned by one package, declared with
-  `talos_messages`. Never mirror a struct by hand; `GenericState` and
-  operator_interface's `GenericTarget` are slated for removal (D3, D4). Each
-  struct has a build-time schema descriptor (`talos::Descriptor<M>`,
-  `<Struct>.TALOS_SCHEMA_HASH`). Attaching to a topic checks schema name
-  and hash; a mismatch fails, naming both types. **[enforced]**
+  `talos_messages`. Never mirror a struct by hand (the earlier `GenericState`
+  and `GenericTarget` side doors have been deleted; D3 and D4 will replace
+  hard-coded subsystem lists with framework nodes). Each struct has a build-time
+  schema descriptor (`talos::Descriptor<M>`, `<Struct>.TALOS_SCHEMA_HASH`).
+  Attaching to a topic checks schema name and hash; a mismatch fails, naming
+  both types. **[enforced]**
 - A measurement message carries `sample_time_ns`: when the measurement was
   taken, in the node clock, not when it was published (`DrivetrainState`,
   `geometry.PoseObservation`, `geometry.PoseEstimate`). A node reading
@@ -338,7 +339,7 @@ touch the code, or under the design item named.
 
 | Where | Deviation | Rule | Fix |
 |---|---|---|---|
-| `operator_interface.h` extras, `telemetry/node.h:325-393` | subsystem names hard-coded | §7, §8 | D3, D4 |
+| `operator_interface.h`, `telemetry/node.h:325-393` | subsystem names hard-coded | §7, §8 | D3, D4 |
 | `telemetry/node.h` units | `"rev/s"` strings written by hand | §6 | derive from suffix (D3) |
 | `operator_interface.toml` | `deadband`, `heading_timeout_s` | §6, §8 | `deadband_frac`, `heading_timeout_us` |
 | `intake.py:18` | fixed `INTAKE_RPS` ignores the requested speed | §3 | use the target's demand |

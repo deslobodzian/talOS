@@ -12,5 +12,6 @@ FlatBuffers schema identity, unit linting, and reflection decoding.
 - **Hashing:** `struct_hash` (`schema_hash.h`, `talos_schema.struct_hash`)
   computes an FNV-1a 64 hash of canonical field definitions, types, offsets,
   and layout from reflection data.
-- **Decoding:** `//talOS/schema:decode` (`decode.h`) parses raw binary payloads
-  into named fields using reflection schema bytes without compile-time types.
+- **Decoding:** `//talOS/schema:decode` (`decode.h`, `DecodeToText`) parses
+  raw binary payloads into named fields using reflection schema bytes without
+  compile-time types.

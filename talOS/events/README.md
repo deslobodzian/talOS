@@ -184,15 +184,15 @@ Inspect a log with `bazel run //talOS/launcher:log_dump -- /tmp/run.tlog`.
 ## Log format
 
 `[FileHeader][ManifestEntry × n][schema block][Record ...]`, little-endian,
-append-only, with a CRC on the manifest block and on every record. The schema
-block carries each manifest entry's topic schema (`talOS/schema/identity.h`):
-its name and embedded `.bfbs` reflection schema bytes. A record is a 56-byte
-header plus its payload up to the last non-zero byte: fixed-size messages are
-mostly trailing zero padding, so the header keeps the payload's full size and
-the reader zero-fills it back, handing out exactly the bytes that were recorded.
-A log that ends mid-record is not corruption: everything before the cut still
-replays, which matters when a robot loses power. A record whose checksum is
-wrong *is* corruption and is refused.
+append-only, with a CRC on the manifest and schema blocks, and on every record.
+The schema block carries each manifest entry's topic schema
+(`talOS/schema/identity.h`): its name and embedded `.bfbs` reflection schema
+bytes. A record is a 56-byte header plus its payload up to the last non-zero
+byte: fixed-size messages are mostly trailing zero padding, so the header keeps
+the payload's full size and the reader zero-fills it back, handing out exactly
+the bytes that were recorded. A log that ends mid-record is not corruption:
+everything before the cut still replays, which matters when a robot loses
+power. A record whose checksum is wrong *is* corruption and is refused.
 
 Format details live in `log/format.h`. The version field is checked on read;
 readers reject a version they do not know rather than guessing.
