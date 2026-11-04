@@ -49,6 +49,16 @@ cc_library(
     hdrs = ["unit_suffix.h"],
 )
 
+cc_test(
+    name = "unit_suffix_test",
+    size = "small",
+    srcs = ["unit_suffix_test.cc"],
+    deps = [
+        ":unit_suffix",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # talos::schema::struct_hash over upstream flatbuffers/reflection.h types.
 cc_library(
     name = "schema_hash",
