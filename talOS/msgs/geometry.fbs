@@ -49,14 +49,15 @@ struct OdometrySample {
 // A field-frame robot pose measured by a camera (or any absolute source),
 // published by that source on its own /<camera>/state. sample_time_ns is when
 // the image was taken, in the node clock, not when the result was published;
-// std_* are one-sigma measurement uncertainties. A consumer ignores the
-// observation unless `valid`.
+// *_std_* are one-sigma measurement uncertainties (named axis first, so
+// Python's flattened names round-trip: x_std_m, not std_xm). A consumer
+// ignores the observation unless `valid`.
 struct PoseObservation {
   sample_time_ns:ulong;
   pose:Pose2d;
-  std_x_m:double;
-  std_y_m:double;
-  std_yaw_rad:double;
+  x_std_m:double;
+  y_std_m:double;
+  yaw_std_rad:double;
   tag_count:uint;
   valid:bool;
 }
