@@ -234,7 +234,7 @@ observation once (`updated`). Rules every estimator keeps:
   count it; hold the pose and publish `valid = false` while the inputs are
   stale.
 - Name the pose in consumers by config only:
-  `[subsystems.telemetry] pose_topic = "/localizer/state"`.
+  `[studio] pose_topic = "/localizer/state"`.
 
 `2026-robot/main_processor/pose_estimator` is the full example: swerve
 odometry plus cameras, with `backend = "kalman"` (wpimath

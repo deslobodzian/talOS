@@ -53,7 +53,7 @@ Beside the stack:
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |
 | `talOS/process` | stop handlers and `ConfigureRealtime` for node binaries |
 | `talOS/msgs` | shared geometry and control message structs (field and chassis angles in radians; `SwerveModulePosition`, `PoseObservation`, `PoseEstimate`) |
-| `talOS/telemetry` | the Studio telemetry frame schema and byte-topic wire format |
+| `talOS/telemetry` | `:node` framework node, telemetry frame schema, byte-topic wire format |
 | `talOS/schema` | `talos::Descriptor<M>` (`.bfbs` bytes, name, schema hash), `talos::schema::struct_hash`, the unit-suffix table; Python `talos_schema` and upstream `reflection` classes |
 | `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle`, `talos_graph_test` (both fed by a config's generated `robot_manifest.bzl`, `tools/sync_manifest.py`) |
 | `third_party/wpilib` | wpimath and wpiutil (C++) from WPILib's Maven release artifacts (`//third_party/wpilib:wpimath`); a bundle stages the shared libraries in `lib/`. Python nodes use the same release through `robotpy-wpimath` in `//talOS/python:requirements.txt` (with `gtsam` for factor graphs) |

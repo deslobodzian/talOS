@@ -1,11 +1,11 @@
 # talOS telemetry wire format (v2)
 
-The Studio telemetry feed: one producer (`//2026-robot/main_processor/telemetry`)
-publishes size-prefixed FlatBuffer `Frame`s on the `/talos/telemetry` byte
-topic; the Studio bridge (`//studio/bridge`) forwards them to browsers and
-agents. This package owns the contract both ends share: `telemetry.fbs` (the
-frame schema) and `wire.h` (slot geometry and header validation). Neither end
-depends on the other.
+The Studio telemetry feed: one framework node (`//talOS/telemetry:node`)
+observes state and status topics in the declared graph and publishes
+size-prefixed FlatBuffer `Frame`s on the `/talos/telemetry` byte topic
+(configured via `[studio] topic`); the Studio bridge (`//studio/bridge`)
+forwards them to browsers and agents. This package owns the framework node,
+`telemetry.fbs` (the frame schema), and `wire.h` (slot geometry and header validation).
 
 ## Frame format
 
@@ -39,10 +39,10 @@ carries the `intake::Inhibit` names). Out-of-range values have no label.
 
 ## Dictionary protocol
 
-The producer builds its dictionary **once at construction** — the fixed
-channel set plus one `<name>/value|connected|stale` triple per subsystem whose
-TOML sets `telemetry = true` — and never changes it afterwards. It sends the
-dictionary:
+The framework node builds its dictionary **once at construction** from the
+graph descriptors (all SENDER topics with role `state` or `status` matching
+include/exclude globs, plus Driver Station and `pose/valid`), and never
+changes it afterwards. It sends the dictionary:
 
 - on the **first** frame of the stream,
 - on **every 100th** frame after it (sequence 100, 200, ...),
@@ -78,16 +78,22 @@ If the channel count grows enough to threaten the 1200-byte cap, the
 construction-time check fails loudly at startup instead of the feed silently
 blowing the radio budget on the field.
 
-## Adding a channel
+## Automatic channels and units
 
-1. Add the channel to the producer's fixed channel table in
-   `2026-robot/main_processor/telemetry/node.h` (name, unit, enum labels if
-   any), in the position it should occupy in the dictionary — dictionary
-   order is wire order, so append rather than insert where possible.
-2. Fill its slot in the `values_` vector each tick, leaving `NaN` when the
-   source is absent or stale.
-3. The dictionary, its FNV-1a `dictionary_id`, the construction-time size
-   check and the bridge's JSON views all derive from the table; no other
-   file changes. Re-run `bazel test //talOS/telemetry/... //studio/bridge/...
-   //2026-robot/main_processor/telemetry/...` to confirm the worst-case frame
-   still fits the budget.
+Channels are discovered automatically from the graph descriptors:
+
+1. **Naming**: Channel names follow wire conventions `<owner>/<role>/<field>`
+   (for example `drivetrain/state/vx_mps`, `pose/valid`).
+2. **Units from suffix**: Numeric units are derived directly from field name
+   suffixes (via `talOS/schema/unit_suffix.h`), such as `_mps` (`m/s`),
+   `_rad` (`rad`), `_s` (`s`). Fields without recognized unit suffixes have empty units.
+3. **Enum labels**: Enum fields extract string labels automatically from FlatBuffers
+   schema reflection (`reflection::Schema`).
+4. **Include/exclude globs**: In `telemetry.toml`, `include` and `exclude` lists
+   of glob patterns can filter which topics are captured. Exclude patterns take
+   precedence over include patterns.
+5. **Pose extraction**: When `[studio] pose_topic` is set, telemetry extracts
+   `x_m`, `y_m`, and `yaw_rad` from the `geometry.Pose2d` struct inside that topic via
+   reflection and sets `chassis`. When stale, `pose/valid` is 0 and chassis is 0.
+6. **Budget enforcement**: The 1200-byte worst-case frame budget is verified at
+   construction. If exceeded, construction throws naming the largest topics.

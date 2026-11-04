@@ -942,9 +942,7 @@ inline bool ShouldRetryStudioBridge(
 inline std::string StudioBridgeWatchTopic(
     const std::vector<NodeDescription>& described,
     const config::RobotConfig& robot_config) {
-  std::string topic = robot_config.studio.topic.empty()
-                          ? std::string{"/talos/telemetry"}
-                          : robot_config.studio.topic;
+  std::string topic = robot_config.studio.topic;
   for (const auto& node : described) {
     if (!node.answered || node.declared.name != kStudioBridgeName) continue;
     for (const auto& source : node.declared.sources) {

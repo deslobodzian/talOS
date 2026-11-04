@@ -18,7 +18,7 @@ enum Inhibit : ubyte {
   DEMAND_NONFINITE,
 }
 
-// Studio view fields (2026-robot/main_processor/telemetry/node.h forwards
+// Studio view fields (talOS/telemetry/node.h forwards
 // them as mechanism channels, mirroring ShooterState.target_velocity_rps):
 // requested_velocity_rps echoes the demand the policy acted on this tick
 // (0 when no target lane is selected), roller_velocity_rps is the measured

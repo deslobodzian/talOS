@@ -66,9 +66,8 @@ def _check_studio(studio, where):
     for key in studio:
         if key not in _STUDIO_KEYS:
             raise ManifestError(f"{where}: [studio] unknown key '{key}'")
-    if "topic" not in studio:
-        raise ManifestError(f"{where}: [studio] missing required key 'topic'")
-    _non_empty(studio, "topic", "[studio]")
+    if "topic" in studio:
+        _non_empty(studio, "topic", "[studio]")
     if "bridge" in studio:
         _non_empty(studio, "bridge", "[studio]")
     if "webroot" in studio:

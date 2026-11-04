@@ -115,6 +115,7 @@ struct TopicRow {
   std::uint32_t message_bytes{0};
   std::vector<std::string> publishers;
   std::vector<std::string> subscribers;
+  std::vector<std::string> observers;
   std::uint64_t published{0};
   std::uint64_t received{0};
   std::uint64_t dropped{0};
@@ -202,6 +203,9 @@ inline std::vector<TopicRow> TopicsOf(
       if (source.kind == event::SourceKind::SENDER) {
         row.publishers.push_back(node.name);
         row.published += source.events;
+      } else if (source.observer()) {
+        row.observers.push_back(node.name);
+        row.received += source.events;
       } else {
         row.subscribers.push_back(node.name);
         row.received += source.events;
@@ -233,6 +237,8 @@ inline void AppendSource(std::string& out,
   out += source.external() ? "true" : "false";
   out += ",\"optional\":";
   out += source.optional() ? "true" : "false";
+  out += ",\"observer\":";
+  out += source.observer() ? "true" : "false";
   out += ",\"period_ns\":";
   AppendI64(out, source.period_ns);
   out += ",\"events\":";
@@ -327,6 +333,8 @@ inline void AppendTopic(std::string& out, const TopicRow& row) {
   AppendNames(out, row.publishers);
   out += ",\"subscribers\":";
   AppendNames(out, row.subscribers);
+  out += ",\"observers\":";
+  AppendNames(out, row.observers);
   out += ",\"published\":";
   AppendU64(out, row.published);
   out += ",\"received\":";

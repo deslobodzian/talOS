@@ -87,7 +87,7 @@ struct RobotConfig {
     uint16_t http_port{5800};
     // Relative to the launcher's working directory.
     std::string webroot{"bazel-bin/studio/dist"};
-    std::string topic;
+    std::string topic{"/talos/telemetry"};
     std::string pose_topic;
   };
   StudioConfig studio;
@@ -429,10 +429,9 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     s.webroot = detail::ReadNonEmpty(*studio, "webroot", s.webroot, "[studio]");
     s.http_port =
         detail::ReadPort(*studio, "http_port", s.http_port, "[studio]");
-    if (!studio->contains("topic")) {
-      throw std::invalid_argument("[studio] missing required key 'topic'");
+    if (studio->contains("topic")) {
+      s.topic = detail::ReadNonEmpty(*studio, "topic", "", "[studio]");
     }
-    s.topic = detail::ReadNonEmpty(*studio, "topic", "", "[studio]");
     if (studio->contains("pose_topic")) {
       s.pose_topic =
           detail::ReadNonEmpty(*studio, "pose_topic", "", "[studio]");

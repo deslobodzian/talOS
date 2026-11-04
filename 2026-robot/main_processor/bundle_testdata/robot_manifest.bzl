@@ -12,7 +12,7 @@ NODES = [
     "//2026-robot/main_processor/operator_interface:node",
     "//2026-robot/main_processor/pose_estimator:node",
     "//2026-robot/main_processor/shooter:node",
-    "//2026-robot/main_processor/telemetry:node",
+    "//talOS/telemetry:node",
 ]
 
 # Every file robot.toml reads besides itself.

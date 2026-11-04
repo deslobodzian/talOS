@@ -113,6 +113,7 @@ test('a well-formed graph parses with both ends of every topic intact', () => {
     message_bytes: 64,
     publishers: ['odometry'],
     subscribers: ['telemetry'],
+    observers: [],
     published: '10',
     received: '9',
     dropped: '0'
@@ -216,6 +217,7 @@ const healthRow = (over: Partial<SystemTopic> = {}): SystemTopic => ({
   message_bytes: 64,
   publishers: ['odometry'],
   subscribers: ['telemetry'],
+  observers: [],
   published: '10',
   received: '9',
   dropped: '0',
@@ -382,8 +384,8 @@ test('the demo graph is a document the parser actually accepts', () => {
   // named end is a node in the same document.
   const known = new Set(graph.nodes.map(n => n.name));
   for (const t of graph.topics) {
-    assert.ok(t.publishers.length + t.subscribers.length > 0, t.name);
-    for (const end of [...t.publishers, ...t.subscribers])
+    assert.ok(t.publishers.length + t.subscribers.length + t.observers.length > 0, t.name);
+    for (const end of [...t.publishers, ...t.subscribers, ...t.observers])
       assert.ok(known.has(end), `${t.name} names unknown node ${end}`);
   }
 
@@ -593,6 +595,7 @@ test('a declared graph parses into nodes, ends and the launcher\'s lint', () => 
     message_bytes: 64,
     external: true,
     optional: false,
+    observer: false,
     schema: 'odometry.OdometryState',
     schema_hash: '0x0123456789abcdef'
   });

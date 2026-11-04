@@ -292,8 +292,10 @@ subsystem names.
 **Removed:** `GenericState`, the `telemetry`/`telemetry_unit` keys, and the
 robot's telemetry package.
 
-**Acceptance:** a scaffolded subsystem appears in Studio with correct units and
-no edits outside its own package.
+**Acceptance: passed.**
+- A scaffolded subsystem appears in Studio with correct units and no edits outside its own package.
+- Unit tests cover pose_topic missing error, invalid schema buffer error, enum label extraction, include/exclude glob precedence, and stale NaN with pose/valid 0.
+- All configs migrated to `//talOS/telemetry:node` and `[studio] topic` / `pose_topic`.
 
 ---
 
