@@ -176,8 +176,8 @@ code the table is `talOS/schema/unit_suffix.h`.
 Rules:
 
 - **One quantity, one field.** A struct never carries the same quantity twice
-  in two units (today `DrivetrainState` has both `omega_radps` and
-  `yaw_rate_rps`). **[review; lint planned: D2]**
+  in two units (`DrivetrainState` carries the chassis rate once, as
+  `omega_radps`). **[review; lint planned: D2]**
 - **Conversions happen at a named boundary, once.** The device layer speaks
   shaft units (`_rot`). A node that turns a shaft angle into a field-frame
   angle (a gyro yaw into a heading) converts there and publishes `_rad`. In
@@ -207,7 +207,14 @@ Rules:
   `<Struct>.TALOS_SCHEMA_HASH`). **[review; D2 replaces size-only attach
   checks with that schema hash]**
 - A measurement message carries `sample_time_ns`: when the measurement was
-  taken, not when it was published. **[planned: D6]**
+  taken, in the node clock, not when it was published (`DrivetrainState`,
+  `geometry.PoseObservation`, `geometry.PoseEstimate`). A node reading
+  hardware stamps it with `HardwareLink::sample_time()`
+  (`talos.hardware_sample_time_ns(node)` in Python), the gateway's sample
+  time mapped through the bridge's clock offset; that is an upper-bounded
+  latency estimate, never earlier than the true sample, and unknown until
+  the mapping converges. A measurement without a known time is published
+  with its validity flags false. **[review]**
 - A message carries validity next to the value it qualifies (`yaw_valid` next
   to `yaw_rad`), not one flag for the whole struct. **[review]**
 - Enums for states and reasons (`Inhibit`), with the zero value meaning
@@ -221,6 +228,10 @@ Rules:
   **[review]**
 - Validate at construction: finite, in range, consistent. Throw with the key
   name. **[review]**
+- Lists are TOML arrays: `node.param<std::vector<std::string>>("cameras")` /
+  `std::vector<double>` in C++, `node.param("cameras")` (a `list`) in Python.
+  An element of the wrong type fails at construction naming the key and the
+  element. **[enforced]** by the param API.
 - Parameter keys follow §6 (`tolerance_rot`, `deadband_frac`,
   `heading_timeout_us`). **[review; warning planned: D2]**
 - Robot-wide wiring (which producers drive which subsystem, telemetry,
@@ -233,6 +244,10 @@ Rules:
 
 - Use `node.now()` only. Never `steady_clock`, `time.time()` or sleeps. This is
   what makes `Sim` and replay match the robot. **[review]**
+- Estimators integrate on measurement sample times (`sample_time_ns`), never
+  on arrival or publish time, and call wpimath's time-taking entry points
+  (`UpdateWithTime`/`updateWithTime`), never `Update()`/`update()`, which read
+  WPILib's own clock. **[review]**
 - No randomness in decisions. Telemetry stream ids are the one exception. **[review]**
 - **Restart safety.** A node can be restarted mid-match (`max_restarts`). Its
   initial state must be safe with every input present, so a state machine
@@ -318,14 +333,12 @@ touch the code, or under the design item named.
 
 | Where | Deviation | Rule | Fix |
 |---|---|---|---|
-| `drivetrain/drive_message.fbs` `DrivetrainState` | `yaw_rot` heading (field frame) and `yaw_rate_rps` duplicating `omega_radps`; `timestamp_ns` is publish time | §6, §7 | `yaw_rad` + `yaw_valid`, drop `yaw_rate_rps`, `sample_time_ns` (D6) |
-| `talOS/msgs/geometry.fbs`, `odometry_message.fbs` | headings in `_rot` | §6 | `_rad` |
-| `drivetrain/drivetrain.h:40` | stops publishing `state` when a motor disconnects; yaw reads 0 with the gyro disconnected | §4 | publish every tick with validity flags |
 | `operator_interface.h` extras, `telemetry/node.h:325-393` | subsystem names hard-coded; `GenericTarget`/`GenericState` hand mirrors; `teleop_button`/`telemetry` keys | §7, §8 | D3, D4 |
 | `telemetry/node.h` units | `"rev/s"` strings written by hand | §6 | derive from suffix (D3) |
 | `operator_interface.toml` | `deadband`, `heading_timeout_s` | §6, §8 | `deadband_frac`, `heading_timeout_us` |
 | `intake.py:18` | fixed `INTAKE_RPS` ignores the requested speed | §3 | use the target's demand |
-| `drivetrain/swerve.h`, `drivetrain/geometry.h`, `odometry/odometry.h` | hand-written swerve kinematics and pose integration | §14 | wpimath `SwerveDriveKinematics` / `SwerveDrivePoseEstimator` once D6 adds the dependency |
+| `drivetrain/swerve.h` `SwerveKinematics::ToModuleStates` | wheel speeds are desaturated by hand, not with wpimath's `DesaturateWheelSpeeds` (the kinematics, `Optimize` and forward kinematics are wpimath's `SwerveDriveKinematics<4>`) | §14 | `DesaturateWheelSpeeds` takes one attainable speed for every module, while `[geometry]` gives each module its own `wheel_radius_m` and drive `max_velocity_rps`; keep until wpimath takes per-module limits |
+| `drivetrain/node_test.cc` `UpdateDoesNotAllocate` | the process-wide allocation check (`malloc_logger`, so libwpimath counts) runs on macOS only; on Linux it is skipped | §10 | a glibc-compatible allocation hook (glibc removed `__malloc_hook` in 2.34) |
 
 ## 14. Open source first
 
