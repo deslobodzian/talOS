@@ -1,21 +1,26 @@
 namespace geometry;
 
+// Field and chassis frame: x forward (downfield), y left, angles CCW+ in
+// radians, matching wpimath's Rotation2d. Shaft and joint angles stay in
+// rotations (`_rot`) in their own messages; a node converts at the boundary
+// where a shaft angle becomes a frame angle (METHODOLOGY.md §6).
+
 // Planar translation in meters (field or robot frame).
 struct Translation2d {
   x_m:double;
   y_m:double;
 }
 
-// Planar heading in rotations (CCW+, matching CANcoder and Pigeon2).
+// Planar heading in radians, CCW+.
 struct Rotation2d {
-  yaw_rot:double;
+  yaw_rad:double;
 }
 
-// Planar pose in meters and rotations (CCW+).
+// Planar pose in meters and radians, CCW+.
 struct Pose2d {
   x_m:double;
   y_m:double;
-  yaw_rot:double;
+  yaw_rad:double;
 }
 
 // Planar linear and angular velocity in m/s and rad/s (CCW+).
@@ -25,9 +30,47 @@ struct Twist2d {
   omega_radps:double;
 }
 
+// One swerve module's accumulated wheel travel and azimuth (wpimath
+// SwerveModulePosition): distance in meters along the wheel, azimuth in
+// radians from robot forward, CCW+.
+struct SwerveModulePosition {
+  distance_m:double;
+  angle_rad:double;
+}
+
 // Stamped pose and velocity for odometry and localization feeds.
+// sample_time_ns: node-clock time the pose describes.
 struct OdometrySample {
-  timestamp_ns:uint64;
+  sample_time_ns:ulong;
   pose:Pose2d;
   velocity:Twist2d;
+}
+
+// A field-frame robot pose measured by a camera (or any absolute source),
+// published by that source on its own /<camera>/state. sample_time_ns is when
+// the image was taken, in the node clock, not when the result was published;
+// std_* are one-sigma measurement uncertainties. A consumer ignores the
+// observation unless `valid`.
+struct PoseObservation {
+  sample_time_ns:ulong;
+  pose:Pose2d;
+  std_x_m:double;
+  std_y_m:double;
+  std_yaw_rad:double;
+  tag_count:uint;
+  valid:bool;
+}
+
+// A pose estimator's output: the field pose at sample_time_ns (the latest
+// odometry sample folded in), the chassis velocity, and how many absolute
+// observations it has accepted and rejected since it started. `valid` is
+// false until odometry has been integrated and whenever the odometry input
+// is stale or invalid.
+struct PoseEstimate {
+  sample_time_ns:ulong;
+  pose:Pose2d;
+  velocity:Twist2d;
+  valid:bool;
+  observation_accepted_count:uint;
+  observation_rejected_count:uint;
 }
