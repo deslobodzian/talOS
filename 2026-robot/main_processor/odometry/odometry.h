@@ -25,25 +25,27 @@ class Odometry {
 
  private:
   void Integrate(const drivetrain::DrivetrainState& state) {
-    // The drivetrain's own clock, so a delayed delivery does not stretch the
-    // step it covers.
+    // Chassis speeds are 0 and meaningless while the modules are invalid.
+    if (!state.modules_valid()) return;
+    // The hardware sample's clock, so a delayed delivery does not stretch
+    // the step it covers.
     const double dt_s =
-        have_last_ && state.timestamp_ns() >= last_ns_
-            ? static_cast<double>(state.timestamp_ns() - last_ns_) * 1e-9
+        have_last_ && state.sample_time_ns() >= last_ns_
+            ? static_cast<double>(state.sample_time_ns() - last_ns_) * 1e-9
             : 0.0;
     have_last_ = true;
-    last_ns_ = state.timestamp_ns();
+    last_ns_ = state.sample_time_ns();
 
-    const double theta = state.yaw_rot() * 2.0 * std::numbers::pi;
+    const double theta = state.yaw_rad();
     x_m_ +=
         (state.vx_mps() * std::cos(theta) - state.vy_mps() * std::sin(theta)) *
         dt_s;
     y_m_ +=
         (state.vx_mps() * std::sin(theta) + state.vy_mps() * std::cos(theta)) *
         dt_s;
-    pose_.send(OdometryState{state.timestamp_ns(), x_m_, y_m_, state.yaw_rot(),
-                             state.vx_mps(), state.vy_mps(),
-                             state.omega_radps()});
+    pose_.send(OdometryState{state.sample_time_ns(), x_m_, y_m_,
+                             theta / (2.0 * std::numbers::pi), state.vx_mps(),
+                             state.vy_mps(), state.omega_radps()});
   }
 
   double x_m_ = 0;

@@ -106,7 +106,8 @@ class TelemetryTest : public ::testing::Test {
 TEST_F(TelemetryTest, PublishesChassisPoseAndChannelsFromOdometry) {
   sim.publish(odometry::topics::kState, Odometry(3.25, 1.5, 0.25));
   sim.publish(drivetrain::topics::kState,
-              drivetrain::DrivetrainState{0, true, 1.5, -0.5, 0.25, 0.25, 0.1});
+              drivetrain::DrivetrainState{
+                  0, true, true, false, 1.5, -0.5, 0.25, 0.75, {}, {}, {}, {}});
   sim.step(50ms);
 
   const Frame* frame = Latest();
@@ -123,12 +124,17 @@ TEST_F(TelemetryTest, PublishesChassisPoseAndChannelsFromOdometry) {
   EXPECT_NEAR(channels.at("odometry/omega"), 0.25, 1e-12);
   EXPECT_EQ(channels.count("shooter/flywheel"), 0u);
   EXPECT_NEAR(channels.at("drivetrain/vx"), 1.5, 1e-12);
+  EXPECT_NEAR(channels.at("drivetrain/yaw"), 0.75, 1e-12);
   EXPECT_NEAR(channels.at("drivetrain/enabled"), 1.0, 1e-12);
+  EXPECT_NEAR(channels.at("drivetrain/modules_valid"), 1.0, 1e-12);
+  EXPECT_NEAR(channels.at("drivetrain/yaw_valid"), 0.0, 1e-12);
+  EXPECT_EQ(channels.count("drivetrain/yaw_rate"), 0u);
 }
 
 TEST_F(TelemetryTest, PublishesNothingUntilAPoseExists) {
   sim.publish(drivetrain::topics::kState,
-              drivetrain::DrivetrainState{0, true, 1, 0, 0, 0, 0});
+              drivetrain::DrivetrainState{
+                  0, true, true, true, 1, 0, 0, 0, {}, {}, {}, {}});
   sim.step(50ms);
   EXPECT_EQ(Latest(), nullptr);
 }
