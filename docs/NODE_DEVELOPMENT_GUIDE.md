@@ -13,7 +13,7 @@ the constructor; `update()` runs every period.
 |---|---|---|
 | `node.subscribe<M>(topic, {.optional = true})` | `node.subscribe(M, topic, optional=True)` | latest value; optional callback argument |
 | `node.publish<M>(topic)` | `node.publish(M, topic)` | |
-| `node.param<T>("key")`, `param<T>("key", fallback)` | `node.param("key")`, `param("key", fallback)` | this subsystem's TOML keys; dotted keys reach nested tables |
+| `node.param<T>("key")`, `param<T>("key", fallback)` | `node.param("key")`, `param("key", fallback)` | this subsystem's TOML keys; dotted keys reach nested tables. `T`: `bool`, integers, `double`, `std::string`, and TOML arrays as `std::vector<std::string>` / `std::vector<double>` (integer elements convert; `[]` is valid). Python returns arrays as `list[str]` / `list[float]`; a list default asks for an array. A wrong element type is an error naming the key and element index |
 | `node.every(period, fn)` | `node.every(seconds, fn)` | extra timer |
 | `name()`, `now()`, `tick()`, `period()`, `simulation()`, `config_path()` | same, as properties (seconds) | |
 | `sub.value()`, `sub->field()`, `has_value()` | `sub.value` (`None` before the first), `has_value` | |

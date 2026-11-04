@@ -7,7 +7,7 @@ raise, with the C++ message, or with the Python exception a callback raised.
 import ctypes
 import os
 
-ABI_VERSION = 13
+ABI_VERSION = 14
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -19,7 +19,8 @@ CALLBACK = ctypes.CFUNCTYPE(c_int32, c_void_p)
 MESSAGE_CALLBACK = ctypes.CFUNCTYPE(c_int32, c_void_p, c_uint32, c_void_p)
 FACTORY = ctypes.CFUNCTYPE(c_int32, c_void_p, c_void_p)
 
-PARAM_ANY, PARAM_BOOL, PARAM_INT, PARAM_DOUBLE, PARAM_STRING = range(5)
+(PARAM_ANY, PARAM_BOOL, PARAM_INT, PARAM_DOUBLE, PARAM_STRING,
+ PARAM_STRING_LIST, PARAM_DOUBLE_LIST, PARAM_LIST) = range(8)
 (DEVICE_MOTOR, DEVICE_CANCODER, DEVICE_GYRO, DEVICE_DIGITAL_INPUT,
  DEVICE_DIGITAL_OUTPUT, DEVICE_ANALOG_INPUT, DEVICE_ENCODER,
  DEVICE_PWM) = range(8)
@@ -34,7 +35,9 @@ class TalosError(RuntimeError):
 
 class Param(ctypes.Structure):
     _fields_ = [("kind", c_int32), ("boolean", c_int32), ("integer", c_int64),
-                ("number", c_double), ("string", c_char_p)]
+                ("number", c_double), ("string", c_char_p),
+                ("count", c_uint64), ("numbers", ctypes.POINTER(c_double)),
+                ("strings", ctypes.POINTER(c_char_p))]
 
 
 class Sample(ctypes.Structure):
