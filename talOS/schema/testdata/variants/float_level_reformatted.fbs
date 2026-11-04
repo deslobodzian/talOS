@@ -1,0 +1,16 @@
+// float_level.fbs reformatted and commented: the same schema.
+namespace   schema_variant;
+
+/// How a reading was produced.
+enum Kind:ubyte{RAW,FILTERED}
+
+/// A level reading.
+struct Reading
+{
+    level_m : float;   // metres
+    kind : Kind;
+
+    ok : bool;
+}
+
+struct Holder { reading : Reading; }

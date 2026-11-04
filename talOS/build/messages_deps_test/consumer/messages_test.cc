@@ -14,13 +14,13 @@ namespace {
 
 TEST(MessagesDepsTest, EmbeddedStructRoundTrip) {
   const deps_geometry::Pose2d pose{1.0, 2.0, 0.5};
-  EXPECT_DOUBLE_EQ(pose.x(), 1.0);
-  EXPECT_DOUBLE_EQ(pose.y(), 2.0);
+  EXPECT_DOUBLE_EQ(pose.x_m(), 1.0);
+  EXPECT_DOUBLE_EQ(pose.y_m(), 2.0);
   EXPECT_DOUBLE_EQ(pose.heading_rad(), 0.5);
 
   const ConsumerState state{pose, 10.0, true};
-  EXPECT_DOUBLE_EQ(state.pose().x(), 1.0);
-  EXPECT_DOUBLE_EQ(state.pose().y(), 2.0);
+  EXPECT_DOUBLE_EQ(state.pose().x_m(), 1.0);
+  EXPECT_DOUBLE_EQ(state.pose().y_m(), 2.0);
   EXPECT_DOUBLE_EQ(state.pose().heading_rad(), 0.5);
   EXPECT_DOUBLE_EQ(state.velocity_rps(), 10.0);
   EXPECT_TRUE(state.enabled());

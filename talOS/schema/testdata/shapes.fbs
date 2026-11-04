@@ -1,0 +1,29 @@
+// Fixtures for //talOS/schema:schema_hash_test and schema_hash_py_test.
+namespace schema_test;
+
+enum Mode : ubyte { OFF, LOW = 3, HIGH }
+
+enum Level : short { BOTTOM = -1, NONE, TOP = 300 }
+
+struct Inner {
+  mode:Mode;
+  offset_m:float;
+}
+
+// Mixed alignment: 1-, 8-, 2-, 4-byte fields, a nested struct and padding.
+struct Mixed {
+  flag:bool;
+  position_m:double;
+  level:Level;
+  sample_count:uint;
+  inner:Inner;
+  speed_frac:float;
+}
+
+// Fixed-length arrays of scalars, enums and structs.
+struct Arrays {
+  samples_m:[double:3];
+  modes:[Mode:2];
+  inners:[Inner:2];
+  channel_id:[ubyte:5];
+}

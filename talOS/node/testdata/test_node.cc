@@ -24,7 +24,7 @@ class Counter {
   }
 
   void update() {
-    const std::int64_t extra = input_.has_value() ? input_->value() : 0;
+    const std::int64_t extra = input_.has_value() ? input_->tick_count() : 0;
     const node_test::Count count{
         static_cast<std::int64_t>(node_.tick()) * step_ + beats_ + extra,
         node_.now().nanos()};

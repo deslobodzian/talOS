@@ -45,33 +45,150 @@ _talos_schemas = rule(
     },
 )
 
+_TalosBfbsInfo = provider(
+    doc = "The binary schemas (.bfbs) of a talos_messages target.",
+    fields = {
+        "schemas": "list of struct(bfbs = File, file = declaration file " +
+                   "'//<include_prefix>/<name>.fbs', stem = '<name>')",
+    },
+)
+
+_DESCRIPTOR_GEN = Label("//talOS/build:descriptor_gen")
+
+def _talos_bfbs_impl(ctx):
+    # One reflection.Schema per schema, compiled from the include tree so
+    # flatc records each type's declaration file as //<prefix>/<name>.fbs and
+    # the generators can tell this package's structs from included ones. The
+    # field-name lint runs in the same action: no .bfbs, so no C++ header
+    # or Python module, while a numeric field lacks a unit suffix. flatc
+    # records paths relative to the realpath of --bfbs-filenames, and the
+    # sandbox symlinks each input file elsewhere, so it compiles a real copy.
+    tree = ctx.attr.schemas[_TalosMessagesInfo].tree
+    schemas = []
+    for src in ctx.files.srcs:
+        stem = src.basename.removesuffix(".fbs")
+        out = ctx.actions.declare_file("%s/%s.bfbs" % (ctx.label.name, stem))
+        file = "//%s/%s" % (ctx.attr.include_prefix, src.basename)
+        ctx.actions.run_shell(
+            inputs = [tree],
+            tools = [ctx.executable._flatc, ctx.executable._gen],
+            outputs = [out],
+            command = (
+                'tmp="$(mktemp -d)" && trap \'rm -rf "$tmp"\' EXIT && ' +
+                'cp -RL "$2/." "$tmp" && ' +
+                '"$1" --binary --schema --bfbs-filenames "$tmp" -I "$tmp" ' +
+                '-o "$(dirname "$4")" "$tmp/$3" && "$5" lint "$4" "//$3"'
+            ),
+            arguments = [
+                ctx.executable._flatc.path,
+                tree.path,
+                file.removeprefix("//"),
+                out.path,
+                ctx.executable._gen.path,
+            ],
+            mnemonic = "TalosBfbs",
+            progress_message = "Compiling and linting schema %s of %%{label}" % src.basename,
+        )
+        schemas.append(struct(bfbs = out, file = file, stem = stem))
+    return [
+        DefaultInfo(files = depset([s.bfbs for s in schemas])),
+        _TalosBfbsInfo(schemas = schemas),
+    ]
+
+_talos_bfbs = rule(
+    implementation = _talos_bfbs_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = [".fbs"], mandatory = True),
+        "schemas": attr.label(mandatory = True, providers = [_TalosMessagesInfo]),
+        "include_prefix": attr.string(mandatory = True),
+        "_flatc": attr.label(
+            default = Label("@flatbuffers//:flatc"),
+            executable = True,
+            cfg = "exec",
+        ),
+        "_gen": attr.label(default = _DESCRIPTOR_GEN, executable = True, cfg = "exec"),
+    },
+)
+
+def _talos_cc_descriptors_impl(ctx):
+    # <stem>_descriptor.h beside flatc's <stem>_generated.h, so both include
+    # as "<prefix>/<stem>_...h" through the talos_messages cc_library.
+    headers = []
+    for schema in ctx.attr.bfbs[_TalosBfbsInfo].schemas:
+        out = ctx.actions.declare_file(schema.stem + "_descriptor.h")
+        ctx.actions.run(
+            executable = ctx.executable._gen,
+            inputs = [schema.bfbs],
+            outputs = [out],
+            arguments = [
+                "cc",
+                schema.bfbs.path,
+                schema.file,
+                out.path,
+                "%s/%s_generated.h" % (ctx.attr.include_prefix, schema.stem),
+                ctx.attr.messages_label,
+            ],
+            mnemonic = "TalosDescriptorCc",
+            progress_message = "Generating C++ descriptors of %s" % schema.file,
+        )
+        headers.append(out)
+    return [DefaultInfo(files = depset(headers))]
+
+_talos_cc_descriptors = rule(
+    implementation = _talos_cc_descriptors_impl,
+    attrs = {
+        "bfbs": attr.label(mandatory = True, providers = [_TalosBfbsInfo]),
+        "include_prefix": attr.string(mandatory = True),
+        "messages_label": attr.string(mandatory = True),
+        "_gen": attr.label(default = _DESCRIPTOR_GEN, executable = True, cfg = "exec"),
+    },
+)
+
 def _flatc_py_tree_impl(ctx):
     # One directory output, so the generated modules (one per struct, plus a
     # package __init__.py per namespace) need not be listed: what flatc emits
-    # is decided by the schema, which a macro cannot read.
+    # is decided by the schema, which a macro cannot read. descriptor_gen
+    # then appends each struct's TALOS_SCHEMA_* attributes to its module.
     out = ctx.actions.declare_directory(ctx.label.name)
     schemas = ctx.attr.schemas[_TalosMessagesInfo].tree
-    inputs = ctx.files.srcs + [schemas]
-    command = '"$1" -p --python-typing -I "$3" -o "$2" "${@:4}"'
-    arguments = [ctx.executable._flatc.path, out.path, schemas.path]
+    bfbs = ctx.attr.bfbs[_TalosBfbsInfo].schemas
+    inputs = ctx.files.srcs + [schemas] + [s.bfbs for s in bfbs]
+    command = (
+        'flatc="$1" out="$2" tree="$3" gen="$4" ns="$5" topics="$6" n="$7"; ' +
+        'shift 7; "$flatc" -p --python-typing -I "$tree" -o "$out" ' +
+        '"${@:1:$n}" || exit 1; shift "$n"; ' +
+        'while [ "$#" -gt 0 ]; do "$gen" py "$1" "$2" "$out" || exit 1; ' +
+        "shift 2; done"
+    )
+    topics = ""
     if ctx.file.topics:
         # topics.py joins the namespace's package, so it imports beside the
         # structs: `from <namespace> import topics`.
         inputs.append(ctx.file.topics)
-        command = (
-            '"$1" -p --python-typing -I "$3" -o "$2" "${@:6}" && ' +
-            'if [ ! -f "$2/$4/__init__.py" ]; then ' +
+        topics = ctx.file.topics.path
+        command += (
+            '; if [ ! -f "$out/$ns/__init__.py" ]; then ' +
             'echo "talos_messages: topics need the schema namespace to be ' +
-            'the include prefix, $4" >&2; exit 1; fi && ' +
-            'cp "$5" "$2/$4/topics.py"'
+            'the include prefix, $ns" >&2; exit 1; fi && ' +
+            'cp "$topics" "$out/$ns/topics.py"'
         )
-        arguments += [ctx.attr.namespace, ctx.file.topics.path]
+    arguments = [
+        ctx.executable._flatc.path,
+        out.path,
+        schemas.path,
+        ctx.executable._gen.path,
+        ctx.attr.namespace,
+        topics,
+        str(len(ctx.files.srcs)),
+    ] + [f.path for f in ctx.files.srcs]
+    for s in bfbs:
+        arguments += [s.bfbs.path, s.file]
     ctx.actions.run_shell(
         inputs = inputs,
-        tools = [ctx.executable._flatc],
+        tools = [ctx.executable._flatc, ctx.executable._gen],
         outputs = [out],
         command = command,
-        arguments = arguments + [f.path for f in ctx.files.srcs],
+        arguments = arguments,
         mnemonic = "FlatcPython",
         progress_message = "Generating Python flatbuffers for %{label}",
     )
@@ -91,6 +208,7 @@ _flatc_py_tree = rule(
     attrs = {
         "srcs": attr.label_list(allow_files = [".fbs"], mandatory = True),
         "schemas": attr.label(mandatory = True, providers = [_TalosMessagesInfo]),
+        "bfbs": attr.label(mandatory = True, providers = [_TalosBfbsInfo]),
         "topics": attr.label(allow_single_file = [".py"]),
         "namespace": attr.string(),
         "_flatc": attr.label(
@@ -98,6 +216,7 @@ _flatc_py_tree = rule(
             executable = True,
             cfg = "exec",
         ),
+        "_gen": attr.label(default = _DESCRIPTOR_GEN, executable = True, cfg = "exec"),
     },
 )
 
@@ -137,8 +256,18 @@ def talos_messages(
       :<name>     cc_library. #include "<prefix>/<fbs_basename>_generated.h";
                   with `topics`, also "<prefix>/topics.h".
                   <prefix> defaults to the package's basename.
+                  "<prefix>/<fbs_basename>_descriptor.h" specializes
+                  talos::Descriptor<M> for each struct the file declares
+                  (talOS/schema/descriptor.h).
       :<name>_py  py_library whose modules import as <namespace>.<Struct>;
-                  with `topics`, also <namespace>.topics.
+                  with `topics`, also <namespace>.topics. Each struct class
+                  carries TALOS_SCHEMA_NAME, TALOS_SCHEMA_HASH and
+                  TALOS_SCHEMA_BFBS, the values Descriptor<M> holds.
+      :<name>_bfbs  one <fbs_basename>.bfbs (reflection.Schema) per schema.
+
+    Every numeric struct field must end in a unit suffix from
+    docs/METHODOLOGY.md §6 (talOS/schema/unit_suffix.h); bools, enums and
+    structs need none. A field without one fails the build.
 
     Messages are .fbs structs with `namespace <package>;` -- never talos.*,
     which would collide with the `talos` framework package in Python.
@@ -243,18 +372,34 @@ def talos_messages(
         flatc_args = flatc_args,
         visibility = ["//visibility:private"],
     )
+    bfbs_name = name + "_bfbs"
+    _talos_bfbs(
+        name = bfbs_name,
+        srcs = srcs,
+        schemas = ":" + schemas_name,
+        include_prefix = include_prefix,
+        visibility = visibility,
+    )
+    _talos_cc_descriptors(
+        name = name + "_descriptors",
+        bfbs = ":" + bfbs_name,
+        include_prefix = include_prefix,
+        messages_label = label,
+        visibility = ["//visibility:private"],
+    )
     cc_library(
         name = name,
-        hdrs = hdrs + [":" + fbs_name + "_srcs"],
+        hdrs = hdrs + [":" + fbs_name + "_srcs", ":" + name + "_descriptors"],
         strip_include_prefix = ".",
         include_prefix = include_prefix,
-        deps = [":" + fbs_name] + list(deps),
+        deps = [":" + fbs_name, str(Label("//talOS/schema:descriptor"))] + list(deps),
         visibility = visibility,
     )
     _flatc_py_tree(
         name = name + "_py_gen",
         srcs = srcs,
         schemas = ":" + schemas_name,
+        bfbs = ":" + bfbs_name,
         topics = topics_py,
         namespace = include_prefix,
         visibility = ["//visibility:private"],

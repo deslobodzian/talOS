@@ -1,0 +1,11 @@
+// Passes the field-name lint although it embeds included.fbs's struct.
+include "lint_test/included.fbs";
+
+namespace lint_test;
+
+struct Good {
+  included:Included;
+  position_m:double;
+  sample_time_ns:ulong;
+  valid:bool;
+}

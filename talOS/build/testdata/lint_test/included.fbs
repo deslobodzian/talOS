@@ -1,0 +1,7 @@
+// A struct whose field lacks a unit suffix, included by good.fbs: it fails
+// its own file's lint, not the including file's.
+namespace lint_test;
+
+struct Included {
+  raw:int;
+}

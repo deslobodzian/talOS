@@ -1,0 +1,15 @@
+// schema_variant as compiled by //talOS/schema:variants; the other files
+// here change one thing each.
+namespace schema_variant;
+
+enum Kind : ubyte { RAW, FILTERED }
+
+struct Reading {
+  level_m:float;
+  kind:Kind;
+  ok:bool;
+}
+
+struct Holder {
+  reading:Reading;
+}

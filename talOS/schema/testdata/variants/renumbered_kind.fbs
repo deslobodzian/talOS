@@ -1,0 +1,14 @@
+// float_level.fbs with Kind.FILTERED renumbered: same layout, other values.
+namespace schema_variant;
+
+enum Kind : ubyte { RAW, FILTERED = 2 }
+
+struct Reading {
+  level_m:float;
+  kind:Kind;
+  ok:bool;
+}
+
+struct Holder {
+  reading:Reading;
+}

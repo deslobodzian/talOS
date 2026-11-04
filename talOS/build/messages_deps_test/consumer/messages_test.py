@@ -21,22 +21,22 @@ class MessagesDepsTest(unittest.TestCase):
         self.assertEqual(mtype.size, 40)
         self.assertEqual(
             mtype.fields,
-            ("pose_x", "pose_y", "pose_heading_rad", "velocity_rps",
+            ("pose_x_m", "pose_y_m", "pose_heading_rad", "velocity_rps",
              "enabled"))
-        data = mtype.encode({"pose_x": 1.0, "pose_y": 2.0,
+        data = mtype.encode({"pose_x_m": 1.0, "pose_y_m": 2.0,
                              "pose_heading_rad": 0.5, "velocity_rps": 10.0,
                              "enabled": True})
         self.assertEqual(len(data), 40)
 
         state = mtype.decode(data)
-        self.assertEqual(state.pose_x, 1.0)
-        self.assertEqual(state.pose_y, 2.0)
+        self.assertEqual(state.pose_x_m, 1.0)
+        self.assertEqual(state.pose_y_m, 2.0)
         self.assertEqual(state.pose_heading_rad, 0.5)
         self.assertEqual(state.velocity_rps, 10.0)
         self.assertTrue(state.enabled)
         self.assertEqual(
             repr(state),
-            "ConsumerState(pose_x=1.0, pose_y=2.0, pose_heading_rad=0.5, "
+            "ConsumerState(pose_x_m=1.0, pose_y_m=2.0, pose_heading_rad=0.5, "
             "velocity_rps=10.0, enabled=True)")
 
 

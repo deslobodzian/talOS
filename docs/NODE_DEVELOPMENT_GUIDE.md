@@ -113,8 +113,12 @@ talos_messages(name = "messages", srcs = ["shooter_message.fbs"],
                topics = {"state": "/shooter/state"})
 # :messages    C++: #include "<package>/shooter_message_generated.h"
 #                   #include "<package>/topics.h"   shooter::topics::kState
+#                   #include "<package>/shooter_message_descriptor.h"
+#                     talos::Descriptor<shooter::ShooterState>::kHash
 # :messages_py Python: from <namespace>.ShooterTarget import ShooterTarget
 #                      from <namespace> import topics   topics.STATE
+#                      ShooterTarget.TALOS_SCHEMA_HASH
+# :messages_bfbs  shooter_message.bfbs (FlatBuffers reflection.Schema)
 
 talos_cc_node(name = "node", node_name = "shooter", srcs = ["shooter.cc"], deps = [":shooter"])
 talos_py_node(name = "node", node_name = "intake", main = "intake.py",
@@ -132,6 +136,14 @@ and include its schema by the dep's include prefix:
 `include "geometry/geometry.fbs";` in the `.fbs`, then C++ includes
 `"geometry/geometry_generated.h"`. Deps are transitive. At a repository root
 the package path is empty, so pass `include_prefix` explicitly there.
+Every numeric struct field must end in a unit suffix from
+[METHODOLOGY.md §6](METHODOLOGY.md#6-units) (`_rps`, `_m`, `_count`, ...);
+bools, enums and structs need none. A field without one fails the build,
+naming the field. Each struct also gets a schema descriptor
+(`talOS/schema/descriptor.h`): its `.bfbs` bytes, its qualified name and a
+64-bit schema hash that changes with any field name, type, offset, nested
+struct or enum value, but not with comments or formatting. Python's
+`talos_schema.struct_hash` computes the same hash from the same bytes.
 The node's name comes from `node_name`; add the node to the robot config as
 `node = "//path:node"`.
 

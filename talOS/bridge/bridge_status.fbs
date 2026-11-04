@@ -10,11 +10,11 @@ namespace bridge;
 // first 32 fit. subsystem_count is the number of those subsystems.
 // configured is whether the RoboRIO acknowledged this bridge's configuration.
 struct BridgeStatus {
-  states_received:uint64;
-  commands_sent:uint64;
-  identity_rejected:uint64;
-  ownership_rejected:uint64;
-  driver_station_packets:uint64;
+  states_received_count:uint64;
+  commands_sent_count:uint64;
+  identity_rejected_count:uint64;
+  ownership_rejected_count:uint64;
+  driver_station_packet_count:uint64;
   state_age_us:uint64;
   timed_out_mask:uint32;
   subsystem_count:uint32;
