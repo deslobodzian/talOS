@@ -1,3 +1,3 @@
-#include "telemetry/node.h"
+#include "talOS/telemetry/node.h"
 
 TALOS_NODE(talos::telemetry::Telemetry)

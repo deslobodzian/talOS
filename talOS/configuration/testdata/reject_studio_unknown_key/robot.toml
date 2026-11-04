@@ -1,0 +1,7 @@
+[studio]
+topic = "/talos/telemetry"
+unknown = "value"
+
+[[subsystems]]
+name = "a"
+path = "a.toml"

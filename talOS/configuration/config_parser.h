@@ -87,6 +87,8 @@ struct RobotConfig {
     uint16_t http_port{5800};
     // Relative to the launcher's working directory.
     std::string webroot{"bazel-bin/studio/dist"};
+    std::string topic{"/talos/telemetry"};
+    std::string pose_topic;
   };
   StudioConfig studio;
 
@@ -409,12 +411,31 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     }
   }
 
-  if (auto* studio = tbl["studio"].as_table()) {
+  if (tbl.contains("studio")) {
+    auto* studio = tbl["studio"].as_table();
+    if (!studio) {
+      throw std::invalid_argument("[studio] must be a table");
+    }
     auto& s = result.studio;
+    for (auto&& [k, v] : *studio) {
+      if (k.str() != "bridge" && k.str() != "webroot" &&
+          k.str() != "http_port" && k.str() != "topic" &&
+          k.str() != "pose_topic") {
+        throw std::invalid_argument("[studio] unknown key '" +
+                                    std::string(k.str()) + "'");
+      }
+    }
     s.bridge = detail::ReadNonEmpty(*studio, "bridge", s.bridge, "[studio]");
     s.webroot = detail::ReadNonEmpty(*studio, "webroot", s.webroot, "[studio]");
     s.http_port =
         detail::ReadPort(*studio, "http_port", s.http_port, "[studio]");
+    if (studio->contains("topic")) {
+      s.topic = detail::ReadNonEmpty(*studio, "topic", "", "[studio]");
+    }
+    if (studio->contains("pose_topic")) {
+      s.pose_topic =
+          detail::ReadNonEmpty(*studio, "pose_topic", "", "[studio]");
+    }
   }
 
   auto* subsystems_tbl = tbl["subsystems"].as_table();

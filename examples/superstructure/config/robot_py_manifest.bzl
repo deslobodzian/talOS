@@ -10,6 +10,7 @@ NODES = [
     "//examples/superstructure/py:elevator",
     "//examples/superstructure/py:intake",
     "//examples/superstructure/py:superstructure",
+    "//talOS/telemetry:node",
 ]
 
 # Every file robot_py.toml reads besides itself.
@@ -18,4 +19,5 @@ CONFIG_FILES = [
     "//examples/superstructure/config:subsystems/elevator.toml",
     "//examples/superstructure/config:subsystems/intake.toml",
     "//examples/superstructure/config:subsystems/superstructure.toml",
+    "//examples/superstructure/config:subsystems/telemetry.toml",
 ]

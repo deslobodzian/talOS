@@ -27,11 +27,23 @@ using Duration = std::chrono::nanoseconds;
 namespace config {
 struct RobotConfig;
 }  // namespace config
+namespace introspect {
+struct Description;
+}  // namespace introspect
 }  // namespace talos
 
 namespace talos::detail {
 
 class LoopPort;  // talOS/node/internal.h
+
+// The declared graph a framework node may read: introspect::DeclaredGraph
+// (talOS/introspection/describe.h).
+using DeclaredGraph = std::vector<introspect::Description>;
+
+// Where a Node gets the declared graph: the graph, or null while there is
+// none yet (the launcher's first --describe pass). May throw: a node run
+// without a graph cannot build a node that needs one.
+using GraphSource = std::function<const DeclaredGraph*()>;
 
 // What a Node is built from: talos::Run, testing::Sim and the C ABI make one.
 struct NodeSetup {
@@ -40,6 +52,7 @@ struct NodeSetup {
   std::shared_ptr<const config::RobotConfig> config;  // parsed config_path
   bool simulation = false;
   LoopPort* loop = nullptr;
+  GraphSource graph;  // unset: no graph (null)
 };
 
 // The user's object, type-erased so the runner and the harness need not be
@@ -84,6 +97,20 @@ struct NodeAccess {
   static std::chrono::nanoseconds freshness_timeout(const Node& node);
   // Topics subscribed with optional = true, for describe and the registry.
   static std::vector<std::string_view> optional_topics(const Node& node);
+  // Topics subscribed with add_observer, for describe and the registry.
+  static std::vector<std::string_view> observer_topics(const Node& node);
+
+  // The declared graph (describe.h DeclaredGraph): every other node of the
+  // session that does not read it, with each end's schema bytes. Null while
+  // the launcher is still collecting it (its first --describe pass), so a
+  // node registers only what it can without one; the launcher then
+  // describes it again, and starts it, with the graph. Throws when the node
+  // runs without one (a direct run without --graph). Call in the
+  // constructor: asking marks the node as one whose topics depend on the
+  // graph.
+  static const DeclaredGraph* declared_graph(Node& node);
+  static bool reads_graph(const Node& node);
+  static const config::RobotConfig& robot_config(const Node& node);
 
   // A parameter of this node's subsystem table, or nullopt when absent. A
   // present key of another type throws, naming it.
@@ -123,6 +150,13 @@ struct NodeAccess {
   static bool subscription_fresh(const Node& node, std::size_t index,
                                  std::chrono::nanoseconds max_age);
   static bool subscription_updated(const Node& node, std::size_t index);
+  // A subscription that observes a topic rather than consuming it: what a
+  // framework node that reads every state topic in the declared graph opens.
+  // The graph lint does not count it as a reader (names.h
+  // kSourceFlagObserver). No callback: it is read at the node's tick.
+  static std::size_t add_observer(Node& node, std::string_view topic,
+                                  std::size_t bytes, std::size_t alignment,
+                                  const schema::Identity& schema);
 
   static std::size_t add_publisher(Node& node, std::string_view topic,
                                    std::size_t bytes, std::size_t alignment,

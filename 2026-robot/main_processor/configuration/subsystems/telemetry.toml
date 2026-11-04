@@ -1,13 +1,6 @@
-# Publishes Studio telemetry frames on `topic`, which must stay
-# /talos/telemetry: the reserved `talos` owner because the feed belongs to no
-# subsystem, and role `telemetry` because it is for recording and display only.
-# It is the only producer there, which the Studio bridge requires: that topic
-# uses DROP_NEWEST so a full queue drops a frame instead of overwriting bytes
-# the bridge is still sending.
+# Publishes Studio telemetry frames on [studio] topic (/talos/telemetry).
+# Framework node: observes all state and status senders in the declared graph.
 [subsystem]
 name = "telemetry"
-node = "//2026-robot/main_processor/telemetry:node"
+node = "//talOS/telemetry:node"
 period_us = 10000
-topic = "/talos/telemetry"
-# The field pose (geometry.PoseEstimate) drawn in Studio and sent as pose/*.
-pose_topic = "/pose_estimator/state"

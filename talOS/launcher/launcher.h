@@ -598,9 +598,30 @@ inline std::vector<naming::Diagnostic> LintParameterUnits(
   return findings;
 }
 
+// Where the launcher writes the declared graph that graph-reading nodes get
+// as `--graph` (introspect::DeclaredGraph): beside graph.json in the session
+// directory.
+inline std::string DeclaredGraphPath(const LauncherOptions& options) {
+  const std::filesystem::path dir =
+      options.output_dir.empty()
+          ? std::filesystem::temp_directory_path() /
+                ("talos_describe_" + std::to_string(::getpid()))
+          : std::filesystem::path{options.output_dir};
+  return (dir / "declared_graph.json").string();
+}
+
 // Phase one of a launch: ask every binary in the roster what it is, assemble
 // the graph they describe, and lint it. The binaries, not the config, are the
 // source: a second declaration of the topology is a thing to forget to update.
+//
+// Two passes. A framework node whose topics follow from the other nodes'
+// (telemetry observes every state topic, teleop writes each bound lane with
+// its consumer's schema) asks for the declared graph in its constructor and
+// says so in its description (reads_graph). Every node is described once
+// without a graph; then the descriptions of the nodes that do not read it
+// are written to DeclaredGraphPath, and each graph reader is described
+// again with `--graph` that file, which it is also started with. A graph
+// reader therefore sees every node but the graph readers.
 inline std::vector<naming::Diagnostic> DescribeGraph(
     const std::vector<NodeSpec>& specs, const LauncherOptions& options,
     std::vector<NodeDescription>& out,
@@ -608,43 +629,69 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
   out.clear();
   out.reserve(specs.size());
 
-  std::vector<naming::NodeShape> shapes;
   std::vector<naming::Diagnostic> probe_findings;
-
-  for (const auto& spec : specs) {
-    NodeDescription described;
-    described.roster_name = spec.name;
-    described.target = spec.target;
-    described.binary_path = spec.binary_path;
-
+  const auto probe = [&](const NodeSpec& spec, NodeDescription& described,
+                         const std::string& graph_path) {
     // A node whose topics depend on its configuration must describe the
     // configuration this session will use.
     std::vector<std::string> args{spec.binary_path, "--describe", "--config",
                                   options.config_path};
     if (options.simulation) args.push_back("--sim");
-
+    if (!graph_path.empty()) args.insert(args.end(), {"--graph", graph_path});
     described.answered =
         ProbeDescribe(spec.binary_path, args,
                       std::chrono::milliseconds{options.describe_timeout_ms},
                       described.declared, described.error);
+  };
 
+  bool any_reader = false;
+  for (const auto& spec : specs) {
+    NodeDescription described;
+    described.roster_name = spec.name;
+    described.target = spec.target;
+    described.binary_path = spec.binary_path;
+    probe(spec, described, "");
+    any_reader =
+        any_reader || (described.answered && described.declared.reads_graph);
+    out.push_back(std::move(described));
+  }
+
+  if (any_reader) {
+    introspect::DeclaredGraph graph;
+    for (const auto& described : out) {
+      if (described.answered && !described.declared.reads_graph) {
+        graph.push_back(described.declared);
+      }
+    }
+    const std::string graph_path = DeclaredGraphPath(options);
+    std::filesystem::create_directories(
+        std::filesystem::path{graph_path}.parent_path());
+    std::ofstream{graph_path} << introspect::DeclaredGraphToJson(graph);
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+      if (!out[i].answered || !out[i].declared.reads_graph) continue;
+      probe(specs[i], out[i], graph_path);
+    }
+  }
+
+  std::vector<naming::NodeShape> shapes;
+  for (const auto& described : out) {
     if (described.answered) {
       shapes.push_back({described.declared.name, described.declared.target,
                         described.declared.sources});
-      if (described.declared.name != spec.name) {
-        probe_findings.push_back({naming::Severity::WARNING, spec.name,
-                                  "the config calls this node '" + spec.name +
-                                      "' but the binary describes itself as '" +
-                                      described.declared.name + "'"});
+      if (described.declared.name != described.roster_name) {
+        probe_findings.push_back(
+            {naming::Severity::WARNING, described.roster_name,
+             "the config calls this node '" + described.roster_name +
+                 "' but the binary describes itself as '" +
+                 described.declared.name + "'"});
       }
     } else {
       // A warning: a node someone is halfway through writing stays launchable.
       probe_findings.push_back(
-          {naming::Severity::WARNING, spec.name,
+          {naming::Severity::WARNING, described.roster_name,
            "did not answer --describe (" + described.error +
                "), so its topics are missing from the declared graph"});
     }
-    out.push_back(std::move(described));
   }
 
   auto diagnostics = naming::LintGraph(shapes, target_sources);
@@ -755,6 +802,7 @@ inline std::string GraphToJson(
       ss << ", \"message_bytes\": " << source.message_bytes;
       ss << ", \"external\": " << (source.external() ? "true" : "false");
       ss << ", \"optional\": " << (source.optional() ? "true" : "false");
+      ss << ", \"observer\": " << (source.observer() ? "true" : "false");
       if (source.kind != event::SourceKind::TIMER) {
         // As describe writes them: the hash a hex string, not a double.
         ss << ", \"schema\": " << Quoted(source.schema);
@@ -889,14 +937,12 @@ inline bool ShouldRetryStudioBridge(
 }
 
 // The topic the bridge watches: what it described (its --describe reads the
-// same `[subsystems.telemetry] topic` key the telemetry node publishes on), or
-// that key itself when the bridge did not answer.
+// `[studio] topic` key the telemetry node publishes on), or that key itself
+// when the bridge did not answer.
 inline std::string StudioBridgeWatchTopic(
     const std::vector<NodeDescription>& described,
     const config::RobotConfig& robot_config) {
-  std::string topic =
-      robot_config.toml_data["subsystems"]["telemetry"]["topic"].value_or(
-          std::string{"/talos/telemetry"});
+  std::string topic = robot_config.studio.topic;
   for (const auto& node : described) {
     if (!node.answered || node.declared.name != kStudioBridgeName) continue;
     for (const auto& source : node.declared.sources) {
@@ -1205,6 +1251,10 @@ class Launcher {
         args.insert(args.end(),
                     {proc.log_path, "--config", options_.config_path});
         if (options_.simulation) args.push_back("--sim");
+        // Started with the graph it was described with (DescribeGraph).
+        if (described[i].answered && described[i].declared.reads_graph) {
+          args.insert(args.end(), {"--graph", DeclaredGraphPath(options_)});
+        }
         if (proc.name == kHardwareNodeName) {
           args.insert(args.end(), {"--remote", remote, "--remote-port",
                                    std::to_string(remote_port), "--local-port",

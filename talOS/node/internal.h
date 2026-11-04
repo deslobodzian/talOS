@@ -11,10 +11,13 @@
 
 #include "talOS/events/callback.h"
 #include "talOS/events/delivery.h"
+#include "talOS/events/manifest.h"
 #include "talOS/events/time.h"
+#include "talOS/introspection/describe.h"
 #include "talOS/schema/identity.h"
 
 namespace talos {
+class Node;
 struct BytePublishOptions;
 }  // namespace talos
 
@@ -106,5 +109,13 @@ class LoopPortFor : public LoopPort {
  private:
   Loop& loop_;
 };
+
+// What `--describe` prints for `node`, built on a loop whose registrations
+// are `manifest`: every topic end with its schema (bytes included), ring
+// layout and endpoint flags, the byte topics the loop does not carry, and
+// whether the node read the declared graph. testing::Sim builds the declared
+// graph it hands its nodes the same way.
+introspect::Description DescribeNode(const Node& node, std::string_view target,
+                                     const event::Manifest& manifest);
 
 }  // namespace talos::detail

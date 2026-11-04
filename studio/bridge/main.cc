@@ -186,23 +186,12 @@ int main(int argc, char** argv) try {
     for (int j = 1; j + 1 < argc; ++j) {
       if (std::string_view(argv[j]) == "--config") config_path = argv[j + 1];
     }
-    // The watched topic is the telemetry node's own configuration, read from
-    // the same key it reads ([subsystems.telemetry] topic), so the two ends
-    // cannot drift apart. The fallback is the topic the robot's telemetry.toml
-    // sets (the launcher lint pins it in practice: a drifted default fails the
-    // launch with "read by studio_bridge but nothing publishes it").
+    // The watched topic is read from [studio] topic in robot configuration.
     std::string topic = "/talos/telemetry";
     if (config_path != nullptr) {
       try {
         const auto robot = talos::config::ParseRobotConfig(config_path);
-        if (const auto* tbl = robot.GetSubsystemTable("telemetry")) {
-          if (auto node = (*tbl)["topic"]) {
-            if (auto val = node.value<std::string_view>();
-                val && !val->empty()) {
-              topic = std::string(*val);
-            }
-          }
-        }
+        topic = robot.studio.topic;
       } catch (const std::exception& e) {
         std::cerr << "studio_bridge --describe: cannot parse " << config_path
                   << " (" << e.what() << "); describing the default topic\n";

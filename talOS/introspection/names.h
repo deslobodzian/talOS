@@ -71,9 +71,12 @@ inline constexpr std::string_view kDirectionSuffixes[] = {
 // How a source's far end is expected to behave (SourceRecord::flags), so the
 // lint can tell a designed dead end from a fault: `/hw/command` is consumed
 // over UDP (external); `/drivetrain/target/auto` has no publisher yet
-// (optional).
+// (optional). An observer is a framework node reading a topic it found in the
+// declared graph (telemetry): it is not a consumer, so a topic only an
+// observer reads is still "published but nothing subscribes to it".
 inline constexpr std::uint32_t kSourceFlagExternal = 1u << 0;
 inline constexpr std::uint32_t kSourceFlagOptional = 1u << 1;
+inline constexpr std::uint32_t kSourceFlagObserver = 1u << 2;
 
 inline bool IsSender(event::SourceKind kind) {
   return kind == event::SourceKind::SENDER;
@@ -252,9 +255,13 @@ struct SourceShape {
   std::uint64_t schema_hash{0};
   std::uint32_t alignment{0};
   std::uint32_t slots{0};
+  // The schema's reflection.Schema bytes (schema::Identity::bfbs): empty for
+  // a layout without one, and never in a registry snapshot.
+  std::string bfbs;
 
   bool external() const { return (flags & kSourceFlagExternal) != 0; }
   bool optional() const { return (flags & kSourceFlagOptional) != 0; }
+  bool observer() const { return (flags & kSourceFlagObserver) != 0; }
 };
 
 struct NodeShape {
@@ -392,7 +399,7 @@ inline std::vector<Diagnostic> LintGraph(
                       owner + "'s [targets]");
           }
         }
-      } else {
+      } else if (!source.observer()) {
         topic.readers.push_back(node.name);
       }
 

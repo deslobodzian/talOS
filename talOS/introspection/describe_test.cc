@@ -46,6 +46,7 @@ void ExpectSameDescription(const Description& written,
                            const Description& read) {
   EXPECT_EQ(read.name, written.name);
   EXPECT_EQ(read.target, written.target);
+  EXPECT_EQ(read.reads_graph, written.reads_graph);
   ASSERT_EQ(read.sources.size(), written.sources.size());
   for (std::size_t i = 0; i < written.sources.size(); ++i) {
     const auto& a = written.sources[i];
@@ -60,6 +61,7 @@ void ExpectSameDescription(const Description& written,
     EXPECT_EQ(b.schema_hash, a.schema_hash) << "source " << i;
     EXPECT_EQ(b.alignment, a.alignment) << "source " << i;
     EXPECT_EQ(b.slots, a.slots) << "source " << i;
+    EXPECT_EQ(b.bfbs, a.bfbs) << "source " << i;
   }
 }
 
@@ -118,6 +120,66 @@ TEST(Describe, RoundTripsEndpointFlags) {
   ASSERT_TRUE(DescribeReader::Parse(DescribeToJson(written), read, error))
       << error;
   ExpectSameDescription(written, read);
+}
+
+// The schema bytes cross as base64, every byte value and every padding
+// length included, so a graph-reading node gets the bfbs the publisher has.
+TEST(Describe, RoundTripsSchemaBytesObserversAndGraphReaders) {
+  event::Manifest manifest = sample_manifest();
+  std::string bytes;
+  for (int i = 0; i < 256; ++i) bytes += static_cast<char>(i);
+  manifest[1].schema.bfbs = bytes;               // 256 bytes: two '='
+  manifest[2].schema.bfbs = bytes.substr(0, 5);  // one '='
+  manifest[3].schema.bfbs = bytes.substr(7, 3);  // none
+  Description written = DescribeManifest(
+      "telemetry", "//talOS/telemetry:node", manifest, kSlots,
+      {{"/drivetrain/target", naming::kSourceFlagObserver}});
+  written.reads_graph = true;
+  ASSERT_TRUE(written.sources[1].observer());
+  EXPECT_EQ(written.sources[1].bfbs, bytes);
+
+  Description read;
+  std::string error;
+  ASSERT_TRUE(DescribeReader::Parse(DescribeToJson(written), read, error))
+      << error;
+  ExpectSameDescription(written, read);
+  EXPECT_TRUE(read.sources[1].observer());
+  EXPECT_FALSE(read.sources[2].observer());
+}
+
+TEST(Describe, RejectsMalformedSchemaBytes) {
+  std::string json = DescribeToJson(
+      DescribeManifest("d", "//d:d", sample_manifest(), kSlots));
+  const std::size_t at = json.find("\"bfbs\": \"\"");
+  ASSERT_NE(at, std::string::npos);
+  json.replace(at, 10, "\"bfbs\": \"abc\"");
+  Description read;
+  std::string error;
+  EXPECT_FALSE(DescribeReader::Parse(json, read, error));
+  EXPECT_NE(error.find("bfbs"), std::string::npos) << error;
+}
+
+TEST(Describe, DeclaredGraphRoundTripsEveryNode) {
+  event::Manifest manifest = sample_manifest();
+  manifest[1].schema.bfbs = std::string{"\x00\x01{}[]\"", 7};
+  const DeclaredGraph written{
+      DescribeManifest("drivetrain", "//d:drivetrain", manifest, kSlots),
+      DescribeManifest("empty", "//e:empty", event::Manifest{}, kSlots),
+      DescribeManifest("shooter", "//s:shooter", sample_manifest(), kSlots)};
+  DeclaredGraph read;
+  std::string error;
+  ASSERT_TRUE(
+      DescribeReader::ParseGraph(DeclaredGraphToJson(written), read, error))
+      << error;
+  ASSERT_EQ(read.size(), written.size());
+  for (std::size_t i = 0; i < written.size(); ++i) {
+    ExpectSameDescription(written[i], read[i]);
+  }
+
+  ASSERT_TRUE(DescribeReader::ParseGraph(DeclaredGraphToJson({}), read, error))
+      << error;
+  EXPECT_TRUE(read.empty());
+  EXPECT_FALSE(DescribeReader::ParseGraph("not json", read, error));
 }
 
 TEST(Describe, RoundTripsANodeThatRegisteredNothing) {

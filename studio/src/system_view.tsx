@@ -198,7 +198,8 @@ export function Wiring(
     const peers = peersOf(source.name, direction === 'in' ? 'publishers' :
                                                             'subscribers');
     const rate = rates[rateKey(node.name, source.id)];
-    const declared = source.external || source.optional;
+    const declared = source.external || source.optional || source.observer;
+    const kindLabel = source.observer ? 'OBSERVER' : KIND_LABEL[source.kind];
     return <li key={source.kind + source.id}
                className={peers.length || declared ? '' : 'dangling'}>
       <div className="edge-topic">
@@ -206,12 +207,13 @@ export function Wiring(
         <span className="edge-rate">{hertz(rate)}</span>
       </div>
       <div className="edge-meta">
-        <em>{KIND_LABEL[source.kind]}</em>
-        <span>{peers.length      ? peers.join(', ') :
-                   source.external ? 'outside talOS — no shared-memory peer' :
-                   source.optional ? 'optional — no peer yet' :
-                   direction === 'in' ? 'no publisher' :
-                                        'no subscriber'}</span>
+        <em>{kindLabel}</em>
+        <span>{source.observer ? (peers.length ? peers.join(', ') : 'no publisher') :
+               peers.length      ? peers.join(', ') :
+               source.external ? 'outside talOS — no shared-memory peer' :
+               source.optional ? 'optional — no peer yet' :
+               direction === 'in' ? 'no publisher' :
+                                    'no subscriber'}</span>
         {source.dropped !== '0' &&
          <span className="warn">{integer(source.dropped)} dropped</span>}
       </div>
@@ -688,7 +690,7 @@ export function OverviewTab(
           out.push({
             severity: 'warn',
             text: `${topic.name} is read by ${
-                topic.subscribers.join(', ')} but nothing publishes it`,
+                [...topic.subscribers, ...(topic.observers ?? [])].join(', ')} but nothing publishes it`,
             tab: 'system'
           });
         if (topic.dropped !== '0')

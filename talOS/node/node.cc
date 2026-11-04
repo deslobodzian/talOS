@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -43,6 +45,7 @@ struct Node::Impl {
     std::size_t bytes;
     std::unique_ptr<std::byte[]> data;  // operator new[]: aligned for M
     bool optional;
+    bool observer = false;
     detail::MessageCallback on_message;
     bool has_value = false;
     Time received{};
@@ -84,6 +87,8 @@ struct Node::Impl {
   std::shared_ptr<const config::RobotConfig> config;
   bool simulation = false;
   detail::LoopPort* loop = nullptr;
+  detail::GraphSource graph;
+  bool reads_graph = false;
   Duration period{};
   Duration timeout{};
 
@@ -231,6 +236,7 @@ Node::Node(detail::NodeSetup setup) : impl_{std::make_unique<Impl>()} {
   impl.config = std::move(setup.config);
   impl.simulation = setup.simulation;
   impl.loop = setup.loop;
+  impl.graph = std::move(setup.graph);
   impl.timeout =
       std::chrono::microseconds{impl.config->hardware.command_timeout_us};
 
@@ -345,6 +351,29 @@ std::vector<std::string_view> NodeAccess::optional_topics(const Node& node) {
     if (slot->optional) topics.push_back(slot->topic);
   }
   return topics;
+}
+
+std::vector<std::string_view> NodeAccess::observer_topics(const Node& node) {
+  std::vector<std::string_view> topics;
+  for (const auto& slot : node.impl_->subscriptions) {
+    if (slot->observer) topics.push_back(slot->topic);
+  }
+  return topics;
+}
+
+const DeclaredGraph* NodeAccess::declared_graph(Node& node) {
+  Node::Impl& impl = *node.impl_;
+  impl.CheckOpen("declared_graph");
+  impl.reads_graph = true;
+  return impl.graph ? impl.graph() : nullptr;
+}
+
+bool NodeAccess::reads_graph(const Node& node) {
+  return node.impl_->reads_graph;
+}
+
+const config::RobotConfig& NodeAccess::robot_config(const Node& node) {
+  return *node.impl_->config;
 }
 
 std::size_t NodeAccess::add_state_machine(Node& node, std::int64_t initial) {
@@ -615,6 +644,15 @@ bool NodeAccess::subscription_updated(const Node& node, std::size_t index) {
   return node.impl_->SubscriptionAt(index).updated;
 }
 
+std::size_t NodeAccess::add_observer(Node& node, std::string_view topic,
+                                     std::size_t bytes, std::size_t alignment,
+                                     const schema::Identity& schema) {
+  const std::size_t index = add_subscription(node, topic, bytes, alignment,
+                                             schema, /*optional=*/false, {});
+  node.impl_->subscriptions[index]->observer = true;
+  return index;
+}
+
 std::size_t NodeAccess::add_publisher(Node& node, std::string_view topic,
                                       std::size_t bytes, std::size_t alignment,
                                       const schema::Identity& schema) {
@@ -789,6 +827,7 @@ struct Flags {
   std::string replay_path;
   std::string replay_inputs;
   std::string config_path;
+  std::string graph_path;
   int duration_s = 0;
   std::uint64_t session_id = 0;
   bool simulation = false;
@@ -810,6 +849,8 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
       flags.session_id = std::stoull(argv[++i]);
     } else if (arg == "--config" && i + 1 < argc) {
       flags.config_path = argv[++i];
+    } else if (arg == "--graph" && i + 1 < argc) {
+      flags.graph_path = argv[++i];
     } else if (arg == "--replay" && i + 1 < argc) {
       flags.replay_path = argv[++i];
     } else if (arg == "--replay-inputs" && i + 1 < argc) {
@@ -819,7 +860,7 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
     } else {
       throw std::invalid_argument(
           "usage: node [--sim] [--describe] [--duration-s N] [--log PATH] "
-          "[--session-id ID] [--config PATH] [--replay PATH] "
+          "[--session-id ID] [--config PATH] [--graph PATH] [--replay PATH] "
           "[--replay-inputs SESSION_DIR]");
     }
   }
@@ -834,6 +875,36 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
     throw std::invalid_argument("missing --config PATH");
   }
   return flags;
+}
+
+// The declared graph from --graph, read on first use. Without the flag:
+// none yet under --describe (the launcher's first pass), and an error
+// otherwise, since a node that reads the graph cannot be built without one.
+GraphSource GraphFromFlags(const Flags& flags, std::string_view node_name) {
+  if (flags.graph_path.empty()) {
+    if (flags.describe) return [] { return nullptr; };
+    return [name = std::string{node_name}]() -> const DeclaredGraph* {
+      throw std::runtime_error(
+          name +
+          " reads the declared graph: run it under the launcher, which "
+          "passes --graph, or pass --graph <session dir>/declared_graph.json");
+    };
+  }
+  auto graph = std::make_shared<std::optional<DeclaredGraph>>();
+  return [graph, path = flags.graph_path]() -> const DeclaredGraph* {
+    if (!graph->has_value()) {
+      std::ifstream file{path};
+      if (!file) throw std::runtime_error("cannot read --graph " + path);
+      const std::string text{std::istreambuf_iterator<char>{file}, {}};
+      DeclaredGraph parsed;
+      std::string error;
+      if (!introspect::DescribeReader::ParseGraph(text, parsed, error)) {
+        throw std::runtime_error("--graph " + path + ": " + error);
+      }
+      graph->emplace(std::move(parsed));
+    }
+    return &**graph;
+  };
 }
 
 // One node as the runner holds it. Members destroy in reverse: the user's
@@ -857,6 +928,7 @@ Hosted Host(std::unique_ptr<LoopPort> port, const char* node_name,
           config::ParseRobotConfig(flags.config_path)),
       .simulation = flags.simulation,
       .loop = hosted.port.get(),
+      .graph = GraphFromFlags(flags, node_name),
   });
   hosted.user = make(*hosted.node);
   NodeAccess::start(*hosted.node);
@@ -932,11 +1004,15 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
   return 0;
 }
 
-// Endpoint attributes of the loop's sources: the optional subscriptions.
+// Endpoint attributes of the loop's sources: the optional subscriptions and
+// the observers.
 std::vector<introspect::EndpointAttribute> Endpoints(const Node& node) {
   std::vector<introspect::EndpointAttribute> attributes;
   for (const std::string_view topic : NodeAccess::optional_topics(node)) {
     attributes.push_back({topic, introspect::naming::kSourceFlagOptional});
+  }
+  for (const std::string_view topic : NodeAccess::observer_topics(node)) {
+    attributes.push_back({topic, introspect::naming::kSourceFlagObserver});
   }
   return attributes;
 }
@@ -985,6 +1061,27 @@ std::vector<introspect::Reporter::Selection> Selections(const Node& node) {
 
 }  // namespace
 
+introspect::Description DescribeNode(const Node& node, std::string_view target,
+                                     const event::Manifest& manifest) {
+  auto description = introspect::DescribeManifest(
+      std::string{node.name()}, std::string{target}, manifest,
+      static_cast<std::uint32_t>(event::RealtimeEventLoop<>::Options{}.slots),
+      Endpoints(node));
+  const schema::Identity bytes = schema::Bytes();
+  for (const auto& topic : NodeAccess::byte_topics(node)) {
+    introspect::naming::SourceShape source{
+        event::SourceKind::SENDER, std::string{topic.topic},
+        static_cast<std::uint32_t>(topic.max_bytes), ByteTopicFlags(topic)};
+    source.schema = bytes.name;
+    source.schema_hash = bytes.hash;
+    source.alignment = static_cast<std::uint32_t>(kMessageAlignment);
+    source.slots = static_cast<std::uint32_t>(topic.slots);
+    description.sources.push_back(std::move(source));
+  }
+  description.reads_graph = NodeAccess::reads_graph(node);
+  return description;
+}
+
 int RunMain(int argc, char** argv, const char* node_name,
             const char* node_target, const InstanceFactory& make) {
   try {
@@ -998,23 +1095,10 @@ int RunMain(int argc, char** argv, const char* node_name,
       event::SimulationEnvironment environment;
       event::SimulatedEventLoop<> loop{environment};
       const Hosted hosted = Host(loop, node_name, flags, make);
-      auto description = introspect::DescribeManifest(
-          node_name, node_target, loop.manifest(),
-          static_cast<std::uint32_t>(
-              event::RealtimeEventLoop<>::Options{}.slots),
-          Endpoints(*hosted.node));
-      const schema::Identity bytes = schema::Bytes();
-      for (const auto& topic : NodeAccess::byte_topics(*hosted.node)) {
-        introspect::naming::SourceShape source{
-            event::SourceKind::SENDER, std::string{topic.topic},
-            static_cast<std::uint32_t>(topic.max_bytes), ByteTopicFlags(topic)};
-        source.schema = bytes.name;
-        source.schema_hash = bytes.hash;
-        source.alignment = static_cast<std::uint32_t>(kMessageAlignment);
-        source.slots = static_cast<std::uint32_t>(topic.slots);
-        description.sources.push_back(std::move(source));
-      }
-      std::printf("%s", introspect::DescribeToJson(description).c_str());
+      std::printf("%s",
+                  introspect::DescribeToJson(
+                      DescribeNode(*hosted.node, node_target, loop.manifest()))
+                      .c_str());
       return 0;
     }
     if (!flags.replay_path.empty()) {

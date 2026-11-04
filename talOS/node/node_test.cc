@@ -6,10 +6,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <span>
@@ -568,9 +570,8 @@ struct Result {
   std::string output;
 };
 
-Result RunBinary(const std::string& args) {
-  const std::string command =
-      "'" + Runfile("TALOS_TEST_NODE") + "' " + args + " 2>&1";
+Result RunBinary(const std::string& args, const char* binary = "TALOS_TEST_NODE") {
+  const std::string command = "'" + Runfile(binary) + "' " + args + " 2>&1";
   FILE* pipe = ::popen(command.c_str(), "r");
   if (pipe == nullptr) throw std::runtime_error("popen failed");
   Result result{0, {}};
@@ -595,35 +596,93 @@ TEST(Binary, DescribeListsEveryEndpointIncludingOptionalOnes) {
   EXPECT_NE(result.output.find(R"("target": "//talOS/node:test_node")"),
             std::string::npos)
       << result.output;
-  // Every topic endpoint names its schema; a timer has none.
+  // Every topic endpoint names its schema, with its reflection bytes; a
+  // timer has none.
   const std::string count_schema =
       R"("schema": "node_test.Count", "schema_hash": ")" +
       introspect::HexHash(Descriptor<Count>::kHash) +
-      R"(", "alignment": 8, "slots": 1024})";
+      R"(", "alignment": 8, "slots": 1024, "bfbs": ")" +
+      introspect::Base64(schema::Of<Count>().bfbs) + R"("})";
   EXPECT_NE(
       result.output.find(
-          R"({"kind": "WATCHER", "name": "/test_node/target", "message_bytes": 16, "external": false, "optional": true, )" +
+          R"({"kind": "WATCHER", "name": "/test_node/target", "message_bytes": 16, "external": false, "optional": true, "observer": false, )" +
           count_schema),
       std::string::npos)
       << result.output;
   EXPECT_NE(
       result.output.find(
-          R"({"kind": "SENDER", "name": "/test_node/state", "message_bytes": 16, "external": false, "optional": false, )" +
+          R"({"kind": "SENDER", "name": "/test_node/state", "message_bytes": 16, "external": false, "optional": false, "observer": false, )" +
           count_schema),
       std::string::npos)
       << result.output;
   EXPECT_NE(
       result.output.find(
-          R"({"kind": "SENDER", "name": "/test_node/frames", "message_bytes": 64, "external": true, "optional": false, "schema": "talos.Bytes", "schema_hash": ")" +
+          R"({"kind": "SENDER", "name": "/test_node/frames", "message_bytes": 64, "external": true, "optional": false, "observer": false, "schema": "talos.Bytes", "schema_hash": ")" +
           introspect::HexHash(schema::BytesHash()) +
-          R"(", "alignment": 8, "slots": 16})"),
+          R"(", "alignment": 8, "slots": 16, "bfbs": ""})"),
       std::string::npos)
+      << result.output;
+  EXPECT_NE(result.output.find(R"("reads_graph": false)"), std::string::npos)
       << result.output;
   EXPECT_NE(result.output.find(R"({"kind": "TIMER", "name": "test_node")"),
             std::string::npos)
       << result.output;
   // A node with no hardware never touches /hw/*.
   EXPECT_EQ(result.output.find("/hw/"), std::string::npos) << result.output;
+}
+
+std::string TempFile(const std::string& name) {
+  const char* tmp = std::getenv("TEST_TMPDIR");
+  return std::string{tmp != nullptr ? tmp : "/tmp"} + "/" + name;
+}
+
+// The launcher's two describe passes and its run, against a node that reads
+// the declared graph.
+TEST(Binary, AGraphReaderDescribesWhatTheGraphItWasGivenHolds) {
+  // First pass: no graph yet; it says it reads one and registers nothing.
+  const Result first = RunBinary("--describe " + ConfigFlag(), "TALOS_GRAPH_NODE");
+  ASSERT_EQ(first.status, 0) << first.output;
+  introspect::Description described;
+  std::string error;
+  ASSERT_TRUE(introspect::DescribeReader::Parse(first.output, described, error))
+      << error << "\n" << first.output;
+  EXPECT_TRUE(described.reads_graph);
+  EXPECT_EQ(described.sources.size(), 1u);  // its tick timer
+
+  // Second pass: test_node's description is the graph.
+  const Result test_node = RunBinary("--describe " + ConfigFlag());
+  ASSERT_EQ(test_node.status, 0) << test_node.output;
+  introspect::Description publisher;
+  ASSERT_TRUE(
+      introspect::DescribeReader::Parse(test_node.output, publisher, error))
+      << error;
+  const std::string graph = TempFile("talos_declared_graph.json");
+  {
+    std::ofstream out{graph};
+    out << introspect::DeclaredGraphToJson({publisher});
+  }
+  const Result second = RunBinary(
+      "--describe --graph '" + graph + "' " + ConfigFlag(), "TALOS_GRAPH_NODE");
+  ASSERT_EQ(second.status, 0) << second.output;
+  ASSERT_TRUE(introspect::DescribeReader::Parse(second.output, described, error))
+      << error;
+  const auto observed = std::find_if(
+      described.sources.begin(), described.sources.end(),
+      [](const auto& source) { return source.name == "/test_node/state"; });
+  ASSERT_NE(observed, described.sources.end()) << second.output;
+  EXPECT_TRUE(observed->observer());
+  EXPECT_EQ(observed->kind, event::SourceKind::WATCHER);
+  EXPECT_EQ(observed->schema, "node_test.Count");
+  EXPECT_EQ(observed->schema_hash, Descriptor<Count>::kHash);
+  EXPECT_EQ(observed->bfbs, schema::Of<Count>().bfbs);
+
+  // Run for real without a graph: it cannot be built, and says how to fix it.
+  const Result run = RunBinary("--sim --duration-s 1 --log '" +
+                                   TempFile("graph_node.tlog") + "' " +
+                                   ConfigFlag(),
+                               "TALOS_GRAPH_NODE");
+  EXPECT_NE(run.status, 0);
+  EXPECT_NE(run.output.find("--graph"), std::string::npos) << run.output;
 }
 
 TEST(Binary, LoggedSimRunReplaysWithoutDivergence) {
@@ -646,6 +705,38 @@ bool ShmSegmentExists(const std::string& topic) {
   if (fd == -1) return false;
   ::close(fd);
   return true;
+}
+
+// In a Sim a graph reader sees every node added before it, schemas
+// included, except other graph readers.
+struct GraphReader {
+  explicit GraphReader(Node& node)
+      : graph{*detail::NodeAccess::declared_graph(node)} {}
+  detail::DeclaredGraph graph;
+};
+
+struct CountPublisher {
+  explicit CountPublisher(Node& node)
+      : out{node.publish<Count>("state")} {}
+  Publisher<Count> out;
+};
+
+TEST(Node, SimHandsAGraphReaderTheNodesAddedBeforeIt) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<CountPublisher>("talker");
+  const auto& first = sim.add<GraphReader>("listener");
+  const auto& second = sim.add<GraphReader>("mechanism");
+  ASSERT_EQ(first.graph.size(), 1u);
+  EXPECT_EQ(first.graph[0].name, "talker");
+  const auto& state = first.graph[0].sources.back();
+  EXPECT_EQ(state.name, "/talker/state");
+  EXPECT_EQ(state.schema, "node_test.Count");
+  EXPECT_EQ(state.bfbs, schema::Of<Count>().bfbs);
+  // The first reader is not in the second's graph.
+  ASSERT_EQ(second.graph.size(), 1u);
+  EXPECT_EQ(second.graph[0].name, "talker");
+  EXPECT_TRUE(detail::NodeAccess::reads_graph(sim.node("listener")));
+  EXPECT_FALSE(detail::NodeAccess::reads_graph(sim.node("talker")));
 }
 
 // Outside the Sim a byte topic is an RTMS queue, opened by the first send:

@@ -222,19 +222,34 @@ TEST(ConfigTest, StudioTable) {
   EXPECT_EQ(defaults.studio.bridge, "//studio/bridge:studio_bridge");
   EXPECT_EQ(defaults.studio.http_port, 5800);
   EXPECT_EQ(defaults.studio.webroot, "bazel-bin/studio/dist");
+  EXPECT_EQ(defaults.studio.topic, "/talos/telemetry");
+
+  const auto no_topic = Parse(R"(
+[studio]
+bridge = "//custom/studio:bridge"
+)");
+  EXPECT_EQ(no_topic.studio.bridge, "//custom/studio:bridge");
+  EXPECT_EQ(no_topic.studio.topic, "/talos/telemetry");
 
   const auto cfg = Parse(R"(
 [studio]
 bridge = "//custom/studio:bridge"
 http_port = 8080
 webroot = "custom/dist"
+topic = "/custom/telemetry"
+pose_topic = "/custom/pose"
 )");
   EXPECT_EQ(cfg.studio.bridge, "//custom/studio:bridge");
   EXPECT_EQ(cfg.studio.http_port, 8080);
   EXPECT_EQ(cfg.studio.webroot, "custom/dist");
+  EXPECT_EQ(cfg.studio.topic, "/custom/telemetry");
+  EXPECT_EQ(cfg.studio.pose_topic, "/custom/pose");
 
   ExpectRejected("[studio]\nhttp_port = 70000\n");
   ExpectRejected("[studio]\nbridge = \"\"\n");
+  ExpectRejected("[studio]\ntopic = \"\"\n");
+  ExpectRejected("[studio]\npose_topic = \"\"\n");
+  ExpectRejected("[studio]\nunknown = 1\n");
 }
 
 using Sources = std::vector<std::string>;
@@ -307,6 +322,7 @@ TEST_F(ManifestTest, MergesSubsystemFilesAndKeepsTopLevelTables) {
 period_us = 10000
 [studio]
 http_port = 9000
+topic = "/talos/telemetry"
 [[subsystems]]
 name = "shooter"
 path = "subsystems/shooter.toml"
@@ -453,6 +469,7 @@ controller_port = 5804
 [studio]
 http_port = 8080
 webroot = "base/dist"
+topic = "/talos/telemetry"
 
 [[subsystems]]
 name = "intake"
@@ -472,6 +489,7 @@ period_us = 5000
 
 [studio]
 http_port = 9090
+topic = "/talos/telemetry"
 
 [[subsystems]]
 name = "intake"

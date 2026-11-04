@@ -49,6 +49,16 @@ cc_library(
     hdrs = ["unit_suffix.h"],
 )
 
+cc_test(
+    name = "unit_suffix_test",
+    size = "small",
+    srcs = ["unit_suffix_test.cc"],
+    deps = [
+        ":unit_suffix",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # talos::schema::struct_hash over upstream flatbuffers/reflection.h types.
 cc_library(
     name = "schema_hash",
@@ -109,7 +119,10 @@ talos_messages(
     name = "test_messages",
     srcs = ["testdata/shapes.fbs"],
     include_prefix = "schema_test",
-    visibility = ["//talOS/python:__pkg__"],
+    visibility = [
+        "//talOS/python:__pkg__",
+        "//talOS/telemetry:__pkg__",
+    ],
 )
 
 # schema_variant (an enum, a struct using it, a struct nesting that) in five
