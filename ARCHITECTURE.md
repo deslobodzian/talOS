@@ -83,7 +83,9 @@ sent since that mode began, and only while `robot_enabled(node)`; otherwise
 null, and the node goes neutral. The policy is `[robot.targets]` (defaults:
 teleop `["teleop"]`, autonomous `["auto"]`, test none) with a per-subsystem
 `[targets]` override. No process sits between a producer and its subsystem,
-so a subsystem's safety depends only on its own process and the bridge.
+so a subsystem's safety depends only on its own process and the bridge. Each
+`get()` records the selected source in the node's live registry row, which is
+how Studio's system view shows who drives each subsystem.
 
 Messages reach a node when its loop drains its topics. A node without message
 callbacks drains right before each of its own timers (`update()`, `every()`)

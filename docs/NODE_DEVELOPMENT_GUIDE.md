@@ -102,7 +102,10 @@ Sources follow the topic segment rules; an unknown mode is a config error. A
 consumer reads its lanes without a callback, so it keeps draining right before
 its timer. Republish a lane every period; `release()` hands control to the next
 lane on the consumer's next tick. The launcher refuses a lane whose source no
-mode lists and warns about a policy lane nobody writes.
+mode lists and warns about a policy lane nobody writes. Each `get()` also
+records the selected source in the node's registry row, so Studio's system view
+shows who drives the subsystem ("driven by teleop", or "none") with nothing to
+add in the node.
 
 ## BUILD
 

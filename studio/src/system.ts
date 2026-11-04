@@ -54,6 +54,11 @@ export type SystemSource = {
   optional: boolean;
 };
 
+// One talos::Target of a node: the lanes its policy names, and the source of
+// the lane it selected last -- who drives the subsystem. Null when nobody
+// does: robot disabled, Driver Station stale, or no live lane in the mode.
+export type SystemSelection = {sources: string[]; selected: string|null};
+
 export type SystemNode = {
   name: string; target: string; slot: number; pid: string; session_id: string;
   generation: string;
@@ -65,6 +70,9 @@ export type SystemNode = {
   simulation: boolean;
   replay: boolean;
   sources: SystemSource[];
+  // The node's Targets, in the order it opened them. Empty for a node that
+  // drives nothing, and for a bridge that predates the field.
+  selections: SystemSelection[];
 };
 
 export type SystemTopic = {
@@ -95,6 +103,9 @@ const MAX_NODES = 256;
 const MAX_SOURCES = 512;
 const MAX_TOPICS = 4096;
 const MAX_STRING = 512;
+
+// A node holds one Target per subsystem it drives; the registry keeps four.
+const MAX_SELECTIONS = 64;
 
 // A lint finding is a sentence, not a name, so it gets its own bound.
 const MAX_DIAGNOSTICS = 1024;
@@ -207,6 +218,25 @@ function parseSource(value: unknown, where: string): SystemSource {
   };
 }
 
+function parseSelection(value: unknown, where: string): SystemSelection {
+  const selection = record(value, where);
+  const selected = selection.selected;
+  if (selected !== null &&
+      (typeof selected !== 'string' || selected.length > MAX_STRING))
+    fail(`${where}.selected must be a string or null`);
+  return {sources: names(selection, 'sources'), selected: selected as string|null};
+}
+
+// Absent is read as none rather than refused, the rule `flag` follows: a
+// bridge built before Targets reported their selection sends no field, and
+// its document is otherwise whole.
+function selections(node: Record<string, unknown>,
+                    where: string): SystemSelection[] {
+  if (node.selections === undefined) return [];
+  return list(node, 'selections', MAX_SELECTIONS)
+      .map((entry, i) => parseSelection(entry, `${where}.selections[${i}]`));
+}
+
 function parseNode(value: unknown, where: string): SystemNode {
   const node = record(value, where);
   return {
@@ -225,7 +255,8 @@ function parseNode(value: unknown, where: string): SystemNode {
     replay: bool(node, 'replay'),
     sources:
         list(node, 'sources', MAX_SOURCES)
-            .map((entry, i) => parseSource(entry, `${where}.sources[${i}]`))
+            .map((entry, i) => parseSource(entry, `${where}.sources[${i}]`)),
+    selections: selections(node, where)
   };
 }
 
@@ -535,6 +566,14 @@ export function declaredStatus(declared: DeclaredGraph,
 
 export const isSubscriber = (kind: SourceKind) =>
     kind === 'WATCHER' || kind === 'FETCHER';
+
+// Who drives a node's subsystem, as one line: each Target's selected source,
+// 'none' for one that nobody drives. Null for a node without Targets, which
+// drives nothing and has nothing to say here.
+export function drivenBy(node: SystemNode): string|null {
+  if (!node.selections.length) return null;
+  return node.selections.map(s => s.selected ?? 'none').join(' · ');
+}
 
 export const rateKey = (node: string, sourceId: number) => `${node} ${sourceId}`;
 

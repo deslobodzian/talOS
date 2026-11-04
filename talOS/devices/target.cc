@@ -26,6 +26,7 @@ struct TargetState {
   std::vector<std::int32_t> autonomous;
   std::vector<std::int32_t> test;
   DriverStation ds;
+  std::size_t selection = 0;  // NodeAccess::add_selection: who drives
 };
 
 struct LaneState {
@@ -61,6 +62,22 @@ LaneState& LaneAt(Node& node, std::size_t index) {
   }
   return lanes[index];
 }
+
+// Hands whatever target_get decided -- on every path out of it -- to the
+// node's registry row, so a viewer can see who drives the subsystem.
+class ReportSelection {
+ public:
+  ReportSelection(Node& node, std::size_t selection, const std::int32_t& source)
+      : node_{node}, selection_{selection}, source_{source} {}
+  ~ReportSelection() { NodeAccess::set_selected(node_, selection_, source_); }
+  ReportSelection(const ReportSelection&) = delete;
+  ReportSelection& operator=(const ReportSelection&) = delete;
+
+ private:
+  Node& node_;
+  std::size_t selection_;
+  const std::int32_t& source_;
+};
 
 }  // namespace
 
@@ -117,6 +134,7 @@ std::size_t TargetAccess::open_target(Node& node, std::size_t bytes,
   state.teleop = indexes(policy.teleop);
   state.autonomous = indexes(policy.autonomous);
   state.test = indexes(policy.test);
+  state.selection = NodeAccess::add_selection(node, state.sources);
   auto& targets = node.extension<Targets>().targets;
   targets.push_back(std::move(state));
   return targets.size() - 1;
@@ -126,6 +144,7 @@ const void* TargetAccess::target_get(Node& node, std::size_t target,
                                      std::int32_t& source) {
   source = -1;
   const TargetState& state = TargetAt(node, target);
+  const ReportSelection report{node, state.selection, source};
   if (!robot_enabled(node)) return nullptr;
   const std::vector<std::int32_t>* lanes = nullptr;
   switch (DriverStationAccess::mode(state.ds)) {

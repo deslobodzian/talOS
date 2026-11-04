@@ -250,6 +250,33 @@ inline void AppendSource(std::string& out,
   out += '}';
 }
 
+inline void AppendNames(std::string& out,
+                        const std::vector<std::string>& names) {
+  out += '[';
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    if (i != 0) out += ',';
+    AppendEscaped(out, names[i]);
+  }
+  out += ']';
+}
+
+// One Target of a node: its policy's sources and who drives, `null` when
+// nobody does. Not a version bump: a reader that predates it ignores the
+// field, and one that knows it reads its absence as "no Targets", which is
+// what an older bridge could say about any node.
+inline void AppendSelection(std::string& out,
+                            const introspect::SelectionSnapshot& selection) {
+  out += "{\"sources\":";
+  AppendNames(out, selection.sources);
+  out += ",\"selected\":";
+  if (const auto source = selection.selected_source()) {
+    AppendEscaped(out, *source);
+  } else {
+    out += "null";
+  }
+  out += '}';
+}
+
 inline void AppendNode(std::string& out, const introspect::NodeSnapshot& node) {
   out += "{\"name\":";
   AppendEscaped(out, node.name);
@@ -282,17 +309,13 @@ inline void AppendNode(std::string& out, const introspect::NodeSnapshot& node) {
     if (i != 0) out += ',';
     AppendSource(out, node.sources[i]);
   }
-  out += "]}";
-}
-
-inline void AppendNames(std::string& out,
-                        const std::vector<std::string>& names) {
-  out += '[';
-  for (std::size_t i = 0; i < names.size(); ++i) {
-    if (i != 0) out += ',';
-    AppendEscaped(out, names[i]);
-  }
   out += ']';
+  out += ",\"selections\":[";
+  for (std::size_t i = 0; i < node.selections.size(); ++i) {
+    if (i != 0) out += ',';
+    AppendSelection(out, node.selections[i]);
+  }
+  out += "]}";
 }
 
 inline void AppendTopic(std::string& out, const TopicRow& row) {
