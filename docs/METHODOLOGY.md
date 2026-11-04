@@ -242,9 +242,9 @@ Rules:
   `--describe-only` warning. **[enforced (warning)]**
 - Robot-wide wiring (which producers drive which subsystem, telemetry,
   bindings) lives in TOML read by the framework. It is never a list of
-  subsystem names in code. Target lanes are already config-only
-  (`[robot.targets]`, `[targets]`); telemetry and bindings are
-  **[planned: D3, D4]**.
+  subsystem names in code. Target lanes and telemetry are config-only
+  (`[robot.targets]`, `[targets]`, `[studio]`); teleop bindings are
+  **[planned: D4]**.
 
 ## 9. Time, determinism, restart
 
@@ -348,8 +348,7 @@ touch the code, or under the design item named.
 
 | Where | Deviation | Rule | Fix |
 |---|---|---|---|
-| `operator_interface.h`, `telemetry/node.h:325-393` | subsystem names hard-coded | §7, §8 | D3, D4 |
-| `telemetry/node.h` units | `"rev/s"` strings written by hand | §6 | derive from suffix (D3) |
+| `operator_interface.h` | subsystem names hard-coded | §7, §8 | D4 |
 | `operator_interface.toml` | `deadband`, `heading_timeout_s` | §6, §8 | `deadband_frac`, `heading_timeout_us` |
 | `intake.py:18` | fixed `INTAKE_RPS` ignores the requested speed | §3 | use the target's demand |
 | `drivetrain/swerve.h` `SwerveKinematics::ToModuleStates` | wheel speeds are desaturated by hand, not with wpimath's `DesaturateWheelSpeeds` (the kinematics, `Optimize` and forward kinematics are wpimath's `SwerveDriveKinematics<4>`) | §14 | `DesaturateWheelSpeeds` takes one attainable speed for every module, while `[geometry]` gives each module its own `wheel_radius_m` and drive `max_velocity_rps`; keep until wpimath takes per-module limits |

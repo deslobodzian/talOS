@@ -460,5 +460,225 @@ node = "//talOS/telemetry:node"
   }
 }
 
+TEST(TelemetryTest, PoseTopicMissingErrors) {
+  const std::string kAbsentConfig = R"(
+[robot]
+period_us = 10000
+
+[studio]
+topic = "/talos/telemetry"
+pose_topic = "/absent/state"
+
+[subsystems.demo.motors.m_demo]
+can_id = 1
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)";
+  Sim sim1 = Sim::FromToml(kAbsentConfig);
+  try {
+    sim1.add<Telemetry>("telemetry");
+    FAIL() << "expected exception for absent pose_topic";
+  } catch (const std::invalid_argument& err) {
+    EXPECT_NE(std::string{err.what()}.find("/absent/state"), std::string::npos);
+  }
+
+  const std::string kNoPoseFieldConfig = R"(
+[robot]
+period_us = 10000
+
+[studio]
+topic = "/talos/telemetry"
+pose_topic = "/demo/state"
+
+[subsystems.demo]
+node = "//demo:node"
+
+[subsystems.demo.motors.m]
+can_id = 1
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)";
+  Sim sim2 = Sim::FromToml(kNoPoseFieldConfig);
+  sim2.add<ShapesNode>("demo");
+  try {
+    sim2.add<Telemetry>("telemetry");
+    FAIL() << "expected exception for topic lacking geometry.Pose2d field";
+  } catch (const std::invalid_argument& err) {
+    EXPECT_NE(std::string{err.what()}.find("/demo/state"), std::string::npos);
+  }
+}
+
+class BadBfbsNode {
+ public:
+  explicit BadBfbsNode(talos::Node& node) {
+    using talos::detail::NodeAccess;
+    NodeAccess::add_publisher(
+        node, "/bad/state", 16, 8,
+        talos::schema::Identity{"bad.State", 12345, "invalid schema bytes"});
+  }
+};
+
+class MissingObjectNode {
+ public:
+  explicit MissingObjectNode(talos::Node& node) {
+    using talos::detail::NodeAccess;
+    const auto schema = talos::schema::Of<schema_test::Mixed>();
+    NodeAccess::add_publisher(
+        node, "/missing_obj/state", 16, 8,
+        talos::schema::Identity{"bad.NonExistent", 12345, schema.bfbs});
+  }
+};
+
+TEST(TelemetryTest, BadBfbsAndMissingObjectErrors) {
+  const std::string kBadBfbsConfig = R"(
+[robot]
+period_us = 10000
+
+[studio]
+topic = "/talos/telemetry"
+
+[subsystems.bad]
+node = "//bad:node"
+
+[subsystems.bad.motors.m_bad]
+can_id = 1
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)";
+  Sim sim1 = Sim::FromToml(kBadBfbsConfig);
+  sim1.add<BadBfbsNode>("bad");
+  try {
+    sim1.add<Telemetry>("telemetry");
+    FAIL() << "expected bad schema buffer exception";
+  } catch (const std::invalid_argument& err) {
+    EXPECT_NE(std::string{err.what()}.find("/bad/state"), std::string::npos);
+  }
+
+  const std::string kMissingObjConfig = R"(
+[robot]
+period_us = 10000
+
+[studio]
+topic = "/talos/telemetry"
+
+[subsystems.missing]
+node = "//missing:node"
+
+[subsystems.missing.motors.m_missing]
+can_id = 1
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)";
+  Sim sim2 = Sim::FromToml(kMissingObjConfig);
+  sim2.add<MissingObjectNode>("missing");
+  try {
+    sim2.add<Telemetry>("telemetry");
+    FAIL() << "expected missing root object exception";
+  } catch (const std::invalid_argument& err) {
+    EXPECT_NE(std::string{err.what()}.find("/missing_obj/state"),
+              std::string::npos);
+  }
+}
+
+TEST(TelemetryTest, EnumLabelsExtraction) {
+  const std::string kConfig = R"(
+[robot]
+period_us = 10000
+
+[studio]
+topic = "/talos/telemetry"
+
+[subsystems.demo]
+node = "//demo:node"
+
+[subsystems.demo.motors.m]
+can_id = 1
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)";
+  Sim sim = Sim::FromToml(kConfig);
+  sim.add<ShapesNode>("demo");
+  auto& telemetry = sim.add<Telemetry>("telemetry");
+
+  const auto dict = DictionaryMap(telemetry);
+  ASSERT_TRUE(dict.contains("demo/state/inner/mode"));
+  const auto& mode_labels = dict.at("demo/state/inner/mode")->labels;
+  ASSERT_GE(mode_labels.size(), 5u);
+  EXPECT_EQ(mode_labels[0], "OFF");
+  EXPECT_EQ(mode_labels[3], "LOW");
+  EXPECT_EQ(mode_labels[4], "HIGH");
+}
+
+TEST(TelemetryTest, StalePoseBecomesZeroAndNaN) {
+  const std::string kConfig = R"(
+[robot]
+period_us = 10000
+
+[studio]
+topic = "/talos/telemetry"
+pose_topic = "/pose_estimator/state"
+
+[subsystems.pose_estimator]
+node = "//estimator:node"
+
+[subsystems.pose_estimator.motors.m_est]
+can_id = 1
+
+[subsystems.demo]
+node = "//demo:node"
+
+[subsystems.demo.motors.m_demo]
+can_id = 2
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+stale_timeout_us = 50000
+)";
+  Sim sim = Sim::FromToml(kConfig);
+  auto& estimator = sim.add<EstimatorNode>("pose_estimator");
+  auto& shapes = sim.add<ShapesNode>("demo");
+  auto& telemetry = sim.add<Telemetry>("telemetry");
+
+  ::geometry::PoseEstimate estimate{
+      0,
+      ::geometry::Pose2d{2.0, 3.0, 1.0},
+      ::geometry::Twist2d{0.0, 0.0, 0.0},
+      true,
+      0,
+      0,
+  };
+  estimator.pose_.send(estimate);
+  sim.step(20ms);
+
+  auto frame = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(frame, nullptr);
+  EXPECT_DOUBLE_EQ(frame->chassis()->x(), 2.0);
+  auto channels = DecodeChannels(telemetry, frame);
+  EXPECT_DOUBLE_EQ(channels.at("pose/valid"), 1.0);
+
+  // Advance time past stale_timeout_us (100ms) without sending new pose
+  sim.step(100ms);
+
+  // Publish arrays on demo node so telemetry produces a new frame while pose is
+  // stale
+  schema_test::Arrays arrays{};
+  shapes.arrays_.send(arrays);
+  sim.step(20ms);
+
+  frame = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(frame, nullptr);
+  EXPECT_DOUBLE_EQ(frame->chassis()->x(), 0.0);
+  EXPECT_DOUBLE_EQ(frame->chassis()->y(), 0.0);
+  EXPECT_DOUBLE_EQ(frame->chassis()->yaw(), 0.0);
+  channels = DecodeChannels(telemetry, frame);
+  EXPECT_DOUBLE_EQ(channels.at("pose/valid"), 0.0);
+  // Pose estimator channels are NaN when stale
+  EXPECT_FALSE(channels.contains("pose_estimator/state/twist/vx_mps"));
+}
+
 }  // namespace
 }  // namespace talos::telemetry

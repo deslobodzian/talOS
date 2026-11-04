@@ -52,6 +52,7 @@ export type SystemSource = {
   // is what teaches people to ignore a fault report.
   external: boolean;
   optional: boolean;
+  observer: boolean;
 };
 
 // One talos::Target of a node: the lanes its policy names, and the source of
@@ -78,6 +79,7 @@ export type SystemNode = {
 export type SystemTopic = {
   name: string; message_bytes: number; publishers: string[];
   subscribers: string[];
+  observers: string[];
   published: string;
   received: string;
   dropped: string;
@@ -214,7 +216,8 @@ function parseSource(value: unknown, where: string): SystemSource {
     last_latency_ns: u64(source, 'last_latency_ns'),
     max_latency_ns: u64(source, 'max_latency_ns'),
     external: flag(source, 'external'),
-    optional: flag(source, 'optional')
+    optional: flag(source, 'optional'),
+    observer: flag(source, 'observer')
   };
 }
 
@@ -267,6 +270,7 @@ function parseTopic(value: unknown, where: string): SystemTopic {
     message_bytes: num(topic, 'message_bytes'),
     publishers: names(topic, 'publishers'),
     subscribers: names(topic, 'subscribers'),
+    observers: topic.observers === undefined ? [] : names(topic, 'observers'),
     published: u64(topic, 'published'),
     received: u64(topic, 'received'),
     dropped: u64(topic, 'dropped')
@@ -337,7 +341,7 @@ export const DECLARED_VERSION = 1;
 // not a topic and has neither.
 export type DeclaredSource = {
   kind: SourceKind; name: string; message_bytes: number; external: boolean;
-  optional: boolean; schema: string | null; schema_hash: string | null;
+  optional: boolean; observer: boolean; schema: string | null; schema_hash: string | null;
 };
 
 export type DeclaredNode = {
@@ -373,6 +377,7 @@ function parseDeclaredSource(value: unknown, where: string): DeclaredSource {
     message_bytes: num(source, 'message_bytes'),
     external: flag(source, 'external'),
     optional: flag(source, 'optional'),
+    observer: flag(source, 'observer'),
     schema: timer ? null : str(source, 'schema'),
     schema_hash: hash
   };

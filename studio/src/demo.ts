@@ -99,6 +99,7 @@ type DemoSource = {
   // topic that is not a fault next to one that is.
   external?: boolean;
   optional?: boolean;
+  observer?: boolean;
 };
 
 type DemoNode = {
@@ -316,11 +317,11 @@ const DEMO_NODES: DemoNode[] = [
     periodUs: 10000,
     sources: [
       {kind: 'TIMER', name: 'telemetry', bytes: 0, hz: 100},
-      {kind: 'WATCHER', name: '/pose_estimator/state', bytes: 72, hz: 50},
-      {kind: 'WATCHER', name: '/drivetrain/state', bytes: 48, hz: 200},
+      {kind: 'WATCHER', name: '/pose_estimator/state', bytes: 72, hz: 50, observer: true},
+      {kind: 'WATCHER', name: '/drivetrain/state', bytes: 48, hz: 200, observer: true},
       // Waiting on the node that never started.
-      {kind: 'WATCHER', name: '/shooter/state', bytes: 24, hz: 0},
-      {kind: 'WATCHER', name: '/hw/state/driver_station', bytes: HW_PACKET, hz: 50},
+      {kind: 'WATCHER', name: '/shooter/state', bytes: 24, hz: 0, observer: true},
+      {kind: 'WATCHER', name: '/hw/state/driver_station', bytes: HW_PACKET, hz: 50, observer: true},
       {kind: 'SENDER', name: '/talos/telemetry', bytes: STUDIO_SLOT, hz: 100}
     ]
   }
@@ -356,7 +357,8 @@ function demoSource(node: DemoNode, source: DemoSource, id: number,
     last_latency_ns: String(dispatched ? 40000 + (id % 5) * 3000 : 0),
     max_latency_ns: String(dispatched ? 900000 + (id % 7) * 50000 : 0),
     external: source.external === true,
-    optional: source.optional === true
+    optional: source.optional === true,
+    observer: source.observer === true
   };
 }
 
@@ -428,6 +430,7 @@ function deriveTopics(nodes: SystemNode[]): SystemTopic[] {
           message_bytes: 0,
           publishers: [],
           subscribers: [],
+          observers: [],
           published: '0',
           received: '0',
           dropped: '0'
@@ -440,6 +443,9 @@ function deriveTopics(nodes: SystemNode[]): SystemTopic[] {
       if (source.kind === 'SENDER') {
         row.publishers.push(node.name);
         row.published = String(BigInt(row.published) + BigInt(source.events));
+      } else if (source.observer) {
+        row.observers.push(node.name);
+        row.received = String(BigInt(row.received) + BigInt(source.events));
       } else {
         row.subscribers.push(node.name);
         row.received = String(BigInt(row.received) + BigInt(source.events));
@@ -531,6 +537,7 @@ const declaredNode = (node: DemoNode): DeclaredNode => ({
                              message_bytes: source.bytes,
                              external: source.external === true,
                              optional: source.optional === true,
+                             observer: source.observer === true,
                              ...(source.kind === 'TIMER'
                                      ? {schema: null, schema_hash: null}
                                      : demoSchema(source.name))

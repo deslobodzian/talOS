@@ -54,11 +54,15 @@ test('the parser accepts what the launcher actually writes', () => {
   assert.equal(graph.diagnostics.filter(d => d.severity === 'error').length, 0);
   assert.deepEqual(
       graph.diagnostics.map(d => `${d.severity} ${d.subject}`).sort(), [
-        'warning /drivetrain/target/auto', 'warning /intake/target/auto',
-        'warning /shooter/target/auto', 'warning operator_interface'
+        'warning /drivetrain/target/auto', 'warning /intake/state',
+        'warning /intake/target/auto', 'warning /pose_estimator/state',
+        'warning /shooter/state', 'warning /shooter/target/auto',
+        'warning operator_interface'
       ]);
-  for (const d of graph.diagnostics.filter(d => d.subject.startsWith('/')))
+  for (const d of graph.diagnostics.filter(d => d.subject.includes('/target/')))
     assert.match(d.message, /is in the target policy of \w+ but nothing writes it yet/);
+  for (const d of graph.diagnostics.filter(d => d.subject.endsWith('/state')))
+    assert.match(d.message, /is published but nothing subscribes to it/);
   // METHODOLOGY §6: the parameter keys still lacking a unit suffix.
   assert.match(graph.diagnostics.find(d => d.subject === 'operator_interface')!.message,
                /without a unit suffix .*: deadband, intake_button, shoot_button$/);
@@ -161,8 +165,8 @@ test('the launcher\'s findings cross the language boundary intact', () => {
   // printed lowercase, which was a real guess in this parser.
   for (const d of graph.diagnostics)
     assert.ok(d.severity === 'error' || d.severity === 'warning', d.severity);
-  assert.equal(graph.diagnostics.length - errors.length, 4,
-               'the autonomous-lane and parameter-unit warnings are still ' +
+  assert.equal(graph.diagnostics.length - errors.length, 7,
+               'the autonomous-lane, unread-state, and parameter-unit warnings are still ' +
                    'there beside the errors');
 
   const subjects = errors.map(d => d.subject).sort();

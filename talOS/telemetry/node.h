@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <random>
@@ -232,9 +233,9 @@ class Telemetry {
         double x_m = 0.0;
         double y_m = 0.0;
         double yaw_rad = 0.0;
-        std::memcpy(&x_m, raw + pose_offset_, sizeof(double));
-        std::memcpy(&y_m, raw + pose_offset_ + 8, sizeof(double));
-        std::memcpy(&yaw_rad, raw + pose_offset_ + 16, sizeof(double));
+        std::memcpy(&x_m, raw + pose_x_offset_, sizeof(double));
+        std::memcpy(&y_m, raw + pose_y_offset_, sizeof(double));
+        std::memcpy(&yaw_rad, raw + pose_yaw_offset_, sizeof(double));
         if (valid && std::isfinite(x_m) && std::isfinite(y_m) &&
             std::isfinite(yaw_rad)) {
           pose_ok = true;
@@ -380,16 +381,12 @@ class Telemetry {
 
   static std::string ResolveTopic(Node& node) {
     using talos::detail::NodeAccess;
-    const auto& studio = NodeAccess::robot_config(node).studio;
-    if (!studio.topic.empty()) return studio.topic;
-    return node.param<std::string>("topic", "/talos/telemetry");
+    return NodeAccess::robot_config(node).studio.topic;
   }
 
   static std::string ResolvePoseTopic(Node& node) {
     using talos::detail::NodeAccess;
-    const auto& studio = NodeAccess::robot_config(node).studio;
-    if (!studio.pose_topic.empty()) return studio.pose_topic;
-    return node.param<std::string>("pose_topic", "");
+    return NodeAccess::robot_config(node).studio.pose_topic;
   }
 
   static std::uint64_t RandomStreamId() {
@@ -449,16 +446,25 @@ class Telemetry {
 
     // Check if pose_topic is defined in graph
     if (!pose_topic_.empty()) {
+      bool found_pose_topic = false;
       for (const auto& node_desc : graph) {
         for (const auto& source : node_desc.sources) {
           if (source.name == pose_topic_ &&
-              source.kind == event::SourceKind::SENDER &&
-              !source.bfbs.empty()) {
+              source.kind == event::SourceKind::SENDER) {
+            found_pose_topic = true;
             SetupPoseExtraction(source);
             break;
           }
         }
         if (has_pose_) break;
+      }
+      if (!found_pose_topic) {
+        throw std::invalid_argument("telemetry: pose topic '" + pose_topic_ +
+                                    "' is absent from graph");
+      }
+      if (!has_pose_) {
+        throw std::invalid_argument("telemetry: pose topic '" + pose_topic_ +
+                                    "' has no geometry.Pose2d field");
       }
     }
 
@@ -484,6 +490,9 @@ class Telemetry {
           ObserveDriverStation(source);
         } else if (!source.bfbs.empty()) {
           ObserveDescribedTopic(source);
+        } else {
+          std::cerr << "[" << node_.name() << "] skipping topic '"
+                    << source.name << "' without schema\n";
         }
       }
     }
@@ -492,43 +501,78 @@ class Telemetry {
   void SetupPoseExtraction(const introspect::naming::SourceShape& source) {
     using talos::detail::NodeAccess;
 
+    if (source.bfbs.empty()) {
+      throw std::invalid_argument("telemetry: pose topic '" + source.name +
+                                  "' has no schema");
+    }
+
     flatbuffers::Verifier verifier{
         reinterpret_cast<const std::uint8_t*>(source.bfbs.data()),
         source.bfbs.size()};
-    if (!reflection::VerifySchemaBuffer(verifier)) return;
+    if (!reflection::VerifySchemaBuffer(verifier)) {
+      throw std::invalid_argument(
+          "telemetry: failed to verify schema for pose topic '" + source.name +
+          "'");
+    }
 
     const reflection::Schema* schema =
         reflection::GetSchema(source.bfbs.data());
     const reflection::Object* object =
         schema->objects()->LookupByKey(source.schema.c_str());
-    if (!object) return;
+    if (!object) {
+      throw std::invalid_argument("telemetry: schema object '" + source.schema +
+                                  "' for pose topic '" + source.name +
+                                  "' is missing");
+    }
 
+    bool found_pose = false;
     for (const auto* field : *object->fields()) {
       const auto& type = *field->type();
       if (type.base_type() == reflection::BaseType::Obj) {
         const auto* sub_obj = schema->objects()->Get(type.index());
         if (sub_obj != nullptr &&
             sub_obj->name()->string_view() == "geometry.Pose2d") {
-          pose_offset_ = field->offset();
-          has_pose_ = true;
-          break;
+          const std::size_t pose_offset = field->offset();
+          bool found_x = false;
+          bool found_y = false;
+          bool found_yaw = false;
+          for (const auto* sub_field : *sub_obj->fields()) {
+            if (sub_field->name()->string_view() == "x_m") {
+              pose_x_offset_ = pose_offset + sub_field->offset();
+              found_x = true;
+            } else if (sub_field->name()->string_view() == "y_m") {
+              pose_y_offset_ = pose_offset + sub_field->offset();
+              found_y = true;
+            } else if (sub_field->name()->string_view() == "yaw_rad") {
+              pose_yaw_offset_ = pose_offset + sub_field->offset();
+              found_yaw = true;
+            }
+          }
+          if (found_x && found_y && found_yaw) {
+            found_pose = true;
+            break;
+          }
         }
       }
     }
 
-    if (has_pose_) {
-      for (const auto* field : *object->fields()) {
-        if (field->name()->string_view() == "valid" &&
-            field->type()->base_type() == reflection::BaseType::Bool) {
-          pose_has_valid_field_ = true;
-          pose_valid_offset_ = field->offset();
-          break;
-        }
-      }
-      pose_sub_index_ = NodeAccess::add_observer(
-          node_, source.name, source.message_bytes, source.alignment,
-          {source.schema, source.schema_hash, source.bfbs});
+    if (!found_pose) {
+      throw std::invalid_argument("telemetry: pose topic '" + source.name +
+                                  "' has no geometry.Pose2d field");
     }
+
+    has_pose_ = true;
+    for (const auto* field : *object->fields()) {
+      if (field->name()->string_view() == "valid" &&
+          field->type()->base_type() == reflection::BaseType::Bool) {
+        pose_has_valid_field_ = true;
+        pose_valid_offset_ = field->offset();
+        break;
+      }
+    }
+    pose_sub_index_ = NodeAccess::add_observer(
+        node_, source.name, source.message_bytes, source.alignment,
+        {source.schema, source.schema_hash, source.bfbs});
   }
 
   void ObserveDriverStation(const introspect::naming::SourceShape& source) {
@@ -565,13 +609,20 @@ class Telemetry {
     flatbuffers::Verifier verifier{
         reinterpret_cast<const std::uint8_t*>(source.bfbs.data()),
         source.bfbs.size()};
-    if (!reflection::VerifySchemaBuffer(verifier)) return;
+    if (!reflection::VerifySchemaBuffer(verifier)) {
+      throw std::invalid_argument(
+          "telemetry: failed to verify schema for topic '" + source.name + "'");
+    }
 
     const reflection::Schema* schema =
         reflection::GetSchema(source.bfbs.data());
     const reflection::Object* object =
         schema->objects()->LookupByKey(source.schema.c_str());
-    if (!object) return;
+    if (!object) {
+      throw std::invalid_argument("telemetry: root schema object '" +
+                                  source.schema + "' for topic '" +
+                                  source.name + "' is missing");
+    }
 
     std::size_t sub_idx = 0;
     if (has_pose_ && source.name == pose_topic_) {
@@ -696,7 +747,9 @@ class Telemetry {
   std::size_t idx_pose_valid_{0};
   bool has_pose_{false};
   std::size_t pose_sub_index_{0};
-  std::size_t pose_offset_{0};
+  std::size_t pose_x_offset_{0};
+  std::size_t pose_y_offset_{0};
+  std::size_t pose_yaw_offset_{0};
   bool pose_has_valid_field_{false};
   std::size_t pose_valid_offset_{0};
 

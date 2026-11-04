@@ -222,6 +222,14 @@ TEST(ConfigTest, StudioTable) {
   EXPECT_EQ(defaults.studio.bridge, "//studio/bridge:studio_bridge");
   EXPECT_EQ(defaults.studio.http_port, 5800);
   EXPECT_EQ(defaults.studio.webroot, "bazel-bin/studio/dist");
+  EXPECT_EQ(defaults.studio.topic, "/talos/telemetry");
+
+  const auto no_topic = Parse(R"(
+[studio]
+bridge = "//custom/studio:bridge"
+)");
+  EXPECT_EQ(no_topic.studio.bridge, "//custom/studio:bridge");
+  EXPECT_EQ(no_topic.studio.topic, "/talos/telemetry");
 
   const auto cfg = Parse(R"(
 [studio]
@@ -237,12 +245,11 @@ pose_topic = "/custom/pose"
   EXPECT_EQ(cfg.studio.topic, "/custom/telemetry");
   EXPECT_EQ(cfg.studio.pose_topic, "/custom/pose");
 
-  ExpectRejected("[studio]\nhttp_port = 70000\ntopic = \"/talos/telemetry\"\n");
-  ExpectRejected("[studio]\nbridge = \"\"\ntopic = \"/talos/telemetry\"\n");
-  ExpectRejected("[studio]\nbridge = \"//custom/studio:bridge\"\n");
+  ExpectRejected("[studio]\nhttp_port = 70000\n");
+  ExpectRejected("[studio]\nbridge = \"\"\n");
   ExpectRejected("[studio]\ntopic = \"\"\n");
-  ExpectRejected("[studio]\ntopic = \"/t\"\npose_topic = \"\"\n");
-  ExpectRejected("[studio]\ntopic = \"/t\"\nunknown = 1\n");
+  ExpectRejected("[studio]\npose_topic = \"\"\n");
+  ExpectRejected("[studio]\nunknown = 1\n");
 }
 
 using Sources = std::vector<std::string>;

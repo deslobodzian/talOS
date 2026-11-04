@@ -1,0 +1,4 @@
+# Optional topic in [studio] defaults to /talos/telemetry.
+accept = true
+nodes = ["//a:node"]
+files = ["a.toml"]

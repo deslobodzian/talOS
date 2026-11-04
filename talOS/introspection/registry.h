@@ -787,6 +787,7 @@ struct SourceSnapshot {
   // node and a `--describe` the same question and gets the answer the same way.
   bool external() const { return (flags & naming::kSourceFlagExternal) != 0; }
   bool optional() const { return (flags & naming::kSourceFlagOptional) != 0; }
+  bool observer() const { return (flags & naming::kSourceFlagObserver) != 0; }
 };
 
 // One Target of a node: the lanes its policy names and the one it selected

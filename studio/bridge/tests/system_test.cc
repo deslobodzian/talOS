@@ -314,7 +314,15 @@ TEST(SystemGraph, CarriesEndpointAttributesOnEverySourceAndTopic) {
                          .name = "/drivetrain/target/auto",
                          .message_bytes = 32,
                          .flags = naming::kSourceFlagOptional}};
-  input.nodes = {HardwareBridge(), drivetrain};
+  introspect::NodeSnapshot telemetry;
+  telemetry.name = "telemetry";
+  telemetry.alive = true;
+  telemetry.sources = {{.id = 0,
+                        .kind = event::SourceKind::WATCHER,
+                        .name = "/drivetrain/state",
+                        .message_bytes = 48,
+                        .flags = naming::kSourceFlagObserver}};
+  input.nodes = {HardwareBridge(), drivetrain, telemetry};
   input.registry_available = true;
 
   const std::string json = SystemGraphJson(input);
@@ -326,22 +334,33 @@ TEST(SystemGraph, CarriesEndpointAttributesOnEverySourceAndTopic) {
   // Per source, so a viewer can explain one endpoint without re-deriving the
   // topic table.
   EXPECT_NE(json.find("\"name\":\"/hw/command\",\"message_bytes\":1032,"
-                      "\"alignment\":8,\"external\":true,\"optional\":false"),
+                      "\"alignment\":8,\"external\":true,\"optional\":false,"
+                      "\"observer\":false"),
             std::string::npos);
   EXPECT_NE(json.find("\"name\":\"/hw/state\",\"message_bytes\":1032,"
-                      "\"alignment\":8,\"external\":false,\"optional\":false"),
+                      "\"alignment\":8,\"external\":false,\"optional\":false,"
+                      "\"observer\":false"),
             std::string::npos);
-  EXPECT_NE(
-      json.find("\"name\":\"/drivetrain/target/auto\",\"message_bytes\":"
-                "32,\"alignment\":0,\"external\":false,\"optional\":true"),
-      std::string::npos);
+  EXPECT_NE(json.find("\"name\":\"/drivetrain/target/auto\",\"message_bytes\":"
+                      "32,\"alignment\":0,\"external\":false,\"optional\":true,"
+                      "\"observer\":false"),
+            std::string::npos);
+  EXPECT_NE(json.find("\"name\":\"/drivetrain/state\",\"message_bytes\":48,"
+                      "\"alignment\":0,\"external\":false,\"optional\":false,"
+                      "\"observer\":true"),
+            std::string::npos);
 
   // And per topic, with the verdict, so `curl` alone answers the question.
   EXPECT_NE(json.find("{\"name\":\"/hw/command\",\"message_bytes\":1032,"
                       "\"publishers\":[\"hardware_bridge\"],\"subscribers\":[],"
+                      "\"observers\":[],"
                       "\"published\":\"12\",\"received\":\"0\","
                       "\"dropped\":\"0\",\"external\":true,\"optional\":false,"
                       "\"health\":\"bridged\"}"),
+            std::string::npos);
+  EXPECT_NE(json.find("{\"name\":\"/drivetrain/state\",\"message_bytes\":48,"
+                      "\"publishers\":[],\"subscribers\":[],"
+                      "\"observers\":[\"telemetry\"],"),
             std::string::npos);
   EXPECT_NE(json.find("\"external\":false,\"optional\":true,"
                       "\"health\":\"unconnected\""),
