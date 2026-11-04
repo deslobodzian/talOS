@@ -751,12 +751,26 @@ constexpr std::string_view kStubThatHangsOnDescribe =
     "done\n"
     "exit 0\n";
 
+// A topic endpoint as a node describes it. The schema follows the size, so
+// two endpoints of one size agree on the topic and of two sizes do not.
+introspect::naming::SourceShape Endpoint(event::SourceKind kind,
+                                         std::string topic,
+                                         std::uint32_t bytes) {
+  return {kind,
+          std::move(topic),
+          bytes,
+          0,
+          "launcher_test.Message" + std::to_string(bytes),
+          0x1000 + bytes,
+          8,
+          1024};
+}
 introspect::naming::SourceShape Sender(std::string topic, std::uint32_t bytes) {
-  return {event::SourceKind::SENDER, std::move(topic), bytes, 0};
+  return Endpoint(event::SourceKind::SENDER, std::move(topic), bytes);
 }
 introspect::naming::SourceShape Watcher(std::string topic,
                                         std::uint32_t bytes) {
-  return {event::SourceKind::WATCHER, std::move(topic), bytes, 0};
+  return Endpoint(event::SourceKind::WATCHER, std::move(topic), bytes);
 }
 
 std::string ReadFile(const std::string& path) {

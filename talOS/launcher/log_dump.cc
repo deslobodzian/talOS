@@ -7,6 +7,7 @@
 
 #include "talOS/events/context.h"
 #include "talOS/launcher/launcher.h"
+#include "talOS/schema/decode.h"
 
 namespace {
 
@@ -87,6 +88,14 @@ int main(int argc, char** argv) {
         ToMillis(base_ns, r.header.now_ns),
         static_cast<unsigned long long>(r.header.sequence), r.header.aux,
         r.header.payload_bytes);
+    // The topic's schema travels in the log (talOS/events/log/format.h), so
+    // every payload decodes without the build that recorded it.
+    if (r.source != nullptr && !r.source->schema.name.empty() &&
+        !r.payload.empty()) {
+      std::printf("      %s %s\n", r.source->schema.name.c_str(),
+                  talos::schema::DecodeToText(r.source->schema, r.payload)
+                      .c_str());
+    }
   }
 
   std::printf("\nsummary: %zu records across %zu processes\n", records.size(),

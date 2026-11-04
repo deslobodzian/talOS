@@ -30,6 +30,7 @@ cc_binary(
     deps = [
         ":launcher_lib",
         "//talOS/events:events_core",
+        "//talOS/schema:decode",
     ],
 )
 

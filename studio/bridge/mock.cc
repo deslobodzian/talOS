@@ -60,8 +60,10 @@ int main(int argc, char** argv) try {
   std::signal(SIGINT, signal_handler);
   std::signal(SIGTERM, signal_handler);
   RTMSQueue queue(argc > 1 ? argv[1] : "/talos/telemetry", wire::slot_bytes, 8,
-                  wire::slot_count,
-                  {OverflowPolicy::DROP_NEWEST, ReadMode::SEQUENCE});
+                  talos::schema::Bytes(), wire::slot_count,
+                  {.overflow_policy = OverflowPolicy::DROP_NEWEST,
+                   .read_mode = ReadMode::SEQUENCE,
+                   .publisher = true});
   // The segment exists now; tests wait for this line before starting a bridge.
   std::cout << "ready\n" << std::flush;
 

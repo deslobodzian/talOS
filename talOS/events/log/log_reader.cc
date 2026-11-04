@@ -4,7 +4,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <stdexcept>
 #include <system_error>
@@ -57,15 +59,26 @@ std::vector<std::byte> read_whole_file(std::string_view path) {
 }  // namespace
 
 LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
-  if (data_.size() < sizeof(FileHeader)) {
+  // The magic and version come first so an older log -- whose header is
+  // shorter -- is reported as one, not as a truncated file.
+  constexpr std::size_t kVersionEnd = offsetof(FileHeader, header_bytes);
+  if (data_.size() < kVersionEnd) {
     throw std::runtime_error("LogReader: file too short for a header");
   }
 
   FileHeader header{};
-  std::memcpy(&header, data_.data(), sizeof(header));
+  std::memcpy(&header, data_.data(),
+              std::min(data_.size(), sizeof(header)));
 
   if (std::memcmp(header.magic, FILE_MAGIC, sizeof(header.magic)) != 0) {
     throw std::runtime_error("LogReader: bad file magic");
+  }
+  if (header.version < FORMAT_VERSION) {
+    throw std::runtime_error(
+        "LogReader: format version " + std::to_string(header.version) +
+        " predates message schemas in logs (this build reads version " +
+        std::to_string(FORMAT_VERSION) +
+        "); dump or replay it with the build that recorded it");
   }
   if (header.version != FORMAT_VERSION) {
     throw std::runtime_error("LogReader: unsupported format version " +
@@ -80,18 +93,24 @@ LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
   const std::size_t manifest_bytes_size =
       static_cast<std::size_t>(header.manifest_count) * sizeof(ManifestEntry);
   const std::size_t manifest_offset = header.header_bytes;
+  const std::size_t schema_offset = manifest_offset + manifest_bytes_size;
 
-  if (data_.size() < manifest_offset + manifest_bytes_size) {
+  if (data_.size() < schema_offset ||
+      data_.size() - schema_offset < header.schema_bytes) {
     throw std::runtime_error("LogReader: file too short for its manifest");
   }
 
   const std::span<const std::byte> manifest_bytes{
       data_.data() + manifest_offset, manifest_bytes_size};
-  if (crc32(manifest_bytes) != header.crc32) {
+  const std::span<const std::byte> schema_bytes{
+      data_.data() + schema_offset,
+      static_cast<std::size_t>(header.schema_bytes)};
+  if (crc32(schema_bytes, crc32(manifest_bytes)) != header.crc32) {
     throw std::runtime_error("manifest checksum mismatch");
   }
 
   manifest_.reserve(header.manifest_count);
+  std::size_t schema_at = 0;
   for (std::uint32_t i = 0; i < header.manifest_count; ++i) {
     ManifestEntry entry{};
     std::memcpy(&entry,
@@ -107,7 +126,25 @@ LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
     reg.period_ns = entry.period_ns;
     reg.offset_ns = entry.offset_ns;
     reg.armed = entry.armed != 0;
+
+    const std::size_t schema_size = std::size_t{entry.schema_name_bytes} +
+                                    std::size_t{entry.schema_bfbs_bytes};
+    if (schema_bytes.size() - schema_at < schema_size) {
+      throw std::runtime_error("LogReader: source " + std::to_string(i) +
+                               "'s schema runs past the schema block");
+    }
+    const char* schema =
+        reinterpret_cast<const char*>(schema_bytes.data()) + schema_at;
+    reg.schema.name.assign(schema, entry.schema_name_bytes);
+    reg.schema.hash = entry.schema_hash;
+    reg.schema.bfbs.assign(schema + entry.schema_name_bytes,
+                           entry.schema_bfbs_bytes);
+    schema_at += schema_size;
     manifest_.push_back(std::move(reg));
+  }
+  if (schema_at != schema_bytes.size()) {
+    throw std::runtime_error(
+        "LogReader: schema block longer than its manifest's schemas");
   }
 
   start_time_ = MonotonicTime::from_nanos(header.start_monotonic_ns);
@@ -116,7 +153,7 @@ LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
   session_id_ = header.session_id;
   process_name_ = read_name(header.process_name);
 
-  records_offset_ = manifest_offset + manifest_bytes_size;
+  records_offset_ = schema_offset + schema_bytes.size();
   cursor_ = records_offset_;
 }
 

@@ -18,7 +18,7 @@
 
 #include "flatbuffers/reflection_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
-#include "schema_test/shapes_descriptor.h"
+#include "schema_test/shapes_generated.h"
 #include "talOS/schema/descriptor.h"
 
 namespace {

@@ -16,6 +16,7 @@ namespace talos::node_api {
 
 void SetError(std::string message);
 void ClearError();
+const std::string& LastError();
 
 // Runs `body`, turning any exception into `failure` plus talos_last_error().
 template <class R, class F>
@@ -50,10 +51,15 @@ inline const char* NonNull(const char* text, const char* what) {
   return text;
 }
 
-// A callback's non-zero return becomes an exception on the C++ side; the
-// caller keeps the real error.
+// A callback's non-zero return becomes an exception on the C++ side. When
+// the callback failed because a talos_* call it made failed, that call's
+// error is the reason and is kept; otherwise the caller keeps the real
+// error.
 inline void Check(std::int32_t status, const char* what) {
-  if (status != 0) throw std::runtime_error(std::string{what} + " failed");
+  if (status == 0) return;
+  std::string message = std::string{what} + " failed";
+  if (!LastError().empty()) message += ": " + LastError();
+  throw std::runtime_error(message);
 }
 
 // The caller builds and owns its object; the framework holds nothing.

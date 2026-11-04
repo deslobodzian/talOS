@@ -19,7 +19,10 @@
 //   talos.Bytes                  a byte topic (Node::publish_bytes): opaque
 //   talos.hardware.Packet        talOS/hardware/packet.h, the gateway link
 //   talos.TargetEnvelope<NAME>   talOS/devices/target.h around struct NAME:
-//                                its bfbs is NAME's
+//                                a kEnvelopeHeaderBytes header (uint64
+//                                mode_since_us, uint8 active at
+//                                kEnvelopeActiveOffset, 7 zero bytes), then
+//                                NAME; its bfbs is NAME's
 //
 // Their hashes are FNV-1a 64 (the schema hash's function) of a canonical
 // text: "talos.Bytes", "talos.hardware.Packet <sizeof>", and
@@ -90,6 +93,8 @@ constexpr std::uint64_t fnv1a64_hex(std::uint64_t value, std::uint64_t hash) {
 inline constexpr std::string_view kBytesName = "talos.Bytes";
 inline constexpr std::string_view kPacketName = "talos.hardware.Packet";
 inline constexpr std::string_view kEnvelopePrefix = "talos.TargetEnvelope<";
+inline constexpr std::size_t kEnvelopeHeaderBytes = 16;
+inline constexpr std::size_t kEnvelopeActiveOffset = 8;
 
 constexpr std::uint64_t BytesHash() { return fnv1a64(kBytesName); }
 

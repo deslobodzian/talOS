@@ -60,7 +60,25 @@ Manifest MakeManifest() {
   sender.offset_ns = 0;
   manifest.push_back(sender);
 
+  // A struct topic with reflection bytes (any bytes: the log does not parse
+  // them) and a byte topic with none.
+  manifest[1].schema = {"log_test.Sample", 0x0123456789abcdefULL,
+                        std::string{"\x00\x01"
+                                    "bfbs\xff",
+                                    7}};
+  manifest[2].schema = schema::Bytes();
+
   return manifest;
+}
+
+// Where the first record begins in a log of MakeManifest().
+std::size_t RecordsOffset() {
+  std::size_t offset = sizeof(FileHeader);
+  for (const auto& reg : MakeManifest()) {
+    offset += sizeof(ManifestEntry) + reg.schema.name.size() +
+              reg.schema.bfbs.size();
+  }
+  return offset;
 }
 
 std::vector<std::byte> MakePayload(std::size_t size, int seed) {
@@ -193,6 +211,7 @@ TEST(LogRoundTrip, AllFieldsAndManifestMatch) {
   ASSERT_EQ(reader.manifest().size(), manifest.size());
   for (std::size_t i = 0; i < manifest.size(); ++i) {
     EXPECT_EQ(reader.manifest()[i], manifest[i]);
+    EXPECT_EQ(reader.manifest()[i].schema.bfbs, manifest[i].schema.bfbs);
   }
   EXPECT_EQ(reader.process_name(), "talos_log_test");
   EXPECT_EQ(reader.start_time(), MonotonicTime::from_nanos(42));
@@ -208,7 +227,7 @@ TEST(LogRoundTrip, AllFieldsAndManifestMatch) {
   EXPECT_EQ(index, expected.size());
   EXPECT_EQ(reader.record_count(), expected.size());
   EXPECT_FALSE(reader.truncated());
-  EXPECT_EQ(reader.format_version(), 4u);
+  EXPECT_EQ(reader.format_version(), 5u);
   EXPECT_EQ(reader.session_id(), 0u);
 
   ::unlink(path.c_str());
@@ -226,7 +245,7 @@ TEST(LogRoundTrip, SessionIdPreserved) {
   }
   LogReader reader{path};
   EXPECT_EQ(reader.session_id(), expected_session);
-  EXPECT_EQ(reader.format_version(), 4u);
+  EXPECT_EQ(reader.format_version(), 5u);
   ::unlink(path.c_str());
 }
 
@@ -323,8 +342,8 @@ TEST(LogPadding, TrailingZerosAreNotStoredButReadBack) {
     ASSERT_FALSE(writer.failed()) << writer.error();
   }
 
-  EXPECT_EQ(FileSize(path), sizeof(FileHeader) + 3 * sizeof(ManifestEntry) +
-                                3 * sizeof(RecordHeader) + 3 + 0 + kBytes);
+  EXPECT_EQ(FileSize(path),
+            RecordsOffset() + 3 * sizeof(RecordHeader) + 3 + 0 + kBytes);
 
   LogReader reader{path};
   LogReader::Record record;
@@ -360,7 +379,7 @@ TEST(LogPadding, StoredBytesBeyondThePayloadThrow) {
     ASSERT_FALSE(writer.failed()) << writer.error();
   }
 
-  const std::size_t offset = sizeof(FileHeader) + 3 * sizeof(ManifestEntry);
+  const std::size_t offset = RecordsOffset();
   std::fstream file{path, std::ios::in | std::ios::out | std::ios::binary};
   ASSERT_TRUE(file.is_open());
   RecordHeader header{};
@@ -396,7 +415,7 @@ TEST(LogCorruption, PayloadCrcMismatchThrows) {
   // (skipping the records that store no bytes at the start of the fixture) to
   // find the first record that actually has stored bytes to corrupt.
   ASSERT_FALSE(expected.empty());
-  std::size_t offset = sizeof(FileHeader) + 3 * sizeof(ManifestEntry);
+  std::size_t offset = RecordsOffset();
   std::size_t target_index = 0;
   for (; target_index < expected.size(); ++target_index) {
     if (StoredSize(expected[target_index].payload) != 0) {
@@ -472,6 +491,48 @@ TEST(LogFormatErrors, BadVersionThrows) {
   WriteFixture(path, LogWriter::kDefaultBufferBytes);
 
   FlipByte(path, offsetof(FileHeader, version));
+
+  EXPECT_THROW(LogReader{path}, std::runtime_error);
+
+  ::unlink(path.c_str());
+}
+
+// A log from before the schema block (format 4) is refused by name, not
+// misread as a truncated or corrupt version 5 file.
+TEST(LogFormatErrors, OlderFormatIsRefusedWithItsVersion) {
+  const std::string path = TempPath("old_version");
+  WriteFixture(path, LogWriter::kDefaultBufferBytes);
+  {
+    std::fstream file{path, std::ios::in | std::ios::out | std::ios::binary};
+    ASSERT_TRUE(file.is_open());
+    const std::uint32_t old_version = 4;
+    file.seekp(static_cast<std::streamoff>(offsetof(FileHeader, version)));
+    file.write(reinterpret_cast<const char*>(&old_version),
+               sizeof(old_version));
+  }
+  // Shorter than a v5 header too, as a real v4 log with no manifest is.
+  ASSERT_EQ(0, ::truncate(path.c_str(), 112));
+
+  try {
+    LogReader reader{path};
+    FAIL() << "a format 4 log was accepted";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(std::string{error.what()}.find(
+                  "format version 4 predates message schemas"),
+              std::string::npos)
+        << error.what();
+  }
+
+  ::unlink(path.c_str());
+}
+
+// The schema block is covered by the manifest checksum: a flipped schema
+// name byte would otherwise decode the log as the wrong type.
+TEST(LogCorruption, SchemaBlockCrcMismatchThrowsOnOpen) {
+  const std::string path = TempPath("schema_corrupt");
+  WriteFixture(path, LogWriter::kDefaultBufferBytes);
+
+  FlipByte(path, sizeof(FileHeader) + 3 * sizeof(ManifestEntry) + 2);
 
   EXPECT_THROW(LogReader{path}, std::runtime_error);
 

@@ -166,27 +166,28 @@ HardwareNode::EndpointAttributes() {
 
 introspect::Description HardwareNode::Describe() {
   BuildIntrospectionManifest();
-  return introspect::DescribeManifest(
-      kNodeName, kNodeTarget, introspection_manifest_, EndpointAttributes());
+  return introspect::DescribeManifest(kNodeName, kNodeTarget,
+                                      introspection_manifest_, MAX_SLOTS,
+                                      EndpointAttributes());
 }
 
 void HardwareNode::BuildIntrospectionManifest() {
   introspection_manifest_.clear();
 
-  const auto add = [this](event::SourceKind kind, std::string name,
-                          std::size_t bytes, std::size_t alignment) {
+  const auto add = [this]<class M>(event::SourceKind kind, std::string name) {
     const auto id = static_cast<std::uint16_t>(introspection_manifest_.size());
     introspection_manifest_.push_back({
         .id = id,
         .kind = kind,
         .name = std::move(name),
-        .message_bytes = static_cast<std::uint32_t>(bytes),
-        .alignment = static_cast<std::uint32_t>(alignment),
+        .message_bytes = static_cast<std::uint32_t>(sizeof(M)),
+        .alignment = static_cast<std::uint32_t>(alignof(M)),
+        .schema = schema::Of<M>(),
     });
     return static_cast<std::size_t>(id);
   };
   const auto add_packet = [&add](event::SourceKind kind, std::string name) {
-    return add(kind, std::move(name), sizeof(Packet), alignof(Packet));
+    return add.template operator()<Packet>(kind, std::move(name));
   };
 
   // The fixed ends first, then one request per subsystem, so the fixed ids
@@ -194,8 +195,8 @@ void HardwareNode::BuildIntrospectionManifest() {
   add_packet(event::SourceKind::SENDER, kStateTopic);
   add_packet(event::SourceKind::SENDER, kCommandTopic);
   add_packet(event::SourceKind::SENDER, kDriverStationTopic);
-  add(event::SourceKind::SENDER, bridge::topics::kStatus,
-      sizeof(bridge::BridgeStatus), alignof(bridge::BridgeStatus));
+  add.template operator()<bridge::BridgeStatus>(event::SourceKind::SENDER,
+                                                bridge::topics::kStatus);
 
   for (auto& [name, tracker] : subsystems_) {
     tracker.source_index =

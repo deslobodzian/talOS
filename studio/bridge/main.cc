@@ -295,7 +295,7 @@ int main(int argc, char** argv) try {
   }
   close(existing);
   RTMSQueue queue(topic, talos::telemetry_wire::slot_bytes, 8,
-                  talos::telemetry_wire::slot_count,
+                  talos::schema::Bytes(), talos::telemetry_wire::slot_count,
                   {OverflowPolicy::DROP_NEWEST, ReadMode::SEQUENCE});
   auto reader = queue.register_reader();
   if (!reader) throw std::runtime_error("RTMS reader slots exhausted");

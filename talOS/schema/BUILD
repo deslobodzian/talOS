@@ -20,6 +20,29 @@ cc_library(
     deps = [":descriptor"],
 )
 
+# talos::schema::DecodeToText: a payload as named fields from its Identity's
+# .bfbs (flatbuffers/reflection.h), for log_dump.
+cc_library(
+    name = "decode",
+    srcs = ["decode.cc"],
+    hdrs = ["decode.h"],
+    deps = [
+        ":identity",
+        "@flatbuffers//:runtime_cc",
+    ],
+)
+
+cc_test(
+    name = "decode_test",
+    size = "small",
+    srcs = ["decode_test.cc"],
+    deps = [
+        ":decode",
+        ":test_messages",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # The METHODOLOGY §6 unit suffixes the field-name lint checks against.
 cc_library(
     name = "unit_suffix",

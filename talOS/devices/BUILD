@@ -1,5 +1,6 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//talOS/build:contract.bzl", "talos_messages")
 
 # Robot hardware for talos::Node: Motor, CANcoder, Gyro, digital/analog I/O,
 # encoders and PWM through the bridge, attached as a Node extension, the
@@ -57,12 +58,20 @@ cc_test(
     ],
 )
 
+talos_messages(
+    name = "target_test_message",
+    srcs = ["target_test_message.fbs"],
+    include_prefix = "target_test",
+    visibility = ["//visibility:private"],
+)
+
 cc_test(
     name = "target_test",
     size = "small",
     srcs = ["target_test.cc"],
     deps = [
         ":devices",
+        ":target_test_message",
         ":testing",
         "//talOS/driver_station",
         "//talOS/node:testing",

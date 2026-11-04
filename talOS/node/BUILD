@@ -91,6 +91,7 @@ cc_test(
         ":testing",
         "//talOS/configuration",
         "//talOS/events",
+        "//talOS/introspection:describe",
         "//talOS/memory:shared_memory",
         "//talOS/rtms",
         "@googletest//:gtest_main",

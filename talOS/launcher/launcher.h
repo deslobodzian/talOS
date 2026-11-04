@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "talOS/configuration/config_parser.h"
+#include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
@@ -1328,16 +1329,21 @@ class Launcher {
 struct MergedRecord {
   std::string process_name;
   std::string source_name;
+  // The record's source in its log's manifest, schema included (format.h);
+  // null for an EXIT record or an id the manifest lacks.
+  std::shared_ptr<const event::Registration> source;
   event::log::RecordHeader header;
   std::vector<std::byte> payload;
 };
 
-inline std::string ResolveSourceName(const event::Manifest& manifest,
-                                     std::uint16_t source_id) {
-  for (const auto& reg : manifest) {
-    if (reg.id == source_id) return reg.name;
+// `source_id`'s entry in `manifest`, sharing its ownership; null if none.
+inline std::shared_ptr<const event::Registration> ResolveSource(
+    const std::shared_ptr<const event::Manifest>& manifest,
+    std::uint16_t source_id) {
+  for (const auto& reg : *manifest) {
+    if (reg.id == source_id) return {manifest, &reg};
   }
-  return "?";
+  return nullptr;
 }
 
 // A session directory's event logs (every `*.tlog` in it, which is where the
@@ -1369,6 +1375,7 @@ inline bool MergeLogs(const std::vector<std::string>& log_paths,
 
   struct ReaderState {
     std::unique_ptr<event::log::LogReader> reader;
+    std::shared_ptr<const event::Manifest> manifest;
     event::log::LogReader::Record current;
     bool has_record{false};
   };
@@ -1390,6 +1397,8 @@ inline bool MergeLogs(const std::vector<std::string>& log_paths,
               std::to_string(states.front().reader->session_id());
       return false;
     }
+    state.manifest =
+        std::make_shared<const event::Manifest>(state.reader->manifest());
     state.has_record = state.reader->next(state.current);
     states.push_back(std::move(state));
   }
@@ -1410,8 +1419,12 @@ inline bool MergeLogs(const std::vector<std::string>& log_paths,
 
     MergedRecord record;
     record.process_name = best->reader->process_name();
-    record.source_name = ResolveSourceName(best->reader->manifest(),
-                                           best->current.header.source_id);
+    if (best->current.header.kind !=
+        static_cast<std::uint16_t>(event::EventKind::EXIT)) {
+      record.source =
+          ResolveSource(best->manifest, best->current.header.source_id);
+    }
+    record.source_name = record.source ? record.source->name : "?";
     record.header = best->current.header;
     record.payload.assign(best->current.payload.begin(),
                           best->current.payload.end());

@@ -88,14 +88,16 @@ struct Descriptor<TargetEnvelope<M>> {
 };
 
 namespace detail {
-inline constexpr std::size_t kTargetEnvelopeHeaderBytes = 16;
+// The layout talOS/schema/identity.h documents for log_dump.
+inline constexpr std::size_t kTargetEnvelopeHeaderBytes =
+    schema::kEnvelopeHeaderBytes;
 // What TargetAccess assumes of the envelope, checked by Target and
 // TargetLane for each M.
 template <Message M>
 inline constexpr bool kTargetEnvelopeLayout =
     sizeof(TargetEnvelope<M>) == kTargetEnvelopeHeaderBytes + sizeof(M) &&
     alignof(TargetEnvelope<M>) == alignof(M) &&
-    offsetof(TargetEnvelope<M>, active) == 8 &&
+    offsetof(TargetEnvelope<M>, active) == schema::kEnvelopeActiveOffset &&
     offsetof(TargetEnvelope<M>, message) == kTargetEnvelopeHeaderBytes;
 }  // namespace detail
 

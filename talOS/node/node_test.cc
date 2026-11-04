@@ -22,6 +22,7 @@
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/realtime_event_loop.h"
 #include "talOS/events/simulated_event_loop.h"
+#include "talOS/introspection/describe.h"
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/node/internal.h"
 #include "talOS/node/testing.h"
@@ -545,19 +546,28 @@ TEST(Binary, DescribeListsEveryEndpointIncludingOptionalOnes) {
   EXPECT_NE(result.output.find(R"("target": "//talOS/node:test_node")"),
             std::string::npos)
       << result.output;
+  // Every topic endpoint names its schema; a timer has none.
+  const std::string count_schema =
+      R"("schema": "node_test.Count", "schema_hash": ")" +
+      introspect::HexHash(Descriptor<Count>::kHash) +
+      R"(", "alignment": 8, "slots": 1024})";
   EXPECT_NE(
       result.output.find(
-          R"({"kind": "WATCHER", "name": "/test_node/target", "message_bytes": 16, "external": false, "optional": true})"),
+          R"({"kind": "WATCHER", "name": "/test_node/target", "message_bytes": 16, "external": false, "optional": true, )" +
+          count_schema),
       std::string::npos)
       << result.output;
   EXPECT_NE(
       result.output.find(
-          R"({"kind": "SENDER", "name": "/test_node/state", "message_bytes": 16, "external": false, "optional": false})"),
+          R"({"kind": "SENDER", "name": "/test_node/state", "message_bytes": 16, "external": false, "optional": false, )" +
+          count_schema),
       std::string::npos)
       << result.output;
   EXPECT_NE(
       result.output.find(
-          R"({"kind": "SENDER", "name": "/test_node/frames", "message_bytes": 64, "external": true, "optional": false})"),
+          R"({"kind": "SENDER", "name": "/test_node/frames", "message_bytes": 64, "external": true, "optional": false, "schema": "talos.Bytes", "schema_hash": ")" +
+          introspect::HexHash(schema::BytesHash()) +
+          R"(", "alignment": 8, "slots": 16})"),
       std::string::npos)
       << result.output;
   EXPECT_NE(result.output.find(R"({"kind": "TIMER", "name": "test_node")"),
@@ -613,7 +623,7 @@ TEST(BytePublisher, OpensRtmsOnFirstSendAndDropsNewestWhenFull) {
   ASSERT_TRUE(ShmSegmentExists(topic));
 
   RTMSQueue reader_queue{
-      topic, 64, kMessageAlignment, 4,
+      topic, 64, kMessageAlignment, schema::Bytes(), 4,
       RTMSOptions{.overflow_policy = OverflowPolicy::DROP_NEWEST,
                   .read_mode = ReadMode::SEQUENCE}};
   const auto reader = reader_queue.register_reader();

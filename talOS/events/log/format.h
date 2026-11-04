@@ -13,21 +13,31 @@
 
 // On-disk layout of a talOS dispatch log.
 //
-//   [FileHeader][ManifestEntry * manifest_count][Record ...]
+//   [FileHeader][ManifestEntry * manifest_count][schema block][Record ...]
 //
-// where a Record is a RecordHeader followed by stored_bytes of message bytes.
+// The schema block carries each manifest entry's topic schema
+// (talOS/schema/identity.h), in manifest order: its schema_name_bytes of
+// name, then its schema_bfbs_bytes of reflection.Schema bytes (none for a
+// timer, a byte topic or the hardware packet). So a log decodes to named
+// fields without the build that wrote it, and replay compares schema
+// identities, not just sizes.
+//
+// A Record is a RecordHeader followed by stored_bytes of message bytes.
 // A payload is stored without its trailing zero bytes, which for fixed-size
 // messages is mostly padding; readers zero-fill it back to payload_bytes, so
 // what they hand out is byte-identical to what was recorded.
-// Everything is fixed-size and little-endian, so the file can be mapped and
-// walked without a parser, and a truncated tail costs at most one record.
+// Everything but the schema block is fixed-size and little-endian, so the
+// records can be walked without a parser, and a truncated tail costs at most
+// one record.
 //
 // The format is versioned and never rewritten in place. Readers must reject a
 // version they do not know rather than guessing.
 namespace talos::event::log {
 
 inline constexpr char FILE_MAGIC[8] = {'T', 'A', 'L', 'O', 'S', 'L', 'O', 'G'};
-inline constexpr std::uint32_t FORMAT_VERSION = 4;
+// 5: the schema block, ManifestEntry's schema fields and
+// FileHeader::schema_bytes.
+inline constexpr std::uint32_t FORMAT_VERSION = 5;
 
 // Marks the start of every record so a damaged log can be resynchronised.
 inline constexpr std::uint32_t RECORD_MAGIC = 0x54524543;  // "TREC"
@@ -42,8 +52,9 @@ struct FileHeader {
   std::int64_t start_monotonic_ns;  // loop start on the recording timeline
   std::int64_t start_wall_ns;       // informational only, ignored by replay
   std::uint32_t manifest_count;
-  std::uint32_t crc32;  // over the manifest block only
+  std::uint32_t crc32;  // over the manifest block, then the schema block
   char process_name[64];
+  std::uint64_t schema_bytes;  // size of the schema block
 };
 
 struct ManifestEntry {
@@ -55,6 +66,9 @@ struct ManifestEntry {
   std::int64_t period_ns;
   std::int64_t offset_ns;
   char name[64];
+  std::uint64_t schema_hash;
+  std::uint32_t schema_name_bytes;
+  std::uint32_t schema_bfbs_bytes;
 };
 
 struct RecordHeader {
@@ -73,8 +87,8 @@ struct RecordHeader {
 
 #pragma pack(pop)
 
-static_assert(sizeof(FileHeader) == 112);
-static_assert(sizeof(ManifestEntry) == 96);
+static_assert(sizeof(FileHeader) == 120);
+static_assert(sizeof(ManifestEntry) == 112);
 static_assert(sizeof(RecordHeader) == 56);
 
 // CRC-32 (IEEE 802.3, reflected) computed with a small runtime table. Logs are

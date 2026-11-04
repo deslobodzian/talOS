@@ -22,7 +22,6 @@
 #include "odometry/topics.h"
 #include "shooter/shooter_message_generated.h"
 #include "shooter/topics.h"
-#include "talOS/configuration/config_parser.h"
 #include "talOS/devices/devices.h"
 #include "talOS/node/node.h"
 #include "talOS/telemetry/telemetry_generated.h"
@@ -120,7 +119,7 @@ class Telemetry {
                                    {.slots = telemetry_wire::slot_count,
                                     .drop_newest = true,
                                     .external = true})} {
-    BuildDictionary(node);
+    BuildDictionary();
     dictionary_id_ = DictionaryId(dictionary_);
     stream_id_ = RandomStreamId();
     values_.assign(dictionary_.size(),
@@ -293,7 +292,7 @@ class Telemetry {
     return dictionary_.size() - 1;
   }
 
-  void BuildDictionary(Node& node) {
+  void BuildDictionary() {
     idx_pose_valid_ = AddChannel("pose/valid");
     idx_odometry_stale_ = AddChannel("odometry/stale");
     idx_drivetrain_stale_ = AddChannel("drivetrain/stale");

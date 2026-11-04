@@ -12,7 +12,6 @@ cc_library(
         "//2026-robot/main_processor/drivetrain:messages",
         "//2026-robot/main_processor/intake:messages",
         "//2026-robot/main_processor/shooter:messages",
-        "//talOS/configuration",
         "//talOS/devices",
         "//talOS/node",
     ],

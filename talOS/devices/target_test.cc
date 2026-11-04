@@ -16,6 +16,7 @@
 #include "talOS/node/access.h"
 #include "talOS/node/sim_access.h"
 #include "talOS/node/testing.h"
+#include "target_test/target_test_message_generated.h"
 
 namespace talos {
 namespace {
@@ -30,13 +31,10 @@ using testing::Sim;
 using testing::SimHardware;
 namespace ds = driver_station;
 
-// A double-aligned message and a 4-byte one, so both alignments run.
-struct Goal {
-  double position_rot;
-};
-struct Small {
-  float speed_rps;
-};
+// A double-aligned message and a 4-byte one, so both alignments run
+// (target_test_message.fbs).
+using target_test::Goal;
+using target_test::Small;
 static_assert(sizeof(TargetEnvelope<Goal>) == 24);
 static_assert(sizeof(TargetEnvelope<Small>) == 20);
 
@@ -105,7 +103,7 @@ class TargetTest : public ::testing::Test {
     sim.step(4ms);
   }
   std::optional<double> Seen() const {
-    return lift.seen ? std::optional{lift.seen->position_rot} : std::nullopt;
+    return lift.seen ? std::optional{lift.seen->position_rot()} : std::nullopt;
   }
 
   Sim sim = Sim::FromToml(kRobotToml);
@@ -303,7 +301,7 @@ TEST(TargetPolicy, SubsystemTargetsReplaceTheListedModes) {
   PublishTarget(sim, "wrist", "driver", Small{2.5f});
   sim.step(5ms);
   ASSERT_TRUE(wrist.seen.has_value());
-  EXPECT_FLOAT_EQ(wrist.seen->speed_rps, 2.5f);
+  EXPECT_FLOAT_EQ(wrist.seen->speed_rps(), 2.5f);
 
   // Test mode opted in; autonomous kept the robot default.
   hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTest));
@@ -353,7 +351,7 @@ TEST(TargetPolicy, RemapRedirectsOneLane) {
   PublishTarget(sim, "left_lift", "teleop", Goal{2.0});
   sim.step(5ms);
   ASSERT_TRUE(lift.seen.has_value());
-  EXPECT_EQ(lift.seen->position_rot, 2.0);
+  EXPECT_EQ(lift.seen->position_rot(), 2.0);
   EXPECT_EQ(lift.source, "teleop");
   // Still the second priority: align, not remapped, preempts it.
   PublishTarget(sim, "lift", "align", Goal{3.0});
@@ -443,16 +441,16 @@ TEST(TargetLane, SendsAndReleasesTheEnvelope) {
   auto envelope = LatestTarget<Goal>(sim, "lift", "teleop");
   ASSERT_TRUE(envelope.has_value());
   EXPECT_EQ(envelope->active, 1);
-  EXPECT_EQ(envelope->message.position_rot, 0.75);
+  EXPECT_EQ(envelope->message.position_rot(), 0.75);
   ASSERT_TRUE(lift.seen.has_value());
-  EXPECT_EQ(lift.seen->position_rot, 0.75);
+  EXPECT_EQ(lift.seen->position_rot(), 0.75);
 
   producer.talking = false;
   sim.step(10ms);
   envelope = LatestTarget<Goal>(sim, "lift", "teleop");
   ASSERT_TRUE(envelope.has_value());
   EXPECT_EQ(envelope->active, 0);
-  EXPECT_EQ(envelope->message.position_rot, 0.0);
+  EXPECT_EQ(envelope->message.position_rot(), 0.0);
   EXPECT_EQ(lift.seen, std::nullopt);
 }
 
@@ -481,7 +479,7 @@ TEST(TargetLane, StampsTheGenerationItsNodeDrained) {
   EXPECT_NE(second, first);
   EXPECT_EQ(LatestTarget<Goal>(sim, "lift", "teleop")->mode_since_us(), second);
   ASSERT_TRUE(lift.seen.has_value());
-  EXPECT_EQ(lift.seen->position_rot, 0.75);
+  EXPECT_EQ(lift.seen->position_rot(), 0.75);
 }
 
 // A producer with its own lane, for the remapped config.
@@ -537,7 +535,7 @@ TEST(TargetEnvelope, IsTheHeaderThenTheMessage) {
                                std::as_writable_bytes(std::span{&envelope, 1}));
   EXPECT_EQ(envelope.mode_since_us(), 0x0102030405060708u);
   EXPECT_EQ(envelope.active, 1);
-  EXPECT_EQ(envelope.message.speed_rps, 1.5f);
+  EXPECT_EQ(envelope.message.speed_rps(), 1.5f);
   const auto header = detail::DecodeTargetEnvelopeHeader(
       std::as_bytes(std::span{&envelope, 1}).data());
   EXPECT_EQ(header.mode_since_us, 0x0102030405060708u);

@@ -152,6 +152,7 @@ std::optional<detail::ParamValue> FindParam(const Node& node,
 
 void SetError(std::string message) { g_last_error = std::move(message); }
 void ClearError() { g_last_error.clear(); }
+const std::string& LastError() { return g_last_error; }
 
 }  // namespace talos::node_api
 

@@ -247,6 +247,7 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
 
   std::vector<ManifestEntry> entries;
   entries.reserve(manifest.size());
+  std::vector<std::byte> schemas;
   for (const auto& reg : manifest) {
     ManifestEntry entry{};
     entry.id = reg.id;
@@ -257,7 +258,14 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
     entry.period_ns = reg.period_ns;
     entry.offset_ns = reg.offset_ns;
     write_name(entry.name, reg.name);
+    entry.schema_hash = reg.schema.hash;
+    entry.schema_name_bytes = static_cast<std::uint32_t>(reg.schema.name.size());
+    entry.schema_bfbs_bytes = static_cast<std::uint32_t>(reg.schema.bfbs.size());
     entries.push_back(entry);
+    const auto name = std::as_bytes(std::span{reg.schema.name});
+    const auto bfbs = std::as_bytes(std::span{reg.schema.bfbs});
+    schemas.insert(schemas.end(), name.begin(), name.end());
+    schemas.insert(schemas.end(), bfbs.begin(), bfbs.end());
   }
 
   const std::span<const std::byte> manifest_bytes =
@@ -274,7 +282,8 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
           std::chrono::system_clock::now().time_since_epoch())
           .count();
   header.manifest_count = static_cast<std::uint32_t>(entries.size());
-  header.crc32 = crc32(manifest_bytes);
+  header.crc32 = crc32(schemas, crc32(manifest_bytes));
+  header.schema_bytes = schemas.size();
   write_name(header.process_name, state.process_name);
 
   // Written inline, before the writer thread exists, so the header can never
@@ -282,6 +291,9 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
   state.write_all(&header, sizeof(header));
   if (!manifest_bytes.empty()) {
     state.write_all(manifest_bytes.data(), manifest_bytes.size());
+  }
+  if (!schemas.empty()) {
+    state.write_all(schemas.data(), schemas.size());
   }
 
   if (!state.options.background || state.writer.joinable()) {

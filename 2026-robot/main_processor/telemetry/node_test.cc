@@ -420,105 +420,6 @@ TEST_F(TelemetryTest, WorstCaseValueFrameFitsTheBudget) {
   EXPECT_GT(value_bytes, 0u);
 }
 
-TEST(Telemetry, PublishesTomlConfiguredSubsystemStateChannels) {
-  Sim sim = Sim::FromToml(R"(
-[robot]
-period_us = 5000
-command_timeout_us = 100000
-
-[subsystems.telemetry]
-period_us = 10000
-topic = "/talos/telemetry"
-stale_timeout_us = 100000
-
-[subsystems.wrist]
-period_us = 20000
-teleop_button = 3
-teleop_demand = 25.0
-telemetry = true
-
-[subsystems.wrist.motors.wrist_motor]
-can_id = 1
-)");
-  Telemetry& telemetry = sim.add<Telemetry>("telemetry");
-
-  sim.publish("/wrist/state", GenericState{1, {}, 25.0, 1, {}});
-  sim.step(10ms);  // one tick: the latest frame is the dictionary frame
-
-  const auto latest = sim.latest_bytes("/talos/telemetry");
-  ASSERT_TRUE(latest.has_value());
-  const std::vector<std::byte> latest_value =
-      latest.value_or(std::vector<std::byte>{});
-  const Frame* frame =
-      Talos::Telemetry::GetSizePrefixedFrame(latest_value.data());
-  ASSERT_NE(frame, nullptr);
-  ASSERT_NE(frame->dictionary(), nullptr);
-  ASSERT_NE(frame->values(), nullptr);
-
-  std::map<std::string, double> channels;
-  std::map<std::string, std::string> units;
-  ASSERT_EQ(frame->dictionary()->size(), frame->values()->size());
-  for (std::size_t i = 0; i < frame->dictionary()->size(); ++i) {
-    const auto* info = frame->dictionary()->Get(i);
-    const double value = frame->values()->Get(i);
-    if (info->unit() != nullptr) {
-      units[info->name()->str()] = info->unit()->str();
-    }
-    if (!std::isnan(value)) channels[info->name()->str()] = value;
-  }
-  EXPECT_NEAR(channels.at("wrist/value"), 25.0, 1e-12);
-  EXPECT_EQ(units.at("wrist/value"), "rev/s");
-  EXPECT_NEAR(channels.at("wrist/connected"), 1.0, 1e-12);
-  EXPECT_NEAR(channels.at("wrist/stale"), 0.0, 1e-12);
-  EXPECT_NEAR(channels.at("mechanism/stale"), 0.0, 1e-12);
-  EXPECT_EQ(telemetry.dictionary().size(), frame->dictionary()->size());
-
-  sim.step(150ms);
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
-  sim.step(20ms);
-
-  const auto stale_bytes = sim.latest_bytes("/talos/telemetry");
-  ASSERT_TRUE(stale_bytes.has_value());
-  const std::vector<std::byte> stale_value =
-      stale_bytes.value_or(std::vector<std::byte>{});
-  const Frame* stale_frame =
-      Talos::Telemetry::GetSizePrefixedFrame(stale_value.data());
-  ASSERT_NE(stale_frame, nullptr);
-  std::map<std::string, double> stale_channels;
-  const auto& dictionary = telemetry.dictionary();
-  for (std::size_t i = 0; i < dictionary.size(); ++i) {
-    const double value = stale_frame->values()->Get(i);
-    if (!std::isnan(value)) stale_channels[dictionary[i].name] = value;
-  }
-  EXPECT_EQ(stale_channels.count("wrist/value"), 0u);
-  EXPECT_NEAR(stale_channels.at("wrist/stale"), 1.0, 1e-12);
-  EXPECT_NEAR(stale_channels.at("mechanism/stale"), 1.0, 1e-12);
-}
-
-// Channel names are the keys of /telemetry.json and Studio's decoder. A
-// TOML subsystem named after a fixed channel group would emit a second
-// "bridge/stale" and hide one of them, so the dictionary refuses it.
-TEST(Telemetry, RefusesAConfiguredSubsystemThatDuplicatesAChannel) {
-  Sim sim = Sim::FromToml(R"(
-[robot]
-period_us = 5000
-command_timeout_us = 100000
-
-[subsystems.telemetry]
-period_us = 10000
-topic = "/talos/telemetry"
-stale_timeout_us = 100000
-
-[subsystems.bridge]
-period_us = 20000
-telemetry = true
-
-[subsystems.bridge.motors.bridge_motor]
-can_id = 1
-)");
-  EXPECT_THROW(sim.add<Telemetry>("telemetry"), std::invalid_argument);
-}
-
 // The Studio feed bypasses the loop, so --describe must still declare it.
 TEST(Binary, DescribeDeclaresTheStudioFeedAsAnExternalSender) {
   const std::string command = "'" + Runfile("TALOS_TEST_NODE") +
@@ -537,7 +438,7 @@ TEST(Binary, DescribeDeclaresTheStudioFeedAsAnExternalSender) {
       output.find(
           R"({"kind": "SENDER", "name": "/talos/telemetry", "message_bytes": )" +
           std::to_string(telemetry_wire::slot_bytes) +
-          R"(, "external": true, "optional": false})"),
+          R"(, "external": true, "optional": false, "schema": "talos.Bytes")"),
       std::string::npos)
       << output;
   for (const char* watched :
