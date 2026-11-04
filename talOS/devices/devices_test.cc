@@ -13,6 +13,8 @@
 #include <string>
 #include <string_view>
 
+#include "bridge/bridge_status_generated.h"
+#include "bridge/topics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/testing.h"
 #include "talOS/driver_station/driver_station.h"
@@ -340,6 +342,120 @@ TEST(Devices, AcceptStateRejectsAnotherConfigAndStaleSamples) {
   sim.publish(hardware::kStateTopic, StatePacket(id, 2000, false));
   sim.step(2ms);
   EXPECT_FALSE(robot_enabled(node));
+}
+
+// The bridge's clock mapping as /hw/status carries it, for gateway boot
+// `boot_id`.
+::bridge::BridgeStatus ClockStatus(std::uint64_t boot_id,
+                                   std::int64_t offset_us, bool valid) {
+  ::bridge::BridgeStatus status{};
+  status.mutate_clock_boot_id(boot_id);
+  status.mutate_clock_offset_us(offset_us);
+  status.mutate_clock_offset_valid(valid);
+  return status;
+}
+
+// sample_time() is the latched state's sample_time_us plus the offset the
+// bridge published for that state's gateway boot, and nothing when the
+// bridge has no valid mapping for it.
+TEST(Devices, SampleTimeMapsTheStateThroughTheBridgesOffset) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Watcher>("watcher");
+  Node& node = sim.node("watcher");
+  const auto& link = node.extension<HardwareLink>();
+  const std::uint64_t id = hardware::ConfigurationId(link.config().hardware);
+
+  // A valid mapping but no state yet.
+  sim.publish(::bridge::topics::kStatus, ClockStatus(7, 4'000'000, true));
+  sim.step(2ms);
+  EXPECT_EQ(link.sample_time(), std::nullopt);
+
+  // StatePacket is boot 7. The gateway sampled at its 1000 us; the bridge's
+  // clock read 4 s more.
+  sim.publish(hardware::kStateTopic, StatePacket(id, 1000, false));
+  sim.step(2ms);
+  ASSERT_TRUE(link.fresh());
+  EXPECT_FALSE(robot_enabled(node));
+  EXPECT_EQ(link.sample_time(), Time::from_nanos(4'001'000'000));
+
+  // A mapping for another gateway boot, as after a reboot the bridge has
+  // not yet reported on, maps nothing.
+  sim.publish(::bridge::topics::kStatus, ClockStatus(6, 4'000'000, true));
+  sim.step(2ms);
+  EXPECT_EQ(link.sample_time(), std::nullopt);
+
+  // Nor does one that has not converged.
+  sim.publish(::bridge::topics::kStatus, ClockStatus(7, 4'000'000, false));
+  sim.step(2ms);
+  EXPECT_EQ(link.sample_time(), std::nullopt);
+
+  // A negative offset (the gateway clock ahead) maps too.
+  sim.publish(::bridge::topics::kStatus, ClockStatus(7, -500, true));
+  sim.publish(hardware::kStateTopic, StatePacket(id, 2000, true));
+  sim.step(2ms);
+  EXPECT_EQ(link.sample_time(), Time::from_nanos(1'500'000));
+
+  // A state older than [robot] command_timeout_us maps nothing.
+  sim.step(110ms);
+  ASSERT_FALSE(link.fresh());
+  EXPECT_EQ(link.sample_time(), std::nullopt);
+}
+
+// SimHardware runs the bridge's filter: no sample time until it converges,
+// then the sim time each state was sampled at, whatever the gateway's own
+// clock reads, enabled or not, until the hardware goes quiet.
+TEST(Devices, SimHardwareSampleTimeConvergesFollowsLatencyAndGoesStale) {
+  auto sim = Sim::FromToml(kRobotToml);  // [robot] period_us = 5000
+  sim.add<Watcher>("watcher");
+  const auto& link = sim.node("watcher").extension<HardwareLink>();
+  auto hw = std::make_unique<SimHardware>(sim);
+  // The RoboRIO's clock is 1.25 s ahead of sim time.
+  hw->set_gateway_clock(1250ms, 0ms);
+
+  // At most 7 states (0, 5, ..., 30 ms) by 30 ms: not converged.
+  sim.step(30ms);
+  ASSERT_TRUE(link.fresh());
+  EXPECT_EQ(link.sample_time(), std::nullopt);
+
+  // The 8th state went out at 35 ms.
+  sim.step(15ms);
+  EXPECT_FALSE(robot_enabled(sim.node("watcher")));
+  const std::optional<Time> sampled = link.sample_time();
+  ASSERT_TRUE(sampled.has_value());
+  const Time now = sim.now();
+  EXPECT_LE(*sampled, now);
+  EXPECT_LE(now - *sampled, 10ms);  // the node drains before its 5 ms tick
+  // A publication time: a multiple of the period in sim time, not the
+  // gateway's clock 1.25 s off it.
+  EXPECT_EQ(sampled->nanos() % 5'000'000, 0);
+
+  // States now leave 2 ms after they are sampled. The filter keeps the
+  // shorter delay it has seen, so each maps to its true sample time.
+  hw->set_gateway_clock(1250ms, 2ms);
+  sim.step(20ms);
+  const std::optional<Time> delayed = link.sample_time();
+  ASSERT_TRUE(delayed.has_value());
+  EXPECT_EQ(delayed->nanos() % 5'000'000, 3'000'000);
+  EXPECT_LE(sim.now() - *delayed, 12ms);
+
+  hw->enable();
+  sim.step(10ms);
+  EXPECT_TRUE(robot_enabled(sim.node("watcher")));
+  EXPECT_TRUE(link.sample_time().has_value());
+
+  hw.reset();  // the bridge goes silent
+  sim.step(150ms);
+  EXPECT_FALSE(link.fresh());
+  EXPECT_EQ(link.sample_time(), std::nullopt);
+}
+
+TEST(Devices, SimHardwareRejectsAGatewayClockBeforeZero) {
+  auto sim = Sim::FromToml(kRobotToml);
+  SimHardware hw{sim};
+  EXPECT_THROW(hw.set_gateway_clock(0ms, -1ms), std::invalid_argument);
+  EXPECT_THROW(hw.set_gateway_clock(1ms, 2ms), std::invalid_argument);
+  sim.step(10ms);
+  EXPECT_NO_THROW(hw.set_gateway_clock(0ms, 2ms));
 }
 
 // A read finds its device wherever the newest state put it, including after

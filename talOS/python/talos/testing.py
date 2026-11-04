@@ -152,7 +152,11 @@ class Sim:
 
 class SimHardware:
     """Plays the bridge for a Sim: publishes /hw/state every robot period
-    (configured; enabled after enable()) and records each node's requests."""
+    (configured; enabled after enable()) and records each node's requests.
+    It also publishes /hw/status with the bridge's own gateway clock filter,
+    so talos.hardware_sample_time_ns(node) is None until the 8th state, then
+    each state's sim sample time plus the smallest latency the filter has
+    seen (its publication time while the latency is constant)."""
 
     def __init__(self, sim):
         self._sim = sim  # outlives this
@@ -191,6 +195,12 @@ class SimHardware:
 
     def set_gyro(self, node, device, yaw, yaw_rate):
         self._set(lib.talos_sim_hardware_set_gyro, node, device, yaw, yaw_rate)
+
+    def set_gateway_clock(self, offset=0.0, latency=0.0):
+        """From now on the gateway clock reads sim time + `offset` seconds,
+        and each state is sampled `latency` seconds before it goes out."""
+        _abi.ok(lib.talos_sim_hardware_set_gateway_clock(
+            self._handle, round(offset * _NS), round(latency * _NS)))
 
     def set_connected(self, node, device, connected):
         """A disconnected device reports connected False (a motor's sample

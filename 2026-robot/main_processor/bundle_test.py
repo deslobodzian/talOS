@@ -1,4 +1,8 @@
-"""Relocated bundles describe their graph and keep their config identity."""
+"""Relocated bundles describe their graph and keep their config identity.
+
+--describe runs every node binary, so a C++ node that cannot load a shared
+library it links (libwpimath from lib/) or a Python node that cannot import
+its wheels fails here."""
 
 import json
 import os
@@ -11,6 +15,8 @@ import unittest
 from python.runfiles import runfiles
 
 BUNDLES = ("robot_bundle", "relocation_bundle")
+# The 2026 drivetrain links wpimath (//third_party/wpilib:wpimath).
+SHARED_LIBS = {"robot_bundle": ("libwpimath", "libwpiutil")}
 
 
 def describe(bundle, where):
@@ -42,6 +48,14 @@ class BundleTest(unittest.TestCase):
                 self.assertNotIn("error:", proc.stdout.lower())
                 self.assertNotIn("not described", proc.stdout)
                 self.assertIsNotNone(graph, out)
+                for node in graph["nodes"]:
+                    self.assertTrue(node.get("described"),
+                                    f"{node.get('name')}: {node.get('describe_error')}\n{out}")
+                libs = os.listdir(os.path.join(src, "lib")) if os.path.isdir(
+                    os.path.join(src, "lib")) else []
+                for lib in SHARED_LIBS.get(name, ()):
+                    self.assertTrue(
+                        any(f.startswith(lib + ".") for f in libs), (lib, libs))
                 # The copy keeps the identity the bundle was built with.
                 self.assertTrue(manifest["config_sha256"])
                 self.assertEqual(graph["config_sha256"],

@@ -30,11 +30,13 @@
 // Incoming states pass hardware::AcceptState for this config's id and are
 // latched with their receive time; getters read the latched state (0 before
 // the first one), while connected() requires both a valid sample and a
-// hardware state younger than [robot] command_timeout_us.
+// hardware state younger than [robot] command_timeout_us. The link also
+// watches the bridge's /hw/status for the clock mapping sample_time() uses.
 
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string_view>
 
 #include "talOS/devices/access.h"
@@ -64,6 +66,15 @@ class HardwareLink {
   bool fresh() const;
   // Age of the last accepted hardware state (Duration::max() if none).
   Duration age() const;
+  // Node-clock time at which the gateway sampled the latest accepted
+  // hardware state: its sample_time_us mapped through the bridge's clock
+  // offset on /hw/status (talOS/bridge/clock_offset.h). nullopt before any
+  // state, while that state is not fresh(), and until the bridge's mapping
+  // for the state's gateway boot has converged. Independent of enabled().
+  // Later than the true sample time by the link's smallest latency (the
+  // bridge cannot observe it), so node.now() - sample_time() never exceeds
+  // the sample's true age: a one-sided estimate, not clock synchronisation.
+  std::optional<Time> sample_time() const;
   const config::RobotConfig& config() const;  // parsed node.config_path()
 
  private:

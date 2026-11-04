@@ -107,7 +107,8 @@ class TelemetryTest : public ::testing::Test {
 
   Sim sim{Runfile("TALOS_TEST_CONFIG")};
   Telemetry& telemetry = sim.add<Telemetry>("telemetry");
-  talos::testing::SimHardware hw{sim};
+  // Optional so a test can stand in for the bridge's /hw/status itself.
+  std::optional<talos::testing::SimHardware> hw{std::in_place, sim};
 
  private:
   std::optional<std::vector<std::byte>> latest_;
@@ -322,8 +323,12 @@ TEST_F(TelemetryTest, DropsStaleShooterWhileIntakeStaysLive) {
 }
 
 TEST_F(TelemetryTest, ForwardsBridgeHealthAndMarksItStale) {
-  sim.publish(::bridge::topics::kStatus,
-              ::bridge::BridgeStatus{100, 90, 2, 3, 50, 1500, 0b101, 3, true});
+  // SimHardware publishes its own /hw/status; this test is the bridge.
+  hw.reset();
+  ::bridge::BridgeStatus status{100,   90, 2,    3,    50,         1500,
+                                0b101, 3,  true, 11,   -2'500'000, 750,
+                                1,     4,  200,  false};
+  sim.publish(::bridge::topics::kStatus, status);
   PublishPose(Pose(1.0, 2.0, 0.0));
   sim.step(30ms);
   auto channels = Channels();
@@ -333,10 +338,26 @@ TEST_F(TelemetryTest, ForwardsBridgeHealthAndMarksItStale) {
   EXPECT_NEAR(channels.at("bridge/timed_out_mask"), 5.0, 1e-12);
   EXPECT_NEAR(channels.at("bridge/configured"), 1.0, 1e-12);
   EXPECT_NEAR(channels.at("bridge/stale"), 0.0, 1e-12);
+  // An unconverged clock mapping reports only that, and its resets.
+  EXPECT_NEAR(channels.at("bridge/clock_offset_valid"), 0.0, 1e-12);
+  EXPECT_NEAR(channels.at("bridge/clock_resets"), 1.0, 1e-12);
+  EXPECT_EQ(channels.count("bridge/clock_offset_us"), 0u);
+  EXPECT_EQ(channels.count("bridge/clock_offset_spread_us"), 0u);
+
+  status.mutate_clock_offset_valid(true);
+  sim.publish(::bridge::topics::kStatus, status);
+  PublishPose(Pose(1.0, 2.0, 0.0));
+  sim.step(20ms);
+  channels = Channels();
+  EXPECT_NEAR(channels.at("bridge/clock_offset_valid"), 1.0, 1e-12);
+  EXPECT_NEAR(channels.at("bridge/clock_offset_us"), -2'500'000.0, 1e-12);
+  EXPECT_NEAR(channels.at("bridge/clock_offset_spread_us"), 750.0, 1e-12);
   // Units live in the dictionary now.
   for (const ChannelDef& channel : telemetry.dictionary()) {
-    if (channel.name == "bridge/state_age_us") {
-      EXPECT_EQ(channel.unit, "us");
+    if (channel.name == "bridge/state_age_us" ||
+        channel.name == "bridge/clock_offset_us" ||
+        channel.name == "bridge/clock_offset_spread_us") {
+      EXPECT_EQ(channel.unit, "us") << channel.name;
     }
   }
 
@@ -347,6 +368,8 @@ TEST_F(TelemetryTest, ForwardsBridgeHealthAndMarksItStale) {
   channels = Channels();
   EXPECT_EQ(channels.count("bridge/state_age_us"), 0u);
   EXPECT_EQ(channels.count("bridge/configured"), 0u);
+  EXPECT_EQ(channels.count("bridge/clock_offset_valid"), 0u);
+  EXPECT_EQ(channels.count("bridge/clock_offset_us"), 0u);
   EXPECT_NEAR(channels.at("bridge/stale"), 1.0, 1e-12);
 }
 
@@ -362,7 +385,7 @@ TEST_F(TelemetryTest, ReadsDriverStationFromHardwareTopic) {
   data.fms.flags = driver_station::kDsAttached | driver_station::kEnabled |
                    driver_station::kTeleop;
   data.fms.match_time_s = 42.0f;
-  hw.set_driver_station(data);
+  hw->set_driver_station(data);
   PublishPose(Pose(1.0, 2.0, 0.0));
   sim.step(50ms);
   channels = Channels();

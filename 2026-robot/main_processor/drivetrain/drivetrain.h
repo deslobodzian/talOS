@@ -23,6 +23,7 @@ class Drivetrain {
  public:
   explicit Drivetrain(talos::Node& node)
       : node_{node},
+        link_{node.extension<talos::HardwareLink>()},
         geometry_{LoadSwerveGeometry(node)},
         kinematics_{geometry_},
         gyro_{node, "drivetrain_imu"},
@@ -40,22 +41,27 @@ class Drivetrain {
   }
 
   void update() {
-    const std::optional<talos::Time> sample_time = SampleTime();
+    // Node-clock time the hardware sample this tick reads was taken; nullopt
+    // until the bridge's clock mapping converges or while hardware is stale.
+    // A measurement without a time is not usable, so it clears both flags;
+    // driving does not need it.
+    const std::optional<talos::Time> sample_time = link_.sample_time();
     // Every module or none: until all eight motors report, nothing is driven
     // and the module fields are not believed.
-    bool modules_valid = sample_time.has_value();
+    bool connected = true;
     std::array<ModuleState, kModuleCount> measured{};
     for (std::size_t i = 0; i < kModuleCount; ++i) {
       if (!drive_[i].connected() || !steer_[i].connected()) {
-        modules_valid = false;
+        connected = false;
         continue;
       }
       measured[i] = {drive_[i].velocity(), steer_[i].position()};
     }
+    const bool modules_valid = connected && sample_time.has_value();
 
     ChassisSpeeds speeds{};
     const ChassisTarget* target = target_.get();
-    if (modules_valid) {
+    if (connected) {
       for (std::size_t i = 0; i < kModuleCount; ++i) {
         modules_[i] = geometry::SwerveModulePosition{
             WheelTravel(drive_[i].position(),
@@ -78,10 +84,10 @@ class Drivetrain {
     // yaw_rad_ keeps the last valid heading while the source is missing.
     bool yaw_valid = false;
     if (integrate_heading_) {
-      if (modules_valid) {
+      if (connected) {
         yaw_rad_ += speeds.omega_radps *
                     std::chrono::duration<double>{node_.period()}.count();
-        yaw_valid = true;
+        yaw_valid = sample_time.has_value();
       }
     } else if (sample_time.has_value() && gyro_.connected()) {
       yaw_rad_ = ToRadians(gyro_.yaw()).value();
@@ -96,12 +102,8 @@ class Drivetrain {
   }
 
  private:
-  // Node-clock time the hardware sample this tick reads was taken; nullopt
-  // while unknown. Until HardwareLink::sample_time() is merged this is the
-  // tick time.
-  std::optional<talos::Time> SampleTime() const { return node_.now(); }
-
   talos::Node& node_;
+  talos::HardwareLink& link_;
   SwerveGeometry geometry_;
   SwerveKinematics kinematics_;
   std::array<talos::Motor, kModuleCount> drive_;
