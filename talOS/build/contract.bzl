@@ -485,6 +485,13 @@ def talos_cc_node(
       visibility: of the talos_node target (public by default).
       **kwargs: passed to the cc_binary.
     """
+    # A bundle copies the binary to bin/<name> and its shared libraries
+    # (libwpimath, ...) to lib/ (talos_bundle), so the binary also searches
+    # ../lib beside Bazel's own runfiles rpaths.
+    linkopts = kwargs.pop("linkopts", []) + select({
+        Label("@platforms//os:macos"): ["-Wl,-rpath,@loader_path/../lib"],
+        "//conditions:default": ["-Wl,-rpath,$$ORIGIN/../lib"],
+    })
     if not node_target:
         node_target = str(native.package_relative_label(name))
         if node_target.startswith("@@//"):
@@ -495,6 +502,7 @@ def talos_cc_node(
         name = bin_name,
         srcs = srcs,
         deps = deps + [node_dep],
+        linkopts = linkopts,
         local_defines = [
             'TALOS_NODE_NAME=\\"%s\\"' % node_name,
             'TALOS_NODE_TARGET=\\"%s\\"' % node_target,
@@ -616,6 +624,7 @@ def _talos_bundle_impl(ctx):
 
         direct_inputs.append(n_exec)
         rf_list = []
+        lib_list = []
         if n_rf and n_rf.files:
             transitive_inputs.append(n_rf.files)
             if n_lang == "python":
@@ -628,7 +637,13 @@ def _talos_bundle_impl(ctx):
                         "src_path": f.path,
                         "rf_rel": rf_rel,
                     })
-
+            else:
+                # A C++ node is copied without its runfiles, so the shared
+                # libraries it links go to lib/, which talos_cc_node's rpath
+                # names.
+                for f in n_rf.files.to_list():
+                    if f.extension in ("dylib", "so") or ".so." in f.basename:
+                        lib_list.append({"src_path": f.path, "name": f.basename})
         raw_label = str(node.label)
         clean_label = raw_label
         if clean_label.startswith("@@//"):
@@ -643,6 +658,7 @@ def _talos_bundle_impl(ctx):
             "language": n_lang,
             "src_path": n_exec.path,
             "runfiles": rf_list,
+            "shared_libs": lib_list,
         })
 
     # Each config file keeps its path relative to the config, so `include`,
