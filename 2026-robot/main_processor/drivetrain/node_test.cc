@@ -40,6 +40,10 @@ using talos::testing::SimHardware;
 namespace ds = talos::driver_station;
 
 constexpr double kTau = 2 * std::numbers::pi;
+// Long enough for the bridge's clock mapping (8 hardware states at 5 ms) to
+// converge, after which hardware sample times, and so the measurement
+// flags, are valid.
+constexpr auto kConverged = std::chrono::milliseconds{60};
 
 std::string Runfile(const char* env) {
   std::string error;
@@ -384,7 +388,7 @@ TEST_F(DrivetrainTest, ReportsTheChassisMotionTheModulesMeasure) {
     hw.set_motor("drivetrain", module.drive, 0.0, 2.0);
     hw.set_motor("drivetrain", module.steer, 0.25, 0.0);
   }
-  sim.step(20ms);
+  sim.step(kConverged);
   const DrivetrainState state = State();
   EXPECT_TRUE(state.modules_valid());
   EXPECT_NEAR(state.vx_mps(), 0.0, 1e-9);
@@ -413,7 +417,7 @@ TEST_F(DrivetrainTest, ModulePositionsComeFromTheDriveAndSteerMotors) {
     hw.set_motor("drivetrain", geometry.modules[i].drive, 1.0 + i, 0.0);
     hw.set_motor("drivetrain", geometry.modules[i].steer, -0.1 * i, 0.0);
   }
-  sim.step(20ms);
+  sim.step(kConverged);
   const DrivetrainState state = State();
   ASSERT_TRUE(state.modules_valid());
   for (std::size_t i = 0; i < kModuleCount; ++i) {
@@ -424,6 +428,43 @@ TEST_F(DrivetrainTest, ModulePositionsComeFromTheDriveAndSteerMotors) {
     EXPECT_NEAR(m.angle_rad(), -0.1 * i * kTau, 1e-12)
         << geometry.modules[i].name;
   }
+}
+
+TEST_F(DrivetrainTest, DrivesBeforeTheClockMappingConvergesButReportsNoSample) {
+  // Four hardware states in: the bridge's offset filter needs eight, so no
+  // sample time is known yet. The modules are measured and driven anyway;
+  // only the published measurement is not believed.
+  Teleop();  // the lane must be published inside the teleop generation
+  talos::testing::PublishTarget(sim, "drivetrain", "teleop",
+                                ChassisTarget{1.0, 0, 0});
+  sim.step(10ms);
+  const DrivetrainState early = State();
+  EXPECT_FALSE(early.modules_valid());
+  EXPECT_FALSE(early.yaw_valid());
+  EXPECT_EQ(early.sample_time_ns(), 0u);
+  EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+
+  Hold(ChassisTarget{1.0, 0, 0}, 60ms);
+  EXPECT_TRUE(State().modules_valid());
+  EXPECT_TRUE(State().yaw_valid());
+}
+
+TEST_F(DrivetrainTest, SampleTimeIsTheMappedHardwareSampleTimeNotTheTickTime) {
+  // 1 ms link latency while the filter converges, then 4 ms: the minimum
+  // stays 1 ms for the window, so each state maps 3 ms before it arrived.
+  // A drivetrain stamping its own tick time would read within a tick of now.
+  hw.set_gateway_clock(std::chrono::seconds{1000}, 1ms);
+  Teleop();
+  sim.step(kConverged);
+  ASSERT_TRUE(State().modules_valid());
+  hw.set_gateway_clock(std::chrono::seconds{1000}, 4ms);
+  sim.step(20ms);
+  const DrivetrainState state = State();
+  ASSERT_TRUE(state.modules_valid());
+  const std::int64_t lag_ns =
+      sim.now().nanos() - static_cast<std::int64_t>(state.sample_time_ns());
+  EXPECT_GE(lag_ns, std::chrono::nanoseconds{3ms}.count());
+  EXPECT_LE(lag_ns, std::chrono::nanoseconds{3ms + 5ms}.count());
 }
 
 TEST_F(DrivetrainTest, ADisconnectedMotorStillPublishesButDrivesNothing) {
@@ -500,7 +541,7 @@ TEST_F(DrivetrainOnImuTest, HeadingIsThePigeonYawInRadians) {
 TEST_F(DrivetrainOnImuTest, ADisconnectedGyroIsInvalidAndHoldsTheLastHeading) {
   Teleop();
   hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0.0);
-  sim.step(20ms);
+  sim.step(kConverged);
   ASSERT_TRUE(State().yaw_valid());
 
   hw.set_connected("drivetrain", "drivetrain_imu", false);
@@ -518,7 +559,7 @@ TEST_F(DrivetrainOnImuTest, ADisconnectedGyroIsInvalidAndHoldsTheLastHeading) {
 TEST_F(DrivetrainOnImuTest, AGyroThatNeverReportedReadsAnInvalidZero) {
   hw.set_connected("drivetrain", "drivetrain_imu", false);
   hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0.0);
-  sim.step(20ms);
+  sim.step(kConverged);
   EXPECT_FALSE(State().yaw_valid());
   EXPECT_EQ(State().yaw_rad(), 0.0);
   EXPECT_TRUE(State().modules_valid());
