@@ -1,0 +1,6 @@
+[subsystems.a]
+node = "//a:node"
+
+[[subsystems.a.teleop.bindings]]
+button = 1
+while_held = { arr = [1, 2] }

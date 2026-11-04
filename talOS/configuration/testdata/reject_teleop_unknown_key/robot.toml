@@ -1,0 +1,5 @@
+[subsystems.a]
+node = "//a:node"
+
+[subsystems.a.teleop]
+foo = "bar"

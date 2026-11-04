@@ -87,8 +87,6 @@ struct RobotConfig {
     uint16_t http_port{5800};
     // Relative to the launcher's working directory.
     std::string webroot{"bazel-bin/studio/dist"};
-    std::string topic;
-    std::string pose_topic;
   };
   StudioConfig studio;
 
@@ -357,6 +355,146 @@ inline void ApplyTargetPolicy(const toml::table& tbl, TargetPolicy& policy,
     *lanes = std::move(parsed);
   }
 }
+inline void ValidateTeleop(const toml::table& sub_tbl,
+                           const std::string& sub_name) {
+  if (!sub_tbl.contains("teleop")) return;
+  const auto& teleop_node = sub_tbl["teleop"];
+  const auto* teleop_tbl = teleop_node.as_table();
+  if (teleop_tbl == nullptr) {
+    throw std::invalid_argument("[subsystems." + sub_name +
+                                ".teleop] must be a table");
+  }
+  for (auto&& [k, v] : *teleop_tbl) {
+    if (k.str() != "bindings") {
+      throw std::invalid_argument("[subsystems." + sub_name +
+                                  ".teleop] unknown key '" +
+                                  std::string(k.str()) + "'");
+    }
+  }
+  if (!teleop_tbl->contains("bindings")) return;
+  const auto* bindings = (*teleop_tbl)["bindings"].as_array();
+  if (bindings == nullptr) {
+    throw std::invalid_argument("[subsystems." + sub_name +
+                                ".teleop.bindings] must be an array");
+  }
+  for (std::size_t i = 0; i < bindings->size(); ++i) {
+    const std::string entry_where = "[subsystems." + sub_name +
+                                    "] teleop.bindings[" + std::to_string(i) +
+                                    "]";
+    const auto* entry = (*bindings)[i].as_table();
+    if (entry == nullptr) {
+      throw std::invalid_argument(entry_where + " must be a table");
+    }
+    for (auto&& [k, v] : *entry) {
+      const std::string_view ks = k.str();
+      if (ks != "button" && ks != "axis" && ks != "port" &&
+          ks != "while_held" && ks != "field" && ks != "scale" &&
+          ks != "deadband_frac") {
+        throw std::invalid_argument(entry_where + " unknown key '" +
+                                    std::string(ks) + "'");
+      }
+    }
+    const bool has_button = entry->contains("button");
+    const bool has_axis = entry->contains("axis");
+    if ((has_button && has_axis) || (!has_button && !has_axis)) {
+      throw std::invalid_argument(
+          entry_where + ": binding must specify either 'button' or 'axis'");
+    }
+    if (entry->contains("port")) {
+      const auto& p_node = (*entry)["port"];
+      if (!p_node.is_integer()) {
+        throw std::invalid_argument(entry_where +
+                                    ".port must be an integer in [0, 5]");
+      }
+      const auto p = p_node.value<int64_t>();
+      if (!p || *p < 0 || *p > 5) {
+        throw std::invalid_argument(entry_where +
+                                    ".port must be an integer in [0, 5]");
+      }
+    }
+    if (has_button) {
+      for (const char* forbidden : {"field", "scale", "deadband_frac"}) {
+        if (entry->contains(forbidden)) {
+          throw std::invalid_argument(entry_where +
+                                      " button binding cannot have axis keys");
+        }
+      }
+      const auto& b_node = (*entry)["button"];
+      if (!b_node.is_integer()) {
+        throw std::invalid_argument(entry_where +
+                                    ".button must be an integer in [1, 32]");
+      }
+      const auto b = b_node.value<int64_t>();
+      if (!b || *b < 1 || *b > 32) {
+        throw std::invalid_argument(entry_where +
+                                    ".button must be an integer in [1, 32]");
+      }
+      if (!entry->contains("while_held")) {
+        throw std::invalid_argument(entry_where +
+                                    " button binding missing 'while_held'");
+      }
+      const auto* wh = (*entry)["while_held"].as_table();
+      if (wh == nullptr) {
+        throw std::invalid_argument(entry_where +
+                                    ".while_held must be a table");
+      }
+      for (auto&& [fk, fv] : *wh) {
+        if (fv.is_table() || fv.is_array()) {
+          throw std::invalid_argument(entry_where + ".while_held." +
+                                      std::string(fk.str()) +
+                                      " must be a scalar");
+        }
+      }
+    }
+    if (has_axis) {
+      if (entry->contains("while_held")) {
+        throw std::invalid_argument(entry_where +
+                                    " axis binding cannot have 'while_held'");
+      }
+      const auto& a_node = (*entry)["axis"];
+      if (!a_node.is_integer()) {
+        throw std::invalid_argument(entry_where +
+                                    ".axis must be an integer in [0, 11]");
+      }
+      const auto a = a_node.value<int64_t>();
+      if (!a || *a < 0 || *a > 11) {
+        throw std::invalid_argument(entry_where +
+                                    ".axis must be an integer in [0, 11]");
+      }
+      if (!entry->contains("field")) {
+        throw std::invalid_argument(entry_where +
+                                    " axis binding missing 'field'");
+      }
+      const auto f = (*entry)["field"].value<std::string_view>();
+      if (!f || f->empty()) {
+        throw std::invalid_argument(entry_where +
+                                    ".field must be a non-empty string");
+      }
+      if (!entry->contains("scale")) {
+        throw std::invalid_argument(entry_where +
+                                    " axis binding missing 'scale'");
+      }
+      const auto& sc = (*entry)["scale"];
+      if (!sc.is_floating_point() && !sc.is_integer()) {
+        throw std::invalid_argument(entry_where + ".scale must be a number");
+      }
+      if (entry->contains("deadband_frac")) {
+        const auto& df = (*entry)["deadband_frac"];
+        if (!df.is_floating_point() && !df.is_integer()) {
+          throw std::invalid_argument(entry_where +
+                                      ".deadband_frac must be a number");
+        }
+        const double d = df.as_floating_point()
+                             ? df.as_floating_point()->get()
+                             : static_cast<double>(df.as_integer()->get());
+        if (d < 0.0 || d >= 1.0) {
+          throw std::invalid_argument(entry_where +
+                                      ".deadband_frac must be in [0, 1)");
+        }
+      }
+    }
+  }
+}
 
 }  // namespace detail
 
@@ -411,32 +549,12 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     }
   }
 
-  if (tbl.contains("studio")) {
-    auto* studio = tbl["studio"].as_table();
-    if (!studio) {
-      throw std::invalid_argument("[studio] must be a table");
-    }
+  if (auto* studio = tbl["studio"].as_table()) {
     auto& s = result.studio;
-    for (auto&& [k, v] : *studio) {
-      if (k.str() != "bridge" && k.str() != "webroot" &&
-          k.str() != "http_port" && k.str() != "topic" &&
-          k.str() != "pose_topic") {
-        throw std::invalid_argument("[studio] unknown key '" +
-                                    std::string(k.str()) + "'");
-      }
-    }
     s.bridge = detail::ReadNonEmpty(*studio, "bridge", s.bridge, "[studio]");
     s.webroot = detail::ReadNonEmpty(*studio, "webroot", s.webroot, "[studio]");
     s.http_port =
         detail::ReadPort(*studio, "http_port", s.http_port, "[studio]");
-    if (!studio->contains("topic")) {
-      throw std::invalid_argument("[studio] missing required key 'topic'");
-    }
-    s.topic = detail::ReadNonEmpty(*studio, "topic", "", "[studio]");
-    if (studio->contains("pose_topic")) {
-      s.pose_topic =
-          detail::ReadNonEmpty(*studio, "pose_topic", "", "[studio]");
-    }
   }
 
   auto* subsystems_tbl = tbl["subsystems"].as_table();
@@ -465,6 +583,7 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
       }
       detail::ApplyTargetPolicy(*targets, policy, where);
     }
+    detail::ValidateTeleop(*sub_tbl, sub_name);
 
     auto each = [&](const char* section, auto parse) {
       auto* devices = (*sub_tbl)[section].as_table();

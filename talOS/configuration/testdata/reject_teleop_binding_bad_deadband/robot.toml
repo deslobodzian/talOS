@@ -1,0 +1,8 @@
+[subsystems.a]
+node = "//a:node"
+
+[[subsystems.a.teleop.bindings]]
+axis = 1
+field = "vel"
+scale = 10.0
+deadband_frac = 1.0

@@ -57,30 +57,6 @@ def _join(base_dir, rel, where):
 
 _TOP_LEVEL_KEYS = ("include", "robot", "studio", "subsystems")
 _ENTRY_KEYS = ("name", "path", "node", "defaults")
-_STUDIO_KEYS = ("bridge", "webroot", "http_port", "topic", "pose_topic")
-
-
-def _check_studio(studio, where):
-    if not isinstance(studio, dict):
-        raise ManifestError(f"{where}: [studio] must be a table")
-    for key in studio:
-        if key not in _STUDIO_KEYS:
-            raise ManifestError(f"{where}: [studio] unknown key '{key}'")
-    if "topic" not in studio:
-        raise ManifestError(f"{where}: [studio] missing required key 'topic'")
-    _non_empty(studio, "topic", "[studio]")
-    if "bridge" in studio:
-        _non_empty(studio, "bridge", "[studio]")
-    if "webroot" in studio:
-        _non_empty(studio, "webroot", "[studio]")
-    if "pose_topic" in studio:
-        _non_empty(studio, "pose_topic", "[studio]")
-    if "http_port" in studio:
-        port = studio["http_port"]
-        if (not isinstance(port, int) or isinstance(port, bool) or
-                port < 1 or port > 65535):
-            raise ManifestError(
-                "[studio] field 'http_port' must be a port in [1, 65535]")
 
 
 def _non_empty(table, key, where):
@@ -96,6 +72,84 @@ def _check_top_level_keys(doc, path):
     for key in doc:
         if key not in _TOP_LEVEL_KEYS:
             raise ManifestError(f"{path}: unknown top-level key '{key}'")
+
+def _check_teleop(teleop, sub_name):
+    if not isinstance(teleop, dict):
+        raise ManifestError(f"[subsystems.{sub_name}.teleop] must be a table")
+    for key in teleop:
+        if key != "bindings":
+            raise ManifestError(
+                f"[subsystems.{sub_name}.teleop] unknown key '{key}'")
+    if "bindings" in teleop:
+        bindings = teleop["bindings"]
+        if not isinstance(bindings, list):
+            raise ManifestError(
+                f"[subsystems.{sub_name}.teleop.bindings] must be an array")
+        for i, entry in enumerate(bindings):
+            entry_where = f"[subsystems.{sub_name}] teleop.bindings[{i}]"
+            if not isinstance(entry, dict):
+                raise ManifestError(f"{entry_where} must be a table")
+            for k in entry:
+                if k not in ("button", "axis", "port", "while_held", "field",
+                             "scale", "deadband_frac"):
+                    raise ManifestError(f"{entry_where} unknown key '{k}'")
+            has_button = "button" in entry
+            has_axis = "axis" in entry
+            if (has_button and has_axis) or (not has_button and not has_axis):
+                raise ManifestError(
+                    f"{entry_where}: binding must specify either 'button' or 'axis'")
+            if "port" in entry:
+                p = entry["port"]
+                if not isinstance(p, int) or isinstance(p, bool) or p < 0 or p > 5:
+                    raise ManifestError(
+                        f"{entry_where}.port must be an integer in [0, 5]")
+            if has_button:
+                for k in ("field", "scale", "deadband_frac"):
+                    if k in entry:
+                        raise ManifestError(
+                            f"{entry_where} button binding cannot have axis keys")
+                b = entry["button"]
+                if not isinstance(b, int) or isinstance(b, bool) or b < 1 or b > 32:
+                    raise ManifestError(
+                        f"{entry_where}.button must be an integer in [1, 32]")
+                if "while_held" not in entry:
+                    raise ManifestError(
+                        f"{entry_where} button binding missing 'while_held'")
+                wh = entry["while_held"]
+                if not isinstance(wh, dict):
+                    raise ManifestError(
+                        f"{entry_where}.while_held must be a table")
+                for fk, fv in wh.items():
+                    if isinstance(fv, (dict, list)):
+                        raise ManifestError(
+                            f"{entry_where}.while_held.{fk} must be a scalar")
+            if has_axis:
+                if "while_held" in entry:
+                    raise ManifestError(
+                        f"{entry_where} axis binding cannot have 'while_held'")
+                a = entry["axis"]
+                if not isinstance(a, int) or isinstance(a, bool) or a < 0 or a > 11:
+                    raise ManifestError(
+                        f"{entry_where}.axis must be an integer in [0, 11]")
+                if "field" not in entry:
+                    raise ManifestError(
+                        f"{entry_where} axis binding missing 'field'")
+                f = entry["field"]
+                if not isinstance(f, str) or not f:
+                    raise ManifestError(
+                        f"{entry_where}.field must be a non-empty string")
+                if "scale" not in entry:
+                    raise ManifestError(
+                        f"{entry_where} axis binding missing 'scale'")
+                sc = entry["scale"]
+                if not isinstance(sc, (int, float)) or isinstance(sc, bool):
+                    raise ManifestError(f"{entry_where}.scale must be a number")
+                if "deadband_frac" in entry:
+                    df = entry["deadband_frac"]
+                    if (not isinstance(df, (int, float)) or isinstance(df, bool)
+                            or df < 0.0 or df >= 1.0):
+                        raise ManifestError(
+                            f"{entry_where}.deadband_frac must be in [0, 1)")
 
 
 def _merge_tables(base, over):
@@ -264,16 +318,17 @@ def effective(root, config, overrides=None, available=None):
                 base["subsystems"] = reader.expand(base_subs, include)
         _merge_tables(base, doc)
         doc = base
-    if "studio" in doc:
-        _check_studio(doc["studio"], config)
     if isinstance(doc.get("subsystems"), list):
         doc["subsystems"] = reader.expand(doc["subsystems"], config)
     subs = doc.get("subsystems")
     if not isinstance(subs, dict):
         raise ManifestError(f"{config}: missing [subsystems] table")
     for name, table in subs.items():
-        if isinstance(table, dict) and "node" in table:
-            _non_empty(table, "node", f"[subsystems.{name}]")
+        if isinstance(table, dict):
+            if "node" in table:
+                _non_empty(table, "node", f"[subsystems.{name}]")
+            if "teleop" in table:
+                _check_teleop(table["teleop"], name)
     return subs, sorted(reader.files)
 
 
