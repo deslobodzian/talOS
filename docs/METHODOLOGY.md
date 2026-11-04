@@ -195,6 +195,10 @@ Rules:
   numbers) without a suffix, naming it. A suffix needs a name before it
   (`count` alone fails; `tick_count` passes). **[enforced]** Numeric
   parameters without a suffix get a `--describe-only` warning. **[planned: D2]**
+- No one-letter word before the suffix: `x_std_m`, not `std_x_m`, and
+  `module0`, not `module_0`. flatc camel-cases field names for Python, and
+  talos derives the snake_case names back from them, so `std_x_m` would read
+  as `std_xm` there. **[review]**
 
 ## 7. Messages
 
@@ -265,7 +269,7 @@ intake; the whole graph used ≈ 4.5 % of one core.
 | Rule | Budget | Status |
 |---|---|---|
 | `update()` p99 wall time | ≤ 10 % of `period_us` | [review]; read `max_latency` in the registry / Studio system view |
-| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | [review]; an allocation-free assertion in `Sim` is planned |
+| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | [review]; the drivetrain's `UpdateDoesNotAllocate` counts every allocation in the process, wpimath's included (macOS only; §13) |
 | Python nodes | fine for any period ≥ 5 ms: they cost memory (≈ 30 MB), not jitter | [review] |
 | Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [review]; producer → consumer is one hop (`Target` resolves lanes in the consumer) |
 | Per-tick work | O(devices), never O(history); bound every loop | [review] |
@@ -321,7 +325,7 @@ producer that has drained it would.
 |---|---|---|
 | A mechanism | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py`; fill in the TOML; write the §11 tests | edit `operator_interface` or `telemetry` code |
 | A producer of a target (auto routine, auto-align) | a `talos::TargetLane` on `/<sub>/target/<source>`; list `<source>` in `[robot.targets]` or that subsystem's `[targets]` (the launcher refuses a lane no mode lists) | subscribe to another producer's lane, or write a lane someone else writes |
-| A process without hardware (pose estimator, vision, auto) | a node with no devices; subscribe to `state` topics; publish `/<me>/state`; do the math with wpimath (§14); walkthrough in DESIGN_AUTOMATIC_WIRING.md §D6 | read `/hw/state` directly; hand-roll a Kalman filter or kinematics |
+| A process without hardware (pose estimator, vision, auto) | a node with no devices; subscribe to `state` topics; publish `/<me>/state` every tick with validity, while disabled too (no actuation gate on computation); do the math with wpimath or GTSAM (§14); `bazel run //tools:new_subsystem -- <name> --type estimator`; walkthrough in DESIGN_AUTOMATIC_WIRING.md §D6 | read `/hw/state` directly; hand-roll a Kalman filter or kinematics |
 | A message | the owning package's `.fbs` and `talos_messages(topics = ...)`; §6 and §7 | a hand-written C++/Python mirror |
 | A device type | `talOS/hardware`, `talOS/devices`, `devices.py`, the RoboRIO program, in one change | |
 | A node-API feature | `talOS/node` (or `devices`), `talOS/node_api`, `talOS/python/talos`, tests in both languages, in one change | a Python-only reimplementation |
@@ -367,7 +371,7 @@ A dependency is adopted when it meets all of these:
 | Serialization, schemas, reflection | FlatBuffers (structs, and `reflection.fbs`/`.bfbs` for runtime schemas) | in use; `.bfbs` descriptors and schema hashes in use (D2 stage 1); hash-checked attach, descriptor-bearing logs and the reflection codec planned (D2) |
 | Config | TOML: toml++ (C++), `tomllib` (Python stdlib) | in use |
 | Tests | googletest, `unittest` | in use |
-| Geometry, kinematics, pose estimation, trajectories, profiles, PID, filters | wpimath 2026.2.1 (C++: WPILib's Maven release artifacts through `third_party/wpilib`, `//third_party/wpilib:wpimath`, shared libraries staged in a bundle's `lib/`; Python: `robotpy-wpimath` 2026.2.1.1 on the same native build). allwpilib 2026 has no `MODULE.bazel` and no BCR entry. `//2026-robot/controller_processor/rio:wpilib_lockstep_test` keeps the Maven pin, the `robotpy-native-wpimath` pin and GradleRIO on one release | in use (D6): drivetrain `units::` boundary conversions, the pose estimator's `kalman` backend (`SwerveDrive4PoseEstimator`); macOS arm64 built and run, Linux artifacts fetched and hash-checked but not run |
+| Geometry, kinematics, pose estimation, trajectories, profiles, PID, filters | wpimath 2026.2.1 (C++: WPILib's Maven release artifacts through `third_party/wpilib`, `//third_party/wpilib:wpimath`, shared libraries staged in a bundle's `lib/`; Python: `robotpy-wpimath` 2026.2.1.1 on the same native build). allwpilib 2026 has no `MODULE.bazel` and no BCR entry. `//2026-robot/controller_processor/rio:wpilib_lockstep_test` keeps the Maven pin, the `robotpy-native-wpimath` pin and GradleRIO on one release | in use (D6): drivetrain kinematics (`SwerveDriveKinematics<4>`) and `units::` boundary conversions, the pose estimator's `kalman` backend (`SwerveDrive4PoseEstimator`); built and run on macOS arm64; the Linux artifacts are wired but not built here |
 | Smoothing and mapping (factor graphs) | GTSAM 4.3.0 (`gtsam` wheel on PyPI, BSD) | in use (D6): the pose estimator's `factor_graph` backend (`IncrementalFixedLagSmoother`). Python only: GTSAM has no Bazel module, and its C++ build is CMake with a large dependency surface |
 | Vision: AprilTag pose observations | PhotonVision on the camera coprocessor; `photonlibpy`/photonlib, or `apriltag`/`robotpy-apriltag` for an in-process pipeline | candidate (D6) |
 | Autonomous paths | Choreo or PathPlanner trajectories, followed with wpimath controllers | candidate |

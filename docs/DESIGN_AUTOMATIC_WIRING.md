@@ -4,8 +4,9 @@ Status: partially implemented checkpoint, not acceptance-complete. See
 [HANDOFF_AUTOMATIC_WIRING.md](HANDOFF_AUTOMATIC_WIRING.md) for current evidence,
 remaining work, and completion order. The rules it serves are in
 [METHODOLOGY.md](METHODOLOGY.md). D2 has its first stage (build-level
-descriptors and the field-name lint); the rest of D2, and D3, D4 and D6,
-remain proposals.
+descriptors and the field-name lint). D6 is implemented except
+`--replay-inputs`, which waits for D2's descriptor-bearing logs. The rest of
+D2, and D3 and D4, remain proposals.
 
 ## Problem
 
@@ -490,7 +491,7 @@ flowchart LR
 | 2 | D1, migrating the 2026 robot and the scaffold; delete the arbiter | D1 acceptance; `--describe-only` on every config; live sim fault table |
 | 3 | D2 | D2 acceptance |
 | 4 | D3, then D4; delete the robot telemetry package and `GenericTarget`/`GenericState` | D3/D4 acceptance; Studio shows a scaffolded subsystem |
-| 5 | D6 (wpimath dependency first, verified on macOS arm64 and Linux) | estimator `Sim` test; `--replay-inputs` on a recorded sim session |
+| 5 | D6 (wpimath and GTSAM dependencies first; built and run on macOS arm64, Linux left to CI) | estimator `Sim` tests on both backends; `bundle_test` with wpimath; `--replay-inputs` on a recorded sim session (not built: after D2's descriptor-bearing logs) |
 
 Every step updates `ARCHITECTURE.md`, `NODE_DEVELOPMENT_GUIDE.md`,
 `examples/superstructure`, `tools/new_subsystem.py` and the "planned" marks in
