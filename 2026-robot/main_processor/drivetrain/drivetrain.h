@@ -14,8 +14,8 @@
 
 namespace drivetrain {
 
-// Swerve drive: turns the arbiter's chassis target into a drive velocity and
-// a steer position per module, and reports the chassis motion the modules
+// Swerve drive: turns the selected chassis target lane into a drive velocity
+// and a steer position per module, and reports the chassis motion the modules
 // measure together with the robot heading.
 class Drivetrain {
  public:
@@ -28,7 +28,7 @@ class Drivetrain {
         // on a robot: an integrated heading drifts with no absolute reference.
         integrate_heading_{
             node.param<bool>("integrate_heading", node.simulation())},
-        target_{node.subscribe<ChassisTarget>(topics::kTarget)},
+        target_{node},
         state_{node.publish<DrivetrainState>(topics::kState)} {
     for (std::size_t i = 0; i < kModuleCount; ++i) {
       drive_[i] = talos::Motor{node, geometry_.modules[i].drive};
@@ -44,11 +44,9 @@ class Drivetrain {
       if (!drive_[i].connected() || !steer_[i].connected()) return;
       measured[i] = {drive_[i].velocity(), steer_[i].position()};
     }
-    if (target_.fresh() && target_->enabled()) {
+    if (const ChassisTarget* t = target_.get()) {
       const auto setpoints = ToModuleStates(
-          geometry_,
-          {target_->vx_mps(), target_->vy_mps(), target_->omega_radps()},
-          measured);
+          geometry_, {t->vx_mps(), t->vy_mps(), t->omega_radps()}, measured);
       for (std::size_t i = 0; setpoints && i < kModuleCount; ++i) {
         drive_[i].set_velocity((*setpoints)[i].drive_rps);
         steer_[i].set_position((*setpoints)[i].steer_rot);
@@ -81,7 +79,7 @@ class Drivetrain {
   talos::Gyro gyro_;
   bool integrate_heading_;
   double integrated_yaw_rot_ = 0;
-  talos::Subscription<ChassisTarget> target_;
+  talos::Target<ChassisTarget> target_;
   talos::Publisher<DrivetrainState> state_;
 };
 

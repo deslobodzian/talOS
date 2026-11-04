@@ -4,7 +4,8 @@ enum IntakeCommand : ubyte { IDLE, INTAKE, EJECT }
 
 enum IntakeState : ubyte { IDLE, INTAKING, HOLDING, EJECTING }
 
-// What the superstructure asks of the intake, on /intake/target.
+// What the superstructure asks of the intake, on the lane
+// /intake/target/superstructure.
 struct IntakeGoal {
   command:IntakeCommand;
 }

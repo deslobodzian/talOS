@@ -67,22 +67,25 @@ policy is that an error refuses.
 
 An error is something that cannot be right in any configuration: two writers on
 one topic, which makes the dispatch log unreplayable; one topic used with two
-message sizes; a subscriber whose topic nothing publishes. A warning is a state
-that is normal while a robot is being built, such as a feed nobody has
-subscribed to yet.
+message sizes; a subscriber whose topic nothing publishes; a target lane
+(`/<sub>/target/<source>`) whose source is in no mode of that subsystem's
+target policy, so nothing will ever read it. A warning is a state that is
+normal while a robot is being built, such as a feed nobody has subscribed to
+yet, or a policy lane nobody writes yet (`/drivetrain/target/auto` until
+autonomous exists). The launcher hands the lint every subsystem's policy
+sources from the config (`[robot.targets]` plus each subsystem's `[targets]`).
 
 Two things keep that distinction honest, and both of them matter more than they
 look:
 
 - A node declares endpoint attributes for the ends whose far side is not a node
-  in this session. The arbiter marks `/drivetrain/target/auto` and
-  `/shooter/target/auto` optional, because autonomous is not written and those
-  subscriptions are deliberately unfed; the hardware bridge marks `/hw/command`
-  external, because the RoboRIO consumes it over UDP and no shared-memory
-  subscriber will ever appear. Without these the report would flag a known
-  design decision on every single launch, and a report that always complains is
-  a report nobody reads — which costs exactly the finding it was built to
-  deliver.
+  in this session. A `talos::Target` subscribes to its policy lanes optional,
+  because a lane with no producer is normal (the lint still warns about it,
+  once, by name); the hardware bridge marks `/hw/command` external, because the
+  RoboRIO consumes it over UDP and no shared-memory subscriber will ever
+  appear. Without these the report would flag a known design decision as an
+  error on every single launch, and a report that always complains is a report
+  nobody reads — which costs exactly the finding it was built to deliver.
 
 - Timers are described but not linted. A timer is an event source with no far
   end, and its name is a label like `swerve`, not a path, so measuring it

@@ -258,6 +258,11 @@ class MessageType:
             for field, accessor in self.accessors.items()
             if accessor in stub_enums}
         self._create = create
+        # The struct's minimum alignment, as flatc's Create Prep()s it; a
+        # target lane's envelope pads to it (talOS/devices/target.h).
+        builder = flatbuffers.Builder(self.size)
+        create(builder, *(0 for _ in params))
+        self.alignment = builder.minalign
         layout = _layout(create, len(params), self.size)
         if layout is None:  # Builder and accessors, in Create order
             self.packer = None

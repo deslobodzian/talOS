@@ -2,13 +2,15 @@ namespace demo;
 
 enum ElevatorState : ubyte { STOWED, MOVING, AT_GOAL }
 
-// The height the superstructure asks for, on /elevator/target.
+// The height the superstructure asks for, on the lane
+// /elevator/target/superstructure.
 struct ElevatorGoal {
   height_rot:double;
 }
 
 // Where the elevator is, on /elevator/state. goal_rot echoes the goal that
-// at_goal refers to, so a reader can tell "at the old goal" from "at mine".
+// at_goal refers to, so a reader can tell "at the old goal" from "at mine";
+// with no target it is 0 and at_goal is false.
 struct ElevatorStatus {
   state:ElevatorState;
   height_rot:double;

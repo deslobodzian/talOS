@@ -4,17 +4,15 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
 
 # ChassisTarget / DrivetrainState (namespace drivetrain) and the drivetrain's
-# topics. Odometry, the operator interface, telemetry and the arbiter consume
-# them. /drivetrain/target has one writer, the arbiter; teleop and autonomous
-# publish on their own lanes and the arbiter picks one.
+# topics. Odometry, the operator interface and telemetry consume them. The
+# drivetrain reads its target through talos::Target: teleop and autonomous
+# publish on their own lanes, /drivetrain/target/<source>, and the robot's
+# [robot.targets] policy picks one per match mode.
 talos_messages(
     name = "messages",
     srcs = ["drive_message.fbs"],
     topics = {
         "state": "/drivetrain/state",
-        "target": "/drivetrain/target",
-        "teleop_target": "/drivetrain/target/teleop",
-        "auto_target": "/drivetrain/target/auto",
     },
 )
 
@@ -40,8 +38,8 @@ cc_library(
     hdrs = ["drivetrain.h"],
     include_prefix = "drivetrain",
     strip_include_prefix = ".",
-    # The arbiter's teleop-chain test runs the real drivetrain.
-    visibility = ["//2026-robot/main_processor/arbiter:__pkg__"],
+    # The operator interface's teleop-chain test runs the real drivetrain.
+    visibility = ["//2026-robot/main_processor/operator_interface:__pkg__"],
     deps = [
         ":messages",
         ":swerve",
@@ -57,12 +55,14 @@ talos_cc_node(
     deps = [":drivetrain"],
 )
 
-# Dev tools: publish a chassis target by hand, and watch the drivetrain link.
+# Dev tools: publish a chassis target lane by hand (sim/bench only: it
+# bypasses the operator interface), and watch the drivetrain link.
 cc_binary(
     name = "send_target",
     srcs = ["send_target.cc"],
     deps = [
         ":messages",
+        "//talOS/devices",
         "//talOS/events:events_os",
         "//talOS/ipc",
     ],
@@ -75,6 +75,7 @@ cc_binary(
     deps = [
         ":messages",
         ":swerve",
+        "//talOS/devices",
         "//talOS/hardware",
         "//talOS/ipc",
         "//talOS/process",

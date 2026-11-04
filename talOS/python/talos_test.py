@@ -26,6 +26,8 @@ verbose = true
 
 [subsystems.lift.motors.lift]
 can_id = 1
+[subsystems.lift.targets]
+teleop = ["align", "teleop"]
 """
 
 
@@ -220,6 +222,132 @@ class DriverStationTest(unittest.TestCase):
         del hw
         sim.step(0.15)  # past [robot] command_timeout_us
         self.assertFalse(ds.connected or ds.enabled)
+
+
+class Aimer:
+    """Records what its Target selected on each update()."""
+
+    def __init__(self, node):
+        self.target = talos.Target(node, Goal)
+        self.seen = None
+        self.source = ""
+
+    def update(self):
+        self.seen = self.target.get()
+        self.source = self.target.source
+
+
+class Driver:
+    """Writes the lift's teleop lane while `talking`."""
+
+    def __init__(self, node):
+        self.lane = talos.TargetLane(node, Goal, "lift", "teleop")
+        self.talking = True
+
+    def update(self):
+        if self.talking:
+            self.lane.send(height_rot=0.5, count=7)
+        else:
+            self.lane.release()
+
+
+class TargetTest(unittest.TestCase):
+    """The same selection the C++ talos::Target runs (target_test.cc)."""
+
+    def setUp(self):
+        self.sim = Sim.from_toml(ROBOT_TOML)
+        self.lift = self.sim.add(Aimer, "lift")
+        self.hw = SimHardware(self.sim)
+        self.hw.enable()
+        self.mode(enabled=True, teleop=True)
+
+    def mode(self, **flags):
+        self.hw.set_driver_station(**flags)
+        self.sim.step(0.02)
+
+    def hold(self, source, height, seconds=0.03):
+        for _ in range(round(seconds / 0.01)):
+            self.sim.publish_target(Goal, "lift", source, height_rot=height)
+            self.sim.step(0.01)
+
+    def seen(self):
+        return None if self.lift.seen is None else self.lift.seen.height_rot
+
+    def test_teleop_drives_and_never_sent_is_none(self):
+        self.sim.step(0.05)
+        self.assertIsNone(self.seen())
+        self.assertEqual(self.lift.source, "")
+        self.hold("teleop", 1.5)
+        self.assertEqual(self.seen(), 1.5)
+        self.assertEqual(self.lift.source, "teleop")
+
+    def test_release_falls_through_within_one_tick(self):
+        self.sim.publish_target(Goal, "lift", "teleop", height_rot=1.0)
+        self.sim.publish_target(Goal, "lift", "align", height_rot=2.0)
+        self.sim.step(0.01)
+        self.assertEqual((self.seen(), self.lift.source), (2.0, "align"))
+        self.sim.release_target(Goal, "lift", "align")
+        self.sim.step(0.01)
+        self.assertEqual((self.seen(), self.lift.source), (1.0, "teleop"))
+
+    def test_stale_lane_is_none(self):
+        self.hold("teleop", 1.0)
+        self.sim.step(0.09)
+        self.assertEqual(self.seen(), 1.0)
+        self.sim.step(0.01)
+        self.assertIsNone(self.seen())
+
+    def test_mode_switch_ignores_the_old_lane(self):
+        self.mode(enabled=True, autonomous=True)
+        self.hold("auto", 3.0)
+        self.assertEqual((self.seen(), self.lift.source), (3.0, "auto"))
+        self.hw.set_driver_station(enabled=True, teleop=True)
+        self.hold("auto", 3.0)
+        self.assertIsNone(self.seen())
+
+    def test_lane_from_before_the_mode_change_is_ignored(self):
+        self.hold("teleop", 1.0)
+        self.mode(enabled=True, autonomous=True)
+        self.mode(enabled=True, teleop=True)  # teleop lane still fresh
+        self.assertIsNone(self.seen())
+        self.hold("teleop", 1.25, 0.01)
+        self.assertEqual(self.seen(), 1.25)
+
+    def test_lane_in_the_same_drain_as_the_mode_change_is_accepted(self):
+        self.mode()  # attached, disabled
+        self.sim.step(0.001)  # off the grid packets and ticks share
+        self.hw.set_driver_station(enabled=True, teleop=True)
+        self.sim.step(0.009)  # the packet goes out just after this tick
+        self.sim.publish_target(Goal, "lift", "teleop", height_rot=0.5)
+        self.sim.step(0.01)
+        self.assertEqual(self.seen(), 0.5)
+
+    def test_robot_disabled_and_driver_station_loss_are_none(self):
+        self.hold("teleop", 1.0)
+        self.hw.enable(False)
+        self.hold("teleop", 1.0)
+        self.assertIsNone(self.seen())
+        self.hw.enable()
+        self.hold("teleop", 1.0)
+        self.assertEqual(self.seen(), 1.0)
+        self.hw.stop_driver_station()
+        self.hold("teleop", 1.0, 0.12)
+        self.assertIsNone(self.seen())
+
+    def test_lane_sends_and_releases(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        driver = sim.add(Driver, "planner")
+        lift = sim.add(Aimer, "lift")
+        hw = SimHardware(sim)
+        hw.enable()
+        hw.set_driver_station(enabled=True, teleop=True)
+        sim.step(0.04)
+        self.assertEqual(sim.latest_target(Goal, "lift", "teleop").count, 7)
+        self.assertEqual(lift.seen.height_rot, 0.5)
+        driver.talking = False
+        sim.step(0.02)
+        self.assertIsNone(sim.latest_target(Goal, "lift", "teleop"))
+        self.assertIsNone(lift.seen)
 
 
 class StateMachineTest(unittest.TestCase):

@@ -5,7 +5,6 @@ struct ChassisTarget {
   vx_mps:double;
   vy_mps:double;
   omega_radps:double;
-  enabled:bool;
 }
 
 struct DrivetrainState {

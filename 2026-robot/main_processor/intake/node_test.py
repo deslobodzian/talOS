@@ -21,18 +21,28 @@ intake = talos.load(os.path.join(HERE, "intake.py"))
 
 
 class IntakeTest(unittest.TestCase):
-    def run_intake(self, ask, enabled=True, beam=False, target_enabled=True,
-                   seconds=0.05, roller_connected=True):
-        """Publishes one target at t0, runs, returns (request, last state)."""
+    def run_intake(self, ask, enabled=True, beam=False, lane="send",
+                   seconds=0.05, roller_connected=True, ds_loss=False):
+        """Teleop DS, then one lane envelope ("send", "release" after a
+        send, or None for never sent); runs, returns (request, last state)."""
         sim = Sim(CONFIG)
         sim.add(intake.Intake, "intake")
         hw = SimHardware(sim)
         hw.enable(enabled)
+        hw.set_driver_station(enabled=True, teleop=True)
         hw.set_motor("intake", "roller", 0.0, 12.5)
         hw.set_connected("intake", "roller", roller_connected)
         hw.set_digital_input("intake", "intake_beam", beam)
-        sim.publish(IntakeTarget, topics.TARGET, enabled=target_enabled,
-                    roller_velocity_rps=ask)
+        sim.step(0.01)  # the teleop mode is current before the lane speaks
+        if lane is not None:
+            sim.publish_target(IntakeTarget, "intake", "teleop",
+                               roller_velocity_rps=ask)
+        if lane == "release":
+            sim.step(0.02)
+            sim.release_target(IntakeTarget, "intake", "teleop")
+        if ds_loss:
+            sim.step(0.02)
+            hw.stop_driver_station()
         sim.step(seconds)
         return (hw.motor_request("intake", "roller"),
                 sim.latest(IntakeState, topics.STATE))
@@ -57,9 +67,12 @@ class IntakeTest(unittest.TestCase):
         cases = [
             ("disabled robot", dict(ask=25.0, enabled=False),
              Inhibit.GATEWAY_NOT_READY),
-            ("disabled target", dict(ask=25.0, target_enabled=False),
-             Inhibit.TARGET_DISABLED),
-            ("stale target", dict(ask=25.0, seconds=0.3),
+            ("stale lane", dict(ask=25.0, seconds=0.3),
+             Inhibit.TARGET_STALE),
+            ("released lane", dict(ask=25.0, lane="release"),
+             Inhibit.TARGET_STALE),
+            ("never sent", dict(ask=25.0, lane=None), Inhibit.TARGET_STALE),
+            ("driver station lost", dict(ask=25.0, ds_loss=True, seconds=0.3),
              Inhibit.TARGET_STALE),
             ("nonfinite ask", dict(ask=math.nan), Inhibit.DEMAND_NONFINITE),
         ]
@@ -69,7 +82,7 @@ class IntakeTest(unittest.TestCase):
                 self.assertEqual(request.mode, talos.Mode.NEUTRAL)
                 self.assertEqual(state.inhibit, inhibit)
         # Only a live, finite ask is echoed as requested.
-        _, state = self.run_intake(25.0, target_enabled=False)
+        _, state = self.run_intake(25.0, lane="release")
         self.assertEqual(state.requested_velocity_rps, 0.0)
 
     def test_disconnected_roller_reports_feedback_invalid(self):
@@ -110,7 +123,13 @@ class BinaryTest(unittest.TestCase):
                    for s in doc["sources"]),
             sorted([("TIMER", "intake", 0),
                     ("WATCHER", "/hw/state", 1404),
-                    ("WATCHER", topics.TARGET, IntakeTarget.SizeOf()),
+                    ("WATCHER", "/hw/state/driver_station", 1404),
+                    # Lanes of the default policy: active (padded to the
+                    # message's 4-byte alignment) + IntakeTarget.
+                    ("WATCHER", "/intake/target/teleop",
+                     4 + IntakeTarget.SizeOf()),
+                    ("WATCHER", "/intake/target/auto",
+                     4 + IntakeTarget.SizeOf()),
                     ("SENDER", "/hw/request/intake", 1404),
                     ("SENDER", topics.STATE, IntakeState.SizeOf())]))
 

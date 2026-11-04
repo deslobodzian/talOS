@@ -207,7 +207,7 @@ test('the system graph reports every node, both ends of every topic, and health'
        // states are unreachable and their topics read as faults.
        assert.equal(result.version, 2);
        assert.equal(result.summary.endpoint_attributes, true);
-       assert.ok(result.summary.unconnected_topics >= 2);
+       assert.ok(result.summary.unconnected_topics >= 1);
        assert.equal(
            Object.values(result.summary.topics_by_health)
                .reduce((total: number, n: any) => total + Number(n), 0),
@@ -437,7 +437,7 @@ test('the agent fetches the declared graph from the bridge it follows',
                       'the agent never fetched /declared.json');
          const result =
              dispatch(agent.context(), 'get_declared_graph', {}) as any;
-         assert.equal(result.nodes.length, 7);
+         assert.equal(result.nodes.length, 6);
          assert.ok(result.nodes.some((n: any) => n.name === 'shooter'));
          // No system graph on this connection, so there is nothing to compare
          // the declared nodes against and it says so instead of guessing.
@@ -469,7 +469,7 @@ test('a bridge started without --declared leaves everything else working',
          agent.ingestSystemGraph(demoSystemGraph(500n));
          const graph =
              dispatch(agent.context(), 'get_system_graph', {}) as any;
-         assert.equal(graph.summary.nodes, 6);
+         assert.equal(graph.summary.nodes, 5);
        } finally {
          agent.close();
          bridge.close();

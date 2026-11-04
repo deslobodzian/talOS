@@ -235,6 +235,55 @@ webroot = "custom/dist"
   ExpectRejected("[studio]\nbridge = \"\"\n");
 }
 
+using Sources = std::vector<std::string>;
+
+TEST(ConfigTest, TargetPolicyDefaultsAndOverrides) {
+  const auto defaults = ParseRobotConfigString(kMotor);
+  EXPECT_EQ(defaults.targets.teleop, (Sources{"teleop"}));
+  EXPECT_EQ(defaults.targets.autonomous, (Sources{"auto"}));
+  EXPECT_TRUE(defaults.targets.test.empty());
+  EXPECT_EQ(defaults.TargetsFor("test"), defaults.targets);
+  EXPECT_EQ(defaults.TargetsFor("not_configured"), defaults.targets);
+
+  const auto cfg = Parse(R"(
+[robot.targets]
+autonomous = ["auto", "align"]
+test = ["test"]
+[subsystems.wrist]
+[subsystems.wrist.targets]
+teleop = ["align", "teleop"]
+test = []
+[subsystems.roller]
+)");
+  EXPECT_EQ(cfg.targets.teleop, (Sources{"teleop"}));
+  EXPECT_EQ(cfg.targets.autonomous, (Sources{"auto", "align"}));
+  const TargetPolicy& wrist = cfg.TargetsFor("wrist");
+  EXPECT_EQ(wrist.teleop, (Sources{"align", "teleop"}));
+  EXPECT_EQ(wrist.autonomous, (Sources{"auto", "align"}));  // the robot's
+  EXPECT_TRUE(wrist.test.empty());
+  EXPECT_EQ(wrist.Sources(), (Sources{"align", "teleop", "auto"}));
+  EXPECT_EQ(cfg.TargetsFor("roller"), cfg.targets);
+}
+
+TEST(ConfigTest, RejectsBadTargetPolicies) {
+  for (const char* body : {
+           "[robot.targets]\nteleoperated = [\"teleop\"]\n",  // unknown mode
+           "[robot.targets]\nteleop = \"teleop\"\n",          // not an array
+           "[robot.targets]\nteleop = [1]\n",                 // not a name
+           "[robot.targets]\nteleop = [\"Teleop\"]\n",        // not a segment
+           "[robot.targets]\nteleop = [\"tgt\"]\n",           // abbreviation
+           "[robot.targets]\nteleop = [\"a\", \"a\"]\n",      // twice
+           "[robot]\ntargets = 3\n",
+           "[subsystems.test.targets]\nauto = [\"auto\"]\n",
+           "[subsystems.test]\ntargets = [\"teleop\"]\n",
+       }) {
+    EXPECT_THROW(
+        ParseRobotConfigString(std::string(body) + std::string(kMotor)),
+        std::invalid_argument)
+        << body;
+  }
+}
+
 class ManifestTest : public ::testing::Test {
  protected:
   void SetUp() override {

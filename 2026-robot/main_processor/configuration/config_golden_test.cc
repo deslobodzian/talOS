@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "talOS/configuration/config_parser.h"
 #include "talOS/hardware/config.h"
@@ -323,6 +324,21 @@ TEST(ConfigTest, GoldenTestParsesSwerveRobotTomlEqualToSwerveConfig) {
       ParseRobotConfig("2026-robot/main_processor/configuration/robot.toml");
   const auto expected = ReferenceSwerveConfig(false);
   VerifyReferenceRobotConfig(config, expected);
+}
+
+TEST(ConfigTest, TargetPolicyIsTheDefaultForEveryActuatedSubsystem) {
+  const auto config =
+      ParseRobotConfig("2026-robot/main_processor/configuration/robot.toml");
+  const auto* subs = config.toml_data["subsystems"].as_table();
+  ASSERT_NE(subs, nullptr);
+  // No router node: each subsystem's Target picks its own lane.
+  EXPECT_FALSE(subs->contains("arbiter"));
+  for (const char* name : {"drivetrain", "shooter", "intake"}) {
+    const TargetPolicy& policy = config.TargetsFor(name);
+    EXPECT_EQ(policy.teleop, std::vector<std::string>{"teleop"}) << name;
+    EXPECT_EQ(policy.autonomous, std::vector<std::string>{"auto"}) << name;
+    EXPECT_TRUE(policy.test.empty()) << name;
+  }
 }
 
 TEST(ConfigTest, ExtraSubsystemShiftingLogicalIdsStillMatchesReferenceDevices) {

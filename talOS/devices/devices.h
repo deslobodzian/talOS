@@ -38,6 +38,7 @@
 #include <string_view>
 
 #include "talOS/devices/access.h"
+#include "talOS/devices/target.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/node/node.h"
 
@@ -245,6 +246,7 @@ class DriverStation {
   const driver_station::DriverStationData& data() const;
 
  private:
+  friend struct detail::DriverStationAccess;  // the targets' side: access.h
   bool flag(driver_station::DsFlags flag) const;
   detail::DriverStationLink* link_{nullptr};
 };

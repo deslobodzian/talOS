@@ -1,8 +1,9 @@
 # Design: automatic wiring (no arbiter, no hard-coded subsystems)
 
-Status: proposal. The rules it serves are in [METHODOLOGY.md](METHODOLOGY.md).
-Each item (D1–D6) is a separate change that can land and be verified on its
-own; §7 gives the order.
+Status: partially implemented checkpoint, not acceptance-complete. See
+[HANDOFF_AUTOMATIC_WIRING.md](HANDOFF_AUTOMATIC_WIRING.md) for current evidence,
+remaining work, and completion order. The rules it serves are in
+[METHODOLOGY.md](METHODOLOGY.md). D2, D3, D4, and D6 remain proposals.
 
 ## Problem
 
@@ -40,6 +41,13 @@ beyond reading descriptors.
 ---
 
 ## D1. Target lanes, resolved inside the consumer (replaces the arbiter)
+
+**Status: substantially implemented; integration and acceptance incomplete.**
+`talos::Target`/`TargetLane`/`TargetEnvelope` exist in `talOS/devices/target.h`,
+with C ABI version 12, Python wrappers, test helpers, configuration policy,
+and graph lane checks. The arbiter is deleted. Mode-transition ordering,
+selected-source registry reporting, and current-tree/live verification remain
+open; see [the handoff](HANDOFF_AUTOMATIC_WIRING.md).
 
 The pattern is ROS's `twist_mux`: several input lanes, a priority order, a
 timeout on each lane, and the highest-priority live lane wins. Here it is
@@ -134,7 +142,7 @@ who is driving each subsystem.
 ### Removed
 
 - the `arbiter` package and `subsystems/arbiter.toml`;
-- `GenericTarget` (two copies);
+- the arbiter's `GenericTarget`; the operator-interface copy remains until D4;
 - the `arbitrate` key;
 - `enabled` in target structs;
 - the scaffold's arbiter edits.
@@ -263,18 +271,26 @@ its lane active.
 
 ---
 
-## D5. The manifest is the single source
+## D5. The manifest is the single source (implemented; hardening and integration verification incomplete)
 
 - `robot.toml` `[[subsystems]]` is the only node list.
-- `bazel run //tools:sync_manifest -- <robot.toml>` writes
-  `<robot>/main_processor/manifest.bzl` (`ROBOT_NODES`). It is a short Python
-  `tomllib` script, the only reader besides the C++ parser.
-- `talos_bundle` and `talos_graph_test` take `ROBOT_NODES`.
-- `manifest_sync_test` fails when `manifest.bzl` is stale.
-- `new_subsystem` edits `robot.toml` and runs the sync. It stops editing BUILD
-  lists.
-- Bundling copies `defaults = "..."` files and non-default `path`s (a gap found
-  in the TODO audit).
+- `bazel run //tools:sync_manifest -- <dir>/robot.toml` writes
+  `<dir>/robot_manifest.bzl` beside the config (`<stem>_manifest.bzl` for
+  other names, e.g. `robot_py_manifest.bzl`): `NODES`, the node labels, and
+  `CONFIG_FILES`, every file the config reads besides itself (`include`,
+  `path`, `defaults`). It is a short Python `tomllib` script
+  (`tools/sync_manifest.py`), the only reader besides the C++ parser, and
+  follows the parser's `include`/`node`/`defaults` precedence.
+- `talos_bundle` (`nodes`, `config_files`) and `talos_graph_test` (`nodes`,
+  `data`) take `NODES` and `CONFIG_FILES`.
+- `manifest_sync_test` (`tools/sync_manifest.bzl`) runs the script with
+  `--check` and fails, with the regenerate command and a diff, when the
+  manifest is stale. It sees only the files `CONFIG_FILES` lists, so an entry
+  naming a new file fails too.
+- `new_subsystem` edits `robot.toml`, writes the subsystem file and
+  regenerates the manifest. It edits no BUILD file.
+- Bundling stages every config file at its path relative to the config, so
+  `defaults = "..."` files and non-default `path`s resolve in the bundle.
 
 **Acceptance:** adding a `[[subsystems]]` line without running the sync fails
 CI with the fix printed.

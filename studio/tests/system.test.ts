@@ -670,11 +670,12 @@ test('the demo reaches every health state a viewer can render', () => {
   // And each of them is the topic the demo's comment claims it is.
   assert.equal(running.get('/shooter/state'), 'orphaned');
   assert.equal(running.get('/hw/request/shooter'), 'orphaned');
-  assert.equal(running.get('/shooter/target'), 'unread');
+  assert.equal(running.get('/shooter/target/teleop'), 'unread');
   assert.equal(running.get('/talos/telemetry'), 'unread');
   assert.equal(running.get('/hw/command'), 'bridged');
   assert.equal(running.get('/drivetrain/target/auto'), 'unconnected');
-  assert.equal(running.get('/shooter/target/auto'), 'unconnected');
+  // Its only reader is the shooter, which never started, and nothing writes it.
+  assert.equal(running.get('/shooter/target/auto'), undefined);
   assert.equal(running.get('/hw/state'), 'lossy');
   assert.equal(running.get('/hw/request/drivetrain'), 'ok');
   assert.equal(starting.get('/hw/state'), 'idle');

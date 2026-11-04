@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -134,6 +135,13 @@ inline std::optional<std::string> CheckSegment(std::string_view segment,
 }
 
 }  // namespace detail
+
+// One segment of a topic name, e.g. a target lane's source
+// (`/drivetrain/target/<source>`); `what` names it in the message.
+inline std::optional<std::string> CheckSegmentName(std::string_view segment,
+                                                   std::string_view what) {
+  return detail::CheckSegment(segment, what);
+}
 
 // A node's name: its `[subsystems.<name>]` key, log stem and registry row.
 inline std::optional<std::string> CheckNodeName(std::string_view name) {
@@ -261,13 +269,28 @@ struct Diagnostic {
   }
 };
 
+// Each subsystem's target sources: every `<source>` its target policy lists
+// in any mode ([robot.targets] plus its own [targets]), keyed by subsystem.
+using TargetSources =
+    std::map<std::string, std::vector<std::string>, std::less<>>;
+
+// A target lane is `/<sub>/target/<source>`.
+inline bool IsTargetLane(std::string_view topic) {
+  const auto segments = detail::Segments(topic);
+  return segments.size() == 3 && segments[1] == "target";
+}
+
 // Everything checkable about a whole graph, errors first.
 //
 // Errors cannot be correct in any configuration (two writers, a reader with no
-// writer, two message sizes, a malformed name). Warnings are normal during
-// development or in a partial launch (an unread topic, an owner not in this
-// session). Timers are skipped: their names are labels, not topics.
-inline std::vector<Diagnostic> LintGraph(const std::vector<NodeShape>& nodes) {
+// writer, two message sizes, a malformed name, a lane its subsystem never
+// reads). Warnings are normal during development or in a partial launch (an
+// unread topic, an owner not in this session, a policy lane nobody writes yet).
+// Timers are skipped: their names are labels, not topics. `target_sources`
+// comes from the config; a subsystem missing from it is not lane-checked.
+inline std::vector<Diagnostic> LintGraph(
+    const std::vector<NodeShape>& nodes,
+    const TargetSources& target_sources = {}) {
   std::vector<Diagnostic> out;
   const auto add = [&out](Severity severity, std::string subject,
                           std::string message) {
@@ -341,6 +364,19 @@ inline std::vector<Diagnostic> LintGraph(const std::vector<NodeShape>& nodes) {
                     "', which is also its subject; a '" + role +
                     "' topic is written by whoever is asking, not by the "
                     "subsystem being asked");
+          if (IsTargetLane(source.name) && owner != node.name) {
+            const std::string lane_source{segments[2]};
+            const auto policy = target_sources.find(owner);
+            if (policy != target_sources.end() &&
+                std::find(policy->second.begin(), policy->second.end(),
+                          lane_source) == policy->second.end())
+              add(Severity::ERROR, source.name,
+                  "is written by '" + node.name + "', but '" + lane_source +
+                      "' is in no mode of " + owner + "'s target policy, so " +
+                      owner +
+                      " never reads it; list it in [robot.targets] or " +
+                      owner + "'s [targets]");
+          }
         }
       } else {
         topic.readers.push_back(node.name);
@@ -387,6 +423,11 @@ inline std::vector<Diagnostic> LintGraph(const std::vector<NodeShape>& nodes) {
           "is read by " + join(topic.readers) +
               " but nothing publishes it; either the writer is missing or the "
               "two ends are spelled differently");
+    } else if (topic.writers.empty() && !topic.readers.empty() &&
+               IsTargetLane(topic.name)) {
+      add(Severity::WARNING, topic.name,
+          "is in the target policy of " + join(topic.readers) +
+              " but nothing writes it yet");
     }
     if (topic.readers.empty() && !topic.exempt)
       add(Severity::WARNING, topic.name,

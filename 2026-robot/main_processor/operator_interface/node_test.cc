@@ -3,13 +3,19 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
+#include <numbers>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include "drivetrain/drivetrain.h"
 #include "operator_interface/operator_interface.h"
+#include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/devices/testing.h"
 #include "talOS/node/testing.h"
 
@@ -17,6 +23,7 @@ namespace operator_interface {
 namespace {
 
 using namespace std::chrono_literals;
+using talos::testing::LatestTarget;
 using talos::testing::Sim;
 using talos::testing::SimHardware;
 namespace ds = talos::driver_station;
@@ -50,20 +57,6 @@ ds::DriverStationData DsState(std::uint32_t flags,
 constexpr std::uint32_t kTeleopEnabled =
     ds::kEnabled | ds::kTeleop | ds::kDsAttached;
 
-// Counts the chassis requests on the teleop lane, and the stops among them.
-struct Probe {
-  explicit Probe(talos::Node& node) {
-    node.subscribe<drivetrain::ChassisTarget>(
-        drivetrain::topics::kTeleopTarget,
-        [this](const drivetrain::ChassisTarget& target) {
-          ++chassis;
-          if (!target.enabled()) ++stops;
-        });
-  }
-  int chassis = 0;
-  int stops = 0;
-};
-
 // One operator interface whose [subsystems.operator_interface] table holds
 // `keys` and nothing else, so every other setting is the compiled default.
 class Harness {
@@ -94,29 +87,48 @@ period_us = 20000
     sim_.step(10ms);
   }
   void Advance(talos::Duration d) { sim_.step(d); }
-  int chassis_count() const { return probe_.chassis; }
-  int stop_count() const { return probe_.stops; }
-  drivetrain::ChassisTarget chassis() const {
-    return Last<drivetrain::ChassisTarget>(drivetrain::topics::kTeleopTarget);
+  // Envelopes written on /drivetrain/target/teleop so far.
+  std::uint64_t chassis_count() const {
+    return talos::detail::SimAccess::message_count(
+        sim_, "/drivetrain/target/teleop",
+        sizeof(talos::TargetEnvelope<drivetrain::ChassisTarget>));
   }
-  shooter::ShooterTarget shooter() const {
-    return Last<shooter::ShooterTarget>(shooter::topics::kTeleopTarget);
+  // The newest envelope on each teleop lane (nullopt: never written).
+  std::optional<talos::TargetEnvelope<drivetrain::ChassisTarget>> chassis_lane()
+      const {
+    return LatestTarget<drivetrain::ChassisTarget>(sim_, "drivetrain",
+                                                   "teleop");
   }
-  intake::IntakeTarget intake() const {
-    return Last<intake::IntakeTarget>(intake::topics::kTeleopTarget);
+  std::optional<talos::TargetEnvelope<shooter::ShooterTarget>> shooter_lane()
+      const {
+    return LatestTarget<shooter::ShooterTarget>(sim_, "shooter", "teleop");
   }
+  std::optional<talos::TargetEnvelope<intake::IntakeTarget>> intake_lane()
+      const {
+    return LatestTarget<intake::IntakeTarget>(sim_, "intake", "teleop");
+  }
+  // The message of an active lane; fails the test when it is released.
+  drivetrain::ChassisTarget chassis() const { return Active(chassis_lane()); }
+  shooter::ShooterTarget shooter() const { return Active(shooter_lane()); }
+  intake::IntakeTarget intake() const { return Active(intake_lane()); }
+  bool shooter_active() const { return IsActive(shooter_lane()); }
+  bool intake_active() const { return IsActive(intake_lane()); }
+  bool chassis_active() const { return IsActive(chassis_lane()); }
 
  private:
   template <class M>
-  M Last(const char* topic) const {
-    const auto message = sim_.latest<M>(topic);
-    EXPECT_TRUE(message.has_value()) << topic;
-    return message.value_or(M{});
+  static bool IsActive(const std::optional<talos::TargetEnvelope<M>>& e) {
+    EXPECT_TRUE(e.has_value());
+    return e.has_value() && e->active != 0;
+  }
+  template <class M>
+  static M Active(const std::optional<talos::TargetEnvelope<M>>& e) {
+    EXPECT_TRUE(IsActive(e));
+    return e.has_value() ? e->message : M{};
   }
 
   Sim sim_;
   OperatorInterface& node_ = sim_.add<OperatorInterface>("operator_interface");
-  Probe& probe_ = sim_.add<Probe>("probe");
   std::unique_ptr<SimHardware> hw_ = std::make_unique<SimHardware>(sim_);
 };
 
@@ -133,7 +145,6 @@ TEST(OperatorInterface, MapsStickAxesToChassisRequests) {
   EXPECT_NEAR(target.vx_mps(), 0.75 * kMaxLinear, 1e-9);
   EXPECT_NEAR(target.vy_mps(), 0.5 * kMaxLinear, 1e-9);
   EXPECT_NEAR(target.omega_radps(), 0.25 * kMaxAngular, 1e-9);
-  EXPECT_TRUE(target.enabled());
 }
 
 TEST(OperatorInterface, DeadbandIsZeroInsideAndContinuousAtTheThreshold) {
@@ -153,11 +164,9 @@ TEST(OperatorInterface, TuningAndBindingsComeFromTheSubsystemTable) {
       "intake_target_rps = 12.5\nintake_button = 4\n"};
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0, /*buttons=*/1)));
   EXPECT_NEAR(harness.chassis().vx_mps(), 2.0, 1e-9);
-  EXPECT_FALSE(harness.shooter().enabled());  // button 1 is no longer shoot
+  EXPECT_FALSE(harness.shooter_active());  // button 1 is no longer shoot
   harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/4 | 8)));
-  EXPECT_TRUE(harness.shooter().enabled());
   EXPECT_NEAR(harness.shooter().target_velocity_rps(), 75.0, 1e-9);
-  EXPECT_TRUE(harness.intake().enabled());
   EXPECT_NEAR(harness.intake().roller_velocity_rps(), 12.5, 1e-6);
 }
 
@@ -227,48 +236,45 @@ TEST(OperatorInterface, RequestsNothingWhenDisabledAutonomousOrDisconnected) {
   for (const auto& [flags, stick] : cases) {
     Harness harness{kNoDeadbandRobotRelative};
     harness.Push(DsState(flags, stick));
-    EXPECT_EQ(harness.chassis_count(), 0);
+    EXPECT_EQ(harness.chassis_count(), 0u);
   }
 }
 
-TEST(OperatorInterface, PublishesOneStopPerTargetOnTheDisableEdge) {
+TEST(OperatorInterface, ReleasesEveryLaneOnceOnTheDisableEdge) {
   Harness harness{kNoDeadbandRobotRelative};
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0, /*buttons=*/3)));
-  ASSERT_GT(harness.chassis_count(), 0);
-  ASSERT_EQ(harness.stop_count(), 0);
-  EXPECT_TRUE(harness.shooter().enabled());
-  EXPECT_TRUE(harness.intake().enabled());
+  ASSERT_TRUE(harness.chassis_active());
+  ASSERT_TRUE(harness.shooter_active());
+  ASSERT_TRUE(harness.intake_active());
 
-  // Disabled with the stick still deflected: every subsystem is told to stop
-  // rather than left to time the last request out.
+  // Disabled with the stick still deflected: every lane is released rather
+  // than left to time the last request out.
   harness.Push(DsState(ds::kDsAttached, Stick(0, -1.0f, 0, 3)));
-  EXPECT_EQ(harness.stop_count(), 1);
-  EXPECT_FALSE(harness.chassis().enabled());
-  EXPECT_NEAR(harness.chassis().vx_mps(), 0.0, 1e-12);
-  EXPECT_FALSE(harness.shooter().enabled());
-  EXPECT_FALSE(harness.intake().enabled());
+  EXPECT_FALSE(harness.chassis_active());
+  EXPECT_FALSE(harness.shooter_active());
+  EXPECT_FALSE(harness.intake_active());
+  const std::uint64_t after_release = harness.chassis_count();
 
   // Staying disabled is not another edge.
   harness.Push(DsState(ds::kDsAttached, Stick(0, -1.0f, 0)));
-  EXPECT_EQ(harness.stop_count(), 1);
+  EXPECT_EQ(harness.chassis_count(), after_release);
 }
 
-TEST(OperatorInterface, ASilentDriverStationGetsOneStopPerTarget) {
+TEST(OperatorInterface, ASilentDriverStationReleasesEveryLaneOnce) {
   Harness harness{kNoDeadbandRobotRelative};
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0, /*buttons=*/3)));
-  ASSERT_GT(harness.chassis_count(), 0);
-  ASSERT_EQ(harness.stop_count(), 0);
-  ASSERT_TRUE(harness.chassis().enabled());
+  ASSERT_TRUE(harness.chassis_active());
 
   // No packet arrives to say "disabled"; the last one ages past the command
-  // timeout and update() stops every target once.
+  // timeout and update() releases every lane once.
   harness.Silence();
   harness.Advance(300ms);
-  EXPECT_EQ(harness.stop_count(), 1);
-  EXPECT_FALSE(harness.chassis().enabled());
-  EXPECT_NEAR(harness.chassis().vx_mps(), 0.0, 1e-12);
-  EXPECT_FALSE(harness.shooter().enabled());
-  EXPECT_FALSE(harness.intake().enabled());
+  EXPECT_FALSE(harness.chassis_active());
+  EXPECT_FALSE(harness.shooter_active());
+  EXPECT_FALSE(harness.intake_active());
+  const std::uint64_t after_release = harness.chassis_count();
+  harness.Advance(100ms);
+  EXPECT_EQ(harness.chassis_count(), after_release);
 }
 
 TEST(OperatorInterface, RequestsNothingWithoutTheDsAttachedFlag) {
@@ -277,20 +283,18 @@ TEST(OperatorInterface, RequestsNothingWithoutTheDsAttachedFlag) {
   Harness harness{kNoDeadbandRobotRelative};
   harness.Push(DsState(ds::kEnabled | ds::kTeleop, Stick(0, -0.9f, 0)));
   harness.Advance(100ms);
-  EXPECT_EQ(harness.chassis_count(), 0);
+  EXPECT_EQ(harness.chassis_count(), 0u);
 }
 
 TEST(OperatorInterface, RunsShooterOnButtonOneAndIntakeOnButtonTwo) {
   Harness harness;
   harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/1)));
-  EXPECT_TRUE(harness.shooter().enabled());
   EXPECT_NEAR(harness.shooter().target_velocity_rps(), 60.0, 1e-9);
-  EXPECT_FALSE(harness.intake().enabled());
-  EXPECT_TRUE(harness.chassis().enabled());
+  EXPECT_FALSE(harness.intake_active());
+  EXPECT_TRUE(harness.chassis_active());
 
   harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/2)));
-  EXPECT_FALSE(harness.shooter().enabled());
-  EXPECT_TRUE(harness.intake().enabled());
+  EXPECT_FALSE(harness.shooter_active());
   EXPECT_NEAR(harness.intake().roller_velocity_rps(), 30.0, 1e-6);
 }
 
@@ -315,41 +319,132 @@ can_id = 1
   sim.add<OperatorInterface>("operator_interface");
   SimHardware hw{sim};
 
-  // Button 3 (bit 2) pressed in teleop -> enabled with demand 25.0.
+  const auto wrist = [&sim] {
+    return LatestTarget<GenericTarget>(sim, "wrist", "teleop");
+  };
+
+  // Button 3 (bit 2) pressed in teleop -> the lane asks for 25.0.
   hw.set_driver_station(
       DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/1u << 2)));
   sim.step(10ms);
-  auto target = sim.latest<GenericTarget>("/wrist/target/teleop");
-  ASSERT_TRUE(target.has_value());
-  const GenericTarget pressed = target.value_or(GenericTarget{});
-  EXPECT_EQ(pressed.enabled, 1u);
-  EXPECT_DOUBLE_EQ(pressed.demand, 25.0);
+  ASSERT_TRUE(wrist().has_value());
+  EXPECT_EQ(wrist()->active, 1u);
+  EXPECT_DOUBLE_EQ(wrist()->message.demand, 25.0);
 
-  // Button 3 released -> disabled with demand 0.0.
+  // Button 3 released -> the lane is released.
   hw.set_driver_station(DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/0)));
   sim.step(10ms);
-  target = sim.latest<GenericTarget>("/wrist/target/teleop");
-  ASSERT_TRUE(target.has_value());
-  const GenericTarget released = target.value_or(GenericTarget{});
-  EXPECT_EQ(released.enabled, 0u);
-  EXPECT_DOUBLE_EQ(released.demand, 0.0);
+  ASSERT_TRUE(wrist().has_value());
+  EXPECT_EQ(wrist()->active, 0u);
 
-  // Press button 3 again, then disable robot -> falling-edge stop emitted.
+  // Press button 3 again, then disable the robot -> released on the edge.
   hw.set_driver_station(
       DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/1u << 2)));
   sim.step(10ms);
-  const auto repressed = sim.latest<GenericTarget>("/wrist/target/teleop");
-  ASSERT_TRUE(repressed.has_value());
-  ASSERT_EQ(repressed.value_or(GenericTarget{}).enabled, 1u);
+  ASSERT_TRUE(wrist().has_value());
+  ASSERT_EQ(wrist()->active, 1u);
 
   hw.set_driver_station(
       DsState(ds::kDsAttached, Stick(0, 0, 0, /*buttons=*/1u << 2)));
   sim.step(10ms);
-  target = sim.latest<GenericTarget>("/wrist/target/teleop");
-  ASSERT_TRUE(target.has_value());
-  const GenericTarget disabled = target.value_or(GenericTarget{});
-  EXPECT_EQ(disabled.enabled, 0u);
-  EXPECT_DOUBLE_EQ(disabled.demand, 0.0);
+  ASSERT_TRUE(wrist().has_value());
+  EXPECT_EQ(wrist()->active, 0u);
+}
+
+// --- the teleop chain on the real robot config ---------------------------
+
+std::string RobotConfig() {
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error));
+  const char* location = std::getenv("TALOS_TEST_CONFIG");
+  if (!runfiles || location == nullptr) {
+    throw std::runtime_error("robot config unavailable: " + error);
+  }
+  return runfiles->Rlocation(location);
+}
+
+// The whole teleop path, with the same nodes the launcher starts and
+// nothing stubbed: a joystick packet lands on /hw/state/driver_station (sent
+// by SimHardware, as the bridge forwards it), the operator interface writes
+// it to /drivetrain/target/teleop, the drivetrain's Target selects that lane
+// because the mode says teleop, and resolves it into per-module requests.
+class TeleopChain : public ::testing::Test {
+ protected:
+  void Push(const ds::DriverStationData& data) {
+    hw.set_driver_station(data);
+    sim.step(20ms);
+  }
+  static ds::DriverStationData ForwardStick() {
+    return DsState(kTeleopEnabled, Stick(0, -1.0f, 0));  // full forward
+  }
+  void ExpectModulesNeutral() const {
+    for (const auto& module : geometry.modules) {
+      EXPECT_EQ(hw.motor_request("drivetrain", module.drive).mode,
+                talos::hardware::Mode::kNeutral)
+          << module.name;
+    }
+  }
+
+  Sim sim{RobotConfig()};
+  OperatorInterface& operator_interface_node =
+      sim.add<OperatorInterface>("operator_interface");
+  drivetrain::Drivetrain& drivetrain_node =
+      sim.add<drivetrain::Drivetrain>("drivetrain");
+  SimHardware hw{sim};
+  const drivetrain::SwerveGeometry geometry = drivetrain::BuildSwerveGeometry(
+      talos::config::ParseRobotConfig(RobotConfig()), "drivetrain");
+
+  void SetUp() override { hw.enable(); }
+};
+
+TEST_F(TeleopChain, JoystickDeflectionReachesTheSwerveModulesAsVelocity) {
+  Push(ForwardStick());
+  // 4 m/s over a 0.0508 m wheel, below the 20 rps drive ceiling, so the
+  // request is not desaturated.
+  const double expected_rps = 4.0 / (2 * std::numbers::pi * 0.0508);
+  for (const auto& module : geometry.modules) {
+    const auto drive = hw.motor_request("drivetrain", module.drive);
+    const auto steer = hw.motor_request("drivetrain", module.steer);
+    EXPECT_EQ(drive.mode, talos::hardware::Mode::kVelocity) << module.name;
+    EXPECT_NEAR(drive.demand, expected_rps, 1e-9) << module.name;
+    EXPECT_EQ(steer.mode, talos::hardware::Mode::kPosition) << module.name;
+    EXPECT_NEAR(steer.demand, 0.0, 1e-9) << module.name;
+  }
+}
+
+TEST_F(TeleopChain, ReleasingTheStickStopsTheModulesWithoutWaitingForTimeout) {
+  Push(ForwardStick());
+  ASSERT_EQ(hw.motor_request("drivetrain", geometry.modules[0].drive).mode,
+            talos::hardware::Mode::kVelocity);
+  Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+  for (const auto& module : geometry.modules) {
+    EXPECT_NEAR(hw.motor_request("drivetrain", module.drive).demand, 0.0, 1e-9)
+        << module.name;
+  }
+}
+
+TEST_F(TeleopChain, DisablingOrLosingTheDriverStationStopsTheModules) {
+  Push(ForwardStick());
+  ASSERT_EQ(hw.motor_request("drivetrain", geometry.modules[0].drive).mode,
+            talos::hardware::Mode::kVelocity);
+  Push(DsState(ds::kDsAttached, Stick(0, -1.0f, 0)));
+  ExpectModulesNeutral();
+
+  Push(ForwardStick());
+  ASSERT_EQ(hw.motor_request("drivetrain", geometry.modules[0].drive).mode,
+            talos::hardware::Mode::kVelocity);
+  hw.stop_driver_station();
+  sim.step(200ms);
+  ExpectModulesNeutral();
+}
+
+TEST_F(TeleopChain, AutonomousIgnoresTheSticks) {
+  Push(DsState(ds::kEnabled | ds::kAutonomous | ds::kDsAttached,
+               Stick(0, -1.0f, 0)));
+  sim.step(40ms);
+  ExpectModulesNeutral();
 }
 
 }  // namespace

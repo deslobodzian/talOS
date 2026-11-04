@@ -540,12 +540,23 @@ inline bool ProbeDescribe(const std::string& binary_path,
   return true;
 }
 
+// Every subsystem's target sources, for the lane checks in LintGraph.
+inline naming::TargetSources TargetSourcesOf(
+    const config::RobotConfig& robot_config) {
+  naming::TargetSources sources;
+  for (const auto& [subsystem, policy] : robot_config.subsystem_targets) {
+    sources.emplace(subsystem, policy.Sources());
+  }
+  return sources;
+}
+
 // Phase one of a launch: ask every binary in the roster what it is, assemble
 // the graph they describe, and lint it. The binaries, not the config, are the
 // source: a second declaration of the topology is a thing to forget to update.
 inline std::vector<naming::Diagnostic> DescribeGraph(
     const std::vector<NodeSpec>& specs, const LauncherOptions& options,
-    std::vector<NodeDescription>& out) {
+    std::vector<NodeDescription>& out,
+    const naming::TargetSources& target_sources = {}) {
   out.clear();
   out.reserve(specs.size());
 
@@ -588,7 +599,7 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
     out.push_back(std::move(described));
   }
 
-  auto diagnostics = naming::LintGraph(shapes);
+  auto diagnostics = naming::LintGraph(shapes, target_sources);
   diagnostics.insert(diagnostics.end(), probe_findings.begin(),
                      probe_findings.end());
   return diagnostics;
@@ -979,7 +990,8 @@ class Launcher {
 
     // Phase one: describe and lint before anything starts.
     std::vector<NodeDescription> described;
-    const auto diagnostics = DescribeGraph(node_specs, options_, described);
+    const auto diagnostics = DescribeGraph(node_specs, options_, described,
+                                           TargetSourcesOf(robot_config));
     const std::size_t declared_topics = CountDeclaredTopics(described);
 
     const std::string graph_path = options_.output_dir + "/graph.json";

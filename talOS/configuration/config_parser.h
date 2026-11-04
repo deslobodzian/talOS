@@ -32,9 +32,37 @@
 #include <vector>
 
 #include "talOS/hardware/config.h"
+#include "talOS/introspection/names.h"
 #include "toml.hpp"
 
 namespace talos::config {
+
+// Which target lanes (/<sub>/target/<source>) drive a subsystem in each
+// Driver Station mode, highest priority first. [robot.targets] sets the
+// default for every subsystem; a subsystem's own [targets] table (in a
+// single-file config, [subsystems.<name>.targets]) replaces the modes it
+// lists.
+struct TargetPolicy {
+  std::vector<std::string> teleop{"teleop"};
+  std::vector<std::string> autonomous{"auto"};
+  std::vector<std::string> test{};  // pit tests opt in: test = ["test"]
+
+  // Every source named by any mode, once, in the order teleop, autonomous,
+  // test list them.
+  std::vector<std::string> Sources() const {
+    std::vector<std::string> out;
+    for (const auto* mode : {&teleop, &autonomous, &test}) {
+      for (const auto& source : *mode) {
+        if (std::find(out.begin(), out.end(), source) == out.end()) {
+          out.push_back(source);
+        }
+      }
+    }
+    return out;
+  }
+
+  bool operator==(const TargetPolicy&) const = default;
+};
 
 struct RobotConfig {
   hardware::Config hardware;
@@ -77,6 +105,17 @@ struct RobotConfig {
       }
     }
     return nullptr;
+  }
+
+  // [robot.targets], and each subsystem's policy with its [targets] applied.
+  TargetPolicy targets;
+  std::map<std::string, TargetPolicy, std::less<>> subsystem_targets;
+
+  // The policy of `subsystem`; the robot default for a name not in the
+  // config.
+  const TargetPolicy& TargetsFor(std::string_view subsystem) const {
+    const auto it = subsystem_targets.find(subsystem);
+    return it != subsystem_targets.end() ? it->second : targets;
   }
 };
 
@@ -275,6 +314,48 @@ inline RawDevice ParseEncoder(const toml::table& t, const std::string& name) {
   return {.name = name, .config = std::move(e)};
 }
 
+// Applies a [targets] table over `policy`: each listed mode is replaced. Keys
+// are the Driver Station modes; values are arrays of source names, which are
+// topic segments (talOS/NAMING.md) because they end a lane's topic.
+inline void ApplyTargetPolicy(const toml::table& tbl, TargetPolicy& policy,
+                              const std::string& where) {
+  for (auto&& [key, value] : tbl) {
+    const std::string mode{key.str()};
+    std::vector<std::string>* lanes = mode == "teleop" ? &policy.teleop
+                                      : mode == "autonomous"
+                                          ? &policy.autonomous
+                                      : mode == "test" ? &policy.test
+                                                       : nullptr;
+    if (lanes == nullptr) {
+      throw std::invalid_argument(where + ": unknown mode '" + mode +
+                                  "' (modes are teleop, autonomous, test)");
+    }
+    const auto* sources = value.as_array();
+    if (sources == nullptr) {
+      throw std::invalid_argument(where + "." + mode +
+                                  " must be an array of source names");
+    }
+    std::vector<std::string> parsed;
+    for (auto&& item : *sources) {
+      const auto source = item.value_exact<std::string>();
+      if (!source) {
+        throw std::invalid_argument(where + "." + mode +
+                                    " must be an array of source names");
+      }
+      if (auto problem =
+              introspect::naming::CheckSegmentName(*source, "target source")) {
+        throw std::invalid_argument(where + "." + mode + ": " + *problem);
+      }
+      if (std::find(parsed.begin(), parsed.end(), *source) != parsed.end()) {
+        throw std::invalid_argument(where + "." + mode + " lists '" + *source +
+                                    "' twice");
+      }
+      parsed.push_back(*source);
+    }
+    *lanes = std::move(parsed);
+  }
+}
+
 }  // namespace detail
 
 // Effective controller endpoint: an explicit CLI value wins, otherwise the
@@ -319,6 +400,13 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
         *robot, "controller_port", result.controller_port, "[robot]");
     result.local_port =
         detail::ReadPort(*robot, "local_port", result.local_port, "[robot]");
+    if (robot->contains("targets")) {
+      const auto* targets = (*robot)["targets"].as_table();
+      if (targets == nullptr) {
+        throw std::invalid_argument("[robot.targets] must be a table");
+      }
+      detail::ApplyTargetPolicy(*targets, result.targets, "[robot.targets]");
+    }
   }
 
   if (auto* studio = tbl["studio"].as_table()) {
@@ -340,6 +428,15 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     auto* sub_tbl = sub_val.as_table();
     if (!sub_tbl) continue;
     result.subsystems[sub_name].subsystem = sub_name;
+    TargetPolicy& policy = result.subsystem_targets[sub_name] = result.targets;
+    if (sub_tbl->contains("targets")) {
+      const auto* targets = (*sub_tbl)["targets"].as_table();
+      const std::string where = "[subsystems." + sub_name + ".targets]";
+      if (targets == nullptr) {
+        throw std::invalid_argument(where + " must be a table");
+      }
+      detail::ApplyTargetPolicy(*targets, policy, where);
+    }
 
     auto each = [&](const char* section, auto parse) {
       auto* devices = (*sub_tbl)[section].as_table();

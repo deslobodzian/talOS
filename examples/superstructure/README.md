@@ -1,26 +1,51 @@
 # Superstructure example
 
 An intake, an elevator, and a superstructure that sequences them, written as
-three **separate nodes** that talk only over topics:
+three **separate nodes** that talk only over topics. Goals travel on target
+lanes, `/<subsystem>/target/<source>`: each producer writes its own lane
+(`talos::TargetLane`) and each subsystem picks the live one for the current
+Driver Station mode (`talos::Target`):
 
 ```
- /superstructure/target ──▶ superstructure ──▶ /intake/target   ──▶ intake   (roller + beam break)
-                                 ▲  ▲      ──▶ /elevator/target ──▶ elevator (one motion-magic TalonFX)
-                                 │  └──────────── /intake/state   ◀──┘    │
-                                 └─────────────── /elevator/state ◀───────┘
+ /superstructure/target/teleop ─┐
+ /superstructure/target/auto   ─┴▶ superstructure ──▶ /intake/target/superstructure   ──▶ intake   (roller + beam break)
+                                       ▲  ▲        ──▶ /elevator/target/superstructure ──▶ elevator (one motion-magic TalonFX)
+                                       │  └──────────── /intake/state   ◀─────────────────┘     │
+                                       └─────────────── /elevator/state ◀──────────────────────┘
 ```
+
+Which lanes count in which mode is config. The superstructure uses the default
+`[robot.targets]` policy; the intake and elevator each replace it with a
+`[targets]` table in their subsystem file, so only the superstructure drives
+them, in both modes:
+
+| Subsystem | teleop | autonomous | Set in |
+|---|---|---|---|
+| superstructure | `/superstructure/target/teleop` | `/superstructure/target/auto` | default `[robot.targets]` |
+| intake | `/intake/target/superstructure` | `/intake/target/superstructure` | `[targets]` in `subsystems/intake.toml` |
+| elevator | `/elevator/target/superstructure` | `/elevator/target/superstructure` | `[targets]` in `subsystems/elevator.toml` |
+
+A Target has a goal only while the robot is enabled, the Driver Station is in
+an enabled mode, and that mode's lane is active (not released) and fresh
+(younger than `[robot] command_timeout_us`). With none, a subsystem is
+neutral: it calls no actuator.
 
 - **intake**: IDLE → INTAKING (roller in) → HOLDING once the beam breaks (small
-  hold voltage) → EJECTING (reverse for `eject_ms`) → IDLE.
-- **elevator**: motion magic to the goal height and holds it there. It reports
-  STOWED at 0, MOVING, or AT_GOAL (within `tolerance_rot`), and echoes the goal
-  that `at_goal` refers to. It keeps its last goal if its target goes stale.
+  hold voltage) → EJECTING (reverse for `eject_ms`) → IDLE. With no target it
+  behaves as asked for IDLE with the roller neutral; the state machine still
+  tracks the beam break and finishes a timed eject.
+- **elevator**: motion magic to the goal height while it has a target. It
+  reports STOWED at 0, MOVING, or AT_GOAL (within `tolerance_rot`), and echoes
+  the goal that `at_goal` refers to. With no target the lift is neutral (it
+  never holds an old goal); its status echoes goal 0 with `at_goal` false, and
+  reads STOWED within `tolerance_rot` of 0, MOVING elsewhere.
 - **superstructure**: STOWED → INTAKING (on INTAKE) → HOLDING (the intake
   has the piece) → RAISING (on SCORE_HIGH, elevator to `high_rot`) → SCORING
   (the elevator is at that height; intake ejects) → STOWED (the piece is gone).
-  When either mechanism's state goes stale it holds the current step and keeps
-  sending that step's goals; it never advances on old data. A stale
-  `/superstructure/target` counts as STOW.
+  It republishes both mechanism lanes every tick. When either mechanism's state
+  goes stale it holds the current step and keeps sending that step's goals; it
+  never advances on old data. No goal of its own (disabled, stale, released or
+  never sent) counts as STOW.
 
 Every tunable (voltages, eject time, tolerance, height) is a parameter read
 from the robot config: `node.param<T>("key")` in C++, `node.param("key")` in
@@ -39,10 +64,13 @@ of it. `talos::Motor roller{node, "roller"}` names a device in your
 subsystem's TOML, and the layer handles `/hw/state`, the per-node hardware
 request, and neutral-when-disabled. Your code is the class in between: read
 inputs, step a state machine, set outputs, publish a status. The intake and
-elevator use all three layers; the superstructure has no hardware, so it uses
-only the first. Python has the same three layers (`talos.Node`, then
-`talos.Motor(node, "roller")`, then your class), as a thin binding over the
-same C++ code, so both languages behave identically.
+elevator use all three layers. The superstructure has no hardware, but its goal
+is a `talos::Target` and its outputs are `talos::TargetLane`s, which also come
+from `talOS/devices` (a Target reads `/hw/state` and the Driver Station to know
+whether the robot is enabled and in which mode). Python has the same three
+layers (`talos.Node`, then `talos.Motor(node, "roller")` and
+`talos.Target(node, Msg)`, then your class), as a thin binding over the same
+C++ code, so both languages behave identically.
 
 ## Layout
 
@@ -65,12 +93,18 @@ bazel test //examples/superstructure/...
 ```
 
 `cpp/superstructure_test.cc` runs all three nodes in one `talos::testing::Sim`,
-with `SimHardware` standing in for the bridge and `config/robot.toml` as the
-config. It walks the whole sequence by publishing goals and flipping the beam
-break, and it checks the roller voltages, the elevator's motion-magic demand,
-`at_goal`, the eject, and the return to STOWED. It also checks that disabling
-the robot neutralizes every motor while every state machine keeps its state,
-and that stale mechanism states never advance the superstructure.
+with `SimHardware` standing in for the bridge and the Driver Station (enabled,
+in teleop) and `config/robot.toml` as the config. It walks the whole sequence
+by publishing the driver's goal on `/superstructure/target/teleop`
+(`PublishTarget`) and flipping the beam break, and it checks the roller
+voltages, the elevator's motion-magic demand, `at_goal`, the eject, and the
+return to STOWED. It also checks that disabling the robot neutralizes every
+motor (the superstructure, losing its own goal, steps back to HOLDING), that a
+missing, released or stale goal counts as STOW, and that stale mechanism
+states never advance the superstructure. The elevator alone goes neutral on a
+stale, released or never-sent lane, while disabled, on Driver Station loss,
+with the lift disconnected and on a non-finite goal; the intake alone goes
+neutral on a stale lane while keeping its state.
 `py/superstructure_test.py` runs the same scenarios on the Python nodes with
 `talos.testing.Sim` and `config/robot_py.toml`.
 
@@ -87,8 +121,7 @@ bazel build //talOS/launcher //talOS/bridge:hardware_node \
 ```
 
 Then run it live against the lightweight sim gateway, which stands in for the
-RoboRIO, stays enabled with no Driver Station, and moves motors straight to
-their demands:
+RoboRIO and moves motors straight to their demands:
 
 ```sh
 ./bazel-bin/talOS/launcher/launcher --config examples/superstructure/config/robot.toml \
@@ -98,15 +131,20 @@ their demands:
 Use `--config examples/superstructure/config/robot_py.toml` in either command
 to run the Python nodes instead. Both configs declare the same graph.
 
-Nothing in the example publishes `/superstructure/target`; a driver or
-autonomous node would. So the live graph comes up, sits STOWED, and holds the
-elevator at 0. The subscription is declared `{.optional = true}`, so the
-graph check accepts it having no publisher. The check reports no errors and
-three expected warnings: `/hw/state/driver_station`, `/hw/status` and
-`/superstructure/state` are published but nothing reads them, because the
-example has no driver or telemetry node. On a real robot, a driver node reads
-the driver station, publishes
-`/superstructure/target` and watches `/superstructure/state`.
+Nothing in the example publishes `/superstructure/target/teleop` or
+`/superstructure/target/auto`; a driver or autonomous node would. Nothing
+moves without a Driver Station in an enabled mode (the real Driver Station, or
+`talOS/driver_station`'s `send_joystick`): every Target is empty and every
+motor neutral. With an enabled teleop Driver Station, the live graph sits
+STOWED and holds the elevator at 0. The check reports no errors and four
+expected warnings: `/superstructure/target/teleop` and
+`/superstructure/target/auto` are in the superstructure's target policy but
+nothing writes them yet, and `/hw/status` and `/superstructure/state` are
+published but nothing reads them, because the example has no driver,
+autonomous or telemetry node. On a real robot, a driver node reads the Driver
+Station, writes `/superstructure/target/teleop` with a
+`talos::TargetLane<SuperstructureGoal>{node, "superstructure", "teleop"}` and
+watches `/superstructure/state`.
 
 ## Write your own mechanism
 
@@ -119,7 +157,8 @@ bazel run //tools:new_subsystem -- wrist --lang cpp   # or --lang py
 It writes `<robot>/main_processor/wrist/` (messages with an explicit
 `include_prefix`, the node, a Sim test covering the disabled and stale-target
 cases), the subsystem TOML with the lowest free CAN id marked as a
-placeholder, the manifest entry and the bundle lists. What follows explains
+placeholder, the `[[subsystems]]` entry in `robot.toml`, and the regenerated
+`robot_manifest.bzl` (no BUILD file lists nodes). What follows explains
 each generated piece, taking a wrist that goes to an angle as an example.
 
 1. **Messages.** Add `messages/wrist.fbs` and list it in `messages/BUILD`:
@@ -132,10 +171,12 @@ each generated piece, taking a wrist that goes to an angle as an example.
    Use structs only, with no tables or strings. C++ gets
    `#include "demo/wrist_generated.h"` and `demo::WristGoal`, with enums
    spelled `WristState::MOVING`. Python gets `from demo.WristGoal import
-   WristGoal`. Add the topic names to `topics` in `messages/BUILD`:
-   `"wrist_goal": "/wrist/target", "wrist_status": "/wrist/state"`. C++ reads
-   them as `topics::kWristGoal` (`#include "demo/topics.h"`), Python as
-   `topics.WRIST_GOAL` (`from demo import topics`).
+   WristGoal`. Add the state topic to `topics` in `messages/BUILD`:
+   `"wrist_status": "/wrist/state"`. C++ reads it as `topics::kWristStatus`
+   (`#include "demo/topics.h"`), Python as `topics.WRIST_STATUS`
+   (`from demo import topics`). The goal needs no topic entry: it arrives on
+   target lanes, `/wrist/target/<source>`, which `talos::Target` names from
+   the subsystem and its policy.
 2. **The class** (`cpp/wrist.h`):
    ```cpp
    class Wrist {
@@ -143,31 +184,36 @@ each generated piece, taking a wrist that goes to an angle as an example.
      using State = WristState;
      explicit Wrist(talos::Node& node)
          : motor_{node, "motor"},
-           goal_{node.subscribe<WristGoal>(topics::kWristGoal)},
+           goal_{node},
            status_{node.publish<WristStatus>(topics::kWristStatus)},
            sm_{node, State::STOWED},
            tolerance_rot_{node.param<double>("tolerance_rot")} {}
      void update() {
-       if (goal_.fresh()) goal_rot_ = goal_->angle_rot();
-       motor_.set_motion_magic(goal_rot_);
-       const bool at_goal = std::abs(motor_.position() - goal_rot_) <= tolerance_rot_;
+       const WristGoal* goal = goal_.get();  // null: disabled, stale, released
+       const bool drive = goal != nullptr && motor_.connected() &&
+                          std::isfinite(goal->angle_rot());
+       if (drive) motor_.set_motion_magic(goal->angle_rot());
+       const bool at_goal =
+           drive && std::abs(motor_.position() - goal->angle_rot()) <= tolerance_rot_;
        sm_.go(at_goal ? State::AT_GOAL : State::MOVING);
        status_.send(WristStatus{sm_.state(), motor_.position(), at_goal});
      }
     private:
      talos::Motor motor_;
-     talos::Subscription<WristGoal> goal_;
+     talos::Target<WristGoal> goal_;
      talos::Publisher<WristStatus> status_;
      talos::StateMachine<State> sm_;
      double tolerance_rot_;
-     double goal_rot_ = 0.0;
    };
    ```
    Then `cpp/wrist.cc` is two lines: the include and `TALOS_NODE(demo::Wrist)`.
-   Take every handle and topic in the constructor. Anything you don't set in
-   an `update()` goes out neutral, and every motor is neutral while the robot
-   is disabled. In Python it is `py/wrist.py`, a `class Wrist` with
-   `__init__(self, node)` and `update(self)`; see the side-by-side below.
+   Take every handle and topic in the constructor. Call an actuator only
+   inside `drive`: anything you don't set in an `update()` goes out neutral,
+   so with no target the wrist is neutral rather than holding an old goal, and
+   every motor is neutral while the robot is disabled. In Python it is
+   `py/wrist.py`, a `class Wrist` with `__init__(self, node)` and
+   `update(self)`, reading `self.goal = talos.Target(node, WristGoal)` with
+   `self.goal.get()` (None when there is no target).
 3. **BUILD** (`cpp/BUILD`): add `wrist.h` to `:mechanisms`, then
    ```
    talos_cc_node(name = "wrist", node_name = "wrist", srcs = ["wrist.cc"], deps = [":mechanisms"])
@@ -201,7 +247,16 @@ each generated piece, taking a wrist that goes to an angle as an example.
    ```
    `robot_py.toml` gets the same entry with
    `node = "//examples/superstructure/py:wrist"`. The device key
-   (`motors.motor`) is the name you give the handle.
+   (`motors.motor`) is the name you give the handle. The wrist reads the
+   default `[robot.targets]` lanes (`/wrist/target/teleop`,
+   `/wrist/target/auto`); to have the superstructure drive it instead, give
+   `wrist.toml` a `[targets]` table as `elevator.toml` does, and write
+   `talos::TargetLane<WristGoal>{node, "wrist", "superstructure"}` in the
+   superstructure. Then regenerate the manifests the graph tests read;
+   `manifest_sync_test` fails until you do:
+   ```sh
+   bazel run //tools:sync_manifest -- examples/superstructure/config/robot.toml examples/superstructure/config/robot_py.toml
+   ```
 5. **Test** it in `cpp/superstructure_test.cc` or a test of its own (Python:
    the same calls on `talos.testing.Sim`, with durations in seconds):
    ```cpp
@@ -209,12 +264,16 @@ each generated piece, taking a wrist that goes to an angle as an example.
    sim.add<demo::Wrist>("wrist");
    SimHardware hw{sim};
    hw.enable();
+   hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
    hw.ideal_motors();
-   sim.publish(topics::kWristGoal, WristGoal{0.25});
+   sim.step(10ms);  // the teleop mode begins
+   PublishTarget(sim, "wrist", "teleop", WristGoal{0.25});
    sim.step(50ms);
    EXPECT_EQ(hw.motor_request("wrist", "motor").mode, Mode::kMotionMagic);
    EXPECT_TRUE(sim.latest<WristStatus>(topics::kWristStatus)->at_goal());
    ```
+   and cover the disabled, stale, released and never-sent cases, which must
+   all leave the motor neutral (`docs/METHODOLOGY.md` §11).
 
 ## Wrapping C++ nodes in Python (`py/`)
 
@@ -238,12 +297,13 @@ Elevator = talos.cpp_node(
 ```
 
 When a subsystem is written directly in Python, it uses the same `talos.Node`,
-`talos.Motor`, and `talos.StateMachine` concepts (all backed by the single C++
-implementation through `talOS/node_api`).
+`talos.Motor`, `talos.Target`, `talos.TargetLane` and `talos.StateMachine`
+concepts (all backed by the single C++ implementation through
+`talOS/node_api`).
 
 Python reads message fields as snake_case attributes named as in the .fbs
-(`goal.value.height_rot`), and `send(**fields)` takes the same names; any
+(`goal.height_rot`), and `send(**fields)` takes the same names; any
 field you leave out is 0. A schema enum is a flatc class of int constants
 (`from demo.IntakeCommand import IntakeCommand`, then `IntakeCommand.EJECT`).
-Topic names come from the same `topics` dict as C++'s: `topics.ELEVATOR_GOAL`
-is `topics::kElevatorGoal`.
+Topic names come from the same `topics` dict as C++'s: `topics.ELEVATOR_STATUS`
+is `topics::kElevatorStatus`.

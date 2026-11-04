@@ -4,7 +4,10 @@
     intake = sim.add(Intake, "intake")
     hw = talos.testing.SimHardware(sim)
     hw.enable()
-    sim.publish(IntakeTarget, "/intake/target", roller_velocity_rps=30.0)
+    hw.set_driver_station(enabled=True, teleop=True)
+    sim.step(0.01)
+    sim.publish_target(IntakeTarget, "intake", "teleop",
+                       roller_velocity_rps=30.0)
     sim.step(0.1)
     assert hw.motor_request("intake", "roller").mode == talos.Mode.VELOCITY
 
@@ -88,6 +91,33 @@ class Sim:
         found = _abi.ok(lib.talos_sim_latest_raw(
             self._handle, _abi.encode(topic), buffer, mtype.size))
         return mtype.decode(buffer.raw) if found else None
+
+    def publish_target(self, msg, subsystem, source, message=None, **fields):
+        """Publishes an active target on /<subsystem>/target/<source>, as a
+        talos.TargetLane would."""
+        mtype = message_type(msg)
+        data = message._bytes if message is not None else mtype.encode(fields)
+        _abi.ok(lib.talos_sim_publish_target(
+            self._handle, _abi.encode(subsystem), _abi.encode(source), data,
+            mtype.size, mtype.alignment))
+
+    def release_target(self, msg, subsystem, source):
+        """Publishes a release (nothing to say) on that lane."""
+        mtype = message_type(msg)
+        _abi.ok(lib.talos_sim_publish_target(
+            self._handle, _abi.encode(subsystem), _abi.encode(source), None,
+            mtype.size, mtype.alignment))
+
+    def latest_target(self, msg, subsystem, source):
+        """The newest `msg` on /<subsystem>/target/<source>: the message
+        when active, None when released or never sent."""
+        mtype = message_type(msg)
+        buffer = ctypes.create_string_buffer(mtype.size)
+        active = ctypes.c_int32()
+        found = _abi.ok(lib.talos_sim_latest_target(
+            self._handle, _abi.encode(subsystem), _abi.encode(source), buffer,
+            mtype.size, mtype.alignment, active))
+        return mtype.decode(buffer.raw) if found and active.value else None
 
     def latest_bytes(self, topic):
         """The newest byte message on `topic`, or None."""
@@ -179,6 +209,11 @@ class SimHardware:
             packet.joysticks[port] = _joystick(stick)
         _abi.ok(lib.talos_sim_hardware_set_driver_station(self._handle,
                                                           packet))
+
+    def stop_driver_station(self):
+        """Stops forwarding: the Driver Station goes silent, as when its link
+        drops, while /hw/state keeps coming."""
+        _abi.ok(lib.talos_sim_hardware_set_driver_station(self._handle, None))
 
     def motor_request(self, node, device):
         """The last request `node` flushed for `device` (neutral before any):

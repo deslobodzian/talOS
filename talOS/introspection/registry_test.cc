@@ -326,12 +326,12 @@ TEST_F(Registry, EndpointAttributesSurviveTheSegment) {
                       .alignment = 8});
   manifest.push_back({.id = 2,
                       .kind = event::SourceKind::SENDER,
-                      .name = "/arbiter/request/shooter",
+                      .name = "/autonomous/request/shooter",
                       .message_bytes = 32,
                       .alignment = 8});
   manifest.push_back({.id = 3,
                       .kind = event::SourceKind::SENDER,
-                      .name = "/arbiter/state",
+                      .name = "/autonomous/state",
                       .message_bytes = 8,
                       .alignment = 8});
 
@@ -342,11 +342,11 @@ TEST_F(Registry, EndpointAttributesSurviveTheSegment) {
       {"/drivetrain/target/auto", naming::kSourceFlagOptional},
       // Two entries for one topic, which is how a node says both things
       // without having to OR the constants at the call site.
-      {"/arbiter/request/shooter", naming::kSourceFlagExternal},
-      {"/arbiter/request/shooter", naming::kSourceFlagOptional},
+      {"/autonomous/request/shooter", naming::kSourceFlagExternal},
+      {"/autonomous/request/shooter", naming::kSourceFlagOptional},
   };
 
-  NodeRegistration registration{{.name = "arbiter"}, path_};
+  NodeRegistration registration{{.name = "autonomous"}, path_};
   registration.publish(manifest, endpoints);
 
   auto reader = RegistryReader::open(path_);
@@ -364,13 +364,13 @@ TEST_F(Registry, EndpointAttributesSurviveTheSegment) {
   EXPECT_FALSE(sources[1].external());
   EXPECT_TRUE(sources[1].optional());
 
-  EXPECT_EQ(sources[2].name, "/arbiter/request/shooter");
+  EXPECT_EQ(sources[2].name, "/autonomous/request/shooter");
   EXPECT_TRUE(sources[2].external());
   EXPECT_TRUE(sources[2].optional());
 
   // Declared nothing, so it reads as an ordinary topic: the attribute is
   // keyed by name and must not leak to its neighbours.
-  EXPECT_EQ(sources[3].name, "/arbiter/state");
+  EXPECT_EQ(sources[3].name, "/autonomous/state");
   EXPECT_EQ(sources[3].flags, 0u);
 
   // The descriptive fields the flags word sits between are unaffected, which

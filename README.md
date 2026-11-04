@@ -77,7 +77,8 @@ Layers and rules: [ARCHITECTURE.md](ARCHITECTURE.md). Names:
 | `talOS/msgs` | shared geometry and control message structs |
 | `talOS/telemetry` | the Studio telemetry frame schema and byte-topic wire format |
 | `talOS/configuration`, `launcher`, `introspection` | `robot.toml` parser, the launcher, graph description and names |
-| `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle` |
+| `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle`, `talos_graph_test` |
+| `tools/sync_manifest.py` | writes a config's `robot_manifest.bzl` (`NODES`, `CONFIG_FILES`), which the bundle and graph test read; `manifest_sync_test` fails when it is stale |
 | `2026-robot/` | this season's robot ([README](2026-robot/README.md)) |
 | `examples/superstructure/` | intake + elevator + superstructure example |
 | `studio/` | the telemetry viewer |

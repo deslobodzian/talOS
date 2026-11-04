@@ -559,15 +559,33 @@ class DriverStationLink {
   }
   const driver_station::DriverStationData& data() const { return data_; }
 
+  DsMode Mode() const {
+    if (!Connected()) return DsMode::kNone;
+    const std::uint32_t flags = data_.fms.flags;
+    if ((flags & driver_station::kEnabled) == 0 ||
+        (flags & driver_station::kEStop) != 0) {
+      return DsMode::kNone;
+    }
+    if ((flags & driver_station::kAutonomous) != 0) return DsMode::kAutonomous;
+    if ((flags & driver_station::kTeleop) != 0) return DsMode::kTeleop;
+    if ((flags & driver_station::kTest) != 0) return DsMode::kTest;
+    return DsMode::kNone;
+  }
+  Time mode_since() const { return mode_since_; }
+
  private:
   void OnPacket(const void* data) {
     Packet packet{};
     std::memcpy(&packet, data, sizeof packet);
     driver_station::DriverStationData next{};
     if (!driver_station::Decode(packet.bytes(), next)) return;
+    // The mode as it stood when this packet arrived: none if the previous
+    // packet had already gone stale.
+    const DsMode before = Mode();
     data_ = next;
     have_ = true;
     received_ = node_.now();
+    if (Mode() != before) mode_since_ = received_;
     for (const auto& listener : listeners_) listener();
   }
 
@@ -575,8 +593,16 @@ class DriverStationLink {
   driver_station::DriverStationData data_{};
   bool have_ = false;
   Time received_{};
+  Time mode_since_{};
   std::vector<std::function<void()>> listeners_;
 };
+
+DsMode DriverStationAccess::mode(const DriverStation& ds) {
+  return ds.link_->Mode();
+}
+Time DriverStationAccess::mode_since(const DriverStation& ds) {
+  return ds.link_->mode_since();
+}
 
 }  // namespace detail
 

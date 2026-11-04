@@ -4,9 +4,10 @@ enum SuperstructureCommand : ubyte { STOW, INTAKE, SCORE_HIGH }
 
 enum SuperstructureState : ubyte { STOWED, INTAKING, HOLDING, RAISING, SCORING }
 
-// What the driver (or autonomous) asks for, on /superstructure/target.
-// Republish it every period: a goal older than [robot] command_timeout_us
-// counts as STOW.
+// What the driver (or autonomous) asks for, on the lanes
+// /superstructure/target/teleop (or /superstructure/target/auto). Republish
+// it every period: no live goal (stale past [robot] command_timeout_us,
+// released, or the robot disabled) counts as STOW.
 struct SuperstructureGoal {
   command:SuperstructureCommand;
 }

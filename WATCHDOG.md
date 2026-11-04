@@ -18,7 +18,9 @@ receive; enforce them. These are the review-specific traps.
 
 - A node-API change missing its `talOS/node_api` C ABI or `talOS/python/talos`
   mirror, or a device type missing one of hardware / devices / devices.py / RIO.
-- Two writers on one topic instead of `/<sub>/target/<source>` plus an arbiter.
+- Two writers on one topic instead of one `/<sub>/target/<source>` lane per
+  producer, or a consumer reading a target without `talos::Target` (a plain
+  subscription skips the mode, release and freshness rules).
 - A message changed in size or layout without every C++/Python/Studio consumer
   updated (Studio TS bindings come from `pnpm generate`).
 - `talOS/` gaining a dependency on a robot, an example, or `studio/`.

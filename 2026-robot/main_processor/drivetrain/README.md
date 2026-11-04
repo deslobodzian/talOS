@@ -41,18 +41,19 @@ which end of a topic is allowed to publish it.
 
 | Topic | Single publisher | Payload |
 |---|---|---|
-| `/drivetrain/target` | `arbiter` node | FlatBuffer `ChassisTarget` |
+| `/drivetrain/target/<source>` | that source's producer (`teleop`: `operator_interface`) | `talos::TargetEnvelope<ChassisTarget>` (`active` + `ChassisTarget`) |
 | `/hw/state` | Hardware bridge | Canonical hardware state in fixed `Packet` |
 | `/hw/request/drivetrain` | Drivetrain | Partial command, this subsystem's devices only, in fixed `Packet` |
 | `/hw/command` | Hardware bridge | Canonical hardware command in fixed `Packet` |
 
-The node subscribes to one target topic however many producers exist:
-`operator_interface` publishes `/drivetrain/target/teleop`, an auto routine
-`/drivetrain/target/auto`, and the `arbiter` node forwards exactly one of them
-to `/drivetrain/target`.
+Each producer writes its own lane: `operator_interface` publishes
+`/drivetrain/target/teleop`, an auto routine `/drivetrain/target/auto`. The
+node reads them through `talos::Target`, which follows the lane the robot's
+`[robot.targets]` policy names for the current Driver Station mode (nothing
+while the Driver Station is disabled, e-stopped or silent).
 
 Chassis units are meters/second and radians/second. Axes are forward X, left Y,
-CCW yaw. Targets carry an enable flag; a target older than the robot's
+CCW yaw. A released lane (`active = 0`), a lane older than the robot's
 `command_timeout_us` (by receive time), stale/invalid/disabled hardware state,
 or any module motor missing from the state produce neutral requests. Messages
 are bounded and go through the event loop recorder.
@@ -119,12 +120,19 @@ bazel run //2026-robot/main_processor/drivetrain:node -- --sim --log /tmp/drivet
 bazel run //2026-robot/main_processor/drivetrain:send_target -- 1 0 0 2
 ```
 
+`send_target` is a sim/bench tool only: it writes a drivetrain lane
+(`--source NAME`, default `teleop`) directly, bypassing the operator
+interface, so the drivetrain follows it only while enabled in a Driver Station
+mode whose policy selects that source (Teleoperated for `teleop`). On a robot,
+drive through the operator interface.
+
 Wait for the gateway to print `hardware gateway config=...` before starting the
 bridge; that line means its socket is open.
 
 ### Watching it work
 
-`monitor` subscribes to the target, state and command topics above and redraws
+`monitor` subscribes to one target lane (`--source NAME`, default `teleop`),
+the state and the command topics above and redraws
 them a few times a second. It publishes nothing and holds no hardware, so it is
 safe to start and stop at any time, against a simulation or a real robot:
 
@@ -136,7 +144,7 @@ bazel run //2026-robot/main_processor/drivetrain:monitor
 gateway   configured yes   enabled yes   commanding yes   fault  no
           epoch 2   age 0 ms   199 Hz   seq 568
 
-target    vx   1.00 m/s   vy   0.00 m/s   omega   0.00 rad/s   enabled yes   age 0 ms
+target    teleop lane   vx   1.00 m/s   vy   0.00 m/s   omega   0.00 rad/s   active yes   age 0 ms
 
 command   age 0 ms   201 Hz   seq 567
 
@@ -168,7 +176,7 @@ back to Disabled neutralizes them again immediately. That gate is the real
 thing, not a simulation detail: it is the same check that runs on the robot.
 
 The last command requests forward motion at 1 m/s for two seconds, then
-disables its target. The fake provides ideal actuator responses, not tire or
+releases its lane. The fake provides ideal actuator responses, not tire or
 motor physics. Gateway, bridge, and node run until Ctrl-C; `--duration-s N`
 provides bounded runs for tests.
 

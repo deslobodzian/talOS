@@ -5,6 +5,13 @@ name = "elevator"
 period_us = 10000
 tolerance_rot = 0.1  # at_goal when within this of the goal
 
+# Who drives the elevator, per Driver Station mode (highest priority first):
+# only the superstructure's lane, /elevator/target/superstructure, in both
+# teleop and autonomous. Replaces [robot.targets]' teleop/autonomous lists.
+[targets]
+teleop = ["superstructure"]
+autonomous = ["superstructure"]
+
 [motors.lift]
 type = "TalonFX"
 bus = "rio"

@@ -4,12 +4,17 @@
 #include "demo/intake_generated.h"
 #include "demo/superstructure_generated.h"
 #include "demo/topics.h"
+#include "talOS/devices/devices.h"
 #include "talOS/node/node.h"
 
 namespace demo {
 
 // Sequences the intake and the elevator, which are separate nodes: it only
-// reads their states and writes their goals.
+// reads their states and writes their "superstructure" target lanes
+// (/intake/target/superstructure, /elevator/target/superstructure) every
+// tick. Its own goal is a Target: /superstructure/target/teleop in teleop,
+// /superstructure/target/auto in autonomous (the default policy). No live
+// goal (disabled, stale, released, never sent) counts as STOW.
 //
 //   STOWED -> INTAKING -> HOLDING -> RAISING -> SCORING -> STOWED
 //          (INTAKE)    (has piece) (SCORE_HIGH) (at height) (piece gone)
@@ -18,22 +23,20 @@ class Superstructure {
   using State = SuperstructureState;
 
   explicit Superstructure(talos::Node& node)
-      // Nothing in this example publishes the goal (a driver or autonomous
-      // node would), so it is optional to the launcher's graph check.
-      : goal_{node.subscribe<SuperstructureGoal>(topics::kSuperstructureGoal,
-                                                 {.optional = true})},
+      : goal_{node},
         intake_{node.subscribe<IntakeStatus>(topics::kIntakeStatus)},
         elevator_{node.subscribe<ElevatorStatus>(topics::kElevatorStatus)},
-        intake_goal_{node.publish<IntakeGoal>(topics::kIntakeGoal)},
-        elevator_goal_{node.publish<ElevatorGoal>(topics::kElevatorGoal)},
+        intake_goal_{node, "intake", "superstructure"},
+        elevator_goal_{node, "elevator", "superstructure"},
         status_{
             node.publish<SuperstructureStatus>(topics::kSuperstructureStatus)},
         sm_{node, State::STOWED},
         high_rot_{node.param<double>("high_rot")} {}
 
   void update() {
+    const SuperstructureGoal* goal = goal_.get();
     const SuperstructureCommand command =
-        goal_.fresh() ? goal_->command() : SuperstructureCommand::STOW;
+        goal != nullptr ? goal->command() : SuperstructureCommand::STOW;
     // Only advance on what the mechanisms report now. If either one has gone
     // quiet, hold the current step and keep sending its goals.
     if (intake_.fresh() && elevator_.fresh()) advance(command);
@@ -100,11 +103,11 @@ class Superstructure {
     elevator_goal_.send(ElevatorGoal{elevator_height_rot});
   }
 
-  talos::Subscription<SuperstructureGoal> goal_;
+  talos::Target<SuperstructureGoal> goal_;
   talos::Subscription<IntakeStatus> intake_;
   talos::Subscription<ElevatorStatus> elevator_;
-  talos::Publisher<IntakeGoal> intake_goal_;
-  talos::Publisher<ElevatorGoal> elevator_goal_;
+  talos::TargetLane<IntakeGoal> intake_goal_;
+  talos::TargetLane<ElevatorGoal> elevator_goal_;
   talos::Publisher<SuperstructureStatus> status_;
   talos::StateMachine<State> sm_;
   double high_rot_;

@@ -426,4 +426,80 @@ TEST_F(NodeApi, DriverStationReadsWhatSimHardwareForwards) {
   talos_sim_hardware_destroy(hw);
 }
 
+struct Lanes {
+  int64_t target = -1;
+  int64_t lane = -1;
+};
+
+int32_t BuildLanes(TalosNode* node, void* user) {
+  auto& l = *static_cast<Lanes*>(user);
+  l.target = talos_target_open(node, sizeof(float), alignof(float));
+  // The roller writes its own subsystem's lane only in this test; the lint,
+  // not the API, refuses that in a session.
+  l.lane = talos_target_lane_open(node, "roller", "teleop", sizeof(float),
+                                  alignof(float));
+  return l.target < 0 || l.lane < 0 ? 1 : 0;
+}
+
+TEST_F(NodeApi, TargetSelectsTheTeleopLaneAndLanesRelease) {
+  Lanes lanes;
+  TalosNode* node = talos_sim_add(sim_, "roller", &BuildLanes, &lanes);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  ASSERT_EQ(talos_sim_hardware_enable(hw, 1), TALOS_OK);
+  TalosDriverStationPacket packet{};
+  packet.flags = TALOS_DS_ATTACHED | TALOS_DS_ENABLED | TALOS_DS_TELEOP;
+  ASSERT_EQ(talos_sim_hardware_set_driver_station(hw, &packet), TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+
+  float out = 0;
+  int32_t source = 7;
+  EXPECT_EQ(talos_target_get(node, lanes.target, &out, &source), 0);
+  EXPECT_EQ(source, -1);
+
+  const float speed = 12.5f;
+  ASSERT_EQ(talos_target_lane_send(node, lanes.lane, &speed, sizeof speed), 1);
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_target_get(node, lanes.target, &out, &source), 1);
+  EXPECT_FLOAT_EQ(out, 12.5f);
+  EXPECT_STREQ(talos_target_source_name(node, lanes.target, source), "teleop");
+  EXPECT_EQ(talos_target_get(node, lanes.target, nullptr, nullptr), 1);
+
+  float latest = 0;
+  int32_t active = -1;
+  ASSERT_EQ(talos_sim_latest_target(sim_, "roller", "teleop", &latest,
+                                    sizeof latest, alignof(float), &active),
+            1);
+  EXPECT_EQ(active, 1);
+  EXPECT_FLOAT_EQ(latest, 12.5f);
+
+  ASSERT_EQ(talos_target_lane_release(node, lanes.lane), 1);
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(talos_target_get(node, lanes.target, &out, &source), 0);
+
+  // The harness writes the same envelope.
+  const float other = 3.0f;
+  ASSERT_EQ(talos_sim_publish_target(sim_, "roller", "teleop", &other,
+                                     sizeof other, alignof(float)),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_target_get(node, lanes.target, &out, &source), 1);
+  EXPECT_FLOAT_EQ(out, 3.0f);
+
+  // Wrong sizes and alignments are refused, naming the problem.
+  EXPECT_EQ(talos_target_lane_send(node, lanes.lane, &speed, 8), TALOS_ERR);
+  EXPECT_EQ(talos_target_open(node, 12, 8), -1);
+  EXPECT_NE(std::string{talos_last_error()}.find("alignment"),
+            std::string::npos);
+  EXPECT_EQ(talos_target_source_name(node, lanes.target, 5), nullptr);
+
+  // A silent Driver Station selects nothing.
+  ASSERT_EQ(talos_sim_hardware_set_driver_station(hw, nullptr), TALOS_OK);
+  ASSERT_EQ(talos_target_lane_send(node, lanes.lane, &speed, sizeof speed), 1);
+  ASSERT_EQ(talos_sim_step(sim_, 150 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(talos_target_get(node, lanes.target, &out, &source), 0);
+  talos_sim_hardware_destroy(hw);
+}
+
 }  // namespace

@@ -10,10 +10,12 @@ talos.robot_enabled(node) is false. Feedback is in mechanism units and reads
 0 (connected False) until the first hardware state.
 """
 
+import ctypes
 import enum
 
 from talos import _abi
 from talos._abi import lib
+from talos._messages import message_type
 
 
 class Mode(enum.IntEnum):
@@ -259,3 +261,71 @@ class DriverStation:
             raise IndexError(f"no Driver Station joystick port {port} "
                              f"(ports are 0-{_abi.DS_MAX_JOYSTICKS - 1})")
         return Joystick(self._read().joysticks[port])
+
+
+class Target:
+    """The lanes of this node's target policy, resolved (talos::Target in
+    talOS/devices/target.h). Take it in __init__:
+
+        self.target = talos.Target(node, PositionTarget)
+        ...
+        t = self.target.get()   # None: disabled, stale or no live lane
+        if t is not None:
+            self.motor.set_motion_magic(t.position_rot)
+
+    get() returns the message of the first lane, in the current Driver
+    Station mode's priority order ([robot.targets], the subsystem's
+    [targets]), that is active, fresh and sent since the mode began, while
+    robot_enabled(node); otherwise None. `source` names that lane, or "".
+    """
+
+    def __init__(self, node, msg):
+        self._node = node._handle
+        self._type = message_type(msg)
+        self._index = _abi.index(lib.talos_target_open(
+            self._node, self._type.size, self._type.alignment))
+        self._buffer = ctypes.create_string_buffer(self._type.size)
+        self._source = ctypes.c_int32(-1)
+
+    def get(self):
+        if not _abi.ok(lib.talos_target_get(self._node, self._index,
+                                            self._buffer, self._source)):
+            return None
+        return self._type.decode(self._buffer.raw)
+
+    @property
+    def source(self):
+        if not _abi.ok(lib.talos_target_get(self._node, self._index, None,
+                                            self._source)):
+            return ""
+        return _abi.check(lib.talos_target_source_name(
+            self._node, self._index, self._source.value),
+            lambda name: name is None).decode()
+
+
+class TargetLane:
+    """One producer's lane, /<subsystem>/target/<source> (talos::TargetLane):
+
+        self.lane = talos.TargetLane(node, PositionTarget, "wrist", "auto")
+        self.lane.send(position_rot=0.25)   # republish every period
+        self.lane.release()                 # nothing to say
+    """
+
+    def __init__(self, node, msg, subsystem, source):
+        self._node = node._handle
+        self._type = message_type(msg)
+        self._index = _abi.index(lib.talos_target_lane_open(
+            self._node, _abi.encode(subsystem), _abi.encode(source),
+            self._type.size, self._type.alignment))
+
+    def send(self, message=None, **fields):
+        """send(field=value, ...) with the .fbs field names, or send(message)
+        to forward a received one."""
+        data = message._bytes if message is not None else (
+            self._type.encode(fields))
+        return bool(_abi.ok(lib.talos_target_lane_send(
+            self._node, self._index, data, len(data))))
+
+    def release(self):
+        return bool(_abi.ok(lib.talos_target_lane_release(
+            self._node, self._index)))

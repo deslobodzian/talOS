@@ -26,7 +26,7 @@ supply_limit_a = 40.0
 stator_limit_a = 80.0
 # Electrical + mechanical scaling. sensor_to_mechanism_ratio converts rotor
 # revs to wheel revs (1.0 = direct drive); max_velocity_rps caps what the
-# node may ask for no matter what the arbiter sends.
+# node may ask for no matter what its target lane asks.
 max_voltage = 12.0
 sensor_to_mechanism_ratio = 1.0
 max_velocity_rps = 100.0

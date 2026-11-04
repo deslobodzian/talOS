@@ -7,8 +7,7 @@ cc_library(
     hdrs = ["operator_interface.h"],
     include_prefix = "operator_interface",
     strip_include_prefix = ".",
-    # The arbiter's teleop-chain test runs the real operator interface.
-    visibility = ["//2026-robot/main_processor/arbiter:__pkg__"],
+    visibility = ["//visibility:private"],
     deps = [
         "//2026-robot/main_processor/drivetrain:messages",
         "//2026-robot/main_processor/intake:messages",
@@ -26,14 +25,26 @@ talos_cc_node(
     deps = [":operator_interface"],
 )
 
+# The operator interface on its own, plus the whole teleop chain (driver
+# station, operator interface, drivetrain) on the real robot config.
 cc_test(
     name = "node_test",
     size = "small",
     srcs = ["node_test.cc"],
+    data = [
+        "//2026-robot/main_processor/configuration:robot.toml",
+        "//2026-robot/main_processor/configuration:robot_config",
+    ],
+    env = {
+        "TALOS_TEST_CONFIG": "$(rlocationpath //2026-robot/main_processor/configuration:robot.toml)",
+    },
     deps = [
         ":operator_interface",
+        "//2026-robot/main_processor/drivetrain",
+        "//talOS/configuration",
         "//talOS/devices:testing",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
 )

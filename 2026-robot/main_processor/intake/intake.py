@@ -1,6 +1,7 @@
 """Intake: a roller wheel and a beam break.
 
-The arbiter asks for a wheel speed on /intake/target. Every tick the intake
+The selected target lane (/intake/target/<source>, picked per match mode by
+the robot's [robot.targets] policy) asks for a wheel speed. Every tick the intake
 spins the roller for that ask (holding still once a piece breaks the beam,
 unless asked to eject) and reports what it did on /intake/state. Gains live
 in the robot config ([motors.roller] slot0); the Talon closes the velocity
@@ -35,15 +36,14 @@ class Intake:
         self.node = node
         self.roller = talos.Motor(node, "roller")
         self.beam = talos.DigitalInput(node, "intake_beam")
-        self.target = node.subscribe(IntakeTarget, topics.TARGET)
+        self.target = talos.Target(node, IntakeTarget)
         self.state = node.publish(IntakeState, topics.STATE)
 
     def update(self):
-        target = self.target.value  # None until the first
-        live = self.target.fresh() and target.enabled
-        demand = (roller_demand(target.roller_velocity_rps, self.beam.value)
-                  if live else 0.0)
-        inhibit = self.inhibit(target, live, demand)
+        t = self.target.get()  # None: disabled, stale, released or never sent
+        demand = (roller_demand(t.roller_velocity_rps, self.beam.value)
+                  if t is not None else 0.0)
+        inhibit = self.inhibit(t, demand)
         if inhibit == Inhibit.DRIVE:
             self.roller.set_velocity(demand)  # otherwise the flush sends neutral
         self.state.send(
@@ -53,13 +53,11 @@ class Intake:
             requested_velocity_rps=demand if math.isfinite(demand) else 0.0,
             inhibit=inhibit)
 
-    def inhibit(self, target, live, demand):
+    def inhibit(self, t, demand):
         """Why the wheel must not drive this tick; the first reason wins."""
         if not talos.robot_enabled(self.node):
             return Inhibit.GATEWAY_NOT_READY
-        if target is None or not target.enabled:
-            return Inhibit.TARGET_DISABLED
-        if not live:
+        if t is None:
             return Inhibit.TARGET_STALE
         if not self.roller.connected:
             return Inhibit.FEEDBACK_INVALID

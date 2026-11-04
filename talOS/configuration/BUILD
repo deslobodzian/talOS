@@ -7,6 +7,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//talOS/hardware:config",
+        "//talOS/introspection:names",
         "@tomlplusplus//:toml++",
     ],
 )

@@ -149,8 +149,8 @@ const STUDIO_SLOT = 16384;
 //                declared graph is the other half of the answer: it names the
 //                node that was supposed to be here, which is the difference
 //                between a crash at startup and a topic nobody ever wrote.
-//   unread       /shooter/target -- the arbiter publishes it and the node that
-//                would read it is the one that never started. Also
+//   unread       /shooter/target/teleop -- operator_interface publishes it and
+//                the node that would read it is the one that never started. Also
 //                /talos/telemetry, whose reader is the Studio bridge: it holds
 //                an RTMS reader slot but claims no registry slot, so from the
 //                registry's side the feed has no subscriber.
@@ -158,9 +158,10 @@ const STUDIO_SLOT = 16384;
 //                link, so a shared-memory subscriber will never exist. The
 //                hardware node declares that end external, and the viewer says
 //                so rather than counting it as unread.
-//   unconnected  /drivetrain/target/auto and /shooter/target/auto -- ends
-//                declared optional. Autonomous is not written, so a missing
-//                peer is the design rather than a fault.
+//   unconnected  /drivetrain/target/auto -- a lane the drivetrain declares
+//                optional. Autonomous is not written, so a missing peer is the
+//                design rather than a fault. (/shooter/target/auto is declared
+//                the same way, but its only reader is the shooter.)
 //   lossy        /hw/state -- a 200 Hz consumer occasionally lapped by a 200 Hz
 //                producer.
 //   idle         every topic, in the first moments of a session: both ends
@@ -217,7 +218,24 @@ const DEMO_NODES: DemoNode[] = [
         hz: 200,
         dropsPerSecond: 2
       },
-      {kind: 'FETCHER', name: '/drivetrain/target', bytes: 32, hz: 50},
+      {kind: 'WATCHER', name: '/hw/state/driver_station', bytes: HW_PACKET, hz: 50},
+      // Every lane a Target reads is optional: no source is required to exist.
+      {
+        kind: 'FETCHER',
+        name: '/drivetrain/target/teleop',
+        bytes: 32,
+        hz: 50,
+        optional: true
+      },
+      // No autonomous publisher exists yet, and the drivetrain says so on the
+      // lane it reads: the auto topic has a reader, no writer, and no fault.
+      {
+        kind: 'FETCHER',
+        name: '/drivetrain/target/auto',
+        bytes: 32,
+        hz: 0,
+        optional: true
+      },
       {kind: 'SENDER', name: '/hw/request/drivetrain', bytes: HW_PACKET, hz: 200},
       {kind: 'SENDER', name: '/drivetrain/state', bytes: 48, hz: 200}
     ]
@@ -247,29 +265,14 @@ const DEMO_NODES: DemoNode[] = [
     sources: [
       {kind: 'TIMER', name: 'shooter', bytes: 0, hz: 200},
       {kind: 'WATCHER', name: '/hw/state', bytes: HW_PACKET, hz: 200},
-      {kind: 'FETCHER', name: '/shooter/target', bytes: 16, hz: 50},
-      {kind: 'SENDER', name: '/hw/request/shooter', bytes: HW_PACKET, hz: 200},
-      {kind: 'SENDER', name: '/shooter/state', bytes: 24, hz: 200}
-    ]
-  },
-  {
-    name: 'arbiter',
-    target: '//2026-robot/main_processor/arbiter:node',
-    pid: 4135,
-    periodUs: 20000,
-    sources: [
-      {kind: 'TIMER', name: 'arbiter', bytes: 0, hz: 50},
-      {kind: 'FETCHER', name: '/drivetrain/target/teleop', bytes: 32, hz: 50},
-      // No autonomous publisher exists yet, and the arbiter says so on the end
-      // it holds: both auto topics have a reader, no writer, and no fault.
+      {kind: 'WATCHER', name: '/hw/state/driver_station', bytes: HW_PACKET, hz: 50},
       {
         kind: 'FETCHER',
-        name: '/drivetrain/target/auto',
-        bytes: 32,
-        hz: 0,
+        name: '/shooter/target/teleop',
+        bytes: 16,
+        hz: 50,
         optional: true
       },
-      {kind: 'FETCHER', name: '/shooter/target/teleop', bytes: 16, hz: 50},
       {
         kind: 'FETCHER',
         name: '/shooter/target/auto',
@@ -277,8 +280,8 @@ const DEMO_NODES: DemoNode[] = [
         hz: 0,
         optional: true
       },
-      {kind: 'SENDER', name: '/drivetrain/target', bytes: 32, hz: 50},
-      {kind: 'SENDER', name: '/shooter/target', bytes: 16, hz: 50}
+      {kind: 'SENDER', name: '/hw/request/shooter', bytes: HW_PACKET, hz: 200},
+      {kind: 'SENDER', name: '/shooter/state', bytes: 24, hz: 200}
     ]
   },
   {

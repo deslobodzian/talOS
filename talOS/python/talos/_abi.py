@@ -7,7 +7,7 @@ raise, with the C++ message, or with the Python exception a callback raised.
 import ctypes
 import os
 
-ABI_VERSION = 11
+ABI_VERSION = 12
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -120,6 +120,15 @@ _SIGNATURES = {
     "talos_encoder_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
     "talos_driver_station": (c_int32, [c_void_p, CALLBACK, c_void_p]),
     "talos_driver_station_read": (c_int32, [c_void_p, _P(DriverStation)]),
+    "talos_target_open": (c_int64, [c_void_p, c_uint32, c_uint32]),
+    "talos_target_get": (c_int32, [c_void_p, c_int64, c_void_p,
+                                   _P(c_int32)]),
+    "talos_target_source_name": (c_char_p, [c_void_p, c_int64, c_int32]),
+    "talos_target_lane_open": (c_int64, [c_void_p, c_char_p, c_char_p,
+                                         c_uint32, c_uint32]),
+    "talos_target_lane_send": (c_int32, [c_void_p, c_int64, c_char_p,
+                                         c_uint32]),
+    "talos_target_lane_release": (c_int32, [c_void_p, c_int64]),
 }
 _TESTING_SIGNATURES = {
     "talos_sim_create": (c_void_p, [c_char_p]),
@@ -135,6 +144,11 @@ _TESTING_SIGNATURES = {
                                        c_uint32]),
     "talos_sim_latest_bytes": (c_int32, [c_void_p, c_char_p, c_void_p,
                                          c_uint32, _P(c_uint32)]),
+    "talos_sim_publish_target": (c_int32, [c_void_p, c_char_p, c_char_p,
+                                           c_char_p, c_uint32, c_uint32]),
+    "talos_sim_latest_target": (c_int32, [c_void_p, c_char_p, c_char_p,
+                                          c_void_p, c_uint32, c_uint32,
+                                          _P(c_int32)]),
     "talos_sim_hardware_create": (c_void_p, [c_void_p]),
     "talos_sim_hardware_destroy": (None, [c_void_p]),
     "talos_sim_hardware_enable": (c_int32, [c_void_p, c_int32]),

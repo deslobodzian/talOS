@@ -11,7 +11,9 @@ bazel build //2026-robot/main_processor:robot_bundle
 ```
 
 `talos_bundle` (`talOS/build/contract.bzl`) takes `nodes`, `config`
-(`robot.toml`) and `subsystems` (the `subsystems/*.toml` files) and writes
+(`robot.toml`) and `config_files`; the robot's BUILD passes `NODES` and
+`CONFIG_FILES` from the generated `configuration/robot_manifest.bzl`
+(`bazel run //tools:sync_manifest -- <robot.toml>`). It writes
 `bazel-bin/2026-robot/main_processor/robot_bundle/`:
 
 | Entry | What |
@@ -19,7 +21,7 @@ bazel build //2026-robot/main_processor:robot_bundle
 | `run.sh` | runs `./launcher --bundle <dir> --config config/robot.toml "$@"` |
 | `launcher` | `//talOS/launcher` |
 | `bin/` | node binaries and their runfiles (a Python node's carry `libtalos_node.so`) |
-| `config/` | `robot.toml` plus one `<name>.toml` per subsystem |
+| `config/` | `robot.toml` and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
 | `bundle_manifest.toml` | node names, targets, binaries, languages, config SHA-256 |
 
 Before deploying, set `[robot] controller_address` in the config to the RoboRIO

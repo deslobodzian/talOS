@@ -21,9 +21,14 @@
 // goes out at that moment. Devices are keyed by (node, device) exactly as the
 // node names them.
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
+#include <string>
 #include <string_view>
 
+#include "talOS/devices/target.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/node/testing.h"
@@ -65,6 +70,9 @@ class SimHardware {
   // The Driver Station packet to forward from now on, stamped with the sim
   // time as the Rio stamps it.
   void set_driver_station(const driver_station::DriverStationData& data);
+  // Stops forwarding: the Driver Station goes silent, as when its link
+  // drops, while /hw/state keeps coming.
+  void stop_driver_station();
 
   // Outputs: the last request flushed by that node for that device (neutral,
   // false and 0 before any).
@@ -77,5 +85,49 @@ class SimHardware {
   struct Impl;
   std::shared_ptr<Impl> impl_;  // the Sim's periodic callback holds a weak_ptr
 };
+
+// A Driver Station packet with `flags` (driver_station::kEnabled,
+// kTeleop, ...) plus kDsAttached, and no joysticks:
+//   hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+driver_station::DriverStationData DsPacket(std::uint32_t flags);
+
+// Target lanes, as a producer node writes them (talos::TargetLane).
+//   PublishTarget(sim, "shooter", "teleop", shooter::ShooterTarget{60.0});
+//   ReleaseTarget<shooter::ShooterTarget>(sim, "shooter", "teleop");
+//   LatestTarget<demo::ElevatorGoal>(sim, "elevator", "superstructure");
+// Envelopes go through the same encoder TargetLane uses.
+void PublishTargetRaw(Sim& sim, std::string_view subsystem,
+                      std::string_view source, const void* message,
+                      std::size_t bytes, std::size_t alignment);
+// The newest envelope on the lane: its message copied into `out` and
+// `active` set, or false when the lane has had none.
+bool LatestTargetRaw(const Sim& sim, std::string_view subsystem,
+                     std::string_view source, void* out, std::size_t bytes,
+                     std::size_t alignment, bool& active);
+
+template <Message M>
+void PublishTarget(Sim& sim, std::string_view subsystem,
+                   std::string_view source, const M& message) {
+  PublishTargetRaw(sim, subsystem, source, &message, sizeof(M), alignof(M));
+}
+template <Message M>
+void ReleaseTarget(Sim& sim, std::string_view subsystem,
+                   std::string_view source) {
+  PublishTargetRaw(sim, subsystem, source, nullptr, sizeof(M), alignof(M));
+}
+// The newest envelope on /<subsystem>/target/<source>, or nullopt.
+template <Message M>
+std::optional<TargetEnvelope<M>> LatestTarget(const Sim& sim,
+                                              std::string_view subsystem,
+                                              std::string_view source) {
+  TargetEnvelope<M> envelope{};
+  bool active = false;
+  if (!LatestTargetRaw(sim, subsystem, source, &envelope.message, sizeof(M),
+                       alignof(M), active)) {
+    return std::nullopt;
+  }
+  envelope.active = active ? 1 : 0;
+  return envelope;
+}
 
 }  // namespace talos::testing

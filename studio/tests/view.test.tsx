@@ -112,12 +112,12 @@ test('a half-wired topic its own node declared is not shown as a fault', () => {
 
   // And the wiring view agrees with the table about the same two ends, rather
   // than drawing them as broken wires. The external end is on the default
-  // (first) node; the optional ends are on the arbiter, so render its wiring.
+  // (first) node; the optional ends are on the drivetrain, so render its wiring.
   assert.ok(html.includes('outside talOS'),
             'wiring calls an external end a missing peer');
   const system = state();
-  const arbiter = system.graph!.nodes.find(n => n.name === 'arbiter')!;
-  const wiring = render(<Wiring graph={system.graph!} node={arbiter}
+  const drivetrain = system.graph!.nodes.find(n => n.name === 'drivetrain')!;
+  const wiring = render(<Wiring graph={system.graph!} node={drivetrain}
                                 rates={system.rates}/>);
   assert.ok(wiring.includes('optional — no peer yet'),
             'wiring calls an optional end a missing peer');
@@ -222,15 +222,15 @@ test('the system tab reports what was declared against what registered', () => {
   // The demo declares a node that never claimed a registry slot. Which node,
   // what would have built it, and why it matters are all on screen: the live
   // graph alone can only be silent about it.
-  assert.ok(html.includes('7 nodes declared'), 'declared count missing');
-  assert.ok(html.includes('6 registered'), 'registered count missing');
+  assert.ok(html.includes('6 nodes declared'), 'declared count missing');
+  assert.ok(html.includes('5 registered'), 'registered count missing');
   assert.ok(html.includes('1 never appeared'), 'no missing-node count');
   assert.ok(html.includes('declared, never registered'),
             'the missing node is not explained');
   assert.ok(html.includes('shooter'));
   assert.ok(html.includes('//2026-robot/main_processor/shooter:node'),
             'the missing node does not say what would have built it');
-  assert.ok(html.includes('7 declared'), 'the toolbar count is missing');
+  assert.ok(html.includes('6 declared'), 'the toolbar count is missing');
 
   // The launcher's own sentence, not the viewer's paraphrase of it.
   assert.ok(html.includes('is published but nothing subscribes to it'),
@@ -320,7 +320,7 @@ test('the overview reads declared against live, and names what never appeared',
        const html = render(<OverviewTab view={emptyView} system={state(true)}
                                         onOpen={() => {}}/>);
        assert.ok(html.includes('Declared'), 'no declared row');
-       assert.ok(html.includes('7 nodes, 6 live'), 'declared vs live not shown');
+       assert.ok(html.includes('6 nodes, 5 live'), 'declared vs live not shown');
        assert.ok(html.includes('Never appeared'));
        assert.ok(html.includes('shooter'));
        assert.ok(html.includes('0 errors, 1 warnings'), 'no lint tally');
@@ -354,5 +354,5 @@ test('the attention list flags real orphans and leaves the design alone', () => 
 
   // The consequences of the node that never started are still each their own
   // item: the launcher's lint saw a graph in which the shooter was present.
-  assert.ok(html.includes('/shooter/target is published but nobody reads it'));
+  assert.ok(html.includes('/shooter/target/teleop is published but nobody reads it'));
 });

@@ -11,13 +11,14 @@
   and `talos.cpp_node` rather than a second Python implementation.
 - Language independence: adding or modifying a node in one language never
   requires editing code in another language (e.g. a Python subsystem is wired
-  into `arbiter`, `operator_interface` and `telemetry` through its TOML config,
-  never by editing C++ files).
+  into its target lanes, `operator_interface` and `telemetry` through TOML
+  config, never by editing C++ files).
 - Messages are FlatBuffers structs only. Topic names come from the package's
   `talos_messages(topics = ...)` and follow talOS/NAMING.md. One writer per topic;
-  extra producers publish `/<sub>/target/<source>` for an arbiter.
-- Actuation is gated on `robot_enabled(node)` and a `fresh()` target; never write
-  `/hw/request/<node>` directly.
+  each producer of a target writes its own `/<sub>/target/<source>` lane
+  (`talos::TargetLane`), and the consumer resolves them with `talos::Target`.
+- Actuation is gated on `robot_enabled(node)` and a live target
+  (`talos::Target::get()` non-null); never write `/hw/request/<node>` directly.
 - Never set `commissioned = true` or change physical CAN ids in a robot config.
 - New node behaviour gets a `Sim`/`SimHardware` (or `talos.testing`) test that
   covers the disabled and stale-target cases. Finish every change with

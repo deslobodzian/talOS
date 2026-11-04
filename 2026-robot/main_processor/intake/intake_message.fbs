@@ -1,7 +1,6 @@
 namespace intake;
 
 struct IntakeTarget {
-  enabled:bool;
   roller_velocity_rps:float;
 }
 
@@ -11,6 +10,8 @@ struct IntakeTarget {
 enum Inhibit : ubyte {
   DRIVE,
   GATEWAY_NOT_READY,
+  // No longer produced: lanes carry `active`, so a released target reads
+  // as TARGET_STALE. Kept so the later wire values do not shift.
   TARGET_DISABLED,
   TARGET_STALE,
   FEEDBACK_INVALID,
@@ -20,7 +21,7 @@ enum Inhibit : ubyte {
 // Studio view fields (2026-robot/main_processor/telemetry/node.h forwards
 // them as mechanism channels, mirroring ShooterState.target_velocity_rps):
 // requested_velocity_rps echoes the demand the policy acted on this tick
-// (0 when no fresh enabled target), roller_velocity_rps is the measured
+// (0 when no target lane is selected), roller_velocity_rps is the measured
 // wheel speed, and inhibit names why the wheel is NOT driving. Appended,
 // never reordered: flatbuffers structs are fixed-size, so field order is the
 // wire order.

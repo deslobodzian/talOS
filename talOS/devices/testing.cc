@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
@@ -301,6 +303,8 @@ void SimHardware::set_driver_station(
   impl_->ds_packet = data;
 }
 
+void SimHardware::stop_driver_station() { impl_->ds_packet.reset(); }
+
 hardware::MotorRequest SimHardware::motor_request(
     std::string_view node, std::string_view device) const {
   const std::uint16_t id = impl_->Id(node, Kind::kMotor, device);
@@ -319,6 +323,44 @@ double SimHardware::pwm(std::string_view node, std::string_view device) const {
   const std::uint16_t id = impl_->Id(node, Kind::kPwm, device);
   impl_->Collect();
   return ValueOr(impl_->pwm_outputs, id, 0.0);
+}
+
+driver_station::DriverStationData DsPacket(std::uint32_t flags) {
+  driver_station::DriverStationData data{};
+  data.fms.flags = flags | driver_station::kDsAttached;
+  return data;
+}
+
+namespace {
+std::string LaneTopic(std::string_view subsystem, std::string_view source) {
+  return "/" + std::string{subsystem} + "/target/" + std::string{source};
+}
+}  // namespace
+
+void PublishTargetRaw(Sim& sim, std::string_view subsystem,
+                      std::string_view source, const void* message,
+                      std::size_t bytes, std::size_t alignment) {
+  std::vector<std::byte> envelope(
+      detail::TargetEnvelopeBytes(bytes, alignment));
+  detail::EncodeTargetEnvelope(message != nullptr, message, bytes, alignment,
+                               envelope);
+  SimAccess::publish_raw(sim, LaneTopic(subsystem, source), envelope.data(),
+                         envelope.size());
+}
+
+bool LatestTargetRaw(const Sim& sim, std::string_view subsystem,
+                     std::string_view source, void* out, std::size_t bytes,
+                     std::size_t alignment, bool& active) {
+  const std::string topic = LaneTopic(subsystem, source);
+  std::vector<std::byte> envelope(
+      detail::TargetEnvelopeBytes(bytes, alignment));
+  const std::uint64_t count =
+      SimAccess::message_count(sim, topic, envelope.size());
+  if (count == 0) return false;
+  SimAccess::read_raw(sim, topic, envelope.size(), count - 1, envelope.data());
+  active = envelope[0] == std::byte{1};
+  std::memcpy(out, envelope.data() + alignment, bytes);
+  return true;
 }
 
 }  // namespace talos::testing

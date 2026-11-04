@@ -22,23 +22,27 @@ doubled or trailing `_`.
   | `event` | the owner | something that happened once |
   | `telemetry` | the owner | observation feed for recording/display |
   | `target` | anyone but the owner | what it is asked to become |
-  | `request` | anyone but the owner | actuator instruction awaiting arbitration |
+  | `request` | anyone but the owner | actuator instruction awaiting resolution |
   | `command` | anyone but the owner | actuator instruction, already resolved |
 
-- **qualifier**: the source or variant, e.g. `teleop`, `auto`.
+- **qualifier**: the source or variant, e.g. `teleop`, `auto`. A target's
+  qualifier is the producer's lane: `/<sub>/target/<source>` carries a
+  `talos::TargetEnvelope` and is written by one `talos::TargetLane`. Sources
+  in `[robot.targets]` and `[targets]` follow the segment rules.
 
 Abbreviations are rejected (`tgt`, `cmd`, `req`, `ds`, `dt`, `drive`, `odom`,
 `pos`, `vel`, …; use the full word), and so are direction suffixes (`_in`,
 `_out`, `_pub`, `_sub`, `_tx`, `_rx`, `_topic`, `_send`, `_recv`).
 
 The graph lint also rejects two writers on one topic, a read topic nobody
-writes (unless the subscription is `optional`), and one topic used with two
-message sizes. A topic nobody reads, or whose owner is not a node in the
-session, is a warning.
+writes (unless the subscription is `optional`), one topic used with two
+message sizes, and a target lane whose source is in no mode of that
+subsystem's target policy. A topic nobody reads, a policy lane nobody writes
+yet, or a topic whose owner is not a node in the session, is a warning.
 
-Examples: `/drivetrain/state`, `/drivetrain/target` (written by the arbiter),
-`/drivetrain/target/teleop`, `/hw/state`, `/hw/state/driver_station`,
-`/hw/request/<node>`, `/talos/telemetry`.
+Examples: `/drivetrain/state`, `/drivetrain/target/teleop` (written by the
+operator interface), `/drivetrain/target/auto`, `/hw/state`,
+`/hw/state/driver_station`, `/hw/request/<node>`, `/talos/telemetry`.
 
 ## Nodes
 

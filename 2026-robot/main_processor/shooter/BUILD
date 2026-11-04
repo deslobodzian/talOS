@@ -3,17 +3,14 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
 
 # ShooterTarget / ShooterState (namespace shooter) and the shooter's topics.
-# The arbiter, operator interface and telemetry consume them. /shooter/target
-# has one writer, the arbiter; teleop and autonomous publish on their own
-# lanes and the arbiter picks one.
+# The operator interface and telemetry consume them. The shooter reads its
+# target through talos::Target: teleop and autonomous publish on their own
+# lanes, /shooter/target/<source>, and the [robot.targets] policy picks one.
 talos_messages(
     name = "messages",
     srcs = ["shooter_message.fbs"],
     topics = {
         "state": "/shooter/state",
-        "target": "/shooter/target",
-        "teleop_target": "/shooter/target/teleop",
-        "auto_target": "/shooter/target/auto",
     },
 )
 

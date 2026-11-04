@@ -95,34 +95,38 @@ def main():
         os.makedirs(named_launcher_dir, exist_ok=True)
         safe_symlink("../launcher", os.path.join(named_launcher_dir, "launcher"))
 
-    # 2. Config
-    config_src = spec["config_path"]
-    config_basename = os.path.basename(config_src)
-    config_dest = os.path.join(config_dir, config_basename)
-    safe_copy(config_src, config_dest)
+    # 2. Config. Every file keeps its path relative to the others under
+    # config/, rooted at their deepest common directory, so the config's
+    # relative `include`, `path` and `defaults` resolve as in the source tree
+    # (a `../shared/x.toml` puts the config one level down).
+    config = spec["config"]
+    config_files = spec.get("config_files", [])
+    common = os.path.commonpath(
+        [os.path.dirname(f["short_path"]) or "." for f in [config] + config_files]) or "."
 
-    # Config identity: sha256 over the robot config plus every subsystem file,
-    # names mixed in so a rename is an identity change. Stored in the manifest
+    def staged(entry):
+        return os.path.relpath(entry["short_path"], common).replace(os.sep, "/")
+
+    config_rel = "config/" + staged(config)
+    safe_copy(config["src_path"], os.path.join(out_dir, config_rel))
+
+    # Config identity: sha256 over the robot config plus every file it reads,
+    # paths mixed in so a move is an identity change. Stored in the manifest
     # so a session can say exactly which configuration it ran.
     config_hash = hashlib.sha256()
-    with open(config_dest, "rb") as f:
+    with open(os.path.join(out_dir, config_rel), "rb") as f:
         config_hash.update(f.read())
-    subsystem_bytes = {}
-
-    # 3. Subsystems
-    for sub in spec.get("subsystems", []):
-        sub_src = sub["src_path"]
-        sub_name = sub["name"]
-        safe_copy(sub_src, os.path.join(config_dir, f"{sub_name}.toml"))
-        safe_copy(sub_src, os.path.join(config_dir, "subsystems", f"{sub_name}.toml"))
-        safe_copy(sub_src, os.path.join(out_dir, sub_name, "subsystem.toml"))
-        safe_copy(sub_src, os.path.join(config_dir, sub_name, "subsystem.toml"))
-        with open(os.path.join(config_dir, f"{sub_name}.toml"), "rb") as f:
-            subsystem_bytes[sub_name] = f.read()
-    for sub_name in sorted(subsystem_bytes):
-        config_hash.update(sub_name.encode("utf-8"))
+    staged_bytes = {}
+    for entry in config_files:
+        rel = staged(entry)
+        dest = os.path.join(config_dir, rel)
+        safe_copy(entry["src_path"], dest)
+        with open(dest, "rb") as f:
+            staged_bytes[rel] = f.read()
+    for rel in sorted(staged_bytes):
+        config_hash.update(rel.encode("utf-8"))
         config_hash.update(b"\x00")
-        config_hash.update(subsystem_bytes[sub_name])
+        config_hash.update(staged_bytes[rel])
     config_sha256 = config_hash.hexdigest()
 
     # 4. Nodes. A Python node's runfiles carry libtalos_node.so (a data
@@ -197,7 +201,7 @@ def main():
     # literal (ASCII, \uXXXX escapes) is also a valid TOML basic string.
     lines = [
         "bundle_version = 1",
-        f"config_path = {json.dumps(f'config/{config_basename}')}",
+        f"config_path = {json.dumps(config_rel)}",
         f"config_sha256 = {json.dumps(config_sha256)}",
     ]
     for entry in manifest_nodes:
@@ -235,7 +239,7 @@ done
 
 extra_args=()
 if [[ "$has_config" == "false" ]]; then
-  extra_args+=(--config "config/{config_basename}")
+  extra_args+=(--config "{config_rel}")
 fi
 if [[ "$has_output_dir" == "false" && -n "${{TALOS_LOG_DIR:-}}" ]]; then
   extra_args+=(--output-dir "${{TALOS_LOG_DIR}}")

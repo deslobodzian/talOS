@@ -1,30 +1,16 @@
 load("@rules_python//python:defs.bzl", "py_test")
+load("//2026-robot/main_processor/configuration:robot_manifest.bzl", "CONFIG_FILES", "NODES")
 load("//talOS/build:contract.bzl", "talos_bundle")
 
 package(default_visibility = ["//visibility:public"])
 
+# NODES and CONFIG_FILES are generated from robot.toml:
+#   bazel run //tools:sync_manifest -- 2026-robot/main_processor/configuration/robot.toml
 talos_bundle(
     name = "robot_bundle",
     config = "//2026-robot/main_processor/configuration:robot.toml",
-    nodes = [
-        "//talOS/bridge:hardware_node",
-        "//2026-robot/main_processor/arbiter:node",
-        "//2026-robot/main_processor/drivetrain:node",
-        "//2026-robot/main_processor/intake:node",
-        "//2026-robot/main_processor/odometry:node",
-        "//2026-robot/main_processor/operator_interface:node",
-        "//2026-robot/main_processor/shooter:node",
-        "//2026-robot/main_processor/telemetry:node",
-    ],
-    subsystems = [
-        "//2026-robot/main_processor/configuration:subsystems/arbiter.toml",
-        "//2026-robot/main_processor/configuration:subsystems/drivetrain.toml",
-        "//2026-robot/main_processor/configuration:subsystems/intake.toml",
-        "//2026-robot/main_processor/configuration:subsystems/odometry.toml",
-        "//2026-robot/main_processor/configuration:subsystems/operator_interface.toml",
-        "//2026-robot/main_processor/configuration:subsystems/shooter.toml",
-        "//2026-robot/main_processor/configuration:subsystems/telemetry.toml",
-    ],
+    config_files = CONFIG_FILES,
+    nodes = ["//talOS/bridge:hardware_node"] + NODES,
 )
 
 genrule(

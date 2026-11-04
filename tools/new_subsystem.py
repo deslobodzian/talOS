@@ -5,18 +5,20 @@
 
 Writes <robot>/main_processor/<name>/ (messages, node, Sim test, testdata),
 modelled on that robot's shooter (C++) and intake (Python) packages, then adds
-configuration/subsystems/<name>.toml, its [[subsystems]] manifest entry, and the
-node and subsystem labels in the robot's talos_bundle. Everything is checked
-before anything is written, so a refused run leaves the tree untouched.
+configuration/subsystems/<name>.toml and its [[subsystems]] entry in
+configuration/robot.toml, and regenerates configuration/robot_manifest.bzl
+(//tools:sync_manifest), which the bundle and graph test read. Everything is
+checked before anything is written, so a refused run leaves the tree untouched.
 """
 
 import argparse
 import difflib
 import keyword
 import os
-import re
 import sys
 import tomllib
+
+from tools import sync_manifest
 
 # Mirrors talOS/introspection/names.h (CheckSegment, CheckNodeName); keep them
 # in sync. The launcher re-checks at --describe-only, so drift only costs an
@@ -142,10 +144,10 @@ def string_list(labels, indent):
 FBS = """\
 namespace @NAME@;
 
-// What /@NAME@/target asks for. The node drives the motor only while the
-// robot is enabled and this is fresh and enabled.
+// What a producer asks for on its lane, /@NAME@/target/<source>. The node
+// drives the motor only while the robot is enabled and a lane of its target
+// policy is live.
 struct @PASCAL@Target {
-  enabled:bool;
   velocity_rps:double;
 }
 
@@ -160,10 +162,10 @@ struct @PASCAL@State {
 POSITION_FBS = """\
 namespace @NAME@;
 
-// What /@NAME@/target asks for. The node drives the motor with Motion Magic
-// only while the robot is enabled and this is fresh and enabled.
+// What a producer asks for on its lane, /@NAME@/target/<source>. The node
+// drives the motor with Motion Magic only while the robot is enabled and a
+// lane of its target policy is live.
 struct @PASCAL@Target {
-  enabled:bool;
   position_rot:double;
 }
 
@@ -178,17 +180,16 @@ struct @PASCAL@State {
 
 MESSAGES_BUILD = """\
 # @PASCAL@Target / @PASCAL@State (namespace @NAME@) and the @NAME@'s topics.
-# /@NAME@/target has one writer (the arbiter); teleop and autonomous producers
-# publish on their own lanes (/target/teleop, /target/auto).
+# Producers write their own lanes, /@NAME@/target/<source>, through
+# talos::TargetLane / talos.TargetLane; the @NAME@ reads them with
+# talos::Target, whose policy comes from [robot.targets] and the subsystem's
+# [targets].
 talos_messages(
     name = "messages",
     srcs = ["@NAME@_message.fbs"],
     include_prefix = "@NAME@",
     topics = {
-        "auto_target": "/@NAME@/target/auto",
         "state": "/@NAME@/state",
-        "target": "/@NAME@/target",
-        "teleop_target": "/@NAME@/target/teleop",
     },
 )
 """
@@ -241,42 +242,42 @@ cc_test(
 CC_HEADER = """\
 #pragma once
 
+#include <cmath>
+
 @INCLUDES@
 
 namespace @NAME@ {
 
-// Drives the motor at the velocity /@NAME@/target asks for and reports what
-// it did on /@NAME@/state. Gains live in the robot config, slot0 of
+// Drives the motor at the velocity its target asks for and reports what it
+// did on /@NAME@/state. Gains live in the robot config, slot0 of
 // [motors.@NAME@_motor]; the motor controller closes the velocity loop
 // onboard.
 //
-// Nothing publishes /@NAME@/target yet. A teleop or autonomous producer
-// publishes its own lane, /@NAME@/target/<source>, and a line in the arbiter
-// picks one and republishes it on /@NAME@/target.
+// Nothing asks yet. A teleop or autonomous producer writes its own lane,
+// /@NAME@/target/<source>, with talos::TargetLane; talos::Target picks the
+// live lane by the policy in [robot.targets] or the subsystem's [targets].
 class @PASCAL@ {
  public:
   using Target = @PASCAL@Target;
   using State = @PASCAL@State;
 
   explicit @PASCAL@(talos::Node& node)
-      : node_{node},
-        motor_{node, "@NAME@_motor"},
-        // Optional: the graph lint accepts a target nobody publishes yet.
-        target_{node.subscribe<Target>(topics::kTarget, {.optional = true})},
+      : motor_{node, "@NAME@_motor"},
+        target_{node},
         state_{node.publish<State>(topics::kState)} {}
 
   void update() {
-    const bool enabled = talos::robot_enabled(node_);
+    const Target* t = target_.get();  // null: disabled, stale or released
+    const bool drive =
+        t != nullptr && motor_.connected() && std::isfinite(t->velocity_rps());
     // Otherwise nothing is set and the flush sends neutral.
-    if (enabled && target_.fresh() && target_->enabled())
-      motor_.set_velocity(target_->velocity_rps());
-    state_.send(State{enabled, motor_.velocity(), motor_.connected()});
+    if (drive) motor_.set_velocity(t->velocity_rps());
+    state_.send(State{drive, motor_.velocity(), motor_.connected()});
   }
 
  private:
-  talos::Node& node_;
   talos::Motor motor_;
-  talos::Subscription<Target> target_;
+  talos::Target<Target> target_;
   talos::Publisher<State> state_;
 };
 
@@ -291,38 +292,38 @@ CC_POSITION_HEADER = """\
 
 namespace @NAME@ {
 
-// Drives the motor to the position /@NAME@/target asks for with Motion Magic
-// and reports what it did on /@NAME@/state.
+// Drives the motor to the position its target asks for with Motion Magic
+// and reports what it did on /@NAME@/state. Producers write lanes
+// /@NAME@/target/<source> with talos::TargetLane; the policy comes from
+// [robot.targets] or the subsystem's [targets].
 class @PASCAL@ {
  public:
   using Target = @PASCAL@Target;
   using State = @PASCAL@State;
 
   explicit @PASCAL@(talos::Node& node)
-      : node_{node},
-        motor_{node, "@NAME@_motor"},
+      : motor_{node, "@NAME@_motor"},
         tolerance_rot_{node.param<double>("tolerance_rot", 0.05)},
-        target_{node.subscribe<Target>(topics::kTarget, {.optional = true})},
+        target_{node},
         state_{node.publish<State>(topics::kState)} {}
 
   void update() {
-    const bool enabled = talos::robot_enabled(node_);
-    const bool active = enabled && target_.fresh() && target_->enabled();
-    if (active) {
-      goal_rot_ = target_->position_rot();
-      motor_.set_motion_magic(goal_rot_);
-    }
+    const Target* t = target_.get();  // null: disabled, stale or released
+    const bool drive =
+        t != nullptr && motor_.connected() && std::isfinite(t->position_rot());
     const double pos = motor_.position();
-    const bool at_goal = active && std::abs(pos - goal_rot_) <= tolerance_rot_;
-    state_.send(State{enabled, pos, motor_.connected(), at_goal});
+    bool at_goal = false;
+    if (drive) {
+      motor_.set_motion_magic(t->position_rot());
+      at_goal = std::abs(pos - t->position_rot()) <= tolerance_rot_;
+    }
+    state_.send(State{drive, pos, motor_.connected(), at_goal});
   }
 
  private:
-  talos::Node& node_;
   talos::Motor motor_;
   double tolerance_rot_;
-  double goal_rot_ = 0.0;
-  talos::Subscription<Target> target_;
+  talos::Target<Target> target_;
   talos::Publisher<State> state_;
 };
 
@@ -343,6 +344,7 @@ CC_TEST = """\
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -354,8 +356,12 @@ namespace {
 
 using namespace std::chrono_literals;
 using talos::hardware::Mode;
+using talos::testing::DsPacket;
+using talos::testing::PublishTarget;
+using talos::testing::ReleaseTarget;
 using talos::testing::Sim;
 using talos::testing::SimHardware;
+namespace ds = talos::driver_station;
 
 std::string Runfile(const char* env) {
   std::string error;
@@ -375,12 +381,21 @@ class @PASCAL@Test : public ::testing::Test {
   using Target = @PASCAL@::Target;
   using State = @PASCAL@::State;
 
-  // Holds a target the way the arbiter does: republished every 20 ms.
-  void Hold(double rps, std::chrono::milliseconds duration) {
+  // An enabled teleop robot: the default policy reads the teleop lane.
+  void Teleop() {
+    hw.enable();
+    hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+    sim.step(10ms);  // the mode is current before any lane arrives
+  }
+  // Holds the teleop lane the way a producer does: republished every 20 ms.
+  void Hold(double demand, std::chrono::milliseconds duration) {
     for (auto t = 0ms; t < duration; t += 20ms) {
-      sim.publish(topics::kTarget, Target{true, rps});
+      PublishTarget(sim, "@NAME@", "teleop", Target{demand});
       sim.step(20ms);
     }
+  }
+  Mode Request() const {
+    return hw.motor_request("@NAME@", "@NAME@_motor").mode;
   }
   State Latest() const {
     const auto state = sim.latest<State>(topics::kState);
@@ -393,9 +408,9 @@ class @PASCAL@Test : public ::testing::Test {
   SimHardware hw{sim};
 };
 
-TEST_F(@PASCAL@Test, DrivesTheMotorAtAFreshTarget) {
-  hw.enable();
+TEST_F(@PASCAL@Test, DrivesTheMotorAtALiveLane) {
   hw.ideal_motors();
+  Teleop();
   Hold(30.0, 60ms);
 
   const auto request = hw.motor_request("@NAME@", "@NAME@_motor");
@@ -408,27 +423,56 @@ TEST_F(@PASCAL@Test, DrivesTheMotorAtAFreshTarget) {
 }
 
 TEST_F(@PASCAL@Test, DisabledRobotGoesNeutral) {
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
   hw.enable(false);
+  sim.step(10ms);
   Hold(30.0, 60ms);
-  EXPECT_EQ(hw.motor_request("@NAME@", "@NAME@_motor").mode, Mode::kNeutral);
+  EXPECT_EQ(Request(), Mode::kNeutral);
   EXPECT_FALSE(Latest().enabled());
 }
 
-TEST_F(@PASCAL@Test, StaleTargetGoesNeutral) {
-  hw.enable();
+TEST_F(@PASCAL@Test, StaleLaneGoesNeutral) {
+  Teleop();
   Hold(30.0, 40ms);
-  ASSERT_EQ(hw.motor_request("@NAME@", "@NAME@_motor").mode, Mode::kVelocity);
+  ASSERT_EQ(Request(), Mode::kVelocity);
 
-  sim.step(150ms);  // past command_timeout_us: the target is stale
-  EXPECT_EQ(hw.motor_request("@NAME@", "@NAME@_motor").mode, Mode::kNeutral);
-  EXPECT_TRUE(Latest().enabled());  // state keeps publishing
+  sim.step(150ms);  // past command_timeout_us: the lane is stale
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_FALSE(Latest().enabled());  // state keeps publishing
 }
 
-TEST_F(@PASCAL@Test, DisabledTargetGoesNeutral) {
-  hw.enable();
-  sim.publish(topics::kTarget, Target{false, 30.0});
+TEST_F(@PASCAL@Test, ReleasedLaneGoesNeutral) {
+  Teleop();
+  Hold(30.0, 40ms);
+  ASSERT_EQ(Request(), Mode::kVelocity);
+
+  ReleaseTarget<Target>(sim, "@NAME@", "teleop");
   sim.step(40ms);
-  EXPECT_EQ(hw.motor_request("@NAME@", "@NAME@_motor").mode, Mode::kNeutral);
+  EXPECT_EQ(Request(), Mode::kNeutral);
+}
+
+TEST_F(@PASCAL@Test, NeverSentGoesNeutral) {
+  Teleop();
+  sim.step(60ms);
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_FALSE(Latest().enabled());
+}
+
+TEST_F(@PASCAL@Test, DriverStationLossGoesNeutral) {
+  Teleop();
+  Hold(30.0, 40ms);
+  ASSERT_EQ(Request(), Mode::kVelocity);
+
+  hw.stop_driver_station();  // the bridge stops forwarding DS packets
+  Hold(30.0, 160ms);         // past command_timeout_us: the DS is stale
+  EXPECT_EQ(Request(), Mode::kNeutral);
+}
+
+TEST_F(@PASCAL@Test, NonFiniteDemandGoesNeutral) {
+  Teleop();
+  Hold(std::numeric_limits<double>::quiet_NaN(), 40ms);
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_FALSE(Latest().enabled());
 }
 
 struct Result {
@@ -523,17 +567,20 @@ py_test(
 """
 
 PY_NODE = '''\
-"""@PASCAL@: one motor driven at the velocity /@NAME@/target asks for.
+"""@PASCAL@: one motor driven at the velocity its target asks for.
 
-Every tick the @NAME@ drives the motor at the target's velocity while the
-robot is enabled and the target is fresh and enabled, and reports what it did
-on /@NAME@/state. Gains live in the robot config ([motors.@NAME@_motor]
-slot0); the motor controller closes the velocity loop onboard.
+Every tick the @NAME@ drives the motor at the target's velocity while a lane
+of its target policy is live (robot enabled, lane active and fresh), the motor
+is connected and the demand is finite, and reports what it did on
+/@NAME@/state. Gains live in the robot config ([motors.@NAME@_motor] slot0);
+the motor controller closes the velocity loop onboard.
 
-Nothing publishes /@NAME@/target yet. A teleop or autonomous producer
-publishes its own lane, /@NAME@/target/<source>, and a line in the arbiter
-picks one and republishes it on /@NAME@/target.
+Nothing asks yet. A teleop or autonomous producer writes its own lane,
+/@NAME@/target/<source>, with talos.TargetLane; talos.Target picks the live
+lane by the policy in [robot.targets] or the subsystem's [targets].
 """
+
+import math
 
 import talos
 from @NAME@ import topics
@@ -543,25 +590,29 @@ from @NAME@.@PASCAL@Target import @PASCAL@Target
 
 class @PASCAL@:
     def __init__(self, node):
-        self.node = node
         self.motor = talos.Motor(node, "@NAME@_motor")
-        # Optional: the graph lint accepts a target nobody publishes yet.
-        self.target = node.subscribe(@PASCAL@Target, topics.TARGET,
-                                     optional=True)
+        self.target = talos.Target(node, @PASCAL@Target)
         self.state = node.publish(@PASCAL@State, topics.STATE)
 
     def update(self):
-        enabled = talos.robot_enabled(self.node)
-        target = self.target.value  # None until the first
-        if enabled and self.target.fresh() and target.enabled:
+        t = self.target.get()  # None: disabled, stale or released
+        drive = (t is not None and self.motor.connected
+                 and math.isfinite(t.velocity_rps))
+        if drive:
             # Otherwise nothing is set and the flush sends neutral.
-            self.motor.set_velocity(target.velocity_rps)
-        self.state.send(enabled=enabled, velocity_rps=self.motor.velocity,
+            self.motor.set_velocity(t.velocity_rps)
+        self.state.send(enabled=drive, velocity_rps=self.motor.velocity,
                         connected=self.motor.connected)
 '''
 
 PY_POSITION_NODE = '''\
-"""@PASCAL@: one motor driven to the position /@NAME@/target asks for."""
+"""@PASCAL@: one motor driven to the position its target asks for.
+
+Producers write lanes /@NAME@/target/<source> with talos.TargetLane; the
+policy comes from [robot.targets] or the subsystem's [targets].
+"""
+
+import math
 
 import talos
 from @NAME@ import topics
@@ -571,24 +622,21 @@ from @NAME@.@PASCAL@Target import @PASCAL@Target
 
 class @PASCAL@:
     def __init__(self, node):
-        self.node = node
         self.motor = talos.Motor(node, "@NAME@_motor")
         self.tolerance_rot = node.param("tolerance_rot", 0.05)
-        self.goal_rot = 0.0
-        self.target = node.subscribe(@PASCAL@Target, topics.TARGET,
-                                     optional=True)
+        self.target = talos.Target(node, @PASCAL@Target)
         self.state = node.publish(@PASCAL@State, topics.STATE)
 
     def update(self):
-        enabled = talos.robot_enabled(self.node)
-        target = self.target.value
-        active = enabled and self.target.fresh() and target.enabled
-        if active:
-            self.goal_rot = target.position_rot
-            self.motor.set_motion_magic(self.goal_rot)
+        t = self.target.get()  # None: disabled, stale or released
+        drive = (t is not None and self.motor.connected
+                 and math.isfinite(t.position_rot))
         pos = self.motor.position
-        at_goal = active and abs(pos - self.goal_rot) <= self.tolerance_rot
-        self.state.send(enabled=enabled, position_rot=pos,
+        at_goal = False
+        if drive:
+            self.motor.set_motion_magic(t.position_rot)
+            at_goal = abs(pos - t.position_rot) <= self.tolerance_rot
+        self.state.send(enabled=drive, position_rot=pos,
                         connected=self.motor.connected, at_goal=at_goal)
 '''
 
@@ -609,39 +657,84 @@ node_py = talos.load(os.path.join(HERE, "@NAME@.py"))
 
 
 class @PASCAL@Test(unittest.TestCase):
-    def run_node(self, enabled=True, target_enabled=True, seconds=0.05):
-        """Publishes one 30 rps target at t0, runs, returns (request, state)."""
-        sim = Sim(CONFIG)
-        sim.add(node_py.@PASCAL@, "@NAME@")
-        hw = SimHardware(sim)
-        hw.enable(enabled)
-        hw.set_motor("@NAME@", "@NAME@_motor", 0.0, 12.5)
-        sim.publish(@PASCAL@Target, topics.TARGET, enabled=target_enabled,
-                    velocity_rps=30.0)
-        sim.step(seconds)
-        return (hw.motor_request("@NAME@", "@NAME@_motor"),
-                sim.latest(@PASCAL@State, topics.STATE))
+    def setUp(self):
+        self.sim = Sim(CONFIG)
+        self.sim.add(node_py.@PASCAL@, "@NAME@")
+        self.hw = SimHardware(self.sim)
+        self.hw.set_motor("@NAME@", "@NAME@_motor", 0.0, 12.5)
 
-    def test_fresh_target_drives_the_motor(self):
-        request, state = self.run_node()
+    def teleop(self, enabled=True):
+        """Robot enabled (or not) in teleop: the default policy reads the
+        teleop lane. Steps so the mode is current before any lane."""
+        self.hw.enable(enabled)
+        self.hw.set_driver_station(enabled=True, teleop=True)
+        self.sim.step(0.01)
+
+    def hold(self, demand, seconds):
+        """Republishes the teleop lane every 20 ms, as a producer does."""
+        for _ in range(round(seconds / 0.02)):
+            self.sim.publish_target(@PASCAL@Target, "@NAME@", "teleop",
+                                    velocity_rps=demand)
+            self.sim.step(0.02)
+
+    def mode(self):
+        return self.hw.motor_request("@NAME@", "@NAME@_motor").mode
+
+    def state(self):
+        return self.sim.latest(@PASCAL@State, topics.STATE)
+
+    def test_live_lane_drives_the_motor(self):
+        self.teleop()
+        self.hold(30.0, 0.06)
+        request = self.hw.motor_request("@NAME@", "@NAME@_motor")
         self.assertEqual(request.mode, talos.Mode.VELOCITY)
         self.assertEqual(request.demand, 30.0)
+        state = self.state()
         self.assertTrue(state.enabled)
         self.assertEqual(state.velocity_rps, 12.5)
         self.assertTrue(state.connected)
 
-    def test_failed_gate_sends_neutral(self):
-        cases = [
-            ("disabled robot", dict(enabled=False)),
-            ("disabled target", dict(target_enabled=False)),
-            ("stale target", dict(seconds=0.3)),  # past command_timeout_us
-        ]
-        for name, inputs in cases:
-            with self.subTest(name):
-                request, state = self.run_node(**inputs)
-                self.assertEqual(request.mode, talos.Mode.NEUTRAL)
-                # State keeps publishing whatever the gate says.
-                self.assertEqual(state.enabled, inputs.get("enabled", True))
+    def test_disabled_robot_sends_neutral(self):
+        self.teleop(enabled=False)
+        self.hold(30.0, 0.06)
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.assertFalse(self.state().enabled)
+
+    def test_stale_lane_sends_neutral(self):
+        self.teleop()
+        self.hold(30.0, 0.04)
+        self.assertEqual(self.mode(), talos.Mode.VELOCITY)
+        self.sim.step(0.15)  # past command_timeout_us
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.assertFalse(self.state().enabled)  # state keeps publishing
+
+    def test_released_lane_sends_neutral(self):
+        self.teleop()
+        self.hold(30.0, 0.04)
+        self.assertEqual(self.mode(), talos.Mode.VELOCITY)
+        self.sim.release_target(@PASCAL@Target, "@NAME@", "teleop")
+        self.sim.step(0.04)
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+
+    def test_never_sent_sends_neutral(self):
+        self.teleop()
+        self.sim.step(0.06)
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.assertFalse(self.state().enabled)
+
+    def test_driver_station_loss_sends_neutral(self):
+        self.teleop()
+        self.hold(30.0, 0.04)
+        self.assertEqual(self.mode(), talos.Mode.VELOCITY)
+        self.hw.stop_driver_station()
+        self.hold(30.0, 0.16)  # past command_timeout_us: the DS is stale
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+
+    def test_non_finite_demand_sends_neutral(self):
+        self.teleop()
+        self.hold(float("nan"), 0.04)
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.assertFalse(self.state().enabled)
 
 
 class BinaryTest(unittest.TestCase):
@@ -691,13 +784,21 @@ SUBSYSTEM_TOML = """\
 name = "@NAME@"
 node = "//@PACKAGE@:node"
 period_us = @PERIOD@
-# Zero-code robot wiring: uncomment to arbitrate /@NAME@/target, bind a Driver
-# Station button on /@NAME@/target/teleop, and stream /@NAME@/state to Studio
-# without editing any C++ or Python files in other packages.
-# arbitrate = true
+# Zero-code robot wiring: uncomment to have the operator interface write a
+# Driver Station button on the /@NAME@/target/teleop lane, and to stream
+# /@NAME@/state to Studio, without editing any C++ or Python files in other
+# packages.
 # teleop_button = 3
 # teleop_demand = 20.0
 # telemetry = true
+
+# Which /@NAME@/target/<source> lanes drive the @NAME@ in each Driver Station
+# mode, highest priority first. Without this table [robot.targets] applies
+# (teleop = ["teleop"], autonomous = ["auto"]); listed modes replace it.
+# [targets]
+# teleop = ["teleop"]
+# autonomous = ["auto"]
+
 # Device names are robot-wide, so the key carries the subsystem's name.
 [motors.@NAME@_motor]
 type = "TalonFX"
@@ -815,7 +916,7 @@ def package_files(name, lang, standalone=False, kind="velocity"):
         py_test = fill(PY_TEST, FROM_IMPORTS=from_imports, **values)
         if kind == "position":
             py_test = (py_test
-                       .replace("velocity_rps=30.0", "position_rot=30.0")
+                       .replace("velocity_rps=demand", "position_rot=demand")
                        .replace("talos.Mode.VELOCITY", "talos.Mode.MOTION_MAGIC")
                        .replace("state.velocity_rps, 12.5", "state.position_rot, 0.0"))
         files.update({
@@ -868,31 +969,6 @@ def used_can_ids(configuration):
     return ids
 
 
-def insert_label(text, attribute, label, peers, path, rule_name="talos_bundle"):
-    """`text` with `label` added to the `attribute = [...]` list of `rule_name`,
-    beside the entries matching `peers` in sorted position."""
-    bundle = re.search(rf"^{re.escape(rule_name)}\(\n", text, re.M)
-    if not bundle:
-        raise Refused(f"{path}: no {rule_name}( call to add the node to")
-    match = re.compile(rf"^( +){attribute} = \[\n((?:\1 +\"[^\"\n]*\",\n)*)\1\],\n",
-                       re.M).search(text, bundle.end())
-    if not match:
-        raise Refused(f"{path}: {rule_name} has no one-label-per-line "
-                      f"`{attribute} = [...]` list; add {label} by hand")
-    lines = match.group(2).splitlines(keepends=True)
-    indent = (re.match(r" *", lines[0]).group(0) if lines
-              else match.group(1) + "    ")
-    labels = [line.strip().strip(",").strip('"') for line in lines]
-    if label in labels:
-        raise Refused(f"{path}: {attribute} already lists {label}")
-    at = len(lines)
-    matching = [i for i, existing in enumerate(labels) if peers(existing)]
-    if matching:
-        at = next((i for i in matching if labels[i] > label), matching[-1] + 1)
-    lines.insert(at, f'{indent}"{label}",\n')
-    return text[:match.start(2)] + "".join(lines) + text[match.end(2):]
-
-
 def manifest_names(robot_toml):
     with open(robot_toml, "rb") as f:
         doc = tomllib.load(f)
@@ -909,10 +985,8 @@ def plan(root, robot, name, lang, kind="velocity"):
     processor = os.path.join(root, robot, "main_processor")
     configuration = os.path.join(processor, "configuration")
     robot_toml = os.path.join(configuration, "robot.toml")
-    bundle_build = os.path.join(processor, "BUILD")
-    for path in (robot_toml, bundle_build):
-        if not os.path.isfile(path):
-            raise Refused(f"{rel(root, path)} not found; is --robot right?")
+    if not os.path.isfile(robot_toml):
+        raise Refused(f"{rel(root, robot_toml)} not found; is --robot right?")
     package = os.path.join(processor, name)
     subsystem_toml = os.path.join(configuration, "subsystems", f"{name}.toml")
     if os.path.exists(package):
@@ -928,47 +1002,29 @@ def plan(root, robot, name, lang, kind="velocity"):
         raise Refused(f"every CAN id 1..{MAX_CAN_ID} is taken in "
                       f"{rel(root, configuration)}")
 
-    label_prefix = f"//{robot}/main_processor/"
-    node_label = f"{label_prefix}{name}:node"
-    config_label = f"{label_prefix}configuration"
-    toml_label = f"{config_label}:subsystems/{name}.toml"
     writes = [(os.path.join(package, path), None, content)
               for path, content in package_files(name, lang, kind=kind).items()]
-    writes.append((subsystem_toml, None, fill(
+    subsystem = fill(
         SUBSYSTEM_TOML, NAME=name, PASCAL=pascal(name), ROBOT=robot,
         PACKAGE=f"{robot}/main_processor/{name}", PERIOD=PERIOD_US,
-        CAN_ID=can_id)))
+        CAN_ID=can_id)
+    writes.append((subsystem_toml, None, subsystem))
 
     old = read(robot_toml)
-    writes.append((robot_toml, old, old.rstrip("\n") + "\n" +
-                   fill(MANIFEST_ENTRY, NAME=name)))
+    new_robot = old.rstrip("\n") + "\n" + fill(MANIFEST_ENTRY, NAME=name)
+    writes.append((robot_toml, old, new_robot))
 
-    old = read(bundle_build)
-    new = insert_label(old, "nodes", node_label,
-                       lambda x: x.startswith(label_prefix) and x.endswith(":node"),
-                       rel(root, bundle_build))
-    new = insert_label(new, "subsystems", toml_label,
-                       lambda x: x.startswith(config_label + ":subsystems/"),
-                       rel(root, bundle_build))
-    writes.append((bundle_build, old, new))
-
-    # talos_bundle takes the toml as a label, so configuration/BUILD must
-    # export it unless a glob already does.
-    config_build = os.path.join(configuration, "BUILD")
-    old = read(config_build) if os.path.isfile(config_build) else ""
-    new_cfg_build = old
-    exported = f'"subsystems/{name}.toml"' in new_cfg_build or re.search(
-        r"exports_files\(\s*glob\(\s*\[\s*\"subsystems/\*\.toml\"", new_cfg_build)
-    if not exported:
-        new_cfg_build = new_cfg_build + ("\n" if new_cfg_build else "") + (
-            f'exports_files(["subsystems/{name}.toml"])\n')
-    if re.search(r"^talos_graph_test\(\n", new_cfg_build, re.M):
-        new_cfg_build = insert_label(
-            new_cfg_build, "nodes", node_label,
-            lambda x: x.startswith(label_prefix) and x.endswith(":node"),
-            rel(root, config_build), rule_name="talos_graph_test")
-    if new_cfg_build != old:
-        writes.append((config_build, old or None, new_cfg_build))
+    # The bundle and graph test take their node and file lists from the
+    # generated manifest, so regenerate it from the edited config.
+    config = rel(root, robot_toml)
+    try:
+        manifest = sync_manifest.generate(root, config, overrides={
+            config: new_robot, rel(root, subsystem_toml): subsystem})
+    except sync_manifest.ManifestError as err:
+        raise Refused(f"cannot regenerate the manifest: {err}")
+    manifest_file = os.path.join(root, sync_manifest.manifest_path(config))
+    old = read(manifest_file) if os.path.isfile(manifest_file) else None
+    writes.append((manifest_file, old, manifest))
     return writes, can_id
 
 

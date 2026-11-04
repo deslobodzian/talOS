@@ -15,6 +15,16 @@ controller_address = "127.0.0.1"
 controller_port = 5802
 local_port = 5803
 
+# Target policy: which lanes (/<sub>/target/<source>) each Driver Station
+# mode reads, in priority order; the first fresh, active lane drives. A
+# subsystem file's own [targets] table replaces the modes it lists. A
+# disabled, e-stopped or silent Driver Station selects nothing. These are the
+# defaults, spelled out so the policy is discoverable; test mode opts in.
+[robot.targets]
+teleop = ["teleop"]
+autonomous = ["auto"]
+test = []
+
 # Sim-session viewer. Studio's bridge is a host-side process, not a robot
 # node, so it is not a [[subsystems]] entry. The launcher starts and
 # supervises it when asked (--start-studio-bridge, which sim.sh passes unless
@@ -32,10 +42,6 @@ webroot = "bazel-bin/studio/dist"
 # into one canonical view BEFORE validating, so exclusive-ownership and
 # deterministic (subsystem, device) id ordering behave exactly as one file.
 # Manifest order is irrelevant: logical ids sort by (subsystem, device) name.
-[[subsystems]]
-name = "arbiter"
-path = "subsystems/arbiter.toml"
-
 [[subsystems]]
 name = "drivetrain"
 path = "subsystems/drivetrain.toml"

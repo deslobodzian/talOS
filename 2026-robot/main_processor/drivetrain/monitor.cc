@@ -1,7 +1,8 @@
 // A read-only view of the drivetrain link, for watching a simulation or a real
 // robot work.
 //
-// It subscribes to the same three local topics the node and bridge use and
+// It subscribes to the same three local topics the node and bridge use (the
+// target being one lane, /drivetrain/target/<source>) and
 // prints what is on them, so it answers the questions you actually have while
 // something is running: is the gateway talking, is the robot enabled, is the
 // node commanding anything, and are the wheels responding. It publishes
@@ -20,6 +21,7 @@
 #include "drivetrain/drive_message_generated.h"
 #include "drivetrain/geometry.h"
 #include "drivetrain/topics.h"
+#include "talOS/devices/target.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/ipc/subscriber.h"
@@ -108,9 +110,11 @@ void PrintGateway(const talos::hardware::State& state, bool have_state,
               static_cast<unsigned long long>(freshness.sequence));
 }
 
-void PrintTarget(const drivetrain::ChassisTarget& target, bool have_target,
-                 const Freshness& freshness, Clock::time_point now) {
-  std::printf("target    ");
+void PrintTarget(const std::string& source,
+                 const talos::TargetEnvelope<drivetrain::ChassisTarget>& lane,
+                 bool have_target, const Freshness& freshness,
+                 Clock::time_point now) {
+  std::printf("target    %s lane   ", source.c_str());
   if (!have_target) {
     std::printf(
         "none. Try: bazel run "
@@ -118,11 +122,12 @@ void PrintTarget(const drivetrain::ChassisTarget& target, bool have_target,
         "1 0 0 5\n\n");
     return;
   }
+  const drivetrain::ChassisTarget& target = lane.message;
   std::printf(
-      "vx %6.2f m/s   vy %6.2f m/s   omega %6.2f rad/s   enabled %s   age %s\n"
+      "vx %6.2f m/s   vy %6.2f m/s   omega %6.2f rad/s   active %s   age %s\n"
       "\n",
       target.vx_mps(), target.vy_mps(), target.omega_radps(),
-      on_off(target.enabled()), freshness.age(now).c_str());
+      on_off(lane.active != 0), freshness.age(now).c_str());
 }
 
 const talos::hardware::MotorSample* FindSample(
@@ -227,6 +232,7 @@ int main(int argc, char** argv) {
     double rate_hz = 10;
     std::string config_path =
         "2026-robot/main_processor/configuration/robot.toml";
+    std::string source = "teleop";
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       if (arg == "--duration-s" && i + 1 < argc) {
@@ -235,9 +241,14 @@ int main(int argc, char** argv) {
         rate_hz = std::stod(argv[++i]);
       } else if (arg == "--config" && i + 1 < argc) {
         config_path = argv[++i];
+      } else if (arg == "--source" && i + 1 < argc) {
+        source = argv[++i];
       } else {
         throw std::invalid_argument(
-            "usage: monitor [--duration-s N] [--rate-hz N] [--config PATH]");
+            "usage: monitor [--duration-s N] [--rate-hz N] [--config PATH] "
+            "[--source NAME]\n"
+            "  --source: the /drivetrain/target/<NAME> lane to watch "
+            "(default teleop)");
       }
     }
     if (duration_s < 0) {
@@ -259,8 +270,9 @@ int main(int argc, char** argv) {
     using Packet = talos::hardware::Packet;
     ipc::Subscriber<Packet> states{talos::hardware::kStateTopic, latest};
     ipc::Subscriber<Packet> commands{talos::hardware::kCommandTopic, latest};
-    ipc::Subscriber<drivetrain::ChassisTarget> targets{
-        drivetrain::topics::kTarget, latest};
+    const std::string lane_topic = "/drivetrain/target/" + source;
+    ipc::Subscriber<talos::TargetEnvelope<drivetrain::ChassisTarget>> targets{
+        lane_topic, latest};
 
     if (!states.registered() || !commands.registered() ||
         !targets.registered()) {
@@ -269,7 +281,7 @@ int main(int argc, char** argv) {
 
     talos::hardware::State state{};
     talos::hardware::Command command{};
-    drivetrain::ChassisTarget target{};
+    talos::TargetEnvelope<drivetrain::ChassisTarget> target{};
     bool have_state = false, have_command = false, have_target = false;
     Freshness state_seen, command_seen, target_seen;
 
@@ -306,7 +318,7 @@ int main(int argc, char** argv) {
       std::printf("\033[H\033[J");  // Home, then clear: redraw without flicker.
       std::printf("talOS drivetrain monitor        Ctrl-C to stop\n\n");
       PrintGateway(state, have_state, state_seen, now);
-      PrintTarget(target, have_target, target_seen, now);
+      PrintTarget(source, target, have_target, target_seen, now);
       PrintModules(modules, state, have_state, command, have_command,
                    command_seen, now);
       std::fflush(stdout);

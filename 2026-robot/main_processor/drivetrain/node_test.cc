@@ -27,6 +27,7 @@ using namespace std::chrono_literals;
 using talos::hardware::Mode;
 using talos::testing::Sim;
 using talos::testing::SimHardware;
+namespace ds = talos::driver_station;
 
 constexpr double kTau = 2 * std::numbers::pi;
 
@@ -191,10 +192,17 @@ class DrivetrainTest : public ::testing::Test {
   explicit DrivetrainTest(std::string config = ConfigPath())
       : sim{std::move(config)} {}
 
-  // Holds a target the way the arbiter does: republished every 20 ms.
-  void Hold(const ChassisTarget& target, std::chrono::milliseconds duration) {
+  // An enabled robot in teleop: the policy selects /drivetrain/target/teleop.
+  void Teleop() {
+    hw.enable();
+    hw.set_driver_station(talos::testing::DsPacket(ds::kEnabled | ds::kTeleop));
+    sim.step(10ms);
+  }
+  // Holds a lane the way a producer does: republished every 20 ms.
+  void Hold(const ChassisTarget& target, std::chrono::milliseconds duration,
+            const char* source = "teleop") {
     for (auto t = 0ms; t < duration; t += 20ms) {
-      sim.publish(topics::kTarget, target);
+      talos::testing::PublishTarget(sim, "drivetrain", source, target);
       sim.step(20ms);
     }
   }
@@ -206,6 +214,12 @@ class DrivetrainTest : public ::testing::Test {
   talos::hardware::MotorRequest Request(const std::string& device) const {
     return hw.motor_request("drivetrain", device);
   }
+  void ExpectNeutral() const {
+    for (const SwerveModule& module : geometry.modules) {
+      EXPECT_EQ(Request(module.drive).mode, Mode::kNeutral) << module.name;
+      EXPECT_EQ(Request(module.steer).mode, Mode::kNeutral) << module.name;
+    }
+  }
 
   Sim sim;
   Drivetrain& drivetrain = sim.add<Drivetrain>("drivetrain");
@@ -214,8 +228,8 @@ class DrivetrainTest : public ::testing::Test {
 };
 
 TEST_F(DrivetrainTest, DrivesEveryModuleToAFreshTarget) {
-  hw.enable();
-  Hold(ChassisTarget{1.0, 0, 0, true}, 40ms);
+  Teleop();
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
   const double rps = 1.0 / (kTau * geometry.modules[0].wheel_radius_m);
   for (const SwerveModule& module : geometry.modules) {
     EXPECT_EQ(Request(module.drive).mode, Mode::kVelocity) << module.name;
@@ -226,24 +240,56 @@ TEST_F(DrivetrainTest, DrivesEveryModuleToAFreshTarget) {
   EXPECT_TRUE(State().enabled());
 }
 
-TEST_F(DrivetrainTest, StaleTargetDisabledTargetOrDisabledRobotGoNeutral) {
-  hw.enable();
-  Hold(ChassisTarget{1.0, 0, 0, true}, 40ms);
+TEST_F(DrivetrainTest, NeverSentStaysNeutralButStillReportsState) {
+  Teleop();
+  sim.step(60ms);
+  ExpectNeutral();
+  EXPECT_TRUE(State().enabled());
+}
+
+TEST_F(DrivetrainTest, StaleLaneGoesNeutral) {
+  Teleop();
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+  sim.step(150ms);  // the producer went quiet: the lane is stale
+  ExpectNeutral();
+}
+
+TEST_F(DrivetrainTest, ReleasedLaneGoesNeutralAtOnce) {
+  Teleop();
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+  talos::testing::ReleaseTarget<ChassisTarget>(sim, "drivetrain", "teleop");
+  sim.step(20ms);
+  ExpectNeutral();
+}
+
+TEST_F(DrivetrainTest, DisabledRobotGoesNeutral) {
+  Teleop();
+  hw.enable(false);
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  ExpectNeutral();
+  EXPECT_FALSE(State().enabled());
+}
+
+TEST_F(DrivetrainTest, DriverStationLossOrOtherModeLaneGoesNeutral) {
+  Teleop();
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
   ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
 
-  sim.step(150ms);  // the arbiter went quiet: the target is stale
-  for (const SwerveModule& module : geometry.modules) {
-    EXPECT_EQ(Request(module.drive).mode, Mode::kNeutral) << module.name;
-    EXPECT_EQ(Request(module.steer).mode, Mode::kNeutral) << module.name;
-  }
+  // The Driver Station goes silent; its last packet ages out.
+  hw.stop_driver_station();
+  Hold(ChassisTarget{1.0, 0, 0}, 160ms);
+  ExpectNeutral();
 
-  Hold(ChassisTarget{1.0, 0, 0, false}, 40ms);
-  EXPECT_EQ(Request("front_left_drive").mode, Mode::kNeutral);
-
-  hw.enable(false);
-  Hold(ChassisTarget{1.0, 0, 0, true}, 40ms);
-  EXPECT_EQ(Request("front_left_drive").mode, Mode::kNeutral);
-  EXPECT_FALSE(State().enabled());
+  // Autonomous selects the auto lane; teleop's keeps talking to nobody.
+  hw.set_driver_station(
+      talos::testing::DsPacket(ds::kEnabled | ds::kAutonomous));
+  sim.step(10ms);
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  ExpectNeutral();
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms, "auto");
+  EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
 }
 
 TEST_F(DrivetrainTest, ReportsTheChassisMotionTheModulesMeasure) {
@@ -302,9 +348,13 @@ TEST(Drivetrain, LinkDropStopsPublishingStateAndHoldsOdometry) {
   auto hw = std::make_unique<SimHardware>(sim);
   hw->enable();
   hw->ideal_motors();
+  hw->set_driver_station(talos::testing::DsPacket(
+      talos::driver_station::kEnabled | talos::driver_station::kTeleop));
+  sim.step(10ms);
 
   for (auto t = 0ms; t < 60ms; t += 20ms) {
-    sim.publish(topics::kTarget, ChassisTarget{1.0, 0, 1.0, true});
+    talos::testing::PublishTarget(sim, "drivetrain", "teleop",
+                                  ChassisTarget{1.0, 0, 1.0});
     sim.step(20ms);
   }
   const auto before_drop = sim.latest<DrivetrainState>(topics::kState);
@@ -315,7 +365,8 @@ TEST(Drivetrain, LinkDropStopsPublishingStateAndHoldsOdometry) {
 
   hw.reset();
   for (auto t = 0ms; t < 160ms; t += 20ms) {
-    sim.publish(topics::kTarget, ChassisTarget{1.0, 0, 1.0, true});
+    talos::testing::PublishTarget(sim, "drivetrain", "teleop",
+                                  ChassisTarget{1.0, 0, 1.0});
     sim.step(20ms);
   }
 
@@ -328,7 +379,8 @@ TEST(Drivetrain, LinkDropStopsPublishingStateAndHoldsOdometry) {
       at_timeout.value_or(DrivetrainState{});
 
   for (auto t = 0ms; t < 60ms; t += 20ms) {
-    sim.publish(topics::kTarget, ChassisTarget{1.0, 0, 1.0, true});
+    talos::testing::PublishTarget(sim, "drivetrain", "teleop",
+                                  ChassisTarget{1.0, 0, 1.0});
     sim.step(20ms);
   }
   EXPECT_EQ(talos::detail::SimAccess::message_count(sim, topics::kState,
@@ -345,7 +397,7 @@ TEST(Drivetrain, LinkDropStopsPublishingStateAndHoldsOdometry) {
 // These structs cross every chassis topic on the robot, so a layout change
 // is a new contract (whole-bundle rollback), never a silent edit.
 TEST(Messages, WireSizesAreFrozen) {
-  EXPECT_EQ(sizeof(ChassisTarget), 32u);
+  EXPECT_EQ(sizeof(ChassisTarget), 24u);
   EXPECT_EQ(sizeof(DrivetrainState), 56u);
 }
 

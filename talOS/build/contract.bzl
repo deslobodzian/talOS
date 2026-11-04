@@ -440,7 +440,7 @@ def _talos_bundle_impl(ctx):
     launcher_runfiles = ctx.attr.launcher[DefaultInfo].default_runfiles.files
 
     direct_inputs = [launcher_exec, ctx.file.config]
-    direct_inputs.extend(ctx.files.subsystems)
+    direct_inputs.extend(ctx.files.config_files)
     transitive_inputs = [launcher_runfiles]
 
     nodes_spec = []
@@ -500,23 +500,19 @@ def _talos_bundle_impl(ctx):
             "runfiles": rf_list,
         })
 
-    subsystems_spec = []
-    for sub in ctx.files.subsystems:
-        if sub.basename.endswith(".toml"):
-            sub_name = sub.basename[:-5]
-        else:
-            sub_name = sub.basename
-        subsystems_spec.append({
-            "src_path": sub.path,
-            "name": sub_name,
-        })
+    # Each config file keeps its path relative to the config, so `include`,
+    # `path` and `defaults` resolve in the bundle as they do in the source tree.
+    config_files_spec = [
+        {"src_path": f.path, "short_path": f.short_path}
+        for f in ctx.files.config_files
+    ]
 
     spec = {
         "bundle_name": ctx.label.name,
         "bundle_version": 1,
         "launcher_path": launcher_exec.path,
-        "config_path": ctx.file.config.path,
-        "subsystems": subsystems_spec,
+        "config": {"src_path": ctx.file.config.path, "short_path": ctx.file.config.short_path},
+        "config_files": config_files_spec,
         "nodes": nodes_spec,
     }
 
@@ -616,10 +612,10 @@ talos_bundle = rule(
             allow_single_file = True,
             doc = "The robot.toml config file",
         ),
-        "subsystems": attr.label_list(
+        "config_files": attr.label_list(
             allow_files = True,
             default = [],
-            doc = "List of subsystem TOML files",
+            doc = "Every file the config reads besides itself: the CONFIG_FILES of its generated manifest",
         ),
         "launcher": attr.label(
             default = Label("//talOS/launcher:launcher"),
@@ -646,8 +642,8 @@ def talos_graph_test(
     Args:
       name: test target name.
       config: the robot.toml file or label.
-      nodes: the node binaries `config` names.
-      data: additional runtime files (e.g., subsystem .toml files or filegroups).
+      nodes: the node binaries `config` names: the NODES of its generated manifest.
+      data: every file `config` reads besides itself: the manifest's CONFIG_FILES.
       **kwargs: passed to py_test.
     """
     config_label = native.package_relative_label(config)

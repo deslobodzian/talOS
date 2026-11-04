@@ -5,8 +5,8 @@ load("//talOS/build:contract.bzl", "talos_messages")
 package(default_visibility = ["//visibility:public"])
 
 # Shared geometry and control message contracts (ROS *_msgs style), so
-# subsystems, arbiters, odometry, and operator interfaces can interoperate
-# without depending on each other's packages or repos.
+# subsystems, target producers, odometry, and operator interfaces can
+# interoperate without depending on each other's packages or repos.
 talos_messages(
     name = "geometry",
     srcs = ["geometry.fbs"],
@@ -26,6 +26,8 @@ cc_test(
     deps = [
         ":control",
         ":geometry",
+        "//talOS/devices",
+        "//talOS/devices:testing",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
     ],

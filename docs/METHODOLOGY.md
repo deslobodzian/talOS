@@ -35,35 +35,33 @@ after construction **[enforced: `--describe` records the constructor's topics]**
 class Wrist {
  public:
   explicit Wrist(talos::Node& node)
-      : node_{node},
-        motor_{node, "motor"},                                   // [motors.motor]
+      : motor_{node, "motor"},                                   // [motors.motor]
         angle_{node, "angle"},                                   // [sensors.angle]
         tolerance_rot_{node.param<double>("tolerance_rot")},     // required: no fallback
-        target_{node.subscribe<control::PositionTarget>("target")},
+        target_{node},                                           // /wrist/target/<source> lanes
         state_{node.publish<control::PositionState>("state")} {
     if (!(tolerance_rot_ > 0)) throw std::invalid_argument("tolerance_rot must be > 0");
   }
 
   void update() {
-    // read
+    // read: null unless the robot is enabled and the lane selected for the
+    // current Driver Station mode is active and fresh
+    const control::PositionTarget* t = target_.get();
     const bool feedback = motor_.connected() && angle_.connected();
-    const bool drive = talos::robot_enabled(node_) && target_.fresh() &&
-                       target_->enabled() && feedback &&
-                       std::isfinite(target_->position_rot());
+    const bool drive = t != nullptr && feedback && std::isfinite(t->position_rot());
     // decide + write: actuators only inside `drive`; everything else goes neutral by omission
-    if (drive) motor_.set_motion_magic(target_->position_rot());
-    const double goal_rot = drive ? target_->position_rot() : angle_.position();
+    if (drive) motor_.set_motion_magic(t->position_rot());
+    const double goal_rot = drive ? t->position_rot() : angle_.position();
     state_.send(control::PositionState{
         angle_.position(), angle_.velocity(), goal_rot, drive,
         drive && std::abs(angle_.position() - goal_rot) <= tolerance_rot_, feedback});
   }
 
  private:
-  talos::Node& node_;
   talos::Motor motor_;
   talos::CANcoder angle_;
   double tolerance_rot_;
-  talos::Subscription<control::PositionTarget> target_;
+  talos::Target<control::PositionTarget> target_;
   talos::Publisher<control::PositionState> state_;
 };
 // wrist.cc:  TALOS_NODE(wrist::Wrist)
@@ -79,14 +77,13 @@ class Wrist:
         self.tolerance_rot = node.param("tolerance_rot")
         if not self.tolerance_rot > 0:
             raise ValueError("tolerance_rot must be > 0")
-        self.target = node.subscribe(PositionTarget, "target")
+        self.target = talos.Target(node, PositionTarget)
         self.state = node.publish(PositionState, "state")
 
     def update(self):
-        t = self.target.value
+        t = self.target.get()
         feedback = self.motor.connected and self.angle.connected
-        drive = (talos.robot_enabled(self.node) and self.target.fresh() and t.enabled
-                 and feedback and math.isfinite(t.position_rot))
+        drive = t is not None and feedback and math.isfinite(t.position_rot)
         if drive:
             self.motor.set_motion_magic(t.position_rot)
         goal_rot = t.position_rot if drive else self.angle.position
@@ -96,10 +93,10 @@ class Wrist:
                         connected=feedback)
 ```
 
-When D1 lands, the `target_.fresh() && target_->enabled()` pair becomes
-`talos::Target<M>::get()`, which returns null unless the robot is enabled and
-the lane selected for the current mode is fresh. The `enabled` field then
-leaves target messages. **[planned: D1]**
+`Target<M>::get()` folds `robot_enabled(node)`, the Driver Station mode, the
+lane priority, release and freshness into one null check, so target messages
+carry no `enabled` field. **[review; the graph lint checks each lane against
+the policy]**
 
 ## 3. Inputs
 
@@ -107,7 +104,7 @@ There are exactly two kinds of input, and they are treated differently.
 
 | Kind | Topic | Missing or stale means | Read with |
 |---|---|---|---|
-| **Target**: what someone asks this node to do | `/<me>/target` today; `/<me>/target/<source>` lanes under D1 | do nothing: neutral | `fresh()` plus the message's `enabled` (D1: `Target<M>::get()`) |
+| **Target**: what someone asks this node to do | `/<me>/target/<source>` lanes, one per producer; priority per Driver Station mode from `[robot.targets]` / the subsystem's `[targets]` | do nothing: neutral | `talos::Target<M>::get()` (null: neutral) |
 | **Observation**: what another node reports | `/<other>/state`, `/<other>/status`, `/hw/...` | the decision that needs it is not made; publish your state with the matching validity flag cleared | `fresh()` plus that message's own validity flags |
 
 - Never dereference a subscription without checking `fresh()` in the same
@@ -129,7 +126,10 @@ There are exactly two kinds of input, and they are treated differently.
 - Never publish NaN or infinity. Publish a validity flag and a finite
   placeholder instead. **[review]**
 - One writer per topic. Several producers of one target each write their own
-  `/<sub>/target/<source>` lane. **[enforced: graph lint]**
+  `/<sub>/target/<source>` lane with `talos::TargetLane`, republished every
+  period; a producer with nothing to say calls `release()` rather than
+  sending zeros. **[enforced: graph lint, including a lane no policy mode
+  lists]**
 - Something that happened once (a shot fired, a piece acquired) goes on
   `/<me>/event`, not as a pulse in `state`. **[review]**
 
@@ -194,8 +194,8 @@ Rules:
 - Look in `talOS/msgs` (`geometry`, `control`) before writing a new struct.
   Reuse beats a near-duplicate. **[review]**
 - Messages are FlatBuffers structs owned by one package, declared with
-  `talos_messages`. Never mirror a struct by hand; `GenericTarget` and
-  `GenericState` are slated for removal. **[review; D2 replaces size-only checks with a schema hash]**
+  `talos_messages`. Never mirror a struct by hand; `GenericState` and
+  operator_interface's `GenericTarget` are slated for removal (D3, D4). **[review; D2 replaces size-only checks with a schema hash]**
 - A measurement message carries `sample_time_ns`: when the measurement was
   taken, not when it was published. **[planned: D6]**
 - A message carries validity next to the value it qualifies (`yaw_valid` next
@@ -215,7 +215,9 @@ Rules:
   `heading_timeout_us`). **[review; warning planned: D2]**
 - Robot-wide wiring (which producers drive which subsystem, telemetry,
   bindings) lives in TOML read by the framework. It is never a list of
-  subsystem names in code. **[planned: D1, D3, D4]**
+  subsystem names in code. Target lanes are already config-only
+  (`[robot.targets]`, `[targets]`); telemetry and bindings are
+  **[planned: D3, D4]**.
 
 ## 9. Time, determinism, restart
 
@@ -240,7 +242,7 @@ intake; the whole graph used ≈ 4.5 % of one core.
 | `update()` p99 wall time | ≤ 10 % of `period_us` | [review]; read `max_latency` in the registry / Studio system view |
 | Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | [review]; an allocation-free assertion in `Sim` is planned |
 | Python nodes | fine for any period ≥ 5 ms: they cost memory (≈ 30 MB), not jitter | [review] |
-| Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [review]; D1 removes the arbiter hop |
+| Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [review]; producer → consumer is one hop (`Target` resolves lanes in the consumer) |
 | Per-tick work | O(devices), never O(history); bound every loop | [review] |
 
 How a node receives messages decides its latency, regardless of language
@@ -262,11 +264,18 @@ with **all** of these cases **[review; the scaffold generates the skeleton]**:
 | Happy path | the right mode and demand on each actuator; `state` reflects it |
 | Robot disabled (`hw.enable(false)`) | every actuator neutral, `state.enabled == false`, `state` still published |
 | Target stale (stop publishing; step past `command_timeout_us`) | neutral within one period after the timeout |
+| Target released (`ReleaseTarget` / `sim.release_target`) | neutral (or the next lane in priority) on the next tick |
 | Target never sent | neutral; no exception |
+| Driver Station lost (`hw.stop_driver_station()`) | neutral once the DS is stale |
 | Feedback disconnected (`hw.set_connected(node, dev, false)`) | neutral; validity flag cleared |
 | Non-finite demand | neutral; no NaN in `state` |
 | Bad parameter | the constructor throws, naming the key |
-| Source switch (D1) | the old mode's lane is ignored after a mode change |
+| Source switch (a node with several lanes) | the old mode's lane is ignored after a mode change |
+
+Publish targets with `talos::testing::PublishTarget` / `sim.publish_target`,
+with `hw.enable()` and a teleop-enabled Driver Station
+(`hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop))` /
+`hw.set_driver_station(enabled=True, teleop=True)`).
 
 - Test behaviour through topics and `SimHardware`. Never test private methods
   or log text.
@@ -281,8 +290,8 @@ with **all** of these cases **[review; the scaffold generates the skeleton]**:
 
 | Adding | Do | Never |
 |---|---|---|
-| A mechanism | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py`; fill in the TOML; write the §11 tests | edit `arbiter`, `operator_interface` or `telemetry` code |
-| A producer of a target (auto routine, auto-align) | publish `/<sub>/target/<source>`; today add one arbiter line, under D1 list the source in `[targets]` | write `/<sub>/target` |
+| A mechanism | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py`; fill in the TOML; write the §11 tests | edit `operator_interface` or `telemetry` code |
+| A producer of a target (auto routine, auto-align) | a `talos::TargetLane` on `/<sub>/target/<source>`; list `<source>` in `[robot.targets]` or that subsystem's `[targets]` (the launcher refuses a lane no mode lists) | subscribe to another producer's lane, or write a lane someone else writes |
 | A process without hardware (pose estimator, vision, auto) | a node with no devices; subscribe to `state` topics; publish `/<me>/state`; do the math with wpimath (§14); walkthrough in DESIGN_AUTOMATIC_WIRING.md §D6 | read `/hw/state` directly; hand-roll a Kalman filter or kinematics |
 | A message | the owning package's `.fbs` and `talos_messages(topics = ...)`; §6 and §7 | a hand-written C++/Python mirror |
 | A device type | `talOS/hardware`, `talOS/devices`, `devices.py`, the RoboRIO program, in one change | |
@@ -298,8 +307,7 @@ touch the code, or under the design item named.
 | `drivetrain/drive_message.fbs` `DrivetrainState` | `yaw_rot` heading (field frame) and `yaw_rate_rps` duplicating `omega_radps`; `timestamp_ns` is publish time | §6, §7 | `yaw_rad` + `yaw_valid`, drop `yaw_rate_rps`, `sample_time_ns` (D6) |
 | `talOS/msgs/geometry.fbs`, `odometry_message.fbs` | headings in `_rot` | §6 | `_rad` |
 | `drivetrain/drivetrain.h:40` | stops publishing `state` when a motor disconnects; yaw reads 0 with the gyro disconnected | §4 | publish every tick with validity flags |
-| `arbiter/`, `operator_interface.h:70-92`, `telemetry/node.h:325-393` | subsystem names hard-coded; `GenericTarget`/`GenericState` hand mirrors; `arbitrate`/`teleop_button`/`telemetry` keys | §7, §8 | D1, D3, D4 |
-| `examples/superstructure/cpp/elevator.h:27-30,54` | holds the last goal when stale; drives to 0 before any goal | §3, §5 | neutral on stale; update the README and both tests |
+| `operator_interface.h` extras, `telemetry/node.h:325-393` | subsystem names hard-coded; `GenericTarget`/`GenericState` hand mirrors; `teleop_button`/`telemetry` keys | §7, §8 | D3, D4 |
 | `telemetry/node.h` units | `"rev/s"` strings written by hand | §6 | derive from suffix (D3) |
 | `operator_interface.toml` | `deadband`, `heading_timeout_s` | §6, §8 | `deadband_frac`, `heading_timeout_us` |
 | `intake.py:18` | fixed `INTAKE_RPS` ignores the requested speed | §3 | use the target's demand |

@@ -2,17 +2,14 @@ load("@rules_python//python:defs.bzl", "py_test")
 load("//talOS/build:contract.bzl", "talos_messages", "talos_py_node")
 
 # IntakeTarget / IntakeState (namespace intake) and the intake's topics. The
-# arbiter, operator interface and telemetry consume them. /intake/target has
-# one writer, the arbiter; teleop and autonomous publish on their own lanes
-# and the arbiter picks one.
+# operator interface and telemetry consume them. The intake reads its target
+# through talos.Target: teleop and autonomous publish on their own lanes,
+# /intake/target/<source>, and the [robot.targets] policy picks one.
 talos_messages(
     name = "messages",
     srcs = ["intake_message.fbs"],
     topics = {
         "state": "/intake/state",
-        "target": "/intake/target",
-        "teleop_target": "/intake/target/teleop",
-        "auto_target": "/intake/target/auto",
     },
 )
 

@@ -33,13 +33,15 @@ from talos._abi import TalosError, lib
 from talos._messages import Message, enum_names, message_type
 from talos.devices import (Alliance, AnalogInput, CANcoder, DigitalInput,
                            DigitalOutput, DriverStation, Encoder, Gyro,
-                           Joystick, Mode, Motor, PwmOutput, robot_enabled)
+                           Joystick, Mode, Motor, PwmOutput, Target,
+                           TargetLane, robot_enabled)
 
 __all__ = [
     "Alliance", "AnalogInput", "BytePublisher", "CANcoder", "DigitalInput",
     "DigitalOutput", "DriverStation", "Encoder", "Gyro", "Joystick", "Message",
     "Mode", "Motor", "Node", "Publisher", "PwmOutput", "StateMachine",
-    "Subscription", "TalosError", "cpp_node", "load", "robot_enabled", "run",
+    "Subscription", "TalosError", "Target", "TargetLane", "cpp_node", "load",
+    "robot_enabled", "run",
 ]
 
 _NS = 1e9

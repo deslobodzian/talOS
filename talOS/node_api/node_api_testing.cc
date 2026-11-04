@@ -137,6 +137,35 @@ int32_t talos_sim_latest_bytes(const TalosSim* sim, const char* topic,
   });
 }
 
+int32_t talos_sim_publish_target(TalosSim* sim, const char* subsystem,
+                                 const char* source, const void* message,
+                                 uint32_t size, uint32_t alignment) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    talos::testing::PublishTargetRaw(
+        AsSim(sim), NonNull(subsystem, "subsystem"), NonNull(source, "source"),
+        message, size, alignment);
+    return TALOS_OK;
+  });
+}
+
+int32_t talos_sim_latest_target(const TalosSim* sim, const char* subsystem,
+                                const char* source, void* out, uint32_t size,
+                                uint32_t alignment, int32_t* active) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out == nullptr || active == nullptr) {
+      throw std::invalid_argument("null output");
+    }
+    bool is_active = false;
+    if (!talos::testing::LatestTargetRaw(
+            AsSim(sim), NonNull(subsystem, "subsystem"),
+            NonNull(source, "source"), out, size, alignment, is_active)) {
+      return 0;
+    }
+    *active = is_active ? 1 : 0;
+    return 1;
+  });
+}
+
 // --- SimHardware -------------------------------------------------------------
 
 TalosSimHardware* talos_sim_hardware_create(TalosSim* sim) {
@@ -241,7 +270,8 @@ int32_t talos_sim_hardware_set_driver_station(
     TalosSimHardware* hw, const TalosDriverStationPacket* packet) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     if (packet == nullptr) {
-      throw std::invalid_argument("null TalosDriverStationPacket");
+      AsHardware(hw).stop_driver_station();
+      return TALOS_OK;
     }
     namespace ds = talos::driver_station;
     ds::DriverStationData data{};

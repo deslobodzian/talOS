@@ -18,7 +18,7 @@ RoboRIO program under WPILib simulation) takes the RoboRIO's place.
 
 ```
 robot code        2026-robot/main_processor/*, examples/*
-talOS/devices     Motor, CANcoder, Gyro, DigitalInput, ..., robot_enabled, testing::SimHardware
+talOS/devices     Motor, CANcoder, Gyro, DigitalInput, ..., robot_enabled, Target, TargetLane, testing::SimHardware
 talOS/node        Node, Subscription, Publisher, StateMachine, TALOS_NODE, testing::Sim
 talOS/python      the same API in Python, ctypes over talOS/node_api (libtalos_node.so)
 talOS/events      event loop, dispatch log, replay
@@ -35,8 +35,8 @@ Allowed dependencies:
   reimplement a wire format, a memory layout, a state machine, or a C++ node
   (C++ nodes exposed to Python use `TALOS_EXPORT_NODE` and `talos.cpp_node`).
 - Adding a node in one language never requires modifying code in another
-  language: cross-cutting robot wiring (`arbiter`, `operator_interface`,
-  `telemetry`) is driven by the subsystem's TOML configuration.
+  language: cross-cutting robot wiring (target policies, `operator_interface`,
+  `telemetry`) is driven by TOML configuration.
 - Nodes share only messages and topic names (`talos_messages`), never each
   other's classes.
 
@@ -54,7 +54,7 @@ Beside the stack:
 | `talOS/process` | stop handlers and `ConfigureRealtime` for node binaries |
 | `talOS/msgs` | shared geometry and control message structs |
 | `talOS/telemetry` | the Studio telemetry frame schema and byte-topic wire format |
-| `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle`, `talos_graph_test` |
+| `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle`, `talos_graph_test` (both fed by a config's generated `robot_manifest.bzl`, `tools/sync_manifest.py`) |
 
 ## The tick
 
@@ -69,6 +69,21 @@ After each tick the devices layer flushes one hardware request for the node:
 
 A subscription's `fresh()` means a value younger than `command_timeout_us`, so
 a node that stops hearing its target goes neutral on its own.
+
+## Targets
+
+What a subsystem is asked to do arrives on target lanes,
+`/<sub>/target/<source>`, one per producer (`teleop`, `auto`, `align`, ...).
+Each carries a `TargetEnvelope<M>`: `active`, then the producer's message. A
+producer writes its lane with `talos::TargetLane<M>` (`send`, or `release()`
+when it has nothing to say). The consumer resolves its own lanes with
+`talos::Target<M>`: `get()` returns the first lane, in the priority order the
+config gives for the current Driver Station mode, that is active, fresh and
+sent since that mode began, and only while `robot_enabled(node)`; otherwise
+null, and the node goes neutral. The policy is `[robot.targets]` (defaults:
+teleop `["teleop"]`, autonomous `["auto"]`, test none) with a per-subsystem
+`[targets]` override. No process sits between a producer and its subsystem,
+so a subsystem's safety depends only on its own process and the bridge.
 
 Messages reach a node when its loop drains its topics. A node without message
 callbacks drains right before each of its own timers (`update()`, `every()`)
@@ -94,8 +109,8 @@ locked, best effort (`talOS/process`).
   `<namespace>.<Struct>`.
 - Topic names are declared once, in the package's `topics.h`, and follow
   [talOS/NAMING.md](talOS/NAMING.md).
-- One writer per topic. Several producers of a target publish
-  `/<sub>/target/<source>` and an arbiter node writes `/<sub>/target`.
+- One writer per topic. Several producers of a target each write their own
+  lane, and the consumer picks one (see "Targets").
 - The launcher refuses to start a graph that breaks a naming or graph rule
   (`--allow-graph-errors` overrides).
 
@@ -103,10 +118,12 @@ locked, best effort (`talOS/process`).
 
 ```
 configuration/robot.toml        [robot] period, timeouts, controller address
+                                [robot.targets] target lanes per Driver Station mode
                                 [studio] viewer bridge
                                 [[subsystems]] name + path, one per subsystem
 configuration/subsystems/*.toml [subsystem] name, node = "//...:node", period_us,
-                                custom keys (node.param), [motors.*] and other devices
+                                custom keys (node.param), [motors.*] and other devices,
+                                [targets] lane priorities per mode
 ```
 
 A manifest entry may also set `node = "//...:target"`, which overrides the
@@ -117,13 +134,23 @@ addressed by name.
 Example configs carry placeholder CAN ids; the robot's config carries the
 physical ones and sets `commissioned = true` only after checking them.
 
+`[[subsystems]]` is the only list of a robot's nodes. Bazel cannot read TOML,
+so `bazel run //tools:sync_manifest -- <dir>/robot.toml` writes
+`<dir>/robot_manifest.bzl` (`<stem>_manifest.bzl` for any other config name):
+`NODES`, every node label the config launches, and `CONFIG_FILES`, every file
+it reads besides itself (`include`, `path`, `defaults`). `talos_bundle` and
+`talos_graph_test` take those constants; no BUILD file lists nodes or
+subsystem files. Each config package has a `manifest_sync_test`
+(`tools/sync_manifest.bzl`) that fails, printing the regenerate command, when
+the config changes and the manifest does not.
+
 ## Where a new thing goes
 
 | New thing | Where |
 |---|---|
-| a mechanism | a node package under `<robot>/main_processor/<name>/`, plus a subsystem file; generate it with `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` (walkthrough in [examples/superstructure](examples/superstructure/README.md)) |
+| a mechanism | a node package under `<robot>/main_processor/<name>/`, plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` does all of it (walkthrough in [examples/superstructure](examples/superstructure/README.md)) |
 | a message or topic | the owning package's `.fbs` and `topics.h` |
-| a producer of an existing target | a `/<sub>/target/<source>` topic and a line in the arbiter |
+| a producer of an existing target | a `talos::TargetLane` on `/<sub>/target/<source>`, and `<source>` in that subsystem's policy (`[robot.targets]` or its `[targets]`); the launcher refuses a lane no mode lists |
 | a device type | `talOS/hardware` (config + wire), `talOS/devices`, `talOS/python/talos/devices.py`, and the RoboRIO program |
 | a node-API feature | `talOS/node`, mirrored in `talOS/node_api` and `talOS/python/talos` |
 | a robot | a sibling of `2026-robot/` |

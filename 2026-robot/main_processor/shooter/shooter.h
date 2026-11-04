@@ -10,7 +10,7 @@
 
 namespace shooter {
 
-// Spins the flywheel to the arbiter's target and reports whether it is at
+// Spins the flywheel to the selected target lane and reports whether it is at
 // speed and whether a game piece is breaking the beam.
 class Shooter {
  public:
@@ -20,16 +20,19 @@ class Shooter {
       : node_{node},
         flywheel_{node, "flywheel"},
         beam_break_{node, "beam_break"},
-        target_{node.subscribe<ShooterTarget>(topics::kTarget)},
+        target_{node},
         state_{node.publish<ShooterState>(topics::kState)} {}
 
   void update() {
     const bool enabled = talos::robot_enabled(node_);
-    const double goal = target_->target_velocity_rps();
-    const bool spin = enabled && target_.fresh() && target_->enabled() &&
-                      flywheel_.connected() && std::isfinite(goal);
-    if (spin)
-      flywheel_.set_velocity(goal);  // otherwise the flush sends neutral
+    double goal = 0.0;
+    bool spin = false;
+    if (const ShooterTarget* t = target_.get()) {
+      goal = t->target_velocity_rps();
+      spin = flywheel_.connected() && std::isfinite(goal);
+      if (spin)
+        flywheel_.set_velocity(goal);  // otherwise the flush sends neutral
+    }
 
     const double velocity = flywheel_.velocity();
     const bool at_speed = spin && std::abs(goal) > 1e-3 &&
@@ -43,7 +46,7 @@ class Shooter {
   talos::Node& node_;
   talos::Motor flywheel_;
   talos::DigitalInput beam_break_;
-  talos::Subscription<ShooterTarget> target_;
+  talos::Target<ShooterTarget> target_;
   talos::Publisher<ShooterState> state_;
 };
 

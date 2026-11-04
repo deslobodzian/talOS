@@ -1,10 +1,11 @@
 namespace control;
 
 // Standard velocity command for rollers, flywheels, and conveyor mechanisms.
+// Sent on a target lane (talos::TargetLane), whose envelope says whether it
+// is active.
 struct VelocityTarget {
   velocity_rps:double;
   feedforward_v:double;
-  enabled:bool;
 }
 
 // Standard velocity feedback published by velocity-controlled mechanisms.
@@ -20,7 +21,6 @@ struct VelocityState {
 struct PositionTarget {
   position_rot:double;
   feedforward_v:double;
-  enabled:bool;
 }
 
 // Standard position feedback with goal echo and tolerance indicator.
@@ -38,5 +38,4 @@ struct ChassisTarget {
   vx_mps:double;
   vy_mps:double;
   omega_radps:double;
-  enabled:bool;
 }

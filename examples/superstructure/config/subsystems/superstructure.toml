@@ -1,5 +1,7 @@
-# No hardware: reads /superstructure/target and the mechanism states, writes
-# the mechanism targets.
+# No hardware: reads its goal on /superstructure/target/teleop and
+# /superstructure/target/auto (the default [robot.targets] policy) and the
+# mechanism states, and writes /intake/target/superstructure and
+# /elevator/target/superstructure.
 [subsystem]
 name = "superstructure"
 period_us = 20000

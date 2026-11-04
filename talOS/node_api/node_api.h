@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 11u
+#define TALOS_NODE_ABI_VERSION 12u
 
 enum {
   TALOS_OK = 0,
@@ -231,6 +231,33 @@ int32_t talos_driver_station(TalosNode* node, TalosCallback on_packet,
 // Fills `out` from the node's DriverStation, taken by talos_driver_station.
 int32_t talos_driver_station_read(TalosNode* node, TalosDriverStation* out);
 
+// --- target lanes (talos::Target, talos::TargetLane) ----------------------
+
+// Opens this node's Target for a message of `message_bytes` aligned to
+// `alignment` (the struct's minimum alignment, a power of two <= 8): one
+// lane per source of the node's target policy, plus the Driver Station.
+// Call while the factory runs. Returns its index.
+int64_t talos_target_open(TalosNode* node, uint32_t message_bytes,
+                          uint32_t alignment);
+// Target::get(): returns 1 and copies the selected message into `out` (when
+// not NULL), or 0 when nothing is selected. `*source_index` (when not NULL)
+// is the selected source, or -1.
+int32_t talos_target_get(TalosNode* node, int64_t target, void* out,
+                         int32_t* source_index);
+// The name of source `source_index` of `target` ("teleop", ...); NULL on
+// error.
+const char* talos_target_source_name(TalosNode* node, int64_t target,
+                                     int32_t source_index);
+// Opens the lane /<subsystem>/target/<source>. Call while the factory runs.
+int64_t talos_target_lane_open(TalosNode* node, const char* subsystem,
+                               const char* source, uint32_t message_bytes,
+                               uint32_t alignment);
+// TargetLane::send (active = 1) and release (active = 0). Return 1 sent, 0
+// dropped by the transport, TALOS_ERR.
+int32_t talos_target_lane_send(TalosNode* node, int64_t lane,
+                               const void* message, uint32_t size);
+int32_t talos_target_lane_release(TalosNode* node, int64_t lane);
+
 // --- test harness (libtalos_node_testing.so only) ------------------------
 
 TalosSim* talos_sim_create(const char* config_path);
@@ -253,6 +280,17 @@ int32_t talos_sim_latest_raw(const TalosSim* sim, const char* topic, void* out,
 int32_t talos_sim_latest_bytes(const TalosSim* sim, const char* topic,
                                void* out, uint32_t capacity,
                                uint32_t* out_size);
+// Publishes a TargetEnvelope around `message` (`size` bytes aligned to
+// `alignment`) on /<subsystem>/target/<source>: active = 1, or, with
+// `message` NULL, a release (active = 0).
+int32_t talos_sim_publish_target(TalosSim* sim, const char* subsystem,
+                                 const char* source, const void* message,
+                                 uint32_t size, uint32_t alignment);
+// The newest envelope on that lane: 1 and its message copied into `out`
+// (`*active` set) when there is one, 0 when none yet.
+int32_t talos_sim_latest_target(const TalosSim* sim, const char* subsystem,
+                                const char* source, void* out, uint32_t size,
+                                uint32_t alignment, int32_t* active);
 
 TalosSimHardware* talos_sim_hardware_create(TalosSim* sim);
 void talos_sim_hardware_destroy(TalosSimHardware* hw);
@@ -282,7 +320,9 @@ int32_t talos_sim_hardware_set_gyro(TalosSimHardware* hw, const char* node,
 int32_t talos_sim_hardware_set_connected(TalosSimHardware* hw, const char* node,
                                          const char* device, int32_t connected);
 // The Driver Station packet to forward from now on
-// (SimHardware::set_driver_station); the rest of the packet is zero.
+// (SimHardware::set_driver_station); the rest of the packet is zero. NULL
+// stops forwarding: the Driver Station goes silent
+// (SimHardware::stop_driver_station).
 typedef struct TalosDriverStationPacket {
   uint32_t flags;    // TALOS_DS_*
   int32_t alliance;  // talos::driver_station::Alliance

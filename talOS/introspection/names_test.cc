@@ -126,7 +126,7 @@ TEST(TopicName, LengthLimitIsTheTransportLimit) {
 
 TEST(NodeName, MatchesTheSubsystemKeyRules) {
   for (const auto* name :
-       {"drivetrain", "shooter", "odometry", "arbiter", "driver_station",
+       {"drivetrain", "shooter", "odometry", "autonomous", "driver_station",
         "operator_interface", "telemetry", "hardware_node"}) {
     EXPECT_FALSE(CheckNodeName(name).has_value()) << name;
   }
@@ -204,10 +204,8 @@ TEST(LintGraph, AcceptsAWellFormedGraph) {
   const std::vector<NodeShape> nodes = {
       {"drivetrain",
        "//2026-robot/main_processor/drivetrain:node",
-       {Watcher("/drivetrain/target"), Sender("/drivetrain/state")}},
-      {"arbiter",
-       "//2026-robot/main_processor/arbiter:node",
-       {Watcher("/drivetrain/target/teleop"), Sender("/drivetrain/target")}},
+       {Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional),
+        Sender("/drivetrain/state")}},
       {"operator_interface",
        "//2026-robot/main_processor/operator_interface:node",
        {Sender("/drivetrain/target/teleop")}},
@@ -222,7 +220,8 @@ TEST(LintGraph, AcceptsAWellFormedGraph) {
        {Watcher("/odometry/state"),
         Sender("/talos/telemetry", 32, kSourceFlagExternal)}},
   };
-  const auto diagnostics = LintGraph(nodes);
+  const auto diagnostics =
+      LintGraph(nodes, {{"drivetrain", {"teleop", "auto"}}});
   EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
   EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
 }
@@ -250,31 +249,32 @@ TEST(LintGraph, CatchesTwoSpellingsOfOneTopic) {
 
 TEST(LintGraph, TwoWritersIsAnErrorAndBothAreNamed) {
   const std::vector<NodeShape> nodes = {
-      {"arbiter",
-       "//2026-robot/main_processor/arbiter:node",
-       {Sender("/drivetrain/target")}},
+      {"autonomous",
+       "//2026-robot/main_processor/autonomous:node",
+       {Sender("/drivetrain/target/teleop")}},
       {"operator_interface",
        "//2026-robot/main_processor/operator_interface:node",
-       {Sender("/drivetrain/target")}},
+       {Sender("/drivetrain/target/teleop")}},
       {"drivetrain",
        "//2026-robot/main_processor/drivetrain:node",
-       {Watcher("/drivetrain/target")}},
+       {Watcher("/drivetrain/target/teleop")}},
   };
   const auto diagnostics = LintGraph(nodes);
   ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(
-      Mentions(diagnostics, Severity::ERROR, "/drivetrain/target", "arbiter"));
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/drivetrain/target",
-                       "operator_interface"));
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
+                       "/drivetrain/target/teleop", "autonomous"));
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
+                       "/drivetrain/target/teleop", "operator_interface"));
   // Replay is the reason, and the message should say so.
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/drivetrain/target",
-                       "replayable"));
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
+                       "/drivetrain/target/teleop", "replayable"));
 }
 
 // The owner segment names the subject, and the role says which way the data
 // moves relative to it. Getting this backwards was the first draft's mistake:
 // "the owner is the publisher" reads as obvious and is false, because the
-// arbiter publishes /drivetrain/target and the drivetrain consumes it.
+// operator interface publishes /drivetrain/target/teleop and the drivetrain
+// consumes it.
 TEST(LintGraph, StateFlowsOutOfItsOwner) {
   const std::vector<NodeShape> nodes = {
       {"odometry",
@@ -305,16 +305,57 @@ TEST(LintGraph, StateFlowsOutOfItsOwner) {
 
 TEST(LintGraph, TargetsFlowIntoTheirOwner) {
   // A node publishing its own target is talking to itself: either the name is
-  // wrong or the arbitration is confused.
+  // wrong or the producer is confused.
   const std::vector<NodeShape> nodes = {
       {"drivetrain",
        "//2026-robot/main_processor/drivetrain:node",
-       {Sender("/drivetrain/target"), Watcher("/drivetrain/target")}},
+       {Sender("/drivetrain/target/teleop"),
+        Watcher("/drivetrain/target/teleop")}},
   };
   const auto diagnostics = LintGraph(nodes);
   ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/drivetrain/target",
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
+                       "/drivetrain/target/teleop",
                        "not by the subsystem being asked"))
+      << Describe(diagnostics);
+}
+
+// A lane whose source no mode of the subsystem's policy lists is never read:
+// a dead producer, refused before launch.
+TEST(LintGraph, LaneOutsideThePolicyIsAnError) {
+  const std::vector<NodeShape> nodes = {
+      {"aligner",
+       "//2026-robot/main_processor/aligner:node",
+       {Sender("/drivetrain/target/align")}},
+      {"drivetrain",
+       "//2026-robot/main_processor/drivetrain:node",
+       {Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional)}},
+  };
+  const auto diagnostics =
+      LintGraph(nodes, {{"drivetrain", {"teleop", "auto"}}});
+  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/drivetrain/target/align",
+                       "in no mode of drivetrain's target policy"))
+      << Describe(diagnostics);
+
+  // Listed: fine. A subsystem the policy map does not know is not checked.
+  EXPECT_FALSE(HasError(
+      LintGraph(nodes, {{"drivetrain", {"align", "teleop", "auto"}}})));
+  EXPECT_FALSE(HasError(LintGraph(nodes, {{"shooter", {"teleop"}}})));
+}
+
+// A policy lane with no producer yet (autonomous is not written) is normal
+// during development, so it warns rather than refusing the launch.
+TEST(LintGraph, PolicyLaneWithNoWriterIsAWarning) {
+  const std::vector<NodeShape> nodes = {
+      {"drivetrain",
+       "//2026-robot/main_processor/drivetrain:node",
+       {Watcher("/drivetrain/target/auto", 32, kSourceFlagOptional)}},
+  };
+  const auto diagnostics = LintGraph(nodes, {{"drivetrain", {"auto"}}});
+  EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
+  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING,
+                       "/drivetrain/target/auto", "nothing writes it yet"))
       << Describe(diagnostics);
 }
 
@@ -330,8 +371,8 @@ TEST(LintGraph, ReservedNamespacesAreExemptFromTheOwnerRule) {
       {"drivetrain",
        "//2026-robot/main_processor/drivetrain:node",
        {Sender("/hw/request/drivetrain"), Watcher("/hw/state")}},
-      {"arbiter",
-       "//2026-robot/main_processor/arbiter:node",
+      {"operator_interface",
+       "//2026-robot/main_processor/operator_interface:node",
        {Watcher("/hw/state/driver_station")}},
   };
   EXPECT_TRUE(LintGraph(nodes).empty()) << Describe(LintGraph(nodes));
@@ -380,22 +421,18 @@ TEST(LintGraph, ExternalAndOptionalEndsAreNotFaults) {
            // Consumed by the RoboRIO over UDP; no shared-memory peer exists.
            Sender("/hw/command", 32, kSourceFlagExternal),
        }},
-      {"arbiter",
-       "//2026-robot/main_processor/arbiter:node",
-       {
-           // Autonomous is not written yet.
-           Watcher("/drivetrain/target/auto", 32, kSourceFlagOptional),
-           Sender("/drivetrain/target"),
-       }},
       {"drivetrain",
        "//2026-robot/main_processor/drivetrain:node",
-       {Watcher("/drivetrain/target")}},
+       {
+           // A feed nobody may be publishing yet.
+           Watcher("/drivetrain/state/vision", 32, kSourceFlagOptional),
+       }},
   };
   const auto diagnostics = LintGraph(nodes);
   EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
   for (const auto& diagnostic : diagnostics) {
     EXPECT_NE(diagnostic.subject, "/hw/command");
-    EXPECT_NE(diagnostic.subject, "/drivetrain/target/auto");
+    EXPECT_NE(diagnostic.subject, "/drivetrain/state/vision");
   }
 }
 

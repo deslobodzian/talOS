@@ -1,0 +1,84 @@
+"""Tests bundle_builder.py's config staging: relative layout and identity."""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+from python.runfiles import runfiles
+
+
+def put(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+class BundleBuilderTest(unittest.TestCase):
+    def build(self, tmp, files):
+        """Bundles `files` ({short_path: text}); the first is the config."""
+        src = os.path.join(tmp, "src")
+        entries = []
+        for short_path, text in files.items():
+            put(os.path.join(src, short_path), text)
+            entries.append({"src_path": os.path.join(src, short_path),
+                            "short_path": short_path})
+        launcher = os.path.join(src, "launcher")
+        put(launcher, "")
+        spec = os.path.join(tmp, "spec.json")
+        with open(spec, "w", encoding="utf-8") as f:
+            json.dump({"bundle_name": "b", "launcher_path": launcher,
+                       "config": entries[0], "config_files": entries[1:],
+                       "nodes": []}, f)
+        out = os.path.join(tmp, "out")
+        builder = runfiles.Create().Rlocation("_main/talOS/build/bundle_builder.py")
+        subprocess.run([sys.executable, builder, "--spec", spec, "--out", out],
+                       check=True)
+        with open(os.path.join(out, "bundle_manifest.toml"), encoding="utf-8") as f:
+            manifest = f.read()
+        return out, manifest
+
+    def test_files_keep_their_paths_relative_to_the_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out, manifest = self.build(tmp, {
+                "bot/config/robot.toml": "[robot]\n",
+                "bot/config/subsystems/arm.toml": "arm\n",
+                "bot/config/mechanisms/wrist.toml": "wrist\n",
+                "bot/shared/arm_defaults.toml": "defaults\n",
+            })
+            for rel in ("config/config/robot.toml",
+                        "config/config/subsystems/arm.toml",
+                        "config/config/mechanisms/wrist.toml",
+                        "config/shared/arm_defaults.toml"):
+                self.assertTrue(os.path.isfile(os.path.join(out, rel)), rel)
+            self.assertIn('config_path = "config/config/robot.toml"', manifest)
+            with open(os.path.join(out, "run.sh"), encoding="utf-8") as f:
+                self.assertIn('--config "config/config/robot.toml"', f.read())
+
+    def test_config_in_its_own_directory_stays_at_the_top(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out, manifest = self.build(tmp, {
+                "bot/config/robot.toml": "[robot]\n",
+                "bot/config/subsystems/arm.toml": "arm\n",
+            })
+            self.assertTrue(os.path.isfile(os.path.join(out, "config/robot.toml")))
+            self.assertTrue(os.path.isfile(
+                os.path.join(out, "config/subsystems/arm.toml")))
+            self.assertIn('config_path = "config/robot.toml"', manifest)
+
+    def test_identity_changes_with_a_file_path(self):
+        def sha(files):
+            with tempfile.TemporaryDirectory() as tmp:
+                _, manifest = self.build(tmp, files)
+            return next(line for line in manifest.splitlines()
+                        if line.startswith("config_sha256"))
+        base = {"c/robot.toml": "[robot]\n", "c/subsystems/a.toml": "x\n"}
+        moved = {"c/robot.toml": "[robot]\n", "c/other/a.toml": "x\n"}
+        self.assertNotEqual(sha(base), sha(moved))
+        self.assertEqual(sha(base), sha(dict(base)))
+
+
+if __name__ == "__main__":
+    unittest.main()

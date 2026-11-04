@@ -48,12 +48,13 @@ usually a bug — and it is the specific bug this whole directory exists to catc
 because two spellings of one name produce exactly that shape. But it is not
 always a bug, and the cases where it is not are permanent.
 
-`/hw/command` is published by the arbiter and consumed by the RoboRIO, which
-reads it over UDP through the hardware bridge. It will never have a
-shared-memory subscriber, and there is no version of this robot in which it
-would. `/drivetrain/target/auto` is subscribed to by the drivetrain and
-published by nobody, because autonomous is not written yet; it will be, and
-until then the topic is deliberately half-connected.
+`/hw/command` is published by the hardware bridge and consumed by the RoboRIO,
+which reads it over UDP. It will never have a shared-memory subscriber, and
+there is no version of this robot in which it would. `/drivetrain/target/auto`
+is subscribed to by the drivetrain's `talos::Target` and published by nobody,
+because autonomous is not written yet; it will be, and until then the topic is
+deliberately half-connected (the lint mentions it as a warning, never as an
+error).
 
 Reported as faults, those two are noise on every run, and noise on every run is
 how a report stops being read. The next real dangling topic then arrives into a

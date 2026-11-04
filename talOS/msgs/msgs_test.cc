@@ -4,6 +4,8 @@
 
 #include "control/control_generated.h"
 #include "geometry/geometry_generated.h"
+#include "talOS/devices/devices.h"
+#include "talOS/devices/testing.h"
 #include "talOS/node/node.h"
 #include "talOS/node/testing.h"
 
@@ -12,6 +14,8 @@ namespace {
 
 using namespace std::chrono_literals;
 using testing::Sim;
+using testing::SimHardware;
+namespace ds = driver_station;
 
 static_assert(Message<geometry::Translation2d>);
 static_assert(Message<geometry::Rotation2d>);
@@ -35,20 +39,20 @@ can_id = 1
 
 struct DummyPositionNode {
   explicit DummyPositionNode(Node& n)
-      : target{n.subscribe<control::PositionTarget>("/wrist/target",
-                                                    {.optional = true})},
+      : target{n},
         state{n.publish<control::PositionState>("/wrist/state")},
         odom{n.publish<geometry::OdometrySample>("/wrist/telemetry")} {}
 
   void update() {
-    const bool active = target.fresh() && target->enabled();
-    const double goal = active ? target->position_rot() : 0.0;
+    const control::PositionTarget* t = target.get();
+    const double goal = t != nullptr ? t->position_rot() : 0.0;
+    const bool active = t != nullptr;
     state.send(control::PositionState{goal, 0.0, goal, active, active, true});
     odom.send(geometry::OdometrySample{100u, geometry::Pose2d{1.5, -2.5, 0.25},
                                        geometry::Twist2d{3.0, 0.0, 0.5}});
   }
 
-  Subscription<control::PositionTarget> target;
+  Target<control::PositionTarget> target;
   Publisher<control::PositionState> state;
   Publisher<geometry::OdometrySample> odom;
 };
@@ -56,8 +60,13 @@ struct DummyPositionNode {
 TEST(StandardMessages, RoundTripControlAndGeometryStructsOnSim) {
   auto sim = Sim::FromToml(kToml);
   sim.add<DummyPositionNode>("wrist");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(testing::DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(10ms);
 
-  sim.publish("/wrist/target", control::PositionTarget{0.375, 0.5, true});
+  testing::PublishTarget(sim, "wrist", "teleop",
+                         control::PositionTarget{0.375, 0.5});
   sim.step(20ms);
 
   const auto pos = sim.latest<control::PositionState>("/wrist/state");

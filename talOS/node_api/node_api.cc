@@ -31,6 +31,7 @@ thread_local std::string g_param_string;  // TalosParam::string
 
 using detail::HardwareAccess;
 using detail::NodeAccess;
+using detail::TargetAccess;
 
 std::size_t Index(std::int64_t index) {
   if (index < 0) throw std::out_of_range("negative index");
@@ -157,6 +158,7 @@ void ClearError() { g_last_error.clear(); }
 using namespace talos::node_api;
 using talos::detail::HardwareAccess;
 using talos::detail::NodeAccess;
+using talos::detail::TargetAccess;
 
 extern "C" {
 
@@ -517,6 +519,70 @@ int32_t talos_driver_station_read(TalosNode* node, TalosDriverStation* out) {
       out->joysticks[port] = JoystickOf(ds.joystick(port));
     }
     return TALOS_OK;
+  });
+}
+
+// --- target lanes ------------------------------------------------------------
+
+int64_t talos_target_open(TalosNode* node, uint32_t message_bytes,
+                          uint32_t alignment) {
+  return Guard<int64_t>(-1, [&] {
+    return static_cast<int64_t>(
+        TargetAccess::open_target(AsNode(node), message_bytes, alignment));
+  });
+}
+
+int32_t talos_target_get(TalosNode* node, int64_t target, void* out,
+                         int32_t* source_index) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    talos::Node& n = AsNode(node);
+    std::int32_t source = -1;
+    const void* message = TargetAccess::target_get(n, Index(target), source);
+    if (source_index != nullptr) *source_index = source;
+    if (message == nullptr) return 0;
+    if (out != nullptr) {
+      std::memcpy(out, message, TargetAccess::target_bytes(n, Index(target)));
+    }
+    return 1;
+  });
+}
+
+const char* talos_target_source_name(TalosNode* node, int64_t target,
+                                     int32_t source_index) {
+  return Guard<const char*>(nullptr, [&] {
+    const auto sources =
+        TargetAccess::target_sources(AsNode(node), Index(target));
+    if (source_index < 0 ||
+        static_cast<std::size_t>(source_index) >= sources.size()) {
+      throw std::out_of_range("no target source " +
+                              std::to_string(source_index));
+    }
+    return sources[static_cast<std::size_t>(source_index)].c_str();
+  });
+}
+
+int64_t talos_target_lane_open(TalosNode* node, const char* subsystem,
+                               const char* source, uint32_t message_bytes,
+                               uint32_t alignment) {
+  return Guard<int64_t>(-1, [&] {
+    return static_cast<int64_t>(TargetAccess::open_lane(
+        AsNode(node), NonNull(subsystem, "subsystem"),
+        NonNull(source, "source"), message_bytes, alignment));
+  });
+}
+
+int32_t talos_target_lane_send(TalosNode* node, int64_t lane,
+                               const void* message, uint32_t size) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    return TargetAccess::lane_send(AsNode(node), Index(lane), message, size)
+               ? 1
+               : 0;
+  });
+}
+
+int32_t talos_target_lane_release(TalosNode* node, int64_t lane) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    return TargetAccess::lane_release(AsNode(node), Index(lane)) ? 1 : 0;
   });
 }
 

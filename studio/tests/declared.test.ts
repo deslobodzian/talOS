@@ -38,7 +38,7 @@ test('the parser accepts what the launcher actually writes', () => {
   // The roster, as `--describe` found it.
   assert.equal(graph.nodes.length, 7);
   assert.deepEqual(graph.nodes.map(n => n.name).sort(), [
-    'arbiter', 'drivetrain', 'hardware_node', 'odometry', 'operator_interface',
+    'drivetrain', 'hardware_node', 'intake', 'odometry', 'operator_interface',
     'shooter', 'telemetry'
   ]);
   for (const node of graph.nodes) {
@@ -46,11 +46,19 @@ test('the parser accepts what the launcher actually writes', () => {
     assert.ok(node.sources.length > 0, `${node.name} declared no sources`);
   }
 
-  // A clean graph carries no findings. This is the assertion that would catch
-  // the launcher renaming `diagnostics` or nesting it per node: an absent key
-  // parses as empty, so the count below is the only thing that distinguishes
-  // "no findings" from "findings the parser could not see".
-  assert.equal(graph.diagnostics.length, 0);
+  // A launchable graph carries no errors, only the warnings for the autonomous
+  // lanes nothing writes yet. This is the assertion that would catch the
+  // launcher renaming `diagnostics` or nesting it per node: an absent key
+  // parses as empty, so naming the findings is the only thing that
+  // distinguishes "no errors" from "findings the parser could not see".
+  assert.equal(graph.diagnostics.filter(d => d.severity === 'error').length, 0);
+  assert.deepEqual(
+      graph.diagnostics.map(d => `${d.severity} ${d.subject}`).sort(), [
+        'warning /drivetrain/target/auto', 'warning /intake/target/auto',
+        'warning /shooter/target/auto'
+      ]);
+  for (const d of graph.diagnostics)
+    assert.match(d.message, /is in the target policy of \w+ but nothing writes it yet/);
 });
 
 test('endpoint attributes survive the crossing', () => {
@@ -58,18 +66,29 @@ test('endpoint attributes survive the crossing', () => {
   const ends = graph.nodes.flatMap(
       node => node.sources.map(source => ({node: node.name, ...source})));
 
-  // The four ends that used to read as faults. Named individually rather than
+  // The ends that used to read as faults. Named individually rather than
   // counted, because the point of the flags is which ones carry them.
   const external = ends.filter(e => e.external).map(e => e.name).sort();
   assert.deepEqual(external, ['/hw/command', '/talos/telemetry']);
 
+  // Every target lane a consumer reads is optional, written or not.
   const optional = ends.filter(e => e.optional).map(e => e.name).sort();
-  assert.deepEqual(
-      optional, ['/drivetrain/target/auto', '/shooter/target/auto']);
+  assert.deepEqual(optional, [
+    '/drivetrain/target/auto', '/drivetrain/target/teleop',
+    '/intake/target/auto', '/intake/target/teleop', '/shooter/target/auto',
+    '/shooter/target/teleop'
+  ]);
+
+  // A lane is an envelope: alignof + sizeof of the target it carries.
+  const bytes = (name: string) =>
+      new Set(ends.filter(e => e.name.startsWith(name)).map(e => e.message_bytes));
+  assert.deepEqual(bytes('/drivetrain/target/'), new Set([32]));
+  assert.deepEqual(bytes('/shooter/target/'), new Set([16]));
+  assert.deepEqual(bytes('/intake/target/'), new Set([8]));
 
   // Everything else is an ordinary end, not an unset field read as false.
   assert.equal(ends.filter(e => !e.external && !e.optional).length,
-               ends.length - 4);
+               ends.length - 8);
 });
 
 test('every declared topic name conforms to the naming protocol', () => {
@@ -110,21 +129,25 @@ test('a node that never registered is named, with its cause', () => {
 
 test('the launcher\'s findings cross the language boundary intact', () => {
   const graph = parseDeclaredGraph(faults);
-  assert.equal(graph.diagnostics.length, 2,
-               'the faults fixture should carry exactly the two findings the ' +
+  const errors = graph.diagnostics.filter(d => d.severity === 'error');
+  assert.equal(errors.length, 2,
+               'the faults fixture should carry exactly the two errors the ' +
                    'misspelling produces');
 
-  // Severity survives the C++ enumerator being spelled ERROR and printed
-  // lowercase, which was a real guess in this parser.
-  for (const d of graph.diagnostics) assert.equal(d.severity, 'error');
+  // Severity survives the C++ enumerator being spelled ERROR or WARNING and
+  // printed lowercase, which was a real guess in this parser.
+  for (const d of graph.diagnostics)
+    assert.ok(d.severity === 'error' || d.severity === 'warning', d.severity);
+  assert.equal(graph.diagnostics.length - errors.length, 3,
+               'the autonomous-lane warnings are still there beside the errors');
 
-  const subjects = graph.diagnostics.map(d => d.subject).sort();
+  const subjects = errors.map(d => d.subject).sort();
   assert.deepEqual(subjects, ['/hw/req/drive', '/hw/request/drivetrain']);
 
   // The sentences are the launcher's, not re-derived here: a viewer that
   // rewords them says something subtly different from the tool that refused
   // the launch.
-  const messages = graph.diagnostics.map(d => d.message).join(' ');
+  const messages = errors.map(d => d.message).join(' ');
   assert.match(messages, /is an abbreviation; use 'request'/);
   assert.match(messages, /the two ends are spelled differently/);
 });

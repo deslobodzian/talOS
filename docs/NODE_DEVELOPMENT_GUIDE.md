@@ -24,7 +24,7 @@ the constructor; `update()` runs every period.
 | `TALOS_NODE(Class)` in one `.cc` | `talos_py_node(class_name = ...)` | |
 
 Messages are FlatBuffers **structs** (no tables or strings), at most 8-byte
-aligned. A relative topic name (`"state"`, `"target/teleop"`) expands to
+aligned. A relative topic name (`"state"`, `"event/shot"`) expands to
 `"/<name>/<topic>"`; `[subsystems.<name>.remap]` can redirect relative or
 absolute topics without changing node code.
 
@@ -71,17 +71,50 @@ Handles are named by their device key in the subsystem config
 Every motor not set during an `update()` is sent neutral, and all are neutral
 while the robot is disabled. Units are rotations, rotations/s, volts, amps.
 
+## Targets
+
+What a subsystem is asked to do arrives on lanes `/<sub>/target/<source>`, one
+per producer, each carrying `talos::TargetEnvelope<M>` (`active`, then `M`).
+Header `talOS/devices/target.h` (included by `devices.h`).
+
+| C++ | Python |
+|---|---|
+| `talos::Target<M> target_{node}` (constructor) | `talos.Target(node, M)` |
+| `const M* t = target_.get()`: null unless `robot_enabled(node)` and the current Driver Station mode has a lane that is active, fresh and sent since the mode began | `t = target.get()` (`None`) |
+| `target_.source()`: `"teleop"`, `"auto"`, ... or `""` | `target.source` |
+| `talos::TargetLane<M> lane_{node, "wrist", "auto"}`: `send(M{...})`, `release()` | `talos.TargetLane(node, M, "wrist", "auto")`: `send(field=...)` or `send(message)`, `release()` |
+
+Which lanes count, highest priority first, is config:
+
+```toml
+# robot.toml: every subsystem (these are the defaults)
+[robot.targets]
+teleop = ["teleop"]
+autonomous = ["auto"]
+test = []
+
+# subsystems/drivetrain.toml: replaces only the modes it lists
+[targets]
+teleop = ["align", "teleop"]
+```
+
+Sources follow the topic segment rules; an unknown mode is a config error. A
+consumer reads its lanes without a callback, so it keeps draining right before
+its timer. Republish a lane every period; `release()` hands control to the next
+lane on the consumer's next tick. The launcher refuses a lane whose source no
+mode lists and warns about a policy lane nobody writes.
+
 ## BUILD
 
 ```python
 load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages", "talos_py_node")
 
 talos_messages(name = "messages", srcs = ["shooter_message.fbs"],
-               topics = {"state": "/shooter/state", "target": "/shooter/target"})
+               topics = {"state": "/shooter/state"})
 # :messages    C++: #include "<package>/shooter_message_generated.h"
-#                   #include "<package>/topics.h"   shooter::topics::kTarget
+#                   #include "<package>/topics.h"   shooter::topics::kState
 # :messages_py Python: from <namespace>.ShooterTarget import ShooterTarget
-#                      from <namespace> import topics   topics.TARGET
+#                      from <namespace> import topics   topics.STATE
 
 talos_cc_node(name = "node", node_name = "shooter", srcs = ["shooter.cc"], deps = [":shooter"])
 talos_py_node(name = "node", node_name = "intake", main = "intake.py",
@@ -90,8 +123,9 @@ talos_py_node(name = "node", node_name = "intake", main = "intake.py",
 
 `include_prefix` on `talos_messages` overrides the package-basename prefix;
 with `topics`, it must be the schema's namespace. Topic keys are
-lower_snake_case: `"teleop_target"` is `kTeleopTarget` in C++ and
-`TELEOP_TARGET` in Python.
+lower_snake_case: `"vision_state"` is `kVisionState` in C++ and
+`VISION_STATE` in Python. Target lanes are not listed: `TargetLane` and
+`Target` build them from the subsystem and source names.
 To use another package's types, list its `talos_messages` target in `deps`
 and include its schema by the dep's include prefix:
 `deps = ["//shared/geometry:messages"]` with
@@ -113,18 +147,25 @@ auto& shooter = sim.add<Shooter>("shooter");
 SimHardware hw{sim};
 hw.enable();
 hw.ideal_motors();                    // motors reach their demand at once
-sim.publish(topics::kTarget, ShooterTarget{80.0, 0, true});
+hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+sim.step(10ms);                       // the mode is current
+PublishTarget(sim, "shooter", "teleop", ShooterTarget{80.0});
 sim.step(20ms);
 hw.motor_request("shooter", "flywheel").mode;  // Mode::kVelocity
 sim.latest<ShooterState>(topics::kState);     // std::optional
+ReleaseTarget<ShooterTarget>(sim, "shooter", "teleop");
 ```
 
 `SimHardware` also has `set_motor`, `set_digital_input`, `set_analog_input`,
 `set_encoder`, `set_cancoder`, `set_gyro`, `set_driver_station`,
-`set_connected(node, device, false)` (the device reports disconnected),
-`digital_output`, `pwm`.
+`stop_driver_station()` (the DS goes silent), `set_connected(node, device,
+false)` (the device reports disconnected), `digital_output`, `pwm`.
+`LatestTarget<M>(sim, sub, source)` reads a lane a node under test wrote.
 
 Python: `from talos.testing import Sim, SimHardware` (`//talOS/python:testing`),
 the same methods (`Sim.from_toml`, `sim.step(seconds)`,
 `sim.publish(M, topic, **fields)`, `sim.latest(M, topic)`,
-`sim.latest_bytes(topic)`). See `2026-robot/main_processor/intake/node_test.py`.
+`sim.publish_target(M, sub, source, **fields)`, `sim.release_target(M, sub,
+source)`, `sim.latest_target(M, sub, source)`, `hw.set_driver_station(enabled=True,
+teleop=True)`, `hw.stop_driver_station()`, `sim.latest_bytes(topic)`). See
+`2026-robot/main_processor/intake/node_test.py`.

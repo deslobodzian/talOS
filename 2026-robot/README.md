@@ -9,11 +9,10 @@
 
 | Node | Lang | Does | Reads | Writes |
 |---|---|---|---|---|
-| `drivetrain` | C++ | swerve kinematics and module control | `/drivetrain/target` | `/drivetrain/state` |
-| `shooter` | C++ | flywheel to target speed, beam break | `/shooter/target` | `/shooter/state` |
-| `intake` | Python | roller and beam break | `/intake/target` | `/intake/state` |
-| `arbiter` | C++ | picks teleop or auto per match mode (none once the Driver Station is silent or detached); the one writer of each target | `/hw/state/driver_station`, `/<sub>/target/teleop`, `/<sub>/target/auto` | `/drivetrain/target`, `/shooter/target`, `/intake/target` |
-| `operator_interface` | C++ | joystick 0 sticks and buttons (`shoot_button`, `intake_button`, per-subsystem `teleop_button`, 1-based) to targets | `/hw/state/driver_station`, `/drivetrain/state` | `/drivetrain/target/teleop`, `/shooter/target/teleop`, `/intake/target/teleop` |
+| `drivetrain` | C++ | swerve kinematics and module control | `/drivetrain/target/teleop`, `/drivetrain/target/auto` | `/drivetrain/state` |
+| `shooter` | C++ | flywheel to target speed, beam break | `/shooter/target/teleop`, `/shooter/target/auto` | `/shooter/state` |
+| `intake` | Python | roller and beam break | `/intake/target/teleop`, `/intake/target/auto` | `/intake/state` |
+| `operator_interface` | C++ | joystick 0 sticks and buttons (`shoot_button`, `intake_button`, per-subsystem `teleop_button`, 1-based) to teleop target lanes | `/hw/state/driver_station`, `/drivetrain/state` | `/drivetrain/target/teleop`, `/shooter/target/teleop`, `/intake/target/teleop` |
 | `odometry` | C++ | pose from drivetrain state | `/drivetrain/state` | `/odometry/state` |
 | `telemetry` | C++ | Studio frames | the state topics, `/hw/state/driver_station`, `/hw/status` | `/talos/telemetry` |
 | `hardware_node` (`//talOS/bridge`) | C++ | UDP courier to the RoboRIO | `/hw/request/<node>` | `/hw/state`, `/hw/status` |
@@ -23,8 +22,12 @@ Simulation stands in for the RoboRIO with `main_processor/simulation:sim_gateway
 ## Config
 
 `main_processor/configuration/robot.toml` is the manifest (`[robot]`,
-`[studio]`, and a `[[subsystems]]` list); each subsystem's devices and
-parameters are in `subsystems/<name>.toml`. `config_golden_test` pins them.
+`[robot.targets]`, `[studio]`, and a `[[subsystems]]` list); each subsystem's devices and
+parameters are in `subsystems/<name>.toml`. `[robot.targets]` is the target
+policy: which lanes (`/<sub>/target/<source>`) each match mode reads, in
+priority order; each subsystem's `talos::Target` follows the first fresh,
+active one, and nothing while the Driver Station is disabled, e-stopped or
+silent. `config_golden_test` pins them.
 Devices are referred to by name; ids are assigned by sorting
 (subsystem, device).
 
@@ -51,4 +54,5 @@ or `talos_py_node` in `main_processor/<name>/`, then a `[[subsystems]]` entry in
 `robot.toml` and `subsystems/<name>.toml` with
 `node = "//2026-robot/main_processor/<name>:node"`, and the node in
 `main_processor/BUILD`'s `robot_bundle`. If it takes teleop or auto targets,
-route them through `arbiter`.
+read them with `talos::Target` / `talos.Target` and have each producer write
+its own `talos::TargetLane` (`/<name>/target/<source>`).

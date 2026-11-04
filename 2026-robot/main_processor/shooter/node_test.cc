@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -20,6 +21,7 @@ using namespace std::chrono_literals;
 using talos::hardware::Mode;
 using talos::testing::Sim;
 using talos::testing::SimHardware;
+namespace ds = talos::driver_station;
 
 std::string Runfile(const char* env) {
   std::string error;
@@ -36,10 +38,17 @@ std::string Runfile(const char* env) {
 
 class ShooterTest : public ::testing::Test {
  protected:
-  // Holds a target the way the arbiter does: republished every 20 ms.
+  // An enabled robot in teleop: the policy selects /shooter/target/teleop.
+  void Teleop() {
+    hw.enable();
+    hw.set_driver_station(talos::testing::DsPacket(ds::kEnabled | ds::kTeleop));
+    sim.step(10ms);
+  }
+  // Holds a lane the way a producer does: republished every 20 ms.
   void Hold(double rps, std::chrono::milliseconds duration) {
     for (auto t = 0ms; t < duration; t += 20ms) {
-      sim.publish(topics::kTarget, ShooterTarget{rps, true});
+      talos::testing::PublishTarget(sim, "shooter", "teleop",
+                                    ShooterTarget{rps});
       sim.step(20ms);
     }
   }
@@ -48,6 +57,11 @@ class ShooterTest : public ::testing::Test {
     EXPECT_TRUE(state.has_value());
     return state.value_or(ShooterState{});
   }
+  void ExpectNeutral() const {
+    EXPECT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kNeutral);
+    EXPECT_DOUBLE_EQ(State().target_velocity_rps(), 0.0);
+    EXPECT_FALSE(State().at_speed());
+  }
 
   Sim sim{Runfile("TALOS_TEST_CONFIG")};
   Shooter& shooter = sim.add<Shooter>("shooter");
@@ -55,7 +69,7 @@ class ShooterTest : public ::testing::Test {
 };
 
 TEST_F(ShooterTest, SpinsToAFreshTargetAndReportsAtSpeed) {
-  hw.enable();
+  Teleop();
   hw.ideal_motors();
   Hold(80.0, 60ms);
 
@@ -70,7 +84,7 @@ TEST_F(ShooterTest, SpinsToAFreshTargetAndReportsAtSpeed) {
 }
 
 TEST_F(ShooterTest, NotAtSpeedWhileTheFlywheelIsSlow) {
-  hw.enable();
+  Teleop();
   hw.set_motor("shooter", "flywheel", 0.0, 50.0);
   Hold(80.0, 60ms);
   EXPECT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
@@ -78,20 +92,52 @@ TEST_F(ShooterTest, NotAtSpeedWhileTheFlywheelIsSlow) {
   EXPECT_DOUBLE_EQ(State().flywheel_velocity_rps(), 50.0);
 }
 
-TEST_F(ShooterTest, StaleTargetOrDisabledRobotGoesNeutral) {
-  hw.enable();
+TEST_F(ShooterTest, NeverSentStaysNeutral) {
+  Teleop();
+  sim.step(60ms);
+  ExpectNeutral();
+  EXPECT_TRUE(State().enabled());
+}
+
+TEST_F(ShooterTest, StaleLaneGoesNeutral) {
+  Teleop();
   Hold(80.0, 40ms);
   ASSERT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
+  sim.step(150ms);  // the producer went quiet: the lane is stale
+  ExpectNeutral();
+}
 
-  sim.step(150ms);  // the arbiter went quiet: the target is stale
-  EXPECT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kNeutral);
-  EXPECT_DOUBLE_EQ(State().target_velocity_rps(), 0.0);
-  EXPECT_FALSE(State().at_speed());
+TEST_F(ShooterTest, ReleasedLaneGoesNeutralAtOnce) {
+  Teleop();
+  Hold(80.0, 40ms);
+  ASSERT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
+  talos::testing::ReleaseTarget<ShooterTarget>(sim, "shooter", "teleop");
+  sim.step(20ms);
+  ExpectNeutral();
+}
 
+TEST_F(ShooterTest, DisabledRobotGoesNeutral) {
+  Teleop();
   hw.enable(false);
   Hold(80.0, 40ms);
-  EXPECT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kNeutral);
+  ExpectNeutral();
   EXPECT_FALSE(State().enabled());
+}
+
+TEST_F(ShooterTest, DriverStationLossGoesNeutral) {
+  Teleop();
+  Hold(80.0, 40ms);
+  ASSERT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
+  // The Driver Station goes silent; its last packet ages out.
+  hw.stop_driver_station();
+  Hold(80.0, 160ms);
+  ExpectNeutral();
+}
+
+TEST_F(ShooterTest, NonFiniteTargetGoesNeutral) {
+  Teleop();
+  Hold(std::numeric_limits<double>::quiet_NaN(), 40ms);
+  ExpectNeutral();
 }
 
 TEST_F(ShooterTest, ReportsTheBeamBreak) {

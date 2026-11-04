@@ -3,11 +3,14 @@ load("//talOS/build:contract.bzl", "talos_messages")
 # The example's messages and topics (namespace demo), shared by the C++ and
 # Python nodes:
 #   C++:    #include "demo/intake_generated.h"   demo::IntakeGoal
-#           #include "demo/topics.h"            demo::topics::kIntakeGoal
+#           #include "demo/topics.h"            demo::topics::kIntakeStatus
 #   Python: from demo.IntakeGoal import IntakeGoal
-#           from demo import topics             topics.INTAKE_GOAL
-# Each mechanism publishes its own /<name>/state and reads /<name>/target;
-# the superstructure is the only writer of the mechanism targets.
+#           from demo import topics             topics.INTAKE_STATUS
+# Each node publishes its own /<name>/state. Goals travel on target lanes,
+# /<name>/target/<source> (talos::Target / talos::TargetLane), named by the
+# subsystem and source rather than listed here: the superstructure writes
+# /intake/target/superstructure and /elevator/target/superstructure, and a
+# driver or autonomous node writes /superstructure/target/{teleop,auto}.
 talos_messages(
     name = "messages",
     srcs = [
@@ -17,11 +20,8 @@ talos_messages(
     ],
     include_prefix = "demo",
     topics = {
-        "intake_goal": "/intake/target",
         "intake_status": "/intake/state",
-        "elevator_goal": "/elevator/target",
         "elevator_status": "/elevator/state",
-        "superstructure_goal": "/superstructure/target",
         "superstructure_status": "/superstructure/state",
     },
 )
