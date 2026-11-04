@@ -9,7 +9,9 @@ topics; the RoboRIO is only the hardware layer, reached over UDP.
 
 @talOS/NAMING.md
 
-API reference: `docs/NODE_DEVELOPMENT_GUIDE.md`. Mechanism walkthrough:
+API reference: `docs/NODE_DEVELOPMENT_GUIDE.md`. Method (units, node anatomy,
+test matrix, open source first): `docs/METHODOLOGY.md`. Planned wiring
+changes: `docs/DESIGN_AUTOMATIC_WIRING.md`. Mechanism walkthrough:
 `examples/superstructure/README.md`.
 
 ## Build, test, lint
