@@ -8,6 +8,33 @@ Read this file first, then [METHODOLOGY.md](METHODOLOGY.md) and
 [DESIGN_AUTOMATIC_WIRING.md](DESIGN_AUTOMATIC_WIRING.md). This handoff records
 actual completion status where the design describes intended behavior.
 
+## Status at the 2026-11-04 stop (read this before the sections below)
+
+`agent/automatic-wiring` at `2cf2694` is verified: `bazel build //...`, 79/79
+tests, `--describe-only` with no errors on all three configs, `sync_manifest
+--check` on all four, `./sim.sh --sim-gateway` 15 s with every process exiting
+0 and no restarts, decoded `log_dump`. Studio `pnpm test`/`pnpm build` pass.
+
+| Item | State on `agent/automatic-wiring` |
+|---|---|
+| D1 | Done. Mode generation in DS packets and the 16-byte envelope header; regressions in C++ and Python; selected source in registry v2 and Studio. Live sim fault table held; stick to drive request median 2.99 ms (old 4.98 ms). |
+| D5 | Done. Shared accept/reject fixtures for parser and `sync_manifest`; effective-config scaffold checks; bundle identity over config-relative paths; relocated-bundle test; scaffold goldens; `@wrist//:node` second repo proven in a throwaway. |
+| D2 | Code done: `.bfbs`, suffix lint, descriptors and hash, schema on every endpoint, attach check, session-owned segments, `.tlog` v5 with descriptors, reflection-only Python codec, param-suffix warning. C ABI 15. Docs pass pending (below). |
+| D6 | Done except `--replay-inputs`: wpimath/robotpy/gtsam pins, lockstep test, bundle `lib/`, radians, module positions, bridge clock offset and `sample_time_ns`, list params, Python `pose_estimator` (kalman or factor_graph), `--type estimator` scaffold. |
+| D3, D4 | Not on this branch. Side doors (`teleop_button`, `telemetry`, `GenericTarget`, `GenericState`) are already deleted from code. |
+
+Unmerged branches (worktrees under `.muse/`), none verified with the full finish list:
+
+| Branch | Content | Next |
+|---|---|---|
+| `wiring/d2docs` | D2 docs pass, written by a Gemini Flash worker | review every claim against the code before merging |
+| `wiring/d2docs-replay` (`d7a8ffd`, WIP) | `--replay-inputs` (`talOS/events/input_replay.*`, node flag, launcher `--replay-inputs DIR --only NODE`); its 12 focused tests pass | fix DESIGN D6 lines that still say "not built"; run it into `pose_estimator` against a recorded sim session twice and compare; full finish list |
+| `wiring/d3d4` (`0466f29`, WIP) | D3/D4 prerequisite only: declared graph with base64 schema bytes, observer subscriptions the lint ignores, `--graph`, launcher second describe pass; focused tests pass | D3 telemetry node, D4 teleop node and `driver` node, Studio, scaffold `[teleop]` example, wrist gate; plan in that commit's worker report (`history://D3D4`) |
+
+Not verified anywhere: Linux build (wpimath Linux artifacts), `phoenixTest`
+(GradleRIO wants the missing `MacOSX26.sdk`; `buildRio` compiles), the robot.
+
+
 ## User requirements
 
 - Remove the hard-coded arbiter in favor of automatic, configuration-driven

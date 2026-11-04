@@ -86,8 +86,8 @@ struct NodeProcessInfo {
 struct SessionManifest {
   uint64_t session_id{0};
   std::string config_path;
-  // sha256 over the robot config plus every subsystem file, from the bundle
-  // manifest. Empty for non-bundle launches.
+  // sha256 over every staged file as config-relative path + bytes, from the
+  // bundle manifest. Empty for non-bundle launches.
   std::string config_sha256;
   std::string output_dir;
   bool simulation{false};

@@ -12,7 +12,7 @@
 | `drivetrain` | C++ | swerve kinematics and module control | `/drivetrain/target/teleop`, `/drivetrain/target/auto` | `/drivetrain/state` |
 | `shooter` | C++ | flywheel to target speed, beam break | `/shooter/target/teleop`, `/shooter/target/auto` | `/shooter/state` |
 | `intake` | Python | roller and beam break | `/intake/target/teleop`, `/intake/target/auto` | `/intake/state` |
-| `operator_interface` | C++ | joystick 0 sticks and buttons (`shoot_button`, `intake_button`, per-subsystem `teleop_button`, 1-based) to teleop target lanes | `/hw/state/driver_station`, `/drivetrain/state` | `/drivetrain/target/teleop`, `/shooter/target/teleop`, `/intake/target/teleop` |
+| `operator_interface` | C++ | joystick 0 sticks and buttons (`shoot_button`, `intake_button`, 1-based) to teleop target lanes | `/hw/state/driver_station`, `/drivetrain/state` | `/drivetrain/target/teleop`, `/shooter/target/teleop`, `/intake/target/teleop` |
 | `pose_estimator` | Python | field pose from swerve odometry and camera observations; backend `kalman` (wpimath) or `factor_graph` (GTSAM); runs while disabled | `/drivetrain/state`, `/<camera>/state` per `cameras` | `/pose_estimator/state` |
 | `telemetry` | C++ | Studio frames; the pose from `pose_topic` | the state topics, `/hw/state/driver_station`, `/hw/status` | `/talos/telemetry` |
 | `hardware_node` (`//talOS/bridge`) | C++ | UDP courier to the RoboRIO | `/hw/request/<node>` | `/hw/state`, `/hw/status` |

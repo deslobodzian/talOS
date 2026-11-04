@@ -234,20 +234,21 @@ into a live robot's shared memory.
 
 ## Log format
 
-`[FileHeader][ManifestEntry × n][Record ...]`, little-endian, append-only, with
-a CRC on the manifest block and on every record. A record is a 56-byte header
-plus its payload up to the last non-zero byte: fixed-size messages are mostly
-trailing zero padding, so the header keeps the payload's full size and the
-reader zero-fills it back, handing out exactly the bytes that were recorded. A
-log that ends mid-record is not corruption: everything before the cut still
-replays, which matters when a robot loses power. A record whose checksum is
-wrong *is* corruption and is refused.
+`[FileHeader][ManifestEntry × n][schema block][Record ...]`, little-endian,
+append-only, with a CRC on the manifest and schema blocks, and on every record.
+The schema block carries each manifest entry's topic schema
+(`talOS/schema/identity.h`): its name and embedded `.bfbs` reflection schema
+bytes. A record is a 56-byte header plus its payload up to the last non-zero
+byte: fixed-size messages are mostly trailing zero padding, so the header keeps
+the payload's full size and the reader zero-fills it back, handing out exactly
+the bytes that were recorded. A log that ends mid-record is not corruption:
+everything before the cut still replays, which matters when a robot loses
+power. A record whose checksum is wrong *is* corruption and is refused.
 
 Format details live in `log/format.h`. The version field is checked on read;
 readers reject a version they do not know rather than guessing.
-The current format is version 4, which added the trailing-zero trimming;
-earlier logs are rejected.
-
+The current format is version 5, which adds the schema block and per-topic
+schema identities; version 4 and earlier logs are refused.
 Records are copied into preallocated chunks and handed to a background thread
 through an atomic ring. Dispatch does not lock, wait for disk, or resize buffers.
 The writer checks for new chunks every millisecond. If the pool is exhausted,
