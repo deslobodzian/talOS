@@ -2,9 +2,11 @@
 #include <sys/wait.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <numbers>
 #include <stdexcept>
 #include <string>
 
@@ -32,6 +34,13 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
+// A drivetrain state with valid modules and heading.
+DrivetrainState Valid(std::uint64_t sample_time_ns, double vx_mps,
+                      double vy_mps, double omega_radps, double yaw_rad) {
+  return {sample_time_ns, true,    true, true, vx_mps, vy_mps,
+          omega_radps,    yaw_rad, {},   {},   {},     {}};
+}
+
 class OdometryTest : public ::testing::Test {
  protected:
   OdometryState Drive(const DrivetrainState& state) {
@@ -46,24 +55,24 @@ class OdometryTest : public ::testing::Test {
   Odometry& odometry = sim.add<Odometry>("odometry");
 };
 
-TEST_F(OdometryTest, IntegratesFieldRotatedVelocityOverTheDrivetrainClock) {
-  OdometryState pose = Drive({1'000'000'000, true, 0.0, 0.0, 0.0, 0.0, 0.0});
+TEST_F(OdometryTest, IntegratesFieldRotatedVelocityOverTheSampleClock) {
+  OdometryState pose = Drive(Valid(1'000'000'000, 0.0, 0.0, 0.0, 0.0));
   EXPECT_DOUBLE_EQ(pose.x_m(), 0.0);
   EXPECT_DOUBLE_EQ(pose.y_m(), 0.0);
 
   // 2 m/s forward for 100 ms, facing downfield.
-  pose = Drive({1'100'000'000, true, 2.0, 0.0, 0.0, 0.0, 0.0});
+  pose = Drive(Valid(1'100'000'000, 2.0, 0.0, 0.0, 0.0));
   EXPECT_NEAR(pose.x_m(), 0.2, 1e-9);
   EXPECT_NEAR(pose.y_m(), 0.0, 1e-9);
 
   // 2 m/s forward for 100 ms, facing a quarter turn left: field +y.
-  pose = Drive({1'200'000'000, true, 2.0, 0.0, 0.0, 0.25, 0.0});
+  pose = Drive(Valid(1'200'000'000, 2.0, 0.0, 0.0, std::numbers::pi / 2));
   EXPECT_NEAR(pose.x_m(), 0.2, 1e-9);
   EXPECT_NEAR(pose.y_m(), 0.2, 1e-9);
   EXPECT_DOUBLE_EQ(pose.yaw_rot(), 0.25);
 
   // 1 m/s left for 200 ms, facing downfield.
-  pose = Drive({1'400'000'000, true, 0.0, 1.0, 0.0, 0.0, 0.0});
+  pose = Drive(Valid(1'400'000'000, 0.0, 1.0, 0.0, 0.0));
   EXPECT_NEAR(pose.x_m(), 0.2, 1e-9);
   EXPECT_NEAR(pose.y_m(), 0.4, 1e-9);
   EXPECT_EQ(pose.timestamp_ns(), 1'400'000'000u);
@@ -71,7 +80,7 @@ TEST_F(OdometryTest, IntegratesFieldRotatedVelocityOverTheDrivetrainClock) {
 
 TEST_F(OdometryTest, PassesTheChassisVelocitiesAndHeadingThrough) {
   const OdometryState pose =
-      Drive({1'020'000'000, true, 1.5, -0.5, 0.8, 0.125, 0.8});
+      Drive(Valid(1'020'000'000, 1.5, -0.5, 0.8, std::numbers::pi / 4));
   EXPECT_EQ(pose.timestamp_ns(), 1'020'000'000u);
   EXPECT_DOUBLE_EQ(pose.vx_mps(), 1.5);
   EXPECT_DOUBLE_EQ(pose.vy_mps(), -0.5);
@@ -79,10 +88,19 @@ TEST_F(OdometryTest, PassesTheChassisVelocitiesAndHeadingThrough) {
   EXPECT_DOUBLE_EQ(pose.yaw_rot(), 0.125);
 }
 
+TEST_F(OdometryTest, InvalidModulesMoveNothing) {
+  Drive(Valid(1'000'000'000, 0.0, 0.0, 0.0, 0.0));
+  DrivetrainState invalid = Valid(1'100'000'000, 3.0, 0.0, 0.0, 0.0);
+  invalid.mutate_modules_valid(false);
+  sim.publish(drivetrain::topics::kState, invalid);
+  sim.step(10ms);
+  const OdometryState pose = Drive(Valid(1'200'000'000, 0.0, 0.0, 0.0, 0.0));
+  EXPECT_DOUBLE_EQ(pose.x_m(), 0.0);
+}
+
 TEST_F(OdometryTest, AClockStepBackwardsMovesNothing) {
-  Drive({2'000'000'000, true, 0.0, 0.0, 0.0, 0.0, 0.0});
-  const OdometryState pose =
-      Drive({1'000'000'000, true, 3.0, 0.0, 0.0, 0.0, 0.0});
+  Drive(Valid(2'000'000'000, 0.0, 0.0, 0.0, 0.0));
+  const OdometryState pose = Drive(Valid(1'000'000'000, 3.0, 0.0, 0.0, 0.0));
   EXPECT_DOUBLE_EQ(pose.x_m(), 0.0);
 }
 

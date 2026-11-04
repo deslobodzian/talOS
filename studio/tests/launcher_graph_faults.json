@@ -27,7 +27,7 @@
         {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false},
         {"kind": "WATCHER", "name": "/drivetrain/target/teleop", "message_bytes": 40, "external": false, "optional": true},
         {"kind": "WATCHER", "name": "/drivetrain/target/auto", "message_bytes": 40, "external": false, "optional": true},
-        {"kind": "SENDER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false},
+        {"kind": "SENDER", "name": "/drivetrain/state", "message_bytes": 112, "external": false, "optional": false},
         {"kind": "SENDER", "name": "/hw/req/drive", "message_bytes": 1404, "external": false, "optional": false},
         {"kind": "TIMER", "name": "drivetrain", "message_bytes": 0, "external": false, "optional": false}
       ]
@@ -52,7 +52,7 @@
       "described": true,
       "sources": [
         {"kind": "SENDER", "name": "/odometry/state", "message_bytes": 56, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false}
+        {"kind": "WATCHER", "name": "/drivetrain/state", "message_bytes": 112, "external": false, "optional": false}
       ]
     },
     {
@@ -64,7 +64,7 @@
         {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false},
         {"kind": "SENDER", "name": "/shooter/target/teleop", "message_bytes": 24, "external": false, "optional": false},
         {"kind": "SENDER", "name": "/intake/target/teleop", "message_bytes": 20, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false},
+        {"kind": "WATCHER", "name": "/drivetrain/state", "message_bytes": 112, "external": false, "optional": false},
         {"kind": "TIMER", "name": "operator_interface", "message_bytes": 0, "external": false, "optional": false}
       ]
     },
@@ -88,7 +88,7 @@
       "described": true,
       "sources": [
         {"kind": "WATCHER", "name": "/odometry/state", "message_bytes": 56, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false},
+        {"kind": "WATCHER", "name": "/drivetrain/state", "message_bytes": 112, "external": false, "optional": false},
         {"kind": "WATCHER", "name": "/shooter/state", "message_bytes": 32, "external": false, "optional": false},
         {"kind": "WATCHER", "name": "/intake/state", "message_bytes": 20, "external": false, "optional": false},
         {"kind": "WATCHER", "name": "/hw/status", "message_bytes": 64, "external": false, "optional": false},

@@ -226,8 +226,11 @@ class Telemetry {
       set(idx_drivetrain_vx_, drivetrain_->vx_mps());
       set(idx_drivetrain_vy_, drivetrain_->vy_mps());
       set(idx_drivetrain_omega_, drivetrain_->omega_radps());
-      set(idx_drivetrain_yaw_rate_, drivetrain_->yaw_rate_rps());
+      set(idx_drivetrain_yaw_, drivetrain_->yaw_rad());
       set(idx_drivetrain_enabled_, drivetrain_->enabled() ? 1.0 : 0.0);
+      set(idx_drivetrain_modules_valid_,
+          drivetrain_->modules_valid() ? 1.0 : 0.0);
+      set(idx_drivetrain_yaw_valid_, drivetrain_->yaw_valid() ? 1.0 : 0.0);
     }
     if (ds_.connected()) {
       set(idx_ds_enabled_, ds_.enabled() ? 1.0 : 0.0);
@@ -378,8 +381,10 @@ class Telemetry {
     idx_drivetrain_vx_ = AddChannel("drivetrain/vx", "m/s");
     idx_drivetrain_vy_ = AddChannel("drivetrain/vy", "m/s");
     idx_drivetrain_omega_ = AddChannel("drivetrain/omega", "rad/s");
-    idx_drivetrain_yaw_rate_ = AddChannel("drivetrain/yaw_rate", "rev/s");
+    idx_drivetrain_yaw_ = AddChannel("drivetrain/yaw", "rad");
     idx_drivetrain_enabled_ = AddChannel("drivetrain/enabled");
+    idx_drivetrain_modules_valid_ = AddChannel("drivetrain/modules_valid");
+    idx_drivetrain_yaw_valid_ = AddChannel("drivetrain/yaw_valid");
     idx_ds_enabled_ = AddChannel("ds/enabled");
     idx_ds_teleop_ = AddChannel("ds/teleop");
     idx_ds_autonomous_ = AddChannel("ds/autonomous");
@@ -426,10 +431,10 @@ class Telemetry {
       idx_shooter_flywheel_{0}, idx_shooter_beam_broken_{0},
       idx_shooter_stale_{0}, idx_intake_requested_{0}, idx_intake_measured_{0},
       idx_intake_inhibit_{0}, idx_intake_stale_{0}, idx_drivetrain_vx_{0},
-      idx_drivetrain_vy_{0}, idx_drivetrain_omega_{0},
-      idx_drivetrain_yaw_rate_{0}, idx_drivetrain_enabled_{0},
-      idx_ds_enabled_{0}, idx_ds_teleop_{0}, idx_ds_autonomous_{0},
-      idx_ds_match_time_{0}, idx_bridge_state_age_us_{0},
+      idx_drivetrain_vy_{0}, idx_drivetrain_omega_{0}, idx_drivetrain_yaw_{0},
+      idx_drivetrain_enabled_{0}, idx_drivetrain_modules_valid_{0},
+      idx_drivetrain_yaw_valid_{0}, idx_ds_enabled_{0}, idx_ds_teleop_{0},
+      idx_ds_autonomous_{0}, idx_ds_match_time_{0}, idx_bridge_state_age_us_{0},
       idx_bridge_identity_rejected_{0}, idx_bridge_ownership_rejected_{0},
       idx_bridge_timed_out_mask_{0}, idx_bridge_configured_{0},
       idx_bridge_stale_{0};

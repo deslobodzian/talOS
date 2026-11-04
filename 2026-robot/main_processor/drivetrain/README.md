@@ -21,7 +21,12 @@ controller; pose estimation and vision are separate future nodes.
 
 - `drivetrain.h`: the node, a `talos::Node` class with eight `talos::Motor`s
   and the Pigeon (`drivetrain_imu`); `drivetrain.cc` is `TALOS_NODE`.
-- `swerve.h`: the kinematics, plain math on the module geometry.
+- `swerve.h`: the kinematics, on wpimath's `frc::SwerveDriveKinematics<4>`
+  (inverse and forward kinematics, `SwerveModuleState::Optimize`), and the
+  drivetrain's one unit boundary (`ToRadians`, `WheelTravel`, `WheelSpeed`,
+  `WheelRps`), where shaft rotations become meters and radians. Wheel speeds
+  are desaturated by hand, because each module has its own wheel radius and
+  drive maximum and `DesaturateWheelSpeeds` takes a single one.
 - `geometry.h`: the geometry, read from `[subsystems.drivetrain.geometry]`;
   each module names its drive, steer and encoder devices, checked against
   this subsystem's devices at startup.
@@ -29,10 +34,22 @@ controller; pose estimation and vision are separate future nodes.
   `drivetrain::DrivetrainState` and `drivetrain::topics::k*`,
   `//2026-robot/main_processor/drivetrain:messages`.
 
-The heading on `/drivetrain/state` is the Pigeon's yaw. Under `--sim` it is
-instead integrated from the rotation the modules measure, because a simulated
-Pigeon reads a valid, permanently zero yaw; `integrate_heading = true|false`
-in `[subsystem]` overrides that choice.
+`/drivetrain/state` (`DrivetrainState`) is published every tick, whatever
+the hardware says:
+
+- `modules_valid` is true when all eight module motors report. While it is
+  false nothing is driven (every module neutral), the chassis speeds read 0
+  and the four module positions (`module0`..`module3`, in geometry order:
+  wheel travel in meters from the drive motor, azimuth in radians from the
+  steer motor) hold their last valid values.
+- `yaw_rad` is the Pigeon's yaw converted from rotations, and `yaw_valid`
+  says whether the Pigeon reports. While it does not, `yaw_rad` holds the last
+  valid heading (0 before the first). Under `--sim` the heading is instead
+  integrated from the rotation the modules measure, valid while the modules
+  are, because a simulated Pigeon reads a valid, permanently zero yaw;
+  `integrate_heading = true|false` in `[subsystem]` overrides that choice.
+- `sample_time_ns` is the node-clock time of the hardware sample the state
+  was computed from, 0 (with both flags false) while it is unknown.
 
 ## Local Topics
 
