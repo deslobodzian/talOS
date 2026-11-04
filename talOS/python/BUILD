@@ -1,3 +1,4 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("//talOS/build:contract.bzl", "talos_messages")
 
@@ -14,7 +15,7 @@ py_library(
     data = ["//talOS/node_api:libtalos_node.so"],
     imports = ["."],
     visibility = ["//visibility:public"],
-    deps = ["@pypi//flatbuffers"],
+    deps = ["//talOS/schema:reflection_py"],
 )
 
 # `talos.testing`: Sim and SimHardware.
@@ -45,18 +46,32 @@ py_test(
     ],
 )
 
-# The struct.Struct message codec against flatbuffers.Builder: identical
-# bytes, round trips, the Builder fallback, and the speedup.
+# Prints the flatc C++ bytes of fixed //talOS/schema:test_messages values,
+# which messages_test compares the Python codec against.
+cc_binary(
+    name = "messages_golden",
+    testonly = True,
+    srcs = ["messages_golden.cc"],
+    deps = ["//talOS/schema:test_messages"],
+)
+
+# The reflection-driven struct.Struct codec: byte-for-byte against flatc C++
+# (nested structs, fixed arrays, enums of two widths, mixed alignment) and
+# flatc Python, round trips, and bad-field errors.
 py_test(
     name = "messages_test",
     size = "small",
     srcs = ["messages_test.py"],
+    data = [":messages_golden"],
+    env = {"TALOS_MESSAGES_GOLDEN": "$(rlocationpath :messages_golden)"},
     legacy_create_init = False,
     deps = [
         ":talos",
         ":test_messages_py",
         "//talOS/msgs:control_py",
         "//talOS/msgs:geometry_py",
+        "//talOS/schema:test_messages_py",
         "@pypi//flatbuffers",
+        "@rules_python//python/runfiles",
     ],
 )

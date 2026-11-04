@@ -1,13 +1,15 @@
-"""The struct.Struct message codec against the flatbuffers.Builder path."""
+"""The reflection-driven struct.Struct message codec: byte-for-byte against
+flatc C++ (messages_golden) and flatc Python (flatbuffers.Builder)."""
 
+import os
 import random
 import struct
+import subprocess
 import sys
-import time
 import unittest
-from unittest import mock
 
 import flatbuffers
+from python.runfiles import runfiles
 
 from control.ChassisTarget import ChassisTarget
 from control.PositionState import PositionState
@@ -22,7 +24,11 @@ from geometry.Pose2d import Pose2d
 from geometry.Rotation2d import Rotation2d
 from geometry.Translation2d import Translation2d
 from geometry.Twist2d import Twist2d
-from talos import _messages
+from schema_test.Arrays import Arrays
+from schema_test.Inner import Inner
+from schema_test.Level import Level
+from schema_test.Mixed import Mixed
+from schema_test.Mode import Mode
 from talos._messages import Message, MessageType, message_type
 
 TYPES = (Goal, Status, Report, Translation2d, Rotation2d, Pose2d, Twist2d,
@@ -33,34 +39,33 @@ _INT_BITS = {"b": (8, True), "B": (8, False), "h": (16, True),
              "H": (16, False), "i": (32, True), "I": (32, False),
              "q": (64, True), "Q": (64, False)}
 
-
-class Scaled:
-    """A hand-written struct whose Create converts its arguments, which the
-    layout recorder cannot follow: it must take the Builder path."""
-
-    __slots__ = ["_tab"]
-
-    @classmethod
-    def SizeOf(cls):  # noqa: N802 (flatc's API)
-        return 8
-
-    def Init(self, buf, pos):  # noqa: N802
-        self._tab = flatbuffers.table.Table(buf, pos)
-
-    def Count(self):  # noqa: N802
-        return self._tab.Get(flatbuffers.number_types.Int32Flags,
-                             self._tab.Pos)
-
-    def Ratio(self):  # noqa: N802
-        return self._tab.Get(flatbuffers.number_types.Float32Flags,
-                             self._tab.Pos + 4)
+# The values messages_golden.cc encodes with flatc C++, by its labels.
+GOLDEN_VALUES = {
+    "inner": (Inner, {"mode": Mode.HIGH, "offset_m": -1.5}),
+    "mixed_zero": (Mixed, {}),
+    "mixed_top": (Mixed, {
+        "flag": True, "position_m": 1234.5678, "level": Level.TOP,
+        "sample_count": 4000000000, "inner_mode": Mode.LOW,
+        "inner_offset_m": 0.25, "speed_frac": -0.75}),
+    "mixed_bottom": (Mixed, {
+        "flag": False, "position_m": -0.5, "level": Level.BOTTOM,
+        "sample_count": 7, "inner_mode": Mode.OFF, "inner_offset_m": -8.0,
+        "speed_frac": 1.0}),
+    "arrays": (Arrays, {
+        "samples_m": (1.5, -2.25, 1e9), "modes": (Mode.HIGH, Mode.LOW),
+        "inners_0_mode": Mode.LOW, "inners_0_offset_m": 3.5,
+        "inners_1_mode": Mode.HIGH, "inners_1_offset_m": -0.125,
+        "channel_id": (1, 2, 3, 254, 255)}),
+    "arrays_zero": (Arrays, {}),
+}
 
 
-def CreateScaled(builder, count, ratio):  # noqa: N802
-    builder.Prep(4, 8)
-    builder.PrependFloat32(float(ratio))
-    builder.PrependInt32(int(count))
-    return builder.Offset()
+def golden_bytes():
+    """{label: flatc C++ bytes} from messages_golden."""
+    path = runfiles.Create().Rlocation(os.environ["TALOS_MESSAGES_GOLDEN"])
+    out = subprocess.run([path], check=True, capture_output=True, text=True)
+    return {label: bytes.fromhex(data)
+            for label, data in (line.split() for line in out.stdout.splitlines())}
 
 
 def random_value(rng, code):
@@ -76,30 +81,99 @@ def random_value(rng, code):
 
 
 def random_fields(rng, mtype):
+    """Random values for a type without arrays (one packed value a field)."""
     return {field: random_value(rng, code)
-            for field, code in zip(mtype._packed_fields, mtype._packed_codes)}
+            for field, code in zip(mtype.fields, mtype._slot_codes)}
 
 
 def builder_bytes(cls, mtype, fields):
-    """What flatbuffers.Builder writes for `fields`, independent of talos."""
+    """What flatc Python's Create<Struct> writes for `fields`, through
+    flatbuffers.Builder, independent of talos."""
     create = getattr(sys.modules[cls.__module__], "Create" + cls.__name__)
     builder = flatbuffers.Builder(0)
     create(builder, *(fields.get(f, 0) for f in mtype.fields))
     return bytes(builder.Bytes[builder.Head():])
 
 
-def builder_type(cls):
-    """cls's MessageType on the Builder and accessor path."""
-    with mock.patch.object(_messages, "_layout", return_value=None):
-        return MessageType(cls)
+class CppBytesTest(unittest.TestCase):
+    """Nested structs, fixed arrays, enums of two widths and mixed
+    alignment, against the bytes flatc C++ structs hold."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.golden = golden_bytes()
+
+    def test_every_golden_value_is_covered(self):
+        self.assertEqual(set(self.golden), set(GOLDEN_VALUES))
+
+    def test_encoding_matches_cpp_byte_for_byte(self):
+        for label, (cls, fields) in GOLDEN_VALUES.items():
+            self.assertEqual(message_type(cls).encode(fields),
+                             self.golden[label], label)
+
+    def test_decoding_cpp_bytes_reads_the_values(self):
+        for label, (cls, fields) in GOLDEN_VALUES.items():
+            mtype = message_type(cls)
+            message = mtype.decode(self.golden[label])
+            for field in mtype.fields:
+                expected = fields.get(field)
+                if expected is None:
+                    count = mtype._arrays.get(field)
+                    expected = 0 if count is None else (0,) * count
+                self.assertEqual(getattr(message, field), expected,
+                                 (label, field))
+
+    def test_layout_is_the_schema_layout(self):
+        for cls, size, alignment in ((Inner, 8, 4), (Mixed, 40, 8),
+                                     (Arrays, 56, 8)):
+            mtype = message_type(cls)
+            self.assertEqual((mtype.size, mtype.alignment), (size, alignment))
+            self.assertEqual(mtype.size, cls.SizeOf())
+            self.assertEqual(mtype.schema_name, cls.TALOS_SCHEMA_NAME)
+            self.assertEqual(mtype.schema_hash, cls.TALOS_SCHEMA_HASH)
+        self.assertEqual(message_type(Mixed).fields, (
+            "flag", "position_m", "level", "sample_count", "inner_mode",
+            "inner_offset_m", "speed_frac"))
+        self.assertEqual(message_type(Arrays).fields, (
+            "samples_m", "modes", "inners_0_mode", "inners_0_offset_m",
+            "inners_1_mode", "inners_1_offset_m", "channel_id"))
+
+    def test_enum_names_come_from_the_schema(self):
+        mixed = message_type(Mixed).enum_names
+        self.assertEqual(mixed["level"], {-1: "BOTTOM", 0: "NONE", 300: "TOP"})
+        self.assertEqual(mixed["inner_mode"], {0: "OFF", 3: "LOW", 4: "HIGH"})
+        self.assertEqual(set(mixed), {"level", "inner_mode"})
+        arrays = message_type(Arrays).enum_names
+        self.assertEqual(set(arrays),
+                         {"modes", "inners_0_mode", "inners_1_mode"})
+        message = message_type(Arrays).decode(self.golden["arrays"])
+        self.assertIn("modes=(HIGH, LOW)", repr(message))
+        self.assertIn("channel_id=(1, 2, 3, 254, 255)", repr(message))
+        self.assertIn("inners_1_mode=HIGH", repr(message))
+
+    def test_scalar_arrays_read_as_tuples(self):
+        message = message_type(Arrays).decode(self.golden["arrays"])
+        self.assertIs(type(message.samples_m), tuple)
+        self.assertEqual(message.samples_m, (1.5, -2.25, 1e9))
+        # A list encodes like a tuple.
+        self.assertEqual(
+            message_type(Arrays).encode(
+                dict(GOLDEN_VALUES["arrays"][1], samples_m=[1.5, -2.25, 1e9])),
+            self.golden["arrays"])
 
 
 class StructCodecTest(unittest.TestCase):
-    def test_every_type_takes_the_struct_path(self):
+    def test_every_type_has_its_schema_layout(self):
         for cls in TYPES:
             mtype = message_type(cls)
-            self.assertIsNotNone(mtype.packer, cls.__name__)
             self.assertEqual(mtype.packer.size, cls.SizeOf(), cls.__name__)
+            self.assertEqual(mtype.size, cls.SizeOf(), cls.__name__)
+            self.assertEqual(mtype.schema_name, cls.TALOS_SCHEMA_NAME)
+            self.assertEqual(mtype.schema_hash, cls.TALOS_SCHEMA_HASH)
+            builder = flatbuffers.Builder(0)
+            getattr(sys.modules[cls.__module__], "Create" + cls.__name__)(
+                builder, *(0 for _ in mtype.fields))
+            self.assertEqual(mtype.alignment, builder.minalign, cls.__name__)
 
     def test_encoding_matches_the_builder_byte_for_byte(self):
         rng = random.Random(1234)
@@ -118,23 +192,18 @@ class StructCodecTest(unittest.TestCase):
                                  builder_bytes(cls, mtype, subset),
                                  (cls.__name__, subset))
 
-    def test_decoding_round_trips_and_matches_the_accessors(self):
+    def test_decoding_round_trips(self):
         rng = random.Random(5678)
         for cls in TYPES:
-            mtype, slow = message_type(cls), builder_type(cls)
+            mtype = message_type(cls)
             for _ in range(200):
                 fields = random_fields(rng, mtype)
-                data = mtype.encode(fields)
-                message, accessed = mtype.decode(data), slow.decode(data)
+                message = mtype.decode(mtype.encode(fields))
                 for field in mtype.fields:
                     self.assertEqual(getattr(message, field), fields[field],
                                      (cls.__name__, field))
-                    self.assertEqual(getattr(message, field),
-                                     getattr(accessed, field),
-                                     (cls.__name__, field))
                     self.assertIs(type(getattr(message, field)),
-                                  type(getattr(accessed, field)))
-                self.assertEqual(repr(message), repr(accessed))
+                                  type(fields[field]), (cls.__name__, field))
 
     def test_nested_struct_fields_flatten(self):
         mtype = message_type(OdometrySample)
@@ -176,51 +245,35 @@ class StructCodecTest(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "field height_rot"):
             mtype.encode({"height_rot": "up"})
 
-    def test_unrecordable_create_falls_back_to_the_builder(self):
-        mtype = MessageType(Scaled)
-        self.assertIsNone(mtype.packer)
-        data = mtype.encode({"count": -3, "ratio": 0.5})
-        builder = flatbuffers.Builder(0)
-        CreateScaled(builder, -3, 0.5)
-        self.assertEqual(data, bytes(builder.Bytes[builder.Head():]))
-        message = mtype.decode(data)
-        self.assertEqual((message.count, message.ratio), (-3, 0.5))
-        self.assertEqual(repr(message), "Scaled(count=-3, ratio=0.5)")
-        with self.assertRaisesRegex(TypeError, "Scaled has no field x"):
-            mtype.encode({"x": 1})
+    def test_bad_shape_values_raise_type_error(self):
+        arrays, mixed = message_type(Arrays), message_type(Mixed)
+        with self.assertRaisesRegex(TypeError, "Arrays has no field inners"):
+            arrays.encode({"inners": ()})
+        with self.assertRaisesRegex(
+                TypeError, r"bad value \(1.0, 2.0\) for field samples_m: "
+                "needs 3 items"):
+            arrays.encode({"samples_m": (1.0, 2.0)})
+        with self.assertRaisesRegex(TypeError,
+                                    "bad value 1.0 for field samples_m"):
+            arrays.encode({"samples_m": 1.0})
+        with self.assertRaisesRegex(TypeError,
+                                    r"bad value 256 for field channel_id\[4\]"):
+            arrays.encode({"channel_id": (1, 2, 3, 4, 256)})
+        with self.assertRaisesRegex(TypeError, "bad value 40000 for field level"):
+            mixed.encode({"level": 40000})
+        with self.assertRaisesRegex(TypeError,
+                                    r"bad value 1e\+300 for field speed_frac"):
+            mixed.encode({"speed_frac": 1e300})
 
-    def test_builder_path_matches_for_generated_types(self):
-        rng = random.Random(91011)
-        for cls in TYPES:
-            fast, slow = message_type(cls), builder_type(cls)
-            self.assertIsNone(slow.packer)
-            for _ in range(20):
-                fields = random_fields(rng, fast)
-                self.assertEqual(slow.encode(fields), fast.encode(fields))
-                decoded = slow.decode(fast.encode(fields))
-                for field in fast.fields:
-                    self.assertEqual(getattr(decoded, field), fields[field])
+    def test_a_class_without_a_schema_raises_type_error(self):
+        class Handwritten:
+            @classmethod
+            def SizeOf(cls):  # noqa: N802 (flatc's API)
+                return 8
 
-    def test_struct_path_is_faster(self):
-        fast, slow = message_type(OdometrySample), builder_type(OdometrySample)
-        fields = random_fields(random.Random(7), fast)
-        data = fast.encode(fields)
-
-        def best(mtype, ops=10_000):
-            runs = []
-            for _ in range(3):
-                start = time.perf_counter()
-                for _ in range(ops):
-                    message = mtype.decode(mtype.encode(fields))
-                    message.pose_x_m
-                    message.velocity_omega_radps
-                runs.append(time.perf_counter() - start)
-            return min(runs)
-
-        self.assertEqual(slow.encode(fields), data)
-        fast_s, slow_s = best(fast), best(slow)
-        self.assertLess(fast_s * 2, slow_s,
-                        f"struct {fast_s:.4f}s vs builder {slow_s:.4f}s")
+        with self.assertRaisesRegex(TypeError,
+                                    "Handwritten has no TALOS_SCHEMA_BFBS"):
+            MessageType(Handwritten)
 
 
 if __name__ == "__main__":
