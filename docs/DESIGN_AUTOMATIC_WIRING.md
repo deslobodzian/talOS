@@ -387,54 +387,87 @@ CI with the fix printed.
 
 ## D6. Estimation support, and adding a pose estimator
 
-What a pose estimator needs, and what is missing today:
+What a pose estimator needs, and where each piece now lives:
 
-| Need | Today | Change |
+| Need | Before | Now |
 |---|---|---|
-| Wheel module positions (distance, angle) | `DrivetrainState` has chassis speeds only | add `modules: [geometry.SwerveModulePosition x4]` (`distance_m`, `angle_rad`) |
-| Gyro heading with validity | `yaw_rot`, which reads 0 when disconnected | `yaw_rad` + `yaw_valid` |
-| When a sample was taken | `timestamp_ns` = publish time | `sample_time_ns`: `HardwareLink::sample_time()` maps the gateway's `sample_time_us` into the node clock (the bridge keeps a min-filtered offset). Exposed in C++, C ABI and Python. |
-| Vision observations | none | `geometry.PoseObservation { sample_time_ns, pose: Pose2d, std_x_m, std_y_m, std_yaw_rad, tag_count, valid }` in `talOS/msgs` |
-| Estimator math | hand-written odometry | wpimath `SwerveDrive4PoseEstimator` (C++ from allwpilib's Bazel build; Python `robotpy-wpimath`). The Bazel route on macOS arm64 is unverified. |
-| Offline tuning | `--replay` replays a node's own log | `--replay-inputs <session>`: drive a *new* node from another session's logged topics |
-| A list parameter (`cameras = [...]`) | `param<T>` takes bool, integer, double or string only (`talOS/node/node.h:274`) | `param<std::vector<std::string>>` and `std::vector<double>`, in the C ABI and Python |
+| Wheel module positions (distance, angle) | `DrivetrainState` had chassis speeds only | `module0`..`module3: geometry.SwerveModulePosition` (`distance_m`, `angle_rad`) in `[subsystems.drivetrain.geometry].modules` order, plus `modules_valid` |
+| Gyro heading with validity | `yaw_rot`, which read 0 when disconnected | `yaw_rad` + `yaw_valid` |
+| When a sample was taken | `timestamp_ns` = publish time | `sample_time_ns`, from `HardwareLink::sample_time()`: the gateway's `sample_time_us` mapped into the node clock (the bridge keeps a min-filtered offset). C++, C ABI and Python. |
+| Vision observations | none | `geometry.PoseObservation { sample_time_ns, pose: Pose2d, x_std_m, y_std_m, yaw_std_rad, tag_count, valid }` in `talOS/msgs` |
+| Estimator output | `odometry.OdometryState` | `geometry.PoseEstimate { sample_time_ns, pose, velocity: Twist2d, valid, observation_accepted_count, observation_rejected_count }` |
+| Estimator math | hand-written dead reckoning (`odometry`, deleted) | `pose_estimator` (Python): wpimath or GTSAM, chosen by `backend` |
+| A topics-only package | `talos_messages` needed a schema | `talos_messages(srcs = [], topics = ..., deps = ["//talOS/msgs:geometry"])` |
+| A list parameter (`cameras = [...]`) | `param<T>` took bool, integer, double or string only | `param<std::vector<std::string>>` / `std::vector<double>`, in the C ABI and Python (`node.param("cameras")` is a list) |
+| Offline tuning | `--replay` replays a node's own log | `--replay-inputs <session>` (drive a *new* node from another session's logged topics) is not built yet |
 
-With D1–D6 in place, **adding a pose estimator** takes these steps:
+### The 2026 robot's estimator
 
-1. `bazel run //tools:new_subsystem -- pose_estimator --lang py --type estimator`
-   generates a node with no devices, a `geometry.PoseEstimate` state and a
-   `Sim` test skeleton.
-2. Write the node (≈ 40 lines):
+`2026-robot/main_processor/pose_estimator` is one Python node with two
+backends behind one shell. The shell owns the inputs, the checks and the
+output; a backend only folds in odometry and observations:
 
-   ```python
-   from wpimath.estimator import SwerveDrive4PoseEstimator
-   class PoseEstimator:
-       def __init__(self, node):
-           self.drive = node.subscribe(DrivetrainState, "/drivetrain/state")
-           self.cameras = [node.subscribe(PoseObservation, f"/{c}/state")
-                           for c in node.param("cameras")]    # list in TOML
-           self.est = SwerveDrive4PoseEstimator(kinematics_from(node), ...)
-           self.state = node.publish(PoseEstimate, "state")
-       def update(self):
-           d = self.drive.value
-           if self.drive.fresh() and d.yaw_valid:
-               self.est.updateWithTime(d.sample_time_ns * 1e-9, Rotation2d(d.yaw_rad), modules(d))
-           for cam in self.cameras:
-               o = cam.value
-               if cam.updated and o.valid:
-                   self.est.addVisionMeasurement(pose(o), o.sample_time_ns * 1e-9, stds(o))
-           self.state.send(...)   # every tick, valid flag from drive freshness
-   ```
-3. Add a `subsystems/pose_estimator.toml` with `cameras = ["front_camera"]`, and
-   one `[[subsystems]]` line.
-4. Point consumers at it with config only: `[studio] pose_topic`, and
-   `pose_topic = "/pose_estimator/state"` on the `driver` node (or `remap`).
-5. Tune offline: `--replay-inputs` against a match session. It shows up in
-   Studio with units, without further work.
+- `backend = "kalman"`: `wpimath.estimator.SwerveDrive4PoseEstimator` from
+  `robotpy-wpimath` (the C++ class is `frc::SwerveDrivePoseEstimator<4>`;
+  there is no `SwerveDrive4PoseEstimator` in C++). A steady-state Kalman gain
+  from `kalman.state_std_*` and each observation's standard deviations, with
+  latency compensation by replaying buffered odometry. Odometry goes in only
+  through `updateWithTime(sample_time_ns / 1e9, ...)`: `update()` reads
+  WPILib's wall/FPGA clock and would break Sim and replay determinism.
+  Observations go through `addVisionMeasurement(pose, sample_time_s, stds)`.
+- `backend = "factor_graph"`: `gtsam.IncrementalFixedLagSmoother` (iSAM2)
+  over one `Pose2` per integrated drivetrain sample, stamped with its sample
+  time. Each step adds a `BetweenFactorPose2` whose `dx, dy` come from
+  `wpimath.kinematics.SwerveDrive4Kinematics.toTwist2d(prev, cur)` and whose
+  `dtheta` is the gyro's yaw change (wpimath odometry's own rule); the first
+  pose gets a prior; each accepted observation becomes a `PriorFactorPose2`
+  on the sample nearer its time, after moving it by the odometry between
+  the two (interpolated along the constant twist between the bracketing
+  samples). That adds no error for constant-velocity motion within one
+  sample interval, where plain nearest-key attachment would cost speed × half
+  an interval (4 cm at 4 m/s, 20 ms). The lag window is
+  `max_observation_age_us`. gtsam is imported only for this backend.
 
-The camera side is another node:
-- a `photon` node reads PhotonVision results (photonlib) and publishes
-  `/front_camera/state`;
+Shared rules: odometry is integrated only when the drivetrain sample is new
+(`sample_time_ns` increased) with `modules_valid` and `yaw_valid`; an
+observation is rejected and counted when `valid` is false, a value is
+non-finite, a standard deviation is not positive, it arrives before any
+odometry or predates the first sample, it is more than
+`observation_future_tolerance_us` newer than the latest odometry sample, or
+older than `max_observation_age_us` (at most 1.5 s, wpimath's pose buffer).
+Each observation is read once (`Subscription.updated`). `valid` is true once
+odometry has been integrated and while the drivetrain input is fresh, usable
+and still advancing; otherwise the pose is held. Nothing is actuation-gated:
+the estimate runs while the robot is disabled. `module_x_m`/`module_y_m`
+repeat the drivetrain geometry and `config_golden_test` keeps them equal.
+Every test scenario runs against both backends.
+
+Why Python: GTSAM is available to this build only as the pinned `gtsam`
+wheel (no C++ Bazel route), and wpimath's estimator is the same binary in
+both languages (the RobotPy wheel's `libwpimath` is byte-identical to the
+Maven one), so one Python node serves both backends and the comparison
+between them is like for like. At 20 ms the cost is small: a factor-graph
+update measured 0.03 ms median and 0.25 ms p99. The one Python-specific cost
+is a cold start of several seconds after a fresh deploy (numpy, wpimath and,
+for `factor_graph`, 150 MB of gtsam), which the launcher's describe timeout
+has to allow for.
+
+### Adding a pose estimator
+
+1. `bazel run //tools:new_subsystem -- <name> --lang py|cpp --type estimator`
+   writes a hardware-free node publishing `geometry.PoseEstimate` on
+   `/<name>/state` from the `PoseObservation`s of the cameras listed in its
+   `cameras` param (optional subscriptions), a topics-only `talos_messages`,
+   a Sim test covering the disabled and stale cases, and its
+   `subsystems/<name>.toml` plus `[[subsystems]]` line and manifests.
+2. Fuse odometry into it: read `/drivetrain/state` and follow
+   `pose_estimator.py` (wpimath or GTSAM), or replace the 2026 robot's node.
+3. Point consumers at it with config only: `[subsystems.telemetry]
+   pose_topic = "/<name>/state"` (telemetry names no estimator package).
+
+The camera side is another node, publishing `geometry.PoseObservation` on
+its own `/<camera>/state`:
+- a `photon` node reads PhotonVision results (photonlib);
 - or an in-process AprilTag pipeline (`robotpy-apriltag`) does the same.
 
 ---
