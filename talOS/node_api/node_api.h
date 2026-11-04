@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 13u
+#define TALOS_NODE_ABI_VERSION 14u
 
 enum {
   TALOS_OK = 0,
@@ -68,24 +68,33 @@ uint64_t talos_node_next_update(const TalosNode* node);
 int64_t talos_node_period_ns(const TalosNode* node);
 const char* talos_node_config_path(const TalosNode* node);
 
-// Parameter kinds. ANY takes the key's own type.
+// Parameter kinds. ANY takes the key's own type; LIST takes an array of
+// either element kind (an empty array reports DOUBLE_LIST).
 enum {
   TALOS_PARAM_ANY = 0,
   TALOS_PARAM_BOOL = 1,
   TALOS_PARAM_INT = 2,
   TALOS_PARAM_DOUBLE = 3,
   TALOS_PARAM_STRING = 4,
+  TALOS_PARAM_STRING_LIST = 5,
+  TALOS_PARAM_DOUBLE_LIST = 6,
+  TALOS_PARAM_LIST = 7,
 };
+// The pointers are valid until the next talos_node_param call on this thread.
 typedef struct TalosParam {
   int32_t kind;  // what was found
   int32_t boolean;
   int64_t integer;
   double number;
-  const char* string;  // valid until the next call on this thread
+  const char* string;
+  uint64_t count;              // elements of a list kind
+  const double* numbers;       // DOUBLE_LIST: `count` values
+  const char* const* strings;  // STRING_LIST: `count` strings
 } TalosParam;
 // A key of this node's subsystem table as `kind`. Returns 1 when found, 0
 // when absent and not `required`, TALOS_ERR when absent and required or of
-// the wrong type (the error names the node and key).
+// the wrong type (the error names the node and key, and for a list the
+// offending element's index and type).
 int32_t talos_node_param(const TalosNode* node, const char* key, int32_t kind,
                          int32_t required, TalosParam* out);
 
