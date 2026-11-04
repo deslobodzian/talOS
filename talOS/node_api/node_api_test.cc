@@ -478,14 +478,24 @@ TEST_F(NodeApi, TargetSelectsTheTeleopLaneAndLanesRelease) {
   ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
   EXPECT_EQ(talos_target_get(node, lanes.target, &out, &source), 0);
 
-  // The harness writes the same envelope.
+  // The harness writes the same envelope, stamped with the generation of the
+  // Driver Station packet it forwarded last...
+  const uint64_t generation = talos_sim_driver_station_generation(sim_);
+  ASSERT_NE(generation, 0u);
   const float other = 3.0f;
   ASSERT_EQ(talos_sim_publish_target(sim_, "roller", "teleop", &other,
-                                     sizeof other, alignof(float)),
+                                     sizeof other, alignof(float), nullptr),
             TALOS_OK);
   ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
   ASSERT_EQ(talos_target_get(node, lanes.target, &out, &source), 1);
   EXPECT_FLOAT_EQ(out, 3.0f);
+  // ... or with an explicit one: another generation never drives.
+  const uint64_t earlier = generation - 1;
+  ASSERT_EQ(talos_sim_publish_target(sim_, "roller", "teleop", &other,
+                                     sizeof other, alignof(float), &earlier),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(talos_target_get(node, lanes.target, &out, &source), 0);
 
   // Wrong sizes and alignments are refused, naming the problem.
   EXPECT_EQ(talos_target_lane_send(node, lanes.lane, &speed, 8), TALOS_ERR);

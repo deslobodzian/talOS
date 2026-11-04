@@ -58,6 +58,7 @@ struct SimHardware::Impl {
   std::map<std::string, std::uint64_t> cursors;  // per request topic
   std::set<std::pair<Kind, std::uint16_t>> disconnected;
   std::optional<driver_station::DriverStationData> ds_packet;
+  driver_station::ModeTracker ds_mode;
 
   explicit Impl(Sim& s) : sim{s} {}
 
@@ -207,8 +208,9 @@ struct SimHardware::Impl {
     if (ds_packet) PublishDriverStation(*ds_packet);
   }
 
-  void PublishDriverStation(driver_station::DriverStationData data) const {
+  void PublishDriverStation(driver_station::DriverStationData data) {
     data.sample_time_us = static_cast<std::uint64_t>(sim.now().nanos() / 1000);
+    ds_mode.Stamp(data);
     Packet packet{};
     packet.size =
         static_cast<std::uint32_t>(driver_station::Encode(data, packet.data));
@@ -337,20 +339,36 @@ std::string LaneTopic(std::string_view subsystem, std::string_view source) {
 }
 }  // namespace
 
+std::uint64_t DriverStationGeneration(const Sim& sim) {
+  const std::uint64_t count = SimAccess::message_count(
+      sim, hardware::kDriverStationTopic, sizeof(Packet));
+  if (count == 0) return 0;
+  Packet packet{};
+  SimAccess::read_raw(sim, hardware::kDriverStationTopic, sizeof packet,
+                      count - 1, &packet);
+  driver_station::DriverStationData data{};
+  if (!driver_station::Decode(packet.bytes(), data)) return 0;
+  return detail::DsModeOf(data.fms.flags) != detail::DsMode::kNone
+             ? data.mode_since_us
+             : 0;
+}
+
 void PublishTargetRaw(Sim& sim, std::string_view subsystem,
                       std::string_view source, const void* message,
-                      std::size_t bytes, std::size_t alignment) {
+                      std::size_t bytes, std::size_t alignment,
+                      std::uint64_t mode_since_us) {
   std::vector<std::byte> envelope(
       detail::TargetEnvelopeBytes(bytes, alignment));
-  detail::EncodeTargetEnvelope(message != nullptr, message, bytes, alignment,
-                               envelope);
+  detail::EncodeTargetEnvelope(mode_since_us, message != nullptr, message,
+                               bytes, alignment, envelope);
   SimAccess::publish_raw(sim, LaneTopic(subsystem, source), envelope.data(),
                          envelope.size());
 }
 
 bool LatestTargetRaw(const Sim& sim, std::string_view subsystem,
                      std::string_view source, void* out, std::size_t bytes,
-                     std::size_t alignment, bool& active) {
+                     std::size_t alignment,
+                     detail::TargetEnvelopeHeader& header) {
   const std::string topic = LaneTopic(subsystem, source);
   std::vector<std::byte> envelope(
       detail::TargetEnvelopeBytes(bytes, alignment));
@@ -358,8 +376,8 @@ bool LatestTargetRaw(const Sim& sim, std::string_view subsystem,
       SimAccess::message_count(sim, topic, envelope.size());
   if (count == 0) return false;
   SimAccess::read_raw(sim, topic, envelope.size(), count - 1, envelope.data());
-  active = envelope[0] == std::byte{1};
-  std::memcpy(out, envelope.data() + alignment, bytes);
+  header = detail::DecodeTargetEnvelopeHeader(envelope.data());
+  std::memcpy(out, envelope.data() + detail::kTargetEnvelopeHeaderBytes, bytes);
   return true;
 }
 

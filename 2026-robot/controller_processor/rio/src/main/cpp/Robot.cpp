@@ -187,6 +187,9 @@ void Robot::StartCompetition() {
 
   std::array<uint8_t, talos::protocol::kMaxPayloadSize> ds_buffer{};
   uint64_t last_ds_sample_us = 0;
+  // Stamps each packet's mode generation, real Driver Station or the
+  // desktop SimDriverStation alike: both are read back through WPILib.
+  talos::driver_station::ModeTracker ds_mode;
 
   while (running_.load(std::memory_order_relaxed)) {
     if (gateway_->configured()) {
@@ -217,7 +220,8 @@ void Robot::StartCompetition() {
       if (now_us - last_ds_sample_us >=
           talos::driver_station::kSamplePeriodUs) {
         last_ds_sample_us = now_us;
-        const auto ds = talos::driver_station::SampleDriverStation(now_us);
+        auto ds = talos::driver_station::SampleDriverStation(now_us);
+        ds_mode.Stamp(ds);
         // Encode() returns 0 if the payload will not fit; send nothing rather
         // than an empty frame the receiver would forward as a decode failure.
         if (const auto ds_size = talos::driver_station::Encode(ds, ds_buffer)) {

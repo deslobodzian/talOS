@@ -124,12 +124,12 @@ class BinaryTest(unittest.TestCase):
             sorted([("TIMER", "intake", 0),
                     ("WATCHER", "/hw/state", 1404),
                     ("WATCHER", "/hw/state/driver_station", 1404),
-                    # Lanes of the default policy: active (padded to the
-                    # message's 4-byte alignment) + IntakeTarget.
+                    # Lanes of the default policy: the 16-byte envelope
+                    # header (mode generation, active) + IntakeTarget.
                     ("WATCHER", "/intake/target/teleop",
-                     4 + IntakeTarget.SizeOf()),
+                     16 + IntakeTarget.SizeOf()),
                     ("WATCHER", "/intake/target/auto",
-                     4 + IntakeTarget.SizeOf()),
+                     16 + IntakeTarget.SizeOf()),
                     ("SENDER", "/hw/request/intake", 1404),
                     ("SENDER", topics.STATE, IntakeState.SizeOf())]))
 

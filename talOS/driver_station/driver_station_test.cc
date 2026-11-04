@@ -12,6 +12,7 @@ namespace {
 TEST(DriverStationTest, RoundTripEncoding) {
   DriverStationData original{};
   original.sample_time_us = 123456789;
+  original.mode_since_us = 123400000;
   original.fms.flags = kDsAttached | kFmsAttached | kEnabled | kTeleop;
   original.fms.alliance = Alliance::kRed;
   original.fms.station = 2;
@@ -56,6 +57,7 @@ TEST(DriverStationTest, RoundTripEncoding) {
   ASSERT_TRUE(Decode({buffer.data(), size}, decoded));
 
   EXPECT_EQ(decoded.sample_time_us, original.sample_time_us);
+  EXPECT_EQ(decoded.mode_since_us, original.mode_since_us);
   EXPECT_EQ(decoded.fms.flags, original.fms.flags);
   EXPECT_EQ(decoded.fms.alliance, original.fms.alliance);
   EXPECT_EQ(decoded.fms.station, original.fms.station);
@@ -113,6 +115,68 @@ TEST(DriverStationTest, CorruptPayloadRejection) {
   std::array<uint8_t, 10> short_data{};
   DriverStationData ds{};
   EXPECT_FALSE(Decode(short_data, ds));
+}
+
+DriverStationData Sample(uint64_t time_us, uint32_t flags) {
+  DriverStationData ds{};
+  ds.sample_time_us = time_us;
+  ds.fms.flags = flags;
+  return ds;
+}
+
+// The generation each sample is stamped with.
+uint64_t Stamp(ModeTracker& tracker, uint64_t time_us, uint32_t flags) {
+  DriverStationData ds = Sample(time_us, flags);
+  tracker.Stamp(ds);
+  return ds.mode_since_us;
+}
+
+constexpr uint32_t kTeleopEnabled = kDsAttached | kEnabled | kTeleop;
+
+TEST(ModeTrackerTest, GenerationIsTheFirstSampleOfEachMode) {
+  ModeTracker tracker;
+  EXPECT_EQ(Stamp(tracker, 1000, kDsAttached | kTeleop), 1000u);
+  EXPECT_EQ(Stamp(tracker, 1020, kDsAttached | kTeleop), 1000u);
+  EXPECT_EQ(Stamp(tracker, 1040, kTeleopEnabled), 1040u);
+  EXPECT_EQ(Stamp(tracker, 1060, kTeleopEnabled), 1040u);
+  // Disabling and re-enabling in the same mode is a new generation: what
+  // was asked before the disable must not drive after it.
+  EXPECT_EQ(Stamp(tracker, 1080, kDsAttached | kTeleop), 1080u);
+  EXPECT_EQ(Stamp(tracker, 1100, kTeleopEnabled), 1100u);
+  EXPECT_EQ(Stamp(tracker, 1120, kDsAttached | kEnabled | kAutonomous), 1120u);
+  EXPECT_EQ(Stamp(tracker, 1140, kTeleopEnabled | kEStop), 1140u);
+}
+
+TEST(ModeTrackerTest, EveryModeFlagStartsAGeneration) {
+  for (const uint32_t bit :
+       {kDsAttached, kEnabled, kAutonomous, kTeleop, kTest, kEStop}) {
+    ModeTracker tracker;
+    Stamp(tracker, 10, kTeleopEnabled);
+    EXPECT_EQ(Stamp(tracker, 20, kTeleopEnabled ^ bit), 20u) << bit;
+  }
+}
+
+TEST(ModeTrackerTest, FmsAndJoysticksDoNotStartAGeneration) {
+  ModeTracker tracker;
+  Stamp(tracker, 10, kTeleopEnabled);
+  DriverStationData ds = Sample(20, kTeleopEnabled | kFmsAttached);
+  ds.fms.match_time_s = 90.0f;
+  ds.joysticks[0].connected = true;
+  ds.joysticks[0].buttons = 1;
+  tracker.Stamp(ds);
+  EXPECT_EQ(ds.mode_since_us, 10u);
+}
+
+TEST(ModeTrackerTest, GenerationIsNeverZeroAndAlwaysMovesForward) {
+  ModeTracker tracker;
+  // A sampler whose clock starts at 0 still stamps a generation no target
+  // mistakes for "none".
+  EXPECT_EQ(Stamp(tracker, 0, kTeleopEnabled), 1u);
+  // A mode change sampled at a repeated or earlier time still differs from
+  // the generation before it.
+  EXPECT_EQ(Stamp(tracker, 1, kDsAttached), 2u);
+  EXPECT_EQ(Stamp(tracker, 1, kTeleopEnabled), 3u);
+  EXPECT_EQ(Stamp(tracker, 500, kDsAttached), 500u);
 }
 
 }  // namespace

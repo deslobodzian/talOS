@@ -275,8 +275,9 @@ class Target:
 
     get() returns the message of the first lane, in the current Driver
     Station mode's priority order ([robot.targets], the subsystem's
-    [targets]), that is active, fresh and sent since the mode began, while
-    robot_enabled(node); otherwise None. `source` names that lane, or "".
+    [targets]), that is active, fresh and stamped with the current mode
+    generation, while robot_enabled(node); otherwise None. `source` names
+    that lane, or "".
     """
 
     def __init__(self, node, msg):
@@ -309,6 +310,10 @@ class TargetLane:
         self.lane = talos.TargetLane(node, PositionTarget, "wrist", "auto")
         self.lane.send(position_rot=0.25)   # republish every period
         self.lane.release()                 # nothing to say
+
+    send() stamps the mode generation this node's Driver Station shows (0,
+    which no consumer accepts, while it shows no mode), so a target from an
+    earlier enable or mode never drives this one.
     """
 
     def __init__(self, node, msg, subsystem, source):

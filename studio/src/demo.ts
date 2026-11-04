@@ -223,7 +223,7 @@ const DEMO_NODES: DemoNode[] = [
       {
         kind: 'FETCHER',
         name: '/drivetrain/target/teleop',
-        bytes: 32,
+        bytes: 40,
         hz: 50,
         optional: true
       },
@@ -232,7 +232,7 @@ const DEMO_NODES: DemoNode[] = [
       {
         kind: 'FETCHER',
         name: '/drivetrain/target/auto',
-        bytes: 32,
+        bytes: 40,
         hz: 0,
         optional: true
       },
@@ -269,14 +269,14 @@ const DEMO_NODES: DemoNode[] = [
       {
         kind: 'FETCHER',
         name: '/shooter/target/teleop',
-        bytes: 16,
+        bytes: 24,
         hz: 50,
         optional: true
       },
       {
         kind: 'FETCHER',
         name: '/shooter/target/auto',
-        bytes: 16,
+        bytes: 24,
         hz: 0,
         optional: true
       },
@@ -294,8 +294,8 @@ const DEMO_NODES: DemoNode[] = [
       {kind: 'TIMER', name: 'operator_interface', bytes: 0, hz: 50},
       {kind: 'WATCHER', name: '/hw/state/driver_station', bytes: HW_PACKET, hz: 50},
       {kind: 'FETCHER', name: '/drivetrain/state', bytes: 48, hz: 50},
-      {kind: 'SENDER', name: '/drivetrain/target/teleop', bytes: 32, hz: 50},
-      {kind: 'SENDER', name: '/shooter/target/teleop', bytes: 16, hz: 50}
+      {kind: 'SENDER', name: '/drivetrain/target/teleop', bytes: 40, hz: 50},
+      {kind: 'SENDER', name: '/shooter/target/teleop', bytes: 24, hz: 50}
     ]
   },
   {

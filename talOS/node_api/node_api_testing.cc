@@ -137,13 +137,22 @@ int32_t talos_sim_latest_bytes(const TalosSim* sim, const char* topic,
   });
 }
 
+uint64_t talos_sim_driver_station_generation(const TalosSim* sim) {
+  return Guard<uint64_t>(
+      0, [&] { return talos::testing::DriverStationGeneration(AsSim(sim)); });
+}
+
 int32_t talos_sim_publish_target(TalosSim* sim, const char* subsystem,
                                  const char* source, const void* message,
-                                 uint32_t size, uint32_t alignment) {
+                                 uint32_t size, uint32_t alignment,
+                                 const uint64_t* mode_since_us) {
   return Guard<int32_t>(TALOS_ERR, [&] {
+    talos::testing::Sim& s = AsSim(sim);
     talos::testing::PublishTargetRaw(
-        AsSim(sim), NonNull(subsystem, "subsystem"), NonNull(source, "source"),
-        message, size, alignment);
+        s, NonNull(subsystem, "subsystem"), NonNull(source, "source"), message,
+        size, alignment,
+        mode_since_us != nullptr ? *mode_since_us
+                                 : talos::testing::DriverStationGeneration(s));
     return TALOS_OK;
   });
 }
@@ -155,13 +164,13 @@ int32_t talos_sim_latest_target(const TalosSim* sim, const char* subsystem,
     if (out == nullptr || active == nullptr) {
       throw std::invalid_argument("null output");
     }
-    bool is_active = false;
+    talos::detail::TargetEnvelopeHeader header;
     if (!talos::testing::LatestTargetRaw(
             AsSim(sim), NonNull(subsystem, "subsystem"),
-            NonNull(source, "source"), out, size, alignment, is_active)) {
+            NonNull(source, "source"), out, size, alignment, header)) {
       return 0;
     }
-    *active = is_active ? 1 : 0;
+    *active = header.active ? 1 : 0;
     return 1;
   });
 }

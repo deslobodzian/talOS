@@ -25,8 +25,8 @@
       "sources": [
         {"kind": "WATCHER", "name": "/hw/state", "message_bytes": 1404, "external": false, "optional": false},
         {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/drivetrain/target/teleop", "message_bytes": 32, "external": false, "optional": true},
-        {"kind": "WATCHER", "name": "/drivetrain/target/auto", "message_bytes": 32, "external": false, "optional": true},
+        {"kind": "WATCHER", "name": "/drivetrain/target/teleop", "message_bytes": 40, "external": false, "optional": true},
+        {"kind": "WATCHER", "name": "/drivetrain/target/auto", "message_bytes": 40, "external": false, "optional": true},
         {"kind": "SENDER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false},
         {"kind": "SENDER", "name": "/hw/req/drive", "message_bytes": 1404, "external": false, "optional": false},
         {"kind": "TIMER", "name": "drivetrain", "message_bytes": 0, "external": false, "optional": false}
@@ -40,8 +40,8 @@
         {"kind": "WATCHER", "name": "/hw/state", "message_bytes": 1404, "external": false, "optional": false},
         {"kind": "SENDER", "name": "/hw/request/intake", "message_bytes": 1404, "external": false, "optional": false},
         {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/intake/target/teleop", "message_bytes": 8, "external": false, "optional": true},
-        {"kind": "WATCHER", "name": "/intake/target/auto", "message_bytes": 8, "external": false, "optional": true},
+        {"kind": "WATCHER", "name": "/intake/target/teleop", "message_bytes": 20, "external": false, "optional": true},
+        {"kind": "WATCHER", "name": "/intake/target/auto", "message_bytes": 20, "external": false, "optional": true},
         {"kind": "SENDER", "name": "/intake/state", "message_bytes": 20, "external": false, "optional": false},
         {"kind": "TIMER", "name": "intake", "message_bytes": 0, "external": false, "optional": false}
       ]
@@ -60,10 +60,10 @@
       "target": "//2026-robot/main_processor/operator_interface:node",
       "described": true,
       "sources": [
-        {"kind": "SENDER", "name": "/drivetrain/target/teleop", "message_bytes": 32, "external": false, "optional": false},
-        {"kind": "SENDER", "name": "/shooter/target/teleop", "message_bytes": 16, "external": false, "optional": false},
-        {"kind": "SENDER", "name": "/intake/target/teleop", "message_bytes": 8, "external": false, "optional": false},
+        {"kind": "SENDER", "name": "/drivetrain/target/teleop", "message_bytes": 40, "external": false, "optional": false},
         {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false},
+        {"kind": "SENDER", "name": "/shooter/target/teleop", "message_bytes": 24, "external": false, "optional": false},
+        {"kind": "SENDER", "name": "/intake/target/teleop", "message_bytes": 20, "external": false, "optional": false},
         {"kind": "WATCHER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false},
         {"kind": "TIMER", "name": "operator_interface", "message_bytes": 0, "external": false, "optional": false}
       ]
@@ -76,8 +76,8 @@
         {"kind": "WATCHER", "name": "/hw/state", "message_bytes": 1404, "external": false, "optional": false},
         {"kind": "SENDER", "name": "/hw/request/shooter", "message_bytes": 1404, "external": false, "optional": false},
         {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/shooter/target/teleop", "message_bytes": 16, "external": false, "optional": true},
-        {"kind": "WATCHER", "name": "/shooter/target/auto", "message_bytes": 16, "external": false, "optional": true},
+        {"kind": "WATCHER", "name": "/shooter/target/teleop", "message_bytes": 24, "external": false, "optional": true},
+        {"kind": "WATCHER", "name": "/shooter/target/auto", "message_bytes": 24, "external": false, "optional": true},
         {"kind": "SENDER", "name": "/shooter/state", "message_bytes": 32, "external": false, "optional": false},
         {"kind": "TIMER", "name": "shooter", "message_bytes": 0, "external": false, "optional": false}
       ]

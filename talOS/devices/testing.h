@@ -68,7 +68,8 @@ class SimHardware {
                      bool connected);
 
   // The Driver Station packet to forward from now on, stamped with the sim
-  // time as the Rio stamps it.
+  // time as the Rio stamps it, and with its mode generation by one
+  // driver_station::ModeTracker, as the Rio's sampler does.
   void set_driver_station(const driver_station::DriverStationData& data);
   // Stops forwarding: the Driver Station goes silent, as when its link
   // drops, while /hw/state keeps coming.
@@ -95,25 +96,48 @@ driver_station::DriverStationData DsPacket(std::uint32_t flags);
 //   PublishTarget(sim, "shooter", "teleop", shooter::ShooterTarget{60.0});
 //   ReleaseTarget<shooter::ShooterTarget>(sim, "shooter", "teleop");
 //   LatestTarget<demo::ElevatorGoal>(sim, "elevator", "superstructure");
-// Envelopes go through the same encoder TargetLane uses.
+// Envelopes go through the same encoder TargetLane uses, stamped with
+// DriverStationGeneration(sim): what a producer that has drained the latest
+// Driver Station packet stamps. To stand in for a producer that has not (a
+// target queued from an earlier mode, or a stale Driver Station view), pass
+// the generation explicitly:
+//   const std::uint64_t before = DriverStationGeneration(sim);
+//   ... change mode ...
+//   PublishTarget(sim, "shooter", "teleop", shooter::ShooterTarget{60.0},
+//                 before);
+//
+// The mode generation of the newest packet on /hw/state/driver_station: its
+// mode_since_us when its flags name a mode, 0 when they do not or there has
+// been none.
+std::uint64_t DriverStationGeneration(const Sim& sim);
 void PublishTargetRaw(Sim& sim, std::string_view subsystem,
                       std::string_view source, const void* message,
-                      std::size_t bytes, std::size_t alignment);
-// The newest envelope on the lane: its message copied into `out` and
-// `active` set, or false when the lane has had none.
+                      std::size_t bytes, std::size_t alignment,
+                      std::uint64_t mode_since_us);
+// The newest envelope on the lane: its message copied into `out` and its
+// header into `header`, or false when the lane has had none.
 bool LatestTargetRaw(const Sim& sim, std::string_view subsystem,
                      std::string_view source, void* out, std::size_t bytes,
-                     std::size_t alignment, bool& active);
+                     std::size_t alignment,
+                     detail::TargetEnvelopeHeader& header);
 
 template <Message M>
 void PublishTarget(Sim& sim, std::string_view subsystem,
+                   std::string_view source, const M& message,
+                   std::uint64_t mode_since_us) {
+  PublishTargetRaw(sim, subsystem, source, &message, sizeof(M), alignof(M),
+                   mode_since_us);
+}
+template <Message M>
+void PublishTarget(Sim& sim, std::string_view subsystem,
                    std::string_view source, const M& message) {
-  PublishTargetRaw(sim, subsystem, source, &message, sizeof(M), alignof(M));
+  PublishTarget(sim, subsystem, source, message, DriverStationGeneration(sim));
 }
 template <Message M>
 void ReleaseTarget(Sim& sim, std::string_view subsystem,
                    std::string_view source) {
-  PublishTargetRaw(sim, subsystem, source, nullptr, sizeof(M), alignof(M));
+  PublishTargetRaw(sim, subsystem, source, nullptr, sizeof(M), alignof(M),
+                   DriverStationGeneration(sim));
 }
 // The newest envelope on /<subsystem>/target/<source>, or nullopt.
 template <Message M>
@@ -121,12 +145,13 @@ std::optional<TargetEnvelope<M>> LatestTarget(const Sim& sim,
                                               std::string_view subsystem,
                                               std::string_view source) {
   TargetEnvelope<M> envelope{};
-  bool active = false;
+  detail::TargetEnvelopeHeader header;
   if (!LatestTargetRaw(sim, subsystem, source, &envelope.message, sizeof(M),
-                       alignof(M), active)) {
+                       alignof(M), header)) {
     return std::nullopt;
   }
-  envelope.active = active ? 1 : 0;
+  envelope.set_mode_since_us(header.mode_since_us);
+  envelope.active = header.active ? 1 : 0;
   return envelope;
 }
 

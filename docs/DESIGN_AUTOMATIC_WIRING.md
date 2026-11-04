@@ -60,12 +60,49 @@ NAMING.md already allows this. The aggregate `/<sub>/target` topic goes away.
 Each lane carries a framework envelope around the user struct:
 
 ```
-struct TargetEnvelope<M> { uint8 active; /* padding to alignof(M) */ M message; }   // size = alignof(M) + sizeof(M)
+struct TargetEnvelope<M> {
+  uint64 mode_since_us;   // the producer's Driver Station mode generation; 0: it had none
+  uint8  active;
+  uint8  padding[7];      // zero
+  M      message;         // offset 16
+}                         // size = 16 + sizeof(M); alignment = alignof(M)
 ```
 
 `active = 0` means "this producer has nothing to say". That replaces the
 `enabled` field in every target struct, and it replaces the arbiter's
-"send stop once on mode change".
+"send stop once on mode change". `mode_since_us` is held as bytes in the C++
+struct so the envelope keeps `M`'s alignment (a 4-byte `M` is a 20-byte lane).
+
+### Mode generation
+
+Invariant: a target issued under an earlier Driver Station enable or mode can
+never actuate. Receipt time cannot enforce it: every message delivered in one
+drain shares the drain's timestamp, so a target queued before a mode change is
+indistinguishable, by time, from one derived from the packet that changed the
+mode. The generation is therefore carried end to end:
+
+- Every Driver Station sampler (the RoboRIO program, real and WPILib-sim
+  alike; `SimHardware`; `send_joystick`) runs one
+  `driver_station::ModeTracker`, which stamps `DriverStationData::mode_since_us`
+  with the `sample_time_us` of the first sample whose mode key (attached,
+  enabled, e-stop, autonomous, teleop, test: `driver_station::ModeKey`)
+  differs from the previous sample's; never 0, and strictly later than the
+  previous generation. The bridge forwards the packet unchanged.
+- A node's generation is its latest packet's `mode_since_us` while its
+  Driver Station mode is not none (fresh, attached, enabled, not e-stopped),
+  else 0.
+- `TargetLane::send` stamps the producer's generation; `release()` sends
+  `active = 0`.
+- `Target::get` accepts a lane only when its stamp is nonzero and equal to
+  the consumer's generation.
+
+A Driver Station link that drops and returns while the RoboRIO stays in the
+same mode keeps its generation, so a producer that kept talking drives again as
+soon as its lane is fresh; re-enabling or re-attaching starts a new one, and
+the old lane stays ignored until the producer resends from the new packet. A
+producer and its consumer drain the same packet independently, so for at most
+one consumer period after a mode change a lane can be rejected because one of
+them has not drained it yet: conservative, never unsafe.
 
 ### Policy (TOML, no code)
 
@@ -84,16 +121,18 @@ teleop = ["align", "teleop"]   # auto-align preempts the driver while it is acti
 ### Selection, on every drain (deterministic: inputs are the node's own logged messages)
 
 ```
-mode  = DS mode          (none if the DS is stale, disabled or e-stopped)
-since = time the mode became current
+mode       = DS mode     (none if the DS is stale, detached, disabled or e-stopped)
+generation = latest DS packet's mode_since_us while mode is not none, else 0
 selected = first lane L in policy[mode] whose latest envelope
-           was received at or after `since`, is younger than command_timeout_us,
-           and has active = 1
+           is younger than command_timeout_us,
+           has active = 1, and
+           has mode_since_us != 0 and == generation
 get()    = robot_enabled(node) && selected ? &selected.message : null
 ```
 
-- Received at or after `since`: an `auto` target from before teleop began can
-  never drive teleop.
+- Same generation: an `auto` target from before teleop began, or a teleop
+  target from before a disable, can never drive this teleop period, even when
+  it arrives in the same drain as the packet that started it.
 - `active = 0` falls through to the next lane at once, so releasing an
   auto-align returns control to the driver on the next tick, not after
   100 ms.
@@ -159,8 +198,12 @@ who is driving each subsystem.
 ### Acceptance
 
 - `Sim` tests in C++ and Python cover: teleop drives; a mode switch ignores the
-  old lane; `release()` falls through within one tick; a stale lane goes
-  neutral; DS loss goes neutral.
+  old lane; a target queued before a re-enable is rejected in the same drain
+  as the re-enabling packet while one stamped with the new generation is
+  accepted; a producer with no mode stamps 0 and never drives; DS loss goes
+  neutral and same-mode recovery keeps the generation; re-attach starts a new
+  one; a stale high-priority lane falls back to the next; `release()` falls
+  through within one tick; `[subsystems.<name>.remap]` redirects one lane.
 - The 2026 graph launches without the arbiter, and `--describe-only` is clean.
 - Live sim: stick → drive request median drops by the arbiter hop (baseline
   4.98 ms), and the fault table from the LiveSim run still holds.

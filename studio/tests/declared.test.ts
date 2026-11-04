@@ -79,12 +79,13 @@ test('endpoint attributes survive the crossing', () => {
     '/shooter/target/teleop'
   ]);
 
-  // A lane is an envelope: alignof + sizeof of the target it carries.
+  // A lane is an envelope: the 16-byte header (mode generation, active), then
+  // the target it carries.
   const bytes = (name: string) =>
       new Set(ends.filter(e => e.name.startsWith(name)).map(e => e.message_bytes));
-  assert.deepEqual(bytes('/drivetrain/target/'), new Set([32]));
-  assert.deepEqual(bytes('/shooter/target/'), new Set([16]));
-  assert.deepEqual(bytes('/intake/target/'), new Set([8]));
+  assert.deepEqual(bytes('/drivetrain/target/'), new Set([40]));
+  assert.deepEqual(bytes('/shooter/target/'), new Set([24]));
+  assert.deepEqual(bytes('/intake/target/'), new Set([20]));
 
   // Everything else is an ordinary end, not an unset field read as false.
   assert.equal(ends.filter(e => !e.external && !e.optional).length,

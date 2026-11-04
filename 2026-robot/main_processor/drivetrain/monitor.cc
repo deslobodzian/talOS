@@ -125,9 +125,10 @@ void PrintTarget(const std::string& source,
   const drivetrain::ChassisTarget& target = lane.message;
   std::printf(
       "vx %6.2f m/s   vy %6.2f m/s   omega %6.2f rad/s   active %s   age %s\n"
-      "\n",
+      "          mode generation %llu\n\n",
       target.vx_mps(), target.vy_mps(), target.omega_radps(),
-      on_off(lane.active != 0), freshness.age(now).c_str());
+      on_off(lane.active != 0), freshness.age(now).c_str(),
+      static_cast<unsigned long long>(lane.mode_since_us()));
 }
 
 const talos::hardware::MotorSample* FindSample(

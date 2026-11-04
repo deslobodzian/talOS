@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -18,6 +19,7 @@ namespace talos {
 namespace {
 
 using namespace std::chrono_literals;
+using testing::DriverStationGeneration;
 using testing::DsPacket;
 using testing::LatestTarget;
 using testing::PublishTarget;
@@ -26,15 +28,15 @@ using testing::Sim;
 using testing::SimHardware;
 namespace ds = driver_station;
 
-// A double-aligned message and a 4-byte one, so both envelope paddings run.
+// A double-aligned message and a 4-byte one, so both alignments run.
 struct Goal {
   double position_rot;
 };
 struct Small {
   float speed_rps;
 };
-static_assert(sizeof(TargetEnvelope<Goal>) == 16);
-static_assert(sizeof(TargetEnvelope<Small>) == 8);
+static_assert(sizeof(TargetEnvelope<Goal>) == 24);
+static_assert(sizeof(TargetEnvelope<Small>) == 20);
 
 // The lift lets auto-align preempt the driver in teleop (robot default); the
 // wrist overrides teleop and opts into test mode.
@@ -90,6 +92,15 @@ class TargetTest : public ::testing::Test {
       PublishTarget(sim, "lift", source, Goal{position});
       sim.step(5ms);
     }
+  }
+  // Disabled, then teleop again: the packet that re-enables lands just
+  // after the lift's tick, so it waits for the next drain with whatever the
+  // producers queued meanwhile.
+  void ReenableBetweenTicks() {
+    Mode(0);
+    sim.step(1ms);  // off the 5 ms grid the packets and ticks share
+    hw.set_driver_station(DsPacket(kTeleop));
+    sim.step(4ms);
   }
   std::optional<double> Seen() const {
     return lift.seen ? std::optional{lift.seen->position_rot} : std::nullopt;
@@ -164,19 +175,35 @@ TEST_F(TargetTest, LaneFromBeforeTheModeChangeIsIgnored) {
   EXPECT_EQ(Seen(), 1.25);
 }
 
-TEST_F(TargetTest, LaneInTheSameDrainAsTheModeChangeIsAccepted) {
-  // Disabled: nothing drives, whatever the lanes say.
-  Mode(0);
-  sim.step(1ms);  // off the 5 ms grid the packets and ticks share
-  hw.set_driver_station(DsPacket(kTeleop));
-  // SimHardware forwards the mode-change packet at the end of this step,
-  // just after the node's tick, so it waits for the next drain.
-  sim.step(4ms);
-  // The operator interface derived this target from that same packet; it
-  // lands in the same drain.
+TEST_F(TargetTest, TargetQueuedBeforeTheModeChangeIsRejectedInTheSameDrain) {
+  Hold("teleop", 1.0, 20ms);
+  ASSERT_EQ(Seen(), 1.0);
+  const std::uint64_t teleop = DriverStationGeneration(sim);
+  ReenableBetweenTicks();
+  ASSERT_NE(DriverStationGeneration(sim), teleop);
+  // Said under the first teleop period and delivered in the same drain as
+  // the packet that starts the second: both are received at one instant,
+  // so only the generation tells them apart.
+  PublishTarget(sim, "lift", "teleop", Goal{2.0}, teleop);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), std::nullopt);
+  EXPECT_EQ(lift.source, "");
+}
+
+TEST_F(TargetTest, TargetOfTheNewGenerationIsAcceptedInTheSameDrain) {
+  ReenableBetweenTicks();
+  // The operator interface derived this target from the re-enabling packet;
+  // it lands in the same drain.
   PublishTarget(sim, "lift", "teleop", Goal{0.5});
   sim.step(5ms);
   EXPECT_EQ(Seen(), 0.5);
+}
+
+TEST_F(TargetTest, TargetFromAProducerWithNoModeIsRejected) {
+  // A producer whose Driver Station view is stale or disabled stamps 0.
+  PublishTarget(sim, "lift", "teleop", Goal{1.0}, 0);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), std::nullopt);
 }
 
 TEST_F(TargetTest, RobotDisabledIsNull) {
@@ -194,6 +221,53 @@ TEST_F(TargetTest, DriverStationLossIsNull) {
   hw.stop_driver_station();
   Hold("teleop", 1.0, 110ms);  // the producer keeps talking
   EXPECT_EQ(Seen(), std::nullopt);
+}
+
+TEST_F(TargetTest, SameModeRecoveryKeepsTheGeneration) {
+  Hold("teleop", 1.0, 20ms);
+  const std::uint64_t teleop = DriverStationGeneration(sim);
+  hw.stop_driver_station();
+  sim.step(150ms);
+  // While its view was stale the producer stamped 0.
+  PublishTarget(sim, "lift", "teleop", Goal{3.0}, 0);
+  // The link comes back with the Rio still enabled in teleop: the same
+  // generation, so the producer drives again as soon as it resends.
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);  // the lift has drained the returning packet
+  EXPECT_EQ(DriverStationGeneration(sim), teleop);
+  EXPECT_EQ(Seen(), std::nullopt);
+  Hold("teleop", 1.5, 5ms);
+  EXPECT_EQ(Seen(), 1.5);
+}
+
+TEST_F(TargetTest, ReattachStartsANewGenerationTheOldLaneCannotDrive) {
+  Hold("teleop", 1.0, 20ms);
+  const std::uint64_t teleop = DriverStationGeneration(sim);
+  ds::DriverStationData detached{};
+  detached.fms.flags = kTeleop;  // enabled bits latched, DS not attached
+  hw.set_driver_station(detached);
+  sim.step(10ms);
+  EXPECT_EQ(Seen(), std::nullopt);
+  Mode(kTeleop);
+  ASSERT_NE(DriverStationGeneration(sim), teleop);
+  // A producer that has not drained the re-attach yet resends the old word.
+  PublishTarget(sim, "lift", "teleop", Goal{1.0}, teleop);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), std::nullopt);
+  Hold("teleop", 1.25, 5ms);
+  EXPECT_EQ(Seen(), 1.25);
+}
+
+TEST_F(TargetTest, StaleHigherPriorityLaneFallsBackToTheNext) {
+  PublishTarget(sim, "lift", "align", Goal{2.0});
+  Hold("teleop", 1.0, 50ms);
+  EXPECT_EQ(Seen(), 2.0);
+  EXPECT_EQ(lift.source, "align");
+  // Auto-align stopped talking without a release; the driver gets control
+  // back once its lane is older than command_timeout_us.
+  Hold("teleop", 1.0, 60ms);
+  EXPECT_EQ(Seen(), 1.0);
+  EXPECT_EQ(lift.source, "teleop");
 }
 
 TEST_F(TargetTest, DisabledOrEStoppedDriverStationIsNull) {
@@ -243,6 +317,49 @@ TEST(TargetPolicy, SubsystemTargetsReplaceTheListedModes) {
   EXPECT_EQ(wrist.source, "auto");
 }
 
+// The lift's teleop lane comes from a topic of the config's choosing; its
+// align lane, and every other node's lanes, stay where they were. The
+// blind producer's Driver Station is remapped onto a topic nothing writes.
+constexpr const char* kRemapToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[robot.targets]
+teleop = ["align", "teleop"]
+
+[subsystems.lift.motors.m]
+can_id = 1
+[subsystems.lift.remap]
+"target/teleop" = "/left_lift/target/teleop"
+
+[subsystems.blind_producer.remap]
+"/hw/state/driver_station" = "/hw/state/driver_station_unplugged"
+)";
+
+TEST(TargetPolicy, RemapRedirectsOneLane) {
+  auto sim = Sim::FromToml(kRemapToml);
+  auto& lift = sim.add<Consumer<Goal>>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);
+
+  PublishTarget(sim, "lift", "teleop", Goal{1.0});
+  sim.step(5ms);
+  EXPECT_EQ(lift.seen, std::nullopt);  // not the lift's teleop lane any more
+  PublishTarget(sim, "left_lift", "teleop", Goal{2.0});
+  sim.step(5ms);
+  ASSERT_TRUE(lift.seen.has_value());
+  EXPECT_EQ(lift.seen->position_rot, 2.0);
+  EXPECT_EQ(lift.source, "teleop");
+  // Still the second priority: align, not remapped, preempts it.
+  PublishTarget(sim, "lift", "align", Goal{3.0});
+  PublishTarget(sim, "left_lift", "teleop", Goal{2.0});
+  sim.step(5ms);
+  EXPECT_EQ(lift.source, "align");
+}
+
 // A producer node writes the same envelopes the helpers do.
 struct Producer {
   explicit Producer(Node& node) : lane{node, "lift", "teleop"} {}
@@ -281,6 +398,61 @@ TEST(TargetLane, SendsAndReleasesTheEnvelope) {
   EXPECT_EQ(lift.seen, std::nullopt);
 }
 
+TEST(TargetLane, StampsTheGenerationItsNodeDrained) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Producer>("producer");
+  auto& lift = sim.add<Consumer<Goal>>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(20ms);
+  const std::uint64_t first = DriverStationGeneration(sim);
+  ASSERT_NE(first, 0u);
+  EXPECT_EQ(LatestTarget<Goal>(sim, "lift", "teleop")->mode_since_us(), first);
+
+  // Disabled: the producer keeps sending, stamped 0.
+  hw.set_driver_station(DsPacket(0));
+  sim.step(20ms);
+  EXPECT_EQ(LatestTarget<Goal>(sim, "lift", "teleop")->mode_since_us(), 0u);
+  EXPECT_EQ(lift.seen, std::nullopt);
+
+  // Re-enabled: a new generation, which the producer picks up on its own.
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(20ms);
+  const std::uint64_t second = DriverStationGeneration(sim);
+  EXPECT_NE(second, first);
+  EXPECT_EQ(LatestTarget<Goal>(sim, "lift", "teleop")->mode_since_us(), second);
+  ASSERT_TRUE(lift.seen.has_value());
+  EXPECT_EQ(lift.seen->position_rot, 0.75);
+}
+
+// A producer with its own lane, for the remapped config.
+struct BlindProducer {
+  explicit BlindProducer(Node& node) : lane{node, "lift", "align"} {}
+  void update() { lane.send(Goal{5.0}); }
+  TargetLane<Goal> lane;
+};
+
+TEST(TargetLane, AProducerThatSeesNoDriverStationNeverDrives) {
+  auto sim = Sim::FromToml(kRemapToml);
+  sim.add<BlindProducer>("blind_producer");
+  auto& lift = sim.add<Consumer<Goal>>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(50ms);
+  // The lift is enabled in teleop, and align is its first lane, fresh and
+  // active; but its producer never saw the mode it would be driving.
+  const auto envelope = LatestTarget<Goal>(sim, "lift", "align");
+  ASSERT_TRUE(envelope.has_value());
+  EXPECT_EQ(envelope->active, 1);
+  EXPECT_EQ(envelope->mode_since_us(), 0u);
+  EXPECT_EQ(lift.seen, std::nullopt);
+  PublishTarget(sim, "left_lift", "teleop", Goal{2.0});
+  sim.step(5ms);
+  EXPECT_EQ(lift.source, "teleop");
+}
+
 struct BadLane {
   explicit BadLane(Node& node) : lane{node, "lift", "Auto"} {}
   TargetLane<Goal> lane;
@@ -291,13 +463,27 @@ TEST(TargetLane, RejectsASourceThatIsNotATopicSegment) {
   EXPECT_THROW(sim.add<BadLane>("producer"), std::invalid_argument);
 }
 
-TEST(TargetEnvelope, BytesFollowTheAlignment) {
-  EXPECT_EQ(detail::TargetEnvelopeBytes(24, 8), 32u);
-  EXPECT_EQ(detail::TargetEnvelopeBytes(4, 4), 8u);
-  EXPECT_EQ(detail::TargetEnvelopeBytes(1, 1), 2u);
+TEST(TargetEnvelope, IsTheHeaderThenTheMessage) {
+  EXPECT_EQ(detail::TargetEnvelopeBytes(24, 8), 40u);
+  EXPECT_EQ(detail::TargetEnvelopeBytes(4, 4), 20u);
+  EXPECT_EQ(detail::TargetEnvelopeBytes(1, 1), 17u);
   EXPECT_THROW(detail::TargetEnvelopeBytes(12, 8), std::invalid_argument);
   EXPECT_THROW(detail::TargetEnvelopeBytes(16, 16), std::invalid_argument);
   EXPECT_THROW(detail::TargetEnvelopeBytes(8, 3), std::invalid_argument);
+
+  // The bytes EncodeTargetEnvelope writes are the struct's layout.
+  TargetEnvelope<Small> envelope{};
+  const Small message{1.5f};
+  detail::EncodeTargetEnvelope(0x0102030405060708u, true, &message,
+                               sizeof message, alignof(Small),
+                               std::as_writable_bytes(std::span{&envelope, 1}));
+  EXPECT_EQ(envelope.mode_since_us(), 0x0102030405060708u);
+  EXPECT_EQ(envelope.active, 1);
+  EXPECT_EQ(envelope.message.speed_rps, 1.5f);
+  const auto header = detail::DecodeTargetEnvelopeHeader(
+      std::as_bytes(std::span{&envelope, 1}).data());
+  EXPECT_EQ(header.mode_since_us, 0x0102030405060708u);
+  EXPECT_TRUE(header.active);
 }
 
 }  // namespace
