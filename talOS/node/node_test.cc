@@ -108,8 +108,7 @@ TEST(Node, ReadsArrayParamsAndNamesTheOffendingElement) {
   EXPECT_EQ(node.param<Strings>("none"), Strings{});
   EXPECT_EQ(node.param<Doubles>("none"), Doubles{});
   // A present array wins over the fallback, even an empty one.
-  EXPECT_EQ(node.param<Strings>("cameras", {"x"}),
-            (Strings{"front", "back"}));
+  EXPECT_EQ(node.param<Strings>("cameras", {"x"}), (Strings{"front", "back"}));
   EXPECT_EQ(node.param<Doubles>("none", {9.0}), Doubles{});
   EXPECT_EQ(node.param<Strings>("absent", {"x"}), Strings{"x"});
   EXPECT_EQ(node.param<Doubles>("absent", {}), Doubles{});

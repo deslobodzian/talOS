@@ -143,8 +143,8 @@ TEST_F(NodeApi, ListParamsComeBackAsCountedArrays) {
   ASSERT_NE(node, nullptr) << talos_last_error();
 
   TalosParam p{};
-  for (int32_t kind : {TALOS_PARAM_STRING_LIST, TALOS_PARAM_LIST,
-                       TALOS_PARAM_ANY}) {
+  for (int32_t kind :
+       {TALOS_PARAM_STRING_LIST, TALOS_PARAM_LIST, TALOS_PARAM_ANY}) {
     ASSERT_EQ(talos_node_param(node, "cameras", kind, 1, &p), 1)
         << talos_last_error();
     EXPECT_EQ(p.kind, TALOS_PARAM_STRING_LIST);
@@ -152,8 +152,8 @@ TEST_F(NodeApi, ListParamsComeBackAsCountedArrays) {
     EXPECT_STREQ(p.strings[0], "front");
     EXPECT_STREQ(p.strings[1], "back");
   }
-  for (int32_t kind : {TALOS_PARAM_DOUBLE_LIST, TALOS_PARAM_LIST,
-                       TALOS_PARAM_ANY}) {
+  for (int32_t kind :
+       {TALOS_PARAM_DOUBLE_LIST, TALOS_PARAM_LIST, TALOS_PARAM_ANY}) {
     ASSERT_EQ(talos_node_param(node, "offsets_m", kind, 1, &p), 1)
         << talos_last_error();
     EXPECT_EQ(p.kind, TALOS_PARAM_DOUBLE_LIST);
