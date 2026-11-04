@@ -223,6 +223,7 @@ period_us = 5000
 [studio]
 bridge = "//example/studio:bridge"
 http_port = 8080
+topic = "/talos/telemetry"
 
 [subsystems.alpha]
 node = "//example/alpha:node"
@@ -257,11 +258,10 @@ can_id = 1
 }
 
 TEST(LauncherTest, StudioBridgeWatchTopicFollowsDescribe) {
-  // No description: the config's telemetry topic, else the default.
+  // No description: the config's studio topic, else the default.
   config::RobotConfig robot;
   EXPECT_EQ(StudioBridgeWatchTopic({}, robot), "/talos/telemetry");
-  robot.toml_data =
-      toml::parse("[subsystems.telemetry]\ntopic = \"/config/telemetry\"\n");
+  robot.studio.topic = "/config/telemetry";
   EXPECT_EQ(StudioBridgeWatchTopic({}, robot), "/config/telemetry");
 
   // The bridge's own WATCHER wins, tracking a topic override.
@@ -1048,10 +1048,10 @@ TEST(LauncherGraphTest, AGraphReaderIsDescribedAgainWithTheOtherNodesGraph) {
                  WriteStubNode("graph_alpha",
                                DescribingStub("alpha", "//example/alpha:node",
                                               {Sender("/alpha/state")}))};
-  NodeSpec gamma{"gamma", "//example/gamma:node",
-                 WriteStubNode("graph_gamma",
-                               GraphReaderStub("gamma", "//example/gamma:node",
-                                               record))};
+  NodeSpec gamma{
+      "gamma", "//example/gamma:node",
+      WriteStubNode("graph_gamma",
+                    GraphReaderStub("gamma", "//example/gamma:node", record))};
   LauncherOptions options;
   options.describe_timeout_ms = 4000;
   options.output_dir = TempPath("graph_reader_out");
@@ -1067,8 +1067,8 @@ TEST(LauncherGraphTest, AGraphReaderIsDescribedAgainWithTheOtherNodesGraph) {
   // The graph it was handed: alpha, every byte of its schema, and not gamma.
   introspect::DeclaredGraph graph;
   std::string error;
-  ASSERT_TRUE(introspect::DescribeReader::ParseGraph(ReadFile(record + "/graph"),
-                                                     graph, error))
+  ASSERT_TRUE(introspect::DescribeReader::ParseGraph(
+      ReadFile(record + "/graph"), graph, error))
       << error;
   ASSERT_EQ(graph.size(), 1u);
   EXPECT_EQ(graph[0].name, "alpha");

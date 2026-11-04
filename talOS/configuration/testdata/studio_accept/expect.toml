@@ -1,0 +1,3 @@
+accept = true
+nodes = ["//a:node"]
+files = ["a.toml"]

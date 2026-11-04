@@ -1,0 +1,2 @@
+# Empty 'pose_topic' in [studio] table when present.
+accept = false

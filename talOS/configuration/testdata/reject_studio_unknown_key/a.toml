@@ -1,0 +1,6 @@
+[subsystem]
+name = "a"
+node = "//a:node"
+
+[motors.m]
+can_id = 1

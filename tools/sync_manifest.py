@@ -57,6 +57,30 @@ def _join(base_dir, rel, where):
 
 _TOP_LEVEL_KEYS = ("include", "robot", "studio", "subsystems")
 _ENTRY_KEYS = ("name", "path", "node", "defaults")
+_STUDIO_KEYS = ("bridge", "webroot", "http_port", "topic", "pose_topic")
+
+
+def _check_studio(studio, where):
+    if not isinstance(studio, dict):
+        raise ManifestError(f"{where}: [studio] must be a table")
+    for key in studio:
+        if key not in _STUDIO_KEYS:
+            raise ManifestError(f"{where}: [studio] unknown key '{key}'")
+    if "topic" not in studio:
+        raise ManifestError(f"{where}: [studio] missing required key 'topic'")
+    _non_empty(studio, "topic", "[studio]")
+    if "bridge" in studio:
+        _non_empty(studio, "bridge", "[studio]")
+    if "webroot" in studio:
+        _non_empty(studio, "webroot", "[studio]")
+    if "pose_topic" in studio:
+        _non_empty(studio, "pose_topic", "[studio]")
+    if "http_port" in studio:
+        port = studio["http_port"]
+        if (not isinstance(port, int) or isinstance(port, bool) or
+                port < 1 or port > 65535):
+            raise ManifestError(
+                "[studio] field 'http_port' must be a port in [1, 65535]")
 
 
 def _non_empty(table, key, where):
@@ -240,6 +264,8 @@ def effective(root, config, overrides=None, available=None):
                 base["subsystems"] = reader.expand(base_subs, include)
         _merge_tables(base, doc)
         doc = base
+    if "studio" in doc:
+        _check_studio(doc["studio"], config)
     if isinstance(doc.get("subsystems"), list):
         doc["subsystems"] = reader.expand(doc["subsystems"], config)
     subs = doc.get("subsystems")

@@ -603,10 +603,10 @@ inline std::vector<naming::Diagnostic> LintParameterUnits(
 // directory.
 inline std::string DeclaredGraphPath(const LauncherOptions& options) {
   const std::filesystem::path dir =
-      options.output_dir.empty() ? std::filesystem::temp_directory_path() /
-                                       ("talos_describe_" +
-                                        std::to_string(::getpid()))
-                                 : std::filesystem::path{options.output_dir};
+      options.output_dir.empty()
+          ? std::filesystem::temp_directory_path() /
+                ("talos_describe_" + std::to_string(::getpid()))
+          : std::filesystem::path{options.output_dir};
   return (dir / "declared_graph.json").string();
 }
 
@@ -651,8 +651,8 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
     described.target = spec.target;
     described.binary_path = spec.binary_path;
     probe(spec, described, "");
-    any_reader = any_reader ||
-                 (described.answered && described.declared.reads_graph);
+    any_reader =
+        any_reader || (described.answered && described.declared.reads_graph);
     out.push_back(std::move(described));
   }
 
@@ -937,14 +937,14 @@ inline bool ShouldRetryStudioBridge(
 }
 
 // The topic the bridge watches: what it described (its --describe reads the
-// same `[subsystems.telemetry] topic` key the telemetry node publishes on), or
-// that key itself when the bridge did not answer.
+// `[studio] topic` key the telemetry node publishes on), or that key itself
+// when the bridge did not answer.
 inline std::string StudioBridgeWatchTopic(
     const std::vector<NodeDescription>& described,
     const config::RobotConfig& robot_config) {
-  std::string topic =
-      robot_config.toml_data["subsystems"]["telemetry"]["topic"].value_or(
-          std::string{"/talos/telemetry"});
+  std::string topic = robot_config.studio.topic.empty()
+                          ? std::string{"/talos/telemetry"}
+                          : robot_config.studio.topic;
   for (const auto& node : described) {
     if (!node.answered || node.declared.name != kStudioBridgeName) continue;
     for (const auto& source : node.declared.sources) {

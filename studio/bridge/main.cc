@@ -195,7 +195,9 @@ int main(int argc, char** argv) try {
     if (config_path != nullptr) {
       try {
         const auto robot = talos::config::ParseRobotConfig(config_path);
-        if (const auto* tbl = robot.GetSubsystemTable("telemetry")) {
+        if (!robot.studio.topic.empty()) {
+          topic = robot.studio.topic;
+        } else if (const auto* tbl = robot.GetSubsystemTable("telemetry")) {
           if (auto node = (*tbl)["topic"]) {
             if (auto val = node.value<std::string_view>();
                 val && !val->empty()) {

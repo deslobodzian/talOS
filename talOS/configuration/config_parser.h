@@ -411,7 +411,11 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     }
   }
 
-  if (auto* studio = tbl["studio"].as_table()) {
+  if (tbl.contains("studio")) {
+    auto* studio = tbl["studio"].as_table();
+    if (!studio) {
+      throw std::invalid_argument("[studio] must be a table");
+    }
     auto& s = result.studio;
     for (auto&& [k, v] : *studio) {
       if (k.str() != "bridge" && k.str() != "webroot" &&

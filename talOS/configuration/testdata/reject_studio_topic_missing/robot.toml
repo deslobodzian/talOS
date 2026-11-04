@@ -1,0 +1,6 @@
+[studio]
+bridge = "//studio/bridge:studio_bridge"
+
+[[subsystems]]
+name = "a"
+path = "a.toml"
