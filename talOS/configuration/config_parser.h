@@ -428,6 +428,12 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     auto* sub_tbl = sub_val.as_table();
     if (!sub_tbl) continue;
     result.subsystems[sub_name].subsystem = sub_name;
+    // The launcher starts a subsystem's `node`; a malformed one must not
+    // silently leave the subsystem without a process.
+    if (sub_tbl->contains("node")) {
+      detail::ReadNonEmpty(*sub_tbl, "node", "",
+                           ("[subsystems." + sub_name + "]").c_str());
+    }
     TargetPolicy& policy = result.subsystem_targets[sub_name] = result.targets;
     if (sub_tbl->contains("targets")) {
       const auto* targets = (*sub_tbl)["targets"].as_table();

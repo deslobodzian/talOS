@@ -1,0 +1,8 @@
+[subsystems.a]
+node = "//a:node"
+
+[subsystems.b]
+period_us = 1
+
+[subsystems.b.motors.m]
+can_id = 1

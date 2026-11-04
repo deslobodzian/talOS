@@ -1,0 +1,16 @@
+# Bundle relocation case for //2026-robot/main_processor:bundle_test: a config
+# one directory away from the competition config it builds on, using every
+# way a config reaches another file. Not a robot configuration.
+include = "../configuration/robot.toml"
+
+# A custom path outside subsystems/, layered over a parent-directory
+# defaults file (the competition shooter), so CAN ids and gains come from it.
+[[subsystems]]
+name = "shooter"
+path = "mechanisms/shooter.toml"
+defaults = "../configuration/subsystems/shooter.toml"
+
+# An entry-level node override merged into the included entry by name.
+[[subsystems]]
+name = "intake"
+node = "//2026-robot/main_processor/intake:node"

@@ -1,0 +1,5 @@
+[subsystems.a]
+node = 3
+
+[subsystems.a.motors.m]
+can_id = 1

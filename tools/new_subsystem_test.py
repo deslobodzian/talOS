@@ -6,6 +6,15 @@ import unittest
 
 from tools import new_subsystem
 
+GOLDEN_FILEGROUP = """
+# Golden copy of //tools:new_subsystem output; only this target is not generated.
+filegroup(
+    name = "golden",
+    srcs = glob(["**"]),
+    visibility = ["//tools:__pkg__"],
+)
+"""
+
 
 class NewSubsystemTest(unittest.TestCase):
     def test_check_name_accepts_valid_names_and_rejects_invalid_ones(self):
@@ -51,6 +60,18 @@ class NewSubsystemTest(unittest.TestCase):
                         '[motors.flywheel]\ncan_id = 1\n')
             with open(os.path.join(cfg, "BUILD"), "w", encoding="utf-8") as f:
                 f.write('exports_files(glob(["subsystems/*.toml"]))\n')
+            # A config including robot.toml goes stale with it; one that does
+            # not must be left alone.
+            for path, text in (
+                    ("practice/BUILD", ""),
+                    ("practice/robot.toml", 'include = "../configuration/robot.toml"\n'),
+                    ("practice/robot_manifest.bzl", ""),
+                    ("other/BUILD", ""),
+                    ("other/robot.toml", '[subsystems.x]\nnode = "//x:node"\n'),
+                    ("other/robot_manifest.bzl", "")):
+                os.makedirs(os.path.dirname(os.path.join(proc, path)), exist_ok=True)
+                with open(os.path.join(proc, path), "w", encoding="utf-8") as f:
+                    f.write(text)
 
             writes, can_id = new_subsystem.plan(root, "custom-bot", "wrist", "cpp")
             self.assertEqual(can_id, 2)
@@ -88,23 +109,99 @@ class NewSubsystemTest(unittest.TestCase):
             # The robot had no manifest yet, so it is written as a new file.
             self.assertIn((os.path.join(cfg, "robot_manifest.bzl"), None, manifest),
                           writes)
+            practice = "custom-bot/main_processor/practice/robot_manifest.bzl"
+            self.assertEqual(
+                sorted(p for p in by_rel if p.endswith(".bzl")),
+                ["custom-bot/main_processor/configuration/robot_manifest.bzl",
+                 practice])
+            self.assertIn('    "//custom-bot/main_processor/wrist:node",\n',
+                          by_rel[practice])
 
-    def test_plan_standalone_generates_self_contained_bzlmod_repo(self):
+    def test_plan_sees_inherited_subsystems_and_can_ids(self):
+        # Ids and names reach robot.toml only through an include, a custom
+        # path outside subsystems/ and a parent-directory defaults file.
+        files = {
+            "bot/main_processor/configuration/BUILD": "",
+            "bot/main_processor/configuration/robot.toml":
+                'include = "base.toml"\n',
+            "bot/main_processor/configuration/base.toml":
+                '[[subsystems]]\nname = "shooter"\npath = "mech/shooter.toml"\n'
+                'defaults = "../../shared/shooter_defaults.toml"\n\n'
+                '[[subsystems]]\nname = "feeder"\npath = "mech/feeder.toml"\n',
+            "bot/main_processor/configuration/mech/shooter.toml":
+                '[subsystem]\nname = "shooter"\n',
+            "bot/main_processor/configuration/mech/feeder.toml":
+                '[subsystem]\nname = "feeder"\nnode = "//f:node"\n'
+                '[motors.feed]\ncan_id = 2\n',
+            "bot/shared/BUILD": "",
+            "bot/shared/shooter_defaults.toml":
+                '[subsystem]\nname = "shooter"\nnode = "//s:node"\n'
+                '[motors.flywheel]\ncan_id = 1\n',
+        }
+        with tempfile.TemporaryDirectory() as root:
+            for path, text in files.items():
+                os.makedirs(os.path.dirname(os.path.join(root, path)),
+                            exist_ok=True)
+                with open(os.path.join(root, path), "w", encoding="utf-8") as f:
+                    f.write(text)
+            _, can_id = new_subsystem.plan(root, "bot", "wrist", "py")
+            self.assertEqual(can_id, 3)
+            for inherited in ("shooter", "feeder"):
+                with self.assertRaises(new_subsystem.Refused):
+                    new_subsystem.plan(root, "bot", inherited, "py")
+
+    def test_plan_standalone_builds_against_this_checkout(self):
+        # A generated repo must build as written: it points @talos at the
+        # checkout it came from and takes its C++23 flags and Bazel version.
         with tempfile.TemporaryDirectory() as tmp:
-            target = os.path.join(tmp, "talos-wrist")
-            writes = new_subsystem.plan_standalone(target, "wrist", "cpp")
+            talos = os.path.join(tmp, "src", "talOS")
+            os.makedirs(talos)
+            for config, text in ((".bazelrc", "build --cxxopt=-std=c++23\n"),
+                                 (".bazelversion", "8.6.0\n")):
+                with open(os.path.join(talos, config), "w",
+                          encoding="utf-8") as f:
+                    f.write(text)
+            target = os.path.join(tmp, "repos", "wrist")
+            writes = new_subsystem.plan_standalone(target, "wrist", "cpp",
+                                                   talos)
             by_rel = {
                 os.path.relpath(path, target).replace(os.sep, "/"): content
                 for path, _, content in writes
             }
-            self.assertIn("MODULE.bazel", by_rel)
-            self.assertIn('module(name = "wrist"', by_rel["MODULE.bazel"])
-            self.assertIn('bazel_dep(name = "talos"', by_rel["MODULE.bazel"])
-            self.assertIn("defaults.toml", by_rel)
-            self.assertIn('node = "@wrist//:node"', by_rel["defaults.toml"])
-            self.assertNotIn("can_id =", by_rel["defaults.toml"])
-            self.assertIn("@talos//talOS/build:contract.bzl", by_rel["BUILD"])
-            self.assertIn('exports_files(["defaults.toml"])', by_rel["BUILD"])
+            self.assertIn(
+                'local_path_override(module_name = "talos", '
+                'path = "../../src/talOS")', by_rel["MODULE.bazel"])
+            self.assertEqual(by_rel[".bazelrc"], "build --cxxopt=-std=c++23\n")
+            self.assertEqual(by_rel[".bazelversion"], "8.6.0\n")
+            # Loads stay first; every talOS label names the @talos module.
+            build = by_rel["BUILD"]
+            self.assertTrue(build.startswith("load("))
+            self.assertNotIn('"//talOS', build)
+
+    def test_generated_packages_match_the_built_golden_packages(self):
+        # tools/scaffold_testdata holds the generator's output, built and
+        # tested by `bazel test //...`: the templates compile and their
+        # tests pass only while this equality holds. Each golden BUILD adds
+        # one filegroup, which hands the files to this test.
+        for name, lang in (("gripper", "cpp"), ("scaffold_py", "py")):
+            golden = os.path.join("tools", "scaffold_testdata", name)
+            on_disk = {}
+            for directory, _, files in os.walk(golden):
+                for f in files:
+                    path = os.path.join(directory, f)
+                    with open(path, encoding="utf-8") as text:
+                        on_disk[os.path.relpath(path, golden).replace(
+                            os.sep, "/")] = text.read()
+            generated = new_subsystem.package_files(name, lang)
+            generated["BUILD"] += GOLDEN_FILEGROUP
+            with self.subTest(name):
+                self.assertEqual(sorted(on_disk), sorted(generated))
+                for path, content in generated.items():
+                    self.assertEqual(
+                        on_disk[path], content,
+                        f"{golden}/{path} differs from the generator's "
+                        f"output, new_subsystem.package_files({name!r}, "
+                        f"{lang!r}) (plus the golden filegroup in BUILD)")
 
     def test_position_archetype_generates_motion_magic_for_cpp_and_python(self):
         cpp_files = new_subsystem.package_files("wrist", "cpp", kind="position")

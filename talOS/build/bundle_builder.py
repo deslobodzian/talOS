@@ -107,26 +107,26 @@ def main():
     def staged(entry):
         return os.path.relpath(entry["short_path"], common).replace(os.sep, "/")
 
-    config_rel = "config/" + staged(config)
-    safe_copy(config["src_path"], os.path.join(out_dir, config_rel))
-
-    # Config identity: sha256 over the robot config plus every file it reads,
-    # paths mixed in so a move is an identity change. Stored in the manifest
-    # so a session can say exactly which configuration it ran.
-    config_hash = hashlib.sha256()
-    with open(os.path.join(out_dir, config_rel), "rb") as f:
-        config_hash.update(f.read())
+    # Config identity (config_sha256): sha256 over every staged file, the
+    # robot config included, each as its config/-relative path, its length and
+    # its bytes, sorted by path. Absolute and workspace locations never
+    # participate, so relocating the tree (or the bundle) keeps the identity;
+    # renaming or moving any file relative to the others, the root config
+    # too, changes it. Stored in the manifest so a session can say exactly
+    # which configuration it ran.
     staged_bytes = {}
-    for entry in config_files:
+    for entry in [config] + config_files:
         rel = staged(entry)
         dest = os.path.join(config_dir, rel)
         safe_copy(entry["src_path"], dest)
         with open(dest, "rb") as f:
             staged_bytes[rel] = f.read()
+    config_rel = "config/" + staged(config)
+    config_hash = hashlib.sha256()
     for rel in sorted(staged_bytes):
-        config_hash.update(rel.encode("utf-8"))
-        config_hash.update(b"\x00")
-        config_hash.update(staged_bytes[rel])
+        content = staged_bytes[rel]
+        config_hash.update(f"{rel}\0{len(content)}\0".encode("utf-8"))
+        config_hash.update(content)
     config_sha256 = config_hash.hexdigest()
 
     # 4. Nodes. A Python node's runfiles carry libtalos_node.so (a data

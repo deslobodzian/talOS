@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #include "config_parser.h"
 
@@ -583,6 +585,77 @@ defaults = "subsystems/mech_defaults.toml"
   EXPECT_EQ((*mech_tbl)["period_us"].value_or(0), 20000);
   EXPECT_DOUBLE_EQ((*mech_tbl)["feed_volts"].value_or(0.0), 8.0);
   EXPECT_DOUBLE_EQ((*mech_tbl)["hold_volts"].value_or(0.0), 1.5);
+}
+
+// talOS/configuration/testdata: each case is a config tree plus expect.toml
+// (`config`, default "robot.toml"; `accept`; `nodes`; `files`, every file the
+// config reads besides itself). //tools:sync_manifest_test runs the same
+// cases, so the parser and the Bazel manifest cannot disagree untested.
+namespace fs = std::filesystem;
+
+std::vector<std::string> Strings(const toml::table& t, const char* key) {
+  std::vector<std::string> out;
+  if (const auto* arr = t[key].as_array()) {
+    for (auto&& v : *arr) out.emplace_back(*v.value<std::string>());
+  }
+  return out;
+}
+
+std::vector<std::string> Nodes(const RobotConfig& cfg) {
+  std::vector<std::string> out;
+  for (auto&& [name, sub] : *cfg.toml_data["subsystems"].as_table()) {
+    if (auto node = (*sub.as_table())["node"].value<std::string>()) {
+      out.push_back(*node);
+    }
+  }
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+
+TEST(ConfigTest, SharedResolutionCases) {
+  const fs::path testdata = "talOS/configuration/testdata";
+  int cases = 0;
+  for (const auto& dir : fs::directory_iterator(testdata)) {
+    ++cases;
+    const std::string name = dir.path().filename().string();
+    SCOPED_TRACE(name);
+    const toml::table expect =
+        toml::parse_file((dir.path() / "expect.toml").string());
+    const std::string config = expect["config"].value_or("robot.toml");
+    // A private copy, so files can be deleted to prove which are read.
+    const fs::path copy = fs::path(::testing::TempDir()) / "cases" / name;
+    fs::remove_all(copy);
+    fs::create_directories(copy);
+    fs::copy(dir.path(), copy, fs::copy_options::recursive);
+    const std::string path = (copy / config).string();
+    if (!expect["accept"].value_or(false)) {
+      EXPECT_THROW(ParseRobotConfig(path), std::invalid_argument);
+      continue;
+    }
+    EXPECT_EQ(Nodes(ParseRobotConfig(path)), Strings(expect, "nodes"));
+
+    const auto files = Strings(expect, "files");
+    // Every listed file is read: without it the config does not load.
+    for (const auto& file : files) {
+      const fs::path saved = copy / (file + ".saved");
+      fs::rename(copy / file, saved);
+      EXPECT_THROW(ParseRobotConfig(path), std::invalid_argument) << file;
+      fs::rename(saved, copy / file);
+    }
+    // No other file is read: the config loads with all of them gone.
+    std::vector<fs::path> others;
+    for (const auto& f : fs::recursive_directory_iterator(copy)) {
+      const std::string rel = fs::relative(f.path(), copy).generic_string();
+      if (f.is_regular_file() && rel != config && rel != "expect.toml" &&
+          std::find(files.begin(), files.end(), rel) == files.end()) {
+        others.push_back(f.path());
+      }
+    }
+    for (const auto& f : others) fs::remove(f);
+    EXPECT_EQ(Nodes(ParseRobotConfig(path)), Strings(expect, "nodes"));
+  }
+  EXPECT_GT(cases, 0);
 }
 
 }  // namespace

@@ -1,0 +1,15 @@
+[robot]
+period_us = 10000
+
+[[subsystems]]
+name = "intake"
+path = "subsystems/intake.toml"
+
+[[subsystems]]
+name = "arm"
+path = "subsystems/arm.toml"
+
+[[subsystems]]
+name = "wrist"
+path = "subsystems/wrist.toml"
+defaults = "../shared/wrist_defaults.toml"

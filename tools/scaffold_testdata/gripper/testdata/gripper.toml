@@ -1,0 +1,9 @@
+[subsystem]
+name = "gripper"
+period_us = 20000
+
+[motors.gripper_motor]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }

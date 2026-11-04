@@ -1,0 +1,5 @@
+[subsystem]
+name = "a"
+
+[motors.m]
+can_id = 1

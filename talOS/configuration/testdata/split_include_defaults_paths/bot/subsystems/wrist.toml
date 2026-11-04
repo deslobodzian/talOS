@@ -1,0 +1,4 @@
+[subsystem]
+name = "wrist"
+node = "//bot/wrist:file"
+defaults = "wrist_local.toml"

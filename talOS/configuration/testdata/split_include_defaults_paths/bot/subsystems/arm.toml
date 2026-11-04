@@ -1,0 +1,3 @@
+[subsystem]
+name = "arm"
+node = "//bot/arm:unused"

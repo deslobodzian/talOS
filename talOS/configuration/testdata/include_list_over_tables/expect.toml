@@ -1,0 +1,4 @@
+# A list child replaces an included single-file [subsystems] view.
+accept = true
+nodes = ["//c:node"]
+files = ["base.toml", "c.toml"]

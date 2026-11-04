@@ -68,16 +68,29 @@ class BundleBuilderTest(unittest.TestCase):
                 os.path.join(out, "config/subsystems/arm.toml")))
             self.assertIn('config_path = "config/robot.toml"', manifest)
 
-    def test_identity_changes_with_a_file_path(self):
+    def test_identity_is_relative_paths_and_contents(self):
         def sha(files):
             with tempfile.TemporaryDirectory() as tmp:
                 _, manifest = self.build(tmp, files)
             return next(line for line in manifest.splitlines()
                         if line.startswith("config_sha256"))
         base = {"c/robot.toml": "[robot]\n", "c/subsystems/a.toml": "x\n"}
-        moved = {"c/robot.toml": "[robot]\n", "c/other/a.toml": "x\n"}
-        self.assertNotEqual(sha(base), sha(moved))
-        self.assertEqual(sha(base), sha(dict(base)))
+        # Relocating the whole tree keeps the identity.
+        self.assertEqual(sha(base), sha({
+            "elsewhere/deep/robot.toml": "[robot]\n",
+            "elsewhere/deep/subsystems/a.toml": "x\n"}))
+        for changed in (
+                {"c/robot.toml": "[robot]\n", "c/other/a.toml": "x\n"},
+                # Only the root config renamed.
+                {"c/practice.toml": "[robot]\n", "c/subsystems/a.toml": "x\n"},
+                # Only the root config moved relative to its dependency.
+                {"c/robots/robot.toml": "[robot]\n",
+                 "c/subsystems/a.toml": "x\n"},
+                {"c/robot.toml": "[robot]\n", "c/subsystems/a.toml": "y\n"},
+                # Bytes moved across a file boundary.
+                {"c/robot.toml": "[robot]\nx\n", "c/subsystems/a.toml": ""}):
+            with self.subTest(changed):
+                self.assertNotEqual(sha(base), sha(changed))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,15 @@
+namespace scaffold_py;
+
+// What a producer asks for on its lane, /scaffold_py/target/<source>. The node
+// drives the motor only while the robot is enabled and a lane of its target
+// policy is live.
+struct ScaffoldPyTarget {
+  velocity_rps:double;
+}
+
+// What the scaffold_py is doing, published every tick.
+struct ScaffoldPyState {
+  enabled:bool;
+  velocity_rps:double;
+  connected:bool;
+}

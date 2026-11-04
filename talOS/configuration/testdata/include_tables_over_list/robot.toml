@@ -1,0 +1,7 @@
+include = "base.toml"
+
+[subsystems.b]
+node = "//b:child"
+
+[subsystems.a]
+period_us = 1

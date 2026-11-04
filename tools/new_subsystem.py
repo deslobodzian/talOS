@@ -1,14 +1,19 @@
 """Scaffolds a talos subsystem: a node package plus its robot wiring.
 
     bazel run //tools:new_subsystem -- <name> --lang cpp|py \\
-        [--robot 2026-robot] [--dry-run]
+        [--robot 2026-robot] [--standalone DIR] [--dry-run]
 
 Writes <robot>/main_processor/<name>/ (messages, node, Sim test, testdata),
 modelled on that robot's shooter (C++) and intake (Python) packages, then adds
 configuration/subsystems/<name>.toml and its [[subsystems]] entry in
 configuration/robot.toml, and regenerates configuration/robot_manifest.bzl
-(//tools:sync_manifest), which the bundle and graph test read. Everything is
-checked before anything is written, so a refused run leaves the tree untouched.
+(//tools:sync_manifest), which the bundle and graph test read, plus the
+manifest of every other config in the robot that includes robot.toml.
+Names and CAN ids already taken are read from the effective config, so a
+subsystem inherited through `include`, `defaults` or a custom `path` counts.
+Everything is checked before anything is written, so a refused run leaves the
+tree untouched. --standalone writes the package as its own Bzlmod repository
+in DIR instead, building against this checkout.
 """
 
 import argparse
@@ -254,8 +259,9 @@ namespace @NAME@ {
 // onboard.
 //
 // Nothing asks yet. A teleop or autonomous producer writes its own lane,
-// /@NAME@/target/<source>, with talos::TargetLane; talos::Target picks the
-// live lane by the policy in [robot.targets] or the subsystem's [targets].
+// /@NAME@/target/<source>, with talos::TargetLane; talos::Target
+// picks the live lane by the policy in [robot.targets] or the subsystem's
+// [targets].
 class @PASCAL@ {
  public:
   using Target = @PASCAL@Target;
@@ -803,7 +809,8 @@ period_us = @PERIOD@
 [motors.@NAME@_motor]
 type = "TalonFX"
 bus = "rio"
-# PLACEHOLDER: the lowest id no other subsystem file uses, not the motor's.
+# PLACEHOLDER: the lowest id the robot config does not use yet, not the
+# motor's.
 # Replace it with the physical CAN id before the robot drives this motor.
 can_id = @CAN_ID@
 # Flip `inverted` if a positive velocity turns the mechanism the wrong way;
@@ -836,8 +843,8 @@ bazel_dep(name = "talos", version = "0.1.0")
 
 STANDALONE_DEFAULTS_TOML = """\
 # @PASCAL@ subsystem defaults, shipped by the @@NAME@ repository.
-# A robot manifest layers its own overrides (physical CAN ids, inversions, and
-# tuned slot0 gains) on top of this file via `defaults = ...`.
+# The robot's own subsystem file starts as a copy of this one, with the
+# motor's physical can_id added; inversions and tuned slot0 gains go there.
 [subsystem]
 name = "@NAME@"
 node = "@@NAME@//:node"
@@ -875,9 +882,6 @@ def package_files(name, lang, standalone=False, kind="velocity"):
         data = ["testdata/robot.toml", f"testdata/{name}.toml", ":node"]
         build = fill(CC_BUILD, MESSAGES=messages,
                      DATA="[\n" + string_list(data, 4), **values)
-        if standalone:
-            build = build.replace('"//talOS/', '"@talos//talOS/')
-            build = ('exports_files(["defaults.toml"])\n\n' + build)
         hdr_template = CC_POSITION_HEADER if kind == "position" else CC_HEADER
         cc_test = fill(CC_TEST, INCLUDES=includes(test_includes), **values)
         if kind == "position":
@@ -909,9 +913,6 @@ def package_files(name, lang, standalone=False, kind="velocity"):
             for module in sorted(imports, key=str.lower))
         build = fill(PY_BUILD, MESSAGES=messages,
                      DATA="[\n" + string_list(data, 4), **values)
-        if standalone:
-            build = build.replace('"//talOS/', '"@talos//talOS/')
-            build = ('exports_files(["defaults.toml"])\n\n' + build)
         node_template = PY_POSITION_NODE if kind == "position" else PY_NODE
         py_test = fill(PY_TEST, FROM_IMPORTS=from_imports, **values)
         if kind == "position":
@@ -926,6 +927,12 @@ def package_files(name, lang, standalone=False, kind="velocity"):
             "testdata/robot.toml": fill(PY_TESTDATA_ROBOT, **values),
         })
     if standalone:
+        # talOS labels name the @talos module; the repo root is the package,
+        # so defaults.toml is exported after the loads.
+        loads, _, rest = files["BUILD"].replace(
+            '"//talOS/', '"@talos//talOS/').partition("\n\n")
+        files["BUILD"] = (loads + '\n\nexports_files(["defaults.toml"])\n\n'
+                          + rest)
         extra_deps = (
             'bazel_dep(name = "rules_cc", version = "0.2.18")\n'
             'bazel_dep(name = "googletest", version = "1.17.0.bcr.2")\n'
@@ -943,8 +950,9 @@ def includes(paths):
     return "\n".join(f'#include "{path}"' for path in sorted(paths))
 
 
-def used_can_ids(configuration):
-    """Every can_id in the robot's manifest and subsystem files."""
+def used_can_ids(subsystems):
+    """Every can_id in the effective [subsystems] view: inherited through
+    `include`, layered from `defaults` files, read from custom `path`s."""
     ids = set()
 
     def walk(value):
@@ -958,24 +966,8 @@ def used_can_ids(configuration):
             for item in value:
                 walk(item)
 
-    paths = [os.path.join(configuration, "robot.toml")]
-    subsystems = os.path.join(configuration, "subsystems")
-    if os.path.isdir(subsystems):
-        paths += [os.path.join(subsystems, f)
-                  for f in sorted(os.listdir(subsystems)) if f.endswith(".toml")]
-    for path in paths:
-        with open(path, "rb") as f:
-            walk(tomllib.load(f))
+    walk(subsystems)
     return ids
-
-
-def manifest_names(robot_toml):
-    with open(robot_toml, "rb") as f:
-        doc = tomllib.load(f)
-    subsystems = doc.get("subsystems", [])
-    if isinstance(subsystems, dict):  # single-file [subsystems.<name>] form
-        return set(subsystems)
-    return {entry.get("name") for entry in subsystems}
 
 
 def plan(root, robot, name, lang, kind="velocity"):
@@ -993,10 +985,15 @@ def plan(root, robot, name, lang, kind="velocity"):
         raise Refused(f"{rel(root, package)} already exists")
     if os.path.exists(subsystem_toml):
         raise Refused(f"{rel(root, subsystem_toml)} already exists")
-    if name in manifest_names(robot_toml):
-        raise Refused(f"{rel(root, robot_toml)} already lists subsystem '{name}'")
+    config = rel(root, robot_toml)
+    try:
+        subsystems, _ = sync_manifest.effective(root, config)
+    except sync_manifest.ManifestError as err:
+        raise Refused(f"cannot read {config}: {err}")
+    if name in subsystems:
+        raise Refused(f"{config} already has subsystem '{name}'")
 
-    used = used_can_ids(configuration)
+    used = used_can_ids(subsystems)
     can_id = next((i for i in range(1, MAX_CAN_ID + 1) if i not in used), None)
     if can_id is None:
         raise Refused(f"every CAN id 1..{MAX_CAN_ID} is taken in "
@@ -1015,32 +1012,63 @@ def plan(root, robot, name, lang, kind="velocity"):
     writes.append((robot_toml, old, new_robot))
 
     # The bundle and graph test take their node and file lists from the
-    # generated manifest, so regenerate it from the edited config.
-    config = rel(root, robot_toml)
-    try:
-        manifest = sync_manifest.generate(root, config, overrides={
-            config: new_robot, rel(root, subsystem_toml): subsystem})
-    except sync_manifest.ManifestError as err:
-        raise Refused(f"cannot regenerate the manifest: {err}")
-    manifest_file = os.path.join(root, sync_manifest.manifest_path(config))
-    old = read(manifest_file) if os.path.isfile(manifest_file) else None
-    writes.append((manifest_file, old, manifest))
+    # generated manifest, so regenerate it from the edited config, and every
+    # other manifest in the robot whose config reads robot.toml (an
+    # `include` of it), which the new entry changes too.
+    overrides = {config: new_robot, rel(root, subsystem_toml): subsystem}
+    configs = [config] + [
+        other for other in robot_configs(root, robot) if other != config]
+    for path in configs:
+        try:
+            if path != config:
+                _, files = sync_manifest.resolve(root, path, overrides)
+                if config not in files:
+                    continue
+            manifest = sync_manifest.generate(root, path, overrides=overrides)
+        except sync_manifest.ManifestError as err:
+            raise Refused(f"cannot regenerate the manifest of {path}: {err}")
+        manifest_file = os.path.join(root, sync_manifest.manifest_path(path))
+        old = read(manifest_file) if os.path.isfile(manifest_file) else None
+        writes.append((manifest_file, old, manifest))
     return writes, can_id
 
 
-def plan_standalone(target_dir, name, lang, kind="velocity"):
-    """[(path, None, content)] for a standalone Bzlmod subsystem repository."""
+def robot_configs(root, robot):
+    """Workspace-relative configs under `robot` that have a manifest."""
+    found = []
+    for directory, dirs, files in os.walk(os.path.join(root, robot)):
+        dirs[:] = sorted(d for d in dirs if not d.startswith((".", "bazel-")))
+        for f in sorted(files):
+            if f.endswith("_manifest.bzl"):
+                stem = f.removesuffix("_manifest.bzl")
+                config = os.path.join(directory, stem + ".toml")
+                if os.path.isfile(config):
+                    found.append(rel(root, config))
+    return found
+
+
+def plan_standalone(target_dir, name, lang, talos_root, kind="velocity"):
+    """[(path, None, content)] for a standalone Bzlmod subsystem repository
+    that builds against the talOS checkout at `talos_root` as it stands."""
     if problem := check_name(name):
         raise Refused(problem)
     if os.path.exists(target_dir) and os.listdir(target_dir):
         raise Refused(f"{target_dir} already exists and is not empty")
-    return [
-        (os.path.join(target_dir, path), None, content)
-        for path, content in package_files(
-            name, lang, standalone=True, kind=kind).items()
-    ]
-
-
+    files = package_files(name, lang, standalone=True, kind=kind)
+    # Real paths, so a symlinked directory (macOS /tmp) cannot skew it.
+    talos_path = os.path.relpath(os.path.realpath(talos_root),
+                                 os.path.realpath(target_dir)).replace(
+                                     os.sep, "/")
+    files["MODULE.bazel"] += (
+        "\n# The talOS checkout this repository was generated from. Replace it\n"
+        "# with a registry version once talos is published to one.\n"
+        f'local_path_override(module_name = "talos", path = "{talos_path}")\n')
+    # talOS's C++23 flags and Bazel version are per workspace, not carried by
+    # the module, so the new workspace takes the checkout's own.
+    for config in (".bazelrc", ".bazelversion"):
+        files[config] = read(os.path.join(talos_root, config))
+    return [(os.path.join(target_dir, path), None, content)
+            for path, content in files.items()]
 
 
 # Line ending of each file read, so an edit keeps a CRLF checkout's style.
@@ -1087,13 +1115,22 @@ Next:
 def standalone_next_steps(target_dir, name):
     return f"""\
 Next (standalone subsystem repo at {target_dir}):
-  1. In {target_dir}/MODULE.bazel, point @talos at your talOS checkout or registry:
-       local_path_override(module_name = "talos", path = "../talOS")
-  2. Run tests inside {target_dir}:
-       bazel test //:all
-  3. Consume from a robot repo's MODULE.bazel:
+  1. Run its tests (MODULE.bazel overrides @talos with this checkout):
+       cd {target_dir} && bazel test //...
+  2. Consume it from a robot repo's MODULE.bazel:
        bazel_dep(name = "{name}", version = "0.1.0")
-     and layer physical CAN ids + gains over {target_dir}/defaults.toml."""
+       local_path_override(module_name = "{name}", path = "{target_dir}")
+  3. Copy {target_dir}/defaults.toml to the robot's
+     configuration/subsystems/{name}.toml, add the motor's physical can_id,
+     list it in robot.toml ([[subsystems]] name = "{name}",
+     path = "subsystems/{name}.toml") and regenerate the manifest:
+       bazel run //tools:sync_manifest -- <robot.toml>"""
+
+
+def shown(base, path):
+    """`path` relative to `base` when inside it, else absolute."""
+    relative = rel(base, path)
+    return os.path.abspath(path) if relative.startswith("../") else relative
 
 
 def main(argv):
@@ -1116,16 +1153,14 @@ def main(argv):
     args = parser.parse_args(argv)
 
     root = os.environ.get("BUILD_WORKSPACE_DIRECTORY")
-    if not root and not args.standalone:
+    if not root:
         print("new_subsystem: BUILD_WORKSPACE_DIRECTORY is unset; run it with "
               "`bazel run //tools:new_subsystem -- ...`", file=sys.stderr)
         return 2
-    base = root or os.getcwd()
     try:
         if args.standalone:
-            target_dir = (args.standalone if os.path.isabs(args.standalone)
-                          else os.path.join(base, args.standalone))
-            writes = plan_standalone(target_dir, args.name, args.lang,
+            target_dir = os.path.join(root, args.standalone)
+            writes = plan_standalone(target_dir, args.name, args.lang, root,
                                      kind=args.kind)
             can_id = None
         else:
@@ -1136,16 +1171,16 @@ def main(argv):
         return 1
 
     if args.dry_run:
-        show(base, writes)
+        show(root, writes)
     else:
         for path, _, content in writes:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8",
                       newline=NEWLINES.get(path, "\n")) as f:
                 f.write(content)
-            print(f"wrote {rel(base, path)}")
+            print(f"wrote {shown(root, path)}")
     if args.standalone:
-        print(standalone_next_steps(rel(base, target_dir), args.name))
+        print(standalone_next_steps(shown(root, target_dir), args.name))
     else:
         print(next_steps(args.robot, args.name, can_id))
     return 0

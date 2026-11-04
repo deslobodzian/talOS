@@ -1,0 +1,7 @@
+[subsystem]
+name = "arm"
+node = "//bot/arm:node"
+
+[motors.lift]
+can_id = 99
+brake = true

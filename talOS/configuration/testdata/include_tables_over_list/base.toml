@@ -1,0 +1,7 @@
+[[subsystems]]
+name = "a"
+path = "a.toml"
+
+[[subsystems]]
+name = "b"
+path = "b.toml"

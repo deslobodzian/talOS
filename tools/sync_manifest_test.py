@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+import tomllib
 import unittest
 
 from tools import sync_manifest
@@ -101,6 +102,29 @@ class SyncManifestTest(unittest.TestCase):
             '[[subsystems]]\nname = "x"\npath = "/etc/x.toml"\n')
         with self.assertRaises(sync_manifest.ManifestError):
             sync_manifest.resolve(self.root, "bot/abs.toml")
+
+
+CASES = "talOS/configuration/testdata"
+
+
+class SharedResolutionCasesTest(unittest.TestCase):
+    """The cases //talOS/configuration:test runs through the C++ parser."""
+
+    def test_cases_match_the_parser(self):
+        names = sorted(os.listdir(CASES))
+        self.assertTrue(names)
+        for name in names:
+            root = os.path.join(CASES, name)
+            with open(os.path.join(root, "expect.toml"), "rb") as f:
+                expect = tomllib.load(f)
+            config = expect.get("config", "robot.toml")
+            with self.subTest(name):
+                if not expect["accept"]:
+                    with self.assertRaises(sync_manifest.ManifestError):
+                        sync_manifest.resolve(root, config)
+                    continue
+                self.assertEqual(sync_manifest.resolve(root, config),
+                                 (expect["nodes"], expect["files"]))
 
 
 if __name__ == "__main__":

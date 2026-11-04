@@ -1,0 +1,9 @@
+include = "base.toml"
+
+[[subsystems]]
+name = "intake"
+node = "//py:intake"
+
+[[subsystems]]
+name = "arm"
+path = "custom/arm_alt.toml"

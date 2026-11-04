@@ -24,6 +24,14 @@ bazel build //2026-robot/main_processor:robot_bundle
 | `config/` | `robot.toml` and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
 | `bundle_manifest.toml` | node names, targets, binaries, languages, config SHA-256 |
 
+The config SHA-256 (`config_sha256`, copied into every session manifest) is
+the identity of the staged config: every file under `config/`, the robot
+config included, contributes its path relative to `config/` and its bytes.
+Absolute and workspace locations never participate, so moving the whole
+config tree or copying the bundle elsewhere keeps the identity; editing,
+renaming or moving any one file relative to the others (the root config too)
+changes it.
+
 Before deploying, set `[robot] controller_address` in the config to the RoboRIO
 (the shipped value is loopback for simulation) and `commissioned = true` once
 the hardware is checked; or pass `--remote <ip>` to `run.sh`.
