@@ -1,0 +1,21 @@
+# Pose estimator test robot: the estimator alone, two cameras, the 2026
+# robot's module layout. node_test.py builds its Sim configs the same way,
+# one per backend.
+[robot]
+name = "pose_estimator_test"
+period_us = 20000
+command_timeout_us = 100000
+
+[subsystems.pose_estimator]
+period_us = 20000
+backend = "factor_graph"
+cameras = ["front_camera", "back_camera"]
+module_x_m = [-0.30, -0.30, 0.30, 0.30]
+module_y_m = [0.30, -0.30, 0.30, -0.30]
+
+# A robot config needs one motor; the drivetrain whose state the estimator
+# reads owns it. The tests publish /drivetrain/state themselves.
+[subsystems.drivetrain.motors.front_left_drive]
+type = "TalonFX"
+bus = "test"
+can_id = 1

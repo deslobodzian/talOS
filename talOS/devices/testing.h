@@ -20,6 +20,15 @@
 // it before the first step to have a state at time 0; later, the first state
 // goes out at that moment. Devices are keyed by (node, device) exactly as the
 // node names them.
+//
+// Each period it also publishes the bridge's /hw/status: the states and
+// Driver Station packets it sent, configured, and the gateway clock mapping
+// of the bridge's own filter (talOS/bridge/clock_offset.h) fed with each
+// state at the sim time it goes out; the other counters stay 0. So, as on a
+// robot, HardwareLink::sample_time() is nullopt until the
+// ClockOffsetEstimator::kConvergedSamples-th state (40 ms at the default
+// [robot] period_us = 5000) and then maps each state to the sim time of the
+// gateway sample, plus the smallest latency the filter has seen.
 
 #include <cstddef>
 #include <cstdint>
@@ -60,6 +69,16 @@ class SimHardware {
                     double position, double velocity);
   void set_gyro(std::string_view node, std::string_view device, double yaw,
                 double yaw_rate);
+  // The RoboRIO's clock and link: from now on the gateway clock reads sim
+  // time + `gateway_offset` (states and Driver Station packets are stamped
+  // with it), and each state is sampled `latency` before it goes out.
+  // Defaults 0 and 0. A latency that grows leaves the filter's smaller
+  // minimum in place for its window, so sample_time() reads that much
+  // earlier than the publication; one that grows by a period or more makes
+  // the next states no newer than the last, and they are dropped as on a
+  // robot. Throws std::invalid_argument for a negative latency or a gateway
+  // clock that would read before 0.
+  void set_gateway_clock(Duration gateway_offset, Duration latency);
   // A disconnected device keeps its slot in /hw/state with valid == false
   // and zero values, so its handle reads connected() == false. Every device
   // of that node named `device` is affected, whatever its kind; an unknown

@@ -1,3 +1,5 @@
+include "geometry/geometry.fbs";
+
 namespace drivetrain;
 
 // Robot-relative chassis request. x forward, y left, yaw CCW.
@@ -7,12 +9,31 @@ struct ChassisTarget {
   omega_radps:double;
 }
 
+// Published every drivetrain tick, valid or not.
+//
+// sample_time_ns: node-clock time the hardware sample behind this state was
+// taken; 0, with both flags false, while that time is unknown.
+// modules_valid: all eight module motors report and the sample time is
+// known. Otherwise the chassis speeds are 0 and the module positions hold
+// their last valid values (0 before the first).
+// yaw_valid: the heading is usable (the gyro reports, or under --sim the
+// heading integrated from valid modules) and the sample time is known.
+// Otherwise yaw_rad holds the last valid heading (0 before the first).
+// vx/vy/omega: robot-relative chassis motion the modules measure.
+// yaw_rad: field heading, CCW+.
+// module0..3: accumulated wheel travel and azimuth per module, in
+// [subsystems.drivetrain.geometry].modules order.
 struct DrivetrainState {
-  timestamp_ns:ulong;
+  sample_time_ns:ulong;
   enabled:bool;
+  modules_valid:bool;
+  yaw_valid:bool;
   vx_mps:double;
   vy_mps:double;
   omega_radps:double;
-  yaw_rot:double;
-  yaw_rate_rps:double;
+  yaw_rad:double;
+  module0:geometry.SwerveModulePosition;
+  module1:geometry.SwerveModulePosition;
+  module2:geometry.SwerveModulePosition;
+  module3:geometry.SwerveModulePosition;
 }

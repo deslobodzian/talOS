@@ -1,0 +1,42 @@
+# Field pose from swerve odometry, corrected by camera pose observations, on
+# /pose_estimator/state (geometry.PoseEstimate). Owns no devices and runs
+# while the robot is disabled. See 2026-robot/main_processor/pose_estimator.
+[subsystem]
+name = "pose_estimator"
+node = "//2026-robot/main_processor/pose_estimator:node"
+period_us = 20000
+# "kalman" (wpimath SwerveDrive4PoseEstimator) or "factor_graph" (GTSAM
+# fixed-lag smoother); [kalman] / [factor_graph] below tune each.
+backend = "kalman"
+# Camera nodes, each publishing geometry.PoseObservation on /<name>/state.
+# None yet: the estimate is odometry only.
+cameras = []
+# Module offsets from the robot centre, in the order of
+# [subsystems.drivetrain.geometry].modules (back_left, back_right,
+# front_left, front_right). config_golden_test checks they match.
+module_x_m = [-0.30, -0.30, 0.30, 0.30]
+module_y_m = [0.30, -0.30, 0.30, -0.30]
+# Observations older than this, relative to the newest drivetrain sample, are
+# rejected; at most 1.5 s (wpimath's pose buffer). The factor graph's lag.
+max_observation_age_us = 1500000
+# How far past the newest drivetrain sample an observation may be taken.
+observation_future_tolerance_us = 20000
+# Drivetrain state older than this makes the estimate invalid (held).
+drivetrain_timeout_us = 100000
+
+# wpimath stateStdDevs: trust in the odometry-propagated state; larger trusts
+# observations more.
+[kalman]
+state_std_x_m = 0.1
+state_std_y_m = 0.1
+state_std_yaw_rad = 0.1
+
+# One sigma of each odometry step (one drivetrain sample) and of the prior on
+# the first pose (the field origin at the gyro's heading).
+[factor_graph]
+odometry_std_x_m = 0.01
+odometry_std_y_m = 0.01
+odometry_std_yaw_rad = 0.005
+prior_std_x_m = 1.0
+prior_std_y_m = 1.0
+prior_std_yaw_rad = 0.5

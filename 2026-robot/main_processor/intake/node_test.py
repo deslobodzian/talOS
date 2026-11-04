@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 import talos
+from bridge.BridgeStatus import BridgeStatus
 from intake import topics
 from intake.Inhibit import Inhibit
 from intake.IntakeState import IntakeState
@@ -124,6 +125,8 @@ class BinaryTest(unittest.TestCase):
             sorted([("TIMER", "intake", 0),
                     ("WATCHER", "/hw/state", 1404),
                     ("WATCHER", "/hw/state/driver_station", 1404),
+                    # The bridge's clock mapping (HardwareLink::sample_time).
+                    ("WATCHER", "/hw/status", BridgeStatus.SizeOf()),
                     # Lanes of the default policy: the 16-byte envelope
                     # header (mode generation, active) + IntakeTarget.
                     ("WATCHER", "/intake/target/teleop",

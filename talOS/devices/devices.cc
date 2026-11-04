@@ -12,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include "bridge/bridge_status_generated.h"
+#include "bridge/topics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/hardware/gate.h"
 #include "talOS/hardware/packet.h"
@@ -181,6 +183,14 @@ struct HardwareLink::Impl {
   hardware::State state{};
   bool have_state = false;
   Time state_received{};
+  // The bridge's gateway-to-node clock mapping. The state is the gateway's
+  // canonical wire bytes, which the bridge relays untouched (its
+  // sample_time_us is what every request echoes, on the gateway clock), so
+  // the mapping travels beside it on the bridge's own /hw/status, stamped
+  // with the gateway boot it describes. The offset moves only with clock
+  // drift and the filter's window, so the newest status (at most 20 ms old)
+  // maps the newest state.
+  Subscription<::bridge::BridgeStatus> bridge_status;
 
   explicit Impl(Node& n) : node{n} {}
 
@@ -191,6 +201,16 @@ struct HardwareLink::Impl {
     return have_state ? node.now() - state_received : Duration::max();
   }
   bool Enabled() const { return Fresh() && hardware::GatewayReady(state); }
+  std::optional<Time> SampleTime() const {
+    if (!Fresh() || !bridge_status.has_value()) return std::nullopt;
+    const ::bridge::BridgeStatus& clock = bridge_status.value();
+    if (!clock.clock_offset_valid() || clock.clock_boot_id() != state.boot_id) {
+      return std::nullopt;
+    }
+    const std::int64_t us = static_cast<std::int64_t>(state.sample_time_us) +
+                            clock.clock_offset_us();
+    return Time::from_nanos(us * 1000);
+  }
 
   Device& At(std::size_t index, Kind kind) {
     if (index >= devices.size() || devices[index].kind != kind) {
@@ -270,6 +290,8 @@ HardwareLink::HardwareLink(Node& node) : impl_{std::make_unique<Impl>(node)} {
   detail::NodeAccess::add_subscription(
       node, hardware::kStateTopic, sizeof(Packet), alignof(Packet),
       /*optional=*/false, [&impl](const void* data) { impl.OnState(data); });
+  impl.bridge_status =
+      node.subscribe<::bridge::BridgeStatus>(::bridge::topics::kStatus);
 }
 
 HardwareLink::~HardwareLink() = default;
@@ -279,6 +301,10 @@ bool HardwareLink::enabled() const { return impl_->Enabled(); }
 bool HardwareLink::fresh() const { return impl_->Fresh(); }
 
 Duration HardwareLink::age() const { return impl_->Age(); }
+
+std::optional<Time> HardwareLink::sample_time() const {
+  return impl_->SampleTime();
+}
 
 const config::RobotConfig& HardwareLink::config() const {
   return impl_->config;

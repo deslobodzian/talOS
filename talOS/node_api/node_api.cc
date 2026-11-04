@@ -15,6 +15,7 @@
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "talOS/devices/access.h"
 #include "talOS/devices/devices.h"
@@ -27,7 +28,11 @@ namespace talos::node_api {
 namespace {
 
 thread_local std::string g_last_error;
-thread_local std::string g_param_string;  // TalosParam::string
+// What TalosParam's pointers address, until the next talos_node_param call.
+thread_local std::string g_param_string;
+thread_local std::vector<std::string> g_param_strings;
+thread_local std::vector<const char*> g_param_string_pointers;
+thread_local std::vector<double> g_param_numbers;
 
 using detail::HardwareAccess;
 using detail::NodeAccess;
@@ -102,9 +107,9 @@ TalosJoystick JoystickOf(const Joystick& joystick) {
   return out;
 }
 
-void Fill(TalosParam& out, const detail::ParamValue& value) {
+void Fill(TalosParam& out, detail::ParamValue value) {
   std::visit(
-      [&out](const auto& v) {
+      [&out](auto& v) {
         using V = std::decay_t<decltype(v)>;
         if constexpr (std::is_same_v<V, bool>) {
           out.kind = TALOS_PARAM_BOOL;
@@ -115,10 +120,25 @@ void Fill(TalosParam& out, const detail::ParamValue& value) {
         } else if constexpr (std::is_same_v<V, double>) {
           out.kind = TALOS_PARAM_DOUBLE;
           out.number = v;
-        } else {
+        } else if constexpr (std::is_same_v<V, std::string>) {
           out.kind = TALOS_PARAM_STRING;
-          g_param_string = v;
+          g_param_string = std::move(v);
           out.string = g_param_string.c_str();
+        } else if constexpr (std::is_same_v<V, std::vector<std::string>>) {
+          out.kind = TALOS_PARAM_STRING_LIST;
+          g_param_strings = std::move(v);
+          g_param_string_pointers.clear();
+          for (const std::string& s : g_param_strings) {
+            g_param_string_pointers.push_back(s.c_str());
+          }
+          out.count = g_param_strings.size();
+          out.strings = g_param_string_pointers.data();
+        } else {
+          static_assert(std::is_same_v<V, std::vector<double>>);
+          out.kind = TALOS_PARAM_DOUBLE_LIST;
+          g_param_numbers = std::move(v);
+          out.count = g_param_numbers.size();
+          out.numbers = g_param_numbers.data();
         }
       },
       value);
@@ -142,6 +162,18 @@ std::optional<detail::ParamValue> FindParam(const Node& node,
       return wrap(NodeAccess::find_double(node, key));
     case TALOS_PARAM_STRING:
       return wrap(NodeAccess::find_string(node, key));
+    case TALOS_PARAM_STRING_LIST:
+      return wrap(NodeAccess::find_string_list(node, key));
+    case TALOS_PARAM_DOUBLE_LIST:
+      return wrap(NodeAccess::find_double_list(node, key));
+    case TALOS_PARAM_LIST: {
+      auto value = NodeAccess::find_param(node, key);
+      if (value && !std::holds_alternative<std::vector<std::string>>(*value) &&
+          !std::holds_alternative<std::vector<double>>(*value)) {
+        NodeAccess::param_error(node, key, "must be an array");
+      }
+      return value;
+    }
     default:
       throw std::invalid_argument("unknown parameter kind " +
                                   std::to_string(kind));
@@ -216,12 +248,12 @@ int32_t talos_node_param(const TalosNode* node, const char* key, int32_t kind,
     const std::string_view k = NonNull(key, "key");
     if (out == nullptr) throw std::invalid_argument("null TalosParam");
     *out = TalosParam{};
-    const auto value = FindParam(n, k, kind);
+    auto value = FindParam(n, k, kind);
     if (!value) {
       if (required != 0) NodeAccess::param_error(n, k, "is missing");
       return 0;
     }
-    Fill(*out, *value);
+    Fill(*out, *std::move(value));
     return 1;
   });
 }
@@ -398,6 +430,16 @@ int64_t talos_device(TalosNode* node, int32_t kind, const char* name) {
 int32_t talos_robot_enabled(TalosNode* node) {
   return Guard<int32_t>(TALOS_ERR,
                         [&] { return talos::robot_enabled(AsNode(node)); });
+}
+
+int32_t talos_hardware_sample_time(TalosNode* node, int64_t* out_ns) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
+    const std::optional<talos::Time> sampled = Link(node).sample_time();
+    if (!sampled) return 0;
+    *out_ns = sampled->nanos();
+    return 1;
+  });
 }
 
 int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,

@@ -176,8 +176,8 @@ code the table is `talOS/schema/unit_suffix.h`.
 Rules:
 
 - **One quantity, one field.** A struct never carries the same quantity twice
-  in two units (today `DrivetrainState` has both `omega_radps` and
-  `yaw_rate_rps`). **[review; lint planned: D2]**
+  in two units (`DrivetrainState` carries the chassis rate once, as
+  `omega_radps`). **[review; lint planned: D2]**
 - **Conversions happen at a named boundary, once.** The device layer speaks
   shaft units (`_rot`). A node that turns a shaft angle into a field-frame
   angle (a gyro yaw into a heading) converts there and publishes `_rad`. In
@@ -195,6 +195,10 @@ Rules:
   numbers) without a suffix, naming it. A suffix needs a name before it
   (`count` alone fails; `tick_count` passes). **[enforced]** Numeric
   parameters without a suffix get a `--describe-only` warning. **[planned: D2]**
+- No one-letter word before the suffix: `x_std_m`, not `std_x_m`, and
+  `module0`, not `module_0`. flatc camel-cases field names for Python, and
+  talos derives the snake_case names back from them, so `std_x_m` would read
+  as `std_xm` there. **[review]**
 
 ## 7. Messages
 
@@ -207,7 +211,14 @@ Rules:
   `<Struct>.TALOS_SCHEMA_HASH`). **[review; D2 replaces size-only attach
   checks with that schema hash]**
 - A measurement message carries `sample_time_ns`: when the measurement was
-  taken, not when it was published. **[planned: D6]**
+  taken, in the node clock, not when it was published (`DrivetrainState`,
+  `geometry.PoseObservation`, `geometry.PoseEstimate`). A node reading
+  hardware stamps it with `HardwareLink::sample_time()`
+  (`talos.hardware_sample_time_ns(node)` in Python), the gateway's sample
+  time mapped through the bridge's clock offset; that is an upper-bounded
+  latency estimate, never earlier than the true sample, and unknown until
+  the mapping converges. A measurement without a known time is published
+  with its validity flags false. **[review]**
 - A message carries validity next to the value it qualifies (`yaw_valid` next
   to `yaw_rad`), not one flag for the whole struct. **[review]**
 - Enums for states and reasons (`Inhibit`), with the zero value meaning
@@ -221,6 +232,10 @@ Rules:
   **[review]**
 - Validate at construction: finite, in range, consistent. Throw with the key
   name. **[review]**
+- Lists are TOML arrays: `node.param<std::vector<std::string>>("cameras")` /
+  `std::vector<double>` in C++, `node.param("cameras")` (a `list`) in Python.
+  An element of the wrong type fails at construction naming the key and the
+  element. **[enforced]** by the param API.
 - Parameter keys follow §6 (`tolerance_rot`, `deadband_frac`,
   `heading_timeout_us`). **[review; warning planned: D2]**
 - Robot-wide wiring (which producers drive which subsystem, telemetry,
@@ -233,6 +248,10 @@ Rules:
 
 - Use `node.now()` only. Never `steady_clock`, `time.time()` or sleeps. This is
   what makes `Sim` and replay match the robot. **[review]**
+- Estimators integrate on measurement sample times (`sample_time_ns`), never
+  on arrival or publish time, and call wpimath's time-taking entry points
+  (`UpdateWithTime`/`updateWithTime`), never `Update()`/`update()`, which read
+  WPILib's own clock. **[review]**
 - No randomness in decisions. Telemetry stream ids are the one exception. **[review]**
 - **Restart safety.** A node can be restarted mid-match (`max_restarts`). Its
   initial state must be safe with every input present, so a state machine
@@ -250,7 +269,7 @@ intake; the whole graph used ≈ 4.5 % of one core.
 | Rule | Budget | Status |
 |---|---|---|
 | `update()` p99 wall time | ≤ 10 % of `period_us` | [review]; read `max_latency` in the registry / Studio system view |
-| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | [review]; an allocation-free assertion in `Sim` is planned |
+| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | [review]; the drivetrain's `UpdateDoesNotAllocate` counts every allocation in the process, wpimath's included (macOS only; §13) |
 | Python nodes | fine for any period ≥ 5 ms: they cost memory (≈ 30 MB), not jitter | [review] |
 | Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [review]; producer → consumer is one hop (`Target` resolves lanes in the consumer) |
 | Per-tick work | O(devices), never O(history); bound every loop | [review] |
@@ -306,7 +325,7 @@ producer that has drained it would.
 |---|---|---|
 | A mechanism | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py`; fill in the TOML; write the §11 tests | edit `operator_interface` or `telemetry` code |
 | A producer of a target (auto routine, auto-align) | a `talos::TargetLane` on `/<sub>/target/<source>`; list `<source>` in `[robot.targets]` or that subsystem's `[targets]` (the launcher refuses a lane no mode lists) | subscribe to another producer's lane, or write a lane someone else writes |
-| A process without hardware (pose estimator, vision, auto) | a node with no devices; subscribe to `state` topics; publish `/<me>/state`; do the math with wpimath (§14); walkthrough in DESIGN_AUTOMATIC_WIRING.md §D6 | read `/hw/state` directly; hand-roll a Kalman filter or kinematics |
+| A process without hardware (pose estimator, vision, auto) | a node with no devices; subscribe to `state` topics; publish `/<me>/state` every tick with validity, while disabled too (no actuation gate on computation); do the math with wpimath or GTSAM (§14); `bazel run //tools:new_subsystem -- <name> --type estimator`; walkthrough in DESIGN_AUTOMATIC_WIRING.md §D6 | read `/hw/state` directly; hand-roll a Kalman filter or kinematics |
 | A message | the owning package's `.fbs` and `talos_messages(topics = ...)`; §6 and §7 | a hand-written C++/Python mirror |
 | A device type | `talOS/hardware`, `talOS/devices`, `devices.py`, the RoboRIO program, in one change | |
 | A node-API feature | `talOS/node` (or `devices`), `talOS/node_api`, `talOS/python/talos`, tests in both languages, in one change | a Python-only reimplementation |
@@ -318,14 +337,12 @@ touch the code, or under the design item named.
 
 | Where | Deviation | Rule | Fix |
 |---|---|---|---|
-| `drivetrain/drive_message.fbs` `DrivetrainState` | `yaw_rot` heading (field frame) and `yaw_rate_rps` duplicating `omega_radps`; `timestamp_ns` is publish time | §6, §7 | `yaw_rad` + `yaw_valid`, drop `yaw_rate_rps`, `sample_time_ns` (D6) |
-| `talOS/msgs/geometry.fbs`, `odometry_message.fbs` | headings in `_rot` | §6 | `_rad` |
-| `drivetrain/drivetrain.h:40` | stops publishing `state` when a motor disconnects; yaw reads 0 with the gyro disconnected | §4 | publish every tick with validity flags |
 | `operator_interface.h` extras, `telemetry/node.h:325-393` | subsystem names hard-coded; `GenericTarget`/`GenericState` hand mirrors; `teleop_button`/`telemetry` keys | §7, §8 | D3, D4 |
 | `telemetry/node.h` units | `"rev/s"` strings written by hand | §6 | derive from suffix (D3) |
 | `operator_interface.toml` | `deadband`, `heading_timeout_s` | §6, §8 | `deadband_frac`, `heading_timeout_us` |
 | `intake.py:18` | fixed `INTAKE_RPS` ignores the requested speed | §3 | use the target's demand |
-| `drivetrain/swerve.h`, `drivetrain/geometry.h`, `odometry/odometry.h` | hand-written swerve kinematics and pose integration | §14 | wpimath `SwerveDriveKinematics` / `SwerveDrivePoseEstimator` once D6 adds the dependency |
+| `drivetrain/swerve.h` `SwerveKinematics::ToModuleStates` | wheel speeds are desaturated by hand, not with wpimath's `DesaturateWheelSpeeds` (the kinematics, `Optimize` and forward kinematics are wpimath's `SwerveDriveKinematics<4>`) | §14 | `DesaturateWheelSpeeds` takes one attainable speed for every module, while `[geometry]` gives each module its own `wheel_radius_m` and drive `max_velocity_rps`; keep until wpimath takes per-module limits |
+| `drivetrain/node_test.cc` `UpdateDoesNotAllocate` | the process-wide allocation check (`malloc_logger`, so libwpimath counts) runs on macOS only; on Linux it is skipped | §10 | a glibc-compatible allocation hook (glibc removed `__malloc_hook` in 2.34) |
 
 ## 14. Open source first
 
@@ -340,9 +357,11 @@ A dependency is adopted when it meets all of these:
 2. It is maintained, and it builds on every target platform: macOS arm64 (the
    Mini and laptops), Linux x86_64/arm64 (CI) and, if it runs there, the RoboRIO.
 3. Bazel consumes it through the Bazel Central Registry (`bazel_dep`), an
-   upstream `MODULE.bazel` (`archive_override`/`git_override`), or the pinned
-   pip lock (`//talOS/python:requirements.txt`). It is never vendored by copy
-   unless upstream has no build we can use.
+   upstream `MODULE.bazel` (`archive_override`/`git_override`), the pinned
+   pip lock (`//talOS/python:requirements.txt`, every distribution hashed),
+   or, when upstream publishes no Bazel module, its own sha256-pinned release
+   artifacts fetched by a module extension (`third_party/<name>`). It is
+   never vendored by copy unless upstream has no build we can use.
 4. It stays off the hot path unless it meets §10 (no allocation per tick in
    `update()`).
 5. It is added in one change, with the reason, to this table.
@@ -352,7 +371,8 @@ A dependency is adopted when it meets all of these:
 | Serialization, schemas, reflection | FlatBuffers (structs, and `reflection.fbs`/`.bfbs` for runtime schemas) | in use; `.bfbs` descriptors and schema hashes in use (D2 stage 1); hash-checked attach, descriptor-bearing logs and the reflection codec planned (D2) |
 | Config | TOML: toml++ (C++), `tomllib` (Python stdlib) | in use |
 | Tests | googletest, `unittest` | in use |
-| Geometry, kinematics, pose estimation, trajectories, profiles, PID, filters | wpimath (C++, from allwpilib's upstream Bazel build; Python: `robotpy-wpimath` on PyPI) | planned (D6); Bazel integration on macOS arm64 still to be verified |
+| Geometry, kinematics, pose estimation, trajectories, profiles, PID, filters | wpimath 2026.2.1 (C++: WPILib's Maven release artifacts through `third_party/wpilib`, `//third_party/wpilib:wpimath`, shared libraries staged in a bundle's `lib/`; Python: `robotpy-wpimath` 2026.2.1.1 on the same native build). allwpilib 2026 has no `MODULE.bazel` and no BCR entry. `//2026-robot/controller_processor/rio:wpilib_lockstep_test` keeps the Maven pin, the `robotpy-native-wpimath` pin and GradleRIO on one release | in use (D6): drivetrain kinematics (`SwerveDriveKinematics<4>`) and `units::` boundary conversions, the pose estimator's `kalman` backend (`SwerveDrive4PoseEstimator`); built and run on macOS arm64; the Linux artifacts are wired but not built here |
+| Smoothing and mapping (factor graphs) | GTSAM 4.3.0 (`gtsam` wheel on PyPI, BSD) | in use (D6): the pose estimator's `factor_graph` backend (`IncrementalFixedLagSmoother`). Python only: GTSAM has no Bazel module, and its C++ build is CMake with a large dependency surface |
 | Vision: AprilTag pose observations | PhotonVision on the camera coprocessor; `photonlibpy`/photonlib, or `apriltag`/`robotpy-apriltag` for an in-process pipeline | candidate (D6) |
 | Autonomous paths | Choreo or PathPlanner trajectories, followed with wpimath controllers | candidate |
 | Log viewing | export `.tlog` to MCAP (Foxglove) or WPILOG (AdvantageScope) rather than building more viewer features | candidate |

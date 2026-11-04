@@ -33,6 +33,19 @@ def robot_enabled(node):
     return bool(_abi.ok(lib.talos_robot_enabled(node._handle)))
 
 
+def hardware_sample_time_ns(node):
+    """When the gateway sampled the latest accepted hardware state, as an
+    int of nanoseconds on the node clock (the one node.now reads in
+    seconds), or None: before any state, while it is stale, and until the
+    bridge's clock mapping has converged (HardwareLink::sample_time).
+    Later than the true sample time by the link's smallest latency, so
+    node.now - t / 1e9 never exceeds the sample's true age."""
+    sampled = ctypes.c_int64()
+    found = _abi.ok(lib.talos_hardware_sample_time(node._handle,
+                                                   ctypes.byref(sampled)))
+    return sampled.value if found else None
+
+
 class _Device:
     _KIND = None
 

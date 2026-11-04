@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "bridge/topics.h"
+#include "talOS/events/os/poller.h"
 #include "talOS/process/process.h"
 
 namespace talos::hardware {
@@ -276,6 +277,9 @@ void HardwareNode::Tick(uint64_t now_us) {
 
       ++states_received_;
       last_state_receipt_us_ = now_us;
+      // Every decoded frame feeds the clock mapping, whatever its config:
+      // the gateway's clock does not depend on what it was configured with.
+      clock_.Observe(state.boot_id, state.sample_time_us, now_us);
       if (state.boot_id != last_boot_id_ || state.config_id != config_id_ ||
           !is_configured_) {
         if (now_us - last_push_time_us_ >= 50000 ||
@@ -477,6 +481,13 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       timed_out_mask,
       static_cast<uint32_t>(subsystems_.size()),
       is_configured_,
+      clock_.boot_id(),
+      clock_.offset_us(),
+      clock_.spread_us(),
+      clock_.resets_count(),
+      clock_.ignored_count(),
+      static_cast<uint32_t>(clock_.window_count()),
+      clock_.converged(),
   };
 }
 
@@ -505,10 +516,11 @@ int HardwareNode::Run(int duration_s) {
   auto next_tick = std::chrono::steady_clock::now();
   while (!talos::process::stop_requested.load() &&
          (!duration_s || std::chrono::steady_clock::now() < end)) {
-    const auto now_us = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count());
+    // The node clock (Node::now() reads the same Poller clock), not
+    // std::chrono::steady_clock: on macOS the two differ by time asleep, and
+    // the clock mapping on /hw/status must land in the nodes' time.
+    const auto now_us =
+        static_cast<uint64_t>(talos::event::Poller::now().nanos() / 1000);
     Tick(now_us);
 
     // Four times a second: often enough that the registry never looks stale,

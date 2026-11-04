@@ -47,15 +47,16 @@ Beside the stack:
 | `talOS/configuration` | parses `robot.toml` and the subsystem files |
 | `talOS/hardware` | hardware config, request/state messages, the gateway the RoboRIO and sim run |
 | `talOS/protocol` | frame and UDP wire format |
-| `talOS/bridge` | `:hardware_node`; publishes link health on `/hw/status` (`bridge::BridgeStatus`) |
+| `talOS/bridge` | `:hardware_node`; publishes link health and the gateway-to-node clock mapping (`:clock_offset`, read by `HardwareLink::sample_time()`) on `/hw/status` (`bridge::BridgeStatus`) |
 | `talOS/driver_station` | Driver Station codec |
 | `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed nodes up to `[robot] max_restarts`); `--describe-only` lints the graph |
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |
 | `talOS/process` | stop handlers and `ConfigureRealtime` for node binaries |
-| `talOS/msgs` | shared geometry and control message structs |
+| `talOS/msgs` | shared geometry and control message structs (field and chassis angles in radians; `SwerveModulePosition`, `PoseObservation`, `PoseEstimate`) |
 | `talOS/telemetry` | the Studio telemetry frame schema and byte-topic wire format |
 | `talOS/schema` | `talos::Descriptor<M>` (`.bfbs` bytes, name, schema hash), `talos::schema::struct_hash`, the unit-suffix table; Python `talos_schema` and upstream `reflection` classes |
 | `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle`, `talos_graph_test` (both fed by a config's generated `robot_manifest.bzl`, `tools/sync_manifest.py`) |
+| `third_party/wpilib` | wpimath and wpiutil (C++) from WPILib's Maven release artifacts (`//third_party/wpilib:wpimath`); a bundle stages the shared libraries in `lib/`. Python nodes use the same release through `robotpy-wpimath` in `//talOS/python:requirements.txt` (with `gtsam` for factor graphs) |
 
 ## The tick
 

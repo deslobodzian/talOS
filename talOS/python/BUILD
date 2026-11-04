@@ -1,6 +1,9 @@
 load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("//talOS/build:contract.bzl", "talos_messages")
 
+# The pip lock, read by //2026-robot/controller_processor/rio:wpilib_lockstep_test.
+exports_files(["requirements.txt"])
+
 # `import talos`: Python nodes over the C++ talos::Node and devices layer,
 # through //talOS/node_api:libtalos_node.so.
 py_library(

@@ -149,8 +149,9 @@ const STUDIO_SLOT = 16384;
 // and each of these is a shape that actually occurs:
 //
 //   orphaned     /shooter/state and /hw/request/shooter -- the shooter node was
-//                declared and never claimed a registry slot, so odometry waits
-//                on a topic nothing publishes and so does the hardware node.
+//                declared and never claimed a registry slot, so telemetry
+//                waits on a topic nothing publishes and so does the hardware
+//                node.
 //                From inside either one this is indistinguishable from a quiet
 //                topic, which is exactly why it belongs in a system view. The
 //                declared graph is the other half of the answer: it names the
@@ -253,16 +254,14 @@ const DEMO_NODES: DemoNode[] = [
     ]
   },
   {
-    name: 'odometry',
-    target: '//2026-robot/main_processor/odometry:node',
+    name: 'pose_estimator',
+    target: '//2026-robot/main_processor/pose_estimator:node',
     pid: 4133,
-    periodUs: 5000,
+    periodUs: 20000,
     sources: [
-      {kind: 'TIMER', name: 'odometry', bytes: 0, hz: 200},
-      {kind: 'WATCHER', name: '/drivetrain/state', bytes: 48, hz: 200},
-      // Waiting on the node that never started.
-      {kind: 'WATCHER', name: '/shooter/state', bytes: 24, hz: 0},
-      {kind: 'SENDER', name: '/odometry/state', bytes: 64, hz: 200}
+      {kind: 'TIMER', name: 'pose_estimator', bytes: 0, hz: 50},
+      {kind: 'WATCHER', name: '/drivetrain/state', bytes: 48, hz: 50},
+      {kind: 'SENDER', name: '/pose_estimator/state', bytes: 72, hz: 50}
     ]
   },
   {
@@ -317,8 +316,10 @@ const DEMO_NODES: DemoNode[] = [
     periodUs: 10000,
     sources: [
       {kind: 'TIMER', name: 'telemetry', bytes: 0, hz: 100},
-      {kind: 'WATCHER', name: '/odometry/state', bytes: 64, hz: 200},
+      {kind: 'WATCHER', name: '/pose_estimator/state', bytes: 72, hz: 50},
       {kind: 'WATCHER', name: '/drivetrain/state', bytes: 48, hz: 200},
+      // Waiting on the node that never started.
+      {kind: 'WATCHER', name: '/shooter/state', bytes: 24, hz: 0},
       {kind: 'WATCHER', name: '/hw/state/driver_station', bytes: HW_PACKET, hz: 50},
       {kind: 'SENDER', name: '/talos/telemetry', bytes: STUDIO_SLOT, hz: 100}
     ]

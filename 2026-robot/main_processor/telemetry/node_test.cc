@@ -13,7 +13,6 @@
 #include <limits>
 #include <map>
 #include <memory>
-#include <numbers>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -44,8 +43,14 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
-odometry::OdometryState Odometry(double x, double y, double yaw_rot) {
-  return odometry::OdometryState{0, x, y, yaw_rot, 1.5, -0.5, 0.25};
+geometry::PoseEstimate Pose(double x, double y, double yaw_rad,
+                            bool valid = true) {
+  return geometry::PoseEstimate{0,
+                                geometry::Pose2d{x, y, yaw_rad},
+                                geometry::Twist2d{1.5, -0.5, 0.25},
+                                valid,
+                                0,
+                                0};
 }
 
 shooter::ShooterState Shooter() {
@@ -78,6 +83,11 @@ class TelemetryTest : public ::testing::Test {
     return bytes ? bytes->size() : 0;
   }
 
+  // On the topic the config names ([subsystems.telemetry] pose_topic).
+  void PublishPose(const geometry::PoseEstimate& pose) {
+    sim.publish(sim.node("telemetry").param<std::string>("pose_topic"), pose);
+  }
+
   // Present channels only: NaN is the wire's absence marker, so an absent
   // or stale source simply has no entry here.
   std::map<std::string, double> Channels() {
@@ -97,16 +107,18 @@ class TelemetryTest : public ::testing::Test {
 
   Sim sim{Runfile("TALOS_TEST_CONFIG")};
   Telemetry& telemetry = sim.add<Telemetry>("telemetry");
-  talos::testing::SimHardware hw{sim};
+  // Optional so a test can stand in for the bridge's /hw/status itself.
+  std::optional<talos::testing::SimHardware> hw{std::in_place, sim};
 
  private:
   std::optional<std::vector<std::byte>> latest_;
 };
 
-TEST_F(TelemetryTest, PublishesChassisPoseAndChannelsFromOdometry) {
-  sim.publish(odometry::topics::kState, Odometry(3.25, 1.5, 0.25));
+TEST_F(TelemetryTest, PublishesChassisPoseAndChannelsFromThePoseEstimate) {
+  PublishPose(Pose(3.25, 1.5, 0.25));
   sim.publish(drivetrain::topics::kState,
-              drivetrain::DrivetrainState{0, true, 1.5, -0.5, 0.25, 0.25, 0.1});
+              drivetrain::DrivetrainState{
+                  0, true, true, false, 1.5, -0.5, 0.25, 0.75, {}, {}, {}, {}});
   sim.step(50ms);
 
   const Frame* frame = Latest();
@@ -114,26 +126,31 @@ TEST_F(TelemetryTest, PublishesChassisPoseAndChannelsFromOdometry) {
   ASSERT_NE(frame->chassis(), nullptr);
   EXPECT_NEAR(frame->chassis()->x(), 3.25, 1e-12);
   EXPECT_NEAR(frame->chassis()->y(), 1.5, 1e-12);
-  EXPECT_NEAR(frame->chassis()->yaw(), 0.25 * 2 * std::numbers::pi, 1e-12);
+  EXPECT_NEAR(frame->chassis()->yaw(), 0.25, 1e-12);  // radians, as sent
   EXPECT_EQ(frame->sequence_id(), 4u);
 
   const auto channels = Channels();
   EXPECT_NEAR(channels.at("pose/valid"), 1.0, 1e-12);
-  EXPECT_NEAR(channels.at("odometry/vx"), 1.5, 1e-12);
-  EXPECT_NEAR(channels.at("odometry/omega"), 0.25, 1e-12);
+  EXPECT_NEAR(channels.at("pose/vx"), 1.5, 1e-12);
+  EXPECT_NEAR(channels.at("pose/omega"), 0.25, 1e-12);
   EXPECT_EQ(channels.count("shooter/flywheel"), 0u);
   EXPECT_NEAR(channels.at("drivetrain/vx"), 1.5, 1e-12);
+  EXPECT_NEAR(channels.at("drivetrain/yaw"), 0.75, 1e-12);
   EXPECT_NEAR(channels.at("drivetrain/enabled"), 1.0, 1e-12);
+  EXPECT_NEAR(channels.at("drivetrain/modules_valid"), 1.0, 1e-12);
+  EXPECT_NEAR(channels.at("drivetrain/yaw_valid"), 0.0, 1e-12);
+  EXPECT_EQ(channels.count("drivetrain/yaw_rate"), 0u);
 }
 
 TEST_F(TelemetryTest, PublishesNothingUntilAPoseExists) {
   sim.publish(drivetrain::topics::kState,
-              drivetrain::DrivetrainState{0, true, 1, 0, 0, 0, 0});
+              drivetrain::DrivetrainState{
+                  0, true, true, true, 1, 0, 0, 0, {}, {}, {}, {}});
   sim.step(50ms);
   EXPECT_EQ(Latest(), nullptr);
 }
 
-TEST_F(TelemetryTest, PublishesMechanismChannelsWithoutOdometry) {
+TEST_F(TelemetryTest, PublishesMechanismChannelsWithoutAPose) {
   sim.publish(shooter::topics::kState, Shooter());
   sim.step(50ms);
 
@@ -141,7 +158,7 @@ TEST_F(TelemetryTest, PublishesMechanismChannelsWithoutOdometry) {
   EXPECT_NEAR(channels.at("shooter/flywheel"), 42.0, 1e-12);
   EXPECT_NEAR(channels.at("pose/valid"), 0.0, 1e-12);
   EXPECT_NEAR(channels.at("mechanism/stale"), 0.0, 1e-12);
-  EXPECT_EQ(channels.count("odometry/vx"), 0u);
+  EXPECT_EQ(channels.count("pose/vx"), 0u);
   const Frame* frame = Latest();
   ASSERT_NE(frame, nullptr);
   ASSERT_NE(frame->chassis(), nullptr);
@@ -155,7 +172,7 @@ TEST_F(TelemetryTest, PoseValidTracksFreshPose) {
   sim.step(20ms);
   EXPECT_NEAR(Channels().at("pose/valid"), 0.0, 1e-12);
 
-  sim.publish(odometry::topics::kState, Odometry(3.25, 1.5, 0.25));
+  PublishPose(Pose(3.25, 1.5, 0.25));
   sim.step(20ms);
   EXPECT_NEAR(Channels().at("pose/valid"), 1.0, 1e-12);
   const Frame* frame = Latest();
@@ -165,22 +182,22 @@ TEST_F(TelemetryTest, PoseValidTracksFreshPose) {
 
 TEST_F(TelemetryTest, OmitsStaleMechanismRowsButKeepsPublishingPose) {
   sim.publish(shooter::topics::kState, Shooter());
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  PublishPose(Pose(1.0, 2.0, 0.0));
   sim.step(50ms);
   EXPECT_GT(Channels().count("shooter/flywheel"), 0u);
 
   sim.step(150ms);
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  PublishPose(Pose(1.0, 2.0, 0.0));
   sim.step(30ms);
   const auto channels = Channels();
   EXPECT_EQ(channels.count("shooter/flywheel"), 0u);
   EXPECT_NEAR(channels.at("mechanism/stale"), 1.0, 1e-12);
   EXPECT_NEAR(channels.at("pose/valid"), 1.0, 1e-12);
-  EXPECT_NEAR(channels.at("odometry/vx"), 1.5, 1e-12);
+  EXPECT_NEAR(channels.at("pose/vx"), 1.5, 1e-12);
 }
 
-TEST_F(TelemetryTest, MarksStaleOdometryAndHoldsFieldView) {
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+TEST_F(TelemetryTest, MarksAStalePoseAndHoldsFieldView) {
+  PublishPose(Pose(1.0, 2.0, 0.0));
   sim.step(50ms);
   ASSERT_NE(Latest(), nullptr);
 
@@ -189,8 +206,8 @@ TEST_F(TelemetryTest, MarksStaleOdometryAndHoldsFieldView) {
   sim.step(30ms);
   const auto channels = Channels();
   EXPECT_NEAR(channels.at("pose/valid"), 0.0, 1e-12);
-  EXPECT_NEAR(channels.at("odometry/stale"), 1.0, 1e-12);
-  EXPECT_EQ(channels.count("odometry/vx"), 0u);
+  EXPECT_NEAR(channels.at("pose/stale"), 1.0, 1e-12);
+  EXPECT_EQ(channels.count("pose/vx"), 0u);
   EXPECT_NEAR(channels.at("shooter/flywheel"), 42.0, 1e-12);
   const Frame* frame = Latest();
   ASSERT_NE(frame, nullptr);
@@ -198,13 +215,33 @@ TEST_F(TelemetryTest, MarksStaleOdometryAndHoldsFieldView) {
   EXPECT_EQ(frame->chassis()->y(), 0.0);
 }
 
+TEST_F(TelemetryTest, AnInvalidEstimateIsNotDrawn) {
+  // Fresh but invalid (the estimator's odometry input is stale): not
+  // stale, yet the field view must not draw it.
+  PublishPose(Pose(1.0, 2.0, 0.5, /*valid=*/false));
+  sim.publish(shooter::topics::kState, Shooter());
+  sim.step(30ms);
+  const auto channels = Channels();
+  EXPECT_NEAR(channels.at("pose/valid"), 0.0, 1e-12);
+  EXPECT_NEAR(channels.at("pose/stale"), 0.0, 1e-12);
+  EXPECT_EQ(channels.count("pose/vx"), 0u);
+  const Frame* frame = Latest();
+  ASSERT_NE(frame, nullptr);
+  EXPECT_EQ(frame->chassis()->x(), 0.0);
+  EXPECT_EQ(frame->chassis()->yaw(), 0.0);
+
+  PublishPose(Pose(1.0, 2.0, 0.5));
+  sim.step(30ms);
+  EXPECT_NEAR(Channels().at("pose/valid"), 1.0, 1e-12);
+  EXPECT_NEAR(Latest()->chassis()->yaw(), 0.5, 1e-12);
+}
+
 TEST_F(TelemetryTest, DropsAFrameWhosePoseIsNaN) {
-  sim.publish(odometry::topics::kState,
-              Odometry(std::numeric_limits<double>::quiet_NaN(), 0, 0));
+  PublishPose(Pose(std::numeric_limits<double>::quiet_NaN(), 0, 0));
   sim.step(50ms);
   EXPECT_EQ(Latest(), nullptr);
 
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  PublishPose(Pose(1.0, 2.0, 0.0));
   sim.step(50ms);
   EXPECT_NEAR(Channels().at("pose/valid"), 1.0, 1e-12);
 }
@@ -212,7 +249,7 @@ TEST_F(TelemetryTest, DropsAFrameWhosePoseIsNaN) {
 TEST_F(TelemetryTest, NaNValuesMarkAbsentChannels) {
   const shooter::ShooterState shooter{
       0, std::numeric_limits<double>::quiet_NaN(), 42.0, true, true, true};
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  PublishPose(Pose(1.0, 2.0, 0.0));
   sim.publish(shooter::topics::kState, shooter);
   sim.step(50ms);
   const auto channels = Channels();
@@ -230,18 +267,18 @@ TEST_F(TelemetryTest, NaNValuesMarkAbsentChannels) {
 }
 
 TEST_F(TelemetryTest, ForwardsShooterStateIntoMechanismChannels) {
-  sim.publish(odometry::topics::kState, Odometry(3.25, 1.5, 0.25));
+  PublishPose(Pose(3.25, 1.5, 0.25));
   sim.publish(shooter::topics::kState, Shooter());
   sim.step(50ms);
 
   const auto channels = Channels();
   EXPECT_NEAR(channels.at("shooter/flywheel"), 42.0, 1e-12);
   EXPECT_NEAR(channels.at("shooter/beam_broken"), 1.0, 1e-12);
-  EXPECT_NEAR(channels.at("odometry/vx"), 1.5, 1e-12);
+  EXPECT_NEAR(channels.at("pose/vx"), 1.5, 1e-12);
 }
 
 TEST_F(TelemetryTest, IntakeInhibitIsAnEnumChannelWithLabels) {
-  sim.publish(odometry::topics::kState, Odometry(3.25, 1.5, 0.25));
+  PublishPose(Pose(3.25, 1.5, 0.25));
   sim.publish(intake::topics::kState, Intake(intake::Inhibit::TARGET_STALE));
   sim.step(10ms);  // one tick: the latest frame is the dictionary frame
 
@@ -286,9 +323,13 @@ TEST_F(TelemetryTest, DropsStaleShooterWhileIntakeStaysLive) {
 }
 
 TEST_F(TelemetryTest, ForwardsBridgeHealthAndMarksItStale) {
-  sim.publish(::bridge::topics::kStatus,
-              ::bridge::BridgeStatus{100, 90, 2, 3, 50, 1500, 0b101, 3, true});
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  // SimHardware publishes its own /hw/status; this test is the bridge.
+  hw.reset();
+  ::bridge::BridgeStatus status{100,   90, 2,    3,    50,         1500,
+                                0b101, 3,  true, 11,   -2'500'000, 750,
+                                1,     4,  200,  false};
+  sim.publish(::bridge::topics::kStatus, status);
+  PublishPose(Pose(1.0, 2.0, 0.0));
   sim.step(30ms);
   auto channels = Channels();
   EXPECT_NEAR(channels.at("bridge/state_age_us"), 1500.0, 1e-12);
@@ -297,26 +338,44 @@ TEST_F(TelemetryTest, ForwardsBridgeHealthAndMarksItStale) {
   EXPECT_NEAR(channels.at("bridge/timed_out_mask"), 5.0, 1e-12);
   EXPECT_NEAR(channels.at("bridge/configured"), 1.0, 1e-12);
   EXPECT_NEAR(channels.at("bridge/stale"), 0.0, 1e-12);
+  // An unconverged clock mapping reports only that, and its resets.
+  EXPECT_NEAR(channels.at("bridge/clock_offset_valid"), 0.0, 1e-12);
+  EXPECT_NEAR(channels.at("bridge/clock_resets"), 1.0, 1e-12);
+  EXPECT_EQ(channels.count("bridge/clock_offset_us"), 0u);
+  EXPECT_EQ(channels.count("bridge/clock_offset_spread_us"), 0u);
+
+  status.mutate_clock_offset_valid(true);
+  sim.publish(::bridge::topics::kStatus, status);
+  PublishPose(Pose(1.0, 2.0, 0.0));
+  sim.step(20ms);
+  channels = Channels();
+  EXPECT_NEAR(channels.at("bridge/clock_offset_valid"), 1.0, 1e-12);
+  EXPECT_NEAR(channels.at("bridge/clock_offset_us"), -2'500'000.0, 1e-12);
+  EXPECT_NEAR(channels.at("bridge/clock_offset_spread_us"), 750.0, 1e-12);
   // Units live in the dictionary now.
   for (const ChannelDef& channel : telemetry.dictionary()) {
-    if (channel.name == "bridge/state_age_us") {
-      EXPECT_EQ(channel.unit, "us");
+    if (channel.name == "bridge/state_age_us" ||
+        channel.name == "bridge/clock_offset_us" ||
+        channel.name == "bridge/clock_offset_spread_us") {
+      EXPECT_EQ(channel.unit, "us") << channel.name;
     }
   }
 
   for (int i = 0; i < 8; ++i) {
-    sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+    PublishPose(Pose(1.0, 2.0, 0.0));
     sim.step(20ms);
   }
   channels = Channels();
   EXPECT_EQ(channels.count("bridge/state_age_us"), 0u);
   EXPECT_EQ(channels.count("bridge/configured"), 0u);
+  EXPECT_EQ(channels.count("bridge/clock_offset_valid"), 0u);
+  EXPECT_EQ(channels.count("bridge/clock_offset_us"), 0u);
   EXPECT_NEAR(channels.at("bridge/stale"), 1.0, 1e-12);
 }
 
 TEST_F(TelemetryTest, ReadsDriverStationFromHardwareTopic) {
   // No DS packet forwarded yet: stale, and the mode channels stay absent.
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  PublishPose(Pose(1.0, 2.0, 0.0));
   sim.step(30ms);
   auto channels = Channels();
   EXPECT_NEAR(channels.at("ds/stale"), 1.0, 1e-12);
@@ -326,8 +385,8 @@ TEST_F(TelemetryTest, ReadsDriverStationFromHardwareTopic) {
   data.fms.flags = driver_station::kDsAttached | driver_station::kEnabled |
                    driver_station::kTeleop;
   data.fms.match_time_s = 42.0f;
-  hw.set_driver_station(data);
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  hw->set_driver_station(data);
+  PublishPose(Pose(1.0, 2.0, 0.0));
   sim.step(50ms);
   channels = Channels();
   EXPECT_NEAR(channels.at("ds/stale"), 0.0, 1e-12);
@@ -338,7 +397,7 @@ TEST_F(TelemetryTest, ReadsDriverStationFromHardwareTopic) {
 }
 
 TEST_F(TelemetryTest, StreamAndDictionaryIdsAreStable) {
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  PublishPose(Pose(1.0, 2.0, 0.0));
   sim.step(30ms);
   const Frame* first = Latest();
   ASSERT_NE(first, nullptr);
@@ -349,7 +408,7 @@ TEST_F(TelemetryTest, StreamAndDictionaryIdsAreStable) {
   const std::uint64_t stream = first->stream_id();
   const std::uint32_t dictionary = first->dictionary_id();
 
-  sim.publish(odometry::topics::kState, Odometry(2.0, 2.0, 0.0));
+  PublishPose(Pose(2.0, 2.0, 0.0));
   sim.step(30ms);
   const Frame* later = Latest();
   ASSERT_NE(later, nullptr);
@@ -358,12 +417,12 @@ TEST_F(TelemetryTest, StreamAndDictionaryIdsAreStable) {
 }
 
 TEST_F(TelemetryTest, DictionaryRidesFirstAndEveryHundredthFrame) {
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  PublishPose(Pose(1.0, 2.0, 0.0));
   std::map<std::uint64_t, bool> has_dictionary;
   std::uint64_t last_sequence = 0;
   bool saw_any = false;
   for (int i = 0; i < 210; ++i) {
-    sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+    PublishPose(Pose(1.0, 2.0, 0.0));
     sim.step(10ms);
     const Frame* frame = Latest();
     ASSERT_NE(frame, nullptr);
@@ -400,7 +459,7 @@ TEST_F(TelemetryTest, WorstCaseValueFrameFitsTheBudget) {
             << " channels\n";
   EXPECT_LE(worst, telemetry_wire::kMaxValueFrameBytes);
 
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  PublishPose(Pose(1.0, 2.0, 0.0));
   sim.publish(shooter::topics::kState, Shooter());
   sim.publish(intake::topics::kState, Intake(intake::Inhibit::DRIVE));
   sim.step(10ms);  // one tick: the latest frame is the dictionary frame
@@ -412,7 +471,7 @@ TEST_F(TelemetryTest, WorstCaseValueFrameFitsTheBudget) {
             << " bytes\n";
   EXPECT_LE(first_bytes, telemetry_wire::slot_bytes);
 
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  PublishPose(Pose(1.0, 2.0, 0.0));
   sim.step(20ms);
   const std::size_t value_bytes = LatestBytes();
   std::cout << "telemetry: measured value frame " << value_bytes << " bytes\n";
@@ -430,6 +489,8 @@ command_timeout_us = 100000
 period_us = 10000
 topic = "/talos/telemetry"
 stale_timeout_us = 100000
+# Any estimator's topic: telemetry names none.
+pose_topic = "/localizer/state"
 
 [subsystems.wrist]
 period_us = 20000
@@ -474,7 +535,7 @@ can_id = 1
   EXPECT_EQ(telemetry.dictionary().size(), frame->dictionary()->size());
 
   sim.step(150ms);
-  sim.publish(odometry::topics::kState, Odometry(1.0, 2.0, 0.0));
+  sim.publish("/localizer/state", Pose(1.0, 2.0, 0.0));
   sim.step(20ms);
 
   const auto stale_bytes = sim.latest_bytes("/talos/telemetry");
@@ -493,6 +554,9 @@ can_id = 1
   EXPECT_EQ(stale_channels.count("wrist/value"), 0u);
   EXPECT_NEAR(stale_channels.at("wrist/stale"), 1.0, 1e-12);
   EXPECT_NEAR(stale_channels.at("mechanism/stale"), 1.0, 1e-12);
+  // The pose came from the configured topic.
+  EXPECT_NEAR(stale_channels.at("pose/valid"), 1.0, 1e-12);
+  EXPECT_NEAR(stale_frame->chassis()->x(), 1.0, 1e-12);
 }
 
 // Channel names are the keys of /telemetry.json and Studio's decoder. A
@@ -508,6 +572,7 @@ command_timeout_us = 100000
 period_us = 10000
 topic = "/talos/telemetry"
 stale_timeout_us = 100000
+pose_topic = "/pose_estimator/state"
 
 [subsystems.bridge]
 period_us = 20000
@@ -541,7 +606,7 @@ TEST(Binary, DescribeDeclaresTheStudioFeedAsAnExternalSender) {
       std::string::npos)
       << output;
   for (const char* watched :
-       {"/odometry/state", "/drivetrain/state", "/shooter/state",
+       {"/pose_estimator/state", "/drivetrain/state", "/shooter/state",
         "/intake/state", "/hw/state/driver_station"}) {
     EXPECT_NE(output.find(std::string{R"({"kind": "WATCHER", "name": ")"} +
                           watched + "\""),

@@ -51,12 +51,12 @@ name = "intake"
 path = "subsystems/intake.toml"
 
 [[subsystems]]
-name = "odometry"
-path = "subsystems/odometry.toml"
-
-[[subsystems]]
 name = "operator_interface"
 path = "subsystems/operator_interface.toml"
+
+[[subsystems]]
+name = "pose_estimator"
+path = "subsystems/pose_estimator.toml"
 
 [[subsystems]]
 name = "shooter"

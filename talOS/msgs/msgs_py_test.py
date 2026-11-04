@@ -31,10 +31,10 @@ class WristNode:
         self.state.send(position_rot=goal, velocity_rps=0.0, goal_rot=goal,
                         enabled=active, at_goal=active, connected=True)
         self.odom.send(
-            timestamp_ns=42,
+            sample_time_ns=42,
             pose_x_m=1.25,
             pose_y_m=-0.75,
-            pose_yaw_rot=0.5,
+            pose_yaw_rad=0.5,
             velocity_vx_mps=2.0,
             velocity_vy_mps=-1.0,
             velocity_omega_radps=0.25,
@@ -62,10 +62,10 @@ class StandardMessagesTest(unittest.TestCase):
 
         sample = sim.latest(OdometrySample, "/wrist/telemetry")
         self.assertIsNotNone(sample)
-        self.assertEqual(sample.timestamp_ns, 42)
+        self.assertEqual(sample.sample_time_ns, 42)
         self.assertAlmostEqual(sample.pose_x_m, 1.25)
         self.assertAlmostEqual(sample.pose_y_m, -0.75)
-        self.assertAlmostEqual(sample.pose_yaw_rot, 0.5)
+        self.assertAlmostEqual(sample.pose_yaw_rad, 0.5)
         self.assertAlmostEqual(sample.velocity_vx_mps, 2.0)
         self.assertAlmostEqual(sample.velocity_vy_mps, -1.0)
         self.assertAlmostEqual(sample.velocity_omega_radps, 0.25)

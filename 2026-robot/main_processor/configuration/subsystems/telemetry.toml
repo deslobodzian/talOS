@@ -9,3 +9,5 @@ name = "telemetry"
 node = "//2026-robot/main_processor/telemetry:node"
 period_us = 10000
 topic = "/talos/telemetry"
+# The field pose (geometry.PoseEstimate) drawn in Studio and sent as pose/*.
+pose_topic = "/pose_estimator/state"

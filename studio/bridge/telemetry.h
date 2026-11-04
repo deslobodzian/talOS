@@ -164,7 +164,7 @@ inline std::string TelemetryJson(const TelemetryState& state,
   out += ",\"chassis\":";
   AppendPose(out, state.chassis);
   // Keyed by name (unique by the producer's construction-time check) so a
-  // reader goes straight to doc["channels"]["odometry/vx"]["value"]; members
+  // reader goes straight to doc["channels"]["pose/vx"]["value"]; members
   // stay in dictionary order.
   out += ",\"channels\":{";
   for (std::size_t i = 0; i < state.dictionary.size(); ++i) {

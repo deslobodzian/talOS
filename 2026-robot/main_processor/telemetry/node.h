@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
-#include <numbers>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -16,10 +15,9 @@
 #include "bridge/topics.h"
 #include "drivetrain/drive_message_generated.h"
 #include "drivetrain/topics.h"
+#include "geometry/geometry_generated.h"
 #include "intake/intake_message_generated.h"
 #include "intake/topics.h"
-#include "odometry/odometry_message_generated.h"
-#include "odometry/topics.h"
 #include "shooter/shooter_message_generated.h"
 #include "shooter/topics.h"
 #include "talOS/configuration/config_parser.h"
@@ -117,8 +115,10 @@ class Telemetry {
       : node_{node},
         stale_after_{std::chrono::microseconds{
             node.param<std::int64_t>("stale_timeout_us", 100'000)}},
-        odometry_{node.subscribe<::odometry::OdometryState>(
-            ::odometry::topics::kState)},
+        // The field pose: a geometry.PoseEstimate from whichever estimator
+        // the config names, so no estimator package is named here.
+        pose_{node.subscribe<::geometry::PoseEstimate>(
+            node.param<std::string>("pose_topic"))},
         drivetrain_{node.subscribe<::drivetrain::DrivetrainState>(
             ::drivetrain::topics::kState)},
         shooter_{
@@ -155,10 +155,10 @@ class Telemetry {
   const std::vector<ChannelDef>& dictionary() const { return dictionary_; }
 
   void update() {
-    const double yaw_rad = odometry_->yaw_rot() * 2.0 * std::numbers::pi;
-    const bool odom_ok = Fresh(odometry_) && std::isfinite(odometry_->x_m()) &&
-                         std::isfinite(odometry_->y_m()) &&
-                         std::isfinite(yaw_rad);
+    const bool pose_ok = Fresh(pose_) && pose_->valid() &&
+                         std::isfinite(pose_->pose().x_m()) &&
+                         std::isfinite(pose_->pose().y_m()) &&
+                         std::isfinite(pose_->pose().yaw_rad());
     const bool shooter_ok = Fresh(shooter_);
     const bool intake_ok = Fresh(intake_);
     bool extra_ok = false;
@@ -171,7 +171,7 @@ class Telemetry {
     // A live mechanism is worth showing before (and without) any pose; the
     // drivetrain and driver station alone carry neither, so they never
     // trigger a frame on their own.
-    if (!odom_ok && !mech_ok) return;
+    if (!pose_ok && !mech_ok) return;
 
     std::fill(values_.begin(), values_.end(),
               std::numeric_limits<double>::quiet_NaN());
@@ -181,21 +181,20 @@ class Telemetry {
       if (std::isfinite(value)) values_[index] = value;
     };
 
-    // Chassis is zeros until a fresh finite pose arrives, so the field view
-    // must gate drawing on this flag.
-    set(idx_pose_valid_, odom_ok ? 1.0 : 0.0);
-    if (odometry_.has_value())
-      set(idx_odometry_stale_, Fresh(odometry_) ? 0.0 : 1.0);
+    // Chassis is zeros until a fresh, valid, finite pose arrives, so the
+    // field view must gate drawing on this flag.
+    set(idx_pose_valid_, pose_ok ? 1.0 : 0.0);
+    if (pose_.has_value()) set(idx_pose_stale_, Fresh(pose_) ? 0.0 : 1.0);
     if (drivetrain_.has_value())
       set(idx_drivetrain_stale_, Fresh(drivetrain_) ? 0.0 : 1.0);
     set(idx_ds_stale_, ds_.connected() ? 0.0 : 1.0);
     if (shooter_.has_value() || intake_.has_value() || extra_has_value)
       set(idx_mechanism_stale_, mech_ok ? 0.0 : 1.0);
 
-    if (odom_ok) {
-      set(idx_odometry_vx_, odometry_->vx_mps());
-      set(idx_odometry_vy_, odometry_->vy_mps());
-      set(idx_odometry_omega_, odometry_->omega_radps());
+    if (pose_ok) {
+      set(idx_pose_vx_, pose_->velocity().vx_mps());
+      set(idx_pose_vy_, pose_->velocity().vy_mps());
+      set(idx_pose_omega_, pose_->velocity().omega_radps());
     }
     if (mech_ok && shooter_.has_value()) {
       if (shooter_ok) {
@@ -226,8 +225,11 @@ class Telemetry {
       set(idx_drivetrain_vx_, drivetrain_->vx_mps());
       set(idx_drivetrain_vy_, drivetrain_->vy_mps());
       set(idx_drivetrain_omega_, drivetrain_->omega_radps());
-      set(idx_drivetrain_yaw_rate_, drivetrain_->yaw_rate_rps());
+      set(idx_drivetrain_yaw_, drivetrain_->yaw_rad());
       set(idx_drivetrain_enabled_, drivetrain_->enabled() ? 1.0 : 0.0);
+      set(idx_drivetrain_modules_valid_,
+          drivetrain_->modules_valid() ? 1.0 : 0.0);
+      set(idx_drivetrain_yaw_valid_, drivetrain_->yaw_valid() ? 1.0 : 0.0);
     }
     if (ds_.connected()) {
       set(idx_ds_enabled_, ds_.enabled() ? 1.0 : 0.0);
@@ -249,6 +251,18 @@ class Telemetry {
         set(idx_bridge_timed_out_mask_,
             static_cast<double>(bridge_->timed_out_mask()));
         set(idx_bridge_configured_, bridge_->configured() ? 1.0 : 0.0);
+        // The gateway-to-node clock mapping: the offset and the delay
+        // spread only once it has converged for the current gateway boot.
+        set(idx_bridge_clock_offset_valid_,
+            bridge_->clock_offset_valid() ? 1.0 : 0.0);
+        set(idx_bridge_clock_resets_,
+            static_cast<double>(bridge_->clock_resets_count()));
+        if (bridge_->clock_offset_valid()) {
+          set(idx_bridge_clock_offset_us_,
+              static_cast<double>(bridge_->clock_offset_us()));
+          set(idx_bridge_clock_offset_spread_us_,
+              static_cast<double>(bridge_->clock_offset_spread_us()));
+        }
       }
       set(idx_bridge_stale_, bridge_ok ? 0.0 : 1.0);
     }
@@ -277,12 +291,13 @@ class Telemetry {
       }
       dictionary_offset = builder.CreateVector(entries);
     }
-    const Talos::Telemetry::Pose chassis{odom_ok ? odometry_->x_m() : 0.0,
-                                         odom_ok ? odometry_->y_m() : 0.0,
-                                         0.0,
-                                         0.0,
-                                         0.0,
-                                         odom_ok ? yaw_rad : 0.0};
+    const Talos::Telemetry::Pose chassis{
+        pose_ok ? pose_->pose().x_m() : 0.0,
+        pose_ok ? pose_->pose().y_m() : 0.0,
+        0.0,
+        0.0,
+        0.0,
+        pose_ok ? pose_->pose().yaw_rad() : 0.0};
     Talos::Telemetry::FinishSizePrefixedFrameBuffer(
         builder,
         Talos::Telemetry::CreateFrame(
@@ -324,13 +339,13 @@ class Telemetry {
 
   void BuildDictionary(Node& node) {
     idx_pose_valid_ = AddChannel("pose/valid");
-    idx_odometry_stale_ = AddChannel("odometry/stale");
+    idx_pose_stale_ = AddChannel("pose/stale");
     idx_drivetrain_stale_ = AddChannel("drivetrain/stale");
     idx_ds_stale_ = AddChannel("ds/stale");
     idx_mechanism_stale_ = AddChannel("mechanism/stale");
-    idx_odometry_vx_ = AddChannel("odometry/vx", "m/s");
-    idx_odometry_vy_ = AddChannel("odometry/vy", "m/s");
-    idx_odometry_omega_ = AddChannel("odometry/omega", "rad/s");
+    idx_pose_vx_ = AddChannel("pose/vx", "m/s");
+    idx_pose_vy_ = AddChannel("pose/vy", "m/s");
+    idx_pose_omega_ = AddChannel("pose/omega", "rad/s");
     idx_shooter_flywheel_ = AddChannel("shooter/flywheel", "rev/s");
     idx_shooter_beam_broken_ = AddChannel("shooter/beam_broken");
     idx_shooter_stale_ = AddChannel("shooter/stale");
@@ -351,9 +366,8 @@ class Telemetry {
       if (const auto* subs = cfg.toml_data["subsystems"].as_table()) {
         for (const auto& [key, val] : *subs) {
           const std::string_view sub_name = key.str();
-          if (sub_name == "odometry" || sub_name == "drivetrain" ||
-              sub_name == "shooter" || sub_name == "intake" ||
-              sub_name == "telemetry") {
+          if (sub_name == "drivetrain" || sub_name == "shooter" ||
+              sub_name == "intake" || sub_name == "telemetry") {
             continue;
           }
           const auto* tbl = val.as_table();
@@ -378,8 +392,10 @@ class Telemetry {
     idx_drivetrain_vx_ = AddChannel("drivetrain/vx", "m/s");
     idx_drivetrain_vy_ = AddChannel("drivetrain/vy", "m/s");
     idx_drivetrain_omega_ = AddChannel("drivetrain/omega", "rad/s");
-    idx_drivetrain_yaw_rate_ = AddChannel("drivetrain/yaw_rate", "rev/s");
+    idx_drivetrain_yaw_ = AddChannel("drivetrain/yaw", "rad");
     idx_drivetrain_enabled_ = AddChannel("drivetrain/enabled");
+    idx_drivetrain_modules_valid_ = AddChannel("drivetrain/modules_valid");
+    idx_drivetrain_yaw_valid_ = AddChannel("drivetrain/yaw_valid");
     idx_ds_enabled_ = AddChannel("ds/enabled");
     idx_ds_teleop_ = AddChannel("ds/teleop");
     idx_ds_autonomous_ = AddChannel("ds/autonomous");
@@ -390,6 +406,11 @@ class Telemetry {
     idx_bridge_timed_out_mask_ = AddChannel("bridge/timed_out_mask");
     idx_bridge_configured_ = AddChannel("bridge/configured");
     idx_bridge_stale_ = AddChannel("bridge/stale");
+    idx_bridge_clock_offset_us_ = AddChannel("bridge/clock_offset_us", "us");
+    idx_bridge_clock_offset_spread_us_ =
+        AddChannel("bridge/clock_offset_spread_us", "us");
+    idx_bridge_clock_offset_valid_ = AddChannel("bridge/clock_offset_valid");
+    idx_bridge_clock_resets_ = AddChannel("bridge/clock_resets");
   }
 
   template <class M>
@@ -400,7 +421,7 @@ class Telemetry {
 
   Node& node_;
   Duration stale_after_;
-  Subscription<::odometry::OdometryState> odometry_;
+  Subscription<::geometry::PoseEstimate> pose_;
   Subscription<::drivetrain::DrivetrainState> drivetrain_;
   Subscription<::shooter::ShooterState> shooter_;
   Subscription<::intake::IntakeState> intake_;
@@ -420,19 +441,22 @@ class Telemetry {
   std::vector<double> values_;
   flatbuffers::FlatBufferBuilder builder_{1024};
   std::uint64_t sequence_ = 0;
-  std::size_t idx_pose_valid_{0}, idx_odometry_stale_{0},
-      idx_drivetrain_stale_{0}, idx_ds_stale_{0}, idx_mechanism_stale_{0},
-      idx_odometry_vx_{0}, idx_odometry_vy_{0}, idx_odometry_omega_{0},
-      idx_shooter_flywheel_{0}, idx_shooter_beam_broken_{0},
-      idx_shooter_stale_{0}, idx_intake_requested_{0}, idx_intake_measured_{0},
-      idx_intake_inhibit_{0}, idx_intake_stale_{0}, idx_drivetrain_vx_{0},
-      idx_drivetrain_vy_{0}, idx_drivetrain_omega_{0},
-      idx_drivetrain_yaw_rate_{0}, idx_drivetrain_enabled_{0},
-      idx_ds_enabled_{0}, idx_ds_teleop_{0}, idx_ds_autonomous_{0},
-      idx_ds_match_time_{0}, idx_bridge_state_age_us_{0},
+  std::size_t idx_pose_valid_{0}, idx_pose_stale_{0}, idx_drivetrain_stale_{0},
+      idx_ds_stale_{0}, idx_mechanism_stale_{0}, idx_pose_vx_{0},
+      idx_pose_vy_{0}, idx_pose_omega_{0}, idx_shooter_flywheel_{0},
+      idx_shooter_beam_broken_{0}, idx_shooter_stale_{0},
+      idx_intake_requested_{0}, idx_intake_measured_{0}, idx_intake_inhibit_{0},
+      idx_intake_stale_{0}, idx_drivetrain_vx_{0}, idx_drivetrain_vy_{0},
+      idx_drivetrain_omega_{0}, idx_drivetrain_yaw_{0},
+      idx_drivetrain_enabled_{0}, idx_drivetrain_modules_valid_{0},
+      idx_drivetrain_yaw_valid_{0}, idx_ds_enabled_{0}, idx_ds_teleop_{0},
+      idx_ds_autonomous_{0}, idx_ds_match_time_{0}, idx_bridge_state_age_us_{0},
       idx_bridge_identity_rejected_{0}, idx_bridge_ownership_rejected_{0},
       idx_bridge_timed_out_mask_{0}, idx_bridge_configured_{0},
       idx_bridge_stale_{0};
+  std::size_t idx_bridge_clock_offset_us_{0},
+      idx_bridge_clock_offset_spread_us_{0}, idx_bridge_clock_offset_valid_{0},
+      idx_bridge_clock_resets_{0};
 };
 
 }  // namespace talos::telemetry

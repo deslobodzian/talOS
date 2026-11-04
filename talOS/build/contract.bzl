@@ -27,7 +27,8 @@ def _talos_schemas_impl(ctx):
             'out="$1"; prefix="$2"; n="$3"; shift 3; ' +
             'for dep in "${@:1:$n}"; do ' +
             'cp -R "$dep/." "$out" && chmod -R u+w "$out" || exit 1; done; ' +
-            'shift "$n"; mkdir -p "$out/$prefix" && cp "$@" "$out/$prefix"'
+            'shift "$n"; mkdir -p "$out/$prefix" && ' +
+            '{ [ "$#" -eq 0 ] || cp "$@" "$out/$prefix"; }'
         ),
         arguments = [tree.path, ctx.attr.include_prefix, str(len(dep_trees))] +
                     [t.path for t in dep_trees] + [f.path for f in ctx.files.srcs],
@@ -153,10 +154,13 @@ def _flatc_py_tree_impl(ctx):
     schemas = ctx.attr.schemas[_TalosMessagesInfo].tree
     bfbs = ctx.attr.bfbs[_TalosBfbsInfo].schemas
     inputs = ctx.files.srcs + [schemas] + [s.bfbs for s in bfbs]
+    # A topics-only package (no srcs) has no flatc output: its namespace
+    # package is just __init__.py and topics.py.
     command = (
         'flatc="$1" out="$2" tree="$3" gen="$4" ns="$5" topics="$6" n="$7"; ' +
-        'shift 7; "$flatc" -p --python-typing -I "$tree" -o "$out" ' +
-        '"${@:1:$n}" || exit 1; shift "$n"; ' +
+        'shift 7; if [ "$n" -gt 0 ]; then "$flatc" -p --python-typing ' +
+        '-I "$tree" -o "$out" "${@:1:$n}" || exit 1; else ' +
+        'mkdir -p "$out/$ns" && : > "$out/$ns/__init__.py"; fi; shift "$n"; ' +
         'while [ "$#" -gt 0 ]; do "$gen" py "$1" "$2" "$out" || exit 1; ' +
         "shift 2; done"
     )
@@ -292,7 +296,10 @@ def talos_messages(
 
     Args:
       name: the cc_library; the py_library is name + "_py".
-      srcs: .fbs schemas.
+      srcs: .fbs schemas. Empty for a topics-only package whose messages
+        all come from `deps` (a pose estimator publishing
+        geometry.PoseEstimate): `:<name>` is then topics.h plus the deps and
+        `:<name>_py` is `<prefix>.topics`.
       topics: lower_snake_case name -> topic.
       include_prefix: overrides the include prefix.
       deps: other talos_messages targets this package's schemas include.
@@ -336,6 +343,30 @@ def talos_messages(
         deps = [_dep_target(dep, "_schemas") for dep in deps],
         visibility = visibility,
     )
+    bfbs_name = name + "_bfbs"
+    _talos_bfbs(
+        name = bfbs_name,
+        srcs = srcs,
+        schemas = ":" + schemas_name,
+        include_prefix = include_prefix,
+        visibility = visibility,
+    )
+    _talos_messages_py(name, srcs, schemas_name, bfbs_name, topics_py, include_prefix, deps, visibility)
+    if not srcs:
+        # Topics only: every message the package uses comes from `deps` (a
+        # pose estimator publishing geometry.PoseEstimate), so flatc has
+        # nothing to compile and the library is topics.h plus the deps.
+        if not topics:
+            fail("talos_messages: %s has neither srcs nor topics" % label)
+        cc_library(
+            name = name,
+            hdrs = hdrs,
+            strip_include_prefix = ".",
+            include_prefix = include_prefix,
+            deps = list(deps),
+            visibility = visibility,
+        )
+        return
     fbs_name = name + "_fbs"
     # --no-includes suppresses #include of dep schemas; drop it once this
     # package has deps, and keep each include's prefix so the generated
@@ -372,14 +403,6 @@ def talos_messages(
         flatc_args = flatc_args,
         visibility = ["//visibility:private"],
     )
-    bfbs_name = name + "_bfbs"
-    _talos_bfbs(
-        name = bfbs_name,
-        srcs = srcs,
-        schemas = ":" + schemas_name,
-        include_prefix = include_prefix,
-        visibility = visibility,
-    )
     _talos_cc_descriptors(
         name = name + "_descriptors",
         bfbs = ":" + bfbs_name,
@@ -395,6 +418,8 @@ def talos_messages(
         deps = [":" + fbs_name, str(Label("//talOS/schema:descriptor"))] + list(deps),
         visibility = visibility,
     )
+
+def _talos_messages_py(name, srcs, schemas_name, bfbs_name, topics_py, include_prefix, deps, visibility):
     _flatc_py_tree(
         name = name + "_py_gen",
         srcs = srcs,
@@ -485,6 +510,13 @@ def talos_cc_node(
       visibility: of the talos_node target (public by default).
       **kwargs: passed to the cc_binary.
     """
+    # A bundle copies the binary to bin/<name> and its shared libraries
+    # (libwpimath, ...) to lib/ (talos_bundle), so the binary also searches
+    # ../lib beside Bazel's own runfiles rpaths.
+    linkopts = kwargs.pop("linkopts", []) + select({
+        Label("@platforms//os:macos"): ["-Wl,-rpath,@loader_path/../lib"],
+        "//conditions:default": ["-Wl,-rpath,$$ORIGIN/../lib"],
+    })
     if not node_target:
         node_target = str(native.package_relative_label(name))
         if node_target.startswith("@@//"):
@@ -495,6 +527,7 @@ def talos_cc_node(
         name = bin_name,
         srcs = srcs,
         deps = deps + [node_dep],
+        linkopts = linkopts,
         local_defines = [
             'TALOS_NODE_NAME=\\"%s\\"' % node_name,
             'TALOS_NODE_TARGET=\\"%s\\"' % node_target,
@@ -616,6 +649,7 @@ def _talos_bundle_impl(ctx):
 
         direct_inputs.append(n_exec)
         rf_list = []
+        lib_list = []
         if n_rf and n_rf.files:
             transitive_inputs.append(n_rf.files)
             if n_lang == "python":
@@ -628,7 +662,13 @@ def _talos_bundle_impl(ctx):
                         "src_path": f.path,
                         "rf_rel": rf_rel,
                     })
-
+            else:
+                # A C++ node is copied without its runfiles, so the shared
+                # libraries it links go to lib/, which talos_cc_node's rpath
+                # names.
+                for f in n_rf.files.to_list():
+                    if f.extension in ("dylib", "so") or ".so." in f.basename:
+                        lib_list.append({"src_path": f.path, "name": f.basename})
         raw_label = str(node.label)
         clean_label = raw_label
         if clean_label.startswith("@@//"):
@@ -643,6 +683,7 @@ def _talos_bundle_impl(ctx):
             "language": n_lang,
             "src_path": n_exec.path,
             "runfiles": rf_list,
+            "shared_libs": lib_list,
         })
 
     # Each config file keeps its path relative to the config, so `include`,
