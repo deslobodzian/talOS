@@ -37,19 +37,25 @@ controller; pose estimation and vision are separate future nodes.
 `/drivetrain/state` (`DrivetrainState`) is published every tick, whatever
 the hardware says:
 
-- `modules_valid` is true when all eight module motors report. While it is
-  false nothing is driven (every module neutral), the chassis speeds read 0
-  and the four module positions (`module0`..`module3`, in geometry order:
-  wheel travel in meters from the drive motor, azimuth in radians from the
-  steer motor) hold their last valid values.
+- `modules_valid` is true when all eight module motors report and the sample
+  time is known. While a motor does not report, nothing is driven (every
+  module neutral), the chassis speeds read 0 and the four module positions
+  (`module0`..`module3`, in geometry order: wheel travel in meters from the
+  drive motor, azimuth in radians from the steer motor) hold their last valid
+  values.
 - `yaw_rad` is the Pigeon's yaw converted from rotations, and `yaw_valid`
   says whether the Pigeon reports. While it does not, `yaw_rad` holds the last
   valid heading (0 before the first). Under `--sim` the heading is instead
   integrated from the rotation the modules measure, valid while the modules
   are, because a simulated Pigeon reads a valid, permanently zero yaw;
   `integrate_heading = true|false` in `[subsystem]` overrides that choice.
-- `sample_time_ns` is the node-clock time of the hardware sample the state
-  was computed from, 0 (with both flags false) while it is unknown.
+- `sample_time_ns` is `HardwareLink::sample_time()`: the gateway's sample
+  time of the `/hw/state` the tick read, mapped into the node clock by the
+  bridge's min-filtered offset (`talOS/hardware/README.md`). It reads later
+  than the true sample by the link's minimum latency, never earlier. It is 0,
+  with `modules_valid` and `yaw_valid` false, until the mapping converges
+  (8 hardware states) and whenever hardware is stale; the modules are still
+  driven then, since actuation does not need the time.
 
 ## Local Topics
 
