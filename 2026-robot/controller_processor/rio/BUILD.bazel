@@ -1,0 +1,16 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+# The RoboRIO program builds with Gradle (GradleRIO), not Bazel. This package
+# only checks that the WPILib release GradleRIO pins is the one the main
+# processor links (C++ Maven artifacts) and imports (robotpy wheels).
+py_test(
+    name = "wpilib_lockstep_test",
+    size = "small",
+    srcs = ["wpilib_lockstep_test.py"],
+    data = [
+        "build.gradle",
+        "//talOS/python:requirements.txt",
+        "//third_party/wpilib:extensions.bzl",
+    ],
+    deps = ["@rules_python//python/runfiles"],
+)

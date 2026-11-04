@@ -1,1 +1,51 @@
-flatbuffers==25.12.19
+# Pinned Python lock for the `pypi` hub (MODULE.bazel pip.parse), CPython
+# 3.11. Every distribution, transitive ones included, is pinned with the
+# sha256 of its cp311/py3 wheels for macOS (arm64, x86_64) and manylinux
+# (x86_64, aarch64).
+#
+# robotpy-native-wpimath/wpiutil must stay on the WPILib release that
+# third_party/wpilib/extensions.bzl (_VERSION) and GradleRIO pin;
+# //2026-robot/controller_processor/rio:wpilib_lockstep_test checks it.
+flatbuffers==25.12.19 \
+    --hash=sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4
+gtsam==4.3.0 \
+    --hash=sha256:17ba2389d2fdce4bbe15261e2655d78ed1a20c5b4b3df52f65b2cced73ad7ac1 \
+    --hash=sha256:07deb2aa005f7bbe0b42906623a6c5314804d50b32ebc0e2a53de468546c97d8 \
+    --hash=sha256:63cae1c925f0094832b7f8d629951d4631cac57c6d7faba140c8ecc9f3c57752
+# gtsam's wheel metadata requires pytest (and so its four dependencies)
+# unconditionally; nothing in talos imports them.
+iniconfig==2.3.1 \
+    --hash=sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7
+numpy==2.4.6 \
+    --hash=sha256:0280e0356c0829a18d9de1cb7eee50ec22ca639878d7240307ca0943d73cd2c4 \
+    --hash=sha256:110f8b71aacb688ec69062bb7f6938a0f8acb01b7c1c4beb453c65b6d234584d \
+    --hash=sha256:4cfe66903cc32a9921a6733d96b19bb6abf310397581bbad89c228f5abaf0ee8 \
+    --hash=sha256:8155154c7c691289fe18f510b5d4657c68c67989f293f0535a91360392ff6538 \
+    --hash=sha256:0ab0a9c4ffb1a6d95ef519fe4247dba8eb6b18ad93999f76b7f657039acabd47 \
+    --hash=sha256:89cd468399cfd2504718f0ba50e410dca55a170b61a02ad92bb18c8a65186e93
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+pluggy==1.7.0 \
+    --hash=sha256:7dd7b0d8832ba3cb632c306926ded123429211b83641b35dc5c41ad2d34f9bec
+pygments==2.21.0 \
+    --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
+pytest==9.2.0 \
+    --hash=sha256:07acdcf88ec174f907dc01af70bf52d49b014bbab03faeeade31c96b18c2e588
+robotpy-wpimath==2026.2.1.1 \
+    --hash=sha256:714988a85c160c3e72320bed0b17c5513fd93d51e640b701f41fa46ab4a1edf7 \
+    --hash=sha256:04b7988d3d2830e8198165e24bd55c3ae61877675e8c1ed5035f1ee27e7e9983 \
+    --hash=sha256:181abb34f3f39413a00b05de68ac3a58c6093b9a2eb45adae03dfb707d0ef896 \
+    --hash=sha256:317ded93e92f28660c8b81231ed0f0332a079de096ce1fcd9e3e88fa6d54ecf5
+robotpy-wpiutil==2026.2.1.1 \
+    --hash=sha256:7323d322357e712d2abd1d223883ae43e1af1480d45f359bc0609d46b65cf1d1 \
+    --hash=sha256:c895a35ae200241edbb0d445989d4d5ec2090452215b9275574e3ac68fc57fb2 \
+    --hash=sha256:48236590a210e7dd679a55938cea32374129e9e8aa08d67b4f3e41a33a588b8f \
+    --hash=sha256:5327cd54fcee03d3ebdbbe9f8ad0ab6f598ac71c76e1cef51c063e86df6e9043
+robotpy-native-wpimath==2026.2.1 \
+    --hash=sha256:6f8d3f8f3b07bab1fc02d2c441fe9a886c69356a13eccfae79703aaa6e8f883e \
+    --hash=sha256:95e445a50195934462403e9982bb0ed7c2153592b92ef3469557239a15af0727 \
+    --hash=sha256:e986707c13c6b625966f1fff4b4974c6c282cf1048ef7cffd24db385b6a04b15
+robotpy-native-wpiutil==2026.2.1 \
+    --hash=sha256:651d231d3c46bd207dfcfc6ed5b8449c30d20cd09683579d06d5d79137ad9a22 \
+    --hash=sha256:73cce29328250f6aee2dc3e0e1de125179010069a498da0819eeeea9298c42bb \
+    --hash=sha256:949d59d10bbd1b1941a480bd53ed59dfda8f2e92d1c35b895def2df0027e1f32
