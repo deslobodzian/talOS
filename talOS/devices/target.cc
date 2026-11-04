@@ -26,12 +26,14 @@ struct TargetState {
   std::vector<std::int32_t> autonomous;
   std::vector<std::int32_t> test;
   DriverStation ds;
+  std::size_t selection = 0;  // NodeAccess::add_selection: who drives
 };
 
 struct LaneState {
   std::size_t publisher = 0;
   std::size_t bytes = 0;
   std::size_t alignment = 0;
+  DriverStation ds;                 // whose generation send() stamps
   std::vector<std::byte> envelope;  // reused for every send
 };
 
@@ -62,6 +64,22 @@ LaneState& LaneAt(Node& node, std::size_t index) {
   return lanes[index];
 }
 
+// Hands whatever target_get decided -- on every path out of it -- to the
+// node's registry row, so a viewer can see who drives the subsystem.
+class ReportSelection {
+ public:
+  ReportSelection(Node& node, std::size_t selection, const std::int32_t& source)
+      : node_{node}, selection_{selection}, source_{source} {}
+  ~ReportSelection() { NodeAccess::set_selected(node_, selection_, source_); }
+  ReportSelection(const ReportSelection&) = delete;
+  ReportSelection& operator=(const ReportSelection&) = delete;
+
+ private:
+  Node& node_;
+  std::size_t selection_;
+  const std::int32_t& source_;
+};
+
 }  // namespace
 
 std::size_t TargetEnvelopeBytes(std::size_t bytes, std::size_t alignment) {
@@ -73,17 +91,28 @@ std::size_t TargetEnvelopeBytes(std::size_t bytes, std::size_t alignment) {
         ": the alignment must be a power of two at most " +
         std::to_string(kMessageAlignment) + " that divides the size");
   }
-  return alignment + bytes;
+  return kTargetEnvelopeHeaderBytes + bytes;
 }
 
-void EncodeTargetEnvelope(bool active, const void* message, std::size_t bytes,
+void EncodeTargetEnvelope(std::uint64_t mode_since_us, bool active,
+                          const void* message, std::size_t bytes,
                           std::size_t alignment, std::span<std::byte> out) {
   if (out.size() != TargetEnvelopeBytes(bytes, alignment)) {
     throw std::invalid_argument("target envelope buffer has the wrong size");
   }
   std::fill(out.begin(), out.end(), std::byte{0});
-  out[0] = std::byte{active ? std::uint8_t{1} : std::uint8_t{0}};
-  if (message != nullptr) std::memcpy(out.data() + alignment, message, bytes);
+  std::memcpy(out.data(), &mode_since_us, sizeof mode_since_us);
+  out[8] = std::byte{active ? std::uint8_t{1} : std::uint8_t{0}};
+  if (message != nullptr) {
+    std::memcpy(out.data() + kTargetEnvelopeHeaderBytes, message, bytes);
+  }
+}
+
+TargetEnvelopeHeader DecodeTargetEnvelopeHeader(const std::byte* envelope) {
+  TargetEnvelopeHeader header;
+  std::memcpy(&header.mode_since_us, envelope, sizeof header.mode_since_us);
+  header.active = envelope[8] == std::byte{1};
+  return header;
 }
 
 std::size_t TargetAccess::open_target(Node& node, std::size_t bytes,
@@ -117,6 +146,7 @@ std::size_t TargetAccess::open_target(Node& node, std::size_t bytes,
   state.teleop = indexes(policy.teleop);
   state.autonomous = indexes(policy.autonomous);
   state.test = indexes(policy.test);
+  state.selection = NodeAccess::add_selection(node, state.sources);
   auto& targets = node.extension<Targets>().targets;
   targets.push_back(std::move(state));
   return targets.size() - 1;
@@ -126,6 +156,7 @@ const void* TargetAccess::target_get(Node& node, std::size_t target,
                                      std::int32_t& source) {
   source = -1;
   const TargetState& state = TargetAt(node, target);
+  const ReportSelection report{node, state.selection, source};
   if (!robot_enabled(node)) return nullptr;
   const std::vector<std::int32_t>* lanes = nullptr;
   switch (DriverStationAccess::mode(state.ds)) {
@@ -141,21 +172,26 @@ const void* TargetAccess::target_get(Node& node, std::size_t target,
     case DsMode::kNone:
       return nullptr;
   }
-  const Time since = DriverStationAccess::mode_since(state.ds);
-  const Time now = node.now();
+  // Zero while the consumer's own Driver Station shows no mode; the switch
+  // above has already returned then.
+  const std::uint64_t generation = DriverStationAccess::generation(state.ds);
   const Duration timeout = NodeAccess::freshness_timeout(node);
   for (const std::int32_t lane : *lanes) {
     const std::size_t subscription =
         state.subscriptions[static_cast<std::size_t>(lane)];
     if (!NodeAccess::subscription_has_value(node, subscription)) continue;
-    const Duration age = NodeAccess::subscription_age(node, subscription);
-    // Received before this mode began: a word meant for another mode.
-    if (now - age < since || age >= timeout) continue;
+    if (NodeAccess::subscription_age(node, subscription) >= timeout) continue;
     const auto* envelope = static_cast<const std::byte*>(
         NodeAccess::subscription_value(node, subscription));
-    if (envelope[0] != std::byte{1}) continue;  // released
+    const TargetEnvelopeHeader header = DecodeTargetEnvelopeHeader(envelope);
+    if (!header.active) continue;  // released
+    // Issued under another enable or mode (or with no Driver Station view
+    // at all): a word meant for a different generation.
+    if (header.mode_since_us == 0 || header.mode_since_us != generation) {
+      continue;
+    }
     source = lane;
-    return envelope + state.alignment;
+    return envelope + kTargetEnvelopeHeaderBytes;
   }
   return nullptr;
 }
@@ -188,6 +224,9 @@ std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
           NodeAccess::add_publisher(node, topic, envelope, kMessageAlignment),
       .bytes = bytes,
       .alignment = alignment,
+      // Subscribed here, so the producer drains the Driver Station right
+      // before its timer and send() stamps the packet it saw last.
+      .ds = DriverStation{node},
       .envelope = std::vector<std::byte>(envelope),
   });
   return lanes.size() - 1;
@@ -203,16 +242,16 @@ bool TargetAccess::lane_send(Node& node, std::size_t lane, const void* message,
         (message == nullptr ? std::string{"no message"}
                             : std::to_string(bytes) + " bytes"));
   }
-  EncodeTargetEnvelope(true, message, state.bytes, state.alignment,
-                       state.envelope);
+  EncodeTargetEnvelope(DriverStationAccess::generation(state.ds), true, message,
+                       state.bytes, state.alignment, state.envelope);
   return NodeAccess::publisher_send(
       node, state.publisher, state.envelope.data(), state.envelope.size());
 }
 
 bool TargetAccess::lane_release(Node& node, std::size_t lane) {
   LaneState& state = LaneAt(node, lane);
-  EncodeTargetEnvelope(false, nullptr, state.bytes, state.alignment,
-                       state.envelope);
+  EncodeTargetEnvelope(DriverStationAccess::generation(state.ds), false,
+                       nullptr, state.bytes, state.alignment, state.envelope);
   return NodeAccess::publisher_send(
       node, state.publisher, state.envelope.data(), state.envelope.size());
 }

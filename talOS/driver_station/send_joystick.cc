@@ -80,10 +80,12 @@ int main(int argc, char** argv) {
         std::chrono::steady_clock::now() + std::chrono::seconds{duration_s};
     auto next = std::chrono::steady_clock::now();
     uint64_t sent = 0, dropped = 0;
+    talos::driver_station::ModeTracker mode;
     while (!talos::process::stop_requested.load() &&
            std::chrono::steady_clock::now() < end) {
       ds.sample_time_us =
           static_cast<uint64_t>(talos::event::Poller::now().nanos() / 1000);
+      mode.Stamp(ds);
       talos::hardware::Packet packet{};
       packet.size =
           static_cast<uint32_t>(talos::driver_station::Encode(ds, packet.data));
@@ -102,6 +104,7 @@ int main(int argc, char** argv) {
     ds.fms.flags = talos::driver_station::kDsAttached;
     ds.sample_time_us =
         static_cast<uint64_t>(talos::event::Poller::now().nanos() / 1000);
+    mode.Stamp(ds);
     talos::hardware::Packet packet{};
     packet.size =
         static_cast<uint32_t>(talos::driver_station::Encode(ds, packet.data));

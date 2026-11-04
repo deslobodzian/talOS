@@ -45,7 +45,7 @@ class Wrist {
 
   void update() {
     // read: null unless the robot is enabled and the lane selected for the
-    // current Driver Station mode is active and fresh
+    // current Driver Station mode is active, fresh and of this mode generation
     const control::PositionTarget* t = target_.get();
     const bool feedback = motor_.connected() && angle_.connected();
     const bool drive = t != nullptr && feedback && std::isfinite(t->position_rot());
@@ -93,10 +93,13 @@ class Wrist:
                         connected=feedback)
 ```
 
-`Target<M>::get()` folds `robot_enabled(node)`, the Driver Station mode, the
-lane priority, release and freshness into one null check, so target messages
-carry no `enabled` field. **[review; the graph lint checks each lane against
-the policy]**
+`Target<M>::get()` folds `robot_enabled(node)`, the Driver Station mode and
+its generation, the lane priority, release and freshness into one null check,
+so target messages carry no `enabled` field. A target sent under an earlier
+enable or mode never passes it: each envelope carries the producer's mode
+generation (the RoboRIO's `mode_since_us`), and only the consumer's current one
+is accepted. **[enforced: `Target`, `target_test`, `talos_test`; the graph lint
+checks each lane against the policy]**
 
 ## 3. Inputs
 
@@ -104,7 +107,7 @@ There are exactly two kinds of input, and they are treated differently.
 
 | Kind | Topic | Missing or stale means | Read with |
 |---|---|---|---|
-| **Target**: what someone asks this node to do | `/<me>/target/<source>` lanes, one per producer; priority per Driver Station mode from `[robot.targets]` / the subsystem's `[targets]` | do nothing: neutral | `talos::Target<M>::get()` (null: neutral) |
+| **Target**: what someone asks this node to do | `/<me>/target/<source>` lanes, one per producer; priority per Driver Station mode from `[robot.targets]` / the subsystem's `[targets]` | do nothing: neutral (also when the lane was sent under another mode generation) | `talos::Target<M>::get()` (null: neutral) |
 | **Observation**: what another node reports | `/<other>/state`, `/<other>/status`, `/hw/...` | the decision that needs it is not made; publish your state with the matching validity flag cleared | `fresh()` plus that message's own validity flags |
 
 - Never dereference a subscription without checking `fresh()` in the same
@@ -278,11 +281,15 @@ with **all** of these cases **[review; the scaffold generates the skeleton]**:
 | Non-finite demand | neutral; no NaN in `state` |
 | Bad parameter | the constructor throws, naming the key |
 | Source switch (a node with several lanes) | the old mode's lane is ignored after a mode change |
+| Target from an earlier mode generation (`PublishTarget(..., message, before)` / `sim.publish_target(..., mode_since_us=before)` after a re-enable) | neutral, even when it lands in the same drain as the re-enabling packet |
 
 Publish targets with `talos::testing::PublishTarget` / `sim.publish_target`,
 with `hw.enable()` and a teleop-enabled Driver Station
 (`hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop))` /
-`hw.set_driver_station(enabled=True, teleop=True)`).
+`hw.set_driver_station(enabled=True, teleop=True)`). They stamp the mode
+generation of the newest Driver Station packet
+(`DriverStationGeneration(sim)` / `sim.driver_station_generation`), as a
+producer that has drained it would.
 
 - Test behaviour through topics and `SimHardware`. Never test private methods
   or log text.

@@ -69,6 +69,19 @@ class Reporter {
     std::function<std::uint64_t()> dropped;
   };
 
+  // One of the node's Targets (talOS/devices/target.h): who drives the
+  // subsystem, which no manifest or counter says. The node selects a lane on
+  // every get(); this reads the latest selection once per refresh.
+  struct Selection {
+    // The policy's sources, in TargetPolicy::Sources() order.
+    std::vector<std::string> sources;
+
+    // Index into `sources` of the lane the Target selected last, or -1 for
+    // none. Called from the reporting thread, so the same rule as
+    // ExtraSource::events: a copy of an atomic, never anything that locks.
+    std::function<std::int32_t()> selected;
+  };
+
   struct Options {
     std::string name;
     std::string target;
@@ -88,6 +101,9 @@ class Reporter {
     // The `topic` views are not copied, so they must outlive the Reporter --
     // string literals at a node's main, which is where these are written.
     std::vector<EndpointAttribute> endpoints;
+
+    // The node's Targets, in the order it opened them.
+    std::vector<Selection> selections;
 
     // How often the slot is refreshed. Four times a second is well inside the
     // liveness timeout and far below any rate a human or an agent polls at.
@@ -177,6 +193,7 @@ class Reporter {
     }
 
     registration->publish(manifest, endpoints);
+    registration->publish_selections(options_.selections);
     published_.store(true, std::memory_order_release);
 
     while (!stop.stop_requested() && loop.running()) {
@@ -227,6 +244,12 @@ class Reporter {
                               events,
                               /*last_monotonic_ns=*/0, /*last_latency_ns=*/0,
                               /*max_latency_ns=*/0);
+    }
+
+    for (std::size_t i = 0; i < options_.selections.size(); ++i) {
+      const Selection& selection = options_.selections[i];
+      registration.set_selected(static_cast<std::uint32_t>(i),
+                                selection.selected ? selection.selected() : -1);
     }
     registration.end_sample();
   }

@@ -26,9 +26,10 @@ them, in both modes:
 | elevator | `/elevator/target/superstructure` | `/elevator/target/superstructure` | `[targets]` in `subsystems/elevator.toml` |
 
 A Target has a goal only while the robot is enabled, the Driver Station is in
-an enabled mode, and that mode's lane is active (not released) and fresh
-(younger than `[robot] command_timeout_us`). With none, a subsystem is
-neutral: it calls no actuator.
+an enabled mode, and that mode's lane is active (not released), fresh
+(younger than `[robot] command_timeout_us`) and sent under the current mode
+generation (its producer had drained the Driver Station packet of this enable
+and mode). With none, a subsystem is neutral: it calls no actuator.
 
 - **intake**: IDLE → INTAKING (roller in) → HOLDING once the beam breaks (small
   hold voltage) → EJECTING (reverse for `eject_ms`) → IDLE. With no target it

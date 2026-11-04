@@ -41,7 +41,7 @@ which end of a topic is allowed to publish it.
 
 | Topic | Single publisher | Payload |
 |---|---|---|
-| `/drivetrain/target/<source>` | that source's producer (`teleop`: `operator_interface`) | `talos::TargetEnvelope<ChassisTarget>` (`active` + `ChassisTarget`) |
+| `/drivetrain/target/<source>` | that source's producer (`teleop`: `operator_interface`) | `talos::TargetEnvelope<ChassisTarget>` (mode generation + `active` + `ChassisTarget`) |
 | `/hw/state` | Hardware bridge | Canonical hardware state in fixed `Packet` |
 | `/hw/request/drivetrain` | Drivetrain | Partial command, this subsystem's devices only, in fixed `Packet` |
 | `/hw/command` | Hardware bridge | Canonical hardware command in fixed `Packet` |
@@ -123,8 +123,12 @@ bazel run //2026-robot/main_processor/drivetrain:send_target -- 1 0 0 2
 `send_target` is a sim/bench tool only: it writes a drivetrain lane
 (`--source NAME`, default `teleop`) directly, bypassing the operator
 interface, so the drivetrain follows it only while enabled in a Driver Station
-mode whose policy selects that source (Teleoperated for `teleop`). On a robot,
-drive through the operator interface.
+mode whose policy selects that source (Teleoperated for `teleop`). Like a
+`TargetLane`, it stamps each envelope with the mode generation of the newest
+`/hw/state/driver_station` packet, so it cannot drive an enable or mode it did
+not see; without Driver Station packets (the sim gateway sends none) it
+stamps 0 and the drivetrain stays neutral. On a robot, drive through the
+operator interface.
 
 Wait for the gateway to print `hardware gateway config=...` before starting the
 bridge; that line means its socket is open.

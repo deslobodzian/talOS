@@ -70,11 +70,15 @@ struct HardwareAccess {
 // stale, detached, disabled or e-stopped.
 enum class DsMode : std::uint8_t { kNone, kTeleop, kAutonomous, kTest };
 
+// The mode a packet's flags name (driver_station::ModeKey), as if it were
+// fresh: none when detached, disabled or e-stopped.
+DsMode DsModeOf(std::uint32_t flags);
+
 struct DriverStationAccess {
   static DsMode mode(const DriverStation& ds);
-  // When the current mode began: the receipt time of the first packet
-  // observed in it.
-  static event::MonotonicTime mode_since(const DriverStation& ds);
+  // The current mode generation: the latest packet's mode_since_us while
+  // mode() is not none, else 0.
+  static std::uint64_t generation(const DriverStation& ds);
 };
 
 // Target and TargetLane (target.h) over message bytes, so the C ABI drives
@@ -94,6 +98,7 @@ struct TargetAccess {
   // The message size the target was opened with.
   static std::size_t target_bytes(Node& node, std::size_t target);
 
+  // Subscribes to the Driver Station, whose generation lane_send stamps.
   static std::size_t open_lane(Node& node, std::string_view subsystem,
                                std::string_view source, std::size_t bytes,
                                std::size_t alignment);
@@ -102,13 +107,21 @@ struct TargetAccess {
   static bool lane_release(Node& node, std::size_t lane);
 };
 
-// sizeof(TargetEnvelope<M>) for a message of `bytes` and `alignment`. Throws
-// std::invalid_argument unless alignment is a power of two at most 8 that
-// divides bytes.
+// sizeof(TargetEnvelope<M>) for a message of `bytes` and `alignment`: the
+// 16-byte header plus `bytes`. Throws std::invalid_argument unless alignment
+// is a power of two at most 8 that divides bytes.
 std::size_t TargetEnvelopeBytes(std::size_t bytes, std::size_t alignment);
-// Writes the envelope: active, zero padding, then the message (zeros when
-// `message` is null). `out` holds TargetEnvelopeBytes(bytes, alignment).
-void EncodeTargetEnvelope(bool active, const void* message, std::size_t bytes,
+// Writes the envelope: the header (mode_since_us, active, zeros), then the
+// message (zeros when `message` is null). `out` holds
+// TargetEnvelopeBytes(bytes, alignment).
+void EncodeTargetEnvelope(std::uint64_t mode_since_us, bool active,
+                          const void* message, std::size_t bytes,
                           std::size_t alignment, std::span<std::byte> out);
+// An envelope's header, as EncodeTargetEnvelope wrote it.
+struct TargetEnvelopeHeader {
+  std::uint64_t mode_since_us = 0;
+  bool active = false;
+};
+TargetEnvelopeHeader DecodeTargetEnvelopeHeader(const std::byte* envelope);
 
 }  // namespace talos::detail

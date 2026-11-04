@@ -314,14 +314,71 @@ class TargetTest(unittest.TestCase):
         self.hold("teleop", 1.25, 0.01)
         self.assertEqual(self.seen(), 1.25)
 
-    def test_lane_in_the_same_drain_as_the_mode_change_is_accepted(self):
+    def reenable_between_ticks(self):
+        """Disabled, then teleop again; the re-enabling packet waits for the
+        lift's next drain with whatever producers queued meanwhile."""
         self.mode()  # attached, disabled
         self.sim.step(0.001)  # off the grid packets and ticks share
         self.hw.set_driver_station(enabled=True, teleop=True)
         self.sim.step(0.009)  # the packet goes out just after this tick
+
+    def test_target_queued_before_the_mode_change_is_rejected(self):
+        self.hold("teleop", 1.0)
+        self.assertEqual(self.seen(), 1.0)
+        teleop = self.sim.driver_station_generation
+        self.reenable_between_ticks()
+        self.assertNotEqual(self.sim.driver_station_generation, teleop)
+        # Same drain as the re-enabling packet, said under the old period.
+        self.sim.publish_target(Goal, "lift", "teleop", height_rot=2.0,
+                                mode_since_us=teleop)
+        self.sim.step(0.01)
+        self.assertEqual((self.seen(), self.lift.source), (None, ""))
+
+    def test_target_of_the_new_generation_is_accepted_in_the_same_drain(self):
+        self.reenable_between_ticks()
         self.sim.publish_target(Goal, "lift", "teleop", height_rot=0.5)
         self.sim.step(0.01)
         self.assertEqual(self.seen(), 0.5)
+
+    def test_target_from_a_producer_with_no_mode_is_rejected(self):
+        self.sim.publish_target(Goal, "lift", "teleop", height_rot=1.0,
+                                mode_since_us=0)
+        self.sim.step(0.01)
+        self.assertIsNone(self.seen())
+
+    def test_same_mode_recovery_keeps_the_generation(self):
+        self.hold("teleop", 1.0)
+        teleop = self.sim.driver_station_generation
+        self.hw.stop_driver_station()
+        self.sim.step(0.15)
+        self.sim.publish_target(Goal, "lift", "teleop", height_rot=3.0,
+                                mode_since_us=0)  # sent while it saw none
+        self.mode(enabled=True, teleop=True)
+        self.assertEqual(self.sim.driver_station_generation, teleop)
+        self.assertIsNone(self.seen())
+        self.hold("teleop", 1.5, 0.01)
+        self.assertEqual(self.seen(), 1.5)
+
+    def test_reattach_starts_a_generation_the_old_lane_cannot_drive(self):
+        self.hold("teleop", 1.0)
+        teleop = self.sim.driver_station_generation
+        self.mode(enabled=True, teleop=True, attached=False)
+        self.assertIsNone(self.seen())
+        self.mode(enabled=True, teleop=True)
+        self.assertNotEqual(self.sim.driver_station_generation, teleop)
+        self.sim.publish_target(Goal, "lift", "teleop", height_rot=1.0,
+                                mode_since_us=teleop)
+        self.sim.step(0.01)
+        self.assertIsNone(self.seen())
+        self.hold("teleop", 1.25, 0.01)
+        self.assertEqual(self.seen(), 1.25)
+
+    def test_stale_higher_priority_lane_falls_back_to_the_next(self):
+        self.sim.publish_target(Goal, "lift", "align", height_rot=2.0)
+        self.hold("teleop", 1.0, 0.05)
+        self.assertEqual((self.seen(), self.lift.source), (2.0, "align"))
+        self.hold("teleop", 1.0, 0.07)  # align is past command_timeout_us
+        self.assertEqual((self.seen(), self.lift.source), (1.0, "teleop"))
 
     def test_robot_disabled_and_driver_station_loss_are_none(self):
         self.hold("teleop", 1.0)
@@ -350,6 +407,87 @@ class TargetTest(unittest.TestCase):
         sim.step(0.02)
         self.assertIsNone(sim.latest_target(Goal, "lift", "teleop"))
         self.assertIsNone(lift.seen)
+
+    def test_lane_follows_its_nodes_driver_station_generation(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        sim.add(Driver, "planner")
+        lift = sim.add(Aimer, "lift")
+        hw = SimHardware(sim)
+        hw.enable()
+        hw.set_driver_station(enabled=True, teleop=True)
+        sim.step(0.04)
+        self.assertEqual(lift.seen.height_rot, 0.5)
+        hw.set_driver_station(enabled=False, teleop=True)
+        sim.step(0.04)
+        self.assertIsNone(lift.seen)
+        # A new generation, which the Python producer stamps on its own.
+        hw.set_driver_station(enabled=True, teleop=True)
+        sim.step(0.04)
+        self.assertEqual(lift.seen.height_rot, 0.5)
+
+
+# The lift's teleop lane is remapped; the blind driver's Driver Station is
+# remapped onto a topic nothing writes.
+REMAP_TOML = """
+[robot]
+period_us = 10000
+command_timeout_us = 100000
+
+[subsystems.lift.motors.lift]
+can_id = 1
+[subsystems.lift.targets]
+teleop = ["align", "teleop"]
+[subsystems.lift.remap]
+"target/teleop" = "/left_lift/target/teleop"
+
+[subsystems.blind_driver.remap]
+"/hw/state/driver_station" = "/hw/state/driver_station_unplugged"
+"""
+
+
+class BlindAligner:
+    """Writes the lift's align lane, seeing no Driver Station."""
+
+    def __init__(self, node):
+        self.lane = talos.TargetLane(node, Goal, "lift", "align")
+
+    def update(self):
+        self.lane.send(height_rot=5.0)
+
+
+class RemappedTargetTest(unittest.TestCase):
+    def setUp(self):
+        self.sim = Sim.from_toml(REMAP_TOML)
+
+    def start(self):
+        lift = self.sim.add(Aimer, "lift")
+        self.hw = SimHardware(self.sim)
+        self.hw.enable()
+        self.hw.set_driver_station(enabled=True, teleop=True)
+        self.sim.step(0.02)
+        return lift
+
+    def test_remap_redirects_one_lane(self):
+        lift = self.start()
+        self.sim.publish_target(Goal, "lift", "teleop", height_rot=1.0)
+        self.sim.step(0.01)
+        self.assertIsNone(lift.seen)
+        self.sim.publish_target(Goal, "left_lift", "teleop", height_rot=2.0)
+        self.sim.step(0.01)
+        self.assertEqual((lift.seen.height_rot, lift.source), (2.0, "teleop"))
+        self.sim.publish_target(Goal, "lift", "align", height_rot=3.0)
+        self.sim.publish_target(Goal, "left_lift", "teleop", height_rot=2.0)
+        self.sim.step(0.01)
+        self.assertEqual(lift.source, "align")
+
+    def test_a_producer_that_sees_no_driver_station_never_drives(self):
+        self.sim.add(BlindAligner, "blind_driver")
+        lift = self.start()
+        self.sim.step(0.05)
+        self.assertIsNone(lift.seen)  # align is active and fresh, stamped 0
+        self.sim.publish_target(Goal, "left_lift", "teleop", height_rot=2.0)
+        self.sim.step(0.01)
+        self.assertEqual(lift.source, "teleop")
 
 
 class StateMachineTest(unittest.TestCase):

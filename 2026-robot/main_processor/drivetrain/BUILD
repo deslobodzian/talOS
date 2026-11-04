@@ -63,7 +63,9 @@ cc_binary(
     deps = [
         ":messages",
         "//talOS/devices",
+        "//talOS/driver_station",
         "//talOS/events:events_os",
+        "//talOS/hardware",
         "//talOS/ipc",
     ],
 )

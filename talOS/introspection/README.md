@@ -9,14 +9,15 @@ has an answer — the nodes have to say so.
 This is where they say it. One shared-memory segment holds a fixed array of
 slots. A node claims a slot at startup, writes its event-loop manifest into it —
 every timer, watcher, fetcher and sender, by name, kind and message size — and
-then keeps a heartbeat and a set of counters current for as long as it runs.
-Studio's bridge and any agent map the segment read-only and get the whole
-system: which processes exist, which topics each one is on and at which end, and
-how much traffic has actually moved.
+then keeps a heartbeat, a set of counters and the lane each of its Targets
+selected current for as long as it runs. Studio's bridge and any agent map the
+segment read-only and get the whole system: which processes exist, which topics
+each one is on and at which end, how much traffic has actually moved, and who
+drives each subsystem.
 
 ## The segment
 
-The path is `/talos_registry.1`, and the trailing number is `kRegistryVersion`.
+The path is `/talos_registry.2`, and the trailing number is `kRegistryVersion`.
 The version is part of the name on purpose. The records below are a frozen
 binary layout shared between processes that were compiled separately, so a build
 whose records have a different shape must not be able to read a segment written
@@ -94,6 +95,36 @@ adds is that a node started by hand still says so out loud, because a
 misspelling nobody is ever told about is how the two-spelling bug survives. A
 timer's name is skipped: it is a label, not an address, and nothing subscribes
 to it.
+
+## Who drives a subsystem
+
+A subsystem's `talos::Target` (`talOS/devices/target.h`) picks, on every
+`get()`, the first live lane of its policy — `teleop`, `auto`, `align` — or
+none. No manifest entry or counter says which one won, and "who is driving the
+drivetrain right now" is the first question asked of a robot that moves when it
+should not, or does not when it should. So each slot also holds one
+`SelectionRecord` per Target the node opened, in opening order: the policy's
+source names (`TargetPolicy::Sources()` order), written once and published with
+a release-ordered `selection_count` the way the sources are, and a
+`std::atomic<int32_t> selected` — the index of the selected lane, or -1 for
+none. `SelectionSnapshot::selected_source()` turns that back into the name, or
+`nullopt` when nobody drives.
+
+The hot path never touches the segment. `get()` stores the index into the
+node's own atomic (`NodeAccess::set_selected`: one relaxed load, and a store
+only when the answer changed), and the `Reporter` copies it into the slot
+inside each refresh sample through `Reporter::Options::selections`. A slot
+holds `kMaxSelectionsPerNode` Targets and `kMaxSelectionSources` names each;
+the declared counts say when a node or a policy had more, and a selected source
+past the name table reads as `#<index>` rather than as nobody.
+
+This one did bump the version, to 2. There was no reserved word left to reuse,
+and a name table per Target would not have fit in one: the records sit at the
+end of `NodeRecord`, which changes its size and the offset of every slot after
+the first. That is a layout an older reader would misinterpret — the header's
+record sizes would make it refuse the segment outright — so the two builds now
+use different segments, and a viewer not yet rebuilt sees no nodes rather than
+an error.
 
 ## Claiming a slot, and liveness
 

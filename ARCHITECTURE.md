@@ -75,16 +75,34 @@ a node that stops hearing its target goes neutral on its own.
 
 What a subsystem is asked to do arrives on target lanes,
 `/<sub>/target/<source>`, one per producer (`teleop`, `auto`, `align`, ...).
-Each carries a `TargetEnvelope<M>`: `active`, then the producer's message. A
-producer writes its lane with `talos::TargetLane<M>` (`send`, or `release()`
-when it has nothing to say). The consumer resolves its own lanes with
+Each carries a `TargetEnvelope<M>`: a 16-byte header (the producer's Driver
+Station mode generation, `active`), then the producer's message. A producer
+writes its lane with `talos::TargetLane<M>` (`send`, or `release()` when it
+has nothing to say). The consumer resolves its own lanes with
 `talos::Target<M>`: `get()` returns the first lane, in the priority order the
 config gives for the current Driver Station mode, that is active, fresh and
-sent since that mode began, and only while `robot_enabled(node)`; otherwise
-null, and the node goes neutral. The policy is `[robot.targets]` (defaults:
-teleop `["teleop"]`, autonomous `["auto"]`, test none) with a per-subsystem
-`[targets]` override. No process sits between a producer and its subsystem,
-so a subsystem's safety depends only on its own process and the bridge.
+stamped with the consumer's current mode generation, and only while
+`robot_enabled(node)`; otherwise null, and the node goes neutral. The policy
+is `[robot.targets]` (defaults: teleop `["teleop"]`, autonomous `["auto"]`,
+test none) with a per-subsystem `[targets]` override. No process sits between
+a producer and its subsystem, so a subsystem's safety depends only on its own
+process and the bridge. Each `get()` records the selected source in the node's
+live registry row, which is how Studio's system view shows who drives each
+subsystem.
+
+The mode generation is what keeps a target issued under an earlier enable or
+mode from ever actuating. The RoboRIO program (and `SimHardware`,
+`send_joystick`) stamps each Driver Station packet with `mode_since_us`, the
+sample time of the first packet in the current mode, via one
+`driver_station::ModeTracker`; disabling, re-enabling, switching mode,
+e-stopping or re-attaching starts a new generation, and the bridge forwards it
+unchanged. `TargetLane::send` stamps the generation its own node last drained
+(0 while that view is stale, disabled or in no mode); `Target::get` accepts a
+lane only when its stamp is nonzero and equals the generation the consumer
+last drained. Receipt time cannot do this: a target queued before a mode
+change and the packet that changes the mode can be drained together, at one
+instant. A Driver Station link that drops and returns in the same mode keeps
+its generation, so the producer drives again once its lane is fresh.
 
 Messages reach a node when its loop drains its topics. A node without message
 callbacks drains right before each of its own timers (`update()`, `every()`)

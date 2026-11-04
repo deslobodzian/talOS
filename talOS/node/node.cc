@@ -70,6 +70,12 @@ struct Node::Impl {
     std::uint64_t entered_update;
     Time entered_at;
   };
+  struct SelectionSlot {
+    std::vector<std::string> sources;
+    // Written by the loop's thread on every selection, read by the
+    // registry's.
+    std::atomic<std::int32_t> selected{-1};
+  };
 
   std::string name;
   std::string config_path;
@@ -84,6 +90,7 @@ struct Node::Impl {
   std::vector<std::unique_ptr<BytePublisherSlot>> byte_publishers;
   std::vector<std::unique_ptr<TimerSlot>> timers;
   std::vector<StateMachineSlot> state_machines;
+  std::vector<std::unique_ptr<SelectionSlot>> selections;
   std::vector<std::pair<std::type_index, std::shared_ptr<void>>> extensions;
 
   std::function<void()> update;
@@ -107,6 +114,14 @@ struct Node::Impl {
                               std::to_string(index));
     }
     return *byte_publishers[index];
+  }
+
+  SelectionSlot& SelectionAt(std::size_t index) const {
+    if (index >= selections.size()) {
+      throw std::out_of_range(name + ": no target selection at index " +
+                              std::to_string(index));
+    }
+    return *selections[index];
   }
 
   StateMachineSlot& StateMachineAt(std::size_t index) {
@@ -631,6 +646,39 @@ std::uint64_t NodeAccess::byte_topic_dropped(const Node& node,
   return node.impl_->ByteAt(index).dropped.load(std::memory_order_relaxed);
 }
 
+std::size_t NodeAccess::add_selection(Node& node,
+                                      std::vector<std::string> sources) {
+  node.impl_->CheckOpen("add_selection");
+  auto slot = std::make_unique<Node::Impl::SelectionSlot>();
+  slot->sources = std::move(sources);
+  node.impl_->selections.push_back(std::move(slot));
+  return node.impl_->selections.size() - 1;
+}
+
+void NodeAccess::set_selected(Node& node, std::size_t index,
+                              std::int32_t source) {
+  std::atomic<std::int32_t>& selected = node.impl_->SelectionAt(index).selected;
+  // The loop's thread is the only writer; skipping an unchanged store keeps
+  // the registry thread's cache line clean on every tick a lane holds.
+  if (selected.load(std::memory_order_relaxed) != source) {
+    selected.store(source, std::memory_order_relaxed);
+  }
+}
+
+std::size_t NodeAccess::selection_count(const Node& node) {
+  return node.impl_->selections.size();
+}
+
+std::span<const std::string> NodeAccess::selection_sources(const Node& node,
+                                                           std::size_t index) {
+  return node.impl_->SelectionAt(index).sources;
+}
+
+std::int32_t NodeAccess::selected(const Node& node, std::size_t index) {
+  return node.impl_->SelectionAt(index).selected.load(
+      std::memory_order_relaxed);
+}
+
 }  // namespace detail
 
 // --- the binary --------------------------------------------------------------
@@ -747,6 +795,21 @@ std::vector<introspect::Reporter::ExtraSource> ByteTopicSources(
   return sources;
 }
 
+// Who drives the subsystem: each Target's policy and its latest selection.
+std::vector<introspect::Reporter::Selection> Selections(const Node& node) {
+  std::vector<introspect::Reporter::Selection> selections;
+  const std::size_t count = NodeAccess::selection_count(node);
+  selections.reserve(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto sources = NodeAccess::selection_sources(node, i);
+    selections.push_back({
+        .sources = {sources.begin(), sources.end()},
+        .selected = [&node, i] { return NodeAccess::selected(node, i); },
+    });
+  }
+  return selections;
+}
+
 }  // namespace
 
 int RunMain(int argc, char** argv, const char* node_name,
@@ -797,7 +860,8 @@ int RunMain(int argc, char** argv, const char* node_name,
                                    .session_id = flags.session_id,
                                    .simulation = flags.simulation,
                                    .extra = ByteTopicSources(*hosted.node),
-                                   .endpoints = Endpoints(*hosted.node)}};
+                                   .endpoints = Endpoints(*hosted.node),
+                                   .selections = Selections(*hosted.node)}};
 
     std::jthread stopper{[&](const std::stop_token& stop) {
       while (!stop.stop_requested()) {

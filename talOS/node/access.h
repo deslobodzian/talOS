@@ -134,6 +134,22 @@ struct NodeAccess {
                                             std::size_t index);
   static std::uint64_t byte_topic_dropped(const Node& node, std::size_t index);
 
+  // Who drives this node's subsystem, for the registry: one entry per
+  // talos::Target (talOS/devices/target.h), in the order they were opened.
+  // `sources` is the Target's policy, in TargetPolicy::Sources() order.
+  // Call in the constructor.
+  static std::size_t add_selection(Node& node,
+                                   std::vector<std::string> sources);
+  // Records the lane selection `index` resolved to: an index into its
+  // sources, or -1 for none. Called on every Target::get(), so it is one
+  // relaxed atomic load, and a store only when the answer changed.
+  static void set_selected(Node& node, std::size_t index, std::int32_t source);
+  static std::size_t selection_count(const Node& node);
+  static std::span<const std::string> selection_sources(const Node& node,
+                                                        std::size_t index);
+  // The last set_selected() value of `index`. Safe to call from any thread.
+  static std::int32_t selected(const Node& node, std::size_t index);
+
   static std::size_t add_state_machine(Node& node, std::int64_t initial);
   static std::int64_t state_machine_state(const Node& node, std::size_t index);
   static std::int64_t state_machine_previous(const Node& node,

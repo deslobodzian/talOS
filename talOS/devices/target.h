@@ -22,12 +22,29 @@
 // message of the first lane in the current mode's list whose latest envelope
 //   - is active (the producer did not release it),
 //   - is fresh (younger than [robot] command_timeout_us), and
-//   - arrived at or after the mode began (the first Driver Station packet in
-//     it), so a lane from an earlier mode never drives this one,
+//   - carries the consumer's current mode generation,
 // and only while robot_enabled(node). Otherwise it returns null: neutral.
+//
+// The mode generation is the invariant that a target issued under an earlier
+// Driver Station enable or mode never actuates. The sampler on the far side of
+// the link (the RoboRIO program, SimHardware) stamps every Driver Station
+// packet with mode_since_us, the sample time of the first packet in the
+// current mode (driver_station::ModeTracker); a disable, re-enable, mode
+// switch, e-stop or re-attach starts a new one. TargetLane::send stamps the
+// producer's own view of it into the envelope: the generation of the packet
+// its node drained last, or 0 while that view is stale, disabled or in no
+// mode. Target accepts an envelope only when that stamp is nonzero and equal
+// to the generation of the packet the consumer drained last. Receipt time
+// would not do: a target queued before a mode change and the packet that
+// changed the mode can land in one drain and share a timestamp. A Driver
+// Station that drops and comes back in the same mode keeps its generation, so
+// a producer that kept talking drives again as soon as its lane is fresh.
+//
 // Target subscribes without a callback, so the node keeps draining right
 // before its timer; selection runs on every get().
 
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -37,21 +54,38 @@
 
 namespace talos {
 
-// What a lane carries: active (0: this producer has nothing to say), padding
-// to alignof(M), then M; alignof(M) + sizeof(M) bytes.
+// What a lane carries: a 16-byte header {uint64 mode_since_us; uint8 active;
+// 7 bytes zero}, then M at offset 16; 16 + sizeof(M) bytes. The generation is
+// held as bytes so the envelope keeps M's alignment: a 4-byte M makes a
+// 20-byte envelope, as the lane topic is registered.
 template <Message M>
 struct TargetEnvelope {
+  // The producer's Driver Station mode generation, native byte order: 0
+  // when it had none.
+  std::array<std::byte, 8> mode_since_us_bytes{};
+  // 0: this producer has nothing to say.
   std::uint8_t active{0};
+  std::array<std::uint8_t, 7> padding{};
   M message{};
+
+  std::uint64_t mode_since_us() const {
+    return std::bit_cast<std::uint64_t>(mode_since_us_bytes);
+  }
+  void set_mode_since_us(std::uint64_t us) {
+    mode_since_us_bytes = std::bit_cast<std::array<std::byte, 8>>(us);
+  }
 };
 
 namespace detail {
+inline constexpr std::size_t kTargetEnvelopeHeaderBytes = 16;
 // What TargetAccess assumes of the envelope, checked by Target and
 // TargetLane for each M.
 template <Message M>
 inline constexpr bool kTargetEnvelopeLayout =
-    sizeof(TargetEnvelope<M>) == alignof(M) + sizeof(M) &&
-    offsetof(TargetEnvelope<M>, message) == alignof(M);
+    sizeof(TargetEnvelope<M>) == kTargetEnvelopeHeaderBytes + sizeof(M) &&
+    alignof(TargetEnvelope<M>) == alignof(M) &&
+    offsetof(TargetEnvelope<M>, active) == 8 &&
+    offsetof(TargetEnvelope<M>, message) == kTargetEnvelopeHeaderBytes;
 }  // namespace detail
 
 // The lanes of this node's target policy, resolved: see the top of this
@@ -68,7 +102,7 @@ class Target {
   }
 
   // The selected lane's message, or null: robot disabled, Driver Station
-  // stale or in a mode with no live lane.
+  // stale or in a mode with no live lane of this generation.
   const M* get() const {
     std::int32_t source = -1;
     return static_cast<const M*>(
@@ -89,7 +123,8 @@ class Target {
   std::size_t index_{0};
 };
 
-// One producer's lane, /<subsystem>/target/<source>.
+// One producer's lane, /<subsystem>/target/<source>. Takes the node's
+// DriverStation, whose generation every send() stamps.
 template <Message M>
 class TargetLane {
   static_assert(detail::kTargetEnvelopeLayout<M>);
@@ -101,8 +136,11 @@ class TargetLane {
         index_{detail::TargetAccess::open_lane(node, subsystem, source,
                                                sizeof(M), alignof(M))} {}
 
-  // Asks for `message` (active = 1). Republish every period: a lane older
-  // than [robot] command_timeout_us is stale.
+  // Asks for `message` (active = 1) under the mode generation this node's
+  // Driver Station shows now (0, which no consumer accepts, while it shows
+  // none). Republish every period: a lane older than [robot]
+  // command_timeout_us is stale, and one from an earlier generation is
+  // ignored.
   bool send(const M& message) {
     return detail::TargetAccess::lane_send(*node_, index_, &message, sizeof(M));
   }

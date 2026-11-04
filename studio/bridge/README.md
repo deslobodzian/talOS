@@ -46,7 +46,7 @@ arrived: "not known yet" is not "the robot is doing nothing".
 Telemetry says what one node chose to publish. It does not say what is running,
 and a subscriber waiting on a topic nothing publishes looks identical from the
 inside to a healthy one. So the bridge also serves the live node registry: it
-maps `/talos_registry.1` read-only, rebuilds a JSON document from it every 250
+maps `/talos_registry.2` read-only, rebuilds a JSON document from it every 250
 ms, and sends that document two ways. WebSocket clients on `/telemetry` get it
 as a **text** frame, so a client tells the two message families apart by frame
 type rather than by sniffing bytes. `GET /system.json` returns the same
@@ -60,6 +60,14 @@ the document reports `registry.available` as false with empty node and topic
 lists, which is a different statement from an empty system. A newly connected
 WebSocket client is sent the current document immediately rather than waiting
 for the next refresh.
+
+Each node carries `selections`: one entry per `talos::Target` it opened, as
+`{"sources": ["teleop", "auto"], "selected": "teleop"}`, with `selected: null`
+when nobody drives the subsystem (robot disabled, Driver Station stale, or no
+live lane in the mode). The system view shows it on the node card as
+"driven by". A node without Targets sends an empty list, and a viewer reads a
+missing field — an older bridge — the same way, so this needed no
+`kSystemGraphVersion` bump.
 
 This one is JSON while telemetry frames are FlatBuffers, and the difference is
 not inconsistency. Telemetry is high rate and fixed shape, where the size and

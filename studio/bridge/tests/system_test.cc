@@ -162,6 +162,28 @@ TEST(SystemGraph, ReportsAnAbsentRegistryRatherThanFailing) {
   EXPECT_NE(json.find("\"topics\":[]"), std::string::npos);
 }
 
+TEST(SystemGraph, NamesWhoDrivesEachTargetAndNullWhenNobodyDoes) {
+  introspect::NodeSnapshot drivetrain;
+  drivetrain.name = "drivetrain";
+  drivetrain.alive = true;
+  drivetrain.selections = {
+      {.sources = {"teleop", "auto"}, .selected = 1},
+      {.sources = {"teleop", "auto"}, .selected = -1},
+  };
+  SystemGraphInput input;
+  input.nodes = {drivetrain, Telemetry()};
+  const std::string json = SystemGraphJson(input);
+
+  EXPECT_NE(json.find("\"selections\":[{\"sources\":[\"teleop\",\"auto\"],"
+                      "\"selected\":\"auto\"},{\"sources\":[\"teleop\","
+                      "\"auto\"],\"selected\":null}]"),
+            std::string::npos)
+      << json;
+  // A node without Targets says so with an empty list, not a missing field.
+  EXPECT_NE(json.find("\"name\":\"telemetry\""), std::string::npos);
+  EXPECT_NE(json.find("\"selections\":[]"), std::string::npos) << json;
+}
+
 TEST(SystemGraph, EscapesNamesThatWouldOtherwiseBreakTheDocument) {
   introspect::NodeSnapshot node;
   node.name = "odd\"name\\with\ttabs";

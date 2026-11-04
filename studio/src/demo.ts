@@ -120,6 +120,13 @@ type DemoNode = {
   // from the outside. Its sources still describe what it would have held, so
   // the topics its peers wait on are the real ones.
   neverStarts?: boolean;
+
+  // The Targets this node holds (talOS/devices/target.h): each one's policy
+  // sources, and which demo node publishes each lane. A Target is driven by
+  // the first source whose publisher is still running, the way it picks the
+  // first live lane -- so the drivetrain is driven by teleop until
+  // operator_interface stops, and by nobody after.
+  targets?: {sources: string[]; publishers: Record<string, string>}[];
   sources: DemoSource[];
 };
 
@@ -170,7 +177,8 @@ const STUDIO_SLOT = 16384;
 //   stale        operator_interface -- it stops two seconds in, then holds its
 //                registry slot with frozen counters. Watch it: it stays "alive"
 //                until its heartbeat passes the five-second timeout, then goes
-//                stale while its publish rates fall to zero.
+//                stale while its publish rates fall to zero. The drivetrain it
+//                drove goes from "driven by teleop" to "none" when it stops.
 const DEMO_NODES: DemoNode[] = [
   {
     name: 'hardware_node',
@@ -206,6 +214,10 @@ const DEMO_NODES: DemoNode[] = [
     target: '//2026-robot/main_processor/drivetrain:node',
     pid: 4132,
     periodUs: 5000,
+    targets: [{
+      sources: ['teleop', 'auto'],
+      publishers: {teleop: 'operator_interface'}
+    }],
     sources: [
       {kind: 'TIMER', name: 'drivetrain', bytes: 0, hz: 200},
       // Two lost messages a second out of 200: enough that the lossy state is
@@ -223,7 +235,7 @@ const DEMO_NODES: DemoNode[] = [
       {
         kind: 'FETCHER',
         name: '/drivetrain/target/teleop',
-        bytes: 32,
+        bytes: 40,
         hz: 50,
         optional: true
       },
@@ -232,7 +244,7 @@ const DEMO_NODES: DemoNode[] = [
       {
         kind: 'FETCHER',
         name: '/drivetrain/target/auto',
-        bytes: 32,
+        bytes: 40,
         hz: 0,
         optional: true
       },
@@ -269,14 +281,14 @@ const DEMO_NODES: DemoNode[] = [
       {
         kind: 'FETCHER',
         name: '/shooter/target/teleop',
-        bytes: 16,
+        bytes: 24,
         hz: 50,
         optional: true
       },
       {
         kind: 'FETCHER',
         name: '/shooter/target/auto',
-        bytes: 16,
+        bytes: 24,
         hz: 0,
         optional: true
       },
@@ -294,8 +306,8 @@ const DEMO_NODES: DemoNode[] = [
       {kind: 'TIMER', name: 'operator_interface', bytes: 0, hz: 50},
       {kind: 'WATCHER', name: '/hw/state/driver_station', bytes: HW_PACKET, hz: 50},
       {kind: 'FETCHER', name: '/drivetrain/state', bytes: 48, hz: 50},
-      {kind: 'SENDER', name: '/drivetrain/target/teleop', bytes: 32, hz: 50},
-      {kind: 'SENDER', name: '/shooter/target/teleop', bytes: 16, hz: 50}
+      {kind: 'SENDER', name: '/drivetrain/target/teleop', bytes: 40, hz: 50},
+      {kind: 'SENDER', name: '/shooter/target/teleop', bytes: 24, hz: 50}
     ]
   },
   {
@@ -380,7 +392,19 @@ function demoNode(node: DemoNode, slot: number, elapsed: number,
     // letting the demo pass for a robot.
     simulation: true,
     replay: false,
-    sources
+    sources,
+    // As of the node's own last tick, so a stopped node's row stays frozen. A
+    // lane is live while its publisher has started and not yet stopped.
+    selections: (node.targets ?? []).map(target => ({
+      sources: target.sources,
+      selected: target.sources.find(source => {
+        const publisher =
+            DEMO_NODES.find(n => n.name === target.publishers[source]);
+        return publisher !== undefined && !publisher.neverStarts &&
+            (publisher.stopsAfterSeconds === undefined ||
+             live < publisher.stopsAfterSeconds);
+      }) ?? null
+    }))
   };
 }
 

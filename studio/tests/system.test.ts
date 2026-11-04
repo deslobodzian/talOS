@@ -7,6 +7,7 @@ import {
   type DeclaredGraph,
   declaredStatus,
   declaredUrl,
+  drivenBy,
   endpointAttributesKnown,
   eventRates,
   isSubscriber,
@@ -336,6 +337,38 @@ test('watchers and fetchers are the subscribing ends', () => {
   assert.equal(isSubscriber('TIMER'), false);
 });
 
+test('a Target\'s selected source is read, and nobody driving is null', () => {
+  const graph = parse({
+    nodes: [node({
+      selections: [
+        {sources: ['teleop', 'auto'], selected: 'auto'},
+        {sources: ['teleop', 'auto'], selected: null}
+      ]
+    })]
+  });
+  assert.deepEqual(graph.nodes[0].selections, [
+    {sources: ['teleop', 'auto'], selected: 'auto'},
+    {sources: ['teleop', 'auto'], selected: null}
+  ]);
+  assert.equal(drivenBy(graph.nodes[0]), 'auto · none');
+
+  // A node without Targets, or a bridge that predates them, says nothing
+  // about who drives -- which is not the same as saying nobody does.
+  const plain = parse({nodes: [node({selections: []})]});
+  assert.equal(drivenBy(plain.nodes[0]), null);
+  const older = parse();
+  assert.deepEqual(older.nodes[0].selections, []);
+  assert.equal(drivenBy(older.nodes[0]), null);
+
+  rejects({nodes: [node({selections: [{sources: ['teleop']}]})]},
+          /selected must be a string or null/);
+  rejects({nodes: [node({selections: [{sources: ['teleop'], selected: 0}]})]},
+          /selected must be a string or null/);
+  rejects({nodes: [node({selections: [{sources: 'teleop', selected: null}]})]},
+          /sources must be an array/);
+  rejects({nodes: [node({selections: {}})]}, /selections must be an array/);
+});
+
 test('the demo graph is a document the parser actually accepts', () => {
   // The demo is what the tabs render with no robot attached, so it has to
   // satisfy the same parser as the bridge's output -- otherwise it drifts into
@@ -359,6 +392,13 @@ test('the demo graph is a document the parser actually accepts', () => {
   const later = parseSystemGraph(demoSystemGraph(250n));
   assert.ok(BigInt(later.wall_ns) > BigInt(graph.wall_ns));
   assert.ok(eventRates(later, graph).size > 0);
+
+  // The drivetrain is driven by teleop while operator_interface publishes
+  // that lane, and by nobody once it stops two seconds in.
+  const driven = [50n, 250n].map(
+      sequence => drivenBy(parseSystemGraph(demoSystemGraph(sequence))
+                               .nodes.find(n => n.name === 'drivetrain')!));
+  assert.deepEqual(driven, ['teleop', 'none']);
 });
 
 test('event rates need two samples and ignore counter resets', () => {

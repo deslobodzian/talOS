@@ -39,6 +39,13 @@ Stick = collections.namedtuple("Stick", "axes buttons povs name button_count",
                                defaults=((), (), (), "", None))
 
 
+def _generation(mode_since_us):
+    """The C ABI's optional explicit generation: NULL derives it."""
+    if mode_since_us is None:
+        return None
+    return ctypes.byref(ctypes.c_uint64(mode_since_us))
+
+
 class Sim:
     """One simulated clock hosting several nodes; topics are in memory."""
 
@@ -92,21 +99,31 @@ class Sim:
             self._handle, _abi.encode(topic), buffer, mtype.size))
         return mtype.decode(buffer.raw) if found else None
 
-    def publish_target(self, msg, subsystem, source, message=None, **fields):
+    @property
+    def driver_station_generation(self):
+        """The Driver Station mode generation a producer that has drained
+        the newest /hw/state/driver_station packet stamps on its lanes: the
+        packet's mode_since_us while it names a mode, else 0."""
+        return lib.talos_sim_driver_station_generation(self._handle)
+
+    def publish_target(self, msg, subsystem, source, message=None, *,
+                       mode_since_us=None, **fields):
         """Publishes an active target on /<subsystem>/target/<source>, as a
-        talos.TargetLane would."""
+        talos.TargetLane would: stamped with driver_station_generation, or
+        with `mode_since_us` for a producer that has not seen the current
+        mode (a target queued from an earlier one, a stale view: 0)."""
         mtype = message_type(msg)
         data = message._bytes if message is not None else mtype.encode(fields)
         _abi.ok(lib.talos_sim_publish_target(
             self._handle, _abi.encode(subsystem), _abi.encode(source), data,
-            mtype.size, mtype.alignment))
+            mtype.size, mtype.alignment, _generation(mode_since_us)))
 
     def release_target(self, msg, subsystem, source):
         """Publishes a release (nothing to say) on that lane."""
         mtype = message_type(msg)
         _abi.ok(lib.talos_sim_publish_target(
             self._handle, _abi.encode(subsystem), _abi.encode(source), None,
-            mtype.size, mtype.alignment))
+            mtype.size, mtype.alignment, None))
 
     def latest_target(self, msg, subsystem, source):
         """The newest `msg` on /<subsystem>/target/<source>: the message

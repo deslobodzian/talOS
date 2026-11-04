@@ -4,9 +4,13 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "talOS/events/manifest.h"
 #include "talOS/events/realtime_event_loop.h"
@@ -91,6 +95,81 @@ TEST_F(Registry, PublishesTopologyAndCountersToAReader) {
   EXPECT_EQ(node.sources[2].dropped, 1u);
   EXPECT_EQ(node.sources[2].sequence, 11u);
   EXPECT_EQ(node.sources[2].max_latency_ns, 78);
+}
+
+// What Reporter::Selection carries into publish_selections: a policy's
+// sources.
+struct Policy {
+  std::vector<std::string> sources;
+};
+
+TEST_F(Registry, ATargetsSelectedSourceReadsBackAndClearsToNone) {
+  NodeRegistration registration{{.name = "lift"}, path_};
+  registration.publish(sample_manifest());
+  registration.publish_selections(
+      std::vector<Policy>{{{"align", "teleop", "auto"}}});
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+
+  const auto selection = [&reader] {
+    const auto nodes = reader->nodes();
+    EXPECT_EQ(nodes.size(), 1u);
+    EXPECT_EQ(nodes.front().selections.size(), 1u);
+    return nodes.front().selections.front();
+  };
+
+  // Nothing has selected yet: nobody drives.
+  EXPECT_EQ(selection().sources,
+            (std::vector<std::string>{"align", "teleop", "auto"}));
+  EXPECT_EQ(selection().selected_source(), std::nullopt);
+
+  registration.set_selected(0, 1);
+  EXPECT_EQ(selection().selected_source(), "teleop");
+  registration.set_selected(0, 2);
+  EXPECT_EQ(selection().selected_source(), "auto");
+  registration.set_selected(0, -1);
+  EXPECT_EQ(selection().selected, -1);
+  EXPECT_EQ(selection().selected_source(), std::nullopt);
+}
+
+TEST_F(Registry, SelectionsBeyondTheSlotAreCountedAndARecycledSlotHasNone) {
+  {
+    std::vector<Policy> policies(kMaxSelectionsPerNode + 1,
+                                 Policy{{"teleop", "auto"}});
+    // One policy longer than the slot's name table.
+    for (std::size_t i = 0; i < kMaxSelectionSources + 2; ++i) {
+      policies.front().sources.push_back("s" + std::to_string(i));
+    }
+    NodeRegistration registration{{.name = "crowded"}, path_};
+    registration.publish({});
+    registration.publish_selections(policies);
+    const std::int32_t last =
+        static_cast<std::int32_t>(policies.front().sources.size() - 1);
+    registration.set_selected(0, last);
+
+    const auto nodes = RegistryReader::open(path_)->nodes();
+    ASSERT_EQ(nodes.size(), 1u);
+    const NodeSnapshot& node = nodes.front();
+    EXPECT_EQ(node.declared_selection_count, kMaxSelectionsPerNode + 1);
+    ASSERT_EQ(node.selections.size(), kMaxSelectionsPerNode);
+    const SelectionSnapshot& first = node.selections.front();
+    EXPECT_EQ(first.sources.size(), kMaxSelectionSources);
+    EXPECT_EQ(first.declared_source_count, kMaxSelectionSources + 4);
+    // Selected, but its name did not fit: still says something drives.
+    EXPECT_EQ(first.selected_source(), "#" + std::to_string(last));
+    for (std::size_t i = 1; i < node.selections.size(); ++i) {
+      EXPECT_EQ(node.selections[i].selected_source(), std::nullopt);
+    }
+  }
+
+  // The slot is free again; a node without Targets must not inherit the
+  // previous owner's.
+  NodeRegistration next{{.name = "plain"}, path_};
+  next.publish({});
+  const auto nodes = RegistryReader::open(path_)->nodes();
+  ASSERT_EQ(nodes.size(), 1u);
+  EXPECT_TRUE(nodes.front().selections.empty());
+  EXPECT_EQ(nodes.front().declared_selection_count, 0u);
 }
 
 TEST_F(Registry, SeveralNodesCoexistAndAReleasedSlotDisappears) {
@@ -214,23 +293,28 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
   const std::uint16_t sender =
       loop.register_sender(topic, /*message_bytes=*/8, /*alignment=*/8);
   const std::size_t sources_before = loop.manifest().size();
+  // What the node's Target last selected: index 1, "auto".
+  std::atomic<std::int32_t> selected{1};
 
-  Reporter reporter{loop,
-                    {.name = "probe",
-                     .target = "//talOS/introspection:registry_test",
-                     .session_id = 42,
-                     .simulation = true,
-                     // A topic the node owns outside the loop, carrying its
-                     // attribute inline.
-                     .extra = {{.kind = event::SourceKind::SENDER,
-                                .name = feed,
-                                .message_bytes = 64,
-                                .flags = naming::kSourceFlagOptional}},
-                     // The loop's own sender, keyed by name because the loop
-                     // has no idea that this one's consumer is off-box.
-                     .endpoints = {{topic, naming::kSourceFlagExternal}},
-                     .period = 20ms,
-                     .registry_path = path_}};
+  Reporter reporter{
+      loop,
+      {.name = "probe",
+       .target = "//talOS/introspection:registry_test",
+       .session_id = 42,
+       .simulation = true,
+       // A topic the node owns outside the loop, carrying its
+       // attribute inline.
+       .extra = {{.kind = event::SourceKind::SENDER,
+                  .name = feed,
+                  .message_bytes = 64,
+                  .flags = naming::kSourceFlagOptional}},
+       // The loop's own sender, keyed by name because the loop
+       // has no idea that this one's consumer is off-box.
+       .endpoints = {{topic, naming::kSourceFlagExternal}},
+       .selections = {{.sources = {"teleop", "auto"},
+                       .selected = [&selected] { return selected.load(); }}},
+       .period = 20ms,
+       .registry_path = path_}};
 
   timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
   loop.run_for(220ms);
@@ -273,6 +357,11 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
   EXPECT_EQ(node.sources[2].name, feed);
   EXPECT_TRUE(node.sources[2].optional());
   EXPECT_FALSE(node.sources[2].external());
+
+  ASSERT_EQ(node.selections.size(), 1u);
+  EXPECT_EQ(node.selections[0].sources,
+            (std::vector<std::string>{"teleop", "auto"}));
+  EXPECT_EQ(node.selections[0].selected_source(), "auto");
 }
 
 TEST_F(Registry, LoopCountsPublishesAndTimerDispatchesPerSource) {

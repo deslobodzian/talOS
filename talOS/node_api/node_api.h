@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 12u
+#define TALOS_NODE_ABI_VERSION 13u
 
 enum {
   TALOS_OK = 0,
@@ -252,8 +252,9 @@ const char* talos_target_source_name(TalosNode* node, int64_t target,
 int64_t talos_target_lane_open(TalosNode* node, const char* subsystem,
                                const char* source, uint32_t message_bytes,
                                uint32_t alignment);
-// TargetLane::send (active = 1) and release (active = 0). Return 1 sent, 0
-// dropped by the transport, TALOS_ERR.
+// TargetLane::send (active = 1, stamped with this node's Driver Station mode
+// generation) and release (active = 0). Return 1 sent, 0 dropped by the
+// transport, TALOS_ERR.
 int32_t talos_target_lane_send(TalosNode* node, int64_t lane,
                                const void* message, uint32_t size);
 int32_t talos_target_lane_release(TalosNode* node, int64_t lane);
@@ -280,12 +281,18 @@ int32_t talos_sim_latest_raw(const TalosSim* sim, const char* topic, void* out,
 int32_t talos_sim_latest_bytes(const TalosSim* sim, const char* topic,
                                void* out, uint32_t capacity,
                                uint32_t* out_size);
+// The Driver Station mode generation a producer that drained the newest
+// packet on /hw/state/driver_station stamps: its mode_since_us when its flags
+// name a mode, 0 otherwise or before any packet.
+uint64_t talos_sim_driver_station_generation(const TalosSim* sim);
 // Publishes a TargetEnvelope around `message` (`size` bytes aligned to
 // `alignment`) on /<subsystem>/target/<source>: active = 1, or, with
-// `message` NULL, a release (active = 0).
+// `message` NULL, a release (active = 0). Stamped with `*mode_since_us`, or,
+// with `mode_since_us` NULL, talos_sim_driver_station_generation.
 int32_t talos_sim_publish_target(TalosSim* sim, const char* subsystem,
                                  const char* source, const void* message,
-                                 uint32_t size, uint32_t alignment);
+                                 uint32_t size, uint32_t alignment,
+                                 const uint64_t* mode_since_us);
 // The newest envelope on that lane: 1 and its message copied into `out`
 // (`*active` set) when there is one, 0 when none yet.
 int32_t talos_sim_latest_target(const TalosSim* sim, const char* subsystem,

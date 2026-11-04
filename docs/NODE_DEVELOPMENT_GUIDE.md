@@ -74,15 +74,16 @@ while the robot is disabled. Units are rotations, rotations/s, volts, amps.
 ## Targets
 
 What a subsystem is asked to do arrives on lanes `/<sub>/target/<source>`, one
-per producer, each carrying `talos::TargetEnvelope<M>` (`active`, then `M`).
-Header `talOS/devices/target.h` (included by `devices.h`).
+per producer, each carrying `talos::TargetEnvelope<M>` (a 16-byte header: the
+producer's Driver Station mode generation and `active`; then `M`). Header
+`talOS/devices/target.h` (included by `devices.h`).
 
 | C++ | Python |
 |---|---|
 | `talos::Target<M> target_{node}` (constructor) | `talos.Target(node, M)` |
-| `const M* t = target_.get()`: null unless `robot_enabled(node)` and the current Driver Station mode has a lane that is active, fresh and sent since the mode began | `t = target.get()` (`None`) |
+| `const M* t = target_.get()`: null unless `robot_enabled(node)` and the current Driver Station mode has a lane that is active, fresh and stamped with the current mode generation | `t = target.get()` (`None`) |
 | `target_.source()`: `"teleop"`, `"auto"`, ... or `""` | `target.source` |
-| `talos::TargetLane<M> lane_{node, "wrist", "auto"}`: `send(M{...})`, `release()` | `talos.TargetLane(node, M, "wrist", "auto")`: `send(field=...)` or `send(message)`, `release()` |
+| `talos::TargetLane<M> lane_{node, "wrist", "auto"}`: `send(M{...})` (stamped with this node's mode generation), `release()` | `talos.TargetLane(node, M, "wrist", "auto")`: `send(field=...)` or `send(message)`, `release()` |
 
 Which lanes count, highest priority first, is config:
 
@@ -102,7 +103,21 @@ Sources follow the topic segment rules; an unknown mode is a config error. A
 consumer reads its lanes without a callback, so it keeps draining right before
 its timer. Republish a lane every period; `release()` hands control to the next
 lane on the consumer's next tick. The launcher refuses a lane whose source no
-mode lists and warns about a policy lane nobody writes.
+mode lists and warns about a policy lane nobody writes. Each `get()` also
+records the selected source in the node's registry row, so Studio's system view
+shows who drives the subsystem ("driven by teleop", or "none") with nothing to
+add in the node.
+
+A lane drives only the Driver Station mode generation it was sent under: the
+RoboRIO stamps every Driver Station packet with `mode_since_us` (the first
+sample of the current enable and mode), a `TargetLane` stamps the generation
+its node last drained, and `Target` ignores any other. A target computed
+before a disable, re-enable, mode switch or re-attach never actuates after it,
+even if it arrives in the same drain as the packet that changed the mode; the
+producer's next send, made from the new packet, is accepted. In tests,
+`PublishTarget` / `sim.publish_target` stamp the generation of the newest
+Driver Station packet; pass `mode_since_us` (C++: the last argument) to stand
+in for a producer that has not seen it.
 
 ## BUILD
 
