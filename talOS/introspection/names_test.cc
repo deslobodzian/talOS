@@ -214,7 +214,7 @@ TEST(LintGraph, AcceptsAWellFormedGraph) {
        "//2026-robot/main_processor/odometry:node",
        {Watcher("/drivetrain/state"), Sender("/odometry/state")}},
       {"telemetry",
-       "//2026-robot/main_processor/telemetry:node",
+       "//talOS/telemetry:node",
        // The Studio bridge reads /talos/telemetry but is not a registered
        // node, so the feed is declared external rather than left to read as a
        // topic nobody consumes.
@@ -387,7 +387,7 @@ TEST(LintGraph, ReadingEndIsNotCheckedAgainstTheOwner) {
        "//2026-robot/main_processor/drivetrain:node",
        {Sender("/drivetrain/state")}},
       {"telemetry",
-       "//2026-robot/main_processor/telemetry:node",
+       "//talOS/telemetry:node",
        {Watcher("/drivetrain/state"),
         Sender("/talos/telemetry", 32, kSourceFlagExternal)}},
   };
@@ -563,7 +563,7 @@ TEST(LintGraph, MatchingSchemasPassAndDifferentRingLayoutsDoNot) {
 TEST(LintGraph, UnreadTopicIsAWarningNotAnError) {
   const std::vector<NodeShape> nodes = {
       {"telemetry",
-       "//2026-robot/main_processor/telemetry:node",
+       "//talOS/telemetry:node",
        {Sender("/talos/telemetry")}},
   };
   const auto diagnostics = LintGraph(nodes);
@@ -576,7 +576,7 @@ TEST(LintGraph, UnreadTopicIsAWarningNotAnError) {
 TEST(LintGraph, ErrorsSortAheadOfWarnings) {
   const std::vector<NodeShape> nodes = {
       {"telemetry",
-       "//2026-robot/main_processor/telemetry:node",
+       "//talOS/telemetry:node",
        {Sender("/talos/telemetry")}},
       {"drivetrain",
        "//2026-robot/main_processor/drivetrain:node",

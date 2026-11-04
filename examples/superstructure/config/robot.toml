@@ -14,6 +14,9 @@ controller_address = "127.0.0.1"
 controller_port = 5802
 local_port = 5803
 
+[studio]
+topic = "/talos/telemetry"
+
 [[subsystems]]
 name = "intake"
 path = "subsystems/intake.toml"
@@ -28,3 +31,7 @@ node = "//examples/superstructure/cpp:elevator"
 name = "superstructure"
 path = "subsystems/superstructure.toml"
 node = "//examples/superstructure/cpp:superstructure"
+
+[[subsystems]]
+name = "telemetry"
+path = "subsystems/telemetry.toml"

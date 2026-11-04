@@ -1,0 +1,5 @@
+# Superstructure example telemetry node.
+[subsystem]
+name = "telemetry"
+node = "//talOS/telemetry:node"
+period_us = 10000

@@ -311,7 +311,7 @@ const DEMO_NODES: DemoNode[] = [
   },
   {
     name: 'telemetry',
-    target: '//2026-robot/main_processor/telemetry:node',
+    target: '//talOS/telemetry:node',
     pid: 4138,
     periodUs: 10000,
     sources: [

@@ -35,6 +35,8 @@ test = []
 bridge = "//studio/bridge:studio_bridge"
 http_port = 5800
 webroot = "bazel-bin/studio/dist"
+topic = "/talos/telemetry"
+pose_topic = "/pose_estimator/state"
 
 # Subsystem manifest. Each entry names one subsystem and the file holding its
 # config, pathed relative to this file; an optional `node = "//pkg:target"`

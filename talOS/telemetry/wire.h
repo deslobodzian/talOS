@@ -8,7 +8,7 @@
 namespace talos::telemetry_wire {
 
 // The telemetry wire contract, shared by the producer
-// (//2026-robot/main_processor/telemetry), the Studio bridge
+// (//talOS/telemetry:node), the Studio bridge
 // (//studio/bridge) and the tests. See talOS/telemetry/README.md for the
 // full protocol and the size/rate budget.
 //
