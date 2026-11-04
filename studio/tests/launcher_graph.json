@@ -9,13 +9,13 @@
       "target": "//talOS/bridge:hardware_node",
       "described": true,
       "sources": [
-        {"kind": "SENDER", "name": "/hw/state", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "SENDER", "name": "/hw/command", "message_bytes": 1404, "external": true, "optional": false},
-        {"kind": "SENDER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "SENDER", "name": "/hw/status", "message_bytes": 64, "external": false, "optional": false},
-        {"kind": "FETCHER", "name": "/hw/request/drivetrain", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "FETCHER", "name": "/hw/request/intake", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "FETCHER", "name": "/hw/request/shooter", "message_bytes": 1404, "external": false, "optional": false}
+        {"kind": "SENDER", "name": "/hw/state", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "SENDER", "name": "/hw/command", "message_bytes": 1404, "external": true, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "SENDER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "SENDER", "name": "/hw/status", "message_bytes": 64, "external": false, "optional": false, "schema": "bridge.BridgeStatus", "schema_hash": "0x62dce0fec2f44c17", "alignment": 8, "slots": 1024},
+        {"kind": "FETCHER", "name": "/hw/request/drivetrain", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "FETCHER", "name": "/hw/request/intake", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "FETCHER", "name": "/hw/request/shooter", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024}
       ]
     },
     {
@@ -23,12 +23,12 @@
       "target": "//2026-robot/main_processor/drivetrain:node",
       "described": true,
       "sources": [
-        {"kind": "WATCHER", "name": "/hw/state", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/drivetrain/target/teleop", "message_bytes": 40, "external": false, "optional": true},
-        {"kind": "WATCHER", "name": "/drivetrain/target/auto", "message_bytes": 40, "external": false, "optional": true},
-        {"kind": "SENDER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false},
-        {"kind": "SENDER", "name": "/hw/request/drivetrain", "message_bytes": 1404, "external": false, "optional": false},
+        {"kind": "WATCHER", "name": "/hw/state", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "WATCHER", "name": "/drivetrain/target/teleop", "message_bytes": 40, "external": false, "optional": true, "schema": "talos.TargetEnvelope<drivetrain.ChassisTarget>", "schema_hash": "0x6afed51452740f04", "alignment": 8, "slots": 1024},
+        {"kind": "WATCHER", "name": "/drivetrain/target/auto", "message_bytes": 40, "external": false, "optional": true, "schema": "talos.TargetEnvelope<drivetrain.ChassisTarget>", "schema_hash": "0x6afed51452740f04", "alignment": 8, "slots": 1024},
+        {"kind": "SENDER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false, "schema": "drivetrain.DrivetrainState", "schema_hash": "0x8db24627f196cc7a", "alignment": 8, "slots": 1024},
+        {"kind": "SENDER", "name": "/hw/request/drivetrain", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
         {"kind": "TIMER", "name": "drivetrain", "message_bytes": 0, "external": false, "optional": false}
       ]
     },
@@ -37,12 +37,12 @@
       "target": "//2026-robot/main_processor/intake:node",
       "described": true,
       "sources": [
-        {"kind": "WATCHER", "name": "/hw/state", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "SENDER", "name": "/hw/request/intake", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/intake/target/teleop", "message_bytes": 20, "external": false, "optional": true},
-        {"kind": "WATCHER", "name": "/intake/target/auto", "message_bytes": 20, "external": false, "optional": true},
-        {"kind": "SENDER", "name": "/intake/state", "message_bytes": 20, "external": false, "optional": false},
+        {"kind": "WATCHER", "name": "/hw/state", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "SENDER", "name": "/hw/request/intake", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "WATCHER", "name": "/intake/target/teleop", "message_bytes": 20, "external": false, "optional": true, "schema": "talos.TargetEnvelope<intake.IntakeTarget>", "schema_hash": "0x611722557563b8ba", "alignment": 8, "slots": 1024},
+        {"kind": "WATCHER", "name": "/intake/target/auto", "message_bytes": 20, "external": false, "optional": true, "schema": "talos.TargetEnvelope<intake.IntakeTarget>", "schema_hash": "0x611722557563b8ba", "alignment": 8, "slots": 1024},
+        {"kind": "SENDER", "name": "/intake/state", "message_bytes": 20, "external": false, "optional": false, "schema": "intake.IntakeState", "schema_hash": "0x79500160d91a3f73", "alignment": 8, "slots": 1024},
         {"kind": "TIMER", "name": "intake", "message_bytes": 0, "external": false, "optional": false}
       ]
     },
@@ -51,8 +51,8 @@
       "target": "//2026-robot/main_processor/odometry:node",
       "described": true,
       "sources": [
-        {"kind": "SENDER", "name": "/odometry/state", "message_bytes": 56, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false}
+        {"kind": "SENDER", "name": "/odometry/state", "message_bytes": 56, "external": false, "optional": false, "schema": "odometry.OdometryState", "schema_hash": "0xe4569272beb7d445", "alignment": 8, "slots": 1024},
+        {"kind": "WATCHER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false, "schema": "drivetrain.DrivetrainState", "schema_hash": "0x8db24627f196cc7a", "alignment": 8, "slots": 1024}
       ]
     },
     {
@@ -60,11 +60,11 @@
       "target": "//2026-robot/main_processor/operator_interface:node",
       "described": true,
       "sources": [
-        {"kind": "SENDER", "name": "/drivetrain/target/teleop", "message_bytes": 40, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "SENDER", "name": "/shooter/target/teleop", "message_bytes": 24, "external": false, "optional": false},
-        {"kind": "SENDER", "name": "/intake/target/teleop", "message_bytes": 20, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false},
+        {"kind": "SENDER", "name": "/drivetrain/target/teleop", "message_bytes": 40, "external": false, "optional": false, "schema": "talos.TargetEnvelope<drivetrain.ChassisTarget>", "schema_hash": "0x6afed51452740f04", "alignment": 8, "slots": 1024},
+        {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "SENDER", "name": "/shooter/target/teleop", "message_bytes": 24, "external": false, "optional": false, "schema": "talos.TargetEnvelope<shooter.ShooterTarget>", "schema_hash": "0x58c8d0e5410d74f7", "alignment": 8, "slots": 1024},
+        {"kind": "SENDER", "name": "/intake/target/teleop", "message_bytes": 20, "external": false, "optional": false, "schema": "talos.TargetEnvelope<intake.IntakeTarget>", "schema_hash": "0x611722557563b8ba", "alignment": 8, "slots": 1024},
+        {"kind": "WATCHER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false, "schema": "drivetrain.DrivetrainState", "schema_hash": "0x8db24627f196cc7a", "alignment": 8, "slots": 1024},
         {"kind": "TIMER", "name": "operator_interface", "message_bytes": 0, "external": false, "optional": false}
       ]
     },
@@ -73,12 +73,12 @@
       "target": "//2026-robot/main_processor/shooter:node",
       "described": true,
       "sources": [
-        {"kind": "WATCHER", "name": "/hw/state", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "SENDER", "name": "/hw/request/shooter", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/shooter/target/teleop", "message_bytes": 24, "external": false, "optional": true},
-        {"kind": "WATCHER", "name": "/shooter/target/auto", "message_bytes": 24, "external": false, "optional": true},
-        {"kind": "SENDER", "name": "/shooter/state", "message_bytes": 32, "external": false, "optional": false},
+        {"kind": "WATCHER", "name": "/hw/state", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "SENDER", "name": "/hw/request/shooter", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
+        {"kind": "WATCHER", "name": "/shooter/target/teleop", "message_bytes": 24, "external": false, "optional": true, "schema": "talos.TargetEnvelope<shooter.ShooterTarget>", "schema_hash": "0x58c8d0e5410d74f7", "alignment": 8, "slots": 1024},
+        {"kind": "WATCHER", "name": "/shooter/target/auto", "message_bytes": 24, "external": false, "optional": true, "schema": "talos.TargetEnvelope<shooter.ShooterTarget>", "schema_hash": "0x58c8d0e5410d74f7", "alignment": 8, "slots": 1024},
+        {"kind": "SENDER", "name": "/shooter/state", "message_bytes": 32, "external": false, "optional": false, "schema": "shooter.ShooterState", "schema_hash": "0x24ee4ff3f93dc643", "alignment": 8, "slots": 1024},
         {"kind": "TIMER", "name": "shooter", "message_bytes": 0, "external": false, "optional": false}
       ]
     },
@@ -87,20 +87,21 @@
       "target": "//2026-robot/main_processor/telemetry:node",
       "described": true,
       "sources": [
-        {"kind": "WATCHER", "name": "/odometry/state", "message_bytes": 56, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/shooter/state", "message_bytes": 32, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/intake/state", "message_bytes": 20, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/hw/status", "message_bytes": 64, "external": false, "optional": false},
-        {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false},
+        {"kind": "WATCHER", "name": "/odometry/state", "message_bytes": 56, "external": false, "optional": false, "schema": "odometry.OdometryState", "schema_hash": "0xe4569272beb7d445", "alignment": 8, "slots": 1024},
+        {"kind": "WATCHER", "name": "/drivetrain/state", "message_bytes": 56, "external": false, "optional": false, "schema": "drivetrain.DrivetrainState", "schema_hash": "0x8db24627f196cc7a", "alignment": 8, "slots": 1024},
+        {"kind": "WATCHER", "name": "/shooter/state", "message_bytes": 32, "external": false, "optional": false, "schema": "shooter.ShooterState", "schema_hash": "0x24ee4ff3f93dc643", "alignment": 8, "slots": 1024},
+        {"kind": "WATCHER", "name": "/intake/state", "message_bytes": 20, "external": false, "optional": false, "schema": "intake.IntakeState", "schema_hash": "0x79500160d91a3f73", "alignment": 8, "slots": 1024},
+        {"kind": "WATCHER", "name": "/hw/status", "message_bytes": 64, "external": false, "optional": false, "schema": "bridge.BridgeStatus", "schema_hash": "0x62dce0fec2f44c17", "alignment": 8, "slots": 1024},
+        {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1404, "external": false, "optional": false, "schema": "talos.hardware.Packet", "schema_hash": "0x33d3c5e0cdc00979", "alignment": 4, "slots": 1024},
         {"kind": "TIMER", "name": "telemetry", "message_bytes": 0, "external": false, "optional": false},
-        {"kind": "SENDER", "name": "/talos/telemetry", "message_bytes": 16384, "external": true, "optional": false}
+        {"kind": "SENDER", "name": "/talos/telemetry", "message_bytes": 16384, "external": true, "optional": false, "schema": "talos.Bytes", "schema_hash": "0x6e5e99c85b6b1359", "alignment": 8, "slots": 64}
       ]
     }
   ],
   "diagnostics": [
     {"severity": "warning", "subject": "/drivetrain/target/auto", "message": "is in the target policy of drivetrain but nothing writes it yet"},
     {"severity": "warning", "subject": "/intake/target/auto", "message": "is in the target policy of intake but nothing writes it yet"},
-    {"severity": "warning", "subject": "/shooter/target/auto", "message": "is in the target policy of shooter but nothing writes it yet"}
+    {"severity": "warning", "subject": "/shooter/target/auto", "message": "is in the target policy of shooter but nothing writes it yet"},
+    {"severity": "warning", "subject": "operator_interface", "message": "numeric parameters without a unit suffix (docs/METHODOLOGY.md §6): deadband, intake_button, shoot_button"}
   ]
 }

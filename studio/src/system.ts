@@ -331,9 +331,13 @@ const DECLARED_KIND = 'talos.declared_graph';
 // introspect::kDescribeVersion, which is what the launcher assembles this from.
 export const DECLARED_VERSION = 1;
 
+// `schema` and `schema_hash` name the topic's type (talOS/schema/identity.h):
+// "control.VelocityTarget", "talos.Bytes", "talos.TargetEnvelope<...>", and
+// its 64-bit hash as describe writes it, "0x" and 16 hex digits. A timer is
+// not a topic and has neither.
 export type DeclaredSource = {
   kind: SourceKind; name: string; message_bytes: number; external: boolean;
-  optional: boolean;
+  optional: boolean; schema: string | null; schema_hash: string | null;
 };
 
 export type DeclaredNode = {
@@ -359,12 +363,18 @@ function parseDeclaredSource(value: unknown, where: string): DeclaredSource {
   const kind = str(source, 'kind');
   if (!KINDS.includes(kind as SourceKind))
     fail(`${where}.kind must be one of ${KINDS.join(', ')}`);
+  const timer = kind === 'TIMER';
+  const hash = timer ? null : str(source, 'schema_hash');
+  if (hash !== null && !/^0x[0-9a-f]{16}$/.test(hash))
+    fail(`${where}.schema_hash must be 0x and 16 lowercase hex digits`);
   return {
     kind: kind as SourceKind,
     name: str(source, 'name'),
     message_bytes: num(source, 'message_bytes'),
     external: flag(source, 'external'),
-    optional: flag(source, 'optional')
+    optional: flag(source, 'optional'),
+    schema: timer ? null : str(source, 'schema'),
+    schema_hash: hash
   };
 }
 

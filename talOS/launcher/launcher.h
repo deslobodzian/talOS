@@ -33,6 +33,8 @@
 #include "talOS/events/log/log_reader.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
+#include "talOS/rtms/rtms.h"
+#include "talOS/schema/unit_suffix.h"
 #include "toml.hpp"
 
 namespace talos::launcher {
@@ -551,6 +553,44 @@ inline naming::TargetSources TargetSourcesOf(
   return sources;
 }
 
+// METHODOLOGY §6: every numeric parameter key ends in a unit suffix. One
+// warning per subsystem whose [subsystems.<name>] table has numeric keys (a
+// number, or an array of numbers) without one, listing them. Nested tables
+// (motors, targets) are device and policy config, not parameters.
+inline std::vector<naming::Diagnostic> LintParameterUnits(
+    const config::RobotConfig& robot_config) {
+  std::vector<naming::Diagnostic> findings;
+  const toml::table* subsystems =
+      robot_config.toml_data["subsystems"].as_table();
+  if (subsystems == nullptr) return findings;
+  const auto number = [](const toml::node& value) {
+    return value.is_integer() || value.is_floating_point();
+  };
+  const auto numeric = [&number](const toml::node& value) {
+    if (number(value)) return true;
+    const toml::array* array = value.as_array();
+    return array != nullptr && !array->empty() &&
+           std::all_of(array->begin(), array->end(), number);
+  };
+  for (const auto& [subsystem, table] : *subsystems) {
+    const toml::table* params = table.as_table();
+    if (params == nullptr) continue;
+    std::string unitless;
+    for (const auto& [key, value] : *params) {
+      if (!numeric(value) || schema::has_unit_suffix(key.str())) continue;
+      unitless += unitless.empty() ? "" : ", ";
+      unitless += key.str();
+    }
+    if (unitless.empty()) continue;
+    findings.push_back(
+        {naming::Severity::WARNING, std::string{subsystem.str()},
+         "numeric parameters without a unit suffix (docs/METHODOLOGY.md "
+         "§6): " +
+             unitless});
+  }
+  return findings;
+}
+
 // Phase one of a launch: ask every binary in the roster what it is, assemble
 // the graph they describe, and lint it. The binaries, not the config, are the
 // source: a second declaration of the topology is a thing to forget to update.
@@ -622,6 +662,56 @@ inline std::size_t CountDeclaredTopics(
   return topics.size();
 }
 
+// The shape each declared topic's segment is created with: its publisher's
+// (the first SENDER), else its first end's. Ends that disagree are a lint
+// error the session was told to ignore (--allow-graph-errors); the ends that
+// differ from the segment then fail at attach, naming both shapes.
+inline std::vector<naming::SourceShape> SessionTopics(
+    const std::vector<NodeDescription>& described) {
+  std::vector<naming::SourceShape> topics;
+  for (const auto& node : described) {
+    for (const auto& source : node.declared.sources) {
+      if (source.kind == event::SourceKind::TIMER) continue;
+      const auto known = std::find_if(
+          topics.begin(), topics.end(),
+          [&source](const auto& topic) { return topic.name == source.name; });
+      if (known == topics.end()) {
+        topics.push_back(source);
+      } else if (source.kind == event::SourceKind::SENDER &&
+                 known->kind != event::SourceKind::SENDER) {
+        *known = source;
+      }
+    }
+  }
+  return topics;
+}
+
+// Phase two's first step: the session owns every declared topic. Each
+// segment is created session-owned (rtms.h "Segment lifetime") before any
+// node starts, replacing whatever the name held, and unlinked when the
+// returned queues are destroyed at the end of the session. Nodes only
+// attach, so a node that is killed and restarted, or that exits cleanly,
+// leaves its topics -- and the subscribers reading them -- in place. A
+// topic of a node that did not answer --describe is not declared, so its
+// first process creates it as outside a session. Throws, naming the topic,
+// if a segment cannot be created.
+inline std::vector<RTMSQueue> CreateSessionSegments(
+    const std::vector<NodeDescription>& described) {
+  std::vector<RTMSQueue> segments;
+  for (const auto& topic : SessionTopics(described)) {
+    try {
+      segments.emplace_back(
+          topic.name, topic.message_bytes, topic.alignment,
+          schema::Identity{topic.schema, topic.schema_hash, {}}, topic.slots,
+          RTMSOptions{.session_owner = true});
+    } catch (const std::exception& e) {
+      throw std::runtime_error("cannot create the segment of " + topic.name +
+                               ": " + e.what());
+    }
+  }
+  return segments;
+}
+
 // The declared graph on disk, beside the session's manifest. uint64 values are
 // decimal strings: a JSON number is a double, and an id past 2^53 would change.
 inline std::string GraphToJson(
@@ -658,6 +748,14 @@ inline std::string GraphToJson(
       ss << ", \"message_bytes\": " << source.message_bytes;
       ss << ", \"external\": " << (source.external() ? "true" : "false");
       ss << ", \"optional\": " << (source.optional() ? "true" : "false");
+      if (source.kind != event::SourceKind::TIMER) {
+        // As describe writes them: the hash a hex string, not a double.
+        ss << ", \"schema\": " << Quoted(source.schema);
+        ss << ", \"schema_hash\": "
+           << Quoted(introspect::HexHash(source.schema_hash));
+        ss << ", \"alignment\": " << source.alignment;
+        ss << ", \"slots\": " << source.slots;
+      }
       ss << "}";
     }
     ss << (node.declared.sources.empty() ? "]\n" : "\n      ]\n");
@@ -991,8 +1089,11 @@ class Launcher {
 
     // Phase one: describe and lint before anything starts.
     std::vector<NodeDescription> described;
-    const auto diagnostics = DescribeGraph(node_specs, options_, described,
-                                           TargetSourcesOf(robot_config));
+    auto diagnostics = DescribeGraph(node_specs, options_, described,
+                                     TargetSourcesOf(robot_config));
+    for (auto& finding : LintParameterUnits(robot_config)) {
+      diagnostics.push_back(std::move(finding));
+    }
     const std::size_t declared_topics = CountDeclaredTopics(described);
 
     const std::string graph_path = options_.output_dir + "/graph.json";
@@ -1012,7 +1113,18 @@ class Launcher {
       return 0;
     }
 
-    // Phase two.
+    // Phase two. The session's topics exist before any node does, and until
+    // the session ends.
+    std::vector<RTMSQueue> segments;
+    try {
+      segments = CreateSessionSegments(described);
+    } catch (const std::exception& e) {
+      std::cerr << "launcher: " << e.what() << "\n";
+      return 1;
+    }
+    std::cout << "[launcher] Created " << segments.size()
+              << " session-owned topic segments\n";
+
     SessionManifest manifest;
     manifest.session_id = options_.session_id;
     manifest.config_path = options_.config_path;

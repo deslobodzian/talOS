@@ -541,8 +541,14 @@ test('a rate window needs two samples and rejects a nonsense span', () => {
 
 // --- the declared graph -----------------------------------------------------
 
-const declaredSource = (over: Json = {}): Json =>
-    ({kind: 'SENDER', name: '/odometry/state', message_bytes: 64, ...over});
+const declaredSource = (over: Json = {}): Json => ({
+  kind: 'SENDER',
+  name: '/odometry/state',
+  message_bytes: 64,
+  schema: 'odometry.OdometryState',
+  schema_hash: '0x0123456789abcdef',
+  ...over
+});
 const declaredNode = (over: Json = {}): Json => ({
   name: 'odometry',
   target: '//2026-robot/main_processor/odometry:node',
@@ -586,9 +592,14 @@ test('a declared graph parses into nodes, ends and the launcher\'s lint', () => 
     name: '/hw/command',
     message_bytes: 64,
     external: true,
-    optional: false
+    optional: false,
+    schema: 'odometry.OdometryState',
+    schema_hash: '0x0123456789abcdef'
   });
   assert.equal(declared.nodes[0].sources[1].optional, true);
+  // A timer is not a topic and has no schema, whatever the document says.
+  assert.equal(declared.nodes[0].sources[2].schema, null);
+  assert.equal(declared.nodes[0].sources[2].schema_hash, null);
   assert.deepEqual(declared.diagnostics, [{
     severity: 'warning',
     subject: '/talos/telemetry',
@@ -607,6 +618,12 @@ test('a declared graph is refused as strictly as a live one, and says which', ()
   refuses({nodes: [declaredNode({target: null})]}, /target must be a string/);
   refuses({nodes: [declaredNode({sources: [declaredSource({kind: 'PUBLISHER'})]})]},
           /kind must be one of/);
+  refuses({nodes: [declaredNode({sources: [declaredSource({schema: undefined})]})]},
+          /schema must be a string/);
+  refuses({nodes: [declaredNode({sources: [declaredSource({schema_hash: 12})]})]},
+          /schema_hash must be a string/);
+  refuses({nodes: [declaredNode({sources: [declaredSource({schema_hash: '0x12'})]})]},
+          /schema_hash must be 0x and 16 lowercase hex digits/);
   refuses({nodes: [declaredNode({sources: [declaredSource({message_bytes: '64'})]})]},
           /message_bytes must be a non-negative integer/);
   refuses({nodes: [declaredNode({sources: [declaredSource({external: 'yes'})]})]},

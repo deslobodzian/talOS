@@ -55,10 +55,32 @@ test('the parser accepts what the launcher actually writes', () => {
   assert.deepEqual(
       graph.diagnostics.map(d => `${d.severity} ${d.subject}`).sort(), [
         'warning /drivetrain/target/auto', 'warning /intake/target/auto',
-        'warning /shooter/target/auto'
+        'warning /shooter/target/auto', 'warning operator_interface'
       ]);
-  for (const d of graph.diagnostics)
+  for (const d of graph.diagnostics.filter(d => d.subject.startsWith('/')))
     assert.match(d.message, /is in the target policy of \w+ but nothing writes it yet/);
+  // METHODOLOGY §6: the parameter keys still lacking a unit suffix.
+  assert.match(graph.diagnostics.find(d => d.subject === 'operator_interface')!.message,
+               /without a unit suffix .*: deadband, intake_button, shoot_button$/);
+});
+
+test('every topic end names its schema, and the ends of a topic agree', () => {
+  const graph = parseDeclaredGraph(fixture);
+  const schemas = new Map<string, string>();
+  for (const node of graph.nodes) {
+    for (const source of node.sources) {
+      if (source.kind === 'TIMER') {
+        assert.equal(source.schema, null);
+        continue;
+      }
+      assert.ok(source.schema, `${node.name} ${source.name} has no schema`);
+      const identity = `${source.schema} ${source.schema_hash}`;
+      assert.equal(schemas.get(source.name) ?? identity, identity, source.name);
+      schemas.set(source.name, identity);
+    }
+  }
+  assert.equal(schemas.get('/hw/state'),
+               'talos.hardware.Packet 0x33d3c5e0cdc00979');
 });
 
 test('endpoint attributes survive the crossing', () => {
@@ -139,8 +161,9 @@ test('the launcher\'s findings cross the language boundary intact', () => {
   // printed lowercase, which was a real guess in this parser.
   for (const d of graph.diagnostics)
     assert.ok(d.severity === 'error' || d.severity === 'warning', d.severity);
-  assert.equal(graph.diagnostics.length - errors.length, 3,
-               'the autonomous-lane warnings are still there beside the errors');
+  assert.equal(graph.diagnostics.length - errors.length, 4,
+               'the autonomous-lane and parameter-unit warnings are still ' +
+                   'there beside the errors');
 
   const subjects = errors.map(d => d.subject).sort();
   assert.deepEqual(subjects, ['/hw/req/drive', '/hw/request/drivetrain']);

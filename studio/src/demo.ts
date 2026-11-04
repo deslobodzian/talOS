@@ -507,6 +507,18 @@ const DEMO_DIAGNOSTICS = [{
   message: 'is published but nothing subscribes to it'
 }];
 
+// A demo topic's schema: named after the topic, hashed (FNV-1a 64, as the
+// schema hash is) from that name, so every end of one topic agrees.
+function demoSchema(topic: string): {schema: string; schema_hash: string} {
+  const schema = 'demo' + topic.replace(/\//g, '.');
+  let hash = 0xcbf29ce484222645n;
+  for (const c of schema) {
+    hash ^= BigInt(c.charCodeAt(0));
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return {schema, schema_hash: '0x' + hash.toString(16).padStart(16, '0')};
+}
+
 // Every end the node's constructor registered, timers included: `--describe`
 // prints the manifest, and the manifest is where a timer lives too.
 const declaredNode = (node: DemoNode): DeclaredNode => ({
@@ -517,7 +529,10 @@ const declaredNode = (node: DemoNode): DeclaredNode => ({
                              name: source.name,
                              message_bytes: source.bytes,
                              external: source.external === true,
-                             optional: source.optional === true
+                             optional: source.optional === true,
+                             ...(source.kind === 'TIMER'
+                                     ? {schema: null, schema_hash: null}
+                                     : demoSchema(source.name))
                            }))
 });
 

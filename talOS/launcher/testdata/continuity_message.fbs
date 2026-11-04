@@ -1,0 +1,8 @@
+// continuity_test's one topic, /continuity_source/state.
+namespace continuity_test;
+
+struct Count {
+  // Which publisher wrote it: 0 the first run, 1 its restart, 2 the test.
+  run_index:uint;
+  sequence_count:uint;
+}

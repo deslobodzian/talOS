@@ -285,6 +285,39 @@ TEST(LauncherTest, StudioBridgeWatchTopicFollowsDescribe) {
   EXPECT_EQ(StudioBridgeWatchTopic({alpha}, robot), "/config/telemetry");
 }
 
+// METHODOLOGY §6 for parameters: a numeric key without a unit suffix is
+// named, per subsystem; strings, bools and nested device tables are not
+// parameters with units.
+TEST(LauncherTest, NumericParametersWithoutAUnitSuffixAreWarned) {
+  config::RobotConfig robot;
+  robot.toml_data = toml::parse(R"(
+[subsystems.shooter]
+period_us = 5000
+gain = 0.5
+tolerance_rot = 0.1
+gains = [1, 2.5]
+offsets_m = [0.1]
+label = "x"
+enabled = true
+names = ["a"]
+[subsystems.shooter.motors.flywheel]
+can_id = 3
+inverted_count = 1
+wobble = 2
+
+[subsystems.intake]
+speed_rps = 40.0
+)");
+  const auto findings = LintParameterUnits(robot);
+  ASSERT_EQ(findings.size(), 1u);
+  EXPECT_EQ(findings[0].severity, introspect::naming::Severity::WARNING);
+  EXPECT_EQ(findings[0].subject, "shooter");
+  EXPECT_NE(findings[0].message.find("unit suffix"), std::string::npos);
+  EXPECT_NE(findings[0].message.find(": gain, gains"), std::string::npos)
+      << findings[0].message;
+  EXPECT_EQ(findings[0].message.find("wobble"), std::string::npos);
+}
+
 TEST(LauncherTest, ShouldRetryStudioBridgePredicate) {
   using clock = std::chrono::steady_clock;
   const auto now = clock::now();
@@ -1038,7 +1071,9 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   EXPECT_EQ(options.bundle_config_sha256, "abc123");
 
   // A manifest that is not TOML is an error, not a silently empty bundle.
-  { std::ofstream{bundle_dir + "/bundle_manifest.toml"} << "nodes = [\n"; }
+  {
+    std::ofstream{bundle_dir + "/bundle_manifest.toml"} << "nodes = [\n";
+  }
   LauncherOptions broken;
   broken.bundle_dir = bundle_dir;
   EXPECT_FALSE(LoadBundle(broken, error));
