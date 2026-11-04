@@ -3,10 +3,8 @@
 Status: partially implemented checkpoint, not acceptance-complete. See
 [HANDOFF_AUTOMATIC_WIRING.md](HANDOFF_AUTOMATIC_WIRING.md) for current evidence,
 remaining work, and completion order. The rules it serves are in
-[METHODOLOGY.md](METHODOLOGY.md). D2 has its first stage (build-level
-descriptors and the field-name lint). D6 is implemented except
-`--replay-inputs`, which waits for D2's descriptor-bearing logs. The rest of
-D2, and D3 and D4, remain proposals.
+[METHODOLOGY.md](METHODOLOGY.md). D2 is implemented. D6 is implemented,
+including `--replay-inputs`. D3 and D4 remain proposals.
 
 ## Problem
 
@@ -222,9 +220,7 @@ nobody drives.
 
 ## D2. Self-describing topics (FlatBuffers reflection)
 
-**Status: stage 1 implemented (descriptors and field-name lint); attach
-checks, launcher-owned segments, descriptor-bearing logs and the reflection
-codec remain.** `talos_messages` compiles each schema to `<file>.bfbs` with
+**Status: implemented.** `talos_messages` compiles each schema to `<file>.bfbs` with
 `flatc --binary --schema --bfbs-filenames` and lints it in the same action
 (`talOS/build/descriptor_gen.cc` against `talOS/schema/unit_suffix.h`). It
 generates `<prefix>/<file>_descriptor.h` specializing `talos::Descriptor<M>`
@@ -257,18 +253,17 @@ own reflection:
 - **Attach checks a schema hash** (the hash of the struct's reflection
   object), not just size. A mismatch fails, naming both types.
 - **`.tlog` files carry descriptors** at session start, so `log_dump` can
-  decode payloads (an open TODO) and the `.tlog` → MCAP export can emit typed
+  decode payloads and the `.tlog` → MCAP export can emit typed
   channels.
 - **The Python codec** (`_messages.py`) reads layout from reflection instead of
   recording `Create<Struct>` calls. The recorder heuristic is deleted.
 - **Field-name lint** against the METHODOLOGY §6 suffix table runs in the
   `talos_messages` action and fails the build.
 
-**Acceptance:**
+**Acceptance: passed.**
 - `log_dump` prints decoded fields for every topic.
 - A deliberately changed field type with the same size is rejected at attach.
 - The Python codec tests pass on reflection alone.
-
 ---
 
 ## D3. Telemetry from descriptors (framework node)
@@ -400,7 +395,7 @@ What a pose estimator needs, and where each piece now lives:
 | Estimator math | hand-written dead reckoning (`odometry`, deleted) | `pose_estimator` (Python): wpimath or GTSAM, chosen by `backend` |
 | A topics-only package | `talos_messages` needed a schema | `talos_messages(srcs = [], topics = ..., deps = ["//talOS/msgs:geometry"])` |
 | A list parameter (`cameras = [...]`) | `param<T>` took bool, integer, double or string only | `param<std::vector<std::string>>` / `std::vector<double>`, in the C ABI and Python (`node.param("cameras")` is a list) |
-| Offline tuning | `--replay` replays a node's own log | `--replay-inputs <session>` (drive a *new* node from another session's logged topics) is not built yet |
+| Offline tuning | `--replay` replays a node's own log | `launcher --replay-inputs <session> --only <node>` (the node binary's `--replay-inputs`, so C++ and Python alike): the node, new to the session or changed, runs on a simulated loop from the session's origin, fed every topic it subscribes to that any of the session's logs recorded at its recorded time (`talOS/events/input_replay.h`); its outputs go to a new log, reproducibly; a schema mismatch fails naming both types; unrecorded inputs are listed |
 
 ### The 2026 robot's estimator
 
@@ -491,7 +486,7 @@ flowchart LR
 | 2 | D1, migrating the 2026 robot and the scaffold; delete the arbiter | D1 acceptance; `--describe-only` on every config; live sim fault table |
 | 3 | D2 | D2 acceptance |
 | 4 | D3, then D4; delete the robot telemetry package and `GenericTarget`/`GenericState` | D3/D4 acceptance; Studio shows a scaffolded subsystem |
-| 5 | D6 (wpimath and GTSAM dependencies first; built and run on macOS arm64, Linux left to CI) | estimator `Sim` tests on both backends; `bundle_test` with wpimath; `--replay-inputs` on a recorded sim session (not built: after D2's descriptor-bearing logs) |
+| 5 | D6 (wpimath and GTSAM dependencies first; built and run on macOS arm64, Linux left to CI) | estimator `Sim` tests on both backends; `bundle_test` with wpimath; `--replay-inputs` on a recorded sim session |
 
 Every step updates `ARCHITECTURE.md`, `NODE_DEVELOPMENT_GUIDE.md`,
 `examples/superstructure`, `tools/new_subsystem.py` and the "planned" marks in

@@ -181,22 +181,74 @@ represented by the terminal `EXIT` record.
 
 Inspect a log with `bazel run //talOS/launcher:log_dump -- /tmp/run.tlog`.
 
+## Replaying another session's inputs
+
+`ReplayEventLoop` answers "does this program still do what it did?" and
+refuses a program whose manifest differs from the log's. Offline tuning asks
+the other question: what would a *new* program -- one that was not in the
+session, or a changed version of one that was -- have done in that match?
+`input_replay.h` answers it without comparing anything:
+
+```cpp
+const RecordedSession session{"/tmp/talos_logs/<session>"};  // every *.tlog
+SimulationEnvironment environment;
+SimulatedEventLoop<log::LogWriter> loop{
+    environment, log::LogWriter{"/tmp/out/estimator.tlog", "estimator"},
+    {.start = session.start()}};
+Estimator estimator{loop};                 // registers its watchers
+const InputReplayReport report = ReplayInputs(loop, environment, session);
+```
+
+- `RecordedSession` reads every log of a session directory. A topic's
+  messages come from whichever logs recorded them: the writer's accepted
+  `SEND`s, or, when the writer kept no log of the topic, the earliest
+  reader's receipts. One message seen in several logs is kept once, by topic
+  and transport sequence, at the earliest recorded time. Logs from two
+  sessions, or a topic recorded with two schemas, are refused.
+- `ReplayInputs` runs the loop on its virtual clock from the session's origin
+  to its last recorded time. Each recorded message on a topic the program
+  watches is published at its recorded time, so the next drain delivers it,
+  as a live reader's would have. Topics the program sends are its own output
+  and are not fed; what it sends goes to its recorder, a new log.
+- A watched topic recorded with another schema (name or hash, `.tlog` v5's
+  per-topic descriptors) throws `ReplayError` before anything runs, naming
+  both types and who recorded it. Watched topics no log recorded are listed in
+  `InputReplayReport::unrecorded`; nothing arrives on them.
+
+The loop is simulated and its inputs come from a file, so two replays of one
+session produce identical records. Replay feeds every input from the session
+origin (monotonic t = 0), including any messages the live node missed during
+process startup or native module imports, so replayed output can legitimately
+differ from the live log at the beginning of the run. To make the output
+`.tlog` files byte-identical in their headers across runs, pass an explicit
+`--session-id <id>` (otherwise only the generated `session_id` and the
+informational wall-clock `start_wall_ns` in `FileHeader` differ, with all
+records, schemas, and payloads 100% bit-identical).
+
+Node binaries expose this as
+`--replay-inputs <session dir>` (`talOS/node/node.cc`, Python nodes included
+through the C ABI); the launcher as `--replay-inputs <dir> --only <node>`
+(`talOS/launcher/README.md`). Byte topics (`Node::publish_bytes`) are
+discarded there: the loop never logs them, and an offline run must not write
+into a live robot's shared memory.
+
 ## Log format
 
-`[FileHeader][ManifestEntry × n][Record ...]`, little-endian, append-only, with
-a CRC on the manifest block and on every record. A record is a 56-byte header
-plus its payload up to the last non-zero byte: fixed-size messages are mostly
-trailing zero padding, so the header keeps the payload's full size and the
-reader zero-fills it back, handing out exactly the bytes that were recorded. A
-log that ends mid-record is not corruption: everything before the cut still
-replays, which matters when a robot loses power. A record whose checksum is
-wrong *is* corruption and is refused.
+`[FileHeader][ManifestEntry × n][schema block][Record ...]`, little-endian,
+append-only, with a CRC on the manifest and schema blocks, and on every record.
+The schema block carries each manifest entry's topic schema
+(`talOS/schema/identity.h`): its name and embedded `.bfbs` reflection schema
+bytes. A record is a 56-byte header plus its payload up to the last non-zero
+byte: fixed-size messages are mostly trailing zero padding, so the header keeps
+the payload's full size and the reader zero-fills it back, handing out exactly
+the bytes that were recorded. A log that ends mid-record is not corruption:
+everything before the cut still replays, which matters when a robot loses
+power. A record whose checksum is wrong *is* corruption and is refused.
 
 Format details live in `log/format.h`. The version field is checked on read;
 readers reject a version they do not know rather than guessing.
-The current format is version 4, which added the trailing-zero trimming;
-earlier logs are rejected.
-
+The current format is version 5, which adds the schema block and per-topic
+schema identities; version 4 and earlier logs are refused.
 Records are copied into preallocated chunks and handed to a background thread
 through an atomic ring. Dispatch does not lock, wait for disk, or resize buffers.
 The writer checks for new chunks every millisecond. If the pool is exhausted,

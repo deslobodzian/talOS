@@ -24,10 +24,11 @@ the constructor; `update()` runs every period.
 | `TALOS_NODE(Class)` in one `.cc` | `talos_py_node(class_name = ...)` | |
 
 Messages are FlatBuffers **structs** (no tables or strings), at most 8-byte
-aligned. A relative topic name (`"state"`, `"event/shot"`) expands to
+aligned. Topics are typed by schema identity (`Descriptor<M>`, name and
+schema hash): attaching with a mismatched schema fails, naming both types.
+A relative topic name (`"state"`, `"event/shot"`) expands to
 `"/<name>/<topic>"`; `[subsystems.<name>.remap]` can redirect relative or
 absolute topics without changing node code.
-
 ### When messages arrive
 
 A subscription is updated when the node's loop drains its topics, and the
@@ -164,6 +165,8 @@ naming the field. Each struct also gets a schema descriptor
 64-bit schema hash that changes with any field name, type, offset, nested
 struct or enum value, but not with comments or formatting. Python's
 `talos_schema.struct_hash` computes the same hash from the same bytes.
+Logs (`.tlog` format version 5) carry these descriptors, and `log_dump`
+prints decoded fields.
 The node's name comes from `node_name`; add the node to the robot config as
 `node = "//path:node"`.
 
@@ -237,3 +240,9 @@ observation once (`updated`). Rules every estimator keeps:
 odometry plus cameras, with `backend = "kalman"` (wpimath
 `SwerveDrive4PoseEstimator`) or `"factor_graph"` (a GTSAM fixed-lag
 smoother), and tests that run every scenario against both.
+
+Tune or verify offline with `launcher --replay-inputs <session> --only <node>`.
+The node runs on a simulated loop fed recorded inputs from the session origin
+(monotonic t = 0), including messages missed during live startup. Two replays
+of a session yield bit-identical records; pass `--session-id <id>` if you need
+to pin the header session ID as well.

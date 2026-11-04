@@ -108,6 +108,10 @@ class SimulatedEventLoop
     std::size_t max_messages_per_tick{64};
     // As on the realtime loop, so a simulation delivers when the robot would.
     Delivery delivery{Delivery::POLL};
+    // The clock's origin: where it starts and what the manifest's timer
+    // offsets count from. Input replay (input_replay.h) starts at the
+    // recorded session's, so recorded times mean what they meant live.
+    MonotonicTime start{};
   };
 
   // How often the loop has drained its watched topics, as on the realtime
@@ -116,13 +120,18 @@ class SimulatedEventLoop
 
   explicit SimulatedEventLoop(SimulationEnvironment& environment,
                               Options options = Options{})
-      : environment_{&environment}, options_{options} {}
+      : environment_{&environment}, options_{options}, now_{options.start} {
+    this->set_start_time(options.start);
+  }
 
   SimulatedEventLoop(SimulationEnvironment& environment, Recorder recorder,
                      Options options = Options{})
       : Base{std::move(recorder)},
         environment_{&environment},
-        options_{options} {}
+        options_{options},
+        now_{options.start} {
+    this->set_start_time(options.start);
+  }
 
   // Fixed before the first run, like the realtime loop's.
   void set_delivery(Delivery delivery) {

@@ -33,6 +33,7 @@ cc_binary(
     deps = [
         ":launcher_lib",
         "//talOS/events:events_core",
+        "//talOS/events:events_log",
         "//talOS/schema:decode",
     ],
 )
@@ -103,6 +104,64 @@ cc_test(
         ":launcher_lib",
         "//talOS/events:events_log",
         "//talOS/rtms",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+# --replay-inputs: a producer recorded in a session, a consumer that was not
+# in it, and a reader of the producer's topic as another type of the same
+# size.
+talos_messages(
+    name = "replay_message",
+    srcs = ["testdata/replay_message.fbs"],
+    include_prefix = "replay_inputs_test",
+    visibility = ["//visibility:private"],
+)
+
+talos_cc_node(
+    name = "replay_source",
+    srcs = ["testdata/replay_source.cc"],
+    node_name = "replay_source",
+    visibility = ["//visibility:private"],
+    deps = [":replay_message"],
+)
+
+talos_cc_node(
+    name = "replay_consumer",
+    srcs = ["testdata/replay_consumer.cc"],
+    node_name = "replay_consumer",
+    visibility = ["//visibility:private"],
+    deps = [":replay_message"],
+)
+
+talos_cc_node(
+    name = "replay_impostor",
+    srcs = ["testdata/replay_impostor.cc"],
+    node_name = "replay_impostor",
+    visibility = ["//visibility:private"],
+    deps = [":replay_message"],
+)
+
+cc_test(
+    name = "replay_inputs_test",
+    size = "small",
+    srcs = ["replay_inputs_test.cc"],
+    data = [
+        ":replay_consumer",
+        ":replay_impostor",
+        ":replay_source",
+    ],
+    env = {
+        "TALOS_SOURCE_NODE": "$(rlocationpath :replay_source)",
+        "TALOS_CONSUMER_NODE": "$(rlocationpath :replay_consumer)",
+        "TALOS_IMPOSTOR_NODE": "$(rlocationpath :replay_impostor)",
+    },
+    deps = [
+        ":launcher_lib",
+        ":replay_message",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],

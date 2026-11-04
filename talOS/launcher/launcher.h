@@ -86,8 +86,8 @@ struct NodeProcessInfo {
 struct SessionManifest {
   uint64_t session_id{0};
   std::string config_path;
-  // sha256 over the robot config plus every subsystem file, from the bundle
-  // manifest. Empty for non-bundle launches.
+  // sha256 over every staged file as config-relative path + bytes, from the
+  // bundle manifest. Empty for non-bundle launches.
   std::string config_sha256;
   std::string output_dir;
   bool simulation{false};
@@ -165,6 +165,11 @@ struct LauncherOptions {
 
   // Probe and lint without spawning anything, as a pre-flight check.
   bool describe_only{false};
+
+  // Input replay: run only `only`, fed the topics the session in this
+  // directory logged (talOS/events/input_replay.h), and nothing else.
+  std::string replay_inputs;
+  std::string only;
 
   // How long one binary gets to answer --describe. A Python node importing
   // native wheels (robotpy-wpimath) needs several seconds on its first run
@@ -1097,7 +1102,8 @@ class Launcher {
 
   // Lints the declared graph, then runs the roster until every node exits,
   // the duration passes or a signal arrives, and writes manifest.json.
-  // Returns 0, or the last nonzero exit code of a node.
+  // Returns 0, or the last nonzero exit code of a node. With --replay-inputs
+  // it runs only the --only node, on recorded topics (RunOnRecordedInputs).
   int Run() {
     std::string bundle_error;
     if (!LoadBundle(options_, bundle_error)) {
@@ -1106,6 +1112,11 @@ class Launcher {
     }
     if (options_.config_path.empty()) {
       std::cerr << "launcher: --config PATH or --bundle PATH is required\n";
+      return 1;
+    }
+    if (options_.replay_inputs.empty() != options_.only.empty()) {
+      std::cerr << "launcher: --replay-inputs SESSION_DIR and --only NODE go "
+                   "together\n";
       return 1;
     }
     std::filesystem::create_directories(options_.output_dir);
@@ -1135,6 +1146,9 @@ class Launcher {
     if (node_specs.empty()) {
       std::cerr << "launcher: no nodes declared in config\n";
       return 1;
+    }
+    if (!options_.replay_inputs.empty()) {
+      return RunOnRecordedInputs(node_specs);
     }
 
     // Phase one: describe and lint before anything starts.
@@ -1307,6 +1321,64 @@ class Launcher {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+  }
+
+  // --replay-inputs: runs the one roster member --only names on the topics
+  // the session in options_.replay_inputs logged, by starting its binary with
+  // --replay-inputs (talOS/node/node.cc, which Python nodes share through
+  // the C ABI). Nothing else starts: no other node, no segment, no hardware.
+  // Its log is <output_dir>/<name>.tlog. Returns its exit code.
+  int RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(options_.replay_inputs, ec)) {
+      std::cerr << "launcher: --replay-inputs " << options_.replay_inputs
+                << " is not a session directory\n";
+      return 1;
+    }
+    // The new log must not land among the logs being read.
+    if (std::filesystem::equivalent(options_.output_dir, options_.replay_inputs,
+                                    ec)) {
+      std::cerr << "launcher: --output-dir must not be the replayed session's "
+                   "directory\n";
+      return 1;
+    }
+    const auto spec = std::find_if(
+        specs.begin(), specs.end(),
+        [&](const NodeSpec& s) { return s.name == options_.only; });
+    if (spec == specs.end()) {
+      std::cerr << "launcher: --only " << options_.only
+                << " names no roster member of " << options_.config_path
+                << "\n";
+      return 1;
+    }
+    if (spec->name == kHardwareNodeName || spec->name == kSimGatewayName ||
+        spec->name == kStudioBridgeName) {
+      std::cerr << "launcher: " << spec->name
+                << " is not a talos node and has no input replay\n";
+      return 1;
+    }
+
+    const std::string log_path =
+        NodeLogPath(options_.output_dir, spec->name, 0);
+    std::cout << "[launcher] Replaying session " << options_.replay_inputs
+              << " into " << spec->name << " (" << spec->target << "); log "
+              << log_path << "\n";
+    const pid_t pid = SpawnProcess(
+        {spec->binary_path, "--replay-inputs", options_.replay_inputs,
+         "--session-id", std::to_string(options_.session_id), "--log", log_path,
+         "--config", options_.config_path, "--sim"});
+    if (pid < 0) {
+      std::cerr << "[launcher] fork() failed for node " << spec->name << "\n";
+      return 1;
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0) {
+      if (errno != EINTR) return 1;
+    }
+    const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    std::cout << "[launcher] " << spec->name << " finished ("
+              << ExitReason(status) << ")\n";
+    return clean ? 0 : (WIFEXITED(status) ? WEXITSTATUS(status) : 1);
   }
 
   static void InstallSignals() {
@@ -1510,22 +1582,6 @@ inline std::shared_ptr<const event::Registration> ResolveSource(
     if (reg.id == source_id) return {manifest, &reg};
   }
   return nullptr;
-}
-
-// A session directory's event logs (every `*.tlog` in it, which is where the
-// launcher puts each node's log), or a single log file as given.
-inline std::vector<std::string> FindLogFiles(const std::string& path_or_dir) {
-  std::error_code ec;
-  if (!std::filesystem::is_directory(path_or_dir, ec)) return {path_or_dir};
-  std::vector<std::string> result;
-  for (const auto& entry :
-       std::filesystem::directory_iterator(path_or_dir, ec)) {
-    if (entry.path().extension() == ".tlog") {
-      result.push_back(entry.path().string());
-    }
-  }
-  std::sort(result.begin(), result.end());
-  return result;
 }
 
 // Merges logs of one session by event time, then now, then dispatch index.

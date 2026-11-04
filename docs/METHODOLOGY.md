@@ -194,7 +194,7 @@ Rules:
   `talos_messages` action fails on a numeric struct field (or array of
   numbers) without a suffix, naming it. A suffix needs a name before it
   (`count` alone fails; `tick_count` passes). **[enforced]** Numeric
-  parameters without a suffix get a `--describe-only` warning. **[planned: D2]**
+  parameters without a suffix get a `--describe-only` warning. **[enforced (warning)]**
 - No one-letter word before the suffix: `x_std_m`, not `std_x_m`, and
   `module0`, not `module_0`. flatc camel-cases field names for Python, and
   talos derives the snake_case names back from them, so `std_x_m` would read
@@ -205,11 +205,12 @@ Rules:
 - Look in `talOS/msgs` (`geometry`, `control`) before writing a new struct.
   Reuse beats a near-duplicate. **[review]**
 - Messages are FlatBuffers structs owned by one package, declared with
-  `talos_messages`. Never mirror a struct by hand; `GenericState` and
-  operator_interface's `GenericTarget` are slated for removal (D3, D4). Each
-  struct has a build-time schema descriptor (`talos::Descriptor<M>`,
-  `<Struct>.TALOS_SCHEMA_HASH`). **[review; D2 replaces size-only attach
-  checks with that schema hash]**
+  `talos_messages`. Never mirror a struct by hand (the earlier `GenericState`
+  and `GenericTarget` side doors have been deleted; D3 and D4 will replace
+  hard-coded subsystem lists with framework nodes). Each struct has a build-time
+  schema descriptor (`talos::Descriptor<M>`, `<Struct>.TALOS_SCHEMA_HASH`).
+  Attaching to a topic checks schema name and hash; a mismatch fails, naming
+  both types. **[enforced]**
 - A measurement message carries `sample_time_ns`: when the measurement was
   taken, in the node clock, not when it was published (`DrivetrainState`,
   `geometry.PoseObservation`, `geometry.PoseEstimate`). A node reading
@@ -237,7 +238,8 @@ Rules:
   An element of the wrong type fails at construction naming the key and the
   element. **[enforced]** by the param API.
 - Parameter keys follow §6 (`tolerance_rot`, `deadband_frac`,
-  `heading_timeout_us`). **[review; warning planned: D2]**
+  `heading_timeout_us`). Numeric keys without a suffix produce a
+  `--describe-only` warning. **[enforced (warning)]**
 - Robot-wide wiring (which producers drive which subsystem, telemetry,
   bindings) lives in TOML read by the framework. It is never a list of
   subsystem names in code. Target lanes are already config-only
@@ -253,6 +255,15 @@ Rules:
   (`UpdateWithTime`/`updateWithTime`), never `Update()`/`update()`, which read
   WPILib's own clock. **[review]**
 - No randomness in decisions. Telemetry stream ids are the one exception. **[review]**
+- **Tune offline on recorded inputs.** A node's output is a function of its
+  inputs and their times, so a new or changed node (an estimator, a vision
+  filter) is tuned against a recorded match with
+  `launcher --config <robot.toml> --replay-inputs <session dir> --only <node>`:
+  every topic it subscribes to that the session logged arrives at its recorded
+  time, its outputs go to a new log, and two runs write identical logs. A topic
+  recorded with another schema fails naming both types; topics nothing
+  recorded are listed (`talOS/launcher/README.md`). **[enforced:
+  `input_replay_test`, `replay_inputs_test`]**
 - **Restart safety.** A node can be restarted mid-match (`max_restarts`). Its
   initial state must be safe with every input present, so a state machine
   starts in its idle state and re-derives progress from observations
@@ -337,7 +348,7 @@ touch the code, or under the design item named.
 
 | Where | Deviation | Rule | Fix |
 |---|---|---|---|
-| `operator_interface.h` extras, `telemetry/node.h:325-393` | subsystem names hard-coded; `GenericTarget`/`GenericState` hand mirrors; `teleop_button`/`telemetry` keys | §7, §8 | D3, D4 |
+| `operator_interface.h`, `telemetry/node.h:325-393` | subsystem names hard-coded | §7, §8 | D3, D4 |
 | `telemetry/node.h` units | `"rev/s"` strings written by hand | §6 | derive from suffix (D3) |
 | `operator_interface.toml` | `deadband`, `heading_timeout_s` | §6, §8 | `deadband_frac`, `heading_timeout_us` |
 | `intake.py:18` | fixed `INTAKE_RPS` ignores the requested speed | §3 | use the target's demand |
@@ -368,7 +379,7 @@ A dependency is adopted when it meets all of these:
 
 | Need | Use | Status |
 |---|---|---|
-| Serialization, schemas, reflection | FlatBuffers (structs, and `reflection.fbs`/`.bfbs` for runtime schemas) | in use; `.bfbs` descriptors and schema hashes in use (D2 stage 1); hash-checked attach, descriptor-bearing logs and the reflection codec planned (D2) |
+| Serialization, schemas, reflection | FlatBuffers (structs, and `reflection.fbs`/`.bfbs` for runtime schemas) | in use: `.bfbs` descriptors, schema hashes, hash-checked attach, descriptor-bearing logs and reflection codec |
 | Config | TOML: toml++ (C++), `tomllib` (Python stdlib) | in use |
 | Tests | googletest, `unittest` | in use |
 | Geometry, kinematics, pose estimation, trajectories, profiles, PID, filters | wpimath 2026.2.1 (C++: WPILib's Maven release artifacts through `third_party/wpilib`, `//third_party/wpilib:wpimath`, shared libraries staged in a bundle's `lib/`; Python: `robotpy-wpimath` 2026.2.1.1 on the same native build). allwpilib 2026 has no `MODULE.bazel` and no BCR entry. `//2026-robot/controller_processor/rio:wpilib_lockstep_test` keeps the Maven pin, the `robotpy-native-wpimath` pin and GradleRIO on one release | in use (D6): drivetrain kinematics (`SwerveDriveKinematics<4>`) and `units::` boundary conversions, the pose estimator's `kalman` backend (`SwerveDrive4PoseEstimator`); built and run on macOS arm64; the Linux artifacts are wired but not built here |

@@ -211,6 +211,41 @@ manifest records each node's `restart_count` and every log in `log_paths`
 `log_dump` on the session directory merges every `*.tlog`, restarts included.
 A node's `exit_code` and `pid` are its last run's.
 
+## Replaying a session into one node
+
+`--replay-inputs <session dir> --only <node>` runs one roster member of the
+config, and nothing else, on the topics a recorded session logged: no other
+node, no shared-memory segment, no hardware bridge, no gateway.
+
+```sh
+./sim.sh --sim-gateway --no-studio --no-open --duration-s 15   # /tmp/talos_logs/<id>
+bazel run //talOS/launcher -- \
+  --config "$PWD/2026-robot/main_processor/configuration/robot.toml" \
+  --replay-inputs /tmp/talos_logs/<id> --only pose_estimator \
+  --output-dir /tmp/pose_estimator_replay
+bazel run //talOS/launcher:log_dump -- /tmp/pose_estimator_replay
+```
+
+The launcher starts the node's binary with `--sim --replay-inputs <dir>
+--log <output_dir>/<node>.tlog --config <config>`, the flag every node binary
+takes (C++ and Python alike: both run `talos::Run`). The node builds as it
+would live, then runs on a simulated loop whose clock starts at the session's
+origin; every message the session logged on a topic it subscribes to arrives
+at its recorded time (`talOS/events/README.md`, "Replaying another session's
+inputs"). It prints what it was fed, from whose log, and the topics it
+subscribes to that nothing recorded. A topic recorded with another schema
+fails before the node runs, naming both types. The node may be one the
+session never ran, or a changed version of one that it did: its new outputs
+are its own log, not compared with anything, and two replays of one session
+write identical records. Replay feeds every input from the session origin,
+including messages the live node missed while initializing at startup, so its
+output can legitimately differ from the live log at the beginning of the run.
+Pass `--session-id <id>` if you need the output files to match in their
+`session_id` header field (otherwise only the random session id and host
+wall-clock start time in the 120-byte file header differ; all records and
+payloads are bit-identical). The output directory must not be the session's,
+whose logs are being read.
+
 ## graph.json
 
 Phase one writes `<output_dir>/graph.json` beside the session's
@@ -242,9 +277,19 @@ runfiles tree instead, and `main.cc` chases `BUILD_WORKSPACE_DIRECTORY` back so
 both spellings behave the same.
 
 `:launcher_lib` depends on `//talOS/introspection:describe` and `:names` — the
-format and the naming rules, neither of which pulls in an event loop or shared
-memory. The launcher never opens a topic; it starts processes that do.
+format and the naming rules.
 
+## Session segments and logs
+
+Before spawning nodes, phase two calls `CreateSessionSegments` (`launcher.h`),
+which creates every declared topic as a session-owned RTMS segment with its
+schema name, schema hash, alignment, and slots. Nodes only attach. When the
+session ends, the launcher destroys its queues and unlinks all session segments.
+
+Recorded logs (`.tlog` format version 5) embed descriptors for each logged topic.
+`log_dump` (`//talOS/launcher:log_dump`) reads these descriptors and decodes
+recorded message payloads into named fields without requiring the original build
+environment.
 ## If you change the shape of `graph.json`
 
 Studio parses this document in TypeScript (`studio/src/system.ts`), and neither

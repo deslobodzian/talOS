@@ -62,6 +62,10 @@ int main(int argc, char** argv) {
         options.describe_only = true;
       } else if (arg == "--describe-timeout-ms" && i + 1 < argc) {
         options.describe_timeout_ms = std::stoi(argv[++i]);
+      } else if (arg == "--replay-inputs" && i + 1 < argc) {
+        options.replay_inputs = argv[++i];
+      } else if (arg == "--only" && i + 1 < argc) {
+        options.only = argv[++i];
       } else if (arg == "--max-restarts" && i + 1 < argc) {
         options.max_restarts = std::stoi(argv[++i]);
         if (*options.max_restarts < 0) {
@@ -75,7 +79,8 @@ int main(int argc, char** argv) {
                      "[--studio-http-port PORT] [--describe-only] "
                      "[--allow-graph-errors] [--describe-timeout-ms MS] "
                      "[--max-restarts N] "
-                     "[--remote IP] [--remote-port PORT] [--local-port PORT]\n"
+                     "[--remote IP] [--remote-port PORT] [--local-port PORT] "
+                     "[--replay-inputs SESSION_DIR --only NODE]\n"
                      "\n"
                      "  --bundle PATH          launch from a bundle directory "
                      "(assembled by talos_bundle)\n"
@@ -93,7 +98,12 @@ int main(int argc, char** argv) {
                      "graph has errors\n"
                      "  --max-restarts N       restarts per crashed node; "
                      "overrides [robot] max_restarts\n"
-                     "                         (default 5, 0 disables)\n";
+                     "                         (default 5, 0 disables)\n"
+                     "  --replay-inputs DIR    run only the --only node, fed "
+                     "the topics the session\n"
+                     "                         in DIR logged at their "
+                     "recorded times; its log goes\n"
+                     "                         to --output-dir\n";
         return 0;
       } else {
         throw std::invalid_argument("unknown argument: " + arg);

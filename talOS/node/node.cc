@@ -21,6 +21,7 @@
 
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/context.h"
+#include "talOS/events/input_replay.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/realtime_event_loop.h"
@@ -654,9 +655,9 @@ std::size_t NodeAccess::add_publisher(Node& node, std::string_view topic,
   Node::Impl& impl = *node.impl_;
   const std::string resolved = impl.ResolveTopic(topic);
   CheckLayout(impl.name, resolved, bytes, alignment);
-  const std::uint16_t id = impl.loop->register_sender(
-      resolved, static_cast<std::uint32_t>(bytes),
-      static_cast<std::uint32_t>(alignment), schema);
+  const std::uint16_t id =
+      impl.loop->register_sender(resolved, static_cast<std::uint32_t>(bytes),
+                                 static_cast<std::uint32_t>(alignment), schema);
   impl.publishers.push_back({id, bytes});
   return impl.publishers.size() - 1;
 }
@@ -760,7 +761,8 @@ std::vector<NodeAccess::ByteTopicShape> NodeAccess::byte_topics(
     const Node& node) {
   std::vector<ByteTopicShape> topics;
   for (const auto& slot : node.impl_->byte_publishers) {
-    topics.push_back({slot->topic, slot->max_bytes, slot->slots, slot->external});
+    topics.push_back(
+        {slot->topic, slot->max_bytes, slot->slots, slot->external});
   }
   return topics;
 }
@@ -819,6 +821,7 @@ namespace {
 struct Flags {
   std::string log_path;
   std::string replay_path;
+  std::string replay_inputs;
   std::string config_path;
   std::string graph_path;
   int duration_s = 0;
@@ -846,13 +849,20 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
       flags.graph_path = argv[++i];
     } else if (arg == "--replay" && i + 1 < argc) {
       flags.replay_path = argv[++i];
+    } else if (arg == "--replay-inputs" && i + 1 < argc) {
+      flags.replay_inputs = argv[++i];
     } else if (arg == "--duration-s" && i + 1 < argc) {
       flags.duration_s = std::stoi(argv[++i]);
     } else {
       throw std::invalid_argument(
           "usage: node [--sim] [--describe] [--duration-s N] [--log PATH] "
-          "[--session-id ID] [--config PATH] [--graph PATH] [--replay PATH]");
+          "[--session-id ID] [--config PATH] [--graph PATH] [--replay PATH] "
+          "[--replay-inputs SESSION_DIR]");
     }
+  }
+  if (!flags.replay_path.empty() && !flags.replay_inputs.empty()) {
+    throw std::invalid_argument(
+        "--replay and --replay-inputs exclude each other");
   }
   if (flags.duration_s < 0) {
     throw std::invalid_argument("duration must be nonnegative");
@@ -901,13 +911,12 @@ struct Hosted {
   Instance user;
 };
 
-// Built the same way on all three loops, so --describe reports, and replay
+// Built the same way on every loop, so --describe reports, and replay
 // checks, exactly what the live constructor registers.
-template <class Loop>
-Hosted Host(Loop& loop, const char* node_name, const Flags& flags,
-            const InstanceFactory& make) {
+Hosted Host(std::unique_ptr<LoopPort> port, const char* node_name,
+            const Flags& flags, const InstanceFactory& make) {
   Hosted hosted;
-  hosted.port = std::make_unique<LoopPortFor<Loop>>(loop);
+  hosted.port = std::move(port);
   hosted.node = NodeAccess::create(NodeSetup{
       .name = node_name,
       .config_path = flags.config_path,
@@ -920,6 +929,75 @@ Hosted Host(Loop& loop, const char* node_name, const Flags& flags,
   hosted.user = make(*hosted.node);
   NodeAccess::start(*hosted.node);
   return hosted;
+}
+
+template <class Loop>
+Hosted Host(Loop& loop, const char* node_name, const Flags& flags,
+            const InstanceFactory& make) {
+  return Host(std::make_unique<LoopPortFor<Loop>>(loop), node_name, flags,
+              make);
+}
+
+// A byte topic that goes nowhere. The loop never logged byte topics, and a
+// node replayed offline must not write into the shared memory of a robot
+// that may be running on this machine.
+class DiscardedByteTopic final : public ByteTopic {
+ public:
+  bool write(std::span<const std::byte>) override { return true; }
+};
+
+// The loop port under --replay-inputs: the simulated loop, with byte topics
+// discarded.
+template <class Loop>
+class InputReplayPort final : public LoopPortFor<Loop> {
+ public:
+  using LoopPortFor<Loop>::LoopPortFor;
+  std::unique_ptr<ByteTopic> open_byte_topic(
+      std::string_view, std::size_t, const BytePublishOptions&) override {
+    return std::make_unique<DiscardedByteTopic>();
+  }
+};
+
+// --replay-inputs: this node, on a simulated loop starting at the recorded
+// session's origin, fed every message the session logged on a topic it
+// watches at its recorded time (talOS/events/input_replay.h). What it sends
+// is logged to --log. A topic recorded with another schema fails before
+// anything runs; topics nobody recorded are listed.
+int RunOnRecordedInputs(const char* node_name, const Flags& flags,
+                        const InstanceFactory& make) {
+  using Loop = event::SimulatedEventLoop<event::log::LogWriter>;
+  const event::RecordedSession session{flags.replay_inputs};
+  event::SimulationEnvironment environment;
+  Loop loop{
+      environment,
+      event::log::LogWriter{flags.log_path, node_name,
+                            event::log::LogWriterOptions{}, flags.session_id},
+      Loop::Options{.start = session.start()}};
+  const Hosted hosted = Host(std::make_unique<InputReplayPort<Loop>>(loop),
+                             node_name, flags, make);
+  const event::InputReplayReport report =
+      event::ReplayInputs(loop, environment, session);
+
+  std::printf(
+      "replay-inputs: %zu logs of session %llu, %.3f s\n",
+      session.log_paths().size(),
+      static_cast<unsigned long long>(session.session_id()),
+      static_cast<double>((session.end() - session.start()).count()) / 1e9);
+  for (const auto& fed : report.fed) {
+    std::printf("  fed %s: %zu messages (recorded by %s)\n", fed.topic.c_str(),
+                fed.messages, fed.recorded_by.c_str());
+  }
+  for (const auto& topic : report.unrecorded) {
+    std::printf("  not recorded: %s\n", topic.c_str());
+  }
+  std::printf("%s: dispatches=%llu recording_failed=%d log=%s\n", node_name,
+              static_cast<unsigned long long>(loop.dispatch_count()),
+              loop.recorder().failed(), flags.log_path.c_str());
+  if (loop.recorder().failed()) {
+    std::fprintf(stderr, "%s\n", loop.recorder().error().c_str());
+    return 1;
+  }
+  return 0;
 }
 
 // Endpoint attributes of the loop's sources: the optional subscriptions and
@@ -1027,6 +1105,9 @@ int RunMain(int argc, char** argv, const char* node_name,
       std::printf("replay: diverged=%d clean_exit=%d\n", loop.diverged(),
                   loop.reached_exit());
       return loop.diverged() || !loop.reached_exit() ? 1 : 0;
+    }
+    if (!flags.replay_inputs.empty()) {
+      return RunOnRecordedInputs(node_name, flags, make);
     }
     event::RealtimeEventLoop<event::log::LogWriter> loop{event::log::LogWriter{
         flags.log_path, node_name, event::log::LogWriterOptions{},
