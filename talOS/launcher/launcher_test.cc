@@ -1002,6 +1002,123 @@ TEST(LauncherGraphTest, ProbeReportsABinaryThatIsNotThere) {
   EXPECT_NE(error.find("no executable"), std::string::npos) << error;
 }
 
+// A framework node that reads the declared graph, as a stub: described
+// without --graph it registers nothing but says it reads the graph; with
+// --graph it observes /alpha/state and keeps a copy of the graph it was
+// given. Every run appends its arguments to `<record>/args`.
+std::string GraphReaderStub(std::string_view node, std::string_view target,
+                            const std::string& record) {
+  introspect::Description first;
+  first.name = std::string{node};
+  first.target = std::string{target};
+  first.reads_graph = true;
+  introspect::Description second = first;
+  auto observed = Watcher("/alpha/state");
+  observed.flags = introspect::naming::kSourceFlagObserver;
+  second.sources = {observed};
+  return std::string{"#!/bin/sh\n"} + "echo \"$@\" >> '" + record +
+         "/args'\n"
+         "describe=0\n"
+         "graph=''\n"
+         "while [ $# -gt 0 ]; do\n"
+         "  case \"$1\" in\n"
+         "    --describe) describe=1 ;;\n"
+         "    --graph) shift; graph=\"$1\" ;;\n"
+         "  esac\n"
+         "  shift\n"
+         "done\n"
+         "[ $describe = 1 ] || exit 0\n"
+         "if [ -z \"$graph\" ]; then\n"
+         "  cat <<'TALOS_DESCRIBE'\n" +
+         introspect::DescribeToJson(first) +
+         "TALOS_DESCRIBE\n"
+         "  exit 0\n"
+         "fi\n"
+         "cp \"$graph\" '" +
+         record +
+         "/graph'\n"
+         "cat <<'TALOS_DESCRIBE'\n" +
+         introspect::DescribeToJson(second) + "TALOS_DESCRIBE\n";
+}
+
+TEST(LauncherGraphTest, AGraphReaderIsDescribedAgainWithTheOtherNodesGraph) {
+  const std::string record = TempPath("graph_reader_record");
+  std::filesystem::create_directories(record);
+  NodeSpec alpha{"alpha", "//example/alpha:node",
+                 WriteStubNode("graph_alpha",
+                               DescribingStub("alpha", "//example/alpha:node",
+                                              {Sender("/alpha/state")}))};
+  NodeSpec gamma{"gamma", "//example/gamma:node",
+                 WriteStubNode("graph_gamma",
+                               GraphReaderStub("gamma", "//example/gamma:node",
+                                               record))};
+  LauncherOptions options;
+  options.describe_timeout_ms = 4000;
+  options.output_dir = TempPath("graph_reader_out");
+  std::vector<NodeDescription> described;
+  const auto diagnostics = DescribeGraph({gamma, alpha}, options, described);
+
+  ASSERT_EQ(described.size(), 2u);
+  ASSERT_TRUE(described[0].answered) << described[0].error;
+  EXPECT_TRUE(described[0].declared.reads_graph);
+  ASSERT_EQ(described[0].declared.sources.size(), 1u);
+  EXPECT_TRUE(described[0].declared.sources[0].observer());
+
+  // The graph it was handed: alpha, every byte of its schema, and not gamma.
+  introspect::DeclaredGraph graph;
+  std::string error;
+  ASSERT_TRUE(introspect::DescribeReader::ParseGraph(ReadFile(record + "/graph"),
+                                                     graph, error))
+      << error;
+  ASSERT_EQ(graph.size(), 1u);
+  EXPECT_EQ(graph[0].name, "alpha");
+  EXPECT_EQ(graph[0].sources.at(0).schema, "launcher_test.Message48");
+  EXPECT_EQ(ReadFile(record + "/graph"), ReadFile(DeclaredGraphPath(options)));
+  const std::string args = ReadFile(record + "/args");
+  EXPECT_NE(args.find("--graph " + DeclaredGraphPath(options)),
+            std::string::npos)
+      << args;
+
+  // An observer is not a consumer: alpha's state still has nobody reading it.
+  const bool unread = std::any_of(
+      diagnostics.begin(), diagnostics.end(),
+      [](const introspect::naming::Diagnostic& d) {
+        return d.subject == "/alpha/state" &&
+               d.message.find("nothing subscribes") != std::string::npos;
+      });
+  EXPECT_TRUE(unread);
+
+  std::filesystem::remove_all(record);
+  std::filesystem::remove_all(options.output_dir);
+  std::remove(alpha.binary_path.c_str());
+  std::remove(gamma.binary_path.c_str());
+}
+
+TEST(LauncherGraphTest, AGraphReaderStartsWithTheGraphItWasDescribedWith) {
+  const std::string record = TempPath("graph_run_record");
+  std::filesystem::create_directories(record);
+  GraphFixture fixture{
+      "graph_run",
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")}),
+      GraphReaderStub("beta", "//example/beta:node", record)};
+
+  Launcher launcher{fixture.options};
+  EXPECT_EQ(launcher.Run(), 0);
+
+  // Two describes and one run, each of the last two with the graph.
+  const std::string args = ReadFile(record + "/args");
+  const std::string with_graph =
+      "--graph " + fixture.out_dir + "/declared_graph.json";
+  std::size_t count = 0;
+  for (std::size_t at = args.find(with_graph); at != std::string::npos;
+       at = args.find(with_graph, at + 1)) {
+    ++count;
+  }
+  EXPECT_EQ(count, 2u) << args;
+  EXPECT_NE(args.find("--session-id"), std::string::npos) << args;
+  std::filesystem::remove_all(record);
+}
+
 TEST(LauncherBundleTest, ResolveBinaryPrefersOverrideThenBazelBin) {
   std::map<std::string, std::string> overrides;
   overrides["//example/alpha:node"] = "/bin/alpha";

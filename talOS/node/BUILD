@@ -9,6 +9,7 @@ cc_library(
     visibility = ["//visibility:private"],
     deps = [
         "//talOS/events:events_core",
+        "//talOS/introspection:describe",
         "//talOS/schema:identity",
     ],
 )
@@ -72,16 +73,27 @@ talos_cc_node(
     deps = [":test_messages"],
 )
 
+# A node that reads the declared graph, for the --graph tests.
+talos_cc_node(
+    name = "graph_node",
+    srcs = ["testdata/graph_node.cc"],
+    node_name = "graph_node",
+    visibility = ["//visibility:private"],
+    deps = ["//talOS/introspection:describe"],
+)
+
 cc_test(
     name = "node_test",
     size = "small",
     srcs = ["node_test.cc"],
     data = [
         "testdata/robot.toml",
+        ":graph_node",
         ":test_node",
     ],
     env = {
         "TALOS_TEST_NODE": "$(rlocationpath :test_node)",
+        "TALOS_GRAPH_NODE": "$(rlocationpath :graph_node)",
         "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
     },
     deps = [

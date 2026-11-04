@@ -54,7 +54,75 @@ struct Description {
   // Sources the loop registered, plus anything the node owns outside it. Both
   // reach the registry, so both belong here or the declared graph would flag a
   // topic the running graph shows as fine.
+
+  // The node's constructor asked for the declared graph (NodeAccess::
+  // declared_graph): its topics depend on the other nodes', so the launcher
+  // describes it again with the graph in hand (see DeclaredGraph below).
+  bool reads_graph = false;
 };
+
+// The declared graph a framework node reads (telemetry observes every state
+// topic in it, teleop finds each lane's schema in it): the descriptions of
+// every node in the session that does not read the graph itself, schema
+// bytes included. The launcher writes it as DeclaredGraphToJson and passes
+// its path as `--graph`; testing::Sim builds it from the nodes added so far.
+using DeclaredGraph = std::vector<Description>;
+
+inline constexpr std::string_view kBase64Alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// RFC 4648 base64 with padding: how describe carries a schema's bfbs bytes.
+inline std::string Base64(std::string_view bytes) {
+  std::string out;
+  out.reserve((bytes.size() + 2) / 3 * 4);
+  std::size_t i = 0;
+  for (; i + 2 < bytes.size(); i += 3) {
+    const std::uint32_t n = (static_cast<std::uint8_t>(bytes[i]) << 16) |
+                            (static_cast<std::uint8_t>(bytes[i + 1]) << 8) |
+                            static_cast<std::uint8_t>(bytes[i + 2]);
+    out += kBase64Alphabet[(n >> 18) & 63];
+    out += kBase64Alphabet[(n >> 12) & 63];
+    out += kBase64Alphabet[(n >> 6) & 63];
+    out += kBase64Alphabet[n & 63];
+  }
+  if (i < bytes.size()) {
+    std::uint32_t n = static_cast<std::uint8_t>(bytes[i]) << 16;
+    if (i + 1 < bytes.size()) n |= static_cast<std::uint8_t>(bytes[i + 1]) << 8;
+    out += kBase64Alphabet[(n >> 18) & 63];
+    out += kBase64Alphabet[(n >> 12) & 63];
+    out += i + 1 < bytes.size() ? kBase64Alphabet[(n >> 6) & 63] : '=';
+    out += '=';
+  }
+  return out;
+}
+
+// The inverse of Base64; false on anything it did not write.
+inline bool FromBase64(std::string_view text, std::string& out) {
+  out.clear();
+  if (text.size() % 4 != 0) return false;
+  out.reserve(text.size() / 4 * 3);
+  for (std::size_t i = 0; i < text.size(); i += 4) {
+    std::uint32_t n = 0;
+    int padding = 0;
+    for (std::size_t j = 0; j < 4; ++j) {
+      const char c = text[i + j];
+      std::uint32_t value = 0;
+      if (c == '=' && i + 4 == text.size() && j >= 2) {
+        ++padding;
+      } else {
+        if (padding != 0) return false;
+        const std::size_t at = kBase64Alphabet.find(c);
+        if (at == std::string_view::npos) return false;
+        value = static_cast<std::uint32_t>(at);
+      }
+      n = (n << 6) | value;
+    }
+    out += static_cast<char>((n >> 16) & 0xFF);
+    if (padding < 2) out += static_cast<char>((n >> 8) & 0xFF);
+    if (padding < 1) out += static_cast<char>(n & 0xFF);
+  }
+  return true;
+}
 
 inline void AppendJsonString(std::string& out, std::string_view value) {
   out += '"';
@@ -89,6 +157,8 @@ inline std::string DescribeToJson(const Description& description) {
   AppendJsonString(out, description.name);
   out += ",\n  \"target\": ";
   AppendJsonString(out, description.target);
+  out += ",\n  \"reads_graph\": ";
+  out += description.reads_graph ? "true" : "false";
   out += ",\n  \"sources\": [";
   for (std::size_t i = 0; i < description.sources.size(); ++i) {
     const auto& source = description.sources[i];
@@ -102,6 +172,8 @@ inline std::string DescribeToJson(const Description& description) {
     out += source.external() ? "true" : "false";
     out += ", \"optional\": ";
     out += source.optional() ? "true" : "false";
+    out += ", \"observer\": ";
+    out += source.observer() ? "true" : "false";
     if (source.kind != event::SourceKind::TIMER) {
       // The hash as a hex string: a JSON number is a double.
       out += ", \"schema\": ";
@@ -109,10 +181,24 @@ inline std::string DescribeToJson(const Description& description) {
       out += ", \"schema_hash\": \"" + HexHash(source.schema_hash) + "\"";
       out += ", \"alignment\": " + std::to_string(source.alignment);
       out += ", \"slots\": " + std::to_string(source.slots);
+      // Last, so the short fields stay readable at the start of the line.
+      out += ", \"bfbs\": \"" + Base64(source.bfbs) + "\"";
     }
     out += "}";
   }
   out += description.sources.empty() ? "]\n}\n" : "\n  ]\n}\n";
+  return out;
+}
+
+// The declared graph as the launcher hands it to a graph-reading node: a JSON
+// array of describe documents.
+inline std::string DeclaredGraphToJson(const DeclaredGraph& graph) {
+  std::string out = "[\n";
+  for (std::size_t i = 0; i < graph.size(); ++i) {
+    if (i != 0) out += ",\n";
+    out += DescribeToJson(graph[i]);
+  }
+  out += "]\n";
   return out;
 }
 
@@ -140,6 +226,7 @@ inline Description DescribeManifest(
     if (registration.kind != event::SourceKind::TIMER) {
       source.schema = registration.schema.name;
       source.schema_hash = registration.schema.hash;
+      source.bfbs = registration.schema.bfbs;
       source.alignment = registration.alignment;
       source.slots = slots;
     }
@@ -181,9 +268,18 @@ class DescribeReader {
       error = "no target field";
       return false;
     }
+    const std::size_t header_end = at;
     if (!Field(text, "sources", at)) {
       error = "no sources field";
       return false;
+    }
+    // Optional, so a hand-written describe (the Studio bridge's) need not
+    // say it; looked up only between the target and the sources.
+    {
+      const std::string_view header = text.substr(header_end, at - header_end);
+      std::size_t flag = 0;
+      out.reads_graph =
+          Field(header, "reads_graph", flag) && Boolean(header, flag);
     }
 
     // Each source is parsed inside its own object.
@@ -246,6 +342,9 @@ class DescribeReader {
       attribute = 0;
       if (Field(entry, "optional", attribute) && Boolean(entry, attribute))
         source.flags |= naming::kSourceFlagOptional;
+      attribute = 0;
+      if (Field(entry, "observer", attribute) && Boolean(entry, attribute))
+        source.flags |= naming::kSourceFlagObserver;
 
       // Every topic end names its schema and ring layout: the launcher
       // creates the segment from them.
@@ -273,9 +372,45 @@ class DescribeReader {
         source.alignment =
             static_cast<std::uint32_t>(Number(entry, at_alignment));
         source.slots = static_cast<std::uint32_t>(Number(entry, at_slots));
+        // Absent means a layout without reflection bytes.
+        std::size_t at_bfbs = 0;
+        if (Field(entry, "bfbs", at_bfbs)) {
+          std::string encoded;
+          if (!String(entry, at_bfbs, encoded) ||
+              !FromBase64(encoded, source.bfbs)) {
+            error = "source '" + source.name + "' has malformed bfbs";
+            return false;
+          }
+        }
       }
 
       out.sources.push_back(std::move(source));
+    }
+    return true;
+  }
+
+  // Reads what DeclaredGraphToJson wrote: every describe document in `text`,
+  // each starting at its "describe_version" key.
+  static bool ParseGraph(std::string_view text, DeclaredGraph& out,
+                         std::string& error) {
+    out.clear();
+    constexpr std::string_view kStart = "\"describe_version\"";
+    std::size_t begin = text.find(kStart);
+    while (begin != std::string_view::npos) {
+      const std::size_t next = text.find(kStart, begin + kStart.size());
+      const std::string_view document = text.substr(
+          begin, next == std::string_view::npos ? next : next - begin);
+      Description description;
+      if (!Parse(document, description, error)) {
+        error = "node " + std::to_string(out.size()) + ": " + error;
+        return false;
+      }
+      out.push_back(std::move(description));
+      begin = next;
+    }
+    if (out.empty() && text.find('[') == std::string_view::npos) {
+      error = "not a declared graph (no JSON array)";
+      return false;
     }
     return true;
   }

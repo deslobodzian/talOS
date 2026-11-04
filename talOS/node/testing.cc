@@ -85,6 +85,8 @@ struct Sim::Impl {
     std::unique_ptr<detail::LoopPort> port;
     std::unique_ptr<Node> node;
     detail::Instance user;
+    // What this node got from NodeAccess::declared_graph, if it asked.
+    detail::DeclaredGraph graph;
     ~Hosted() {
       user.reset();
       node.reset();
@@ -208,12 +210,25 @@ void* SimAccess::add_instance(Sim& sim, std::string_view node_name,
       std::make_unique<event::SimulatedEventLoop<>>(impl.environment);
   hosted->port =
       std::make_unique<testing::SimPort>(*hosted->loop, impl.byte_topics);
+  // The declared graph, as the launcher builds it: every node added before
+  // this one that does not read the graph itself. Add a graph-reading node
+  // (telemetry, teleop) after the nodes it should see.
+  Sim::Impl::Hosted* self = hosted.get();
   hosted->node = NodeAccess::create(NodeSetup{
       .name = hosted->name,
       .config_path = impl.config_path,
       .config = impl.config,
       .simulation = true,
       .loop = hosted->port.get(),
+      .graph = [&impl, self]() -> const detail::DeclaredGraph* {
+        self->graph.clear();
+        for (const auto& other : impl.nodes) {
+          if (NodeAccess::reads_graph(*other->node)) continue;
+          self->graph.push_back(
+              detail::DescribeNode(*other->node, "", other->loop->manifest()));
+        }
+        return &self->graph;
+      },
   });
   hosted->user = make(*hosted->node);
   NodeAccess::start(*hosted->node);
