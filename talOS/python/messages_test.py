@@ -161,18 +161,18 @@ class StructCodecTest(unittest.TestCase):
         self.assertEqual(report, mtype.decode(report._bytes))
         goal = message_type(Goal).decode(message_type(Goal).encode({}))
         self.assertIs(goal.enabled, False)
-        self.assertEqual(repr(goal),
-                         "Goal(height_rot=0.0, enabled=False, count=0)")
+        self.assertEqual(
+            repr(goal), "Goal(height_rot=0.0, enabled=False, tick_count=0)")
         with self.assertRaisesRegex(AttributeError, "height_rot, enabled"):
             goal.height
 
     def test_bad_fields_raise_type_error(self):
         mtype = message_type(Goal)
         with self.assertRaisesRegex(TypeError, "Goal has no field height; "
-                                    "it has height_rot, enabled, count"):
+                                    "it has height_rot, enabled, tick_count"):
             mtype.encode({"height": 1.0})
-        with self.assertRaisesRegex(TypeError, "field count"):
-            mtype.encode({"count": 1 << 40})
+        with self.assertRaisesRegex(TypeError, "field tick_count"):
+            mtype.encode({"tick_count": 1 << 40})
         with self.assertRaisesRegex(TypeError, "field height_rot"):
             mtype.encode({"height_rot": "up"})
 

@@ -243,9 +243,9 @@ class Telemetry {
         set(idx_bridge_state_age_us_,
             static_cast<double>(bridge_->state_age_us()));
         set(idx_bridge_identity_rejected_,
-            static_cast<double>(bridge_->identity_rejected()));
+            static_cast<double>(bridge_->identity_rejected_count()));
         set(idx_bridge_ownership_rejected_,
-            static_cast<double>(bridge_->ownership_rejected()));
+            static_cast<double>(bridge_->ownership_rejected_count()));
         set(idx_bridge_timed_out_mask_,
             static_cast<double>(bridge_->timed_out_mask()));
         set(idx_bridge_configured_, bridge_->configured() ? 1.0 : 0.0);

@@ -54,6 +54,7 @@ Beside the stack:
 | `talOS/process` | stop handlers and `ConfigureRealtime` for node binaries |
 | `talOS/msgs` | shared geometry and control message structs |
 | `talOS/telemetry` | the Studio telemetry frame schema and byte-topic wire format |
+| `talOS/schema` | `talos::Descriptor<M>` (`.bfbs` bytes, name, schema hash), `talos::schema::struct_hash`, the unit-suffix table; Python `talos_schema` and upstream `reflection` classes |
 | `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle`, `talos_graph_test` (both fed by a config's generated `robot_manifest.bzl`, `tools/sync_manifest.py`) |
 
 ## The tick
@@ -101,7 +102,8 @@ locked, best effort (`talOS/process`).
 - A topic is a shared-memory slot holding the latest message of one fixed size.
 - Messages are FlatBuffers **structs** (no tables, strings or vectors), declared
   in a `.fbs` per package and built with `talos_messages`, which generates C++
-  and Python.
+  and Python, a `.bfbs` schema and a schema descriptor per struct, and fails
+  the build on a numeric field without a unit suffix.
 - Every user topic's slot is 8-byte aligned, so a C++ and a Python endpoint
   agree on the layout from the size alone.
 - The FlatBuffers namespace is the short subsystem name (`shooter`, `intake`,

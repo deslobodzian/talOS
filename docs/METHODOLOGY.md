@@ -153,7 +153,8 @@ There are exactly two kinds of input, and they are treated differently.
 
 Every numeric field in a message and every numeric parameter ends in a unit
 suffix from this table. The suffix **is** the unit: C++, Python, telemetry and
-Studio all read it from the name. There is no second unit table anywhere.
+Studio all read it from the name. There is no second unit table anywhere: in
+code the table is `talOS/schema/unit_suffix.h`.
 
 | Quantity | Suffix | Unit | Used for |
 |---|---|---|---|
@@ -186,7 +187,10 @@ Rules:
 - In TOML, durations are `_us`. Python's API takes seconds as `float` for
   `every()` and `period`, and C++ takes `std::chrono`. That is an API
   difference, not a data unit. **[review]**
-- Message field names are checked against the table at build time. Numeric
+- Message field names are checked against the table at build time: the
+  `talos_messages` action fails on a numeric struct field (or array of
+  numbers) without a suffix, naming it. A suffix needs a name before it
+  (`count` alone fails; `tick_count` passes). **[enforced]** Numeric
   parameters without a suffix get a `--describe-only` warning. **[planned: D2]**
 
 ## 7. Messages
@@ -195,7 +199,10 @@ Rules:
   Reuse beats a near-duplicate. **[review]**
 - Messages are FlatBuffers structs owned by one package, declared with
   `talos_messages`. Never mirror a struct by hand; `GenericState` and
-  operator_interface's `GenericTarget` are slated for removal (D3, D4). **[review; D2 replaces size-only checks with a schema hash]**
+  operator_interface's `GenericTarget` are slated for removal (D3, D4). Each
+  struct has a build-time schema descriptor (`talos::Descriptor<M>`,
+  `<Struct>.TALOS_SCHEMA_HASH`). **[review; D2 replaces size-only attach
+  checks with that schema hash]**
 - A measurement message carries `sample_time_ns`: when the measurement was
   taken, not when it was published. **[planned: D6]**
 - A message carries validity next to the value it qualifies (`yaw_valid` next
@@ -335,7 +342,7 @@ A dependency is adopted when it meets all of these:
 
 | Need | Use | Status |
 |---|---|---|
-| Serialization, schemas, reflection | FlatBuffers (structs, and `reflection.fbs`/`.bfbs` for runtime schemas) | in use; reflection planned (D2) |
+| Serialization, schemas, reflection | FlatBuffers (structs, and `reflection.fbs`/`.bfbs` for runtime schemas) | in use; `.bfbs` descriptors and schema hashes in use (D2 stage 1); hash-checked attach, descriptor-bearing logs and the reflection codec planned (D2) |
 | Config | TOML: toml++ (C++), `tomllib` (Python stdlib) | in use |
 | Tests | googletest, `unittest` | in use |
 | Geometry, kinematics, pose estimation, trajectories, profiles, PID, filters | wpimath (C++, from allwpilib's upstream Bazel build; Python: `robotpy-wpimath` on PyPI) | planned (D6); Bazel integration on macOS arm64 still to be verified |

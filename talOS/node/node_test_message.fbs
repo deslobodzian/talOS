@@ -1,6 +1,6 @@
 namespace node_test;
 
 struct Count {
-  value:long;
+  tick_count:long;
   stamp_ns:long;
 }

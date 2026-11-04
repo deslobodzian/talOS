@@ -3,7 +3,9 @@
 Status: partially implemented checkpoint, not acceptance-complete. See
 [HANDOFF_AUTOMATIC_WIRING.md](HANDOFF_AUTOMATIC_WIRING.md) for current evidence,
 remaining work, and completion order. The rules it serves are in
-[METHODOLOGY.md](METHODOLOGY.md). D2, D3, D4, and D6 remain proposals.
+[METHODOLOGY.md](METHODOLOGY.md). D2 has its first stage (build-level
+descriptors and the field-name lint); the rest of D2, and D3, D4 and D6,
+remain proposals.
 
 ## Problem
 
@@ -168,6 +170,22 @@ who is driving each subsystem.
 ---
 
 ## D2. Self-describing topics (FlatBuffers reflection)
+
+**Status: stage 1 implemented (descriptors and field-name lint); attach
+checks, launcher-owned segments, descriptor-bearing logs and the reflection
+codec remain.** `talos_messages` compiles each schema to `<file>.bfbs` with
+`flatc --binary --schema --bfbs-filenames` and lints it in the same action
+(`talOS/build/descriptor_gen.cc` against `talOS/schema/unit_suffix.h`). It
+generates `<prefix>/<file>_descriptor.h` specializing `talos::Descriptor<M>`
+(`kName`, `kHash`, `kBfbs`; `talOS/schema/descriptor.h`) and appends
+`TALOS_SCHEMA_NAME`/`HASH`/`BFBS` to each flatc Python class. The hash
+(`talos::schema::struct_hash`, Python `talos_schema.struct_hash` over
+`reflection` classes generated from upstream `reflection.fbs`) is FNV-1a 64
+of a canonical text of the struct's reflection object: field names, types,
+offsets, nested structs and enums, size and alignment. `--bfbs-gen-embed`
+is not used: 25.12.19 requires a table root, so the generator embeds the
+bytes itself. `//talOS/schema:schema_hash_test` and `:schema_hash_py_test`
+check parity and that same-size changes move the hash.
 
 Today a topic is checked by size alone (`names_test.cc:433` says so), and every
 generic consumer needs compile-time types. Instead, use FlatBuffers'

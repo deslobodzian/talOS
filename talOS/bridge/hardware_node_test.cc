@@ -953,7 +953,7 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   // order) are timed out.
   node.Tick(999000);
   const bridge::BridgeStatus initial = node.Status(999000);
-  EXPECT_EQ(initial.states_received(), 0u);
+  EXPECT_EQ(initial.states_received_count(), 0u);
   EXPECT_EQ(initial.state_age_us(), 0u);
   EXPECT_EQ(initial.subsystem_count(), 2u);
   EXPECT_EQ(initial.timed_out_mask(), 0b11u);
@@ -986,7 +986,7 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   // State age runs on the bridge clock from the frame's receipt.
   ASSERT_TRUE(
       InjectState(node, gateway, TrustState(config_id, 11, 1, 1000), 1000000));
-  EXPECT_EQ(node.Status(1000000).states_received(), 1u);
+  EXPECT_EQ(node.Status(1000000).states_received_count(), 1u);
   EXPECT_EQ(node.Status(1000000).state_age_us(), 0u);
   EXPECT_EQ(node.Status(1003500).state_age_us(), 3500u);
 
@@ -1005,7 +1005,7 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   ASSERT_FALSE(node.is_subsystem_timed_out("drivetrain"));
   ASSERT_TRUE(node.is_subsystem_timed_out("intake"));
   EXPECT_EQ(node.Status(1001000).timed_out_mask(), 0b10u);
-  EXPECT_EQ(node.Status(1001000).commands_sent(), 1u);
+  EXPECT_EQ(node.Status(1001000).commands_sent_count(), 1u);
 
   // A request from the wrong boot and one that addresses another subsystem's
   // motor each count once.
@@ -1026,11 +1026,11 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   PublishCommand(intake_pub, cross);
   node.Tick(1003000);
   const bridge::BridgeStatus counted = node.Status(1003000);
-  EXPECT_EQ(counted.identity_rejected(), identity_before + 1);
-  EXPECT_EQ(counted.ownership_rejected(), ownership_before + 1);
-  EXPECT_EQ(counted.identity_rejected(), node.identity_rejected());
-  EXPECT_EQ(counted.ownership_rejected(), node.ownership_rejected());
-  EXPECT_EQ(counted.driver_station_packets(),
+  EXPECT_EQ(counted.identity_rejected_count(), identity_before + 1);
+  EXPECT_EQ(counted.ownership_rejected_count(), ownership_before + 1);
+  EXPECT_EQ(counted.identity_rejected_count(), node.identity_rejected());
+  EXPECT_EQ(counted.ownership_rejected_count(), node.ownership_rejected());
+  EXPECT_EQ(counted.driver_station_packet_count(),
             node.driver_station_packets_received());
   EXPECT_EQ(counted.state_age_us(), 3000u);
   EXPECT_EQ(counted.timed_out_mask(), 0b10u);

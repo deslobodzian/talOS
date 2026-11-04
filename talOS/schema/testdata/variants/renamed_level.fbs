@@ -1,0 +1,14 @@
+// float_level.fbs with level_m renamed: same layout, different field.
+namespace schema_variant;
+
+enum Kind : ubyte { RAW, FILTERED }
+
+struct Reading {
+  height_m:float;
+  kind:Kind;
+  ok:bool;
+}
+
+struct Holder {
+  reading:Reading;
+}

@@ -115,9 +115,9 @@ struct Talker {
 struct Listener {
   explicit Listener(Node& n)
       : in{n.subscribe<Count>("/talker/state", [this](const Count& c) {
-          heard.push_back(c.value());
+          heard.push_back(c.tick_count());
         })} {}
-  void update() { latest_in_update = in.has_value() ? in->value() : -1; }
+  void update() { latest_in_update = in.has_value() ? in->tick_count() : -1; }
   Subscription<Count> in;
   std::vector<std::int64_t> heard;
   std::int64_t latest_in_update = -1;
@@ -131,13 +131,13 @@ TEST(Node, TwoNodesTalkOverATopicInOneSim) {
   sim.step(52ms);  // talker ticks at 10..50 ms; the last lands by 51 ms
 
   EXPECT_EQ(listener.heard, (std::vector<std::int64_t>{0, 1, 2, 3, 4}));
-  EXPECT_EQ(listener.in->value(), 4);
+  EXPECT_EQ(listener.in->tick_count(), 4);
   EXPECT_GE(listener.latest_in_update, 3);
   const auto latest = sim.latest<Count>("/talker/state");
   if (!latest.has_value()) {
     FAIL() << "nothing published on /talker/state";
   }
-  EXPECT_EQ(latest->value(), 4);
+  EXPECT_EQ(latest->tick_count(), 4);
 }
 
 struct Watcher {
@@ -159,7 +159,8 @@ TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   auto& watcher = sim.add<Watcher>("listener");  // 5 ms period
 
   EXPECT_FALSE(watcher.in.has_value());
-  EXPECT_EQ(watcher.in->value(), 0);  // zero-initialized before any message
+  // Zero-initialized before any message.
+  EXPECT_EQ(watcher.in->tick_count(), 0);
   EXPECT_EQ(watcher.in.age(), Duration::max());
 
   sim.step(5ms);  // tick 0: nothing yet
@@ -178,7 +179,7 @@ TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   EXPECT_TRUE(watcher.fresh[1]);
   EXPECT_EQ(watcher.ages[1], 0ms);
   EXPECT_EQ(watcher.ages[2], 5ms);
-  EXPECT_EQ(watcher.in->value(), 7);
+  EXPECT_EQ(watcher.in->tick_count(), 7);
 
   sim.step(100ms);  // past [robot] command_timeout_us
   EXPECT_FALSE(watcher.fresh.back());
@@ -195,8 +196,8 @@ struct RelativeWrist {
         frames{n.publish_bytes("frames", 8)} {}
   void update() {
     if (target.has_value()) {
-      state.send(Count{target->value() + external->value(), 0});
-      const std::byte b{static_cast<unsigned char>(target->value())};
+      state.send(Count{target->tick_count() + external->tick_count(), 0});
+      const std::byte b{static_cast<unsigned char>(target->tick_count())};
       frames.send(std::span<const std::byte>{&b, 1});
     }
   }
@@ -233,7 +234,7 @@ can_id = 1
   const auto wrist_state = sim.latest<Count>("/wrist/state");
   ASSERT_TRUE(wrist_state.has_value());
   const Count wrist = wrist_state.value_or(Count{});
-  EXPECT_EQ(wrist.value(), 13);
+  EXPECT_EQ(wrist.tick_count(), 13);
   const auto wrist_frames = sim.latest_bytes("/wrist/frames");
   ASSERT_TRUE(wrist_frames.has_value());
   const std::vector<std::byte> wframes =
@@ -243,7 +244,7 @@ can_id = 1
   const auto left_state = sim.latest<Count>("/wrist/left_state");
   ASSERT_TRUE(left_state.has_value());
   const Count left = left_state.value_or(Count{});
-  EXPECT_EQ(left.value(), 27);
+  EXPECT_EQ(left.tick_count(), 27);
   const auto left_frames = sim.latest_bytes("/left_wrist/raw_frames");
   ASSERT_TRUE(left_frames.has_value());
   const std::vector<std::byte> lframes =

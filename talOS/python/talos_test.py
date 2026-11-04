@@ -41,7 +41,7 @@ class Planner:
 
     def update(self):
         self.goal.send(height_rot=self.height, enabled=True,
-                       count=self.node.tick)
+                       tick_count=self.node.tick)
 
 
 class Follower:
@@ -59,7 +59,7 @@ class Follower:
         goal = self.goal.value
         if goal is not None:
             self.status.send(height_rot=goal.height_rot * self.gain,
-                             at_goal=goal.enabled, tick=self.node.tick)
+                             at_goal=goal.enabled, tick_count=self.node.tick)
 
 
 class Lift:
@@ -101,8 +101,9 @@ class TwoNodesTest(unittest.TestCase):
         status = sim.latest(Status, "/follower/status")
         self.assertEqual(status.height_rot, 2.5)
         self.assertTrue(status.at_goal)
-        self.assertEqual(status.tick, 4)  # ticks 0..4 ran by 50 ms
-        self.assertEqual([g.count for g in follower.received], [0, 1, 2, 3, 4])
+        self.assertEqual(status.tick_count, 4)  # ticks 0..4 ran by 50 ms
+        self.assertEqual([g.tick_count for g in follower.received],
+                         [0, 1, 2, 3, 4])
         self.assertTrue(follower.goal.fresh())
         self.assertFalse(follower.goal.fresh(max_age=0.001))
         self.assertLess(follower.goal.age, 0.01)
@@ -246,7 +247,7 @@ class Driver:
 
     def update(self):
         if self.talking:
-            self.lane.send(height_rot=0.5, count=7)
+            self.lane.send(height_rot=0.5, tick_count=7)
         else:
             self.lane.release()
 
@@ -342,7 +343,8 @@ class TargetTest(unittest.TestCase):
         hw.enable()
         hw.set_driver_station(enabled=True, teleop=True)
         sim.step(0.04)
-        self.assertEqual(sim.latest_target(Goal, "lift", "teleop").count, 7)
+        self.assertEqual(
+            sim.latest_target(Goal, "lift", "teleop").tick_count, 7)
         self.assertEqual(lift.seen.height_rot, 0.5)
         driver.talking = False
         sim.step(0.02)
@@ -440,15 +442,15 @@ class MessageTest(unittest.TestCase):
         sim = Sim.from_toml(ROBOT_TOML)
         echo = sim.add(Echo, "planner")
         self.assertIsNone(echo.goal.value)
-        sim.publish(Goal, "/echo/in", count=7)  # the rest is 0/False
+        sim.publish(Goal, "/echo/in", tick_count=7)  # the rest is 0/False
         sim.step(0.015)
 
         goal = echo.goal.value
-        self.assertEqual((goal.height_rot, goal.enabled, goal.count),
+        self.assertEqual((goal.height_rot, goal.enabled, goal.tick_count),
                          (0.0, False, 7))
         self.assertEqual(sim.latest(Goal, "/echo/out"), goal)
         self.assertEqual(repr(goal),
-                         "Goal(height_rot=0.0, enabled=False, count=7)")
+                         "Goal(height_rot=0.0, enabled=False, tick_count=7)")
         with self.assertRaisesRegex(AttributeError, "height_rot, enabled"):
             goal.height
         with self.assertRaisesRegex(TypeError, "no field heigth_rot"):
@@ -479,7 +481,7 @@ class MessageTest(unittest.TestCase):
             def update(self):
                 if self.goal.has_value:
                     self.status.send(height_rot=self.goal.value.height_rot,
-                                     at_goal=True, tick=self.node.tick)
+                                     at_goal=True, tick_count=self.node.tick)
                 payload = bytearray(range(self.node.tick + 1))
                 self.sent.append(self.frames.send(memoryview(payload)))
 
