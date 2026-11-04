@@ -22,6 +22,8 @@ py_test(
     ],
     data = [
         "//tools/scaffold_testdata/gripper:golden",
+        "//tools/scaffold_testdata/localizer:golden",
+        "//tools/scaffold_testdata/py_localizer:golden",
         "//tools/scaffold_testdata/scaffold_py:golden",
     ],
     legacy_create_init = False,
