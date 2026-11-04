@@ -13,13 +13,13 @@
 #include <string_view>
 #include <utility>
 
+#include "driver/driver.h"
 #include "drivetrain/drivetrain.h"
-#include "operator_interface/operator_interface.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/devices/testing.h"
 #include "talOS/node/testing.h"
 
-namespace operator_interface {
+namespace driver {
 namespace {
 
 using namespace std::chrono_literals;
@@ -58,8 +58,8 @@ ds::DriverStationData DsState(std::uint32_t flags,
 constexpr std::uint32_t kTeleopEnabled =
     ds::kEnabled | ds::kTeleop | ds::kDsAttached;
 
-// One operator interface whose [subsystems.operator_interface] table holds
-// `keys` and nothing else, so every other setting is the compiled default.
+// One driver node whose [subsystems.driver] table holds `keys` and nothing
+// else, so every other setting is the compiled default.
 class Harness {
  public:
   explicit Harness(std::string_view keys = "")
@@ -71,7 +71,7 @@ command_timeout_us = 100000
 [subsystems.mechanism.motors.unused]
 can_id = 1
 
-[subsystems.operator_interface]
+[subsystems.driver]
 period_us = 20000
 )"} + std::string{keys})} {}
 
@@ -96,26 +96,14 @@ period_us = 20000
         sim_, "/drivetrain/target/teleop",
         sizeof(talos::TargetEnvelope<drivetrain::ChassisTarget>));
   }
-  // The newest envelope on each teleop lane (nullopt: never written).
+  // The newest envelope on drivetrain teleop lane (nullopt: never written).
   std::optional<talos::TargetEnvelope<drivetrain::ChassisTarget>> chassis_lane()
       const {
     return LatestTarget<drivetrain::ChassisTarget>(sim_, "drivetrain",
                                                    "teleop");
   }
-  std::optional<talos::TargetEnvelope<shooter::ShooterTarget>> shooter_lane()
-      const {
-    return LatestTarget<shooter::ShooterTarget>(sim_, "shooter", "teleop");
-  }
-  std::optional<talos::TargetEnvelope<intake::IntakeTarget>> intake_lane()
-      const {
-    return LatestTarget<intake::IntakeTarget>(sim_, "intake", "teleop");
-  }
   // The message of an active lane; fails the test when it is released.
   drivetrain::ChassisTarget chassis() const { return Active(chassis_lane()); }
-  shooter::ShooterTarget shooter() const { return Active(shooter_lane()); }
-  intake::IntakeTarget intake() const { return Active(intake_lane()); }
-  bool shooter_active() const { return IsActive(shooter_lane()); }
-  bool intake_active() const { return IsActive(intake_lane()); }
   bool chassis_active() const { return IsActive(chassis_lane()); }
 
  private:
@@ -131,16 +119,16 @@ period_us = 20000
   }
 
   Sim sim_;
-  OperatorInterface& node_ = sim_.add<OperatorInterface>("operator_interface");
+  Driver& node_ = sim_.add<Driver>("driver");
   std::unique_ptr<SimHardware> hw_ = std::make_unique<SimHardware>(sim_);
 };
 
 constexpr const char* kNoDeadbandRobotRelative =
-    "deadband = 0.0\nfield_oriented = false\n";
+    "deadband_frac = 0.0\nfield_oriented = false\n";
 constexpr const char* kNoDeadbandFieldOriented =
-    "deadband = 0.0\nfield_oriented = true\n";
+    "deadband_frac = 0.0\nfield_oriented = true\n";
 
-TEST(OperatorInterface, MapsStickAxesToChassisRequests) {
+TEST(Driver, MapsStickAxesToChassisRequests) {
   Harness harness{kNoDeadbandRobotRelative};
   // Forward is negative axis 1, left is negative axis 0, CCW is negative 2.
   harness.Push(DsState(kTeleopEnabled, Stick(-0.5f, -0.75f, -0.25f, 1)));
@@ -150,8 +138,8 @@ TEST(OperatorInterface, MapsStickAxesToChassisRequests) {
   EXPECT_NEAR(target.omega_radps(), 0.25 * kMaxAngular, 1e-9);
 }
 
-TEST(OperatorInterface, DeadbandIsZeroInsideAndContinuousAtTheThreshold) {
-  Harness harness{"deadband = 0.05\nfield_oriented = false\n"};
+TEST(Driver, DeadbandIsZeroInsideAndContinuousAtTheThreshold) {
+  Harness harness{"deadband_frac = 0.05\nfield_oriented = false\n"};
   harness.Push(DsState(kTeleopEnabled, Stick(0, -0.04f, 0)));
   EXPECT_NEAR(harness.chassis().vx_mps(), 0.0, 1e-12);
   // Just outside: the output ramps from zero rather than stepping to full.
@@ -160,20 +148,14 @@ TEST(OperatorInterface, DeadbandIsZeroInsideAndContinuousAtTheThreshold) {
               1e-6);
 }
 
-TEST(OperatorInterface, TuningAndBindingsComeFromTheSubsystemTable) {
+TEST(Driver, TuningAndBindingsComeFromTheSubsystemTable) {
   Harness harness{
-      "deadband = 0.0\nfield_oriented = false\nmax_linear_mps = 2.0\n"
-      "shooter_target_rps = 75.0\nshoot_button = 3\n"
-      "intake_target_rps = 12.5\nintake_button = 4\n"};
+      "deadband_frac = 0.0\nfield_oriented = false\nmax_linear_mps = 2.0\n"};
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0, /*buttons=*/1)));
   EXPECT_NEAR(harness.chassis().vx_mps(), 2.0, 1e-9);
-  EXPECT_FALSE(harness.shooter_active());  // button 1 is no longer shoot
-  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/4 | 8)));
-  EXPECT_NEAR(harness.shooter().target_velocity_rps(), 75.0, 1e-9);
-  EXPECT_NEAR(harness.intake().roller_velocity_rps(), 12.5, 1e-6);
 }
 
-TEST(OperatorInterface, FieldOrientedRotatesTheRequestByDrivetrainHeading) {
+TEST(Driver, FieldOrientedRotatesTheRequestByDrivetrainHeading) {
   Harness harness{kNoDeadbandFieldOriented};
   harness.PublishHeading(kQuarterTurnRad);  // CCW: nose to field +y
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
@@ -182,7 +164,7 @@ TEST(OperatorInterface, FieldOrientedRotatesTheRequestByDrivetrainHeading) {
   EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
 }
 
-TEST(OperatorInterface, HeadingWithinTimeoutStaysFieldOriented) {
+TEST(Driver, HeadingWithinTimeoutStaysFieldOriented) {
   Harness harness{kNoDeadbandFieldOriented};
   harness.PublishHeading(kQuarterTurnRad);
   harness.Advance(20ms);  // one dropped packet is not a stale publisher
@@ -190,7 +172,7 @@ TEST(OperatorInterface, HeadingWithinTimeoutStaysFieldOriented) {
   EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
 }
 
-TEST(OperatorInterface, WithoutAFreshFiniteHeadingDrivesRobotRelative) {
+TEST(Driver, WithoutAFreshFiniteHeadingDrivesRobotRelative) {
   // Rotating by an assumed or stale yaw looks right only while the robot
   // happens to face that way, so the request passes through untouched.
   const auto robot_relative = [](Harness& harness) {
@@ -226,7 +208,7 @@ TEST(OperatorInterface, WithoutAFreshFiniteHeadingDrivesRobotRelative) {
   }
 }
 
-TEST(OperatorInterface, InvalidHeadingsDoNotKeepAnOldOneFresh) {
+TEST(Driver, InvalidHeadingsDoNotKeepAnOldOneFresh) {
   // A valid heading, then the gyro drops while the drivetrain keeps
   // publishing: the last valid heading ages out rather than being renewed.
   Harness harness{kNoDeadbandFieldOriented};
@@ -237,7 +219,7 @@ TEST(OperatorInterface, InvalidHeadingsDoNotKeepAnOldOneFresh) {
   EXPECT_NEAR(harness.chassis().vy_mps(), 0.0, 1e-9);
 }
 
-TEST(OperatorInterface, AFreshHeadingResumesFieldOrientedAfterStale) {
+TEST(Driver, AFreshHeadingResumesFieldOrientedAfterStale) {
   Harness harness{kNoDeadbandFieldOriented};
   harness.PublishHeading(kQuarterTurnRad);
   harness.Advance(1s);
@@ -246,7 +228,7 @@ TEST(OperatorInterface, AFreshHeadingResumesFieldOrientedAfterStale) {
   EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
 }
 
-TEST(OperatorInterface, RequestsNothingWhenDisabledAutonomousOrDisconnected) {
+TEST(Driver, RequestsNothingWhenDisabledAutonomousOrDisconnected) {
   const ds::JoystickData deflected = Stick(0, -0.9f, 0);
   const std::pair<std::uint32_t, ds::JoystickData> cases[]{
       {ds::kDsAttached, deflected},
@@ -260,19 +242,15 @@ TEST(OperatorInterface, RequestsNothingWhenDisabledAutonomousOrDisconnected) {
   }
 }
 
-TEST(OperatorInterface, ReleasesEveryLaneOnceOnTheDisableEdge) {
+TEST(Driver, ReleasesLaneOnceOnTheDisableEdge) {
   Harness harness{kNoDeadbandRobotRelative};
-  harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0, /*buttons=*/3)));
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
   ASSERT_TRUE(harness.chassis_active());
-  ASSERT_TRUE(harness.shooter_active());
-  ASSERT_TRUE(harness.intake_active());
 
-  // Disabled with the stick still deflected: every lane is released rather
+  // Disabled with the stick still deflected: lane is released rather
   // than left to time the last request out.
-  harness.Push(DsState(ds::kDsAttached, Stick(0, -1.0f, 0, 3)));
+  harness.Push(DsState(ds::kDsAttached, Stick(0, -1.0f, 0)));
   EXPECT_FALSE(harness.chassis_active());
-  EXPECT_FALSE(harness.shooter_active());
-  EXPECT_FALSE(harness.intake_active());
   const std::uint64_t after_release = harness.chassis_count();
 
   // Staying disabled is not another edge.
@@ -280,42 +258,28 @@ TEST(OperatorInterface, ReleasesEveryLaneOnceOnTheDisableEdge) {
   EXPECT_EQ(harness.chassis_count(), after_release);
 }
 
-TEST(OperatorInterface, ASilentDriverStationReleasesEveryLaneOnce) {
+TEST(Driver, ASilentDriverStationReleasesLaneOnce) {
   Harness harness{kNoDeadbandRobotRelative};
-  harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0, /*buttons=*/3)));
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
   ASSERT_TRUE(harness.chassis_active());
 
   // No packet arrives to say "disabled"; the last one ages past the command
-  // timeout and update() releases every lane once.
+  // timeout and update() releases the lane once.
   harness.Silence();
   harness.Advance(300ms);
   EXPECT_FALSE(harness.chassis_active());
-  EXPECT_FALSE(harness.shooter_active());
-  EXPECT_FALSE(harness.intake_active());
   const std::uint64_t after_release = harness.chassis_count();
   harness.Advance(100ms);
   EXPECT_EQ(harness.chassis_count(), after_release);
 }
 
-TEST(OperatorInterface, RequestsNothingWithoutTheDsAttachedFlag) {
+TEST(Driver, RequestsNothingWithoutTheDsAttachedFlag) {
   // Enabled teleop flags from a packet that does not say the DS is attached
   // read as disabled.
   Harness harness{kNoDeadbandRobotRelative};
   harness.Push(DsState(ds::kEnabled | ds::kTeleop, Stick(0, -0.9f, 0)));
   harness.Advance(100ms);
   EXPECT_EQ(harness.chassis_count(), 0u);
-}
-
-TEST(OperatorInterface, RunsShooterOnButtonOneAndIntakeOnButtonTwo) {
-  Harness harness;
-  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/1)));
-  EXPECT_NEAR(harness.shooter().target_velocity_rps(), 60.0, 1e-9);
-  EXPECT_FALSE(harness.intake_active());
-  EXPECT_TRUE(harness.chassis_active());
-
-  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0, /*buttons=*/2)));
-  EXPECT_FALSE(harness.shooter_active());
-  EXPECT_NEAR(harness.intake().roller_velocity_rps(), 30.0, 1e-6);
 }
 
 // --- the teleop chain on the real robot config ---------------------------
@@ -334,7 +298,7 @@ std::string RobotConfig() {
 
 // The whole teleop path, with the same nodes the launcher starts and
 // nothing stubbed: a joystick packet lands on /hw/state/driver_station (sent
-// by SimHardware, as the bridge forwards it), the operator interface writes
+// by SimHardware, as the bridge forwards it), the driver writes
 // it to /drivetrain/target/teleop, the drivetrain's Target selects that lane
 // because the mode says teleop, and resolves it into per-module requests.
 class TeleopChain : public ::testing::Test {
@@ -355,8 +319,7 @@ class TeleopChain : public ::testing::Test {
   }
 
   Sim sim{RobotConfig()};
-  OperatorInterface& operator_interface_node =
-      sim.add<OperatorInterface>("operator_interface");
+  Driver& driver_node = sim.add<Driver>("driver");
   drivetrain::Drivetrain& drivetrain_node =
       sim.add<drivetrain::Drivetrain>("drivetrain");
   SimHardware hw{sim};
@@ -415,4 +378,4 @@ TEST_F(TeleopChain, AutonomousIgnoresTheSticks) {
 }
 
 }  // namespace
-}  // namespace operator_interface
+}  // namespace driver

@@ -42,3 +42,7 @@ slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
 [digital_inputs.intake_beam]
 dio = 1
+
+[[teleop.bindings]]
+button = 2
+while_held = { roller_velocity_rps = 30.0 }

@@ -126,7 +126,7 @@ type DemoNode = {
   // sources, and which demo node publishes each lane. A Target is driven by
   // the first source whose publisher is still running, the way it picks the
   // first live lane -- so the drivetrain is driven by teleop until
-  // operator_interface stops, and by nobody after.
+  // driver stops, and by nobody after.
   targets?: {sources: string[]; publishers: Record<string, string>}[];
   sources: DemoSource[];
 };
@@ -158,7 +158,7 @@ const STUDIO_SLOT = 16384;
 //                declared graph is the other half of the answer: it names the
 //                node that was supposed to be here, which is the difference
 //                between a crash at startup and a topic nobody ever wrote.
-//   unread       /shooter/target/teleop -- operator_interface publishes it and
+//   unread       /shooter/target/teleop -- teleop publishes it and
 //                the node that would read it is the one that never started. Also
 //                /talos/telemetry, whose reader is the Studio bridge: it holds
 //                an RTMS reader slot but claims no registry slot, so from the
@@ -176,7 +176,7 @@ const STUDIO_SLOT = 16384;
 //   idle         every topic, in the first moments of a session: both ends
 //                wired and nothing published yet. The demo starts there rather
 //                than mid-flight, so this is what the first frame shows.
-//   stale        operator_interface -- it stops two seconds in, then holds its
+//   stale        driver -- it stops two seconds in, then holds its
 //                registry slot with frozen counters. Watch it: it stays "alive"
 //                until its heartbeat passes the five-second timeout, then goes
 //                stale while its publish rates fall to zero. The drivetrain it
@@ -218,7 +218,7 @@ const DEMO_NODES: DemoNode[] = [
     periodUs: 5000,
     targets: [{
       sources: ['teleop', 'auto'],
-      publishers: {teleop: 'operator_interface'}
+      publishers: {teleop: 'driver'}
     }],
     sources: [
       {kind: 'TIMER', name: 'drivetrain', bytes: 0, hz: 200},
@@ -297,17 +297,16 @@ const DEMO_NODES: DemoNode[] = [
     ]
   },
   {
-    name: 'operator_interface',
-    target: '//2026-robot/main_processor/operator_interface:node',
+    name: 'driver',
+    target: '//2026-robot/main_processor/driver:node',
     pid: 4137,
     periodUs: 20000,
     stopsAfterSeconds: 2,
     sources: [
-      {kind: 'TIMER', name: 'operator_interface', bytes: 0, hz: 50},
+      {kind: 'TIMER', name: 'driver', bytes: 0, hz: 50},
       {kind: 'WATCHER', name: '/hw/state/driver_station', bytes: HW_PACKET, hz: 50},
       {kind: 'FETCHER', name: '/drivetrain/state', bytes: 48, hz: 50},
-      {kind: 'SENDER', name: '/drivetrain/target/teleop', bytes: 40, hz: 50},
-      {kind: 'SENDER', name: '/shooter/target/teleop', bytes: 24, hz: 50}
+      {kind: 'SENDER', name: '/drivetrain/target/teleop', bytes: 40, hz: 50}
     ]
   },
   {

@@ -5,36 +5,28 @@
 
 #include "drivetrain/drive_message_generated.h"
 #include "drivetrain/topics.h"
-#include "intake/intake_message_generated.h"
-#include "shooter/shooter_message_generated.h"
 #include "talOS/devices/devices.h"
 #include "talOS/node/node.h"
+#include "talOS/teleop/deadband.h"
 
-namespace operator_interface {
+namespace driver {
 
 // Maps each Driver Station packet (/hw/state/driver_station, through
 // talos::DriverStation) to teleop requests as it arrives: stick scaling,
-// deadband and field-oriented rotation for the chassis, buttons and setpoints
-// for the shooter and intake. It writes only the teleop lanes
-// (/<sub>/target/teleop); each subsystem's talos::Target decides from the
-// match mode whether that lane is the one it follows.
-class OperatorInterface {
+// deadband and field-oriented rotation for the chassis. It writes only the
+// drivetrain teleop lane (/drivetrain/target/teleop); the drivetrain's
+// talos::Target decides from the match mode whether that lane is the one it
+// follows.
+class Driver {
  public:
-  explicit OperatorInterface(talos::Node& node)
+  explicit Driver(talos::Node& node)
       : node_{node},
         max_linear_mps_{node.param("max_linear_mps", 4.0)},
         max_angular_radps_{node.param("max_angular_radps", 6.0)},
-        deadband_{node.param("deadband", 0.05)},
+        deadband_frac_{node.param("deadband_frac", 0.05)},
         field_oriented_{node.param("field_oriented", true)},
         heading_timeout_{HeadingTimeout(node)},
-        shooter_rps_{node.param("shooter_target_rps", 60.0)},
-        intake_rps_{node.param("intake_target_rps", 30.0)},
-        // 1-based, matching Driver Station numbering.
-        shoot_button_{node.param<int>("shoot_button", 1)},
-        intake_button_{node.param<int>("intake_button", 2)},
         chassis_{node, "drivetrain", "teleop"},
-        shooter_{node, "shooter", "teleop"},
-        intake_{node, "intake", "teleop"},
         ds_{node, [this] { OnDriver(); }} {
     // The drivetrain owns the heading. One it marks invalid (no gyro) or a
     // non-finite one carries no direction, so it is dropped and the previous
@@ -64,22 +56,12 @@ class OperatorInterface {
         std::chrono::duration<double>{std::isfinite(s) && s > 0 ? s : 0.1});
   }
 
-  // Zero inside the deadband, then rescaled to ramp from 0 at the threshold
-  // to full scale at 1 instead of stepping.
-  double Deadband(double value) const {
-    const double magnitude = std::abs(value);
-    if (magnitude <= deadband_ || deadband_ >= 1.0) return 0.0;
-    return std::copysign((magnitude - deadband_) / (1.0 - deadband_), value);
-  }
-
-  // One release per lane on the falling edge, so each subsystem drops
-  // teleop at once rather than timing the last request out.
+  // One release on the falling edge, so the drivetrain drops teleop at once
+  // rather than timing the last request out.
   void Stop() {
     if (!commanding_) return;
     commanding_ = false;
     chassis_.release();
-    shooter_.release();
-    intake_.release();
   }
 
   void OnDriver() {
@@ -92,9 +74,9 @@ class OperatorInterface {
       return;
     }
 
-    double vx = Deadband(-stick.axis(1)) * max_linear_mps_;
-    double vy = Deadband(-stick.axis(0)) * max_linear_mps_;
-    const double omega = Deadband(-stick.axis(2)) * max_angular_radps_;
+    double vx = talos::teleop::Deadband(-stick.axis(1), deadband_frac_) * max_linear_mps_;
+    double vy = talos::teleop::Deadband(-stick.axis(0), deadband_frac_) * max_linear_mps_;
+    const double omega = talos::teleop::Deadband(-stick.axis(2), deadband_frac_) * max_angular_radps_;
     // Field-relative sticks need a fresh heading; without one, drive
     // robot-relative rather than on a stale or assumed yaw.
     if (field_oriented_ && have_heading_ &&
@@ -106,33 +88,15 @@ class OperatorInterface {
     }
     commanding_ = true;
     chassis_.send(drivetrain::ChassisTarget{vx, vy, omega});
-
-    // A button held asks; released, the lane has nothing to say.
-    if (stick.button(shoot_button_)) {
-      shooter_.send(shooter::ShooterTarget{shooter_rps_});
-    } else {
-      shooter_.release();
-    }
-    if (stick.button(intake_button_)) {
-      intake_.send(intake::IntakeTarget{static_cast<float>(intake_rps_)});
-    } else {
-      intake_.release();
-    }
   }
 
   talos::Node& node_;
   double max_linear_mps_;
   double max_angular_radps_;
-  double deadband_;
+  double deadband_frac_;
   bool field_oriented_;
   talos::Duration heading_timeout_;
-  double shooter_rps_;
-  double intake_rps_;
-  int shoot_button_;
-  int intake_button_;
   talos::TargetLane<drivetrain::ChassisTarget> chassis_;
-  talos::TargetLane<shooter::ShooterTarget> shooter_;
-  talos::TargetLane<intake::IntakeTarget> intake_;
   talos::DriverStation ds_;
   double yaw_rad_ = 0;
   talos::Time heading_at_{};
@@ -140,4 +104,4 @@ class OperatorInterface {
   bool commanding_ = false;
 };
 
-}  // namespace operator_interface
+}  // namespace driver

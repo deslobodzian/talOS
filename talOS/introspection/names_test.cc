@@ -127,8 +127,8 @@ TEST(TopicName, LengthLimitIsTheTransportLimit) {
 
 TEST(NodeName, MatchesTheSubsystemKeyRules) {
   for (const auto* name :
-       {"drivetrain", "shooter", "odometry", "autonomous", "driver_station",
-        "operator_interface", "telemetry", "hardware_node"}) {
+      {"drivetrain", "shooter", "odometry", "autonomous", "driver_station",
+       "driver", "telemetry", "hardware_node"}) {
     EXPECT_FALSE(CheckNodeName(name).has_value()) << name;
   }
   EXPECT_TRUE(CheckNodeName("").has_value());
@@ -207,8 +207,8 @@ TEST(LintGraph, AcceptsAWellFormedGraph) {
        "//2026-robot/main_processor/drivetrain:node",
        {Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional),
         Sender("/drivetrain/state")}},
-      {"operator_interface",
-       "//2026-robot/main_processor/operator_interface:node",
+      {"driver",
+       "//2026-robot/main_processor/driver:node",
        {Sender("/drivetrain/target/teleop")}},
       {"odometry",
        "//2026-robot/main_processor/odometry:node",
@@ -253,8 +253,8 @@ TEST(LintGraph, TwoWritersIsAnErrorAndBothAreNamed) {
       {"autonomous",
        "//2026-robot/main_processor/autonomous:node",
        {Sender("/drivetrain/target/teleop")}},
-      {"operator_interface",
-       "//2026-robot/main_processor/operator_interface:node",
+      {"driver",
+       "//2026-robot/main_processor/driver:node",
        {Sender("/drivetrain/target/teleop")}},
       {"drivetrain",
        "//2026-robot/main_processor/drivetrain:node",
@@ -265,10 +265,31 @@ TEST(LintGraph, TwoWritersIsAnErrorAndBothAreNamed) {
   EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
                        "/drivetrain/target/teleop", "autonomous"));
   EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
-                       "/drivetrain/target/teleop", "operator_interface"));
+                       "/drivetrain/target/teleop", "driver"));
   // Replay is the reason, and the message should say so.
   EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
                        "/drivetrain/target/teleop", "replayable"));
+}
+TEST(LintGraph, TeleopNodeAndAnotherWriterOnSameTeleopLaneIsRefusedAsTwoWriters) {
+  const std::vector<NodeShape> nodes = {
+      {"teleop",
+       "//talOS/teleop:node",
+       {Sender("/shooter/target/teleop")}},
+      {"driver",
+       "//2026-robot/main_processor/driver:node",
+       {Sender("/shooter/target/teleop")}},
+      {"shooter",
+       "//2026-robot/main_processor/shooter:node",
+       {Watcher("/shooter/target/teleop")}},
+  };
+  const auto diagnostics = LintGraph(nodes);
+  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
+                       "/shooter/target/teleop", "teleop"));
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
+                       "/shooter/target/teleop", "driver"));
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
+                       "/shooter/target/teleop", "2 writers"));
 }
 
 // The owner segment names the subject, and the role says which way the data
@@ -372,8 +393,8 @@ TEST(LintGraph, ReservedNamespacesAreExemptFromTheOwnerRule) {
       {"drivetrain",
        "//2026-robot/main_processor/drivetrain:node",
        {Sender("/hw/request/drivetrain"), Watcher("/hw/state")}},
-      {"operator_interface",
-       "//2026-robot/main_processor/operator_interface:node",
+      {"driver",
+       "//2026-robot/main_processor/driver:node",
        {Watcher("/hw/state/driver_station")}},
   };
   EXPECT_TRUE(LintGraph(nodes).empty()) << Describe(LintGraph(nodes));

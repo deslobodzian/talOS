@@ -1,0 +1,4 @@
+[subsystem]
+name = "teleop"
+node = "//talOS/teleop:node"
+period_us = 20000

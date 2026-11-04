@@ -40,6 +40,7 @@ constexpr uint32_t ModeKey(uint32_t flags) { return flags & kModeFlags; }
 constexpr std::size_t kMaxJoysticks = 6;
 constexpr std::size_t kMaxAxes = 12;
 constexpr std::size_t kMaxPovs = 4;
+constexpr std::size_t kMaxButtons = 32;
 constexpr std::size_t kMaxNameLength = 32;
 constexpr std::size_t kMaxGameMessageLength = 32;
 constexpr std::size_t kMaxEventNameLength = 32;

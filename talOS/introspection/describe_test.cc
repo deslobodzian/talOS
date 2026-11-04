@@ -102,8 +102,8 @@ TEST(Describe, RoundTripsEndpointFlags) {
   // looks each up by key, so a missing key must not shift the answer onto the
   // next source.
   const Description written = DescribeManifest(
-      "operator_interface",
-      "//2026-robot/main_processor/operator_interface:node", sample_manifest(),
+      "driver",
+      "//2026-robot/main_processor/driver:node", sample_manifest(),
       kSlots,
       {{"/hw/request/drivetrain",
         naming::kSourceFlagExternal | naming::kSourceFlagOptional},

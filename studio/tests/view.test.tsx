@@ -153,7 +153,7 @@ test('a node card says who drives its subsystem, and none when nobody does',
                                  rates={{}} selected={false}
                                  onSelect={() => {}}/>);
        };
-       // operator_interface publishes the teleop lane for the first two
+       // driver publishes the teleop lane for the first two
        // seconds of the demo, then stops.
        const driving = card(50n, 'drivetrain');
        assert.match(driving, /<dt>driven by<\/dt><dd class="driving">teleop<\/dd>/);

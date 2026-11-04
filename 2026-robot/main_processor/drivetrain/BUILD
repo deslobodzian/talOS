@@ -41,8 +41,8 @@ cc_library(
     hdrs = ["drivetrain.h"],
     include_prefix = "drivetrain",
     strip_include_prefix = ".",
-    # The operator interface's teleop-chain test runs the real drivetrain.
-    visibility = ["//2026-robot/main_processor/operator_interface:__pkg__"],
+    # The driver's teleop-chain test runs the real drivetrain.
+    visibility = ["//2026-robot/main_processor/driver:__pkg__"],
     deps = [
         ":messages",
         ":swerve",

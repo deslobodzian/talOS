@@ -31,6 +31,7 @@
 #include <variant>
 #include <vector>
 
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/config.h"
 #include "talOS/introspection/names.h"
 #include "toml.hpp"
@@ -63,6 +64,20 @@ struct TargetPolicy {
 
   bool operator==(const TargetPolicy&) const = default;
 };
+using TeleopValue = std::variant<bool, int64_t, double, std::string>;
+
+struct TeleopBinding {
+  int port{0};
+  std::optional<int> button;
+  std::optional<int> axis;
+  std::vector<std::pair<std::string, TeleopValue>> while_held;
+  std::string field;
+  double scale{1.0};
+  double deadband_frac{0.0};
+
+  bool operator==(const TeleopBinding&) const = default;
+};
+
 
 struct RobotConfig {
   hardware::Config hardware;
@@ -119,6 +134,9 @@ struct RobotConfig {
     const auto it = subsystem_targets.find(subsystem);
     return it != subsystem_targets.end() ? it->second : targets;
   }
+  // Subsystem teleop bindings, preserving list order.
+  std::map<std::string, std::vector<TeleopBinding>> teleop;
+
 };
 
 namespace detail {
@@ -357,9 +375,11 @@ inline void ApplyTargetPolicy(const toml::table& tbl, TargetPolicy& policy,
     *lanes = std::move(parsed);
   }
 }
-inline void ValidateTeleop(const toml::table& sub_tbl,
-                           const std::string& sub_name) {
-  if (!sub_tbl.contains("teleop")) return;
+
+inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
+                                             const std::string& sub_name) {
+  std::vector<TeleopBinding> result;
+  if (!sub_tbl.contains("teleop")) return result;
   const auto& teleop_node = sub_tbl["teleop"];
   const auto* teleop_tbl = teleop_node.as_table();
   if (teleop_tbl == nullptr) {
@@ -373,7 +393,7 @@ inline void ValidateTeleop(const toml::table& sub_tbl,
                                   std::string(k.str()) + "'");
     }
   }
-  if (!teleop_tbl->contains("bindings")) return;
+  if (!teleop_tbl->contains("bindings")) return result;
   const auto* bindings = (*teleop_tbl)["bindings"].as_array();
   if (bindings == nullptr) {
     throw std::invalid_argument("[subsystems." + sub_name +
@@ -402,17 +422,22 @@ inline void ValidateTeleop(const toml::table& sub_tbl,
       throw std::invalid_argument(
           entry_where + ": binding must specify either 'button' or 'axis'");
     }
+    TeleopBinding b;
     if (entry->contains("port")) {
       const auto& p_node = (*entry)["port"];
       if (!p_node.is_integer()) {
-        throw std::invalid_argument(entry_where +
-                                    ".port must be an integer in [0, 5]");
+        throw std::invalid_argument(
+            entry_where + ".port must be an integer in [0, " +
+            std::to_string(driver_station::kMaxJoysticks - 1) + "]");
       }
       const auto p = p_node.value<int64_t>();
-      if (!p || *p < 0 || *p > 5) {
-        throw std::invalid_argument(entry_where +
-                                    ".port must be an integer in [0, 5]");
+      if (!p || *p < 0 ||
+          *p >= static_cast<int64_t>(driver_station::kMaxJoysticks)) {
+        throw std::invalid_argument(
+            entry_where + ".port must be an integer in [0, " +
+            std::to_string(driver_station::kMaxJoysticks - 1) + "]");
       }
+      b.port = static_cast<int>(*p);
     }
     if (has_button) {
       for (const char* forbidden : {"field", "scale", "deadband_frac"}) {
@@ -423,14 +448,18 @@ inline void ValidateTeleop(const toml::table& sub_tbl,
       }
       const auto& b_node = (*entry)["button"];
       if (!b_node.is_integer()) {
-        throw std::invalid_argument(entry_where +
-                                    ".button must be an integer in [1, 32]");
+        throw std::invalid_argument(
+            entry_where + ".button must be an integer in [1, " +
+            std::to_string(driver_station::kMaxButtons) + "]");
       }
-      const auto b = b_node.value<int64_t>();
-      if (!b || *b < 1 || *b > 32) {
-        throw std::invalid_argument(entry_where +
-                                    ".button must be an integer in [1, 32]");
+      const auto btn = b_node.value<int64_t>();
+      if (!btn || *btn < 1 ||
+          *btn > static_cast<int64_t>(driver_station::kMaxButtons)) {
+        throw std::invalid_argument(
+            entry_where + ".button must be an integer in [1, " +
+            std::to_string(driver_station::kMaxButtons) + "]");
       }
+      b.button = static_cast<int>(*btn);
       if (!entry->contains("while_held")) {
         throw std::invalid_argument(entry_where +
                                     " button binding missing 'while_held'");
@@ -440,10 +469,25 @@ inline void ValidateTeleop(const toml::table& sub_tbl,
         throw std::invalid_argument(entry_where +
                                     ".while_held must be a table");
       }
-      for (auto&& [fk, fv] : *wh) {
+      std::vector<std::string> wh_keys;
+      for (auto&& [fk, fv] : *wh) wh_keys.emplace_back(fk.str());
+      std::sort(wh_keys.begin(), wh_keys.end());
+      for (const auto& fk : wh_keys) {
+        const auto& fv = (*wh)[fk];
         if (fv.is_table() || fv.is_array()) {
-          throw std::invalid_argument(entry_where + ".while_held." +
-                                      std::string(fk.str()) +
+          throw std::invalid_argument(entry_where + ".while_held." + fk +
+                                      " must be a scalar");
+        }
+        if (fv.is_boolean()) {
+          b.while_held.emplace_back(fk, *fv.value<bool>());
+        } else if (fv.is_integer()) {
+          b.while_held.emplace_back(fk, *fv.value<int64_t>());
+        } else if (fv.is_floating_point()) {
+          b.while_held.emplace_back(fk, *fv.value<double>());
+        } else if (fv.is_string()) {
+          b.while_held.emplace_back(fk, *fv.value<std::string>());
+        } else {
+          throw std::invalid_argument(entry_where + ".while_held." + fk +
                                       " must be a scalar");
         }
       }
@@ -455,14 +499,18 @@ inline void ValidateTeleop(const toml::table& sub_tbl,
       }
       const auto& a_node = (*entry)["axis"];
       if (!a_node.is_integer()) {
-        throw std::invalid_argument(entry_where +
-                                    ".axis must be an integer in [0, 11]");
+        throw std::invalid_argument(
+            entry_where + ".axis must be an integer in [0, " +
+            std::to_string(driver_station::kMaxAxes - 1) + "]");
       }
       const auto a = a_node.value<int64_t>();
-      if (!a || *a < 0 || *a > 11) {
-        throw std::invalid_argument(entry_where +
-                                    ".axis must be an integer in [0, 11]");
+      if (!a || *a < 0 ||
+          *a >= static_cast<int64_t>(driver_station::kMaxAxes)) {
+        throw std::invalid_argument(
+            entry_where + ".axis must be an integer in [0, " +
+            std::to_string(driver_station::kMaxAxes - 1) + "]");
       }
+      b.axis = static_cast<int>(*a);
       if (!entry->contains("field")) {
         throw std::invalid_argument(entry_where +
                                     " axis binding missing 'field'");
@@ -472,6 +520,7 @@ inline void ValidateTeleop(const toml::table& sub_tbl,
         throw std::invalid_argument(entry_where +
                                     ".field must be a non-empty string");
       }
+      b.field = std::string(*f);
       if (!entry->contains("scale")) {
         throw std::invalid_argument(entry_where +
                                     " axis binding missing 'scale'");
@@ -480,6 +529,9 @@ inline void ValidateTeleop(const toml::table& sub_tbl,
       if (!sc.is_floating_point() && !sc.is_integer()) {
         throw std::invalid_argument(entry_where + ".scale must be a number");
       }
+      b.scale = sc.is_floating_point()
+                    ? sc.as_floating_point()->get()
+                    : static_cast<double>(sc.as_integer()->get());
       if (entry->contains("deadband_frac")) {
         const auto& df = (*entry)["deadband_frac"];
         if (!df.is_floating_point() && !df.is_integer()) {
@@ -493,9 +545,12 @@ inline void ValidateTeleop(const toml::table& sub_tbl,
           throw std::invalid_argument(entry_where +
                                       ".deadband_frac must be in [0, 1)");
         }
+        b.deadband_frac = d;
       }
     }
+    result.push_back(std::move(b));
   }
+  return result;
 }
 
 }  // namespace detail
@@ -604,8 +659,10 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
       }
       detail::ApplyTargetPolicy(*targets, policy, where);
     }
-    detail::ValidateTeleop(*sub_tbl, sub_name);
-
+    auto bindings = detail::ParseTeleop(*sub_tbl, sub_name);
+    if (!bindings.empty()) {
+      result.teleop[sub_name] = std::move(bindings);
+    }
     auto each = [&](const char* section, auto parse) {
       auto* devices = (*sub_tbl)[section].as_table();
       if (!devices) return;

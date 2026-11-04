@@ -64,12 +64,12 @@ which end of a topic is allowed to publish it.
 
 | Topic | Single publisher | Payload |
 |---|---|---|
-| `/drivetrain/target/<source>` | that source's producer (`teleop`: `operator_interface`) | `talos::TargetEnvelope<ChassisTarget>` (mode generation + `active` + `ChassisTarget`) |
+| `/drivetrain/target/<source>` | that source's producer (`teleop`: `driver`) | `talos::TargetEnvelope<ChassisTarget>` (mode generation + `active` + `ChassisTarget`) |
 | `/hw/state` | Hardware bridge | Canonical hardware state in fixed `Packet` |
 | `/hw/request/drivetrain` | Drivetrain | Partial command, this subsystem's devices only, in fixed `Packet` |
 | `/hw/command` | Hardware bridge | Canonical hardware command in fixed `Packet` |
 
-Each producer writes its own lane: `operator_interface` publishes
+Each producer writes its own lane: `driver` publishes
 `/drivetrain/target/teleop`, an auto routine `/drivetrain/target/auto`. The
 node reads them through `talos::Target`, which follows the lane the robot's
 `[robot.targets]` policy names for the current Driver Station mode (nothing

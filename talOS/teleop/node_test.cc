@@ -419,6 +419,55 @@ period_us = 20000
         << msg;
   }
 }
+TEST(TeleopNode, ConstructionErrorNumericDoesNotFitIntegerField) {
+  constexpr const char* kTomlOverflow = R"(
+[robot]
+period_us = 20000
+
+[subsystems.mechanism]
+period_us = 20000
+
+[[subsystems.mechanism.teleop.bindings]]
+button = 1
+while_held = { sample_count = 5000000000 }
+
+[subsystems.teleop]
+period_us = 20000
+)";
+  Sim sim1 = MakeSim(kTomlOverflow);
+  sim1.add<ConsumerNode<schema_test::Mixed>>("mechanism");
+  try {
+    sim1.add<Teleop>("teleop");
+    FAIL() << "expected std::invalid_argument";
+  } catch (const std::invalid_argument& e) {
+    const std::string msg = e.what();
+    EXPECT_NE(msg.find("does not fit integer field"), std::string::npos) << msg;
+  }
+
+  constexpr const char* kTomlFraction = R"(
+[robot]
+period_us = 20000
+
+[subsystems.mechanism]
+period_us = 20000
+
+[[subsystems.mechanism.teleop.bindings]]
+button = 1
+while_held = { sample_count = 1.5 }
+
+[subsystems.teleop]
+period_us = 20000
+)";
+  Sim sim2 = MakeSim(kTomlFraction);
+  sim2.add<ConsumerNode<schema_test::Mixed>>("mechanism");
+  try {
+    sim2.add<Teleop>("teleop");
+    FAIL() << "expected std::invalid_argument";
+  } catch (const std::invalid_argument& e) {
+    const std::string msg = e.what();
+    EXPECT_NE(msg.find("fractional value for integer field"), std::string::npos) << msg;
+  }
+}
 
 TEST(TeleopNode, ConstructionErrorAxisBoundToNonNumeric) {
   constexpr const char* kToml = R"(

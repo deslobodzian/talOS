@@ -57,45 +57,46 @@ inline std::size_t TypeSize(reflection::BaseType type) {
   }
 }
 
+template <typename T>
+inline void CheckAndCopyInt(std::byte* dest, int64_t val, std::string_view where) {
+  if (val < static_cast<int64_t>(std::numeric_limits<T>::lowest()) ||
+      val > static_cast<int64_t>(std::numeric_limits<T>::max())) {
+    throw std::invalid_argument(std::string{where} + ": value " +
+                                std::to_string(val) + " does not fit integer field");
+  }
+  auto v = static_cast<T>(val);
+  std::memcpy(dest, &v, sizeof(v));
+}
+
 inline void EncodeIntegerBytes(std::byte* dest, reflection::BaseType type,
-                               int64_t val) {
+                               int64_t val, std::string_view where = "") {
   using reflection::BaseType;
   switch (type) {
-    case BaseType::Byte: {
-      auto v = static_cast<int8_t>(val);
-      std::memcpy(dest, &v, sizeof(v));
+    case BaseType::Byte:
+      CheckAndCopyInt<int8_t>(dest, val, where);
       break;
-    }
-    case BaseType::UByte: {
-      auto v = static_cast<uint8_t>(val);
-      std::memcpy(dest, &v, sizeof(v));
+    case BaseType::UByte:
+      CheckAndCopyInt<uint8_t>(dest, val, where);
       break;
-    }
-    case BaseType::Short: {
-      auto v = static_cast<int16_t>(val);
-      std::memcpy(dest, &v, sizeof(v));
+    case BaseType::Short:
+      CheckAndCopyInt<int16_t>(dest, val, where);
       break;
-    }
-    case BaseType::UShort: {
-      auto v = static_cast<uint16_t>(val);
-      std::memcpy(dest, &v, sizeof(v));
+    case BaseType::UShort:
+      CheckAndCopyInt<uint16_t>(dest, val, where);
       break;
-    }
-    case BaseType::Int: {
-      auto v = static_cast<int32_t>(val);
-      std::memcpy(dest, &v, sizeof(v));
+    case BaseType::Int:
+      CheckAndCopyInt<int32_t>(dest, val, where);
       break;
-    }
-    case BaseType::UInt: {
-      auto v = static_cast<uint32_t>(val);
-      std::memcpy(dest, &v, sizeof(v));
+    case BaseType::UInt:
+      CheckAndCopyInt<uint32_t>(dest, val, where);
       break;
-    }
-    case BaseType::Long: {
+    case BaseType::Long:
       std::memcpy(dest, &val, sizeof(val));
       break;
-    }
     case BaseType::ULong: {
+      if (val < 0) {
+        throw std::invalid_argument(std::string{where} + ": negative value for unsigned field");
+      }
       auto v = static_cast<uint64_t>(val);
       std::memcpy(dest, &v, sizeof(v));
       break;
@@ -106,7 +107,7 @@ inline void EncodeIntegerBytes(std::byte* dest, reflection::BaseType type,
 }
 
 inline void EncodeNumericBytes(std::byte* dest, reflection::BaseType type,
-                               double val) {
+                               double val, std::string_view where = "") {
   using reflection::BaseType;
   if (type == BaseType::Float) {
     auto f = static_cast<float>(val);
@@ -114,9 +115,14 @@ inline void EncodeNumericBytes(std::byte* dest, reflection::BaseType type,
   } else if (type == BaseType::Double) {
     std::memcpy(dest, &val, sizeof(double));
   } else {
-    EncodeIntegerBytes(dest, type, static_cast<int64_t>(std::round(val)));
+    if (std::trunc(val) != val) {
+      throw std::invalid_argument(std::string{where} +
+                                  ": fractional value for integer field");
+    }
+    EncodeIntegerBytes(dest, type, static_cast<int64_t>(val), where);
   }
 }
+
 
 inline void WriteScalar(std::byte* dest, reflection::BaseType type,
                         double val) {
@@ -253,32 +259,9 @@ class Teleop {
     }
 
     const config::RobotConfig& config = NodeAccess::robot_config(node);
-    const auto* subsystems_tbl = config.toml_data["subsystems"].as_table();
-    if (subsystems_tbl == nullptr) {
-      return;
-    }
-
-    std::vector<std::string> sub_names;
-    for (auto&& [k, v] : *subsystems_tbl) {
-      sub_names.emplace_back(k.str());
-    }
-    std::sort(sub_names.begin(), sub_names.end());
-
-    for (const auto& sub_name : sub_names) {
-      const auto* sub_tbl = (*subsystems_tbl)[sub_name].as_table();
-      if (sub_tbl == nullptr || !sub_tbl->contains("teleop")) {
-        continue;
-      }
-      const auto* teleop_tbl = (*sub_tbl)["teleop"].as_table();
-      if (teleop_tbl == nullptr || !teleop_tbl->contains("bindings")) {
-        continue;
-      }
-      const auto* bindings_arr = (*teleop_tbl)["bindings"].as_array();
-      if (bindings_arr == nullptr || bindings_arr->empty()) {
-        continue;
-      }
-
-      BuildSubsystem(sub_name, *bindings_arr, config, *graph);
+    for (const auto& [sub_name, bindings] : config.teleop) {
+      if (bindings.empty()) continue;
+      BuildSubsystem(sub_name, bindings, config, *graph);
     }
   }
 
@@ -349,7 +332,7 @@ class Teleop {
 
  private:
   void BuildSubsystem(const std::string& sub_name,
-                      const toml::array& bindings_arr,
+                      const std::vector<config::TeleopBinding>& bindings,
                       const config::RobotConfig& config,
                       const introspect::DeclaredGraph& graph) {
     using talos::detail::TargetAccess;
@@ -429,59 +412,19 @@ class Teleop {
       return id;
     };
 
-    for (std::size_t i = 0; i < bindings_arr.size(); ++i) {
+    for (std::size_t i = 0; i < bindings.size(); ++i) {
+      const auto& parsed_binding = bindings[i];
       const std::string entry_where = "[subsystems." + sub_name +
                                       "] teleop.bindings[" + std::to_string(i) +
                                       "]";
-      const auto* entry = bindings_arr[i].as_table();
-      if (entry == nullptr) {
-        throw std::invalid_argument(entry_where + " must be a table");
-      }
-      const bool has_button = entry->contains("button");
-      const bool has_axis = entry->contains("axis");
-      if ((has_button && has_axis) || (!has_button && !has_axis)) {
-        throw std::invalid_argument(
-            entry_where + ": binding must specify either 'button' or 'axis'");
-      }
-
-      int port = 0;
-      if (entry->contains("port")) {
-        const auto p = (*entry)["port"].value<int64_t>();
-        if (!p || *p < 0 || *p > 5) {
-          throw std::invalid_argument(entry_where +
-                                      ".port: port must be in [0, 5]");
-        }
-        port = static_cast<int>(*p);
-      }
-
       detail::PrecomputedBinding binding;
-      binding.port = port;
+      binding.port = parsed_binding.port;
 
-      if (has_button) {
+      if (parsed_binding.button.has_value()) {
         binding.is_button = true;
-        const auto b = (*entry)["button"].value<int64_t>();
-        if (!b || *b < 1 || *b > 32) {
-          throw std::invalid_argument(entry_where +
-                                      ".button: button must be in [1, 32]");
-        }
-        binding.button = static_cast<int>(*b);
+        binding.button = *parsed_binding.button;
 
-        if (!entry->contains("while_held")) {
-          throw std::invalid_argument(entry_where +
-                                      " button binding missing 'while_held'");
-        }
-        const auto* wh = (*entry)["while_held"].as_table();
-        if (wh == nullptr) {
-          throw std::invalid_argument(entry_where +
-                                      ".while_held must be a table");
-        }
-
-        std::vector<std::string> wh_keys;
-        for (auto&& [fk, fv] : *wh) wh_keys.emplace_back(fk.str());
-        std::sort(wh_keys.begin(), wh_keys.end());
-
-        for (const auto& fk : wh_keys) {
-          const auto& fv = (*wh)[fk];
+        for (const auto& [fk, fv] : parsed_binding.while_held) {
           const std::string field_where = entry_where + ".while_held." + fk;
           detail::ResolvedField rf =
               detail::ResolveField(*schema, *object, fk, field_where);
@@ -492,20 +435,20 @@ class Teleop {
           action.size = detail::TypeSize(rf.base_type);
 
           if (rf.base_type == reflection::BaseType::Bool) {
-            if (!fv.is_boolean()) {
+            if (!std::holds_alternative<bool>(fv)) {
               throw std::invalid_argument(
                   field_where + ": field '" + rf.leaf_name +
                   "' is bool but value is not a boolean");
             }
             action.bytes[0] =
-                static_cast<std::byte>(*fv.value<bool>() ? 1 : 0);
+                static_cast<std::byte>(std::get<bool>(fv) ? 1 : 0);
           } else if (rf.enum_def != nullptr) {
-            if (!fv.is_string()) {
+            if (!std::holds_alternative<std::string>(fv)) {
               throw std::invalid_argument(
                   field_where + ": field '" + rf.leaf_name +
                   "' is enum but value is not a string");
             }
-            const std::string label = *fv.value<std::string>();
+            const std::string& label = std::get<std::string>(fv);
             const reflection::EnumVal* ev = nullptr;
             for (const auto* val : *rf.enum_def->values()) {
               if (val->name()->str() == label) {
@@ -520,84 +463,46 @@ class Teleop {
                                           rf.enum_def->name()->str());
             }
             detail::EncodeIntegerBytes(action.bytes.data(), rf.base_type,
-                                       ev->value());
+                                       ev->value(), field_where);
           } else {
-            if (!fv.is_number()) {
+            double val = 0.0;
+            if (std::holds_alternative<int64_t>(fv)) {
+              val = static_cast<double>(std::get<int64_t>(fv));
+            } else if (std::holds_alternative<double>(fv)) {
+              val = std::get<double>(fv);
+            } else {
               throw std::invalid_argument(
                   field_where + ": field '" + rf.leaf_name +
                   "' is numeric but value is not a number");
             }
-            const double val = fv.is_floating_point()
-                                   ? *fv.value<double>()
-                                   : static_cast<double>(*fv.value<int64_t>());
-            detail::EncodeNumericBytes(action.bytes.data(), rf.base_type, val);
+            detail::EncodeNumericBytes(action.bytes.data(), rf.base_type, val,
+                                       field_where);
           }
 
           binding.button_fields.push_back(action);
         }
       } else {
         binding.is_button = false;
-        const auto a = (*entry)["axis"].value<int64_t>();
-        if (!a || *a < 0 || *a > 11) {
-          throw std::invalid_argument(entry_where +
-                                      ".axis: axis must be in [0, 11]");
-        }
-        binding.axis = static_cast<int>(*a);
-
-        if (!entry->contains("field")) {
-          throw std::invalid_argument(entry_where + ".field: missing 'field'");
-        }
-        const auto f = (*entry)["field"].value<std::string>();
-        if (!f || f->empty()) {
-          throw std::invalid_argument(entry_where +
-                                      ".field: must be a non-empty string");
-        }
-
-        if (!entry->contains("scale")) {
-          throw std::invalid_argument(entry_where + ".scale: missing 'scale'");
-        }
-        const auto& sc = (*entry)["scale"];
-        if (!sc.is_number()) {
-          throw std::invalid_argument(entry_where +
-                                      ".scale: must be a number");
-        }
-        binding.scale = sc.is_floating_point()
-                            ? *sc.value<double>()
-                            : static_cast<double>(*sc.value<int64_t>());
-
-        if (entry->contains("deadband_frac")) {
-          const auto& df = (*entry)["deadband_frac"];
-          if (!df.is_number()) {
-            throw std::invalid_argument(entry_where +
-                                        ".deadband_frac: must be a number");
-          }
-          const double d = df.is_floating_point()
-                               ? *df.value<double>()
-                               : static_cast<double>(*df.value<int64_t>());
-          if (d < 0.0 || d >= 1.0) {
-            throw std::invalid_argument(entry_where +
-                                        ".deadband_frac: must be in [0, 1)");
-          }
-          binding.deadband_frac = d;
-        }
+        binding.axis = *parsed_binding.axis;
+        binding.scale = parsed_binding.scale;
+        binding.deadband_frac = parsed_binding.deadband_frac;
 
         const std::string field_where = entry_where + ".field";
         detail::ResolvedField rf =
-            detail::ResolveField(*schema, *object, *f, field_where);
+            detail::ResolveField(*schema, *object, parsed_binding.field, field_where);
         if (rf.base_type == reflection::BaseType::Bool ||
             rf.enum_def != nullptr) {
           throw std::invalid_argument(field_where + ": field '" + rf.leaf_name +
                                       "' must be a numeric scalar");
         }
 
-        binding.axis_field.field_id = get_field_id(*f);
+        binding.axis_field.field_id = get_field_id(parsed_binding.field);
         binding.axis_field.offset = rf.offset;
         binding.axis_field.base_type = rf.base_type;
       }
 
       state.bindings.push_back(std::move(binding));
     }
-
     state.field_set.resize(field_ids.size(), 0);
     subsystems_.push_back(std::move(state));
   }

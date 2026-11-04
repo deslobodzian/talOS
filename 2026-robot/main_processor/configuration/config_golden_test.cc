@@ -81,8 +81,7 @@ inline hardware::Config ReferenceSwerveConfig(bool simulation = false) {
   std::sort(c.motors.begin(), c.motors.end(),
             [](const auto& a, const auto& b) { return a.name < b.name; });
 
-  // "intake" sorts between "driver_station" and "operator_interface", so its
-  // devices take ids 14-15 and the shooter pair shifts to 16-17.
+  // "intake" devices take ids 14-15 and the shooter pair shifts to 16-17.
   hardware::DigitalInputConfig intake_beam;
   intake_beam.id = 14;
   intake_beam.name = "intake_beam";
