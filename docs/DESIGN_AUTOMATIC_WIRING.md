@@ -45,9 +45,10 @@ beyond reading descriptors.
 **Status: substantially implemented; integration and acceptance incomplete.**
 `talos::Target`/`TargetLane`/`TargetEnvelope` exist in `talOS/devices/target.h`,
 with C ABI version 12, Python wrappers, test helpers, configuration policy,
-and graph lane checks. The arbiter is deleted. Mode-transition ordering,
-selected-source registry reporting, and current-tree/live verification remain
-open; see [the handoff](HANDOFF_AUTOMATIC_WIRING.md).
+and graph lane checks. The arbiter is deleted. Each Target's selected source
+is reported in its node's registry row and shown in Studio's system view.
+Mode-transition ordering and current-tree/live verification remain open; see
+[the handoff](HANDOFF_AUTOMATIC_WIRING.md).
 
 The pattern is ROS's `twist_mux`: several input lanes, a priority order, a
 timeout on each lane, and the highest-priority live lane wins. Here it is
@@ -167,7 +168,12 @@ C ABI (`node_api.h`, ABI version bump):
 - `talos_target_lane_release(lane)`
 
 The selected source is reported in the node's registry row, so Studio shows
-who is driving each subsystem.
+who is driving each subsystem: every `get()` records the selected lane's index
+(one relaxed atomic, stored only when it changes), the reporting thread copies
+it into the row's selection records (`talOS/introspection/registry.h`,
+`kRegistryVersion` 2), and the bridge's system graph carries it as
+`nodes[].selections[] = {sources, selected}` with `selected: null` when
+nobody drives.
 
 ### Graph lint (`talOS/introspection/names.h`)
 

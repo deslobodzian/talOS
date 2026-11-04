@@ -24,6 +24,7 @@ import {RPC_METHODS} from '../agent/rpc';
 import {
   AgentTab,
   DeclaredPanel,
+  NodeCard,
   OverviewTab,
   SystemTab,
   type SystemState,
@@ -141,6 +142,33 @@ test('a node that stopped heartbeating is marked stale, not merely absent',
        }}/>);
        assert.ok(html.includes('STALE'));
        for (const node of dead) assert.ok(html.includes(node.name));
+     });
+
+test('a node card says who drives its subsystem, and none when nobody does',
+     () => {
+       const card = (sequence: bigint, name: string) => {
+         const graph = parseSystemGraph(demoSystemGraph(sequence));
+         return render(<NodeCard graph={graph}
+                                 node={graph.nodes.find(n => n.name === name)!}
+                                 rates={{}} selected={false}
+                                 onSelect={() => {}}/>);
+       };
+       // operator_interface publishes the teleop lane for the first two
+       // seconds of the demo, then stops.
+       const driving = card(50n, 'drivetrain');
+       assert.match(driving, /<dt>driven by<\/dt><dd class="driving">teleop<\/dd>/);
+       const idle = card(250n, 'drivetrain');
+       assert.match(idle, /<dt>driven by<\/dt><dd class="idle">none<\/dd>/);
+       // A node with no Target drives nothing, and says nothing about it.
+       assert.ok(!card(50n, 'odometry').includes('driven by'));
+
+       // The wiring view of the selected node agrees with its card.
+       const graph = parseSystemGraph(demoSystemGraph(50n));
+       const wiring = render(<Wiring graph={graph}
+                                     node={graph.nodes.find(
+                                         n => n.name === 'drivetrain')!}
+                                     rates={{}}/>);
+       assert.ok(wiring.includes('driven by teleop'));
      });
 
 test('every view renders without a system graph and says why', () => {

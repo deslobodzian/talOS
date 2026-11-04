@@ -8,10 +8,12 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "talOS/devices/devices.h"
 #include "talOS/devices/testing.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/node/access.h"
 #include "talOS/node/sim_access.h"
 #include "talOS/node/testing.h"
 
@@ -358,6 +360,62 @@ TEST(TargetPolicy, RemapRedirectsOneLane) {
   PublishTarget(sim, "left_lift", "teleop", Goal{2.0});
   sim.step(5ms);
   EXPECT_EQ(lift.source, "align");
+}
+
+// Who drives, as the node's registry row says it: only get() runs, so the
+// report cannot depend on anyone asking for source().
+struct Driven {
+  explicit Driven(Node& n) : node{n}, target{n} {}
+  void update() { target.get(); }
+  std::string driver() const {
+    const std::int32_t index = detail::NodeAccess::selected(node, 0);
+    if (index < 0) return "";
+    return std::string{detail::NodeAccess::selection_sources(
+        node, 0)[static_cast<std::size_t>(index)]};
+  }
+  Node& node;
+  Target<Goal> target;
+};
+
+TEST(TargetSelection, TheNodeReportsWhoDrivesAndNobodyWhenStaleOrDisabled) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& lift = sim.add<Driven>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);
+
+  ASSERT_EQ(detail::NodeAccess::selection_count(lift.node), 1u);
+  const auto sources = detail::NodeAccess::selection_sources(lift.node, 0);
+  EXPECT_EQ((std::vector<std::string>{sources.begin(), sources.end()}),
+            (std::vector<std::string>{"align", "teleop", "auto"}));
+  EXPECT_EQ(lift.driver(), "");
+
+  PublishTarget(sim, "lift", "teleop", Goal{1.0});
+  sim.step(5ms);
+  EXPECT_EQ(lift.driver(), "teleop");
+  PublishTarget(sim, "lift", "align", Goal{2.0});
+  sim.step(5ms);
+  EXPECT_EQ(lift.driver(), "align");
+  ReleaseTarget<Goal>(sim, "lift", "align");
+  PublishTarget(sim, "lift", "teleop", Goal{1.0});
+  sim.step(5ms);
+  EXPECT_EQ(lift.driver(), "teleop");
+
+  // Stale: the teleop lane outlives command_timeout_us unrepeated.
+  sim.step(110ms);
+  EXPECT_EQ(lift.driver(), "");
+
+  // Disabled: the producer keeps talking, and nobody drives.
+  PublishTarget(sim, "lift", "teleop", Goal{1.0});
+  sim.step(5ms);
+  ASSERT_EQ(lift.driver(), "teleop");
+  hw.enable(false);
+  for (auto t = 0ms; t < 20ms; t += 5ms) {
+    PublishTarget(sim, "lift", "teleop", Goal{1.0});
+    sim.step(5ms);
+  }
+  EXPECT_EQ(lift.driver(), "");
 }
 
 // A producer node writes the same envelopes the helpers do.

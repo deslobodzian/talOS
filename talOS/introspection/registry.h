@@ -11,10 +11,11 @@
  * This is where every node says so. One shared-memory segment holds a fixed
  * array of slots; a node claims one at startup, writes its event-loop manifest
  * into it -- every timer, watcher, fetcher and sender, by name and message size
- * -- and then keeps a heartbeat and a set of counters current while it runs.
- * Studio and any agent map the segment read-only and get the whole system:
- * which processes exist, which topics each one publishes and subscribes to, and
- * how much traffic has actually moved.
+ * -- and then keeps a heartbeat, a set of counters and the lane each of its
+ * Targets selected current while it runs. Studio and any agent map the segment
+ * read-only and get the whole system: which processes exist, which topics each
+ * one publishes and subscribes to, how much traffic has actually moved, and who
+ * drives each subsystem.
  *
  * The layout is frozen and the version is part of the segment name, so a node
  * from an older build cannot be misread by a newer reader: it lands in a
@@ -77,11 +78,22 @@ namespace talos::introspect {
 // wrote as zero, which reads as "no sample in progress" -- the correct answer
 // for a writer that predates the guard, whose stores land around reads of an
 // undisturbed zero.
-inline constexpr std::uint32_t kRegistryVersion = 1;
-inline constexpr const char* kRegistryPath = "/talos_registry.1";
+//
+// Version 2 is a real layout change: NodeRecord grew the selection records at
+// its end, which moves sizeof(NodeRecord) and every slot after the first. No
+// reserved word was left to reuse, and a table of source names per Target does
+// not fit in one anyway. A version-1 viewer therefore sees an empty registry
+// rather than misreading the new records, until it is rebuilt.
+inline constexpr std::uint32_t kRegistryVersion = 2;
+inline constexpr const char* kRegistryPath = "/talos_registry.2";
 
 inline constexpr std::size_t kMaxNodes = 32;
 inline constexpr std::size_t kMaxSourcesPerNode = 64;
+
+// A node holds one Target per subsystem it drives -- in practice one -- and a
+// policy lists a handful of lanes; both caps are far above either.
+inline constexpr std::size_t kMaxSelectionsPerNode = 4;
+inline constexpr std::size_t kMaxSelectionSources = 8;
 
 // event::MAX_SOURCE_NAME plus the terminator, so any name the event loop
 // accepts fits here without truncation.
@@ -140,6 +152,22 @@ struct SourceRecord {
   std::atomic<std::int64_t> max_latency_ns;
 };
 
+// One talos::Target (talOS/devices/target.h): the lanes its policy names, and
+// which of them it selected last. The names are written once, before the
+// selection count is published; `selected` keeps moving.
+struct SelectionRecord {
+  // The policy's sources, in TargetPolicy::Sources() order, as far as
+  // kMaxSelectionSources holds; declared_source_count is how many it named.
+  std::uint32_t source_count;
+  std::uint32_t declared_source_count;
+  char sources[kMaxSelectionSources][kMaxNameBytes];
+
+  // Index into the policy's sources of the lane the Target's last get()
+  // returned, or -1 when it returned null: robot disabled, Driver Station
+  // stale, or no live lane in the current mode.
+  std::atomic<std::int32_t> selected;
+};
+
 // One node. Padded to a cache line so two nodes writing their own counters do
 // not contend on the same line.
 struct alignas(64) NodeRecord {
@@ -165,13 +193,13 @@ struct alignas(64) NodeRecord {
   // registered more than this segment can hold.
   std::atomic<std::uint32_t> declared_source_count;
 
-  // Seqlock for one refresh: the writer brackets the heartbeat, dispatch and
-  // per-source counter stores with begin_sample/end_sample (odd while a sample
-  // is landing, even when the slot is stable), and the reader retries a copy
-  // taken across a change. This reuses the word `reserved` held, so the layout
-  // does not move and the version stays at 1; see kRegistryVersion for why
-  // that reuse is sound. Claim resets it: a recycled slot may hold an odd
-  // sequence from a writer that died mid-sample.
+  // Seqlock for one refresh: the writer brackets the heartbeat, dispatch,
+  // per-source counter and selection stores with begin_sample/end_sample (odd
+  // while a sample is landing, even when the slot is stable), and the reader
+  // retries a copy taken across a change. This reuses the word `reserved`
+  // held, so it moved no field; see kRegistryVersion for why that reuse is
+  // sound. Claim resets it: a recycled slot may hold an odd sequence from a
+  // writer that died mid-sample.
   std::atomic<std::uint32_t> sample_seq;
 
   std::int64_t start_wall_ns;
@@ -181,6 +209,12 @@ struct alignas(64) NodeRecord {
   char target[kMaxTargetBytes];
 
   SourceRecord sources[kMaxSourcesPerNode];
+
+  // The node's Targets, in the order it opened them. Published like the
+  // sources: the records first, then the count, with release.
+  std::atomic<std::uint32_t> selection_count;
+  std::atomic<std::uint32_t> declared_selection_count;
+  SelectionRecord selections[kMaxSelectionsPerNode];
 };
 
 struct RegistryHeader {
@@ -204,6 +238,7 @@ static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
               "the registry is read across processes without a lock");
 static_assert(std::atomic<std::int64_t>::is_always_lock_free);
 static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+static_assert(std::atomic<std::int32_t>::is_always_lock_free);
 static_assert(std::is_standard_layout_v<RegistryHeader>);
 
 // The claim that let kRegistryVersion stay at 1 when endpoint attributes
@@ -438,6 +473,44 @@ class NodeRegistration {
     });
   }
 
+  // Writes the source table of each of the node's Targets, in the order it
+  // opened them, then publishes the count; every selection starts as none.
+  // Call once, after publish(): a Target is opened in the node's constructor,
+  // so the list is fixed by then. Any range whose elements have `.sources`, a
+  // range of strings, fits -- Reporter::Selection is what the Reporter passes,
+  // and naming it here would make this header reach for reporter.h.
+  template <typename Selections>
+  void publish_selections(const Selections& selections) {
+    std::uint32_t total = 0;
+    for (const auto& selection : selections) {
+      if (total < kMaxSelectionsPerNode) {
+        SelectionRecord& record = record_->selections[total];
+        std::uint32_t declared = 0;
+        for (const auto& source : selection.sources) {
+          if (declared < kMaxSelectionSources) {
+            copy_name(record.sources[declared], kMaxNameBytes, source);
+          }
+          ++declared;
+        }
+        record.declared_source_count = declared;
+        record.source_count =
+            declared < kMaxSelectionSources
+                ? declared
+                : static_cast<std::uint32_t>(kMaxSelectionSources);
+        record.selected.store(-1, std::memory_order_relaxed);
+      }
+      ++total;
+    }
+    record_->declared_selection_count.store(total, std::memory_order_relaxed);
+    // Release: the records above must be visible to any reader that sees
+    // this count.
+    record_->selection_count.store(
+        total < kMaxSelectionsPerNode
+            ? total
+            : static_cast<std::uint32_t>(kMaxSelectionsPerNode),
+        std::memory_order_release);
+  }
+
   // Opens one refresh sample. Bracket the heartbeat, dispatch and
   // per-source counter stores so a reader sees the whole sample or retries:
   // begin_sample, the stores, then end_sample. Adjacent samples must not
@@ -478,6 +551,16 @@ class NodeRegistration {
                                    std::memory_order_relaxed);
     source.last_latency_ns.store(last_latency_ns, std::memory_order_relaxed);
     source.max_latency_ns.store(max_latency_ns, std::memory_order_relaxed);
+  }
+
+  // Which lane Target `index` selected last: an index into its sources, or
+  // -1 for none. Called from the reporting thread inside a sample.
+  void set_selected(std::uint32_t index, std::int32_t selected) {
+    if (index >= record_->selection_count.load(std::memory_order_relaxed)) {
+      return;
+    }
+    record_->selections[index].selected.store(selected,
+                                              std::memory_order_relaxed);
   }
 
   const std::string& name() const { return identity_.name; }
@@ -562,6 +645,7 @@ class NodeRegistration {
       // it then would yank the new owner's row out from under it.
       if (record_->generation.load(std::memory_order_acquire) == generation_) {
         record_->source_count.store(0, std::memory_order_relaxed);
+        record_->selection_count.store(0, std::memory_order_relaxed);
         record_->state.store(static_cast<std::uint64_t>(SlotState::FREE),
                              std::memory_order_release);
       }
@@ -631,6 +715,8 @@ class NodeRegistration {
     record->flags.store(identity.flags, std::memory_order_relaxed);
     record->source_count.store(0, std::memory_order_relaxed);
     record->declared_source_count.store(0, std::memory_order_relaxed);
+    record->selection_count.store(0, std::memory_order_relaxed);
+    record->declared_selection_count.store(0, std::memory_order_relaxed);
     record->dispatch_count.store(0, std::memory_order_relaxed);
     // A recycled slot may hold an odd sequence from a writer that died
     // mid-sample; a fresh claim is quiescent by definition.
@@ -703,6 +789,24 @@ struct SourceSnapshot {
   bool optional() const { return (flags & naming::kSourceFlagOptional) != 0; }
 };
 
+// One Target of a node: the lanes its policy names and the one it selected
+// last. This is who drives the subsystem -- "teleop", "auto", or nobody.
+struct SelectionSnapshot {
+  std::vector<std::string> sources;
+  std::uint32_t declared_source_count{0};
+  std::int32_t selected{-1};
+
+  // The selected lane's source, or nullopt when the Target's last get() was
+  // null. A source past the slot's name table (more than
+  // kMaxSelectionSources in one policy) reads as "#<index>".
+  std::optional<std::string> selected_source() const {
+    if (selected < 0) return std::nullopt;
+    const auto index = static_cast<std::size_t>(selected);
+    if (index < sources.size()) return sources[index];
+    return "#" + std::to_string(index);
+  }
+};
+
 struct NodeSnapshot {
   std::size_t slot{0};
   std::string name;
@@ -717,6 +821,8 @@ struct NodeSnapshot {
   std::uint32_t declared_source_count{0};
   bool alive{false};
   std::vector<SourceSnapshot> sources;
+  std::uint32_t declared_selection_count{0};
+  std::vector<SelectionSnapshot> selections;
 };
 
 // Read-only view of the registry. Safe to poll at any rate: it takes no locks
@@ -846,6 +952,32 @@ class RegistryReader {
       out.max_latency_ns =
           source.max_latency_ns.load(std::memory_order_relaxed);
       node.sources.push_back(std::move(out));
+    }
+
+    // Acquire pairs with publish_selections(), as source_count does above.
+    const std::uint32_t selections =
+        record.selection_count.load(std::memory_order_acquire);
+    const std::uint32_t held =
+        selections > kMaxSelectionsPerNode
+            ? static_cast<std::uint32_t>(kMaxSelectionsPerNode)
+            : selections;
+    node.declared_selection_count =
+        record.declared_selection_count.load(std::memory_order_relaxed);
+    node.selections.reserve(held);
+    for (std::uint32_t t = 0; t < held; ++t) {
+      const SelectionRecord& selection = record.selections[t];
+      SelectionSnapshot out;
+      const std::uint32_t names =
+          selection.source_count > kMaxSelectionSources
+              ? static_cast<std::uint32_t>(kMaxSelectionSources)
+              : selection.source_count;
+      out.sources.reserve(names);
+      for (std::uint32_t s = 0; s < names; ++s) {
+        out.sources.push_back(read_name(selection.sources[s], kMaxNameBytes));
+      }
+      out.declared_source_count = selection.declared_source_count;
+      out.selected = selection.selected.load(std::memory_order_relaxed);
+      node.selections.push_back(std::move(out));
     }
     return node;
   }

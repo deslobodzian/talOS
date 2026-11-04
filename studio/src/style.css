@@ -62,6 +62,7 @@ code{font:inherit;font-family:'JetBrains Mono',monospace;color:#a8c4d4}
 .node-card dl{margin:0;display:grid;grid-template-columns:1fr 1fr;gap:3px 10px;font:9px 'JetBrains Mono',monospace}
 .node-card dl div{display:flex;justify-content:space-between;gap:6px}.node-card dt{color:#7c92a7}.node-card dd{margin:0;color:#bacbdb}
 .node-card small.warn{font-size:8.5px;line-height:1.4}
+.node-card dl div.driven-by{grid-column:1/-1}.node-card dd.driving{color:#48e1cf}.node-card dd.idle{color:#7c92a7}
 
 .wiring{flex:1;min-height:0;display:grid;grid-template-rows:1fr auto 1fr;gap:10px;padding:12px;overflow:auto}
 .wiring section{min-height:0;display:flex;flex-direction:column}

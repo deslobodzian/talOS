@@ -85,7 +85,9 @@ stamped with the consumer's current mode generation, and only while
 is `[robot.targets]` (defaults: teleop `["teleop"]`, autonomous `["auto"]`,
 test none) with a per-subsystem `[targets]` override. No process sits between
 a producer and its subsystem, so a subsystem's safety depends only on its own
-process and the bridge.
+process and the bridge. Each `get()` records the selected source in the node's
+live registry row, which is how Studio's system view shows who drives each
+subsystem.
 
 The mode generation is what keeps a target issued under an earlier enable or
 mode from ever actuating. The RoboRIO program (and `SimHardware`,

@@ -17,6 +17,7 @@ import type {TabId} from './tabs';
 import {
   type DeclaredGraph,
   declaredStatus,
+  drivenBy,
   endpointAttributesKnown,
   isSubscriber,
   rateKey,
@@ -139,6 +140,7 @@ export function NodeCard(
                       .map(s => rates[rateKey(node.name, s.id)])
                       .filter((r): r is number => r !== undefined)
                       .sort((a, b) => b - a)[0];
+  const driver = drivenBy(node);
   return <button
       className={'node-card' + (selected ? ' selected' : '') +
                  (node.alive ? '' : ' dead')}
@@ -160,6 +162,10 @@ export function NodeCard(
           staleness(graph, node) <= 0 ? 'now' :
                                         duration(staleness(graph, node)) + ' ago'
       }</dd></div>
+      {driver !== null &&
+       <div className="driven-by"><dt>driven by</dt><dd className={
+           node.selections.some(s => s.selected !== null) ? 'driving' : 'idle'
+       }>{driver}</dd></div>}
     </dl>
     {node.declared_sources > node.sources.length &&
      <small className="warn">
@@ -182,6 +188,7 @@ export function Wiring(
 
   const incoming = node.sources.filter(s => isSubscriber(s.kind));
   const outgoing = node.sources.filter(s => s.kind === 'SENDER');
+  const driver = drivenBy(node);
 
   // A missing peer is only dangling when nobody said it would be missing. The
   // node holding this end declared whether its far end lives outside talOS or
@@ -221,6 +228,8 @@ export function Wiring(
       <span className={'dot ' + (node.alive ? 'active' : '')}/>
       <b>{node.name}</b>
       <small>{node.sources.filter(s => s.kind === 'TIMER').length} timers</small>
+      {driver !== null &&
+       <small className="driven-by">{`driven by ${driver}`}</small>}
     </div>
     <section>
       <h4>Publishes <small>{outgoing.length}</small></h4>
