@@ -50,6 +50,21 @@ _PARAM_KINDS = {bool: _abi.PARAM_BOOL, int: _abi.PARAM_INT,
                 float: _abi.PARAM_DOUBLE, str: _abi.PARAM_STRING}
 
 
+def _param_kind(key, default):
+    """The talos_node_param kind a default asks for."""
+    if not isinstance(default, list):
+        return _PARAM_KINDS.get(type(default), _abi.PARAM_ANY)
+    if not default:
+        return _abi.PARAM_LIST
+    if all(isinstance(v, str) for v in default):
+        return _abi.PARAM_STRING_LIST
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool)
+           for v in default):
+        return _abi.PARAM_DOUBLE_LIST
+    raise TypeError(f"param {key!r}: a list default must hold only strings "
+                    "or only numbers")
+
+
 class Node:
     """The framework's side of one node. Made by talos, handed to __init__."""
 
@@ -85,8 +100,11 @@ class Node:
         """A key of this subsystem's config table, typed like `default`.
 
         Without a default the key must exist. Dotted keys reach nested tables.
+        A TOML array comes back as a list: of str, or of float (integer
+        elements convert). A list default asks for an array; its elements
+        pick the element type, and [] accepts either.
         """
-        kind = _PARAM_KINDS.get(type(default), _abi.PARAM_ANY)
+        kind = _param_kind(key, default)
         out = _abi.Param()
         found = _abi.ok(lib.talos_node_param(
             self._handle, _abi.encode(key), kind, default is _REQUIRED, out))
@@ -98,6 +116,10 @@ class Node:
             return out.integer
         if out.kind == _abi.PARAM_DOUBLE:
             return out.number
+        if out.kind == _abi.PARAM_STRING_LIST:
+            return [out.strings[i].decode() for i in range(out.count)]
+        if out.kind == _abi.PARAM_DOUBLE_LIST:
+            return [out.numbers[i] for i in range(out.count)]
         return out.string.decode()
 
     def subscribe(self, msg, topic, callback=None, optional=False):

@@ -24,6 +24,14 @@ mode = "fast"
 retries = 3
 verbose = true
 
+[subsystems.vision]
+cameras = ["front", "back"]
+offsets_m = [0.5, 1, -2.25]
+no_cameras = []
+mixed = [1.0, "back"]
+flags = [true]
+exposure_s = 0.01
+
 [subsystems.lift.motors.lift]
 can_id = 1
 [subsystems.lift.targets]
@@ -564,6 +572,54 @@ class ParamTest(unittest.TestCase):
 
         with self.assertRaisesRegex(talos.TalosError, "must be an integer"):
             sim.add(Mistyped, "planner")
+
+    def test_lists(self):
+        seen = {}
+
+        class Vision:
+            def __init__(self, node):
+                seen["cameras"] = node.param("cameras")
+                seen["offsets_m"] = node.param("offsets_m")
+                seen["no_cameras"] = node.param("no_cameras")
+                seen["cameras_any"] = node.param("cameras", [])
+                seen["offsets_typed"] = node.param("offsets_m", [0.0])
+                seen["empty_over_default"] = node.param("no_cameras", ["x"])
+                seen["absent"] = node.param("absent", ["left"])
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        sim.add(Vision, "vision")
+        self.assertEqual(seen, {
+            "cameras": ["front", "back"], "offsets_m": [0.5, 1.0, -2.25],
+            "no_cameras": [], "cameras_any": ["front", "back"],
+            "offsets_typed": [0.5, 1.0, -2.25], "empty_over_default": [],
+            "absent": ["left"]})
+        self.assertEqual([type(v) for v in seen["offsets_m"]], [float] * 3)
+
+        def reading(key, *default):
+            class Reader:
+                def __init__(self, node):
+                    node.param(key, *default)
+            return Reader
+
+        for key, default, error in (
+                ("mixed", (), r"'mixed' must be an array of strings or of "
+                              r"numbers; element 1 is a string"),
+                ("flags", (), r"'flags' .*element 0 is a boolean"),
+                ("cameras", ([0.0],), r"'cameras' must be an array of "
+                                      r"numbers; element 0 is a string"),
+                ("offsets_m", (["a"],), r"'offsets_m' must be an array of "
+                                        r"strings; element 0 is a float"),
+                ("exposure_s", ([],), r"'exposure_s' must be an array"),
+                ("exposure_s", (["a"],), r"'exposure_s' must be an array of "
+                                         r"strings"),
+                ("absent", (), r"'absent' is missing")):
+            with self.subTest(key=key, default=default):
+                with self.assertRaisesRegex(talos.TalosError, error):
+                    Sim.from_toml(ROBOT_TOML).add(reading(key, *default),
+                                                  "vision")
+        with self.assertRaisesRegex(TypeError, "'cameras': a list default"):
+            Sim.from_toml(ROBOT_TOML).add(reading("cameras", ["a", 1.0]),
+                                          "vision")
 
 
 class MessageTest(unittest.TestCase):

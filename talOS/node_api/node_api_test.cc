@@ -21,6 +21,10 @@ command_timeout_us = 100000
 [subsystems.relay]
 gain = 2.5
 label = "left"
+cameras = ["front", "back"]
+offsets_m = [0.5, 1]
+none = []
+mixed = [1.0, "back"]
 
 [subsystems.roller.motors.wheel]
 can_id = 1
@@ -131,6 +135,55 @@ TEST_F(NodeApi, ParamsFallBackOrReportTheMissingKey) {
             std::string::npos);
   EXPECT_EQ(talos_node_param(node, "label", TALOS_PARAM_BOOL, 0, &p),
             TALOS_ERR);
+}
+
+TEST_F(NodeApi, ListParamsComeBackAsCountedArrays) {
+  Relay relay;
+  TalosNode* node = talos_sim_add(sim_, "relay", &BuildRelay, &relay);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+
+  TalosParam p{};
+  for (int32_t kind : {TALOS_PARAM_STRING_LIST, TALOS_PARAM_LIST,
+                       TALOS_PARAM_ANY}) {
+    ASSERT_EQ(talos_node_param(node, "cameras", kind, 1, &p), 1)
+        << talos_last_error();
+    EXPECT_EQ(p.kind, TALOS_PARAM_STRING_LIST);
+    ASSERT_EQ(p.count, 2u);
+    EXPECT_STREQ(p.strings[0], "front");
+    EXPECT_STREQ(p.strings[1], "back");
+  }
+  for (int32_t kind : {TALOS_PARAM_DOUBLE_LIST, TALOS_PARAM_LIST,
+                       TALOS_PARAM_ANY}) {
+    ASSERT_EQ(talos_node_param(node, "offsets_m", kind, 1, &p), 1)
+        << talos_last_error();
+    EXPECT_EQ(p.kind, TALOS_PARAM_DOUBLE_LIST);
+    ASSERT_EQ(p.count, 2u);
+    EXPECT_DOUBLE_EQ(p.numbers[0], 0.5);
+    EXPECT_DOUBLE_EQ(p.numbers[1], 1.0);  // integer converted
+  }
+  ASSERT_EQ(talos_node_param(node, "none", TALOS_PARAM_STRING_LIST, 1, &p), 1);
+  EXPECT_EQ(p.kind, TALOS_PARAM_STRING_LIST);
+  EXPECT_EQ(p.count, 0u);
+  ASSERT_EQ(talos_node_param(node, "none", TALOS_PARAM_LIST, 1, &p), 1);
+  EXPECT_EQ(p.kind, TALOS_PARAM_DOUBLE_LIST);
+  EXPECT_EQ(p.count, 0u);
+  EXPECT_EQ(talos_node_param(node, "absent", TALOS_PARAM_LIST, 0, &p), 0);
+  EXPECT_EQ(p.count, 0u);
+
+  EXPECT_EQ(talos_node_param(node, "mixed", TALOS_PARAM_ANY, 1, &p), TALOS_ERR);
+  EXPECT_NE(std::string{talos_last_error()}.find(
+                "'mixed' must be an array of strings or of numbers; element 1 "
+                "is a string"),
+            std::string::npos)
+      << talos_last_error();
+  EXPECT_EQ(talos_node_param(node, "cameras", TALOS_PARAM_DOUBLE_LIST, 0, &p),
+            TALOS_ERR);
+  EXPECT_NE(std::string{talos_last_error()}.find("element 0 is a string"),
+            std::string::npos);
+  EXPECT_EQ(talos_node_param(node, "label", TALOS_PARAM_LIST, 0, &p),
+            TALOS_ERR);
+  EXPECT_NE(std::string{talos_last_error()}.find("'label' must be an array"),
+            std::string::npos);
 }
 
 TEST_F(NodeApi, FailingCallbackStopsTheStep) {
