@@ -1,3 +1,4 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_python//python:defs.bzl", "py_test")
 load("//talOS/build:contract.bzl", "talos_messages", "talos_py_node")
 
@@ -28,6 +29,17 @@ talos_py_node(
     ],
 )
 
+cc_binary(
+    name = "replay_session_tool",
+    testonly = True,
+    srcs = ["replay_session_tool.cc"],
+    deps = [
+        "//2026-robot/main_processor/drivetrain:messages",
+        "//talOS/events",
+        "//talOS/msgs:geometry",
+    ],
+)
+
 py_test(
     name = "node_test",
     size = "small",
@@ -36,8 +48,12 @@ py_test(
         "pose_estimator.py",
         "testdata/robot.toml",
         ":node",
+        ":replay_session_tool",
     ],
-    env = {"POSE_ESTIMATOR_BINARY": "$(rlocationpath :node)"},
+    env = {
+        "POSE_ESTIMATOR_BINARY": "$(rlocationpath :node)",
+        "REPLAY_SESSION_TOOL_BINARY": "$(rlocationpath :replay_session_tool)",
+    },
     legacy_create_init = False,
     deps = [
         ":messages_py",

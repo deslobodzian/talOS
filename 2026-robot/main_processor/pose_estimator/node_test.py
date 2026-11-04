@@ -11,7 +11,6 @@ import os
 import subprocess
 import tempfile
 import unittest
-
 import talos
 from drivetrain import topics as drivetrain_topics
 from drivetrain.DrivetrainState import DrivetrainState
@@ -411,6 +410,7 @@ class EstimatorTest(unittest.TestCase):
                 self.assertIn(key, str(caught.exception))
 
 
+
 class BinaryTest(unittest.TestCase):
     def run_binary(self, *argv):
         resolver = runfiles.Create()
@@ -445,6 +445,92 @@ class BinaryTest(unittest.TestCase):
                             "--log", log)
             self.run_binary("--replay", log, "--config", CONFIG)
 
+    def test_replay_inputs_determinism_and_observation_handling(self):
+        resolver = runfiles.Create()
+        tool_binary = resolver.Rlocation(
+            os.environ["REPLAY_SESSION_TOOL_BINARY"])
+        binary = resolver.Rlocation(os.environ["POSE_ESTIMATOR_BINARY"])
+        env = dict(os.environ, **resolver.EnvVars())
+        env.pop("PYTHONPATH", None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session_dir = os.path.join(tmp, "session")
+            proc = subprocess.run([tool_binary, "generate", session_dir],
+                                  capture_output=True, text=True, timeout=30)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            for backend in BACKENDS:
+                with self.subTest(backend=backend):
+                    cfg_path = os.path.join(tmp, f"robot_{backend}.toml")
+                    with open(cfg_path, "w") as f:
+                        f.write(robot_toml(backend))
+
+                    log1 = os.path.join(tmp, f"{backend}_1.tlog")
+                    log2 = os.path.join(tmp, f"{backend}_2.tlog")
+
+                    for log_path in (log1, log2):
+                        proc = subprocess.run(
+                            [binary, "--replay-inputs", session_dir,
+                             "--config", cfg_path, "--log", log_path,
+                             "--session-id", "42"],
+                            cwd=tmp, env=env, capture_output=True, text=True,
+                            timeout=30)
+                        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+                    # (a) outputs are bit-identical for both estimates and record stream
+                    records1 = subprocess.run(
+                        [tool_binary, "records", log1],
+                        capture_output=True, text=True, check=True).stdout
+                    records2 = subprocess.run(
+                        [tool_binary, "records", log2],
+                        capture_output=True, text=True, check=True).stdout
+                    self.assertTrue(records1)
+                    self.assertEqual(records1, records2)
+
+                    estimates1_raw = subprocess.run(
+                        [tool_binary, "estimates", log1],
+                        capture_output=True, text=True, check=True).stdout
+                    estimates2_raw = subprocess.run(
+                        [tool_binary, "estimates", log2],
+                        capture_output=True, text=True, check=True).stdout
+                    self.assertEqual(estimates1_raw, estimates2_raw)
+
+                    estimates = [json.loads(line) for line in estimates1_raw.splitlines() if line.strip()]
+                    self.assertGreater(len(estimates), 40)
+
+                    # (b) estimated pose changes over the run (non-constant)
+                    first_pose = (estimates[0]["pose_x_m"], estimates[0]["pose_y_m"],
+                                  estimates[0]["pose_yaw_rad"])
+                    last_pose = (estimates[-1]["pose_x_m"], estimates[-1]["pose_y_m"],
+                                 estimates[-1]["pose_yaw_rad"])
+                    self.assertNotEqual(first_pose, last_pose)
+                    self.assertGreater(estimates[-1]["pose_x_m"], 0.5)
+                    self.assertGreater(estimates[-1]["pose_yaw_rad"], 0.4)
+
+                    # (c) delayed vision measurement shifts estimate toward observation
+                    before_obs = estimates[16]
+                    after_obs = estimates[17]
+                    self.assertEqual(before_obs["observation_accepted_count"], 0)
+                    self.assertEqual(after_obs["observation_accepted_count"], 1)
+                    step_forward = after_obs["pose_x_m"] - before_obs["pose_x_m"]
+                    self.assertGreater(step_forward, 0.04)
+
+                    # (d) stale/invalid observations are rejected and don't change estimate
+                    stale_step = estimates[18]
+                    self.assertEqual(stale_step["observation_accepted_count"], 1)
+                    self.assertEqual(stale_step["observation_rejected_count"], 1)
+
+                    invalid_step = estimates[19]
+                    self.assertEqual(invalid_step["observation_accepted_count"], 1)
+                    self.assertEqual(invalid_step["observation_rejected_count"], 2)
+
+                    self.assertLess(stale_step["pose_x_m"], 1.0)
+                    self.assertLess(stale_step["pose_y_m"], 0.1)
+                    self.assertLess(invalid_step["pose_x_m"], 1.0)
+                    self.assertLess(invalid_step["pose_y_m"], 0.1)
+
+                    self.assertEqual(estimates[-1]["observation_accepted_count"], 1)
+                    self.assertEqual(estimates[-1]["observation_rejected_count"], 2)
 
 if __name__ == "__main__":
     unittest.main()
