@@ -162,6 +162,11 @@ enum {  // talos::hardware::Mode
 // "roller"). Returns its index, or -1 naming the device in the error.
 int64_t talos_device(TalosNode* node, int32_t kind, const char* name);
 int32_t talos_robot_enabled(TalosNode* node);
+// HardwareLink::sample_time: the node-clock time (ns) at which the gateway
+// sampled the latest accepted hardware state. Returns 1 with *out_ns set, 0
+// when there is none (no fresh state, or the bridge's clock mapping for its
+// gateway boot has not converged), TALOS_ERR on error.
+int32_t talos_hardware_sample_time(TalosNode* node, int64_t* out_ns);
 
 // One motor command for the next flush (Motor::set_* / stop).
 int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
@@ -331,6 +336,11 @@ int32_t talos_sim_hardware_set_cancoder(TalosSimHardware* hw, const char* node,
 int32_t talos_sim_hardware_set_gyro(TalosSimHardware* hw, const char* node,
                                     const char* device, double yaw,
                                     double yaw_rate);
+// SimHardware::set_gateway_clock: the gateway clock reads sim time +
+// gateway_offset_ns, and each state is sampled latency_ns before it goes out.
+int32_t talos_sim_hardware_set_gateway_clock(TalosSimHardware* hw,
+                                             int64_t gateway_offset_ns,
+                                             int64_t latency_ns);
 // Marks every device of `node` named `device` (dis)connected
 // (SimHardware::set_connected).
 int32_t talos_sim_hardware_set_connected(TalosSimHardware* hw, const char* node,

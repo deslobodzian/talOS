@@ -252,6 +252,18 @@ class Telemetry {
         set(idx_bridge_timed_out_mask_,
             static_cast<double>(bridge_->timed_out_mask()));
         set(idx_bridge_configured_, bridge_->configured() ? 1.0 : 0.0);
+        // The gateway-to-node clock mapping: the offset and the delay
+        // spread only once it has converged for the current gateway boot.
+        set(idx_bridge_clock_offset_valid_,
+            bridge_->clock_offset_valid() ? 1.0 : 0.0);
+        set(idx_bridge_clock_resets_,
+            static_cast<double>(bridge_->clock_resets_count()));
+        if (bridge_->clock_offset_valid()) {
+          set(idx_bridge_clock_offset_us_,
+              static_cast<double>(bridge_->clock_offset_us()));
+          set(idx_bridge_clock_offset_spread_us_,
+              static_cast<double>(bridge_->clock_offset_spread_us()));
+        }
       }
       set(idx_bridge_stale_, bridge_ok ? 0.0 : 1.0);
     }
@@ -395,6 +407,11 @@ class Telemetry {
     idx_bridge_timed_out_mask_ = AddChannel("bridge/timed_out_mask");
     idx_bridge_configured_ = AddChannel("bridge/configured");
     idx_bridge_stale_ = AddChannel("bridge/stale");
+    idx_bridge_clock_offset_us_ = AddChannel("bridge/clock_offset_us", "us");
+    idx_bridge_clock_offset_spread_us_ =
+        AddChannel("bridge/clock_offset_spread_us", "us");
+    idx_bridge_clock_offset_valid_ = AddChannel("bridge/clock_offset_valid");
+    idx_bridge_clock_resets_ = AddChannel("bridge/clock_resets");
   }
 
   template <class M>
@@ -438,6 +455,9 @@ class Telemetry {
       idx_bridge_identity_rejected_{0}, idx_bridge_ownership_rejected_{0},
       idx_bridge_timed_out_mask_{0}, idx_bridge_configured_{0},
       idx_bridge_stale_{0};
+  std::size_t idx_bridge_clock_offset_us_{0},
+      idx_bridge_clock_offset_spread_us_{0}, idx_bridge_clock_offset_valid_{0},
+      idx_bridge_clock_resets_{0};
 };
 
 }  // namespace talos::telemetry

@@ -18,7 +18,8 @@
 The class is built with the node and registers everything in __init__;
 update(), when present, runs every period. This is a thin binding over the
 C++ talos::Node (talOS/node), so both languages behave the same. Times are
-seconds.
+seconds, except where a name ends in _ns (integer nanoseconds, the unit
+message fields such as sample_time_ns carry).
 """
 
 import ctypes
@@ -34,14 +35,14 @@ from talos._messages import Message, enum_names, message_type
 from talos.devices import (Alliance, AnalogInput, CANcoder, DigitalInput,
                            DigitalOutput, DriverStation, Encoder, Gyro,
                            Joystick, Mode, Motor, PwmOutput, Target,
-                           TargetLane, robot_enabled)
+                           TargetLane, hardware_sample_time_ns, robot_enabled)
 
 __all__ = [
     "Alliance", "AnalogInput", "BytePublisher", "CANcoder", "DigitalInput",
     "DigitalOutput", "DriverStation", "Encoder", "Gyro", "Joystick", "Message",
     "Mode", "Motor", "Node", "Publisher", "PwmOutput", "StateMachine",
     "Subscription", "TalosError", "Target", "TargetLane", "cpp_node", "load",
-    "robot_enabled", "run",
+    "hardware_sample_time_ns", "robot_enabled", "run",
 ]
 
 _NS = 1e9

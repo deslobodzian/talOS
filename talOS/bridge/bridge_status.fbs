@@ -9,6 +9,17 @@ namespace bridge;
 // actuator-owning subsystem, in sorted name order, has timed out; only the
 // first 32 fit. subsystem_count is the number of those subsystems.
 // configured is whether the RoboRIO acknowledged this bridge's configuration.
+//
+// The clock_* fields map the gateway's State.sample_time_us into the node
+// clock (talOS/bridge/clock_offset.h): the node-clock time of a sample of
+// gateway boot clock_boot_id is sample_time_us + clock_offset_us, later than
+// the truth by the smallest transport latency in the window (an upper-bounded
+// latency estimate, not clock synchronisation). clock_offset_valid is whether
+// the window holds enough samples of that boot; clock_offset_spread_us is the
+// largest minus the smallest one-way delay in it; clock_window_count is how
+// many samples it holds. clock_resets_count counts restarts for a new gateway
+// boot and clock_ignored_count duplicate or reordered samples left out.
+// talos::HardwareLink::sample_time() applies the mapping.
 struct BridgeStatus {
   states_received_count:uint64;
   commands_sent_count:uint64;
@@ -19,4 +30,11 @@ struct BridgeStatus {
   timed_out_mask:uint32;
   subsystem_count:uint32;
   configured:bool;
+  clock_boot_id:uint64;
+  clock_offset_us:int64;
+  clock_offset_spread_us:uint64;
+  clock_resets_count:uint64;
+  clock_ignored_count:uint64;
+  clock_window_count:uint32;
+  clock_offset_valid:bool;
 }

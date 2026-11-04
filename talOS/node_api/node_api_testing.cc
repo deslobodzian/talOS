@@ -265,6 +265,17 @@ int32_t talos_sim_hardware_set_gyro(TalosSimHardware* hw, const char* node,
   });
 }
 
+int32_t talos_sim_hardware_set_gateway_clock(TalosSimHardware* hw,
+                                             int64_t gateway_offset_ns,
+                                             int64_t latency_ns) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    AsHardware(hw).set_gateway_clock(
+        std::chrono::nanoseconds{gateway_offset_ns},
+        std::chrono::nanoseconds{latency_ns});
+    return TALOS_OK;
+  });
+}
+
 int32_t talos_sim_hardware_set_connected(TalosSimHardware* hw, const char* node,
                                          const char* device,
                                          int32_t connected) {
