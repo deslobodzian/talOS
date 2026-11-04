@@ -12,6 +12,9 @@
 #include <utility>
 #include <vector>
 
+#include "bridge/bridge_status_generated.h"
+#include "bridge/topics.h"
+#include "talOS/bridge/clock_offset.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
 #include "talOS/hardware/packet.h"
@@ -59,9 +62,19 @@ struct SimHardware::Impl {
   std::set<std::pair<Kind, std::uint16_t>> disconnected;
   std::optional<driver_station::DriverStationData> ds_packet;
   driver_station::ModeTracker ds_mode;
+  Duration gateway_offset{};
+  Duration latency{};
+  hardware::ClockOffsetEstimator clock;
+  std::uint64_t states_sent = 0;
+  std::uint64_t ds_packets_sent = 0;
 
   explicit Impl(Sim& s) : sim{s} {}
 
+  // The gateway clock, in its microseconds, `before` ago.
+  std::uint64_t GatewayUs(Duration before = Duration{}) const {
+    return static_cast<std::uint64_t>(
+        (sim.now().nanos() + (gateway_offset - before).count()) / 1000);
+  }
   std::uint16_t Id(std::string_view node, Kind kind,
                    std::string_view device) const {
     return detail::HardwareAccess::device_id(config, node, kind, device);
@@ -125,7 +138,7 @@ struct SimHardware::Impl {
     state.config_id = config_id;
     state.boot_id = 1;
     state.epoch = 1;
-    state.sample_time_us = static_cast<std::uint64_t>(sim.now().nanos() / 1000);
+    state.sample_time_us = GatewayUs(latency);
     state.flags = hardware::kConfigured | (enabled ? hardware::kEnabled : 0u);
 
     auto fill = [](auto& samples, auto& count, const auto& configs,
@@ -205,11 +218,34 @@ struct SimHardware::Impl {
     packet.size =
         static_cast<std::uint32_t>(hardware::Encode(state, packet.data));
     sim.publish(hardware::kStateTopic, packet);
+    ++states_sent;
     if (ds_packet) PublishDriverStation(*ds_packet);
+
+    // What the bridge would report having received exactly this, now.
+    clock.Observe(state.boot_id, state.sample_time_us,
+                  static_cast<std::uint64_t>(sim.now().nanos() / 1000));
+    ::bridge::BridgeStatus status{
+        states_sent,
+        0,
+        0,
+        0,
+        ds_packets_sent,
+        0,
+        0,
+        0,
+        true,
+        clock.boot_id(),
+        clock.offset_us(),
+        clock.spread_us(),
+        clock.resets_count(),
+        clock.ignored_count(),
+        static_cast<std::uint32_t>(clock.window_count()),
+        clock.converged()};
+    sim.publish(::bridge::topics::kStatus, status);
   }
 
   void PublishDriverStation(driver_station::DriverStationData data) {
-    data.sample_time_us = static_cast<std::uint64_t>(sim.now().nanos() / 1000);
+    data.sample_time_us = GatewayUs();
     ds_mode.Stamp(data);
     Packet packet{};
     packet.size =
@@ -219,6 +255,7 @@ struct SimHardware::Impl {
           "SimHardware: the Driver Station packet does not encode");
     }
     sim.publish(hardware::kDriverStationTopic, packet);
+    ++ds_packets_sent;
   }
 };
 
@@ -271,6 +308,18 @@ void SimHardware::set_cancoder(std::string_view node, std::string_view device,
 void SimHardware::set_gyro(std::string_view node, std::string_view device,
                            double yaw, double yaw_rate) {
   impl_->sensors[impl_->Id(node, Kind::kGyro, device)] = {yaw, yaw_rate};
+}
+
+void SimHardware::set_gateway_clock(Duration gateway_offset, Duration latency) {
+  if (latency < Duration::zero()) {
+    throw std::invalid_argument("SimHardware: negative sample latency");
+  }
+  if (impl_->sim.now().nanos() + (gateway_offset - latency).count() < 0) {
+    throw std::invalid_argument(
+        "SimHardware: the gateway clock would read before 0");
+  }
+  impl_->gateway_offset = gateway_offset;
+  impl_->latency = latency;
 }
 
 void SimHardware::set_connected(std::string_view node, std::string_view device,

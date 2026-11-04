@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "bridge/bridge_status_generated.h"
+#include "talOS/bridge/clock_offset.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/hardware/config.h"
 #include "talOS/hardware/config_wire.h"
@@ -87,9 +88,13 @@ class HardwareNode {
   // configured command timeout (timeout/5, clamped to [5, 20] ms) so a live
   // merge always refreshes the gateway well before it expires.
   uint64_t heartbeat_us() const { return heartbeat_us_; }
+  // The gateway-to-node clock mapping, fed by every decoded /hw/state frame.
+  const ClockOffsetEstimator& clock() const { return clock_; }
 
   // The /hw/status message as of `now_us` (the bridge's monotonic clock, the
   // same one Tick() receives). Tick() publishes it every kStatusPeriodUs.
+  // Run() reads that clock from talos::event::Poller::now(), the clock every
+  // node's Node::now() runs on, so the clock_* mapping lands in node time.
   bridge::BridgeStatus Status(uint64_t now_us) const;
 
   void PushConfig(uint64_t now_us);
@@ -187,6 +192,7 @@ class HardwareNode {
   // Bridge-clock receipt time of the last /hw/state frame; meaningful once
   // states_received_ is non-zero.
   uint64_t last_state_receipt_us_{0};
+  ClockOffsetEstimator clock_;
   uint64_t statuses_published_{0};
   uint64_t last_status_us_{0};
   uint64_t cmd_sequence_{0};

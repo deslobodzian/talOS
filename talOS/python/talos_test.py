@@ -156,6 +156,33 @@ class DevicesTest(unittest.TestCase):
         with self.assertRaisesRegex(talos.TalosError, "'elbow'"):
             hw.set_connected("lift", "elbow", False)
 
+    def test_hardware_sample_time_converges_and_goes_stale(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        lift = sim.add(Lift, "lift")
+        node = sim.node("lift")
+        hw = SimHardware(sim)
+        hw.set_gateway_clock(offset=2.0)  # the RoboRIO's clock is 2 s ahead
+        # A state every 10 ms from 0: at most 6 by 50 ms, short of the 8 the
+        # bridge's clock filter needs.
+        sim.step(0.05)
+        self.assertIsNone(talos.hardware_sample_time_ns(node))
+
+        sim.step(0.05)
+        sampled = talos.hardware_sample_time_ns(node)
+        self.assertIsInstance(sampled, int)
+        # A publication time in sim time, not the gateway clock 2 s off it.
+        self.assertEqual(sampled % 10_000_000, 0)
+        now_ns = round(sim.now * 1e9)
+        self.assertLessEqual(sampled, now_ns)
+        self.assertGreaterEqual(sampled, now_ns - 20_000_000)
+        self.assertFalse(lift.enabled)  # independent of enable
+        with self.assertRaisesRegex(talos.TalosError, "latency"):
+            hw.set_gateway_clock(latency=-0.001)
+
+        del hw  # the bridge goes silent
+        sim.step(0.15)
+        self.assertIsNone(talos.hardware_sample_time_ns(node))
+
 
 class Pilot:
     """Reads the Driver Station, counting packets."""

@@ -7,7 +7,7 @@ raise, with the C++ message, or with the Python exception a callback raised.
 import ctypes
 import os
 
-ABI_VERSION = 13
+ABI_VERSION = 14
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -109,6 +109,7 @@ _SIGNATURES = {
     "talos_state_machine_just_entered": (c_int32, [c_void_p, c_int64]),
     "talos_device": (c_int64, [c_void_p, c_int32, c_char_p]),
     "talos_robot_enabled": (c_int32, [c_void_p]),
+    "talos_hardware_sample_time": (c_int32, [c_void_p, _P(c_int64)]),
     "talos_motor_set": (c_int32, [c_void_p, c_int64, c_int32, c_double,
                                   c_double, c_int32]),
     "talos_digital_output_set": (c_int32, [c_void_p, c_int64, c_int32]),
@@ -168,6 +169,8 @@ _TESTING_SIGNATURES = {
                                                   c_double]),
     "talos_sim_hardware_set_gyro": (c_int32, [c_void_p, c_char_p, c_char_p,
                                               c_double, c_double]),
+    "talos_sim_hardware_set_gateway_clock": (c_int32, [c_void_p, c_int64,
+                                                       c_int64]),
     "talos_sim_hardware_set_connected": (c_int32, [c_void_p, c_char_p,
                                                    c_char_p, c_int32]),
     "talos_sim_hardware_set_driver_station": (

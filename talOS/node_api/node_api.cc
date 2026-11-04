@@ -400,6 +400,16 @@ int32_t talos_robot_enabled(TalosNode* node) {
                         [&] { return talos::robot_enabled(AsNode(node)); });
 }
 
+int32_t talos_hardware_sample_time(TalosNode* node, int64_t* out_ns) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
+    const std::optional<talos::Time> sampled = Link(node).sample_time();
+    if (!sampled) return 0;
+    *out_ns = sampled->nanos();
+    return 1;
+  });
+}
+
 int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
                         double demand, double ff_volts, int32_t slot) {
   return Guard<int32_t>(TALOS_ERR, [&] {

@@ -365,6 +365,38 @@ TEST_F(NodeApi, DisconnectedDeviceSampleIsInvalid) {
   talos_sim_hardware_destroy(hw);
 }
 
+TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
+  Roller roller;
+  TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  // The gateway clock is 3 s ahead of sim time.
+  ASSERT_EQ(talos_sim_hardware_set_gateway_clock(hw, 3000 * kMs, 0), TALOS_OK);
+  EXPECT_EQ(talos_sim_hardware_set_gateway_clock(hw, 0, -1), TALOS_ERR);
+  EXPECT_NE(std::string{talos_last_error()}.find("latency"), std::string::npos);
+
+  // States every 10 ms from 0: at most 6 by 50 ms, short of the 8 the
+  // bridge's filter needs.
+  ASSERT_EQ(talos_sim_step(sim_, 50 * kMs), TALOS_OK) << talos_last_error();
+  int64_t sampled = -1;
+  EXPECT_EQ(talos_hardware_sample_time(node, &sampled), 0);
+  EXPECT_EQ(sampled, -1);
+
+  ASSERT_EQ(talos_sim_step(sim_, 50 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_hardware_sample_time(node, &sampled), 1);
+  // A publication time in sim time, not the gateway clock 3 s off it.
+  EXPECT_EQ(sampled % (10 * kMs), 0);
+  EXPECT_LE(sampled, talos_sim_now_ns(sim_));
+  EXPECT_GE(sampled, talos_sim_now_ns(sim_) - 20 * kMs);
+  EXPECT_EQ(roller.enabled, 0);  // independent of enable
+  EXPECT_EQ(talos_hardware_sample_time(node, nullptr), TALOS_ERR);
+
+  talos_sim_hardware_destroy(hw);  // the bridge goes silent
+  ASSERT_EQ(talos_sim_step(sim_, 150 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(talos_hardware_sample_time(node, &sampled), 0);
+}
+
 // --- Driver Station ------------------------------------------------------
 
 int32_t BuildPilot(TalosNode* node, void* user) {
