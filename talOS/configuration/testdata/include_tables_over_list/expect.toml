@@ -1,0 +1,5 @@
+# A [subsystems.<name>] child merges over the included list's expanded view:
+# its node replaces the base's, and a child table without a node keeps it.
+accept = true
+nodes = ["//a:file", "//b:child"]
+files = ["a.toml", "b.toml", "base.toml"]

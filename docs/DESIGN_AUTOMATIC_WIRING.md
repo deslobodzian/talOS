@@ -271,7 +271,7 @@ its lane active.
 
 ---
 
-## D5. The manifest is the single source (implemented; hardening and integration verification incomplete)
+## D5. The manifest is the single source (implemented)
 
 - `robot.toml` `[[subsystems]]` is the only node list.
 - `bazel run //tools:sync_manifest -- <dir>/robot.toml` writes
@@ -280,7 +280,13 @@ its lane active.
   `CONFIG_FILES`, every file the config reads besides itself (`include`,
   `path`, `defaults`). It is a short Python `tomllib` script
   (`tools/sync_manifest.py`), the only reader besides the C++ parser, and
-  follows the parser's `include`/`node`/`defaults` precedence.
+  ports the parser's resolution step for step: top-level and entry keys,
+  duplicate names, value types, and `include`/`node`/`defaults` precedence.
+  The cases under `talOS/configuration/testdata` (a config tree plus
+  `expect.toml`: accept or reject, nodes, files read) run through both
+  `//talOS/configuration:test` and `//tools:sync_manifest_test`, so the two
+  readers cannot disagree untested. It rejects absolute and
+  workspace-leaving paths, which have no Bazel label.
 - `talos_bundle` (`nodes`, `config_files`) and `talos_graph_test` (`nodes`,
   `data`) take `NODES` and `CONFIG_FILES`.
 - `manifest_sync_test` (`tools/sync_manifest.bzl`) runs the script with
@@ -288,9 +294,23 @@ its lane active.
   manifest is stale. It sees only the files `CONFIG_FILES` lists, so an entry
   naming a new file fails too.
 - `new_subsystem` edits `robot.toml`, writes the subsystem file and
-  regenerates the manifest. It edits no BUILD file.
+  regenerates its manifest and that of every other config in the robot that
+  includes it. It edits no BUILD file. Existing names and the placeholder CAN
+  id come from the effective config (includes, defaults, custom paths).
+  `tools/scaffold_testdata` holds its output for one C++ and one Python
+  package; `bazel test //...` builds and tests them, and
+  `new_subsystem_test` fails when the generator's output drifts from them.
+- `new_subsystem --standalone DIR` writes a Bzlmod repo that builds as
+  written: `local_path_override` to the generating checkout plus its
+  `.bazelrc` and `.bazelversion`. A robot consumes it with `bazel_dep` +
+  `local_path_override` and names `@<name>//:node` in its own subsystem file.
 - Bundling stages every config file at its path relative to the config, so
   `defaults = "..."` files and non-default `path`s resolve in the bundle.
+  `config_sha256` covers each staged file's config-relative path and bytes,
+  the root config's included (docs/DEPLOYMENT.md);
+  `//2026-robot/main_processor:bundle_test` describes relocated copies of
+  the robot bundle and of `bundle_testdata/robot.toml` (include,
+  parent-directory defaults, custom path, entry node).
 
 **Acceptance:** adding a `[[subsystems]]` line without running the sync fails
 CI with the fix printed.

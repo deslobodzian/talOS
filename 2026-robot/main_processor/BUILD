@@ -1,4 +1,5 @@
 load("@rules_python//python:defs.bzl", "py_test")
+load("//2026-robot/main_processor/bundle_testdata:robot_manifest.bzl", RELOCATION_CONFIG_FILES = "CONFIG_FILES", RELOCATION_NODES = "NODES")
 load("//2026-robot/main_processor/configuration:robot_manifest.bzl", "CONFIG_FILES", "NODES")
 load("//talOS/build:contract.bzl", "talos_bundle")
 
@@ -13,55 +14,24 @@ talos_bundle(
     nodes = ["//talOS/bridge:hardware_node"] + NODES,
 )
 
-genrule(
-    name = "bundle_test_gen",
-    outs = ["bundle_test.py"],
-    cmd = """cat << 'EOF' > $@
-import os
-import shutil
-import subprocess
-import tempfile
-import unittest
-from python.runfiles import runfiles
-
-
-class BundleTest(unittest.TestCase):
-    def test_relocated_bundle_describe(self):
-        r = runfiles.Create()
-        bundle_src = r.Rlocation("_main/2026-robot/main_processor/robot_bundle")
-        self.assertTrue(bundle_src and os.path.isdir(bundle_src), f"missing bundle: {bundle_src}")
-        with tempfile.TemporaryDirectory() as tmp:
-            copied_bundle = os.path.join(tmp, "robot_bundle")
-            log_dir = os.path.join(tmp, "logs")
-            shutil.copytree(os.path.realpath(bundle_src), copied_bundle, symlinks=True)
-            env = dict(os.environ)
-            env["TALOS_LOG_DIR"] = log_dir
-            proc = subprocess.run(
-                ["./run.sh", "--describe-only"],
-                cwd=copied_bundle,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stdout + "\\n" + proc.stderr)
-            self.assertNotIn("error:", proc.stdout.lower())
-            self.assertNotIn("not described", proc.stdout)
-            self.assertTrue(os.path.isfile(os.path.join(log_dir, "graph.json")))
-
-
-if __name__ == "__main__":
-    unittest.main()
-EOF
-""",
-    visibility = ["//visibility:private"],
+# bundle_test only: a config reaching its files through `include`,
+# parent-directory `defaults`, a custom `path` and an entry `node`.
+talos_bundle(
+    name = "relocation_bundle",
+    testonly = True,
+    config = "//2026-robot/main_processor/bundle_testdata:robot.toml",
+    config_files = RELOCATION_CONFIG_FILES,
+    nodes = ["//talOS/bridge:hardware_node"] + RELOCATION_NODES,
 )
 
 py_test(
     name = "bundle_test",
     size = "small",
     srcs = ["bundle_test.py"],
-    data = [":robot_bundle"],
+    data = [
+        ":relocation_bundle",
+        ":robot_bundle",
+    ],
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],
 )

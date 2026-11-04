@@ -21,6 +21,7 @@ a config that reads an unlisted file is reported stale too.
 
 import argparse
 import ast
+import copy
 import difflib
 import os
 import posixpath
@@ -54,6 +55,39 @@ def _join(base_dir, rel, where):
     return path
 
 
+_TOP_LEVEL_KEYS = ("include", "robot", "studio", "subsystems")
+_ENTRY_KEYS = ("name", "path", "node", "defaults")
+
+
+def _non_empty(table, key, where):
+    """config_parser.h ReadNonEmpty: a present `key` must be a non-empty
+    string."""
+    value = table[key]
+    if not isinstance(value, str) or not value:
+        raise ManifestError(f"{where} field '{key}' must be a non-empty string")
+    return value
+
+
+def _check_top_level_keys(doc, path):
+    for key in doc:
+        if key not in _TOP_LEVEL_KEYS:
+            raise ManifestError(f"{path}: unknown top-level key '{key}'")
+
+
+def _merge_tables(base, over):
+    """config_parser.h MergeTables: `over` wins; tables merge recursively."""
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _merge_tables(base[key], value)
+        else:
+            base[key] = copy.deepcopy(value)
+
+
+def _entry_name(entry):
+    name = entry.get("name") if isinstance(entry, dict) else None
+    return name if isinstance(name, str) and name else None
+
+
 class _Reader:
     """Parses the config's files, recording each one besides the config."""
 
@@ -83,50 +117,82 @@ class _Reader:
             raise ManifestError(f"TOML parse error in {path}: {err}")
 
     def expand(self, entries, where):
-        """[[subsystems]] entries (paths already workspace-relative) ->
-        {name: node or None}, as config_parser.h's ExpandManifest."""
+        """[[subsystems]] entries (paths already workspace-relative) -> the
+        [subsystems.<name>] view, as config_parser.h's ExpandManifest."""
         views = {}
         for entry in entries:
-            name, path = entry.get("name"), entry.get("path")
-            if not name or not path:
+            name = _entry_name(entry)
+            path = entry.get("path") if isinstance(entry, dict) else None
+            if name is None or not isinstance(path, str) or not path:
                 raise ManifestError(f"invalid [[subsystems]] entry in {where}: "
                                     "needs 'name' and 'path'")
+            for key in entry:
+                if key not in _ENTRY_KEYS:
+                    raise ManifestError(
+                        f"unknown key '{key}' in [[subsystems]] entry "
+                        f"'{name}' in {where} (expected name, path, node, "
+                        "defaults)")
+            node = (_non_empty(entry, "node", "[[subsystems]] entry")
+                    if "node" in entry else None)
+            entry_defaults = (
+                _non_empty(entry, "defaults", "[[subsystems]] entry")
+                if "defaults" in entry else None)
             sub = self.load(path)
-            header = sub.get("subsystem", {})
-            if header.get("name") != name:
+            header = sub.get("subsystem")
+            if not isinstance(header, dict) or header.get("name") != name:
                 raise ManifestError(f"{path}: [subsystem].name must match "
                                     f"manifest entry '{name}'")
-            defaults = entry.get("defaults")
-            if defaults is None and "defaults" in header:
-                defaults = _join(posixpath.dirname(path), header["defaults"],
-                                 path)
-            node = entry.get("node", header.get("node"))
+            if name in views:
+                raise ManifestError(f"duplicate [[subsystems]] entry in "
+                                    f"{where}: '{name}'")
+            header_defaults = (_non_empty(header, "defaults", "[subsystem]")
+                               if "defaults" in header else None)
+            defaults = entry_defaults
+            if defaults is None and header_defaults is not None:
+                defaults = _join(posixpath.dirname(path), header_defaults, path)
             if defaults is not None:
-                base = self.load(defaults)
-                if node is None:
-                    node = base.get("subsystem", {}).get("node")
-            views[name] = node
+                merged = self.load(defaults)
+                _merge_tables(merged, sub)
+                sub = merged
+                header = sub["subsystem"]
+            view = {k: v for k, v in header.items()
+                    if k not in ("name", "defaults")}
+            view.update((k, v) for k, v in sub.items() if k != "subsystem")
+            if node is not None:
+                view["node"] = node
+            views[name] = view
         return views
 
 
 def _normalized(entries, base_dir, where):
-    """Entries with `path`/`defaults` relative to the workspace root."""
+    """config_parser.h NormalizeManifestPaths: string `path`/`defaults`
+    relative to the workspace root; other values are left for expand."""
     out = []
     for entry in entries:
-        entry = dict(entry)
-        for key in ("path", "defaults"):
-            if isinstance(entry.get(key), str) and entry[key]:
-                entry[key] = _join(base_dir, entry[key], where)
+        if isinstance(entry, dict):
+            entry = dict(entry)
+            for key in ("path", "defaults"):
+                if isinstance(entry.get(key), str) and entry[key]:
+                    entry[key] = _join(base_dir, entry[key], where)
         out.append(entry)
     return out
 
 
-def _merge_entries(base, child):
+def _merge_entries(base, child, where):
     """config_parser.h MergeManifests: child entries override base by name."""
-    merged = [dict(entry) for entry in base]
+    merged = [dict(e) if isinstance(e, dict) else e for e in base]
+    seen = set()
     for entry in child:
-        match = next((m for m in merged if m.get("name") == entry.get("name")),
-                     None)
+        name = _entry_name(entry)
+        if name is None:
+            raise ManifestError(f"invalid [[subsystems]] entry in {where}: "
+                                "needs 'name'")
+        if name in seen:
+            raise ManifestError(f"duplicate [[subsystems]] entry in {where}: "
+                                f"'{name}'")
+        seen.add(name)
+        match = next((m for m in merged
+                      if isinstance(m, dict) and m.get("name") == name), None)
         if match is None:
             merged.append(dict(entry))
         else:
@@ -134,24 +200,13 @@ def _merge_entries(base, child):
     return merged
 
 
-def _table_views(tables):
-    return {name: (t.get("node") if isinstance(t, dict) else None)
-            for name, t in tables.items()}
+def effective(root, config, overrides=None, available=None):
+    """(`config`'s canonical {name: [subsystems.<name>] table} view, sorted
+    workspace-relative paths of every file it reads besides itself).
 
-
-def _merge_views(base, child_tables):
-    views = dict(base)
-    for name, table in child_tables.items():
-        if isinstance(table, dict) and "node" in table:
-            views[name] = table["node"]
-        else:
-            views.setdefault(name, None)
-    return views
-
-
-def resolve(root, config, overrides=None, available=None):
-    """(sorted node labels, sorted workspace-relative paths of every file
-    `config` reads besides itself).
+    Mirrors config_parser.h ParseRobotConfig step for step; the shared cases
+    in talOS/configuration/testdata hold both to the same decisions. Device
+    tables are not checked here: the parser does that when the config loads.
 
     `overrides` maps a path to content that replaces the file on disk (a
     pending edit). `available`, when given, is the set of paths that may be
@@ -159,39 +214,49 @@ def resolve(root, config, overrides=None, available=None):
     """
     reader = _Reader(root, overrides or {}, available)
     doc = reader.load(config, record=False)
+    _check_top_level_keys(doc, config)
     config_dir = posixpath.dirname(config)
-    subs = doc.get("subsystems")
-    if isinstance(subs, list):
-        subs = _normalized(subs, config_dir, config)
+    if isinstance(doc.get("subsystems"), list):
+        doc["subsystems"] = _normalized(doc["subsystems"], config_dir, config)
     if "include" in doc:
-        include = _join(config_dir, doc["include"], config)
+        include = _join(config_dir, _non_empty(doc, "include", "top-level"),
+                        config)
         base = reader.load(include)
+        _check_top_level_keys(base, include)
         if "include" in base:
             raise ManifestError(f"nested 'include' is not supported in {include}")
+        del doc["include"]
         base_subs = base.get("subsystems")
         if isinstance(base_subs, list):
             base_subs = _normalized(base_subs, posixpath.dirname(include),
                                     include)
-        # A list child merges into a list base by name; a [subsystems.<name>]
-        # child merges over the base's expanded view; a child with no
-        # subsystems keeps the base's.
-        if isinstance(base_subs, list) and isinstance(subs, list):
-            subs = _merge_entries(base_subs, subs)
-        elif isinstance(subs, dict) and isinstance(base_subs, (list, dict)):
-            base_views = (reader.expand(base_subs, include)
-                          if isinstance(base_subs, list)
-                          else _table_views(base_subs))
-            return _result(_merge_views(base_views, subs), reader)
-        elif subs is None:
-            subs = base_subs
-    if isinstance(subs, list):
-        return _result(reader.expand(subs, config), reader)
-    return _result(_table_views(subs or {}), reader)
+            base["subsystems"] = base_subs
+            # A list child merges into a list base by name; any other child
+            # [subsystems] merges over the base's expanded view.
+            if isinstance(doc.get("subsystems"), list):
+                base["subsystems"] = _merge_entries(
+                    base_subs, doc.pop("subsystems"), config)
+            elif "subsystems" in doc:
+                base["subsystems"] = reader.expand(base_subs, include)
+        _merge_tables(base, doc)
+        doc = base
+    if isinstance(doc.get("subsystems"), list):
+        doc["subsystems"] = reader.expand(doc["subsystems"], config)
+    subs = doc.get("subsystems")
+    if not isinstance(subs, dict):
+        raise ManifestError(f"{config}: missing [subsystems] table")
+    for name, table in subs.items():
+        if isinstance(table, dict) and "node" in table:
+            _non_empty(table, "node", f"[subsystems.{name}]")
+    return subs, sorted(reader.files)
 
 
-def _result(views, reader):
-    nodes = sorted({node for node in views.values() if node})
-    return nodes, sorted(reader.files)
+def resolve(root, config, overrides=None, available=None):
+    """(sorted node labels, sorted files read), from effective()."""
+    subs, files = effective(root, config, overrides, available)
+    nodes = {t["node"] for t in subs.values()
+             if isinstance(t, dict) and "node" in t}
+    return sorted(nodes), files
 
 
 def package_of(root, path):

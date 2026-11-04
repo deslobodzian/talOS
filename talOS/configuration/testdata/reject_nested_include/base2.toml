@@ -1,0 +1,3 @@
+[[subsystems]]
+name = "a"
+path = "a.toml"

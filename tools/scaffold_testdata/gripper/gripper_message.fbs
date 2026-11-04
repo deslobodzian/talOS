@@ -1,0 +1,15 @@
+namespace gripper;
+
+// What a producer asks for on its lane, /gripper/target/<source>. The node
+// drives the motor only while the robot is enabled and a lane of its target
+// policy is live.
+struct GripperTarget {
+  velocity_rps:double;
+}
+
+// What the gripper is doing, published every tick.
+struct GripperState {
+  enabled:bool;
+  velocity_rps:double;
+  connected:bool;
+}

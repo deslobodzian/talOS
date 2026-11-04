@@ -261,7 +261,7 @@ def talos_messages(
     )
     py_library(
         name = name + "_py",
-        deps = [":" + name + "_py_gen", "@pypi//flatbuffers"] + [_dep_target(dep, "_py") for dep in deps],
+        deps = [":" + name + "_py_gen", Label("@pypi//flatbuffers")] + [_dep_target(dep, "_py") for dep in deps],
         visibility = visibility,
     )
 

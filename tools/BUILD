@@ -20,6 +20,10 @@ py_test(
         "new_subsystem.py",
         "new_subsystem_test.py",
     ],
+    data = [
+        "//tools/scaffold_testdata/gripper:golden",
+        "//tools/scaffold_testdata/scaffold_py:golden",
+    ],
     legacy_create_init = False,
     main = "new_subsystem_test.py",
     deps = [":sync_manifest_lib"],
@@ -41,6 +45,7 @@ py_test(
     name = "sync_manifest_test",
     size = "small",
     srcs = ["sync_manifest_test.py"],
+    data = ["//talOS/configuration:resolution_cases"],
     legacy_create_init = False,
     deps = [":sync_manifest_lib"],
 )

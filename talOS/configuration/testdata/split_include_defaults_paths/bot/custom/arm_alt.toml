@@ -1,0 +1,6 @@
+[subsystem]
+name = "arm"
+defaults = "arm_defaults.toml"
+
+[motors.lift]
+can_id = 1

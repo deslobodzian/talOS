@@ -1,0 +1,9 @@
+include = "base.toml"
+
+[[subsystems]]
+name = "a"
+node = "//x:y"
+
+[[subsystems]]
+name = "a"
+node = "//x:z"

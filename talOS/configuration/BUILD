@@ -12,10 +12,19 @@ cc_library(
     ],
 )
 
+# Config trees with the expected parse decision, nodes and read files. The
+# parser (:test) and //tools:sync_manifest_test both run every case.
+filegroup(
+    name = "resolution_cases",
+    srcs = glob(["testdata/**"]),
+    visibility = ["//tools:__pkg__"],
+)
+
 cc_test(
     name = "test",
     size = "small",
     srcs = ["config_test.cc"],
+    data = [":resolution_cases"],
     deps = [
         ":configuration",
         "//talOS/hardware:config",

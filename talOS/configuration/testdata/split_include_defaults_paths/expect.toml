@@ -1,0 +1,14 @@
+# include + list merge by name, a custom `path` override, parent-directory
+# entry defaults winning over the file's own defaults, defaults supplying a
+# node, and file node winning over defaults node.
+config = "bot/robot.toml"
+accept = true
+nodes = ["//bot/arm:node", "//bot/wrist:file", "//py:intake"]
+files = [
+    "bot/base.toml",
+    "bot/custom/arm_alt.toml",
+    "bot/custom/arm_defaults.toml",
+    "bot/subsystems/intake.toml",
+    "bot/subsystems/wrist.toml",
+    "shared/wrist_defaults.toml",
+]

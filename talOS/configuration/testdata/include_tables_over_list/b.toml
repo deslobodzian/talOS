@@ -1,0 +1,3 @@
+[subsystem]
+name = "b"
+node = "//b:file"

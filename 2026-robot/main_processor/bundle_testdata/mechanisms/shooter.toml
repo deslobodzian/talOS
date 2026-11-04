@@ -1,0 +1,5 @@
+# Layered over ../../configuration/subsystems/shooter.toml (the entry's
+# `defaults`); only the loop period differs.
+[subsystem]
+name = "shooter"
+period_us = 10000

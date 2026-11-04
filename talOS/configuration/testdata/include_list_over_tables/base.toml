@@ -1,0 +1,2 @@
+[subsystems.a]
+node = "//a:node"

@@ -1,0 +1,3 @@
+[subsystem]
+name = "intake"
+node = "//bot/intake:node"

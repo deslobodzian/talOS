@@ -1,0 +1,5 @@
+nodes = 1
+
+[[subsystems]]
+name = "a"
+path = "a.toml"
