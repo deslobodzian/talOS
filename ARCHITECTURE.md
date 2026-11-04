@@ -123,8 +123,16 @@ locked, best effort (`talOS/process`).
   in a `.fbs` per package and built with `talos_messages`, which generates C++
   and Python, a `.bfbs` schema and a schema descriptor per struct, and fails
   the build on a numeric field without a unit suffix.
-- Every user topic's slot is 8-byte aligned, so a C++ and a Python endpoint
-  agree on the layout from the size alone.
+- Topics are typed by schema identity (`talos::Descriptor<M>`, name and
+  64-bit schema hash), not size alone. An attach with a mismatched schema
+  fails, naming both types.
+- Under the launcher, session-owned segments are created for every declared
+  topic before nodes spawn and unlinked at session end. Outside a session, the
+  last queue to close unlinks, and dead readers are reclaimed.
+- Dispatch logs (`.tlog` format version 5) carry each logged topic's schema
+  descriptor, allowing `log_dump` to decode payloads to named fields without
+  the recording build.
+- Every user topic's slot is 8-byte aligned, matching FlatBuffers struct rules.
 - The FlatBuffers namespace is the short subsystem name (`shooter`, `intake`,
   `drivetrain`); C++ includes `<package>/<file>_generated.h`, Python imports
   `<namespace>.<Struct>`.

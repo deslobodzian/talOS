@@ -222,9 +222,7 @@ nobody drives.
 
 ## D2. Self-describing topics (FlatBuffers reflection)
 
-**Status: stage 1 implemented (descriptors and field-name lint); attach
-checks, launcher-owned segments, descriptor-bearing logs and the reflection
-codec remain.** `talos_messages` compiles each schema to `<file>.bfbs` with
+**Status: implemented.** `talos_messages` compiles each schema to `<file>.bfbs` with
 `flatc --binary --schema --bfbs-filenames` and lints it in the same action
 (`talOS/build/descriptor_gen.cc` against `talOS/schema/unit_suffix.h`). It
 generates `<prefix>/<file>_descriptor.h` specializing `talos::Descriptor<M>`
@@ -264,11 +262,10 @@ own reflection:
 - **Field-name lint** against the METHODOLOGY §6 suffix table runs in the
   `talos_messages` action and fails the build.
 
-**Acceptance:**
+**Acceptance: passed.**
 - `log_dump` prints decoded fields for every topic.
 - A deliberately changed field type with the same size is rejected at attach.
 - The Python codec tests pass on reflection alone.
-
 ---
 
 ## D3. Telemetry from descriptors (framework node)

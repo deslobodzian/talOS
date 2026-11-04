@@ -242,9 +242,19 @@ runfiles tree instead, and `main.cc` chases `BUILD_WORKSPACE_DIRECTORY` back so
 both spellings behave the same.
 
 `:launcher_lib` depends on `//talOS/introspection:describe` and `:names` — the
-format and the naming rules, neither of which pulls in an event loop or shared
-memory. The launcher never opens a topic; it starts processes that do.
+format and the naming rules.
 
+## Session segments and logs
+
+Before spawning nodes, phase two calls `CreateSessionSegments` (`launcher.h`),
+which creates every declared topic as a session-owned RTMS segment with its
+schema name, schema hash, alignment, and slots. Nodes only attach. When the
+session ends, the launcher destroys its queues and unlinks all session segments.
+
+Recorded logs (`.tlog` format version 5) embed descriptors for each logged topic.
+`log_dump` (`//talOS/launcher:log_dump`) reads these descriptors and decodes
+recorded message payloads into named fields without requiring the original build
+environment.
 ## If you change the shape of `graph.json`
 
 Studio parses this document in TypeScript (`studio/src/system.ts`), and neither
