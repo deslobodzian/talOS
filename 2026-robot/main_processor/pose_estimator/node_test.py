@@ -11,6 +11,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+
 import talos
 from drivetrain import topics as drivetrain_topics
 from drivetrain.DrivetrainState import DrivetrainState
@@ -410,7 +411,6 @@ class EstimatorTest(unittest.TestCase):
                 self.assertIn(key, str(caught.exception))
 
 
-
 class BinaryTest(unittest.TestCase):
     def run_binary(self, *argv):
         resolver = runfiles.Create()
@@ -531,6 +531,7 @@ class BinaryTest(unittest.TestCase):
 
                     self.assertEqual(estimates[-1]["observation_accepted_count"], 1)
                     self.assertEqual(estimates[-1]["observation_rejected_count"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
