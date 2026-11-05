@@ -800,6 +800,7 @@ period_us = @PERIOD@
 # [[teleop.bindings]]
 # button = 3
 # while_held = { velocity_rps = 20.0 }
+
 # Which /@NAME@/target/<source> lanes drive the @NAME@ in each Driver Station
 # mode, highest priority first. Without this table [robot.targets] applies
 # (teleop = ["teleop"], autonomous = ["auto"]); listed modes replace it.
