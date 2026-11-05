@@ -1,6 +1,7 @@
 #include "talOS/driver_station/driver_station.h"
 
 #include <gtest/gtest.h>
+
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -20,8 +21,10 @@ TEST(DriverStationTest, RoundTripEncoding) {
   original.fms.match_number = 42;
   original.fms.replay_number = 1;
   original.fms.match_time_s = 135.5f;
-  std::snprintf(original.fms.game_specific_message, sizeof(original.fms.game_specific_message), "AMP");
-  std::snprintf(original.fms.event_name, sizeof(original.fms.event_name), "CMPTX");
+  std::snprintf(original.fms.game_specific_message,
+                sizeof(original.fms.game_specific_message), "AMP");
+  std::snprintf(original.fms.event_name, sizeof(original.fms.event_name),
+                "CMPTX");
 
   // Stick 0 connected
   original.joysticks[0].connected = true;
@@ -34,7 +37,8 @@ TEST(DriverStationTest, RoundTripEncoding) {
   original.joysticks[0].axes[2] = 0.0f;
   original.joysticks[0].axes[3] = 1.0f;
   original.joysticks[0].povs[0] = 90;
-  std::snprintf(original.joysticks[0].name, sizeof(original.joysticks[0].name), "Logitech Gamepad");
+  std::snprintf(original.joysticks[0].name, sizeof(original.joysticks[0].name),
+                "Logitech Gamepad");
 
   // Stick 1 connected
   original.joysticks[1].connected = true;
@@ -44,7 +48,8 @@ TEST(DriverStationTest, RoundTripEncoding) {
   original.joysticks[1].buttons = (1u << 2);
   original.joysticks[1].axes[0] = -0.2f;
   original.joysticks[1].axes[1] = 0.8f;
-  std::snprintf(original.joysticks[1].name, sizeof(original.joysticks[1].name), "Xbox Controller");
+  std::snprintf(original.joysticks[1].name, sizeof(original.joysticks[1].name),
+                "Xbox Controller");
 
   // Sticks 2..5 disconnected
 
@@ -65,7 +70,8 @@ TEST(DriverStationTest, RoundTripEncoding) {
   EXPECT_EQ(decoded.fms.match_number, original.fms.match_number);
   EXPECT_EQ(decoded.fms.replay_number, original.fms.replay_number);
   EXPECT_FLOAT_EQ(decoded.fms.match_time_s, original.fms.match_time_s);
-  EXPECT_STREQ(decoded.fms.game_specific_message, original.fms.game_specific_message);
+  EXPECT_STREQ(decoded.fms.game_specific_message,
+               original.fms.game_specific_message);
   EXPECT_STREQ(decoded.fms.event_name, original.fms.event_name);
 
   // Check Stick 0

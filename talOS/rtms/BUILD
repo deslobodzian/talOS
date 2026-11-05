@@ -19,7 +19,10 @@ cc_library(
 )
 
 # The schema variants are //talOS/schema's same-size type change fixtures.
-_VARIANTS = ["float_level", "int_level"]
+_VARIANTS = [
+    "float_level",
+    "int_level",
+]
 
 cc_test(
     name = "rtms_test",

@@ -259,8 +259,10 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
     entry.offset_ns = reg.offset_ns;
     write_name(entry.name, reg.name);
     entry.schema_hash = reg.schema.hash;
-    entry.schema_name_bytes = static_cast<std::uint32_t>(reg.schema.name.size());
-    entry.schema_bfbs_bytes = static_cast<std::uint32_t>(reg.schema.bfbs.size());
+    entry.schema_name_bytes =
+        static_cast<std::uint32_t>(reg.schema.name.size());
+    entry.schema_bfbs_bytes =
+        static_cast<std::uint32_t>(reg.schema.bfbs.size());
     entries.push_back(entry);
     const auto name = std::as_bytes(std::span{reg.schema.name});
     const auto bfbs = std::as_bytes(std::span{reg.schema.bfbs});

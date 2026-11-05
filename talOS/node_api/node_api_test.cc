@@ -40,7 +40,8 @@ struct Value {
 // Value's schema identity, as a binding passes its message class's.
 constexpr TalosSchema kValueSchema{"node_api_test.Value", 0x0123456789abcdefULL,
                                    nullptr, 0};
-constexpr TalosSchema kFloatSchema{"node_api_test.Speed", 0x5eedULL, nullptr, 0};
+constexpr TalosSchema kFloatSchema{"node_api_test.Speed", 0x5eedULL, nullptr,
+                                   0};
 
 // Relays /relay/in to /relay/out, scaled by its `gain` parameter.
 struct Relay {
@@ -548,8 +549,8 @@ struct Lanes {
 
 int32_t BuildLanes(TalosNode* node, void* user) {
   auto& l = *static_cast<Lanes*>(user);
-  l.target = talos_target_open(node, sizeof(float), alignof(float),
-                               &kFloatSchema);
+  l.target =
+      talos_target_open(node, sizeof(float), alignof(float), &kFloatSchema);
   // The roller writes its own subsystem's lane only in this test; the lint,
   // not the API, refuses that in a session.
   l.lane = talos_target_lane_open(node, "roller", "teleop", sizeof(float),

@@ -297,7 +297,7 @@ class RegistryMapping {
                                std::strerror(errno));
     }
 
-    struct stat status{};
+    struct stat status {};
     if (::fstat(fd, &status) < 0) {
       ::close(fd);
       throw std::runtime_error("registry fstat failed for " + path_);

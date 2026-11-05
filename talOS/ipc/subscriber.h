@@ -33,17 +33,14 @@ class Subscriber {
  public:
   explicit Subscriber(
       std::string_view topic,
-      RTMSOptions options = RTMSOptions{
-          .overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
-          .read_mode = ReadMode::SEQUENCE,
-      })
-      : topic_{topic},
-        queue_{topic_,
-               sizeof(Message),
-               alignof(Message),
-               talos::schema::Of<Message>(),
-               MAX_SLOTS,
-               options} {
+      RTMSOptions options =
+          RTMSOptions{
+              .overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+              .read_mode = ReadMode::SEQUENCE,
+          })
+      : topic_{topic}, queue_{topic_,           sizeof(Message),
+                              alignof(Message), talos::schema::Of<Message>(),
+                              MAX_SLOTS,        options} {
     reader_id_ = queue_.register_reader();
   }
 

@@ -355,9 +355,9 @@ Subscription<M> Node::subscribe(std::string_view topic, F on_message,
 
 template <Message M>
 Publisher<M> Node::publish(std::string_view topic) {
-  return Publisher<M>{this, detail::NodeAccess::add_publisher(
-                                *this, topic, sizeof(M), kMessageAlignment,
-                                schema::Of<M>())};
+  return Publisher<M>{
+      this, detail::NodeAccess::add_publisher(
+                *this, topic, sizeof(M), kMessageAlignment, schema::Of<M>())};
 }
 
 template <class T>

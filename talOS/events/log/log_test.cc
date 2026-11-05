@@ -75,8 +75,8 @@ Manifest MakeManifest() {
 std::size_t RecordsOffset() {
   std::size_t offset = sizeof(FileHeader);
   for (const auto& reg : MakeManifest()) {
-    offset += sizeof(ManifestEntry) + reg.schema.name.size() +
-              reg.schema.bfbs.size();
+    offset +=
+        sizeof(ManifestEntry) + reg.schema.name.size() + reg.schema.bfbs.size();
   }
   return offset;
 }

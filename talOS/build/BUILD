@@ -56,10 +56,10 @@ py_test(
     size = "small",
     srcs = ["descriptor_gen_lint_test.py"],
     data = [
-        ":descriptor_gen",
         "lint_fixtures/bad.bfbs",
         "lint_fixtures/good.bfbs",
         "lint_fixtures/included.bfbs",
+        ":descriptor_gen",
     ],
     env = {
         "TALOS_DESCRIPTOR_GEN": "$(rlocationpath :descriptor_gen)",

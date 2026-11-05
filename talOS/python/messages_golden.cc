@@ -30,8 +30,8 @@ int main() {
   Print("mixed_zero", Mixed());
   Print("mixed_top", Mixed(true, 1234.5678, Level::TOP, 4000000000u,
                            Inner(Mode::LOW, 0.25f), -0.75f));
-  Print("mixed_bottom", Mixed(false, -0.5, Level::BOTTOM, 7u,
-                              Inner(Mode::OFF, -8.0f), 1.0f));
+  Print("mixed_bottom",
+        Mixed(false, -0.5, Level::BOTTOM, 7u, Inner(Mode::OFF, -8.0f), 1.0f));
 
   Arrays arrays;
   const double samples[] = {1.5, -2.25, 1e9};
@@ -41,7 +41,8 @@ int main() {
   *arrays.mutable_inners()->GetMutablePointer(0) = Inner(Mode::LOW, 3.5f);
   *arrays.mutable_inners()->GetMutablePointer(1) = Inner(Mode::HIGH, -0.125f);
   const unsigned char channel[] = {1, 2, 3, 254, 255};
-  for (int i = 0; i < 5; ++i) arrays.mutable_channel_id()->Mutate(i, channel[i]);
+  for (int i = 0; i < 5; ++i)
+    arrays.mutable_channel_id()->Mutate(i, channel[i]);
   Print("arrays", arrays);
   Print("arrays_zero", Arrays());
   return 0;

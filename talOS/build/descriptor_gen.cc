@@ -157,8 +157,9 @@ int write_cc(const Input& in, std::string_view file, const char* out_path,
   for (const reflection::Object* object : in.structs) {
     const std::string_view name = object->name()->string_view();
     const std::size_t dot = name.rfind('.');
-    const std::string_view ns =
-        dot == std::string_view::npos ? std::string_view{} : name.substr(0, dot);
+    const std::string_view ns = dot == std::string_view::npos
+                                    ? std::string_view{}
+                                    : name.substr(0, dot);
     const std::string_view leaf =
         dot == std::string_view::npos ? name : name.substr(dot + 1);
     if (ns.empty()) {

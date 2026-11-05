@@ -4,8 +4,8 @@
 #include <string>
 #include <vector>
 
-#include "talOS/events/context.h"
 #include "events_test/events_test_message_generated.h"
+#include "talOS/events/context.h"
 #include "talOS/events/handles.h"
 #include "talOS/events/time.h"
 

@@ -23,7 +23,7 @@ std::vector<std::byte> read_whole_file(std::string_view path) {
                             "LogReader: open failed for " + std::string{path});
   }
 
-  struct stat st{};
+  struct stat st {};
   if (::fstat(fd, &st) != 0) {
     const int saved_errno = errno;
     ::close(fd);

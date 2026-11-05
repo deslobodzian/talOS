@@ -19,9 +19,9 @@ namespace talos::event {
 // schema descriptor. Tables have no compile-time size, so a slot could not
 // hold them and replay could not compare them byte for byte.
 template <typename Message>
-concept LoopMessage = std::is_trivially_copyable_v<Message> &&
-                      ipc::NotDerivedFromFlatbufferTable<Message> &&
-                      Described<Message>;
+concept LoopMessage =
+    std::is_trivially_copyable_v<Message> &&
+    ipc::NotDerivedFromFlatbufferTable<Message> && Described<Message>;
 
 // Adapts a byte payload to a typed handler.
 //
@@ -99,11 +99,10 @@ Timer<Loop> make_timer(Loop& loop, std::string_view name, Class* instance) {
 
 template <LoopMessage Message, auto Method, typename Loop, typename Class>
 std::uint16_t watch(Loop& loop, std::string_view topic, Class* instance) {
-  return loop.register_watcher(topic,
-                               static_cast<std::uint32_t>(sizeof(Message)),
-                               static_cast<std::uint32_t>(alignof(Message)),
-                               schema::Of<Message>(),
-                               make_message_thunk<Message, Method>(instance));
+  return loop.register_watcher(
+      topic, static_cast<std::uint32_t>(sizeof(Message)),
+      static_cast<std::uint32_t>(alignof(Message)), schema::Of<Message>(),
+      make_message_thunk<Message, Method>(instance));
 }
 
 template <LoopMessage Message, typename Loop>

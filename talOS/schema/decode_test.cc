@@ -19,8 +19,12 @@ std::span<const std::byte> BytesOf(const T& value) {
 
 TEST(Decode, NamesEveryFieldInDeclarationOrder) {
   const schema_test::Mixed mixed{
-      true, 1.5, schema_test::Level::TOP, 7,
-      schema_test::Inner{schema_test::Mode::LOW, 0.25f}, 0.5f};
+      true,
+      1.5,
+      schema_test::Level::TOP,
+      7,
+      schema_test::Inner{schema_test::Mode::LOW, 0.25f},
+      0.5f};
   EXPECT_EQ(DecodeToText(Of<schema_test::Mixed>(), BytesOf(mixed)),
             "{flag: true, position_m: 1.5, level: TOP, sample_count: 7, "
             "inner: {mode: LOW, offset_m: 0.25}, speed_frac: 0.5}");
@@ -67,9 +71,8 @@ TEST(Decode, ALayoutWithoutSchemaBytesPrintsHex) {
 
   std::vector<std::byte> long_bytes(kMaxHexBytes + 10, std::byte{0xff});
   const std::string text = DecodeToText(Bytes(), long_bytes);
-  EXPECT_EQ(text.size(),
-            std::string{"bytes=74 hex="}.size() + 2 * kMaxHexBytes +
-                std::string{"...(+10)"}.size())
+  EXPECT_EQ(text.size(), std::string{"bytes=74 hex="}.size() +
+                             2 * kMaxHexBytes + std::string{"...(+10)"}.size())
       << text;
 }
 

@@ -110,7 +110,8 @@ constexpr std::uint64_t EnvelopeHash(std::uint64_t inner) {
 template <class M>
 struct EnvelopeName {
   static constexpr std::string_view kInner = Descriptor<M>::kName;
-  static constexpr std::size_t kSize = kEnvelopePrefix.size() + kInner.size() + 1;
+  static constexpr std::size_t kSize =
+      kEnvelopePrefix.size() + kInner.size() + 1;
   static constexpr std::array<char, kSize> kStorage = [] {
     std::array<char, kSize> out{};
     std::size_t at = 0;
@@ -126,12 +127,14 @@ struct EnvelopeName {
 template <Described M>
 Identity Of() {
   const std::span<const std::uint8_t> bfbs = Descriptor<M>::kBfbs;
-  return Identity{std::string{Descriptor<M>::kName}, Descriptor<M>::kHash,
-                  std::string{reinterpret_cast<const char*>(bfbs.data()),
-                              bfbs.size()}};
+  return Identity{
+      std::string{Descriptor<M>::kName}, Descriptor<M>::kHash,
+      std::string{reinterpret_cast<const char*>(bfbs.data()), bfbs.size()}};
 }
 
-inline Identity Bytes() { return Identity{std::string{kBytesName}, BytesHash(), {}}; }
+inline Identity Bytes() {
+  return Identity{std::string{kBytesName}, BytesHash(), {}};
+}
 
 // A TargetEnvelope around `message` (talOS/devices/target.h).
 inline Identity Envelope(const Identity& message) {

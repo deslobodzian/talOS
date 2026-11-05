@@ -108,7 +108,8 @@ struct RTMSOptions {
 };
 
 // The segment format, checked before any other header field is trusted.
-inline constexpr std::uint64_t kRtmsMagic = 0x32534D54534F4C41ULL;  // "ALOSTMS2"
+inline constexpr std::uint64_t kRtmsMagic =
+    0x32534D54534F4C41ULL;  // "ALOSTMS2"
 inline constexpr std::uint64_t kRtmsVersion = 3;
 
 // RTMSHeader::lifetime: a session-owned flag, a closing flag, and the count

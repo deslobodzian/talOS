@@ -17,7 +17,8 @@ class RawPublisher {
                         const talos::schema::Identity& schema,
                         RTMSOptions options = RTMSOptions{})
       : topic_{topic},
-        queue_{topic, size, alignment, schema, MAX_SLOTS, publishing(options)} {}
+        queue_{topic, size, alignment, schema, MAX_SLOTS, publishing(options)} {
+  }
   WriteStatus write(std::span<const std::byte> message) {
     return queue_.write(message);
   }

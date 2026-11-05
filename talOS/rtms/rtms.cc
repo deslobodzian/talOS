@@ -94,7 +94,8 @@ class HeaderView {
     if (sized) {
       void* mapped =
           ::mmap(nullptr, sizeof(RTMSHeader), PROT_READ, MAP_SHARED, fd, 0);
-      if (mapped != MAP_FAILED) header_ = static_cast<const RTMSHeader*>(mapped);
+      if (mapped != MAP_FAILED)
+        header_ = static_cast<const RTMSHeader*>(mapped);
     }
     ::close(fd);
   }
@@ -169,11 +170,11 @@ RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
     throw std::invalid_argument("slots must be at least 2");
   }
 
-  if (schema.name.empty() || schema.name.size() > talos::schema::kMaxSchemaName) {
-    throw std::invalid_argument("RTMS topic " + std::string{path} +
-                                " needs a schema name of 1 to " +
-                                std::to_string(talos::schema::kMaxSchemaName) +
-                                " characters");
+  if (schema.name.empty() ||
+      schema.name.size() > talos::schema::kMaxSchemaName) {
+    throw std::invalid_argument(
+        "RTMS topic " + std::string{path} + " needs a schema name of 1 to " +
+        std::to_string(talos::schema::kMaxSchemaName) + " characters");
   }
 
   open(schema);
@@ -188,9 +189,9 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
   };
   const auto schema_matches = [&schema](const RTMSHeader& header) {
     return header.schema_hash == schema.hash &&
-           std::string_view{header.schema_name,
-                            ::strnlen(header.schema_name,
-                                      sizeof(header.schema_name))} ==
+           std::string_view{
+               header.schema_name,
+               ::strnlen(header.schema_name, sizeof(header.schema_name))} ==
                schema.name;
   };
 
@@ -323,8 +324,8 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
     header_ = header;
     return;
   }
-  throw std::runtime_error("RTMS: " + path_ +
-                           " stayed closing; its last holder never unlinked it");
+  throw std::runtime_error(
+      "RTMS: " + path_ + " stayed closing; its last holder never unlinked it");
 }
 
 void RTMSQueue::close() noexcept {

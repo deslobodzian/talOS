@@ -1188,9 +1188,7 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   EXPECT_EQ(options.bundle_config_sha256, "abc123");
 
   // A manifest that is not TOML is an error, not a silently empty bundle.
-  {
-    std::ofstream{bundle_dir + "/bundle_manifest.toml"} << "nodes = [\n";
-  }
+  { std::ofstream{bundle_dir + "/bundle_manifest.toml"} << "nodes = [\n"; }
   LauncherOptions broken;
   broken.bundle_dir = bundle_dir;
   EXPECT_FALSE(LoadBundle(broken, error));

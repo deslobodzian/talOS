@@ -112,8 +112,7 @@ class Target {
   explicit Target(Node& node)
       : node_{&node},
         index_{detail::TargetAccess::open_target(node, sizeof(M), alignof(M),
-                                                 schema::Of<M>())} {
-  }
+                                                 schema::Of<M>())} {}
 
   // The selected lane's message, or null: robot disabled, Driver Station
   // stale or in a mode with no live lane of this generation.
@@ -147,9 +146,8 @@ class TargetLane {
   TargetLane() = default;
   TargetLane(Node& node, std::string_view subsystem, std::string_view source)
       : node_{&node},
-        index_{detail::TargetAccess::open_lane(node, subsystem, source,
-                                               sizeof(M), alignof(M),
-                                               schema::Of<M>())} {}
+        index_{detail::TargetAccess::open_lane(
+            node, subsystem, source, sizeof(M), alignof(M), schema::Of<M>())} {}
 
   // Asks for `message` (active = 1) under the mode generation this node's
   // Driver Station shows now (0, which no consumer accepts, while it shows

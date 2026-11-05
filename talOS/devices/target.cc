@@ -223,9 +223,8 @@ std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
       "/" + std::string{subsystem} + "/target/" + std::string{source};
   auto& lanes = node.extension<Targets>().lanes;
   lanes.push_back(LaneState{
-      .publisher = NodeAccess::add_publisher(node, topic, envelope,
-                                             kMessageAlignment,
-                                             schema::Envelope(message)),
+      .publisher = NodeAccess::add_publisher(
+          node, topic, envelope, kMessageAlignment, schema::Envelope(message)),
       .bytes = bytes,
       .alignment = alignment,
       // Subscribed here, so the producer drains the Driver Station right
