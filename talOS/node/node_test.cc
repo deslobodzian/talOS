@@ -570,7 +570,8 @@ struct Result {
   std::string output;
 };
 
-Result RunBinary(const std::string& args, const char* binary = "TALOS_TEST_NODE") {
+Result RunBinary(const std::string& args,
+                 const char* binary = "TALOS_TEST_NODE") {
   const std::string command = "'" + Runfile(binary) + "' " + args + " 2>&1";
   FILE* pipe = ::popen(command.c_str(), "r");
   if (pipe == nullptr) throw std::runtime_error("popen failed");
@@ -640,12 +641,14 @@ std::string TempFile(const std::string& name) {
 // the declared graph.
 TEST(Binary, AGraphReaderDescribesWhatTheGraphItWasGivenHolds) {
   // First pass: no graph yet; it says it reads one and registers nothing.
-  const Result first = RunBinary("--describe " + ConfigFlag(), "TALOS_GRAPH_NODE");
+  const Result first =
+      RunBinary("--describe " + ConfigFlag(), "TALOS_GRAPH_NODE");
   ASSERT_EQ(first.status, 0) << first.output;
   introspect::Description described;
   std::string error;
   ASSERT_TRUE(introspect::DescribeReader::Parse(first.output, described, error))
-      << error << "\n" << first.output;
+      << error << "\n"
+      << first.output;
   EXPECT_TRUE(described.reads_graph);
   EXPECT_EQ(described.sources.size(), 1u);  // its tick timer
 
@@ -664,7 +667,8 @@ TEST(Binary, AGraphReaderDescribesWhatTheGraphItWasGivenHolds) {
   const Result second = RunBinary(
       "--describe --graph '" + graph + "' " + ConfigFlag(), "TALOS_GRAPH_NODE");
   ASSERT_EQ(second.status, 0) << second.output;
-  ASSERT_TRUE(introspect::DescribeReader::Parse(second.output, described, error))
+  ASSERT_TRUE(
+      introspect::DescribeReader::Parse(second.output, described, error))
       << error;
   const auto observed = std::find_if(
       described.sources.begin(), described.sources.end(),
@@ -677,10 +681,10 @@ TEST(Binary, AGraphReaderDescribesWhatTheGraphItWasGivenHolds) {
   EXPECT_EQ(observed->bfbs, schema::Of<Count>().bfbs);
 
   // Run for real without a graph: it cannot be built, and says how to fix it.
-  const Result run = RunBinary("--sim --duration-s 1 --log '" +
-                                   TempFile("graph_node.tlog") + "' " +
-                                   ConfigFlag(),
-                               "TALOS_GRAPH_NODE");
+  const Result run =
+      RunBinary("--sim --duration-s 1 --log '" + TempFile("graph_node.tlog") +
+                    "' " + ConfigFlag(),
+                "TALOS_GRAPH_NODE");
   EXPECT_NE(run.status, 0);
   EXPECT_NE(run.output.find("--graph"), std::string::npos) << run.output;
 }
@@ -716,8 +720,7 @@ struct GraphReader {
 };
 
 struct CountPublisher {
-  explicit CountPublisher(Node& node)
-      : out{node.publish<Count>("state")} {}
+  explicit CountPublisher(Node& node) : out{node.publish<Count>("state")} {}
   Publisher<Count> out;
 };
 
@@ -763,7 +766,11 @@ TEST(BytePublisher, OpensRtmsOnFirstSendAndDropsNewestWhenFull) {
   ASSERT_TRUE(ShmSegmentExists(topic));
 
   RTMSQueue reader_queue{
-      topic, 64, kMessageAlignment, schema::Bytes(), 4,
+      topic,
+      64,
+      kMessageAlignment,
+      schema::Bytes(),
+      4,
       RTMSOptions{.overflow_policy = OverflowPolicy::DROP_NEWEST,
                   .read_mode = ReadMode::SEQUENCE}};
   const auto reader = reader_queue.register_reader();

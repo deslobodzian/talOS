@@ -11,7 +11,8 @@ class Observer {
  public:
   explicit Observer(talos::Node& node) {
     using talos::detail::NodeAccess;
-    const talos::detail::DeclaredGraph* graph = NodeAccess::declared_graph(node);
+    const talos::detail::DeclaredGraph* graph =
+        NodeAccess::declared_graph(node);
     if (graph == nullptr) return;  // the launcher's first --describe pass
     for (const auto& described : *graph) {
       for (const auto& source : described.sources) {

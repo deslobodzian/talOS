@@ -419,8 +419,8 @@ inline std::vector<Diagnostic> LintGraph(
               "used with two schemas: " +
                   schema::Describe(topic.schema, topic.schema_hash) + " by " +
                   topic.first_schema_from + ", " +
-                  schema::Describe(source.schema, source.schema_hash) +
-                  " by " + node.name);
+                  schema::Describe(source.schema, source.schema_hash) + " by " +
+                  node.name);
         }
       }
       if (source.message_bytes != 0) {

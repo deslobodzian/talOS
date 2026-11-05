@@ -146,7 +146,8 @@ inline void AppendJsonString(std::string& out, std::string_view value) {
 inline std::string HexHash(std::uint64_t hash) {
   static constexpr char kHex[] = "0123456789abcdef";
   std::string out = "0x";
-  for (int shift = 60; shift >= 0; shift -= 4) out += kHex[(hash >> shift) & 0xF];
+  for (int shift = 60; shift >= 0; shift -= 4)
+    out += kHex[(hash >> shift) & 0xF];
   return out;
 }
 
@@ -358,7 +359,8 @@ class DescribeReader {
         std::string hash;
         std::size_t at_hash = 0;
         if (!Field(entry, "schema_hash", at_hash) ||
-            !String(entry, at_hash, hash) || !ParseHex(hash, source.schema_hash)) {
+            !String(entry, at_hash, hash) ||
+            !ParseHex(hash, source.schema_hash)) {
           error = "source '" + source.name + "' has no schema_hash";
           return false;
         }

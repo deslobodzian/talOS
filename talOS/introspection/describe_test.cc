@@ -17,13 +17,13 @@ event::Manifest sample_manifest() {
                       .kind = event::SourceKind::TIMER,
                       .name = "swerve",
                       .period_ns = 5'000'000});
-  manifest.push_back({.id = 1,
-                      .kind = event::SourceKind::WATCHER,
-                      .name = "/drivetrain/target",
-                      .message_bytes = 48,
-                      .alignment = 8,
-                      .schema = {"drivetrain.ChassisTarget",
-                                 0xfedcba9876543210ULL}});
+  manifest.push_back(
+      {.id = 1,
+       .kind = event::SourceKind::WATCHER,
+       .name = "/drivetrain/target",
+       .message_bytes = 48,
+       .alignment = 8,
+       .schema = {"drivetrain.ChassisTarget", 0xfedcba9876543210ULL}});
   manifest.push_back({.id = 2,
                       .kind = event::SourceKind::FETCHER,
                       .name = "/driver_station/state",
@@ -102,8 +102,7 @@ TEST(Describe, RoundTripsEndpointFlags) {
   // looks each up by key, so a missing key must not shift the answer onto the
   // next source.
   const Description written = DescribeManifest(
-      "driver",
-      "//2026-robot/main_processor/driver:node", sample_manifest(),
+      "driver", "//2026-robot/main_processor/driver:node", sample_manifest(),
       kSlots,
       {{"/hw/request/drivetrain",
         naming::kSourceFlagExternal | naming::kSourceFlagOptional},
@@ -131,9 +130,9 @@ TEST(Describe, RoundTripsSchemaBytesObserversAndGraphReaders) {
   manifest[1].schema.bfbs = bytes;               // 256 bytes: two '='
   manifest[2].schema.bfbs = bytes.substr(0, 5);  // one '='
   manifest[3].schema.bfbs = bytes.substr(7, 3);  // none
-  Description written = DescribeManifest(
-      "telemetry", "//talOS/telemetry:node", manifest, kSlots,
-      {{"/drivetrain/target", naming::kSourceFlagObserver}});
+  Description written =
+      DescribeManifest("telemetry", "//talOS/telemetry:node", manifest, kSlots,
+                       {{"/drivetrain/target", naming::kSourceFlagObserver}});
   written.reads_graph = true;
   ASSERT_TRUE(written.sources[1].observer());
   EXPECT_EQ(written.sources[1].bfbs, bytes);
@@ -148,8 +147,8 @@ TEST(Describe, RoundTripsSchemaBytesObserversAndGraphReaders) {
 }
 
 TEST(Describe, RejectsMalformedSchemaBytes) {
-  std::string json = DescribeToJson(
-      DescribeManifest("d", "//d:d", sample_manifest(), kSlots));
+  std::string json =
+      DescribeToJson(DescribeManifest("d", "//d:d", sample_manifest(), kSlots));
   const std::size_t at = json.find("\"bfbs\": \"\"");
   ASSERT_NE(at, std::string::npos);
   json.replace(at, 10, "\"bfbs\": \"abc\"");
@@ -183,9 +182,8 @@ TEST(Describe, DeclaredGraphRoundTripsEveryNode) {
 }
 
 TEST(Describe, RoundTripsANodeThatRegisteredNothing) {
-  const Description written =
-      DescribeManifest("empty", "//example/empty:node", event::Manifest{},
-                       kSlots);
+  const Description written = DescribeManifest("empty", "//example/empty:node",
+                                               event::Manifest{}, kSlots);
 
   Description read;
   std::string error;
@@ -215,8 +213,8 @@ TEST(Describe, RoundTripsNamesThatNeedEscaping) {
 TEST(Describe, WritesTheKindNamesTheRegistryUses) {
   // Not a formatting preference: the registry and the log print kinds with
   // event::to_string, and a viewer joining declared to running matches on them.
-  const std::string json = DescribeToJson(
-      DescribeManifest("drivetrain", "//x:drivetrain", sample_manifest(), kSlots));
+  const std::string json = DescribeToJson(DescribeManifest(
+      "drivetrain", "//x:drivetrain", sample_manifest(), kSlots));
   EXPECT_NE(json.find("\"kind\": \"TIMER\""), std::string::npos);
   EXPECT_NE(json.find("\"kind\": \"WATCHER\""), std::string::npos);
   EXPECT_NE(json.find("\"kind\": \"FETCHER\""), std::string::npos);
@@ -303,7 +301,8 @@ TEST(Describe, ReadsThroughOutputPrintedAheadOfTheJson) {
   // sloppiness: the alternative is a launch that reports a node as
   // undescribable because a library it links said hello.
   const Description written =
-      DescribeManifest("odometry", "//2026-robot/main_processor/odometry:node", sample_manifest(), kSlots);
+      DescribeManifest("odometry", "//2026-robot/main_processor/odometry:node",
+                       sample_manifest(), kSlots);
 
   Description read;
   std::string error;

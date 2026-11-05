@@ -18,30 +18,14 @@ struct SuffixUnit {
 
 // The unit suffixes and their display units (docs/METHODOLOGY.md §6).
 inline constexpr std::array<SuffixUnit, 25> kUnitSuffixTable = {{
-    {"_ns", "ns"},
-    {"_us", "us"},
-    {"_m", "m"},
-    {"_mps", "m/s"},
-    {"_mps2", "m/s²"},
-    {"_rad", "rad"},
-    {"_radps", "rad/s"},
-    {"_radps2", "rad/s²"},
-    {"_rot", "rot"},
-    {"_rps", "rot/s"},
-    {"_rps2", "rot/s²"},
-    {"_v", "V"},
-    {"_a", "A"},
-    {"_w", "W"},
-    {"_degc", "°C"},
-    {"_kg", "kg"},
-    {"_n", "N"},
-    {"_nm", "N·m"},
-    {"_frac", ""},
-    {"_duty", ""},
-    {"_ratio", ""},
-    {"_count", ""},
-    {"_index", ""},
-    {"_id", ""},
+    {"_ns", "ns"},       {"_us", "us"},         {"_m", "m"},
+    {"_mps", "m/s"},     {"_mps2", "m/s²"},     {"_rad", "rad"},
+    {"_radps", "rad/s"}, {"_radps2", "rad/s²"}, {"_rot", "rot"},
+    {"_rps", "rot/s"},   {"_rps2", "rot/s²"},   {"_v", "V"},
+    {"_a", "A"},         {"_w", "W"},           {"_degc", "°C"},
+    {"_kg", "kg"},       {"_n", "N"},           {"_nm", "N·m"},
+    {"_frac", ""},       {"_duty", ""},         {"_ratio", ""},
+    {"_count", ""},      {"_index", ""},        {"_id", ""},
     {"_mask", ""},
 }};
 
@@ -63,7 +47,8 @@ constexpr bool has_unit_suffix(std::string_view name) {
   return false;
 }
 
-// Display unit for a field name derived from its suffix, or empty string if none.
+// Display unit for a field name derived from its suffix, or empty string if
+// none.
 constexpr std::string_view unit_for_field(std::string_view name) {
   for (const auto& entry : kUnitSuffixTable) {
     if (name.size() > entry.suffix.size() &&
