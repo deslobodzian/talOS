@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 
@@ -32,6 +34,10 @@ class Drivetrain {
         // on a robot: an integrated heading drifts with no absolute reference.
         integrate_heading_{
             node.param<bool>("integrate_heading", node.simulation())},
+        max_linear_accel_mps2_{
+            node.param<double>("max_linear_accel_mps2", 0.0)},
+        max_angular_accel_radps2_{
+            node.param<double>("max_angular_accel_radps2", 0.0)},
         target_{node},
         state_{node.publish<DrivetrainState>(topics::kState)} {
     for (std::size_t i = 0; i < kModuleCount; ++i) {
@@ -61,6 +67,10 @@ class Drivetrain {
 
     ChassisSpeeds speeds{};
     const ChassisTarget* target = target_.get();
+    const bool valid_target =
+        connected && target != nullptr && std::isfinite(target->vx_mps()) &&
+        std::isfinite(target->vy_mps()) && std::isfinite(target->omega_radps());
+    if (!valid_target) commanded_speeds_ = {0.0, 0.0, 0.0};
     if (connected) {
       for (std::size_t i = 0; i < kModuleCount; ++i) {
         modules_[i] = geometry::SwerveModulePosition{
@@ -70,10 +80,31 @@ class Drivetrain {
             ToRadians(measured[i].steer_rot).value()};
       }
       speeds = kinematics_.ToChassisSpeeds(measured);
-      if (target != nullptr) {
-        const auto setpoints = kinematics_.ToModuleStates(
-            {target->vx_mps(), target->vy_mps(), target->omega_radps()},
-            measured, std::chrono::duration<double>{node_.period()}.count());
+      if (valid_target) {
+        const double dt_s =
+            std::chrono::duration<double>{node_.period()}.count();
+        double dx = target->vx_mps() - commanded_speeds_.vx_mps;
+        double dy = target->vy_mps() - commanded_speeds_.vy_mps;
+        if (std::isfinite(max_linear_accel_mps2_) &&
+            max_linear_accel_mps2_ > 0.0 && dt_s > 0.0) {
+          const double delta = std::hypot(dx, dy);
+          const double limit = max_linear_accel_mps2_ * dt_s;
+          if (delta > limit) {
+            dx *= limit / delta;
+            dy *= limit / delta;
+          }
+        }
+        double domega = target->omega_radps() - commanded_speeds_.omega_radps;
+        if (std::isfinite(max_angular_accel_radps2_) &&
+            max_angular_accel_radps2_ > 0.0 && dt_s > 0.0) {
+          const double limit = max_angular_accel_radps2_ * dt_s;
+          domega = std::clamp(domega, -limit, limit);
+        }
+        commanded_speeds_.vx_mps += dx;
+        commanded_speeds_.vy_mps += dy;
+        commanded_speeds_.omega_radps += domega;
+        const auto setpoints =
+            kinematics_.ToModuleStates(commanded_speeds_, measured, dt_s);
         for (std::size_t i = 0; setpoints && i < kModuleCount; ++i) {
           drive_[i].set_velocity((*setpoints)[i].drive_rps);
           steer_[i].set_position((*setpoints)[i].steer_rot);
@@ -110,6 +141,9 @@ class Drivetrain {
   std::array<talos::Motor, kModuleCount> steer_;
   talos::Gyro gyro_;
   bool integrate_heading_;
+  double max_linear_accel_mps2_;
+  double max_angular_accel_radps2_;
+  ChassisSpeeds commanded_speeds_{0.0, 0.0, 0.0};
   double yaw_rad_ = 0;
   std::array<geometry::SwerveModulePosition, kModuleCount> modules_{};
   talos::Target<ChassisTarget> target_;

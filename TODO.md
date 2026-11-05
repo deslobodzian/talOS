@@ -71,6 +71,13 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
 - [x] `examples/external_subsystem/bundle_test.py` now installs through `deploy.sh`, exercising the real deployment path rather than relocating with `copytree`.
 - [x] CI includes a `macos-latest` job, and documentation drift is corrected for the current hardware, simulation, control and deployment APIs.
 
+## Full-stack validation & runtime control / Wave 4 (2026-11-05)
+
+- [x] `//2026-robot/main_processor/simulation:startup_test` covers the full nine-node closed loop across disabled → auto → teleop → disabled and `SIGSTOP`/`SIGCONT` fault injection. `.gitignore` no longer ignores `MODULE.bazel.lock`.
+- [x] Pigeon2 `offset_rot` (`MountPoseYaw`) and `inverted` are supported across `config.cc`, `PhoenixBackend`, `PhysicsSimBackend` and `SimBackend`. Physics simulation preserves rotor positions across resets; runtime `Motor::rezero` and `Gyro::rezero` are exposed in C++, C ABI v18 and Python.
+- [x] Drivetrain translational and rotational acceleration limits are configurable with `max_linear_accel_mps2` and `max_angular_accel_radps2`, with immediate neutral/reset on disable or target release.
+- [x] `//talOS/launcher:log_dump` supports `--node`, `--topic`, `--since-ms` and `--until-ms` filtering and `--format text|jsonl|csv` export, covered by `//talOS/launcher:log_dump_test`.
+
 ## Decisions taken
 
 - [x] Odometry when the RIO link drops: hold. `Drivetrain` clears `modules_valid`/`yaw_valid`, zeroes speeds and keeps the last module positions while samples are stale.

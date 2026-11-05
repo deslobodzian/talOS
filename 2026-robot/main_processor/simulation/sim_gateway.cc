@@ -34,6 +34,15 @@ double Seconds(const std::string& text) {
   return value;
 }
 
+uint16_t Port(const std::string& text) {
+  std::size_t used = 0;
+  const int value = std::stoi(text, &used);
+  if (used != text.size() || value <= 0 || value > 65535) {
+    throw std::invalid_argument("port must be between 1 and 65535");
+  }
+  return static_cast<uint16_t>(value);
+}
+
 std::vector<Phase> ParseSchedule(const std::string& spec) {
   std::vector<Phase> phases;
   std::size_t start = 0;
@@ -94,10 +103,16 @@ int main(int argc, char** argv) {
     ds::Alliance alliance = ds::Alliance::kBlue;
     bool physics = false;
     const char* config_path = nullptr;
+    uint16_t local_port = 5802;
+    uint16_t remote_port = 5803;
     for (int i = 1; i < argc; ++i) {
       const std::string arg{argv[i]};
       if (arg == "--physics") {
         physics = true;
+      } else if (arg == "--port" && i + 1 < argc) {
+        local_port = Port(argv[++i]);
+      } else if (arg == "--remote-port" && i + 1 < argc) {
+        remote_port = Port(argv[++i]);
       } else if (arg == "--duration-s" && i + 1 < argc) {
         const std::string value = argv[++i];
         duration_s = value == "0" ? 0 : Seconds(value);
@@ -117,7 +132,8 @@ int main(int argc, char** argv) {
       } else {
         throw std::invalid_argument(
             "usage: sim_gateway --config PATH [--physics] [--duration-s N] "
-            "[--mode-schedule mode:seconds,...] [--alliance blue|red]");
+            "[--mode-schedule mode:seconds,...] [--alliance blue|red] "
+            "[--port N] [--remote-port N]");
       }
     }
     if (config_path == nullptr) {
@@ -155,7 +171,7 @@ int main(int argc, char** argv) {
       }
     }
     talos::hardware::Endpoint endpoint{gateway};
-    if (endpoint.Open("127.0.0.1", 5802, "127.0.0.1", 5803) !=
+    if (endpoint.Open("127.0.0.1", local_port, "127.0.0.1", remote_port) !=
         talos::protocol::UdpStatus::kOk) {
       throw std::runtime_error("cannot open simulation socket");
     }

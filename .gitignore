@@ -42,7 +42,6 @@
 
 # Bazel stuff
 bazel-*
-*MODULE.bazel.lock
 
 # hedron_compile_commands output
 compile_commands.json

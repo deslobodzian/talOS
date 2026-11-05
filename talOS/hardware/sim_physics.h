@@ -308,8 +308,9 @@ class PhysicsSimBackend final : public Backend {
         // Pigeon yaw comes from simulated chassis motion, never
         // from a motor demand directly.
         out.valid = true;
-        out.position_rot = yaw_rot_;
-        out.velocity_rps = yaw_rate_rps_;
+        const double sign = s.inverted ? -1.0 : 1.0;
+        out.position_rot = (yaw_rot_ + s.offset_rot) * sign;
+        out.velocity_rps = yaw_rate_rps_ * sign;
       } else {
         // CANcoder mirrors its linked mechanism through the boundary.
         out.valid = true;
@@ -404,9 +405,9 @@ class PhysicsSimBackend final : public Backend {
   }
   // Fault injection for reset handling. The next gateway Tick
   // reports these logical IDs as reset; BeginRestoreAfterReset re-applies the
-  // motor-to-sensor mapping and zeroes rotor states, mirroring a device that
-  // lost its configuration and position across the reset. The gateway drops
-  // obsolete demand separately via Neutral/epoch bump.
+  // motor-to-sensor mapping while preserving physical rotor positions. Only
+  // velocities and outputs reset; the gateway drops obsolete demand separately
+  // via Neutral/epoch bump.
   void SimulateDeviceReset(uint16_t id) { pending_resets_.push_back(id); }
   bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override {
     reset_ids = pending_resets_;
@@ -414,7 +415,7 @@ class PhysicsSimBackend final : public Backend {
     return !reset_ids.empty();
   }
   void BeginRestoreAfterReset() override {
-    axes_.fill(AxisState{});
+    for (auto& axis : axes_) axis.rotor_velocity_rps = 0.0;
     profiles_.fill(Profile{});
     commands_.fill(MotorRequest{});
     applied_volts_.fill(0.0);

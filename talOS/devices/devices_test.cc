@@ -401,6 +401,57 @@ TEST(Devices, GettersReadTheLatchedFeedback) {
   EXPECT_DOUBLE_EQ(mech.gyro.yaw_rate(), -0.5);
 }
 
+TEST(Devices, RezeroSharesSoftwareFramesAndPreservesHardwareLimits) {
+  std::string toml{kRobotToml};
+  toml.insert(toml.find("[subsystems.mech.digital_outputs"),
+              "soft_limits = true\nreverse_limit_rot = -0.5\n"
+              "forward_limit_rot = 0.5\n");
+  auto sim = Sim::FromToml(toml);
+  auto& mech = sim.add<Mech>("mech");
+  Motor other{sim.node("mech"), "b"};
+  Gyro other_gyro{sim.node("mech"), "gyro"};
+  auto hw = std::make_unique<SimHardware>(sim);
+  hw->set_motor("mech", "b", 0.25, 2);
+  hw->set_gyro("mech", "gyro", 0.75, -0.5);
+  sim.step(10ms);
+  mech.b.rezero(-1);
+  mech.gyro.rezero();
+  EXPECT_DOUBLE_EQ(other.position(), -1);
+  EXPECT_DOUBLE_EQ(other.velocity(), 2);
+  EXPECT_DOUBLE_EQ(other_gyro.yaw(), 0);
+  EXPECT_DOUBLE_EQ(other_gyro.yaw_rate(), -0.5);
+  other.rezero(-1);
+  other_gyro.rezero();
+  EXPECT_DOUBLE_EQ(mech.b.position(), -1);
+  EXPECT_DOUBLE_EQ(mech.gyro.yaw(), 0);
+  mech.b_motion_magic = 0;
+  sim.step(10ms);
+  EXPECT_EQ(hw->motor_request("mech", "b").mode, Mode::kNeutral);
+  hw->enable();
+  sim.step(10ms);
+  EXPECT_DOUBLE_EQ(hw->motor_request("mech", "b").demand, 0.5);
+  mech.b.rezero(std::numeric_limits<double>::quiet_NaN());
+  mech.gyro.rezero(std::numeric_limits<double>::infinity());
+  EXPECT_DOUBLE_EQ(other.position(), -1);
+  EXPECT_DOUBLE_EQ(other_gyro.yaw(), 0);
+  hw->set_connected("mech", "b", false);
+  hw->set_connected("mech", "gyro", false);
+  sim.step(10ms);
+  mech.b.rezero(10);
+  mech.gyro.rezero(10);
+  hw->set_connected("mech", "b", true);
+  hw->set_connected("mech", "gyro", true);
+  sim.step(10ms);
+  EXPECT_DOUBLE_EQ(other.position(), -1);
+  EXPECT_DOUBLE_EQ(other_gyro.yaw(), 0);
+  hw.reset();
+  sim.step(200ms);
+  mech.b.rezero(10);
+  mech.gyro.rezero(10);
+  EXPECT_DOUBLE_EQ(other.position(), -1);
+  EXPECT_DOUBLE_EQ(other_gyro.yaw(), 0);
+}
+
 TEST(Devices, IdealMotorsReachTheirRequests) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");

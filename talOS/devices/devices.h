@@ -107,6 +107,10 @@ class Motor {
   // Commands adjusted to configured limits or neutralized for non-finite
   // values, counted once per setter call over this handle's device lifetime.
   std::uint64_t clamped_count() const;
+  // Node-shared software frame; ignored unless the sample is connected and
+  // both input and resulting offset are finite. No hardware reset is sent.
+  // Position goals use this frame; soft limits remain in the hardware frame.
+  void rezero(double position_rot = 0);
 
   double position() const;  // rotations
   double velocity() const;  // rotations/s
@@ -136,6 +140,9 @@ class Gyro {  // Pigeon2
  public:
   Gyro() = default;
   Gyro(Node& node, std::string_view name);
+  // Node-shared software yaw frame; connected, finite samples/inputs only.
+  // No hardware reset is sent; yaw rate is unchanged.
+  void rezero(double yaw_rot = 0);
   double yaw() const;       // rotations, CCW+
   double yaw_rate() const;  // rotations/s, CCW+
   bool connected() const;   // sample valid and hardware state fresh

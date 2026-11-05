@@ -30,6 +30,9 @@ mixed = [1.0, "back"]
 can_id = 1
 [subsystems.roller.digital_inputs.beam]
 dio = 0
+[subsystems.roller.sensors.gyro]
+type = "Pigeon2"
+can_id = 2
 )";
 
 struct Value {
@@ -386,6 +389,33 @@ TEST_F(NodeApi, MotorClampCountUsesSharedDevicesImplementation) {
   ASSERT_EQ(talos_motor_clamped_count(node, roller.wheel, &count), TALOS_OK);
   EXPECT_EQ(count, 1u);
   EXPECT_EQ(talos_motor_clamped_count(node, roller.wheel, nullptr), TALOS_ERR);
+}
+
+TEST_F(NodeApi, MotorRezeroUsesSharedSoftwareFrame) {
+  Roller roller;
+  TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
+  ASSERT_NE(node, nullptr);
+  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
+  const auto gyro = talos_device(node, TALOS_DEVICE_GYRO, "gyro");
+  ASSERT_GE(gyro, 0);
+  ASSERT_NE(hw, nullptr);
+  ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3, 2),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_gyro(hw, "roller", "gyro", 0.75, -0.5),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK);
+  ASSERT_EQ(talos_motor_rezero(node, roller.wheel, 1), TALOS_OK);
+  TalosSample sample{};
+  ASSERT_EQ(talos_gyro_rezero(node, gyro, 0.25), TALOS_OK);
+  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &sample), TALOS_OK);
+  EXPECT_DOUBLE_EQ(sample.position, 1);
+  EXPECT_DOUBLE_EQ(sample.velocity, 2);
+  EXPECT_EQ(talos_gyro_rezero(node, roller.wheel, 0), TALOS_ERR);
+  ASSERT_EQ(talos_sensor_sample(node, gyro, &sample), TALOS_OK);
+  EXPECT_DOUBLE_EQ(sample.position, 0.25);
+  EXPECT_DOUBLE_EQ(sample.velocity, -0.5);
+  EXPECT_EQ(talos_motor_rezero(node, -1, 0), TALOS_ERR);
+  talos_sim_hardware_destroy(hw);
 }
 
 TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {

@@ -164,6 +164,7 @@ struct HardwareLink::Impl {
     hardware::MotorRequest motor{};
     const hardware::MotorConfig* motor_config = nullptr;
     std::uint64_t clamped_count = 0;
+    double position_offset = 0;
     bool digital = false;
     double pwm = 0;
     // Where this device's sample was in the state arrays last time it was
@@ -368,6 +369,10 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
                                 " is not 0, 1 or 2");
   }
   const auto& config = *device.motor_config;
+  if (mode == hardware::Mode::kPosition ||
+      mode == hardware::Mode::kMotionMagic) {
+    demand += device.position_offset;
+  }
   const double requested_demand = demand;
   const double requested_ff = ff_volts;
   // A non-finite demand is no demand: neutral, rather than handing the
@@ -418,6 +423,32 @@ std::uint64_t HardwareAccess::motor_clamped_count(const HardwareLink& link,
   return link.impl_->At(index, Kind::kMotor).clamped_count;
 }
 
+void HardwareAccess::motor_rezero(HardwareLink& link, std::size_t index,
+                                  double position_rot) {
+  auto& device = link.impl_->At(index, Kind::kMotor);
+  const auto& impl = *link.impl_;
+  const auto sample = FindSample(impl.state.motors, impl.state.motor_count,
+                                 device.id, device.sample_index);
+  const double offset = sample.position_rot - position_rot;
+  if (impl.Fresh() && sample.valid && std::isfinite(sample.position_rot) &&
+      std::isfinite(position_rot) && std::isfinite(offset)) {
+    device.position_offset = offset;
+  }
+}
+
+void HardwareAccess::gyro_rezero(HardwareLink& link, std::size_t index,
+                                 double yaw_rot) {
+  auto& device = link.impl_->At(index, Kind::kGyro);
+  const auto& impl = *link.impl_;
+  const auto sample = FindSample(impl.state.sensors, impl.state.sensor_count,
+                                 device.id, device.sample_index);
+  const double offset = sample.position_rot - yaw_rot;
+  if (impl.Fresh() && sample.valid && std::isfinite(sample.position_rot) &&
+      std::isfinite(yaw_rot) && std::isfinite(offset)) {
+    device.position_offset = offset;
+  }
+}
+
 hardware::MotorSample HardwareAccess::motor_sample(const HardwareLink& link,
                                                    std::size_t index) {
   const auto& impl = *link.impl_;
@@ -425,6 +456,7 @@ hardware::MotorSample HardwareAccess::motor_sample(const HardwareLink& link,
   auto sample = FindSample(impl.state.motors, impl.state.motor_count, device.id,
                            device.sample_index);
   if (!impl.Fresh()) sample.valid = false;
+  sample.position_rot -= device.position_offset;
   return sample;
 }
 
@@ -435,6 +467,7 @@ hardware::SensorSample HardwareAccess::sensor_sample(const HardwareLink& link,
   auto sample = FindSample(impl.state.sensors, impl.state.sensor_count,
                            device.id, device.sample_index);
   if (!impl.Fresh()) sample.valid = false;
+  sample.position_rot -= device.position_offset;
   return sample;
 }
 
@@ -521,6 +554,9 @@ void Motor::stop() {
 std::uint64_t Motor::clamped_count() const {
   return HardwareAccess::motor_clamped_count(*link_, index_);
 }
+void Motor::rezero(double position_rot) {
+  HardwareAccess::motor_rezero(*link_, index_, position_rot);
+}
 double Motor::position() const {
   return HardwareAccess::motor_sample(*link_, index_).position_rot;
 }
@@ -553,6 +589,9 @@ bool CANcoder::connected() const {
 Gyro::Gyro(Node& node, std::string_view name)
     : link_{LinkOf(node)},
       index_{HardwareAccess::add_device(*link_, Kind::kGyro, name)} {}
+void Gyro::rezero(double yaw_rot) {
+  HardwareAccess::gyro_rezero(*link_, index_, yaw_rot);
+}
 double Gyro::yaw() const {
   return HardwareAccess::sensor_sample(*link_, index_).position_rot;
 }

@@ -28,9 +28,13 @@ Startup validates and restores them before reporting ready. Missing or corrupt
 files leave the gateway unconfigured. A stale file cannot accept commands from
 a different configuration ID.
 
-Logical IDs remain independent of CAN addresses. The default IMU is a Pigeon2,
-mounted in its native frame. Steering uses a CANcoder on the same CAN bus as
-its TalonFX. Different buses may reuse CAN addresses.
+Logical IDs remain independent of CAN addresses. Pigeon2 `offset_rot` configures
+Phoenix MountPoseYaw (rotations in `[-0.5, 0.5)`); `inverted` reverses yaw and
+yaw rate after mounting correction. Both simulation backends use the same
+`(raw_yaw + offset_rot) * sign` convention. The ideal fake has zero raw yaw.
+Steering uses a CANcoder on the same CAN bus as its TalonFX. Different buses
+may reuse CAN addresses. Physics reset restoration preserves physical rotor
+positions while clearing velocity, commands and applied voltage.
 
 Example addresses and zero gains are not commissioned settings. After matching
 the manifest to the physical robot and tuning it, explicitly set the hardware

@@ -65,6 +65,12 @@ class SimBackend final : public Backend {
     }
     for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
       state.sensors[i] = {config_.sensors[i].id, true, 0, 0};
+      if (config_.sensors[i].kind == SensorKind::kPigeon2) {
+        const auto& sensor = config_.sensors[i];
+        state.sensors[i].position_rot =
+            sensor.offset_rot * (sensor.inverted ? -1.0 : 1.0);
+        continue;  // The ideal fake has no chassis motion.
+      }
       for (std::size_t j = 0; j < config_.motors.size(); ++j) {
         if (config_.motors[j].feedback_sensor_id == config_.sensors[i].id) {
           state.sensors[i].position_rot = samples_[j].position_rot;

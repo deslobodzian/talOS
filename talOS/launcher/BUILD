@@ -40,6 +40,21 @@ cc_binary(
 )
 
 cc_test(
+    name = "log_dump_test",
+    size = "small",
+    srcs = ["log_dump_test.cc"],
+    data = [":log_dump"],
+    env = {"TALOS_LOG_DUMP": "$(rlocationpath :log_dump)"},
+    deps = [
+        ":continuity_message",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+cc_test(
     name = "launcher_test",
     size = "small",
     srcs = ["launcher_test.cc"],

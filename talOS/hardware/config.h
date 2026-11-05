@@ -56,7 +56,8 @@ struct SensorConfig {
   int can_id{};
   std::string bus{"rio"};
   bool inverted{false};
-  double offset_rot{0};  // CANcoder magnet offset in rotations.
+  // CANcoder magnet offset, or Pigeon mount yaw added before inversion.
+  double offset_rot{0};  // rotations, [-0.5, 0.5)
   bool operator==(const SensorConfig&) const = default;
 };
 

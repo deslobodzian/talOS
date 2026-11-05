@@ -122,6 +122,42 @@ class TwoNodesTest(unittest.TestCase):
 
 
 class DevicesTest(unittest.TestCase):
+    def test_rezero_shares_motor_and_gyro_frames(self):
+        class Frames:
+            def __init__(self, node):
+                self.motor = talos.Motor(node, "lift")
+                self.other = talos.Motor(node, "lift")
+                self.gyro = talos.Gyro(node, "gyro")
+
+            def update(self):
+                self.motor.set_position(1)
+
+        toml = ROBOT_TOML + """
+[subsystems.lift.sensors.gyro]
+type = "Pigeon2"
+can_id = 2
+"""
+        sim = Sim.from_toml(toml)
+        frames = sim.add(Frames, "lift")
+        hw = SimHardware(sim)
+        hw.set_motor("lift", "lift", 3, 2)
+        hw.set_gyro("lift", "gyro", 0.75, -0.5)
+        sim.step(0.02)
+        frames.motor.rezero()
+        frames.gyro.rezero(0.25)
+        self.assertEqual(frames.other.position, 0)
+        self.assertEqual(frames.other.velocity, 2)
+        self.assertEqual(frames.gyro.yaw, 0.25)
+        self.assertEqual(frames.gyro.yaw_rate, -0.5)
+        frames.motor.rezero(float("nan"))
+        self.assertEqual(frames.other.position, 0)
+        sim.step(0.02)
+        self.assertEqual(hw.motor_request("lift", "lift").mode,
+                         talos.Mode.NEUTRAL)
+        hw.enable()
+        sim.step(0.02)
+        self.assertEqual(hw.motor_request("lift", "lift").demand, 4)
+
     def test_motor_clamping_is_exposed_as_a_property(self):
         class Shooter:
             def __init__(self, node):

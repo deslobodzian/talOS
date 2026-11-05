@@ -374,6 +374,103 @@ TEST_F(DrivetrainTest, DrivesEveryModuleToAFreshTarget) {
   EXPECT_TRUE(State().enabled());
 }
 
+class DrivetrainSlewTest : public DrivetrainTest {
+ protected:
+  DrivetrainSlewTest()
+      : DrivetrainTest{ConfigWith("max_linear_accel_mps2 = 2.0\n"
+                                  "max_angular_accel_radps2 = 4.0")} {}
+
+  void ExpectCommand(ChassisSpeeds speeds) {
+    SwerveKinematics kinematics{geometry};
+    const auto expected = kinematics.ToModuleStates(speeds, {}, 0.005);
+    if (!expected.has_value()) {
+      FAIL() << "Expected module states";
+    }
+    const auto& expected_states = *expected;
+    for (std::size_t i = 0; i < kModuleCount; ++i) {
+      EXPECT_EQ(Request(geometry.modules[i].drive).mode, Mode::kVelocity);
+      EXPECT_NEAR(Request(geometry.modules[i].drive).demand,
+                  expected_states[i].drive_rps, 1e-9);
+      EXPECT_NEAR(Request(geometry.modules[i].steer).demand,
+                  expected_states[i].steer_rot, 1e-9);
+    }
+  }
+};
+
+TEST_F(DrivetrainSlewTest, TranslationUsesVectorAccelerationAndConverges) {
+  Teleop();
+  // A 3-4-5 diagonal: each 5 ms tick adds 0.01 m/s in magnitude,
+  // not 0.01 m/s independently on each axis.
+  for (int tick = 1; tick <= 7; ++tick) {
+    talos::testing::PublishTarget(sim, "drivetrain", "teleop",
+                                  ChassisTarget{0.03, 0.04, 0.0});
+    sim.step(5ms);
+    const double fraction = std::min(tick / 5.0, 1.0);
+    ExpectCommand({0.03 * fraction, 0.04 * fraction, 0.0});
+  }
+}
+
+TEST_F(DrivetrainSlewTest,
+       AngularAccelerationLimitsBothDirectionsAndConverges) {
+  Teleop();
+  for (int tick = 1; tick <= 7; ++tick) {
+    talos::testing::PublishTarget(sim, "drivetrain", "teleop",
+                                  ChassisTarget{0.0, 0.0, 0.1});
+    sim.step(5ms);
+    ExpectCommand({0.0, 0.0, std::min(tick * 0.02, 0.1)});
+  }
+  for (int tick = 1; tick <= 12; ++tick) {
+    talos::testing::PublishTarget(sim, "drivetrain", "teleop",
+                                  ChassisTarget{0.0, 0.0, -0.1});
+    sim.step(5ms);
+    ExpectCommand({0.0, 0.0, std::max(0.1 - tick * 0.02, -0.1)});
+  }
+}
+
+class DrivetrainSlewResetTest : public DrivetrainSlewTest,
+                                public ::testing::WithParamInterface<int> {};
+
+TEST_P(DrivetrainSlewResetTest, UnsafeInputNeutralizesAndRestartsFromZero) {
+  Teleop();
+  Hold(ChassisTarget{1.0, 0.0, 1.0}, 40ms);
+  ExpectCommand({0.08, 0.0, 0.16});
+  switch (GetParam()) {
+    case 0:
+      talos::testing::ReleaseTarget<ChassisTarget>(sim, "drivetrain", "teleop");
+      break;
+    case 1:
+      hw.enable(false);
+      break;
+    case 2:
+      sim.step(150ms);  // target lane expires
+      break;
+    case 3:
+      talos::testing::PublishTarget(
+          sim, "drivetrain", "teleop",
+          ChassisTarget{std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0});
+      break;
+    case 4:
+      hw.set_connected("drivetrain", "front_left_steer", false);
+      break;
+    default:
+      FAIL() << "Unknown reset scenario";
+  }
+  // Hardware feedback is delivered after the tick that samples it; lane
+  // changes are visible directly on the next tick.
+  const auto visibility = (GetParam() == 1 || GetParam() == 4) ? 10ms : 5ms;
+  sim.step(visibility);
+  ExpectNeutral();
+  hw.enable();
+  hw.set_connected("drivetrain", "front_left_steer", true);
+  talos::testing::PublishTarget(sim, "drivetrain", "teleop",
+                                ChassisTarget{1.0, 0.0, 1.0});
+  sim.step(visibility);
+  ExpectCommand({0.01, 0.0, 0.02});
+}
+
+INSTANTIATE_TEST_SUITE_P(SafetyGates, DrivetrainSlewResetTest,
+                         ::testing::Values(0, 1, 2, 3, 4));
+
 TEST_F(DrivetrainTest, NeverSentStaysNeutralButStillReportsState) {
   Teleop();
   sim.step(60ms);

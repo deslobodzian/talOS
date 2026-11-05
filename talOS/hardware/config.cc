@@ -72,9 +72,6 @@ void Validate(const Config& c) {
     Require(std::isfinite(s.offset_rot) && s.offset_rot >= -0.5 &&
                 s.offset_rot < 0.5,
             "invalid encoder offset");
-    Require(
-        s.kind != SensorKind::kPigeon2 || (!s.inverted && s.offset_rot == 0),
-        "Pigeon mounting must use its native frame");
   }
   for (const auto& m : c.motors) {
     device(m.id, m.name, m.bus, m.can_id);

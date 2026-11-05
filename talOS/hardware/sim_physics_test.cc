@@ -400,6 +400,45 @@ TEST(SimBelievability, PigeonYawFollowsChassisMotion) {
   EXPECT_NEAR(s.sensors[0].velocity_rps, 0.25, 1e-9);
 }
 
+TEST(SimBelievability, PigeonMountOffsetPrecedesInversion) {
+  for (const bool inverted : {false, true}) {
+    Config config = SingleMotorConfig();
+    SensorConfig imu{9, "imu", SensorKind::kPigeon2, 30, "rio"};
+    imu.offset_rot = 0.125;
+    imu.inverted = inverted;
+    config.sensors.push_back(imu);
+    PhysicsSimBackend backend;
+    ASSERT_TRUE(backend.Configure(config));
+    backend.SetChassisYawRate(0.25);
+    State state{};
+    uint64_t now_us = 0;
+    StepBackend(backend, state, now_us, 5000, 201);
+    const double sign = inverted ? -1.0 : 1.0;
+    EXPECT_NEAR(state.sensors[0].position_rot, sign * 0.375, 1e-9);
+    EXPECT_NEAR(state.sensors[0].velocity_rps, sign * 0.25, 1e-9);
+  }
+}
+
+TEST(SimBelievability, ResetRestorePreservesPhysicalRotorPosition) {
+  PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(SingleMotorConfig()));
+  const std::array commands{Duty(1, 0.5)};
+  ASSERT_TRUE(backend.Apply(commands));
+  State state{};
+  uint64_t now_us = 0;
+  StepBackend(backend, state, now_us, 5000, 201);
+  const double position = state.motors[0].position_rot;
+  ASSERT_GT(position, 0.0);
+  ASSERT_GT(state.motors[0].velocity_rps, 0.0);
+  backend.BeginRestoreAfterReset();
+  ASSERT_TRUE(backend.Read(state));  // Same timestamp: inspect reset directly.
+  EXPECT_DOUBLE_EQ(state.motors[0].position_rot, position);
+  EXPECT_DOUBLE_EQ(state.motors[0].velocity_rps, 0.0);
+  EXPECT_DOUBLE_EQ(state.motors[0].voltage, 0.0);
+  StepBackend(backend, state, now_us, 5000, 20);
+  EXPECT_DOUBLE_EQ(state.motors[0].position_rot, position);
+}
+
 // CANcoders mirror the linked mechanism through the boundary.
 TEST(SimBelievability, CancoderMirrorsLinkedMechanism) {
   Config c = SingleMotorConfig();

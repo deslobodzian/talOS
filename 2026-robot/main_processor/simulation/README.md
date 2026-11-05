@@ -33,6 +33,9 @@ stopped or `--duration-s` expires (zero or omitted means unbounded).
 scheduled mode and a new `mode_since_us` generation at each mode transition;
 the gateway's enable gate follows that same mode. The bridge publishes these
 packets on `/hw/state/driver_station`, just as it does for the RoboRIO.
+`--port N` selects the gateway's loopback UDP listening port (default 5802);
+`--remote-port N` selects the bridge's receiving port (default 5803). Tests
+choose ephemeral ports so independent simulated stacks do not share sockets.
 
 ## What is ideal vs physics-backed
 
@@ -69,3 +72,20 @@ locating modules at ±0.30 m and a 0.0508 m wheel radius. Tests with other
 names or dimensions can register pairs using `SetSwerveModuleGeometry`.
 `SetGyro` and `SetChassisYawRate` explicitly override automatic coupling
 until reconfiguration or controller restart.
+
+## Full-stack regression test
+
+```sh
+bazel test --test_output=errors //2026-robot/main_processor/simulation:all
+```
+
+`startup_test` launches the real robot configuration and all nine processes
+against the UDP simulation gateway, with ephemeral loopback ports and a unique
+shared-memory namespace per session. It exercises disabled, autonomous, and
+teleop modes, checks every node exits without restarts or recorder failures,
+and requires records in the hardware, autonomous, drivetrain, and pose logs.
+A second session pauses the teleop target producer (`driver`) with `SIGSTOP`
+for 250 ms and resumes it with `SIGCONT`: longer than the 100 ms command
+freshness limit but shorter than the 500 ms heartbeat-stall floor. The session
+must still finish cleanly without restarting any node. Temporary logs and
+process groups are cleaned up even when an assertion fails.

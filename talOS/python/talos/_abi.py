@@ -7,7 +7,7 @@ raise, with the C++ message, or with the Python exception a callback raised.
 import ctypes
 import os
 
-_EXPECTED_ABI_VERSION = 17
+_EXPECTED_ABI_VERSION = 18
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -132,6 +132,8 @@ _SIGNATURES = {
     "talos_motor_set": (c_int32, [c_void_p, c_int64, c_int32, c_double,
                                   c_double, c_int32]),
     "talos_motor_clamped_count": (c_int32, [c_void_p, c_int64, _P(c_uint64)]),
+    "talos_motor_rezero": (c_int32, [c_void_p, c_int64, c_double]),
+    "talos_gyro_rezero": (c_int32, [c_void_p, c_int64, c_double]),
     "talos_digital_output_set": (c_int32, [c_void_p, c_int64, c_int32]),
     "talos_pwm_set": (c_int32, [c_void_p, c_int64, c_double]),
     "talos_motor_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),

@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 17u
+#define TALOS_NODE_ABI_VERSION 18u
 
 enum {
   TALOS_OK = 0,
@@ -192,6 +192,11 @@ int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
 // Monotonic per-device count of adjusted/neutralized motor setter calls.
 int32_t talos_motor_clamped_count(TalosNode* node, int64_t index,
                                   uint64_t* out);
+// Node-shared software offsets; ignored for disconnected/non-finite samples
+// or non-finite inputs. Motor goals translate to hardware coordinates before
+// applying configured soft limits, which remain in the hardware frame.
+int32_t talos_motor_rezero(TalosNode* node, int64_t index, double position_rot);
+int32_t talos_gyro_rezero(TalosNode* node, int64_t index, double yaw_rot);
 int32_t talos_digital_output_set(TalosNode* node, int64_t index, int32_t value);
 int32_t talos_pwm_set(TalosNode* node, int64_t index, double output);
 

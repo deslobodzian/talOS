@@ -316,6 +316,41 @@ Recorded logs (`.tlog` format version 5) embed descriptors for each logged topic
 `log_dump` (`//talOS/launcher:log_dump`) reads these descriptors and decodes
 recorded message payloads into named fields without requiring the original build
 environment.
+
+### Filtering and exporting logs
+
+Passing only file or session-directory paths retains the human-readable dump,
+decoded payloads, and summary. Paths can be combined with:
+
+- `--node name`: match a process name exactly.
+- `--topic pattern`: match a topic exactly, or match its prefix when the pattern
+  ends with `*` (quote wildcards to prevent shell expansion).
+- `--since-ms ms`, `--until-ms ms`: inclusive event-time bounds in milliseconds
+  relative to the earliest record in the entire input session, **before**
+  filtering. Values must be finite numbers.
+- `--format text|jsonl|csv`: default `text`; `jsonl` emits one JSON object per
+  matching record; `csv` emits a header and RFC-4180 rows. Machine-readable
+  formats omit the human-readable preamble and summary.
+
+Repeat `--node` or `--topic`, or separate their values with commas, to select
+alternatives within that filter. Different filters are combined with AND.
+Use `--` before a path beginning with `--`. Unknown flags and invalid values
+are usage errors.
+
+```sh
+bazel run //talOS/launcher:log_dump -- /tmp/logs/session \
+  --node drivetrain,pose_estimator --topic '/drivetrain/*' \
+  --since-ms 1000 --until-ms 5000 --format jsonl
+```
+
+Both export formats contain `process`, `dispatch_index`, `kind`, `source_id`,
+`topic`, `event_ms`, `now_ms`, `sequence`, `aux`, `payload_bytes`, `schema`, and
+`decoded`. Times keep the same session baseline regardless of filters.
+`schema` is empty when the source has no schema; `decoded` is empty without a
+schema or payload, otherwise it contains the descriptor-decoded payload text.
+JSON strings are escaped; CSV fields containing commas, quotes, or newlines
+are quoted and embedded quotes are doubled.
+
 ## If you change the shape of `graph.json`
 
 Studio parses this document in TypeScript (`studio/src/system.ts`), and neither

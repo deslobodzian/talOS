@@ -485,6 +485,21 @@ int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
   });
 }
 
+int32_t talos_motor_rezero(TalosNode* node, int64_t index,
+                           double position_rot) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    HardwareAccess::motor_rezero(Link(node), Index(index), position_rot);
+    return TALOS_OK;
+  });
+}
+
+int32_t talos_gyro_rezero(TalosNode* node, int64_t index, double yaw_rot) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    HardwareAccess::gyro_rezero(Link(node), Index(index), yaw_rot);
+    return TALOS_OK;
+  });
+}
+
 int32_t talos_motor_clamped_count(TalosNode* node, int64_t index,
                                   uint64_t* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {

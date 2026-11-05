@@ -109,6 +109,37 @@ hw::MotorRequest Request(uint16_t id, hw::Mode mode, double demand) {
 
 }  // namespace
 
+TEST(PhoenixBackendPigeon, MountYawConfiguredAndInversionFlipsReadYaw) {
+  EnsureHal();
+  hw::Config config;
+  config.motors.push_back(TestMotor(1, "m1", 1));
+  hw::SensorConfig imu{9, "imu", hw::SensorKind::kPigeon2, 30, "rio"};
+  imu.offset_rot = 0.125;
+  imu.inverted = true;
+  config.sensors.push_back(imu);
+  PhoenixBackend backend(false);
+  ASSERT_TRUE(backend.Configure(config));
+
+  // A second handle observes the same simulated CAN device/configurator.
+  ctre::phoenix6::hardware::Pigeon2 observer(30, ctre::phoenix6::CANBus{"rio"});
+  ctre::phoenix6::configs::Pigeon2Configuration applied;
+  ASSERT_TRUE(observer.GetConfigurator().Refresh(applied).IsOK());
+  EXPECT_NEAR(applied.MountPose.MountPoseYaw.value(), 45.0, 1e-3);
+  observer.GetSimState().SetSupplyVoltage(units::volt_t{12.0});
+  observer.GetSimState().SetRawYaw(units::degree_t{90.0});
+  hw::State state{};
+  for (int i = 0; i < 30; ++i) {
+    backend.Read(state);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  auto& yaw = observer.GetYaw();
+  ASSERT_TRUE(yaw.Refresh().GetStatus().IsOK());
+  ASSERT_TRUE(state.sensors[0].valid);
+  ASSERT_GT(std::abs(yaw.GetValue().value()), 1.0);
+  EXPECT_NEAR(state.sensors[0].position_rot, -yaw.GetValue().value() / 360.0,
+              1e-6);
+}
+
 TEST(PhoenixBackendEncoders, QuadratureScalingAppliesCountsPerRevAndOffset) {
   EnsureHal();
   hw::Config c;

@@ -153,6 +153,7 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       device.imu =
           std::make_unique<ph::hardware::Pigeon2>(s.can_id, ph::CANBus{s.bus});
       ph::configs::Pigeon2Configuration cfg;
+      cfg.MountPose.MountPoseYaw = units::degree_t{s.offset_rot * 360.0};
       ok &= note_failure(
           s.name, s.bus, s.can_id, "apply_pigeon2_config",
           Retry([&] { return device.imu->GetConfigurator().Apply(cfg); }));
@@ -398,8 +399,9 @@ bool PhoenixBackend::Read(hw::State& s) {
     } else {
       auto& p = device.imu->GetYaw(false);
       auto& v = device.imu->GetAngularVelocityZWorld(false);
-      out.position_rot = p.GetValue().value() / 360.0;
-      out.velocity_rps = v.GetValue().value() / 360.0;
+      const double sign = config_.sensors[i].inverted ? -1.0 : 1.0;
+      out.position_rot = sign * p.GetValue().value() / 360.0;
+      out.velocity_rps = sign * v.GetValue().value() / 360.0;
       out.valid = Fresh(p) && Fresh(v);
       out.position_age_us = Age(p);
       out.velocity_age_us = Age(v);

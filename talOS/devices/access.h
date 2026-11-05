@@ -52,6 +52,10 @@ struct HardwareAccess {
                         int slot);
   static std::uint64_t motor_clamped_count(const HardwareLink& link,
                                            std::size_t index);
+  static void motor_rezero(HardwareLink& link, std::size_t index,
+                           double position_rot);
+  static void gyro_rezero(HardwareLink& link, std::size_t index,
+                          double yaw_rot);
   // The latched sample for a device; all zeros (valid == false) until an
   // accepted hardware state carries it.
   static hardware::MotorSample motor_sample(const HardwareLink& link,

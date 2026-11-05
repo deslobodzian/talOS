@@ -13,6 +13,7 @@
 #include "config_wire.h"
 #include "endpoint.h"
 #include "sim_backend.h"
+#include "sim_physics.h"
 
 namespace talos::hardware {
 namespace {
@@ -184,6 +185,43 @@ TEST(ConfigWire, FollowersAndGravityRoundTrip) {
   ASSERT_TRUE(DeserializeConfig(SerializeConfig(config), decoded));
   EXPECT_EQ(decoded, config);
   EXPECT_EQ(ConfigurationId(decoded), ConfigurationId(config));
+}
+
+TEST(ConfigWire, PigeonMountCalibrationRoundTripsAndReachesIdealBackend) {
+  auto config = SwerveConfig(true);
+  for (auto& sensor : config.sensors) {
+    if (sensor.kind != SensorKind::kPigeon2) continue;
+    sensor.offset_rot = 0.125;
+    sensor.inverted = true;
+  }
+  EXPECT_NO_THROW(Validate(config));
+  Config decoded;
+  ASSERT_TRUE(DeserializeConfig(SerializeConfig(config), decoded));
+  EXPECT_EQ(decoded, config);
+  SimBackend backend;
+  Gateway gateway{decoded, backend, 1};
+  gateway.Tick(1000, false);
+  const auto state = gateway.snapshot();
+  for (std::size_t i = 0; i < decoded.sensors.size(); ++i) {
+    if (decoded.sensors[i].kind != SensorKind::kPigeon2) continue;
+    EXPECT_TRUE(state.sensors[i].valid);
+    EXPECT_DOUBLE_EQ(state.sensors[i].position_rot, -0.125);
+    EXPECT_DOUBLE_EQ(state.sensors[i].velocity_rps, 0.0);
+  }
+}
+
+TEST(Config, PigeonMountYawRetainsFiniteHalfTurnBounds) {
+  auto config = SwerveConfig(true);
+  for (auto& sensor : config.sensors) {
+    if (sensor.kind != SensorKind::kPigeon2) continue;
+    sensor.inverted = true;
+    sensor.offset_rot = -0.5;
+    EXPECT_NO_THROW(Validate(config));
+    sensor.offset_rot = 0.5;
+    EXPECT_THROW(Validate(config), std::invalid_argument);
+    sensor.offset_rot = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_THROW(Validate(config), std::invalid_argument);
+  }
 }
 
 TEST(Config, RejectsAmbiguousHardwareAndInvalidFeedback) {
@@ -914,6 +952,33 @@ TEST(Gateway, ResetWhileEnabledNeutralizesBeforeRestore) {
   EXPECT_FALSE(g.Accept(stale, 2, 2000));
   g.Tick(3000, true);
   EXPECT_TRUE(g.Accept(Request(g), 0, 3000));
+}
+
+TEST(Gateway, PhysicsResetPreservesPositionAndRejectsOldDemand) {
+  sim::PhysicsSimBackend backend;
+  Gateway gateway{SwerveConfig(true), backend, 1};
+  gateway.Tick(1000, true);
+  for (uint64_t now = 6000; now <= 101000; now += 5000) {
+    auto command = Request(gateway);
+    for (std::size_t i = 0; i < command.count; ++i) {
+      command.motors[i].mode = Mode::kDutyCycle;
+      command.motors[i].demand = 0.2;
+    }
+    ASSERT_TRUE(gateway.Accept(command, now, now));
+    gateway.Tick(now, true);
+  }
+  const auto stale = Request(gateway);
+  const auto epoch = gateway.snapshot().epoch;
+  backend.SimulateDeviceReset(gateway.snapshot().motors[0].id);
+  gateway.Tick(106000, true);
+  const double position = gateway.snapshot().motors[0].position_rot;
+  ASSERT_NE(position, 0.0);
+  EXPECT_NE(gateway.snapshot().epoch, epoch);
+  EXPECT_FALSE(gateway.Accept(stale, 200000, 106000));
+  gateway.Tick(111000, true);
+  EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].position_rot, position);
+  EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].velocity_rps, 0.0);
+  EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].voltage, 0.0);
 }
 
 TEST(Gateway, FailedResetRestoreLatchesFaultAndReneutralizes) {

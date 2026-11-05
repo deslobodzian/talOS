@@ -5,6 +5,9 @@
 name = "drivetrain"
 node = "//2026-robot/main_processor/drivetrain:node"
 period_us = 5000
+# Optional chassis slew limits; omitted (0.0) preserves immediate step commands.
+# max_linear_accel_mps2 = 15.0
+# max_angular_accel_radps2 = 25.0
 
 [motors.back_left_drive]
 type = "TalonFX"

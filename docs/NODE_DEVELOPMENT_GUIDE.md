@@ -71,6 +71,16 @@ Handles are named by their device key in the subsystem config
 | `node.extension<talos::HardwareLink>().sample_time()`: node-clock `Time` the latest hardware state was sampled at, `nullopt` while stale or before the bridge's clock mapping converges (8 states) | `talos.hardware_sample_time_ns(node)` (int ns, or `None`) |
 | `node.extension<talos::HardwareLink>().fresh()` / `.fresh(max_age)` and `.age()` | `link = talos.HardwareLink(node)`; `link.fresh()` / `link.fresh(max_age)` (`None` uses command timeout; seconds or `datetime.timedelta`); `link.age` (float seconds, `math.inf` before the first state); `link.sample_time` (int ns or `None`) |
 
+`Motor::rezero(position_rot = 0)` and `Gyro::rezero(yaw_rot = 0)` (same
+methods in Python) set a software offset shared by all handles for that device
+on the node. They do not reset hardware and work while disabled. Disconnected,
+stale, or non-finite feedback and non-finite inputs leave the offset unchanged.
+Motor position and gyro yaw subtract the offset; velocity/rate are unchanged.
+Motor position and motion-magic goals translate back to hardware coordinates
+before clamping. Configured soft limits remain in the **hardware frame** and
+the gateway's safety checks are never bypassed.
+
+
 Every motor not set during an `update()` is sent neutral, and all are neutral
 while the robot is disabled. Units are rotations, rotations/s, volts, amps.
 

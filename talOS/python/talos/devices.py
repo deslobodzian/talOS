@@ -104,6 +104,14 @@ class Motor(_Input):
     _KIND = _abi.DEVICE_MOTOR
     _SAMPLE = lib.talos_motor_sample
 
+    def rezero(self, position_rot=0):
+        """Set the node-shared software position on connected finite feedback.
+
+        Position goals use this frame; soft limits remain hardware coordinates.
+        Disconnected/non-finite feedback or input leaves the offset unchanged.
+        """
+        _abi.ok(lib.talos_motor_rezero(self._node, self._index, position_rot))
+
     @property
     def clamped_count(self):
         """Number of setter calls clamped or neutralized for non-finite input."""
@@ -168,6 +176,10 @@ class Gyro(_Input):
     """A Pigeon2. Rotations and rotations/s, CCW+."""
     _KIND = _abi.DEVICE_GYRO
     _SAMPLE = lib.talos_sensor_sample
+
+    def rezero(self, yaw_rot=0):
+        """Set node-shared software yaw on connected finite feedback/input."""
+        _abi.ok(lib.talos_gyro_rezero(self._node, self._index, yaw_rot))
 
     @property
     def yaw(self):

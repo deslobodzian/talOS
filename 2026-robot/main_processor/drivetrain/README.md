@@ -18,6 +18,17 @@ wrapping. The hardware API also supports Motion Magic when a subsystem needs
 profiled positions. This is not yet a trajectory follower or field-relative
 controller; pose estimation and vision are separate future nodes.
 
+Optional `[subsystem]` parameters `max_linear_accel_mps2` and
+`max_angular_accel_radps2` limit commanded chassis acceleration before
+discretization. Translation uses a vector-magnitude limit, preserving the
+direction of the velocity change; rotation is limited independently. Each
+defaults to `0.0`; non-positive or non-finite values leave that limit disabled.
+The period is the configured node update period, not elapsed wall time.
+Disabled, stale/released or non-finite targets and disconnected module motors
+neutralize immediately and reset both ramps to zero. Re-enabling therefore
+starts a new ramp rather than resuming the previous command. The robot config
+leaves the example limits commented out to preserve existing step behavior.
+
 ## Code
 
 - `drivetrain.h`: the node, a `talos::Node` class with eight `talos::Motor`s
