@@ -26,6 +26,13 @@ cc_library(
         "@flatbuffers//:runtime_cc",
     ],
 )
+cc_binary(
+    name = "libteleop.so",
+    srcs = ["teleop_abi.cc"],
+    linkshared = True,
+    deps = [":teleop"],
+)
+
 
 talos_cc_node(
     name = "node",

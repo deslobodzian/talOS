@@ -127,8 +127,8 @@ TEST(TopicName, LengthLimitIsTheTransportLimit) {
 
 TEST(NodeName, MatchesTheSubsystemKeyRules) {
   for (const auto* name :
-      {"drivetrain", "shooter", "odometry", "autonomous", "driver_station",
-       "driver", "telemetry", "hardware_node"}) {
+       {"drivetrain", "shooter", "odometry", "autonomous", "driver_station",
+        "driver", "telemetry", "hardware_node"}) {
     EXPECT_FALSE(CheckNodeName(name).has_value()) << name;
   }
   EXPECT_TRUE(CheckNodeName("").has_value());
@@ -270,11 +270,10 @@ TEST(LintGraph, TwoWritersIsAnErrorAndBothAreNamed) {
   EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
                        "/drivetrain/target/teleop", "replayable"));
 }
-TEST(LintGraph, TeleopNodeAndAnotherWriterOnSameTeleopLaneIsRefusedAsTwoWriters) {
+TEST(LintGraph,
+     TeleopNodeAndAnotherWriterOnSameTeleopLaneIsRefusedAsTwoWriters) {
   const std::vector<NodeShape> nodes = {
-      {"teleop",
-       "//talOS/teleop:node",
-       {Sender("/shooter/target/teleop")}},
+      {"teleop", "//talOS/teleop:node", {Sender("/shooter/target/teleop")}},
       {"driver",
        "//2026-robot/main_processor/driver:node",
        {Sender("/shooter/target/teleop")}},
@@ -284,12 +283,12 @@ TEST(LintGraph, TeleopNodeAndAnotherWriterOnSameTeleopLaneIsRefusedAsTwoWriters)
   };
   const auto diagnostics = LintGraph(nodes);
   ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
-                       "/shooter/target/teleop", "teleop"));
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
-                       "/shooter/target/teleop", "driver"));
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
-                       "/shooter/target/teleop", "2 writers"));
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/target/teleop",
+                       "teleop"));
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/target/teleop",
+                       "driver"));
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/target/teleop",
+                       "2 writers"));
 }
 
 // The owner segment names the subject, and the role says which way the data
@@ -535,12 +534,12 @@ TEST(LintGraph, TwoSchemasOfTheSameSizeOnOneTopicIsAnErrorNamingBothTypes) {
   };
   const auto diagnostics = LintGraph(nodes);
   ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/state",
-                       "two schemas"))
+  EXPECT_TRUE(
+      Mentions(diagnostics, Severity::ERROR, "/shooter/state", "two schemas"))
       << Describe(diagnostics);
-  for (const auto* named : {"shooter.State (0x0000000000000001)",
-                            "shooter.OldState (0x0000000000000002)",
-                            "by shooter", "by odometry"}) {
+  for (const auto* named :
+       {"shooter.State (0x0000000000000001)",
+        "shooter.OldState (0x0000000000000002)", "by shooter", "by odometry"}) {
     EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/state", named))
         << named << "\n"
         << Describe(diagnostics);
@@ -583,9 +582,7 @@ TEST(LintGraph, MatchingSchemasPassAndDifferentRingLayoutsDoNot) {
 
 TEST(LintGraph, UnreadTopicIsAWarningNotAnError) {
   const std::vector<NodeShape> nodes = {
-      {"telemetry",
-       "//talOS/telemetry:node",
-       {Sender("/talos/telemetry")}},
+      {"telemetry", "//talOS/telemetry:node", {Sender("/talos/telemetry")}},
   };
   const auto diagnostics = LintGraph(nodes);
   EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
@@ -596,9 +593,7 @@ TEST(LintGraph, UnreadTopicIsAWarningNotAnError) {
 
 TEST(LintGraph, ErrorsSortAheadOfWarnings) {
   const std::vector<NodeShape> nodes = {
-      {"telemetry",
-       "//talOS/telemetry:node",
-       {Sender("/talos/telemetry")}},
+      {"telemetry", "//talOS/telemetry:node", {Sender("/talos/telemetry")}},
       {"drivetrain",
        "//2026-robot/main_processor/drivetrain:node",
        {Watcher("/drivetrain/target")}},

@@ -323,6 +323,17 @@ const DEMO_NODES: DemoNode[] = [
       {kind: 'WATCHER', name: '/hw/state/driver_station', bytes: HW_PACKET, hz: 50, observer: true},
       {kind: 'SENDER', name: '/talos/telemetry', bytes: STUDIO_SLOT, hz: 100}
     ]
+  },
+  {
+    name: 'teleop',
+    target: '//talOS/teleop:node',
+    pid: 4139,
+    periodUs: 20000,
+    sources: [
+      {kind: 'TIMER', name: 'teleop', bytes: 0, hz: 50},
+      {kind: 'WATCHER', name: '/hw/state/driver_station', bytes: HW_PACKET, hz: 50},
+      {kind: 'SENDER', name: '/shooter/target/teleop', bytes: 24, hz: 50}
+    ]
   }
 ];
 

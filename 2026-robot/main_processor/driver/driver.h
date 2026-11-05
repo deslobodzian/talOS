@@ -74,9 +74,13 @@ class Driver {
       return;
     }
 
-    double vx = talos::teleop::Deadband(-stick.axis(1), deadband_frac_) * max_linear_mps_;
-    double vy = talos::teleop::Deadband(-stick.axis(0), deadband_frac_) * max_linear_mps_;
-    const double omega = talos::teleop::Deadband(-stick.axis(2), deadband_frac_) * max_angular_radps_;
+    double vx = talos::teleop::Deadband(-stick.axis(1), deadband_frac_) *
+                max_linear_mps_;
+    double vy = talos::teleop::Deadband(-stick.axis(0), deadband_frac_) *
+                max_linear_mps_;
+    const double omega =
+        talos::teleop::Deadband(-stick.axis(2), deadband_frac_) *
+        max_angular_radps_;
     // Field-relative sticks need a fresh heading; without one, drive
     // robot-relative rather than on a stale or assumed yaw.
     if (field_oriented_ && have_heading_ &&

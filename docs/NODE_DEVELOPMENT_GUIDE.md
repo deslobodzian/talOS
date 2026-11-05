@@ -101,6 +101,31 @@ test = []
 teleop = ["align", "teleop"]
 ```
 
+### Binding joystick buttons and axes via TOML
+
+A mechanism subsystem can bind Driver Station joystick buttons and axes to its
+target lane without editing C++ or Python code. The framework node
+`//talOS/teleop:node` (`subsystems/teleop.toml`) reads `[[teleop.bindings]]`
+tables from each subsystem configuration and writes the subsystem's
+`/<sub>/target/teleop` lane using its schema descriptor:
+
+```toml
+# subsystems/shooter.toml
+[[teleop.bindings]]
+button = 1                     # joystick 0 button (1-based); add port = N for other joysticks
+while_held = { target_velocity_rps = 60.0 }
+
+# subsystems/arm.toml
+[[teleop.bindings]]
+axis = 1                       # axis index [0, 11]
+field = "velocity_rps"         # field in target message struct
+scale = 60.0                   # in the field's unit
+deadband_frac = 0.05           # optional deadband [0, 1)
+```
+
+While held or deflected past deadband, `teleop` publishes active targets with the
+bound fields encoded; released or in neutral, it calls `release()`.
+
 Sources follow the topic segment rules; an unknown mode is a config error. A
 consumer reads its lanes without a callback, so it keeps draining right before
 its timer. Republish a lane every period; `release()` hands control to the next

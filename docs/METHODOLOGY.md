@@ -206,7 +206,7 @@ Rules:
   Reuse beats a near-duplicate. **[review]**
 - Messages are FlatBuffers structs owned by one package, declared with
   `talos_messages`. Never mirror a struct by hand (the earlier `GenericState`
-  and `GenericTarget` side doors have been deleted; D3 and D4 will replace
+  and `GenericTarget` side doors have been deleted; D3 and D4 replaced
   hard-coded subsystem lists with framework nodes). Each struct has a build-time
   schema descriptor (`talos::Descriptor<M>`, `<Struct>.TALOS_SCHEMA_HASH`).
   Attaching to a topic checks schema name and hash; a mismatch fails, naming
@@ -244,7 +244,7 @@ Rules:
   bindings) lives in TOML read by the framework. It is never a list of
   subsystem names in code. Target lanes and telemetry are config-only
   (`[robot.targets]`, `[targets]`, `[studio]`); teleop bindings are
-  **[planned: D4]**.
+  **[done: D4]**.
 
 ## 9. Time, determinism, restart
 
@@ -348,8 +348,8 @@ touch the code, or under the design item named.
 
 | Where | Deviation | Rule | Fix |
 |---|---|---|---|
-| `operator_interface.h` | subsystem names hard-coded | §7, §8 | D4 |
-| `operator_interface.toml` | `deadband`, `heading_timeout_s` | §6, §8 | `deadband_frac`, `heading_timeout_us` |
+| `driver.h` | chassis-only teleop driving; mechanism bindings moved to `[[teleop.bindings]]` | §7, §8 | done: D4 |
+| `driver.toml` | `deadband_frac` | §6, §8 | done: D4 |
 | `intake.py:18` | fixed `INTAKE_RPS` ignores the requested speed | §3 | use the target's demand |
 | `drivetrain/swerve.h` `SwerveKinematics::ToModuleStates` | wheel speeds are desaturated by hand, not with wpimath's `DesaturateWheelSpeeds` (the kinematics, `Optimize` and forward kinematics are wpimath's `SwerveDriveKinematics<4>`) | §14 | `DesaturateWheelSpeeds` takes one attainable speed for every module, while `[geometry]` gives each module its own `wheel_radius_m` and drive `max_velocity_rps`; keep until wpimath takes per-module limits |
 | `drivetrain/node_test.cc` `UpdateDoesNotAllocate` | the process-wide allocation check (`malloc_logger`, so libwpimath counts) runs on macOS only; on Linux it is skipped | §10 | a glibc-compatible allocation hook (glibc removed `__malloc_hook` in 2.34) |

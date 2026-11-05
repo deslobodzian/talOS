@@ -437,7 +437,7 @@ test('the agent fetches the declared graph from the bridge it follows',
                       'the agent never fetched /declared.json');
          const result =
              dispatch(agent.context(), 'get_declared_graph', {}) as any;
-         assert.equal(result.nodes.length, 6);
+         assert.equal(result.nodes.length, 7);
          assert.ok(result.nodes.some((n: any) => n.name === 'shooter'));
          // No system graph on this connection, so there is nothing to compare
          // the declared nodes against and it says so instead of guessing.
@@ -469,7 +469,7 @@ test('a bridge started without --declared leaves everything else working',
          agent.ingestSystemGraph(demoSystemGraph(500n));
          const graph =
              dispatch(agent.context(), 'get_system_graph', {}) as any;
-         assert.equal(graph.summary.nodes, 5);
+         assert.equal(graph.summary.nodes, 6);
        } finally {
          agent.close();
          bridge.close();

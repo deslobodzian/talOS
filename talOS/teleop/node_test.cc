@@ -1,3 +1,5 @@
+#include "talOS/node/node.h"
+
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -14,7 +16,6 @@
 #include "talOS/devices/testing.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
-#include "talOS/node/node.h"
 #include "talOS/node/testing.h"
 #include "talOS/teleop/deadband.h"
 #include "talOS/teleop/node.h"
@@ -57,8 +58,8 @@ ds::JoystickData MakeStick(float axis0 = 0.0f, float axis1 = 0.0f,
 }
 
 ds::DriverStationData DsPacket(std::uint32_t flags,
-                              const ds::JoystickData& stick,
-                              std::size_t port = 0) {
+                               const ds::JoystickData& stick,
+                               std::size_t port = 0) {
   ds::DriverStationData data{};
   data.fms.flags = flags;
   data.joysticks[port] = stick;
@@ -181,7 +182,8 @@ TEST(TeleopNode, PrecedenceBetweenTwoBindingsOnOneField) {
   // Both button 1 and button 2 held (mask 3: bits 0 and 1)
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 3)));
   ASSERT_TRUE(roller.seen.has_value());
-  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 10.0);  // First binding in list wins
+  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(),
+                   10.0);  // First binding in list wins
 
   // Only button 2 held (mask 2)
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 2)));
@@ -239,8 +241,8 @@ TEST(TeleopNode, AxisDeadbandEdgeAndContinuousScaling) {
   EXPECT_NEAR(arm.seen->velocity_rps(), 10.0, 1e-6);
 
   // Negative axis: axis = -0.5625:
-  // rescaled = copysign((0.5625 - 0.125) / 0.875, -0.5625) = -0.4375 / 0.875 = -0.5
-  // value = 10.0 * -0.5 = -5.0
+  // rescaled = copysign((0.5625 - 0.125) / 0.875, -0.5625) = -0.4375 / 0.875 =
+  // -0.5 value = 10.0 * -0.5 = -5.0
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(-0.5625f)));
   ASSERT_TRUE(arm.seen.has_value());
   EXPECT_NEAR(arm.seen->velocity_rps(), -5.0, 1e-6);
@@ -357,8 +359,10 @@ period_us = 20000
     FAIL() << "expected std::invalid_argument";
   } catch (const std::invalid_argument& e) {
     const std::string msg = e.what();
-    EXPECT_NE(msg.find("[subsystems.shooter] teleop.bindings[0].while_held.foo_rps: no field 'foo_rps' in control.VelocityTarget"),
-              std::string::npos)
+    EXPECT_NE(
+        msg.find("[subsystems.shooter] teleop.bindings[0].while_held.foo_rps: "
+                 "no field 'foo_rps' in control.VelocityTarget"),
+        std::string::npos)
         << msg;
   }
 }
@@ -465,7 +469,8 @@ period_us = 20000
     FAIL() << "expected std::invalid_argument";
   } catch (const std::invalid_argument& e) {
     const std::string msg = e.what();
-    EXPECT_NE(msg.find("fractional value for integer field"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("fractional value for integer field"), std::string::npos)
+        << msg;
   }
 }
 
@@ -518,7 +523,8 @@ period_us = 20000
     FAIL() << "expected std::invalid_argument";
   } catch (const std::invalid_argument& e) {
     const std::string msg = e.what();
-    EXPECT_NE(msg.find("[subsystems.ghost] teleop: no reader of '/ghost/target/teleop' in the graph"),
+    EXPECT_NE(msg.find("[subsystems.ghost] teleop: no reader of "
+                       "'/ghost/target/teleop' in the graph"),
               std::string::npos)
         << msg;
   }
@@ -549,7 +555,8 @@ period_us = 20000
     FAIL() << "expected std::invalid_argument";
   } catch (const std::invalid_argument& e) {
     const std::string msg = e.what();
-    EXPECT_NE(msg.find("[subsystems.roller] teleop: 'teleop' missing from the subsystem's teleop-mode target policy"),
+    EXPECT_NE(msg.find("[subsystems.roller] teleop: 'teleop' missing from the "
+                       "subsystem's teleop-mode target policy"),
               std::string::npos)
         << msg;
   }

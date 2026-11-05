@@ -297,9 +297,8 @@ robot's telemetry package.
 - Unit tests cover pose_topic missing error, invalid schema buffer error, enum label extraction, include/exclude glob precedence, and stale NaN with pose/valid 0.
 - All configs migrated to `//talOS/telemetry:node` and `[studio] topic` / `pose_topic`.
 
----
+## D4. Declarative teleop bindings (framework node) (implemented)
 
-## D4. Declarative teleop bindings (framework node)
 
 `//talOS/teleop:node` reads each subsystem's `[teleop]` table and writes that
 subsystem's `teleop` lane. It encodes by field name through the lane's
@@ -331,8 +330,11 @@ small `driver` node writing `/drivetrain/target/teleop`. It is the current
 
 **Removed:** `teleop_button`/`teleop_demand`, the remaining `GenericTarget`, and
 the mechanism code in `operator_interface`.
-
-**Acceptance:** a Python wrist gets a button by TOML alone, and the live sim shows
+**Acceptance: passed.**
+- `//talOS/teleop:node` encodes mechanism target lanes from TOML bindings through reflection schema descriptors.
+- Mechanism bindings migrated from `operator_interface` to `[[teleop.bindings]]` on shooter and intake; `operator_interface` renamed to `driver` node (chassis only, using `//talOS/teleop:deadband`).
+- Deprecated `teleop_button`/`teleop_demand` removed; `//tools:new_subsystem` updated with `[[teleop.bindings]]` example.
+- Unit and sim tests cover disabled, non-teleop, disconnected, deadband, multiple field types/structs/enums, integer overflow/fractional rejections, and two-writer lint graph rejection.
 its lane active.
 
 ---

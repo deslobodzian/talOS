@@ -58,11 +58,13 @@ inline std::size_t TypeSize(reflection::BaseType type) {
 }
 
 template <typename T>
-inline void CheckAndCopyInt(std::byte* dest, int64_t val, std::string_view where) {
+inline void CheckAndCopyInt(std::byte* dest, int64_t val,
+                            std::string_view where) {
   if (val < static_cast<int64_t>(std::numeric_limits<T>::lowest()) ||
       val > static_cast<int64_t>(std::numeric_limits<T>::max())) {
     throw std::invalid_argument(std::string{where} + ": value " +
-                                std::to_string(val) + " does not fit integer field");
+                                std::to_string(val) +
+                                " does not fit integer field");
   }
   auto v = static_cast<T>(val);
   std::memcpy(dest, &v, sizeof(v));
@@ -95,7 +97,8 @@ inline void EncodeIntegerBytes(std::byte* dest, reflection::BaseType type,
       break;
     case BaseType::ULong: {
       if (val < 0) {
-        throw std::invalid_argument(std::string{where} + ": negative value for unsigned field");
+        throw std::invalid_argument(std::string{where} +
+                                    ": negative value for unsigned field");
       }
       auto v = static_cast<uint64_t>(val);
       std::memcpy(dest, &v, sizeof(v));
@@ -122,7 +125,6 @@ inline void EncodeNumericBytes(std::byte* dest, reflection::BaseType type,
     EncodeIntegerBytes(dest, type, static_cast<int64_t>(val), where);
   }
 }
-
 
 inline void WriteScalar(std::byte* dest, reflection::BaseType type,
                         double val) {
@@ -390,12 +392,12 @@ class Teleop {
     const std::size_t inner_bytes = object->bytesize();
     const std::size_t inner_alignment = object->minalign();
     const std::uint64_t inner_hash = schema::struct_hash(*schema, *object);
-    const schema::Identity inner_identity{
-        std::string(inner_name), inner_hash, reader->bfbs};
+    const schema::Identity inner_identity{std::string(inner_name), inner_hash,
+                                          reader->bfbs};
 
-    const std::size_t lane_index = TargetAccess::open_lane(
-        node_, sub_name, "teleop", inner_bytes, inner_alignment,
-        inner_identity);
+    const std::size_t lane_index =
+        TargetAccess::open_lane(node_, sub_name, "teleop", inner_bytes,
+                                inner_alignment, inner_identity);
 
     detail::SubsystemState state;
     state.name = sub_name;
@@ -459,8 +461,7 @@ class Teleop {
             if (ev == nullptr) {
               throw std::invalid_argument(field_where +
                                           ": unknown enum label '" + label +
-                                          "' in " +
-                                          rf.enum_def->name()->str());
+                                          "' in " + rf.enum_def->name()->str());
             }
             detail::EncodeIntegerBytes(action.bytes.data(), rf.base_type,
                                        ev->value(), field_where);
@@ -488,8 +489,8 @@ class Teleop {
         binding.deadband_frac = parsed_binding.deadband_frac;
 
         const std::string field_where = entry_where + ".field";
-        detail::ResolvedField rf =
-            detail::ResolveField(*schema, *object, parsed_binding.field, field_where);
+        detail::ResolvedField rf = detail::ResolveField(
+            *schema, *object, parsed_binding.field, field_where);
         if (rf.base_type == reflection::BaseType::Bool ||
             rf.enum_def != nullptr) {
           throw std::invalid_argument(field_where + ": field '" + rf.leaf_name +

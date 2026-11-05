@@ -96,6 +96,57 @@
       ]
     },
     {
+      "name": "driver",
+      "target": "//2026-robot/main_processor/driver:node",
+      "described": true,
+      "sources": [
+        {
+          "kind": "SENDER",
+          "name": "/drivetrain/target/teleop",
+          "message_bytes": 40,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.TargetEnvelope<drivetrain.ChassisTarget>",
+          "schema_hash": "0x6afed51452740f04",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/hw/state/driver_station",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.hardware.Packet",
+          "schema_hash": "0x33d3c5e0cdc00979",
+          "alignment": 4,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/drivetrain/state",
+          "message_bytes": 112,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "drivetrain.DrivetrainState",
+          "schema_hash": "0xa4bfcc84220ca6ea",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "TIMER",
+          "name": "driver",
+          "message_bytes": 0,
+          "external": false,
+          "optional": false,
+          "observer": false
+        }
+      ]
+    },
+    {
       "name": "drivetrain",
       "target": "//2026-robot/main_processor/drivetrain:node",
       "described": true,
@@ -286,81 +337,6 @@
         {
           "kind": "TIMER",
           "name": "intake",
-          "message_bytes": 0,
-          "external": false,
-          "optional": false,
-          "observer": false
-        }
-      ]
-    },
-    {
-      "name": "operator_interface",
-      "target": "//2026-robot/main_processor/operator_interface:node",
-      "described": true,
-      "sources": [
-        {
-          "kind": "SENDER",
-          "name": "/drivetrain/target/teleop",
-          "message_bytes": 40,
-          "external": false,
-          "optional": false,
-          "observer": false,
-          "schema": "talos.TargetEnvelope<drivetrain.ChassisTarget>",
-          "schema_hash": "0x6afed51452740f04",
-          "alignment": 8,
-          "slots": 1024
-        },
-        {
-          "kind": "WATCHER",
-          "name": "/hw/state/driver_station",
-          "message_bytes": 1404,
-          "external": false,
-          "optional": false,
-          "observer": false,
-          "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
-          "alignment": 4,
-          "slots": 1024
-        },
-        {
-          "kind": "SENDER",
-          "name": "/shooter/target/teleop",
-          "message_bytes": 24,
-          "external": false,
-          "optional": false,
-          "observer": false,
-          "schema": "talos.TargetEnvelope<shooter.ShooterTarget>",
-          "schema_hash": "0x58c8d0e5410d74f7",
-          "alignment": 8,
-          "slots": 1024
-        },
-        {
-          "kind": "SENDER",
-          "name": "/intake/target/teleop",
-          "message_bytes": 20,
-          "external": false,
-          "optional": false,
-          "observer": false,
-          "schema": "talos.TargetEnvelope<intake.IntakeTarget>",
-          "schema_hash": "0x611722557563b8ba",
-          "alignment": 8,
-          "slots": 1024
-        },
-        {
-          "kind": "WATCHER",
-          "name": "/drivetrain/state",
-          "message_bytes": 112,
-          "external": false,
-          "optional": false,
-          "observer": false,
-          "schema": "drivetrain.DrivetrainState",
-          "schema_hash": "0xa4bfcc84220ca6ea",
-          "alignment": 8,
-          "slots": 1024
-        },
-        {
-          "kind": "TIMER",
-          "name": "operator_interface",
           "message_bytes": 0,
           "external": false,
           "optional": false,
@@ -604,6 +580,57 @@
           "slots": 64
         }
       ]
+    },
+    {
+      "name": "teleop",
+      "target": "//talOS/teleop:node",
+      "described": true,
+      "sources": [
+        {
+          "kind": "WATCHER",
+          "name": "/hw/state/driver_station",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.hardware.Packet",
+          "schema_hash": "0x33d3c5e0cdc00979",
+          "alignment": 4,
+          "slots": 1024
+        },
+        {
+          "kind": "SENDER",
+          "name": "/intake/target/teleop",
+          "message_bytes": 20,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.TargetEnvelope<intake.IntakeTarget>",
+          "schema_hash": "0x611722557563b8ba",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "SENDER",
+          "name": "/shooter/target/teleop",
+          "message_bytes": 24,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.TargetEnvelope<shooter.ShooterTarget>",
+          "schema_hash": "0x58c8d0e5410d74f7",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "TIMER",
+          "name": "teleop",
+          "message_bytes": 0,
+          "external": false,
+          "optional": false,
+          "observer": false
+        }
+      ]
     }
   ],
   "diagnostics": [
@@ -636,11 +663,6 @@
       "severity": "warning",
       "subject": "/shooter/state",
       "message": "is published but nothing subscribes to it"
-    },
-    {
-      "severity": "warning",
-      "subject": "operator_interface",
-      "message": "numeric parameters without a unit suffix (docs/METHODOLOGY.md \u00a76): deadband, intake_button, shoot_button"
     }
   ]
 }

@@ -78,7 +78,6 @@ struct TeleopBinding {
   bool operator==(const TeleopBinding&) const = default;
 };
 
-
 struct RobotConfig {
   hardware::Config hardware;
   std::map<std::string, hardware::Devices> subsystems;
@@ -136,7 +135,6 @@ struct RobotConfig {
   }
   // Subsystem teleop bindings, preserving list order.
   std::map<std::string, std::vector<TeleopBinding>> teleop;
-
 };
 
 namespace detail {
@@ -377,7 +375,7 @@ inline void ApplyTargetPolicy(const toml::table& tbl, TargetPolicy& policy,
 }
 
 inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
-                                             const std::string& sub_name) {
+                                              const std::string& sub_name) {
   std::vector<TeleopBinding> result;
   if (!sub_tbl.contains("teleop")) return result;
   const auto& teleop_node = sub_tbl["teleop"];

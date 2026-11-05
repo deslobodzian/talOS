@@ -15,11 +15,11 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "SENDER",
@@ -27,11 +27,11 @@
           "message_bytes": 1404,
           "external": true,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "SENDER",
@@ -39,11 +39,11 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "SENDER",
@@ -51,11 +51,11 @@
           "message_bytes": 112,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "bridge.BridgeStatus",
           "schema_hash": "0x4c34d7f97350fc87",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "FETCHER",
@@ -63,11 +63,11 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "FETCHER",
@@ -75,11 +75,11 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "FETCHER",
@@ -87,10 +87,61 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
+          "slots": 1024
+        }
+      ]
+    },
+    {
+      "name": "driver",
+      "target": "//2026-robot/main_processor/driver:node",
+      "described": true,
+      "sources": [
+        {
+          "kind": "SENDER",
+          "name": "/drivetrain/target/teleop",
+          "message_bytes": 40,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.TargetEnvelope<drivetrain.ChassisTarget>",
+          "schema_hash": "0x6afed51452740f04",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/hw/state/driver_station",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.hardware.Packet",
+          "schema_hash": "0x33d3c5e0cdc00979",
+          "alignment": 4,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/drivetrain/state",
+          "message_bytes": 112,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "drivetrain.DrivetrainState",
+          "schema_hash": "0xa4bfcc84220ca6ea",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "TIMER",
+          "name": "driver",
+          "message_bytes": 0,
+          "external": false,
+          "optional": false,
           "observer": false
         }
       ]
@@ -106,11 +157,11 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "WATCHER",
@@ -118,11 +169,11 @@
           "message_bytes": 112,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "bridge.BridgeStatus",
           "schema_hash": "0x4c34d7f97350fc87",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "WATCHER",
@@ -130,11 +181,11 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "WATCHER",
@@ -142,11 +193,11 @@
           "message_bytes": 40,
           "external": false,
           "optional": true,
+          "observer": false,
           "schema": "talos.TargetEnvelope<drivetrain.ChassisTarget>",
           "schema_hash": "0x6afed51452740f04",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "WATCHER",
@@ -154,11 +205,11 @@
           "message_bytes": 40,
           "external": false,
           "optional": true,
+          "observer": false,
           "schema": "talos.TargetEnvelope<drivetrain.ChassisTarget>",
           "schema_hash": "0x6afed51452740f04",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "SENDER",
@@ -166,11 +217,11 @@
           "message_bytes": 112,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "drivetrain.DrivetrainState",
           "schema_hash": "0xa4bfcc84220ca6ea",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "SENDER",
@@ -178,11 +229,11 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "TIMER",
@@ -205,11 +256,11 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "WATCHER",
@@ -217,11 +268,11 @@
           "message_bytes": 112,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "bridge.BridgeStatus",
           "schema_hash": "0x4c34d7f97350fc87",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "SENDER",
@@ -229,11 +280,11 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "WATCHER",
@@ -241,11 +292,11 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "WATCHER",
@@ -253,11 +304,11 @@
           "message_bytes": 20,
           "external": false,
           "optional": true,
+          "observer": false,
           "schema": "talos.TargetEnvelope<intake.IntakeTarget>",
           "schema_hash": "0x611722557563b8ba",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "WATCHER",
@@ -265,11 +316,11 @@
           "message_bytes": 20,
           "external": false,
           "optional": true,
+          "observer": false,
           "schema": "talos.TargetEnvelope<intake.IntakeTarget>",
           "schema_hash": "0x611722557563b8ba",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "SENDER",
@@ -277,90 +328,15 @@
           "message_bytes": 20,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "intake.IntakeState",
           "schema_hash": "0x79500160d91a3f73",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "TIMER",
           "name": "intake",
-          "message_bytes": 0,
-          "external": false,
-          "optional": false,
-          "observer": false
-        }
-      ]
-    },
-    {
-      "name": "operator_interface",
-      "target": "//2026-robot/main_processor/operator_interface:node",
-      "described": true,
-      "sources": [
-        {
-          "kind": "SENDER",
-          "name": "/drivetrain/target/teleop",
-          "message_bytes": 40,
-          "external": false,
-          "optional": false,
-          "schema": "talos.TargetEnvelope<drivetrain.ChassisTarget>",
-          "schema_hash": "0x6afed51452740f04",
-          "alignment": 8,
-          "slots": 1024,
-          "observer": false
-        },
-        {
-          "kind": "WATCHER",
-          "name": "/hw/state/driver_station",
-          "message_bytes": 1404,
-          "external": false,
-          "optional": false,
-          "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
-          "alignment": 4,
-          "slots": 1024,
-          "observer": false
-        },
-        {
-          "kind": "SENDER",
-          "name": "/shooter/target/teleop",
-          "message_bytes": 24,
-          "external": false,
-          "optional": false,
-          "schema": "talos.TargetEnvelope<shooter.ShooterTarget>",
-          "schema_hash": "0x58c8d0e5410d74f7",
-          "alignment": 8,
-          "slots": 1024,
-          "observer": false
-        },
-        {
-          "kind": "SENDER",
-          "name": "/intake/target/teleop",
-          "message_bytes": 20,
-          "external": false,
-          "optional": false,
-          "schema": "talos.TargetEnvelope<intake.IntakeTarget>",
-          "schema_hash": "0x611722557563b8ba",
-          "alignment": 8,
-          "slots": 1024,
-          "observer": false
-        },
-        {
-          "kind": "WATCHER",
-          "name": "/drivetrain/state",
-          "message_bytes": 112,
-          "external": false,
-          "optional": false,
-          "schema": "drivetrain.DrivetrainState",
-          "schema_hash": "0xa4bfcc84220ca6ea",
-          "alignment": 8,
-          "slots": 1024,
-          "observer": false
-        },
-        {
-          "kind": "TIMER",
-          "name": "operator_interface",
           "message_bytes": 0,
           "external": false,
           "optional": false,
@@ -379,11 +355,11 @@
           "message_bytes": 112,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "drivetrain.DrivetrainState",
           "schema_hash": "0xa4bfcc84220ca6ea",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "SENDER",
@@ -391,11 +367,11 @@
           "message_bytes": 72,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "geometry.PoseEstimate",
           "schema_hash": "0x64a0ad522b244795",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "TIMER",
@@ -418,11 +394,11 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "WATCHER",
@@ -430,11 +406,11 @@
           "message_bytes": 112,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "bridge.BridgeStatus",
           "schema_hash": "0x4c34d7f97350fc87",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "SENDER",
@@ -442,11 +418,11 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "WATCHER",
@@ -454,11 +430,11 @@
           "message_bytes": 1404,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "talos.hardware.Packet",
           "schema_hash": "0x33d3c5e0cdc00979",
           "alignment": 4,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "WATCHER",
@@ -466,11 +442,11 @@
           "message_bytes": 24,
           "external": false,
           "optional": true,
+          "observer": false,
           "schema": "talos.TargetEnvelope<shooter.ShooterTarget>",
           "schema_hash": "0x58c8d0e5410d74f7",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "WATCHER",
@@ -478,11 +454,11 @@
           "message_bytes": 24,
           "external": false,
           "optional": true,
+          "observer": false,
           "schema": "talos.TargetEnvelope<shooter.ShooterTarget>",
           "schema_hash": "0x58c8d0e5410d74f7",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "SENDER",
@@ -490,11 +466,11 @@
           "message_bytes": 32,
           "external": false,
           "optional": false,
+          "observer": false,
           "schema": "shooter.ShooterState",
           "schema_hash": "0x24ee4ff3f93dc643",
           "alignment": 8,
-          "slots": 1024,
-          "observer": false
+          "slots": 1024
         },
         {
           "kind": "TIMER",
@@ -604,6 +580,57 @@
           "slots": 64
         }
       ]
+    },
+    {
+      "name": "teleop",
+      "target": "//talOS/teleop:node",
+      "described": true,
+      "sources": [
+        {
+          "kind": "WATCHER",
+          "name": "/hw/state/driver_station",
+          "message_bytes": 1404,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.hardware.Packet",
+          "schema_hash": "0x33d3c5e0cdc00979",
+          "alignment": 4,
+          "slots": 1024
+        },
+        {
+          "kind": "SENDER",
+          "name": "/intake/target/teleop",
+          "message_bytes": 20,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.TargetEnvelope<intake.IntakeTarget>",
+          "schema_hash": "0x611722557563b8ba",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "SENDER",
+          "name": "/shooter/target/teleop",
+          "message_bytes": 24,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.TargetEnvelope<shooter.ShooterTarget>",
+          "schema_hash": "0x58c8d0e5410d74f7",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "TIMER",
+          "name": "teleop",
+          "message_bytes": 0,
+          "external": false,
+          "optional": false,
+          "observer": false
+        }
+      ]
     }
   ],
   "diagnostics": [
@@ -619,26 +646,6 @@
     },
     {
       "severity": "warning",
-      "subject": "/shooter/target/auto",
-      "message": "is in the target policy of shooter but nothing writes it yet"
-    },
-    {
-      "severity": "warning",
-      "subject": "operator_interface",
-      "message": "numeric parameters without a unit suffix (docs/METHODOLOGY.md \u00a76): deadband, intake_button, shoot_button"
-    },
-    {
-      "severity": "error",
-      "subject": "/hw/req/drive",
-      "message": "topic '/hw/req/drive': role 'req' is an abbreviation; use 'request' (declared by drivetrain)"
-    },
-    {
-      "severity": "error",
-      "subject": "/hw/request/drivetrain",
-      "message": "is read by hardware_node but nothing publishes it; either the writer is missing or the two ends are spelled differently"
-    },
-    {
-      "severity": "warning",
       "subject": "/intake/state",
       "message": "is published but nothing subscribes to it"
     },
@@ -649,8 +656,23 @@
     },
     {
       "severity": "warning",
+      "subject": "/shooter/target/auto",
+      "message": "is in the target policy of shooter but nothing writes it yet"
+    },
+    {
+      "severity": "warning",
       "subject": "/shooter/state",
       "message": "is published but nothing subscribes to it"
+    },
+    {
+      "severity": "error",
+      "subject": "/hw/req/drive",
+      "message": "topic '/hw/req/drive': role 'req' is an abbreviation; use 'request' (declared by drivetrain)"
+    },
+    {
+      "severity": "error",
+      "subject": "/hw/request/drivetrain",
+      "message": "is read by hardware_node but nothing publishes it; either the writer is missing or the two ends are spelled differently"
     }
   ]
 }
