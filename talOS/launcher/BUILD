@@ -13,6 +13,7 @@ cc_library(
         "//talOS/events:events_log",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
+        "//talOS/introspection:registry",
         "//talOS/rtms",
         "//talOS/schema:unit_suffix",
         "@tomlplusplus//:toml++",
@@ -57,6 +58,7 @@ cc_test(
     srcs = ["supervision_test.cc"],
     deps = [
         ":launcher_lib",
+        "//talOS/introspection:registry",
         "@googletest//:gtest_main",
     ],
 )

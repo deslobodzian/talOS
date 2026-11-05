@@ -66,6 +66,7 @@ LogWriter::State::~State() {
     submit_active();
   }
   stop_writer();
+  sync();
 
   if (fd >= 0) {
     ::close(fd);
@@ -74,7 +75,7 @@ LogWriter::State::~State() {
 }
 
 void LogWriter::State::set_error(std::string message) noexcept {
-  std::lock_guard lock{mutex};
+  std::lock_guard lock{error_mutex};
   failed = true;
   if (error.empty()) {
     error = std::move(message);
@@ -101,14 +102,15 @@ void LogWriter::State::write_all(const void* data, std::size_t size) {
 // a failed write is recorded and the chunk is dropped rather than retried
 // forever, because the loop it serves cannot wait.
 void LogWriter::State::write_chunk(Chunk& chunk) noexcept {
-  const std::size_t size = chunk.used;
-  chunk.used = 0;
+  const std::size_t size = options.background
+                               ? chunk.committed.load(std::memory_order_acquire)
+                               : chunk.used;
 
   if (failed || size == 0) return;
 
-  std::size_t written = 0;
-  while (written < size) {
-    const ssize_t n = ::write(fd, chunk.data.data() + written, size - written);
+  while (chunk.written < size) {
+    const ssize_t n =
+        ::write(fd, chunk.data.data() + chunk.written, size - chunk.written);
     if (n < 0) {
       if (errno == EINTR) {
         continue;
@@ -117,8 +119,19 @@ void LogWriter::State::write_chunk(Chunk& chunk) noexcept {
                 std::strerror(errno));
       return;
     }
-    written += static_cast<std::size_t>(n);
+    chunk.written += static_cast<std::size_t>(n);
   }
+}
+
+void LogWriter::State::sync() noexcept {
+  int result;
+  do {
+    result = ::fsync(fd);
+  } while (result < 0 && errno == EINTR);
+  if (result < 0) {
+    set_error(std::string{"LogWriter: fsync failed: "} + std::strerror(errno));
+  }
+  last_sync = std::chrono::steady_clock::now();
 }
 
 void LogWriter::State::submit_active() noexcept {
@@ -131,6 +144,8 @@ void LogWriter::State::submit_active() noexcept {
 
   if (!options.background) {
     write_chunk(*chunk);
+    chunk->used = 0;
+    chunk->written = 0;
     active = chunk;
     return;
   }
@@ -206,12 +221,20 @@ void LogWriter::State::append(RecordHeader header,
                 payload.data(), payload.size());
   }
   active->used += total;
+  if (options.background) {
+    active->committed.store(active->used, std::memory_order_release);
+  } else if (std::chrono::steady_clock::now() - last_sync >=
+             std::chrono::seconds{1}) {
+    submit_active();
+    sync();
+  }
 }
 
 void LogWriter::State::drain() noexcept {
   submit_active();
 
   if (!options.background) {
+    sync();
     return;
   }
 
@@ -219,6 +242,9 @@ void LogWriter::State::drain() noexcept {
   pending_ready.notify_all();
   chunk_ready.wait(lock,
                    [this] { return completed.load() == submitted.load(); });
+  // All submitted chunks have reached the descriptor; serialize fsync with
+  // the worker's periodic sync, which also runs under this mutex.
+  sync();
 }
 
 void LogWriter::State::stop_writer() noexcept {
@@ -313,8 +339,12 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
         return raw->completed.load() != raw->submitted.load() || raw->stopping;
       });
 
+      const bool sync_due = std::chrono::steady_clock::now() - raw->last_sync >=
+                            std::chrono::seconds{1};
       const auto next = raw->completed.load(std::memory_order_relaxed);
-      if (next == raw->submitted.load(std::memory_order_acquire)) {
+      const bool submitted =
+          next != raw->submitted.load(std::memory_order_acquire);
+      if (!submitted && !sync_due) {
         if (raw->stopping) {
           return;
         }
@@ -329,8 +359,15 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
       raw->write_chunk(*chunk);
       lock.lock();
 
-      raw->completed.store(next + 1, std::memory_order_release);
-      raw->chunk_ready.notify_all();
+      if (submitted) {
+        chunk->committed.store(0, std::memory_order_relaxed);
+        chunk->written = 0;
+        raw->completed.store(next + 1, std::memory_order_release);
+        raw->chunk_ready.notify_all();
+      }
+      if (sync_due) {
+        raw->sync();
+      }
     }
   }};
 }
@@ -390,7 +427,7 @@ std::string LogWriter::error() const {
     case State::CaptureError::NONE:
       break;
   }
-  std::lock_guard lock{state_->mutex};
+  std::lock_guard lock{state_->error_mutex};
   return state_->error;
 }
 

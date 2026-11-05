@@ -434,7 +434,7 @@ class ConfigAssembler {
     }
 
     // New session / config ID
-    if (active_config_id_ != hdr.config_id) {
+    if (chunk_count_ == 0 || active_config_id_ != hdr.config_id) {
       active_config_id_ = hdr.config_id;
       total_crc32_ = hdr.total_crc32;
       total_bytes_ = hdr.total_bytes;
@@ -501,6 +501,9 @@ class ConfigAssembler {
     }
 
     config_ = parsed;
+    const auto completed_id = active_config_id_;
+    Reset();
+    active_config_id_ = completed_id;
     return Status::kComplete;
   }
 
@@ -527,6 +530,32 @@ class ConfigAssembler {
   std::vector<uint8_t> assembled_buffer_{};
   Config config_{};
 };
+
+// Disk envelope: config_wire bytes followed by their little-endian CRC32.
+inline std::vector<uint8_t> PersistedConfig(const Config& config) {
+  auto bytes = SerializeConfig(config);
+  const auto crc = ComputeCrc32(bytes);
+  detail::ByteWriter{bytes}.Int(crc, 4);
+  return bytes;
+}
+
+inline bool LoadPersistedConfig(std::span<const uint8_t> bytes,
+                                Config& config) {
+  if (bytes.size() < 4) return false;
+  const auto payload = bytes.first(bytes.size() - 4);
+  detail::ByteReader trailer{bytes.last(4)};
+  if (ComputeCrc32(payload) != trailer.Int(4)) return false;
+  Config parsed;
+  if (!DeserializeConfig(payload, parsed) || !CheckCeilings(parsed).ok)
+    return false;
+  try {
+    Validate(parsed);
+  } catch (...) {
+    return false;
+  }
+  config = std::move(parsed);
+  return true;
+}
 
 inline std::size_t EncodeConfigAck(const ConfigAckPayload& ack,
                                    std::span<uint8_t> out) {

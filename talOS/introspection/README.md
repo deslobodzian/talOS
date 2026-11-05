@@ -17,7 +17,10 @@ drives each subsystem.
 
 ## The segment
 
-The path is `/talos_registry.2`, and the trailing number is `kRegistryVersion`.
+The logical path is `/talos_registry.2`, and the trailing number is
+`kRegistryVersion`. Registry opens and explicit unlinks apply `ShmObjectName`,
+just like topics: `TALOS_SHM_NAMESPACE` (or Bazel's `TEST_TMPDIR` fallback)
+isolates tests and their children, while production retains the ordinary name.
 The version is part of the name on purpose. The records below are a frozen
 binary layout shared between processes that were compiled separately, so a build
 whose records have a different shape must not be able to read a segment written

@@ -71,39 +71,52 @@ int main(int argc, char** argv) {
         if (*options.max_restarts < 0) {
           throw std::invalid_argument("--max-restarts must be >= 0");
         }
+      } else if (arg == "--restart-window-ms" && i + 1 < argc) {
+        options.restart_window_ms = std::stoi(argv[++i]);
+      } else if (arg == "--heartbeat-periods" && i + 1 < argc) {
+        options.heartbeat_periods = std::stoi(argv[++i]);
+      } else if (arg == "--heartbeat-startup-grace-ms" && i + 1 < argc) {
+        options.heartbeat_startup_grace_ms = std::stoi(argv[++i]);
       } else if (arg == "--help" || arg == "-h") {
-        std::cout << "usage: launcher (--config PATH | --bundle PATH) "
-                     "[--output-dir PATH] "
-                     "[--duration-s N] [--session-id ID] [--sim] "
-                     "[--start-sim-gateway] [--start-studio-bridge] "
-                     "[--studio-http-port PORT] [--describe-only] "
-                     "[--allow-graph-errors] [--describe-timeout-ms MS] "
-                     "[--max-restarts N] "
-                     "[--remote IP] [--remote-port PORT] [--local-port PORT] "
-                     "[--replay-inputs SESSION_DIR --only NODE]\n"
-                     "\n"
-                     "  --bundle PATH          launch from a bundle directory "
-                     "(assembled by talos_bundle)\n"
-                     "  --remote IP            controller address; overrides "
-                     "[robot] controller_address\n"
-                     "  --remote-port PORT     controller port; overrides "
-                     "[robot] controller_port (default 5802)\n"
-                     "  --local-port PORT      local bind port; overrides "
-                     "[robot] local_port (default 5803)\n"
-                     "  --describe-only        ask every node in the config "
-                     "what it is, lint the\n"
-                     "                         graph they describe, and exit "
-                     "without starting a robot\n"
-                     "  --allow-graph-errors   start anyway when the declared "
-                     "graph has errors\n"
-                     "  --max-restarts N       restarts per crashed node; "
-                     "overrides [robot] max_restarts\n"
-                     "                         (default 5, 0 disables)\n"
-                     "  --replay-inputs DIR    run only the --only node, fed "
-                     "the topics the session\n"
-                     "                         in DIR logged at their "
-                     "recorded times; its log goes\n"
-                     "                         to --output-dir\n";
+        std::cout
+            << "usage: launcher (--config PATH | --bundle PATH) "
+               "[--output-dir PATH] "
+               "[--duration-s N] [--session-id ID] [--sim] "
+               "[--start-sim-gateway] [--start-studio-bridge] "
+               "[--studio-http-port PORT] [--describe-only] "
+               "[--allow-graph-errors] [--describe-timeout-ms MS] "
+               "[--max-restarts N] "
+               "[--remote IP] [--remote-port PORT] [--local-port PORT] "
+               "[--replay-inputs SESSION_DIR --only NODE]\n"
+               "\n"
+               "  --bundle PATH          launch from a bundle directory "
+               "(assembled by talos_bundle)\n"
+               "  --remote IP            controller address; overrides "
+               "[robot] controller_address\n"
+               "  --remote-port PORT     controller port; overrides "
+               "[robot] controller_port (default 5802)\n"
+               "  --local-port PORT      local bind port; overrides "
+               "[robot] local_port (default 5803)\n"
+               "  --describe-only        ask every node in the config "
+               "what it is, lint the\n"
+               "                         graph they describe, and exit "
+               "without starting a robot\n"
+               "  --allow-graph-errors   start anyway when the declared "
+               "graph has errors\n"
+               "  --max-restarts N       restarts per node per rolling window; "
+               "overrides [robot] max_restarts (default 5, 0 disables)\n"
+               "  --restart-window-ms MS rolling restart window (default "
+               "60000)\n"
+               "  --heartbeat-periods N  stalled heartbeat/dispatch timeout in "
+               "node "
+               "periods (default 10, minimum timeout 500ms)\n"
+               "  --heartbeat-startup-grace-ms MS startup grace (default "
+               "5000)\n"
+               "  --replay-inputs DIR    run only the --only node, fed "
+               "the topics the session\n"
+               "                         in DIR logged at their "
+               "recorded times; its log goes\n"
+               "                         to --output-dir\n";
         return 0;
       } else {
         throw std::invalid_argument("unknown argument: " + arg);

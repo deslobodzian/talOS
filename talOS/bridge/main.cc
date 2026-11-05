@@ -19,6 +19,7 @@ int main(int argc, char** argv) {
     bool simulation = false;
     uint64_t session_id = 0;
     bool describe = false;
+    std::string log_path;
 
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
@@ -37,7 +38,7 @@ int main(int argc, char** argv) {
       } else if (arg == "--describe") {
         describe = true;
       } else if (arg == "--log" && i + 1 < argc) {
-        ++i;  // Optional log path
+        log_path = argv[++i];
       } else if (arg == "--session-id" && i + 1 < argc) {
         session_id = std::stoull(argv[++i]);
       } else {
@@ -67,7 +68,8 @@ int main(int argc, char** argv) {
                                        remote_port,
                                        local_port,
                                        simulation,
-                                       session_id};
+                                       session_id,
+                                       std::move(log_path)};
 
     // --describe answers out of the constructor alone: no socket, no shared
     // memory, no registry slot, nothing the real node holds. That is what lets

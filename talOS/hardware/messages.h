@@ -55,6 +55,7 @@ struct MotorSample {
   bool valid{};
   double position_rot{}, velocity_rps{}, voltage{}, stator_current_a{};
   uint32_t position_age_us{}, velocity_age_us{};
+  uint32_t fault_flags{};
   bool operator==(const MotorSample&) const = default;
 };
 struct SensorSample {
@@ -97,6 +98,20 @@ struct PwmSample {
   double output{};
   bool operator==(const PwmSample&) const = default;
 };
+struct HealthSample {
+  bool valid{};
+  double battery_v{};
+  bool brownout{};
+  double can_utilization_frac{};
+  bool operator==(const HealthSample&) const = default;
+};
+struct GatewayCounters {
+  uint32_t rejected_command_count{};
+  uint32_t neutralized_motor_count{};
+  uint32_t apply_failure_count{};
+  uint32_t device_reset_count{};
+  bool operator==(const GatewayCounters&) const = default;
+};
 struct State {
   uint64_t config_id{}, boot_id{}, epoch{}, sample_time_us{},
       last_command_sequence{};
@@ -111,6 +126,8 @@ struct State {
   std::array<AnalogInputSample, kMaxAnalogInputs> analog_inputs{};
   std::array<EncoderSample, kMaxEncoders> encoders{};
   std::array<PwmSample, kMaxPwmOutputs> pwm_outputs{};
+  HealthSample health{};
+  GatewayCounters counters{};
   bool operator==(const State&) const = default;
 };
 

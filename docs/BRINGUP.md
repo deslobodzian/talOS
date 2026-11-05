@@ -12,8 +12,8 @@
 - [ ] Run `bazel build //2026-robot/main_processor:robot_bundle`. Expected: the field-config bundle is generated at `bazel-bin/2026-robot/main_processor/robot_bundle/`.
 - [ ] Deploy the RoboRIO program using `./gradlew deploy` from `2026-robot/controller_processor/rio`. Expected: the intended gateway program starts on the RIO with the Mini's companion address.
 - [ ] On the Mini run `./tools/deploy.sh install bazel-bin/2026-robot/main_processor/robot_bundle`. Expected: `/opt/talos/current` selects a new read-only bundle and the previous bundle is retained. Use the documented `--prefix` option if the operator needs a different writable installation location.
-- [ ] Start exactly one launcher with `/opt/talos/current/run.sh`; stop any boot-managed instance first. Expected: nodes stay running and a logging session is created. Do not edit the installed bundle; rebuild and reinstall configuration changes.
-- [ ] Run `./tools/deploy.sh logs`. Expected: the session manifest identifies the deployed config hash and node log paths. Retain that session and the RIO console output for every check below.
+- [ ] Start exactly one launcher with `/opt/talos/current/run.sh --output-dir /opt/talos/logs`; stop any boot-managed instance first. Expected: nodes stay running and a unique `/opt/talos/logs/<session-id>/` logging session is created. The launcher appends the session id; pass the output root, not a session path. Do not edit the installed bundle; rebuild and reinstall configuration changes.
+- [ ] Run `./tools/deploy.sh logs` (add `--prefix` for a custom installation). Expected: session directories are listed and the newest manifest identifies the deployed config hash and node log paths. Retain that session and the RIO console output for every check below.
 - [ ] For live inspection, run `bazel build //studio:web_dist`, then in another terminal `bazel run //studio/bridge:studio_bridge -- --drop-newest-publisher /talos/telemetry 5800 bazel-bin/studio/dist`. Open `http://127.0.0.1:5800` on the Mini and select Studio's system view. Expected: live node rows, source selections and loop timing are visible. Run only one Studio bridge.
 
 ## Uncommissioned, then disabled
@@ -42,7 +42,7 @@
 
 ## Link timing and fault injection
 
-- [ ] Collect representative enabled sessions and decode each with `bazel run //talOS/launcher:log_dump -- <session-dir>` (replace the placeholder with the directory reported by deployment logs). Expected: timestamped topic records and named payload fields are available; preserve the raw `.tlog` files and record the config hash.
+- [ ] Collect representative enabled sessions with `./tools/deploy.sh fetch /media/usb/robot-sessions` on the Mini (add `--prefix` for a custom installation), using a fresh destination to avoid merging existing sessions. Expected: each complete session folder, its manifest and all restarted-node log attempts are copied. Stop the stack before the final fetch for a stable completed recording. Transfer the folders to the analysis machine and decode each with `bazel run //talOS/launcher:log_dump -- <session-dir>` (replace the placeholder with a copied session directory). Expected: timestamped topic records and named payload fields are available; preserve the raw `.tlog` files and record the config hash.
 - [ ] Measure `/hw/state` inter-arrival from the launcher logs. Pass: median about **5 ms**, **p99 under 10 ms**, and **no gap of 100 ms while enabled**.
 - [ ] Correlate target receipts with drivetrain ticks. Pass: target age at each tick is **about 25 ms at most**, **never `command_timeout_us`**. Freshness starts at node receipt, not a sender timestamp; account for the consumer's drain/tick when interpreting a stalled consumer.
 - [ ] Check `DrivetrainState.timestamp_ns` against node time, not the RIO sample clock. Expected: odometry's integration `dt` uses node-time state timestamps; it must not interpret RIO uptime as node time.

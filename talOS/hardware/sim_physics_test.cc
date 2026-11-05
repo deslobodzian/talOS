@@ -55,6 +55,31 @@ void StepBackend(Backend& backend, State& s, uint64_t& now_us, uint64_t step_us,
   }
 }
 
+template <typename Sim>
+void CheckPowerHealth() {
+  Sim backend;
+  Gateway gateway{SingleMotorConfig(), backend, 1};
+  gateway.Tick(1000, false);
+  EXPECT_EQ(gateway.snapshot().health, (HealthSample{true, 12.0, false, 0.0}));
+  backend.SetPowerHealth(6.5, true);
+  gateway.Tick(2000, true);
+  EXPECT_EQ(gateway.snapshot().health, (HealthSample{true, 6.5, true, 0.0}));
+  // Health remains observable without a live command, including
+  // timeout/disable.
+  gateway.Tick(200000, true);
+  EXPECT_TRUE(gateway.snapshot().health.brownout);
+  EXPECT_EQ(gateway.snapshot().flags & kCommandActive, 0u);
+  gateway.Tick(201000, false);
+  EXPECT_DOUBLE_EQ(gateway.snapshot().health.battery_v, 6.5);
+}
+
+TEST(SimHealth, IdealReportsPowerWhileDisabledAndStale) {
+  CheckPowerHealth<SimBackend>();
+}
+TEST(SimHealth, PhysicsReportsPowerWhileDisabledAndStale) {
+  CheckPowerHealth<PhysicsSimBackend>();
+}
+
 // The ideal backend is for fast logic tests: demands apply instantly,
 // even with zero gains. The physics backend must NOT behave this way.
 TEST(SimBelievability, IdealTeleportsWhilePhysicsRamps) {

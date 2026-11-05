@@ -50,6 +50,8 @@ struct HardwareAccess {
   static void motor_set(HardwareLink& link, std::size_t index,
                         hardware::Mode mode, double demand, double ff_volts,
                         int slot);
+  static std::uint64_t motor_clamped_count(const HardwareLink& link,
+                                           std::size_t index);
   // The latched sample for a device; all zeros (valid == false) until an
   // accepted hardware state carries it.
   static hardware::MotorSample motor_sample(const HardwareLink& link,

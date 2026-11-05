@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -21,15 +22,20 @@ static_assert(alignof(bridge::BridgeStatus) == 8);
 HardwareNode::HardwareNode(config::RobotConfig robot_config,
                            std::string remote_ip, uint16_t remote_port,
                            uint16_t local_port, bool simulation,
-                           uint64_t session_id)
+                           uint64_t session_id, std::string log_path)
     : robot_config_{std::move(robot_config)},
       config_{robot_config_.hardware},
       remote_ip_{std::move(remote_ip)},
       remote_port_{remote_port},
       local_port_{local_port},
       simulation_{simulation},
-      session_id_{session_id} {
-  if (simulation_ || remote_ip_ == "127.0.0.1") {
+      session_id_{session_id},
+      log_path_{std::move(log_path)} {
+  if (simulation_ && remote_ip_ != "127.0.0.1") {
+    throw std::invalid_argument(
+        "--sim requires --remote 127.0.0.1, got --remote " + remote_ip_);
+  }
+  if (remote_ip_ == "127.0.0.1") {
     config_.commissioned = true;
   }
   config_id_ = ConfigurationId(config_);
@@ -133,6 +139,11 @@ bool HardwareNode::Open() {
   }
 
   BuildIntrospectionManifest();
+  if (!log_path_.empty()) {
+    log_ = std::make_unique<event::log::LogWriter>(
+        log_path_, kNodeName, event::log::LogWriter::Options{}, session_id_);
+    log_->start(introspection_manifest_, event::Poller::now());
+  }
 
   // A registry that cannot be opened must not stop the robot: not being
   // visible in a viewer is a far smaller failure than not driving.
@@ -247,9 +258,8 @@ void HardwareNode::PublishIntrospection() {
 void HardwareNode::PushConfig(uint64_t now_us) {
   auto chunks = CreateConfigChunks(config_);
   for (std::size_t i = 0; i < chunks.size(); ++i) {
-    peer_.SendFrame(protocol::FrameType::kHardwareConfig,
-                    static_cast<uint16_t>(i + 1), now_us, chunks[i].data(),
-                    chunks[i].size());
+    peer_.SendFrame(protocol::FrameType::kHardwareConfig, 0, now_us,
+                    chunks[i].data(), chunks[i].size());
   }
   last_push_time_us_ = now_us;
 }
@@ -308,10 +318,12 @@ void HardwareNode::Tick(uint64_t now_us) {
       last_epoch_ = state.epoch;
       last_sample_time_us_ = state.sample_time_us;
       last_state_flags_ = state.flags;
+      latest_state_ = state;
 
       talos::hardware::Packet pkt{};
       pkt.size = static_cast<uint32_t>(Encode(state, pkt.data));
       if (state_pub_) state_pub_->write(pkt);
+      LogPacket(0, pkt, now_us, states_received_);
       continue;
     }
 
@@ -346,8 +358,19 @@ void HardwareNode::Tick(uint64_t now_us) {
         } else if (!OwnsRequestDevices(tracker, partial)) {
           ++ownership_rejected_;
         } else {
-          // Apply the addressed actuators; ids absent from the merge are
-          // ignored.
+          // A request replaces this subsystem's whole desired output, not
+          // just the addressed devices. Omitted outputs are neutral.
+          for (auto j : tracker.motor_slots) {
+            full_cmd_.motors[j].mode = Mode::kNeutral;
+            full_cmd_.motors[j].demand = 0.0;
+            full_cmd_.motors[j].feedforward_v = 0.0;
+          }
+          for (auto j : tracker.digital_output_slots) {
+            full_cmd_.digital_outputs[j].value = false;
+          }
+          for (auto j : tracker.pwm_output_slots) {
+            full_cmd_.pwm_outputs[j].output = 0.0;
+          }
           for (std::size_t i = 0; i < partial.count; ++i) {
             const auto& pm = partial.motors[i];
             if (auto it = motor_index_.find(pm.id); it != motor_index_.end()) {
@@ -442,10 +465,10 @@ void HardwareNode::Tick(uint64_t now_us) {
       cmd_pkt.size = static_cast<uint32_t>(Encode(full_cmd_, cmd_pkt.data));
       if (cmd_pkt.size > 0) {
         if (cmd_pub_) cmd_pub_->write(cmd_pkt);
-        peer_.SendFrame(protocol::FrameType::kHardwareCommand,
-                        static_cast<uint16_t>(++cmd_sequence_), now_us,
+        peer_.SendFrame(protocol::FrameType::kHardwareCommand, 0, now_us,
                         cmd_pkt.data.data(), cmd_pkt.size);
         ++commands_sent_;
+        LogPacket(1, cmd_pkt, now_us, commands_sent_);
         last_sent_cmd_ = full_cmd_;
         last_send_us_ = now_us;
         have_last_sent_ = true;
@@ -470,6 +493,15 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
     if (bit < 32 && tracker.timed_out) timed_out_mask |= uint32_t{1} << bit;
     ++bit;
   }
+  uint32_t motor_fault_mask = 0;
+  for (std::size_t i = 0; i < config_.motors.size() && i < 32; ++i) {
+    for (std::size_t j = 0; j < latest_state_.motor_count; ++j) {
+      if (latest_state_.motors[j].id == config_.motors[i].id &&
+          latest_state_.motors[j].fault_flags != 0) {
+        motor_fault_mask |= uint32_t{1} << i;
+      }
+    }
+  }
   const uint64_t state_age_us =
       states_received_ > 0 && now_us > last_state_receipt_us_
           ? now_us - last_state_receipt_us_
@@ -491,7 +523,31 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       clock_.ignored_count(),
       static_cast<uint32_t>(clock_.window_count()),
       clock_.converged(),
+      latest_state_.health.valid,
+      latest_state_.health.battery_v,
+      latest_state_.health.brownout,
+      latest_state_.health.can_utilization_frac,
+      motor_fault_mask,
+      latest_state_.counters.rejected_command_count,
+      latest_state_.counters.neutralized_motor_count,
+      latest_state_.counters.apply_failure_count,
+      latest_state_.counters.device_reset_count,
   };
+}
+
+void HardwareNode::LogPacket(uint16_t source_id, const Packet& packet,
+                             uint64_t now_us, uint64_t sequence) {
+  if (!log_) return;
+  const auto now = event::MonotonicTime::from_nanos(
+      static_cast<std::int64_t>(now_us * 1000));
+  const event::Context context{.event_time = now, .now = now};
+  log_->send(context, source_id,
+             std::as_bytes(std::span{&packet, std::size_t{1}}), 0, sequence);
+  if (log_->failed() && !log_failure_reported_) {
+    std::fprintf(stderr, "hardware_node: log capture failed: %s\n",
+                 log_->error().c_str());
+    log_failure_reported_ = true;
+  }
 }
 
 bool HardwareNode::ShouldSendCommand(uint64_t now_us) {

@@ -71,8 +71,9 @@ if [ "$WANT_RIO" = "1" ] && [ "$WANT_GATEWAY" = "1" ]; then
 fi
 
 SESSION_ID="$(date +%s)"
-OUT_DIR="/tmp/talos_logs/${SESSION_ID}"
-LOG_DIR="${OUT_DIR}/sim"
+OUT_DIR="/tmp/talos_logs"
+SESSION_DIR="${OUT_DIR}/${SESSION_ID}"
+LOG_DIR="${SESSION_DIR}/sim"
 mkdir -p "$LOG_DIR"
 
 PIDS=""
@@ -103,7 +104,7 @@ cleanup() {
   sleep 1
   for p in $ordered; do kill -KILL "$p" 2>/dev/null; done
   wait 2>/dev/null
-  echo "sim.sh: logs in $LOG_DIR"
+  echo "sim.sh: session logs in $SESSION_DIR (launcher/RIO output in $LOG_DIR)"
 }
 trap cleanup EXIT INT TERM
 
@@ -180,7 +181,7 @@ fi
 LAUNCHER_PID=$!
 track "$LAUNCHER_PID" "launcher"
 
-GRAPH="$OUT_DIR/graph.json"
+GRAPH="$SESSION_DIR/graph.json"
 for i in $(seq 1 60); do
   [ -f "$GRAPH" ] && break
   sleep 0.5

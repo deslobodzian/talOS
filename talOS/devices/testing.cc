@@ -240,7 +240,16 @@ struct SimHardware::Impl {
         clock.resets_count(),
         clock.ignored_count(),
         static_cast<std::uint32_t>(clock.window_count()),
-        clock.converged()};
+        clock.converged(),
+        state.health.valid,
+        state.health.battery_v,
+        state.health.brownout,
+        state.health.can_utilization_frac,
+        0,
+        state.counters.rejected_command_count,
+        state.counters.neutralized_motor_count,
+        state.counters.apply_failure_count,
+        state.counters.device_reset_count};
     sim.publish(::bridge::topics::kStatus, status);
   }
 

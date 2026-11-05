@@ -102,6 +102,9 @@ class Motor {
   void set_position(double rot, double ff_volts = 0, int slot = 0);  // PID
   void set_motion_magic(double rot, double ff_volts = 0, int slot = 0);
   void stop();  // neutral
+  // Commands adjusted to configured limits or neutralized for non-finite
+  // values, counted once per setter call over this handle's device lifetime.
+  std::uint64_t clamped_count() const;
 
   double position() const;  // rotations
   double velocity() const;  // rotations/s

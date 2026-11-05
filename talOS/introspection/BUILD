@@ -4,13 +4,15 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 package(default_visibility = ["//visibility:public"])
 
 # The naming protocol, as code: the topic grammar, the closed role vocabulary
-# and the graph-level checks. No transport and no shared memory, so the launcher
-# can validate a graph that has not started and the registry can validate one
-# that has, from the same source of truth.
+# and the graph-level checks. Uses the transport's reader-slot limit so launch
+# validation stays consistent with runtime registration.
 cc_library(
     name = "names",
     hdrs = ["names.h"],
-    deps = ["//talOS/events:events_core"],
+    deps = [
+        "//talOS/events:events_core",
+        "//talOS/rtms",
+    ],
 )
 
 # What a node's shape is before it runs: `--describe` writes it, the launcher
@@ -33,6 +35,7 @@ cc_library(
     deps = [
         ":names",
         "//talOS/events:events_core",
+        "//talOS/memory:shared_memory",
     ],
 )
 
@@ -75,7 +78,7 @@ cc_test(
         ":names",
         ":registry",
         ":reporter",
-        "//talOS/events:events",
+        "//talOS/events",
         "@googletest//:gtest_main",
     ],
 )

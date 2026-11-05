@@ -19,7 +19,14 @@ frames; `Endpoint` reassembles them, calls `Gateway::Reconfigure`, and answers
 with a `kHardwareConfigAck`. The manifest holds logical device IDs, names, CAN
 addresses and bus names, inversion, encoder offsets, current/voltage limits,
 gearing, three gain slots, soft limits, and Motion Magic cruise velocity,
-acceleration, and jerk. Reconfiguration is only accepted while disabled.
+acceleration, and jerk. Changed configurations require disabled operation;
+identical pushes succeed even while enabled without device traffic.
+
+The RoboRIO atomically saves successful configuration bytes with a CRC32 to
+`/home/lvuser/talos_config.bin` (`talos_config.bin` in desktop simulation).
+Startup validates and restores them before reporting ready. Missing or corrupt
+files leave the gateway unconfigured. A stale file cannot accept commands from
+a different configuration ID.
 
 Logical IDs remain independent of CAN addresses. The default IMU is a Pigeon2,
 mounted in its native frame. Steering uses a CANcoder on the same CAN bus as
@@ -29,6 +36,8 @@ Example addresses and zero gains are not commissioned settings. After matching
 the manifest to the physical robot and tuning it, explicitly set the hardware
 `commissioned` flag. Until then telemetry is available but commands are
 refused.
+Only a loopback remote (`127.0.0.1`) may bypass commissioning; `--sim` rejects
+non-loopback remotes.
 
 Both endpoints compute a canonical configuration fingerprint. Changing a CAN
 address, offset, limit, or gain changes that ID; commands with a different ID
@@ -64,8 +73,13 @@ outputs, analog inputs, quadrature and duty-cycle encoders, and PWM outputs.
 Phoenix and both sims implement all of them.
 
 CAN bus load and measured sensor age must be checked on the actual bus before
-choosing production frequencies. The backend configures signal rates
-explicitly and uses one-shot control requests.
+choosing production frequencies. The backend configures every consumed signal,
+including the TalonFX fault field, at the manifest status rate, then calls
+`OptimizeBusUtilization()` on each TalonFX, CANcoder, and Pigeon2. Per-device
+optimization keeps the explicitly selected signals while stopping unused
+default frames; it does not replace measuring the real bus. Reads refresh the
+cached signals non-blockingly. One-shot control requests are refreshed by the
+bridge heartbeat (at most 20 ms), not on every gateway tick.
 
 References: [CTRE remote sensor control](https://v6.docs.ctr-electronics.com/en/latest/docs/api-reference/device-specific/talonfx/remote-sensors.html)
 and [Motion Magic](https://v6.docs.ctr-electronics.com/en/latest/docs/api-reference/device-specific/talonfx/motion-magic.html).
@@ -77,12 +91,16 @@ Frame types `kHardwareState` and `kHardwareCommand` use the versioned UDP frame
 transport. Their payload codecs explicitly encode little-endian integers and
 IEEE-754 doubles, with exact length checks. Native C++ object layout is never
 the network format. The payload limit is `protocol::kMaxPayloadSize`, currently
-1400 bytes; `Packet` and the endpoint buffer are both sized from that constant.
+1432 bytes; `Packet` and the endpoint buffer are both sized from that constant.
 
 The gateway publishes its configuration ID, boot ID, control epoch, monotonic
 poll timestamp, last accepted command sequence, enable/configuration/fault
 flags, and identified motor/sensor samples. Motor samples contain mechanism
-position/velocity, voltage, and stator current. CANcoder samples contain angle
+position/velocity, voltage, stator current, and the Phoenix fault bitfield.
+State also carries valid power/CAN health (battery volts, brownout, and CAN
+utilization fraction) and per-boot gateway safety counters. Protocol version 2
+rejects older peers instead of interpreting the expanded state as an old layout.
+CANcoder samples contain angle
 and velocity; Pigeon2 samples contain yaw and yaw rate, expressed in rotations.
 Position/velocity signal ages are included separately, in microseconds. Ages
 describe cached Phoenix measurements at polling; samples are not a synchronized
@@ -90,10 +108,15 @@ CAN capture.
 
 Commands echo the gateway's boot ID, epoch, and poll timestamp. Expiry is checked
 using only the gateway clock, so it does not assume synchronized host clocks.
-Duplicate/reordered command sequences, old sessions, expired observations,
-unknown modes, non-finite values, and out-of-range demands are rejected before
-any motor request is applied. Each command supplies every configured motor in
-manifest order; the bridge merges per-subsystem requests into that one command.
+Duplicate/reordered command sequences, old sessions, expired observations, and
+structural errors reject the whole command. Non-finite or out-of-range motor
+demands/feedforward neutralize only that motor. Per-boot counters report refused
+commands, neutralized motors, apply failures, and device resets. Each command
+supplies every configured motor in manifest order.
+The bridge neutralizes omitted subsystem actuators. `/hw/status` exposes the
+latest accepted health sample, motor fault mask, and gateway counters.
+`hardware_node --log PATH` records merged `/hw/command` and decoded `/hw/state`
+as raw `Packet` topics in a version-5 `.tlog`.
 
 Nodes read the gateway's poll timestamp in their own clock through
 `HardwareLink::sample_time()` (C `talos_hardware_sample_time`, Python
@@ -109,15 +132,20 @@ The bridge stamps receipt with `talos::event::Poller::now()`, the clock
 
 Driver Station disable/e-stop, command timeout, or invalid telemetry neutralizes
 outputs. Enable transitions and timeout/telemetry stops invalidate outstanding
-commands by advancing the epoch. A failed configuration or motor apply prevents
-further output; an apply failure remains latched until process restart. A
-transient status failure may recover, but requires a new valid command.
+commands by advancing the epoch. Apply failures neutralize outputs and retry
+on the next fresh command; three consecutive failures latch a fault. A
+disabled-to-enabled transition or successful reconfiguration (including an
+identical push) clears the latch. A transient status failure requires a fresh
+valid command after recovery.
 
 Each `Tick` polls `Backend::PollDeviceResets()` (Phoenix: `HasResetOccurred()`
-per TalonFX/CANcoder/Pigeon2). On any reset the gateway invalidates outstanding
-commands (epoch bump plus `Neutral`) and then re-applies configuration
-(`RestoreAfterReset()`), so a freshly reset device never resumes an obsolete
-demand. A failed restore latches a fault.
+per TalonFX/CANcoder/Pigeon2). A reset invalidates outstanding commands and
+starts `BeginRestoreAfterReset()`. `PollRestore()` never blocks: Phoenix applies
+saved device configurations on a worker thread while ticks and state publication
+continue with outputs neutral. Failed restores retry after 250 ms, doubling
+the delay up to 2 s. The gateway stays neutral and keeps publishing state during
+backoff, then accepts fresh commands after a successful restore even if still
+enabled. `Gateway::restore_attempt_count()` counts all restore starts per boot.
 
 Fault scope: stale motor current/voltage zeroes the effort fields but keeps the
 sample valid; an invalid RIO encoder invalidates only that sample; stale or
@@ -154,6 +182,11 @@ Both implement `Backend`, both share the gateway safe-state policy
 (disable/timeout/failure neutralizes every output type), and both step on the
 explicit `sample_time_us` clock, so Gateway ticks with explicit timestamps are
 exactly reproducible.
+Both publish valid 12 V, no-brownout, zero-CAN-load health by default;
+`SetPowerHealth(volts, brownout)` injects low-power telemetry. Physics also uses
+the injected voltage as its motor supply. Health is observable while disabled
+or without a live command. On the real backend, neutral disables PWM pulses
+(`PWM::SetDisabled`) rather than commanding servo centre, and de-energizes DIO.
 
 | | Ideal (`SimBackend`) | Physics-backed (`sim::PhysicsSimBackend`) |
 |---|---|---|

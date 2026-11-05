@@ -220,6 +220,126 @@ TEST(Devices, StaleStateForcesNeutralButKeepsFlushing) {
   EXPECT_EQ(command->motors[0].demand, 0.0);
 }
 
+TEST(Devices, MotorDemandsClampPerDeviceAndCountAdjustedCalls) {
+  std::string toml{kRobotToml};
+  toml.insert(toml.find("[subsystems.mech.digital_outputs"),
+              "soft_limits = true\nreverse_limit_rot = -0.5\n"
+              "forward_limit_rot = 0.5\n");
+  auto sim = Sim::FromToml(toml);
+  auto& mech = sim.add<Mech>("mech");
+  SimHardware hw{sim};
+  mech.a_velocity = 120;
+  mech.b_motion_magic = 2;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kNeutral);
+  EXPECT_GT(mech.a.clamped_count(), 0u);
+  hw.enable();
+  sim.step(10ms);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, 100);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "b").demand, 0.5);
+  EXPECT_GT(mech.b.clamped_count(), 0u);
+  const auto count = mech.a.clamped_count();
+  mech.a_velocity = 50;
+  sim.step(10ms);
+  EXPECT_EQ(mech.a.clamped_count(), count);
+  mech.a_velocity = std::numeric_limits<double>::quiet_NaN();
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kNeutral);
+  EXPECT_GT(mech.a.clamped_count(), count);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
+}
+
+TEST(Devices, MotorVoltageDutyPositionAndFeedforwardUseConfiguredLimits) {
+  struct Limited {
+    explicit Limited(Node& node) : motor{node, "a"} {}
+    void update() {
+      switch (mode) {
+        case Mode::kDutyCycle:
+          motor.set_duty_cycle(demand);
+          break;
+        case Mode::kVoltage:
+          motor.set_voltage(demand);
+          break;
+        case Mode::kVelocity:
+          motor.set_velocity(demand, ff);
+          break;
+        case Mode::kPosition:
+          motor.set_position(demand, ff);
+          break;
+        default:
+          motor.stop();
+          break;
+      }
+    }
+    Motor motor;
+    Mode mode = Mode::kDutyCycle;
+    double demand = -2;
+    double ff = 0;
+  };
+  std::string toml{kRobotToml};
+  toml.insert(toml.find("[subsystems.mech.motors.b]"),
+              "max_voltage = 6\nmax_velocity_rps = 80\n"
+              "soft_limits = true\nreverse_limit_rot = -2\n"
+              "forward_limit_rot = 3\n");
+  auto sim = Sim::FromToml(toml);
+  auto& limited = sim.add<Limited>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  sim.step(10ms);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, -1);
+  limited.mode = Mode::kVoltage;
+  limited.demand = 12;
+  sim.step(10ms);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, 6);
+  limited.mode = Mode::kVelocity;
+  limited.demand = -120;
+  limited.ff = -20;
+  sim.step(10ms);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, -80);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").feedforward_v, -6);
+  limited.mode = Mode::kPosition;
+  limited.demand = -10;
+  limited.ff = 20;
+  sim.step(10ms);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, -2);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").feedforward_v, 6);
+  limited.ff = std::numeric_limits<double>::infinity();
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kNeutral);
+}
+
+TEST(Devices, DigitalAndPwmOutputsNeutralizeWhileDisabledOrStale) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  auto hw = std::make_unique<SimHardware>(sim);
+  mech.led_on = true;
+  mech.servo_out = 0.75;
+  sim.step(10ms);
+  EXPECT_FALSE(hw->digital_output("mech", "led"));
+  EXPECT_DOUBLE_EQ(hw->pwm("mech", "servo"), 0);
+  hw->enable();
+  sim.step(10ms);
+  EXPECT_TRUE(hw->digital_output("mech", "led"));
+  EXPECT_DOUBLE_EQ(hw->pwm("mech", "servo"), 0.75);
+  hw->enable(false);
+  sim.step(10ms);
+  EXPECT_FALSE(hw->digital_output("mech", "led"));
+  EXPECT_DOUBLE_EQ(hw->pwm("mech", "servo"), 0);
+  hw->enable();
+  sim.step(10ms);
+  hw.reset();
+  sim.step(150ms);
+  const auto command = LastCommand(sim);
+  if (!command.has_value()) {
+    FAIL() << "Expected the last hardware command";
+  }
+  const auto& last_command = *command;
+  ASSERT_EQ(last_command.digital_output_count, 1);
+  ASSERT_EQ(last_command.pwm_output_count, 1);
+  EXPECT_FALSE(last_command.digital_outputs[0].value);
+  EXPECT_DOUBLE_EQ(last_command.pwm_outputs[0].output, 0);
+}
+
 TEST(Devices, DigitalAndPwmOutputsRideAlongOnlyWhenSet) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");

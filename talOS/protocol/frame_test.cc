@@ -86,5 +86,16 @@ TEST(FrameTest, ReservedHeaderWordIsZero) {
   EXPECT_EQ(decoded.payload_size, 4u);
 }
 
+TEST(FrameTest, RejectsPreviousProtocolVersion) {
+  std::array<uint8_t, kMaxFrameSize> frame{};
+  const auto size = EncodeFrame(FrameType::kHardwareState, kFlagNone, 1, 2,
+                                nullptr, 0, frame.data(), frame.size());
+  frame[8] = static_cast<uint8_t>(kProtocolVersion - 1);
+  frame[9] = 0;
+  DecodedFrame decoded;
+  EXPECT_EQ(DecodeFrame(frame.data(), size, &decoded),
+            DecodeStatus::kUnsupportedVersion);
+}
+
 }  // namespace
 }  // namespace talos::protocol

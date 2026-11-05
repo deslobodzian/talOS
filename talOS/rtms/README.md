@@ -30,6 +30,19 @@ cleanly leaves its topics in place without disrupting subscribers.
 Without the launcher (tests, CLI tools), the first queue to open a name creates
 the segment and the last one to close unlinks it. Dead readers are reclaimed.
 
+Publishers (`RTMSOptions::publisher`) atomically claim the header's writer pid
+when opening. A second live publisher, including another publisher in the same
+process, is refused with the topic and both pids. A dead publisher's claim is
+reclaimed on open, allowing crash restarts without disconnecting live readers.
+Closing the publisher releases its claim.
+Low-level queues opened without `publisher` claim ownership on their first
+write, so omitting that option cannot bypass the single-writer guard.
+
+Each topic has eight reader slots (`MAX_READERS`), including observer
+subscriptions. Dead readers are reclaimed before registration fails. The graph
+lint rejects declared reader counts above this limit before launch; standalone
+`ipc::Subscriber` construction throws with the topic and limit if exhausted.
+
 ## Memory
 
 Each ring buffer is stored with a corresponding header in shared memory:

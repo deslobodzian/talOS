@@ -34,8 +34,9 @@ Abbreviations are rejected (`tgt`, `cmd`, `req`, `ds`, `dt`, `drive`, `odom`,
 `pos`, `vel`, …; use the full word), and so are direction suffixes (`_in`,
 `_out`, `_pub`, `_sub`, `_tx`, `_rx`, `_topic`, `_send`, `_recv`).
 
-The graph lint also rejects two writers on one topic, a read topic nobody
-writes (unless the subscription is `optional`), one topic used with two
+The graph lint also rejects two writers on one topic, more than eight declared
+readers per topic (including observers), a read topic nobody writes (unless the
+subscription is `optional`), one topic used with two
 message sizes, and a target lane whose source is in no mode of that
 subsystem's target policy. A topic nobody reads, a policy lane nobody writes
 yet, or a topic whose owner is not a node in the session, is a warning.

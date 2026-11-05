@@ -236,6 +236,7 @@ class PhysicsSimBackend final : public Backend {
   }
 
   bool Read(State& state) override {
+    state.health = {true, supply_v_, brownout_, 0.0};
     double dt = 0.0;
     if (previous_time_) {
       const int64_t delta =
@@ -388,7 +389,7 @@ class PhysicsSimBackend final : public Backend {
     encoders_[id] = {position_rot, velocity_rps};
   }
   // Fault injection for reset handling. The next gateway Tick
-  // reports these logical IDs as reset; RestoreAfterReset re-applies the
+  // reports these logical IDs as reset; BeginRestoreAfterReset re-applies the
   // motor-to-sensor mapping and zeroes rotor states, mirroring a device that
   // lost its configuration and position across the reset. The gateway drops
   // obsolete demand separately via Neutral/epoch bump.
@@ -398,7 +399,7 @@ class PhysicsSimBackend final : public Backend {
     pending_resets_.clear();
     return !reset_ids.empty();
   }
-  bool RestoreAfterReset() override {
+  void BeginRestoreAfterReset() override {
     axes_.fill(AxisState{});
     commands_.fill(MotorRequest{});
     applied_volts_.fill(0.0);
@@ -411,7 +412,9 @@ class PhysicsSimBackend final : public Backend {
       held_[i].id = config_.motors[i].id;
       held_[i].valid = true;
     }
-    return !restore_fails_;
+  }
+  RestoreStatus PollRestore() override {
+    return restore_fails_ ? RestoreStatus::kFailed : RestoreStatus::kDone;
   }
   void SetRestoreFails(bool fails) { restore_fails_ = fails; }
   void FreezeFeedback(uint16_t motor_id) {
@@ -433,6 +436,10 @@ class PhysicsSimBackend final : public Backend {
     supply_v_ = std::clamp(volts, 0.0, 16.0);
   }
   double supply_voltage() const { return supply_v_; }
+  void SetPowerHealth(double battery_v, bool brownout) {
+    SetSupplyVoltage(battery_v);
+    brownout_ = brownout;
+  }
   // Zeroes rotor states, latched commands, yaw, and fault flags. Config and
   // output states are kept; the gateway boot id is gateway-owned and
   // unaffected (a full reboot epoch bump goes through Reconfigure/Invalidate).
@@ -464,6 +471,7 @@ class PhysicsSimBackend final : public Backend {
   }
 
  private:
+  bool brownout_{};
   struct ManualEncoder {
     double position_rot{};
     double velocity_rps{};

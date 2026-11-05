@@ -12,6 +12,7 @@
 #include "bridge/bridge_status_generated.h"
 #include "talOS/bridge/clock_offset.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/events/log/log_writer.h"
 #include "talOS/hardware/config.h"
 #include "talOS/hardware/config_wire.h"
 #include "talOS/hardware/messages.h"
@@ -63,7 +64,8 @@ class HardwareNode {
   explicit HardwareNode(config::RobotConfig robot_config,
                         std::string remote_ip = "127.0.0.1",
                         uint16_t remote_port = 5802, uint16_t local_port = 5803,
-                        bool simulation = false, uint64_t session_id = 0);
+                        bool simulation = false, uint64_t session_id = 0,
+                        std::string log_path = {});
 
   ~HardwareNode() = default;
 
@@ -151,6 +153,8 @@ class HardwareNode {
   // from the last send, otherwise only on the bounded heartbeat. Timeout
   // neutralization changes the merge, so it always sends immediately.
   bool ShouldSendCommand(uint64_t now_us);
+  void LogPacket(uint16_t source_id, const Packet& packet, uint64_t now_us,
+                 uint64_t sequence);
 
   config::RobotConfig robot_config_;
   Config config_;
@@ -177,6 +181,10 @@ class HardwareNode {
   event::Manifest introspection_manifest_;
   std::optional<introspect::NodeRegistration> registration_;
   uint64_t session_id_{0};
+  std::string log_path_;
+  std::unique_ptr<event::log::LogWriter> log_;
+  bool log_failure_reported_{false};
+  State latest_state_{};
   std::chrono::steady_clock::time_point next_introspection_{};
 
   bool is_configured_{false};
@@ -195,7 +203,6 @@ class HardwareNode {
   ClockOffsetEstimator clock_;
   uint64_t statuses_published_{0};
   uint64_t last_status_us_{0};
-  uint64_t cmd_sequence_{0};
   uint64_t last_push_time_us_{0};
 
   // Explicit periodic scheduling: 1 kHz tick period as a

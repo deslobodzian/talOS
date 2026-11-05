@@ -31,7 +31,12 @@ class BundleTest(unittest.TestCase):
                 capture_output=True, text=True, timeout=120)
             output = proc.stdout + "\n" + proc.stderr
             self.assertEqual(proc.returncode, 0, output)
-            with open(os.path.join(logs, "graph.json"), encoding="utf-8") as stream:
+            sessions = sorted(
+                (os.path.join(logs, name) for name in os.listdir(logs)
+                 if os.path.isdir(os.path.join(logs, name))),
+                key=os.path.getmtime, reverse=True)
+            self.assertTrue(sessions, output)
+            with open(os.path.join(sessions[0], "graph.json"), encoding="utf-8") as stream:
                 graph = json.load(stream)
             self.assertEqual(graph["config_sha256"], manifest["config_sha256"])
             self.assertTrue(graph["nodes"], output)

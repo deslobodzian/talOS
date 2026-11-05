@@ -121,12 +121,14 @@ class BinaryTest(unittest.TestCase):
     def test_describe_lists_the_intake_topics(self):
         doc = json.loads(self.run_binary("--describe", "--config", CONFIG))
         self.assertEqual(doc["name"], "intake")
+        # A hardware packet: a 4-byte length + the protocol's max payload.
+        packet_bytes = 1436
         self.assertEqual(
             sorted((s["kind"], s["name"], s["message_bytes"])
                    for s in doc["sources"]),
             sorted([("TIMER", "intake", 0),
-                    ("WATCHER", "/hw/state", 1404),
-                    ("WATCHER", "/hw/state/driver_station", 1404),
+                    ("WATCHER", "/hw/state", packet_bytes),
+                    ("WATCHER", "/hw/state/driver_station", packet_bytes),
                     # The bridge's clock mapping (HardwareLink::sample_time).
                     ("WATCHER", "/hw/status", BridgeStatus.SizeOf()),
                     # Lanes of the default policy: the 16-byte envelope
@@ -135,7 +137,7 @@ class BinaryTest(unittest.TestCase):
                      16 + IntakeTarget.SizeOf()),
                     ("WATCHER", "/intake/target/auto",
                      16 + IntakeTarget.SizeOf()),
-                    ("SENDER", "/hw/request/intake", 1404),
+                    ("SENDER", "/hw/request/intake", packet_bytes),
                     ("SENDER", topics.STATE, IntakeState.SizeOf())]))
 
     def test_sim_run_replays_without_divergence(self):

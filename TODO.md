@@ -16,6 +16,11 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
   - Measure from the launcher's `.tlog`s (`bazel run //talOS/launcher:log_dump -- <dir>`): `/hw/state` inter-arrival (median about 5 ms, p99 under 10 ms, no gap of 100 ms while enabled); target age at each drivetrain tick (about 25 ms at most, never `command_timeout_us`); loop lateness in Studio's system view.
   - Then inject faults: `SIGSTOP` the `driver` node (chassis) and the `teleop` node (mechanism buttons) for 50 ms and 200 ms (200 ms must go neutral within `command_timeout_us` plus a tick; each subsystem times out its own lane), `SIGSTOP` the drivetrain for 80 ms, unplug the RIO Ethernet while the wheels spin. Also measure stick → drive request median on the real link (sim: 2.99 ms; old arbiter baseline 4.98 ms).
 - [ ] Measure loop lateness on the Mini. Node binaries and the bridge request realtime scheduling (`talos::process::ConfigureRealtime`: Mach time-constraint policy on macOS, `SCHED_FIFO` + `mlockall` on Linux; `TALOS_REALTIME=0` disables) and nodes without message callbacks drain only before their own timers; neither has been measured on the robot. Check that the Mach policy is accepted for every node period, also when started by launchd, and that no node prints the "realtime scheduling incomplete" line.
+- [ ] Check the Tier 0 hardening on the real RIO and CAN bus (all proven in tests and sim only):
+  - the persisted config at `/home/lvuser/talos_config.bin` restores at boot before enable, and a RIO program restart while enabled resumes driving;
+  - the async device-reset restore and its retry with backoff after pulling and replugging a Talon's CAN while enabled;
+  - `battery_v`, `brownout`, `can_utilization_frac` and `motor_fault_mask` in `/hw/status` against the DS and Phoenix Tuner, and CAN utilization after `OptimizeBusUtilization`;
+  - PWM neutral now disables the pulse, so check what each PWM device actually does when disabled.
 
 ## Merge `agent/automatic-wiring`
 
@@ -34,6 +39,19 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
 - [x] `tools/setup.sh` was committed without its executable bit (`./tools/setup.sh` failed); it missed a WPILib-installer roborio toolchain (`~/wpilib/2026/roborio`); it warned falsely when `/usr/local/sbin` is merged into `/usr/local/bin` (Fedora).
 - [x] `DrivetrainTest.UpdateDoesNotAllocate` failed on macOS once `SimulatedChannel::publish` was inlined into `SimulatedEventLoop::send_impl`; the sim-transport filter matches both frames.
 - [x] Earlier: odometry runaway on a quiet link, `deploy.sh logs` session search, bundle-relative paths, D1/D5 acceptance, `talos_graph_test` in CI, selected target source in Studio.
+
+## Tier 0 hardening (2026-11-05)
+
+- [x] A RIO program restart while enabled no longer leaves the robot dead: the gateway persists the last applied config (`talos_config.bin`, CRC-checked) and restores it at startup before reporting ready, and an identical push succeeds while enabled. The config assembler no longer re-acknowledges every chunk after completion.
+- [x] One out-of-range demand no longer stops the robot: the devices layer clamps each motor to its configured limits (`Motor::clamped_count()` in C++, C ABI and Python), and the gateway neutralizes only the offending motor (`neutralized_motor_count`) instead of rejecting the whole command.
+- [x] Apply failures are counted, neutralized and retried. Only 3 consecutive failures latch, and re-enabling or any successful reconfigure clears the latch. Device-reset restores run off the 5 ms loop and retry with backoff (250 ms doubling to 2 s), so a failed restore no longer needs a disable.
+- [x] `State` carries battery voltage, brownout, CAN utilization, per-motor fault flags and the gateway counters. `/hw/status` publishes them, so Studio shows them as `hw/status/*`. Protocol version 2; the payload is now 1432 bytes, so a frame is 1472 bytes and fits a 1500-byte MTU.
+- [x] Logs survive: every launch writes `<output-dir>/<session_id>/`; old sessions are pruned (`[robot] log_keep_sessions` / `log_max_bytes`); `.tlog`s are fsynced about every second; `manifest.json` is written at start and updated atomically. `hardware_node --log` records every command sent and state received. `deploy.sh logs` lists sessions and `deploy.sh fetch` copies them.
+- [x] Commissioning: only a loopback remote forces `commissioned`; `--sim` with a non-loopback remote is refused by the launcher and the bridge.
+- [x] The launcher restarts nodes whose registry heartbeat or dispatch progress stalls, and `max_restarts` now applies per rolling window instead of per session. A framework node that never dispatches anything counts as stalled after its startup grace period.
+- [x] DIO and PWM are gated on `robot_enabled` in the nodes. Outputs a subsystem omits from its request go neutral in the bridge merge. PWM neutral disables the pulse rather than sending a centre pulse.
+- [x] RTMS enforces a single writer at runtime (dead writers are reclaimable). Reader-slot exhaustion is an explicit error, and the graph lint rejects a topic with more than 8 declared readers.
+- [x] Tests no longer share host-global shared-memory names: `ShmObjectName` hashes `TALOS_SHM_NAMESPACE` / `TEST_TMPDIR` into `/~<16 hex>` under `bazel test`. The `exclusive` tags are removed from `continuity_test` and `replay_inputs_test`, and `hardware_node_test.cc` uses OS-assigned ephemeral UDP ports.
 
 ## Decisions taken
 

@@ -120,7 +120,7 @@ inline constexpr std::uint64_t kLifetimeCountMask = (1ULL << 32) - 1;
 
 struct alignas(CACHE_LINE) Writer {
   std::atomic<uint64_t> sequence{};
-  // pid of the publisher that attached last, 0 when none is attached.
+  // Exclusive publisher pid, 0 when unclaimed; dead owners may be replaced.
   std::atomic<uint64_t> owner_pid{};
 };
 

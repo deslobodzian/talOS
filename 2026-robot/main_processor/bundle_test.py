@@ -32,7 +32,11 @@ def describe(bundle, prefix):
     env = dict(os.environ, TALOS_LOG_DIR=log_dir)
     proc = subprocess.run(["./run.sh", "--describe-only"], cwd=where, env=env,
                           capture_output=True, text=True, timeout=120)
-    graph = os.path.join(log_dir, "graph.json")
+    sessions = sorted(
+        (os.path.join(log_dir, name) for name in os.listdir(log_dir)
+         if os.path.isdir(os.path.join(log_dir, name))),
+        key=os.path.getmtime, reverse=True)
+    graph = os.path.join(sessions[0], "graph.json") if sessions else ""
     if not os.path.isfile(graph):
         return proc, None
     with open(graph, encoding="utf-8") as f:

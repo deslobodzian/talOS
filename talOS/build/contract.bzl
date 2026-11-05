@@ -883,7 +883,11 @@ def talos_graph_test(
         "                timeout=120,\n" +
         "            )\n" +
         "            self.assertEqual(proc.returncode, 0, proc.stdout + \"\\n\" + proc.stderr)\n" +
-        "            with open(os.path.join(out_dir, \"graph.json\"), \"r\") as f:\n" +
+        "            # The launcher writes into <output-dir>/<session_id>/.\n" +
+        "            sessions = [os.path.join(out_dir, d) for d in os.listdir(out_dir)\n" +
+        "                        if os.path.isdir(os.path.join(out_dir, d))]\n" +
+        "            self.assertEqual(len(sessions), 1, sessions)\n" +
+        "            with open(os.path.join(sessions[0], \"graph.json\"), \"r\") as f:\n" +
         "                graph = json.load(f)\n" +
         "            for node in graph.get(\"nodes\", []):\n" +
         "                self.assertTrue(\n" +

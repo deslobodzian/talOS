@@ -26,11 +26,13 @@ broadcast under `/dev/rtms/<topic_name>`).
   latest-value shortcut.
 - The publisher owns the topic layout outside a launcher session: it
   passes `RTMSOptions::publisher`, so it reclaims a segment of another
-  build or schema that no live process holds. Each `Subscriber` registers
-  one shared-memory reader slot, is move-only (copying would
-  double-release the slot), and releases it on destruction; a slot whose
-  process died is reclaimed. Segment lifetime (launcher-owned, or the last
-  holder unlinks) is RTMS's: see `talOS/rtms/rtms.h`.
+  build or schema that no live process holds. A live publisher exclusively
+  owns the topic; another publisher throws with the topic and both pids.
+  Each `Subscriber` registers one of eight shared-memory reader slots and
+  throws with the topic and limit if they are exhausted. It is move-only
+  (copying would double-release the slot), and releases it on destruction;
+  a slot whose process died is reclaimed. Segment lifetime (launcher-owned,
+  or the last holder unlinks) is RTMS's: see `talOS/rtms/rtms.h`.
 - Test schemas live next to their users (e.g. `ipc_test_message.fbs`,
   built with `talos_messages`).
 

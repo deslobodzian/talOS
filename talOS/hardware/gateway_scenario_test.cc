@@ -15,6 +15,7 @@
 #include <span>
 #include <vector>
 
+#include "talOS/hardware/config_wire.h"
 #include "talOS/hardware/gateway.h"
 #include "talOS/hardware/sim_backend.h"
 
@@ -69,6 +70,8 @@ class FaultyBackend : public Backend {
   bool fail_read = false;
   bool fail_apply = false;
   bool fail_restore = false;
+  int restore_failures_remaining{};
+  int restore_attempts{};
   bool Configure(const Config& config) override {
     return sim_.Configure(config);
   }
@@ -88,9 +91,16 @@ class FaultyBackend : public Backend {
   bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override {
     return sim_.PollDeviceResets(reset_ids);
   }
-  bool RestoreAfterReset() override {
-    if (fail_restore) return false;
-    return sim_.RestoreAfterReset();
+  void BeginRestoreAfterReset() override {
+    ++restore_attempts;
+    sim_.BeginRestoreAfterReset();
+  }
+  RestoreStatus PollRestore() override {
+    if (restore_failures_remaining > 0) {
+      --restore_failures_remaining;
+      return RestoreStatus::kFailed;
+    }
+    return fail_restore ? RestoreStatus::kFailed : sim_.PollRestore();
   }
   void SimulateDeviceReset(uint16_t id) { sim_.SimulateDeviceReset(id); }
 
@@ -203,34 +213,35 @@ TEST(GatewayScenario, ControllerRestartRequiresFreshEpoch) {
   EXPECT_TRUE(AcceptVel(gw, kBootId, 10.0, 12000, 2));
 }
 
-TEST(GatewayScenario, FailedApplyLatchesFaultUntilReconfigure) {
+TEST(GatewayScenario, TransientApplyFailureRecoversOnFreshCommand) {
   FaultyBackend backend;
   backend.fail_apply = true;
   Gateway gw(RollerConfig(), backend, kBootId);
-  gw.Tick(2000, false);
   gw.Tick(3000, true);
-  // The failed transaction latches the fault and neutralizes: nothing moves.
-  EXPECT_FALSE(gw.Accept(
-      FreshCommand(gw, kBootId, Mode::kVelocity, 10.0, 3000, 1), 1, 3000));
-  EXPECT_TRUE(HasFlag(gw.snapshot(), kHardwareFault));
+  EXPECT_FALSE(AcceptVel(gw, kBootId, 10.0, 3000, 1));
+  EXPECT_FALSE(HasFlag(gw.snapshot(), kHardwareFault));
   backend.fail_apply = false;
   gw.Tick(8000, true);
-  // Clearing the device fault is not enough: the latch holds until a
-  // successful reconfiguration, so Accepts keep failing.
-  EXPECT_FALSE(gw.Accept(
-      FreshCommand(gw, kBootId, Mode::kVelocity, 10.0, 8000, 2), 2, 8000));
-  // Recovery is a disabled-side reconfiguration (changed, so it is not the
-  // idempotent no-op) followed by a fully fresh command.
-  gw.Tick(9000, false);
-  Config recovered = RollerConfig();
-  recovered.motors[0].max_velocity_rps = 50.0;
-  ASSERT_TRUE(gw.Reconfigure(recovered));
-  EXPECT_FALSE(HasFlag(gw.snapshot(), kHardwareFault));
-  gw.Tick(10000, true);
-  EXPECT_TRUE(AcceptVel(gw, kBootId, 10.0, 10000, 3));
+  ASSERT_TRUE(AcceptVel(gw, kBootId, 10.0, 8000, 2));
+  gw.Tick(9000, true);
+  EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 10);
 }
 
-TEST(GatewayScenario, FailedRestoreLatchesFaultAndDropsDemand) {
+TEST(GatewayScenario, PersistedRestartAcceptsIdenticalPushWhileEnabled) {
+  const auto bytes = PersistedConfig(RollerConfig());
+  Config restored;
+  ASSERT_TRUE(LoadPersistedConfig(bytes, restored));
+  SimBackend backend;
+  Gateway gw(backend, kBootId);
+  ASSERT_TRUE(gw.Reconfigure(restored));
+  gw.Tick(3000, true);
+  const auto epoch = gw.snapshot().epoch;
+  ASSERT_TRUE(gw.Reconfigure(RollerConfig()));
+  EXPECT_EQ(gw.snapshot().epoch, epoch);
+  EXPECT_TRUE(AcceptVel(gw, kBootId, 10, 3000, 1));
+}
+
+TEST(GatewayScenario, FailedRestoreStaysNeutralAndDropsDemand) {
   FaultyBackend backend;
   backend.fail_restore = true;
   Gateway gw(RollerConfig(), backend, kBootId);
@@ -244,6 +255,65 @@ TEST(GatewayScenario, FailedRestoreLatchesFaultAndDropsDemand) {
   // restored device is zero, never the pre-reset demand.
   gw.Tick(12000, true);
   EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 0.0);
+}
+
+TEST(GatewayScenario, RestoreRetriesTwiceThenResumesWhileEnabled) {
+  FaultyBackend backend;
+  backend.restore_failures_remaining = 2;
+  Gateway gw(RollerConfig(), backend, kBootId);
+  gw.Tick(1000, true);
+  ASSERT_TRUE(AcceptVel(gw, kBootId, 10, 1000, 1));
+  const auto stale = FreshCommand(gw, kBootId, Mode::kVelocity, 10, 1000, 2);
+  backend.SimulateDeviceReset(kMotorId);
+  gw.Tick(2000, true);
+  gw.Tick(3000, true);
+  EXPECT_FALSE(gw.configured());
+  EXPECT_EQ(backend.restore_attempts, 1);
+  gw.Tick(252999, true);
+  EXPECT_EQ(backend.restore_attempts, 1);
+  EXPECT_EQ(gw.snapshot().sample_time_us, 252999u);
+  EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 0);
+  EXPECT_FALSE(AcceptVel(gw, kBootId, 10, 252999, 3));
+  gw.Tick(253000, true);
+  EXPECT_EQ(backend.restore_attempts, 2);
+  gw.Tick(254000, true);
+  gw.Tick(753999, true);
+  EXPECT_EQ(backend.restore_attempts, 2);
+  EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 0);
+  gw.Tick(754000, true);
+  EXPECT_EQ(backend.restore_attempts, 3);
+  gw.Tick(755000, true);
+  EXPECT_TRUE(gw.configured());
+  EXPECT_FALSE(HasFlag(gw.snapshot(), kHardwareFault));
+  EXPECT_EQ(gw.restore_attempt_count(), 3u);
+  EXPECT_EQ(gw.snapshot().counters.device_reset_count, 1u);
+  EXPECT_FALSE(gw.Accept(stale, 4, 755000));
+  ASSERT_TRUE(AcceptVel(gw, kBootId, 10, 755000, 5));
+  gw.Tick(756000, true);
+  EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 10);
+}
+
+TEST(GatewayScenario, RestoreBackoffCapsAtTwoSeconds) {
+  FaultyBackend backend;
+  backend.fail_restore = true;
+  Gateway gw(RollerConfig(), backend, kBootId);
+  gw.Tick(1000, true);
+  backend.SimulateDeviceReset(kMotorId);
+  gw.Tick(2000, true);
+  uint64_t now = 3000;
+  int attempts = 1;
+  for (uint64_t delay : {250000u, 500000u, 1000000u, 2000000u, 2000000u}) {
+    gw.Tick(now, true);
+    gw.Tick(now + delay - 1, true);
+    EXPECT_EQ(backend.restore_attempts, attempts);
+    EXPECT_EQ(gw.snapshot().sample_time_us, now + delay - 1);
+    EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 0);
+    gw.Tick(now + delay, true);
+    EXPECT_EQ(backend.restore_attempts, ++attempts);
+    EXPECT_FALSE(AcceptVel(gw, kBootId, 10, now + delay, attempts));
+    now += delay + 1;
+  }
+  EXPECT_EQ(gw.restore_attempt_count(), 6u);
 }
 
 }  // namespace

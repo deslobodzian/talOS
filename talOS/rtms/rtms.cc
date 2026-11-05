@@ -40,11 +40,9 @@ std::string ValidatePath(std::string_view path) {
         "Topic name '" + std::string(path) +
         "' exceeds limit of 30 characters after leading slash");
   }
-  // One definition of the mapping, in shared_memory_ptr.h, so this and
-  // SharedMemoryPtr cannot drift onto different segment names for one topic.
-  // The reclaim and unlink helpers below open a segment directly, which is
-  // why RTMS needs the mapped name here and not just inside SharedMemoryPtr.
-  return ShmObjectName(path);
+  // Keep the logical topic for diagnostics; every OS boundary applies the
+  // shared naming policy (including the process/test namespace).
+  return std::string{path};
 }
 
 bool ProcessAlive(std::uint64_t pid) {
@@ -56,6 +54,23 @@ std::uint64_t OwnPid() { return static_cast<std::uint64_t>(::getpid()); }
 
 std::uint64_t ReaderWord(ReaderState state) {
   return (OwnPid() << 2) | static_cast<std::uint64_t>(state);
+}
+
+void ClaimWriter(RTMSHeader& header, const std::string& path) {
+  std::uint64_t owner = header.writer.owner_pid.load(std::memory_order_acquire);
+  for (;;) {
+    if (owner != 0 && ProcessAlive(owner)) {
+      throw std::runtime_error(
+          "RTMS topic " + path + " already has writer pid " +
+          std::to_string(owner) + "; refusing writer pid " +
+          std::to_string(OwnPid()));
+    }
+    if (header.writer.owner_pid.compare_exchange_weak(
+            owner, OwnPid(), std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+      return;
+    }
+  }
 }
 
 std::string SchemaOf(const RTMSHeader& header) {
@@ -78,7 +93,7 @@ bool WaitInitialized(const RTMSHeader& header) {
 class HeaderView {
  public:
   explicit HeaderView(const std::string& path) {
-    const int fd = ::shm_open(path.c_str(), O_RDONLY, 0666);
+    const int fd = ::shm_open(ShmObjectName(path).c_str(), O_RDONLY, 0666);
     if (fd == -1) return;
     struct stat info {};
     bool sized = false;
@@ -128,7 +143,7 @@ void UnlinkIfSame(const std::string& path, std::uint64_t segment_id) {
            view.header()->magic.load(std::memory_order_acquire) == kRtmsMagic &&
            view.header()->segment_id == segment_id;
   }
-  if (same) ::shm_unlink(path.c_str());
+  if (same) ::shm_unlink(ShmObjectName(path).c_str());
 }
 
 std::uint64_t NewSegmentId() {
@@ -199,7 +214,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
   if (options_.session_owner) {
     // A new session replaces whatever the name held: a segment of a
     // previous session that ended without cleaning up, or a standalone run's.
-    ::shm_unlink(path_.c_str());
+    ::shm_unlink(ShmObjectName(path_).c_str());
   }
 
   for (int attempt = 0; attempt < kOpenAttempts; ++attempt) {
@@ -228,7 +243,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
                      "rtms: reclaiming stale shared memory %s, which this "
                      "build cannot use and no live process holds\n",
                      path_.c_str());
-        ::shm_unlink(path_.c_str());
+        ::shm_unlink(ShmObjectName(path_).c_str());
       }
     }
 
@@ -319,7 +334,15 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
       continue;
     }
     if (options_.publisher) {
-      header->writer.owner_pid.store(OwnPid(), std::memory_order_release);
+      try {
+        ClaimWriter(*header, path_);
+      } catch (...) {
+        if (counted_) {
+          header->lifetime.fetch_sub(1, std::memory_order_acq_rel);
+          counted_ = false;
+        }
+        throw;
+      }
     }
     ptr_ = std::move(ptr);
     header_ = header;
@@ -429,6 +452,12 @@ std::size_t RTMSQueue::reclaim_dead_readers() {
 }
 
 WriteStatus RTMSQueue::write(std::span<const std::byte> message) {
+  // Low-level queues may omit publisher at construction; their first write
+  // must still claim exclusive ownership before touching the ring.
+  if (!options_.publisher) {
+    ClaimWriter(*header_, path_);
+    options_.publisher = true;
+  }
   const std::uint64_t slot_mask = slots_ - 1;
 
   if (message.size() > header_->message_bytes) {

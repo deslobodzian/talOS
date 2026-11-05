@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "talOS/events/manifest.h"
+#include "talOS/rtms/rtms.h"
 
 namespace talos::introspect::naming {
 
@@ -322,7 +323,8 @@ inline std::vector<Diagnostic> LintGraph(
     std::string name;
     std::vector<std::string> writers;
     std::vector<std::string> readers;
-    bool exempt{false};  // Any end declared external or optional.
+    std::size_t reader_count{0};  // Observers also consume transport slots.
+    bool exempt{false};           // Any end declared external or optional.
     std::uint32_t message_bytes{0};
     std::string first_size_from;
     std::string schema;  // the first end's that declared one
@@ -402,6 +404,7 @@ inline std::vector<Diagnostic> LintGraph(
       } else if (!source.observer()) {
         topic.readers.push_back(node.name);
       }
+      if (IsReader(source.kind)) ++topic.reader_count;
 
       // Two types on one topic: named by schema identity, which also catches
       // two same-size types a size check cannot tell apart. A shape without
@@ -471,6 +474,12 @@ inline std::vector<Diagnostic> LintGraph(
           "the 'test' namespace is for tests; a node in a session must not "
           "use it");
 
+    if (topic.reader_count > MAX_READERS) {
+      add(Severity::ERROR, topic.name,
+          "has " + std::to_string(topic.reader_count) +
+              " readers; RTMS reader limit is " + std::to_string(MAX_READERS) +
+              " (including observers)");
+    }
     if (topic.writers.size() > 1) {
       add(Severity::ERROR, topic.name,
           "has " + std::to_string(topic.writers.size()) + " writers (" +

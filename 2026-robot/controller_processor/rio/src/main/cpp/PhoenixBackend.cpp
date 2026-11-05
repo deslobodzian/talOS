@@ -1,5 +1,7 @@
 #include "PhoenixBackend.h"
 
+#include <frc/RobotController.h>
+
 #include <algorithm>
 #include <cmath>
 #include <ctre/phoenix6/controls/DutyCycleOut.hpp>
@@ -59,6 +61,7 @@ std::optional<hw::ConfigError> PhoenixBackend::last_config_error() const {
 
 bool PhoenixBackend::Configure(const hw::Config& c) {
   hw::Validate(c);
+  restore_operations_.clear();
   last_error_.reset();
   // The first failed device apply wins the precise error: device
   // name, bus, CAN ID, operation, and the raw vendor status value.
@@ -137,6 +140,9 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       ok &= note_failure(
           s.name, s.bus, s.can_id, "apply_cancoder_config",
           Retry([&] { return device.encoder->GetConfigurator().Apply(cfg); }));
+      restore_operations_.push_back([ptr = device.encoder.get(), cfg] {
+        return Retry([&] { return ptr->GetConfigurator().Apply(cfg); }).IsOK();
+      });
       signals_.push_back(&device.encoder->GetAbsolutePosition(false));
       signals_.push_back(&device.encoder->GetVelocity(false));
     } else {
@@ -146,6 +152,9 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       ok &= note_failure(
           s.name, s.bus, s.can_id, "apply_pigeon2_config",
           Retry([&] { return device.imu->GetConfigurator().Apply(cfg); }));
+      restore_operations_.push_back([ptr = device.imu.get(), cfg] {
+        return Retry([&] { return ptr->GetConfigurator().Apply(cfg); }).IsOK();
+      });
       signals_.push_back(&device.imu->GetYaw(false));
       signals_.push_back(&device.imu->GetAngularVelocityZWorld(false));
     }
@@ -195,10 +204,14 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     ok &= note_failure(
         m.name, m.bus, m.can_id, "apply_talonfx_config",
         Retry([&] { return motor->GetConfigurator().Apply(cfg); }));
+    restore_operations_.push_back([ptr = motor.get(), cfg] {
+      return Retry([&] { return ptr->GetConfigurator().Apply(cfg); }).IsOK();
+    });
     signals_.push_back(&motor->GetPosition(false));
     signals_.push_back(&motor->GetVelocity(false));
     signals_.push_back(&motor->GetMotorVoltage(false));
     signals_.push_back(&motor->GetStatorCurrent(false));
+    signals_.push_back(&motor->GetFaultField(false));
     motors_.push_back(std::move(motor));
   }
 
@@ -241,6 +254,35 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       return signal->SetUpdateFrequency(units::hertz_t{c.status_hz});
     });
     ok &= note_failure("signal_rates", "", -1, "set_signal_frequency", code);
+    restore_operations_.push_back([signal, hz = c.status_hz] {
+      return Retry(
+                 [&] { return signal->SetUpdateFrequency(units::hertz_t{hz}); })
+          .IsOK();
+    });
+  }
+  for (auto& motor : motors_) {
+    const auto code = Retry([&] { return motor->OptimizeBusUtilization(); });
+    ok &=
+        note_failure("signal_rates", "", -1, "optimize_bus_utilization", code);
+    restore_operations_.push_back([ptr = motor.get()] {
+      return Retry([&] { return ptr->OptimizeBusUtilization(); }).IsOK();
+    });
+  }
+  for (auto& sensor : sensors_) {
+    const auto code = Retry([&] {
+      return sensor.encoder ? sensor.encoder->OptimizeBusUtilization()
+                            : sensor.imu->OptimizeBusUtilization();
+    });
+    ok &=
+        note_failure("signal_rates", "", -1, "optimize_bus_utilization", code);
+    restore_operations_.push_back(
+        [encoder = sensor.encoder.get(), imu = sensor.imu.get()] {
+          return Retry([&] {
+                   return encoder ? encoder->OptimizeBusUtilization()
+                                  : imu->OptimizeBusUtilization();
+                 })
+              .IsOK();
+        });
   }
   return ok;
 }
@@ -263,14 +305,27 @@ bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
   return !reset_ids.empty();
 }
 
-bool PhoenixBackend::RestoreAfterReset() {
-  // A reset drops device-side configuration: re-apply everything from the
-  // last good manifest. The gateway separately neutralizes outputs and bumps
-  // the epoch, so no obsolete demand resumes on the restored devices.
-  return Configure(config_);
+void PhoenixBackend::BeginRestoreAfterReset() {
+  // Only immutable device configurations cross onto the worker. Device objects
+  // remain stable, so cached status reads and one-shot Neutral keep running.
+  restore_ = std::async(std::launch::async, [this] {
+    bool ok = true;
+    for (const auto& operation : restore_operations_) ok &= operation();
+    return ok;
+  });
+}
+
+PhoenixBackend::RestoreStatus PhoenixBackend::PollRestore() {
+  if (!restore_.valid()) return RestoreStatus::kDone;
+  if (restore_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
+    return RestoreStatus::kPending;
+  return restore_.get() ? RestoreStatus::kDone : RestoreStatus::kFailed;
 }
 
 bool PhoenixBackend::Read(hw::State& s) {
+  s.health = {true, frc::RobotController::GetBatteryVoltage().value(),
+              frc::RobotController::IsBrownedOut(),
+              frc::RobotController::GetCANStatus().percentBusUtilization};
   if (is_simulation_) {
     const auto now = std::chrono::steady_clock::now();
     double dt =
@@ -295,6 +350,7 @@ bool PhoenixBackend::Read(hw::State& s) {
     out.velocity_rps = v.GetValue().value();
     out.position_age_us = Age(p);
     out.velocity_age_us = Age(v);
+    out.fault_flags = motor.GetFaultField(false).GetValue();
     // Stale current/voltage is telemetry-only degradation. The
     // effort fields zero but the sample stays valid and the backend stays
     // healthy; only lost motion feedback sinks the robot.
@@ -475,7 +531,7 @@ bool PhoenixBackend::ApplyOutputs(
 void PhoenixBackend::Neutral() {
   for (auto& motor : motors_)
     motor->SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
-  for (auto& pwm : pwm_outputs_) pwm->SetSpeed(0.0);
+  for (auto& pwm : pwm_outputs_) pwm->SetDisabled();
   // Support matrix: DIO outputs de-energize on every safe-state transition.
   for (auto& dio : digital_outputs_) dio->Set(false);
   if (is_simulation_) {

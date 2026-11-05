@@ -126,7 +126,7 @@ there.
 ### The declared graph
 
 The launcher probes every node with `--describe` before it spawns anything and
-writes the resulting *declared* graph to `<output_dir>/graph.json`. Pass that
+writes the resulting *declared* graph to `<output_dir>/<session_id>/graph.json`. Pass that
 path as `--declared PATH` and the bridge serves the file at
 `GET /declared.json`.
 

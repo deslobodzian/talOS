@@ -10,7 +10,10 @@ py_test(
     name = "bundle_builder_test",
     size = "small",
     srcs = ["bundle_builder_test.py"],
-    data = ["bundle_builder.py"],
+    data = [
+        "bundle_builder.py",
+        "//tools:deploy.sh",
+    ],
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],
 )

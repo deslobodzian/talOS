@@ -47,9 +47,9 @@ Beside the stack:
 | `talOS/configuration` | parses `robot.toml` and the subsystem files |
 | `talOS/hardware` | hardware config, request/state messages, the gateway the RoboRIO and sim run |
 | `talOS/protocol` | frame and UDP wire format |
-| `talOS/bridge` | `:hardware_node`; publishes link health and the gateway-to-node clock mapping (`:clock_offset`, read by `HardwareLink::sample_time()`) on `/hw/status` (`bridge::BridgeStatus`) |
+| `talOS/bridge` | `:hardware_node`; publishes link health, RoboRIO power/CAN health and gateway counters, and the gateway-to-node clock mapping (`:clock_offset`, read by `HardwareLink::sample_time()`) on `/hw/status` (`bridge::BridgeStatus`); `--log` records every command sent and state received |
 | `talOS/driver_station` | Driver Station codec |
-| `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed nodes up to `[robot] max_restarts`); `--describe-only` lints the graph |
+| `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed or stalled nodes, at most `[robot] max_restarts` per restart window); writes each session to `<output-dir>/<session_id>/` with a manifest kept current and old sessions pruned; `--describe-only` lints the graph |
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |
 | `talOS/process` | stop handlers and `ConfigureRealtime` for node binaries |
 | `talOS/msgs` | shared geometry and control message structs (field and chassis angles in radians; `SwerveModulePosition`, `PoseObservation`, `PoseEstimate`) |
@@ -68,7 +68,11 @@ After each tick the devices layer flushes one hardware request for the node:
 - every motor is neutral while `robot_enabled(node)` is false (no accepted
   hardware state, gateway not enabled, a fault, or a state older than
   `[robot] command_timeout_us`);
-- digital and PWM outputs set during the tick are sent as set.
+- digital and PWM outputs set during the tick are sent as set only while
+  `robot_enabled(node)` is true; otherwise DIO is false and PWM is zero;
+- motor demand and feedforward are clamped to that motor's configured limits;
+  non-finite values neutralize only that motor. `Motor::clamped_count()` counts
+  adjusted setter calls for the lifetime of the device.
 
 A subscription's `fresh()` means a value younger than `command_timeout_us`, so
 a node that stops hearing its target goes neutral on its own.
@@ -138,6 +142,14 @@ requests stop (`/hw/status` `timed_out_mask`).
 - Under the launcher, session-owned segments are created for every declared
   topic before nodes spawn and unlinked at session end. Outside a session, the
   last queue to close unlinks, and dead readers are reclaimed.
+- Shared-memory OS names use `ShmObjectName`: interior topic slashes become
+  dots. `TALOS_SHM_NAMESPACE`, when set, instead selects a namespace; otherwise
+  Bazel's `TEST_TMPDIR` isolates each test run and its child processes. A
+  namespaced name is `/~` plus 16 lowercase hex digits of FNV-1a-64 over the
+  namespace, a NUL separator, and the mapped topic (18 bytes total). Mapping
+  an existing `/~` name is idempotent. Production runs with neither variable
+  retain their ordinary names; publishers, subscribers, launcher session
+  cleanup, the registry and Studio all use the same mapping.
 - Dispatch logs (`.tlog` format version 5) carry each logged topic's schema
   descriptor, allowing `log_dump` to decode payloads to named fields without
   the recording build.

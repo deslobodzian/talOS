@@ -172,6 +172,8 @@ out/
 networktables.json
 simgui.json
 *-window.json
+# Last applied hardware config, persisted by the gateway (desktop sim writes it here)
+talos_config.bin
 
 # Simulation data log directory
 logs/

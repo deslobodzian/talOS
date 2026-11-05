@@ -49,10 +49,10 @@ struct Reader {
 };
 }  // namespace
 std::size_t Encode(const Command& c, std::span<uint8_t> data) {
-  if (c.count > kMaxMotors ||
-      c.digital_output_count > kMaxDigitalOutputs ||
-      c.pwm_output_count > kMaxPwmOutputs)
+  if (c.count > kMaxMotors || c.digital_output_count > kMaxDigitalOutputs ||
+      c.pwm_output_count > kMaxPwmOutputs) {
     return 0;
+  }
   Writer w{data};
   w.Int(c.config_id, 8);
   w.Int(c.boot_id, 8);
@@ -91,10 +91,10 @@ bool Decode(std::span<const uint8_t> data, Command& out) {
   c.count = r.Int(2);
   c.digital_output_count = r.Int(2);
   c.pwm_output_count = r.Int(2);
-  if (c.count > kMaxMotors ||
-      c.digital_output_count > kMaxDigitalOutputs ||
-      c.pwm_output_count > kMaxPwmOutputs)
+  if (c.count > kMaxMotors || c.digital_output_count > kMaxDigitalOutputs ||
+      c.pwm_output_count > kMaxPwmOutputs) {
     return false;
+  }
   for (std::size_t i = 0; i < c.count; ++i) {
     auto& m = c.motors[i];
     m.id = r.Int(2);
@@ -125,9 +125,9 @@ std::size_t Encode(const State& s, std::span<uint8_t> data) {
       s.digital_input_count > kMaxDigitalInputs ||
       s.digital_output_count > kMaxDigitalOutputs ||
       s.analog_input_count > kMaxAnalogInputs ||
-      s.encoder_count > kMaxEncoders ||
-      s.pwm_output_count > kMaxPwmOutputs)
+      s.encoder_count > kMaxEncoders || s.pwm_output_count > kMaxPwmOutputs) {
     return 0;
+  }
   Writer w{data};
   w.Int(s.config_id, 8);
   w.Int(s.boot_id, 8);
@@ -152,6 +152,7 @@ std::size_t Encode(const State& s, std::span<uint8_t> data) {
     w.Real(m.stator_current_a);
     w.Int(m.position_age_us, 4);
     w.Int(m.velocity_age_us, 4);
+    w.Int(m.fault_flags, 4);
   }
   for (std::size_t i = 0; i < s.sensor_count; ++i) {
     const auto& x = s.sensors[i];
@@ -195,6 +196,14 @@ std::size_t Encode(const State& s, std::span<uint8_t> data) {
     w.Int(p.valid ? 1 : 0, 1);
     w.Real(p.output);
   }
+  w.Int(s.health.valid ? 1 : 0, 1);
+  w.Real(s.health.battery_v);
+  w.Int(s.health.brownout ? 1 : 0, 1);
+  w.Real(s.health.can_utilization_frac);
+  w.Int(s.counters.rejected_command_count, 4);
+  w.Int(s.counters.neutralized_motor_count, 4);
+  w.Int(s.counters.apply_failure_count, 4);
+  w.Int(s.counters.device_reset_count, 4);
   return w.ok ? w.pos : 0;
 }
 bool Decode(std::span<const uint8_t> data, State& out) {
@@ -217,9 +226,9 @@ bool Decode(std::span<const uint8_t> data, State& out) {
       s.digital_input_count > kMaxDigitalInputs ||
       s.digital_output_count > kMaxDigitalOutputs ||
       s.analog_input_count > kMaxAnalogInputs ||
-      s.encoder_count > kMaxEncoders ||
-      s.pwm_output_count > kMaxPwmOutputs)
+      s.encoder_count > kMaxEncoders || s.pwm_output_count > kMaxPwmOutputs) {
     return false;
+  }
   for (std::size_t i = 0; i < s.motor_count; ++i) {
     auto& m = s.motors[i];
     m.id = r.Int(2);
@@ -232,6 +241,7 @@ bool Decode(std::span<const uint8_t> data, State& out) {
     m.stator_current_a = r.Real();
     m.position_age_us = r.Int(4);
     m.velocity_age_us = r.Int(4);
+    m.fault_flags = r.Int(4);
   }
   for (std::size_t i = 0; i < s.sensor_count; ++i) {
     auto& x = s.sensors[i];
@@ -291,6 +301,17 @@ bool Decode(std::span<const uint8_t> data, State& out) {
     p.valid = (valid == 1);
     p.output = r.Real();
   }
+  const auto health_valid = r.Int(1);
+  s.health.battery_v = r.Real();
+  const auto brownout = r.Int(1);
+  s.health.can_utilization_frac = r.Real();
+  if (health_valid > 1 || brownout > 1) return false;
+  s.health.valid = health_valid == 1;
+  s.health.brownout = brownout == 1;
+  s.counters.rejected_command_count = r.Int(4);
+  s.counters.neutralized_motor_count = r.Int(4);
+  s.counters.apply_failure_count = r.Int(4);
+  s.counters.device_reset_count = r.Int(4);
   if (!r.Done()) return false;
   out = s;
   return true;
@@ -301,7 +322,7 @@ bool Decode(std::span<const uint8_t> data, State& out) {
 static_assert(32 + 6 + kMaxMotors * 20 + kMaxDigitalOutputs * 3 +
                   kMaxPwmOutputs * 10 <=
               protocol::kMaxPayloadSize);
-static_assert(44 + 14 + kMaxMotors * 43 + kMaxSensors * 27 +
+static_assert(44 + 14 + 34 + kMaxMotors * 47 + kMaxSensors * 27 +
                   kMaxDigitalInputs * 4 + kMaxDigitalOutputs * 4 +
                   kMaxAnalogInputs * 15 + kMaxEncoders * 23 +
                   kMaxPwmOutputs * 11 <=

@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -22,12 +24,13 @@ namespace talos::event::log {
 
 // Writes a dispatch log in the on-disk format described by format.h.
 //
-// Records are copied into a preallocated chunk and only reach the file when
-// that chunk is full, so a loop that logs every dispatch pays one memcpy per
-// record and no syscall at all. A single-producer/single-consumer ring hands
-// chunks to the background writer without locking or waiting on the producer.
-// If the pool fills, capture stops permanently and failed() becomes true.
-// Previously accepted chunks are drained, preserving a prefix without holes.
+// Records are copied into preallocated chunks. A
+// single-producer/single-consumer ring hands chunks to the background writer
+// without locking or waiting on the producer. Once per second the writer also
+// writes the committed prefix of the active chunk before fsync, so quiet logs
+// do not remain buffered indefinitely. If the pool fills, capture stops
+// permanently and failed() becomes true. Previously accepted chunks are
+// drained, preserving a prefix without holes.
 //
 // dispatch()/send()/finish() never throw: a full disk or a transient
 // EIO must not bring down a control loop that is otherwise healthy. Such
@@ -45,6 +48,8 @@ struct LogWriterOptions {
 
   // Write from a background thread. Turn off for tests that want writes to
   // land synchronously, or for a process where an extra thread is not wanted.
+  // Without a background thread, the one-second sync is checked on append;
+  // an idle synchronous writer must be flushed explicitly.
   bool background{true};
 };
 
@@ -80,9 +85,12 @@ class LogWriter {
   void send(const Context& parent, std::uint16_t source_id,
             std::span<const std::byte> payload, std::uint32_t status,
             std::uint64_t sequence) noexcept;
+  // Records loop completion. EXIT may be readable before this writer or its
+  // owning process is destroyed; it does not acknowledge resource release.
   void finish(const Context& context) noexcept;
 
-  // Pushes everything buffered to the file and waits for it to be written.
+  // Pushes everything buffered to the file and fsyncs it before returning.
+  // Destruction also drains and fsyncs before closing the descriptor.
   // Safe to call repeatedly, including after a failure.
   void flush() noexcept;
 
@@ -106,6 +114,8 @@ class LogWriter {
   struct Chunk {
     std::vector<std::byte> data;
     std::size_t used{0};
+    std::atomic<std::size_t> committed{0};
+    std::size_t written{0};  // Consumer only.
   };
 
   // All state lives behind a pointer so that moving a LogWriter never has to
@@ -119,6 +129,7 @@ class LogWriter {
     void acquire_chunk() noexcept;
     void write_chunk(Chunk& chunk) noexcept;
     void write_all(const void* data, std::size_t size);
+    void sync() noexcept;
     void drain() noexcept;
     void stop_writer() noexcept;
     void set_error(std::string message) noexcept;
@@ -128,7 +139,9 @@ class LogWriter {
     std::uint64_t session_id{0};
     Options options;
 
-    std::vector<Chunk> pool;
+    std::deque<Chunk> pool;
+    std::chrono::steady_clock::time_point last_sync{
+        std::chrono::steady_clock::now()};
     Chunk* active{nullptr};
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<std::uint64_t> completed{0};
@@ -142,6 +155,9 @@ class LogWriter {
     std::thread writer;
     bool stopping{false};
     std::atomic<bool> failed{false};  // Disk failure, independent of capture.
+    // Error reporting also runs while the worker coordination mutex is held
+    // (fsync in drain/periodic sync), so it needs independent protection.
+    mutable std::mutex error_mutex;
     std::string error;
   };
 

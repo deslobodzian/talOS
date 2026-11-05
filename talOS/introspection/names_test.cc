@@ -201,6 +201,24 @@ std::string Describe(const std::vector<Diagnostic>& diagnostics) {
   return out.empty() ? " (none)" : out;
 }
 
+TEST(LintGraph, ReaderLimitIncludesObserversAndAllowsExactlyTheLimit) {
+  std::vector<NodeShape> nodes = {
+      {"drivetrain", "//robot/drivetrain:node", {Sender("/drivetrain/state")}}};
+  for (std::size_t i = 0; i < MAX_READERS; ++i) {
+    const auto name = "observer_" + std::to_string(i);
+    nodes.push_back({name,
+                     "//robot/" + name + ":node",
+                     {Watcher("/drivetrain/state", 32, kSourceFlagObserver)}});
+  }
+  EXPECT_FALSE(HasError(LintGraph(nodes))) << Describe(LintGraph(nodes));
+  nodes.push_back(
+      {"consumer", "//robot/consumer:node", {Watcher("/drivetrain/state")}});
+  const auto diagnostics = LintGraph(nodes);
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/drivetrain/state",
+                       "reader limit is " + std::to_string(MAX_READERS)))
+      << Describe(diagnostics);
+}
+
 TEST(LintGraph, AcceptsAWellFormedGraph) {
   const std::vector<NodeShape> nodes = {
       {"drivetrain",

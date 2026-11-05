@@ -67,6 +67,83 @@ RTMSOptions overwrite_sequence_options() {
 }
 
 }  // namespace
+TEST(WriterOwnership, RefusesSecondLiveWriterAndReleasesOnClose) {
+  const auto path = make_test_path("writer");
+  RTMSQueue session{path,
+                    sizeof(Message::TestMessage),
+                    alignof(Message::TestMessage),
+                    kSchema,
+                    64,
+                    {.session_owner = true}};
+  {
+    RTMSQueue writer{path,
+                     sizeof(Message::TestMessage),
+                     alignof(Message::TestMessage),
+                     kSchema,
+                     64,
+                     {.publisher = true}};
+    try {
+      RTMSQueue second{path,
+                       sizeof(Message::TestMessage),
+                       alignof(Message::TestMessage),
+                       kSchema,
+                       64,
+                       {.publisher = true}};
+      FAIL() << "two live writers must not share a topic";
+    } catch (const std::runtime_error& error) {
+      EXPECT_NE(std::string{error.what()}.find(path), std::string::npos);
+      EXPECT_NE(std::string{error.what()}.find(std::to_string(::getpid())),
+                std::string::npos);
+    }
+  }
+  EXPECT_NO_THROW((RTMSQueue{path,
+                             sizeof(Message::TestMessage),
+                             alignof(Message::TestMessage),
+                             kSchema,
+                             64,
+                             {.publisher = true}}));
+}
+
+TEST(WriterOwnership, ReclaimsCrashedWriterWithoutLosingReaders) {
+  const auto path = make_test_path("crash_writer");
+  RTMSQueue session{path,
+                    sizeof(Message::TestMessage),
+                    alignof(Message::TestMessage),
+                    kSchema,
+                    64,
+                    {.session_owner = true}};
+  const auto reader = session.register_reader();
+  if (!reader.has_value()) {
+    FAIL() << "Expected a registered reader";
+  }
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    RTMSQueue writer{path,
+                     sizeof(Message::TestMessage),
+                     alignof(Message::TestMessage),
+                     kSchema,
+                     64,
+                     {.publisher = true}};
+    writer.write(BytesOf(Message::TestMessage{1, 1.0F}));
+    ::_exit(0);  // Skip destruction, like a crash.
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), 0);
+  ASSERT_EQ(session.writer_sequence(), 1u);
+  RTMSQueue restarted{path,
+                      sizeof(Message::TestMessage),
+                      alignof(Message::TestMessage),
+                      kSchema,
+                      64,
+                      {.publisher = true}};
+  EXPECT_EQ(restarted.write(BytesOf(Message::TestMessage{2, 2.0F})),
+            WriteResult::SUCCESS);
+  EXPECT_EQ(session.writer_sequence(), 2u);
+  session.release_reader(*reader);
+}
 
 TEST(SingleProcess, RTMSSequence) {
   const std::string path = make_test_path("single_sequence");
@@ -1112,7 +1189,7 @@ RTMSOptions publisher_options() {
 // Leaves a segment of `bytes` behind at `path` with no live owner, the way a
 // SIGKILLed process does.
 void leak_segment(const std::string& path, std::size_t bytes) {
-  const int fd = shm_open(path.c_str(), O_CREAT | O_RDWR, 0666);
+  const int fd = shm_open(ShmObjectName(path).c_str(), O_CREAT | O_RDWR, 0666);
   ASSERT_NE(fd, -1);
   ASSERT_EQ(ftruncate(fd, static_cast<off_t>(bytes)), 0);
   ASSERT_EQ(close(fd), 0);
@@ -1122,7 +1199,7 @@ void leak_segment(const std::string& path, std::size_t bytes) {
 
 TEST(RTMSStaleSegment, PublisherReclaimsALeftoverOfTheWrongShape) {
   const std::string path = make_test_path("stale_reclaim");
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
   leak_segment(path, 4096);
 
   // Without the reclaim the leftover wins and construction fails outright.
@@ -1139,12 +1216,12 @@ TEST(RTMSStaleSegment, PublisherReclaimsALeftoverOfTheWrongShape) {
                   publisher_options()};
   const Message::TestMessage message{7, 1.5F};
   EXPECT_EQ(WriteResult(queue.write(BytesOf(message))), WriteResult::SUCCESS);
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
 }
 
 TEST(RTMSStaleSegment, ReaderReportsSkewInsteadOfClearingTheSegment) {
   const std::string path = make_test_path("stale_reader");
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
   leak_segment(path, 4096);
 
   // A reader that disagrees with a live publisher is a version skew, so it
@@ -1155,15 +1232,15 @@ TEST(RTMSStaleSegment, ReaderReportsSkewInsteadOfClearingTheSegment) {
       std::runtime_error);
 
   // The segment is still there for the owner to deal with.
-  const int fd = shm_open(path.c_str(), O_RDWR, 0666);
+  const int fd = shm_open(ShmObjectName(path).c_str(), O_RDWR, 0666);
   EXPECT_NE(fd, -1);
   if (fd != -1) close(fd);
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
 }
 
 TEST(RTMSStaleSegment, PublisherLeavesAHealthySegmentAloneUnderALiveReader) {
   const std::string path = make_test_path("stale_healthy");
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
 
   // A reader gets there first and takes a slot. The publisher that follows
   // has an identical layout, so there is nothing to reclaim -- and unlinking
@@ -1196,7 +1273,7 @@ TEST(RTMSStaleSegment, PublisherLeavesAHealthySegmentAloneUnderALiveReader) {
                 info),
             ReadResult::OK);
   EXPECT_EQ(received.id(), sent.id());
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
 }
 
 // --- schema identity
@@ -1237,7 +1314,7 @@ TEST(RTMSSchema, AChangedFieldTypeOfTheSameSizeIsRejectedAtAttach) {
   const talos::schema::Identity after = Reading("TALOS_VARIANT_INT_LEVEL");
   ASSERT_NE(before.hash, after.hash);
   const std::string path = make_test_path("schema_changed");
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
 
   constexpr std::size_t kBytes = 8;  // float or int, then two bytes, padded
   RTMSQueue publisher{path, kBytes, 4, before, 16, publisher_options()};
@@ -1263,7 +1340,7 @@ TEST(RTMSSchema, AChangedFieldTypeOfTheSameSizeIsRejectedAtAttach) {
 
 TEST(RTMSSchema, ANameMismatchIsRejectedEvenWithTheSameHash) {
   const std::string path = make_test_path("schema_name");
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
   RTMSQueue publisher{path,
                       sizeof(Message::TestMessage),
                       alignof(Message::TestMessage),
@@ -1330,7 +1407,7 @@ Message::TestMessage ReadOne(RTMSQueue& queue, std::size_t reader) {
 // HotPath C8: a publisher that exits cleanly must not take its topic with it.
 TEST(RTMSLifetime, APublishersCleanExitDoesNotSeverItsSubscriber) {
   const std::string path = make_test_path("clean_exit");
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
   RTMSQueue subscriber{path,
                        sizeof(Message::TestMessage),
                        alignof(Message::TestMessage),
@@ -1368,7 +1445,7 @@ TEST(RTMSLifetime, APublishersCleanExitDoesNotSeverItsSubscriber) {
 
 TEST(RTMSLifetime, TheLastQueueToCloseAStandaloneSegmentUnlinksIt) {
   const std::string path = make_test_path("last_close");
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
   {
     RTMSQueue first{path,
                     sizeof(Message::TestMessage),
@@ -1391,7 +1468,7 @@ TEST(RTMSLifetime, TheLastQueueToCloseAStandaloneSegmentUnlinksIt) {
 
 TEST(RTMSLifetime, ASessionOwnedSegmentOutlivesEveryNodeUntilTheSessionEnds) {
   const std::string path = make_test_path("session");
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
   // A leftover of the wrong shape is replaced, not attached to.
   {
     RTMSQueue leftover{path, 32, 8, {"Message.Old", 1}, 4, publisher_options()};
@@ -1434,7 +1511,7 @@ TEST(RTMSLifetime, ASessionOwnedSegmentOutlivesEveryNodeUntilTheSessionEnds) {
 // (drop-newest) writer back forever.
 TEST(RTMSDeadReader, AKilledReaderNoLongerHoldsADropNewestWriterBack) {
   const std::string path = make_test_path("dead_reader");
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
   constexpr std::size_t kSlots = 4;
   RTMSQueue publisher{path,
                       sizeof(Message::TestMessage),
@@ -1461,7 +1538,7 @@ TEST(RTMSDeadReader, AKilledReaderNoLongerHoldsADropNewestWriterBack) {
 
 TEST(RTMSDeadReader, SlotsOfKilledReadersAreReclaimedWhenNoneAreFree) {
   const std::string path = make_test_path("dead_slots");
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
   RTMSQueue publisher{path,
                       sizeof(Message::TestMessage),
                       alignof(Message::TestMessage),
@@ -1496,7 +1573,7 @@ TEST(RTMSDeadReader, SlotsOfKilledReadersAreReclaimedWhenNoneAreFree) {
 TEST(RTMSDeadReader,
      APublisherReclaimsAnotherSchemasSegmentNoLiveProcessHolds) {
   const std::string path = make_test_path("dead_schema");
-  shm_unlink(path.c_str());
+  shm_unlink(ShmObjectName(path).c_str());
   RunInChildThenKill([&path] {
     auto* queue = new RTMSQueue{path,
                                 sizeof(Message::TestMessage),

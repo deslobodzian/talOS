@@ -5,6 +5,7 @@
 #include <cstring>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -42,6 +43,11 @@ class Subscriber {
                               alignof(Message), talos::schema::Of<Message>(),
                               MAX_SLOTS,        options} {
     reader_id_ = queue_.register_reader();
+    if (!reader_id_) {
+      throw std::runtime_error("RTMS topic " + topic_ +
+                               " exhausted reader slots (limit " +
+                               std::to_string(MAX_READERS) + ")");
+    }
   }
 
   Subscriber(const Subscriber&) = delete;

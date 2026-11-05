@@ -17,6 +17,7 @@ class SimBackend final : public Backend {
     return true;
   }
   bool Read(State& state) override {
+    state.health = health_;
     const double dt =
         previous_time_ ? (state.sample_time_us - previous_time_) * 1e-6 : 0;
     previous_time_ = state.sample_time_us;
@@ -104,9 +105,10 @@ class SimBackend final : public Backend {
     pending_resets_.clear();
     return !reset_ids.empty();
   }
-  bool RestoreAfterReset() override {
-    commands_ = {};
-    return true;
+  void BeginRestoreAfterReset() override { commands_ = {}; }
+  RestoreStatus PollRestore() override { return RestoreStatus::kDone; }
+  void SetPowerHealth(double battery_v, bool brownout) {
+    health_ = {true, battery_v, brownout, 0.0};
   }
 
   void SetDigitalInput(uint16_t id, bool value) { digital_inputs_[id] = value; }
@@ -131,6 +133,7 @@ class SimBackend final : public Backend {
     double velocity_rps{};
   };
   Config config_;
+  HealthSample health_{true, 12.0, false, 0.0};
   uint64_t previous_time_{};
   std::vector<uint16_t> pending_resets_;
   std::array<MotorRequest, kMaxMotors> commands_{};

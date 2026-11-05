@@ -37,4 +37,13 @@ struct BridgeStatus {
   clock_ignored_count:uint64;
   clock_window_count:uint32;
   clock_offset_valid:bool;
+  health_valid:bool;
+  battery_v:double;
+  brownout:bool;
+  can_utilization_frac:double;
+  motor_fault_mask:uint32;
+  gateway_rejected_command_count:uint32;
+  gateway_neutralized_motor_count:uint32;
+  gateway_apply_failure_count:uint32;
+  gateway_device_reset_count:uint32;
 }

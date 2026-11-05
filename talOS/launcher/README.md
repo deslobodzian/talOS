@@ -25,8 +25,9 @@ The launcher parses those manifests, assembles the graph they describe, and runs
 `naming::LintGraph` over it. Every finding is printed. If any of them is an
 error, nothing is spawned and the launcher exits non-zero.
 
-**Phase two starts.** Only then does the launcher fork the roster, wait for it,
-read back the dispatch logs and write the session manifest.
+**Phase two starts.** Only then does the launcher fork the roster and supervise
+it. It persists the session manifest before spawning and atomically replaces it
+as nodes start, restart, or exit; normal shutdown adds final log counts.
 
 `--describe-only` stops after phase one, which makes the check useful on its own
 — in CI, in a pit before a match, or after a rename that touched two packages.
@@ -169,7 +170,7 @@ overrides `[studio] http_port` for one run. Supervision is sim-only: without
 `--sim` the flag has no effect, since a deployed session has no build tree
 serving the webroot and no browser to open. The bridge answers `--describe`
 like any other node, and the launcher starts it with the session's `graph.json`
-as `--declared`; its stdout lands in `<output_dir>/studio_bridge.log`
+as `--declared`; its stdout lands in `<output_dir>/<session_id>/studio_bridge.log`
 (plaintext, not a `.tlog`) beside the manifest.
 
 The bridge refuses to start before the telemetry publisher exists, so it is the
@@ -187,11 +188,12 @@ Studio.
 A roster member — `hardware_node`, every subsystem node, `sim_gateway` — that
 exits with a nonzero status or by a signal while the session is not stopping is
 restarted. The first restart waits 50 ms, each later one twice as long, capped
-at 1 s, and a node is restarted at most `max_restarts` times:
+at 1 s. Each node may restart at most `max_restarts` times within a rolling
+60-second window (not over the whole session):
 
 ```toml
 [robot]
-max_restarts = 5  # per node; 0 disables restarts
+max_restarts = 5  # per node per rolling restart window; 0 disables restarts
 ```
 
 The key is optional (default 5) and must be an integer >= 0; `--max-restarts N`
@@ -211,6 +213,12 @@ manifest records each node's `restart_count` and every log in `log_paths`
 `log_dump` on the session directory merges every `*.tlog`, restarts included.
 A node's `exit_code` and `pid` are its last run's.
 
+Heartbeat supervision reads the introspection registry without modifying it.
+`--heartbeat-periods N` defaults to 10 periods, with a minimum timeout of
+500 ms. `--heartbeat-startup-grace-ms MS` defaults to 5000 ms to allow node
+initialization. Stalled nodes are killed and enter the same restart policy.
+`--restart-window-ms MS` overrides the default 60000 ms rolling budget window.
+
 ## Replaying a session into one node
 
 `--replay-inputs <session dir> --only <node>` runs one roster member of the
@@ -223,7 +231,7 @@ bazel run //talOS/launcher -- \
   --config "$PWD/2026-robot/main_processor/configuration/robot.toml" \
   --replay-inputs /tmp/talos_logs/<id> --only pose_estimator \
   --output-dir /tmp/pose_estimator_replay
-bazel run //talOS/launcher:log_dump -- /tmp/pose_estimator_replay
+bazel run //talOS/launcher:log_dump -- /tmp/pose_estimator_replay/<new-session-id>
 ```
 
 The launcher starts the node's binary with `--sim --replay-inputs <dir>
@@ -248,7 +256,7 @@ whose logs are being read.
 
 ## graph.json
 
-Phase one writes `<output_dir>/graph.json` beside the session's
+Phase one writes `<output_dir>/<session_id>/graph.json` beside the session's
 `manifest.json`: the session id, the config it came from, every node with its
 name, target, whether it answered, and each source's kind, name, message size
 and endpoint attributes, followed by every diagnostic. Studio's bridge serves it
@@ -280,6 +288,24 @@ both spellings behave the same.
 format and the naming rules.
 
 ## Session segments and logs
+
+`--output-dir DIR` always names a root: each launch writes to
+`DIR/<session_id>/`, including deployed `TALOS_LOG_DIR` roots. Without the flag,
+the root is `/tmp/talos_logs`. Use persistent storage on a deployed robot.
+`manifest.json` is written before nodes start, flushed and synced, then replaced
+atomically at each process lifecycle change; an interrupted session retains its
+last complete manifest (`end_wall_ns = 0` means no normal shutdown).
+
+At startup, retention removes the oldest recognized sessions (directories with
+a `manifest.json`) until `[robot] log_keep_sessions` (default 50, including the
+current session) and `log_max_bytes` (default 2 GiB) are satisfied. Both must be
+positive. The current session, symlinks, and unrelated directories are never
+deleted. The current session can itself grow beyond the budget; retention runs
+on the next launch. Event writers sync approximately once a second and at close.
+
+Simulation is only permitted with effective remote `127.0.0.1`. `--sim` with a
+different configured or overridden remote is refused before any process starts.
+
 
 Before spawning nodes, phase two calls `CreateSessionSegments` (`launcher.h`),
 which creates every declared topic as a session-owned RTMS segment with its

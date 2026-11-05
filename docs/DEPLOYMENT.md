@@ -51,7 +51,8 @@ launch; use `--remote-port` and `--local-port` if the ports also differ.
 ```sh
 ./tools/deploy.sh install <bundle> [--prefix /opt/talos]
 ./tools/deploy.sh enable-boot [--prefix /opt/talos] [--user talos] [--dry-run]
-./tools/deploy.sh logs [--prefix /opt/talos] [dir]
+./tools/deploy.sh logs [--prefix /opt/talos] [LOG_ROOT]
+./tools/deploy.sh fetch [--prefix /opt/talos] DEST
 ./tools/deploy.sh rollback [--prefix /opt/talos]
 ```
 
@@ -64,13 +65,28 @@ launch; use `--remote-port` and `--local-port` if the ports also differ.
   LaunchDaemon `/Library/LaunchDaemons/org.talos.robot.plist` (`KeepAlive`)
   and bootstraps it into the system domain, so it starts without a login.
   Both use sudo. `--dry-run` prints the unit or plist instead.
-- **logs** prints the session manifest (session id, config path and hash, each
-  node's exit code and log path) found under `current` (or `dir`), or lists the
-  directory if there is none.
+- **logs** lists session directories under `<prefix>/logs` (or `LOG_ROOT`) and
+  summarizes the newest manifest by modification time: session id, config path
+  and hash, each node's exit code and log path. No installed bundle is needed
+  to inspect retained sessions.
+- **fetch** copies every session folder from `<prefix>/logs` into `DEST`,
+  preserving its manifest and all node logs, including restarted attempts.
+  Run it on the main processor, for example
+  `./tools/deploy.sh fetch /media/usb/robot-sessions`, then transfer that
+  directory to the analysis machine. Existing destination session names are
+  rejected rather than merged; choose a fresh destination for each collection.
 - **rollback** swaps `current` and `previous`: the whole previous bundle, with
   its own config.
 
 Run by hand: `/opt/talos/current/run.sh --duration-s 30`.
+
+Boot services set `TALOS_LOG_DIR=<prefix>/logs`. The generated `run.sh` passes
+that directory as the launcher's output **root**, unless an explicit
+`--output-dir ROOT` is supplied. The launcher appends a unique session id on
+every invocation, so recordings live in `<prefix>/logs/<session-id>/` and
+restarts of the service never reuse a previous session folder. For a manual
+run to use the same root, set `TALOS_LOG_DIR=/opt/talos/logs` or pass
+`--output-dir /opt/talos/logs`; `logs LOG_ROOT` can inspect another output root.
 
 ## RoboRIO
 

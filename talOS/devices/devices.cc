@@ -162,6 +162,8 @@ struct HardwareLink::Impl {
     std::uint16_t id;
     bool set = false;  // commanded since the last flush
     hardware::MotorRequest motor{};
+    const hardware::MotorConfig* motor_config = nullptr;
+    std::uint64_t clamped_count = 0;
     bool digital = false;
     double pwm = 0;
     // Where this device's sample was in the state arrays last time it was
@@ -259,11 +261,11 @@ struct HardwareLink::Impl {
         if (device.kind == Kind::kDigitalOutput &&
             command.digital_output_count < hardware::kMaxDigitalOutputs) {
           command.digital_outputs[command.digital_output_count++] = {
-              device.id, device.digital};
+              device.id, drive && device.digital};
         } else if (device.kind == Kind::kPwm &&
                    command.pwm_output_count < hardware::kMaxPwmOutputs) {
-          command.pwm_outputs[command.pwm_output_count++] = {device.id,
-                                                             device.pwm};
+          command.pwm_outputs[command.pwm_output_count++] = {
+              device.id, drive ? device.pwm : 0.0};
         }
       }
       Packet packet{};
@@ -341,6 +343,14 @@ std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
     impl.motor_devices.push_back(impl.devices.size());
   }
   impl.devices.push_back({.kind = kind, .id = id});
+  if (kind == Kind::kMotor) {
+    for (const auto& motor : impl.config.hardware.motors) {
+      if (motor.id == id) {
+        impl.devices.back().motor_config = &motor;
+        break;
+      }
+    }
+  }
   return impl.devices.size() - 1;
 }
 
@@ -353,6 +363,9 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
                                 ": motor slot " + std::to_string(slot) +
                                 " is not 0, 1 or 2");
   }
+  const auto& config = *device.motor_config;
+  const double requested_demand = demand;
+  const double requested_ff = ff_volts;
   // A non-finite demand is no demand: neutral, rather than handing the
   // gateway a NaN.
   if (!std::isfinite(demand) || !std::isfinite(ff_volts)) {
@@ -361,12 +374,44 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
     ff_volts = 0;
     slot = 0;
   }
+  if (mode != hardware::Mode::kNeutral) {
+    switch (mode) {
+      case hardware::Mode::kDutyCycle:
+        demand = std::clamp(demand, -1.0, 1.0);
+        break;
+      case hardware::Mode::kVoltage:
+        demand = std::clamp(demand, -config.max_voltage, config.max_voltage);
+        break;
+      case hardware::Mode::kVelocity:
+        demand = std::clamp(demand, -config.max_velocity_rps,
+                            config.max_velocity_rps);
+        break;
+      case hardware::Mode::kPosition:
+      case hardware::Mode::kMotionMagic:
+        if (config.soft_limits) {
+          demand = std::clamp(demand, config.reverse_limit_rot,
+                              config.forward_limit_rot);
+        }
+        break;
+      case hardware::Mode::kNeutral:
+        break;
+    }
+    ff_volts = std::clamp(ff_volts, -config.max_voltage, config.max_voltage);
+  }
+  if (demand != requested_demand || ff_volts != requested_ff) {
+    ++device.clamped_count;
+  }
   device.motor = {.id = device.id,
                   .mode = mode,
                   .slot = static_cast<std::uint8_t>(slot),
                   .demand = demand,
                   .feedforward_v = ff_volts};
   device.set = true;
+}
+
+std::uint64_t HardwareAccess::motor_clamped_count(const HardwareLink& link,
+                                                  std::size_t index) {
+  return link.impl_->At(index, Kind::kMotor).clamped_count;
 }
 
 hardware::MotorSample HardwareAccess::motor_sample(const HardwareLink& link,
@@ -468,6 +513,9 @@ void Motor::set_motion_magic(double rot, double ff_volts, int slot) {
 }
 void Motor::stop() {
   HardwareAccess::motor_set(*link_, index_, Mode::kNeutral, 0, 0, 0);
+}
+std::uint64_t Motor::clamped_count() const {
+  return HardwareAccess::motor_clamped_count(*link_, index_);
 }
 double Motor::position() const {
   return HardwareAccess::motor_sample(*link_, index_).position_rot;

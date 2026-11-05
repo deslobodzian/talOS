@@ -130,6 +130,7 @@ can_id = 1
 
   LauncherOptions Options() const {
     LauncherOptions options;
+    options.session_id = 1;
     options.simulation = true;
     options.describe_timeout_ms = 4000;
     options.binary_overrides["//talOS/bridge:hardware_node"] = "/usr/bin/true";
@@ -145,7 +146,8 @@ can_id = 1
   void Record() {
     LauncherOptions options = Options();
     options.config_path = record_config_;
-    options.output_dir = session_dir_;
+    options.output_dir =
+        std::filesystem::path{session_dir_}.parent_path().string();
     options.duration_s = 2;
     ASSERT_EQ(Launcher{options}.Run(), 0);
   }
@@ -160,7 +162,7 @@ can_id = 1
     return Launcher{options}.Run();
   }
 
-  const std::string session_dir_ = TempPath("session");
+  const std::string session_dir_ = TempPath("session") + "/1";
   const std::string config_ = TempPath("robot.toml");
   const std::string record_config_ = TempPath("record.toml");
 };
@@ -179,7 +181,7 @@ TEST_F(ReplayInputsTest, ANodeThatWasNotInTheSessionRunsOnItsTopics) {
   ASSERT_EQ(Replay("replay_consumer", second), 0);
 
   const std::vector<Sent> summaries =
-      Sends(first + "/replay_consumer.tlog", "/replay_consumer/state");
+      Sends(first + "/1/replay_consumer.tlog", "/replay_consumer/state");
   ASSERT_FALSE(summaries.empty());
   // On the recording's clock: nothing before the first reading arrived
   // counted it, and every reading was counted by the end.
@@ -201,7 +203,7 @@ TEST_F(ReplayInputsTest, ANodeThatWasNotInTheSessionRunsOnItsTopics) {
     EXPECT_LE(As<Summary>(sent).reading_count(), published_by_then);
   }
   // Reproducible: the second replay sent the same bytes at the same times.
-  EXPECT_EQ(Sends(second + "/replay_consumer.tlog", "/replay_consumer/state"),
+  EXPECT_EQ(Sends(second + "/1/replay_consumer.tlog", "/replay_consumer/state"),
             summaries);
 
   std::filesystem::remove_all(first);

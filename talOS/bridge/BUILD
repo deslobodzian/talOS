@@ -30,6 +30,7 @@ cc_library(
         ":clock_offset",
         ":messages",
         "//talOS/configuration",
+        "//talOS/events:events_log",
         "//talOS/events:events_os",
         "//talOS/hardware",
         "//talOS/introspection:describe",
@@ -55,13 +56,17 @@ cc_test(
     name = "node_test",
     size = "small",
     srcs = ["hardware_node_test.cc"],
+    data = [":hardware_node"],
+    env = {"HARDWARE_NODE": "$(rlocationpath :hardware_node)"},
     deps = [
         ":messages",
         ":node_lib",
+        "//talOS/events:events_log",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
 )
 

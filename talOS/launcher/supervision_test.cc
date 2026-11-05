@@ -86,12 +86,19 @@ std::string ReadFile(const std::string& path) {
 LauncherOptions BaseOptions(std::string_view tag,
                             std::string_view robot_keys = "") {
   LauncherOptions options;
+  options.session_id = GenerateSessionId();
   options.output_dir = TempPath(tag);
   options.describe_timeout_ms = 4000;
   options.config_path = WriteFixtureToml(tag, robot_keys);
   options.binary_overrides["//talOS/bridge:hardware_node"] =
       ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
   return options;
+}
+
+int RunSession(LauncherOptions& options) {
+  const int result = Launcher{options}.Run();
+  options.output_dir += "/" + std::to_string(options.session_id);
+  return result;
 }
 
 // A stub body that appends its --log argument to `record` (one line per run),
@@ -150,8 +157,8 @@ TEST(Supervision, SessionsAreIsolatedAndCleanOnlyOwnedDirs) {
   b.binary_overrides["//example/beta:node"] =
       WriteStub("iso_b_beta", "exit 0\n");
 
-  EXPECT_EQ(Launcher{a}.Run(), 0);
-  EXPECT_EQ(Launcher{b}.Run(), 0);
+  EXPECT_EQ(RunSession(a), 0);
+  EXPECT_EQ(RunSession(b), 0);
   EXPECT_TRUE(std::filesystem::exists(a.output_dir + "/manifest.json"));
   EXPECT_TRUE(std::filesystem::exists(b.output_dir + "/manifest.json"));
   // Distinct sessions: manifests name their own output dir, never each
@@ -176,7 +183,7 @@ TEST(Supervision, CriticalFailurePropagatesExitCode) {
       WriteStub("crit_alpha", "exit 3\n");
   options.binary_overrides["//example/beta:node"] =
       WriteStub("crit_beta", "exit 0\n");
-  EXPECT_EQ(Launcher{options}.Run(), 3);
+  EXPECT_EQ(RunSession(options), 3);
   const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
   EXPECT_NE(manifest.find("\"name\": \"alpha\""), std::string::npos);
   EXPECT_NE(manifest.find("\"exit_code\": 3"), std::string::npos) << manifest;
@@ -197,7 +204,7 @@ TEST(Supervision, CrashingNodeIsRestartedUpToTheLimit) {
   options.binary_overrides["//example/beta:node"] =
       WriteStub("restart_beta", RecordLogArgThen(beta_runs, "exit 0\n"));
 
-  EXPECT_NE(Launcher{options}.Run(), 0);
+  EXPECT_NE(RunSession(options), 0);
 
   const std::string dir = options.output_dir;
   const std::vector<std::string> expected_logs{dir + "/alpha.tlog",
@@ -238,7 +245,7 @@ TEST(Supervision, MaxRestartsZeroDisablesRestarts) {
   options.binary_overrides["//example/beta:node"] =
       WriteStub("norestart_beta", "exit 0\n");
 
-  EXPECT_EQ(Launcher{options}.Run(), 3);
+  EXPECT_EQ(RunSession(options), 3);
   EXPECT_EQ(ReadLines(alpha_runs),
             std::vector<std::string>{options.output_dir + "/alpha.tlog"});
   const std::string alpha =
@@ -258,9 +265,89 @@ TEST(Supervision, NegativeMaxRestartsRefusesToLaunch) {
       WriteStub("badrestart_alpha", "exit 0\n");
   options.binary_overrides["//example/beta:node"] =
       WriteStub("badrestart_beta", "exit 0\n");
-  EXPECT_EQ(Launcher{options}.Run(), 1);
+  EXPECT_EQ(RunSession(options), 1);
   EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/manifest.json"));
   std::filesystem::remove_all(options.output_dir);
+}
+
+TEST(Supervision, RestartsOutsideRollingWindowDoNotExhaustBudget) {
+  auto options = BaseOptions("window_out", "max_restarts = 1\n");
+  options.restart_window_ms = 100;
+  const auto runs = TempPath("window_runs");
+  ::remove(runs.c_str());
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "window_alpha",
+      RecordLogArgThen(runs,
+                       "case \"$log\" in *restart2.tlog) exit 0;; esac\n"
+                       "sleep 0.2\nexit 3\n"));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("window_beta", "exit 0\n");
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_EQ(ReadLines(runs).size(), 3u);
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
+TEST(Supervision, StalledRegistryHeartbeatIsKilledAndRestarted) {
+  auto options = BaseOptions("stalled_out", "max_restarts = 1\n");
+  options.heartbeat_startup_grace_ms = 0;
+  options.duration_s = 3;
+  const auto pid_file = TempPath("stalled_pid");
+  const auto runs = TempPath("stalled_runs");
+  ::remove(pid_file.c_str());
+  ::remove(runs.c_str());
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "stalled_alpha",
+      RecordLogArgThen(runs,
+                       "case \"$log\" in *restart1.tlog) exit 0;; esac\n"
+                       "echo $$ > " +
+                           pid_file + "\nexec sleep 10\n"));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("stalled_beta", "exit 0\n");
+  // Supply the stub's registry row from the fixture, without giving the
+  // launcher a writable mapping or requiring a real framework node binary.
+  std::jthread publisher{[&](const std::stop_token& stop) {
+    pid_t pid = 0;
+    while (!stop.stop_requested()) {
+      std::ifstream input{pid_file};
+      if (input >> pid) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    if (pid <= 0) return;
+    introspect::NodeRegistration registration{
+        {"alpha", "//example/alpha:node", options.session_id, 0}};
+    introspect::RegistryMapping mapping;
+    for (auto& row : mapping.header()->nodes) {
+      if (row.state.load(std::memory_order_acquire) !=
+          static_cast<uint64_t>(introspect::SlotState::ACTIVE)) {
+        continue;
+      }
+      if (row.session_id == options.session_id &&
+          row.pid == static_cast<uint64_t>(::getpid())) {
+        row.state.store(static_cast<uint64_t>(introspect::SlotState::CLAIMING),
+                        std::memory_order_release);
+        row.pid = static_cast<uint64_t>(pid);
+        row.heartbeat_wall_ns.store(introspect::wall_now_ns());
+        row.dispatch_count.store(1);
+        row.state.store(static_cast<uint64_t>(introspect::SlotState::ACTIVE),
+                        std::memory_order_release);
+        break;
+      }
+    }
+    while (!stop.stop_requested()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+  }};
+  EXPECT_EQ(RunSession(options), 0);
+  publisher.request_stop();
+  publisher.join();
+  EXPECT_EQ(ReadLines(runs).size(), 2u);
+  const auto alpha =
+      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
+  EXPECT_NE(alpha.find("\"restart_count\": 1"), std::string::npos);
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(pid_file.c_str());
+  ::remove(runs.c_str());
 }
 
 }  // namespace

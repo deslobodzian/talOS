@@ -1,5 +1,6 @@
 #pragma once
 
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -33,6 +35,7 @@
 #include "talOS/events/log/log_reader.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
+#include "talOS/introspection/registry.h"
 #include "talOS/rtms/rtms.h"
 #include "talOS/schema/unit_suffix.h"
 #include "toml.hpp"
@@ -156,8 +159,12 @@ struct LauncherOptions {
   // Studio HTTP port override. Zero means "take [studio] http_port".
   uint16_t studio_http_port{0};
 
-  // Restart budget per crashed node. Unset means "take [robot] max_restarts".
+  // Restart budget per node in restart_window_ms; unset takes
+  // robot.max_restarts.
   std::optional<int> max_restarts;
+  int restart_window_ms{60000};
+  int heartbeat_periods{10};
+  int heartbeat_startup_grace_ms{5000};
 
   // Launch a graph the linter called broken anyway. The default is refusal:
   // two spellings of one topic are silent at runtime.
@@ -837,8 +844,9 @@ inline std::string GraphToJson(
 //
 // A roster member other than the Studio bridge that crashes -- exits nonzero
 // or by a signal -- while the session is not stopping is respawned after a
-// backoff of 50 ms, doubling per restart, capped at 1 s, at most max_restarts
-// times. A clean exit is a node that finished and stays finished. The backoff
+// backoff of 50 ms, doubling within a rolling restart window, capped at 1 s.
+// max_restarts limits starts within that window, not the session lifetime.
+// A clean exit is a node that finished and stays finished. The backoff
 // is scheduled inside the supervision loop, so a restarting node never delays
 // another node or the session deadline. Every run writes its own event log.
 // ---------------------------------------------------------------------------
@@ -1092,10 +1100,9 @@ class Launcher {
  public:
   explicit Launcher(LauncherOptions options) : options_{std::move(options)} {
     if (options_.session_id == 0) options_.session_id = GenerateSessionId();
-    if (options_.output_dir.empty()) {
-      options_.output_dir =
-          "/tmp/talos_logs/" + std::to_string(options_.session_id);
-    }
+    const std::filesystem::path root =
+        options_.output_dir.empty() ? "/tmp/talos_logs" : options_.output_dir;
+    options_.output_dir = (root / std::to_string(options_.session_id)).string();
   }
 
   // Lints the declared graph, then runs the roster until every node exits,
@@ -1133,10 +1140,26 @@ class Launcher {
       }
       return 1;
     }
+    const std::string effective_remote =
+        EffectiveRemoteAddress(robot_config, options_);
+    if (options_.simulation && effective_remote != "127.0.0.1") {
+      std::cerr
+          << "launcher: --sim requires remote 127.0.0.1; effective remote "
+          << effective_remote << "\n";
+      return 1;
+    }
+    ApplyRetention(robot_config);
     std::string restart_error;
     if (!ResolveMaxRestarts(robot_config, options_, max_restarts_,
                             restart_error)) {
       std::cerr << "launcher: " << restart_error << "\n";
+      return 1;
+    }
+    if (options_.restart_window_ms <= 0 || options_.heartbeat_periods <= 0 ||
+        options_.heartbeat_startup_grace_ms < 0) {
+      std::cerr
+          << "launcher: restart window and heartbeat periods must be positive; "
+             "startup grace must be nonnegative\n";
       return 1;
     }
 
@@ -1195,6 +1218,8 @@ class Launcher {
     manifest.simulation = options_.simulation;
     manifest.declared_topics = declared_topics;
     manifest.start_wall_ns = WallNanos();
+    session_manifest_ = manifest;
+    PersistManifest({});
 
     std::vector<NodeProcessInfo> procs;
     procs.reserve(node_specs.size());
@@ -1216,6 +1241,7 @@ class Launcher {
       }
       if (!proc.log_path.empty()) proc.log_paths.push_back(proc.log_path);
     }
+    PersistManifest(procs);
 
     InstallSignals();
 
@@ -1238,6 +1264,14 @@ class Launcher {
     for (std::size_t i = 0; i < procs.size(); ++i) {
       if (studio && i == studio->index()) continue;
       auto& proc = procs[i];
+      auto period_us =
+          robot_config.toml_data["subsystems"][proc.name]["period_us"]
+              .value_or<int64_t>(robot_config.toml_data["robot"]["period_us"]
+                                     .value_or<int64_t>(5000));
+      launches[i].heartbeat_timeout = std::chrono::microseconds{
+          std::max<int64_t>(500000, period_us * options_.heartbeat_periods)};
+      launches[i].heartbeat_enabled =
+          proc.described && proc.name != kSimGatewayName;
       auto& args = launches[i].args;
       args.push_back(node_specs[i].binary_path);
       if (proc.name == kSimGatewayName) {
@@ -1273,10 +1307,12 @@ class Launcher {
         continue;
       }
       proc.pid = pid;
+      PersistManifest(procs);
       std::cout << "[launcher] Started " << proc.name << " (pid " << pid
                 << ", target " << proc.target << ")\n";
     }
     if (studio) studio->Start(procs[studio->index()]);
+    PersistManifest(procs);
 
     Supervise(procs, launches, studio, deadline);
     manifest.end_wall_ns = WallNanos();
@@ -1301,18 +1337,100 @@ class Launcher {
     }
     manifest.nodes = std::move(procs);
 
-    std::ofstream{options_.output_dir + "/manifest.json"} << manifest.ToJson();
+    session_manifest_ = manifest;
+    PersistManifest(manifest.nodes);
     PrintManifest(manifest);
     return exit_status;
   }
 
  private:
+  void PersistManifest(const std::vector<NodeProcessInfo>& procs) {
+    session_manifest_.nodes = procs;
+    const std::string path = options_.output_dir + "/manifest.json";
+    const std::string temporary = path + ".tmp";
+    FILE* file = std::fopen(temporary.c_str(), "wb");
+    if (file == nullptr) throw std::runtime_error("cannot create " + temporary);
+    const std::string json = session_manifest_.ToJson();
+    const bool written =
+        std::fwrite(json.data(), 1, json.size(), file) == json.size();
+    const bool flushed = std::fflush(file) == 0;
+    const bool synced = ::fsync(::fileno(file)) == 0;
+    const bool closed = std::fclose(file) == 0;
+    if (!written || !flushed || !synced || !closed ||
+        std::rename(temporary.c_str(), path.c_str()) != 0) {
+      throw std::runtime_error("cannot persist " + path);
+    }
+    const int directory = ::open(options_.output_dir.c_str(), O_RDONLY);
+    if (directory < 0)
+      throw std::runtime_error("cannot open session directory");
+    const int result = ::fsync(directory);
+    ::close(directory);
+    if (result != 0) throw std::runtime_error("cannot sync session directory");
+  }
+
+  void ApplyRetention(const config::RobotConfig& config) {
+    const auto robot = config.toml_data["robot"];
+    const int64_t cap = robot["log_keep_sessions"].value_or(int64_t{50});
+    const int64_t budget =
+        robot["log_max_bytes"].value_or(int64_t{2LL * 1024 * 1024 * 1024});
+    if (cap < 1 || budget < 1)
+      throw std::runtime_error(
+          "log_keep_sessions and log_max_bytes must be positive");
+    struct Session {
+      std::filesystem::path path;
+      std::filesystem::file_time_type time;
+      uintmax_t bytes;
+    };
+    std::vector<Session> sessions;
+    uintmax_t total = 0;
+    const auto current = std::filesystem::path{options_.output_dir};
+    for (const auto& entry :
+         std::filesystem::directory_iterator(current.parent_path())) {
+      // A session is recognized by its manifest; unrelated folders and symlinks
+      // are never retention candidates.
+      if (entry.is_symlink() || !entry.is_directory() ||
+          !std::filesystem::is_regular_file(entry.path() / "manifest.json"))
+        continue;
+      uintmax_t bytes = 0;
+      for (const auto& file :
+           std::filesystem::recursive_directory_iterator(entry.path())) {
+        if (!file.is_symlink() && file.is_regular_file())
+          bytes += file.file_size();
+      }
+      total += bytes;
+      sessions.push_back({entry.path(), entry.last_write_time(), bytes});
+    }
+    std::sort(
+        sessions.begin(), sessions.end(),
+        [](const Session& a, const Session& b) { return a.time < b.time; });
+    // Include the newly created current session even before its manifest
+    // exists.
+    std::size_t count = sessions.size() + 1;
+    for (const auto& session : sessions) {
+      if (session.path == current) continue;
+      if (count <= static_cast<uint64_t>(cap) &&
+          total <= static_cast<uint64_t>(budget))
+        break;
+      std::filesystem::remove_all(session.path);
+      total -= session.bytes;
+      --count;
+    }
+  }
+
   // How one roster member is spawned, and its pending restart.
   struct NodeLaunch {
     std::vector<std::string> args;
     std::size_t log_arg{0};  // Index of the --log value in args; 0 for none.
     bool restart_pending{false};
     std::chrono::steady_clock::time_point restart_at{};
+    std::deque<std::chrono::steady_clock::time_point> restart_times;
+    bool heartbeat_enabled{false};
+    bool heartbeat_killed{false};
+    std::chrono::nanoseconds heartbeat_timeout{std::chrono::milliseconds{500}};
+    std::chrono::steady_clock::time_point started_at{};
+    std::chrono::steady_clock::time_point heartbeat_changed_at{};
+    int64_t last_heartbeat{0};
+    uint64_t last_dispatch{0};
   };
 
   static int64_t WallNanos() {
@@ -1334,8 +1452,10 @@ class Launcher {
       return 1;
     }
     // The new log must not land among the logs being read.
-    if (std::filesystem::equivalent(options_.output_dir, options_.replay_inputs,
-                                    ec)) {
+    const auto relative = std::filesystem::weakly_canonical(options_.output_dir)
+                              .lexically_relative(std::filesystem::canonical(
+                                  options_.replay_inputs));
+    if (!relative.empty() && *relative.begin() != "..") {
       std::cerr << "launcher: --output-dir must not be the replayed session's "
                    "directory\n";
       return 1;
@@ -1406,6 +1526,12 @@ class Launcher {
     proc.pid = pid;
     proc.exited = false;
     proc.exit_code = -1;
+    launch.restart_times.push_back(std::chrono::steady_clock::now());
+    launch.started_at = std::chrono::steady_clock::now();
+    launch.heartbeat_changed_at = launch.started_at;
+    launch.last_heartbeat = 0;
+    launch.last_dispatch = 0;
+    launch.heartbeat_killed = false;
   }
 
   // Waits until every node has exited, SIGINTing them all once on a signal or
@@ -1418,24 +1544,93 @@ class Launcher {
                  std::optional<StudioBridge>& studio,
                  std::chrono::steady_clock::time_point deadline) {
     bool stop_sent = false;
+    std::optional<introspect::RegistryMapping> registry;
+    const auto started = std::chrono::steady_clock::now();
+    for (auto& launch : launches) {
+      launch.started_at = started;
+      launch.heartbeat_changed_at = started;
+    }
     for (;;) {
       const auto now = std::chrono::steady_clock::now();
       const bool past_deadline = now >= deadline;
       const bool stopping = stop_requested_ != 0 || stop_sent || past_deadline;
+      if (!registry) {
+        try {
+          registry.emplace(introspect::kRegistryPath, true);
+        } catch (const std::runtime_error&) {
+          // Nodes create the registry asynchronously; never create it here.
+        }
+      }
       for (std::size_t i = 0; i < procs.size(); ++i) {
         auto& proc = procs[i];
         if (proc.pid <= 0 || proc.exited) continue;
+        auto& launch = launches[i];
+        while (!launch.restart_times.empty() &&
+               now - launch.restart_times.front() >=
+                   std::chrono::milliseconds{options_.restart_window_ms}) {
+          launch.restart_times.pop_front();
+        }
+        if (!stopping && !launch.heartbeat_killed &&
+            !(studio && i == studio->index()) && proc.name != kSimGatewayName) {
+          bool found = false;
+          if (registry) {
+            for (const auto& record : registry->header()->nodes) {
+              if (record.state.load(std::memory_order_acquire) !=
+                  static_cast<uint64_t>(introspect::SlotState::ACTIVE))
+                continue;
+              const auto generation =
+                  record.generation.load(std::memory_order_acquire);
+              if (record.pid != static_cast<uint64_t>(proc.pid) ||
+                  record.session_id != options_.session_id)
+                continue;
+              const auto beat =
+                  record.heartbeat_wall_ns.load(std::memory_order_relaxed);
+              const auto dispatch =
+                  record.dispatch_count.load(std::memory_order_relaxed);
+              if (record.generation.load(std::memory_order_acquire) !=
+                      generation ||
+                  record.state.load(std::memory_order_acquire) !=
+                      static_cast<uint64_t>(introspect::SlotState::ACTIVE))
+                continue;
+              found = true;
+              launch.heartbeat_enabled = true;
+              if (beat != launch.last_heartbeat &&
+                  dispatch != launch.last_dispatch) {
+                launch.heartbeat_changed_at = now;
+                launch.last_heartbeat = beat;
+                launch.last_dispatch = dispatch;
+              }
+              break;
+            }
+          }
+          const bool grace_over =
+              now - launch.started_at >=
+              std::chrono::milliseconds{options_.heartbeat_startup_grace_ms};
+          if (launch.heartbeat_enabled && grace_over &&
+              now - launch.heartbeat_changed_at >= launch.heartbeat_timeout) {
+            std::cerr << "[launcher] " << proc.name
+                      << (found ? " heartbeat/dispatch stalled"
+                                : " heartbeat missing")
+                      << "; killing pid " << proc.pid << "\n";
+            ::kill(proc.pid, SIGKILL);
+            launch.heartbeat_killed = true;
+          }
+        }
         int status = 0;
         if (::waitpid(proc.pid, &status, WNOHANG) != proc.pid) continue;
         proc.exited = true;
         proc.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        PersistManifest(procs);
         const bool is_bridge = studio && i == studio->index();
         if (is_bridge && studio->Starting(i)) continue;
         const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-        if (!is_bridge && ShouldRestartNode(clean, proc.restart_count,
-                                            max_restarts_, stopping)) {
+        if (!is_bridge &&
+            ShouldRestartNode(clean,
+                              static_cast<int>(launch.restart_times.size()),
+                              max_restarts_, stopping)) {
           const int restart = proc.restart_count + 1;
-          const auto backoff = RestartBackoff(restart);
+          const auto backoff =
+              RestartBackoff(static_cast<int>(launch.restart_times.size()) + 1);
           launches[i].restart_pending = true;
           launches[i].restart_at = now + backoff;
           std::cout << "[launcher] " << proc.name << " exited ("
@@ -1458,9 +1653,20 @@ class Launcher {
           launch.restart_pending = false;
         } else if (now >= launch.restart_at) {
           Restart(procs[i], launch);
+          PersistManifest(procs);
         }
       }
-      if (studio) studio->Supervise(procs[studio->index()], now, stopping);
+      if (studio) {
+        const auto& before = procs[studio->index()];
+        const auto pid = before.pid;
+        const bool exited = before.exited;
+        const bool failed = before.failed;
+        studio->Supervise(procs[studio->index()], now, stopping);
+        const auto& after = procs[studio->index()];
+        if (pid != after.pid || exited != after.exited ||
+            failed != after.failed)
+          PersistManifest(procs);
+      }
 
       bool all_done = true;
       for (std::size_t i = 0; i < procs.size(); ++i) {
@@ -1554,6 +1760,7 @@ class Launcher {
   }
 
   LauncherOptions options_;
+  SessionManifest session_manifest_;
   int max_restarts_{kDefaultMaxRestarts};
   static inline volatile std::sig_atomic_t stop_requested_{false};
 };

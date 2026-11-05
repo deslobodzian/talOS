@@ -120,6 +120,36 @@ class TwoNodesTest(unittest.TestCase):
 
 
 class DevicesTest(unittest.TestCase):
+    def test_motor_clamping_is_exposed_as_a_property(self):
+        class Shooter:
+            def __init__(self, node):
+                self.motor = talos.Motor(node, "lift")
+                self.demand = 120.0
+
+            def update(self):
+                self.motor.set_velocity(self.demand)
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        shooter = sim.add(Shooter, "lift")
+        hw = SimHardware(sim)
+        self.assertEqual(shooter.motor.clamped_count, 0)
+        sim.step(0.02)
+        self.assertEqual(hw.motor_request("lift", "lift").mode,
+                         talos.Mode.NEUTRAL)
+        hw.enable()
+        sim.step(0.02)
+        self.assertEqual(hw.motor_request("lift", "lift").demand, 100.0)
+        self.assertGreater(shooter.motor.clamped_count, 0)
+        count = shooter.motor.clamped_count
+        shooter.demand = 50.0
+        sim.step(0.02)
+        self.assertEqual(shooter.motor.clamped_count, count)
+        shooter.demand = float("nan")
+        sim.step(0.02)
+        self.assertEqual(hw.motor_request("lift", "lift").mode,
+                         talos.Mode.NEUTRAL)
+        self.assertGreater(shooter.motor.clamped_count, count)
+
     def test_neutral_when_disabled_and_requests_when_enabled(self):
         sim = Sim.from_toml(ROBOT_TOML)
         lift = sim.add(Lift, "lift")

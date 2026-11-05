@@ -133,6 +133,85 @@ class BundleBuilderTest(unittest.TestCase):
             self.assertIn("libwpimath.so", proc.stderr)
             self.assertIn("'a'", proc.stderr)
 
+    def test_run_script_passes_output_root_without_a_session_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out, _ = self.build(tmp, {"c/robot.toml": "[robot]\n"})
+            launcher = os.path.join(out, "launcher")
+            put(launcher, "#!/usr/bin/env python3\n"
+                "import json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+            env = dict(os.environ, TALOS_LOG_DIR=os.path.join(tmp, "log root"))
+            for explicit in ([], ["--output-dir", os.path.join(tmp, "override")],
+                             ["--output-dir=" + os.path.join(tmp, "override")]):
+                with self.subTest(explicit=explicit):
+                    proc = subprocess.run([os.path.join(out, "run.sh"), *explicit],
+                                          env=env, capture_output=True, text=True)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    args = json.loads(proc.stdout)
+                    if explicit:
+                        self.assertEqual(args[-len(explicit):], explicit)
+                        self.assertNotIn(env["TALOS_LOG_DIR"], args)
+                    else:
+                        self.assertEqual(args[args.index("--output-dir") + 1],
+                                         env["TALOS_LOG_DIR"])
+
+
+class DeploySessionsTest(unittest.TestCase):
+    def deploy(self, prefix, *args):
+        script = runfiles.Create().Rlocation("_main/tools/deploy.sh")
+        return subprocess.run(["bash", script, *args, "--prefix", prefix],
+                              capture_output=True, text=True)
+
+    def session(self, prefix, name, timestamp):
+        path = os.path.join(prefix, "logs", name)
+        put(os.path.join(path, "manifest.json"), json.dumps({
+            "session_id": name, "config_path": "config/robot.toml",
+            "config_sha256": "abcdef", "nodes": []}))
+        put(os.path.join(path, "arm.0.tlog"), "first attempt")
+        put(os.path.join(path, "arm.1.tlog"), "restarted attempt")
+        os.utime(os.path.join(path, "manifest.json"), ns=(timestamp, timestamp))
+        return path
+
+    def test_logs_lists_sessions_and_selects_newest_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Names deliberately sort opposite to manifest modification time.
+            older = self.session(tmp, "z_old", 1_000_000_000)
+            newer = self.session(tmp, "a_new", 2_000_000_000)
+            proc = self.deploy(tmp, "logs")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(older, proc.stdout)
+            self.assertIn(newer, proc.stdout)
+            self.assertIn(f"newest session manifest: {newer}/manifest.json",
+                          proc.stdout)
+            self.assertIn("session a_new config config/robot.toml", proc.stdout)
+
+    def test_logs_does_not_require_an_installed_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.deploy(tmp, "logs")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("no session directories", proc.stdout)
+
+    def test_fetch_copies_complete_sessions_and_refuses_merging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = os.path.join(tmp, "prefix")
+            sessions = [self.session(prefix, name, index + 1)
+                        for index, name in enumerate(("one", "two"))]
+            dest = os.path.join(tmp, "collected logs")
+            proc = self.deploy(prefix, "fetch", dest)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            for session in sessions:
+                copied = os.path.join(dest, os.path.basename(session))
+                self.assertEqual(sorted(os.listdir(copied)),
+                                 ["arm.0.tlog", "arm.1.tlog", "manifest.json"])
+                for name in os.listdir(copied):
+                    with open(os.path.join(session, name), "rb") as source:
+                        with open(os.path.join(copied, name), "rb") as target:
+                            self.assertEqual(source.read(), target.read())
+            proc = self.deploy(prefix, "fetch", dest)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("already exists", proc.stderr)
+            proc = self.deploy(prefix, "fetch", os.path.join(prefix, "logs", "copy"))
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("outside the log root", proc.stderr)
 
 if __name__ == "__main__":
     unittest.main()

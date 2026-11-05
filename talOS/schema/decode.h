@@ -9,7 +9,7 @@
 //                              bfbs; enums print their value's name
 //   talos.TargetEnvelope<M>    {mode_since_us: 1200, active: true,
 //                               message: {...M...}}
-//   a layout with no bfbs      bytes=1404 hex=0a01ff... (talos.Bytes,
+//   a layout with no bfbs      bytes=1436 hex=0a01ff... (talos.Bytes,
 //   (byte topics, the          talos.hardware.Packet): the payload without
 //   hardware packet)           its trailing zeros, the first kMaxHexBytes
 //                              of it in hex

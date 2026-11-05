@@ -56,6 +56,7 @@
 
 #include "talOS/events/manifest.h"
 #include "talOS/introspection/names.h"
+#include "talOS/memory/shared_memory_ptr.h"
 
 namespace talos::introspect {
 
@@ -287,7 +288,7 @@ class RegistryMapping {
  public:
   explicit RegistryMapping(std::string_view path = kRegistryPath,
                            bool read_only = false)
-      : path_{path} {
+      : path_{ShmObjectName(path)} {
     const std::size_t size = sizeof(RegistryHeader);
     const int flags = read_only ? O_RDONLY : (O_CREAT | O_RDWR);
 
@@ -361,7 +362,7 @@ class RegistryMapping {
   // Removes the segment's name. Only tests need this; a robot leaves the
   // registry in place between runs.
   static void unlink(std::string_view path = kRegistryPath) {
-    ::shm_unlink(std::string{path}.c_str());
+    ::shm_unlink(ShmObjectName(path).c_str());
   }
 
  private:

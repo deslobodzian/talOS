@@ -110,10 +110,12 @@ class FakeBackend : public Backend {
     resets.clear();
     return !ids.empty();
   }
-  bool RestoreAfterReset() override {
-    events.push_back("restore");
-    return restore_ok;
+  void BeginRestoreAfterReset() override { events.push_back("restore"); }
+  RestoreStatus PollRestore() override {
+    if (pending_ticks-- > 0) return RestoreStatus::kPending;
+    return restore_ok ? RestoreStatus::kDone : RestoreStatus::kFailed;
   }
+  int pending_ticks{};
   bool configure_ok{true}, healthy{true}, apply_ok{true}, restore_ok{true};
   int applied{}, neutral{}, configure_calls{};
   std::vector<std::string> events{};
@@ -228,10 +230,10 @@ TEST(Gateway, RejectsWholeTransactionBeforeApplyingAnyMotor) {
   for (int invalid = 0; invalid < 6; ++invalid) {
     auto c = Request(g);
     auto& m = c.motors[c.count - 1];
-    if (invalid == 0) m.demand = std::numeric_limits<double>::quiet_NaN();
+    if (invalid == 0) m.id = 65535;
     if (invalid == 1) m.id = c.motors[0].id;
     if (invalid == 2) m.slot = 3;
-    if (invalid == 3) m.demand = 1e9;
+    if (invalid == 3) m.slot = 255;
     if (invalid == 4) m.mode = static_cast<Mode>(255);
     if (invalid == 5) --c.count;
     EXPECT_FALSE(g.Accept(c, 1, 1000));
@@ -309,16 +311,26 @@ TEST(Gateway, ReconfigurationRequiresDisabledOperation) {
   EXPECT_TRUE(g.Reconfigure(changed));
   EXPECT_EQ(backend.configure_calls, configures + 1);
 }
-TEST(Gateway, ApplyFailureLatchesNeutral) {
+TEST(Gateway, ApplyFailureRetriesThenLatchesAndReenableClears) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
   g.Tick(1000, true);
   backend.apply_ok = false;
   EXPECT_FALSE(g.Accept(Request(g), 1, 1000));
+  EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
   backend.apply_ok = true;
-  g.Tick(2000, true);
-  EXPECT_FALSE(g.Accept(Request(g), 2, 2000));
+  EXPECT_TRUE(g.Accept(Request(g), 2, 1000));
+  backend.apply_ok = false;
+  for (uint32_t i = 0; i < Gateway::kConsecutiveApplyFailureLimit; ++i) {
+    EXPECT_FALSE(g.Accept(Request(g), i + 3, 1000));
+  }
   EXPECT_TRUE(g.snapshot().flags & kHardwareFault);
+  EXPECT_EQ(g.snapshot().counters.apply_failure_count, 4u);
+  backend.apply_ok = true;
+  EXPECT_FALSE(g.Accept(Request(g), 7, 1000));
+  g.Tick(2000, false);
+  g.Tick(3000, true);
+  EXPECT_TRUE(g.Accept(Request(g), 8, 3000));
 }
 TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   FakeBackend backend;
@@ -408,12 +420,14 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   state.analog_input_count = kMaxAnalogInputs;
   state.encoder_count = kMaxEncoders;
   state.pwm_output_count = kMaxPwmOutputs;
+  state.health = {true, 9.2, true, 0.73};
+  state.counters = {1, 2, 3, 4};
 
   for (std::size_t i = 0; i < kMaxMotors; ++i) {
     const auto x = static_cast<double>(i);
     state.motors[i] = {
-        static_cast<uint16_t>(i + 1),   true, 1.0 + x, 2.0 + x, 11.5, 25.0,
-        123 + static_cast<uint32_t>(i), 456};
+        static_cast<uint16_t>(i + 1),   true, 1.0 + x,    2.0 + x, 11.5, 25.0,
+        123 + static_cast<uint32_t>(i), 456,  0x80000001u};
   }
   for (std::size_t i = 0; i < kMaxSensors; ++i) {
     state.sensors[i] = {static_cast<uint16_t>(50 + i),
@@ -447,13 +461,14 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   // The same per-device widths the payload-budget static_asserts in messages.cc
   // are built from, so raising a device cap moves both together or neither.
   constexpr std::size_t kWidestState =
-      44 + 14 + kMaxMotors * 43 + kMaxSensors * 27 + kMaxDigitalInputs * 4 +
-      kMaxDigitalOutputs * 4 + kMaxAnalogInputs * 15 + kMaxEncoders * 23 +
-      kMaxPwmOutputs * 11;
+      44 + 14 + 34 + kMaxMotors * 47 + kMaxSensors * 27 +
+      kMaxDigitalInputs * 4 + kMaxDigitalOutputs * 4 + kMaxAnalogInputs * 15 +
+      kMaxEncoders * 23 + kMaxPwmOutputs * 11;
   ASSERT_EQ(state_size, kWidestState);
   ASSERT_LE(state_size, protocol::kMaxPayloadSize);
   State copy;
   ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), state_size}, copy));
+  EXPECT_EQ(copy, state);
   EXPECT_EQ(copy.motors[0].position_age_us, 123u);
   EXPECT_EQ(copy.sensors[0].velocity_age_us, 1011u);
   EXPECT_EQ(copy.digital_inputs[0].value, true);
@@ -788,7 +803,8 @@ TEST(Gateway, ResetWhileEnabledNeutralizesBeforeRestore) {
   EXPECT_NE(g.snapshot().epoch, epoch);
   EXPECT_FALSE(g.snapshot().flags & kCommandActive);
   EXPECT_FALSE(g.Accept(stale, 2, 2000));
-  EXPECT_TRUE(g.Accept(Request(g), 0, 2000));
+  g.Tick(3000, true);
+  EXPECT_TRUE(g.Accept(Request(g), 0, 3000));
 }
 
 TEST(Gateway, FailedResetRestoreLatchesFaultAndReneutralizes) {
@@ -801,6 +817,7 @@ TEST(Gateway, FailedResetRestoreLatchesFaultAndReneutralizes) {
   backend.resets.push_back(1);
   backend.events.clear();
   g.Tick(2000, true);
+  g.Tick(3000, true);
   // Neutralize before the restore and again after the failed device change,
   // mirroring Reconfigure (plus the Tick-end neutral while faulted).
   ASSERT_GE(backend.events.size(), 3u);
@@ -812,8 +829,8 @@ TEST(Gateway, FailedResetRestoreLatchesFaultAndReneutralizes) {
 }
 
 std::optional<ConfigAckPayload> PushConfigAndAwaitAck(
-    Endpoint& endpoint, protocol::RuntimeUdpPeer& companion,
-    const Config& cfg) {
+    Endpoint& endpoint, protocol::RuntimeUdpPeer& companion, const Config& cfg,
+    bool enabled = false) {
   auto chunks = CreateConfigChunks(cfg);
   for (std::size_t i = 0; i < chunks.size(); ++i) {
     EXPECT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig, i + 1,
@@ -821,7 +838,7 @@ std::optional<ConfigAckPayload> PushConfigAndAwaitAck(
               protocol::UdpStatus::kOk);
   }
   std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  endpoint.Tick(2000, false);  // Disabled: Reconfigure reaches the backend.
+  endpoint.Tick(2000, enabled);
   for (int i = 0; i < 100; ++i) {
     protocol::DecodedFrame frame;
     if (companion.TryReceive(&frame) != protocol::UdpStatus::kOk) {
@@ -887,6 +904,106 @@ TEST(Endpoint, ConfigAckReasonFallsBackWithoutDetailedError) {
   }
   EXPECT_EQ(ack->status, ConfigAckStatus::kBackendFailed);
   EXPECT_EQ(std::string(ack->reason), "Backend configuration failed");
+}
+
+TEST(Gateway, PendingRestoreKeepsPollingAndNeutral) {
+  FakeBackend backend;
+  backend.pending_ticks = 3;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, true);
+  backend.resets = {1, 2};
+  g.Tick(2000, true);
+  for (uint64_t now = 3000; now <= 5000; now += 1000) {
+    g.Tick(now, true);
+    EXPECT_EQ(g.snapshot().sample_time_us, now);
+    EXPECT_FALSE(g.Accept(Request(g), now, now));
+    EXPECT_TRUE(g.snapshot().flags & kHardwareFault);
+  }
+  g.Tick(6000, true);
+  EXPECT_TRUE(g.Accept(Request(g), 1, 6000));
+  EXPECT_EQ(g.snapshot().counters.device_reset_count, 2u);
+}
+
+TEST(Gateway, RangeErrorsNeutralizeOnlyTheirMotor) {
+  SimBackend backend;
+  auto config = SwerveConfig(true);
+  config.motors[0].soft_limits = true;
+  config.motors[0].reverse_limit_rot = -2;
+  config.motors[0].forward_limit_rot = 2;
+  Gateway g{config, backend, 1};
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const std::array<MotorRequest, 8> invalid{{
+      {config.motors[0].id, Mode::kVelocity, 0, nan, 0},
+      {config.motors[0].id, Mode::kVelocity, 0, 21, 0},
+      {config.motors[0].id, Mode::kDutyCycle, 0, 1.1, 0},
+      {config.motors[0].id, Mode::kVoltage, 0, 13, 0},
+      {config.motors[0].id, Mode::kPosition, 0, -3, 0},
+      {config.motors[0].id, Mode::kMotionMagic, 0, 3, 0},
+      {config.motors[0].id, Mode::kVelocity, 0, 1, nan},
+      {config.motors[0].id, Mode::kVelocity, 0, 1, 13},
+  }};
+  uint64_t now = 1000, sequence = 1;
+  for (const auto& request : invalid) {
+    g.Tick(now, true);
+    auto command = Request(g);
+    command.motors[0] = request;
+    ASSERT_TRUE(g.Accept(command, sequence++, now));
+    g.Tick(++now, true);
+    EXPECT_DOUBLE_EQ(g.snapshot().motors[0].velocity_rps, 0);
+    EXPECT_DOUBLE_EQ(g.snapshot().motors[1].velocity_rps, 1);
+  }
+  EXPECT_EQ(g.snapshot().counters.neutralized_motor_count, invalid.size());
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
+}
+
+TEST(ConfigWire, PersistenceValidatesCrcAndAssemblerResetsAfterCompletion) {
+  const auto config = SwerveConfig(true);
+  auto bytes = PersistedConfig(config);
+  Config loaded;
+  ASSERT_TRUE(LoadPersistedConfig(bytes, loaded));
+  EXPECT_EQ(loaded, config);
+  bytes[0] ^= 1;
+  EXPECT_FALSE(LoadPersistedConfig(bytes, loaded));
+  EXPECT_FALSE(LoadPersistedConfig({}, loaded));
+  auto invalid = config;
+  invalid.motors[0].max_voltage = -1;
+  EXPECT_FALSE(LoadPersistedConfig(PersistedConfig(invalid), loaded));
+  auto chunks = CreateConfigChunks(config, 200);
+  ASSERT_GT(chunks.size(), 1u);
+  ConfigAssembler assembler;
+  std::string error;
+  for (std::size_t i = 0; i < chunks.size(); ++i) {
+    EXPECT_EQ(assembler.AddChunk(chunks[i], error),
+              i + 1 == chunks.size() ? ConfigAssembler::Status::kComplete
+                                     : ConfigAssembler::Status::kIncomplete);
+  }
+  EXPECT_EQ(assembler.AddChunk(chunks[0], error),
+            ConfigAssembler::Status::kIncomplete);
+}
+
+TEST(Endpoint, RestoredGatewayAcknowledgesIdenticalConfigWhileEnabled) {
+  Config restored;
+  ASSERT_TRUE(
+      LoadPersistedConfig(PersistedConfig(SwerveConfig(true)), restored));
+  FakeBackend backend;
+  Gateway gateway{backend, 3010};
+  ASSERT_TRUE(gateway.Reconfigure(restored));
+  gateway.Tick(1000, true);
+  const auto configure_calls = backend.configure_calls;
+  Endpoint endpoint{gateway};
+  ASSERT_EQ(endpoint.Open("127.0.0.1", 15810, "127.0.0.1", 15811),
+            protocol::UdpStatus::kOk);
+  protocol::RuntimeUdpPeer companion;
+  ASSERT_EQ(companion.Open("127.0.0.1", 15811, "127.0.0.1", 15810),
+            protocol::UdpStatus::kOk);
+  const auto ack = PushConfigAndAwaitAck(endpoint, companion, restored, true);
+  if (!ack.has_value()) {
+    FAIL() << "Expected configuration acknowledgement";
+  }
+  const auto& acknowledgement = *ack;
+  EXPECT_EQ(acknowledgement.status, ConfigAckStatus::kOk);
+  EXPECT_EQ(backend.configure_calls, configure_calls);
+  EXPECT_TRUE(gateway.Accept(Request(gateway), 1, 2000));
 }
 
 }  // namespace

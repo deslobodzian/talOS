@@ -7,6 +7,8 @@
 #include <frc/simulation/DriverStationSim.h>
 #include <frc/simulation/DutyCycleEncoderSim.h>
 #include <frc/simulation/EncoderSim.h>
+#include <frc/simulation/PWMSim.h>
+#include <frc/simulation/RoboRioSim.h>
 #include <gtest/gtest.h>
 #include <hal/HAL.h>
 
@@ -49,8 +51,8 @@ struct EnabledDs {
   }
 };
 
-// Production re-sends the latest command every Gateway tick, so the pump does
-// the same: a single one-shot Apply would otherwise age out mid-test.
+// The bridge heartbeat (at most 20 ms), not Gateway ticks, refreshes one-shot
+// requests in production. Refresh here too so requests do not age out mid-test.
 void PumpReads(PhoenixBackend& backend, hw::State& s,
                const std::array<hw::MotorRequest, 1>& cmd, int iters = 20) {
   for (int i = 0; i < iters; ++i) {
@@ -202,7 +204,7 @@ TEST(PhoenixBackendEncoders, DutyCycleDisconnectInvalidatesSample) {
   EXPECT_TRUE(s.motors[0].valid);
 }
 
-TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndZeroesPwm) {
+TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndDisablesPwm) {
   EnsureHal();
   hw::Config c;
   c.motors.push_back(TestMotor(1, "m1", 1));
@@ -232,6 +234,8 @@ TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndZeroesPwm) {
   EXPECT_TRUE(s.digital_outputs[0].value);
   EXPECT_TRUE(s.pwm_outputs[0].valid);
   EXPECT_GT(s.pwm_outputs[0].output, 0.5);
+  frc::sim::PWMSim pwm_sim{0};
+  EXPECT_GT(pwm_sim.GetPulseMicrosecond(), 0);
 
   backend.Neutral();
 
@@ -240,6 +244,26 @@ TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndZeroesPwm) {
   EXPECT_FALSE(s.digital_outputs[0].value);
   EXPECT_TRUE(s.pwm_outputs[0].valid);
   EXPECT_DOUBLE_EQ(s.pwm_outputs[0].output, 0.0);
+  EXPECT_EQ(pwm_sim.GetPulseMicrosecond(), 0);
+}
+
+TEST(PhoenixBackendHealth, ReportsBatteryAndBrownout) {
+  EnsureHal();
+  PhoenixBackend backend(true);
+  hw::Config config;
+  config.motors.push_back(TestMotor(1, "health_motor", 1));
+  ASSERT_TRUE(backend.Configure(config));
+  frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{7.1});
+  hw::State state;
+  backend.Read(state);  // Power health does not depend on CAN sample freshness.
+  EXPECT_TRUE(state.health.valid);
+  EXPECT_DOUBLE_EQ(state.health.battery_v, 7.1);
+  // WPILib desktop HAL_GetBrownedOut is always false; the portable sim
+  // backends cover injected brownout=true separately.
+  EXPECT_FALSE(state.health.brownout);
+  EXPECT_GE(state.health.can_utilization_frac, 0.0);
+  EXPECT_LE(state.health.can_utilization_frac, 1.0);
+  frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{12.0});
 }
 
 TEST(PhoenixBackendSim, ZeroVoltageVelocityRequestDoesNotSupplyDemand) {

@@ -6,8 +6,12 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <random>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "DriverStationReader.h"
 #include "PhoenixBackend.h"
@@ -30,6 +34,11 @@ uint64_t NowUs() {
 
 // Set to the companion's static address before deploying to the robot.
 constexpr const char* kCompanionAddress = "10.56.87.11";
+#ifdef __FRC_ROBORIO__
+constexpr const char* kConfigPath = "/home/lvuser/talos_config.bin";
+#else
+constexpr const char* kConfigPath = "talos_config.bin";
+#endif
 
 // The Driver Station's watchdog: it must hear the current mode every loop, or
 // it decides robot code has hung and disables the robot. This is the one piece
@@ -74,11 +83,8 @@ class SimDriverStation {
     active_ = true;
     const std::string_view mode{requested};
     if (mode == "auto") {
-      // Stay disabled until the bridge's config push lands. The gateway
-      // refuses hardware configuration while enabled, so enabling at
-      // startup would wedge the run: states flow but no command is ever
-      // accepted. configured() flips on the same Reconfigure success the
-      // acknowledgement reports, so polling it awaits the ack.
+      // Without a persisted configuration the first push still requires
+      // disabled operation. A restored configuration can start enabled.
       enabled_ = false;
       enable_when_configured_ = true;
     } else {
@@ -148,7 +154,28 @@ void Robot::StartCompetition() {
   const uint64_t boot_id = (uint64_t{random()} << 32) | random() | 1;
 
   gateway_ = std::make_unique<talos::hardware::Gateway>(*backend_, boot_id);
+  std::ifstream saved{kConfigPath, std::ios::binary};
+  if (saved) {
+    const std::vector<uint8_t> bytes{std::istreambuf_iterator<char>{saved}, {}};
+    talos::hardware::Config restored;
+    if (talos::hardware::LoadPersistedConfig(bytes, restored))
+      gateway_->Reconfigure(restored);
+  }
   endpoint_ = std::make_unique<talos::hardware::Endpoint>(*gateway_);
+  endpoint_->OnConfigured([last_id = gateway_->snapshot().config_id](
+                              const talos::hardware::Config& config) mutable {
+    const auto id = talos::hardware::ConfigurationId(config);
+    if (id == last_id) return;
+    const auto bytes = talos::hardware::PersistedConfig(config);
+    const std::string temporary = std::string{kConfigPath} + ".tmp";
+    std::ofstream file{temporary, std::ios::binary | std::ios::trunc};
+    file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    file.close();
+    if (file && std::rename(temporary.c_str(), kConfigPath) == 0)
+      last_id = id;
+    else
+      std::fprintf(stderr, "cannot persist hardware configuration\n");
+  });
 
   const auto status =
       endpoint_->Open(IsSimulation() ? "127.0.0.1" : "0.0.0.0", 5802,

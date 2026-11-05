@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -119,6 +120,30 @@ void ExpectRecordEquals(const ExpectedRecord& expected,
   ASSERT_EQ(actual.payload.size(), expected.payload.size());
   EXPECT_EQ(0, std::memcmp(actual.payload.data(), expected.payload.data(),
                            expected.payload.size()));
+}
+
+// EXIT describes loop completion, not process teardown. Consumers must not
+// infer that IPC writer claims or other process resources have been released.
+TEST(LogWriter, ExitIsReadableBeforeWriterDestruction) {
+  const std::string path = TempPath("live_exit");
+  {
+    LogWriter writer{path, "live_exit"};
+    writer.start(MakeManifest(), MonotonicTime::from_nanos(0));
+    Context context{};
+    writer.finish(context);
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+
+    LogReader reader{path};
+    LogReader::Record record;
+    ASSERT_TRUE(reader.next(record));
+    EXPECT_EQ(record.header.kind, static_cast<std::uint16_t>(EventKind::EXIT));
+    EXPECT_FALSE(reader.next(record));
+    // Still alive, with shutdown/close work outstanding despite readable EXIT.
+    writer.flush();
+    EXPECT_FALSE(writer.failed()) << writer.error();
+  }
+  std::remove(path.c_str());
 }
 
 // Writes the round-trip fixture used by several tests: a manifest, ~50
@@ -622,6 +647,101 @@ TEST(LogBackgroundWriter, FlushWaitsForTheWriterThread) {
   EXPECT_FALSE(reader.truncated());
 
   std::remove(path.c_str());
+}
+
+TEST(LogBackgroundWriter, IdlePartialChunkReachesFileAndIsNotDuplicated) {
+  const auto path = TempPath("periodic_partial");
+  {
+    LogWriter writer{path, "periodic", LogWriter::Options{4096, 2, true}};
+    writer.start({}, {});
+    for (std::uint64_t i = 1; i <= 2; ++i) {
+      Context context{};
+      context.dispatch_index = i;
+      writer.dispatch(context, MakePayload(16, static_cast<int>(i)));
+      // No further producer activity and no flush: the worker must write the
+      // committed prefix of a chunk that is nowhere near full.
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds{3};
+      struct stat status {};
+      const auto expected = static_cast<off_t>(sizeof(FileHeader) +
+                                               i * (sizeof(RecordHeader) + 16));
+      do {
+        ASSERT_EQ(::stat(path.c_str(), &status), 0);
+        if (status.st_size >= expected) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+      } while (std::chrono::steady_clock::now() < deadline);
+      ASSERT_EQ(status.st_size, expected);
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+    // Destruction must write the remaining suffix, not repeat either prefix.
+    Context context{};
+    context.dispatch_index = 3;
+    writer.dispatch(context, MakePayload(16, 3));
+  }
+  LogReader reader{path};
+  LogReader::Record record{};
+  for (std::uint64_t i = 1; i <= 3; ++i) {
+    ASSERT_TRUE(reader.next(record));
+    EXPECT_EQ(record.header.dispatch_index, i);
+    const auto expected = MakePayload(16, static_cast<int>(i));
+    EXPECT_TRUE(std::equal(record.payload.begin(), record.payload.end(),
+                           expected.begin(), expected.end()));
+  }
+  EXPECT_FALSE(reader.next(record));
+  EXPECT_FALSE(reader.truncated());
+  ::unlink(path.c_str());
+}
+
+// Invalidate only this writer's descriptor after start() has written its
+// header. No descriptors may be opened until the writer is destroyed, since it
+// still owns the now-invalid descriptor number.
+bool CloseLogDescriptor(const std::string& path) {
+  struct stat target {};
+  if (::stat(path.c_str(), &target) != 0) return false;
+  const auto limit = ::sysconf(_SC_OPEN_MAX);
+  for (int fd = 0; fd < limit; ++fd) {
+    struct stat candidate {};
+    if (::fstat(fd, &candidate) == 0 && candidate.st_dev == target.st_dev &&
+        candidate.st_ino == target.st_ino) {
+      return ::close(fd) == 0;
+    }
+  }
+  return false;
+}
+
+TEST(LogDurability, FlushReportsFsyncFailure) {
+  const auto path = TempPath("flush_sync_closed");
+  for (const bool background : {false, true}) {
+    LogWriter writer{path, "sync_failure",
+                     LogWriter::Options{4096, 2, background}};
+    writer.start({}, {});
+    ASSERT_TRUE(CloseLogDescriptor(path));
+    EXPECT_FALSE(writer.failed());
+    writer.flush();
+    EXPECT_TRUE(writer.failed());
+    EXPECT_NE(writer.error().find("fsync failed"), std::string::npos);
+    writer.flush();
+    EXPECT_TRUE(writer.failed());
+  }
+  // Neither writer buffers records, so EBADF must originate in fsync.
+  ::unlink(path.c_str());
+}
+
+TEST(LogDurability, IdleBackgroundWriterFsyncsWithoutExplicitFlush) {
+  const auto path = TempPath("periodic_sync_closed");
+  {
+    LogWriter writer{path, "periodic_sync"};
+    writer.start({}, {});
+    ASSERT_TRUE(CloseLogDescriptor(path));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{3};
+    while (!writer.failed() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    EXPECT_TRUE(writer.failed());
+    EXPECT_NE(writer.error().find("fsync failed"), std::string::npos);
+  }
+  ::unlink(path.c_str());
 }
 
 TEST(LogBackgroundWriter, BlockedDiskStopsCaptureWithoutBlockingProducer) {

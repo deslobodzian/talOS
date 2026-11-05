@@ -11,6 +11,7 @@
 #   ./tools/deploy.sh install <bundle> [--prefix DIR]
 #   ./tools/deploy.sh enable-boot [--prefix DIR] [--user NAME] [--dry-run]
 #   ./tools/deploy.sh logs [--prefix DIR]
+#   ./tools/deploy.sh fetch [--prefix DIR] DEST
 #   ./tools/deploy.sh rollback [--prefix DIR]
 #
 set -euo pipefail
@@ -125,39 +126,34 @@ WantedBy=multi-user.target
 }
 
 # --- logs -------------------------------------------------------------------
-# Manifest first (which session, which config hash), then the per-node logs
-# it names. Falls back to a directory listing when no manifest exists.
+# List session directories under the output root and summarize the newest
+# manifest. Never search unrelated bundles or the machine-wide /tmp logs.
 cmd_logs() {
-  local dir="$PREFIX/current"
-  [ $# -gt 0 ] && dir="$1"
-  [ -e "$dir" ] || die "nothing installed at $dir"
-  local manifest; manifest="$(python3 - "$PREFIX/logs" "$dir" "/tmp/talos_logs" <<'EOF'
-import os, sys
-best_path, best_mtime = "", -1.0
-for root_dir in sys.argv[1:]:
-    if not os.path.exists(root_dir):
-        continue
-    for cur, dirs, files in os.walk(root_dir, followlinks=True):
-        depth = cur[len(root_dir):].count(os.sep)
-        if depth >= 3:
-            dirs[:] = []
-        if "manifest.json" in files:
-            p = os.path.join(cur, "manifest.json")
-            try:
-                mt = os.path.getmtime(p)
-                if mt > best_mtime:
-                    best_mtime, best_path = mt, p
-            except OSError:
-                pass
-if best_path:
-    print(best_path)
-EOF
-)"
-  if [ -n "$manifest" ]; then
-    say "session manifest: $manifest"
-    python3 - "$manifest" <<'EOF'
-import json, sys
-m = json.load(open(sys.argv[1]))
+  [ $# -le 1 ] || die "usage: deploy.sh logs [--prefix DIR] [LOG_ROOT]"
+  local dir="${1:-$PREFIX/logs}"
+  python3 - "$dir" <<'EOF'
+import json
+import os
+import sys
+
+root = sys.argv[1]
+if not os.path.isdir(root):
+    print(f"deploy: no session directories at {root}")
+    sys.exit(0)
+sessions = sorted(entry.path for entry in os.scandir(root)
+                  if entry.is_dir(follow_symlinks=False))
+print(f"deploy: session directories under {root}:")
+for path in sessions:
+    print(f"  {path}")
+manifests = [os.path.join(path, "manifest.json") for path in sessions
+             if os.path.isfile(os.path.join(path, "manifest.json"))]
+if not manifests:
+    print("deploy: no session manifest yet")
+    sys.exit(0)
+manifest = max(manifests, key=lambda path: (os.stat(path).st_mtime_ns, path))
+print(f"deploy: newest session manifest: {manifest}")
+with open(manifest, encoding="utf-8") as source:
+    m = json.load(source)
 print(f"session {m.get('session_id')} config {m.get('config_path')} "
       f"sha {m.get('config_sha256', '')[:16]}")
 for n in m.get("nodes", []):
@@ -165,10 +161,36 @@ for n in m.get("nodes", []):
           f"failed={n.get('recorder_failed')} records={n.get('record_count')} "
           f"{n.get('log_path')}")
 EOF
-  else
-    say "no session manifest yet; bundle contents:"
-    ls "$dir"
-  fi
+}
+
+# --- fetch ------------------------------------------------------------------
+# Copy whole sessions, including manifests and every node's log attempts.
+cmd_fetch() {
+  [ $# -eq 1 ] || die "usage: deploy.sh fetch [--prefix DIR] DEST"
+  python3 - "$PREFIX/logs" "$1" <<'EOF'
+import os
+import shutil
+import sys
+
+root, dest = map(os.path.realpath, sys.argv[1:])
+if not os.path.isdir(root):
+    sys.exit(f"deploy: error: no session directories at {root}")
+if os.path.commonpath([root, dest]) == root:
+    sys.exit("deploy: error: fetch destination must be outside the log root")
+sessions = sorted(entry.name for entry in os.scandir(root)
+                  if entry.is_dir(follow_symlinks=False))
+if not sessions:
+    sys.exit(f"deploy: error: no session directories at {root}")
+# Refuse collisions before copying anything: fetching must not mix sessions.
+for name in sessions:
+    if os.path.lexists(os.path.join(dest, name)):
+        sys.exit(f"deploy: error: destination session already exists: {name}")
+os.makedirs(dest, exist_ok=True)
+for name in sessions:
+    shutil.copytree(os.path.join(root, name), os.path.join(dest, name),
+                    symlinks=True)
+    print(f"deploy: fetched {os.path.join(dest, name)}")
+EOF
 }
 
 # --- rollback ---------------------------------------------------------------
@@ -205,6 +227,7 @@ main() {
     install) cmd_install "$@" ;;
     enable-boot) cmd_enable_boot "$@" ;;
     logs) cmd_logs "$@" ;;
+    fetch) cmd_fetch "$@" ;;
     rollback) cmd_rollback "$@" ;;
     *) usage; exit 2 ;;
   esac

@@ -5,9 +5,10 @@
     self.ds = talos.DriverStation(node)          # what the bridge forwards
 
 Take handles in __init__. Commands apply to the next flush after update();
-a motor not commanded by then is neutral, and every motor is neutral while
-talos.robot_enabled(node) is false. Feedback is in mechanism units and reads
-0 (connected False) until the first hardware state.
+motors not commanded by then are neutral. Motors, digital outputs and PWM
+outputs are neutral while talos.robot_enabled(node) is false. Motor demands
+clamp to configured limits; non-finite input neutralizes the motor. Feedback
+is in mechanism units and reads 0 (connected False) until the first state.
 """
 
 import ctypes
@@ -71,6 +72,14 @@ class _Input(_Device):
 class Motor(_Input):
     _KIND = _abi.DEVICE_MOTOR
     _SAMPLE = lib.talos_motor_sample
+
+    @property
+    def clamped_count(self):
+        """Number of setter calls clamped or neutralized for non-finite input."""
+        count = _abi.c_uint64()
+        _abi.ok(lib.talos_motor_clamped_count(
+            self._node, self._index, ctypes.byref(count)))
+        return count.value
 
     def set_duty_cycle(self, fraction):  # [-1, 1]
         self._set(Mode.DUTY_CYCLE, fraction)

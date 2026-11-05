@@ -6,7 +6,9 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <limits>
@@ -37,7 +39,8 @@
 // Public because anything that opens a segment directly -- RTMS's stale-segment
 // reclaim, a test, a tool listing /dev/shm -- needs this name and not the
 // topic.
-inline std::string ShmObjectName(std::string_view topic) {
+inline std::string ShmObjectName(std::string_view topic, std::string_view ns) {
+  if (topic.starts_with("/~")) return std::string{topic};
   std::string_view stripped = topic;
   while (stripped.starts_with('/')) {
     stripped.remove_prefix(1);
@@ -48,7 +51,39 @@ inline std::string ShmObjectName(std::string_view topic) {
   for (const char c : stripped) {
     result.push_back(c == '/' ? '.' : c);
   }
+  if (!ns.empty()) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    const auto append = [&hash](std::string_view bytes) {
+      for (const unsigned char byte : bytes) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+      }
+    };
+    append(ns);
+    append(std::string_view{"\0", 1});
+    append(result);
+    constexpr char hex[] = "0123456789abcdef";
+    result.assign("/~");
+    for (int shift = 60; shift >= 0; shift -= 4) {
+      result.push_back(hex[(hash >> shift) & 0xf]);
+    }
+  }
   return result;
+}
+
+// Cache once: children inherit the same test/session namespace, while normal
+// production processes retain the readable, unnamespaced POSIX names.
+inline std::string ShmObjectName(std::string_view topic) {
+  static const std::string ns = [] {
+    if (const char* value = std::getenv("TALOS_SHM_NAMESPACE")) {
+      return std::string{value};
+    }
+    if (const char* value = std::getenv("TEST_TMPDIR")) {
+      return std::string{value};
+    }
+    return std::string{};
+  }();
+  return ShmObjectName(topic, ns);
 }
 
 enum class SharedMemoryMode { CREATE, ATTACH };

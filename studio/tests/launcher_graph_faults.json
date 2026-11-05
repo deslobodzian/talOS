@@ -12,7 +12,7 @@
         {
           "kind": "SENDER",
           "name": "/hw/state",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -24,7 +24,7 @@
         {
           "kind": "SENDER",
           "name": "/hw/command",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": true,
           "optional": false,
           "observer": false,
@@ -36,7 +36,7 @@
         {
           "kind": "SENDER",
           "name": "/hw/state/driver_station",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -60,7 +60,7 @@
         {
           "kind": "FETCHER",
           "name": "/hw/request/drivetrain",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -72,7 +72,7 @@
         {
           "kind": "FETCHER",
           "name": "/hw/request/intake",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -84,7 +84,7 @@
         {
           "kind": "FETCHER",
           "name": "/hw/request/shooter",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -115,7 +115,7 @@
         {
           "kind": "WATCHER",
           "name": "/hw/state/driver_station",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -154,7 +154,7 @@
         {
           "kind": "WATCHER",
           "name": "/hw/state",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -178,7 +178,7 @@
         {
           "kind": "WATCHER",
           "name": "/hw/state/driver_station",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -226,7 +226,7 @@
         {
           "kind": "SENDER",
           "name": "/hw/req/drive",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -253,7 +253,7 @@
         {
           "kind": "WATCHER",
           "name": "/hw/state",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -277,7 +277,7 @@
         {
           "kind": "SENDER",
           "name": "/hw/request/intake",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -289,7 +289,7 @@
         {
           "kind": "WATCHER",
           "name": "/hw/state/driver_station",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -391,7 +391,7 @@
         {
           "kind": "WATCHER",
           "name": "/hw/state",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -415,7 +415,7 @@
         {
           "kind": "SENDER",
           "name": "/hw/request/shooter",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -427,7 +427,7 @@
         {
           "kind": "WATCHER",
           "name": "/hw/state/driver_station",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,
@@ -502,7 +502,7 @@
         {
           "kind": "WATCHER",
           "name": "/hw/state/driver_station",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": true,
@@ -589,7 +589,7 @@
         {
           "kind": "WATCHER",
           "name": "/hw/state/driver_station",
-          "message_bytes": 1404,
+          "message_bytes": 1436,
           "external": false,
           "optional": false,
           "observer": false,

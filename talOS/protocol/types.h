@@ -4,7 +4,7 @@
 
 namespace talos::protocol {
 
-constexpr uint16_t kProtocolVersion = 1;
+constexpr uint16_t kProtocolVersion = 2;
 constexpr uint64_t kFrameMagic = 0x4F4952534F4C4154ull;  // "TALOSRIO" LE
 
 enum class FrameType : uint16_t {

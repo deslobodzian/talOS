@@ -33,7 +33,7 @@ TEST(SharedMemory, SharedMemoryPtr) {
 TEST(ShmObjectNameTest, ProducesAPortablePosixName) {
   for (const auto* topic : {"/hw/state", "/hw/state/driver_station",
                             "/drivetrain/target/teleop", "/talos/telemetry"}) {
-    const std::string name = ShmObjectName(topic);
+    const std::string name = ShmObjectName(topic, "");
     ASSERT_FALSE(name.empty());
     EXPECT_EQ(name.front(), '/') << name;
     // POSIX allows exactly one slash, at the front.
@@ -44,13 +44,13 @@ TEST(ShmObjectNameTest, ProducesAPortablePosixName) {
     EXPECT_EQ(name.size(), std::string_view{topic}.size());
   }
 
-  EXPECT_EQ(ShmObjectName("/hw/state/driver_station"),
+  EXPECT_EQ(ShmObjectName("/hw/state/driver_station", ""),
             "/hw.state.driver_station");
   // A name that already conforms comes back unchanged, and the mapping is
   // idempotent -- RTMS applies it and then SharedMemoryPtr applies it again.
-  EXPECT_EQ(ShmObjectName("/talos_registry.1"), "/talos_registry.1");
-  EXPECT_EQ(ShmObjectName(ShmObjectName("/hw/state")),
-            ShmObjectName("/hw/state"));
+  EXPECT_EQ(ShmObjectName("/talos_registry.1", ""), "/talos_registry.1");
+  EXPECT_EQ(ShmObjectName(ShmObjectName("/hw/state", ""), ""),
+            ShmObjectName("/hw/state", ""));
 }
 
 // Two different topics must never land on one segment. That would join two
@@ -60,9 +60,25 @@ TEST(ShmObjectNameTest, IsInjectiveOverTheTopicGrammar) {
   // The reason the separator is '.' and not '_': topic segments may contain
   // underscores (`driver_station`, `operator_interface`), so '_' would make
   // these two the same segment name. The grammar allows no '.' in a segment.
-  EXPECT_NE(ShmObjectName("/hw/state/driver_station"),
-            ShmObjectName("/hw/state_driver/station"));
-  EXPECT_NE(ShmObjectName("/a/state/b"), ShmObjectName("/a/state_b"));
-  EXPECT_NE(ShmObjectName("/operator_interface/state"),
-            ShmObjectName("/operator/interface/state"));
+  EXPECT_NE(ShmObjectName("/hw/state/driver_station", ""),
+            ShmObjectName("/hw/state_driver/station", ""));
+  EXPECT_NE(ShmObjectName("/a/state/b", ""), ShmObjectName("/a/state_b", ""));
+  EXPECT_NE(ShmObjectName("/operator_interface/state", ""),
+            ShmObjectName("/operator/interface/state", ""));
+}
+
+TEST(ShmObjectNameTest, NamespacesAreStableIsolatedAndIdempotent) {
+  const auto first = ShmObjectName("/hw/state", "run-a");
+  const auto second = ShmObjectName("/hw/state", "run-b");
+  EXPECT_NE(first, second);
+  EXPECT_EQ(first, ShmObjectName("/hw/state", "run-a"));
+  EXPECT_EQ(first, ShmObjectName("/hw.state", "run-a"));
+  EXPECT_EQ(first, ShmObjectName(first, "run-a"));
+  EXPECT_EQ(first, ShmObjectName(first, "run-b"));
+  EXPECT_EQ(first, ShmObjectName(first, ""));
+  EXPECT_EQ(first.size(), 18u);
+  EXPECT_TRUE(first.starts_with("/~"));
+  EXPECT_EQ(first.find_first_not_of("0123456789abcdef", 2), std::string::npos);
+  EXPECT_NE(first, ShmObjectName("/hw/command", "run-a"));
+  EXPECT_NE(ShmObjectName("/c", "ab"), ShmObjectName("/bc", "a"));
 }

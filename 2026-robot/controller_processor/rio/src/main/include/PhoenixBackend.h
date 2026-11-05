@@ -16,6 +16,8 @@
 #include <ctre/phoenix6/sim/CANcoderSimState.hpp>
 #include <ctre/phoenix6/sim/Pigeon2SimState.hpp>
 #include <ctre/phoenix6/sim/TalonFXSimState.hpp>
+#include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -38,7 +40,8 @@ class PhoenixBackend final : public talos::hardware::Backend {
       const override;
   // Per-device reset detection (HasResetOccurred) and restore.
   bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override;
-  bool RestoreAfterReset() override;
+  void BeginRestoreAfterReset() override;
+  RestoreStatus PollRestore() override;
 
  private:
   void UpdateSimulation(double dt);
@@ -67,6 +70,8 @@ class PhoenixBackend final : public talos::hardware::Backend {
   std::vector<std::unique_ptr<frc::PWM>> pwm_outputs_;
 
   std::optional<talos::hardware::ConfigError> last_error_;
+  std::vector<std::function<bool()>> restore_operations_;
+  std::future<bool> restore_;
 
   bool is_simulation_{false};
   std::optional<std::chrono::steady_clock::time_point> last_sim_time_;

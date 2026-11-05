@@ -64,7 +64,7 @@ bool SegmentExists(std::string_view topic) {
   return true;
 }
 
-// True once `path` is a complete log: its run ended and wrote EXIT.
+// True once the loop wrote EXIT, not necessarily after process teardown.
 bool LogFinished(const std::string& path) {
   if (!std::filesystem::exists(path)) return false;
   try {
@@ -147,6 +147,7 @@ can_id = 2
   LauncherOptions options;
   options.config_path = config;
   options.output_dir = out_dir;
+  options.session_id = 1;
   options.simulation = true;
   options.duration_s = 4;
   options.describe_timeout_ms = 4000;
@@ -157,10 +158,11 @@ can_id = 2
       Runfile("TALOS_SINK_NODE");
 
   int status = -1;
-  std::thread session{[&] { status = Launcher{options}.Run(); }};
+  std::jthread session{[&] { status = Launcher{options}.Run(); }};
 
   // The restart's clean exit: its log is complete.
-  const std::string restart_log = out_dir + "/continuity_source.restart1.tlog";
+  const std::string restart_log =
+      out_dir + "/1/continuity_source.restart1.tlog";
   const auto give_up = std::chrono::steady_clock::now() + 3s;
   while (!LogFinished(restart_log) &&
          std::chrono::steady_clock::now() < give_up) {
@@ -170,6 +172,19 @@ can_id = 2
     session.join();
     FAIL() << "the restarted source never exited";
   }
+
+  // EXIT is flushed before the node's publishers are destroyed. In particular,
+  // fsync can leave this process alive with a readable EXIT and a live writer
+  // claim. Wait for the actual release before testing the clean handoff; a
+  // second publisher must never steal ownership from a still-live publisher.
+  SharedMemoryPtr segment{kTopic, sizeof(RTMSHeader)};
+  const auto* header = static_cast<const RTMSHeader*>(segment.ptr());
+  while (header->writer.owner_pid.load(std::memory_order_acquire) != 0 &&
+         std::chrono::steady_clock::now() < give_up) {
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_EQ(header->writer.owner_pid.load(std::memory_order_acquire), 0u)
+      << "the restarted source did not release its writer after EXIT";
 
   // The source exited cleanly; the topic is still there, and the sink still
   // reads it: a standalone publisher (this test) reaches it.
@@ -196,7 +211,7 @@ can_id = 2
   EXPECT_FALSE(SegmentExists(kTopic));
 
   const std::string manifest = [&] {
-    std::ifstream in{out_dir + "/manifest.json"};
+    std::ifstream in{out_dir + "/1/manifest.json"};
     return std::string{std::istreambuf_iterator<char>(in),
                        std::istreambuf_iterator<char>()};
   }();
@@ -209,7 +224,7 @@ can_id = 2
   // One sink process, one log, every publisher's messages in it: the first
   // run's, the restart's after a SIGKILL, and this test's after a clean exit.
   const std::multiset<std::uint32_t> runs =
-      RunsReceived(out_dir + "/continuity_sink.tlog");
+      RunsReceived(out_dir + "/1/continuity_sink.tlog");
   EXPECT_GT(runs.count(0), 0u);
   EXPECT_GT(runs.count(1), 0u);
   EXPECT_GT(runs.count(2), 0u);

@@ -9,7 +9,7 @@ This package is the wire contract between the companion bridge
 All traffic is UDP: the gateway listens on port 5802 and the companion on
 5803. Every datagram is one frame: a fixed 40 byte header
 (`kFrameHeaderSize`) followed by an optional payload of up to
-`kMaxPayloadSize` bytes, which is 1400: a 1440-byte frame fits inside the 1472
+`kMaxPayloadSize` bytes, which is 1432: a 1472-byte frame fits inside the 1472
 bytes a 1500-byte Ethernet MTU leaves after the IPv4 and UDP headers, and
 `frame.h` has a static assertion to that effect. Multi-byte header fields are
 encoded little-endian explicitly by `EncodeFrame`; the C++ struct layout is not

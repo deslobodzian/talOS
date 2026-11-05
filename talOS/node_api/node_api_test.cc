@@ -369,6 +369,25 @@ int32_t BuildRoller(TalosNode* node, void* user) {
       &r);
 }
 
+TEST_F(NodeApi, MotorClampCountUsesSharedDevicesImplementation) {
+  Roller roller;
+  TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
+  ASSERT_NE(node, nullptr);
+  uint64_t count = 99;
+  ASSERT_EQ(talos_motor_clamped_count(node, roller.wheel, &count), TALOS_OK);
+  EXPECT_EQ(count, 0u);
+  ASSERT_EQ(
+      talos_motor_set(node, roller.wheel, TALOS_MODE_VELOCITY, 120.0, 0, 0),
+      TALOS_OK);
+  ASSERT_EQ(talos_motor_clamped_count(node, roller.wheel, &count), TALOS_OK);
+  EXPECT_EQ(count, 1u);
+  ASSERT_EQ(talos_motor_set(node, roller.wheel, TALOS_MODE_VOLTAGE, 1.0, 0, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_motor_clamped_count(node, roller.wheel, &count), TALOS_OK);
+  EXPECT_EQ(count, 1u);
+  EXPECT_EQ(talos_motor_clamped_count(node, roller.wheel, nullptr), TALOS_ERR);
+}
+
 TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {
   Roller roller;
   TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);

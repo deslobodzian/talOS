@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -420,8 +421,10 @@ TEST(LauncherTest, FailingBridgeRetriesInLoopWithoutBlockingSession) {
   EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
             20)
       << "a failing bridge must not cost the old ~60s startup wait";
-  EXPECT_TRUE(std::filesystem::exists(out_dir + "/manifest.json"));
-  const std::string manifest = ReadFile(out_dir + "/manifest.json");
+  const std::string session =
+      out_dir + "/" + std::to_string(options.session_id);
+  EXPECT_TRUE(std::filesystem::exists(session + "/manifest.json"));
+  const std::string manifest = ReadFile(session + "/manifest.json");
   EXPECT_NE(manifest.find("\"name\": \"studio_bridge\""), std::string::npos)
       << manifest;
   // Exhaustion is degraded, not broken: the bridge is failed, the session ran.
@@ -472,7 +475,8 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
             20)
       << "deadline must fire without waiting out the bridge window";
-  EXPECT_TRUE(std::filesystem::exists(out_dir + "/manifest.json"));
+  EXPECT_TRUE(std::filesystem::exists(
+      out_dir + "/" + std::to_string(options.session_id) + "/manifest.json"));
 
   std::filesystem::remove_all(out_dir);
 }
@@ -512,8 +516,10 @@ TEST(LauncherTest, StableBridgeJoinsSessionUntilDeadline) {
 
   EXPECT_GE(elapsed_s, 2) << "session must run to the deadline with Studio";
   EXPECT_LT(elapsed_s, 20) << "session must end at the deadline";
-  ASSERT_TRUE(std::filesystem::exists(out_dir + "/manifest.json"));
-  const std::string manifest = ReadFile(out_dir + "/manifest.json");
+  const std::string session =
+      out_dir + "/" + std::to_string(options.session_id);
+  ASSERT_TRUE(std::filesystem::exists(session + "/manifest.json"));
+  const std::string manifest = ReadFile(session + "/manifest.json");
   EXPECT_NE(manifest.find("\"name\": \"studio_bridge\""), std::string::npos)
       << manifest;
   // A stable viewer is a session member, not a failure.
@@ -706,7 +712,8 @@ TEST(LauncherTest, RunsChildProcessesAndWritesManifest) {
   int code = launcher.Run();
   EXPECT_EQ(code, 0);
 
-  std::string manifest_path = out_dir + "/manifest.json";
+  std::string manifest_path =
+      out_dir + "/" + std::to_string(options.session_id) + "/manifest.json";
   EXPECT_TRUE(std::filesystem::exists(manifest_path));
 
   std::ifstream mf(manifest_path);
@@ -823,6 +830,7 @@ struct GraphFixture {
     std::filesystem::create_directories(out_dir);
     options.output_dir = out_dir;
     options.session_id = 0x0123456789ABCDEFULL;
+    out_dir += "/" + std::to_string(options.session_id);
     options.config_path = WriteFixtureToml();
     options.describe_timeout_ms = 4000;
     options.binary_overrides["//talOS/bridge:hardware_node"] =
@@ -1244,10 +1252,11 @@ TEST(LauncherBundleTest, LauncherRunsFromBundleDirectoryWithDescribeOnly) {
   options.bundle_dir = bundle_dir;
   options.describe_only = true;
   options.output_dir = bundle_dir + "/logs";
+  options.session_id = 1;
 
   Launcher launcher{options};
   EXPECT_EQ(launcher.Run(), 0);
-  EXPECT_TRUE(std::filesystem::exists(bundle_dir + "/logs/graph.json"));
+  EXPECT_TRUE(std::filesystem::exists(bundle_dir + "/logs/1/graph.json"));
 
   std::filesystem::remove_all(bundle_dir);
 }
@@ -1289,6 +1298,104 @@ TEST(LauncherRemoteTest, EffectiveAddressDefaultsToLoopback) {
   EXPECT_EQ(EffectiveRemoteAddress(robot_cfg, options), "127.0.0.1");
   EXPECT_EQ(EffectiveRemotePort(robot_cfg, options), 5802);
   EXPECT_EQ(EffectiveLocalPort(robot_cfg, options), 5803);
+}
+
+LauncherOptions SessionFixture(std::string_view tag) {
+  LauncherOptions options;
+  options.config_path = WriteFixtureToml();
+  options.output_dir = TempPath(tag);
+  options.session_id = 1;
+  options.binary_overrides["//talOS/bridge:hardware_node"] = "/usr/bin/true";
+  options.binary_overrides["//example/alpha:node"] = "/usr/bin/true";
+  options.binary_overrides["//example/beta:node"] = "/usr/bin/true";
+  return options;
+}
+
+TEST(LauncherSessions, TwoLaunchesPreserveBothSessions) {
+  auto options = SessionFixture("two_sessions");
+  std::filesystem::remove_all(options.output_dir);
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  const std::string first = ReadFile(options.output_dir + "/1/manifest.json");
+  options.session_id = 2;
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  EXPECT_EQ(ReadFile(options.output_dir + "/1/manifest.json"), first);
+  EXPECT_FALSE(ReadFile(options.output_dir + "/2/manifest.json").empty());
+  std::filesystem::remove_all(options.output_dir);
+}
+
+TEST(LauncherSessions, RetentionDeletesOnlyOldSessions) {
+  auto options = SessionFixture("retention");
+  std::filesystem::remove_all(options.output_dir);
+  std::string configuration{kFixtureToml};
+  configuration.insert(configuration.find("period_us"),
+                       "log_keep_sessions = 2\n");
+  std::ofstream{options.config_path} << configuration;
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  options.session_id = 2;
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  const auto old =
+      std::filesystem::file_time_type::clock::now() - std::chrono::hours{1};
+  std::filesystem::last_write_time(options.output_dir + "/1", old);
+  std::filesystem::create_directories(options.output_dir + "/unrelated");
+  std::ofstream{options.output_dir + "/unrelated/keep"} << "untouched";
+  options.session_id = 3;
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/1"));
+  EXPECT_TRUE(std::filesystem::exists(options.output_dir + "/2/manifest.json"));
+  EXPECT_TRUE(std::filesystem::exists(options.output_dir + "/3/manifest.json"));
+  EXPECT_EQ(ReadFile(options.output_dir + "/unrelated/keep"), "untouched");
+  std::filesystem::remove_all(options.output_dir);
+}
+
+TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
+  auto options = SessionFixture("killed_manifest");
+  std::filesystem::remove_all(options.output_dir);
+  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+      "killed_alpha", NodeDescribeThenSleep("alpha", "//example/alpha:node",
+                                            {Sender("/alpha/state")}, 2));
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) ::_exit(Launcher{options}.Run());
+  const std::string path = options.output_dir + "/1/manifest.json";
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  std::string before;
+  do {
+    before = ReadFile(path);
+    if (before.find("\"name\": \"alpha\"") != std::string::npos &&
+        before.find("\"pid\": -1") == std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  } while (std::chrono::steady_clock::now() < deadline);
+  ::kill(child, SIGKILL);
+  int status = 0;
+  ::waitpid(child, &status, 0);
+  const std::string manifest = ReadFile(path);
+  ASSERT_FALSE(manifest.empty());
+  EXPECT_EQ(manifest.front(), '{');
+  EXPECT_EQ(manifest.substr(manifest.size() - 2), "}\n");
+  const std::string parse =
+      "python3 -c 'import json,sys; json.load(open(sys.argv[1]))' '" + path +
+      "'";
+  EXPECT_EQ(std::system(parse.c_str()), 0);
+  // Let the short-lived orphan finish before deleting its session.
+  std::this_thread::sleep_for(std::chrono::seconds{2});
+  EXPECT_NE(manifest.find("\"end_wall_ns\": 0"), std::string::npos);
+  EXPECT_NE(manifest.find("\"name\": \"alpha\""), std::string::npos);
+  std::filesystem::remove_all(options.output_dir);
+}
+
+TEST(LauncherRemoteTest, SimulationRefusesPhysicalEffectiveRemote) {
+  auto options = SessionFixture("sim_guard");
+  options.simulation = true;
+  options.remote = "10.12.34.2";
+  testing::internal::CaptureStderr();
+  EXPECT_EQ(Launcher{options}.Run(), 1);
+  const std::string error = testing::internal::GetCapturedStderr();
+  EXPECT_NE(error.find("--sim"), std::string::npos);
+  EXPECT_NE(error.find("10.12.34.2"), std::string::npos);
+  std::filesystem::remove_all(options.output_dir);
 }
 
 }  // namespace

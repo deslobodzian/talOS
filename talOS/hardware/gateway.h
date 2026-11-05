@@ -10,8 +10,8 @@
 #include "messages.h"
 
 namespace talos::hardware {
-// Platform-specific code owns device objects. Configure is startup-only and
-// may block; Read/Apply must use cached or nonblocking device APIs.
+// Platform-specific code owns device objects. Configure runs at startup or
+// disabled and may block; Read/Apply/Neutral and reset polling must not block.
 class Backend {
  public:
   virtual ~Backend() = default;
@@ -38,21 +38,24 @@ class Backend {
     reset_ids.clear();
     return false;
   }
-  // Re-applies configuration after a reset. Returns false on failure. The
-  // gateway neutralizes and invalidates before calling; on false it latches
-  // a fault and neutralizes again.
-  virtual bool RestoreAfterReset() { return true; }
+  enum class RestoreStatus { kPending, kDone, kFailed };
+  // Start nonblocking restoration; PollRestore never waits for device traffic.
+  // Failed restoration is retried by Gateway with capped exponential backoff.
+  virtual void BeginRestoreAfterReset() {}
+  virtual RestoreStatus PollRestore() { return RestoreStatus::kDone; }
 };
 
 class Gateway {
  public:
+  static constexpr uint32_t kConsecutiveApplyFailureLimit = 3;
+  static constexpr uint64_t kRestoreInitialBackoffUs = 250000;
+  static constexpr uint64_t kRestoreMaxBackoffUs = 2000000;
   Gateway(Config config, Backend& backend, uint64_t boot_id);
   Gateway(Backend& backend, uint64_t boot_id);
   // Replaces the active hardware configuration. Safe-reconfiguration rules:
-  // - Disabled only: returns false while enabled (see Tick) without touching
-  //   devices or latched fault/configured state.
-  // - Idempotent: a push identical to the active configuration is a no-op
-  //   that succeeds without device traffic or an epoch change.
+  // - Changed configurations require disabled operation.
+  // - Identical pushes succeed even while enabled without device traffic or
+  //   an epoch change, and clear the apply-failure latch.
   // - Neutralizes outputs via Backend::Neutral() BEFORE Backend::Configure()
   //   so no stale setpoint survives a device change; a successful change
   //   invalidates outstanding commands by advancing the epoch.
@@ -64,6 +67,9 @@ class Gateway {
   // genuine disabled-side change blocks.
   bool Reconfigure(const Config& config);
   void Tick(uint64_t now_us, bool driver_station_enabled);
+  // Structural errors reject all outputs; range errors neutralize one motor.
+  // Apply failures invalidate commands and retry until the consecutive limit;
+  // re-enabling or any successful Reconfigure clears the apply-failure latch.
   bool Accept(const Command& command, uint64_t sequence, uint64_t now_us);
   State snapshot() const;
   const Config& config() const { return config_; }
@@ -71,6 +77,7 @@ class Gateway {
   // Precise failure behind the last rejected configuration, if the
   // backend could say more than "it failed".
   std::optional<ConfigError> config_error() const { return config_error_; }
+  uint32_t restore_attempt_count() const { return restore_attempt_count_; }
 
  private:
   void Invalidate();
@@ -81,6 +88,12 @@ class Gateway {
   bool configured_{false}, enabled_{false}, active_{false}, fault_{false};
   bool have_sequence_{false};
   bool healthy_{false};
+  bool restoring_{false};
+  bool restore_waiting_{false};
+  uint64_t restore_retry_at_{};
+  uint64_t restore_backoff_us_{kRestoreInitialBackoffUs};
+  uint32_t restore_attempt_count_{};
+  uint32_t consecutive_apply_failures_{};
   uint64_t accepted_at_{}, observed_at_{};
   std::optional<ConfigError> config_error_;
 };

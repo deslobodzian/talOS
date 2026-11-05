@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdio>
+#include <functional>
 #include <string>
 
 #include "../protocol/udp.h"
@@ -14,6 +15,9 @@ namespace talos::hardware {
 class Endpoint {
  public:
   explicit Endpoint(Gateway& gateway) : gateway_{gateway} {}
+  void OnConfigured(std::function<void(const Config&)> callback) {
+    on_configured_ = std::move(callback);
+  }
   protocol::UdpStatus Open(const char* local, uint16_t local_port,
                            const char* remote, uint16_t remote_port) {
     return peer_.Open(local, local_port, remote, remote_port);
@@ -35,6 +39,7 @@ class Endpoint {
           ConfigAckPayload ack{};
           ack.config_id = assembler_.config_id();
           if (ok) {
+            if (on_configured_) on_configured_(gateway_.config());
             ack.status = ConfigAckStatus::kOk;
           } else {
             ack.status = ConfigAckStatus::kBackendFailed;
@@ -97,6 +102,7 @@ class Endpoint {
   Gateway& gateway_;
   protocol::RuntimeUdpPeer peer_;
   ConfigAssembler assembler_;
+  std::function<void(const Config&)> on_configured_;
   std::array<uint8_t, protocol::kMaxPayloadSize> buffer_{};
 };
 }  // namespace talos::hardware

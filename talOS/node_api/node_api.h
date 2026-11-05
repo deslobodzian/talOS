@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 15u
+#define TALOS_NODE_ABI_VERSION 16u
 
 enum {
   TALOS_OK = 0,
@@ -182,6 +182,9 @@ int32_t talos_hardware_sample_time(TalosNode* node, int64_t* out_ns);
 // One motor command for the next flush (Motor::set_* / stop).
 int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
                         double demand, double ff_volts, int32_t slot);
+// Monotonic per-device count of adjusted/neutralized motor setter calls.
+int32_t talos_motor_clamped_count(TalosNode* node, int64_t index,
+                                  uint64_t* out);
 int32_t talos_digital_output_set(TalosNode* node, int64_t index, int32_t value);
 int32_t talos_pwm_set(TalosNode* node, int64_t index, double output);
 
