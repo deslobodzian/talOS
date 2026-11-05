@@ -35,11 +35,11 @@ const faults =
 test('the parser accepts what the launcher actually writes', () => {
   const graph = parseDeclaredGraph(fixture);
 
-  // The roster, as `--describe` found it.
-  assert.equal(graph.nodes.length, 7);
+  // The roster, as `--describe` found it (8 nodes now that teleop is present).
+  assert.equal(graph.nodes.length, 8);
   assert.deepEqual(graph.nodes.map(n => n.name).sort(), [
-    'drivetrain', 'hardware_node', 'intake', 'operator_interface',
-    'pose_estimator', 'shooter', 'telemetry'
+    'driver', 'drivetrain', 'hardware_node', 'intake',
+    'pose_estimator', 'shooter', 'telemetry', 'teleop'
   ]);
   for (const node of graph.nodes) {
     assert.ok(node.target.startsWith('//'), `${node.name} has no build target`);
@@ -56,16 +56,12 @@ test('the parser accepts what the launcher actually writes', () => {
       graph.diagnostics.map(d => `${d.severity} ${d.subject}`).sort(), [
         'warning /drivetrain/target/auto', 'warning /intake/state',
         'warning /intake/target/auto', 'warning /pose_estimator/state',
-        'warning /shooter/state', 'warning /shooter/target/auto',
-        'warning operator_interface'
+        'warning /shooter/state', 'warning /shooter/target/auto'
       ]);
   for (const d of graph.diagnostics.filter(d => d.subject.includes('/target/')))
     assert.match(d.message, /is in the target policy of \w+ but nothing writes it yet/);
   for (const d of graph.diagnostics.filter(d => d.subject.endsWith('/state')))
     assert.match(d.message, /is published but nothing subscribes to it/);
-  // METHODOLOGY §6: the parameter keys still lacking a unit suffix.
-  assert.match(graph.diagnostics.find(d => d.subject === 'operator_interface')!.message,
-               /without a unit suffix .*: deadband, intake_button, shoot_button$/);
 });
 
 test('every topic end names its schema, and the ends of a topic agree', () => {
@@ -146,8 +142,7 @@ test('a node that never registered is named, with its cause', () => {
   // question the registry cannot answer alone: "was this supposed to be here?"
   const live = parseSystemGraph(demoSystemGraph(1500n));
   const status = declaredStatus(declared, live);
-  assert.ok(status, 'declaredStatus returned null for two present graphs');
-  assert.equal(status!.declared, 7);
+  assert.equal(status!.declared, 8);
   assert.ok(status!.missing.length > 0,
             'the demo live graph declares every fixture node, so this proves nothing');
   for (const node of status!.missing)
@@ -165,7 +160,7 @@ test('the launcher\'s findings cross the language boundary intact', () => {
   // printed lowercase, which was a real guess in this parser.
   for (const d of graph.diagnostics)
     assert.ok(d.severity === 'error' || d.severity === 'warning', d.severity);
-  assert.equal(graph.diagnostics.length - errors.length, 7,
+  assert.equal(graph.diagnostics.length - errors.length, 6,
                'the autonomous-lane, unread-state, and parameter-unit warnings are still ' +
                    'there beside the errors');
 

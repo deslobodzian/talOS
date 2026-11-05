@@ -3,29 +3,28 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_cc_node")
 
 cc_library(
-    name = "operator_interface",
-    hdrs = ["operator_interface.h"],
-    include_prefix = "operator_interface",
+    name = "driver",
+    hdrs = ["driver.h"],
+    include_prefix = "driver",
     strip_include_prefix = ".",
     visibility = ["//visibility:private"],
     deps = [
         "//2026-robot/main_processor/drivetrain:messages",
-        "//2026-robot/main_processor/intake:messages",
-        "//2026-robot/main_processor/shooter:messages",
         "//talOS/devices",
         "//talOS/node",
+        "//talOS/teleop:deadband",
     ],
 )
 
 talos_cc_node(
     name = "node",
-    srcs = ["operator_interface.cc"],
-    node_name = "operator_interface",
-    deps = [":operator_interface"],
+    srcs = ["driver.cc"],
+    node_name = "driver",
+    deps = [":driver"],
 )
 
-# The operator interface on its own, plus the whole teleop chain (driver
-# station, operator interface, drivetrain) on the real robot config.
+# The driver on its own, plus the whole teleop chain (driver
+# station, driver, drivetrain) on the real robot config.
 cc_test(
     name = "node_test",
     size = "small",
@@ -38,7 +37,7 @@ cc_test(
         "TALOS_TEST_CONFIG": "$(rlocationpath //2026-robot/main_processor/configuration:robot.toml)",
     },
     deps = [
-        ":operator_interface",
+        ":driver",
         "//2026-robot/main_processor/drivetrain",
         "//talOS/configuration",
         "//talOS/devices:testing",

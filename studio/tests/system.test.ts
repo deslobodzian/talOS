@@ -395,7 +395,7 @@ test('the demo graph is a document the parser actually accepts', () => {
   assert.ok(BigInt(later.wall_ns) > BigInt(graph.wall_ns));
   assert.ok(eventRates(later, graph).size > 0);
 
-  // The drivetrain is driven by teleop while operator_interface publishes
+  // The drivetrain is driven by teleop while driver publishes
   // that lane, and by nobody once it stops two seconds in.
   const driven = [50n, 250n].map(
       sequence => drivenBy(parseSystemGraph(demoSystemGraph(sequence))

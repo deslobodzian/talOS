@@ -7,20 +7,22 @@ Regenerate after changing the config:
 
 # Every node label robot.toml launches.
 NODES = [
+    "//2026-robot/main_processor/driver:node",
     "//2026-robot/main_processor/drivetrain:node",
     "//2026-robot/main_processor/intake:node",
-    "//2026-robot/main_processor/operator_interface:node",
     "//2026-robot/main_processor/pose_estimator:node",
     "//2026-robot/main_processor/shooter:node",
     "//talOS/telemetry:node",
+    "//talOS/teleop:node",
 ]
 
 # Every file robot.toml reads besides itself.
 CONFIG_FILES = [
+    "//2026-robot/main_processor/configuration:subsystems/driver.toml",
     "//2026-robot/main_processor/configuration:subsystems/drivetrain.toml",
     "//2026-robot/main_processor/configuration:subsystems/intake.toml",
-    "//2026-robot/main_processor/configuration:subsystems/operator_interface.toml",
     "//2026-robot/main_processor/configuration:subsystems/pose_estimator.toml",
     "//2026-robot/main_processor/configuration:subsystems/shooter.toml",
     "//2026-robot/main_processor/configuration:subsystems/telemetry.toml",
+    "//2026-robot/main_processor/configuration:subsystems/teleop.toml",
 ]

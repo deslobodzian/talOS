@@ -793,11 +793,13 @@ SUBSYSTEM_TOML = """\
 name = "@NAME@"
 node = "//@PACKAGE@:node"
 period_us = @PERIOD@
-# Zero-code robot wiring: uncomment to have the operator interface write a
+
+# Zero-code robot wiring: uncomment to have the teleop node write a
 # Driver Station button on the /@NAME@/target/teleop lane, without editing any
 # C++ or Python files in other packages.
-# teleop_button = 3
-# teleop_demand = 20.0
+# [[teleop.bindings]]
+# button = 3
+# while_held = { velocity_rps = 20.0 }
 
 # Which /@NAME@/target/<source> lanes drive the @NAME@ in each Driver Station
 # mode, highest priority first. Without this table [robot.targets] applies

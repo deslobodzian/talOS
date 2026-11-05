@@ -6,6 +6,7 @@ cc_library(
     hdrs = ["config_parser.h"],
     visibility = ["//visibility:public"],
     deps = [
+        "//talOS/driver_station",
         "//talOS/hardware:config",
         "//talOS/introspection:names",
         "@tomlplusplus//:toml++",

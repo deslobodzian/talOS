@@ -153,7 +153,7 @@ test('a node card says who drives its subsystem, and none when nobody does',
                                  rates={{}} selected={false}
                                  onSelect={() => {}}/>);
        };
-       // operator_interface publishes the teleop lane for the first two
+       // driver publishes the teleop lane for the first two
        // seconds of the demo, then stops.
        const driving = card(50n, 'drivetrain');
        assert.match(driving, /<dt>driven by<\/dt><dd class="driving">teleop<\/dd>/);
@@ -250,15 +250,15 @@ test('the system tab reports what was declared against what registered', () => {
   // The demo declares a node that never claimed a registry slot. Which node,
   // what would have built it, and why it matters are all on screen: the live
   // graph alone can only be silent about it.
-  assert.ok(html.includes('6 nodes declared'), 'declared count missing');
-  assert.ok(html.includes('5 registered'), 'registered count missing');
+  assert.ok(html.includes('7 nodes declared'), 'declared count missing');
+  assert.ok(html.includes('6 registered'), 'registered count missing');
   assert.ok(html.includes('1 never appeared'), 'no missing-node count');
   assert.ok(html.includes('declared, never registered'),
             'the missing node is not explained');
   assert.ok(html.includes('shooter'));
   assert.ok(html.includes('//2026-robot/main_processor/shooter:node'),
             'the missing node does not say what would have built it');
-  assert.ok(html.includes('6 declared'), 'the toolbar count is missing');
+  assert.ok(html.includes('7 declared'), 'the toolbar count is missing');
 
   // The launcher's own sentence, not the viewer's paraphrase of it.
   assert.ok(html.includes('is published but nothing subscribes to it'),
@@ -348,7 +348,7 @@ test('the overview reads declared against live, and names what never appeared',
        const html = render(<OverviewTab view={emptyView} system={state(true)}
                                         onOpen={() => {}}/>);
        assert.ok(html.includes('Declared'), 'no declared row');
-       assert.ok(html.includes('6 nodes, 5 live'), 'declared vs live not shown');
+       assert.ok(html.includes('7 nodes, 6 live'), 'declared vs live not shown');
        assert.ok(html.includes('Never appeared'));
        assert.ok(html.includes('shooter'));
        assert.ok(html.includes('0 errors, 1 warnings'), 'no lint tally');

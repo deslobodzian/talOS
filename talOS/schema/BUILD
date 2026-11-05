@@ -122,6 +122,7 @@ talos_messages(
     visibility = [
         "//talOS/python:__pkg__",
         "//talOS/telemetry:__pkg__",
+        "//talOS/teleop:__pkg__",
     ],
 )
 

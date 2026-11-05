@@ -53,8 +53,8 @@ name = "intake"
 path = "subsystems/intake.toml"
 
 [[subsystems]]
-name = "operator_interface"
-path = "subsystems/operator_interface.toml"
+name = "driver"
+path = "subsystems/driver.toml"
 
 [[subsystems]]
 name = "pose_estimator"
@@ -67,3 +67,7 @@ path = "subsystems/shooter.toml"
 [[subsystems]]
 name = "telemetry"
 path = "subsystems/telemetry.toml"
+
+[[subsystems]]
+name = "teleop"
+path = "subsystems/teleop.toml"

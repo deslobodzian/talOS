@@ -39,7 +39,7 @@ type = "TalonFX"
 bus = "rio"
 can_id = 2
 
-[subsystems.operator_interface]
+[subsystems.driver]
 period_us = 20000
 
 [subsystems.beam_break]
@@ -154,9 +154,9 @@ TEST(HardwareNodeTest, MergesSubsystemRequestsAndIsolatesTimeouts) {
 
 TEST(HardwareNodeTest, ActuatorLessSubsystemsGetNoTracker) {
   auto cfg = talos::config::ParseRobotConfigString(kTestToml);
-  ASSERT_TRUE(cfg.subsystems.contains("operator_interface"));
+  ASSERT_TRUE(cfg.subsystems.contains("driver"));
   ASSERT_TRUE(cfg.subsystems.contains("beam_break"));
-  ASSERT_TRUE(cfg.subsystems.at("operator_interface").motors.empty());
+  ASSERT_TRUE(cfg.subsystems.at("driver").motors.empty());
   ASSERT_EQ(cfg.subsystems.at("beam_break").digital_inputs.size(), 1u);
 
   HardwareNode node{cfg, "127.0.0.1", 25806, 25807, true};
@@ -167,7 +167,7 @@ TEST(HardwareNodeTest, ActuatorLessSubsystemsGetNoTracker) {
 
   EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
   EXPECT_TRUE(node.is_subsystem_timed_out("shooter"));
-  EXPECT_FALSE(node.is_subsystem_timed_out("operator_interface"));
+  EXPECT_FALSE(node.is_subsystem_timed_out("driver"));
   EXPECT_FALSE(node.is_subsystem_timed_out("beam_break"));
 }
 
@@ -882,7 +882,7 @@ TEST(HardwareNodeTest, DescribesItselfWithoutOpeningAnything) {
   ASSERT_TRUE(by_name.contains(bridge::topics::kStatus));
   ASSERT_TRUE(by_name.contains(RequestTopic("drivetrain")));
   ASSERT_TRUE(by_name.contains(RequestTopic("shooter")));
-  EXPECT_FALSE(by_name.contains(RequestTopic("operator_interface")));
+  EXPECT_FALSE(by_name.contains(RequestTopic("driver")));
   EXPECT_FALSE(by_name.contains(RequestTopic("beam_break")));
 
   EXPECT_EQ(by_name[kStateTopic].kind, event::SourceKind::SENDER);

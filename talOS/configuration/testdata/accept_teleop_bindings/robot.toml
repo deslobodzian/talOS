@@ -1,0 +1,15 @@
+[subsystems.a]
+node = "//a:node"
+
+[subsystems.a.motors.m]
+can_id = 1
+
+[[subsystems.a.teleop.bindings]]
+button = 3
+while_held = { position_rot = 0.25 }
+
+[[subsystems.a.teleop.bindings]]
+axis = 1
+field = "velocity_rps"
+scale = 60.0
+deadband_frac = 0.05
