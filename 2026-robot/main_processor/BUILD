@@ -1,15 +1,15 @@
 load("@rules_python//python:defs.bzl", "py_test")
 load("//2026-robot/main_processor/bundle_testdata:robot_manifest.bzl", RELOCATION_CONFIG_FILES = "CONFIG_FILES", RELOCATION_NODES = "NODES")
-load("//2026-robot/main_processor/configuration:robot_manifest.bzl", "CONFIG_FILES", "NODES")
+load("//2026-robot/main_processor/configuration:robot_field_manifest.bzl", "CONFIG_FILES", "NODES")
 load("//talOS/build:contract.bzl", "talos_bundle")
 
 package(default_visibility = ["//visibility:public"])
 
-# NODES and CONFIG_FILES are generated from robot.toml:
-#   bazel run //tools:sync_manifest -- 2026-robot/main_processor/configuration/robot.toml
+# NODES and CONFIG_FILES are generated from robot_field.toml:
+#   bazel run //tools:sync_manifest -- 2026-robot/main_processor/configuration/robot_field.toml
 talos_bundle(
     name = "robot_bundle",
-    config = "//2026-robot/main_processor/configuration:robot.toml",
+    config = "//2026-robot/main_processor/configuration:robot_field.toml",
     config_files = CONFIG_FILES,
     nodes = ["//talOS/bridge:hardware_node"] + NODES,
 )
@@ -31,6 +31,7 @@ py_test(
     data = [
         ":relocation_bundle",
         ":robot_bundle",
+        "//tools:deploy.sh",
     ],
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],

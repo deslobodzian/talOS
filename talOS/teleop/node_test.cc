@@ -110,8 +110,11 @@ TEST(TeleopNode, ButtonDrivesLaneWithEncodedValue) {
 
   // Press button 1 (1-based, bit 0 in buttons mask: 1u << 0 = 1)
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 1)));
-  ASSERT_TRUE(roller.seen.has_value());
-  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
+  if (!roller.seen.has_value()) {
+    FAIL() << "Expected teleop target";
+  }
+  const auto& pressed = roller.seen.value();
+  EXPECT_DOUBLE_EQ(pressed.velocity_rps(), 60.0);
   EXPECT_EQ(roller.source, "teleop");
 
   // Release button 1
@@ -144,12 +147,15 @@ TEST(TeleopNode, RichStructFieldEncoding) {
 
   // Button 2 (bit 1: mask 2)
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 2)));
-  ASSERT_TRUE(mech.seen.has_value());
-  EXPECT_TRUE(mech.seen->flag());
-  EXPECT_DOUBLE_EQ(mech.seen->position_m(), 3.5);
-  EXPECT_EQ(mech.seen->level(), schema_test::Level::TOP);
-  EXPECT_EQ(mech.seen->inner().mode(), schema_test::Mode::HIGH);
-  EXPECT_FLOAT_EQ(mech.seen->inner().offset_m(), 1.25f);
+  if (!mech.seen.has_value()) {
+    FAIL() << "Expected teleop target";
+  }
+  const auto& seen = mech.seen.value();
+  EXPECT_TRUE(seen.flag());
+  EXPECT_DOUBLE_EQ(seen.position_m(), 3.5);
+  EXPECT_EQ(seen.level(), schema_test::Level::TOP);
+  EXPECT_EQ(seen.inner().mode(), schema_test::Mode::HIGH);
+  EXPECT_FLOAT_EQ(seen.inner().offset_m(), 1.25f);
 }
 
 constexpr const char* kPrecedenceToml = R"(
@@ -181,14 +187,20 @@ TEST(TeleopNode, PrecedenceBetweenTwoBindingsOnOneField) {
 
   // Both button 1 and button 2 held (mask 3: bits 0 and 1)
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 3)));
-  ASSERT_TRUE(roller.seen.has_value());
-  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(),
+  if (!roller.seen.has_value()) {
+    FAIL() << "Expected teleop target";
+  }
+  const auto& both_pressed = roller.seen.value();
+  EXPECT_DOUBLE_EQ(both_pressed.velocity_rps(),
                    10.0);  // First binding in list wins
 
   // Only button 2 held (mask 2)
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 2)));
-  ASSERT_TRUE(roller.seen.has_value());
-  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 20.0);
+  if (!roller.seen.has_value()) {
+    FAIL() << "Expected teleop target";
+  }
+  const auto& second_pressed = roller.seen.value();
+  EXPECT_DOUBLE_EQ(second_pressed.velocity_rps(), 20.0);
 
   // Neither held
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 0)));
@@ -232,20 +244,29 @@ TEST(TeleopNode, AxisDeadbandEdgeAndContinuousScaling) {
   // rescaled = (0.2125 - 0.125) / (1.0 - 0.125) = 0.0875 / 0.875 = 0.1
   // value = scale * 0.1 = 1.0
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.2125f)));
-  ASSERT_TRUE(arm.seen.has_value());
-  EXPECT_NEAR(arm.seen->velocity_rps(), 1.0, 1e-6);
+  if (!arm.seen.has_value()) {
+    FAIL() << "Expected teleop target";
+  }
+  const auto& above_deadband = arm.seen.value();
+  EXPECT_NEAR(above_deadband.velocity_rps(), 1.0, 1e-6);
 
   // Full scale (axis = 1.0): rescaled = 1.0 -> 10.0
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1.0f)));
-  ASSERT_TRUE(arm.seen.has_value());
-  EXPECT_NEAR(arm.seen->velocity_rps(), 10.0, 1e-6);
+  if (!arm.seen.has_value()) {
+    FAIL() << "Expected teleop target";
+  }
+  const auto& full_scale = arm.seen.value();
+  EXPECT_NEAR(full_scale.velocity_rps(), 10.0, 1e-6);
 
   // Negative axis: axis = -0.5625:
   // rescaled = copysign((0.5625 - 0.125) / 0.875, -0.5625) = -0.4375 / 0.875 =
   // -0.5 value = 10.0 * -0.5 = -5.0
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(-0.5625f)));
-  ASSERT_TRUE(arm.seen.has_value());
-  EXPECT_NEAR(arm.seen->velocity_rps(), -5.0, 1e-6);
+  if (!arm.seen.has_value()) {
+    FAIL() << "Expected teleop target";
+  }
+  const auto& negative_axis = arm.seen.value();
+  EXPECT_NEAR(negative_axis.velocity_rps(), -5.0, 1e-6);
 }
 
 TEST(TeleopNode, DisabledRobotReleasesOnceAndSendsNoFurtherMessages) {

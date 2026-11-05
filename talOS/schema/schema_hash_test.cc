@@ -135,8 +135,8 @@ TEST(SchemaHash, RejectsWhatIsNotAStructInASchema) {
   const std::vector<std::uint8_t> base = Variant("TALOS_VARIANT_FLOAT_LEVEL");
   EXPECT_FALSE(Hash(base, "schema_variant.Missing"));
   EXPECT_FALSE(Hash(base, "schema_variant.Kind"));  // an enum
-  const std::vector<std::uint8_t> truncated(base.begin(),
-                                            base.begin() + base.size() / 2);
+  const std::vector<std::uint8_t> truncated(base.data(),
+                                            base.data() + base.size() / 2);
   EXPECT_FALSE(Hash(truncated, "schema_variant.Reading"));
   const std::vector<std::uint8_t> garbage(64, 0xa5);
   EXPECT_FALSE(Hash(garbage, "schema_variant.Reading"));

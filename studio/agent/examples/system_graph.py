@@ -12,7 +12,7 @@ from rpc_client import RpcError, rpc
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default="http://127.0.0.1:5802/rpc")
+    parser.add_argument("--url", default="http://127.0.0.1:5804/rpc")
     parser.add_argument("--topic", default=None,
                         help="Topic to describe (default: first graph topic)")
     args = parser.parse_args()

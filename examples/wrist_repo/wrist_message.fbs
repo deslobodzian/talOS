@@ -1,0 +1,15 @@
+namespace wrist;
+
+// What a producer asks for on its lane, /wrist/target/<source>. The node
+// drives the motor only while the robot is enabled and a lane of its target
+// policy is live.
+struct WristTarget {
+  velocity_rps:double;
+}
+
+// What the wrist is doing, published every tick.
+struct WristState {
+  enabled:bool;
+  velocity_rps:double;
+  connected:bool;
+}

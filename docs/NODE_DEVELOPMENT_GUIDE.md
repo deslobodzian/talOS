@@ -109,6 +109,8 @@ target lane without editing C++ or Python code. The framework node
 tables from each subsystem configuration and writes the subsystem's
 `/<sub>/target/teleop` lane using its schema descriptor:
 
+Python authors can exercise these bindings in `talos.testing.Sim` by depending on `//talOS/python:teleop`, importing `Teleop` from `talos.teleop`, and calling `sim.add(Teleop, "teleop")` after adding their subsystem nodes.
+
 ```toml
 # subsystems/shooter.toml
 [[teleop.bindings]]

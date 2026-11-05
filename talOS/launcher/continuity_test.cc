@@ -77,6 +77,8 @@ bool LogFinished(const std::string& path) {
       }
     }
   } catch (const std::exception&) {
+    // A log still being written may not yet have a complete readable record.
+    return false;
   }
   return false;
 }

@@ -14,7 +14,7 @@ from rpc_client import RpcError, rpc
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("node")
-    parser.add_argument("--url", default="http://127.0.0.1:5802/rpc")
+    parser.add_argument("--url", default="http://127.0.0.1:5804/rpc")
     args = parser.parse_args()
 
     try:
@@ -53,7 +53,11 @@ def main():
     channels = (latest or {}).get("channels", {})
     for topic in published:
         detail = rpc(args.url, "describe_topic", {"topic": topic})
-        value = channels.get(topic, "<not retained>")
+        # Graph topics have a leading slash; dictionary channels append each
+        # reflected field to that topic, without the leading slash.
+        prefix = topic.lstrip("/") + "/"
+        value = {name: reading for name, reading in channels.items()
+                 if name.startswith(prefix)} or "<not retained>"
         report["publishes"][topic] = {"health": detail["health"], "latest": value}
     print(json.dumps(report, indent=2, default=str))
 

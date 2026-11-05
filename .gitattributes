@@ -1,4 +1,6 @@
-* text=auto
+# LF everywhere, whatever core.autocrlf says: tests that edit TOML as strings
+# fail on CRLF (e.g. a Windows checkout read from WSL through /mnt/c).
+* text=auto eol=lf
 
 # Shell scripts must keep LF or bash (incl. WSL) fails with $'\r'.
 *.sh text eol=lf

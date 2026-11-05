@@ -50,10 +50,12 @@ class IntakeTest(unittest.TestCase):
 
     def test_ask_maps_to_velocity_command(self):
         cases = [
-            (25.0, False, intake.INTAKE_RPS),
-            (-5.0, False, intake.EJECT_RPS),
+            (25.0, False, 25.0),
+            (-5.0, False, -5.0),
             (25.0, True, 0.0),  # piece held: stop pulling
-            (-5.0, True, intake.EJECT_RPS),  # eject still gets it out
+            (-5.0, True, -5.0),  # eject still gets it out
+            (0.0, False, 0.0),
+            (0.0, True, 0.0),
         ]
         for ask, beam, demand in cases:
             with self.subTest(ask=ask, beam=beam):

@@ -18,7 +18,7 @@ import {
 import {handleRpc, type RpcContext} from './rpc';
 
 export function startAgent(
-    port = Number(process.env.AGENT_PORT ?? 5802),
+    port = Number(process.env.AGENT_PORT ?? 5804),
     upstream = process.env.TELEMETRY_URL ?? 'ws://127.0.0.1:5800/telemetry') {
   // Reject DNS rebinding to loopback as well as browser-originated requests.
   const allowedHost = (host: string|undefined) =>

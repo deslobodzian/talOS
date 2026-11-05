@@ -300,8 +300,11 @@ TEST(TargetPolicy, SubsystemTargetsReplaceTheListedModes) {
   EXPECT_EQ(wrist.seen, std::nullopt);
   PublishTarget(sim, "wrist", "driver", Small{2.5f});
   sim.step(5ms);
-  ASSERT_TRUE(wrist.seen.has_value());
-  EXPECT_FLOAT_EQ(wrist.seen->speed_rps(), 2.5f);
+  if (!wrist.seen.has_value()) {
+    FAIL() << "Expected a wrist target";
+  }
+  const auto& wrist_target = *wrist.seen;
+  EXPECT_FLOAT_EQ(wrist_target.speed_rps(), 2.5f);
 
   // Test mode opted in; autonomous kept the robot default.
   hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTest));
@@ -350,8 +353,11 @@ TEST(TargetPolicy, RemapRedirectsOneLane) {
   EXPECT_EQ(lift.seen, std::nullopt);  // not the lift's teleop lane any more
   PublishTarget(sim, "left_lift", "teleop", Goal{2.0});
   sim.step(5ms);
-  ASSERT_TRUE(lift.seen.has_value());
-  EXPECT_EQ(lift.seen->position_rot(), 2.0);
+  if (!lift.seen.has_value()) {
+    FAIL() << "Expected a remapped lift target";
+  }
+  const auto& remapped_target = *lift.seen;
+  EXPECT_EQ(remapped_target.position_rot(), 2.0);
   EXPECT_EQ(lift.source, "teleop");
   // Still the second priority: align, not remapped, preempts it.
   PublishTarget(sim, "lift", "align", Goal{3.0});
@@ -420,10 +426,11 @@ TEST(TargetSelection, TheNodeReportsWhoDrivesAndNobodyWhenStaleOrDisabled) {
 struct Producer {
   explicit Producer(Node& node) : lane{node, "lift", "teleop"} {}
   void update() {
-    if (talking)
+    if (talking) {
       lane.send(Goal{0.75});
-    else
+    } else {
       lane.release();
+    }
   }
   TargetLane<Goal> lane;
   bool talking = true;
@@ -439,18 +446,27 @@ TEST(TargetLane, SendsAndReleasesTheEnvelope) {
   sim.step(20ms);
 
   auto envelope = LatestTarget<Goal>(sim, "lift", "teleop");
-  ASSERT_TRUE(envelope.has_value());
-  EXPECT_EQ(envelope->active, 1);
-  EXPECT_EQ(envelope->message.position_rot(), 0.75);
-  ASSERT_TRUE(lift.seen.has_value());
-  EXPECT_EQ(lift.seen->position_rot(), 0.75);
+  if (!envelope.has_value()) {
+    FAIL() << "Expected an active target envelope";
+  }
+  const auto& active_envelope = *envelope;
+  EXPECT_EQ(active_envelope.active, 1);
+  EXPECT_EQ(active_envelope.message.position_rot(), 0.75);
+  if (!lift.seen.has_value()) {
+    FAIL() << "Expected a lift target";
+  }
+  const auto& seen_target = *lift.seen;
+  EXPECT_EQ(seen_target.position_rot(), 0.75);
 
   producer.talking = false;
   sim.step(10ms);
   envelope = LatestTarget<Goal>(sim, "lift", "teleop");
-  ASSERT_TRUE(envelope.has_value());
-  EXPECT_EQ(envelope->active, 0);
-  EXPECT_EQ(envelope->message.position_rot(), 0.0);
+  if (!envelope.has_value()) {
+    FAIL() << "Expected a released target envelope";
+  }
+  const auto& released_envelope = *envelope;
+  EXPECT_EQ(released_envelope.active, 0);
+  EXPECT_EQ(released_envelope.message.position_rot(), 0.0);
   EXPECT_EQ(lift.seen, std::nullopt);
 }
 
@@ -464,12 +480,22 @@ TEST(TargetLane, StampsTheGenerationItsNodeDrained) {
   sim.step(20ms);
   const std::uint64_t first = DriverStationGeneration(sim);
   ASSERT_NE(first, 0u);
-  EXPECT_EQ(LatestTarget<Goal>(sim, "lift", "teleop")->mode_since_us(), first);
+  auto envelope = LatestTarget<Goal>(sim, "lift", "teleop");
+  if (!envelope.has_value()) {
+    FAIL() << "Expected the first target envelope";
+  }
+  const auto& first_envelope = *envelope;
+  EXPECT_EQ(first_envelope.mode_since_us(), first);
 
   // Disabled: the producer keeps sending, stamped 0.
   hw.set_driver_station(DsPacket(0));
   sim.step(20ms);
-  EXPECT_EQ(LatestTarget<Goal>(sim, "lift", "teleop")->mode_since_us(), 0u);
+  envelope = LatestTarget<Goal>(sim, "lift", "teleop");
+  if (!envelope.has_value()) {
+    FAIL() << "Expected a disabled target envelope";
+  }
+  const auto& disabled_envelope = *envelope;
+  EXPECT_EQ(disabled_envelope.mode_since_us(), 0u);
   EXPECT_EQ(lift.seen, std::nullopt);
 
   // Re-enabled: a new generation, which the producer picks up on its own.
@@ -477,9 +503,17 @@ TEST(TargetLane, StampsTheGenerationItsNodeDrained) {
   sim.step(20ms);
   const std::uint64_t second = DriverStationGeneration(sim);
   EXPECT_NE(second, first);
-  EXPECT_EQ(LatestTarget<Goal>(sim, "lift", "teleop")->mode_since_us(), second);
-  ASSERT_TRUE(lift.seen.has_value());
-  EXPECT_EQ(lift.seen->position_rot(), 0.75);
+  envelope = LatestTarget<Goal>(sim, "lift", "teleop");
+  if (!envelope.has_value()) {
+    FAIL() << "Expected the second target envelope";
+  }
+  const auto& second_envelope = *envelope;
+  EXPECT_EQ(second_envelope.mode_since_us(), second);
+  if (!lift.seen.has_value()) {
+    FAIL() << "Expected a lift target";
+  }
+  const auto& seen_target = *lift.seen;
+  EXPECT_EQ(seen_target.position_rot(), 0.75);
 }
 
 // A producer with its own lane, for the remapped config.
@@ -500,9 +534,12 @@ TEST(TargetLane, AProducerThatSeesNoDriverStationNeverDrives) {
   // The lift is enabled in teleop, and align is its first lane, fresh and
   // active; but its producer never saw the mode it would be driving.
   const auto envelope = LatestTarget<Goal>(sim, "lift", "align");
-  ASSERT_TRUE(envelope.has_value());
-  EXPECT_EQ(envelope->active, 1);
-  EXPECT_EQ(envelope->mode_since_us(), 0u);
+  if (!envelope.has_value()) {
+    FAIL() << "Expected a target envelope without driver station state";
+  }
+  const auto& blind_envelope = *envelope;
+  EXPECT_EQ(blind_envelope.active, 1);
+  EXPECT_EQ(blind_envelope.mode_since_us(), 0u);
   EXPECT_EQ(lift.seen, std::nullopt);
   PublishTarget(sim, "left_lift", "teleop", Goal{2.0});
   sim.step(5ms);

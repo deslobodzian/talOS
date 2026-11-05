@@ -369,7 +369,9 @@ install_bazel() {
     "$(release_sha bazelisk)" "$dest" || return 1
   local p
   p="$(command -v bazel 2>/dev/null || true)"
-  [ "$p" = "$dest" ] || hint "'bazel' resolves to $p ahead of $dest; remove it or fix PATH"
+  # -ef: Fedora merges /usr/local/sbin into /usr/local/bin, so one file can
+  # resolve through either name.
+  [ "$p" -ef "$dest" ] || hint "'bazel' resolves to $p ahead of $dest; remove it or fix PATH"
 }
 
 # --- studio: node, pnpm -------------------------------------------------------
@@ -500,14 +502,16 @@ install_jdk() {
 }
 
 # GradleRIO names the toolchain dir after its toolchain year, which lags the
-# season (GradleRIO 2026.x installs frc/2025), so accept any year.
+# season (GradleRIO 2026.x installs frc/2025), so accept any year. With the
+# WPILib installer present GradleRIO uses its copy in ~/wpilib/<year>/roborio
+# ("Valid Toolchain found! FRCHome") and installs nothing under ~/.gradle.
 detect_rio() {
   local base g
   base="${GRADLE_USER_HOME:-$HOME/.gradle}/toolchains/frc"
-  for g in "$base"/*/roborio/bin/*-g++; do
+  for g in "$base"/*/roborio/bin/*-g++ "$HOME/wpilib/$FRC_YEAR/roborio/bin/"*-g++; do
     if [ -x "$g" ]; then DETAIL="${g%/bin/*}"; return 0; fi
   done
-  DETAIL="not installed in $base/<year>/roborio"
+  DETAIL="not installed in $base/<year>/roborio or ~/wpilib/$FRC_YEAR/roborio"
   return 1
 }
 install_rio() {

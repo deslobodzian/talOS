@@ -878,7 +878,7 @@ export function AgentTab({call}: {call: (method: string, params: unknown) => Pro
       </div>
       <div className="panel-footer">
         SAME CODE PATH AS <code>bazel run //studio:agent</code>
-        <span>http://127.0.0.1:5802/rpc</span>
+        <span>http://127.0.0.1:5804/rpc</span>
       </div>
     </section>
     <section className="panel">

@@ -1,11 +1,15 @@
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_graph_test")
 load("//tools:sync_manifest.bzl", "manifest_sync_test")
+load(":robot_field_manifest.bzl", FIELD_CONFIG_FILES = "CONFIG_FILES", FIELD_NODES = "NODES")
 load(":robot_manifest.bzl", "CONFIG_FILES", "NODES")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["robot.toml"])
+exports_files([
+    "robot.toml",
+    "robot_field.toml",
+])
 
 exports_files(glob(["subsystems/*.toml"]))
 
@@ -43,4 +47,18 @@ manifest_sync_test(
     config = "robot.toml",
     config_files = CONFIG_FILES,
     manifest = "robot_manifest.bzl",
+)
+
+talos_graph_test(
+    name = "field_graph_test",
+    config = "robot_field.toml",
+    data = FIELD_CONFIG_FILES,
+    nodes = FIELD_NODES,
+)
+
+manifest_sync_test(
+    name = "field_manifest_sync_test",
+    config = "robot_field.toml",
+    config_files = FIELD_CONFIG_FILES,
+    manifest = "robot_field_manifest.bzl",
 )

@@ -32,9 +32,10 @@ generation (its producer had drained the Driver Station packet of this enable
 and mode). With none, a subsystem is neutral: it calls no actuator.
 
 - **intake**: IDLE → INTAKING (roller in) → HOLDING once the beam breaks (small
-  hold voltage) → EJECTING (reverse for `eject_ms`) → IDLE. With no target it
-  behaves as asked for IDLE with the roller neutral; the state machine still
-  tracks the beam break and finishes a timed eject.
+  hold voltage) → EJECTING (reverse for `eject_us`, 500000 µs by default) →
+  IDLE. Roller voltages are `intake_v`, `hold_v`, and `eject_v`. With no
+  target it behaves as asked for IDLE with the roller neutral; the state
+  machine still tracks the beam break and finishes a timed eject.
 - **elevator**: motion magic to the goal height while it has a target. It
   reports STOWED at 0, MOVING, or AT_GOAL (within `tolerance_rot`), and echoes
   the goal that `at_goal` refers to. With no target the lift is neutral (it
@@ -55,6 +56,13 @@ Python.
 The nodes are implemented once in C++ (`cpp/`) and wrapped in Python (`py/`)
 via `TALOS_EXPORT_NODE` and `talos.cpp_node`, so both sets of binaries and
 tests run the exact same implementation without duplicating logic.
+
+For a subsystem shipped as its own Bzlmod repository, see
+[`../wrist_repo/`](../wrist_repo/) and its robot-side consumer
+[`../external_subsystem/`](../external_subsystem/). The root `MODULE.bazel`
+imports `@wrist//:node` with `bazel_dep` and `local_path_override`; the consumer
+tests its graph, generated manifest, and a relocated bundle:
+`bazel test //examples/external_subsystem:all` and `bazel test @wrist//...`.
 
 ## Three layers
 

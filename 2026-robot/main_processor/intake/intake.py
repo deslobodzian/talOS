@@ -16,18 +16,15 @@ from intake.Inhibit import Inhibit
 from intake.IntakeState import IntakeState
 from intake.IntakeTarget import IntakeTarget
 
-INTAKE_RPS = 30.0  # positive ask: pull a piece in
-EJECT_RPS = -20.0  # negative ask: push it back out
-
 
 def roller_demand(ask_rps, beam_broken):
     """A held piece stops the pull but can still be ejected."""
     if not math.isfinite(ask_rps):
         return ask_rps
     if ask_rps > 0:
-        return 0.0 if beam_broken else INTAKE_RPS
+        return 0.0 if beam_broken else ask_rps
     if ask_rps < 0:
-        return EJECT_RPS
+        return ask_rps
     return 0.0
 
 

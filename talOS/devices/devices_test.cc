@@ -421,22 +421,28 @@ TEST(Devices, SimHardwareSampleTimeConvergesFollowsLatencyAndGoesStale) {
   sim.step(15ms);
   EXPECT_FALSE(robot_enabled(sim.node("watcher")));
   const std::optional<Time> sampled = link.sample_time();
-  ASSERT_TRUE(sampled.has_value());
+  if (!sampled.has_value()) {
+    FAIL() << "Expected a sampled time";
+  }
+  const auto& sampled_time = *sampled;
   const Time now = sim.now();
-  EXPECT_LE(*sampled, now);
-  EXPECT_LE(now - *sampled, 10ms);  // the node drains before its 5 ms tick
+  EXPECT_LE(sampled_time, now);
+  EXPECT_LE(now - sampled_time, 10ms);  // the node drains before its 5 ms tick
   // A publication time: a multiple of the period in sim time, not the
   // gateway's clock 1.25 s off it.
-  EXPECT_EQ(sampled->nanos() % 5'000'000, 0);
+  EXPECT_EQ(sampled_time.nanos() % 5'000'000, 0);
 
   // States now leave 2 ms after they are sampled. The filter keeps the
   // shorter delay it has seen, so each maps to its true sample time.
   hw->set_gateway_clock(1250ms, 2ms);
   sim.step(20ms);
   const std::optional<Time> delayed = link.sample_time();
-  ASSERT_TRUE(delayed.has_value());
-  EXPECT_EQ(delayed->nanos() % 5'000'000, 3'000'000);
-  EXPECT_LE(sim.now() - *delayed, 12ms);
+  if (!delayed.has_value()) {
+    FAIL() << "Expected a delayed time";
+  }
+  const auto& delayed_time = *delayed;
+  EXPECT_EQ(delayed_time.nanos() % 5'000'000, 3'000'000);
+  EXPECT_LE(sim.now() - delayed_time, 12ms);
 
   hw->enable();
   sim.step(10ms);

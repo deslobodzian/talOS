@@ -32,6 +32,16 @@ py_library(
     deps = [":talos"],
 )
 
+# Optional framework teleop node, backed by the same implementation as C++.
+py_library(
+    name = "teleop",
+    srcs = ["talos/teleop.py"],
+    data = ["//talOS/teleop:libteleop.so"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [":talos"],
+)
+
 talos_messages(
     name = "test_messages",
     srcs = ["testdata/talos_test_message.fbs"],

@@ -1,12 +1,13 @@
-"""Relocated bundles describe their graph and keep their config identity.
+"""Installed bundles describe their graph and keep their config identity.
 
---describe runs every node binary, so a C++ node that cannot load a shared
-library it links (libwpimath from lib/) or a Python node that cannot import
-its wheels fails here."""
+Each bundle is installed the way the robot gets it (tools/deploy.sh install
+into a fresh prefix), then --describe runs every node binary from there, so a
+C++ node that cannot load a shared library it links (libwpimath from lib/), a
+Python node that cannot import its wheels or start its interpreter, or an
+install that breaks the bundle's relative symlinks fails here."""
 
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -19,10 +20,15 @@ BUNDLES = ("robot_bundle", "relocation_bundle")
 SHARED_LIBS = {"robot_bundle": ("libwpimath", "libwpiutil")}
 
 
-def describe(bundle, where):
-    """Copies `bundle` to `where` and runs its run.sh --describe-only."""
-    shutil.copytree(os.path.realpath(bundle), where, symlinks=True)
-    log_dir = os.path.join(where, "logs")
+def describe(bundle, prefix):
+    """Installs `bundle` under `prefix` with deploy.sh and runs the installed
+    run.sh --describe-only."""
+    r = runfiles.Create()
+    deploy = r.Rlocation("_main/tools/deploy.sh")
+    subprocess.run(["bash", deploy, "install", bundle, "--prefix", prefix],
+                   check=True, capture_output=True, text=True, timeout=120)
+    where = os.path.join(prefix, "current")
+    log_dir = os.path.join(prefix, "logs")
     env = dict(os.environ, TALOS_LOG_DIR=log_dir)
     proc = subprocess.run(["./run.sh", "--describe-only"], cwd=where, env=env,
                           capture_output=True, text=True, timeout=120)
@@ -34,15 +40,30 @@ def describe(bundle, where):
 
 
 class BundleTest(unittest.TestCase):
-    def test_relocated_bundles_describe_with_a_stable_identity(self):
+    def test_installed_bundles_describe_with_a_stable_identity(self):
         r = runfiles.Create()
         for name in BUNDLES:
-            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+            # deploy.sh installs read-only, so cleanup cannot remove it all;
+            # Bazel clears TEST_TMPDIR.
+            with self.subTest(name), tempfile.TemporaryDirectory(
+                    ignore_cleanup_errors=True) as tmp:
                 src = r.Rlocation(f"_main/2026-robot/main_processor/{name}")
                 self.assertTrue(src and os.path.isdir(src), src)
                 with open(os.path.join(src, "bundle_manifest.toml"), "rb") as f:
                     manifest = tomllib.load(f)
-                proc, graph = describe(src, os.path.join(tmp, "moved", name))
+                if name == "robot_bundle":
+                    # Resolve the deployed overlay's robot scalar over its base,
+                    # rather than accidentally checking the simulation config.
+                    self.assertEqual(manifest["config_path"], "config/robot_field.toml")
+                    config_path = os.path.join(src, manifest["config_path"])
+                    config_dir = os.path.dirname(config_path)
+                    with open(config_path, "rb") as f:
+                        overlay = tomllib.load(f)
+                    with open(os.path.join(config_dir, overlay["include"]), "rb") as f:
+                        base = tomllib.load(f)
+                    robot = base["robot"] | overlay.get("robot", {})
+                    self.assertEqual(robot["controller_address"], "10.56.87.2")
+                proc, graph = describe(src, os.path.join(tmp, "prefix"))
                 out = proc.stdout + "\n" + proc.stderr
                 self.assertEqual(proc.returncode, 0, out)
                 self.assertNotIn("error:", proc.stdout.lower())

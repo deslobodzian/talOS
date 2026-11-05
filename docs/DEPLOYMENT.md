@@ -11,18 +11,18 @@ bazel build //2026-robot/main_processor:robot_bundle
 ```
 
 `talos_bundle` (`talOS/build/contract.bzl`) takes `nodes`, `config`
-(`robot.toml`) and `config_files`; the robot's BUILD passes `NODES` and
-`CONFIG_FILES` from the generated `configuration/robot_manifest.bzl`
-(`bazel run //tools:sync_manifest -- <robot.toml>`). It writes
+(`robot_field.toml`) and `config_files`; the robot's BUILD passes `NODES` and
+`CONFIG_FILES` from the generated `configuration/robot_field_manifest.bzl`
+(`bazel run //tools:sync_manifest -- <robot_field.toml>`). It writes
 `bazel-bin/2026-robot/main_processor/robot_bundle/`:
 
 | Entry | What |
 |---|---|
-| `run.sh` | runs `./launcher --bundle <dir> --config config/robot.toml "$@"` |
+| `run.sh` | runs `./launcher --bundle <dir> --config config/robot_field.toml "$@"` |
 | `launcher` | `//talOS/launcher` |
 | `bin/` | node binaries; a Python node's runfiles beside it (its wheels, e.g. `robotpy-wpimath` and `gtsam`, and `libtalos_node.so`) |
 | `lib/` | the shared libraries C++ nodes link (`libwpimath`, `libwpiutil`), one copy per name; `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
-| `config/` | `robot.toml` and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
+| `config/` | `robot_field.toml` and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
 | `bundle_manifest.toml` | node names, targets, binaries, languages, config SHA-256 |
 
 The config SHA-256 (`config_sha256`, copied into every session manifest) is
@@ -33,9 +33,18 @@ config tree or copying the bundle elsewhere keeps the identity; editing,
 renaming or moving any one file relative to the others (the root config too)
 changes it.
 
-Before deploying, set `[robot] controller_address` in the config to the RoboRIO
-(the shipped value is loopback for simulation) and `commissioned = true` once
-the hardware is checked; or pass `--remote <ip>` to `run.sh`.
+The bundle uses `2026-robot/main_processor/configuration/robot_field.toml`,
+which includes `robot.toml` and overrides only `[robot] controller_address`
+to the RoboRIO's `10.56.87.2`. Simulation and its tests keep using
+`robot.toml` with loopback (`127.0.0.1`); no source edits are needed when
+switching between simulation and the field bundle. The overlay does not
+change CAN ids or commissioning: hardware must still be checked and
+commissioned through the normal bring-up process.
+
+To bring up the bundle against a different controller address without editing
+the config, run `./run.sh --remote <ip>` (for example,
+`./run.sh --remote 10.56.87.3`). This overrides the effective address for that
+launch; use `--remote-port` and `--local-port` if the ports also differ.
 
 ## On the main processor
 
@@ -46,11 +55,15 @@ the hardware is checked; or pass `--remote <ip>` to `run.sh`.
 ./tools/deploy.sh rollback [--prefix /opt/talos]
 ```
 
-- **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only),
-  moves `current` to `previous`, and points `current` at the new one.
-- **enable-boot** writes `/etc/systemd/system/talos.service` running
-  `<prefix>/current/run.sh` (restart on failure) and enables it. `--dry-run`, or
-  macOS, prints the unit instead.
+- **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only,
+  symlinks kept), moves `current` to `previous`, and points `current` at the
+  new one.
+- **enable-boot** starts `<prefix>/current/run.sh` at boot as `--user`
+  (default `talos`; the account must exist). Linux: writes and enables
+  `/etc/systemd/system/talos.service` (restart on failure). macOS: writes the
+  LaunchDaemon `/Library/LaunchDaemons/org.talos.robot.plist` (`KeepAlive`)
+  and bootstraps it into the system domain, so it starts without a login.
+  Both use sudo. `--dry-run` prints the unit or plist instead.
 - **logs** prints the session manifest (session id, config path and hash, each
   node's exit code and log path) found under `current` (or `dir`), or lists the
   directory if there is none.
@@ -64,3 +77,4 @@ Run by hand: `/opt/talos/current/run.sh --duration-s 30`.
 `2026-robot/controller_processor/rio` is deployed with GradleRIO
 (`./gradlew deploy` in that directory). Set `kCompanionAddress` in
 `src/main/cpp/Robot.cpp` to the main processor's address first.
+Robot bring-up checklist: [BRINGUP.md](BRINGUP.md).

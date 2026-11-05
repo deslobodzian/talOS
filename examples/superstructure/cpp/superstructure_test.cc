@@ -136,9 +136,12 @@ TEST_F(SuperstructureTest, IntakesRaisesScoresAndStows) {
   EXPECT_DOUBLE_EQ(RollerRequest().demand, kIntakeVolts);
   const auto intake_lane =
       LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
-  ASSERT_TRUE(intake_lane.has_value());
-  EXPECT_EQ(intake_lane->active, 1);
-  EXPECT_EQ(intake_lane->message.command(), IntakeCommand::INTAKE);
+  if (!intake_lane.has_value()) {
+    FAIL() << "Expected an intake target";
+  }
+  const auto& intake_target = *intake_lane;
+  EXPECT_EQ(intake_target.active, 1);
+  EXPECT_EQ(intake_target.message.command(), IntakeCommand::INTAKE);
 
   // The beam breaks: HOLDING, with a small hold voltage.
   SetBeamBreak(true);
@@ -436,6 +439,45 @@ TEST_F(ElevatorAlone, NeutralWithTheLiftDisconnected) {
 TEST_F(ElevatorAlone, NeutralOnANonFiniteGoal) {
   Drive(std::numeric_limits<double>::quiet_NaN(), 50ms);
   ExpectNeutral();
+}
+
+TEST(IntakeAlone, EjectDurationUsesMicroseconds) {
+  Sim sim{RobotConfig()};
+  sim.add<demo::Intake>("intake");
+  SimHardware hw{sim};
+  EnableTeleop(sim, hw);
+  const auto drive = [&](IntakeCommand command, int ticks) {
+    for (int i = 0; i < ticks; ++i) {
+      PublishTarget(sim, "intake", "superstructure", IntakeGoal{command});
+      sim.step(20ms);
+    }
+  };
+  drive(IntakeCommand::INTAKE, 2);
+  drive(IntakeCommand::EJECT, 1);
+  const auto initial_status = sim.latest<IntakeStatus>(topics::kIntakeStatus);
+  if (!initial_status.has_value()) {
+    FAIL() << "Expected initial intake status";
+  }
+  const auto& initial = *initial_status;
+  ASSERT_EQ(initial.state(), IntakeState::EJECTING);
+
+  // eject_us = 500000 is 500 ms, not 500 seconds or half a millisecond.
+  drive(IntakeCommand::EJECT, 23);
+  const auto ejecting_status = sim.latest<IntakeStatus>(topics::kIntakeStatus);
+  if (!ejecting_status.has_value()) {
+    FAIL() << "Expected intake status during ejection";
+  }
+  const auto& ejecting = *ejecting_status;
+  EXPECT_EQ(ejecting.state(), IntakeState::EJECTING);
+  EXPECT_DOUBLE_EQ(hw.motor_request("intake", "roller").demand, kEjectVolts);
+  drive(IntakeCommand::EJECT, 3);
+  const auto final_status = sim.latest<IntakeStatus>(topics::kIntakeStatus);
+  if (!final_status.has_value()) {
+    FAIL() << "Expected final intake status";
+  }
+  const auto& final = *final_status;
+  EXPECT_EQ(final.state(), IntakeState::IDLE);
+  EXPECT_EQ(hw.motor_request("intake", "roller").mode, Mode::kNeutral);
 }
 
 // The intake with no target: the state machine carries on, the roller is

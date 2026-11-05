@@ -8,6 +8,20 @@ Read this file first, then [METHODOLOGY.md](METHODOLOGY.md) and
 [DESIGN_AUTOMATIC_WIRING.md](DESIGN_AUTOMATIC_WIRING.md). This handoff records
 actual completion status where the design describes intended behavior.
 
+## Status at 2026-11-05 (supersedes the "Not verified anywhere" list below)
+
+- CI parity reproduced locally: Linux arm64 container build + 83/83 tests,
+  `phoenixTest` and `buildRio` in a Linux amd64 container; clang-format-18,
+  buildifier 8.2.1 and clang-tidy-18 violations on the changed files fixed.
+  CI itself has not run yet (needs the draft PR).
+- The follow-ups in TODO.md "Next for agents" are done or decided: Python
+  teleop in `talos.testing`, silent `/hw/state` exclusion, Studio port and
+  channel names checked on the live page, unit-suffixed example params,
+  `examples/wrist_repo` + `examples/external_subsystem`, field overlay config,
+  docs/BRINGUP.md, `deploy.sh`/`setup.sh` fixes found by running them on macOS.
+- The suite is 90 tests (adds the teleop Python test, the field overlay's
+  graph and manifest tests, the external subsystem's three and `@wrist`'s).
+
 ## Status at the 2026-11-04 evening stop (read this before the sections below)
 
 `agent/automatic-wiring` at `75356df` is verified:

@@ -71,9 +71,12 @@ TEST_F(Registry, PublishesTopologyAndCountersToAReader) {
                           /*max_latency_ns=*/78);
 
   auto reader = RegistryReader::open(path_);
-  ASSERT_TRUE(reader.has_value());
+  if (!reader.has_value()) {
+    FAIL() << "Expected registry reader";
+  }
+  const auto& registry = reader.value();
 
-  const auto nodes = reader->nodes();
+  const auto nodes = registry.nodes();
   ASSERT_EQ(nodes.size(), 1u);
   const NodeSnapshot& node = nodes.front();
 
@@ -113,10 +116,13 @@ TEST_F(Registry, ATargetsSelectedSourceReadsBackAndClearsToNone) {
   registration.publish_selections(
       std::vector<Policy>{{{"align", "teleop", "auto"}}});
   auto reader = RegistryReader::open(path_);
-  ASSERT_TRUE(reader.has_value());
+  if (!reader.has_value()) {
+    FAIL() << "Expected registry reader";
+  }
+  const auto& registry = reader.value();
 
-  const auto selection = [&reader] {
-    const auto nodes = reader->nodes();
+  const auto selection = [&registry] {
+    const auto nodes = registry.nodes();
     EXPECT_EQ(nodes.size(), 1u);
     EXPECT_EQ(nodes.front().selections.size(), 1u);
     return nodes.front().selections.front();
@@ -151,7 +157,12 @@ TEST_F(Registry, SelectionsBeyondTheSlotAreCountedAndARecycledSlotHasNone) {
         static_cast<std::int32_t>(policies.front().sources.size() - 1);
     registration.set_selected(0, last);
 
-    const auto nodes = RegistryReader::open(path_)->nodes();
+    auto reader = RegistryReader::open(path_);
+    if (!reader.has_value()) {
+      FAIL() << "Expected registry reader";
+    }
+    const auto& registry = reader.value();
+    const auto nodes = registry.nodes();
     ASSERT_EQ(nodes.size(), 1u);
     const NodeSnapshot& node = nodes.front();
     EXPECT_EQ(node.declared_selection_count, kMaxSelectionsPerNode + 1);
@@ -170,7 +181,12 @@ TEST_F(Registry, SelectionsBeyondTheSlotAreCountedAndARecycledSlotHasNone) {
   // previous owner's.
   NodeRegistration next{{.name = "plain"}, path_};
   next.publish({});
-  const auto nodes = RegistryReader::open(path_)->nodes();
+  auto reader = RegistryReader::open(path_);
+  if (!reader.has_value()) {
+    FAIL() << "Expected registry reader";
+  }
+  const auto& registry = reader.value();
+  const auto nodes = registry.nodes();
   ASSERT_EQ(nodes.size(), 1u);
   EXPECT_TRUE(nodes.front().selections.empty());
   EXPECT_EQ(nodes.front().declared_selection_count, 0u);
@@ -199,8 +215,11 @@ TEST_F(Registry, SeveralNodesCoexistAndAReleasedSlotDisappears) {
 
   // Both registrations are gone now, so the registry is empty but still valid.
   auto view = RegistryReader::open(path_);
-  ASSERT_TRUE(view.has_value());
-  EXPECT_TRUE(view->nodes().empty());
+  if (!view.has_value()) {
+    FAIL() << "Expected registry reader";
+  }
+  const auto& registry = view.value();
+  EXPECT_TRUE(registry.nodes().empty());
 }
 
 TEST_F(Registry, ReaderReportsNothingBeforeAnyNodeStarts) {
@@ -225,24 +244,30 @@ TEST_F(Registry, ANewClaimSweepsSlotsLeftBehindByACrashedNode) {
 
   {
     auto stale = RegistryReader::open(path_);
-    ASSERT_TRUE(stale.has_value());
-    ASSERT_EQ(stale->nodes().size(), 1u);
-    EXPECT_FALSE(stale->nodes().front().alive);
+    if (!stale.has_value()) {
+      FAIL() << "Expected registry reader";
+    }
+    const auto& registry = stale.value();
+    ASSERT_EQ(registry.nodes().size(), 1u);
+    EXPECT_FALSE(registry.nodes().front().alive);
   }
 
   NodeRegistration newcomer({.name = "intake", .session_id = 1788}, path_);
   newcomer.publish(sample_manifest());
 
   auto view = RegistryReader::open(path_);
-  ASSERT_TRUE(view.has_value());
-  const auto nodes = view->nodes();
+  if (!view.has_value()) {
+    FAIL() << "Expected registry reader";
+  }
+  const auto& registry = view.value();
+  const auto nodes = registry.nodes();
   ASSERT_EQ(nodes.size(), 1u);
   EXPECT_EQ(nodes.front().session_id, 1788u);
   EXPECT_TRUE(nodes.front().alive);
 
   // Destroying the swept owner must not yank the new owner's row.
   ghost.reset();
-  const auto after = view->nodes();
+  const auto after = registry.nodes();
   ASSERT_EQ(after.size(), 1u);
   EXPECT_EQ(after.front().session_id, 1788u);
 }
@@ -259,8 +284,11 @@ TEST_F(Registry, SourcesBeyondCapacityAreCountedButNotStored) {
   registration.publish(manifest);
 
   auto reader = RegistryReader::open(path_);
-  ASSERT_TRUE(reader.has_value());
-  const auto nodes = reader->nodes();
+  if (!reader.has_value()) {
+    FAIL() << "Expected registry reader";
+  }
+  const auto& registry = reader.value();
+  const auto nodes = registry.nodes();
   ASSERT_EQ(nodes.size(), 1u);
   EXPECT_EQ(nodes.front().sources.size(), kMaxSourcesPerNode);
   EXPECT_EQ(nodes.front().declared_source_count, manifest.size());
@@ -330,8 +358,11 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
   EXPECT_GT(handler.fired, 0u);
 
   auto reader = RegistryReader::open(path_);
-  ASSERT_TRUE(reader.has_value());
-  const auto nodes = reader->nodes();
+  if (!reader.has_value()) {
+    FAIL() << "Expected registry reader";
+  }
+  const auto& registry = reader.value();
+  const auto nodes = registry.nodes();
   ASSERT_EQ(nodes.size(), 1u);
   const NodeSnapshot& node = nodes.front();
 
@@ -448,8 +479,11 @@ TEST_F(Registry, EndpointAttributesSurviveTheSegment) {
   registration.publish(manifest, endpoints);
 
   auto reader = RegistryReader::open(path_);
-  ASSERT_TRUE(reader.has_value());
-  const auto nodes = reader->nodes();
+  if (!reader.has_value()) {
+    FAIL() << "Expected registry reader";
+  }
+  const auto& registry = reader.value();
+  const auto nodes = registry.nodes();
   ASSERT_EQ(nodes.size(), 1u);
   const auto& sources = nodes.front().sources;
   ASSERT_EQ(sources.size(), 4u);
@@ -487,8 +521,11 @@ TEST_F(Registry, ASourceWithNoAttributesIsNeitherExternalNorOptional) {
   registration.publish(sample_manifest());
 
   auto reader = RegistryReader::open(path_);
-  ASSERT_TRUE(reader.has_value());
-  const auto nodes = reader->nodes();
+  if (!reader.has_value()) {
+    FAIL() << "Expected registry reader";
+  }
+  const auto& registry = reader.value();
+  const auto nodes = registry.nodes();
   ASSERT_EQ(nodes.size(), 1u);
   const auto& sources = nodes.front().sources;
   ASSERT_EQ(sources.size(), 3u);
@@ -534,8 +571,11 @@ TEST_F(Registry, AMisnamedTopicIsWarnedAboutAndStillPublished) {
   EXPECT_EQ(warnings.find("tick"), std::string::npos) << warnings;
 
   auto reader = RegistryReader::open(path_);
-  ASSERT_TRUE(reader.has_value());
-  const auto nodes = reader->nodes();
+  if (!reader.has_value()) {
+    FAIL() << "Expected registry reader";
+  }
+  const auto& registry = reader.value();
+  const auto nodes = registry.nodes();
   ASSERT_EQ(nodes.size(), 1u);
   ASSERT_EQ(nodes.front().sources.size(), 2u);
   EXPECT_EQ(nodes.front().sources[1].name, "/hw/cmd");
@@ -549,7 +589,10 @@ TEST_F(Registry, WholeSamplesReadWhole) {
   registration.publish(sample_manifest());
 
   auto reader = RegistryReader::open(path_);
-  ASSERT_TRUE(reader.has_value());
+  if (!reader.has_value()) {
+    FAIL() << "Expected registry reader";
+  }
+  const auto& registry = reader.value();
 
   for (std::uint64_t i = 1; i <= 20; ++i) {
     registration.begin_sample();
@@ -560,7 +603,7 @@ TEST_F(Registry, WholeSamplesReadWhole) {
                             /*max_latency_ns=*/0);
     registration.end_sample();
 
-    const auto nodes = reader->nodes();
+    const auto nodes = registry.nodes();
     ASSERT_EQ(nodes.size(), 1u);
     EXPECT_EQ(nodes.front().dispatch_count, i);
     ASSERT_EQ(nodes.front().sources.size(), 3u);
@@ -582,14 +625,17 @@ TEST_F(Registry, ReaderMakesProgressWhileASampleIsOpen) {
                           /*max_latency_ns=*/0);
 
   auto reader = RegistryReader::open(path_);
-  ASSERT_TRUE(reader.has_value());
+  if (!reader.has_value()) {
+    FAIL() << "Expected registry reader";
+  }
+  const auto& registry = reader.value();
 
   registration.begin_sample();
   registration.heartbeat();
 
   // The sequence stays odd for as long as the sample stays open; the reader
   // still terminates and still reports the node.
-  const auto mid = reader->nodes();
+  const auto mid = registry.nodes();
   ASSERT_EQ(mid.size(), 1u);
   EXPECT_EQ(mid.front().name, "parked");
 
@@ -599,7 +645,7 @@ TEST_F(Registry, ReaderMakesProgressWhileASampleIsOpen) {
                           /*max_latency_ns=*/0);
   registration.end_sample();
 
-  const auto after = reader->nodes();
+  const auto after = registry.nodes();
   ASSERT_EQ(after.size(), 1u);
   EXPECT_EQ(after.front().dispatch_count, 8u);
   ASSERT_EQ(after.front().sources.size(), 3u);
@@ -623,8 +669,11 @@ TEST_F(Registry, WriterWithoutTheGuardReadsAsStable) {
   EXPECT_EQ(record.sample_seq.load(std::memory_order_relaxed), 0u);
 
   auto reader = RegistryReader::open(path_);
-  ASSERT_TRUE(reader.has_value());
-  const auto nodes = reader->nodes();
+  if (!reader.has_value()) {
+    FAIL() << "Expected registry reader";
+  }
+  const auto& registry = reader.value();
+  const auto nodes = registry.nodes();
   ASSERT_EQ(nodes.size(), 1u);
   EXPECT_EQ(nodes.front().dispatch_count, 41u);
   ASSERT_EQ(nodes.front().sources.size(), 3u);

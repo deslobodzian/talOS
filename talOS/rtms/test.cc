@@ -1338,7 +1338,10 @@ TEST(RTMSLifetime, APublishersCleanExitDoesNotSeverItsSubscriber) {
                        16,
                        overwrite_sequence_options()};
   const auto reader = subscriber.register_reader();
-  ASSERT_TRUE(reader.has_value());
+  if (!reader.has_value()) {
+    FAIL() << "Expected registered reader";
+  }
+  const auto& reader_id = reader.value();
   {
     RTMSQueue publisher{path,
                         sizeof(Message::TestMessage),
@@ -1349,7 +1352,7 @@ TEST(RTMSLifetime, APublishersCleanExitDoesNotSeverItsSubscriber) {
     ASSERT_EQ(publisher.write(BytesOf({1, 1.0F})), WriteResult::SUCCESS);
   }
   EXPECT_TRUE(SegmentExists(path));
-  EXPECT_EQ(ReadOne(subscriber, *reader).id(), 1);
+  EXPECT_EQ(ReadOne(subscriber, reader_id).id(), 1);
   // A restarted publisher reaches the same subscriber, continuing the
   // sequence where the first one stopped.
   RTMSQueue restarted{path,
@@ -1359,8 +1362,8 @@ TEST(RTMSLifetime, APublishersCleanExitDoesNotSeverItsSubscriber) {
                       16,
                       publisher_options()};
   ASSERT_EQ(restarted.write(BytesOf({2, 2.0F})), WriteResult::SUCCESS);
-  EXPECT_EQ(ReadOne(subscriber, *reader).id(), 2);
-  subscriber.release_reader(*reader);
+  EXPECT_EQ(ReadOne(subscriber, reader_id).id(), 2);
+  subscriber.release_reader(reader_id);
 }
 
 TEST(RTMSLifetime, TheLastQueueToCloseAStandaloneSegmentUnlinksIt) {
@@ -1477,12 +1480,15 @@ TEST(RTMSDeadReader, SlotsOfKilledReadersAreReclaimedWhenNoneAreFree) {
     }
   });
   const auto reader = publisher.register_reader();
-  ASSERT_TRUE(reader.has_value());
+  if (!reader.has_value()) {
+    FAIL() << "Expected registered reader";
+  }
+  const auto& reader_id = reader.value();
   ASSERT_EQ(publisher.write(BytesOf({9, 9.0F})), WriteResult::SUCCESS);
-  EXPECT_EQ(ReadOne(publisher, *reader).id(), 9);
+  EXPECT_EQ(ReadOne(publisher, reader_id).id(), 9);
   // A live reader is never reclaimed.
   EXPECT_EQ(publisher.reclaim_dead_readers(), 0u);
-  publisher.release_reader(*reader);
+  publisher.release_reader(reader_id);
 }
 
 // A publisher reclaims a segment of another schema that only dead processes

@@ -112,7 +112,9 @@ TEST(Swerve, SteersFromTheCurrentAzimuthAndAStoppedWheelHolds) {
     EXPECT_NEAR(m.steer_rot, 0.5, 1e-12);
   }
   // No motion: every wheel stays where it points.
-  for (std::size_t i = 0; i < kModuleCount; ++i) current[i].steer_rot = 0.1 * i;
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    current[i].steer_rot = 0.1 * static_cast<double>(i);
+  }
   const auto stopped = kinematics.ToModuleStates({0, 0, 0}, current);
   ASSERT_TRUE(stopped.has_value());
   for (std::size_t i = 0; i < kModuleCount; ++i) {
@@ -153,11 +155,14 @@ TEST(Swerve, EachModuleIsLimitedByItsOwnDriveAndWheel) {
   geometry.modules[2].wheel_radius_m *= 2;
   SwerveKinematics kinematics{geometry};
   const auto fast = kinematics.ToModuleStates({100, 0, 0}, {});
-  ASSERT_TRUE(fast.has_value());
-  EXPECT_NEAR((*fast)[1].drive_rps, 10, 1e-9);
-  EXPECT_NEAR((*fast)[0].drive_rps, 10, 1e-9);
-  EXPECT_NEAR((*fast)[3].drive_rps, 10, 1e-9);
-  EXPECT_NEAR((*fast)[2].drive_rps, 5, 1e-9);  // same ground speed
+  if (!fast.has_value()) {
+    FAIL() << "Expected module states for valid chassis speeds";
+  }
+  const auto& fast_states = *fast;
+  EXPECT_NEAR(fast_states[1].drive_rps, 10, 1e-9);
+  EXPECT_NEAR(fast_states[0].drive_rps, 10, 1e-9);
+  EXPECT_NEAR(fast_states[3].drive_rps, 10, 1e-9);
+  EXPECT_NEAR(fast_states[2].drive_rps, 5, 1e-9);  // same ground speed
 }
 
 TEST(Swerve, ForwardKinematicsInvertsInverseKinematics) {
@@ -414,8 +419,10 @@ TEST_F(DrivetrainTest, ModulePositionsComeFromTheDriveAndSteerMotors) {
   // Different values per module, so a module reported in another's slot or
   // a drive/steer swap shows.
   for (std::size_t i = 0; i < kModuleCount; ++i) {
-    hw.set_motor("drivetrain", geometry.modules[i].drive, 1.0 + i, 0.0);
-    hw.set_motor("drivetrain", geometry.modules[i].steer, -0.1 * i, 0.0);
+    hw.set_motor("drivetrain", geometry.modules[i].drive,
+                 1.0 + static_cast<double>(i), 0.0);
+    hw.set_motor("drivetrain", geometry.modules[i].steer,
+                 -0.1 * static_cast<double>(i), 0.0);
   }
   sim.step(kConverged);
   const DrivetrainState state = State();
@@ -469,8 +476,10 @@ TEST_F(DrivetrainTest, SampleTimeIsTheMappedHardwareSampleTimeNotTheTickTime) {
 
 TEST_F(DrivetrainTest, ADisconnectedMotorStillPublishesButDrivesNothing) {
   Teleop();
-  for (std::size_t i = 0; i < kModuleCount; ++i)
-    hw.set_motor("drivetrain", geometry.modules[i].drive, 1.0 + i, 0.0);
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    hw.set_motor("drivetrain", geometry.modules[i].drive,
+                 1.0 + static_cast<double>(i), 0.0);
+  }
   Hold(ChassisTarget{1.0, 0, 0}, 40ms);
   ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
   const double yaw_before = State().yaw_rad();
@@ -657,13 +666,20 @@ void RecordAllocation(std::uint32_t type, std::uintptr_t, std::uintptr_t,
 // (talOS/events/simulated_event_loop.h), so their storage grows
 // geometrically under any publisher. That is the test transport's
 // allocation, not the node's; the real transport is a preallocated ring.
+// SimulatedChannel::publish may be inlined into SimulatedEventLoop::send_impl,
+// which does nothing else, so either frame marks the transport.
 bool InSimTransport(const Allocation& a) {
   for (int i = 0; i < a.depth; ++i) {
     Dl_info info;
-    if (::dladdr(a.frames[i], &info) != 0 && info.dli_sname != nullptr &&
-        std::string_view{info.dli_sname}.find("SimulatedChannel") !=
-            std::string_view::npos)
+    if (::dladdr(a.frames[i], &info) == 0 || info.dli_sname == nullptr) {
+      continue;
+    }
+    const std::string_view name{info.dli_sname};
+    if (name.find("SimulatedChannel") != std::string_view::npos ||
+        (name.find("SimulatedEventLoop") != std::string_view::npos &&
+         name.find("send_impl") != std::string_view::npos)) {
       return true;
+    }
   }
   return false;
 }

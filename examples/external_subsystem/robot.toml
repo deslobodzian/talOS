@@ -1,0 +1,11 @@
+# A robot consuming the committed standalone @wrist Bzlmod module.
+[robot]
+name = "external_subsystem"
+period_us = 20000
+command_timeout_us = 100000
+status_hz = 200.0
+commissioned = false
+
+[[subsystems]]
+name = "wrist"
+path = "wrist.toml"

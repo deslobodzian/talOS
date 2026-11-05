@@ -26,7 +26,7 @@ function history() {
   const timeline = new Timeline();
   [0, 4, 5, 0, 7].forEach((current, i) => {
     const frame = decode(demoPacket(BigInt(i)))!;
-    frame.channels['motor.current'] = current;
+    frame.channels['intake/state/current_a'] = current;
     timeline.append(frame);
   });
   return timeline;
@@ -60,10 +60,10 @@ test(
       const response = dispatch(ctx(timeline), 'query_state_at', {
                          timestamp_ns: '1020000001',
                          mode: 'at_or_before',
-                         topics: ['motor.current', 'chassis.x']
+                         topics: ['intake/state/current_a', 'chassis.x']
                        }) as any;
       assert.equal(response.timestamp_ns, '1020000000');
-      assert.equal(response.topics['motor.current'], 4);
+      assert.equal(response.topics['intake/state/current_a'], 4);
       assert.equal(typeof response.topics['chassis.x'], 'number');
       assert.throws(
           () => dispatch(
@@ -78,13 +78,16 @@ test(
       const result =
           dispatch(
               ctx(timeline), 'scan_channel_events',
-              {topic: 'motor.current', condition: {op: 'gt', value: 3}}) as any;
+              {
+                topic: 'intake/state/current_a',
+                condition: {op: 'gt', value: 3}
+              }) as {ranges: {start_ns: string; end_ns: string; samples: number}[]};
       assert.deepEqual(result.ranges, [
         {start_ns: '1020000000', end_ns: '1040000000', samples: 2},
         {start_ns: '1080000000', end_ns: '1080000000', samples: 1}
       ]);
       const edge = dispatch(ctx(timeline), 'scan_channel_events', {
-                     topic: 'motor.current',
+                     topic: 'intake/state/current_a',
                      condition: {op: 'falling'},
                      start_ns: '1060000000'
                    }) as any;

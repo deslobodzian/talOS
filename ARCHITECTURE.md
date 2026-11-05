@@ -53,7 +53,7 @@ Beside the stack:
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |
 | `talOS/process` | stop handlers and `ConfigureRealtime` for node binaries |
 | `talOS/msgs` | shared geometry and control message structs (field and chassis angles in radians; `SwerveModulePosition`, `PoseObservation`, `PoseEstimate`) |
-| `talOS/telemetry` | `:node` framework node, telemetry frame schema, byte-topic wire format |
+| `talOS/telemetry` | `:node` framework node, telemetry frame schema, byte-topic wire format; schema-less `/hw/state` is excluded because `/hw/status` (`bridge::BridgeStatus`) already reports link health. |
 | `talOS/teleop` | `:node` framework teleop node; `:deadband` stick deadband calculation; declarative button/axis-to-lane mapping |
 | `talOS/schema` | `talos::Descriptor<M>` (`.bfbs` bytes, name, schema hash), `talos::schema::struct_hash`, the unit-suffix table; Python `talos_schema` and upstream `reflection` classes |
 | `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle`, `talos_graph_test` (both fed by a config's generated `robot_manifest.bzl`, `tools/sync_manifest.py`) |
@@ -116,6 +116,14 @@ reports, and a silent target is judged stale at most one period after
 reproduces either from the log. Off-simulation the loop thread runs under
 `SCHED_FIFO` (Linux) or the Mach time-constraint policy (macOS) with memory
 locked, best effort (`talOS/process`).
+
+Freshness counts from receipt by design: targets carry no send time. A
+consumer that stalls (a Python GC pause, CPU starvation) and then drains reads
+the producer's latest value as new, so it can act on a value as old as the
+stall for up to another `command_timeout_us`. This is accepted for C++ and
+Python nodes alike: the mode generation still refuses anything sent under an
+earlier enable or mode, and the bridge neutralizes a subsystem whose own
+requests stop (`/hw/status` `timed_out_mask`).
 
 ## Topics and messages
 

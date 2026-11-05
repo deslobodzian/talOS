@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
 #include <limits>
 #include <map>
 #include <random>
@@ -485,14 +484,13 @@ class Telemetry {
         }
 
         seen_topics.insert(source.name);
+        // Schema-less state/status packets (notably /hw/state) contribute
+        // neither subscriptions nor dictionary channels.
 
         if (source.name == "/hw/state/driver_station") {
           ObserveDriverStation(source);
         } else if (!source.bfbs.empty()) {
           ObserveDescribedTopic(source);
-        } else {
-          std::cerr << "[" << node_.name() << "] skipping topic '"
-                    << source.name << "' without schema\n";
         }
       }
     }

@@ -1,7 +1,11 @@
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
-# manifest_sync_test (sync_manifest.bzl) runs the script as its main.
-exports_files(["sync_manifest.py"])
+# manifest_sync_test (sync_manifest.bzl) runs the script as its main;
+# //2026-robot/main_processor:bundle_test installs bundles with deploy.sh.
+exports_files([
+    "deploy.sh",
+    "sync_manifest.py",
+])
 
 # bazel run //tools:new_subsystem -- <name> --lang cpp|py [--robot R] [--standalone DIR] [--dry-run]
 # Writes a node package under <robot>/main_processor/<name>/, adds it to that

@@ -20,8 +20,9 @@ namespace {
 
 float AxisValue(const std::string& text) {
   const double value = std::stod(text);
-  if (!std::isfinite(value) || value < -1.0 || value > 1.0)
+  if (!std::isfinite(value) || value < -1.0 || value > 1.0) {
     throw std::invalid_argument("axis values must be within [-1, 1]");
+  }
   return static_cast<float>(value);
 }
 
@@ -35,25 +36,27 @@ int main(int argc, char** argv) {
     bool disabled = false;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
-      if (arg == "--x" && i + 1 < argc)
+      if (arg == "--x" && i + 1 < argc) {
         axis1 = -AxisValue(argv[++i]);  // Forward is negative axis 1.
-      else if (arg == "--y" && i + 1 < argc)
+      } else if (arg == "--y" && i + 1 < argc) {
         axis0 = -AxisValue(argv[++i]);  // Left is negative axis 0.
-      else if (arg == "--rot" && i + 1 < argc)
+      } else if (arg == "--rot" && i + 1 < argc) {
         axis2 = -AxisValue(argv[++i]);
-      else if (arg == "--buttons" && i + 1 < argc)
+      } else if (arg == "--buttons" && i + 1 < argc) {
         buttons = static_cast<uint32_t>(std::stoul(argv[++i]));
-      else if (arg == "--duration-s" && i + 1 < argc)
+      } else if (arg == "--duration-s" && i + 1 < argc) {
         duration_s = std::stoi(argv[++i]);
-      else if (arg == "--disabled")
+      } else if (arg == "--disabled") {
         disabled = true;
-      else
+      } else {
         throw std::invalid_argument(
             "usage: send_joystick [--x -1..1] [--y -1..1] [--rot -1..1] "
             "[--buttons MASK] [--duration-s N] [--disabled]");
+      }
     }
-    if (duration_s <= 0)
+    if (duration_s <= 0) {
       throw std::invalid_argument("duration must be positive");
+    }
 
     talos::process::InstallStopHandlers();
     ipc::Publisher<talos::hardware::Packet> publisher{
@@ -61,9 +64,10 @@ int main(int argc, char** argv) {
 
     talos::driver_station::DriverStationData ds{};
     ds.fms.flags = talos::driver_station::kDsAttached;
-    if (!disabled)
+    if (!disabled) {
       ds.fms.flags |=
           talos::driver_station::kEnabled | talos::driver_station::kTeleop;
+    }
     ds.fms.alliance = talos::driver_station::Alliance::kBlue;
     auto& stick = ds.joysticks[0];
     stick.connected = true;

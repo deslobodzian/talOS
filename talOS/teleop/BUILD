@@ -1,5 +1,7 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_python//python:defs.bzl", "py_test")
 load("//talOS/build:contract.bzl", "talos_cc_node")
 
 package(default_visibility = ["//visibility:public"])
@@ -32,6 +34,26 @@ talos_cc_node(
     srcs = ["node.cc"],
     node_name = "teleop",
     deps = [":teleop"],
+)
+
+cc_binary(
+    name = "libteleop.so",
+    srcs = ["teleop_abi.cc"],
+    linkshared = True,
+    deps = [":teleop"],
+)
+
+py_test(
+    name = "python_test",
+    size = "small",
+    srcs = ["teleop_test.py"],
+    legacy_create_init = False,
+    main = "teleop_test.py",
+    deps = [
+        "//talOS/msgs:control_py",
+        "//talOS/python:teleop",
+        "//talOS/python:testing",
+    ],
 )
 
 cc_test(

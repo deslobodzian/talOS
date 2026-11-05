@@ -138,6 +138,7 @@ std::size_t TargetAccess::open_target(Node& node, std::size_t bytes,
   }
   const auto indexes = [&state](const std::vector<std::string>& mode) {
     std::vector<std::int32_t> out;
+    out.reserve(mode.size());
     for (const std::string& source : mode) {
       out.push_back(static_cast<std::int32_t>(
           std::find(state.sources.begin(), state.sources.end(), source) -

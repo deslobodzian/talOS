@@ -1,0 +1,19 @@
+# Wrist subsystem defaults, shipped by the @wrist repository.
+# The robot's own subsystem file starts as a copy of this one, with the
+# motor's physical can_id added; inversions and tuned slot0 gains go there.
+[subsystem]
+name = "wrist"
+node = "@wrist//:node"
+period_us = 20000
+
+[motors.wrist_motor]
+type = "TalonFX"
+bus = "rio"
+inverted = false
+brake = true
+supply_limit_a = 40.0
+stator_limit_a = 80.0
+max_voltage = 12.0
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 100.0
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }

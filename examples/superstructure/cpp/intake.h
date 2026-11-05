@@ -27,10 +27,10 @@ class Intake {
         goal_{node},
         status_{node.publish<IntakeStatus>(topics::kIntakeStatus)},
         sm_{node, State::IDLE},
-        intake_volts_{node.param<double>("intake_volts")},
-        hold_volts_{node.param<double>("hold_volts")},
-        eject_volts_{node.param<double>("eject_volts")},
-        eject_time_{std::chrono::milliseconds{node.param<int>("eject_ms")}} {}
+        intake_volts_{node.param<double>("intake_v")},
+        hold_volts_{node.param<double>("hold_v")},
+        eject_volts_{node.param<double>("eject_v")},
+        eject_time_{std::chrono::microseconds{node.param<int>("eject_us")}} {}
 
   void update() {
     const IntakeGoal* goal = goal_.get();

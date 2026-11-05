@@ -1,0 +1,11 @@
+# Local wrist fixture. Device IDs are assigned by the normal parser.
+[robot]
+name = "wrist_test"
+period_us = 20000
+command_timeout_us = 100000
+status_hz = 200.0
+commissioned = false
+
+[[subsystems]]
+name = "wrist"
+path = "wrist.toml"

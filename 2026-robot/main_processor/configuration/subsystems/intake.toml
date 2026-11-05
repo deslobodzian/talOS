@@ -3,7 +3,8 @@
 # subsystem files into one canonical view before validation.
 #
 # STUDENT NOTE -- where the motor's behavior lives:
-#   speeds (intake / eject / stop) .... main_processor/intake/intake.py top block
+#   asked speeds ..................... this file ([[teleop.bindings]] below)
+#   beam-break stopping .............. main_processor/intake/intake.py
 #   gains + limits (below) ............ this file ([motors.roller])
 # The node asks for velocity and the motor's onboard PID closes the loop, so
 # these gains decide whether the wheel actually reaches the asked speed.
@@ -43,6 +44,8 @@ slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 [digital_inputs.intake_beam]
 dio = 1
 
+# Held button asks for 30 wheel rps (below the 100 rps motor limit).
+# Positive asks stop at the beam; negative asks eject at their asked speed.
 [[teleop.bindings]]
 button = 2
 while_held = { roller_velocity_rps = 30.0 }

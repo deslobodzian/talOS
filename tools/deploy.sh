@@ -33,7 +33,13 @@ cmd_install() {
   local dest="$PREFIX/bundles/$stamp"
   say "installing to $dest"
   run mkdir -p "$PREFIX/bundles"
-  run cp -r "$bundle" "$dest"
+  # Resolve the operand first: -P would copy a symlinked bundle path (a
+  # runfiles entry, a link into bazel-out) as a link, not the bundle.
+  bundle="$(cd "$bundle" && pwd -P)" || die "cannot resolve $bundle"
+  # -RP keeps the bundle's relative symlinks (GNU and BSD alike). macOS
+  # `cp -r` dereferences them; a copied venv python3 then cannot find
+  # @executable_path/../lib/libpython3.11.dylib and every Python node fails.
+  run cp -RP "$bundle" "$dest"
   run chmod -R a-w "$dest" 2>/dev/null || true
   if [ -L "$PREFIX/current" ]; then
     run rm -f "$PREFIX/previous"
@@ -44,8 +50,9 @@ cmd_install() {
 }
 
 # --- enable-boot ------------------------------------------------------------
-# Writes a systemd unit that starts the installed bundle on boot. Prints the
-# unit (and the macOS note) under --dry-run instead of touching /etc.
+# Starts the installed bundle on boot as --user: a systemd unit on Linux, a
+# launchd LaunchDaemon on macOS (a daemon, not a LaunchAgent, so it starts
+# without anyone logging in). --dry-run prints it instead of installing.
 cmd_enable_boot() {
   local user="talos"
   while [ $# -gt 0 ]; do
@@ -74,6 +81,8 @@ WantedBy=multi-user.target
 <dict>
   <key>Label</key>
   <string>org.talos.robot</string>
+  <key>UserName</key>
+  <string>$user</string>
   <key>ProgramArguments</key>
   <array>
     <string>$PREFIX/current/run.sh</string>
@@ -90,17 +99,19 @@ WantedBy=multi-user.target
 </dict>
 </plist>
 "
+    local plist_dest="/Library/LaunchDaemons/org.talos.robot.plist"
     if [ "$DRY_RUN" = "1" ]; then
-      printf '%s\n' "$unit"
+      say "would write $plist_dest:"
       printf '%s\n' "$plist"
       return 0
     fi
-    local plist_dest="$HOME/Library/LaunchAgents/org.talos.robot.plist"
-    mkdir -p "$(dirname "$plist_dest")"
-    printf '%s' "$plist" > "$plist_dest"
-    launchctl unload "$plist_dest" 2>/dev/null || true
-    launchctl load "$plist_dest"
-    say "boot start enabled ($plist_dest)"
+    id -u "$user" >/dev/null 2>&1 || die "no user '$user' (pass --user)"
+    printf '%s' "$plist" | sudo tee "$plist_dest" >/dev/null
+    sudo chown root:wheel "$plist_dest"
+    sudo chmod 644 "$plist_dest"
+    sudo launchctl bootout system/org.talos.robot 2>/dev/null || true
+    sudo launchctl bootstrap system "$plist_dest"
+    say "boot start enabled ($plist_dest, as $user)"
     return 0
   fi
   if [ "$DRY_RUN" = "1" ]; then

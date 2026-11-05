@@ -4,3 +4,6 @@
 .muse
 .claude
 .agents
+
+# Standalone Bzlmod example; consumed through @wrist, not main-repo packages.
+examples/wrist_repo

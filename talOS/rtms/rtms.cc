@@ -94,8 +94,9 @@ class HeaderView {
     if (sized) {
       void* mapped =
           ::mmap(nullptr, sizeof(RTMSHeader), PROT_READ, MAP_SHARED, fd, 0);
-      if (mapped != MAP_FAILED)
+      if (mapped != MAP_FAILED) {
         header_ = static_cast<const RTMSHeader*>(mapped);
+      }
     }
     ::close(fd);
   }

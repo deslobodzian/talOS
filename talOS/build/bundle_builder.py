@@ -205,7 +205,16 @@ def main():
                 sys.exit(f"bundle: nodes '{seen[1]}' and '{name}' link different "
                          f"shared libraries named {lib['name']}")
         # Every label the robot config may name this node by.
-        targets = [t for t in (target, node.get("label")) if t]
+        targets = []
+        for label in (target, node.get("label")):
+            if not label:
+                continue
+            targets.append(label)
+            if label.startswith("@"):
+                repo, package = label.lstrip("@").split("//", 1)
+                # The config uses an apparent module name; node metadata uses
+                # Bazel's canonical repository name. Preserve both spellings.
+                targets.append("@" + repo.split("+", 1)[0] + "//" + package)
         manifest_nodes.append({
             "name": name,
             "targets": list(dict.fromkeys(targets)),

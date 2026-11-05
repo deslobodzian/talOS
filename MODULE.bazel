@@ -1,5 +1,10 @@
 module(name = "talos", version = "0.1.0")
 
+# Committed standalone subsystem example, consumed like a separate repository.
+# dev_dependency: a module that depends on @talos must not inherit it.
+bazel_dep(name = "wrist", version = "0.1.0", dev_dependency = True)
+local_path_override(module_name = "wrist", path = "examples/wrist_repo")
+
 bazel_dep(name = "apple_support", version = "2.0.0", repo_name = "build_bazel_apple_support")
 bazel_dep(name = "rules_cc", version = "0.2.18")
 bazel_dep(name = "googletest", version = "1.17.0.bcr.2")

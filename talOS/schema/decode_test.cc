@@ -31,6 +31,8 @@ TEST(Decode, NamesEveryFieldInDeclarationOrder) {
 }
 
 TEST(Decode, AnEnumValueWithNoNamePrintsItsNumber) {
+  // Deliberately tests decoding an unnamed wire enum value.
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
   schema_test::Inner inner{static_cast<schema_test::Mode>(9), 1.0f};
   EXPECT_EQ(DecodeToText(Of<schema_test::Inner>(), BytesOf(inner)),
             "{mode: 9, offset_m: 1}");

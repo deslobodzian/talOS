@@ -50,9 +50,11 @@ class EstimatorNode {
 class HardwareNode {
  public:
   explicit HardwareNode(talos::Node& node)
-      : ds_{node.publish<hardware::Packet>("/hw/state/driver_station")} {}
+      : ds_{node.publish<hardware::Packet>("/hw/state/driver_station")},
+        raw_{node.publish<hardware::Packet>("/hw/state")} {}
 
   talos::Publisher<hardware::Packet> ds_;
+  talos::Publisher<hardware::Packet> raw_;
 };
 
 struct FrameHolder {
@@ -64,13 +66,14 @@ struct FrameHolder {
     if (payload.size() != bytes.size()) return nullptr;
     flatbuffers::Verifier verifier{
         reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()};
-    if (!Talos::Telemetry::VerifySizePrefixedFrameBuffer(verifier))
+    if (!Talos::Telemetry::VerifySizePrefixedFrameBuffer(verifier)) {
       return nullptr;
+    }
     return Talos::Telemetry::GetSizePrefixedFrame(bytes.data());
   }
 
   const Frame* operator->() const { return get(); }
-  operator const Frame*() const { return get(); }
+  explicit operator const Frame*() const { return get(); }
   bool operator==(std::nullptr_t) const { return get() == nullptr; }
   bool operator!=(std::nullptr_t) const { return get() != nullptr; }
 };
@@ -107,6 +110,87 @@ std::map<std::string, const ChannelDef*> DictionaryMap(
     out[def.name] = &def;
   }
   return out;
+}
+
+TEST(TelemetryTest, SchemaLessStateIsSilentlyExcluded) {
+  const std::string kConfig = R"(
+[robot]
+period_us = 10000
+
+[studio]
+topic = "/talos/telemetry"
+
+[subsystems.demo]
+node = "//demo:node"
+
+[subsystems.hw]
+node = "//hw:node"
+
+[subsystems.hw.motors.m]
+can_id = 1
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)";
+  Sim sim = Sim::FromToml(kConfig);
+  sim.add<HardwareNode>("hw");
+  auto& shapes = sim.add<ShapesNode>("demo");
+
+  ::testing::internal::CaptureStderr();
+  auto& telemetry = sim.add<Telemetry>("telemetry");
+  const std::string stderr_output = ::testing::internal::GetCapturedStderr();
+  EXPECT_TRUE(stderr_output.empty()) << stderr_output;
+
+  const auto dict = DictionaryMap(telemetry);
+  EXPECT_TRUE(dict.contains("demo/state/position_m"));
+  EXPECT_TRUE(dict.contains("demo/status/samples_m/0"));
+  for (const auto& [name, channel] : dict) {
+    EXPECT_NE(name, "hw/state");
+    EXPECT_FALSE(name.starts_with("hw/state/") &&
+                 !name.starts_with("hw/state/driver_station/"));
+  }
+
+  shapes.mixed_.send(schema_test::Mixed{true,
+                                        4.5,
+                                        schema_test::Level::TOP,
+                                        1234,
+                                        {schema_test::Mode::HIGH, 1.25f},
+                                        0.8f});
+  sim.step(20ms);
+  const auto frame = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(frame, nullptr);
+  EXPECT_DOUBLE_EQ(DecodeChannels(telemetry, frame).at("demo/state/position_m"),
+                   4.5);
+}
+
+TEST(TelemetryTest, SchemaLessPoseTopicIsStillAnError) {
+  const std::string kConfig = R"(
+[robot]
+period_us = 10000
+
+[studio]
+topic = "/talos/telemetry"
+pose_topic = "/hw/state"
+
+[subsystems.hw]
+node = "//hw:node"
+
+[subsystems.hw.motors.m]
+can_id = 1
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)";
+  Sim sim = Sim::FromToml(kConfig);
+  sim.add<HardwareNode>("hw");
+  try {
+    sim.add<Telemetry>("telemetry");
+    FAIL() << "expected exception for schema-less pose_topic";
+  } catch (const std::invalid_argument& err) {
+    EXPECT_NE(
+        std::string{err.what()}.find("pose topic '/hw/state' has no schema"),
+        std::string::npos);
+  }
 }
 
 TEST(TelemetryTest, FlatteningAndUnits) {

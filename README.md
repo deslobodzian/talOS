@@ -64,6 +64,7 @@ To write your own mechanism, follow
 reference: [docs/NODE_DEVELOPMENT_GUIDE.md](docs/NODE_DEVELOPMENT_GUIDE.md).
 Layers and rules: [ARCHITECTURE.md](ARCHITECTURE.md). Names:
 [talOS/NAMING.md](talOS/NAMING.md). Deploying: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+Robot bring-up checklist: [docs/BRINGUP.md](docs/BRINGUP.md).
 
 ## Layout
 

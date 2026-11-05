@@ -13,7 +13,11 @@ template <typename T>
 void Print(const char* label, const T& value) {
   std::printf("%s ", label);
   const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
-  for (std::size_t i = 0; i < sizeof(T); ++i) std::printf("%02x", bytes[i]);
+  for (std::size_t i = 0; i < sizeof(T); ++i) {
+    // flatc constructors initialize every wire byte, including explicit
+    // padding. NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage)
+    std::printf("%02x", bytes[i]);
+  }
   std::printf("\n");
 }
 
@@ -41,8 +45,9 @@ int main() {
   *arrays.mutable_inners()->GetMutablePointer(0) = Inner(Mode::LOW, 3.5f);
   *arrays.mutable_inners()->GetMutablePointer(1) = Inner(Mode::HIGH, -0.125f);
   const unsigned char channel[] = {1, 2, 3, 254, 255};
-  for (int i = 0; i < 5; ++i)
+  for (int i = 0; i < 5; ++i) {
     arrays.mutable_channel_id()->Mutate(i, channel[i]);
+  }
   Print("arrays", arrays);
   Print("arrays_zero", Arrays());
   return 0;

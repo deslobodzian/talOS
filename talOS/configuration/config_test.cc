@@ -614,7 +614,13 @@ namespace fs = std::filesystem;
 std::vector<std::string> Strings(const toml::table& t, const char* key) {
   std::vector<std::string> out;
   if (const auto* arr = t[key].as_array()) {
-    for (auto&& v : *arr) out.emplace_back(*v.value<std::string>());
+    for (auto&& v : *arr) {
+      const auto value = v.value<std::string>();
+      EXPECT_TRUE(value.has_value());
+      if (value.has_value()) {
+        out.emplace_back(*value);
+      }
+    }
   }
   return out;
 }

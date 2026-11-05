@@ -32,6 +32,13 @@ silent. `config_golden_test` pins them.
 Devices are referred to by name; ids are assigned by sorting
 (subsystem, device).
 
+The deployable `//2026-robot/main_processor:robot_bundle` instead uses
+`main_processor/configuration/robot_field.toml`: it includes `robot.toml`
+and overrides only the controller address to the RoboRIO's `10.56.87.2`.
+Simulation and tests retain `robot.toml`'s loopback address. For a different
+controller, launch the bundle with `./run.sh --remote <ip>`; see deployment
+instructions below.
+
 ## Run in simulation
 
 From the repository root:

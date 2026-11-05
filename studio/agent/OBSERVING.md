@@ -9,7 +9,7 @@ curl localhost:5800/channels.json    # channel dictionary: names, units, enum la
 curl localhost:5800/system.json      # nodes, topics, health
 ```
 
-`/telemetry.json` is keyed by channel name: `channels["pose/vx"]` is
+`/telemetry.json` is keyed by channel name: `channels["pose_estimator/state/velocity/vx_mps"]` is
 `{"value": 1.2, "unit": "m/s"}`, `value` is `null` when there was no fresh
 reading (never zero-filled), `unit` is always present, and enum channels add
 an in-range `label`. Beside it: `chassis`, `stream_id`, `sequence_id`,
@@ -22,7 +22,7 @@ timestamp, and threshold scans. Read `README.md` for the full method
 reference; this note is the short Python path.
 
 - Start: `bazel run //studio:agent` (defaults: upstream
-  `ws://127.0.0.1:5800/telemetry`, serves `http://127.0.0.1:5802/rpc`).
+  `ws://127.0.0.1:5800/telemetry`, serves `http://127.0.0.1:5804/rpc`).
 - Transport: JSON-RPC 2.0 over `POST /rpc`. Batches and notifications
   (requests without `id`) work; notifications get no reply (`204`).
 - `GET /health` reports upstream connectivity, retained frame count,
@@ -62,6 +62,6 @@ reference; this note is the short Python path.
   values?" Combines `get_declared_graph`, `get_system_graph`,
   `describe_topic`, and `get_latest`.
 
-The RPC examples take `--url` (default `http://127.0.0.1:5802/rpc`) and
+The RPC examples take `--url` (default `http://127.0.0.1:5804/rpc`) and
 exit non-zero with a one-line reason when the agent or bridge is not up
 yet. `telemetry.py` takes `--bridge` (default `http://127.0.0.1:5800`).

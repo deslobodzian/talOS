@@ -175,20 +175,22 @@ introspect::Description HardwareNode::Describe() {
 void HardwareNode::BuildIntrospectionManifest() {
   introspection_manifest_.clear();
 
-  const auto add = [this]<class M>(event::SourceKind kind, std::string name) {
+  const auto add = [this]<class M>(event::SourceKind kind,
+                                   const std::string& name) {
     const auto id = static_cast<std::uint16_t>(introspection_manifest_.size());
     introspection_manifest_.push_back({
         .id = id,
         .kind = kind,
-        .name = std::move(name),
+        .name = name,
         .message_bytes = static_cast<std::uint32_t>(sizeof(M)),
         .alignment = static_cast<std::uint32_t>(alignof(M)),
         .schema = schema::Of<M>(),
     });
     return static_cast<std::size_t>(id);
   };
-  const auto add_packet = [&add](event::SourceKind kind, std::string name) {
-    return add.template operator()<Packet>(kind, std::move(name));
+  const auto add_packet = [&add](event::SourceKind kind,
+                                 const std::string& name) {
+    return add.template operator()<Packet>(kind, name);
   };
 
   // The fixed ends first, then one request per subsystem, so the fixed ids

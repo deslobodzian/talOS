@@ -53,7 +53,7 @@ Package managers: apt (Ubuntu/Debian), dnf (Fedora), pacman (Arch), brew (macOS)
 
 | Platform | Notes |
 |---|---|
-| Ubuntu 24.04+, Debian 13+, Fedora 39+, Arch | Ubuntu 22.04 ships GCC 11/12: too old |
+| Ubuntu 24.04+, Debian 13+, Fedora 39+, Arch | Ubuntu 22.04 ships GCC 11/12: too old. Fedora 45 no longer packages JDK 17: install Temurin 17 by hand (or `--no-rio`), then rerun |
 | macOS 13.4+ | Xcode Command Line Tools (`xcode-select --install`) |
 | Windows 11, Windows 10 22H2 | via WSL2 `Ubuntu-24.04` |
 
@@ -101,5 +101,5 @@ bazel run @hedron_compile_commands//:refresh_all
 |---|---|
 | `std::format` / `jthread` not found, `-std=c++23` unknown | GCC < 13. Install `g++-13`+ or use a supported distro |
 | macOS libc++ / availability errors | `-fexperimental-library` and min macOS 13.4 are already in `.bazelrc`; update Xcode CLT |
-| RIO build can't find the roboRIO compiler | `cd 2026-robot/controller_processor/rio && ./gradlew installRoboRioToolchain` (JDK 17). It lands in `~/.gradle/toolchains/frc/2025/roborio` (toolchain year lags GradleRIO) |
+| RIO build can't find the roboRIO compiler | `cd 2026-robot/controller_processor/rio && ./gradlew installRoboRioToolchain` (JDK 17). It lands in `~/.gradle/toolchains/frc/2025/roborio` (toolchain year lags GradleRIO); with the WPILib installer present GradleRIO uses `~/wpilib/2026/roborio` instead |
 | `$'\r': command not found`, `/usr/bin/env: 'bash\r'` | CRLF working copy. Windows: rerun `tools\setup.ps1`. WSL/Linux: `git ls-files -z -- '*.sh' '*gradlew' \| xargs -0 sed -i 's/\r$//'` |

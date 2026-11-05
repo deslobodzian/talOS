@@ -75,14 +75,14 @@ TEST(ClockOffset, DuplicateAndReorderedSamplesAreIgnored) {
     clock.Observe(3, kGatewayStartUs + 5000 * i,
                   kBridgeStartUs + 5000 * i + 500);
   }
-  const std::uint64_t last_sample = kGatewayStartUs + 5000 * 9;
+  const std::uint64_t last_sample = kGatewayStartUs + 5000ULL * 9;
   ASSERT_EQ(clock.offset_us(), kTrueOffsetUs + 500);
 
   // A duplicate of the last frame and the frame before it, both delivered
   // again 3 ms late (a retransmit, a reordering switch). Taken in, either
   // would widen the spread and keep a sample the gateway's own clock says
   // is not new.
-  const std::uint64_t late_us = kBridgeStartUs + 5000 * 9 + 3500;
+  const std::uint64_t late_us = kBridgeStartUs + 5000ULL * 9 + 3500;
   EXPECT_FALSE(clock.Observe(3, last_sample, late_us));
   EXPECT_FALSE(clock.Observe(3, last_sample - 5000, late_us + 10));
   EXPECT_EQ(clock.ignored_count(), 2u);
@@ -91,8 +91,8 @@ TEST(ClockOffset, DuplicateAndReorderedSamplesAreIgnored) {
   EXPECT_EQ(clock.spread_us(), 0u);
 
   // The next fresh frame is taken.
-  EXPECT_TRUE(
-      clock.Observe(3, last_sample + 5000, kBridgeStartUs + 5000 * 10 + 400));
+  EXPECT_TRUE(clock.Observe(3, last_sample + 5000,
+                            kBridgeStartUs + 5000ULL * 10 + 400));
   EXPECT_EQ(clock.offset_us(), kTrueOffsetUs + 400);
   EXPECT_EQ(clock.window_count(), 11u);
 }
