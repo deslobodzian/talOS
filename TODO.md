@@ -14,7 +14,7 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
   - target freshness is measured from when the node receives the target (`Subscription::fresh()`, `talOS/node/node.cc`), not from a sender timestamp (`issued_ns` has been removed);
   - `DrivetrainState.timestamp_ns` is node time, not RoboRIO sample time (only odometry reads it, as its integration `dt`).
   - Measure from the launcher's `.tlog`s (`bazel run //talOS/launcher:log_dump -- <dir>`): `/hw/state` inter-arrival (median about 5 ms, p99 under 10 ms, no gap of 100 ms while enabled); target age at each drivetrain tick (about 25 ms at most, never `command_timeout_us`); loop lateness in Studio's system view.
-  - Then inject faults: `SIGSTOP` the operator interface for 50 ms and 200 ms (200 ms must go neutral within `command_timeout_us` plus a tick; there is no arbiter any more, so each subsystem times out its own lane), `SIGSTOP` the drivetrain for 80 ms, unplug the RIO Ethernet while the wheels spin. Also measure the stick → drive request median now that the arbiter hop is gone (baseline 4.98 ms with it).
+  - Then inject faults: `SIGSTOP` the `driver` node (chassis) and the `teleop` node (mechanism buttons) for 50 ms and 200 ms (200 ms must go neutral within `command_timeout_us` plus a tick; each subsystem times out its own lane), `SIGSTOP` the drivetrain for 80 ms, unplug the RIO Ethernet while the wheels spin. Also measure stick → drive request median on the real link (sim: 2.99 ms; old arbiter baseline 4.98 ms).
 - [ ] Measure loop lateness on the Mini. Node binaries and the bridge now request realtime scheduling (`talos::process::ConfigureRealtime`: Mach time-constraint policy on macOS, `SCHED_FIFO` + `mlockall` on Linux; `TALOS_REALTIME=0` disables) and nodes without message callbacks drain only before their own timers; neither has been measured on the robot. Check that the Mach policy is accepted for every node period and that no node prints the "realtime scheduling incomplete" line.
 
 ## Found, not fixed
@@ -26,11 +26,22 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
 - [x] CI never runs `--describe-only` on the real configs. Fixed: added `talos_graph_test` in `talOS/build/contract.bzl` and wired `graph_test` targets in `2026-robot/main_processor/configuration/BUILD` and `examples/superstructure/config/BUILD`.
 - [x] Complete D1 acceptance. Done: mode generation stamps every target, regressions in C++ and Python, live sim fault table, stick-to-request median 2.99 ms. `GenericTarget` is gone (D4). See `docs/HANDOFF_AUTOMATIC_WIRING.md`.
 - [x] The selected target source is in the node's registry row and shown in Studio's system view.
-- [ ] Automatic wiring is verified only on macOS in simulation: run the Linux build, `phoenixTest`, and CI's clang-format-18/clang-tidy-18/buildifier on `agent/automatic-wiring` before merging to `main`.
+- [ ] Automatic wiring (D1-D6) is verified only on macOS in simulation. A draft PR from `agent/automatic-wiring` to `main` runs CI: the Linux build and tests (wpimath Linux artifacts never built), `clang-format-18` (local formatting used 21), and `buildifier` on changed files. Run `clang-tidy-18` by hand if CI does not. Fix what fails, then merge. `phoenixTest` still needs a machine with the macOS SDK GradleRIO wants (or Linux).
+
+## Next for agents (automatic-wiring follow-ups)
+
+Read `docs/HANDOFF_AUTOMATIC_WIRING.md` "Status at the 2026-11-04 evening stop" first.
+
+- [ ] Get the draft PR's CI green (item above). Do not merge red.
+- [ ] Python subsystem authors cannot exercise their `[[teleop.bindings]]` in a Python `Sim`: `//talOS/teleop:node` is C++ only. If wanted, expose it the sanctioned way (`TALOS_EXPORT_NODE` + `talos.cpp_node`, as `examples/superstructure/py` does) with a `talos.testing` test, and note that the declared-graph API it needs is C++-only by design (handoff "Decisions"). An unused `libteleop.so` was removed rather than kept without a consumer.
+- [ ] `//talOS/telemetry:node` skips topics without a schema (today `/hw/state`, the raw hardware packet) and prints that once to stderr. Decide whether `/hw/state` gets a descriptor or stays out of telemetry.
+- [ ] Studio: `studio/bridge/telemetry.h:167` still cites the old channel name `pose/vx` in a comment; channels are now `<owner>/<role>/<field>` (e.g. `pose_estimator/state/velocity/vx_mps`). Check Studio views for any remaining assumption of the old names on the actual page.
+- [ ] Lint warnings left on purpose: `target/auto` lanes nothing writes (see Decisions), unit-suffix warnings on `examples/superstructure` intake params (`eject_ms`, `eject_volts`, `hold_volts`, `intake_volts`). Renaming those params touches the example's C++ and Python nodes together.
+- [ ] Local cleanup, ask the user first: worktrees under `.muse/` and the local `wiring/*` branches are merged and no longer needed.
 
 ## Tooling
 
-- [ ] Timing measurement needs: `log_dump` payload decoding (it prints sizes only) and a telemetry channel for the DS link offset. Done: hardware-state age (`HardwareLink::age()`, `/hw/status` `state_age_us`) and per-subsystem bridge timeouts (`/hw/status` `timed_out_mask`, shown in Studio as `bridge/*`).
+- [ ] Timing measurement needs a telemetry channel for the DS link offset. Done: `log_dump` decodes payloads to named fields (D2), hardware-state age (`HardwareLink::age()`, `/hw/status` `state_age_us`) and per-subsystem bridge timeouts (`/hw/status` `timed_out_mask`, shown in Studio as `hw/status/*`).
 - [x] `tools/deploy.sh enable-boot` now generates/installs a macOS `launchd` plist (`/Library/LaunchDaemons/org.talos.robot.plist`) on Darwin.
 - [ ] Shooter and intake monitors (only the drivetrain has `monitor` and `send_target`, and neither is in the bundle) and a bring-up checklist in `docs/`.
 - [x] `tools/new_subsystem.py` unit tests (`//tools:new_subsystem_test`) added for `check_name`, `plan` (with custom `--robot`, checking the regenerated manifest), and `--standalone` Bzlmod repository generation.
@@ -40,7 +51,7 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
 
 Done: `bazel run //tools:new_subsystem -- <name> --lang cpp|py`; `talos_messages(deps = [...])` (a schema includes another package's types) with a guard against an empty package path; nested structs in the Python message codec; `@repo//` node labels through the names lint, `node_target` and `ResolveBinary`, with bundle-manifest overrides matching both label spellings. Proven with scratch modules only (an external node built, its baked label passed the lint, `--describe-only` was clean); no real second repo exists yet.
 
-- [ ] Prove it with a real second repo (a wrist, say) consumed through `bazel_dep` + `local_path_override`, launched as `@wrist//:node` and bundled. Bundling an external node (`bundle_builder.py`, the manifest `label`) is untested.
+- [ ] Prove it with a real second repo (a wrist, say) consumed through `bazel_dep` + `local_path_override`, launched as `@wrist//:node` and bundled. A throwaway `@wrist//:node` repo has been built and launched (D5); a committed one, and bundling an external node (`bundle_builder.py`, the manifest `label`), are not.
 - [x] Split subsystem defaults from robot overrides: `ParseRobotConfig` supports `defaults = "..."` in `[[subsystems]]` and `[subsystem]`, deep-merging subsystem device/param defaults with robot-level overrides (`//talOS/configuration:test`).
 - [x] Shared messages package (`//talOS/msgs:geometry` and `//talOS/msgs:control`, ROS `*_msgs` style) added with C++ and Python `Sim` tests.
 - [x] `tools/new_subsystem.py` scaffolds a `talos::Target`/`talos.Target` consumer of its `/<sub>/target/<source>` lanes, the §11 test matrix, and a commented `[targets]` policy, plus `--standalone DIR` for standalone Bzlmod subsystem repos.
@@ -51,7 +62,7 @@ Done: `bazel run //tools:new_subsystem -- <name> --lang cpp|py`; `talos_messages
 - [x] Studio slimmed in place: the Tauri shell, `rules_rust`/crate_universe, the UDP path (port 5801, `[studio] udp_port`) and `package-lock.json` are gone; the bridge serves the web UI and WebSocket only. The schema moved to `//talOS/telemetry`, so robot code no longer depends on `studio/`.
 - [ ] Keep the headless agent server (`//studio:agent`, port 5802) and `ws`, or remove them?
 - [ ] Studio post-match replay (`studio_bridge --replay-dir <session>`) and a topic inspector/publisher, which would replace the per-subsystem `monitor`/`send_target` binaries.
-- [x] `operator_interface` runs on `talos::DriverStation` (`/hw/state/driver_station`) and writes the teleop lanes; button masks became 1-based `shoot_button`/`intake_button`.
+- [x] Teleop is split: the `driver` node (`2026-robot/main_processor/driver`) drives the chassis from `talos::DriverStation`; mechanism buttons are `[[teleop.bindings]]` in each subsystem's TOML, written by `//talOS/teleop:node`.
 - [x] `examples/superstructure/config/robot_py.toml` now uses top-level `include = "robot.toml"` and overrides only `node =` on `[[subsystems]]`; unknown top-level keys in `robot.toml` are rejected.
 - [ ] When the RIO link drops, should odometry hold the pose (the old behaviour) or keep integrating the last velocities? (See "Found, not fixed".)
 - [ ] Freshness counts from receipt, so a stalled consumer (Python GC, CPU starvation) that drains a backlog sees old targets as fresh for another `command_timeout_us`; only the RIO's observed-age check bounds the hardware sample, not the target's age. Nodes without message callbacks now drain only before their own timers, so receipt is the drain and the bound loosens by at most one node period. Acceptable for Python nodes? [read]
@@ -61,11 +72,11 @@ Done: `bazel run //tools:new_subsystem -- <name> --lang cpp|py`; `talos_messages
 
 - [ ] Windows checkouts get CRLF for everything except `*.sh` and `gradlew` (`* text=auto` plus `core.autocrlf`). Tests that edit TOML as strings (`ConfigWith` in `2026-robot/main_processor/drivetrain/node_test.cc`) then fail when run from WSL against `/mnt/c`. Either `* text=auto eol=lf`, or always clone inside WSL (`docs/INSTALL.md` recommends it).
 - [x] Fixed doc drift in `2026-robot/main_processor/drivetrain/README.md` and `subsystems/intake.toml`.
-- [ ] The intake uses a fixed `INTAKE_RPS` whatever the ask, so the operator interface's `intake_target_rps` has no effect (`intake.py`). [read]
+- [ ] The intake uses a fixed `INTAKE_RPS` whatever the ask (`intake.py`), so the `roller_velocity_rps` in its `[[teleop.bindings]]` only switches it on. [read]
 - [ ] `talOS/` still knows about Studio by label: `config_parser.h` defaults the bridge label and webroot, and the launcher has a `StudioBridge` class. There is no build dependency.
 
 ## Written but never run
 
 - [ ] `tools/setup.ps1` install mode (only `-Check` ran), including the stop when the WSL default user is root; `tools/setup.sh` on macOS (Homebrew), Fedora (dnf) and Arch (pacman). `setup.sh` ran end to end on Ubuntu 24.04 only.
-- [ ] `./sim.sh` end to end (WPILib sim, Studio) and the RoboRIO Gradle tasks (`phoenixTest`, `buildRio`): untouched, not re-run.
-- [ ] Anything on a Mac: the build, the tests, the bundle, `deploy.sh`.
+- [ ] `./sim.sh` with the WPILib RoboRIO sim (only `--sim-gateway`, with and without Studio, has run since automatic wiring) and `phoenixTest`; `buildRio` compiles.
+- [ ] `deploy.sh` on a Mac. The build, tests, bundle (`bundle_test`) and sim run on macOS arm64.
