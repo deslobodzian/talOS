@@ -1,0 +1,7 @@
+[subsystems.roller.motors.motor]
+can_id = 1
+
+[[subsystems.roller.teleop.bindings]]
+pov = 315
+pov_index = 3
+on_toggle = { velocity_rps = 60.0 }

@@ -2,7 +2,6 @@
 
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -21,9 +20,13 @@ class BundleTest(unittest.TestCase):
         wrist = next(node for node in manifest["nodes"] if node["name"] == "wrist")
         self.assertIn("@wrist//:node", wrist["targets"])
         self.assertIn("@@wrist+//:node", wrist["targets"])
-        with tempfile.TemporaryDirectory() as tmp:
-            moved = os.path.join(tmp, "relocated", "bundle")
-            shutil.copytree(os.path.realpath(source), moved, symlinks=True)
+        deploy = runfiles.Create().Rlocation("_main/tools/deploy.sh")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            prefix = os.path.join(tmp, "prefix")
+            subprocess.run(
+                ["bash", deploy, "install", source, "--prefix", prefix],
+                check=True, capture_output=True, text=True, timeout=120)
+            moved = os.path.join(prefix, "current")
             logs = os.path.join(tmp, "logs")
             proc = subprocess.run(
                 ["./run.sh", "--describe-only"], cwd=moved,

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <numbers>
 
+#include "autonomous/trajectory.h"
 #include "drivetrain/drive_message_generated.h"
 #include "geometry/geometry_generated.h"
 #include "intake/intake_message_generated.h"
@@ -29,6 +30,10 @@ class Autonomous {
         yaw_tolerance_{node.param("yaw_tolerance_rad", 0.05)},
         max_linear_{node.param("max_linear_mps", 2.0)},
         max_angular_{node.param("max_angular_radps", 3.0)},
+        field_length_{node.param("field_length_m", 16.54)},
+        field_width_{node.param("field_width_m", 8.21)},
+        kp_xy_{node.param("xy_feedback_per_m_mps", 1.0)},
+        kp_yaw_{node.param("yaw_feedback_per_rad_radps", 1.0)},
         feed_duration_{std::chrono::microseconds{
             node.param<int>("feed_duration_us", 500000)}},
         pose_{node.subscribe<geometry::PoseEstimate>("/pose_estimator/state")},
@@ -45,6 +50,7 @@ class Autonomous {
   void update() {
     if (!ds_.enabled() || !ds_.autonomous()) {
       phase_.go(Phase::kIdle);
+      trajectory_started_ = false;
       if (!released_) {
         drive_.release();
         shooter_.release();
@@ -73,30 +79,35 @@ class Autonomous {
       shooter = 0;
       if (pose_.fresh() && pose_->valid()) {
         const auto& p = pose_->pose();
-        // Red uses the same waypoint rotated pi about the field origin.
-        const double x = red_ ? -target_x_ : target_x_;
-        const double y = red_ ? -target_y_ : target_y_;
-        const double yaw = target_yaw_ + (red_ ? std::numbers::pi : 0.0);
-        const double dx = x - p.x_m(), dy = y - p.y_m();
-        const double da =
-            std::remainder(yaw - p.yaw_rad(), 2 * std::numbers::pi);
-        if (std::isfinite(dx) && std::isfinite(dy) && std::isfinite(da)) {
-          const double distance = std::hypot(dx, dy);
-          if (distance <= position_tolerance_ &&
-              std::abs(da) <= yaw_tolerance_) {
-            phase_.go(Phase::kHold);
-          } else {
-            // Unit-gain position/heading feedback, with a vector speed limit.
-            const double scale =
-                distance > max_linear_ ? max_linear_ / distance : 1.0;
-            const double vx = dx * scale, vy = dy * scale;
-            const double c = std::cos(p.yaw_rad()), s = std::sin(p.yaw_rad());
-            drive = drivetrain::ChassisTarget{
-                vx * c + vy * s, -vx * s + vy * c,
-                std::clamp(da, -max_angular_, max_angular_)};
-            if (intake_state_.fresh() && !intake_state_->beam_broken()) {
-              intake = intake_velocity_;
-            }
+        if (!trajectory_started_) {
+          auto target = TrajectorySample{0, target_x_, target_y_, target_yaw_};
+          if (red_) {
+            target.x_m = field_length_ - target.x_m;
+            target.y_m = field_width_ - target.y_m;
+            target.yaw_rad = WrapAngle(target.yaw_rad + std::numbers::pi);
+          }
+          trajectory_ = Trajectory::FromPoses(
+              p, geometry::Pose2d{target.x_m, target.y_m, target.yaw_rad},
+              max_linear_, max_angular_);
+          trajectory_started_ = true;
+          trajectory_start_ = phase_.time_in_state();
+        }
+        const double elapsed = std::chrono::duration<double>(
+                                   phase_.time_in_state() - trajectory_start_)
+                                   .count();
+        const auto desired = trajectory_.SampleAt(elapsed);
+        const double dx = desired.x_m - p.x_m(), dy = desired.y_m - p.y_m();
+        const double da = WrapAngle(desired.yaw_rad - p.yaw_rad());
+        if (elapsed >= trajectory_.total_time_s() &&
+            std::hypot(dx, dy) <= position_tolerance_ &&
+            std::abs(da) <= yaw_tolerance_) {
+          phase_.go(Phase::kHold);
+        } else {
+          drive =
+              HolonomicController{kp_xy_, kp_yaw_, max_linear_, max_angular_}
+                  .Calculate(desired, p);
+          if (intake_state_.fresh() && !intake_state_->beam_broken()) {
+            intake = intake_velocity_;
           }
         }
       }
@@ -112,6 +123,10 @@ class Autonomous {
   double shooter_velocity_, intake_velocity_, feed_velocity_;
   double target_x_, target_y_, target_yaw_;
   double position_tolerance_, yaw_tolerance_, max_linear_, max_angular_;
+  double field_length_, field_width_, kp_xy_, kp_yaw_;
+  Trajectory trajectory_;
+  talos::Duration trajectory_start_{};
+  bool trajectory_started_ = false;
   talos::Duration feed_duration_;
   talos::Subscription<geometry::PoseEstimate> pose_;
   talos::Subscription<shooter::ShooterState> shooter_state_;

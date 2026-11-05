@@ -34,6 +34,26 @@ jobs:
     - name: Test
       run: bazel test //... --noshow_progress --test_output=errors
 
+  build-macos:
+    name: Bazel Build (macOS)
+    runs-on: macos-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+
+    - name: Setup bazel-action
+      uses: bazel-contrib/setup-bazel@0.19.0
+      with:
+        bazelisk-cache: true
+        disk-cache: ${{ github.workflow }}
+        repository-cache: true
+
+    - name: Build
+      run: bazel build //... --noshow_progress --test_output=errors
+
+    - name: Test
+      run: bazel test //... --noshow_progress --test_output=errors
+
   rio-adapter:
     name: RIO adapter (GradleRIO)
     runs-on: ubuntu-latest

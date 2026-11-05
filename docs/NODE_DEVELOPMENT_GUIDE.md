@@ -69,6 +69,7 @@ Handles are named by their device key in the subsystem config
 | `talos::DriverStation ds{node}`: `connected()`, `enabled()`, `autonomous()`, `teleop()`, `test()`, `estop()`, `alliance()`, `match_time()`, `joystick(port)` → `axis(i)`, `button(n)` (1-based), `pov(i)` | `talos.DriverStation(node)`, same as properties/methods |
 | `talos::robot_enabled(node)` | `talos.robot_enabled(node)` |
 | `node.extension<talos::HardwareLink>().sample_time()`: node-clock `Time` the latest hardware state was sampled at, `nullopt` while stale or before the bridge's clock mapping converges (8 states) | `talos.hardware_sample_time_ns(node)` (int ns, or `None`) |
+| `node.extension<talos::HardwareLink>().fresh()` / `.fresh(max_age)` and `.age()` | `link = talos.HardwareLink(node)`; `link.fresh()` / `link.fresh(max_age)` (`None` uses command timeout; seconds or `datetime.timedelta`); `link.age` (float seconds, `math.inf` before the first state); `link.sample_time` (int ns or `None`) |
 
 Every motor not set during an `update()` is sent neutral, and all are neutral
 while the robot is disabled. Units are rotations, rotations/s, volts, amps.
@@ -125,8 +126,14 @@ scale = 60.0                   # in the field's unit
 deadband_frac = 0.05           # optional deadband [0, 1)
 ```
 
-While held or deflected past deadband, `teleop` publishes active targets with the
-bound fields encoded; released or in neutral, it calls `release()`.
+Bindings select exactly one `button`, `axis` or `pov`. A `pov` is a compass
+direction in degrees (0, 45, ..., 315); optional `pov_index` selects hat 0..3.
+Button and POV bindings require exactly one nonempty scalar table:
+`while_held = { ... }` or `on_toggle = { ... }`. A toggle changes on the
+rising edge and resets on disable, leaving teleop or joystick disconnect.
+While held, toggled on or deflected past deadband, `teleop` publishes active
+targets with the bound fields encoded; released or in neutral, it calls
+`release()`.
 
 Sources follow the topic segment rules; an unknown mode is a config error. A
 consumer reads its lanes without a callback, so it keeps draining right before

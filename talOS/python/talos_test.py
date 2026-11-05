@@ -1,6 +1,8 @@
 """The talos package, end to end through libtalos_node on talos.testing.Sim."""
 
 import enum
+import math
+from datetime import timedelta
 import unittest
 
 import talos
@@ -193,6 +195,37 @@ class DevicesTest(unittest.TestCase):
         self.assertEqual(lift.lift.position, 0.75)
         with self.assertRaisesRegex(talos.TalosError, "'elbow'"):
             hw.set_connected("lift", "elbow", False)
+
+    def test_hardware_link_freshness_and_age(self):
+        class Watcher:
+            def __init__(self, node):
+                self.link = talos.HardwareLink(node)
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        watcher = sim.add(Watcher, "lift")
+        link = watcher.link
+        self.assertFalse(link.fresh())
+        self.assertFalse(link.fresh(100))
+        self.assertEqual(link.age, math.inf)
+        self.assertIsNone(link.sample_time)
+        hw = SimHardware(sim)
+        sim.step(0.03)
+        self.assertFalse(talos.robot_enabled(sim.node("lift")))
+        self.assertTrue(link.fresh())
+        self.assertIsInstance(link.age, float)
+        self.assertGreaterEqual(link.age, 0)
+        self.assertLess(link.age, 0.1)
+        self.assertFalse(link.fresh(0))
+        self.assertFalse(link.fresh(link.age))
+        self.assertTrue(link.fresh(link.age + 1e-9))
+        self.assertTrue(link.fresh(timedelta(seconds=1)))
+        del hw
+        sim.step(0.15)
+        self.assertFalse(link.fresh())
+        # A queued final state may drain after the publisher is gone.
+        self.assertGreaterEqual(link.age, 0.1)
+        self.assertTrue(link.fresh(1))
+        self.assertFalse(link.fresh(timedelta(milliseconds=100)))
 
     def test_hardware_sample_time_converges_and_goes_stale(self):
         sim = Sim.from_toml(ROBOT_TOML)

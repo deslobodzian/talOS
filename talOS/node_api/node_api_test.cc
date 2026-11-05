@@ -500,6 +500,40 @@ TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   EXPECT_EQ(talos_hardware_sample_time(node, &sampled), 0);
 }
 
+TEST_F(NodeApi, HardwareFreshnessAndAge) {
+  Roller roller;
+  TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  int64_t age = -1;
+  EXPECT_EQ(talos_hardware_fresh(node, -1), 0);
+  EXPECT_EQ(talos_hardware_fresh(node, INT64_MAX), 0);
+  EXPECT_EQ(talos_hardware_age(node, &age), 0);
+  EXPECT_EQ(age, -1);
+  EXPECT_EQ(talos_hardware_age(node, nullptr), TALOS_ERR);
+  EXPECT_EQ(talos_hardware_age(nullptr, &age), TALOS_ERR);
+  EXPECT_EQ(talos_hardware_fresh(nullptr, -1), TALOS_ERR);
+
+  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK);
+  EXPECT_EQ(talos_robot_enabled(node), 0);
+  EXPECT_EQ(talos_hardware_fresh(node, -1), 1);
+  ASSERT_EQ(talos_hardware_age(node, &age), 1);
+  EXPECT_GE(age, 0);
+  EXPECT_LT(age, 100 * kMs);
+  EXPECT_EQ(talos_hardware_fresh(node, 0), 0);
+  EXPECT_EQ(talos_hardware_fresh(node, age), 0);
+  EXPECT_EQ(talos_hardware_fresh(node, age + 1), 1);
+
+  talos_sim_hardware_destroy(hw);
+  ASSERT_EQ(talos_sim_step(sim_, 150 * kMs), TALOS_OK);
+  EXPECT_EQ(talos_hardware_fresh(node, -1), 0);
+  EXPECT_EQ(talos_hardware_fresh(node, 1000 * kMs), 1);
+  ASSERT_EQ(talos_hardware_age(node, &age), 1);
+  // A queued final state may drain after the hardware publisher is gone.
+  EXPECT_GE(age, 100 * kMs);
+}
+
 // --- Driver Station ------------------------------------------------------
 
 int32_t BuildPilot(TalosNode* node, void* user) {

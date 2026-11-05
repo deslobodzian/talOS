@@ -1,0 +1,8 @@
+[subsystems.roller.motors.motor]
+can_id = 1
+
+[[subsystems.roller.teleop.bindings]]
+axis = 0
+field = "velocity_rps"
+scale = 1.0
+on_toggle = { velocity_rps = 2.0 }

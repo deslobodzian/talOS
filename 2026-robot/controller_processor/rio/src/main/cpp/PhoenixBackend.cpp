@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <ctre/phoenix6/controls/DutyCycleOut.hpp>
+#include <ctre/phoenix6/controls/Follower.hpp>
 #include <ctre/phoenix6/controls/MotionMagicVoltage.hpp>
 #include <ctre/phoenix6/controls/NeutralOut.hpp>
 #include <ctre/phoenix6/controls/PositionVoltage.hpp>
@@ -26,6 +27,9 @@ void SetGains(Slot& slot, const hw::Gains& gains) {
   slot.kV = gains.v;
   slot.kA = gains.a;
   slot.kG = gains.g;
+  slot.GravityType = gains.gravity_type == hw::GravityType::kArmCosine
+                         ? ph::signals::GravityTypeValue::Arm_Cosine
+                         : ph::signals::GravityTypeValue::Elevator_Static;
 }
 bool Fresh(const ph::BaseStatusSignal& signal) {
   return signal.GetStatus().IsOK() &&
@@ -358,6 +362,17 @@ bool PhoenixBackend::Read(hw::State& s) {
                            std::isfinite(volts.GetValue().value()) &&
                            std::isfinite(amps.GetValue().value());
     out.voltage = effort_ok ? volts.GetValue().value() : 0.0;
+    // Phoenix opposition changes the follower's effective rotor polarity.
+    // Expose the configured mechanism frame, not that dynamically flipped
+    // controller frame, just as the platform simulation backends do.
+    const auto& motor_config = config_.motors[i];
+    if (motor_config.master_id != 0 && motor_config.oppose_master) {
+      out.voltage = -out.voltage;
+      if (motor_config.feedback == hw::Feedback::kRotor) {
+        out.position_rot = -out.position_rot;
+        out.velocity_rps = -out.velocity_rps;
+      }
+    }
     out.stator_current_a = effort_ok ? amps.GetValue().value() : 0.0;
     out.valid = Fresh(p) && Fresh(v) && std::isfinite(out.position_rot) &&
                 std::isfinite(out.velocity_rps);
@@ -467,6 +482,34 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
     const auto& r = commands[i];
     auto& m = *motors_[i];
     ctre::phoenix::StatusCode result;
+    const auto& config = config_.motors[i];
+    if (config.master_id != 0) {
+      const auto master =
+          std::find_if(config_.motors.begin(), config_.motors.end(),
+                       [&](const auto& candidate) {
+                         return candidate.id == config.master_id;
+                       });
+      if (master == config_.motors.end()) return false;
+      const auto master_index =
+          static_cast<std::size_t>(master - config_.motors.begin());
+      auto& position = motors_[master_index]->GetPosition(false);
+      auto& velocity = motors_[master_index]->GetVelocity(false);
+      if (commands[master_index].mode == hw::Mode::kNeutral ||
+          !Fresh(position) || !Fresh(velocity) ||
+          !std::isfinite(position.GetValue().value()) ||
+          !std::isfinite(velocity.GetValue().value())) {
+        result = m.SetControl(ph::controls::NeutralOut{});
+      } else {
+        result = m.SetControl(
+            ph::controls::Follower{master->can_id, config.oppose_master}
+                .WithUpdateFreqHz(0_Hz));
+      }
+      if (!result.IsOK()) {
+        Neutral();
+        return false;
+      }
+      continue;
+    }
     switch (r.mode) {
       case hw::Mode::kNeutral:
         result = m.SetControl(ph::controls::NeutralOut{});

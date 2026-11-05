@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 16u
+#define TALOS_NODE_ABI_VERSION 17u
 
 enum {
   TALOS_OK = 0,
@@ -178,6 +178,13 @@ int32_t talos_robot_enabled(TalosNode* node);
 // when there is none (no fresh state, or the bridge's clock mapping for its
 // gateway boot has not converged), TALOS_ERR on error.
 int32_t talos_hardware_sample_time(TalosNode* node, int64_t* out_ns);
+// HardwareLink::fresh: 1 when an accepted hardware state has arrived and
+// is younger than max_age_ns (or [robot] command_timeout_us when
+// max_age_ns < 0), 0 when stale or absent, TALOS_ERR on error.
+int32_t talos_hardware_fresh(TalosNode* node, int64_t max_age_ns);
+// HardwareLink::age: 1 with *out_ns set to the age (ns) of the latest
+// accepted hardware state, 0 when none has arrived, TALOS_ERR on error.
+int32_t talos_hardware_age(TalosNode* node, int64_t* out_ns);
 
 // One motor command for the next flush (Motor::set_* / stop).
 int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,

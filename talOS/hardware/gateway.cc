@@ -246,6 +246,21 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
          r.feedforward_v != 0);
     if (invalid) requests[i] = MotorRequest{m.id, Mode::kNeutral, 0, 0, 0};
   }
+  // Resolve followers after every master has been sanitized, independent of
+  // manifest order. Invalid local/remote feedback or an invalid master demand
+  // must neutralize its followers in the same transaction.
+  for (std::size_t i = 0; i < c.count; ++i) {
+    const auto master_id = config_.motors[i].master_id;
+    if (master_id == 0) continue;
+    for (std::size_t j = 0; j < c.count; ++j) {
+      if (config_.motors[j].id == master_id &&
+          requests[j].mode == Mode::kNeutral) {
+        requests[i] =
+            MotorRequest{config_.motors[i].id, Mode::kNeutral, 0, 0, 0};
+        break;
+      }
+    }
+  }
   if (c.digital_output_count != config_.digital_outputs.size() ||
       c.pwm_output_count != config_.pwm_outputs.size()) {
     ++state_.counters.rejected_command_count;

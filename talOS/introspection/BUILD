@@ -11,6 +11,7 @@ cc_library(
     hdrs = ["names.h"],
     deps = [
         "//talOS/events:events_core",
+        "//talOS/hardware",
         "//talOS/rtms",
     ],
 )

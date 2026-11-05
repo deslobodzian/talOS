@@ -23,6 +23,12 @@ max_observation_age_us = 1500000
 observation_future_tolerance_us = 20000
 # Drivetrain state older than this makes the estimate invalid (held).
 drivetrain_timeout_us = 100000
+initial_x_m = 0.0
+initial_y_m = 0.0
+initial_yaw_rad = 0.0
+field_length_m = 16.54
+field_width_m = 8.21
+max_innovation_m = 3.0
 
 # wpimath stateStdDevs: trust in the odometry-propagated state; larger trusts
 # observations more.
@@ -32,7 +38,7 @@ state_std_y_m = 0.1
 state_std_yaw_rad = 0.1
 
 # One sigma of each odometry step (one drivetrain sample) and of the prior on
-# the first pose (the field origin at the gyro's heading).
+# the first pose (the configured initial field pose).
 [factor_graph]
 odometry_std_x_m = 0.01
 odometry_std_y_m = 0.01

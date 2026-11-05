@@ -19,6 +19,47 @@ namespace {
 using namespace std::chrono_literals;
 namespace ds = talos::driver_station;
 
+TEST(TrajectoryTest, InterpolatesMultipleSamplesAndCompletes) {
+  const std::array<TrajectorySample, 3> samples{
+      {{0, 0, 0, 0, 1, 0, 0}, {1, 1, 0, 0, 1, 0, 0}, {2, 2, 0, 0, 1, 0, 0}}};
+  Trajectory trajectory{samples};
+  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0.5).x_m, 0.5);
+  EXPECT_DOUBLE_EQ(trajectory.SampleAt(1.5).x_m, 1.5);
+  EXPECT_DOUBLE_EQ(trajectory.total_time_s(), 2);
+  EXPECT_DOUBLE_EQ(trajectory.SampleAt(2).x_m, 2);
+  EXPECT_DOUBLE_EQ(trajectory.SampleAt(3).x_m, 2);
+  trajectory.FlipForRed(16.54, 8.21);
+  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).x_m, 16.54);
+  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).y_m, 8.21);
+  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).vx_mps, -1);
+}
+
+TEST(TrajectoryTest, RampStartsAndEndsAtRest) {
+  const auto trajectory = Trajectory::FromPoses(
+      geometry::Pose2d{0, 0, 0}, geometry::Pose2d{3, 0, 1}, 2, 3);
+  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).vx_mps, 0);
+  EXPECT_NEAR(trajectory.SampleAt(trajectory.total_time_s() / 2).vx_mps, 2,
+              1e-9);
+  const auto end = trajectory.SampleAt(trajectory.total_time_s());
+  EXPECT_DOUBLE_EQ(end.x_m, 3);
+  EXPECT_DOUBLE_EQ(end.yaw_rad, 1);
+  EXPECT_DOUBLE_EQ(end.vx_mps, 0);
+}
+
+TEST(TrajectoryTest, CombinesFeedforwardFeedbackAndRobotFrameLimits) {
+  const HolonomicController controller{2, 3, 10, 4};
+  const auto target =
+      controller.Calculate({0, 2, 1, std::numbers::pi / 2 + 0.2, 1, 2, 0.5},
+                           geometry::Pose2d{1, 1, std::numbers::pi / 2});
+  EXPECT_NEAR(target.vx_mps(), 2, 1e-9);
+  EXPECT_NEAR(target.vy_mps(), -3, 1e-9);
+  EXPECT_NEAR(target.omega_radps(), 1.1, 1e-9);
+  const auto limited = HolonomicController{1, 1, 2, 3}.Calculate(
+      {0, 100, 100, 0, 0, 0, 100}, geometry::Pose2d{});
+  EXPECT_NEAR(std::hypot(limited.vx_mps(), limited.vy_mps()), 2, 1e-9);
+  EXPECT_DOUBLE_EQ(limited.omega_radps(), 3);
+}
+
 std::string Runfile(const char* env) {
   std::string error;
   std::unique_ptr<rules_cc::cc::runfiles::Runfiles> files(
@@ -71,6 +112,8 @@ class AutonomousTest : public ::testing::Test {
     sim.step(480ms);
     Pose();
     sim.step(20ms);
+    Pose();
+    sim.step(20ms);
   }
 };
 
@@ -106,11 +149,17 @@ TEST_F(AutonomousTest, WaitsForSpeedFeedsThenRotatesDriveAndHolds) {
   Pose(0, 0, std::numbers::pi / 2);
   sim.step(20ms);
   EXPECT_NEAR(Drive().vx_mps(), 0, 1e-9);
-  EXPECT_NEAR(Drive().vy_mps(), -2, 1e-9);
+  EXPECT_DOUBLE_EQ(Drive().vy_mps(), 0);
+  Pose(0, 0, std::numbers::pi / 2);
+  sim.step(20ms);
+  EXPECT_LT(Drive().vy_mps(), 0);
   EXPECT_LT(Drive().omega_radps(), 0);
   EXPECT_EQ(Intake(), 30);
   Pose(2, 0, 0);
-  sim.step(20ms);
+  for (int i = 0; i < 100; ++i) {
+    Pose(2, 0, 0);
+    sim.step(20ms);
+  }
   EXPECT_DOUBLE_EQ(Drive().vx_mps(), 0);
   EXPECT_DOUBLE_EQ(Drive().vy_mps(), 0);
   EXPECT_DOUBLE_EQ(Drive().omega_radps(), 0);
@@ -136,8 +185,9 @@ TEST_F(AutonomousTest, InvalidAndStalePoseStopImmediately) {
 
 TEST_F(AutonomousTest, RedRotatesWaypointAndHeading) {
   StartDrive(true);
-  EXPECT_LT(Drive().vx_mps(), 0);
-  EXPECT_NEAR(std::abs(Drive().omega_radps()), 3, 1e-9);
+  EXPECT_GT(Drive().vx_mps(), 0);
+  EXPECT_GT(Drive().vy_mps(), 0);
+  EXPECT_GT(std::abs(Drive().omega_radps()), 0);
 }
 
 TEST_F(AutonomousTest, BeamStopsCollectionAndDriverStationLossReleases) {

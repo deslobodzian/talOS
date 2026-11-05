@@ -30,7 +30,6 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
 ## Found, not fixed
 
 - [ ] Studio's system view lists `sim_gateway` as "declared, never registered — it crashed at startup, or its binary is missing" while it runs: the gateway is not a talos node and never registers. Seen live with `./sim.sh --sim-gateway`.
-- [ ] `examples/external_subsystem/bundle_test.py` still relocates with `copytree(symlinks=True)`; the 2026 `bundle_test` installs through `deploy.sh`, which is what caught the `cp -r` bug below.
 
 ## Fixed on 2026-11-05
 
@@ -61,6 +60,16 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
 - [x] Sim-consistent config defaults: drivetrain drive `slot0.v = 0.81`, `max_velocity_rps = 14.5` and `cruise_velocity_rps = 14.5` in `drivetrain.toml`; intake roller `slot0` uses `p = 0.1`, `v = 0.12` in `intake.toml`. Real-robot verification/tuning remains required before commissioning.
 - [x] `PhysicsSimBackend` implements MotionMagic trapezoidal profiling and automatic swerve-to-Pigeon2 rotational coupling (`talOS/hardware/sim_physics.h`).
 - [x] `//2026-robot/main_processor/autonomous:node` writes `/drivetrain/target/auto`, `/shooter/target/auto` and `/intake/target/auto`: preload spinup → feed → alliance-aware waypoint + intake → hold. All six missing-auto graph warnings on `2026-robot` are eliminated.
+
+## 2027 platform / Wave 3 (2026-11-05)
+
+- [x] Hardware supports follower motors and `gravity_type`, with hardware sanity lints for invalid or physically inconsistent configurations.
+- [x] `HardwareLink.fresh()` / age are exposed through C ABI v17 and Python; `//talOS/python:api_parity_test` checks API parity.
+- [x] Teleop bindings support declarative `pov` inputs and `on_toggle` actions.
+- [x] `pose_estimator` supports initial pose seeding and vision `tag_count`, field-bounds and innovation outlier gating; reusable `Trajectory` and `HolonomicController` support autonomous motion.
+- [x] `sim_gateway` supports scriptable `--mode-schedule` and `--alliance`.
+- [x] `examples/external_subsystem/bundle_test.py` now installs through `deploy.sh`, exercising the real deployment path rather than relocating with `copytree`.
+- [x] CI includes a `macos-latest` job, and documentation drift is corrected for the current hardware, simulation, control and deployment APIs.
 
 ## Decisions taken
 

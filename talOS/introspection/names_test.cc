@@ -624,6 +624,70 @@ TEST(LintGraph, ErrorsSortAheadOfWarnings) {
       << Describe(diagnostics);
 }
 
+TEST(HardwareConfig, SensorVelocityLimitIsAdvisoryAndUsesMechanismRatio) {
+  hardware::Config config;
+  hardware::MotorConfig motor;
+  motor.name = "wrist";
+  motor.max_velocity_rps = 21;
+  motor.sensor_to_mechanism_ratio = 5;
+  motor.rotor_to_sensor_ratio = 100;
+  config.motors.push_back(motor);
+  EXPECT_TRUE(CheckHardwareConfig(config).empty());
+
+  config.motors.front().max_velocity_rps = 21.1;
+  const auto diagnostics = CheckHardwareConfig(config);
+  ASSERT_EQ(diagnostics.size(), 1u);
+  EXPECT_FALSE(HasError(diagnostics));
+  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING, "wrist", "105 rps"))
+      << Describe(diagnostics);
+}
+
+TEST(HardwareConfig, RioTrafficCountsMotorAndSensorFramesAtStatusFrequency) {
+  hardware::Config config;
+  config.motors.resize(3);
+  config.sensors.resize(4);
+  config.status_hz = 750;
+  EXPECT_TRUE(CheckHardwareConfig(config).empty());
+
+  config.status_hz = 751;
+  const auto diagnostics = CheckHardwareConfig(config);
+  ASSERT_EQ(diagnostics.size(), 1u);
+  EXPECT_FALSE(HasError(diagnostics));
+  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING, "rio", "15000 frames/s"))
+      << Describe(diagnostics);
+}
+
+TEST(HardwareConfig, OtherCanBusesDoNotCountTowardRioTraffic) {
+  hardware::Config config;
+  config.status_hz = 1000;
+  config.motors.resize(3);
+  config.sensors.resize(2);
+  ASSERT_EQ(CheckHardwareConfig(config).size(), 1u);
+  config.motors.front().bus = "canivore";
+  EXPECT_TRUE(CheckHardwareConfig(config).empty());
+  config.motors.front().bus = "rio";
+  config.sensors.front().bus = "canivore";
+  EXPECT_TRUE(CheckHardwareConfig(config).empty());
+}
+
+TEST(HardwareConfig, ReportsAllWarningsWithoutRejectingConfiguration) {
+  hardware::Config config;
+  config.status_hz = 1000;
+  config.motors.resize(4);
+  config.motors[0].name = "wrist";
+  config.motors[0].max_velocity_rps = 106;
+  config.motors[1].name = "shoulder";
+  config.motors[1].sensor_to_mechanism_ratio = 2;
+  const auto diagnostics = CheckHardwareConfig(config);
+  ASSERT_EQ(diagnostics.size(), 3u);
+  EXPECT_FALSE(HasError(diagnostics));
+  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING, "wrist", "105 rps"));
+  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING, "shoulder", "105 rps"));
+  EXPECT_TRUE(
+      Mentions(diagnostics, Severity::WARNING, "rio", "15000 frames/s"));
+  EXPECT_TRUE(CheckHardwareConfig(hardware::Config{}).empty());
+}
+
 TEST(LintGraph, RejectsTheTestNamespaceAndDuplicateNodeNames) {
   const std::vector<NodeShape> in_test_namespace = {
       {"drivetrain",

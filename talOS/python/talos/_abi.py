@@ -7,7 +7,7 @@ raise, with the C++ message, or with the Python exception a callback raised.
 import ctypes
 import os
 
-ABI_VERSION = 16
+_EXPECTED_ABI_VERSION = 17
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -127,6 +127,8 @@ _SIGNATURES = {
     "talos_device": (c_int64, [c_void_p, c_int32, c_char_p]),
     "talos_robot_enabled": (c_int32, [c_void_p]),
     "talos_hardware_sample_time": (c_int32, [c_void_p, _P(c_int64)]),
+    "talos_hardware_fresh": (c_int32, [c_void_p, c_int64]),
+    "talos_hardware_age": (c_int32, [c_void_p, _P(c_int64)]),
     "talos_motor_set": (c_int32, [c_void_p, c_int64, c_int32, c_double,
                                   c_double, c_int32]),
     "talos_motor_clamped_count": (c_int32, [c_void_p, c_int64, _P(c_uint64)]),
@@ -221,9 +223,9 @@ def _load():
             continue
         library = ctypes.CDLL(path)
         version = library.talos_abi_version()
-        if version != ABI_VERSION:
+        if version != _EXPECTED_ABI_VERSION:
             raise TalosError(f"{path} has ABI {version}, talos wants "
-                             f"{ABI_VERSION}")
+                             f"{_EXPECTED_ABI_VERSION}")
         signatures = dict(_SIGNATURES)
         if hasattr(library, "talos_sim_create"):
             signatures.update(_TESTING_SIGNATURES)

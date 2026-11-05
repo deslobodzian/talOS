@@ -45,6 +45,21 @@ are refused. This is a compatibility check, not authentication. Configuration
 validation rejects duplicate IDs/names/addresses, invalid numeric values, and
 remote encoder references that do not exist on the motor's bus.
 
+Motor tables may specify `follow = "master_motor"` and optional
+`oppose_master = true` (default false). The master must be a motor owned by
+the same subsystem on the same CAN bus; self-follow and follower chains are
+rejected. Followers use the master's output rather than their own demand,
+and neutralize when the master is neutral or loses valid feedback.
+Both simulation backends support same-direction and opposed followers.
+
+Each `[subsystems.<sub>.motors.<motor>.slot0]` (also `slot1`, `slot2`) accepts
+`gravity_type = "ElevatorStatic"` (default; alias `"Elevator"`) or
+`gravity_type = "ArmCosine"` (alias `"Arm"`). Gain `g` supplies constant
+elevator compensation or cosine arm compensation, respectively, with the arm
+angle measured in mechanism rotations and zero at horizontal. These fields
+and follower settings participate in the configuration fingerprint and wire
+format, so both endpoints must use the matching software version.
+
 A rejected configuration latches a `ConfigError` (`config_error.h`) on the
 gateway (`Gateway::config_error()`, cleared by the next success): device name,
 CAN bus, CAN ID, the operation attempted (e.g. `apply_talonfx_config`), the raw
@@ -65,7 +80,7 @@ Each closed-loop request selects gain slot 0, 1, or 2. Drive motors use rotor
 feedback divided by the configured mechanism ratio. Steering uses
 `RemoteCANcoder` with continuous wrapping. The backend uses standard voltage
 controls and does not require Phoenix Pro. TorqueCurrentFOC, FusedCANcoder,
-followers, and dynamic Motion Magic requests are not implemented. Duty-cycle
+and dynamic Motion Magic requests are not implemented. Duty-cycle
 encoder velocity is finite-difference across Reads.
 
 Besides motors and CAN sensors, the manifest accepts RIO digital inputs and

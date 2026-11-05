@@ -1,0 +1,6 @@
+[subsystems.roller.motors.motor]
+can_id = 1
+
+[[subsystems.roller.teleop.bindings]]
+pov = 45.0
+while_held = { velocity_rps = 1.0 }

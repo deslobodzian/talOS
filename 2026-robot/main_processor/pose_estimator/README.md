@@ -28,7 +28,7 @@ fails at startup):
   `Pose2` per integrated drivetrain sample. `BetweenFactorPose2` from
   `SwerveDrive4Kinematics.toTwist2d` (dx, dy) and the gyro's yaw change
   (dtheta), sigma `[factor_graph] odometry_std_*` per sample; a prior
-  (`prior_std_*`) on the first pose, the origin at the gyro's heading; each
+  (`prior_std_*`) on the configured initial pose; each
   accepted observation is a `PriorFactorPose2` on the sample nearer its
   time, moved by the odometry between the two along the constant twist
   between the bracketing samples (exact for constant velocity within a
@@ -38,6 +38,14 @@ fails at startup):
 
 ## Rules (both backends)
 
+- Both backends seed the first integrated sample with `initial_x_m`,
+  `initial_y_m`, and `initial_yaw_rad` (finite, default zero), independently
+  of the gyro's initial reading; subsequent gyro deltas change that heading.
+- Field dimensions `field_length_m` (16.54) and `field_width_m` (8.21)
+  must be finite and positive. Observations outside the inclusive field
+  rectangle or with no tags are rejected. A single-tag observation more
+  than `max_innovation_m` (3.0, finite and positive) from the current estimate
+  is rejected; multi-tag solves may relocalize across larger wheel-slip jumps.
 - A drivetrain sample is integrated once, when `sample_time_ns` increased,
   `modules_valid` and `yaw_valid` hold and every value is finite.
 - `valid` = odometry integrated at least once, the drivetrain message fresh

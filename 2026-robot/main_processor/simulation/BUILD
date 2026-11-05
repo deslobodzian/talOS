@@ -7,18 +7,18 @@ cc_binary(
     name = "sim_gateway",
     srcs = ["sim_gateway.cc"],
     deps = [
-        "//talOS/configuration:configuration",
-        "//talOS/hardware:hardware",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/hardware",
         "//talOS/introspection:describe",
-        "//talOS/process:process",
+        "//talOS/process",
     ],
 )
 
-# Fail-fast startup contract: no --config must exit nonzero (an unconfigured
-# gateway stamps config_id 0 and the graph runs dead), --describe must
-# answer. Hermetic: neither path touches sockets or shared memory.
+# Startup and scripted Driver Station contract, including UDP mode generations.
 py_test(
     name = "startup_test",
     srcs = ["startup_test.py"],
     data = [":sim_gateway"],
+    tags = ["exclusive"],
 )

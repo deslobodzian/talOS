@@ -59,6 +59,21 @@ py_test(
     ],
 )
 
+py_test(
+    name = "api_parity_test",
+    size = "small",
+    srcs = ["api_parity_test.py"],
+    data = [
+        "talos/_abi.py",
+        "//talOS/node_api:node_api.h",
+    ],
+    env = {
+        "TALOS_ABI_HEADER": "$(rlocationpath //talOS/node_api:node_api.h)",
+        "TALOS_ABI_PYTHON": "$(rlocationpath talos/_abi.py)",
+    },
+    deps = ["@rules_python//python/runfiles"],
+)
+
 # Prints the flatc C++ bytes of fixed //talOS/schema:test_messages values,
 # which messages_test compares the Python codec against.
 cc_binary(

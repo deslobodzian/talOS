@@ -113,43 +113,57 @@ def _check_teleop(teleop, sub_name):
             if not isinstance(entry, dict):
                 raise ManifestError(f"{entry_where} must be a table")
             for k in entry:
-                if k not in ("button", "axis", "port", "while_held", "field",
-                             "scale", "deadband_frac"):
+                if k not in ("button", "axis", "pov", "pov_index", "port",
+                             "while_held", "on_toggle", "field", "scale",
+                             "deadband_frac"):
                     raise ManifestError(f"{entry_where} unknown key '{k}'")
             has_button = "button" in entry
             has_axis = "axis" in entry
-            if (has_button and has_axis) or (not has_button and not has_axis):
+            has_pov = "pov" in entry
+            if sum((has_button, has_axis, has_pov)) != 1:
                 raise ManifestError(
-                    f"{entry_where}: binding must specify either 'button' or 'axis'")
+                    f"{entry_where}: binding must specify exactly one of 'button', 'axis', 'pov'")
+            if "pov_index" in entry and not has_pov:
+                raise ManifestError(f"{entry_where}.pov_index requires 'pov'")
+            if has_pov:
+                angle = entry["pov"]
+                if type(angle) is not int or angle not in range(0, 360, 45):
+                    raise ManifestError(f"{entry_where}.pov must be a compass angle")
+                index = entry.get("pov_index", 0)
+                if type(index) is not int or not 0 <= index < 4:
+                    raise ManifestError(f"{entry_where}.pov_index must be in [0, 3]")
             if "port" in entry:
                 p = entry["port"]
                 if not isinstance(p, int) or isinstance(p, bool) or p < 0 or p > 5:
                     raise ManifestError(
                         f"{entry_where}.port must be an integer in [0, 5]")
-            if has_button:
+            if has_button or has_pov:
                 for k in ("field", "scale", "deadband_frac"):
                     if k in entry:
                         raise ManifestError(
-                            f"{entry_where} button binding cannot have axis keys")
-                b = entry["button"]
-                if not isinstance(b, int) or isinstance(b, bool) or b < 1 or b > 32:
-                    raise ManifestError(
-                        f"{entry_where}.button must be an integer in [1, 32]")
-                if "while_held" not in entry:
-                    raise ManifestError(
-                        f"{entry_where} button binding missing 'while_held'")
-                wh = entry["while_held"]
-                if not isinstance(wh, dict):
-                    raise ManifestError(
-                        f"{entry_where}.while_held must be a table")
-                for fk, fv in wh.items():
-                    if isinstance(fv, (dict, list)):
+                            f"{entry_where} button/pov binding cannot have axis keys")
+                if has_button:
+                    b = entry["button"]
+                    if type(b) is not int or not 1 <= b <= 32:
                         raise ManifestError(
-                            f"{entry_where}.while_held.{fk} must be a scalar")
-            if has_axis:
-                if "while_held" in entry:
+                            f"{entry_where}.button must be an integer in [1, 32]")
+                actions = [k for k in ("while_held", "on_toggle") if k in entry]
+                if len(actions) != 1:
                     raise ManifestError(
-                        f"{entry_where} axis binding cannot have 'while_held'")
+                        f"{entry_where} requires exactly one of while_held/on_toggle")
+                action = actions[0]
+                values = entry[action]
+                if not isinstance(values, dict) or not values:
+                    raise ManifestError(
+                        f"{entry_where}.{action} must be a non-empty table")
+                for fk, fv in values.items():
+                    if type(fv) not in (bool, int, float, str):
+                        raise ManifestError(
+                            f"{entry_where}.{action}.{fk} must be a scalar")
+            if has_axis:
+                if "while_held" in entry or "on_toggle" in entry:
+                    raise ManifestError(
+                        f"{entry_where} axis binding cannot have action tables")
                 a = entry["axis"]
                 if not isinstance(a, int) or isinstance(a, bool) or a < 0 or a > 11:
                     raise ManifestError(

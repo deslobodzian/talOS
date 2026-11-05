@@ -54,6 +54,16 @@ def _positive(node, key, default):
     return value
 
 
+def _initial_pose(node):
+    values = []
+    for key in ("initial_x_m", "initial_y_m", "initial_yaw_rad"):
+        value = node.param(key, 0.0)
+        if not math.isfinite(value):
+            raise ValueError(f"pose_estimator: {key} must be finite, got {value}")
+        values.append(value)
+    return Pose2d(values[0], values[1], Rotation2d(values[2]))
+
+
 def _std_devs(node, table, prefix, defaults):
     return tuple(_positive(node, f"{table}.{prefix}_{axis}", default)
                  for axis, default in zip(("x_m", "y_m", "yaw_rad"), defaults))
@@ -93,11 +103,11 @@ class KalmanBackend:
         self.state_std = _std_devs(node, "kalman", "state_std",
                                    (0.1, 0.1, 0.1))
         self.estimator = None
+        self.initial_pose = _initial_pose(node)
 
     def start(self, time_s, yaw, positions):
-        # The field heading starts at the gyro's; x and y at the origin.
         self.estimator = SwerveDrive4PoseEstimator(
-            self.kinematics, yaw, positions, Pose2d(0.0, 0.0, yaw),
+            self.kinematics, yaw, positions, self.initial_pose,
             self.state_std, (1.0, 1.0, 1.0))
         self.estimator.updateWithTime(time_s, yaw, positions)
 
@@ -152,9 +162,10 @@ class FactorGraphBackend:
         self.yaw = Rotation2d()
         self.positions = None
         self.estimate = Pose2d()
+        self.initial_pose = _initial_pose(node)
 
     def start(self, time_s, yaw, positions):
-        origin = Pose2d(0.0, 0.0, yaw)
+        origin = self.initial_pose
         graph = self.gtsam.NonlinearFactorGraph()
         graph.add(self.gtsam.PriorFactorPose2(0, self._pose2(origin),
                                               self.prior_noise))
@@ -261,6 +272,9 @@ class PoseEstimator:
             node, "observation_future_tolerance_us", 20_000) / _US
         self.drivetrain_timeout_s = _positive(
             node, "drivetrain_timeout_us", 100_000) / _US
+        self.field_length_m = _positive(node, "field_length_m", 16.54)
+        self.field_width_m = _positive(node, "field_width_m", 8.21)
+        self.max_innovation_m = _positive(node, "max_innovation_m", 3.0)
         backend = node.param("backend")
         if backend == "kalman":
             self.backend = KalmanBackend(node, kinematics)
@@ -342,6 +356,14 @@ class PoseEstimator:
             return False
         if min(std_devs) <= 0 or self.first_ns is None:
             return False
+        if (o.tag_count < 1 or not 0.0 <= o.pose_x_m <= self.field_length_m
+                or not 0.0 <= o.pose_y_m <= self.field_width_m):
+            return False
+        if o.tag_count == 1:
+            current = self.backend.pose()
+            if math.hypot(o.pose_x_m - current.X(),
+                          o.pose_y_m - current.Y()) > self.max_innovation_m:
+                return False
         if o.sample_time_ns < self.first_ns:
             return False  # nothing to attach it to
         latest_s, time_s = self.latest_ns / _NS, o.sample_time_ns / _NS

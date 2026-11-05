@@ -4,7 +4,10 @@ load("//talOS/build:contract.bzl", "talos_cc_node")
 
 cc_library(
     name = "autonomous",
-    hdrs = ["autonomous.h"],
+    hdrs = [
+        "autonomous.h",
+        "trajectory.h",
+    ],
     include_prefix = "autonomous",
     strip_include_prefix = ".",
     deps = [

@@ -55,6 +55,147 @@ void StepBackend(Backend& backend, State& s, uint64_t& now_us, uint64_t step_us,
   }
 }
 
+TEST(SimGravity, ClosedLoopUsesSelectedSlotAndMechanismAngle) {
+  MotorConfig cfg = TestMotor(1, "arm", 1);
+  cfg.slots[1].g = 3.0;
+  for (const auto mode :
+       {Mode::kVelocity, Mode::kPosition, Mode::kMotionMagic}) {
+    MotorRequest req{1, mode, 1, 0.0, 0.5};
+    for (const double position : {0.0, 0.25, 0.5, 0.75, 1.0}) {
+      double volts = 0.0;
+      cfg.slots[1].gravity_type = GravityType::kElevatorStatic;
+      ASSERT_TRUE(sim::DriveVoltage(req, cfg, position, 0.0, 12.0, volts));
+      EXPECT_DOUBLE_EQ(volts, 3.5);
+      cfg.slots[1].gravity_type = GravityType::kArmCosine;
+      ASSERT_TRUE(sim::DriveVoltage(req, cfg, position, 0.0, 12.0, volts));
+      EXPECT_NEAR(volts, 0.5 + 3.0 * std::cos(position * 2.0 * std::acos(-1.0)),
+                  1e-12);
+    }
+    req.slot = 0;
+    double volts = 0.0;
+    ASSERT_TRUE(sim::DriveVoltage(req, cfg, 0.0, 0.0, 12.0, volts));
+    EXPECT_DOUBLE_EQ(volts, 0.5);
+  }
+}
+
+TEST(SimGravity, ProfiledMotionMagicIncludesGravityAndClampsVoltage) {
+  for (const auto type :
+       {GravityType::kElevatorStatic, GravityType::kArmCosine}) {
+    auto cfg = SingleMotorConfig();
+    cfg.motors[0].slots[0].g = 20.0;
+    cfg.motors[0].slots[0].gravity_type = type;
+    cfg.motors[0].cruise_velocity_rps = 1.0;
+    cfg.motors[0].acceleration_rps2 = 2.0;
+    cfg.motors[0].max_voltage = 5.0;
+    PhysicsSimBackend backend;
+    ASSERT_TRUE(backend.Configure(cfg));
+    std::array<MotorRequest, kMaxMotors> commands{};
+    commands[0] = {1, Mode::kMotionMagic, 0, 1.0, 0.0};
+    ASSERT_TRUE(backend.Apply(commands));
+    backend.Step(0.001);
+    EXPECT_DOUBLE_EQ(backend.applied_voltage(0), 5.0);
+    backend.Neutral();
+    backend.Step(0.001);
+    EXPECT_DOUBLE_EQ(backend.applied_voltage(0), 0.0);
+  }
+}
+
+TEST(SimFollowers, PhysicsResolvesOrderOppositionAndNeutral) {
+  for (const bool follower_first : {false, true}) {
+    for (const bool oppose : {false, true}) {
+      auto cfg = SingleMotorConfig();
+      auto follower = TestMotor(2, "follower", 2);
+      follower.master_id = 1;
+      follower.oppose_master = oppose;
+      cfg.motors.push_back(follower);
+      if (follower_first) std::swap(cfg.motors[0], cfg.motors[1]);
+      const std::size_t master = follower_first ? 1 : 0;
+      const std::size_t slave = 1 - master;
+      PhysicsSimBackend backend;
+      ASSERT_TRUE(backend.Configure(cfg));
+      std::array<MotorRequest, kMaxMotors> commands{};
+      commands[master] = Duty(1, 0.5);
+      commands[slave] = Duty(2, -0.9);  // Followers ignore independent demands.
+      ASSERT_TRUE(backend.Apply(commands));
+      backend.Step(0.005);
+      EXPECT_DOUBLE_EQ(backend.applied_voltage(master), 6.0);
+      EXPECT_DOUBLE_EQ(backend.applied_voltage(slave), oppose ? -6.0 : 6.0);
+      State state{};
+      ASSERT_TRUE(backend.Read(state));
+      EXPECT_DOUBLE_EQ(state.motors[slave].velocity_rps,
+                       state.motors[master].velocity_rps * (oppose ? -1 : 1));
+      backend.SetMotorConnected(1, false);
+      backend.Step(0.005);
+      EXPECT_DOUBLE_EQ(backend.applied_voltage(slave), 0.0);
+      backend.SetMotorConnected(1, true);
+      commands[master] = {};
+      ASSERT_TRUE(backend.Apply(commands));
+      backend.Step(0.005);
+      EXPECT_DOUBLE_EQ(backend.applied_voltage(slave), 0.0);
+      commands[master] = Duty(1, 0.5);
+      ASSERT_TRUE(backend.Apply(commands));
+      backend.Step(0.005);
+      backend.Neutral();
+      backend.Step(0.005);
+      EXPECT_DOUBLE_EQ(backend.applied_voltage(slave), 0.0);
+    }
+  }
+}
+
+TEST(SimFollowers, InvalidRemoteMasterFeedbackNeutralizesFollower) {
+  auto cfg = SingleMotorConfig();
+  cfg.motors[0].feedback = Feedback::kRemoteCANcoder;
+  cfg.motors[0].feedback_sensor_id = 99;  // Missing sensor is invalid.
+  auto follower = TestMotor(2, "follower", 2);
+  follower.master_id = 1;
+  cfg.motors.push_back(follower);
+  PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(cfg));
+  std::array<MotorRequest, kMaxMotors> commands{};
+  commands[0] = Duty(1, 0.5);
+  ASSERT_TRUE(backend.Apply(commands));
+  backend.Step(0.005);
+  EXPECT_DOUBLE_EQ(backend.applied_voltage(0), 0.0);
+  EXPECT_DOUBLE_EQ(backend.applied_voltage(1), 0.0);
+}
+
+TEST(SimFollowers, IdealMirrorsPositionVelocityAndNeutralInEitherOrder) {
+  for (const bool follower_first : {false, true}) {
+    for (const bool oppose : {false, true}) {
+      auto cfg = SingleMotorConfig();
+      auto follower = TestMotor(2, "follower", 2);
+      follower.master_id = 1;
+      follower.oppose_master = oppose;
+      cfg.motors.push_back(follower);
+      if (follower_first) std::swap(cfg.motors[0], cfg.motors[1]);
+      const std::size_t master = follower_first ? 1 : 0;
+      const std::size_t slave = 1 - master;
+      const double sign = oppose ? -1.0 : 1.0;
+      SimBackend backend;
+      ASSERT_TRUE(backend.Configure(cfg));
+      std::array<MotorRequest, kMaxMotors> commands{};
+      commands[master] = {1, Mode::kPosition, 0, 2.0, 0.0};
+      commands[slave] = Duty(2, 1.0);
+      ASSERT_TRUE(backend.Apply(commands));
+      State state{};
+      state.sample_time_us = 1000;
+      ASSERT_TRUE(backend.Read(state));
+      EXPECT_DOUBLE_EQ(state.motors[slave].position_rot, 2.0 * sign);
+      commands[master] = {1, Mode::kVelocity, 0, 3.0, 0.0};
+      ASSERT_TRUE(backend.Apply(commands));
+      state.sample_time_us += 10000;
+      ASSERT_TRUE(backend.Read(state));
+      EXPECT_DOUBLE_EQ(state.motors[slave].velocity_rps, 3.0 * sign);
+      EXPECT_DOUBLE_EQ(state.motors[slave].position_rot,
+                       state.motors[master].position_rot * sign);
+      backend.Neutral();
+      state.sample_time_us += 10000;
+      ASSERT_TRUE(backend.Read(state));
+      EXPECT_DOUBLE_EQ(state.motors[slave].velocity_rps, 0.0);
+    }
+  }
+}
+
 template <typename Sim>
 void CheckPowerHealth() {
   Sim backend;

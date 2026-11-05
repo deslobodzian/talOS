@@ -70,6 +70,9 @@ struct TeleopBinding {
   int port{0};
   std::optional<int> button;
   std::optional<int> axis;
+  std::optional<int> pov;
+  int pov_index{0};
+  std::vector<std::pair<std::string, TeleopValue>> on_toggle;
   std::vector<std::pair<std::string, TeleopValue>> while_held;
   std::string field;
   double scale{1.0};
@@ -227,6 +230,7 @@ struct RawDevice {
   std::string name;
   DeviceConfig config;
   std::string feedback_sensor;  // Motors with RemoteCANcoder feedback only.
+  std::string follow_motor;
 };
 
 inline bool IsCANcoder(const RawDevice& d) {
@@ -269,12 +273,26 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
       g.v = Read(*slot, "v", g.v);
       g.a = Read(*slot, "a", g.a);
       g.g = Read(*slot, "g", g.g);
+      const auto gravity = Read<std::string>(*slot, "gravity_type", "Elevator");
+      if (gravity == "Elevator" || gravity == "ElevatorStatic") {
+        g.gravity_type = hardware::GravityType::kElevatorStatic;
+      } else if (gravity == "Arm" || gravity == "ArmCosine") {
+        g.gravity_type = hardware::GravityType::kArmCosine;
+      } else {
+        throw std::invalid_argument("unknown gravity_type for motor " + name +
+                                    " slot" + std::to_string(s));
+      }
     }
   }
 
   // The sensor is resolved to a logical id after numbering, so Validate
   // never sees the name; the parser checks the pairing.
   RawDevice raw{.name = name};
+  raw.follow_motor = Read<std::string>(t, "follow", "");
+  m.oppose_master = Read(t, "oppose_master", false);
+  if (t.contains("oppose_master") && raw.follow_motor.empty()) {
+    throw std::invalid_argument("oppose_master requires follow for " + name);
+  }
   const std::string feedback = Read<std::string>(t, "feedback", "Rotor");
   raw.feedback_sensor = Read<std::string>(t, "feedback_sensor", "");
   if (feedback == "RemoteCANcoder") {
@@ -407,20 +425,44 @@ inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
     }
     for (auto&& [k, v] : *entry) {
       const std::string_view ks = k.str();
-      if (ks != "button" && ks != "axis" && ks != "port" &&
-          ks != "while_held" && ks != "field" && ks != "scale" &&
-          ks != "deadband_frac") {
+      if (ks != "button" && ks != "axis" && ks != "port" && ks != "pov" &&
+          ks != "pov_index" && ks != "on_toggle" && ks != "while_held" &&
+          ks != "field" && ks != "scale" && ks != "deadband_frac") {
         throw std::invalid_argument(entry_where + " unknown key '" +
                                     std::string(ks) + "'");
       }
     }
     const bool has_button = entry->contains("button");
     const bool has_axis = entry->contains("axis");
-    if ((has_button && has_axis) || (!has_button && !has_axis)) {
+    const bool has_pov = entry->contains("pov");
+    if (static_cast<int>(has_button) + static_cast<int>(has_axis) +
+            static_cast<int>(has_pov) !=
+        1) {
       throw std::invalid_argument(
-          entry_where + ": binding must specify either 'button' or 'axis'");
+          entry_where +
+          ": binding must specify exactly one of button/axis/pov");
     }
     TeleopBinding b;
+    if (entry->contains("pov_index") && !has_pov) {
+      throw std::invalid_argument(entry_where + ".pov_index requires 'pov'");
+    }
+    if (has_pov) {
+      const auto angle = (*entry)["pov"].value<int64_t>();
+      if (!(*entry)["pov"].is_integer() || !angle || *angle < 0 ||
+          *angle >= 360 || *angle % 45 != 0) {
+        throw std::invalid_argument(entry_where +
+                                    ".pov must be a compass angle");
+      }
+      b.pov = static_cast<int>(*angle);
+      if (entry->contains("pov_index")) {
+        const auto index = (*entry)["pov_index"].value<int64_t>();
+        if (!(*entry)["pov_index"].is_integer() || !index || *index < 0 ||
+            *index >= static_cast<int64_t>(driver_station::kMaxPovs)) {
+          throw std::invalid_argument(entry_where + ".pov_index out of range");
+        }
+        b.pov_index = static_cast<int>(*index);
+      }
+    }
     if (entry->contains("port")) {
       const auto& p_node = (*entry)["port"];
       if (!p_node.is_integer()) {
@@ -437,35 +479,40 @@ inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
       }
       b.port = static_cast<int>(*p);
     }
-    if (has_button) {
+    if (has_button || has_pov) {
       for (const char* forbidden : {"field", "scale", "deadband_frac"}) {
         if (entry->contains(forbidden)) {
           throw std::invalid_argument(entry_where +
                                       " button binding cannot have axis keys");
         }
       }
-      const auto& b_node = (*entry)["button"];
-      if (!b_node.is_integer()) {
+      if (has_button) {
+        const auto& b_node = (*entry)["button"];
+        if (!b_node.is_integer()) {
+          throw std::invalid_argument(
+              entry_where + ".button must be an integer in [1, " +
+              std::to_string(driver_station::kMaxButtons) + "]");
+        }
+        const auto btn = b_node.value<int64_t>();
+        if (!btn || *btn < 1 ||
+            *btn > static_cast<int64_t>(driver_station::kMaxButtons)) {
+          throw std::invalid_argument(
+              entry_where + ".button must be an integer in [1, " +
+              std::to_string(driver_station::kMaxButtons) + "]");
+        }
+        b.button = static_cast<int>(*btn);
+      }
+      if (entry->contains("while_held") == entry->contains("on_toggle")) {
         throw std::invalid_argument(
-            entry_where + ".button must be an integer in [1, " +
-            std::to_string(driver_station::kMaxButtons) + "]");
+            entry_where + " requires exactly one of while_held/on_toggle");
       }
-      const auto btn = b_node.value<int64_t>();
-      if (!btn || *btn < 1 ||
-          *btn > static_cast<int64_t>(driver_station::kMaxButtons)) {
-        throw std::invalid_argument(
-            entry_where + ".button must be an integer in [1, " +
-            std::to_string(driver_station::kMaxButtons) + "]");
-      }
-      b.button = static_cast<int>(*btn);
-      if (!entry->contains("while_held")) {
-        throw std::invalid_argument(entry_where +
-                                    " button binding missing 'while_held'");
-      }
-      const auto* wh = (*entry)["while_held"].as_table();
-      if (wh == nullptr) {
-        throw std::invalid_argument(entry_where +
-                                    ".while_held must be a table");
+      const std::string action =
+          entry->contains("on_toggle") ? "on_toggle" : "while_held";
+      auto& assignments = action == "on_toggle" ? b.on_toggle : b.while_held;
+      const auto* wh = (*entry)[action].as_table();
+      if (wh == nullptr || wh->empty()) {
+        throw std::invalid_argument(entry_where + "." + action +
+                                    " must be a non-empty table");
       }
       std::vector<std::string> wh_keys;
       for (auto&& [fk, fv] : *wh) wh_keys.emplace_back(fk.str());
@@ -473,27 +520,27 @@ inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
       for (const auto& fk : wh_keys) {
         const auto& fv = (*wh)[fk];
         if (fv.is_table() || fv.is_array()) {
-          throw std::invalid_argument(entry_where + ".while_held." + fk +
+          throw std::invalid_argument(entry_where + "." + action + "." + fk +
                                       " must be a scalar");
         }
         if (fv.is_boolean()) {
-          b.while_held.emplace_back(fk, *fv.value<bool>());
+          assignments.emplace_back(fk, *fv.value<bool>());
         } else if (fv.is_integer()) {
-          b.while_held.emplace_back(fk, *fv.value<int64_t>());
+          assignments.emplace_back(fk, *fv.value<int64_t>());
         } else if (fv.is_floating_point()) {
-          b.while_held.emplace_back(fk, *fv.value<double>());
+          assignments.emplace_back(fk, *fv.value<double>());
         } else if (fv.is_string()) {
-          b.while_held.emplace_back(fk, *fv.value<std::string>());
+          assignments.emplace_back(fk, *fv.value<std::string>());
         } else {
-          throw std::invalid_argument(entry_where + ".while_held." + fk +
+          throw std::invalid_argument(entry_where + "." + action + "." + fk +
                                       " must be a scalar");
         }
       }
     }
     if (has_axis) {
-      if (entry->contains("while_held")) {
+      if (entry->contains("while_held") || entry->contains("on_toggle")) {
         throw std::invalid_argument(entry_where +
-                                    " axis binding cannot have 'while_held'");
+                                    " axis binding cannot have action tables");
       }
       const auto& a_node = (*entry)["axis"];
       if (!a_node.is_integer()) {
@@ -745,6 +792,18 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     require_same_subsystem(*sensor, dev.subsystem, dev.name);
     motor->feedback_sensor_id =
         std::visit([](const auto& c) { return c.id; }, sensor->config);
+  }
+  for (auto& dev : raw_devices) {
+    auto* motor = std::get_if<hardware::MotorConfig>(&dev.config);
+    if (!motor || dev.follow_motor.empty()) continue;
+    const auto* master = find(dev.follow_motor);
+    if (!master ||
+        !std::holds_alternative<hardware::MotorConfig>(master->config)) {
+      throw std::invalid_argument("follow motor not found: " +
+                                  dev.follow_motor);
+    }
+    require_same_subsystem(*master, dev.subsystem, dev.name);
+    motor->master_id = std::get<hardware::MotorConfig>(master->config).id;
   }
 
   // Swerve geometry module references must name this subsystem's devices.

@@ -36,6 +36,57 @@ class Roller:
 
 
 class TeleopTest(unittest.TestCase):
+    def test_pov_and_toggle_edges_and_safety_reset(self):
+        for trigger in ("button = 1", "pov = 90\npov_index = 1"):
+            for action in ("while_held", "on_toggle"):
+                with self.subTest(trigger=trigger, action=action):
+                    config = ROBOT_TOML.replace(
+                        "button = 1\nwhile_held", trigger + "\n" + action)
+                    sim = Sim.from_toml(config)
+                    roller = sim.add(Roller, "roller")
+                    sim.add(Teleop, "teleop")
+                    hw = SimHardware(sim)
+                    hw.enable()
+
+                    def packet(pressed=False, enabled=True, teleop=True,
+                               connected=True):
+                        hw.set_driver_station(
+                            enabled=enabled, teleop=teleop,
+                            joysticks=[Stick(
+                                buttons=(1,) if pressed else (),
+                                povs=(-1, 90 if pressed else -1),
+                                button_count=1)] if connected else [])
+                        sim.step(0.06)
+
+                    packet()
+                    self.assertIsNone(roller.seen)
+                    packet(True)
+                    self.assertEqual(roller.seen.velocity_rps, 60.0)
+                    packet(True)
+                    self.assertIsNotNone(roller.seen)
+                    packet()
+                    self.assertEqual(roller.seen is not None,
+                                     action == "on_toggle")
+                    packet(True)
+                    self.assertEqual(roller.seen is not None,
+                                     action == "while_held")
+                    packet()
+                    packet(True)
+                    for unavailable in ({"enabled": False},
+                                        {"teleop": False},
+                                        {"connected": False}):
+                        packet(**unavailable)
+                        self.assertIsNone(roller.seen)
+                        packet()
+                        self.assertIsNone(roller.seen)
+                        packet(True)
+                        self.assertIsNotNone(roller.seen)
+                    hw.stop_driver_station()
+                    sim.step(0.3)
+                    self.assertIsNone(roller.seen)
+                    packet()
+                    self.assertIsNone(roller.seen)
+
     def test_button_binding_releases_when_unavailable(self):
         sim = Sim.from_toml(ROBOT_TOML)
         roller = sim.add(Roller, "roller")

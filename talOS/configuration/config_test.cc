@@ -25,6 +25,35 @@ void ExpectRejected(std::string_view body) {
   EXPECT_THROW(Parse(body), std::invalid_argument) << body;
 }
 
+TEST(ConfigTest, ParsesFollowerAndGravityTypes) {
+  const auto cfg = Parse(R"(
+[subsystems.test.motors.follower]
+can_id = 2
+follow = "m1"
+oppose_master = true
+[subsystems.test.motors.follower.slot0]
+gravity_type = "ArmCosine"
+[subsystems.test.motors.follower.slot1]
+gravity_type = "ElevatorStatic"
+[subsystems.test.motors.follower.slot2]
+gravity_type = "Arm"
+)");
+  const auto& follower = cfg.hardware.motors[0];
+  EXPECT_EQ(follower.master_id, cfg.hardware.motors[1].id);
+  EXPECT_TRUE(follower.oppose_master);
+  EXPECT_EQ(follower.slots[0].gravity_type, hardware::GravityType::kArmCosine);
+  EXPECT_EQ(follower.slots[1].gravity_type,
+            hardware::GravityType::kElevatorStatic);
+  EXPECT_EQ(follower.slots[2].gravity_type, hardware::GravityType::kArmCosine);
+  ExpectRejected("oppose_master = false\n");
+  ExpectRejected("follow = \"missing\"\n");
+  ExpectRejected("[subsystems.test.motors.m1.slot0]\ngravity_type = \"bad\"\n");
+  ExpectRejected(
+      "follow = \"sensor\"\n[subsystems.test.sensors.sensor]\ncan_id = 2\n");
+  ExpectRejected(
+      "follow = \"other\"\n[subsystems.other.motors.other]\ncan_id = 2\n");
+}
+
 TEST(ConfigTest, ParsesEveryDeviceTableIntoOwnership) {
   const auto cfg = Parse(R"(
 [subsystems.test.sensors.enc]
@@ -603,6 +632,34 @@ defaults = "subsystems/mech_defaults.toml"
   EXPECT_EQ((*mech_tbl)["period_us"].value_or(0), 20000);
   EXPECT_DOUBLE_EQ((*mech_tbl)["feed_volts"].value_or(0.0), 8.0);
   EXPECT_DOUBLE_EQ((*mech_tbl)["hold_volts"].value_or(0.0), 1.5);
+}
+
+TEST(ConfigTest, ParsesPovAndToggleBindings) {
+  for (int angle = 0; angle < 360; angle += 45) {
+    const auto cfg = Parse(
+        "[[subsystems.test.teleop.bindings]]\npov = " + std::to_string(angle) +
+        "\npov_index = 3\non_toggle = { velocity_rps = 60.0 }\n");
+    const auto& binding = cfg.teleop.at("test").front();
+    EXPECT_EQ(binding.pov, angle);
+    EXPECT_EQ(binding.pov_index, 3);
+    EXPECT_TRUE(binding.while_held.empty());
+    ASSERT_EQ(binding.on_toggle.size(), 1u);
+    EXPECT_EQ(binding.on_toggle.front().first, "velocity_rps");
+    EXPECT_DOUBLE_EQ(std::get<double>(binding.on_toggle.front().second), 60.0);
+  }
+  const auto cfg = Parse(
+      "[[subsystems.test.teleop.bindings]]\npov = 0\n"
+      "while_held = { velocity_rps = 1.0 }\n");
+  EXPECT_EQ(cfg.teleop.at("test").front().pov_index, 0);
+  for (const std::string binding :
+       {"pov = true\nwhile_held = { x = 1 }",
+        "pov = -45\nwhile_held = { x = 1 }",
+        "pov = 90\npov_index = 0.0\nwhile_held = { x = 1 }",
+        "pov = 90\non_toggle = {}",
+        "button = 1\nwhile_held = {}\non_toggle = { x = 1 }",
+        "axis = 0\nfield = 'x'\nscale = 1\npov_index = 0"}) {
+    ExpectRejected("[[subsystems.test.teleop.bindings]]\n" + binding);
+  }
 }
 
 // talOS/configuration/testdata: each case is a config tree plus expect.toml

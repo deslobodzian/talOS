@@ -231,6 +231,11 @@ struct PrecomputedBinding {
   bool is_button{true};
   int port{0};
   int button{0};
+  std::optional<int> pov;
+  int pov_index{0};
+  bool on_toggle{false};
+  bool toggled{false};
+  bool was_pressed{false};
   std::vector<ButtonFieldAction> button_fields;
   int axis{0};
   double scale{1.0};
@@ -281,6 +286,10 @@ class Teleop {
       }
       const bool condition_ok = ds_ok && any_stick_connected;
       if (!condition_ok) {
+        for (auto& binding : sub.bindings) {
+          binding.toggled = false;
+          binding.was_pressed = false;
+        }
         if (sub.commanding) {
           TargetAccess::lane_release(node_, sub.lane_index);
           sub.commanding = false;
@@ -292,11 +301,21 @@ class Teleop {
       std::fill(sub.field_set.begin(), sub.field_set.end(), 0);
 
       bool any_live = false;
-      for (const auto& b : sub.bindings) {
+      for (auto& b : sub.bindings) {
         const auto stick = ds_.joystick(b.port);
-        if (!stick.connected()) continue;
+        if (!stick.connected()) {
+          b.toggled = false;
+          b.was_pressed = false;
+          continue;
+        }
         if (b.is_button) {
-          if (stick.button(b.button)) {
+          const bool pressed =
+              b.pov ? stick.pov(b.pov_index) == *b.pov : stick.button(b.button);
+          if (b.on_toggle && !b.was_pressed && pressed) {
+            b.toggled = !b.toggled;
+          }
+          b.was_pressed = pressed;
+          if (b.on_toggle ? b.toggled : pressed) {
             any_live = true;
             for (const auto& f : b.button_fields) {
               if (!sub.field_set[f.field_id]) {
@@ -422,12 +441,18 @@ class Teleop {
       detail::PrecomputedBinding binding;
       binding.port = parsed_binding.port;
 
-      if (parsed_binding.button.has_value()) {
+      if (parsed_binding.button.has_value() || parsed_binding.pov.has_value()) {
         binding.is_button = true;
-        binding.button = *parsed_binding.button;
-
-        for (const auto& [fk, fv] : parsed_binding.while_held) {
-          const std::string field_where = entry_where + ".while_held." + fk;
+        binding.button = parsed_binding.button.value_or(0);
+        binding.pov = parsed_binding.pov;
+        binding.pov_index = parsed_binding.pov_index;
+        binding.on_toggle = !parsed_binding.on_toggle.empty();
+        const auto& assignments = binding.on_toggle ? parsed_binding.on_toggle
+                                                    : parsed_binding.while_held;
+        const std::string action_name =
+            binding.on_toggle ? ".on_toggle." : ".while_held.";
+        for (const auto& [fk, fv] : assignments) {
+          const std::string field_where = entry_where + action_name + fk;
           detail::ResolvedField rf =
               detail::ResolveField(*schema, *object, fk, field_where);
 

@@ -21,18 +21,47 @@ class SimBackend final : public Backend {
     const double dt =
         previous_time_ ? (state.sample_time_us - previous_time_) * 1e-6 : 0;
     previous_time_ = state.sample_time_us;
+    std::array<bool, kMaxMotors> resolved{};
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       auto& m = samples_[i];
       const auto& r = commands_[i];
       m.id = config_.motors[i].id;
       m.valid = true;
+      if (config_.motors[i].master_id != 0) continue;
+      resolved[i] = true;
       m.velocity_rps = r.mode == Mode::kVelocity ? r.demand : 0;
       if (r.mode == Mode::kPosition || r.mode == Mode::kMotionMagic)
         m.position_rot = r.demand;
       else
         m.position_rot += m.velocity_rps * dt;
       m.voltage = r.mode == Mode::kVoltage ? r.demand : 0;
-      state.motors[i] = m;
+    }
+    // Resolve current samples, not last tick's samples, even when a follower
+    // precedes its master in the configuration.
+    for (std::size_t pass = 0; pass < config_.motors.size(); ++pass) {
+      bool progress = false;
+      for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+        if (resolved[i]) continue;
+        const auto& cfg = config_.motors[i];
+        for (std::size_t j = 0; j < config_.motors.size(); ++j) {
+          if (config_.motors[j].id != cfg.master_id || !resolved[j]) continue;
+          const double sign = cfg.oppose_master ? -1.0 : 1.0;
+          samples_[i].position_rot = samples_[j].position_rot * sign;
+          samples_[i].velocity_rps = samples_[j].velocity_rps * sign;
+          samples_[i].voltage = samples_[j].voltage * sign;
+          resolved[i] = true;
+          progress = true;
+          break;
+        }
+      }
+      if (!progress) break;
+    }
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      if (!resolved[i]) {
+        samples_[i].velocity_rps = 0.0;
+        samples_[i].voltage = 0.0;
+      }
+      state.motors[i] = samples_[i];
     }
     for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
       state.sensors[i] = {config_.sensors[i].id, true, 0, 0};

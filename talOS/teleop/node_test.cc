@@ -122,6 +122,72 @@ TEST(TeleopNode, ButtonDrivesLaneWithEncodedValue) {
   EXPECT_FALSE(roller.seen.has_value());
 }
 
+TEST(TeleopNode, PovAndToggleEdgesResetOnSafetyTransitions) {
+  for (const std::string trigger : {"button = 1", "pov = 90\npov_index = 1"}) {
+    for (const std::string action : {"while_held", "on_toggle"}) {
+      SCOPED_TRACE(trigger + action);
+      std::string config =
+          "[robot]\nperiod_us = 20000\ncommand_timeout_us = 100000\n"
+          "[subsystems.roller]\n[[subsystems.roller.teleop.bindings]]\n";
+      config.append(trigger);
+      config.append("\n");
+      config.append(action);
+      config.append(" = { velocity_rps = 60.0 }\n[subsystems.teleop]\n");
+      Sim sim = MakeSim(config);
+      auto& roller = sim.add<ConsumerNode<control::VelocityTarget>>("roller");
+      sim.add<Teleop>("teleop");
+      SimHardware hw{sim};
+      hw.enable();
+      auto packet = [&](bool pressed, std::uint32_t flags = kTeleopEnabled,
+                        bool connected = true) {
+        auto stick = MakeStick(0, 0, 0, pressed ? 1 : 0, connected);
+        stick.pov_count = 2;
+        stick.povs[0] = -1;
+        stick.povs[1] = pressed ? 90 : -1;
+        Push(hw, sim, DsPacket(flags, stick));
+      };
+      packet(false);
+      EXPECT_FALSE(roller.seen);
+      packet(true);
+      if (!roller.seen.has_value()) {
+        FAIL() << "Expected teleop target";
+      }
+      const auto& pressed = roller.seen.value();
+      EXPECT_DOUBLE_EQ(pressed.velocity_rps(), 60.0);
+      packet(true);  // Holding never generates another rising edge.
+      EXPECT_TRUE(roller.seen);
+      packet(false);
+      EXPECT_EQ(roller.seen.has_value(), action == "on_toggle");
+      packet(true);
+      EXPECT_EQ(roller.seen.has_value(), action == "while_held");
+      packet(false);
+      packet(true);  // Latch back on.
+      EXPECT_TRUE(roller.seen);
+      for (const auto flags :
+           {ds::kDsAttached | ds::kTeleop,
+            ds::kDsAttached | ds::kEnabled | ds::kAutonomous}) {
+        packet(false, flags);
+        EXPECT_FALSE(roller.seen);
+        packet(false);
+        EXPECT_FALSE(roller.seen);  // No stale toggle on re-enable.
+        packet(true);
+        EXPECT_TRUE(roller.seen);
+      }
+      packet(false, kTeleopEnabled, false);
+      EXPECT_FALSE(roller.seen);
+      packet(false);
+      EXPECT_FALSE(roller.seen);
+      packet(true);
+      EXPECT_TRUE(roller.seen);
+      hw.stop_driver_station();
+      sim.step(300ms);
+      EXPECT_FALSE(roller.seen);
+      packet(false);
+      EXPECT_FALSE(roller.seen);
+    }
+  }
+}
+
 constexpr const char* kRichToml = R"(
 [robot]
 period_us = 20000

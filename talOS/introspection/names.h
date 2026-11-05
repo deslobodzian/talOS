@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "talOS/events/manifest.h"
+#include "talOS/hardware/config.h"
 #include "talOS/rtms/rtms.h"
 
 namespace talos::introspect::naming {
@@ -283,6 +284,42 @@ struct Diagnostic {
            ": " + subject + ": " + message;
   }
 };
+
+// Advisory hardware limits, not configuration errors: the estimate counts
+// status frames on the roboRIO CAN bus only, not CANivore traffic.
+inline std::vector<Diagnostic> CheckHardwareConfig(
+    const hardware::Config& config) {
+  std::vector<Diagnostic> out;
+  std::size_t rio_frames_per_update = 0;
+  for (const auto& motor : config.motors) {
+    const double sensor_velocity =
+        motor.max_velocity_rps * motor.sensor_to_mechanism_ratio;
+    if (sensor_velocity > 105.0) {
+      out.push_back(
+          {Severity::WARNING, motor.name,
+           "max_velocity_rps * sensor_to_mechanism_ratio is " +
+               std::to_string(sensor_velocity) +
+               " rps, exceeding the recommended 105 rps; check gearing and "
+               "the configured maximum velocity"});
+    }
+    if (motor.bus == "rio") rio_frames_per_update += 4;
+  }
+  for (const auto& sensor : config.sensors) {
+    if (sensor.bus == "rio") rio_frames_per_update += 2;
+  }
+  const double rio_frames_per_second =
+      static_cast<double>(rio_frames_per_update) * config.status_hz;
+  if (rio_frames_per_second > 15000.0) {
+    out.push_back(
+        {Severity::WARNING, "rio",
+         "estimated CAN status traffic (4 * motors + 2 * sensors) * "
+         "status_hz is " +
+             std::to_string(rio_frames_per_second) +
+             " frames/s, exceeding the recommended 15000 frames/s; reduce "
+             "status_hz or move devices to another CAN bus"});
+  }
+  return out;
+}
 
 // Each subsystem's target sources: every `<source>` its target policy lists
 // in any mode ([robot.targets] plus its own [targets]), keyed by subsystem.

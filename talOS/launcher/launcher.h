@@ -1179,6 +1179,9 @@ class Launcher {
     for (auto& finding : LintParameterUnits(robot_config)) {
       diagnostics.push_back(std::move(finding));
     }
+    for (auto& finding : naming::CheckHardwareConfig(robot_config.hardware)) {
+      diagnostics.push_back(std::move(finding));
+    }
     const std::size_t declared_topics = CountDeclaredTopics(described);
 
     const std::string graph_path = options_.output_dir + "/graph.json";

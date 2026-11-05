@@ -32,7 +32,10 @@ py_test(
     name = "bundle_test",
     size = "small",
     srcs = ["bundle_test.py"],
-    data = [":robot_bundle"],
+    data = [
+        ":robot_bundle",
+        "//tools:deploy.sh",
+    ],
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],
 )

@@ -138,6 +138,8 @@ inline std::vector<uint8_t> SerializeConfig(const Config& c) {
     w.Text(m.bus);
     w.Int(m.inverted ? 1 : 0, 1);
     w.Int(m.brake ? 1 : 0, 1);
+    w.Int(m.master_id, 2);
+    w.Int(m.oppose_master ? 1 : 0, 1);
     w.Real(m.supply_limit_a);
     w.Real(m.stator_limit_a);
     w.Real(m.max_voltage);
@@ -155,6 +157,7 @@ inline std::vector<uint8_t> SerializeConfig(const Config& c) {
     w.Real(m.jerk_rps3);
     for (const auto& g : m.slots) {
       for (double val : {g.p, g.i, g.d, g.s, g.v, g.a, g.g}) w.Real(val);
+      w.Int(static_cast<uint8_t>(g.gravity_type), 1);
     }
   }
 
@@ -230,6 +233,10 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
     m.bus = r.Text();
     m.inverted = (r.Int(1) == 1);
     m.brake = (r.Int(1) == 1);
+    m.master_id = r.Int(2);
+    const auto oppose_master = r.Int(1);
+    if (oppose_master > 1) return false;
+    m.oppose_master = oppose_master != 0;
     m.supply_limit_a = r.Real();
     m.stator_limit_a = r.Real();
     m.max_voltage = r.Real();
@@ -258,6 +265,10 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
       g.v = r.Real();
       g.a = r.Real();
       g.g = r.Real();
+      const auto gravity_type = r.Int(1);
+      if (gravity_type > static_cast<uint8_t>(GravityType::kArmCosine))
+        return false;
+      g.gravity_type = static_cast<GravityType>(gravity_type);
     }
   }
 

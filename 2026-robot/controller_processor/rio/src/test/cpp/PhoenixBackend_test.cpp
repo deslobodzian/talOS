@@ -54,7 +54,7 @@ struct EnabledDs {
 // The bridge heartbeat (at most 20 ms), not Gateway ticks, refreshes one-shot
 // requests in production. Refresh here too so requests do not age out mid-test.
 void PumpReads(PhoenixBackend& backend, hw::State& s,
-               const std::array<hw::MotorRequest, 1>& cmd, int iters = 20) {
+               std::span<const hw::MotorRequest> cmd, int iters = 20) {
   for (int i = 0; i < iters; ++i) {
     backend.Apply(cmd);
     backend.Read(s);
@@ -325,3 +325,73 @@ TEST(PhoenixBackendSim, VoltageStillDrivesMotor) {
   EXPECT_GT(s.motors[0].velocity_rps, 5.0);
   EXPECT_GT(s.motors[0].position_rot, 0.0);
 }
+
+TEST(PhoenixBackendGains, MapsGravityTypeForEverySlot) {
+  EnsureHal();
+  hw::Config c;
+  auto motor = TestMotor(1, "gravity_motor", 1);
+  motor.slots[0].gravity_type = hw::GravityType::kArmCosine;
+  motor.slots[1].gravity_type = hw::GravityType::kElevatorStatic;
+  motor.slots[2].gravity_type = hw::GravityType::kArmCosine;
+  c.motors.push_back(motor);
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(c));
+
+  ctre::phoenix6::hardware::TalonFX device{1, ctre::phoenix6::CANBus{"rio"}};
+  ctre::phoenix6::configs::TalonFXConfiguration applied;
+  ASSERT_TRUE(device.GetConfigurator().Refresh(applied).IsOK());
+  using Gravity = ctre::phoenix6::signals::GravityTypeValue;
+  EXPECT_EQ(applied.Slot0.GravityType, Gravity::Arm_Cosine);
+  EXPECT_EQ(applied.Slot1.GravityType, Gravity::Elevator_Static);
+  EXPECT_EQ(applied.Slot2.GravityType, Gravity::Arm_Cosine);
+}
+
+class PhoenixBackendFollower : public ::testing::TestWithParam<bool> {};
+
+TEST_P(PhoenixBackendFollower, FollowsMasterAndNeutralizesWithMaster) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config c;
+  // Nonmatching logical/CAN IDs and follower-first order exercise lookup.
+  auto follower = TestMotor(20, "follower", 2);
+  follower.master_id = 10;
+  follower.oppose_master = GetParam();
+  c.motors.push_back(follower);
+  c.motors.push_back(TestMotor(10, "master", 1));
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(c));
+  std::array<hw::MotorRequest, 2> commands{
+      Request(20, hw::Mode::kNeutral, 0.0),
+      Request(10, hw::Mode::kVoltage, 6.0)};
+  hw::State state;
+  PumpReads(backend, state, commands, 30);
+  ASSERT_TRUE(state.motors[0].valid);
+  ASSERT_TRUE(state.motors[1].valid);
+  EXPECT_GT(state.motors[1].voltage, 3.0);
+  EXPECT_GT(state.motors[0].voltage * (GetParam() ? -1.0 : 1.0), 3.0);
+  EXPECT_GT(state.motors[0].velocity_rps * (GetParam() ? -1.0 : 1.0), 1.0);
+  // The physical simulation voltage includes opposition; the controller's
+  // logical MotorVoltage signal does not. Platform feedback uses the former
+  // direction in the configured mechanism frame.
+  ctre::phoenix6::hardware::TalonFX follower_device{
+      2, ctre::phoenix6::CANBus{"rio"}};
+  EXPECT_GT(follower_device.GetSimState().GetMotorVoltage().value() *
+                (GetParam() ? -1.0 : 1.0),
+            3.0);
+
+  commands[1] = Request(10, hw::Mode::kNeutral, 0.0);
+  // A follower's independent demand must not override master neutral.
+  commands[0] = Request(20, hw::Mode::kVoltage, 6.0);
+  PumpReads(backend, state, commands);
+  EXPECT_NEAR(state.motors[0].voltage, 0.0, 0.5);
+
+  commands[1] = Request(10, hw::Mode::kVoltage, 6.0);
+  PumpReads(backend, state, commands, 30);
+  EXPECT_GT(std::abs(state.motors[0].voltage), 3.0);
+  frc::sim::DriverStationSim::SetEnabled(false);
+  frc::sim::DriverStationSim::NotifyNewData();
+  PumpReads(backend, state, commands);
+  EXPECT_NEAR(state.motors[0].voltage, 0.0, 0.5);
+}
+
+INSTANTIATE_TEST_SUITE_P(Direction, PhoenixBackendFollower, ::testing::Bool());

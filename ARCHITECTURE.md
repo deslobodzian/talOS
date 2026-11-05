@@ -35,7 +35,7 @@ Allowed dependencies:
   reimplement a wire format, a memory layout, a state machine, or a C++ node
   (C++ nodes exposed to Python use `TALOS_EXPORT_NODE` and `talos.cpp_node`).
 - Adding a node in one language never requires modifying code in another
-  language: cross-cutting robot wiring (target policies, `operator_interface`,
+  language: cross-cutting robot wiring (target policies, `driver` / `teleop`,
   `telemetry`) is driven by TOML configuration.
 - Nodes share only messages and topic names (`talos_messages`), never each
   other's classes.

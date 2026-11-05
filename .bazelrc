@@ -2,6 +2,10 @@ common --enable_bzlmod
 
 build --enable_platform_specific_config
 
+# Parallel py_test / talos_py_node runs share symlinked runfiles directories under
+# Linux processwrapper-sandbox; prevent races writing __pycache__/*.pyc files.
+build --test_env=PYTHONDONTWRITEBYTECODE=1
+
 build:linux --cxxopt=-std=c++23 --cxxopt=-O3
 build:macos --cxxopt=-std=c++23 --cxxopt=-O3
 # Two things Apple's libc++ needs before talOS compiles on macOS at all.

@@ -47,15 +47,15 @@ bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configurat
 
 - Muse (`muse-code/muse-spark-1.3-contributor`) is the main session model and
   implements: it plans slices, writes the code, runs the checks. Generic `task`
-  subagents also run on Muse (`task.agentModelOverrides`).
+  subagents run on `openai-codex/gpt-6.1-sol:low`, with
+  `google/gemini-3.8-flash` fallback (`task.agentModelOverrides`).
 - Claude Architect (Opus) and Gemini Product (Gemini) are advisors on the main
   session (`~/.omp/agent/WATCHDOG.yml`): design, architecture, features and code
   review. They advise; they do not implement. Act on their notes or say why not.
 - Repo-specific review priorities are in `WATCHDOG.md`; the `reviewer` agent
   uses them for a final pass.
-- The user config's retry chain can move a Muse session or worker to Sonnet;
-  `resolvedModelIsFallback` in the session log shows it. Report work that did
-  not run on Muse.
+- The user config's retry chain can move a session or worker to a fallback;
+  `resolvedModelIsFallback` in the session log shows it.
 - Muse session worktrees live under `.muse/` (ignored by `.bazelignore`).
 
 ## Implementation rules

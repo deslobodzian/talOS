@@ -121,6 +121,7 @@ TEST(Devices, NothingIsSentBeforeTheFirstAcceptedState) {
   sim.step(50ms);
   EXPECT_EQ(Sent(sim), 0u);
   EXPECT_FALSE(link.fresh());
+  EXPECT_FALSE(link.fresh(Duration::max()));
   EXPECT_EQ(link.age(), Duration::max());
   EXPECT_FALSE(mech.a.connected());
   EXPECT_EQ(mech.a.position(), 0.0);
@@ -129,6 +130,9 @@ TEST(Devices, NothingIsSentBeforeTheFirstAcceptedState) {
   sim.step(10ms);
   EXPECT_GT(Sent(sim), 0u);
   EXPECT_TRUE(link.fresh());
+  EXPECT_FALSE(link.fresh(0ns));
+  EXPECT_FALSE(link.fresh(link.age()));
+  EXPECT_TRUE(link.fresh(link.age() + 1ns));
   EXPECT_LT(link.age(), 100ms);
   EXPECT_TRUE(mech.a.connected());
 }
@@ -202,6 +206,7 @@ TEST(Devices, StaleStateForcesNeutralButKeepsFlushing) {
   EXPECT_FALSE(robot_enabled(sim.node("mech")));
   EXPECT_FALSE(link.fresh());
   EXPECT_GE(link.age(), 100ms);
+  EXPECT_TRUE(link.fresh(1s));
   EXPECT_FALSE(mech.a.connected());
   EXPECT_FALSE(mech.cc.connected());
   EXPECT_FALSE(mech.gyro.connected());

@@ -78,6 +78,16 @@ void Validate(const Config& c) {
   }
   for (const auto& m : c.motors) {
     device(m.id, m.name, m.bus, m.can_id);
+    if (m.master_id != 0) {
+      Require(m.master_id != m.id, "motor cannot follow itself");
+      const MotorConfig* master = nullptr;
+      for (const auto& candidate : c.motors) {
+        if (candidate.id == m.master_id) master = &candidate;
+      }
+      Require(master && master->bus == m.bus,
+              "follower master must exist on the same CAN bus");
+      Require(master->master_id == 0, "follower chains are not supported");
+    }
     Require(Positive(m.supply_limit_a) && Positive(m.stator_limit_a) &&
                 Positive(m.max_voltage) && m.max_voltage <= 12,
             "invalid motor limits");
@@ -94,21 +104,26 @@ void Validate(const Config& c) {
                 m.reverse_limit_rot < m.forward_limit_rot,
             "invalid soft limits");
     for (const auto& g : m.slots) {
-      for (double x : {g.p, g.i, g.d, g.s, g.v, g.a, g.g})
+      for (double x : {g.p, g.i, g.d, g.s, g.v, g.a, g.g}) {
         Require(std::isfinite(x) && x >= 0, "invalid gain");
+      }
+      Require(g.gravity_type <= GravityType::kArmCosine,
+              "unknown gravity type");
     }
     Require(m.feedback == Feedback::kRotor ||
                 m.feedback == Feedback::kRemoteCANcoder,
             "unknown feedback source");
     if (m.feedback == Feedback::kRemoteCANcoder) {
       bool found = false;
-      for (const auto& s : c.sensors)
+      for (const auto& s : c.sensors) {
         found |= s.id == m.feedback_sensor_id &&
                  s.kind == SensorKind::kCANcoder && s.bus == m.bus;
+      }
       Require(found, "remote CANcoder must exist on the motor's CAN bus");
-    } else
+    } else {
       Require(m.feedback_sensor_id == 0,
               "rotor feedback cannot reference a remote sensor");
+    }
   }
   for (const auto& di : c.digital_inputs) {
     check_base(di.id, di.name);
@@ -123,7 +138,8 @@ void Validate(const Config& c) {
   for (const auto& ai : c.analog_inputs) {
     check_base(ai.id, ai.name);
     Require(ai.channel >= 0 && ai.channel <= 7, "invalid analog channel");
-    Require(analog_channels.insert(ai.channel).second, "duplicate analog channel");
+    Require(analog_channels.insert(ai.channel).second,
+            "duplicate analog channel");
   }
   for (const auto& enc : c.encoders) {
     check_base(enc.id, enc.name);
@@ -131,12 +147,14 @@ void Validate(const Config& c) {
     Require(dio_channels.insert(enc.dio_a).second, "duplicate DIO channel");
     if (enc.kind == EncoderKind::kQuadrature) {
       Require(enc.dio_b >= 0 && enc.dio_b <= 31, "invalid DIO channel");
-      Require(enc.dio_a != enc.dio_b, "quadrature encoder dio_a and dio_b must differ");
+      Require(enc.dio_a != enc.dio_b,
+              "quadrature encoder dio_a and dio_b must differ");
       Require(dio_channels.insert(enc.dio_b).second, "duplicate DIO channel");
       Require(Positive(enc.counts_per_rev), "invalid counts_per_rev");
     } else {
       Require(enc.kind == EncoderKind::kDutyCycle, "unknown encoder kind");
-      Require(std::isfinite(enc.offset_rot) && enc.offset_rot >= -0.5 && enc.offset_rot < 0.5,
+      Require(std::isfinite(enc.offset_rot) && enc.offset_rot >= -0.5 &&
+                  enc.offset_rot < 0.5,
               "invalid encoder offset");
     }
   }
@@ -169,6 +187,8 @@ uint64_t ConfigurationId(const Config& c) {
     h.Text(m.bus);
     h.Add(m.inverted);
     h.Add(m.brake);
+    h.Add(m.master_id);
+    h.Add(m.oppose_master);
     h.Number(m.supply_limit_a);
     h.Number(m.stator_limit_a);
     h.Number(m.max_voltage);
@@ -184,8 +204,10 @@ uint64_t ConfigurationId(const Config& c) {
     h.Number(m.cruise_velocity_rps);
     h.Number(m.acceleration_rps2);
     h.Number(m.jerk_rps3);
-    for (const auto& g : m.slots)
+    for (const auto& g : m.slots) {
       for (double x : {g.p, g.i, g.d, g.s, g.v, g.a, g.g}) h.Number(x);
+      h.Add(static_cast<uint8_t>(g.gravity_type));
+    }
   }
   for (const auto& s : c.sensors) {
     h.Add(s.id);

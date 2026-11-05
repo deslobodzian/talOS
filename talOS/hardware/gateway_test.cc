@@ -141,6 +141,51 @@ Command Request(const Gateway& g) {
   }
   return c;
 }
+TEST(Config, ValidatesFollowersAndFingerprintsTheirSettings) {
+  auto c = SwerveConfig(true);
+  const auto independent_id = ConfigurationId(c);
+  c.motors[1].master_id = c.motors[0].id;
+  EXPECT_NO_THROW(Validate(c));
+  EXPECT_NE(ConfigurationId(c), independent_id);
+  const auto follower_id = ConfigurationId(c);
+  c.motors[1].oppose_master = true;
+  EXPECT_NE(ConfigurationId(c), follower_id);
+  c.motors[1].slots[2].gravity_type = GravityType::kArmCosine;
+  const auto gravity_id = ConfigurationId(c);
+  c.motors[1].slots[2].gravity_type = GravityType::kElevatorStatic;
+  EXPECT_NE(ConfigurationId(c), gravity_id);
+  c.motors[1].master_id = c.motors[1].id;
+  EXPECT_THROW(Validate(c), std::invalid_argument);
+  c.motors[1].master_id = 65535;
+  EXPECT_THROW(Validate(c), std::invalid_argument);
+  c.motors[1].master_id = c.motors[0].id;
+  c.motors[0].bus = "other";
+  EXPECT_THROW(Validate(c), std::invalid_argument);
+  c = SwerveConfig(true);
+  c.motors[1].master_id = c.motors[0].id;
+  c.motors[2].master_id = c.motors[1].id;
+  EXPECT_THROW(Validate(c), std::invalid_argument);
+  c.motors[2].master_id = 0;
+  c.motors[0].master_id = c.motors[1].id;
+  EXPECT_THROW(Validate(c), std::invalid_argument);
+  c = SwerveConfig(true);
+  // Intentionally cast 2 to GravityType to verify validation rejects it.
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  c.motors[0].slots[0].gravity_type = static_cast<GravityType>(2);
+  EXPECT_THROW(Validate(c), std::invalid_argument);
+}
+
+TEST(ConfigWire, FollowersAndGravityRoundTrip) {
+  auto config = SwerveConfig(true);
+  config.motors[1].master_id = config.motors[0].id;
+  config.motors[1].oppose_master = true;
+  config.motors[1].slots[2].gravity_type = GravityType::kArmCosine;
+  Config decoded;
+  ASSERT_TRUE(DeserializeConfig(SerializeConfig(config), decoded));
+  EXPECT_EQ(decoded, config);
+  EXPECT_EQ(ConfigurationId(decoded), ConfigurationId(config));
+}
+
 TEST(Config, RejectsAmbiguousHardwareAndInvalidFeedback) {
   auto c = SwerveConfig(true);
   EXPECT_NO_THROW(Validate(c));
@@ -241,6 +286,32 @@ TEST(Gateway, InvalidMotorFeedbackIsolatesOnlyThatMotor) {
   EXPECT_EQ(backend.last_requests[1].mode, Mode::kVelocity);
   EXPECT_EQ(g.snapshot().counters.neutralized_motor_count, 1u);
   EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+}
+
+TEST(Gateway, NeutralizedMasterAlsoNeutralizesFollowerRegardlessOfOrder) {
+  for (bool master_first : {false, true}) {
+    auto config = SwerveConfig(true);
+    const std::size_t master = master_first ? 0 : 1;
+    const std::size_t follower = master_first ? 1 : 0;
+    config.motors[follower].master_id = config.motors[master].id;
+    for (int failure = 0; failure < 4; ++failure) {
+      FakeBackend backend;
+      if (failure == 0) backend.invalid_motor = config.motors[master].id;
+      if (failure == 1) {
+        config.motors[master].feedback = Feedback::kRemoteCANcoder;
+        config.motors[master].feedback_sensor_id = config.sensors[0].id;
+        backend.invalid_sensor = config.sensors[0].id;
+      }
+      Gateway gateway{config, backend, 1};
+      gateway.Tick(1000, true);
+      auto command = Request(gateway);
+      if (failure == 2) command.motors[master].mode = Mode::kNeutral;
+      if (failure == 3) command.motors[master].demand = 1e9;
+      ASSERT_TRUE(gateway.Accept(command, 1, 1000));
+      EXPECT_EQ(backend.last_requests[master].mode, Mode::kNeutral);
+      EXPECT_EQ(backend.last_requests[follower].mode, Mode::kNeutral);
+    }
+  }
 }
 
 TEST(Gateway, InvalidRemoteFeedbackIsolatesOnlyItsMotor) {

@@ -21,17 +21,18 @@ class Shooter {
  public:
   explicit Shooter(talos::Node& node)
       : node_{node}, flywheel_{node, "flywheel"},
-        target_{node.subscribe<ShooterTarget>(kTargetTopic)},
+        target_{node},
         state_{node.publish<ShooterState>(kStateTopic)} {}
   void update() {
-    const bool spin = talos::robot_enabled(node_) && target_.fresh() && target_->enabled();
-    if (spin) flywheel_.set_velocity(target_->target_velocity_rps());  // else neutral
+    const auto* target = target_.get();
+    if (talos::robot_enabled(node_) && target && target->enabled())
+      flywheel_.set_velocity(target->target_velocity_rps());  // else neutral
     state_.send(ShooterState{/* ... */});
   }
  private:
   talos::Node& node_;
   talos::Motor flywheel_;
-  talos::Subscription<ShooterTarget> target_;
+  talos::Target<ShooterTarget> target_;
   talos::Publisher<ShooterState> state_;
 };
 ```
@@ -49,12 +50,12 @@ class Intake:
         self.node = node
         self.roller = talos.Motor(node, "roller")
         self.beam = talos.DigitalInput(node, "intake_beam")
-        self.target = node.subscribe(IntakeTarget, "/intake/target")
+        self.target = talos.Target(node, IntakeTarget)
         self.state = node.publish(IntakeState, "/intake/state")
 
     def update(self):
-        target = self.target.value  # None until the first message
-        if self.target.fresh() and target.enabled:  # otherwise the flush sends neutral
+        target = self.target.get()  # None while disabled, stale, or without a live lane
+        if talos.robot_enabled(self.node) and target is not None and target.enabled:
             self.roller.set_velocity(roller_demand(target.roller_velocity_rps, self.beam.value))
         self.state.send(beam_broken=self.beam.value, enabled=talos.robot_enabled(self.node))
 ```
@@ -81,6 +82,7 @@ Robot bring-up checklist: [docs/BRINGUP.md](docs/BRINGUP.md).
 | `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle`, `talos_graph_test` |
 | `tools/sync_manifest.py` | writes a config's `robot_manifest.bzl` (`NODES`, `CONFIG_FILES`), which the bundle and graph test read; `manifest_sync_test` fails when it is stale |
 | `2026-robot/` | this season's robot ([README](2026-robot/README.md)) |
+| `2026-robot/main_processor/{driver,autonomous}` | reusable teleop lane wiring and autonomous target production |
 | `examples/superstructure/` | intake + elevator + superstructure example |
 | `studio/` | the telemetry viewer |
 | `sim.sh`, `tools/deploy.sh`, `tools/test_drivetrain.py` | run in sim, deploy, drivetrain smoke test |

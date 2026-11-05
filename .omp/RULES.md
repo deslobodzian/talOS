@@ -11,7 +11,7 @@
   and `talos.cpp_node` rather than a second Python implementation.
 - Language independence: adding or modifying a node in one language never
   requires editing code in another language (e.g. a Python subsystem is wired
-  into its target lanes, `operator_interface` and `telemetry` through TOML
+  into its target lanes, `driver` / `teleop` and `telemetry` through TOML
   config, never by editing C++ files).
 - Messages are FlatBuffers structs only. Topic names come from the package's
   `talos_messages(topics = ...)` and follow talOS/NAMING.md. One writer per topic;

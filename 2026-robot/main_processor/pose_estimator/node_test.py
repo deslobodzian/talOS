@@ -143,7 +143,8 @@ class EstimatorTest(unittest.TestCase):
         return (e.pose_x_m, e.pose_y_m, e.pose_yaw_rad)
 
     def observe(self, camera="front_camera", *, age_s=0.0, x=None, y=None,
-                yaw=None, std=(0.05, 0.05, 0.05), valid=True, time_ns=None):
+                yaw=None, std=(0.05, 0.05, 0.05), valid=True, time_ns=None,
+                tag_count=2):
         """Publishes one observation taken `age_s` before the newest
         drivetrain sample, by default of the chassis' current true pose."""
         if time_ns is None:
@@ -154,12 +155,40 @@ class EstimatorTest(unittest.TestCase):
             pose_x_m=self.chassis.x if x is None else x,
             pose_y_m=self.chassis.y if y is None else y,
             pose_yaw_rad=self.chassis.yaw if yaw is None else yaw,
-            x_std_m=std[0], y_std_m=std[1], yaw_std_rad=std[2], tag_count=2,
+            x_std_m=std[0], y_std_m=std[1], yaw_std_rad=std[2], tag_count=tag_count,
             valid=valid)
 
     def counts(self):
         e = self.estimate()
         return (e.observation_accepted_count, e.observation_rejected_count)
+
+    def test_configured_initial_pose(self):
+        for backend in BACKENDS:
+            with self.subTest(backend):
+                chassis = self.start(backend, extra=(
+                    "initial_x_m = 2.0\ninitial_y_m = 3.0\n"
+                    "initial_yaw_rad = 1.0"))
+                self.assertPoseHeld((2.0, 3.0, 1.0))
+                chassis.hold(DT)
+                self.assertPoseHeld((2.0, 3.0, 1.0))
+
+    def test_tag_bounds_and_innovation_gates(self):
+        for backend in BACKENDS:
+            for observation in (dict(tag_count=0), dict(x=-0.01),
+                                dict(x=16.55), dict(y=-0.01),
+                                dict(y=8.22), dict(x=4.0, tag_count=1)):
+                with self.subTest(backend=backend, observation=observation):
+                    chassis = self.start(backend)
+                    self.observe(**observation)
+                    chassis.hold(DT)
+                    self.assertEqual(self.counts(), (0, 1))
+                    self.assertPoseHeld((0.0, 0.0, 0.0))
+            with self.subTest(backend=backend, relocalization=True):
+                chassis = self.start(backend)
+                self.observe(x=4.0, tag_count=2)
+                chassis.hold(DT)
+                self.assertEqual(self.counts(), (1, 0))
+                self.assertGreater(self.pose()[0], 0.1)
 
     def test_odometry_tracks_a_straight_line_then_an_arc(self):
         for backend in BACKENDS:
@@ -403,6 +432,9 @@ class EstimatorTest(unittest.TestCase):
              robot_toml("factor_graph",
                         extra="factor_graph.odometry_std_yaw_rad = -1.0")),
         ]
+        for key in ("initial_x_m", "initial_y_m", "initial_yaw_rad",
+                    "field_length_m", "field_width_m", "max_innovation_m"):
+            cases.append((key, robot_toml("kalman", extra=f"{key} = nan")))
         for key, toml in cases:
             with self.subTest(key):
                 sim = Sim.from_toml(toml)

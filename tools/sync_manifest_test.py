@@ -16,6 +16,22 @@ def put(root, path, text):
 
 
 class SyncManifestTest(unittest.TestCase):
+    def test_pov_toggle_validation(self):
+        for angle in range(0, 360, 45):
+            sync_manifest._check_teleop(
+                {"bindings": [{"pov": angle, "pov_index": 3,
+                               "on_toggle": {"velocity_rps": 60.0}}]}, "roller")
+        for entry in (
+                {"pov": True, "while_held": {"x": 1}},
+                {"pov": -45, "while_held": {"x": 1}},
+                {"pov": 90, "pov_index": 0.0, "while_held": {"x": 1}},
+                {"pov": 90, "on_toggle": {}},
+                {"button": 1, "while_held": {}, "on_toggle": {"x": 1}},
+                {"axis": 0, "field": "x", "scale": 1, "pov_index": 0}):
+            with self.subTest(entry=entry):
+                with self.assertRaises(sync_manifest.ManifestError):
+                    sync_manifest._check_teleop({"bindings": [entry]}, "roller")
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = self.tmp.name

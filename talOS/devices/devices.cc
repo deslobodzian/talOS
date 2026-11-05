@@ -303,6 +303,10 @@ bool HardwareLink::enabled() const { return impl_->Enabled(); }
 
 bool HardwareLink::fresh() const { return impl_->Fresh(); }
 
+bool HardwareLink::fresh(Duration max_age) const {
+  return impl_->have_state && impl_->Age() < max_age;
+}
+
 Duration HardwareLink::age() const { return impl_->Age(); }
 
 std::optional<Time> HardwareLink::sample_time() const {

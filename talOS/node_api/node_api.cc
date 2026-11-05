@@ -457,6 +457,25 @@ int32_t talos_hardware_sample_time(TalosNode* node, int64_t* out_ns) {
   });
 }
 
+int32_t talos_hardware_fresh(TalosNode* node, int64_t max_age_ns) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    const talos::HardwareLink& link = Link(node);
+    return static_cast<int32_t>(max_age_ns < 0
+                                    ? link.fresh()
+                                    : link.fresh(talos::Duration{max_age_ns}));
+  });
+}
+
+int32_t talos_hardware_age(TalosNode* node, int64_t* out_ns) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
+    const talos::Duration age = Link(node).age();
+    if (age == talos::Duration::max()) return 0;
+    *out_ns = age.count();
+    return 1;
+  });
+}
+
 int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
                         double demand, double ff_volts, int32_t slot) {
   return Guard<int32_t>(TALOS_ERR, [&] {

@@ -64,6 +64,8 @@ class HardwareLink {
   bool enabled() const;
   // Accepted hardware state younger than [robot] command_timeout_us.
   bool fresh() const;
+  // Custom maximum age, independent of the configured command timeout.
+  bool fresh(Duration max_age) const;
   // Age of the last accepted hardware state (Duration::max() if none).
   Duration age() const;
   // Node-clock time at which the gateway sampled the latest accepted

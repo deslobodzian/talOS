@@ -16,9 +16,11 @@ inline constexpr std::size_t kMaxEncoders = 4;
 inline constexpr std::size_t kMaxPwmOutputs = 4;
 enum class SensorKind : uint8_t { kCANcoder = 1, kPigeon2 = 2 };
 enum class Feedback : uint8_t { kRotor = 0, kRemoteCANcoder = 1 };
+enum class GravityType : uint8_t { kElevatorStatic = 0, kArmCosine = 1 };
 
 struct Gains {
   double p{}, i{}, d{}, s{}, v{}, a{}, g{};
+  GravityType gravity_type{GravityType::kElevatorStatic};
   bool operator==(const Gains&) const = default;
 };
 
@@ -42,6 +44,8 @@ struct MotorConfig {
   double max_velocity_rps{100};
   double cruise_velocity_rps{20}, acceleration_rps2{40}, jerk_rps3{0};
   std::array<Gains, 3> slots{};
+  uint16_t master_id{0};  // Zero denotes an independent motor.
+  bool oppose_master{false};
   bool operator==(const MotorConfig&) const = default;
 };
 

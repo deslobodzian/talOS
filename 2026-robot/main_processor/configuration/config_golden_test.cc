@@ -356,6 +356,18 @@ TEST(ConfigTest, PoseEstimatorModuleOffsetsMatchDrivetrainGeometry) {
   const auto config =
       ParseRobotConfig("2026-robot/main_processor/configuration/robot.toml");
   const toml::table& root = config.toml_data;
+  for (const char* key : {"initial_x_m", "initial_y_m", "initial_yaw_rad"}) {
+    EXPECT_DOUBLE_EQ(
+        root.at_path(std::string{"subsystems.pose_estimator."} + key)
+            .value_or(-1.0),
+        0.0);
+  }
+  for (const char* key : {"field_length_m", "field_width_m"}) {
+    EXPECT_EQ(root.at_path(std::string{"subsystems.pose_estimator."} + key)
+                  .value<double>(),
+              root.at_path(std::string{"subsystems.autonomous."} + key)
+                  .value<double>());
+  }
   const auto* modules =
       root.at_path("subsystems.drivetrain.geometry.modules").as_array();
   const auto* xs =

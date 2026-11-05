@@ -13,6 +13,8 @@ is in mechanism units and reads 0 (connected False) until the first state.
 
 import ctypes
 import enum
+import math
+from datetime import timedelta
 
 from talos import _abi
 from talos._abi import lib
@@ -45,6 +47,35 @@ def hardware_sample_time_ns(node):
     found = _abi.ok(lib.talos_hardware_sample_time(node._handle,
                                                    ctypes.byref(sampled)))
     return sampled.value if found else None
+
+
+class HardwareLink:
+    """This node's accepted hardware state; ages are seconds since receipt."""
+
+    def __init__(self, node):
+        self._node = node
+        # Attach the C++ extension during construction, before the loop starts.
+        _abi.ok(lib.talos_hardware_fresh(node._handle, -1))
+
+    def fresh(self, max_age=None) -> bool:
+        """Whether state is younger than max_age (default command timeout)."""
+        if isinstance(max_age, timedelta):
+            max_age = max_age.total_seconds()
+        ns = -1 if max_age is None else round(max_age * 1e9)
+        return bool(_abi.ok(lib.talos_hardware_fresh(self._node._handle, ns)))
+
+    @property
+    def age(self) -> float:
+        """Seconds since the last accepted state; infinity before the first."""
+        ns = ctypes.c_int64()
+        found = _abi.ok(lib.talos_hardware_age(
+            self._node._handle, ctypes.byref(ns)))
+        return ns.value / 1e9 if found else math.inf
+
+    @property
+    def sample_time(self):
+        """Gateway sample time as integer node-clock nanoseconds, or None."""
+        return hardware_sample_time_ns(self._node)
 
 
 class _Device:

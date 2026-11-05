@@ -142,7 +142,7 @@ class SessionGenerator {
       // 3. Invalid observation
       cam_sender_.send(geometry::PoseObservation{
           static_cast<std::uint64_t>(ctx.now.nanos()),
-          geometry::Pose2d{10.0, 10.0, 2.0},
+          geometry::Pose2d{10.0, 8.0, 2.0},
           /*x_std_m=*/0.01,
           /*y_std_m=*/0.01,
           /*yaw_std_rad=*/0.01,

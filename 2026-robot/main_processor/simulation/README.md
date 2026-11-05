@@ -5,19 +5,34 @@ frames as the RoboRIO program, so the companion bridge and subsystem nodes
 run unmodified against either.
 
 ```sh
-# Ideal actuators (fast logic tests); stays enabled without a Driver Station.
-bazel run //2026-robot/main_processor/simulation:sim_gateway
+# Ideal actuators (fast logic tests); defaults to enabled teleop, blue alliance.
+bazel run //2026-robot/main_processor/simulation:sim_gateway -- \
+  --config "$PWD/2026-robot/main_processor/configuration/robot.toml"
 
-# Physics-backed actuators (PID/gearing/direction/limits believability).
-bazel run //2026-robot/main_processor/simulation:sim_gateway -- --physics
+# Physics-backed actuators, bounded to ten seconds.
+bazel run //2026-robot/main_processor/simulation:sim_gateway -- \
+  --config "$PWD/2026-robot/main_processor/configuration/robot.toml" \
+  --physics --duration-s 10
 
-# Either mode accepts a bounded run for scripted checks (no live sim needed).
-bazel run //2026-robot/main_processor/simulation:sim_gateway -- --physics --duration-s 10
+# Script a disabled / autonomous / teleop cycle on the red alliance.
+bazel run //2026-robot/main_processor/simulation:sim_gateway -- \
+  --config "$PWD/2026-robot/main_processor/configuration/robot.toml" \
+  --mode-schedule disabled:0.2,auto:0.5,teleop:0.5,disabled:0.2 \
+  --alliance red --duration-s 1.5
 ```
 
 The summary line (`active_ticks=... first_wheel_rotations=...`) keeps its
 exact format in both modes: `tools/test_drivetrain.py` parses it. The backend
 choice is logged to stderr (`backend=ideal|physics`).
+
+`--mode-schedule` accepts comma-separated `mode:seconds` phases with positive,
+finite fractional durations. Modes are `disabled`, `auto` (or `autonomous`),
+`teleop`, and `test`. After the schedule finishes, the final mode is held until
+stopped or `--duration-s` expires (zero or omitted means unbounded).
+`--alliance blue|red` defaults to blue. Driver Station packets carry the
+scheduled mode and a new `mode_since_us` generation at each mode transition;
+the gateway's enable gate follows that same mode. The bridge publishes these
+packets on `/hw/state/driver_station`, just as it does for the RoboRIO.
 
 ## What is ideal vs physics-backed
 

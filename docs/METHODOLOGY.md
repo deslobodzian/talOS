@@ -326,9 +326,9 @@ producer that has drained it would.
 - A config change runs `talos_graph_test` (CI) and launcher `--describe-only`
   **[enforced]**.
 - A C ABI change keeps `node_api_test` and `talos_test` exercising the new
-  symbol from both languages. An `api_parity_test` comparing `node_api.h`
-  exports with `_abi.py` bindings is planned (today `HardwareLink::fresh()`
-  and `age()` exist only in C++).
+  symbol from both languages. `HardwareLink::fresh()` and `age()` are exposed
+  in both languages; `//talOS/python:api_parity_test` enforces matching ABI
+  versions, exports and parameter counts between `node_api.h` and `_abi.py`.
 
 ## 12. Adding things
 

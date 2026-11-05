@@ -148,6 +148,13 @@ inline AxisState StepAxis(const MotorModel& motor, const MechanismModel& mech,
   return out;
 }
 
+inline double GravityVoltage(const Gains& gains, double mech_pos) {
+  constexpr double kTau = 6.28318530717958647692;
+  return gains.g * (gains.gravity_type == GravityType::kArmCosine
+                        ? std::cos(mech_pos * kTau)
+                        : 1.0);
+}
+
 // Emulated controller voltage. Closed-loop modes run a P+FF loop on
 // the configured gain slot and clamp to the motor's voltage ceiling, so
 // missing gains honestly produce ~0 V. Returns false for commanded neutral
@@ -173,11 +180,12 @@ inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
     case Mode::kVelocity: {
       const auto& gains = cfg.slots[req.slot < 3 ? req.slot : 0];
       const double error = req.demand - mech_vel;
-      volts_out = clamp(req.feedforward_v + gains.p * error +
-                            gains.s * (req.demand >= 0.0 ? 1.0 : -1.0) *
-                                (std::abs(req.demand) > 1e-9 ? 1.0 : 0.0) +
-                            gains.v * req.demand,
-                        ceiling);
+      volts_out =
+          clamp(req.feedforward_v + gains.p * error +
+                    gains.s * (req.demand >= 0.0 ? 1.0 : -1.0) *
+                        (std::abs(req.demand) > 1e-9 ? 1.0 : 0.0) +
+                    gains.v * req.demand + GravityVoltage(gains, mech_pos),
+                ceiling);
       return true;
     }
     case Mode::kPosition:
@@ -186,8 +194,10 @@ inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
       // to position control. Profiled requests are handled by the backend.
       const auto& gains = cfg.slots[req.slot < 3 ? req.slot : 0];
       const double error = req.demand - mech_pos;
-      volts_out = clamp(
-          req.feedforward_v + gains.p * error - gains.d * mech_vel, ceiling);
+      volts_out =
+          clamp(req.feedforward_v + gains.p * error - gains.d * mech_vel +
+                    GravityVoltage(gains, mech_pos),
+                ceiling);
       return true;
     }
   }
@@ -618,11 +628,22 @@ class PhysicsSimBackend final : public Backend {
     }
   }
 
+  bool FeedbackValid(std::size_t i) const {
+    if (!motor_connected_[i]) return false;
+    if (config_.motors[i].feedback != Feedback::kRemoteCANcoder) return true;
+    const int sensor = motor_to_sensor_[i];
+    return sensor >= 0 && sensor_connected_[sensor];
+  }
+
   void StepModels(double dt_s) {
     if (dt_s < 0.0) return;
+    applied_volts_.fill(0.0);
+    powered_.fill(false);
+    std::array<bool, kMaxMotors> resolved{};
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       const auto& m = config_.motors[i];
-      MotorModel motor;
+      if (m.master_id != 0) continue;
+      resolved[i] = true;
       MechanismModel mech;
       mech.gear_ratio = Gear(i);
       mech.brake = m.brake;
@@ -644,22 +665,49 @@ class PhysicsSimBackend final : public Backend {
         const double sign = velocity > 0.0 ? 1.0 : velocity < 0.0 ? -1.0 : 0.0;
         const double ceiling =
             std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply_v_);
-        volts = std::clamp(req.feedforward_v +
-                               gains.p * (profile.profile_pos_rot - mech_pos) +
-                               gains.v * velocity + gains.a * accel +
-                               gains.s * sign + gains.d * (velocity - mech_vel),
-                           -ceiling, ceiling);
-        want_power = motor_connected_[i];
+        volts = std::clamp(
+            req.feedforward_v + gains.p * (profile.profile_pos_rot - mech_pos) +
+                gains.v * velocity + gains.a * accel + gains.s * sign +
+                gains.d * (velocity - mech_vel) +
+                GravityVoltage(gains, mech_pos),
+            -ceiling, ceiling);
+        want_power = FeedbackValid(i);
       } else {
         profile.active = false;
-        want_power = motor_connected_[i] &&
+        want_power = FeedbackValid(i) &&
                      DriveVoltage(req, m, mech_pos, mech_vel, supply_v_, volts);
       }
-      double rotor_volts = m.inverted ? -volts : volts;
-      axes_[i] = StepAxis(motor, mech, axes_[i], rotor_volts, want_power,
-                          supply_v_, dt_s);
       applied_volts_[i] = want_power ? volts : 0.0;
       powered_[i] = want_power;
+    }
+    // Resolve follower chains before integrating any axis: configuration order
+    // cannot introduce a one-step delay. Missing masters/cycles stay neutral.
+    for (std::size_t pass = 0; pass < config_.motors.size(); ++pass) {
+      bool progress = false;
+      for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+        if (resolved[i]) continue;
+        const auto& m = config_.motors[i];
+        const int master = MotorIndex(m.master_id);
+        if (master < 0 || !resolved[master]) continue;
+        resolved[i] = true;
+        progress = true;
+        powered_[i] = FeedbackValid(i) && powered_[master];
+        applied_volts_[i] = powered_[i] ? applied_volts_[master] *
+                                              (m.oppose_master ? -1.0 : 1.0)
+                                        : 0.0;
+      }
+      if (!progress) break;
+    }
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      const auto& m = config_.motors[i];
+      MotorModel motor;
+      MechanismModel mech;
+      mech.gear_ratio = Gear(i);
+      mech.brake = m.brake;
+      const double volts = applied_volts_[i];
+      const double rotor_volts = m.inverted ? -volts : volts;
+      axes_[i] = StepAxis(motor, mech, axes_[i], rotor_volts, powered_[i],
+                          supply_v_, dt_s);
     }
     if (!gyro_override_ && !modules_.empty()) {
       constexpr double kTau = 6.28318530717958647692;

@@ -1,4 +1,4 @@
-# Preload shot, then a blue-origin waypoint; Red rotates the waypoint pi.
+# Preload shot, then a field waypoint; Red rotates about the field centre.
 [subsystem]
 name = "autonomous"
 node = "//2026-robot/main_processor/autonomous:node"
@@ -15,3 +15,8 @@ yaw_tolerance_rad = 0.05
 max_linear_mps = 2.0
 max_angular_radps = 3.0
 feed_duration_us = 500000
+field_length_m = 16.54
+field_width_m = 8.21
+# Feedback velocity per metre/radian of pose error.
+xy_feedback_per_m_mps = 1.0
+yaw_feedback_per_rad_radps = 1.0
