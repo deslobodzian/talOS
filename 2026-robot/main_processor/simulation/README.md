@@ -28,6 +28,11 @@ controller voltage output and writes rotor position/velocity back. Closed-loop
 demands with missing gains honestly stall; neutral coasts/brakes per the
 motor's brake flag instead of snapping to zero.
 
+MotionMagic uses trapezoidal position/velocity setpoints when both cruise
+velocity and acceleration are positive, including velocity/acceleration
+feedforward and velocity-error damping. Without those limits it uses the
+ordinary position loop.
+
 ## Deterministic stepping
 
 Physics has no wall-clock or randomness: `Read()` derives `dt` from
@@ -40,8 +45,12 @@ concerns, intentionally outside the model and tested separately.
 
 Beam breaks and limit-switch inputs via `SetDigitalInput`; soft limits come
 from `MotorConfig` and are enforced in physics. `FreezeFeedback`,
-`SetMotorConnected`/`SetSensorConnected` (disconnect fails `Read`, which is
-the gateway fault path; reconnect recovers), `SetSupplyVoltage`, and
-`RestartController` (zeroes motion, keeps config) cover the rest. Pigeon yaw
-integrates `SetChassisYawRate`; full swerve-chassis coupling is future work
-(roller/flywheel mechanisms first).
+`SetMotorConnected`/`SetSensorConnected` (a disconnect invalidates only that
+sample; `Read` fails only when all configured motors and sensors disconnect),
+`SetSupplyVoltage`, and `RestartController` (zeroes motion, keeps config)
+cover the rest. Pigeon yaw derives from the tangential motion of named
+`*_drive`/`*_steer` pairs, with `front`/`back` (`rear`) and `left`/`right`
+locating modules at ±0.30 m and a 0.0508 m wheel radius. Tests with other
+names or dimensions can register pairs using `SetSwerveModuleGeometry`.
+`SetGyro` and `SetChassisYawRate` explicitly override automatic coupling
+until reconfiguration or controller restart.

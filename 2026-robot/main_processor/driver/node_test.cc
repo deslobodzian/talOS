@@ -148,6 +148,59 @@ TEST(Driver, DeadbandIsZeroInsideAndContinuousAtTheThreshold) {
               1e-6);
 }
 
+TEST(Driver, CircularDeadbandCapsDiagonalAndPreservesDirection) {
+  Harness harness{kNoDeadbandRobotRelative};
+  harness.Push(DsState(kTeleopEnabled, Stick(-1, -1, 0)));
+  EXPECT_NEAR(harness.chassis().vx_mps(), kMaxLinear / std::sqrt(2), 1e-9);
+  EXPECT_NEAR(harness.chassis().vy_mps(), kMaxLinear / std::sqrt(2), 1e-9);
+  Harness deadband{"deadband_frac = 0.05\nfield_oriented = false\n"};
+  deadband.Push(DsState(kTeleopEnabled, Stick(-0.04f, -0.04f, 0)));
+  EXPECT_GT(deadband.chassis().vx_mps(), 0);
+  EXPECT_NEAR(deadband.chassis().vx_mps(), deadband.chassis().vy_mps(), 1e-9);
+}
+
+TEST(Driver, RedAllianceReversesFieldTranslationOnly) {
+  Harness harness{kNoDeadbandFieldOriented};
+  harness.PublishHeading(kQuarterTurnRad);
+  auto packet = DsState(kTeleopEnabled, Stick(0, -1, -0.5f));
+  packet.fms.alliance = ds::Alliance::kRed;
+  harness.Push(packet);
+  EXPECT_NEAR(harness.chassis().vx_mps(), 0, 1e-9);
+  EXPECT_NEAR(harness.chassis().vy_mps(), kMaxLinear, 1e-9);
+  EXPECT_NEAR(harness.chassis().omega_radps(), 3, 1e-9);
+}
+
+TEST(Driver, RezeroLatchesOnlyOnRisingEdge) {
+  Harness harness{kNoDeadbandFieldOriented};
+  harness.PublishHeading(kQuarterTurnRad);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1, 0, 1)));
+  EXPECT_NEAR(harness.chassis().vx_mps(), kMaxLinear, 1e-9);
+  harness.PublishHeading(std::numbers::pi);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1, 0, 1)));
+  EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1, 0)));
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1, 0, 1)));
+  EXPECT_NEAR(harness.chassis().vx_mps(), kMaxLinear, 1e-9);
+}
+
+TEST(Driver, HeadingHoldCorrectsWrappedErrorAndResetsAfterManualTurn) {
+  Harness harness{"deadband_frac = 0.0\nheading_hold_radps = 4.0\n"};
+  harness.PublishHeading(std::numbers::pi - 0.1);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+  harness.PublishHeading(-std::numbers::pi + 0.1);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+  EXPECT_NEAR(harness.chassis().omega_radps(), -0.8, 1e-9);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, -0.5f)));
+  EXPECT_NEAR(harness.chassis().omega_radps(), 3, 1e-9);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+  EXPECT_NEAR(harness.chassis().omega_radps(), 0, 1e-9);
+  harness.Advance(1s);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+  EXPECT_NEAR(harness.chassis().omega_radps(), 0, 1e-9);
+  harness.Push(DsState(ds::kDsAttached, Stick(0, 0, 0)));
+  EXPECT_FALSE(harness.chassis_active());
+}
+
 TEST(Driver, TuningAndBindingsComeFromTheSubsystemTable) {
   Harness harness{
       "deadband_frac = 0.0\nfield_oriented = false\nmax_linear_mps = 2.0\n"};

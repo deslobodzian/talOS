@@ -91,10 +91,14 @@ class FakeBackend : public Backend {
     return configure_ok;
   }
   bool Read(State& s) override {
-    for (auto& m : s.motors) m.valid = healthy;
+    for (auto& m : s.motors) m.valid = healthy && m.id != invalid_motor;
+    for (auto& sensor : s.sensors) {
+      sensor.valid = healthy && sensor.id != invalid_sensor;
+    }
     return healthy;
   }
-  bool Apply(std::span<const MotorRequest>) override {
+  bool Apply(std::span<const MotorRequest> requests) override {
+    last_requests.assign(requests.begin(), requests.end());
     ++applied;
     return apply_ok;
   }
@@ -118,6 +122,8 @@ class FakeBackend : public Backend {
   int pending_ticks{};
   bool configure_ok{true}, healthy{true}, apply_ok{true}, restore_ok{true};
   int applied{}, neutral{}, configure_calls{};
+  uint16_t invalid_motor{}, invalid_sensor{};
+  std::vector<MotorRequest> last_requests{};
   std::vector<std::string> events{};
   std::vector<uint16_t> resets{};
   std::optional<ConfigError> config_error{};
@@ -222,6 +228,38 @@ TEST(Gateway, DisableAndTelemetryFailureInvalidateOutstandingCommands) {
   g.Tick(5000, true);
   EXPECT_FALSE(g.Accept(command, 1, 5000));
   EXPECT_TRUE(g.Accept(Request(g), 0, 5000));
+}
+TEST(Gateway, InvalidMotorFeedbackIsolatesOnlyThatMotor) {
+  FakeBackend backend;
+  auto config = SwerveConfig(true);
+  backend.invalid_motor = config.motors[0].id;
+  Gateway g{config, backend, 1};
+  g.Tick(1000, true);
+  ASSERT_TRUE(g.Accept(Request(g), 1, 1000));
+  ASSERT_EQ(backend.last_requests.size(), config.motors.size());
+  EXPECT_EQ(backend.last_requests[0].mode, Mode::kNeutral);
+  EXPECT_EQ(backend.last_requests[1].mode, Mode::kVelocity);
+  EXPECT_EQ(g.snapshot().counters.neutralized_motor_count, 1u);
+  EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+}
+
+TEST(Gateway, InvalidRemoteFeedbackIsolatesOnlyItsMotor) {
+  FakeBackend backend;
+  auto config = SwerveConfig(true);
+  std::size_t steer_index = 0;
+  while (config.motors[steer_index].feedback != Feedback::kRemoteCANcoder) {
+    ++steer_index;
+  }
+  backend.invalid_sensor = config.motors[steer_index].feedback_sensor_id;
+  Gateway g{config, backend, 1};
+  g.Tick(1000, true);
+  ASSERT_TRUE(g.Accept(Request(g), 1, 1000));
+  for (std::size_t i = 0; i < config.motors.size(); ++i) {
+    EXPECT_EQ(backend.last_requests[i].mode,
+              i == steer_index ? Mode::kNeutral : Mode::kVelocity);
+  }
+  EXPECT_EQ(g.snapshot().counters.neutralized_motor_count, 1u);
+  EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
 }
 TEST(Gateway, RejectsWholeTransactionBeforeApplyingAnyMotor) {
   FakeBackend backend;

@@ -31,15 +31,9 @@ stator_limit_a = 80.0
 max_voltage = 12.0
 sensor_to_mechanism_ratio = 1.0
 max_velocity_rps = 100.0
-# Velocity-loop gains (slot 0, selected by intake.py). ALL ZERO means
-# UNTUNED: with no feedforward the wheel lags its demand and Studio's
-# requested-vs-measured rows split apart. Tune in order:
-#   v (kV, rps -> volt): raise until steady-state measured ~= requested;
-#   p: raise until the step response stops lagging, back off at oscillation;
-#   s (static friction, volt): smallest value that breaks the wheel loose;
-#   i, d: leave zero until v+p+s cannot hold speed under load.
-# Compare [motors.flywheel] in the shooter config for a tuned example.
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+# Velocity-loop starting gains (slot 0, selected by intake.py).
+# Commission under load: tune v for steady-state tracking, then p for response.
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
 
 [digital_inputs.intake_beam]
 dio = 1

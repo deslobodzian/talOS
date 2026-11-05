@@ -168,7 +168,11 @@ TEST(Swerve, EachModuleIsLimitedByItsOwnDriveAndWheel) {
 TEST(Swerve, ForwardKinematicsInvertsInverseKinematics) {
   const SwerveGeometry geometry = Geometry();
   SwerveKinematics kinematics{geometry};
-  const auto modules = kinematics.ToModuleStates({1.0, -0.5, 0.8}, {});
+  const auto initial = kinematics.ToModuleStates({1.0, -0.5, 0.8}, {});
+  if (!initial.has_value()) {
+    FAIL() << "Expected initial module states";
+  }
+  const auto modules = kinematics.ToModuleStates({1.0, -0.5, 0.8}, *initial);
   if (!modules.has_value()) {
     FAIL() << "ToModuleStates returned nullopt";
   }
@@ -184,6 +188,48 @@ TEST(Swerve, UnitBoundary) {
   EXPECT_NEAR(WheelTravel(2.0, 0.05).value(), 2.0 * kTau * 0.05, 1e-15);
   EXPECT_NEAR(WheelSpeed(3.0, 0.05).value(), 3.0 * kTau * 0.05, 1e-15);
   EXPECT_NEAR(WheelRps(WheelSpeed(3.0, 0.05), 0.05), 3.0, 1e-12);
+}
+
+TEST(Swerve, CosineScalingSuppressesMisalignedDrive) {
+  const auto geometry = Geometry();
+  SwerveKinematics kinematics{geometry};
+  const double full = WheelRps(units::meters_per_second_t{1},
+                               geometry.modules[0].wheel_radius_m);
+  for (double angle : {0.0, 0.125, 0.25}) {
+    std::array<ModuleState, kModuleCount> current{};
+    for (auto& module : current) module.steer_rot = angle;
+    const auto states = kinematics.ToModuleStates({1, 0, 0}, current);
+    if (!states.has_value()) {
+      FAIL() << "Expected module states for valid chassis speeds";
+    }
+    const auto& module_states = *states;
+    for (const auto& state : module_states) {
+      EXPECT_NEAR(state.drive_rps, full * std::cos(angle * kTau), 1e-12);
+    }
+  }
+}
+
+TEST(Swerve, DiscretizationCompensatesCombinedTranslationAndRotation) {
+  SwerveKinematics kinematics{Geometry()};
+  constexpr double dt = 0.02;
+  const auto initial = kinematics.ToModuleStates({1, 0.5, 2}, {}, dt);
+  if (!initial.has_value()) {
+    FAIL() << "Expected initial module states";
+  }
+  const auto aligned = kinematics.ToModuleStates({1, 0.5, 2}, *initial, dt);
+  if (!aligned.has_value()) {
+    FAIL() << "Expected aligned module states";
+  }
+  const auto actual = kinematics.ToChassisSpeeds(*aligned);
+  const auto expected = frc::ChassisSpeeds::Discretize(
+      frc::ChassisSpeeds{units::meters_per_second_t{1},
+                         units::meters_per_second_t{0.5},
+                         units::radians_per_second_t{2}},
+      units::second_t{dt});
+  EXPECT_NEAR(actual.vx_mps, expected.vx.value(), 1e-12);
+  EXPECT_NEAR(actual.vy_mps, expected.vy.value(), 1e-12);
+  EXPECT_NEAR(actual.omega_radps, expected.omega.value(), 1e-12);
+  EXPECT_GT(std::abs(actual.vy_mps - 0.5), 0.01);
 }
 
 // --- geometry from config ------------------------------------------------

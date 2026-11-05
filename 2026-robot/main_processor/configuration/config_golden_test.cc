@@ -52,9 +52,10 @@ inline hardware::Config ReferenceSwerveConfig(bool simulation = false) {
     drive.bus = module.bus;
     drive.inverted = module.drive_inverted;
     drive.sensor_to_mechanism_ratio = 6.75;
-    drive.max_velocity_rps = 20;
+    drive.max_velocity_rps = 14.5;
+    drive.cruise_velocity_rps = 14.5;
     drive.slots[0].p = 0.1;
-    drive.slots[0].v = 0.12;
+    drive.slots[0].v = 0.81;
     c.motors.push_back(drive);
     hardware::MotorConfig steer;
     steer.id = module.steer_id;
@@ -102,6 +103,8 @@ inline hardware::Config ReferenceSwerveConfig(bool simulation = false) {
   roller.feedback_sensor_id = 0;
   roller.rotor_to_sensor_ratio = 1.0;
   roller.sensor_to_mechanism_ratio = 1.0;
+  roller.slots[0].p = 0.1;
+  roller.slots[0].v = 0.12;
   c.motors.push_back(roller);
 
   hardware::DigitalInputConfig beam_break;
@@ -332,6 +335,13 @@ TEST(ConfigTest, TargetPolicyIsTheDefaultForEveryActuatedSubsystem) {
   ASSERT_NE(subs, nullptr);
   // No router node: each subsystem's Target picks its own lane.
   EXPECT_FALSE(subs->contains("arbiter"));
+  EXPECT_TRUE(subs->contains("autonomous"));
+  EXPECT_EQ(config.toml_data.at_path("subsystems.autonomous.node")
+                .value_or(std::string{}),
+            "//2026-robot/main_processor/autonomous:node");
+  EXPECT_EQ(
+      config.toml_data.at_path("subsystems.autonomous.period_us").value_or(0),
+      20000);
   for (const char* name : {"drivetrain", "shooter", "intake"}) {
     const TargetPolicy& policy = config.TargetsFor(name);
     EXPECT_EQ(policy.teleop, std::vector<std::string>{"teleop"}) << name;

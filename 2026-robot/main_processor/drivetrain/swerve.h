@@ -100,7 +100,7 @@ class SwerveKinematics {
   // its own wheel radius and drive max_velocity_rps.
   std::optional<std::array<ModuleState, kModuleCount>> ToModuleStates(
       const ChassisSpeeds& speeds,
-      const std::array<ModuleState, kModuleCount>& current) {
+      const std::array<ModuleState, kModuleCount>& current, double dt_s = 0.0) {
     if (!std::isfinite(speeds.vx_mps) || !std::isfinite(speeds.vy_mps) ||
         !std::isfinite(speeds.omega_radps))
       return std::nullopt;
@@ -110,16 +110,20 @@ class SwerveKinematics {
     // A module with no speed comes back on its remembered heading: the one it
     // has now.
     kinematics_.ResetHeadings(headings);
-    const auto states = kinematics_.ToSwerveModuleStates(
-        frc::ChassisSpeeds{units::meters_per_second_t{speeds.vx_mps},
-                           units::meters_per_second_t{speeds.vy_mps},
-                           units::radians_per_second_t{speeds.omega_radps}});
+    frc::ChassisSpeeds chassis{units::meters_per_second_t{speeds.vx_mps},
+                               units::meters_per_second_t{speeds.vy_mps},
+                               units::radians_per_second_t{speeds.omega_radps}};
+    if (dt_s > 0)
+      chassis = frc::ChassisSpeeds::Discretize(chassis, units::second_t{dt_s});
+    const auto states = kinematics_.ToSwerveModuleStates(chassis);
     std::array<ModuleState, kModuleCount> out{};
     double scale = 1;
     for (std::size_t i = 0; i < kModuleCount; ++i) {
       const SwerveModule& module = geometry_.modules[i];
       frc::SwerveModuleState state = states[i];
       state.Optimize(headings[i]);
+      state.speed *= std::max(
+          0.0, std::cos((state.angle - headings[i]).Radians().value()));
       out[i].drive_rps = WheelRps(state.speed, module.wheel_radius_m);
       if (!std::isfinite(out[i].drive_rps)) return std::nullopt;
       out[i].steer_rot = current[i].steer_rot +

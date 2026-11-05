@@ -9,9 +9,10 @@ ChassisTarget publisher -> drivetrain node -> hardware bridge -> RoboRIO
                               +---- hardware state +----- UDP -----+
 ```
 
-The drivetrain converts chassis velocity to module velocity and steering
-position, desaturates wheel speeds, and selects the shorter steering path.
-At zero requested speed it holds the measured steering angle. Drive requests
+The drivetrain discretizes chassis velocity over its update period to compensate
+translation/rotation skew, selects the shorter steering path, cosine-scales drive
+speed by azimuth error, and desaturates wheel speeds. At zero requested speed it
+holds the measured steering angle. Drive requests
 use TalonFX velocity control; steering uses position control with continuous
 wrapping. The hardware API also supports Motion Magic when a subsystem needs
 profiled positions. This is not yet a trajectory follower or field-relative
@@ -74,6 +75,15 @@ Each producer writes its own lane: `driver` publishes
 node reads them through `talos::Target`, which follows the lane the robot's
 `[robot.targets]` policy names for the current Driver Station mode (nothing
 while the Driver Station is disabled, e-stopped or silent).
+
+The driver applies a circular stick deadband and caps translation radially.
+With a fresh heading, field-oriented translation is alliance-relative (Red is
+rotated by pi); stale headings fall back to robot-relative drive. Joystick 0's
+`rezero_button_id` (1-based, default 1; non-positive disables) latches the current
+heading as driver-forward on its rising edge. `heading_hold_radps` sets angular
+correction per radian of wrapped heading error (configured to 4.0, compiled
+default 0.0); manual rotation resets the held heading, and stale headings or
+disabled/disconnected Driver Station state cancel hold.
 
 Chassis units are meters/second and radians/second. Axes are forward X, left Y,
 CCW yaw. A released lane (`active = 0`), a lane older than the robot's

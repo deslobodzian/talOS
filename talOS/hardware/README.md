@@ -130,8 +130,8 @@ after the last one is left out, and it is valid from the 8th state of a boot.
 The bridge stamps receipt with `talos::event::Poller::now()`, the clock
 `Node::now()` reads.
 
-Driver Station disable/e-stop, command timeout, or invalid telemetry neutralizes
-outputs. Enable transitions and timeout/telemetry stops invalidate outstanding
+Driver Station disable/e-stop, command timeout, or total backend feedback loss
+neutralizes outputs. Enable transitions and timeout/backend stops invalidate
 commands by advancing the epoch. Apply failures neutralize outputs and retry
 on the next fresh command; three consecutive failures latch a fault. A
 disabled-to-enabled transition or successful reconfiguration (including an
@@ -148,9 +148,15 @@ backoff, then accepts fresh commands after a successful restore even if still
 enabled. `Gateway::restore_attempt_count()` counts all restore starts per boot.
 
 Fault scope: stale motor current/voltage zeroes the effort fields but keeps the
-sample valid; an invalid RIO encoder invalidates only that sample; stale or
-invalid motion feedback, CAN sensor loss, disconnects, and failed
-Apply/Configure neutralize every output. DIO/analog/PWM never sink the backend.
+sample valid; an invalid RIO encoder invalidates only that sample. Invalid motor
+motion feedback neutralizes only that motor's non-neutral demands. A missing or
+invalid remote CANcoder also neutralizes only motors using it; healthy motors in
+the same command continue driving. These neutralizations increment
+`neutralized_motor_count`. The backend remains healthy while any configured
+motor or CAN sensor has valid feedback (or none are configured). Total loss of
+all configured motor/CAN-sensor feedback neutralizes every output and advances
+the command epoch. Failed Apply/Configure also neutralizes every output.
+DIO/analog/PWM and RIO encoder validity never sink the backend.
 
 ## RoboRIO
 
@@ -192,11 +198,11 @@ or without a live command. On the real backend, neutral disables PWM pulses
 |---|---|---|
 | Use for | Fast logic tests: wiring, sequencing, timeouts | PID/gearing/direction/limit believability |
 | Velocity demand | Applies instantly, even with zero gains | P+FF loop produces volts; zero gains stall |
-| Position demand | Teleports | P-loop ramps through voltage (no MotionMagic profile yet) |
+| Position demand | Teleports | P-loop ramps through voltage; MotionMagic uses trapezoid profiles |
 | Neutral | Velocity snaps to 0 | Unpowered decay: brake stops fast, coast rolls on |
 | Gearing/inversion | Ignored | Rotor/gearing division, inversion flips direction |
 | Soft limits | Ignored | Clamped, axis stopped at the limit |
-| Pigeon yaw | Zero | Integrates `SetChassisYawRate` chassis motion |
+| Pigeon yaw | Zero | Integrates named swerve drive/steer motion or explicit `SetChassisYawRate` |
 | Supply voltage | Ignored | Scales free speed (`SetSupplyVoltage`) |
 | Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback, per-device disconnect, controller restart |
 

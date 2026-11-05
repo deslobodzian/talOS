@@ -45,6 +45,10 @@ pose_topic = "/pose_estimator/state"
 # deterministic (subsystem, device) id ordering behave exactly as one file.
 # Manifest order is irrelevant: logical ids sort by (subsystem, device) name.
 [[subsystems]]
+name = "autonomous"
+path = "subsystems/autonomous.toml"
+
+[[subsystems]]
 name = "drivetrain"
 path = "subsystems/drivetrain.toml"
 

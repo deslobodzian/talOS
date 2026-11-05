@@ -407,9 +407,8 @@ TEST(SimBelievability, FrozenFeedbackHoldsStaleSamples) {
   EXPECT_GT(s.motors[0].position_rot, held_pos);
 }
 
-// Disconnect invalidates the sample and fails the read (gateway fault
-// path); reconnect recovers. Sensors behave the same way.
-TEST(SimBelievability, DisconnectFailsReadsAndReconnectRecovers) {
+// Individual disconnects invalidate only that sample; total bus loss fails.
+TEST(SimBelievability, DisconnectIsIsolatedUntilAllDevicesAreLost) {
   Config c = SingleMotorConfig();
   c.sensors.push_back({9, "imu", SensorKind::kPigeon2, 30, "rio"});
   PhysicsSimBackend backend;
@@ -419,7 +418,7 @@ TEST(SimBelievability, DisconnectFailsReadsAndReconnectRecovers) {
   ASSERT_TRUE(backend.Read(s));
   backend.SetMotorConnected(1, false);
   s.sample_time_us = 10000;
-  EXPECT_FALSE(backend.Read(s));
+  EXPECT_TRUE(backend.Read(s));
   EXPECT_FALSE(s.motors[0].valid);
   backend.SetMotorConnected(1, true);
   s.sample_time_us = 15000;
@@ -427,11 +426,85 @@ TEST(SimBelievability, DisconnectFailsReadsAndReconnectRecovers) {
   EXPECT_TRUE(s.motors[0].valid);
   backend.SetSensorConnected(9, false);
   s.sample_time_us = 20000;
-  EXPECT_FALSE(backend.Read(s));
+  EXPECT_TRUE(backend.Read(s));
   EXPECT_FALSE(s.sensors[0].valid);
+  backend.SetMotorConnected(1, false);
+  EXPECT_FALSE(backend.Read(s));
   backend.SetSensorConnected(9, true);
   s.sample_time_us = 25000;
   EXPECT_TRUE(backend.Read(s));
+}
+
+TEST(SimBelievability, EmptyBusRemainsHealthy) {
+  PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(Config{}));
+  State state{};
+  EXPECT_TRUE(backend.Read(state));
+}
+
+TEST(SimBelievability, MotionMagicProfilesCruiseAndSettlesInBothDirections) {
+  for (double direction : {-1.0, 1.0}) {
+    Config config = SingleMotorConfig();
+    auto& motor = config.motors[0];
+    motor.cruise_velocity_rps = 2.0;
+    motor.acceleration_rps2 = 4.0;
+    motor.slots[0].p = 1.0;
+    motor.slots[0].v = 0.12;
+    motor.slots[0].a = 0.006;  // 50 ms mechanism time constant times kV.
+    PhysicsSimBackend backend;
+    ASSERT_TRUE(backend.Configure(config));
+    std::array<MotorRequest, kMaxMotors> commands{};
+    commands[0] = {1, Mode::kMotionMagic, 0, direction * 6.0, 0};
+    ASSERT_TRUE(backend.Apply(commands));
+    State state{};
+    uint64_t now = 0;
+    double peak_velocity = 0.0;
+    for (int i = 0; i < 1600; ++i) {
+      StepBackend(backend, state, now, 5000, 1);
+      peak_velocity =
+          std::max(peak_velocity, std::abs(state.motors[0].velocity_rps));
+    }
+    EXPECT_GT(peak_velocity, 1.9);
+    EXPECT_LT(peak_velocity, 2.1);
+    EXPECT_NEAR(state.motors[0].position_rot, direction * 6.0, 0.01);
+    EXPECT_NEAR(state.motors[0].velocity_rps, 0.0, 0.01);
+  }
+}
+
+TEST(SimBelievability, SwerveRotationDrivesPigeonAndExplicitOverrideWins) {
+  Config config;
+  const std::array<const char*, 4> names{"front_left", "front_right",
+                                         "back_left", "back_right"};
+  const std::array<double, 4> angles{0.375, 0.125, -0.375, -0.125};
+  std::array<MotorRequest, kMaxMotors> commands{};
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    auto drive = TestMotor(2 * i + 1, "drive", static_cast<int>(2 * i + 1));
+    drive.name = std::string(names[i]) + "_drive";
+    auto steer = TestMotor(2 * i + 2, "steer", static_cast<int>(2 * i + 2));
+    steer.name = std::string(names[i]) + "_steer";
+    steer.slots[0].p = 1.0;
+    config.motors.push_back(drive);
+    config.motors.push_back(steer);
+    commands[2 * i + 1] = {steer.id, Mode::kPosition, 0, angles[i], 0};
+  }
+  config.sensors.push_back({20, "imu", SensorKind::kPigeon2, 30, "rio"});
+  PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(backend.Apply(commands));
+  State state{};
+  uint64_t now = 0;
+  StepBackend(backend, state, now, 5000, 400);
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    commands[2 * i] = Duty(2 * i + 1, 0.02);
+  }
+  ASSERT_TRUE(backend.Apply(commands));
+  StepBackend(backend, state, now, 5000, 201);
+  EXPECT_GT(state.sensors[0].position_rot, 0.15);
+  EXPECT_GT(state.sensors[0].velocity_rps, 0.2);
+  backend.SetGyro(2.0, -0.25);
+  StepBackend(backend, state, now, 5000, 200);
+  EXPECT_NEAR(state.sensors[0].position_rot, 1.75, 1e-9);
+  EXPECT_DOUBLE_EQ(state.sensors[0].velocity_rps, -0.25);
 }
 
 // Supply-voltage change scales the available speed; restart zeroes

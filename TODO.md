@@ -8,7 +8,7 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
 
 - [x] `controller_address`: `robot_bundle` is built from `configuration/robot_field.toml` (an `include` overlay setting `10.56.87.2`); `robot.toml` stays loopback for sim. `bundle_test` fails if the bundled config does not resolve to `10.56.87.2`.
 - [ ] Give the Mac Mini the static address `10.56.87.11`. It is compiled into the RIO program (`kCompanionAddress` in `2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp`), which only sends state there.
-- [ ] Check the CAN ids in `subsystems/*.toml` against Phoenix Tuner X; measure the four CANcoder `offset_rot` (all `0.0`); check each `inverted`; tune the intake `slot0` (all zero: the roller will not follow its demand) and the drivetrain gains (drive `v = 0.12` with `sensor_to_mechanism_ratio = 6.75` looks like a rotor-side value; mechanism-side would be about 0.81 [read]). Then `commissioned = true`, and update `config_golden_test` in the same change.
+- [ ] Check the CAN ids in `subsystems/*.toml` against Phoenix Tuner X; measure the four CANcoder `offset_rot` (all `0.0`); check each `inverted`; verify and tune the sim-consistent intake roller `slot0` (`p = 0.1`, `v = 0.12`) and drivetrain defaults (`slot0.v = 0.81`, `max_velocity_rps = 14.5`, `cruise_velocity_rps = 14.5`) on the real robot. Only then set `commissioned = true`, and update `config_golden_test` in the same change.
 - [ ] Build and test on the Mini first (`bazel test //...`), then build `robot_bundle` there (there is no cross-compile config), `tools/deploy.sh install`, `enable-boot --user <account>`, and check the drivetrain, shooter and intake in the order in docs/BRINGUP.md. `enable-boot` installs a LaunchDaemon (`/Library/LaunchDaemons/org.talos.robot.plist`) with sudo; only its `--dry-run` has run.
 - [ ] Confirm two timing changes behave on the real link (sim cannot: the node and the RIO share one clock and the link has no latency):
   - target freshness is measured from when the node receives the target (`Subscription::fresh()`, `talOS/node/node.cc`), not from a sender timestamp (`issued_ns` has been removed);
@@ -53,6 +53,15 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
 - [x] RTMS enforces a single writer at runtime (dead writers are reclaimable). Reader-slot exhaustion is an explicit error, and the graph lint rejects a topic with more than 8 declared readers.
 - [x] Tests no longer share host-global shared-memory names: `ShmObjectName` hashes `TALOS_SHM_NAMESPACE` / `TEST_TMPDIR` into `/~<16 hex>` under `bazel test`. The `exclusive` tags are removed from `continuity_test` and `replay_inputs_test`, and `hardware_node_test.cc` uses OS-assigned ephemeral UDP ports.
 
+## Control, simulation & autonomous (2026-11-05)
+
+- [x] Per-motor feedback faults are isolated in `Gateway::Accept`, `PhoenixBackend::Read` and `PhysicsSimBackend::Read`: a disconnected/stale motor or remote CANcoder neutralizes only that motor; whole-robot unhealthy triggers only on total CAN bus loss.
+- [x] Swerve kinematics uses second-order `ChassisSpeeds::Discretize` and scales drive speed by the cosine of steer error (`2026-robot/main_processor/drivetrain/swerve.h`).
+- [x] Driver controls use a circular deadband and radial speed cap, a Red-alliance field-frame flip, rising-edge gyro re-zero (`rezero_button_id`) and proportional heading hold (`heading_hold_radps`) in `2026-robot/main_processor/driver/driver.h`.
+- [x] Sim-consistent config defaults: drivetrain drive `slot0.v = 0.81`, `max_velocity_rps = 14.5` and `cruise_velocity_rps = 14.5` in `drivetrain.toml`; intake roller `slot0` uses `p = 0.1`, `v = 0.12` in `intake.toml`. Real-robot verification/tuning remains required before commissioning.
+- [x] `PhysicsSimBackend` implements MotionMagic trapezoidal profiling and automatic swerve-to-Pigeon2 rotational coupling (`talOS/hardware/sim_physics.h`).
+- [x] `//2026-robot/main_processor/autonomous:node` writes `/drivetrain/target/auto`, `/shooter/target/auto` and `/intake/target/auto`: preload spinup → feed → alliance-aware waypoint + intake → hold. All six missing-auto graph warnings on `2026-robot` are eliminated.
+
 ## Decisions taken
 
 - [x] Odometry when the RIO link drops: hold. `Drivetrain` clears `modules_valid`/`yaw_valid`, zeroes speeds and keeps the last module positions while samples are stale.
@@ -64,10 +73,10 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
 - [x] `.gitattributes`: `* text=auto eol=lf`.
 - [x] A real second repo: `examples/wrist_repo` (`@wrist`, dev dependency + `local_path_override`) consumed and bundled by `examples/external_subsystem`; its tests run from `//...` through `:wrist_tests`.
 - [x] Earlier: Studio slimmed in place, teleop split into `driver` + `[[teleop.bindings]]`, `include` overlays.
+- [x] Initial waypoint/preload autonomous now publishes all three robot `auto` lanes; the robot no longer idles because those producers are missing. Multi-routine selection and trajectory files remain future work.
 
 ## Open decisions
 
-- [ ] Nothing publishes `/<sub>/target/auto`, so the robot idles in autonomous, and every config warns about it. Fine for bring-up, not for a match.
 - [ ] Studio post-match replay (`studio_bridge --replay-dir <session>`) and a topic inspector/publisher, which would replace the per-subsystem `monitor`/`send_target` binaries. Until decided, shooter and intake have no monitor (only the drivetrain has `monitor` and `send_target`, and neither is in the bundle).
 - [ ] `talOS/` still knows about Studio by label: `config_parser.h` defaults the bridge label and webroot, and the launcher has a `StudioBridge` class. There is no build dependency.
 

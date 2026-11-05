@@ -71,13 +71,24 @@ class FaultyBackend : public Backend {
   bool fail_apply = false;
   bool fail_restore = false;
   int restore_failures_remaining{};
+  uint16_t disconnected_motor{};
   int restore_attempts{};
   bool Configure(const Config& config) override {
     return sim_.Configure(config);
   }
   bool Read(State& state) override {
-    if (fail_read) return false;
-    return sim_.Read(state);
+    const bool read_ok = sim_.Read(state);
+    bool any_valid = state.motor_count == 0 && state.sensor_count == 0;
+    for (std::size_t i = 0; i < state.motor_count; ++i) {
+      auto& motor = state.motors[i];
+      motor.valid &= !fail_read && motor.id != disconnected_motor;
+      any_valid |= motor.valid;
+    }
+    for (std::size_t i = 0; i < state.sensor_count; ++i) {
+      state.sensors[i].valid &= !fail_read;
+      any_valid |= state.sensors[i].valid;
+    }
+    return read_ok && any_valid;
   }
   bool Apply(std::span<const MotorRequest> commands) override {
     if (fail_apply) return false;
@@ -190,6 +201,43 @@ TEST(GatewayScenario, MissingFeedbackFaultsAndBlocksCommands) {
   EXPECT_TRUE(gw.Accept(
       FreshCommand(gw, kBootId, Mode::kVelocity, 10.0, recovered_now, 2), 2,
       recovered_now));
+}
+TEST(GatewayScenario, DisconnectedMotorLeavesHealthyMotorDriving) {
+  FaultyBackend backend;
+  auto config = RollerConfig();
+  auto second = config.motors[0];
+  second.id = 8;
+  second.name = "second";
+  second.can_id = 6;
+  config.motors.push_back(second);
+  Gateway gw(config, backend, kBootId);
+  gw.Tick(2000, true);
+  auto command = FreshCommand(gw, kBootId, Mode::kVelocity, 10.0, 2000, 1);
+  command.count = 2;
+  command.motors[1] = {second.id, Mode::kVelocity, 0, 12.0, 0.0};
+  ASSERT_TRUE(gw.Accept(command, 1, 2000));
+  const auto epoch = gw.snapshot().epoch;
+  backend.disconnected_motor = kMotorId;
+  gw.Tick(7000, true);
+  EXPECT_EQ(gw.snapshot().epoch, epoch);
+  command.observed_time_us = 7000;
+  ASSERT_TRUE(gw.Accept(command, 2, 7000));
+  gw.Tick(12000, true);
+  EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 0.0);
+  EXPECT_DOUBLE_EQ(gw.snapshot().motors[1].velocity_rps, 12.0);
+  EXPECT_EQ(gw.snapshot().counters.neutralized_motor_count, 1u);
+  EXPECT_FALSE(HasFlag(gw.snapshot(), kHardwareFault));
+
+  backend.fail_read = true;
+  gw.Tick(17000, true);
+  EXPECT_TRUE(HasFlag(gw.snapshot(), kHardwareFault));
+  EXPECT_FALSE(HasFlag(gw.snapshot(), kCommandActive));
+  EXPECT_GT(gw.snapshot().epoch, epoch);
+  EXPECT_FALSE(gw.Accept(command, 3, 17000));
+  backend.fail_read = false;
+  gw.Tick(22000, true);
+  EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 0.0);
+  EXPECT_DOUBLE_EQ(gw.snapshot().motors[1].velocity_rps, 0.0);
 }
 
 TEST(GatewayScenario, ControllerRestartRequiresFreshEpoch) {

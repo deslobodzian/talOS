@@ -73,7 +73,7 @@ class Drivetrain {
       if (target != nullptr) {
         const auto setpoints = kinematics_.ToModuleStates(
             {target->vx_mps(), target->vy_mps(), target->omega_radps()},
-            measured);
+            measured, std::chrono::duration<double>{node_.period()}.count());
         for (std::size_t i = 0; setpoints && i < kModuleCount; ++i) {
           drive_[i].set_velocity((*setpoints)[i].drive_rps);
           steer_[i].set_position((*setpoints)[i].steer_rot);

@@ -1,0 +1,17 @@
+# Preload shot, then a blue-origin waypoint; Red rotates the waypoint pi.
+[subsystem]
+name = "autonomous"
+node = "//2026-robot/main_processor/autonomous:node"
+period_us = 20000
+shooter_velocity_rps = 60.0
+intake_velocity_rps = 30.0
+# Negative roller demand feeds a held piece past the intake beam interlock.
+feed_velocity_rps = -20.0
+target_x_m = 2.0
+target_y_m = 0.0
+target_yaw_rad = 0.0
+position_tolerance_m = 0.10
+yaw_tolerance_rad = 0.05
+max_linear_mps = 2.0
+max_angular_radps = 3.0
+feed_duration_us = 500000

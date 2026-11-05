@@ -7,6 +7,7 @@ Regenerate after changing the config:
 
 # Every node label robot.toml launches.
 NODES = [
+    "//2026-robot/main_processor/autonomous:node",
     "//2026-robot/main_processor/driver:node",
     "//2026-robot/main_processor/drivetrain:node",
     "//2026-robot/main_processor/intake:node",
@@ -18,6 +19,7 @@ NODES = [
 
 # Every file robot.toml reads besides itself.
 CONFIG_FILES = [
+    "//2026-robot/main_processor/configuration:subsystems/autonomous.toml",
     "//2026-robot/main_processor/configuration:subsystems/driver.toml",
     "//2026-robot/main_processor/configuration:subsystems/drivetrain.toml",
     "//2026-robot/main_processor/configuration:subsystems/intake.toml",

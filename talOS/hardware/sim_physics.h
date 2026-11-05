@@ -22,10 +22,9 @@
 // back as mechanism units (rotor / gear ratio), per CTRE sim guidance that
 // sim state is fed from the device's voltage output, not from the demand.
 //
-// Sensors cross the hardware boundary. CANcoder samples mirror the
-// linked mechanism (motor.feedback_sensor_id); Pigeon yaw integrates the
-// chassis yaw rate set via SetChassisYawRate. Full swerve-chassis coupling is
-// future work; roller/flywheel mechanisms come first.
+// Sensors cross the hardware boundary. CANcoder samples mirror the linked
+// mechanism. Pigeon yaw integrates swerve module motion unless explicitly
+// overridden with SetGyro or SetChassisYawRate.
 //
 // Stopping is consistent. Commanded neutral (Mode::kNeutral, and
 // Neutral() on disable/timeout/failure) removes drive and lets the rotor
@@ -49,6 +48,7 @@
 #include <cmath>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -182,9 +182,8 @@ inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
     }
     case Mode::kPosition:
     case Mode::kMotionMagic: {
-      // P-loop on position with velocity damping. MotionMagic cruise/accel
-      // profiling is NOT emulated (documented limit); the P-loop still ramps
-      // through voltage rather than teleporting.
+      // Without positive cruise/acceleration limits, MotionMagic falls back
+      // to position control. Profiled requests are handled by the backend.
       const auto& gains = cfg.slots[req.slot < 3 ? req.slot : 0];
       const double error = req.demand - mech_pos;
       volts_out = clamp(
@@ -201,6 +200,9 @@ class PhysicsSimBackend final : public Backend {
   bool Configure(const Config& config) override {
     config_ = config;
     axes_.fill(AxisState{});
+    profiles_.fill(Profile{});
+    gyro_override_ = false;
+    modules_.clear();
     commands_.fill(MotorRequest{});
     applied_volts_.fill(0.0);
     powered_.fill(false);
@@ -232,6 +234,7 @@ class PhysicsSimBackend final : public Backend {
         }
       }
     }
+    ConfigureSwerve();
     return true;
   }
 
@@ -246,7 +249,7 @@ class PhysicsSimBackend final : public Backend {
     }
     previous_time_ = state.sample_time_us;
     StepModels(dt);
-    bool healthy = true;
+    bool healthy = config_.motors.empty() && config_.sensors.empty();
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       const auto& m = config_.motors[i];
       auto& out = state.motors[i];
@@ -259,9 +262,9 @@ class PhysicsSimBackend final : public Backend {
         out.velocity_rps = 0;
         out.voltage = 0;
         out.stator_current_a = 0;
-        healthy = false;
         continue;
       }
+      healthy = true;
       if (frozen_[i]) {
         out = held_[i];
         continue;
@@ -288,9 +291,9 @@ class PhysicsSimBackend final : public Backend {
         out.valid = false;
         out.position_rot = 0;
         out.velocity_rps = 0;
-        healthy = false;
         continue;
       }
+      healthy = true;
       if (s.kind == SensorKind::kPigeon2) {
         // Pigeon yaw comes from simulated chassis motion, never
         // from a motor demand directly.
@@ -370,6 +373,7 @@ class PhysicsSimBackend final : public Backend {
   // to zero motion state.
   void Neutral() override {
     commands_ = {};
+    profiles_.fill(Profile{});
     applied_volts_.fill(0.0);
     powered_.fill(false);
     digital_outputs_.clear();
@@ -401,6 +405,7 @@ class PhysicsSimBackend final : public Backend {
   }
   void BeginRestoreAfterReset() override {
     axes_.fill(AxisState{});
+    profiles_.fill(Profile{});
     commands_.fill(MotorRequest{});
     applied_volts_.fill(0.0);
     powered_.fill(false);
@@ -445,6 +450,8 @@ class PhysicsSimBackend final : public Backend {
   // unaffected (a full reboot epoch bump goes through Reconfigure/Invalidate).
   void RestartController() {
     axes_.fill(AxisState{});
+    profiles_.fill(Profile{});
+    gyro_override_ = false;
     commands_.fill(MotorRequest{});
     applied_volts_.fill(0.0);
     powered_.fill(false);
@@ -455,7 +462,33 @@ class PhysicsSimBackend final : public Backend {
     yaw_rate_rps_ = 0.0;
   }
   // Chassis motion driving the Pigeon, in mechanism rotations/s.
-  void SetChassisYawRate(double yaw_rate_rps) { yaw_rate_rps_ = yaw_rate_rps; }
+  void SetChassisYawRate(double yaw_rate_rps) {
+    gyro_override_ = true;
+    yaw_rate_rps_ = yaw_rate_rps;
+  }
+  void SetGyro(double yaw_rot, double yaw_rate_rps) {
+    SetChassisYawRate(yaw_rate_rps);
+    yaw_rot_ = yaw_rot;
+  }
+  // Override inferred placement, or register arbitrarily named module pairs.
+  // Wheel travel uses the standard 0.0508 m wheel radius.
+  void SetSwerveModuleGeometry(uint16_t drive_id, uint16_t steer_id, double x_m,
+                               double y_m) {
+    const int drive = MotorIndex(drive_id);
+    const int steer = MotorIndex(steer_id);
+    if (drive < 0 || steer < 0 || !std::isfinite(x_m) || !std::isfinite(y_m) ||
+        (x_m == 0.0 && y_m == 0.0))
+      return;
+    for (auto& module : modules_) {
+      if (module.drive == static_cast<std::size_t>(drive)) {
+        module = {static_cast<std::size_t>(drive),
+                  static_cast<std::size_t>(steer), x_m, y_m};
+        return;
+      }
+    }
+    modules_.push_back({static_cast<std::size_t>(drive),
+                        static_cast<std::size_t>(steer), x_m, y_m});
+  }
   double chassis_yaw_rot() const { return yaw_rot_; }
   double applied_voltage(std::size_t motor_index) const {
     return motor_index < applied_volts_.size() ? applied_volts_[motor_index]
@@ -471,6 +504,83 @@ class PhysicsSimBackend final : public Backend {
   }
 
  private:
+  struct Profile {
+    double profile_pos_rot{};
+    double profile_vel_rps{};
+    bool active{};
+  };
+  struct Module {
+    std::size_t drive;
+    std::size_t steer;
+    double x_m;
+    double y_m;
+  };
+
+  void ConfigureSwerve() {
+    const bool has_gyro = std::any_of(
+        config_.sensors.begin(), config_.sensors.end(),
+        [](const auto& s) { return s.kind == SensorKind::kPigeon2; });
+    if (!has_gyro) return;
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      const auto& name = config_.motors[i].name;
+      if (!name.ends_with("_drive")) continue;
+      const auto prefix = name.substr(0, name.size() - 6);
+      for (std::size_t j = 0; j < config_.motors.size(); ++j) {
+        if (config_.motors[j].name != prefix + "_steer") continue;
+        // Conventional module names locate the wheel in the robot frame:
+        // +x forward, +y left. Unknown locations cannot determine rotation.
+        const double x = prefix.find("front") != std::string::npos ? 0.30
+                         : prefix.find("back") != std::string::npos ||
+                                 prefix.find("rear") != std::string::npos
+                             ? -0.30
+                             : 0.0;
+        const double y = prefix.find("left") != std::string::npos    ? 0.30
+                         : prefix.find("right") != std::string::npos ? -0.30
+                                                                     : 0.0;
+        if (x != 0.0 || y != 0.0) modules_.push_back({i, j, x, y});
+      }
+    }
+  }
+
+  // Exact acceleration/cruise/deceleration segments, with a stationary goal.
+  // Replanning from the current setpoint also handles demand changes.
+  double AdvanceProfile(Profile& p, const MotorConfig& cfg, double goal,
+                        double dt) {
+    if (dt <= 0.0) return 0.0;
+    const double direction = p.profile_pos_rot > goal ? -1.0 : 1.0;
+    const double pos = p.profile_pos_rot * direction;
+    const double vel = p.profile_vel_rps * direction;
+    const double accel = cfg.acceleration_rps2;
+    const double cruise = cfg.cruise_velocity_rps;
+    const double cutoff_time = vel / accel;
+    const double distance =
+        std::max(0.0, goal * direction - pos + vel * vel / (2.0 * accel));
+    const double accel_time =
+        std::min(cruise / accel, std::sqrt(distance / accel));
+    const double full_speed_distance =
+        std::max(0.0, distance - accel_time * accel_time * accel);
+    const double end_accel = accel_time - cutoff_time;
+    const double end_cruise = end_accel + full_speed_distance / cruise;
+    const double end_decel = end_cruise + accel_time;
+    double next_pos = goal * direction;
+    double next_vel = 0.0;
+    if (dt < end_accel) {
+      next_vel = vel + dt * accel;
+      next_pos = pos + (vel + dt * accel / 2.0) * dt;
+    } else if (dt < end_cruise) {
+      next_vel = cruise;
+      next_pos = pos + (vel + end_accel * accel / 2.0) * end_accel +
+                 cruise * (dt - end_accel);
+    } else if (dt < end_decel) {
+      const double remaining = end_decel - dt;
+      next_vel = remaining * accel;
+      next_pos = goal * direction - remaining * next_vel / 2.0;
+    }
+    const double previous_vel = p.profile_vel_rps;
+    p.profile_pos_rot = next_pos * direction;
+    p.profile_vel_rps = next_vel * direction;
+    return (p.profile_vel_rps - previous_vel) / dt;
+  }
   bool brownout_{};
   struct ManualEncoder {
     double position_rot{};
@@ -509,7 +619,7 @@ class PhysicsSimBackend final : public Backend {
   }
 
   void StepModels(double dt_s) {
-    yaw_rot_ += yaw_rate_rps_ * dt_s;
+    if (dt_s < 0.0) return;
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       const auto& m = config_.motors[i];
       MotorModel motor;
@@ -522,21 +632,60 @@ class PhysicsSimBackend final : public Backend {
       const double gear = mech.gear_ratio;
       const double mech_pos = axes_[i].rotor_position_rot / gear;
       const double mech_vel = axes_[i].rotor_velocity_rps / gear;
-      const bool want_power =
-          motor_connected_[i] &&
-          DriveVoltage(commands_[i], m, mech_pos, mech_vel, supply_v_, volts);
+      auto& profile = profiles_[i];
+      const auto& req = commands_[i];
+      bool want_power;
+      if (req.mode == Mode::kMotionMagic && m.cruise_velocity_rps > 0.0 &&
+          m.acceleration_rps2 > 0.0) {
+        if (!profile.active) profile = {mech_pos, mech_vel, true};
+        const double accel = AdvanceProfile(profile, m, req.demand, dt_s);
+        const auto& gains = m.slots[req.slot < 3 ? req.slot : 0];
+        const double velocity = profile.profile_vel_rps;
+        const double sign = velocity > 0.0 ? 1.0 : velocity < 0.0 ? -1.0 : 0.0;
+        const double ceiling =
+            std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply_v_);
+        volts = std::clamp(req.feedforward_v +
+                               gains.p * (profile.profile_pos_rot - mech_pos) +
+                               gains.v * velocity + gains.a * accel +
+                               gains.s * sign + gains.d * (velocity - mech_vel),
+                           -ceiling, ceiling);
+        want_power = motor_connected_[i];
+      } else {
+        profile.active = false;
+        want_power = motor_connected_[i] &&
+                     DriveVoltage(req, m, mech_pos, mech_vel, supply_v_, volts);
+      }
       double rotor_volts = m.inverted ? -volts : volts;
       axes_[i] = StepAxis(motor, mech, axes_[i], rotor_volts, want_power,
                           supply_v_, dt_s);
       applied_volts_[i] = want_power ? volts : 0.0;
       powered_[i] = want_power;
     }
+    if (!gyro_override_ && !modules_.empty()) {
+      constexpr double kTau = 6.28318530717958647692;
+      double angular_velocity = 0.0;
+      double lever_squared = 0.0;
+      for (const auto& module : modules_) {
+        const double speed = axes_[module.drive].rotor_velocity_rps /
+                             Gear(module.drive) * kTau * 0.0508;
+        const double angle =
+            axes_[module.steer].rotor_position_rot / Gear(module.steer) * kTau;
+        angular_velocity += speed * (module.x_m * std::sin(angle) -
+                                     module.y_m * std::cos(angle));
+        lever_squared += module.x_m * module.x_m + module.y_m * module.y_m;
+      }
+      yaw_rate_rps_ = angular_velocity / lever_squared / kTau;
+    }
+    yaw_rot_ += yaw_rate_rps_ * dt_s;
   }
 
   Config config_;
   std::optional<uint64_t> previous_time_;
   std::array<MotorRequest, kMaxMotors> commands_{};
   std::array<AxisState, kMaxMotors> axes_{};
+  std::array<Profile, kMaxMotors> profiles_{};
+  std::vector<Module> modules_;
+  bool gyro_override_{false};
   std::array<double, kMaxMotors> applied_volts_{};
   std::array<bool, kMaxMotors> powered_{};
   std::array<bool, kMaxMotors> frozen_{};

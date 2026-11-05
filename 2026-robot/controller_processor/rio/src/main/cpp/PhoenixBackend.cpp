@@ -338,7 +338,7 @@ bool PhoenixBackend::Read(hw::State& s) {
   }
   ph::BaseStatusSignal::RefreshAll(
       false, std::span<ph::BaseStatusSignal* const>{signals_});
-  bool healthy = true;
+  bool healthy = motors_.empty() && sensors_.empty();
   for (std::size_t i = 0; i < motors_.size(); ++i) {
     auto& motor = *motors_[i];
     auto& out = s.motors[i];
@@ -353,7 +353,7 @@ bool PhoenixBackend::Read(hw::State& s) {
     out.fault_flags = motor.GetFaultField(false).GetValue();
     // Stale current/voltage is telemetry-only degradation. The
     // effort fields zero but the sample stays valid and the backend stays
-    // healthy; only lost motion feedback sinks the robot.
+    // healthy; lost motion feedback isolates only the affected motor.
     const bool effort_ok = Fresh(volts) && Fresh(amps) &&
                            std::isfinite(volts.GetValue().value()) &&
                            std::isfinite(amps.GetValue().value());
@@ -361,7 +361,7 @@ bool PhoenixBackend::Read(hw::State& s) {
     out.stator_current_a = effort_ok ? amps.GetValue().value() : 0.0;
     out.valid = Fresh(p) && Fresh(v) && std::isfinite(out.position_rot) &&
                 std::isfinite(out.velocity_rps);
-    healthy &= out.valid;
+    healthy |= out.valid;
     if (!out.valid) {
       out.position_rot = 0;
       out.velocity_rps = 0;
@@ -391,7 +391,7 @@ bool PhoenixBackend::Read(hw::State& s) {
     }
     out.valid &=
         std::isfinite(out.position_rot) && std::isfinite(out.velocity_rps);
-    healthy &= out.valid;
+    healthy |= out.valid;
     if (!out.valid) {
       out.position_rot = 0;
       out.velocity_rps = 0;

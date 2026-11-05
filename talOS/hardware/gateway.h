@@ -16,6 +16,9 @@ class Backend {
  public:
   virtual ~Backend() = default;
   virtual bool Configure(const Config&) = 0;
+  // Return false for a failed read pass or total motor/CAN-sensor feedback
+  // loss, not an individual dropout. With no such devices configured, return
+  // true. Individual sample validity gates only the affected motor in Accept().
   virtual bool Read(State&) = 0;
   virtual bool Apply(std::span<const MotorRequest>) = 0;
   virtual bool ApplyOutputs(
@@ -67,9 +70,12 @@ class Gateway {
   // genuine disabled-side change blocks.
   bool Reconfigure(const Config& config);
   void Tick(uint64_t now_us, bool driver_station_enabled);
-  // Structural errors reject all outputs; range errors neutralize one motor.
-  // Apply failures invalidate commands and retry until the consecutive limit;
-  // re-enabling or any successful Reconfigure clears the apply-failure latch.
+  // Structural errors reject all outputs; range errors or invalid motor/remote
+  // CANcoder feedback neutralize only that motor. Total backend loss
+  // neutralizes all outputs and invalidates outstanding commands by advancing
+  // the epoch. Apply failures invalidate commands and retry until the
+  // consecutive limit; re-enabling or any successful Reconfigure clears the
+  // apply-failure latch.
   bool Accept(const Command& command, uint64_t sequence, uint64_t now_us);
   State snapshot() const;
   const Config& config() const { return config_; }

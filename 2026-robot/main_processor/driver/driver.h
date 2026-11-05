@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <numbers>
 
 #include "drivetrain/drive_message_generated.h"
 #include "drivetrain/topics.h"
@@ -26,6 +28,8 @@ class Driver {
         deadband_frac_{node.param("deadband_frac", 0.05)},
         field_oriented_{node.param("field_oriented", true)},
         heading_timeout_{HeadingTimeout(node)},
+        rezero_button_id_{node.param("rezero_button_id", 1)},
+        heading_hold_radps_{node.param("heading_hold_radps", 0.0)},
         chassis_{node, "drivetrain", "teleop"},
         ds_{node, [this] { OnDriver(); }} {
     // The drivetrain owns the heading. One it marks invalid (no gyro) or a
@@ -59,6 +63,7 @@ class Driver {
   // One release on the falling edge, so the drivetrain drops teleop at once
   // rather than timing the last request out.
   void Stop() {
+    holding_heading_ = false;
     if (!commanding_) return;
     commanding_ = false;
     chassis_.release();
@@ -74,18 +79,48 @@ class Driver {
       return;
     }
 
-    double vx = talos::teleop::Deadband(-stick.axis(1), deadband_frac_) *
-                max_linear_mps_;
-    double vy = talos::teleop::Deadband(-stick.axis(0), deadband_frac_) *
-                max_linear_mps_;
-    const double omega =
-        talos::teleop::Deadband(-stick.axis(2), deadband_frac_) *
-        max_angular_radps_;
+    const bool rezero =
+        rezero_button_id_ > 0 && stick.button(rezero_button_id_);
+    if (rezero && !rezero_pressed_ && have_heading_) {
+      yaw_offset_rad_ = yaw_rad_;
+      hold_yaw_rad_ = yaw_rad_;
+      holding_heading_ = true;
+    }
+    rezero_pressed_ = rezero;
+    const double raw_x = -stick.axis(1);
+    const double raw_y = -stick.axis(0);
+    const double magnitude = std::hypot(raw_x, raw_y);
+    const double linear_scale =
+        magnitude > 0 ? talos::teleop::Deadband(std::min(magnitude, 1.0),
+                                                deadband_frac_) *
+                            max_linear_mps_ / magnitude
+                      : 0.0;
+    double vx = raw_x * linear_scale;
+    double vy = raw_y * linear_scale;
+    double omega = talos::teleop::Deadband(-stick.axis(2), deadband_frac_) *
+                   max_angular_radps_;
+    const bool fresh_heading =
+        have_heading_ && node_.now() - heading_at_ < heading_timeout_;
+    if (fresh_heading) {
+      if (omega != 0 || !holding_heading_) hold_yaw_rad_ = yaw_rad_;
+      if (omega == 0 && holding_heading_) {
+        const double error =
+            std::remainder(hold_yaw_rad_ - yaw_rad_, 2 * std::numbers::pi);
+        omega = std::clamp(heading_hold_radps_ * error, -max_angular_radps_,
+                           max_angular_radps_);
+      }
+      holding_heading_ = true;
+    } else {
+      holding_heading_ = false;
+    }
     // Field-relative sticks need a fresh heading; without one, drive
     // robot-relative rather than on a stale or assumed yaw.
-    if (field_oriented_ && have_heading_ &&
-        node_.now() - heading_at_ < heading_timeout_) {
-      const double yaw = yaw_rad_;
+    if (field_oriented_ && fresh_heading) {
+      if (ds_.alliance() == talos::driver_station::Alliance::kRed) {
+        vx = -vx;
+        vy = -vy;
+      }
+      const double yaw = yaw_rad_ - yaw_offset_rad_;
       const double robot_vx = vx * std::cos(yaw) + vy * std::sin(yaw);
       vy = -vx * std::sin(yaw) + vy * std::cos(yaw);
       vx = robot_vx;
@@ -100,9 +135,15 @@ class Driver {
   double deadband_frac_;
   bool field_oriented_;
   talos::Duration heading_timeout_;
+  int rezero_button_id_;
+  double heading_hold_radps_;
   talos::TargetLane<drivetrain::ChassisTarget> chassis_;
   talos::DriverStation ds_;
   double yaw_rad_ = 0;
+  double yaw_offset_rad_ = 0;
+  double hold_yaw_rad_ = 0;
+  bool holding_heading_ = false;
+  bool rezero_pressed_ = false;
   talos::Time heading_at_{};
   bool have_heading_ = false;
   bool commanding_ = false;

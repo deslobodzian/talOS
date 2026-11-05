@@ -207,7 +207,8 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
     ++state_.counters.rejected_command_count;
     return false;
   }
-  // Structure errors reject the transaction; range errors isolate one motor.
+  // Structure errors reject the transaction; range/feedback errors isolate a
+  // motor.
   std::array<MotorRequest, kMaxMotors> requests{};
   for (std::size_t i = 0; i < c.count; ++i) {
     const auto& r = c.motors[i];
@@ -217,7 +218,20 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
       return false;
     }
     requests[i] = r;
+    bool feedback_valid = state_.motors[i].valid;
+    if (m.feedback == Feedback::kRemoteCANcoder) {
+      bool sensor_valid = false;
+      for (std::size_t j = 0; j < state_.sensor_count; ++j) {
+        const auto& sensor = state_.sensors[j];
+        if (sensor.id == m.feedback_sensor_id) {
+          sensor_valid = sensor.valid;
+          break;
+        }
+      }
+      feedback_valid &= sensor_valid;
+    }
     const bool invalid =
+        (r.mode != Mode::kNeutral && !feedback_valid) ||
         !std::isfinite(r.demand) || !std::isfinite(r.feedforward_v) ||
         std::abs(r.feedforward_v) > m.max_voltage ||
         (r.mode == Mode::kDutyCycle && std::abs(r.demand) > 1) ||
