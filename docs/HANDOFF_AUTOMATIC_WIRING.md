@@ -1,38 +1,53 @@
 # Automatic wiring: implementation handoff
 
-This is an **incomplete checkpoint**, not a release or a verified final tree.
-Continue on `agent/automatic-wiring`. Preserve the implementation already here;
-do not restart it from the design document.
+D1 through D6 are implemented and verified in simulation on
+`agent/automatic-wiring`. This is not a robot release: see "Not verified
+anywhere" below and the robot-readiness backlog at the end.
 
 Read this file first, then [METHODOLOGY.md](METHODOLOGY.md) and
 [DESIGN_AUTOMATIC_WIRING.md](DESIGN_AUTOMATIC_WIRING.md). This handoff records
 actual completion status where the design describes intended behavior.
 
-## Status at the 2026-11-04 stop (read this before the sections below)
+## Status at the 2026-11-04 evening stop (read this before the sections below)
 
-`agent/automatic-wiring` at `2cf2694` is verified: `bazel build //...`, 79/79
-tests, `--describe-only` with no errors on all three configs, `sync_manifest
---check` on all four, `./sim.sh --sim-gateway` 15 s with every process exiting
-0 and no restarts, decoded `log_dump`. Studio `pnpm test`/`pnpm build` pass.
+`agent/automatic-wiring` at `75356df` is verified:
 
-| Item | State on `agent/automatic-wiring` |
+- `bazel build //...` and 83/83 tests pass.
+- `--describe-only` reports no errors on all three configs.
+- `sync_manifest --check` passes on all four configs.
+- `./sim.sh --sim-gateway --no-studio --no-open --duration-s 15` runs 9
+  processes; every one exits 0 with no restarts.
+- Changed C++ passes clang-format (21, not CI's 18).
+
+| Item | State |
 |---|---|
 | D1 | Done. Mode generation in DS packets and the 16-byte envelope header; regressions in C++ and Python; selected source in registry v2 and Studio. Live sim fault table held; stick to drive request median 2.99 ms (old 4.98 ms). |
+| D2 | Done, docs pass reviewed claim by claim (`e76e357`). |
+| D3 | Done. `//talOS/telemetry:node` observes every `state`/`status` sender in the declared graph (observer endpoints the lint ignores). Channels are `<owner>/<role>/<field>`, units come from field suffixes, enum labels from reflection, stale values are NaN. `[studio] topic` (default `/talos/telemetry`) and `pose_topic` (missing topic or `geometry.Pose2d` is a construction error). The robot telemetry package is deleted. Gate: a scaffolded Python `wrist` appeared on the live Studio Signals page as `wrist/state/velocity_rps` [rot/s], `enabled`, `connected` with no edits outside its package. |
+| D4 | Done. `//talOS/teleop:node` reads `[[teleop.bindings]]` (parsed once in `config_parser.h`, mirrored by `sync_manifest.py`, shared fixtures), resolves fields through the lane reader's schema in the declared graph, and writes `/<sub>/target/teleop`. The first live binding wins per field; it releases when nothing is live and goes silent while disabled, out of teleop, stale or disconnected. `operator_interface` became `driver` (chassis only, `deadband_frac`); shooter/intake buttons live in their own TOMLs. Gate: a throwaway `wrist` with one TOML binding, live sim plus `send_joystick --buttons 4` for 5 s: 250 `active: true, velocity_rps: 20` lane sends, 248 `WristState {enabled: true, velocity_rps: 20}`, released before and after. |
 | D5 | Done. Shared accept/reject fixtures for parser and `sync_manifest`; effective-config scaffold checks; bundle identity over config-relative paths; relocated-bundle test; scaffold goldens; `@wrist//:node` second repo proven in a throwaway. |
-| D2 | Code done: `.bfbs`, suffix lint, descriptors and hash, schema on every endpoint, attach check, session-owned segments, `.tlog` v5 with descriptors, reflection-only Python codec, param-suffix warning. C ABI 15. Docs pass pending (below). |
-| D6 | Done except `--replay-inputs`: wpimath/robotpy/gtsam pins, lockstep test, bundle `lib/`, radians, module positions, bridge clock offset and `sample_time_ns`, list params, Python `pose_estimator` (kalman or factor_graph), `--type estimator` scaffold. |
-| D3, D4 | Not on this branch. Side doors (`teleop_button`, `telemetry`, `GenericTarget`, `GenericState`) are already deleted from code. |
+| D6 | Done, including `--replay-inputs`. The hermetic regression `pose_estimator:node_test` replays a generated session twice per backend (kalman and factor_graph) and checks: identical record streams, delayed vision accepted, and stale and invalid observations rejected. Logs are read through a C++ `LogReader` tool, not Python. |
 
-Unmerged branches (worktrees under `.muse/`), none verified with the full finish list:
+Decisions taken while finishing:
 
-| Branch | Content | Next |
-|---|---|---|
-| `wiring/d2docs` | D2 docs pass, written by a Gemini Flash worker | review every claim against the code before merging |
-| `wiring/d2docs-replay` (`d7a8ffd`, WIP) | `--replay-inputs` (`talOS/events/input_replay.*`, node flag, launcher `--replay-inputs DIR --only NODE`); its 12 focused tests pass | fix DESIGN D6 lines that still say "not built"; run it into `pose_estimator` against a recorded sim session twice and compare; full finish list |
-| `wiring/d3d4` (`0466f29`, WIP) | D3/D4 prerequisite only: declared graph with base64 schema bytes, observer subscriptions the lint ignores, `--graph`, launcher second describe pass; focused tests pass | D3 telemetry node, D4 teleop node and `driver` node, Studio, scaffold `[teleop]` example, wrist gate; plan in that commit's worker report (`history://D3D4`) |
+- The declared-graph API (`NodeAccess::declared_graph`, `add_observer`,
+  `robot_config`) is framework-only C++. It has no C ABI or Python
+  counterpart; only the telemetry and teleop nodes use it.
+- Teleop releases its lane once when the DS is disabled, out of teleop,
+  stale or disconnected, then sends nothing until conditions return.
+
+Open, not blocking:
+
+- Lint warnings for `target/auto` lanes that nothing writes yet.
+- Unit-suffix warnings on the superstructure example's `intake` params.
+- Telemetry logs schema-less topics (`/hw/state`) to stderr once at startup.
 
 Not verified anywhere: Linux build (wpimath Linux artifacts), `phoenixTest`
-(GradleRIO wants the missing `MacOSX26.sdk`; `buildRio` compiles), the robot.
+(GradleRIO wants the missing `MacOSX26.sdk`; `buildRio` compiles), CI's
+clang-format-18/clang-tidy-18/buildifier, the robot.
+
+The sections below record the earlier checkpoint's plan and evidence; the
+table above supersedes their status claims.
 
 
 ## User requirements
