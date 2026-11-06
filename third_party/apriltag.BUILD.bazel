@@ -1,3 +1,5 @@
+"""Builds the upstream AprilTag CPU detector and its test data."""
+
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
 package(default_visibility = ["//visibility:public"])
@@ -21,6 +23,9 @@ cc_library(
         "*.h",
         "common/*.h",
     ]),
+    # Camera simulation and capture must sustain their frame rate in fastbuild.
+    # Keep this third-party pixel-processing kernel optimized in every mode.
+    copts = ["-O2"],
     includes = ["."],
     linkopts = ["-lm", "-lpthread"],
 )
@@ -29,4 +34,3 @@ filegroup(
     name = "test_data",
     srcs = glob(["test/data/*.jpg", "test/data/*.txt"]),
 )
-

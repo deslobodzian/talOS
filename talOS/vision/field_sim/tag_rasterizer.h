@@ -15,8 +15,8 @@
 // silently.
 //
 // Honest limitations, documented so sim results are read correctly:
-//   - flat shading only: no lighting falloff, lens blur, motion blur, sensor
-//     noise, or occlusion by field structures/robots;
+//   - flat shading only: no lighting falloff, lens blur, or occlusion by
+//     field structures/robots;
 //   - the background defaults to white, not black: the detector's white
 //     border model samples OUTSIDE the fitted quad, so a black void would
 //     starve it. Matches the repo's proven synthetic renderer;
@@ -27,10 +27,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <opencv2/imgproc.hpp>
+#include <random>
 #include <vector>
 
 #include "talOS/vision/field_sim/sim_camera.h"
@@ -55,15 +57,25 @@ struct SimRenderOptions {
   uint8_t white_gray = 255;
 };
 
+// Caller-owned storage retains capacity across frames and exposure samples.
+struct RenderScratch {
+  std::vector<SimTagDetection> detections;
+  std::vector<SimTagDetection> start;
+  std::vector<SimTagDetection> end;
+  std::vector<uint8_t> instant;
+  cv::Mat accumulated;
+  cv::Mat sensor_noise;
+  cv::Mat exposed;
+};
+
 // Renders every projectable layout tag with a known pattern into gray_out
 // (resized to w*h, row-major, stride w). Tags without a pattern entry are
 // skipped. Returns the number of tags rasterized.
-inline int RenderFieldView(const FieldLayout& layout,
-                           const std::map<int, TagPattern>& patterns,
-                           const SimCameraView& cam,
-                           const talos::geometry::SE3<double>& T_field_robot,
-                           double tag_size_m, const SimRenderOptions& options,
-                           std::vector<uint8_t>* gray_out) {
+inline int RenderInstantaneousFieldView(
+    const FieldLayout& layout, const std::map<int, TagPattern>& patterns,
+    const SimCameraView& cam, const talos::geometry::SE3<double>& T_field_robot,
+    double tag_size_m, const SimRenderOptions& options,
+    std::vector<uint8_t>* gray_out, std::vector<SimTagDetection>* detections) {
   if (gray_out == nullptr) return 0;
   const int w = static_cast<int>(cam.intrinsics.image_width);
   const int h = static_cast<int>(cam.intrinsics.image_height);
@@ -72,8 +84,8 @@ inline int RenderFieldView(const FieldLayout& layout,
   // Header over the caller's buffer: fills write in place, no copy.
   cv::Mat img(h, w, CV_8UC1, gray_out->data());
 
-  std::vector<SimTagDetection> dets =
-      SimulateVisibleTags(layout, cam, T_field_robot, tag_size_m, true);
+  SimulateVisibleTags(layout, cam, T_field_robot, tag_size_m, detections, true);
+  auto& dets = *detections;
   std::sort(dets.begin(), dets.end(), [](const auto& a, const auto& b) {
     return a.T_camera_tag.translation().z() > b.T_camera_tag.translation().z();
   });
@@ -125,15 +137,125 @@ inline int RenderFieldView(const FieldLayout& layout,
         if (!ok) continue;
         // fillConvexPoly takes integer points; rounding matches the old
         // scanline filler's pixel coverage to the pixel.
-        const std::vector<cv::Point> poly = {
-            {cvRound(px[0].x()), cvRound(px[0].y())},
-            {cvRound(px[1].x()), cvRound(px[1].y())},
-            {cvRound(px[2].x()), cvRound(px[2].y())},
-            {cvRound(px[3].x()), cvRound(px[3].y())}};
-        cv::fillConvexPoly(img, poly, cv::Scalar(color));
+        const std::array<cv::Point, 4> poly = {
+            {{cvRound(px[0].x()), cvRound(px[0].y())},
+             {cvRound(px[1].x()), cvRound(px[1].y())},
+             {cvRound(px[2].x()), cvRound(px[2].y())},
+             {cvRound(px[3].x()), cvRound(px[3].y())}}};
+        cv::fillConvexPoly(img, poly.data(), 4, cv::Scalar(color));
       }
     }
     ++painted;
+  }
+  return painted;
+}
+
+// Integrate a global-shutter exposure centered on T_field_robot. Translation
+// is constant in field coordinates; yaw rotates about the robot origin, not
+// the camera. Composing the mounting at each instant therefore includes the
+// camera's tangential velocity from its mounting lever arm.
+inline int RenderFieldView(
+    const FieldLayout& layout, const std::map<int, TagPattern>& patterns,
+    const SimCameraView& cam, const talos::geometry::SE3<double>& T_field_robot,
+    double tag_size_m, const SimRenderOptions& options,
+    std::vector<uint8_t>* gray_out,
+    const Eigen::Vector3d& robot_velocity_field_mps = Eigen::Vector3d::Zero(),
+    double yaw_rate_radps = 0.0, std::mt19937_64* rng = nullptr,
+    RenderScratch* scratch = nullptr) {
+  if (gray_out == nullptr) return 0;
+  if (cam.intrinsics.image_width <= 0 || cam.intrinsics.image_height <= 0 ||
+      !(tag_size_m > 0.0)) {
+    return 0;
+  }
+  const double exposure_s = std::max(0.0, cam.exposure_ms) * 0.001;
+  const bool moving =
+      exposure_s > 0.0 &&
+      (robot_velocity_field_mps.squaredNorm() > 0.0 || yaw_rate_radps != 0.0);
+  // Static rendering remains usable without scratch; motion integration
+  // requires caller-owned storage rather than allocating frame temporaries.
+  if (moving && scratch == nullptr) return 0;
+  RenderScratch local_scratch;
+  if (scratch == nullptr) scratch = &local_scratch;
+  int painted = 0;
+  if (!moving) {
+    painted = RenderInstantaneousFieldView(layout, patterns, cam, T_field_robot,
+                                           tag_size_m, options, gray_out,
+                                           &scratch->detections);
+  } else {
+    auto pose_at = [&](double time) {
+      return talos::geometry::SE3<double>(
+          talos::geometry::SO3<double>::Exp(
+              Eigen::Vector3d(0.0, 0.0, yaw_rate_radps * time)) *
+              T_field_robot.rotation(),
+          T_field_robot.translation() + robot_velocity_field_mps * time);
+    };
+    // Resolve the exposure at roughly half-pixel intervals. Use projected
+    // motion, so depth, focal length and mounting offset all affect sampling.
+    SimulateVisibleTags(layout, cam, pose_at(-exposure_s * 0.5), tag_size_m,
+                        &scratch->start, true);
+    SimulateVisibleTags(layout, cam, pose_at(exposure_s * 0.5), tag_size_m,
+                        &scratch->end, true);
+    double displacement_px = 0.0;
+    for (const auto& a : scratch->start) {
+      for (const auto& b : scratch->end) {
+        if (a.tag_id != b.tag_id) continue;
+        for (int i = 0; i < 4; ++i) {
+          displacement_px =
+              std::max(displacement_px, (a.corners[i] - b.corners[i]).norm());
+        }
+      }
+    }
+    if (displacement_px < 0.5) {
+      painted = RenderInstantaneousFieldView(layout, patterns, cam,
+                                             T_field_robot, tag_size_m, options,
+                                             gray_out, &scratch->detections);
+    } else {
+      const int samples = static_cast<int>(
+          std::clamp(std::ceil(displacement_px * 2.0), 2.0, 64.0));
+      auto& instant = scratch->instant;
+      auto& accumulated = scratch->accumulated;
+      accumulated.create(cam.intrinsics.image_height,
+                         cam.intrinsics.image_width, CV_32FC1);
+      accumulated.setTo(0);
+      for (int sample = 0; sample < samples; ++sample) {
+        const double time = ((sample + 0.5) / samples - 0.5) * exposure_s;
+        painted = std::max(painted,
+                           RenderInstantaneousFieldView(
+                               layout, patterns, cam, pose_at(time), tag_size_m,
+                               options, &instant, &scratch->detections));
+        const cv::Mat sample_image(cam.intrinsics.image_height,
+                                   cam.intrinsics.image_width, CV_8UC1,
+                                   instant.data());
+        cv::add(accumulated, sample_image, accumulated, cv::noArray(), CV_32F);
+      }
+      gray_out->resize(static_cast<size_t>(accumulated.rows) *
+                       accumulated.cols);
+      cv::Mat output(accumulated.rows, accumulated.cols, CV_8UC1,
+                     gray_out->data());
+      accumulated.convertTo(output, CV_8U, 1.0 / samples);
+    }
+  }
+  // Exposure varies coherently across the frame; read noise is independent
+  // for every sensor pixel and added AFTER exposure integration and gain.
+  double gain = 1.0;
+  if (rng != nullptr && cam.exposure_gain_std > 0.0) {
+    std::normal_distribution<double> distribution(1.0, cam.exposure_gain_std);
+    gain = std::max(0.0, distribution(*rng));
+  }
+  cv::Mat output(cam.intrinsics.image_height, cam.intrinsics.image_width,
+                 CV_8UC1, gray_out->data());
+  if (rng != nullptr && cam.sensor_noise_std_gray > 0.0) {
+    scratch->sensor_noise.create(output.size(), CV_32FC1);
+    // Local OpenCV state avoids its thread-global RNG and derives each frame's
+    // deterministic sensor stream from the camera's explicit generator.
+    cv::RNG sensor_rng((*rng)());
+    sensor_rng.fill(scratch->sensor_noise, cv::RNG::NORMAL, 0.0,
+                    cam.sensor_noise_std_gray);
+    output.convertTo(scratch->exposed, CV_32F, gain);
+    cv::add(scratch->exposed, scratch->sensor_noise, scratch->exposed);
+    scratch->exposed.convertTo(output, CV_8U);
+  } else if (gain != 1.0) {
+    output.convertTo(output, CV_8U, gain);
   }
   return painted;
 }

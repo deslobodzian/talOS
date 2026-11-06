@@ -8,3 +8,11 @@ base_yaw_std_rad = 0.06
 initial_x_m = 2.0
 initial_y_m = 2.0
 initial_yaw_rad = 0.0
+
+# Synthetic camera effects only; plausible starting points, not calibration.
+# Independent 8-bit read noise: 2 gray levels (~0.8% of full scale).
+# Frame exposure gain: 2% standard deviation. Exposure: short 5 ms for motion.
+[camera]
+sensor_noise_std_gray = 2.0
+exposure_gain_std = 0.02
+exposure_ms = 5.0

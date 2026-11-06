@@ -235,24 +235,65 @@ TEST(SimCamera, MountYawTurnsTheView) {
   EXPECT_NEAR(dets[0].center.x(), 320.0, 1e-6);
 }
 
-TEST(SimCamera, NoiseIsDeterministicAndZeroMeanSpirit) {
+TEST(SimCamera, NoiseAdvancesAndReplaysWithZeroMeanAndConfiguredVariance) {
   SimCameraView noisy = TestCamera();
-  noisy.pixel_noise_std = 1.0;
+  noisy.pixel_noise_std = 1.5;
   noisy.rng_seed = 42;
-  const auto a = SimulateVisibleTags(SingleTagLayout(), noisy,
-                                     RobotPoseOnField(0.0, 0.0, 0.0), kTagSize);
-  const auto b = SimulateVisibleTags(SingleTagLayout(), noisy,
-                                     RobotPoseOnField(0.0, 0.0, 0.0), kTagSize);
+  std::mt19937_64 rng(noisy.rng_seed), replay_rng(noisy.rng_seed);
+  std::mt19937_64 different_rng(43);
+  const auto layout = SingleTagLayout();
+  const auto pose = RobotPoseOnField(0.0, 0.0, 0.0);
+  double sum = 0, squares = 0, previous = 0;
+  constexpr int kFrames = 4000;
+  for (int i = 0; i < kFrames; ++i) {
+    const auto observed =
+        SimulateVisibleTags(layout, noisy, pose, kTagSize, false, &rng);
+    const auto repeated =
+        SimulateVisibleTags(layout, noisy, pose, kTagSize, false, &replay_rng);
+    ASSERT_EQ(observed.size(), 1u);
+    ASSERT_EQ(repeated.size(), 1u);
+    const double x = observed[0].corners[0].x();
+    EXPECT_DOUBLE_EQ(x, repeated[0].corners[0].x());
+    if (i == 0) {
+      const auto other = SimulateVisibleTags(layout, noisy, pose, kTagSize,
+                                             false, &different_rng);
+      ASSERT_EQ(other.size(), 1u);
+      EXPECT_NE(x, other[0].corners[0].x());
+    } else {
+      EXPECT_NE(x, previous);
+    }
+    previous = x;
+    // Analytic pinhole oracle: fx=500, tag half-width=.1, range=2.
+    const double error = x - 295.0;
+    sum += error;
+    squares += error * error;
+  }
+  const double mean = sum / kFrames;
+  EXPECT_NEAR(mean, 0.0, 0.08);
+  EXPECT_NEAR(std::sqrt(squares / kFrames - mean * mean), 1.5, 0.08);
+}
+
+TEST(SimCamera, GeometryProjectionDoesNotConsumeOrApplyObservationNoise) {
+  auto camera = TestCamera();
+  camera.pixel_noise_std = 20;
+  camera.rng_seed = 31;
+  std::mt19937_64 rng(camera.rng_seed), replay_rng(camera.rng_seed);
+  const auto layout = SingleTagLayout();
+  const auto pose = RobotPoseOnField(0, 0, 0);
+  const auto geometry =
+      SimulateVisibleTags(layout, camera, pose, kTagSize, true, &rng);
+  ASSERT_EQ(geometry.size(), 1u);
+  EXPECT_DOUBLE_EQ(geometry[0].corners[0].x(), 295);
+  const auto a =
+      SimulateVisibleTags(layout, camera, pose, kTagSize, false, &rng);
+  const auto b =
+      SimulateVisibleTags(layout, camera, pose, kTagSize, false, &replay_rng);
   ASSERT_EQ(a.size(), 1u);
   ASSERT_EQ(b.size(), 1u);
   EXPECT_DOUBLE_EQ(a[0].corners[0].x(), b[0].corners[0].x());
-  // Noise actually perturbs (probability-1 event if the RNG runs).
-  EXPECT_NE(a[0].corners[0].x(), 295.0);
-  // ...while the same scene with zero noise is exact.
-  const auto exact =
-      SimulateVisibleTags(SingleTagLayout(), TestCamera(),
-                          RobotPoseOnField(0.0, 0.0, 0.0), kTagSize);
-  EXPECT_DOUBLE_EQ(exact[0].corners[0].x(), 295.0);
+  const auto noiseless = SimulateVisibleTags(layout, camera, pose, kTagSize);
+  ASSERT_EQ(noiseless.size(), 1u);
+  EXPECT_DOUBLE_EQ(noiseless[0].corners[0].x(), 295);
 }
 
 TEST(SimCamera, ExpConventionIsRightHanded) {

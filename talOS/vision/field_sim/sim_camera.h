@@ -20,7 +20,7 @@
 // detectors sometimes fire on partial tags; the sim deliberately excludes
 // them so estimator tests never train on an observation the real pipeline
 // would only produce unreliably. Other honest limitations: no occlusion by
-// field structures or other robots, no motion blur, no dropped frames. The
+// field structures or other robots, no dropped frames. The
 // ambiguity score is a deterministic incidence-angle heuristic, not a
 // measured homography property.
 
@@ -50,9 +50,13 @@ struct SimCameraView {
   // Minimum tag-face incidence: -normal.z() in the camera frame must clear
   // this. 1.0 is dead-on, 0.0 is edge-on.
   double facing_min = 0.2;
-  // Optional zero-mean pixel noise on corners/center for estimator testing.
-  // Seeded, so a sim run replays deterministically.
+  // Fast-path corner/center observation noise, standard deviation in pixels.
   double pixel_noise_std = 0.0;
+  // Rendered sensor noise, standard deviation in 8-bit grayscale levels.
+  double sensor_noise_std_gray = 0.0;
+  // Frame-wide multiplicative exposure gain standard deviation (unitless).
+  double exposure_gain_std = 0.0;
+  double exposure_ms = 0.0;
   uint64_t rng_seed = 0;
 };
 
@@ -92,11 +96,12 @@ inline talos::geometry::SE3<double> RobotPoseOnField(double x_m, double y_m,
 }
 
 // Projects every layout tag into the camera; returns the visible ones in
-// increasing tag-id order. Pure and deterministic for fixed inputs.
+// increasing tag-id order. Only an explicit caller-owned RNG enables noise.
 inline void SimulateVisibleTags(
     const FieldLayout& layout, const SimCameraView& cam,
     const talos::geometry::SE3<double>& T_field_robot, double tag_size_m,
-    std::vector<SimTagDetection>* output, bool geometry_only = false) {
+    std::vector<SimTagDetection>* output, bool geometry_only = false,
+    std::mt19937_64* rng = nullptr) {
   if (!output) return;
   auto& out = *output;
   out.clear();
@@ -110,9 +115,9 @@ inline void SimulateVisibleTags(
   // projected corners pair with detected corners by index.
   const std::array<Eigen::Vector3d, 4> model = GetTagModelCorners(tag_size_m);
 
-  std::mt19937_64 rng(cam.rng_seed);
-  std::normal_distribution<double> noise(0.0, cam.pixel_noise_std);
-  const bool add_noise = cam.pixel_noise_std > 0.0;
+  std::normal_distribution<double> noise(
+      0.0, cam.pixel_noise_std > 0.0 ? cam.pixel_noise_std : 1.0);
+  const bool add_noise = rng && !geometry_only && cam.pixel_noise_std > 0.0;
 
   // FieldLayout offers lookup by id only; probe the plausible id range.
   // FRC fields number tags densely from 1, so 256 covers every season.
@@ -187,11 +192,11 @@ inline void SimulateVisibleTags(
     det.center *= 0.25;
     if (add_noise) {
       for (size_t i = 0; i < 4; ++i) {
-        det.corners[i].x() += noise(rng);
-        det.corners[i].y() += noise(rng);
+        det.corners[i].x() += noise(*rng);
+        det.corners[i].y() += noise(*rng);
       }
-      det.center.x() += noise(rng);
-      det.center.y() += noise(rng);
+      det.center.x() += noise(*rng);
+      det.center.y() += noise(*rng);
     }
     out.push_back(det);
   }
@@ -200,10 +205,10 @@ inline void SimulateVisibleTags(
 inline std::vector<SimTagDetection> SimulateVisibleTags(
     const FieldLayout& layout, const SimCameraView& cam,
     const talos::geometry::SE3<double>& T_field_robot, double tag_size_m,
-    bool geometry_only = false) {
+    bool geometry_only = false, std::mt19937_64* rng = nullptr) {
   std::vector<SimTagDetection> out;
   SimulateVisibleTags(layout, cam, T_field_robot, tag_size_m, &out,
-                      geometry_only);
+                      geometry_only, rng);
   return out;
 }
 

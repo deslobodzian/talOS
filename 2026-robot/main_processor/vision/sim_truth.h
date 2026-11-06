@@ -22,6 +22,8 @@ class SimTruth {
     if (!state.modules_valid() || !std::isfinite(state.vx_mps()) ||
         !std::isfinite(state.vy_mps()) || !std::isfinite(state.omega_radps())) {
       have_sample_ = false;
+      velocity_field_mps_.setZero();
+      yaw_rate_radps_ = 0;
       return;
     }
     if (have_sample_) {
@@ -38,6 +40,11 @@ class SimTruth {
       pose_ = talos::geometry::SE2<double>{start_yaw_ + state.yaw_rad(),
                                            pose_.translation()};
     }
+    const double yaw = pose_.angle();
+    velocity_field_mps_ = Eigen::Vector3d{
+        std::cos(yaw) * state.vx_mps() - std::sin(yaw) * state.vy_mps(),
+        std::sin(yaw) * state.vx_mps() + std::cos(yaw) * state.vy_mps(), 0};
+    yaw_rate_radps_ = state.omega_radps();
     previous_ns_ = stamp;
     have_sample_ = true;
   }
@@ -47,11 +54,18 @@ class SimTruth {
         pose_.translation().x(), pose_.translation().y(), pose_.angle());
   }
 
+  const Eigen::Vector3d& velocity_field_mps() const {
+    return velocity_field_mps_;
+  }
+  double yaw_rate_radps() const { return yaw_rate_radps_; }
+
  private:
   talos::geometry::SE2<double> pose_;
   double start_yaw_;
   std::uint64_t previous_ns_ = 0;
   bool have_sample_ = false;
+  Eigen::Vector3d velocity_field_mps_ = Eigen::Vector3d::Zero();
+  double yaw_rate_radps_ = 0;
 };
 
 }  // namespace vision

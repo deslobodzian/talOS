@@ -189,6 +189,39 @@ TEST(VisionTest, SimTruthRejectsDuplicateInvalidAndDiscontinuousSamples) {
   EXPECT_NEAR(truth.pose().translation().y(), 2.05, 1e-9);
 }
 
+TEST(VisionTest, TruthMotionForExposureUsesFieldAxesAndRejectsInvalidVelocity) {
+  SimTruth truth{2, 2, std::numbers::pi / 2};
+  EXPECT_EQ(truth.velocity_field_mps(), Eigen::Vector3d::Zero());
+  truth.Observe(drivetrain::DrivetrainState{
+      1000000, false, true, true, 2, 1, 0.4, 0, {}, {}, {}, {}});
+  EXPECT_NEAR(truth.velocity_field_mps().x(), -1, 1e-12);
+  EXPECT_NEAR(truth.velocity_field_mps().y(), 2, 1e-12);
+  EXPECT_DOUBLE_EQ(truth.velocity_field_mps().z(), 0);
+  EXPECT_DOUBLE_EQ(truth.yaw_rate_radps(), 0.4);
+  truth.Observe(drivetrain::DrivetrainState{
+      2000000, false, false, true, 20, 10, 4, 0, {}, {}, {}, {}});
+  EXPECT_EQ(truth.velocity_field_mps(), Eigen::Vector3d::Zero());
+  EXPECT_DOUBLE_EQ(truth.yaw_rate_radps(), 0);
+}
+
+TEST(VisionTest, RejectsInvalidSyntheticExposureAndSensorConfiguration) {
+  for (const auto* key :
+       {"sensor_noise_std_gray", "exposure_gain_std", "exposure_ms"}) {
+    for (const auto* value : {"-1.0", "nan", "inf"}) {
+      SCOPED_TRACE(std::string(key) + "=" + value);
+      std::ostringstream text;
+      text << "include = "
+           << std::quoted(
+                  std::filesystem::absolute(Runfile("TALOS_TEST_CONFIG"))
+                      .string())
+           << "\n[subsystems.front_left_camera.camera]\n"
+           << key << " = " << value << '\n';
+      auto sim = talos::testing::Sim::FromToml(text.str());
+      EXPECT_THROW(sim.add<Vision>("front_left_camera"), std::runtime_error);
+    }
+  }
+}
+
 TEST(VisionTest, RejectsOutOfBoundsHighErrorAndNonfiniteEstimates) {
   auto sim = MakeSim(false);
   auto& node = sim.add<Vision>("front_left_camera");

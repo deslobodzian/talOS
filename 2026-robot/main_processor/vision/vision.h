@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -62,6 +63,7 @@ class Vision {
       throw std::runtime_error("vision layout: " + error);
     }
     LoadCamera();
+    rng_.seed(camera_.rng_seed);
     talos::vision::PipelineConfig config;
     config.backend_name = node.param<std::string>("backend", "auto");
     config.intrinsics = camera_.intrinsics;
@@ -199,6 +201,9 @@ class Vision {
     camera_.min_tag_px = number("min_tag_px", 12);
     camera_.facing_min = number("facing_min", 0.2);
     camera_.pixel_noise_std = number("pixel_noise_std", 0);
+    camera_.sensor_noise_std_gray = number("sensor_noise_std_gray", 0);
+    camera_.exposure_gain_std = number("exposure_gain_std", 0);
+    camera_.exposure_ms = number("exposure_ms", 0);
     const auto seed = node_.param<std::int64_t>("camera.rng_seed", 0);
     camera_.rng_seed = seed;
     if (camera_id_ < 0 || camera_id_ > 31 || width < 160 || width > 4096 ||
@@ -207,8 +212,13 @@ class Vision {
         !std::isfinite(camera_.min_tag_px) || !(camera_.min_tag_px >= 0) ||
         !(camera_.facing_min >= 0) || !(camera_.facing_min <= 1) ||
         !std::isfinite(camera_.pixel_noise_std) ||
-        !(camera_.pixel_noise_std >= 0) || seed < 0 ||
-        !camera_.mounting.T_robot_camera.matrix().allFinite()) {
+        !(camera_.pixel_noise_std >= 0) ||
+        !std::isfinite(camera_.sensor_noise_std_gray) ||
+        !(camera_.sensor_noise_std_gray >= 0) ||
+        !std::isfinite(camera_.exposure_gain_std) ||
+        !(camera_.exposure_gain_std >= 0) ||
+        !std::isfinite(camera_.exposure_ms) || !(camera_.exposure_ms >= 0) ||
+        seed < 0 || !camera_.mounting.T_robot_camera.matrix().allFinite()) {
       throw std::runtime_error("invalid vision camera: " +
                                std::string(node_.name()));
     }
@@ -238,7 +248,9 @@ class Vision {
     Completed result;
     if (rasterize_) {
       fs::RenderFieldView(layout_.layout, patterns_, camera_, truth_.pose(),
-                          tag_size_, {}, pixels_.get());
+                          tag_size_, {}, pixels_.get(),
+                          truth_.velocity_field_mps(), truth_.yaw_rate_radps(),
+                          &rng_, &render_scratch_);
       const auto& intr = camera_.intrinsics;
       const talos::vision::Frame frame(
           camera_id_, 1, captured_, now, intr.image_width, intr.image_height,
@@ -248,7 +260,7 @@ class Vision {
     } else {
       detections_.clear();
       fs::SimulateVisibleTags(layout_.layout, camera_, truth_.pose(), tag_size_,
-                              &sim_tags_);
+                              &sim_tags_, false, &rng_);
       for (const auto& tag : sim_tags_) {
         talos::vision::TagDetection3D detection;
         detection.valid = true;
@@ -430,8 +442,10 @@ class Vision {
   talos::Publisher<VisionStatus> status_;
   talos::vision::field_sim::FieldLayoutData layout_;
   talos::vision::field_sim::SimCameraView camera_;
+  std::mt19937_64 rng_;
   std::map<int, talos::vision::field_sim::TagPattern> patterns_;
   std::shared_ptr<std::vector<std::uint8_t>> pixels_;
+  talos::vision::field_sim::RenderScratch render_scratch_;
   std::vector<talos::vision::field_sim::SimTagDetection> sim_tags_;
   std::vector<talos::vision::TagDetection3D> detections_;
   std::unique_ptr<talos::vision::AprilTagPipeline> pipeline_;

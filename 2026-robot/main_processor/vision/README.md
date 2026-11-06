@@ -26,6 +26,38 @@ than 100 ms cannot advance truth. No camera subscribes to the estimator's pose:
 estimator drift cannot move the simulated field or confirm itself. Golden
 config tests keep camera and estimator starting poses equal.
 
+Simulation camera keys live under `[camera]` (shared defaults in
+`vision.toml`, with per-camera overrides in the named camera files):
+
+| Key | Units and meaning |
+| --- | --- |
+| `pixel_noise_std` | Corner-coordinate Gaussian standard deviation in pixels, only for `rasterize = false`; never grayscale noise. Per-camera default: 0.5 px. |
+| `sensor_noise_std_gray` | Independent sensor Gaussian standard deviation in 8-bit grayscale levels; rendered images only. Shared default: 2.0. |
+| `exposure_gain_std` | Dimensionless frame-wide multiplicative gain standard deviation; rendered images only. Shared default: 0.02. |
+| `exposure_ms` | Exposure duration in milliseconds for rendered motion blur. Shared default: 5.0 ms. |
+| `rng_seed` | Nonnegative integer replay seed; each `Vision` instance explicitly owns a persistent `std::mt19937_64`, seeded after camera configuration loads and passed to both simulation paths, so successive frames differ but replay remains repeatable. |
+
+All four noise/exposure magnitudes must be finite and nonnegative; zero disables
+the corresponding effect. These are plausible simulation settings, not measured
+camera specifications: 2 gray levels are about 0.8% of the 8-bit range, 0.02 gain
+represents 2% frame exposure variation, and a short 5 ms exposure limits rather
+than eliminates motion smear at robot speeds. Tune them against captured frames.
+Rasterization receives field-relative measured linear velocity and yaw rate from
+`SimTruth`; it never differentiates a noisy localization estimate. Stationary
+images still have sensor/exposure variation. The direct-corner path does not
+model exposure or image sensor noise. Neither path adds arbitrary pose jitter
+after solving; observation standard deviations describe uncertainty rather than
+perturbing the published pose a second time.
+
+The renderer also receives caller-owned `RenderScratch` retained beside the
+camera's pixel buffer. Motion integration reuses its detection vectors, instant
+image and accumulator across frames rather than hiding mutable state in camera
+configuration or allocating temporary frame buffers on each render.
+Image noise, gain and exposure accumulation use OpenCV kernels over reused
+matrices. The third-party AprilTag target is compiled with `-O2` in every Bazel
+mode, including `fastbuild`: noisy-image thresholding otherwise exceeds the
+camera period even when the surrounding simulation code is unoptimized.
+
 Without `--sim`, construction validates calibration, registers topics and starts
 a worker waiting for the first node-clock tick; it does not open a camera.
 The worker owns all device open/start/stop calls and all detection/localization.
