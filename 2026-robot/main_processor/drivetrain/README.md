@@ -9,14 +9,15 @@ ChassisTarget publisher -> drivetrain node -> hardware bridge -> RoboRIO
                               +---- hardware state +----- UDP -----+
 ```
 
-The drivetrain discretizes chassis velocity over its update period to compensate
-translation/rotation skew, selects the shorter steering path, cosine-scales drive
-speed by azimuth error, and desaturates wheel speeds. At zero requested speed it
+The drivetrain discretizes chassis velocity by taking the SE2 logarithm of
+the desired finite-period translation and rotation, compensating motion skew.
+It selects the shorter steering path, cosine-scales drive speed by azimuth
+error, and desaturates wheel speeds. At zero requested speed it
 holds the measured steering angle. Drive requests
 use TalonFX velocity control; steering uses position control with continuous
 wrapping. The hardware API also supports Motion Magic when a subsystem needs
 profiled positions. This is not yet a trajectory follower or field-relative
-controller; pose estimation and vision are separate future nodes.
+controller; pose estimation and vision run as separate nodes.
 
 Optional `[subsystem]` parameters `max_linear_accel_mps2` and
 `max_angular_accel_radps2` limit commanded chassis acceleration before
@@ -33,12 +34,13 @@ leaves the example limits commented out to preserve existing step behavior.
 
 - `drivetrain.h`: the node, a `talos::Node` class with eight `talos::Motor`s
   and the Pigeon (`drivetrain_imu`); `drivetrain.cc` is `TALOS_NODE`.
-- `swerve.h`: the kinematics, on wpimath's `frc::SwerveDriveKinematics<4>`
-  (inverse and forward kinematics, `SwerveModuleState::Optimize`), and the
-  drivetrain's one unit boundary (`ToRadians`, `WheelTravel`, `WheelSpeed`,
-  `WheelRps`), where shaft rotations become meters and radians. Wheel speeds
-  are desaturated by hand, because each module has its own wheel radius and
-  drive maximum and `DesaturateWheelSpeeds` takes a single one.
+- `swerve.h`: inverse and full least-squares forward kinematics (including
+  off-center layouts), using `talos::geometry::SO2` for principal-valued
+  steering deltas and `SE2::Discretize` for finite-period pose matching.
+  The unit boundary
+  (`ToRadians`, `ToRotations`, `WheelTravel`, `WheelSpeed`, `WheelRps`) uses
+  plain doubles in radians/meters and mechanism rotations. Wheel speeds are
+  desaturated together against each module's wheel radius and drive maximum.
 - `geometry.h`: the geometry, read from `[subsystems.drivetrain.geometry]`;
   each module names its drive, steer and encoder devices, checked against
   this subsystem's devices at startup.

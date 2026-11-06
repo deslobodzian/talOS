@@ -1,8 +1,8 @@
 """Talos contract build rules and macros for FlatBuffers and multi-language messages."""
 
-load("@rules_cc//cc:cc_library.bzl", "cc_library")
-load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@flatbuffers//:build_defs.bzl", "DEFAULT_INCLUDE_PATHS", "flatbuffer_cc_library")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("@rules_python//python:py_info.bzl", "PyInfo")
 
@@ -154,6 +154,7 @@ def _flatc_py_tree_impl(ctx):
     schemas = ctx.attr.schemas[_TalosMessagesInfo].tree
     bfbs = ctx.attr.bfbs[_TalosBfbsInfo].schemas
     inputs = ctx.files.srcs + [schemas] + [s.bfbs for s in bfbs]
+
     # A topics-only package (no srcs) has no flatc output: its namespace
     # package is just __init__.py and topics.py.
     command = (
@@ -248,12 +249,12 @@ def _dep_target(dep, suffix):
     return dep + ":" + dep.split("/")[-1] + suffix
 
 def talos_messages(
-    name,
-    srcs,
-    topics = {},
-    include_prefix = None,
-    deps = [],
-    visibility = ["//visibility:public"]):
+        name,
+        srcs,
+        topics = {},
+        include_prefix = None,
+        deps = [],
+        visibility = ["//visibility:public"]):
     """A package's FlatBuffers messages and topic names, for C++ and Python.
 
     Provides:
@@ -368,6 +369,7 @@ def talos_messages(
         )
         return
     fbs_name = name + "_fbs"
+
     # --no-includes suppresses #include of dep schemas; drop it once this
     # package has deps, and keep each include's prefix so the generated
     # #include names the dep's include prefix (resolved through its cc_library).
@@ -492,14 +494,13 @@ talos_node = rule(
 )
 
 def talos_cc_node(
-    name,
-    node_name,
-    srcs,
-    deps = [],
-    node_target = None,
-    visibility = None,
-    **kwargs
-):
+        name,
+        node_name,
+        srcs,
+        deps = [],
+        node_target = None,
+        visibility = None,
+        **kwargs):
     """A C++ talOS node: sources ending in TALOS_NODE(Class).
 
     TALOS_NODE_NAME and TALOS_NODE_TARGET reach the sources as string-literal
@@ -516,8 +517,9 @@ def talos_cc_node(
       visibility: of the talos_node target (public by default).
       **kwargs: passed to the cc_binary.
     """
+
     # A bundle copies the binary to bin/<name> and its shared libraries
-    # (libwpimath, ...) to lib/ (talos_bundle), so the binary also searches
+    # to lib/ (talos_bundle), so the binary also searches
     # ../lib beside Bazel's own runfiles rpaths.
     linkopts = kwargs.pop("linkopts", []) + select({
         Label("@platforms//os:macos"): ["-Wl,-rpath,@loader_path/../lib"],
@@ -551,16 +553,15 @@ def talos_cc_node(
     )
 
 def talos_py_node(
-    name,
-    node_name,
-    main,
-    class_name,
-    deps = [],
-    data = [],
-    node_target = None,
-    visibility = None,
-    **kwargs
-):
+        name,
+        node_name,
+        main,
+        class_name,
+        deps = [],
+        data = [],
+        node_target = None,
+        visibility = None,
+        **kwargs):
     """A Python talOS node: class `class_name` of the file `main`.
 
     Generates the runner that calls talos.run(Class), as a py_binary wrapped
@@ -823,12 +824,11 @@ talos_bundle = rule(
 )
 
 def talos_graph_test(
-    name,
-    config,
-    nodes,
-    data = [],
-    **kwargs
-):
+        name,
+        config,
+        nodes,
+        data = [],
+        **kwargs):
     """Probes every node in `config` with `launcher --describe-only` and lints the graph.
 
     Args:
@@ -916,5 +916,3 @@ def talos_graph_test(
         deps = [Label("@rules_python//python/runfiles")],
         **kwargs
     )
-
-

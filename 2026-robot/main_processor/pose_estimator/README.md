@@ -14,14 +14,22 @@ disabled. Telemetry draws it through `[subsystems.telemetry] pose_topic`.
 | `/<camera>/state`, per name in `cameras` | `geometry.PoseObservation` | optional subscriptions: a listed camera that is not running is no graph error |
 | `/pose_estimator/state` | `geometry.PoseEstimate` | pose at the newest integrated `sample_time_ns`, the drivetrain's chassis velocity, `valid`, accepted/rejected observation counts |
 
+The configured sources are `front_left_camera`, `front_right_camera`,
+`rear_left_camera` and `rear_right_camera`, built from the shared C++ vision
+node. Each also publishes `vision.VisionStatus` on `/<camera>/status`.
+Live AVFoundation/V4L2 capture starts on the camera's first update and runs
+through a capture callback and processing worker. Under `--sim`, observations
+come from rendered/projected tags using drivetrain-integrated truth, never
+this estimator's output. Camera intrinsics, distortion, mounts and devices
+live in each camera's subsystem file; see [vision](../vision/README.md).
+
 ## Backends
 
 `backend` in `configuration/subsystems/pose_estimator.toml` (an unknown value
 fails at startup):
 
-- `kalman`: `wpimath.estimator.SwerveDrive4PoseEstimator` (C++
-  `frc::SwerveDrivePoseEstimator<4>`), a steady-state Kalman gain with
-  latency compensation by odometry replay. Tuned by `[kalman]
+- `kalman`: Python `wpimath.estimator.SwerveDrive4PoseEstimator`, a steady-state
+  Kalman gain with latency compensation by odometry replay. Tuned by `[kalman]
   state_std_x_m/y_m/yaw_rad`. Odometry goes in through
   `updateWithTime(sample_time_s, ...)` only.
 - `factor_graph`: `gtsam.IncrementalFixedLagSmoother` (iSAM2) over one

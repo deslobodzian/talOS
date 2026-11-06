@@ -1,0 +1,10 @@
+# Shared defaults for every camera; this is not a launched subsystem.
+[subsystem]
+period_us = 50000
+tag_size_m = 0.1651
+rasterize = true
+base_xy_std_m = 0.08
+base_yaw_std_rad = 0.06
+initial_x_m = 2.0
+initial_y_m = 2.0
+initial_yaw_rad = 0.0

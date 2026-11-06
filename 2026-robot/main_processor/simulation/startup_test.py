@@ -179,7 +179,8 @@ class FullStackSimulation(unittest.TestCase):
                     self.assertEqual(set(nodes), {
                         "hardware_node", "autonomous", "driver", "drivetrain",
                         "intake", "pose_estimator", "shooter", "telemetry",
-                        "teleop",
+                        "teleop", "front_left_camera", "front_right_camera",
+                        "rear_left_camera", "rear_right_camera",
                     }, diagnostics)
                     for name, node in nodes.items():
                         with self.subTest(node=name):
@@ -187,7 +188,9 @@ class FullStackSimulation(unittest.TestCase):
                             self.assertFalse(node["recorder_failed"], diagnostics)
                             self.assertEqual(node["restart_count"], 0, diagnostics)
                     for name in ("hardware_node", "autonomous", "drivetrain",
-                                 "pose_estimator"):
+                                 "pose_estimator", "front_left_camera",
+                                 "front_right_camera", "rear_left_camera",
+                                 "rear_right_camera"):
                         with self.subTest(log=name):
                             self.assertGreater(nodes[name]["record_count"], 0,
                                                diagnostics)

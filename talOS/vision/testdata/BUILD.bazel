@@ -1,0 +1,14 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["2026-rebuilt-welded.json"])
+
+filegroup(
+    name = "testdata",
+    srcs = glob([
+        "*.jpg",
+        "*.png",
+        "*.txt",
+        "*.md",
+        "*.json",
+    ]),
+)

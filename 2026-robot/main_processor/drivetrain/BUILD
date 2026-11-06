@@ -17,8 +17,7 @@ talos_messages(
     deps = ["//talOS/msgs:geometry"],
 )
 
-# The swerve kinematics (wpimath's SwerveDriveKinematics) and the geometry
-# they run on, read from config.
+# Swerve kinematics on talOS geometry, with module locations read from config.
 cc_library(
     name = "swerve",
     hdrs = [
@@ -31,8 +30,8 @@ cc_library(
     deps = [
         "//talOS/configuration",
         "//talOS/devices",
+        "//talOS/geometry",
         "//talOS/node",
-        "//third_party/wpilib:wpimath",
     ],
 )
 
@@ -48,7 +47,6 @@ cc_library(
         ":swerve",
         "//talOS/devices",
         "//talOS/node",
-        "//third_party/wpilib:wpimath",
     ],
 )
 

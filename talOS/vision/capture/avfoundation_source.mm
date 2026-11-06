@@ -1,0 +1,326 @@
+#include "talOS/vision/capture/avfoundation_source.h"
+#import <AVFoundation/AVFoundation.h>
+#import <CoreVideo/CoreVideo.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstddef>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
+#include "talOS/events/os/poller.h"
+
+@interface TalosCaptureDelegate
+    : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate> {
+ @public
+  std::function<void(CMSampleBufferRef)> callback;
+}
+@end
+@implementation TalosCaptureDelegate
+- (void)captureOutput:(AVCaptureOutput*)output
+    didOutputSampleBuffer:(CMSampleBufferRef)sample
+           fromConnection:(AVCaptureConnection*)connection {
+  if (callback) callback(sample);
+}
+@end
+
+namespace talos::vision {
+namespace {
+std::vector<CameraMode> Modes(AVCaptureDevice* device) {
+  std::vector<CameraMode> modes;
+  for (AVCaptureDeviceFormat* format in device.formats) {
+    auto d = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+    for (AVFrameRateRange* range in format.videoSupportedFrameRateRanges) {
+      for (double fps : {15., 30., 60.}) {
+        if (fps < range.minFrameRate || fps > range.maxFrameRate) continue;
+        CameraMode mode{static_cast<uint32_t>(d.width),
+                        static_cast<uint32_t>(d.height), fps,
+                        PixelFormat::kBgra8};
+        if (std::find(modes.begin(), modes.end(), mode) == modes.end())
+          modes.push_back(mode);
+      }
+    }
+  }
+  return modes;
+}
+class Source final : public CameraSource {
+ public:
+  Source(uint32_t id, std::string device, double exposure_ms = 0)
+      : id_(id),
+        device_id_(std::move(device)),
+        exposure_ms_(std::isfinite(exposure_ms) && exposure_ms > 0 ? exposure_ms
+                                                                   : 0) {}
+  ~Source() override { Stop(); }
+  uint32_t camera_id() const override { return id_; }
+  std::string device_id() const override { return device_id_; }
+  std::string name() const override { return device_id_; }
+  std::vector<CameraMode> SupportedModes() const override {
+    @autoreleasepool {
+      return Modes([AVCaptureDevice deviceWithUniqueID:@(device_id_.c_str())]);
+    }
+  }
+  CameraMode CurrentMode() const override { return mode_; }
+  bool SetMode(const CameraMode& mode) override {
+    if (running_) return false;
+    if (!mode.width || !mode.height || !std::isfinite(mode.fps) ||
+        mode.fps <= 0 || mode.fps > 2147483.0)
+      return false;
+    mode_ = mode;
+    return true;
+  }
+  CameraControls GetControls() const override { return controls_; }
+  bool SetControls(const CameraControls& c) override {
+    // macOS AVFoundation does not expose manual duration/ISO. Do not claim to
+    // set them.
+    if (!c.auto_exposure || !c.auto_gain) return false;
+    controls_ = c;
+    return true;
+  }
+  void SetFrameCallback(FrameCallback cb) override {
+    callback_ = std::move(cb);
+  }
+  void SetConnectionCallback(ConnectionCallback cb) override {
+    connection_ = std::move(cb);
+  }
+  bool IsRunning() const override { return running_; }
+  bool IsConnected() const override { return running_ && device_.connected; }
+  bool Start() override {
+    if (running_) return true;
+    @autoreleasepool {
+      if (device_id_.empty()) {
+        const auto devices = DiscoverCaptureDevices();
+        if (id_ >= devices.size()) return false;
+        device_id_ = devices[id_].id;
+      }
+      device_ = [AVCaptureDevice deviceWithUniqueID:@(device_id_.c_str())];
+      if (!device_ || !device_.connected) return false;
+      const auto permission =
+          [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
+      if (permission == AVAuthorizationStatusNotDetermined) {
+        // Request once without blocking the detector worker. Its normal device
+        // retry starts capture after the user responds to the macOS prompt.
+        static std::atomic<bool> requested{false};
+        if (!requested.exchange(true)) {
+          [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo
+                                   completionHandler:^(BOOL granted){
+                                   }];
+        }
+        if (connection_)
+          connection_(ConnectionState::kDisconnected,
+                      "Waiting for macOS camera permission");
+        return false;
+      }
+      if (permission != AVAuthorizationStatusAuthorized) {
+        if (connection_)
+          connection_(ConnectionState::kError,
+                      "Camera access is not authorized for this process; "
+                      "enable camera access in macOS Privacy settings");
+        return false;
+      }
+      NSError* error = nil;
+      session_ = [[AVCaptureSession alloc] init];
+      [session_ beginConfiguration];
+      AVCaptureDeviceInput* input =
+          [AVCaptureDeviceInput deviceInputWithDevice:device_ error:&error];
+      if (!input || ![session_ canAddInput:input]) {
+        [session_ commitConfiguration];
+        return false;
+      }
+      [session_ addInput:input];
+      if (![device_ lockForConfiguration:&error]) {
+        [session_ commitConfiguration];
+        return false;
+      }
+      bool selected = false;
+      for (AVCaptureDeviceFormat* format in device_.formats) {
+        auto d =
+            CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+        if (d.width != mode_.width || d.height != mode_.height) continue;
+        for (AVFrameRateRange* range in format.videoSupportedFrameRateRanges) {
+          if (mode_.fps < range.minFrameRate || mode_.fps > range.maxFrameRate)
+            continue;
+          device_.activeFormat = format;
+          device_.activeVideoMinFrameDuration = CMTimeMake(
+              1000, static_cast<int32_t>(std::lround(mode_.fps * 1000.0)));
+          device_.activeVideoMaxFrameDuration =
+              device_.activeVideoMinFrameDuration;
+          selected = true;
+          break;
+        }
+        if (selected) break;
+      }
+      [device_ unlockForConfiguration];
+      if (!selected) {
+        [session_ commitConfiguration];
+        return false;
+      }
+      output_ = [[AVCaptureVideoDataOutput alloc] init];
+      output_.alwaysDiscardsLateVideoFrames = YES;
+      OSType requested = mode_.format == PixelFormat::kGray8
+                             ? kCVPixelFormatType_OneComponent8
+                         : mode_.format == PixelFormat::kYuyv
+                             ? kCVPixelFormatType_422YpCbCr8_yuvs
+                             : kCVPixelFormatType_32BGRA;
+      if (![output_.availableVideoCVPixelFormatTypes
+              containsObject:@(requested)])
+        requested = kCVPixelFormatType_32BGRA;
+      output_.videoSettings =
+          @{(id)kCVPixelBufferPixelFormatTypeKey : @(requested)};
+      for (auto& buffer : buffers_)
+        buffer = std::make_shared<std::vector<uint8_t>>(
+            static_cast<size_t>(mode_.width) * mode_.height * 4);
+      delegate_ = [[TalosCaptureDelegate alloc] init];
+      delegate_->callback = [this](CMSampleBufferRef sample) {
+        Receive(sample);
+      };
+      dispatch_ = dispatch_queue_create("talos.camera", DISPATCH_QUEUE_SERIAL);
+      [output_ setSampleBufferDelegate:delegate_ queue:dispatch_];
+      if (![session_ canAddOutput:output_]) {
+        [session_ commitConfiguration];
+        return false;
+      }
+      [session_ addOutput:output_];
+      [session_ commitConfiguration];
+      session_id_ = event::steady_now().nanos();
+      sequence_ = 0;
+      running_ = true;
+      [session_ startRunning];
+      if (!session_.running) {
+        running_ = false;
+        if (connection_)
+          connection_(ConnectionState::kError, "Capture session did not start");
+        return false;
+      }
+      if (connection_) connection_(ConnectionState::kConnected, "");
+      return true;
+    }
+  }
+  void Stop() override {
+    running_ = false;
+    @autoreleasepool {
+      [session_ stopRunning];
+      [output_ setSampleBufferDelegate:nil queue:nullptr];
+      if (dispatch_)
+        dispatch_sync(dispatch_, ^{
+                      });
+      if (delegate_) delegate_->callback = {};
+      delegate_ = nil;
+      output_ = nil;
+      session_ = nil;
+      device_ = nil;
+      dispatch_ = nullptr;
+    }
+  }
+
+  uint64_t dropped_frames() const override { return dropped_frames_.load(); }
+
+ private:
+  void Receive(CMSampleBufferRef sample) {
+    if (!running_) return;
+    CVPixelBufferRef pixels = CMSampleBufferGetImageBuffer(sample);
+    if (!pixels || CVPixelBufferLockBaseAddress(
+                       pixels, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
+      return;
+    const size_t size =
+        CVPixelBufferGetBytesPerRow(pixels) * CVPixelBufferGetHeight(pixels);
+    std::shared_ptr<std::vector<uint8_t>> bytes;
+    for (size_t i = 0; i < buffers_.size(); ++i) {
+      const size_t index = (next_buffer_ + i) % buffers_.size();
+      if (buffers_[index].use_count() == 1) {
+        bytes = buffers_[index];
+        next_buffer_ = (index + 1) % buffers_.size();
+        break;
+      }
+    }
+    if (!bytes) {
+      ++dropped_frames_;
+      CVPixelBufferUnlockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly);
+      return;
+    }
+    bytes->resize(size);
+    const auto pixel_type = CVPixelBufferGetPixelFormatType(pixels);
+    const auto format = pixel_type == kCVPixelFormatType_OneComponent8
+                            ? PixelFormat::kGray8
+                        : pixel_type == kCVPixelFormatType_422YpCbCr8_yuvs
+                            ? PixelFormat::kYuyv
+                            : PixelFormat::kBgra8;
+    std::memcpy(bytes->data(), CVPixelBufferGetBaseAddress(pixels), size);
+    Frame frame(id_, session_id_, sequence_++, event::Poller::now(),
+                static_cast<uint32_t>(CVPixelBufferGetWidth(pixels)),
+                static_cast<uint32_t>(CVPixelBufferGetHeight(pixels)),
+                static_cast<uint32_t>(CVPixelBufferGetBytesPerRow(pixels)),
+                format, bytes);
+    CVPixelBufferUnlockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly);
+    const CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
+    frame.set_raw_timestamp_ns(
+        CMTIME_IS_NUMERIC(pts) ? CMTimeGetSeconds(pts) * 1e9 : 0);
+    frame.set_timestamp_kind(TimestampKind::kDelivery);
+    frame.set_mapping_quality(TimestampMappingQuality::kEstimated);
+    if (session_.synchronizationClock && CMTIME_IS_NUMERIC(pts)) {
+      const CMTime hostPTS = CMSyncConvertTime(
+          pts, session_.synchronizationClock, CMClockGetHostTimeClock());
+      const double age = CMTimeGetSeconds(
+          CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), hostPTS));
+      if (std::isfinite(age) && age >= 0 && age < 5) {
+        frame.set_capture_time(event::MonotonicTime::from_nanos(
+            event::Poller::now().nanos() - static_cast<int64_t>(age * 1e9) -
+            static_cast<int64_t>(exposure_ms_ * 5e5)));
+        frame.set_timestamp_kind(TimestampKind::kPresentation);
+        frame.set_mapping_quality(TimestampMappingQuality::kInterpolated);
+      }
+    }
+    if (callback_) callback_(frame);
+  }
+  uint32_t id_;
+  std::string device_id_;
+  CameraMode mode_{1280, 720, 30, PixelFormat::kBgra8};
+  CameraControls controls_{.auto_exposure = true, .auto_gain = true};
+  FrameCallback callback_;
+  ConnectionCallback connection_;
+  std::atomic<bool> running_{false};
+  std::atomic<uint64_t> dropped_frames_{0};
+  const double exposure_ms_;
+  uint64_t session_id_ = 0, sequence_ = 0;
+  std::array<std::shared_ptr<std::vector<uint8_t>>, 2> buffers_;
+  size_t next_buffer_{0};
+  AVCaptureDevice* device_ = nil;
+  AVCaptureSession* session_ = nil;
+  AVCaptureVideoDataOutput* output_ = nil;
+  TalosCaptureDelegate* delegate_ = nil;
+  dispatch_queue_t dispatch_ = nullptr;
+};
+}  // namespace
+std::vector<CaptureDevice> DiscoverCaptureDevices() {
+  @autoreleasepool {
+    std::vector<CaptureDevice> result;
+    AVCaptureDeviceDiscoverySession* discovery =
+        [AVCaptureDeviceDiscoverySession
+            discoverySessionWithDeviceTypes:@[
+              AVCaptureDeviceTypeBuiltInWideAngleCamera,
+              AVCaptureDeviceTypeExternalUnknown
+            ]
+                                  mediaType:AVMediaTypeVideo
+                                   position:AVCaptureDevicePositionUnspecified];
+    for (AVCaptureDevice* device in discovery.devices)
+      result.push_back({device.uniqueID.UTF8String,
+                        device.localizedName.UTF8String, Modes(device)});
+    return result;
+  }
+}
+std::unique_ptr<CameraSource> CreateCaptureSource(uint32_t id,
+                                                  const std::string& device) {
+  return std::make_unique<Source>(id, device);
+}
+std::unique_ptr<CameraSource> CreatePlatformCameraSource(
+    const CameraSourceConfig& config) {
+  auto source = std::make_unique<Source>(config.camera_id, config.device_path,
+                                         config.exposure_ms);
+  source->SetMode({config.width, config.height, config.fps, config.format});
+  return source;
+}
+}  // namespace talos::vision

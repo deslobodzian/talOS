@@ -1,0 +1,68 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_cc//cc:objc_library.bzl", "objc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+objc_library(
+    name = "avfoundation",
+    srcs = ["avfoundation_source.mm"],
+    hdrs = ["avfoundation_source.h"],
+    copts = [
+        "-std=c++23",
+        "-fexperimental-library",
+        "-fobjc-arc",
+    ],
+    sdk_frameworks = [
+        "AVFoundation",
+        "CoreMedia",
+        "CoreVideo",
+        "Foundation",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        "//talOS/events:events_core",
+        "//talOS/events:events_os",
+        "//talOS/vision:camera_source",
+        "//talOS/vision:frame",
+    ],
+)
+
+cc_library(
+    name = "capture",
+    srcs = select({
+        "@platforms//os:macos": [],
+        "@platforms//os:linux": ["v4l2_source.cc"],
+        "//conditions:default": ["unsupported_source.cc"],
+    }),
+    hdrs = [
+        "avfoundation_source.h",
+        "v4l2_source.h",
+    ],
+    additional_linker_inputs = select({
+        "@platforms//os:macos": ["Info.plist"],
+        "//conditions:default": [],
+    }),
+    linkopts = select({
+        "@platforms//os:macos": ["-Wl,-sectcreate,__TEXT,__info_plist,$(location Info.plist)"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//talOS/events:events_core",
+        "//talOS/vision:camera_source",
+        "//talOS/vision:frame",
+    ] + select({
+        "@platforms//os:macos": [":avfoundation"],
+        "@platforms//os:linux": ["//talOS/events:events_os"],
+        "//conditions:default": [],
+    }),
+)
+
+cc_test(
+    name = "capture_test",
+    srcs = ["capture_test.cc"],
+    deps = [
+        ":capture",
+        "@googletest//:gtest_main",
+    ],
+)

@@ -1,0 +1,141 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "metal_shaders",
+    hdrs = ["metal_shaders.h"],
+)
+
+cc_library(
+    name = "apriltag_metal_adapter",
+    srcs = [
+        "apriltag_metal_adapter.c",
+        "gpu_sparse_clusters.cc",
+    ],
+    hdrs = [
+        "apriltag_metal_adapter.h",
+        "gpu_sparse_clusters.h",
+    ],
+    deps = [
+        "@apriltag",
+    ],
+)
+
+cc_library(
+    name = "metal_apriltag_backend",
+    srcs = ["metal_apriltag_backend.cc"],
+    hdrs = ["metal_apriltag_backend.h"],
+    deps = [
+        ":apriltag_metal_adapter",
+        ":metal_shaders",
+        "//talOS/geometry",
+        "//talOS/vision:compute_backend",
+        "//talOS/vision:frame",
+        "//talOS/vision:localization",
+        "//talOS/vision/apriltag:cpu_apriltag_backend",
+        "@apriltag",
+        "@eigen3//:eigen",
+        "@opencv//:imgcodecs",
+    ] + select({
+        "@platforms//os:macos": ["//third_party/metal-cpp:metal-cpp-compute"],
+        "//conditions:default": [],
+    }),
+)
+
+cc_test(
+    name = "metal_apriltag_parity_test",
+    size = "small",
+    srcs = ["metal_apriltag_parity_test.cc"],
+    data = [
+        "//talOS/vision/testdata",
+        "@apriltag//:test_data",
+    ],
+    deps = [
+        ":metal_apriltag_backend",
+        "//talOS/geometry",
+        "//talOS/vision:compute_backend",
+        "//talOS/vision:frame",
+        "//talOS/vision/apriltag:cpu_apriltag_backend",
+        "//talOS/vision/apriltag:test_image_loader",
+        "@apriltag",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ] + select({
+        "@platforms//os:macos": ["//third_party/metal-cpp:metal-cpp-compute"],
+        "//conditions:default": [],
+    }),
+)
+
+cc_test(
+    name = "metal_apriltag_perf_test",
+    size = "medium",
+    srcs = ["metal_apriltag_perf_test.cc"],
+    data = [
+        "//talOS/vision/testdata",
+        "@apriltag//:test_data",
+    ],
+    deps = [
+        ":metal_apriltag_backend",
+        "//talOS/geometry",
+        "//talOS/vision:compute_backend",
+        "//talOS/vision:frame",
+        "//talOS/vision:synthetic_source",
+        "//talOS/vision/apriltag:cpu_apriltag_backend",
+        "@apriltag",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ] + select({
+        "@platforms//os:macos": ["//third_party/metal-cpp:metal-cpp-compute"],
+        "//conditions:default": [],
+    }),
+)
+
+cc_test(
+    name = "metal_ccl_clustering_test",
+    size = "medium",
+    srcs = ["metal_ccl_clustering_test.cc"],
+    data = [
+        "//talOS/vision/testdata",
+        "@apriltag//:test_data",
+    ],
+    deps = [
+        ":apriltag_metal_adapter",
+        ":metal_apriltag_backend",
+        ":metal_shaders",
+        "//talOS/geometry",
+        "//talOS/vision:compute_backend",
+        "//talOS/vision:frame",
+        "//talOS/vision:synthetic_source",
+        "//talOS/vision/apriltag:cpu_apriltag_backend",
+        "//talOS/vision/apriltag:test_image_loader",
+        "@apriltag",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ] + select({
+        "@platforms//os:macos": ["//third_party/metal-cpp:metal-cpp-compute"],
+        "//conditions:default": [],
+    }),
+)
+
+cc_test(
+    name = "apriltag_metal_adapter_test",
+    size = "small",
+    srcs = ["apriltag_metal_adapter_test.cc"],
+    data = [
+        "//talOS/vision/testdata",
+        "@apriltag//:test_data",
+    ],
+    deps = [
+        ":apriltag_metal_adapter",
+        ":metal_shaders",
+        "//talOS/vision/apriltag:test_image_loader",
+        "@apriltag",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ] + select({
+        "@platforms//os:macos": ["//third_party/metal-cpp:metal-cpp-compute"],
+        "//conditions:default": [],
+    }),
+)

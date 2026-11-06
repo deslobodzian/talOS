@@ -1,0 +1,134 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "frame",
+    hdrs = ["frame.h"],
+    deps = [
+        "//talOS/events:events_core",
+    ],
+)
+
+cc_library(
+    name = "camera_source",
+    hdrs = ["camera_source.h"],
+    deps = [
+        ":frame",
+    ],
+)
+
+cc_library(
+    name = "synthetic_source",
+    srcs = ["synthetic_source.cc"],
+    hdrs = ["synthetic_source.h"],
+    deps = [
+        ":camera_source",
+        ":frame",
+        "//talOS/events:events_core",
+        "@opencv//:core",
+        "@opencv//:imgproc",
+    ],
+)
+
+cc_library(
+    name = "compute_backend",
+    srcs = ["compute_backend.cc"],
+    hdrs = ["compute_backend.h"],
+    deps = [
+        ":frame",
+        "//talOS/vision/apriltag:cpu_apriltag_backend",
+        "@apriltag",
+        "@opencv//:core",
+        "@opencv//:imgproc",
+    ],
+)
+
+cc_library(
+    name = "calibration",
+    hdrs = ["calibration.h"],
+    deps = [
+        "//talOS/geometry",
+        "@eigen3//:eigen",
+    ],
+)
+
+cc_library(
+    name = "localization",
+    hdrs = ["localization.h"],
+    deps = [
+        ":calibration",
+        "//talOS/geometry",
+        "@apriltag",
+        "@eigen3//:eigen",
+    ],
+)
+
+cc_library(
+    name = "pipeline",
+    srcs = [
+        "pipeline.cc",
+    ],
+    hdrs = [
+        "pipeline.h",
+    ],
+    deps = [
+        ":calibration",
+        ":compute_backend",
+        ":frame",
+        ":localization",
+        "//talOS/events:events_core",
+        "//talOS/geometry",
+        "//talOS/vision/metal:metal_apriltag_backend",
+    ],
+)
+
+cc_test(
+    name = "frame_test",
+    size = "small",
+    srcs = ["frame_test.cc"],
+    deps = [
+        ":frame",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "calibration_test",
+    size = "small",
+    srcs = ["calibration_test.cc"],
+    deps = [
+        ":calibration",
+        "//talOS/geometry",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "localization_test",
+    size = "small",
+    srcs = ["localization_test.cc"],
+    deps = [
+        ":calibration",
+        ":localization",
+        "//talOS/geometry",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "pipeline_test",
+    size = "small",
+    srcs = ["pipeline_test.cc"],
+    deps = [
+        ":compute_backend",
+        ":pipeline",
+        ":synthetic_source",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)

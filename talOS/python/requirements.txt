@@ -3,9 +3,9 @@
 # sha256 of its cp311/py3 wheels for macOS (arm64, x86_64) and manylinux
 # (x86_64, aarch64).
 #
-# robotpy-native-wpimath/wpiutil must stay on the WPILib release that
-# third_party/wpilib/extensions.bzl (_VERSION) and GradleRIO pin;
-# //2026-robot/controller_processor/rio:wpilib_lockstep_test checks it.
+# robotpy-native-wpimath and robotpy-wpimath must stay on the WPILib release
+# GradleRIO pins; wrapper post-releases may extend the native release.
+# //2026-robot/controller_processor/rio:wpilib_lockstep_test checks them.
 flatbuffers==25.12.19 \
     --hash=sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4
 gtsam==4.3.0 \

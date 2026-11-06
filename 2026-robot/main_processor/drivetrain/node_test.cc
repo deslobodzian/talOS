@@ -6,10 +6,12 @@
 #include <execinfo.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -183,18 +185,17 @@ TEST(Swerve, ForwardKinematicsInvertsInverseKinematics) {
 }
 
 TEST(Swerve, UnitBoundary) {
-  EXPECT_NEAR(ToRadians(0.125).value(), std::numbers::pi / 4, 1e-15);
-  EXPECT_NEAR(ToRotations(units::radian_t{std::numbers::pi}), 0.5, 1e-15);
-  EXPECT_NEAR(WheelTravel(2.0, 0.05).value(), 2.0 * kTau * 0.05, 1e-15);
-  EXPECT_NEAR(WheelSpeed(3.0, 0.05).value(), 3.0 * kTau * 0.05, 1e-15);
+  EXPECT_NEAR(ToRadians(0.125), std::numbers::pi / 4, 1e-15);
+  EXPECT_NEAR(ToRotations(std::numbers::pi), 0.5, 1e-15);
+  EXPECT_NEAR(WheelTravel(2.0, 0.05), 2.0 * kTau * 0.05, 1e-15);
+  EXPECT_NEAR(WheelSpeed(3.0, 0.05), 3.0 * kTau * 0.05, 1e-15);
   EXPECT_NEAR(WheelRps(WheelSpeed(3.0, 0.05), 0.05), 3.0, 1e-12);
 }
 
 TEST(Swerve, CosineScalingSuppressesMisalignedDrive) {
   const auto geometry = Geometry();
   SwerveKinematics kinematics{geometry};
-  const double full = WheelRps(units::meters_per_second_t{1},
-                               geometry.modules[0].wheel_radius_m);
+  const double full = WheelRps(1.0, geometry.modules[0].wheel_radius_m);
   for (double angle : {0.0, 0.125, 0.25}) {
     std::array<ModuleState, kModuleCount> current{};
     for (auto& module : current) module.steer_rot = angle;
@@ -221,15 +222,42 @@ TEST(Swerve, DiscretizationCompensatesCombinedTranslationAndRotation) {
     FAIL() << "Expected aligned module states";
   }
   const auto actual = kinematics.ToChassisSpeeds(*aligned);
-  const auto expected = frc::ChassisSpeeds::Discretize(
-      frc::ChassisSpeeds{units::meters_per_second_t{1},
-                         units::meters_per_second_t{0.5},
-                         units::radians_per_second_t{2}},
-      units::second_t{dt});
-  EXPECT_NEAR(actual.vx_mps, expected.vx.value(), 1e-12);
-  EXPECT_NEAR(actual.vy_mps, expected.vy.value(), 1e-12);
-  EXPECT_NEAR(actual.omega_radps, expected.omega.value(), 1e-12);
+  // Independent Twist2d log oracle for (vx,vy,omega,dt)=(1,0.5,2,0.02):
+  // a=0.02, c=a*cot(a), (vx',vy')=(c+0.5*a, -a+0.5*c).
+  EXPECT_NEAR(actual.vx_mps, 1.0098666631109754, 1e-12);
+  EXPECT_NEAR(actual.vy_mps, 0.47993333155548773, 1e-12);
+  EXPECT_NEAR(actual.omega_radps, 2.0, 1e-12);
   EXPECT_GT(std::abs(actual.vy_mps - 0.5), 0.01);
+}
+
+TEST(Swerve, ForwardKinematicsHandlesOffCenterNonSquareLayout) {
+  auto geometry = Geometry();
+  const std::array<double, kModuleCount> xs{0.1, 0.9, 0.2, 1.1};
+  const std::array<double, kModuleCount> ys{-0.2, 0.1, 0.6, 0.8};
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    geometry.modules[i].x_m = xs[i];
+    geometry.modules[i].y_m = ys[i];
+  }
+  SwerveKinematics kinematics{geometry};
+  std::array<ModuleState, kModuleCount> sideways{};
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    sideways[i] = {WheelRps(0.5, geometry.modules[i].wheel_radius_m), 0.25};
+  }
+  const auto translation = kinematics.ToChassisSpeeds(sideways);
+  EXPECT_NEAR(translation.vx_mps, 0.0, 1e-15);
+  EXPECT_NEAR(translation.vy_mps, 0.5, 1e-15);
+  EXPECT_NEAR(translation.omega_radps, 0.0, 1e-15);
+  for (const ChassisSpeeds requested :
+       {ChassisSpeeds{0.4, -0.3, 0.2}, ChassisSpeeds{-0.2, 0.5, -0.4}}) {
+    const auto initial = kinematics.ToModuleStates(requested, {});
+    ASSERT_TRUE(initial.has_value());
+    const auto aligned = kinematics.ToModuleStates(requested, *initial);
+    ASSERT_TRUE(aligned.has_value());
+    const auto recovered = kinematics.ToChassisSpeeds(*aligned);
+    EXPECT_NEAR(recovered.vx_mps, requested.vx_mps, 1e-12);
+    EXPECT_NEAR(recovered.vy_mps, requested.vy_mps, 1e-12);
+    EXPECT_NEAR(recovered.omega_radps, requested.omega_radps, 1e-12);
+  }
 }
 
 // --- geometry from config ------------------------------------------------
@@ -778,9 +806,9 @@ TEST(Drivetrain, LinkDropKeepsPublishingInvalidStateAndHoldsPositions) {
 // --- allocation ------------------------------------------------------------
 
 #if defined(__APPLE__)
-// Every malloc in the process, including those made inside libwpimath (whose
-// operator new binds to libc++, not to this binary). libsystem_malloc calls
-// malloc_logger, when set, on every allocation; each one's stack is kept
+// Every malloc in the process, including those made inside linked libraries
+// (whose operator new binds to libc++, not to this binary). libsystem_malloc
+// calls malloc_logger, when set, on every allocation; each one's stack is kept
 // (backtrace() does not allocate) and symbolized afterwards.
 using MallocLogger = void(std::uint32_t, std::uintptr_t, std::uintptr_t,
                           std::uintptr_t, std::uintptr_t, std::uint32_t);

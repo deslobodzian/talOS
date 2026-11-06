@@ -16,10 +16,20 @@
 | `autonomous` | C++ | preload spinup/feed, alliance-relative waypoint and collection | `/hw/state/driver_station`, `/pose_estimator/state`, `/shooter/state`, `/intake/state` | `/drivetrain/target/auto`, `/shooter/target/auto`, `/intake/target/auto` |
 | `teleop` (`//talOS/teleop:node`) | C++ | framework teleop node; maps joystick buttons and axes declared in `[[teleop.bindings]]` to mechanism target lanes | `/hw/state/driver_station` | `/shooter/target/teleop`, `/intake/target/teleop` |
 | `pose_estimator` | Python | field pose from swerve odometry and camera observations; backend `kalman` (wpimath) or `factor_graph` (GTSAM); runs while disabled | `/drivetrain/state`, `/<camera>/state` per `cameras` | `/pose_estimator/state` |
+| `front_left_camera`, `front_right_camera`, `rear_left_camera`, `rear_right_camera` | C++ | independent AprilTag localization at 20 Hz; shared vision implementation; runs while disabled | `/drivetrain/state` (optional simulated truth) | `/<camera>/state`, `/<camera>/status` |
 | `telemetry` (`//talOS/telemetry:node`) | C++ | framework telemetry node; Studio frames; the pose from `[studio] pose_topic` | the state and status topics, `/hw/state/driver_station`, `/hw/status` | `/talos/telemetry` |
 | `hardware_node` (`//talOS/bridge`) | C++ | UDP courier to the RoboRIO | `/hw/request/<node>` | `/hw/state`, `/hw/status` |
 
 Simulation stands in for the RoboRIO with `main_processor/simulation:sim_gateway`.
+
+Camera calibration is in `configuration/subsystems/<name>_camera.toml`, layered
+over shared defaults in `subsystems/vision.toml`. The field layout is embedded
+into each node binary, so deployed bundles require no vision runfiles.
+Only `--sim` enables synthetic images (`rasterize = true`) or fast projection
+(`rasterize = false`). Simulated ground truth integrates measured drivetrain
+motion, never estimator output. Without `--sim`, cameras capture real images
+on a bounded worker thread; unavailable devices report unhealthy status rather
+than synthetic observations. Describing the graph never opens cameras.
 
 Autonomous waits for fresh shooter `at_speed`, then feeds for 500 ms at
 -20 rps: negative roller demand is allowed through the intake beam interlock,

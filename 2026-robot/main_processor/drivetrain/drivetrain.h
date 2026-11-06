@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
@@ -75,9 +76,8 @@ class Drivetrain {
       for (std::size_t i = 0; i < kModuleCount; ++i) {
         modules_[i] = geometry::SwerveModulePosition{
             WheelTravel(drive_[i].position(),
-                        geometry_.modules[i].wheel_radius_m)
-                .value(),
-            ToRadians(measured[i].steer_rot).value()};
+                        geometry_.modules[i].wheel_radius_m),
+            ToRadians(measured[i].steer_rot)};
       }
       speeds = kinematics_.ToChassisSpeeds(measured);
       if (valid_target) {
@@ -121,7 +121,7 @@ class Drivetrain {
         yaw_valid = sample_time.has_value();
       }
     } else if (sample_time.has_value() && gyro_.connected()) {
-      yaw_rad_ = ToRadians(gyro_.yaw()).value();
+      yaw_rad_ = ToRadians(gyro_.yaw());
       yaw_valid = true;
     }
 

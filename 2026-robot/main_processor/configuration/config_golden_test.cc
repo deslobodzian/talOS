@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -356,12 +357,33 @@ TEST(ConfigTest, PoseEstimatorModuleOffsetsMatchDrivetrainGeometry) {
   const auto config =
       ParseRobotConfig("2026-robot/main_processor/configuration/robot.toml");
   const toml::table& root = config.toml_data;
-  for (const char* key : {"initial_x_m", "initial_y_m", "initial_yaw_rad"}) {
-    EXPECT_DOUBLE_EQ(
-        root.at_path(std::string{"subsystems.pose_estimator."} + key)
-            .value_or(-1.0),
-        0.0);
+  EXPECT_DOUBLE_EQ(
+      root.at_path("subsystems.pose_estimator.initial_x_m").value_or(-1.0),
+      2.0);
+  EXPECT_DOUBLE_EQ(
+      root.at_path("subsystems.pose_estimator.initial_y_m").value_or(-1.0),
+      2.0);
+  EXPECT_DOUBLE_EQ(
+      root.at_path("subsystems.pose_estimator.initial_yaw_rad").value_or(-1.0),
+      0.0);
+  const auto* cameras =
+      root.at_path("subsystems.pose_estimator.cameras").as_array();
+  ASSERT_NE(cameras, nullptr);
+  ASSERT_EQ(cameras->size(), 4u);
+  for (const auto& camera : *cameras) {
+    const auto name = camera.value_or(std::string{});
+    EXPECT_NE(name.find("_camera"), std::string::npos);
+    EXPECT_EQ(root.at_path("subsystems." + name + ".period_us").value_or(0),
+              50000);
+    EXPECT_TRUE(
+        root.at_path("subsystems." + name + ".rasterize").value_or(false));
+    for (const char* key : {"initial_x_m", "initial_y_m", "initial_yaw_rad"}) {
+      EXPECT_EQ(root.at_path("subsystems." + name + "." + key).value<double>(),
+                root.at_path(std::string{"subsystems.pose_estimator."} + key)
+                    .value<double>());
+    }
   }
+  EXPECT_FALSE(root.at_path("subsystems.vision"));
   for (const char* key : {"field_length_m", "field_width_m"}) {
     EXPECT_EQ(root.at_path(std::string{"subsystems.pose_estimator."} + key)
                   .value<double>(),
