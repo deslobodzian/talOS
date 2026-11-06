@@ -196,6 +196,14 @@ a worst-case frame at startup and refuses an over-budget dictionary. Dictionary
 frames are larger/variable, bounded by the **16384 B** slot. First/every-100th-frame
 dictionaries allow late join/recovery in about a second at 100 Hz.
 
+The 2026 four-camera configuration excludes the cumulative captured, processed
+and range-rejected camera counters at channel level, retaining camera health,
+timing, dropped-frame and visible-tag diagnostics. Measured with the producer's
+`MeasureValueFrameBytes` over its real declared graph, this reduces the value
+frame from **139 channels / 1200 B** to **127 channels / 1104 B** (96 B headroom).
+Topic-level includes remain unchanged; excludes match topics or individual
+dictionary channels, and only retained channels count toward the budget.
+
 Studio's bridge forwards the occupied frame, not 16384 bytes of padding. At the
 value cap, `1200×8×100` = **0.96 Mbit/s per connected client**, before TCP/IP,
 WebSocket, retransmission, dictionary and graph overhead. The value cap leaves

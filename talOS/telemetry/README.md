@@ -89,9 +89,16 @@ Channels are discovered automatically from the graph descriptors:
    `_rad` (`rad`), `_s` (`s`). Fields without recognized unit suffixes have empty units.
 3. **Enum labels**: Enum fields extract string labels automatically from FlatBuffers
    schema reflection (`reflection::Schema`).
-4. **Include/exclude globs**: In `telemetry.toml`, `include` and `exclude` lists
-   of glob patterns can filter which topics are captured. Exclude patterns take
-   precedence over include patterns.
+4. **Include/exclude globs**: In `telemetry.toml`, `include` selects whole
+   topics only (default `["*"]`). `exclude` takes precedence and matches both
+   whole topics and individual dictionary channel names: excluding a topic
+   removes all its channels; excluding a channel leaves its siblings intact.
+   Names match with or without a leading `/`, using shell-style globs (`*`
+   also matches `/`). For example,
+   `exclude = ["*_camera/status/frames_captured_count"]` removes that counter
+   from every camera without hiding its other status fields. Automatic
+   channels such as `pose/valid` can also be excluded. Only retained channels
+   contribute to the dictionary, values vector and construction-time budget.
 5. **Pose extraction**: When `[studio] pose_topic` is set, telemetry extracts
    `x_m`, `y_m`, and `yaw_rad` from the `geometry.Pose2d` struct inside that topic via
    reflection and sets `chassis`. When stale, `pose/valid` is 0 and chassis is 0.

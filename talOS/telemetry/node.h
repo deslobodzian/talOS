@@ -152,27 +152,24 @@ inline std::vector<std::string> ExtractEnumLabels(
   return labels;
 }
 
-inline bool MatchesGlobs(std::string_view topic,
-                         const std::vector<std::string>& includes,
-                         const std::vector<std::string>& excludes) {
-  const std::string full_str{topic};
-  const std::string unslashed = (!topic.empty() && topic.front() == '/')
-                                    ? std::string{topic.substr(1)}
-                                    : full_str;
-
-  for (const auto& pattern : excludes) {
-    if (::fnmatch(pattern.c_str(), full_str.c_str(), 0) == 0 ||
-        ::fnmatch(pattern.c_str(), unslashed.c_str(), 0) == 0) {
-      return false;
-    }
-  }
-  for (const auto& pattern : includes) {
+inline bool MatchesAnyGlob(std::string_view name,
+                           const std::vector<std::string>& patterns) {
+  const std::string unslashed{
+      !name.empty() && name.front() == '/' ? name.substr(1) : name};
+  const std::string full_str = "/" + unslashed;
+  for (const auto& pattern : patterns) {
     if (::fnmatch(pattern.c_str(), full_str.c_str(), 0) == 0 ||
         ::fnmatch(pattern.c_str(), unslashed.c_str(), 0) == 0) {
       return true;
     }
   }
   return false;
+}
+
+inline bool MatchesGlobs(std::string_view topic,
+                         const std::vector<std::string>& includes,
+                         const std::vector<std::string>& excludes) {
+  return !MatchesAnyGlob(topic, excludes) && MatchesAnyGlob(topic, includes);
 }
 
 }  // namespace detail
@@ -403,6 +400,9 @@ class Telemetry {
 
   std::size_t AddChannel(std::string name, std::string unit = "",
                          std::vector<std::string> labels = {}) {
+    if (detail::MatchesAnyGlob(name, exclude_globs_)) {
+      return std::numeric_limits<std::size_t>::max();
+    }
     for (const ChannelDef& existing : dictionary_) {
       if (existing.name == name) {
         throw std::invalid_argument("telemetry: duplicate channel '" + name +
@@ -419,7 +419,17 @@ class Telemetry {
     if (worst_case > telemetry_wire::kMaxValueFrameBytes) {
       std::map<std::string, std::size_t> counts;
       for (const auto& topic : observed_topics_) {
-        counts[topic.name] = topic.is_driver_station ? 8 : topic.readers.size();
+        if (topic.is_driver_station) {
+          const auto& channels = topic.ds_channels;
+          for (const auto index :
+               {channels.connected, channels.enabled, channels.autonomous,
+                channels.teleop, channels.test, channels.estop,
+                channels.fms_attached, channels.match_time_s}) {
+            if (index < dictionary_.size()) ++counts[topic.name];
+          }
+        } else {
+          counts[topic.name] = topic.readers.size();
+        }
       }
       std::vector<std::pair<std::string, std::size_t>> sorted_counts(
           counts.begin(), counts.end());
@@ -720,6 +730,7 @@ class Telemetry {
 
     const std::size_t channel_idx =
         AddChannel(std::move(channel_name), std::move(unit), std::move(labels));
+    if (channel_idx == std::numeric_limits<std::size_t>::max()) return;
     readers.push_back(FieldReader{
         .channel_index = channel_idx,
         .offset = offset,

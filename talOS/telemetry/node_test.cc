@@ -316,6 +316,71 @@ exclude = ["*state*"]
   EXPECT_FALSE(dict.contains("demo/state/position_m"));
 }
 
+TEST(TelemetryTest, ChannelExcludePreservesOtherChannelsAndShrinksBudget) {
+  const std::string config = R"(
+[robot]
+period_us = 10000
+
+[studio]
+topic = "/talos/telemetry"
+
+[subsystems.demo]
+node = "//demo:node"
+
+[subsystems.demo.motors.m]
+can_id = 1
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)";
+  Sim baseline = Sim::FromToml(config);
+  baseline.add<ShapesNode>("demo");
+  const auto& original = baseline.add<Telemetry>("telemetry");
+  auto expected = DictionaryMap(original);
+  ASSERT_EQ(expected.erase("demo/state/sample_count"), 1u);
+  const auto original_bytes =
+      MeasureValueFrameBytes(original.dictionary().size());
+
+  for (const std::string pattern :
+       {"demo/state/sample_count", "/demo/state/sample_count"}) {
+    std::string filtered_config = config;
+    filtered_config += "exclude = [\"";
+    filtered_config += pattern;
+    filtered_config += "\"]\n";
+    Sim filtered = Sim::FromToml(filtered_config);
+    auto& shapes = filtered.add<ShapesNode>("demo");
+    const auto& telemetry = filtered.add<Telemetry>("telemetry");
+    const auto actual = DictionaryMap(telemetry);
+    ASSERT_EQ(actual.size(), expected.size());
+    for (const auto& [name, definition] : expected) {
+      EXPECT_TRUE(actual.contains(name)) << name;
+    }
+    EXPECT_FALSE(actual.contains("demo/state/sample_count"));
+    EXPECT_EQ(MeasureValueFrameBytes(telemetry.dictionary().size()),
+              original_bytes - sizeof(double));
+
+    shapes.mixed_.send(schema_test::Mixed{true,
+                                          4.5,
+                                          schema_test::Level::TOP,
+                                          1234,
+                                          {schema_test::Mode::HIGH, 1.25f},
+                                          0.8f});
+    filtered.step(20ms);
+    const auto frame = LatestFrame(filtered, "/talos/telemetry");
+    ASSERT_NE(frame, nullptr);
+    const auto values = DecodeChannels(telemetry, frame);
+    EXPECT_DOUBLE_EQ(values.at("demo/state/position_m"), 4.5);
+    EXPECT_FALSE(values.contains("demo/state/sample_count"));
+    filtered.step(200ms);
+    shapes.arrays_.send(schema_test::Arrays{});
+    filtered.step(20ms);
+    const auto stale = LatestFrame(filtered, "/talos/telemetry");
+    ASSERT_NE(stale, nullptr);
+    EXPECT_FALSE(
+        DecodeChannels(telemetry, stale).contains("demo/state/position_m"));
+  }
+}
+
 TEST(TelemetryTest, NaNOnStale) {
   const std::string kConfig = R"(
 [robot]
