@@ -1,0 +1,41 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "calibration",
+    srcs = ["calibration.cc"],
+    hdrs = ["calibration.h"],
+    deps = [
+        "@opencv//:calib3d",
+        "@opencv//:core",
+        "@opencv//:objdetect",
+        "@tomlplusplus//:toml++",
+    ],
+)
+
+cc_binary(
+    name = "calibrate_camera",
+    srcs = ["main.cc"],
+    deps = [
+        ":calibration",
+        "//talOS/vision/capture",
+        "@opencv//:imgcodecs",
+        "@opencv//:imgproc",
+    ],
+)
+
+cc_test(
+    name = "calibration_test",
+    size = "medium",
+    srcs = ["calibration_test.cc"],
+    deps = [
+        ":calibration",
+        "@googletest//:gtest_main",
+        "@opencv//:calib3d",
+        "@opencv//:imgcodecs",
+        "@opencv//:imgproc",
+    ],
+)

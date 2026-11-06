@@ -10,7 +10,7 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
 - [ ] Give the Mac Mini the static address `10.56.87.11`. It is compiled into the RIO program (`kCompanionAddress` in `2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp`), which only sends state there.
 - [ ] Check the CAN ids in `subsystems/*.toml` against Phoenix Tuner X; measure the four CANcoder `offset_rot` (all `0.0`); check each `inverted`; verify and tune the sim-consistent intake roller `slot0` (`p = 0.1`, `v = 0.12`) and drivetrain defaults (`slot0.v = 0.81`, `max_velocity_rps = 14.5`, `cruise_velocity_rps = 14.5`) on the real robot. Only then set `commissioned = true`, and update `config_golden_test` in the same change.
 - [ ] Build and test on the Mini first (`bazel test //...`), then build `robot_bundle` there (there is no cross-compile config), `tools/deploy.sh install`, `enable-boot --user <account>`, and check the drivetrain, shooter and intake in the order in docs/BRINGUP.md. `enable-boot` installs a LaunchDaemon (`/Library/LaunchDaemons/org.talos.robot.plist`) with sudo; only its `--dry-run` has run.
-- [ ] Calibrate each camera's intrinsics and Brown-Conrady distortion, measure its robot-frame mount, and set `device` in each camera subsystem file.
+- [ ] Calibrate each camera's intrinsics and Brown-Conrady distortion with `//talOS/vision/calibrate:calibrate_camera` (see docs/BRINGUP.md), measure its robot-frame mount, and set `device` in each camera subsystem file.
 - [ ] On the robot, verify that live capture starts at the first camera update and each `/<camera>/status` stays healthy; the checked-in calibrations and mounts are not measured robot calibration.
 - [ ] Confirm two timing changes behave on the real link (sim cannot: the node and the RIO share one clock and the link has no latency):
   - target freshness is measured from when the node receives the target (`Subscription::fresh()`, `talOS/node/node.cc`), not from a sender timestamp (`issued_ns` has been removed);
@@ -24,13 +24,14 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
   - `battery_v`, `brownout`, `can_utilization_frac` and `motor_fault_mask` in `/hw/status` against the DS and Phoenix Tuner, and CAN utilization after `OptimizeBusUtilization`;
   - PWM neutral now disables the pulse, so check what each PWM device actually does when disabled.
 
-## Merge `agent/automatic-wiring`
+## Merge `vision`
 
-- [ ] Open the draft PR to `main` and get CI green; do not merge red. Reproduced locally on 2026-11-05: Linux arm64 container `bazel build //...` + `bazel test //...` 83/83 at `a54428e`; `phoenixTest` (8/8 per variant) and `buildRio` in a Linux amd64 container; `clang-format-18` (449 violations in 23 files, fixed), `buildifier` 8.2.1 (2 files, fixed) and `clang-tidy-18` (93 errors in 18 files, fixed) on the files changed since `main`. Not yet run: CI itself.
+- [ ] Open the PR `vision` → `main` and get CI green; do not merge red. Locally verified at `887084d`: macOS 107/107 tests, Linux arm64 container build + tests, clang-tidy-18 0 findings, `phoenixTest` + `buildRio` in a Linux amd64 container. GitHub CI not yet run.
 - [ ] `phoenixTest` on macOS still needs the `MacOSX26.sdk` GradleRIO wants; it passes on Linux.
 
 ## Found, not fixed
 
+- [ ] A restarted simulated camera re-seeds its per-process drivetrain-integrated `SimTruth` at the initial pose and publishes confidently wrong observations after a launcher restart; use an absolute simulator truth pose. Seen live.
 - [ ] Studio's system view lists `sim_gateway` as "declared, never registered — it crashed at startup, or its binary is missing" while it runs: the gateway is not a talos node and never registers. Seen live with `./sim.sh --sim-gateway`.
 - [ ] With four cameras, the telemetry value frame is exactly at the 1200-byte cap. A fifth camera or another scalar status field fails telemetry construction; choose per-topic selection in `[subsystems.telemetry]` or make an explicit budget decision.
 - [ ] [read] `sim_gateway` emits Driver Station frames every gateway tick (200 Hz), while the RoboRIO emits ≤50 Hz, so simulation exercises a DS rate the robot never produces (`sim_gateway.cc:204-210`, `Robot.cpp:244-258`).

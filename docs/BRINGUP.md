@@ -16,6 +16,43 @@
 - [ ] Run `./tools/deploy.sh logs` (add `--prefix` for a custom installation). Expected: session directories are listed and the newest manifest identifies the deployed config hash and node log paths. Retain that session and the RIO console output for every check below.
 - [ ] For live inspection, run `bazel build //studio:web_dist`, then in another terminal `bazel run //studio/bridge:studio_bridge -- --drop-newest-publisher /talos/telemetry 5800 bazel-bin/studio/dist`. Open `http://127.0.0.1:5800` on the Mini and select Studio's system view. Expected: live node rows, source selections and loop timing are visible. Run only one Studio bridge.
 
+## Camera intrinsics calibration
+
+1. With the robot disabled and the camera at its deployment focus and resolution,
+   generate a ChArUco board:
+   `bazel run //talOS/vision/calibrate:calibrate_camera -- --board /tmp/charuco.png`.
+   Print at exactly 200 pixels per 40 mm square (280 × 200 mm total), without
+   scaling or cropping; mount it flat on rigid backing. The board uses 7 × 5
+   squares, 40 mm square length, 30 mm markers and `DICT_4X4_50`.
+2. Capture sharp, well-lit views at varied distances and tilts, moving the board
+   across all image edges and the center. Keep the camera focus fixed. Use at
+   least 12 distinct views, preferably 20–30; avoid motion blur and reflections.
+   Existing image files must all have the same dimensions.
+3. For an image directory run
+   `bazel run //talOS/vision/calibrate:calibrate_camera -- --images /absolute/path/images`.
+   Alternatively use `--device DEVICE_ID --seconds 120 --interval 1` for native
+   AVFoundation (macOS) or V4L2 (Linux) capture. Use the camera's stable device id
+   (V4L2 device path on Linux); macOS requires camera permission. Live capture
+   requests the existing source default mode (1280 × 720). Match the resulting
+   width/height in deployment. Frames are sampled at the interval and accepted
+   only when their corresponding board points differ by at least 2.5% of image
+   width from previously accepted views.
+4. Check the reported view count and RMS reprojection error in pixels. The tool
+   refuses fewer than 12 views, coverage below 10 of 12 image grid cells, or RMS
+   above 1 pixel. Aim below 0.5 px; inspect/repeat captures rather than trusting a
+   low RMS alone. Verify coverage, focus and held-out images.
+5. Re-run with `--update 2026-robot/main_processor/configuration/subsystems/front_left_camera.toml`
+   (choose the actual camera file). The tool prints a `[camera]` TOML fragment
+   and updates only fx, fy, cx, cy, k1, k2, k3, p1, p2, width and height within
+   that table, preserving unrelated lines and comments. Unsupported/ambiguous
+   table syntax is refused; keep a backup and review the diff. It never changes
+   commissioning, CAN ids, device selection or mount extrinsics. Measure the
+   robot-frame mount separately and repeat for every camera.
+
+The tool uses OpenCV 4.12's ChArUco detector: the BCR module exposes both
+`@opencv//:objdetect` and `@opencv//:calib3d`. Calibration uses the five-coefficient
+Brown–Conrady model (no rational/thin-prism extensions).
+
 ## Uncommissioned, then disabled
 
 - [ ] With the uncommissioned bundle and DS disabled, run `bazel run //2026-robot/main_processor/drivetrain:monitor -- --config 2026-robot/main_processor/configuration/robot_field.toml`. Expected: RIO logs `commissioned=0`, monitor shows not configured, and every actuator stays neutral. This deliberate refusal is not a CAN fault to bypass.
