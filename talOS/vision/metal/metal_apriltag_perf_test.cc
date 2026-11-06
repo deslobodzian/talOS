@@ -27,7 +27,7 @@ void Warmup(talos::vision::ComputeBackend& backend,
   }
 }
 
-TEST(MetalAprilTagPerfTest, GpuIsFasterThanCpuOnHdFrames) {
+TEST(MetalAprilTagPerfTest, GpuAndCpuDetectionParityOnHdFrames) {
   // Generate a realistic 1920x1080 RGB8 camera frame with AprilTags
   SyntheticCameraSource source(0, "test_camera",
                                CameraMode{.width = 1920,

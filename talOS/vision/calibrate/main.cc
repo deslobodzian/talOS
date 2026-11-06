@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -6,6 +7,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <thread>
+#include <vector>
 
 #include "talOS/vision/calibrate/calibration.h"
 #include "talOS/vision/capture/avfoundation_source.h"
@@ -19,7 +21,30 @@ int main(int argc, char** argv) {
       if (arg == "--help") {
         std::cout << "calibrate_camera --images DIR | --device ID [--interval "
                      "SECONDS] [--seconds SECONDS] [--update FILE]\n"
-                     "calibrate_camera --board OUTPUT.png\n";
+                     "calibrate_camera --board OUTPUT.png\n"
+                     "calibrate_camera --list-devices\n";
+        return 0;
+      }
+      if (arg == "--list-devices") {
+#if defined(__APPLE__)
+        for (const auto& capture : talos::vision::DiscoverCaptureDevices()) {
+          std::cout << capture.id << '\t' << capture.name << '\n';
+        }
+#elif defined(__linux__)
+        const std::filesystem::path directory("/dev/v4l/by-id");
+        if (std::filesystem::exists(directory)) {
+          std::vector<std::filesystem::path> devices;
+          for (const auto& entry :
+               std::filesystem::directory_iterator(directory)) {
+            devices.push_back(entry.path());
+          }
+          std::sort(devices.begin(), devices.end());
+          for (const auto& path : devices) {
+            std::cout << path.string() << '\t' << path.filename().string()
+                      << '\n';
+          }
+        }
+#endif
         return 0;
       }
       if (i + 1 == argc) throw std::runtime_error("Missing option value");

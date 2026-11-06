@@ -58,11 +58,19 @@ matrices. The third-party AprilTag target is compiled with `-O2` in every Bazel
 mode, including `fastbuild`: noisy-image thresholding otherwise exceeds the
 camera period even when the surrounding simulation code is unoptimized.
 
-Without `--sim`, construction validates calibration, registers topics and starts
-a worker waiting for the first node-clock tick; it does not open a camera.
+Without `--sim`, construction validates calibration and registers topics; it
+does not open a camera. Live capture requires a nonempty `camera.device` set to
+a stable device id, never a camera index: an AVFoundation uniqueID on macOS or
+a `/dev/v4l/by-id/...` path on Linux. List macOS ids and names with
+`bazel run //talOS/vision/calibrate:calibrate_camera -- --list-devices`
+(uses `DiscoverCaptureDevices()`); on Linux use `ls -l /dev/v4l/by-id/`.
+An empty device logs one diagnostic naming the node, disables live capture,
+and publishes invalid observations and unhealthy status on each update.
+Simulation ignores this requirement. With a configured device, construction
+starts a worker waiting for the first node-clock tick.
 The worker owns all device open/start/stop calls and all detection/localization.
-A missing or disconnected device is recreated with node-clock backoff of
-1, 2, 4, then at most 8 seconds, resetting after a processed frame. This also
+A missing or disconnected configured device is recreated with node-clock
+backoff of 1, 2, 4, then at most 8 seconds, resetting after a processed frame. This also
 recovers first-launch permission denial and capture-loop exits. The loop passes
 time atomically and uses a nonblocking result-slot try-lock; it never opens a
 device, spawns a thread, or waits for worker work. Capture replaces one pending

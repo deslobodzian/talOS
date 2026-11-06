@@ -31,9 +31,16 @@
 3. For an image directory run
    `bazel run //talOS/vision/calibrate:calibrate_camera -- --images /absolute/path/images`.
    Alternatively use `--device DEVICE_ID --seconds 120 --interval 1` for native
-   AVFoundation (macOS) or V4L2 (Linux) capture. Use the camera's stable device id
-   (V4L2 device path on Linux); macOS requires camera permission. Live capture
-   requests the existing source default mode (1280 × 720). Match the resulting
+   AVFoundation (macOS) or V4L2 (Linux) capture. On macOS, run
+   `bazel run //talOS/vision/calibrate:calibrate_camera -- --list-devices` to
+   print each camera's `DiscoverCaptureDevices()` uniqueID and name; camera
+   permission is required. On Linux, use `ls -l /dev/v4l/by-id/` to find the
+   stable `/dev/v4l/by-id/...` path. Set each camera's `camera.device` to its
+   own stable id and confirm it matches that camera's physical mount.
+   Live robot vision refuses an empty device (no index fallback), logs one
+   diagnostic, and publishes invalid observations and unhealthy status until
+   configured and restarted. `--sim` does not require device ids.
+   Live capture requests the existing source default mode (1280 × 720). Match the resulting
    width/height in deployment. Frames are sampled at the interval and accepted
    only when their corresponding board points differ by at least 2.5% of image
    width from previously accepted views.

@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <map>
 #include <memory>
@@ -14,6 +15,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -57,6 +59,13 @@ class Vision {
             {.optional = true})),
         state_(node.publish<geometry::PoseObservation>("state")),
         status_(node.publish<VisionStatus>("status")) {
+    if (!simulated_ && device_.empty()) {
+      std::fprintf(stderr,
+                   "%.*s: camera.device must be set to a stable device id "
+                   "(AVFoundation uniqueID on macOS, /dev/v4l/by-id/... on "
+                   "Linux); live capture disabled\n",
+                   static_cast<int>(node_.name().size()), node_.name().data());
+    }
     std::string error;
     if (!talos::vision::field_sim::LoadFieldLayoutFromJson(
             kFieldLayoutJson, tag_size_, &layout_, &error)) {
@@ -82,7 +91,9 @@ class Vision {
     }
     sim_tags_.reserve(256);
     detections_.reserve(256);
-    if (!simulated_) worker_ = std::thread([this] { Work(); });
+    if (CanCapture(simulated_, device_)) {
+      worker_ = std::thread([this] { Work(); });
+    }
   }
 
   ~Vision() {
@@ -92,6 +103,10 @@ class Vision {
     }
     wake_.notify_one();
     if (worker_.joinable()) worker_.join();
+  }
+
+  static bool CanCapture(bool simulated, std::string_view device) {
+    return !simulated && !device.empty();
   }
 
   bool AcceptEstimate(const talos::vision::RobotPoseEstimate& estimate) const {
@@ -132,6 +147,8 @@ class Vision {
       completed = Simulate(now);
       ++captured_;
       RecordProcessed(completed->capture_ns);
+    } else if (!CanCapture(simulated_, device_)) {
+      completed = Completed{static_cast<std::uint64_t>(now.nanos())};
     } else {
       worker_now_ns_.store(now.nanos(), std::memory_order_release);
       wake_.notify_one();
@@ -318,6 +335,7 @@ class Vision {
   // Only the worker owns camera lifecycle calls. Retry timing comes from the
   // node clock supplied by update(), never a wall-clock timer.
   bool OpenCamera() {
+    if (!CanCapture(simulated_, device_)) return false;
     talos::vision::CameraSourceConfig config;
     config.camera_id = camera_id_;
     config.device_path = device_;
