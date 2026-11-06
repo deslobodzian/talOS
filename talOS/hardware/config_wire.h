@@ -375,8 +375,8 @@ struct ConfigAckPayload {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(ConfigChunkHeader) == 24);
-static_assert(sizeof(ConfigAckPayload) == 73);
+static_assert(sizeof(ConfigChunkHeader) == 24, "Update docs/DATA_FLOW.md");
+static_assert(sizeof(ConfigAckPayload) == 73, "Update docs/DATA_FLOW.md");
 
 inline std::vector<std::vector<uint8_t>> CreateConfigChunks(
     const Config& config, std::size_t max_payload = protocol::kMaxPayloadSize) {

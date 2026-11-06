@@ -15,8 +15,12 @@ constexpr std::size_t kFrameHeaderSize = 40;
 // this in hardware/messages.cc.
 constexpr std::size_t kMaxPayloadSize = 1432;
 constexpr std::size_t kMaxFrameSize = kFrameHeaderSize + kMaxPayloadSize;
-static_assert(kMaxFrameSize <= 1472,
-              "frame must fit one 1500-byte MTU datagram");
+static_assert(kFrameHeaderSize == 40,
+              "frame header size changed; update docs/DATA_FLOW.md");
+static_assert(kMaxPayloadSize == 1432,
+              "frame payload limit changed; update docs/DATA_FLOW.md");
+static_assert(kMaxFrameSize == 1472,
+              "frame size changed; update docs/DATA_FLOW.md");
 
 enum class DecodeStatus : uint8_t {
   kOk = 0,

@@ -23,6 +23,8 @@ namespace talos::telemetry_wire {
 // and at the 100 Hz telemetry rate it is 1200 * 8 * 100 = 0.96 Mbit/s per
 // client, under 25% of the 4 Mbit/s FRC radio floor (rule R704 budget).
 inline constexpr std::size_t kMaxValueFrameBytes = 1200;
+static_assert(kMaxValueFrameBytes == 1200,
+              "telemetry value frame limit changed; update docs/DATA_FLOW.md");
 
 // Slot geometry for the /talos/telemetry byte topic. A dictionary frame
 // (names, units, labels) is larger than a value frame but still bounded

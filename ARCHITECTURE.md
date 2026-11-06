@@ -14,6 +14,9 @@ and publishes what comes back on `/hw/state` and `/hw/state/driver_station`.
 In simulation `//2026-robot/main_processor/simulation:sim_gateway` (or the
 RoboRIO program under WPILib simulation) takes the RoboRIO's place.
 
+See [Data flow and byte budgets](docs/DATA_FLOW.md) for every transport,
+producer/consumer, rate, dynamic payload, and shared-memory slot size.
+
 ## Layers
 
 ```

@@ -33,6 +33,8 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
 
 - [ ] Studio's system view lists `sim_gateway` as "declared, never registered — it crashed at startup, or its binary is missing" while it runs: the gateway is not a talos node and never registers. Seen live with `./sim.sh --sim-gateway`.
 - [ ] With four cameras, the telemetry value frame is exactly at the 1200-byte cap. A fifth camera or another scalar status field fails telemetry construction; choose per-topic selection in `[subsystems.telemetry]` or make an explicit budget decision.
+- [ ] [read] `sim_gateway` emits Driver Station frames every gateway tick (200 Hz), while the RoboRIO emits ≤50 Hz, so simulation exercises a DS rate the robot never produces (`sim_gateway.cc:204-210`, `Robot.cpp:244-258`).
+- [ ] [read] Protocol `AckRequested` / `Ack` / `Fragment` flags are declared but unused by runtime send paths; delete them or use them explicitly (`talOS/protocol/types.h`, `talOS/hardware/endpoint.h`, `talOS/bridge/node.cc`).
 
 ## Fixed on 2026-11-05
 

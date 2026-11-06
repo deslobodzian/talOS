@@ -18,6 +18,8 @@ namespace talos::hardware {
 // 8-byte alignment (talos::kMessageAlignment). ipc::Publisher lays the slot out
 // at alignof(Message), so the two agree only while this holds.
 static_assert(alignof(bridge::BridgeStatus) == 8);
+static_assert(sizeof(bridge::BridgeStatus) == 160,
+              "BridgeStatus size changed; update docs/DATA_FLOW.md");
 
 HardwareNode::HardwareNode(config::RobotConfig robot_config,
                            std::string remote_ip, uint16_t remote_port,

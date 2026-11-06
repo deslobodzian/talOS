@@ -95,6 +95,40 @@ TEST(DriverStationTest, RoundTripEncoding) {
   EXPECT_FALSE(decoded.joysticks[2].connected);
 }
 
+TEST(DriverStationTest, FullyPopulatedEncodingReachesMaximumSize) {
+  DriverStationData original{};
+  original.sample_time_us = 123456789;
+  original.mode_since_us = 123400000;
+  original.fms.flags = kDsAttached | kFmsAttached | kEnabled | kTeleop;
+  original.fms.alliance = Alliance::kBlue;
+  original.fms.station = 3;
+  original.fms.match_type = MatchType::kQualification;
+  original.fms.match_number = 42;
+  original.fms.replay_number = 1;
+  original.fms.match_time_s = 135.5f;
+  std::memset(original.fms.game_specific_message, 'G',
+              kMaxGameMessageLength - 1);
+  std::memset(original.fms.event_name, 'E', kMaxEventNameLength - 1);
+  for (auto& stick : original.joysticks) {
+    stick.connected = true;
+    stick.axis_count = kMaxAxes;
+    stick.button_count = kMaxButtons;
+    stick.pov_count = kMaxPovs;
+    stick.buttons = 0xffffffffu;
+    stick.axes.fill(0.5f);
+    stick.povs.fill(270);
+    std::memset(stick.name, 'N', kMaxNameLength - 1);
+  }
+
+  std::array<uint8_t, kMaxEncodedSize> buffer{};
+  const auto size = Encode(original, buffer);
+  ASSERT_EQ(size, kMaxEncodedSize);
+  DriverStationData decoded{};
+  ASSERT_TRUE(Decode({buffer.data(), size}, decoded));
+  EXPECT_EQ(decoded, original);
+  EXPECT_EQ(Encode(original, {buffer.data(), buffer.size() - 1}), 0u);
+}
+
 TEST(DriverStationTest, UnterminatedStringsTruncateInsteadOfFailing) {
   DriverStationData original{};
   std::memset(original.fms.game_specific_message, 'G', kMaxGameMessageLength);

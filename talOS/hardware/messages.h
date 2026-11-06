@@ -131,6 +131,38 @@ struct State {
   bool operator==(const State&) const = default;
 };
 
+// Canonical encoded bytes, independent of native struct padding.
+inline constexpr std::size_t kCommandBaseSize = 4 * 8 + 3 * 2;
+inline constexpr std::size_t kMotorRequestSize = 2 + 1 + 1 + 2 * 8;
+inline constexpr std::size_t kDigitalOutputRequestSize = 2 + 1;
+inline constexpr std::size_t kPwmRequestSize = 2 + 8;
+inline constexpr std::size_t kMaxCommandSize =
+    kCommandBaseSize + kMaxMotors * kMotorRequestSize +
+    kMaxDigitalOutputs * kDigitalOutputRequestSize +
+    kMaxPwmOutputs * kPwmRequestSize;
+
+inline constexpr std::size_t kHealthSampleSize = 1 + 8 + 1 + 8;
+inline constexpr std::size_t kGatewayCountersSize = 4 * 4;
+inline constexpr std::size_t kStateBaseSize =
+    5 * 8 + 4 + 7 * 2 + kHealthSampleSize + kGatewayCountersSize;
+inline constexpr std::size_t kMotorSampleSize = 2 + 1 + 4 * 8 + 3 * 4;
+inline constexpr std::size_t kSensorSampleSize = 2 + 1 + 2 * 8 + 2 * 4;
+inline constexpr std::size_t kDigitalInputSampleSize = 2 + 1 + 1;
+inline constexpr std::size_t kDigitalOutputSampleSize = 2 + 1 + 1;
+inline constexpr std::size_t kAnalogInputSampleSize = 2 + 1 + 8 + 4;
+inline constexpr std::size_t kEncoderSampleSize = 2 + 1 + 2 * 8 + 4;
+inline constexpr std::size_t kPwmSampleSize = 2 + 1 + 8;
+inline constexpr std::size_t kMaxStateSize =
+    kStateBaseSize + kMaxMotors * kMotorSampleSize +
+    kMaxSensors * kSensorSampleSize +
+    kMaxDigitalInputs * kDigitalInputSampleSize +
+    kMaxDigitalOutputs * kDigitalOutputSampleSize +
+    kMaxAnalogInputs * kAnalogInputSampleSize +
+    kMaxEncoders * kEncoderSampleSize + kMaxPwmOutputs * kPwmSampleSize;
+
+static_assert(kMaxCommandSize == 410, "Update docs/DATA_FLOW.md");
+static_assert(kMaxStateSize == 1412, "Update docs/DATA_FLOW.md");
+
 // Explicit little-endian codecs: no padding, native bool layout, or alignment
 // assumptions cross the RoboRIO/companion boundary.
 std::size_t Encode(const Command&, std::span<uint8_t>);
