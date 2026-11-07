@@ -373,11 +373,41 @@ std::string WriteStubNode(std::string_view name, std::string_view script);
 std::string DescribeJson(
     std::string_view node, std::string_view target,
     const std::vector<introspect::naming::SourceShape>& sources);
+std::string DescribingStub(
+    std::string_view node, std::string_view target,
+    const std::vector<introspect::naming::SourceShape>& sources);
 introspect::naming::SourceShape Sender(std::string topic,
                                        std::uint32_t bytes = 48);
 introspect::naming::SourceShape Watcher(std::string topic,
                                         std::uint32_t bytes = 48);
 std::string ReadFile(const std::string& path);
+
+TEST(LauncherTest, DescribeDeadlineAppliesAfterStdoutCloses) {
+  const auto binary = WriteStubNode(
+      "describe_closed_stdout", "#!/bin/sh\nexec 1>&-\nexec sleep 30\n");
+  introspect::Description description;
+  std::string error;
+  const auto started = std::chrono::steady_clock::now();
+  EXPECT_FALSE(ProbeDescribe(binary, {binary, "--describe"},
+                             std::chrono::milliseconds{100}, description,
+                             error));
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  EXPECT_NE(error.find("no answer within 100ms"), std::string::npos);
+  EXPECT_LT(elapsed, std::chrono::seconds{3});
+  std::filesystem::remove(binary);
+}
+
+TEST(LauncherTest, DescribeOutputIsBounded) {
+  const auto binary = WriteStubNode(
+      "describe_excess_output",
+      "#!/bin/sh\nexec dd if=/dev/zero bs=4096 count=1025 2>/dev/null\n");
+  introspect::Description description;
+  std::string error;
+  EXPECT_FALSE(ProbeDescribe(binary, {binary, "--describe"},
+                             std::chrono::seconds{5}, description, error));
+  EXPECT_NE(error.find("4 MiB limit"), std::string::npos);
+  std::filesystem::remove(binary);
+}
 
 // A bridge stub for supervision tests: answers --describe like a viewer, then
 // either fails (telemetry never arrives) or sleeps (viewer stays up).
@@ -430,7 +460,9 @@ TEST(LauncherTest, FailingBridgeRetriesInLoopWithoutBlockingSession) {
   options.describe_timeout_ms = 4000;
   options.config_path = WriteFixtureToml();
   options.binary_overrides["//talOS/bridge:hardware_node"] =
-      ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
+      WriteStubNode(tag + "_hardware",
+                    DescribingStub("hardware_node",
+                                   "//talOS/bridge:hardware_node", {}));
   options.binary_overrides["//example/alpha:node"] = WriteStubNode(
       tag + "_alpha", NodeDescribeThenSleep("alpha", "//example/alpha:node",
                                             {Sender("/alpha/state")}, 3));
@@ -485,7 +517,9 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   options.duration_s = 2;
   options.config_path = WriteFixtureToml();
   options.binary_overrides["//talOS/bridge:hardware_node"] =
-      ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
+      WriteStubNode(tag + "_hardware",
+                    DescribingStub("hardware_node",
+                                   "//talOS/bridge:hardware_node", {}));
   options.binary_overrides["//example/alpha:node"] = WriteStubNode(
       tag + "_alpha", NodeDescribeThenSleep("alpha", "//example/alpha:node",
                                             {Sender("/alpha/state")}, 30));
@@ -509,6 +543,42 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   std::filesystem::remove_all(out_dir);
 }
 
+TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
+  const std::string tag = "ignore_interrupt";
+  const std::string out_dir = TempPath(tag + "_out");
+  std::filesystem::create_directories(out_dir);
+  LauncherOptions options;
+  options.output_dir = out_dir;
+  options.session_id = 0xDEAD2200ULL;
+  options.simulation = true;
+  options.describe_timeout_ms = 4000;
+  options.duration_s = 1;
+  options.config_path = WriteFixtureToml();
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStubNode(tag + "_hardware",
+                    DescribingStub("hardware_node",
+                                   "//talOS/bridge:hardware_node", {}));
+  auto stubborn = NodeDescribeThenSleep(
+      "alpha", "//example/alpha:node", {Sender("/alpha/state")}, 30);
+  stubborn.insert(stubborn.find("exec sleep"), "trap '' INT\n");
+  const auto alpha = WriteStubNode(tag + "_alpha", stubborn);
+  const auto beta = WriteStubNode(
+      tag + "_beta",
+      NodeDescribeThenSleep("beta", "//example/beta:node",
+                            {Watcher("/alpha/state")}, 30));
+  options.binary_overrides["//example/alpha:node"] = alpha;
+  options.binary_overrides["//example/beta:node"] = beta;
+  const auto started = std::chrono::steady_clock::now();
+  Launcher launcher{options};
+  EXPECT_EQ(launcher.Run(), -1);
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  EXPECT_GE(elapsed, std::chrono::seconds{3});
+  EXPECT_LT(elapsed, std::chrono::seconds{10});
+  std::filesystem::remove(alpha);
+  std::filesystem::remove(beta);
+  std::filesystem::remove_all(out_dir);
+}
+
 // A bridge that survives its grace second joins the session: it is not failed
 // and the session runs to the deadline with it.
 TEST(LauncherTest, StableBridgeJoinsSessionUntilDeadline) {
@@ -525,7 +595,9 @@ TEST(LauncherTest, StableBridgeJoinsSessionUntilDeadline) {
   options.duration_s = 3;
   options.config_path = WriteFixtureToml();
   options.binary_overrides["//talOS/bridge:hardware_node"] =
-      ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
+      WriteStubNode(tag + "_hardware",
+                    DescribingStub("hardware_node",
+                                   "//talOS/bridge:hardware_node", {}));
   options.binary_overrides["//example/alpha:node"] = WriteStubNode(
       tag + "_alpha", NodeDescribeThenSleep("alpha", "//example/alpha:node",
                                             {Sender("/alpha/state")}, 30));
@@ -727,14 +799,15 @@ TEST(LauncherTest, RunsChildProcessesAndWritesManifest) {
   options.session_id = 0x55555555ULL;
   options.duration_s = 1;
 
-  // Use /usr/bin/true (or /bin/echo) for all nodes so the test executes
-  // instantly and cleanly
-  std::string mock_bin =
-      ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
+  // Empty descriptions keep the graph valid; runtime exits immediately.
   options.config_path = WriteFixtureToml();
-  options.binary_overrides["//talOS/bridge:hardware_node"] = mock_bin;
-  options.binary_overrides["//example/alpha:node"] = mock_bin;
-  options.binary_overrides["//example/beta:node"] = mock_bin;
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      "manifest_hardware",
+      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
+  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+      "manifest_alpha", DescribingStub("alpha", "//example/alpha:node", {}));
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      "manifest_beta", DescribingStub("beta", "//example/beta:node", {}));
 
   Launcher launcher{options};
   int code = launcher.Run();
@@ -847,7 +920,7 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>()};
 }
 
-// Two stubs and a hardware node that says nothing, wired to the fixture config.
+// Two stubs and an empty hardware node, wired to the fixture config.
 struct GraphFixture {
   LauncherOptions options;
   std::string out_dir;
@@ -862,7 +935,9 @@ struct GraphFixture {
     options.config_path = WriteFixtureToml();
     options.describe_timeout_ms = 4000;
     options.binary_overrides["//talOS/bridge:hardware_node"] =
-        ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
+        WriteStubNode(std::string{tag} + "_hardware",
+                      DescribingStub("hardware_node",
+                                     "//talOS/bridge:hardware_node", {}));
     options.binary_overrides["//example/alpha:node"] =
         WriteStubNode(std::string{tag} + "_alpha", alpha_script);
     options.binary_overrides["//example/beta:node"] =
@@ -939,20 +1014,30 @@ TEST(LauncherGraphTest, AllowGraphErrorsLaunchesTheBrokenGraphAnyway) {
             std::string::npos);
 }
 
-TEST(LauncherGraphTest, ABinaryThatIgnoresDescribeIsAWarningAndStillLaunches) {
+TEST(LauncherGraphTest, ABinaryThatIgnoresDescribeRefusesLaunch) {
   GraphFixture fixture{"silent", kStubWithoutDescribe, kStubWithoutDescribe};
 
   Launcher launcher{fixture.options};
-  EXPECT_EQ(launcher.Run(), 0);
-  EXPECT_TRUE(fixture.has_manifest());
+  EXPECT_EQ(launcher.Run(), 1);
+  EXPECT_FALSE(fixture.has_manifest());
 
   const std::string graph = fixture.graph_json();
   EXPECT_NE(graph.find("\"described\": false"), std::string::npos) << graph;
   EXPECT_NE(graph.find("did not answer --describe"), std::string::npos)
       << graph;
-  EXPECT_NE(graph.find("\"severity\": \"warning\""), std::string::npos)
-      << graph;
-  EXPECT_EQ(graph.find("\"severity\": \"error\""), std::string::npos) << graph;
+  EXPECT_NE(graph.find("\"severity\": \"error\""), std::string::npos) << graph;
+}
+
+TEST(LauncherGraphTest, AllowGraphErrorsPermitsFailedDescribe) {
+  GraphFixture fixture{"silent_allowed", kStubWithoutDescribe,
+                       kStubWithoutDescribe};
+  fixture.options.allow_graph_errors = true;
+  EXPECT_EQ(Launcher{fixture.options}.Run(), 0);
+  EXPECT_TRUE(fixture.has_manifest());
+  EXPECT_NE(fixture.graph_json().find("did not answer --describe"),
+            std::string::npos);
+  EXPECT_NE(fixture.graph_json().find("\"severity\": \"error\""),
+            std::string::npos);
 }
 
 TEST(LauncherGraphTest, ANodeThatHangsOnDescribeDoesNotHangTheLaunch) {
@@ -963,7 +1048,8 @@ TEST(LauncherGraphTest, ANodeThatHangsOnDescribeDoesNotHangTheLaunch) {
 
   const auto started = std::chrono::steady_clock::now();
   Launcher launcher{fixture.options};
-  EXPECT_EQ(launcher.Run(), 0);
+  EXPECT_EQ(launcher.Run(), 1);
+  EXPECT_FALSE(fixture.has_manifest());
   const auto elapsed = std::chrono::steady_clock::now() - started;
   EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
             10);
@@ -1333,9 +1419,15 @@ LauncherOptions SessionFixture(std::string_view tag) {
   options.config_path = WriteFixtureToml();
   options.output_dir = TempPath(tag);
   options.session_id = 1;
-  options.binary_overrides["//talOS/bridge:hardware_node"] = "/usr/bin/true";
-  options.binary_overrides["//example/alpha:node"] = "/usr/bin/true";
-  options.binary_overrides["//example/beta:node"] = "/usr/bin/true";
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      std::string{tag} + "_hardware",
+      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
+  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+      std::string{tag} + "_alpha",
+      DescribingStub("alpha", "//example/alpha:node", {}));
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      std::string{tag} + "_beta",
+      DescribingStub("beta", "//example/beta:node", {}));
   return options;
 }
 

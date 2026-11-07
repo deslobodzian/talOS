@@ -144,6 +144,22 @@ bus = "rio"
 can_id = 2
 )";
 
+  const std::string hardware_stub = config + ".hardware.sh";
+  introspect::Description hardware;
+  hardware.name = "hardware_node";
+  hardware.target = "//talOS/bridge:hardware_node";
+  std::ofstream{hardware_stub}
+      << "#!/bin/sh\n"
+      << "for arg in \"$@\"; do\n"
+      << "  if [ \"$arg\" = \"--describe\" ]; then\n"
+      << "    cat <<'TALOS_DESCRIBE'\n"
+      << introspect::DescribeToJson(hardware)
+      << "TALOS_DESCRIBE\n"
+      << "  fi\n"
+      << "done\nexit 0\n";
+  std::filesystem::permissions(hardware_stub,
+                               std::filesystem::perms::owner_all);
+
   LauncherOptions options;
   options.config_path = config;
   options.output_dir = out_dir;
@@ -151,7 +167,7 @@ can_id = 2
   options.simulation = true;
   options.duration_s = 4;
   options.describe_timeout_ms = 4000;
-  options.binary_overrides["//talOS/bridge:hardware_node"] = "/usr/bin/true";
+  options.binary_overrides["//talOS/bridge:hardware_node"] = hardware_stub;
   options.binary_overrides["//talOS/launcher:continuity_source"] =
       Runfile("TALOS_SOURCE_NODE");
   options.binary_overrides["//talOS/launcher:continuity_sink"] =
@@ -232,6 +248,7 @@ can_id = 2
   std::filesystem::remove_all(out_dir);
   std::filesystem::remove(marker);
   std::filesystem::remove(config);
+  std::filesystem::remove(hardware_stub);
 }
 
 }  // namespace

@@ -101,13 +101,10 @@ timeout, just a topic with one end.
 
 ## When a binary does not answer
 
-A binary that ignores `--describe` produces a warning and the launch proceeds.
-This is deliberate: a node someone is halfway through writing must stay
-launchable, and a framework that refuses to start what it cannot describe is a
-framework people route around. Its topics are missing from the declared graph,
-which is recorded per node in `graph.json` and in the session manifest, so a
-graph that passed because half of it went unread does not look like a graph that
-passed.
+A binary that fails `--describe` produces a graph error and prevents launch
+unless `--allow-graph-errors` is supplied. Missing descriptions remain recorded
+per node in `graph.json` and the session manifest; overriding the error cannot
+create segments for undeclared topics.
 
 The probe has a timeout — fifteen seconds by default,
 `--describe-timeout-ms` to change it — after which the probe is killed and
@@ -238,7 +235,10 @@ A node's `exit_code` and `pid` are its last run's.
 Heartbeat supervision reads the introspection registry without modifying it.
 `--heartbeat-periods N` defaults to 10 periods, with a minimum timeout of
 500 ms. `--heartbeat-startup-grace-ms MS` defaults to 5000 ms to allow node
-initialization. Stalled nodes are killed and enter the same restart policy.
+initialization. Stalled nodes, including nodes that never publish a registry row,
+are killed and enter the same restart policy once both the startup grace and
+heartbeat timeout have elapsed. Registration is required even when
+`--allow-graph-errors` permits a failed description.
 `--restart-window-ms MS` overrides the default 60000 ms rolling budget window.
 
 ## Replaying a session into one node

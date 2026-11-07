@@ -120,12 +120,27 @@ type = "TalonFX"
 bus = "rio"
 can_id = 1
 )";
+    introspect::Description hardware;
+    hardware.name = "hardware_node";
+    hardware.target = "//talOS/bridge:hardware_node";
+    const std::string stub = record_config_ + ".hardware.sh";
+    std::ofstream{stub}
+        << "#!/bin/sh\n"
+        << "for arg in \"$@\"; do\n"
+        << "  if [ \"$arg\" = \"--describe\" ]; then\n"
+        << "    cat <<'TALOS_DESCRIBE'\n"
+        << introspect::DescribeToJson(hardware)
+        << "TALOS_DESCRIBE\n"
+        << "  fi\n"
+        << "done\nexit 0\n";
+    std::filesystem::permissions(stub, std::filesystem::perms::owner_all);
   }
 
   void TearDown() override {
     std::filesystem::remove_all(session_dir_);
     std::filesystem::remove(config_);
     std::filesystem::remove(record_config_);
+    std::filesystem::remove(record_config_ + ".hardware.sh");
   }
 
   LauncherOptions Options() const {
@@ -133,7 +148,8 @@ can_id = 1
     options.session_id = 1;
     options.simulation = true;
     options.describe_timeout_ms = 4000;
-    options.binary_overrides["//talOS/bridge:hardware_node"] = "/usr/bin/true";
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        record_config_ + ".hardware.sh";
     options.binary_overrides["//talOS/launcher:replay_source"] =
         Runfile("TALOS_SOURCE_NODE");
     options.binary_overrides["//talOS/launcher:replay_consumer"] =

@@ -2,9 +2,8 @@
 // propagation from critical nodes.
 //
 // Every session runs in a pid-unique temp directory with shell-stub nodes,
-// so no two tests share state, ports, or shared memory. Stubs answer
-// --describe by exiting nonzero (the documented "warning, launch proceeds"
-// path), which keeps phase one fast without redeclaring the describe JSON.
+// so no two tests share state, ports, or shared memory. Stubs describe an
+// empty graph unless a test explicitly exercises a failed probe.
 
 #include <gtest/gtest.h>
 #include <sys/stat.h>
@@ -64,12 +63,29 @@ std::string WriteFixtureToml(std::string_view tag,
   return path;
 }
 
-std::string WriteStub(std::string_view tag, std::string_view body) {
+std::string WriteStub(std::string_view tag, std::string_view body,
+                      std::string_view node = "",
+                      bool answers_describe = true) {
   const std::string path = TempPath(tag) + ".sh";
+  if (node.empty()) node = tag.ends_with("_beta") ? "beta" : "alpha";
+  introspect::Description description;
+  description.name = std::string{node};
+  description.target = node == "hardware_node"
+                           ? "//talOS/bridge:hardware_node"
+                           : "//example/" + std::string{node} + ":node";
   std::ofstream out{path};
   out << "#!/bin/sh\n"
       << "for arg in \"$@\"; do\n"
-      << "  if [ \"$arg\" = \"--describe\" ]; then exit 1; fi\n"
+      << "  if [ \"$arg\" = \"--describe\" ]; then\n";
+  if (answers_describe) {
+    out << "    cat <<'TALOS_DESCRIBE'\n"
+        << introspect::DescribeToJson(description)
+        << "TALOS_DESCRIBE\n"
+        << "    exit 0\n";
+  } else {
+    out << "    exit 1\n";
+  }
+  out << "  fi\n"
       << "done\n"
       << body;
   out.close();
@@ -91,7 +107,7 @@ LauncherOptions BaseOptions(std::string_view tag,
   options.describe_timeout_ms = 4000;
   options.config_path = WriteFixtureToml(tag, robot_keys);
   options.binary_overrides["//talOS/bridge:hardware_node"] =
-      ::access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/echo";
+      WriteStub(std::string{tag} + "_hardware", "exit 0\n", "hardware_node");
   return options;
 }
 
@@ -347,6 +363,84 @@ TEST(Supervision, StalledRegistryHeartbeatIsKilledAndRestarted) {
   EXPECT_NE(alpha.find("\"restart_count\": 1"), std::string::npos);
   std::filesystem::remove_all(options.output_dir);
   ::remove(pid_file.c_str());
+  ::remove(runs.c_str());
+}
+
+TEST(Supervision, NeverRegisteredNodeIsKilledAndRestarted) {
+  auto options = BaseOptions("unregistered_out", "max_restarts = 1\n");
+  options.heartbeat_startup_grace_ms = 0;
+  options.duration_s = 3;
+  const auto runs = TempPath("unregistered_runs");
+  ::remove(runs.c_str());
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "unregistered_alpha",
+      RecordLogArgThen(runs,
+                       "case \"$log\" in *restart1.tlog) exit 0;; esac\n"
+                       "exec sleep 10\n"));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("unregistered_beta", "exit 0\n");
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_EQ(ReadLines(runs),
+            (std::vector<std::string>{options.output_dir + "/alpha.tlog",
+                                      options.output_dir +
+                                          "/alpha.restart1.tlog"}));
+  const auto alpha =
+      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
+  EXPECT_NE(alpha.find("\"restart_count\": 1"), std::string::npos) << alpha;
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
+TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
+  auto options = BaseOptions("undescribed_out", "max_restarts = 1\n");
+  options.allow_graph_errors = true;
+  options.heartbeat_startup_grace_ms = 0;
+  options.duration_s = 3;
+  const auto runs = TempPath("undescribed_runs");
+  ::remove(runs.c_str());
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "undescribed_alpha",
+      RecordLogArgThen(runs,
+                       "case \"$log\" in *restart1.tlog) exit 0;; esac\n"
+                       "exec sleep 10\n"),
+      "alpha", false);
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("undescribed_beta", "exit 0\n");
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_EQ(ReadLines(runs).size(), 2u);
+  const auto alpha =
+      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
+  EXPECT_NE(alpha.find("\"described\": false"), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"restart_count\": 1"), std::string::npos) << alpha;
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
+TEST(Supervision, SimGatewayDoesNotRequireFrameworkRegistration) {
+  auto options = BaseOptions(
+      "gateway_out",
+      "max_restarts = 1\nsim_gateway = \"//example/sim_gateway:node\"\n");
+  options.simulation = true;
+  options.start_sim_gateway = true;
+  options.heartbeat_startup_grace_ms = 0;
+  options.duration_s = 3;
+  const auto runs = TempPath("gateway_runs");
+  ::remove(runs.c_str());
+  options.binary_overrides["//example/sim_gateway:node"] =
+      WriteStub("gateway", "echo run >> " + runs + "\nexec sleep 1\n",
+                "sim_gateway");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("gateway_alpha", "exit 0\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("gateway_beta", "exit 0\n");
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_EQ(ReadLines(runs).size(), 1u);
+  const auto gateway =
+      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"),
+                    "sim_gateway");
+  EXPECT_NE(gateway.find("\"described\": true"), std::string::npos) << gateway;
+  EXPECT_NE(gateway.find("\"restart_count\": 0"), std::string::npos) << gateway;
+  std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
 }
 

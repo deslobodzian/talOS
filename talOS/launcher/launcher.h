@@ -506,6 +506,7 @@ inline bool ProbeDescribe(const std::string& binary_path,
   std::string text;
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   bool timed_out = false;
+  constexpr std::size_t kMaxDescribeBytes = 4 * 1024 * 1024;
   for (;;) {
     const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
         deadline - std::chrono::steady_clock::now());
@@ -531,14 +532,36 @@ inline bool ProbeDescribe(const std::string& binary_path,
       error = std::string{"read() failed: "} + std::strerror(errno);
       break;
     }
-    if (got == 0) break;  // EOF: the child closed stdout, so it is finished.
+    if (got == 0) break;  // EOF does not imply that the child has exited.
+    if (static_cast<std::size_t>(got) > kMaxDescribeBytes - text.size()) {
+      error = "describe output exceeds the 4 MiB limit";
+      break;
+    }
     text.append(buffer, static_cast<std::size_t>(got));
   }
   ::close(fds[0]);
 
-  if (timed_out || !error.empty()) ::kill(pid, SIGKILL);
   int status = 0;
-  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  if (!timed_out && error.empty()) {
+    for (;;) {
+      const pid_t result = ::waitpid(pid, &status, WNOHANG);
+      if (result == pid) break;
+      if (result < 0) {
+        if (errno == EINTR) continue;
+        error = std::string{"waitpid() failed: "} + std::strerror(errno);
+        break;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        timed_out = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  }
+  if (timed_out || !error.empty()) {
+    ::kill(pid, SIGKILL);
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
   }
 
   if (timed_out) {
@@ -698,9 +721,8 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
                  described.declared.name + "'"});
       }
     } else {
-      // A warning: a node someone is halfway through writing stays launchable.
       probe_findings.push_back(
-          {naming::Severity::WARNING, described.roster_name,
+          {naming::Severity::ERROR, described.roster_name,
            "did not answer --describe (" + described.error +
                "), so its topics are missing from the declared graph"});
     }
@@ -1284,8 +1306,6 @@ class Launcher {
                                      .value_or<int64_t>(5000));
       launches[i].heartbeat_timeout = std::chrono::microseconds{
           std::max<int64_t>(500000, period_us * options_.heartbeat_periods)};
-      launches[i].heartbeat_enabled =
-          proc.described && proc.name != kSimGatewayName;
       auto& args = launches[i].args;
       args.push_back(node_specs[i].binary_path);
       if (proc.name == kSimGatewayName) {
@@ -1442,7 +1462,6 @@ class Launcher {
     bool restart_pending{false};
     std::chrono::steady_clock::time_point restart_at{};
     std::deque<std::chrono::steady_clock::time_point> restart_times;
-    bool heartbeat_enabled{false};
     bool heartbeat_killed{false};
     std::chrono::nanoseconds heartbeat_timeout{std::chrono::milliseconds{500}};
     std::chrono::steady_clock::time_point started_at{};
@@ -1562,6 +1581,7 @@ class Launcher {
                  std::optional<StudioBridge>& studio,
                  std::chrono::steady_clock::time_point deadline) {
     bool stop_sent = false;
+    auto shutdown_deadline = std::chrono::steady_clock::time_point::max();
     std::optional<introspect::RegistryMapping> registry;
     const auto started = std::chrono::steady_clock::now();
     for (auto& launch : launches) {
@@ -1611,7 +1631,6 @@ class Launcher {
                       static_cast<uint64_t>(introspect::SlotState::ACTIVE))
                 continue;
               found = true;
-              launch.heartbeat_enabled = true;
               if (beat != launch.last_heartbeat &&
                   dispatch != launch.last_dispatch) {
                 launch.heartbeat_changed_at = now;
@@ -1624,7 +1643,9 @@ class Launcher {
           const bool grace_over =
               now - launch.started_at >=
               std::chrono::milliseconds{options_.heartbeat_startup_grace_ms};
-          if (launch.heartbeat_enabled && grace_over &&
+          // Registration is part of startup, not an opt-in to supervision:
+          // until a row arrives, the spawn time is the last progress time.
+          if (grace_over &&
               now - launch.heartbeat_changed_at >= launch.heartbeat_timeout) {
             std::cerr << "[launcher] " << proc.name
                       << (found ? " heartbeat/dispatch stalled"
@@ -1708,9 +1729,15 @@ class Launcher {
 
       if (!stop_sent && (stop_requested_ || past_deadline)) {
         stop_sent = true;
+        shutdown_deadline = now + std::chrono::seconds{2};
         std::cout << "[launcher] Stopping children...\n";
         for (const auto& proc : procs) {
           if (proc.pid > 0 && !proc.exited) ::kill(proc.pid, SIGINT);
+        }
+      }
+      if (stop_sent && now >= shutdown_deadline) {
+        for (const auto& proc : procs) {
+          if (proc.pid > 0 && !proc.exited) ::kill(proc.pid, SIGKILL);
         }
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
