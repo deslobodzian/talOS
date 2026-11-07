@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -54,6 +55,144 @@ FieldLayout RoundTripLayout() {
   return layout;
 }
 
+// Test oracle for the former full-frame integration. Production keeps only the
+// region-limited path; this deliberately slow reference pins pixel equivalence.
+int FullFrameExposure(const FieldLayout& layout,
+                      const std::map<int, TagPattern>& patterns,
+                      const SimCameraView& camera,
+                      const talos::geometry::SE3<double>& pose,
+                      const Eigen::Vector3d& velocity, double yaw_rate,
+                      const SimRenderOptions& options,
+                      std::vector<uint8_t>* output) {
+  const double seconds = camera.exposure_ms * 0.001;
+  auto pose_at = [&](double time) {
+    return talos::geometry::SE3<double>(
+        talos::geometry::SO3<double>::Exp(
+            Eigen::Vector3d(0, 0, yaw_rate * time)) *
+            pose.rotation(),
+        pose.translation() + velocity * time);
+  };
+  const auto start = SimulateVisibleTags(
+      layout, camera, pose_at(-seconds * 0.5), kTagSize, true);
+  const auto end = SimulateVisibleTags(layout, camera, pose_at(seconds * 0.5),
+                                       kTagSize, true);
+  double displacement = 0;
+  for (const auto& a : start) {
+    for (const auto& b : end) {
+      if (a.tag_id != b.tag_id) continue;
+      for (int corner = 0; corner < 4; ++corner)
+        displacement = std::max(displacement,
+                                (a.corners[corner] - b.corners[corner]).norm());
+    }
+  }
+  std::vector<SimTagDetection> detections;
+  if (displacement < 0.5)
+    return RenderInstantaneousFieldView(layout, patterns, camera, pose,
+                                        kTagSize, options, output, &detections);
+  const int samples =
+      static_cast<int>(std::clamp(std::ceil(displacement * 2), 2.0, 64.0));
+  cv::Mat sum(camera.intrinsics.image_height, camera.intrinsics.image_width,
+              CV_32FC1, cv::Scalar(0));
+  std::vector<uint8_t> instant;
+  int painted = 0;
+  for (int sample = 0; sample < samples; ++sample) {
+    const double time = ((sample + 0.5) / samples - 0.5) * seconds;
+    painted = std::max(painted, RenderInstantaneousFieldView(
+                                    layout, patterns, camera, pose_at(time),
+                                    kTagSize, options, &instant, &detections));
+    const cv::Mat image(sum.size(), CV_8UC1, instant.data());
+    cv::add(sum, image, sum, cv::noArray(), CV_32F);
+  }
+  output->resize(instant.size());
+  cv::Mat image(sum.size(), CV_8UC1, output->data());
+  sum.convertTo(image, CV_8U, 1.0 / samples);
+  return painted;
+}
+
+TEST(RenderDetect, RegionExposureMatchesFullFrameWithinOneGrayLevel) {
+  std::map<int, TagPattern> patterns;
+  std::string error;
+  ASSERT_TRUE(LoadTag36h11Patterns(&patterns, &error)) << error;
+  auto layout = RoundTripLayout();
+  // Partially overlapping tags exercise painter ordering and rectangle unions.
+  const auto first = *layout.GetTagPose(kTagId);
+  layout.SetTagPose(8, talos::geometry::SE3<double>(
+                           first.rotation(), Eigen::Vector3d(1.8, 0.10, 0.54)));
+  struct Motion {
+    double x, y, yaw;
+    Eigen::Vector3d velocity;
+    double yaw_rate;
+  };
+  const std::array<Motion, 6> motions{{
+      {0, 0, 0, {0, 2, 0}, 0},
+      {0, 0, 0, {1.4, 0.5, 0}, 3},
+      {0, 0.94, 0, {0, -2, 0}, -3},
+      {0.1, -0.2, 0.25, {-1, 0.5, 0}, 2},
+      {1.35, 0, 0, {0.2, 0, 0}, 3},
+      {0, 0, 0, {0.001, 0, 0}, 0},
+  }};
+  for (bool distorted : {false, true}) {
+    auto camera = RoundTripCamera();
+    camera.exposure_ms = 20;
+    if (distorted) {
+      camera.intrinsics.k1 = -0.12;
+      camera.intrinsics.k2 = 0.03;
+      camera.intrinsics.p1 = 0.002;
+      camera.intrinsics.p2 = -0.003;
+      camera.mounting = MountFromXyzYpr(0.2, -0.15, 0.5, 0, 10, 3);
+    }
+    for (const auto& motion : motions) {
+      SCOPED_TRACE(::testing::Message()
+                   << "distorted=" << distorted << " x=" << motion.x
+                   << " y=" << motion.y << " yaw=" << motion.yaw);
+      const auto pose = RobotPoseOnField(motion.x, motion.y, motion.yaw);
+      for (uint8_t background : {uint8_t{255}, uint8_t{127}}) {
+        SimRenderOptions options;
+        options.background_gray = background;
+        options.black_gray = 17;
+        options.white_gray = 230;
+        RenderScratch scratch;
+        std::vector<uint8_t> regional, reference;
+        const auto painted = RenderFieldView(
+            layout, patterns, camera, pose, kTagSize, options, &regional,
+            motion.velocity, motion.yaw_rate, nullptr, &scratch);
+        EXPECT_EQ(painted, FullFrameExposure(layout, patterns, camera, pose,
+                                             motion.velocity, motion.yaw_rate,
+                                             options, &reference));
+        ASSERT_EQ(regional.size(), reference.size());
+        const cv::Mat actual(camera.intrinsics.image_height,
+                             camera.intrinsics.image_width, CV_8UC1,
+                             regional.data());
+        const cv::Mat expected(actual.size(), CV_8UC1, reference.data());
+        EXPECT_LE(cv::norm(actual, expected, cv::NORM_INF), 1);
+        for (std::size_t i = 0; i < scratch.regions.size(); ++i)
+          for (std::size_t j = i + 1; j < scratch.regions.size(); ++j)
+            EXPECT_TRUE((scratch.regions[i] & scratch.regions[j]).empty());
+      }
+    }
+  }
+}
+
+TEST(RenderDetect, ExposureAccumulatesOnlySmallTagRegionsAndKeepsBackground) {
+  std::map<int, TagPattern> patterns;
+  std::string error;
+  ASSERT_TRUE(LoadTag36h11Patterns(&patterns, &error)) << error;
+  auto camera = RoundTripCamera();
+  camera.exposure_ms = 5;
+  RenderScratch scratch;
+  std::vector<uint8_t> output;
+  EXPECT_EQ(RenderFieldView(RoundTripLayout(), patterns, camera,
+                            RobotPoseOnField(0, 0, 0), kTagSize, {}, &output,
+                            {0, 2, 0}, 0, nullptr, &scratch),
+            1);
+  ASSERT_FALSE(scratch.regions.empty());
+  int area = 0;
+  for (const auto& region : scratch.regions) area += region.area();
+  EXPECT_LT(area, 640 * 480 / 10);
+  EXPECT_EQ(output.front(), 255);
+  EXPECT_EQ(output.back(), 255);
+}
+
 TEST(RenderDetect, PatternsLoadForAllFieldTags) {
   std::map<int, TagPattern> patterns;
   std::string error;
@@ -89,14 +228,12 @@ TEST(RenderDetect, RenderedTagDecodesThroughTheRealPipeline) {
   ASSERT_EQ(gray.size(), 640u * 480u);
 
   PipelineConfig config;
-  config.kind = "apriltag";
   config.backend_name = "cpu";
-  config.revision = 1;
   config.intrinsics = cam.intrinsics;
   config.mounting = cam.mounting;
   config.layout = layout;
-  config.parameters["decimate"] = "1.0";
-  config.parameters["threads"] = "1";
+  config.detector_options.quad_decimate = 1.0f;
+  config.detector_options.threads = 1;
   AprilTagPipeline pipeline(config);
 
   Frame frame(0, /*session_id=*/1, /*sequence_number=*/1,
@@ -107,7 +244,9 @@ TEST(RenderDetect, RenderedTagDecodesThroughTheRealPipeline) {
   ASSERT_EQ(res.detections.size(), 1u) << "expected exactly the rendered tag";
   const DetectionResult& det = res.detections[0];
   EXPECT_EQ(det.tag_id, kTagId);
-  EXPECT_TRUE(det.valid);
+  ASSERT_TRUE(det.valid) << "decision margin=" << det.decision_margin
+                         << ", required=" << config.min_decision_margin;
+  EXPECT_GE(det.decision_margin, config.min_decision_margin);
   // Corners land where the projector put them (detector refines edges, so
   // allow a couple of pixels of honest disagreement). Projector and
   // detector share the model-corner convention, but match up to rotation
@@ -150,14 +289,15 @@ TEST(RenderDetect, RenderedTagDecodesThroughTheRealPipeline) {
   EXPECT_NEAR(t.x(), 0.0, 0.05);
   EXPECT_NEAR(t.y(), 0.0, 0.05);
   EXPECT_NEAR(t.z(), 1.5, 0.05);
-  EXPECT_GT(det.decision_margin, 0.0f);
-  // End-to-end field composition: the pipeline's own robot field pose must
-  // recover the true robot pose (origin). This proves the sim mounting, the
-  // backend camera frame, and the layout tag frame all agree with each
-  // other — the same composition live code runs on real images.
-  ASSERT_EQ(res.field_poses.size(), 1u);
-  EXPECT_TRUE(res.field_poses[0].valid);
-  const Eigen::Vector3d fr = res.field_poses[0].T_field_robot.translation();
+  // End-to-end field composition: localize the pipeline detections explicitly
+  // and recover the true robot pose (origin). This proves the sim mounting,
+  // backend camera frame, and layout tag frame all agree with each other.
+  const auto robot_pose = SolveMultiTagRobotPose(
+      res.detections, frame.camera_id(), config.mounting, config.layout,
+      config.intrinsics, config.validation_options);
+  ASSERT_TRUE(robot_pose.validity.valid) << robot_pose.validity.message;
+  EXPECT_EQ(robot_pose.tag_count, 1);
+  const Eigen::Vector3d fr = robot_pose.T_field_robot.translation();
   EXPECT_NEAR(fr.x(), 0.0, 0.05);
   EXPECT_NEAR(fr.y(), 0.0, 0.05);
   EXPECT_NEAR(fr.z(), 0.0, 0.05);
@@ -166,7 +306,7 @@ TEST(RenderDetect, RenderedTagDecodesThroughTheRealPipeline) {
   // origin in place); a flipped pattern or a wrong frame conversion shows
   // up here as tens of degrees.
   const Eigen::Matrix3d fR =
-      res.field_poses[0].T_field_robot.rotation().rotationMatrix();
+      robot_pose.T_field_robot.rotation().rotationMatrix();
   for (int r = 0; r < 3; ++r) {
     for (int c = 0; c < 3; ++c) {
       EXPECT_NEAR(fR(r, c), (r == c) ? 1.0 : 0.0, 0.03)
@@ -431,14 +571,12 @@ TEST(RenderDetect, ModerateSensorNoiseAndMotionStillDecode) {
                             0.01, &rng, &scratch),
             1);
   PipelineConfig config;
-  config.kind = "apriltag";
   config.backend_name = "cpu";
-  config.revision = 1;
   config.intrinsics = camera.intrinsics;
   config.mounting = camera.mounting;
   config.layout = layout;
-  config.parameters["decimate"] = "1.0";
-  config.parameters["threads"] = "1";
+  config.detector_options.quad_decimate = 1.0f;
+  config.detector_options.threads = 1;
   AprilTagPipeline pipeline(config);
   Frame frame(0, 1, 1, talos::event::MonotonicTime::from_nanos(1000), 640, 480,
               640, PixelFormat::kGray8, std::move(pixels));
@@ -446,6 +584,94 @@ TEST(RenderDetect, ModerateSensorNoiseAndMotionStillDecode) {
   ASSERT_TRUE(result.success) << result.error_message;
   ASSERT_EQ(result.detections.size(), 1u);
   EXPECT_EQ(result.detections.front().tag_id, kTagId);
+  const auto& detection = result.detections.front();
+  ASSERT_TRUE(detection.valid)
+      << "decision margin=" << detection.decision_margin
+      << ", required=" << config.min_decision_margin;
+  EXPECT_GE(detection.decision_margin, config.min_decision_margin);
+}
+
+TEST(RenderDetect, ProductionSimCornerNoiseMatchesSolverPixelStd) {
+  auto camera = RoundTripCamera();
+  // Production sim effects in configuration/subsystems/vision.toml. This
+  // framework test cannot depend upward on a robot's TOML configuration.
+  camera.sensor_noise_std_gray = 2.0;
+  camera.exposure_gain_std = 0.02;
+  camera.exposure_ms = 5.0;
+  std::mt19937_64 rng(1000);
+  RenderScratch scratch;
+  const auto layout = RoundTripLayout();
+  std::map<int, TagPattern> patterns;
+  std::string error;
+  ASSERT_TRUE(LoadTag36h11Patterns(&patterns, &error)) << error;
+  PipelineConfig config;
+  config.backend_name = "cpu";
+  config.intrinsics = camera.intrinsics;
+  config.mounting = camera.mounting;
+  config.layout = layout;
+  config.detector_options.quad_decimate = 2.0f;
+  config.detector_options.threads = 2;
+  config.detector_options.refine_edges = true;
+  AprilTagPipeline pipeline(config);
+  std::array<double, 2> sum{}, squared_sum{};
+  size_t corners = 0;
+  uint64_t sequence = 0;
+  for (const double distance : {1.5, 2.5, 4.0, 6.0}) {
+    size_t distance_detections = 0;
+    for (int offset = -2; offset <= 2; ++offset) {
+      const auto robot =
+          RobotPoseOnField(1.5 - distance, offset * 0.037, offset * 0.018);
+      const auto camera_tag = camera.mounting.T_robot_camera.inverse() *
+                              robot.inverse() * *layout.GetTagPose(kTagId);
+      const auto model_corners = GetTagModelCorners(kTagSize);
+      std::array<Eigen::Vector2d, 4> expected;
+      for (size_t corner = 0; corner < expected.size(); ++corner) {
+        ASSERT_TRUE(camera.intrinsics.ProjectPoint(
+            camera_tag.act(model_corners[corner]), &expected[corner]));
+      }
+      for (int repetition = 0; repetition < 8; ++repetition) {
+        std::vector<uint8_t> pixels;
+        ASSERT_EQ(RenderFieldView(layout, patterns, camera, robot, kTagSize, {},
+                                  &pixels, Eigen::Vector3d(0.2, 0.1, 0), 0.05,
+                                  &rng, &scratch),
+                  1);
+        Frame frame(0, 1, sequence++,
+                    talos::event::MonotonicTime::from_nanos(1000), 640, 480,
+                    640, PixelFormat::kGray8, std::move(pixels));
+        const auto result = pipeline.ProcessFrame(frame);
+        ASSERT_TRUE(result.success) << result.error_message;
+        for (const auto& detection : result.detections) {
+          if (detection.tag_id != kTagId || detection.hamming > 1 ||
+              detection.decision_margin < config.min_decision_margin)
+            continue;
+          ++distance_detections;
+          for (size_t corner = 0; corner < expected.size(); ++corner) {
+            for (size_t axis = 0; axis < 2; ++axis) {
+              const double residual =
+                  detection.corners[2 * corner + axis] - expected[corner](axis);
+              sum[axis] += residual;
+              squared_sum[axis] += residual * residual;
+            }
+            ++corners;
+          }
+        }
+      }
+    }
+    EXPECT_GE(distance_detections, 20u) << "distance_m=" << distance;
+  }
+  ASSERT_GT(corners, 0u);
+  const double mean = (sum[0] + sum[1]) / (2 * corners);
+  const double std_px = std::sqrt(
+      (squared_sum[0] + squared_sum[1]) / (2 * corners) - mean * mean);
+  const double configured_std_px = PoseSolverOptions{}.pixel_std_px;
+  RecordProperty("corner_coordinate_samples", static_cast<int>(2 * corners));
+  RecordProperty("corner_error_mean_px", mean);
+  RecordProperty("corner_error_std_px", std_px);
+  RecordProperty("corner_error_rms_px",
+                 std::sqrt((squared_sum[0] + squared_sum[1]) / (2 * corners)));
+  EXPECT_NEAR(std_px, configured_std_px, configured_std_px * 0.3)
+      << "empirical corner-coordinate std_px=" << std_px
+      << ", signed mean_px=" << mean << ", samples=" << 2 * corners;
 }
 
 }  // namespace

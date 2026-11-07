@@ -19,9 +19,13 @@ The configured sources are `front_left_camera`, `front_right_camera`,
 node. Each also publishes `vision.VisionStatus` on `/<camera>/status`.
 Live AVFoundation/V4L2 capture starts on the camera's first update and runs
 through a capture callback and processing worker. Under `--sim`, observations
-come from rendered/projected tags using drivetrain-integrated truth, never
-this estimator's output. Camera intrinsics, distortion, mounts and devices
-live in each camera's subsystem file; see [vision](../vision/README.md).
+come from rendered/projected tags using absolute `/sim/state` truth from
+`sim_gateway --physics`, never this estimator's output or measured odometry.
+WPILib sim publishes no truth, so simulated camera observations remain invalid.
+The gateway owns the world's `--start-pose`; the estimator's independent
+`initial_*` seed may differ and be corrected by vision. Camera intrinsics,
+distortion, mounts and devices live in each camera's subsystem file;
+see [vision](../vision/README.md).
 
 ## Backends
 
@@ -52,8 +56,12 @@ fails at startup):
 - Field dimensions `field_length_m` (16.54) and `field_width_m` (8.21)
   must be finite and positive. Observations outside the inclusive field
   rectangle or with no tags are rejected. A single-tag observation more
-  than `max_innovation_m` (3.0, finite and positive) from the current estimate
-  is rejected; multi-tag solves may relocalize across larger wheel-slip jumps.
+  than `max_innovation_m` (3.0 m, finite and positive) from the current estimate,
+  or whose absolute wrapped yaw difference exceeds `max_yaw_innovation_rad`
+  (0.2618 rad, approximately 15 degrees; finite and positive), is rejected and
+  counted in `observation_rejected_count`. Wrapping handles the ±π boundary.
+  Multi-tag solves bypass both innovation gates and may relocalize across
+  larger wheel-slip or heading jumps.
 - A drivetrain sample is integrated once, when `sample_time_ns` increased,
   `modules_valid` and `yaw_valid` hold and every value is finite.
 - `valid` = odometry integrated at least once, the drivetrain message fresh
@@ -74,7 +82,8 @@ fails at startup):
 scenario against both backends on `talos.testing.Sim`: a straight line then
 an arc against the closed-form pose; a delayed observation correcting
 wheel-slip drift; an observation between samples placed at its own time;
-each rejection case leaving the pose alone; estimation while disabled;
-stale, frozen and invalid drivetrain input; repeated samples; `cameras`
+each rejection case leaving the pose alone; single-tag yaw acceptance,
+rejection and ±π wrapping, with multi-tag relocalization unaffected;
+estimation while disabled; stale, frozen and invalid drivetrain input; repeated samples; `cameras`
 wiring; startup errors naming the bad key; `--describe` and a logged sim run
 replaying without divergence.

@@ -529,12 +529,16 @@ node = "//talOS/telemetry:node"
   ASSERT_TRUE(dict.contains("hw/state/driver_station/enabled"));
   ASSERT_TRUE(dict.contains("hw/state/driver_station/teleop"));
   ASSERT_TRUE(dict.contains("hw/state/driver_station/autonomous"));
+  ASSERT_TRUE(dict.contains("hw/state/driver_station/alliance"));
   ASSERT_TRUE(dict.contains("hw/state/driver_station/match_time_s"));
   EXPECT_EQ(dict.at("hw/state/driver_station/match_time_s")->unit, "s");
+  EXPECT_EQ(dict.at("hw/state/driver_station/alliance")->labels,
+            (std::vector<std::string>{"unknown", "red", "blue"}));
 
   driver_station::DriverStationData ds_data{};
   ds_data.fms.flags = driver_station::kDsAttached | driver_station::kEnabled |
                       driver_station::kTeleop;
+  ds_data.fms.alliance = driver_station::Alliance::kRed;
   ds_data.fms.match_time_s = 75.5f;
 
   hardware::Packet packet{};
@@ -552,6 +556,7 @@ node = "//talOS/telemetry:node"
   EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/enabled"), 1.0);
   EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/teleop"), 1.0);
   EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/autonomous"), 0.0);
+  EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/alliance"), 1.0);
   EXPECT_NEAR(channels.at("hw/state/driver_station/match_time_s"), 75.5, 1e-3);
 }
 

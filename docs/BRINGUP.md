@@ -55,10 +55,46 @@
    table syntax is refused; keep a backup and review the diff. It never changes
    commissioning, CAN ids, device selection or mount extrinsics. Measure the
    robot-frame mount separately and repeat for every camera.
+6. Measure each camera's exposure-to-timestamp bias, separately from mount and
+   intrinsics calibration. Under a safe, supervised constant-speed translation
+   or rotation, align camera observations against independent odometry/gyro
+   history; repeat both directions and several speeds to distinguish a time
+   shift from fixed mounting bias. A timestamped LED/blink exposure test is an
+   alternative. Set `[camera] latency_offset_us` in that camera's TOML to the
+   measured nonnegative delay (default 0, finite and below 1,000,000 µs).
+   Published `sample_time_ns = capture_ns - latency_offset_us * 1000`;
+   do not subtract processing delay if the source already timestamps exposure.
+   Rebuild/redeploy and repeat the motion check: timestamp alignment should
+   improve, and status `last_latency_us` now includes the correction. Leave
+   `sim_timestamp_lag_us = 0` on the robot; it is a sim-only injection, ignored
+   live, not a calibration setting.
 
 The tool uses OpenCV 4.12's ChArUco detector: the BCR module exposes both
 `@opencv//:objdetect` and `@opencv//:calib3d`. Calibration uses the five-coefficient
 Brown–Conrady model (no rational/thin-prism extensions).
+
+## Vision frame recording and replay
+
+Every launched camera records frames while a session directory is present
+(always, under the launcher): `recording.enabled = true` writes lossless 8-bit
+PNG frames and a detection-context JSON sidecar to
+`<session>/frames/<camera>/`, rate-limited by `recording.sample_hz` /
+`recording.rejected_hz` and capped by `recording.max_bytes` (oldest pairs
+deleted first). Fetch a session with `./tools/deploy.sh fetch` as usual; the
+frames come along. Re-run the detector and localization offline over a camera's
+frames with:
+
+```sh
+bazel run //talOS/vision/recording:frame_replay -- \
+  --frames <session>/frames/front_left_camera \
+  --layout 2026-robot/main_processor/vision/data/2026-rebuilt-welded.json
+```
+
+The tool prints a Markdown summary: valid observations and per-reason rejection
+counts before/after, plus position/yaw error RMS against the recorded truth.
+Override the recorded detector settings with `--decimate`, `--threads`,
+`--sigma`, `--refine-edges`, `--hamming`, `--min-decision-margin` and
+`--backend`; pass `--max-range-m` to match a non-default `camera.max_range_m`.
 
 ## Uncommissioned, then disabled
 

@@ -15,6 +15,8 @@ flowchart LR
   DEV[CAN motors / sensors and local IO] <-->|Phoenix / WPILib| RIO
   RIO <-->|wired UDP 5802 ↔ 5803| HW[hardware_node]
   SIM[sim_gateway or WPILib RoboRIO sim] <-->|same UDP contract in simulation| HW
+  SIM -->|/sim/state, physics gateway only| V
+  SIM -->|/sim/state, physics gateway only| T
   HW -->|/hw/state and /hw/state/driver_station| N[drivetrain / intake / shooter]
   N -->|/hw/request/node| HW
   HW -->|Driver Station snapshot| DRIVER[driver / teleop / autonomous]
@@ -46,21 +48,31 @@ second hop. See [architecture](../ARCHITECTURE.md#two-processors).
 | hardware_node → RIO: Command (21) | UDP 5803 → 5802 | Bridge polls every 1000 µs. Send immediately when merged command changes, otherwise heartbeat `clamp(command_timeout_us / 5, 5000, 20000)` µs: 20000 µs = 50 Hz with the configured 100000 µs timeout. Only after observed state and while a subsystem request is active; not unconditionally 1000 Hz. |
 | hardware_node → RIO: Config chunks (22) | UDP 5803 → 5802 | Whole config push on observed boot/config mismatch or while unacknowledged; retry when a State arrives and ≥50000 µs since last push, immediately for a changed boot ID. Not periodic after successful matching acknowledgment. |
 | RIO → hardware_node: ConfigAck (23) | UDP 5802 → 5803 | On completed assembly/reconfiguration or rejected chunk/config; no per-chunk ACK for incomplete assemblies. |
-| RIO → hardware_node: DriverStation (24) | UDP 5802 → 5803 | ≤50 Hz on real RIO. Standalone `sim_gateway` currently emits DS each gateway tick (200 Hz), unlike the real RIO's 50 Hz sampling gate. |
+| RIO → hardware_node: DriverStation (24) | UDP 5802 → 5803 | ≤50 Hz on real RIO and standalone `sim_gateway`: snapshots are gated to ≥20000 µs apart, independently of the hardware tick. |
 | hardware_node → device-owning nodes / DS consumers / telemetry | Shared-memory `/hw/state`, `/hw/state/driver_station`, `/hw/status`; no port | State/DS on received frames; bridge status first tick then every 20000 µs (50 Hz, `node.h`'s `kStatusPeriodUs`). Consumers run at their own periods. |
 | drivetrain / shooter / intake → hardware_node | Shared-memory `/hw/request/<node>` | Devices-layer flush each update: drivetrain and shooter 5000 µs (200 Hz); intake 20000 µs (50 Hz). Bridge neutralizes an owner silent for >2× its period. |
 | driver / teleop / autonomous → actuator nodes | Shared-memory target lanes | 20000 µs (50 Hz); mode/freshness policy selects one lane. `driver` produces chassis control; `teleop` provides configured mechanism control; autonomous supplies auto lanes. |
-| Camera → camera node | USB capture, AVFoundation on macOS / V4L2 on Linux; no port | Capture/processing workers run at camera availability; configured node publication period 50000 µs (20 Hz), not a guarantee of 20 fresh images/s. |
-| Camera nodes → pose_estimator / telemetry | Shared-memory `/<camera>/state`, `/<camera>/status` | Four configured camera nodes, 20 Hz publication each. |
+| Camera → camera node | USB capture, AVFoundation on macOS / V4L2 on Linux; no port | Requested capture rate 60 fps; capture/processing workers run at camera availability. Node period 10000 µs (100 Hz) does not guarantee 60 fresh images/s. |
+| Camera nodes → pose_estimator / telemetry | Shared-memory `/<camera>/state`, `/<camera>/status` | Four configured camera nodes: status each 100 Hz node tick; live observations once per processed frame, up to 60 fps, not republished at the node rate. |
 | drivetrain → pose_estimator | Shared-memory `/drivetrain/state` | 200 Hz publication; estimator updates every 20000 µs (50 Hz), fusing latest odometry and new valid camera observations. |
+| `sim_gateway --physics` → simulated cameras / telemetry | Shared-memory `/sim/state` | Every physics/hardware tick (200 Hz); main-processor node-clock timestamp, true field pose and field-frame velocity. No writer under ideal or WPILib/RoboRIO simulation. |
 | Nodes → telemetry → studio_bridge | Shared-memory states/statuses → `/talos/telemetry` byte topic | Telemetry period 10000 µs = 100 Hz; dictionary first frame and every 100th frame (1 Hz at this rate). |
 | studio_bridge ↔ browser/agent | HTTP + WebSocket, configured port 5800 | Forwards telemetry frames as available; initial graph/dictionary on connection. HTTP requests and graph refresh are not the 100 Hz value stream. |
+
+Camera observation timestamps describe exposure, not publication. Measure each
+camera's timestamp delay during bring-up and set its `[camera] latency_offset_us`
+(default 0): live and sim both subtract this offset from the capture stamp.
+`last_latency_us` measures node time minus that corrected stamp. Sim-only
+`camera.sim_timestamp_lag_us` (default 0, ignored live) adds known stamp bias and
+delays delivery until the biased stamp's instant; equal offset restores the
+original truth stamp without removing delivery delay. Both values must be
+finite, nonnegative and below one second. Underflow/future stamps publish invalid.
 
 Timing sources: `2026-robot/main_processor/configuration/robot.toml:1-16`, its
 `subsystems/*.toml`, `talOS/bridge/node.cc` (`Tick`, `PushConfig`,
 `ShouldSendCommand`), `talOS/hardware/endpoint.h:25-98`,
 `2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp:221-258`, and
-`2026-robot/main_processor/simulation/sim_gateway.cc:204-210`.
+`2026-robot/main_processor/simulation/sim_gateway.cc`.
 
 ## UDP frame and payload sizes
 
@@ -174,18 +186,23 @@ length. Queue bookkeeping/ring headers are additional to the per-slot bytes.
 | `/hw/request/<node>`: device owner → bridge | 1436 | Packet; only that owner's actuator requests, not a full-capacity command |
 | `/hw/status`: bridge → telemetry/observers | 160 | fixed `bridge.BridgeStatus`, alignment 8 |
 | `/<sub>/target/<source>`: producer → target resolver | `16 + sizeof(message)` | TargetEnvelope mode-generation/active header 16 + FlatBuffers struct; chassis 40, shooter 24, intake 20 |
+| `/autonomous/state`: autonomous → telemetry | 1 | AutonomousState: phase enum (ubyte) |
 | `/drivetrain/state`: drivetrain → estimator/driver/telemetry | 112 | DrivetrainState: padded time/flags header 16 + chassis/yaw 32 + four module positions 64 |
 | `/intake/state`: intake → telemetry | 20 | IntakeState, including FlatBuffers padding |
 | `/shooter/state`: shooter → telemetry | 32 | ShooterState, including FlatBuffers padding |
 | `/<camera>/state`: each camera → estimator/telemetry | 64 | geometry.PoseObservation, including padding |
 | `/<camera>/status`: each camera → telemetry | 56 | vision.VisionStatus, including padding |
 | `/pose_estimator/state`: estimator → telemetry | 72 | geometry.PoseEstimate, including padding |
+| `/sim/state`: physics sim_gateway → four simulated cameras / telemetry | 56 | geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
 | `/talos/telemetry`: telemetry → studio_bridge | 16384 × 64 slots | byte ring = 1048576 B of slot storage; actual frames have padding stripped before WebSocket forwarding |
 
 Sources: `talOS/hardware/packet.h`, `talOS/bridge/bridge_status.fbs`,
 `talOS/devices/target.h`, `talOS/msgs/geometry.fbs`, robot `*_message.fbs`,
 `vision/vision.fbs`, and `talOS/telemetry/wire.h`. Struct sizes include alignment
 padding: they must not be inferred by simply adding scalar field widths.
+The `/sim/state` slot is pinned by `static_assert(sizeof(geometry::OdometrySample)
+== 56)` in `simulation/sim_gateway.cc`. This truth topic is local to the main
+processor and never crosses the hardware UDP link.
 
 ## Telemetry, Studio, and the radio boundary
 
@@ -198,11 +215,17 @@ dictionaries allow late join/recovery in about a second at 100 Hz.
 
 The 2026 four-camera configuration excludes the cumulative captured, processed
 and range-rejected camera counters at channel level, retaining camera health,
-timing, dropped-frame and visible-tag diagnostics. Measured with the producer's
-`MeasureValueFrameBytes` over its real declared graph, this reduces the value
-frame from **139 channels / 1200 B** to **127 channels / 1104 B** (96 B headroom).
-Topic-level includes remain unchanged; excludes match topics or individual
-dictionary channels, and only retained channels count toward the budget.
+timing, dropped-frame and visible-tag diagnostics. The producer's
+`MeasureValueFrameBytes` over the original real declared graph measured
+**141 channels / 1216 B** before exclusions and **129 channels / 1120 B** after.
+In a physics-gateway session `/sim/state` adds **7 channels**: `sample_time_ns`,
+pose x/y/yaw and velocity vx/vy/omega. At 8 B/channel that is **136 channels /
+1176 B**, leaving **24 B headroom** under the 1200 B cap; no additional excludes
+are needed. Non-physics sessions remain at 129 channels / 1120 B. The full-stack
+startup test runs the declared physics graph, so telemetry's construction-time
+`CheckFrameBudget` enforces the cap on that graph. Topic-level includes remain
+unchanged; excludes match topics or individual dictionary channels, and only
+retained channels count toward the budget.
 
 Studio's bridge forwards the occupied frame, not 16384 bytes of padding. At the
 value cap, `1200×8×100` = **0.96 Mbit/s per connected client**, before TCP/IP,

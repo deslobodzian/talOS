@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -21,17 +23,17 @@
 #include <utility>
 #include <vector>
 
-#include "drivetrain/drive_message_generated.h"
-#include "drivetrain/topics.h"
 #include "geometry/geometry_generated.h"
+#include "sim/topics.h"
 #include "talOS/node/node.h"
 #include "talOS/vision/capture/avfoundation_source.h"
 #include "talOS/vision/field_sim/field_layout_loader.h"
 #include "talOS/vision/field_sim/tag_patterns.h"
 #include "talOS/vision/field_sim/tag_rasterizer.h"
 #include "talOS/vision/pipeline.h"
+#include "talOS/vision/recording/recorder.h"
+#include "talOS/vision/recording/recording.h"
 #include "vision/data/field_layout_2026.h"
-#include "vision/sim_truth.h"
 #include "vision/vision_generated.h"
 
 namespace vision {
@@ -45,20 +47,14 @@ class Vision {
         simulated_(node.simulation()),
         rasterize_(node.param("rasterize", true)),
         tag_size_(node.param("tag_size_m", 0.1651)),
-        base_xy_(node.param("base_xy_std_m", 0.08)),
-        base_yaw_(node.param("base_yaw_std_rad", 0.06)),
         camera_id_(node.param<int>("camera.id")),
         device_(node.param<std::string>("camera.device", "")),
-        truth_(node.param("initial_x_m", 2.0), node.param("initial_y_m", 2.0),
-               node.param("initial_yaw_rad", 0.0)),
-        drivetrain_(node.subscribe<drivetrain::DrivetrainState>(
-            drivetrain::topics::kState,
-            [this](const drivetrain::DrivetrainState& state) {
-              if (simulated_) truth_.Observe(state);
-            },
-            {.optional = true})),
         state_(node.publish<geometry::PoseObservation>("state")),
         status_(node.publish<VisionStatus>("status")) {
+    if (simulated_) {
+      truth_.emplace(node.subscribe<geometry::OdometrySample>(
+          sim::topics::kState, {.optional = true}));
+    }
     if (!simulated_ && device_.empty()) {
       std::fprintf(stderr,
                    "%.*s: camera.device must be set to a stable device id "
@@ -72,14 +68,103 @@ class Vision {
       throw std::runtime_error("vision layout: " + error);
     }
     LoadCamera();
+    if (simulated_ && sim_timestamp_lag_ns_ > 0) {
+      // Reserve the capture-rate lag window plus boundary/scheduling margin.
+      // The node/status tick may be much slower or faster than camera frames.
+      constexpr std::size_t kMargin = 2;
+      const auto frames =
+          std::ceil(static_cast<long double>(sim_timestamp_lag_ns_) *
+                    capture_config_.fps / 1.0e9L);
+      if (frames > sim_pending_.max_size() - kMargin) {
+        throw std::invalid_argument(
+            std::string(node_.name()) +
+            ": camera.fps requires too many delayed frames");
+      }
+      sim_pending_.resize(static_cast<std::size_t>(frames) + kMargin);
+    }
+    solver_options_.pixel_std_px =
+        node.param("pixel_std_px", solver_options_.pixel_std_px);
+    solver_options_.floor_z_std_m =
+        node.param("floor_z_std_m", solver_options_.floor_z_std_m);
+    solver_options_.floor_tilt_std_rad =
+        node.param("floor_tilt_std_rad", solver_options_.floor_tilt_std_rad);
+    solver_options_.huber_delta_px =
+        node.param("huber_delta_px", solver_options_.huber_delta_px);
+    solver_options_.min_xy_std_m =
+        node.param("min_xy_std_m", solver_options_.min_xy_std_m);
+    solver_options_.min_yaw_std_rad =
+        node.param("min_yaw_std_rad", solver_options_.min_yaw_std_rad);
     rng_.seed(camera_.rng_seed);
     talos::vision::PipelineConfig config;
     config.backend_name = node.param<std::string>("backend", "auto");
+    config.detector_options.quad_decimate =
+        node.param<float>("detector.decimate", 1.0f);
+    config.detector_options.threads = node.param<int>("detector.threads", 1);
+    config.detector_options.quad_sigma =
+        node.param<float>("detector.sigma", 0.0f);
+    config.detector_options.refine_edges =
+        node.param<bool>("detector.refine_edges", true);
+    config.detector_options.max_hamming =
+        node.param<int>("detector.hamming_threshold", 1);
+    config.min_decision_margin =
+        node.param<double>("detector.min_decision_margin", 30.0);
     config.intrinsics = camera_.intrinsics;
     config.mounting = camera_.mounting;
     config.layout = layout_.layout;
-    if (!simulated_ || rasterize_) {
+    config.validation_options = validation_options_;
+    try {
       pipeline_ = std::make_unique<talos::vision::AprilTagPipeline>(config);
+    } catch (const std::invalid_argument& error) {
+      throw std::invalid_argument(std::string(node.name()) + ": " +
+                                  error.what());
+    }
+    recording_enabled_ = node.param("recording.enabled", true);
+    recording_sample_hz_ = node.param("recording.sample_hz", 1.0);
+    recording_rejected_hz_ = node.param("recording.rejected_hz", 1.0);
+    const auto recording_max_bytes =
+        node.param<std::int64_t>("recording.max_bytes", 268435456);
+    if (!std::isfinite(recording_sample_hz_) || recording_sample_hz_ < 0 ||
+        !std::isfinite(recording_rejected_hz_) || recording_rejected_hz_ < 0) {
+      throw std::invalid_argument(std::string(node.name()) +
+                                  ": recording.sample_hz and "
+                                  "recording.rejected_hz must be finite and "
+                                  "nonnegative");
+    }
+    if (recording_max_bytes < 0) {
+      throw std::invalid_argument(std::string(node.name()) +
+                                  ": recording.max_bytes must be nonnegative");
+    }
+    recording_max_bytes_ = static_cast<std::uint64_t>(recording_max_bytes);
+    if (recording_enabled_) {
+      const auto session = node.session_dir();
+      if (session.has_value()) {
+        talos::vision::recording::FrameRecorder::Options recorder_options;
+        recorder_options.output_dir =
+            *session / "frames" / std::string{node.name()};
+        recorder_options.sample_hz = recording_sample_hz_;
+        recorder_options.rejected_hz = recording_rejected_hz_;
+        recorder_options.max_bytes = recording_max_bytes_;
+        recorder_options.context.camera = std::string{node.name()};
+        recorder_options.context.width = camera_.intrinsics.image_width;
+        recorder_options.context.height = camera_.intrinsics.image_height;
+        recorder_options.context.intrinsics = camera_.intrinsics;
+        recorder_options.context.mounting = extrinsics_;
+        recorder_options.context.detector = {
+            config.backend_name,
+            static_cast<double>(config.detector_options.quad_decimate),
+            config.detector_options.threads,
+            static_cast<double>(config.detector_options.quad_sigma),
+            config.detector_options.refine_edges,
+            config.detector_options.max_hamming,
+            config.min_decision_margin};
+        try {
+          recorder_ = std::make_unique<talos::vision::recording::FrameRecorder>(
+              std::move(recorder_options));
+        } catch (const std::exception& error) {
+          std::fprintf(stderr, "%s: recording disabled: %s\n",
+                       std::string{node.name()}.c_str(), error.what());
+        }
+      }
     }
     if (simulated_ && rasterize_) {
       if (!talos::vision::field_sim::LoadTag36h11Patterns(&patterns_, &error)) {
@@ -109,13 +194,31 @@ class Vision {
     return !simulated && !device.empty();
   }
 
+  // Shared by live capture and simulated truth stamps. Check before unsigned
+  // arithmetic: a negative corrected time must not wrap into a future sample.
+  static std::optional<std::uint64_t> CorrectCaptureTimestamp(
+      std::uint64_t capture_ns, std::uint64_t offset_ns,
+      std::uint64_t lag_ns = 0) {
+    if (capture_ns > std::numeric_limits<std::uint64_t>::max() - lag_ns)
+      return std::nullopt;
+    const auto stamped_ns = capture_ns + lag_ns;
+    if (stamped_ns < offset_ns) return std::nullopt;
+    return stamped_ns - offset_ns;
+  }
+
+  const talos::vision::CameraSourceConfig& capture_config() const {
+    return capture_config_;
+  }
+
   bool AcceptEstimate(const talos::vision::RobotPoseEstimate& estimate) const {
     const auto& t = estimate.T_field_robot.translation();
     return estimate.validity.valid && t.allFinite() &&
            estimate.T_field_robot.rotation().rotationMatrix().allFinite() &&
            std::isfinite(estimate.reprojection_error_px) &&
-           estimate.reprojection_error_px <= 3.5 && t.x() >= 0 && t.y() >= 0 &&
-           t.x() <= layout_.dims.length_m && t.y() <= layout_.dims.width_m;
+           estimate.reprojection_error_px <=
+               validation_options_.max_reprojection_error_px &&
+           t.x() >= 0 && t.y() >= 0 && t.x() <= layout_.dims.length_m &&
+           t.y() <= layout_.dims.width_m;
   }
 
   // Compact in place without releasing reserved storage. Invalid detections
@@ -142,11 +245,46 @@ class Vision {
 
   void update() {
     const auto now = node_.now();
+    const auto now_ns = static_cast<std::uint64_t>(now.nanos());
     std::optional<Completed> completed;
     if (simulated_) {
-      completed = Simulate(now);
-      ++captured_;
-      RecordProcessed(completed->capture_ns);
+      if (truth_->fresh()) {
+        truth_outage_ = false;
+        // Deliver ready frames before rendering or admitting a new capture.
+        DrainSimPending(now_ns);
+        const auto& truth = truth_->value();
+        const auto stamp = truth.sample_time_ns();
+        if (SimCaptureDue(stamp)) {
+          auto capture = Simulate(truth);
+          ++captured_;
+          RecordProcessed(capture.capture_ns);
+          if (sim_pending_.empty()) {
+            completed = capture;
+          } else {
+            if (sim_pending_count_ == sim_pending_.size()) {
+              sim_pending_head_ = (sim_pending_head_ + 1) % sim_pending_.size();
+              --sim_pending_count_;
+              ++dropped_;
+            }
+            sim_pending_[(sim_pending_head_ + sim_pending_count_) %
+                         sim_pending_.size()] = capture;
+            ++sim_pending_count_;
+          }
+        }
+        DrainSimPending(now_ns);
+      } else {
+        sim_pending_count_ = 0;
+        completed = Completed{
+            truth_->has_value() ? truth_->value().sample_time_ns() : 0};
+        if (!truth_outage_) {
+          std::fprintf(
+              stderr,
+              "%.*s: no fresh /sim/state; simulated cameras need "
+              "sim_gateway --physics (WPILib sim publishes no truth)\n",
+              static_cast<int>(node_.name().size()), node_.name().data());
+          truth_outage_ = true;
+        }
+      }
     } else if (!CanCapture(simulated_, device_)) {
       completed = Completed{static_cast<std::uint64_t>(now.nanos())};
     } else {
@@ -163,16 +301,7 @@ class Vision {
         frame_period_us_ = worker_period_us_;
       }
     }
-    if (completed) {
-      last_latency_us_ =
-          static_cast<std::uint64_t>(std::max<std::int64_t>(
-              0,
-              now.nanos() - static_cast<std::int64_t>(completed->capture_ns))) /
-          1000;
-      visible_ = completed->visible;
-      healthy_ = completed->success;
-      PublishObservation(*completed);
-    }
+    if (completed) PublishObservation(*completed, now_ns);
     const bool healthy =
         healthy_ && (simulated_ || connected_.load(std::memory_order_acquire));
     status_.send(VisionStatus{captured_, processed_, dropped_, frame_period_us_,
@@ -193,13 +322,53 @@ class Vision {
   };
   static_assert(std::is_trivially_copyable_v<Completed>);
 
+  // What the recorder needs per frame beyond the detections already produced:
+  // the gray frame (nullptr when there is none, e.g. the non-raster sim path)
+  // and, under --sim, the /sim/state pose the frame was rendered from.
+  struct RecordingFeed {
+    const talos::vision::Frame* gray;
+    std::optional<talos::vision::recording::TruthRecord> truth;
+    RecordingFeed(
+        const talos::vision::Frame* g = nullptr,
+        std::optional<talos::vision::recording::TruthRecord> t = std::nullopt)
+        : gray{g}, truth{std::move(t)} {}
+  };
+
+  bool SimCaptureDue(std::uint64_t stamp) {
+    if (!first_sim_capture_ns_) {
+      first_sim_capture_ns_ = stamp;
+      last_sim_capture_ns_ = stamp;
+      return true;
+    }
+    if (stamp <= last_sim_capture_ns_) return false;
+    // Keep frame deadlines anchored to the first truth sample, rather than
+    // restarting a full frame period after each quantized node tick. Compute
+    // the phase directly to avoid accumulating fractional-period rounding.
+    const auto frame =
+        std::floor(static_cast<long double>(stamp - *first_sim_capture_ns_) *
+                   capture_config_.fps / 1.0e9L);
+    if (frame < next_sim_capture_frame_) return false;
+    const auto skipped = frame - next_sim_capture_frame_;
+    // A slow tick captures only its latest truth, never synthesized frames.
+    // Saturate only when the count cannot be represented by the wire counter.
+    dropped_ += static_cast<std::uint64_t>(std::min(
+        skipped, static_cast<long double>(
+                     std::numeric_limits<std::uint64_t>::max() - dropped_)));
+    next_sim_capture_frame_ = frame + 1;
+    last_sim_capture_ns_ = stamp;
+    return true;
+  }
+
   void LoadCamera() {
     auto number = [&](const char* key, double fallback) {
       return node_.param(std::string("camera.") + key, fallback);
     };
+    extrinsics_ = {number("x_m", 0),       number("y_m", 0),
+                   number("z_m", 0),       number("roll_rad", 0),
+                   number("pitch_rad", 0), number("yaw_rad", 0)};
     camera_.mounting = talos::vision::CameraMounting::FromExtrinsics(
-        number("x_m", 0), number("y_m", 0), number("z_m", 0),
-        number("roll_rad", 0), number("pitch_rad", 0), number("yaw_rad", 0));
+        extrinsics_.x_m, extrinsics_.y_m, extrinsics_.z_m, extrinsics_.roll_rad,
+        extrinsics_.pitch_rad, extrinsics_.yaw_rad);
     auto& intr = camera_.intrinsics;
     intr.fx = number("fx", 0);
     intr.fy = number("fy", 0);
@@ -221,14 +390,40 @@ class Vision {
     camera_.sensor_noise_std_gray = number("sensor_noise_std_gray", 0);
     camera_.exposure_gain_std = number("exposure_gain_std", 0);
     camera_.exposure_ms = number("exposure_ms", 0);
+    solver_options_.mount_angle_std_rad =
+        number("mount_angle_std_rad", solver_options_.mount_angle_std_rad);
+    solver_options_.mount_translation_std_m = number(
+        "mount_translation_std_m", solver_options_.mount_translation_std_m);
     const auto seed = node_.param<std::int64_t>("camera.rng_seed", 0);
     camera_.rng_seed = seed;
-    if (camera_id_ < 0 || camera_id_ > 31 || width < 160 || width > 4096 ||
-        height < 120 || height > 2160 || !intr.IsValid() ||
-        !std::isfinite(camera_.max_range_m) || !(camera_.max_range_m > 0) ||
-        !std::isfinite(camera_.min_tag_px) || !(camera_.min_tag_px >= 0) ||
-        !(camera_.facing_min >= 0) || !(camera_.facing_min <= 1) ||
-        !std::isfinite(camera_.pixel_noise_std) ||
+    auto require = [&](bool valid, const char* key) {
+      if (!valid) {
+        throw std::runtime_error(std::string(node_.name()) + ": invalid " +
+                                 key);
+      }
+    };
+    auto duration_ns = [&](const char* key) {
+      const auto value = number(key, 0);
+      const auto qualified_key = std::string("camera.") + key;
+      require(std::isfinite(value) && value >= 0 && value < 1.0e6,
+              qualified_key.c_str());
+      return static_cast<std::uint64_t>(value * 1000);
+    };
+    latency_offset_ns_ = duration_ns("latency_offset_us");
+    sim_timestamp_lag_ns_ = duration_ns("sim_timestamp_lag_us");
+    require(camera_id_ >= 0 && camera_id_ <= 31, "camera.id");
+    require(width >= 160 && width <= 4096, "camera.width");
+    require(height >= 120 && height <= 2160, "camera.height");
+    require(std::isfinite(solver_options_.mount_angle_std_rad) &&
+                solver_options_.mount_angle_std_rad >= 0,
+            "camera.mount_angle_std_rad");
+    require(std::isfinite(solver_options_.mount_translation_std_m) &&
+                solver_options_.mount_translation_std_m >= 0,
+            "camera.mount_translation_std_m");
+    if (!intr.IsValid() || !std::isfinite(camera_.max_range_m) ||
+        !(camera_.max_range_m > 0) || !std::isfinite(camera_.min_tag_px) ||
+        !(camera_.min_tag_px >= 0) || !(camera_.facing_min >= 0) ||
+        !(camera_.facing_min <= 1) || !std::isfinite(camera_.pixel_noise_std) ||
         !(camera_.pixel_noise_std >= 0) ||
         !std::isfinite(camera_.sensor_noise_std_gray) ||
         !(camera_.sensor_noise_std_gray >= 0) ||
@@ -239,45 +434,149 @@ class Vision {
       throw std::runtime_error("invalid vision camera: " +
                                std::string(node_.name()));
     }
+    capture_config_.camera_id = camera_id_;
+    capture_config_.device_path = device_;
+    capture_config_.width = width;
+    capture_config_.height = height;
+    capture_config_.fps = node_.param<double>("camera.fps", 60.0);
+    if (!std::isfinite(capture_config_.fps) || capture_config_.fps <= 0) {
+      throw std::invalid_argument(std::string(node_.name()) +
+                                  ": camera.fps must be finite and positive");
+    }
+    sim_camera_ = camera_;
+    if (simulated_) {
+      constexpr std::array<const char*, 6> keys = {
+          "sim_mount_error_x_m",       "sim_mount_error_y_m",
+          "sim_mount_error_z_m",       "sim_mount_error_roll_rad",
+          "sim_mount_error_pitch_rad", "sim_mount_error_yaw_rad"};
+      std::array<double, 6> error{};
+      for (size_t i = 0; i < error.size(); ++i) {
+        error[i] = number(keys[i], 0);
+        require(std::isfinite(error[i]), keys[i]);
+      }
+      const auto delta = talos::vision::CameraMounting::FromExtrinsics(
+          error[0], error[1], error[2], error[3], error[4], error[5]);
+      const talos::geometry::SE3<double> optical_to_mount(
+          talos::vision::CameraMounting::OpticalToRobotRotation().inverse(),
+          Eigen::Vector3d::Zero());
+      // Compose in the mount's NWU frame, before the optical-axis mapping.
+      sim_camera_.mounting.T_robot_camera = camera_.mounting.T_robot_camera *
+                                            optical_to_mount *
+                                            delta.T_robot_camera;
+    }
   }
 
   Completed Localize(std::vector<talos::vision::TagDetection3D>& detections,
-                     std::uint64_t capture_ns, bool success) {
+                     std::uint64_t capture_ns, bool success,
+                     const RecordingFeed& feed = {}) {
     Completed result{capture_ns};
     result.success = success;
+    const bool record = recorder_ && feed.gray != nullptr;
+    if (record) {
+      talos::vision::AnnotateDetectionReasons(
+          detections, layout_.layout, camera_.max_range_m, validation_options_);
+      SnapshotDetections(detections);
+    }
     result.rejected_range = FilterDetections(detections, camera_.max_range_m);
     result.visible = static_cast<std::uint32_t>(detections.size());
     const auto estimate = talos::vision::SolveMultiTagRobotPose(
         detections, camera_id_, camera_.mounting, layout_.layout,
-        camera_.intrinsics);
+        camera_.intrinsics, validation_options_, solver_options_);
     result.observation = MakeObservation(estimate, capture_ns, success);
+    if (record) {
+      // The ambiguity gate applies only to single-tag observations; mark that
+      // lone detection so the sidecar attributes the rejection truthfully
+      // instead of blaming every in-range tag.
+      if (talos::vision::IsSingleTagAmbiguityRejection(estimate)) {
+        for (auto& dr : recording_detections_) {
+          if (dr.tag_id == estimate.tag_id) {
+            dr.valid = false;
+            dr.reject_reason =
+                std::string{talos::vision::recording::kReasonAmbiguity};
+          }
+        }
+      }
+      RecordFeed(*feed.gray, capture_ns, result.observation, feed.truth);
+    }
     return result;
   }
 
-  Completed Process(const talos::vision::Frame& frame) {
-    auto result = pipeline_->ProcessFrame(frame);
-    return Localize(result.detections, frame.capture_timestamp_ns(),
-                    result.success);
+  void SnapshotDetections(
+      const std::vector<talos::vision::TagDetection3D>& detections) {
+    recording_detections_.clear();
+    recording_detections_.reserve(detections.size());
+    for (const auto& d : detections) {
+      talos::vision::recording::DetectionRecord dr;
+      dr.tag_id = d.tag_id;
+      dr.hamming = d.hamming;
+      dr.decision_margin = d.decision_margin;
+      dr.corners_px = d.corners;
+      dr.valid = d.valid && d.reject_reason.empty();
+      dr.reprojection_error_px = d.reprojection_error;
+      dr.ambiguity = d.ambiguity;
+      dr.reject_reason = d.reject_reason.empty()
+                             ? std::nullopt
+                             : std::optional<std::string>{d.reject_reason};
+      recording_detections_.push_back(std::move(dr));
+    }
   }
 
-  Completed Simulate(talos::Time now) {
+  void RecordFeed(
+      const talos::vision::Frame& gray, std::uint64_t capture_ns,
+      const geometry::PoseObservation& observation,
+      const std::optional<talos::vision::recording::TruthRecord>& truth) {
+    recording_frame_.capture_ns = capture_ns;
+    recording_frame_.detections.assign(recording_detections_.begin(),
+                                       recording_detections_.end());
+    recording_frame_.observation.valid = observation.valid();
+    recording_frame_.observation.x_m = observation.pose().x_m();
+    recording_frame_.observation.y_m = observation.pose().y_m();
+    recording_frame_.observation.yaw_rad = observation.pose().yaw_rad();
+    recording_frame_.observation.x_std_m = observation.x_std_m();
+    recording_frame_.observation.y_std_m = observation.y_std_m();
+    recording_frame_.observation.yaw_std_rad = observation.yaw_std_rad();
+    recording_frame_.observation.tag_count = observation.tag_count();
+    recording_frame_.truth = truth;
+    recording_frame_.reason =
+        std::string{talos::vision::recording::FrameReason(recording_frame_)};
+    recorder_->Record(gray, recording_frame_);
+  }
+
+  Completed Process(const talos::vision::Frame& frame,
+                    const std::optional<talos::vision::recording::TruthRecord>&
+                        truth = std::nullopt) {
+    auto result = pipeline_->ProcessFrame(frame);
+    return Localize(result.detections, frame.capture_timestamp_ns(),
+                    result.success, RecordingFeed{&frame, truth});
+  }
+
+  Completed Simulate(const geometry::OdometrySample& truth) {
     namespace fs = talos::vision::field_sim;
+    const auto& pose = truth.pose();
+    const auto field_pose =
+        fs::RobotPoseOnField(pose.x_m(), pose.y_m(), pose.yaw_rad());
+    const auto capture_time = talos::Time::from_nanos(
+        static_cast<std::int64_t>(truth.sample_time_ns()));
     Completed result;
     if (rasterize_) {
-      fs::RenderFieldView(layout_.layout, patterns_, camera_, truth_.pose(),
-                          tag_size_, {}, pixels_.get(),
-                          truth_.velocity_field_mps(), truth_.yaw_rate_radps(),
-                          &rng_, &render_scratch_);
+      const auto& velocity = truth.velocity();
+      fs::RenderFieldView(
+          layout_.layout, patterns_, sim_camera_, field_pose, tag_size_, {},
+          pixels_.get(),
+          Eigen::Vector3d{velocity.vx_mps(), velocity.vy_mps(), 0},
+          velocity.omega_radps(), &rng_, &render_scratch_);
       const auto& intr = camera_.intrinsics;
       const talos::vision::Frame frame(
-          camera_id_, 1, captured_, now, intr.image_width, intr.image_height,
-          intr.image_width, talos::vision::PixelFormat::kGray8,
+          camera_id_, 1, captured_, capture_time, intr.image_width,
+          intr.image_height, intr.image_width,
+          talos::vision::PixelFormat::kGray8,
           std::shared_ptr<const std::vector<std::uint8_t>>(pixels_));
-      result = Process(frame);
+      result = Process(frame, talos::vision::recording::TruthRecord{
+                                  pose.x_m(), pose.y_m(), pose.yaw_rad()});
     } else {
       detections_.clear();
-      fs::SimulateVisibleTags(layout_.layout, camera_, truth_.pose(), tag_size_,
-                              &sim_tags_, false, &rng_);
+      fs::SimulateVisibleTags(layout_.layout, sim_camera_, field_pose,
+                              tag_size_, &sim_tags_, false, &rng_);
       for (const auto& tag : sim_tags_) {
         talos::vision::TagDetection3D detection;
         detection.valid = true;
@@ -290,7 +589,7 @@ class Vision {
         }
         detections_.push_back(detection);
       }
-      result = Localize(detections_, now.nanos(), true);
+      result = Localize(detections_, truth.sample_time_ns(), true);
     }
     rejected_range_ += result.rejected_range;
     return result;
@@ -313,35 +612,52 @@ class Vision {
     if (success && AcceptEstimate(estimate)) {
       const auto& t = estimate.T_field_robot.translation();
       const auto r = estimate.T_field_robot.rotation().rotationMatrix();
-      const auto stds = talos::vision::ComputeObservationStdDevs(
-          estimate.average_distance_m, estimate.tag_count, estimate.ambiguity,
-          base_xy_, base_yaw_);
       observation = geometry::PoseObservation{
           capture_ns,
           geometry::Pose2d{t.x(), t.y(), std::atan2(r(1, 0), r(0, 0))},
-          stds.x_std_m,
-          stds.y_std_m,
-          stds.yaw_std_rad,
+          estimate.std_devs.x_std_m,
+          estimate.std_devs.y_std_m,
+          estimate.std_devs.yaw_std_rad,
           static_cast<std::uint32_t>(estimate.tag_count),
           true};
     }
     return observation;
   }
 
-  void PublishObservation(const Completed& completed) {
-    state_.send(completed.observation);
+  void DrainSimPending(std::uint64_t now_ns) {
+    // A late timestamp delays physical delivery even when offset cancels its
+    // bias. Publish every due frame in order, including catch-up batches.
+    while (sim_pending_count_ > 0) {
+      const auto& capture = sim_pending_[sim_pending_head_];
+      const auto delivery_ns =
+          CorrectCaptureTimestamp(capture.capture_ns, 0, sim_timestamp_lag_ns_);
+      if (delivery_ns && *delivery_ns > now_ns) break;
+      PublishObservation(capture, now_ns);
+      sim_pending_head_ = (sim_pending_head_ + 1) % sim_pending_.size();
+      --sim_pending_count_;
+    }
+  }
+
+  void PublishObservation(const Completed& completed, std::uint64_t now_ns) {
+    const auto stamp =
+        CorrectCaptureTimestamp(completed.capture_ns, latency_offset_ns_,
+                                simulated_ ? sim_timestamp_lag_ns_ : 0);
+    const bool timestamp_valid = stamp && *stamp <= now_ns;
+    const auto& observation = completed.observation;
+    last_latency_us_ = timestamp_valid ? (now_ns - *stamp) / 1000 : 0;
+    visible_ = completed.visible;
+    healthy_ = completed.success;
+    state_.send(geometry::PoseObservation{
+        stamp.value_or(0), observation.pose(), observation.x_std_m(),
+        observation.y_std_m(), observation.yaw_std_rad(),
+        observation.tag_count(), observation.valid() && timestamp_valid});
   }
 
   // Only the worker owns camera lifecycle calls. Retry timing comes from the
   // node clock supplied by update(), never a wall-clock timer.
   bool OpenCamera() {
     if (!CanCapture(simulated_, device_)) return false;
-    talos::vision::CameraSourceConfig config;
-    config.camera_id = camera_id_;
-    config.device_path = device_;
-    config.width = camera_.intrinsics.image_width;
-    config.height = camera_.intrinsics.image_height;
-    source_ = talos::vision::CreatePlatformCameraSource(config);
+    source_ = talos::vision::CreatePlatformCameraSource(capture_config_);
     if (!source_) return false;
     source_->SetFrameCallback([this](const talos::vision::Frame& frame) {
       {
@@ -451,15 +767,25 @@ class Vision {
 
   talos::Node& node_;
   bool simulated_, rasterize_;
-  double tag_size_, base_xy_, base_yaw_;
+  double tag_size_;
   int camera_id_;
   std::string device_;
-  SimTruth truth_;
-  talos::Subscription<drivetrain::DrivetrainState> drivetrain_;
+  std::optional<talos::Subscription<geometry::OdometrySample>> truth_;
+  bool truth_outage_ = false;
+  std::optional<std::uint64_t> first_sim_capture_ns_;
+  std::uint64_t last_sim_capture_ns_ = 0;
+  long double next_sim_capture_frame_ = 1;
+  std::uint64_t latency_offset_ns_ = 0, sim_timestamp_lag_ns_ = 0;
+  std::vector<Completed> sim_pending_;
+  std::size_t sim_pending_head_ = 0, sim_pending_count_ = 0;
   talos::Publisher<geometry::PoseObservation> state_;
   talos::Publisher<VisionStatus> status_;
   talos::vision::field_sim::FieldLayoutData layout_;
   talos::vision::field_sim::SimCameraView camera_;
+  talos::vision::field_sim::SimCameraView sim_camera_;
+  talos::vision::CameraSourceConfig capture_config_;
+  talos::vision::PoseValidationOptions validation_options_;
+  talos::vision::PoseSolverOptions solver_options_;
   std::mt19937_64 rng_;
   std::map<int, talos::vision::field_sim::TagPattern> patterns_;
   std::shared_ptr<std::vector<std::uint8_t>> pixels_;
@@ -467,6 +793,13 @@ class Vision {
   std::vector<talos::vision::field_sim::SimTagDetection> sim_tags_;
   std::vector<talos::vision::TagDetection3D> detections_;
   std::unique_ptr<talos::vision::AprilTagPipeline> pipeline_;
+  std::unique_ptr<talos::vision::recording::FrameRecorder> recorder_;
+  talos::vision::recording::Extrinsics extrinsics_;
+  std::vector<talos::vision::recording::DetectionRecord> recording_detections_;
+  talos::vision::recording::FrameRecord recording_frame_;
+  bool recording_enabled_ = true;
+  double recording_sample_hz_ = 1.0, recording_rejected_hz_ = 1.0;
+  std::uint64_t recording_max_bytes_ = 268435456;
   std::unique_ptr<talos::vision::CameraSource> source_;
   std::thread worker_;
   std::mutex mutex_;

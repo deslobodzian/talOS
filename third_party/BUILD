@@ -3,6 +3,8 @@
 # first-party code here.
 package(default_visibility = ["//visibility:public"])
 
+exports_files(["apriltag_pose_ambiguity.patch"])
+
 alias(
     name = "apriltag",
     actual = "@apriltag//:apriltag",

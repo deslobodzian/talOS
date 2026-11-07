@@ -140,7 +140,8 @@ inline bool EstimateTagPoseFromHomography(
   double err1 = 0.0;
   double err2 = 0.0;
 
-  estimate_tag_pose_orthogonal_iteration(&info, &err1, &p1, &err2, &p2, 50);
+  const int new_minima =
+      estimate_tag_pose_orthogonal_iteration(&info, &err1, &p1, &err2, &p2, 50);
   matd_destroy(temp_det.H);
 
   if (!p1.R || !p1.t) {
@@ -201,7 +202,8 @@ inline bool EstimateTagPoseFromHomography(
     err2 = std::numeric_limits<double>::infinity();
   }
   const double ambiguity =
-      detail::OrderPoseCandidates(pose1, pose2, err1, err2);
+      has_secondary ? detail::OrderPoseCandidates(pose1, pose2, err1, err2)
+                    : (new_minima > 1 ? 1.0 : 0.0);
   if (primary_err_out) *primary_err_out = err1;
   if (secondary_err_out) *secondary_err_out = err2;
   if (primary_pose) *primary_pose = pose1;
@@ -222,10 +224,26 @@ inline bool EstimateTagPoseFromHomography(
 // Criteria for validating pose estimates before robot localization.
 struct PoseValidationOptions {
   double max_reprojection_error_px{3.5};
-  double max_ambiguity{0.45};
+  double max_ambiguity{0.2};
   double min_distance_m{0.1};
   double max_distance_m{15.0};
   double min_z_m{0.05};
+};
+
+// Measurement noise, extrinsic calibration uncertainty and robust loss, in
+// pixels, metres and radians. mount_* model the camera extrinsic calibration
+// uncertainty (not sim-only): a mount whose true angle is off by ~1 deg puts a
+// `range * mount_angle_std_rad` lateral bias in x/y that the corner noise does
+// not admit, so it is added to the published covariance before the floors.
+struct PoseSolverOptions {
+  double pixel_std_px{0.33};
+  double floor_z_std_m{0.05};
+  double floor_tilt_std_rad{0.05};
+  double huber_delta_px{2.0};
+  double min_xy_std_m{0.02};
+  double min_yaw_std_rad{0.035};
+  double mount_angle_std_rad{0.0175};
+  double mount_translation_std_m{0.01};
 };
 
 // Reasons for pose invalidity.
@@ -239,6 +257,7 @@ enum class PoseInvalidReason {
   kTooClose,
   kInvalidRotation,
   kDegenerateHomography,
+  kInvalidCovariance,
 };
 
 constexpr std::string_view PoseInvalidReasonToString(PoseInvalidReason reason) {
@@ -261,6 +280,8 @@ constexpr std::string_view PoseInvalidReasonToString(PoseInvalidReason reason) {
       return "Rotation matrix is non-orthogonal or reflection";
     case PoseInvalidReason::kDegenerateHomography:
       return "Homography decomposition failed";
+    case PoseInvalidReason::kInvalidCovariance:
+      return "Joint pose covariance is not finite positive definite";
   }
   return "Unknown";
 }
@@ -274,14 +295,6 @@ struct PoseValidity {
 struct ObservationStdDevs {
   double x_std_m{0.1}, y_std_m{0.1}, yaw_std_rad{0.1};
 };
-inline ObservationStdDevs ComputeObservationStdDevs(
-    double distance, int count, double ambiguity, double base_xy_std_m = 0.08,
-    double base_yaw_std_rad = 0.06) {
-  const double s = std::pow(std::max(distance, 0.5), 2) /
-                   std::sqrt(std::max(count, 1)) *
-                   (1 + 2 * std::max(0.0, ambiguity));
-  return {base_xy_std_m * s, base_xy_std_m * s, base_yaw_std_rad * s};
-}
 struct DetectionResult {
   int tag_id{-1}, hamming{0};
   float center_x{0}, center_y{0}, decision_margin{0};
@@ -292,8 +305,44 @@ struct DetectionResult {
   double reprojection_error{0}, secondary_reprojection_error_px{-1};
   double ambiguity{0};
   bool valid{false};
+  // Why this detection is excluded, in the offline-recording vocabulary
+  // (empty = usable). The pipeline sets "hamming", "decision_margin" or
+  // "reprojection"; AnnotateDetectionReasons below adds "range" and
+  // "not_in_layout"; AnnotateAmbiguityRejection adds "ambiguity" only when a
+  // single-tag observation is actually rejected for it. Never published.
+  std::string reject_reason;
 };
 using TagDetection3D = DetectionResult;
+
+// Annotates each detection's reject_reason for offline recording, mirroring
+// the camera node's range filter and layout membership. Only adds a reason; a
+// detection already marked by the pipeline keeps it. "range" covers a
+// non-finite range, a range above `max_range_m`, behind the camera, too
+// close, or too far; "not_in_layout" a tag absent from the layout. The
+// single-tag ambiguity gate is applied separately by
+// AnnotateAmbiguityRejection below, never per detection.
+inline void AnnotateDetectionReasons(std::vector<TagDetection3D>& detections,
+                                     const FieldLayout& layout,
+                                     double max_range_m,
+                                     const PoseValidationOptions& validation) {
+  for (auto& d : detections) {
+    if (!d.reject_reason.empty()) continue;
+    if (!layout.HasTag(d.tag_id)) {
+      d.reject_reason = "not_in_layout";
+      continue;
+    }
+    const auto& p = d.T_camera_tag;
+    const double range = p.translation().norm();
+    const double z = p.translation().z();
+    if (!std::isfinite(range) || range > max_range_m ||
+        z <= validation.min_z_m || range < validation.min_distance_m ||
+        range > validation.max_distance_m) {
+      d.reject_reason = "range";
+      continue;
+    }
+  }
+}
+
 struct RobotPoseEstimate {
   talos::geometry::SE3<double> T_field_robot{}, T_camera_tag{};
   int tag_id{-1}, tag_count{0};
@@ -302,14 +351,35 @@ struct RobotPoseEstimate {
   ObservationStdDevs std_devs{};
   PoseValidity validity;
 };
+// True when `estimate` is the single-tag observation the ambiguity gate
+// rejected. Multi-tag joint solves never carry this reason: the joint geometry
+// resolves the planar ambiguity, so their detections stay decode-valid.
+inline bool IsSingleTagAmbiguityRejection(const RobotPoseEstimate& estimate) {
+  return estimate.tag_count == 1 &&
+         estimate.validity.reason == PoseInvalidReason::kHighAmbiguity;
+}
+// Marks the lone detection behind a single-tag observation rejected for high
+// ambiguity, so the recorder can attribute the rejection truthfully. Detections
+// in a multi-tag solve are left untouched.
+inline void AnnotateAmbiguityRejection(std::vector<TagDetection3D>& detections,
+                                       const RobotPoseEstimate& estimate) {
+  if (!IsSingleTagAmbiguityRejection(estimate)) return;
+  for (auto& d : detections) {
+    if (d.tag_id == estimate.tag_id) d.reject_reason = "ambiguity";
+  }
+}
 inline Eigen::Vector3d FloorResidual(const talos::geometry::SE3<double>& p) {
   const auto r = p.rotation().rotationMatrix();
   return {p.translation().z(), std::atan2(r(2, 1), r(2, 2)),
           std::atan2(-r(2, 0), std::hypot(r(2, 1), r(2, 2)))};
 }
-inline double FloorPenalty(const talos::geometry::SE3<double>& p) {
-  const auto v = FloorResidual(p);
-  return std::abs(v.x()) + 0.5 * std::hypot(v.y(), v.z());
+inline double FloorSquaredMahalanobis(const talos::geometry::SE3<double>& pose,
+                                      const PoseSolverOptions& options) {
+  return FloorResidual(pose)
+      .cwiseQuotient(Eigen::Vector3d(options.floor_z_std_m,
+                                     options.floor_tilt_std_rad,
+                                     options.floor_tilt_std_rad))
+      .squaredNorm();
 }
 inline RobotPoseEstimate ComputeRobotFieldPose(
     int tag_id, uint32_t camera_id,
@@ -318,9 +388,11 @@ inline RobotPoseEstimate ComputeRobotFieldPose(
     double reprojection_error = 0, double ambiguity = 0,
     const PoseValidationOptions& options = {},
     const talos::geometry::SE3<double>* secondary_T_camera_tag = nullptr,
-    double secondary_reprojection_error_px = -1) {
+    double secondary_reprojection_error_px = -1,
+    const PoseSolverOptions& solver_options = {}) {
   RobotPoseEstimate out;
   out.tag_id = tag_id;
+  out.tag_count = 1;
   out.camera_id = camera_id;
   out.T_camera_tag = T_camera_tag;
   out.reprojection_error_px = reprojection_error;
@@ -341,16 +413,27 @@ inline RobotPoseEstimate ComputeRobotFieldPose(
       secondary_reprojection_error_px <=
           options.max_reprojection_error_px * 1.5) {
     const auto secondary = compose(*secondary_T_camera_tag);
-    const double a = FloorPenalty(out.T_field_robot),
-                 b = FloorPenalty(secondary);
-    double other = b;
-    if (b + 0.15 < a) {
+    const double primary_floor =
+        FloorSquaredMahalanobis(out.T_field_robot, solver_options);
+    const double secondary_floor =
+        FloorSquaredMahalanobis(secondary, solver_options);
+    // Override pixel ordering only with decisive floor evidence: the winner
+    // is inside a 3-sigma prior radius and the alternative outside 6 sigma.
+    // In particular, a merely smaller floor residual is not disambiguation.
+    constexpr double kCompatibleFloorRadius = 3;
+    constexpr double kExcludedFloorRadius = 6;
+    const double compatible_sq =
+        kCompatibleFloorRadius * kCompatibleFloorRadius;
+    const double excluded_sq = kExcludedFloorRadius * kExcludedFloorRadius;
+    const bool secondary_resolved =
+        secondary_floor <= compatible_sq && primary_floor >= excluded_sq;
+    resolved = secondary_resolved || (primary_floor <= compatible_sq &&
+                                      secondary_floor >= excluded_sq);
+    if (secondary_resolved) {
       out.T_field_robot = secondary;
       out.T_camera_tag = *secondary_T_camera_tag;
       out.reprojection_error_px = secondary_reprojection_error_px;
-      other = a;
     }
-    resolved = FloorPenalty(out.T_field_robot) < 0.25 && other > 0.5;
   }
   const auto& p = out.T_camera_tag;
   const double d = p.translation().norm();
@@ -371,24 +454,100 @@ inline RobotPoseEstimate ComputeRobotFieldPose(
   if ((r * r.transpose() - Eigen::Matrix3d::Identity()).norm() > 1e-2 ||
       r.determinant() <= 0)
     return reject(PoseInvalidReason::kInvalidRotation);
-  out.tag_count = 1;
   out.average_distance_m = d;
-  out.std_devs = ComputeObservationStdDevs(d, 1, ambiguity);
   out.validity = {true, PoseInvalidReason::kValid, "Valid"};
   return out;
 }
 
-// Joint pinhole PnP uses fixed per-observation undistortion, right SE(3)
-// increments, and a weak NWU ground-plane prior.
+namespace detail {
+using PoseNormalMatrix = Eigen::Matrix<double, 6, 6>;
+
+// Right boxplus orders its tangent (omega, v): field translation changes by
+// R*v, not v. Yaw's derivative is for atan2(R(1,0), R(0,0)), not omega.z().
+inline bool SetCovarianceStdDevs(const PoseNormalMatrix& normal,
+                                 const PoseSolverOptions& options,
+                                 RobotPoseEstimate* estimate) {
+  auto reject = [&] {
+    estimate->validity = {
+        false, PoseInvalidReason::kInvalidCovariance,
+        "Joint pose covariance is not finite positive definite"};
+    return false;
+  };
+  if (!normal.allFinite()) return reject();
+  const Eigen::LLT<PoseNormalMatrix> factor(normal);
+  if (factor.info() != Eigen::Success) return reject();
+  const PoseNormalMatrix covariance =
+      factor.solve(PoseNormalMatrix::Identity());
+  if (!covariance.allFinite() ||
+      Eigen::LLT<PoseNormalMatrix>(covariance).info() != Eigen::Success)
+    return reject();
+  const auto r = estimate->T_field_robot.rotation().rotationMatrix();
+  const double yaw_denom = r(0, 0) * r(0, 0) + r(1, 0) * r(1, 0);
+  if (yaw_denom <= 1e-12) return reject();
+  Eigen::Matrix<double, 3, 6> map = Eigen::Matrix<double, 3, 6>::Zero();
+  map.block<2, 3>(0, 3) = r.topRows<2>();
+  map(2, 1) = (r(1, 0) * r(0, 2) - r(0, 0) * r(1, 2)) / yaw_denom;
+  map(2, 2) = (r(0, 0) * r(1, 1) - r(1, 0) * r(0, 1)) / yaw_denom;
+  const Eigen::Matrix3d base_covariance = map * covariance * map.transpose();
+  if (!base_covariance.allFinite() ||
+      Eigen::LLT<Eigen::Matrix3d>(base_covariance).info() != Eigen::Success)
+    return reject();
+  Eigen::Matrix3d field_covariance = base_covariance;
+  // Extrinsic calibration uncertainty: an unknown mount rotation of
+  // mount_angle_std_rad tilts the optical axis and shifts the lever arm by
+  // `range * angle`, while an unknown mount translation shifts it directly.
+  // Both are added isotropically to field x/y (the tilt direction is
+  // unobservable without calibration) and the angle also adds to yaw. Added
+  // before the floors so a perfectly calibrated mount (zero std) reproduces
+  // the pure corner covariance exactly.
+  const double range = estimate->average_distance_m;
+  const double mount_xy_var =
+      options.mount_translation_std_m * options.mount_translation_std_m +
+      (range * options.mount_angle_std_rad) *
+          (range * options.mount_angle_std_rad);
+  field_covariance(0, 0) += mount_xy_var;
+  field_covariance(1, 1) += mount_xy_var;
+  field_covariance(2, 2) +=
+      options.mount_angle_std_rad * options.mount_angle_std_rad;
+  estimate->std_devs = {
+      std::max(options.min_xy_std_m, std::sqrt(field_covariance(0, 0))),
+      std::max(options.min_xy_std_m, std::sqrt(field_covariance(1, 1))),
+      std::max(options.min_yaw_std_rad, std::sqrt(field_covariance(2, 2)))};
+  return true;
+}
+}  // namespace detail
+
+// All observations, including single tags, share this right-increment SE(3)
+// LM solve. Pixel rows and floor rows are whitened before Huber IRLS; the
+// undamped final information matrix supplies measurement covariance.
 inline RobotPoseEstimate SolveMultiTagRobotPose(
     const std::vector<TagDetection3D>& observations, uint32_t camera_id,
     const CameraMounting& mounting, const FieldLayout& layout,
     const CameraIntrinsics& intrinsics,
-    const PoseValidationOptions& options = {}) {
+    const PoseValidationOptions& options = {},
+    const PoseSolverOptions& solver_options = {}) {
   std::vector<const TagDetection3D*> tags;
+  tags.reserve(observations.size());
   RobotPoseEstimate out;
   out.camera_id = camera_id;
-  double best = 1e100, distance_sum = 0;
+  auto reject = [&](PoseInvalidReason reason, const char* message) {
+    out.validity = {false, reason, message};
+    return out;
+  };
+  const auto& noise = solver_options;
+  if (!std::isfinite(noise.pixel_std_px) || noise.pixel_std_px <= 0 ||
+      !std::isfinite(noise.floor_z_std_m) || noise.floor_z_std_m <= 0 ||
+      !std::isfinite(noise.floor_tilt_std_rad) ||
+      noise.floor_tilt_std_rad <= 0 || !std::isfinite(noise.huber_delta_px) ||
+      noise.huber_delta_px <= 0 || !std::isfinite(noise.min_xy_std_m) ||
+      noise.min_xy_std_m < 0 || !std::isfinite(noise.min_yaw_std_rad) ||
+      noise.min_yaw_std_rad < 0 || !std::isfinite(noise.mount_angle_std_rad) ||
+      noise.mount_angle_std_rad < 0 ||
+      !std::isfinite(noise.mount_translation_std_m) ||
+      noise.mount_translation_std_m < 0)
+    return reject(PoseInvalidReason::kInvalidCovariance,
+                  "Invalid solver noise");
+  double distance_sum = 0;
   for (const auto& t : observations) {
     const double d = t.T_camera_tag.translation().norm();
     if (!t.valid || !layout.HasTag(t.tag_id) || !std::isfinite(d) ||
@@ -400,31 +559,11 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
       continue;
     tags.push_back(&t);
     distance_sum += d;
-    auto seed_options = options;
-    seed_options.max_ambiguity = 1;
-    auto seed = ComputeRobotFieldPose(
-        t.tag_id, camera_id, t.T_camera_tag, mounting, layout,
-        t.reprojection_error, t.ambiguity, seed_options,
-        &t.secondary_T_camera_tag, t.secondary_reprojection_error_px);
-    const double score =
-        seed.reprojection_error_px + FloorPenalty(seed.T_field_robot);
-    if (seed.validity.valid && score < best) {
-      best = score;
-      out = seed;
-    }
   }
-  if (tags.empty() || best == 1e100 || !intrinsics.IsValid()) {
-    out.validity = {false, PoseInvalidReason::kDegenerateHomography,
-                    "No usable PnP seed"};
-    return out;
-  }
-  if (tags.size() == 1) {
-    const auto& t = *tags.front();
-    return ComputeRobotFieldPose(t.tag_id, camera_id, t.T_camera_tag, mounting,
-                                 layout, t.reprojection_error, t.ambiguity,
-                                 options, &t.secondary_T_camera_tag,
-                                 t.secondary_reprojection_error_px);
-  }
+  if (tags.empty() || !intrinsics.IsValid())
+    return reject(PoseInvalidReason::kDegenerateHomography,
+                  "No usable PnP seed");
+
   std::vector<Eigen::Vector3d> points;
   std::vector<Eigen::Vector2d> pixels;
   points.reserve(4 * tags.size());
@@ -438,70 +577,213 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
           {t->corners[2 * j], t->corners[2 * j + 1]}));
     }
   }
-  const int rows = static_cast<int>(2 * points.size() + 3);
-  auto residual = [&](const auto& pose, Eigen::VectorXd& r) {
-    const auto camera_field =
-        mounting.T_robot_camera.inverse() * pose.inverse();
+  const int pixel_rows = static_cast<int>(2 * points.size());
+  const int rows = pixel_rows + 3;
+  const auto camera_robot = mounting.T_robot_camera.inverse();
+  const auto camera_rotation = camera_robot.rotation().rotationMatrix();
+  auto evaluate = [&](const auto& pose, Eigen::VectorXd& residual,
+                      Eigen::MatrixXd* jacobian) {
+    const auto robot_field = pose.inverse();
     for (size_t i = 0; i < points.size(); ++i) {
-      const auto p = camera_field.act(points[i]);
+      const auto p_robot = robot_field.act(points[i]);
+      const auto p = camera_robot.act(p_robot);
       if (!p.allFinite() || p.z() <= options.min_z_m) return false;
-      r(2 * i) = intrinsics.fx * p.x() / p.z() + intrinsics.cx - pixels[i].x();
-      r(2 * i + 1) =
-          intrinsics.fy * p.y() / p.z() + intrinsics.cy - pixels[i].y();
-    }
-    r.tail<3>() = FloorResidual(pose);
-    return r.allFinite();
-  };
-  Eigen::VectorXd r(rows), trial_r(rows), shifted(rows);
-  if (!residual(out.T_field_robot, r)) {
-    out.validity = {false, PoseInvalidReason::kBehindCamera,
-                    "Invalid initial projection"};
-    return out;
-  }
-  Eigen::MatrixXd jac(rows, 6);
-  double lambda = 1e-3;
-  for (int iteration = 0; iteration < 10; ++iteration) {
-    bool ok = true;
-    for (int c = 0; c < 6; ++c) {
-      Eigen::Matrix<double, 6, 1> step = Eigen::Matrix<double, 6, 1>::Zero();
-      step(c) = 1e-6;
-      if (!residual(out.T_field_robot.boxplus(step), shifted)) {
-        ok = false;
-        break;
+      residual(2 * i) =
+          (intrinsics.fx * p.x() / p.z() + intrinsics.cx - pixels[i].x()) /
+          noise.pixel_std_px;
+      residual(2 * i + 1) =
+          (intrinsics.fy * p.y() / p.z() + intrinsics.cy - pixels[i].y()) /
+          noise.pixel_std_px;
+      if (jacobian) {
+        Eigen::Matrix<double, 2, 3> projection;
+        projection << intrinsics.fx / p.z(), 0,
+            -intrinsics.fx * p.x() / (p.z() * p.z()), 0, intrinsics.fy / p.z(),
+            -intrinsics.fy * p.y() / (p.z() * p.z());
+        Eigen::Matrix<double, 3, 6> tangent;
+        tangent.leftCols<3>() = talos::geometry::SO3<double>::Hat(p_robot);
+        tangent.rightCols<3>() = -Eigen::Matrix3d::Identity();
+        jacobian->block<2, 6>(2 * i, 0) =
+            projection * camera_rotation * tangent / noise.pixel_std_px;
       }
-      jac.col(c) = (shifted - r) / 1e-6;
     }
-    if (!ok) break;
-    Eigen::Matrix<double, 6, 6> normal = jac.transpose() * jac;
-    normal.diagonal().array() += lambda;
-    const Eigen::Matrix<double, 6, 1> delta =
-        normal.ldlt().solve(-jac.transpose() * r);
-    if (!delta.allFinite()) break;
-    const auto trial = out.T_field_robot.boxplus(delta);
-    if (residual(trial, trial_r) && trial_r.squaredNorm() < r.squaredNorm()) {
-      out.T_field_robot = trial;
-      r = trial_r;
-      lambda *= 0.25;
-      if (delta.norm() < 1e-7) break;
-    } else {
-      lambda *= 10;
+    const auto floor = FloorResidual(pose);
+    residual.tail<3>() = floor.cwiseQuotient(
+        Eigen::Vector3d(noise.floor_z_std_m, noise.floor_tilt_std_rad,
+                        noise.floor_tilt_std_rad));
+    if (jacobian) {
+      const double sr = std::sin(floor.y()), cr = std::cos(floor.y());
+      const double cp = std::cos(floor.z()), tp = std::tan(floor.z());
+      if (std::abs(cp) < 1e-6) return false;
+      jacobian->bottomRows<3>().setZero();
+      jacobian->block<1, 3>(pixel_rows, 3) =
+          pose.rotation().rotationMatrix().row(2) / noise.floor_z_std_m;
+      jacobian->block<1, 3>(pixel_rows + 1, 0) =
+          Eigen::RowVector3d(1, sr * tp, cr * tp) / noise.floor_tilt_std_rad;
+      jacobian->block<1, 3>(pixel_rows + 2, 0) =
+          Eigen::RowVector3d(0, cr, -sr) / noise.floor_tilt_std_rad;
+    }
+    return residual.allFinite();
+  };
+  const double huber_delta = noise.huber_delta_px / noise.pixel_std_px;
+  auto cost = [&](const Eigen::VectorXd& r) {
+    double value = r.tail<3>().squaredNorm();
+    for (int i = 0; i < pixel_rows; ++i) {
+      const double a = std::abs(r(i));
+      value += a <= huber_delta ? a * a : huber_delta * (2 * a - huber_delta);
+    }
+    return value;
+  };
+  Eigen::VectorXd residual(rows), trial_residual(rows), weighted_residual(rows);
+  Eigen::MatrixXd jacobian(rows, 6), weighted_jacobian(rows, 6);
+  detail::PoseNormalMatrix normal;
+
+  // Runs the joint LM from `seed`, returning the refined estimate. The scratch
+  // buffers are shared across seeds; each run reinitializes them via linearize.
+  auto solve_from = [&](const talos::geometry::SE3<double>& seed) {
+    RobotPoseEstimate est;
+    est.camera_id = camera_id;
+    est.T_field_robot = seed;
+    auto linearize = [&] {
+      if (!evaluate(est.T_field_robot, residual, &jacobian)) return false;
+      weighted_jacobian = jacobian;
+      weighted_residual = residual;
+      for (int i = 0; i < pixel_rows; ++i) {
+        const double a = std::abs(residual(i));
+        if (a > huber_delta) {
+          const double sqrt_weight = std::sqrt(huber_delta / a);
+          weighted_jacobian.row(i) *= sqrt_weight;
+          weighted_residual(i) *= sqrt_weight;
+        }
+      }
+      normal.noalias() = weighted_jacobian.transpose() * weighted_jacobian;
+      return normal.allFinite();
+    };
+    double lambda = 1e-3;
+    for (int iteration = 0; iteration < 30; ++iteration) {
+      if (!linearize()) {
+        est.validity = {false, PoseInvalidReason::kBehindCamera,
+                        "Invalid joint projection"};
+        return est;
+      }
+      detail::PoseNormalMatrix damped = normal;
+      damped.diagonal().array() += lambda;
+      const Eigen::Matrix<double, 6, 1> delta = damped.ldlt().solve(
+          -weighted_jacobian.transpose() * weighted_residual);
+      if (!delta.allFinite()) {
+        est.validity = {false, PoseInvalidReason::kInvalidCovariance,
+                        "Invalid joint step"};
+        return est;
+      }
+      const auto trial = est.T_field_robot.boxplus(delta);
+      if (evaluate(trial, trial_residual, nullptr) &&
+          cost(trial_residual) < cost(residual)) {
+        est.T_field_robot = trial;
+        lambda *= 0.25;
+        if (delta.norm() < 1e-8) break;
+      } else {
+        if (delta.norm() < 1e-8) break;
+        lambda *= 10;
+      }
+    }
+    if (!linearize()) {
+      est.validity = {false, PoseInvalidReason::kBehindCamera,
+                      "Invalid final projection"};
+      return est;
+    }
+    est.tag_id = -1;
+    est.tag_count = static_cast<int>(tags.size());
+    est.average_distance_m = distance_sum / tags.size();
+    est.reprojection_error_px =
+        noise.pixel_std_px *
+        std::sqrt(residual.head(pixel_rows).squaredNorm() / points.size());
+    est.ambiguity = 0;
+    if (!detail::SetCovarianceStdDevs(normal, noise, &est)) return est;
+    if (est.reprojection_error_px > options.max_reprojection_error_px) {
+      est.validity = {false, PoseInvalidReason::kHighReprojectionError,
+                      "Joint PnP residual too high"};
+      return est;
+    }
+    est.validity = {true, PoseInvalidReason::kValid, "Valid"};
+    return est;
+  };
+
+  // A single tag keeps the ComputeRobotFieldPose path so the ambiguity gate
+  // (and the floor-disambiguation override) decides the observation; the LM
+  // then only refines and computes covariance.
+  if (tags.size() == 1) {
+    const auto& t = *tags.front();
+    auto seed = ComputeRobotFieldPose(
+        t.tag_id, camera_id, t.T_camera_tag, mounting, layout,
+        t.reprojection_error, t.ambiguity, options, &t.secondary_T_camera_tag,
+        t.secondary_reprojection_error_px, noise);
+    if (!seed.validity.valid) return seed;
+    auto result = solve_from(seed.T_field_robot);
+    result.tag_id = t.tag_id;
+    result.ambiguity = t.ambiguity;
+    return result;
+  }
+
+  // Multi-tag: a single tag's primary is unreliable near the planar-ambiguity
+  // boundary, so evaluate every pose candidate (primary and secondary, when
+  // present) of every tag by the joint unweighted reprojection residual over
+  // all tags' corners (no LM), and seed the joint solve from the best.
+  auto joint_rms = [&](const talos::geometry::SE3<double>& T_field_robot) {
+    const auto robot_field = T_field_robot.inverse();
+    double sum_sq = 0.0;
+    for (size_t i = 0; i < points.size(); ++i) {
+      const auto p = camera_robot.act(robot_field.act(points[i]));
+      if (!p.allFinite() || p.z() <= options.min_z_m)
+        return std::numeric_limits<double>::infinity();
+      const double u = intrinsics.fx * p.x() / p.z() + intrinsics.cx;
+      const double v = intrinsics.fy * p.y() / p.z() + intrinsics.cy;
+      const double du = u - pixels[i].x(), dv = v - pixels[i].y();
+      sum_sq += du * du + dv * dv;
+    }
+    return std::sqrt(sum_sq / points.size());
+  };
+  struct SeedCandidate {
+    talos::geometry::SE3<double> T_field_robot;
+    double residual;
+  };
+  std::vector<SeedCandidate> seeds;
+  seeds.reserve(2 * tags.size());
+  for (const auto* t : tags) {
+    const auto field = *layout.GetTagPose(t->tag_id);
+    auto add = [&](const talos::geometry::SE3<double>& camera_tag) {
+      const auto robot =
+          field * camera_tag.inverse() * mounting.T_robot_camera.inverse();
+      const double residual = joint_rms(robot);
+      if (std::isfinite(residual)) seeds.push_back({robot, residual});
+    };
+    add(t->T_camera_tag);
+    if (t->secondary_reprojection_error_px >= 0.0 &&
+        std::isfinite(t->secondary_reprojection_error_px))
+      add(t->secondary_T_camera_tag);
+  }
+  if (seeds.empty())
+    return reject(PoseInvalidReason::kDegenerateHomography,
+                  "No usable PnP seed");
+  std::sort(seeds.begin(), seeds.end(), [](const auto& a, const auto& b) {
+    return a.residual < b.residual;
+  });
+
+  RobotPoseEstimate best_estimate = solve_from(seeds.front().T_field_robot);
+  double best_score = best_estimate.validity.valid
+                          ? best_estimate.reprojection_error_px
+                          : std::numeric_limits<double>::infinity();
+  // The runner-up seed guards against converging into the planar-flip local
+  // minimum; keep whichever converges to the lower final reprojection error.
+  for (size_t k = 1; k < seeds.size() && k < 2; ++k) {
+    auto alt = solve_from(seeds[k].T_field_robot);
+    const double alt_score = alt.validity.valid
+                                 ? alt.reprojection_error_px
+                                 : std::numeric_limits<double>::infinity();
+    if (alt_score < best_score) {
+      best_estimate = std::move(alt);
+      best_score = alt_score;
     }
   }
-  out.tag_id = -1;
-  out.tag_count = static_cast<int>(tags.size());
-  out.average_distance_m = distance_sum / tags.size();
-  out.reprojection_error_px =
-      std::sqrt(r.head(rows - 3).squaredNorm() / points.size());
-  out.ambiguity = 0;
-  out.std_devs =
-      ComputeObservationStdDevs(out.average_distance_m, out.tag_count, 0);
-  out.validity = {
-      out.reprojection_error_px <= options.max_reprojection_error_px,
-      PoseInvalidReason::kValid, "Valid"};
-  if (!out.validity.valid)
-    out.validity = {false, PoseInvalidReason::kHighReprojectionError,
-                    "Joint PnP residual too high"};
-  return out;
+  return best_estimate;
 }
 
 }  // namespace talos::vision

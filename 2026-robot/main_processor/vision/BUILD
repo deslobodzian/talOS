@@ -27,17 +27,14 @@ talos_messages(
 
 cc_library(
     name = "vision",
-    hdrs = [
-        "sim_truth.h",
-        "vision.h",
-    ],
+    hdrs = ["vision.h"],
     include_prefix = "vision",
     strip_include_prefix = ".",
     deps = [
         ":messages",
-        "//2026-robot/main_processor/drivetrain:messages",
         "//2026-robot/main_processor/vision/data:field_layout_2026",
         "//talOS/geometry",
+        "//talOS/hardware:sim_messages",
         "//talOS/msgs:geometry",
         "//talOS/node",
         "//talOS/vision:camera_source",
@@ -46,6 +43,8 @@ cc_library(
         "//talOS/vision/capture",
         "//talOS/vision/field_sim",
         "//talOS/vision/field_sim:field_sim_patterns",
+        "//talOS/vision/recording",
+        "//talOS/vision/recording:recorder",
     ],
 )
 
@@ -75,6 +74,7 @@ cc_test(
         ":vision",
         "//talOS/configuration",
         "//talOS/node:testing",
+        "//talOS/vision/recording:replay",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],

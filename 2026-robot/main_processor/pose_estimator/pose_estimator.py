@@ -20,7 +20,8 @@ An observation is rejected (and counted) when it is marked invalid, carries
 a non-finite value or a non-positive standard deviation, arrives before any
 odometry, was taken before the first odometry sample, is newer than the
 latest odometry sample by more than observation_future_tolerance_us, or is
-older than it by more than max_observation_age_us.
+older than it by more than max_observation_age_us. Single-tag observations
+also pass position and wrapped-yaw innovation gates against the current estimate.
 """
 
 import collections
@@ -275,6 +276,8 @@ class PoseEstimator:
         self.field_length_m = _positive(node, "field_length_m", 16.54)
         self.field_width_m = _positive(node, "field_width_m", 8.21)
         self.max_innovation_m = _positive(node, "max_innovation_m", 3.0)
+        self.max_yaw_innovation_rad = _positive(
+            node, "max_yaw_innovation_rad", 0.2618)
         backend = node.param("backend")
         if backend == "kalman":
             self.backend = KalmanBackend(node, kinematics)
@@ -363,6 +366,11 @@ class PoseEstimator:
             current = self.backend.pose()
             if math.hypot(o.pose_x_m - current.X(),
                           o.pose_y_m - current.Y()) > self.max_innovation_m:
+                return False
+            yaw_delta = o.pose_yaw_rad - current.rotation().radians()
+            yaw_innovation = abs(math.atan2(math.sin(yaw_delta),
+                                           math.cos(yaw_delta)))
+            if yaw_innovation > self.max_yaw_innovation_rad:
                 return False
         if o.sample_time_ns < self.first_ns:
             return False  # nothing to attach it to

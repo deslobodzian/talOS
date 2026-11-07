@@ -6,6 +6,8 @@ defaults = "vision.toml"
 [camera]
 id = 1
 device = ""
+# latency_offset_us defaults to 0; set this camera's measured capture-stamp bias.
+# sim_timestamp_lag_us defaults to 0 and is injected only by accuracy scenarios.
 x_m = 0.25
 y_m = -0.2
 z_m = 0.45

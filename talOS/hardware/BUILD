@@ -1,5 +1,20 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//talOS/build:contract.bzl", "talos_messages")
+
+# Simulation ground truth (reserved owner `sim`): the simulated robot's true
+# field pose and field-frame velocity as geometry.OdometrySample, written only
+# by a physics-backed simulator (sim_gateway --physics), never on a robot.
+talos_messages(
+    name = "sim_messages",
+    srcs = [],
+    include_prefix = "sim",
+    topics = {
+        "state": "/sim/state",
+    },
+    visibility = ["//visibility:public"],
+    deps = ["//talOS/msgs:geometry"],
+)
 
 cc_library(
     name = "config",

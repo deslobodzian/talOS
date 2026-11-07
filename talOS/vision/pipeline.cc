@@ -1,175 +1,86 @@
 #include "talOS/vision/pipeline.h"
 
-#include <chrono>
 #include <cmath>
-#include <cstddef>
-#include <initializer_list>
 #include <stdexcept>
-#include <string_view>
 #include <utility>
 
 #include "talOS/vision/metal/metal_apriltag_backend.h"
 
 namespace talos::vision {
 namespace {
+void ValidateConfig(const PipelineConfig& config) {
+  const auto& options = config.detector_options;
+  if (!std::isfinite(options.quad_decimate) || options.quad_decimate < 1 ||
+      options.quad_decimate > 8) {
+    throw std::invalid_argument("detector.decimate must be between 1 and 8");
+  }
+  if (options.threads < 1 || options.threads > 16) {
+    throw std::invalid_argument("detector.threads must be between 1 and 16");
+  }
+  if (!std::isfinite(options.quad_sigma) || options.quad_sigma < 0 ||
+      options.quad_sigma > 4) {
+    throw std::invalid_argument("detector.sigma must be between 0 and 4");
+  }
+  if (options.max_hamming < 0 || options.max_hamming > 2) {
+    throw std::invalid_argument(
+        "detector.hamming_threshold must be between 0 and 2");
+  }
+  if (!std::isfinite(config.min_decision_margin) ||
+      config.min_decision_margin < 0 || config.min_decision_margin > 1000) {
+    throw std::invalid_argument(
+        "detector.min_decision_margin must be between 0 and 1000");
+  }
+  if (config.backend_name != "cpu" && config.backend_name != "metal" &&
+      config.backend_name != "auto") {
+    throw std::invalid_argument("backend must be cpu, metal or auto");
+  }
+  if (config.backend_name == "metal" &&
+      (options.quad_sigma != 0 ||
+       (options.quad_decimate != 1 && options.quad_decimate != 2))) {
+    throw std::invalid_argument(
+        "backend metal requires detector.sigma = 0 and detector.decimate = 1 "
+        "or 2; select auto to allow CPU fallback");
+  }
+}
+
 std::shared_ptr<ComputeBackend> MakeBackend(const PipelineConfig& config) {
-  apriltag::DetectorOptions options;
-  options.threads = config.GetInt("threads", 1);
-  options.quad_decimate = static_cast<float>(config.GetDouble("decimate", 1.0));
-  options.quad_sigma = static_cast<float>(config.GetDouble("sigma", 0.0));
-  options.refine_edges = config.GetBool("refine_edges", true);
-  options.max_hamming = config.GetInt("hamming_threshold", 1);
   if (config.backend_name == "metal" || config.backend_name == "auto") {
-    auto backend = std::make_shared<metal::MetalAprilTagBackend>(options);
+    auto backend =
+        std::make_shared<metal::MetalAprilTagBackend>(config.detector_options);
     if (config.backend_name == "metal" && !backend->supports_gpu()) {
       throw std::invalid_argument(
-          "Metal device unavailable; select auto to allow CPU fallback");
+          "backend metal device unavailable; select auto to allow CPU "
+          "fallback");
     }
     return backend;
   }
-  return std::make_shared<CpuAprilTagBackend>(options);
+  return std::make_shared<CpuAprilTagBackend>(config.detector_options);
 }
 }  // namespace
 
 AprilTagPipeline::AprilTagPipeline(const PipelineConfig& config,
                                    std::shared_ptr<ComputeBackend> backend)
-    : config_{config},
-      backend_{std::move(backend)},
-      external_backend_(backend_ != nullptr) {
-  std::string error;
-  if (!AprilTagPipeline::ValidateConfig(config, &error)) {
-    throw std::invalid_argument(error);
-  }
-  if (!backend_) backend_ = MakeBackend(config);
-}
-
-bool AprilTagPipeline::ValidateConfig(const PipelineConfig& config,
-                                      std::string* error_msg) const {
-  if (config.kind != "apriltag") {
-    if (error_msg) *error_msg = "Config kind must be 'apriltag'";
-    return false;
-  }
-
-  for (const char* key : {"decimate", "sigma", "threads", "hamming_threshold",
-                          "min_decision_margin"}) {
-    if (auto it = config.parameters.find(key); it != config.parameters.end()) {
-      try {
-        std::size_t used = 0;
-        double value = std::stod(it->second, &used);
-        if (used != it->second.size() || !std::isfinite(value)) {
-          throw std::invalid_argument("invalid number");
-        }
-        if ((std::string_view(key) == "threads" ||
-             std::string_view(key) == "hamming_threshold") &&
-            std::trunc(value) != value) {
-          throw std::invalid_argument("integer required");
-        }
-      } catch (...) {
-        if (error_msg) *error_msg = std::string("Invalid parameter: ") + key;
-        return false;
-      }
-    }
-  }
-  double decimate = config.GetDouble("decimate", 1.0);
-  if (!std::isfinite(decimate) || decimate < 1.0 || decimate > 8.0) {
-    if (error_msg) *error_msg = "Decimate factor must be >= 1.0";
-    return false;
-  }
-
-  int threads = config.GetInt("threads", 1);
-  if (threads < 1 || threads > 16) {
-    if (error_msg) *error_msg = "Thread count must be >= 1";
-    return false;
-  }
-
-  const double sigma = config.GetDouble("sigma", 0.0);
-  if (config.backend_name == "metal" &&
-      (sigma != 0 || (decimate != 1 && decimate != 2))) {
-    if (error_msg) {
-      *error_msg =
-          "Metal supports decimation 1 or 2 and blur 0; select auto to allow "
-          "CPU fallback";
-    }
-    return false;
-  }
-  if (config.GetDouble("min_decision_margin", 0) < 0 ||
-      config.GetDouble("min_decision_margin", 0) > 1000) {
-    if (error_msg) *error_msg = "Decision margin must be between 0 and 1000";
-    return false;
-  }
-  if (auto it = config.parameters.find("refine_edges");
-      it != config.parameters.end() && it->second != "true" &&
-      it->second != "false" && it->second != "1" && it->second != "0") {
-    if (error_msg) *error_msg = "refine_edges must be a boolean";
-    return false;
-  }
-  if (!std::isfinite(sigma) || sigma < 0 || sigma > 4 ||
-      config.GetInt("hamming_threshold", 1) < 0 ||
-      config.GetInt("hamming_threshold", 1) > 2 ||
-      (config.backend_name != "cpu" && config.backend_name != "metal" &&
-       config.backend_name != "auto")) {
-    if (error_msg) *error_msg = "Invalid detector settings or backend";
-    return false;
-  }
-  return true;
-}
-
-bool AprilTagPipeline::ApplyConfig(const PipelineConfig& config) {
-  std::string err;
-  if (!ValidateConfig(config, &err)) {
-    return false;
-  }
-  try {
-    auto prepared = external_backend_ ? backend_ : MakeBackend(config);
-    config_ = config;
-    backend_ = std::move(prepared);
-  } catch (...) {
-    return false;
-  }
-  return true;
+    : config_{config}, backend_{std::move(backend)} {
+  ValidateConfig(config_);
+  if (!backend_) backend_ = MakeBackend(config_);
 }
 
 PipelineResult AprilTagPipeline::ProcessFrame(const Frame& frame) {
   PipelineResult result;
-  result.camera_id = frame.camera_id();
-  result.session_id = frame.session_id();
-  result.sequence_number = frame.sequence_number();
-  result.capture_time = frame.capture_time();
-  result.timestamp_kind = frame.timestamp_kind();
-  result.mapping_quality = frame.mapping_quality();
-  result.revision = config_.revision;
-
-  if (!backend_) {
-    result.success = false;
-    result.error_message = "No compute backend configured";
-    result.completion_time = talos::event::steady_now();
-    return result;
-  }
-
-  // Stage 1 & 2 & 3: Grayscale conversion, quad detection, tag decode
-  BackendExecutionResult backend_res = backend_->Execute(frame);
-  result.timings = backend_res.timings;
-  result.effective_backend = backend_res.effective_backend;
-  result.fallback_reason = backend_res.fallback_reason;
+  auto backend_result = backend_->Execute(frame);
   if (config_.backend_name == "metal" &&
-      backend_res.effective_backend != "metal") {
-    result.success = false;
+      backend_result.effective_backend != "metal") {
     result.error_message =
-        "Requested Metal execution failed: " + backend_res.fallback_reason;
-    result.completion_time = talos::event::steady_now();
+        "Requested Metal execution failed: " + backend_result.fallback_reason;
     return result;
   }
-  if (!backend_res.success) {
-    result.success = false;
-    result.error_message = backend_res.error_message;
-    result.completion_time = talos::event::steady_now();
+  if (!backend_result.success) {
+    result.error_message = std::move(backend_result.error_message);
     return result;
   }
 
-  // Stage 4: 3D Pose estimation and field localization
-  const auto t_pose_start = std::chrono::steady_clock::now();
-
-  for (const auto& raw : backend_res.detections) {
+  result.detections.reserve(backend_result.detections.size());
+  for (const auto& raw : backend_result.detections) {
     TagDetection3D det;
     det.tag_id = raw.id;
     det.hamming = raw.hamming;
@@ -180,63 +91,36 @@ PipelineResult AprilTagPipeline::ProcessFrame(const Frame& frame) {
     det.homography = raw.homography;
 
     const double tag_size = config_.layout.GetTagSize(raw.id);
-
     talos::geometry::SE3<double> primary_pose;
     talos::geometry::SE3<double> secondary_pose;
-    double ambiguity = 0.0;
-
-    bool pose_ok = EstimateTagPoseFromHomography(
-        raw.homography, config_.intrinsics, tag_size, &primary_pose,
-        &secondary_pose, &ambiguity, &raw.corners);
-
-    if (pose_ok) {
+    double ambiguity = 0, primary_error = 0, secondary_error = 0;
+    if (EstimateTagPoseFromHomography(raw.homography, config_.intrinsics,
+                                      tag_size, &primary_pose, &secondary_pose,
+                                      &primary_error, &secondary_error,
+                                      &ambiguity, &raw.corners)) {
       det.T_camera_tag = primary_pose;
       det.secondary_T_camera_tag = secondary_pose;
-      det.secondary_reprojection_error_px = ComputeReprojectionError(
-          raw.corners, secondary_pose, config_.intrinsics, tag_size);
+      det.secondary_reprojection_error_px = secondary_error;
       det.ambiguity = ambiguity;
-      det.reprojection_error = ComputeReprojectionError(
-          raw.corners, primary_pose, config_.intrinsics, tag_size);
-      det.valid =
-          (raw.hamming <= config_.GetInt("hamming_threshold", 1) &&
-           raw.decision_margin >= config_.GetDouble("min_decision_margin", 0) &&
-           det.reprojection_error <=
-               config_.validation_options.max_reprojection_error_px);
-
-      // Field localization
-      RobotPoseEstimate field_res = ComputeRobotFieldPose(
-          raw.id, frame.camera_id(), primary_pose, config_.mounting,
-          config_.layout, det.reprojection_error, ambiguity,
-          config_.validation_options, &secondary_pose,
-          det.secondary_reprojection_error_px);
-
-      if (det.valid && field_res.validity.valid) {
-        FieldPoseResult fp;
-        fp.tag_id = raw.id;
-        fp.camera_id = frame.camera_id();
-        fp.T_field_robot = field_res.T_field_robot;
-        fp.reprojection_error = field_res.reprojection_error_px;
-        fp.ambiguity = det.ambiguity;
-        fp.capture_timestamp_ns = frame.capture_timestamp_ns();
-        fp.revision = config_.revision;
-        fp.valid = true;
-        result.field_poses.push_back(fp);
+      det.reprojection_error = primary_error;
+      det.valid = raw.hamming <= config_.detector_options.max_hamming &&
+                  raw.decision_margin >= config_.min_decision_margin &&
+                  det.reprojection_error <=
+                      config_.validation_options.max_reprojection_error_px;
+      if (!det.valid) {
+        if (raw.hamming > config_.detector_options.max_hamming) {
+          det.reject_reason = "hamming";
+        } else if (raw.decision_margin < config_.min_decision_margin) {
+          det.reject_reason = "decision_margin";
+        } else {
+          det.reject_reason = "reprojection";
+        }
       }
     } else {
-      det.valid = false;
+      det.reject_reason = "reprojection";
     }
-
-    result.detections.push_back(det);
+    result.detections.push_back(std::move(det));
   }
-
-  const auto t_pose_end = std::chrono::steady_clock::now();
-  result.timings.pose_us =
-      std::chrono::duration_cast<std::chrono::microseconds>(t_pose_end -
-                                                            t_pose_start)
-          .count();
-  result.timings.total_us += result.timings.pose_us;
-
-  result.completion_time = talos::event::steady_now();
   result.success = true;
   return result;
 }

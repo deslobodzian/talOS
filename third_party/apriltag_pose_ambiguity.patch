@@ -1,0 +1,84 @@
+diff --git a/apriltag_pose.c b/apriltag_pose.c
+--- a/apriltag_pose.c
++++ b/apriltag_pose.c
+@@ -1,7 +1,6 @@
+ #include <math.h>
+ #include <stdio.h>
+ 
+-#include "common/debug_print.h"
+ #include "apriltag_pose.h"
+ #include "common/homography.h"
+ 
+@@ -256,7 +255,7 @@
+ /**
+  * Given a local minima of the pose error tries to find the other minima.
+  */
+-matd_t* fix_pose_ambiguities(matd_t** v, matd_t** p, matd_t* t, matd_t* R, int n_points) {
++matd_t* fix_pose_ambiguities(matd_t** v, matd_t** p, matd_t* t, matd_t* R, int n_points, int* n_minima_out) {
+     matd_t* I3 = matd_identity(3);
+ 
+     // 1. Find R_t
+@@ -435,9 +434,6 @@
+         matd_scale_inplace(R_beta, 1/(1 + t_cur*t_cur));
+         ret = matd_op("M'MMM'", R_t, R_gamma, R_beta, R_z);
+         matd_destroy(R_beta);
+-    } else if (n_minima > 1)  {
+-        // This can happen if our prior pose estimate was not very good.
+-        debug_print("Error, more than one new minimum found.\n");
+     }
+     matd_destroy(I3);
+     matd_destroy(M1);
+@@ -446,6 +442,7 @@
+     matd_destroy(R_gamma);
+     matd_destroy(R_z);
+     matd_destroy(R_1_prime);
++    *n_minima_out = n_minima;
+     return ret;
+ }
+ 
+@@ -487,7 +484,7 @@
+ /**
+  * Estimate tag pose using orthogonal iteration.
+  */
+-void estimate_tag_pose_orthogonal_iteration(
++int estimate_tag_pose_orthogonal_iteration(
+         apriltag_detection_info_t* info,
+         double* err1,
+         apriltag_pose_t* solution1,
+@@ -508,7 +505,8 @@
+ 
+     estimate_pose_for_tag_homography(info, solution1);
+     *err1 = orthogonal_iteration(v, p, &solution1->t, &solution1->R, 4, nIters);
+-    solution2->R = fix_pose_ambiguities(v, p, solution1->t, solution1->R, 4);
++    int n_minima;
++    solution2->R = fix_pose_ambiguities(v, p, solution1->t, solution1->R, 4, &n_minima);
+     if (solution2->R) {
+         solution2->t = matd_create(3, 1);
+         *err2 = orthogonal_iteration(v, p, &solution2->t, &solution2->R, 4, nIters);
+@@ -520,6 +518,7 @@
+         matd_destroy(p[i]);
+         matd_destroy(v[i]);
+     }
++    return n_minima;
+ }
+ 
+ /**
+diff --git a/apriltag_pose.h b/apriltag_pose.h
+--- a/apriltag_pose.h
++++ b/apriltag_pose.h
+@@ -56,8 +56,14 @@
+  *      vol. 28, no. 12, pp. 2024-2030, Dec. 2006.  doi: 10.1109/TPAMI.2006.252
+  *
+  * @outparam err1, pose1, err2, pose2
++ * @return Number of new local minima found by the ambiguity search, excluding
++ * the initial minimum (using the search's existing 0.1-radian separation).
++ * Zero means no alternate minimum; one means pose2 and err2 are populated.
++ * More than one means the ambiguity search failed to select a second pose,
++ * which can happen when the initial estimate is poor. For zero or more than
++ * one, pose2->R is NULL, err2 is HUGE_VAL, and pose2->t is unchanged.
+  */
+-void estimate_tag_pose_orthogonal_iteration(
++int estimate_tag_pose_orthogonal_iteration(
+         apriltag_detection_info_t* info,
+         double* err1,
+         apriltag_pose_t* pose1,

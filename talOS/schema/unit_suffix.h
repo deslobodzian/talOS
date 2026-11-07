@@ -17,7 +17,7 @@ struct SuffixUnit {
 };
 
 // The unit suffixes and their display units (docs/METHODOLOGY.md §6).
-inline constexpr std::array<SuffixUnit, 25> kUnitSuffixTable = {{
+inline constexpr std::array<SuffixUnit, 26> kUnitSuffixTable = {{
     {"_ns", "ns"},       {"_us", "us"},         {"_m", "m"},
     {"_mps", "m/s"},     {"_mps2", "m/s²"},     {"_rad", "rad"},
     {"_radps", "rad/s"}, {"_radps2", "rad/s²"}, {"_rot", "rot"},
@@ -26,14 +26,14 @@ inline constexpr std::array<SuffixUnit, 25> kUnitSuffixTable = {{
     {"_kg", "kg"},       {"_n", "N"},           {"_nm", "N·m"},
     {"_frac", ""},       {"_duty", ""},         {"_ratio", ""},
     {"_count", ""},      {"_index", ""},        {"_id", ""},
-    {"_mask", ""},
+    {"_mask", ""},       {"_px", "px"},
 }};
 
-inline constexpr std::array<std::string_view, 25> kUnitSuffixes = {
+inline constexpr std::array<std::string_view, 26> kUnitSuffixes = {
     "_ns",     "_us",    "_m",   "_mps",  "_mps2", "_rad",  "_radps",
     "_radps2", "_rot",   "_rps", "_rps2", "_v",    "_a",    "_w",
     "_degc",   "_kg",    "_n",   "_nm",   "_frac", "_duty", "_ratio",
-    "_count",  "_index", "_id",  "_mask",
+    "_count",  "_index", "_id",  "_mask", "_px",
 };
 
 // `name` is something followed by one of kUnitSuffixes.

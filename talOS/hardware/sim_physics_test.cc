@@ -757,5 +757,186 @@ TEST(SimBelievability, SteppingIsDeterministic) {
   EXPECT_NEAR(s.motors[0].velocity_rps, q.motors[0].velocity_rps, 1e-6);
 }
 
+// Four independently controlled modules; all observations cross Read() with
+// an explicit sim clock. Non-centered layouts exercise translation elimination
+// in the chassis least-squares solve rather than assuming symmetry.
+struct WorldFixture {
+  static constexpr double kTau = 6.28318530717958647692;
+  static constexpr double kRadius = 0.0508;
+  PhysicsSimBackend backend;
+  State state{};
+  uint64_t now_us{};
+  std::array<MotorRequest, kMaxMotors> commands{};
+  std::array<double, 4> x{0.3, 0.3, -0.3, -0.3};
+  std::array<double, 4> y{0.3, -0.3, 0.3, -0.3};
+
+  explicit WorldFixture(sim::PhysicsOptions options = {},
+                        bool off_center = false)
+      : backend{options} {
+    Config config;
+    for (std::size_t i = 0; i < 4; ++i) {
+      auto drive = TestMotor(2 * i + 1, "drive", 2 * i + 1);
+      auto steer = TestMotor(2 * i + 2, "steer", 2 * i + 2);
+      drive.name += std::to_string(i);
+      steer.name += std::to_string(i);
+      steer.slots[0].p = 1.0;
+      config.motors.push_back(drive);
+      config.motors.push_back(steer);
+    }
+    config.sensors.push_back({20, "imu", SensorKind::kPigeon2, 30, "rio"});
+    EXPECT_TRUE(backend.Configure(config));
+    for (std::size_t i = 0; i < 4; ++i) {
+      if (off_center) {
+        x[i] += 0.15;
+        y[i] += 0.07;
+      }
+      backend.SetSwerveModuleGeometry(2 * i + 1, 2 * i + 2, x[i], y[i]);
+    }
+    StepBackend(backend, state, now_us, 5000, 1);
+  }
+
+  void Drive(double vx, double vy, double omega) {
+    for (std::size_t i = 0; i < 4; ++i) {
+      const double wheel_vx = vx - omega * y[i];
+      const double wheel_vy = vy + omega * x[i];
+      commands[2 * i + 1] = {static_cast<uint16_t>(2 * i + 2), Mode::kPosition,
+                             0, std::atan2(wheel_vy, wheel_vx) / kTau, 0.0};
+    }
+    EXPECT_TRUE(backend.Apply(commands));
+    Advance(2000);  // Settle azimuths before applying drive power.
+    for (std::size_t i = 0; i < 4; ++i) {
+      const double speed = std::hypot(vx - omega * y[i], vy + omega * x[i]);
+      commands[2 * i] = Duty(2 * i + 1, speed / (100.0 * kTau * kRadius));
+    }
+    EXPECT_TRUE(backend.Apply(commands));
+  }
+
+  void Advance(int steps) { StepBackend(backend, state, now_us, 5000, steps); }
+};
+
+TEST(SimWorld, ZeroErrorStraightRotationAndArcMatchCommandedChassisMotion) {
+  for (const auto [vx, vy, omega] :
+       {std::tuple{1.0, 0.0, 0.0}, std::tuple{0.0, 0.0, 0.8},
+        std::tuple{0.8, 0.3, 0.6}}) {
+    WorldFixture world{
+        {.start_x_m = 2.0, .start_y_m = 3.0, .start_yaw_rad = 0.0}, true};
+    world.Drive(vx, vy, omega);
+    world.Advance(400);  // Reach steady commanded speed.
+    const auto before = world.backend.truth();
+    world.Advance(200);
+    const auto& after = world.backend.truth();
+    const double sinc = omega == 0.0 ? 1.0 : std::sin(omega) / omega;
+    const double cosc = omega == 0.0 ? 0.0 : (1.0 - std::cos(omega)) / omega;
+    const double dx = sinc * vx - cosc * vy;
+    const double dy = cosc * vx + sinc * vy;
+    EXPECT_NEAR(after.x_m,
+                before.x_m + std::cos(before.yaw_rad) * dx -
+                    std::sin(before.yaw_rad) * dy,
+                1e-8);
+    EXPECT_NEAR(after.y_m,
+                before.y_m + std::sin(before.yaw_rad) * dx +
+                    std::cos(before.yaw_rad) * dy,
+                1e-8);
+    EXPECT_NEAR(after.yaw_rad, before.yaw_rad + omega, 1e-8);
+    EXPECT_NEAR(after.vx_mps,
+                std::cos(after.yaw_rad) * vx - std::sin(after.yaw_rad) * vy,
+                1e-8);
+    EXPECT_NEAR(after.vy_mps,
+                std::sin(after.yaw_rad) * vx + std::cos(after.yaw_rad) * vy,
+                1e-8);
+    EXPECT_NEAR(after.omega_radps, omega, 1e-8);
+    EXPECT_NEAR(world.state.sensors[0].position_rot,
+                after.yaw_rad / WorldFixture::kTau, 1e-12);
+    EXPECT_NEAR(world.state.sensors[0].velocity_rps, omega / WorldFixture::kTau,
+                1e-8);
+  }
+}
+
+TEST(SimWorld, RadiusErrorChangesGroundTravelButNotWheelEncoders) {
+  WorldFixture nominal;
+  WorldFixture larger{{.wheel_radius_error_frac = 0.2}};
+  nominal.Drive(1.0, 0.0, 0.0);
+  larger.Drive(1.0, 0.0, 0.0);
+  nominal.Advance(400);
+  larger.Advance(400);
+  const double odometric_travel = larger.state.motors[0].position_rot *
+                                  WorldFixture::kTau * WorldFixture::kRadius;
+  EXPECT_NEAR(larger.backend.truth().x_m, 1.2 * odometric_travel, 1e-10);
+  EXPECT_DOUBLE_EQ(larger.state.motors[0].position_rot,
+                   nominal.state.motors[0].position_rot);
+  EXPECT_DOUBLE_EQ(larger.state.motors[0].velocity_rps,
+                   nominal.state.motors[0].velocity_rps);
+  EXPECT_NEAR(nominal.backend.truth().x_m, odometric_travel, 1e-10);
+}
+
+TEST(SimWorld, SlipReducesTravelOnlyDuringWheelAcceleration) {
+  WorldFixture nominal;
+  WorldFixture slipping{{.wheel_slip_gain = 0.3}};
+  nominal.Drive(1.0, 0.0, 0.0);
+  slipping.Drive(1.0, 0.0, 0.0);
+  nominal.Advance(40);
+  slipping.Advance(40);
+  EXPECT_LT(slipping.backend.truth().x_m, nominal.backend.truth().x_m);
+  EXPECT_DOUBLE_EQ(slipping.state.motors[0].position_rot,
+                   nominal.state.motors[0].position_rot);
+  nominal.Advance(360);
+  slipping.Advance(360);
+  const double nominal_before = nominal.backend.truth().x_m;
+  const double slip_before = slipping.backend.truth().x_m;
+  nominal.Advance(200);
+  slipping.Advance(200);
+  EXPECT_NEAR(slipping.backend.truth().x_m - slip_before,
+              nominal.backend.truth().x_m - nominal_before, 1e-10);
+  EXPECT_NEAR(slipping.backend.truth().vx_mps, 1.0, 1e-10);
+}
+
+TEST(SimWorld, GyroDriftIsLinearAndDoesNotRotatePhysicalTruth) {
+  WorldFixture world{{.gyro_drift_radps = 0.03}};
+  for (int second = 1; second <= 3; ++second) {
+    world.Advance(200);
+    const auto& truth = world.backend.truth();
+    EXPECT_DOUBLE_EQ(truth.yaw_rad, 0.0);
+    EXPECT_NEAR(world.state.sensors[0].position_rot * WorldFixture::kTau -
+                    truth.yaw_rad,
+                0.03 * second, 1e-12);
+    EXPECT_NEAR(world.state.sensors[0].velocity_rps, 0.03 / WorldFixture::kTau,
+                1e-12);
+  }
+}
+
+TEST(SimWorld, StartPoseSurvivesControllerRestartWhileReportedGyroZeroes) {
+  WorldFixture world{
+      {.start_x_m = 2.0, .start_y_m = 4.0, .start_yaw_rad = 0.7}};
+  EXPECT_DOUBLE_EQ(world.backend.truth().x_m, 2.0);
+  EXPECT_DOUBLE_EQ(world.backend.truth().y_m, 4.0);
+  EXPECT_DOUBLE_EQ(world.backend.truth().yaw_rad, 0.7);
+  EXPECT_DOUBLE_EQ(world.state.sensors[0].position_rot, 0.0);
+  world.Drive(1.0, 0.0, 0.3);
+  world.Advance(200);
+  const auto before = world.backend.truth();
+  world.backend.RestartController();
+  world.Advance(1);
+  const auto& after = world.backend.truth();
+  EXPECT_DOUBLE_EQ(after.x_m, before.x_m);
+  EXPECT_DOUBLE_EQ(after.y_m, before.y_m);
+  EXPECT_DOUBLE_EQ(after.yaw_rad, before.yaw_rad);
+  EXPECT_DOUBLE_EQ(after.vx_mps, 0.0);
+  EXPECT_DOUBLE_EQ(after.vy_mps, 0.0);
+  EXPECT_DOUBLE_EQ(after.omega_radps, 0.0);
+  EXPECT_DOUBLE_EQ(world.state.sensors[0].position_rot, 0.0);
+  EXPECT_DOUBLE_EQ(world.state.sensors[0].velocity_rps, 0.0);
+  EXPECT_DOUBLE_EQ(world.state.motors[0].position_rot, 0.0);
+  EXPECT_DOUBLE_EQ(world.state.motors[0].velocity_rps, 0.0);
+}
+
+TEST(SimWorld, ExplicitGyroOverridesDoNotTeleportTruth) {
+  WorldFixture world{{.start_yaw_rad = 0.7}};
+  world.backend.SetGyro(2.0, -0.25);
+  world.Advance(200);
+  EXPECT_DOUBLE_EQ(world.backend.truth().yaw_rad, 0.7);
+  EXPECT_NEAR(world.state.sensors[0].position_rot, 1.75, 1e-12);
+  EXPECT_DOUBLE_EQ(world.state.sensors[0].velocity_rps, -0.25);
+}
+
 }  // namespace
 }  // namespace talos::hardware

@@ -149,6 +149,27 @@ under `--sim` (or against loopback) the bridge treats the config as
 commissioned, while on hardware the config's `commissioned` flag gates
 commands.
 
+## Lightweight simulation gateway
+
+`--sim --start-sim-gateway` starts the binary named by `[robot] sim_gateway`
+as a roster member. Repeat `--sim-gateway-arg ARG` to forward individual
+arguments verbatim, in order, to **both** its `--describe` probe and runtime.
+The forwarding flag requires `--start-sim-gateway`. For example:
+
+```sh
+bazel run //talOS/launcher -- \
+  --config "$PWD/2026-robot/main_processor/configuration/robot.toml" \
+  --sim --start-sim-gateway --sim-gateway-arg --physics \
+  --sim-gateway-arg --wheel-radius-error --sim-gateway-arg 0.1
+```
+
+Without `--physics`, the gateway uses ideal actuators and declares no truth
+sender; with it, the launcher creates `/sim/state` and telemetry observes it.
+The gateway registers its live identity with the session ID like other roster
+members, but heartbeat/stall supervision remains disabled for this process.
+`sim.sh --sim-gateway` supplies `--physics`; its repeatable `--gateway-arg ARG`
+forwards additional settings through the same launcher interface.
+
 ## Studio bridge
 
 Sim sessions can put the Studio viewer bridge under launcher supervision with

@@ -164,6 +164,7 @@ code the table is `talOS/schema/unit_suffix.h`.
 | timestamp | `_ns` | ns, talos monotonic clock (`node.now()`), `uint64` | when a sample was taken |
 | duration | `_us` | µs, integer | periods, timeouts, ages, in TOML and messages |
 | length | `_m`, `_mps`, `_mps2` | m, m/s, m/s² | field and chassis |
+| image distance | `_px` | pixels | image corners, reprojection noise, detector size gates |
 | field-frame angle | `_rad`, `_radps`, `_radps2` | rad, CCW+ | heading, pose yaw, chassis ω |
 | shaft or joint angle | `_rot`, `_rps`, `_rps2` | rotations of the **mechanism**, after `sensor_to_mechanism_ratio` | motors, CANcoders, wrists, flywheels |
 | electrical | `_v`, `_a`, `_w` | V, A, W | |
@@ -353,7 +354,7 @@ touch the code, or under the design item named.
 | `driver.toml` | `deadband_frac` | §6, §8 | done: D4 |
 | `intake.py:18` | fixed `INTAKE_RPS` ignores the requested speed | §3 | use the target's demand |
 | `drivetrain/node_test.cc` `UpdateDoesNotAllocate` | the process-wide allocation check (`malloc_logger`) runs on macOS only; on Linux it is skipped | §10 | a glibc-compatible allocation hook (glibc removed `__malloc_hook` in 2.34) |
-| `2026-robot/main_processor/vision/vision.h` simulation path | render/detect/solve runs synchronously in `update()`, allocating inside rasterization/detection/PnP and taking roughly 5 ms of a 50 ms simulated period; this sim-only cost preserves deterministic replay (live work is off-thread) | §10 | reusable allocation-free detector/solver workspaces and deterministic simulated compute scheduling; fast-projection tag/detection buffers and the raster image are already reused |
+| `2026-robot/main_processor/vision/vision.h` simulation path | render/detect/solve runs synchronously in `update()`, allocating inside rasterization/detection/PnP within a configured 10 ms node period; this sim-only cost preserves deterministic replay (live work is off-thread) | §10 | reusable allocation-free detector/solver workspaces and deterministic simulated compute scheduling; fast-projection tag/detection buffers and the raster image are already reused |
 
 ## 14. Open source first
 
@@ -384,7 +385,7 @@ A dependency is adopted when it meets all of these:
 | Tests | googletest, `unittest` | in use |
 | Geometry, kinematics and pose estimation | C++: header-only `talos::geometry` SO2/SE2/SO3/SE3 on Eigen 3.4 (`@eigen3`); drivetrain inverse/forward swerve kinematics use it with per-module speed limits. Python: `robotpy-wpimath` 2026.2.1.1 | in use: shared C++ frame math and the Python pose estimator's `kalman` backend; `wpilib_lockstep_test` aligns GradleRIO with the RobotPy native/wrapper wheels only |
 | Smoothing and mapping (factor graphs) | GTSAM 4.3.0 (`gtsam` wheel on PyPI, BSD) | in use (D6): the pose estimator's `factor_graph` backend (`IncrementalFixedLagSmoother`). Python only: GTSAM has no Bazel module, and its C++ build is CMake with a large dependency surface |
-| Vision: AprilTag pose observations | `talOS/vision`: upstream AprilTag 3.4.5 (`@apriltag`), OpenCV 4.12 conversion/IO, Metal preprocessing/CCL on macOS, AVFoundation/V4L2 capture | in use: undistorted homography, floor/tilt single-tag disambiguation, joint multi-tag PnP, distance/tag-count/ambiguity-dependent observation standard deviations; one robot node per camera, no side-channel server |
+| Vision: AprilTag pose observations | `talOS/vision`: upstream AprilTag 3.4.5 (`@apriltag`), OpenCV 4.12 conversion/IO, Metal preprocessing/CCL on macOS, AVFoundation/V4L2 capture | in use: typed detector options, decode-margin/Hamming validity gates before localization, undistorted homography, robust joint single/multi-tag corner solving with floor/tilt priors, marginalized field-frame x/y/yaw covariance and configured uncertainty floors; ambiguity unknown=1, verified unique=0; one robot node per camera, 100 Hz status and up to 60 fps live observations, no side-channel server |
 | Autonomous paths | Choreo or PathPlanner trajectories, followed with wpimath controllers | candidate |
 | Log viewing | export `.tlog` to MCAP (Foxglove) or WPILOG (AdvantageScope) rather than building more viewer features | candidate |
 | RoboRIO hardware | WPILib HAL and Phoenix 6 | in use |

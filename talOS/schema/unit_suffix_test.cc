@@ -80,6 +80,11 @@ TEST(UnitSuffixTest, SuffixTableMatchesMethodology) {
 
   EXPECT_TRUE(has_unit_suffix("fault_mask"));
   EXPECT_EQ(unit_for_field("fault_mask"), "");
+
+  for (const auto* name : {"pixel_std_px", "huber_delta_px", "min_tag_px"}) {
+    EXPECT_TRUE(has_unit_suffix(name));
+    EXPECT_EQ(unit_for_field(name), "px");
+  }
 }
 
 TEST(UnitSuffixTest, RejectsInvalidNames) {

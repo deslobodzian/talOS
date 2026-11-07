@@ -78,8 +78,6 @@ cc_library(
         ":compute_backend",
         ":frame",
         ":localization",
-        "//talOS/events:events_core",
-        "//talOS/geometry",
         "//talOS/vision/metal:metal_apriltag_backend",
     ],
 )
@@ -128,6 +126,7 @@ cc_test(
         ":compute_backend",
         ":pipeline",
         ":synthetic_source",
+        "//talOS/vision/metal:metal_apriltag_backend",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],

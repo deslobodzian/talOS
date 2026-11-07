@@ -3,12 +3,14 @@ load("//talOS/build:contract.bzl", "talos_graph_test")
 load("//tools:sync_manifest.bzl", "manifest_sync_test")
 load(":robot_field_manifest.bzl", FIELD_CONFIG_FILES = "CONFIG_FILES", FIELD_NODES = "NODES")
 load(":robot_manifest.bzl", "CONFIG_FILES", "NODES")
+load(":robot_physics_sim_manifest.bzl", PHYSICS_CONFIG_FILES = "CONFIG_FILES")
 
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "robot.toml",
     "robot_field.toml",
+    "robot_physics_sim.toml",
 ])
 
 exports_files(glob(["subsystems/*.toml"]))
@@ -25,7 +27,10 @@ cc_test(
     name = "config_golden_test",
     size = "small",
     srcs = ["config_golden_test.cc"],
-    data = [":robot_config"],
+    data = [
+        "robot_physics_sim.toml",
+        ":robot_config",
+    ] + PHYSICS_CONFIG_FILES,
     deps = [
         "//talOS/configuration",
         "//talOS/hardware:config",
@@ -61,4 +66,11 @@ manifest_sync_test(
     config = "robot_field.toml",
     config_files = FIELD_CONFIG_FILES,
     manifest = "robot_field_manifest.bzl",
+)
+
+manifest_sync_test(
+    name = "physics_sim_manifest_sync_test",
+    config = "robot_physics_sim.toml",
+    config_files = PHYSICS_CONFIG_FILES,
+    manifest = "robot_physics_sim_manifest.bzl",
 )

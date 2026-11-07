@@ -59,10 +59,15 @@ the hardware says:
   values.
 - `yaw_rad` is the Pigeon's yaw converted from rotations, and `yaw_valid`
   says whether the Pigeon reports. While it does not, `yaw_rad` holds the last
-  valid heading (0 before the first). Under `--sim` the heading is instead
-  integrated from the rotation the modules measure, valid while the modules
-  are, because a simulated Pigeon reads a valid, permanently zero yaw;
+  valid heading (0 before the first). Under `--sim` the default instead
+  integrates heading from module rotation, valid while the modules are,
+  because WPILib/ideal sims report a valid, permanently zero Pigeon yaw.
   `integrate_heading = true|false` in `[subsystem]` overrides that choice.
+  The physics gateway models the Pigeon, including injected gyro drift:
+  `configuration/robot_physics_sim.toml` includes `robot.toml` and sets
+  `[subsystems.drivetrain] integrate_heading = false` to use that modeled yaw.
+  `./sim.sh --sim-gateway` selects this config; WPILib keeps `robot.toml`
+  and module-integrated heading.
 - `sample_time_ns` is `HardwareLink::sample_time()`: the gateway's sample
   time of the `/hw/state` the tick read, mapped into the node clock by the
   bridge's min-filtered offset (`talOS/hardware/README.md`). It reads later

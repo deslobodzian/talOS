@@ -329,6 +329,28 @@ TEST(ConfigTest, GoldenTestParsesSwerveRobotTomlEqualToSwerveConfig) {
   VerifyReferenceRobotConfig(config, expected);
 }
 
+TEST(ConfigTest, PhysicsSimulationUsesPigeonWithTheSameNodeRoster) {
+  const auto base =
+      ParseRobotConfig("2026-robot/main_processor/configuration/robot.toml");
+  const auto physics = ParseRobotConfig(
+      "2026-robot/main_processor/configuration/robot_physics_sim.toml");
+  EXPECT_FALSE(
+      physics.toml_data.at_path("subsystems.drivetrain.integrate_heading")
+          .value_or(true));
+  const auto* base_subsystems = base.toml_data["subsystems"].as_table();
+  const auto* physics_subsystems = physics.toml_data["subsystems"].as_table();
+  ASSERT_NE(base_subsystems, nullptr);
+  ASSERT_NE(physics_subsystems, nullptr);
+  EXPECT_EQ(physics_subsystems->size(), base_subsystems->size());
+  for (const auto& [name, subsystem] : *base_subsystems) {
+    const auto* table = subsystem.as_table();
+    ASSERT_NE(table, nullptr);
+    EXPECT_EQ((*physics_subsystems)[name]["node"].value<std::string>(),
+              (*table)["node"].value<std::string>())
+        << name;
+  }
+}
+
 TEST(ConfigTest, TargetPolicyIsTheDefaultForEveryActuatedSubsystem) {
   const auto config =
       ParseRobotConfig("2026-robot/main_processor/configuration/robot.toml");
@@ -343,6 +365,16 @@ TEST(ConfigTest, TargetPolicyIsTheDefaultForEveryActuatedSubsystem) {
   EXPECT_EQ(
       config.toml_data.at_path("subsystems.autonomous.period_us").value_or(0),
       20000);
+  EXPECT_DOUBLE_EQ(config.toml_data.at_path("subsystems.autonomous.target_x_m")
+                       .value_or(-1.0),
+                   6.0);
+  EXPECT_DOUBLE_EQ(config.toml_data.at_path("subsystems.autonomous.target_y_m")
+                       .value_or(-1.0),
+                   4.0);
+  EXPECT_DOUBLE_EQ(
+      config.toml_data.at_path("subsystems.autonomous.target_yaw_rad")
+          .value_or(-1.0),
+      0.0);
   for (const char* name : {"drivetrain", "shooter", "intake"}) {
     const TargetPolicy& policy = config.TargetsFor(name);
     EXPECT_EQ(policy.teleop, std::vector<std::string>{"teleop"}) << name;
@@ -366,6 +398,10 @@ TEST(ConfigTest, PoseEstimatorModuleOffsetsMatchDrivetrainGeometry) {
   EXPECT_DOUBLE_EQ(
       root.at_path("subsystems.pose_estimator.initial_yaw_rad").value_or(-1.0),
       0.0);
+  EXPECT_DOUBLE_EQ(
+      root.at_path("subsystems.pose_estimator.max_yaw_innovation_rad")
+          .value_or(-1.0),
+      0.2618);
   const auto* cameras =
       root.at_path("subsystems.pose_estimator.cameras").as_array();
   ASSERT_NE(cameras, nullptr);
@@ -374,14 +410,48 @@ TEST(ConfigTest, PoseEstimatorModuleOffsetsMatchDrivetrainGeometry) {
     const auto name = camera.value_or(std::string{});
     EXPECT_NE(name.find("_camera"), std::string::npos);
     EXPECT_EQ(root.at_path("subsystems." + name + ".period_us").value_or(0),
-              50000);
+              10000);
     EXPECT_TRUE(
         root.at_path("subsystems." + name + ".rasterize").value_or(false));
-    for (const char* key : {"initial_x_m", "initial_y_m", "initial_yaw_rad"}) {
-      EXPECT_EQ(root.at_path("subsystems." + name + "." + key).value<double>(),
-                root.at_path(std::string{"subsystems.pose_estimator."} + key)
-                    .value<double>());
+    EXPECT_DOUBLE_EQ(
+        root.at_path("subsystems." + name + ".camera.fps").value_or(-1.0),
+        60.0);
+    for (const char* key : {"latency_offset_us", "sim_timestamp_lag_us"}) {
+      EXPECT_DOUBLE_EQ(
+          root.at_path("subsystems." + name + ".camera." + key).value_or(-1.0),
+          0.0);
     }
+    const auto detector_path = "subsystems." + name + ".detector.";
+    EXPECT_DOUBLE_EQ(root.at_path(detector_path + "decimate").value_or(-1.0),
+                     2.0);
+    EXPECT_EQ(root.at_path(detector_path + "threads").value_or(0), 2);
+    EXPECT_DOUBLE_EQ(root.at_path(detector_path + "sigma").value_or(-1.0), 0.0);
+    EXPECT_TRUE(root.at_path(detector_path + "refine_edges").value_or(false));
+    EXPECT_EQ(root.at_path(detector_path + "hamming_threshold").value_or(-1),
+              1);
+    EXPECT_DOUBLE_EQ(
+        root.at_path(detector_path + "min_decision_margin").value_or(-1.0),
+        30.0);
+    const auto recording_path = "subsystems." + name + ".recording.";
+    EXPECT_TRUE(root.at_path(recording_path + "enabled").value_or(false));
+    EXPECT_DOUBLE_EQ(root.at_path(recording_path + "sample_hz").value_or(-1.0),
+                     1.0);
+    EXPECT_DOUBLE_EQ(
+        root.at_path(recording_path + "rejected_hz").value_or(-1.0), 1.0);
+    EXPECT_EQ(root.at_path(recording_path + "max_bytes").value_or(0),
+              268435456);
+    const auto solver_path = "subsystems." + name + ".";
+    for (const auto& [key, expected] : {std::pair{"pixel_std_px", 0.33},
+                                        {"floor_z_std_m", 0.05},
+                                        {"floor_tilt_std_rad", 0.05},
+                                        {"huber_delta_px", 2.0},
+                                        {"min_xy_std_m", 0.02},
+                                        {"min_yaw_std_rad", 0.035}}) {
+      EXPECT_DOUBLE_EQ(root.at_path(solver_path + key).value_or(-1.0), expected)
+          << name << "." << key;
+    }
+    EXPECT_FALSE(root.at_path(solver_path + "base_xy_std_m"));
+    EXPECT_FALSE(root.at_path(solver_path + "base_yaw_std_rad"));
   }
   EXPECT_FALSE(root.at_path("subsystems.vision"));
   for (const char* key : {"field_length_m", "field_width_m"}) {

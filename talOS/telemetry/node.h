@@ -297,6 +297,11 @@ class Telemetry {
             SetValue(topic.ds_channels.fms_attached,
                      (flags & driver_station::kFmsAttached) != 0 ? 1.0 : 0.0);
           }
+          if (topic.ds_channels.alliance < dictionary_.size()) {
+            SetValue(topic.ds_channels.alliance,
+                     static_cast<double>(
+                         static_cast<std::uint8_t>(ds_data.fms.alliance)));
+          }
           if (topic.ds_channels.match_time_s < dictionary_.size()) {
             SetValue(topic.ds_channels.match_time_s,
                      static_cast<double>(ds_data.fms.match_time_s));
@@ -364,6 +369,7 @@ class Telemetry {
     std::size_t test{std::numeric_limits<std::size_t>::max()};
     std::size_t estop{std::numeric_limits<std::size_t>::max()};
     std::size_t fms_attached{std::numeric_limits<std::size_t>::max()};
+    std::size_t alliance{std::numeric_limits<std::size_t>::max()};
     std::size_t match_time_s{std::numeric_limits<std::size_t>::max()};
   };
 
@@ -424,7 +430,8 @@ class Telemetry {
           for (const auto index :
                {channels.connected, channels.enabled, channels.autonomous,
                 channels.teleop, channels.test, channels.estop,
-                channels.fms_attached, channels.match_time_s}) {
+                channels.fms_attached, channels.alliance,
+                channels.match_time_s}) {
             if (index < dictionary_.size()) ++counts[topic.name];
           }
         } else {
@@ -605,6 +612,8 @@ class Telemetry {
     topic.ds_channels.estop = AddChannel("hw/state/driver_station/estop");
     topic.ds_channels.fms_attached =
         AddChannel("hw/state/driver_station/fms_attached");
+    topic.ds_channels.alliance = AddChannel("hw/state/driver_station/alliance",
+                                            "", {"unknown", "red", "blue"});
     topic.ds_channels.match_time_s =
         AddChannel("hw/state/driver_station/match_time_s", "s");
 

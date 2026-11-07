@@ -30,9 +30,9 @@ class Drivetrain {
         geometry_{LoadSwerveGeometry(node)},
         kinematics_{geometry_},
         gyro_{node, "drivetrain_imu"},
-        // A simulated Pigeon reads a valid, permanently zero yaw, so under
-        // --sim the heading integrates the rotation the modules measure. Off
-        // on a robot: an integrated heading drifts with no absolute reference.
+        // WPILib/ideal sims report a permanently zero Pigeon yaw, so --sim
+        // defaults to module-integrated heading. robot_physics_sim.toml sets
+        // this false to use the physics gateway's modeled Pigeon (and drift).
         integrate_heading_{
             node.param<bool>("integrate_heading", node.simulation())},
         max_linear_accel_mps2_{

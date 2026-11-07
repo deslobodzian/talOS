@@ -65,6 +65,8 @@ struct NodeSpec {
   std::string name;
   std::string target;  // e.g. "//2026-robot/main_processor/drivetrain:node"
   std::string binary_path;
+  // Forwarded unchanged to both --describe and runtime.
+  std::vector<std::string> extra_args;
 };
 
 struct NodeProcessInfo {
@@ -147,6 +149,7 @@ struct LauncherOptions {
   bool simulation{false};
   int duration_s{0};
   bool start_sim_gateway{false};
+  std::vector<std::string> sim_gateway_args;
   // Sim sessions only: run the Studio viewer bridge as a supervised member of
   // the session (see "Studio bridge" below and [studio] in the robot config).
   bool start_studio_bridge{false};
@@ -354,6 +357,7 @@ inline NodeSpec MakeNodeSpec(std::string_view name, const std::string& target,
     auto it = options.binary_overrides.find(spec.name);
     if (it != options.binary_overrides.end()) spec.binary_path = it->second;
   }
+  if (name == kSimGatewayName) spec.extra_args = options.sim_gateway_args;
   return spec;
 }
 
@@ -645,6 +649,7 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
                                   options.config_path};
     if (options.simulation) args.push_back("--sim");
     if (!graph_path.empty()) args.insert(args.end(), {"--graph", graph_path});
+    args.insert(args.end(), spec.extra_args.begin(), spec.extra_args.end());
     described.answered =
         ProbeDescribe(spec.binary_path, args,
                       std::chrono::milliseconds{options.describe_timeout_ms},
@@ -1110,6 +1115,10 @@ class Launcher {
   // Returns 0, or the last nonzero exit code of a node. With --replay-inputs
   // it runs only the --only node, on recorded topics (RunOnRecordedInputs).
   int Run() {
+    if (!options_.sim_gateway_args.empty() && !options_.start_sim_gateway) {
+      std::cerr << "launcher: --sim-gateway-arg requires --start-sim-gateway\n";
+      return 1;
+    }
     std::string bundle_error;
     if (!LoadBundle(options_, bundle_error)) {
       std::cerr << "launcher: " << bundle_error << "\n";
@@ -1280,7 +1289,9 @@ class Launcher {
       if (proc.name == kSimGatewayName) {
         // The gateway stamps the config's config_id; unconfigured it stamps
         // 0, which every mechanism rejects.
-        args.insert(args.end(), {"--config", options_.config_path});
+        args.insert(args.end(),
+                    {"--config", options_.config_path, "--session-id",
+                     std::to_string(options_.session_id)});
       } else {
         args.insert(args.end(), {"--session-id",
                                  std::to_string(options_.session_id), "--log"});
@@ -1298,6 +1309,8 @@ class Launcher {
                                    std::to_string(local_port)});
         }
       }
+      args.insert(args.end(), node_specs[i].extra_args.begin(),
+                  node_specs[i].extra_args.end());
       if (options_.duration_s > 0) {
         args.insert(args.end(),
                     {"--duration-s", std::to_string(options_.duration_s)});

@@ -1,6 +1,17 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("//talOS/build:contract.bzl", "talos_cc_node")
+load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
+
+# AutonomousState (namespace autonomous) and the autonomous node's topic. The
+# telemetry node consumes /autonomous/state and forwards the phase enum as the
+# `autonomous/state/phase` channel.
+talos_messages(
+    name = "messages",
+    srcs = ["autonomous_message.fbs"],
+    topics = {
+        "state": "/autonomous/state",
+    },
+)
 
 cc_library(
     name = "autonomous",
@@ -11,6 +22,7 @@ cc_library(
     include_prefix = "autonomous",
     strip_include_prefix = ".",
     deps = [
+        ":messages",
         "//2026-robot/main_processor/drivetrain:messages",
         "//2026-robot/main_processor/intake:messages",
         "//2026-robot/main_processor/shooter:messages",

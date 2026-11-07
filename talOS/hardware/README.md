@@ -221,7 +221,7 @@ or without a live command. On the real backend, neutral disables PWM pulses
 | Neutral | Velocity snaps to 0 | Unpowered decay: brake stops fast, coast rolls on |
 | Gearing/inversion | Ignored | Rotor/gearing division, inversion flips direction |
 | Soft limits | Ignored | Clamped, axis stopped at the limit |
-| Pigeon yaw | Zero | Integrates named swerve drive/steer motion or explicit `SetChassisYawRate` |
+| Pigeon yaw | Zero | True chassis yaw relative to boot, plus optional drift; explicit gyro overrides remain available |
 | Supply voltage | Ignored | Scales free speed (`SetSupplyVoltage`) |
 | Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback, per-device disconnect, controller restart |
 
@@ -229,3 +229,44 @@ Tests live in `sim_physics_test.cc`. The standalone `sim_gateway` runs the
 ideal backend by default and the physics backend with `--physics` (see
 `2026-robot/main_processor/simulation/README.md`). The RoboRIO desktop model
 keeps its own first-order Kraken model (same 100 rps at 12 V family).
+
+### Ground truth and odometry error
+
+`PhysicsSimBackend::truth()` exposes true planar field pose (meters/radians)
+and field-frame velocity (m/s, rad/s). Each step converts every registered
+swerve wheel's surface velocity and steer azimuth into ground velocity, solves
+the rigid-body least-squares chassis motion, and integrates the field pose.
+Conventional `front`/`back` (`rear`), `left`/`right` drive/steer names infer
+module coordinates at ±0.30 m; `SetSwerveModuleGeometry` registers other names
+or dimensions. No gyro is required to compute truth.
+
+`sim::PhysicsOptions` selects the start pose and three deterministic errors
+(all errors default to zero):
+
+- `wheel_radius_error_frac = e`: true radius is `0.0508 × (1 + e)` m.
+  Rotor/encoder readings still measure wheel rotation faithfully; only ground
+  travel changes, so odometry using the nominal radius drifts.
+- `wheel_slip_gain = g`: each module's slip fraction is
+  `min(1, g × abs(surface_acceleration_mps2) / 9.80665)`; ground speed is
+  surface speed times `1 − slip`. Constant wheel speed has no slip.
+  This deliberately simplified model only reduces travel during acceleration
+  **and braking**; odometry over-reports travel in either case. There is no RNG.
+- `gyro_drift_radps = d`: reported gyro yaw gains `d × elapsed_seconds`, and
+  reported yaw rate gains `d`. Neither changes physical truth.
+
+Pigeon yaw is relative to its boot heading (zero initially even for a nonzero
+true start yaw), then mounting offset/inversion apply as usual.
+`RestartController` preserves the true field pose, resets reported gyro yaw
+and drift elapsed time, clears rotor motion/commands/faults as before, and
+leaves config/output states intact. `SetGyro`/`SetChassisYawRate` override only
+the reported gyro until configuration or controller restart, without
+teleporting the robot or changing its module-derived ground motion.
+
+Only `sim_gateway --physics` publishes truth on `/sim/state`
+(`geometry.OdometrySample`) each hardware tick. It uses the main-processor node
+clock, blue-alliance field coordinates (x downfield, y left, yaw CCW+), and
+field-frame velocity. Its default start pose is `2,2,0`; the backend's default
+start pose for tests is `0,0,0`. Ideal simulation and WPILib/RoboRIO simulation
+publish no truth, so simulated cameras there produce invalid observations.
+The estimator's independent initial pose is not moved to match the gateway.
+

@@ -63,28 +63,19 @@ struct RenderScratch {
   std::vector<SimTagDetection> start;
   std::vector<SimTagDetection> end;
   std::vector<uint8_t> instant;
+  std::vector<cv::Rect> regions;
   cv::Mat accumulated;
   cv::Mat sensor_noise;
   cv::Mat exposed;
 };
 
-// Renders every projectable layout tag with a known pattern into gray_out
-// (resized to w*h, row-major, stride w). Tags without a pattern entry are
-// skipped. Returns the number of tags rasterized.
-inline int RenderInstantaneousFieldView(
-    const FieldLayout& layout, const std::map<int, TagPattern>& patterns,
-    const SimCameraView& cam, const talos::geometry::SE3<double>& T_field_robot,
-    double tag_size_m, const SimRenderOptions& options,
-    std::vector<uint8_t>* gray_out, std::vector<SimTagDetection>* detections) {
-  if (gray_out == nullptr) return 0;
-  const int w = static_cast<int>(cam.intrinsics.image_width);
-  const int h = static_cast<int>(cam.intrinsics.image_height);
-  if (w <= 0 || h <= 0 || !(tag_size_m > 0.0)) return 0;
-  gray_out->assign(static_cast<size_t>(w) * h, options.background_gray);
-  // Header over the caller's buffer: fills write in place, no copy.
-  cv::Mat img(h, w, CV_8UC1, gray_out->data());
-
-  SimulateVisibleTags(layout, cam, T_field_robot, tag_size_m, detections, true);
+// Paint projected tags without initializing the background. Exposure
+// integration clears only its active regions; the static renderer clears the
+// whole frame.
+inline int RasterizeProjectedTags(const std::map<int, TagPattern>& patterns,
+                                  const SimCameraView& cam, double tag_size_m,
+                                  const SimRenderOptions& options, cv::Mat& img,
+                                  std::vector<SimTagDetection>* detections) {
   auto& dets = *detections;
   std::sort(dets.begin(), dets.end(), [](const auto& a, const auto& b) {
     return a.T_camera_tag.translation().z() > b.T_camera_tag.translation().z();
@@ -95,6 +86,23 @@ inline int RenderInstantaneousFieldView(
     const auto it = patterns.find(det.tag_id);
     if (it == patterns.end()) continue;
     const TagPattern& pattern = it->second;
+    // Adjacent cells share vertices: project each lattice point once instead
+    // of repeating four SE(3)/distortion evaluations for every one of 100
+    // cells.
+    std::array<cv::Point, 121> vertices;
+    std::array<bool, 121> valid;
+    for (int row = 0; row <= 10; ++row) {
+      for (int col = 0; col <= 10; ++col) {
+        const auto index = row * 11 + col;
+        const Eigen::Vector3d corner{0, (-1.25 + col * 0.25) * half_m,
+                                     (1.25 - row * 0.25) * half_m};
+        Eigen::Vector2d pixel;
+        valid[index] =
+            cam.intrinsics.ProjectPoint(det.T_camera_tag.act(corner), &pixel);
+        if (valid[index])
+          vertices[index] = {cvRound(pixel.x()), cvRound(pixel.y())};
+      }
+    }
     for (int gr = 0; gr < 10; ++gr) {
       for (int gc = 0; gc < 10; ++gc) {
         uint8_t color;
@@ -112,42 +120,108 @@ inline int RenderInstantaneousFieldView(
           // a data bit, so this also covers any non-bit interior cell.)
           color = options.black_gray;
         }
-        // Cell corners in tag-frame meters (grid spans ±1.25 tag units in
-        // the y/z plane, x=0). Row 0 at the TOP (+Z); column 0 at the LEFT
-        // as seen facing the tag face (-Y side: a viewer on the +X side
-        // looks back along -X, so screen-right is +Y and the left edge
-        // starts at -1.25). Matches the detector's bit sampling through
-        // the fitted quad — pinned by the render-to-detect round trip).
-        const double y_lo = -1.25 + gc * 0.25;
-        const double z_top = 1.25 - gr * 0.25;
-        const Eigen::Vector3d corners_m[4] = {
-            {0.0, y_lo * half_m, z_top * half_m},
-            {0.0, (y_lo + 0.25) * half_m, z_top * half_m},
-            {0.0, (y_lo + 0.25) * half_m, (z_top - 0.25) * half_m},
-            {0.0, y_lo * half_m, (z_top - 0.25) * half_m}};
-        Eigen::Vector2d px[4];
-        bool ok = true;
-        for (int i = 0; i < 4; ++i) {
-          if (!cam.intrinsics.ProjectPoint(det.T_camera_tag.act(corners_m[i]),
-                                           &px[i])) {
-            ok = false;
-            break;
-          }
-        }
-        if (!ok) continue;
-        // fillConvexPoly takes integer points; rounding matches the old
-        // scanline filler's pixel coverage to the pixel.
+        // The lattice spans ±1.25 tag units in the tag's y/z plane:
+        // row zero is top (+Z), column zero is left (-Y as seen by the lens).
+        const int index = gr * 11 + gc;
+        if (!valid[index] || !valid[index + 1] || !valid[index + 12] ||
+            !valid[index + 11])
+          continue;
         const std::array<cv::Point, 4> poly = {
-            {{cvRound(px[0].x()), cvRound(px[0].y())},
-             {cvRound(px[1].x()), cvRound(px[1].y())},
-             {cvRound(px[2].x()), cvRound(px[2].y())},
-             {cvRound(px[3].x()), cvRound(px[3].y())}}};
+            vertices[index], vertices[index + 1], vertices[index + 12],
+            vertices[index + 11]};
         cv::fillConvexPoly(img, poly.data(), 4, cv::Scalar(color));
       }
     }
     ++painted;
   }
   return painted;
+}
+
+// Renders every projectable layout tag with a known pattern into gray_out
+// (resized to w*h, row-major, stride w). Returns the number of tags rasterized.
+inline int RenderInstantaneousFieldView(
+    const FieldLayout& layout, const std::map<int, TagPattern>& patterns,
+    const SimCameraView& cam, const talos::geometry::SE3<double>& T_field_robot,
+    double tag_size_m, const SimRenderOptions& options,
+    std::vector<uint8_t>* gray_out, std::vector<SimTagDetection>* detections) {
+  if (gray_out == nullptr) return 0;
+  const int w = static_cast<int>(cam.intrinsics.image_width);
+  const int h = static_cast<int>(cam.intrinsics.image_height);
+  if (w <= 0 || h <= 0 || !(tag_size_m > 0.0)) return 0;
+  gray_out->assign(static_cast<size_t>(w) * h, options.background_gray);
+  cv::Mat image(h, w, CV_8UC1, gray_out->data());
+  SimulateVisibleTags(layout, cam, T_field_robot, tag_size_m, detections, true);
+  return RasterizeProjectedTags(patterns, cam, tag_size_m, options, image,
+                                detections);
+}
+
+// Maintain disjoint rectangles covering the union. Overlapping rectangles
+// merge, so a pixel shared by two tags is accumulated exactly once per sample.
+inline void IncludeExposureRegion(cv::Rect region,
+                                  std::vector<cv::Rect>* regions) {
+  if (region.empty()) return;
+  for (std::size_t i = 0; i < regions->size();) {
+    if ((region & (*regions)[i]).empty()) {
+      ++i;
+    } else {
+      region |= (*regions)[i];
+      (*regions)[i] = regions->back();
+      regions->pop_back();
+      i = 0;
+    }
+  }
+  regions->push_back(region);
+}
+
+inline void IncludeExposureTags(const std::vector<SimTagDetection>& detections,
+                                const std::map<int, TagPattern>& patterns,
+                                const SimCameraView& cam, double tag_size_m,
+                                std::vector<cv::Rect>* regions) {
+  // The fitted quad excludes the white quiet zone, which extends to 1.25
+  // times its size. Project that margin rather than scaling a perspective bbox.
+  const auto corners = GetTagModelCorners(tag_size_m * 1.25);
+  for (const auto& detection : detections) {
+    if (!patterns.contains(detection.tag_id)) continue;
+    double xmin = cam.intrinsics.image_width,
+           ymin = cam.intrinsics.image_height;
+    double xmax = 0, ymax = 0;
+    bool projected = true;
+    for (const auto& corner : corners) {
+      Eigen::Vector2d pixel;
+      if (!cam.intrinsics.ProjectPoint(detection.T_camera_tag.act(corner),
+                                       &pixel)) {
+        projected = false;
+        break;
+      }
+      xmin = std::min(xmin, pixel.x());
+      xmax = std::max(xmax, pixel.x());
+      ymin = std::min(ymin, pixel.y());
+      ymax = std::max(ymax, pixel.y());
+    }
+    // A quiet-zone corner can cross the near plane while inner cells still
+    // project. In that degenerate case the tag may cover the whole image.
+    if (!projected) {
+      IncludeExposureRegion(cv::Rect(0, 0, cam.intrinsics.image_width,
+                                     cam.intrinsics.image_height),
+                            regions);
+      continue;
+    }
+    // Cover integer polygon rounding and the rasterizer's boundary pixels.
+    const int left = static_cast<int>(
+        std::clamp(std::floor(xmin) - 2, 0.0,
+                   static_cast<double>(cam.intrinsics.image_width)));
+    const int top = static_cast<int>(
+        std::clamp(std::floor(ymin) - 2, 0.0,
+                   static_cast<double>(cam.intrinsics.image_height)));
+    const int right = static_cast<int>(
+        std::clamp(std::ceil(xmax) + 3, 0.0,
+                   static_cast<double>(cam.intrinsics.image_width)));
+    const int bottom = static_cast<int>(
+        std::clamp(std::ceil(ymax) + 3, 0.0,
+                   static_cast<double>(cam.intrinsics.image_height)));
+    IncludeExposureRegion(cv::Rect(left, top, right - left, bottom - top),
+                          regions);
+  }
 }
 
 // Integrate a global-shutter exposure centered on T_field_robot. Translation
@@ -212,27 +286,44 @@ inline int RenderFieldView(
     } else {
       const int samples = static_cast<int>(
           std::clamp(std::ceil(displacement_px * 2.0), 2.0, 64.0));
+      auto& regions = scratch->regions;
+      regions.clear();
+      IncludeExposureTags(scratch->start, patterns, cam, tag_size_m, &regions);
+      IncludeExposureTags(scratch->end, patterns, cam, tag_size_m, &regions);
       auto& instant = scratch->instant;
+      instant.resize(static_cast<size_t>(cam.intrinsics.image_height) *
+                     cam.intrinsics.image_width);
+      cv::Mat sample_image(cam.intrinsics.image_height,
+                           cam.intrinsics.image_width, CV_8UC1, instant.data());
       auto& accumulated = scratch->accumulated;
-      accumulated.create(cam.intrinsics.image_height,
-                         cam.intrinsics.image_width, CV_32FC1);
+      accumulated.create(sample_image.size(), CV_32FC1);
       accumulated.setTo(0);
       for (int sample = 0; sample < samples; ++sample) {
         const double time = ((sample + 0.5) / samples - 0.5) * exposure_s;
-        painted = std::max(painted,
-                           RenderInstantaneousFieldView(
-                               layout, patterns, cam, pose_at(time), tag_size_m,
-                               options, &instant, &scratch->detections));
-        const cv::Mat sample_image(cam.intrinsics.image_height,
-                                   cam.intrinsics.image_width, CV_8UC1,
-                                   instant.data());
-        cv::add(accumulated, sample_image, accumulated, cv::noArray(), CV_32F);
+        SimulateVisibleTags(layout, cam, pose_at(time), tag_size_m,
+                            &scratch->detections, true);
+        // Endpoints bound ordinary short exposures. Extend for tags entering
+        // view or curved projected trajectories, preserving exact coverage.
+        IncludeExposureTags(scratch->detections, patterns, cam, tag_size_m,
+                            &regions);
+        for (const auto& region : regions)
+          sample_image(region).setTo(options.background_gray);
+        painted = std::max(painted, RasterizeProjectedTags(
+                                        patterns, cam, tag_size_m, options,
+                                        sample_image, &scratch->detections));
+        for (const auto& region : regions) {
+          cv::Mat sum = accumulated(region);
+          cv::addWeighted(sample_image(region), 1, sum, 1,
+                          -static_cast<double>(options.background_gray), sum,
+                          CV_32F);
+        }
       }
-      gray_out->resize(static_cast<size_t>(accumulated.rows) *
-                       accumulated.cols);
-      cv::Mat output(accumulated.rows, accumulated.cols, CV_8UC1,
-                     gray_out->data());
-      accumulated.convertTo(output, CV_8U, 1.0 / samples);
+      gray_out->resize(instant.size());
+      cv::Mat output(sample_image.size(), CV_8UC1, gray_out->data());
+      // The static background contributes once; only tag-region deviations
+      // were integrated. Untouched pixels therefore remain the static frame.
+      accumulated.convertTo(output, CV_8U, 1.0 / samples,
+                            options.background_gray);
     }
   }
   // Exposure varies coherently across the frame; read noise is independent
