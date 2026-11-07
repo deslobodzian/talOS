@@ -20,6 +20,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "hardware/gateway.h"
@@ -27,6 +28,9 @@
 class PhoenixBackend final : public talos::hardware::Backend {
  public:
   explicit PhoenixBackend(bool is_simulation = false);
+
+  // Decode the cached TalonFX FaultField (SPN 0x34c, frame 0xad), without CAN IO.
+  static std::string DecodeTalonFaultBits(uint32_t fault_flags);
 
   bool Configure(const talos::hardware::Config&) override;
   bool Read(talos::hardware::State&) override;
@@ -44,6 +48,7 @@ class PhoenixBackend final : public talos::hardware::Backend {
   RestoreStatus PollRestore() override;
 
  private:
+  friend class PhoenixBackendFollowerFeedback;
   void UpdateSimulation(double dt);
 
   struct Sensor {
@@ -53,6 +58,11 @@ class PhoenixBackend final : public talos::hardware::Backend {
   talos::hardware::Config config_;
   std::vector<std::unique_ptr<ctre::phoenix6::hardware::TalonFX>> motors_;
   std::vector<Sensor> sensors_;
+  std::array<uint32_t, talos::hardware::kMaxMotors> last_fault_flags_{};
+  std::array<bool, talos::hardware::kMaxMotors> last_motor_valid_{};
+  std::array<bool, talos::hardware::kMaxSensors> last_sensor_valid_{};
+  uint32_t last_motor_fault_mask_{0};
+  bool last_brownout_{false};
   std::vector<ctre::phoenix6::BaseStatusSignal*> signals_;
   std::vector<std::unique_ptr<frc::DigitalInput>> digital_inputs_;
   std::vector<std::unique_ptr<frc::DigitalOutput>> digital_outputs_;

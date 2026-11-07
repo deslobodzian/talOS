@@ -55,6 +55,18 @@ void ObserveMode() {
   }
 }
 
+uint32_t DriverStationModeFlags() {
+  namespace ds = talos::driver_station;
+  uint32_t flags = 0;
+  if (frc::DriverStation::IsDSAttached()) flags |= ds::kDsAttached;
+  if (frc::DriverStation::IsEnabled()) flags |= ds::kEnabled;
+  if (frc::DriverStation::IsAutonomous()) flags |= ds::kAutonomous;
+  if (frc::DriverStation::IsTeleop()) flags |= ds::kTeleop;
+  if (frc::DriverStation::IsTest()) flags |= ds::kTest;
+  if (frc::DriverStation::IsEStopped()) flags |= ds::kEStop;
+  return flags;
+}
+
 #ifndef __FRC_ROBORIO__
 // An automated stand-in for the Driver Station, for tests that run this program
 // headless. It is off unless TALOS_SIM_DS is set, so an interactive
@@ -214,8 +226,8 @@ void Robot::StartCompetition() {
 
   std::array<uint8_t, talos::protocol::kMaxPayloadSize> ds_buffer{};
   uint64_t last_ds_sample_us = 0;
-  // Stamps each packet's mode generation, real Driver Station or the
-  // desktop SimDriverStation alike: both are read back through WPILib.
+  // Observe every hardware tick, including transitions between DS packets.
+  // Real and desktop Driver Stations are both read back through WPILib.
   talos::driver_station::ModeTracker ds_mode;
 
   while (running_.load(std::memory_order_relaxed)) {
@@ -237,9 +249,12 @@ void Robot::StartCompetition() {
     ObserveMode();
 
     const uint64_t now_us = NowUs();
+    const uint32_t mode_flags = DriverStationModeFlags();
+    ds_mode.Observe(mode_flags, now_us);
     if (endpoint_) {
-      endpoint_->Tick(now_us, frc::DriverStation::IsEnabled() &&
-                                  !frc::DriverStation::IsEStopped());
+      endpoint_->Tick(
+          now_us, (mode_flags & talos::driver_station::kEnabled) != 0 &&
+                      (mode_flags & talos::driver_station::kEStop) == 0);
 
       // The Driver Station only produces new data at 50 Hz, so sampling it on
       // every hardware tick would put three duplicate packets on the link, and

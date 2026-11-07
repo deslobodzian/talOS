@@ -11,7 +11,10 @@
 #include <ctre/phoenix6/controls/PositionVoltage.hpp>
 #include <ctre/phoenix6/controls/VelocityVoltage.hpp>
 #include <ctre/phoenix6/controls/VoltageOut.hpp>
+#include <iomanip>
+#include <iostream>
 #include <limits>
+#include <string>
 
 namespace ph = ctre::phoenix6;
 namespace hw = talos::hardware;
@@ -35,11 +38,30 @@ bool Fresh(const ph::BaseStatusSignal& signal) {
   return signal.GetStatus().IsOK() &&
          signal.GetTimestamp().GetLatency() < 50_ms;
 }
+template <typename Position, typename Velocity>
+bool ValidMotionFeedback(const Position& position, const Velocity& velocity) {
+  return Fresh(position) && Fresh(velocity) &&
+         std::isfinite(position.GetValue().value()) &&
+         std::isfinite(velocity.GetValue().value());
+}
 uint32_t Age(const ph::BaseStatusSignal& signal) {
   const double age = signal.GetTimestamp().GetLatency().value() * 1e6;
   if (!std::isfinite(age) || age >= std::numeric_limits<uint32_t>::max())
     return std::numeric_limits<uint32_t>::max();
   return static_cast<uint32_t>(std::max(0.0, std::ceil(age)));
+}
+
+void LogFeedbackChange(const char* kind, const std::string& name, uint16_t id,
+                       const std::string& bus, int can_id, bool valid,
+                       const ph::BaseStatusSignal& p,
+                       const ph::BaseStatusSignal& v) {
+  std::cerr << "[phoenix] " << kind << " " << name << " (id=" << id
+            << ", bus=" << bus << ", can_id=" << can_id << ") feedback "
+            << (valid ? "RECOVERED" : "INVALID/STALE")
+            << " (position_status=" << p.GetStatus().GetName()
+            << ", velocity_status=" << v.GetStatus().GetName()
+            << ", position_age_us=" << Age(p) << ", velocity_age_us=" << Age(v)
+            << ")\n";
 }
 
 // A config apply or a signal-rate change can miss its reply window while a
@@ -59,6 +81,51 @@ ctre::phoenix::StatusCode Retry(Call call) {
 PhoenixBackend::PhoenixBackend(bool is_simulation)
     : is_simulation_{is_simulation} {}
 
+std::string PhoenixBackend::DecodeTalonFaultBits(uint32_t fault_flags) {
+  if (fault_flags == 0) return "none";
+  // Phoenix 6 TalonFX FaultField, SPN 0x34c / CAN frame 0xad.
+  static constexpr std::array<const char*, 32> names{
+      "Hardware (hardware fault occurred)",
+      "ProcTemp (processor temperature exceeded limit)",
+      "DeviceTemp (device temperature exceeded limit)",
+      "Undervoltage (supply voltage near brownout)",
+      "BootDuringEnable (booted while enabled)",
+      "UnlicensedFeatureInUse (unlicensed feature in use)",
+      "StaticBrakeDisabled (static brake momentarily disabled)",
+      "UsingFusedCANcoderWhileUnlicensed (fused CANcoder requires Pro)",
+      "SupplyCurrLimit (supply current limit active)",
+      "StatorCurrLimit (stator current limit active)",
+      "FusedSensorOutOfSync (remote fused sensor out of sync)",
+      "RemoteSensorDataInvalid (remote sensor data invalid)",
+      "MissingHardLimitRemote (remote hard limit device missing)",
+      "MissingSoftLimitRemote (remote soft limit device missing)",
+      "ForwardSoftLimit (forward soft limit asserted)",
+      "ReverseSoftLimit (reverse soft limit asserted)",
+      "ForwardHardLimit (forward hard limit asserted)",
+      "ReverseHardLimit (reverse hard limit asserted)",
+      "OverSupplyV (supply voltage exceeded rating)",
+      "UnstableSupplyV (supply voltage unstable)",
+      "RemoteSensorPosOverflow (remote sensor position overflowed)",
+      "MissingDifferentialFX (differential TalonFX missing)",
+      "RemoteSensorReset (remote sensor reset)",
+      "BridgeBrownout (bridge disabled due to supply voltage)",
+      nullptr,
+      "RotorFault1 (rotor fault 1)",
+      "RotorFault2 (rotor fault 2)",
+      nullptr, nullptr, nullptr, nullptr, nullptr};
+  std::string faults;
+  for (unsigned bit = 0; bit < names.size(); ++bit) {
+    if ((fault_flags & (uint32_t{1} << bit)) == 0) continue;
+    if (!faults.empty()) faults += ", ";
+    if (names[bit]) {
+      faults += names[bit];
+    } else {
+      faults += "UnknownBit" + std::to_string(bit);
+    }
+  }
+  return faults;
+}
+
 std::optional<hw::ConfigError> PhoenixBackend::last_config_error() const {
   return last_error_;
 }
@@ -67,6 +134,11 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   hw::Validate(c);
   restore_operations_.clear();
   last_error_.reset();
+  last_fault_flags_.fill(0);
+  last_motor_valid_.fill(true);
+  last_sensor_valid_.fill(true);
+  last_motor_fault_mask_ = 0;
+  last_brownout_ = false;
   // The first failed device apply wins the precise error: device
   // name, bus, CAN ID, operation, and the raw vendor status value.
   const auto note_failure = [this](const std::string& name,
@@ -289,6 +361,13 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
               .IsOK();
         });
   }
+  if (!ok && last_error_) {
+    const auto& error = *last_error_;
+    std::cerr << "[phoenix] configure failed on " << error.device_name
+              << " (bus=" << error.bus << ", can_id=" << error.can_id
+              << ", op=" << error.operation << "): " << error.message
+              << " (status=" << error.vendor_status << ")\n";
+  }
   return ok;
 }
 
@@ -297,15 +376,26 @@ bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
   reset_ids.clear();
   for (std::size_t i = 0; i < motors_.size() && i < config_.motors.size();
        ++i) {
-    if (motors_[i]->HasResetOccurred())
-      reset_ids.push_back(config_.motors[i].id);
+    if (motors_[i]->HasResetOccurred()) {
+      const auto& motor = config_.motors[i];
+      reset_ids.push_back(motor.id);
+      std::cerr << "[phoenix] device reset detected: motor " << motor.name
+                << " (id=" << motor.id << ", bus=" << motor.bus
+                << ", can_id=" << motor.can_id << ")\n";
+    }
   }
   for (std::size_t i = 0; i < sensors_.size() && i < config_.sensors.size();
        ++i) {
     const bool reset = sensors_[i].encoder
                            ? sensors_[i].encoder->HasResetOccurred()
                            : sensors_[i].imu->HasResetOccurred();
-    if (reset) reset_ids.push_back(config_.sensors[i].id);
+    if (reset) {
+      const auto& sensor = config_.sensors[i];
+      reset_ids.push_back(sensor.id);
+      std::cerr << "[phoenix] device reset detected: sensor " << sensor.name
+                << " (id=" << sensor.id << ", bus=" << sensor.bus
+                << ", can_id=" << sensor.can_id << ")\n";
+    }
   }
   return !reset_ids.empty();
 }
@@ -313,6 +403,7 @@ bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
 void PhoenixBackend::BeginRestoreAfterReset() {
   // Only immutable device configurations cross onto the worker. Device objects
   // remain stable, so cached status reads and one-shot Neutral keep running.
+  std::cerr << "[phoenix] async device restore started\n";
   restore_ = std::async(std::launch::async, [this] {
     bool ok = true;
     for (const auto& operation : restore_operations_) ok &= operation();
@@ -324,7 +415,10 @@ PhoenixBackend::RestoreStatus PhoenixBackend::PollRestore() {
   if (!restore_.valid()) return RestoreStatus::kDone;
   if (restore_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
     return RestoreStatus::kPending;
-  return restore_.get() ? RestoreStatus::kDone : RestoreStatus::kFailed;
+  const bool ok = restore_.get();
+  std::cerr << "[phoenix] async device restore "
+            << (ok ? "SUCCEEDED" : "FAILED") << "\n";
+  return ok ? RestoreStatus::kDone : RestoreStatus::kFailed;
 }
 
 bool PhoenixBackend::Read(hw::State& s) {
@@ -375,8 +469,34 @@ bool PhoenixBackend::Read(hw::State& s) {
       }
     }
     out.stator_current_a = effort_ok ? amps.GetValue().value() : 0.0;
+    if (out.fault_flags != last_fault_flags_[i]) {
+      const uint32_t prev = last_fault_flags_[i];
+      const uint32_t raised = out.fault_flags & ~prev;
+      const uint32_t cleared = prev & ~out.fault_flags;
+      std::cerr << "[phoenix] motor " << motor_config.name
+                << " (mask_bit=" << i << ", id=" << motor_config.id
+                << ", bus=" << motor_config.bus
+                << ", can_id=" << motor_config.can_id
+                << ") fault_flags=0x" << std::hex << out.fault_flags
+                << " (was 0x" << prev << ")" << std::dec;
+      if (raised != 0)
+        std::cerr << " raised=[" << DecodeTalonFaultBits(raised) << "]";
+      if (cleared != 0)
+        std::cerr << " cleared=[" << DecodeTalonFaultBits(cleared) << "]";
+      std::cerr << " active=[" << DecodeTalonFaultBits(out.fault_flags) << "]"
+                << " pos=" << out.position_rot << " rot vel=" << out.velocity_rps
+                << " rps V=" << out.voltage << "V I=" << out.stator_current_a
+                << "A (limits: supply=" << motor_config.supply_limit_a
+                << "A stator=" << motor_config.stator_limit_a << "A)\n";
+      last_fault_flags_[i] = out.fault_flags;
+    }
     out.valid = Fresh(p) && Fresh(v) && std::isfinite(out.position_rot) &&
                 std::isfinite(out.velocity_rps);
+    if (out.valid != last_motor_valid_[i]) {
+      LogFeedbackChange("motor", motor_config.name, motor_config.id,
+                        motor_config.bus, motor_config.can_id, out.valid, p, v);
+      last_motor_valid_[i] = out.valid;
+    }
     healthy |= out.valid;
     if (!out.valid) {
       out.position_rot = 0;
@@ -388,9 +508,13 @@ bool PhoenixBackend::Read(hw::State& s) {
   for (std::size_t i = 0; i < sensors_.size(); ++i) {
     auto& device = sensors_[i];
     auto& out = s.sensors[i];
+    const ph::BaseStatusSignal* position_signal;
+    const ph::BaseStatusSignal* velocity_signal;
     if (device.encoder) {
       auto& p = device.encoder->GetAbsolutePosition(false);
       auto& v = device.encoder->GetVelocity(false);
+      position_signal = &p;
+      velocity_signal = &v;
       out.position_rot = p.GetValue().value();
       out.velocity_rps = v.GetValue().value();
       out.valid = Fresh(p) && Fresh(v);
@@ -399,6 +523,8 @@ bool PhoenixBackend::Read(hw::State& s) {
     } else {
       auto& p = device.imu->GetYaw(false);
       auto& v = device.imu->GetAngularVelocityZWorld(false);
+      position_signal = &p;
+      velocity_signal = &v;
       const double sign = config_.sensors[i].inverted ? -1.0 : 1.0;
       out.position_rot = sign * p.GetValue().value() / 360.0;
       out.velocity_rps = sign * v.GetValue().value() / 360.0;
@@ -408,6 +534,13 @@ bool PhoenixBackend::Read(hw::State& s) {
     }
     out.valid &=
         std::isfinite(out.position_rot) && std::isfinite(out.velocity_rps);
+    if (out.valid != last_sensor_valid_[i]) {
+      const auto& sensor = config_.sensors[i];
+      LogFeedbackChange("sensor", sensor.name, sensor.id, sensor.bus,
+                        sensor.can_id, out.valid, *position_signal,
+                        *velocity_signal);
+      last_sensor_valid_[i] = out.valid;
+    }
     healthy |= out.valid;
     if (!out.valid) {
       out.position_rot = 0;
@@ -434,20 +567,27 @@ bool PhoenixBackend::Read(hw::State& s) {
     auto& out = s.encoders[i];
     auto& dev = rio_encoders_[i];
     if (dev.duty_cycle) {
+      const bool connected = dev.duty_cycle->IsConnected();
       const double pos = dev.duty_cycle->Get() - dev.config.offset_rot;
       double vel = 0.0;
-      const auto now = std::chrono::steady_clock::now();
-      if (dev.last_time && now > *dev.last_time) {
-        const double dt =
-            std::chrono::duration<double>(now - *dev.last_time).count();
-        if (dt > 0.0) vel = (pos - dev.last_position_rot) / dt;
+      if (connected) {
+        const auto now = std::chrono::steady_clock::now();
+        if (dev.last_time && now > *dev.last_time) {
+          const double dt =
+              std::chrono::duration<double>(now - *dev.last_time).count();
+          const double delta_rot =
+              std::remainder(pos - dev.last_position_rot, 1.0);
+          if (dt > 0.0) vel = delta_rot / dt;
+        }
+        dev.last_position_rot = pos;
+        dev.last_time = now;
+      } else {
+        dev.last_time.reset();
+        dev.last_position_rot = 0.0;
       }
-      dev.last_position_rot = pos;
-      dev.last_time = now;
       out.position_rot = pos;
       out.velocity_rps = vel;
-      out.valid = dev.duty_cycle->IsConnected() && std::isfinite(pos) &&
-                  std::isfinite(vel);
+      out.valid = connected && std::isfinite(pos) && std::isfinite(vel);
       out.age_us = 0;
     } else {
       const double pos = dev.quadrature->GetDistance() - dev.config.offset_rot;
@@ -469,6 +609,32 @@ bool PhoenixBackend::Read(hw::State& s) {
     auto& out = s.pwm_outputs[i];
     out.output = pwm_outputs_[i]->GetSpeed();
     out.valid = true;
+  }
+  uint32_t motor_fault_mask = 0;
+  for (std::size_t i = 0; i < motors_.size(); ++i) {
+    if (s.motors[i].fault_flags != 0) motor_fault_mask |= uint32_t{1} << i;
+  }
+  if (motor_fault_mask != last_motor_fault_mask_) {
+    std::cerr << "[phoenix] motor_fault_mask changed: 0x" << std::hex
+              << last_motor_fault_mask_ << " -> 0x" << motor_fault_mask
+              << std::dec << " (active motors: ";
+    bool first = true;
+    for (std::size_t i = 0; i < motors_.size(); ++i) {
+      if (s.motors[i].fault_flags == 0) continue;
+      if (!first) std::cerr << ", ";
+      const auto& motor = config_.motors[i];
+      std::cerr << i << ":" << motor.name << "(" << motor.can_id << ")";
+      first = false;
+    }
+    if (first) std::cerr << "none";
+    std::cerr << ")\n";
+    last_motor_fault_mask_ = motor_fault_mask;
+  }
+  if (s.health.brownout != last_brownout_) {
+    std::cerr << "[phoenix] power brownout "
+              << (s.health.brownout ? "ACTIVE" : "CLEARED")
+              << " (battery_v=" << s.health.battery_v << "V)\n";
+    last_brownout_ = s.health.brownout;
   }
   return healthy;
 }
@@ -496,10 +662,23 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
           static_cast<std::size_t>(master - config_.motors.begin());
       auto& position = motors_[master_index]->GetPosition(false);
       auto& velocity = motors_[master_index]->GetVelocity(false);
+      bool feedback_valid =
+          ValidMotionFeedback(m.GetPosition(false), m.GetVelocity(false));
+      if (config.feedback == hw::Feedback::kRemoteCANcoder) {
+        bool sensor_valid = false;
+        for (std::size_t j = 0; j < config_.sensors.size(); ++j) {
+          if (config_.sensors[j].id == config.feedback_sensor_id &&
+              sensors_[j].encoder) {
+            sensor_valid = ValidMotionFeedback(
+                sensors_[j].encoder->GetAbsolutePosition(false),
+                sensors_[j].encoder->GetVelocity(false));
+            break;
+          }
+        }
+        feedback_valid &= sensor_valid;
+      }
       if (commands[master_index].mode == hw::Mode::kNeutral ||
-          !Fresh(position) || !Fresh(velocity) ||
-          !std::isfinite(position.GetValue().value()) ||
-          !std::isfinite(velocity.GetValue().value())) {
+          !ValidMotionFeedback(position, velocity) || !feedback_valid) {
         result = m.SetControl(ph::controls::NeutralOut{});
       } else {
         result = m.SetControl(
@@ -508,6 +687,9 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
       }
       if (!result.IsOK()) {
         Neutral();
+        std::cerr << "[phoenix] apply control failed on motor " << config.name
+                  << " (can_id=" << config.can_id << "): " << result.GetName()
+                  << "\n";
         return false;
       }
       continue;
@@ -555,6 +737,9 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
     }
     if (!result.IsOK()) {
       Neutral();
+      std::cerr << "[phoenix] apply control failed on motor " << config.name
+                << " (can_id=" << config.can_id << "): " << result.GetName()
+                << "\n";
       return false;
     }
   }

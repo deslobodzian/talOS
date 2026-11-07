@@ -17,6 +17,7 @@
 #include <cmath>
 #include <span>
 #include <thread>
+#include <tuple>
 
 #include "hardware/gateway.h"
 
@@ -108,6 +109,83 @@ hw::MotorRequest Request(uint16_t id, hw::Mode mode, double demand) {
 }
 
 }  // namespace
+
+TEST(PhoenixBackendFaults, ZeroFlagsDecodeAsNone) {
+  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(0), "none");
+}
+
+TEST(PhoenixBackendFaults, SupplyCurrentLimitUsesBitEight) {
+  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(0x100),
+            "SupplyCurrLimit (supply current limit active)");
+}
+
+TEST(PhoenixBackendFaults, StatorCurrentLimitUsesBitNine) {
+  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(0x200),
+            "StatorCurrLimit (stator current limit active)");
+}
+
+TEST(PhoenixBackendFaults, ConcurrentCurrentLimitsAreBothDecoded) {
+  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(0x300),
+            "SupplyCurrLimit (supply current limit active), "
+            "StatorCurrLimit (stator current limit active)");
+}
+
+TEST(PhoenixBackendFaults, HardwareUsesBitZero) {
+  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(0x1),
+            "Hardware (hardware fault occurred)");
+}
+
+TEST(PhoenixBackendFaults, UndervoltageUsesBitThree) {
+  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(0x8),
+            "Undervoltage (supply voltage near brownout)");
+}
+
+TEST(PhoenixBackendFaults, UnknownHighBitsRetainTheirBitIndices) {
+  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(uint32_t{1} << 31),
+            "UnknownBit31");
+  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(
+                (uint32_t{1} << 24) | (uint32_t{1} << 27) | (uint32_t{1} << 31)),
+            "UnknownBit24, UnknownBit27, UnknownBit31");
+  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(
+                (uint32_t{1} << 31) | 0x100),
+            "SupplyCurrLimit (supply current limit active), UnknownBit31");
+}
+
+TEST(PhoenixBackendFaults, EveryKnownFaultUsesItsFaultFieldBit) {
+  static constexpr std::array<const char*, 27> expected{
+      "Hardware (hardware fault occurred)",
+      "ProcTemp (processor temperature exceeded limit)",
+      "DeviceTemp (device temperature exceeded limit)",
+      "Undervoltage (supply voltage near brownout)",
+      "BootDuringEnable (booted while enabled)",
+      "UnlicensedFeatureInUse (unlicensed feature in use)",
+      "StaticBrakeDisabled (static brake momentarily disabled)",
+      "UsingFusedCANcoderWhileUnlicensed (fused CANcoder requires Pro)",
+      "SupplyCurrLimit (supply current limit active)",
+      "StatorCurrLimit (stator current limit active)",
+      "FusedSensorOutOfSync (remote fused sensor out of sync)",
+      "RemoteSensorDataInvalid (remote sensor data invalid)",
+      "MissingHardLimitRemote (remote hard limit device missing)",
+      "MissingSoftLimitRemote (remote soft limit device missing)",
+      "ForwardSoftLimit (forward soft limit asserted)",
+      "ReverseSoftLimit (reverse soft limit asserted)",
+      "ForwardHardLimit (forward hard limit asserted)",
+      "ReverseHardLimit (reverse hard limit asserted)",
+      "OverSupplyV (supply voltage exceeded rating)",
+      "UnstableSupplyV (supply voltage unstable)",
+      "RemoteSensorPosOverflow (remote sensor position overflowed)",
+      "MissingDifferentialFX (differential TalonFX missing)",
+      "RemoteSensorReset (remote sensor reset)",
+      "BridgeBrownout (bridge disabled due to supply voltage)",
+      "UnknownBit24",
+      "RotorFault1 (rotor fault 1)",
+      "RotorFault2 (rotor fault 2)"};
+  for (unsigned bit = 0; bit < expected.size(); ++bit) {
+    SCOPED_TRACE(bit);
+    EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(uint32_t{1} << bit),
+              expected[bit]);
+  }
+}
 
 TEST(PhoenixBackendPigeon, MountYawConfiguredAndInversionFlipsReadYaw) {
   EnsureHal();
@@ -203,6 +281,52 @@ TEST(PhoenixBackendEncoders, DutyCycleReportsOffsetCorrectedPosition) {
   ASSERT_TRUE(backend.Read(s));
   EXPECT_TRUE(s.encoders[0].valid);
   EXPECT_DOUBLE_EQ(s.encoders[0].velocity_rps, 0.0);
+}
+
+TEST(PhoenixBackendEncoders, DutyCycleVelocityWrapsAndReconnectStartsAtRest) {
+  EnsureHal();
+  hw::Config config;
+  config.motors.push_back(TestMotor(1, "m1", 1));
+  config.encoders.push_back(DutyEncoder(11, "duty", 2, 0.125));
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  frc::sim::DutyCycleEncoderSim sim(2);
+  sim.SetConnected(true);
+  sim.Set(0.99);
+  hw::State state{};
+  const auto before_first = std::chrono::steady_clock::now();
+  ASSERT_TRUE(backend.Read(state));
+  const auto after_first = std::chrono::steady_clock::now();
+  ASSERT_TRUE(state.encoders[0].valid);
+  EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  sim.Set(0.01);
+  const auto before_second = std::chrono::steady_clock::now();
+  ASSERT_TRUE(backend.Read(state));
+  const auto after_second = std::chrono::steady_clock::now();
+  ASSERT_TRUE(state.encoders[0].valid);
+  // The read timestamps lie inside these intervals. Across the rollover the
+  // displacement is +0.02 rotations, not -0.98.
+  const double min_dt =
+      std::chrono::duration<double>(before_second - after_first).count();
+  const double max_dt =
+      std::chrono::duration<double>(after_second - before_first).count();
+  ASSERT_GT(min_dt, 0.0);
+  EXPECT_GE(state.encoders[0].velocity_rps, 0.02 / max_dt - 1e-9);
+  EXPECT_LE(state.encoders[0].velocity_rps, 0.02 / min_dt + 1e-9);
+
+  sim.SetConnected(false);
+  sim.Set(0.7);
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_FALSE(state.encoders[0].valid);
+  EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
+  sim.SetConnected(true);
+  sim.Set(0.4);
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_TRUE(state.encoders[0].valid);
+  EXPECT_NEAR(state.encoders[0].position_rot, 0.275, 1e-9);
+  EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
 }
 
 TEST(PhoenixBackendEncoders, DutyCycleDisconnectInvalidatesSample) {
@@ -426,3 +550,91 @@ TEST_P(PhoenixBackendFollower, FollowsMasterAndNeutralizesWithMaster) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Direction, PhoenixBackendFollower, ::testing::Bool());
+
+class PhoenixBackendFollowerFeedback
+    : public ::testing::TestWithParam<std::tuple<bool, bool>> {
+ protected:
+  static ctre::phoenix6::BaseStatusSignal& StaleSignal(PhoenixBackend& backend,
+                                                     bool remote,
+                                                     bool position) {
+    if (remote) {
+      if (position)
+        return backend.sensors_[0].encoder->GetAbsolutePosition(false);
+      return backend.sensors_[0].encoder->GetVelocity(false);
+    }
+    if (position) return backend.motors_[0]->GetPosition(false);
+    return backend.motors_[0]->GetVelocity(false);
+  }
+
+  static void RefreshExcept(PhoenixBackend& backend,
+                            ctre::phoenix6::BaseStatusSignal& stale) {
+    std::vector<ctre::phoenix6::BaseStatusSignal*> signals;
+    for (auto* signal : backend.signals_) {
+      if (signal != &stale) signals.push_back(signal);
+    }
+    ctre::phoenix6::BaseStatusSignal::RefreshAll(
+        false, std::span<ctre::phoenix6::BaseStatusSignal* const>{signals});
+  }
+};
+
+TEST_P(PhoenixBackendFollowerFeedback, StaleOwnFeedbackNeutralizesOnlyFollower) {
+  EnsureHal();
+  EnabledDs ds;
+  const auto [remote, position] = GetParam();
+  hw::Config config;
+  auto follower = TestMotor(20, "follower", 2);
+  follower.master_id = 10;
+  if (remote) {
+    hw::SensorConfig sensor;
+    sensor.id = 30;
+    sensor.name = "follower_encoder";
+    sensor.kind = hw::SensorKind::kCANcoder;
+    sensor.can_id = 3;
+    sensor.bus = "rio";
+    config.sensors.push_back(sensor);
+    follower.feedback = hw::Feedback::kRemoteCANcoder;
+    follower.feedback_sensor_id = sensor.id;
+  }
+  config.motors.push_back(follower);
+  config.motors.push_back(TestMotor(10, "master", 1));
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  const std::array<hw::MotorRequest, 2> commands{
+      Request(20, hw::Mode::kNeutral, 0.0),
+      Request(10, hw::Mode::kVoltage, 6.0)};
+  hw::State state;
+  PumpReads(backend, state, commands, 30);
+  ASSERT_TRUE(state.motors[0].valid);
+  ASSERT_TRUE(state.motors[1].valid);
+  if (remote) {
+    ASSERT_TRUE(state.sensors[0].valid);
+  }
+  ASSERT_GT(state.motors[0].voltage, 3.0);
+  ASSERT_GT(state.motors[1].voltage, 3.0);
+
+  // Stop refreshing exactly one cached feedback signal. Read would refresh it,
+  // so inspect physical sim voltage directly instead of masked state fields.
+  auto& stale = StaleSignal(backend, remote, position);
+  std::this_thread::sleep_for(std::chrono::milliseconds(70));
+  for (int i = 0; i < 20; ++i) {
+    RefreshExcept(backend, stale);
+    ASSERT_TRUE(backend.Apply(commands));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_GE(stale.GetTimestamp().GetLatency().value(), 0.05);
+  ctre::phoenix6::hardware::TalonFX follower_device{
+      2, ctre::phoenix6::CANBus{"rio"}};
+  ctre::phoenix6::hardware::TalonFX master_device{
+      1, ctre::phoenix6::CANBus{"rio"}};
+  EXPECT_NEAR(follower_device.GetSimState().GetMotorVoltage().value(), 0.0, 0.5);
+  EXPECT_GT(master_device.GetSimState().GetMotorVoltage().value(), 3.0);
+
+  // Refreshing the failed feedback restores following without reconfiguration.
+  PumpReads(backend, state, commands, 30);
+  EXPECT_GT(state.motors[0].voltage, 3.0);
+  EXPECT_GT(state.motors[1].voltage, 3.0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    SourceAndSignal, PhoenixBackendFollowerFeedback,
+    ::testing::Combine(::testing::Bool(), ::testing::Bool()));
