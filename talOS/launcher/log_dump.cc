@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -7,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -150,6 +152,16 @@ std::string CsvString(std::string_view value) {
   return result;
 }
 
+void ExportPayloadHex(std::span<const std::byte> payload) {
+  constexpr char hex[] = "0123456789abcdef";
+  std::cout << '"';
+  for (const auto byte : payload) {
+    const auto value = std::to_integer<unsigned char>(byte);
+    std::cout << hex[value >> 4] << hex[value & 15];
+  }
+  std::cout << '"';
+}
+
 void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
                   bool json) {
   const std::string schema = r.source == nullptr ? "" : r.source->schema.name;
@@ -167,19 +179,25 @@ void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
               << ",\"topic\":" << quote(r.source_name)
               << ",\"event_ms\":" << ToMillis(base_ns, r.header.event_time_ns)
               << ",\"now_ms\":" << ToMillis(base_ns, r.header.now_ns)
+              << ",\"publish_ms\":"
+              << ToMillis(base_ns, r.header.publish_time_ns)
               << ",\"sequence\":" << r.header.sequence
               << ",\"aux\":" << r.header.aux
               << ",\"payload_bytes\":" << r.header.payload_bytes
               << ",\"schema\":" << quote(schema)
-              << ",\"decoded\":" << quote(decoded) << "}\n";
+              << ",\"payload_hex\":";
+    ExportPayloadHex(r.payload);
+    std::cout << ",\"decoded\":" << quote(decoded) << "}\n";
   } else {
     std::cout << quote(r.process_name) << ',' << r.header.dispatch_index << ','
               << quote(EventKindName(r.header.kind)) << ','
               << r.header.source_id << ',' << quote(r.source_name) << ','
               << ToMillis(base_ns, r.header.event_time_ns) << ','
-              << ToMillis(base_ns, r.header.now_ns) << ',' << r.header.sequence
-              << ',' << r.header.aux << ',' << r.header.payload_bytes << ','
-              << quote(schema) << ',' << quote(decoded) << "\r\n";
+              << ToMillis(base_ns, r.header.now_ns) << ','
+              << ToMillis(base_ns, r.header.publish_time_ns) << ','
+              << r.header.sequence << ',' << r.header.aux << ','
+              << r.header.payload_bytes << ',' << quote(schema) << ','
+              << quote(decoded) << "\r\n";
   }
 }
 
@@ -227,7 +245,7 @@ int main(int argc, char** argv) {
     if (options.format == "csv") {
       std::cout
           << "process,dispatch_index,kind,source_id,topic,event_ms,now_ms,"
-             "sequence,aux,payload_bytes,schema,decoded\r\n";
+             "publish_ms,sequence,aux,payload_bytes,schema,decoded\r\n";
     }
     for (const auto& r : records) {
       if (Matches(options, r, base_ns)) {
@@ -264,12 +282,13 @@ int main(int argc, char** argv) {
 
     std::printf(
         "  [%-12s] #%-6llu %-8s src=%-3s (%-16s) event=%9.3fms now=%9.3fms "
-        "seq=%-6llu aux=%-6u payload=%uB\n",
+        "publish=%9.3fms seq=%-6llu aux=%-6u payload=%uB\n",
         r.process_name.c_str(),
         static_cast<unsigned long long>(r.header.dispatch_index),
         EventKindName(r.header.kind), source_id.c_str(), source_name.c_str(),
         ToMillis(base_ns, r.header.event_time_ns),
         ToMillis(base_ns, r.header.now_ns),
+        ToMillis(base_ns, r.header.publish_time_ns),
         static_cast<unsigned long long>(r.header.sequence), r.header.aux,
         r.header.payload_bytes);
     // The topic's schema travels in the log (talOS/events/log/format.h), so

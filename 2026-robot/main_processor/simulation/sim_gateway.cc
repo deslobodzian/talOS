@@ -13,6 +13,7 @@
 #include "geometry/geometry_descriptor.h"
 #include "geometry/geometry_generated.h"
 #include "sim/topics.h"
+#include "schedules.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/os/poller.h"
@@ -36,6 +37,8 @@ constexpr const char* kUsage =
     "[--start-pose X_M,Y_M,YAW_RAD] [--wheel-radius-error FRAC] "
     "[--wheel-slip-gain G] [--gyro-drift-radps R]] [--duration-s N] "
     "[--mode-schedule mode:seconds,...] [--alliance blue|red] "
+    "[--joystick-schedule 'time:axes=...;buttons=MASK;pov=DEG|...'] "
+    "[--fault-schedule 'start:end:kind:target[:volts]|...'] "
     "[--port N] [--remote-port N] [--session-id N]";
 
 // Shared-memory slot contract: docs/DATA_FLOW.md.
@@ -155,6 +158,8 @@ int main(int argc, char** argv) {
     }
     double duration_s = 0;
     std::vector<Phase> phases;
+    std::vector<robot::simulation::JoystickEvent> joysticks;
+    std::vector<robot::simulation::FaultEvent> faults;
     ds::Alliance alliance = ds::Alliance::kBlue;
     bool physics_options = false;
     uint64_t session_id = 0;
@@ -205,6 +210,11 @@ int main(int argc, char** argv) {
         duration_s = value == "0" ? 0 : Seconds(value);
       } else if (arg == "--mode-schedule" && i + 1 < argc) {
         phases = ParseSchedule(argv[++i]);
+      } else if (arg == "--joystick-schedule" && i + 1 < argc) {
+        joysticks = robot::simulation::ParseJoysticks(argv[++i]);
+      } else if (arg == "--fault-schedule" && i + 1 < argc) {
+        physics_options = true;
+        faults = robot::simulation::ParseFaults(argv[++i]);
       } else if (arg == "--alliance" && i + 1 < argc) {
         const std::string value = argv[++i];
         if (value == "blue") {
@@ -258,6 +268,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error(
             "sim_gateway: Reconfigure failed for the robot config");
       }
+      robot::simulation::ResolveFaults(faults, hw_config);
     }
     talos::hardware::Endpoint endpoint{gateway};
     if (endpoint.Open("127.0.0.1", local_port, "127.0.0.1", remote_port) !=
@@ -282,6 +293,7 @@ int main(int argc, char** argv) {
     const auto start = std::chrono::steady_clock::now();
     auto next = start;
     std::size_t phase = 0;
+    std::size_t joystick_event = 0;
     ds::ModeTracker mode_tracker;
     ds::DriverStationData driver_station;
     driver_station.fms.alliance = alliance;
@@ -301,6 +313,12 @@ int main(int argc, char** argv) {
       while (phase + 1 < phases.size() && elapsed_s >= phases[phase].end_s) {
         ++phase;
       }
+      while (joystick_event < joysticks.size() &&
+             elapsed_s >= joysticks[joystick_event].start_s) {
+        driver_station.joysticks[0] = joysticks[joystick_event++].joystick;
+      }
+      endpoint.SetSendEnabled(
+          !robot::simulation::ApplyFaults(faults, elapsed_s, physics_backend));
       driver_station.sample_time_us =
           std::chrono::duration_cast<std::chrono::microseconds>(
               tick_time.time_since_epoch())

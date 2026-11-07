@@ -976,6 +976,72 @@ TEST(Gateway, StartsUnconfiguredAndRefusesEnableUntilReconfigured) {
   EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
 }
 
+TEST(Endpoint, OutboundBlackoutPreservesReceiveAndSafetyTicks) {
+  SimBackend backend;
+  Gateway gateway{backend, 2002};
+  Endpoint endpoint{gateway};
+  ASSERT_EQ(endpoint.Open("127.0.0.1", 15812, "127.0.0.1", 15813),
+            protocol::UdpStatus::kOk);
+  protocol::RuntimeUdpPeer companion;
+  ASSERT_EQ(companion.Open("127.0.0.1", 15813, "127.0.0.1", 15812),
+            protocol::UdpStatus::kOk);
+
+  endpoint.SetSendEnabled(false);
+  const auto cfg = SwerveConfig(true);
+  const auto chunks = CreateConfigChunks(cfg);
+  for (std::size_t i = 0; i < chunks.size(); ++i) {
+    ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig, i + 1,
+                                  1000, chunks[i].data(), chunks[i].size()),
+              protocol::UdpStatus::kOk);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  ASSERT_EQ(endpoint.Tick(2000, false), protocol::UdpStatus::kOk);
+  EXPECT_TRUE(gateway.configured());  // Receives config, but drops its ACK.
+  ASSERT_EQ(endpoint.Tick(3000, true), protocol::UdpStatus::kOk);
+  EXPECT_TRUE(gateway.snapshot().flags & kEnabled);
+  Command command = Request(gateway);
+  command.motors[0].demand = 5.0;
+  std::array<uint8_t, kMaxCommandSize> command_bytes{};
+  const auto command_size = Encode(command, command_bytes);
+  ASSERT_GT(command_size, 0u);
+  ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareCommand, 100,
+                                3000, command_bytes.data(), command_size),
+            protocol::UdpStatus::kOk);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  ASSERT_EQ(endpoint.Tick(4000, true), protocol::UdpStatus::kOk);
+  ASSERT_EQ(endpoint.Tick(5000, true), protocol::UdpStatus::kOk);
+  EXPECT_TRUE(gateway.snapshot().flags & kCommandActive);
+  EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].velocity_rps, 5.0);
+  ASSERT_EQ(endpoint.Tick(5000 + cfg.command_timeout_us, true),
+            protocol::UdpStatus::kOk);
+  EXPECT_FALSE(gateway.snapshot().flags & kCommandActive);
+  EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].velocity_rps, 0.0);
+  const std::array<uint8_t, 1> ds_payload{0};
+  ASSERT_EQ(endpoint.SendFrame(protocol::FrameType::kDriverStation, 3000,
+                               ds_payload.data(), ds_payload.size()),
+            protocol::UdpStatus::kOk);
+  protocol::DecodedFrame frame;
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  EXPECT_EQ(companion.TryReceive(&frame), protocol::UdpStatus::kWouldBlock);
+
+  endpoint.SetSendEnabled(true);
+  const uint64_t resumed_at = 6000 + cfg.command_timeout_us;
+  ASSERT_EQ(endpoint.Tick(resumed_at, false), protocol::UdpStatus::kOk);
+  ASSERT_EQ(endpoint.SendFrame(protocol::FrameType::kDriverStation, resumed_at,
+                               ds_payload.data(), ds_payload.size()),
+            protocol::UdpStatus::kOk);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  ASSERT_EQ(companion.TryReceive(&frame), protocol::UdpStatus::kOk);
+  EXPECT_EQ(frame.header.type, protocol::FrameType::kHardwareState);
+  State state;
+  ASSERT_TRUE(Decode({frame.payload, frame.payload_size}, state));
+  EXPECT_EQ(state.sample_time_us, resumed_at);
+  EXPECT_FALSE(state.flags & kEnabled);
+  ASSERT_EQ(companion.TryReceive(&frame), protocol::UdpStatus::kOk);
+  EXPECT_EQ(frame.header.type, protocol::FrameType::kDriverStation);
+  EXPECT_EQ(companion.TryReceive(&frame), protocol::UdpStatus::kWouldBlock);
+}
+
 TEST(Endpoint, PushesConfigOverUdpAndHandlesEpochChangeOnRestart) {
   SimBackend backend;
   Gateway gateway{backend, 2002};

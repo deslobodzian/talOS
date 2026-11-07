@@ -40,6 +40,48 @@ even when physics and hardware snapshots run at 200 Hz.
 `--remote-port N` selects the bridge's receiving port (default 5803). Tests
 choose ephemeral ports so independent simulated stacks do not share sockets.
 
+## Scripted joystick and fault schedules
+
+Both schedules use seconds since the gateway's loop starts and run alongside
+`--mode-schedule`. Quote the argument so the shell does not interpret `|` or `;`.
+
+`--joystick-schedule 'time:axes=A0,A1,...;buttons=MASK;pov=DEG|...'`
+sets complete, connected joystick-0 snapshots. Times must be nonnegative and
+strictly increasing. Each snapshot is held until the next event; before the
+first event the joystick is disconnected. All three fields are required.
+Axes are one to twelve finite values in `[-1,1]`; omitted axes are zero.
+Buttons are a decimal uint32 mask (bit 0 is button 1). POV is `-1` (released)
+or an integer in `[0,359]` degrees. Other joysticks remain disconnected.
+For the 2026 driver, negative axis 1 is forward; center the stick in teleop
+before pushing it, and center again after stale DS input or a driver stall.
+
+`--fault-schedule 'start:end:kind:target[:volts]|...'` requires `--physics`.
+Intervals are half-open `[start,end)`, with finite `0 <= start < end`.
+Device targets use logical TOML device names, not physical CAN IDs.
+
+| Kind | Target | Effect |
+|---|---|---|
+| `motor_disconnect` | Motor name | Invalid feedback until the interval ends |
+| `sensor_disconnect` | Sensor name | Invalid feedback until the interval ends |
+| `freeze` | Motor name | Hold feedback until the interval ends |
+| `supply_voltage` | `all` | Require fifth field, volts in `[0,16]`; restore 12 V at end |
+| `reset` | Motor or sensor name | One device-reset edge on the first tick at/after start |
+| `udp_blackout` | `bridge` | Drop **all outbound UDP**, including DS, hardware state and config ACKs |
+
+Unknown devices and overlapping intervals of the same kind/target are rejected.
+Blackouts do not stop incoming commands, physics or gateway safety ticks;
+suppressed packets are discarded, never replayed after recovery.
+The bridge's `/hw/status.motor_fault_mask` uses configured motor order and
+marks invalid feedback as well as nonzero controller fault flags.
+
+```sh
+bazel run //2026-robot/main_processor/simulation:sim_gateway -- \
+  --config "$PWD/2026-robot/main_processor/configuration/robot_physics_sim.toml" \
+  --physics --mode-schedule disabled:0.5,teleop:5 --duration-s 6 \
+  --joystick-schedule '0:axes=0,0,0;buttons=0;pov=-1|1:axes=0,-0.6,0;buttons=0;pov=-1|3:axes=0,0,0;buttons=0;pov=-1|3.3:axes=0,-0.6,0;buttons=0;pov=-1' \
+  --fault-schedule '2:2.5:udp_blackout:bridge|4:5:motor_disconnect:back_left_drive'
+```
+
 `./sim.sh --sim-gateway` selects the physics backend. Its repeatable
 `--gateway-arg ARG` passes one argument verbatim through the launcher's
 repeatable `--sim-gateway-arg ARG` interface, preserving order:
@@ -141,18 +183,34 @@ they do not teleport the robot or override its ground motion.
 bazel test --test_output=errors //2026-robot/main_processor/simulation:all
 ```
 
-`startup_test` launches the real robot configuration and its processes,
-including the physics gateway, with ephemeral loopback ports and a unique
-shared-memory namespace per session. The declared `/sim/state` sender is part
-of the real graph, so telemetry's construction-time frame-budget check covers
-its channels too. The test exercises disabled, autonomous, and teleop modes,
-checks every process exits without restarts or recorder failures, and requires
-records in the hardware, autonomous, drivetrain, pose and camera logs.
-A second session pauses the teleop target producer (`driver`) with `SIGSTOP`
-for 250 ms and resumes it with `SIGCONT`: longer than the 100 ms command
-freshness limit but shorter than the 500 ms heartbeat-stall floor. The session
-must still finish cleanly without restarting any node. Temporary logs and
-process groups are cleaned up even when an assertion fails.
+`startup_test` runs a bounded eight-second scripted match using the real
+launcher, robot processes and physics gateway, with ephemeral UDP ports and
+unique shared-memory names. It checks disabled/autonomous/teleop operation,
+clean process exits, no restarts/recorder failures, and nonempty node logs.
+It then decodes the complete JSONL `payload_hex` bytes from `log_dump` (the
+human-readable `decoded` packet preview is intentionally truncated).
+Additional JSONL fields, including publication timestamps, are tolerated.
+
+The match proves nonzero drivetrain velocity requests before each injection:
+
+- `SIGSTOP driver` for 250 ms: every drivetrain motor must request actual
+  neutral mode within `command_timeout + 2 periods` (110 ms in this config).
+- `SIGCONT` with forward still held: neutral must persist until the scheduled
+  centered stick; a later forward push must drive again.
+- A 500 ms outbound UDP blackout: the same 110 ms bound is measured from the
+  last received DS sample; recovery while held cannot rearm driving.
+- Disconnect `back_left_drive`: that motor must request neutral and its
+  configured-order fault bit must appear in `/hw/status`.
+
+Assertions require dense recorded output throughout the safety windows,
+not merely one eventual zero demand. Without stale-target neutralization,
+the pre-proven forward request remains active past the deadline and fails;
+without rearming, resumed held input fails the continued-neutral window.
+Zero-demand velocity mode is **not** accepted as neutral. The test uses the
+node clock and v6 log record timestamps to align signal injection precisely
+on macOS as well as Linux. Process groups are always reaped. On failure it
+prints and retains the temporary directory containing `sessions/`, launcher
+diagnostics and (when export succeeds) `match.jsonl`; successful runs remove it.
 
 ## Pose-estimator accuracy scenario
 

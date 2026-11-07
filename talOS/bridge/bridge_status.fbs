@@ -41,6 +41,7 @@ struct BridgeStatus {
   battery_v:double;
   brownout:bool;
   can_utilization_frac:double;
+  // Bit i (configured motor order): invalid feedback or controller fault flags.
   motor_fault_mask:uint32;
   gateway_rejected_command_count:uint32;
   gateway_neutralized_motor_count:uint32;

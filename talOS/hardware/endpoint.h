@@ -22,6 +22,9 @@ class Endpoint {
                            const char* remote, uint16_t remote_port) {
     return peer_.Open(local, local_port, remote, remote_port);
   }
+  // Link fault injection drops outbound traffic, never inbound commands or
+  // gateway safety ticks. Suppressed datagrams are not queued for recovery.
+  void SetSendEnabled(bool enabled) { send_enabled_ = enabled; }
   protocol::UdpStatus Tick(uint64_t now_us, bool enabled) {
     gateway_.Tick(now_us, enabled);
     for (int i = 0; i < 16; ++i) {
@@ -59,9 +62,8 @@ class Endpoint {
           }
           std::array<uint8_t, 128> ack_buf{};
           const auto ack_size = EncodeConfigAck(ack, ack_buf);
-          peer_.SendFrame(protocol::FrameType::kHardwareConfigAck,
-                          frame.header.sequence, now_us, ack_buf.data(),
-                          ack_size);
+          Send(protocol::FrameType::kHardwareConfigAck, frame.header.sequence,
+               now_us, ack_buf.data(), ack_size);
         } else if (status != ConfigAssembler::Status::kIncomplete) {
           ConfigAckPayload ack{};
           ack.config_id = assembler_.config_id();
@@ -75,9 +77,8 @@ class Endpoint {
           std::snprintf(ack.reason, sizeof(ack.reason), "%s", err.c_str());
           std::array<uint8_t, 128> ack_buf{};
           const auto ack_size = EncodeConfigAck(ack, ack_buf);
-          peer_.SendFrame(protocol::FrameType::kHardwareConfigAck,
-                          frame.header.sequence, now_us, ack_buf.data(),
-                          ack_size);
+          Send(protocol::FrameType::kHardwareConfigAck, frame.header.sequence,
+               now_us, ack_buf.data(), ack_size);
         }
         continue;
       }
@@ -88,17 +89,24 @@ class Endpoint {
         gateway_.Accept(command, frame.header.sequence, now_us);
     }
     const auto size = Encode(gateway_.snapshot(), buffer_);
-    return peer_.SendFrame(protocol::FrameType::kHardwareState, 0, now_us,
-                           buffer_.data(), size);
+    return Send(protocol::FrameType::kHardwareState, 0, now_us, buffer_.data(),
+                size);
   }
   // Payload-agnostic passthrough for frames this endpoint does not own, so
   // their encoding stays with the caller rather than in the gateway layer.
   protocol::UdpStatus SendFrame(protocol::FrameType type, uint64_t now_us,
                                 const void* payload, std::size_t payload_size) {
-    return peer_.SendFrame(type, 0, now_us, payload, payload_size);
+    return Send(type, 0, now_us, payload, payload_size);
   }
 
  private:
+  protocol::UdpStatus Send(protocol::FrameType type, uint64_t sequence,
+                           uint64_t now_us, const void* payload,
+                           std::size_t payload_size) {
+    if (!send_enabled_) return protocol::UdpStatus::kOk;
+    return peer_.SendFrame(type, sequence, now_us, payload, payload_size);
+  }
+  bool send_enabled_{true};
   Gateway& gateway_;
   protocol::RuntimeUdpPeer peer_;
   ConfigAssembler assembler_;

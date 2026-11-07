@@ -2,6 +2,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -61,6 +62,7 @@ class LogDumpTest : public testing::Test {
       ctx.event_time = talos::event::MonotonicTime::from_nanos(
           1'000'000'000 + times[i] * 1'000'000);
       ctx.now = ctx.event_time;
+      ctx.publish_time = ctx.event_time - std::chrono::milliseconds{3};
       ctx.sequence = i + 1;
       const continuity_test::Count value{7, 9};
       writer.dispatch(ctx, std::as_bytes(std::span{&value, 1}));
@@ -106,6 +108,7 @@ TEST_F(LogDumpTest, DefaultTextAndNodeFilters) {
   EXPECT_NE(text.find("summary: 4 records across 2 processes"),
             std::string::npos);
   EXPECT_NE(text.find("continuity_test.Count"), std::string::npos);
+  EXPECT_NE(text.find("publish=   -3.000ms"), std::string::npos);
   const auto alpha = Run({"--node", "alpha"});
   EXPECT_NE(alpha.find("summary: 2 records across 1 processes"),
             std::string::npos);
@@ -145,24 +148,55 @@ TEST_F(LogDumpTest, MachineReadableFormatsEscapeAndDecode) {
       std::string::npos);
   EXPECT_NE(json.find("\"topic\":\"/beta/quote,\\\"\\u000a\""),
             std::string::npos);
-  EXPECT_NE(json.find("\"event_ms\":10,\"now_ms\":10,\"sequence\":1,\"aux\":0,"
-                      "\"payload_bytes\":8"),
+  EXPECT_NE(json.find("\"event_ms\":10,\"now_ms\":10,\"publish_ms\":7,"
+                      "\"sequence\":1,\"aux\":0,\"payload_bytes\":8"),
             std::string::npos);
-  EXPECT_NE(json.find("\"schema\":\"continuity_test.Count\",\"decoded\":\"{run_"
-                      "index: 7, sequence_count: 9}\""),
+  EXPECT_NE(json.find("\"schema\":\"continuity_test.Count\","
+                      "\"payload_hex\":\"0700000009000000\","
+                      "\"decoded\":\"{run_index: 7, sequence_count: 9}\""),
             std::string::npos);
   EXPECT_EQ(json.find("summary"), std::string::npos);
   const auto csv =
       Run({"--format", "csv", "--node", "beta", "--until-ms", "10"});
   EXPECT_TRUE(
       csv.starts_with("process,dispatch_index,kind,source_id,topic,event_ms,"
-                      "now_ms,sequence,aux,payload_bytes,schema,decoded\r\n"));
+                      "now_ms,publish_ms,sequence,aux,payload_bytes,schema,"
+                      "decoded\r\n"));
   EXPECT_NE(csv.find("beta,1,TIMER,1,\"/beta/"
-                     "quote,\"\"\n\",10,10,1,0,8,continuity_test.Count,"),
+                     "quote,\"\"\n\",10,10,7,1,0,8,continuity_test.Count,"),
             std::string::npos);
   EXPECT_NE(csv.find("\"{run_index: 7, sequence_count: 9}\"\r\n"),
             std::string::npos);
   EXPECT_EQ(csv.find("summary"), std::string::npos);
+}
+
+TEST_F(LogDumpTest, JsonExportsCompletePayloadBeyondDisplayHexLimit) {
+  talos::event::Registration source;
+  source.id = 1;
+  source.kind = talos::event::SourceKind::SENDER;
+  source.name = "/raw";
+  source.message_bytes = 96;
+  talos::event::log::LogWriter writer{
+      directory_ + "/raw.tlog", "raw",
+      talos::event::log::LogWriterOptions{4096, 1, false}, 42};
+  writer.start({source},
+               talos::event::MonotonicTime::from_nanos(1'000'000'000));
+  std::vector<std::byte> payload(96, std::byte{0xab});
+  payload.back() = std::byte{0};  // Preserve trailing zeros too.
+  talos::event::Context ctx{};
+  ctx.kind = talos::event::EventKind::SEND;
+  ctx.source_id = 1;
+  ctx.dispatch_index = 1;
+  ctx.event_time = talos::event::MonotonicTime::from_nanos(1'000'000'000);
+  ctx.now = ctx.event_time;
+  writer.dispatch(ctx, payload);
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
+  std::string expected{"\"payload_hex\":\""};
+  for (int i = 0; i < 95; ++i) expected += "ab";
+  expected += "00\"";
+  EXPECT_NE(Run({"--format", "jsonl", "--node", "raw"}).find(expected),
+            std::string::npos);
 }
 
 TEST_F(LogDumpTest, RejectsInvalidOptions) {

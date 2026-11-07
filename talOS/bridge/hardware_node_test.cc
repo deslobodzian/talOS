@@ -477,8 +477,10 @@ TEST(HardwareNodeTest,
   state.counters = {11, 12, 13, 14};
   state.motor_count = 2;
   state.motors[0].id = cfg.hardware.motors[1].id;
+  state.motors[0].valid = true;
   state.motors[0].fault_flags = 5;
   state.motors[1].id = cfg.hardware.motors[0].id;
+  state.motors[1].valid = true;
   ASSERT_TRUE(InjectState(node, gateway, state, 1000000));
   const auto status = node.Status(1001000);
   EXPECT_TRUE(status.health_valid());
@@ -496,6 +498,16 @@ TEST(HardwareNodeTest,
   ASSERT_TRUE(InjectState(node, gateway, state, 1002000));
   EXPECT_FALSE(node.Status(1002000).health_valid());
   EXPECT_EQ(node.Status(1002000).motor_fault_mask(), 0u);
+  // An invalid sample needs attention even without a controller fault code.
+  // IDs are deliberately in reverse order: mask bits follow configuration.
+  state.motors[1].valid = false;
+  state.sample_time_us++;
+  ASSERT_TRUE(InjectState(node, gateway, state, 1003000));
+  EXPECT_EQ(node.Status(1003000).motor_fault_mask(), 1u);
+  state.motors[1].valid = true;
+  state.sample_time_us++;
+  ASSERT_TRUE(InjectState(node, gateway, state, 1004000));
+  EXPECT_EQ(node.Status(1004000).motor_fault_mask(), 0u);
 }
 
 TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
@@ -589,7 +601,7 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   ASSERT_EQ(WEXITSTATUS(status), 0);
   ASSERT_TRUE(received_command);
   event::log::LogReader reader(log_path);
-  EXPECT_EQ(reader.format_version(), 5u);
+  EXPECT_EQ(reader.format_version(), 6u);
   bool logged_command = false;
   bool logged_state = false;
   event::log::LogReader::Record record;
