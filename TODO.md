@@ -26,7 +26,8 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
 
 ## Merge `vision`
 
-- [ ] PR #2 `vision` → `main` (https://github.com/deslobodzian/talOS/pull/2): get CI green; do not merge red. The first CI run passed macOS build + tests, GradleRIO, clang-format and buildifier, and failed Linux (gcc rejected out-of-order designated initializers) and clang-tidy (findings in the new vision/recording code and tests, and the upstream-derived Metal adapter).
+- [ ] PR #2 `vision` → `main` (https://github.com/deslobodzian/talOS/pull/2): get CI green; do not merge red. CI on x86-64 Linux found what the arm64 container could not: gcc rejecting out-of-order designated initializers, libjpeg-turbo's SIMD table missing from Bazel's test shared objects (`build:linux --@@libjpeg_turbo+//:noasm=yes`), `SO3::Log` losing accuracy near pi, and an x86-only unused NEON helper. All fixed on the branch.
+- [ ] `PhoenixBackendPigeon.MountYawConfiguredAndInversionFlipsReadYaw` (GradleRIO `phoenixTest`) failed once in CI with "CAN frame not received/too-stale" on a Pigeon config refresh, then passed on the next run with no RIO change: a Phoenix sim timing flake. If it recurs, wait for the device before refreshing.
 - [ ] `phoenixTest` on macOS still needs the `MacOSX26.sdk` GradleRIO wants; it passes on Linux.
 
 ## Sim vision slices
