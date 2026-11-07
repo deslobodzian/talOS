@@ -106,9 +106,10 @@ subsystem.
 
 The mode generation is what keeps a target issued under an earlier enable or
 mode from ever actuating. The RoboRIO program (and `SimHardware`,
-`send_joystick`) stamps each Driver Station packet with `mode_since_us`, the
-sample time of the first packet in the current mode, via one
-`driver_station::ModeTracker`; disabling, re-enabling, switching mode,
+`send_joystick`) stamps each Driver Station packet with `mode_since_us` via one
+`driver_station::ModeTracker`: the time of the first observation in the current
+mode; the RoboRIO observes every hardware tick independently of the 20 ms packet
+publication cadence. Disabling, re-enabling, switching mode,
 e-stopping or re-attaching starts a new generation, and the bridge forwards it
 unchanged. `TargetLane::send` stamps the generation its own node last drained
 (0 while that view is stale, disabled or in no mode); `Target::get` accepts a
@@ -165,8 +166,9 @@ requests stop (`/hw/status` `timed_out_mask`).
 - The FlatBuffers namespace is the short subsystem name (`shooter`, `intake`,
   `drivetrain`); C++ includes `<package>/<file>_generated.h`, Python imports
   `<namespace>.<Struct>`.
-- Topic names are declared once, in the package's `topics.h`, and follow
-  [talOS/NAMING.md](talOS/NAMING.md).
+- Topic names are declared once in the package's `BUILD` via
+  `talos_messages(topics = ...)`, which generates the package's `topics.h`,
+  and follow [talOS/NAMING.md](talOS/NAMING.md).
 - One writer per topic. Several producers of a target each write their own
   lane, and the consumer picks one (see "Targets").
 - The launcher refuses to start a graph that breaks a naming or graph rule
@@ -209,7 +211,7 @@ the config changes and the manifest does not.
 | a mechanism | a node package under `<robot>/main_processor/<name>/`, plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` does all of it (walkthrough in [examples/superstructure](examples/superstructure/README.md)) |
 | a mechanism in its own repository | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py --standalone DIR` writes a Bzlmod repo (overriding `@talos` with this checkout); the robot adds `bazel_dep` + `local_path_override`, a subsystem file naming `@<name>//:node`, and its `[[subsystems]]` entry |
 | a camera | its calibrated `configuration/subsystems/<camera>.toml`, a name in `vision/BUILD`'s `CAMERAS`, a `[[subsystems]]` entry and regenerated manifest; list it in the pose estimator's `cameras` |
-| a message or topic | the owning package's `.fbs` and `topics.h` |
+| a message or topic | the owning package's `.fbs` and `BUILD` declaration via `talos_messages(topics = ...)`, which generates `topics.h` |
 | a producer of an existing target | a `talos::TargetLane` on `/<sub>/target/<source>`, and `<source>` in that subsystem's policy (`[robot.targets]` or its `[targets]`); the launcher refuses a lane no mode lists |
 | a device type | `talOS/hardware` (config + wire), `talOS/devices`, `talOS/python/talos/devices.py`, and the RoboRIO program |
 | a node-API feature | `talOS/node`, mirrored in `talOS/node_api` and `talOS/python/talos` |

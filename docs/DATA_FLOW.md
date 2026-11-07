@@ -43,7 +43,7 @@ second hop. See [architecture](../ARCHITECTURE.md#two-processors).
 | Link / direction | Transport / port | Trigger or rate in the 2026 configuration |
 |---|---|---|
 | Devices ↔ RIO backend | CAN / local DIO, analog, encoder, PWM; no IP port | Gateway samples/applies on `Config.period_us`: 5000 µs = 200 Hz. Vendor CAN status frequencies are device configuration, not a separate talOS packet rate. |
-| Driver Station ↔ RIO | WPILib/FRC native control/status over radio; not talOS UDP | DS produces new data at 50 Hz; RIO refreshes WPILib each hardware tick, emits a talOS DS snapshot at most every 20000 µs. Native FRC packet layouts are external to this repo. |
+| Driver Station ↔ RIO | WPILib/FRC native control/status over radio; not talOS UDP | DS produces new data at 50 Hz; RIO refreshes WPILib each hardware tick, emits a talOS DS snapshot at most every 20000 µs. Mode generations observe every hardware tick, including transitions between published snapshots. Native FRC packet layouts are external to this repo. |
 | RIO → hardware_node: State (type 20) | UDP source gateway 5802 → bridge 5803, wired robot switch | One snapshot per gateway tick, 200 Hz. |
 | hardware_node → RIO: Command (21) | UDP 5803 → 5802 | Bridge polls every 1000 µs. Send immediately when merged command changes, otherwise heartbeat `clamp(command_timeout_us / 5, 5000, 20000)` µs: 20000 µs = 50 Hz with the configured 100000 µs timeout. Only after observed state and while a subsystem request is active; not unconditionally 1000 Hz. |
 | hardware_node → RIO: Config chunks (22) | UDP 5803 → 5802 | Whole config push on observed boot/config mismatch or while unacknowledged; retry when a State arrives and ≥50000 µs since last push, immediately for a changed boot ID. Not periodic after successful matching acknowledgment. |
@@ -156,6 +156,11 @@ checks CRC32, deserializes and validates caps, then reconfigures. A new config I
 replaces the assembly; inconsistent metadata or invalid assembled data is
 rejected. Completion/backend failure or malformed data produces the 73-byte ACK
 with status/reason (`config_wire.h`, `endpoint.h`).
+Hardware configuration assembly rejects serialized totals above **10,051 B**
+(`kMaxSerializedConfigSize`) before allocation. Chunk data is limited to
+**1,408 B**; chunk counts cannot exceed 10,051 or the serialized byte count.
+Transfer metadata and chunk geometry must remain consistent, and assembler
+exceptions reject the transfer without escaping the gateway safety loop.
 
 There is no selective retransmission or hot-path fragmentation protocol. A lost
 chunk leaves an incomplete assembly with no success ACK; the bridge repeats the
@@ -177,6 +182,15 @@ the inconsistency without changing the wire format.
 Fixed message topics store their complete native FlatBuffers struct/envelope;
 there is no UDP frame header. Slot bytes are not the dynamic occupied payload
 length. Queue bookkeeping/ring headers are additional to the per-slot bytes.
+
+RTMS segment version 4 records the exact completed `DROP_NEWEST` publication
+position in existing writer-header padding without increasing header or slot
+sizes. For published position P and slot sequence s, readers require
+P − s < slots, except that equality is accepted when the shared
+reliable-publication marker equals P. Overwriting writers invalidate this marker
+before modifying slot bytes. A standalone publisher reclaims segments of another
+version by unlinking and recreating them; a new session owner unlinks any prior
+segment before creation. An attaching reader rejects a version mismatch.
 
 | Topic / owner → consumer | Slot bytes | Meaning / rate |
 |---|---:|---|
@@ -203,6 +217,17 @@ padding: they must not be inferred by simply adding scalar field widths.
 The `/sim/state` slot is pinned by `static_assert(sizeof(geometry::OdometrySample)
 == 56)` in `simulation/sim_gateway.cc`. This truth topic is local to the main
 processor and never crosses the hardware UDP link.
+
+Autonomous phases are IDLE, SPINUP, FEED, DRIVE, HOLD, and ABORTED (append-only
+ubyte; state remains one byte). SPINUP and DRIVE abort after configured deadlines;
+FEED ends after its validated positive duration. Pose outages release the drive
+lane and pause trajectory progress without extending the DRIVE deadline. HOLD
+and ABORTED release all autonomous target lanes; leaving enabled-autonomous
+resets the routine to IDLE.
+
+Phoenix followers drive only while their master is permitted and their own
+cached position/velocity feedback—including configured remote CANcoder
+feedback—is fresh and finite; invalid feedback neutralizes the follower.
 
 ## Telemetry, Studio, and the radio boundary
 

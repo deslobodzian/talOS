@@ -1,10 +1,9 @@
 # Design: automatic wiring (no arbiter, no hard-coded subsystems)
 
-Status: partially implemented checkpoint, not acceptance-complete. See
-[HANDOFF_AUTOMATIC_WIRING.md](HANDOFF_AUTOMATIC_WIRING.md) for current evidence,
-remaining work, and completion order. The rules it serves are in
-[METHODOLOGY.md](METHODOLOGY.md). D2 is implemented. D6 is implemented,
-including `--replay-inputs`. D3 and D4 remain proposals.
+Status: D1 through D6 are implemented. See
+[HANDOFF_AUTOMATIC_WIRING.md](HANDOFF_AUTOMATIC_WIRING.md) for current evidence
+and remaining robot-readiness work. The rules it serves are in
+[METHODOLOGY.md](METHODOLOGY.md). D6 includes `--replay-inputs`.
 
 ## Problem
 
@@ -86,11 +85,12 @@ mode. The generation is therefore carried end to end:
 
 - Every Driver Station sampler (the RoboRIO program, real and WPILib-sim
   alike; `SimHardware`; `send_joystick`) runs one
-  `driver_station::ModeTracker`, which stamps `DriverStationData::mode_since_us`
-  with the `sample_time_us` of the first sample whose mode key (attached,
-  enabled, e-stop, autonomous, teleop, test: `driver_station::ModeKey`)
-  differs from the previous sample's; never 0, and strictly later than the
-  previous generation. The bridge forwards the packet unchanged.
+  `driver_station::ModeTracker`, which stamps `DriverStationData::mode_since_us`.
+  `ModeTracker` advances the generation on the first observation of each
+  changed mode key (attached, enabled, e-stop, autonomous, teleop, test:
+  `driver_station::ModeKey`). Hardware gateways observe every tick, including
+  ticks between Driver Station publications; generations remain nonzero and
+  strictly increasing. The bridge forwards the packet unchanged.
 - A node's generation is its latest packet's `mode_since_us` while its
   Driver Station mode is not none (fresh, attached, enabled, not e-stopped),
   else 0.

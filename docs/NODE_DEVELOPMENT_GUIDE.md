@@ -27,6 +27,9 @@ the constructor; `update()` runs every period.
 Messages are FlatBuffers **structs** (no tables or strings), at most 8-byte
 aligned. Topics are typed by schema identity (`Descriptor<M>`, name and
 schema hash): attaching with a mismatched schema fails, naming both types.
+Python publisher, target-lane, and simulation forwarding requires matching
+schema names, schema hashes, and byte sizes; mismatches raise `TypeError`
+before publication.
 A relative topic name (`"state"`, `"event/shot"`) expands to
 `"/<name>/<topic>"`; `[subsystems.<name>.remap]` can redirect relative or
 absolute topics without changing node code.
@@ -157,9 +160,10 @@ add in the node.
 
 A lane drives only the Driver Station mode generation it was sent under: the
 RoboRIO stamps every Driver Station packet with `mode_since_us` (the first
-sample of the current enable and mode), a `TargetLane` stamps the generation
-its node last drained, and `Target` ignores any other. A target computed
-before a disable, re-enable, mode switch or re-attach never actuates after it,
+observation of the current enable and mode, tracked every hardware tick), a
+`TargetLane` stamps the generation its node last drained, and `Target` ignores
+any other. A target computed before a disable, re-enable, mode switch or
+re-attach never actuates after it,
 even if it arrives in the same drain as the packet that changed the mode; the
 producer's next send, made from the new packet, is accepted. In tests,
 `PublishTarget` / `sim.publish_target` stamp the generation of the newest

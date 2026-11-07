@@ -76,6 +76,9 @@ table above supersedes their status claims.
 - Prefer maintained open-source libraries. Use FlatBuffers reflection for
   schemas and WPILib/RobotPy for estimation; do not build new equivalents.
 
+The section below is the historical pre-D2–D6 checkpoint, superseded by
+“Status at 2026-11-05” and “Status at the 2026-11-04 evening stop” above.
+
 ## What is implemented
 
 | Item | Current state |
