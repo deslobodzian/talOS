@@ -60,8 +60,8 @@ a dictionary frame recovers within a second, and a producer restart (new
 
 Value-only frames are capped at `kMaxValueFrameBytes = 1200` bytes **including
 the 4-byte prefix**, enforced by the producer at construction: it builds a
-worst-case all-channels-present frame, measures it, and throws rather than
-start if the frame would exceed the cap.
+worst-case all-channels-present frame with all scalar metadata fields serialized,
+measures it, and throws rather than start if the frame would exceed the cap.
 
 - One frame fits a 1500-byte MTU Ethernet frame with IPv4/TCP and WebSocket
   framing overhead to spare, so a frame is never fragmented across packets.

@@ -71,6 +71,24 @@ inline std::uint32_t DictionaryId(const std::vector<ChannelDef>& dictionary) {
   return hash;
 }
 
+namespace detail {
+
+// Keep measured and live frames on the same serialization path.
+inline void FinishFrame(
+    flatbuffers::FlatBufferBuilder& builder, std::uint64_t stream_id,
+    std::uint64_t sequence_id, std::uint64_t timestamp_ns,
+    std::uint32_t dictionary_id, const Talos::Telemetry::Pose& chassis,
+    flatbuffers::Offset<flatbuffers::Vector<double>> values,
+    flatbuffers::Offset<flatbuffers::Vector<
+        flatbuffers::Offset<Talos::Telemetry::ChannelInfo>>> dictionary = 0) {
+  Talos::Telemetry::FinishSizePrefixedFrameBuffer(
+      builder, Talos::Telemetry::CreateFrame(
+                   builder, stream_id, sequence_id, timestamp_ns, dictionary_id,
+                   &chassis, values, dictionary));
+}
+
+}  // namespace detail
+
 // Size in bytes (prefix included) of a value-only frame with every channel
 // present. FlatBuffers vector size does not depend on the values, so this
 // is the worst case the construction-time budget check measures.
@@ -79,13 +97,35 @@ inline std::size_t MeasureValueFrameBytes(std::size_t channel_count) {
   const std::vector<double> values(channel_count, 0.0);
   const auto values_offset = builder.CreateVector(values.data(), values.size());
   const Talos::Telemetry::Pose chassis{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-  Talos::Telemetry::FinishSizePrefixedFrameBuffer(
-      builder, Talos::Telemetry::CreateFrame(builder, /*stream_id=*/0,
-                                             /*sequence_id=*/0,
-                                             /*timestamp_ns=*/0,
-                                             /*dictionary_id=*/0, &chassis,
-                                             values_offset,
-                                             /*dictionary=*/0));
+  // Scalars have fixed widths, but zero defaults would omit their fields.
+  detail::FinishFrame(builder, 1, 1, 1, 1, chassis, values_offset);
+  return builder.GetSize();
+}
+
+// Dictionary frames carry the full value vector as well as channel metadata.
+inline std::size_t MeasureDictionaryFrameBytes(
+    const std::vector<ChannelDef>& dictionary) {
+  flatbuffers::FlatBufferBuilder builder{1024};
+  const std::vector<double> values(dictionary.size(), 0.0);
+  const auto values_offset = builder.CreateVector(values);
+  std::vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>> entries;
+  entries.reserve(dictionary.size());
+  for (const ChannelDef& channel : dictionary) {
+    std::vector<flatbuffers::Offset<flatbuffers::String>> labels;
+    labels.reserve(channel.labels.size());
+    for (const std::string& label : channel.labels) {
+      labels.push_back(builder.CreateString(label));
+    }
+    entries.push_back(Talos::Telemetry::CreateChannelInfo(
+        builder, builder.CreateString(channel.name),
+        channel.unit.empty() ? 0 : builder.CreateString(channel.unit),
+        channel.labels.empty() ? 0 : builder.CreateVector(labels)));
+  }
+  const auto dictionary_offset = builder.CreateVector(entries);
+  const Talos::Telemetry::Pose chassis{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  // Nonzero scalars include every field serialized by a live dictionary frame.
+  detail::FinishFrame(builder, 1, 1, 1, 1, chassis, values_offset,
+                      dictionary_offset);
   return builder.GetSize();
 }
 
@@ -249,7 +289,8 @@ class Telemetry {
       }
     }
 
-    if (!any_source_fresh) return;
+    if (!any_source_fresh && !last_frame_had_fresh_) return;
+    last_frame_had_fresh_ = any_source_fresh;
 
     std::fill(values_.begin(), values_.end(),
               std::numeric_limits<double>::quiet_NaN());
@@ -342,12 +383,10 @@ class Telemetry {
       dictionary_offset = builder.CreateVector(entries);
     }
 
-    Talos::Telemetry::FinishSizePrefixedFrameBuffer(
-        builder,
-        Talos::Telemetry::CreateFrame(
-            builder, stream_id_, sequence_,
-            static_cast<std::uint64_t>(node_.now().nanos()), dictionary_id_,
-            &chassis, values_offset, dictionary_offset));
+    detail::FinishFrame(
+        builder, stream_id_, sequence_,
+        static_cast<std::uint64_t>(node_.now().nanos()), dictionary_id_, chassis,
+        values_offset, dictionary_offset);
 
     studio_.send(std::as_bytes(
         std::span{builder.GetBufferPointer(), builder.GetSize()}));
@@ -454,6 +493,14 @@ class Telemetry {
                std::to_string(sorted_counts[i].second) + " channels)";
       }
       throw std::runtime_error(err);
+    }
+    const std::size_t dictionary_bytes =
+        MeasureDictionaryFrameBytes(dictionary_);
+    if (dictionary_bytes > telemetry_wire::slot_bytes) {
+      throw std::runtime_error(
+          "telemetry: dictionary frame is " + std::to_string(dictionary_bytes) +
+          " bytes, over the " + std::to_string(telemetry_wire::slot_bytes) +
+          "-byte shared-memory slot budget");
     }
   }
 
@@ -761,6 +808,7 @@ class Telemetry {
   std::vector<double> values_;
   flatbuffers::FlatBufferBuilder builder_{1024};
   std::uint64_t sequence_ = 0;
+  bool last_frame_had_fresh_{false};
 
   std::size_t idx_pose_valid_{0};
   bool has_pose_{false};

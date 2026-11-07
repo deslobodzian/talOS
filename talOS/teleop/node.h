@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <optional>
 #include <span>
@@ -109,20 +110,48 @@ inline void EncodeIntegerBytes(std::byte* dest, reflection::BaseType type,
   }
 }
 
+inline bool FitsFloatingPoint(reflection::BaseType type, double val) {
+  return std::isfinite(val) &&
+         (type != reflection::BaseType::Float ||
+          std::abs(val) <= std::numeric_limits<float>::max());
+}
+
 inline void EncodeNumericBytes(std::byte* dest, reflection::BaseType type,
                                double val, std::string_view where = "") {
   using reflection::BaseType;
+  if ((type == BaseType::Float || type == BaseType::Double) &&
+      !FitsFloatingPoint(type, val)) {
+    throw std::invalid_argument(
+        std::string{where} +
+        ": value must be finite and fit floating-point field");
+  }
   if (type == BaseType::Float) {
     auto f = static_cast<float>(val);
     std::memcpy(dest, &f, sizeof(float));
   } else if (type == BaseType::Double) {
     std::memcpy(dest, &val, sizeof(double));
   } else {
-    if (std::trunc(val) != val) {
+    if (!std::isfinite(val) || std::trunc(val) != val) {
       throw std::invalid_argument(std::string{where} +
-                                  ": fractional value for integer field");
+                                  ": non-finite or fractional value for integer field");
     }
-    EncodeIntegerBytes(dest, type, static_cast<int64_t>(val), where);
+    if (type == BaseType::ULong) {
+      // UINT64_MAX rounds up to 2^64 as a double, so use an exclusive
+      // power-of-two upper bound before converting.
+      if (val < 0.0 || val >= std::ldexp(1.0, 64)) {
+        throw std::invalid_argument(std::string{where} +
+                                    ": value does not fit unsigned integer field");
+      }
+      const auto v = static_cast<std::uint64_t>(val);
+      std::memcpy(dest, &v, sizeof(v));
+      return;
+    }
+    if (val < static_cast<double>(std::numeric_limits<std::int64_t>::min()) ||
+        val >= std::ldexp(1.0, 63)) {
+      throw std::invalid_argument(std::string{where} +
+                                  ": value does not fit integer field");
+    }
+    EncodeIntegerBytes(dest, type, static_cast<std::int64_t>(val), where);
   }
 }
 
@@ -301,6 +330,7 @@ class Teleop {
       std::fill(sub.field_set.begin(), sub.field_set.end(), 0);
 
       bool any_live = false;
+      bool invalid_axis = false;
       for (auto& b : sub.bindings) {
         const auto stick = ds_.joystick(b.port);
         if (!stick.connected()) {
@@ -327,12 +357,20 @@ class Teleop {
           }
         } else {
           const double raw = stick.axis(b.axis);
+          if (!std::isfinite(raw)) {
+            invalid_axis = true;
+            break;
+          }
           if (std::abs(raw) > b.deadband_frac) {
             any_live = true;
             if (!sub.field_set[b.axis_field.field_id]) {
               sub.field_set[b.axis_field.field_id] = 1;
               const double rescaled = Deadband(raw, b.deadband_frac);
               const double val = rescaled * b.scale;
+              if (!detail::FitsFloatingPoint(b.axis_field.base_type, val)) {
+                invalid_axis = true;
+                break;
+              }
               detail::WriteScalar(sub.buffer.data() + b.axis_field.offset,
                                   b.axis_field.base_type, val);
             }
@@ -340,7 +378,7 @@ class Teleop {
         }
       }
 
-      if (any_live) {
+      if (any_live && !invalid_axis) {
         sub.commanding = true;
         TargetAccess::lane_send(node_, sub.lane_index, sub.buffer.data(),
                                 sub.buffer.size());
@@ -512,6 +550,11 @@ class Teleop {
         binding.axis = *parsed_binding.axis;
         binding.scale = parsed_binding.scale;
         binding.deadband_frac = parsed_binding.deadband_frac;
+        if (!std::isfinite(binding.scale) ||
+            !std::isfinite(binding.deadband_frac)) {
+          throw std::invalid_argument(
+              entry_where + ": scale and deadband_frac must be finite");
+        }
 
         const std::string field_where = entry_where + ".field";
         detail::ResolvedField rf = detail::ResolveField(
@@ -520,6 +563,11 @@ class Teleop {
             rf.enum_def != nullptr) {
           throw std::invalid_argument(field_where + ": field '" + rf.leaf_name +
                                       "' must be a numeric scalar");
+        }
+        if (rf.base_type != reflection::BaseType::Float &&
+            rf.base_type != reflection::BaseType::Double) {
+          throw std::invalid_argument(field_where + ": axis field '" +
+                                      rf.leaf_name + "' must be floating-point");
         }
 
         binding.axis_field.field_id = get_field_id(parsed_binding.field);

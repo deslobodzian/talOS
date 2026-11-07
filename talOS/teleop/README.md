@@ -36,6 +36,10 @@ schema, including numeric types, booleans and enum labels; nested struct fields
 use slash-separated paths. Axis triggers instead require `field` and `scale`,
 with optional `deadband_frac` in [0, 1), and reject action tables and `pov_index`.
 
+Numeric assignments must be finite and representable by their destination
+fields. A nonfinite axis input or an axis output outside its destination field's
+finite range releases the subsystem's entire teleop lane.
+
 `while_held` contributes assignments only while the button is pressed or the
 selected POV matches its direction. `on_toggle` flips a latch on each rising
 edge: holding the trigger does not retrigger it, releasing preserves the latch,

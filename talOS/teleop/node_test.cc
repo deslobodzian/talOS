@@ -2,9 +2,12 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -335,6 +338,52 @@ TEST(TeleopNode, AxisDeadbandEdgeAndContinuousScaling) {
   EXPECT_NEAR(negative_axis.velocity_rps(), -5.0, 1e-6);
 }
 
+TEST(TeleopNode, OverflowingAxisOutputReleasesEntireLaneAndRecovers) {
+  for (const std::string field : {"inner/offset_m", "position_m"}) {
+    SCOPED_TRACE(field);
+    const std::string scale = field == "position_m" ? "1e308" : "1e40";
+    const std::string config =
+        "[robot]\nperiod_us = 20000\ncommand_timeout_us = 100000\n"
+        "[subsystems.mechanism]\n"
+        "[[subsystems.mechanism.teleop.bindings]]\n"
+        "button = 1\nwhile_held = { flag = true }\n"
+        "[[subsystems.mechanism.teleop.bindings]]\n"
+        "axis = 0\nfield = \"" +
+        field + "\"\nscale = " + scale + "\n[subsystems.teleop]\n";
+    Sim sim = MakeSim(config);
+    auto& mechanism = sim.add<ConsumerNode<schema_test::Mixed>>("mechanism");
+    sim.add<Teleop>("teleop");
+    SimHardware hw{sim};
+    hw.enable();
+
+    auto push = [&](float axis, std::uint32_t flags = kTeleopEnabled) {
+      Push(hw, sim, DsPacket(flags, MakeStick(axis, 0, 0, 1)));
+    };
+    push(0.001f);
+    ASSERT_TRUE(mechanism.seen);
+    EXPECT_TRUE(mechanism.seen->flag());
+    EXPECT_TRUE(std::isfinite(mechanism.seen->position_m()));
+    EXPECT_TRUE(std::isfinite(mechanism.seen->inner().offset_m()));
+    EXPECT_GT(field == "position_m" ? mechanism.seen->position_m()
+                                    : mechanism.seen->inner().offset_m(),
+              0.0);
+
+    // Float narrowing and double multiplication overflow both fail closed,
+    // even though the button binding is still live.
+    push(4.0f);
+    EXPECT_FALSE(mechanism.seen);
+    push(0.001f);
+    EXPECT_TRUE(mechanism.seen);
+    push(0.001f, ds::kTeleop | ds::kDsAttached);
+    EXPECT_FALSE(mechanism.seen);
+    push(0.001f);
+    EXPECT_TRUE(mechanism.seen);
+    hw.stop_driver_station();
+    sim.step(150ms);
+    EXPECT_FALSE(mechanism.seen);
+  }
+}
+
 TEST(TeleopNode, DisabledRobotReleasesOnceAndSendsNoFurtherMessages) {
   Sim sim = MakeSim(kRollerToml);
   auto& roller = sim.add<ConsumerNode<control::VelocityTarget>>("roller");
@@ -423,6 +472,150 @@ TEST(TeleopNode, StickDisconnectedReleasesLaneOnce) {
 }
 
 // --- Construction error tests ---
+
+TEST(TeleopNode, ConstructionRejectsInvalidFloatingPointButtonAssignments) {
+  for (const std::string action : {"while_held", "on_toggle"}) {
+    for (const std::string field : {"position_m", "inner/offset_m"}) {
+      for (const std::string value : {"nan", "inf", "-inf", "1e40", "-1e40"}) {
+        if (field == "position_m" &&
+            (value == "1e40" || value == "-1e40")) {
+          continue;  // These values fit a double.
+        }
+        SCOPED_TRACE(action + "." + field + " = " + value);
+        const std::string config =
+            "[robot]\nperiod_us = 20000\n[subsystems.mechanism]\n"
+            "[[subsystems.mechanism.teleop.bindings]]\nbutton = 1\n" +
+            action + " = { \"" + field + "\" = " + value +
+            " }\n[subsystems.teleop]\n";
+        Sim sim = MakeSim(config);
+        sim.add<ConsumerNode<schema_test::Mixed>>("mechanism");
+        try {
+          sim.add<Teleop>("teleop");
+          FAIL() << "expected std::invalid_argument";
+        } catch (const std::invalid_argument& e) {
+          const std::string message{e.what()};
+          EXPECT_NE(message.find("[subsystems.mechanism] teleop.bindings[0]." +
+                                 action + "." + field),
+                    std::string::npos)
+              << message;
+          EXPECT_NE(message.find("finite and fit floating-point field"),
+                    std::string::npos)
+              << message;
+        }
+      }
+    }
+  }
+}
+
+TEST(TeleopNode, FloatingPointEncodingAcceptsFiniteLimitsWithoutOverflow) {
+  using reflection::BaseType;
+  std::array<std::byte, 8> bytes{};
+  const double float_max = std::numeric_limits<float>::max();
+  for (const double value : {float_max, -float_max}) {
+    EXPECT_NO_THROW(
+        detail::EncodeNumericBytes(bytes.data(), BaseType::Float, value));
+    float decoded{};
+    std::memcpy(&decoded, bytes.data(), sizeof(decoded));
+    EXPECT_TRUE(std::isfinite(decoded));
+    EXPECT_DOUBLE_EQ(decoded, value);
+  }
+  EXPECT_THROW(
+      detail::EncodeNumericBytes(
+          bytes.data(), BaseType::Float,
+          std::nextafter(float_max, std::numeric_limits<double>::infinity())),
+      std::invalid_argument);
+  EXPECT_NO_THROW(detail::EncodeNumericBytes(
+      bytes.data(), BaseType::Double, std::numeric_limits<double>::max()));
+}
+
+TEST(TeleopNode, ConstructionRejectsNonFiniteAxisParameters) {
+  for (const std::string parameter : {"scale", "deadband_frac"}) {
+    for (const std::string value : {"nan", "inf", "-inf"}) {
+      SCOPED_TRACE(parameter + " = " + value);
+      std::string config{kAxisToml};
+      const std::string old_value =
+          parameter == "scale" ? "scale = 10.0" : "deadband_frac = 0.125";
+      config.replace(config.find(old_value), old_value.size(),
+                     parameter + " = " + value);
+      // Some parameter parsers reject these even before node construction.
+      EXPECT_THROW(
+          {
+            Sim sim = MakeSim(config);
+            sim.add<ConsumerNode<control::VelocityTarget>>("arm");
+            sim.add<Teleop>("teleop");
+          },
+          std::invalid_argument);
+    }
+  }
+}
+
+TEST(TeleopNode, ConstructionRejectsAxisBoundToInteger) {
+  const std::string config = R"(
+[robot]
+period_us = 20000
+[subsystems.mechanism]
+period_us = 20000
+[[subsystems.mechanism.teleop.bindings]]
+axis = 0
+field = "sample_count"
+scale = 1.0
+[subsystems.teleop]
+period_us = 20000
+)";
+  Sim sim = MakeSim(config);
+  sim.add<ConsumerNode<schema_test::Mixed>>("mechanism");
+  try {
+    sim.add<Teleop>("teleop");
+    FAIL() << "expected std::invalid_argument";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string{e.what()}.find("must be floating-point"),
+              std::string::npos);
+  }
+}
+
+TEST(TeleopNode, NumericIntegerEncodingChecksBoundsBeforeConversion) {
+  using reflection::BaseType;
+  std::array<std::byte, 8> bytes{};
+  for (const double value : {
+           std::numeric_limits<double>::quiet_NaN(),
+           std::numeric_limits<double>::infinity(),
+           -std::numeric_limits<double>::infinity(),
+           std::ldexp(1.0, 63),
+           std::nextafter(-std::ldexp(1.0, 63),
+                          -std::numeric_limits<double>::infinity())}) {
+    EXPECT_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::Long,
+                                             value),
+                 std::invalid_argument);
+  }
+  EXPECT_NO_THROW(detail::EncodeNumericBytes(
+      bytes.data(), BaseType::Long, -std::ldexp(1.0, 63)));
+  std::int64_t signed_value{};
+  std::memcpy(&signed_value, bytes.data(), sizeof(signed_value));
+  EXPECT_EQ(signed_value, std::numeric_limits<std::int64_t>::min());
+  const double largest_signed =
+      std::nextafter(std::ldexp(1.0, 63), 0.0);
+  EXPECT_NO_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::Long,
+                                            largest_signed));
+  EXPECT_THROW(detail::EncodeNumericBytes(
+                   bytes.data(), BaseType::ULong, std::ldexp(1.0, 64)),
+               std::invalid_argument);
+  EXPECT_THROW(
+      detail::EncodeNumericBytes(bytes.data(), BaseType::ULong, -1.0),
+      std::invalid_argument);
+  const double largest_unsigned =
+      std::nextafter(std::ldexp(1.0, 64), 0.0);
+  EXPECT_NO_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::ULong,
+                                            largest_unsigned));
+  std::uint64_t unsigned_value{};
+  std::memcpy(&unsigned_value, bytes.data(), sizeof(unsigned_value));
+  EXPECT_EQ(unsigned_value, static_cast<std::uint64_t>(largest_unsigned));
+  EXPECT_THROW(
+      detail::EncodeNumericBytes(bytes.data(), BaseType::Byte, 128.0),
+      std::invalid_argument);
+  EXPECT_THROW(
+      detail::EncodeNumericBytes(bytes.data(), BaseType::UInt, -1.0),
+      std::invalid_argument);
+}
 
 TEST(TeleopNode, ConstructionErrorUnknownFieldInButton) {
   constexpr const char* kToml = R"(

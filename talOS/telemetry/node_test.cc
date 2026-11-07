@@ -614,6 +614,157 @@ node = "//talOS/telemetry:node"
   }
 }
 
+// Each topic contributes one channel after excluding its offset field.
+class BoundaryChannelsNode {
+ public:
+  explicit BoundaryChannelsNode(talos::Node& node) {
+    const auto count = node.param<std::int64_t>("channel_count", 0);
+    for (std::int64_t i = 0; i < count; ++i) {
+      publishers_.push_back(node.publish<schema_test::Inner>(
+          "/budget/state/" + std::to_string(i)));
+    }
+  }
+
+  void send() {
+    for (auto& publisher : publishers_) {
+      publisher.send(schema_test::Inner{schema_test::Mode::LOW, 1.0f});
+    }
+  }
+
+ private:
+  std::vector<talos::Publisher<schema_test::Inner>> publishers_;
+};
+
+TEST(TelemetryTest, LargestAcceptedLiveValueFrameFitsBudget) {
+  std::size_t channel_count = 1;
+  while (MeasureValueFrameBytes(channel_count + 1) <=
+         telemetry_wire::kMaxValueFrameBytes) {
+    ++channel_count;
+  }
+  ASSERT_LE(MeasureValueFrameBytes(channel_count),
+            telemetry_wire::kMaxValueFrameBytes);
+  ASSERT_GT(MeasureValueFrameBytes(channel_count + 1),
+            telemetry_wire::kMaxValueFrameBytes);
+
+  const auto config = [](std::size_t count) {
+    return std::string{R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+[subsystems.budget]
+node = "//budget:node"
+channel_count = )"} +
+           std::to_string(count) + R"(
+[subsystems.budget.motors.m]
+can_id = 1
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+exclude = ["budget/state/*/offset_m"]
+)";
+  };
+
+  // The built-in pose/valid channel accounts for the remaining entry.
+  Sim sim = Sim::FromToml(config(channel_count - 1));
+  auto& source = sim.add<BoundaryChannelsNode>("budget");
+  const auto& telemetry = sim.add<Telemetry>("telemetry");
+  ASSERT_EQ(telemetry.dictionary().size(), channel_count);
+  source.send();
+  sim.step(20ms);
+  source.send();
+  sim.step(20ms);
+  const auto frame = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(frame, nullptr);
+  ASSERT_EQ(frame->dictionary(), nullptr);
+  ASSERT_NE(frame->stream_id(), 0u);
+  ASSERT_NE(frame->sequence_id(), 0u);
+  ASSERT_NE(frame->timestamp_ns(), 0u);
+  ASSERT_NE(frame->dictionary_id(), 0u);
+  ASSERT_EQ(frame->values()->size(), channel_count);
+  EXPECT_LE(frame.bytes.size(), telemetry_wire::kMaxValueFrameBytes);
+  EXPECT_LE(frame.bytes.size(), MeasureValueFrameBytes(channel_count));
+
+  Sim oversized = Sim::FromToml(config(channel_count));
+  oversized.add<BoundaryChannelsNode>("budget");
+  EXPECT_THROW(oversized.add<Telemetry>("telemetry"), std::runtime_error);
+}
+
+// A single scalar keeps the value frame small while its metadata exceeds a
+// dictionary slot. BFBS permits long field names even with short topic names.
+class LargeDictionaryNode {
+ public:
+  explicit LargeDictionaryNode(talos::Node& node) {
+    flatbuffers::FlatBufferBuilder builder;
+    const auto field_name =
+        builder.CreateString(std::string(telemetry_wire::slot_bytes, 'x'));
+    const auto object_name = builder.CreateString("budget.State");
+    reflection::TypeBuilder type_builder{builder};
+    type_builder.add_base_type(reflection::BaseType::Double);
+    type_builder.add_index(-1);
+    const auto type = type_builder.Finish();
+    reflection::FieldBuilder field_builder{builder};
+    field_builder.add_name(field_name);
+    field_builder.add_type(type);
+    const auto field = field_builder.Finish();
+    const auto fields = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Field>>{field});
+    reflection::ObjectBuilder object_builder{builder};
+    object_builder.add_name(object_name);
+    object_builder.add_fields(fields);
+    object_builder.add_is_struct(true);
+    object_builder.add_minalign(8);
+    object_builder.add_bytesize(8);
+    const auto object = object_builder.Finish();
+    const auto objects = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Object>>{object});
+    const auto enums = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder schema_builder{builder};
+    schema_builder.add_objects(objects);
+    schema_builder.add_enums(enums);
+    reflection::FinishSchemaBuffer(builder, schema_builder.Finish());
+    schema_.assign(reinterpret_cast<const char*>(builder.GetBufferPointer()),
+                   builder.GetSize());
+    talos::detail::NodeAccess::add_publisher(
+        node, "/budget/state", 8, 8,
+        talos::schema::Identity{"budget.State", 12345, schema_});
+  }
+
+ private:
+  std::string schema_;
+};
+
+TEST(TelemetryTest, DictionaryFrameMustFitSharedMemorySlot) {
+  const std::vector<ChannelDef> small{{"pose/valid", "", {}}};
+  EXPECT_LE(MeasureDictionaryFrameBytes(small), telemetry_wire::slot_bytes);
+  const std::vector<ChannelDef> large{
+      {"status", "", {std::string(telemetry_wire::slot_bytes, 'x')}}};
+  EXPECT_LT(MeasureValueFrameBytes(large.size()),
+            telemetry_wire::kMaxValueFrameBytes);
+  EXPECT_GT(MeasureDictionaryFrameBytes(large), telemetry_wire::slot_bytes);
+
+  Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 10000
+[subsystems.budget]
+node = "//budget:node"
+[subsystems.budget.motors.m]
+can_id = 1
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)");
+  sim.add<LargeDictionaryNode>("budget");
+  try {
+    sim.add<Telemetry>("telemetry");
+    FAIL() << "expected dictionary slot budget failure";
+  } catch (const std::runtime_error& err) {
+    const std::string message{err.what()};
+    EXPECT_NE(message.find("dictionary frame is"), std::string::npos);
+    EXPECT_NE(message.find("16384-byte shared-memory slot budget"),
+              std::string::npos);
+  }
+}
+
 TEST(TelemetryTest, PoseTopicMissingErrors) {
   const std::string kAbsentConfig = R"(
 [robot]
@@ -768,7 +919,7 @@ node = "//talOS/telemetry:node"
   EXPECT_EQ(mode_labels[4], "HIGH");
 }
 
-TEST(TelemetryTest, StalePoseBecomesZeroAndNaN) {
+TEST(TelemetryTest, AllSourcesStaleEmitsOneClearingFrameThenResumes) {
   const std::string kConfig = R"(
 [robot]
 period_us = 10000
@@ -806,16 +957,40 @@ stale_timeout_us = 50000
       0,
   };
   estimator.pose_.send(estimate);
-  sim.step(20ms);
+  sim.step(50ms);
 
   auto frame = LatestFrame(sim, "/talos/telemetry");
   ASSERT_NE(frame, nullptr);
   EXPECT_DOUBLE_EQ(frame->chassis()->x(), 2.0);
   auto channels = DecodeChannels(telemetry, frame);
   EXPECT_DOUBLE_EQ(channels.at("pose/valid"), 1.0);
+  const auto fresh_sequence = frame->sequence_id();
 
-  // Advance time past stale_timeout_us (100ms) without sending new pose
+  // Advance time past stale_timeout_us (50ms) without sending new pose
   sim.step(100ms);
+  // The last fresh source becoming stale emits one clearing frame, even when
+  // there is no other source left to trigger normal publication.
+  frame = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(frame, nullptr);
+  const auto stale_sequence = frame->sequence_id();
+  EXPECT_EQ(stale_sequence, fresh_sequence + 1);
+  EXPECT_DOUBLE_EQ(frame->chassis()->x(), 0.0);
+  EXPECT_DOUBLE_EQ(frame->chassis()->y(), 0.0);
+  EXPECT_DOUBLE_EQ(frame->chassis()->z(), 0.0);
+  EXPECT_DOUBLE_EQ(frame->chassis()->roll(), 0.0);
+  EXPECT_DOUBLE_EQ(frame->chassis()->pitch(), 0.0);
+  EXPECT_DOUBLE_EQ(frame->chassis()->yaw(), 0.0);
+  for (std::size_t i = 0; i < telemetry.dictionary().size(); ++i) {
+    if (telemetry.dictionary()[i].name == "pose/valid") {
+      EXPECT_DOUBLE_EQ(frame->values()->Get(i), 0.0);
+    } else {
+      EXPECT_TRUE(std::isnan(frame->values()->Get(i)));
+    }
+  }
+  sim.step(100ms);
+  frame = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(frame, nullptr);
+  EXPECT_EQ(frame->sequence_id(), stale_sequence);
 
   // Publish arrays on demo node so telemetry produces a new frame while pose is
   // stale
@@ -825,6 +1000,7 @@ stale_timeout_us = 50000
 
   frame = LatestFrame(sim, "/talos/telemetry");
   ASSERT_NE(frame, nullptr);
+  EXPECT_GT(frame->sequence_id(), stale_sequence);
   EXPECT_DOUBLE_EQ(frame->chassis()->x(), 0.0);
   EXPECT_DOUBLE_EQ(frame->chassis()->y(), 0.0);
   EXPECT_DOUBLE_EQ(frame->chassis()->yaw(), 0.0);
