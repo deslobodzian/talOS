@@ -54,6 +54,30 @@ const char* kNewSchemaJson = R"({
   ]
 })";
 
+TEST(FieldLayoutLoader, RejectsInvalidAndDuplicateTagIds) {
+  for (const auto* id : {"1.5", "2147483648", "-2147483649", "1e999"}) {
+    std::string text = kClassicJson;
+    const auto pos = text.find("\"ID\": 7");
+    ASSERT_NE(pos, std::string::npos);
+    text.replace(pos, 7, std::string("\"ID\": ") + id);
+    FieldLayoutData data;
+    std::string error;
+    EXPECT_FALSE(LoadFieldLayoutFromJson(text, kTagSize, &data, &error)) << id;
+    EXPECT_FALSE(error.empty());
+  }
+  std::string text = kClassicJson;
+  const auto start = text.find("{\"ID\"");
+  const auto end = text.find("\n  ]", start);
+  ASSERT_NE(start, std::string::npos);
+  ASSERT_NE(end, std::string::npos);
+  const auto tag = text.substr(start, end - start);
+  text.insert(end, "," + tag);
+  FieldLayoutData data;
+  std::string error;
+  EXPECT_FALSE(LoadFieldLayoutFromJson(text, kTagSize, &data, &error));
+  EXPECT_NE(error.find("duplicate"), std::string::npos);
+}
+
 TEST(JsonParser, RoundTripsValues) {
   JsonValue v;
   std::string err;

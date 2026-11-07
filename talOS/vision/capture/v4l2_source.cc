@@ -124,6 +124,11 @@ class Source final : public CameraSource {
     if (!selected) {
       return Fail();
     }
+    if (mode_.width > 0 && mode_.height > 0 &&
+        (format.fmt.pix.width != mode_.width ||
+         format.fmt.pix.height != mode_.height)) {
+      return Fail();
+    }
     mode_.width = format.fmt.pix.width;
     mode_.height = format.fmt.pix.height;
     mode_.format = format.fmt.pix.pixelformat == V4L2_PIX_FMT_GREY

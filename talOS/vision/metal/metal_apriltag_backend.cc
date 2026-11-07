@@ -514,6 +514,12 @@ struct MetalAprilTagBackend::Impl {
         in_buf_needs_release = true;
       }
     }
+    const auto cpu_fallback = [&]() {
+      if (in_buf_needs_release) in_buf->release();
+      pool->release();
+      return CpuDetect(data, width, height, stride, format, p_intrinsics,
+                       tag_size_meters);
+    };
     if (in_buf == nullptr) {
       if (!cached_in_buf || cached_in_capacity < in_bytes) {
         if (cached_in_buf) cached_in_buf->release();
@@ -521,9 +527,11 @@ struct MetalAprilTagBackend::Impl {
             device->newBuffer(in_bytes, MTL::ResourceStorageModeShared);
         cached_in_capacity = in_bytes;
       }
+      if (!cached_in_buf || !cached_in_buf->contents()) return cpu_fallback();
       std::memcpy(cached_in_buf->contents(), data, in_bytes);
       in_buf = cached_in_buf;
     }
+    if (!in_buf->contents()) return cpu_fallback();
 
     const bool use_gpu_decimated = (options.quad_decimate >= 2.0f);
     MTL::Buffer* dec_buf = nullptr;
@@ -546,6 +554,10 @@ struct MetalAprilTagBackend::Impl {
       cached_gray_capacity = gray_bytes;
     }
     gray_buf = cached_gray_buf;
+    if (!gray_buf || !gray_buf->contents() ||
+        (use_gpu_decimated && (!dec_buf || !dec_buf->contents()))) {
+      return cpu_fallback();
+    }
 
     MTL::CommandBuffer* cmd_buf = queue->commandBuffer();
     MTL::ComputeCommandEncoder* enc = cmd_buf->computeCommandEncoder();
@@ -618,12 +630,12 @@ struct MetalAprilTagBackend::Impl {
     if (pso_tile_min_max_4x4 != nullptr &&
         pso_tile_blur_and_threshold != nullptr && detect_gray_buf != nullptr &&
         detect_w >= 4 && detect_h >= 4) {
-      RunGpuThreshold(
+      const bool threshold_ok = RunGpuThreshold(
           cmd_buf, detect_gray_buf, nullptr, static_cast<uint32_t>(detect_w),
           static_cast<uint32_t>(detect_h), static_cast<uint32_t>(detect_w),
           static_cast<uint32_t>(td->qtp.min_white_black_diff), enc);
       enc->memoryBarrier(MTL::BarrierScopeBuffers);
-      if (cached_thresh_buf != nullptr &&
+      if (threshold_ok && cached_thresh_buf != nullptr &&
           cached_thresh_buf->contents() != nullptr) {
         threshim.buf = static_cast<uint8_t*>(cached_thresh_buf->contents());
         threshim_ptr = &threshim;
@@ -692,7 +704,10 @@ struct MetalAprilTagBackend::Impl {
           }
           if (cached_parent_buf != nullptr && cached_size_buf != nullptr &&
               cached_cand_buf != nullptr && cached_cand_count_buf != nullptr &&
-              cached_thresh_buf != nullptr) {
+              cached_thresh_buf != nullptr &&
+              cached_parent_buf->contents() && cached_size_buf->contents() &&
+              cached_cand_buf->contents() && cached_cand_count_buf->contents() &&
+              cached_thresh_buf->contents()) {
             *static_cast<uint32_t*>(cached_cand_count_buf->contents()) = 0;
             MTL::ComputeCommandEncoder* cenc = enc;
             const uint32_t dw = static_cast<uint32_t>(detect_w);
@@ -899,16 +914,16 @@ struct MetalAprilTagBackend::Impl {
 #endif
   }
 
-  void RunGpuThreshold(MTL::CommandBuffer* cmd_buf, MTL::Buffer* gray_buf,
+  bool RunGpuThreshold(MTL::CommandBuffer* cmd_buf, MTL::Buffer* gray_buf,
                        MTL::Buffer* thresh_buf, uint32_t width, uint32_t height,
                        uint32_t stride, uint32_t min_diff,
                        MTL::ComputeCommandEncoder* shared_encoder = nullptr) {
 #if defined(__APPLE__)
     if (!cmd_buf || !gray_buf || width == 0 || height == 0) {
-      return;
+      return false;
     }
     if (!pso_tile_min_max_4x4 || !pso_tile_blur_and_threshold) {
-      return;
+      return false;
     }
 
     std::lock_guard<std::recursive_mutex> lock(mutex);
@@ -917,7 +932,7 @@ struct MetalAprilTagBackend::Impl {
     const uint32_t tw = width / 4;
     const uint32_t th = height / 4;
     if (tw == 0 || th == 0) {
-      return;
+      return false;
     }
 
     const size_t min_max_bytes = static_cast<size_t>(tw) * th;
@@ -944,6 +959,12 @@ struct MetalAprilTagBackend::Impl {
         cached_thresh_capacity = thresh_bytes;
       }
       out_thresh = cached_thresh_buf;
+    }
+    if (!gray_buf->contents() ||
+        !cached_im_min_buf || !cached_im_min_buf->contents() ||
+        !cached_im_max_buf || !cached_im_max_buf->contents() ||
+        !out_thresh || !out_thresh->contents()) {
+      return false;
     }
 
     MTL::ComputeCommandEncoder* enc = shared_encoder != nullptr
@@ -982,6 +1003,7 @@ struct MetalAprilTagBackend::Impl {
     enc->dispatchThreadgroups(tg_count_thresh, tg_size);
 
     if (shared_encoder == nullptr) enc->endEncoding();
+    return true;
 #else
     (void)shared_encoder;
     (void)cmd_buf;
@@ -991,6 +1013,7 @@ struct MetalAprilTagBackend::Impl {
     (void)height;
     (void)stride;
     (void)min_diff;
+    return false;
 #endif
   }
 };

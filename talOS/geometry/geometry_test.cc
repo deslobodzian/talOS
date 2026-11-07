@@ -94,6 +94,22 @@ TEST(SE2, RoundTripAndOracle) {
       SE2<double>::Exp(Eigen::Vector3d::Zero()).translation().isZero(1e-15));
 }
 
+TEST(SE2, LogUsesPrincipalAngleNearFullTurns) {
+  const Eigen::Vector2d translation(1.5, -2.0);
+  for (double angle : {-2 * kPi, -2 * kPi - 1e-8, -2 * kPi + 1e-8,
+                       2 * kPi, 2 * kPi - 1e-8, 2 * kPi + 1e-8}) {
+    const SE2<double> pose(angle, translation);
+    const auto tangent = pose.Log();
+    ASSERT_TRUE(tangent.allFinite());
+    EXPECT_NEAR(tangent(0), SO2<double>(angle).angle(), kTight);
+    EXPECT_LT(tangent.tail<2>().norm(), 3.0);
+    const auto recovered = SE2<double>::Exp(tangent);
+    EXPECT_TRUE(recovered.translation().isApprox(translation, kTight));
+    EXPECT_TRUE(recovered.rotation().rotationMatrix().isApprox(
+        pose.rotation().rotationMatrix(), kTight));
+  }
+}
+
 TEST(SO3, Axioms) {
   auto rng = Rng();
   for (int i = 0; i < 500; ++i) {

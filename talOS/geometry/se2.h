@@ -52,10 +52,10 @@ class SE2 {
     return SE2(w, v * tau.template tail<2>());
   }
 
-  // Logarithmic map, exact: omega = theta, v = V^-1 t with
+  // Logarithmic map, exact: omega = principal theta, v = V^-1 t with
   // V^-1 = (sinc I - m J) / (sinc^2 + m^2), regular at the origin.
   Vector3 Log() const {
-    const Scalar w = theta_;
+    const Scalar w = SO2<Scalar>(theta_).angle();
     const Scalar aw = std::abs(w);
     Scalar sinc, m;
     if (aw < TaylorThreshold()) {
