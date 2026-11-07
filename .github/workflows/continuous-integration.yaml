@@ -152,9 +152,10 @@ jobs:
         esac
         echo "Diff base: $BASE"
         # --dry-run --Werror: check only, never reformats. .clang-format at
-        # the repo root is picked up automatically.
+        # the repo root is picked up automatically. third_party/ is vendored
+        # upstream source (metal-cpp) and keeps its upstream formatting.
         git diff --name-only --diff-filter=d -z "$BASE" HEAD -- \
-          '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' \
+          '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' ':!third_party/' \
           | xargs -0 -r clang-format-18 --dry-run --Werror
 
   clang-tidy:
