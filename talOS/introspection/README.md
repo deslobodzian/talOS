@@ -38,12 +38,31 @@ wall time; the Studio bridge converts heartbeat age back into a display wall
 timestamp at serialization. Version-2 binaries must be rebuilt together: the
 old wall-time epoch is deliberately isolated in its old segment.
 
-A fresh segment is zero-filled, which is what makes initialization safe without
-a lock: the first process to attach wins a compare-exchange on the header's
-magic word from 0 to `kInitializing`, fills in the capacities, and then stores
-the real magic. Everyone else spins on the magic for a bounded 50 ms and fails
-with a message naming the segment if it never appears — a process that died
-between the two stores would otherwise hang every node that followed it.
+Openers serialize segment creation, sizing and initialization with an exclusive
+`flock` on a regular file, `/tmp/talos-registry-<mapped-name>.lock` (the mapped
+name without its leading slash). The name is the exact `ShmObjectName` result
+used for the segment, so `TALOS_SHM_NAMESPACE` and `TEST_TMPDIR` isolate the lock
+and the segment together; no second namespace or temp-directory rule applies.
+The lock is opened independently for each acquisition, serializing threads as
+well as processes, and is close-on-exec. The kernel releases it on close or
+process death, including SIGKILL. A normal file works on Linux and macOS:
+[Darwin's `flock` requires a vnode](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_descrip.c),
+but [its shared-memory descriptors are `DTYPE_PSXSHM`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/posix_shm.c),
+not vnodes; locking the shm descriptor itself is not portable.
+
+The writer resets any uncommitted segment under this lock, fills the header,
+then release-stores the magic word as the final commit. An initializer killed
+at any earlier instruction leaves an uncommitted segment: the next writer
+reinitializes it, without a timeout or manual `shm_unlink`. A committed but
+incompatible layout is still rejected, never reset. A read-only opener takes
+the startup lock and validates the commit; it cannot repair an incomplete
+segment and reports that a writer must initialize it. Polling an open reader
+never locks. Lock files deliberately persist, even across explicit segment
+unlinks: unlinking a lock file could split waiters between two inodes.
+
+The record layout, registry name/version and monotonic heartbeat epoch are
+unchanged. All writers sharing a registry must use this locking protocol;
+rebuild them together rather than mixing old lock-free claimers with new ones.
 
 `RegistryMapping` does its own `shm_open` and `mmap` rather than using
 `SharedMemoryPtr`, because `SharedMemoryPtr` unlinks on destruction. That is
@@ -139,18 +158,21 @@ an error.
 
 ## Claiming a slot, and liveness
 
-A slot is FREE, CLAIMING or ACTIVE, and a node moves it with a compare-exchange
-— the same pattern RTMS already uses for reader slots. `NodeRegistration` takes
-a FREE slot if there is one. Only when every slot is taken does it consider
-stealing one, and then only from a node whose last heartbeat is older than
-`kLivenessTimeout`, five seconds.
+A slot is FREE, CLAIMING or ACTIVE. `NodeRegistration` holds the same kernel
+lock from the stale-slot sweep through the claim's ACTIVE commit. It takes a
+FREE slot and writes identity, counts, heartbeat and generation before
+release-storing ACTIVE. A claimant killed at any instruction before this
+commit cannot keep the lock held. Any CLAIMING slot observed by the next sweep
+under the lock is therefore abandoned, and is freed immediately, even if the
+claimant died before recording a pid or heartbeat. This also recovers a sweeper
+killed during its own temporary CLAIMING transition. Recovery takes one sweep
+(a fixed scan of 32 slots), not 32 restarts or a heartbeat timeout.
 
-Five seconds is deliberately generous. A process stopped in a debugger is not a
-dead process, and the cost of waiting is one stale row in a viewer, whereas the
-cost of being impatient is evicting a node that was about to publish. For the
-same reason staleness is checked only on the fallback path: a stale slot is left
-alone while any slot is genuinely free, so a registry that is not under pressure
-never evicts anyone.
+Every new claim also sweeps ACTIVE slots whose host-monotonic heartbeat is at
+least `kLivenessTimeout`, five seconds old. The heartbeat is rechecked after
+the ACTIVE-to-CLAIMING transition so a refresh observed during the sweep can
+keep the row. Five seconds is deliberately generous: a process stopped in a
+debugger is not a dead process, and the cost of waiting is one stale viewer row.
 
 Each claim bumps a generation counter before the slot goes ACTIVE. A reader
 snapshots the generation, copies the identity fields, and re-reads it; a change
@@ -170,10 +192,10 @@ Writers only ever touch their own slot, which is padded to a cache line so two
 nodes updating counters do not contend on the same line. Every field a reader
 observes while a node runs is a lock-free atomic — there are static assertions
 to that effect, because a registry that fell back to a lock would be a registry
-that could block a control loop. `RegistryReader` writes nothing and takes
-nothing, so it is safe to poll at any rate, and `RegistryReader::open` returns
-`nullopt` instead of throwing when the segment does not exist: no nodes running
-is an ordinary state for a viewer to start up in, not an error.
+that could block a control loop. `RegistryReader` writes nothing and locks only
+while opening, never while polling, so it is safe to poll at any rate.
+`RegistryReader::open` returns `nullopt` instead of throwing when the segment
+does not exist: no nodes running is an ordinary viewer startup state.
 
 ## Why the reporter is a thread and not an event source
 
@@ -263,6 +285,12 @@ the launcher runs before it spawns anything. NAMING.md is the prose.
 ```sh
 bazel test //talOS/introspection/...
 ```
+
+`registry_test` uses forked children stopped at startup-only injection hooks,
+then SIGKILLed before the initialization or ACTIVE commit. `waitpid(WUNTRACED)`
+synchronizes the kill without sleeps. The tests verify initialization recovery,
+all 32 slots remaining usable after an abandoned claim, and eight concurrent
+processes holding distinct registrations across the entire registry.
 
 `:registry` is the segment and both ends of it, and depends only on
 `//talOS/events:events_core` and `:names` — a reader such as Studio's bridge

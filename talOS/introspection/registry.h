@@ -37,16 +37,19 @@
  */
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -220,8 +223,8 @@ struct alignas(64) NodeRecord {
 };
 
 struct RegistryHeader {
-  // 0 in a fresh segment. The first writer CASes it to kInitializing, fills in
-  // the rest, then stores kMagic; everyone else waits for kMagic.
+  // Initialization is serialized by RegistryLock. kMagic is committed last;
+  // an opener holding the lock can restart any uncommitted initialization.
   std::atomic<std::uint64_t> magic;
   std::uint32_t version;
   std::uint32_t node_capacity;
@@ -285,6 +288,49 @@ inline std::string read_name(const char* value, std::size_t capacity) {
   return std::string{value, n};
 }
 
+// Optional startup-only fault-injection seams. Production callers leave these
+// null; tests stop a child while it owns the lock, before either commit.
+struct RegistryTestHooks {
+  void (*initializing)(RegistryHeader*){nullptr};
+  void (*claiming)(NodeRecord*){nullptr};
+};
+
+// Use a regular file: Darwin's shm descriptors are not vnodes, so flock on
+// them fails with ENOTSUP. Each acquisition opens a separate file description,
+// which also serializes threads in one process. close (including process death)
+// releases the lock. Never unlink this file: waiters must keep the same inode.
+class RegistryLock {
+ public:
+  explicit RegistryLock(const std::string& mapped_path) {
+    // Namespace selection is entirely ShmObjectName's job. Its mapped result
+    // has only a leading slash, which is removed for the regular filename.
+    const std::string file_path =
+        "/tmp/talos-registry-" + mapped_path.substr(1) + ".lock";
+    // flock does not require write access. Observers that can only read the
+    // shared segment must not need a writable lock file either.
+    fd_ = ::open(file_path.c_str(), O_CREAT | O_RDONLY | O_CLOEXEC | O_NOFOLLOW,
+                 0666);
+    if (fd_ < 0) {
+      throw std::runtime_error("registry lock open failed for " + file_path +
+                               ": " + std::strerror(errno));
+    }
+    while (::flock(fd_, LOCK_EX) < 0) {
+      if (errno == EINTR) continue;
+      const int error = errno;
+      ::close(fd_);
+      throw std::runtime_error("registry lock failed for " + file_path + ": " +
+                               std::strerror(error));
+    }
+  }
+
+  ~RegistryLock() { ::close(fd_); }
+  RegistryLock(const RegistryLock&) = delete;
+  RegistryLock& operator=(const RegistryLock&) = delete;
+
+ private:
+  int fd_{-1};
+};
+
 // Maps the registry segment, creating it if this is the first process to ask.
 //
 // Deliberately not SharedMemoryPtr: that unlinks on destruction, which is right
@@ -294,8 +340,10 @@ inline std::string read_name(const char* value, std::size_t capacity) {
 class RegistryMapping {
  public:
   explicit RegistryMapping(std::string_view path = kRegistryPath,
-                           bool read_only = false)
+                           bool read_only = false,
+                           const RegistryTestHooks* test_hooks = nullptr)
       : path_{ShmObjectName(path)} {
+    const RegistryLock lock{path_};
     const std::size_t size = sizeof(RegistryHeader);
     const int flags = read_only ? O_RDONLY : (O_CREAT | O_RDWR);
 
@@ -332,10 +380,16 @@ class RegistryMapping {
 
     header_ = static_cast<RegistryHeader*>(address);
 
-    if (read_only) {
-      await_initialized();
-    } else {
-      initialize();
+    try {
+      if (read_only) {
+        validate_initialized();
+      } else {
+        initialize(test_hooks);
+      }
+    } catch (...) {
+      ::munmap(header_, size);
+      header_ = nullptr;
+      throw;
     }
   }
 
@@ -373,44 +427,37 @@ class RegistryMapping {
   }
 
  private:
-  void initialize() {
-    std::uint64_t expected = 0;
-    if (header_->magic.compare_exchange_strong(expected, kInitializing,
-                                               std::memory_order_acq_rel)) {
-      // A fresh segment is zero-filled, so only the descriptive fields need
-      // writing. Re-initializing an existing segment would blow away live
-      // nodes, which is exactly what the CAS prevents.
+  void initialize(const RegistryTestHooks* test_hooks) {
+    if (header_->magic.load(std::memory_order_acquire) != kMagic) {
+      // No committed registry exists, and the file lock excludes any live
+      // initializer. Reset all residue, even if its owner died mid-reset.
+      ::new (header_) RegistryHeader{};
+      header_->magic.store(kInitializing, std::memory_order_relaxed);
       header_->version = kRegistryVersion;
+      if (test_hooks != nullptr && test_hooks->initializing != nullptr) {
+        test_hooks->initializing(header_);
+      }
       header_->node_capacity = static_cast<std::uint32_t>(kMaxNodes);
       header_->source_capacity = static_cast<std::uint32_t>(kMaxSourcesPerNode);
       header_->node_record_bytes = sizeof(NodeRecord);
       header_->source_record_bytes = sizeof(SourceRecord);
       header_->magic.store(kMagic, std::memory_order_release);
-      return;
     }
-    await_initialized();
+    validate_initialized();
   }
 
-  void await_initialized() const {
-    // The winner of the CAS above publishes kMagic microseconds later. Bounded
-    // so a segment left in kInitializing by a process that died mid-setup is
-    // reported instead of hanging a node forever.
-    for (int attempt = 0; attempt < 200; ++attempt) {
-      if (header_->magic.load(std::memory_order_acquire) == kMagic) {
-        if (header_->version != kRegistryVersion ||
-            header_->node_record_bytes != sizeof(NodeRecord) ||
-            header_->source_record_bytes != sizeof(SourceRecord)) {
-          throw std::runtime_error(
-              "registry " + path_ +
-              " was created by a process with a different record layout");
-        }
-        return;
-      }
-      ::usleep(250);
+  void validate_initialized() const {
+    if (header_->magic.load(std::memory_order_acquire) != kMagic) {
+      throw std::runtime_error("registry " + path_ +
+                               " has not been initialized by a writer");
     }
-    throw std::runtime_error("registry " + path_ +
-                             " was never initialized; remove it with "
-                             "shm_unlink and restart the nodes");
+    if (header_->version != kRegistryVersion ||
+        header_->node_record_bytes != sizeof(NodeRecord) ||
+        header_->source_record_bytes != sizeof(SourceRecord)) {
+      throw std::runtime_error(
+          "registry " + path_ +
+          " was created by a process with a different record layout");
+    }
   }
 
   std::string path_;
@@ -428,9 +475,11 @@ class NodeRegistration {
     std::uint32_t flags{0};
   };
 
-  NodeRegistration(Identity identity, std::string_view path = kRegistryPath)
-      : mapping_{path}, identity_{std::move(identity)} {
-    record_ = claim(mapping_.header(), identity_);
+  NodeRegistration(Identity identity, std::string_view path = kRegistryPath,
+                   const RegistryTestHooks* test_hooks = nullptr)
+      : mapping_{path, false, test_hooks}, identity_{std::move(identity)} {
+    const RegistryLock lock{mapping_.path()};
+    record_ = claim(mapping_.header(), identity_, test_hooks);
     if (record_ == nullptr) {
       throw std::runtime_error(
           "registry is full: " + std::to_string(kMaxNodes) +
@@ -692,6 +741,15 @@ class NodeRegistration {
             .count();
     for (std::size_t i = 0; i < kMaxNodes; ++i) {
       NodeRecord& record = header->nodes[i];
+      // A live claimant/sweeper holds RegistryLock until its state commit.
+      // Under that lock any remaining CLAIMING row is abandoned, even if
+      // death preceded its first pid or heartbeat store. Reclaim immediately.
+      if (record.state.load(std::memory_order_acquire) ==
+          static_cast<std::uint64_t>(SlotState::CLAIMING)) {
+        record.state.store(static_cast<std::uint64_t>(SlotState::FREE),
+                           std::memory_order_release);
+        continue;
+      }
       if (record.state.load(std::memory_order_acquire) !=
           static_cast<std::uint64_t>(SlotState::ACTIVE)) {
         continue;
@@ -723,7 +781,8 @@ class NodeRegistration {
   // heartbeating long enough ago to be considered gone. Stale rows are swept
   // first (see sweep_stale), so the fallback below only fires for a slot that
   // went quiet between the sweep and the claim.
-  static NodeRecord* claim(RegistryHeader* header, const Identity& identity) {
+  static NodeRecord* claim(RegistryHeader* header, const Identity& identity,
+                           const RegistryTestHooks* test_hooks) {
     sweep_stale(header);
     NodeRecord* record = claim_where(header, SlotState::FREE, false);
     if (record == nullptr) {
@@ -731,6 +790,9 @@ class NodeRegistration {
     }
     if (record == nullptr) {
       return nullptr;
+    }
+    if (test_hooks != nullptr && test_hooks->claiming != nullptr) {
+      test_hooks->claiming(record);
     }
 
     record->pid = static_cast<std::uint64_t>(::getpid());
@@ -924,7 +986,7 @@ class RegistryReader {
   // wedged viewer. That fallback is exactly what a reader without the guard
   // takes every time, so it is no worse than the status quo ante.
   static std::optional<NodeSnapshot> copy_stable(const NodeRecord& record,
-                                               std::size_t slot) {
+                                                 std::size_t slot) {
     const auto generation = record.generation.load(std::memory_order_acquire);
     for (int attempt = 0; attempt < 4; ++attempt) {
       const std::uint32_t before =

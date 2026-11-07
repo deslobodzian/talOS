@@ -1,12 +1,16 @@
 #include "talOS/introspection/registry.h"
 
 #include <gtest/gtest.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -40,6 +44,224 @@ class Registry : public ::testing::Test {
 
   std::string path_ = temp_registry("reg");
 };
+// Always reap children, including on an assertion failure while one is stopped.
+class Children {
+ public:
+  ~Children() {
+    for (const pid_t pid : pids_) ::kill(pid, SIGKILL);
+    for (const pid_t pid : pids_) Wait(pid, nullptr, 0);
+  }
+
+  void add(pid_t pid) { pids_.push_back(pid); }
+
+  static pid_t Wait(pid_t pid, int* status, int options) {
+    pid_t result;
+    do {
+      result = ::waitpid(pid, status, options);
+    } while (result < 0 && errno == EINTR);
+    return result;
+  }
+
+  int reap(pid_t pid) {
+    int status = -1;
+    if (Wait(pid, &status, 0) == pid) {
+      pids_.erase(std::find(pids_.begin(), pids_.end(), pid));
+    }
+    return status;
+  }
+
+ private:
+  std::vector<pid_t> pids_;
+};
+
+class Pipe {
+ public:
+  Pipe() {
+    if (::pipe(fds_) < 0) throw std::runtime_error("pipe failed");
+  }
+  ~Pipe() {
+    ::close(fds_[0]);
+    ::close(fds_[1]);
+  }
+  int reader() const { return fds_[0]; }
+  int writer() const { return fds_[1]; }
+
+ private:
+  int fds_[2];
+};
+
+bool read_all(int fd, void* destination, std::size_t size) {
+  auto* bytes = static_cast<char*>(destination);
+  while (size != 0) {
+    const ssize_t count = ::read(fd, bytes, size);
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) return false;
+    bytes += count;
+    size -= static_cast<std::size_t>(count);
+  }
+  return true;
+}
+
+bool write_all(int fd, const void* source, std::size_t size) {
+  const auto* bytes = static_cast<const char*>(source);
+  while (size != 0) {
+    const ssize_t count = ::write(fd, bytes, size);
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) return false;
+    bytes += count;
+    size -= static_cast<std::size_t>(count);
+  }
+  return true;
+}
+
+TEST_F(Registry, KilledInitializerIsRecoveredByTheNextWriter) {
+  Children children;
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    const RegistryTestHooks hooks{.initializing = [](RegistryHeader* header) {
+      // Leave partial metadata and slot residue, not just an empty header.
+      header->node_capacity = 999;
+      header->nodes[0].state.store(
+          static_cast<std::uint64_t>(SlotState::CLAIMING));
+      ::raise(SIGSTOP);
+    }};
+    try {
+      RegistryMapping mapping{path_, false, &hooks};
+      ::_exit(1);  // The parent must kill us before initialization commits.
+    } catch (...) {
+      ::_exit(2);
+    }
+  }
+  children.add(pid);
+  int status = 0;
+  ASSERT_EQ(Children::Wait(pid, &status, WUNTRACED), pid);
+  ASSERT_TRUE(WIFSTOPPED(status));
+  ASSERT_EQ(WSTOPSIG(status), SIGSTOP);
+  ASSERT_EQ(::kill(pid, SIGKILL), 0);
+  status = children.reap(pid);
+  ASSERT_TRUE(WIFSIGNALED(status));
+  ASSERT_EQ(WTERMSIG(status), SIGKILL);
+
+  // A read-only observer cannot publish initialization on a writer's behalf.
+  EXPECT_THROW((RegistryMapping{path_, true}), std::runtime_error);
+  NodeRegistration registration{{.name = "recovered"}, path_};
+  RegistryMapping mapping{path_};
+  EXPECT_EQ(mapping.header()->node_capacity, kMaxNodes);
+  EXPECT_EQ(mapping.header()->magic.load(), kMagic);
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto nodes = reader->nodes();
+  ASSERT_EQ(nodes.size(), 1u);
+  EXPECT_EQ(nodes.front().name, "recovered");
+  EXPECT_TRUE(nodes.front().alive);
+}
+
+TEST_F(Registry, KilledClaimantDoesNotConsumeAnyOfThe32Slots) {
+  RegistryMapping mapping{path_};
+  Children children;
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    const RegistryTestHooks hooks{
+        .claiming = [](NodeRecord*) { ::raise(SIGSTOP); }};
+    try {
+      NodeRegistration registration{{.name = "killed"}, path_, &hooks};
+      ::_exit(1);
+    } catch (...) {
+      ::_exit(2);
+    }
+  }
+  children.add(pid);
+  int status = 0;
+  ASSERT_EQ(Children::Wait(pid, &status, WUNTRACED), pid);
+  ASSERT_TRUE(WIFSTOPPED(status));
+  ASSERT_EQ(WSTOPSIG(status), SIGSTOP);
+  EXPECT_EQ(mapping.header()->nodes[0].state.load(),
+            static_cast<std::uint64_t>(SlotState::CLAIMING));
+  // The kill is before even the claimant pid/heartbeat is recorded.
+  EXPECT_EQ(mapping.header()->nodes[0].pid, 0u);
+  ASSERT_EQ(::kill(pid, SIGKILL), 0);
+  status = children.reap(pid);
+  ASSERT_TRUE(WIFSIGNALED(status));
+  ASSERT_EQ(WTERMSIG(status), SIGKILL);
+
+  std::vector<std::unique_ptr<NodeRegistration>> registrations;
+  for (std::size_t i = 0; i < kMaxNodes; ++i) {
+    registrations.push_back(std::make_unique<NodeRegistration>(
+        NodeRegistration::Identity{.name = "node" + std::to_string(i)}, path_));
+    EXPECT_EQ(registrations.back()->slot(), i);
+  }
+  EXPECT_THROW(NodeRegistration({.name = "overflow"}, path_),
+               std::runtime_error);
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  EXPECT_EQ(reader->nodes().size(), kMaxNodes);
+}
+
+TEST_F(Registry, ConcurrentProcessesNeverReceiveTheSameSlot) {
+  constexpr std::size_t kProcesses = 8;
+  constexpr std::size_t kClaimsPerProcess = kMaxNodes / kProcesses;
+  Pipe start;
+  Pipe results;
+  Pipe finish;
+  Children children;
+  std::array<pid_t, kProcesses> pids{};
+  for (std::size_t process = 0; process < kProcesses; ++process) {
+    const pid_t pid = ::fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+      char token;
+      if (!read_all(start.reader(), &token, 1)) ::_exit(2);
+      std::array<std::size_t, kClaimsPerProcess> slots;
+      slots.fill(kMaxNodes);  // Report failure instead of blocking the parent.
+      std::vector<std::unique_ptr<NodeRegistration>> registrations;
+      try {
+        for (std::size_t i = 0; i < kClaimsPerProcess; ++i) {
+          registrations.push_back(std::make_unique<NodeRegistration>(
+              NodeRegistration::Identity{.name = "node" +
+                                                 std::to_string(process) + "_" +
+                                                 std::to_string(i)},
+              path_));
+          slots[i] = registrations.back()->slot();
+        }
+      } catch (...) {
+      }
+      // One pipe-atomic report; registrations stay alive until all reports
+      // have been checked, so releasing a slot cannot hide double assignment.
+      if (!write_all(results.writer(), slots.data(), sizeof(slots))) ::_exit(3);
+      if (!read_all(finish.reader(), &token, 1)) ::_exit(4);
+      registrations.clear();
+      ::_exit(0);
+    }
+    children.add(pid);
+    pids[process] = pid;
+  }
+  const std::array<char, kProcesses> tokens{};
+  ASSERT_TRUE(write_all(start.writer(), tokens.data(), tokens.size()));
+  std::array<bool, kMaxNodes> seen{};
+  for (std::size_t process = 0; process < kProcesses; ++process) {
+    std::array<std::size_t, kClaimsPerProcess> slots{};
+    ASSERT_TRUE(read_all(results.reader(), slots.data(), sizeof(slots)));
+    for (const std::size_t slot : slots) {
+      ASSERT_LT(slot, kMaxNodes);
+      EXPECT_FALSE(seen[slot]) << "slot " << slot << " assigned twice";
+      seen[slot] = true;
+    }
+  }
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  EXPECT_EQ(reader->nodes().size(), kMaxNodes);
+  EXPECT_THROW(NodeRegistration({.name = "overflow"}, path_),
+               std::runtime_error);
+  ASSERT_TRUE(write_all(finish.writer(), tokens.data(), tokens.size()));
+  for (const pid_t pid : pids) {
+    const int status = children.reap(pid);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+  }
+  EXPECT_TRUE(reader->nodes().empty());
+}
 
 event::Manifest sample_manifest() {
   event::Manifest manifest;
@@ -203,7 +425,7 @@ TEST_F(Registry, ReclaimedSlotRejectsUpdatesFromItsPreviousOwner) {
       std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
           .count();
   slot.heartbeat_monotonic_ns.store(monotonic_now_ns() - timeout - 1,
-                                     std::memory_order_relaxed);
+                                    std::memory_order_relaxed);
 
   NodeRegistration next{{.name = "new"}, path_};
   ASSERT_EQ(next.slot(), old->slot());
@@ -347,9 +569,9 @@ TEST_F(Registry, HeartbeatAndSweepUseHostMonotonicTime) {
     auto reader = RegistryReader::open(path_);
     ASSERT_TRUE(reader.has_value());
     const auto nodes = reader->nodes();
-    const auto found = std::find_if(nodes.begin(), nodes.end(), [](const auto& n) {
-      return n.name == "healthy";
-    });
+    const auto found =
+        std::find_if(nodes.begin(), nodes.end(),
+                     [](const auto& n) { return n.name == "healthy"; });
     ASSERT_NE(found, nodes.end());
     EXPECT_TRUE(found->alive);
     EXPECT_EQ(found->heartbeat_monotonic_ns, beat);
