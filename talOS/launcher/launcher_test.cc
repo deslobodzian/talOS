@@ -703,6 +703,8 @@ TEST(LauncherTest, SessionManifestJsonFormatting) {
   node1.log_path = "/tmp/test_dir/drivetrain.tlog";
   node1.log_paths = {node1.log_path, "/tmp/test_dir/drivetrain.restart1.tlog"};
   node1.restart_count = 1;
+  node1.quarantined = true;
+  node1.retry_at_monotonic_ns = 123'456'789;
   node1.pid = 1234;
   node1.exit_code = 0;
   node1.record_count = 50;
@@ -726,6 +728,9 @@ TEST(LauncherTest, SessionManifestJsonFormatting) {
             std::string::npos)
       << json;
   EXPECT_NE(json.find("\"restart_count\": 1"), std::string::npos) << json;
+  EXPECT_NE(json.find("\"quarantined\": true"), std::string::npos) << json;
+  EXPECT_NE(json.find("\"retry_at_monotonic_ns\": 123456789"), std::string::npos)
+      << json;
 }
 
 TEST(LauncherTest, RestartBackoffDoublesFrom50msCappedAt1s) {
@@ -746,15 +751,13 @@ TEST(LauncherTest, EachRunGetsItsOwnLogPath) {
 }
 
 TEST(LauncherTest, ShouldRestartNodePredicate) {
-  EXPECT_TRUE(ShouldRestartNode(false, 0, 5, false));
-  EXPECT_TRUE(ShouldRestartNode(false, 4, 5, false));
+  EXPECT_TRUE(ShouldRestartNode(false, 5, false));
   // A clean exit finished; it is not a crash.
-  EXPECT_FALSE(ShouldRestartNode(true, 0, 5, false));
-  // Budget spent, or none at all.
-  EXPECT_FALSE(ShouldRestartNode(false, 5, 5, false));
-  EXPECT_FALSE(ShouldRestartNode(false, 0, 0, false));
+  EXPECT_FALSE(ShouldRestartNode(true, 5, false));
+  // Zero is a deliberate permanent stop, not a quarantine.
+  EXPECT_FALSE(ShouldRestartNode(false, 0, false));
   // A stopping session (signal or deadline) restarts nothing.
-  EXPECT_FALSE(ShouldRestartNode(false, 0, 5, true));
+  EXPECT_FALSE(ShouldRestartNode(false, 5, true));
 }
 
 TEST(LauncherTest, MaxRestartsComesFromFlagThenConfigThenDefault) {
@@ -1083,6 +1086,38 @@ TEST(LauncherGraphTest, DescribeOnlyReportsABrokenGraphAsAFailure) {
   Launcher launcher{fixture.options};
   EXPECT_NE(launcher.Run(), 0);
   EXPECT_FALSE(fixture.has_manifest());
+}
+
+TEST(LauncherGraphTest, DescribeOnlyEnforcesOptInPerModeTargetCoverage) {
+  for (const bool required : {false, true}) {
+    auto teleop_lane = Watcher("/alpha/target/teleop");
+    auto auto_lane = Watcher("/alpha/target/auto");
+    teleop_lane.flags = introspect::naming::kSourceFlagOptional;
+    auto_lane.flags = introspect::naming::kSourceFlagOptional;
+    GraphFixture fixture{
+        required ? "required_mode_coverage" : "optional_mode_coverage",
+        DescribingStub("alpha", "//example/alpha:node",
+                       {teleop_lane, auto_lane}),
+        DescribingStub("beta", "//example/beta:node",
+                       {Sender("/alpha/target/teleop")})};
+    std::string toml{kFixtureToml};
+    const std::string header = "[robot]\n";
+    toml.insert(toml.find(header) + header.size(),
+                std::string{"require_target_coverage = "} +
+                    (required ? "true\n" : "false\n"));
+    {
+      std::ofstream config{fixture.options.config_path};
+      config << toml;
+    }
+    fixture.options.describe_only = true;
+    Launcher launcher{fixture.options};
+    EXPECT_EQ(launcher.Run(), required ? 1 : 0);
+    EXPECT_FALSE(fixture.has_manifest());
+    const auto graph = fixture.graph_json();
+    EXPECT_NE(graph.find("/alpha/target/auto"), std::string::npos);
+    EXPECT_EQ(graph.find("target coverage required") != std::string::npos,
+              required);
+  }
 }
 
 TEST(LauncherGraphTest, WarnsWhenABinaryDisagreesWithTheConfigAboutItsName) {

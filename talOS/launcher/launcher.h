@@ -6,6 +6,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -36,6 +40,7 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/registry.h"
+#include "talOS/launcher/service_notifier.h"
 #include "talOS/rtms/rtms.h"
 #include "talOS/schema/unit_suffix.h"
 #include "toml.hpp"
@@ -81,6 +86,8 @@ struct NodeProcessInfo {
   pid_t pid{-1};
   int exit_code{-1};
   bool exited{false};
+  bool quarantined{false};
+  int64_t retry_at_monotonic_ns{0};  // Zero when no restart is pending.
   bool failed{false};
   uint64_t record_count{0};
   // Whether this binary answered --describe: a session whose graph was never
@@ -127,6 +134,10 @@ struct SessionManifest {
       ss << "      \"pid\": " << n.pid << ",\n";
       ss << "      \"exit_code\": " << n.exit_code << ",\n";
       ss << "      \"restart_count\": " << n.restart_count << ",\n";
+      ss << "      \"quarantined\": " << (n.quarantined ? "true" : "false")
+         << ",\n";
+      ss << "      \"retry_at_monotonic_ns\": " << n.retry_at_monotonic_ns
+         << ",\n";
       ss << "      \"recorder_failed\": " << (n.failed ? "true" : "false")
          << ",\n";
       ss << "      \"described\": " << (n.described ? "true" : "false")
@@ -424,24 +435,98 @@ inline uint16_t EffectiveStudioHttpPort(const config::RobotConfig& config,
                                        : config.studio.http_port;
 }
 
-// fork + execv of args[0]. With an output path, the child's stdout and stderr
-// are appended there. Returns the child pid, or -1 when fork fails.
+// The launcher alone holds each lifetime pipe's writer. A tiny guardian in the
+// child's group kills the group on EOF, including when the launcher is SIGKILLed.
+// Descriptors are closed in other children and on exec; no node owns a writer.
+inline std::map<pid_t, int>& ProcessLifetimes() {
+  static std::map<pid_t, int> lifetimes;
+  return lifetimes;
+}
+
+inline void SignalProcessGroup(pid_t pid, int signal) {
+  if (pid > 0) ::kill(-pid, signal);
+}
+
+// Call after reaping the leader: even a clean exit must not leave helpers.
+inline void FinishProcessGroup(pid_t pid) {
+  SignalProcessGroup(pid, SIGKILL);
+  auto& lifetimes = ProcessLifetimes();
+  const auto found = lifetimes.find(pid);
+  if (found != lifetimes.end()) {
+    ::close(found->second);
+    lifetimes.erase(found);
+  }
+}
+
+// fork + execv of args[0], in its own process group. stdout_fd is used only by
+// --describe; otherwise stdout/stderr can be appended to output_path.
 inline pid_t SpawnProcess(std::vector<std::string> args,
-                          const std::string& output_path = "") {
-  // The child inherits unflushed stdio buffers, and freopen below flushes them
-  // into the launcher's own log a second time. Empty them before forking.
-  std::cout.flush();
-  std::fflush(nullptr);
-  const pid_t pid = ::fork();
-  if (pid != 0) return pid;
-  if (!output_path.empty()) {
-    std::freopen(output_path.c_str(), "a", stdout);
-    std::freopen(output_path.c_str(), "a", stderr);
+                          const std::string& output_path = "",
+                          int stdout_fd = -1) {
+  int lifetime[2];
+  if (::pipe(lifetime) != 0) return -1;
+  if (::fcntl(lifetime[0], F_SETFD, FD_CLOEXEC) < 0 ||
+      ::fcntl(lifetime[1], F_SETFD, FD_CLOEXEC) < 0) {
+    ::close(lifetime[0]);
+    ::close(lifetime[1]);
+    return -1;
   }
   std::vector<char*> c_args;
   c_args.reserve(args.size() + 1);
   for (auto& arg : args) c_args.push_back(arg.data());
   c_args.push_back(nullptr);
+  std::cout.flush();
+  std::fflush(nullptr);
+  const pid_t parent = ::getpid();
+  const pid_t pid = ::fork();
+  if (pid != 0) {
+    ::close(lifetime[0]);
+    if (pid < 0) {
+      ::close(lifetime[1]);
+    } else {
+      // Both sides establish the group, closing the spawn/signal race.
+      ::setpgid(pid, pid);
+      ProcessLifetimes().emplace(pid, lifetime[1]);
+    }
+    return pid;
+  }
+  ::close(lifetime[1]);
+  for (const auto& [other_pid, fd] : ProcessLifetimes()) {
+    (void)other_pid;
+    ::close(fd);
+  }
+  if (::setpgid(0, 0) != 0) ::_exit(127);
+#ifdef __linux__
+  if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) ::_exit(127);
+#endif
+  if (::getppid() != parent) ::_exit(127);
+  std::signal(SIGINT, SIG_DFL);
+  std::signal(SIGTERM, SIG_DFL);
+  const pid_t group = ::getpid();
+  const pid_t guardian = ::fork();
+  if (guardian < 0) ::_exit(127);
+  if (guardian == 0) {
+    // Graceful group signals belong to the node; the guardian waits for EOF.
+    std::signal(SIGINT, SIG_IGN);
+    std::signal(SIGTERM, SIG_IGN);
+    for (const int fd : {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO}) {
+      if (fd != lifetime[0]) ::close(fd);
+    }
+    if (stdout_fd > STDERR_FILENO) ::close(stdout_fd);
+    char unused;
+    while (::read(lifetime[0], &unused, 1) < 0 && errno == EINTR) {
+    }
+    SignalProcessGroup(group, SIGKILL);
+    ::_exit(0);
+  }
+  ::close(lifetime[0]);
+  if (stdout_fd >= 0) {
+    if (::dup2(stdout_fd, STDOUT_FILENO) < 0) ::_exit(127);
+    if (stdout_fd != STDOUT_FILENO) ::close(stdout_fd);
+  } else if (!output_path.empty()) {
+    std::freopen(output_path.c_str(), "a", stdout);
+    std::freopen(output_path.c_str(), "a", stderr);
+  }
   ::execv(c_args[0], c_args.data());
   std::fprintf(stderr, "[launcher] execv failed for %s: %s\n", c_args[0],
                std::strerror(errno));
@@ -481,25 +566,12 @@ inline bool ProbeDescribe(const std::string& binary_path,
     return false;
   }
 
-  std::vector<std::string> owned = args;
-  std::vector<char*> c_args;
-  c_args.reserve(owned.size() + 1);
-  for (auto& arg : owned) c_args.push_back(arg.data());
-  c_args.push_back(nullptr);
-
-  const pid_t pid = ::fork();
+  const pid_t pid = SpawnProcess(args, "", fds[1]);
   if (pid < 0) {
     error = std::string{"fork() failed: "} + std::strerror(errno);
     ::close(fds[0]);
     ::close(fds[1]);
     return false;
-  }
-  if (pid == 0) {
-    ::close(fds[0]);
-    ::dup2(fds[1], STDOUT_FILENO);
-    ::close(fds[1]);
-    ::execv(binary_path.c_str(), c_args.data());
-    ::_exit(127);
   }
   ::close(fds[1]);
 
@@ -559,10 +631,11 @@ inline bool ProbeDescribe(const std::string& binary_path,
     }
   }
   if (timed_out || !error.empty()) {
-    ::kill(pid, SIGKILL);
+    SignalProcessGroup(pid, SIGKILL);
     while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
     }
   }
+  FinishProcessGroup(pid);
 
   if (timed_out) {
     error = "no answer within " + std::to_string(timeout.count()) +
@@ -590,6 +663,19 @@ inline naming::TargetSources TargetSourcesOf(
   naming::TargetSources sources;
   for (const auto& [subsystem, policy] : robot_config.subsystem_targets) {
     sources.emplace(subsystem, policy.Sources());
+  }
+  return sources;
+}
+
+inline naming::TargetModeSources TargetModeSourcesOf(
+    const config::RobotConfig& robot_config) {
+  naming::TargetModeSources sources;
+  for (const auto& [subsystem, policy] : robot_config.subsystem_targets) {
+    sources.emplace(subsystem,
+                    naming::TargetModeSources::mapped_type{
+                        {"teleop", policy.teleop},
+                        {"autonomous", policy.autonomous},
+                        {"test", policy.test}});
   }
   return sources;
 }
@@ -659,7 +745,9 @@ inline std::string DeclaredGraphPath(const LauncherOptions& options) {
 inline std::vector<naming::Diagnostic> DescribeGraph(
     const std::vector<NodeSpec>& specs, const LauncherOptions& options,
     std::vector<NodeDescription>& out,
-    const naming::TargetSources& target_sources = {}) {
+    const naming::TargetSources& target_sources = {},
+    const naming::TargetModeSources& target_mode_sources = {},
+    bool require_target_coverage = false) {
   out.clear();
   out.reserve(specs.size());
 
@@ -728,7 +816,8 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
     }
   }
 
-  auto diagnostics = naming::LintGraph(shapes, target_sources);
+  auto diagnostics = naming::LintGraph(
+      shapes, target_sources, target_mode_sources, require_target_coverage);
   diagnostics.insert(diagnostics.end(), probe_findings.begin(),
                      probe_findings.end());
   return diagnostics;
@@ -900,10 +989,9 @@ inline std::string NodeLogPath(const std::string& output_dir,
   return path + ".tlog";
 }
 
-// True for a crash the budget still covers in a session that is not stopping.
-inline bool ShouldRestartNode(bool clean_exit, int restarts_made,
-                              int max_restarts, bool stopping) {
-  return !clean_exit && !stopping && restarts_made < max_restarts;
+// Crashes remain retryable after a budget quarantine; zero disables all retries.
+inline bool ShouldRestartNode(bool clean_exit, int max_restarts, bool stopping) {
+  return !clean_exit && !stopping && max_restarts > 0;
 }
 
 // `--max-restarts` wins, then `[robot] max_restarts`, then the default.
@@ -1094,9 +1182,11 @@ class StudioBridge {
   void Finish(NodeProcessInfo& proc, bool stop_requested) {
     if (!active_ || stable_ || stop_requested) return;
     if (proc.pid > 0 && !proc.exited) {
-      ::kill(proc.pid, SIGINT);
+      SignalProcessGroup(proc.pid, SIGKILL);
       int status = 0;
-      ::waitpid(proc.pid, &status, WNOHANG);
+      while (::waitpid(proc.pid, &status, 0) < 0 && errno == EINTR) {
+      }
+      FinishProcessGroup(proc.pid);
       proc.exited = true;
     }
     GiveUp(proc);
@@ -1207,8 +1297,9 @@ class Launcher {
 
     // Phase one: describe and lint before anything starts.
     std::vector<NodeDescription> described;
-    auto diagnostics = DescribeGraph(node_specs, options_, described,
-                                     TargetSourcesOf(robot_config));
+    auto diagnostics = DescribeGraph(
+        node_specs, options_, described, TargetSourcesOf(robot_config),
+        TargetModeSourcesOf(robot_config), robot_config.require_target_coverage);
     for (auto& finding : LintParameterUnits(robot_config)) {
       diagnostics.push_back(std::move(finding));
     }
@@ -1530,6 +1621,7 @@ class Launcher {
     while (::waitpid(pid, &status, 0) < 0) {
       if (errno != EINTR) return 1;
     }
+    FinishProcessGroup(pid);
     const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
     std::cout << "[launcher] " << spec->name << " finished ("
               << ExitReason(status) << ")\n";
@@ -1545,6 +1637,10 @@ class Launcher {
   // Respawns a crashed node into a fresh event log.
   void Restart(NodeProcessInfo& proc, NodeLaunch& launch) {
     launch.restart_pending = false;
+    if (proc.quarantined)
+      std::cout << "[launcher] " << proc.name << " retrying after quarantine\n";
+    proc.quarantined = false;
+    proc.retry_at_monotonic_ns = 0;
     const int restart = proc.restart_count + 1;
     if (launch.log_arg != 0) {
       launch.args[launch.log_arg] =
@@ -1588,7 +1684,10 @@ class Launcher {
       launch.started_at = started;
       launch.heartbeat_changed_at = started;
     }
+    ServiceNotifier notifier;
+    notifier.Send("READY=1");
     for (;;) {
+      notifier.Send("WATCHDOG=1");
       const auto now = std::chrono::steady_clock::now();
       const bool past_deadline = now >= deadline;
       const bool stopping = stop_requested_ != 0 || stop_sent || past_deadline;
@@ -1601,13 +1700,13 @@ class Launcher {
       }
       for (std::size_t i = 0; i < procs.size(); ++i) {
         auto& proc = procs[i];
-        if (proc.pid <= 0 || proc.exited) continue;
         auto& launch = launches[i];
         while (!launch.restart_times.empty() &&
                now - launch.restart_times.front() >=
                    std::chrono::milliseconds{options_.restart_window_ms}) {
           launch.restart_times.pop_front();
         }
+        if (proc.pid <= 0 || proc.exited) continue;
         if (!stopping && !launch.heartbeat_killed &&
             !(studio && i == studio->index()) && proc.name != kSimGatewayName) {
           bool found = false;
@@ -1622,7 +1721,7 @@ class Launcher {
                   record.session_id != options_.session_id)
                 continue;
               const auto beat =
-                  record.heartbeat_wall_ns.load(std::memory_order_relaxed);
+                  record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
               const auto dispatch =
                   record.dispatch_count.load(std::memory_order_relaxed);
               if (record.generation.load(std::memory_order_acquire) !=
@@ -1651,37 +1750,46 @@ class Launcher {
                       << (found ? " heartbeat/dispatch stalled"
                                 : " heartbeat missing")
                       << "; killing pid " << proc.pid << "\n";
-            ::kill(proc.pid, SIGKILL);
+            SignalProcessGroup(proc.pid, SIGKILL);
             launch.heartbeat_killed = true;
           }
         }
         int status = 0;
         if (::waitpid(proc.pid, &status, WNOHANG) != proc.pid) continue;
+        FinishProcessGroup(proc.pid);
         proc.exited = true;
         proc.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         PersistManifest(procs);
         const bool is_bridge = studio && i == studio->index();
         if (is_bridge && studio->Starting(i)) continue;
         const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-        if (!is_bridge &&
-            ShouldRestartNode(clean,
-                              static_cast<int>(launch.restart_times.size()),
-                              max_restarts_, stopping)) {
-          const int restart = proc.restart_count + 1;
-          const auto backoff =
-              RestartBackoff(static_cast<int>(launch.restart_times.size()) + 1);
-          launches[i].restart_pending = true;
-          launches[i].restart_at = now + backoff;
+        if (!is_bridge && ShouldRestartNode(clean, max_restarts_, stopping)) {
+          const int recent = static_cast<int>(launch.restart_times.size());
+          const auto backoff = RestartBackoff(recent + 1);
+          proc.quarantined = recent >= max_restarts_;
+          launch.restart_pending = true;
+          launch.restart_at =
+              (proc.quarantined
+                   ? launch.restart_times.front() +
+                         std::chrono::milliseconds{options_.restart_window_ms}
+                   : now) +
+              backoff;
+          proc.retry_at_monotonic_ns =
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  launch.restart_at.time_since_epoch())
+                  .count();
+          const auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
+              launch.restart_at - now);
           std::cout << "[launcher] " << proc.name << " exited ("
-                    << ExitReason(status) << "); restart " << restart << "/"
-                    << max_restarts_ << " in " << backoff.count() << " ms\n";
+                    << ExitReason(status) << "); "
+                    << (proc.quarantined ? "quarantined; retry" : "restart")
+                    << " " << proc.restart_count + 1 << " in "
+                    << delay.count() << " ms\n";
+          PersistManifest(procs);
           continue;
         }
         std::cout << "[launcher] Process " << proc.name << " (pid " << proc.pid
                   << ") exited with code " << proc.exit_code;
-        if (!is_bridge && !clean && !stopping && max_restarts_ > 0) {
-          std::cout << "; restart limit (" << max_restarts_ << ") reached";
-        }
         std::cout << "\n";
       }
       for (std::size_t i = 0; i < procs.size(); ++i) {
@@ -1690,6 +1798,9 @@ class Launcher {
         // A stopping session ends with the crash as the node's last word.
         if (stopping) {
           launch.restart_pending = false;
+          procs[i].quarantined = false;
+          procs[i].retry_at_monotonic_ns = 0;
+          PersistManifest(procs);
         } else if (now >= launch.restart_at) {
           Restart(procs[i], launch);
           PersistManifest(procs);
@@ -1732,12 +1843,12 @@ class Launcher {
         shutdown_deadline = now + std::chrono::seconds{2};
         std::cout << "[launcher] Stopping children...\n";
         for (const auto& proc : procs) {
-          if (proc.pid > 0 && !proc.exited) ::kill(proc.pid, SIGINT);
+          if (proc.pid > 0 && !proc.exited) SignalProcessGroup(proc.pid, SIGINT);
         }
       }
       if (stop_sent && now >= shutdown_deadline) {
         for (const auto& proc : procs) {
-          if (proc.pid > 0 && !proc.exited) ::kill(proc.pid, SIGKILL);
+          if (proc.pid > 0 && !proc.exited) SignalProcessGroup(proc.pid, SIGKILL);
         }
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(20));

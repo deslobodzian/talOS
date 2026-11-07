@@ -17,7 +17,7 @@ drives each subsystem.
 
 ## The segment
 
-The logical path is `/talos_registry.2`, and the trailing number is
+The logical path is `/talos_registry.3`, and the trailing number is
 `kRegistryVersion`. Registry opens and explicit unlinks apply `ShmObjectName`,
 just like topics: `TALOS_SHM_NAMESPACE` (or Bazel's `TEST_TMPDIR` fallback)
 isolates tests and their children, while production retains the ordinary name.
@@ -29,6 +29,14 @@ in a different segment. `RegistryHeader` also carries `node_record_bytes` and
 `source_record_bytes`, and a reader that attaches to a segment whose sizes
 disagree with its own reports that rather than proceeding, which catches a
 layout change that someone forgot to bump the version for.
+
+Version 3 changes heartbeat timestamps to host monotonic nanoseconds. Heartbeat
+publication, stale-slot sweeping and reader liveness all use `steady_clock`,
+whose epoch is shared across processes on the same host. NTP and manual wall
+clock changes cannot evict healthy nodes. `start_wall_ns` remains human-facing
+wall time; the Studio bridge converts heartbeat age back into a display wall
+timestamp at serialization. Version-2 binaries must be rebuilt together: the
+old wall-time epoch is deliberately isolated in its old segment.
 
 A fresh segment is zero-filled, which is what makes initialization safe without
 a lock: the first process to attach wins a compare-exchange on the header's

@@ -65,11 +65,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 User=$user
 Environment=\"TALOS_LOG_DIR=$PREFIX/logs\"
 ExecStart=$PREFIX/current/run.sh
-Restart=on-failure
+WatchdogSec=3
+Restart=always
 RestartSec=2
 
 [Install]

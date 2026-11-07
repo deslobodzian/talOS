@@ -223,7 +223,15 @@ scheduled inside the supervision loop, like the Studio bridge's retries, so a
 restarting node never delays another node or the deadline. Each restart prints
 one line:
 
-    [launcher] alpha exited (signal 11); restart 1/5 in 50 ms
+    [launcher] alpha exited (signal 11); restart 1 in 50 ms
+
+When the rolling budget is exhausted, the node is **quarantined**, not
+permanently abandoned. Exactly one retry is scheduled for the oldest restart
+plus the window and normal backoff. Quarantine and retry transitions are
+logged; the live manifest exposes `quarantined` and
+`retry_at_monotonic_ns` (zero with no pending restart). Stopping cancels the
+retry; `max_restarts = 0` never schedules one. A persistent fault remains
+rate-limited, while a cleared fault can recover later in the same session.
 
 Every run writes its own event log rather than truncating the last one: the
 first run `<name>.tlog`, restart `k` `<name>.restart<k>.tlog`. The session
@@ -233,6 +241,8 @@ manifest records each node's `restart_count` and every log in `log_paths`
 A node's `exit_code` and `pid` are its last run's.
 
 Heartbeat supervision reads the introspection registry without modifying it.
+Registry heartbeats and stale-slot checks use host monotonic time, unaffected
+by NTP or manual wall-clock corrections.
 `--heartbeat-periods N` defaults to 10 periods, with a minimum timeout of
 500 ms. `--heartbeat-startup-grace-ms MS` defaults to 5000 ms to allow node
 initialization. Stalled nodes, including nodes that never publish a registry row,
@@ -240,6 +250,18 @@ are killed and enter the same restart policy once both the startup grace and
 heartbeat timeout have elapsed. Registration is required even when
 `--allow-graph-errors` permits a failed description.
 `--restart-window-ms MS` overrides the default 60000 ms rolling budget window.
+
+Every spawned child has its own process group; restart, stop and shutdown
+signal the group, and even a clean exit removes remaining helpers. A guardian
+in each group watches a launcher-owned lifetime pipe and kills the group on
+EOF, including after launcher SIGKILL. Linux also uses `PR_SET_PDEATHSIG`;
+macOS relies on the pipe. Children must not daemonize out of their group.
+
+With `NOTIFY_SOCKET` set, the launcher sends `READY=1` on entry to supervision
+and `WATCHDOG=1` on every loop iteration, using nonblocking Unix datagrams
+(including Linux `@` abstract names). A hung loop therefore stops feeding the
+service watchdog. See [deployment](../../docs/DEPLOYMENT.md) for the generated
+systemd watchdog policy and macOS's launchd limitations.
 
 ## Replaying a session into one node
 

@@ -85,8 +85,10 @@ namespace talos::introspect {
 // reserved word was left to reuse, and a table of source names per Target does
 // not fit in one anyway. A version-1 viewer therefore sees an empty registry
 // rather than misreading the new records, until it is rebuilt.
-inline constexpr std::uint32_t kRegistryVersion = 2;
-inline constexpr const char* kRegistryPath = "/talos_registry.2";
+// Version 3 changes the heartbeat epoch from wall time to the host monotonic
+// clock. Mixing epochs would make healthy nodes appear stale.
+inline constexpr std::uint32_t kRegistryVersion = 3;
+inline constexpr const char* kRegistryPath = "/talos_registry.3";
 
 inline constexpr std::size_t kMaxNodes = 32;
 inline constexpr std::size_t kMaxSourcesPerNode = 64;
@@ -179,9 +181,8 @@ struct alignas(64) NodeRecord {
   // underneath it.
   std::atomic<std::uint64_t> generation;
 
-  // Wall clock, because the reader is a different process and the monotonic
-  // clocks need not agree.
-  std::atomic<std::int64_t> heartbeat_wall_ns;
+  // Host monotonic time is shared by processes and cannot jump with NTP.
+  std::atomic<std::int64_t> heartbeat_monotonic_ns;
 
   // Published after the source records are written, so a reader never walks
   // entries that are still being filled in.
@@ -262,6 +263,12 @@ static_assert(offsetof(NodeRecord, start_wall_ns) ==
 inline std::int64_t wall_now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+inline std::int64_t monotonic_now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
 
@@ -533,7 +540,8 @@ class NodeRegistration {
 
   void heartbeat() {
     if (!owns_slot()) return;
-    record_->heartbeat_wall_ns.store(wall_now_ns(), std::memory_order_relaxed);
+    record_->heartbeat_monotonic_ns.store(monotonic_now_ns(),
+                                          std::memory_order_relaxed);
   }
 
   void set_dispatch_count(std::uint64_t count) {
@@ -678,7 +686,7 @@ class NodeRegistration {
   // previous session's ghosts -- and only touches slots the liveness check
   // already treats as dead.
   static void sweep_stale(RegistryHeader* header) {
-    const std::int64_t now = wall_now_ns();
+    const std::int64_t now = monotonic_now_ns();
     const std::int64_t timeout =
         std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
             .count();
@@ -688,7 +696,7 @@ class NodeRegistration {
           static_cast<std::uint64_t>(SlotState::ACTIVE)) {
         continue;
       }
-      if (now - record.heartbeat_wall_ns.load(std::memory_order_relaxed) <
+      if (now - record.heartbeat_monotonic_ns.load(std::memory_order_relaxed) <
           timeout) {
         continue;
       }
@@ -702,7 +710,7 @@ class NodeRegistration {
         continue;
       }
       const bool still_stale =
-          now - record.heartbeat_wall_ns.load(std::memory_order_relaxed) >=
+          now - record.heartbeat_monotonic_ns.load(std::memory_order_relaxed) >=
           timeout;
       record.state.store(still_stale
                              ? static_cast<std::uint64_t>(SlotState::FREE)
@@ -739,7 +747,8 @@ class NodeRegistration {
     // A recycled slot may hold an odd sequence from a writer that died
     // mid-sample; a fresh claim is quiescent by definition.
     record->sample_seq.store(0, std::memory_order_relaxed);
-    record->heartbeat_wall_ns.store(wall_now_ns(), std::memory_order_relaxed);
+    record->heartbeat_monotonic_ns.store(monotonic_now_ns(),
+                                         std::memory_order_relaxed);
 
     // A reader that saw the previous occupant must observe a different
     // generation, so bump it before the slot goes live.
@@ -751,7 +760,7 @@ class NodeRegistration {
 
   static NodeRecord* claim_where(RegistryHeader* header, SlotState from,
                                  bool require_stale) {
-    const std::int64_t now = wall_now_ns();
+    const std::int64_t now = monotonic_now_ns();
     const std::int64_t timeout =
         std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
             .count();
@@ -760,7 +769,7 @@ class NodeRegistration {
       NodeRecord& record = header->nodes[i];
       if (require_stale) {
         const std::int64_t beat =
-            record.heartbeat_wall_ns.load(std::memory_order_relaxed);
+            record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
         if (now - beat < timeout) {
           continue;
         }
@@ -836,7 +845,7 @@ struct NodeSnapshot {
   std::uint64_t generation{0};
   std::uint64_t dispatch_count{0};
   std::int64_t start_wall_ns{0};
-  std::int64_t heartbeat_wall_ns{0};
+  std::int64_t heartbeat_monotonic_ns{0};
   std::uint32_t flags{0};
   std::uint32_t declared_source_count{0};
   bool alive{false};
@@ -874,7 +883,7 @@ class RegistryReader {
   std::vector<NodeSnapshot> nodes() const {
     std::vector<NodeSnapshot> out;
     const RegistryHeader* header = mapping_.header();
-    const std::int64_t now = wall_now_ns();
+    const std::int64_t now = monotonic_now_ns();
     const std::int64_t timeout =
         std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
             .count();
@@ -899,7 +908,7 @@ class RegistryReader {
           continue;
         }
         node->generation = generation;
-        node->alive = now - node->heartbeat_wall_ns < timeout;
+        node->alive = now - node->heartbeat_monotonic_ns < timeout;
         out.push_back(std::move(*node));
         break;
       }
@@ -944,8 +953,8 @@ class RegistryReader {
     node.pid = record.pid;
     node.session_id = record.session_id;
     node.start_wall_ns = record.start_wall_ns;
-    node.heartbeat_wall_ns =
-        record.heartbeat_wall_ns.load(std::memory_order_relaxed);
+    node.heartbeat_monotonic_ns =
+        record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
     node.flags = record.flags.load(std::memory_order_relaxed);
     node.dispatch_count = record.dispatch_count.load(std::memory_order_relaxed);
     node.declared_source_count =

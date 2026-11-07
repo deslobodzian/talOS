@@ -47,7 +47,7 @@ arrived: "not known yet" is not "the robot is doing nothing".
 Telemetry says what one node chose to publish. It does not say what is running,
 and a subscriber waiting on a topic nothing publishes looks identical from the
 inside to a healthy one. So the bridge also serves the live node registry: it
-maps `/talos_registry.2` read-only, rebuilds a JSON document from it every 250
+maps `/talos_registry.3` read-only, rebuilds a JSON document from it every 250
 ms, and sends that document two ways. WebSocket clients on `/telemetry` get it
 as a **text** frame, so a client tells the two message families apart by frame
 type rather than by sniffing bytes. `GET /system.json` returns the same

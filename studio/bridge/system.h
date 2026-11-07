@@ -283,7 +283,8 @@ inline void AppendSelection(std::string& out,
   out += '}';
 }
 
-inline void AppendNode(std::string& out, const introspect::NodeSnapshot& node) {
+inline void AppendNode(std::string& out, const introspect::NodeSnapshot& node,
+                        std::int64_t wall_ns, std::int64_t monotonic_ns) {
   out += "{\"name\":";
   AppendEscaped(out, node.name);
   out += ",\"target\":";
@@ -299,7 +300,9 @@ inline void AppendNode(std::string& out, const introspect::NodeSnapshot& node) {
   out += ",\"start_wall_ns\":";
   AppendI64(out, node.start_wall_ns);
   out += ",\"heartbeat_wall_ns\":";
-  AppendI64(out, node.heartbeat_wall_ns);
+  // Keep the public JSON field in the wall epoch. Liveness itself is decided
+  // from monotonic time in the registry, never from this display timestamp.
+  AppendI64(out, wall_ns - (monotonic_ns - node.heartbeat_monotonic_ns));
   out += ",\"dispatch_count\":";
   AppendU64(out, node.dispatch_count);
   out += ",\"declared_sources\":";
@@ -360,6 +363,7 @@ struct SystemGraphInput {
   std::uint32_t node_capacity{0};
   std::uint32_t source_capacity{0};
   std::int64_t wall_ns{0};
+  std::int64_t monotonic_ns{0};
 };
 
 inline std::string SystemGraphJson(const SystemGraphInput& input) {
@@ -398,7 +402,7 @@ inline std::string SystemGraphJson(const SystemGraphInput& input) {
   out += ",\"nodes\":[";
   for (std::size_t i = 0; i < input.nodes.size(); ++i) {
     if (i != 0) out += ',';
-    AppendNode(out, input.nodes[i]);
+    AppendNode(out, input.nodes[i], input.wall_ns, input.monotonic_ns);
   }
   out += ']';
 

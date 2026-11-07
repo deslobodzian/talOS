@@ -5,7 +5,10 @@ load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
 
 cc_library(
     name = "launcher_lib",
-    hdrs = ["launcher.h"],
+    hdrs = [
+        "launcher.h",
+        "service_notifier.h",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         "//talOS/configuration",

@@ -6,10 +6,13 @@
 // empty graph unless a test explicitly exercises a failed probe.
 
 #include <gtest/gtest.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -195,6 +198,7 @@ TEST(Supervision, SessionsAreIsolatedAndCleanOnlyOwnedDirs) {
 
 TEST(Supervision, CriticalFailurePropagatesExitCode) {
   LauncherOptions options = BaseOptions("crit_out");
+  options.max_restarts = 0;
   options.binary_overrides["//example/alpha:node"] =
       WriteStub("crit_alpha", "exit 3\n");
   options.binary_overrides["//example/beta:node"] =
@@ -206,11 +210,11 @@ TEST(Supervision, CriticalFailurePropagatesExitCode) {
   std::filesystem::remove_all(options.output_dir);
 }
 
-// A node that keeps crashing is restarted up to [robot] max_restarts, each run
-// into its own log, and the manifest says so. Its clean-exiting sibling is not
-// restarted.
-TEST(Supervision, CrashingNodeIsRestartedUpToTheLimit) {
+// A persistent fault is quarantined at the rolling limit, not retried in a
+// tight loop. Stopping the session cancels its one pending retry.
+TEST(Supervision, CrashingNodeQuarantinesUntilTheSessionStops) {
   LauncherOptions options = BaseOptions("restart_out", "max_restarts = 2\n");
+  options.duration_s = 1;
   const std::string alpha_runs = TempPath("restart_alpha_runs");
   const std::string beta_runs = TempPath("restart_beta_runs");
   ::remove(alpha_runs.c_str());
@@ -268,6 +272,9 @@ TEST(Supervision, MaxRestartsZeroDisablesRestarts) {
       ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
   EXPECT_NE(alpha.find("\"restart_count\": 0"), std::string::npos) << alpha;
   EXPECT_NE(alpha.find("\"exit_code\": 3"), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"quarantined\": false"), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"retry_at_monotonic_ns\": 0"), std::string::npos)
+      << alpha;
 
   std::filesystem::remove_all(options.output_dir);
   ::remove(alpha_runs.c_str());
@@ -303,6 +310,223 @@ TEST(Supervision, RestartsOutsideRollingWindowDoNotExhaustBudget) {
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
 }
+
+TEST(Supervision, ExhaustedBudgetRetriesOnceAfterTheWindowAndRecovers) {
+  auto options = BaseOptions("quarantine_out", "max_restarts = 1\n");
+  options.restart_window_ms = 300;
+  options.duration_s = 2;
+  const auto runs = TempPath("quarantine_runs");
+  const auto cleared = TempPath("quarantine_cleared");
+  ::remove(runs.c_str());
+  ::remove(cleared.c_str());
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "quarantine_alpha",
+      RecordLogArgThen(runs, "if [ -f " + cleared +
+                                 " ]; then exit 0; fi\nexit 3\n"));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("quarantine_beta", "exit 0\n");
+  std::string quarantined;
+  std::size_t runs_at_quarantine = 0;
+  int64_t retry_at = 0;
+  int64_t recovered_at = 0;
+  // RunSession rewrites options.output_dir on return; don't read it concurrently.
+  const auto manifest = options.output_dir + "/" +
+                        std::to_string(options.session_id) + "/manifest.json";
+  std::jthread observer{[&](const std::stop_token& stop) {
+    while (!stop.stop_requested()) {
+      auto entry = ManifestEntry(ReadFile(manifest), "alpha");
+      if (entry.find("\"quarantined\": true") != std::string::npos) {
+        quarantined = std::move(entry);
+        runs_at_quarantine = ReadLines(runs).size();
+        const std::string key = "\"retry_at_monotonic_ns\": ";
+        const auto at = quarantined.find(key);
+        if (at != std::string::npos)
+          retry_at = std::stoll(quarantined.substr(at + key.size()));
+        std::ofstream{cleared} << "fault cleared\n";
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    for (;;) {
+      if (ReadLines(runs).size() >= 3) {
+        recovered_at = introspect::monotonic_now_ns();
+        return;
+      }
+      if (stop.stop_requested()) return;
+      std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+  }};
+  const auto session_started_at = introspect::monotonic_now_ns();
+  EXPECT_EQ(RunSession(options), 0);
+  observer.request_stop();
+  observer.join();
+  EXPECT_FALSE(quarantined.empty());
+  EXPECT_EQ(runs_at_quarantine, 2u);
+  EXPECT_GT(retry_at, 0);
+  // Initial 50 ms backoff, the 300 ms rolling window, then normal 100 ms
+  // backoff for the second restart; quarantine cannot turn into a quick retry.
+  EXPECT_GE(retry_at, session_started_at + 450'000'000);
+  EXPECT_GE(recovered_at, retry_at);
+  EXPECT_EQ(ReadLines(runs).size(), 3u);
+  const auto alpha =
+      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
+  EXPECT_NE(alpha.find("\"restart_count\": 2"), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"quarantined\": false"), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"retry_at_monotonic_ns\": 0"), std::string::npos)
+      << alpha;
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+  ::remove(cleared.c_str());
+}
+
+TEST(Supervision, StalledNodeGroupKillStopsItsHelper) {
+  auto options = BaseOptions("helper_out");
+  options.max_restarts = 0;
+  options.heartbeat_startup_grace_ms = 0;
+  options.duration_s = 3;
+  const auto helper_pid = TempPath("helper_pid");
+  int lifetime[2];
+  ASSERT_EQ(::pipe(lifetime), 0);
+  // The helper inherits this writer across exec. EOF proves it stopped, even
+  // on hosts where an orphaned helper briefly remains as a zombie.
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("helper_alpha",
+                "sleep 30 &\necho $! > " + helper_pid + "\nwait\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("helper_beta", "exit 0\n");
+  EXPECT_NE(RunSession(options), 0);
+  ::close(lifetime[1]);
+  pollfd ready{lifetime[0], POLLIN, 0};
+  const int result = ::poll(&ready, 1, 1000);
+  char byte = 0;
+  EXPECT_GT(result, 0);
+  if (result > 0) EXPECT_EQ(::read(lifetime[0], &byte, 1), 0);
+  ::close(lifetime[0]);
+  pid_t helper = 0;
+  std::ifstream{helper_pid} >> helper;
+  EXPECT_GT(helper, 0);
+  // Also clean up on a regression, rather than leaking the fixture's helper.
+  if (helper > 0) ::kill(helper, SIGKILL);
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(helper_pid.c_str());
+}
+
+TEST(Supervision, KillingLauncherKillsNodeAndItsHelper) {
+  int output[2];
+  ASSERT_EQ(::pipe(output), 0);
+  const pid_t launcher = ::fork();
+  ASSERT_GE(launcher, 0);
+  if (launcher == 0) {
+    ::close(output[0]);
+    const auto node = SpawnProcess(
+        {"/bin/sh", "-c", "sleep 30 & echo $$; wait"}, "", output[1]);
+    ::close(output[1]);
+    if (node < 0) ::_exit(1);
+    for (;;) ::pause();
+  }
+  ::close(output[1]);
+  pollfd ready{output[0], POLLIN, 0};
+  const int started = ::poll(&ready, 1, 3000);
+  char text[64]{};
+  ssize_t size = 0;
+  if (started > 0) size = ::read(output[0], text, sizeof(text) - 1);
+  ::kill(launcher, SIGKILL);
+  int status = 0;
+  while (::waitpid(launcher, &status, 0) < 0 && errno == EINTR) {
+  }
+  const int stopped = ::poll(&ready, 1, 3000);
+  char byte = 0;
+  EXPECT_GT(started, 0);
+  EXPECT_GT(size, 0);
+  EXPECT_GT(stopped, 0);
+  if (stopped > 0) EXPECT_EQ(::read(output[0], &byte, 1), 0);
+  if (size > 0) {
+    SignalProcessGroup(static_cast<pid_t>(std::strtol(text, nullptr, 10)),
+                       SIGKILL);
+  }
+  ::close(output[0]);
+}
+
+// The real supervision loop, not a watchdog thread, must deliver READY before
+// its first WATCHDOG. A hung loop consequently cannot keep the unit healthy.
+TEST(Supervision, SendsReadyThenWatchdogDatagrams) {
+  const std::string path = "/tmp/tn_" + std::to_string(::getpid());
+  ::unlink(path.c_str());
+  const int socket = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+  ASSERT_GE(socket, 0);
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+  ASSERT_EQ(::bind(socket, reinterpret_cast<const sockaddr*>(&address),
+                   static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                          path.size() + 1)),
+            0);
+  auto options = BaseOptions("notify_out");
+  options.max_restarts = 0;
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("notify_alpha", "sleep 0.1\nexit 0\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("notify_beta", "exit 0\n");
+  const pid_t launcher = ::fork();
+  ASSERT_GE(launcher, 0);
+  if (launcher == 0) {
+    ::close(socket);
+    ::setenv("NOTIFY_SOCKET", path.c_str(), 1);
+    ::_exit(Launcher{options}.Run());
+  }
+  std::vector<std::string> messages;
+  for (int i = 0; i < 2; ++i) {
+    pollfd ready{socket, POLLIN, 0};
+    if (::poll(&ready, 1, 10000) <= 0) break;
+    char buffer[64];
+    const auto size = ::recv(socket, buffer, sizeof(buffer), 0);
+    if (size > 0) messages.emplace_back(buffer, static_cast<std::size_t>(size));
+  }
+  int status = 0;
+  while (::waitpid(launcher, &status, 0) < 0 && errno == EINTR) {
+  }
+  EXPECT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
+  EXPECT_EQ(messages, (std::vector<std::string>{"READY=1", "WATCHDOG=1"}));
+  ::close(socket);
+  ::unlink(path.c_str());
+  std::filesystem::remove_all(options.output_dir);
+}
+
+#ifdef __linux__
+TEST(Supervision, NotifierSupportsAbstractSocketNames) {
+  const std::string path = "@tn_" + std::to_string(::getpid());
+  const int socket = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+  ASSERT_GE(socket, 0);
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  std::memcpy(address.sun_path, path.data(), path.size());
+  address.sun_path[0] = '\0';
+  ASSERT_EQ(::bind(socket, reinterpret_cast<const sockaddr*>(&address),
+                   static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                          path.size())),
+            0);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::close(socket);
+    ::setenv("NOTIFY_SOCKET", path.c_str(), 1);
+    ServiceNotifier notifier;
+    notifier.Send("WATCHDOG=1");
+    ::_exit(0);
+  }
+  pollfd ready{socket, POLLIN, 0};
+  const int received = ::poll(&ready, 1, 1000);
+  char buffer[64]{};
+  ssize_t size = 0;
+  if (received > 0) size = ::recv(socket, buffer, sizeof(buffer), 0);
+  int status = 0;
+  ::waitpid(child, &status, 0);
+  EXPECT_EQ(std::string(buffer, static_cast<std::size_t>(std::max<ssize_t>(size, 0))),
+            "WATCHDOG=1");
+  ::close(socket);
+}
+#endif
 
 TEST(Supervision, StalledRegistryHeartbeatIsKilledAndRestarted) {
   auto options = BaseOptions("stalled_out", "max_restarts = 1\n");
@@ -343,7 +567,7 @@ TEST(Supervision, StalledRegistryHeartbeatIsKilledAndRestarted) {
         row.state.store(static_cast<uint64_t>(introspect::SlotState::CLAIMING),
                         std::memory_order_release);
         row.pid = static_cast<uint64_t>(pid);
-        row.heartbeat_wall_ns.store(introspect::wall_now_ns());
+        row.heartbeat_monotonic_ns.store(introspect::monotonic_now_ns());
         row.dispatch_count.store(1);
         row.state.store(static_cast<uint64_t>(introspect::SlotState::ACTIVE),
                         std::memory_order_release);

@@ -61,7 +61,8 @@ launch; use `--remote-port` and `--local-port` if the ports also differ.
   new one.
 - **enable-boot** starts `<prefix>/current/run.sh` at boot as `--user`
   (default `talos`; the account must exist). Linux: writes and enables
-  `/etc/systemd/system/talos.service` (restart on failure). macOS: writes the
+  `/etc/systemd/system/talos.service` (`Type=notify`, `Restart=always`, a
+  three-second supervision watchdog). macOS: writes the
   LaunchDaemon `/Library/LaunchDaemons/org.talos.robot.plist` (`KeepAlive`)
   and bootstraps it into the system domain, so it starts without a login.
   Both use sudo. `--dry-run` prints the unit or plist instead.
@@ -87,6 +88,37 @@ every invocation, so recordings live in `<prefix>/logs/<session-id>/` and
 restarts of the service never reuse a previous session folder. For a manual
 run to use the same root, set `TALOS_LOG_DIR=/opt/talos/logs` or pass
 `--output-dir /opt/talos/logs`; `logs LOG_ROOT` can inspect another output root.
+
+## Supervision and service recovery
+
+On Linux the launcher sends `READY=1` when the graph has started and enters
+supervision, then `WATCHDOG=1` on each supervision iteration (normally every
+20 ms). `WatchdogSec=3` leaves substantial scheduling and manifest-write
+headroom while recovering a hung launcher during a match; systemd expects a
+notification within half that interval. A stalled loop cannot be masked by
+an independent watchdog thread. `Restart=always` starts a fresh session after
+either a watchdog failure or a launcher exit; `systemctl stop talos` still
+stops the service deliberately. Notifications use `NOTIFY_SOCKET` directly,
+including Linux abstract (`@...`) Unix datagram sockets, without libsystemd.
+
+Each node (including description probes and the Studio bridge) owns a process
+group. Restart, stop and shutdown signal that whole group, not just its
+leader. A per-node guardian watches a launcher-owned lifetime pipe and kills
+the group when the launcher dies, even on SIGKILL; Linux additionally sets
+`PR_SET_PDEATHSIG` on the node. macOS uses the same lifetime-pipe protection,
+but has no `PR_SET_PDEATHSIG` or systemd watchdog: launchd's `KeepAlive`
+restarts an exited launcher, not a hung one. Nodes and helpers must remain in
+their assigned process group rather than daemonizing into another session.
+
+Exhausting a node's rolling restart budget quarantines it until the oldest
+restart ages out of the window, plus the normal backoff. Exactly one retry is
+pending, so clearing a transient fault can recover the node without a service
+restart. The session manifest records `quarantined` and
+`retry_at_monotonic_ns`; a stopping session cancels pending retries.
+`max_restarts = 0` never restarts a node. Registry version 3
+(`/talos_registry.3`) uses host-monotonic heartbeat/liveness timestamps, so
+wall-clock corrections cannot falsely evict healthy nodes; deploy all node
+and viewer binaries together.
 
 ## RoboRIO
 

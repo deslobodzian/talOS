@@ -28,7 +28,7 @@ introspect::NodeSnapshot Odometry() {
   node.generation = 3;
   node.dispatch_count = 9007199254740993ull;  // 2^53 + 1
   node.start_wall_ns = 1'700'000'000'000'000'000;
-  node.heartbeat_wall_ns = 1'700'000'000'500'000'000;
+  node.heartbeat_monotonic_ns = 500'000'000;
   node.flags = introspect::kFlagSimulation;
   node.declared_source_count = 2;
   node.alive = true;
@@ -126,6 +126,7 @@ TEST(SystemGraph, LargeCountersSurviveAsDecimalStrings) {
   input.node_capacity = 32;
   input.source_capacity = 64;
   input.wall_ns = 1'700'000'000'500'000'000;
+  input.monotonic_ns = 500'000'000;
   input.bridge = {
       .topic = "/talos/telemetry", .clients = 2, .frames_forwarded = 7};
 
@@ -150,6 +151,23 @@ TEST(SystemGraph, LargeCountersSurviveAsDecimalStrings) {
   EXPECT_NE(json.find("\"alive\":true"), std::string::npos);
   EXPECT_NE(json.find("\"kind\":\"SENDER\""), std::string::npos);
   EXPECT_NE(json.find("\"kind\":\"WATCHER\""), std::string::npos);
+}
+
+TEST(SystemGraph, ConvertsMonotonicHeartbeatAgeToWallTimeForTheViewer) {
+  SystemGraphInput input;
+  input.nodes = {Odometry()};
+  input.monotonic_ns = 750'000'000;
+  input.wall_ns = 1'700'000'000'750'000'000;
+  auto json = SystemGraphJson(input);
+  EXPECT_NE(json.find("\"heartbeat_wall_ns\":\"1700000000500000000\""),
+            std::string::npos);
+  // A wall-clock step changes the display epoch, not the heartbeat's age or
+  // the registry's already-computed liveness decision.
+  input.wall_ns += 60'000'000'000;
+  json = SystemGraphJson(input);
+  EXPECT_NE(json.find("\"heartbeat_wall_ns\":\"1700000060500000000\""),
+            std::string::npos);
+  EXPECT_NE(json.find("\"alive\":true"), std::string::npos);
 }
 
 TEST(SystemGraph, ReportsAnAbsentRegistryRatherThanFailing) {

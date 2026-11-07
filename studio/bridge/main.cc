@@ -64,6 +64,7 @@ struct Bridge {
                     .invalid = invalid,
                     .ws_drops = ws_drops};
     input.wall_ns = talos::introspect::wall_now_ns();
+    input.monotonic_ns = talos::introspect::monotonic_now_ns();
     if (registry) {
       input.registry_available = true;
       input.node_capacity = registry->node_capacity();
@@ -99,7 +100,7 @@ struct Bridge {
     node.target = "//studio/bridge:studio_bridge";
     node.pid = static_cast<std::uint64_t>(::getpid());
     node.start_wall_ns = started_wall_ns;
-    node.heartbeat_wall_ns = talos::introspect::wall_now_ns();
+    node.heartbeat_monotonic_ns = talos::introspect::monotonic_now_ns();
     node.alive = true;
     node.dispatch_count = forwarded;
     node.declared_source_count = 1;

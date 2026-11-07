@@ -202,8 +202,8 @@ TEST_F(Registry, ReclaimedSlotRejectsUpdatesFromItsPreviousOwner) {
   const auto timeout =
       std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
           .count();
-  slot.heartbeat_wall_ns.store(wall_now_ns() - timeout - 1,
-                                std::memory_order_relaxed);
+  slot.heartbeat_monotonic_ns.store(monotonic_now_ns() - timeout - 1,
+                                     std::memory_order_relaxed);
 
   NodeRegistration next{{.name = "new"}, path_};
   ASSERT_EQ(next.slot(), old->slot());
@@ -212,7 +212,8 @@ TEST_F(Registry, ReclaimedSlotRejectsUpdatesFromItsPreviousOwner) {
   next.set_dispatch_count(42);
   next.set_source(0, 1, 2, 3, 4, 5, 6);
   next.set_selected(0, 1);
-  const auto heartbeat = slot.heartbeat_wall_ns.load(std::memory_order_relaxed);
+  const auto heartbeat =
+      slot.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
   const auto sequence = slot.sample_seq.load(std::memory_order_relaxed);
 
   old->begin_sample();
@@ -225,7 +226,8 @@ TEST_F(Registry, ReclaimedSlotRejectsUpdatesFromItsPreviousOwner) {
   old.reset();  // Destruction must not free the reclaimed slot either.
 
   EXPECT_EQ(slot.sample_seq.load(std::memory_order_relaxed), sequence);
-  EXPECT_EQ(slot.heartbeat_wall_ns.load(std::memory_order_relaxed), heartbeat);
+  EXPECT_EQ(slot.heartbeat_monotonic_ns.load(std::memory_order_relaxed),
+            heartbeat);
   auto reader = RegistryReader::open(path_);
   ASSERT_TRUE(reader.has_value());
   const auto nodes = reader->nodes();
@@ -291,8 +293,8 @@ TEST_F(Registry, ANewClaimSweepsSlotsLeftBehindByACrashedNode) {
       std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
           .count();
   RegistryMapping mapping{path_};
-  mapping.header()->nodes[ghost->slot()].heartbeat_wall_ns.store(
-      wall_now_ns() - timeout_ns - 1, std::memory_order_relaxed);
+  mapping.header()->nodes[ghost->slot()].heartbeat_monotonic_ns.store(
+      monotonic_now_ns() - timeout_ns - 1, std::memory_order_relaxed);
 
   {
     auto stale = RegistryReader::open(path_);
@@ -322,6 +324,36 @@ TEST_F(Registry, ANewClaimSweepsSlotsLeftBehindByACrashedNode) {
   const auto after = registry.nodes();
   ASSERT_EQ(after.size(), 1u);
   EXPECT_EQ(after.front().session_id, 1788u);
+}
+
+TEST_F(Registry, HeartbeatAndSweepUseHostMonotonicTime) {
+  const auto before = monotonic_now_ns();
+  NodeRegistration healthy{{.name = "healthy"}, path_};
+  healthy.heartbeat();
+  const auto after = monotonic_now_ns();
+  RegistryMapping mapping{path_};
+  NodeRecord& row = mapping.header()->nodes[healthy.slot()];
+  const auto beat = row.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
+  EXPECT_GE(beat, before);
+  EXPECT_LE(beat, after);
+
+  // Human-facing wall timestamps may be arbitrarily far in either direction.
+  // A claim sweeps existing rows; neither that sweep nor reader liveness may
+  // mistake the monotonic heartbeat for a wall-clock timestamp.
+  for (const auto wall : {int64_t{0}, int64_t{8'000'000'000'000'000'000}}) {
+    row.start_wall_ns = wall;
+    NodeRegistration newcomer{{.name = "newcomer"}, path_};
+    EXPECT_NE(newcomer.slot(), healthy.slot());
+    auto reader = RegistryReader::open(path_);
+    ASSERT_TRUE(reader.has_value());
+    const auto nodes = reader->nodes();
+    const auto found = std::find_if(nodes.begin(), nodes.end(), [](const auto& n) {
+      return n.name == "healthy";
+    });
+    ASSERT_NE(found, nodes.end());
+    EXPECT_TRUE(found->alive);
+    EXPECT_EQ(found->heartbeat_monotonic_ns, beat);
+  }
 }
 
 TEST_F(Registry, SourcesBeyondCapacityAreCountedButNotStored) {
@@ -717,7 +749,8 @@ TEST_F(Registry, WriterWithoutTheGuardReadsAsStable) {
   NodeRecord& record = mapping.header()->nodes[registration.slot()];
   record.dispatch_count.store(41, std::memory_order_relaxed);
   record.sources[2].events.store(41, std::memory_order_relaxed);
-  record.heartbeat_wall_ns.store(wall_now_ns(), std::memory_order_relaxed);
+  record.heartbeat_monotonic_ns.store(monotonic_now_ns(),
+                                      std::memory_order_relaxed);
   EXPECT_EQ(record.sample_seq.load(std::memory_order_relaxed), 0u);
 
   auto reader = RegistryReader::open(path_);
