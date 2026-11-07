@@ -1,0 +1,9 @@
+[subsystems.test.motors.motor]
+can_id = 1
+
+[subsystems.test.encoders.quadrature_encoder]
+type = "QuadratureEncoder"
+dio_a = 2
+dio_b = 3
+counts_per_rev = 4096.0
+counts_per_revolution = 1

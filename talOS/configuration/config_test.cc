@@ -25,6 +25,27 @@ void ExpectRejected(std::string_view body) {
   EXPECT_THROW(Parse(body), std::invalid_argument) << body;
 }
 
+TEST(ConfigTest, RejectsMalformedStructuralTablesAndUnknownMotorKeys) {
+  for (const auto* text : {
+           "robot = 1\n[subsystems.test]\n",
+           "[subsystems]\ntest = 1\n"}) {
+    EXPECT_THROW(ParseRobotConfigString(text), std::invalid_argument);
+  }
+  for (const auto* section : {"motors", "sensors", "digital_inputs",
+                              "digital_outputs", "analog_inputs", "encoders",
+                              "pwm_outputs"}) {
+    EXPECT_THROW(ParseRobotConfigString(
+                     std::string("[subsystems.test]\n") + section + " = 1\n"),
+                 std::invalid_argument);
+  }
+  ExpectRejected("canid = 2\n");
+  for (int slot = 0; slot < 3; ++slot) {
+    ExpectRejected("slot" + std::to_string(slot) + " = 1\n");
+    ExpectRejected("[subsystems.test.motors.m1.slot" + std::to_string(slot) +
+                   "]\nunknown = 1\n");
+  }
+}
+
 TEST(ConfigTest, ParsesFollowerAndGravityTypes) {
   const auto cfg = Parse(R"(
 [subsystems.test.motors.follower]
@@ -344,6 +365,25 @@ class ManifestTest : public ::testing::Test {
 
   std::filesystem::path dir_;
 };
+
+TEST_F(ManifestTest, UnknownDeviceKeyNamesSourceFileDeviceAndKey) {
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"test\"\npath = \"subsystems/test.toml\"\n");
+  Write("subsystems/test.toml",
+        "[subsystem]\nname = \"test\"\ndefaults = \"defaults.toml\"\n"
+        "[sensors.encoder]\ncan_id = 2\n");
+  Write("subsystems/defaults.toml",
+        "[sensors.encoder]\noffest_rot = 0.25\n");
+  try {
+    (void)ParseRobotConfig(Robot());
+    FAIL() << "unknown sensor key was accepted";
+  } catch (const std::invalid_argument& error) {
+    const std::string message = error.what();
+    EXPECT_NE(message.find("unknown sensor key 'offest_rot' for encoder"),
+              std::string::npos);
+    EXPECT_NE(message.find("subsystems/defaults.toml"), std::string::npos);
+  }
+}
 
 TEST_F(ManifestTest, MergesSubsystemFilesAndKeepsTopLevelTables) {
   Write("robot.toml", R"(
@@ -711,7 +751,16 @@ TEST(ConfigTest, SharedResolutionCases) {
     fs::copy(dir.path(), copy, fs::copy_options::recursive);
     const std::string path = (copy / config).string();
     if (!expect["accept"].value_or(false)) {
-      EXPECT_THROW(ParseRobotConfig(path), std::invalid_argument);
+      try {
+        (void)ParseRobotConfig(path);
+        FAIL() << "invalid config was accepted";
+      } catch (const std::invalid_argument& error) {
+        if (const auto expected = expect["error_contains"].value<std::string>()) {
+          EXPECT_NE(std::string(error.what()).find(*expected),
+                    std::string::npos)
+              << error.what();
+        }
+      }
       continue;
     }
     EXPECT_EQ(Nodes(ParseRobotConfig(path)), Strings(expect, "nodes"));

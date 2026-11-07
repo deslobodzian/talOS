@@ -16,6 +16,41 @@ def put(root, path, text):
 
 
 class SyncManifestTest(unittest.TestCase):
+    def test_rejects_structural_tables_and_unknown_motor_keys(self):
+        bad = [
+            "robot = 1\n[subsystems.test]\n",
+            "[subsystems]\ntest = 1\n",
+            "[subsystems.test.motors.m]\ncan_id = 1\ncanid = 2\n",
+        ]
+        bad += [f"[subsystems.test]\n{section} = 1\n"
+                for section in sync_manifest._DEVICE_SECTIONS]
+        for slot in ("slot0", "slot1", "slot2"):
+            bad += [
+                f"[subsystems.test.motors.m]\ncan_id = 1\n{slot} = 1\n",
+                f"[subsystems.test.motors.m.{slot}]\nunknown = 1\n",
+            ]
+        for text in bad:
+            with self.subTest(text=text):
+                with self.assertRaises(sync_manifest.ManifestError):
+                    sync_manifest.effective(
+                        self.root, "bad.toml", overrides={"bad.toml": text})
+        text = ("[subsystems.test.motors.m]\ncan_id = 1\nbrake = true\n"
+                "[subsystems.test.motors.m.slot0]\np = 1.0\n"
+                'gravity_type = "Arm"\n')
+        sync_manifest.effective(
+            self.root, "good.toml", overrides={"good.toml": text})
+
+    def test_unknown_device_key_error_names_config_device_and_key(self):
+        text = ('[subsystems.test.sensors.encoder]\n'
+                'type = "CANcoder"\ncan_id = 2\noffest_rot = 0.25\n')
+        with self.assertRaises(sync_manifest.ManifestError) as caught:
+            sync_manifest.effective(
+                self.root, "bad.toml", overrides={"bad.toml": text})
+        message = str(caught.exception)
+        self.assertIn("bad.toml", message)
+        self.assertIn("[subsystems.test].sensors.encoder", message)
+        self.assertIn("unknown sensor key 'offest_rot'", message)
+
     def test_pov_toggle_validation(self):
         for angle in range(0, 360, 45):
             sync_manifest._check_teleop(
@@ -136,8 +171,11 @@ class SharedResolutionCasesTest(unittest.TestCase):
             config = expect.get("config", "robot.toml")
             with self.subTest(name):
                 if not expect["accept"]:
-                    with self.assertRaises(sync_manifest.ManifestError):
+                    with self.assertRaises(sync_manifest.ManifestError) as caught:
                         sync_manifest.resolve(root, config)
+                    if "error_contains" in expect:
+                        self.assertIn(expect["error_contains"],
+                                      str(caught.exception))
                     continue
                 self.assertEqual(sync_manifest.resolve(root, config),
                                  (expect["nodes"], expect["files"]))

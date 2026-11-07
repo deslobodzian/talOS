@@ -1,0 +1,2 @@
+accept = false
+error_contains = "unknown encoder key 'counts_per_rev'"

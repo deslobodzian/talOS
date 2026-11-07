@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -239,6 +240,22 @@ inline bool IsCANcoder(const RawDevice& d) {
 }
 
 inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
+  for (auto&& [key, value] : t) {
+    const auto k = key.str();
+    if (k != "type" && k != "bus" && k != "can_id" && k != "inverted" &&
+        k != "brake" && k != "supply_limit_a" && k != "stator_limit_a" &&
+        k != "max_voltage" && k != "rotor_to_sensor_ratio" &&
+        k != "sensor_to_mechanism_ratio" && k != "continuous_wrap" &&
+        k != "soft_limits" && k != "reverse_limit_rot" &&
+        k != "forward_limit_rot" && k != "max_velocity_rps" &&
+        k != "cruise_velocity_rps" && k != "acceleration_rps2" &&
+        k != "jerk_rps3" && k != "follow" && k != "oppose_master" &&
+        k != "feedback" && k != "feedback_sensor" &&
+        k != "slot0" && k != "slot1" && k != "slot2") {
+      throw std::invalid_argument("unknown motor key '" + std::string(k) +
+                                  "' for " + name);
+    }
+  }
   if (Read<std::string>(t, "type", "TalonFX") != "TalonFX") {
     throw std::invalid_argument("unknown motor type for " + name);
   }
@@ -264,7 +281,19 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   m.acceleration_rps2 = Read(t, "acceleration_rps2", m.acceleration_rps2);
   m.jerk_rps3 = Read(t, "jerk_rps3", m.jerk_rps3);
   for (int s = 0; s < 3; ++s) {
+    const auto slot_name = "slot" + std::to_string(s);
+    if (t.contains(slot_name) && !t[slot_name].is_table()) {
+      throw std::invalid_argument(slot_name + " must be a table for " + name);
+    }
     if (auto* slot = t["slot" + std::to_string(s)].as_table()) {
+      for (auto&& [key, value] : *slot) {
+        const auto k = key.str();
+        if (k != "p" && k != "i" && k != "d" && k != "s" &&
+            k != "v" && k != "a" && k != "g" && k != "gravity_type") {
+          throw std::invalid_argument("unknown motor slot key '" +
+                                      std::string(k) + "' for " + name);
+        }
+      }
       auto& g = m.slots[s];
       g.p = Read(*slot, "p", g.p);
       g.i = Read(*slot, "i", g.i);
@@ -313,7 +342,24 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   return raw;
 }
 
+inline void CheckDeviceKeys(
+    const toml::table& t, const std::string& name, std::string_view kind,
+    std::initializer_list<std::string_view> allowed) {
+  for (auto&& [key, value] : t) {
+    if (std::find(allowed.begin(), allowed.end(), key.str()) == allowed.end()) {
+      std::string message = "unknown " + std::string(kind) + " key '" +
+                            std::string(key.str()) + "' for " + name;
+      if (key.source().path) {
+        message += " in " + *key.source().path;
+      }
+      throw std::invalid_argument(message);
+    }
+  }
+}
+
 inline RawDevice ParseSensor(const toml::table& t, const std::string& name) {
+  CheckDeviceKeys(t, name, "sensor",
+                  {"type", "bus", "can_id", "inverted", "offset_rot"});
   hardware::SensorConfig s;
   const std::string type = Read<std::string>(t, "type", "CANcoder");
   if (type == "CANcoder") {
@@ -335,11 +381,14 @@ inline RawDevice ParseEncoder(const toml::table& t, const std::string& name) {
   hardware::EncoderConfig e;
   const std::string type = Read<std::string>(t, "type", "QuadratureEncoder");
   if (type == "QuadratureEncoder") {
+    CheckDeviceKeys(t, name, "encoder",
+                    {"type", "dio_a", "dio_b", "counts_per_rev"});
     e.kind = hardware::EncoderKind::kQuadrature;
     e.dio_a = ReadRequired<int>(t, "dio_a", name);
     e.dio_b = ReadRequired<int>(t, "dio_b", name);
     e.counts_per_rev = Read(t, "counts_per_rev", e.counts_per_rev);
   } else if (type == "DutyCycleEncoder") {
+    CheckDeviceKeys(t, name, "encoder", {"type", "dio", "offset_rot"});
     e.kind = hardware::EncoderKind::kDutyCycle;
     e.dio_a = ReadRequired<int>(t, "dio", name);
     e.offset_rot = Read(t, "offset_rot", e.offset_rot);
@@ -630,6 +679,9 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
   result.toml_data = tbl;
   auto& hw = result.hardware;
 
+  if (tbl.contains("robot") && !tbl["robot"].is_table()) {
+    throw std::invalid_argument("[robot] must be a table");
+  }
   if (auto* robot = tbl["robot"].as_table()) {
     hw.period_us = Read(*robot, "period_us", hw.period_us);
     hw.command_timeout_us =
@@ -687,7 +739,9 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
   for (auto&& [sub_key, sub_val] : *subsystems_tbl) {
     const std::string sub_name(sub_key.str());
     auto* sub_tbl = sub_val.as_table();
-    if (!sub_tbl) continue;
+    if (!sub_tbl) {
+      throw std::invalid_argument("[subsystems." + sub_name + "] must be a table");
+    }
     result.subsystems[sub_name].subsystem = sub_name;
     // The launcher starts a subsystem's `node`; a malformed one must not
     // silently leave the subsystem without a process.
@@ -710,7 +764,12 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     }
     auto each = [&](const char* section, auto parse) {
       auto* devices = (*sub_tbl)[section].as_table();
-      if (!devices) return;
+      if (!devices) {
+        if (sub_tbl->contains(section)) {
+          throw std::invalid_argument(std::string(section) + " must be a table");
+        }
+        return;
+      }
       for (auto&& [dev_key, dev_val] : *devices) {
         const std::string name(dev_key.str());
         auto* dev_tbl = dev_val.as_table();
@@ -728,19 +787,23 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     each("sensors", detail::ParseSensor);
     each("encoders", detail::ParseEncoder);
     each("digital_inputs", [](const toml::table& t, const std::string& n) {
+      detail::CheckDeviceKeys(t, n, "digital input", {"dio"});
       return detail::RawDevice{.config = hardware::DigitalInputConfig{
                                    .dio = ReadRequired<int>(t, "dio", n)}};
     });
     each("digital_outputs", [](const toml::table& t, const std::string& n) {
+      detail::CheckDeviceKeys(t, n, "digital output", {"dio"});
       return detail::RawDevice{.config = hardware::DigitalOutputConfig{
                                    .dio = ReadRequired<int>(t, "dio", n)}};
     });
     each("analog_inputs", [](const toml::table& t, const std::string& n) {
+      detail::CheckDeviceKeys(t, n, "analog input", {"channel"});
       return detail::RawDevice{
           .config = hardware::AnalogInputConfig{
               .channel = ReadRequired<int>(t, "channel", n)}};
     });
     each("pwm_outputs", [](const toml::table& t, const std::string& n) {
+      detail::CheckDeviceKeys(t, n, "PWM output", {"channel"});
       return detail::RawDevice{
           .config = hardware::PwmConfig{
               .channel = ReadRequired<int>(t, "channel", n)}};
@@ -894,7 +957,7 @@ inline toml::table ParseTomlFile(const std::string& path) {
   std::stringstream ss;
   ss << f.rdbuf();
   try {
-    return toml::parse(ss.str());
+    return toml::parse(ss.str(), path);
   } catch (const toml::parse_error& err) {
     throw std::invalid_argument("TOML parse error in " + path + ": " +
                                 err.what());

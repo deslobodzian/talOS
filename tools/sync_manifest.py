@@ -58,6 +58,68 @@ def _join(base_dir, rel, where):
 _TOP_LEVEL_KEYS = ("include", "robot", "studio", "subsystems")
 _ENTRY_KEYS = ("name", "path", "node", "defaults")
 _STUDIO_KEYS = ("bridge", "webroot", "http_port", "topic", "pose_topic")
+_DEVICE_SECTIONS = ("motors", "sensors", "digital_inputs", "digital_outputs",
+                    "analog_inputs", "encoders", "pwm_outputs")
+_MOTOR_KEYS = {
+    "type", "bus", "can_id", "inverted", "brake", "supply_limit_a",
+    "stator_limit_a", "max_voltage", "rotor_to_sensor_ratio",
+    "sensor_to_mechanism_ratio", "continuous_wrap", "soft_limits",
+    "reverse_limit_rot", "forward_limit_rot", "max_velocity_rps",
+    "cruise_velocity_rps", "acceleration_rps2", "jerk_rps3", "follow",
+    "oppose_master", "feedback", "feedback_sensor", "slot0", "slot1", "slot2",
+}
+_SLOT_KEYS = {"p", "i", "d", "s", "v", "a", "g", "gravity_type"}
+_SENSOR_KEYS = {"type", "bus", "can_id", "inverted", "offset_rot"}
+_ENCODER_KEYS = {
+    "QuadratureEncoder": {"type", "dio_a", "dio_b", "counts_per_rev"},
+    "DutyCycleEncoder": {"type", "dio", "offset_rot"},
+}
+_IO_KEYS = {
+    "digital_inputs": ("digital input", {"dio"}),
+    "digital_outputs": ("digital output", {"dio"}),
+    "analog_inputs": ("analog input", {"channel"}),
+    "pwm_outputs": ("PWM output", {"channel"}),
+}
+
+
+def _check_devices(table, where):
+    for section in _DEVICE_SECTIONS:
+        if section not in table:
+            continue
+        devices = table[section]
+        if not isinstance(devices, dict):
+            raise ManifestError(f"{where}.{section} must be a table")
+        for name, device in devices.items():
+            device_where = f"{where}.{section}.{name}"
+            if not isinstance(device, dict):
+                raise ManifestError(f"{device_where} must be a table")
+            if section == "motors":
+                kind, allowed = "motor", _MOTOR_KEYS
+            elif section == "sensors":
+                kind, allowed = "sensor", _SENSOR_KEYS
+            elif section == "encoders":
+                kind = "encoder"
+                device_type = device.get("type", "QuadratureEncoder")
+                if not isinstance(device_type, str) or device_type not in _ENCODER_KEYS:
+                    raise ManifestError(
+                        f"{device_where}: unknown encoder type '{device_type}'")
+                allowed = _ENCODER_KEYS[device_type]
+            else:
+                kind, allowed = _IO_KEYS[section]
+            for key in device:
+                if key not in allowed:
+                    raise ManifestError(f"{device_where}: unknown {kind} key '{key}'")
+            if section != "motors":
+                continue
+            for slot in ("slot0", "slot1", "slot2"):
+                if slot not in device:
+                    continue
+                if not isinstance(device[slot], dict):
+                    raise ManifestError(f"{device_where}.{slot} must be a table")
+                for key in device[slot]:
+                    if key not in _SLOT_KEYS:
+                        raise ManifestError(
+                            f"{device_where}.{slot}: unknown motor slot key '{key}'")
 
 
 def _check_studio(studio, where):
@@ -319,9 +381,8 @@ def effective(root, config, overrides=None, available=None):
     """(`config`'s canonical {name: [subsystems.<name>] table} view, sorted
     workspace-relative paths of every file it reads besides itself).
 
-    Mirrors config_parser.h ParseRobotConfig step for step; the shared cases
-    in talOS/configuration/testdata hold both to the same decisions. Device
-    tables are not checked here: the parser does that when the config loads.
+    Mirrors config_parser.h ParseRobotConfig step for step; structural device
+    and device-key checks agree with the runtime parser.
 
     `overrides` maps a path to content that replaces the file on disk (a
     pending edit). `available`, when given, is the set of paths that may be
@@ -355,6 +416,8 @@ def effective(root, config, overrides=None, available=None):
                 base["subsystems"] = reader.expand(base_subs, include)
         _merge_tables(base, doc)
         doc = base
+    if "robot" in doc and not isinstance(doc["robot"], dict):
+        raise ManifestError(f"{config}: [robot] must be a table")
     if "studio" in doc:
         _check_studio(doc["studio"], config)
     if isinstance(doc.get("subsystems"), list):
@@ -363,11 +426,13 @@ def effective(root, config, overrides=None, available=None):
     if not isinstance(subs, dict):
         raise ManifestError(f"{config}: missing [subsystems] table")
     for name, table in subs.items():
-        if isinstance(table, dict):
-            if "node" in table:
-                _non_empty(table, "node", f"[subsystems.{name}]")
-            if "teleop" in table:
-                _check_teleop(table["teleop"], name)
+        if not isinstance(table, dict):
+            raise ManifestError(f"[subsystems.{name}] must be a table")
+        if "node" in table:
+            _non_empty(table, "node", f"[subsystems.{name}]")
+        if "teleop" in table:
+            _check_teleop(table["teleop"], name)
+        _check_devices(table, f"{config}: [subsystems.{name}]")
     return subs, sorted(reader.files)
 
 
