@@ -11,7 +11,7 @@
 |---|---|---|---|---|
 | `drivetrain` | C++ | swerve kinematics and module control | `/drivetrain/target/teleop`, `/drivetrain/target/auto` | `/drivetrain/state` |
 | `shooter` | C++ | flywheel to target speed, beam break | `/shooter/target/teleop`, `/shooter/target/auto` | `/shooter/state` |
-| `intake` | Python | roller and beam break | `/intake/target/teleop`, `/intake/target/auto` | `/intake/state` |
+| `intake` | Python | roller, beam break and shooter-ready feed permit | `/intake/target/teleop`, `/intake/target/auto`, `/shooter/state` | `/intake/state` |
 | `driver` | C++ | joystick 0 sticks to drivetrain teleop target lane (deadband, field-oriented) | `/hw/state/driver_station`, `/drivetrain/state` | `/drivetrain/target/teleop` |
 | `autonomous` | C++ | preload spinup/feed, alliance-relative waypoint and collection | `/hw/state/driver_station`, `/pose_estimator/state`, `/shooter/state`, `/intake/state` | `/drivetrain/target/auto`, `/shooter/target/auto`, `/intake/target/auto` |
 | `teleop` (`//talOS/teleop:node`) | C++ | framework teleop node; maps joystick buttons and axes declared in `[[teleop.bindings]]` to mechanism target lanes | `/hw/state/driver_station` | `/shooter/target/teleop`, `/intake/target/teleop` |
@@ -41,6 +41,17 @@ that origin (configure the estimator's starting pose consistently). Invalid or
 stale pose stops drive and intake immediately; stale intake feedback inhibits
 collection. Reaching the waypoint holds all outputs at zero until mode exit.
 Disable, teleop, or DS loss releases all three lanes once.
+
+Teleop joystick 0: hold button **1** for the 60 rps flywheel, **2** to collect
+at +30 rps (stops at the intake beam), and **3** to feed at -20 rps past the
+beam. Hold **1+3** to score; button 3 alone cannot feed a stopped shooter.
+If 2 and 3 are held together, collection wins (first binding takes precedence).
+Every negative intake target, autonomous or teleop, requires fresh shooter
+`at_speed` with a positive shooter target on every tick; otherwise the roller
+is neutral and `/intake/state.inhibit` reports `SHOOTER_NOT_READY`.
+`requested_velocity_rps` retains the withheld feed ask for diagnosis.
+Release the buttons and enable with controls neutral to rearm after a disable
+or link loss.
 
 ## Config
 

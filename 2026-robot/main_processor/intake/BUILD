@@ -18,7 +18,10 @@ talos_py_node(
     class_name = "Intake",
     main = "intake.py",
     node_name = "intake",
-    deps = [":messages_py"],
+    deps = [
+        ":messages_py",
+        "//2026-robot/main_processor/shooter:messages_py",
+    ],
 )
 
 py_test(
@@ -34,6 +37,7 @@ py_test(
     legacy_create_init = False,
     deps = [
         ":messages_py",
+        "//2026-robot/main_processor/shooter:messages_py",
         "//talOS/bridge:messages_py",
         "//talOS/python:testing",
         "@rules_python//python/runfiles",

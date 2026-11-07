@@ -16,13 +16,15 @@ enum Inhibit : ubyte {
   TARGET_STALE,
   FEEDBACK_INVALID,
   DEMAND_NONFINITE,
+  SHOOTER_NOT_READY,
 }
 
 // Studio view fields (talOS/telemetry/node.h forwards
 // them as mechanism channels, mirroring ShooterState.target_velocity_rps):
-// requested_velocity_rps echoes the demand the policy acted on this tick
-// (0 when no target lane is selected), roller_velocity_rps is the measured
-// wheel speed, and inhibit names why the wheel is NOT driving. Appended,
+// requested_velocity_rps echoes the finite, beam-limited demand, including a
+// negative feed ask withheld by SHOOTER_NOT_READY (0 with no selected target
+// or a nonfinite ask). roller_velocity_rps is measured wheel speed; inhibit
+// names why the wheel is NOT driving. Appended,
 // never reordered: flatbuffers structs are fixed-size, so field order is the
 // wire order.
 struct IntakeState {

@@ -192,6 +192,14 @@ def ds_snapshot(row):
     return flags, axis1
 
 
+def ds_buttons(row):
+    data = packet_bytes(row)
+    offset = 30
+    for _ in range(2):
+        offset += 1 + data[offset]
+    return struct.unpack_from("<I", data, offset + 4)[0]
+
+
 def log_baseline_ns(session):
     """Find log_dump's exact origin without assuming a Python/C++ clock epoch.
 
@@ -283,6 +291,8 @@ class FullStackSimulation(unittest.TestCase):
                      if sub == "drivetrain" and kind == "motors" and name.endswith("_drive")]
         fault_id = next(i for i, _, name, kind in layout
                         if kind == "motors" and name == "back_left_drive")
+        roller_id = next(i for i, sub, name, kind in layout
+                         if sub == "intake" and name == "roller" and kind == "motors")
         motor_order = [i for i, _, _, kind in layout if kind == "motors"]
         fault_bit = 1 << motor_order.index(fault_id)
         gw_port, bridge_port = udp_ports()
@@ -302,7 +312,8 @@ class FullStackSimulation(unittest.TestCase):
                     "--mode-schedule", "disabled:0.5,auto:0.5,teleop:6,disabled:1",
                     "--joystick-schedule",
                     "0:axes=0,0,0;buttons=0;pov=-1|"
-                    "1.4:axes=0,-0.6,0;buttons=0;pov=-1|"
+                    "1.4:axes=0,-0.6,0;buttons=4;pov=-1|"
+                    "1.8:axes=0,-0.6,0;buttons=5;pov=-1|"
                     "3:axes=0,0,0;buttons=0;pov=-1|"
                     "3.4:axes=0,-0.6,0;buttons=0;pov=-1|"
                     "5:axes=0,0,0;buttons=0;pov=-1|"
@@ -364,8 +375,9 @@ class FullStackSimulation(unittest.TestCase):
                     self.assertGreater(node["record_count"], 0, name)
             dumped = subprocess.run(
                 [str(root / "talOS/launcher/log_dump"), "--format", "jsonl",
-                 "--node", "drivetrain,hardware_node",
-                 "--topic", "/hw/request/drivetrain,/hw/state/driver_station,/hw/state,/hw/status",
+                 "--node", "drivetrain,hardware_node,intake,shooter",
+                 "--topic", "/hw/request/drivetrain,/hw/request/intake,/shooter/state,"
+                 "/hw/state/driver_station,/hw/state,/hw/status",
                  str(session)], capture_output=True, text=True, timeout=10, check=True)
             (tmp / "match.jsonl").write_text(dumped.stdout)
             rows = [json.loads(line) for line in dumped.stdout.splitlines()]
@@ -377,6 +389,27 @@ class FullStackSimulation(unittest.TestCase):
             ds = [r for r in rows if r["process"] == "drivetrain" and
                   r["topic"] == "/hw/state/driver_station" and r["kind"] == "MESSAGE"]
             self.assertGreater(len(ds), 100)
+            intake_requests = [
+                r for r in rows if r["process"] == "intake" and
+                r["topic"] == "/hw/request/intake" and r["kind"] == "SEND"]
+            feed_only = next(r["now_ms"] for r in ds if ds_buttons(r) == 4)
+            spinup = next(r["now_ms"] for r in ds if ds_buttons(r) == 5)
+            # Button 3 alone must not feed a stopped flywheel. Require dense
+            # request samples so a missing recorder cannot pass as safe.
+            self.assert_neutral(intake_requests, feed_only + 80, spinup, [roller_id])
+            ready = [
+                r for r in rows if r["process"] == "shooter" and
+                r["topic"] == "/shooter/state" and r["kind"] == "SEND" and
+                spinup < r["now_ms"] < spinup + 1000 and
+                struct.unpack_from("<?", bytes.fromhex(r["payload_hex"]), 24)[0] and
+                struct.unpack_from("<d", bytes.fromhex(r["payload_hex"]), 16)[0] > 0]
+            self.assertTrue(ready, "flywheel never reached speed while 1+3 held")
+            feeding = self.window(intake_requests, ready[0]["now_ms"] + 80,
+                                  ready[0]["now_ms"] + 200)
+            self.assertTrue(all(
+                motor_requests(r)[roller_id][0] == 3 and
+                motor_requests(r)[roller_id][2] == -20.0 for r in feeding),
+                "ready shooter plus held buttons 1+3 did not feed")
             centers = []
             previous_axis = None
             for row in ds:

@@ -120,6 +120,7 @@ Override the recorded detector settings with `--decimate`, `--threads`,
 
 - [ ] Secure the shooter, clear its discharge path, enable teleop and use the shooter binding in `2026-robot/main_processor/configuration/subsystems/shooter.toml` (button 1). Expected: the flywheel follows the configured demand in the correct direction, the beam input changes when interrupted, and release/disable removes drive (coast-down is not continued actuation).
 - [ ] Secure the intake, enable teleop and use the intake binding in `2026-robot/main_processor/configuration/subsystems/intake.toml` (button 2). Expected: the roller intakes in the correct direction, beam detection changes its state as implemented, and release/disable neutralizes it. Observe both mechanisms in Studio; drivetrain monitor is not a shooter/intake monitor.
+- [ ] With both mechanisms secured and the discharge path clear, hold button 3 alone. Expected: no feed; `/intake/state` reports `SHOOTER_NOT_READY` and requested -20 rps. Hold 1+3: feeding begins only at shooter speed and stops if readiness or fresh shooter feedback is lost. Release button 1 while holding 3: the roller neutralizes even during flywheel coast-down. Hold 2+3: collection (+30 rps, stopping at the beam) takes precedence. Disable always neutralizes both mechanisms.
 
 ## Link timing and fault injection
 
