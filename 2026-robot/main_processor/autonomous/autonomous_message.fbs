@@ -20,4 +20,6 @@ enum Phase : ubyte {
 // `autonomous/state/phase` enum channel, whose labels are the names above.
 struct AutonomousState {
   phase:Phase;
+  // Index in autonomous.toml's routines: selected while disabled, latched in auto.
+  routine_index:ubyte;
 }

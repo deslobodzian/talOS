@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <numbers>
 #include <stdexcept>
@@ -84,16 +86,35 @@ class AutonomousTest : public ::testing::Test {
     hw.set_driver_station(packet);
     sim.step(20ms);
   }
+  void Pov(int angle, unsigned flags = 0) {
+    auto packet = talos::testing::DsPacket(flags);
+    packet.joysticks[0].connected = true;
+    packet.joysticks[0].pov_count = 1;
+    packet.joysticks[0].povs[0] = angle;
+    hw.set_driver_station(packet);
+    sim.step(20ms);
+  }
+  std::uint8_t Routine() {
+    return sim.latest<AutonomousState>(topics::kState)->routine_index();
+  }
+  void Select(unsigned index) {
+    Pov(-1);
+    for (unsigned i = 0; i < index; ++i) {
+      Pov(90);
+      Pov(-1);
+    }
+    ASSERT_EQ(Routine(), index);
+  }
   void Shooter(bool ready) {
     sim.publish(shooter::topics::kState,
                 shooter::ShooterState{0, 60, 60, ready, true, true});
   }
   void Pose(double x = 0, double y = 0, double yaw = 0, bool valid = true,
             bool localized = true) {
-    sim.publish("/pose_estimator/state",
-                geometry::PoseEstimate{0, geometry::Pose2d{x, y, yaw},
-                                       geometry::Twist2d{}, valid, localized, 0,
-                                       0});
+    sim.publish(
+        "/pose_estimator/state",
+        geometry::PoseEstimate{0, geometry::Pose2d{x, y, yaw},
+                               geometry::Twist2d{}, valid, localized, 0, 0});
     sim.publish(intake::topics::kState,
                 intake::IntakeState{true, 0, false, 0, intake::Inhibit::DRIVE});
   }
@@ -137,8 +158,7 @@ class AutonomousTest : public ::testing::Test {
     sim.step(20ms);
   }
   void ReachPhase(autonomous::Phase phase) {
-    if (phase == autonomous::Phase::DRIVE ||
-        phase == autonomous::Phase::HOLD) {
+    if (phase == autonomous::Phase::DRIVE || phase == autonomous::Phase::HOLD) {
       StartDrive();
       if (phase == autonomous::Phase::HOLD) {
         for (int i = 0; i < 300; ++i) {
@@ -300,11 +320,12 @@ TEST_P(AutonomousPhaseTest, DriverStationOutageDoesNotExtendWallDeadline) {
   ExpectReleased();
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    RoutinePhases, AutonomousPhaseTest,
-    ::testing::Values(autonomous::Phase::SPINUP, autonomous::Phase::FEED,
-                      autonomous::Phase::DRIVE, autonomous::Phase::HOLD,
-                      autonomous::Phase::ABORTED));
+INSTANTIATE_TEST_SUITE_P(RoutinePhases, AutonomousPhaseTest,
+                         ::testing::Values(autonomous::Phase::SPINUP,
+                                           autonomous::Phase::FEED,
+                                           autonomous::Phase::DRIVE,
+                                           autonomous::Phase::HOLD,
+                                           autonomous::Phase::ABORTED));
 
 TEST_F(AutonomousTest, ShooterDropoutStopsFeedAndPreservesAccumulatedTime) {
   Mode(ds::kEnabled | ds::kAutonomous);
@@ -590,6 +611,219 @@ TEST_F(AutonomousTest, BeamStopsCollectionAndDriverStationLossReleases) {
   EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
   EXPECT_FALSE(Lane<shooter::ShooterTarget>("shooter").active);
   EXPECT_FALSE(Lane<intake::IntakeTarget>("intake").active);
+}
+
+TEST_F(AutonomousTest, SelectionEdgesAreSeededDisabledOnlyAndLatchedAtArm) {
+  Pov(90);  // Held on the first connected snapshot is not a press.
+  EXPECT_EQ(Routine(), 0);
+  Pov(90);
+  EXPECT_EQ(Routine(), 0);
+  Pov(-1);
+  Pov(90);
+  EXPECT_EQ(Routine(), 1);
+  Pov(-1);
+  Pov(270);
+  EXPECT_EQ(Routine(), 0);
+  Pov(-1);
+  Pov(270);
+  EXPECT_EQ(Routine(), 3);
+  Pov(-1, ds::kEnabled | ds::kTeleop);
+  Pov(90, ds::kEnabled | ds::kTeleop);
+  EXPECT_EQ(Routine(), 3);
+  Pov(-1, ds::kEnabled | ds::kAutonomous);
+  EXPECT_EQ(Routine(), 3);
+  EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
+  Pov(90, ds::kEnabled | ds::kAutonomous);
+  EXPECT_EQ(Routine(), 3);
+  EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
+  Pov(90);  // A press held across disable is not a new edge.
+  EXPECT_EQ(Routine(), 3);
+  Pov(-1);
+  Pov(90);
+  EXPECT_EQ(Routine(), 0);
+}
+
+// FMS holds the robot disabled in autonomous mode before the match starts,
+// which is exactly when the drive team picks the routine.
+TEST_F(AutonomousTest, SelectionWorksInFmsPreMatchAndIgnoresReconnectHeldPov) {
+  Pov(-1, ds::kAutonomous);
+  Pov(90, ds::kAutonomous);
+  EXPECT_EQ(Routine(), 1);
+  hw.stop_driver_station();
+  sim.step(160ms);
+  Pov(90, ds::kAutonomous);  // Held across a DS reconnect is not a press.
+  EXPECT_EQ(Routine(), 1);
+  Pov(-1, ds::kAutonomous);
+  Pov(90, ds::kAutonomous);
+  EXPECT_EQ(Routine(), 2);
+}
+
+class SelectedRoutineTest : public AutonomousTest,
+                            public ::testing::WithParamInterface<unsigned> {};
+
+TEST_P(SelectedRoutineTest, DisabledAndStaleDriverStationReleaseEveryRoutine) {
+  Select(GetParam());
+  ExpectReleased();
+  Mode(ds::kEnabled | ds::kAutonomous);
+  Shooter(true);
+  Pose();
+  sim.step(20ms);
+  EXPECT_EQ(Routine(), GetParam());
+  hw.stop_driver_station();
+  sim.step(160ms);
+  ExpectReleased();
+  Mode(0);
+  ExpectReleased();
+}
+
+TEST_P(SelectedRoutineTest, RestartOfEachRunningRoutineCannotRefire) {
+  Select(GetParam());
+  Mode(ds::kEnabled | ds::kAutonomous);
+  Shooter(true);
+  Pose();
+  sim.step(20ms);
+  talos::testing::Sim restarted{Runfile("TALOS_TEST_CONFIG")};
+  restarted.add<Autonomous>("autonomous");
+  talos::testing::SimHardware restarted_hw{restarted};
+  restarted_hw.set_driver_station(
+      talos::testing::DsPacket(ds::kEnabled | ds::kAutonomous));
+  for (int i = 0; i < 100; ++i) {
+    restarted.publish(shooter::topics::kState,
+                      shooter::ShooterState{0, 60, 60, true, true, true});
+    restarted.step(20ms);
+    ASSERT_EQ(restarted.latest<AutonomousState>(topics::kState)->phase(),
+              autonomous::Phase::INHIBITED);
+    EXPECT_FALSE(restarted
+                     .latest<talos::TargetEnvelope<drivetrain::ChassisTarget>>(
+                         "/drivetrain/target/auto")
+                     ->active);
+    EXPECT_FALSE(restarted
+                     .latest<talos::TargetEnvelope<shooter::ShooterTarget>>(
+                         "/shooter/target/auto")
+                     ->active);
+    EXPECT_FALSE(restarted
+                     .latest<talos::TargetEnvelope<intake::IntakeTarget>>(
+                         "/intake/target/auto")
+                     ->active);
+  }
+}
+
+TEST_P(SelectedRoutineTest, FeedbackInterlocksAndRoutineOutputs) {
+  Select(GetParam());
+  Mode(ds::kEnabled | ds::kAutonomous);
+  if (GetParam() == 1) {
+    EXPECT_EQ(Phase(), autonomous::Phase::HOLD);
+    for (int i = 0; i < 800; ++i) {
+      Shooter(true);
+      Pose();
+      sim.step(20ms);
+      ExpectReleased();
+    }
+  } else if (GetParam() == 3) {
+    EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
+    EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+    EXPECT_FALSE(Lane<shooter::ShooterTarget>("shooter").active);
+    EXPECT_FALSE(Lane<intake::IntakeTarget>("intake").active);
+    Pose();
+    sim.step(20ms);
+    Pose();
+    sim.step(20ms);
+    EXPECT_GT(Drive().vx_mps(), 0);
+    Pose(0, 0, 0, true, false);
+    sim.step(20ms);
+    EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+    Pose();
+    sim.step(20ms);
+    sim.step(120ms);
+    EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+    EXPECT_FALSE(Lane<shooter::ShooterTarget>("shooter").active);
+    EXPECT_FALSE(Lane<intake::IntakeTarget>("intake").active);
+  } else {
+    EXPECT_EQ(Phase(), autonomous::Phase::SPINUP);
+    EXPECT_EQ(Intake(), 0);
+    Shooter(true);
+    sim.step(20ms);
+    EXPECT_EQ(Intake(), -20);
+    sim.step(120ms);
+    EXPECT_EQ(Phase(), autonomous::Phase::SPINUP);
+    EXPECT_EQ(Intake(), 0);
+    Shooter(true);
+    sim.step(20ms);
+    ReadyFor(500ms);
+    EXPECT_EQ(Phase(), GetParam() == 2 ? autonomous::Phase::HOLD
+                                       : autonomous::Phase::DRIVE);
+    if (GetParam() == 2) {
+      ExpectReleased();
+      Shooter(true);
+      Pose();
+      sim.step(1s);
+      EXPECT_EQ(Phase(), autonomous::Phase::HOLD);
+      ExpectReleased();
+    }
+  }
+}
+INSTANTIATE_TEST_SUITE_P(Routines, SelectedRoutineTest,
+                         ::testing::Values(0U, 1U, 2U, 3U));
+
+TEST(AutonomousSelection, PersistsAcrossRestartAndCorruptionUsesDefault) {
+  const auto dir = std::filesystem::path{std::getenv("TEST_TMPDIR")} /
+                   "autonomous-selection-test";
+  std::filesystem::create_directories(dir);
+  std::filesystem::remove(dir / "autonomous-selection");
+  const auto run = [&](bool select, bool enabled) {
+    talos::testing::Sim sim{Runfile("TALOS_TEST_CONFIG")};
+    sim.set_session_dir(dir);
+    sim.add<Autonomous>("autonomous");
+    talos::testing::SimHardware hw{sim};
+    const auto packet = [&](int angle) {
+      auto data = talos::testing::DsPacket(
+          enabled ? ds::kEnabled | ds::kAutonomous : 0);
+      data.joysticks[0].connected = true;
+      data.joysticks[0].pov_count = 1;
+      data.joysticks[0].povs[0] = angle;
+      hw.set_driver_station(data);
+      sim.step(20ms);
+    };
+    packet(-1);
+    if (select) packet(270);  // preload -> taxi, persisted as index 3.
+    const auto state = sim.latest<AutonomousState>(topics::kState);
+    EXPECT_EQ(state->routine_index(), select || enabled ? 3 : 0);
+    if (enabled) {
+      EXPECT_EQ(state->phase(), autonomous::Phase::INHIBITED);
+      EXPECT_FALSE(sim.latest<talos::TargetEnvelope<shooter::ShooterTarget>>(
+                          "/shooter/target/auto")
+                       ->active);
+    }
+  };
+  run(true, false);
+  run(false, true);
+  {
+    std::ofstream corrupt{dir / "autonomous-selection", std::ios::trunc};
+    corrupt << "corrupt";
+  }
+  run(false, false);
+}
+
+TEST(AutonomousParameters, RejectsInvalidRoutineAndSelectionConfiguration) {
+  for (const char* setting :
+       {"routines = []", "routines = ['missing']",
+        "routines = ['none', 'none']", "default_routine = 'missing'",
+        "selection_port_index = 6", "selection_pov_index = -1",
+        "selection_next_direction_index = 8",
+        "selection_previous_direction_index = 2",
+        "routine.taxi.target_x_m = nan",
+        "routine.shoot_only.spinup_timeout_s = 0.0"}) {
+    SCOPED_TRACE(setting);
+    auto sim = talos::testing::Sim::FromToml(std::string{R"(
+[robot]
+period_us = 20000
+command_timeout_us = 100000
+[subsystems.mechanism.motors.unused]
+can_id = 1
+[subsystems.autonomous]
+)"} + setting);
+    EXPECT_THROW(sim.add<Autonomous>("autonomous"), std::invalid_argument);
+  }
 }
 
 TEST(AutonomousParameters, RejectsNonpositiveAndNonfinitePhaseDurations) {

@@ -210,7 +210,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | `/hw/request/<node>`: device owner → bridge | 1448 | 1436 B Packet; only that owner's actuator requests, not a full-capacity command |
 | `/hw/status`: bridge → telemetry/observers | 168 | 160 B fixed `bridge.BridgeStatus`, alignment 8 |
 | `/<sub>/target/<source>`: producer → target resolver | `align_up(16 + sizeof(message), 8) + 8` | TargetEnvelope payload: mode-generation/active header 16 + FlatBuffers struct; chassis/shooter/intake payload 40/24/20 B, slots 48/32/32 B |
-| `/autonomous/state`: autonomous → telemetry | 16 | 1 B AutonomousState: phase enum (ubyte) |
+| `/autonomous/state`: autonomous → telemetry | 16 | 2 B AutonomousState: phase enum and selected/latched routine_index (ubyte); routine adds one 8 B telemetry scalar |
 | `/drivetrain/state`: drivetrain → estimator/driver/telemetry | 120 | 112 B DrivetrainState: padded time/flags header 16 + chassis/yaw 32 + four module positions 64 |
 | `/intake/state`: intake → telemetry | 32 | 20 B IntakeState, including FlatBuffers padding |
 | `/shooter/state`: shooter → telemetry | 40 | 32 B ShooterState, including FlatBuffers padding |

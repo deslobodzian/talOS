@@ -6,8 +6,10 @@
 #include <numbers>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "autonomous/autonomous_message_generated.h"
+#include "autonomous/selection.h"
 #include "autonomous/topics.h"
 #include "autonomous/trajectory.h"
 #include "drivetrain/drive_message_generated.h"
@@ -22,7 +24,7 @@
 namespace autonomous {
 
 // Shared-memory slot contract for /autonomous/state: docs/DATA_FLOW.md.
-static_assert(sizeof(AutonomousState) == 1,
+static_assert(sizeof(AutonomousState) == 2,
               "AutonomousState size changed; update docs/DATA_FLOW.md");
 
 class Autonomous {
@@ -47,6 +49,15 @@ class Autonomous {
             node.param<int>("feed_duration_us", 500000)}},
         spinup_timeout_s_{PositiveSeconds(node, "spinup_timeout_s", 2.0)},
         drive_timeout_s_{PositiveSeconds(node, "drive_timeout_s", 10.0)},
+        routines_{LoadRoutines(node)},
+        selection_{node.session_dir(), RoutineSignature(routines_),
+                   static_cast<unsigned>(routines_.size()),
+                   DefaultRoutine(node, routines_)},
+        selection_port_{node.param("selection_port_index", 0)},
+        selection_pov_{node.param("selection_pov_index", 0)},
+        selection_next_{node.param("selection_next_direction_index", 2)},
+        selection_previous_{
+            node.param("selection_previous_direction_index", 6)},
         pose_{node.subscribe<geometry::PoseEstimate>("/pose_estimator/state")},
         shooter_state_{
             node.subscribe<shooter::ShooterState>(shooter::topics::kState)},
@@ -62,6 +73,13 @@ class Autonomous {
       throw std::invalid_argument(
           "autonomous: feed_duration_us must be positive");
     }
+    if (selection_port_ < 0 || selection_port_ > 5 || selection_pov_ < 0 ||
+        selection_pov_ > 3 || !PovAngle(selection_next_) ||
+        !PovAngle(selection_previous_) ||
+        selection_next_ == selection_previous_) {
+      throw std::invalid_argument("autonomous: invalid selection input");
+    }
+    ValidateFinite();
   }
 
   void update() {
@@ -72,50 +90,60 @@ class Autonomous {
     // but never keep commanding lanes or advance feed/trajectory time.
     if (!ds_.connected()) {
       trajectory_pose_available_ = false;
+      selection_seeded_ = false;
       CheckDeadline(now);
       ReleaseTargets();
-      state_.send(AutonomousState{WirePhase()});
+      PublishState();
       return;
     }
+    SelectRoutine();
     if (!ds_.enabled() || !ds_.autonomous()) {
       ResetRoutine();
       ReleaseTargets();
-      state_.send(AutonomousState{WirePhase()});
+      PublishState();
       return;
     }
     // A new process must observe disabled/non-auto before it can arm. Merely
     // receiving an already-running auto generation must never fire a piece.
     if (phase_.is(Phase::kInhibited)) {
       ReleaseTargets();
-      state_.send(AutonomousState{WirePhase()});
+      PublishState();
       return;
     }
     if (generation_ != ds_.data().mode_since_us) ResetRoutine();
     if (phase_.is(Phase::kIdle)) {
       generation_ = ds_.data().mode_since_us;
       red_ = ds_.alliance() == talos::driver_station::Alliance::kRed;
+      latched_ = selection_.get();
+      ApplyRoutine();
+      action_ = 0;
       spinup_started_ = now;
-      phase_.go(Phase::kSpinup);
+      phase_.go(CurrentAction().phase);
     }
     CheckDeadline(now);
     if (phase_.is(Phase::kAborted) || phase_.is(Phase::kHold)) {
       ReleaseTargets();
-      state_.send(AutonomousState{WirePhase()});
+      PublishState();
       return;
     }
-    released_ = false;
     const bool shooter_ready =
         shooter_state_.fresh() && shooter_state_->at_speed() &&
         std::abs(shooter_state_->target_velocity_rps() - shooter_velocity_) <=
             1e-6;
-    if (phase_.is(Phase::kFeed) && !shooter_ready) {
-      phase_.go(Phase::kSpinup);
+    // Prerequisites and completions belong to action descriptors, not to the
+    // routine name. FEED retries SPINUP without resetting the preload budget.
+    if (CurrentAction().prerequisite == Prerequisite::kShooterReady &&
+        !PrerequisiteMet(CurrentAction(), shooter_ready)) {
+      --action_;
+      phase_.go(CurrentAction().phase);
     }
-    if (phase_.is(Phase::kSpinup) && shooter_ready) {
-      phase_.go(Phase::kFeed);
+    if (CurrentAction().completion == Completion::kShooterReady &&
+        shooter_ready) {
+      Advance();
     }
-    if (phase_.is(Phase::kFeed) && feed_elapsed_ >= feed_duration_) {
-      phase_.go(Phase::kDrive);
+    if (CurrentAction().completion == Completion::kFeedDuration &&
+        feed_elapsed_ >= feed_duration_) {
+      Advance();
     }
     drivetrain::ChassisTarget drive{};
     double intake = 0;
@@ -125,9 +153,9 @@ class Autonomous {
       feeding_ = true;
       feed_last_update_ = now;
     }
-    if (phase_.is(Phase::kDrive)) {
+    if (CurrentAction().completion == Completion::kWaypoint) {
       shooter = 0;
-      if (pose_.fresh() && pose_->valid() && pose_->localized()) {
+      if (PrerequisiteMet(CurrentAction(), shooter_ready)) {
         const auto& p = pose_->pose();
         if (!trajectory_started_) {
           auto target = TrajectorySample{0, target_x_, target_y_, target_yaw_};
@@ -158,12 +186,13 @@ class Autonomous {
         if (elapsed >= trajectory_.total_time_s() &&
             std::hypot(dx, dy) <= position_tolerance_ &&
             std::abs(da) <= yaw_tolerance_) {
-          phase_.go(Phase::kHold);
+          Advance();
         } else {
           drive =
               HolonomicController{kp_xy_, kp_yaw_, max_linear_, max_angular_}
                   .Calculate(desired, p);
-          if (intake_state_.fresh() && !intake_state_->beam_broken()) {
+          if (routines_[latched_].collect && intake_state_.fresh() &&
+              !intake_state_->beam_broken()) {
             intake = intake_velocity_;
           }
         }
@@ -173,7 +202,7 @@ class Autonomous {
     }
     if (phase_.is(Phase::kHold)) {
       ReleaseTargets();
-      state_.send(AutonomousState{WirePhase()});
+      PublishState();
       return;
     }
     if (phase_.is(Phase::kDrive) && !trajectory_pose_available_) {
@@ -181,13 +210,43 @@ class Autonomous {
     } else {
       drive_.send(drive);
     }
-    shooter_.send(shooter::ShooterTarget{shooter});
-    intake_.send(intake::IntakeTarget{static_cast<float>(intake)});
-    state_.send(AutonomousState{WirePhase()});
+    if (phase_.is(Phase::kDrive) && !routines_[latched_].collect) {
+      shooter_.release();
+      intake_.release();
+    } else {
+      shooter_.send(shooter::ShooterTarget{shooter});
+      intake_.send(intake::IntakeTarget{static_cast<float>(intake)});
+    }
+    PublishState();
   }
 
  private:
-  enum class Phase { kIdle, kSpinup, kFeed, kDrive, kHold, kAborted, kInhibited };
+  enum class Phase {
+    kIdle,
+    kSpinup,
+    kFeed,
+    kDrive,
+    kHold,
+    kAborted,
+    kInhibited
+  };
+  enum class Prerequisite { kNone, kShooterReady, kLocalizedPose };
+  enum class Completion { kShooterReady, kFeedDuration, kWaypoint, kNever };
+  enum class Timeout { kPreload, kDrive, kNone };
+  enum class Cancel { kReleaseAll };
+  struct Action {
+    Phase phase;
+    Prerequisite prerequisite;
+    Completion completion;
+    Timeout timeout;
+    Cancel cancel = Cancel::kReleaseAll;
+  };
+  struct Routine {
+    std::string name;
+    std::vector<Action> actions;
+    bool collect;
+    double shooter, intake, feed, x, y, yaw, feed_us, spinup_s, drive_s;
+  };
   talos::Node& node_;
   double shooter_velocity_, intake_velocity_, feed_velocity_;
   double target_x_, target_y_, target_yaw_;
@@ -200,6 +259,13 @@ class Autonomous {
   bool trajectory_started_ = false;
   talos::Duration feed_duration_;
   double spinup_timeout_s_, drive_timeout_s_;
+  std::vector<Routine> routines_;
+  Selection selection_;
+  int selection_port_, selection_pov_, selection_next_, selection_previous_;
+  bool selection_seeded_ = false, next_was_pressed_ = false;
+  bool previous_was_pressed_ = false;
+  std::uint8_t latched_ = 0;
+  std::size_t action_ = 0;
   std::uint64_t generation_ = 0;
   talos::Time spinup_started_{};
   talos::Duration feed_elapsed_{};
@@ -214,7 +280,6 @@ class Autonomous {
   talos::DriverStation ds_;
   talos::StateMachine<Phase> phase_;
   talos::Publisher<AutonomousState> state_;
-  bool released_ = false;
   bool red_ = false;
 
   static double PositiveSeconds(talos::Node& node, const char* key,
@@ -241,9 +306,11 @@ class Autonomous {
     // feed and readiness retries. Flapping readiness or a DS outage cannot
     // postpone the deadline. Drive likewise includes every outage.
     if (((phase_.is(Phase::kSpinup) || phase_.is(Phase::kFeed)) &&
+         CurrentAction().timeout == Timeout::kPreload &&
          now - spinup_started_ >=
              std::chrono::duration<double>{spinup_timeout_s_}) ||
         (phase_.is(Phase::kDrive) &&
+         CurrentAction().timeout == Timeout::kDrive &&
          phase_.time_in_state() >=
              std::chrono::duration<double>{drive_timeout_s_})) {
       phase_.go(Phase::kAborted);
@@ -251,11 +318,152 @@ class Autonomous {
   }
 
   void ReleaseTargets() {
-    if (released_) return;
-    drive_.release();
-    shooter_.release();
-    intake_.release();
-    released_ = true;
+    // Every action's explicit cancellation policy is fail-closed. Repeat
+    // releases even in HOLD/none so the lane is observably released all period.
+    switch (CurrentAction().cancel) {
+      case Cancel::kReleaseAll:
+        drive_.release();
+        shooter_.release();
+        intake_.release();
+        break;
+    }
+  }
+
+  static bool PovAngle(int value) { return value >= 0 && value < 8; }
+  static std::vector<Routine> LoadRoutines(talos::Node& node) {
+    const auto names = node.param<std::vector<std::string>>(
+        "routines", {"preload", "none", "shoot_only", "taxi"});
+    if (names.empty() || names.size() > 256)
+      throw std::invalid_argument(
+          "autonomous: routines must contain 1..256 names");
+    std::vector<Routine> result;
+    for (const auto& name : names) {
+      if (name != "preload" && name != "none" && name != "shoot_only" &&
+          name != "taxi")
+        throw std::invalid_argument("autonomous: unknown routine " + name);
+      if (std::any_of(result.begin(), result.end(),
+                      [&](const Routine& r) { return r.name == name; }))
+        throw std::invalid_argument("autonomous: duplicate routine " + name);
+      Routine r{};
+      r.name = name;
+      r.collect = name == "preload";
+      if (name == "preload" || name == "shoot_only") {
+        r.actions.push_back({Phase::kSpinup, Prerequisite::kNone,
+                             Completion::kShooterReady, Timeout::kPreload});
+        r.actions.push_back({Phase::kFeed, Prerequisite::kShooterReady,
+                             Completion::kFeedDuration, Timeout::kPreload});
+      }
+      if (name == "preload" || name == "taxi")
+        r.actions.push_back({Phase::kDrive, Prerequisite::kLocalizedPose,
+                             Completion::kWaypoint, Timeout::kDrive});
+      r.actions.push_back({Phase::kHold, Prerequisite::kNone,
+                           Completion::kNever, Timeout::kNone});
+      const auto param = [&](const char* key, double fallback) {
+        const double value = node.param("routine." + name + "." + key,
+                                        node.param(key, fallback));
+        if (!std::isfinite(value))
+          throw std::invalid_argument(
+              "autonomous: nonfinite routine parameter");
+        return value;
+      };
+      r.shooter = param("shooter_velocity_rps", 60);
+      r.intake = param("intake_velocity_rps", 30);
+      r.feed = param("feed_velocity_rps", -20);
+      r.x = param("target_x_m", 2);
+      r.y = param("target_y_m", 0);
+      r.yaw = param("target_yaw_rad", 0);
+      // feed_duration_us is an integer in the existing public configuration.
+      r.feed_us = node.param<int>("routine." + name + ".feed_duration_us",
+                                  node.param<int>("feed_duration_us", 500000));
+      r.spinup_s = param("spinup_timeout_s", 2);
+      r.drive_s = param("drive_timeout_s", 10);
+      if (r.feed_us <= 0 || r.spinup_s <= 0 || r.drive_s <= 0)
+        throw std::invalid_argument("autonomous: invalid routine duration");
+      result.push_back(std::move(r));
+    }
+    return result;
+  }
+  static std::uint8_t DefaultRoutine(talos::Node& node,
+                                     const std::vector<Routine>& routines) {
+    const auto name = node.param<std::string>("default_routine", "preload");
+    for (std::size_t i = 0; i < routines.size(); ++i)
+      if (routines[i].name == name) return static_cast<std::uint8_t>(i);
+    throw std::invalid_argument("autonomous: default routine not in routines");
+  }
+  static std::uint64_t RoutineSignature(const std::vector<Routine>& routines) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const auto& r : routines) {
+      for (unsigned char c : r.name) hash = (hash ^ c) * 1099511628211ULL;
+      hash = (hash ^ 0xff) * 1099511628211ULL;
+    }
+    return hash;
+  }
+  void ValidateFinite() const {
+    for (double value :
+         {position_tolerance_, yaw_tolerance_, max_linear_, max_angular_,
+          field_length_, field_width_, kp_xy_, kp_yaw_}) {
+      if (!std::isfinite(value) || value <= 0)
+        throw std::invalid_argument("autonomous: invalid controller parameter");
+    }
+  }
+  void ApplyRoutine() {
+    const auto& r = routines_[latched_];
+    shooter_velocity_ = r.shooter;
+    intake_velocity_ = r.intake;
+    feed_velocity_ = r.feed;
+    target_x_ = r.x;
+    target_y_ = r.y;
+    target_yaw_ = r.yaw;
+    feed_duration_ = std::chrono::microseconds{static_cast<int>(r.feed_us)};
+    spinup_timeout_s_ = r.spinup_s;
+    drive_timeout_s_ = r.drive_s;
+  }
+  bool PrerequisiteMet(const Action& action, bool shooter_ready) const {
+    switch (action.prerequisite) {
+      case Prerequisite::kNone:
+        return true;
+      case Prerequisite::kShooterReady:
+        return shooter_ready;
+      case Prerequisite::kLocalizedPose:
+        return pose_.fresh() && pose_->valid() && pose_->localized();
+    }
+    return false;
+  }
+  const Action& CurrentAction() const {
+    return routines_[latched_].actions[action_];
+  }
+  void Advance() {
+    ++action_;
+    phase_.go(CurrentAction().phase);
+  }
+  void SelectRoutine() {
+    const auto stick = ds_.joystick(selection_port_);
+    if (!stick.connected()) {
+      selection_seeded_ = false;
+      return;
+    }
+    const bool next = stick.pov(selection_pov_) == selection_next_ * 45;
+    const bool previous = stick.pov(selection_pov_) == selection_previous_ * 45;
+    // Any disabled mode: FMS holds the robot disabled-autonomous pre-match.
+    if (selection_seeded_ && !ds_.enabled()) {
+      int step =
+          (next && !next_was_pressed_) - (previous && !previous_was_pressed_);
+      if (step != 0) {
+        const int count = static_cast<int>(routines_.size());
+        selection_.set(static_cast<std::uint8_t>(
+            (selection_.get() + step + count) % count));
+      }
+    }
+    next_was_pressed_ = next;
+    previous_was_pressed_ = previous;
+    selection_seeded_ = true;
+  }
+  void PublishState() {
+    const bool running =
+        ds_.enabled() && ds_.autonomous() && !phase_.is(Phase::kInhibited);
+    state_.send(AutonomousState{WirePhase(), running || generation_ != 0
+                                                 ? latched_
+                                                 : selection_.get()});
   }
 
   autonomous::Phase WirePhase() const {

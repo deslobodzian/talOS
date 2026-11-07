@@ -17,6 +17,7 @@ cc_library(
     name = "autonomous",
     hdrs = [
         "autonomous.h",
+        "selection.h",
         "trajectory.h",
     ],
     include_prefix = "autonomous",

@@ -365,14 +365,19 @@ TEST(ConfigTest, TargetPolicyIsTheDefaultForEveryActuatedSubsystem) {
   EXPECT_EQ(
       config.toml_data.at_path("subsystems.autonomous.period_us").value_or(0),
       20000);
-  EXPECT_DOUBLE_EQ(config.toml_data.at_path("subsystems.autonomous.target_x_m")
-                       .value_or(-1.0),
-                   6.0);
-  EXPECT_DOUBLE_EQ(config.toml_data.at_path("subsystems.autonomous.target_y_m")
-                       .value_or(-1.0),
-                   4.0);
   EXPECT_DOUBLE_EQ(
-      config.toml_data.at_path("subsystems.autonomous.target_yaw_rad")
+      config.toml_data
+          .at_path("subsystems.autonomous.routine.preload.target_x_m")
+          .value_or(-1.0),
+      6.0);
+  EXPECT_DOUBLE_EQ(
+      config.toml_data
+          .at_path("subsystems.autonomous.routine.preload.target_y_m")
+          .value_or(-1.0),
+      4.0);
+  EXPECT_DOUBLE_EQ(
+      config.toml_data
+          .at_path("subsystems.autonomous.routine.preload.target_yaw_rad")
           .value_or(-1.0),
       0.0);
   for (const char* name : {"drivetrain", "shooter", "intake"}) {

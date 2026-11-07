@@ -31,16 +31,33 @@ motion, never estimator output. Without `--sim`, cameras capture real images
 on a bounded worker thread; unavailable devices report unhealthy status rather
 than synthetic observations. Describing the graph never opens cameras.
 
-Autonomous waits for fresh shooter `at_speed`, then feeds for 500 ms at
+Select autonomous on joystick 0 **POV right/left** while DS-connected and
+disabled in any mode, including FMS pre-match disabled-autonomous (unused by
+driver/teleop bindings). Release between
+presses; a held POV at startup/reconnect is not a press. The configured order is
+`preload`, `none`, `shoot_only`, `taxi` (default `preload`). Selection survives a
+node restart within the launcher session; a new session or corrupt selection
+file uses the default. Studio is read-only: `autonomous/state/routine_index`
+reports the selected index while disabled and the latched index during auto.
+Enabled inputs never change it. Tune the list, default, POV binding and
+`routine.<name>` action parameters in `subsystems/autonomous.toml`.
+
+`none` releases all lanes throughout; `taxi` only drives to its waypoint;
+`shoot_only` shoots the preload then holds. `preload` preserves the full sequence:
+it waits for fresh shooter `at_speed`, then feeds for 500 ms at
 -20 rps: negative roller demand is allowed through the intake beam interlock,
 whereas positive collection stops when a piece breaks the beam. It then stops
 the shooter and drives toward the configured waypoint with bounded field-frame
 position/heading feedback rotated into robot coordinates. The waypoint is in
 blue-origin coordinates; Red rotates both translation and heading by pi about
-that origin (configure the estimator's starting pose consistently). Invalid or
-stale pose stops drive and intake immediately; stale intake feedback inhibits
-collection. Reaching the waypoint holds all outputs at zero until mode exit.
-Disable, teleop, or DS loss releases all three lanes once.
+the field centre (configure the estimator's starting pose consistently). Invalid,
+unlocalized or stale pose stops drive and collection immediately; stale intake
+feedback inhibits collection. Reaching the waypoint releases all lanes until mode
+exit. Feed counts only commanded feeding time and continuously requires matching
+fresh shooter readiness. Spinup/feed share a wall-clock deadline; drive has its
+own, neither extended by outages. Disable, teleop or DS loss releases all lanes.
+A DS outage resumes the same generation without re-firing; a restarted node
+starts INHIBITED and must observe non-auto/disabled before a new auto can arm.
 
 Teleop joystick 0: hold button **1** for the 60 rps flywheel, **2** to collect
 at +30 rps (stops at the intake beam), and **3** to feed at -20 rps past the
