@@ -50,10 +50,12 @@ Thunk make_thunk(Class* instance) {
       }};
 }
 
-// Binds a captureless lambda or free function.
+// Binds a callable, with the same timer/message signatures as member handlers.
 template <typename Callable>
 Thunk make_thunk(Callable* callable)
-  requires requires(Callable& c, const Context& ctx) { c(ctx); }
+  requires(requires(Callable& c, const Context& ctx) { c(ctx); } ||
+           requires(Callable& c, const Context& ctx,
+                    std::span<const std::byte> payload) { c(ctx, payload); })
 {
   return Thunk{callable,
                [](void* object, const Context& context,

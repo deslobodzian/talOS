@@ -27,17 +27,23 @@ class SimulatedChannel {
   std::uint32_t message_bytes() const { return message_bytes_; }
   std::uint64_t next_sequence() const { return count_; }
 
-  std::uint64_t publish(std::span<const std::byte> bytes) {
+  std::uint64_t publish(std::span<const std::byte> bytes,
+                        MonotonicTime publish_time) {
     const std::size_t offset = data_.size();
     data_.resize(offset + message_bytes_, std::byte{0});
     std::memcpy(data_.data() + offset, bytes.data(),
                 std::min<std::size_t>(bytes.size(), message_bytes_));
+    publish_times_.push_back(publish_time);
     return count_++;
   }
 
   void copy_to(std::uint64_t sequence, std::span<std::byte> destination) const {
     std::memcpy(destination.data(), data_.data() + sequence * message_bytes_,
                 message_bytes_);
+  }
+
+  MonotonicTime publish_time(std::uint64_t sequence) const {
+    return publish_times_.at(sequence);
   }
 
   // The schema of the first endpoint registered on this topic, which every
@@ -51,6 +57,7 @@ class SimulatedChannel {
   std::uint32_t message_bytes_;
   std::uint64_t count_{0};
   std::vector<std::byte> data_;
+  std::vector<MonotonicTime> publish_times_;
   schema::Identity schema_;
 };
 
@@ -171,7 +178,8 @@ class SimulatedEventLoop
     return environment_
         ->channel(topic, static_cast<std::uint32_t>(sizeof(Message)))
         .publish(std::span<const std::byte>{
-            reinterpret_cast<const std::byte*>(&message), sizeof(Message)});
+            reinterpret_cast<const std::byte*>(&message), sizeof(Message)},
+                 now_);
   }
 
   void run_for(Duration duration) { run_until(now_ + duration); }
@@ -259,7 +267,9 @@ class SimulatedEventLoop
 
   SendOutcome send_impl(std::uint16_t id, std::span<const std::byte> bytes) {
     Cursor& cursor = cursors_[id];
-    return SendOutcome{SendStatus::OK, cursor.channel->publish(bytes)};
+    return SendOutcome{
+        SendStatus::OK,
+        cursor.channel->publish(bytes, this->monotonic_now())};
   }
 
   // Virtual time always lands exactly on the deadline, so a message's
@@ -280,16 +290,21 @@ class SimulatedEventLoop
            drained < options_.max_messages_per_tick &&
            cursor.sequence < cursor.channel->next_sequence();
            ++drained) {
-        const std::uint64_t sequence = cursor.sequence;
+        const std::uint64_t sequence =
+            sources[id].latest_only ? cursor.channel->next_sequence() - 1
+                                    : cursor.sequence;
+        const std::uint64_t dropped = sequence - cursor.sequence;
         cursor.channel->copy_to(sequence, sources[id].buffer);
         cursor.sequence = sequence + 1;
 
         this->dispatch_message(static_cast<std::uint16_t>(id), tick_deadline,
-                               now_, sequence, 0, sources[id].buffer);
+                               now_, sequence, dropped, sources[id].buffer,
+                               cursor.channel->publish_time(sequence));
 
         if (!this->running()) {
           return;
         }
+        if (sources[id].latest_only) break;
       }
     }
   }

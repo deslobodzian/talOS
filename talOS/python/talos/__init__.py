@@ -173,7 +173,11 @@ class Node:
 
 
 class Subscription:
-    """Latest value on a topic, kept by the framework."""
+    """Latest value on a topic, aged from publication, not delivery.
+
+    Without a callback each drain skips to the newest message. With a callback
+    the framework delivers in sequence, up to 64 messages per topic per drain.
+    """
 
     def __init__(self, node, mtype, index):
         self._node, self._type, self._index = node._handle, mtype, index
@@ -200,7 +204,7 @@ class Subscription:
             self._node, self._index, max_age_ns)))
 
     @property
-    def age(self):  # seconds since it arrived; inf before the first
+    def age(self):  # seconds since publication; inf before the first
         if not self.has_value:
             return math.inf
         return lib.talos_subscription_age_ns(self._node, self._index) / _NS

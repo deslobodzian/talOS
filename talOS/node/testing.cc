@@ -258,7 +258,8 @@ void SimAccess::publish_raw(Sim& sim, std::string_view topic, const void* data,
                             std::size_t bytes) {
   sim.impl_->environment.channel(topic, static_cast<std::uint32_t>(bytes))
       .publish(std::span<const std::byte>{static_cast<const std::byte*>(data),
-                                          bytes});
+                                          bytes},
+               sim.now());
 }
 
 std::uint64_t SimAccess::message_count(const Sim& sim, std::string_view topic,
@@ -278,6 +279,13 @@ void SimAccess::read_raw(const Sim& sim, std::string_view topic,
   }
   channel.copy_to(sequence,
                   std::span<std::byte>{static_cast<std::byte*>(out), bytes});
+}
+
+Time SimAccess::publish_time(const Sim& sim, std::string_view topic,
+                             std::size_t bytes, std::uint64_t sequence) {
+  return sim.impl_->environment
+      .channel(topic, static_cast<std::uint32_t>(bytes))
+      .publish_time(sequence);
 }
 
 }  // namespace talos::detail

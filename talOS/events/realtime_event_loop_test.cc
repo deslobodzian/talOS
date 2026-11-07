@@ -76,6 +76,64 @@ TEST(RealtimeEventLoop, PeriodicTimerRunsAtRate) {
   EXPECT_LE(total_cycles, 220u);
 }
 
+TEST(RealtimeEventLoop, ResamplesClockAfterEachDueTimerCallback) {
+  RealtimeEventLoop<> loop;
+  loop.set_delivery(Delivery::BEFORE_TIMERS);
+  MonotonicTime first_finished{};
+  MonotonicTime second_observed{};
+  auto first = [&](const Context&) {
+    std::this_thread::sleep_for(10ms);
+    first_finished = Poller::now();
+  };
+  auto second = [&](const Context& context) {
+    second_observed = context.now;
+    loop.exit();
+  };
+  const auto first_id = loop.register_timer("first", make_thunk(&first));
+  const auto second_id = loop.register_timer("second", make_thunk(&second));
+  const auto deadline = loop.monotonic_now();
+  loop.arm_timer(first_id, deadline, {});
+  loop.arm_timer(second_id, deadline, {});
+  loop.run_for(100ms);
+  EXPECT_GT(first_finished, deadline);
+  EXPECT_GE(second_observed, first_finished);
+}
+
+TEST(RealtimeEventLoop, LatestBacklogDispatchesNewestWithPublicationAge) {
+  const std::string topic = "/latest_" + std::to_string(::getpid());
+  RealtimeEventLoop<> loop;
+  loop.set_delivery(Delivery::BEFORE_TIMERS);
+  std::vector<Context> observed;
+  auto on_message = [&](const Context& context) { observed.push_back(context); };
+  const auto watcher = loop.register_watcher(
+      topic, sizeof(EventsTest::SensorMessage),
+      alignof(EventsTest::SensorMessage),
+      talos::schema::Of<EventsTest::SensorMessage>(), make_thunk(&on_message),
+      true);
+  RTMSQueue publisher{topic, sizeof(EventsTest::SensorMessage),
+                      alignof(EventsTest::SensorMessage),
+                      talos::schema::Of<EventsTest::SensorMessage>()};
+  const auto published = Poller::now() - 100ms;
+  for (int i = 0; i < 130; ++i) {
+    const EventsTest::SensorMessage message{i, 0.0F, 0.0F};
+    ASSERT_EQ(publisher.write(
+                  std::span<const std::byte>{
+                      reinterpret_cast<const std::byte*>(&message),
+                      sizeof(message)},
+                  published.nanos()),
+              WriteResult::SUCCESS);
+  }
+  auto stop = [&](const Context&) { loop.exit(); };
+  const auto timer = loop.register_timer("stop", make_thunk(&stop));
+  loop.arm_timer(timer, loop.monotonic_now(), {});
+  loop.run_for(100ms);
+  ASSERT_EQ(observed.size(), 1u);
+  EXPECT_EQ(observed.front().sequence, 129u);
+  EXPECT_EQ(observed.front().publish_time, published);
+  EXPECT_GE(observed.front().now - observed.front().publish_time, 100ms);
+  EXPECT_EQ(loop.source_counters()[watcher].dropped.load(), 129u);
+}
+
 TEST(RealtimeEventLoop, ExitFromAnotherThreadReturnsPromptly) {
   RealtimeEventLoop<> loop;
 

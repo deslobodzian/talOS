@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <array>
@@ -94,6 +95,30 @@ TEST(LayoutValidation, RejectsCorruptOffsetAndStride) {
   header->slot_stride += 8;
   EXPECT_THROW((RTMSQueue{path, 8, 8, kSchema, 2}), std::runtime_error);
   header->slot_stride = stride;
+}
+
+TEST(LayoutValidation, SlotsIncludeAlignedPublicationTime) {
+  struct Layout {
+    std::size_t message_size;
+    std::size_t alignment;
+    std::size_t time_offset;
+    std::size_t stride;
+  };
+  for (const Layout layout :
+       {Layout{1, 1, 8, 16}, Layout{8, 4, 8, 16}, Layout{16, 8, 16, 24},
+        Layout{16, 16, 16, 32}}) {
+    const auto path =
+        make_test_path("stamp_layout_" + std::to_string(layout.message_size) +
+                       "_" + std::to_string(layout.alignment));
+    RTMSQueue queue{path, layout.message_size, layout.alignment, kSchema, 2};
+    SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+    const auto* header = static_cast<const RTMSHeader*>(mapping.ptr());
+    EXPECT_EQ(header->version, 5u);
+    EXPECT_EQ(header->slot_stride, layout.stride);
+    EXPECT_EQ(header->data_offset % rtms_slot_alignment(layout.alignment), 0u);
+    EXPECT_EQ(rtms_publish_time_offset(layout.message_size), layout.time_offset);
+    EXPECT_EQ(header->total_bytes, header->data_offset + 2 * layout.stride);
+  }
 }
 
 TEST(ReaderOwnership, ReleaseRejectsInvalidFreeAndForeignReaders) {
@@ -361,6 +386,73 @@ TEST(SingleProcess, WriteSequenceIncrementsMonotonically) {
   EXPECT_EQ(queue.writer_sequence(), static_cast<std::uint64_t>(writes));
 }
 
+TEST(PublishTime, ExplicitTimestampsSurviveSequenceAndLatestReads) {
+  for (const ReadMode mode : {ReadMode::SEQUENCE, ReadMode::LATEST}) {
+    auto options = sequence_options();
+    options.read_mode = mode;
+    const auto path = make_test_path(mode == ReadMode::SEQUENCE ? "stamp_seq"
+                                                               : "stamp_latest");
+    RTMSQueue queue{path, sizeof(Message::TestMessage),
+                    alignof(Message::TestMessage), kSchema, 4, options};
+    const auto reader = queue.register_reader();
+    ASSERT_TRUE(reader.has_value());
+    // Non-monotonic, negative, and zero values must be preserved verbatim.
+    constexpr std::array<std::int64_t, 4> times{
+        0, 9'876'543'210'123, -5'000'000'000, 42};
+    for (int batch = 0; batch < 3; ++batch) {
+      for (int i = 0; i < 4; ++i) {
+        const Message::TestMessage message{
+            batch * 4 + i, static_cast<float>(i)};
+        ASSERT_EQ(queue.write(BytesOf(message), times[i]),
+                  WriteResult::SUCCESS);
+      }
+      const int first = mode == ReadMode::LATEST ? 3 : 0;
+      for (int i = first; i < 4; ++i) {
+        Message::TestMessage received{};
+        MessageInfo info{};
+        ASSERT_EQ(queue.read_next(
+                      *reader, std::as_writable_bytes(std::span{&received, 1}),
+                      info),
+                  ReadResult::OK);
+        EXPECT_EQ(received.id(), batch * 4 + i);
+        EXPECT_EQ(received.value(), static_cast<float>(i));
+        EXPECT_EQ(info.sequence, static_cast<std::uint64_t>(batch * 4 + i));
+        EXPECT_EQ(info.dropped, mode == ReadMode::LATEST ? 3u : 0u);
+        EXPECT_EQ(info.publish_time_ns, times[i]);
+      }
+    }
+    queue.release_reader(*reader);
+  }
+}
+
+TEST(PublishTime, ConvenienceWriteSamplesHostMonotonicClock) {
+  RTMSQueue queue{make_test_path("stamp_host"), sizeof(Message::TestMessage),
+                  alignof(Message::TestMessage), kSchema, 2};
+  const auto reader = queue.register_reader();
+  ASSERT_TRUE(reader.has_value());
+  const auto now_ns = [] {
+    struct timespec now {};
+#if defined(__APPLE__)
+    ::clock_gettime(CLOCK_MONOTONIC_RAW, &now);
+#else
+    ::clock_gettime(CLOCK_MONOTONIC, &now);
+#endif
+    return static_cast<std::int64_t>(now.tv_sec) * 1'000'000'000LL + now.tv_nsec;
+  };
+  const auto before = now_ns();
+  ASSERT_EQ(queue.write(BytesOf(Message::TestMessage{7, 7.0F})),
+            WriteResult::SUCCESS);
+  const auto after = now_ns();
+  Message::TestMessage received{};
+  MessageInfo info{};
+  ASSERT_EQ(queue.read_next(
+                *reader, std::as_writable_bytes(std::span{&received, 1}), info),
+            ReadResult::OK);
+  EXPECT_GE(info.publish_time_ns, before);
+  EXPECT_LE(info.publish_time_ns, after);
+  queue.release_reader(*reader);
+}
+
 TEST(SingleProcess, ShortWritesZeroPadPreviouslyUsedSlots) {
   constexpr std::size_t slots = 4;
   std::array<std::byte, 16> full;
@@ -401,16 +493,17 @@ TEST(SingleProcess, MismatchedReaderPolicyRejectsOverwrittenSequence) {
   ASSERT_TRUE(reader.has_value());
   for (std::size_t i = 0; i <= slots; ++i) {
     ASSERT_EQ(writer.write(BytesOf(Message::TestMessage{
-                  static_cast<int>(i), static_cast<float>(i)})),
+                  static_cast<int>(i), static_cast<float>(i)}), 1'000 + i),
               WriteResult::SUCCESS);
   }
   std::array<std::byte, sizeof(Message::TestMessage)> received{};
-  MessageInfo info;
+  MessageInfo info{.publish_time_ns = 123};
   // DROP_NEWEST readers do not skip sequences, but may not return bytes from
   // a different sequence when the writer actually uses OVERWRITE_OLDEST.
   EXPECT_EQ(subscriber.read_next(*reader, received, info), ReadResult::TORN);
   EXPECT_EQ(info.sequence, 0u);
   EXPECT_EQ(info.dropped, 0u);
+  EXPECT_EQ(info.publish_time_ns, 0);
   subscriber.release_reader(*reader);
 }
 
@@ -438,9 +531,9 @@ TEST(SingleProcess, InProgressOverwriteRejectsMixedSlot) {
     ASSERT_TRUE(reader.has_value());
     ASSERT_TRUE(recovering_reader.has_value());
     ASSERT_TRUE(latest_reader.has_value());
-    ASSERT_EQ(writer.write(original), WriteResult::SUCCESS);
+    ASSERT_EQ(writer.write(original, 100), WriteResult::SUCCESS);
     for (std::size_t i = 1; i < slots; ++i) {
-      ASSERT_EQ(writer.write(newer), WriteResult::SUCCESS);
+      ASSERT_EQ(writer.write(newer, 100 + i), WriteResult::SUCCESS);
     }
 
     SharedMemoryPtr header_mapping{path, sizeof(RTMSHeader)};
@@ -453,25 +546,31 @@ TEST(SingleProcess, InProgressOverwriteRejectsMixedSlot) {
     // Simulate a writer stopped halfway through sequence `slots`: sequence 0
     // now contains mixed bytes, but the published position is still `slots`.
     std::memcpy(first_slot, newer.data(), newer.size() / 2);
+    const std::int64_t in_progress_time = 999'999;
+    std::memcpy(first_slot + rtms_publish_time_offset(original.size()),
+                &in_progress_time, sizeof(in_progress_time));
     ASSERT_EQ(writer.writer_sequence(), slots);
     EXPECT_EQ(first_slot[0], newer[0]);
     EXPECT_EQ(first_slot[original.size() - 1], original.back());
 
     std::array<std::byte, 16> received{};
-    MessageInfo info;
+    MessageInfo info{.publish_time_ns = 123};
     EXPECT_EQ(subscriber.read_next(*reader, received, info), ReadResult::TORN);
     EXPECT_EQ(subscriber.reader_sequence(*reader), 0u);
     EXPECT_EQ(info.sequence, 0u);
     EXPECT_EQ(info.dropped, 0u);
+    EXPECT_EQ(info.publish_time_ns, 0);
 
     ASSERT_EQ(recovering.read_next(*recovering_reader, received, info),
               ReadResult::OK);
     EXPECT_EQ(info.sequence, 1u);
     EXPECT_EQ(info.dropped, 1u);
+    EXPECT_EQ(info.publish_time_ns, 101);
     EXPECT_EQ(received, newer);
     ASSERT_EQ(latest.read_next(*latest_reader, received, info), ReadResult::OK);
     EXPECT_EQ(info.sequence, slots - 1);
     EXPECT_EQ(info.dropped, slots - 1);
+    EXPECT_EQ(info.publish_time_ns, 100 + slots - 1);
     EXPECT_EQ(received, newer);
     subscriber.release_reader(*reader);
     recovering.release_reader(*recovering_reader);
@@ -1131,7 +1230,10 @@ void FreeRunningWriteThread(const std::string& path, std::size_t slots,
       // OVERWRITE_OLDEST never blocks the writer. Anything but
       // SUCCESS here is a real bug: sizes match exactly, so
       // ERROR_SIZE_MISSMATCH cannot legitimately happen either.
-      if (queue.write(rtms_message).result != WriteResult::SUCCESS) {
+      const std::int64_t publish_time_ns =
+          static_cast<std::int64_t>(sequence) * 1'000 + 17;
+      if (queue.write(rtms_message, publish_time_ns).result !=
+          WriteResult::SUCCESS) {
         failed.store(true);
         return;
       }
@@ -1199,9 +1301,12 @@ void FreeRunningReadThread(const std::string& path, std::size_t slots,
       Message::TestMessage received{};
       std::memcpy(&received, buffer.data(), sizeof(received));
 
-      // id and value are written together from the same counter, so
-      // any mismatch means the reader observed a torn slot.
-      if (received.id() != static_cast<int>(received.value())) {
+      // Payload, sequence, and publication time must all belong to one slot
+      // generation, even when the writer laps us during the copy.
+      if (received.id() != static_cast<int>(received.value()) ||
+          info.sequence != static_cast<std::uint64_t>(received.id()) ||
+          info.publish_time_ns !=
+              static_cast<std::int64_t>(received.id()) * 1'000 + 17) {
         failed.store(true);
         break;
       }

@@ -245,8 +245,8 @@ TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   EXPECT_FALSE(watcher.updated[0]);
   EXPECT_FALSE(watcher.fresh[0]);
 
-  // No callback, so the node drains right before its tick: the message
-  // arrives at tick 1 itself and its age counts from there.
+  // No callback, so the node drains right before its tick. Publication time
+  // still counts: the 5 ms wait before the first drain must not disappear.
   sim.publish("/watch/target", Count{7, 0});
   sim.step(5ms);  // tick 1 at 10 ms
   sim.step(5ms);  // tick 2 at 15 ms: nothing new since tick 1 began
@@ -254,8 +254,8 @@ TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   EXPECT_TRUE(watcher.updated[1]);
   EXPECT_FALSE(watcher.updated[2]);
   EXPECT_TRUE(watcher.fresh[1]);
-  EXPECT_EQ(watcher.ages[1], 0ms);
-  EXPECT_EQ(watcher.ages[2], 5ms);
+  EXPECT_EQ(watcher.ages[1], 5ms);
+  EXPECT_EQ(watcher.ages[2], 10ms);
   EXPECT_EQ(watcher.in->tick_count(), 7);
 
   sim.step(100ms);  // past [robot] command_timeout_us
@@ -263,6 +263,43 @@ TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   EXPECT_FALSE(watcher.in.fresh());
   EXPECT_TRUE(watcher.in.fresh(1s));
   EXPECT_TRUE(watcher.in.has_value());
+}
+
+struct Backlog {
+  explicit Backlog(Node& n)
+      : latest{n.subscribe<Count>("/backlog")},
+        ordered{n.subscribe<Count>("/backlog", [this](const Count& c) {
+          received.push_back(c.tick_count());
+        })} {}
+  void update() {}
+  Subscription<Count> latest;
+  Subscription<Count> ordered;
+  std::vector<std::int64_t> received;
+};
+
+// A plain subscription is a latest value: one drain jumps a backlog longer
+// than the per-drain cap to its newest message, aged from publication. A
+// callback subscription still sees every message in order, 64 per drain.
+TEST(Node, PlainSubscriptionSkipsBacklogWhileCallbacksKeepCappedSequence) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& backlog = sim.add<Backlog>("listener");
+  sim.step(10ms);
+  for (std::int64_t i = 0; i < 130; ++i) {
+    sim.publish("/backlog", Count{i, 0});
+  }
+
+  sim.step(1ms);
+  EXPECT_EQ(backlog.latest->tick_count(), 129);
+  EXPECT_EQ(backlog.latest.age(), 1ms);
+  ASSERT_EQ(backlog.received.size(), 64u);
+  sim.step(1ms);
+  ASSERT_EQ(backlog.received.size(), 128u);
+  sim.step(1ms);
+  ASSERT_EQ(backlog.received.size(), 130u);
+  for (std::int64_t i = 0; i < 130; ++i) {
+    EXPECT_EQ(backlog.received[static_cast<std::size_t>(i)], i);
+  }
+  EXPECT_EQ(backlog.latest->tick_count(), 129);
 }
 
 struct RelativeWrist {

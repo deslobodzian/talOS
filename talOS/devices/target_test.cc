@@ -152,6 +152,29 @@ TEST_F(TargetTest, StaleLaneIsNull) {
   EXPECT_EQ(Seen(), std::nullopt);
 }
 
+TEST(Target, FirstDrainAfterCommandTimeoutDoesNotReviveAnOldTarget) {
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+[subsystems.lift]
+period_us = 200000
+[subsystems.lift.motors.m]
+can_id = 1
+)");
+  auto& lift = sim.add<Consumer<Goal>>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);
+  PublishTarget(sim, "lift", "teleop", Goal{2.0});
+  sim.step(190ms);  // First consumer drain; the producer has been silent.
+  EXPECT_TRUE(robot_enabled(sim.node("lift")));
+  EXPECT_EQ(lift.target.get(), nullptr);
+  EXPECT_FALSE(lift.seen);
+  EXPECT_EQ(lift.source, "");
+}
+
 TEST_F(TargetTest, ModeSwitchIgnoresTheOldModesLane) {
   Mode(kAuto);
   Hold("auto", 3.0, 20ms);

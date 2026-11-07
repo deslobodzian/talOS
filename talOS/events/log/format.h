@@ -35,9 +35,9 @@
 namespace talos::event::log {
 
 inline constexpr char FILE_MAGIC[8] = {'T', 'A', 'L', 'O', 'S', 'L', 'O', 'G'};
-// 5: the schema block, ManifestEntry's schema fields and
-// FileHeader::schema_bytes.
-inline constexpr std::uint32_t FORMAT_VERSION = 5;
+// 6: RecordHeader::publish_time_ns preserves producer time separately from
+// receipt/dispatch time. Version 5 introduced message schemas.
+inline constexpr std::uint32_t FORMAT_VERSION = 6;
 
 // Marks the start of every record so a damaged log can be resynchronised.
 inline constexpr std::uint32_t RECORD_MAGIC = 0x54524543;  // "TREC"
@@ -78,6 +78,7 @@ struct RecordHeader {
   std::uint64_t dispatch_index;
   std::int64_t event_time_ns;
   std::int64_t now_ns;
+  std::int64_t publish_time_ns;  // producer time for MESSAGE and SEND
   std::uint64_t sequence;
   std::uint32_t aux;            // dropped count, WriteResult
   std::uint32_t payload_bytes;  // message size as recorded
@@ -89,7 +90,7 @@ struct RecordHeader {
 
 static_assert(sizeof(FileHeader) == 120);
 static_assert(sizeof(ManifestEntry) == 112);
-static_assert(sizeof(RecordHeader) == 56);
+static_assert(sizeof(RecordHeader) == 64);
 
 // CRC-32 (IEEE 802.3, reflected) computed with a small runtime table. Logs are
 // written on the loop thread, so this stays branch-light and allocation free.

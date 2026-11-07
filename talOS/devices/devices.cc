@@ -185,7 +185,8 @@ struct HardwareLink::Impl {
 
   hardware::State state{};
   bool have_state = false;
-  Time state_received{};
+  Time state_published{};
+  std::size_t state_subscription = 0;
   // The bridge's gateway-to-node clock mapping. The state is the gateway's
   // canonical wire bytes, which the bridge relays untouched (its
   // sample_time_us is what every request echoes, on the gateway clock), so
@@ -198,10 +199,10 @@ struct HardwareLink::Impl {
   explicit Impl(Node& n) : node{n} {}
 
   bool Fresh() const {
-    return have_state && node.now() - state_received < timeout;
+    return have_state && node.now() - state_published < timeout;
   }
   Duration Age() const {
-    return have_state ? node.now() - state_received : Duration::max();
+    return have_state ? node.now() - state_published : Duration::max();
   }
   bool Enabled() const { return Fresh() && hardware::GatewayReady(state); }
   std::optional<Time> SampleTime() const {
@@ -246,7 +247,8 @@ struct HardwareLink::Impl {
     if (!hardware::AcceptState(have_state, state, config_id, next)) return;
     state = next;
     have_state = true;
-    state_received = node.now();
+    state_published = node.now() - detail::NodeAccess::subscription_age(
+                                       node, state_subscription);
   }
 
   void Flush() {
@@ -290,7 +292,7 @@ HardwareLink::HardwareLink(Node& node) : impl_{std::make_unique<Impl>(node)} {
   impl.config_id = hardware::ConfigurationId(impl.config.hardware);
   impl.timeout =
       std::chrono::microseconds{impl.config.hardware.command_timeout_us};
-  detail::NodeAccess::add_subscription(
+  impl.state_subscription = detail::NodeAccess::add_subscription(
       node, hardware::kStateTopic, sizeof(Packet), alignof(Packet),
       schema::Of<Packet>(), /*optional=*/false,
       [&impl](const void* data) { impl.OnState(data); });
@@ -660,10 +662,10 @@ namespace detail {
 class DriverStationLink {
  public:
   explicit DriverStationLink(Node& node) : node_{node} {
-    NodeAccess::add_subscription(node, hardware::kDriverStationTopic,
-                                 sizeof(Packet), alignof(Packet),
-                                 schema::Of<Packet>(), /*optional=*/false,
-                                 [this](const void* data) { OnPacket(data); });
+    subscription_ = NodeAccess::add_subscription(
+        node, hardware::kDriverStationTopic, sizeof(Packet), alignof(Packet),
+        schema::Of<Packet>(), /*optional=*/false,
+        [this](const void* data) { OnPacket(data); });
   }
 
   // A listener runs as each packet arrives, so its node drains every tick.
@@ -674,7 +676,7 @@ class DriverStationLink {
 
   bool Connected() const {
     return have_ && (data_.fms.flags & driver_station::kDsAttached) != 0 &&
-           node_.now() - received_ < NodeAccess::freshness_timeout(node_);
+           node_.now() - published_ < NodeAccess::freshness_timeout(node_);
   }
   const driver_station::DriverStationData& data() const { return data_; }
 
@@ -700,14 +702,15 @@ class DriverStationLink {
     }
     data_ = next;
     have_ = true;
-    received_ = node_.now();
+    published_ = node_.now() - NodeAccess::subscription_age(node_, subscription_);
     for (const auto& listener : listeners_) listener();
   }
 
   Node& node_;
   driver_station::DriverStationData data_{};
   bool have_ = false;
-  Time received_{};
+  Time published_{};
+  std::size_t subscription_ = 0;
   std::vector<std::function<void()>> listeners_;
 };
 

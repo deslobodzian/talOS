@@ -52,6 +52,10 @@ struct Context {
   MonotonicTime event_time{};
   MonotonicTime now{};
 
+  // Writer's monotonic timestamp, carried with the payload. Message age is
+  // now - publish_time, independently of receipt/dispatch scheduling latency.
+  MonotonicTime publish_time{};
+
   // Timer: number of periods that elapsed (1 when on time, >1 after an
   // overrun). Message: the RTMS sequence.
   std::uint64_t sequence{0};

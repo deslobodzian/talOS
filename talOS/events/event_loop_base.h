@@ -142,13 +142,19 @@ class EventLoopBase {
   // `schema` is the topic's identity (talOS/schema/identity.h): the
   // realtime loop's segment refuses one of another type, and the log
   // records it so a payload can be decoded.
+  //
+  // `latest_only` (implied by an empty callback) delivers only the newest
+  // available message at each drain, counting skipped ones as dropped. A
+  // sequence watcher receives every retained message in order, at most
+  // `max_messages_per_tick` per drain. Either way Context::publish_time is
+  // the writer's publication time, so `now - publish_time` is message age.
   std::uint16_t register_watcher(std::string_view topic,
                                  std::uint32_t message_bytes,
                                  std::uint32_t alignment,
                                  const schema::Identity& schema,
-                                 Thunk callback) {
+                                 Thunk callback, bool latest_only = false) {
     return add_source(SourceKind::WATCHER, topic, message_bytes, alignment,
-                      schema, callback);
+                      schema, callback, latest_only);
   }
 
   std::uint16_t register_sender(std::string_view topic,
@@ -203,6 +209,7 @@ class EventLoopBase {
     Registration registration;
     Thunk callback;
     std::vector<std::byte> buffer;  // staging for watcher payloads
+    bool latest_only{false};
   };
 
   std::vector<Source>& sources() { return sources_; }
@@ -342,13 +349,15 @@ class EventLoopBase {
   void dispatch_message(std::uint16_t id, MonotonicTime event_time,
                         MonotonicTime now, std::uint64_t sequence,
                         std::uint64_t dropped,
-                        std::span<const std::byte> payload) {
+                        std::span<const std::byte> payload,
+                        MonotonicTime publish_time) {
     Context context{};
     context.kind = EventKind::MESSAGE;
     context.source_id = id;
     context.dispatch_index = ++dispatch_index_;
     context.event_time = event_time;
     context.now = now;
+    context.publish_time = publish_time;
     context.sequence = sequence;
     context.dropped = dropped;
 
@@ -396,7 +405,8 @@ class EventLoopBase {
 
   std::uint16_t add_source(SourceKind kind, std::string_view name,
                            std::uint32_t message_bytes, std::uint32_t alignment,
-                           const schema::Identity& schema, Thunk callback) {
+                           const schema::Identity& schema, Thunk callback,
+                           bool latest_only = false) {
     if (registration_closed_) {
       throw RegistrationError(
           "event sources must be registered before run(): '" +
@@ -432,6 +442,8 @@ class EventLoopBase {
     Source source{};
     source.registration = registration;
     source.callback = callback;
+    source.latest_only =
+        kind == SourceKind::WATCHER && (latest_only || !callback.valid());
     source.buffer.resize(message_bytes);
 
     sources_.push_back(std::move(source));

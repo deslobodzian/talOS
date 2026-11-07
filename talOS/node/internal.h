@@ -49,7 +49,8 @@ class LoopPort {
                                          std::uint32_t message_bytes,
                                          std::uint32_t alignment,
                                          const schema::Identity& schema,
-                                         event::Thunk callback) = 0;
+                                         event::Thunk callback,
+                                         bool latest_only) = 0;
   virtual std::uint16_t register_sender(std::string_view topic,
                                         std::uint32_t message_bytes,
                                         std::uint32_t alignment,
@@ -83,9 +84,10 @@ class LoopPortFor : public LoopPort {
                                  std::uint32_t message_bytes,
                                  std::uint32_t alignment,
                                  const schema::Identity& schema,
-                                 event::Thunk callback) override {
+                                 event::Thunk callback,
+                                 bool latest_only) override {
     return loop_.register_watcher(topic, message_bytes, alignment, schema,
-                                  callback);
+                                  callback, latest_only);
   }
   std::uint16_t register_sender(std::string_view topic,
                                 std::uint32_t message_bytes,

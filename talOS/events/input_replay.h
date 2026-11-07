@@ -22,8 +22,8 @@
 // first difference. This is the other question -- "what would this program
 // have done in that match?" -- so nothing is compared: the program runs on a
 // SimulatedEventLoop whose clock starts at the session's origin, every
-// recorded message on a topic it watches is published at its recorded time,
-// and whatever it sends is its own new output, logged by its recorder.
+// recorded message on a topic it watches is published at its producer's
+// recorded publish time, and whatever it sends is its own new output.
 namespace talos::event {
 
 // A topic as a session's logs recorded it.
@@ -38,7 +38,7 @@ struct RecordedTopic {
 };
 
 struct RecordedMessage {
-  MonotonicTime time;
+  MonotonicTime time;      // producer's publish time, not a reader's receipt
   std::uint32_t topic{0};  // index into RecordedSession::topics()
   std::uint64_t sequence{0};
   std::size_t offset{0};  // of its payload in the session's byte store
@@ -46,11 +46,9 @@ struct RecordedMessage {
 
 // Every message one session's logs recorded, by topic.
 //
-// A message's time is when the session first saw it: its writer's send
-// (the dispatch in which the writer published it), or, for a topic whose
-// writer kept no log of it, the earliest reader's receipt. One message seen
-// in several logs (sent by one node, received by three) is kept once, by
-// topic and transport sequence, at the earliest of those times.
+// A message's time is its producer's publish time, preserved in both SEND and
+// MESSAGE records even when only a delayed reader logged it. One message seen
+// in several logs is kept once, by topic and transport sequence.
 class RecordedSession {
  public:
   // `path` is a session directory (every *.tlog in it, restarts included)
@@ -108,10 +106,10 @@ const RecordedTopic* MatchRecordedTopic(const RecordedSession& session,
                                         const Registration& registration);
 
 // Runs `loop` from the session's start to its end, publishing every recorded
-// message on a topic the program watches at its recorded time, so the first
-// drain at or after it delivers it, as a live reader's would. A topic the
-// program sends itself is its own output and is not fed. `loop` must have
-// finished registration, not have run, and start at session.start()
+// message on a topic the program watches at its producer's publish time, so
+// the first drain at or after it delivers it with its original timestamp.
+// A topic the program sends itself is its own output and is not fed. `loop`
+// must have finished registration, not have run, and start at session.start()
 // (SimulatedEventLoop::Options::start). Finishes the loop, which closes its
 // recorder's log. Throws ReplayError before running on a schema mismatch.
 template <RecorderPolicy Recorder>
@@ -161,7 +159,7 @@ InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
     // Everything due before the message happens first; the drain at its
     // time or after it delivers it.
     loop.run_until(message.time - Duration{1});
-    channel->publish(session.payload(message));
+    channel->publish(session.payload(message), message.time);
     ++report.fed[fed_index[message.topic]].messages;
   }
   loop.run_until(session.end());

@@ -31,8 +31,8 @@ gave them. Seven rules make that true:
    dispatch and frozen for the whole callback, so two reads inside one handler
    cannot disagree. Handlers never touch `std::chrono` clocks directly.
 3. **Every input is recorded.** Timer firings (deadline plus how many periods
-   elapsed), message payloads with their sequence and drop count, the start
-   time and the exit.
+   elapsed), message payloads with their sequence, drop count and writer
+   publication time, the start time and the exit.
 4. **Every output is recorded.** Each `send` is logged with its bytes, the
    transport's verdict and the sequence it got, tagged with the dispatch that
    produced it. Timer setup/disable and handler-requested exit are validated too.
@@ -89,10 +89,23 @@ layout. `Options::delivery` (or `set_delivery()` before the run) picks when:
   over 200 ms against about 200 under `POLL`
   (`RealtimeEventLoop.BeforeTimersWakesOnlyForTimers`).
 
-Each drained message is stamped with the drain that saw it, and the log
-records the resulting dispatch order, so replay reproduces either policy.
-`SimulatedEventLoop` takes the same option. The node layer chooses for each
-node: see `NodeAccess::require_immediate_delivery` in `talOS/node/access.h`.
+Each dispatch samples its own `now`, frozen for that callback; a slow timer
+callback cannot hide elapsed time from the next due timer. Messages retain the
+writer's publication time separately from their drain/dispatch time. Message
+age is `now - publish_time`, including any wait before draining, while
+`Context::latency()` remains drain scheduling latency.
+
+Subscriptions without a per-message callback skip directly to the newest
+available value once per drain, counting skipped messages as dropped. Callback
+subscriptions retain sequence delivery with `max_messages_per_tick` (64 by
+default) bounding each drain. The node's internal storage callback does not
+turn a plain latest-value subscription into sequence delivery.
+
+The log records dispatch and publication times and the resulting order, so
+replay reproduces both delivery policies and ages. `SimulatedEventLoop` takes
+the same options and stamps messages at simulated send time. The node layer
+chooses delivery timing: see `NodeAccess::require_immediate_delivery` in
+`talOS/node/access.h`.
 
 ## Writing a handler
 
@@ -151,6 +164,11 @@ A changed gain, a reordered branch or a missing send is reported as a
 divergence naming the dispatch and the topic. Set `Options{false}` to collect
 every divergence in one pass instead of throwing at the first.
 
+Dispatch logs use `.tlog` version 6: 120 B file header, 112 B manifest entries,
+64 B record headers plus stored payloads. The extra publication timestamp is
+required to reproduce ages; older versions are rejected with both version
+numbers in the error. Input replay injects messages at publication, not receipt.
+
 Note that both snippets set the schedule up the same way. `monotonic_now()`
 before `run()` returns the loop's *origin*, which the realtime loop fixes at
 construction and the replay loop takes from the log, so a program that builds
@@ -201,16 +219,16 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
 
 - `RecordedSession` reads every log of a session directory. A topic's
   messages come from whichever logs recorded them: the writer's accepted
-  `SEND`s, or, when the writer kept no log of the topic, the earliest
-  reader's receipts. One message seen in several logs is kept once, by topic
-  and transport sequence, at the earliest recorded time. Logs from two
-  sessions, or a topic recorded with two schemas, are refused.
+  `SEND`s or readers' receipts. Both preserve the writer's publication time.
+  One message seen in several logs is kept once, by topic and transport
+  sequence. Logs from two sessions, or a topic recorded with two schemas,
+  are refused.
 - `ReplayInputs` runs the loop on its virtual clock from the session's origin
   to its last recorded time. Each recorded message on a topic the program
-  watches is published at its recorded time, so the next drain delivers it,
-  as a live reader's would have. Topics the program sends are its own output
-  and are not fed; what it sends goes to its recorder, a new log.
-- A watched topic recorded with another schema (name or hash, `.tlog` v5's
+  watches is published at the writer's publication time, so the next drain
+  delivers it with its original age. Topics the program sends are its own
+  output and are not fed; what it sends goes to its recorder, a new log.
+- A watched topic recorded with another schema (name or hash in the
   per-topic descriptors) throws `ReplayError` before anything runs, naming
   both types and who recorded it. Watched topics no log recorded are listed in
   `InputReplayReport::unrecorded`; nothing arrives on them.
@@ -238,7 +256,7 @@ into a live robot's shared memory.
 append-only, with a CRC on the manifest and schema blocks, and on every record.
 The schema block carries each manifest entry's topic schema
 (`talOS/schema/identity.h`): its name and embedded `.bfbs` reflection schema
-bytes. A record is a 56-byte header plus its payload up to the last non-zero
+bytes. A record is a 64-byte header plus its payload up to the last non-zero
 byte: fixed-size messages are mostly trailing zero padding, so the header keeps
 the payload's full size and the reader zero-fills it back, handing out exactly
 the bytes that were recorded. A log that ends mid-record is not corruption:
@@ -247,8 +265,9 @@ power. A record whose checksum is wrong *is* corruption and is refused.
 
 Format details live in `log/format.h`. The version field is checked on read;
 readers reject a version they do not know rather than guessing.
-The current format is version 5, which adds the schema block and per-topic
-schema identities; version 4 and earlier logs are refused.
+The current format is version 6, which adds each message's writer publication
+time to the schema identities introduced in version 5. Other versions are
+refused with both recorded and supported versions in the error.
 Records are copied into preallocated chunks and handed to a background thread
 through an atomic ring. Dispatch does not lock, wait for disk, or resize buffers.
 The writer checks for new chunks every millisecond. If the pool is exhausted,

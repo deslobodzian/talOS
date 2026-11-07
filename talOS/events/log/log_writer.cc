@@ -380,6 +380,7 @@ void LogWriter::dispatch(const Context& context,
   header.dispatch_index = context.dispatch_index;
   header.event_time_ns = context.event_time.nanos();
   header.now_ns = context.now.nanos();
+  header.publish_time_ns = context.publish_time.nanos();
   header.sequence = context.sequence;
   header.aux = static_cast<std::uint32_t>(context.dropped);
   state_->append(header, payload);
@@ -394,6 +395,7 @@ void LogWriter::send(const Context& parent, std::uint16_t source_id,
   header.dispatch_index = parent.dispatch_index;
   header.event_time_ns = parent.event_time.nanos();
   header.now_ns = parent.now.nanos();
+  header.publish_time_ns = parent.now.nanos();
   header.sequence = sequence;
   header.aux = status;
   state_->append(header, payload);
@@ -406,6 +408,7 @@ void LogWriter::finish(const Context& context) noexcept {
   header.dispatch_index = context.dispatch_index;
   header.event_time_ns = context.event_time.nanos();
   header.now_ns = context.now.nanos();
+  header.publish_time_ns = context.publish_time.nanos();
   header.sequence = context.sequence;
   header.aux = static_cast<std::uint32_t>(context.dropped);
   state_->append(header, std::span<const std::byte>{});

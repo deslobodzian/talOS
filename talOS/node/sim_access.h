@@ -36,6 +36,8 @@ struct SimAccess {
                                      std::string_view topic, std::size_t bytes);
   static void read_raw(const testing::Sim& sim, std::string_view topic,
                        std::size_t bytes, std::uint64_t sequence, void* out);
+  static Time publish_time(const testing::Sim& sim, std::string_view topic,
+                           std::size_t bytes, std::uint64_t sequence);
 };
 
 }  // namespace talos::detail

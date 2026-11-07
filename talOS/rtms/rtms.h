@@ -27,6 +27,27 @@ inline constexpr std::size_t align_up(std::size_t value,
   return (value + alignment - 1) & ~(alignment - 1);
 }
 
+// Each slot keeps the payload first, then an aligned int64 publication time.
+inline constexpr std::size_t rtms_slot_alignment(std::size_t alignment) {
+  return alignment < alignof(std::int64_t) ? alignof(std::int64_t) : alignment;
+}
+
+inline constexpr std::size_t rtms_publish_time_offset(std::size_t message_size) {
+  return align_up(message_size, alignof(std::int64_t));
+}
+
+inline constexpr std::size_t rtms_slot_stride(std::size_t message_size,
+                                             std::size_t alignment) {
+  return align_up(rtms_publish_time_offset(message_size) + sizeof(std::int64_t),
+                  rtms_slot_alignment(alignment));
+}
+
+static_assert(sizeof(std::int64_t) == 8);
+static_assert(rtms_slot_stride(1, 1) == 16);
+static_assert(rtms_slot_stride(8, 4) == 16);
+static_assert(rtms_slot_stride(16, 8) == 24);
+static_assert(rtms_slot_stride(16, 16) == 32);
+
 static inline bool is_pow_2(std::size_t n) {
   return (n > 0) && (n & (n - 1)) == 0;
 }
@@ -74,6 +95,8 @@ enum class ReadResult {
 struct MessageInfo {
   std::uint64_t sequence{0};
   std::uint64_t dropped{0};
+  // Producer's monotonic clock, captured when this message was published.
+  std::int64_t publish_time_ns{0};
 };
 
 // For when a reader becomes too slow and our buffer is full
@@ -110,7 +133,7 @@ struct RTMSOptions {
 // The segment format, checked before any other header field is trusted.
 inline constexpr std::uint64_t kRtmsMagic =
     0x32534D54534F4C41ULL;  // "ALOSTMS2"
-inline constexpr std::uint64_t kRtmsVersion = 4;
+inline constexpr std::uint64_t kRtmsVersion = 5;
 
 // RTMSHeader::lifetime: a session-owned flag, a closing flag, and the count
 // of queues attached to a segment that is not session-owned.
@@ -162,6 +185,8 @@ struct RTMSHeader {
   Reader readers[MAX_READERS];
 };
 
+static_assert(sizeof(RTMSHeader) == 832);
+
 template <typename F, class T = const std::byte>
 concept TakesSpan = std::invocable<F, std::span<T>>;
 
@@ -203,15 +228,20 @@ class RTMSQueue {
   // Frees every reader slot whose claiming process has died. Returns how
   // many it freed.
   std::size_t reclaim_dead_readers();
+  // Samples the host monotonic clock used by the platform's event Poller.
   WriteStatus write(std::span<const std::byte> message);
+  // Explicit timestamp for simulated/replayed publications on their timeline.
+  WriteStatus write(std::span<const std::byte> message,
+                    std::int64_t publish_time_ns);
 
   // Copies the next message for `reader_id` into `destination` and reports
-  // its sequence plus how many messages were skipped to get there.
+  // its sequence, publication time, and how many messages were skipped.
   //
   // Unlike read(), this is safe against a writer that laps the reader: the
   // slot is copied first and the copy is only accepted if the writer did not
   // reach it during the copy (a seqlock, using the writer sequence that the
   // frozen shared-memory layout already provides).
+  // Payload and publication time are accepted under the same validity check.
   ReadResult read_next(std::uint64_t reader_id,
                        std::span<std::byte> destination, MessageInfo& info);
 
@@ -315,6 +345,7 @@ class RTMSQueue {
   std::uint64_t message_size_{0};
   std::uint64_t message_alignment_{0};
   std::uint64_t data_offset_{0};
+  std::uint64_t publish_time_offset_{0};
   std::uint64_t stride_{0};
   std::uint64_t total_bytes_{0};
 

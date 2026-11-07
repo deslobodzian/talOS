@@ -144,6 +144,10 @@ struct NodeAccess {
 
   // `schema` is the topic's identity (talOS/schema/identity.h): what the
   // segment checks at attach, describe reports and the log records.
+  // Without `on_message` each drain keeps only the newest message (skipped
+  // ones count as dropped); with it every message arrives in sequence, at
+  // most 64 per drain. subscription_age() is now minus the writer's
+  // publication time for both kinds.
   static std::size_t add_subscription(Node& node, std::string_view topic,
                                       std::size_t bytes, std::size_t alignment,
                                       const schema::Identity& schema,

@@ -179,44 +179,54 @@ the inconsistency without changing the wire format.
 
 ## Main-processor shared-memory slots
 
-Fixed message topics store their complete native FlatBuffers struct/envelope;
-there is no UDP frame header. Slot bytes are not the dynamic occupied payload
-length. Queue bookkeeping/ring headers are additional to the per-slot bytes.
+Fixed message topics store their complete native FlatBuffers struct/envelope
+plus a writer publication timestamp; there is no UDP frame header. RTMS segment
+version **5** stores `[payload][padding to 8][i64 publish_time_ns][tail padding]`.
+For payload size M and alignment A, timestamp offset is `align_up(M, 8)` and
+slot stride is `align_up(align_up(M, 8) + 8, max(A, 8))`. The **832 B** ring
+header is additional; data starts at `align_up(832, max(A, 8))`. These sizes
+are compile-time asserted in `talOS/rtms/rtms.h`.
 
-RTMS segment version 4 records the exact completed `DROP_NEWEST` publication
-position in existing writer-header padding without increasing header or slot
-sizes. For published position P and slot sequence s, readers require
-P − s < slots, except that equality is accepted when the shared
-reliable-publication marker equals P. Overwriting writers invalidate this marker
-before modifying slot bytes. A standalone publisher reclaims segments of another
-version by unlinking and recreating them; a new session owner unlinks any prior
-segment before creation. An attaching reader rejects a version mismatch.
+The timestamp uses the host monotonic clock (macOS `CLOCK_MONOTONIC_RAW`,
+Linux `CLOCK_MONOTONIC`), shared with `node.now()`; simulation uses its virtual
+clock. Payload and timestamp are copied before the same slot-validity check.
+For published position P and slot sequence s, readers require P − s < slots,
+except that equality is accepted when the reliable-publication marker equals P.
+Overwriting writers invalidate this marker before modifying slot bytes. A
+standalone publisher reclaims incompatible unheld segments; attaching readers
+reject version mismatches. A new session owner replaces any prior segment.
+
+`age()` and `fresh()` count from publication, never delivery. A stalled consumer
+cannot revive an expired command by draining it. Latest-value subscriptions
+dispatch only the newest available message per drain and count skipped messages
+as dropped; per-message callbacks retain sequence delivery, capped at 64 messages
+per topic per drain by default. Dispatch scheduling latency remains separate.
 
 | Topic / owner → consumer | Slot bytes | Meaning / rate |
 |---|---:|---|
-| `/hw/state`: bridge → devices/telemetry | 1436 | `hardware::Packet`: u32 size + 1432 data; occupied data currently 705, ≤1412 |
-| `/hw/command`: bridge → observers/logging | 1436 | Packet; merged Command occupied data currently 238, ≤410 |
-| `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1436 | Packet; DS occupied data 38–670 |
-| `/hw/request/<node>`: device owner → bridge | 1436 | Packet; only that owner's actuator requests, not a full-capacity command |
-| `/hw/status`: bridge → telemetry/observers | 160 | fixed `bridge.BridgeStatus`, alignment 8 |
-| `/<sub>/target/<source>`: producer → target resolver | `16 + sizeof(message)` | TargetEnvelope mode-generation/active header 16 + FlatBuffers struct; chassis 40, shooter 24, intake 20 |
-| `/autonomous/state`: autonomous → telemetry | 1 | AutonomousState: phase enum (ubyte) |
-| `/drivetrain/state`: drivetrain → estimator/driver/telemetry | 112 | DrivetrainState: padded time/flags header 16 + chassis/yaw 32 + four module positions 64 |
-| `/intake/state`: intake → telemetry | 20 | IntakeState, including FlatBuffers padding |
-| `/shooter/state`: shooter → telemetry | 32 | ShooterState, including FlatBuffers padding |
-| `/<camera>/state`: each camera → estimator/telemetry | 64 | geometry.PoseObservation, including padding |
-| `/<camera>/status`: each camera → telemetry | 56 | vision.VisionStatus, including padding |
-| `/pose_estimator/state`: estimator → telemetry | 72 | geometry.PoseEstimate, including padding |
-| `/sim/state`: physics sim_gateway → four simulated cameras / telemetry | 56 | geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
-| `/talos/telemetry`: telemetry → studio_bridge | 16384 × 64 slots | byte ring = 1048576 B of slot storage; actual frames have padding stripped before WebSocket forwarding |
+| `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data currently 705, ≤1412 |
+| `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data currently 238, ≤410 |
+| `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1448 | 1436 B Packet; DS occupied data 38–670 |
+| `/hw/request/<node>`: device owner → bridge | 1448 | 1436 B Packet; only that owner's actuator requests, not a full-capacity command |
+| `/hw/status`: bridge → telemetry/observers | 168 | 160 B fixed `bridge.BridgeStatus`, alignment 8 |
+| `/<sub>/target/<source>`: producer → target resolver | `align_up(16 + sizeof(message), 8) + 8` | TargetEnvelope payload: mode-generation/active header 16 + FlatBuffers struct; chassis/shooter/intake payload 40/24/20 B, slots 48/32/32 B |
+| `/autonomous/state`: autonomous → telemetry | 16 | 1 B AutonomousState: phase enum (ubyte) |
+| `/drivetrain/state`: drivetrain → estimator/driver/telemetry | 120 | 112 B DrivetrainState: padded time/flags header 16 + chassis/yaw 32 + four module positions 64 |
+| `/intake/state`: intake → telemetry | 32 | 20 B IntakeState, including FlatBuffers padding |
+| `/shooter/state`: shooter → telemetry | 40 | 32 B ShooterState, including FlatBuffers padding |
+| `/<camera>/state`: each camera → estimator/telemetry | 72 | 64 B geometry.PoseObservation, including padding |
+| `/<camera>/status`: each camera → telemetry | 64 | 56 B vision.VisionStatus, including padding |
+| `/pose_estimator/state`: estimator → telemetry | 80 | 72 B geometry.PoseEstimate; `valid` = fresh usable odometry, `localized` = established field-frame trust; `localized` sits in existing payload padding |
+| `/sim/state`: physics sim_gateway → four simulated cameras / telemetry | 64 | 56 B geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
+| `/talos/telemetry`: telemetry → studio_bridge | 16392 × 64 slots | 16384 B byte payload capacity; ring = 1049088 B of slot storage; actual frames have padding stripped before WebSocket forwarding |
 
 Sources: `talOS/hardware/packet.h`, `talOS/bridge/bridge_status.fbs`,
 `talOS/devices/target.h`, `talOS/msgs/geometry.fbs`, robot `*_message.fbs`,
 `vision/vision.fbs`, and `talOS/telemetry/wire.h`. Struct sizes include alignment
 padding: they must not be inferred by simply adding scalar field widths.
-The `/sim/state` slot is pinned by `static_assert(sizeof(geometry::OdometrySample)
-== 56)` in `simulation/sim_gateway.cc`. This truth topic is local to the main
-processor and never crosses the hardware UDP link.
+The `/sim/state` payload is pinned by `static_assert(sizeof(geometry::OdometrySample)
+== 56)` in `simulation/sim_gateway.cc`; RTMS adds its 8 B publication timestamp.
+This truth topic is local to the main processor and never crosses hardware UDP.
 
 Autonomous phases are IDLE, SPINUP, FEED, DRIVE, HOLD, and ABORTED (append-only
 ubyte; state remains one byte). SPINUP and DRIVE abort after configured deadlines;
@@ -228,6 +238,16 @@ resets the routine to IDLE.
 Phoenix followers drive only while their master is permitted and their own
 cached position/velocity feedback—including configured remote CANcoder
 feedback—is fresh and finite; invalid feedback neutralizes the follower.
+
+## Dispatch logs
+
+`.tlog` version **6** carries a publication timestamp on each message dispatch
+and send, separate from event/dispatch time. Exact replay preserves publication
+age; input replay injects at the recorded publication time rather than receipt.
+Older formats are rejected with the recorded and supported versions. The packed
+file header remains **120 B**, manifest entry **112 B**, and record header grows
+from 56 to **64 B**, followed by the stored payload bytes. Matching assertions
+live in `talOS/events/log/format.h`.
 
 ## Telemetry, Studio, and the radio boundary
 
@@ -243,10 +263,11 @@ and range-rejected camera counters at channel level, retaining camera health,
 timing, dropped-frame and visible-tag diagnostics. The producer's
 `MeasureValueFrameBytes` over the original real declared graph measured
 **141 channels / 1216 B** before exclusions and **129 channels / 1120 B** after.
+The localization latch adds one scalar (8 B), yielding **130 channels / 1128 B**.
 In a physics-gateway session `/sim/state` adds **7 channels**: `sample_time_ns`,
-pose x/y/yaw and velocity vx/vy/omega. At 8 B/channel that is **136 channels /
-1176 B**, leaving **24 B headroom** under the 1200 B cap; no additional excludes
-are needed. Non-physics sessions remain at 129 channels / 1120 B. The full-stack
+pose x/y/yaw and velocity vx/vy/omega. At 8 B/channel that is **137 channels /
+1184 B**, leaving **16 B headroom** under the 1200 B cap; no additional excludes
+are needed. Non-physics sessions use 130 channels / 1128 B. The full-stack
 startup test runs the declared physics graph, so telemetry's construction-time
 `CheckFrameBudget` enforces the cap on that graph. Topic-level includes remain
 unchanged; excludes match topics or individual dictionary channels, and only

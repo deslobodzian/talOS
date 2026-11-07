@@ -49,7 +49,7 @@ struct Node::Impl {
     bool observer = false;
     detail::MessageCallback on_message;
     bool has_value = false;
-    Time received{};
+    Time published{};
     bool pending = false;  // arrived since the last update() began
     bool updated = false;  // what update() sees: pending at its start
   };
@@ -198,7 +198,7 @@ struct Node::Impl {
     std::memcpy(slot->data.get(), payload.data(), copied);
     std::memset(slot->data.get() + copied, 0, slot->bytes - copied);
     slot->has_value = true;
-    slot->received = context.now;
+    slot->published = context.publish_time;
     slot->pending = true;
     if (slot->on_message) slot->on_message(slot->data.get());
   }
@@ -625,7 +625,8 @@ std::size_t NodeAccess::add_subscription(Node& node, std::string_view topic,
   slot->on_message = std::move(on_message);
   impl.loop->register_watcher(slot->topic, static_cast<std::uint32_t>(bytes),
                               static_cast<std::uint32_t>(alignment), schema,
-                              event::Thunk{slot.get(), &Node::Impl::OnMessage});
+                              event::Thunk{slot.get(), &Node::Impl::OnMessage},
+                              !slot->on_message);
   impl.subscriptions.push_back(std::move(slot));
   return impl.subscriptions.size() - 1;
 }
@@ -642,7 +643,7 @@ bool NodeAccess::subscription_has_value(const Node& node, std::size_t index) {
 Duration NodeAccess::subscription_age(const Node& node, std::size_t index) {
   const auto& slot = node.impl_->SubscriptionAt(index);
   if (!slot.has_value) return Duration::max();
-  return node.now() - slot.received;
+  return node.now() - slot.published;
 }
 
 bool NodeAccess::subscription_fresh(const Node& node, std::size_t index,

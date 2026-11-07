@@ -80,6 +80,8 @@ class LogWriter {
   // Throws std::system_error if the write fails.
   void start(const Manifest& manifest, MonotonicTime start_time);
 
+  // MESSAGE dispatches preserve the producer's publish time independently of
+  // receipt time. SEND records use parent.now, the outgoing publication time.
   void dispatch(const Context& context,
                 std::span<const std::byte> payload) noexcept;
   void send(const Context& parent, std::uint16_t source_id,

@@ -14,6 +14,15 @@ All messages will use FlatBuffers for serialization.
 FlatBuffers **must** be structs! Tables are not allowed so the slot size is
 known at compile time.
 
+Every publication also stores an `int64_t` monotonic timestamp in its slot,
+separate from the message schema. `write(bytes)` samples the host clock used by
+the event Poller (`CLOCK_MONOTONIC_RAW` on macOS, `CLOCK_MONOTONIC` elsewhere).
+`write(bytes, publish_time_ns)` preserves the supplied nanoseconds for simulation
+and replay. `read_next()` returns that timestamp as `MessageInfo::publish_time_ns`
+alongside the sequence and dropped-message count. The payload and timestamp are
+copied before the same slot-validity check; an overwritten candidate exposes
+neither its timestamp nor its metadata as an accepted message.
+
 ## Schema identity
 
 The segment's creator records its schema name and 64-bit schema hash in the
@@ -59,3 +68,21 @@ Each ring buffer is stored with a corresponding header in shared memory:
 - `lifetime`: Atomic bitflag and refcount tracking session ownership and attached queues.
 - `writer`: `Writer` tracking sequence and owner pid.
 - `readers`: Array of `Reader` structs tracking reader sequences and pids.
+
+### Ring slots (segment version 5)
+
+For payload size `M` and message alignment `A`, each slot is:
+
+`[M payload bytes][padding to 8-byte boundary][int64 publish_time_ns][tail padding]`
+
+- Header size: 832 bytes (`sizeof(RTMSHeader)`, compile-time asserted).
+- Slot alignment: `max(A, alignof(int64_t))` (at least 8 bytes).
+- Timestamp offset: `align_up(M, 8)`.
+- Slot stride: `align_up(align_up(M, 8) + 8, max(A, 8))`.
+- Data offset: `align_up(sizeof(RTMSHeader), max(A, 8))`.
+- Segment bytes: `data_offset + slots * slot_stride` (before OS page rounding).
+
+An 8-byte payload aligned to 4 or 8 takes a 16-byte slot; a 16-byte payload
+aligned to 8 takes 24 bytes; aligned to 16 it takes 32 bytes. These sizes are
+compile-time asserted in `rtms.h`. Version 4 segments lack publication timestamps
+and cannot be attached by version 5 readers.

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "events_test/events_test_message_generated.h"
+#include "talOS/events/handles.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/replay_event_loop.h"
@@ -95,6 +96,52 @@ TEST(Replay, ReproducesRecordedBehaviour) {
   EXPECT_EQ(robot.efforts(), recorded);
   EXPECT_EQ(robot.control_count(), recorded.size());
 
+  std::remove(path.c_str());
+}
+
+struct MessageTimes {
+  std::vector<Context> contexts;
+
+  void receive(const Context& context, const EventsTest::SensorMessage&) {
+    contexts.push_back(context);
+  }
+};
+
+TEST(Replay, PreservesPublishTimeAndDispatchAge) {
+  const auto path = temp_path("dispatch_age");
+  constexpr auto origin = MonotonicTime::from_nanos(7'000'000'000);
+  MessageTimes recorded;
+  {
+    SimulationEnvironment environment;
+    using Loop = SimulatedEventLoop<log::LogWriter>;
+    Loop loop{environment, log::LogWriter{path, "dispatch_age"},
+              Loop::Options{.tick_period = 10ms, .start = origin}};
+    watch<EventsTest::SensorMessage, &MessageTimes::receive>(
+        loop, test_topics().sensor, &recorded);
+    loop.run_for(2ms);
+    loop.inject(test_topics().sensor, EventsTest::SensorMessage{1, 2.0F, 3.0F});
+    loop.run_until(origin + 10ms);
+    loop.finish();
+    ASSERT_FALSE(loop.recorder().failed()) << loop.recorder().error();
+  }
+  ASSERT_EQ(recorded.contexts.size(), 1u);
+  EXPECT_EQ(recorded.contexts[0].publish_time, origin + 2ms);
+  EXPECT_EQ(recorded.contexts[0].now - recorded.contexts[0].publish_time, 8ms);
+
+  log::LogReader reader{path};
+  ReplayEventLoop<> loop{reader};
+  MessageTimes replayed;
+  watch<EventsTest::SensorMessage, &MessageTimes::receive>(
+      loop, test_topics().sensor, &replayed);
+  loop.run();
+  EXPECT_FALSE(loop.diverged());
+  EXPECT_TRUE(loop.reached_exit());
+  ASSERT_EQ(replayed.contexts.size(), 1u);
+  EXPECT_EQ(replayed.contexts[0].event_time, recorded.contexts[0].event_time);
+  EXPECT_EQ(replayed.contexts[0].now, recorded.contexts[0].now);
+  EXPECT_EQ(replayed.contexts[0].publish_time,
+            recorded.contexts[0].publish_time);
+  EXPECT_EQ(replayed.contexts[0].now - replayed.contexts[0].publish_time, 8ms);
   std::remove(path.c_str());
 }
 

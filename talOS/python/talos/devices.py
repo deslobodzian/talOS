@@ -50,7 +50,7 @@ def hardware_sample_time_ns(node):
 
 
 class HardwareLink:
-    """This node's accepted hardware state; ages are seconds since receipt."""
+    """Accepted hardware state; ages are seconds since publication."""
 
     def __init__(self, node):
         self._node = node
@@ -66,7 +66,7 @@ class HardwareLink:
 
     @property
     def age(self) -> float:
-        """Seconds since the last accepted state; infinity before the first."""
+        """Seconds since the accepted state was published; inf before any."""
         ns = ctypes.c_int64()
         found = _abi.ok(lib.talos_hardware_age(
             self._node._handle, ctypes.byref(ns)))

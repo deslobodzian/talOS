@@ -106,6 +106,7 @@ struct ExpectedRecord {
   std::uint64_t sequence{};
   std::uint32_t aux{};
   std::vector<std::byte> payload;
+  std::int64_t publish_time_ns{};
 };
 
 void ExpectRecordEquals(const ExpectedRecord& expected,
@@ -115,6 +116,7 @@ void ExpectRecordEquals(const ExpectedRecord& expected,
   EXPECT_EQ(actual.header.dispatch_index, expected.dispatch_index);
   EXPECT_EQ(actual.header.event_time_ns, expected.event_time_ns);
   EXPECT_EQ(actual.header.now_ns, expected.now_ns);
+  EXPECT_EQ(actual.header.publish_time_ns, expected.publish_time_ns);
   EXPECT_EQ(actual.header.sequence, expected.sequence);
   EXPECT_EQ(actual.header.aux, expected.aux);
   ASSERT_EQ(actual.payload.size(), expected.payload.size());
@@ -171,6 +173,9 @@ std::vector<ExpectedRecord> WriteFixtureWithOptions(
     context.event_time =
         MonotonicTime::from_nanos(static_cast<std::int64_t>(i) * 1000);
     context.now = MonotonicTime::from_nanos(i * 1000 + (i % 5) * 10);
+    context.publish_time = context.kind == EventKind::MESSAGE
+                               ? MonotonicTime::from_nanos(i * 1000 - 500)
+                               : MonotonicTime{};
     context.sequence = static_cast<std::uint64_t>(i);
     context.dropped = static_cast<std::uint64_t>(i % 3);
 
@@ -178,7 +183,8 @@ std::vector<ExpectedRecord> WriteFixtureWithOptions(
     expected.push_back({static_cast<std::uint16_t>(context.kind), source_id,
                         context.dispatch_index, context.event_time.nanos(),
                         context.now.nanos(), context.sequence,
-                        static_cast<std::uint32_t>(context.dropped), payload});
+                        static_cast<std::uint32_t>(context.dropped), payload,
+                        context.publish_time.nanos()});
 
     if (i % 5 == 2) {
       const std::size_t send_payload_size =
@@ -192,7 +198,7 @@ std::vector<ExpectedRecord> WriteFixtureWithOptions(
                           source_id, context.dispatch_index,
                           context.event_time.nanos(), context.now.nanos(),
                           static_cast<std::uint64_t>(3000 + i), status,
-                          send_payload});
+                          send_payload, context.now.nanos()});
     }
   }
 
@@ -252,7 +258,7 @@ TEST(LogRoundTrip, AllFieldsAndManifestMatch) {
   EXPECT_EQ(index, expected.size());
   EXPECT_EQ(reader.record_count(), expected.size());
   EXPECT_FALSE(reader.truncated());
-  EXPECT_EQ(reader.format_version(), 5u);
+  EXPECT_EQ(reader.format_version(), 6u);
   EXPECT_EQ(reader.session_id(), 0u);
 
   ::unlink(path.c_str());
@@ -270,7 +276,7 @@ TEST(LogRoundTrip, SessionIdPreserved) {
   }
   LogReader reader{path};
   EXPECT_EQ(reader.session_id(), expected_session);
-  EXPECT_EQ(reader.format_version(), 5u);
+  EXPECT_EQ(reader.format_version(), 6u);
   ::unlink(path.c_str());
 }
 
@@ -522,32 +528,35 @@ TEST(LogFormatErrors, BadVersionThrows) {
   ::unlink(path.c_str());
 }
 
-// A log from before the schema block (format 4) is refused by name, not
-// misread as a truncated or corrupt version 5 file.
-TEST(LogFormatErrors, OlderFormatIsRefusedWithItsVersion) {
-  const std::string path = TempPath("old_version");
-  WriteFixture(path, LogWriter::kDefaultBufferBytes);
-  {
-    std::fstream file{path, std::ios::in | std::ios::out | std::ios::binary};
-    ASSERT_TRUE(file.is_open());
-    const std::uint32_t old_version = 4;
-    file.seekp(static_cast<std::streamoff>(offsetof(FileHeader, version)));
-    file.write(reinterpret_cast<const char*>(&old_version),
-               sizeof(old_version));
+// Pre-schema logs and v5 logs without publish timestamps are rejected before
+// trying to read their records. Future versions also name both versions.
+TEST(LogFormatErrors, UnsupportedFormatsNameActualAndSupportedVersions) {
+  const std::string path = TempPath("unsupported_version");
+  for (const std::uint32_t version : {4u, 5u, 7u}) {
+    SCOPED_TRACE(version);
+    WriteFixture(path, LogWriter::kDefaultBufferBytes);
+    {
+      std::fstream file{path, std::ios::in | std::ios::out | std::ios::binary};
+      ASSERT_TRUE(file.is_open());
+      file.seekp(static_cast<std::streamoff>(offsetof(FileHeader, version)));
+      file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    }
+    if (version == 4) {
+      // An empty v4 file is shorter than the current FileHeader.
+      ASSERT_EQ(0, ::truncate(path.c_str(), 112));
+    }
+    try {
+      LogReader reader{path};
+      FAIL() << "an unsupported log was accepted";
+    } catch (const std::runtime_error& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find("unsupported format version " +
+                         std::to_string(version)),
+                std::string::npos)
+          << what;
+      EXPECT_NE(what.find("supported version 6"), std::string::npos) << what;
+    }
   }
-  // Shorter than a v5 header too, as a real v4 log with no manifest is.
-  ASSERT_EQ(0, ::truncate(path.c_str(), 112));
-
-  try {
-    LogReader reader{path};
-    FAIL() << "a format 4 log was accepted";
-  } catch (const std::runtime_error& error) {
-    EXPECT_NE(std::string{error.what()}.find(
-                  "format version 4 predates message schemas"),
-              std::string::npos)
-        << error.what();
-  }
-
   ::unlink(path.c_str());
 }
 

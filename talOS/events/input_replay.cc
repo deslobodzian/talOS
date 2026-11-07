@@ -98,7 +98,8 @@ RecordedSession::RecordedSession(const std::string& path)
       }
       const std::uint32_t topic = topic_of[header.source_id];
       if (record.payload.size() != topics_[topic].message_bytes) continue;
-      const MonotonicTime time = MonotonicTime::from_nanos(header.now_ns);
+      const MonotonicTime time =
+          MonotonicTime::from_nanos(header.publish_time_ns);
       const auto [it, inserted] =
           seen.try_emplace({topic, header.sequence}, messages_.size());
       if (!inserted) {

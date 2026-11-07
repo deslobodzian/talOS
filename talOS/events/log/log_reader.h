@@ -28,8 +28,8 @@ class LogReader {
   };
 
   // Reads and validates the header and manifest block. Throws
-  // std::runtime_error on a bad magic, an unknown format version, a manifest
-  // whose checksum does not match, or a file too short to hold either.
+  // std::runtime_error on a bad magic, an unsupported format version (naming
+  // actual and supported versions), a checksum mismatch, or a short file.
   explicit LogReader(std::string_view path);
 
   const Manifest& manifest() const noexcept { return manifest_; }

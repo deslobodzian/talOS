@@ -73,17 +73,12 @@ LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
   if (std::memcmp(header.magic, FILE_MAGIC, sizeof(header.magic)) != 0) {
     throw std::runtime_error("LogReader: bad file magic");
   }
-  if (header.version < FORMAT_VERSION) {
+  if (header.version != FORMAT_VERSION) {
     throw std::runtime_error(
-        "LogReader: format version " + std::to_string(header.version) +
-        " predates message schemas in logs (this build reads version " +
+        "LogReader: unsupported format version " +
+        std::to_string(header.version) + " (supported version " +
         std::to_string(FORMAT_VERSION) +
         "); dump or replay it with the build that recorded it");
-  }
-  if (header.version != FORMAT_VERSION) {
-    throw std::runtime_error("LogReader: unsupported format version " +
-                             std::to_string(header.version) + " (expected " +
-                             std::to_string(FORMAT_VERSION) + ")");
   }
   if (header.header_bytes < sizeof(FileHeader) ||
       data_.size() < header.header_bytes) {

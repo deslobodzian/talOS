@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -174,9 +175,11 @@ RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
       message_size_{message_size},
       message_alignment_{message_alignment},
       data_offset_{is_pow_2(message_alignment)
-                       ? align_up(sizeof(RTMSHeader), message_alignment) : 0},
+                       ? align_up(sizeof(RTMSHeader),
+                                   rtms_slot_alignment(message_alignment)) : 0},
+      publish_time_offset_{rtms_publish_time_offset(message_size)},
       stride_{is_pow_2(message_alignment)
-                  ? align_up(message_size, message_alignment) : 0},
+                  ? rtms_slot_stride(message_size, message_alignment) : 0},
       total_bytes_{data_offset_ + stride_ * slots_},
       options_{options} {
   if (message_size == 0 || !is_pow_2(message_alignment)) {
@@ -396,6 +399,7 @@ RTMSQueue::RTMSQueue(RTMSQueue&& other) noexcept
       message_size_{other.message_size_},
       message_alignment_{other.message_alignment_},
       data_offset_{other.data_offset_},
+      publish_time_offset_{other.publish_time_offset_},
       stride_{other.stride_},
       total_bytes_{other.total_bytes_},
       options_{other.options_},
@@ -411,6 +415,7 @@ RTMSQueue& RTMSQueue::operator=(RTMSQueue&& other) noexcept {
     message_size_ = other.message_size_;
     message_alignment_ = other.message_alignment_;
     data_offset_ = other.data_offset_;
+    publish_time_offset_ = other.publish_time_offset_;
     stride_ = other.stride_;
     total_bytes_ = other.total_bytes_;
     options_ = other.options_;
@@ -460,6 +465,18 @@ std::size_t RTMSQueue::reclaim_dead_readers() {
 }
 
 WriteStatus RTMSQueue::write(std::span<const std::byte> message) {
+  struct timespec now {};
+#if defined(__APPLE__)
+  ::clock_gettime(CLOCK_MONOTONIC_RAW, &now);
+#else
+  ::clock_gettime(CLOCK_MONOTONIC, &now);
+#endif
+  return write(message, static_cast<std::int64_t>(now.tv_sec) * 1'000'000'000LL +
+                            now.tv_nsec);
+}
+
+WriteStatus RTMSQueue::write(std::span<const std::byte> message,
+                             std::int64_t publish_time_ns) {
   // Low-level queues may omit publisher at construction; their first write
   // must still claim exclusive ownership before touching the ring.
   if (!options_.publisher) {
@@ -518,6 +535,8 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message) {
     std::memset(next_segment + message.size(), 0,
                 header_->message_bytes - message.size());
   }
+  std::memcpy(next_segment + publish_time_offset_, &publish_time_ns,
+              sizeof(publish_time_ns));
   if (options_.overflow_policy == OverflowPolicy::DROP_NEWEST) {
     header_->writer.reliable_sequence.store(next_position,
                                             std::memory_order_release);
@@ -609,8 +628,10 @@ ReadResult RTMSQueue::read_next(std::uint64_t reader_id,
       return ReadResult::EMPTY;
     }
 
-    std::memcpy(destination.data(), slot_address(candidate.sequence),
-                header_->message_bytes);
+    const std::byte* slot = slot_address(candidate.sequence);
+    std::memcpy(destination.data(), slot, header_->message_bytes);
+    std::memcpy(&candidate.publish_time_ns, slot + publish_time_offset_,
+                sizeof(candidate.publish_time_ns));
 
     if (!slot_still_valid(candidate.sequence)) {
       continue;

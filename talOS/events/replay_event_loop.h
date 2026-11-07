@@ -45,11 +45,10 @@ class ReplayDivergence : public std::runtime_error {
 
 // Re-runs a recorded program from its dispatch log.
 //
-// Nothing is re-derived. Timer firings and message payloads come from the log
-// in recorded order, so the handlers see byte-identical inputs at identical
-// times no matter how the original run was scheduled. The loop then checks
-// what the handlers produce against what they produced originally: every send
-// must match, in order, byte for byte.
+// Nothing is re-derived. Timer firings, message payloads and publish times
+// come from the log in recorded order, so handlers see byte-identical inputs
+// with identical ages no matter how the original run was scheduled. The loop
+// checks every send against the original run, in order, byte for byte.
 template <RecorderPolicy Recorder = NullRecorder>
 class ReplayEventLoop
     : public EventLoopBase<ReplayEventLoop<Recorder>, Recorder> {
@@ -232,8 +231,10 @@ class ReplayEventLoop
     if (static_cast<EventKind>(header.kind) == EventKind::TIMER) {
       this->dispatch_timer(header.source_id, event_time, now_, header.sequence);
     } else {
-      this->dispatch_message(header.source_id, event_time, now_,
-                             header.sequence, header.aux, full_payload(record));
+      this->dispatch_message(
+          header.source_id, event_time, now_, header.sequence, header.aux,
+          full_payload(record),
+          MonotonicTime::from_nanos(header.publish_time_ns));
     }
 
     active_dispatch_ = 0;

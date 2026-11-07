@@ -159,6 +159,44 @@ TEST(SimulatedEventLoop, WatcherReceivesEveryInjectedMessage) {
   EXPECT_EQ(robot.dropped_sensors(), 0u);
 }
 
+TEST(SimulatedEventLoop, LatestSkipsBacklogButCallbacksKeepCappedSequence) {
+  SimulationEnvironment environment;
+  SimulatedEventLoop<> loop{environment};
+  std::vector<Context> latest;
+  std::vector<std::int64_t> ordered;
+  auto on_latest = [&](const Context& context) { latest.push_back(context); };
+  auto on_message = [&](const Context&, std::span<const std::byte> bytes) {
+    const auto* message =
+        reinterpret_cast<const EventsTest::SensorMessage*>(bytes.data());
+    ordered.push_back(message->sensor_id());
+  };
+  const auto schema = talos::schema::Of<EventsTest::SensorMessage>();
+  const auto latest_id = loop.register_watcher(
+      "/backlog", sizeof(EventsTest::SensorMessage),
+      alignof(EventsTest::SensorMessage), schema, make_thunk(&on_latest), true);
+  loop.register_watcher("/backlog", sizeof(EventsTest::SensorMessage),
+                        alignof(EventsTest::SensorMessage), schema,
+                        make_thunk(&on_message));
+  loop.run_for(10ms);
+  for (int i = 0; i < 130; ++i) {
+    loop.inject("/backlog", EventsTest::SensorMessage{i, 0.0F, 0.0F});
+  }
+
+  loop.run_for(1ms);
+  ASSERT_EQ(latest.size(), 1u);
+  EXPECT_EQ(latest.front().sequence, 129u);
+  EXPECT_EQ(latest.front().dropped, 129u);
+  EXPECT_EQ(latest.front().now - latest.front().publish_time, 1ms);
+  EXPECT_EQ(loop.source_counters()[latest_id].dropped.load(), 129u);
+  ASSERT_EQ(ordered.size(), 64u);
+  loop.run_for(1ms);
+  EXPECT_EQ(ordered.size(), 128u);
+  loop.run_for(1ms);
+  ASSERT_EQ(ordered.size(), 130u);
+  EXPECT_EQ(latest.size(), 1u);
+  for (int i = 0; i < 130; ++i) EXPECT_EQ(ordered[i], i);
+}
+
 TEST(SimulatedEventLoop, SetpointWatcherKeepsTheNewestValue) {
   SimulationEnvironment environment;
   SimulatedEventLoop<> loop{environment};

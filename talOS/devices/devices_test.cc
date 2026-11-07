@@ -545,6 +545,45 @@ TEST(Devices, AcceptStateRejectsAnotherConfigAndStaleSamples) {
   EXPECT_FALSE(robot_enabled(node));
 }
 
+TEST(Devices, FirstDrainCannotReviveOldHardwareOrDriverStationState) {
+  struct PeriodicWatcher : Watcher {
+    using Watcher::Watcher;
+    void update() {}
+  };
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+[subsystems.watcher]
+period_us = 200000
+[subsystems.watcher.digital_inputs.switch]
+dio = 3
+[subsystems.watcher.motors.m]
+can_id = 1
+)");
+  sim.add<PeriodicWatcher>("watcher");
+  Node& node = sim.node("watcher");
+  auto& link = node.extension<HardwareLink>();
+  DriverStation station{node};
+  const auto id = hardware::ConfigurationId(link.config().hardware);
+
+  sim.step(10ms);
+  sim.publish(hardware::kStateTopic, StatePacket(id, 1000, true));
+  const auto ds = testing::DsPacket(driver_station::kEnabled |
+                                    driver_station::kTeleop);
+  Packet packet{};
+  packet.size =
+      static_cast<std::uint32_t>(driver_station::Encode(ds, packet.data));
+  sim.publish(hardware::kDriverStationTopic, packet);
+  sim.step(190ms);  // Both packets first arrive after the command timeout.
+
+  EXPECT_EQ(link.age(), 190ms);
+  EXPECT_FALSE(link.fresh());
+  EXPECT_FALSE(robot_enabled(node));
+  EXPECT_FALSE(station.connected());
+  EXPECT_FALSE(station.enabled());
+}
+
 // The bridge's clock mapping as /hw/status carries it, for gateway boot
 // `boot_id`.
 ::bridge::BridgeStatus ClockStatus(std::uint64_t boot_id,

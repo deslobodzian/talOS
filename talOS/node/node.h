@@ -135,7 +135,10 @@ class Node {
   // A node without message callbacks receives messages right before each of
   // its timers (update(), every()); passing `on_message` to any subscription
   // makes the node drain every 1 ms instead, so the callback runs promptly.
-  // age() counts from that delivery.
+  // Without a callback, each drain keeps only the newest available message
+  // and counts skipped messages as dropped. Callbacks receive messages in
+  // sequence, up to 64 per topic per drain. age() counts from publication,
+  // not delivery, for both subscription kinds.
   using SubscribeOptions = talos::SubscribeOptions;
   template <Message M>
   Subscription<M> subscribe(std::string_view topic,
@@ -186,7 +189,7 @@ class Subscription {
   const M& operator*() const { return value(); }
   bool fresh() const;  // has_value() && age() < [robot] command_timeout_us
   bool fresh(Duration max_age) const;
-  Duration age() const;  // now - receive time (max if none)
+  Duration age() const;  // now - publish time (max if none)
   bool updated() const;  // a message arrived since the previous update() began
 
  private:

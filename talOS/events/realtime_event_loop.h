@@ -126,7 +126,9 @@ class RealtimeEventLoop
       }
 
       Expiration expiration{};
-      while (this->running() && scheduler_.pop_expired(now, expiration)) {
+      while (this->running()) {
+        now = Poller::now();
+        if (!scheduler_.pop_expired(now, expiration)) break;
         if (expiration.id == INTERNAL_POLL_TIMER_ID) {
           drain_messages(expiration.deadline, now);
           continue;
@@ -135,6 +137,7 @@ class RealtimeEventLoop
           drain_messages(expiration.deadline, now);
           if (!this->running()) break;
         }
+        now = Poller::now();
         this->dispatch_timer(expiration.id, expiration.deadline, now,
                              expiration.cycles);
       }
@@ -184,12 +187,13 @@ class RealtimeEventLoop
       return;
     }
 
-    // Watchers must see every message in order. The writer overwrites rather
-    // than blocks, so a subscriber that falls behind cannot stall the
-    // publishing process. The segment refuses an endpoint of another schema.
+    // Latest-value subscriptions skip backlog; per-message callbacks retain
+    // sequence delivery. Neither kind can block the publishing process.
     const RTMSOptions rtms_options{
         .overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
-        .read_mode = ReadMode::SEQUENCE,
+        .read_mode = this->source(registration.id).latest_only
+                         ? ReadMode::LATEST
+                         : ReadMode::SEQUENCE,
         .publisher = registration.kind == SourceKind::SENDER,
     };
 
@@ -218,7 +222,7 @@ class RealtimeEventLoop
   SendOutcome send_impl(std::uint16_t id, std::span<const std::byte> bytes) {
     RTMSQueue& queue = *transports_[id].queue;
 
-    const WriteStatus status = queue.write(bytes);
+    const WriteStatus status = queue.write(bytes, this->monotonic_now().nanos());
 
     switch (status.result) {
       case WriteResult::SUCCESS:
@@ -230,11 +234,8 @@ class RealtimeEventLoop
     }
   }
 
-  // `tick_deadline` is when this drain was supposed to happen and `now` is when
-  // it did. Stamping messages with both makes a watcher's dispatch latency mean
-  // something: how late the loop was to deliver. It cannot mean time since
-  // publication, because the frozen shared-memory layout carries no publish
-  // timestamp.
+  // Dispatch scheduling latency remains separate from age: the slot supplies
+  // the publication timestamp even when a consumer has stalled before draining.
   void drain_messages(MonotonicTime tick_deadline, MonotonicTime now) {
     ++activity_.drains;
     auto& sources = this->sources();
@@ -258,13 +259,16 @@ class RealtimeEventLoop
           break;
         }
 
-        this->dispatch_message(static_cast<std::uint16_t>(id), tick_deadline,
-                               now, info.sequence, info.dropped,
-                               sources[id].buffer);
+        now = Poller::now();
+        this->dispatch_message(
+            static_cast<std::uint16_t>(id), tick_deadline, now, info.sequence,
+            info.dropped, sources[id].buffer,
+            MonotonicTime::from_nanos(info.publish_time_ns));
 
         if (!this->running()) {
           return;
         }
+        if (sources[id].latest_only) break;
       }
     }
   }

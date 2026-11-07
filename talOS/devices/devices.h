@@ -28,7 +28,7 @@
 //     them neutral whenever robot_enabled() is false;
 //   - digital/PWM outputs set since the last flush included as set.
 // Incoming states pass hardware::AcceptState for this config's id and are
-// latched with their receive time; getters read the latched state (0 before
+// latched with their publication time; getters read the latched state (0 before
 // the first one), while connected() requires both a valid sample and a
 // hardware state younger than [robot] command_timeout_us. The link also
 // watches the bridge's /hw/status for the clock mapping sample_time() uses.
