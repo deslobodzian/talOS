@@ -1299,6 +1299,16 @@ void AdvanceLive(talos::testing::Sim& sim, int milliseconds) {
   }
 }
 
+// The acquisition worker is a real thread; under a loaded test host it can
+// fall behind any fixed number of simulated milliseconds. Step until the
+// observable result exists, bounded so a real failure still fails.
+template <typename Ready>
+bool AdvanceLiveUntil(talos::testing::Sim& sim, Ready ready,
+                      int max_milliseconds = 2000) {
+  for (int i = 0; i < max_milliseconds && !ready(); ++i) AdvanceLive(sim, 1);
+  return ready();
+}
+
 TEST(VisionTest, LiveControlsReachBackendAndFailuresAppearInStatus) {
   for (bool applied : {true, false}) {
     auto device = std::make_shared<FakeCameraDevice>();
@@ -1310,7 +1320,11 @@ TEST(VisionTest, LiveControlsReachBackendAndFailuresAppearInStatus) {
                        "auto_exposure = false\nauto_gain = false\n",
                        "period_us = 1000\n");
     sim.add<LiveTestVision>("rear_right_camera");
-    AdvanceLive(sim, 30);
+    ASSERT_TRUE(AdvanceLiveUntil(sim, [&] {
+      const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
+      return device->starts == 1 && status &&
+             status->control_failure_count() == (applied ? 0u : 1u);
+    }));
     ASSERT_EQ(device->starts, 1);
     {
       std::lock_guard lock(device->mutex);
@@ -1325,7 +1339,10 @@ TEST(VisionTest, LiveControlsReachBackendAndFailuresAppearInStatus) {
     EXPECT_EQ(status->control_failure_count(), applied ? 0 : 1);
     const auto stamp = sim.now().nanos() - 10000000;
     device->Emit(stamp, talos::vision::TimestampKind::kEndOfFrame);
-    AdvanceLive(sim, 20);
+    ASSERT_TRUE(AdvanceLiveUntil(sim, [&] {
+      return sim.latest<geometry::PoseObservation>("/rear_right_camera/state")
+          .has_value();
+    }));
     const auto observation =
         sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
     ASSERT_TRUE(observation);
