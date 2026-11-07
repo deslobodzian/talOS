@@ -372,4 +372,43 @@ int32_t talos_sim_hardware_pwm(const TalosSimHardware* hw, const char* node,
   });
 }
 
+int32_t talos_sim_hardware_applied_motor(const TalosSimHardware* hw,
+                                         const char* node, const char* device,
+                                         TalosMotorRequest* out) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out == nullptr) throw std::invalid_argument("null TalosMotorRequest");
+    const talos::hardware::MotorRequest request = AsHardware(hw).applied_motor(
+        NonNull(node, "node"), NonNull(device, "device"));
+    *out = TalosMotorRequest{
+        .mode = static_cast<int32_t>(request.mode),
+        .slot = request.slot,
+        .demand = request.demand,
+        .ff_volts = request.feedforward_v,
+    };
+    return TALOS_OK;
+  });
+}
+
+int32_t talos_sim_hardware_applied_digital_output(const TalosSimHardware* hw,
+                                                  const char* node,
+                                                  const char* device) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    return AsHardware(hw).applied_digital_output(NonNull(node, "node"),
+                                                 NonNull(device, "device"))
+               ? 1
+               : 0;
+  });
+}
+
+int32_t talos_sim_hardware_applied_pwm(const TalosSimHardware* hw,
+                                       const char* node, const char* device,
+                                       double* out) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out == nullptr) throw std::invalid_argument("null output");
+    *out = AsHardware(hw).applied_pwm(NonNull(node, "node"),
+                                      NonNull(device, "device"));
+    return TALOS_OK;
+  });
+}
+
 }  // extern "C"

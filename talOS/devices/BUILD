@@ -49,6 +49,20 @@ cc_library(
 )
 
 cc_test(
+    name = "testing_test",
+    size = "small",
+    srcs = ["testing_test.cc"],
+    deps = [
+        ":devices",
+        ":testing",
+        "//talOS/configuration",
+        "//talOS/hardware",
+        "//talOS/node:testing",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "devices_test",
     size = "small",
     srcs = ["devices_test.cc"],

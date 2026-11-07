@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -31,6 +32,14 @@ struct Axis {
   double velocity = 0;
 };
 
+// Neutral decay, the same first-order rotor model and constants as the
+// Phoenix desktop sim (PhoenixBackend kSimNeutral*): brake shorts the windings
+// and stops the rotor quickly, coast rolls on; friction snaps a nearly-stopped
+// unpowered rotor to standstill.
+constexpr double kNeutralBrakeTauS = 0.05;
+constexpr double kNeutralCoastTauS = 1.0;
+constexpr double kNeutralStandstillRps = 0.01;
+
 // CANcoders and gyros share the sensors table, and so its ids.
 Kind TableOf(Kind kind) { return kind == Kind::kGyro ? Kind::kCANcoder : kind; }
 
@@ -56,9 +65,17 @@ struct SimHardware::Impl {
   std::map<std::uint16_t, double> analog_inputs;
 
   std::map<std::uint16_t, hardware::MotorRequest> motor_requests;
+  std::map<std::uint16_t, hardware::MotorRequest> applied_motors;
   std::map<std::uint16_t, bool> digital_outputs;
   std::map<std::uint16_t, double> pwm_outputs;
-  std::map<std::string, std::uint64_t> cursors;  // per request topic
+  std::map<std::uint16_t, bool> applied_digital_outputs;
+  std::map<std::uint16_t, double> applied_pwm_outputs;
+  struct RequestTracker {
+    std::string topic;
+    std::uint64_t cursor = 0;
+    std::optional<Time> last_seen;
+  };
+  std::map<std::string, RequestTracker> requests;
   std::set<std::pair<Kind, std::uint16_t>> disconnected;
   std::optional<driver_station::DriverStationData> ds_packet;
   driver_station::ModeTracker ds_mode;
@@ -83,38 +100,76 @@ struct SimHardware::Impl {
     return !disconnected.contains({TableOf(kind), id});
   }
 
+  void Neutralize(const hardware::Devices& devices) {
+    for (const auto id : devices.motors) {
+      applied_motors[id] = hardware::MotorRequest{.id = id};
+    }
+    for (const auto id : devices.digital_outputs) {
+      applied_digital_outputs[id] = false;
+    }
+    for (const auto id : devices.pwm_outputs) {
+      applied_pwm_outputs[id] = 0.0;
+    }
+  }
+
   // Every request each subsystem flushed since the last look, in order.
   void Collect() {
     for (const auto& [subsystem, devices] : config.subsystems) {
-      const std::string topic = hardware::RequestTopic(subsystem);
+      auto& tracker = requests.at(subsystem);
       const std::uint64_t count =
-          SimAccess::message_count(sim, topic, sizeof(Packet));
-      std::uint64_t& cursor = cursors[topic];
-      for (; cursor < count; ++cursor) {
+          SimAccess::message_count(sim, tracker.topic, sizeof(Packet));
+      for (; tracker.cursor < count; ++tracker.cursor) {
         Packet packet{};
-        SimAccess::read_raw(sim, topic, sizeof packet, cursor, &packet);
+        SimAccess::read_raw(sim, tracker.topic, sizeof packet, tracker.cursor,
+                            &packet);
         hardware::Command command{};
         if (!hardware::Decode(packet.bytes(), command)) continue;
+        tracker.last_seen = SimAccess::publish_time(
+            sim, tracker.topic, sizeof packet, tracker.cursor);
+        // Like the bridge, each request replaces this node's entire output.
+        // Raw inspection still retains the last explicitly requested values.
+        Neutralize(devices);
         for (std::size_t i = 0; i < command.count; ++i) {
           motor_requests[command.motors[i].id] = command.motors[i];
+          applied_motors[command.motors[i].id] = command.motors[i];
         }
         for (std::size_t i = 0; i < command.digital_output_count; ++i) {
           digital_outputs[command.digital_outputs[i].id] =
+              command.digital_outputs[i].value;
+          applied_digital_outputs[command.digital_outputs[i].id] =
               command.digital_outputs[i].value;
         }
         for (std::size_t i = 0; i < command.pwm_output_count; ++i) {
           pwm_outputs[command.pwm_outputs[i].id] =
               command.pwm_outputs[i].output;
+          applied_pwm_outputs[command.pwm_outputs[i].id] =
+              command.pwm_outputs[i].output;
         }
+      }
+      if (!enabled || !tracker.last_seen ||
+          sim.now() - *tracker.last_seen >=
+              std::chrono::microseconds{config.hardware.command_timeout_us}) {
+        Neutralize(devices);
       }
     }
   }
 
   void ApplyIdealMotors() {
     const double dt = std::chrono::duration<double>(period).count();
-    for (const auto& [id, request] : motor_requests) {
-      Axis& axis = motors[id];
+    for (const auto& motor : config.hardware.motors) {
+      const auto request = ValueOr(applied_motors, motor.id,
+                                   hardware::MotorRequest{.id = motor.id});
+      Axis& axis = motors[motor.id];
       switch (request.mode) {
+        case hardware::Mode::kNeutral: {
+          const double tau = motor.brake ? kNeutralBrakeTauS : kNeutralCoastTauS;
+          axis.velocity *= 1.0 - std::min(1.0, dt / tau);
+          if (std::abs(axis.velocity) < kNeutralStandstillRps) {
+            axis.velocity = 0;
+          }
+          axis.position += axis.velocity * dt;
+          break;
+        }
         case hardware::Mode::kVelocity:
           axis.velocity = request.demand;
           axis.position += request.demand * dt;
@@ -183,7 +238,7 @@ struct SimHardware::Impl {
              return hardware::DigitalOutputSample{c.id, false, false};
            }
            return hardware::DigitalOutputSample{
-               c.id, true, ValueOr(digital_outputs, c.id, false)};
+               c.id, true, ValueOr(applied_digital_outputs, c.id, false)};
          });
     fill(state.analog_inputs, state.analog_input_count, hw.analog_inputs,
          [&](const auto& c) {
@@ -211,7 +266,7 @@ struct SimHardware::Impl {
              return hardware::PwmSample{c.id, false, 0.0};
            }
            return hardware::PwmSample{c.id, true,
-                                      ValueOr(pwm_outputs, c.id, 0.0)};
+                                      ValueOr(applied_pwm_outputs, c.id, 0.0)};
          });
 
     Packet packet{};
@@ -274,6 +329,12 @@ SimHardware::SimHardware(Sim& sim) : impl_{std::make_shared<Impl>(sim)} {
   impl.config.hardware.commissioned = true;
   impl.config_id = hardware::ConfigurationId(impl.config.hardware);
   impl.period = std::chrono::microseconds{impl.config.hardware.period_us};
+  for (const auto& [name, devices] : impl.config.subsystems) {
+    impl.requests.emplace(
+        name, Impl::RequestTracker{.topic = hardware::RequestTopic(name),
+                                  .last_seen = std::nullopt});
+    impl.Neutralize(devices);
+  }
   SimAccess::every(sim, impl.period, [weak = std::weak_ptr<Impl>{impl_}] {
     const auto impl = weak.lock();
     if (!impl) return false;
@@ -383,6 +444,27 @@ double SimHardware::pwm(std::string_view node, std::string_view device) const {
   const std::uint16_t id = impl_->Id(node, Kind::kPwm, device);
   impl_->Collect();
   return ValueOr(impl_->pwm_outputs, id, 0.0);
+}
+
+hardware::MotorRequest SimHardware::applied_motor(
+    std::string_view node, std::string_view device) const {
+  const std::uint16_t id = impl_->Id(node, Kind::kMotor, device);
+  impl_->Collect();
+  return impl_->applied_motors.at(id);
+}
+
+bool SimHardware::applied_digital_output(std::string_view node,
+                                        std::string_view device) const {
+  const std::uint16_t id = impl_->Id(node, Kind::kDigitalOutput, device);
+  impl_->Collect();
+  return impl_->applied_digital_outputs.at(id);
+}
+
+double SimHardware::applied_pwm(std::string_view node,
+                               std::string_view device) const {
+  const std::uint16_t id = impl_->Id(node, Kind::kPwm, device);
+  impl_->Collect();
+  return impl_->applied_pwm_outputs.at(id);
 }
 
 driver_station::DriverStationData DsPacket(std::uint32_t flags) {

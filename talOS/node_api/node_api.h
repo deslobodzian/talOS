@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 19u
+#define TALOS_NODE_ABI_VERSION 20u
 
 enum {
   TALOS_OK = 0,
@@ -114,6 +114,9 @@ int32_t talos_node_param(const TalosNode* node, const char* key, int32_t kind,
 
 // Registration: call while the factory runs. Indexes are >= 0; -1 is an
 // error. `schema` names the message type; the topic refuses another.
+// No on_message: each drain keeps only the newest message, counting skipped
+// messages as dropped. With on_message: sequence delivery, capped at 64 messages
+// per topic per drain. Both kinds measure freshness from publication.
 int64_t talos_node_subscribe(TalosNode* node, const char* topic,
                              uint32_t message_bytes, const TalosSchema* schema,
                              int32_t optional, TalosMessageCallback on_message,
@@ -131,6 +134,7 @@ int32_t talos_node_set_update(TalosNode* node, TalosCallback fn, void* user);
 // Subscription `index`: the latest message (zeros until the first), ...
 const void* talos_subscription_value(const TalosNode* node, int64_t index);
 int32_t talos_subscription_has_value(const TalosNode* node, int64_t index);
+// Consumer now minus writer publication time, in ns; INT64_MAX before the first.
 int64_t talos_subscription_age_ns(const TalosNode* node, int64_t index);
 // max_age_ns < 0: [robot] command_timeout_us.
 int32_t talos_subscription_fresh(const TalosNode* node, int64_t index,
@@ -392,7 +396,8 @@ typedef struct TalosDriverStationPacket {
 } TalosDriverStationPacket;
 int32_t talos_sim_hardware_set_driver_station(
     TalosSimHardware* hw, const TalosDriverStationPacket* packet);
-// The last request flushed by `node` for `device`.
+// Raw requests: last value explicitly requested, unchanged by expiry,
+// omission from a later request, or disable.
 typedef struct TalosMotorRequest {
   int32_t mode;  // TALOS_MODE_*
   int32_t slot;
@@ -407,6 +412,17 @@ int32_t talos_sim_hardware_digital_output(const TalosSimHardware* hw,
                                           const char* node, const char* device);
 int32_t talos_sim_hardware_pwm(const TalosSimHardware* hw, const char* node,
                                const char* device, double* out);
+// Applied outputs after per-node timeout, omission, and the enabled gate.
+// Motor/PWM return TALOS_OK or TALOS_ERR; digital returns 0/1 or TALOS_ERR.
+int32_t talos_sim_hardware_applied_motor(const TalosSimHardware* hw,
+                                         const char* node, const char* device,
+                                         TalosMotorRequest* out);
+int32_t talos_sim_hardware_applied_digital_output(const TalosSimHardware* hw,
+                                                  const char* node,
+                                                  const char* device);
+int32_t talos_sim_hardware_applied_pwm(const TalosSimHardware* hw,
+                                       const char* node, const char* device,
+                                       double* out);
 
 #ifdef __cplusplus
 }  // extern "C"

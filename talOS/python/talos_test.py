@@ -121,6 +121,56 @@ class TwoNodesTest(unittest.TestCase):
         self.assertEqual(sim.node("follower").period, 0.01)
         self.assertAlmostEqual(sim.now, 0.055)
 
+    def test_first_drain_ages_from_publication_through_abi(self):
+        class Slow:
+            def __init__(self, node):
+                self.goal = node.subscribe(Goal, "/slow/goal")
+                self.seen = []
+
+            def update(self):
+                self.seen.append((self.goal.age, self.goal.fresh()))
+
+        sim = Sim.from_toml("""
+[robot]
+period_us = 10000
+command_timeout_us = 100000
+[subsystems.slow]
+period_us = 200000
+[subsystems.slow.motors.m]
+can_id = 1
+""")
+        slow = sim.add(Slow, "slow")
+        sim.step(0.01)
+        sim.publish(Goal, "/slow/goal", height_rot=3)
+        sim.step(0.19)
+        self.assertEqual(len(slow.seen), 1)
+        self.assertAlmostEqual(slow.seen[0][0], 0.19)
+        self.assertFalse(slow.seen[0][1])
+        self.assertEqual(slow.goal.value.height_rot, 3)
+
+    def test_latest_backlog_and_callback_sequence_through_abi(self):
+        class Watch:
+            def __init__(self, node):
+                self.latest = node.subscribe(Goal, "/backlog")
+                self.received = []
+                self.ordered = node.subscribe(
+                    Goal, "/backlog",
+                    callback=lambda value: self.received.append(value.tick_count))
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        watch = sim.add(Watch, "follower")
+        sim.step(0.01)
+        for i in range(130):
+            sim.publish(Goal, "/backlog", tick_count=i)
+        sim.step(0.001)
+        self.assertEqual(watch.latest.value.tick_count, 129)
+        self.assertAlmostEqual(watch.latest.age, 0.001)
+        self.assertEqual(watch.received, list(range(64)))
+        sim.step(0.001)
+        self.assertEqual(watch.received, list(range(128)))
+        sim.step(0.001)
+        self.assertEqual(watch.received, list(range(130)))
+
 
 class SubscriptionErrorsTest(unittest.TestCase):
     def test_abi_errors_are_not_values_or_true_flags(self):
@@ -151,6 +201,112 @@ class SubscriptionErrorsTest(unittest.TestCase):
 
 
 class DevicesTest(unittest.TestCase):
+    def test_applied_outputs_expire_while_raw_requests_remain(self):
+        class SlowOutputs:
+            def __init__(self, node):
+                self.motor = talos.Motor(node, "motor")
+                self.led = talos.DigitalOutput(node, "led")
+                self.servo = talos.PwmOutput(node, "servo")
+
+            def update(self):
+                self.motor.set_velocity(12.5, ff_volts=0.25, slot=2)
+                self.led.set(True)
+                self.servo.set(0.75)
+
+        sim = Sim.from_toml("""
+[robot]
+period_us = 5000
+command_timeout_us = 30000
+[subsystems.slow]
+period_us = 100000
+[subsystems.slow.motors.motor]
+can_id = 1
+[subsystems.slow.digital_outputs.led]
+dio = 0
+[subsystems.slow.pwm_outputs.servo]
+channel = 0
+""")
+        sim.add(SlowOutputs, "slow")
+        hw = SimHardware(sim)
+        self.assertEqual(hw.applied_motor("slow", "motor"),
+                         (talos.Mode.NEUTRAL, 0, 0, 0))
+        self.assertFalse(hw.applied_digital_output("slow", "led"))
+        self.assertEqual(hw.applied_pwm("slow", "servo"), 0)
+        hw.enable()
+        sim.step(0.11)  # First request at 100 ms; next is not until 200 ms.
+        requested = (talos.Mode.VELOCITY, 12.5, 0.25, 2)
+        self.assertEqual(hw.motor_request("slow", "motor"), requested)
+        self.assertEqual(hw.applied_motor("slow", "motor"), requested)
+        self.assertTrue(hw.applied_digital_output("slow", "led"))
+        self.assertEqual(hw.applied_pwm("slow", "servo"), 0.75)
+        sim.step(0.019)
+        self.assertEqual(hw.applied_motor("slow", "motor"), requested)
+        sim.step(0.006)  # Deadline plus one hardware tick; no new request.
+        self.assertEqual(hw.applied_motor("slow", "motor"),
+                         (talos.Mode.NEUTRAL, 0, 0, 0))
+        self.assertFalse(hw.applied_digital_output("slow", "led"))
+        self.assertEqual(hw.applied_pwm("slow", "servo"), 0)
+        self.assertEqual(hw.motor_request("slow", "motor"), requested)
+        self.assertTrue(hw.digital_output("slow", "led"))
+        self.assertEqual(hw.pwm("slow", "servo"), 0.75)
+
+        sim.step(0.07)  # A new request at 200 ms restores the applied output.
+        self.assertEqual(hw.applied_motor("slow", "motor"), requested)
+        hw.enable(False)
+        self.assertEqual(hw.applied_motor("slow", "motor").mode,
+                         talos.Mode.NEUTRAL)
+        self.assertFalse(hw.applied_digital_output("slow", "led"))
+        self.assertEqual(hw.applied_pwm("slow", "servo"), 0)
+        self.assertEqual(hw.motor_request("slow", "motor"), requested)
+
+    def test_applied_output_accessors_propagate_device_errors(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        hw = SimHardware(sim)
+        for accessor in (hw.applied_motor, hw.applied_digital_output,
+                         hw.applied_pwm):
+            with self.subTest(accessor=accessor.__name__):
+                with self.assertRaisesRegex(talos.TalosError, "'missing'"):
+                    accessor("lift", "missing")
+
+    def test_ideal_neutral_preserves_momentum_with_brake_coast_decay(self):
+        class PassiveMotors:
+            def __init__(self, node):
+                self.braked = talos.Motor(node, "braked")
+                self.coasting = talos.Motor(node, "coasting")
+
+        sim = Sim.from_toml("""
+[robot]
+period_us = 5000
+[subsystems.mech.motors.braked]
+can_id = 1
+brake = true
+[subsystems.mech.motors.coasting]
+can_id = 2
+brake = false
+""")
+        motors = sim.add(PassiveMotors, "mech")
+        hw = SimHardware(sim)
+        sim.step(0)
+        hw.set_motor("mech", "braked", 0, 40)
+        hw.set_motor("mech", "coasting", 0, 40)
+        hw.ideal_motors()
+        hw.enable()
+        sim.step(0.02)
+        self.assertGreater(motors.braked.velocity, 0)
+        self.assertLess(motors.braked.velocity, motors.coasting.velocity)
+        self.assertLess(motors.coasting.velocity, 40)
+        self.assertGreater(motors.braked.position, 0)
+        self.assertGreater(motors.coasting.position, motors.braked.position)
+        self.assertEqual(hw.applied_motor("mech", "braked").mode,
+                         talos.Mode.NEUTRAL)
+
+        velocity = motors.braked.velocity
+        hw.enable(False)
+        sim.step(0.02)
+        self.assertLess(motors.braked.velocity, velocity)
+        self.assertEqual(hw.applied_motor("mech", "braked").mode,
+                         talos.Mode.NEUTRAL)
+
     def test_rezero_shares_motor_and_gyro_frames(self):
         class Frames:
             def __init__(self, node):
@@ -454,9 +610,11 @@ class TargetTest(unittest.TestCase):
         self.sim.step(0.01)
         self.assertEqual((self.seen(), self.lift.source), (1.0, "teleop"))
 
-    def test_stale_lane_is_none(self):
+    def test_stale_lane_is_none_at_publication_timeout(self):
         self.hold("teleop", 1.0)
-        self.sim.step(0.09)
+        # hold() returns 10 ms after its final publication: 80 ms more
+        # leaves the target 90 ms old, just inside the 100 ms timeout.
+        self.sim.step(0.08)
         self.assertEqual(self.seen(), 1.0)
         self.sim.step(0.01)
         self.assertIsNone(self.seen())

@@ -20,6 +20,9 @@
 // it before the first step to have a state at time 0; later, the first state
 // goes out at that moment. Devices are keyed by (node, device) exactly as the
 // node names them.
+// Requests expire after [robot] command_timeout_us without a publication.
+// Each node's latest request replaces its whole applied output: omitted
+// devices are neutral, and disabled hardware applies only neutral outputs.
 //
 // Each period it also publishes the bridge's /hw/status: the states and
 // Driver Station packets it sent, configured, and the gateway clock mapping
@@ -53,7 +56,12 @@ class SimHardware {
 
   void enable(bool on = true);
   // Each period, velocity/position/motion-magic requests are reached
-  // instantly (velocity integrates into position).
+  // instantly (velocity integrates into position). Neutral removes drive:
+  // velocity decays by min(1, period/tau) each tick, with tau = 50 ms for
+  // brake motors and 1 s for coast motors (the Phoenix desktop sim's
+  // constants), snapping below 0.01 rps. Position integrates the decayed
+  // velocity. Other drive modes are not modeled; use the physics simulator
+  // to model voltage/duty-cycle drive.
   void ideal_motors(bool on = true);
 
   // Feedback.
@@ -94,12 +102,21 @@ class SimHardware {
   // drops, while /hw/state keeps coming.
   void stop_driver_station();
 
-  // Outputs: the last request flushed by that node for that device (neutral,
-  // false and 0 before any).
+  // Raw outputs: the last value explicitly requested for each device
+  // (neutral, false and 0 before any). Timeout, omission from a later
+  // request, and disable do not change these inspection values.
   hardware::MotorRequest motor_request(std::string_view node,
                                        std::string_view device) const;
   bool digital_output(std::string_view node, std::string_view device) const;
   double pwm(std::string_view node, std::string_view device) const;
+
+  // Applied outputs after per-node expiry, omitted-output neutralization
+  // and the enabled gate. Inspecting outputs never refreshes a request.
+  hardware::MotorRequest applied_motor(std::string_view node,
+                                       std::string_view device) const;
+  bool applied_digital_output(std::string_view node,
+                              std::string_view device) const;
+  double applied_pwm(std::string_view node, std::string_view device) const;
 
  private:
   struct Impl;

@@ -164,7 +164,10 @@ class SimHardware:
     It also publishes /hw/status with the bridge's own gateway clock filter,
     so talos.hardware_sample_time_ns(node) is None until the 8th state, then
     each state's sim sample time plus the smallest latency the filter has
-    seen (its publication time while the latency is constant)."""
+    seen (its publication time while the latency is constant).
+    Applied outputs expire after command_timeout_us without a publication;
+    omitted outputs and disabled hardware are neutral. Raw inspection
+    retains the last explicitly requested value for each device."""
 
     def __init__(self, sim):
         self._sim = sim  # outlives this
@@ -179,7 +182,9 @@ class SimHardware:
         _abi.ok(lib.talos_sim_hardware_enable(self._handle, bool(on)))
 
     def ideal_motors(self, on=True):
-        """Velocity/position/motion-magic requests are reached each period."""
+        """Velocity/position/motion-magic requests are reached each period.
+        Neutral decays velocity with tau=50 ms (brake) or 1 s (coast);
+        below 0.01 rps it stops. Voltage/duty-cycle drive is not modeled."""
         _abi.ok(lib.talos_sim_hardware_ideal_motors(self._handle, bool(on)))
 
     def set_motor(self, node, device, position, velocity):
@@ -251,8 +256,9 @@ class SimHardware:
         _abi.ok(lib.talos_sim_hardware_set_driver_station(self._handle, None))
 
     def motor_request(self, node, device):
-        """The last request `node` flushed for `device` (neutral before any):
-        (mode, demand, ff_volts, slot)."""
+        """Last explicitly requested (mode, demand, ff_volts, slot), neutral
+        before any request. Expiry, omitted outputs and disable do not alter
+        it."""
         out = _abi.MotorRequest()
         _abi.ok(lib.talos_sim_hardware_motor_request(
             self._handle, _abi.encode(node), _abi.encode(device), out))
@@ -260,13 +266,35 @@ class SimHardware:
                             out.slot)
 
     def digital_output(self, node, device):
+        """Last explicitly requested digital value (False before any)."""
         return bool(_abi.ok(lib.talos_sim_hardware_digital_output(
             self._handle, _abi.encode(node), _abi.encode(device))))
 
     def pwm(self, node, device):
+        """Last explicitly requested PWM value (0 before any)."""
         out = ctypes.c_double()
         _abi.ok(lib.talos_sim_hardware_pwm(self._handle, _abi.encode(node),
                                            _abi.encode(device), out))
+        return out.value
+
+    def applied_motor(self, node, device):
+        """Applied (mode, demand, ff_volts, slot), after expiry/neutral gates."""
+        out = _abi.MotorRequest()
+        _abi.ok(lib.talos_sim_hardware_applied_motor(
+            self._handle, _abi.encode(node), _abi.encode(device), out))
+        return MotorRequest(talos.Mode(out.mode), out.demand, out.ff_volts,
+                            out.slot)
+
+    def applied_digital_output(self, node, device):
+        """Applied digital value, False on expiry, omission or disable."""
+        return bool(_abi.ok(lib.talos_sim_hardware_applied_digital_output(
+            self._handle, _abi.encode(node), _abi.encode(device))))
+
+    def applied_pwm(self, node, device):
+        """Applied PWM value, 0 on expiry, omission or disable."""
+        out = ctypes.c_double()
+        _abi.ok(lib.talos_sim_hardware_applied_pwm(
+            self._handle, _abi.encode(node), _abi.encode(device), out))
         return out.value
 
     def _set(self, function, node, device, *values):
