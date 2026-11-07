@@ -1,8 +1,81 @@
 #include <gtest/gtest.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <format>
+#include <limits>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
 
 #include <string>
 
+namespace {
+bool fail_truncate = false;
+bool fail_close = false;
+int unmap_calls = 0;
+
+int TestTruncate(int fd, off_t size) {
+  if (std::exchange(fail_truncate, false)) {
+    errno = ENOSPC;
+    return -1;
+  }
+  return ::ftruncate(fd, size);
+}
+
+int TestClose(int fd) {
+  const int result = ::close(fd);
+  if (std::exchange(fail_close, false)) {
+    errno = EIO;
+    return -1;
+  }
+  return result;
+}
+
+int TestUnmap(void* address, std::size_t size) {
+  ++unmap_calls;
+  return ::munmap(address, size);
+}
+}  // namespace
+
+// Inject only the OS failures needed to exercise otherwise unreachable cleanup.
+#define ftruncate TestTruncate
+#define close TestClose
+#define munmap TestUnmap
 #include "shared_memory_ptr.h"
+#undef ftruncate
+#undef close
+#undef munmap
+
+TEST(SharedMemory, FailedCreatorTruncateRemovesPublishedName) {
+  const std::string path = "/truncate_" + std::to_string(::getpid());
+  const auto name = ShmObjectName(path);
+  shm_unlink(name.c_str());
+  fail_truncate = true;
+  EXPECT_THROW((SharedMemoryPtr{path, 4096}), std::runtime_error);
+  const int fd = shm_open(name.c_str(), O_RDWR, 0666);
+  EXPECT_EQ(fd, -1);
+  if (fd != -1) ::close(fd);
+  shm_unlink(name.c_str());
+}
+
+TEST(SharedMemory, FailedCloseUnmapsSuccessfulMapping) {
+  const std::string path = "/close_" + std::to_string(::getpid());
+  const auto name = ShmObjectName(path);
+  shm_unlink(name.c_str());
+  const int before = unmap_calls;
+  fail_close = true;
+  EXPECT_THROW((SharedMemoryPtr{path, 4096}), std::runtime_error);
+  EXPECT_EQ(unmap_calls, before + 1);
+  shm_unlink(name.c_str());
+}
 
 TEST(SharedMemory, SharedMemoryPtr) {
   // One path on both platforms. This was an #ifdef -- a flat name on Linux

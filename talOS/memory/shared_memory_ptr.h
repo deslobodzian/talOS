@@ -180,6 +180,7 @@ class SharedMemoryPtr {
           std::fprintf(stderr, "ftruncate: fd=%d size=%zu errno=%d (%s)\n",
                        shm_fd, size_, err, std::strerror(err));
           close(shm_fd);
+          shm_unlink(shm_name_.c_str());
           return -1;
         }
 
@@ -250,6 +251,7 @@ class SharedMemoryPtr {
     // Says we can close mmap after mapping.
     if (close(shm_fd) == -1) {
       std::perror("failed to close shm_fd");
+      munmap(shm_addr, size_);
       return -1;
     }
 

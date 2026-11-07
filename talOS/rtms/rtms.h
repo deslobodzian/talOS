@@ -110,7 +110,7 @@ struct RTMSOptions {
 // The segment format, checked before any other header field is trusted.
 inline constexpr std::uint64_t kRtmsMagic =
     0x32534D54534F4C41ULL;  // "ALOSTMS2"
-inline constexpr std::uint64_t kRtmsVersion = 3;
+inline constexpr std::uint64_t kRtmsVersion = 4;
 
 // RTMSHeader::lifetime: a session-owned flag, a closing flag, and the count
 // of queues attached to a segment that is not session-owned.
@@ -122,7 +122,12 @@ struct alignas(CACHE_LINE) Writer {
   std::atomic<uint64_t> sequence{};
   // Exclusive publisher pid, 0 when unclaimed; dead owners may be replaced.
   std::atomic<uint64_t> owner_pid{};
+  // Exact completed DROP_NEWEST publication, or 0 when overwriting may have
+  // touched its oldest slot. Allows reliable readers to use the full ring.
+  std::atomic<uint64_t> reliable_sequence{};
 };
+
+static_assert(sizeof(Writer) == CACHE_LINE);
 
 struct alignas(CACHE_LINE) Reader {
   std::atomic<uint64_t> sequence{};

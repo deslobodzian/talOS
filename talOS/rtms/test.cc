@@ -67,6 +67,59 @@ RTMSOptions overwrite_sequence_options() {
 }
 
 }  // namespace
+TEST(LayoutValidation, RejectsInvalidOptionsBeforeMapping) {
+  const auto path = make_test_path("invalid");
+  EXPECT_THROW((RTMSQueue{path, 0, 8, kSchema, 2}), std::invalid_argument);
+  for (std::size_t alignment : {0u, 3u}) {
+    EXPECT_THROW((RTMSQueue{path, 8, alignment, kSchema, 2}),
+                 std::invalid_argument);
+  }
+  for (std::size_t slots : {0u, 1u, 3u, 2048u}) {
+    EXPECT_THROW((RTMSQueue{path, 8, 8, kSchema, slots}),
+                 std::invalid_argument);
+  }
+}
+
+TEST(LayoutValidation, RejectsCorruptOffsetAndStride) {
+  const auto path = make_test_path("layout");
+  RTMSQueue owner{path, 8, 8, kSchema, 2, {.session_owner = true}};
+  SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+  auto* header = static_cast<RTMSHeader*>(mapping.ptr());
+  ASSERT_NE(header, nullptr);
+  const auto offset = header->data_offset;
+  header->data_offset += 8;
+  EXPECT_THROW((RTMSQueue{path, 8, 8, kSchema, 2}), std::runtime_error);
+  header->data_offset = offset;
+  const auto stride = header->slot_stride;
+  header->slot_stride += 8;
+  EXPECT_THROW((RTMSQueue{path, 8, 8, kSchema, 2}), std::runtime_error);
+  header->slot_stride = stride;
+}
+
+TEST(ReaderOwnership, ReleaseRejectsInvalidFreeAndForeignReaders) {
+  const auto path = make_test_path("release");
+  RTMSQueue queue{path, 8, 8, kSchema, 2};
+  SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+  auto* header = static_cast<RTMSHeader*>(mapping.ptr());
+  ASSERT_NE(header, nullptr);
+  queue.release_reader(MAX_READERS);
+  queue.release_reader(static_cast<std::size_t>(-1));
+  queue.release_reader(0);
+  EXPECT_EQ(header->readers[0].state.load(), 0u);
+  const auto foreign = (static_cast<uint64_t>(::getpid() + 1) << 2) |
+                       static_cast<uint64_t>(ReaderState::ACTIVE);
+  header->readers[0].state.store(foreign);
+  queue.release_reader(0);
+  EXPECT_EQ(header->readers[0].state.load(), foreign);
+  header->readers[0].state.store(0);
+  const auto reader = queue.register_reader();
+  ASSERT_TRUE(reader);
+  queue.release_reader(*reader);
+  EXPECT_EQ(header->readers[*reader].state.load(), 0u);
+  RTMSQueue moved{std::move(queue)};
+  queue.release_reader(0);
+}
+
 TEST(WriterOwnership, RefusesSecondLiveWriterAndReleasesOnClose) {
   const auto path = make_test_path("writer");
   RTMSQueue session{path,
@@ -306,6 +359,156 @@ TEST(SingleProcess, WriteSequenceIncrementsMonotonically) {
   }
 
   EXPECT_EQ(queue.writer_sequence(), static_cast<std::uint64_t>(writes));
+}
+
+TEST(SingleProcess, ShortWritesZeroPadPreviouslyUsedSlots) {
+  constexpr std::size_t slots = 4;
+  std::array<std::byte, 16> full;
+  full.fill(std::byte{0xa5});
+  RTMSQueue queue{make_test_path("short_pad"), full.size(), 8, kSchema,
+                  slots, overwrite_sequence_options()};
+  for (std::size_t i = 0; i < slots; ++i) {
+    ASSERT_EQ(queue.write(full), WriteResult::SUCCESS);
+  }
+  const auto reader = queue.register_reader();
+  ASSERT_TRUE(reader.has_value());
+  for (const std::size_t size : {std::size_t{3}, std::size_t{0}}) {
+    for (std::size_t i = 0; i < slots; ++i) {
+      ASSERT_EQ(queue.write(std::span<const std::byte>{full}.first(size)),
+                WriteResult::SUCCESS);
+      std::array<std::byte, 16> received;
+      received.fill(std::byte{0xff});
+      MessageInfo info;
+      ASSERT_EQ(queue.read_next(*reader, received, info), ReadResult::OK);
+      for (std::size_t k = 0; k < received.size(); ++k) {
+        EXPECT_EQ(received[k], k < size ? std::byte{0xa5} : std::byte{0});
+      }
+    }
+  }
+  queue.release_reader(*reader);
+}
+
+TEST(SingleProcess, MismatchedReaderPolicyRejectsOverwrittenSequence) {
+  const auto path = make_test_path("policy_mismatch");
+  constexpr std::size_t slots = 4;
+  RTMSQueue writer{path, sizeof(Message::TestMessage),
+                   alignof(Message::TestMessage), kSchema, slots,
+                   overwrite_sequence_options()};
+  RTMSQueue subscriber{path, sizeof(Message::TestMessage),
+                       alignof(Message::TestMessage), kSchema, slots,
+                       sequence_options()};
+  const auto reader = subscriber.register_reader();
+  ASSERT_TRUE(reader.has_value());
+  for (std::size_t i = 0; i <= slots; ++i) {
+    ASSERT_EQ(writer.write(BytesOf(Message::TestMessage{
+                  static_cast<int>(i), static_cast<float>(i)})),
+              WriteResult::SUCCESS);
+  }
+  std::array<std::byte, sizeof(Message::TestMessage)> received{};
+  MessageInfo info;
+  // DROP_NEWEST readers do not skip sequences, but may not return bytes from
+  // a different sequence when the writer actually uses OVERWRITE_OLDEST.
+  EXPECT_EQ(subscriber.read_next(*reader, received, info), ReadResult::TORN);
+  EXPECT_EQ(info.sequence, 0u);
+  EXPECT_EQ(info.dropped, 0u);
+  subscriber.release_reader(*reader);
+}
+
+TEST(SingleProcess, InProgressOverwriteRejectsMixedSlot) {
+  for (const std::size_t slots : {2u, 4u}) {
+    const auto path =
+        make_test_path("inprog_" + std::to_string(slots));
+    std::array<std::byte, 16> original;
+    original.fill(std::byte{0xa5});
+    std::array<std::byte, 16> newer;
+    newer.fill(std::byte{0x5a});
+    RTMSQueue writer{path, original.size(), 8, kSchema, slots,
+                     overwrite_sequence_options()};
+    // A mismatched DROP_NEWEST reader must validate its original sequence,
+    // rather than skipping it before the post-copy validity check is reached.
+    RTMSQueue subscriber{path, original.size(), 8, kSchema, slots,
+                         sequence_options()};
+    RTMSQueue recovering{path, original.size(), 8, kSchema, slots,
+                         overwrite_sequence_options()};
+    RTMSQueue latest{path, original.size(), 8, kSchema, slots,
+                     latest_options()};
+    const auto reader = subscriber.register_reader();
+    const auto recovering_reader = recovering.register_reader();
+    const auto latest_reader = latest.register_reader();
+    ASSERT_TRUE(reader.has_value());
+    ASSERT_TRUE(recovering_reader.has_value());
+    ASSERT_TRUE(latest_reader.has_value());
+    ASSERT_EQ(writer.write(original), WriteResult::SUCCESS);
+    for (std::size_t i = 1; i < slots; ++i) {
+      ASSERT_EQ(writer.write(newer), WriteResult::SUCCESS);
+    }
+
+    SharedMemoryPtr header_mapping{path, sizeof(RTMSHeader)};
+    auto* header = static_cast<RTMSHeader*>(header_mapping.ptr());
+    ASSERT_NE(header, nullptr);
+    SharedMemoryPtr mapping{
+        path, header->data_offset + header->slots * header->slot_stride};
+    auto* first_slot =
+        static_cast<std::byte*>(mapping.ptr()) + header->data_offset;
+    // Simulate a writer stopped halfway through sequence `slots`: sequence 0
+    // now contains mixed bytes, but the published position is still `slots`.
+    std::memcpy(first_slot, newer.data(), newer.size() / 2);
+    ASSERT_EQ(writer.writer_sequence(), slots);
+    EXPECT_EQ(first_slot[0], newer[0]);
+    EXPECT_EQ(first_slot[original.size() - 1], original.back());
+
+    std::array<std::byte, 16> received{};
+    MessageInfo info;
+    EXPECT_EQ(subscriber.read_next(*reader, received, info), ReadResult::TORN);
+    EXPECT_EQ(subscriber.reader_sequence(*reader), 0u);
+    EXPECT_EQ(info.sequence, 0u);
+    EXPECT_EQ(info.dropped, 0u);
+
+    ASSERT_EQ(recovering.read_next(*recovering_reader, received, info),
+              ReadResult::OK);
+    EXPECT_EQ(info.sequence, 1u);
+    EXPECT_EQ(info.dropped, 1u);
+    EXPECT_EQ(received, newer);
+    ASSERT_EQ(latest.read_next(*latest_reader, received, info), ReadResult::OK);
+    EXPECT_EQ(info.sequence, slots - 1);
+    EXPECT_EQ(info.dropped, slots - 1);
+    EXPECT_EQ(received, newer);
+    subscriber.release_reader(*reader);
+    recovering.release_reader(*recovering_reader);
+    latest.release_reader(*latest_reader);
+  }
+}
+
+TEST(SingleProcess, OverwriteRevokesReliableFullRingGuarantee) {
+  const auto path = make_test_path("reliable_swap");
+  RTMSQueue subscriber{path, 8, 8, kSchema, 2, sequence_options()};
+  const auto reader = subscriber.register_reader();
+  ASSERT_TRUE(reader.has_value());
+  std::array<std::byte, 8> message{};
+  SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+  auto* header = static_cast<RTMSHeader*>(mapping.ptr());
+  ASSERT_NE(header, nullptr);
+  {
+    RTMSQueue reliable{path, message.size(), 8, kSchema, 2, sequence_options()};
+    ASSERT_EQ(reliable.write(message), WriteResult::SUCCESS);
+    ASSERT_EQ(reliable.write(message), WriteResult::SUCCESS);
+    EXPECT_EQ(header->writer.reliable_sequence.load(), 2u);
+    MessageInfo info;
+    std::array<std::byte, 8> received{};
+    ASSERT_EQ(subscriber.read_next(*reader, received, info), ReadResult::OK);
+    EXPECT_EQ(info.sequence, 0u);
+  }
+  {
+    RTMSQueue overwriting{path, message.size(), 8, kSchema, 2,
+                          overwrite_sequence_options()};
+    ASSERT_EQ(overwriting.write(message), WriteResult::SUCCESS);
+    EXPECT_EQ(header->writer.reliable_sequence.load(), 0u);
+    MessageInfo info;
+    std::array<std::byte, 8> received{};
+    EXPECT_EQ(subscriber.read_next(*reader, received, info), ReadResult::TORN);
+    EXPECT_EQ(subscriber.reader_sequence(*reader), 1u);
+  }
+  subscriber.release_reader(*reader);
 }
 
 TEST(SingleProcess, ReadNextSequenceNoDropsWhileCaughtUp) {

@@ -173,17 +173,17 @@ RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
       slots_{slots},
       message_size_{message_size},
       message_alignment_{message_alignment},
-      data_offset_{align_up(sizeof(RTMSHeader), message_alignment)},
-      stride_{align_up(message_size, message_alignment)},
+      data_offset_{is_pow_2(message_alignment)
+                       ? align_up(sizeof(RTMSHeader), message_alignment) : 0},
+      stride_{is_pow_2(message_alignment)
+                  ? align_up(message_size, message_alignment) : 0},
       total_bytes_{data_offset_ + stride_ * slots_},
       options_{options} {
-  if (!is_pow_2(slots)) {
-    throw std::invalid_argument("slots is not a power of 2!");
+  if (message_size == 0 || !is_pow_2(message_alignment)) {
+    throw std::invalid_argument("message size and alignment must be valid");
   }
-
-  // Lap recovery needs at least one slot the writer is not currently in.
-  if (slots < 2) {
-    throw std::invalid_argument("slots must be at least 2");
+  if (slots < 2 || slots > MAX_SLOTS || !is_pow_2(slots)) {
+    throw std::invalid_argument("slots must be a power of two in [2, MAX_SLOTS]");
   }
 
   if (schema.name.empty() ||
@@ -201,6 +201,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
     return header.version == kRtmsVersion && header.slots == slots_ &&
            header.message_bytes == message_size_ &&
            header.message_alignment == message_alignment_ &&
+           header.data_offset == data_offset_ && header.slot_stride == stride_ &&
            header.total_bytes == total_bytes_;
   };
   const auto schema_matches = [&schema](const RTMSHeader& header) {
@@ -270,6 +271,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
       header->writer.sequence.store(0, std::memory_order_relaxed);
       header->writer.owner_pid.store(options_.publisher ? OwnPid() : 0,
                                      std::memory_order_relaxed);
+      header->writer.reliable_sequence.store(0, std::memory_order_relaxed);
       for (auto& reader : header->readers) {
         reader.sequence.store(0, std::memory_order_relaxed);
         reader.state.store(0, std::memory_order_relaxed);
@@ -291,6 +293,12 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
           " is not a talOS segment of this build's format (or its creator "
           "died initializing it); stop the processes using it, or remove it "
           "with shm_unlink, and restart");
+    }
+    if (header->version != kRtmsVersion) {
+      throw std::runtime_error(
+          "RTMS shared-memory version mismatch on " + path_ +
+          ": segment version " + std::to_string(header->version) +
+          ", expected " + std::to_string(kRtmsVersion));
     }
     if (!layout_matches(*header)) {
       throw std::runtime_error(
@@ -491,12 +499,29 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message) {
     }
   }
 
+  // Revoke a former reliable publisher's full-capacity guarantee before any
+  // overwrite, including one interrupted by writer death. The release fence
+  // keeps this invalidation before slot writes; readers fence their slot reads
+  // before checking the marker, as with a seqlock's write-in-progress marker.
+  if (options_.overflow_policy != OverflowPolicy::DROP_NEWEST) {
+    header_->writer.reliable_sequence.store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+  }
+
   const std::uint64_t slot_index = writer_position & slot_mask;
   auto* base = static_cast<std::byte*>(ptr_.ptr());
   auto* next_segment =
       base + header_->data_offset + (slot_index * header_->slot_stride);
 
   std::memcpy(next_segment, message.data(), message.size());
+  if (message.size() < header_->message_bytes) {
+    std::memset(next_segment + message.size(), 0,
+                header_->message_bytes - message.size());
+  }
+  if (options_.overflow_policy == OverflowPolicy::DROP_NEWEST) {
+    header_->writer.reliable_sequence.store(next_position,
+                                            std::memory_order_release);
+  }
   header_->writer.sequence.store(next_position, std::memory_order_release);
   return {WriteResult::SUCCESS, writer_position};
 }
@@ -526,9 +551,9 @@ bool RTMSQueue::select_sequence(const Reader& reader, MessageInfo& info) const {
   // unread slot can ever be overwritten and nothing may be skipped. Skipping
   // here would silently break the guarantee that makes that mode worth having.
   //
-  // Under an overwriting policy the writer is free to lap us. Only the last
-  // `slots` sequences are still intact, and the oldest of those lives in the
-  // slot the writer is about to reuse, so recovery targets the one after it.
+  // Under an overwriting policy the writer is free to lap us. Published
+  // position P may already be writing sequence P, so only the last `slots - 1`
+  // published sequences are guaranteed intact; recovery skips the reused slot.
   if (options_.overflow_policy != OverflowPolicy::DROP_NEWEST &&
       writer_position - message_sequence >= header_->slots) {
     message_sequence = writer_position - header_->slots + 1;
@@ -544,12 +569,6 @@ bool RTMSQueue::select_sequence(const Reader& reader, MessageInfo& info) const {
 }
 
 bool RTMSQueue::slot_still_valid(std::uint64_t message_sequence) const {
-  // A writer that cannot pass the slowest reader cannot have been writing the
-  // slot we just read, so there is nothing to re-check.
-  if (options_.overflow_policy == OverflowPolicy::DROP_NEWEST) {
-    return true;
-  }
-
   // Pairs with the writer's release store. Everything read out of the slot
   // must be ordered before this load, or the check proves nothing.
   std::atomic_thread_fence(std::memory_order_acquire);
@@ -557,9 +576,15 @@ bool RTMSQueue::slot_still_valid(std::uint64_t message_sequence) const {
   const std::uint64_t writer_position =
       header_->writer.sequence.load(std::memory_order_relaxed);
 
-  // The writer reaches our slot again at message_sequence + slots. If its next
-  // write is at or past that point, it may have been writing while we read.
-  return writer_position - message_sequence < header_->slots;
+  // Published position P means an overwriting writer may be writing sequence
+  // P, in slot P & mask. Slot s is intact only while P < s + slots, even if
+  // that write never completes or endpoint policies disagree. At equality,
+  // only an explicitly completed reliable publication guarantees intact data.
+  const std::uint64_t distance = writer_position - message_sequence;
+  return distance < header_->slots ||
+         (distance == header_->slots &&
+          header_->writer.reliable_sequence.load(std::memory_order_acquire) ==
+              writer_position);
 }
 
 ReadResult RTMSQueue::read_next(std::uint64_t reader_id,
@@ -623,6 +648,11 @@ std::optional<std::size_t> RTMSQueue::register_reader() {
 
       reader.state.store(ReaderWord(ReaderState::ACTIVE),
                          std::memory_order_release);
+      const auto writer_after =
+          header_->writer.sequence.load(std::memory_order_acquire);
+      if (writer_after > current && writer_after - current > header_->slots) {
+        reader.sequence.store(writer_after, std::memory_order_release);
+      }
       return i;
     }
     if (reclaim_dead_readers() == 0) break;
@@ -631,6 +661,8 @@ std::optional<std::size_t> RTMSQueue::register_reader() {
 }
 
 void RTMSQueue::release_reader(std::size_t id) {
-  auto& reader = header_->readers[id];
-  reader.state.store(0, std::memory_order_release);
+  if (header_ == nullptr || id >= MAX_READERS) return;
+  auto expected = ReaderWord(ReaderState::ACTIVE);
+  header_->readers[id].state.compare_exchange_strong(
+      expected, 0, std::memory_order_acq_rel, std::memory_order_acquire);
 }
