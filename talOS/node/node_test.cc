@@ -265,6 +265,43 @@ TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   EXPECT_TRUE(watcher.in.has_value());
 }
 
+TEST(Node, PausingOneNodeStopsItsTimersAndDeliveriesButNotItsClock) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Talker>("talker");
+  auto& watcher = sim.add<Watcher>("listener");
+  sim.step(5ms);
+  sim.pause("listener", 200ms);
+  sim.publish("/watch/target", Count{7, 0});
+  sim.step(125ms);
+  EXPECT_EQ(watcher.updated.size(), 1u);
+  EXPECT_FALSE(watcher.in.has_value());
+  EXPECT_EQ(sim.node("listener").now(), sim.now());
+  ASSERT_TRUE(sim.latest<Count>("/talker/state"));
+  EXPECT_EQ(sim.latest<Count>("/talker/state")->tick_count(), 12);
+  sim.resume("listener");
+  ASSERT_EQ(watcher.updated.size(), 2u);
+  EXPECT_TRUE(watcher.updated.back());
+  EXPECT_FALSE(watcher.fresh.back());
+  EXPECT_EQ(watcher.ages.back(), 125ms);
+  sim.step(5ms);
+  EXPECT_EQ(watcher.updated.size(), 3u);
+}
+
+TEST(Node, TimedPauseResumesExactlyAtItsDeadlineAndRejectsInvalidNodes) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& watcher = sim.add<Watcher>("listener");
+  sim.pause("listener", 12ms);
+  sim.step(11ms);
+  EXPECT_TRUE(watcher.updated.empty());
+  sim.step(1ms);
+  ASSERT_EQ(watcher.updated.size(), 1u);
+  sim.step(3ms);
+  EXPECT_EQ(watcher.updated.size(), 2u);
+  EXPECT_THROW(sim.pause("missing", 1ms), std::invalid_argument);
+  EXPECT_THROW(sim.resume("missing"), std::invalid_argument);
+  EXPECT_THROW(sim.pause("listener", -1ms), std::invalid_argument);
+}
+
 struct Backlog {
   explicit Backlog(Node& n)
       : latest{n.subscribe<Count>("/backlog")},

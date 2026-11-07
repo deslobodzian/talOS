@@ -87,6 +87,7 @@ struct Sim::Impl {
     detail::Instance user;
     // What this node got from NodeAccess::declared_graph, if it asked.
     detail::DeclaredGraph graph;
+    std::optional<Time> paused_until;
     ~Hosted() {
       user.reset();
       node.reset();
@@ -168,6 +169,34 @@ Node& Sim::node(std::string_view node_name) {
                               "'");
 }
 
+void Sim::pause(std::string_view node_name, Duration duration) {
+  if (duration < Duration::zero()) {
+    throw std::invalid_argument("Sim: negative pause");
+  }
+  for (const auto& hosted : impl_->nodes) {
+    if (hosted->name == node_name) {
+      hosted->paused_until = now() + duration;
+      return;
+    }
+  }
+  throw std::invalid_argument("Sim: no node named '" + std::string{node_name} +
+                              "'");
+}
+
+void Sim::resume(std::string_view node_name) {
+  for (const auto& hosted : impl_->nodes) {
+    if (hosted->name == node_name) {
+      if (hosted->paused_until) {
+        hosted->paused_until.reset();
+        hosted->loop->run_until(now());
+      }
+      return;
+    }
+  }
+  throw std::invalid_argument("Sim: no node named '" + std::string{node_name} +
+                              "'");
+}
+
 std::optional<std::vector<std::byte>> Sim::latest_bytes(
     std::string_view topic) const {
   const auto found = impl_->byte_topics.find(topic);
@@ -185,8 +214,20 @@ void Sim::step(Duration d) {
     if (impl.now >= end) break;
     Duration next = std::min(impl.now + kSlice, end);
     for (const auto& p : impl.periodic) next = std::min(next, p.next);
+    for (const auto& hosted : impl.nodes) {
+      if (hosted->paused_until && *hosted->paused_until > now()) {
+        next = std::min(next, Duration{hosted->paused_until->nanos()});
+      }
+    }
     const Time until = Time::from_nanos(next.count());
-    for (const auto& hosted : impl.nodes) hosted->loop->run_until(until);
+    for (const auto& hosted : impl.nodes) {
+      if (hosted->paused_until) {
+        hosted->loop->advance_until(until);
+        if (until < *hosted->paused_until) continue;
+        hosted->paused_until.reset();
+      }
+      hosted->loop->run_until(until);
+    }
     impl.now = next;
   }
 }

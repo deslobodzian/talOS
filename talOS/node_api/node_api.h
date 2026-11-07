@@ -115,8 +115,8 @@ int32_t talos_node_param(const TalosNode* node, const char* key, int32_t kind,
 // Registration: call while the factory runs. Indexes are >= 0; -1 is an
 // error. `schema` names the message type; the topic refuses another.
 // No on_message: each drain keeps only the newest message, counting skipped
-// messages as dropped. With on_message: sequence delivery, capped at 64 messages
-// per topic per drain. Both kinds measure freshness from publication.
+// messages as dropped. With on_message: sequence delivery, capped at 64
+// messages per topic per drain. Both kinds measure freshness from publication.
 int64_t talos_node_subscribe(TalosNode* node, const char* topic,
                              uint32_t message_bytes, const TalosSchema* schema,
                              int32_t optional, TalosMessageCallback on_message,
@@ -134,7 +134,8 @@ int32_t talos_node_set_update(TalosNode* node, TalosCallback fn, void* user);
 // Subscription `index`: the latest message (zeros until the first), ...
 const void* talos_subscription_value(const TalosNode* node, int64_t index);
 int32_t talos_subscription_has_value(const TalosNode* node, int64_t index);
-// Consumer now minus writer publication time, in ns; INT64_MAX before the first.
+// Consumer now minus writer publication time, in ns; INT64_MAX before the
+// first.
 int64_t talos_subscription_age_ns(const TalosNode* node, int64_t index);
 // max_age_ns < 0: [robot] command_timeout_us.
 int32_t talos_subscription_fresh(const TalosNode* node, int64_t index,
@@ -321,6 +322,10 @@ TalosNode* talos_sim_add(TalosSim* sim, const char* node_name,
                          TalosFactory factory, void* user);
 TalosNode* talos_sim_node(TalosSim* sim, const char* node_name);
 int32_t talos_sim_step(TalosSim* sim, int64_t duration_ns);
+// Pauses only this node for duration_ns; resume ends a pause early.
+int32_t talos_sim_pause(TalosSim* sim, const char* node_name,
+                        int64_t duration_ns);
+int32_t talos_sim_resume(TalosSim* sim, const char* node_name);
 int64_t talos_sim_now_ns(const TalosSim* sim);
 int32_t talos_sim_publish_raw(TalosSim* sim, const char* topic,
                               const void* data, uint32_t size);

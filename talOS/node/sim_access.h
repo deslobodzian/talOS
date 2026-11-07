@@ -34,6 +34,8 @@ struct SimAccess {
   // Messages ever published on `topic` (sequence numbers 0..count-1).
   static std::uint64_t message_count(const testing::Sim& sim,
                                      std::string_view topic, std::size_t bytes);
+  // Only the RTMS retained window is readable; older sequences throw
+  // std::out_of_range rather than exposing an overwritten ring slot.
   static void read_raw(const testing::Sim& sim, std::string_view topic,
                        std::size_t bytes, std::uint64_t sequence, void* out);
   static Time publish_time(const testing::Sim& sim, std::string_view topic,

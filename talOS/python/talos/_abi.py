@@ -163,6 +163,8 @@ _TESTING_SIGNATURES = {
     "talos_sim_add": (c_void_p, [c_void_p, c_char_p, FACTORY, c_void_p]),
     "talos_sim_node": (c_void_p, [c_void_p, c_char_p]),
     "talos_sim_step": (c_int32, [c_void_p, c_int64]),
+    "talos_sim_pause": (c_int32, [c_void_p, c_char_p, c_int64]),
+    "talos_sim_resume": (c_int32, [c_void_p, c_char_p]),
     "talos_sim_now_ns": (c_int64, [c_void_p]),
     "talos_sim_publish_raw": (c_int32, [c_void_p, c_char_p, c_char_p,
                                         c_uint32]),

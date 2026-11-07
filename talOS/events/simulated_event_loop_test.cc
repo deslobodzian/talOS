@@ -197,6 +197,66 @@ TEST(SimulatedEventLoop, LatestSkipsBacklogButCallbacksKeepCappedSequence) {
   for (int i = 0; i < 130; ++i) EXPECT_EQ(ordered[i], i);
 }
 
+TEST(SimulatedEventLoop, OverflowMatchesRtmsRetainedWindowAndDropCounts) {
+  SimulationEnvironment environment;
+  SimulatedEventLoop<> loop{environment};
+  std::vector<Context> received;
+  std::vector<std::int64_t> values;
+  auto on_message = [&](const Context& context,
+                        std::span<const std::byte> bytes) {
+    received.push_back(context);
+    values.push_back(
+        reinterpret_cast<const EventsTest::SensorMessage*>(bytes.data())
+            ->sensor_id());
+  };
+  const auto id = loop.register_watcher(
+      "/overflow", sizeof(EventsTest::SensorMessage),
+      alignof(EventsTest::SensorMessage),
+      talos::schema::Of<EventsTest::SensorMessage>(), make_thunk(&on_message));
+  constexpr std::size_t count = MAX_SLOTS + 100;
+  for (std::size_t i = 0; i < count; ++i) {
+    loop.inject("/overflow",
+                EventsTest::SensorMessage{static_cast<std::int32_t>(i), 0, 0});
+  }
+  loop.run_for(1ms);
+  ASSERT_EQ(received.size(), 64u);
+  EXPECT_EQ(received.front().sequence, 101u);
+  EXPECT_EQ(received.front().dropped, 101u);
+  EXPECT_EQ(loop.source_counters()[id].dropped.load(), 101u);
+  loop.run_for(20ms);
+  ASSERT_EQ(values.size(), MAX_SLOTS - 1);
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    EXPECT_EQ(values[i], static_cast<std::int64_t>(i + 101));
+    EXPECT_EQ(received[i].publish_time, MonotonicTime{});
+    if (i != 0) {
+      EXPECT_EQ(received[i].dropped, 0u);
+    }
+  }
+  auto& channel =
+      environment.channel("/overflow", sizeof(EventsTest::SensorMessage));
+  EXPECT_THROW(channel.publish_time(100), std::out_of_range);
+}
+
+TEST(SimulatedEventLoop, PausedClockCoalescesMissedTimersOnOriginalPhase) {
+  SimulationEnvironment environment;
+  SimulatedEventLoop<> loop{environment};
+  std::vector<Context> ticks;
+  auto on_tick = [&](const Context& context) { ticks.push_back(context); };
+  const auto id = loop.register_timer("tick", make_thunk(&on_tick));
+  loop.arm_timer(id, MonotonicTime{} + 5ms, 5ms);
+  loop.run_for(5ms);
+  loop.advance_until(MonotonicTime{} + 28ms);
+  loop.run_for(0ms);
+  ASSERT_EQ(ticks.size(), 2u);
+  EXPECT_EQ(ticks.back().now, MonotonicTime{} + 28ms);
+  EXPECT_EQ(ticks.back().event_time, MonotonicTime{} + 10ms);
+  EXPECT_EQ(ticks.back().sequence, 4u);
+  loop.run_for(2ms);
+  ASSERT_EQ(ticks.size(), 3u);
+  EXPECT_EQ(ticks.back().now, MonotonicTime{} + 30ms);
+  EXPECT_EQ(ticks.back().sequence, 1u);
+}
+
 TEST(SimulatedEventLoop, SetpointWatcherKeepsTheNewestValue) {
   SimulationEnvironment environment;
   SimulatedEventLoop<> loop{environment};

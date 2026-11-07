@@ -10,12 +10,12 @@
 //   sim.step(100ms);
 //   EXPECT_TRUE(sim.latest<elevator::ElevatorStatus>("/elevator/status"));
 //
-// Each node runs on its own simulated loop, exactly as it would in its own
-// process, with the same delivery policy (see Node::subscribe); the topics
-// between them are in memory. Time is virtual and advances in 1 ms slices, the
-// loops' message tick: a node with a message callback sees a message by the
-// next slice, any other node at its next update() or every(). Hardware is a
-// layer on top: talOS/devices/testing.h plays the bridge.
+// Each node runs on its own simulated loop, with the process's delivery
+// policy (see Node::subscribe) and bounded RTMS topic/drop semantics. Time is
+// virtual and advances in 1 ms slices: callbacks drain by the next slice,
+// other nodes at their next update() or every(). pause(name, duration) stops
+// only that node's timers and deliveries; resume(name) ends the pause early.
+// Hardware is a layer on top: talOS/devices/testing.h plays the bridge.
 
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +50,11 @@ class Sim {
   // Advances virtual time, running every node's timers and deliveries.
   void step(Duration d);
   Time now() const;
+
+  // Stop one node's deliveries and timers while every clock keeps advancing.
+  // Missed periodic deadlines coalesce on resume, as after SIGSTOP/SIGCONT.
+  void pause(std::string_view node_name, Duration duration);
+  void resume(std::string_view node_name);
 
   // The session output directory the nodes this Sim hosts report through
   // Node::session_dir(). nullopt (the default) means none, as under tests and

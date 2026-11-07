@@ -86,6 +86,15 @@ class Sim:
         """Advances virtual time, running every node's timers and messages."""
         _abi.ok(lib.talos_sim_step(self._handle, round(seconds * _NS)))
 
+    def pause(self, node_name, seconds):
+        """Stops one node's timers and deliveries while its clock advances."""
+        _abi.ok(lib.talos_sim_pause(
+            self._handle, _abi.encode(node_name), round(seconds * _NS)))
+
+    def resume(self, node_name):
+        """Ends a pause early; missed timers coalesce, as after SIGCONT."""
+        _abi.ok(lib.talos_sim_resume(self._handle, _abi.encode(node_name)))
+
     @property
     def now(self):
         return lib.talos_sim_now_ns(self._handle) / _NS

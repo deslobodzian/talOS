@@ -152,6 +152,65 @@ TEST_F(TargetTest, StaleLaneIsNull) {
   EXPECT_EQ(Seen(), std::nullopt);
 }
 
+struct PausableProducer {
+  explicit PausableProducer(Node& node) : lane{node, "lift", "teleop"} {}
+  void update() { lane.send(Goal{0.5}); }
+  TargetLane<Goal> lane;
+};
+
+struct ActuatingConsumer {
+  explicit ActuatingConsumer(Node& node) : target{node}, motor{node, "m"} {}
+  void update() {
+    if (const auto* goal = target.get())
+      motor.set_duty_cycle(goal->position_rot());
+    ++updates;
+  }
+  Target<Goal> target;
+  Motor motor;
+  int updates = 0;
+};
+
+TEST(Target,
+     PausedProducerExpiresToNeutralWhileConsumerAndHardwareKeepRunning) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<PausableProducer>("wrist");
+  sim.add<ActuatingConsumer>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(20ms);
+  ASSERT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kDutyCycle);
+  sim.pause("wrist", 200ms);
+  sim.step(105ms);
+  EXPECT_TRUE(robot_enabled(sim.node("lift")));
+  EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kNeutral);
+  sim.resume("wrist");
+  sim.step(5ms);
+  EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kDutyCycle);
+  hw.enable(false);
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kNeutral);
+}
+
+TEST(Target, PausedConsumerNeverActuatesOnExpiredQueuedTargetAfterResume) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& lift = sim.add<ActuatingConsumer>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(20ms);
+  const int updates = lift.updates;
+  sim.pause("lift", 125ms);
+  PublishTarget(sim, "lift", "teleop", Goal{0.5});
+  sim.step(124ms);
+  EXPECT_EQ(lift.updates, updates);
+  sim.step(1ms);
+  EXPECT_EQ(lift.updates, updates + 1);
+  EXPECT_TRUE(robot_enabled(sim.node("lift")));
+  EXPECT_EQ(lift.target.get(), nullptr);
+  EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kNeutral);
+}
+
 TEST(Target, FirstDrainAfterCommandTimeoutDoesNotReviveAnOldTarget) {
   auto sim = Sim::FromToml(R"(
 [robot]

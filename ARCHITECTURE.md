@@ -138,7 +138,14 @@ message cannot revive it. Subscriptions without per-message callbacks dispatch
 only the newest available message, counting skipped messages as dropped;
 callback subscriptions retain sequence delivery, capped at 64 messages per
 topic per drain. Each realtime timer dispatch samples its own clock. Simulation
-and replay preserve publication-age semantics.
+and replay preserve publication-age semantics. Simulated topics retain RTMS's
+1024-slot overwrite window (1023 guaranteed readable messages), with identical
+latest-value skips and sequence-drop accounting. `testing::Sim::pause(name,
+duration)` stops one node's drains and timers while its clock and peers advance;
+`resume(name)` resumes early. Overdue periodic timers coalesce on their original
+phase, as after SIGSTOP/SIGCONT. Simulation still dispatches nodes serially on
+deterministic 1 ms slices: it does not model concurrent copies, torn reads, OS
+scheduling jitter, or the CPU cost of handlers.
 
 ## Topics and messages
 

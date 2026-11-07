@@ -601,6 +601,31 @@ class TargetTest(unittest.TestCase):
         self.assertEqual(self.seen(), 1.5)
         self.assertEqual(self.lift.source, "teleop")
 
+    def test_paused_consumer_rejects_expired_message_on_early_resume(self):
+        self.sim.pause("lift", 0.2)
+        self.sim.publish_target(Goal, "lift", "teleop", height_rot=1.0)
+        self.sim.step(0.12)
+        self.assertIsNone(self.seen())
+        self.sim.resume("lift")
+        self.assertTrue(talos.robot_enabled(self.sim.node("lift")))
+        self.assertIsNone(self.seen())
+        self.hold("teleop", 2.0)
+        self.assertEqual(self.seen(), 2.0)
+
+    def test_timed_pause_automatically_resumes(self):
+        self.sim.pause("lift", 0.015)
+        self.sim.publish_target(Goal, "lift", "teleop", height_rot=1.0)
+        self.sim.step(0.014)
+        self.assertIsNone(self.seen())
+        self.sim.step(0.001)
+        self.assertEqual(self.seen(), 1.0)
+        with self.assertRaises(talos.TalosError):
+            self.sim.pause("missing", 0.01)
+        with self.assertRaises(talos.TalosError):
+            self.sim.resume("missing")
+        with self.assertRaises(talos.TalosError):
+            self.sim.pause("lift", -0.01)
+
     def test_release_falls_through_within_one_tick(self):
         self.sim.publish_target(Goal, "lift", "teleop", height_rot=1.0)
         self.sim.publish_target(Goal, "lift", "align", height_rot=2.0)

@@ -106,6 +106,22 @@ int32_t talos_sim_step(TalosSim* sim, int64_t duration_ns) {
   });
 }
 
+int32_t talos_sim_pause(TalosSim* sim, const char* node_name,
+                        int64_t duration_ns) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    AsSim(sim).pause(NonNull(node_name, "node_name"),
+                     std::chrono::nanoseconds{duration_ns});
+    return TALOS_OK;
+  });
+}
+
+int32_t talos_sim_resume(TalosSim* sim, const char* node_name) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    AsSim(sim).resume(NonNull(node_name, "node_name"));
+    return TALOS_OK;
+  });
+}
+
 int64_t talos_sim_now_ns(const TalosSim* sim) {
   return Guard<int64_t>(0, [&] { return AsSim(sim).now().nanos(); });
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstring>
 #include <map>
 #include <span>
@@ -13,37 +14,44 @@
 #include "talOS/events/recorder.h"
 #include "talOS/events/scheduler.h"
 #include "talOS/events/time.h"
+#include "talOS/rtms/rtms.h"
 
 namespace talos::event {
 
-// An in-memory topic. Every message ever published is kept, which a real
-// transport obviously cannot do, but it makes the simulation exact: a reader
-// can always be told precisely how many messages it skipped.
+// A bounded overwriting topic, with the same retained window as RTMS.
 class SimulatedChannel {
  public:
   explicit SimulatedChannel(std::uint32_t message_bytes)
-      : message_bytes_{message_bytes} {}
+      : message_bytes_{message_bytes}, data_(MAX_SLOTS * message_bytes) {}
 
   std::uint32_t message_bytes() const { return message_bytes_; }
   std::uint64_t next_sequence() const { return count_; }
+  std::uint64_t oldest_sequence() const {
+    // RTMS reserves the potentially in-progress writer slot even when idle.
+    return count_ >= MAX_SLOTS ? count_ - MAX_SLOTS + 1 : 0;
+  }
 
   std::uint64_t publish(std::span<const std::byte> bytes,
                         MonotonicTime publish_time) {
-    const std::size_t offset = data_.size();
-    data_.resize(offset + message_bytes_, std::byte{0});
+    const std::size_t slot = count_ % MAX_SLOTS;
+    const std::size_t offset = slot * message_bytes_;
+    std::memset(data_.data() + offset, 0, message_bytes_);
     std::memcpy(data_.data() + offset, bytes.data(),
                 std::min<std::size_t>(bytes.size(), message_bytes_));
-    publish_times_.push_back(publish_time);
+    publish_times_[slot] = publish_time;
     return count_++;
   }
 
   void copy_to(std::uint64_t sequence, std::span<std::byte> destination) const {
-    std::memcpy(destination.data(), data_.data() + sequence * message_bytes_,
+    check_sequence(sequence);
+    std::memcpy(destination.data(),
+                data_.data() + (sequence % MAX_SLOTS) * message_bytes_,
                 message_bytes_);
   }
 
   MonotonicTime publish_time(std::uint64_t sequence) const {
-    return publish_times_.at(sequence);
+    check_sequence(sequence);
+    return publish_times_[sequence % MAX_SLOTS];
   }
 
   // The schema of the first endpoint registered on this topic, which every
@@ -54,10 +62,15 @@ class SimulatedChannel {
   }
 
  private:
+  void check_sequence(std::uint64_t sequence) const {
+    if (sequence < oldest_sequence() || sequence >= count_) {
+      throw std::out_of_range("simulated topic sequence is not retained");
+    }
+  }
   std::uint32_t message_bytes_;
   std::uint64_t count_{0};
   std::vector<std::byte> data_;
-  std::vector<MonotonicTime> publish_times_;
+  std::array<MonotonicTime, MAX_SLOTS> publish_times_{};
   schema::Identity schema_;
 };
 
@@ -98,11 +111,11 @@ class SimulationEnvironment {
 
 // A loop on a virtual clock.
 //
-// Time jumps straight to the next deadline, so there is no jitter, no
-// scheduling latency and no wall-clock dependence at all: two runs of the same
-// program over the same injected inputs produce identical logs. That makes it
-// the right place to test the determinism contract itself, with the realtime
-// loop then proving the same contract holds when timing is messy.
+// Without an injected pause, time jumps straight to the next deadline: no
+// jitter, scheduling latency or wall-clock dependence. Pauses advance the
+// clock without dispatch, reproducing overdue timers and transport overflow.
+// Identical inputs and pauses produce identical logs; the realtime loop then
+// proves the same dispatch contract holds when timing is messy.
 template <RecorderPolicy Recorder = NullRecorder>
 class SimulatedEventLoop
     : public EventLoopBase<SimulatedEventLoop<Recorder>, Recorder> {
@@ -177,12 +190,20 @@ class SimulatedEventLoop
   std::uint64_t inject(std::string_view topic, const Message& message) {
     return environment_
         ->channel(topic, static_cast<std::uint32_t>(sizeof(Message)))
-        .publish(std::span<const std::byte>{
-            reinterpret_cast<const std::byte*>(&message), sizeof(Message)},
-                 now_);
+        .publish(
+            std::span<const std::byte>{
+                reinterpret_cast<const std::byte*>(&message), sizeof(Message)},
+            now_);
   }
 
   void run_for(Duration duration) { run_until(now_ + duration); }
+
+  // A stopped process's clock advances without draining or firing timers.
+  void advance_until(MonotonicTime end) {
+    if (end < now_)
+      throw std::invalid_argument("simulation clock went backward");
+    now_ = end;
+  }
 
   // Runs to `end` and returns. The loop is quiescent between calls, which is
   // what makes stepping useful: the test can inject messages and re-arm timers
@@ -194,7 +215,8 @@ class SimulatedEventLoop
       scheduler_.reserve(this->manifest().size() + 1);
       this->begin_run();
       if (options_.delivery == Delivery::POLL) {
-        scheduler_.schedule(INTERNAL_POLL_TIMER_ID, now_ + options_.tick_period,
+        scheduler_.schedule(INTERNAL_POLL_TIMER_ID,
+                            options_.start + options_.tick_period,
                             options_.tick_period);
       }
       started_ = true;
@@ -206,7 +228,7 @@ class SimulatedEventLoop
         break;
       }
 
-      now_ = deadline;
+      now_ = std::max(now_, deadline);
 
       Expiration expiration{};
       while (this->running_state() &&
@@ -267,14 +289,12 @@ class SimulatedEventLoop
 
   SendOutcome send_impl(std::uint16_t id, std::span<const std::byte> bytes) {
     Cursor& cursor = cursors_[id];
-    return SendOutcome{
-        SendStatus::OK,
-        cursor.channel->publish(bytes, this->monotonic_now())};
+    return SendOutcome{SendStatus::OK,
+                       cursor.channel->publish(bytes, this->monotonic_now())};
   }
 
-  // Virtual time always lands exactly on the deadline, so a message's
-  // event_time and observation time coincide and the measured latency is zero.
-  // That is the point of the simulated clock, not an omission.
+  // Normally deadlines and observation times coincide; a paused process
+  // instead observes overdue dispatches with its advanced clock.
   void drain_messages(MonotonicTime tick_deadline) {
     ++drains_;
     auto& sources = this->sources();
@@ -291,8 +311,9 @@ class SimulatedEventLoop
            cursor.sequence < cursor.channel->next_sequence();
            ++drained) {
         const std::uint64_t sequence =
-            sources[id].latest_only ? cursor.channel->next_sequence() - 1
-                                    : cursor.sequence;
+            sources[id].latest_only
+                ? cursor.channel->next_sequence() - 1
+                : std::max(cursor.sequence, cursor.channel->oldest_sequence());
         const std::uint64_t dropped = sequence - cursor.sequence;
         cursor.channel->copy_to(sequence, sources[id].buffer);
         cursor.sequence = sequence + 1;
