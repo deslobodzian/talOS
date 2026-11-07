@@ -2,8 +2,8 @@
 
 The framework teleop node maps joystick input to subsystem target lanes without
 mechanism-specific code. Bindings are evaluated in configuration order; the
-first live binding assigning a field wins. Unassigned fields are zeroed, and
-when no binding is live the lane is released.
+first live binding assigning a field wins. A field no live binding assigns takes
+its explicit default, and when no binding is live the lane is released.
 
 ```toml
 [[teleop.bindings]]
@@ -20,7 +20,15 @@ axis = 1
 field = "velocity_rps"
 scale = -60.0
 deadband_frac = 0.1
+
+[teleop]
+defaults = { feedforward_v = 0.0 }
 ```
+
+`defaults` assigns target fields with the same value checks as `while_held`.
+Construction fails, naming the lane and field, when a field could be left
+unassigned and has no default. A field needs no default only when every binding
+of the lane assigns it (an axis binding assigns its `field`).
 
 These tables belong in a subsystem file (or use
 `[[subsystems.<name>.teleop.bindings]]` in a single-file robot configuration).
@@ -50,3 +58,12 @@ All toggle latches and edge history reset when disabled, outside teleop, or when
 the Driver Station or the binding's joystick disconnects. Re-enabling cannot
 resume an earlier latch. Only enabled teleop with a connected joystick can
 publish active teleop targets; a stale Driver Station also releases them.
+
+Teleop rearms before publishing again: at start, after the Driver Station was
+stale, disabled or outside teleop, after a bound joystick reconnects, and after
+the node's own evaluations stall for longer than `command_timeout_us`. While
+rearming it publishes no active target until every connected bound input is
+neutral (axes inside their deadband, buttons and POVs released) for one
+evaluation. A bound POV must centre even if held in a different direction than
+its binding. Edge history is seeded from that snapshot, so a button held through
+a restart neither commands nor flips a toggle.

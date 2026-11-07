@@ -6,8 +6,8 @@ period_us = 20000
 max_linear_mps = 4.0
 max_angular_radps = 6.0
 deadband_frac = 0.05
-# Stick is field-relative; falls back to robot-relative until the drivetrain
-# publishes a heading on /drivetrain/state.
+# Field-relative translation stops without a fresh drivetrain heading.
+# Recovery requires fresh heading plus centred translation sticks.
 field_oriented = true
 # Button numbers are 1-based; a non-positive value disables re-zero.
 rezero_button_id = 1

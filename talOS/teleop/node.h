@@ -256,6 +256,64 @@ struct AxisFieldAction {
   reflection::BaseType base_type{reflection::BaseType::None};
 };
 
+inline void EncodeAssignment(ButtonFieldAction& action,
+                             const ResolvedField& rf,
+                             const config::TeleopValue& fv,
+                             const std::string& field_where) {
+  if (rf.base_type == reflection::BaseType::Bool) {
+    if (!std::holds_alternative<bool>(fv)) {
+      throw std::invalid_argument(field_where + ": field '" + rf.leaf_name +
+                                  "' is bool but value is not a boolean");
+    }
+    action.bytes[0] = static_cast<std::byte>(std::get<bool>(fv) ? 1 : 0);
+  } else if (rf.enum_def != nullptr) {
+    if (!std::holds_alternative<std::string>(fv)) {
+      throw std::invalid_argument(field_where + ": field '" + rf.leaf_name +
+                                  "' is enum but value is not a string");
+    }
+    const std::string& label = std::get<std::string>(fv);
+    const reflection::EnumVal* ev = nullptr;
+    for (const auto* val : *rf.enum_def->values()) {
+      if (val->name()->str() == label) {
+        ev = val;
+        break;
+      }
+    }
+    if (ev == nullptr) {
+      throw std::invalid_argument(field_where + ": unknown enum label '" +
+                                  label + "' in " + rf.enum_def->name()->str());
+    }
+    EncodeIntegerBytes(action.bytes.data(), rf.base_type, ev->value(),
+                       field_where);
+  } else {
+    double val = 0.0;
+    if (std::holds_alternative<int64_t>(fv)) {
+      val = static_cast<double>(std::get<int64_t>(fv));
+    } else if (std::holds_alternative<double>(fv)) {
+      val = std::get<double>(fv);
+    } else {
+      throw std::invalid_argument(field_where + ": field '" + rf.leaf_name +
+                                  "' is numeric but value is not a number");
+    }
+    EncodeNumericBytes(action.bytes.data(), rf.base_type, val, field_where);
+  }
+}
+
+inline void ScalarPaths(const reflection::Schema& schema,
+                        const reflection::Object& object,
+                        const std::string& prefix,
+                        std::vector<std::string>& paths) {
+  for (const auto* field : *object.fields()) {
+    const std::string path = prefix + field->name()->str();
+    if (field->type()->base_type() == reflection::BaseType::Obj) {
+      ScalarPaths(schema, *schema.objects()->Get(field->type()->index()),
+                  path + "/", paths);
+    } else {
+      paths.push_back(path);
+    }
+  }
+}
+
 struct PrecomputedBinding {
   bool is_button{true};
   int port{0};
@@ -265,6 +323,7 @@ struct PrecomputedBinding {
   bool on_toggle{false};
   bool toggled{false};
   bool was_pressed{false};
+  bool connected{false};
   std::vector<ButtonFieldAction> button_fields;
   int axis{0};
   double scale{1.0};
@@ -278,6 +337,7 @@ struct SubsystemState {
   std::size_t message_bytes{0};
   std::vector<PrecomputedBinding> bindings;
   std::vector<std::byte> buffer;
+  std::vector<std::byte> defaults;
   std::vector<uint8_t> field_set;
   bool commanding{false};
 };
@@ -304,6 +364,52 @@ class Teleop {
   void update() {
     using talos::detail::TargetAccess;
 
+    const auto now = node_.now();
+    if (last_evaluation_ &&
+        now - *last_evaluation_ >=
+            talos::detail::NodeAccess::freshness_timeout(node_)) {
+      armed_ = false;
+    }
+    last_evaluation_ = now;
+    if (!ds_.enabled() || !ds_.teleop()) armed_ = false;
+
+    // A stick that (re)appears may already be deflected; an absent spare
+    // controller is no input and does not block the others.
+    for (auto& sub : subsystems_) {
+      for (auto& binding : sub.bindings) {
+        const bool connected = ds_.joystick(binding.port).connected();
+        if (connected && !binding.connected) armed_ = false;
+        binding.connected = connected;
+      }
+    }
+    if (!armed_) {
+      bool neutral = ds_.enabled() && ds_.teleop();
+      for (auto& sub : subsystems_) {
+        for (auto& binding : sub.bindings) {
+          const auto stick = ds_.joystick(binding.port);
+          binding.toggled = false;
+          // Seed edge history; a button held through rearm is not a press.
+          const bool pressed =
+              binding.is_button &&
+              (binding.pov ? stick.pov(binding.pov_index) == *binding.pov
+                           : stick.button(binding.button));
+          binding.was_pressed = pressed;
+          if (!stick.connected()) continue;
+          const bool released = binding.pov
+                                    ? stick.pov(binding.pov_index) < 0
+                                    : !pressed;
+          const double axis = binding.is_button ? 0.0 : stick.axis(binding.axis);
+          neutral = neutral && released && std::isfinite(axis) &&
+                    std::abs(axis) <= binding.deadband_frac;
+        }
+        if (sub.commanding) {
+          TargetAccess::lane_release(node_, sub.lane_index);
+          sub.commanding = false;
+        }
+      }
+      armed_ = neutral;
+      return;
+    }
     const bool ds_ok = ds_.enabled() && ds_.teleop();
     for (auto& sub : subsystems_) {
       bool any_stick_connected = false;
@@ -326,7 +432,7 @@ class Teleop {
         continue;
       }
 
-      std::memset(sub.buffer.data(), 0, sub.buffer.size());
+      std::copy(sub.defaults.begin(), sub.defaults.end(), sub.buffer.begin());
       std::fill(sub.field_set.begin(), sub.field_set.end(), 0);
 
       bool any_live = false;
@@ -499,49 +605,7 @@ class Teleop {
           action.offset = rf.offset;
           action.size = detail::TypeSize(rf.base_type);
 
-          if (rf.base_type == reflection::BaseType::Bool) {
-            if (!std::holds_alternative<bool>(fv)) {
-              throw std::invalid_argument(
-                  field_where + ": field '" + rf.leaf_name +
-                  "' is bool but value is not a boolean");
-            }
-            action.bytes[0] =
-                static_cast<std::byte>(std::get<bool>(fv) ? 1 : 0);
-          } else if (rf.enum_def != nullptr) {
-            if (!std::holds_alternative<std::string>(fv)) {
-              throw std::invalid_argument(
-                  field_where + ": field '" + rf.leaf_name +
-                  "' is enum but value is not a string");
-            }
-            const std::string& label = std::get<std::string>(fv);
-            const reflection::EnumVal* ev = nullptr;
-            for (const auto* val : *rf.enum_def->values()) {
-              if (val->name()->str() == label) {
-                ev = val;
-                break;
-              }
-            }
-            if (ev == nullptr) {
-              throw std::invalid_argument(field_where +
-                                          ": unknown enum label '" + label +
-                                          "' in " + rf.enum_def->name()->str());
-            }
-            detail::EncodeIntegerBytes(action.bytes.data(), rf.base_type,
-                                       ev->value(), field_where);
-          } else {
-            double val = 0.0;
-            if (std::holds_alternative<int64_t>(fv)) {
-              val = static_cast<double>(std::get<int64_t>(fv));
-            } else if (std::holds_alternative<double>(fv)) {
-              val = std::get<double>(fv);
-            } else {
-              throw std::invalid_argument(
-                  field_where + ": field '" + rf.leaf_name +
-                  "' is numeric but value is not a number");
-            }
-            detail::EncodeNumericBytes(action.bytes.data(), rf.base_type, val,
-                                       field_where);
-          }
+          detail::EncodeAssignment(action, rf, fv, field_where);
 
           binding.button_fields.push_back(action);
         }
@@ -577,6 +641,44 @@ class Teleop {
 
       state.bindings.push_back(std::move(binding));
     }
+    state.defaults.resize(inner_bytes, std::byte{0});
+    const auto defaults_it = config.teleop_defaults.find(sub_name);
+    std::map<std::string, bool> default_fields;
+    if (defaults_it != config.teleop_defaults.end()) {
+      for (const auto& [path, value] : defaults_it->second) {
+        const std::string where = "[subsystems." + sub_name +
+                                  "] teleop.defaults." + path;
+        const auto rf = detail::ResolveField(*schema, *object, path, where);
+        detail::ButtonFieldAction action;
+        action.offset = rf.offset;
+        action.size = detail::TypeSize(rf.base_type);
+        detail::EncodeAssignment(action, rf, value, where);
+        std::memcpy(state.defaults.data() + action.offset, action.bytes.data(),
+                    action.size);
+        default_fields[path] = true;
+      }
+    }
+    std::vector<std::string> paths;
+    detail::ScalarPaths(*schema, *object, "", paths);
+    for (const auto& path : paths) {
+      // A lane publishes only while some binding is live, so a field is
+      // always written when every binding writes it.
+      const bool always_assigned =
+          std::all_of(bindings.begin(), bindings.end(), [&](const auto& binding) {
+            if (binding.axis) return binding.field == path;
+            const auto& assignments = binding.on_toggle.empty()
+                                          ? binding.while_held
+                                          : binding.on_toggle;
+            return std::any_of(assignments.begin(), assignments.end(),
+                               [&](const auto& entry) {
+                                 return entry.first == path;
+                               });
+          });
+      if (!always_assigned && !default_fields.contains(path)) {
+        throw std::invalid_argument(lane_topic + ": field '" + path +
+                                    "' requires an explicit teleop default");
+      }
+    }
     state.field_set.resize(field_ids.size(), 0);
     subsystems_.push_back(std::move(state));
   }
@@ -584,6 +686,8 @@ class Teleop {
   talos::Node& node_;
   talos::DriverStation ds_;
   std::vector<detail::SubsystemState> subsystems_;
+  bool armed_{false};
+  std::optional<talos::Time> last_evaluation_;
 };
 
 }  // namespace talos::teleop

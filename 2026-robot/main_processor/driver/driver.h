@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <numbers>
+#include <optional>
 
 #include "drivetrain/drive_message_generated.h"
 #include "drivetrain/topics.h"
@@ -42,13 +43,16 @@ class Driver {
           yaw_rad_ = s.yaw_rad();
           heading_at_ = node_.now();
           have_heading_ = true;
+          if (armed_ && translation_neutral_) translation_armed_ = true;
         });
   }
 
   // A Driver Station that stops talking gets the same one release per lane
   // as a disable, instead of the last request aging out downstream.
   void update() {
+    CheckEvaluation();
     if (!ds_.connected()) Stop();
+    if (field_oriented_ && !FreshHeading()) translation_armed_ = false;
   }
 
  private:
@@ -60,9 +64,26 @@ class Driver {
         std::chrono::duration<double>{std::isfinite(s) && s > 0 ? s : 0.1});
   }
 
+  bool FreshHeading() const {
+    return have_heading_ && node_.now() - heading_at_ < heading_timeout_;
+  }
+
+  void CheckEvaluation() {
+    const auto now = node_.now();
+    if (last_evaluation_ &&
+        now - *last_evaluation_ >=
+            talos::detail::NodeAccess::freshness_timeout(node_)) {
+      Stop();
+    }
+    last_evaluation_ = now;
+  }
+
   // One release on the falling edge, so the drivetrain drops teleop at once
   // rather than timing the last request out.
   void Stop() {
+    armed_ = false;
+    translation_armed_ = false;
+    translation_neutral_ = false;
     holding_heading_ = false;
     if (!commanding_) return;
     commanding_ = false;
@@ -70,6 +91,7 @@ class Driver {
   }
 
   void OnDriver() {
+    CheckEvaluation();
     const talos::Joystick stick = ds_.joystick(0);
     // Each Target also gates on mode, but a producer that keeps talking while
     // disabled would still be publishing live requests onto its lanes.
@@ -81,15 +103,36 @@ class Driver {
 
     const bool rezero =
         rezero_button_id_ > 0 && stick.button(rezero_button_id_);
+    const double raw_x = -stick.axis(1);
+    const double raw_y = -stick.axis(0);
+    const double raw_rotation = -stick.axis(2);
+    const double magnitude = std::hypot(raw_x, raw_y);
+    const bool translation_neutral =
+        std::isfinite(magnitude) && magnitude <= deadband_frac_;
+    const bool neutral = translation_neutral &&
+                         std::isfinite(raw_rotation) &&
+                         std::abs(raw_rotation) <= deadband_frac_ && !rezero;
+    if (!std::isfinite(magnitude) || !std::isfinite(raw_rotation)) {
+      Stop();
+      return;
+    }
+    translation_neutral_ = translation_neutral;
+    if (!armed_) {
+      // Seed edge history from the snapshot; a held button is not a press.
+      rezero_pressed_ = rezero;
+      armed_ = neutral;
+      translation_armed_ = neutral && FreshHeading();
+      return;
+    }
     if (rezero && !rezero_pressed_ && have_heading_) {
       yaw_offset_rad_ = yaw_rad_;
       hold_yaw_rad_ = yaw_rad_;
       holding_heading_ = true;
     }
     rezero_pressed_ = rezero;
-    const double raw_x = -stick.axis(1);
-    const double raw_y = -stick.axis(0);
-    const double magnitude = std::hypot(raw_x, raw_y);
+    const bool fresh_heading = FreshHeading();
+    if (!fresh_heading) translation_armed_ = false;
+    if (fresh_heading && translation_neutral) translation_armed_ = true;
     const double linear_scale =
         magnitude > 0 ? talos::teleop::Deadband(std::min(magnitude, 1.0),
                                                 deadband_frac_) *
@@ -97,10 +140,8 @@ class Driver {
                       : 0.0;
     double vx = raw_x * linear_scale;
     double vy = raw_y * linear_scale;
-    double omega = talos::teleop::Deadband(-stick.axis(2), deadband_frac_) *
+    double omega = talos::teleop::Deadband(raw_rotation, deadband_frac_) *
                    max_angular_radps_;
-    const bool fresh_heading =
-        have_heading_ && node_.now() - heading_at_ < heading_timeout_;
     if (fresh_heading) {
       if (omega != 0 || !holding_heading_) hold_yaw_rad_ = yaw_rad_;
       if (omega == 0 && holding_heading_) {
@@ -113,9 +154,12 @@ class Driver {
     } else {
       holding_heading_ = false;
     }
-    // Field-relative sticks need a fresh heading; without one, drive
-    // robot-relative rather than on a stale or assumed yaw.
-    if (field_oriented_ && fresh_heading) {
+    // Never reinterpret a field-relative request in a different frame.
+    // Recovery requires a fresh heading and a centred translation stick.
+    if (field_oriented_ && !translation_armed_) {
+      vx = 0;
+      vy = 0;
+    } else if (field_oriented_) {
       if (ds_.alliance() == talos::driver_station::Alliance::kRed) {
         vx = -vx;
         vy = -vy;
@@ -147,6 +191,10 @@ class Driver {
   talos::Time heading_at_{};
   bool have_heading_ = false;
   bool commanding_ = false;
+  bool armed_ = false;
+  bool translation_armed_ = false;
+  bool translation_neutral_ = false;
+  std::optional<talos::Time> last_evaluation_;
 };
 
 }  // namespace driver

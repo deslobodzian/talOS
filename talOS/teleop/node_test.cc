@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "control/control_generated.h"
 #include "schema_test/shapes_generated.h"
@@ -92,6 +93,9 @@ command_timeout_us = 100000
 [subsystems.roller]
 period_us = 20000
 
+[subsystems.roller.teleop]
+defaults = { feedforward_v = 0.0 }
+
 [[subsystems.roller.teleop.bindings]]
 button = 1
 while_held = { velocity_rps = 60.0 }
@@ -106,6 +110,7 @@ TEST(TeleopNode, ButtonDrivesLaneWithEncodedValue) {
   sim.add<Teleop>("teleop");
   SimHardware hw{sim};
   hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
 
   // Initially not pressed
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 0)));
@@ -131,7 +136,9 @@ TEST(TeleopNode, PovAndToggleEdgesResetOnSafetyTransitions) {
       SCOPED_TRACE(trigger + action);
       std::string config =
           "[robot]\nperiod_us = 20000\ncommand_timeout_us = 100000\n"
-          "[subsystems.roller]\n[[subsystems.roller.teleop.bindings]]\n";
+          "[subsystems.roller]\n[subsystems.roller.teleop]\n"
+          "defaults = { feedforward_v = 0.0 }\n"
+          "[[subsystems.roller.teleop.bindings]]\n";
       config.append(trigger);
       config.append("\n");
       config.append(action);
@@ -141,6 +148,7 @@ TEST(TeleopNode, PovAndToggleEdgesResetOnSafetyTransitions) {
       sim.add<Teleop>("teleop");
       SimHardware hw{sim};
       hw.enable();
+      Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
       auto packet = [&](bool pressed, std::uint32_t flags = kTeleopEnabled,
                         bool connected = true) {
         auto stick = MakeStick(0, 0, 0, pressed ? 1 : 0, connected);
@@ -199,6 +207,9 @@ command_timeout_us = 100000
 [subsystems.mechanism]
 period_us = 20000
 
+[subsystems.mechanism.teleop]
+defaults = { sample_count = 0, speed_frac = 0.0 }
+
 [[subsystems.mechanism.teleop.bindings]]
 button = 2
 while_held = { flag = true, position_m = 3.5, level = "TOP", "inner/mode" = "HIGH", "inner/offset_m" = 1.25 }
@@ -213,6 +224,7 @@ TEST(TeleopNode, RichStructFieldEncoding) {
   sim.add<Teleop>("teleop");
   SimHardware hw{sim};
   hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
 
   // Button 2 (bit 1: mask 2)
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 2)));
@@ -235,6 +247,9 @@ command_timeout_us = 100000
 [subsystems.roller]
 period_us = 20000
 
+[subsystems.roller.teleop]
+defaults = { feedforward_v = 0.0 }
+
 [[subsystems.roller.teleop.bindings]]
 button = 1
 while_held = { velocity_rps = 10.0 }
@@ -253,6 +268,7 @@ TEST(TeleopNode, PrecedenceBetweenTwoBindingsOnOneField) {
   sim.add<Teleop>("teleop");
   SimHardware hw{sim};
   hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
 
   // Both button 1 and button 2 held (mask 3: bits 0 and 1)
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 3)));
@@ -284,6 +300,9 @@ command_timeout_us = 100000
 [subsystems.arm]
 period_us = 20000
 
+[subsystems.arm.teleop]
+defaults = { feedforward_v = 0.0 }
+
 [[subsystems.arm.teleop.bindings]]
 axis = 0
 field = "velocity_rps"
@@ -300,6 +319,7 @@ TEST(TeleopNode, AxisDeadbandEdgeAndContinuousScaling) {
   sim.add<Teleop>("teleop");
   SimHardware hw{sim};
   hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
 
   // Inside deadband (|axis| = 0.0625 <= 0.125) -> none live -> released
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.0625f)));
@@ -345,6 +365,10 @@ TEST(TeleopNode, OverflowingAxisOutputReleasesEntireLaneAndRecovers) {
     const std::string config =
         "[robot]\nperiod_us = 20000\ncommand_timeout_us = 100000\n"
         "[subsystems.mechanism]\n"
+        "[subsystems.mechanism.teleop]\n"
+        "defaults = { flag = false, position_m = 0.0, level = 'NONE', "
+        "sample_count = 0, speed_frac = 0.0, "
+        "'inner/mode' = 'OFF', 'inner/offset_m' = 0.0 }\n"
         "[[subsystems.mechanism.teleop.bindings]]\n"
         "button = 1\nwhile_held = { flag = true }\n"
         "[[subsystems.mechanism.teleop.bindings]]\n"
@@ -355,6 +379,7 @@ TEST(TeleopNode, OverflowingAxisOutputReleasesEntireLaneAndRecovers) {
     sim.add<Teleop>("teleop");
     SimHardware hw{sim};
     hw.enable();
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
 
     auto push = [&](float axis, std::uint32_t flags = kTeleopEnabled) {
       Push(hw, sim, DsPacket(flags, MakeStick(axis, 0, 0, 1)));
@@ -377,6 +402,9 @@ TEST(TeleopNode, OverflowingAxisOutputReleasesEntireLaneAndRecovers) {
     push(0.001f, ds::kTeleop | ds::kDsAttached);
     EXPECT_FALSE(mechanism.seen);
     push(0.001f);
+    EXPECT_FALSE(mechanism.seen);
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+    push(0.001f);
     EXPECT_TRUE(mechanism.seen);
     hw.stop_driver_station();
     sim.step(150ms);
@@ -390,6 +418,7 @@ TEST(TeleopNode, DisabledRobotReleasesOnceAndSendsNoFurtherMessages) {
   sim.add<Teleop>("teleop");
   SimHardware hw{sim};
   hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
 
   // Enabled, button 1 pressed
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 1)));
@@ -434,6 +463,7 @@ TEST(TeleopNode, StaleDriverStationReleasesLane) {
   sim.add<Teleop>("teleop");
   SimHardware hw{sim};
   hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
 
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 1)));
   ASSERT_TRUE(roller.seen.has_value());
@@ -449,6 +479,7 @@ TEST(TeleopNode, StickDisconnectedReleasesLaneOnce) {
   sim.add<Teleop>("teleop");
   SimHardware hw{sim};
   hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
 
   Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 1)));
   ASSERT_TRUE(roller.seen.has_value());
@@ -469,6 +500,251 @@ TEST(TeleopNode, StickDisconnectedReleasesLaneOnce) {
   sim.step(40ms);
   sim.step(40ms);
   EXPECT_EQ(lane_count(), count_after_release);
+
+  // Reconnecting with the button already held is not fresh input.
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 1)));
+  EXPECT_FALSE(roller.seen.has_value());
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 1)));
+  EXPECT_TRUE(roller.seen.has_value());
+}
+
+TEST(TeleopNode, AbsentSpareControllerDoesNotBlockRearm) {
+  std::string config{kRollerToml};
+  const std::string marker{"[subsystems.teleop]"};
+  config.insert(config.find(marker),
+                "[[subsystems.roller.teleop.bindings]]\nport = 1\nbutton = 2\n"
+                "while_held = { velocity_rps = 5.0 }\n\n");
+  Sim sim = MakeSim(config);
+  auto& roller = sim.add<ConsumerNode<control::VelocityTarget>>("roller");
+  sim.add<Teleop>("teleop");
+  SimHardware hw{sim};
+  hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 1)));
+  ASSERT_TRUE(roller.seen.has_value());
+  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
+}
+
+TEST(TeleopNode, StartupHeldTriggerDoesNotCommandOrSynthesizeToggle) {
+  for (const std::string action : {"while_held", "on_toggle"}) {
+    std::string config{kRollerToml};
+    config.replace(config.find("while_held"), std::string{"while_held"}.size(),
+                   action);
+    Sim sim = MakeSim(config);
+    auto& roller = sim.add<ConsumerNode<control::VelocityTarget>>("roller");
+    sim.add<Teleop>("teleop");
+    SimHardware hw{sim};
+    hw.enable();
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 1)));
+    EXPECT_FALSE(roller.seen);
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+    EXPECT_FALSE(roller.seen);
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 1)));
+    ASSERT_TRUE(roller.seen);
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+    EXPECT_EQ(roller.seen.has_value(), action == "on_toggle");
+  }
+}
+
+TEST(TeleopNode, BoundPovMustBeReleasedBeforeArmingEvenFromAnotherDirection) {
+  for (const std::string action : {"while_held", "on_toggle"}) {
+    std::string config{kRollerToml};
+    config.replace(config.find("button = 1"), std::string{"button = 1"}.size(),
+                   "pov = 90");
+    config.replace(config.find("while_held"), std::string{"while_held"}.size(),
+                   action);
+    Sim sim = MakeSim(config);
+    auto& roller = sim.add<ConsumerNode<control::VelocityTarget>>("roller");
+    sim.add<Teleop>("teleop");
+    SimHardware hw{sim};
+    hw.enable();
+    const auto packet = [&](int angle) {
+      auto stick = MakeStick();
+      stick.pov_count = 1;
+      stick.povs[0] = angle;
+      Push(hw, sim, DsPacket(kTeleopEnabled, stick));
+    };
+    packet(0);  // A different direction is still not a released POV.
+    EXPECT_FALSE(roller.seen);
+    packet(90);
+    EXPECT_FALSE(roller.seen);
+    packet(-1);
+    EXPECT_FALSE(roller.seen);
+    packet(90);
+    ASSERT_TRUE(roller.seen);
+    EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
+  }
+}
+
+TEST(TeleopNode, HeldAxisMustReturnToNeutralAfterDsLossOrDisable) {
+  Sim sim = MakeSim(kAxisToml);
+  auto& arm = sim.add<ConsumerNode<control::VelocityTarget>>("arm");
+  sim.add<Teleop>("teleop");
+  SimHardware hw{sim};
+  hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1)));
+  EXPECT_FALSE(arm.seen);
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1)));
+  ASSERT_TRUE(arm.seen);
+  for (const bool stale : {false, true}) {
+    if (stale) {
+      hw.stop_driver_station();
+      sim.step(150ms);
+    } else {
+      Push(hw, sim, DsPacket(ds::kTeleop | ds::kDsAttached, MakeStick(1)));
+    }
+    EXPECT_FALSE(arm.seen);
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1)));
+    EXPECT_FALSE(arm.seen);
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+    EXPECT_FALSE(arm.seen);
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1)));
+    ASSERT_TRUE(arm.seen);
+  }
+}
+
+struct PausableTeleop {
+  explicit PausableTeleop(talos::Node& node) : teleop{node} {}
+  void update() {
+    if (!paused) teleop.update();
+  }
+  Teleop teleop;
+  bool paused{false};
+};
+
+TEST(TeleopNode, OwnEvaluationGapRequiresNeutralEvenWithFreshDs) {
+  Sim sim = MakeSim(kAxisToml);
+  auto& arm = sim.add<ConsumerNode<control::VelocityTarget>>("arm");
+  auto& teleop = sim.add<PausableTeleop>("teleop");
+  SimHardware hw{sim};
+  hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1)));
+  ASSERT_TRUE(arm.seen);
+  teleop.paused = true;
+  sim.step(150ms);
+  teleop.paused = false;
+  sim.step(60ms);
+  EXPECT_FALSE(arm.seen);
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1)));
+  ASSERT_TRUE(arm.seen);
+}
+
+constexpr const char* kPartialToml = R"(
+[robot]
+period_us = 20000
+[subsystems.mechanism.teleop]
+defaults = { flag = false, position_m = 2.0, level = "BOTTOM", sample_count = 7, speed_frac = 0.5, "inner/mode" = "LOW", "inner/offset_m" = 1.25 }
+[[subsystems.mechanism.teleop.bindings]]
+button = 1
+while_held = { position_m = 3.5 }
+[subsystems.teleop]
+)";
+
+TEST(TeleopNode, PartialBindingPublishesExplicitDefaultsIncludingNestedFields) {
+  Sim sim = MakeSim(kPartialToml);
+  auto& mechanism = sim.add<ConsumerNode<schema_test::Mixed>>("mechanism");
+  sim.add<Teleop>("teleop");
+  SimHardware hw{sim};
+  hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+  EXPECT_FALSE(mechanism.seen);
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 1)));
+  ASSERT_TRUE(mechanism.seen);
+  EXPECT_DOUBLE_EQ(mechanism.seen->position_m(), 3.5);
+  EXPECT_FALSE(mechanism.seen->flag());
+  EXPECT_EQ(mechanism.seen->level(), schema_test::Level::BOTTOM);
+  EXPECT_EQ(mechanism.seen->sample_count(), 7u);
+  EXPECT_FLOAT_EQ(mechanism.seen->speed_frac(), 0.5f);
+  EXPECT_EQ(mechanism.seen->inner().mode(), schema_test::Mode::LOW);
+  EXPECT_FLOAT_EQ(mechanism.seen->inner().offset_m(), 1.25f);
+}
+
+TEST(TeleopNode, MissingDefaultNamesLaneAndUnassignedField) {
+  std::string config{kPartialToml};
+  const std::string assignment{", \"inner/offset_m\" = 1.25"};
+  config.erase(config.find(assignment), assignment.size());
+  Sim sim = MakeSim(config);
+  sim.add<ConsumerNode<schema_test::Mixed>>("mechanism");
+  try {
+    sim.add<Teleop>("teleop");
+    FAIL() << "expected missing default error";
+  } catch (const std::invalid_argument& error) {
+    EXPECT_NE(std::string{error.what()}.find(
+                  "/mechanism/target/teleop: field 'inner/offset_m'"),
+              std::string::npos);
+  }
+}
+
+TEST(TeleopNode, IdleAxisCannotCoverAFieldNeededByAnotherLiveBinding) {
+  std::string config{kRollerToml};
+  config.insert(config.find("[subsystems.teleop]"),
+                "[[subsystems.roller.teleop.bindings]]\naxis = 0\n"
+                "field = 'feedforward_v'\nscale = 2.0\n\n");
+  Sim sim = MakeSim(config);
+  sim.add<ConsumerNode<control::VelocityTarget>>("roller");
+  try {
+    sim.add<Teleop>("teleop");
+    FAIL() << "expected missing default error";
+  } catch (const std::invalid_argument& error) {
+    EXPECT_NE(std::string{error.what()}.find(
+                  "/roller/target/teleop: field 'velocity_rps'"),
+              std::string::npos);
+  }
+}
+
+TEST(TeleopNode, DefaultsCoverEachIndependentLiveBindingCombination) {
+  std::string config{kRollerToml};
+  const std::string defaults{"defaults = { feedforward_v = 0.0 }"};
+  config.replace(config.find(defaults), defaults.size(),
+                 "defaults = { velocity_rps = 0.0, feedforward_v = 1.5 }");
+  config.insert(config.find("[subsystems.teleop]"),
+                "[[subsystems.roller.teleop.bindings]]\naxis = 0\n"
+                "field = 'feedforward_v'\nscale = 2.0\n\n");
+  Sim sim = MakeSim(config);
+  auto& roller = sim.add<ConsumerNode<control::VelocityTarget>>("roller");
+  sim.add<Teleop>("teleop");
+  SimHardware hw{sim};
+  hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0, 0, 0, 1)));
+  ASSERT_TRUE(roller.seen);
+  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
+  EXPECT_DOUBLE_EQ(roller.seen->feedforward_v(), 1.5);
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1)));
+  ASSERT_TRUE(roller.seen);
+  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 0.0);
+  EXPECT_DOUBLE_EQ(roller.seen->feedforward_v(), 2.0);
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1, 0, 0, 1)));
+  ASSERT_TRUE(roller.seen);
+  EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
+  EXPECT_DOUBLE_EQ(roller.seen->feedforward_v(), 2.0);
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+  EXPECT_FALSE(roller.seen);
+}
+
+TEST(TeleopNode, DefaultsShareAssignmentSchemaValidation) {
+  constexpr std::pair<std::string_view, std::string_view> kInvalidDefaults[]{
+      {"position_m = 2.0", "position_m = 'fast'"},
+      {"position_m = 2.0", "position_m = nan"},
+      {"position_m = 2.0", "position_m = inf"},
+      {"speed_frac = 0.5", "speed_frac = 1e40"},
+      {"sample_count = 7", "sample_count = -1"},
+      {"flag = false", "flag = 1"},
+      {"level = \"BOTTOM\"", "level = 'UNKNOWN'"},
+      {"\"inner/mode\" = \"LOW\"", "\"inner/mode\" = 0"},
+  };
+  for (const auto& [assignment, replacement] : kInvalidDefaults) {
+    SCOPED_TRACE(replacement);
+    std::string config{kPartialToml};
+    config.replace(config.find(assignment), assignment.size(), replacement);
+    Sim sim = MakeSim(config);
+    sim.add<ConsumerNode<schema_test::Mixed>>("mechanism");
+    EXPECT_THROW(sim.add<Teleop>("teleop"), std::invalid_argument);
+  }
 }
 
 // --- Construction error tests ---

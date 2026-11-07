@@ -62,7 +62,8 @@ constexpr std::uint32_t kTeleopEnabled =
 // else, so every other setting is the compiled default.
 class Harness {
  public:
-  explicit Harness(std::string_view keys = "")
+  explicit Harness(std::string_view keys = "", bool prime = true,
+                   int period_us = 20000)
       : sim_{Sim::FromToml(std::string{R"(
 [robot]
 period_us = 5000
@@ -72,8 +73,9 @@ command_timeout_us = 100000
 can_id = 1
 
 [subsystems.driver]
-period_us = 20000
-)"} + std::string{keys})} {}
+)"} + "period_us = " + std::to_string(period_us) + "\n" + std::string{keys})} {
+    if (prime) Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+  }
 
   // SimHardware forwards this packet every robot period from now on.
   void Push(const ds::DriverStationData& state) {
@@ -82,6 +84,7 @@ period_us = 20000
   }
   // The bridge goes silent: no more Driver Station packets.
   void Silence() { hw_.reset(); }
+  void Reconnect() { hw_ = std::make_unique<SimHardware>(sim_); }
   void PublishHeading(double yaw_rad, bool yaw_valid = true) {
     sim_.publish(
         drivetrain::topics::kState,
@@ -225,40 +228,29 @@ TEST(Driver, HeadingWithinTimeoutStaysFieldOriented) {
   EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
 }
 
-TEST(Driver, WithoutAFreshFiniteHeadingDrivesRobotRelative) {
-  // Rotating by an assumed or stale yaw looks right only while the robot
-  // happens to face that way, so the request passes through untouched.
-  const auto robot_relative = [](Harness& harness) {
-    harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
-    EXPECT_NEAR(harness.chassis().vx_mps(), kMaxLinear, 1e-9);
-    EXPECT_NEAR(harness.chassis().vy_mps(), 0.0, 1e-9);
+TEST(Driver, WithoutAFreshFiniteHeadingStopsTranslationButKeepsRotation) {
+  const auto blocked = [](Harness& harness) {
+    harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, -0.5f)));
+    EXPECT_DOUBLE_EQ(harness.chassis().vx_mps(), 0.0);
+    EXPECT_DOUBLE_EQ(harness.chassis().vy_mps(), 0.0);
+    EXPECT_DOUBLE_EQ(harness.chassis().omega_radps(), 3.0);
   };
-  {
-    Harness never{kNoDeadbandFieldOriented};  // no heading yet
-    robot_relative(never);
-  }
-  {
-    Harness stale{kNoDeadbandFieldOriented};
-    stale.PublishHeading(kQuarterTurnRad);
-    stale.Advance(1s);
-    robot_relative(stale);
-  }
-  {
-    Harness nan{kNoDeadbandFieldOriented};
-    nan.PublishHeading(std::numeric_limits<double>::quiet_NaN());
-    robot_relative(nan);
-  }
-  {
-    // The drivetrain publishes every tick; one whose gyro is gone says so.
-    Harness no_gyro{kNoDeadbandFieldOriented};
-    no_gyro.PublishHeading(kQuarterTurnRad, /*yaw_valid=*/false);
-    robot_relative(no_gyro);
-  }
-  {
-    Harness off{kNoDeadbandRobotRelative};
-    off.PublishHeading(kQuarterTurnRad);
-    robot_relative(off);
-  }
+  Harness never{kNoDeadbandFieldOriented};
+  blocked(never);
+  Harness stale{kNoDeadbandFieldOriented};
+  stale.PublishHeading(kQuarterTurnRad);
+  stale.Advance(1s);
+  blocked(stale);
+  Harness nan{kNoDeadbandFieldOriented};
+  nan.PublishHeading(std::numeric_limits<double>::quiet_NaN());
+  blocked(nan);
+  Harness no_gyro{kNoDeadbandFieldOriented};
+  no_gyro.PublishHeading(kQuarterTurnRad, /*yaw_valid=*/false);
+  blocked(no_gyro);
+  Harness off{kNoDeadbandRobotRelative};
+  off.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, -0.5f)));
+  EXPECT_DOUBLE_EQ(off.chassis().vx_mps(), kMaxLinear);
+  EXPECT_DOUBLE_EQ(off.chassis().omega_radps(), 3.0);
 }
 
 TEST(Driver, InvalidHeadingsDoNotKeepAnOldOneFresh) {
@@ -268,16 +260,24 @@ TEST(Driver, InvalidHeadingsDoNotKeepAnOldOneFresh) {
   harness.PublishHeading(kQuarterTurnRad);
   for (int i = 0; i < 20; ++i) harness.PublishHeading(0.0, false);
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
-  EXPECT_NEAR(harness.chassis().vx_mps(), kMaxLinear, 1e-9);
+  EXPECT_NEAR(harness.chassis().vx_mps(), 0.0, 1e-9);
   EXPECT_NEAR(harness.chassis().vy_mps(), 0.0, 1e-9);
 }
 
-TEST(Driver, AFreshHeadingResumesFieldOrientedAfterStale) {
+TEST(Driver, FreshHeadingRequiresNeutralTranslationBeforeResuming) {
   Harness harness{kNoDeadbandFieldOriented};
   harness.PublishHeading(kQuarterTurnRad);
-  harness.Advance(1s);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, -0.5f)));
+  EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
+  harness.Advance(150ms);
+  EXPECT_DOUBLE_EQ(harness.chassis().vx_mps(), 0.0);
+  EXPECT_DOUBLE_EQ(harness.chassis().vy_mps(), 0.0);
+  EXPECT_DOUBLE_EQ(harness.chassis().omega_radps(), 3.0);
   harness.PublishHeading(kQuarterTurnRad);
-  harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
+  EXPECT_DOUBLE_EQ(harness.chassis().vx_mps(), 0.0);
+  EXPECT_DOUBLE_EQ(harness.chassis().vy_mps(), 0.0);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, -0.5f)));
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, -0.5f)));
   EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
 }
 
@@ -289,7 +289,7 @@ TEST(Driver, RequestsNothingWhenDisabledAutonomousOrDisconnected) {
       {kTeleopEnabled, Stick(0, -0.9f, 0, 0, /*connected=*/false)},
   };
   for (const auto& [flags, stick] : cases) {
-    Harness harness{kNoDeadbandRobotRelative};
+    Harness harness{kNoDeadbandRobotRelative, false};
     harness.Push(DsState(flags, stick));
     EXPECT_EQ(harness.chassis_count(), 0u);
   }
@@ -329,10 +329,72 @@ TEST(Driver, ASilentDriverStationReleasesLaneOnce) {
 TEST(Driver, RequestsNothingWithoutTheDsAttachedFlag) {
   // Enabled teleop flags from a packet that does not say the DS is attached
   // read as disabled.
-  Harness harness{kNoDeadbandRobotRelative};
+  Harness harness{kNoDeadbandRobotRelative, false};
   harness.Push(DsState(ds::kEnabled | ds::kTeleop, Stick(0, -0.9f, 0)));
   harness.Advance(100ms);
   EXPECT_EQ(harness.chassis_count(), 0u);
+}
+
+TEST(Driver, StartupHeldAxesOrRezeroCannotArmProducer) {
+  for (const auto& held :
+       {Stick(0, -1, 0), Stick(0, 0, -1), Stick(0, 0, 0, 1)}) {
+    Harness harness{kNoDeadbandRobotRelative, false};
+    harness.Push(DsState(kTeleopEnabled, held));
+    EXPECT_EQ(harness.chassis_count(), 0u);
+    harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+    harness.Push(DsState(kTeleopEnabled, Stick(0, -1, 0)));
+    EXPECT_DOUBLE_EQ(harness.chassis().vx_mps(), kMaxLinear);
+  }
+}
+
+TEST(Driver, FreshHeadingCannotArmAStartupHeldFieldRelativeStick) {
+  Harness harness{kNoDeadbandFieldOriented, false};
+  const auto held = DsState(kTeleopEnabled, Stick(0, -1, -0.5f));
+  harness.Push(held);
+  EXPECT_EQ(harness.chassis_count(), 0u);
+  harness.PublishHeading(kQuarterTurnRad);
+  EXPECT_EQ(harness.chassis_count(), 0u);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+  harness.Push(held);
+  EXPECT_NEAR(harness.chassis().vx_mps(), 0.0, 1e-9);
+  EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
+  EXPECT_DOUBLE_EQ(harness.chassis().omega_radps(), 3.0);
+}
+
+TEST(Driver, HeldStickDoesNotResumeAfterDsLossOrDisable) {
+  Harness harness{kNoDeadbandRobotRelative};
+  for (const bool stale : {false, true}) {
+    harness.Push(DsState(kTeleopEnabled, Stick(0, -1, 0)));
+    ASSERT_TRUE(harness.chassis_active());
+    if (stale) {
+      harness.Silence();
+      harness.Advance(150ms);
+      harness.Reconnect();
+    } else {
+      harness.Push(DsState(ds::kDsAttached, Stick(0, -1, 0)));
+    }
+    harness.Push(DsState(kTeleopEnabled, Stick(0, -1, 0)));
+    EXPECT_FALSE(harness.chassis_active());
+    harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+    harness.Push(DsState(kTeleopEnabled, Stick(0, -1, 0)));
+    EXPECT_DOUBLE_EQ(harness.chassis().vx_mps(), kMaxLinear);
+  }
+}
+
+TEST(Driver, OwnEvaluationGapRequiresNeutralWithoutObservingStaleDs) {
+  // No periodic update runs in this gap. The next evaluation receives a
+  // fresh DS packet, just as a suspended process would on resumption.
+  Harness harness{kNoDeadbandRobotRelative, true, 200000};
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1, 0)));
+  ASSERT_TRUE(harness.chassis_active());
+  harness.Silence();
+  harness.Advance(150ms);
+  harness.Reconnect();
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1, 0)));
+  EXPECT_FALSE(harness.chassis_active());
+  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1, 0)));
+  EXPECT_DOUBLE_EQ(harness.chassis().vx_mps(), kMaxLinear);
 }
 
 // --- the teleop chain on the real robot config ---------------------------
@@ -379,7 +441,13 @@ class TeleopChain : public ::testing::Test {
   const drivetrain::SwerveGeometry geometry = drivetrain::BuildSwerveGeometry(
       talos::config::ParseRobotConfig(RobotConfig()), "drivetrain");
 
-  void SetUp() override { hw.enable(); }
+  void SetUp() override {
+    hw.enable();
+    // ClockOffset requires 8 hardware samples (40 ms at 5 ms) before
+    // sample_time() and the drivetrain's gyro heading become valid.
+    Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+    Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+  }
 };
 
 TEST_F(TeleopChain, JoystickDeflectionReachesTheSwerveModulesAsVelocity) {
@@ -431,6 +499,9 @@ TEST_F(TeleopChain, DisablingOrLosingTheDriverStationStopsTheModules) {
             talos::hardware::Mode::kVelocity);
   Push(DsState(ds::kDsAttached, Stick(0, -1.0f, 0)));
   ExpectModulesNeutral();
+  Push(ForwardStick());
+  ExpectModulesNeutral();  // Held sticks cannot resume after disable.
+  Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
 
   Push(ForwardStick());
   ASSERT_EQ(hw.motor_request("drivetrain", geometry.modules[0].drive).mode,
