@@ -13,6 +13,7 @@
 #include "talOS/devices/devices.h"
 #include "talOS/devices/testing.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/hardware/packet.h"
 #include "talOS/node/access.h"
 #include "talOS/node/sim_access.h"
 #include "talOS/node/testing.h"
@@ -188,6 +189,43 @@ TEST_F(TargetTest, TargetQueuedBeforeTheModeChangeIsRejectedInTheSameDrain) {
   sim.step(5ms);
   EXPECT_EQ(Seen(), std::nullopt);
   EXPECT_EQ(lift.source, "");
+}
+
+TEST_F(TargetTest, FlapBetweenPublishedSamplesRejectsTheOldGeneration) {
+  hw.stop_driver_station();
+  ds::ModeTracker tracker;
+  auto publish_ds = [&] {
+    auto data = DsPacket(kTeleop);
+    data.sample_time_us = static_cast<uint64_t>(sim.now().nanos() / 1000);
+    tracker.Stamp(data);
+    hardware::Packet packet{};
+    packet.size = static_cast<uint32_t>(ds::Encode(data, packet.data));
+    sim.publish(hardware::kDriverStationTopic, packet);
+    return data.mode_since_us;
+  };
+
+  const uint64_t before = publish_ds();
+  PublishTarget(sim, "lift", "teleop", Goal{1.0}, before);
+  sim.step(5ms);
+  ASSERT_EQ(Seen(), 1.0);
+
+  // No DS packet is published during these two hardware observations.
+  tracker.Observe(ds::kDsAttached | ds::kTeleop,
+                  static_cast<uint64_t>(sim.now().nanos() / 1000));
+  sim.step(5ms);
+  tracker.Observe(ds::kDsAttached | kTeleop,
+                  static_cast<uint64_t>(sim.now().nanos() / 1000));
+  sim.step(10ms);
+  const uint64_t after = publish_ds();  // 20 ms after the previous packet
+  ASSERT_GT(after, before);
+  // Still fresh, but stamped before the unreported disable/re-enable.
+  PublishTarget(sim, "lift", "teleop", Goal{2.0}, before);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), std::nullopt);
+
+  PublishTarget(sim, "lift", "teleop", Goal{3.0}, after);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), 3.0);
 }
 
 TEST_F(TargetTest, TargetOfTheNewGenerationIsAcceptedInTheSameDrain) {

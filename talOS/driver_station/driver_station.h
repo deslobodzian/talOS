@@ -95,10 +95,9 @@ struct FmsData {
 
 struct DriverStationData {
   uint64_t sample_time_us{0};
-  // The mode generation: the sample_time_us of the first sample in the
-  // current mode (ModeKey of the flags), never 0. Stamped by the sampler's
-  // ModeTracker; a packet that never went through one carries 0, which no
-  // target accepts.
+  // The mode generation: the time of the first observation in the current
+  // mode (ModeKey of the flags), never 0. Stamped by the sampler's ModeTracker;
+  // a packet that never went through one carries 0, which no target accepts.
   uint64_t mode_since_us{0};
   FmsData fms{};
   std::array<JoystickData, kMaxJoysticks> joysticks{};
@@ -106,20 +105,23 @@ struct DriverStationData {
   bool operator==(const DriverStationData&) const = default;
 };
 
-// What every Driver Station sampler (the RoboRIO program, SimHardware,
-// send_joystick) runs on each sample before encoding it, so a target issued
-// under an earlier enable or mode can be told from one issued under this one
-// (talOS/devices/target.h):
+// Tracks mode generations independently of packet publication. Every hardware
+// tick must Observe the same flags used to enable the gateway, even when no
+// Driver Station packet is due. Stamp also observes its sample, so samplers
+// without a faster hardware tick can simply stamp each packet before encoding.
 //
-//   DriverStationData ds = Sample(now_us);
-//   tracker.Stamp(ds);
-//   Encode(ds, buffer);
+//   tracker.Observe(flags, now_us);
+//   if (sample_due) {
+//     DriverStationData ds = Sample(now_us);
+//     tracker.Stamp(ds);
+//     Encode(ds, buffer);
+//   }
 //
-// Stamp sets ds.mode_since_us to the sample_time_us of the first sample whose
-// ModeKey differs from the previous sample's. Each new generation is at least
-// 1 and later than the one before, even if sample times repeat or step back.
+// Each new generation is at least 1 and later than the one before, even if
+// observation times repeat or step back.
 class ModeTracker {
  public:
+  void Observe(uint32_t flags, uint64_t now_us);
   void Stamp(DriverStationData& ds);
 
  private:

@@ -78,6 +78,7 @@ cc_test(
         ":target_test_message",
         ":testing",
         "//talOS/driver_station",
+        "//talOS/hardware",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
     ],

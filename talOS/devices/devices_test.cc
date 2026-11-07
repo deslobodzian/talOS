@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
@@ -345,6 +346,30 @@ TEST(Devices, DigitalAndPwmOutputsNeutralizeWhileDisabledOrStale) {
   EXPECT_DOUBLE_EQ(last_command.pwm_outputs[0].output, 0);
 }
 
+TEST(Devices, PwmClampsFiniteOutputsWithoutRejectingMotorCommands) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  mech.a_velocity = 10;
+  for (const auto [output, expected] :
+       {std::pair{2.0, 1.0}, std::pair{-2.0, -1.0},
+        std::pair{0.25, 0.25},
+        std::pair{std::numeric_limits<double>::infinity(), 0.0},
+        std::pair{std::numeric_limits<double>::quiet_NaN(), 0.0}}) {
+    SCOPED_TRACE(output);
+    mech.servo_out = output;
+    sim.step(10ms);
+    EXPECT_DOUBLE_EQ(hw.pwm("mech", "servo"), expected);
+    EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kVelocity);
+    EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, 10);
+    const auto command = LastCommand(sim);
+    ASSERT_TRUE(command.has_value());
+    ASSERT_EQ(command->pwm_output_count, 1);
+    EXPECT_DOUBLE_EQ(command->pwm_outputs[0].output, expected);
+  }
+}
+
 TEST(Devices, DigitalAndPwmOutputsRideAlongOnlyWhenSet) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
@@ -576,6 +601,22 @@ TEST(Devices, SampleTimeMapsTheStateThroughTheBridgesOffset) {
   ASSERT_FALSE(link.fresh());
   EXPECT_EQ(link.sample_time(), std::nullopt);
 }
+TEST(Devices, SampleTimeRejectsStaleBridgeStatusWithFreshHardware) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Watcher>("watcher");
+  auto& link = sim.node("watcher").extension<HardwareLink>();
+  const auto id = hardware::ConfigurationId(link.config().hardware);
+  sim.publish(::bridge::topics::kStatus, ClockStatus(7, 4'000'000, true));
+  sim.publish(hardware::kStateTopic, StatePacket(id, 1000, false));
+  sim.step(2ms);
+  ASSERT_TRUE(link.sample_time());
+  sim.step(110ms);
+  sim.publish(hardware::kStateTopic, StatePacket(id, 2000, false));
+  sim.step(2ms);
+  ASSERT_TRUE(link.fresh());
+  EXPECT_EQ(link.sample_time(), std::nullopt);
+}
+
 
 // SimHardware runs the bridge's filter: no sample time until it converges,
 // then the sim time each state was sampled at, whatever the gateway's own
@@ -862,6 +903,33 @@ TEST(Devices, DriverStationDropsACorruptPacket) {
   EXPECT_EQ(pilot.packets, 0);
   EXPECT_FALSE(pilot.ds.connected());
 }
+TEST(Devices, DriverStationRejectsReorderedSampleAndModeTimes) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& pilot = sim.add<Pilot>("watcher");
+  auto data = TeleopStick();
+  const auto publish = [&] {
+    Packet packet{};
+    packet.size = driver_station::Encode(data, packet.data);
+    sim.publish(hardware::kDriverStationTopic, packet);
+    sim.step(10ms);
+  };
+  data.sample_time_us = 200;
+  data.mode_since_us = 100;
+  publish();
+  ASSERT_EQ(pilot.packets, 1);
+  data.sample_time_us = 199;
+  publish();
+  data.sample_time_us = 201;
+  data.mode_since_us = 99;
+  publish();
+  EXPECT_EQ(pilot.packets, 1);
+  EXPECT_EQ(pilot.ds.data().sample_time_us, 200u);
+  EXPECT_EQ(pilot.ds.data().mode_since_us, 100u);
+  data.mode_since_us = 100;
+  publish();
+  EXPECT_EQ(pilot.packets, 2);
+}
+
 
 }  // namespace
 }  // namespace talos

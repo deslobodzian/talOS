@@ -92,13 +92,17 @@ struct Reader {
 };
 }  // namespace
 
-void ModeTracker::Stamp(DriverStationData& ds) {
-  const uint32_t key = ModeKey(ds.fms.flags);
+void ModeTracker::Observe(uint32_t flags, uint64_t now_us) {
+  const uint32_t key = ModeKey(flags);
   if (!have_ || key != key_) {
-    since_us_ = std::max({ds.sample_time_us, since_us_ + 1, uint64_t{1}});
+    since_us_ = std::max({now_us, since_us_ + 1, uint64_t{1}});
     key_ = key;
     have_ = true;
   }
+}
+
+void ModeTracker::Stamp(DriverStationData& ds) {
+  Observe(ds.fms.flags, ds.sample_time_us);
   ds.mode_since_us = since_us_;
 }
 

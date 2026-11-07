@@ -187,6 +187,41 @@ TEST(ModeTrackerTest, GenerationIsTheFirstSampleOfEachMode) {
   EXPECT_EQ(Stamp(tracker, 1140, kTeleopEnabled | kEStop), 1140u);
 }
 
+TEST(ModeTrackerTest, FlapBetweenPublishedSamplesStartsANewGeneration) {
+  ModeTracker tracker;
+  const uint64_t before = Stamp(tracker, 20000, kTeleopEnabled);
+  ASSERT_NE(before, 0u);
+
+  // Hardware ticks observe disable/re-enable before the next 20 ms packet.
+  tracker.Observe(kDsAttached | kTeleop, 25000);
+  tracker.Observe(kTeleopEnabled, 30000);
+  tracker.Observe(kTeleopEnabled, 35000);
+  const uint64_t after = Stamp(tracker, 40000, kTeleopEnabled);
+  EXPECT_EQ(after, 30000u);
+  EXPECT_GT(after, before);
+  EXPECT_EQ(Stamp(tracker, 60000, kTeleopEnabled), after);
+}
+
+TEST(ModeTrackerTest, SteadyHardwareTicksKeepThePublishedGeneration) {
+  ModeTracker tracker;
+  tracker.Observe(kTeleopEnabled, 20000);
+  for (uint64_t now_us = 25000; now_us <= 40000; now_us += 5000) {
+    tracker.Observe(kTeleopEnabled | kFmsAttached, now_us);
+  }
+  EXPECT_EQ(Stamp(tracker, 40000, kTeleopEnabled), 20000u);
+}
+
+TEST(ModeTrackerTest, EveryModeFlagObservedBetweenSamplesStartsAGeneration) {
+  for (const uint32_t bit :
+       {kDsAttached, kEnabled, kAutonomous, kTeleop, kTest, kEStop}) {
+    ModeTracker tracker;
+    const uint64_t before = Stamp(tracker, 20000, kTeleopEnabled);
+    tracker.Observe(kTeleopEnabled ^ bit, 25000);
+    tracker.Observe(kTeleopEnabled, 30000);
+    EXPECT_GT(Stamp(tracker, 40000, kTeleopEnabled), before) << bit;
+  }
+}
+
 TEST(ModeTrackerTest, EveryModeFlagStartsAGeneration) {
   for (const uint32_t bit :
        {kDsAttached, kEnabled, kAutonomous, kTeleop, kTest, kEStop}) {

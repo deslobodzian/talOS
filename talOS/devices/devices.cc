@@ -205,7 +205,7 @@ struct HardwareLink::Impl {
   }
   bool Enabled() const { return Fresh() && hardware::GatewayReady(state); }
   std::optional<Time> SampleTime() const {
-    if (!Fresh() || !bridge_status.has_value()) return std::nullopt;
+    if (!Fresh() || !bridge_status.fresh(timeout)) return std::nullopt;
     const ::bridge::BridgeStatus& clock = bridge_status.value();
     if (!clock.clock_offset_valid() || clock.clock_boot_id() != state.boot_id) {
       return std::nullopt;
@@ -513,7 +513,7 @@ void HardwareAccess::digital_output_set(HardwareLink& link, std::size_t index,
 void HardwareAccess::pwm_set(HardwareLink& link, std::size_t index,
                              double output) {
   auto& device = link.impl_->At(index, Kind::kPwm);
-  device.pwm = std::isfinite(output) ? output : 0.0;
+  device.pwm = std::isfinite(output) ? std::clamp(output, -1.0, 1.0) : 0.0;
   device.set = true;
 }
 
@@ -692,6 +692,12 @@ class DriverStationLink {
     std::memcpy(&packet, data, sizeof packet);
     driver_station::DriverStationData next{};
     if (!driver_station::Decode(packet.bytes(), next)) return;
+    if (have_ && next.sample_time_us > 0 && data_.sample_time_us > 0 &&
+        (next.sample_time_us < data_.sample_time_us ||
+         (next.mode_since_us != 0 &&
+          next.mode_since_us < data_.mode_since_us))) {
+      return;
+    }
     data_ = next;
     have_ = true;
     received_ = node_.now();
