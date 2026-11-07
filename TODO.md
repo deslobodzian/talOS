@@ -10,23 +10,39 @@ valid" promised more than the code guaranteed. Each fix below is one commit on
 the branch; `git log` carries the Problem/Fix/Why. Deferred items keep the
 reason they were deferred so the next pass can pick them up.
 
+Re-rated 6.5/10 after the readiness pass (committed state: clean-worktree `bazel test //...` 134/135; the one failure, a timing-flaky vision test, fixed in `bd9e45a`): Red-alliance driving, auto selection, feed interlock and camera recovery are fixed, but the two gateway blockers below (one CAN device failing configure, or resetting, stops the whole robot) cap readiness until they land.
+
+Landed in the competition-readiness pass (2026-11-07; `git log` has each Problem/Fix/Why):
+
+- [x] **Camera timestamp kind** (`2c4a32e`): SOE/EOF/delivery kinds with one midpoint conversion, live exposure/gain controls, silent-camera reconnect with backoff. AVFoundation path compiled on macOS only, unbuilt on Linux.
+- [x] **Autonomous routine selection** (`745e5b5`): `preload`, `none`, `shoot_only`, `taxi` as action sequences; joystick 0 POV while disabled (incl. FMS pre-match disabled-auto), latched at arm, persisted per session. Loaded trajectories remain open.
+- [x] **Feed permit** (`cade9f4`): the intake refuses every negative (feed) demand without a fresh, at-speed shooter; teleop feed on button 3. Robot-level, not yet a framework concept.
+- [x] **Registry crash windows** (`495601e`): flock-serialized init/claim; dead initializer or claimant recovered.
+- [x] **Simulated transport fidelity** (`73c5c88`): RTMS-sized rings and drop accounting; `Sim::pause/resume` (C++, C ABI, Python). Dispatch is still serial.
+- [x] **Studio trust** (`d06ba4a`): per-sample staleness, worker failure surfaced, bounded updates, fault set vs clear.
+- [x] **Driver frame** (`e770ae2`): driver-relative heading on both alliances (Red flip removed), robot-relative fallback after neutral on heading loss.
+
+In progress (partial edits in the working tree, uncommitted; implementation paused when the subagent model's quota ran out):
+
+- [ ] **Gateway device isolation** (audit blockers): one CAN device failing configure leaves the whole robot unconfigured and the RIO loop re-runs a blocking full `Configure` every 50 ms push; one device reset rejects every command until all devices restore; RIO gateway socket open is never retried. Also lower telemetry-only Phoenix signal rates. Tree state: `Backend::BeginRestoreAfterReset` signature changed in `gateway.h` but not in backends/tests (does not compile).
+- [ ] **Drivetrain degrade** (audit): module liveness ignores its CANcoder (drive motor keeps pushing at a stuck angle); one dead module immobilizes the robot; drive-motor/Pigeon reset makes odometry jump. Tree state: implementation and README present, regression tests incomplete.
+- [ ] **Shooter readiness hysteresis** (audit): `at_speed` ±2 rps with no hysteresis and against the unclamped goal; a shot dip stops the feed. Tree state: implemented, `shooter.h` does not compile (missing `RobotConfig` include/dep).
+- [ ] **Launcher boot resilience** (audit): a non-actuating node failing `--describe` blocks the whole robot at boot; actuator nodes and the bridge can be quarantined up to the restart window. Design: `[subsystem] critical = false` (annotated on cameras, pose_estimator, telemetry). Tree state: parser test and `supervision_test.cc` fail.
+- [ ] **Sanitizers and fuzzing in CI.** `--config=asan/tsan`, seeded decoder mutation tests and CI jobs are in the tree. ASan found a null `memcpy` in `talOS/events/log/log_test.cc:123`, UB in third-party `apriltag` `pjpeg.c:597`, and `config_fuzz_test` aborts in toml++ `parse_key` on malformed input (cause not yet determined). Scaffold BUILD tags break `new_subsystem_test` goldens.
+
 Deferred (not started; in priority order):
 
+- [ ] **CAN bus load** (audit, needs the robot): all 15 devices on the RIO bus at 200 Hz status plus per-tick control frames; measure `can_utilization_frac` before commissioning.
 - [ ] **Per-signal acquisition time.** One `sample_time` per `/hw/state` covers CAN signals cached at different instants (`PhoenixBackend.cpp` Read); odometry treats sensor skew as motion. Needs Phoenix per-signal timestamps carried through the devices API. Large; touches the hardware wire format.
 - [ ] **Clock-offset accuracy.** `talOS/bridge/clock_offset` is one-way: a constant transport delay looks like perfect convergence. Needs a bidirectional exchange or exported timestamp uncertainty propagated into fusion.
-- [ ] **Camera timestamp kind.** V4L2 SOE/EOF flags and AVFoundation delivery fallbacks are flattened into "exposure" time; configured exposure never reaches live capture; a connected-but-silent camera never reconnects. Vision slice.
 - [ ] **One config resolver.** `config_parser.h` and `tools/sync_manifest.py` are two interpreters kept equal by fixtures. Make the C++ resolver emit canonical JSON + dependency closure and have sync_manifest consume it.
 - [ ] **Replay modes.** Label exact dispatch replay vs counterfactual input replay; add a consumer-receipt/drop trace mode; replay adapters so an appended enum value does not make every earlier log un-replayable (schema hash covers enum labels).
 - [ ] **Telemetry beyond one frame.** The 1200 B single value frame is now the limiting budget (2026 graph needed exclusions). Schedule channels across bounded frames by priority/rate.
 - [ ] **Chassis intent coordinator.** Priority lanes hand over whole commands; "driver translates while align rotates" and heading-hold handoff cannot be expressed.
-- [ ] **Autonomous routines.** One hard-coded routine; needs loaded trajectories, action sequences, routine selection and per-action prerequisite/cancel contracts.
-- [ ] **Coupled-action permits as a framework concept.** The autonomous feed now holds a continuous shooter-ready interlock, but teleop can still feed into a stopped shooter; make the feeder consume a ready permit.
+- [ ] **Autonomous trajectories.** Routines are action sequences with one waypoint each; loaded trajectory files and more routines remain.
+- [ ] **Coupled-action permits as a framework concept.** The intake enforces the shooter-ready feed permit itself; generalize when a second coupled mechanism exists.
 - [ ] **Neutral requested vs achieved.** `Backend::Neutral()` returns nothing and Phoenix discards neutral-send status; expose delivery uncertainty and rely on documented controller-side command expiry.
 - [ ] **Python on actuator loops.** Intake is Python; a GC pause > 2 periods trips the bridge watchdog. Measure jitter on the coprocessor or move actuator loops to C++; `docs/METHODOLOGY.md` must not claim "memory, not jitter".
-- [ ] **Registry crash windows.** Initializer death poisons the registry; a crash while CLAIMING leaks a slot (32 total). Needs an OS-released lock.
-- [ ] **Simulated transport fidelity.** `SimulatedEventLoop` keeps unlimited history, never drops, runs nodes serially; add bounded rings and per-node pause injection.
-- [ ] **Studio trust.** Connected is shown as fresh; worker crashes leave RPCs pending; no worker->UI backpressure; motor-fault detector warns on any change.
-- [ ] **Sanitizers and fuzzing in CI.** ASan/UBSan/TSan Bazel configs; fuzz frame/State/Command/DS/config decoders.
 
 ## On the robot
 
