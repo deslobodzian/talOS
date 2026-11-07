@@ -28,7 +28,8 @@ static_assert(sizeof(AutonomousState) == 1,
 class Autonomous {
  public:
   explicit Autonomous(talos::Node& node)
-      : shooter_velocity_{node.param("shooter_velocity_rps", 60.0)},
+      : node_{node},
+        shooter_velocity_{node.param("shooter_velocity_rps", 60.0)},
         intake_velocity_{node.param("intake_velocity_rps", 30.0)},
         feed_velocity_{node.param("feed_velocity_rps", -20.0)},
         target_x_{node.param("target_x_m", 2.0)},
@@ -55,7 +56,7 @@ class Autonomous {
         shooter_{node, "shooter", "auto"},
         intake_{node, "intake", "auto"},
         ds_{node},
-        phase_{node, Phase::kIdle},
+        phase_{node, Phase::kInhibited},
         state_{node.publish<AutonomousState>(topics::kState)} {
     if (feed_duration_ <= talos::Duration::zero()) {
       throw std::invalid_argument(
@@ -64,47 +65,69 @@ class Autonomous {
   }
 
   void update() {
-    if (!ds_.enabled() || !ds_.autonomous()) {
-      phase_.go(Phase::kIdle);
-      trajectory_started_ = false;
+    const auto now = node_.now();
+    if (feeding_) feed_elapsed_ += now - feed_last_update_;
+    feeding_ = false;
+    // Silence is not a mode transition: preserve progress and wall deadlines,
+    // but never keep commanding lanes or advance feed/trajectory time.
+    if (!ds_.connected()) {
+      trajectory_pose_available_ = false;
+      CheckDeadline(now);
       ReleaseTargets();
       state_.send(AutonomousState{WirePhase()});
       return;
     }
+    if (!ds_.enabled() || !ds_.autonomous()) {
+      ResetRoutine();
+      ReleaseTargets();
+      state_.send(AutonomousState{WirePhase()});
+      return;
+    }
+    // A new process must observe disabled/non-auto before it can arm. Merely
+    // receiving an already-running auto generation must never fire a piece.
+    if (phase_.is(Phase::kInhibited)) {
+      ReleaseTargets();
+      state_.send(AutonomousState{WirePhase()});
+      return;
+    }
+    if (generation_ != ds_.data().mode_since_us) ResetRoutine();
     if (phase_.is(Phase::kIdle)) {
+      generation_ = ds_.data().mode_since_us;
       red_ = ds_.alliance() == talos::driver_station::Alliance::kRed;
+      spinup_started_ = now;
       phase_.go(Phase::kSpinup);
     }
-    if ((phase_.is(Phase::kSpinup) &&
-         phase_.time_in_state() >=
-             std::chrono::duration<double>{spinup_timeout_s_}) ||
-        (phase_.is(Phase::kDrive) &&
-         phase_.time_in_state() >=
-             std::chrono::duration<double>{drive_timeout_s_})) {
-      phase_.go(Phase::kAborted);
-    }
+    CheckDeadline(now);
     if (phase_.is(Phase::kAborted) || phase_.is(Phase::kHold)) {
       ReleaseTargets();
       state_.send(AutonomousState{WirePhase()});
       return;
     }
     released_ = false;
-    if (phase_.is(Phase::kSpinup) && shooter_state_.fresh() &&
-        shooter_state_->at_speed() &&
+    const bool shooter_ready =
+        shooter_state_.fresh() && shooter_state_->at_speed() &&
         std::abs(shooter_state_->target_velocity_rps() - shooter_velocity_) <=
-            1e-6) {
+            1e-6;
+    if (phase_.is(Phase::kFeed) && !shooter_ready) {
+      phase_.go(Phase::kSpinup);
+    }
+    if (phase_.is(Phase::kSpinup) && shooter_ready) {
       phase_.go(Phase::kFeed);
     }
-    if (phase_.is(Phase::kFeed) && phase_.time_in_state() >= feed_duration_) {
+    if (phase_.is(Phase::kFeed) && feed_elapsed_ >= feed_duration_) {
       phase_.go(Phase::kDrive);
     }
     drivetrain::ChassisTarget drive{};
     double intake = 0;
     double shooter = shooter_velocity_;
-    if (phase_.is(Phase::kFeed)) intake = feed_velocity_;
+    if (phase_.is(Phase::kFeed)) {
+      intake = feed_velocity_;
+      feeding_ = true;
+      feed_last_update_ = now;
+    }
     if (phase_.is(Phase::kDrive)) {
       shooter = 0;
-      if (pose_.fresh() && pose_->valid()) {
+      if (pose_.fresh() && pose_->valid() && pose_->localized()) {
         const auto& p = pose_->pose();
         if (!trajectory_started_) {
           auto target = TrajectorySample{0, target_x_, target_y_, target_yaw_};
@@ -164,7 +187,8 @@ class Autonomous {
   }
 
  private:
-  enum class Phase { kIdle, kSpinup, kFeed, kDrive, kHold, kAborted };
+  enum class Phase { kIdle, kSpinup, kFeed, kDrive, kHold, kAborted, kInhibited };
+  talos::Node& node_;
   double shooter_velocity_, intake_velocity_, feed_velocity_;
   double target_x_, target_y_, target_yaw_;
   double position_tolerance_, yaw_tolerance_, max_linear_, max_angular_;
@@ -176,6 +200,11 @@ class Autonomous {
   bool trajectory_started_ = false;
   talos::Duration feed_duration_;
   double spinup_timeout_s_, drive_timeout_s_;
+  std::uint64_t generation_ = 0;
+  talos::Time spinup_started_{};
+  talos::Duration feed_elapsed_{};
+  talos::Time feed_last_update_{};
+  bool feeding_ = false;
   talos::Subscription<geometry::PoseEstimate> pose_;
   talos::Subscription<shooter::ShooterState> shooter_state_;
   talos::Subscription<intake::IntakeState> intake_state_;
@@ -198,6 +227,29 @@ class Autonomous {
     return value;
   }
 
+  void ResetRoutine() {
+    phase_.go(Phase::kIdle);
+    generation_ = 0;
+    trajectory_started_ = false;
+    trajectory_pose_available_ = false;
+    feeding_ = false;
+    feed_elapsed_ = talos::Duration::zero();
+  }
+
+  void CheckDeadline(talos::Time now) {
+    // One wall-clock preload budget from the FIRST spinup entry, including
+    // feed and readiness retries. Flapping readiness or a DS outage cannot
+    // postpone the deadline. Drive likewise includes every outage.
+    if (((phase_.is(Phase::kSpinup) || phase_.is(Phase::kFeed)) &&
+         now - spinup_started_ >=
+             std::chrono::duration<double>{spinup_timeout_s_}) ||
+        (phase_.is(Phase::kDrive) &&
+         phase_.time_in_state() >=
+             std::chrono::duration<double>{drive_timeout_s_})) {
+      phase_.go(Phase::kAborted);
+    }
+  }
+
   void ReleaseTargets() {
     if (released_) return;
     drive_.release();
@@ -218,6 +270,8 @@ class Autonomous {
         return autonomous::Phase::HOLD;
       case Phase::kAborted:
         return autonomous::Phase::ABORTED;
+      case Phase::kInhibited:
+        return autonomous::Phase::INHIBITED;
       case Phase::kIdle:
         return autonomous::Phase::IDLE;
     }
