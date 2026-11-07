@@ -319,12 +319,6 @@ bool Decode(std::span<const uint8_t> data, State& out) {
 // The device caps in config.h are only legal while the widest encoding of each
 // message still fits one frame payload. Raising a cap without headroom here
 // fails the build rather than truncating a State on the wire at runtime.
-static_assert(32 + 6 + kMaxMotors * 20 + kMaxDigitalOutputs * 3 +
-                  kMaxPwmOutputs * 10 <=
-              protocol::kMaxPayloadSize);
-static_assert(44 + 14 + 34 + kMaxMotors * 47 + kMaxSensors * 27 +
-                  kMaxDigitalInputs * 4 + kMaxDigitalOutputs * 4 +
-                  kMaxAnalogInputs * 15 + kMaxEncoders * 23 +
-                  kMaxPwmOutputs * 11 <=
-              protocol::kMaxPayloadSize);
+static_assert(kMaxCommandSize <= protocol::kMaxPayloadSize);
+static_assert(kMaxStateSize <= protocol::kMaxPayloadSize);
 }  // namespace talos::hardware

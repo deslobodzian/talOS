@@ -33,6 +33,8 @@ thread_local std::string g_param_string;
 thread_local std::vector<std::string> g_param_strings;
 thread_local std::vector<const char*> g_param_string_pointers;
 thread_local std::vector<double> g_param_numbers;
+// What talos_node_session_dir returns, until the next call.
+thread_local std::string g_session_dir;
 
 using detail::HardwareAccess;
 using detail::NodeAccess;
@@ -240,6 +242,15 @@ int64_t talos_node_period_ns(const TalosNode* node) {
 const char* talos_node_config_path(const TalosNode* node) {
   return Guard<const char*>("",
                             [&] { return AsNode(node).config_path().c_str(); });
+}
+
+const char* talos_node_session_dir(const TalosNode* node) {
+  return Guard<const char*>(nullptr, [&] {
+    const auto dir = NodeAccess::session_dir(AsNode(node));
+    if (!dir) return static_cast<const char*>(nullptr);
+    g_session_dir = dir->string();
+    return g_session_dir.c_str();
+  });
 }
 
 int32_t talos_node_param(const TalosNode* node, const char* key, int32_t kind,

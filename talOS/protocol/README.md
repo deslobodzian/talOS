@@ -4,6 +4,9 @@ This package is the wire contract between the companion bridge
 (`//talOS/bridge:hardware_node`) and the realtime controller gateway
 (`talOS/hardware`, run by the RoboRIO program or `sim_gateway`).
 
+The end-to-end [data-flow reference](../../docs/DATA_FLOW.md) records link
+rates, exact payload/slot sizes, config chunking, and the current robot budget.
+
 ## Frames
 
 All traffic is UDP: the gateway listens on port 5802 and the companion on

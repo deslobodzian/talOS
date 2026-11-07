@@ -1,0 +1,60 @@
+# Shared defaults for every camera; this is not a launched subsystem.
+[subsystem]
+period_us = 10000
+tag_size_m = 0.1651
+rasterize = true
+# Robust corner solver: pixel noise/Huber threshold in pixels, floor priors
+# and minimum published uncertainty in metres/radians.
+# Sim raster/detect measurement: 0.3243 px per coordinate; retain 0.33.
+# Real cameras must override this with their measured calibration RMS.
+pixel_std_px = 0.33
+floor_z_std_m = 0.05
+floor_tilt_std_rad = 0.05
+huber_delta_px = 2.0
+min_xy_std_m = 0.02
+# Outcome-selected under the accuracy preset's ±1 deg yaw mounting bias.
+min_yaw_std_rad = 0.035
+
+[detector]
+# Half-resolution quad search with full-resolution edge refinement.
+decimate = 2.0
+threads = 2
+sigma = 0.0
+refine_edges = true
+hamming_threshold = 1
+min_decision_margin = 30.0
+
+[recording]
+# Offline frame recording, active only under the launcher (a session dir).
+# Recorded frames live in <session>/frames/<camera>/ as lossless PNG + a
+# detection-context JSON sidecar, for offline detector/gate retuning.
+enabled = true
+# Frames with a valid ("sampled") or rejected observation, per second; a rate
+# of 0 records nothing of that kind.
+sample_hz = 1.0
+rejected_hz = 1.0
+# Per-camera disk budget in bytes; the recorder deletes the oldest pairs first.
+max_bytes = 268435456  # 256 MiB
+
+[camera]
+fps = 60
+# Extrinsic calibration uncertainty, live and sim (NOT sim-only): the published
+# observation covariance adds these so the estimator does not over-trust a mount
+# whose true pose differs from the configured one. A mount rotation of
+# `mount_angle_std_rad` tilts the optical axis and shifts the lever arm by
+# `range * angle`; `mount_translation_std_m` shifts it directly. Set both from
+# the real robot's post-mounting calibration residual. Finite, >= 0.
+mount_angle_std_rad = 0.0175   # ≈ 1 deg
+mount_translation_std_m = 0.01
+# Per-camera capture-time calibration, live and sim: subtract from the stamp.
+# Measure on the deployed camera; finite microseconds, 0 <= value < 1000000.
+latency_offset_us = 0
+# Sim only: timestamp truth this much later and delay delivery until that time.
+# Ignored live (but still validated); only the accuracy scenario injects lag.
+sim_timestamp_lag_us = 0
+# Synthetic camera effects only; plausible starting points, not calibration.
+# Independent 8-bit read noise: 2 gray levels (~0.8% of full scale).
+# Frame exposure gain: 2% standard deviation. Exposure: short 5 ms for motion.
+sensor_noise_std_gray = 2.0
+exposure_gain_std = 0.02
+exposure_ms = 5.0

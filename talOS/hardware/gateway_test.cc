@@ -18,6 +18,37 @@
 namespace talos::hardware {
 namespace {
 
+TEST(Messages, FullyCappedEncodingsHaveExactSizes) {
+  State state;
+  state.motor_count = kMaxMotors;
+  state.sensor_count = kMaxSensors;
+  state.digital_input_count = kMaxDigitalInputs;
+  state.digital_output_count = kMaxDigitalOutputs;
+  state.analog_input_count = kMaxAnalogInputs;
+  state.encoder_count = kMaxEncoders;
+  state.pwm_output_count = kMaxPwmOutputs;
+  std::array<uint8_t, kMaxStateSize> state_bytes{};
+  ASSERT_EQ(Encode(state, state_bytes), 1412u);
+  State decoded_state;
+  ASSERT_TRUE(Decode(state_bytes, decoded_state));
+  EXPECT_EQ(decoded_state, state);
+  EXPECT_EQ(Encode(state, std::span{state_bytes}.first(state_bytes.size() - 1)),
+            0u);
+
+  Command command;
+  command.count = kMaxMotors;
+  command.digital_output_count = kMaxDigitalOutputs;
+  command.pwm_output_count = kMaxPwmOutputs;
+  std::array<uint8_t, kMaxCommandSize> command_bytes{};
+  ASSERT_EQ(Encode(command, command_bytes), 410u);
+  Command decoded_command;
+  ASSERT_TRUE(Decode(command_bytes, decoded_command));
+  EXPECT_EQ(decoded_command, command);
+  EXPECT_EQ(
+      Encode(command, std::span{command_bytes}.first(command_bytes.size() - 1)),
+      0u);
+}
+
 struct ModuleConfig {
   const char* name;
   uint16_t drive_id, steer_id, encoder_id;

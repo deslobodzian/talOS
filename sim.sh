@@ -9,7 +9,7 @@
 #   ./sim.sh                 WPILib GUI simulation + node graph + Studio
 #   ./sim.sh --headless      no sim GUI; teleop enabled via TALOS_SIM_DS
 #   ./sim.sh --no-rio        use an existing controller (no WPILib, no gateway)
-#   ./sim.sh --sim-gateway   lightweight simulator instead of WPILib
+#   ./sim.sh --sim-gateway   lightweight physics simulator instead of WPILib
 #   ./sim.sh --no-studio     robot only, no bridge and no browser
 #   ./sim.sh --duration-s 30 stop the node graph after 30 seconds
 #
@@ -24,6 +24,7 @@ WANT_RIO=1
 WANT_GATEWAY=0
 WANT_OPEN=1
 DURATION=""
+GATEWAY_ARGS=()
 # HTTP port only: the telemetry topic lives in the robot config
 # ([subsystems.telemetry] topic), read by the nodes that own each end, so this
 # script never spells it twice.
@@ -37,8 +38,10 @@ Options:
   --headless        run the WPILib sim without its GUI (sets TALOS_SIM_DS=auto)
   --no-studio       skip the Studio bridge and the browser
   --no-rio          use an existing controller (skip WPILib sim and gateway)
-  --sim-gateway     start the lightweight simulator instead of WPILib
+  --sim-gateway     start the lightweight physics simulator instead of WPILib
                     (implies --no-rio; conflicts with WPILib sim)
+  --gateway-arg ARG forward one argument verbatim to sim_gateway (repeatable;
+                    requires --sim-gateway, which always enables --physics)
   --no-open         start Studio but do not open a browser
   --duration-s N    pass --duration-s N to the launcher
   --http-port N     Studio HTTP port (default 5800)
@@ -52,6 +55,11 @@ while [ $# -gt 0 ]; do
     --no-studio)   WANT_STUDIO=0 ;;
     --no-rio)      WANT_RIO=0 ;;
     --sim-gateway|--with-sim-gateway|--lightweight-sim) WANT_GATEWAY=1; WANT_RIO=0 ;;
+    --gateway-arg)
+      [ $# -ge 2 ] || { echo "sim.sh: --gateway-arg needs an argument" >&2; exit 2; }
+      GATEWAY_ARGS+=(--sim-gateway-arg "$2")
+      shift
+      ;;
     --no-open)     WANT_OPEN=0 ;;
     --duration-s)  DURATION="$2"; shift ;;
     --http-port)   HTTP_PORT="$2"; shift ;;
@@ -60,6 +68,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+if [ "${#GATEWAY_ARGS[@]}" -gt 0 ] && [ "$WANT_GATEWAY" != "1" ]; then
+  echo "sim.sh: --gateway-arg requires --sim-gateway" >&2
+  exit 2
+fi
 
 # Three explicit controller modes (never combine WPILib + gateway: two
 # publishers on /hw/state would conflict):
@@ -160,7 +172,11 @@ fi
 
 # --- 2. the node graph ------------------------------------------------------
 say "starting node graph (log: $LOG_DIR/launcher.log)"
-LAUNCH_ARGS="--config 2026-robot/main_processor/configuration/robot.toml --sim --session-id $SESSION_ID --output-dir $OUT_DIR"
+CONFIG="2026-robot/main_processor/configuration/robot.toml"
+if [ "$WANT_GATEWAY" = "1" ]; then
+  CONFIG="2026-robot/main_processor/configuration/robot_physics_sim.toml"
+fi
+LAUNCH_ARGS="--config $CONFIG --sim --session-id $SESSION_ID --output-dir $OUT_DIR"
 [ -n "$DURATION" ] && LAUNCH_ARGS="$LAUNCH_ARGS --duration-s $DURATION"
 # Studio's bridge is a declared node in the launcher's graph ([studio] in the
 # robot config): the launcher starts and supervises it, so sim.sh only asks
@@ -174,10 +190,12 @@ fi
 # an existing controller does. Starting the gateway alongside either would
 # create two publishers on /hw/state.
 if [ "$WANT_GATEWAY" = "1" ]; then
-  LAUNCH_ARGS="$LAUNCH_ARGS --start-sim-gateway"
+  LAUNCH_ARGS="$LAUNCH_ARGS --start-sim-gateway --sim-gateway-arg --physics"
 fi
+# Bash 3.2 treats an empty array as unset under nounset; the + expansion
+# preserves each forwarded argument without expanding an unset array.
 # shellcheck disable=SC2086
-./bazel-bin/talOS/launcher/launcher $LAUNCH_ARGS > "$LOG_DIR/launcher.log" 2>&1 &
+./bazel-bin/talOS/launcher/launcher $LAUNCH_ARGS ${GATEWAY_ARGS[@]+"${GATEWAY_ARGS[@]}"} > "$LOG_DIR/launcher.log" 2>&1 &
 LAUNCHER_PID=$!
 track "$LAUNCHER_PID" "launcher"
 

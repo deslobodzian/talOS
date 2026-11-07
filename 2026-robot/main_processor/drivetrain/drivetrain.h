@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
@@ -29,9 +30,9 @@ class Drivetrain {
         geometry_{LoadSwerveGeometry(node)},
         kinematics_{geometry_},
         gyro_{node, "drivetrain_imu"},
-        // A simulated Pigeon reads a valid, permanently zero yaw, so under
-        // --sim the heading integrates the rotation the modules measure. Off
-        // on a robot: an integrated heading drifts with no absolute reference.
+        // WPILib/ideal sims report a permanently zero Pigeon yaw, so --sim
+        // defaults to module-integrated heading. robot_physics_sim.toml sets
+        // this false to use the physics gateway's modeled Pigeon (and drift).
         integrate_heading_{
             node.param<bool>("integrate_heading", node.simulation())},
         max_linear_accel_mps2_{
@@ -75,9 +76,8 @@ class Drivetrain {
       for (std::size_t i = 0; i < kModuleCount; ++i) {
         modules_[i] = geometry::SwerveModulePosition{
             WheelTravel(drive_[i].position(),
-                        geometry_.modules[i].wheel_radius_m)
-                .value(),
-            ToRadians(measured[i].steer_rot).value()};
+                        geometry_.modules[i].wheel_radius_m),
+            ToRadians(measured[i].steer_rot)};
       }
       speeds = kinematics_.ToChassisSpeeds(measured);
       if (valid_target) {
@@ -121,7 +121,7 @@ class Drivetrain {
         yaw_valid = sample_time.has_value();
       }
     } else if (sample_time.has_value() && gyro_.connected()) {
-      yaw_rad_ = ToRadians(gyro_.yaw()).value();
+      yaw_rad_ = ToRadians(gyro_.yaw());
       yaw_valid = true;
     }
 

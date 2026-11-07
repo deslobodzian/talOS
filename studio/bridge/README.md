@@ -21,8 +21,9 @@ bazel-bin/studio/bridge/studio_bridge --drop-newest-publisher /talos/telemetry 5
 ```
 
 The positional arguments are topic, HTTP/WebSocket port and static web
-directory. `--declared PATH` may appear anywhere on the line and does not shift
-them. Open `http://localhost:5800`; binary frames arrive at `/telemetry`. The
+directory. `--declared PATH` and `--manifest PATH` may appear anywhere on the
+line and do not shift them. Open `http://localhost:5800`; binary frames arrive
+at `/telemetry`. The
 frame schema and slot geometry live in `//talOS/telemetry` (`telemetry.fbs`,
 `wire.h`). The mock emits v2 frames at 200 Hz — a dictionary frame first and
 every 100th frame after it, value-only frames between — with nanosecond
@@ -148,6 +149,23 @@ Sim sessions normally get this for free: the launcher's `--start-studio-bridge`
 (which `sim.sh` passes unless `--no-studio`) declares the bridge in `graph.json`
 and starts it supervised with that graph as `--declared`. A manually started
 bridge is undeclared unless `--declared` points at the session's `graph.json`.
+
+### The session manifest
+
+The launcher also writes a session `manifest.json` beside `graph.json` — the
+session id, config hash, output dir, and per-node `restart_count`, `exit_code`
+and log paths — and keeps it current as nodes start, restart and exit. Pass that
+path as `--manifest PATH` and the bridge serves the file at
+`GET /manifest.json`.
+
+Unlike `/declared.json`, the manifest is re-read on **every request**: the
+launcher atomically replaces it throughout the session, so this view is live
+rather than a startup snapshot. Served verbatim with the same content type and
+size cap as the static file handler; with no `--manifest`, or with a file that
+could not be read, `GET /manifest.json` is **404** — an empty document would say
+the session ran no nodes, which is a different and false statement. The
+launcher's `--start-studio-bridge` passes the session manifest the same way it
+passes the declared graph, so supervised Studio sessions get it for free.
 
 ## Dedicated DROP_NEWEST publisher contract
 

@@ -16,6 +16,7 @@ the constructor; `update()` runs every period.
 | `node.param<T>("key")`, `param<T>("key", fallback)` | `node.param("key")`, `param("key", fallback)` | this subsystem's TOML keys; dotted keys reach nested tables. `T`: `bool`, integers, `double`, `std::string`, and TOML arrays as `std::vector<std::string>` / `std::vector<double>` (integer elements convert; `[]` is valid). Python returns arrays as `list[str]` / `list[float]`; a list default asks for an array. A wrong element type is an error naming the key and element index |
 | `node.every(period, fn)` | `node.every(seconds, fn)` | extra timer |
 | `name()`, `now()`, `tick()`, `period()`, `simulation()`, `config_path()` | same, as properties (seconds) | |
+| `session_dir()` → `std::optional<std::filesystem::path>` | `node.session_dir` → `str \| None` | the session output directory the launcher started this node under (the parent of `--log`), `nullopt`/`None` without `--log` (tests, `--describe`, `--replay`). Nodes that record per-session artifacts (e.g. vision frame recording) write under `<session_dir>/<artifact>/` |
 | `sub.value()`, `sub->field()`, `has_value()` | `sub.value` (`None` before the first), `has_value` | |
 | `sub.fresh()`, `fresh(max_age)`, `age()`, `updated()` | `sub.fresh()`, `fresh(max_age)`, `age`, `updated` | fresh: younger than `[robot] command_timeout_us` |
 | `pub.send(M{...})` | `pub.send(field=value, ...)` or `send(message)` | |

@@ -1,24 +1,68 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "geometry/geometry_descriptor.h"
+#include "geometry/geometry_generated.h"
+#include "sim/topics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/events/os/poller.h"
 #include "talOS/hardware/endpoint.h"
 #include "talOS/hardware/sim_backend.h"
 #include "talOS/hardware/sim_physics.h"
 #include "talOS/introspection/describe.h"
+#include "talOS/introspection/registry.h"
+#include "talOS/ipc/publisher.h"
 #include "talOS/process/process.h"
 
 namespace {
 
 namespace ds = talos::driver_station;
+
+constexpr const char* kNodeName = "sim_gateway";
+constexpr const char* kNodeTarget =
+    "//2026-robot/main_processor/simulation:sim_gateway";
+constexpr const char* kUsage =
+    "usage: sim_gateway --config PATH [--physics "
+    "[--start-pose X_M,Y_M,YAW_RAD] [--wheel-radius-error FRAC] "
+    "[--wheel-slip-gain G] [--gyro-drift-radps R]] [--duration-s N] "
+    "[--mode-schedule mode:seconds,...] [--alliance blue|red] "
+    "[--port N] [--remote-port N] [--session-id N]";
+
+// Shared-memory slot contract: docs/DATA_FLOW.md.
+static_assert(sizeof(geometry::OdometrySample) == 56);
+
+double FiniteNumber(const std::string& text) {
+  std::size_t used = 0;
+  const double value = std::stod(text, &used);
+  if (used != text.size() || !std::isfinite(value)) {
+    throw std::invalid_argument("number must be finite: " + text);
+  }
+  return value;
+}
+
+void StartPose(const std::string& text,
+               talos::hardware::sim::PhysicsOptions& options) {
+  const auto first = text.find(',');
+  const auto second =
+      first == std::string::npos ? first : text.find(',', first + 1);
+  if (first == std::string::npos || second == std::string::npos ||
+      text.find(',', second + 1) != std::string::npos) {
+    throw std::invalid_argument("--start-pose needs X_M,Y_M,YAW_RAD");
+  }
+  options.start_x_m = FiniteNumber(text.substr(0, first));
+  options.start_y_m = FiniteNumber(text.substr(first + 1, second - first - 1));
+  options.start_yaw_rad = FiniteNumber(text.substr(second + 1));
+}
 
 struct Phase {
   uint32_t flags;
@@ -80,14 +124,23 @@ std::vector<Phase> ParseSchedule(const std::string& spec) {
   return phases;
 }
 
-// The launcher probes every roster binary with `--describe --config PATH
-// [--sim]` before spawning anything. The gateway answers from its binary
-// identity: it holds no RTMS endpoints, so the envelope carries no sources.
-int Describe() {
-  talos::introspect::Description description;
-  description.name = "sim_gateway";
-  description.target = "//2026-robot/main_processor/simulation:sim_gateway";
-  std::cout << talos::introspect::DescribeToJson(description);
+talos::event::Manifest Manifest(bool physics) {
+  if (!physics) return {};
+  return {{
+      .id = 0,
+      .kind = talos::event::SourceKind::SENDER,
+      .name = sim::topics::kState,
+      .message_bytes = sizeof(geometry::OdometrySample),
+      .alignment = alignof(geometry::OdometrySample),
+      .schema = talos::schema::Of<geometry::OdometrySample>(),
+  }};
+}
+
+// Use the same manifest for the launcher probe and the live registration.
+int Describe(bool physics) {
+  std::cout << talos::introspect::DescribeToJson(
+      talos::introspect::DescribeManifest(kNodeName, kNodeTarget,
+                                          Manifest(physics), MAX_SLOTS));
   return 0;
 }
 
@@ -95,20 +148,54 @@ int Describe() {
 
 int main(int argc, char** argv) {
   try {
+    bool describe = false;
+    bool physics = false;
     for (int i = 1; i < argc; ++i) {
-      if (std::string{argv[i]} == "--describe") return Describe();
+      describe |= std::string{argv[i]} == "--describe";
     }
     double duration_s = 0;
     std::vector<Phase> phases;
     ds::Alliance alliance = ds::Alliance::kBlue;
-    bool physics = false;
+    bool physics_options = false;
+    uint64_t session_id = 0;
+    talos::hardware::sim::PhysicsOptions options{.start_x_m = 2.0,
+                                                 .start_y_m = 2.0};
     const char* config_path = nullptr;
     uint16_t local_port = 5802;
     uint16_t remote_port = 5803;
     for (int i = 1; i < argc; ++i) {
       const std::string arg{argv[i]};
+      if (arg == "--describe" || (describe && arg == "--sim")) continue;
       if (arg == "--physics") {
         physics = true;
+      } else if (arg == "--start-pose" && i + 1 < argc) {
+        physics_options = true;
+        StartPose(argv[++i], options);
+      } else if (arg == "--wheel-radius-error" && i + 1 < argc) {
+        physics_options = true;
+        options.wheel_radius_error_frac = FiniteNumber(argv[++i]);
+        if (options.wheel_radius_error_frac <= -0.5 ||
+            options.wheel_radius_error_frac >= 0.5) {
+          throw std::invalid_argument(
+              "--wheel-radius-error must be > -0.5 and < 0.5");
+        }
+      } else if (arg == "--wheel-slip-gain" && i + 1 < argc) {
+        physics_options = true;
+        options.wheel_slip_gain = FiniteNumber(argv[++i]);
+        if (options.wheel_slip_gain < 0.0) {
+          throw std::invalid_argument("--wheel-slip-gain must be nonnegative");
+        }
+      } else if (arg == "--gyro-drift-radps" && i + 1 < argc) {
+        physics_options = true;
+        options.gyro_drift_radps = FiniteNumber(argv[++i]);
+      } else if (arg == "--session-id" && i + 1 < argc) {
+        const std::string value = argv[++i];
+        std::size_t used = 0;
+        session_id = std::stoull(value, &used);
+        if (used != value.size() || value.starts_with('-')) {
+          throw std::invalid_argument(
+              "--session-id must be an unsigned integer");
+        }
       } else if (arg == "--port" && i + 1 < argc) {
         local_port = Port(argv[++i]);
       } else if (arg == "--remote-port" && i + 1 < argc) {
@@ -130,12 +217,14 @@ int main(int argc, char** argv) {
       } else if (arg == "--config" && i + 1 < argc) {
         config_path = argv[++i];
       } else {
-        throw std::invalid_argument(
-            "usage: sim_gateway --config PATH [--physics] [--duration-s N] "
-            "[--mode-schedule mode:seconds,...] [--alliance blue|red] "
-            "[--port N] [--remote-port N]");
+        throw std::invalid_argument(kUsage);
       }
     }
+    if (physics_options && !physics) {
+      throw std::invalid_argument(
+          std::string{"physics options require --physics\n"} + kUsage);
+    }
+    if (describe) return Describe(physics);
     if (config_path == nullptr) {
       throw std::invalid_argument(
           "sim_gateway needs --config PATH: an unconfigured gateway stamps "
@@ -144,7 +233,7 @@ int main(int argc, char** argv) {
     }
     talos::process::InstallStopHandlers();
     talos::hardware::SimBackend ideal;
-    talos::hardware::sim::PhysicsSimBackend physics_backend;
+    talos::hardware::sim::PhysicsSimBackend physics_backend{options};
     talos::hardware::Backend& backend =
         physics ? static_cast<talos::hardware::Backend&>(physics_backend)
                 : static_cast<talos::hardware::Backend&>(ideal);
@@ -175,6 +264,21 @@ int main(int argc, char** argv) {
         talos::protocol::UdpStatus::kOk) {
       throw std::runtime_error("cannot open simulation socket");
     }
+    std::optional<ipc::Publisher<geometry::OdometrySample>> truth_publisher;
+    if (physics) truth_publisher.emplace(sim::topics::kState);
+    std::optional<talos::introspect::NodeRegistration> registration;
+    try {
+      registration.emplace(talos::introspect::NodeRegistration::Identity{
+          .name = kNodeName,
+          .target = kNodeTarget,
+          .session_id = session_id,
+          .flags = talos::introspect::kFlagSimulation,
+      });
+      registration->publish(Manifest(physics));
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "sim_gateway: node registry unavailable: %s\n",
+                   e.what());
+    }
     const auto start = std::chrono::steady_clock::now();
     auto next = start;
     std::size_t phase = 0;
@@ -183,6 +287,12 @@ int main(int argc, char** argv) {
     driver_station.fms.alliance = alliance;
     std::array<uint8_t, talos::protocol::kMaxPayloadSize> ds_buffer{};
     uint64_t active_ticks = 0;
+    uint64_t last_ds_us = 0;
+    uint64_t ticks = 0;
+    uint64_t truth_samples = 0;
+    uint64_t truth_dropped = 0;
+    uint64_t truth_sequence = 0;
+    int64_t last_truth_ns = 0;
     while (!talos::process::stop_requested.load()) {
       const auto tick_time = std::chrono::steady_clock::now();
       const double elapsed_s =
@@ -201,9 +311,40 @@ int main(int argc, char** argv) {
       mode_tracker.Stamp(driver_station);
       const auto now = driver_station.sample_time_us;
       endpoint.Tick(now, (driver_station.fms.flags & ds::kEnabled) != 0);
-      const auto ds_size = ds::Encode(driver_station, ds_buffer);
-      endpoint.SendFrame(talos::protocol::FrameType::kDriverStation, now,
-                         ds_buffer.data(), ds_size);
+      if (truth_publisher) {
+        const auto sample_time = talos::event::Poller::now();
+        const auto& truth = physics_backend.truth();
+        const auto status = truth_publisher->write(geometry::OdometrySample{
+            static_cast<uint64_t>(sample_time.nanos()),
+            geometry::Pose2d{truth.x_m, truth.y_m, truth.yaw_rad},
+            geometry::Twist2d{truth.vx_mps, truth.vy_mps, truth.omega_radps}});
+        if (status == WriteResult::SUCCESS) {
+          ++truth_samples;
+          truth_sequence = status.sequence;
+          last_truth_ns = sample_time.nanos();
+        } else {
+          ++truth_dropped;
+        }
+      }
+      // Match the RoboRIO: no more than one DS snapshot every 20 ms,
+      // independently of the hardware/physics tick rate.
+      if (last_ds_us == 0 || now - last_ds_us >= 20000) {
+        const auto ds_size = ds::Encode(driver_station, ds_buffer);
+        endpoint.SendFrame(talos::protocol::FrameType::kDriverStation, now,
+                           ds_buffer.data(), ds_size);
+        last_ds_us = now;
+      }
+      ++ticks;
+      if (registration) {
+        registration->begin_sample();
+        registration->heartbeat();
+        registration->set_dispatch_count(ticks);
+        if (physics) {
+          registration->set_source(0, truth_samples, truth_dropped,
+                                   truth_sequence, last_truth_ns, 0, 0);
+        }
+        registration->end_sample();
+      }
       active_ticks +=
           (gateway.snapshot().flags & talos::hardware::kCommandActive) != 0;
       next += std::chrono::microseconds{

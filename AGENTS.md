@@ -26,6 +26,7 @@ bazel test //path/to/package:all      # narrow loop while iterating
 bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configuration/robot.toml --describe-only
 ```
 
+- Packet/slot size changes: follow the data-flow documentation and size-assert rule in `.omp/RULES.md`.
 - Graph/naming changes (topics, nodes, configs): run `--describe-only` on every
   affected config; the launcher refuses a graph that breaks a rule.
 - RoboRIO program (`2026-robot/controller_processor/rio`) builds with GradleRIO,

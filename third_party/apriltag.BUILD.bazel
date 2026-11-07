@@ -1,0 +1,36 @@
+"""Builds the upstream AprilTag CPU detector and its test data."""
+
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "apriltag",
+    srcs = [
+        "apriltag.c",
+        "apriltag_pose.c",
+        "apriltag_quad_thresh.c",
+        "tag16h5.c",
+        "tag25h9.c",
+        "tag36h11.c",
+        "tagCircle21h7.c",
+        "tagCircle49h12.c",
+        "tagCustom48h12.c",
+        "tagStandard41h12.c",
+        "tagStandard52h13.c",
+    ] + glob(["common/*.c"]),
+    hdrs = glob([
+        "*.h",
+        "common/*.h",
+    ]),
+    # Camera simulation and capture must sustain their frame rate in fastbuild.
+    # Keep this third-party pixel-processing kernel optimized in every mode.
+    copts = ["-O2"],
+    includes = ["."],
+    linkopts = ["-lm", "-lpthread"],
+)
+
+filegroup(
+    name = "test_data",
+    srcs = glob(["test/data/*.jpg", "test/data/*.txt"]),
+)

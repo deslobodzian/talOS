@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -151,6 +152,30 @@ TEST(Node, PeriodComesFromTheSubsystemElseTheRobot) {
   EXPECT_EQ(sim.node("talker").period(), 10ms);
   EXPECT_EQ(sim.node("listener").period(), 5ms);
   EXPECT_EQ(detail::NodeAccess::freshness_timeout(sim.node("listener")), 100ms);
+}
+
+TEST(Node, SessionDirIsAbsentByDefaultAndSetThroughTheSim) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Empty>("listener");
+  EXPECT_FALSE(sim.node("listener").session_dir().has_value());
+
+  // A launched node's session dir is fixed at construction: setting the Sim
+  // dir only affects nodes added after the call.
+  auto with_dir = Sim::FromToml(kRobotToml);
+  with_dir.set_session_dir(std::filesystem::path{"/tmp/talos_session"});
+  with_dir.add<Empty>("listener");
+  const auto dir = with_dir.node("listener").session_dir();
+  if (!dir.has_value()) {
+    FAIL() << "session directory is absent";
+  }
+  EXPECT_EQ(dir->string(), "/tmp/talos_session");
+
+  // Clearing it before adding a node leaves that node with none.
+  auto cleared = Sim::FromToml(kRobotToml);
+  cleared.set_session_dir(std::filesystem::path{"/tmp/talos_session"});
+  cleared.set_session_dir(std::nullopt);
+  cleared.add<Empty>("listener");
+  EXPECT_FALSE(cleared.node("listener").session_dir().has_value());
 }
 
 // --- topics ----------------------------------------------------------------

@@ -23,6 +23,9 @@ receive; enforce them. These are the review-specific traps.
   subscription skips the mode, release and freshness rules).
 - A message changed in size or layout without every C++/Python/Studio consumer
   updated (Studio TS bindings come from `pnpm generate`).
+- A UDP frame, payload codec, device cap, shared-memory slot size, or telemetry
+  frame budget changed without updating `docs/DATA_FLOW.md` and its matching
+  compile-time size assert in the same change.
 - `talOS/` gaining a dependency on a robot, an example, or `studio/`.
 
 ## Verification gaps (concern)

@@ -9,19 +9,15 @@ import {
   decode,
   JitterBuffer,
   MAX_FRAME_BYTES,
+  poseError,
+  simTruthPose,
   TelemetryDecoder,
   Timeline,
 } from '../src/core';
 import {demoPacket} from '../src/demo';
+import {ChannelInfo} from '../src/generated/talos/telemetry/channel-info';
 import {Frame} from '../src/generated/talos/telemetry/frame';
 import {Pose} from '../src/generated/talos/telemetry/pose';
-import {
-  type GraphTab,
-  isGraphTabId,
-  isTabId,
-  newGraphTab,
-  parseGraphTabs,
-} from '../src/tabs';
 
 // Prime the shared decoder with the dictionary frame, as a bridge does on
 // connect, so bare value frames below can be named.
@@ -29,10 +25,20 @@ decode(demoPacket(0n));
 const frame = (i: number) => decode(demoPacket(BigInt(i)))!;
 
 // A bare value frame (no dictionary) for `dictionaryId`, built the way a
-// producer that already sent its dictionary builds every later frame.
+// producer builds every later frame. Options also support custom dictionaries
+// and chassis headings for decoder-level derived-channel tests.
 function valueFrame(sequence: bigint, dictionaryId: number,
-                    values: number[], streamId = 42n): Uint8Array {
+                    values: number[], streamId = 42n,
+                    options: {dictionary?: string[]; yaw?: number} = {}): Uint8Array {
   const b = new Builder(256);
+  const dictionary = options.dictionary ?
+      Frame.createDictionaryVector(b, options.dictionary.map(name => {
+        const text = b.createString(name);
+        ChannelInfo.startChannelInfo(b);
+        ChannelInfo.addName(b, text);
+        return ChannelInfo.endChannelInfo(b);
+      })) :
+      undefined;
   const vector = Frame.createValuesVector(b, values);
   Frame.startFrame(b);
   Frame.addStreamId(b, streamId);
@@ -40,7 +46,9 @@ function valueFrame(sequence: bigint, dictionaryId: number,
   Frame.addTimestampNs(b, 1000000000n + sequence * 20000000n);
   Frame.addDictionaryId(b, dictionaryId);
   Frame.addValues(b, vector);
-  Frame.addChassis(b, Pose.createPose(b, 1, 2, 0, 0, 0, 0));
+  if (dictionary !== undefined) Frame.addDictionary(b, dictionary);
+  Frame.addChassis(
+      b, Pose.createPose(b, 1, 2, 0, 0, 0, options.yaw ?? 0));
   Frame.finishSizePrefixedFrameBuffer(b, Frame.endFrame(b));
   return b.asUint8Array();
 }
@@ -155,65 +163,161 @@ test(
             b.at(1000000000n + BigInt(i) * 20000000n));
     });
 
-
-// --- graph tabs -------------------------------------------------------------
-
-test('a graph tab id is distinguishable from a built-in view id', () => {
-  const created = newGraphTab([]);
-  assert.ok(isGraphTabId(created.id));
-  assert.ok(!isTabId(created.id));
-  // The built-in ids must not be mistaken for graphs, or selecting one would
-  // render an empty graph panel instead of the view.
-  for (const id of ['overview', 'system', 'signals', 'field'])
-    assert.ok(!isGraphTabId(id), id);
-  // A bare prefix names no graph.
-  assert.ok(!isGraphTabId('graph:'));
-});
-
-test('graph tabs are numbered from the labels in use, not the count', () => {
-  let tabs: GraphTab[] = [];
-  tabs = [...tabs, newGraphTab(tabs)];
-  tabs = [...tabs, newGraphTab(tabs)];
-  assert.deepEqual(tabs.map(t => t.label), ['Graph 1', 'Graph 2']);
-  assert.notEqual(tabs[0].id, tabs[1].id);
-
-  // Closing the first and adding another must not produce a second "Graph 2".
-  const after = tabs.filter(t => t.label !== 'Graph 1');
-  const next = newGraphTab(after);
-  assert.equal(next.label, 'Graph 3');
-
-  // A renamed tab does not constrain the numbering.
-  assert.equal(newGraphTab([{id: 'graph:a', label: 'Shooter', channels: []}]).label,
-               'Graph 1');
-});
-
-test('stored graph tabs are validated, because they come back as unknown JSON',
+test('sim truth reads flattened dictionary channels, independently of estimate validity',
      () => {
-       assert.deepEqual(parseGraphTabs(null), []);
-       assert.deepEqual(parseGraphTabs('not an array'), []);
-       assert.deepEqual(parseGraphTabs([1, null, 'x']), []);
+       const snapshot = frame(0);
+       const truth = simTruthPose({
+         ...snapshot,
+         channels: {
+           'sim/state/pose/x_m': 0,
+           'sim/state/pose/y_m': 2,
+           'sim/state/pose/yaw_rad': -.5,
+           'pose/valid': 0
+         }
+       });
+       assert.deepEqual(truth, {x: 0, y: 2, yaw: -.5});
+       assert.notDeepEqual(truth, snapshot.chassis);
+     });
 
-       // A tab with no usable id could be neither selected nor closed, which
-       // would strand the user on a panel with no way out.
-       assert.deepEqual(parseGraphTabs([{id: 'nope', label: 'A'}]), []);
-       assert.deepEqual(parseGraphTabs([{id: 'graph:a', label: ''}]), []);
+test('sim truth is absent without all three current finite pose readings', () => {
+  const snapshot = frame(0);
+  assert.equal(simTruthPose(null), null);
+  assert.equal(simTruthPose(undefined), null);
+  assert.equal(simTruthPose({...snapshot, channels: {}}), null);
+  // Units describe dictionary presence, but cannot stand in for a current
+  // reading: TelemetryDecoder omits NaN (absent/stale) values from channels.
+  const decoder = new TelemetryDecoder();
+  decoder.decode(demoPacket(0n));
+  const missing = decoder.decode(
+      valueFrame(1n, 1, [1.75, 0, 12, 2, 0, 0, 0, 1]))!;
+  assert.equal(missing.units['sim/state/pose/x_m'], 'm');
+  assert.equal(simTruthPose(missing), null);
+  for (const name of [
+         'sim/state/pose/x_m', 'sim/state/pose/y_m', 'sim/state/pose/yaw_rad'
+       ]) {
+    for (const value of [undefined, Number.NaN, Infinity, -Infinity]) {
+      const channels = {...snapshot.channels};
+      if (value === undefined) delete channels[name];
+      else channels[name] = value;
+      assert.equal(simTruthPose({...snapshot, channels}), null, `${name}: ${value}`);
+    }
+  }
+});
 
-       // Duplicate ids would give two tabs one identity: closing one would
-       // close both, and React would warn on the repeated key.
-       assert.equal(
-           parseGraphTabs([
-             {id: 'graph:a', label: 'A', channels: []},
-             {id: 'graph:a', label: 'B', channels: []}
-           ]).length,
-           1);
+test('pose error is planar distance and signed estimate-minus-truth heading', () => {
+  const error = poseError(
+      {x: 4, y: 6, yaw: Math.PI / 3}, {x: 1, y: 2, yaw: 0});
+  assert.equal(error.position_m, 5);
+  assert.ok(Math.abs(error.heading_deg - 60) < 1e-10);
+  assert.deepEqual(
+      poseError({x: 0, y: 0, yaw: 0}, {x: 0, y: 0, yaw: 0}),
+      {position_m: 0, heading_deg: 0});
+});
 
-       // Channels are filtered rather than trusted; a non-string would reach
-       // uPlot as a series label and render as "[object Object]".
-       assert.deepEqual(
-           parseGraphTabs([{id: 'graph:a', label: 'A', channels: ['x', 2, null]}]),
-           [{id: 'graph:a', label: 'A', channels: ['x']}]);
+test('pose heading error wraps both directions across 180 degrees and full turns',
+     () => {
+       const radians = Math.PI / 180;
+       for (const [estimate, truth, expected] of [
+              [-179, 179, 2], [179, -179, -2], [721, -1, 2],
+              [-721, 1, -2], [180, 0, 180], [-180, 0, -180]
+            ]) {
+         const error = poseError(
+             {x: 0, y: 0, yaw: estimate * radians},
+             {x: 0, y: 0, yaw: truth * radians});
+         assert.ok(Math.abs(error.heading_deg - expected) < 1e-10);
+         assert.ok(error.heading_deg >= -180 && error.heading_deg <= 180);
+       }
+     });
 
-       // A missing channels list is an empty graph, not a broken one.
-       assert.deepEqual(parseGraphTabs([{id: 'graph:a', label: 'A'}]),
-                        [{id: 'graph:a', label: 'A', channels: []}]);
+const simPoseChannels = [
+  'sim/state/pose/x_m', 'sim/state/pose/y_m', 'sim/state/pose/yaw_rad',
+  'pose/valid'
+];
+
+test('decoded snapshots derive pose-error channels with units from truth and valid estimates',
+     () => {
+       const snapshot = new TelemetryDecoder().decode(valueFrame(
+           0n, 7, [4, 6, -Math.PI / 3, 1], 42n,
+           {dictionary: simPoseChannels}))!;
+       assert.equal(snapshot.channels['derived/pose_error_m'], 5);
+       assert.ok(
+           Math.abs(snapshot.channels['derived/heading_error_deg'] - 60) < 1e-10);
+       assert.equal(snapshot.units['derived/pose_error_m'], 'm');
+       assert.equal(snapshot.units['derived/heading_error_deg'], 'deg');
+       assert.equal(snapshot.channels['sim/state/pose/x_m'], 4);
+     });
+
+test('derived pose-error readings are absent, not zero, when truth or a valid estimate is absent',
+     () => {
+       for (const {dictionary, values} of [
+              {dictionary: ['pose/valid'], values: [1]},
+              {dictionary: simPoseChannels, values: [4, 6, 0, 0]},
+              {dictionary: simPoseChannels, values: [4, 6, 0, 2]},
+              {dictionary: simPoseChannels, values: [Number.NaN, 6, 0, 1]},
+              {dictionary: simPoseChannels, values: [4, Number.NaN, 0, 1]},
+              {dictionary: simPoseChannels, values: [4, 6, Number.NaN, 1]},
+              {dictionary: simPoseChannels, values: [4, 6]}
+            ]) {
+         const snapshot = new TelemetryDecoder().decode(valueFrame(
+             0n, 7, values, 42n, {dictionary}))!;
+         for (const name of ['derived/pose_error_m', 'derived/heading_error_deg']) {
+           assert.equal(name in snapshot.channels, false);
+           assert.equal(name in snapshot.units, false);
+         }
+       }
+     });
+
+test('derived heading series wraps both directions across 180 degrees', () => {
+  for (const [estimate, truth, expected] of [[-179, 179, 2], [179, -179, -2]]) {
+    const snapshot = new TelemetryDecoder().decode(valueFrame(
+        0n, 7, [1, 2, truth * Math.PI / 180, 1], 42n,
+        {dictionary: simPoseChannels, yaw: estimate * Math.PI / 180}))!;
+    assert.equal(snapshot.channels['derived/pose_error_m'], 0);
+    assert.ok(
+        Math.abs(snapshot.channels['derived/heading_error_deg'] - expected) < 1e-10);
+  }
+});
+
+test('wire channels cannot impersonate Studio-derived series', () => {
+  assert.throws(
+      () => new TelemetryDecoder().decode(valueFrame(
+          0n, 7, [1], 42n, {dictionary: ['derived/pose_error_m']})),
+      /Reserved derived\//);
+});
+
+test('derived series persist in history through seek and replay', () => {
+  const decoder = new TelemetryDecoder();
+  const coordinator = new Coordinator();
+  for (const sequence of [0n, 1n, 2n])
+    coordinator.timeline.append(decoder.decode(demoPacket(sequence))!);
+  coordinator.seek(1000000000n);
+  const first = coordinator.snapshot()!;
+  const error = first.channels['derived/pose_error_m'];
+  assert.ok(error > 0);
+  coordinator.mode = 'REPLAY_PLAYING';
+  coordinator.tick(40000000n);
+  assert.notEqual(coordinator.snapshot()!.channels['derived/pose_error_m'], error);
+  coordinator.seek(1000000000n);
+  assert.equal(coordinator.snapshot()!.channels['derived/pose_error_m'], error);
+  assert.equal(coordinator.timeline.exact(1000000000n), first);
+});
+
+test('demo dictionary and bare frames carry a small estimate offset from truth',
+     () => {
+       const decoder = new TelemetryDecoder();
+       for (const sequence of [0n, 1n, 80n]) {
+         const snapshot = decoder.decode(demoPacket(sequence))!;
+         const truth = simTruthPose(snapshot);
+         assert.ok(truth);
+         const error = poseError(snapshot.chassis, truth);
+         assert.ok(error.position_m > .1 && error.position_m < .2);
+         assert.ok(error.heading_deg > 1 && error.heading_deg < 2);
+         assert.equal(snapshot.units['sim/state/pose/yaw_rad'], 'rad');
+         assert.equal(
+             snapshot.channels['derived/pose_error_m'], error.position_m);
+         assert.equal(
+             snapshot.channels['derived/heading_error_deg'], error.heading_deg);
+         assert.equal(snapshot.units['derived/pose_error_m'], 'm');
+         assert.equal(snapshot.units['derived/heading_error_deg'], 'deg');
+       }
      });

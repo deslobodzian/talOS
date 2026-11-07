@@ -1,0 +1,138 @@
+/* Plot panel: toolbar over a body that splits into a collapsible channel
+ * drawer (left) and the uPlot chart (right). The chart fills the panel; the
+ * drawer's list fills the drawer height and scrolls. */
+
+.plot-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.plot-toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 10px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.plot-toolbar label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.plot-toolbar select {
+  font-size: 11px;
+}
+.plot-toolbar .spacer {
+  flex: 1;
+}
+.drawer-toggle {
+  border: 1px solid var(--border-2);
+  background: var(--surface-2);
+  color: var(--text-2);
+  padding: 4px 9px;
+  border-radius: var(--radius-sm);
+  font-size: 10px;
+}
+.drawer-toggle.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.events-toggle {
+  cursor: pointer;
+}
+.events-toggle input {
+  accent-color: var(--accent);
+}
+
+.plot-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* Channel drawer: fills the panel height; its list scrolls. */
+.channel-drawer {
+  width: 240px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border-soft);
+  padding: 10px 10px 10px 12px;
+  gap: 8px;
+  min-height: 0;
+}
+.channel-drawer .search {
+  flex: none;
+  max-width: none;
+  width: 100%;
+}
+.channel-drawer-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font: 10px var(--font-mono);
+}
+.channel-drawer-group h4 {
+  margin: 8px 0 3px;
+  font: 8px var(--font-sans);
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.channel-drawer-group label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+  color: var(--text-3);
+}
+.channel-drawer-group label:hover {
+  background: var(--surface-hover);
+}
+.channel-drawer-group label.selected {
+  color: var(--accent);
+}
+.channel-drawer-group label input {
+  accent-color: var(--accent);
+}
+.channel-drawer-group label em {
+  font-style: normal;
+  color: #6e839a;
+  margin-left: auto;
+}
+.channel-drawer-empty {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.plot {
+  flex: 1;
+  min-width: 0;
+  min-height: 170px;
+  overflow: hidden;
+  padding: 6px 12px;
+}
+.plot-empty {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.uplot {
+  font: 9px var(--font-mono) !important;
+}
+.u-legend {
+  font-size: 9px;
+}

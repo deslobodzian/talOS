@@ -1,0 +1,27 @@
+[subsystem]
+name = "front_left_camera"
+node = "//2026-robot/main_processor/vision:front_left_camera"
+defaults = "vision.toml"
+
+[camera]
+id = 0
+device = ""
+# latency_offset_us defaults to 0; set this camera's measured capture-stamp bias.
+# sim_timestamp_lag_us defaults to 0 and is injected only by accuracy scenarios.
+x_m = 0.25
+y_m = 0.2
+z_m = 0.45
+roll_rad = 0.0
+pitch_rad = 0.2617993877991494
+yaw_rad = 0.7853981633974483
+fx = 910.5
+fy = 910.5
+cx = 640.0
+cy = 360.0
+width = 1280
+height = 720
+max_range_m = 8.0
+min_tag_px = 12
+facing_min = 0.2
+pixel_noise_std = 0.5
+rng_seed = 1000

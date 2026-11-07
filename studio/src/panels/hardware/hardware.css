@@ -1,0 +1,139 @@
+/* Hardware panel (link / power / clock / counters). */
+
+.hardware {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  align-content: start;
+  overflow: auto;
+  padding: 16px;
+}
+
+.hardware > .card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius-md);
+}
+
+.hardware > .card.wide {
+  grid-column: 1 / -1;
+}
+
+.hardware > .card > .card-heading {
+  height: 38px;
+  padding: 0 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+}
+
+.hardware > .card > .card-heading h2 {
+  font-size: 12px;
+  font-weight: 500;
+  margin: 0;
+}
+
+.hardware > .card > .card-heading > span {
+  font-size: 8px;
+  letter-spacing: 1.2px;
+  color: #738a9e;
+}
+
+.hardware .stat-list {
+  padding: 10px 14px 4px;
+}
+
+.hw-block {
+  padding: 12px 14px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.hw-block:first-of-type {
+  border-top: none;
+}
+
+.hw-block h3 {
+  font-size: 11px;
+  font-weight: 500;
+  margin: 0 0 8px;
+  color: var(--text-2);
+}
+
+.chart-note {
+  margin: 6px 0 0;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.bit-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.bit-list li {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-size: 11px;
+  background: #131f2c;
+  color: #c3d4e3;
+}
+
+.bit-list li.set {
+  border-left: 2px solid var(--warn);
+}
+
+.bit-list li.clear {
+  border-left: 2px solid #3f4c5c;
+  color: var(--text-3);
+}
+
+.bit-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.bit-state {
+  color: var(--warn);
+  font-weight: 500;
+}
+
+.bit-list li.clear .bit-state {
+  color: var(--muted);
+}
+
+.bit-last {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.counter-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.counter-cell b {
+  font-weight: 500;
+  color: var(--text-2);
+}
+
+.counter-cell span {
+  font-size: 10px;
+  color: var(--muted);
+  max-width: 60ch;
+}

@@ -52,6 +52,8 @@ int main(int argc, char** argv) {
         options.simulation = true;
       } else if (arg == "--start-sim-gateway") {
         options.start_sim_gateway = true;
+      } else if (arg == "--sim-gateway-arg" && i + 1 < argc) {
+        options.sim_gateway_args.emplace_back(argv[++i]);
       } else if (arg == "--start-studio-bridge") {
         options.start_studio_bridge = true;
       } else if (arg == "--studio-http-port" && i + 1 < argc) {
@@ -82,7 +84,8 @@ int main(int argc, char** argv) {
             << "usage: launcher (--config PATH | --bundle PATH) "
                "[--output-dir PATH] "
                "[--duration-s N] [--session-id ID] [--sim] "
-               "[--start-sim-gateway] [--start-studio-bridge] "
+               "[--start-sim-gateway [--sim-gateway-arg ARG]...] "
+               "[--start-studio-bridge] "
                "[--studio-http-port PORT] [--describe-only] "
                "[--allow-graph-errors] [--describe-timeout-ms MS] "
                "[--max-restarts N] "
@@ -97,6 +100,10 @@ int main(int argc, char** argv) {
                "[robot] controller_port (default 5802)\n"
                "  --local-port PORT      local bind port; overrides "
                "[robot] local_port (default 5803)\n"
+               "  --sim-gateway-arg ARG  pass one argument verbatim to the "
+               "gateway's probe and runtime;\n"
+               "                         repeat for each argument, requires "
+               "--start-sim-gateway\n"
                "  --describe-only        ask every node in the config "
                "what it is, lint the\n"
                "                         graph they describe, and exit "

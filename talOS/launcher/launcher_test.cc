@@ -178,6 +178,34 @@ can_id = 1
       0);
 }
 
+TEST(LauncherTest, SimGatewayArgumentsReachOnlyGatewaySpecInOrder) {
+  const auto config = config::ParseRobotConfigString(kFixtureToml);
+  LauncherOptions options;
+  options.simulation = true;
+  options.start_sim_gateway = true;
+  for (const auto& spec : DiscoverNodes(config, options)) {
+    EXPECT_TRUE(spec.extra_args.empty());
+  }
+  options.sim_gateway_args = {"--physics", "--start-pose", "3,4,0.5",
+                              "--wheel-radius-error", "0.1"};
+  bool found_gateway = false;
+  for (const auto& spec : DiscoverNodes(config, options)) {
+    if (spec.name == "sim_gateway") {
+      found_gateway = true;
+      EXPECT_EQ(spec.extra_args, options.sim_gateway_args);
+    } else {
+      EXPECT_TRUE(spec.extra_args.empty());
+    }
+  }
+  EXPECT_TRUE(found_gateway);
+  options.start_sim_gateway = false;
+  for (const auto& spec : DiscoverNodes(config, options)) {
+    EXPECT_NE(spec.name, "sim_gateway");
+    EXPECT_TRUE(spec.extra_args.empty());
+  }
+  EXPECT_EQ(Launcher{options}.Run(), 1);
+}
+
 TEST(LauncherTest, StudioBridgeNeedsFlagAndSim) {
   const auto has_bridge = [](const std::vector<NodeSpec>& nodes) {
     return std::count_if(nodes.begin(), nodes.end(), [](const NodeSpec& n) {

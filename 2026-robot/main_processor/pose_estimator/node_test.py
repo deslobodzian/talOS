@@ -190,6 +190,45 @@ class EstimatorTest(unittest.TestCase):
                 self.assertEqual(self.counts(), (1, 0))
                 self.assertGreater(self.pose()[0], 0.1)
 
+    def test_single_tag_yaw_innovation_gate_and_multitag_relocalization(self):
+        for backend in BACKENDS:
+            for yaw, count, accepted in ((0.2, 1, True), (0.3, 1, False),
+                                         (-0.3, 1, False), (0.6, 2, True)):
+                with self.subTest(backend=backend, yaw=yaw, tag_count=count):
+                    chassis = self.start(backend)
+                    before = self.pose()
+                    self.observe(yaw=yaw, tag_count=count)
+                    chassis.hold(DT)
+                    self.assertEqual(self.counts(), (1, 0) if accepted else (0, 1))
+                    if not accepted:
+                        self.assertPoseHeld(before)
+
+    def test_single_tag_yaw_innovation_wraps_at_pi(self):
+        for backend in BACKENDS:
+            for sign in (-1, 1):
+                with self.subTest(backend=backend, sign=sign):
+                    initial = sign * (math.pi - 0.03)
+                    chassis = self.start(
+                        backend, extra=f"initial_yaw_rad = {initial}")
+                    self.observe(yaw=-initial, tag_count=1)
+                    chassis.hold(DT)
+                    self.assertEqual(self.counts(), (1, 0))
+
+    def test_yaw_innovation_limit_is_configurable_and_positive_finite(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend, configured=True):
+                chassis = self.start(
+                    backend, extra="max_yaw_innovation_rad = 0.1")
+                self.observe(yaw=0.11, tag_count=1)
+                chassis.hold(DT)
+                self.assertEqual(self.counts(), (0, 1))
+            for value in ("0.0", "-0.1", "nan", "inf"):
+                with self.subTest(backend=backend, value=value):
+                    sim = Sim.from_toml(robot_toml(
+                        backend, extra=f"max_yaw_innovation_rad = {value}"))
+                    with self.assertRaisesRegex(Exception, "max_yaw_innovation_rad"):
+                        sim.add(estimator.PoseEstimator, "pose_estimator")
+
     def test_odometry_tracks_a_straight_line_then_an_arc(self):
         for backend in BACKENDS:
             with self.subTest(backend):

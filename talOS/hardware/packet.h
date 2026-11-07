@@ -20,6 +20,7 @@ struct Packet {
                                : std::span<const uint8_t>{};
   }
 };
+static_assert(sizeof(Packet) == 1436, "Update docs/DATA_FLOW.md");
 
 // The topics either end of the controller link is addressed by.
 //

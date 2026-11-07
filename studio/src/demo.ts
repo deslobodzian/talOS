@@ -28,6 +28,9 @@ const DEMO_CHANNELS: {name: string; unit: string; labels?: string[]}[] = [
   {name: 'vx', unit: 'm/s'},
   {name: 'vy', unit: 'm/s'},
   {name: 'mode', unit: '', labels: ['disabled', 'teleop', 'auto']},
+  {name: 'sim/state/pose/x_m', unit: 'm'},
+  {name: 'sim/state/pose/y_m', unit: 'm'},
+  {name: 'sim/state/pose/yaw_rad', unit: 'rad'},
 ];
 
 export function demoPacket(sequence: bigint): Uint8Array {
@@ -58,7 +61,11 @@ export function demoPacket(sequence: bigint): Uint8Array {
   const values = Frame.createValuesVector(b, [
     1.75, yaw, 12.4 - .8 * Math.sin(t * .7), 2, .2 * Math.sin(t * 2),
     -1.75 * Math.sin(t * .35), .875 * Math.cos(t * .35),
-    Number(sequence / 50n % 3n)
+    Number(sequence / 50n % 3n),
+    // The estimate has a small translation/heading bias relative to truth.
+    // The shared decoder turns this into the derived/ pose-error series,
+    // exactly as it does for live telemetry and imported recordings.
+    x - .12 - .03 * Math.sin(t * .2), y + .08, yaw - .025
   ]);
   Frame.startFrame(b);
   Frame.addStreamId(b, DEMO_STREAM_ID);

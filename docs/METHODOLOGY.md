@@ -164,6 +164,7 @@ code the table is `talOS/schema/unit_suffix.h`.
 | timestamp | `_ns` | ns, talos monotonic clock (`node.now()`), `uint64` | when a sample was taken |
 | duration | `_us` | µs, integer | periods, timeouts, ages, in TOML and messages |
 | length | `_m`, `_mps`, `_mps2` | m, m/s, m/s² | field and chassis |
+| image distance | `_px` | pixels | image corners, reprojection noise, detector size gates |
 | field-frame angle | `_rad`, `_radps`, `_radps2` | rad, CCW+ | heading, pose yaw, chassis ω |
 | shaft or joint angle | `_rot`, `_rps`, `_rps2` | rotations of the **mechanism**, after `sensor_to_mechanism_ratio` | motors, CANcoders, wrists, flywheels |
 | electrical | `_v`, `_a`, `_w` | V, A, W | |
@@ -181,8 +182,9 @@ Rules:
 - **Conversions happen at a named boundary, once.** The device layer speaks
   shaft units (`_rot`). A node that turns a shaft angle into a field-frame
   angle (a gyro yaw into a heading) converts there and publishes `_rad`. In
-  C++ math, use wpimath's `units::` types and geometry classes at that boundary
-  (§14); in Python, `math.tau`. talos adds no units library of its own. **[review]**
+  C++ math, use plain `double` with unit-suffixed names and
+  `talos::geometry` types for frame transforms (§14); in Python, `math.tau`.
+  talos adds no units library of its own. **[review]**
 - **TalonFX gains** (`slot0..2`) are in Phoenix units per **mechanism** unit,
   because `sensor_to_mechanism_ratio` is applied: `v` is volts per mechanism
   rot/s, so `v ≈ 12 / free_speed_mechanism_rps`. Rotor-side gains on a geared
@@ -280,7 +282,7 @@ intake; the whole graph used ≈ 4.5 % of one core.
 | Rule | Budget | Status |
 |---|---|---|
 | `update()` p99 wall time | ≤ 10 % of `period_us` | [review]; read `max_latency` in the registry / Studio system view |
-| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | [review]; the drivetrain's `UpdateDoesNotAllocate` counts every allocation in the process, wpimath's included (macOS only; §13) |
+| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | [review]; the drivetrain's `UpdateDoesNotAllocate` counts process-wide allocations (macOS only; §13) |
 | Python nodes | fine for any period ≥ 5 ms: they cost memory (≈ 30 MB), not jitter | [review] |
 | Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [review]; producer → consumer is one hop (`Target` resolves lanes in the consumer) |
 | Per-tick work | O(devices), never O(history); bound every loop | [review] |
@@ -336,7 +338,7 @@ producer that has drained it would.
 |---|---|---|
 | A mechanism | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py`; fill in the TOML; write the §11 tests | edit `operator_interface` or `telemetry` code |
 | A producer of a target (auto routine, auto-align) | a `talos::TargetLane` on `/<sub>/target/<source>`; list `<source>` in `[robot.targets]` or that subsystem's `[targets]` (the launcher refuses a lane no mode lists) | subscribe to another producer's lane, or write a lane someone else writes |
-| A process without hardware (pose estimator, vision, auto) | a node with no devices; subscribe to `state` topics; publish `/<me>/state` every tick with validity, while disabled too (no actuation gate on computation); do the math with wpimath or GTSAM (§14); `bazel run //tools:new_subsystem -- <name> --type estimator`; walkthrough in DESIGN_AUTOMATIC_WIRING.md §D6 | read `/hw/state` directly; hand-roll a Kalman filter or kinematics |
+| A process without hardware (pose estimator, vision, auto) | a node with no devices; subscribe to `state` topics; publish `/<me>/state` every tick with validity, while disabled too (no actuation gate on computation); reuse `talos::geometry`/`talOS/vision` in C++, RobotPy or GTSAM in Python (§14); `bazel run //tools:new_subsystem -- <name> --type estimator`; walkthrough in DESIGN_AUTOMATIC_WIRING.md §D6 | read `/hw/state` directly; duplicate shared geometry or hand-roll a Kalman filter |
 | A message | the owning package's `.fbs` and `talos_messages(topics = ...)`; §6 and §7 | a hand-written C++/Python mirror |
 | A device type | `talOS/hardware`, `talOS/devices`, `devices.py`, the RoboRIO program, in one change | |
 | A node-API feature | `talOS/node` (or `devices`), `talOS/node_api`, `talOS/python/talos`, tests in both languages, in one change | a Python-only reimplementation |
@@ -351,8 +353,8 @@ touch the code, or under the design item named.
 | `driver.h` | chassis-only teleop driving; mechanism bindings moved to `[[teleop.bindings]]` | §7, §8 | done: D4 |
 | `driver.toml` | `deadband_frac` | §6, §8 | done: D4 |
 | `intake.py:18` | fixed `INTAKE_RPS` ignores the requested speed | §3 | use the target's demand |
-| `drivetrain/swerve.h` `SwerveKinematics::ToModuleStates` | wheel speeds are desaturated by hand, not with wpimath's `DesaturateWheelSpeeds` (the kinematics, `Optimize` and forward kinematics are wpimath's `SwerveDriveKinematics<4>`) | §14 | `DesaturateWheelSpeeds` takes one attainable speed for every module, while `[geometry]` gives each module its own `wheel_radius_m` and drive `max_velocity_rps`; keep until wpimath takes per-module limits |
-| `drivetrain/node_test.cc` `UpdateDoesNotAllocate` | the process-wide allocation check (`malloc_logger`, so libwpimath counts) runs on macOS only; on Linux it is skipped | §10 | a glibc-compatible allocation hook (glibc removed `__malloc_hook` in 2.34) |
+| `drivetrain/node_test.cc` `UpdateDoesNotAllocate` | the process-wide allocation check (`malloc_logger`) runs on macOS only; on Linux it is skipped | §10 | a glibc-compatible allocation hook (glibc removed `__malloc_hook` in 2.34) |
+| `2026-robot/main_processor/vision/vision.h` simulation path | render/detect/solve runs synchronously in `update()`, allocating inside rasterization/detection/PnP within a configured 10 ms node period; this sim-only cost preserves deterministic replay (live work is off-thread) | §10 | reusable allocation-free detector/solver workspaces and deterministic simulated compute scheduling; fast-projection tag/detection buffers and the raster image are already reused |
 
 ## 14. Open source first
 
@@ -381,9 +383,9 @@ A dependency is adopted when it meets all of these:
 | Serialization, schemas, reflection | FlatBuffers (structs, and `reflection.fbs`/`.bfbs` for runtime schemas) | in use: `.bfbs` descriptors, schema hashes, hash-checked attach, descriptor-bearing logs and reflection codec |
 | Config | TOML: toml++ (C++), `tomllib` (Python stdlib) | in use |
 | Tests | googletest, `unittest` | in use |
-| Geometry, kinematics, pose estimation, trajectories, profiles, PID, filters | wpimath 2026.2.1 (C++: WPILib's Maven release artifacts through `third_party/wpilib`, `//third_party/wpilib:wpimath`, shared libraries staged in a bundle's `lib/`; Python: `robotpy-wpimath` 2026.2.1.1 on the same native build). allwpilib 2026 has no `MODULE.bazel` and no BCR entry. `//2026-robot/controller_processor/rio:wpilib_lockstep_test` keeps the Maven pin, the `robotpy-native-wpimath` pin and GradleRIO on one release | in use (D6): drivetrain kinematics (`SwerveDriveKinematics<4>`) and `units::` boundary conversions, the pose estimator's `kalman` backend (`SwerveDrive4PoseEstimator`); built and run on macOS arm64; the Linux artifacts are wired but not built here |
+| Geometry, kinematics and pose estimation | C++: header-only `talos::geometry` SO2/SE2/SO3/SE3 on Eigen 3.4 (`@eigen3`); drivetrain inverse/forward swerve kinematics use it with per-module speed limits. Python: `robotpy-wpimath` 2026.2.1.1 | in use: shared C++ frame math and the Python pose estimator's `kalman` backend; `wpilib_lockstep_test` aligns GradleRIO with the RobotPy native/wrapper wheels only |
 | Smoothing and mapping (factor graphs) | GTSAM 4.3.0 (`gtsam` wheel on PyPI, BSD) | in use (D6): the pose estimator's `factor_graph` backend (`IncrementalFixedLagSmoother`). Python only: GTSAM has no Bazel module, and its C++ build is CMake with a large dependency surface |
-| Vision: AprilTag pose observations | PhotonVision on the camera coprocessor; `photonlibpy`/photonlib, or `apriltag`/`robotpy-apriltag` for an in-process pipeline | candidate (D6) |
+| Vision: AprilTag pose observations | `talOS/vision`: upstream AprilTag 3.4.5 (`@apriltag`), OpenCV 4.12 conversion/IO, Metal preprocessing/CCL on macOS, AVFoundation/V4L2 capture | in use: typed detector options, decode-margin/Hamming validity gates before localization, undistorted homography, robust joint single/multi-tag corner solving with floor/tilt priors, marginalized field-frame x/y/yaw covariance and configured uncertainty floors; ambiguity unknown=1, verified unique=0; one robot node per camera, 100 Hz status and up to 60 fps live observations, no side-channel server |
 | Autonomous paths | Choreo or PathPlanner trajectories, followed with wpimath controllers | candidate |
 | Log viewing | export `.tlog` to MCAP (Foxglove) or WPILOG (AdvantageScope) rather than building more viewer features | candidate |
 | RoboRIO hardware | WPILib HAL and Phoenix 6 | in use |

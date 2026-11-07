@@ -1,0 +1,225 @@
+/* Session panel (manifest header + merged process table). */
+
+.session {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  align-content: start;
+  overflow: auto;
+  padding: 16px;
+}
+
+.session > .card {
+  display: flex;
+  flex-direction: column;
+  min-height: 120px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.session > .card.wide {
+  grid-column: 1 / -1;
+}
+
+.session > .card > .card-heading {
+  height: 38px;
+  padding: 0 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+}
+
+.session > .card > .card-heading h2 {
+  font-size: 12px;
+  font-weight: 500;
+  margin: 0;
+}
+
+.session > .card > .card-heading > span {
+  font-size: 8px;
+  letter-spacing: 1.2px;
+  color: #738a9e;
+}
+
+/* --- Session header: a responsive key/value grid over the panel width ------ */
+
+.session-fields {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px 20px;
+  padding: 12px 14px 14px;
+}
+
+.session-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+/* Config and output paths get the full width so their middle-ellipsis has room
+   instead of wrapping mid-word in a narrow column. */
+.session-field.wide {
+  grid-column: 1 / -1;
+}
+
+.session-field-label {
+  font-size: 9px;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.session-field-value {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: #cadaea;
+}
+
+/* --- Paths: one line, middle ellipsis, full value on hover + copy ---------- */
+
+.path-value {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.path-line {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+.path-line .path-head {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.path-line .path-tail {
+  flex-shrink: 0;
+}
+
+.sha {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.copy {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  font-size: 9px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: none;
+  cursor: pointer;
+}
+
+.copy:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* --- Processes ------------------------------------------------------------ */
+
+.session-counts {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+/* Columns keep their natural width and the table scrolls horizontally rather
+   than wrapping long values or clipping them. */
+.session-table td {
+  white-space: nowrap;
+}
+
+.session-table td b {
+  margin-right: 6px;
+}
+
+.session-table code.target {
+  font-family: var(--font-mono);
+}
+
+.session-table .mono {
+  font-family: var(--font-mono);
+}
+
+.session-table .alive-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.session-table .log-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 420px;
+}
+
+/* A process row with a problem: tinted, with a left edge so the eye finds it
+   even before reading the tags. The tags below carry the words. */
+.session-table tr.problem td {
+  background: rgba(255, 157, 176, 0.06);
+}
+
+.session-table tr.problem td:first-child {
+  box-shadow: inset 3px 0 0 var(--warn);
+}
+
+/* One problem per tag, each with its own color so the five kinds stay apart
+   at a glance even without reading. */
+.problem-tag {
+  display: inline-block;
+  font-size: 9px;
+  line-height: 1;
+  padding: 2px 6px;
+  margin: 0 4px 2px 0;
+  border: 1px solid;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+}
+
+.problem-tag.dead {
+  border-color: #8a4a58;
+  color: #ff9db0;
+}
+
+.problem-tag.restarted {
+  border-color: #7d6438;
+  color: #ffce8f;
+}
+
+.problem-tag.recorder {
+  border-color: #8a5c3f;
+  color: #ffb182;
+}
+
+.problem-tag.exit {
+  border-color: #8a4a58;
+  color: #ff9db0;
+}
+
+.problem-tag.missing {
+  border-color: #4b4670;
+  color: #b0a8e0;
+}

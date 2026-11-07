@@ -14,6 +14,9 @@ and publishes what comes back on `/hw/state` and `/hw/state/driver_station`.
 In simulation `//2026-robot/main_processor/simulation:sim_gateway` (or the
 RoboRIO program under WPILib simulation) takes the RoboRIO's place.
 
+See [Data flow and byte budgets](docs/DATA_FLOW.md) for every transport,
+producer/consumer, rate, dynamic payload, and shared-memory slot size.
+
 ## Layers
 
 ```
@@ -39,6 +42,9 @@ Allowed dependencies:
   `telemetry`) is driven by TOML configuration.
 - Nodes share only messages and topic names (`talos_messages`), never each
   other's classes.
+- Geometry and vision are reusable libraries beside the node stack:
+  robot camera nodes depend on `talOS/vision`, which depends on
+  `talOS/geometry`, never the reverse.
 
 Beside the stack:
 
@@ -57,7 +63,9 @@ Beside the stack:
 | `talOS/teleop` | `:node` framework teleop node; `:deadband` stick deadband calculation; declarative button/axis-to-lane mapping |
 | `talOS/schema` | `talos::Descriptor<M>` (`.bfbs` bytes, name, schema hash), `talos::schema::struct_hash`, the unit-suffix table; Python `talos_schema` and upstream `reflection` classes |
 | `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle`, `talos_graph_test` (both fed by a config's generated `robot_manifest.bzl`, `tools/sync_manifest.py`) |
-| `third_party/wpilib` | wpimath and wpiutil (C++) from WPILib's Maven release artifacts (`//third_party/wpilib:wpimath`); a bundle stages the shared libraries in `lib/`. Python nodes use the same release through `robotpy-wpimath` in `//talOS/python:requirements.txt` (with `gtsam` for factor graphs) |
+| `talOS/geometry` | header-only SO2/SE2/SO3/SE3 on Eigen 3.4 (`@eigen3`); C++ drivetrain kinematics and vision transforms |
+| `talOS/vision` | camera/frame/backend contracts, calibration, localization and pipeline; AprilTag 3.4.5 CPU detection, macOS Metal preprocessing/CCL, AVFoundation/V4L2 capture, field simulation and fixtures; OpenCV 4.12 image conversion/IO |
+| `talOS/python/requirements.txt` | Python `robotpy-wpimath` pose estimation and GTSAM factor graphs; `wpilib_lockstep_test` aligns GradleRIO with the RobotPy wheels, not C++ dependencies |
 
 ## The tick
 
@@ -200,6 +208,7 @@ the config changes and the manifest does not.
 |---|---|
 | a mechanism | a node package under `<robot>/main_processor/<name>/`, plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` does all of it (walkthrough in [examples/superstructure](examples/superstructure/README.md)) |
 | a mechanism in its own repository | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py --standalone DIR` writes a Bzlmod repo (overriding `@talos` with this checkout); the robot adds `bazel_dep` + `local_path_override`, a subsystem file naming `@<name>//:node`, and its `[[subsystems]]` entry |
+| a camera | its calibrated `configuration/subsystems/<camera>.toml`, a name in `vision/BUILD`'s `CAMERAS`, a `[[subsystems]]` entry and regenerated manifest; list it in the pose estimator's `cameras` |
 | a message or topic | the owning package's `.fbs` and `topics.h` |
 | a producer of an existing target | a `talos::TargetLane` on `/<sub>/target/<source>`, and `<source>` in that subsystem's policy (`[robot.targets]` or its `[targets]`); the launcher refuses a lane no mode lists |
 | a device type | `talOS/hardware` (config + wire), `talOS/devices`, `talOS/python/talos/devices.py`, and the RoboRIO program |

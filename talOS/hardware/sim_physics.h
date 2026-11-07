@@ -23,8 +23,8 @@
 // sim state is fed from the device's voltage output, not from the demand.
 //
 // Sensors cross the hardware boundary. CANcoder samples mirror the linked
-// mechanism. Pigeon yaw integrates swerve module motion unless explicitly
-// overridden with SetGyro or SetChassisYawRate.
+// mechanism. Swerve ground motion determines the true field pose; the Pigeon
+// reports true yaw plus optional drift, unless explicitly overridden.
 //
 // Stopping is consistent. Commanded neutral (Mode::kNeutral, and
 // Neutral() on disable/timeout/failure) removes drive and lets the rotor
@@ -103,6 +103,28 @@ struct SimClock {
 struct AxisState {
   double rotor_position_rot{0.0};
   double rotor_velocity_rps{0.0};
+};
+
+struct PhysicsOptions {
+  double start_x_m{0.0};
+  double start_y_m{0.0};
+  double start_yaw_rad{0.0};
+  double wheel_radius_error_frac{0.0};
+  // Deterministic traction simplification: both acceleration and braking
+  // only reduce ground travel; wheel odometry over-reports either way.
+  double wheel_slip_gain{0.0};
+  double gyro_drift_radps{0.0};
+};
+
+// Blue-alliance field frame: x downfield, y left, yaw CCW+. Velocity is in
+// that same field frame, not the rotating robot frame.
+struct WorldState {
+  double x_m{};
+  double y_m{};
+  double yaw_rad{};
+  double vx_mps{};
+  double vy_mps{};
+  double omega_radps{};
 };
 
 // Single deterministic integration step (rotor side). Returns the new state.
@@ -207,6 +229,10 @@ inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
 // Physics-backed Backend. See the header comment for the item-by-item map.
 class PhysicsSimBackend final : public Backend {
  public:
+  explicit PhysicsSimBackend(PhysicsOptions options = {}) : options_{options} {}
+
+  const WorldState& truth() const { return truth_; }
+
   bool Configure(const Config& config) override {
     config_ = config;
     axes_.fill(AxisState{});
@@ -231,6 +257,9 @@ class PhysicsSimBackend final : public Backend {
     supply_v_ = 12.0;
     yaw_rot_ = 0.0;
     yaw_rate_rps_ = 0.0;
+    truth_ = {options_.start_x_m, options_.start_y_m, options_.start_yaw_rad};
+    gyro_zero_yaw_rad_ = truth_.yaw_rad;
+    elapsed_s_ = 0.0;
     for (std::size_t i = 0; i < config.motors.size(); ++i) {
       const auto& m = config.motors[i];
       held_[i].id = m.id;
@@ -456,9 +485,10 @@ class PhysicsSimBackend final : public Backend {
     SetSupplyVoltage(battery_v);
     brownout_ = brownout;
   }
-  // Zeroes rotor states, latched commands, yaw, and fault flags. Config and
-  // output states are kept; the gateway boot id is gateway-owned and
-  // unaffected (a full reboot epoch bump goes through Reconfigure/Invalidate).
+  // Zeroes rotor states, latched commands, reported gyro, and fault flags.
+  // The physical field pose survives a controller restart; subsequent gyro
+  // samples measure yaw relative to this restart. Drift restarts at zero.
+  // Config/output states and the gateway-owned boot id are unchanged.
   void RestartController() {
     axes_.fill(AxisState{});
     profiles_.fill(Profile{});
@@ -471,8 +501,13 @@ class PhysicsSimBackend final : public Backend {
     sensor_connected_.fill(true);
     yaw_rot_ = 0.0;
     yaw_rate_rps_ = 0.0;
+    gyro_zero_yaw_rad_ = truth_.yaw_rad;
+    elapsed_s_ = 0.0;
+    truth_.vx_mps = truth_.vy_mps = truth_.omega_radps = 0.0;
+    for (auto& module : modules_) module.previous_surface_speed_mps = 0.0;
   }
-  // Chassis motion driving the Pigeon, in mechanism rotations/s.
+  // Explicit reported-gyro overrides, in rotations/s. These do not teleport
+  // the physical robot or change the module-derived ground motion.
   void SetChassisYawRate(double yaw_rate_rps) {
     gyro_override_ = true;
     yaw_rate_rps_ = yaw_rate_rps;
@@ -482,7 +517,7 @@ class PhysicsSimBackend final : public Backend {
     yaw_rot_ = yaw_rot;
   }
   // Override inferred placement, or register arbitrarily named module pairs.
-  // Wheel travel uses the standard 0.0508 m wheel radius.
+  // Wheel travel uses nominal radius 0.0508 m plus the configured error.
   void SetSwerveModuleGeometry(uint16_t drive_id, uint16_t steer_id, double x_m,
                                double y_m) {
     const int drive = MotorIndex(drive_id);
@@ -515,6 +550,8 @@ class PhysicsSimBackend final : public Backend {
   }
 
  private:
+  static constexpr double kTau = 6.28318530717958647692;
+
   struct Profile {
     double profile_pos_rot{};
     double profile_vel_rps{};
@@ -525,13 +562,10 @@ class PhysicsSimBackend final : public Backend {
     std::size_t steer;
     double x_m;
     double y_m;
+    double previous_surface_speed_mps{};
   };
 
   void ConfigureSwerve() {
-    const bool has_gyro = std::any_of(
-        config_.sensors.begin(), config_.sensors.end(),
-        [](const auto& s) { return s.kind == SensorKind::kPigeon2; });
-    if (!has_gyro) return;
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       const auto& name = config_.motors[i].name;
       if (!name.ends_with("_drive")) continue;
@@ -710,25 +744,91 @@ class PhysicsSimBackend final : public Backend {
       axes_[i] = StepAxis(motor, mech, axes_[i], rotor_volts, powered_[i],
                           supply_v_, dt_s);
     }
-    if (!gyro_override_ && !modules_.empty()) {
-      constexpr double kTau = 6.28318530717958647692;
-      double angular_velocity = 0.0;
-      double lever_squared = 0.0;
-      for (const auto& module : modules_) {
-        const double speed = axes_[module.drive].rotor_velocity_rps /
-                             Gear(module.drive) * kTau * 0.0508;
-        const double angle =
-            axes_[module.steer].rotor_position_rot / Gear(module.steer) * kTau;
-        angular_velocity += speed * (module.x_m * std::sin(angle) -
-                                     module.y_m * std::cos(angle));
-        lever_squared += module.x_m * module.x_m + module.y_m * module.y_m;
-      }
-      yaw_rate_rps_ = angular_velocity / lever_squared / kTau;
+    StepChassis(dt_s);
+    elapsed_s_ += dt_s;
+    if (gyro_override_) {
+      yaw_rot_ += yaw_rate_rps_ * dt_s;
+    } else {
+      yaw_rot_ = (truth_.yaw_rad - gyro_zero_yaw_rad_ +
+                  options_.gyro_drift_radps * elapsed_s_) /
+                 kTau;
+      yaw_rate_rps_ = (truth_.omega_radps + options_.gyro_drift_radps) / kTau;
     }
-    yaw_rot_ += yaw_rate_rps_ * dt_s;
+  }
+
+  void StepChassis(double dt_s) {
+    if (dt_s <= 0.0) return;
+    double sum_x = 0.0;
+    double sum_y = 0.0;
+    double sum_vx = 0.0;
+    double sum_vy = 0.0;
+    double moment = 0.0;
+    double lever_squared = 0.0;
+    for (auto& module : modules_) {
+      const double surface_speed = axes_[module.drive].rotor_velocity_rps /
+                                   Gear(module.drive) * kTau * 0.0508 *
+                                   (1.0 + options_.wheel_radius_error_frac);
+      const double acceleration =
+          (surface_speed - module.previous_surface_speed_mps) / dt_s;
+      module.previous_surface_speed_mps = surface_speed;
+      const double slip = std::min(
+          1.0, options_.wheel_slip_gain * std::abs(acceleration) / 9.80665);
+      const double speed = surface_speed * (1.0 - slip);
+      const double angle =
+          axes_[module.steer].rotor_position_rot / Gear(module.steer) * kTau;
+      const double vx = speed * std::cos(angle);
+      const double vy = speed * std::sin(angle);
+      sum_x += module.x_m;
+      sum_y += module.y_m;
+      sum_vx += vx;
+      sum_vy += vy;
+      moment += module.x_m * vy - module.y_m * vx;
+      lever_squared += module.x_m * module.x_m + module.y_m * module.y_m;
+    }
+    double vx = 0.0;
+    double vy = 0.0;
+    double omega = 0.0;
+    if (!modules_.empty()) {
+      // Eliminate translation from the rigid-body least-squares equations
+      // vx - y*omega = wheel_vx, vy + x*omega = wheel_vy. Centering is
+      // essential for module layouts whose centroid is not the robot origin.
+      const double n = static_cast<double>(modules_.size());
+      const double centered_lever =
+          lever_squared - (sum_x * sum_x + sum_y * sum_y) / n;
+      if (centered_lever > 1e-12) {
+        omega =
+            (moment - (sum_x * sum_vy - sum_y * sum_vx) / n) / centered_lever;
+      }
+      vx = (sum_vx + sum_y * omega) / n;
+      vy = (sum_vy - sum_x * omega) / n;
+    }
+    // Exact constant-twist integration over this step avoids an arc's
+    // translation depending on the gateway tick size.
+    const double angle = omega * dt_s;
+    const double sinc = std::abs(angle) < 1e-6 ? 1.0 - angle * angle / 6.0
+                                               : std::sin(angle) / angle;
+    const double cosc = std::abs(angle) < 1e-6
+                            ? angle / 2.0 - angle * angle * angle / 24.0
+                            : (1.0 - std::cos(angle)) / angle;
+    const double dx = dt_s * (sinc * vx - cosc * vy);
+    const double dy = dt_s * (cosc * vx + sinc * vy);
+    const double c = std::cos(truth_.yaw_rad);
+    const double s = std::sin(truth_.yaw_rad);
+    truth_.x_m += c * dx - s * dy;
+    truth_.y_m += s * dx + c * dy;
+    truth_.yaw_rad += angle;
+    truth_.vx_mps =
+        std::cos(truth_.yaw_rad) * vx - std::sin(truth_.yaw_rad) * vy;
+    truth_.vy_mps =
+        std::sin(truth_.yaw_rad) * vx + std::cos(truth_.yaw_rad) * vy;
+    truth_.omega_radps = omega;
   }
 
   Config config_;
+  PhysicsOptions options_;
+  WorldState truth_;
+  double gyro_zero_yaw_rad_{};
+  double elapsed_s_{};
   std::optional<uint64_t> previous_time_;
   std::array<MotorRequest, kMaxMotors> commands_{};
   std::array<AxisState, kMaxMotors> axes_{};

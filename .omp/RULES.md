@@ -20,6 +20,9 @@
 - Actuation is gated on `robot_enabled(node)` and a live target
   (`talos::Target::get()` non-null); never write `/hw/request/<node>` directly.
 - Never set `commissioned = true` or change physical CAN ids in a robot config.
+- Any change to a UDP frame, payload codec, device cap, shared-memory slot size,
+  or telemetry frame budget must update `docs/DATA_FLOW.md` and the matching
+  compile-time size assert in the same change.
 - New node behaviour gets a `Sim`/`SimHardware` (or `talos.testing`) test that
   covers the disabled and stale-target cases. Finish every change with
   `bazel build //...` and `bazel test --test_output=errors //...`, plus launcher

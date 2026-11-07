@@ -1,7 +1,9 @@
 /// <reference lib="webworker" />
 import {handleRpc} from '../agent/rpc';
 
-import {Coordinator, JitterBuffer, TelemetryDecoder, Timeline} from './core';
+import {Coordinator, JitterBuffer, TelemetryDecoder, Timeline, type Snapshot} from './core';
+import {MAX_MANIFEST_BYTES, manifestUrl, parseManifest, type SessionManifest} from './data/manifest';
+import {type Connection, type PlaybackState} from './data/types';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from './demo';
 import {type DeclaredGraph, declaredUrl, MAX_DECLARED_BYTES, parseDeclaredGraph, parseSystemGraph, RateWindow, type SystemGraph} from './system';
 
@@ -13,9 +15,17 @@ let socket: WebSocket|null = null, demo = false, sequence = 0n,
             status = 'Disconnected';
 let packets = new Map<string, Uint8Array>(),
     pendingBytes = new Map<string, Uint8Array>();
-let nextDemo = 0, lastTick = performance.now(), lastView = 0;
+let nextDemo = 0, lastTick = performance.now();
 let retry: ReturnType<typeof setTimeout>|undefined;
 let generation = 0;
+let connection: Connection = 'idle';
+// Frames appended to the timeline since the previous `frames` post, in order.
+// `needsReset` is set whenever the timeline is replaced (connect, demo, a new
+// stream_id, import) so the next post carries `reset: true`.
+let pendingFrames: Snapshot[] = [];
+let needsReset = false;
+let lastPlayback: PlaybackState|null = null;
+let lastPlaybackPost = 0;
 
 // The registry reports cumulative counters, not rates, so a rate needs an
 // older sample to measure against. `previousSystem` is the one immediately
@@ -34,6 +44,15 @@ let nextDemoSystem = 0;
 let declared: DeclaredGraph|null = null;
 let declaredError = '';
 
+// The session manifest, re-polled at 1 Hz while connected: the launcher
+// atomically replaces it throughout a session, so it is a live document rather
+// than a startup snapshot. Absent (404) is "not offered", not an error.
+let manifest: SessionManifest|null = null;
+let manifestError = '';
+let nextManifestPoll = 0;
+let manifestBase: string|null = null;
+let lastManifestRaw: string|null = null;
+
 // Posted only when the graph changes, not on every telemetry tick: it is a few
 // tens of kilobytes and structure changes at 4 Hz, not at the 100 Hz frame rate.
 function postSystem() {
@@ -49,6 +68,48 @@ function postSystem() {
     declared,
     declaredError
   });
+}
+
+// The session manifest, posted on change: it is re-read at 1 Hz, but re-posting
+// an unchanged document would re-render the Session panel for nothing.
+function postManifest() {
+  ctx.postMessage({type: 'manifest', manifest, error: manifestError});
+}
+
+// Every frame appended to the timeline since the previous post, in order,
+// chunked so one message never carries more than 2000 frames. The first chunk
+// after a timeline replacement carries `reset: true`.
+function postFrames() {
+  if (!needsReset && pendingFrames.length === 0) return;
+  while (needsReset || pendingFrames.length > 0) {
+    const chunk = pendingFrames.splice(0, 2000);
+    ctx.postMessage({type: 'frames', reset: needsReset, frames: chunk});
+    needsReset = false;
+    if (pendingFrames.length === 0) break;
+  }
+}
+
+// The playback cursor and stream status, at most every 33 ms and immediately
+// on a discrete change (mode, status, connection). `connection` is derived
+// from the worker's own state rather than stored on the wire.
+function postPlayback(now: number) {
+  const snapshot = coordinator.snapshot();
+  const state: PlaybackState = {
+    mode: coordinator.mode,
+    cursor_ns: snapshot?.timestamp_ns ?? null,
+    bounds: coordinator.timeline.bounds(),
+    stats: {...jitter.stats},
+    status,
+    connection
+  };
+  const discrete = !lastPlayback || lastPlayback.mode !== state.mode ||
+      lastPlayback.status !== state.status ||
+      lastPlayback.connection !== state.connection;
+  if (discrete || now - lastPlaybackPost >= 1000 / 30) {
+    ctx.postMessage({type: 'playback', state});
+    lastPlayback = state;
+    lastPlaybackPost = now;
+  }
 }
 
 // GET /declared.json from the same origin as the telemetry socket.
@@ -103,6 +164,56 @@ function ingestDeclared(text: string) {
   }
 }
 
+// GET /manifest.json, re-read on every request because the launcher replaces
+// it throughout a session. A 404 is "not offered", not a fault: the manifest
+// is null and nothing is reported. A network failure is quiet, for the same
+// reason the declared graph's is. A malformed document keeps the last good
+// manifest and says why this one was refused.
+async function fetchManifest(url: string, gen: number) {
+  const target = manifestUrl(url);
+  if (!target) return;
+  let text: string;
+  try {
+    const response = await fetch(target, {cache: 'no-store'});
+    if (gen !== generation) return;
+    if (response.status === 404) {
+      // "Not offered" is not a fault; it clears whatever the previous bridge
+      // was serving.
+      if (manifest !== null || manifestError !== '') {
+        manifest = null;
+        manifestError = '';
+        lastManifestRaw = null;
+        postManifest();
+      }
+      return;
+    }
+    if (!response.ok) {
+      manifestError = `Session manifest unavailable: HTTP ${response.status}`;
+      postManifest();
+      return;
+    }
+    const size = Number(response.headers.get('content-length') ?? 0);
+    if (size > MAX_MANIFEST_BYTES) {
+      manifestError = 'Invalid session manifest: document too large';
+      postManifest();
+      return;
+    }
+    text = await response.text();
+  } catch {
+    return;
+  }
+  if (gen !== generation) return;
+  if (text === lastManifestRaw) return;  // unchanged since the last read
+  lastManifestRaw = text;
+  try {
+    manifest = parseManifest(text);
+    manifestError = '';
+  } catch (e) {
+    manifestError = String(e);
+  }
+  postManifest();
+}
+
 function ingestSystem(text: string) {
   try {
     const graph = parseSystemGraph(text);
@@ -126,6 +237,8 @@ function resetStream(next: string) {
   jitter = new JitterBuffer(10);
   packets.clear();
   pendingBytes.clear();
+  needsReset = true;
+  pendingFrames = [];
 }
 function reset() {
   coordinator = new Coordinator();
@@ -134,6 +247,8 @@ function reset() {
   streamId = null;
   packets.clear();
   pendingBytes.clear();
+  needsReset = true;
+  pendingFrames = [];
   // Whatever is being connected to next is a different system, so the old
   // topology is not evidence about it.
   system = null;
@@ -142,7 +257,13 @@ function reset() {
   systemError = '';
   declared = null;
   declaredError = '';
+  manifest = null;
+  manifestError = '';
+  manifestBase = null;
+  nextManifestPoll = 0;
+  lastManifestRaw = null;
   postSystem();
+  postManifest();
 }
 function close() {
   generation++;
@@ -181,12 +302,17 @@ function connect(url: string, gen: number) {
     socket = new WebSocket(u);
     socket.binaryType = 'arraybuffer';
     status = 'Connecting';
+    connection = 'connecting';
+    manifestBase = url;
+    nextManifestPoll = performance.now();
     socket.onopen = () => {
       status = 'WebSocket connected';
+      connection = 'live';
       // Asked for on every open, not once per session: the bridge may have been
       // started after Studio was, and the first attempt would have found
       // nothing to answer it.
       void fetchDeclared(url, gen);
+      void fetchManifest(url, gen);
     };
     socket.onmessage = e => {
       // Binary is telemetry, text is the system graph. The bridge picks the
@@ -198,13 +324,16 @@ function connect(url: string, gen: number) {
     };
     socket.onclose = () => {
       status = 'Disconnected · retrying';
+      connection = 'connecting';
       if (gen === generation) retry = setTimeout(() => connect(url, gen), 1000);
     };
     socket.onerror = () => {
       status = 'WebSocket connection failed';
+      connection = 'error';
     };
   } catch (e) {
     status = String(e);
+    connection = 'error';
   }
 }
 ctx.onmessage = ({data}) => {
@@ -228,6 +357,7 @@ ctx.onmessage = ({data}) => {
         ingestDeclared(demoDeclaredGraph());
         ingestSystem(demoSystemGraph(sequence));
         status = 'Deterministic demo · 50 Hz';
+        connection = 'demo';
         break;
       case 'rpc': {
         // The same query surface the headless JSON-RPC server exposes, run
@@ -307,6 +437,9 @@ ctx.onmessage = ({data}) => {
         packets = raw;
         coordinator.seek(BigInt(imported.bounds()?.start ?? '0'));
         status = 'Replay log loaded';
+        connection = 'replay';
+        pendingFrames = imported.frames.slice();
+        needsReset = true;
         break;
       }
     }
@@ -334,6 +467,7 @@ setInterval(() => {
       jitter.stats.invalid++;
       continue;
     }
+    pendingFrames.push(f);
     const raw = pendingBytes.get(f.sequence_id);
     if (raw) packets.set(f.sequence_id, raw);
     pendingBytes.delete(f.sequence_id);
@@ -347,23 +481,14 @@ setInterval(() => {
         break;
     }
   }
+  // The session manifest is re-read once a second while connected: it is a
+  // live document, and the launcher replaces it atomically as nodes restart.
+  if (manifestBase !== null && connection === 'live' && now >= nextManifestPoll) {
+    nextManifestPoll = now + 1000;
+    void fetchManifest(manifestBase, generation);
+  }
   coordinator.tick(BigInt(Math.max(0, Math.round((now - lastTick) * 1e6))));
   lastTick = now;
-  if (now - lastView >= 1000 / 30) {
-    lastView = now;
-    const snapshot = coordinator.snapshot();
-    const t = BigInt(snapshot?.timestamp_ns ?? '0');
-    const frames = coordinator.timeline.frames;
-    let end = frames.length;
-    while (end > 0 && BigInt(frames[end - 1].timestamp_ns) > t) end--;
-    ctx.postMessage({
-      type: 'view',
-      snapshot,
-      history: frames.slice(Math.max(0, end - 600), end),
-      mode: coordinator.mode,
-      bounds: coordinator.timeline.bounds(),
-      stats: jitter.stats,
-      status
-    });
-  }
+  postFrames();
+  postPlayback(now);
 }, 4);

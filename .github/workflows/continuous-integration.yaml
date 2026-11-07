@@ -152,9 +152,10 @@ jobs:
         esac
         echo "Diff base: $BASE"
         # --dry-run --Werror: check only, never reformats. .clang-format at
-        # the repo root is picked up automatically.
+        # the repo root is picked up automatically. third_party/ is vendored
+        # upstream source (metal-cpp) and keeps its upstream formatting.
         git diff --name-only --diff-filter=d -z "$BASE" HEAD -- \
-          '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' \
+          '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' ':!third_party/' \
           | xargs -0 -r clang-format-18 --dry-run --Werror
 
   clang-tidy:
@@ -213,7 +214,7 @@ jobs:
         CHANGED=$(git diff --name-only --diff-filter=d "$BASE" HEAD -- \
           '*.c' '*.cc' '*.cpp')
         python3 - "$BASE" $CHANGED <<'PYEOF'
-        import json, os, subprocess, sys
+        import concurrent.futures, json, os, subprocess, sys
         with open('compile_commands.json') as f:
             db = json.load(f)
         known = {os.path.realpath(e['file']) for e in db}
@@ -230,6 +231,19 @@ jobs:
         if not targets:
             print('No changed sources with compilation database entries; skipping.')
             sys.exit(0)
-        r = subprocess.run(['clang-tidy-18', '-p', '.', *targets])
-        sys.exit(r.returncode)
+        # One clang-tidy per core: a single process over a large PR's
+        # translation units ran for most of an hour.
+        def tidy(path):
+            return subprocess.run(['clang-tidy-18', '-p', '.', '--quiet', path],
+                                  capture_output=True, text=True)
+        failed = 0
+        with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
+            for path, r in zip(targets, pool.map(tidy, targets)):
+                if r.returncode != 0:
+                    failed += 1
+                    print(f'::group::{path}')
+                    print(r.stdout + r.stderr, end='')
+                    print('::endgroup::')
+        print(f'clang-tidy: {len(targets)} files, {failed} with findings')
+        sys.exit(1 if failed else 0)
         PYEOF

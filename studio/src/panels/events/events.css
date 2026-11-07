@@ -1,0 +1,226 @@
+/* Events panel: newest-first timeline of robot events. */
+
+.events-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* --- Header (per-severity counts + follow) -------------------------------- */
+
+.events-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  flex-shrink: 0;
+}
+
+.sev-counts {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: nowrap;
+  min-width: 0;
+  font: 10px var(--font-mono);
+  color: var(--text-3);
+}
+
+.sev-count {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.sev-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #7c8896;
+  flex-shrink: 0;
+}
+
+.sev-count.sev-info { color: var(--info); }
+.sev-count.sev-warn { color: var(--warn); }
+.sev-count.sev-error { color: var(--error); }
+.sev-count.sev-info .sev-dot { background: var(--info); }
+.sev-count.sev-warn .sev-dot { background: var(--warn); }
+.sev-count.sev-error .sev-dot { background: var(--error); }
+
+/* Zero counts read as "none", not "red", so mute the whole item. */
+.sev-count.zero {
+  color: var(--faint);
+}
+.sev-count.zero .sev-dot {
+  background: #55606c;
+  opacity: .6;
+}
+
+.follow {
+  font-size: 9px;
+  letter-spacing: .8px;
+  text-transform: uppercase;
+  padding: 5px 10px;
+  flex-shrink: 0;
+}
+.follow.selected {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* --- Filters (severity toggles, category chips, search) ------------------ */
+
+.events-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  flex-shrink: 0;
+}
+
+.filter-group {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.filter-label {
+  font-size: 8px;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--faint);
+  width: 64px;
+  flex-shrink: 0;
+}
+
+.sev-toggle.sev-info.selected { color: var(--info); border-color: var(--info); }
+.sev-toggle.sev-warn.selected { color: var(--warn); border-color: var(--warn); }
+.sev-toggle.sev-error.selected { color: var(--error); border-color: var(--error); }
+
+/* --- Virtualized list ------------------------------------------------------ */
+
+.events-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.events-spacer {
+  position: relative;
+  width: 100%;
+}
+
+.event-row-slot {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 30px; /* ROW_HEIGHT */
+}
+
+.event-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 100%;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  cursor: pointer;
+  font-size: 10.5px;
+  color: #bacbdb;
+  white-space: nowrap;
+}
+.event-row:hover {
+  background: var(--surface-hover);
+}
+.event-row:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+/* Events later than the cursor (scrubbed back) are dimmed, not hidden. */
+.event-row.future {
+  opacity: .45;
+}
+
+.sev {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 8px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  width: 58px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.sev.sev-info { color: var(--info); }
+.sev.sev-warn { color: var(--warn); }
+.sev.sev-error { color: var(--error); }
+.sev.sev-info .sev-dot { background: var(--info); }
+.sev.sev-warn .sev-dot { background: var(--warn); }
+.sev.sev-error .sev-dot { background: var(--error); }
+
+.rel {
+  font: 10px var(--font-mono);
+  color: var(--muted);
+  width: 58px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.cat-chip {
+  font-size: 8px;
+  letter-spacing: .7px;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border: 1px solid #3c4d61;
+  border-radius: 999px;
+  color: #93a9bd;
+  flex-shrink: 0;
+}
+
+.event-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  overflow: hidden;
+}
+
+.event-title {
+  color: #cadaea;
+}
+
+.event-detail {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.plot-afford {
+  border: 1px solid var(--border-2);
+  background: none;
+  color: var(--accent);
+  font-size: 8px;
+  letter-spacing: .6px;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.plot-afford:hover {
+  background: var(--surface-hover);
+}
+.plot-afford.copied {
+  color: var(--ok);
+  border-color: var(--ok);
+}

@@ -5,6 +5,8 @@
 #include <cmath>
 #include <numbers>
 
+#include "autonomous/autonomous_message_generated.h"
+#include "autonomous/topics.h"
 #include "autonomous/trajectory.h"
 #include "drivetrain/drive_message_generated.h"
 #include "geometry/geometry_generated.h"
@@ -16,6 +18,10 @@
 #include "talOS/node/node.h"
 
 namespace autonomous {
+
+// Shared-memory slot contract for /autonomous/state: docs/DATA_FLOW.md.
+static_assert(sizeof(AutonomousState) == 1,
+              "AutonomousState size changed; update docs/DATA_FLOW.md");
 
 class Autonomous {
  public:
@@ -45,7 +51,8 @@ class Autonomous {
         shooter_{node, "shooter", "auto"},
         intake_{node, "intake", "auto"},
         ds_{node},
-        phase_{node, Phase::kIdle} {}
+        phase_{node, Phase::kIdle},
+        state_{node.publish<AutonomousState>(topics::kState)} {}
 
   void update() {
     if (!ds_.enabled() || !ds_.autonomous()) {
@@ -57,6 +64,7 @@ class Autonomous {
         intake_.release();
         released_ = true;
       }
+      state_.send(AutonomousState{WirePhase()});
       return;
     }
     released_ = false;
@@ -116,6 +124,7 @@ class Autonomous {
     drive_.send(drive);
     shooter_.send(shooter::ShooterTarget{shooter});
     intake_.send(intake::IntakeTarget{static_cast<float>(intake)});
+    state_.send(AutonomousState{WirePhase()});
   }
 
  private:
@@ -136,8 +145,25 @@ class Autonomous {
   talos::TargetLane<intake::IntakeTarget> intake_;
   talos::DriverStation ds_;
   talos::StateMachine<Phase> phase_;
+  talos::Publisher<AutonomousState> state_;
   bool released_ = false;
   bool red_ = false;
+
+  autonomous::Phase WirePhase() const {
+    switch (phase_.state()) {
+      case Phase::kSpinup:
+        return autonomous::Phase::SPINUP;
+      case Phase::kFeed:
+        return autonomous::Phase::FEED;
+      case Phase::kDrive:
+        return autonomous::Phase::DRIVE;
+      case Phase::kHold:
+        return autonomous::Phase::HOLD;
+      case Phase::kIdle:
+        return autonomous::Phase::IDLE;
+    }
+    return autonomous::Phase::IDLE;
+  }
 };
 
 }  // namespace autonomous

@@ -97,6 +97,13 @@ class Node:
     def config_path(self):
         return lib.talos_node_config_path(self._handle).decode()
 
+    @property
+    def session_dir(self):
+        """The session output directory (parent of --log), or None without
+        --log (tests, --describe, --replay)."""
+        path = lib.talos_node_session_dir(self._handle)
+        return None if path is None else path.decode()
+
     def param(self, key, default=_REQUIRED):
         """A key of this subsystem's config table, typed like `default`.
 

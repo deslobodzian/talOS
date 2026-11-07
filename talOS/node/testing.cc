@@ -101,6 +101,7 @@ struct Sim::Impl {
   std::string config_path;
   bool owns_config_file = false;
   std::shared_ptr<const config::RobotConfig> config;
+  std::optional<std::filesystem::path> session_dir;
   // Declared before the nodes: their loops and byte topics write here until
   // they are gone.
   event::SimulationEnvironment environment;
@@ -154,6 +155,10 @@ Sim::Sim(Sim&&) noexcept = default;
 Sim& Sim::operator=(Sim&&) noexcept = default;
 
 Time Sim::now() const { return Time::from_nanos(impl_->now.count()); }
+
+void Sim::set_session_dir(std::optional<std::filesystem::path> dir) {
+  impl_->session_dir = std::move(dir);
+}
 
 Node& Sim::node(std::string_view node_name) {
   for (const auto& hosted : impl_->nodes) {
@@ -229,6 +234,7 @@ void* SimAccess::add_instance(Sim& sim, std::string_view node_name,
         }
         return &self->graph;
       },
+      .session_dir = impl.session_dir,
   });
   hosted->user = make(*hosted->node);
   NodeAccess::start(*hosted->node);

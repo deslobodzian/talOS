@@ -71,6 +71,22 @@ test(
               {timestamp_ns: '18446744073709551616'}),
           /uint64/);
     });
+test('RPC exposes the same derived pose-error series stored in history', () => {
+  const timeline = history();
+  const snapshot = timeline.exact(1020000000n)!;
+  const names = ['derived/pose_error_m', 'derived/heading_error_deg'];
+  const response = dispatch(ctx(timeline), 'query_state_at', {
+                     timestamp_ns: snapshot.timestamp_ns,
+                     topics: names
+                   });
+  for (const name of names)
+    assert.ok(Number.isFinite(snapshot.channels[name]));
+  assert.deepEqual(response, {
+    timestamp_ns: snapshot.timestamp_ns,
+    sequence_id: snapshot.sequence_id,
+    topics: Object.fromEntries(names.map(name => [name, snapshot.channels[name]]))
+  });
+});
 test(
     'threshold scans group samples and edge scans use the preceding sample outside bounds',
     () => {

@@ -1,9 +1,15 @@
-module(name = "talos", version = "0.1.0")
+module(
+    name = "talos",
+    version = "0.1.0",
+)
 
 # Committed standalone subsystem example, consumed like a separate repository.
 # dev_dependency: a module that depends on @talos must not inherit it.
 bazel_dep(name = "wrist", version = "0.1.0", dev_dependency = True)
-local_path_override(module_name = "wrist", path = "examples/wrist_repo")
+local_path_override(
+    module_name = "wrist",
+    path = "examples/wrist_repo",
+)
 
 bazel_dep(name = "apple_support", version = "2.0.0", repo_name = "build_bazel_apple_support")
 bazel_dep(name = "rules_cc", version = "0.2.18")
@@ -12,20 +18,20 @@ bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "flatbuffers", version = "25.12.19")
 bazel_dep(name = "rules_foreign_cc", version = "0.14.0")
 bazel_dep(name = "aspect_bazel_lib", version = "2.22.5")
+
 # No aspect_rules_esbuild: nothing loads it, and 0.27.0 requires
 # aspect_rules_js 3.4.0, whose npm_translate_lock tag dropped the
 # root_package attribute flatbuffers@25.12.19 still passes. Keeping it
 # elevated rules_js past the root 2.8.2 pin and broke evaluation of the npm
 # extension for any build needing npm repos (e.g. //... via studio/).
 bazel_dep(name = "rules_go", version = "0.63.0")
-
 bazel_dep(name = "rules_java", version = "9.6.1")
-
 bazel_dep(name = "rules_python", version = "2.0.1")
+
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 python.toolchain(
-    python_version = "3.11",
     is_default = True,
+    python_version = "3.11",
 )
 use_repo(python, "python_3_11")
 
@@ -44,6 +50,7 @@ git_override(
 # Studio frontend: Bazel owns the Node runtime and the locked npm dependency graph.
 bazel_dep(name = "aspect_rules_js", version = "2.8.2", dev_dependency = True)
 bazel_dep(name = "rules_nodejs", version = "6.6.2", dev_dependency = True)
+
 node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node", dev_dependency = True)
 node.toolchain(node_version = "22.14.0")
 
@@ -60,21 +67,23 @@ use_repo(studio_npm, "studio_npm")
 
 # Studio network bridge: immutable uWebSockets v20.51.0 and its uSockets gitlink.
 studio_http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
 studio_http_archive(
     name = "studio_uws",
-    urls = ["https://codeload.github.com/uNetworking/uWebSockets/tar.gz/53e835c1fa71ea64303b48418fec46533318bf91"],
-    type = "tar.gz",
+    build_file = "//studio/bridge:uws.BUILD.bazel",
     sha256 = "8d50fae3aee565ec58d4b999ff44ce8bb0b78665fff7f5861528fcd4b1385e8a",
     strip_prefix = "uWebSockets-53e835c1fa71ea64303b48418fec46533318bf91",
-    build_file = "//studio/bridge:uws.BUILD.bazel",
+    type = "tar.gz",
+    urls = ["https://codeload.github.com/uNetworking/uWebSockets/tar.gz/53e835c1fa71ea64303b48418fec46533318bf91"],
 )
+
 studio_http_archive(
     name = "studio_usockets",
-    urls = ["https://codeload.github.com/uNetworking/uSockets/tar.gz/8cd4cb66eb061b2594ca114b9ea1ead64613ad4b"],
-    type = "tar.gz",
+    build_file = "//studio/bridge:usockets.BUILD.bazel",
     sha256 = "a45cd5c1a94122ac7f302c19e36b19a01c33676c1a83cd6923f59bc8b6aaed01",
     strip_prefix = "uSockets-8cd4cb66eb061b2594ca114b9ea1ead64613ad4b",
-    build_file = "//studio/bridge:usockets.BUILD.bazel",
+    type = "tar.gz",
+    urls = ["https://codeload.github.com/uNetworking/uSockets/tar.gz/8cd4cb66eb061b2594ca114b9ea1ead64613ad4b"],
 )
 
 # The Python node package (//talOS/python) needs the flatbuffers runtime for
@@ -87,22 +96,24 @@ pip.parse(
 )
 use_repo(pip, "pypi")
 
-# wpimath (C++): WPILib's own Maven artifacts for the release GradleRIO pins
-# (2026-robot/controller_processor/rio/build.gradle). allwpilib 2026.x has no
-# MODULE.bazel and is not in the BCR; see third_party/wpilib/extensions.bzl.
-# Python uses the same native build through robotpy-native-wpimath in
-# //talOS/python:requirements.txt;
-# //2026-robot/controller_processor/rio:wpilib_lockstep_test keeps the three
-# pins on one release.
-wpilib = use_extension("//third_party/wpilib:extensions.bzl", "wpilib")
-use_repo(
-    wpilib,
-    "wpilib_wpimath_headers",
-    "wpilib_wpimath_linuxarm64",
-    "wpilib_wpimath_linuxx86_64",
-    "wpilib_wpimath_osxuniversal",
-    "wpilib_wpiutil_headers",
-    "wpilib_wpiutil_linuxarm64",
-    "wpilib_wpiutil_linuxx86_64",
-    "wpilib_wpiutil_osxuniversal",
+bazel_dep(name = "opencv", version = "4.12.0")
+
+vision_http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+vision_http_archive(
+    name = "eigen3",
+    build_file = "//third_party:eigen.BUILD.bazel",
+    sha256 = "8586084f71f9bde545ee7fa6d00288b264a2b7ac3607b974e54d13e7162c1c72",
+    strip_prefix = "eigen-3.4.0",
+    urls = ["https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz"],
+)
+
+vision_http_archive(
+    name = "apriltag",
+    build_file = "//third_party:apriltag.BUILD.bazel",
+    patch_args = ["-p1"],
+    patches = ["//third_party:apriltag_pose_ambiguity.patch"],
+    sha256 = "3749f48220db78c29c375a373861f4e1f4138e5dbae3c298584e96cfcc556515",
+    strip_prefix = "apriltag-3.4.5",
+    urls = ["https://github.com/AprilRobotics/apriltag/archive/v3.4.5.tar.gz"],
 )

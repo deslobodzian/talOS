@@ -1,0 +1,12 @@
+namespace vision;
+
+struct VisionStatus {
+  frames_captured_count:uint64;
+  frames_processed_count:uint64;
+  frames_dropped_count:uint64;
+  frame_period_us:uint64;
+  last_latency_us:uint64;
+  range_rejected_count:uint64;
+  visible_tag_count:uint32;
+  healthy:bool;
+}

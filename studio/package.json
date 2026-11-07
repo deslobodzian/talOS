@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
-    "test": "tsx --test tests/*.test.ts",
+    "test": "tsx --test --import ./tests/css_loader.mjs tests/*.test.ts*",
     "agent": "tsx agent/server.ts",
     "generate": "bazel run @flatbuffers//:flatc -- --ts -o \"$PWD/src/generated\" \"$PWD/../talOS/telemetry/telemetry.fbs\""
   },

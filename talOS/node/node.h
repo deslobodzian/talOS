@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -112,6 +113,10 @@ class Node {
   std::uint64_t tick() const;  // update() calls completed so far
   Duration period() const;     // [subsystem] period_us, else [robot] period_us
   const std::string& config_path() const;  // the robot config (--config)
+  // The session output directory the launcher started this node under: the
+  // parent directory of --log. nullopt without --log (tests, --describe and
+  // --replay). Frame recorders write under <session_dir>/frames/<name>/.
+  std::optional<std::filesystem::path> session_dir() const;
 
   // Custom keys of this subsystem's TOML table. Dotted keys reach nested
   // tables ("geometry.wheelbase_m"). T: bool, int64_t/int, double,

@@ -23,7 +23,7 @@ genrule(
         "src/generated/talos/telemetry/frame.ts",
         "src/generated/talos/telemetry/pose.ts",
     ],
-    cmd = "$(location @flatbuffers//:flatc) --ts -o $(RULEDIR)/src/generated $(location //talOS/telemetry:telemetry.fbs)",
+    cmd = "$(execpath @flatbuffers//:flatc) --ts -o $(RULEDIR)/src/generated $(execpath //talOS/telemetry:telemetry.fbs)",
     tools = ["@flatbuffers//:flatc"],
 )
 
@@ -94,60 +94,61 @@ js_binary(
     entry_point = "agent/run.mjs",
 )
 
-js_test(
-    name = "core_test",
-    chdir = "studio",
-    data = [":sources"],
-    entry_point = "tests/run.mjs",
-    fixed_args = ["core.test.ts"],
-)
+# One node --test target per test file, run through tests/run.mjs (tsx + a
+# CSS-import stub). Add a test file by adding one line here.
+#
+# patch_node_fs = False: rules_js's fs patches keep resolved paths inside the
+# runfiles symlink tree, so tsx cannot match sources against tsconfig.json and
+# compiles .tsx with the classic JSX transform ("React is not defined").
+#
+# view: renders views with react-dom/server; a typecheck and a bundle prove
+# the code compiles, this proves it runs. declared: parses a graph document
+# the C++ launcher really produced, so a change to its envelope fails here.
+STUDIO_TESTS = {
+    "agent_test": "agent.test.ts",
+    "commands_test": "commands.test.ts",
+    "core_test": "core.test.ts",
+    "declared_test": "declared.test.ts",
+    "discovery_test": "discovery.test.ts",
+    "events_panel_test": "events_panel.test.tsx",
+    "events_test": "events.test.ts",
+    "field_test": "field.test.tsx",
+    "formatters_test": "formatters.test.ts",
+    "frames_test": "frames.test.ts",
+    "hardware_test": "hardware.test.tsx",
+    "hooks_test": "hooks.test.tsx",
+    "inspector_test": "inspector.test.tsx",
+    "layout_test": "layout.test.ts",
+    "manifest_test": "manifest.test.ts",
+    "panels_test": "panels.test.tsx",
+    "plot_test": "plot.test.tsx",
+    "registry_test": "registry.test.tsx",
+    "robot_panel_test": "robot_panel.test.tsx",
+    "robot_test": "robot.test.ts",
+    "session_test": "session.test.tsx",
+    "store_test": "store.test.ts",
+    "subsystems_test": "subsystems.test.tsx",
+    "system_test": "system.test.ts",
+    "view_test": "view.test.tsx",
+    "vision_test": "vision.test.tsx",
+}
 
-js_test(
-    name = "agent_test",
-    chdir = "studio",
-    data = [":sources"],
-    entry_point = "tests/run.mjs",
-    fixed_args = ["agent.test.ts"],
-)
-
-# Renders the system-graph views with react-dom/server. A typecheck and a
-# successful bundle prove the code compiles; this proves it runs.
-js_test(
-    name = "view_test",
-    chdir = "studio",
-    data = [":sources"],
-    entry_point = "tests/run.mjs",
-    fixed_args = ["view.test.tsx"],
-)
-
-js_test(
-    name = "system_test",
-    chdir = "studio",
-    data = [":sources"],
-    entry_point = "tests/run.mjs",
-    fixed_args = ["system.test.ts"],
-)
-
-# The launcher writes the declared graph in C++ and system.ts parses it in
-# TypeScript; neither language can check the other. This parses a document the
-# launcher really produced, so a change to its envelope fails here.
-js_test(
-    name = "declared_test",
-    chdir = "studio",
-    data = [":sources"],
-    entry_point = "tests/run.mjs",
-    fixed_args = ["declared.test.ts"],
-)
+[
+    js_test(
+        name = name,
+        chdir = "studio",
+        data = [":sources"],
+        entry_point = "tests/run.mjs",
+        fixed_args = [test_file],
+        patch_node_fs = False,
+    )
+    for name, test_file in STUDIO_TESTS.items()
+]
 
 test_suite(
     name = "tests",
-    tests = [
-        ":agent_test",
-        ":core_test",
-        ":declared_test",
-        ":system_test",
+    tests = [":" + name for name in STUDIO_TESTS] + [
         ":typecheck",
-        ":view_test",
         "//studio/bridge:system_test",
         "//talOS/telemetry:wire_test",
     ],

@@ -9,14 +9,15 @@ ChassisTarget publisher -> drivetrain node -> hardware bridge -> RoboRIO
                               +---- hardware state +----- UDP -----+
 ```
 
-The drivetrain discretizes chassis velocity over its update period to compensate
-translation/rotation skew, selects the shorter steering path, cosine-scales drive
-speed by azimuth error, and desaturates wheel speeds. At zero requested speed it
+The drivetrain discretizes chassis velocity by taking the SE2 logarithm of
+the desired finite-period translation and rotation, compensating motion skew.
+It selects the shorter steering path, cosine-scales drive speed by azimuth
+error, and desaturates wheel speeds. At zero requested speed it
 holds the measured steering angle. Drive requests
 use TalonFX velocity control; steering uses position control with continuous
 wrapping. The hardware API also supports Motion Magic when a subsystem needs
 profiled positions. This is not yet a trajectory follower or field-relative
-controller; pose estimation and vision are separate future nodes.
+controller; pose estimation and vision run as separate nodes.
 
 Optional `[subsystem]` parameters `max_linear_accel_mps2` and
 `max_angular_accel_radps2` limit commanded chassis acceleration before
@@ -33,12 +34,13 @@ leaves the example limits commented out to preserve existing step behavior.
 
 - `drivetrain.h`: the node, a `talos::Node` class with eight `talos::Motor`s
   and the Pigeon (`drivetrain_imu`); `drivetrain.cc` is `TALOS_NODE`.
-- `swerve.h`: the kinematics, on wpimath's `frc::SwerveDriveKinematics<4>`
-  (inverse and forward kinematics, `SwerveModuleState::Optimize`), and the
-  drivetrain's one unit boundary (`ToRadians`, `WheelTravel`, `WheelSpeed`,
-  `WheelRps`), where shaft rotations become meters and radians. Wheel speeds
-  are desaturated by hand, because each module has its own wheel radius and
-  drive maximum and `DesaturateWheelSpeeds` takes a single one.
+- `swerve.h`: inverse and full least-squares forward kinematics (including
+  off-center layouts), using `talos::geometry::SO2` for principal-valued
+  steering deltas and `SE2::Discretize` for finite-period pose matching.
+  The unit boundary
+  (`ToRadians`, `ToRotations`, `WheelTravel`, `WheelSpeed`, `WheelRps`) uses
+  plain doubles in radians/meters and mechanism rotations. Wheel speeds are
+  desaturated together against each module's wheel radius and drive maximum.
 - `geometry.h`: the geometry, read from `[subsystems.drivetrain.geometry]`;
   each module names its drive, steer and encoder devices, checked against
   this subsystem's devices at startup.
@@ -57,10 +59,15 @@ the hardware says:
   values.
 - `yaw_rad` is the Pigeon's yaw converted from rotations, and `yaw_valid`
   says whether the Pigeon reports. While it does not, `yaw_rad` holds the last
-  valid heading (0 before the first). Under `--sim` the heading is instead
-  integrated from the rotation the modules measure, valid while the modules
-  are, because a simulated Pigeon reads a valid, permanently zero yaw;
+  valid heading (0 before the first). Under `--sim` the default instead
+  integrates heading from module rotation, valid while the modules are,
+  because WPILib/ideal sims report a valid, permanently zero Pigeon yaw.
   `integrate_heading = true|false` in `[subsystem]` overrides that choice.
+  The physics gateway models the Pigeon, including injected gyro drift:
+  `configuration/robot_physics_sim.toml` includes `robot.toml` and sets
+  `[subsystems.drivetrain] integrate_heading = false` to use that modeled yaw.
+  `./sim.sh --sim-gateway` selects this config; WPILib keeps `robot.toml`
+  and module-integrated heading.
 - `sample_time_ns` is `HardwareLink::sample_time()`: the gateway's sample
   time of the `/hw/state` the tick read, mapped into the node clock by the
   bridge's min-filtered offset (`talOS/hardware/README.md`). It reads later

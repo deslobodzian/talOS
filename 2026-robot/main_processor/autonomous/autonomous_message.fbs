@@ -1,0 +1,19 @@
+namespace autonomous;
+
+// The autonomous routine's current phase, published on /autonomous/state
+// every update (enabled or not; reporting is not actuation-gated). Values
+// mirror the node's private StateMachine<Phase> and are append-only, never
+// renumbered: they are wire values.
+enum Phase : ubyte {
+  IDLE,
+  SPINUP,
+  FEED,
+  DRIVE,
+  HOLD,
+}
+
+// Studio view: the phase enum is forwarded by talOS/telemetry as the
+// `autonomous/state/phase` enum channel, whose labels are the names above.
+struct AutonomousState {
+  phase:Phase;
+}

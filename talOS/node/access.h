@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <span>
@@ -53,6 +54,9 @@ struct NodeSetup {
   bool simulation = false;
   LoopPort* loop = nullptr;
   GraphSource graph;  // unset: no graph (null)
+  // The session output directory the launcher started this node under (the
+  // parent of --log), or nullopt without --log (tests, --describe, replay).
+  std::optional<std::filesystem::path> session_dir;
 };
 
 // The user's object, type-erased so the runner and the harness need not be
@@ -111,6 +115,8 @@ struct NodeAccess {
   static const DeclaredGraph* declared_graph(Node& node);
   static bool reads_graph(const Node& node);
   static const config::RobotConfig& robot_config(const Node& node);
+  // The session output directory (parent of --log), or nullopt without --log.
+  static std::optional<std::filesystem::path> session_dir(const Node& node);
 
   // A parameter of this node's subsystem table, or nullopt when absent. A
   // present key of another type throws, naming it.

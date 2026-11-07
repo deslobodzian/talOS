@@ -443,10 +443,10 @@ repeat the drivetrain geometry and `config_golden_test` keeps them equal.
 Every test scenario runs against both backends.
 
 Why Python: GTSAM is available to this build only as the pinned `gtsam`
-wheel (no C++ Bazel route), and wpimath's estimator is the same binary in
-both languages (the RobotPy wheel's `libwpimath` is byte-identical to the
-Maven one), so one Python node serves both backends and the comparison
-between them is like for like. At 20 ms the cost is small: a factor-graph
+wheel (no C++ Bazel route), so one Python node serves both estimator backends
+and the comparison between them is like for like. The current C++ geometry
+and drivetrain use `talos::geometry`, not WPIMath; Python retains RobotPy.
+At 20 ms the cost is small: a factor-graph
 update measured 0.03 ms median and 0.25 ms p99. The one Python-specific cost
 is a cold start of several seconds after a fresh deploy (numpy, wpimath and,
 for `factor_graph`, 150 MB of gtsam), which the launcher's describe timeout

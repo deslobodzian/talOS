@@ -8,9 +8,10 @@ period_us = 20000
 # "kalman" (wpimath SwerveDrive4PoseEstimator) or "factor_graph" (GTSAM
 # fixed-lag smoother); [kalman] / [factor_graph] below tune each.
 backend = "kalman"
-# Camera nodes, each publishing geometry.PoseObservation on /<name>/state.
-# None yet: the estimate is odometry only.
-cameras = []
+# C++ camera nodes: geometry.PoseObservation on /<name>/state, status on
+# /<name>/status. Each camera's subsystem file holds its calibration/device.
+# Under --sim they use /sim/state from sim_gateway --physics, never this estimator.
+cameras = ["front_left_camera", "front_right_camera", "rear_left_camera", "rear_right_camera"]
 # Module offsets from the robot centre, in the order of
 # [subsystems.drivetrain.geometry].modules (back_left, back_right,
 # front_left, front_right). config_golden_test checks they match.
@@ -23,12 +24,14 @@ max_observation_age_us = 1500000
 observation_future_tolerance_us = 20000
 # Drivetrain state older than this makes the estimate invalid (held).
 drivetrain_timeout_us = 100000
-initial_x_m = 0.0
-initial_y_m = 0.0
+initial_x_m = 2.0
+initial_y_m = 2.0
 initial_yaw_rad = 0.0
 field_length_m = 16.54
 field_width_m = 8.21
 max_innovation_m = 3.0
+# Single-tag wrapped yaw innovation limit; radians (15 degrees).
+max_yaw_innovation_rad = 0.2618
 
 # wpimath stateStdDevs: trust in the odometry-propagated state; larger trusts
 # observations more.

@@ -41,6 +41,46 @@ class SimGatewayStartup(unittest.TestCase):
         self.assertEqual(doc["name"], "sim_gateway")
         self.assertEqual(doc["target"],
                          "//2026-robot/main_processor/simulation:sim_gateway")
+        self.assertEqual(doc["sources"], [])
+        proc = subprocess.run(
+            [str(binary()), "--describe", "--physics"], capture_output=True,
+            text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        sources = json.loads(proc.stdout)["sources"]
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]["name"], "/sim/state")
+        self.assertEqual(sources[0]["kind"], "SENDER")
+        self.assertEqual(sources[0]["schema"], "geometry.OdometrySample")
+        self.assertEqual(sources[0]["message_bytes"], 56)
+        self.assertTrue(sources[0]["bfbs"])
+
+    def test_physics_flags_validate_before_starting(self):
+        for flag, value in (
+                ("--start-pose", "2,2,0"),
+                ("--wheel-radius-error", "0.1"),
+                ("--wheel-slip-gain", "0.2"),
+                ("--gyro-drift-radps", "0.01")):
+            with self.subTest(flag=flag):
+                proc = subprocess.run(
+                    [str(binary()), "--describe", flag, value],
+                    capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("require --physics", proc.stderr)
+        for flag, value in (
+                ("--start-pose", "1,2"), ("--start-pose", "1,2,3,4"),
+                ("--start-pose", "nan,2,0"), ("--start-pose", "1,inf,0"),
+                ("--start-pose", "1,2,-inf"),
+                ("--wheel-radius-error", "-0.5"),
+                ("--wheel-radius-error", "0.5"),
+                ("--wheel-radius-error", "nan"),
+                ("--wheel-slip-gain", "-0.01"),
+                ("--wheel-slip-gain", "inf"),
+                ("--gyro-drift-radps", "nan")):
+            with self.subTest(flag=flag, value=value):
+                proc = subprocess.run(
+                    [str(binary()), "--describe", "--physics", flag, value],
+                    capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(proc.returncode, 0)
 
     def test_missing_config_fails_fast(self):
         proc = subprocess.run(
@@ -67,6 +107,7 @@ class SimGatewayStartup(unittest.TestCase):
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True) as proc:
                 phases = []
+                previous_sample = None
                 deadline = time.monotonic() + 10
                 try:
                     while time.monotonic() < deadline:
@@ -83,6 +124,10 @@ class SimGatewayStartup(unittest.TestCase):
                             continue
                         sample, generation, flags, alliance = struct.unpack_from(
                             "<QQIB", packet, 40)
+                        if previous_sample is not None:
+                            self.assertGreaterEqual(sample - previous_sample,
+                                                    20000)
+                        previous_sample = sample
                         self.assertEqual(alliance, 1)
                         self.assertGreater(generation, 0)
                         self.assertLessEqual(generation, sample)
@@ -104,7 +149,7 @@ class SimGatewayStartup(unittest.TestCase):
 class FullStackSimulation(unittest.TestCase):
     def run_session(self, stall_producer=False):
         root = workspace()
-        config = root / "2026-robot/main_processor/configuration/robot.toml"
+        config = root / "2026-robot/main_processor/configuration/robot_physics_sim.toml"
         gw_port, bridge_port = udp_ports()
         env = dict(os.environ, TALOS_SHM_NAMESPACE=f"full-stack-{uuid.uuid4().hex}")
         with tempfile.TemporaryDirectory() as tmp:
@@ -114,22 +159,20 @@ class FullStackSimulation(unittest.TestCase):
             output = Path(tmp) / "sessions"
             processes = []
             stopped_pid = None
-            with open(Path(tmp) / "gateway.txt", "w+") as gateway_log, \
-                    open(Path(tmp) / "launcher.txt", "w+") as launcher_log:
+            with open(Path(tmp) / "launcher.txt", "w+") as launcher_log:
                 try:
-                    started = time.monotonic()
-                    gateway = subprocess.Popen(
-                        [str(binary()), "--config", str(config),
-                         "--port", str(gw_port), "--remote-port", str(bridge_port),
-                         "--mode-schedule",
-                         "disabled:0.2,auto:1.0,teleop:0.6,disabled:0.2",
-                         "--duration-s", "2.5"],
-                        cwd=root, env=env, stdout=gateway_log,
-                        stderr=subprocess.STDOUT, start_new_session=True)
-                    processes.append(gateway)
                     launcher = subprocess.Popen(
                         [str(root / "talOS/launcher/launcher"),
                          "--config", str(config), "--sim",
+                         "--start-sim-gateway",
+                         "--sim-gateway-arg", "--physics",
+                         "--sim-gateway-arg", "--port",
+                         "--sim-gateway-arg", str(gw_port),
+                         "--sim-gateway-arg", "--remote-port",
+                         "--sim-gateway-arg", str(bridge_port),
+                         "--sim-gateway-arg", "--mode-schedule",
+                         "--sim-gateway-arg",
+                         "disabled:0.2,auto:1.0,teleop:0.6,disabled:0.2",
                          "--remote", "127.0.0.1",
                          "--remote-port", str(gw_port),
                          "--local-port", str(bridge_port),
@@ -137,6 +180,24 @@ class FullStackSimulation(unittest.TestCase):
                         cwd=tmp, env=env, stdout=launcher_log,
                         stderr=subprocess.STDOUT, start_new_session=True)
                     processes.append(launcher)
+                    if stall_producer:
+                        # Description/import time is not simulation time:
+                        # anchor injection to the launcher-owned gateway.
+                        deadline = time.monotonic() + 15
+                        while time.monotonic() < deadline:
+                            manifests = list(output.glob("*/manifest.json"))
+                            if manifests:
+                                manifest = json.loads(manifests[0].read_text())
+                                if any(node["name"] == "sim_gateway"
+                                       and node["pid"] > 0
+                                       for node in manifest["nodes"]):
+                                    break
+                            self.assertIsNone(launcher.poll(),
+                                              "launcher exited before gateway")
+                            time.sleep(0.01)
+                        else:
+                            self.fail("gateway did not start")
+                        started = time.monotonic()
                     if stall_producer:
                         # The driver publishes teleop targets. Stop it within
                         # the scheduled teleop phase, beyond target freshness
@@ -166,11 +227,8 @@ class FullStackSimulation(unittest.TestCase):
                         os.kill(stopped_pid, signal.SIGCONT)
                         stopped_pid = None
                     launcher.wait(timeout=30)
-                    gateway.wait(timeout=10)
-                    gateway_log.seek(0)
                     launcher_log.seek(0)
-                    diagnostics = gateway_log.read() + launcher_log.read()
-                    self.assertEqual(gateway.returncode, 0, diagnostics)
+                    diagnostics = launcher_log.read()
                     self.assertEqual(launcher.returncode, 0, diagnostics)
                     manifests = list(output.glob("*/manifest.json"))
                     self.assertEqual(len(manifests), 1, diagnostics)
@@ -179,7 +237,9 @@ class FullStackSimulation(unittest.TestCase):
                     self.assertEqual(set(nodes), {
                         "hardware_node", "autonomous", "driver", "drivetrain",
                         "intake", "pose_estimator", "shooter", "telemetry",
-                        "teleop",
+                        "teleop", "front_left_camera", "front_right_camera",
+                        "rear_left_camera", "rear_right_camera",
+                        "sim_gateway",
                     }, diagnostics)
                     for name, node in nodes.items():
                         with self.subTest(node=name):
@@ -187,7 +247,9 @@ class FullStackSimulation(unittest.TestCase):
                             self.assertFalse(node["recorder_failed"], diagnostics)
                             self.assertEqual(node["restart_count"], 0, diagnostics)
                     for name in ("hardware_node", "autonomous", "drivetrain",
-                                 "pose_estimator"):
+                                 "pose_estimator", "front_left_camera",
+                                 "front_right_camera", "rear_left_camera",
+                                 "rear_right_camera"):
                         with self.subTest(log=name):
                             self.assertGreater(nodes[name]["record_count"], 0,
                                                diagnostics)

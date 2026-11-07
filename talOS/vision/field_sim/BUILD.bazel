@@ -1,0 +1,75 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Field-sim projection library: WPILib layout JSON loader plus the pinhole
+# tag projector the sim detector and (via JSON) the studio field view share.
+# Pure math, no transport dependencies, so the pose-estimator tests can reuse
+# it as ground truth.
+cc_library(
+    name = "field_sim",
+    srcs = ["field_layout_loader.cc"],
+    hdrs = [
+        "field_layout_loader.h",
+        "json_parser.h",
+        "sim_camera.h",
+        "tag_rasterizer.h",
+    ],
+    deps = [
+        "//talOS/geometry",
+        "//talOS/vision:calibration",
+        "@eigen3//:eigen",
+        "@opencv//:core",
+        "@opencv//:imgproc",
+    ],
+)
+
+cc_test(
+    name = "field_sim_test",
+    size = "small",
+    srcs = ["field_sim_test.cc"],
+    data = ["//talOS/vision/testdata:2026-rebuilt-welded.json"],
+    env = {"FIELD_SIM_TESTDATA": "$(location //talOS/vision/testdata:2026-rebuilt-welded.json)"},
+    deps = [
+        ":field_sim",
+        "//talOS/vision:localization",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Patterns for the rasterizer, extracted from the same C library the
+# detector decodes with, so sim and detector share one definition of a tag.
+cc_library(
+    name = "field_sim_patterns",
+    hdrs = ["tag_patterns.h"],
+    deps = [
+        ":field_sim",
+        "@apriltag",
+    ],
+)
+
+# Render-to-detect round trip through the real AprilTag pipeline. Heavier
+# than the projection tests (links the detector), so it stays separate.
+cc_test(
+    name = "render_detect_test",
+    size = "medium",
+    srcs = ["render_detect_test.cc"],
+    deps = [
+        ":field_sim",
+        ":field_sim_patterns",
+        "//talOS/vision:localization",
+        "//talOS/vision:pipeline",
+        "//talOS/vision:synthetic_source",
+        "//talOS/vision/apriltag:cpu_apriltag_backend",
+        "@googletest//:gtest_main",
+    ],
+)
+
+test_suite(
+    name = "...",
+    tests = [
+        ":field_sim_test",
+        ":render_detect_test",
+    ],
+)

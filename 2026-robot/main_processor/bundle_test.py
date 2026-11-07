@@ -2,7 +2,7 @@
 
 Each bundle is installed the way the robot gets it (tools/deploy.sh install
 into a fresh prefix), then --describe runs every node binary from there, so a
-C++ node that cannot load a shared library it links (libwpimath from lib/), a
+C++ node that cannot load a shared library it links, a
 Python node that cannot import its wheels or start its interpreter, or an
 install that breaks the bundle's relative symlinks fails here."""
 
@@ -16,8 +16,6 @@ import unittest
 from python.runfiles import runfiles
 
 BUNDLES = ("robot_bundle", "relocation_bundle")
-# The 2026 drivetrain links wpimath (//third_party/wpilib:wpimath).
-SHARED_LIBS = {"robot_bundle": ("libwpimath", "libwpiutil")}
 
 
 def describe(bundle, prefix):
@@ -76,11 +74,6 @@ class BundleTest(unittest.TestCase):
                 for node in graph["nodes"]:
                     self.assertTrue(node.get("described"),
                                     f"{node.get('name')}: {node.get('describe_error')}\n{out}")
-                libs = os.listdir(os.path.join(src, "lib")) if os.path.isdir(
-                    os.path.join(src, "lib")) else []
-                for lib in SHARED_LIBS.get(name, ()):
-                    self.assertTrue(
-                        any(f.startswith(lib + ".") for f in libs), (lib, libs))
                 # The copy keeps the identity the bundle was built with.
                 self.assertTrue(manifest["config_sha256"])
                 self.assertEqual(graph["config_sha256"],

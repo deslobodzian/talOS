@@ -1,0 +1,64 @@
+/* Field panel: the SVG top-down field view. */
+
+.field-controls {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 8px 18px 0;
+  flex-wrap: wrap;
+  font-size: 10px;
+  color: #9badbd;
+}
+.field-controls label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  user-select: none;
+}
+.field-controls input[type='checkbox'] {
+  accent-color: var(--accent);
+}
+.field-controls .field-trail-seconds input {
+  width: 46px;
+  padding: 2px 4px;
+  font: inherit;
+}
+.field-controls button {
+  padding: 2px 8px;
+  font: inherit;
+}
+
+.field .legend {
+  display: flex;
+  gap: 16px;
+  font-size: 9px;
+  padding: 8px 18px 2px;
+  color: #9badbd;
+  flex-wrap: wrap;
+}
+.field .legend span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.field .legend i {
+  height: 5px;
+  width: 5px;
+  border-radius: 50%;
+}
+.field {
+  flex: 1;
+  min-height: 150px;
+  width: 100%;
+  display: block;
+  padding: 0 16px;
+  touch-action: none;
+  cursor: grab;
+}
+.field:active {
+  cursor: grabbing;
+}
+.field-seek {
+  cursor: pointer;
+}

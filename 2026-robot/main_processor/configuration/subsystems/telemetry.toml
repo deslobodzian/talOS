@@ -4,3 +4,10 @@
 name = "telemetry"
 node = "//talOS/telemetry:node"
 period_us = 10000
+# Leave room below the 1200-byte value-frame cap by dropping cumulative
+# camera counters; retain health, timing, drops and visible-tag diagnostics.
+exclude = [
+    "*_camera/status/frames_captured_count",
+    "*_camera/status/frames_processed_count",
+    "*_camera/status/range_rejected_count",
+]

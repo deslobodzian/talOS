@@ -75,3 +75,19 @@ path = "subsystems/telemetry.toml"
 [[subsystems]]
 name = "teleop"
 path = "subsystems/teleop.toml"
+
+[[subsystems]]
+name = "front_left_camera"
+path = "subsystems/front_left_camera.toml"
+
+[[subsystems]]
+name = "front_right_camera"
+path = "subsystems/front_right_camera.toml"
+
+[[subsystems]]
+name = "rear_left_camera"
+path = "subsystems/rear_left_camera.toml"
+
+[[subsystems]]
+name = "rear_right_camera"
+path = "subsystems/rear_right_camera.toml"

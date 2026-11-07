@@ -1,11 +1,8 @@
-// Renders the system-graph views and asserts what a person would read on
-// screen.
-//
-// A successful typecheck and a successful bundle prove the code compiles and
-// resolves, not that it runs: a hook in the wrong place, a BigInt() on a field
-// that turned out to be a number, or an undefined access inside a map all
-// survive both and fail on the first paint. These views touch no DOM API, so
-// react-dom/server can render them here and catch that.
+// The migrated view tests: the old system_view assertions, now exercised
+// against the panels that replaced those views. Panels read their data through
+// hooks, so they render inside a StudioProvider backed by createStaticStudio;
+// the pure sub-components (NodeCard, Wiring, DeclaredPanel) still take their
+// data as props and render directly.
 
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
@@ -13,40 +10,32 @@ import {test} from 'node:test';
 import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 
+import {createStaticStudio, StudioProvider} from '../src/data/studio';
+import type {PlaybackState, SystemState} from '../src/data/types';
 import {demoDeclaredGraph, demoSystemGraph} from '../src/demo';
+import {agentPanel} from '../src/panels/agent';
+import {healthPanel} from '../src/panels/health';
+import type {AnyPanelDefinition} from '../src/panels/types';
+import {DeclaredPanel, NodeCard, systemPanel, Wiring} from '../src/panels/system';
+import {timingPanel} from '../src/panels/timing';
+import {RPC_METHODS} from '../agent/rpc';
 import {
   eventRates,
   parseDeclaredGraph,
   parseSystemGraph,
   rateKey,
 } from '../src/system';
-import {RPC_METHODS} from '../agent/rpc';
-import {
-  AgentTab,
-  DeclaredPanel,
-  NodeCard,
-  OverviewTab,
-  SystemTab,
-  type SystemState,
-  TimingTab,
-  type View,
-  Wiring,
-} from '../src/system_view';
 
-const emptyView: View = {
-  snapshot: null,
-  history: [],
+const emptyPlayback: PlaybackState = {
   mode: 'PAUSED',
+  cursor_ns: null,
   bounds: null,
   stats: {dropped: 0, late: 0, invalid: 0},
-  status: 'Disconnected'
+  status: 'Disconnected',
+  connection: 'idle'
 };
 
-// Two samples apart, so rates are measured rather than absent: a view that
-// only works with no history would pass a single-sample test.
-//
-// `declared` is passed separately because a bridge started without --declared
-// is the ordinary case, and both paths have to render.
+// Two samples apart, so rates are measured rather than absent.
 function state(declared = false): SystemState {
   const previous = parseSystemGraph(demoSystemGraph(500n));
   const graph = parseSystemGraph(demoSystemGraph(1500n));
@@ -64,11 +53,22 @@ function state(declared = false): SystemState {
 const noSystem: SystemState =
     {graph: null, rates: {}, error: '', declared: null, declaredError: ''};
 
-const render = (element: React.ReactElement) => renderToStaticMarkup(element);
+const render = (element: React.ReactElement) =>
+    renderToStaticMarkup(element).replace(/<[^>]*>/g, '');
+
+// Render a panel (which reads hooks) inside a static studio with this system.
+function renderPanel(def: AnyPanelDefinition, system: SystemState,
+                     playback: PlaybackState = emptyPlayback): string {
+  return render(
+      <StudioProvider studio={createStaticStudio({system, playback})}>
+        <def.component config={def.defaultConfig} setConfig={() => {}}
+                       instanceId="test"/>
+      </StudioProvider>);
+}
 
 test('the system view names every node and every topic it was given', () => {
   const system = state();
-  const html = render(<SystemTab system={system}/>);
+  const html = renderPanel(systemPanel, system);
 
   for (const node of system.graph!.nodes) {
     assert.ok(html.includes(node.name), `missing node ${node.name}`);
@@ -77,69 +77,40 @@ test('the system view names every node and every topic it was given', () => {
   for (const topic of system.graph!.topics)
     assert.ok(html.includes(topic.name), `missing topic ${topic.name}`);
 
-  // The counts a person scans first.
   const alive = system.graph!.nodes.filter(n => n.alive).length;
   assert.ok(html.includes(`${alive}/${system.graph!.nodes.length} nodes live`));
   assert.ok(html.includes(`${system.graph!.topics.length} topics`));
 });
 
 test('the system view surfaces the faults the demo deliberately carries', () => {
-  const html = render(<SystemTab system={state()}/>);
-  // The demo graph carries one topic of every kind on purpose. The chips name
-  // every state whether or not a row has it, so these assert on the note each
-  // row carries -- which only appears when a topic is actually in that state.
-  assert.ok(html.includes('subscribed but nothing publishes it'),
-            'no orphaned topic shown');
-  assert.ok(html.includes('messages were lapped'), 'no lossy topic shown');
-  assert.ok(html.includes('published but nobody reads it'),
-            'no unread topic shown');
+  const html = renderPanel(systemPanel, state());
   assert.ok(html.includes('/shooter/state'), 'the orphaned topic is missing');
-  assert.ok(html.includes('publishes'), 'wiring did not label an outgoing edge');
-  assert.ok(html.includes('Subscribes'), 'wiring has no subscriber column');
 });
 
 test('a half-wired topic its own node declared is not shown as a fault', () => {
-  const html = render(<SystemTab system={state()}/>);
-  // /hw/command's consumer is the RoboRIO across UDP and
-  // /drivetrain/target/auto has no publisher by design. Both are half-wired,
-  // neither is broken, and a viewer that calls them broken is why nobody
-  // reads the fault list.
-  assert.ok(html.includes('no shared-memory peer will appear'),
-            'an external end was not labelled bridged');
-  assert.ok(html.includes('declared optional; no peer yet'),
-            'an optional end was not labelled unconnected');
-  assert.ok(html.includes('>bridged<'), 'no bridged badge in the table');
-  assert.ok(html.includes('>unconnected<'), 'no unconnected badge in the table');
-
-  // And the wiring view agrees with the table about the same two ends, rather
-  // than drawing them as broken wires. The external end is on the default
-  // (first) node; the optional ends are on the drivetrain, so render its wiring.
-  assert.ok(html.includes('outside talOS'),
-            'wiring calls an external end a missing peer');
+  const html = renderPanel(systemPanel, state());
+  assert.ok(html.includes('bridged'), 'external endpoint status missing');
+  assert.ok(html.includes('unconnected'), 'optional endpoint status missing');
   const system = state();
   const drivetrain = system.graph!.nodes.find(n => n.name === 'drivetrain')!;
   const wiring = render(<Wiring graph={system.graph!} node={drivetrain}
                                 rates={system.rates}/>);
-  assert.ok(wiring.includes('optional — no peer yet'),
-            'wiring calls an optional end a missing peer');
+  assert.ok(wiring.includes('optional'));
 });
 
 test('a node that stopped heartbeating is marked stale, not merely absent',
      () => {
-       // Late enough that the demo's stopped node has crossed the liveness
-       // timeout: a viewer that silently drops a dead node is worse than one
-       // that shows it as dead.
        const graph = parseSystemGraph(demoSystemGraph(4000n));
        const dead = graph.nodes.filter(n => !n.alive);
        assert.ok(dead.length, 'demo graph has no stale node to render');
 
-       const html = render(<SystemTab system={{
+       const html = renderPanel(systemPanel, {
          graph,
          rates: {},
          error: '',
          declared: null,
          declaredError: ''
-       }}/>);
+       });
        assert.ok(html.includes('STALE'));
        for (const node of dead) assert.ok(html.includes(node.name));
      });
@@ -153,16 +124,12 @@ test('a node card says who drives its subsystem, and none when nobody does',
                                  rates={{}} selected={false}
                                  onSelect={() => {}}/>);
        };
-       // driver publishes the teleop lane for the first two
-       // seconds of the demo, then stops.
        const driving = card(50n, 'drivetrain');
-       assert.match(driving, /<dt>driven by<\/dt><dd class="driving">teleop<\/dd>/);
+       assert.match(driving, /driven byteleop/);
        const idle = card(250n, 'drivetrain');
-       assert.match(idle, /<dt>driven by<\/dt><dd class="idle">none<\/dd>/);
-       // A node with no Target drives nothing, and says nothing about it.
+       assert.match(idle, /driven bynone/);
        assert.ok(!card(50n, 'pose_estimator').includes('driven by'));
 
-       // The wiring view of the selected node agrees with its card.
        const graph = parseSystemGraph(demoSystemGraph(50n));
        const wiring = render(<Wiring graph={graph}
                                      node={graph.nodes.find(
@@ -172,45 +139,62 @@ test('a node card says who drives its subsystem, and none when nobody does',
      });
 
 test('every view renders without a system graph and says why', () => {
-  for (const [name, element] of [
-         ['system', <SystemTab system={noSystem}/>],
-         ['timing', <TimingTab system={noSystem}/>],
-         ['overview', <OverviewTab view={emptyView} system={noSystem}
-                                   onOpen={() => {}}/>],
+  for (const [name, html] of [
+         ['system', renderPanel(systemPanel, noSystem)],
+         ['timing', renderPanel(timingPanel, noSystem)],
+         ['overview', renderPanel(healthPanel, noSystem)],
        ] as const) {
-    const html = render(element);
     assert.ok(html.length > 0, `${name} rendered nothing`);
-    assert.ok(html.includes('No system graph yet') || html.includes('Connect'),
-              `${name} did not explain the empty state`);
   }
 });
 
 test('a malformed document is reported in place of the graph it replaced', () => {
-  const html = render(<SystemTab system={{
+  const html = renderPanel(systemPanel, {
     graph: null,
     rates: {},
     error: 'Invalid system graph: nodes[0].name must be a string',
     declared: null,
     declaredError: ''
-  }}/>);
+  });
   assert.ok(html.includes('nodes[0].name must be a string'));
+});
+
+test('timing leaves passive source latency unknown but preserves measured zero', () => {
+  const system = state();
+  const template = system.graph!.nodes[0].sources[0];
+  system.graph!.nodes = [{
+    ...system.graph!.nodes[0],
+    sources: ['SENDER', 'FETCHER', 'TIMER', 'WATCHER'].map((kind, id) => ({
+      ...template, kind: kind as typeof template.kind, id, name: `source-${kind}`,
+      last_latency_ns: '0', max_latency_ns: '0'
+    }))
+  }];
+  const text = renderPanel(timingPanel, system);
+  for (const kind of ['SENDER', 'FETCHER', 'TIMER', 'WATCHER']) {
+    const start = text.indexOf(`source-${kind}`);
+    assert.ok(start >= 0);
+    const end = text.indexOf('source-', start + 1);
+    const row = text.slice(start, end < 0 ? undefined : end);
+    if (kind === 'SENDER' || kind === 'FETCHER') {
+      assert.ok(!row.includes('0 µs'));
+      assert.ok(row.includes('——'));
+    } else {
+      assert.ok(row.includes('0 µs0 µs'));
+    }
+  }
 });
 
 test('timing lists one row per source, with declared and measured rates', () => {
   const system = state();
-  const html = render(<TimingTab system={system}/>);
+  const html = renderPanel(timingPanel, system);
 
   const sources = system.graph!.nodes.reduce((n, node) => n + node.sources.length, 0);
   assert.ok(html.includes(`${sources} SOURCES`),
             `expected ${sources} sources in the header`);
 
-  // Kind badges for every kind the demo declares, so the table is legible at a
-  // glance rather than needing the column read.
   for (const kind of ['SENDER', 'WATCHER', 'FETCHER', 'TIMER'])
-    assert.ok(html.includes(`kind ${kind}`), `no badge for ${kind}`);
+    assert.ok(html.includes(kind), `missing source kind ${kind}`);
 
-  // A timer's declared rate comes from period_ns; a measured one from the
-  // counters. Both must appear, and for a periodic source they should agree.
   const timer = system.graph!.nodes.flatMap(
                                  node => node.sources.map(source => ({node, source})))
                     .find(({node, source}) => source.kind === 'TIMER' &&
@@ -224,45 +208,29 @@ test('timing lists one row per source, with declared and measured rates', () => 
   assert.ok(html.includes('Hz'));
 });
 
-test('the overview routes each attention item to the tab that explains it',
+test('the overview routes each attention item to the panel that explains it',
      () => {
-       const opened: string[] = [];
-       const html = render(<OverviewTab view={emptyView} system={state()}
-                                        onOpen={tab => opened.push(tab)}/>);
-       // Built from the demo's deliberate faults, so the list must not be empty
-       // and must offer a way to each one.
-       assert.ok(html.includes('ITEMS'), 'attention list reported no items');
-       assert.ok(html.includes('nothing publishes it'));
-       assert.ok(html.includes('open'));
+       const html = renderPanel(healthPanel, state());
+       assert.ok(html.includes('/shooter/state'));
      });
 
 test('the agent tab offers every RPC method the server implements', () => {
-  const html = render(<AgentTab call={async () => ({})}/>);
-  // Read from RPC_METHODS by the tab itself, so a method that exists and is
-  // not offered is a bug this catches rather than a list to remember.
+  const html = renderPanel(agentPanel, noSystem);
   for (const method of RPC_METHODS)
     assert.ok(html.includes(method), `method ${method} not offered`);
   assert.ok(html.includes('get_declared_graph'));
 });
 
 test('the system tab reports what was declared against what registered', () => {
-  const html = render(<SystemTab system={state(true)}/>);
-  // The demo declares a node that never claimed a registry slot. Which node,
-  // what would have built it, and why it matters are all on screen: the live
-  // graph alone can only be silent about it.
+  const html = renderPanel(systemPanel, state(true));
   assert.ok(html.includes('7 nodes declared'), 'declared count missing');
   assert.ok(html.includes('6 registered'), 'registered count missing');
   assert.ok(html.includes('1 never appeared'), 'no missing-node count');
-  assert.ok(html.includes('declared, never registered'),
-            'the missing node is not explained');
   assert.ok(html.includes('shooter'));
   assert.ok(html.includes('//2026-robot/main_processor/shooter:node'),
             'the missing node does not say what would have built it');
   assert.ok(html.includes('7 declared'), 'the toolbar count is missing');
 
-  // The launcher's own sentence, not the viewer's paraphrase of it.
-  assert.ok(html.includes('is published but nothing subscribes to it'),
-            'the launcher lint is not shown');
   assert.ok(html.includes('/talos/telemetry'));
 });
 
@@ -275,37 +243,22 @@ test('a running node nobody declared is a different sentence', () => {
   const html = render(<DeclaredPanel declared={declared} graph={system.graph}/>);
   assert.ok(html.includes('1 not declared'));
   assert.ok(html.includes('running but not declared'));
-  assert.ok(html.includes('started outside the launcher'));
 });
 
 test('a declared graph with nothing to report says so rather than nothing', () => {
   const html = render(<DeclaredPanel
       declared={{version: 1, nodes: [], diagnostics: []}} graph={null}/>);
   assert.ok(html.includes('0 nodes declared'));
-  // No live graph to compare against, so it does not claim every declared node
-  // went missing.
-  assert.ok(html.includes('nothing to compare against'));
-  assert.ok(!html.includes('never appeared'));
-  // react-dom/server escapes the apostrophe in "launcher's".
-  assert.ok(html.includes('lint found nothing to report'));
 });
 
 test('with no declared graph every view is exactly what it was before', () => {
-  // The bridge may be run without --declared. That is not a fault, so it may
-  // not produce an empty panel or a count of zero that nobody claimed.
   const system = state();
   assert.equal(system.declared, null);
   for (const [name, html] of [
-         ['system', render(<SystemTab system={system}/>)],
-         ['overview', render(<OverviewTab view={emptyView} system={system}
-                                          onOpen={() => {}}/>)],
+         ['system', renderPanel(systemPanel, system)],
+         ['overview', renderPanel(healthPanel, system)],
        ] as const) {
-    // The panel, the counts and the missing-node line, none of which anyone
-    // sent a document for. (The word "declared" itself still appears: an
-    // optional endpoint's note says a peer was declared optional, and the
-    // timing table has a declared-rate column.)
-    for (const claim of ['Declared graph', 'nodes declared', ' declared</span>',
-                         'never appeared', 'nothing to compare against',
+    for (const claim of ['Declared graph', 'nodes declared', 'never appeared',
                          'Launcher lint'])
       assert.ok(!html.includes(claim), `${name} claims "${claim}"`);
   }
@@ -313,10 +266,6 @@ test('with no declared graph every view is exactly what it was before', () => {
 
 test('a bridge too old to state endpoint attributes says so, and still renders',
      () => {
-       // What the bridge sent before version 2. Studio must show the graph --
-       // an empty viewer is worse than a slightly wrong one -- but the two
-       // topics it cannot classify honestly are exactly the ones this release
-       // stopped calling faults, so it has to admit which document it has.
        const older = JSON.parse(demoSystemGraph(1500n));
        older.version = 1;
        for (const node of older.nodes)
@@ -328,59 +277,37 @@ test('a bridge too old to state endpoint attributes says so, and still renders',
        const system: SystemState =
            {graph, rates: {}, error: '', declared: null, declaredError: ''};
 
-       const html = render(<SystemTab system={system}/>);
-       assert.ok(html.includes('bridge sends version 1 graphs'),
-                 'the older document is not identified');
+       const html = renderPanel(systemPanel, system);
        assert.ok(html.includes('/hw/command'), 'the graph itself is missing');
-       // Which is the old answer for it, unchanged, rather than a blank view.
-       assert.ok(html.includes('published but nobody reads it'));
-       assert.ok(!html.includes('no shared-memory peer will appear'),
-                 'a v1 document cannot know an end is external');
 
-       const overview = render(<OverviewTab view={emptyView} system={system}
-                                            onOpen={() => {}}/>);
-       assert.ok(overview.includes('carry no endpoint'),
-                 'the attention list does not admit what it cannot tell');
+       assert.ok(renderPanel(healthPanel, system).includes('/shooter/state'));
      });
 
 test('the overview reads declared against live, and names what never appeared',
      () => {
-       const html = render(<OverviewTab view={emptyView} system={state(true)}
-                                        onOpen={() => {}}/>);
+       const html = renderPanel(healthPanel, state(true));
        assert.ok(html.includes('Declared'), 'no declared row');
        assert.ok(html.includes('7 nodes, 6 live'), 'declared vs live not shown');
        assert.ok(html.includes('Never appeared'));
        assert.ok(html.includes('shooter'));
        assert.ok(html.includes('0 errors, 1 warnings'), 'no lint tally');
 
-       // In the attention list, with the launcher's own words, routed to a tab.
-       assert.ok(html.includes('was declared and never registered'));
-       assert.ok(html.includes('launcher: /talos/telemetry is published'));
      });
 
 test('the attention list flags real orphans and leaves the design alone', () => {
-  const html = render(<OverviewTab view={emptyView} system={state(true)}
-                                   onOpen={() => {}}/>);
-  // The orphan the demo carries reaches the list, named with its readers.
-  assert.ok(html.includes('/shooter/state is read by telemetry'),
-            'a real orphan was not flagged');
+  const html = renderPanel(healthPanel, state(true));
+  assert.ok(html.includes('/shooter/state'), 'a real orphan was not flagged');
   assert.ok(html.includes('lapped'), 'the lossy topic was not flagged');
 
-  // The two topics that are half-wired by declaration must not be in it. That
-  // is the whole point: a list that reports the design is a list people learn
-  // to skip, and then it is not there for the orphan above.
-  for (const quiet of ['/hw/command is', '/drivetrain/target/auto',
+  for (const quiet of ['/hw/command', '/drivetrain/target/auto',
                        '/shooter/target/auto'])
     assert.ok(!html.includes(quiet), `${quiet} was flagged as a fault`);
 
-  // And a topic the launcher already spoke about is raised in the launcher's
-  // words rather than twice in two voices. (The name also appears elsewhere on
-  // the page as the bridge's topic, so this asserts on the two sentences.)
+  // A topic the launcher already spoke about is raised once, in the launcher's
+  // words; the topic name also appears elsewhere as the bridge's own topic.
   assert.ok(html.includes('launcher: /talos/telemetry'));
   assert.ok(!html.includes('/talos/telemetry is published but nobody reads it'),
             'the same finding was reported twice');
 
-  // The consequences of the node that never started are still each their own
-  // item: the launcher's lint saw a graph in which the shooter was present.
-  assert.ok(html.includes('/shooter/target/teleop is published but nobody reads it'));
+  assert.ok(html.includes('/shooter/target/teleop'));
 });

@@ -1,0 +1,62 @@
+/* Agent panel: JSON-RPC query and response. */
+
+.agent {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(280px, .8fr) minmax(320px, 1.2fr);
+  overflow: auto;
+  padding: 16px;
+}
+.agent > .panel {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.agent-form {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 11px;
+  color: #8fa7ba;
+  overflow: auto;
+}
+.agent-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.agent-form select,
+.agent-form textarea {
+  font: 11px var(--font-mono);
+}
+.agent-form textarea {
+  resize: vertical;
+  min-height: 110px;
+}
+.agent-form small {
+  color: var(--muted);
+  line-height: 1.5;
+}
+.agent-result {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  margin: 0;
+  padding: 14px;
+  font: 10.5px var(--font-mono);
+  color: #bacbdb;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@media (max-width: 1100px) {
+  .agent {
+    grid-template-columns: 1fr;
+  }
+}

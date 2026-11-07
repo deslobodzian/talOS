@@ -45,6 +45,22 @@ constexpr std::size_t kMaxNameLength = 32;
 constexpr std::size_t kMaxGameMessageLength = 32;
 constexpr std::size_t kMaxEventNameLength = 32;
 
+// Encoded scalar fields and the two FMS string length prefixes. String
+// storage reserves one byte for NUL; each wire string adds one length byte.
+constexpr std::size_t kFixedEncodedSize =
+    8 + 8 + 4 + 1 + 1 + 1 + 2 + 1 + 4 + 1 + 1;
+constexpr std::size_t kMaxJoystickEncodedSize =
+    1 + 1 + 1 + 1 + 4 + 4 * kMaxAxes + 2 * kMaxPovs + kMaxNameLength;
+constexpr std::size_t kMaxEncodedSize =
+    kFixedEncodedSize + (kMaxGameMessageLength - 1) +
+    (kMaxEventNameLength - 1) + kMaxJoysticks * kMaxJoystickEncodedSize;
+static_assert(kFixedEncodedSize == 32,
+              "Driver Station fixed size changed; update docs/DATA_FLOW.md");
+static_assert(kMaxJoystickEncodedSize == 96,
+              "Driver Station joystick size changed; update docs/DATA_FLOW.md");
+static_assert(kMaxEncodedSize == 670,
+              "Driver Station maximum size changed; update docs/DATA_FLOW.md");
+
 // The Driver Station itself only produces new data at 50 Hz, so sampling any
 // faster only duplicates packets. Must stay in sync with the
 // [subsystems.driver_station] period_us in the robot configuration.

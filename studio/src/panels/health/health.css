@@ -1,0 +1,75 @@
+/* Health panel (stream / system / attention). */
+
+.overview {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  align-content: start;
+  overflow: auto;
+  padding: 16px;
+}
+.overview > .panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 220px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.overview > .panel.wide {
+  grid-column: 1 / -1;
+}
+.overview > .panel > .panel-heading {
+  height: 38px;
+  padding: 0 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+}
+.overview > .panel > .panel-heading h2 {
+  font-size: 12px;
+  font-weight: 500;
+  margin: 0;
+}
+.overview > .panel > .panel-heading > span {
+  font-size: 8px;
+  letter-spacing: 1.2px;
+  color: #738a9e;
+}
+
+.attention {
+  list-style: none;
+  margin: 0;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow: auto;
+}
+.attention li {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  justify-content: space-between;
+  border: 1px solid var(--border-soft);
+  border-left: 2px solid #7d6438;
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-size: 11px;
+  background: #131f2c;
+  color: #c3d4e3;
+}
+.attention li.warn {
+  border-left-color: #8a4a58;
+  color: #ffd4dc;
+}
+
+.declared-error {
+  margin: 0;
+  padding: 0 15px 12px;
+  font-size: 11px;
+}

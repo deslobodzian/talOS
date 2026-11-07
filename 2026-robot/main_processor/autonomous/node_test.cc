@@ -65,8 +65,9 @@ std::string Runfile(const char* env) {
   std::unique_ptr<rules_cc::cc::runfiles::Runfiles> files(
       rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
                                                       &error));
-  if (!files || !std::getenv(env)) throw std::runtime_error(error);
-  return files->Rlocation(std::getenv(env));
+  const char* location = std::getenv(env);
+  if (!files || location == nullptr) throw std::runtime_error(error);
+  return files->Rlocation(location);
 }
 
 class AutonomousTest : public ::testing::Test {
@@ -105,6 +106,11 @@ class AutonomousTest : public ::testing::Test {
   float Intake() {
     return Lane<intake::IntakeTarget>("intake").message.roller_velocity_rps();
   }
+  autonomous::Phase Phase() {
+    auto result = sim.latest<autonomous::AutonomousState>("/autonomous/state");
+    EXPECT_TRUE(result.has_value());
+    return result.value_or(autonomous::AutonomousState{}).phase();
+  }
   void StartDrive(bool red = false) {
     Mode(ds::kEnabled | ds::kAutonomous, red);
     Shooter(true);
@@ -128,6 +134,32 @@ TEST_F(AutonomousTest, DisabledAndTeleopReleaseAllLanes) {
   EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
   EXPECT_FALSE(Lane<shooter::ShooterTarget>("shooter").active);
   EXPECT_FALSE(Lane<intake::IntakeTarget>("intake").active);
+}
+
+TEST_F(AutonomousTest, ReportsPhaseThroughDisabledAutoAndDisable) {
+  // Disabled: the state topic still publishes, reporting the idle phase.
+  Mode(0);
+  EXPECT_EQ(Phase(), autonomous::Phase::IDLE);
+
+  // Enabled+auto starts the routine: spinup, then feed once the shooter is
+  // at speed, then drive, then hold on arrival.
+  Mode(ds::kEnabled | ds::kAutonomous);
+  EXPECT_EQ(Phase(), autonomous::Phase::SPINUP);
+  Shooter(true);
+  sim.step(20ms);
+  EXPECT_EQ(Phase(), autonomous::Phase::FEED);
+  StartDrive();
+  for (int i = 0; i < 300; ++i) {
+    Pose(6, 4, 0);
+    sim.step(20ms);
+  }
+  EXPECT_EQ(Phase(), autonomous::Phase::HOLD);
+
+  // Losing the Driver Station (stale target) returns the routine to idle.
+  hw.stop_driver_station();
+  sim.step(160ms);
+  EXPECT_EQ(Phase(), autonomous::Phase::IDLE);
+  EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
 }
 
 TEST_F(AutonomousTest, WaitsForSpeedFeedsThenRotatesDriveAndHolds) {
@@ -155,9 +187,9 @@ TEST_F(AutonomousTest, WaitsForSpeedFeedsThenRotatesDriveAndHolds) {
   EXPECT_LT(Drive().vy_mps(), 0);
   EXPECT_LT(Drive().omega_radps(), 0);
   EXPECT_EQ(Intake(), 30);
-  Pose(2, 0, 0);
-  for (int i = 0; i < 100; ++i) {
-    Pose(2, 0, 0);
+  Pose(6, 4, 0);
+  for (int i = 0; i < 250; ++i) {
+    Pose(6, 4, 0);
     sim.step(20ms);
   }
   EXPECT_DOUBLE_EQ(Drive().vx_mps(), 0);
@@ -229,8 +261,9 @@ TEST(AutonomousBinary, DescribesAndReplaysDeterministically) {
                             "/intake/target/auto"}) {
     EXPECT_NE(describe.output.find(topic), std::string::npos);
   }
+  const char* tmp = std::getenv("TEST_TMPDIR");
   const std::string log =
-      std::string{std::getenv("TEST_TMPDIR")} + "/autonomous.tlog";
+      std::string{tmp != nullptr ? tmp : "/tmp"} + "/autonomous.tlog";
   auto run = RunNode("--sim --duration-s 1 --log '" + log + "'");
   ASSERT_EQ(run.status, 0) << run.output;
   auto replay = RunNode("--replay '" + log + "'");
