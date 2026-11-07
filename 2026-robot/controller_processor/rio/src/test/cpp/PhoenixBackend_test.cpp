@@ -1,7 +1,8 @@
 // Regression tests for PhoenixBackend encoder handling and simulation
 // honesty: quadrature scaling from counts_per_rev,
-// duty-cycle device support with offsets and connection validity, and no
-// demand teleport when controller voltage is zero (missing gains exposed).
+// duty-cycle device support with offsets and connection validity, no
+// demand teleport when controller voltage is zero (missing gains exposed), and
+// neutral keeping rotor momentum with brake/coast-dependent decay.
 #include "PhoenixBackend.h"
 
 #include <frc/simulation/DriverStationSim.h>
@@ -12,6 +13,7 @@
 #include <gtest/gtest.h>
 #include <hal/HAL.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -479,6 +481,79 @@ TEST(PhoenixBackendSim, VoltageStillDrivesMotor) {
   // 0.5 duty is ~6 V, targeting ~50 rps: physics must still move the rotor.
   EXPECT_GT(s.motors[0].velocity_rps, 5.0);
   EXPECT_GT(s.motors[0].position_rot, 0.0);
+}
+
+namespace {
+
+struct NeutralSample {
+  double spinning_rps;
+  double after_100ms_rps;
+  double after_100ms_rot;
+  double after_300ms_rps;
+  double after_300ms_rot;
+};
+
+// Spin one motor at 6 V, then go neutral through both entry points (the
+// backend-wide Neutral() and per-motor kNeutral requests) and sample the
+// rotor at ~100 ms and ~300 ms of wall-clock sim time.
+NeutralSample SpinThenNeutral(bool brake) {
+  hw::Config c;
+  auto motor = TestMotor(1, "m1", 1);
+  motor.brake = brake;
+  c.motors.push_back(motor);
+  PhoenixBackend backend(true);
+  EXPECT_TRUE(backend.Configure(c));
+
+  std::array<hw::MotorRequest, 1> cmd{Request(1, hw::Mode::kDutyCycle, 0.5)};
+  hw::State s;
+  PumpReads(backend, s, cmd, 30);
+  NeutralSample out{};
+  out.spinning_rps = s.motors[0].velocity_rps;
+
+  backend.Neutral();
+  cmd[0] = Request(1, hw::Mode::kNeutral, 0.0);
+  PumpReads(backend, s, cmd, 10);
+  out.after_100ms_rps = s.motors[0].velocity_rps;
+  out.after_100ms_rot = s.motors[0].position_rot;
+  PumpReads(backend, s, cmd, 20);
+  out.after_300ms_rps = s.motors[0].velocity_rps;
+  out.after_300ms_rot = s.motors[0].position_rot;
+  return out;
+}
+
+}  // namespace
+
+// Neutral removes drive but keeps momentum, like sim::StepAxis: a coasting
+// flywheel still spins after disable and its position keeps advancing.
+TEST(PhoenixBackendSim, CoastNeutralKeepsMomentumAndDecays) {
+  EnsureHal();
+  EnabledDs ds;
+  const NeutralSample n = SpinThenNeutral(/*brake=*/false);
+  ASSERT_GT(n.spinning_rps, 20.0);
+  // ~1 s coast time constant: after ~100 ms most of the speed remains.
+  EXPECT_GT(n.after_100ms_rps, 0.5 * n.spinning_rps);
+  EXPECT_LT(n.after_100ms_rps, n.spinning_rps);
+  // Still decaying toward zero, and still rolling forward.
+  EXPECT_LT(n.after_300ms_rps, n.after_100ms_rps);
+  EXPECT_GT(n.after_300ms_rps, 0.0);
+  EXPECT_GT(n.after_300ms_rot, n.after_100ms_rot);
+}
+
+TEST(PhoenixBackendSim, BrakeNeutralStopsMuchFasterThanCoast) {
+  EnsureHal();
+  EnabledDs ds;
+  const NeutralSample brake = SpinThenNeutral(/*brake=*/true);
+  const NeutralSample coast = SpinThenNeutral(/*brake=*/false);
+  ASSERT_GT(brake.spinning_rps, 20.0);
+  ASSERT_GT(coast.spinning_rps, 20.0);
+  // ~50 ms brake time constant: most speed is gone after ~100 ms, but the
+  // rotor did not stop instantly (no velocity snap on neutral).
+  EXPECT_LT(brake.after_100ms_rps, 0.3 * brake.spinning_rps);
+  EXPECT_GT(brake.after_100ms_rps, 0.0);
+  EXPECT_LT(brake.after_100ms_rps / brake.spinning_rps,
+            0.5 * coast.after_100ms_rps / coast.spinning_rps);
+  EXPECT_LT(brake.after_300ms_rps, 0.5);
+  EXPECT_GT(coast.after_300ms_rps, 10.0 * std::max(brake.after_300ms_rps, 0.1));
 }
 
 TEST(PhoenixBackendGains, MapsGravityTypeForEverySlot) {

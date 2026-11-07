@@ -76,6 +76,17 @@ ctre::phoenix::StatusCode Retry(Call call) {
   }
   return status;
 }
+
+// Desktop-sim neutral decay time constants (rotor velocity, first order).
+// Neutral removes drive but keeps momentum: brake shorts the windings and
+// stops the rotor quickly, coast lets the load roll on. Matches the unpowered
+// branch of talos::hardware::sim::StepAxis (talOS/hardware/sim_physics.h), so
+// disable-time behaviour agrees between the two simulators.
+constexpr double kSimNeutralBrakeTauS = 0.05;
+constexpr double kSimNeutralCoastTauS = 1.0;
+// Friction holds a nearly-stopped unpowered rotor instead of creeping forever
+// (same standstill snap as StepAxis).
+constexpr double kSimNeutralStandstillRps = 0.01;
 }  // namespace
 
 PhoenixBackend::PhoenixBackend(bool is_simulation)
@@ -169,7 +180,7 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   sim_rotor_velocity_.fill(0.0);
   sim_rotor_position_.fill(0.0);
   motor_to_sensor_map_.fill(-1);
-  last_commands_.fill(hw::MotorRequest{});
+  sim_neutral_.fill(true);
   sim_yaw_deg_ = 0.0;
   last_sim_time_ = std::nullopt;
 
@@ -640,12 +651,6 @@ bool PhoenixBackend::Read(hw::State& s) {
 }
 bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
   if (commands.size() != motors_.size()) return false;
-  if (is_simulation_) {
-    for (std::size_t i = 0; i < commands.size() && i < last_commands_.size();
-         ++i) {
-      last_commands_[i] = commands[i];
-    }
-  }
   for (std::size_t i = 0; i < commands.size(); ++i) {
     const auto& r = commands[i];
     auto& m = *motors_[i];
@@ -677,8 +682,11 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
         }
         feedback_valid &= sensor_valid;
       }
-      if (commands[master_index].mode == hw::Mode::kNeutral ||
-          !ValidMotionFeedback(position, velocity) || !feedback_valid) {
+      const bool neutral = commands[master_index].mode == hw::Mode::kNeutral ||
+                           !ValidMotionFeedback(position, velocity) ||
+                           !feedback_valid;
+      sim_neutral_[i] = neutral;
+      if (neutral) {
         result = m.SetControl(ph::controls::NeutralOut{});
       } else {
         result = m.SetControl(
@@ -694,6 +702,7 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
       }
       continue;
     }
+    sim_neutral_[i] = r.mode == hw::Mode::kNeutral;
     switch (r.mode) {
       case hw::Mode::kNeutral:
         result = m.SetControl(ph::controls::NeutralOut{});
@@ -764,13 +773,8 @@ void PhoenixBackend::Neutral() {
   for (auto& pwm : pwm_outputs_) pwm->SetDisabled();
   // Support matrix: DIO outputs de-energize on every safe-state transition.
   for (auto& dio : digital_outputs_) dio->Set(false);
-  if (is_simulation_) {
-    for (auto& cmd : last_commands_) cmd = hw::MotorRequest{};
-    for (std::size_t i = 0; i < motors_.size(); ++i) {
-      sim_rotor_velocity_[i] = 0.0;
-      motors_[i]->GetSimState().SetRotorVelocity(0_tps);
-    }
-  }
+  // Sim: neutral keeps rotor momentum; UpdateSimulation decays it per brake.
+  if (is_simulation_) sim_neutral_.fill(true);
 }
 
 void PhoenixBackend::UpdateSimulation(double dt) {
@@ -784,12 +788,24 @@ void PhoenixBackend::UpdateSimulation(double dt) {
     // Voltage is the only driver (Kraken X60 free speed: 100 rps at 12 V).
     // A closed-loop request with missing gains produces ~0 V, so the rotor
     // coasts to a stop here instead of jumping to the requested demand. Never
-    // consult last_commands_ for physics: that shortcut hides bad tuning.
-    const double volts = sim.GetMotorVoltage().value();
-    const double target_rotor_rps = (volts / 12.0) * 100.0;
-    const double alpha = std::min(1.0, dt / 0.01);
+    // consult the request demand for physics: that shortcut hides bad tuning.
+    // Neutral is unpowered: velocity decays per the brake config and the
+    // position keeps integrating while the rotor rolls on.
+    double target_rotor_rps = 0.0;
+    double tau = 0.01;
+    if (sim_neutral_[i]) {
+      tau = m_cfg.brake ? kSimNeutralBrakeTauS : kSimNeutralCoastTauS;
+    } else {
+      const double volts = sim.GetMotorVoltage().value();
+      target_rotor_rps = (volts / 12.0) * 100.0;
+    }
+    const double alpha = std::min(1.0, dt / tau);
     sim_rotor_velocity_[i] +=
         (target_rotor_rps - sim_rotor_velocity_[i]) * alpha;
+    if (sim_neutral_[i] &&
+        std::abs(sim_rotor_velocity_[i]) < kSimNeutralStandstillRps) {
+      sim_rotor_velocity_[i] = 0.0;
+    }
 
     sim_rotor_position_[i] += sim_rotor_velocity_[i] * dt;
     sim.SetRotorVelocity(units::turns_per_second_t{sim_rotor_velocity_[i]});

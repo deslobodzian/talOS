@@ -88,7 +88,9 @@ class PhoenixBackend final : public talos::hardware::Backend {
   std::array<double, talos::hardware::kMaxMotors> sim_rotor_velocity_{};
   std::array<double, talos::hardware::kMaxMotors> sim_rotor_position_{};
   std::array<int, talos::hardware::kMaxMotors> motor_to_sensor_map_{};
-  std::array<talos::hardware::MotorRequest, talos::hardware::kMaxMotors>
-      last_commands_{};
+  // Desktop sim only: true while the motor is commanded neutral (NeutralOut),
+  // so UpdateSimulation decays the rotor per brake/coast instead of tracking
+  // voltage.
+  std::array<bool, talos::hardware::kMaxMotors> sim_neutral_{};
   double sim_yaw_deg_{0.0};
 };

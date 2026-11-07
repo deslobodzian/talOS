@@ -234,7 +234,9 @@ or without a live command. On the real backend, neutral disables PWM pulses
 Tests live in `sim_physics_test.cc`. The standalone `sim_gateway` runs the
 ideal backend by default and the physics backend with `--physics` (see
 `2026-robot/main_processor/simulation/README.md`). The RoboRIO desktop model
-keeps its own first-order Kraken model (same 100 rps at 12 V family).
+keeps its own first-order Kraken model (same 100 rps at 12 V family) and the
+same neutral rule: neutral removes drive and the rotor decays per `brake`
+(about 0.05 s braked, 1.0 s coasting) instead of stopping instantly.
 
 ### Ground truth and odometry error
 
