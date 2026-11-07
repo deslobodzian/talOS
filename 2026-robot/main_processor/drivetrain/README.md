@@ -95,10 +95,14 @@ node reads them through `talos::Target`, which follows the lane the robot's
 while the Driver Station is disabled, e-stopped or silent).
 
 The driver applies a circular stick deadband and caps translation radially.
-With a fresh heading, field-oriented translation is alliance-relative (Red is
-rotated by pi); stale headings fall back to robot-relative drive. Joystick 0's
+With a fresh heading, field-oriented translation is driver-relative: gyro zero
+at boot is away from this driver, with no alliance flip. Joystick 0's
 `rezero_button_id` (1-based, default 1; non-positive disables) latches the current
-heading as driver-forward on its rising edge. `heading_hold_radps` sets angular
+fresh heading as driver-forward on its rising edge. Heading loss stops
+translation until the translation sticks are centred, then re-arms robot-relative
+drive. It stays robot-relative until heading is fresh **and** translation sticks
+are centred again; rotation remains available throughout. Frame transitions are
+logged by the driver. `heading_hold_radps` sets angular
 correction per radian of wrapped heading error (configured to 4.0, compiled
 default 0.0); manual rotation resets the held heading, and stale headings or
 disabled/disconnected Driver Station state cancel hold.

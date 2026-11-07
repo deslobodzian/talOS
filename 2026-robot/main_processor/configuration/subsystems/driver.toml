@@ -6,8 +6,9 @@ period_us = 20000
 max_linear_mps = 4.0
 max_angular_radps = 6.0
 deadband_frac = 0.05
-# Field-relative translation stops without a fresh drivetrain heading.
-# Recovery requires fresh heading plus centred translation sticks.
+# Driver-forward is gyro-relative at boot/rezero, with no alliance flip.
+# Heading loss stops translation until centred, then uses robot-relative.
+# Fresh heading plus centred translation restores driver-relative driving.
 field_oriented = true
 # Button numbers are 1-based; a non-positive value disables re-zero.
 rezero_button_id = 1

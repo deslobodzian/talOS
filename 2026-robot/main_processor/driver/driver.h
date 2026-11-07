@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <numbers>
 #include <optional>
 
@@ -43,7 +44,7 @@ class Driver {
           yaw_rad_ = s.yaw_rad();
           heading_at_ = node_.now();
           have_heading_ = true;
-          if (armed_ && translation_neutral_) translation_armed_ = true;
+          if (armed_ && translation_neutral_) SetFrame(Frame::kField);
         });
   }
 
@@ -52,10 +53,24 @@ class Driver {
   void update() {
     CheckEvaluation();
     if (!ds_.connected()) Stop();
-    if (field_oriented_ && !FreshHeading()) translation_armed_ = false;
+    if (field_oriented_ && !FreshHeading() && frame_ == Frame::kField)
+      SetFrame(Frame::kWaitingForNeutral);
   }
 
  private:
+  enum class Frame { kWaitingForNeutral, kRobot, kField };
+
+  void SetFrame(Frame next) {
+    if (!field_oriented_) next = Frame::kRobot;
+    if (frame_ == next) return;
+    frame_ = next;
+    // No driver state topic: report frame transitions without a new wire type.
+    std::fprintf(stderr, "driver: translation frame %s\n",
+                 next == Frame::kField   ? "driver-relative (gyro)"
+                 : next == Frame::kRobot ? "robot-relative"
+                                         : "waiting for neutral");
+  }
+
   // Five 20 ms periods by default, so one or two dropped packets do not flap
   // the frame. A non-positive or non-finite value keeps the default.
   static talos::Duration HeadingTimeout(const talos::Node& node) {
@@ -82,7 +97,7 @@ class Driver {
   // rather than timing the last request out.
   void Stop() {
     armed_ = false;
-    translation_armed_ = false;
+    SetFrame(Frame::kWaitingForNeutral);
     translation_neutral_ = false;
     holding_heading_ = false;
     if (!commanding_) return;
@@ -109,8 +124,7 @@ class Driver {
     const double magnitude = std::hypot(raw_x, raw_y);
     const bool translation_neutral =
         std::isfinite(magnitude) && magnitude <= deadband_frac_;
-    const bool neutral = translation_neutral &&
-                         std::isfinite(raw_rotation) &&
+    const bool neutral = translation_neutral && std::isfinite(raw_rotation) &&
                          std::abs(raw_rotation) <= deadband_frac_ && !rezero;
     if (!std::isfinite(magnitude) || !std::isfinite(raw_rotation)) {
       Stop();
@@ -121,18 +135,20 @@ class Driver {
       // Seed edge history from the snapshot; a held button is not a press.
       rezero_pressed_ = rezero;
       armed_ = neutral;
-      translation_armed_ = neutral && FreshHeading();
+      if (neutral) SetFrame(FreshHeading() ? Frame::kField : Frame::kRobot);
       return;
     }
-    if (rezero && !rezero_pressed_ && have_heading_) {
+    if (rezero && !rezero_pressed_ && FreshHeading()) {
       yaw_offset_rad_ = yaw_rad_;
       hold_yaw_rad_ = yaw_rad_;
       holding_heading_ = true;
     }
     rezero_pressed_ = rezero;
     const bool fresh_heading = FreshHeading();
-    if (!fresh_heading) translation_armed_ = false;
-    if (fresh_heading && translation_neutral) translation_armed_ = true;
+    if (!fresh_heading && frame_ == Frame::kField)
+      SetFrame(Frame::kWaitingForNeutral);
+    if (translation_neutral)
+      SetFrame(fresh_heading ? Frame::kField : Frame::kRobot);
     const double linear_scale =
         magnitude > 0 ? talos::teleop::Deadband(std::min(magnitude, 1.0),
                                                 deadband_frac_) *
@@ -154,16 +170,14 @@ class Driver {
     } else {
       holding_heading_ = false;
     }
-    // Never reinterpret a field-relative request in a different frame.
-    // Recovery requires a fresh heading and a centred translation stick.
-    if (field_oriented_ && !translation_armed_) {
+    // Frame changes require neutral translation: never reinterpret a held
+    // stick. Rotation remains available while translation waits to re-arm.
+    if (field_oriented_ && frame_ == Frame::kWaitingForNeutral) {
       vx = 0;
       vy = 0;
-    } else if (field_oriented_) {
-      if (ds_.alliance() == talos::driver_station::Alliance::kRed) {
-        vx = -vx;
-        vy = -vy;
-      }
+    } else if (field_oriented_ && frame_ == Frame::kField) {
+      // Gyro yaw is boot/rezero-relative, not field-absolute. Both alliances
+      // use the latched driver-forward direction without an alliance flip.
       const double yaw = yaw_rad_ - yaw_offset_rad_;
       const double robot_vx = vx * std::cos(yaw) + vy * std::sin(yaw);
       vy = -vx * std::sin(yaw) + vy * std::cos(yaw);
@@ -192,7 +206,7 @@ class Driver {
   bool have_heading_ = false;
   bool commanding_ = false;
   bool armed_ = false;
-  bool translation_armed_ = false;
+  Frame frame_ = Frame::kWaitingForNeutral;
   bool translation_neutral_ = false;
   std::optional<talos::Time> last_evaluation_;
 };
