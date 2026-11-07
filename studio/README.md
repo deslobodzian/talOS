@@ -70,6 +70,32 @@ data/studio.ts ── StudioProvider (worker or static) ─────┘
   control, the status strip and the timeline. It renders panels through the
   registry and gives them navigation via a small context.
 
+### Trust and worker supervision
+
+Freshness is per channel, independent of WebSocket connection: a sample is
+**stale at age >= 1 second** (`data/freshness.ts`, `STALE_AFTER_NS`). The session
+clock advances from the last telemetry timestamp with monotonic elapsed time
+in live mode, even if the socket stays open without samples. Paused/replay
+views use the playback cursor. Status strip, Robot, Subsystems and Hardware
+show a STALE disclosure listing affected channels and their last values.
+Missing retained samples are stale/unknown, never a healthy zero.
+
+Worker errors and message decoding failures reject all pending RPCs with
+`WorkerRpcError`. RPCs time out after 10 seconds. A five-second heartbeat
+detects silent termination after ten seconds without a reply. The status strip
+surfaces failures; Connect, Demo or log import starts a replacement worker.
+
+Worker updates use one acknowledged batch in flight, acknowledged on the next
+UI animation frame. Only the latest playback/system/manifest update waits;
+telemetry history is bounded to 30,000 staged frames, posted in chunks of
+2,000. Overflow drops oldest staged frames, preserving newest readings. The
+status strip exposes dropped frame and coalesced update counts. The worker's
+authoritative timeline remains intact; UI history/events can have gaps after
+an overloaded UI, so these counters must be considered when diagnosing logs.
+Motor fault events warn only for newly set bits; cleared bits produce an
+info/resolved event, including mixed set/clear transitions.
+
+
 ### Layout
 
 A workspace is a JSON tree persisted in `localStorage` (`talos-studio-workspace`):

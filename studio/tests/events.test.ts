@@ -410,3 +410,15 @@ test('a short enabled rejection run does not invent a warning at its end', () =>
   assert.equal(engine.events.length, 2);
   assert.ok(engine.events.every(event => event.severity === 'info'));
 });
+
+test('motor fault set bits warn; clears resolve and unchanged masks are silent', () => {
+  const detector = FRAME_DETECTORS.find(d => d.id === 'link-fault-mask')!;
+  const transition = (a: number, b: number) => detector.detect(
+      frame(1, 1n, {'hw/status/motor_fault_mask': a}),
+      frame(2, 2n, {'hw/status/motor_fault_mask': b}));
+  assert.deepEqual(transition(0, 3).map(e => e.severity), ['warn']);
+  assert.deepEqual(transition(3, 1).map(e => e.severity), ['info']);
+  assert.deepEqual(transition(1, 0).map(e => e.severity), ['info']);
+  assert.deepEqual(transition(1, 1), []);
+  assert.deepEqual(transition(1, 2).map(e => e.severity), ['warn', 'info']);
+});

@@ -9,6 +9,7 @@ import type {ReactNode} from 'react';
 import type {Snapshot} from '../core';
 import type {SessionManifest} from './manifest';
 import {TelemetryStore} from './store';
+import {WorkerClient} from './worker-client';
 import type {
   Bounds,
   Mode,
@@ -17,6 +18,7 @@ import type {
   StudioActions,
   SystemState
 } from './types';
+import type {WorkerMessage} from './worker-client';
 
 export type Studio = {
   store: TelemetryStore;
@@ -96,19 +98,22 @@ export function createWorkerStudio(): Studio {
   const studio = new StudioImpl(
       store, /*actions=*/{} as StudioActions, defaultScheduler, initialPlayback,
       initialSystem);
-  const worker =
-      new Worker(new URL('../worker.ts', import.meta.url), {type: 'module'});
-  const pending = new Map<number, (value: unknown) => void>();
-  let nextRpcId = 1;
-
-  const post = (data: object, transfer?: Transferable[]) =>
-      transfer ? worker.postMessage(data, transfer) : worker.postMessage(data);
+  const client = new WorkerClient(
+      () => new Worker(new URL('../worker.ts', import.meta.url), {type: 'module'}),
+      data => receive(data),
+      error => {
+        studio.playback = {...studio.playback, connection: 'error', status: error.message};
+        studio.notify();
+      });
+  const post = (data: object, transfer?: Transferable[]) => client.post(data, transfer);
 
   studio.actions = {
     connect(url: string) {
+      client.restart();
       post({type: 'connect', url});
     },
     demo() {
+      client.restart();
       post({type: 'demo'});
     },
     setMode(mode: Mode) {
@@ -125,22 +130,27 @@ export function createWorkerStudio(): Studio {
     },
     async importLog(file: File) {
       const buffer = await file.arrayBuffer();
+      client.restart();
       post({type: 'import', buffer}, [buffer]);
     },
     exportLog() {
       post({type: 'export'});
     },
     rpc(method: string, params: unknown) {
-      return new Promise<unknown>(resolve => {
-        const id = nextRpcId++;
-        pending.set(id, resolve);
-        post({type: 'rpc', id, request: {jsonrpc: '2.0', id, method, params}});
-      });
+      return client.rpc(method, params);
     }
   };
 
-  worker.onmessage = (e: MessageEvent) => {
-    const data = e.data;
+  const receive = (data: WorkerMessage) => {
+    if (data.type === 'updates') {
+      for (const message of data.messages) receive(message);
+      studio.playback = {...studio.playback, updates: {
+        dropped: data.dropped, coalesced: data.coalesced
+      }};
+      studio.notify();
+      defaultScheduler(client.acknowledger());
+      return;
+    }
     if (data.type === 'frames') {
       store.ingest(data.frames, data.reset);
       studio.notify();
@@ -164,10 +174,6 @@ export function createWorkerStudio(): Studio {
       studio.manifestError = data.error ?? '';
       if (manifest) store.pushManifest(manifest);
       studio.notify();
-    } else if (data.type === 'rpc') {
-      const settle = pending.get(data.id);
-      pending.delete(data.id);
-      settle?.(data.response);
     } else if (data.type === 'export') {
       const href = URL.createObjectURL(new Blob([data.buffer]));
       const a = document.createElement('a');
@@ -197,6 +203,7 @@ export function createStaticStudio(input: {
   const frames = input.frames ?? [];
   const playback: PlaybackState = {
     mode: input.playback?.mode ?? 'PAUSED',
+    clock_ns: input.playback?.clock_ns ?? input.playback?.cursor_ns ?? frames.at(-1)?.timestamp_ns ?? null,
     cursor_ns: input.playback?.cursor_ns ?? frames.at(-1)?.timestamp_ns ?? null,
     bounds: input.playback?.bounds ?? boundsOf(frames),
     stats: input.playback?.stats ?? {dropped: 0, late: 0, invalid: 0},

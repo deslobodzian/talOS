@@ -5,11 +5,14 @@ import {ByteBuffer} from 'flatbuffers';
 import {Coordinator, JitterBuffer, TelemetryDecoder, Timeline, type Snapshot} from './core';
 import {MAX_MANIFEST_BYTES, manifestUrl, parseManifest, type SessionManifest} from './data/manifest';
 import {type Connection, type PlaybackState} from './data/types';
+import {WorkerUpdateStream} from './data/worker-stream';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from './demo';
 import {Frame} from './generated/talos/telemetry/frame';
 import {type DeclaredGraph, declaredUrl, MAX_DECLARED_BYTES, parseDeclaredGraph, parseSystemGraph, RateWindow, type SystemGraph} from './system';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
+const updates = new WorkerUpdateStream(message => ctx.postMessage(message));
+let sampleArrival = performance.now();
 let coordinator = new Coordinator(), jitter = new JitterBuffer(10);
 let decoder = new TelemetryDecoder();
 let streamId: string|null = null;
@@ -63,7 +66,7 @@ function postSystem() {
   for (const [key, value] of rateWindow.rates()) {
     rates[key] = value;
   }
-  ctx.postMessage({
+  updates.push({
     type: 'system',
     graph: system,
     rates,
@@ -76,7 +79,7 @@ function postSystem() {
 // The session manifest, posted on change: it is re-read at 1 Hz, but re-posting
 // an unchanged document would re-render the Session panel for nothing.
 function postManifest() {
-  ctx.postMessage({type: 'manifest', manifest, error: manifestError});
+  updates.push({type: 'manifest', manifest, error: manifestError});
 }
 
 // Every frame appended to the timeline since the previous post, in order,
@@ -86,7 +89,7 @@ function postFrames() {
   if (!needsReset && pendingFrames.length === 0) return;
   while (needsReset || pendingFrames.length > 0) {
     const chunk = pendingFrames.splice(0, 2000);
-    ctx.postMessage({type: 'frames', reset: needsReset, frames: chunk});
+    updates.push({type: 'frames', reset: needsReset, frames: chunk});
     needsReset = false;
     if (pendingFrames.length === 0) break;
   }
@@ -100,6 +103,9 @@ function postPlayback(now: number) {
   const state: PlaybackState = {
     mode: coordinator.mode,
     cursor_ns: snapshot?.timestamp_ns ?? null,
+    clock_ns: snapshot ? (coordinator.mode === 'LIVE_STREAMING' ?
+        BigInt(snapshot.timestamp_ns) + BigInt(Math.round((now - sampleArrival) * 1e6)) :
+        coordinator.cursor).toString() : null,
     bounds: coordinator.timeline.bounds(),
     stats: {...jitter.stats},
     status,
@@ -109,7 +115,7 @@ function postPlayback(now: number) {
       lastPlayback.status !== state.status ||
       lastPlayback.connection !== state.connection;
   if (discrete || now - lastPlaybackPost >= 1000 / 30) {
-    ctx.postMessage({type: 'playback', state});
+    updates.push({type: 'playback', state});
     lastPlayback = state;
     lastPlaybackPost = now;
   }
@@ -359,6 +365,12 @@ function connect(url: string, gen: number) {
 ctx.onmessage = ({data}) => {
   try {
     switch (data.type) {
+      case 'ack':
+        updates.ack();
+        break;
+      case 'ping':
+        ctx.postMessage({type: 'pong'});
+        break;
       case 'connect':
         close();
         reset();
@@ -521,6 +533,7 @@ setInterval(() => {
       continue;
     }
     pendingFrames.push(f);
+    sampleArrival = now;
     const raw = pendingBytes.get(f.sequence_id);
     if (raw) packets.set(f.sequence_id, raw);
     pendingBytes.delete(f.sequence_id);
@@ -544,4 +557,5 @@ setInterval(() => {
   lastTick = now;
   postFrames();
   postPlayback(now);
+  updates.flush();
 }, 4);

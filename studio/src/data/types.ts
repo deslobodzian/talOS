@@ -26,6 +26,8 @@ export type Connection = 'idle'|'connecting'|'live'|'demo'|'replay'|'error';
 export type PlaybackState = {
   mode: Mode;
   cursor_ns: string|null;  // null until the first frame
+  clock_ns?: string|null;  // session time, advancing through a live data gap
+  updates?: {dropped: number; coalesced: number};
   bounds: Bounds|null;     // retained history; null until the first frame
   stats: StreamStats;
   status: string;          // human-readable connection/import status

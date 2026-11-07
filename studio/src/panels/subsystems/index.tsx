@@ -11,7 +11,7 @@
 import {useMemo} from 'react';
 
 import {discoverSubsystems, type Subsystem} from '../../data/discovery';
-import {useDictionary, useSeries, useSnapshot, useSystem} from '../../data/hooks';
+import {useChannelStale, useDictionary, useSeries, useSnapshot, useSystem} from '../../data/hooks';
 import type {ChannelInfo} from '../../data/types';
 import type {SystemNode} from '../../system';
 import {rateKey} from '../../system';
@@ -22,6 +22,7 @@ import {Sparkline} from '../../ui/Sparkline';
 import {TimeSeriesChart} from '../../ui/TimeSeriesChart';
 import type {PanelDefinition, PanelProps} from '../types';
 import {pairTargets, type Pairing} from './pairing';
+import {FreshnessNotice} from '../../ui/FreshnessNotice';
 import './subsystems.css';
 
 export type SubsystemsConfig = {selected: string[] | null};
@@ -72,9 +73,10 @@ function ChannelRow(
       channel: string; info: ChannelInfo; value: number | undefined;
       seriesValues: Float64Array | undefined;
     }) {
+  const stale = useChannelStale(channel);
   const kind = kindOf(info, value);
   return <li className="channel-row">
-    <code className="channel-name">{channelDisplayName(channel)}</code>
+    <code className="channel-name">{channelDisplayName(channel)}{stale && <em className="text-warn"> · STALE</em>}</code>
     <span className={'channel-value ' + kind}>
       {kind === 'boolean' ?
            <span className={'pill ' + (value === 1 ? 'on' : 'off')}>
@@ -103,12 +105,15 @@ function PairRow(
       measuredSeries: Float64Array | undefined;
       targetSeries: Float64Array | undefined;
     }) {
+  const measuredStale = useChannelStale(pair.measured);
+  const targetStale = useChannelStale(pair.target);
   const error = measuredValue !== undefined && targetValue !== undefined ?
       measuredValue - targetValue :
       undefined;
   return <li className="pair-row">
     <div className="pair-label">
       <b>{pair.stem}</b>
+      {(measuredStale || targetStale) && <em className="text-warn">STALE {measuredStale ? 'measured' : ''} {targetStale ? 'target' : ''}</em>}
       <span className="legend">
         <i className="swatch measured"/>measured
         <i className="swatch target"/>target
@@ -168,6 +173,7 @@ function SubsystemCard(
       </span>;
 
   return <section className="subsystem-card">
+    <FreshnessNotice prefix={sub.name + '/'}/>
     <header className="subsystem-head">
       <h3><StatusDot active={node?.alive ?? false}/>{sub.name}</h3>
       <span className={

@@ -27,9 +27,10 @@ import {
 } from '../../data/discovery';
 import {channelLeaf} from '../../ui/channel';
 import {duration, number} from '../../ui/formatters';
-import {EmptyState, Stat, StatList} from '../../ui/primitives';
+import {EmptyState, StatList} from '../../ui/primitives';
 import {Sparkline} from '../../ui/Sparkline';
 import type {PanelDefinition} from '../types';
+import {ChannelReading, ChannelStat as Stat, FreshnessNotice} from '../../ui/FreshnessNotice';
 import './robot.css';
 
 export type RobotConfig = Record<string, never>;
@@ -169,7 +170,7 @@ function Card({title, eyebrow, children}: {
 
 function ModeBadge({mode}: {mode: DriverStationMode|null}) {
   return <em className={'mode-badge' + (mode ? ' ' + mode : ' unknown')}>
-    {mode ? MODE_LABEL[mode] : '—'}
+    <ChannelReading channel="hw/state/driver_station/enabled">{mode ? MODE_LABEL[mode] : '—'}</ChannelReading>
   </em>;
 }
 
@@ -194,7 +195,7 @@ function SubsystemTile({subsystem, channels, labels}: {
     <b className="tile-name">{subsystem.name}</b>
     <span className={'tile-enabled' + (enabled === true ? ' on' :
                  enabled === false ? ' off' : '')}>
-      {enabled === null ? '—' : enabled ? 'enabled' : 'disabled'}
+      {enabledName ? <ChannelReading channel={enabledName}>{enabled === null ? '—' : enabled ? 'enabled' : 'disabled'}</ChannelReading> : '—'}
     </span>
     <span className="tile-source">← {selected}</span>
     {enumBadge && <span className="tile-enum">{enumBadge.leaf}: {enumBadge.label}</span>}
@@ -215,7 +216,7 @@ function CameraTile({camera, channels}: {
   return <div className="camera-tile">
     <b className="tile-name">{camera.name}</b>
     <span className={'tile-health' + (healthy === false ? ' bad' : healthy === true ? ' good' : '')}>
-      {healthy === null ? '—' : healthy ? 'healthy' : 'unhealthy'}
+      {healthyName ? <ChannelReading channel={healthyName}>{healthy === null ? '—' : healthy ? 'healthy' : 'unhealthy'}</ChannelReading> : '—'}
     </span>
     <span className="tile-metric">{fps === null ? '—' : `${fps.toFixed(0)} fps`}</span>
     <span className="tile-metric">{tags === undefined ? '—' : `${tags} tags`}</span>
@@ -302,6 +303,7 @@ function RobotPanel() {
   const recent = useMemo(() => events.slice(-8), [events]);
 
   return <div className="robot-panel">
+    <FreshnessNotice/>
     <div className="robot-grid">
       <Card title="Driver Station" eyebrow="DS">
         {status.ds.mode === null ?
@@ -309,12 +311,12 @@ function RobotPanel() {
              <div className="ds-card">
                <ModeBadge mode={status.ds.mode}/>
                <StatList>
-                 <Stat label="Enabled" tone={status.ds.enabled ? 'ok' : 'warn'}>
+                 <Stat label="Enabled" channel="hw/state/driver_station/enabled" tone={status.ds.enabled ? 'ok' : 'warn'}>
                    {status.ds.enabled === null ? '—' : status.ds.enabled ? 'yes' : 'no'}
                  </Stat>
-                 <Stat label="Match time">{matchTime(status.ds.matchTime_s)}</Stat>
-                 <Stat label="Alliance">{status.ds.alliance ?? '—'}</Stat>
-                 <Stat label="FMS">{status.ds.fms === null ? '—' : status.ds.fms ? 'attached' : 'not attached'}</Stat>
+                 <Stat label="Match time" channel="hw/state/driver_station/match_time_s">{matchTime(status.ds.matchTime_s)}</Stat>
+                 <Stat label="Alliance" channel="hw/state/driver_station/alliance">{status.ds.alliance ?? '—'}</Stat>
+                 <Stat label="FMS" channel="hw/state/driver_station/fms_attached">{status.ds.fms === null ? '—' : status.ds.fms ? 'attached' : 'not attached'}</Stat>
                </StatList>
              </div>}
       </Card>
@@ -323,9 +325,9 @@ function RobotPanel() {
         {!phaseChannel ?
              <EmptyState>no phase channel discovered</EmptyState> :
              <div className="routine-card">
-               <div className="phase-current">{phase.current ?? '—'}</div>
+               <div className="phase-current"><ChannelReading channel={phaseChannel.name}>{phase.current ?? '—'}</ChannelReading></div>
                <StatList>
-                 <Stat label="In phase">{phase.seconds == null || !Number.isFinite(phase.seconds) ? '—' :
+                 <Stat label="In phase" channel={phaseChannel.name}>{phase.seconds == null || !Number.isFinite(phase.seconds) ? '—' :
                      phase.seconds < 60 ? `${phase.seconds.toFixed(1)} s` :
                      phase.seconds < 3600 ? `${(phase.seconds / 60).toFixed(1)} min` :
                      `${(phase.seconds / 3600).toFixed(1)} h`}</Stat>
@@ -340,16 +342,16 @@ function RobotPanel() {
              <div className="power-card">
                <div className="battery-row">
                  <span className="battery-v">
-                   {status.power.battery_v === null ? '—' :
-                       `${number(status.power.battery_v, 2)} V`}
+                   <ChannelReading channel="hw/status/battery_v">{status.power.battery_v === null ? '—' :
+                       `${number(status.power.battery_v, 2)} V`}</ChannelReading>
                  </span>
                  <Sparkline values={batterySeries.values['hw/status/battery_v'] ?? []}/>
                </div>
                <StatList>
-                 <Stat label="Brownout" tone={status.power.brownout ? 'warn' : undefined}>
+                 <Stat label="Brownout" channel="hw/status/brownout" tone={status.power.brownout ? 'warn' : undefined}>
                    {status.power.brownout === null ? '—' : status.power.brownout ? 'yes' : 'no'}
                  </Stat>
-                 <Stat label="CAN util">{status.power.can_frac == null ? '—' :
+                 <Stat label="CAN util" channel="hw/status/can_utilization_frac">{status.power.can_frac == null ? '—' :
                      `${number(status.power.can_frac * 100, 1)} %`}</Stat>
                </StatList>
              </div>}
@@ -359,19 +361,19 @@ function RobotPanel() {
         {status.link.stateAge_us === null && status.link.faultMask === null ?
              <EmptyState>no link data</EmptyState> :
              <StatList>
-               <Stat label="State age" tone={
+               <Stat label="State age" channel="hw/status/state_age_us" tone={
                    status.link.stateAge_us !== null && status.link.stateAge_us > 200000 ?
                        'warn' : undefined}>
                  {status.link.stateAge_us === null ? '—' :
                      duration(status.link.stateAge_us * 1e3)}
                </Stat>
-               <Stat label="Configured" tone={status.link.configured === false ? 'warn' : undefined}>
+               <Stat label="Configured" channel="hw/status/configured" tone={status.link.configured === false ? 'warn' : undefined}>
                  {status.link.configured === null ? '—' : status.link.configured ? 'yes' : 'no'}
                </Stat>
-               <Stat label="Motor faults" tone={status.link.faultMask ? 'warn' : undefined}>
+               <Stat label="Motor faults" channel="hw/status/motor_fault_mask" tone={status.link.faultMask ? 'warn' : undefined}>
                  {maskBits(status.link.faultMask) ?? '—'}
                </Stat>
-               <Stat label="Timed out" tone={status.link.timedOutMask ? 'warn' : undefined}>
+               <Stat label="Timed out" channel="hw/status/timed_out_mask" tone={status.link.timedOutMask ? 'warn' : undefined}>
                  {maskBits(status.link.timedOutMask) ?? '—'}
                </Stat>
              </StatList>}
@@ -390,19 +392,19 @@ function RobotPanel() {
              <EmptyState>no estimator discovered</EmptyState> :
              <div className="pose-card">
                <StatList>
-                 <Stat label="X">{poseX === undefined ? '—' : number(poseX, 3) + ' m'}</Stat>
-                 <Stat label="Y">{poseY === undefined ? '—' : number(poseY, 3) + ' m'}</Stat>
-                 <Stat label="Heading">{poseYaw === undefined || !Number.isFinite(poseYaw) ? '—' :
+                 <Stat label="X" channel={`${posePrefix}/x_m`}>{poseX === undefined ? '—' : number(poseX, 3) + ' m'}</Stat>
+                 <Stat label="Y" channel={`${posePrefix}/y_m`}>{poseY === undefined ? '—' : number(poseY, 3) + ' m'}</Stat>
+                 <Stat label="Heading" channel={`${posePrefix}/yaw_rad`}>{poseYaw === undefined || !Number.isFinite(poseYaw) ? '—' :
                      `${number(poseYaw * 180 / Math.PI, 1)}°`}</Stat>
-                 <Stat label="Valid" tone={
+                 <Stat label="Valid" channel={`${estimator.name}/state/valid`} tone={
                      status.estimator !== null && status.estimator.valid === false ? 'warn' : undefined}>
                    {status.estimator === null || status.estimator.valid === null ? '—' :
                        status.estimator.valid ? 'yes' : 'no'}
                  </Stat>
-                 <Stat label="Accepted (10 s)" tone={rejected.delta !== null && rejected.delta > 0 ? 'warn' : undefined}>
+                 <Stat label="Accepted (10 s)" channel={estimatorAccepted ?? undefined} tone={rejected.delta !== null && rejected.delta > 0 ? 'warn' : undefined}>
                    {accepted.delta === null ? '—' : accepted.delta}
                  </Stat>
-                 <Stat label="Rejected (10 s)" tone={rejected.delta !== null && rejected.delta > 0 ? 'warn' : undefined}>
+                 <Stat label="Rejected (10 s)" channel={estimatorRejected ?? undefined} tone={rejected.delta !== null && rejected.delta > 0 ? 'warn' : undefined}>
                    {rejected.delta === null ? '—' : rejected.delta}
                  </Stat>
                  <Stat label="Acceptance">{acceptancePct === null ? '—' : `${number(acceptancePct, 1)} %`}</Stat>

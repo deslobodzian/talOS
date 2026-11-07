@@ -245,20 +245,27 @@ export function createFrameDetectors(): FrameDetector[] {
   // Link configuration lost/regained.
   boolEdge('link-configured', 'hw/status/configured', 'hardware',
            'Link configured', 'Link not configured', 'info', 'warn'),
-  // Fault and timeout masks: any change, with the set bits in the detail.
+  // Motor faults distinguish newly set bits from resolved bits.
   {
     id: 'link-fault-mask',
     detect(prev, next) {
       const a = val(prev, 'hw/status/motor_fault_mask'),
             b = val(next, 'hw/status/motor_fault_mask');
       if (a === undefined || b === undefined || a === b) return [];
-      return [{
-        severity: 'warn',
-        category: 'hardware',
-        title: 'Motor fault mask changed',
-        detail: maskDetail(b),
-        channel: 'hw/status/motor_fault_mask'
-      }];
+      const before = BigInt(Math.trunc(a)), after = BigInt(Math.trunc(b));
+      const added = after & ~before, cleared = before & ~after;
+      return [
+        ...(added ? [{
+          severity: 'warn' as const, category: 'hardware' as const,
+          title: 'Motor fault bits set', detail: maskDetail(Number(added)),
+          channel: 'hw/status/motor_fault_mask'
+        }] : []),
+        ...(cleared ? [{
+          severity: 'info' as const, category: 'hardware' as const,
+          title: 'Motor fault bits resolved', detail: maskDetail(Number(cleared)),
+          channel: 'hw/status/motor_fault_mask'
+        }] : [])
+      ];
     }
   },
   {

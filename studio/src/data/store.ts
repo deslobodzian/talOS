@@ -155,6 +155,18 @@ export class TelemetryStore {
     return this.snapshotAtCursor()?.channels[name];
   }
 
+  channelSample(name: string, cursor_ns: string|null = this.cursor) {
+    if (cursor_ns === null) return null;
+    const column = this.columns.get(name);
+    if (!column) return null;
+    for (let i = this.indexOf(BigInt(cursor_ns)); i >= 0; i--) {
+      const slot = this.phys(i);
+      if (Number.isFinite(column[slot]))
+        return {value: column[slot], timestamp_ns: this.timestamps[slot]!};
+    }
+    return null;
+  }
+
   channelInfo(name: string): ChannelInfo|undefined {
     return this.infos.get(name);
   }
