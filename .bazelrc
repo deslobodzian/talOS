@@ -7,6 +7,12 @@ build --enable_platform_specific_config
 build --test_env=PYTHONDONTWRITEBYTECODE=1
 
 build:linux --cxxopt=-std=c++23 --cxxopt=-O3
+# libjpeg-turbo 3.1.2 (BCR, via OpenCV) on x86-64 Linux defines its hidden
+# jpeg_nbits_table in the SIMD assembly library while the C library references
+# it; Bazel links test dependencies as separate shared objects, so every test
+# reaching OpenCV fails to load ("undefined symbol: jpeg_nbits_table"). The C
+# path defines the table itself. talOS decodes no JPEGs on a hot path.
+build:linux --@@libjpeg_turbo+//:noasm=yes
 build:macos --cxxopt=-std=c++23 --cxxopt=-O3
 # Two things Apple's libc++ needs before talOS compiles on macOS at all.
 #

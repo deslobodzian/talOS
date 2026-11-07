@@ -140,15 +140,16 @@ TEST(SO3, LogRoundTripEverywhere) {
     const Eigen::Vector3d w = s * RandomAxis(rng);
     EXPECT_TRUE(SO3<double>::Exp(w).Log().isApprox(w, 1e-9)) << s;
   }
-  // Near pi exercises the largest-diagonal fallback.
-  for (const double e : {1e-2, 1e-4, 1e-6}) {
-    const Eigen::Vector3d w = (kPi - e) * RandomAxis(rng);
-    const Eigen::Vector3d back = SO3<double>::Exp(w).Log();
-    EXPECT_NEAR(back.norm(), kPi - e, 1e-6) << e;
-    // Same rotation: Log(Exp(w)) reproduces R, the only exact claim at
-    // the branch cut.
-    EXPECT_TRUE(SO3<double>::Exp(back).rotationMatrix().isApprox(
-        SO3<double>::Exp(w).rotationMatrix(), 1e-6));
+  // Near pi: both sides of the switch to the largest-diagonal method (1e-5
+  // from pi). Below pi the logarithm is unique, so it reproduces w itself.
+  for (const double e : {1e-2, 1e-4, 2e-5, 1e-5, 5e-6, 1e-6, 1e-8}) {
+    for (int i = 0; i < 50; ++i) {
+      const Eigen::Vector3d w = (kPi - e) * RandomAxis(rng);
+      const Eigen::Vector3d back = SO3<double>::Exp(w).Log();
+      EXPECT_NEAR(back.norm(), kPi - e, 1e-12) << e;
+      EXPECT_TRUE(back.isApprox(w, 1e-8))
+          << e << ": " << back.transpose() << " vs " << w.transpose();
+    }
   }
   EXPECT_TRUE(SO3<double>::Identity().Log().isZero(1e-15));
 }

@@ -63,20 +63,24 @@ class SO3 {
     return SO3(Matrix3::Identity() + a * w_hat + b * w_hat * w_hat);
   }
 
-  // Logarithmic map. Exact away from the pi branch cut; at |angle| ~ pi
-  // reconstructs the axis by the largest-diagonal method.
+  // Logarithmic map. The angle comes from atan2(sin, cos), with sin taken from
+  // the skew part, which stays accurate up to pi; acos of the trace loses
+  // relative accuracy in sin(theta) as (pi - theta) shrinks. The axis comes
+  // from the skew part, except within 1e-5 of pi, where that part vanishes
+  // and the largest-diagonal method is the more accurate (its error is
+  // O((pi - theta)^2), the skew part's O(eps / (pi - theta))).
   Vector3 Log() const {
-    const Scalar trace = r_.trace();
-    Scalar cos_theta = (trace - Scalar(1)) / Scalar(2);
-    cos_theta = std::max(Scalar(-1), std::min(Scalar(1), cos_theta));
-    const Scalar theta = std::acos(cos_theta);
+    const Vector3 skew = Vee(r_ - r_.transpose());  // 2 sin(theta) n
+    const Scalar sin_theta = skew.norm() / Scalar(2);
+    const Scalar cos_theta = (r_.trace() - Scalar(1)) / Scalar(2);
+    const Scalar theta = std::atan2(sin_theta, cos_theta);
     if (theta < TaylorThreshold()) {
       // theta / (2 sin theta) = 1/2 (1 + theta^2/6 + ...).
       const Scalar k = Scalar(0.5) * (Scalar(1) + theta * theta / Scalar(6));
-      return k * Vee(r_ - r_.transpose());
+      return k * skew;
     }
-    if (theta < Scalar(kPi) - Scalar(1e-6)) {
-      return (theta / (Scalar(2) * std::sin(theta))) * Vee(r_ - r_.transpose());
+    if (theta < Scalar(kPi) - Scalar(1e-5)) {
+      return (theta / (Scalar(2) * sin_theta)) * skew;
     }
     // Near pi: R = 2 n n^T - I, so n_i^2 = (R_ii + 1) / 2.
     const Scalar xx = (r_(0, 0) + Scalar(1)) / Scalar(2);
@@ -99,8 +103,8 @@ class SO3 {
     // The diagonal reconstruction fixes |n| but not its overall sign
     // (n and -n give the same R at exactly pi). Align with the skew part,
     // whose sign is correct for theta < pi.
-    if (Vee(r_ - r_.transpose()).dot(n) < Scalar(0)) n = -n;
-    return theta * n;
+    if (skew.dot(n) < Scalar(0)) n = -n;
+    return theta * n.normalized();
   }
 
   const Matrix3& rotationMatrix() const { return r_; }
