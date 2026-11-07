@@ -15,5 +15,5 @@ Checks: >
   -performance-enum-size,
   -portability-avoid-pragma-once
 WarningsAsErrors: '*'
-HeaderFilterRegex: '^(talOS/protocol)[/\\].*'
+HeaderFilterRegex: '^(talOS/|2026-robot/main_processor/|examples/|studio/bridge/)'
 FormatStyle: file
