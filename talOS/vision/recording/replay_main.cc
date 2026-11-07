@@ -33,7 +33,9 @@ constexpr double kDefaultTagSizeM = 0.1651;
 Flags ParseFlags(int argc, char** argv) {
   Flags flags;
   auto next = [&](int& i) -> std::string {
-    if (i + 1 >= argc) throw std::invalid_argument("missing value");
+    if (i + 1 >= argc) {
+      throw std::invalid_argument("missing value");
+    }
     return argv[++i];
   };
   for (int i = 1; i < argc; ++i) {
@@ -50,12 +52,13 @@ Flags ParseFlags(int argc, char** argv) {
       flags.overrides.sigma = std::stod(next(i));
     } else if (arg == "--refine-edges") {
       const std::string v = next(i);
-      if (v == "true")
+      if (v == "true") {
         flags.overrides.refine_edges = true;
-      else if (v == "false")
+      } else if (v == "false") {
         flags.overrides.refine_edges = false;
-      else
+      } else {
         throw std::invalid_argument("--refine-edges must be true or false");
+      }
     } else if (arg == "--hamming") {
       flags.overrides.hamming = std::stoi(next(i));
     } else if (arg == "--min-decision-margin") {
@@ -68,14 +71,20 @@ Flags ParseFlags(int argc, char** argv) {
       throw std::invalid_argument("unknown argument: " + arg);
     }
   }
-  if (flags.frames.empty()) throw std::invalid_argument("--frames is required");
-  if (flags.layout.empty()) throw std::invalid_argument("--layout is required");
+  if (flags.frames.empty()) {
+    throw std::invalid_argument("--frames is required");
+  }
+  if (flags.layout.empty()) {
+    throw std::invalid_argument("--layout is required");
+  }
   return flags;
 }
 
 std::string ReadFile(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
-  if (!in) throw std::runtime_error("cannot read " + path);
+  if (!in) {
+    throw std::runtime_error("cannot read " + path);
+  }
   return {std::istreambuf_iterator<char>{in}, {}};
 }
 
@@ -108,8 +117,12 @@ int main(int argc, char** argv) {
     std::cout << "## Rejections (before / after)\n\n";
     std::cout << "| reason | before | after |\n|---|---|---|\n";
     std::set<std::string> reasons;
-    for (const auto& [r, _] : stats.rejections_before) reasons.insert(r);
-    for (const auto& [r, _] : stats.rejections_after) reasons.insert(r);
+    for (const auto& [r, _] : stats.rejections_before) {
+      reasons.insert(r);
+    }
+    for (const auto& [r, _] : stats.rejections_after) {
+      reasons.insert(r);
+    }
     for (const auto& r : reasons) {
       std::cout << "| " << r << " | " << stats.rejections_before[r] << " | "
                 << stats.rejections_after[r] << " |\n";

@@ -26,12 +26,12 @@ Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN
 
 ## Merge `vision`
 
-- [ ] Open the PR `vision` → `main` and get CI green; do not merge red. Locally verified at `887084d`: macOS 107/107 tests, Linux arm64 container build + tests, clang-tidy-18 0 findings, `phoenixTest` + `buildRio` in a Linux amd64 container. GitHub CI not yet run.
+- [ ] PR #2 `vision` → `main` (https://github.com/deslobodzian/talOS/pull/2): get CI green; do not merge red. The first CI run passed macOS build + tests, GradleRIO, clang-format and buildifier, and failed Linux (gcc rejected out-of-order designated initializers) and clang-tidy (findings in the new vision/recording code and tests, and the upstream-derived Metal adapter).
 - [ ] `phoenixTest` on macOS still needs the `MacOSX26.sdk` GradleRIO wants; it passes on Linux.
 
 ## Sim vision slices
 
-Slices 1-6 (sim truth world, accuracy scenario, typed detector settings, estimate quality, latency offset, frame recording) are done in the working tree, uncommitted.
+Slices 1-6 (sim truth world, accuracy scenario, typed detector settings, estimate quality, latency offset, frame recording) are committed on `vision` (PR #2).
 
 - [x] Slice 6, frame recording: `Node::session_dir()` (C++, C ABI `talos_node_session_dir`, Python `node.session_dir`, `Sim::set_session_dir`); `talOS/vision/recording` writes `<session>/frames/<camera>/<capture_ns:020>_<reason>.{png,json}` (1 Hz sampled + ≤1 Hz rejected, 256 MiB per camera, oldest pairs deleted); `//talOS/vision/recording:frame_replay` re-runs detection/localization offline; Studio's Frames tab opens a recorded folder offline. Sim PNGs measured ~200-260 KB each (15 s session: 15 pairs per camera, 2.9-3.9 MB).
 - [x] Slice 7 (report only, no code change): CPU vs Metal `Execute` on 360 realistic 1280×720 frames (300 rendered noisy/moving + 60 recorded), Apple M3 Max laptop (not the Mini). Robot settings (decimate 2, threads 2), `-c opt`: CPU mean/median/p95 3.48/1.65/10.6 ms, Metal 3.72/2.20/10.2 ms; fastbuild CPU 3.55/1.69/10.9, Metal 4.59/2.81/12.9. Four concurrent 60 fps processes: both sustain 60 fps (p95 CPU 11.6-11.9 ms, Metal 12.1-12.5 ms). Decimate 1/threads 1: Metal ~10% faster (mean 21.3 vs 23.6 ms). Detection parity exact (same tag ids on all frames; corner RMS mean 0.0007 px). Metal construction + first frame ~31 ms. Decision pending: keep, delete, or switch the camera default to `backend = "cpu"`; rerun on the Mini first.

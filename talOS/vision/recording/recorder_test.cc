@@ -31,9 +31,9 @@ CameraContext MakeContext() {
                     .cy = 240.0,
                     .k1 = 0.1,
                     .k2 = 0.2,
-                    .k3 = 0.0,
                     .p1 = 0.01,
-                    .p2 = 0.02};
+                    .p2 = 0.02,
+                    .k3 = 0.0};
   ctx.mounting = {.x_m = 1.0,
                   .y_m = 2.0,
                   .z_m = 3.0,
@@ -214,11 +214,16 @@ TEST_F(RecorderTest, SerializeRecordEmitsTheStudioContract) {
   EXPECT_TRUE(parsed.detections[0].valid);
   EXPECT_FALSE(parsed.detections[0].reject_reason.has_value());
   EXPECT_FALSE(parsed.detections[1].valid);
-  ASSERT_TRUE(parsed.detections[1].reject_reason.has_value());
-  EXPECT_EQ(*parsed.detections[1].reject_reason, "hamming");
+  const auto& reject_reason = parsed.detections[1].reject_reason;
+  if (!reject_reason.has_value()) {
+    FAIL() << "missing rejection reason";
+  }
+  EXPECT_EQ(*reject_reason, "hamming");
   EXPECT_TRUE(parsed.observation.valid);
   EXPECT_EQ(parsed.observation.tag_count, 1);
-  ASSERT_TRUE(parsed.truth.has_value());
+  if (!parsed.truth.has_value()) {
+    FAIL() << "missing truth";
+  }
   EXPECT_DOUBLE_EQ(parsed.truth->x_m, 1.0);
 }
 
@@ -361,7 +366,8 @@ TEST_F(RecorderTest, DestructorIsBoundedWithAFullQueueAndSlowWriter) {
   }  // destructor: finish at most one 100 ms pair, drop the rest
   const auto elapsed = std::chrono::steady_clock::now() - before;
   EXPECT_LT(elapsed, std::chrono::milliseconds{500})
-      << "destructor took " << elapsed.count() / 1e6 << " ms";
+      << "destructor took " << static_cast<double>(elapsed.count()) / 1e6
+      << " ms";
 }
 
 }  // namespace

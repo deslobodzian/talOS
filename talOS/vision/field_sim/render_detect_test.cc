@@ -80,19 +80,22 @@ int FullFrameExposure(const FieldLayout& layout,
   for (const auto& a : start) {
     for (const auto& b : end) {
       if (a.tag_id != b.tag_id) continue;
-      for (int corner = 0; corner < 4; ++corner)
+      for (int corner = 0; corner < 4; ++corner) {
         displacement = std::max(displacement,
                                 (a.corners[corner] - b.corners[corner]).norm());
+      }
     }
   }
   std::vector<SimTagDetection> detections;
-  if (displacement < 0.5)
+  if (displacement < 0.5) {
     return RenderInstantaneousFieldView(layout, patterns, camera, pose,
                                         kTagSize, options, output, &detections);
+  }
   const int samples =
       static_cast<int>(std::clamp(std::ceil(displacement * 2), 2.0, 64.0));
-  cv::Mat sum(camera.intrinsics.image_height, camera.intrinsics.image_width,
-              CV_32FC1, cv::Scalar(0));
+  cv::Mat sum(static_cast<int>(camera.intrinsics.image_height),
+              static_cast<int>(camera.intrinsics.image_width), CV_32FC1,
+              cv::Scalar(0));
   std::vector<uint8_t> instant;
   int painted = 0;
   for (int sample = 0; sample < samples; ++sample) {
@@ -115,7 +118,11 @@ TEST(RenderDetect, RegionExposureMatchesFullFrameWithinOneGrayLevel) {
   ASSERT_TRUE(LoadTag36h11Patterns(&patterns, &error)) << error;
   auto layout = RoundTripLayout();
   // Partially overlapping tags exercise painter ordering and rectangle unions.
-  const auto first = *layout.GetTagPose(kTagId);
+  const auto first_pose = layout.GetTagPose(kTagId);
+  if (!first_pose.has_value()) {
+    FAIL() << "missing optional value";
+  }
+  const auto& first = *first_pose;
   layout.SetTagPose(8, talos::geometry::SE3<double>(
                            first.rotation(), Eigen::Vector3d(1.8, 0.10, 0.54)));
   struct Motion {
@@ -160,14 +167,16 @@ TEST(RenderDetect, RegionExposureMatchesFullFrameWithinOneGrayLevel) {
                                              motion.velocity, motion.yaw_rate,
                                              options, &reference));
         ASSERT_EQ(regional.size(), reference.size());
-        const cv::Mat actual(camera.intrinsics.image_height,
-                             camera.intrinsics.image_width, CV_8UC1,
-                             regional.data());
+        const cv::Mat actual(static_cast<int>(camera.intrinsics.image_height),
+                             static_cast<int>(camera.intrinsics.image_width),
+                             CV_8UC1, regional.data());
         const cv::Mat expected(actual.size(), CV_8UC1, reference.data());
         EXPECT_LE(cv::norm(actual, expected, cv::NORM_INF), 1);
-        for (std::size_t i = 0; i < scratch.regions.size(); ++i)
-          for (std::size_t j = i + 1; j < scratch.regions.size(); ++j)
+        for (std::size_t i = 0; i < scratch.regions.size(); ++i) {
+          for (std::size_t j = i + 1; j < scratch.regions.size(); ++j) {
             EXPECT_TRUE((scratch.regions[i] & scratch.regions[j]).empty());
+          }
+        }
       }
     }
   }
@@ -547,7 +556,7 @@ TEST(RenderDetect, YawBlurIncludesCameraMountLeverArm) {
   double error_sum = 0.0;
   for (int y = 180; y < 300; ++y) {
     for (int x = 250; x < 390; ++x) {
-      const size_t p = y * 640 + x;
+      const size_t p = static_cast<size_t>(y) * 640 + x;
       error_sum += std::abs(blurred[p] - reference[p]);
     }
   }
@@ -616,13 +625,17 @@ TEST(RenderDetect, ProductionSimCornerNoiseMatchesSolverPixelStd) {
   std::array<double, 2> sum{}, squared_sum{};
   size_t corners = 0;
   uint64_t sequence = 0;
+  const auto tag_pose = layout.GetTagPose(kTagId);
+  if (!tag_pose.has_value()) {
+    FAIL() << "missing optional value";
+  }
   for (const double distance : {1.5, 2.5, 4.0, 6.0}) {
     size_t distance_detections = 0;
     for (int offset = -2; offset <= 2; ++offset) {
       const auto robot =
           RobotPoseOnField(1.5 - distance, offset * 0.037, offset * 0.018);
       const auto camera_tag = camera.mounting.T_robot_camera.inverse() *
-                              robot.inverse() * *layout.GetTagPose(kTagId);
+                              robot.inverse() * *tag_pose;
       const auto model_corners = GetTagModelCorners(kTagSize);
       std::array<Eigen::Vector2d, 4> expected;
       for (size_t corner = 0; corner < expected.size(); ++corner) {
@@ -642,13 +655,15 @@ TEST(RenderDetect, ProductionSimCornerNoiseMatchesSolverPixelStd) {
         ASSERT_TRUE(result.success) << result.error_message;
         for (const auto& detection : result.detections) {
           if (detection.tag_id != kTagId || detection.hamming > 1 ||
-              detection.decision_margin < config.min_decision_margin)
+              detection.decision_margin < config.min_decision_margin) {
             continue;
+          }
           ++distance_detections;
           for (size_t corner = 0; corner < expected.size(); ++corner) {
             for (size_t axis = 0; axis < 2; ++axis) {
               const double residual =
-                  detection.corners[2 * corner + axis] - expected[corner](axis);
+                  detection.corners[2 * corner + axis] -
+                  expected[corner](static_cast<Eigen::Index>(axis));
               sum[axis] += residual;
               squared_sum[axis] += residual * residual;
             }
@@ -660,15 +675,17 @@ TEST(RenderDetect, ProductionSimCornerNoiseMatchesSolverPixelStd) {
     EXPECT_GE(distance_detections, 20u) << "distance_m=" << distance;
   }
   ASSERT_GT(corners, 0u);
-  const double mean = (sum[0] + sum[1]) / (2 * corners);
+  const double coordinate_samples = static_cast<double>(2 * corners);
+  const double mean = (sum[0] + sum[1]) / coordinate_samples;
   const double std_px = std::sqrt(
-      (squared_sum[0] + squared_sum[1]) / (2 * corners) - mean * mean);
+      (squared_sum[0] + squared_sum[1]) / coordinate_samples - mean * mean);
   const double configured_std_px = PoseSolverOptions{}.pixel_std_px;
   RecordProperty("corner_coordinate_samples", static_cast<int>(2 * corners));
-  RecordProperty("corner_error_mean_px", mean);
-  RecordProperty("corner_error_std_px", std_px);
+  RecordProperty("corner_error_mean_px", std::to_string(mean));
+  RecordProperty("corner_error_std_px", std::to_string(std_px));
   RecordProperty("corner_error_rms_px",
-                 std::sqrt((squared_sum[0] + squared_sum[1]) / (2 * corners)));
+                 std::to_string(std::sqrt((squared_sum[0] + squared_sum[1]) /
+                                          coordinate_samples)));
   EXPECT_NEAR(std_px, configured_std_px, configured_std_px * 0.3)
       << "empirical corner-coordinate std_px=" << std_px
       << ", signed mean_px=" << mean << ", samples=" << 2 * corners;

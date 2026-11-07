@@ -199,9 +199,10 @@ struct JointFixture {
     intr.cy = 240;
     robot = robot * floor_offset;
     for (int id = 1; id <= count; ++id) {
+      const int row = (id - 1) / 3;
       const Pose optical = SolverTagFrameToLayoutFrame(
           Pose(talos::geometry::SO3<double>::Exp({0.1, 0.2, 0.05}),
-               {0.5 * ((id - 1) % 3 - 1), 0.3 * ((id - 1) / 3) - 0.2,
+               {0.5 * ((id - 1) % 3 - 1), 0.3 * static_cast<double>(row) - 0.2,
                 distance + 0.15 * (id % 2)}));
       layout.SetTagPose(id, robot * mount.T_robot_camera * optical);
       TagDetection3D tag;
@@ -414,8 +415,8 @@ TEST(LocalizationTest, NonPositiveDefiniteCovarianceInvalidatesObservation) {
   fixture.layout.SetTagPose(
       1, fixture.mount.T_robot_camera * fixture.tags[0].T_camera_tag);
   for (size_t i = 0; i < 4; ++i) {
-    fixture.tags[0].corners[2 * i] = fixture.intr.cx;
-    fixture.tags[0].corners[2 * i + 1] = fixture.intr.cy;
+    fixture.tags[0].corners[2 * i] = static_cast<float>(fixture.intr.cx);
+    fixture.tags[0].corners[2 * i + 1] = static_cast<float>(fixture.intr.cy);
   }
   const auto singular = fixture.Solve();
   EXPECT_FALSE(singular.validity.valid);

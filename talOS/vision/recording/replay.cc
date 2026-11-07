@@ -19,7 +19,9 @@ namespace {
 
 std::string ReadFile(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
-  if (!in) throw std::runtime_error("cannot read " + path);
+  if (!in) {
+    throw std::runtime_error("cannot read " + path);
+  }
   return {std::istreambuf_iterator<char>{in}, {}};
 }
 
@@ -30,13 +32,17 @@ std::uint32_t FilterDetections(std::vector<TagDetection3D>& detections,
   std::size_t accepted = 0;
   for (std::size_t i = 0; i < detections.size(); ++i) {
     const auto& detection = detections[i];
-    if (!detection.valid) continue;
+    if (!detection.valid) {
+      continue;
+    }
     const double range = detection.T_camera_tag.translation().norm();
     if (!std::isfinite(range) || range > max_range_m) {
       ++rejected;
       continue;
     }
-    if (accepted != i) detections[accepted] = std::move(detections[i]);
+    if (accepted != i) {
+      detections[accepted] = std::move(detections[i]);
+    }
     ++accepted;
   }
   detections.resize(accepted);
@@ -56,8 +62,12 @@ bool AcceptEstimate(const RobotPoseEstimate& e, double max_reprojection_px,
 
 double WrapAngle(double rad) {
   constexpr double kPi = 3.14159265358979323846;
-  while (rad > kPi) rad -= 2.0 * kPi;
-  while (rad < -kPi) rad += 2.0 * kPi;
+  while (rad > kPi) {
+    rad -= 2.0 * kPi;
+  }
+  while (rad < -kPi) {
+    rad += 2.0 * kPi;
+  }
   return rad;
 }
 
@@ -75,10 +85,11 @@ struct Rms {
 
 void AddRejection(std::map<std::string, std::uint64_t>& counts,
                   const std::optional<std::string>& reason) {
-  if (reason.has_value())
+  if (reason.has_value()) {
     ++counts[*reason];
-  else
+  } else {
     ++counts["(valid)"];
+  }
 }
 
 }  // namespace
@@ -88,7 +99,9 @@ bool ReplayFrames(const std::string& frames_dir,
                   const DetectorOverrides& overrides, ReplayStats* stats,
                   std::string* error) {
   if (stats == nullptr) {
-    if (error != nullptr) *error = "null stats";
+    if (error != nullptr) {
+      *error = "null stats";
+    }
     return false;
   }
   *stats = ReplayStats{};
@@ -97,10 +110,16 @@ bool ReplayFrames(const std::string& frames_dir,
     std::error_code ec;
     for (const auto& entry :
          std::filesystem::directory_iterator(frames_dir, ec)) {
-      if (ec) break;
-      if (!entry.is_regular_file()) continue;
+      if (ec) {
+        break;
+      }
+      if (!entry.is_regular_file()) {
+        continue;
+      }
       const std::string name = entry.path().filename().string();
-      if (name.size() < 5 || name.substr(name.size() - 5) != ".json") continue;
+      if (name.size() < 5 || name.substr(name.size() - 5) != ".json") {
+        continue;
+      }
       stems.push_back(name.substr(0, name.size() - 5));
     }
     std::sort(stems.begin(), stems.end());
@@ -110,15 +129,24 @@ bool ReplayFrames(const std::string& frames_dir,
       CameraContext context;
       FrameRecord recorded;
       std::string parse_error;
-      if (!ParseRecord(ReadFile(frames_dir + "/" + stem + ".json"), &context,
-                       &recorded, &parse_error)) {
-        if (error != nullptr) *error = stem + ".json: " + parse_error;
+      std::string json_path = frames_dir;
+      json_path.append("/").append(stem).append(".json");
+      if (!ParseRecord(ReadFile(json_path), &context, &recorded,
+                       &parse_error)) {
+        if (error != nullptr) {
+          *error = stem;
+          error->append(".json: ").append(parse_error);
+        }
         return false;
       }
-      cv::Mat image =
-          cv::imread(frames_dir + "/" + stem + ".png", cv::IMREAD_GRAYSCALE);
+      std::string png_path = frames_dir;
+      png_path.append("/").append(stem).append(".png");
+      cv::Mat image = cv::imread(png_path, cv::IMREAD_GRAYSCALE);
       if (image.empty()) {
-        if (error != nullptr) *error = "cannot read " + stem + ".png";
+        if (error != nullptr) {
+          *error = "cannot read ";
+          error->append(stem).append(".png");
+        }
         return false;
       }
 
@@ -179,7 +207,9 @@ bool ReplayFrames(const std::string& frames_dir,
       // the "after" column matches the recorder's new truthful sidecar.
       if (IsSingleTagAmbiguityRejection(estimate)) {
         auto& valid = stats->rejections_after["(valid)"];
-        if (valid > 0) --valid;
+        if (valid > 0) {
+          --valid;
+        }
         ++stats->rejections_after["ambiguity"];
       }
       const bool accepted =
@@ -189,8 +219,12 @@ bool ReplayFrames(const std::string& frames_dir,
                          layout.dims.length_m, layout.dims.width_m);
 
       ++stats->frames;
-      if (recorded.observation.valid) ++stats->valid_before;
-      if (accepted) ++stats->valid_after;
+      if (recorded.observation.valid) {
+        ++stats->valid_before;
+      }
+      if (accepted) {
+        ++stats->valid_after;
+      }
 
       for (const auto& d : recorded.detections) {
         AddRejection(stats->rejections_before, d.reject_reason);
@@ -212,20 +246,34 @@ bool ReplayFrames(const std::string& frames_dir,
       }
     }
     stats->rms_x_before =
-        before_rms.count ? std::sqrt(before_rms.sx / before_rms.count) : 0.0;
+        before_rms.count
+            ? std::sqrt(before_rms.sx / static_cast<double>(before_rms.count))
+            : 0.0;
     stats->rms_y_before =
-        before_rms.count ? std::sqrt(before_rms.sy / before_rms.count) : 0.0;
+        before_rms.count
+            ? std::sqrt(before_rms.sy / static_cast<double>(before_rms.count))
+            : 0.0;
     stats->rms_yaw_before =
-        before_rms.count ? std::sqrt(before_rms.syaw / before_rms.count) : 0.0;
+        before_rms.count
+            ? std::sqrt(before_rms.syaw / static_cast<double>(before_rms.count))
+            : 0.0;
     stats->rms_x_after =
-        after_rms.count ? std::sqrt(after_rms.sx / after_rms.count) : 0.0;
+        after_rms.count
+            ? std::sqrt(after_rms.sx / static_cast<double>(after_rms.count))
+            : 0.0;
     stats->rms_y_after =
-        after_rms.count ? std::sqrt(after_rms.sy / after_rms.count) : 0.0;
+        after_rms.count
+            ? std::sqrt(after_rms.sy / static_cast<double>(after_rms.count))
+            : 0.0;
     stats->rms_yaw_after =
-        after_rms.count ? std::sqrt(after_rms.syaw / after_rms.count) : 0.0;
+        after_rms.count
+            ? std::sqrt(after_rms.syaw / static_cast<double>(after_rms.count))
+            : 0.0;
     return true;
   } catch (const std::exception& e) {
-    if (error != nullptr) *error = e.what();
+    if (error != nullptr) {
+      *error = e.what();
+    }
     return false;
   }
 }

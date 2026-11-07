@@ -934,21 +934,20 @@ Hosted Host(std::unique_ptr<LoopPort> port, const char* node_name,
             const Flags& flags, const InstanceFactory& make) {
   Hosted hosted;
   hosted.port = std::move(port);
-  hosted.node = NodeAccess::create(NodeSetup{
-      .name = node_name,
-      .config_path = flags.config_path,
-      .config = std::make_shared<const config::RobotConfig>(
-          config::ParseRobotConfig(flags.config_path)),
-      .simulation = flags.simulation,
-      .loop = hosted.port.get(),
-      .graph = GraphFromFlags(flags, node_name),
-      .session_dir =
-          flags.log_set
-              ? std::optional<std::filesystem::path>{std::filesystem::path{
-                    flags.log_path}
-                                                         .parent_path()}
-              : std::nullopt,
-  });
+  std::optional<std::filesystem::path> session_dir;
+  if (flags.log_set) {
+    session_dir.emplace(std::filesystem::path{flags.log_path}.parent_path());
+  }
+  NodeSetup setup;
+  setup.name = node_name;
+  setup.config_path = flags.config_path;
+  setup.config = std::make_shared<const config::RobotConfig>(
+      config::ParseRobotConfig(flags.config_path));
+  setup.simulation = flags.simulation;
+  setup.loop = hosted.port.get();
+  setup.graph = GraphFromFlags(flags, node_name);
+  setup.session_dir = std::move(session_dir);
+  hosted.node = NodeAccess::create(std::move(setup));
   hosted.user = make(*hosted.node);
   NodeAccess::start(*hosted.node);
   return hosted;

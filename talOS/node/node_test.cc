@@ -165,7 +165,9 @@ TEST(Node, SessionDirIsAbsentByDefaultAndSetThroughTheSim) {
   with_dir.set_session_dir(std::filesystem::path{"/tmp/talos_session"});
   with_dir.add<Empty>("listener");
   const auto dir = with_dir.node("listener").session_dir();
-  ASSERT_TRUE(dir.has_value());
+  if (!dir.has_value()) {
+    FAIL() << "session directory is absent";
+  }
   EXPECT_EQ(dir->string(), "/tmp/talos_session");
 
   // Clearing it before adding a node leaves that node with none.

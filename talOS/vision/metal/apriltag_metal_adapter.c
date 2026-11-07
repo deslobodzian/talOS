@@ -1,3 +1,5 @@
+// NOLINTBEGIN
+// Derived from upstream AprilTag C; retain upstream style for diffing.
 #include "talOS/vision/metal/apriltag_metal_adapter.h"
 
 #define _USE_MATH_DEFINES
@@ -287,6 +289,7 @@ static int quad_update_homographies(struct quad* quad) {
 
   if (quad->H) matd_destroy(quad->H);
   if (quad->Hinv) matd_destroy(quad->Hinv);
+  quad->Hinv = NULL;
 
   quad->H = homography_compute2(corr_arr);
   if (quad->H != NULL) {
@@ -723,6 +726,7 @@ static zarray_t* quad_thresh_from_threshim_and_uf(apriltag_detector_t* td,
   // dereference td->wp. apriltag_detector_create() leaves wp NULL (deferred
   // until apriltag_detector_detect), so init it lazily like detect does.
   if (!ensure_workerpool(td)) {
+    if (external_uf != NULL) unionfind_destroy(external_uf);
     return zarray_create(sizeof(struct quad));
   }
 
@@ -941,6 +945,7 @@ static zarray_t* detect_with_external_stages(apriltag_detector_t* td,
 
   if (zarray_size(td->tag_families) == 0) {
     debug_print("No tag families enabled\n");
+    destroy_clusters(external_clusters);
     return zarray_create(sizeof(apriltag_detection_t*));
   }
 
@@ -948,6 +953,7 @@ static zarray_t* detect_with_external_stages(apriltag_detector_t* td,
     workerpool_destroy(td->wp);
     td->wp = workerpool_create(td->nthreads);
     if (td->wp == NULL) {
+      destroy_clusters(external_clusters);
       return zarray_create(sizeof(apriltag_detection_t*));
     }
   }
@@ -1316,3 +1322,5 @@ zarray_t* apriltag_detector_detect_with_gpu_clusters(apriltag_detector_t* td,
   return detect_with_external_stages(td, im_orig, threshim, NULL, NULL,
                                      gpu_clusters);
 }
+
+// NOLINTEND

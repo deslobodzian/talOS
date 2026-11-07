@@ -145,7 +145,7 @@ void CheckPose(bool rasterize) {
     EXPECT_GE(observed.yaw_std_rad(),
               talos::vision::PoseSolverOptions{}.min_yaw_std_rad);
     ::testing::Test::RecordProperty(std::string(name) + "_tags",
-                                    observed.tag_count());
+                                    static_cast<int>(observed.tag_count()));
     ::testing::Test::RecordProperty(std::string(name) + "_std_m",
                                     std::to_string(observed.x_std_m()));
     if (std::string_view(name) == "rear_right_camera") {
@@ -221,15 +221,21 @@ TEST(VisionTest, SimLagDelaysDeliveryRatherThanPublishingFutureObservations) {
   sim.step(20ms);
   const auto observation =
       sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
-  ASSERT_TRUE(observation.has_value());
+  if (!observation.has_value()) {
+    FAIL() << "missing camera observation";
+  }
   EXPECT_TRUE(observation->valid());
   EXPECT_EQ(observation->sample_time_ns(), truth.sample_time_ns() + 40'000'000);
   EXPECT_LE(observation->sample_time_ns(),
             static_cast<std::uint64_t>(sim.now().nanos()));
   sim.step(
       100ms);  // Stale truth still invalidates a previously delivered pose.
-  EXPECT_FALSE(sim.latest<geometry::PoseObservation>("/rear_right_camera/state")
-                   ->valid());
+  const auto stale =
+      sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
+  if (!stale.has_value()) {
+    FAIL() << "missing camera observation";
+  }
+  EXPECT_FALSE(stale->valid());
 }
 
 TEST(VisionTest, SteadySixtyFpsFortyMillisecondLagDeliversEveryCapturedFrame) {
@@ -244,7 +250,9 @@ TEST(VisionTest, SteadySixtyFpsFortyMillisecondLagDeliversEveryCapturedFrame) {
     sim.step(1ms);
   }
   auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
-  ASSERT_TRUE(status.has_value());
+  if (!status.has_value()) {
+    FAIL() << "missing camera status";
+  }
   // The 1 ms truth grid alternates 16/17 ms intervals without phase drift.
   constexpr std::size_t kCaptured = 61;
   EXPECT_EQ(status->frames_captured_count(), kCaptured);
@@ -258,7 +266,9 @@ TEST(VisionTest, SteadySixtyFpsFortyMillisecondLagDeliversEveryCapturedFrame) {
   // Keep the same still-fresh truth: drain, without fabricating new frames.
   sim.step(40ms);
   status = sim.latest<VisionStatus>("/rear_right_camera/status");
-  ASSERT_TRUE(status.has_value());
+  if (!status.has_value()) {
+    FAIL() << "missing camera status";
+  }
   EXPECT_EQ(status->frames_captured_count(), kCaptured);
   EXPECT_EQ(status->frames_processed_count(), kCaptured);
   EXPECT_EQ(status->frames_dropped_count(), 0u);
@@ -274,7 +284,8 @@ TEST(VisionTest, SteadySixtyFpsFortyMillisecondLagDeliversEveryCapturedFrame) {
     EXPECT_EQ(frame.observation.sample_time_ns(), capture_ns);
     EXPECT_GE(frame.delivery_ns, capture_ns + 40'000'000u);
     EXPECT_LE(frame.delivery_ns, capture_ns + 41'000'000u);
-    EXPECT_NEAR(frame.observation.pose().x_m(), 2 + capture_ms * 0.0001, 0.05);
+    EXPECT_NEAR(frame.observation.pose().x_m(),
+                2 + static_cast<double>(capture_ms) * 0.0001, 0.05);
     EXPECT_NEAR(frame.observation.pose().y_m(), 2, 0.05);
   }
 }
@@ -302,7 +313,9 @@ TEST(VisionTest, CatchUpTickPublishesEveryDueObservationInCaptureOrder) {
   EXPECT_EQ(observer.frames[1].observation.sample_time_ns(), 17'000'000u);
   EXPECT_EQ(observer.frames[0].delivery_ns, observer.frames[1].delivery_ns);
   auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
-  ASSERT_TRUE(status.has_value());
+  if (!status.has_value()) {
+    FAIL() << "missing camera status";
+  }
   EXPECT_EQ(status->frames_captured_count(), 4u);
   EXPECT_EQ(status->frames_processed_count(), 4u);
   EXPECT_EQ(status->frames_dropped_count(), 0u);
@@ -316,7 +329,9 @@ TEST(VisionTest, CatchUpTickPublishesEveryDueObservationInCaptureOrder) {
     EXPECT_EQ(observer.frames[i].observation.sample_time_ns(), i * 17'000'000u);
   }
   status = sim.latest<VisionStatus>("/rear_right_camera/status");
-  ASSERT_TRUE(status.has_value());
+  if (!status.has_value()) {
+    FAIL() << "missing camera status";
+  }
   EXPECT_EQ(status->frames_captured_count(), 4u);
   EXPECT_EQ(status->frames_dropped_count(), 0u);
 }
@@ -334,20 +349,25 @@ TEST(VisionTest, FullDelayedQueueDropsAndCountsOnlyItsOldestCapture) {
     const int capture_index = std::min(ms, 5);
     sim.publish(sim::topics::kState,
                 geometry::OdometrySample{
-                    (100u + capture_index * 17u) * 1'000'000u,
+                    (100u + static_cast<std::uint64_t>(capture_index) * 17u) *
+                        1'000'000u,
                     geometry::Pose2d{2 + capture_index * 0.01, 2, 0},
                     geometry::Twist2d{}});
     sim.step(1ms);
     if (ms == 5) {
       EXPECT_TRUE(observer.frames.empty());
       const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
-      ASSERT_TRUE(status.has_value());
+      if (!status.has_value()) {
+        FAIL() << "missing camera status";
+      }
       EXPECT_EQ(status->frames_captured_count(), 6u);
       EXPECT_EQ(status->frames_dropped_count(), 1u);
     }
   }
   const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
-  ASSERT_TRUE(status.has_value());
+  if (!status.has_value()) {
+    FAIL() << "missing camera status";
+  }
   EXPECT_EQ(status->frames_captured_count(), 6u);
   EXPECT_EQ(status->frames_processed_count(), 6u);
   EXPECT_EQ(status->frames_dropped_count(), 1u);
@@ -368,7 +388,9 @@ TEST(VisionTest, LatencyOffsetUnderflowPublishesInvalid) {
   sim.step(10ms);
   const auto observation =
       sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
-  ASSERT_TRUE(observation.has_value());
+  if (!observation.has_value()) {
+    FAIL() << "missing camera observation";
+  }
   EXPECT_FALSE(observation->valid());
   EXPECT_EQ(observation->sample_time_ns(), 0u);
 }
@@ -478,9 +500,9 @@ TEST(VisionTest, SingleAndMultiTagObservationsPublishConfiguredSolverStdDevs) {
       detection.tag_id = tag.tag_id;
       detection.T_camera_tag = tag.T_camera_tag;
       detection.ambiguity = tag.ambiguity;
-      for (int c = 0; c < 4; ++c) {
-        detection.corners[2 * c] = tag.corners[c].x();
-        detection.corners[2 * c + 1] = tag.corners[c].y();
+      for (std::size_t c = 0; c < 4; ++c) {
+        detection.corners[2 * c] = static_cast<float>(tag.corners[c].x());
+        detection.corners[2 * c + 1] = static_cast<float>(tag.corners[c].y());
       }
       detections.push_back(detection);
     }
@@ -509,7 +531,9 @@ TEST(VisionTest, SingleAndMultiTagObservationsPublishConfiguredSolverStdDevs) {
     sim.step(50ms);
     const auto observation =
         sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
-    ASSERT_TRUE(observation.has_value());
+    if (!observation.has_value()) {
+      FAIL() << "missing camera observation";
+    }
     ASSERT_TRUE(observation->valid());
     EXPECT_EQ(observation->tag_count(), single_tag ? 1u : tags.size());
     EXPECT_NEAR(observation->x_std_m(), expected.std_devs.x_std_m, 1e-8);
@@ -529,11 +553,15 @@ TEST(VisionTest, MissingTruthPublishesInvalidAndOneDiagnosticPerCamera) {
     SCOPED_TRACE(name);
     const auto observation = sim.latest<geometry::PoseObservation>(
         std::string("/") + name + "/state");
-    ASSERT_TRUE(observation.has_value());
+    if (!observation.has_value()) {
+      FAIL() << "missing camera observation";
+    }
     EXPECT_FALSE(observation->valid());
     const auto status =
         sim.latest<VisionStatus>(std::string("/") + name + "/status");
-    ASSERT_TRUE(status.has_value());
+    if (!status.has_value()) {
+      FAIL() << "missing camera status";
+    }
     EXPECT_FALSE(status->healthy());
     const auto message =
         std::string(name) +
@@ -553,17 +581,23 @@ TEST(VisionTest, StaleTruthIsInvalidAndRecoveryAllowsANewOutageDiagnostic) {
   sim.step(50ms);
   auto observation =
       sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
-  ASSERT_TRUE(observation.has_value());
+  if (!observation.has_value()) {
+    FAIL() << "missing camera observation";
+  }
   ASSERT_TRUE(observation->valid());
   ::testing::internal::CaptureStderr();
   sim.step(250ms);  // Beyond command_timeout_us, even from the first drain.
   const auto first_diagnostic = ::testing::internal::GetCapturedStderr();
   observation =
       sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
-  ASSERT_TRUE(observation.has_value());
+  if (!observation.has_value()) {
+    FAIL() << "missing camera observation";
+  }
   EXPECT_FALSE(observation->valid());
   auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
-  ASSERT_TRUE(status.has_value());
+  if (!status.has_value()) {
+    FAIL() << "missing camera status";
+  }
   EXPECT_FALSE(status->healthy());
   EXPECT_EQ(status->visible_tag_count(), 0u);
   EXPECT_NE(first_diagnostic.find("sim_gateway --physics"), std::string::npos);
@@ -573,10 +607,14 @@ TEST(VisionTest, StaleTruthIsInvalidAndRecoveryAllowsANewOutageDiagnostic) {
   sim.step(50ms);
   observation =
       sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
-  ASSERT_TRUE(observation.has_value());
+  if (!observation.has_value()) {
+    FAIL() << "missing camera observation";
+  }
   EXPECT_TRUE(observation->valid());
   status = sim.latest<VisionStatus>("/rear_right_camera/status");
-  ASSERT_TRUE(status.has_value());
+  if (!status.has_value()) {
+    FAIL() << "missing camera status";
+  }
   EXPECT_TRUE(status->healthy());
   ::testing::internal::CaptureStderr();
   sim.step(250ms);
@@ -634,7 +672,9 @@ TEST(VisionTest, GatewayTruthMovesIndependentlyOfStaleEstimator) {
   for (const auto* name : kCameras) {
     const auto observation = sim.latest<geometry::PoseObservation>(
         std::string("/") + name + "/state");
-    ASSERT_TRUE(observation.has_value());
+    if (!observation.has_value()) {
+      FAIL() << "missing camera observation";
+    }
     if (!observation->valid()) continue;
     ++valid;
     EXPECT_EQ(observation->sample_time_ns(), truth.sample_time_ns());
@@ -652,7 +692,9 @@ TEST(VisionTest, AbsoluteTruthJumpsAndCameraRestartsNeverReseedTheWorld) {
                    const geometry::OdometrySample& truth) {
     const auto observation =
         sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
-    ASSERT_TRUE(observation.has_value());
+    if (!observation.has_value()) {
+      FAIL() << "missing camera observation";
+    }
     ASSERT_TRUE(observation->valid());
     EXPECT_EQ(observation->sample_time_ns(), truth.sample_time_ns());
     EXPECT_NEAR(observation->pose().x_m(), new_pose.x_m(), 0.06);
@@ -798,7 +840,9 @@ TEST(VisionTest, SimulatedCaptureFollowsTruthTimeWithoutPhaseDrift) {
   }
   sim.step(1ms);  // Deliver the final captured observation to the callback.
   auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
-  ASSERT_TRUE(status.has_value());
+  if (!status.has_value()) {
+    FAIL() << "missing camera status";
+  }
   EXPECT_EQ(status->frames_captured_count(), 61u);
   EXPECT_EQ(status->frames_processed_count(), 61u);
   EXPECT_EQ(status->frames_dropped_count(), 0u);
@@ -823,14 +867,18 @@ TEST(VisionTest, SimulatedCaptureFollowsTruthTimeWithoutPhaseDrift) {
   EXPECT_EQ(long_intervals, 40u);
   const auto elapsed = observer.frames.back().observation.sample_time_ns() -
                        observer.frames.front().observation.sample_time_ns();
-  EXPECT_NEAR(static_cast<double>(elapsed) / (observer.frames.size() - 1),
+  EXPECT_NEAR(static_cast<double>(elapsed) /
+                  static_cast<double>(observer.frames.size() - 1),
               1.0e9 / 60, 1.0);
   // Advancing node time without advancing truth must not invent captures.
   sim.step(20ms);
-  status = sim.latest<VisionStatus>("/rear_right_camera/status");
-  ASSERT_TRUE(status.has_value());
-  EXPECT_EQ(status->frames_captured_count(), 61u);
-  EXPECT_EQ(status->frames_dropped_count(), 0u);
+  const auto current_status =
+      sim.latest<VisionStatus>("/rear_right_camera/status");
+  if (!current_status.has_value()) {
+    FAIL() << "missing camera status";
+  }
+  EXPECT_EQ(current_status->frames_captured_count(), 61u);
+  EXPECT_EQ(current_status->frames_dropped_count(), 0u);
   EXPECT_EQ(observer.frames.size(), 61u);
 }
 
@@ -844,7 +892,9 @@ TEST(VisionTest, SlowTicksCountSkippedDeadlinesWithoutSynthesizingCaptures) {
   }
   sim.step(1ms);
   const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
-  ASSERT_TRUE(status.has_value());
+  if (!status.has_value()) {
+    FAIL() << "missing camera status";
+  }
   EXPECT_EQ(status->frames_captured_count(), 4u);
   EXPECT_EQ(status->frames_processed_count(), 4u);
   EXPECT_EQ(status->frames_dropped_count(), 6u);
@@ -862,12 +912,16 @@ TEST(VisionTest, ConfiguredMarginExcludesWeakDecodesFromLocalization) {
   sim.publish(sim::topics::kState, Truth(sim));
   sim.step(50ms);
   const auto status = sim.latest<VisionStatus>("/front_left_camera/status");
-  ASSERT_TRUE(status.has_value());
+  if (!status.has_value()) {
+    FAIL() << "missing camera status";
+  }
   EXPECT_TRUE(status->healthy());
   EXPECT_EQ(status->visible_tag_count(), 0u);
   const auto observation =
       sim.latest<geometry::PoseObservation>("/front_left_camera/state");
-  ASSERT_TRUE(observation.has_value());
+  if (!observation.has_value()) {
+    FAIL() << "missing camera observation";
+  }
   EXPECT_FALSE(observation->valid());
 }
 
@@ -1003,7 +1057,9 @@ TEST(VisionTest, RecorderConstructionFailureLeavesCameraRunning) {
     sim.step(50ms);
     const auto observation =
         sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
-    ASSERT_TRUE(observation.has_value());
+    if (!observation.has_value()) {
+      FAIL() << "missing camera observation";
+    }
     EXPECT_TRUE(observation->valid());
   }
   std::filesystem::remove_all(session);
@@ -1156,8 +1212,8 @@ TEST(VisionTest, ShutdownWithRecordingActiveCompletesPromptly) {
   }  // Vision destructor joins the worker, then the bounded recorder
   const auto elapsed = std::chrono::steady_clock::now() - start;
   EXPECT_LT(elapsed, std::chrono::seconds{5})
-      << "shutdown with recording active took " << elapsed.count() / 1e9
-      << " s";
+      << "shutdown with recording active took "
+      << std::chrono::duration<double>(elapsed).count() << " s";
 }
 }  // namespace
 }  // namespace vision

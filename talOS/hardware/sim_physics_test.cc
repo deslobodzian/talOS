@@ -775,8 +775,8 @@ struct WorldFixture {
       : backend{options} {
     Config config;
     for (std::size_t i = 0; i < 4; ++i) {
-      auto drive = TestMotor(2 * i + 1, "drive", 2 * i + 1);
-      auto steer = TestMotor(2 * i + 2, "steer", 2 * i + 2);
+      auto drive = TestMotor(2 * i + 1, "drive", static_cast<int>(2 * i + 1));
+      auto steer = TestMotor(2 * i + 2, "steer", static_cast<int>(2 * i + 2));
       drive.name += std::to_string(i);
       steer.name += std::to_string(i);
       steer.slots[0].p = 1.0;

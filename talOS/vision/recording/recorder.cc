@@ -29,7 +29,9 @@ void ToGray(const Frame& frame, std::uint8_t* dst) {
   const std::uint32_t h = frame.height();
   const std::uint32_t stride = frame.stride() == 0 ? w : frame.stride();
   const std::uint8_t* src = frame.data();
-  if (src == nullptr) return;
+  if (src == nullptr) {
+    return;
+  }
 
   switch (frame.format()) {
     case PixelFormat::kGray8:
@@ -49,8 +51,9 @@ void ToGray(const Frame& frame, std::uint8_t* dst) {
         const std::uint8_t* row = src + static_cast<std::size_t>(y) * stride;
         std::uint8_t* out = dst + static_cast<std::size_t>(y) * w;
         for (std::uint32_t x = 0; x < w; ++x) {
-          const std::uint8_t c0 = row[3 * x], c1 = row[3 * x + 1],
-                             c2 = row[3 * x + 2];
+          const std::size_t offset = 3 * static_cast<std::size_t>(x);
+          const std::uint8_t c0 = row[offset], c1 = row[offset + 1],
+                             c2 = row[offset + 2];
           const std::uint8_t r = bgr ? c2 : c0;
           const std::uint8_t b = bgr ? c0 : c2;
           out[x] = static_cast<std::uint8_t>((30 * r + 59 * c1 + 11 * b) / 100);
@@ -63,8 +66,9 @@ void ToGray(const Frame& frame, std::uint8_t* dst) {
         const std::uint8_t* row = src + static_cast<std::size_t>(y) * stride;
         std::uint8_t* out = dst + static_cast<std::size_t>(y) * w;
         for (std::uint32_t x = 0; x < w; ++x) {
-          const std::uint8_t b = row[4 * x], g = row[4 * x + 1],
-                             r = row[4 * x + 2];
+          const std::size_t offset = 4 * static_cast<std::size_t>(x);
+          const std::uint8_t b = row[offset], g = row[offset + 1],
+                             r = row[offset + 2];
           out[x] = static_cast<std::uint8_t>((30 * r + 59 * g + 11 * b) / 100);
         }
       }
@@ -88,12 +92,18 @@ void WriteFileAtomic(const std::filesystem::path& path, const void* data,
   const std::filesystem::path tmp = path.string() + ".tmp";
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    if (!out) throw std::runtime_error("cannot create " + tmp.string());
+    if (!out) {
+      throw std::runtime_error("cannot create " + tmp.string());
+    }
     out.write(static_cast<const char*>(data),
               static_cast<std::streamsize>(size));
-    if (!out) throw std::runtime_error("cannot write " + tmp.string());
+    if (!out) {
+      throw std::runtime_error("cannot write " + tmp.string());
+    }
     out.close();
-    if (!out) throw std::runtime_error("cannot close " + tmp.string());
+    if (!out) {
+      throw std::runtime_error("cannot close " + tmp.string());
+    }
   }
   std::error_code ec;
   std::filesystem::rename(tmp, path, ec);
@@ -187,17 +197,27 @@ struct FrameRecorder::Impl {
     std::error_code ec;
     for (const auto& entry :
          std::filesystem::directory_iterator(options.output_dir, ec)) {
-      if (ec) break;
-      if (!entry.is_regular_file()) continue;
+      if (ec) {
+        break;
+      }
+      if (!entry.is_regular_file()) {
+        continue;
+      }
       const std::string name = entry.path().filename().string();
-      if (name.size() < 5 || name.substr(name.size() - 5) != ".json") continue;
+      if (name.size() < 5 || name.substr(name.size() - 5) != ".json") {
+        continue;
+      }
       const std::string stem = name.substr(0, name.size() - 5);
       std::error_code ec2;
       const std::uint64_t png =
           std::filesystem::file_size(options.output_dir / (stem + ".png"), ec2);
-      if (ec2) continue;
+      if (ec2) {
+        continue;
+      }
       const std::uint64_t json = std::filesystem::file_size(entry.path(), ec2);
-      if (ec2) continue;
+      if (ec2) {
+        continue;
+      }
       found.emplace_back(stem, png + json);
     }
     std::sort(found.begin(), found.end(),
@@ -223,12 +243,16 @@ struct FrameRecorder::Impl {
   bool RateLimited(const FrameRecord& record, std::uint64_t* interval_ns) {
     const bool rejected = record.reason == "rejected";
     const double rate = rejected ? options.rejected_hz : options.sample_hz;
-    if (rate <= 0.0) return true;  // zero rate records nothing
-    *interval_ns =
-        static_cast<std::uint64_t>(std::llround(kNsPerSecond / rate));
+    if (rate <= 0.0) {
+      return true;  // zero rate records nothing
+    }
+    *interval_ns = static_cast<std::uint64_t>(
+        std::llround(static_cast<double>(kNsPerSecond) / rate));
     bool& seen = rejected ? rejected_seen : sampled_seen;
     std::uint64_t& last = rejected ? last_rejected_ns : last_sampled_ns;
-    if (seen && record.capture_ns - last < *interval_ns) return true;
+    if (seen && record.capture_ns - last < *interval_ns) {
+      return true;
+    }
     last = record.capture_ns;
     seen = true;
     return false;
@@ -245,7 +269,9 @@ struct FrameRecorder::Impl {
       {
         std::unique_lock lock(mutex);
         cv.wait(lock, [this] { return stop || count > 0; });
-        if (count == 0) return;  // stopping with nothing queued
+        if (count == 0) {
+          return;  // stopping with nothing queued
+        }
         slot = &slots[read_index];
         read_index = (read_index + 1) % slots.size();
         --count;
@@ -350,7 +376,9 @@ FrameRecorder::~FrameRecorder() {
     impl_->stop = true;
   }
   impl_->cv.notify_one();
-  if (impl_->writer.joinable()) impl_->writer.join();
+  if (impl_->writer.joinable()) {
+    impl_->writer.join();
+  }
 }
 
 bool FrameRecorder::Record(const Frame& frame, const FrameRecord& record) {
@@ -366,7 +394,9 @@ bool FrameRecorder::Record(const Frame& frame, const FrameRecord& record) {
     }
   }
   std::uint64_t interval_ns = 0;
-  if (impl_->RateLimited(record, &interval_ns)) return false;
+  if (impl_->RateLimited(record, &interval_ns)) {
+    return false;
+  }
 
   std::size_t slot_index = 0;
   {

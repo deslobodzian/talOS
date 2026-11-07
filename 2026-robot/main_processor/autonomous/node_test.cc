@@ -65,8 +65,9 @@ std::string Runfile(const char* env) {
   std::unique_ptr<rules_cc::cc::runfiles::Runfiles> files(
       rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
                                                       &error));
-  if (!files || !std::getenv(env)) throw std::runtime_error(error);
-  return files->Rlocation(std::getenv(env));
+  const char* location = std::getenv(env);
+  if (!files || location == nullptr) throw std::runtime_error(error);
+  return files->Rlocation(location);
 }
 
 class AutonomousTest : public ::testing::Test {
@@ -260,8 +261,9 @@ TEST(AutonomousBinary, DescribesAndReplaysDeterministically) {
                             "/intake/target/auto"}) {
     EXPECT_NE(describe.output.find(topic), std::string::npos);
   }
+  const char* tmp = std::getenv("TEST_TMPDIR");
   const std::string log =
-      std::string{std::getenv("TEST_TMPDIR")} + "/autonomous.tlog";
+      std::string{tmp != nullptr ? tmp : "/tmp"} + "/autonomous.tlog";
   auto run = RunNode("--sim --duration-s 1 --log '" + log + "'");
   ASSERT_EQ(run.status, 0) << run.output;
   auto replay = RunNode("--replay '" + log + "'");

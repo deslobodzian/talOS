@@ -48,7 +48,9 @@ void AppendEscaped(std::string& out, std::string_view value) {
 }
 
 void AppendDouble(std::string& out, double value) {
-  if (!std::isfinite(value)) value = 0.0;
+  if (!std::isfinite(value)) {
+    value = 0.0;
+  }
   char buf[32];
   std::snprintf(buf, sizeof buf, "%.17g", value);
   out += buf;
@@ -60,6 +62,8 @@ void AppendInt(std::string& out, std::int64_t value) {
 
 // --- JSON reading ----------------------------------------------------------
 
+struct JsonMember;
+
 struct Json {
   enum class Type { kNull, kBool, kInt, kDouble, kString, kArray, kObject };
   Type type = Type::kNull;
@@ -68,23 +72,26 @@ struct Json {
   double number = 0.0;
   std::string str;
   std::vector<Json> array;
-  std::vector<std::pair<std::string, Json>> object;
+  std::vector<JsonMember> object;
 
-  const Json* Find(std::string_view key) const {
-    for (const auto& [k, v] : object) {
-      if (k == key) return &v;
-    }
-    return nullptr;
-  }
+  const Json* Find(std::string_view key) const;
   bool IsNull() const { return type == Type::kNull; }
   std::int64_t AsInt(std::int64_t fallback = 0) const {
-    if (type == Type::kInt) return integer;
-    if (type == Type::kDouble) return static_cast<std::int64_t>(number);
+    if (type == Type::kInt) {
+      return integer;
+    }
+    if (type == Type::kDouble) {
+      return static_cast<std::int64_t>(number);
+    }
     return fallback;
   }
   double AsDouble(double fallback = 0.0) const {
-    if (type == Type::kDouble) return number;
-    if (type == Type::kInt) return static_cast<double>(integer);
+    if (type == Type::kDouble) {
+      return number;
+    }
+    if (type == Type::kInt) {
+      return static_cast<double>(integer);
+    }
     return fallback;
   }
   bool AsBool(bool fallback = false) const {
@@ -92,41 +99,73 @@ struct Json {
   }
 };
 
+struct JsonMember {
+  std::string key;
+  Json value;
+};
+
+const Json* Json::Find(std::string_view key) const {
+  for (const auto& member : object) {
+    if (member.key == key) {
+      return &member.value;
+    }
+  }
+  return nullptr;
+}
+
 class Parser {
  public:
   explicit Parser(std::string_view text) : text_(text) {}
 
   bool Run(Json* out, std::string* error) {
     SkipWs();
-    if (!ParseValue(out, error)) return false;
+    if (!ParseValue(out, error)) {
+      return false;
+    }
     SkipWs();
-    if (pos_ != text_.size()) return Fail(error, "trailing characters");
+    if (pos_ != text_.size()) {
+      return Fail(error, "trailing characters");
+    }
     return true;
   }
 
  private:
   bool Fail(std::string* error, const char* what) {
-    if (error != nullptr) *error = what;
+    if (error != nullptr) {
+      *error = what;
+    }
     return false;
   }
   void SkipWs() {
     while (pos_ < text_.size()) {
       const char c = text_[pos_];
-      if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+      if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+        break;
+      }
       ++pos_;
     }
   }
   bool ParseValue(Json* out, std::string* error) {
-    if (pos_ >= text_.size()) return Fail(error, "unexpected end of input");
+    if (pos_ >= text_.size()) {
+      return Fail(error, "unexpected end of input");
+    }
     const char c = text_[pos_];
-    if (c == '{') return ParseObject(out, error);
-    if (c == '[') return ParseArray(out, error);
+    if (c == '{') {
+      return ParseObject(out, error);
+    }
+    if (c == '[') {
+      return ParseArray(out, error);
+    }
     if (c == '"') {
       out->type = Json::Type::kString;
       return ParseString(&out->str, error);
     }
-    if (c == 't' || c == 'f' || c == 'n') return ParseLiteral(out, error);
-    if (c == '-' || (c >= '0' && c <= '9')) return ParseNumber(out, error);
+    if (c == 't' || c == 'f' || c == 'n') {
+      return ParseLiteral(out, error);
+    }
+    if (c == '-' || (c >= '0' && c <= '9')) {
+      return ParseNumber(out, error);
+    }
     return Fail(error, "unexpected character");
   }
   bool ParseObject(Json* out, std::string* error) {
@@ -140,7 +179,9 @@ class Parser {
     for (;;) {
       SkipWs();
       std::string key;
-      if (!ParseString(&key, error)) return false;
+      if (!ParseString(&key, error)) {
+        return false;
+      }
       SkipWs();
       if (pos_ >= text_.size() || text_[pos_] != ':') {
         return Fail(error, "expected ':'");
@@ -148,8 +189,10 @@ class Parser {
       ++pos_;
       SkipWs();
       Json value;
-      if (!ParseValue(&value, error)) return false;
-      out->object.emplace_back(std::move(key), std::move(value));
+      if (!ParseValue(&value, error)) {
+        return false;
+      }
+      out->object.push_back({std::move(key), std::move(value)});
       SkipWs();
       if (pos_ < text_.size() && text_[pos_] == ',') {
         ++pos_;
@@ -173,7 +216,9 @@ class Parser {
     for (;;) {
       SkipWs();
       Json value;
-      if (!ParseValue(&value, error)) return false;
+      if (!ParseValue(&value, error)) {
+        return false;
+      }
       out->array.push_back(std::move(value));
       SkipWs();
       if (pos_ < text_.size() && text_[pos_] == ',') {
@@ -191,9 +236,13 @@ class Parser {
     ++pos_;  // opening quote
     while (pos_ < text_.size()) {
       const char c = text_[pos_++];
-      if (c == '"') return true;
+      if (c == '"') {
+        return true;
+      }
       if (c == '\\') {
-        if (pos_ >= text_.size()) break;
+        if (pos_ >= text_.size()) {
+          break;
+        }
         const char e = text_[pos_++];
         switch (e) {
           case '"':
@@ -221,19 +270,22 @@ class Parser {
             out->push_back('\t');
             break;
           case 'u': {
-            if (pos_ + 4 > text_.size()) return Fail(error, "truncated \\u");
+            if (pos_ + 4 > text_.size()) {
+              return Fail(error, "truncated \\u");
+            }
             unsigned code = 0;
             for (int i = 0; i < 4; ++i) {
               const char h = text_[pos_++];
               code <<= 4;
-              if (h >= '0' && h <= '9')
+              if (h >= '0' && h <= '9') {
                 code |= h - '0';
-              else if (h >= 'a' && h <= 'f')
+              } else if (h >= 'a' && h <= 'f') {
                 code |= h - 'a' + 10;
-              else if (h >= 'A' && h <= 'F')
+              } else if (h >= 'A' && h <= 'F') {
                 code |= h - 'A' + 10;
-              else
+              } else {
                 return Fail(error, "invalid \\u escape");
+              }
             }
             if (code < 0x80) {
               out->push_back(static_cast<char>(code));
@@ -283,7 +335,9 @@ class Parser {
     bool is_int = true;
     while (pos_ < text_.size()) {
       const char c = text_[pos_];
-      if (c == '.' || c == 'e' || c == 'E') is_int = false;
+      if (c == '.' || c == 'e' || c == 'E') {
+        is_int = false;
+      }
       if ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.' ||
           c == 'e' || c == 'E') {
         ++pos_;
@@ -294,7 +348,7 @@ class Parser {
     const std::string token(text_.substr(start, pos_ - start));
     if (is_int) {
       char* end = nullptr;
-      const long long v = std::strtoll(token.c_str(), &end, 10);
+      const std::int64_t v = std::strtoll(token.c_str(), &end, 10);
       if (end == token.c_str() || *end != '\0') {
         return Fail(error, "invalid integer");
       }
@@ -422,7 +476,9 @@ std::string SerializeRecord(const CameraContext& context,
   out += "},\"detections\":[";
   for (std::size_t i = 0; i < record.detections.size(); ++i) {
     const auto& d = record.detections[i];
-    if (i != 0) out += ',';
+    if (i != 0) {
+      out += ',';
+    }
     out += "{\"tag_id\":";
     AppendInt(out, d.tag_id);
     out += ",\"hamming\":";
@@ -431,7 +487,9 @@ std::string SerializeRecord(const CameraContext& context,
     AppendDouble(out, d.decision_margin);
     out += ",\"corners_px\":[";
     for (int c = 0; c < 8; ++c) {
-      if (c != 0) out += ',';
+      if (c != 0) {
+        out += ',';
+      }
       AppendDouble(out, d.corners_px[c]);
     }
     out += "],\"valid\":";
@@ -483,16 +541,22 @@ std::string SerializeRecord(const CameraContext& context,
 bool ParseRecord(std::string_view json, CameraContext* context,
                  FrameRecord* record, std::string* error) {
   if (context == nullptr || record == nullptr) {
-    if (error != nullptr) *error = "null output";
+    if (error != nullptr) {
+      *error = "null output";
+    }
     return false;
   }
   *context = CameraContext{};
   *record = FrameRecord{};
   Json root;
   Parser parser{json};
-  if (!parser.Run(&root, error)) return false;
+  if (!parser.Run(&root, error)) {
+    return false;
+  }
   if (root.type != Json::Type::kObject) {
-    if (error != nullptr) *error = "top level must be an object";
+    if (error != nullptr) {
+      *error = "top level must be an object";
+    }
     return false;
   }
   const Json* camera = root.Find("camera");
@@ -546,17 +610,24 @@ bool ParseRecord(std::string_view json, CameraContext* context,
     for (const auto& d : dets->array) {
       DetectionRecord dr;
       dr.tag_id = static_cast<int>(d.AsInt());
-      if (const Json* v = d.Find("tag_id"); v != nullptr)
+      if (const Json* v = d.Find("tag_id"); v != nullptr) {
         dr.tag_id = static_cast<int>(v->AsInt());
-      if (const Json* v = d.Find("hamming"); v != nullptr)
+      }
+      if (const Json* v = d.Find("hamming"); v != nullptr) {
         dr.hamming = static_cast<int>(v->AsInt());
-      if (const Json* v = d.Find("decision_margin"); v != nullptr)
+      }
+      if (const Json* v = d.Find("decision_margin"); v != nullptr) {
         dr.decision_margin = v->AsDouble();
-      if (const Json* v = d.Find("valid"); v != nullptr) dr.valid = v->AsBool();
-      if (const Json* v = d.Find("reprojection_error_px"); v != nullptr)
+      }
+      if (const Json* v = d.Find("valid"); v != nullptr) {
+        dr.valid = v->AsBool();
+      }
+      if (const Json* v = d.Find("reprojection_error_px"); v != nullptr) {
         dr.reprojection_error_px = v->AsDouble();
-      if (const Json* v = d.Find("ambiguity"); v != nullptr)
+      }
+      if (const Json* v = d.Find("ambiguity"); v != nullptr) {
         dr.ambiguity = v->AsDouble();
+      }
       if (const Json* v = d.Find("reject_reason");
           v != nullptr && v->type == Json::Type::kString) {
         dr.reject_reason = v->str;
