@@ -4,6 +4,7 @@ import enum
 import math
 from datetime import timedelta
 import unittest
+from unittest import mock
 
 import talos
 from talos.testing import Sim, SimHardware, Stick
@@ -119,6 +120,34 @@ class TwoNodesTest(unittest.TestCase):
         self.assertLess(follower.goal.age, 0.01)
         self.assertEqual(sim.node("follower").period, 0.01)
         self.assertAlmostEqual(sim.now, 0.055)
+
+
+class SubscriptionErrorsTest(unittest.TestCase):
+    def test_abi_errors_are_not_values_or_true_flags(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        follower = sim.add(Follower, "follower")
+        subscription = follower.goal
+        self.assertIsNone(subscription.value)
+        with mock.patch.object(talos.lib, "talos_last_error",
+                               return_value=b"subscription failed"):
+            for symbol, read in (
+                ("talos_subscription_has_value",
+                 lambda: subscription.has_value),
+                ("talos_subscription_fresh", lambda: subscription.fresh()),
+                ("talos_subscription_updated", lambda: subscription.updated),
+            ):
+                with self.subTest(symbol=symbol):
+                    with mock.patch.object(talos.lib, symbol, return_value=-1):
+                        with self.assertRaisesRegex(talos.TalosError,
+                                                    "subscription failed"):
+                            read()
+            with mock.patch.object(talos.lib, "talos_subscription_has_value",
+                                   return_value=1):
+                with mock.patch.object(talos.lib, "talos_subscription_value",
+                                       return_value=None):
+                    with self.assertRaisesRegex(talos.TalosError,
+                                                "subscription failed"):
+                        _ = subscription.value
 
 
 class DevicesTest(unittest.TestCase):
@@ -766,6 +795,73 @@ class ParamTest(unittest.TestCase):
 
 
 class MessageTest(unittest.TestCase):
+    def test_forwarding_checks_schema_and_payload_in_every_send_path(self):
+        from talos._messages import message_type
+
+        class Outputs:
+            def __init__(self, node):
+                self.publisher = node.publish(Goal, "/forward/goal")
+                self.lane = talos.TargetLane(node, Goal, "lift", "teleop")
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        outputs = sim.add(Outputs, "planner")
+        goal_type = message_type(Goal)
+        report_type = message_type(Report)
+        self.assertEqual(goal_type.size, report_type.size)
+        goal = goal_type.decode(goal_type.encode({"height_rot": 2.5}))
+        report = report_type.decode(report_type.encode({"height_rot": 9.0}))
+
+        paths = (
+            ("publisher", outputs.publisher.send, "talos_publisher_send"),
+            ("lane", outputs.lane.send, "talos_target_lane_send"),
+            ("sim", lambda msg: sim.publish(
+                Goal, "/forward/injected", msg), "talos_sim_publish_raw"),
+            ("sim_target", lambda msg: sim.publish_target(
+                Goal, "lift", "align", msg), "talos_sim_publish_target"),
+        )
+        for name, send, symbol in paths:
+            with self.subTest(path=name):
+                send(goal)
+                with mock.patch.object(talos.lib, symbol) as forward:
+                    with self.assertRaisesRegex(
+                            TypeError, r"demo\.Goal.*demo\.Report"):
+                        send(report)
+                    forward.assert_not_called()
+
+        self.assertEqual(sim.latest(Goal, "/forward/goal"), goal)
+        self.assertEqual(sim.latest(Goal, "/forward/injected"), goal)
+        self.assertEqual(sim.latest_target(Goal, "lift", "teleop"), goal)
+        self.assertEqual(sim.latest_target(Goal, "lift", "align"), goal)
+
+        changed_hash = type("ChangedGoal", (Goal,), {
+            "TALOS_SCHEMA_HASH": Goal.TALOS_SCHEMA_HASH ^ 1,
+        })
+        alternate_class = type("EquivalentGoal", (Goal,), {})
+        alternate_type = message_type(alternate_class)
+        equivalent = alternate_type.decode(goal._bytes)
+        mismatches = (
+            message_type(changed_hash).decode(goal._bytes),
+            goal_type.decode(goal._bytes[:-1]),
+            goal_type.decode(goal._bytes + b"\0"),
+        )
+        for name, send, symbol in paths:
+            with self.subTest(path=name, identity="equivalent"):
+                # Schema identity, not Python class identity, is the contract.
+                send(equivalent)
+            for bad in mismatches:
+                with self.subTest(path=name, payload=bad._bytes,
+                                  schema_hash=bad._type.schema_hash):
+                    with mock.patch.object(talos.lib, symbol) as forward:
+                        with self.assertRaisesRegex(
+                                TypeError, r"demo\.Goal.*demo\.Goal"):
+                            send(bad)
+                        forward.assert_not_called()
+            with self.subTest(path=name, identity="not_a_message"):
+                with mock.patch.object(talos.lib, symbol) as forward:
+                    with self.assertRaisesRegex(TypeError, "demo.Goal.*object"):
+                        send(object())
+                    forward.assert_not_called()
+
     def test_views_and_send_round_trip(self):
         class Echo:
             def __init__(self, node):

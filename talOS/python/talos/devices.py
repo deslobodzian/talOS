@@ -392,7 +392,7 @@ class TargetLane:
     def send(self, message=None, **fields):
         """send(field=value, ...) with the .fbs field names, or send(message)
         to forward a received one."""
-        data = message._bytes if message is not None else (
+        data = self._type.forward(message) if message is not None else (
             self._type.encode(fields))
         return bool(_abi.ok(lib.talos_target_lane_send(
             self._node, self._index, data, len(data))))

@@ -23,6 +23,9 @@ and value.
 
 Encoding and decoding run through one little-endian struct.Struct per type,
 with explicit zero pad bytes, so the bytes are exactly flatc C++'s.
+
+Forwarding a received message requires the declared schema name, hash and
+byte size to match; an incompatible message raises TypeError.
 """
 
 
@@ -223,6 +226,24 @@ class MessageType:
                 return (f"{self.cls.__name__}: bad value {value!r} for "
                         f"field {field}: {error}")
         return f"{self.cls.__name__}: bad field value"
+
+    def forward(self, message):
+        """Returns bytes only when a received message has this schema."""
+        if not isinstance(message, Message):
+            raise TypeError(f"expected {self.schema_name}, got "
+                            f"{type(message).__name__}")
+        actual = message._type
+        if (actual.schema_name != self.schema_name
+                or actual.schema_hash != self.schema_hash
+                or actual.size != self.size
+                or len(message._bytes) != self.size):
+            raise TypeError(
+                f"expected {self.schema_name} "
+                f"(hash {self.schema_hash:#018x}, {self.size} bytes), got "
+                f"{actual.schema_name} "
+                f"(hash {actual.schema_hash:#018x}, "
+                f"{len(message._bytes)} bytes)")
+        return message._bytes
 
     def decode(self, data):
         return Message(self, data)

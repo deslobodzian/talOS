@@ -184,17 +184,20 @@ class Subscription:
         if not self.has_value:
             return None
         data = lib.talos_subscription_value(self._node, self._index)
+        if not data:
+            _abi.fail()
         return self._type.decode(ctypes.string_at(data, self._type.size))
 
     @property
     def has_value(self):
-        return bool(lib.talos_subscription_has_value(self._node, self._index))
+        return bool(_abi.ok(
+            lib.talos_subscription_has_value(self._node, self._index)))
 
     def fresh(self, max_age=None):
         """has_value and age < max_age (default [robot] command_timeout)."""
         max_age_ns = -1 if max_age is None else round(max_age * _NS)
-        return bool(lib.talos_subscription_fresh(self._node, self._index,
-                                                 max_age_ns))
+        return bool(_abi.ok(lib.talos_subscription_fresh(
+            self._node, self._index, max_age_ns)))
 
     @property
     def age(self):  # seconds since it arrived; inf before the first
@@ -204,7 +207,8 @@ class Subscription:
 
     @property
     def updated(self):  # a message arrived since the previous update() began
-        return bool(lib.talos_subscription_updated(self._node, self._index))
+        return bool(_abi.ok(
+            lib.talos_subscription_updated(self._node, self._index)))
 
 
 class Publisher:
@@ -214,7 +218,7 @@ class Publisher:
     def send(self, message=None, **fields):
         """send(field=value, ...) with the .fbs field names (missing ones
         are 0/False), or send(message) to re-send a received one."""
-        data = message._bytes if message is not None else (
+        data = self._type.forward(message) if message is not None else (
             self._type.encode(fields))
         return bool(_abi.ok(lib.talos_publisher_send(
             self._node, self._index, data, len(data))))
