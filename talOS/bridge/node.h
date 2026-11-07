@@ -189,6 +189,7 @@ class HardwareNode {
 
   bool is_configured_{false};
   uint64_t last_boot_id_{0};
+  uint64_t last_ds_sample_time_us_{0};
   uint64_t last_epoch_{0};
   uint64_t last_sample_time_us_{0};
   uint32_t last_state_flags_{0};
@@ -213,6 +214,7 @@ class HardwareNode {
   Command last_sent_cmd_{};
   uint64_t last_send_us_{0};
   bool have_last_sent_{false};
+  bool last_sent_had_active_subsystem_{false};
 };
 
 }  // namespace talos::hardware

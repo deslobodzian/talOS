@@ -19,6 +19,7 @@
 #include "bridge/topics.h"
 #include "node.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
@@ -197,7 +198,11 @@ TEST(HardwareNodeTest, ForwardsDriverStationPacketsToIpc) {
 
   ipc::Subscriber<talos::hardware::Packet> ds_sub{kDriverStationTopic};
 
-  std::vector<uint8_t> dummy_payload = {0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc};
+  driver_station::DriverStationData data{};
+  data.sample_time_us = 1000;
+  std::vector<uint8_t> dummy_payload(1024);
+  dummy_payload.resize(driver_station::Encode(data, dummy_payload));
+  ASSERT_FALSE(dummy_payload.empty());
   ASSERT_EQ(gateway_peer.SendFrame(protocol::FrameType::kDriverStation, 1, 1000,
                                    dummy_payload.data(), dummy_payload.size()),
             protocol::UdpStatus::kOk);
@@ -216,6 +221,29 @@ TEST(HardwareNodeTest, ForwardsDriverStationPacketsToIpc) {
   EXPECT_EQ(packet.size, dummy_payload.size());
   EXPECT_EQ(std::memcmp(packet.data.data(), dummy_payload.data(), packet.size),
             0);
+
+  const auto send = [&](const uint8_t* bytes, std::size_t size) {
+    ASSERT_EQ(gateway_peer.SendFrame(protocol::FrameType::kDriverStation, 2,
+                                    2000, bytes, size),
+              protocol::UdpStatus::kOk);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    node.Tick(30000);
+  };
+  const uint8_t malformed[] = {1, 2, 3};
+  send(malformed, sizeof malformed);
+  EXPECT_EQ(node.driver_station_packets_received(), 1u);
+  EXPECT_FALSE(ds_sub.read());
+  data.sample_time_us = 999;
+  std::array<uint8_t, 1024> payload{};
+  auto size = driver_station::Encode(data, payload);
+  send(payload.data(), size);
+  EXPECT_EQ(node.driver_station_packets_received(), 1u);
+  EXPECT_FALSE(ds_sub.read());
+  data.sample_time_us = 1001;
+  size = driver_station::Encode(data, payload);
+  send(payload.data(), size);
+  EXPECT_EQ(node.driver_station_packets_received(), 2u);
+  EXPECT_TRUE(ds_sub.read());
 }
 
 constexpr std::string_view kTrustToml = R"(
@@ -283,6 +311,109 @@ State TrustState(uint64_t config_id, uint64_t boot_id, uint64_t epoch,
   state.sample_time_us = sample_time_us;
   state.flags = kConfigured | kEnabled;
   return state;
+}
+
+TEST(HardwareNodeTest, LastSubsystemTimeoutSendsOneFreshNeutralFrame) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  HardwareNode node{cfg, "127.0.0.1", TestPort(26000), TestPort(26001), true};
+  ASSERT_TRUE(node.Open());
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(
+      gateway.Open("127.0.0.1", TestPort(26000), "127.0.0.1", TestPort(26001)),
+      protocol::UdpStatus::kOk);
+  const auto config_id = NodeConfigId(cfg);
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 1000), 1000000));
+  ipc::Publisher<Packet> pub{RequestTopic("intake")};
+  Command request{};
+  request.config_id = config_id;
+  request.boot_id = 11;
+  request.epoch = 1;
+  request.observed_time_us = 1000;
+  request.count = 1;
+  request.motors[0] = {cfg.subsystems.at("intake").motors[0], Mode::kVoltage,
+                       0, 4.0, 1.0};
+  request.digital_output_count = 1;
+  request.digital_outputs[0] = {cfg.hardware.digital_outputs[0].id, true};
+  request.pwm_output_count = 1;
+  request.pwm_outputs[0] = {cfg.hardware.pwm_outputs[0].id, 0.7};
+  PublishCommand(pub, request);
+  node.Tick(1001000);
+  ASSERT_EQ(node.commands_sent(), 1u);
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 12000), 1011000));
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+
+  // The last active subsystem expires before the heartbeat is due. Its neutral
+  // command must reference the new state, not the old request's observation.
+  node.Tick(1011001);
+  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
+  ASSERT_EQ(node.commands_sent(), 2u);
+
+  const auto receive_commands = [&] {
+    std::vector<Command> commands;
+    for (int i = 0; i < 20; ++i) {
+      protocol::DecodedFrame frame;
+      while (gateway.TryReceive(&frame) == protocol::UdpStatus::kOk) {
+        if (frame.header.type != protocol::FrameType::kHardwareCommand) continue;
+        Command command{};
+        EXPECT_TRUE(Decode(
+            std::span<const uint8_t>{frame.payload, frame.payload_size}, command));
+        commands.push_back(command);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return commands;
+  };
+  const auto commands = receive_commands();
+  ASSERT_EQ(commands.size(), 2u);
+  EXPECT_EQ(commands[0].motors[1].mode, Mode::kVoltage);
+  const auto& neutral = commands[1];
+  EXPECT_EQ(neutral.config_id, config_id);
+  EXPECT_EQ(neutral.boot_id, 11u);
+  EXPECT_EQ(neutral.epoch, 1u);
+  EXPECT_EQ(neutral.observed_time_us, 12000u);
+  for (std::size_t i = 0; i < neutral.count; ++i) {
+    EXPECT_EQ(neutral.motors[i].mode, Mode::kNeutral);
+    EXPECT_DOUBLE_EQ(neutral.motors[i].demand, 0);
+    EXPECT_DOUBLE_EQ(neutral.motors[i].feedforward_v, 0);
+  }
+  ASSERT_EQ(neutral.digital_output_count, 1u);
+  EXPECT_FALSE(neutral.digital_outputs[0].value);
+  ASSERT_EQ(neutral.pwm_output_count, 1u);
+  EXPECT_DOUBLE_EQ(neutral.pwm_outputs[0].output, 0);
+
+  for (uint64_t now_us = 1012000; now_us <= 1112000; now_us += 1000) {
+    node.Tick(now_us);
+  }
+  EXPECT_EQ(node.commands_sent(), 2u);
+  EXPECT_TRUE(receive_commands().empty());
+}
+
+TEST(HardwareNodeTest, SubsystemTimeoutInheritsRobotPeriod) {
+  auto cfg = config::ParseRobotConfigString(R"(
+[robot]
+period_us = 20000
+[subsystems.mech.motors.motor]
+can_id = 1
+)");
+  HardwareNode node{cfg, "127.0.0.1", TestPort(26002), TestPort(26003), true};
+  ASSERT_TRUE(node.Open());
+  ipc::Publisher<Packet> pub{RequestTopic("mech")};
+  Command request{};
+  request.config_id = NodeConfigId(cfg);
+  request.count = 1;
+  request.motors[0] = {cfg.hardware.motors[0].id, Mode::kVoltage, 0, 4.0, 0.0};
+  PublishCommand(pub, request);
+  node.Tick(1000);
+  node.Tick(11001);  // Past the former hardcoded 2 * 5000 us timeout.
+  EXPECT_FALSE(node.is_subsystem_timed_out("mech"));
+  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kVoltage);
+  node.Tick(41000);
+  EXPECT_FALSE(node.is_subsystem_timed_out("mech"));
+  node.Tick(41001);
+  EXPECT_TRUE(node.is_subsystem_timed_out("mech"));
+  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
 }
 
 TEST(HardwareNodeTest, SimulationRejectsNonLoopbackAndNamesBothOptions) {
@@ -472,7 +603,11 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
       Command command{};
       ASSERT_TRUE(Decode(logged.bytes(), command));
       EXPECT_EQ(command.boot_id, 42u);
-      EXPECT_DOUBLE_EQ(command.motors[1].demand, 3.5);
+      if (!logged_command) {
+        EXPECT_DOUBLE_EQ(command.motors[1].demand, 3.5);
+      } else {
+        EXPECT_DOUBLE_EQ(command.motors[1].demand, 0.0);
+      }
       logged_command = true;
     } else if (source.name == kStateTopic) {
       State decoded{};

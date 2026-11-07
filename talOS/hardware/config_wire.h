@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -378,6 +379,24 @@ struct ConfigAckPayload {
 static_assert(sizeof(ConfigChunkHeader) == 24, "Update docs/DATA_FLOW.md");
 static_assert(sizeof(ConfigAckPayload) == 73, "Update docs/DATA_FLOW.md");
 
+// Validate() limits device names and CAN bus names to 63 bytes. Text fields
+// also carry a two-byte length; the remaining sizes mirror SerializeConfig.
+inline constexpr std::size_t kMaxConfigTextBytes = 2 + 63;
+inline constexpr std::size_t kMaxSerializedConfigSize =
+    17 + 7 * 2 +
+    kMaxMotors * (275 + 2 * kMaxConfigTextBytes) +
+    kMaxSensors * (16 + 2 * kMaxConfigTextBytes) +
+    (kMaxDigitalInputs + kMaxDigitalOutputs + kMaxAnalogInputs +
+     kMaxPwmOutputs) * (6 + kMaxConfigTextBytes) +
+    kMaxEncoders * (27 + kMaxConfigTextBytes);
+static_assert(kMaxSerializedConfigSize == 10051,
+              "Serialized config maximum changed; update docs/DATA_FLOW.md");
+inline constexpr std::size_t kMaxConfigChunkData =
+    protocol::kMaxPayloadSize - sizeof(ConfigChunkHeader);
+// A custom payload budget may leave only one data byte per chunk.
+inline constexpr std::size_t kMaxConfigChunkCount = kMaxSerializedConfigSize;
+static_assert(kMaxConfigChunkCount <= std::numeric_limits<uint16_t>::max());
+
 inline std::vector<std::vector<uint8_t>> CreateConfigChunks(
     const Config& config, std::size_t max_payload = protocol::kMaxPayloadSize) {
   const auto serialized = SerializeConfig(config);
@@ -425,7 +444,8 @@ class ConfigAssembler {
     kCeilingExceeded,
   };
 
-  Status AddChunk(std::span<const uint8_t> payload, std::string& error_reason) {
+  Status AddChunk(std::span<const uint8_t> payload,
+                  std::string& error_reason) noexcept try {
     if (payload.size() < sizeof(ConfigChunkHeader)) {
       error_reason = "chunk payload smaller than header";
       return Status::kInvalidChunk;
@@ -434,13 +454,41 @@ class ConfigAssembler {
     ConfigChunkHeader hdr;
     std::memcpy(&hdr, payload.data(), sizeof(hdr));
 
-    if (payload.size() != sizeof(ConfigChunkHeader) + hdr.chunk_bytes) {
+    if (hdr.chunk_bytes == 0 || hdr.chunk_bytes > kMaxConfigChunkData ||
+        payload.size() != sizeof(ConfigChunkHeader) + hdr.chunk_bytes) {
       error_reason = "chunk byte count mismatch";
       return Status::kInvalidChunk;
     }
 
-    if (hdr.chunk_count == 0 || hdr.chunk_index >= hdr.chunk_count) {
+    if (hdr.total_bytes == 0 ||
+        hdr.total_bytes > kMaxSerializedConfigSize || hdr.chunk_count == 0 ||
+        hdr.chunk_count > kMaxConfigChunkCount ||
+        hdr.chunk_count > hdr.total_bytes ||
+        hdr.chunk_index >= hdr.chunk_count) {
       error_reason = "invalid chunk index or count";
+      return Status::kInvalidChunk;
+    }
+
+    // Every non-final chunk has the same stride. Infer it from a final
+    // chunk too, so out-of-order delivery gets the same bounds checks.
+    const bool final_chunk = hdr.chunk_index == hdr.chunk_count - 1;
+    std::size_t stride = hdr.chunk_bytes;
+    if (final_chunk && hdr.chunk_count > 1) {
+      if (hdr.chunk_bytes >= hdr.total_bytes ||
+          (hdr.total_bytes - hdr.chunk_bytes) % (hdr.chunk_count - 1) != 0) {
+        error_reason = "invalid final chunk size";
+        return Status::kInvalidChunk;
+      }
+      stride =
+          (hdr.total_bytes - hdr.chunk_bytes) / (hdr.chunk_count - 1);
+    }
+    const std::size_t offset = std::size_t{hdr.chunk_index} * stride;
+    if (stride == 0 || stride > kMaxConfigChunkData ||
+        hdr.chunk_count != (hdr.total_bytes + stride - 1) / stride ||
+        offset >= hdr.total_bytes ||
+        hdr.chunk_bytes !=
+            std::min(stride, std::size_t{hdr.total_bytes} - offset)) {
+      error_reason = "chunk data exceeds transfer bounds";
       return Status::kInvalidChunk;
     }
 
@@ -450,29 +498,17 @@ class ConfigAssembler {
       total_crc32_ = hdr.total_crc32;
       total_bytes_ = hdr.total_bytes;
       chunk_count_ = hdr.chunk_count;
+      chunk_stride_ = stride;
       received_chunks_.assign(chunk_count_, false);
       assembled_buffer_.assign(total_bytes_, 0);
       received_count_ = 0;
     } else {
       if (hdr.total_bytes != total_bytes_ || hdr.total_crc32 != total_crc32_ ||
-          hdr.chunk_count != chunk_count_) {
+          hdr.chunk_count != chunk_count_ || stride != chunk_stride_) {
         error_reason = "inconsistent chunk metadata";
         Reset();
         return Status::kInvalidChunk;
       }
-    }
-
-    std::size_t offset = 0;
-    if (hdr.chunk_index < chunk_count_ - 1) {
-      offset = hdr.chunk_index * hdr.chunk_bytes;
-    } else {
-      offset = total_bytes_ - hdr.chunk_bytes;
-    }
-
-    if (offset + hdr.chunk_bytes > assembled_buffer_.size()) {
-      error_reason = "chunk data exceeds buffer bounds";
-      Reset();
-      return Status::kInvalidChunk;
     }
 
     if (!received_chunks_[hdr.chunk_index]) {
@@ -516,6 +552,12 @@ class ConfigAssembler {
     Reset();
     active_config_id_ = completed_id;
     return Status::kComplete;
+  } catch (...) {
+    // Allocation/deserialization failures must not escape the gateway's
+    // safety loop. Even reporting an error must remain allocation-free here.
+    Reset();
+    error_reason.clear();
+    return Status::kInvalidChunk;
   }
 
   const Config& config() const { return config_; }
@@ -527,6 +569,7 @@ class ConfigAssembler {
     total_bytes_ = 0;
     chunk_count_ = 0;
     received_count_ = 0;
+    chunk_stride_ = 0;
     received_chunks_.clear();
     assembled_buffer_.clear();
   }
@@ -537,6 +580,7 @@ class ConfigAssembler {
   uint32_t total_bytes_{0};
   uint16_t chunk_count_{0};
   uint16_t received_count_{0};
+  std::size_t chunk_stride_{0};
   std::vector<bool> received_chunks_{};
   std::vector<uint8_t> assembled_buffer_{};
   Config config_{};

@@ -30,6 +30,7 @@ cc_library(
         ":clock_offset",
         ":messages",
         "//talOS/configuration",
+        "//talOS/driver_station",
         "//talOS/events:events_log",
         "//talOS/events:events_os",
         "//talOS/hardware",
@@ -61,6 +62,7 @@ cc_test(
     deps = [
         ":messages",
         ":node_lib",
+        "//talOS/driver_station",
         "//talOS/events:events_log",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",

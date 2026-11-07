@@ -63,6 +63,7 @@ bool Gateway::Reconfigure(const Config& config) {
   if (restoring_) return false;
   // Repeated pushes never touch devices, including after a restart enabled.
   if (configured_ && config == config_) {
+    if (enabled_ && fault_) return false;
     fault_ = false;
     consecutive_apply_failures_ = 0;
     config_error_.reset();

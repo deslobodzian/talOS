@@ -510,6 +510,41 @@ TEST(Gateway, ApplyFailureRetriesThenLatchesAndReenableClears) {
   g.Tick(3000, true);
   EXPECT_TRUE(g.Accept(Request(g), 8, 3000));
 }
+
+TEST(Gateway, IdenticalEnabledConfigPreservesLatchedApplyFault) {
+  for (bool reconfigure_disabled : {false, true}) {
+    SCOPED_TRACE(reconfigure_disabled);
+    FakeBackend backend;
+    const auto config = SwerveConfig(true);
+    Gateway g{config, backend, 1};
+    g.Tick(1000, true);
+    backend.apply_ok = false;
+    for (uint32_t i = 0; i < Gateway::kConsecutiveApplyFailureLimit; ++i) {
+      EXPECT_FALSE(g.Accept(Request(g), i + 1, 1000));
+    }
+    ASSERT_TRUE(g.snapshot().flags & kHardwareFault);
+    const int applied = backend.applied;
+    const int configures = backend.configure_calls;
+    const auto epoch = g.snapshot().epoch;
+    EXPECT_FALSE(g.Reconfigure(config));
+    EXPECT_TRUE(g.snapshot().flags & kHardwareFault);
+    EXPECT_EQ(g.snapshot().epoch, epoch);
+    EXPECT_EQ(backend.configure_calls, configures);
+    backend.apply_ok = true;
+    EXPECT_FALSE(g.Accept(Request(g), 10, 1000));
+    EXPECT_EQ(backend.applied, applied);
+
+    g.Tick(2000, false);
+    if (reconfigure_disabled) {
+      EXPECT_TRUE(g.snapshot().flags & kHardwareFault);
+      EXPECT_TRUE(g.Reconfigure(config));
+      EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+    }
+    g.Tick(3000, true);
+    EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+    EXPECT_TRUE(g.Accept(Request(g), 11, 3000));
+  }
+}
 TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
@@ -735,6 +770,155 @@ TEST(ConfigWire, ChunksAndAssemblesConfigLosslessly) {
   EXPECT_EQ(status, ConfigAssembler::Status::kComplete);
   EXPECT_EQ(assembler.config(), cfg);
   EXPECT_EQ(assembler.config_id(), ConfigurationId(cfg));
+}
+
+TEST(ConfigWire, FullyCappedSerializationMatchesAssemblyLimit) {
+  Config config;
+  config.motors.resize(kMaxMotors);
+  config.sensors.resize(kMaxSensors);
+  config.digital_inputs.resize(kMaxDigitalInputs);
+  config.digital_outputs.resize(kMaxDigitalOutputs);
+  config.analog_inputs.resize(kMaxAnalogInputs);
+  config.encoders.resize(kMaxEncoders);
+  config.pwm_outputs.resize(kMaxPwmOutputs);
+  uint16_t next_id = 1;
+  const auto name_devices = [&](auto& devices) {
+    for (auto& device : devices) {
+      device.id = next_id++;
+      const auto suffix = std::to_string(device.id);
+      device.name = std::string(63 - suffix.size(), 'n') + suffix;
+    }
+  };
+  name_devices(config.motors);
+  name_devices(config.sensors);
+  name_devices(config.digital_inputs);
+  name_devices(config.digital_outputs);
+  name_devices(config.analog_inputs);
+  name_devices(config.encoders);
+  name_devices(config.pwm_outputs);
+  int next_can_id = 0;
+  for (auto& motor : config.motors) {
+    motor.bus.assign(63, 'b');
+    motor.can_id = next_can_id++;
+  }
+  for (auto& sensor : config.sensors) {
+    sensor.bus.assign(63, 'b');
+    sensor.can_id = next_can_id++;
+  }
+  int next_dio = 0;
+  for (auto& input : config.digital_inputs) input.dio = next_dio++;
+  for (auto& output : config.digital_outputs) output.dio = next_dio++;
+  for (auto& encoder : config.encoders) {
+    encoder.dio_a = next_dio++;
+    encoder.dio_b = next_dio++;
+  }
+  for (std::size_t i = 0; i < config.analog_inputs.size(); ++i) {
+    config.analog_inputs[i].channel = static_cast<int>(i);
+  }
+  for (std::size_t i = 0; i < config.pwm_outputs.size(); ++i) {
+    config.pwm_outputs[i].channel = static_cast<int>(i);
+  }
+  ASSERT_NO_THROW(Validate(config));
+  EXPECT_EQ(SerializeConfig(config).size(), kMaxSerializedConfigSize);
+
+  const auto chunks = CreateConfigChunks(config);
+  ConfigAssembler assembler;
+  std::string error;
+  for (std::size_t i = chunks.size(); i > 0; --i) {
+    EXPECT_EQ(assembler.AddChunk(chunks[i - 1], error),
+              i == 1 ? ConfigAssembler::Status::kComplete
+                     : ConfigAssembler::Status::kIncomplete);
+  }
+  EXPECT_EQ(assembler.config(), config);
+}
+
+TEST(ConfigWire, RejectsUnboundedChunkMetadataAndRecovers) {
+  const auto config = SwerveConfig(false);
+  const auto chunks = CreateConfigChunks(config, 200);
+  ASSERT_GT(chunks.size(), 1u);
+  ConfigChunkHeader original;
+  std::memcpy(&original, chunks.front().data(), sizeof(original));
+  std::vector<ConfigChunkHeader> invalid;
+  auto header = original;
+  header.total_bytes = std::numeric_limits<uint32_t>::max();
+  invalid.push_back(header);
+  header = original;
+  header.chunk_count = std::numeric_limits<uint16_t>::max();
+  invalid.push_back(header);
+  header = original;
+  header.chunk_index = header.chunk_count;
+  invalid.push_back(header);
+  header = original;
+  header.total_bytes = header.chunk_bytes - 1;
+  header.chunk_count = 1;
+  header.chunk_index = 0;
+  invalid.push_back(header);
+  header = original;
+  header.total_bytes = header.chunk_bytes - 1;
+  header.chunk_count = 2;
+  header.chunk_index = 1;
+  invalid.push_back(header);
+  header = original;
+  header.total_bytes = header.chunk_bytes + 1;
+  header.chunk_count = 3;
+  header.chunk_index = 1;
+  invalid.push_back(header);
+  header = original;
+  header.chunk_bytes = kMaxConfigChunkData + 1;
+  invalid.push_back(header);
+  header = original;
+  header.chunk_bytes = 0;
+  invalid.push_back(header);
+
+  for (const auto& bad_header : invalid) {
+    SCOPED_TRACE(::testing::Message()
+                 << "bytes=" << bad_header.total_bytes
+                 << " count=" << bad_header.chunk_count
+                 << " index=" << bad_header.chunk_index
+                 << " payload=" << bad_header.chunk_bytes);
+    std::vector<uint8_t> bad_chunk(sizeof(ConfigChunkHeader) +
+                                   bad_header.chunk_bytes);
+    std::memcpy(bad_chunk.data(), &bad_header, sizeof(bad_header));
+    ConfigAssembler assembler;
+    std::string error;
+    // These headers must be rejected before starting an allocation-backed
+    // transfer, rather than eventually failing CRC or deserialization.
+    static_assert(noexcept(
+        assembler.AddChunk(std::span<const uint8_t>{}, error)));
+    EXPECT_EQ(assembler.AddChunk(bad_chunk, error),
+              ConfigAssembler::Status::kInvalidChunk);
+    EXPECT_FALSE(error.empty());
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+      EXPECT_EQ(assembler.AddChunk(chunks[i], error),
+                i + 1 == chunks.size() ? ConfigAssembler::Status::kComplete
+                                       : ConfigAssembler::Status::kIncomplete);
+    }
+    EXPECT_EQ(assembler.config(), config);
+  }
+}
+
+TEST(ConfigWire, RejectsChangedTransferTotalsAndRecovers) {
+  const auto config = SwerveConfig(false);
+  const auto chunks = CreateConfigChunks(config, 200);
+  ASSERT_GT(chunks.size(), 2u);
+  ConfigAssembler assembler;
+  std::string error;
+  ASSERT_EQ(assembler.AddChunk(chunks.front(), error),
+            ConfigAssembler::Status::kIncomplete);
+  auto changed = chunks[1];
+  ConfigChunkHeader header;
+  std::memcpy(&header, changed.data(), sizeof(header));
+  ++header.total_bytes;
+  std::memcpy(changed.data(), &header, sizeof(header));
+  EXPECT_EQ(assembler.AddChunk(changed, error),
+            ConfigAssembler::Status::kInvalidChunk);
+  EXPECT_FALSE(error.empty());
+  for (std::size_t i = 0; i < chunks.size(); ++i) {
+    EXPECT_EQ(assembler.AddChunk(chunks[i], error),
+              i + 1 == chunks.size() ? ConfigAssembler::Status::kComplete
+                                     : ConfigAssembler::Status::kIncomplete);
+  }
+  EXPECT_EQ(assembler.config(), config);
 }
 
 TEST(ConfigWire, RejectsCeilingViolations) {

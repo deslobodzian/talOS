@@ -49,6 +49,12 @@ are refused. This is a compatibility check, not authentication. Configuration
 validation rejects duplicate IDs/names/addresses, invalid numeric values, and
 remote encoder references that do not exist on the motor's bus.
 
+Device tables reject unknown keys in both runtime parsing and manifest checking.
+CANcoder and Pigeon2 accept `type`, `bus`, `can_id`, `inverted`, and `offset_rot`.
+QuadratureEncoder accepts `type`, `dio_a`, `dio_b`, and `counts_per_rev`;
+DutyCycleEncoder accepts `type`, `dio`, and `offset_rot`; digital IO accepts only
+`dio`, while analog inputs and PWM outputs accept only `channel`.
+
 Motor tables may specify `follow = "master_motor"` and optional
 `oppose_master = true` (default false). The master must be a motor owned by
 the same subsystem on the same CAN bus; self-follow and follower chains are

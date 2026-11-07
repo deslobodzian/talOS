@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "bridge/topics.h"
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/events/os/poller.h"
 #include "talOS/process/process.h"
 
@@ -81,9 +82,10 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
     SubsystemTracker tracker;
     tracker.name = name;
     tracker.devices = devs;
+    tracker.period_us = config_.period_us;
     if (const auto* tbl = robot_config_.GetSubsystemTable(name)) {
       tracker.period_us =
-          static_cast<uint32_t>((*tbl)["period_us"].value_or(5000));
+          static_cast<uint32_t>((*tbl)["period_us"].value_or(config_.period_us));
     }
     subsystems_[name] = std::move(tracker);
   }
@@ -330,6 +332,12 @@ void HardwareNode::Tick(uint64_t now_us) {
     }
 
     if (frame.header.type == protocol::FrameType::kDriverStation) {
+      driver_station::DriverStationData data{};
+      if (!driver_station::Decode({frame.payload, frame.payload_size}, data) ||
+          data.sample_time_us < last_ds_sample_time_us_) {
+        continue;
+      }
+      last_ds_sample_time_us_ = data.sample_time_us;
       talos::hardware::Packet pkt{};
       const std::size_t n =
           std::min<std::size_t>(frame.payload_size, pkt.data.size());
@@ -449,31 +457,37 @@ void HardwareNode::Tick(uint64_t now_us) {
     if (have_active_observed) {
       full_cmd_.observed_time_us = min_observed_us;
     }
+    if (!any_subsystem_active && last_sent_had_active_subsystem_) {
+      full_cmd_.observed_time_us = latest_state_.sample_time_us;
+    }
   }
 
-  // 3. Send unified command if we have observed state. The headers travel
-  // untouched from the subsystem requests that built the merge: stamping the
-  // current state here would make an obsolete request look current, and the
-  // gateway would accept it as fresh. Publication is change-driven with a
-  // bounded heartbeat: each new sample changes the merge's
+  // 3. Send unified command if we have observed state. Active demands retain
+  // their request observation; only the final timeout's fully neutral command
+  // adopts the latest state so the gateway accepts it. Publication is
+  // change-driven with a bounded heartbeat: each new sample changes the merge's
   // observation headers, so a live 200 Hz link sends at the 200 Hz sample
   // rate instead of the 1 kHz tick rate, and an unchanged merge resends only
   // when the heartbeat elapses. The gateway's 100 ms timeout keeps 5x margin
   // over the heartbeat. Subsystem timeouts still neutralize through the
   // merge, and a changed merge always sends immediately.
-  if (last_boot_id_ != 0 && any_subsystem_active) {
+  if (last_boot_id_ != 0 &&
+      (any_subsystem_active || last_sent_had_active_subsystem_)) {
     if (ShouldSendCommand(now_us)) {
       talos::hardware::Packet cmd_pkt{};
       cmd_pkt.size = static_cast<uint32_t>(Encode(full_cmd_, cmd_pkt.data));
       if (cmd_pkt.size > 0) {
         if (cmd_pub_) cmd_pub_->write(cmd_pkt);
-        peer_.SendFrame(protocol::FrameType::kHardwareCommand, 0, now_us,
-                        cmd_pkt.data.data(), cmd_pkt.size);
-        ++commands_sent_;
-        LogPacket(1, cmd_pkt, now_us, commands_sent_);
-        last_sent_cmd_ = full_cmd_;
-        last_send_us_ = now_us;
-        have_last_sent_ = true;
+        if (peer_.SendFrame(protocol::FrameType::kHardwareCommand, 0, now_us,
+                            cmd_pkt.data.data(), cmd_pkt.size) ==
+            protocol::UdpStatus::kOk) {
+          ++commands_sent_;
+          LogPacket(1, cmd_pkt, now_us, commands_sent_);
+          last_sent_cmd_ = full_cmd_;
+          last_send_us_ = now_us;
+          have_last_sent_ = true;
+          last_sent_had_active_subsystem_ = any_subsystem_active;
+        }
       }
     }
   }
@@ -676,6 +690,7 @@ void HardwareNode::NeutralizeAll() {
 
 void HardwareNode::InvalidateRequests() {
   NeutralizeAll();
+  last_ds_sample_time_us_ = 0;
   for (auto& [name, tracker] : subsystems_) {
     tracker.last_seen_us = 0;
     tracker.last_observed_time_us = 0;
@@ -685,6 +700,7 @@ void HardwareNode::InvalidateRequests() {
   // to equal the pre-transition ones: the identity headers differ, but the
   // heartbeat timer must not get a vote on the first post-transition send.
   have_last_sent_ = false;
+  last_sent_had_active_subsystem_ = false;
 }
 
 }  // namespace talos::hardware
