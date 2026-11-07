@@ -30,7 +30,7 @@ initial_yaw_rad = 0.0
 field_length_m = 16.54
 field_width_m = 8.21
 max_innovation_m = 3.0
-# Single-tag wrapped yaw innovation limit; radians (15 degrees).
+# All-measurement wrapped yaw innovation limit; radians (15 degrees).
 max_yaw_innovation_rad = 0.2618
 
 # wpimath stateStdDevs: trust in the odometry-propagated state; larger trusts

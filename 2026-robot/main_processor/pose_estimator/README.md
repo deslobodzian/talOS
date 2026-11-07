@@ -55,22 +55,26 @@ fails at startup):
   of the gyro's initial reading; subsequent gyro deltas change that heading.
 - Field dimensions `field_length_m` (16.54) and `field_width_m` (8.21)
   must be finite and positive. Observations outside the inclusive field
-  rectangle or with no tags are rejected. A single-tag observation more
-  than `max_innovation_m` (3.0 m, finite and positive) from the current estimate,
-  or whose absolute wrapped yaw difference exceeds `max_yaw_innovation_rad`
-  (0.2618 rad, approximately 15 degrees; finite and positive), is rejected and
-  counted in `observation_rejected_count`. Wrapping handles the ±π boundary.
-  Multi-tag solves bypass both innovation gates and may relocalize across
-  larger wheel-slip or heading jumps.
+  rectangle are rejected. All measurements use the position
+  (`max_innovation_m`, 3.0 m) and wrapped-yaw (`max_yaw_innovation_rad`,
+  0.2618 rad) innovation gates against the estimate at their sample time;
+  both limits must be finite and positive. Large innovations require three
+  consecutive, distinct, mutually consistent measurements within 0.5 s of
+  capture and arrival time, compared after odometry compensation; with
+  multiple configured cameras they must include at least two distinct
+  cameras, with exactly one camera three consistent observations suffice.
+  Invalid or no-tag camera states are skipped without incrementing either
+  counter; `observation_rejected_count` counts offered measurements refused.
 - A drivetrain sample is integrated once, when `sample_time_ns` increased,
   `modules_valid` and `yaw_valid` hold and every value is finite.
 - `valid` = odometry integrated at least once, the drivetrain message fresh
   (`drivetrain_timeout_us`) and usable, and its sample no older than that
   timeout. Otherwise the pose is held and the velocity reads zero.
-- An observation is read once (`updated`) and rejected (counted) when
-  `valid` is false, a value is non-finite, a std dev is not positive, no
-  odometry has been integrated, it predates the first odometry sample, it
-  is more than `observation_future_tolerance_us` newer than the latest
+- An observation is read once (`updated`). Invalid or no-tag camera states
+  are skipped; offered measurements are rejected (counted) when a value is
+  non-finite, a std dev is not positive, no odometry has been integrated, it
+  predates the first odometry sample, is more than
+  `observation_future_tolerance_us` newer than the latest
   odometry sample, or older than `max_observation_age_us` (at most 1.5 s,
   wpimath's pose buffer).
 - `module_x_m` / `module_y_m` repeat `[subsystems.drivetrain.geometry]
@@ -82,8 +86,10 @@ fails at startup):
 scenario against both backends on `talos.testing.Sim`: a straight line then
 an arc against the closed-form pose; a delayed observation correcting
 wheel-slip drift; an observation between samples placed at its own time;
-each rejection case leaving the pose alone; single-tag yaw acceptance,
-rejection and ±π wrapping, with multi-tag relocalization unaffected;
-estimation while disabled; stale, frozen and invalid drivetrain input; repeated samples; `cameras`
+each rejection case leaving the pose alone; yaw acceptance, rejection and ±π
+wrapping, including multi-tag outlier rejection, sustained (multi-camera)
+relocalization, inconsistent/expired/replayed evidence, motion compensation,
+and skipped non-measurements; estimation while disabled; stale, frozen and
+invalid drivetrain input; repeated samples; `cameras`
 wiring; startup errors naming the bad key; `--describe` and a logged sim run
 replaying without divergence.

@@ -174,26 +174,21 @@ class EstimatorTest(unittest.TestCase):
 
     def test_tag_bounds_and_innovation_gates(self):
         for backend in BACKENDS:
-            for observation in (dict(tag_count=0), dict(x=-0.01),
-                                dict(x=16.55), dict(y=-0.01),
-                                dict(y=8.22), dict(x=4.0, tag_count=1)):
+            for observation in (dict(x=-0.01), dict(x=16.55),
+                                dict(y=-0.01), dict(y=8.22),
+                                dict(x=4.0, tag_count=1),
+                                dict(x=4.0, tag_count=2)):
                 with self.subTest(backend=backend, observation=observation):
                     chassis = self.start(backend)
                     self.observe(**observation)
                     chassis.hold(DT)
                     self.assertEqual(self.counts(), (0, 1))
                     self.assertPoseHeld((0.0, 0.0, 0.0))
-            with self.subTest(backend=backend, relocalization=True):
-                chassis = self.start(backend)
-                self.observe(x=4.0, tag_count=2)
-                chassis.hold(DT)
-                self.assertEqual(self.counts(), (1, 0))
-                self.assertGreater(self.pose()[0], 0.1)
 
-    def test_single_tag_yaw_innovation_gate_and_multitag_relocalization(self):
+    def test_yaw_innovation_gate_applies_to_all_tag_counts(self):
         for backend in BACKENDS:
             for yaw, count, accepted in ((0.2, 1, True), (0.3, 1, False),
-                                         (-0.3, 1, False), (0.6, 2, True)):
+                                         (-0.3, 1, False), (0.6, 2, False)):
                 with self.subTest(backend=backend, yaw=yaw, tag_count=count):
                     chassis = self.start(backend)
                     before = self.pose()
@@ -202,6 +197,114 @@ class EstimatorTest(unittest.TestCase):
                     self.assertEqual(self.counts(), (1, 0) if accepted else (0, 1))
                     if not accepted:
                         self.assertPoseHeld(before)
+
+    def test_three_consistent_measurements_relocalize_while_disabled(self):
+        for backend in BACKENDS:
+            for tag_count in (1, 2):
+                for cameras in (("front_camera",),
+                                ("front_camera", "back_camera")):
+                    with self.subTest(backend=backend, tag_count=tag_count,
+                                      cameras=cameras):
+                        chassis = self.start(
+                            backend, disabled_hardware=True, cameras=cameras)
+                        for index in range(3):
+                            self.observe(cameras[index % len(cameras)],
+                                         x=4.0, yaw=0.6, tag_count=tag_count,
+                                         std=(0.001, 0.001, 0.001))
+                            chassis.hold(DT)
+                            if index < 2:
+                                self.assertEqual(self.counts(), (0, index + 1))
+                                self.assertPoseHeld((0.0, 0.0, 0.0))
+                        self.assertEqual(self.counts(), (1, 2))
+                        self.assertAlmostEqual(self.pose()[0], 4.0, delta=0.1)
+                        self.assertAlmostEqual(self.pose()[2], 0.6, delta=0.02)
+
+    def test_multiple_cameras_require_independent_relocalization_confirmation(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(backend)
+                # Repeated, stable errors from one camera cannot relocalize,
+                # even after more than the three required observations.
+                for index in range(5):
+                    self.observe(x=4.0, std=(0.001, 0.001, 0.001))
+                    chassis.hold(DT)
+                    self.assertEqual(self.counts(), (0, index + 1))
+                    self.assertPoseHeld((0.0, 0.0, 0.0))
+                self.observe("back_camera", x=4.0, std=(0.001, 0.001, 0.001))
+                chassis.hold(DT)
+                self.assertEqual(self.counts(), (1, 5))
+                self.assertAlmostEqual(self.pose()[0], 4.0, delta=0.1)
+
+    def test_inconsistent_relocalization_candidates_do_not_move_pose(self):
+        for backend in BACKENDS:
+            # The last sequence agrees with its neighbours but not pairwise.
+            for observations in ((4.0, 8.0, 4.0), (4.0, 6.0, 8.0)):
+                with self.subTest(backend=backend, observations=observations):
+                    chassis = self.start(backend)
+                    for index, x in enumerate(observations):
+                        self.observe("back_camera" if index == 1
+                                     else "front_camera", x=x)
+                        chassis.hold(DT)
+                    self.assertEqual(self.counts(), (0, 3))
+                    self.assertPoseHeld((0.0, 0.0, 0.0))
+            with self.subTest(backend=backend, inconsistent_yaw=True):
+                chassis = self.start(backend)
+                for index, yaw in enumerate((0.6, 1.2, 0.6)):
+                    self.observe("back_camera" if index == 1
+                                 else "front_camera", x=4.0, yaw=yaw)
+                    chassis.hold(DT)
+                self.assertEqual(self.counts(), (0, 3))
+                self.assertPoseHeld((0.0, 0.0, 0.0))
+
+    def test_relocalization_requires_recent_distinct_consecutive_evidence(self):
+        for backend in BACKENDS:
+            for interruption in ("timeout", "replay", "accepted", "rejected"):
+                with self.subTest(backend=backend, interruption=interruption):
+                    chassis = self.start(backend, cameras=("front_camera",))
+                    timestamp = self.estimate().sample_time_ns
+                    self.observe(x=4.0)
+                    chassis.hold(DT)
+                    if interruption == "timeout":
+                        chassis.hold(0.52)
+                    elif interruption == "accepted":
+                        self.observe()
+                        chassis.hold(DT)
+                    elif interruption == "rejected":
+                        self.observe(std=(0.0, 0.05, 0.05))
+                        chassis.hold(DT)
+                    for _ in range(2):
+                        self.observe(x=4.0, time_ns=(
+                            timestamp if interruption == "replay" else None))
+                        chassis.hold(DT)
+                    self.assertEqual(self.counts(),
+                                     (1, 3) if interruption == "accepted"
+                                     else (0, 4) if interruption == "rejected"
+                                     else (0, 3))
+                    self.assertPoseHeld((0.0, 0.0, 0.0))
+
+    def test_relocalization_compensates_for_odometry_between_candidates(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(backend)
+                for index in range(3):
+                    self.observe("back_camera" if index == 1
+                                 else "front_camera",
+                                 x=4.0, yaw=chassis.yaw + 0.6)
+                    chassis.drive(0.0, 0.0, 3.0, 0.1)
+                    if index < 2:
+                        self.assertEqual(self.counts(), (0, index + 1))
+                self.assertEqual(self.counts(), (1, 2))
+
+    def test_invalid_and_no_tag_camera_states_are_not_measurements(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(backend)
+                for fields in (dict(valid=False), dict(tag_count=0),
+                               dict(valid=False, tag_count=0, y=math.nan)):
+                    self.observe(**fields)
+                    chassis.hold(DT)
+                    self.assertEqual(self.counts(), (0, 0))
+                    self.assertPoseHeld((0.0, 0.0, 0.0))
 
     def test_single_tag_yaw_innovation_wraps_at_pi(self):
         for backend in BACKENDS:
@@ -213,6 +316,24 @@ class EstimatorTest(unittest.TestCase):
                     self.observe(yaw=-initial, tag_count=1)
                     chassis.hold(DT)
                     self.assertEqual(self.counts(), (1, 0))
+
+    def test_delayed_single_tag_matches_historical_yaw_during_fast_rotation(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(backend)
+                chassis.drive(0.0, 0.0, 3.5, 0.2)
+                historical_yaw = chassis.yaw
+                historical_ns = self.estimate().sample_time_ns
+                chassis.drive(0.0, 0.0, 3.5, 0.1)
+                self.assertEqual(self.estimate().sample_time_ns - historical_ns,
+                                 100_000_000)
+                self.assertGreater(chassis.yaw - historical_yaw,
+                                   math.radians(20))
+                self.observe(time_ns=historical_ns, yaw=historical_yaw,
+                             tag_count=1)
+                chassis.drive(0.0, 0.0, 3.5, DT)
+                self.assertEqual(self.counts(), (1, 0))
+                self.assertAlmostEqual(self.pose()[2], chassis.yaw, places=4)
 
     def test_yaw_innovation_limit_is_configurable_and_positive_finite(self):
         for backend in BACKENDS:
@@ -297,7 +418,6 @@ class EstimatorTest(unittest.TestCase):
     def test_bad_observations_are_rejected_and_leave_the_pose_alone(self):
         nan, inf = math.nan, math.inf
         cases = [
-            ("marked invalid", dict(valid=False)),
             ("non-finite pose", dict(y=nan)),
             ("infinite yaw", dict(yaw=inf)),
             ("non-finite std", dict(std=(0.05, nan, 0.05))),
@@ -586,14 +706,14 @@ class BinaryTest(unittest.TestCase):
                     step_forward = after_obs["pose_x_m"] - before_obs["pose_x_m"]
                     self.assertGreater(step_forward, 0.04)
 
-                    # (d) stale/invalid observations are rejected and don't change estimate
+                    # (d) stale measurements are rejected; invalid states are skipped
                     stale_step = estimates[18]
                     self.assertEqual(stale_step["observation_accepted_count"], 1)
                     self.assertEqual(stale_step["observation_rejected_count"], 1)
 
                     invalid_step = estimates[19]
                     self.assertEqual(invalid_step["observation_accepted_count"], 1)
-                    self.assertEqual(invalid_step["observation_rejected_count"], 2)
+                    self.assertEqual(invalid_step["observation_rejected_count"], 1)
 
                     self.assertLess(stale_step["pose_x_m"], 1.0)
                     self.assertLess(stale_step["pose_y_m"], 0.1)
@@ -601,7 +721,7 @@ class BinaryTest(unittest.TestCase):
                     self.assertLess(invalid_step["pose_y_m"], 0.1)
 
                     self.assertEqual(estimates[-1]["observation_accepted_count"], 1)
-                    self.assertEqual(estimates[-1]["observation_rejected_count"], 2)
+                    self.assertEqual(estimates[-1]["observation_rejected_count"], 1)
 
 
 if __name__ == "__main__":

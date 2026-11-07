@@ -383,10 +383,17 @@ class TeleopChain : public ::testing::Test {
 };
 
 TEST_F(TeleopChain, JoystickDeflectionReachesTheSwerveModulesAsVelocity) {
-  Push(ForwardStick());
   // 4 m/s over a 0.0508 m wheel, below the 20 rps drive ceiling, so the
   // request is not desaturated.
   const double expected_rps = 4.0 / (2 * std::numbers::pi * 0.0508);
+  Push(ForwardStick());
+  // drivetrain.toml's chassis slew limit ramps the step instead of applying
+  // it in one tick.
+  const double first = hw.motor_request("drivetrain", geometry.modules[0].drive)
+                           .demand;
+  EXPECT_GT(first, 0.0);
+  EXPECT_LT(first, expected_rps);
+  for (int i = 0; i < 50; ++i) Push(ForwardStick());  // 1 s, past the ramp
   for (const auto& module : geometry.modules) {
     const auto drive = hw.motor_request("drivetrain", module.drive);
     const auto steer = hw.motor_request("drivetrain", module.steer);
@@ -397,11 +404,21 @@ TEST_F(TeleopChain, JoystickDeflectionReachesTheSwerveModulesAsVelocity) {
   }
 }
 
-TEST_F(TeleopChain, ReleasingTheStickStopsTheModulesWithoutWaitingForTimeout) {
-  Push(ForwardStick());
-  ASSERT_EQ(hw.motor_request("drivetrain", geometry.modules[0].drive).mode,
-            talos::hardware::Mode::kVelocity);
-  Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+TEST_F(TeleopChain, ReleasingTheStickDeceleratesTheModulesToZero) {
+  for (int i = 0; i < 51; ++i) Push(ForwardStick());
+  const auto& drive = geometry.modules[0].drive;
+  const double cruising = hw.motor_request("drivetrain", drive).demand;
+  ASSERT_GT(cruising, 0.0);
+  // A centred stick is a live zero target: the modules decelerate under the
+  // slew limit, still under velocity control, not neutralized by staleness.
+  double previous = cruising;
+  for (int i = 0; i < 50; ++i) {
+    Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+    const auto request = hw.motor_request("drivetrain", drive);
+    ASSERT_EQ(request.mode, talos::hardware::Mode::kVelocity);
+    EXPECT_LE(request.demand, previous);
+    previous = request.demand;
+  }
   for (const auto& module : geometry.modules) {
     EXPECT_NEAR(hw.motor_request("drivetrain", module.drive).demand, 0.0, 1e-9)
         << module.name;

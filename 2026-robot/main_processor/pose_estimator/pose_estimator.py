@@ -16,12 +16,15 @@ Two backends share this shell, its checks and its tests; `backend` picks one:
   first pose, and one PriorFactor per accepted observation. The lag window
   is max_observation_age_us.
 
-An observation is rejected (and counted) when it is marked invalid, carries
-a non-finite value or a non-positive standard deviation, arrives before any
-odometry, was taken before the first odometry sample, is newer than the
-latest odometry sample by more than observation_future_tolerance_us, or is
-older than it by more than max_observation_age_us. Single-tag observations
-also pass position and wrapped-yaw innovation gates against the current estimate.
+Invalid/no-tag camera states carry no measurement and are skipped. A measurement
+is rejected (and counted) when it carries a non-finite value or a non-positive
+standard deviation, arrives before any odometry, was taken before the first
+odometry sample, is too old or too far in the future, or is outside the field.
+All measurements pass position and wrapped-yaw innovation gates against the
+estimate at their sample time. Large innovations require three consecutive,
+mutually consistent measurements within 0.5 s to relocalize; agreement uses
+the same gates after compensating for intervening odometry. With multiple
+configured cameras, at least two distinct cameras must supply that evidence.
 """
 
 import collections
@@ -43,6 +46,9 @@ from wpimath.kinematics import SwerveDrive4Kinematics, SwerveModulePosition
 # observation could not be replayed against odometry.
 MAX_OBSERVATION_AGE_LIMIT_US = 1_500_000
 MODULE_COUNT = 4
+# Relocalization requires sustained evidence, independent of reported confidence.
+RELOCALIZATION_COUNT = 3
+RELOCALIZATION_WINDOW_S = 0.5
 _NS = 1e9
 _US = 1e6
 
@@ -96,6 +102,21 @@ def module_positions(state):
     return tuple(positions)
 
 
+def _odometry_at(samples, time_s):
+    """Interpolate retained odometry with the samples' constant-twist arc."""
+    after = next((s for s in samples if s.time_s >= time_s), samples[-1])
+    index = samples.index(after)
+    before = samples[index - 1] if index > 0 else after
+    span = after.time_s - before.time_s
+    if span <= 0:
+        return after.odometry
+    fraction = min(max((time_s - before.time_s) / span, 0.0), 1.0)
+    twist = before.odometry.log(after.odometry)
+    return before.odometry.exp(Twist2d(twist.dx * fraction,
+                                      twist.dy * fraction,
+                                      twist.dtheta * fraction))
+
+
 class KalmanBackend:
     """wpimath.estimator.SwerveDrive4PoseEstimator."""
 
@@ -105,21 +126,44 @@ class KalmanBackend:
                                    (0.1, 0.1, 0.1))
         self.estimator = None
         self.initial_pose = _initial_pose(node)
+        self.samples = collections.deque()
+        self.yaw = Rotation2d()
+        self.positions = None
 
     def start(self, time_s, yaw, positions):
         self.estimator = SwerveDrive4PoseEstimator(
             self.kinematics, yaw, positions, self.initial_pose,
             self.state_std, (1.0, 1.0, 1.0))
         self.estimator.updateWithTime(time_s, yaw, positions)
+        self.samples.append(_Sample(0, time_s, self.initial_pose))
+        self.yaw, self.positions = yaw, positions
 
     def add_odometry(self, time_s, yaw, positions):
         self.estimator.updateWithTime(time_s, yaw, positions)
+        wheels = self.kinematics.toTwist2d(self.positions, positions)
+        twist = Twist2d(wheels.dx, wheels.dy, (yaw - self.yaw).radians())
+        self.samples.append(_Sample(
+            0, time_s, self.samples[-1].odometry.exp(twist)))
+        cutoff = time_s - MAX_OBSERVATION_AGE_LIMIT_US / _US
+        while len(self.samples) > 1 and self.samples[1].time_s < cutoff:
+            self.samples.popleft()
+        self.yaw, self.positions = yaw, positions
 
     def add_observation(self, time_s, pose, std_devs):
         self.estimator.addVisionMeasurement(pose, time_s, std_devs)
 
     def pose(self):
         return self.estimator.getEstimatedPosition()
+
+    def pose_at(self, time_s):
+        sample_at = getattr(self.estimator, "sampleAt", None)
+        if sample_at is not None:
+            sampled = sample_at(time_s)
+            if isinstance(sampled, Pose2d):
+                return sampled
+        return self.pose().transformBy(
+            Transform2d(self.samples[-1].odometry,
+                        _odometry_at(self.samples, time_s)))
 
 
 # One integrated drivetrain sample: its graph key, when it was taken and the
@@ -205,6 +249,10 @@ class FactorGraphBackend:
     def pose(self):
         return self.estimate
 
+    def pose_at(self, time_s):
+        return self.estimate.transformBy(
+            Transform2d(self.samples[-1].odometry, self._odometry_at(time_s)))
+
     def _pose2(self, pose):
         return self.gtsam.Pose2(pose.X(), pose.Y(), pose.rotation().radians())
 
@@ -240,15 +288,7 @@ class FactorGraphBackend:
         return nearer if self._alive(nearer) else after
 
     def _odometry_at(self, time_s):
-        before, after = self._bracket(time_s)
-        span = after.time_s - before.time_s
-        if span <= 0:
-            return after.odometry
-        fraction = min(max((time_s - before.time_s) / span, 0.0), 1.0)
-        twist = before.odometry.log(after.odometry)
-        return before.odometry.exp(Twist2d(twist.dx * fraction,
-                                           twist.dy * fraction,
-                                           twist.dtheta * fraction))
+        return _odometry_at(self.samples, time_s)
 
     def _read_estimate(self):
         latest = self.smoother.calculateEstimatePose2(self.samples[-1].key)
@@ -292,20 +332,23 @@ class PoseEstimator:
                 or not all(isinstance(c, str) and c for c in cameras)):
             raise ValueError(f"pose_estimator: cameras must list camera node "
                              f"names, got {cameras!r}")
+        self.relocalization_camera_count = min(2, len(set(cameras)))
         self.cameras = [
-            node.subscribe(PoseObservation, f"/{camera}/state", optional=True)
+            (camera, node.subscribe(
+                PoseObservation, f"/{camera}/state", optional=True))
             for camera in cameras]
         self.state = node.publish(PoseEstimate, topics.STATE)
         self.first_ns = None  # first integrated sample; None before it
         self.latest_ns = 0
         self.accepted = 0
         self.rejected = 0
+        self.relocalization_candidates = []
 
     def update(self):
         drive = self.integrate()
-        for camera in self.cameras:
+        for name, camera in self.cameras:
             if camera.updated:
-                self.observe(camera.value)
+                self.observe(camera.value, name)
         pose = self.backend.pose() if self.first_ns is not None else Pose2d()
         self.state.send(
             sample_time_ns=self.latest_ns,
@@ -342,8 +385,10 @@ class PoseEstimator:
             return None
         return d
 
-    def observe(self, o):
-        if self.acceptable(o):
+    def observe(self, o, camera):
+        if not o.valid or o.tag_count < 1:
+            return
+        if self.acceptable(o, camera):
             self.backend.add_observation(
                 o.sample_time_ns / _NS,
                 Pose2d(o.pose_x_m, o.pose_y_m, Rotation2d(o.pose_yaw_rad)),
@@ -352,28 +397,71 @@ class PoseEstimator:
         else:
             self.rejected += 1
 
-    def acceptable(self, o):
+    def acceptable(self, o, camera):
         values = (o.pose_x_m, o.pose_y_m, o.pose_yaw_rad)
         std_devs = (o.x_std_m, o.y_std_m, o.yaw_std_rad)
-        if not o.valid or not all(map(math.isfinite, values + std_devs)):
+        if not all(map(math.isfinite, values + std_devs)):
+            self.relocalization_candidates.clear()
             return False
         if min(std_devs) <= 0 or self.first_ns is None:
+            self.relocalization_candidates.clear()
             return False
-        if (o.tag_count < 1 or not 0.0 <= o.pose_x_m <= self.field_length_m
+        if (not 0.0 <= o.pose_x_m <= self.field_length_m
                 or not 0.0 <= o.pose_y_m <= self.field_width_m):
+            self.relocalization_candidates.clear()
             return False
-        if o.tag_count == 1:
-            current = self.backend.pose()
-            if math.hypot(o.pose_x_m - current.X(),
-                          o.pose_y_m - current.Y()) > self.max_innovation_m:
-                return False
-            yaw_delta = o.pose_yaw_rad - current.rotation().radians()
-            yaw_innovation = abs(math.atan2(math.sin(yaw_delta),
-                                           math.cos(yaw_delta)))
-            if yaw_innovation > self.max_yaw_innovation_rad:
-                return False
         if o.sample_time_ns < self.first_ns:
+            self.relocalization_candidates.clear()
             return False  # nothing to attach it to
         latest_s, time_s = self.latest_ns / _NS, o.sample_time_ns / _NS
-        return (time_s - latest_s <= self.future_tolerance_s
-                and latest_s - time_s <= self.max_age_s)
+        if (time_s - latest_s > self.future_tolerance_s
+                or latest_s - time_s > self.max_age_s):
+            self.relocalization_candidates.clear()
+            return False
+        reference_time = min(time_s, latest_s)
+        pose = Pose2d(o.pose_x_m, o.pose_y_m, Rotation2d(o.pose_yaw_rad))
+        reference = self.backend.pose_at(reference_time)
+        if self.poses_agree(pose, reference):
+            self.relocalization_candidates.clear()
+            return True
+        return self.relocalizes(o.sample_time_ns, reference_time, pose, camera)
+
+    def poses_agree(self, pose, reference):
+        yaw_delta = (pose.rotation() - reference.rotation()).radians()
+        return (math.hypot(pose.X() - reference.X(),
+                           pose.Y() - reference.Y()) <= self.max_innovation_m
+                and abs(math.atan2(math.sin(yaw_delta), math.cos(yaw_delta)))
+                <= self.max_yaw_innovation_rad)
+
+    def relocalizes(self, sample_ns, time_s, pose, camera):
+        """Confirm distinct, time-ordered candidates, not a replayed frame.
+
+        Every candidate must agree with every other one, not just its neighbour,
+        so a chain of individually small disagreements cannot authorize a jump.
+        Both capture and arrival times must fit the confirmation window.
+        With multiple configured cameras, at least two must confirm the jump.
+        """
+        candidates = self.relocalization_candidates
+        now = self.node.now
+        if candidates:
+            first_ns, _, first_arrival, _, _ = candidates[0]
+            if (sample_ns <= candidates[-1][0]
+                    or (sample_ns - first_ns) / _NS > RELOCALIZATION_WINDOW_S
+                    or now - first_arrival > RELOCALIZATION_WINDOW_S):
+                candidates.clear()
+        odometry = _odometry_at(self.backend.samples, time_s)
+        for _, candidate_odometry, _, candidate_pose, _ in candidates:
+            moved = candidate_pose.transformBy(Transform2d(
+                candidate_odometry, odometry))
+            if not self.poses_agree(pose, moved):
+                candidates.clear()
+                break
+        candidates.append((sample_ns, odometry, now, pose, camera))
+        if len(candidates) > RELOCALIZATION_COUNT:
+            candidates.pop(0)
+        if (len(candidates) < RELOCALIZATION_COUNT
+                or len({candidate[4] for candidate in candidates})
+                < self.relocalization_camera_count):
+            return False
+        candidates.clear()
+        return True

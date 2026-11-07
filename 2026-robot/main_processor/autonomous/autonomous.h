@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cmath>
 #include <numbers>
+#include <stdexcept>
+#include <string>
 
 #include "autonomous/autonomous_message_generated.h"
 #include "autonomous/topics.h"
@@ -42,6 +44,8 @@ class Autonomous {
         kp_yaw_{node.param("yaw_feedback_per_rad_radps", 1.0)},
         feed_duration_{std::chrono::microseconds{
             node.param<int>("feed_duration_us", 500000)}},
+        spinup_timeout_s_{PositiveSeconds(node, "spinup_timeout_s", 2.0)},
+        drive_timeout_s_{PositiveSeconds(node, "drive_timeout_s", 10.0)},
         pose_{node.subscribe<geometry::PoseEstimate>("/pose_estimator/state")},
         shooter_state_{
             node.subscribe<shooter::ShooterState>(shooter::topics::kState)},
@@ -52,28 +56,43 @@ class Autonomous {
         intake_{node, "intake", "auto"},
         ds_{node},
         phase_{node, Phase::kIdle},
-        state_{node.publish<AutonomousState>(topics::kState)} {}
+        state_{node.publish<AutonomousState>(topics::kState)} {
+    if (feed_duration_ <= talos::Duration::zero()) {
+      throw std::invalid_argument(
+          "autonomous: feed_duration_us must be positive");
+    }
+  }
 
   void update() {
     if (!ds_.enabled() || !ds_.autonomous()) {
       phase_.go(Phase::kIdle);
       trajectory_started_ = false;
-      if (!released_) {
-        drive_.release();
-        shooter_.release();
-        intake_.release();
-        released_ = true;
-      }
+      ReleaseTargets();
       state_.send(AutonomousState{WirePhase()});
       return;
     }
-    released_ = false;
     if (phase_.is(Phase::kIdle)) {
       red_ = ds_.alliance() == talos::driver_station::Alliance::kRed;
       phase_.go(Phase::kSpinup);
     }
+    if ((phase_.is(Phase::kSpinup) &&
+         phase_.time_in_state() >=
+             std::chrono::duration<double>{spinup_timeout_s_}) ||
+        (phase_.is(Phase::kDrive) &&
+         phase_.time_in_state() >=
+             std::chrono::duration<double>{drive_timeout_s_})) {
+      phase_.go(Phase::kAborted);
+    }
+    if (phase_.is(Phase::kAborted) || phase_.is(Phase::kHold)) {
+      ReleaseTargets();
+      state_.send(AutonomousState{WirePhase()});
+      return;
+    }
+    released_ = false;
     if (phase_.is(Phase::kSpinup) && shooter_state_.fresh() &&
-        shooter_state_->at_speed()) {
+        shooter_state_->at_speed() &&
+        std::abs(shooter_state_->target_velocity_rps() - shooter_velocity_) <=
+            1e-6) {
       phase_.go(Phase::kFeed);
     }
     if (phase_.is(Phase::kFeed) && phase_.time_in_state() >= feed_duration_) {
@@ -98,11 +117,18 @@ class Autonomous {
               p, geometry::Pose2d{target.x_m, target.y_m, target.yaw_rad},
               max_linear_, max_angular_);
           trajectory_started_ = true;
-          trajectory_start_ = phase_.time_in_state();
+          trajectory_elapsed_ = talos::Duration::zero();
+          trajectory_last_update_ = phase_.time_in_state();
+          trajectory_pose_available_ = false;
         }
-        const double elapsed = std::chrono::duration<double>(
-                                   phase_.time_in_state() - trajectory_start_)
-                                   .count();
+        if (trajectory_pose_available_) {
+          trajectory_elapsed_ +=
+              phase_.time_in_state() - trajectory_last_update_;
+        }
+        trajectory_last_update_ = phase_.time_in_state();
+        trajectory_pose_available_ = true;
+        const double elapsed =
+            std::chrono::duration<double>(trajectory_elapsed_).count();
         const auto desired = trajectory_.SampleAt(elapsed);
         const double dx = desired.x_m - p.x_m(), dy = desired.y_m - p.y_m();
         const double da = WrapAngle(desired.yaw_rad - p.yaw_rad());
@@ -118,25 +144,38 @@ class Autonomous {
             intake = intake_velocity_;
           }
         }
+      } else {
+        trajectory_pose_available_ = false;
       }
     }
-    if (phase_.is(Phase::kHold)) shooter = 0;
-    drive_.send(drive);
+    if (phase_.is(Phase::kHold)) {
+      ReleaseTargets();
+      state_.send(AutonomousState{WirePhase()});
+      return;
+    }
+    if (phase_.is(Phase::kDrive) && !trajectory_pose_available_) {
+      drive_.release();
+    } else {
+      drive_.send(drive);
+    }
     shooter_.send(shooter::ShooterTarget{shooter});
     intake_.send(intake::IntakeTarget{static_cast<float>(intake)});
     state_.send(AutonomousState{WirePhase()});
   }
 
  private:
-  enum class Phase { kIdle, kSpinup, kFeed, kDrive, kHold };
+  enum class Phase { kIdle, kSpinup, kFeed, kDrive, kHold, kAborted };
   double shooter_velocity_, intake_velocity_, feed_velocity_;
   double target_x_, target_y_, target_yaw_;
   double position_tolerance_, yaw_tolerance_, max_linear_, max_angular_;
   double field_length_, field_width_, kp_xy_, kp_yaw_;
   Trajectory trajectory_;
-  talos::Duration trajectory_start_{};
+  talos::Duration trajectory_elapsed_{};
+  talos::Duration trajectory_last_update_{};
+  bool trajectory_pose_available_ = false;
   bool trajectory_started_ = false;
   talos::Duration feed_duration_;
+  double spinup_timeout_s_, drive_timeout_s_;
   talos::Subscription<geometry::PoseEstimate> pose_;
   talos::Subscription<shooter::ShooterState> shooter_state_;
   talos::Subscription<intake::IntakeState> intake_state_;
@@ -149,6 +188,24 @@ class Autonomous {
   bool released_ = false;
   bool red_ = false;
 
+  static double PositiveSeconds(talos::Node& node, const char* key,
+                                double fallback) {
+    const double value = node.param(key, fallback);
+    if (!std::isfinite(value) || value <= 0) {
+      throw std::invalid_argument(std::string{"autonomous: "} + key +
+                                  " must be positive and finite");
+    }
+    return value;
+  }
+
+  void ReleaseTargets() {
+    if (released_) return;
+    drive_.release();
+    shooter_.release();
+    intake_.release();
+    released_ = true;
+  }
+
   autonomous::Phase WirePhase() const {
     switch (phase_.state()) {
       case Phase::kSpinup:
@@ -159,6 +216,8 @@ class Autonomous {
         return autonomous::Phase::DRIVE;
       case Phase::kHold:
         return autonomous::Phase::HOLD;
+      case Phase::kAborted:
+        return autonomous::Phase::ABORTED;
       case Phase::kIdle:
         return autonomous::Phase::IDLE;
     }

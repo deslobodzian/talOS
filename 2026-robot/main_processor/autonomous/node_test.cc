@@ -100,6 +100,11 @@ class AutonomousTest : public ::testing::Test {
     EXPECT_TRUE(result.has_value());
     return result.value_or(talos::TargetEnvelope<M>{});
   }
+  void ExpectReleased() {
+    EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+    EXPECT_FALSE(Lane<shooter::ShooterTarget>("shooter").active);
+    EXPECT_FALSE(Lane<intake::IntakeTarget>("intake").active);
+  }
   drivetrain::ChassisTarget Drive() {
     return Lane<drivetrain::ChassisTarget>("drivetrain").message;
   }
@@ -154,6 +159,7 @@ TEST_F(AutonomousTest, ReportsPhaseThroughDisabledAutoAndDisable) {
     sim.step(20ms);
   }
   EXPECT_EQ(Phase(), autonomous::Phase::HOLD);
+  ExpectReleased();
 
   // Losing the Driver Station (stale target) returns the routine to idle.
   hw.stop_driver_station();
@@ -170,6 +176,10 @@ TEST_F(AutonomousTest, WaitsForSpeedFeedsThenRotatesDriveAndHolds) {
   sim.step(200ms);
   EXPECT_EQ(Intake(), 0);
   Shooter(false);
+  sim.step(20ms);
+  EXPECT_EQ(Intake(), 0);
+  sim.publish(shooter::topics::kState,
+              shooter::ShooterState{0, 30, 30, true, true, true});
   sim.step(20ms);
   EXPECT_EQ(Intake(), 0);
   Shooter(true);
@@ -198,18 +208,108 @@ TEST_F(AutonomousTest, WaitsForSpeedFeedsThenRotatesDriveAndHolds) {
   EXPECT_EQ(Intake(), 0);
 }
 
+TEST_F(AutonomousTest, SpinupDeadlineAbortsAndRequiresLeavingEnabledAuto) {
+  Mode(ds::kEnabled | ds::kAutonomous);
+  Shooter(false);
+  sim.step(1900ms);
+  EXPECT_EQ(Phase(), autonomous::Phase::SPINUP);
+  sim.step(120ms);
+  EXPECT_EQ(Phase(), autonomous::Phase::ABORTED);
+  ExpectReleased();
+
+  Shooter(true);
+  Pose();
+  sim.step(100ms);
+  EXPECT_EQ(Phase(), autonomous::Phase::ABORTED);
+  ExpectReleased();
+
+  Mode(0);
+  EXPECT_EQ(Phase(), autonomous::Phase::IDLE);
+  ExpectReleased();
+  sim.step(120ms);  // Let the previous ready report expire.
+  Mode(ds::kEnabled | ds::kAutonomous);
+  EXPECT_EQ(Phase(), autonomous::Phase::SPINUP);
+  EXPECT_TRUE(Lane<shooter::ShooterTarget>("shooter").active);
+  Shooter(true);
+  sim.step(20ms);
+  EXPECT_EQ(Phase(), autonomous::Phase::FEED);
+}
+
+TEST_F(AutonomousTest, UnreachableWaypointAbortsAtDriveDeadline) {
+  StartDrive();
+  for (int i = 0; i < 490; ++i) {
+    Pose();
+    sim.step(20ms);
+  }
+  EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
+  Pose();
+  sim.step(200ms);
+  EXPECT_EQ(Phase(), autonomous::Phase::ABORTED);
+  ExpectReleased();
+  Pose(6, 4, 0);
+  sim.step(100ms);
+  EXPECT_EQ(Phase(), autonomous::Phase::ABORTED);
+  ExpectReleased();
+}
+
+TEST_F(AutonomousTest, PoseOutageDoesNotExtendDriveDeadline) {
+  StartDrive();
+  sim.step(10s);
+  EXPECT_EQ(Phase(), autonomous::Phase::ABORTED);
+  ExpectReleased();
+}
+
+TEST_F(AutonomousTest, InvalidPosePausesTrajectoryUntilRecovery) {
+  StartDrive();
+  const auto before = Drive();
+  Pose(0, 0, 0, false);
+  sim.step(20ms);
+  EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  sim.step(5s);  // Longer than the trajectory, but within the drive deadline.
+  Pose();
+  sim.step(20ms);
+  EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
+  EXPECT_TRUE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  EXPECT_DOUBLE_EQ(Drive().vx_mps(), before.vx_mps());
+  EXPECT_DOUBLE_EQ(Drive().vy_mps(), before.vy_mps());
+  Pose();
+  sim.step(20ms);
+  EXPECT_GT(Drive().vx_mps(), before.vx_mps());
+}
+
+TEST_F(AutonomousTest, StalePosePausesTrajectoryUntilRecovery) {
+  StartDrive();
+  auto last_active = Drive();
+  for (int i = 0; i < 6; ++i) {
+    sim.step(20ms);
+    if (Lane<drivetrain::ChassisTarget>("drivetrain").active) {
+      last_active = Drive();
+    }
+  }
+  EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  sim.step(5s);
+  Pose();
+  sim.step(20ms);
+  EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
+  EXPECT_TRUE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  EXPECT_DOUBLE_EQ(Drive().vx_mps(), last_active.vx_mps());
+  EXPECT_DOUBLE_EQ(Drive().vy_mps(), last_active.vy_mps());
+}
+
 TEST_F(AutonomousTest, InvalidAndStalePoseStopImmediately) {
   StartDrive();
   EXPECT_GT(Drive().vx_mps(), 0);
   Pose(0, 0, 0, false);
   sim.step(20ms);
   EXPECT_DOUBLE_EQ(Drive().vx_mps(), 0);
+  EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
   EXPECT_EQ(Intake(), 0);
   Pose();
   sim.step(20ms);
   EXPECT_GT(Drive().vx_mps(), 0);
   sim.step(120ms);
   EXPECT_DOUBLE_EQ(Drive().vx_mps(), 0);
+  EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
   EXPECT_DOUBLE_EQ(Drive().vy_mps(), 0);
   EXPECT_DOUBLE_EQ(Drive().omega_radps(), 0);
   EXPECT_EQ(Intake(), 0);
@@ -233,6 +333,26 @@ TEST_F(AutonomousTest, BeamStopsCollectionAndDriverStationLossReleases) {
   EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
   EXPECT_FALSE(Lane<shooter::ShooterTarget>("shooter").active);
   EXPECT_FALSE(Lane<intake::IntakeTarget>("intake").active);
+}
+
+TEST(AutonomousParameters, RejectsNonpositiveAndNonfinitePhaseDurations) {
+  for (const char* setting :
+       {"spinup_timeout_s = 0.0", "spinup_timeout_s = -1.0",
+        "spinup_timeout_s = nan", "spinup_timeout_s = inf",
+        "drive_timeout_s = 0.0", "drive_timeout_s = -1.0",
+        "drive_timeout_s = nan", "drive_timeout_s = inf",
+        "feed_duration_us = 0", "feed_duration_us = -1"}) {
+    SCOPED_TRACE(setting);
+    auto sim = talos::testing::Sim::FromToml(std::string{R"(
+[robot]
+period_us = 20000
+command_timeout_us = 100000
+[subsystems.mechanism.motors.unused]
+can_id = 1
+[subsystems.autonomous]
+)"} + setting);
+    EXPECT_THROW(sim.add<Autonomous>("autonomous"), std::invalid_argument);
+  }
 }
 
 struct Result {

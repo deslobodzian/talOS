@@ -63,7 +63,17 @@ inline double WheelRps(double speed_mps, double wheel_radius_m) {
 class SwerveKinematics {
  public:
   explicit SwerveKinematics(const SwerveGeometry& geometry)
-      : geometry_(geometry) {}
+      : geometry_(geometry) {
+    Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
+    for (std::size_t i = 0; i < kModuleCount; ++i) {
+      const auto& module = geometry_.modules[i];
+      const Eigen::Vector3d row_x(1.0, 0.0, -module.y_m);
+      const Eigen::Vector3d row_y(0.0, 1.0, module.x_m);
+      normal.noalias() += row_x * row_x.transpose();
+      normal.noalias() += row_y * row_y.transpose();
+    }
+    normal_ldlt_.compute(normal);
+  }
 
   // Shortest-path steering, cosine compensation, and one common speed scale
   // respecting each module's individual drive limit. Stopped wheels hold angle.
@@ -116,7 +126,6 @@ class SwerveKinematics {
   // Full least-squares solve, including non-centered module layouts.
   ChassisSpeeds ToChassisSpeeds(
       const std::array<ModuleState, kModuleCount>& measured) const {
-    Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
     Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
     for (std::size_t i = 0; i < kModuleCount; ++i) {
       const auto& module = geometry_.modules[i];
@@ -127,16 +136,15 @@ class SwerveKinematics {
       const double vy = speed * std::sin(angle);
       const Eigen::Vector3d row_x(1.0, 0.0, -module.y_m);
       const Eigen::Vector3d row_y(0.0, 1.0, module.x_m);
-      normal.noalias() += row_x * row_x.transpose();
-      normal.noalias() += row_y * row_y.transpose();
       rhs.noalias() += row_x * vx + row_y * vy;
     }
-    const Eigen::Vector3d result = normal.ldlt().solve(rhs);
+    const Eigen::Vector3d result = normal_ldlt_.solve(rhs);
     return {result.x(), result.y(), result.z()};
   }
 
  private:
   SwerveGeometry geometry_;
+  Eigen::LDLT<Eigen::Matrix3d> normal_ldlt_{};
 };
 
 }  // namespace drivetrain

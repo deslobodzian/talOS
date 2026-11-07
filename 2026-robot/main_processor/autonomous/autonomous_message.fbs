@@ -10,6 +10,7 @@ enum Phase : ubyte {
   FEED,
   DRIVE,
   HOLD,
+  ABORTED,
 }
 
 // Studio view: the phase enum is forwarded by talOS/telemetry as the

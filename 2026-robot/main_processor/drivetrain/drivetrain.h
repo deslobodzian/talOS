@@ -116,9 +116,26 @@ class Drivetrain {
     bool yaw_valid = false;
     if (integrate_heading_) {
       if (connected) {
-        yaw_rad_ += speeds.omega_radps *
-                    std::chrono::duration<double>{node_.period()}.count();
-        yaw_valid = sample_time.has_value();
+        const double dt_s =
+            std::chrono::duration<double>{node_.period()}.count();
+        if (sample_time.has_value()) {
+          const auto sample_ns =
+              static_cast<std::uint64_t>(sample_time->nanos());
+          if (sample_ns > last_integrated_sample_ns_) {
+            const double elapsed_s =
+                last_integrated_sample_ns_ == 0
+                    ? dt_s
+                    : std::min(static_cast<double>(
+                                   sample_ns - last_integrated_sample_ns_) *
+                                   1e-9,
+                               dt_s * 4.0);
+            yaw_rad_ += speeds.omega_radps * elapsed_s;
+            last_integrated_sample_ns_ = sample_ns;
+          }
+        } else {
+          yaw_rad_ += speeds.omega_radps * dt_s;
+        }
+        yaw_valid = modules_valid;
       }
     } else if (sample_time.has_value() && gyro_.connected()) {
       yaw_rad_ = ToRadians(gyro_.yaw());
@@ -145,6 +162,7 @@ class Drivetrain {
   double max_angular_accel_radps2_;
   ChassisSpeeds commanded_speeds_{0.0, 0.0, 0.0};
   double yaw_rad_ = 0;
+  std::uint64_t last_integrated_sample_ns_{0};
   std::array<geometry::SwerveModulePosition, kModuleCount> modules_{};
   talos::Target<ChassisTarget> target_;
   talos::Publisher<DrivetrainState> state_;

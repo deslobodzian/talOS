@@ -6,8 +6,13 @@ node = "//talOS/telemetry:node"
 period_us = 10000
 # Leave room below the 1200-byte value-frame cap by dropping cumulative
 # camera counters; retain health, timing, drops and visible-tag diagnostics.
+# clock_boot_id is a 64-bit identity a double cannot carry exactly; Studio
+# reads only the simulator's truth pose, not its timestamp or velocity.
 exclude = [
     "*_camera/status/frames_captured_count",
     "*_camera/status/frames_processed_count",
     "*_camera/status/range_rejected_count",
+    "hw/status/clock_boot_id",
+    "sim/state/sample_time_ns",
+    "sim/state/velocity/*",
 ]

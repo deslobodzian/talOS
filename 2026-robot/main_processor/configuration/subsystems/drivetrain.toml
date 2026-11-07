@@ -5,9 +5,14 @@
 name = "drivetrain"
 node = "//2026-robot/main_processor/drivetrain:node"
 period_us = 5000
-# Optional chassis slew limits; omitted (0.0) preserves immediate step commands.
-# max_linear_accel_mps2 = 15.0
-# max_angular_accel_radps2 = 25.0
+# Chassis slew limits (provisional, derived, not yet measured on the robot).
+# Stator-limited thrust: 4 x 80 A x 0.0194 N*m/A (Kraken X60) x 6.75 / 0.0508 m
+# = 825 N; at an assumed 60 kg that is 13.7 m/s^2, above the ~10.8 m/s^2
+# traction limit (mu ~1.1). 8.0 keeps ~25% margin under traction. Angular:
+# 8.0 m/s^2 at the 0.424 m module radius = 18.9 rad/s^2. Replace both with
+# measured values during bring-up.
+max_linear_accel_mps2 = 8.0
+max_angular_accel_radps2 = 18.0
 
 [motors.back_left_drive]
 type = "TalonFX"
