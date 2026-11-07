@@ -25,6 +25,9 @@ static_assert(Message<geometry::OdometrySample>);
 static_assert(Message<geometry::SwerveModulePosition>);
 static_assert(Message<geometry::PoseObservation>);
 static_assert(Message<geometry::PoseEstimate>);
+static_assert(sizeof(geometry::PoseEstimate) == 72,
+              "PoseEstimate size changed; update docs/DATA_FLOW.md");
+static_assert(alignof(geometry::PoseEstimate) == 8);
 static_assert(Message<control::VelocityTarget>);
 static_assert(Message<control::VelocityState>);
 static_assert(Message<control::PositionTarget>);

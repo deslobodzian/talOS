@@ -12,7 +12,7 @@ disabled. Telemetry draws it through `[subsystems.telemetry] pose_topic`.
 |---|---|---|
 | `/drivetrain/state` | `drivetrain.DrivetrainState` | `sample_time_ns`, `modules_valid`, `yaw_valid`, `yaw_rad`, `module0`..`module3` (distance, angle), chassis velocity |
 | `/<camera>/state`, per name in `cameras` | `geometry.PoseObservation` | optional subscriptions: a listed camera that is not running is no graph error |
-| `/pose_estimator/state` | `geometry.PoseEstimate` | pose at the newest integrated `sample_time_ns`, the drivetrain's chassis velocity, `valid`, accepted/rejected observation counts |
+| `/pose_estimator/state` | `geometry.PoseEstimate` | pose at the newest integrated `sample_time_ns`, the drivetrain's chassis velocity, `valid`, `localized`, accepted/rejected observation counts |
 
 The configured sources are `front_left_camera`, `front_right_camera`,
 `rear_left_camera` and `rear_right_camera`, built from the shared C++ vision
@@ -26,6 +26,10 @@ The gateway owns the world's `--start-pose`; the estimator's independent
 `initial_*` seed may differ and be corrected by vision. Camera intrinsics,
 distortion, mounts and devices live in each camera's subsystem file;
 see [vision](../vision/README.md).
+
+The estimator also reads the Driver Station through `talos.DriverStation`.
+Only a fresh, attached packet can classify startup; an absent, stale or
+detached Driver Station is not evidence of a normal disabled boot.
 
 ## Backends
 
@@ -53,12 +57,20 @@ fails at startup):
 - Both backends seed the first integrated sample with `initial_x_m`,
   `initial_y_m`, and `initial_yaw_rad` (finite, default zero), independently
   of the gyro's initial reading; subsequent gyro deltas change that heading.
+  The first fresh, attached Driver Station observation decides whether that
+  seed is trusted: disabled means normal pre-match boot, so the first
+  integrated sample is localized; enabled means a mid-match restart, so the
+  seed is untrusted. A later disable never changes that startup decision.
 - Field dimensions `field_length_m` (16.54) and `field_width_m` (8.21)
   must be finite and positive. Observations outside the inclusive field
-  rectangle are rejected. All measurements use the position
+  rectangle are rejected. Once localized, measurements use the position
   (`max_innovation_m`, 3.0 m) and wrapped-yaw (`max_yaw_innovation_rad`,
   0.2618 rad) innovation gates against the estimate at their sample time;
-  both limits must be finite and positive. Large innovations require three
+  both limits must be finite and positive. Before localization, these gates
+  never compare observations against the untrusted seed: otherwise usable
+  observations are accepted and fused immediately, but do not authorize
+  field-relative driving until confirmed. Establishing localization from
+  vision, or accepting a large innovation once localized, requires three
   consecutive, distinct, mutually consistent measurements within 0.5 s of
   capture and arrival time, compared after odometry compensation; with
   multiple configured cameras they must include at least two distinct
@@ -70,6 +82,12 @@ fails at startup):
 - `valid` = odometry integrated at least once, the drivetrain message fresh
   (`drivetrain_timeout_us`) and usable, and its sample no older than that
   timeout. Otherwise the pose is held and the velocity reads zero.
+- `localized` = the integrated estimate has a trusted field frame, either
+  from the disabled-first startup decision or the camera confirmation above.
+  It is false before the first integrated sample. Once true, it stays true
+  for the process lifetime, including enable/disable transitions, Driver
+  Station loss and stale or invalid odometry. It is not a freshness flag:
+  field-pose consumers must require both `valid` and `localized`.
 - An observation is read once (`updated`). Invalid or no-tag camera states
   are skipped; offered measurements are rejected (counted) when a value is
   non-finite, a std dev is not positive, no odometry has been integrated, it
@@ -80,6 +98,12 @@ fails at startup):
 - `module_x_m` / `module_y_m` repeat `[subsystems.drivetrain.geometry]
   .modules` (same order); `config_golden_test` fails if they drift.
 
+`PoseEstimate` remains 72 bytes with 8-byte alignment: `localized` occupies
+existing padding next to `valid`. Telemetry gains one double-valued channel
+(8 bytes per value frame); even the documented 1176-byte physics graph before
+the additional hardware/simulator exclusions remains below the 1200-byte cap
+at 1184 bytes. No additional exclusion is required.
+
 ## Tests
 
 `bazel test //2026-robot/main_processor/pose_estimator:node_test` runs every
@@ -89,7 +113,9 @@ wheel-slip drift; an observation between samples placed at its own time;
 each rejection case leaving the pose alone; yaw acceptance, rejection and ±π
 wrapping, including multi-tag outlier rejection, sustained (multi-camera)
 relocalization, inconsistent/expired/replayed evidence, motion compensation,
-and skipped non-measurements; estimation while disabled; stale, frozen and
-invalid drivetrain input; repeated samples; `cameras`
+and skipped non-measurements; disabled-first seed trust, enabled-first restart
+recovery without seed innovation gating, cross-camera startup confirmation,
+missing/detached DS startup and process-lifetime localization latching;
+estimation while disabled; stale, frozen and invalid drivetrain input; repeated samples; `cameras`
 wiring; startup errors naming the bad key; `--describe` and a logged sim run
 replaying without divergence.

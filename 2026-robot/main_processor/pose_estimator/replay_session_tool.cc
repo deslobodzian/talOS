@@ -248,6 +248,7 @@ int CommandEstimates(std::string_view log_path) {
               << ", \"velocity_vy_mps\": " << est->velocity().vy_mps()
               << ", \"velocity_omega_radps\": " << est->velocity().omega_radps()
               << ", \"valid\": " << (est->valid() ? "true" : "false")
+              << ", \"localized\": " << (est->localized() ? "true" : "false")
               << ", \"observation_accepted_count\": "
               << est->observation_accepted_count()
               << ", \"observation_rejected_count\": "

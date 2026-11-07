@@ -64,14 +64,18 @@ struct PoseObservation {
 
 // A pose estimator's output: the field pose at sample_time_ns (the latest
 // odometry sample folded in), the chassis velocity, and how many absolute
-// observations it has accepted and rejected since it started. `valid` is
-// false until odometry has been integrated and whenever the odometry input
-// is stale or invalid.
+// observations it has accepted and rejected since it started. `valid` means
+// odometry has been integrated and its input is fresh and usable; it does not
+// imply a trustworthy field frame. `localized` means the configured seed was
+// trusted on a disabled-first Driver Station observation, or absolute sources
+// confirmed localization. It becomes true only after odometry is integrated
+// and stays true for the process lifetime, even when `valid` becomes false.
 struct PoseEstimate {
   sample_time_ns:ulong;
   pose:Pose2d;
   velocity:Twist2d;
   valid:bool;
+  localized:bool;
   observation_accepted_count:uint;
   observation_rejected_count:uint;
 }

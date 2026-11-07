@@ -20,10 +20,11 @@ Invalid/no-tag camera states carry no measurement and are skipped. A measurement
 is rejected (and counted) when it carries a non-finite value or a non-positive
 standard deviation, arrives before any odometry, was taken before the first
 odometry sample, is too old or too far in the future, or is outside the field.
-All measurements pass position and wrapped-yaw innovation gates against the
-estimate at their sample time. Large innovations require three consecutive,
-mutually consistent measurements within 0.5 s to relocalize; agreement uses
-the same gates after compensating for intervening odometry. With multiple
+Once localized, measurements pass position and wrapped-yaw innovation gates
+against the estimate at their sample time. An untrusted startup seed does not
+gate measurements. Localization (and large innovations once localized) requires
+three consecutive, mutually consistent measurements within 0.5 s; agreement
+uses the same gates after compensating for intervening odometry. With multiple
 configured cameras, at least two distinct cameras must supply that evidence.
 """
 
@@ -32,6 +33,7 @@ import importlib
 import math
 
 import numpy as np
+import talos
 from drivetrain import topics as drivetrain_topics
 from drivetrain.DrivetrainState import DrivetrainState
 from geometry.PoseEstimate import PoseEstimate
@@ -343,9 +345,15 @@ class PoseEstimator:
         self.accepted = 0
         self.rejected = 0
         self.relocalization_candidates = []
+        self.localized = False
+        self.seed_trusted = None  # first fresh, attached DS observation only
+        self.ds = talos.DriverStation(node, on_packet=self.observe_driver_station)
 
     def update(self):
+        self.observe_driver_station()
         drive = self.integrate()
+        if self.first_ns is not None and self.seed_trusted:
+            self.localized = True
         for name, camera in self.cameras:
             if camera.updated:
                 self.observe(camera.value, name)
@@ -358,8 +366,16 @@ class PoseEstimator:
             velocity_vy_mps=drive.vy_mps if drive else 0.0,
             velocity_omega_radps=drive.omega_radps if drive else 0.0,
             valid=drive is not None,
+            localized=self.localized,
             observation_accepted_count=self.accepted,
             observation_rejected_count=self.rejected)
+
+    def observe_driver_station(self):
+        # Missing/stale/detached DS data reads disabled, but cannot authorize
+        # the configured seed. A later disable cannot trust an enabled-first
+        # restart's seed, nor can a mode change revoke established localization.
+        if self.seed_trusted is None and self.ds.connected:
+            self.seed_trusted = not self.ds.enabled
 
     def integrate(self):
         """Folds in a new drivetrain sample; returns the drivetrain state
@@ -420,6 +436,10 @@ class PoseEstimator:
             return False
         reference_time = min(time_s, latest_s)
         pose = Pose2d(o.pose_x_m, o.pose_y_m, Rotation2d(o.pose_yaw_rad))
+        if not self.localized:
+            if self.relocalizes(o.sample_time_ns, reference_time, pose, camera):
+                self.localized = True
+            return True  # never gate a field observation against an untrusted seed
         reference = self.backend.pose_at(reference_time)
         if self.poses_agree(pose, reference):
             self.relocalization_candidates.clear()

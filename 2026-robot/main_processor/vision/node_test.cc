@@ -659,7 +659,7 @@ TEST(VisionTest, GatewayTruthMovesIndependentlyOfStaleEstimator) {
   for (const auto* name : kCameras) sim.add<Vision>(name);
   sim.publish("/pose_estimator/state",
               geometry::PoseEstimate{0, geometry::Pose2d{10, 5, 1},
-                                     geometry::Twist2d{}, true, 0, 0});
+                                     geometry::Twist2d{}, true, true, 0, 0});
   sim.publish(sim::topics::kState, Truth(sim));
   sim.step(50ms);
   const auto truth = Truth(sim, {2.1, 2, 0});
@@ -668,8 +668,8 @@ TEST(VisionTest, GatewayTruthMovesIndependentlyOfStaleEstimator) {
   // Even a new estimator pose cannot move the world during a truth pause.
   sim.publish("/pose_estimator/state",
               geometry::PoseEstimate{100000000, geometry::Pose2d{8, 4, -1},
-                                     geometry::Twist2d{}, true, 0, 0});
-  sim.step(50ms);
+                                     geometry::Twist2d{}, true, true, 0, 0});
+  sim.step(35ms);
   int valid = 0;
   for (const auto* name : kCameras) {
     const auto observation = sim.latest<geometry::PoseObservation>(

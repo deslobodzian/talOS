@@ -949,7 +949,7 @@ class @PASCAL@ {
     }
     const bool valid =
         last_accepted_.has_value() && node_.now() - *last_accepted_ <= timeout_;
-    state_.send(State{sample_time_ns_, pose_, geometry::Twist2d{}, valid,
+    state_.send(State{sample_time_ns_, pose_, geometry::Twist2d{}, valid, false,
                       accepted_, rejected_});
   }
 
@@ -1185,7 +1185,7 @@ class @PASCAL@:
                  and self.node.now - self.last_accepted_s <= self.timeout_s)
         x, y, yaw = self.pose
         self.state.send(sample_time_ns=self.sample_time_ns, pose_x_m=x,
-                        pose_y_m=y, pose_yaw_rad=yaw, valid=valid,
+                        pose_y_m=y, pose_yaw_rad=yaw, valid=valid, localized=False,
                         observation_accepted_count=self.accepted,
                         observation_rejected_count=self.rejected)
 '''

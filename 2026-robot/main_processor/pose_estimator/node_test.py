@@ -117,14 +117,15 @@ class Chassis:
 
 
 class EstimatorTest(unittest.TestCase):
-    def start(self, backend, *, disabled_hardware=False, **config):
+    def start(self, backend, *, enabled=False, driver_station=True,
+              attached=True, **config):
         self.sim = Sim.from_toml(robot_toml(backend, **config))
         self.sim.add(estimator.PoseEstimator, "pose_estimator")
-        if disabled_hardware:
-            # A live gateway and Driver Station, both saying disabled.
-            self.hw = SimHardware(self.sim)
-            self.hw.enable(False)
-            self.hw.set_driver_station(enabled=False, teleop=True)
+        self.hw = SimHardware(self.sim)
+        self.hw.enable(enabled)
+        if driver_station:
+            self.hw.set_driver_station(
+                enabled=enabled, teleop=True, attached=attached)
         self.chassis = Chassis(self.sim)
         self.sim.step(DT)  # sample time 0 means "unknown"
         self.chassis.publish()
@@ -169,8 +170,149 @@ class EstimatorTest(unittest.TestCase):
                     "initial_x_m = 2.0\ninitial_y_m = 3.0\n"
                     "initial_yaw_rad = 1.0"))
                 self.assertPoseHeld((2.0, 3.0, 1.0))
+                self.assertTrue(self.estimate().valid)
+                self.assertTrue(self.estimate().localized)
                 chassis.hold(DT)
                 self.assertPoseHeld((2.0, 3.0, 1.0))
+
+    def test_enabled_restart_accepts_vision_before_field_localization(self):
+        for backend in BACKENDS:
+            for x, yaw in ((2.1, 1.05), (8.0, 2.0)):
+                with self.subTest(backend=backend, x=x, yaw=yaw):
+                    chassis = self.start(backend, enabled=True, extra=(
+                        "initial_x_m = 2.0\ninitial_y_m = 3.0\n"
+                        "initial_yaw_rad = 1.0"))
+                    self.assertPoseHeld((2.0, 3.0, 1.0))
+                    self.assertTrue(self.estimate().valid)
+                    self.assertFalse(self.estimate().localized)
+                    for index, camera in enumerate(
+                            ("front_camera", "back_camera", "front_camera")):
+                        self.observe(camera, x=x, y=3.0, yaw=yaw,
+                                     std=(0.001, 0.001, 0.001))
+                        chassis.hold(DT)
+                        self.assertEqual(self.counts(), (index + 1, 0))
+                        self.assertTrue(self.estimate().valid)
+                        self.assertEqual(self.estimate().localized, index == 2)
+                    self.assertAlmostEqual(self.pose()[0], x, delta=0.1)
+                    self.assertAlmostEqual(self.pose()[2], yaw, delta=0.02)
+                    # Localization restores the normal innovation gate.
+                    self.observe(x=x, y=3.0, yaw=yaw - 1.0)
+                    chassis.hold(DT)
+                    self.assertEqual(self.counts(), (3, 1))
+
+    def test_restart_needs_independent_camera_confirmation_even_after_disable(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(backend, enabled=True)
+                self.hw.set_driver_station(enabled=False, teleop=True)
+                for index in range(5):
+                    self.observe(x=6.0, std=(0.001, 0.001, 0.001))
+                    chassis.hold(DT)
+                    self.assertFalse(self.estimate().localized)
+                    self.assertEqual(self.counts(), (index + 1, 0))
+                self.observe("back_camera", x=6.0,
+                             std=(0.001, 0.001, 0.001))
+                chassis.hold(DT)
+                self.assertTrue(self.estimate().localized)
+                self.assertEqual(self.counts(), (6, 0))
+
+    def test_one_configured_camera_can_confirm_startup_localization(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(
+                    backend, enabled=True, cameras=("front_camera",))
+                for index in range(3):
+                    self.observe(x=6.0)
+                    chassis.hold(DT)
+                    self.assertEqual(self.counts(), (index + 1, 0))
+                    self.assertEqual(self.estimate().localized, index == 2)
+
+    def test_unlocalized_measurements_still_require_usable_field_observations(self):
+        for backend in BACKENDS:
+            for fields in (dict(x=-0.01), dict(y=8.22), dict(yaw=math.nan),
+                           dict(std=(0.0, 0.05, 0.05))):
+                with self.subTest(backend=backend, fields=fields):
+                    chassis = self.start(backend, enabled=True)
+                    self.observe(**fields)
+                    chassis.hold(DT)
+                    self.assertEqual(self.counts(), (0, 1))
+                    self.assertFalse(self.estimate().localized)
+                    self.assertTrue(self.estimate().valid)
+                    self.assertPoseHeld((0.0, 0.0, 0.0))
+
+    def test_startup_localization_requires_consistent_recent_distinct_evidence(self):
+        for backend in BACKENDS:
+            for interruption in ("inconsistent", "capture_timeout",
+                                 "arrival_timeout", "replay"):
+                with self.subTest(backend=backend, interruption=interruption):
+                    chassis = self.start(backend, enabled=True)
+                    timestamp = self.estimate().sample_time_ns
+                    self.observe(x=6.0, time_ns=(
+                        timestamp + round(DT * 1e9)
+                        if interruption == "arrival_timeout" else None))
+                    chassis.hold(DT)
+                    if interruption == "capture_timeout":
+                        chassis.hold(0.52)
+                    elif interruption == "arrival_timeout":
+                        chassis.hold(0.50)
+                    self.observe("back_camera",
+                                 x=10.0 if interruption == "inconsistent" else 6.0,
+                                 time_ns=(timestamp if interruption == "replay"
+                                          else None))
+                    chassis.hold(DT)
+                    self.observe(x=6.0, time_ns=(
+                        timestamp if interruption == "replay" else None))
+                    chassis.hold(DT)
+                    self.assertFalse(self.estimate().localized)
+
+    def test_unseen_or_detached_ds_does_not_trust_the_seed(self):
+        for backend in BACKENDS:
+            for driver_station in (False, True):
+                with self.subTest(backend=backend, driver_station=driver_station):
+                    chassis = self.start(
+                        backend, driver_station=driver_station, attached=False)
+                    self.assertTrue(self.estimate().valid)
+                    self.assertFalse(self.estimate().localized)
+                    self.hw.set_driver_station(enabled=True, teleop=True)
+                    chassis.hold(DT)
+                    self.assertFalse(self.estimate().localized)
+                    self.hw.set_driver_station(enabled=False, teleop=True)
+                    chassis.hold(DT)
+                    self.assertFalse(self.estimate().localized)
+
+    def test_disabled_first_ds_can_arrive_after_odometry(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(backend, driver_station=False)
+                self.assertFalse(self.estimate().localized)
+                self.hw.set_driver_station(enabled=False, teleop=True)
+                # A DS packet published on a tick boundary can be polled just
+                # after that update; allow the following update to publish it.
+                chassis.hold(2 * DT)
+                self.assertTrue(self.estimate().localized)
+
+    def test_localization_survives_enable_disable_ds_loss_and_stale_odometry(self):
+        for backend in BACKENDS:
+            for enabled in (False, True):
+                with self.subTest(backend=backend, enabled=enabled):
+                    chassis = self.start(backend, enabled=enabled)
+                    if enabled:
+                        for camera in ("front_camera", "back_camera",
+                                       "front_camera"):
+                            self.observe(camera, x=6.0)
+                            chassis.hold(DT)
+                    self.assertTrue(self.estimate().localized)
+                    for mode in (True, False, True):
+                        self.hw.set_driver_station(enabled=mode, teleop=True)
+                        chassis.hold(DT)
+                        self.assertTrue(self.estimate().localized)
+                    self.hw.stop_driver_station()
+                    self.sim.step(0.2)
+                    self.assertFalse(self.estimate().valid)
+                    self.assertTrue(self.estimate().localized)
+                    chassis.hold(DT)
+                    self.assertTrue(self.estimate().valid)
+                    self.assertTrue(self.estimate().localized)
 
     def test_tag_bounds_and_innovation_gates(self):
         for backend in BACKENDS:
@@ -206,7 +348,7 @@ class EstimatorTest(unittest.TestCase):
                     with self.subTest(backend=backend, tag_count=tag_count,
                                       cameras=cameras):
                         chassis = self.start(
-                            backend, disabled_hardware=True, cameras=cameras)
+                            backend, cameras=cameras)
                         for index in range(3):
                             self.observe(cameras[index % len(cameras)],
                                          x=4.0, yaw=0.6, tag_count=tag_count,
@@ -459,19 +601,23 @@ class EstimatorTest(unittest.TestCase):
             with self.subTest(backend):
                 self.sim = Sim.from_toml(robot_toml(backend))
                 self.sim.add(estimator.PoseEstimator, "pose_estimator")
+                self.hw = SimHardware(self.sim)
+                self.hw.enable(False)
+                self.hw.set_driver_station(enabled=False, teleop=True)
                 self.chassis = Chassis(self.sim)
                 self.sim.step(DT)
                 self.observe(time_ns=round(self.sim.now * 1e9))
                 self.sim.step(DT)
                 e = self.estimate()
                 self.assertFalse(e.valid)
+                self.assertFalse(e.localized)
                 self.assertEqual(self.counts(), (0, 1))
                 self.assertEqual(self.pose(), (0.0, 0.0, 0.0))
 
     def test_estimation_continues_while_the_robot_is_disabled(self):
         for backend in BACKENDS:
             with self.subTest(backend):
-                chassis = self.start(backend, disabled_hardware=True)
+                chassis = self.start(backend)
                 # Gateway disabled, Driver Station disabled: an actuator
                 # would send neutral; the estimator keeps estimating.
                 chassis.drive(0.5, 0.0, 0.0, 1.0)  # pushed by hand
@@ -621,6 +767,7 @@ class BinaryTest(unittest.TestCase):
         self.assertEqual(
             sources[("SENDER", topics.STATE)]["message_bytes"],
             PoseEstimate.SizeOf())
+        self.assertEqual(PoseEstimate.SizeOf(), 72)
         self.assertFalse(
             sources[("WATCHER", drivetrain_topics.STATE)]["optional"])
         for camera in ("/front_camera/state", "/back_camera/state"):
@@ -688,6 +835,8 @@ class BinaryTest(unittest.TestCase):
 
                     estimates = [json.loads(line) for line in estimates1_raw.splitlines() if line.strip()]
                     self.assertGreater(len(estimates), 40)
+                    self.assertTrue(all(
+                        not estimate["localized"] for estimate in estimates))
 
                     # (b) estimated pose changes over the run (non-constant)
                     first_pose = (estimates[0]["pose_x_m"], estimates[0]["pose_y_m"],
@@ -698,20 +847,28 @@ class BinaryTest(unittest.TestCase):
                     self.assertGreater(estimates[-1]["pose_x_m"], 0.5)
                     self.assertGreater(estimates[-1]["pose_yaw_rad"], 0.4)
 
-                    # (c) delayed vision measurement shifts estimate toward observation
-                    before_obs = estimates[16]
-                    after_obs = estimates[17]
+                    # (c) Delayed vision shifts the estimate toward observation.
+                    # The DS listener uses POLL delivery: a publication on an
+                    # update boundary may be observed on the next update.
+                    # Locate the acceptance transition, not a fixed tick index.
+                    accepted_index = next(
+                        (index for index, estimate in enumerate(estimates)
+                         if estimate["observation_accepted_count"] > 0), None)
+                    self.assertIsNotNone(accepted_index)
+                    self.assertGreater(accepted_index, 0)
+                    before_obs = estimates[accepted_index - 1]
+                    after_obs = estimates[accepted_index]
                     self.assertEqual(before_obs["observation_accepted_count"], 0)
                     self.assertEqual(after_obs["observation_accepted_count"], 1)
                     step_forward = after_obs["pose_x_m"] - before_obs["pose_x_m"]
                     self.assertGreater(step_forward, 0.04)
 
                     # (d) stale measurements are rejected; invalid states are skipped
-                    stale_step = estimates[18]
+                    stale_step = estimates[accepted_index + 1]
                     self.assertEqual(stale_step["observation_accepted_count"], 1)
                     self.assertEqual(stale_step["observation_rejected_count"], 1)
 
-                    invalid_step = estimates[19]
+                    invalid_step = estimates[accepted_index + 2]
                     self.assertEqual(invalid_step["observation_accepted_count"], 1)
                     self.assertEqual(invalid_step["observation_rejected_count"], 1)
 

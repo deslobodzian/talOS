@@ -464,6 +464,7 @@ node = "//talOS/telemetry:node"
       ::geometry::Pose2d{3.25, 1.5, 0.75},
       ::geometry::Twist2d{0.0, 0.0, 0.0},
       true,
+      true,
       0,
       0,
   };
@@ -487,6 +488,7 @@ node = "//talOS/telemetry:node"
       ::geometry::Pose2d{3.25, 1.5, 0.75},
       ::geometry::Twist2d{0.0, 0.0, 0.0},
       false,
+      true,
       0,
       0,
   };
@@ -953,11 +955,12 @@ stale_timeout_us = 50000
       ::geometry::Pose2d{2.0, 3.0, 1.0},
       ::geometry::Twist2d{0.0, 0.0, 0.0},
       true,
+      true,
       0,
       0,
   };
   estimator.pose_.send(estimate);
-  sim.step(50ms);
+  sim.step(40ms);
 
   auto frame = LatestFrame(sim, "/talos/telemetry");
   ASSERT_NE(frame, nullptr);

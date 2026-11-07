@@ -61,7 +61,7 @@ class Localizer {
     }
     const bool valid =
         last_accepted_.has_value() && node_.now() - *last_accepted_ <= timeout_;
-    state_.send(State{sample_time_ns_, pose_, geometry::Twist2d{}, valid,
+    state_.send(State{sample_time_ns_, pose_, geometry::Twist2d{}, valid, false,
                       accepted_, rejected_});
   }
 
