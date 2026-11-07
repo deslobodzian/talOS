@@ -3,7 +3,7 @@
 // valid observations, per-reason rejection counts, and position/yaw error RMS
 // before/after (against truth when present).
 //
-//   bazel run //talOS/vision/recording:frame_replay -- \
+//   bazel run //talOS/vision/recording:frame_replay --
 //     --frames <session>/frames/<camera> --layout <field_layout.json>
 
 #include <cstdio>

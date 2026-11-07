@@ -305,7 +305,9 @@ TEST(VisionTest, CatchUpTickPublishesEveryDueObservationInCaptureOrder) {
                     static_cast<std::uint64_t>(i) * 17'000'000u,
                     geometry::Pose2d{2 + i * 0.01, 2, 0}, geometry::Twist2d{}});
     sim.step(30ms);
-    if (i < 3) EXPECT_TRUE(observer.frames.empty());
+    if (i < 3) {
+      EXPECT_TRUE(observer.frames.empty());
+    }
   }
   sim.step(1ms);  // Deliver both publications to the callback observer.
   ASSERT_EQ(observer.frames.size(), 2u);

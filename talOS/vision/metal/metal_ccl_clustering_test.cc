@@ -237,13 +237,13 @@ zarray_t* FastGradientClustersFromCandidates(image_u8_t* threshim, int w, int h,
 }
 #endif
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
 // ARM NEON SIMD Accelerated Edge Scanner:
 // Checks 16 horizontal pixels in parallel using 128-bit vector instructions
 uint32_t NeonSimdScanCandidates(const uint8_t* thresh, int w, int h, int stride,
                                 uint32_t* out_candidates,
                                 uint32_t max_candidates) {
   uint32_t count = 0;
-#if defined(__ARM_NEON) || defined(__aarch64__)
   const uint8x16_t k255 = vdupq_n_u8(255);
   const uint8x16_t k127 = vdupq_n_u8(127);
 
@@ -321,9 +321,9 @@ uint32_t NeonSimdScanCandidates(const uint8_t* thresh, int w, int h, int stride,
       }
     }
   }
-#endif
   return count;
 }
+#endif
 
 // Test Fixture
 class MetalCclClusteringTest : public ::testing::Test {
