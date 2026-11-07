@@ -326,6 +326,12 @@ inline std::vector<Diagnostic> CheckHardwareConfig(
 using TargetSources =
     std::map<std::string, std::vector<std::string>, std::less<>>;
 
+// Per-mode policy sources, kept separate from the union used for lane naming.
+using TargetModeSources =
+    std::map<std::string,
+             std::map<std::string, std::vector<std::string>, std::less<>>,
+             std::less<>>;
+
 // A target lane is `/<sub>/target/<source>`.
 inline bool IsTargetLane(std::string_view topic) {
   const auto segments = detail::Segments(topic);
@@ -339,11 +345,14 @@ inline bool IsTargetLane(std::string_view topic) {
 // malformed name, a lane its subsystem never
 // reads). Warnings are normal during development or in a partial launch (an
 // unread topic, an owner not in this session, a policy lane nobody writes yet).
-// Timers are skipped: their names are labels, not topics. `target_sources`
-// comes from the config; a subsystem missing from it is not lane-checked.
+// Required coverage additionally rejects a target-consuming subsystem with no
+// producer for a nonempty mode policy. Timers are skipped: their names are
+// labels, not topics. A subsystem absent from target_sources is not lane-checked.
 inline std::vector<Diagnostic> LintGraph(
     const std::vector<NodeShape>& nodes,
-    const TargetSources& target_sources = {}) {
+    const TargetSources& target_sources = {},
+    const TargetModeSources& target_mode_sources = {},
+    bool require_target_coverage = false) {
   std::vector<Diagnostic> out;
   const auto add = [&out](Severity severity, std::string subject,
                           std::string message) {
@@ -537,6 +546,41 @@ inline std::vector<Diagnostic> LintGraph(
     if (topic.readers.empty() && !topic.exempt)
       add(Severity::WARNING, topic.name,
           "is published but nothing subscribes to it");
+  }
+
+  if (require_target_coverage) {
+    for (const auto& node : nodes) {
+      const bool consumes_targets =
+          std::any_of(node.sources.begin(), node.sources.end(),
+                      [&node](const SourceShape& source) {
+                        return IsReader(source.kind) && !source.observer() &&
+                               IsTargetLane(source.name) &&
+                               detail::Segments(source.name)[0] == node.name;
+                      });
+      if (!consumes_targets) continue;
+      const auto policy = target_mode_sources.find(node.name);
+      if (policy == target_mode_sources.end()) continue;
+      for (const auto& [mode, sources] : policy->second) {
+        if (sources.empty()) continue;
+        bool has_writer = false;
+        std::vector<std::string> lanes;
+        for (const auto& source : sources) {
+          lanes.push_back("/" + node.name + "/target/" + source);
+          const auto topic = std::find_if(
+              topics.begin(), topics.end(), [&lanes](const TopicFacts& facts) {
+                return facts.name == lanes.back();
+              });
+          has_writer = has_writer ||
+                       (topic != topics.end() && !topic->writers.empty());
+        }
+        if (!has_writer) {
+          add(Severity::ERROR, node.name,
+              "target coverage required for mode '" + mode +
+                  "', but none of its policy lanes has a writer: " +
+                  join(lanes));
+        }
+      }
+    }
   }
 
   std::stable_partition(out.begin(), out.end(), [](const Diagnostic& d) {

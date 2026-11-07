@@ -95,6 +95,9 @@ struct RobotConfig {
   uint16_t controller_port{5802};
   uint16_t local_port{5803};
 
+  // Refuse a described graph with no producer for an actuated subsystem's mode.
+  bool require_target_coverage{false};
+
   // Sim-session viewer. Studio's bridge is a host-side process, not a robot
   // node, so it is not a subsystem; this table carries what the launcher
   // needs to start and supervise it in sim sessions. The watched topic is
@@ -139,6 +142,8 @@ struct RobotConfig {
   }
   // Subsystem teleop bindings, preserving list order.
   std::map<std::string, std::vector<TeleopBinding>> teleop;
+  std::map<std::string, std::vector<std::pair<std::string, TeleopValue>>>
+      teleop_defaults;
 };
 
 namespace detail {
@@ -151,7 +156,7 @@ T Read(const toml::table& tbl, std::string_view key, T def) {
   if (!node) return def;
   const std::string field = "field '" + std::string(key) + "'";
   if constexpr (std::is_same_v<T, bool>) {
-    if (auto v = node.value<bool>()) return *v;
+    if (auto v = node.value_exact<bool>()) return *v;
     throw std::invalid_argument(field + " must be a boolean");
   } else if constexpr (std::is_integral_v<T>) {
     if (auto v = node.value<int64_t>(); v && std::in_range<T>(*v)) {
@@ -441,6 +446,29 @@ inline void ApplyTargetPolicy(const toml::table& tbl, TargetPolicy& policy,
   }
 }
 
+inline std::vector<std::pair<std::string, TeleopValue>> ParseTeleopAssignments(
+    const toml::table& table, const std::string& where) {
+  std::vector<std::pair<std::string, TeleopValue>> assignments;
+  std::vector<std::string> keys;
+  for (auto&& [key, value] : table) keys.emplace_back(key.str());
+  std::sort(keys.begin(), keys.end());
+  for (const auto& key : keys) {
+    const auto& value = table[key];
+    if (value.is_boolean()) {
+      assignments.emplace_back(key, *value.value<bool>());
+    } else if (value.is_integer()) {
+      assignments.emplace_back(key, *value.value<int64_t>());
+    } else if (value.is_floating_point()) {
+      assignments.emplace_back(key, *value.value<double>());
+    } else if (value.is_string()) {
+      assignments.emplace_back(key, *value.value<std::string>());
+    } else {
+      throw std::invalid_argument(where + "." + key + " must be a scalar");
+    }
+  }
+  return assignments;
+}
+
 inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
                                               const std::string& sub_name) {
   std::vector<TeleopBinding> result;
@@ -452,7 +480,7 @@ inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
                                 ".teleop] must be a table");
   }
   for (auto&& [k, v] : *teleop_tbl) {
-    if (k.str() != "bindings") {
+    if (k.str() != "bindings" && k.str() != "defaults") {
       throw std::invalid_argument("[subsystems." + sub_name +
                                   ".teleop] unknown key '" +
                                   std::string(k.str()) + "'");
@@ -563,28 +591,7 @@ inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
         throw std::invalid_argument(entry_where + "." + action +
                                     " must be a non-empty table");
       }
-      std::vector<std::string> wh_keys;
-      for (auto&& [fk, fv] : *wh) wh_keys.emplace_back(fk.str());
-      std::sort(wh_keys.begin(), wh_keys.end());
-      for (const auto& fk : wh_keys) {
-        const auto& fv = (*wh)[fk];
-        if (fv.is_table() || fv.is_array()) {
-          throw std::invalid_argument(entry_where + "." + action + "." + fk +
-                                      " must be a scalar");
-        }
-        if (fv.is_boolean()) {
-          assignments.emplace_back(fk, *fv.value<bool>());
-        } else if (fv.is_integer()) {
-          assignments.emplace_back(fk, *fv.value<int64_t>());
-        } else if (fv.is_floating_point()) {
-          assignments.emplace_back(fk, *fv.value<double>());
-        } else if (fv.is_string()) {
-          assignments.emplace_back(fk, *fv.value<std::string>());
-        } else {
-          throw std::invalid_argument(entry_where + "." + action + "." + fk +
-                                      " must be a scalar");
-        }
-      }
+      assignments = ParseTeleopAssignments(*wh, entry_where + "." + action);
     }
     if (has_axis) {
       if (entry->contains("while_held") || entry->contains("on_toggle")) {
@@ -688,6 +695,8 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
         Read(*robot, "command_timeout_us", hw.command_timeout_us);
     hw.status_hz = Read(*robot, "status_hz", hw.status_hz);
     hw.commissioned = Read(*robot, "commissioned", hw.commissioned);
+    result.require_target_coverage = Read(
+        *robot, "require_target_coverage", result.require_target_coverage);
     result.controller_address = detail::ReadNonEmpty(
         *robot, "controller_address", result.controller_address, "[robot]");
     result.controller_port = detail::ReadPort(
@@ -761,6 +770,16 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     auto bindings = detail::ParseTeleop(*sub_tbl, sub_name);
     if (!bindings.empty()) {
       result.teleop[sub_name] = std::move(bindings);
+    }
+    if (const auto* teleop = (*sub_tbl)["teleop"].as_table();
+        teleop != nullptr && teleop->contains("defaults")) {
+      const auto* defaults = (*teleop)["defaults"].as_table();
+      const std::string where = "[subsystems." + sub_name + "] teleop.defaults";
+      if (defaults == nullptr) {
+        throw std::invalid_argument(where + " must be a table");
+      }
+      result.teleop_defaults[sub_name] =
+          detail::ParseTeleopAssignments(*defaults, where);
     }
     auto each = [&](const char* section, auto parse) {
       auto* devices = (*sub_tbl)[section].as_table();

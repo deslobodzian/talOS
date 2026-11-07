@@ -5,6 +5,7 @@ load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("@rules_python//python:py_info.bzl", "PyInfo")
+load("//tools:sync_manifest.bzl", "manifest_freshness_stamp")
 
 _TalosMessagesInfo = provider(
     doc = "The schema include tree of a talos_messages target.",
@@ -624,7 +625,14 @@ def _talos_bundle_impl(ctx):
     launcher_exec = ctx.executable.launcher
     launcher_runfiles = ctx.attr.launcher[DefaultInfo].default_runfiles.files
 
-    direct_inputs = [launcher_exec, ctx.file.config]
+    manifest_stamp = manifest_freshness_stamp(
+        ctx,
+        ctx.file.config,
+        ctx.file.manifest,
+        ctx.files.config_files,
+        ctx.attr._manifest_sync[DefaultInfo].files_to_run,
+    )
+    direct_inputs = [launcher_exec, ctx.file.config, manifest_stamp]
     direct_inputs.extend(ctx.files.config_files)
     transitive_inputs = [launcher_runfiles]
 
@@ -792,7 +800,7 @@ exec "${{BUNDLE_DIR}}/run.sh" "$@"
         ),
     ]
 
-talos_bundle = rule(
+_talos_bundle = rule(
     implementation = _talos_bundle_impl,
     executable = True,
     attrs = {
@@ -804,6 +812,11 @@ talos_bundle = rule(
             mandatory = True,
             allow_single_file = True,
             doc = "The robot.toml config file",
+        ),
+        "manifest": attr.label(
+            mandatory = True,
+            allow_single_file = [".bzl"],
+            doc = "The generated <stem>_manifest.bzl beside config",
         ),
         "config_files": attr.label_list(
             allow_files = True,
@@ -820,8 +833,28 @@ talos_bundle = rule(
             default = Label("//talOS/build:bundle_builder.py"),
             allow_single_file = True,
         ),
+        "_manifest_sync": attr.label(
+            default = Label("//tools:sync_manifest"),
+            executable = True,
+            cfg = "exec",
+        ),
     },
 )
+
+def talos_bundle(name, config, **kwargs):
+    """Assembles a deployable bundle only after checking manifest freshness.
+
+    Args:
+      name: bundle target name.
+      config: robot TOML label; its generated manifest must live beside it.
+      **kwargs: passed to the bundle rule, including nodes and config_files
+        from the manifest's NODES and CONFIG_FILES.
+    """
+    config_label = native.package_relative_label(config)
+    manifest = config_label.same_package_label(
+        config_label.name.removesuffix(".toml") + "_manifest.bzl",
+    )
+    _talos_bundle(name = name, config = config, manifest = manifest, **kwargs)
 
 def talos_graph_test(
         name,

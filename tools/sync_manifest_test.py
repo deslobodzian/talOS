@@ -1,9 +1,12 @@
 """Unit tests for //tools:sync_manifest."""
 
+import contextlib
+import io
 import os
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 
 from tools import sync_manifest
 
@@ -50,6 +53,16 @@ class SyncManifestTest(unittest.TestCase):
         self.assertIn("bad.toml", message)
         self.assertIn("[subsystems.test].sensors.encoder", message)
         self.assertIn("unknown sensor key 'offest_rot'", message)
+
+    def test_teleop_defaults_use_assignment_scalar_types(self):
+        sync_manifest._check_teleop(
+            {"defaults": {"position_rot": 0.25, "mode": "HOLD",
+                          "enabled": False, "count": 2}}, "arm")
+        for defaults in (3, [], {"position_rot": []},
+                         {"nested": {"position_rot": 0.25}}):
+            with self.subTest(defaults=defaults):
+                with self.assertRaises(sync_manifest.ManifestError):
+                    sync_manifest._check_teleop({"defaults": defaults}, "arm")
 
     def test_pov_toggle_validation(self):
         for angle in range(0, 360, 45):
@@ -123,6 +136,44 @@ class SyncManifestTest(unittest.TestCase):
             '[subsystems.a]\nnode = "//a:node"\n[subsystems.b]\nperiod_us = 1\n')
         self.assertEqual(sync_manifest.resolve(self.root, "bot/flat.toml"),
                          (["//a:node"], []))
+
+    def test_target_coverage_key_accepts_only_booleans(self):
+        for value in ("true", "false"):
+            with self.subTest(value=value):
+                sync_manifest.resolve(
+                    self.root, "coverage.toml",
+                    overrides={"coverage.toml":
+                               f"[robot]\nrequire_target_coverage = {value}\n"
+                               '[subsystems.arm]\nnode = "//bot/arm:node"\n'})
+        for value in ("1", '"true"', "[]"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(sync_manifest.ManifestError,
+                                            "require_target_coverage"):
+                    sync_manifest.resolve(
+                        self.root, "coverage.toml",
+                        overrides={"coverage.toml":
+                                   f"[robot]\nrequire_target_coverage = {value}\n"
+                                   "[subsystems.arm]\n"})
+
+    def test_check_mode_fails_on_a_stale_roster_without_rewriting_it(self):
+        sync_manifest.write(self.root, "bot/robot.toml")
+        manifest = os.path.join(self.root, "bot/robot_manifest.bzl")
+        with open(manifest, encoding="utf-8") as f:
+            original = f.read()
+        with mock.patch.dict(os.environ,
+                             {"BUILD_WORKSPACE_DIRECTORY": self.root}):
+            self.assertEqual(sync_manifest.main(["--check", "bot/robot.toml"]), 0)
+            put(self.root, "bot/subsystems/intake.toml",
+                '[subsystem]\nname = "intake"\nnode = "//bot/py:intake"\n')
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                self.assertEqual(
+                    sync_manifest.main(["--check", "bot/robot.toml"]), 1)
+        self.assertIn("is stale", errors.getvalue())
+        self.assertIn("bazel run //tools:sync_manifest -- bot/robot.toml",
+                      errors.getvalue())
+        with open(manifest, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
 
     def test_check_reports_an_unregenerated_entry_with_the_fix(self):
         self.assertTrue(sync_manifest.write(self.root, "bot/robot.toml"))

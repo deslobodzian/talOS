@@ -40,6 +40,7 @@ py_test(
 py_binary(
     name = "sync_manifest",
     srcs = ["sync_manifest.py"],
+    visibility = ["//talOS/build:__pkg__"],
 )
 
 py_library(

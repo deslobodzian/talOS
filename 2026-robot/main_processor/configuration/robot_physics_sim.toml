@@ -1,4 +1,7 @@
 include = "robot.toml"
 
+[robot]
+require_target_coverage = true
+
 [subsystems.drivetrain]
 integrate_heading = false

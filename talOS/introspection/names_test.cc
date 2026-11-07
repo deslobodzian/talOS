@@ -398,6 +398,97 @@ TEST(LintGraph, PolicyLaneWithNoWriterIsAWarning) {
       << Describe(diagnostics);
 }
 
+TEST(LintGraph, RequiredCoverageChecksEachModeRatherThanTheirUnion) {
+  const std::vector<NodeShape> nodes = {
+      {"drivetrain",
+       "//robot/drivetrain:node",
+       {Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional),
+        Watcher("/drivetrain/target/auto", 32, kSourceFlagOptional)}},
+      {"driver", "//robot/driver:node",
+       {Sender("/drivetrain/target/teleop")}},
+  };
+  const TargetSources sources{{"drivetrain", {"teleop", "auto", "align"}}};
+  const TargetModeSources modes{
+      {"drivetrain",
+       {{"teleop", {"teleop"}}, {"autonomous", {"auto", "align"}}, {"test", {}}}}};
+  const auto diagnostics = LintGraph(nodes, sources, modes, true);
+  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "drivetrain",
+                       "mode 'autonomous'"))
+      << Describe(diagnostics);
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "drivetrain",
+                       "/drivetrain/target/auto, /drivetrain/target/align"))
+      << Describe(diagnostics);
+  EXPECT_EQ(std::count_if(diagnostics.begin(), diagnostics.end(),
+                          [](const Diagnostic& diagnostic) {
+                            return diagnostic.severity == Severity::ERROR;
+                          }),
+            1);
+
+  // Partial development launches retain the per-lane warning.
+  const auto optional = LintGraph(nodes, sources, modes, false);
+  EXPECT_FALSE(HasError(optional)) << Describe(optional);
+  EXPECT_TRUE(Mentions(optional, Severity::WARNING,
+                       "/drivetrain/target/auto", "nothing writes it yet"))
+      << Describe(optional);
+}
+
+TEST(LintGraph, RequiredCoverageAllowsOneWriterPerModeAndOptionalLanes) {
+  const std::vector<NodeShape> nodes = {
+      {"drivetrain",
+       "//robot/drivetrain:node",
+       {Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional),
+        Watcher("/drivetrain/target/auto", 32, kSourceFlagOptional),
+        Watcher("/drivetrain/target/align", 32, kSourceFlagOptional)}},
+      {"driver", "//robot/driver:node",
+       {Sender("/drivetrain/target/teleop")}},
+      {"autonomous", "//robot/autonomous:node",
+       {Sender("/drivetrain/target/auto")}},
+      {"telemetry", "//robot/telemetry:node", {}},
+  };
+  const auto diagnostics = LintGraph(
+      nodes, {{"drivetrain", {"teleop", "auto", "align"}}},
+      {{"drivetrain",
+        {{"teleop", {"teleop"}}, {"autonomous", {"align", "auto"}}, {"test", {}}}},
+       {"telemetry", {{"teleop", {"teleop"}}, {"autonomous", {"auto"}}}}},
+      true);
+  EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
+  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING,
+                       "/drivetrain/target/align", "nothing writes it yet"))
+      << Describe(diagnostics);
+}
+
+TEST(LintGraph, RequiredCoverageDetectsAnEntirelyUndeclaredModeLane) {
+  const std::vector<NodeShape> nodes = {
+      {"drivetrain", "//robot/drivetrain:node",
+       {Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional)}},
+      {"driver", "//robot/driver:node",
+       {Sender("/drivetrain/target/teleop")}},
+  };
+  const auto diagnostics = LintGraph(
+      nodes, {{"drivetrain", {"teleop", "auto"}}},
+      {{"drivetrain", {{"teleop", {"teleop"}}, {"autonomous", {"auto"}}}}},
+      true);
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "drivetrain",
+                       "/drivetrain/target/auto"))
+      << Describe(diagnostics);
+}
+
+TEST(LintGraph, RequiredCoverageChecksOptedInTestMode) {
+  const std::vector<NodeShape> nodes = {
+      {"drivetrain", "//robot/drivetrain:node",
+       {Watcher("/drivetrain/target/pit", 32, kSourceFlagOptional)}},
+  };
+  const auto diagnostics = LintGraph(
+      nodes, {{"drivetrain", {"pit"}}},
+      {{"drivetrain",
+        {{"teleop", {}}, {"autonomous", {}}, {"test", {"pit"}}}}},
+      true);
+  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "drivetrain",
+                       "mode 'test'"))
+      << Describe(diagnostics);
+}
+
 // A reserved namespace is exempt from both directions: the bridge publishes
 // /hw/* on behalf of a controller processor that is not a talOS node at all,
 // so neither "the owner publishes it" nor "the owner consumes it" applies.

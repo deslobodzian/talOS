@@ -158,13 +158,25 @@ def _check_top_level_keys(doc, path):
         if key not in _TOP_LEVEL_KEYS:
             raise ManifestError(f"{path}: unknown top-level key '{key}'")
 
+def _check_teleop_assignments(values, where, *, non_empty=False):
+    if not isinstance(values, dict) or (non_empty and not values):
+        requirement = "a non-empty table" if non_empty else "a table"
+        raise ManifestError(f"{where} must be {requirement}")
+    for key, value in values.items():
+        if type(value) not in (bool, int, float, str):
+            raise ManifestError(f"{where}.{key} must be a scalar")
+
+
 def _check_teleop(teleop, sub_name):
     if not isinstance(teleop, dict):
         raise ManifestError(f"[subsystems.{sub_name}.teleop] must be a table")
     for key in teleop:
-        if key != "bindings":
+        if key not in ("bindings", "defaults"):
             raise ManifestError(
                 f"[subsystems.{sub_name}.teleop] unknown key '{key}'")
+    if "defaults" in teleop:
+        _check_teleop_assignments(
+            teleop["defaults"], f"[subsystems.{sub_name}] teleop.defaults")
     if "bindings" in teleop:
         bindings = teleop["bindings"]
         if not isinstance(bindings, list):
@@ -214,14 +226,8 @@ def _check_teleop(teleop, sub_name):
                     raise ManifestError(
                         f"{entry_where} requires exactly one of while_held/on_toggle")
                 action = actions[0]
-                values = entry[action]
-                if not isinstance(values, dict) or not values:
-                    raise ManifestError(
-                        f"{entry_where}.{action} must be a non-empty table")
-                for fk, fv in values.items():
-                    if type(fv) not in (bool, int, float, str):
-                        raise ManifestError(
-                            f"{entry_where}.{action}.{fk} must be a scalar")
+                _check_teleop_assignments(
+                    entry[action], f"{entry_where}.{action}", non_empty=True)
             if has_axis:
                 if "while_held" in entry or "on_toggle" in entry:
                     raise ManifestError(
@@ -418,6 +424,11 @@ def effective(root, config, overrides=None, available=None):
         doc = base
     if "robot" in doc and not isinstance(doc["robot"], dict):
         raise ManifestError(f"{config}: [robot] must be a table")
+    robot = doc.get("robot", {})
+    if ("require_target_coverage" in robot and
+            not isinstance(robot["require_target_coverage"], bool)):
+        raise ManifestError(
+            "[robot] field 'require_target_coverage' must be a boolean")
     if "studio" in doc:
         _check_studio(doc["studio"], config)
     if isinstance(doc.get("subsystems"), list):

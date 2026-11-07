@@ -267,6 +267,16 @@ local_port = 5805
   ExpectRejected("[robot]\ncontroller_address = \"\"\n");
 }
 
+TEST(ConfigTest, TargetCoverageIsOptInAndRequiresABoolean) {
+  EXPECT_FALSE(Parse("").require_target_coverage);
+  EXPECT_TRUE(Parse("[robot]\nrequire_target_coverage = true\n")
+                  .require_target_coverage);
+  EXPECT_FALSE(Parse("[robot]\nrequire_target_coverage = false\n")
+                   .require_target_coverage);
+  ExpectRejected("[robot]\nrequire_target_coverage = 1\n");
+  ExpectRejected("[robot]\nrequire_target_coverage = \"true\"\n");
+}
+
 TEST(ConfigTest, StudioTable) {
   const auto defaults = Parse("");
   EXPECT_EQ(defaults.studio.bridge, "//studio/bridge:studio_bridge");
@@ -672,6 +682,23 @@ defaults = "subsystems/mech_defaults.toml"
   EXPECT_EQ((*mech_tbl)["period_us"].value_or(0), 20000);
   EXPECT_DOUBLE_EQ((*mech_tbl)["feed_volts"].value_or(0.0), 8.0);
   EXPECT_DOUBLE_EQ((*mech_tbl)["hold_volts"].value_or(0.0), 1.5);
+}
+
+TEST(ConfigTest, ParsesTeleopDefaultsWithAssignmentScalarTypes) {
+  const auto cfg = Parse(
+      "[subsystems.test.teleop]\n"
+      "defaults = { position_rot = 0.25, mode = 'HOLD', enabled = false, count = 2 }\n");
+  const auto& defaults = cfg.teleop_defaults.at("test");
+  ASSERT_EQ(defaults.size(), 4u);
+  EXPECT_EQ(defaults[0].first, "count");
+  EXPECT_EQ(std::get<int64_t>(defaults[0].second), 2);
+  EXPECT_FALSE(std::get<bool>(defaults[1].second));
+  EXPECT_EQ(std::get<std::string>(defaults[2].second), "HOLD");
+  EXPECT_DOUBLE_EQ(std::get<double>(defaults[3].second), 0.25);
+  for (const std::string value :
+       {"3", "[]", "{ position_rot = [] }", "{ nested = { value = 1 } }"}) {
+    ExpectRejected("[subsystems.test.teleop]\ndefaults = " + value);
+  }
 }
 
 TEST(ConfigTest, ParsesPovAndToggleBindings) {
