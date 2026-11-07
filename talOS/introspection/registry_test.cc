@@ -192,6 +192,58 @@ TEST_F(Registry, SelectionsBeyondTheSlotAreCountedAndARecycledSlotHasNone) {
   EXPECT_EQ(nodes.front().declared_selection_count, 0u);
 }
 
+TEST_F(Registry, ReclaimedSlotRejectsUpdatesFromItsPreviousOwner) {
+  auto old = std::make_unique<NodeRegistration>(
+      NodeRegistration::Identity{.name = "old"}, path_);
+  old->publish(sample_manifest());
+  old->publish_selections(std::vector<Policy>{{{"teleop", "auto"}}});
+  RegistryMapping mapping{path_};
+  NodeRecord& slot = mapping.header()->nodes[old->slot()];
+  const auto timeout =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
+          .count();
+  slot.heartbeat_wall_ns.store(wall_now_ns() - timeout - 1,
+                                std::memory_order_relaxed);
+
+  NodeRegistration next{{.name = "new"}, path_};
+  ASSERT_EQ(next.slot(), old->slot());
+  next.publish(sample_manifest());
+  next.publish_selections(std::vector<Policy>{{{"teleop", "auto"}}});
+  next.set_dispatch_count(42);
+  next.set_source(0, 1, 2, 3, 4, 5, 6);
+  next.set_selected(0, 1);
+  const auto heartbeat = slot.heartbeat_wall_ns.load(std::memory_order_relaxed);
+  const auto sequence = slot.sample_seq.load(std::memory_order_relaxed);
+
+  old->begin_sample();
+  EXPECT_EQ(slot.sample_seq.load(std::memory_order_relaxed), sequence);
+  old->heartbeat();
+  old->set_dispatch_count(999);
+  old->set_source(0, 999, 999, 999, 999, 999, 999);
+  old->set_selected(0, 0);
+  old->end_sample();
+  old.reset();  // Destruction must not free the reclaimed slot either.
+
+  EXPECT_EQ(slot.sample_seq.load(std::memory_order_relaxed), sequence);
+  EXPECT_EQ(slot.heartbeat_wall_ns.load(std::memory_order_relaxed), heartbeat);
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto nodes = reader->nodes();
+  ASSERT_EQ(nodes.size(), 1u);
+  EXPECT_EQ(nodes.front().name, "new");
+  EXPECT_EQ(nodes.front().dispatch_count, 42u);
+  ASSERT_EQ(nodes.front().sources.size(), 3u);
+  const auto& source = nodes.front().sources.front();
+  EXPECT_EQ(source.events, 1u);
+  EXPECT_EQ(source.dropped, 2u);
+  EXPECT_EQ(source.sequence, 3u);
+  EXPECT_EQ(source.last_monotonic_ns, 4);
+  EXPECT_EQ(source.last_latency_ns, 5);
+  EXPECT_EQ(source.max_latency_ns, 6);
+  ASSERT_EQ(nodes.front().selections.size(), 1u);
+  EXPECT_EQ(nodes.front().selections.front().selected, 1);
+}
+
 TEST_F(Registry, SeveralNodesCoexistAndAReleasedSlotDisappears) {
   auto reader = [this] {
     NodeRegistration first{{.name = "a"}, path_};

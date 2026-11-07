@@ -430,6 +430,7 @@ class NodeRegistration {
           " nodes are already registered");
     }
     generation_ = record_->generation.load(std::memory_order_acquire);
+    pid_ = record_->pid;
   }
 
   ~NodeRegistration() { release(); }
@@ -482,6 +483,7 @@ class NodeRegistration {
   // and naming it here would make this header reach for reporter.h.
   template <typename Selections>
   void publish_selections(const Selections& selections) {
+    if (!owns_slot()) return;
     std::uint32_t total = 0;
     for (const auto& selection : selections) {
       if (total < kMaxSelectionsPerNode) {
@@ -518,20 +520,24 @@ class NodeRegistration {
   // overlap; the reporting thread is the only writer, so plain bracketing is
   // enough, with no RAII and no nesting.
   void begin_sample() {
+    if (!owns_slot()) return;
     record_->sample_seq.fetch_add(1, std::memory_order_relaxed);
   }
 
   void end_sample() {
+    if (!owns_slot()) return;
     // Release: every counter store above must be visible to a reader that
     // observes the closing even sequence.
     record_->sample_seq.fetch_add(1, std::memory_order_release);
   }
 
   void heartbeat() {
+    if (!owns_slot()) return;
     record_->heartbeat_wall_ns.store(wall_now_ns(), std::memory_order_relaxed);
   }
 
   void set_dispatch_count(std::uint64_t count) {
+    if (!owns_slot()) return;
     record_->dispatch_count.store(count, std::memory_order_relaxed);
   }
 
@@ -541,6 +547,7 @@ class NodeRegistration {
                   std::uint64_t dropped, std::uint64_t sequence,
                   std::int64_t last_monotonic_ns, std::int64_t last_latency_ns,
                   std::int64_t max_latency_ns) {
+    if (!owns_slot()) return;
     if (index >= record_->source_count.load(std::memory_order_relaxed)) {
       return;
     }
@@ -557,6 +564,7 @@ class NodeRegistration {
   // Which lane Target `index` selected last: an index into its sources, or
   // -1 for none. Called from the reporting thread inside a sample.
   void set_selected(std::uint32_t index, std::int32_t selected) {
+    if (!owns_slot()) return;
     if (index >= record_->selection_count.load(std::memory_order_relaxed)) {
       return;
     }
@@ -570,8 +578,17 @@ class NodeRegistration {
   }
 
  private:
+  bool owns_slot() const noexcept {
+    return record_ != nullptr &&
+           record_->generation.load(std::memory_order_relaxed) == generation_ &&
+           record_->state.load(std::memory_order_relaxed) ==
+               static_cast<std::uint64_t>(SlotState::ACTIVE) &&
+           record_->pid == pid_;
+  }
+
   template <typename FlagsFor>
   void write_sources(const event::Manifest& manifest, FlagsFor flags_for) {
+    if (!owns_slot()) return;
     check_names(manifest);
 
     const std::uint32_t total = static_cast<std::uint32_t>(manifest.size());
@@ -644,7 +661,7 @@ class NodeRegistration {
       // Only free what is still ours: the slot may have been swept and
       // reclaimed after this owner went quiet (see sweep_stale), and freeing
       // it then would yank the new owner's row out from under it.
-      if (record_->generation.load(std::memory_order_acquire) == generation_) {
+      if (owns_slot()) {
         record_->source_count.store(0, std::memory_order_relaxed);
         record_->selection_count.store(0, std::memory_order_relaxed);
         record_->state.store(static_cast<std::uint64_t>(SlotState::FREE),
@@ -764,6 +781,7 @@ class NodeRegistration {
   // Generation of record_ when claimed. Guards release() against freeing a
   // slot that was swept and reclaimed after this owner went quiet.
   std::uint64_t generation_{0};
+  std::uint64_t pid_{0};
   bool names_checked_{false};
 };
 
@@ -873,14 +891,16 @@ class RegistryReader {
       for (int attempt = 0; attempt < 2; ++attempt) {
         const std::uint64_t generation =
             record.generation.load(std::memory_order_acquire);
-        NodeSnapshot node = copy_stable(record, i);
-        if (record.generation.load(std::memory_order_acquire) != generation &&
-            attempt == 0) {
+        auto node = copy_stable(record, i);
+        if (!node ||
+            record.state.load(std::memory_order_acquire) !=
+                static_cast<std::uint64_t>(SlotState::ACTIVE) ||
+            record.generation.load(std::memory_order_acquire) != generation) {
           continue;
         }
-        node.generation = generation;
-        node.alive = now - node.heartbeat_wall_ns < timeout;
-        out.push_back(std::move(node));
+        node->generation = generation;
+        node->alive = now - node->heartbeat_wall_ns < timeout;
+        out.push_back(std::move(*node));
         break;
       }
     }
@@ -894,19 +914,26 @@ class RegistryReader {
   // refresh that never quiesces -- degrades to one plain copy instead of a
   // wedged viewer. That fallback is exactly what a reader without the guard
   // takes every time, so it is no worse than the status quo ante.
-  static NodeSnapshot copy_stable(const NodeRecord& record, std::size_t slot) {
-    for (int attempt = 0; attempt < 3; ++attempt) {
+  static std::optional<NodeSnapshot> copy_stable(const NodeRecord& record,
+                                               std::size_t slot) {
+    const auto generation = record.generation.load(std::memory_order_acquire);
+    for (int attempt = 0; attempt < 4; ++attempt) {
       const std::uint32_t before =
           record.sample_seq.load(std::memory_order_acquire);
-      if ((before & 1u) != 0u) {
-        continue;
-      }
+      // Retain the bounded plain-copy fallback for a stalled sample writer.
+      if ((before & 1u) != 0u && attempt < 3) continue;
       NodeSnapshot node = copy(record, slot);
-      if (record.sample_seq.load(std::memory_order_acquire) == before) {
+      if (record.state.load(std::memory_order_acquire) !=
+              static_cast<std::uint64_t>(SlotState::ACTIVE) ||
+          record.generation.load(std::memory_order_acquire) != generation) {
+        return std::nullopt;
+      }
+      if (attempt == 3 ||
+          record.sample_seq.load(std::memory_order_acquire) == before) {
         return node;
       }
     }
-    return copy(record, slot);
+    return std::nullopt;
   }
 
   static NodeSnapshot copy(const NodeRecord& record, std::size_t slot) {
