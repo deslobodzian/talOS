@@ -82,13 +82,16 @@ class Superstructure {
           sm_.go(State::RAISING);
         break;
       case State::RAISING:
-        if (elevator_at(high_rot_))
-          sm_.go(State::SCORING);
-        else if (command == SuperstructureCommand::STOW)
+        if (command == SuperstructureCommand::STOW)
           sm_.go(State::HOLDING);
+        else if (elevator_at(high_rot_))
+          sm_.go(State::SCORING);
         break;
       case State::SCORING:
-        if (!has_piece) sm_.go(State::STOWED);
+        if (command == SuperstructureCommand::STOW)
+          sm_.go(State::HOLDING);
+        else if (!has_piece)
+          sm_.go(State::STOWED);
         break;
     }
   }

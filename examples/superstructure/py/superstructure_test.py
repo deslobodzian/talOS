@@ -255,6 +255,40 @@ class SuperstructureAloneTest(unittest.TestCase):
         return self.sim.latest_target(ElevatorGoal, "elevator",
                                       "superstructure").height_rot
 
+    def test_stow_wins_when_raising_arrives_at_scoring_height(self):
+        self.tick(Command.INTAKE, HOLDING, DOWN)
+        self.tick(Command.SCORE_HIGH, HOLDING, DOWN)
+        self.assertEqual(self.state(), SuperstructureState.RAISING)
+        self.tick(Command.STOW, HOLDING, UP)
+        self.assertEqual(self.state(), SuperstructureState.HOLDING)
+        self.assertEqual(self.elevator_goal_rot(), 0.0)
+        self.assertEqual(
+            self.sim.latest_target(IntakeGoal, "intake",
+                                   "superstructure").command,
+            IntakeCommand.IDLE)
+
+    def test_scoring_stows_on_command_or_target_release(self):
+        for release in (False, True):
+            with self.subTest(release=release):
+                self.tick(Command.INTAKE, HOLDING, DOWN)
+                self.tick(Command.SCORE_HIGH, HOLDING, DOWN)
+                self.tick(Command.SCORE_HIGH, HOLDING, UP)
+                self.assertEqual(self.state(), SuperstructureState.SCORING)
+                if release:
+                    self.sim.release_target(SuperstructureGoal,
+                                            "superstructure", "teleop")
+                    self.sim.publish(IntakeStatus, "/intake/state", **HOLDING)
+                    self.sim.publish(ElevatorStatus, "/elevator/state", **UP)
+                    self.sim.step(0.02)
+                else:
+                    self.tick(Command.STOW, HOLDING, UP)
+                self.assertEqual(self.state(), SuperstructureState.HOLDING)
+                self.assertEqual(self.elevator_goal_rot(), 0.0)
+                self.assertEqual(
+                    self.sim.latest_target(IntakeGoal, "intake",
+                                           "superstructure").command,
+                    IntakeCommand.IDLE)
+
     def test_stale_status_holds_the_state_and_does_not_advance(self):
         self.tick(Command.INTAKE, HOLDING, DOWN, times=5)
         self.assertEqual(self.state(), SuperstructureState.HOLDING)

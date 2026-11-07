@@ -286,6 +286,42 @@ class SuperstructureAlone : public ::testing::Test {
   SimHardware hw{sim};
 };
 
+TEST_F(SuperstructureAlone, StowWinsWhenRaisingArrivesAtScoringHeight) {
+  Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+  ASSERT_EQ(State(), SuperstructureState::RAISING);
+  Tick(SuperstructureCommand::STOW, kHolding, kUp);
+  EXPECT_EQ(State(), SuperstructureState::HOLDING);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+  const auto intake =
+      LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+  ASSERT_TRUE(intake.has_value());
+  EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+}
+
+TEST_F(SuperstructureAlone, ScoringStowsOnExplicitCommandOrTargetRelease) {
+  for (bool release : {false, true}) {
+    Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
+    ASSERT_EQ(State(), SuperstructureState::SCORING);
+    if (release) {
+      ReleaseTarget<SuperstructureGoal>(sim, "superstructure", "teleop");
+      sim.publish(topics::kIntakeStatus, kHolding);
+      sim.publish(topics::kElevatorStatus, kUp);
+      sim.step(20ms);
+    } else {
+      Tick(SuperstructureCommand::STOW, kHolding, kUp);
+    }
+    EXPECT_EQ(State(), SuperstructureState::HOLDING);
+    EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+    const auto intake =
+        LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+    ASSERT_TRUE(intake.has_value());
+    EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+  }
+}
+
 TEST_F(SuperstructureAlone, StaleStatusHoldsTheStateAndDoesNotAdvance) {
   for (int i = 0; i < 5; ++i) {
     Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
