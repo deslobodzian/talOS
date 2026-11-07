@@ -11,7 +11,12 @@ namespace studio {
 namespace {
 
 // Builds one size-prefixed v2 frame the way the producer does.
-std::string FrameBytes(bool with_dictionary, double velocity, double inhibit) {
+std::string FrameBytes(bool with_dictionary, double velocity, double inhibit,
+                       int value_count = 3,
+                       std::uint64_t stream_id = 9007199254740993ull,
+                       std::uint32_t dictionary_id = 4242,
+                       bool missing_chassis = false, double yaw = 0.5,
+                       const char* third_name = "pose/valid") {
   flatbuffers::FlatBufferBuilder builder;
   flatbuffers::Offset<
       flatbuffers::Vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>>>
@@ -27,16 +32,22 @@ std::string FrameBytes(bool with_dictionary, double velocity, double inhibit) {
     auto second = Talos::Telemetry::CreateChannelInfo(
         builder, builder.CreateString("intake/inhibit"), 0, labels);
     auto third = Talos::Telemetry::CreateChannelInfo(
-        builder, builder.CreateString("pose/valid"), 0, 0);
+        builder, builder.CreateString(third_name), 0, 0);
     dictionary = builder.CreateVector(std::vector{first, second, third});
   }
-  auto values =
-      builder.CreateVector(std::vector<double>{velocity, inhibit, 1.0});
-  Talos::Telemetry::Pose chassis{1.5, 2.5, 0, 0, 0, 0.5};
+  flatbuffers::Offset<flatbuffers::Vector<double>> values = 0;
+  if (value_count >= 0) {
+    std::vector<double> samples{velocity, inhibit, 1.0};
+    samples.resize(static_cast<std::size_t>(value_count));
+    values = builder.CreateVector(samples);
+  }
+  Talos::Telemetry::Pose chassis{1.5, 2.5, 0, 0, 0, yaw};
   Talos::Telemetry::FinishSizePrefixedFrameBuffer(
       builder,
-      Talos::Telemetry::CreateFrame(builder, 9007199254740993ull, 7, 123456789,
-                                    4242, &chassis, values, dictionary));
+      Talos::Telemetry::CreateFrame(builder, stream_id, 7, 123456789,
+                                    dictionary_id,
+                                    missing_chassis ? nullptr : &chassis,
+                                    values, dictionary));
   return {reinterpret_cast<const char*>(builder.GetBufferPointer()),
           builder.GetSize()};
 }
@@ -95,6 +106,72 @@ TEST(TelemetryJson, ValueFrameWithoutDictionaryIsNotUsable) {
   ASSERT_TRUE(IngestTelemetry(state, FrameBytes(false, 2.0, 0.0), 5));
   EXPECT_TRUE(state.has_frame);
   EXPECT_EQ(state.values[0], 2.0);
+}
+
+TEST(TelemetryJson, RejectsMismatchedDictionaryValuesAtomically) {
+  TelemetryState state;
+  const std::string original = FrameBytes(true, 0.75, 1.0);
+  ASSERT_TRUE(IngestTelemetry(state, original, 10));
+  const std::string before = TelemetryJson(state, 10);
+  EXPECT_FALSE(
+      IngestTelemetry(state, FrameBytes(true, 9.0, 0.0, 2, 55, 99), 20));
+  EXPECT_TRUE(state.has_dictionary);
+  EXPECT_TRUE(state.has_frame);
+  EXPECT_EQ(state.dictionary_frame, original);
+  EXPECT_EQ(TelemetryJson(state, 10), before);
+}
+
+TEST(TelemetryJson, RejectsInvalidCandidatesWithoutChangingCachedState) {
+  const double infinity = std::numeric_limits<double>::infinity();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const std::vector<std::string> invalid{
+      FrameBytes(true, 1.0, 0.0, 3, 55, 99, true),
+      FrameBytes(true, 1.0, 0.0, 3, 55, 99, false, nan),
+      FrameBytes(true, 1.0, 0.0, 3, 55, 99, false, infinity),
+      FrameBytes(true, infinity, 0.0, 3, 55, 99),
+      FrameBytes(true, -infinity, 0.0, 3, 55, 99),
+      FrameBytes(true, 1.0, 0.0, 3, 55, 99, false, 0.5, "drive/velocity"),
+      FrameBytes(true, 1.0, 0.0, 3, 55, 99, false, 0.5, "derived/spoof"),
+      FrameBytes(false, 1.0, 0.0, 3, 9007199254740993ull, 4242, true),
+      FrameBytes(false, infinity, 0.0)};
+  for (const auto& bytes : invalid) {
+    TelemetryState state;
+    const std::string original = FrameBytes(true, 0.75, 1.0);
+    ASSERT_TRUE(IngestTelemetry(state, original, 10));
+    const std::string before = TelemetryJson(state, 10);
+    EXPECT_FALSE(IngestTelemetry(state, bytes, 20));
+    EXPECT_EQ(state.dictionary_frame, original);
+    EXPECT_EQ(TelemetryJson(state, 10), before);
+    ASSERT_TRUE(IngestTelemetry(state, FrameBytes(false, 2.0, 0.0), 30));
+    EXPECT_EQ(state.values[0], 2.0);
+  }
+}
+
+TEST(TelemetryJson, DictionaryWithoutValuesInvalidatesThePreviousFrame) {
+  // Both a repeat of the current dictionary and a replacement must stop
+  // exposing the old values until a matching value frame arrives.
+  for (const bool changed_stream : {false, true}) {
+    for (const bool changed_dictionary : {false, true}) {
+      TelemetryState state;
+      ASSERT_TRUE(IngestTelemetry(state, FrameBytes(true, 0.75, 1.0), 10));
+      const std::uint64_t stream_id =
+          changed_stream ? 55 : 9007199254740993ull;
+      const std::uint32_t dictionary_id = changed_dictionary ? 99 : 4242;
+      ASSERT_TRUE(IngestTelemetry(
+          state, FrameBytes(true, 0.0, 0.0, -1, stream_id, dictionary_id), 20));
+      EXPECT_TRUE(state.has_dictionary);
+      EXPECT_FALSE(state.has_frame);
+      EXPECT_TRUE(state.values.empty());
+      EXPECT_EQ(state.stream_id, stream_id);
+      EXPECT_EQ(state.dictionary_id, dictionary_id);
+      ASSERT_TRUE(IngestTelemetry(
+          state, FrameBytes(false, 2.0, 0.0, 3, stream_id, dictionary_id), 30));
+      EXPECT_TRUE(state.has_frame);
+      ASSERT_EQ(state.values.size(), 3);
+      EXPECT_EQ(state.values[0], 2.0);
+      EXPECT_EQ(state.received_wall_ns, 30);
+    }
+  }
 }
 
 TEST(ChannelsJson, DescribesTheDictionaryOnItsOwn) {

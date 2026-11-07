@@ -42,12 +42,12 @@ test('bitHistory reports the last set edge and current state per bit', () => {
   const b0 = bits[0];
   assert.equal(b0.bit, 0);
   assert.equal(b0.set, true);
-  assert.equal(b0.setCount, 1);   // one 0→1 edge, at the last sample
+  assert.equal(b0.setCount, 2);   // initial active state, then one 0→1 edge
   assert.equal(b0.lastSetAt, 2);
 
   const b1 = bits[1];
   assert.equal(b1.set, true);
-  assert.equal(b1.setCount, 0);   // set at the first sample, never rose
+  assert.equal(b1.setCount, 1);   // initial active state, never rose
   assert.equal(b1.lastSetAt, null);
 });
 
@@ -55,7 +55,7 @@ test('bitHistory leaves an already-set bit without an in-view edge', () => {
   // Bit 2 is 1 from the first sample: set, no rising edge in view.
   const bits = bitHistory([0, 1], [4, 4], 4);
   assert.equal(bits[2].set, true);
-  assert.equal(bits[2].setCount, 0);
+  assert.equal(bits[2].setCount, 1);
   assert.equal(bits[2].lastSetAt, null);
   // Bit 3 never set.
   assert.equal(bits[3].set, false);

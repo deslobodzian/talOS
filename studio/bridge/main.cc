@@ -38,7 +38,7 @@ struct Bridge {
   std::string topic;
   std::set<Socket*> clients;
   us_listen_socket_t* listener = nullptr;
-  std::uint64_t invalid = 0, ws_drops = 0, forwarded = 0;
+  std::uint64_t invalid = 0, ws_drops = 0, telemetry_ws_drops = 0, forwarded = 0;
 
   // The decoded v2 feed: latest dictionary and latest aligned frame,
   // backing /telemetry.json, /channels.json and the dictionary a newly
@@ -113,7 +113,7 @@ struct Bridge {
     source.message_bytes =
         static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes);
     source.events = forwarded;
-    source.dropped = ws_drops;
+    source.dropped = telemetry_ws_drops;
     source.sequence = queue.writer_sequence();
     node.sources.push_back(std::move(source));
     return node;
@@ -133,7 +133,6 @@ struct Bridge {
               ++invalid;
               return;
             }
-            ++forwarded;
             // Forward only frames a client can decode: one aligned with
             // the cached dictionary (a dictionary frame aligns with
             // itself). A value frame that arrives before any dictionary
@@ -148,13 +147,16 @@ struct Bridge {
                 decoded->values() != nullptr &&
                 decoded->values()->size() == telemetry_state.dictionary.size();
             if (!aligned) return;
+            ++forwarded;
             for (auto* client : clients) {
               if (client->getBufferedAmount() > 256 * 1024) {
                 ++ws_drops;
+                ++telemetry_ws_drops;
                 continue;
               }
               if (client->send(bytes, uWS::OpCode::BINARY) == Socket::DROPPED) {
                 ++ws_drops;
+                ++telemetry_ws_drops;
               }
             }
           })) {

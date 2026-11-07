@@ -162,3 +162,17 @@ test('the plot renders its window presets for a populated studio', () => {
   for (const label of ['10 s', '30 s', '2 min', 'All history', 'Events'])
     assert.ok(html.includes(label), `missing ${label}`);
 });
+
+test('the plot window selector retains custom configured durations', () => {
+  for (const windowSeconds of [5, 45, 2.5]) {
+    const html = renderToStaticMarkup(
+        <StudioProvider studio={populatedStudio()}>
+          <plotPanel.component
+              config={{channels: [], windowSeconds, events: true}}
+              setConfig={() => {}} instanceId="test"/>
+        </StudioProvider>);
+    assert.ok(html.includes(
+        `<option value="${windowSeconds}" selected="">${windowSeconds} s</option>`),
+        html);
+  }
+});

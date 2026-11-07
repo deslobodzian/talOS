@@ -18,6 +18,9 @@ import {demoPacket} from '../src/demo';
 import {ChannelInfo} from '../src/generated/talos/telemetry/channel-info';
 import {Frame} from '../src/generated/talos/telemetry/frame';
 import {Pose} from '../src/generated/talos/telemetry/pose';
+import {createFrameDetectors, SYSTEM_DETECTORS} from '../src/data/detectors';
+import {demoDeclaredGraph, demoSystemGraph} from '../src/demo';
+import {declaredStatus, parseDeclaredGraph, parseSystemGraph} from '../src/system';
 
 // Prime the shared decoder with the dictionary frame, as a bridge does on
 // connect, so bare value frames below can be named.
@@ -29,7 +32,8 @@ const frame = (i: number) => decode(demoPacket(BigInt(i)))!;
 // and chassis headings for decoder-level derived-channel tests.
 function valueFrame(sequence: bigint, dictionaryId: number,
                     values: number[], streamId = 42n,
-                    options: {dictionary?: string[]; yaw?: number} = {}): Uint8Array {
+                    options: {dictionary?: string[]; yaw?: number;
+                              missingChassis?: boolean} = {}): Uint8Array {
   const b = new Builder(256);
   const dictionary = options.dictionary ?
       Frame.createDictionaryVector(b, options.dictionary.map(name => {
@@ -47,8 +51,9 @@ function valueFrame(sequence: bigint, dictionaryId: number,
   Frame.addDictionaryId(b, dictionaryId);
   Frame.addValues(b, vector);
   if (dictionary !== undefined) Frame.addDictionary(b, dictionary);
-  Frame.addChassis(
-      b, Pose.createPose(b, 1, 2, 0, 0, 0, options.yaw ?? 0));
+  if (!options.missingChassis)
+    Frame.addChassis(
+        b, Pose.createPose(b, 1, 2, 0, 0, 0, options.yaw ?? 0));
   Frame.finishSizePrefixedFrameBuffer(b, Frame.endFrame(b));
   return b.asUint8Array();
 }
@@ -87,6 +92,23 @@ test('a value frame with an unknown dictionary is held, not fatal', () => {
   assert.equal(unblocked[1].sequence_id, '5');
   assert.equal(unblocked[1].channels.velocity, 3);
 });
+test('held frames and their dictionary frame resolve in sequence order', () => {
+  const decoder = new TelemetryDecoder();
+  const later = valueFrame(9007199254740993n, 9, [2]);
+  const earlier = valueFrame(9007199254740992n, 9, [1]);
+  assert.deepEqual(decoder.decodeFrames(later), []);
+  assert.deepEqual(decoder.decodeFrames(earlier), []);
+  const dictionary = valueFrame(9007199254740994n, 9, [3], 42n,
+                                {dictionary: ['velocity']});
+  const recovered = decoder.decodeFrames(dictionary);
+  assert.deepEqual(recovered.map(({frame}) => frame.sequence_id),
+                   ['9007199254740992', '9007199254740993', '9007199254740994']);
+  assert.deepEqual(recovered.map(({raw}) => raw), [earlier, later, dictionary]);
+  assert.equal(decoder.heldCount, 0);
+  const timeline = new Timeline();
+  for (const {frame} of recovered) assert.equal(timeline.append(frame), true);
+});
+
 test('NaN samples are omitted and oversize frames are refused', () => {
   const decoder = new TelemetryDecoder();
   decoder.decode(demoPacket(0n));
@@ -101,6 +123,52 @@ test('a new stream invalidates the old dictionary', () => {
   const decoder = new TelemetryDecoder();
   decoder.decode(demoPacket(0n));
   assert.equal(decoder.decode(valueFrame(0n, 1, [1], 77n)), null);
+});
+
+test('explicitly empty dictionaries replace cached dictionaries', () => {
+  const decoder = new TelemetryDecoder();
+  decoder.decode(valueFrame(0n, 9, [1], 42n, {dictionary: ['old']}));
+  assert.deepEqual(Object.keys(decoder.decode(
+      valueFrame(1n, 9, [], 42n, {dictionary: []}))!.channels), []);
+  assert.throws(() => decoder.decode(valueFrame(2n, 9, [1])));
+});
+
+test('invalid candidates cannot replace dictionaries, streams or held frames', () => {
+  const invalid = [
+    valueFrame(2n, 9, [1, 2], 77n, {dictionary: ['duplicate', 'duplicate']}),
+    valueFrame(2n, 9, [1], 77n, {dictionary: ['derived/spoof']}),
+    valueFrame(2n, 9, [1, 2], 77n, {dictionary: ['new']}),
+    valueFrame(2n, 9, [Infinity], 77n, {dictionary: ['new']}),
+    valueFrame(2n, 9, [-Infinity], 77n, {dictionary: ['new']}),
+    valueFrame(2n, 9, [1], 77n, {dictionary: ['new'], yaw: NaN}),
+    valueFrame(2n, 9, [1], 77n, {dictionary: ['new'], missingChassis: true})
+  ];
+  for (const bytes of invalid) {
+    const decoder = new TelemetryDecoder();
+    decoder.decode(valueFrame(0n, 1, [1], 42n, {dictionary: ['old']}));
+    decoder.decode(valueFrame(1n, 9, [3]));
+    assert.throws(() => decoder.decode(bytes));
+    assert.equal(decoder.heldCount, 1);
+    assert.equal(decoder.decode(valueFrame(3n, 1, [2]))!.channels.old, 2);
+    const recovered = decoder.decodeAll(
+        valueFrame(4n, 9, [4], 42n, {dictionary: ['held']}));
+    assert.deepEqual(recovered.map(s => s.channels.held), [3, 4]);
+  }
+  const decoder = new TelemetryDecoder();
+  decoder.decode(valueFrame(0n, 9, [1], 42n, {dictionary: ['old']}));
+  assert.throws(() => decoder.decode(
+      valueFrame(1n, 9, [Infinity], 42n, {dictionary: ['new']})));
+  assert.equal(decoder.decode(valueFrame(2n, 9, [2]))!.channels.old, 2);
+});
+
+test('a malformed held frame cannot abort dictionary recovery', () => {
+  const decoder = new TelemetryDecoder();
+  decoder.decode(valueFrame(1n, 9, [1, 2]));
+  decoder.decode(valueFrame(2n, 9, [3]));
+  const recovered = decoder.decodeAll(
+      valueFrame(3n, 9, [4], 42n, {dictionary: ['value']}));
+  assert.deepEqual(recovered.map(s => s.sequence_id), ['2', '3']);
+  assert.equal(decoder.heldCount, 0);
 });
 test('jitter sorts, deduplicates, counts gaps and rejects late packets', () => {
   const j = new JitterBuffer(10);
@@ -140,6 +208,62 @@ test('pause survives ingestion; frame step and replay clamp at end', () => {
   c.tick(200000000n);
   assert.equal(c.mode, 'PAUSED');
   assert.equal(c.snapshot()?.sequence_id, '1');
+});
+
+test('paused and replay cursors recover from empty or evicted history', () => {
+  for (const mode of ['PAUSED', 'REPLAY_PLAYING'] as const) {
+    for (const viaTick of [false, true]) {
+      const c = new Coordinator(new Timeline(1));
+      c.mode = mode;
+      assert.equal(c.snapshot(), null);
+      c.timeline.append(frame(0));
+      if (viaTick) c.tick(0n);
+      assert.equal(c.snapshot()?.sequence_id, '0');
+      c.timeline.append(frame(1));
+      if (viaTick) c.tick(0n);
+      assert.equal(c.snapshot()?.sequence_id, '1');
+      assert.equal(c.cursor, 1020000000n);
+    }
+  }
+  const c = new Coordinator();
+  c.timeline.append(frame(0));
+  c.mode = 'REPLAY_PLAYING';
+  c.cursor = 9999999999n;
+  assert.equal(c.snapshot()?.sequence_id, '0');
+  assert.equal(c.cursor, 1000000000n);
+});
+
+test('target changes distinguish identical source lists by target index', () => {
+  const prev = parseSystemGraph(demoSystemGraph(0n));
+  const next = parseSystemGraph(demoSystemGraph(1n));
+  const sources = ['driver', 'auto'];
+  prev.nodes[0].selections = [
+    {sources, selected: 'driver'}, {sources, selected: 'auto'}
+  ];
+  next.nodes[0].selections = [
+    {sources, selected: 'driver'}, {sources, selected: 'auto'}
+  ];
+  const detector = SYSTEM_DETECTORS.find(d => d.id === 'target-selection')!;
+  assert.deepEqual(detector.detect(prev, next), []);
+  next.nodes[0].selections[1].selected = 'driver';
+  assert.equal(detector.detect(prev, next).length, 1);
+});
+
+test('counter resets refresh the baseline instead of ending a live run', () => {
+  const detector = createFrameDetectors().find(d => d.id === 'counter-clock-resets')!;
+  const sample = (timestamp_ns: string, value: number) => ({
+    ...frame(0), timestamp_ns,
+    channels: {'hw/status/clock_resets_count': value}
+  });
+  const a = sample('0', 99), b = sample('100000000', 100);
+  const reset = sample('1200000000', 0);
+  const advancing = sample('2100000000', 1);
+  assert.equal(detector.detect(a, b).length, 1);
+  assert.deepEqual(detector.detect(b, reset), []);
+  assert.deepEqual(detector.detect(reset, advancing), []);
+  assert.deepEqual(detector.detect(advancing, sample('3000000000', 1)), []);
+  assert.equal(detector.detect(
+      sample('3000000000', 1), sample('3100000000', 1)).length, 1);
 });
 test('all truncated frames and corrupt roots fail closed', () => {
   const bytes = demoPacket(2n);

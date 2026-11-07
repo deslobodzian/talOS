@@ -135,13 +135,15 @@ export function Shell() {
   // --- panel/layout actions -------------------------------------------------
 
   const callbacks: WorkspaceCallbacks = {
-    onSplit: (instanceId, direction) => setWorkspace(w => withActiveRoot(
-        w, root => {
-          const panel = findPanel(root, instanceId);
-          if (!panel) return root;
-          return split(root, instanceId, direction, panel.panelId,
-                       newInstanceId(), panel.config);
-        })),
+    onSplit: (instanceId, direction) => {
+      setMaximized(null);
+      setWorkspace(w => withActiveRoot(w, root => {
+        const panel = findPanel(root, instanceId);
+        if (!panel) return root;
+        return split(root, instanceId, direction, panel.panelId,
+                     newInstanceId(), panel.config);
+      }));
+    },
     onClose: (instanceId) => setWorkspace(w => withActiveRoot(w, root => {
       const next = close(root, instanceId);
       // A page is never left empty: closing its last panel leaves a fresh
@@ -162,27 +164,31 @@ export function Shell() {
   // Memoised so the context value is stable: the shell re-renders on every
   // playback tick, and a new navigation object would re-render every panel.
   const navigation = useMemo(() => ({
-    openPanel: (panelId: string) => setWorkspace(w => withActiveRoot(
-        w, root => {
-          const target = firstPanel(root);
-          return target ?
-              split(root, target.instanceId, 'row', panelId, newInstanceId(),
-                    undefined) :
-              panelNode(panelId, newInstanceId(), undefined);
-        }))
-  }), []);
-
-  // "Add panel" splits the last-interacted panel on the active page (falling
-  // back to the first panel), or replaces an empty root outright.
-  const addPanel = (panelId: string) => setWorkspace(w => withActiveRoot(
-      w, root => {
-        const target = (focusedPanelId && findPanel(root, focusedPanelId)) ??
-            firstPanel(root);
+    openPanel: (panelId: string) => {
+      setMaximized(null);
+      setWorkspace(w => withActiveRoot(w, root => {
+        const target = firstPanel(root);
         return target ?
             split(root, target.instanceId, 'row', panelId, newInstanceId(),
                   undefined) :
             panelNode(panelId, newInstanceId(), undefined);
       }));
+    }
+  }), []);
+
+  // "Add panel" splits the last-interacted panel on the active page (falling
+  // back to the first panel), or replaces an empty root outright.
+  const addPanel = (panelId: string) => {
+    setMaximized(null);
+    setWorkspace(w => withActiveRoot(w, root => {
+      const target = (focusedPanelId && findPanel(root, focusedPanelId)) ??
+          firstPanel(root);
+      return target ?
+          split(root, target.instanceId, 'row', panelId, newInstanceId(),
+                undefined) :
+          panelNode(panelId, newInstanceId(), undefined);
+    }));
+  };
 
   // "Open preset page" appends a fresh page built from the named preset.
   const openPresetPage = (name: string) => {
@@ -260,6 +266,7 @@ export function Shell() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
       // ⌘/Ctrl+K toggles the palette from anywhere.
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey &&
           e.key.toLowerCase() === 'k') {
@@ -269,10 +276,10 @@ export function Shell() {
         return;
       }
 
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       const target = e.target as HTMLElement|null;
-      if (target &&
-          (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' ||
-           target.tagName === 'SELECT' || target.isContentEditable))
+      if (target?.closest(
+          'button, input, textarea, select, [contenteditable="true"], [role="menu"], [role="dialog"], [role="separator"], [role="slider"]'))
         return;
 
       // '?' toggles the shortcuts overlay.
@@ -315,7 +322,7 @@ export function Shell() {
                 onClose={closePage} onAdd={addPage} onReset={resetPage}/>
       <main>
         {activePage ?
-             <WorkspaceArea root={activePage.root} maximized={maximized}
+             <WorkspaceArea key={activePage.id} root={activePage.root} maximized={maximized}
                             callbacks={callbacks}/> :
              <div className="empty-state">No pages. Add a page to begin.</div>}
       </main>

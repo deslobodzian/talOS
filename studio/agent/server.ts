@@ -66,7 +66,11 @@ export function startAgent(
     if (!target) return;
     try {
       const response = await fetch(target, {cache: 'no-store'});
-      if (response.status === 404) return;
+      if (response.status === 404) {
+        declared = null;
+        declaredError = '';
+        return;
+      }
       if (!response.ok) {
         declaredError = `Declared graph unavailable: HTTP ${response.status}`;
         return;
@@ -197,11 +201,16 @@ export function startAgent(
     ws.handleUpgrade(
         req, socket, head, client => ws.emit('connection', client, req));
   });
-  ws.on('connection', client => client.on('message', raw => {
-    const response = parse(raw.toString());
-    if (response !== undefined && client.bufferedAmount < 1024 * 1024)
-      client.send(JSON.stringify(response));
-  }));
+  ws.on('connection', client => {
+    client.on('error', () => {
+      try { client.close(); } catch {}
+    });
+    client.on('message', raw => {
+      const response = parse(raw.toString());
+      if (response !== undefined && client.bufferedAmount < 1024 * 1024)
+        client.send(JSON.stringify(response));
+    });
+  });
   let socket: WebSocket|undefined;
   let retry: NodeJS.Timeout|undefined;
   let stopped = false;

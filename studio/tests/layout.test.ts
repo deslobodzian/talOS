@@ -32,7 +32,8 @@ import {
   split,
   splitNode,
 } from '../src/layout/tree';
-import type {SplitNode} from '../src/layout/types';
+import type {LayoutNode, SplitNode} from '../src/layout/types';
+import {exportWorkspace, importWorkspace} from '../src/layout/workspace';
 
 const p = (panelId: string, instanceId: string) =>
     panelNode(panelId, instanceId, undefined);
@@ -242,3 +243,44 @@ test('the default workspace opens one page per default preset, first active',
        assert.equal(workspace.activePage, workspace.pages[0].id);
        for (const page of workspace.pages) assert.ok(countPanels(page.root) >= 1);
      });
+
+test('parseWorkspace gives duplicate panel instances unique ids across all pages', () => {
+  const root = splitNode('row', [
+    p('health', 'duplicate'),
+    splitNode('column', [p('plot', 'duplicate'), p('field', 'unique')])
+  ]);
+  const workspace = parseWorkspace({
+    version: 1,
+    activePage: 'one',
+    pages: [
+      {id: 'one', title: 'One', root},
+      {id: 'two', title: 'Two', root: p('timing', 'duplicate')}
+    ]
+  });
+  const ids: string[] = [];
+  const collect = (node: LayoutNode): void => {
+    if (node.type === 'panel') ids.push(node.instanceId);
+    else node.children.forEach(collect);
+  };
+  workspace.pages.forEach(page => collect(page.root));
+  assert.equal(ids.length, 4);
+  assert.equal(new Set(ids).size, 4);
+  assert.equal(ids[0], 'duplicate');
+  assert.equal(ids[2], 'unique');
+  assert.deepEqual(workspace.pages.map(page => listPanelIds(page.root)),
+                   [['health', 'plot', 'field'], ['timing']]);
+  assert.deepEqual(parseWorkspace(JSON.parse(serialize(workspace))), workspace);
+});
+
+test('workspace import rejects invalid documents without substituting defaults', () => {
+  for (const raw of [
+    {}, null, [], {version: 2, pages: []}, {version: 1, pages: []},
+    {version: 1, pages: [{id: 'broken', root: {type: 'panel'}}]}
+  ]) {
+    assert.throws(() => importWorkspace(JSON.stringify(raw)),
+                  /Invalid workspace document/);
+  }
+  assert.throws(() => importWorkspace('{'), SyntaxError);
+  const workspace = defaultWorkspace();
+  assert.deepEqual(importWorkspace(exportWorkspace(workspace)), workspace);
+});

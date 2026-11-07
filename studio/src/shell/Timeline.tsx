@@ -29,12 +29,23 @@ function ScrubTrack() {
     actions.seek(t.toString());
   };
 
+  const onTrackKey = (e: React.KeyboardEvent<SVGSVGElement>) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    e.stopPropagation();
+    const step = (end - start) / 100n || 1n;
+    const cursor = playback.cursor_ns == null ? start : BigInt(playback.cursor_ns);
+    const next = cursor + (e.key === 'ArrowLeft' ? -step : step);
+    actions.seek((next < start ? start : next > end ? end : next).toString());
+  };
+
   const cursorX = playback.cursor_ns ? x(playback.cursor_ns) : 0;
 
   return <svg ref={svgRef} className="scrub" viewBox="0 0 1000 32"
-              preserveAspectRatio="none" role="slider"
+              preserveAspectRatio="none" role="slider" tabIndex={0}
               aria-label="Replay timeline" aria-valuemin={0} aria-valuemax={1000}
-              aria-valuenow={Math.round(cursorX)} onClick={onTrackClick}>
+              aria-valuenow={Math.round(cursorX)} onClick={onTrackClick}
+              onKeyDown={onTrackKey}>
     {bands.map((band, i) => <rect key={i} x={x(band.start_ns)} y={7}
         width={Math.max(1, x(band.end_ns) - x(band.start_ns))} height={12}
         className={'band ' + band.mode}/>)}
@@ -61,10 +72,12 @@ export function Timeline({stepNs, onStepNs, transportError, onTransportError}: {
       playback.mode === 'LIVE_STREAMING';
 
   const seekExact = () => {
-    if (/^\d{1,20}$/.test(exactTimestamp))
+    if (/^\d{1,20}$/.test(exactTimestamp)) {
       actions.seek(exactTimestamp);
-    else
+      onTransportError('');
+    } else {
       onTransportError('Enter a timestamp as integer nanoseconds');
+    }
   };
 
   return <footer className="timeline">

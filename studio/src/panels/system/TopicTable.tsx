@@ -44,6 +44,8 @@ export function TopicTable(
                  row.topic.publishers.some(
                      p => p.toLowerCase().includes(needle)) ||
                  row.topic.subscribers.some(
+                     s => s.toLowerCase().includes(needle)) ||
+                 row.topic.observers.some(
                      s => s.toLowerCase().includes(needle))));
   }, [graph.topics, health, filter, chosen]);
 
@@ -118,12 +120,19 @@ export function TopicTable(
                             {name}
                           </button>) :
                       <span className="text-warn">none</span>}</td>
-             <td>{topic.subscribers.length ?
-                      topic.subscribers.map(
-                          name => <button key={name} className="link"
-                                          onClick={() => onPickNode(name)}>
-                            {name}
-                          </button>) :
+             <td>{topic.subscribers.length || topic.observers.length ?
+                      <>
+                        {topic.subscribers.map(
+                            name => <button key={name} className="link"
+                                            onClick={() => onPickNode(name)}>
+                              {name}
+                            </button>)}
+                        {topic.observers.map(
+                            name => <button key={`observer:${name}`} className="link"
+                                            onClick={() => onPickNode(name)}>
+                              {name} (observer)
+                            </button>)}
+                      </> :
                       <span className="text-warn">none</span>}</td>
              <td className="right">{hertz(topicRate(topic))}</td>
              <td className="right">{integer(topic.published)}</td>

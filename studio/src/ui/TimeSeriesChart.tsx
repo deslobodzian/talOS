@@ -113,7 +113,7 @@ function computeGeometry(
       finiteCount++;
     }
   }
-  if (finiteCount < 2) return null;
+  if (finiteCount < 1) return null;
   if (threshold !== undefined && Number.isFinite(threshold)) {
     if (threshold < minY) minY = threshold;
     if (threshold > maxY) maxY = threshold;
@@ -159,6 +159,7 @@ function linePath(
         d += `L${run[i].x.toFixed(1)},${yOf(run[i].yMin).toFixed(1)}` +
              `L${run[i].x.toFixed(1)},${yOf(run[i].yMax).toFixed(1)}`;
       }
+      if (run.length === 1 && run[0].yMin === run[0].yMax) d += ' l 0.01,0';
       parts.push(d);
     }
     return parts.join('');
@@ -166,20 +167,26 @@ function linePath(
 
   const parts: string[] = [];
   let cur: string[] = [];
+  const endRun = () => {
+    if (cur.length) {
+      parts.push('M' + cur.join('L') + (cur.length === 1 ? ' l 0.01,0' : ''));
+      cur = [];
+    }
+  };
   for (let i = 0; i < values.length; i++) {
     const v = values[i];
     if (!Number.isFinite(v)) {
-      if (cur.length) { parts.push('M' + cur.join('L')); cur = []; }
+      endRun();
       continue;
     }
     const x = times ? times[i] : i;
     if (!Number.isFinite(x)) {
-      if (cur.length) { parts.push('M' + cur.join('L')); cur = []; }
+      endRun();
       continue;
     }
     cur.push(`${xOf(x).toFixed(1)},${yOf(v).toFixed(1)}`);
   }
-  if (cur.length) parts.push('M' + cur.join('L'));
+  endRun();
   return parts.join('');
 }
 

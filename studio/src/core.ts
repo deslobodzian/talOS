@@ -181,8 +181,12 @@ export class TelemetryDecoder {
     this.held = [];
     const out: {frame: Snapshot; raw: Uint8Array}[] = [];
     for (const bytes of pending) {
-      const snapshot = this.decode(bytes);
-      if (snapshot) out.push({frame: snapshot, raw: bytes});
+      try {
+        const snapshot = this.decode(bytes);
+        if (snapshot) out.push({frame: snapshot, raw: bytes});
+      } catch {
+        // A bad held frame must not discard the dictionary or its siblings.
+      }
     }
     this.heldCount = this.held.length;
     return out;
@@ -198,6 +202,10 @@ export class TelemetryDecoder {
     const snapshot = this.decode(bytes);
     if (!snapshot) return [];
     const out = [{frame: snapshot, raw: bytes}, ...this.drainHeld()];
+    out.sort((a, b) => {
+      const left = BigInt(a.frame.sequence_id), right = BigInt(b.frame.sequence_id);
+      return left < right ? -1 : left > right ? 1 : 0;
+    });
     this.heldCount = this.held.length;
     return out;
   }
@@ -206,14 +214,13 @@ export class TelemetryDecoder {
     verify(bytes);
     const f = Frame.getSizePrefixedRootAsFrame(new ByteBuffer(bytes));
     const streamId = f.streamId().toString();
-    if (this.stream !== null && streamId !== this.stream) {
-      this.dictionaries.clear();
-      this.held = [];
-    }
-    this.stream = streamId;
+    const newStream = this.stream !== streamId;
     const dictionaryId = f.dictionaryId();
-    let dictionary: Dictionary|undefined = this.dictionaries.get(dictionaryId);
-    if (f.dictionaryLength() > 0) {
+    const hasDictionary = f.dictionaryLength() > 0 ||
+        f.bb!.__offset(f.bb_pos, 16) !== 0;
+    let dictionary: Dictionary|undefined =
+        newStream ? undefined : this.dictionaries.get(dictionaryId);
+    if (hasDictionary) {
       const parsed: Dictionary = [];
       const seen = new Set<string>();
       for (let i = 0; i < f.dictionaryLength(); i++) {
@@ -230,15 +237,28 @@ export class TelemetryDecoder {
         parsed.push({name, unit: info.unit() ?? '', labels});
       }
       dictionary = parsed;
-      this.dictionaries.set(dictionaryId, parsed);
     }
+    if (dictionary && f.valuesLength() > dictionary.length)
+      throw Error('More values than dictionary channels');
+    // Validate even unknown-dictionary packets before they can change streams.
+    const chassis = pose(f.chassis());
+    for (let i = 0; i < f.valuesLength(); i++) {
+      const value = f.values(i)!;
+      if (!Number.isNaN(value)) finite(value);
+    }
+    // Commit only after every candidate field has passed validation.
+    if (newStream) {
+      this.dictionaries.clear();
+      this.held = [];
+    }
+    this.stream = streamId;
+    if (hasDictionary) this.dictionaries.set(dictionaryId, dictionary!);
+    this.heldCount = this.held.length;
     if (!dictionary) {
       if (this.held.length < 4096) this.held.push(bytes.slice());
       this.heldCount = this.held.length;
       return null;
     }
-    if (f.valuesLength() > dictionary.length)
-      throw Error('More values than dictionary channels');
     const channels: Record<string, number> = Object.create(null),
           units: Record<string, string> = Object.create(null),
           labels: Record<string, string[]> = Object.create(null);
@@ -258,7 +278,7 @@ export class TelemetryDecoder {
       sequence_id: f.sequenceId().toString(),
       timestamp_ns: f.timestampNs().toString(),
       dictionary_id: dictionaryId,
-      chassis: pose(f.chassis()),
+      chassis,
       channels,
       units,
       labels
@@ -388,6 +408,13 @@ export class Coordinator {
   cursor = 0n;
   constructor(public timeline = new Timeline()) {}
   snapshot() {
+    if (this.timeline.frames.length > 0) {
+      const first = BigInt(this.timeline.frames[0].timestamp_ns);
+      const last = BigInt(this.timeline.latest()!.timestamp_ns);
+      if (this.cursor < first) this.cursor = first;
+      if (this.mode === 'REPLAY_PLAYING' && this.cursor > last)
+        this.cursor = last;
+    }
     return this.timeline.at(this.cursor);
   }
   seek(t: bigint) {
@@ -404,6 +431,11 @@ export class Coordinator {
   tick(dt: bigint) {
     const b = this.timeline.bounds();
     if (!b) return;
+    const first = BigInt(b.start);
+    const last = BigInt(b.end);
+    if (this.cursor < first) this.cursor = first;
+    if (this.mode === 'REPLAY_PLAYING' && this.cursor > last)
+      this.cursor = last;
     if (this.mode === 'LIVE_STREAMING')
       this.cursor = BigInt(b.end);
     else if (this.mode === 'REPLAY_PLAYING') {

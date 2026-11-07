@@ -53,9 +53,9 @@ export function maskBits(value: number|null|undefined): string|null {
   return bits.length ? bits.join(', ') : 'none';
 }
 
-// The last finite value of a series column, and the change of that value over
-// the trailing `windowSeconds` of the series. Both are null when the column
-// has no reading in range: "not measured" is never "zero".
+// The last finite counter value and accumulated increments over the trailing
+// `windowSeconds`. A decrease starts a new counter from zero. Both are null
+// when the column has no reading: "not measured" is never "zero".
 export function windowDelta(
     series: Series, name: string, windowSeconds: number):
     {current: number|null; delta: number|null} {
@@ -74,7 +74,14 @@ export function windowDelta(
     prior = i;
     if (series.times[i] <= bound) break;
   }
-  const delta = prior === last ? 0 : current - values[prior];
+  let delta = 0;
+  let prev = values[prior];
+  for (let i = prior + 1; i <= last; i++) {
+    const v = values[i];
+    if (!Number.isFinite(v)) continue;
+    delta += v >= prev ? v - prev : Math.max(0, v);
+    prev = v;
+  }
   return {current, delta};
 }
 
@@ -103,23 +110,20 @@ export function phaseFromSeries(
   const currentValue = values[end];
   const current = label(currentValue);
 
-  // Walk back to the first sample whose label differs from the current one.
+  // Walk back through finite samples of the current phase, stopping at a change.
   let previous: string|null = null;
-  let boundary = end;
+  let earliestFinite = end;
   for (let i = end - 1; i >= 0; i--) {
     if (!Number.isFinite(values[i])) continue;
     if (label(values[i]) !== current) {
       previous = label(values[i]);
-      boundary = i;
       break;
     }
+    earliestFinite = i;
   }
 
-  // The phase has held since the first sample of the current label (the
-  // sample after the boundary, or the first retained sample when there is no
-  // previous label in range).
-  const startIndex = boundary === end ? 0 : boundary + 1;
-  return {current, previous, seconds: series.times[end] - series.times[startIndex]};
+  // Gaps before the first finite reading of this run are not phase time.
+  return {current, previous, seconds: series.times[end] - series.times[earliestFinite]};
 }
 
 const MODE_LABEL: Record<DriverStationMode, string> = {

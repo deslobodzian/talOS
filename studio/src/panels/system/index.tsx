@@ -42,8 +42,8 @@ function SystemPanel() {
 
   if (!graph) return <div className="system"><NoSystem error={system.error}/></div>;
 
-  const selected = graph.nodes.find(n => n.name === picked) ?? nodes[0] ??
-      graph.nodes[0] ?? null;
+  const selected = (picked ? nodes.find(n => n.name === picked) : null) ??
+      nodes[0] ?? null;
 
   return <div className="system">
     <div className="system-toolbar">

@@ -303,8 +303,10 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
   const setLayer = (key: keyof FieldLayers) =>
       (e: ChangeEvent<HTMLInputElement>) =>
           setConfig({...config, layers: {...config.layers, [key]: e.target.checked}});
-  const setFollow = (e: ChangeEvent<HTMLInputElement>) =>
-      setConfig({...config, follow: e.target.checked});
+  const setFollow = (e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.checked) setManualView(null);
+    setConfig({...config, follow: e.target.checked});
+  };
   const setTrailSeconds = (e: ChangeEvent<HTMLInputElement>) => {
     const v = Number(e.target.value);
     if (Number.isFinite(v)) setConfig({...config, trailSeconds: Math.max(0.5, v)});

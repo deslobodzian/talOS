@@ -186,6 +186,8 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
         return `${k}\u0001${c?.unit ?? ''}\u0001${(c?.labels ?? []).join('\u0002')}`;
       }).join('\u0000'),
       [keySig, info]);
+  const prevWindowRef = useRef<number|null>(config.windowSeconds);
+  const prevChannelSigRef = useRef<string>(channelSig);
 
   const axes = useMemo(() => {
     const plotChannels: PlotChannel[] = keys.map(k => ({
@@ -336,6 +338,10 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
   useEffect(() => {
     const plot = chart.current;
     if (!plot) return;
+    const windowChanged = prevWindowRef.current !== config.windowSeconds ||
+        prevChannelSigRef.current !== channelSig;
+    prevWindowRef.current = config.windowSeconds;
+    prevChannelSigRef.current = channelSig;
     if (ordered.length === 0) {
       plot.setData([[], ...ordered.map(() => [])]);
       originRef.current = null;
@@ -346,9 +352,12 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
     const times = Array.from(series.times);
     const values = ordered.map(
         name => Array.from(series.values[name] ?? new Float64Array(0)));
-    plot.setData(
-        [times, ...values],
-        playback.mode === 'LIVE_STREAMING' || times.length === 0);
+    const resetScales = windowChanged || playback.mode === 'LIVE_STREAMING' ||
+        times.length === 0;
+    plot.setData([times, ...values], resetScales);
+    if (windowChanged && config.windowSeconds !== null && times.length > 0 &&
+        times[0] < times[times.length - 1])
+      plot.setScale('x', {min: times[0], max: times[times.length - 1]});
     if (playback.cursor_ns && playback.mode !== 'LIVE_STREAMING')
       plot.setCursor({
         left: plot.valToPos(
@@ -356,7 +365,7 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
             'x'),
         top: 0
       });
-  }, [series, channelSig, playback.cursor_ns, playback.mode, ordered]);
+  }, [series, channelSig, config.windowSeconds, playback.cursor_ns, playback.mode, ordered]);
 
   // Redraw when events arrive or the marker toggle flips, without rebuilding.
   useEffect(() => {
@@ -380,6 +389,9 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
               value={w.value === null ? 'all' : String(w.value)}>
             {w.label}
           </option>)}
+          {config.windowSeconds !== null &&
+           !WINDOWS.some(w => w.value === config.windowSeconds) &&
+           <option value={String(config.windowSeconds)}>{config.windowSeconds} s</option>}
         </select>
       </label>
       <label className="events-toggle">

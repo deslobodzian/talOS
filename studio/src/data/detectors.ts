@@ -166,6 +166,10 @@ function incrementDetector(options: IncrementOptions): FrameDetector & {reset():
           run.lastAdvance_ns = ts;
         } else {
           run.stillIncreasing = false;
+          if (value < run.lastValue) {
+            run.lastValue = value;
+            run.lastAdvance_ns = ts;
+          }
         }
 
         if (run.pending) {
@@ -446,9 +450,10 @@ export const SYSTEM_DETECTORS: SystemDetector[] = [
       for (const node of next.nodes) {
         const before = prev?.nodes.find(n => n.name === node.name);
         if (!before) continue;
-        const beforeSelections = new Map(before.selections.map(s => [selectionKey(s), s]));
-        for (const selection of node.selections) {
-          const prior = beforeSelections.get(selectionKey(selection));
+        const beforeSelections = new Map(before.selections.map(
+            (s, i) => [`${i}:${selectionKey(s)}`, s]));
+        for (const [i, selection] of node.selections.entries()) {
+          const prior = beforeSelections.get(`${i}:${selectionKey(selection)}`);
           if (prior && prior.selected !== selection.selected) {
             drafts.push({
               severity: 'info',

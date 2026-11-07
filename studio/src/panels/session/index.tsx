@@ -151,9 +151,9 @@ function SessionPanel() {
   const summary = useMemo(() => summarize(rows), [rows]);
 
   const copyPath = (path: string) => {
-    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText)
-      navigator.clipboard.writeText(path).catch(() => {});
-    setCopied(path);
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(path).then(() => setCopied(path)).catch(() => {});
+    }
   };
 
   return <div className="session">

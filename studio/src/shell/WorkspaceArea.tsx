@@ -50,14 +50,15 @@ function SplitHandle({path, index, direction, sizes, onResize}: {
     const d = drag.current;
     if (!d) return;
     const pos = direction === 'row' ? e.clientX : e.clientY;
+    const pair = (d.startSizes[index] ?? 0) + (d.startSizes[index + 1] ?? 0);
+    if (pair <= 0) return;
     const delta = (pos - d.startPos) / (d.size || 1);
-    const pair = d.startSizes[index] + d.startSizes[index + 1] || 1;
-    const lo = MIN_PANEL_SIZE, hi = 1 - MIN_PANEL_SIZE;
-    const fraction =
-        Math.min(hi, Math.max(lo, d.startSizes[index] / pair + delta));
+    const minShare = Math.min(MIN_PANEL_SIZE, pair / 2);
+    const nextA = Math.min(pair - minShare,
+                          Math.max(minShare, d.startSizes[index] + delta));
     const next = d.startSizes.slice();
-    next[index] = fraction * pair;
-    next[index + 1] = (1 - fraction) * pair;
+    next[index] = nextA;
+    next[index + 1] = pair - nextA;
     onResize(path, next);
   };
 
@@ -71,11 +72,14 @@ function SplitHandle({path, index, direction, sizes, onResize}: {
     else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') delta = -0.05;
     if (!delta) return;
     e.preventDefault();
+    e.stopPropagation();
+    const pair = sizes[index] + sizes[index + 1];
+    if (pair <= 0) return;
+    const minShare = Math.min(MIN_PANEL_SIZE, pair / 2);
     const next = sizes.slice();
-    next[index] =
-        Math.min(1 - MIN_PANEL_SIZE, Math.max(MIN_PANEL_SIZE, next[index] + delta));
-    next[index + 1] = Math.min(
-        1 - MIN_PANEL_SIZE, Math.max(MIN_PANEL_SIZE, next[index + 1] - delta));
+    next[index] = Math.min(pair - minShare,
+                           Math.max(minShare, sizes[index] + delta));
+    next[index + 1] = pair - next[index];
     onResize(path, next);
   };
 
@@ -92,11 +96,12 @@ function renderPanel(node: PanelNode, callbacks: WorkspaceCallbacks,
   const config = def ? def.parseConfig(node.config) : undefined;
 
   const content = Component ?
-      <Component config={config} instanceId={node.instanceId}
+      <Component key={`${node.instanceId}:${node.panelId}`}
+                 config={config} instanceId={node.instanceId}
                  setConfig={c => callbacks.onConfig(node.instanceId, c)}/> :
       <UnknownPanel panelId={node.panelId} config={node.config}/>;
 
-  return <PanelChrome
+  return <PanelChrome key={node.instanceId}
       panelId={node.panelId}
       title={def?.title ?? 'Unknown panel'}
       category={def?.category ?? 'Tools'}
@@ -107,7 +112,9 @@ function renderPanel(node: PanelNode, callbacks: WorkspaceCallbacks,
       onClose={() => callbacks.onClose(node.instanceId)}
       onInteract={() => callbacks.onFocusPanel(node.instanceId)}
       maximized={maximized === node.instanceId}>
-    <PanelErrorBoundary>{content}</PanelErrorBoundary>
+    <PanelErrorBoundary key={`${node.instanceId}:${node.panelId}`}>
+      {content}
+    </PanelErrorBoundary>
   </PanelChrome>;
 }
 
@@ -125,7 +132,9 @@ function SplitView({node, path, callbacks, maximized}: {
   maximized: string|null;
 }) {
   return <div className={'split ' + node.direction}>
-    {node.children.map((child, i) => <Fragment key={i}>
+    {node.children.map((child, i) => {
+      const childKey = child.type === 'panel' ? child.instanceId : `split-${i}`;
+      return <Fragment key={childKey}>
       {i > 0 && <SplitHandle path={path} index={i - 1}
                              direction={node.direction} sizes={node.sizes}
                              onResize={callbacks.onResize}/>}
@@ -133,7 +142,8 @@ function SplitView({node, path, callbacks, maximized}: {
            style={{flexGrow: node.sizes[i] ?? 1, flexBasis: 0, minWidth: 0, minHeight: 0}}>
         {renderNode(child, [...path, i], callbacks, maximized)}
       </div>
-    </Fragment>)}
+    </Fragment>;
+    })}
   </div>;
 }
 

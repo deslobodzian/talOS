@@ -149,7 +149,10 @@ test_suite(
     name = "tests",
     tests = [":" + name for name in STUDIO_TESTS] + [
         ":typecheck",
+        "//studio/bridge:describe_test",
+        "//studio/bridge:integration_test",
         "//studio/bridge:system_test",
+        "//studio/bridge:telemetry_test",
         "//talOS/telemetry:wire_test",
     ],
 )

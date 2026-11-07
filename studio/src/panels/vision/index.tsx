@@ -113,8 +113,7 @@ function VisionPanel() {
 
   // The chart reference is the estimator pose, or sim ground truth when it is
   // present (the disagreement column always compares against the estimator).
-  const simPresent = useMemo(
-      () => dictionary.some(c => c.name === 'sim/state/pose/x_m'), [dictionary]);
+  const simPresent = Number.isFinite(snapshot?.channels['sim/state/pose/x_m']);
   const refOwner = simPresent ? 'sim' : estimator?.name ?? null;
   const refX = refOwner ? channel(refOwner, 'state/pose/x_m') : null;
   const refY = refOwner ? channel(refOwner, 'state/pose/y_m') : null;

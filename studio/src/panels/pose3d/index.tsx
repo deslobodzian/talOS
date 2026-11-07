@@ -4,12 +4,13 @@
 // react-dom/server it renders a placeholder, so the registry test can render
 // every panel without a WebGL context.
 
-import {useEffect, useState} from 'react';
+import {useEffect, useRef, useState} from 'react';
 import {Canvas, useThree} from '@react-three/fiber';
 import * as THREE from 'three';
 import {OrbitControls} from 'three/examples/jsm/controls/OrbitControls.js';
 import {GLTFLoader} from 'three/examples/jsm/loaders/GLTFLoader.js';
 
+import {poseValid} from '../../core';
 import {useSnapshot} from '../../data/hooks';
 import type {PanelDefinition} from '../types';
 import './pose3d.css';
@@ -44,25 +45,40 @@ function OrbitNavigation() {
   return null;
 }
 
+function disposeModel(model: THREE.Group) {
+  model.traverse(object => {
+    if (object instanceof THREE.Mesh) {
+      object.geometry.dispose();
+      const materials = Array.isArray(object.material) ? object.material :
+                                                         [object.material];
+      materials.forEach(material => {
+        for (const value of Object.values(material))
+          if (value instanceof THREE.Texture) value.dispose();
+        material.dispose();
+      });
+    }
+  });
+}
+
 function Pose3dPanel() {
   const s = useSnapshot();
+  const valid = poseValid(s);
   const [model, setModel] = useState<THREE.Group|null>(null);
   const [error, setError] = useState('');
   const isBrowser = typeof window !== 'undefined';
+  const requestRef = useRef(0);
+  const mountedRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      requestRef.current++;
+    };
+  }, []);
 
   useEffect(() => () => {
-    model?.traverse(object => {
-      if (object instanceof THREE.Mesh) {
-        object.geometry.dispose();
-        const materials = Array.isArray(object.material) ? object.material :
-                                                           [object.material];
-        materials.forEach(material => {
-          for (const value of Object.values(material))
-            if (value instanceof THREE.Texture) value.dispose();
-          material.dispose();
-        });
-      }
-    });
+    if (model) disposeModel(model);
   }, [model]);
 
   return <>
@@ -79,7 +95,8 @@ function Pose3dPanel() {
              <gridHelper args={[18, 18, '#486676', '#29424e']}
                          rotation={[Math.PI / 2, 0, 0]} position={[8.25, 4.1, 0]}/>
              {model && <primitive object={model}/>}
-             {s && <group position={[s.chassis.x, s.chassis.y, s.chassis.z + .2]}
+             {s && <group visible={valid}
+                          position={[s.chassis.x, s.chassis.y, s.chassis.z + .2]}
                           rotation={[s.chassis.roll, s.chassis.pitch, s.chassis.yaw,
                                      'ZYX']}>
                <mesh>
@@ -94,6 +111,7 @@ function Pose3dPanel() {
     </div>
     <div className="panel-footer">
       Z UP · METERS
+      {!valid && <span role="status">Pose unavailable</span>}
       {isBrowser && <label className="file">
         Load field GLB
         <input
@@ -101,14 +119,20 @@ function Pose3dPanel() {
             type="file" accept=".glb" onChange={async (e) => {
               const f = e.target.files?.[0];
               if (!f) return;
+              const request = ++requestRef.current;
               try {
                 const gltf =
                     await new GLTFLoader().parseAsync(await f.arrayBuffer(), '');
+                if (!mountedRef.current || request !== requestRef.current) {
+                  disposeModel(gltf.scene);
+                  return;
+                }
                 gltf.scene.rotation.x = Math.PI / 2;
                 setModel(gltf.scene);
                 setError('');
               } catch {
-                setError('Could not load model');
+                if (mountedRef.current && request === requestRef.current)
+                  setError('Could not load model');
               }
             }}/>
       </label>}

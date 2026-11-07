@@ -20,6 +20,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include "studio/bridge/system.h"
@@ -69,13 +70,33 @@ inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
   if (!Talos::Telemetry::VerifySizePrefixedFrameBuffer(verifier)) return false;
   const auto* frame = Talos::Telemetry::GetSizePrefixedFrame(payload.data());
   if (frame == nullptr) return false;
+  const auto* chassis = frame->chassis();
+  if (chassis == nullptr || !std::isfinite(chassis->x()) ||
+      !std::isfinite(chassis->y()) || !std::isfinite(chassis->z()) ||
+      !std::isfinite(chassis->roll()) || !std::isfinite(chassis->pitch()) ||
+      !std::isfinite(chassis->yaw())) {
+    return false;
+  }
+  if (frame->values() != nullptr) {
+    for (const double value : *frame->values()) {
+      if (std::isinf(value)) return false;  // NaN denotes an absent sample.
+    }
+  }
 
   if (frame->dictionary() != nullptr) {
     std::vector<TelemetryChannelInfo> dictionary;
     dictionary.reserve(frame->dictionary()->size());
+    std::unordered_set<std::string_view> names;
     for (const auto* info : *frame->dictionary()) {
       TelemetryChannelInfo channel;
       channel.name = info->name() != nullptr ? info->name()->str() : "";
+      if (!names.insert(info->name() != nullptr
+                            ? std::string_view(info->name()->c_str(),
+                                               info->name()->size())
+                            : std::string_view{}).second ||
+          channel.name.starts_with("derived/")) {
+        return false;
+      }
       channel.unit = info->unit() != nullptr ? info->unit()->str() : "";
       if (info->labels() != nullptr) {
         for (const auto* label : *info->labels()) {
@@ -83,6 +104,16 @@ inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
         }
       }
       dictionary.push_back(std::move(channel));
+    }
+    if (frame->values() != nullptr &&
+        frame->values()->size() != dictionary.size()) {
+      return false;
+    }
+    if (frame->values() == nullptr ||
+        frame->dictionary_id() != state.dictionary_id ||
+        frame->stream_id() != state.stream_id) {
+      state.has_frame = false;
+      state.values.clear();
     }
     state.dictionary = std::move(dictionary);
     state.dictionary_id = frame->dictionary_id();
@@ -100,11 +131,8 @@ inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
 
   state.sequence_id = frame->sequence_id();
   state.timestamp_ns = frame->timestamp_ns();
-  if (frame->chassis() != nullptr) {
-    state.chassis = {frame->chassis()->x(),     frame->chassis()->y(),
-                     frame->chassis()->z(),     frame->chassis()->roll(),
-                     frame->chassis()->pitch(), frame->chassis()->yaw()};
-  }
+  state.chassis = {chassis->x(),     chassis->y(),     chassis->z(),
+                   chassis->roll(), chassis->pitch(), chassis->yaw()};
   state.values.assign(frame->values()->begin(), frame->values()->end());
   state.received_wall_ns = wall_ns;
   state.has_frame = true;

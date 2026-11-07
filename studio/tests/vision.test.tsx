@@ -207,3 +207,20 @@ test('vision panel renders camera rows and the estimator summary', () => {
   // The chart is labelled against sim truth when sim pose is present.
   assert.ok(html.includes('vs sim truth'), html);
 });
+
+test('vision falls back to the estimator when sim is declared without finite data', () => {
+  for (const simX of [undefined, NaN]) {
+    const channels: Record<string, number> = {
+      'pose_estimator/state/pose/x_m': 1,
+      'pose_estimator/state/pose/y_m': 2,
+      'pose_estimator/state/valid': 1
+    };
+    if (simX !== undefined) channels['sim/state/pose/x_m'] = simX;
+    const studio = createStaticStudio({
+      frames: [makeFrame(0, 0, channels)], playback: {mode: 'PAUSED'}
+    });
+    const html = renderPanel(studio);
+    assert.ok(!html.includes('vs sim truth'), html);
+    assert.ok(html.includes('vs estimator'), html);
+  }
+});

@@ -25,6 +25,10 @@ import {
   parseSystemGraph,
   rateKey,
 } from '../src/system';
+import {panelNode, splitNode} from '../src/layout/tree';
+import {filterCommands, relativeEventTime} from '../src/shell/commands';
+import {Timeline} from '../src/shell/Timeline';
+import {WorkspaceArea, type WorkspaceCallbacks} from '../src/shell/WorkspaceArea';
 
 const emptyPlayback: PlaybackState = {
   mode: 'PAUSED',
@@ -310,4 +314,159 @@ test('the attention list flags real orphans and leaves the design alone', () => 
             'the same finding was reported twice');
 
   assert.ok(html.includes('/shooter/target/teleop'));
+});
+
+const workspaceCallbacks: WorkspaceCallbacks = {
+  onSplit() {}, onClose() {}, onSwitch() {}, onConfig() {}, onResize() {},
+  onMaximize() {}, onFocusPanel() {}
+};
+
+type ViewElement = React.ReactElement<{children?: React.ReactNode}>;
+// Inspect the returned element tree without needing a browser DOM. Components
+// using hooks are evaluated only inside a server-rendered probe.
+function componentOutput(element: ViewElement): ViewElement {
+  return (element.type as (props: typeof element.props) => ViewElement)(
+      element.props);
+}
+
+test('panel identity keys reset panel state and errors when its type changes', () => {
+  const panel = (panelId: string, instanceId = 'one') => {
+    const area = WorkspaceArea({
+      root: panelNode(panelId, instanceId, undefined),
+      maximized: null, callbacks: workspaceCallbacks
+    });
+    const chrome = area.props.children as ViewElement;
+    const boundary = chrome.props.children as ViewElement;
+    const content = boundary.props.children as ViewElement;
+    return [chrome.key, boundary.key, content.key];
+  };
+  assert.deepEqual(panel('health'), ['one', 'one:health', 'one:health']);
+  assert.deepEqual(panel('timing'), ['one', 'one:timing', 'one:timing']);
+  assert.deepEqual(panel('health', 'two'), ['two', 'two:health', 'two:health']);
+});
+
+test('split siblings retain instance keys when another sibling closes', () => {
+  const keys = (ids: string[]) => {
+    const area = WorkspaceArea({
+      root: splitNode('row', ids.map(id => panelNode('health', id, undefined))),
+      maximized: null, callbacks: workspaceCallbacks
+    });
+    const split = componentOutput(area.props.children as ViewElement);
+    return (split.props.children as ViewElement[]).map(child => child.key);
+  };
+  assert.deepEqual(keys(['a', 'b', 'c']), ['a', 'b', 'c']);
+  assert.deepEqual(keys(['b', 'c']), ['b', 'c']);
+});
+
+function splitHandle(sizes: number[], onResize: (sizes: number[]) => void) {
+  const root = splitNode('row', sizes.map((_, i) =>
+      panelNode('health', `panel-${i}`, undefined)));
+  root.sizes = sizes;
+  const area = WorkspaceArea({
+    root, maximized: null,
+    callbacks: {...workspaceCallbacks, onResize: (_path, next) => onResize(next)}
+  });
+  const split = componentOutput(area.props.children as ViewElement);
+  const fragment = (split.props.children as ViewElement[])[1];
+  const handleElement = (fragment.props.children as ViewElement[])[0];
+  let handle!: React.ReactElement<React.HTMLAttributes<HTMLDivElement>>;
+  function Probe() {
+    handle = componentOutput(handleElement) as typeof handle;
+    return handle;
+  }
+  renderToStaticMarkup(<Probe/>);
+  return handle.props;
+}
+
+test('divider keyboard resizing preserves the pair and leaves other panes alone', () => {
+  for (const sizes of [[0.2, 0.3, 0.5], [0.12, 0.18, 0.7], [0.05, 0.05, 0.9]]) {
+    for (const key of ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']) {
+      let resized: number[] = [];
+      let prevented = false, stopped = false;
+      const handle = splitHandle(sizes, next => { resized = next; });
+      handle.onKeyDown!({
+        key,
+        preventDefault() { prevented = true; },
+        stopPropagation() { stopped = true; }
+      } as unknown as React.KeyboardEvent<HTMLDivElement>);
+      assert.ok(prevented && stopped);
+      assert.ok(Math.abs(resized[0] + resized[1] - sizes[0] - sizes[1]) < 1e-12);
+      assert.equal(resized[2], sizes[2]);
+      const minimum = Math.min(0.12, (sizes[0] + sizes[1]) / 2);
+      assert.ok(resized[0] >= minimum && resized[1] >= minimum - 1e-12);
+    }
+  }
+});
+
+test('divider pointer movement uses the whole split size rather than pair size', () => {
+  let resized: number[] = [];
+  const handle = splitHandle([0.2, 0.3, 0.5], next => { resized = next; });
+  handle.onPointerDown!({
+    clientX: 100, pointerId: 1,
+    currentTarget: {
+      parentElement: {getBoundingClientRect: () => ({width: 1000, height: 500})},
+      setPointerCapture() {}
+    }
+  } as unknown as React.PointerEvent<HTMLDivElement>);
+  handle.onPointerMove!({clientX: 200} as React.PointerEvent<HTMLDivElement>);
+  assert.ok(Math.abs(resized[0] - 0.3) < 1e-12);
+  assert.ok(Math.abs(resized[1] - 0.2) < 1e-12);
+  assert.equal(resized[2], 0.5);
+  handle.onPointerMove!({clientX: 2000} as React.PointerEvent<HTMLDivElement>);
+  assert.deepEqual(resized, [0.38, 0.12, 0.5]);
+  handle.onPointerUp!({} as React.PointerEvent<HTMLDivElement>);
+  handle.onPointerMove!({clientX: 0} as React.PointerEvent<HTMLDivElement>);
+  assert.deepEqual(resized, [0.38, 0.12, 0.5]);
+});
+
+test('exact command titles outrank longer prefixes and keyword matches', () => {
+  const commands = [
+    {id: 'prefix', title: 'Connect robot', run() {}},
+    {id: 'keyword', title: 'A command', keywords: 'Connect', run() {}},
+    {id: 'exact', title: 'Connect', hint: 'Disconnected', run() {}}
+  ];
+  assert.deepEqual(filterCommands(commands, 'connect').map(command => command.id),
+                   ['exact', 'prefix', 'keyword']);
+  assert.deepEqual(filterCommands(commands, ' CONNECT ').map(command => command.id),
+                   ['exact', 'prefix', 'keyword']);
+});
+
+test('event command times distinguish the future, present, and past', () => {
+  assert.equal(relativeEventTime('2000000000', '1000000000'), '+1.00 s');
+  assert.equal(relativeEventTime('1000000000', '1000000000'), 'now');
+  assert.equal(relativeEventTime('1000000000', '2000000000'), '1.00 s ago');
+  assert.equal(relativeEventTime('1000000000', null), '');
+});
+
+test('timeline slider is focusable and its arrows seek once within bounds', () => {
+  const sought: string[] = [];
+  for (const [cursor, key, expected] of [
+    ['500', 'ArrowLeft', '490'], ['500', 'ArrowRight', '510'],
+    ['0', 'ArrowLeft', '0'], ['1000', 'ArrowRight', '1000']
+  ]) {
+    const studio = createStaticStudio({
+      playback: {...emptyPlayback, bounds: {start: '0', end: '1000'}, cursor_ns: cursor}
+    });
+    studio.actions.seek = value => { sought.push(value); };
+    let slider!: React.ReactElement<React.SVGProps<SVGSVGElement>>;
+    function Probe() {
+      const timeline = Timeline({
+        stepNs: '20', onStepNs() {}, transportError: '', onTransportError() {}
+      });
+      const wrap = (timeline.props.children as ViewElement[])[1];
+      const track = (wrap.props.children as ViewElement[])[1];
+      slider = componentOutput(track) as typeof slider;
+      return slider;
+    }
+    renderToStaticMarkup(<StudioProvider studio={studio}><Probe/></StudioProvider>);
+    assert.equal(slider.props.tabIndex, 0);
+    let prevented = false, stopped = false;
+    slider.props.onKeyDown!({
+      key, preventDefault() { prevented = true; },
+      stopPropagation() { stopped = true; }
+    } as unknown as React.KeyboardEvent<SVGSVGElement>);
+    assert.ok(prevented && stopped);
+    assert.equal(sought.at(-1), expected);
+  }
+  assert.equal(sought.length, 4);
 });

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
+import {once} from 'node:events';
 import {createServer} from 'node:http';
 import type {AddressInfo} from 'node:net';
 import {test} from 'node:test';
 
-import {WebSocketServer} from 'ws';
+import {WebSocket, WebSocketServer} from 'ws';
 
 import {
   dispatch,
@@ -413,7 +414,7 @@ test('every advertised method exists, and nothing else does', () => {
 // a real socket: a wrong path or an unhandled 404 would leave every declared
 // view permanently empty and nothing would say why.
 
-function fakeBridge(declared: string|null) {
+async function fakeBridge(declared: string|null) {
   const server = createServer((request, response) => {
     if (request.url === '/declared.json' && declared !== null) {
       response.setHeader('Content-Type', 'application/json');
@@ -424,19 +425,21 @@ function fakeBridge(declared: string|null) {
     response.writeHead(404).end();
   });
   const sockets = new WebSocketServer({server, path: '/telemetry'});
-  return new Promise<{url: string; close: () => void}>(resolve => {
-    server.listen(0, '127.0.0.1', () => {
-      const {port} = server.address() as AddressInfo;
-      resolve({
-        url: `ws://127.0.0.1:${port}/telemetry`,
-        close: () => {
-          for (const client of sockets.clients) client.terminate();
-          sockets.close();
-          server.close();
-        }
-      });
-    });
-  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const {port} = server.address() as AddressInfo;
+  return {
+    url: `ws://127.0.0.1:${port}/telemetry`,
+    reconnect: (nextDeclared: string|null) => {
+      declared = nextDeclared;
+      for (const client of sockets.clients) client.terminate();
+    },
+    close: () => {
+      for (const client of sockets.clients) client.terminate();
+      sockets.close();
+      server.close();
+    }
+  };
 }
 
 const settle = async (until: () => boolean, what: string) => {
@@ -494,3 +497,48 @@ test('a bridge started without --declared leaves everything else working',
          bridge.close();
        }
      });
+
+test('a reconnecting bridge 404 clears the previous declared graph', async () => {
+  const bridge = await fakeBridge(demoDeclaredGraph());
+  const agent = startAgent(0, bridge.url);
+  try {
+    await settle(() => !!agent.context().declared, 'initial graph missing');
+    bridge.reconnect(null);
+    await settle(() => agent.context().declared === null,
+                 '404 left a stale declared graph');
+    assert.throws(
+        () => dispatch(agent.context(), 'get_declared_graph', {}),
+        (e: unknown) => e instanceof RpcFault && e.code === -32002);
+  } finally {
+    agent.close();
+    bridge.close();
+  }
+});
+
+test('oversized RPC WebSocket payloads close only the offending client', async () => {
+  const bridge = await fakeBridge(null);
+  const agent = startAgent(0, bridge.url);
+  let client: WebSocket|undefined;
+  try {
+    await settle(() => !!agent.server.address(), 'agent did not listen');
+    const {port} = agent.server.address() as AddressInfo;
+    client = new WebSocket(`ws://127.0.0.1:${port}/rpc`);
+    client.on('error', () => {});
+    await once(client, 'open');
+    const closed = once(client, 'close');
+    client.send(Buffer.alloc(65537));
+    assert.equal((await closed)[0], 1009);
+    const response = await fetch(`http://127.0.0.1:${port}/rpc`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({jsonrpc: '2.0', id: 1, method: 'get_schema_tree'})
+    });
+    assert.equal(response.status, 200);
+    const body: unknown = await response.json();
+    assert.ok(body !== null && typeof body === 'object' && 'id' in body);
+    assert.equal(body.id, 1);
+  } finally {
+    client?.terminate();
+    agent.close();
+    bridge.close();
+  }
+});

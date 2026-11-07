@@ -1,10 +1,12 @@
 /// <reference lib="webworker" />
 import {handleRpc} from '../agent/rpc';
+import {ByteBuffer} from 'flatbuffers';
 
 import {Coordinator, JitterBuffer, TelemetryDecoder, Timeline, type Snapshot} from './core';
 import {MAX_MANIFEST_BYTES, manifestUrl, parseManifest, type SessionManifest} from './data/manifest';
 import {type Connection, type PlaybackState} from './data/types';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from './demo';
+import {Frame} from './generated/talos/telemetry/frame';
 import {type DeclaredGraph, declaredUrl, MAX_DECLARED_BYTES, parseDeclaredGraph, parseSystemGraph, RateWindow, type SystemGraph} from './system';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
@@ -15,6 +17,7 @@ let socket: WebSocket|null = null, demo = false, sequence = 0n,
             status = 'Disconnected';
 let packets = new Map<string, Uint8Array>(),
     pendingBytes = new Map<string, Uint8Array>();
+let latestDictRaw: Uint8Array|null = null;
 let nextDemo = 0, lastTick = performance.now();
 let retry: ReturnType<typeof setTimeout>|undefined;
 let generation = 0;
@@ -203,10 +206,15 @@ async function fetchManifest(url: string, gen: number) {
     return;
   }
   if (gen !== generation) return;
-  if (text === lastManifestRaw) return;  // unchanged since the last read
-  lastManifestRaw = text;
+  const previousError = manifestError;
+  manifestError = '';
+  if (text === lastManifestRaw) {
+    if (previousError) postManifest();
+    return;
+  }
   try {
     manifest = parseManifest(text);
+    lastManifestRaw = text;
     manifestError = '';
   } catch (e) {
     manifestError = String(e);
@@ -237,6 +245,7 @@ function resetStream(next: string) {
   jitter = new JitterBuffer(10);
   packets.clear();
   pendingBytes.clear();
+  latestDictRaw = null;
   needsReset = true;
   pendingFrames = [];
 }
@@ -247,6 +256,7 @@ function reset() {
   streamId = null;
   packets.clear();
   pendingBytes.clear();
+  latestDictRaw = null;
   needsReset = true;
   pendingFrames = [];
   // Whatever is being connected to next is a different system, so the old
@@ -269,6 +279,9 @@ function close() {
   generation++;
   clearTimeout(retry);
   if (socket) {
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
     socket.onclose = null;
     socket.close();
     socket = null;
@@ -285,6 +298,9 @@ function ingest(bytes: Uint8Array, now: number) {
         resetStream(frame.stream_id);
       else
         streamId = frame.stream_id;
+      if (Frame.getSizePrefixedRootAsFrame(new ByteBuffer(raw))
+              .dictionaryLength() > 0)
+        latestDictRaw = raw;
       jitter.push(frame, now);
       pendingBytes.set(frame.sequence_id, raw);
       if (pendingBytes.size > 4096)
@@ -306,6 +322,7 @@ function connect(url: string, gen: number) {
     manifestBase = url;
     nextManifestPoll = performance.now();
     socket.onopen = () => {
+      if (gen !== generation) return;
       status = 'WebSocket connected';
       connection = 'live';
       // Asked for on every open, not once per session: the bridge may have been
@@ -315,6 +332,7 @@ function connect(url: string, gen: number) {
       void fetchManifest(url, gen);
     };
     socket.onmessage = e => {
+      if (gen !== generation) return;
       // Binary is telemetry, text is the system graph. The bridge picks the
       // frame type, so neither side has to sniff the payload.
       if (e.data instanceof ArrayBuffer)
@@ -323,11 +341,13 @@ function connect(url: string, gen: number) {
         ingestSystem(e.data);
     };
     socket.onclose = () => {
+      if (gen !== generation) return;
       status = 'Disconnected · retrying';
       connection = 'connecting';
       if (gen === generation) retry = setTimeout(() => connect(url, gen), 1000);
     };
     socket.onerror = () => {
+      if (gen !== generation) return;
       status = 'WebSocket connection failed';
       connection = 'error';
     };
@@ -366,7 +386,8 @@ ctx.onmessage = ({data}) => {
         let response: unknown;
         try {
           response = handleRpc(
-              {timeline: coordinator.timeline, system, previousSystem, declared},
+              {timeline: coordinator.timeline, system, previousSystem, declared,
+               rateWindow},
               data.request);
         } catch (e) {
           response = {
@@ -394,6 +415,10 @@ ctx.onmessage = ({data}) => {
         const chunks =
             coordinator.timeline.frames.map(f => packets.get(f.sequence_id))
                 .filter((x): x is Uint8Array => !!x);
+        if (chunks.length > 0 && latestDictRaw &&
+            Frame.getSizePrefixedRootAsFrame(new ByteBuffer(chunks[0]))
+                    .dictionaryLength() === 0)
+          chunks.unshift(latestDictRaw);
         const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
         let p = 0;
         for (const c of chunks) {
@@ -410,6 +435,13 @@ ctx.onmessage = ({data}) => {
         const imported = new Timeline();
         const raw = new Map<string, Uint8Array>();
         const importDecoder = new TelemetryDecoder();
+        let importedDictRaw: Uint8Array|null = null;
+        let leadingDictionary: {frame: Snapshot; raw: Uint8Array}|null = null;
+        const appendImported = (f: Snapshot, frameRaw: Uint8Array) => {
+          if (!imported.append(f))
+            throw Error('Log sequence/timestamps must strictly increase');
+          raw.set(f.sequence_id, frameRaw);
+        };
         let p = 0;
         while (p < bytes.length) {
           if (p + 4 > bytes.length) throw Error('Truncated log');
@@ -419,22 +451,43 @@ ctx.onmessage = ({data}) => {
           if (size < 16 || p + size > bytes.length)
             throw Error('Truncated log frame');
           const chunk = bytes.slice(p, p + size);
-          for (const {frame: f, raw: frameRaw} of
-               importDecoder.decodeFrames(chunk)) {
-            if (!imported.append(f))
-              throw Error('Log sequence/timestamps must strictly increase');
-            raw.set(f.sequence_id, frameRaw);
+          const decoded = importDecoder.decodeFrames(chunk);
+          if (leadingDictionary && decoded.length > 0) {
+            // Export may prepend a dictionary newer than the retained start.
+            // It seeds decoding only; its snapshot, if retained, comes later
+            // in the chronological slice.
+            if (BigInt(leadingDictionary.frame.sequence_id) <
+                BigInt(decoded[0].frame.sequence_id))
+              appendImported(leadingDictionary.frame, leadingDictionary.raw);
+            leadingDictionary = null;
           }
+          for (const entry of decoded) {
+            if (p === 0 &&
+                Frame.getSizePrefixedRootAsFrame(new ByteBuffer(chunk))
+                        .dictionaryLength() > 0)
+              leadingDictionary = entry;
+            else
+              appendImported(entry.frame, entry.raw);
+          }
+          if (Frame.getSizePrefixedRootAsFrame(new ByteBuffer(chunk))
+                  .dictionaryLength() > 0)
+            importedDictRaw = chunk;
           p += size;
         }
+        if (leadingDictionary)
+          appendImported(leadingDictionary.frame, leadingDictionary.raw);
         if (importDecoder.heldCount > 0)
           throw Error('Log ends before its channel dictionary');
+        const retained = new Set(imported.frames.map(f => f.sequence_id));
+        for (const sequenceId of raw.keys())
+          if (!retained.has(sequenceId)) raw.delete(sequenceId);
         // Commit only after the entire log validates. Deterministic import
         // ignores arrival time.
         close();
         reset();
         coordinator = new Coordinator(imported);
         packets = raw;
+        latestDictRaw = importedDictRaw;
         coordinator.seek(BigInt(imported.bounds()?.start ?? '0'));
         status = 'Replay log loaded';
         connection = 'replay';
