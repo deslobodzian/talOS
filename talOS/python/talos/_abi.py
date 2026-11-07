@@ -7,7 +7,7 @@ raise, with the C++ message, or with the Python exception a callback raised.
 import ctypes
 import os
 
-_EXPECTED_ABI_VERSION = 18
+_EXPECTED_ABI_VERSION = 19
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -99,6 +99,7 @@ _SIGNATURES = {
     "talos_node_next_update": (c_uint64, [c_void_p]),
     "talos_node_period_ns": (c_int64, [c_void_p]),
     "talos_node_config_path": (c_char_p, [c_void_p]),
+    "talos_node_session_dir": (c_char_p, [c_void_p]),
     "talos_node_param": (c_int32, [c_void_p, c_char_p, c_int32, c_int32,
                                    _P(Param)]),
     "talos_node_subscribe": (c_int64, [c_void_p, c_char_p, c_uint32,
@@ -158,6 +159,7 @@ _TESTING_SIGNATURES = {
     "talos_sim_create": (c_void_p, [c_char_p]),
     "talos_sim_from_toml": (c_void_p, [c_char_p]),
     "talos_sim_destroy": (None, [c_void_p]),
+    "talos_sim_set_session_dir": (c_int32, [c_void_p, c_char_p]),
     "talos_sim_add": (c_void_p, [c_void_p, c_char_p, FACTORY, c_void_p]),
     "talos_sim_node": (c_void_p, [c_void_p, c_char_p]),
     "talos_sim_step": (c_int32, [c_void_p, c_int64]),

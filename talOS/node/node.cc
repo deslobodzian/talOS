@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -88,6 +89,7 @@ struct Node::Impl {
   bool simulation = false;
   detail::LoopPort* loop = nullptr;
   detail::GraphSource graph;
+  std::optional<std::filesystem::path> session_dir;
   bool reads_graph = false;
   Duration period{};
   Duration timeout{};
@@ -237,6 +239,7 @@ Node::Node(detail::NodeSetup setup) : impl_{std::make_unique<Impl>()} {
   impl.simulation = setup.simulation;
   impl.loop = setup.loop;
   impl.graph = std::move(setup.graph);
+  impl.session_dir = std::move(setup.session_dir);
   impl.timeout =
       std::chrono::microseconds{impl.config->hardware.command_timeout_us};
 
@@ -268,6 +271,10 @@ Time Node::now() const { return impl_->loop->now(); }
 std::uint64_t Node::tick() const { return impl_->ticks; }
 Duration Node::period() const { return impl_->period; }
 const std::string& Node::config_path() const { return impl_->config_path; }
+
+std::optional<std::filesystem::path> Node::session_dir() const {
+  return impl_->session_dir;
+}
 
 void Node::after_update(std::function<void()> fn) {
   impl_->CheckOpen("after_update");
@@ -374,6 +381,10 @@ bool NodeAccess::reads_graph(const Node& node) {
 
 const config::RobotConfig& NodeAccess::robot_config(const Node& node) {
   return *node.impl_->config;
+}
+
+std::optional<std::filesystem::path> NodeAccess::session_dir(const Node& node) {
+  return node.impl_->session_dir;
 }
 
 std::size_t NodeAccess::add_state_machine(Node& node, std::int64_t initial) {
@@ -832,6 +843,7 @@ struct Flags {
   std::uint64_t session_id = 0;
   bool simulation = false;
   bool describe = false;
+  bool log_set = false;  // --log was passed (vs. the /tmp default)
 };
 
 Flags ParseFlags(int argc, char** argv, const char* node_name) {
@@ -845,6 +857,7 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
       flags.describe = true;
     } else if (arg == "--log" && i + 1 < argc) {
       flags.log_path = argv[++i];
+      flags.log_set = true;
     } else if (arg == "--session-id" && i + 1 < argc) {
       flags.session_id = std::stoull(argv[++i]);
     } else if (arg == "--config" && i + 1 < argc) {
@@ -929,6 +942,12 @@ Hosted Host(std::unique_ptr<LoopPort> port, const char* node_name,
       .simulation = flags.simulation,
       .loop = hosted.port.get(),
       .graph = GraphFromFlags(flags, node_name),
+      .session_dir =
+          flags.log_set
+              ? std::optional<std::filesystem::path>{std::filesystem::path{
+                    flags.log_path}
+                                                         .parent_path()}
+              : std::nullopt,
   });
   hosted.user = make(*hosted.node);
   NodeAccess::start(*hosted.node);

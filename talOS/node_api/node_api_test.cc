@@ -128,6 +128,30 @@ TEST_F(NodeApi, NodeSubscribesPublishesAndTicks) {
   EXPECT_EQ(talos_sim_now_ns(sim_), 25 * kMs);
 }
 
+TEST_F(NodeApi, SessionDirIsNullWithoutLog) {
+  Relay relay;
+  TalosNode* node = talos_sim_add(sim_, "relay", &BuildRelay, &relay);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  EXPECT_EQ(talos_node_session_dir(node), nullptr);
+}
+
+TEST_F(NodeApi, SessionDirSetBeforeAddIsVisibleToNodesAddedAfter) {
+  ASSERT_EQ(talos_sim_set_session_dir(sim_, "/tmp/talos_session"), TALOS_OK);
+  Relay relay;
+  TalosNode* node = talos_sim_add(sim_, "relay", &BuildRelay, &relay);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  EXPECT_STREQ(talos_node_session_dir(node), "/tmp/talos_session");
+}
+
+TEST_F(NodeApi, SessionDirClearedBeforeAddIsAbsent) {
+  ASSERT_EQ(talos_sim_set_session_dir(sim_, "/tmp/talos_session"), TALOS_OK);
+  ASSERT_EQ(talos_sim_set_session_dir(sim_, ""), TALOS_OK);
+  Relay relay;
+  TalosNode* node = talos_sim_add(sim_, "relay", &BuildRelay, &relay);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  EXPECT_EQ(talos_node_session_dir(node), nullptr);
+}
+
 // A second node on /relay/out with a same-size type of another schema.
 struct Impostor {
   int64_t in = -1;

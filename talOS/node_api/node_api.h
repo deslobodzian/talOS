@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 18u
+#define TALOS_NODE_ABI_VERSION 19u
 
 enum {
   TALOS_OK = 0,
@@ -77,6 +77,10 @@ uint64_t talos_node_tick(const TalosNode* node);
 uint64_t talos_node_next_update(const TalosNode* node);
 int64_t talos_node_period_ns(const TalosNode* node);
 const char* talos_node_config_path(const TalosNode* node);
+// The session output directory (the parent of --log), or NULL when there is
+// none (no --log: tests, --describe, --replay). The pointer is valid until
+// the next talos_node_session_dir call on this thread.
+const char* talos_node_session_dir(const TalosNode* node);
 
 // Parameter kinds. ANY takes the key's own type; LIST takes an array of
 // either element kind (an empty array reports DOUBLE_LIST).
@@ -304,6 +308,10 @@ int32_t talos_target_lane_release(TalosNode* node, int64_t lane);
 TalosSim* talos_sim_create(const char* config_path);
 TalosSim* talos_sim_from_toml(const char* robot_toml);
 void talos_sim_destroy(TalosSim* sim);
+// Sets the session output directory the nodes this Sim hosts report through
+// talos_node_session_dir. `path` NULL or "" clears it. Call before
+// talos_sim_add.
+int32_t talos_sim_set_session_dir(TalosSim* sim, const char* path);
 // Builds a node named `node_name` with `factory`. NULL on error.
 TalosNode* talos_sim_add(TalosSim* sim, const char* node_name,
                          TalosFactory factory, void* user);

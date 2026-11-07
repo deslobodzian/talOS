@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -65,6 +67,18 @@ void talos_sim_destroy(TalosSim* sim) {
   Guard<int>(0, [&] {
     delete reinterpret_cast<Sim*>(sim);
     return 0;
+  });
+}
+
+int32_t talos_sim_set_session_dir(TalosSim* sim, const char* path) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    Sim& s = AsSim(sim);
+    if (path == nullptr || path[0] == '\0') {
+      s.set_session_dir(std::nullopt);
+    } else {
+      s.set_session_dir(std::filesystem::path{path});
+    }
+    return TALOS_OK;
   });
 }
 

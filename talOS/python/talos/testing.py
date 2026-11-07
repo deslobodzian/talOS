@@ -60,6 +60,12 @@ class Sim:
         return cls(_handle=_abi.handle(
             lib.talos_sim_from_toml(_abi.encode(robot_toml))))
 
+    def set_session_dir(self, path):
+        """The session output directory (str) the nodes report via
+        Node.session_dir; None clears it. Call before add()."""
+        _abi.ok(lib.talos_sim_set_session_dir(
+            self._handle, None if path is None else _abi.encode(path)))
+
     def __del__(self):
         if getattr(self, "_handle", None):
             lib.talos_sim_destroy(self._handle)

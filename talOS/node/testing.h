@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -49,6 +50,11 @@ class Sim {
   // Advances virtual time, running every node's timers and deliveries.
   void step(Duration d);
   Time now() const;
+
+  // The session output directory the nodes this Sim hosts report through
+  // Node::session_dir(). nullopt (the default) means none, as under tests and
+  // --describe. Set it before adding nodes.
+  void set_session_dir(std::optional<std::filesystem::path> dir);
 
   template <Message M>
   void publish(std::string_view topic, const M& message) {

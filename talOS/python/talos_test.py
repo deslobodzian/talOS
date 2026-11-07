@@ -669,6 +669,23 @@ class StateMachineTest(unittest.TestCase):
 
 
 class ParamTest(unittest.TestCase):
+    def test_session_dir(self):
+        class Reader:
+            def __init__(self, node):
+                self.session_dir = node.session_dir
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        reader = sim.add(Reader, "follower")
+        self.assertIsNone(reader.session_dir)
+
+        sim.set_session_dir("/tmp/talos_session")
+        reader = sim.add(Reader, "planner")
+        self.assertEqual(reader.session_dir, "/tmp/talos_session")
+
+        sim.set_session_dir(None)
+        reader = sim.add(Reader, "lift")
+        self.assertIsNone(reader.session_dir)
+
     def test_fallback_and_missing(self):
         seen = {}
 
