@@ -25,8 +25,13 @@ Shared detector and scheduling defaults (overridable per camera):
 | --- | --- | --- |
 | `subsystem.period_us` | `10000` | Node/status period in microseconds (100 Hz), not the capture period. |
 | `camera.fps` | `60` | Requested live capture rate and maximum simulated capture rate, in frames per second. Must be finite and positive. |
-| `camera.latency_offset_us` | `0` | Per-camera capture-stamp correction in microseconds, live **and** sim: subtract from the capture timestamp before publication. |
+| `camera.latency_offset_us` | `0` | Subtracted only from live delivery/PTS timestamps, and from simulated timestamps. Never applied again to SOE/EOF or known midpoint stamps. |
 | `camera.sim_timestamp_lag_us` | `0` | Sim only: stamp the rendered truth instant this many microseconds later, modeling a timestamp taken after exposure. Ignored live, but validated in both modes. |
+| `camera.readout_us` | `0` | Known sensor readout duration subtracted from live EOF timestamps (unknown readout is zero). |
+| `camera.frame_timeout_us` | `500000` | Live silence deadline; positive, at most 10,000,000 µs. Reopens a connected but silent camera on the worker. |
+| `camera.exposure_ms` | `0` | Manual exposure duration; zero leaves duration unspecified. Also controls simulated exposure blur. |
+| `camera.gain` | `0` | Backend-native manual gain; zero leaves gain unspecified. |
+| `camera.auto_exposure`, `camera.auto_gain` | `true` when duration/gain is zero | Live automatic-control selection. A positive manual value defaults its automatic mode to false. |
 | `camera.mount_angle_std_rad` | `0.0175` | Extrinsic mount-rotation calibration uncertainty in radians (≈1 deg), live **and** sim, not sim-only. Added to the published covariance: field x/y variance gains `(range × value)²`, yaw variance gains `value²`. |
 | `camera.mount_translation_std_m` | `0.01` | Extrinsic mount-translation calibration uncertainty in metres, live **and** sim, not sim-only. Added to the published field x/y variance. |
 | `detector.decimate` | `2.0` | Dimensionless quad-search downsampling factor; 2.0 searches at half resolution, then refines edges at full resolution. |
@@ -36,12 +41,27 @@ Shared detector and scheduling defaults (overridable per camera):
 | `detector.hamming_threshold` | `1` | Maximum corrected tag-code bits (inclusive), passed to the decoder and checked for validity. |
 | `detector.min_decision_margin` | `30.0` | Minimum AprilTag decode-margin score (inclusive), measuring image-intensity contrast, not a probability or pose error. |
 
-Both timing keys must be finite, nonnegative and strictly below 1,000,000 µs;
-construction failures name the node and key. Measure each deployed camera's
-timestamp bias and set `latency_offset_us` in its own `[camera]` table; do not
-subtract processing/transport time already excluded by its capture timestamp.
-A correction that would underflow publishes an invalid observation, never an
-unsigned-wrapped future timestamp. The live path applies only the offset.
+Timing offsets and readout must be finite, nonnegative and strictly below
+1,000,000 µs; construction failures name the node and key. The single conversion
+boundary is observation publication (`CaptureMidpoint`): mapped V4L2 SOE adds
+half the successfully configured manual exposure; EOF subtracts half exposure
+plus known readout. Unknown/automatic exposure contributes zero, never a guessed
+duration. Delivery/host receipt and AVFoundation mapped PTS (which does not
+guarantee exposure semantics) subtract only `latency_offset_us`. Known midpoint
+stamps are unchanged. V4L2 non-monotonic timestamps fall back to host receipt;
+AVFoundation without a synchronized sample clock does likewise. Backends retain
+the source kind rather than claiming these are all exposure timestamps.
+Measure delivery/PTS bias per camera; do not subtract processing/transport delay
+already excluded by a hardware source timestamp. Underflow or future stamps
+publish invalid observations, never an unsigned-wrapped future timestamp.
+
+V4L2 applies automatic/manual exposure mode, manual exposure in 100 µs units,
+and requested gain controls before streaming. macOS AVFoundation supports
+automatic exposure mode, but not custom duration/ISO; manual requests remain
+visible as failed rather than silently ignored. Capture continues on failure:
+`controls_applied` is false and `control_failure_count` increments per open
+whose requested controls could not be applied. Check these before commissioning
+timing. The exposure correction is omitted after a control failure.
 
 Both mount-uncertainty keys must be finite and nonnegative. They model the
 residual calibration error left after mounting each camera, which the corner
@@ -272,8 +292,12 @@ Simulation ignores this requirement. With a configured device, construction
 starts a worker waiting for the first node-clock tick.
 The worker owns all device open/start/stop calls and all detection/localization.
 A missing or disconnected configured device is recreated with node-clock
-backoff of 1, 2, 4, then at most 8 seconds, resetting after a processed frame. This also
-recovers first-launch permission denial and capture-loop exits. The loop passes
+backoff of 0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4, then at most 8 seconds,
+resetting after a processed frame. This also recovers permission denial,
+capture-loop exits, and connected cameras with no frame for `frame_timeout_us`.
+The silence timer starts at successful open and resets on frame receipt;
+`stall_count` counts silence retirements and `reconnect_count` counts successful
+opens after the first successful connection. The loop passes
 time atomically and uses a nonblocking result-slot try-lock; it never opens a
 device, spawns a thread, or waits for worker work. Capture replaces one pending
 frame, and processing replaces one fixed-size completed observation. Replacements
@@ -281,7 +305,7 @@ in either slot count as dropped frames. Shutdown wakes and joins the worker,
 which stops capture before exiting. `--describe` never opens a camera.
 
 One observation is published per processed frame delivered to the loop, stamped
-with that frame's capture time minus `camera.latency_offset_us * 1000`.
+with the best-estimate mid-exposure time under the source-kind rule above.
 Missing tags and rejected estimates publish
 `valid = false`, never a held valid pose. Invalid detections are excluded from
 visibility and localization before range checking; valid camera-to-tag ranges
@@ -297,8 +321,10 @@ latency and never publish a valid pose. Simulation replay uses
 
 Framework telemetry supports every scalar in the status schema and observes all
 four camera streams. Its observers intentionally do not count as control
-consumers: graph lint reports the four status-only warnings. Eight scalar status
-channels per camera preserve the robot's radio-budget check; the status uses the
-enclosing log/telemetry timestamp instead of duplicating it as a scalar.
-`range_rejected_count` counts detections culled before localization.
+consumers: graph lint reports the four status-only warnings. The robot telemetry
+excludes cumulative capture/process/range counters and the new recovery/control
+fields, retaining its existing byte budget. All fields remain available in
+shared-memory status and dispatch logs; status uses the enclosing log timestamp
+instead of duplicating it as a scalar. `range_rejected_count` counts detections
+culled before localization.
 There is no side-channel vision server.

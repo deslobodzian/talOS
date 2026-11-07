@@ -215,7 +215,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | `/intake/state`: intake → telemetry | 32 | 20 B IntakeState, including FlatBuffers padding |
 | `/shooter/state`: shooter → telemetry | 40 | 32 B ShooterState, including FlatBuffers padding |
 | `/<camera>/state`: each camera → estimator/telemetry | 72 | 64 B geometry.PoseObservation, including padding |
-| `/<camera>/status`: each camera → telemetry | 64 | 56 B vision.VisionStatus, including padding |
+| `/<camera>/status`: each camera → telemetry | 96 | 88 B vision.VisionStatus, pinned in vision.h; append-only reconnect/stall/control-failure counters and controls_applied are excluded from robot telemetry, preserving its value-frame budget |
 | `/pose_estimator/state`: estimator → telemetry | 80 | 72 B geometry.PoseEstimate; `valid` = fresh usable odometry, `localized` = established field-frame trust; `localized` sits in existing payload padding |
 | `/sim/state`: physics sim_gateway → four simulated cameras / telemetry | 64 | 56 B geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
 | `/talos/telemetry`: telemetry → studio_bridge | 16392 × 64 slots | 16384 B byte payload capacity; ring = 1049088 B of slot storage; actual frames have padding stripped before WebSocket forwarding |

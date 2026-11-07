@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -42,15 +43,20 @@ namespace vision {
 // Construction only registers/configures: describing never opens hardware.
 class Vision {
  public:
-  explicit Vision(talos::Node& node)
+  using SourceFactory =
+      std::function<std::unique_ptr<talos::vision::CameraSource>(
+          const talos::vision::CameraSourceConfig&)>;
+  explicit Vision(talos::Node& node, SourceFactory factory = {})
       : node_(node),
-        simulated_(node.simulation()),
+        simulated_(node.simulation() && !factory),
         rasterize_(node.param("rasterize", true)),
         tag_size_(node.param("tag_size_m", 0.1651)),
         camera_id_(node.param<int>("camera.id")),
         device_(node.param<std::string>("camera.device", "")),
         state_(node.publish<geometry::PoseObservation>("state")),
         status_(node.publish<VisionStatus>("status")) {
+    source_factory_ = factory ? std::move(factory)
+                              : talos::vision::CreatePlatformCameraSource;
     if (simulated_) {
       truth_.emplace(node.subscribe<geometry::OdometrySample>(
           sim::topics::kState, {.optional = true}));
@@ -304,10 +310,13 @@ class Vision {
     if (completed) PublishObservation(*completed, now_ns);
     const bool healthy =
         healthy_ && (simulated_ || connected_.load(std::memory_order_acquire));
-    status_.send(VisionStatus{captured_, processed_, dropped_, frame_period_us_,
-                              last_latency_us_, rejected_range_, visible_,
-                              healthy});
+    status_.send(VisionStatus{
+        captured_, processed_, dropped_, frame_period_us_, last_latency_us_,
+        rejected_range_, visible_, healthy, reconnects_.load(), stalls_.load(),
+        control_failures_.load(), controls_applied_.load()});
   }
+
+  static_assert(sizeof(VisionStatus) == 88);
 
  private:
   struct Completed {
@@ -319,6 +328,8 @@ class Vision {
     std::uint32_t visible = 0;
     std::uint32_t rejected_range = 0;
     bool success = false;
+    talos::vision::TimestampKind timestamp_kind =
+        talos::vision::TimestampKind::kExposure;
   };
   static_assert(std::is_trivially_copyable_v<Completed>);
 
@@ -411,6 +422,12 @@ class Vision {
     };
     latency_offset_ns_ = duration_ns("latency_offset_us");
     sim_timestamp_lag_ns_ = duration_ns("sim_timestamp_lag_us");
+    readout_ns_ = duration_ns("readout_us");
+    const auto timeout_us = number("frame_timeout_us", 500000);
+    require(
+        std::isfinite(timeout_us) && timeout_us > 0 && timeout_us <= 10000000,
+        "camera.frame_timeout_us");
+    frame_timeout_ns_ = static_cast<std::int64_t>(timeout_us * 1000);
     require(camera_id_ >= 0 && camera_id_ <= 31, "camera.id");
     require(width >= 160 && width <= 4096, "camera.width");
     require(height >= 120 && height <= 2160, "camera.height");
@@ -430,7 +447,8 @@ class Vision {
         !std::isfinite(camera_.exposure_gain_std) ||
         !(camera_.exposure_gain_std >= 0) ||
         !std::isfinite(camera_.exposure_ms) || !(camera_.exposure_ms >= 0) ||
-        seed < 0 || !camera_.mounting.T_robot_camera.matrix().allFinite()) {
+        !(camera_.exposure_ms < 214748364) || seed < 0 ||
+        !camera_.mounting.T_robot_camera.matrix().allFinite()) {
       throw std::runtime_error("invalid vision camera: " +
                                std::string(node_.name()));
     }
@@ -438,6 +456,15 @@ class Vision {
     capture_config_.device_path = device_;
     capture_config_.width = width;
     capture_config_.height = height;
+    capture_config_.exposure_ms = camera_.exposure_ms;
+    capture_config_.gain = number("gain", 0);
+    require(std::isfinite(capture_config_.gain) && capture_config_.gain >= 0 &&
+                capture_config_.gain < 2147483647,
+            "camera.gain");
+    capture_config_.auto_exposure =
+        node_.param("camera.auto_exposure", camera_.exposure_ms == 0);
+    capture_config_.auto_gain =
+        node_.param("camera.auto_gain", capture_config_.gain == 0);
     capture_config_.fps = node_.param<double>("camera.fps", 60.0);
     if (!std::isfinite(capture_config_.fps) || capture_config_.fps <= 0) {
       throw std::invalid_argument(std::string(node_.name()) +
@@ -546,8 +573,10 @@ class Vision {
                     const std::optional<talos::vision::recording::TruthRecord>&
                         truth = std::nullopt) {
     auto result = pipeline_->ProcessFrame(frame);
-    return Localize(result.detections, frame.capture_timestamp_ns(),
-                    result.success, RecordingFeed{&frame, truth});
+    auto completed = Localize(result.detections, frame.capture_timestamp_ns(),
+                              result.success, RecordingFeed{&frame, truth});
+    completed.timestamp_kind = frame.timestamp_kind();
+    return completed;
   }
 
   Completed Simulate(const geometry::OdometrySample& truth) {
@@ -640,8 +669,16 @@ class Vision {
 
   void PublishObservation(const Completed& completed, std::uint64_t now_ns) {
     const auto stamp =
-        CorrectCaptureTimestamp(completed.capture_ns, latency_offset_ns_,
-                                simulated_ ? sim_timestamp_lag_ns_ : 0);
+        simulated_
+            ? CorrectCaptureTimestamp(completed.capture_ns, latency_offset_ns_,
+                                      sim_timestamp_lag_ns_)
+            : talos::vision::CaptureMidpoint(
+                  completed.capture_ns, completed.timestamp_kind,
+                  controls_applied_.load() && !capture_config_.auto_exposure
+                      ? static_cast<std::uint64_t>(capture_config_.exposure_ms *
+                                                   1e6)
+                      : 0,
+                  readout_ns_, latency_offset_ns_);
     const bool timestamp_valid = stamp && *stamp <= now_ns;
     const auto& observation = completed.observation;
     last_latency_us_ = timestamp_valid ? (now_ns - *stamp) / 1000 : 0;
@@ -657,25 +694,32 @@ class Vision {
   // node clock supplied by update(), never a wall-clock timer.
   bool OpenCamera() {
     if (!CanCapture(simulated_, device_)) return false;
-    source_ = talos::vision::CreatePlatformCameraSource(capture_config_);
+    source_ = source_factory_(capture_config_);
     if (!source_) return false;
     source_->SetFrameCallback([this](const talos::vision::Frame& frame) {
       {
         std::lock_guard lock(mutex_);
         if (stopping_.load(std::memory_order_acquire)) return;
         ++received_;
+        last_received_ns_.store(worker_now_ns_.load(std::memory_order_acquire),
+                                std::memory_order_release);
         if (pending_) ++worker_dropped_;
         pending_ = frame;
       }
       wake_.notify_one();
     });
-    return source_->Start() && source_->IsRunning() && source_->IsConnected();
+    const bool opened =
+        source_->Start() && source_->IsRunning() && source_->IsConnected();
+    controls_applied_.store(opened && source_->controls_applied());
+    if (opened && !source_->controls_applied()) ++control_failures_;
+    return opened;
   }
 
   void Work() {
     std::int64_t serviced_ns = -1;
     std::int64_t retry_at_ns = 0;
-    std::int64_t retry_delay_ns = 1000000000;
+    std::int64_t retry_delay_ns = 100000000;
+    bool opened_once = false;
     while (!stopping_.load(std::memory_order_acquire)) {
       std::optional<talos::vision::Frame> frame;
       {
@@ -689,6 +733,15 @@ class Vision {
         if (serviced_ns < 0) continue;
         frame = std::move(pending_);
         pending_.reset();
+      }
+      const auto last_received =
+          last_received_ns_.load(std::memory_order_acquire);
+      const bool stalled = source_ && connected_.load() &&
+                           serviced_ns >= last_received &&
+                           serviced_ns - last_received >= frame_timeout_ns_;
+      if (stalled) {
+        ++stalls_;
+        source_->Stop();
       }
       if (!source_ || !source_->IsRunning() || !source_->IsConnected()) {
         const bool was_connected =
@@ -720,6 +773,11 @@ class Vision {
           opened = false;
         }
         connected_.store(opened, std::memory_order_release);
+        if (opened) {
+          if (opened_once) ++reconnects_;
+          opened_once = true;
+          last_received_ns_.store(serviced_ns, std::memory_order_release);
+        }
         retry_at_ns = serviced_ns + retry_delay_ns;
         retry_delay_ns = std::min<std::int64_t>(retry_delay_ns * 2, 8000000000);
         if (!opened) {
@@ -740,7 +798,7 @@ class Vision {
         result = Completed{
             static_cast<std::uint64_t>(frame->capture_timestamp_ns())};
       }
-      retry_delay_ns = 1000000000;
+      retry_delay_ns = 100000000;
       retry_at_ns = serviced_ns + retry_delay_ns;
       {
         std::lock_guard lock(mutex_);
@@ -801,6 +859,12 @@ class Vision {
   double recording_sample_hz_ = 1.0, recording_rejected_hz_ = 1.0;
   std::uint64_t recording_max_bytes_ = 268435456;
   std::unique_ptr<talos::vision::CameraSource> source_;
+  SourceFactory source_factory_;
+  std::uint64_t readout_ns_ = 0;
+  std::int64_t frame_timeout_ns_ = 500000000;
+  std::atomic<std::int64_t> last_received_ns_{0};
+  std::atomic<std::uint64_t> reconnects_{0}, stalls_{0}, control_failures_{0};
+  std::atomic<bool> controls_applied_{true};
   std::thread worker_;
   std::mutex mutex_;
   std::condition_variable wake_;

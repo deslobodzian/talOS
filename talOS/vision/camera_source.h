@@ -86,6 +86,8 @@ class CameraSource {
   virtual bool IsConnected() const = 0;
   // Cumulative source-side drops, including exhausted reusable buffers.
   virtual uint64_t dropped_frames() const { return 0; }
+  // False when requested controls could not be applied; capture may continue.
+  virtual bool controls_applied() const { return true; }
 };
 
 }  // namespace talos::vision

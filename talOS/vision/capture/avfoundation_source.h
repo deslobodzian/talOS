@@ -40,6 +40,8 @@ struct CameraSourceConfig {
   PixelFormat format{PixelFormat::kGray8};
   double exposure_ms{0.0};
   double gain{0.0};
+  bool auto_exposure{false};
+  bool auto_gain{false};
 };
 std::unique_ptr<CameraSource> CreatePlatformCameraSource(
     const CameraSourceConfig& config);

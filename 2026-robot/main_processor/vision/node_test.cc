@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1216,6 +1217,184 @@ TEST(VisionTest, ShutdownWithRecordingActiveCompletesPromptly) {
   EXPECT_LT(elapsed, std::chrono::seconds{5})
       << "shutdown with recording active took "
       << std::chrono::duration<double>(elapsed).count() << " s";
+}
+
+struct FakeCameraDevice {
+  std::mutex mutex;
+  talos::vision::FrameCallback callback;
+  talos::vision::CameraSourceConfig config;
+  std::atomic<int> starts{0}, stops{0};
+  std::atomic<bool> allow_start{true}, apply_controls{true};
+
+  void Emit(std::int64_t stamp, talos::vision::TimestampKind kind) {
+    std::lock_guard lock(mutex);
+    if (!callback) return;
+    talos::vision::Frame frame(config.camera_id, 1, 0,
+                               talos::Time::from_nanos(stamp), config.width,
+                               config.height);
+    frame.set_timestamp_kind(kind);
+    callback(frame);
+  }
+};
+
+class FakeCameraSource final : public talos::vision::CameraSource {
+ public:
+  FakeCameraSource(std::shared_ptr<FakeCameraDevice> device,
+                   const talos::vision::CameraSourceConfig& config)
+      : device_(std::move(device)) {
+    std::lock_guard lock(device_->mutex);
+    device_->config = config;
+  }
+  uint32_t camera_id() const override { return 0; }
+  std::string device_id() const override { return "fake"; }
+  std::string name() const override { return "fake"; }
+  std::vector<talos::vision::CameraMode> SupportedModes() const override {
+    return {};
+  }
+  talos::vision::CameraMode CurrentMode() const override { return {}; }
+  bool SetMode(const talos::vision::CameraMode&) override { return true; }
+  talos::vision::CameraControls GetControls() const override { return {}; }
+  bool SetControls(const talos::vision::CameraControls&) override {
+    return true;
+  }
+  void SetFrameCallback(talos::vision::FrameCallback callback) override {
+    std::lock_guard lock(device_->mutex);
+    device_->callback = std::move(callback);
+  }
+  void SetConnectionCallback(talos::vision::ConnectionCallback) override {}
+  bool Start() override {
+    ++device_->starts;
+    running_ = device_->allow_start;
+    return running_;
+  }
+  void Stop() override {
+    ++device_->stops;
+    running_ = false;
+    std::lock_guard lock(device_->mutex);
+    device_->callback = {};
+  }
+  bool IsRunning() const override { return running_; }
+  bool IsConnected() const override { return running_; }
+  bool controls_applied() const override { return device_->apply_controls; }
+
+ private:
+  std::shared_ptr<FakeCameraDevice> device_;
+  bool running_ = false;
+};
+
+struct LiveTestVision : Vision {
+  inline static std::shared_ptr<FakeCameraDevice> device;
+  explicit LiveTestVision(talos::Node& node)
+      : Vision(node, [camera = device](const auto& config) {
+          return std::make_unique<FakeCameraSource>(camera, config);
+        }) {}
+};
+
+void AdvanceLive(talos::testing::Sim& sim, int milliseconds) {
+  for (int i = 0; i < milliseconds; ++i) {
+    sim.step(1ms);
+    // Give the real acquisition worker service opportunities on the simulated
+    // clock. No camera or wall-clock watchdog is involved.
+    std::this_thread::sleep_for(200us);
+  }
+}
+
+TEST(VisionTest, LiveControlsReachBackendAndFailuresAppearInStatus) {
+  for (bool applied : {true, false}) {
+    auto device = std::make_shared<FakeCameraDevice>();
+    device->apply_controls = applied;
+    LiveTestVision::device = device;
+    auto sim = MakeSim(false, true,
+                       "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                       "exposure_ms = 4.5\ngain = 12\n"
+                       "auto_exposure = false\nauto_gain = false\n",
+                       "period_us = 1000\n");
+    sim.add<LiveTestVision>("rear_right_camera");
+    AdvanceLive(sim, 30);
+    ASSERT_EQ(device->starts, 1);
+    {
+      std::lock_guard lock(device->mutex);
+      EXPECT_DOUBLE_EQ(device->config.exposure_ms, 4.5);
+      EXPECT_DOUBLE_EQ(device->config.gain, 12);
+      EXPECT_FALSE(device->config.auto_exposure);
+      EXPECT_FALSE(device->config.auto_gain);
+    }
+    const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
+    ASSERT_TRUE(status);
+    EXPECT_EQ(status->controls_applied(), applied);
+    EXPECT_EQ(status->control_failure_count(), applied ? 0 : 1);
+    const auto stamp = sim.now().nanos() - 10000000;
+    device->Emit(stamp, talos::vision::TimestampKind::kEndOfFrame);
+    AdvanceLive(sim, 20);
+    const auto observation =
+        sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
+    ASSERT_TRUE(observation);
+    EXPECT_EQ(observation->sample_time_ns(), stamp - (applied ? 2250000 : 0));
+  }
+}
+
+TEST(VisionTest, SilentLiveCameraReopensWithBackoffAndCountsRecovery) {
+  auto device = std::make_shared<FakeCameraDevice>();
+  LiveTestVision::device = device;
+  auto sim =
+      MakeSim(false, true, "device = \"fake\"\nframe_timeout_us = 50000\n",
+              "period_us = 1000\n");
+  sim.add<LiveTestVision>("rear_right_camera");
+  AdvanceLive(sim, 30);
+  ASSERT_EQ(device->starts, 1);
+  device->allow_start = false;
+  AdvanceLive(sim, 50);
+  auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
+  ASSERT_TRUE(status);
+  EXPECT_EQ(status->stall_count(), 1);
+  EXPECT_EQ(device->starts, 1);  // Initial 100 ms retry deadline.
+  AdvanceLive(sim, 50);
+  EXPECT_EQ(device->starts, 2);
+  AdvanceLive(sim, 120);
+  EXPECT_EQ(device->starts, 2);  // Failed reopen doubled backoff to 200 ms.
+  device->allow_start = true;
+  AdvanceLive(sim, 90);
+  ASSERT_EQ(device->starts, 3);
+  status = sim.latest<VisionStatus>("/rear_right_camera/status");
+  ASSERT_TRUE(status);
+  EXPECT_EQ(status->reconnect_count(), 1);
+  EXPECT_EQ(status->stall_count(), 1);
+  EXPECT_GE(device->stops, 2);
+}
+
+TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
+  using talos::vision::TimestampKind;
+  auto device = std::make_shared<FakeCameraDevice>();
+  LiveTestVision::device = device;
+  auto sim = MakeSim(false, true,
+                     "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "frame_timeout_us = 50000\nexposure_ms = 4\n"
+                     "readout_us = 1000\nlatency_offset_us = 10000\n",
+                     "period_us = 1000\n");
+  sim.add<LiveTestVision>("rear_right_camera");
+  AdvanceLive(sim, 30);
+  // No DS, no targets: camera sensing/recovery also runs while disabled and
+  // cannot depend on a fresh actuation target.
+  for (auto kind : {TimestampKind::kStartOfExposure, TimestampKind::kEndOfFrame,
+                    TimestampKind::kDelivery, TimestampKind::kPresentation}) {
+    const auto stamp = sim.now().nanos() - 10000000;
+    device->Emit(stamp, kind);
+    AdvanceLive(sim, 20);
+    const auto observation =
+        sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
+    ASSERT_TRUE(observation);
+    const auto correction = kind == TimestampKind::kStartOfExposure ? -2000000
+                            : kind == TimestampKind::kEndOfFrame    ? 3000000
+                                                                    : 10000000;
+    EXPECT_EQ(observation->sample_time_ns(), stamp - correction);
+  }
+  const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
+  ASSERT_TRUE(status);
+  EXPECT_EQ(status->frames_captured_count(), 4);
+  EXPECT_EQ(status->frames_processed_count(), 4);
+  EXPECT_EQ(status->stall_count(), 0);
+  EXPECT_EQ(status->reconnect_count(), 0);
+  EXPECT_EQ(device->starts, 1);
 }
 }  // namespace
 }  // namespace vision

@@ -50,11 +50,8 @@ std::vector<CameraMode> Modes(AVCaptureDevice* device) {
 }
 class Source final : public CameraSource {
  public:
-  Source(uint32_t id, std::string device, double exposure_ms = 0)
-      : id_(id),
-        device_id_(std::move(device)),
-        exposure_ms_(std::isfinite(exposure_ms) && exposure_ms > 0 ? exposure_ms
-                                                                   : 0) {}
+  Source(uint32_t id, std::string device)
+      : id_(id), device_id_(std::move(device)) {}
   ~Source() override { Stop(); }
   uint32_t camera_id() const override { return id_; }
   std::string device_id() const override { return device_id_; }
@@ -75,9 +72,7 @@ class Source final : public CameraSource {
   }
   CameraControls GetControls() const override { return controls_; }
   bool SetControls(const CameraControls& c) override {
-    // macOS AVFoundation does not expose manual duration/ISO. Do not claim to
-    // set them.
-    if (!c.auto_exposure || !c.auto_gain) return false;
+    if (running_) return false;
     controls_ = c;
     return true;
   }
@@ -89,6 +84,7 @@ class Source final : public CameraSource {
   }
   bool IsRunning() const override { return running_; }
   bool IsConnected() const override { return running_ && device_.connected; }
+  bool controls_applied() const override { return controls_applied_; }
   bool Start() override {
     if (running_) return true;
     @autoreleasepool {
@@ -154,6 +150,14 @@ class Source final : public CameraSource {
         }
         if (selected) break;
       }
+      // macOS exposes exposure-mode selection, but not custom duration/ISO.
+      // Keep streaming when unsupported and surface the failed request.
+      controls_applied_ =
+          controls_.auto_exposure && controls_.auto_gain &&
+          [device_ isExposureModeSupported:
+                       AVCaptureExposureModeContinuousAutoExposure];
+      if (controls_applied_)
+        device_.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
       [device_ unlockForConfiguration];
       if (!selected) {
         [session_ commitConfiguration];
@@ -268,8 +272,7 @@ class Source final : public CameraSource {
           CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), hostPTS));
       if (std::isfinite(age) && age >= 0 && age < 5) {
         frame.set_capture_time(event::MonotonicTime::from_nanos(
-            event::Poller::now().nanos() - static_cast<int64_t>(age * 1e9) -
-            static_cast<int64_t>(exposure_ms_ * 5e5)));
+            event::Poller::now().nanos() - static_cast<int64_t>(age * 1e9)));
         frame.set_timestamp_kind(TimestampKind::kPresentation);
         frame.set_mapping_quality(TimestampMappingQuality::kInterpolated);
       }
@@ -284,7 +287,7 @@ class Source final : public CameraSource {
   ConnectionCallback connection_;
   std::atomic<bool> running_{false};
   std::atomic<uint64_t> dropped_frames_{0};
-  const double exposure_ms_;
+  bool controls_applied_{true};
   uint64_t session_id_ = 0, sequence_ = 0;
   std::array<std::shared_ptr<std::vector<uint8_t>>, 2> buffers_;
   size_t next_buffer_{0};
@@ -318,8 +321,9 @@ std::unique_ptr<CameraSource> CreateCaptureSource(uint32_t id,
 }
 std::unique_ptr<CameraSource> CreatePlatformCameraSource(
     const CameraSourceConfig& config) {
-  auto source = std::make_unique<Source>(config.camera_id, config.device_path,
-                                         config.exposure_ms);
+  auto source = std::make_unique<Source>(config.camera_id, config.device_path);
+  source->SetControls({config.exposure_ms, config.gain, config.auto_exposure,
+                       config.auto_gain});
   source->SetMode({config.width, config.height, config.fps, config.format});
   return source;
 }

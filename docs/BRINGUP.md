@@ -62,12 +62,25 @@
    shift from fixed mounting bias. A timestamped LED/blink exposure test is an
    alternative. Set `[camera] latency_offset_us` in that camera's TOML to the
    measured nonnegative delay (default 0, finite and below 1,000,000 µs).
-   Published `sample_time_ns = capture_ns - latency_offset_us * 1000`;
-   do not subtract processing delay if the source already timestamps exposure.
+   This offset applies only to delivery/host-receipt or AVFoundation PTS stamps.
+   V4L2 SOE adds half manual exposure; EOF subtracts half exposure plus configured
+   `readout_us` (default zero if unknown). Neither gets the delivery offset.
+   Do not subtract processing delay already excluded by a hardware timestamp.
    Rebuild/redeploy and repeat the motion check: timestamp alignment should
    improve, and status `last_latency_us` now includes the correction. Leave
    `sim_timestamp_lag_us = 0` on the robot; it is a sim-only injection, ignored
    live, not a calibration setting.
+7. Set positive `camera.exposure_ms` / `camera.gain` for manual capture (or
+   explicitly set `auto_exposure` / `auto_gain`). Confirm status
+   `controls_applied = true` and `control_failure_count = 0`; macOS does not
+   expose custom duration/ISO, so manual requests report failure. Verify with a
+   blink/motion test rather than assuming a configured value reached hardware.
+8. Test a USB stall/unplug while disabled. After `frame_timeout_us` of silence
+   (default 500,000 µs), `stall_count` increments and the worker closes/reopens
+   with 100 ms–8 s exponential backoff. `reconnect_count` increments on successful
+   recovery, not failed attempts. Confirm frames resume without restarting the
+   node. New recovery/control fields are logged locally, excluded from radio
+   telemetry to keep its byte budget unchanged.
 
 The tool uses OpenCV 4.12's ChArUco detector: the BCR module exposes both
 `@opencv//:objdetect` and `@opencv//:calib3d`. Calibration uses the five-coefficient

@@ -40,6 +40,8 @@ class Source final : public CameraSource {
     mode_ = {config_.width, config_.height, config_.fps, config_.format};
     controls_.exposure_ms = config_.exposure_ms;
     controls_.gain = config_.gain;
+    controls_.auto_exposure = config_.auto_exposure;
+    controls_.auto_gain = config_.auto_gain;
   }
   ~Source() override { Stop(); }
   uint32_t camera_id() const override { return config_.camera_id; }
@@ -76,6 +78,7 @@ class Source final : public CameraSource {
   bool IsRunning() const override { return running_; }
   bool IsConnected() const override { return running_; }
   uint64_t dropped_frames() const override { return dropped_frames_.load(); }
+  bool controls_applied() const override { return controls_applied_; }
   bool Start() override {
     if (running_) {
       return true;
@@ -144,24 +147,13 @@ class Source final : public CameraSource {
     parm.parm.capture.timeperframe = {
         1000, static_cast<uint32_t>(std::lround(mode_.fps * 1000))};
     Ioctl(fd_, VIDIOC_S_PARM, &parm);
-    auto control = [this](uint32_t id, int32_t value) {
-      v4l2_control c{};
-      c.id = id;
-      c.value = value;
-      Ioctl(fd_, VIDIOC_S_CTRL, &c);
-    };
-    control(V4L2_CID_EXPOSURE_AUTO, controls_.auto_exposure
-                                        ? V4L2_EXPOSURE_AUTO
-                                        : V4L2_EXPOSURE_MANUAL);
-    if (!controls_.auto_exposure && std::isfinite(controls_.exposure_ms) &&
-        controls_.exposure_ms > 0 && controls_.exposure_ms < 214748364) {
-      control(V4L2_CID_EXPOSURE_ABSOLUTE,
-              static_cast<int32_t>(std::lround(controls_.exposure_ms * 10)));
-    }
-    if (std::isfinite(controls_.gain) && controls_.gain >= 0 &&
-        controls_.gain < 2147483647) {
-      control(V4L2_CID_GAIN, static_cast<int32_t>(std::lround(controls_.gain)));
-    }
+    controls_applied_ =
+        ApplyV4L2Controls(controls_, [this](uint32_t id, int32_t value) {
+          v4l2_control control{};
+          control.id = id;
+          control.value = value;
+          return Ioctl(fd_, VIDIOC_S_CTRL, &control) == 0;
+        });
     v4l2_requestbuffers request{};
     request.count = 4;
     request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -285,16 +277,13 @@ class Source final : public CameraSource {
           !(buffer.flags & V4L2_BUF_FLAG_ERROR) &&
           buffer.bytesused >= bytes->size()) {
         std::memcpy(bytes->data(), mappings_[buffer.index].data, bytes->size());
-        const double exposure =
-            std::isfinite(controls_.exposure_ms) && controls_.exposure_ms > 0
-                ? controls_.exposure_ms
-                : 0;
+        // Preserve source meaning; the camera publication boundary converts
+        // SOE/EOF to midpoint once, and delivery uses measured latency only.
         Frame frame(config_.camera_id, session_, sequence_++,
-                    event::MonotonicTime::from_nanos(
-                        capture_end - static_cast<int64_t>(exposure * 500000)),
-                    mode_.width, mode_.height, stride_, mode_.format, bytes);
+                    event::MonotonicTime::from_nanos(capture_end), mode_.width,
+                    mode_.height, stride_, mode_.format, bytes);
         frame.set_raw_timestamp_ns(driver_monotonic ? driver_time : delivery);
-        frame.set_timestamp_kind(TimestampKind::kExposure);
+        frame.set_timestamp_kind(V4L2TimestampKind(buffer.flags));
         frame.set_mapping_quality(TimestampMappingQuality::kEstimated);
         if (callback_) {
           callback_(frame);
@@ -322,6 +311,7 @@ class Source final : public CameraSource {
   ConnectionCallback connection_;
   int fd_{-1};
   bool streaming_{false};
+  bool controls_applied_{true};
   std::atomic<bool> running_{false};
   std::atomic<uint64_t> dropped_frames_{0};
   std::jthread worker_;

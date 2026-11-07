@@ -9,4 +9,8 @@ struct VisionStatus {
   range_rejected_count:uint64;
   visible_tag_count:uint32;
   healthy:bool;
+  reconnect_count:uint64;
+  stall_count:uint64;
+  control_failure_count:uint64;
+  controls_applied:bool;
 }

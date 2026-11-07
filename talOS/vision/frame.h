@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -60,12 +61,13 @@ enum class ClockDomain {
   kUnknown,
 };
 
-// Distinguishes mid-exposure integration timestamps from delivery/arrival
-// timestamps.
+// Meaning of the backend's mapped timestamp, before midpoint correction.
 enum class TimestampKind {
   kExposure,
   kDelivery,
   kPresentation,  // Source sample PTS; not asserted to be exposure midpoint.
+  kStartOfExposure,
+  kEndOfFrame,
 };
 
 // Quality indicator for device-to-host timestamp mapping.
@@ -75,6 +77,30 @@ enum class TimestampMappingQuality {
   kEstimated,       // Estimated via arrival time minus estimated latency
   kUnsynchronized,  // Raw unmapped or free-running clock
 };
+
+// One timing boundary: mapped source time -> estimated integration midpoint.
+// Presentation time has no guaranteed exposure relationship, so like delivery
+// it uses only the measured host-latency correction, never half an exposure.
+inline std::optional<uint64_t> CaptureMidpoint(uint64_t stamp_ns,
+                                               TimestampKind kind,
+                                               uint64_t exposure_ns,
+                                               uint64_t readout_ns,
+                                               uint64_t delivery_offset_ns) {
+  if (kind == TimestampKind::kStartOfExposure) {
+    if (stamp_ns > UINT64_MAX - exposure_ns / 2) return std::nullopt;
+    return stamp_ns + exposure_ns / 2;
+  }
+  uint64_t correction = 0;
+  if (kind == TimestampKind::kEndOfFrame) {
+    if (readout_ns > UINT64_MAX - exposure_ns / 2) return std::nullopt;
+    correction = readout_ns + exposure_ns / 2;
+  } else if (kind == TimestampKind::kDelivery ||
+             kind == TimestampKind::kPresentation) {
+    correction = delivery_offset_ns;
+  }
+  if (stamp_ns < correction) return std::nullopt;
+  return stamp_ns - correction;
+}
 
 // Carries camera identification, capture timing, dimensions, format,
 // and owned or shared frame buffer memory.
@@ -143,6 +169,10 @@ class Frame {
   uint64_t sequence_number() const { return sequence_number_; }
   void set_sequence_number(uint64_t seq) { sequence_number_ = seq; }
 
+  // Host-mapped source instant, interpreted by timestamp_kind().
+  // CaptureMidpoint converts it at the consumer's publication boundary; it is
+  // not necessarily an exposure midpoint just because it is in the host clock
+  // domain.
   talos::event::MonotonicTime capture_time() const { return capture_time_; }
   void set_capture_time(talos::event::MonotonicTime time) {
     capture_time_ = time;
