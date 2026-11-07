@@ -44,10 +44,17 @@ and mode). With none, a subsystem is neutral: it calls no actuator.
 - **superstructure**: STOWED → INTAKING (on INTAKE) → HOLDING (the intake
   has the piece) → RAISING (on SCORE_HIGH, elevator to `high_rot`) → SCORING
   (the elevator is at that height; intake ejects) → STOWED (the piece is gone).
-  It republishes both mechanism lanes every tick. When either mechanism's state
-  goes stale it holds the current step and keeps sending that step's goals; it
-  never advances on old data. No goal of its own (disabled, stale, released or
-  never sent) counts as STOW.
+  Cancellation is checked every tick: STOW or no goal (disabled, stale, released
+  or never sent) abandons the active sequence immediately. With fresh mechanism
+  statuses it requests intake IDLE and elevator height 0. If either status is
+  stale, it releases **both** mechanism lanes instead of renewing a high
+  elevator goal or EJECT. The mechanisms then have no target and are neutral;
+  this is not a gravity-compensating elevator hold. The reported sequence falls
+  back to HOLDING only when a fresh intake status still sees a piece, otherwise
+  STOWED. Once both statuses return, sequencing starts from those observations
+  and the current command, not the interrupted step: a piece that left during
+  the outage is not scored again. Normal sequencing republishes both lanes
+  every tick.
 
 Every tunable (voltages, eject time, tolerance, height) is a parameter read
 from the robot config: `node.param<T>("key")` in C++, `node.param("key")` in
@@ -110,10 +117,13 @@ voltages, the elevator's motion-magic demand, `at_goal`, the eject, and the
 return to STOWED. It also checks that disabling the robot neutralizes every
 motor (the superstructure, losing its own goal, steps back to HOLDING), that a
 missing, released or stale goal counts as STOW, and that stale mechanism
-states never advance the superstructure. The elevator alone goes neutral on a
-stale, released or never-sent lane, while disabled, on Driver Station loss,
-with the lift disconnected and on a non-finite goal; the intake alone goes
-neutral on a stale lane while keeping its state.
+statuses release both lanes. Coordinator-only tests cover STOW during stale
+RAISING, EJECT release during SCORING when either dependency goes stale,
+release/disable/goal expiry with stale statuses, and recovery from fresh
+observations without replaying a completed score. The elevator alone goes
+neutral on a stale, released or never-sent lane, while disabled, on Driver
+Station loss, with the lift disconnected and on a non-finite goal; the intake
+alone goes neutral on a stale lane while keeping its state.
 `py/superstructure_test.py` runs the same scenarios on the Python nodes with
 `talos.testing.Sim` and `config/robot_py.toml`.
 

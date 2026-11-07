@@ -275,6 +275,16 @@ class SuperstructureAlone : public ::testing::Test {
     EXPECT_TRUE(lane.has_value() && lane->active == 1);
     return lane.has_value() ? lane->message.height_rot() : -1.0;
   }
+  void ExpectLanesReleased() const {
+    const auto intake =
+        LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+    const auto elevator =
+        LatestTarget<ElevatorGoal>(sim, "elevator", "superstructure");
+    ASSERT_TRUE(intake.has_value());
+    ASSERT_TRUE(elevator.has_value());
+    EXPECT_EQ(intake->active, 0);
+    EXPECT_EQ(elevator->active, 0);
+  }
 
   const IntakeStatus kHolding{IntakeState::HOLDING, true};
   const ElevatorStatus kDown{ElevatorState::STOWED, 0.0, 0.0, true};
@@ -322,53 +332,124 @@ TEST_F(SuperstructureAlone, ScoringStowsOnExplicitCommandOrTargetRelease) {
   }
 }
 
-TEST_F(SuperstructureAlone, StaleStatusHoldsTheStateAndDoesNotAdvance) {
-  for (int i = 0; i < 5; ++i) {
-    Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
-  }
+TEST_F(SuperstructureAlone, StaleIntakeReleasesLanesUntilObservationsReturn) {
+  Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
   ASSERT_EQ(State(), SuperstructureState::HOLDING);
-
-  // The intake goes quiet for longer than command_timeout_us (100 ms).
   for (int i = 0; i < 6; ++i) {
-    Tick(SuperstructureCommand::INTAKE, std::nullopt, kDown);
-  }
-  // Its last word was "holding a piece", but it is stale: SCORE_HIGH must not
-  // raise, and HOLDING's goals (elevator down, intake idle) keep going out.
-  for (int i = 0; i < 10; ++i) {
     Tick(SuperstructureCommand::SCORE_HIGH, std::nullopt, kDown);
   }
+  EXPECT_EQ(State(), SuperstructureState::STOWED);
+  ExpectLanesReleased();
+
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
   EXPECT_EQ(State(), SuperstructureState::HOLDING);
   EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
-  const auto intake_lane =
-      LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
-  if (!intake_lane.has_value()) {
-    FAIL() << "no intake lane";
-  }
-  EXPECT_EQ(intake_lane->active, 1);
-  EXPECT_EQ(intake_lane->message.command(), IntakeCommand::IDLE);
-
-  // It reports again: RAISING.
   Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
-  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
-  ASSERT_EQ(State(), SuperstructureState::RAISING);
-  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), kHighRot);
-
-  // Now the elevator goes quiet past the timeout, and the driver lets go
-  // (STOW). Without a fresh elevator state it stays RAISING and keeps asking
-  // for the height rather than acting on old data.
-  for (int i = 0; i < 6; ++i) {
-    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, std::nullopt);
-  }
-  for (int i = 0; i < 10; ++i) {
-    Tick(SuperstructureCommand::STOW, kHolding, std::nullopt);
-  }
   EXPECT_EQ(State(), SuperstructureState::RAISING);
   EXPECT_DOUBLE_EQ(ElevatorGoalRot(), kHighRot);
+}
 
-  // A fresh at_goal for the high goal: SCORING.
-  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
-  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
-  EXPECT_EQ(State(), SuperstructureState::SCORING);
+TEST_F(SuperstructureAlone, StaleStatusWhileRaisingStowsImmediately) {
+  for (bool stale_intake : {false, true}) {
+    Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+    ASSERT_EQ(State(), SuperstructureState::RAISING);
+    for (int i = 0; i < 4; ++i) {
+      Tick(SuperstructureCommand::SCORE_HIGH,
+           stale_intake ? std::nullopt : std::optional{kHolding},
+           stale_intake ? std::optional{kDown} : std::nullopt);
+    }
+    ASSERT_EQ(State(), SuperstructureState::RAISING);
+
+    // STOW coincides with the first tick that sees the status as stale.
+    Tick(SuperstructureCommand::STOW,
+         stale_intake ? std::nullopt : std::optional{kHolding},
+         stale_intake ? std::optional{kDown} : std::nullopt);
+    EXPECT_EQ(State(), stale_intake ? SuperstructureState::STOWED
+                                   : SuperstructureState::HOLDING);
+    ExpectLanesReleased();
+
+    // Cancellation persists when the elevator reports its old high goal.
+    Tick(SuperstructureCommand::STOW, kHolding, kUp);
+    EXPECT_EQ(State(), SuperstructureState::HOLDING);
+    EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+  }
+}
+
+TEST_F(SuperstructureAlone, PieceLostWhileRaisingDoesNotStartEject) {
+  Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+  ASSERT_EQ(State(), SuperstructureState::RAISING);
+  Tick(SuperstructureCommand::SCORE_HIGH,
+       IntakeStatus{IntakeState::IDLE, false}, kUp);
+  EXPECT_EQ(State(), SuperstructureState::STOWED);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+  const auto intake =
+      LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+  ASSERT_TRUE(intake.has_value());
+  EXPECT_EQ(intake->active, 1);
+  EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+}
+
+TEST_F(SuperstructureAlone, StaleScoringReleasesEjectAndDoesNotReplayIt) {
+  const IntakeStatus empty{IntakeState::IDLE, false};
+  for (bool stale_intake : {false, true}) {
+    Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
+    ASSERT_EQ(State(), SuperstructureState::SCORING);
+    for (int i = 0; i < 6; ++i) {
+      Tick(SuperstructureCommand::SCORE_HIGH,
+           stale_intake ? std::nullopt : std::optional{kHolding},
+           stale_intake ? std::optional{kUp} : std::nullopt);
+    }
+    EXPECT_NE(State(), SuperstructureState::SCORING);
+    ExpectLanesReleased();
+
+    // The piece left while a dependency was silent. A held SCORE_HIGH must
+    // not replay EJECT or the high goal when current observations return.
+    for (int i = 0; i < 3; ++i) {
+      Tick(SuperstructureCommand::SCORE_HIGH, empty, kUp);
+      EXPECT_EQ(State(), SuperstructureState::STOWED);
+      EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+      const auto intake =
+          LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+      ASSERT_TRUE(intake.has_value());
+      EXPECT_EQ(intake->active, 1);
+      EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+    }
+  }
+}
+
+TEST_F(SuperstructureAlone, GoalLossAndDisableCancelWithStaleStatuses) {
+  for (int cancellation = 0; cancellation < 3; ++cancellation) {
+    Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
+    ASSERT_EQ(State(), SuperstructureState::SCORING);
+    for (int i = 0; i < 4; ++i) {
+      Tick(SuperstructureCommand::SCORE_HIGH, std::nullopt, std::nullopt);
+    }
+    ASSERT_EQ(State(), SuperstructureState::SCORING);
+    if (cancellation == 0)
+      ReleaseTarget<SuperstructureGoal>(sim, "superstructure", "teleop");
+    else if (cancellation == 1)
+      hw.enable(false);
+    sim.step(cancellation == 2 ? 120ms : 20ms);  // Released, disabled, expired.
+    EXPECT_EQ(State(), SuperstructureState::STOWED);
+    ExpectLanesReleased();
+
+    // Fresh mechanism states cannot revive a cancelled score.
+    sim.publish(topics::kIntakeStatus, kHolding);
+    sim.publish(topics::kElevatorStatus, kUp);
+    sim.step(20ms);
+    EXPECT_EQ(State(), SuperstructureState::HOLDING);
+    EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+    if (cancellation == 1) {
+      hw.enable();
+      sim.step(20ms);  // Refresh hardware without shifting the 20 ms test phase.
+    }
+  }
 }
 
 TEST_F(SuperstructureAlone, AtGoalForAnEarlierHeightDoesNotCount) {

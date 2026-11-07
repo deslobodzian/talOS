@@ -255,6 +255,12 @@ class SuperstructureAloneTest(unittest.TestCase):
         return self.sim.latest_target(ElevatorGoal, "elevator",
                                       "superstructure").height_rot
 
+    def assert_lanes_released(self):
+        self.assertIsNone(self.sim.latest_target(IntakeGoal, "intake",
+                                                "superstructure"))
+        self.assertIsNone(self.sim.latest_target(ElevatorGoal, "elevator",
+                                                "superstructure"))
+
     def test_stow_wins_when_raising_arrives_at_scoring_height(self):
         self.tick(Command.INTAKE, HOLDING, DOWN)
         self.tick(Command.SCORE_HIGH, HOLDING, DOWN)
@@ -289,38 +295,109 @@ class SuperstructureAloneTest(unittest.TestCase):
                                            "superstructure").command,
                     IntakeCommand.IDLE)
 
-    def test_stale_status_holds_the_state_and_does_not_advance(self):
-        self.tick(Command.INTAKE, HOLDING, DOWN, times=5)
+    def test_stale_intake_releases_lanes_until_observations_return(self):
+        self.tick(Command.INTAKE, HOLDING, DOWN)
         self.assertEqual(self.state(), SuperstructureState.HOLDING)
+        self.tick(Command.SCORE_HIGH, None, DOWN, times=6)
+        self.assertEqual(self.state(), SuperstructureState.STOWED)
+        self.assert_lanes_released()
 
-        # The intake goes quiet for longer than command_timeout_us (100 ms).
-        # Its last word was "holding a piece", but it is stale: SCORE_HIGH
-        # must not raise, and HOLDING's goals keep going out.
-        self.tick(Command.INTAKE, None, DOWN, times=6)
-        self.tick(Command.SCORE_HIGH, None, DOWN, times=10)
+        self.tick(Command.SCORE_HIGH, HOLDING, DOWN)
         self.assertEqual(self.state(), SuperstructureState.HOLDING)
+        self.assertEqual(self.elevator_goal_rot(), 0.0)
+        self.tick(Command.SCORE_HIGH, HOLDING, DOWN)
+        self.assertEqual(self.state(), SuperstructureState.RAISING)
+        self.assertEqual(self.elevator_goal_rot(), HIGH_ROT)
+
+    def test_stale_status_while_raising_stows_immediately(self):
+        for stale_intake in (False, True):
+            with self.subTest(stale_intake=stale_intake):
+                self.tick(Command.INTAKE, HOLDING, DOWN)
+                self.tick(Command.SCORE_HIGH, HOLDING, DOWN)
+                self.assertEqual(self.state(), SuperstructureState.RAISING)
+                self.tick(Command.SCORE_HIGH,
+                          None if stale_intake else HOLDING,
+                          DOWN if stale_intake else None, times=4)
+                self.assertEqual(self.state(), SuperstructureState.RAISING)
+
+                # STOW coincides with the first tick seeing a stale status.
+                self.tick(Command.STOW, None if stale_intake else HOLDING,
+                          DOWN if stale_intake else None)
+                self.assertEqual(
+                    self.state(), SuperstructureState.STOWED if stale_intake
+                    else SuperstructureState.HOLDING)
+                self.assert_lanes_released()
+
+                # The old high goal cannot revive the cancelled sequence.
+                self.tick(Command.STOW, HOLDING, UP)
+                self.assertEqual(self.state(), SuperstructureState.HOLDING)
+                self.assertEqual(self.elevator_goal_rot(), 0.0)
+
+    def test_piece_lost_while_raising_does_not_start_eject(self):
+        self.tick(Command.INTAKE, HOLDING, DOWN)
+        self.tick(Command.SCORE_HIGH, HOLDING, DOWN)
+        self.assertEqual(self.state(), SuperstructureState.RAISING)
+        self.tick(Command.SCORE_HIGH,
+                  dict(state=IntakeState.IDLE, has_piece=False), UP)
+        self.assertEqual(self.state(), SuperstructureState.STOWED)
         self.assertEqual(self.elevator_goal_rot(), 0.0)
         self.assertEqual(
             self.sim.latest_target(IntakeGoal, "intake",
                                    "superstructure").command,
             IntakeCommand.IDLE)
 
-        # It reports again: RAISING.
-        self.tick(Command.SCORE_HIGH, HOLDING, DOWN, times=2)
-        self.assertEqual(self.state(), SuperstructureState.RAISING)
-        self.assertEqual(self.elevator_goal_rot(), HIGH_ROT)
+    def test_stale_scoring_releases_eject_and_does_not_replay_it(self):
+        empty = dict(state=IntakeState.IDLE, has_piece=False)
+        for stale_intake in (False, True):
+            with self.subTest(stale_intake=stale_intake):
+                self.tick(Command.INTAKE, HOLDING, DOWN)
+                self.tick(Command.SCORE_HIGH, HOLDING, DOWN)
+                self.tick(Command.SCORE_HIGH, HOLDING, UP)
+                self.assertEqual(self.state(), SuperstructureState.SCORING)
+                self.tick(Command.SCORE_HIGH,
+                          None if stale_intake else HOLDING,
+                          UP if stale_intake else None, times=6)
+                self.assertNotEqual(self.state(), SuperstructureState.SCORING)
+                self.assert_lanes_released()
 
-        # Now the elevator goes quiet past the timeout, and the driver lets go
-        # (STOW). Without a fresh elevator state it stays RAISING and keeps
-        # asking for the height rather than acting on old data.
-        self.tick(Command.SCORE_HIGH, HOLDING, None, times=6)
-        self.tick(Command.STOW, HOLDING, None, times=10)
-        self.assertEqual(self.state(), SuperstructureState.RAISING)
-        self.assertEqual(self.elevator_goal_rot(), HIGH_ROT)
+                # The piece left while a dependency was silent. A held score
+                # must not replay EJECT or the high goal on fresh observations.
+                for _ in range(3):
+                    self.tick(Command.SCORE_HIGH, empty, UP)
+                    self.assertEqual(self.state(), SuperstructureState.STOWED)
+                    self.assertEqual(self.elevator_goal_rot(), 0.0)
+                    self.assertEqual(
+                        self.sim.latest_target(IntakeGoal, "intake",
+                                               "superstructure").command,
+                        IntakeCommand.IDLE)
 
-        # A fresh at_goal for the high goal: SCORING.
-        self.tick(Command.SCORE_HIGH, HOLDING, UP, times=2)
-        self.assertEqual(self.state(), SuperstructureState.SCORING)
+    def test_goal_loss_and_disable_cancel_with_stale_statuses(self):
+        for cancellation in ("released", "disabled", "expired"):
+            with self.subTest(cancellation=cancellation):
+                self.tick(Command.INTAKE, HOLDING, DOWN)
+                self.tick(Command.SCORE_HIGH, HOLDING, DOWN)
+                self.tick(Command.SCORE_HIGH, HOLDING, UP)
+                self.assertEqual(self.state(), SuperstructureState.SCORING)
+                self.tick(Command.SCORE_HIGH, None, None, times=4)
+                self.assertEqual(self.state(), SuperstructureState.SCORING)
+                if cancellation == "released":
+                    self.sim.release_target(SuperstructureGoal,
+                                            "superstructure", "teleop")
+                elif cancellation == "disabled":
+                    self.hw.enable(False)
+                self.sim.step(0.12 if cancellation == "expired" else 0.02)
+                self.assertEqual(self.state(), SuperstructureState.STOWED)
+                self.assert_lanes_released()
+
+                # Fresh mechanism states cannot revive a cancelled score.
+                self.sim.publish(IntakeStatus, "/intake/state", **HOLDING)
+                self.sim.publish(ElevatorStatus, "/elevator/state", **UP)
+                self.sim.step(0.02)
+                self.assertEqual(self.state(), SuperstructureState.HOLDING)
+                self.assertEqual(self.elevator_goal_rot(), 0.0)
+                if cancellation == "disabled":
+                    self.hw.enable()
+                    self.sim.step(0.02)  # Keep the 20 ms test phase unchanged.
 
     def test_at_goal_for_an_earlier_height_does_not_count(self):
         self.tick(Command.INTAKE, HOLDING, DOWN, times=5)
