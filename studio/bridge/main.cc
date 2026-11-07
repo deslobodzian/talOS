@@ -206,13 +206,16 @@ int main(int argc, char** argv) try {
     std::cout << talos::introspect::DescribeToJson(description);
     return 0;
   }
-  // `--declared` is lifted out before anything reads a position, so it can be
-  // passed anywhere on the line without shifting the positional arguments.
+  // `--declared` and `--manifest` are lifted out before anything reads a
+  // position, so either can be passed anywhere on the line without shifting
+  // the positional arguments.
   std::vector<const char*> args;
   std::string declared_path;
+  std::string manifest_path;
   for (int i = 0; i < argc; ++i) {
     const std::string_view argument = argv[i];
     static constexpr std::string_view kDeclared = "--declared";
+    static constexpr std::string_view kManifest = "--manifest";
     if (argument == kDeclared && i + 1 < argc) {
       declared_path = argv[++i];
       continue;
@@ -220,6 +223,15 @@ int main(int argc, char** argv) try {
     if (argument.starts_with(kDeclared) && argument.size() > kDeclared.size() &&
         argument[kDeclared.size()] == '=') {
       declared_path = argument.substr(kDeclared.size() + 1);
+      continue;
+    }
+    if (argument == kManifest && i + 1 < argc) {
+      manifest_path = argv[++i];
+      continue;
+    }
+    if (argument.starts_with(kManifest) && argument.size() > kManifest.size() &&
+        argument[kManifest.size()] == '=') {
+      manifest_path = argument.substr(kManifest.size() + 1);
       continue;
     }
     args.push_back(argv[i]);
@@ -233,6 +245,8 @@ int main(int argc, char** argv) try {
            "[topic=/talos/telemetry] [HTTP=5800] [webroot=studio/dist]\n"
            "       [--declared PATH]   the launcher's graph.json, served at "
            "/declared.json\n"
+           "       [--manifest PATH]   the launcher's manifest.json, served at "
+           "/manifest.json\n"
            "       [--describe]          print the --describe envelope and "
            "exit\n"
            "The publisher MUST use DROP_NEWEST; RTMS does not store this "
@@ -355,6 +369,35 @@ int main(int argc, char** argv) try {
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
         ->end(declared_json);
+  });
+  app.get("/manifest.json", [&](auto* res, auto*) {
+    // Re-read on every request: the launcher atomically replaces the manifest
+    // as nodes start, restart, and exit, so /manifest.json is the live view of
+    // restart counts and exit status. 404 when no path was given or the file
+    // is unreadable, so "no manifest" is not confused with "an empty manifest".
+    if (manifest_path.empty()) {
+      res->writeStatus("404 Not Found")->end();
+      return;
+    }
+    std::error_code error;
+    const std::uintmax_t size = fs::file_size(manifest_path, error);
+    if (error) {
+      res->writeStatus("404 Not Found")->end();
+      return;
+    }
+    if (size > static_cast<std::uintmax_t>(32) * 1024 * 1024) {
+      res->writeStatus("413 Content Too Large")->end();
+      return;
+    }
+    std::ifstream input(manifest_path, std::ios::binary);
+    if (!input) {
+      res->writeStatus("404 Not Found")->end();
+      return;
+    }
+    std::string body((std::istreambuf_iterator<char>(input)), {});
+    res->writeHeader("Content-Type", "application/json")
+        ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->end(body);
   });
   app.get("/*", [&](auto* res, auto* req) {
     auto url = std::string(req->getUrl());

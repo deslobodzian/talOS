@@ -987,7 +987,9 @@ class StudioBridge {
               std::to_string(http_port_),
               robot_config.studio.webroot,
               "--declared",
-              graph_path} {
+              graph_path,
+              "--manifest",
+              options.output_dir + "/manifest.json"} {
     proc.log_path.clear();
   }
 

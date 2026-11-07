@@ -1,0 +1,258 @@
+/* Robot panel (at-a-glance card grid). */
+
+.robot-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overflow: auto;
+  padding: 16px;
+}
+
+/* The card grid: three dense columns that collapse as the panel narrows. */
+.robot-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  align-content: start;
+  flex-shrink: 0;
+}
+
+.robot-card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.robot-card-head {
+  height: 38px;
+  padding: 0 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.robot-card-head h2 {
+  font-size: 12px;
+  font-weight: 500;
+  margin: 0;
+}
+.robot-card-head > span {
+  font-size: 8px;
+  letter-spacing: 1.2px;
+  color: var(--muted);
+}
+.robot-card-body {
+  flex: 1;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Strips hold the per-owner tiles below the card grid. They must not shrink
+ * when the panel column is shorter than the content (flex-shrink: 0), or a
+ * short panel collapses the strips into empty bordered bars and hides the
+ * tiles: the panel scrolls instead. */
+.robot-strip {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.robot-strip .tiles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px 14px;
+}
+
+/* --- Driver Station ------------------------------------------------------- */
+
+.ds-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mode-badge {
+  align-self: flex-start;
+  font-style: normal;
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 1px;
+  padding: 3px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-2);
+  color: var(--text-2);
+}
+.mode-badge.unknown {
+  border-style: dashed;
+  color: var(--muted);
+}
+.mode-badge.disabled { border-color: #3f4c5c; color: var(--ds-disabled); }
+.mode-badge.autonomous { border-color: #5f52a3; color: var(--ds-autonomous); }
+.mode-badge.teleop { border-color: #2f6f68; color: var(--ds-teleop); }
+.mode-badge.test { border-color: #7d6438; color: var(--ds-test); }
+.mode-badge.estop { border-color: #8a4a58; color: var(--ds-estop); }
+.mode-badge.disconnected { border: 1px dashed #8a4a58; color: var(--ds-disconnected); }
+
+/* --- Routine -------------------------------------------------------------- */
+
+.phase-current {
+  font-size: 22px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+
+/* --- Power ---------------------------------------------------------------- */
+
+.battery-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+.battery-v {
+  font-family: var(--font-mono);
+  font-size: 18px;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+/* --- Link ----------------------------------------------------------------- */
+
+.gateway {
+  margin-top: 10px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.gateway-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-2);
+}
+.gateway-row code {
+  font-family: var(--font-mono);
+}
+
+/* --- Pose ----------------------------------------------------------------- */
+
+.pose-error {
+  margin-top: 10px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 8px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--warn);
+}
+.pose-error.muted {
+  color: var(--muted);
+}
+
+/* --- Events --------------------------------------------------------------- */
+
+.events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.events li {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 11px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  border-left: 2px solid var(--info);
+  color: var(--text-2);
+}
+.events li.event-warn { border-left-color: var(--warn); }
+.events li.event-error { border-left-color: var(--error); color: #ffd4dc; }
+.events .event-detail {
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 45%;
+}
+.events .link {
+  flex-shrink: 0;
+}
+
+/* --- Subsystems and camera tiles ----------------------------------------- */
+
+.subsystem-tile,
+.camera-tile {
+  flex: 1 1 200px;
+  max-width: 260px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.tile-name {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tile-enabled,
+.tile-health {
+  font-size: 10px;
+  color: var(--muted);
+}
+.tile-enabled.on,
+.tile-health.good {
+  color: var(--ok);
+}
+.tile-enabled.off,
+.tile-health.bad {
+  color: var(--warn);
+}
+.tile-source {
+  font-size: 10px;
+  color: var(--text-3);
+}
+.tile-enum {
+  margin-top: 2px;
+  align-self: flex-start;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .4px;
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  border: 1px solid #7d6438;
+  background: #131f2c;
+  color: #ffd4dc;
+}
+.tile-metric {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-2);
+}

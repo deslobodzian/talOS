@@ -16,6 +16,37 @@ export type Snapshot = {
   units: Record<string, string>;
   labels: Record<string, string[]>
 };
+
+export type PlanarPose = Pick<Pose, 'x'|'y'|'yaw'>;
+
+// Mechanism-only frames have a required zero chassis and pose/valid = 0.
+// Older recordings without this flag always carried a real pose.
+export function poseValid(s: Snapshot|null|undefined): boolean {
+  if (!s) return false;
+  const v: number|undefined = s.channels['pose/valid'];
+  return v === undefined || v === 1;
+}
+
+// Telemetry removes the topic's leading slash and joins nested struct fields
+// with slashes (talOS/telemetry/node.h, ObserveDescribedTopic/FlattenStruct).
+// Missing or stale samples are absent from Snapshot.channels, not zero poses.
+export function simTruthPose(s: Snapshot|null|undefined): PlanarPose|null {
+  if (!s) return null;
+  const x = s.channels['sim/state/pose/x_m'],
+        y = s.channels['sim/state/pose/y_m'],
+        yaw = s.channels['sim/state/pose/yaw_rad'];
+  if (![x, y, yaw].every(Number.isFinite)) return null;
+  return {x, y, yaw};
+}
+
+export function poseError(estimate: PlanarPose, truth: PlanarPose):
+    {position_m: number; heading_deg: number} {
+  const yaw = estimate.yaw - truth.yaw;
+  return {
+    position_m: Math.hypot(estimate.x - truth.x, estimate.y - truth.y),
+    heading_deg: Math.atan2(Math.sin(yaw), Math.cos(yaw)) * 180 / Math.PI
+  };
+}
 export type Mode = 'PAUSED'|'LIVE_STREAMING'|'REPLAY_PLAYING';
 export const MAX_FRAME_BYTES = 16384;
 
@@ -189,6 +220,9 @@ export class TelemetryDecoder {
         const info = f.dictionary(i)!;
         const name = info.name()!;
         if (seen.has(name)) throw Error('Duplicate channel');
+        // Studio owns this namespace; never silently overwrite a wire channel.
+        if (name.startsWith('derived/'))
+          throw Error('Reserved derived/ channel namespace');
         seen.add(name);
         const labels: string[] = [];
         for (let j = 0; j < info.labelsLength(); j++)
@@ -219,7 +253,7 @@ export class TelemetryDecoder {
       if (Number.isNaN(value)) continue;
       channels[entry.name] = finite(value);
     }
-    return {
+    const snapshot: Snapshot = {
       stream_id: streamId,
       sequence_id: f.sequenceId().toString(),
       timestamp_ns: f.timestampNs().toString(),
@@ -229,6 +263,17 @@ export class TelemetryDecoder {
       units,
       labels
     };
+    // Derive once, before history/UI/RPC consume the snapshot. Missing inputs
+    // leave no reading (or unit) rather than inventing a zero-error sample.
+    const truth = simTruthPose(snapshot);
+    if (truth && poseValid(snapshot)) {
+      const error = poseError(snapshot.chassis, truth);
+      channels['derived/pose_error_m'] = error.position_m;
+      units['derived/pose_error_m'] = 'm';
+      channels['derived/heading_error_deg'] = error.heading_deg;
+      units['derived/heading_error_deg'] = 'deg';
+    }
+    return snapshot;
   }
 }
 

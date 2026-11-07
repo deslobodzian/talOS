@@ -1,0 +1,221 @@
+/* Frames panel: offline camera-frame viewer. */
+
+.frames {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px;
+  overflow: auto;
+}
+.frames-toolbar {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: #8fa7ba;
+}
+.frames-counts {
+  font-size: 10px;
+  color: var(--muted);
+}
+.frames-busy {
+  font-size: 10px;
+  color: var(--accent);
+}
+.frames-errors {
+  font-size: 10px;
+  color: #8fa7ba;
+  background: #131f2c;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+}
+.frames-errors summary {
+  cursor: pointer;
+  color: #9db1c4;
+}
+.frames-errors ul {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 140px;
+  overflow: auto;
+}
+.frames-errors li {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+.frames-errors li code {
+  font-size: 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 45%;
+}
+.frames-errors li span {
+  color: var(--warn);
+  flex: 1;
+}
+.frames-empty {
+  flex: 1;
+  min-height: 0;
+}
+.frames-grid {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: 290px minmax(340px, 1fr) minmax(270px, .85fr);
+}
+.frames-grid > .panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  min-width: 0;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius-md);
+}
+.frames-filters {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.frames-filters select {
+  max-width: 150px;
+  font-size: 11px;
+}
+.frames-list-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+.frame-item {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  border-radius: 0;
+  background: none;
+  padding: 8px 12px;
+  text-align: left;
+  font-size: 10px;
+  color: #bacbdb;
+  white-space: nowrap;
+}
+.frame-item:hover {
+  background: var(--surface-hover);
+}
+.frame-item.selected {
+  background: #172a34;
+  border-left: 2px solid var(--accent);
+}
+.frame-item code {
+  font-size: 9.5px;
+  color: #a8c4d4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.frame-item small {
+  font-size: 9px;
+  color: var(--muted);
+  margin-left: auto;
+}
+.frames-image-stage {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background: #0b131e;
+  overflow: hidden;
+}
+.frames-image-stage img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.frames-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.frames-legend {
+  flex-shrink: 0;
+  border-top: 1px solid var(--border-soft);
+  padding: 8px 12px;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 9px;
+  color: #9badbd;
+  max-height: 64px;
+  overflow: auto;
+}
+.frames-legend span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+.frames-legend i {
+  height: 5px;
+  width: 5px;
+  flex-shrink: 0;
+}
+.frames-legend span.valid i { background: var(--accent); }
+.frames-legend span.valid { color: #9fd8cf; }
+.frames-legend span.invalid i { background: var(--error); }
+.frames-legend span.invalid { color: var(--warn); }
+.frames-details-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.frames-details-body h4 {
+  margin: 6px 0 -6px;
+  font-size: 8px;
+  letter-spacing: 1.3px;
+  color: #879cb0;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+.frames-details-body .stat-list {
+  padding: 0;
+}
+.frames-note {
+  margin: 0;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.ui-badge.sampled { border-color: #2f6f68; color: #6fd8c9; }
+.ui-badge.rejected { border-color: #8a4a58; color: #ff9db0; }
+
+@media (max-width: 1100px) {
+  .frames-grid {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(160px, auto) minmax(260px, 1fr) minmax(200px, auto);
+  }
+}

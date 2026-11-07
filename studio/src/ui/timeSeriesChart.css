@@ -1,0 +1,64 @@
+/* Shared time-series chart (ui/TimeSeriesChart.tsx). */
+
+.ts-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ts-chart svg {
+  display: block;
+  border: 1px solid var(--border-soft);
+  background: #0b131e;
+  border-radius: var(--radius-sm);
+}
+
+.ts-chart svg.bare {
+  border: none;
+  background: none;
+  border-radius: 0;
+}
+
+.ts-chart-band {
+  fill: var(--ds-estop);
+  opacity: 0.16;
+}
+
+.ts-chart-threshold {
+  stroke: var(--warn);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+  vector-effect: non-scaling-stroke;
+}
+
+.ts-chart-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 60px;
+  color: var(--faint);
+  font-size: 11px;
+  border: 1px solid var(--border-soft);
+  background: #0b131e;
+  border-radius: var(--radius-sm);
+}
+
+.ts-chart-legend {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 9px;
+  color: var(--text-3);
+}
+
+.ts-chart-legend span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.ts-chart-legend i {
+  width: 8px;
+  height: 3px;
+  border-radius: 2px;
+}

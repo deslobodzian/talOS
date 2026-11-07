@@ -85,6 +85,15 @@ class BridgeIntegration(unittest.TestCase):
                               b'"message_bytes":48,"external":false,"optional":false}]}],'
                               b'"diagnostics":[]}')
             declared.write_bytes(declared_bytes)
+            # The launcher's session manifest, like the declared graph, lives
+            # outside the webroot so the route cannot be confused with the
+            # static file handler. The bridge re-reads it per request, so the
+            # test rewrites it below to prove /manifest.json is live.
+            manifest = Path(outputs, "manifest.json")
+            manifest_bytes = (b'{"session_id":"7","config_path":"robot.toml",'
+                              b'"nodes":[{"name":"drivetrain","restart_count":0,'
+                              b'"exit_code":0}]}')
+            manifest.write_bytes(manifest_bytes)
             with socket.socket() as reservation:
                 reservation.bind(("127.0.0.1", 0))
                 http_port = reservation.getsockname()[1]
@@ -99,7 +108,8 @@ class BridgeIntegration(unittest.TestCase):
                 # exists; the mock prints "ready" once it has created it.
                 self.assertEqual(mock.stdout.readline().strip(), "ready")
                 bridge = subprocess.Popen([str(binaries / "studio_bridge"), "--drop-newest-publisher", topic,
-                                           str(http_port), webroot, "--declared", str(declared)])
+                                           str(http_port), webroot, "--declared", str(declared),
+                                           "--manifest", str(manifest)])
                 processes.append(bridge)
                 # The same bridge with no declared graph, to pin down what
                 # /declared.json does then. Started here so both are up while
@@ -226,6 +236,20 @@ class BridgeIntegration(unittest.TestCase):
                     self.assertEqual(response.read(), declared_bytes)
                     self.assertEqual(response.headers["Content-Type"], "application/json")
 
+                # The session manifest is served the same way, but re-read per
+                # request: rewriting the file changes what /manifest.json
+                # returns, because the launcher keeps it current in place.
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{http_port}/manifest.json", timeout=3) as response:
+                    self.assertEqual(response.read(), manifest_bytes)
+                    self.assertEqual(response.headers["Content-Type"], "application/json")
+                updated_manifest_bytes = manifest_bytes.replace(b'"restart_count":0',
+                                                                b'"restart_count":1')
+                manifest.write_bytes(updated_manifest_bytes)
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{http_port}/manifest.json", timeout=3) as response:
+                    self.assertEqual(response.read(), updated_manifest_bytes)
+
                 # Without --declared it is a 404, not an empty document: "no
                 # declared graph was given" and "the declared graph is empty"
                 # are different statements, and a viewer that could not tell
@@ -234,6 +258,11 @@ class BridgeIntegration(unittest.TestCase):
                     urllib.request.urlopen(
                         f"http://127.0.0.1:{bare_port}/declared.json", timeout=3)
                 self.assertEqual(absent.exception.code, 404)
+                # Without --manifest the manifest is likewise 404.
+                with self.assertRaises(urllib.error.HTTPError) as absent_manifest:
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{bare_port}/manifest.json", timeout=3)
+                self.assertEqual(absent_manifest.exception.code, 404)
                 with socket.create_connection(("127.0.0.1", http_port), timeout=3) as http:
                     http.sendall(b"GET /%2e%2e/secret HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
                     self.assertIn(b"400 Bad Request", http.recv(1024))

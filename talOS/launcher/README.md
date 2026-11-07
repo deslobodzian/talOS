@@ -191,7 +191,8 @@ overrides `[studio] http_port` for one run. Supervision is sim-only: without
 `--sim` the flag has no effect, since a deployed session has no build tree
 serving the webroot and no browser to open. The bridge answers `--describe`
 like any other node, and the launcher starts it with the session's `graph.json`
-as `--declared`; its stdout lands in `<output_dir>/<session_id>/studio_bridge.log`
+as `--declared` and the session's `manifest.json` as `--manifest`; its stdout
+lands in `<output_dir>/<session_id>/studio_bridge.log`
 (plaintext, not a `.tlog`) beside the manifest.
 
 The bridge refuses to start before the telemetry publisher exists, so it is the

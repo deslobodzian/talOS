@@ -1,0 +1,15 @@
+/* 3D viewport panel. */
+
+.spatial {
+  flex: 1;
+  min-height: 180px;
+  background: radial-gradient(ellipse at center, #20333d, #101b27);
+}
+.spatial-ssr {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 11px;
+}
