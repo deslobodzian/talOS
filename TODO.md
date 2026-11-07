@@ -2,6 +2,32 @@
 
 What's left needs the robot, a human step, or a decision. `[read]` marks a finding from reading the code that nobody has reproduced or measured yet. The bring-up procedure is [docs/BRINGUP.md](docs/BRINGUP.md).
 
+## Design review roadmap (2026-11-07, branch `hardening/match-readiness`)
+
+The design review rated the architecture 6/10: the transport fail-safes are
+sound, but "fresh", "restart is safe", "subsystem safety is local" and "pose
+valid" promised more than the code guaranteed. Each fix below is one commit on
+the branch; `git log` carries the Problem/Fix/Why. Deferred items keep the
+reason they were deferred so the next pass can pick them up.
+
+Deferred (not started; in priority order):
+
+- [ ] **Per-signal acquisition time.** One `sample_time` per `/hw/state` covers CAN signals cached at different instants (`PhoenixBackend.cpp` Read); odometry treats sensor skew as motion. Needs Phoenix per-signal timestamps carried through the devices API. Large; touches the hardware wire format.
+- [ ] **Clock-offset accuracy.** `talOS/bridge/clock_offset` is one-way: a constant transport delay looks like perfect convergence. Needs a bidirectional exchange or exported timestamp uncertainty propagated into fusion.
+- [ ] **Camera timestamp kind.** V4L2 SOE/EOF flags and AVFoundation delivery fallbacks are flattened into "exposure" time; configured exposure never reaches live capture; a connected-but-silent camera never reconnects. Vision slice.
+- [ ] **One config resolver.** `config_parser.h` and `tools/sync_manifest.py` are two interpreters kept equal by fixtures. Make the C++ resolver emit canonical JSON + dependency closure and have sync_manifest consume it.
+- [ ] **Replay modes.** Label exact dispatch replay vs counterfactual input replay; add a consumer-receipt/drop trace mode; replay adapters so an appended enum value does not make every earlier log un-replayable (schema hash covers enum labels).
+- [ ] **Telemetry beyond one frame.** The 1200 B single value frame is now the limiting budget (2026 graph needed exclusions). Schedule channels across bounded frames by priority/rate.
+- [ ] **Chassis intent coordinator.** Priority lanes hand over whole commands; "driver translates while align rotates" and heading-hold handoff cannot be expressed.
+- [ ] **Autonomous routines.** One hard-coded routine; needs loaded trajectories, action sequences, routine selection and per-action prerequisite/cancel contracts.
+- [ ] **Coupled-action permits as a framework concept.** The autonomous feed now holds a continuous shooter-ready interlock, but teleop can still feed into a stopped shooter; make the feeder consume a ready permit.
+- [ ] **Neutral requested vs achieved.** `Backend::Neutral()` returns nothing and Phoenix discards neutral-send status; expose delivery uncertainty and rely on documented controller-side command expiry.
+- [ ] **Python on actuator loops.** Intake is Python; a GC pause > 2 periods trips the bridge watchdog. Measure jitter on the coprocessor or move actuator loops to C++; `docs/METHODOLOGY.md` must not claim "memory, not jitter".
+- [ ] **Registry crash windows.** Initializer death poisons the registry; a crash while CLAIMING leaks a slot (32 total). Needs an OS-released lock.
+- [ ] **Simulated transport fidelity.** `SimulatedEventLoop` keeps unlimited history, never drops, runs nodes serially; add bounded rings and per-node pause injection.
+- [ ] **Studio trust.** Connected is shown as fresh; worker crashes leave RPCs pending; no worker->UI backpressure; motor-fault detector warns on any change.
+- [ ] **Sanitizers and fuzzing in CI.** ASan/UBSan/TSan Bazel configs; fuzz frame/State/Command/DS/config decoders.
+
 ## On the robot
 
 Human-only steps (`.omp/RULES.md`: agents never set `commissioned` or change CAN ids):
@@ -113,7 +139,7 @@ Slices 1-6 (sim truth world, accuracy scenario, typed detector settings, estimat
 ## Decisions taken
 
 - [x] Odometry when the RIO link drops: hold. `Drivetrain` clears `modules_valid`/`yaw_valid`, zeroes speeds and keeps the last module positions while samples are stale.
-- [x] Freshness counts from receipt for C++ and Python nodes alike (ARCHITECTURE.md, "The tick").
+- [x] Freshness counts from the writer's publication timestamp in RTMS v5 / `.tlog` v6 for C++ and Python nodes alike (`ARCHITECTURE.md`, "Targets"), while plain subscriptions read latest-value and callback subscriptions read sequence.
 - [x] `/hw/state` stays out of telemetry, silently (`/hw/status` covers link health).
 - [x] Python subsystems can run the framework teleop node in a `talos.testing` Sim (`talos.teleop.Teleop`, via `TALOS_EXPORT_NODE`).
 - [x] The intake runs at the asked `roller_velocity_rps` (stops on the beam unless ejecting).

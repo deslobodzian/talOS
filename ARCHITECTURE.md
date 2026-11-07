@@ -102,7 +102,11 @@ test none) with a per-subsystem `[targets]` override. No process sits between
 a producer and its subsystem, so a subsystem's safety depends only on its own
 process and the bridge. Each `get()` records the selected source in the node's
 live registry row, which is how Studio's system view shows who drives each
-subsystem.
+subsystem. A missing optional policy lane remains a warning. With
+`[robot] require_target_coverage = true` (default `false`), every described
+subsystem that reads its own target lanes must have at least one writer among
+each nonempty Driver Station mode's policy sources; missing coverage is a graph
+error naming the subsystem, mode, and lanes.
 
 The mode generation is what keeps a target issued under an earlier enable or
 mode from ever actuating. The RoboRIO program (and `SimHardware`,
@@ -117,26 +121,24 @@ lane only when its stamp is nonzero and equals the generation the consumer
 last drained. Receipt time cannot do this: a target queued before a mode
 change and the packet that changes the mode can be drained together, at one
 instant. A Driver Station link that drops and returns in the same mode keeps
-its generation, so the producer drives again once its lane is fresh.
+its generation. Driver and declarative teleop producers nevertheless require
+one neutral-input evaluation before publishing active targets after DS
+recovery, startup, or an evaluation gap reaching `command_timeout_us`.
 
 Messages reach a node when its loop drains its topics. A node without message
 callbacks drains right before each of its own timers (`update()`, `every()`)
 and otherwise sleeps; a node with a `subscribe` callback or a Driver Station
-listener, or with no timer, drains every 1 ms. Ages count from the drain, so
-for the first kind a message can be up to one period older than `age()`
-reports, and a silent target is judged stale at most one period after
-`command_timeout_us`. The simulated loop uses the same rule, and replay
-reproduces either from the log. Off-simulation the loop thread runs under
-`SCHED_FIFO` (Linux) or the Mach time-constraint policy (macOS) with memory
-locked, best effort (`talOS/process`).
+listener, or with no timer, drains every 1 ms. Off-simulation the loop thread
+runs under `SCHED_FIFO` (Linux) or the Mach time-constraint policy (macOS) with
+memory locked, best effort (`talOS/process`).
 
-Freshness counts from receipt by design: targets carry no send time. A
-consumer that stalls (a Python GC pause, CPU starvation) and then drains reads
-the producer's latest value as new, so it can act on a value as old as the
-stall for up to another `command_timeout_us`. This is accepted for C++ and
-Python nodes alike: the mode generation still refuses anything sent under an
-earlier enable or mode, and the bridge neutralizes a subsystem whose own
-requests stop (`/hw/status` `timed_out_mask`).
+Messages become visible when the consumer drains its topics, but `age()` and
+`fresh()` count from the writer's publication timestamp. Draining an expired
+message cannot revive it. Subscriptions without per-message callbacks dispatch
+only the newest available message, counting skipped messages as dropped;
+callback subscriptions retain sequence delivery, capped at 64 messages per
+topic per drain. Each realtime timer dispatch samples its own clock. Simulation
+and replay preserve publication-age semantics.
 
 ## Topics and messages
 
@@ -201,8 +203,9 @@ so `bazel run //tools:sync_manifest -- <dir>/robot.toml` writes
 it reads besides itself (`include`, `path`, `defaults`). `talos_bundle` and
 `talos_graph_test` take those constants; no BUILD file lists nodes or
 subsystem files. Each config package has a `manifest_sync_test`
-(`tools/sync_manifest.bzl`) that fails, printing the regenerate command, when
-the config changes and the manifest does not.
+(`tools/sync_manifest.bzl`). `talos_bundle` additionally runs the same check as
+a build action and consumes its success stamp before assembly, so a stale
+manifest fails the build with the regenerate command.
 
 ## Where a new thing goes
 

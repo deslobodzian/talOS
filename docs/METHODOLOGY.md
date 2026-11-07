@@ -267,9 +267,16 @@ Rules:
   recorded are listed (`talOS/launcher/README.md`). **[enforced:
   `input_replay_test`, `replay_inputs_test`]**
 - **Restart safety.** A node can be restarted mid-match (`max_restarts`). Its
-  initial state must be safe with every input present, so a state machine
-  starts in its idle state and re-derives progress from observations
-  (`has_piece` from the beam break, not from a counter). **[review]**
+  initial state must be safe with every input present. One-shot autonomous
+  starts `INHIBITED` and arms only after this process observes a fresh disabled
+  or non-autonomous mode. Same-generation Driver Station outages release lanes
+  without restarting routine progress; new generations reset the routine.
+  Shooter readiness continuously gates feeding, whose accumulated duration
+  excludes released intervals. The preload deadline runs from the generation's
+  first `SPINUP` entry, including feed and readiness retries; `DRIVE` deadlines
+  include all outages. Autonomous field driving requires a fresh, valid,
+  localized pose; pose outages pause trajectory progress but not the deadline.
+  **[enforced: `autonomous` `node_test`]**
 - Config errors throw in the constructor, so the launcher reports them before
   the robot is enabled. **[review]**
 
@@ -283,7 +290,7 @@ intake; the whole graph used ≈ 4.5 % of one core.
 |---|---|---|
 | `update()` p99 wall time | ≤ 10 % of `period_us` | [review]; read `max_latency` in the registry / Studio system view |
 | Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | [review]; the drivetrain's `UpdateDoesNotAllocate` counts process-wide allocations (macOS only; §13) |
-| Python nodes | fine for any period ≥ 5 ms: they cost memory (≈ 30 MB), not jitter | [review] |
+| Python nodes | cost memory (≈ 30 MB) and add GC/interpreter jitter: hard 5 ms actuator loops belong in C++, while 20 ms supervisory/estimator nodes monitor age and watchdog timeouts | [review] |
 | Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [review]; producer → consumer is one hop (`Target` resolves lanes in the consumer) |
 | Per-tick work | O(devices), never O(history); bound every loop | [review] |
 

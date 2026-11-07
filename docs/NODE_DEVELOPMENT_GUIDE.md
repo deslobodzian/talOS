@@ -46,11 +46,12 @@ drain point depends on the node:
 - A node with any message callback, or with no timer at all, drains every
   1 ms, so a callback runs within 1 ms of the message.
 
-`age()` and `fresh()` count from the drain that delivered the message, not
-from its publication: under the first rule a message can be up to one node
-period older than its `age()` says, so a target is judged stale at most one
-period after `[robot] command_timeout_us`. `testing::Sim` applies the same
-rules, so a test sees a message at the tick the robot would.
+`age()` and `fresh()` count from the writer's publication timestamp: draining
+an expired message cannot revive it. Plain subscriptions without callbacks
+dispatch only the newest available message per drain (counting skipped messages
+as dropped), while callback subscriptions retain sequence delivery capped at 64
+messages per drain. `testing::Sim` and replay preserve publication-age
+semantics, so a test sees messages and ages as the robot would.
 
 ### Realtime scheduling
 
@@ -246,6 +247,16 @@ ReleaseTarget<ShooterTarget>(sim, "shooter", "teleop");
 false)` (the device reports disconnected), `digital_output`, `pwm`.
 `LatestTarget<M>(sim, sub, source)` reads a lane a node under test wrote.
 
+`motor_request`, `digital_output`, and `pwm` retain each device's last
+explicitly requested value. Use `applied_motor`, `applied_digital_output`, and
+`applied_pwm` to inspect effective outputs: requests expire after
+`[robot] command_timeout_us` without publication, omitted outputs are neutral,
+and disabled hardware applies neutral outputs. Inspection never refreshes
+freshness. With `ideal_motors()`, neutral velocity decays each tick by
+`min(1, period/tau)`, with `tau = 50 ms` for brake and `1 s` for coast;
+velocity below `0.01 rps` snaps to zero. Position continues integrating during
+decay. Python exposes the same accessors.
+
 Python: `from talos.testing import Sim, SimHardware` (`//talOS/python:testing`),
 the same methods (`Sim.from_toml`, `sim.step(seconds)`,
 `sim.publish(M, topic, **fields)`, `sim.latest(M, topic)`,
@@ -258,7 +269,10 @@ teleop=True)`, `hw.stop_driver_station()`, `sim.latest_bytes(topic)`). See
 
 An estimator is a hardware-free node: it reads state topics and publishes a
 `geometry.PoseEstimate` (`//talOS/msgs:geometry`) on its own `/<name>/state`
-every tick, with `valid`. Absolute measurements arrive as
+every tick, with independent `valid` and `localized` flags. `valid` indicates
+fresh usable integrated odometry; `localized` indicates a trusted field frame
+and latches for the estimator process lifetime. Field-pose consumers require
+both. Absolute measurements arrive as
 `geometry.PoseObservation` (`sample_time_ns`, `pose`, `x_std_m`, `y_std_m`,
 `yaw_std_rad`, `valid`) on each camera node's `/<camera>/state`.
 

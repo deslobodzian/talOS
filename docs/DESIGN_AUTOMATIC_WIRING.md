@@ -395,7 +395,7 @@ What a pose estimator needs, and where each piece now lives:
 | Gyro heading with validity | `yaw_rot`, which read 0 when disconnected | `yaw_rad` + `yaw_valid` |
 | When a sample was taken | `timestamp_ns` = publish time | `sample_time_ns`, from `HardwareLink::sample_time()`: the gateway's `sample_time_us` mapped into the node clock (the bridge keeps a min-filtered offset). C++, C ABI and Python. |
 | Vision observations | none | `geometry.PoseObservation { sample_time_ns, pose: Pose2d, x_std_m, y_std_m, yaw_std_rad, tag_count, valid }` in `talOS/msgs` |
-| Estimator output | `odometry.OdometryState` | `geometry.PoseEstimate { sample_time_ns, pose, velocity: Twist2d, valid, observation_accepted_count, observation_rejected_count }` |
+| Estimator output | `odometry.OdometryState` | `geometry.PoseEstimate { sample_time_ns, pose, velocity: Twist2d, valid, localized, observation_accepted_count, observation_rejected_count }` |
 | Estimator math | hand-written dead reckoning (`odometry`, deleted) | `pose_estimator` (Python): wpimath or GTSAM, chosen by `backend` |
 | A topics-only package | `talos_messages` needed a schema | `talos_messages(srcs = [], topics = ..., deps = ["//talOS/msgs:geometry"])` |
 | A list parameter (`cameras = [...]`) | `param<T>` took bool, integer, double or string only | `param<std::vector<std::string>>` / `std::vector<double>`, in the C ABI and Python (`node.param("cameras")` is a list) |
