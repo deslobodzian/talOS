@@ -63,3 +63,23 @@ bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configurat
 
 Hard rules live in `.omp/RULES.md` (also delivered to subagents). Place new code per
 "Where a new thing goes" above; do not invent a new layer or package convention.
+
+## Commit log (the project's reasoning record)
+
+`git log` is where later agents look for why the code is the way it is, so
+one commit is one logical fix, and its message carries the reasoning:
+
+```
+<area>[, <area>]: <imperative summary, <= 72 chars>
+
+Problem: what was wrong, with the concrete failure scenario.
+Fix: what changed (files/symbols), and the invariant it now holds.
+Why: the design reason; alternatives rejected and why.
+Tests: what each new/changed test proves (fails before, passes after).
+Docs: docs updated in this commit (size/frame changes: DATA_FLOW.md).
+Deferred: known follow-ups, also recorded in TODO.md.
+```
+
+Work lands on a topic branch (`hardening/...`, `feature/...`), one commit per
+fix, verified with the checks above before committing. Do not squash
+unrelated fixes together; do not rewrite published history.
