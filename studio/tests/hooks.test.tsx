@@ -9,7 +9,8 @@ import {test} from 'node:test';
 import {renderToStaticMarkup} from 'react-dom/server';
 
 import type {Snapshot} from '../src/core';
-import {createStaticStudio, StudioProvider} from '../src/data/studio';
+import {createStaticStudio, createWorkerStudio, StudioProvider, WORKER_SILENT_MS} from '../src/data/studio';
+import type {PlaybackState} from '../src/data/types';
 import {
   useActions,
   useChannelValue,
@@ -24,9 +25,11 @@ import {
 } from '../src/data/hooks';
 import {StatusStrip} from '../src/shell/StatusStrip';
 import {Sparkline} from '../src/ui/Sparkline';
-import {sampleStale, STALE_AFTER_NS} from '../src/data/freshness';
+import {readingClock, sampleStale, STALE_AFTER_NS} from '../src/data/freshness';
 import {WorkerClient, WorkerRpcError, type WorkerPort} from '../src/data/worker-client';
 import {WorkerUpdateStream, UPDATE_CAPACITY} from '../src/data/worker-stream';
+import {demoSystemGraph} from '../src/demo';
+import {parseSystemGraph} from '../src/system';
 import {FreshnessNotice} from '../src/ui/FreshnessNotice';
 
 const DS = 'hw/state/driver_station/';
@@ -185,6 +188,79 @@ test('worker errors reject every pending RPC and permit replacement', async () =
     assert.equal(await response, 7);
     client.fail(new WorkerRpcError('terminated', 'test cleanup'));
   }
+});
+
+// A worker studio over a fake port, with the silence watchdog's clock and
+// check in the test's hands. `deliver` posts one acknowledged batch.
+function workerStudio() {
+  let port = fakeWorker();
+  let now = 0;
+  let check = () => {};
+  const studio = createWorkerStudio(() => (port = fakeWorker()),
+                                    {now: () => now, watch: fn => { check = fn; }});
+  const deliver = (...messages: object[]) => port.onmessage?.call(
+      port as Worker, {data: {type: 'updates', messages, dropped: 0, coalesced: 0}} as MessageEvent);
+  const playback = (state: Partial<PlaybackState>) => ({type: 'playback', state: {
+    mode: 'LIVE_STREAMING', cursor_ns: '5000000000', clock_ns: '5000000001',
+    bounds: {start: '5000000000', end: '5000000000'},
+    stats: {dropped: 0, late: 0, invalid: 0}, status: 'WebSocket connected',
+    connection: 'live', ...state
+  }});
+  const current = () => !sampleStale(
+      studio.store.channelSample('fast', studio.playback.cursor_ns)?.timestamp_ns ?? null,
+      readingClock(studio.playback));
+  return {
+    studio, deliver, playback, current,
+    crash: () => port.onerror?.call(port as Worker, {message: 'crash', preventDefault() {}} as ErrorEvent),
+    elapse: (ms: number) => {
+      now += ms;
+      check();
+    }
+  };
+}
+const graphMessage = {type: 'system', graph: parseSystemGraph(demoSystemGraph(0n)), stale: false,
+                      rates: {}, error: '', declared: null, declaredError: ''};
+
+test('a failed worker leaves no live reading current and the graph stale', () => {
+  const w = workerStudio();
+  w.deliver({type: 'frames', reset: true, frames: [snap(1, '5000000000', {fast: 99})]},
+            w.playback({}), graphMessage);
+  assert.equal(w.current(), true);
+  assert.equal(w.studio.system.stale, false);
+  w.crash();
+  assert.equal(w.studio.playback.connection, 'error');
+  assert.equal(w.current(), false, 'the frozen clock no longer says "now"');
+  assert.equal(w.studio.system.stale, true);
+  assert.equal(w.studio.store.channelValue('fast'), 99, 'the reading stays inspectable');
+});
+
+test('a silent worker leaves no live reading current until it speaks again', () => {
+  const w = workerStudio();
+  w.deliver({type: 'frames', reset: true, frames: [snap(1, '5000000000', {fast: 99})]},
+            w.playback({}), graphMessage);
+  w.elapse(WORKER_SILENT_MS - 1);
+  assert.equal(w.current(), true);
+  assert.equal(w.studio.system.stale, false);
+  w.elapse(1);
+  assert.equal(w.current(), false);
+  assert.equal(w.studio.system.stale, true);
+  // The worker resumes: its own clock and graph freshness apply again.
+  w.deliver(w.playback({}), graphMessage);
+  assert.equal(w.current(), true);
+  assert.equal(w.studio.system.stale, false);
+  w.crash();
+});
+
+test('paused history keeps its cursor clock when the worker fails', () => {
+  const w = workerStudio();
+  w.deliver({type: 'frames', reset: true, frames: [snap(1, '5000000000', {fast: 99})]},
+            w.playback({mode: 'PAUSED', clock_ns: '5000000000'}));
+  assert.equal(w.current(), true);
+  w.elapse(WORKER_SILENT_MS);
+  assert.equal(w.current(), true, 'a paused view is judged at its cursor, not wall time');
+  w.crash();
+  assert.equal(w.current(), true);
+  assert.equal(w.studio.playback.clock_ns, '5000000000');
 });
 
 test('worker RPC timeout rejects all callers rather than hanging', async () => {

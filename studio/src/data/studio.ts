@@ -18,7 +18,8 @@ import type {
   StudioActions,
   SystemState
 } from './types';
-import type {WorkerMessage} from './worker-client';
+import type {WorkerMessage, WorkerPort} from './worker-client';
+import {STALE_AFTER_NS} from './freshness';
 
 export type Studio = {
   store: TelemetryStore;
@@ -94,18 +95,43 @@ class StudioImpl implements Studio {
   };
 }
 
-export function createWorkerStudio(): Studio {
+// A worker that has posted nothing for as long as a sample takes to go stale
+// is not keeping time: it posts playback at ~30 Hz whenever it runs.
+export const WORKER_SILENT_MS = Number(STALE_AFTER_NS / 1000000n);
+
+// `factory` and `options` are the test seam: a fake port, and the silence
+// watchdog's monotonic clock and periodic check.
+export function createWorkerStudio(
+    factory: () => WorkerPort = () =>
+        new Worker(new URL('../worker.ts', import.meta.url), {type: 'module'}),
+    options: {now?: () => number; watch?: (check: () => void) => void} = {}): Studio {
+  const now = options.now ?? (() => performance.now());
+  const watch = options.watch ?? (check => { setInterval(check, 250); });
   const store = new TelemetryStore(defaultScheduler);
   const studio = new StudioImpl(
       store, /*actions=*/{} as StudioActions, defaultScheduler, initialPlayback,
       initialSystem);
+  // Live session time and graph freshness come from the worker. A failed or
+  // silent one sends neither, so the last clock it posted must stop saying
+  // "now": live readings become unknown and the graph last-known. Paused and
+  // replay views are judged at their cursor, not wall time, so they keep it.
+  const invalidateCurrent = (): boolean => {
+    const before = [studio.playback, studio.system];
+    if (studio.playback.mode === 'LIVE_STREAMING' && studio.playback.clock_ns !== null)
+      studio.playback = {...studio.playback, clock_ns: null};
+    if (!studio.system.stale) studio.system = {...studio.system, stale: true};
+    return before[0] !== studio.playback || before[1] !== studio.system;
+  };
+  let lastUpdate = now();
+  watch(() => {
+    if (now() - lastUpdate >= WORKER_SILENT_MS && invalidateCurrent()) studio.notify();
+  });
   const client = new WorkerClient(
-      () => new Worker(new URL('../worker.ts', import.meta.url), {type: 'module'}),
+      factory,
       data => receive(data),
       error => {
         studio.playback = {...studio.playback, connection: 'error', status: error.message};
-        // A failed worker sends no more graphs: the last one is last-known.
-        studio.system = {...studio.system, stale: true};
+        invalidateCurrent();
         studio.notify();
       });
   const post = (data: object, transfer?: Transferable[]) => client.post(data, transfer);
@@ -146,6 +172,7 @@ export function createWorkerStudio(): Studio {
 
   const receive = (data: WorkerMessage) => {
     if (data.type === 'updates') {
+      lastUpdate = now();
       for (const message of data.messages) receive(message);
       studio.playback = {...studio.playback, updates: {
         dropped: data.dropped, coalesced: data.coalesced

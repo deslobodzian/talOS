@@ -102,6 +102,12 @@ Worker errors and message decoding failures reject all pending RPCs with
 `WorkerRpcError`. RPCs time out after 10 seconds. A five-second heartbeat
 detects silent termination after ten seconds without a reply. The status strip
 surfaces failures; Connect, Demo or log import starts a replacement worker.
+A failed worker, or one that has posted nothing for `WORKER_SILENT_MS` (1 s;
+it posts playback at ~30 Hz while running), cannot keep the session clock: the
+main thread (`data/studio.ts`) then posts the live clock as unknown and marks
+the system graph stale, without waiting for the ten-second heartbeat, so a
+fresh sample never stays fresh. Paused and replay views keep their cursor
+clock; the next update from a running or replacement worker restores both.
 
 Worker updates use one acknowledged batch in flight, acknowledged on the next
 UI animation frame. Only the latest playback/system/manifest update waits;
