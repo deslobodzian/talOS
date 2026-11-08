@@ -92,6 +92,94 @@ TEST_F(ShooterTest, NotAtSpeedWhileTheFlywheelIsSlow) {
   EXPECT_DOUBLE_EQ(State().flywheel_velocity_rps(), 50.0);
 }
 
+TEST_F(ShooterTest, EntryRequiresThreeConsecutiveTicksInsideTheEntryBand) {
+  Teleop();
+  hw.set_motor("shooter", "flywheel", 0.0, 80.0);
+  sim.step(10ms);  // publish feedback before issuing a target
+  talos::testing::PublishTarget(sim, "shooter", "teleop", ShooterTarget{80.0});
+  sim.step(5ms);
+  EXPECT_FALSE(State().at_speed());
+  sim.step(5ms);
+  EXPECT_FALSE(State().at_speed());
+  sim.step(5ms);
+  EXPECT_TRUE(State().at_speed());
+
+  hw.set_motor("shooter", "flywheel", 0.0, 70.0);
+  sim.step(10ms);
+  ASSERT_FALSE(State().at_speed());
+  hw.set_motor("shooter", "flywheel", 0.0, 80.0);
+  sim.step(5ms);
+  EXPECT_FALSE(State().at_speed());
+  hw.set_motor("shooter", "flywheel", 0.0, 77.0);
+  sim.step(10ms);  // a tick outside entry breaks the streak
+  EXPECT_FALSE(State().at_speed());
+  hw.set_motor("shooter", "flywheel", 0.0, 80.0);
+  sim.step(5ms);  // hardware publishes after the node; allow feedback delivery
+  sim.step(10ms);
+  EXPECT_FALSE(State().at_speed());
+  sim.step(5ms);
+  EXPECT_TRUE(State().at_speed());
+}
+
+TEST_F(ShooterTest, ShotDipInsideExitBandKeepsReadinessButLargerDipDropsIt) {
+  Teleop();
+  hw.set_motor("shooter", "flywheel", 0.0, 80.0);
+  Hold(80.0, 40ms);
+  ASSERT_TRUE(State().at_speed());
+  hw.set_motor("shooter", "flywheel", 0.0, 74.0);
+  Hold(80.0, 20ms);
+  EXPECT_TRUE(State().at_speed());  // 6 rps dip < 10% of 80 rps
+  hw.set_motor("shooter", "flywheel", 0.0, 71.0);
+  Hold(80.0, 20ms);
+  EXPECT_FALSE(State().at_speed());
+  hw.set_motor("shooter", "flywheel", 0.0, 74.0);
+  Hold(80.0, 20ms);
+  EXPECT_FALSE(State().at_speed());  // exit band alone cannot re-enter
+}
+
+TEST_F(ShooterTest, GoalAboveMotorLimitBecomesReadyAtClampedDemand) {
+  Teleop();
+  hw.ideal_motors();
+  Hold(150.0, 60ms);
+  EXPECT_DOUBLE_EQ(hw.motor_request("shooter", "flywheel").demand, 100.0);
+  EXPECT_DOUBLE_EQ(State().target_velocity_rps(), 100.0);
+  EXPECT_TRUE(State().at_speed());
+  talos::testing::PublishTarget(sim, "shooter", "teleop", ShooterTarget{160.0});
+  sim.step(5ms);
+  EXPECT_FALSE(State().at_speed());  // changed even though demand clamps equally
+}
+
+TEST_F(ShooterTest, ChangedTargetAndZeroTargetClearReadiness) {
+  Teleop();
+  hw.set_motor("shooter", "flywheel", 0.0, 80.0);
+  Hold(80.0, 40ms);
+  ASSERT_TRUE(State().at_speed());
+  talos::testing::PublishTarget(sim, "shooter", "teleop", ShooterTarget{81.0});
+  sim.step(5ms);
+  EXPECT_FALSE(State().at_speed());  // still inside entry, but must qualify again
+  Hold(81.0, 20ms);
+  ASSERT_TRUE(State().at_speed());
+  Hold(0.0, 20ms);
+  EXPECT_FALSE(State().at_speed());
+}
+
+TEST_F(ShooterTest, DisconnectedMotorClearsReadiness) {
+  Teleop();
+  hw.set_motor("shooter", "flywheel", 0.0, 80.0);
+  Hold(80.0, 40ms);
+  ASSERT_TRUE(State().at_speed());
+  hw.set_connected("shooter", "flywheel", false);
+  sim.step(5ms);  // publish the disconnected feedback after the node's timer
+  sim.step(5ms);  // the first node tick receiving it must clear readiness
+  ExpectNeutral();
+  hw.set_connected("shooter", "flywheel", true);
+  sim.step(5ms);  // publish reconnected feedback before counting entry ticks
+  sim.step(10ms);
+  EXPECT_FALSE(State().at_speed());
+  sim.step(5ms);
+  EXPECT_TRUE(State().at_speed());
+}
+
 TEST_F(ShooterTest, NeverSentStaysNeutral) {
   Teleop();
   sim.step(60ms);
@@ -101,25 +189,33 @@ TEST_F(ShooterTest, NeverSentStaysNeutral) {
 
 TEST_F(ShooterTest, StaleLaneGoesNeutral) {
   Teleop();
+  hw.set_motor("shooter", "flywheel", 0.0, 80.0);
   Hold(80.0, 40ms);
-  ASSERT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
-  sim.step(150ms);  // the producer went quiet: the lane is stale
+  ASSERT_TRUE(State().at_speed());
+  sim.step(75ms);  // last publication is 95 ms old: still fresh
+  ASSERT_TRUE(State().at_speed());
+  sim.step(5ms);  // exactly command_timeout_us: clear on the first stale tick
   ExpectNeutral();
 }
 
 TEST_F(ShooterTest, ReleasedLaneGoesNeutralAtOnce) {
   Teleop();
+  hw.set_motor("shooter", "flywheel", 0.0, 80.0);
   Hold(80.0, 40ms);
-  ASSERT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
+  ASSERT_TRUE(State().at_speed());
   talos::testing::ReleaseTarget<ShooterTarget>(sim, "shooter", "teleop");
-  sim.step(20ms);
+  sim.step(5ms);
   ExpectNeutral();
 }
 
 TEST_F(ShooterTest, DisabledRobotGoesNeutral) {
   Teleop();
-  hw.enable(false);
+  hw.set_motor("shooter", "flywheel", 0.0, 80.0);
   Hold(80.0, 40ms);
+  ASSERT_TRUE(State().at_speed());
+  hw.enable(false);
+  sim.step(5ms);  // publish disabled hardware feedback
+  sim.step(5ms);  // clear immediately when the node receives that feedback
   ExpectNeutral();
   EXPECT_FALSE(State().enabled());
 }
@@ -146,6 +242,32 @@ TEST_F(ShooterTest, ReportsTheBeamBreak) {
   hw.set_digital_input("shooter", "beam_break", true);
   sim.step(20ms);
   EXPECT_TRUE(State().beam_broken());
+}
+
+TEST(ShooterParameters, RejectInvalidReadinessParametersAtConstruction) {
+  for (const char* setting : {
+           "at_speed_entry_rps = 0", "at_speed_entry_rps = -1",
+           "at_speed_entry_rps = nan", "at_speed_entry_rps = inf",
+           "at_speed_exit_frac = 0", "at_speed_exit_frac = -0.1",
+           "at_speed_exit_frac = 1.1", "at_speed_exit_frac = nan",
+           "at_speed_exit_frac = inf", "at_speed_entry_tick_count = 0",
+           "at_speed_entry_tick_count = -1"}) {
+    SCOPED_TRACE(setting);
+    auto sim = Sim::FromToml(std::string{R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+[subsystems.shooter]
+)"} + setting + R"(
+[subsystems.shooter.motors.flywheel]
+type = "TalonFX"
+can_id = 9
+max_velocity_rps = 100.0
+[subsystems.shooter.digital_inputs.beam_break]
+dio = 0
+)");
+    EXPECT_THROW(sim.add<Shooter>("shooter"), std::invalid_argument);
+  }
 }
 
 struct Result {

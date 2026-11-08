@@ -5,6 +5,15 @@
 name = "shooter"
 node = "//2026-robot/main_processor/shooter:node"
 period_us = 5000
+# Readiness enters after this many consecutive 5 ms ticks within the entry
+# band of the demand clamped to motors.flywheel.max_velocity_rps.
+at_speed_entry_rps = 2.0
+at_speed_entry_tick_count = 3
+# Once ready, allow a shot-induced dip up to max(entry band, this fraction
+# of |clamped demand|). Larger errors require a new consecutive-tick entry.
+at_speed_exit_frac = 0.1
+# Readiness clears immediately on a target change > 0.001 rps (even if both
+# targets clamp equally), release/staleness, disable, or motor disconnect.
 
 [motors.flywheel]
 type = "TalonFX"
