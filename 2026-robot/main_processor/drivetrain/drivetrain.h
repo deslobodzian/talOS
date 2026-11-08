@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <optional>
 
+#include "bridge/bridge_status_generated.h"
+#include "bridge/topics.h"
 #include "drivetrain/drive_message_generated.h"
 #include "drivetrain/geometry.h"
 #include "drivetrain/swerve.h"
@@ -39,11 +41,13 @@ class Drivetrain {
             node.param<double>("max_linear_accel_mps2", 0.0)},
         max_angular_accel_radps2_{
             node.param<double>("max_angular_accel_radps2", 0.0)},
+        status_{node.subscribe<bridge::BridgeStatus>(bridge::topics::kStatus)},
         target_{node},
         state_{node.publish<DrivetrainState>(topics::kState)} {
     for (std::size_t i = 0; i < kModuleCount; ++i) {
       drive_[i] = talos::Motor{node, geometry_.modules[i].drive};
       steer_[i] = talos::Motor{node, geometry_.modules[i].steer};
+      encoder_[i] = talos::CANcoder{node, geometry_.modules[i].encoder};
     }
   }
 
@@ -53,33 +57,51 @@ class Drivetrain {
     // A measurement without a time is not usable, so it clears both flags;
     // driving does not need it.
     const std::optional<talos::Time> sample_time = link_.sample_time();
-    // Every module or none: until all eight motors report, nothing is driven
-    // and the module fields are not believed.
-    bool connected = true;
+    const bool reset =
+        status_.fresh() &&
+        status_.value().gateway_device_reset_count() != reset_count_;
+    if (status_.fresh())
+      reset_count_ = status_.value().gateway_device_reset_count();
+    unsigned live_mask = 0;
     std::array<ModuleState, kModuleCount> measured{};
+    const double period_s =
+        std::chrono::duration<double>{node_.period()}.count();
     for (std::size_t i = 0; i < kModuleCount; ++i) {
-      if (!drive_[i].connected() || !steer_[i].connected()) {
-        connected = false;
-        continue;
+      const bool drive_valid = drive_[i].connected();
+      if (drive_valid) {
+        const double raw = drive_[i].position();
+        // A reset can precede its slower status counter. A physically
+        // impossible wheel step is also a new encoder frame, never travel.
+        const double candidate = raw + drive_offset_[i];
+        const double limit = geometry_.modules[i].max_drive_rps * period_s * 4;
+        if (drive_seen_[i] &&
+            (reset || !drive_valid_[i] ||
+             std::abs(candidate - drive_position_[i]) > limit))
+          drive_offset_[i] = drive_position_[i] - raw;
+        drive_position_[i] = raw + drive_offset_[i];
+        drive_seen_[i] = true;
       }
+      drive_valid_[i] = drive_valid;
+      if (!drive_valid || !steer_[i].connected() || !encoder_[i].connected())
+        continue;
+      live_mask |= 1U << i;
       measured[i] = {drive_[i].velocity(), steer_[i].position()};
+      modules_[i] = geometry::SwerveModulePosition{
+          WheelTravel(drive_position_[i], geometry_.modules[i].wheel_radius_m),
+          ToRadians(measured[i].steer_rot)};
     }
+    const bool connected = live_mask == 15;
+    const bool can_drive = kinematics_.UsableSubset(live_mask);
     const bool modules_valid = connected && sample_time.has_value();
 
     ChassisSpeeds speeds{};
     const ChassisTarget* target = target_.get();
     const bool valid_target =
-        connected && target != nullptr && std::isfinite(target->vx_mps()) &&
+        can_drive && target != nullptr && std::isfinite(target->vx_mps()) &&
         std::isfinite(target->vy_mps()) && std::isfinite(target->omega_radps());
     if (!valid_target) commanded_speeds_ = {0.0, 0.0, 0.0};
-    if (connected) {
-      for (std::size_t i = 0; i < kModuleCount; ++i) {
-        modules_[i] = geometry::SwerveModulePosition{
-            WheelTravel(drive_[i].position(),
-                        geometry_.modules[i].wheel_radius_m),
-            ToRadians(measured[i].steer_rot)};
-      }
-      speeds = kinematics_.ToChassisSpeeds(measured);
+    if (can_drive) {
+      speeds = kinematics_.ToChassisSpeeds(measured, live_mask);
       if (valid_target) {
         const double dt_s =
             std::chrono::duration<double>{node_.period()}.count();
@@ -103,9 +125,10 @@ class Drivetrain {
         commanded_speeds_.vx_mps += dx;
         commanded_speeds_.vy_mps += dy;
         commanded_speeds_.omega_radps += domega;
-        const auto setpoints =
-            kinematics_.ToModuleStates(commanded_speeds_, measured, dt_s);
+        const auto setpoints = kinematics_.ToModuleStates(
+            commanded_speeds_, measured, dt_s, live_mask);
         for (std::size_t i = 0; setpoints && i < kModuleCount; ++i) {
+          if ((live_mask & (1U << i)) == 0) continue;
           drive_[i].set_velocity((*setpoints)[i].drive_rps);
           steer_[i].set_position((*setpoints)[i].steer_rot);
         }
@@ -125,8 +148,8 @@ class Drivetrain {
             const double elapsed_s =
                 last_integrated_sample_ns_ == 0
                     ? dt_s
-                    : std::min(static_cast<double>(
-                                   sample_ns - last_integrated_sample_ns_) *
+                    : std::min(static_cast<double>(sample_ns -
+                                                   last_integrated_sample_ns_) *
                                    1e-9,
                                dt_s * 4.0);
             yaw_rad_ += speeds.omega_radps * elapsed_s;
@@ -137,9 +160,20 @@ class Drivetrain {
         }
         yaw_valid = modules_valid;
       }
-    } else if (sample_time.has_value() && gyro_.connected()) {
-      yaw_rad_ = ToRadians(gyro_.yaw());
-      yaw_valid = true;
+    } else {
+      const bool valid = sample_time.has_value() && gyro_.connected();
+      if (valid) {
+        const double raw = ToRadians(gyro_.yaw());
+        if (gyro_seen_ &&
+            (reset || !gyro_valid_ ||
+             std::abs(std::remainder(raw + yaw_offset_rad_ - yaw_rad_,
+                                     kTwoPi)) > 25.0 * period_s))
+          yaw_offset_rad_ = yaw_rad_ - raw;
+        yaw_rad_ = raw + yaw_offset_rad_;
+        gyro_seen_ = true;
+        yaw_valid = true;
+      }
+      gyro_valid_ = valid;
     }
 
     state_.send(DrivetrainState{
@@ -156,10 +190,17 @@ class Drivetrain {
   SwerveKinematics kinematics_;
   std::array<talos::Motor, kModuleCount> drive_;
   std::array<talos::Motor, kModuleCount> steer_;
+  std::array<talos::CANcoder, kModuleCount> encoder_;
+  std::array<double, kModuleCount> drive_position_{}, drive_offset_{};
+  std::array<bool, kModuleCount> drive_seen_{}, drive_valid_{};
+  std::uint32_t reset_count_{0};
+  bool gyro_seen_{false}, gyro_valid_{false};
+  double yaw_offset_rad_{0};
   talos::Gyro gyro_;
   bool integrate_heading_;
   double max_linear_accel_mps2_;
   double max_angular_accel_radps2_;
+  talos::Subscription<bridge::BridgeStatus> status_;
   ChassisSpeeds commanded_speeds_{0.0, 0.0, 0.0};
   double yaw_rad_ = 0;
   std::uint64_t last_integrated_sample_ns_{0};

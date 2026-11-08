@@ -315,6 +315,11 @@ class PoseEstimator:
             node, "observation_future_tolerance_us", 20_000) / _US
         self.drivetrain_timeout_s = _positive(
             node, "drivetrain_timeout_us", 100_000) / _US
+        # 2026 wheel free speed is 4.63 m/s; default includes >2x margin.
+        self.max_odometry_speed_mps = _positive(
+            node, "max_odometry_speed_mps", 10.0)
+        self.max_odometry_yaw_rate_radps = _positive(
+            node, "max_odometry_yaw_rate_radps", 25.0)
         self.field_length_m = _positive(node, "field_length_m", 16.54)
         self.field_width_m = _positive(node, "field_width_m", 8.21)
         self.max_innovation_m = _positive(node, "max_innovation_m", 3.0)
@@ -344,6 +349,8 @@ class PoseEstimator:
         self.latest_ns = 0
         self.accepted = 0
         self.rejected = 0
+        self.odometry_rejected_count = 0
+        self.checked_ns = 0
         self.relocalization_candidates = []
         self.localized = False
         self.seed_trusted = None  # first fresh, attached DS observation only
@@ -388,14 +395,34 @@ class PoseEstimator:
         if not (d.modules_valid and d.yaw_valid and d.sample_time_ns > 0
                 and positions is not None and math.isfinite(d.yaw_rad)):
             return None
+        if (d.sample_time_ns < self.checked_ns
+                or (d.sample_time_ns == self.checked_ns
+                    and self.checked_ns > self.latest_ns)):
+            return None
         if d.sample_time_ns > self.latest_ns:
             time_s, yaw = d.sample_time_ns / _NS, Rotation2d(d.yaw_rad)
             if self.first_ns is None:
                 self.backend.start(time_s, yaw, positions)
                 self.first_ns = d.sample_time_ns
             else:
+                dt = (d.sample_time_ns - self.checked_ns) / _NS
+                distance = max(abs(new.distance - old.distance)
+                               for old, new in zip(self.backend.positions, positions))
+                yaw_step = abs(math.remainder(
+                    (yaw - self.backend.yaw).radians(), 2 * math.pi))
+                if (distance > self.max_odometry_speed_mps * dt
+                        or yaw_step > self.max_odometry_yaw_rate_radps * dt):
+                    self.odometry_rejected_count += 1
+                    # Adopt the new frame without integrating its jump.
+                    if isinstance(self.backend, KalmanBackend):
+                        self.backend.estimator.resetPosition(
+                            yaw, positions, self.backend.pose())
+                    self.backend.yaw, self.backend.positions = yaw, positions
+                    self.checked_ns = d.sample_time_ns
+                    return None
                 self.backend.add_odometry(time_s, yaw, positions)
             self.latest_ns = d.sample_time_ns
+            self.checked_ns = d.sample_time_ns
         # A sample the gateway stopped refreshing is as stale as no message.
         if self.node.now - self.latest_ns / _NS > self.drivetrain_timeout_s:
             return None

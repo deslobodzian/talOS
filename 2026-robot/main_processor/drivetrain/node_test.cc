@@ -184,6 +184,47 @@ TEST(Swerve, ForwardKinematicsInvertsInverseKinematics) {
   EXPECT_NEAR(speeds.omega_radps, 0.8, 1e-9);
 }
 
+TEST(Swerve, EveryUsableSubsetRecoversTheCommandedTwist) {
+  SwerveKinematics kinematics{Geometry()};
+  const ChassisSpeeds target{1.0, -0.5, 0.8};
+  for (unsigned mask = 0; mask < 16; ++mask) {
+    SCOPED_TRACE(mask);
+    const bool usable = std::popcount(mask) >= 2;
+    EXPECT_EQ(kinematics.UsableSubset(mask), usable);
+    const auto initial = kinematics.ToModuleStates(target, {}, 0.0, mask);
+    ASSERT_EQ(initial.has_value(), usable);
+    if (!usable) {
+      const auto speeds = kinematics.ToChassisSpeeds({}, mask);
+      EXPECT_EQ(speeds.vx_mps, 0);
+      EXPECT_EQ(speeds.vy_mps, 0);
+      EXPECT_EQ(speeds.omega_radps, 0);
+      continue;
+    }
+    const auto aligned = kinematics.ToModuleStates(target, *initial, 0.0, mask);
+    ASSERT_TRUE(aligned.has_value());
+    const auto speeds = kinematics.ToChassisSpeeds(*aligned, mask);
+    EXPECT_NEAR(speeds.vx_mps, target.vx_mps, 1e-9);
+    EXPECT_NEAR(speeds.vy_mps, target.vy_mps, 1e-9);
+    EXPECT_NEAR(speeds.omega_radps, target.omega_radps, 1e-9);
+  }
+}
+
+TEST(Swerve, SingularAndIllConditionedSubsetsAreNotDrivenOrSolved) {
+  for (double separation : {0.0, 1e-8}) {
+    auto geometry = Geometry();
+    geometry.modules[1].x_m = geometry.modules[0].x_m + separation;
+    geometry.modules[1].y_m = geometry.modules[0].y_m;
+    SwerveKinematics kinematics{geometry};
+    EXPECT_FALSE(kinematics.UsableSubset(3));
+    EXPECT_FALSE(kinematics.ToModuleStates({1, 0, 0}, {}, 0, 3));
+    const auto speeds = kinematics.ToChassisSpeeds({}, 3);
+    EXPECT_EQ(speeds.vx_mps, 0);
+    EXPECT_EQ(speeds.vy_mps, 0);
+    EXPECT_EQ(speeds.omega_radps, 0);
+    EXPECT_TRUE(kinematics.UsableSubset(15));
+  }
+}
+
 TEST(Swerve, UnitBoundary) {
   EXPECT_NEAR(ToRadians(0.125), std::numbers::pi / 4, 1e-15);
   EXPECT_NEAR(ToRotations(std::numbers::pi), 0.5, 1e-15);
@@ -478,7 +519,8 @@ TEST_P(DrivetrainSlewResetTest, UnsafeInputNeutralizesAndRestartsFromZero) {
           ChassisTarget{std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0});
       break;
     case 4:
-      hw.set_connected("drivetrain", "front_left_steer", false);
+      for (const auto& module : geometry.modules)
+        hw.set_connected("drivetrain", module.steer, false);
       break;
     default:
       FAIL() << "Unknown reset scenario";
@@ -489,7 +531,8 @@ TEST_P(DrivetrainSlewResetTest, UnsafeInputNeutralizesAndRestartsFromZero) {
   sim.step(visibility);
   ExpectNeutral();
   hw.enable();
-  hw.set_connected("drivetrain", "front_left_steer", true);
+  for (const auto& module : geometry.modules)
+    hw.set_connected("drivetrain", module.steer, true);
   talos::testing::PublishTarget(sim, "drivetrain", "teleop",
                                 ChassisTarget{1.0, 0.0, 1.0});
   sim.step(visibility);
@@ -645,7 +688,7 @@ TEST_F(DrivetrainTest, SampleTimeIsTheMappedHardwareSampleTimeNotTheTickTime) {
   EXPECT_LE(lag_ns, std::chrono::nanoseconds{3ms + 5ms}.count());
 }
 
-TEST_F(DrivetrainTest, ADisconnectedMotorStillPublishesButDrivesNothing) {
+TEST_F(DrivetrainTest, ADisconnectedMotorNeutralizesOnlyItsModule) {
   Teleop();
   for (std::size_t i = 0; i < kModuleCount; ++i) {
     hw.set_motor("drivetrain", geometry.modules[i].drive,
@@ -659,7 +702,9 @@ TEST_F(DrivetrainTest, ADisconnectedMotorStillPublishesButDrivesNothing) {
   hw.set_connected("drivetrain", "front_left_steer", false);
   const std::uint64_t before = StateCount();
   Hold(ChassisTarget{1.0, 0, 0}, 60ms);  // a fresh target the whole time
-  ExpectNeutral();                       // every module, not just front_left
+  EXPECT_EQ(Request("front_left_drive").mode, Mode::kNeutral);
+  EXPECT_EQ(Request("front_left_steer").mode, Mode::kNeutral);
+  EXPECT_EQ(Request("back_left_drive").mode, Mode::kVelocity);
   ExpectPublishedEveryTick(before, 60ms);
   const DrivetrainState state = State();
   EXPECT_TRUE(state.enabled());
@@ -676,6 +721,83 @@ TEST_F(DrivetrainTest, ADisconnectedMotorStillPublishesButDrivesNothing) {
   Hold(ChassisTarget{1.0, 0, 0}, 40ms);
   EXPECT_TRUE(State().modules_valid());
   EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+}
+
+TEST_F(DrivetrainTest, LostCANcoderIsolatesWholeModuleAndLiveSubsetTranslates) {
+  Teleop();
+  hw.ideal_motors();
+  Hold(ChassisTarget{1.0, 0, 0}, 100ms);
+  hw.set_connected("drivetrain", "front_left_encoder", false);
+  Hold(ChassisTarget{1.0, 0, 0}, 100ms);
+  EXPECT_EQ(Request("front_left_drive").mode, Mode::kNeutral);
+  EXPECT_EQ(Request("front_left_steer").mode, Mode::kNeutral);
+  for (const auto& module : geometry.modules) {
+    if (module.name == "front_left") continue;
+    EXPECT_EQ(Request(module.drive).mode, Mode::kVelocity);
+    EXPECT_GT(Request(module.drive).demand, 0.0);
+    EXPECT_EQ(Request(module.steer).mode, Mode::kPosition);
+  }
+  EXPECT_NEAR(State().vx_mps(), 1.0, 1e-9);
+  EXPECT_NEAR(State().vy_mps(), 0.0, 1e-9);
+  EXPECT_FALSE(State().modules_valid());
+  hw.set_connected("drivetrain", "front_right_drive", false);
+  Hold(ChassisTarget{1.0, 0, 0}, 60ms);
+  EXPECT_EQ(Request("back_left_drive").mode, Mode::kVelocity);
+  EXPECT_NEAR(State().vx_mps(), 1.0, 1e-9);
+  hw.set_connected("drivetrain", "back_right_drive", false);
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  ExpectNeutral();
+}
+
+TEST_F(DrivetrainTest, DegradedDriveStillHonorsDisableAndStaleTargets) {
+  Teleop();
+  hw.set_connected("drivetrain", "front_left_encoder", false);
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  ASSERT_EQ(Request("back_left_drive").mode, Mode::kVelocity);
+  sim.step(150ms);
+  ExpectNeutral();
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  ASSERT_EQ(Request("back_left_drive").mode, Mode::kVelocity);
+  hw.enable(false);
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  ExpectNeutral();
+}
+
+TEST_F(DrivetrainTest, DriveResetAndRecoveryPreservePublishedDistance) {
+  hw.set_motor("drivetrain", "front_left_drive", 100.0, 0.0);
+  sim.step(kConverged);
+  const double before = State().module2().distance_m();
+  hw.set_motor("drivetrain", "front_left_drive", 0.0, 0.0);
+  sim.step(20ms);
+  EXPECT_NEAR(State().module2().distance_m(), before, 1e-9);
+  hw.set_connected("drivetrain", "front_left_drive", false);
+  sim.step(20ms);
+  hw.set_motor("drivetrain", "front_left_drive", 0.1, 0.0);
+  hw.set_connected("drivetrain", "front_left_drive", true);
+  sim.step(20ms);
+  EXPECT_NEAR(State().module2().distance_m(), before, 1e-9);
+  hw.set_motor("drivetrain", "front_left_drive", 0.2, 0.0);
+  sim.step(20ms);
+  EXPECT_NEAR(State().module2().distance_m(),
+              before + WheelTravel(0.1, geometry.modules[2].wheel_radius_m),
+              1e-9);
+}
+
+TEST_F(DrivetrainTest, DrivePositionResetWhileDrivingPreservesTravel) {
+  Teleop();
+  hw.ideal_motors();
+  Hold(ChassisTarget{1.0, 0, 0}, 500ms);
+  const double before = State().module2().distance_m();
+  ASSERT_GT(before, 0.3);
+  hw.set_motor("drivetrain", "front_left_drive", 0.0,
+               WheelRps(1.0, geometry.modules[2].wheel_radius_m));
+  Hold(ChassisTarget{1.0, 0, 0}, 20ms);
+  EXPECT_TRUE(State().modules_valid());
+  EXPECT_GE(State().module2().distance_m(), before);
+  EXPECT_LT(State().module2().distance_m() - before, 0.03);
+  const double reanchored = State().module2().distance_m();
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  EXPECT_NEAR(State().module2().distance_m() - reanchored, 0.04, 1e-9);
 }
 
 // Pure chassis rotation at `omega` rad/s: each wheel tangential, turning at
@@ -734,6 +856,35 @@ TEST_F(DrivetrainOnImuTest, ADisconnectedGyroIsInvalidAndHoldsTheLastHeading) {
   // The modules do not need the heading: still valid, still driven.
   EXPECT_TRUE(state.modules_valid());
   EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+}
+
+TEST_F(DrivetrainOnImuTest, GyroResetRecoveryKeepsHeadingContinuous) {
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.25, 0.0);
+  sim.step(kConverged);
+  const double before = State().yaw_rad();
+  hw.set_connected("drivetrain", "drivetrain_imu", false);
+  sim.step(20ms);
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.0, 0.0);
+  hw.set_connected("drivetrain", "drivetrain_imu", true);
+  sim.step(20ms);
+  EXPECT_TRUE(State().yaw_valid());
+  EXPECT_NEAR(State().yaw_rad(), before, 1e-9);
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.01, 0.0);
+  sim.step(20ms);
+  EXPECT_NEAR(State().yaw_rad(), before + ToRadians(0.01), 1e-9);
+}
+
+TEST_F(DrivetrainOnImuTest, UnannouncedPigeonResetDoesNotJumpHeading) {
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.25, 0.0);
+  sim.step(kConverged);
+  const double before = State().yaw_rad();
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.0, 0.0);
+  sim.step(20ms);
+  EXPECT_TRUE(State().yaw_valid());
+  EXPECT_NEAR(State().yaw_rad(), before, 1e-9);
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.01, 0.0);
+  sim.step(20ms);
+  EXPECT_NEAR(State().yaw_rad(), before + ToRadians(0.01), 1e-9);
 }
 
 TEST_F(DrivetrainOnImuTest, AGyroThatNeverReportedReadsAnInvalidZero) {

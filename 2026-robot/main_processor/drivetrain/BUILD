@@ -45,6 +45,7 @@ cc_library(
     deps = [
         ":messages",
         ":swerve",
+        "//talOS/bridge:messages",
         "//talOS/devices",
         "//talOS/node",
     ],

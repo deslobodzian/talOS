@@ -135,6 +135,7 @@ inline SwerveGeometry BuildSwerveGeometry(
     module.steer = detail::RequiredString(*entry, "steer", where);
     const std::string encoder =
         detail::RequiredString(*entry, "encoder", where);
+    module.encoder = encoder;
 
     const auto& drive = SubsystemMotor(config, subsystem, module.drive);
     const auto& steer = SubsystemMotor(config, subsystem, module.steer);

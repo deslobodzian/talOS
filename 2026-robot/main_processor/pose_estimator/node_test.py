@@ -120,7 +120,7 @@ class EstimatorTest(unittest.TestCase):
     def start(self, backend, *, enabled=False, driver_station=True,
               attached=True, **config):
         self.sim = Sim.from_toml(robot_toml(backend, **config))
-        self.sim.add(estimator.PoseEstimator, "pose_estimator")
+        self.node = self.sim.add(estimator.PoseEstimator, "pose_estimator")
         self.hw = SimHardware(self.sim)
         self.hw.enable(enabled)
         if driver_station:
@@ -162,6 +162,47 @@ class EstimatorTest(unittest.TestCase):
     def counts(self):
         e = self.estimate()
         return (e.observation_accepted_count, e.observation_rejected_count)
+
+    def test_implausible_odometry_jump_is_rejected_and_recovers(self):
+        for backend in BACKENDS:
+            for jump in ("wheel", "yaw"):
+                for enabled in (False, True):
+                    with self.subTest(backend=backend, jump=jump, enabled=enabled):
+                        chassis = self.start(
+                            backend, enabled=enabled,
+                            extra="max_odometry_speed_mps = 6.0")
+                        chassis.drive(1.0, 0.0, 0.0, 0.1)
+                        before = self.pose()
+                        previous_ns = self.estimate().sample_time_ns
+                        if jump == "wheel":
+                            chassis.distances[0] += 100.0
+                        else:
+                            chassis.yaw += 2.0
+                        rejected_ns = round(self.sim.now * 1e9)
+                        chassis.publish()
+                        self.sim.step(DT)
+                        self.assertPoseHeld(before)
+                        self.assertFalse(self.estimate().valid)
+                        self.assertEqual(self.node.odometry_rejected_count, 1)
+                        # Replaying the rejected frame (or an older one) must
+                        # neither count twice nor move the adopted baseline.
+                        for timestamp in (rejected_ns, previous_ns):
+                            chassis.publish(sample_time_ns=timestamp)
+                            self.sim.step(DT)
+                            self.assertPoseHeld(before)
+                            self.assertFalse(self.estimate().valid)
+                            self.assertEqual(self.node.odometry_rejected_count, 1)
+                        self.assertEqual(self.counts(), (0, 0))
+                        # Wheel/yaw coordinates retain their new frame. The
+                        # next physical translation is still field-forward.
+                        chassis.drive(1.0, 0.0, 0.0, DT)
+                        self.assertTrue(self.estimate().valid)
+                        self.assertAlmostEqual(
+                            self.pose()[0], before[0] + DT, delta=1e-6)
+                        self.assertAlmostEqual(
+                            self.pose()[1], before[1], delta=1e-6)
+                        self.assertAlmostEqual(
+                            self.pose()[2], before[2], delta=1e-6)
 
     def test_configured_initial_pose(self):
         for backend in BACKENDS:

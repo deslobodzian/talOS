@@ -79,6 +79,15 @@ fails at startup):
   counter; `observation_rejected_count` counts offered measurements refused.
 - A drivetrain sample is integrated once, when `sample_time_ns` increased,
   `modules_valid` and `yaw_valid` hold and every value is finite.
+  Each wheel's implied speed must be at most `max_odometry_speed_mps` (10 m/s,
+  over twice the 2026 wheel free speed); wrapped gyro steps must be at most
+  `max_odometry_yaw_rate_radps` (25 rad/s). Both limits must be positive and
+  finite. Rejected steps hold the pose, invalidate that tick, and increment
+  the node's `odometry_rejected_count` (not an observation rejection or an
+  extra telemetry channel). The new encoder/yaw frame becomes the baseline
+  so later physically plausible motion recovers without integrating the jump.
+  Repeated rejected frames and older timestamps stay invalid without counting
+  again or changing that baseline.
 - `valid` = odometry integrated at least once, the drivetrain message fresh
   (`drivetrain_timeout_us`) and usable, and its sample no older than that
   timeout. Otherwise the pose is held and the velocity reads zero.

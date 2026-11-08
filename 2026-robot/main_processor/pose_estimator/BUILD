@@ -55,6 +55,11 @@ py_test(
         "REPLAY_SESSION_TOOL_BINARY": "$(rlocationpath :replay_session_tool)",
     },
     legacy_create_init = False,
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
     deps = [
         ":messages_py",
         "//2026-robot/main_processor/drivetrain:messages_py",

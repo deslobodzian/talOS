@@ -25,10 +25,9 @@ discretization. Translation uses a vector-magnitude limit, preserving the
 direction of the velocity change; rotation is limited independently. Each
 defaults to `0.0`; non-positive or non-finite values leave that limit disabled.
 The period is the configured node update period, not elapsed wall time.
-Disabled, stale/released or non-finite targets and disconnected module motors
-neutralize immediately and reset both ramps to zero. Re-enabling therefore
-starts a new ramp rather than resuming the previous command. The robot config
-leaves the example limits commented out to preserve existing step behavior.
+Disabled, stale/released or non-finite targets and fewer than two live modules
+neutralize immediately and reset both ramps to zero. Re-enabling starts a new
+ramp rather than resuming the previous command.
 
 ## Code
 
@@ -51,12 +50,24 @@ leaves the example limits commented out to preserve existing step behavior.
 `/drivetrain/state` (`DrivetrainState`) is published every tick, whatever
 the hardware says:
 
-- `modules_valid` is true when all eight module motors report and the sample
-  time is known. While a motor does not report, nothing is driven (every
-  module neutral), the chassis speeds read 0 and the four module positions
-  (`module0`..`module3`, in geometry order: wheel travel in meters from the
-  drive motor, azimuth in radians from the steer motor) hold their last valid
-  values.
+- A module is live only when its drive motor, steer motor and CANcoder report.
+  A missing device neutralizes both motors on that module. Two or more live
+  modules can translate and rotate using their own inverse-kinematics setpoints
+  and common desaturation; measured chassis speeds use a least-squares solve
+  over only those live modules (precomputed fixed-size subset factorizations).
+  Coincident or ill-conditioned subsets are not driven or solved. With fewer
+  than two modules every motor is neutral. This minimum assumes a failed module
+  can passively roll; a mechanically jammed wheel still requires
+  the driver to stop. No extra live-mask/count channels are added: the telemetry
+  stream has a hard 1200-byte value-frame limit, and hardware health already
+  identifies missing devices.
+- `modules_valid` requires all four complete modules and a known sample time.
+  Partial odometry is deliberately not offered to four-module consumers;
+  missing module positions hold their last values while live ones update.
+  Wheel distance and gyro yaw retain their frame across device reset counters
+  and invalid-to-valid recovery. Impossible wheel steps (four times configured
+  wheel free speed) and yaw steps (25 rad/s) are re-anchored, not integrated.
+  Movement during invalid feedback is unknowable and discarded.
 - `yaw_rad` is the Pigeon's yaw converted from rotations, and `yaw_valid`
   says whether the Pigeon reports. While it does not, `yaw_rad` holds the last
   valid heading (0 before the first). Under `--sim` the default instead

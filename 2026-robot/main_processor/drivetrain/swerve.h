@@ -4,6 +4,7 @@
 // module units are mechanism rotations and rotations per second.
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <numbers>
@@ -22,6 +23,7 @@ struct SwerveModule {
   std::string name;   // "front_left"
   std::string drive;  // motor device names in this subsystem
   std::string steer;
+  std::string encoder;
   double x_m{};  // from the robot centre: x forward, y left
   double y_m{};
   double wheel_radius_m{};
@@ -64,22 +66,39 @@ class SwerveKinematics {
  public:
   explicit SwerveKinematics(const SwerveGeometry& geometry)
       : geometry_(geometry) {
-    Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
-    for (std::size_t i = 0; i < kModuleCount; ++i) {
-      const auto& module = geometry_.modules[i];
-      const Eigen::Vector3d row_x(1.0, 0.0, -module.y_m);
-      const Eigen::Vector3d row_y(0.0, 1.0, module.x_m);
-      normal.noalias() += row_x * row_x.transpose();
-      normal.noalias() += row_y * row_y.transpose();
+    for (std::size_t mask = 1; mask < normal_ldlt_.size(); ++mask) {
+      Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
+      for (std::size_t i = 0; i < kModuleCount; ++i) {
+        if ((mask & (1U << i)) == 0) continue;
+        const auto& module = geometry_.modules[i];
+        const Eigen::Vector3d row_x(1.0, 0.0, -module.y_m);
+        const Eigen::Vector3d row_y(0.0, 1.0, module.x_m);
+        normal.noalias() += row_x * row_x.transpose();
+        normal.noalias() += row_y * row_y.transpose();
+      }
+      normal_ldlt_[mask].compute(normal);
+      const auto diagonal = normal_ldlt_[mask].vectorD();
+      // Reject coincident/near-coincident layouts rather than amplify noise
+      // or divide by a zero pivot. All storage and factorizations are fixed
+      // size and prepared before update().
+      usable_[mask] = std::popcount(static_cast<unsigned>(mask)) >= 2 &&
+                      normal_ldlt_[mask].info() == Eigen::Success &&
+                      diagonal.allFinite() &&
+                      diagonal.minCoeff() > 1e-9 * diagonal.maxCoeff();
     }
-    normal_ldlt_.compute(normal);
+  }
+
+  bool UsableSubset(unsigned live_mask) const {
+    return live_mask < usable_.size() && usable_[live_mask];
   }
 
   // Shortest-path steering, cosine compensation, and one common speed scale
   // respecting each module's individual drive limit. Stopped wheels hold angle.
   std::optional<std::array<ModuleState, kModuleCount>> ToModuleStates(
       const ChassisSpeeds& speeds,
-      const std::array<ModuleState, kModuleCount>& current, double dt_s = 0.0) {
+      const std::array<ModuleState, kModuleCount>& current, double dt_s = 0.0,
+      unsigned live_mask = 15) {
+    if (!UsableSubset(live_mask)) return std::nullopt;
     if (!std::isfinite(speeds.vx_mps) || !std::isfinite(speeds.vy_mps) ||
         !std::isfinite(speeds.omega_radps))
       return std::nullopt;
@@ -94,6 +113,7 @@ class SwerveKinematics {
     std::array<ModuleState, kModuleCount> out{};
     double scale = 1.0;
     for (std::size_t i = 0; i < kModuleCount; ++i) {
+      if ((live_mask & (1U << i)) == 0) continue;
       const auto& module = geometry_.modules[i];
       if (!std::isfinite(current[i].steer_rot)) return std::nullopt;
       const double wheel_vx = vx - omega * module.y_m;
@@ -125,9 +145,12 @@ class SwerveKinematics {
 
   // Full least-squares solve, including non-centered module layouts.
   ChassisSpeeds ToChassisSpeeds(
-      const std::array<ModuleState, kModuleCount>& measured) const {
+      const std::array<ModuleState, kModuleCount>& measured,
+      unsigned live_mask = 15) const {
+    if (!UsableSubset(live_mask)) return {};
     Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
     for (std::size_t i = 0; i < kModuleCount; ++i) {
+      if ((live_mask & (1U << i)) == 0) continue;
       const auto& module = geometry_.modules[i];
       const double speed =
           WheelSpeed(measured[i].drive_rps, module.wheel_radius_m);
@@ -138,13 +161,15 @@ class SwerveKinematics {
       const Eigen::Vector3d row_y(0.0, 1.0, module.x_m);
       rhs.noalias() += row_x * vx + row_y * vy;
     }
-    const Eigen::Vector3d result = normal_ldlt_.solve(rhs);
+    const Eigen::Vector3d result = normal_ldlt_[live_mask].solve(rhs);
+    if (!result.allFinite()) return {};
     return {result.x(), result.y(), result.z()};
   }
 
  private:
   SwerveGeometry geometry_;
-  Eigen::LDLT<Eigen::Matrix3d> normal_ldlt_{};
+  std::array<Eigen::LDLT<Eigen::Matrix3d>, 16> normal_ldlt_{};
+  std::array<bool, 16> usable_{};
 };
 
 }  // namespace drivetrain
