@@ -368,8 +368,10 @@ std::string ConfigWith(const std::string& extra) {
       std::filesystem::path{tmp != nullptr ? tmp : "/tmp"} /
       "drivetrain_config";
   std::filesystem::create_directories(dir);
-  std::filesystem::copy_file(source, dir / "robot.toml",
-                             std::filesystem::copy_options::overwrite_existing);
+  // copy_file keeps the source's mode: a read-only checkout (CI) yields a
+  // read-only copy that overwrite_existing could not replace next time.
+  std::filesystem::remove(dir / "robot.toml");
+  std::filesystem::copy_file(source, dir / "robot.toml");
   std::stringstream text;
   text << std::ifstream{source.parent_path() / "drivetrain.toml"}.rdbuf();
   std::string toml = text.str();

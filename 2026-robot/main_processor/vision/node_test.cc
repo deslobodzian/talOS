@@ -1388,9 +1388,10 @@ TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
   using talos::vision::TimestampKind;
   auto device = std::make_shared<FakeCameraDevice>();
   LiveTestVision::device = device;
-  // Frames arrive only when the test emits them, and each wait may take up to
-  // AdvanceLiveUntil's 500 simulated ms on a loaded host, so the stall
-  // timeout sits above that bound. Stall recovery has its own test above.
+  // Frames arrive only when the test emits them, and a starved worker on a
+  // loaded host can take far longer than AdvanceLiveUntil's default bound, so
+  // each wait may use up to 1900 simulated ms, under the 2 s stall timeout.
+  // Stall recovery has its own test above.
   auto sim = MakeSim(false, true,
                      "device = \"fake\"\nwidth = 160\nheight = 120\n"
                      "frame_timeout_us = 2000000\nexposure_ms = 4\n"
@@ -1409,13 +1410,17 @@ TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
     device->Emit(stamp, kind);
     // `latest` still holds the previous kind's observation until the worker
     // finishes this frame, so wait for this frame's own timestamp.
-    EXPECT_TRUE(AdvanceLiveUntil(sim, [&] {
-      const auto observation =
-          sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
-      return observation &&
-             observation->sample_time_ns() ==
-                 static_cast<std::uint64_t>(stamp - correction);
-    })) << static_cast<int>(kind);
+    EXPECT_TRUE(AdvanceLiveUntil(
+        sim,
+        [&] {
+          const auto observation =
+              sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
+          return observation &&
+                 observation->sample_time_ns() ==
+                     static_cast<std::uint64_t>(stamp - correction);
+        },
+        1900))
+        << static_cast<int>(kind);
   }
   const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
   ASSERT_TRUE(status);
