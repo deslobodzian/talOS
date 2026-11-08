@@ -126,14 +126,11 @@ name = "continuity"
 period_us = 5000
 max_restarts = 2
 
+# Non-critical: its restart's clean exit is a finished node, not a lost one.
 [subsystems.continuity_source]
 node = "//talOS/launcher:continuity_source"
 marker = ")" << marker << R"("
-
-[subsystems.continuity_source.motors.m1]
-type = "TalonFX"
-bus = "rio"
-can_id = 1
+critical = false
 
 [subsystems.continuity_sink]
 node = "//talOS/launcher:continuity_sink"

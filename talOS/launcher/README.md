@@ -218,7 +218,9 @@ Studio.
 
 A roster member — `hardware_node`, every subsystem node, `sim_gateway` — that
 exits with a nonzero status or by a signal while the session is not stopping is
-restarted. The first restart waits 50 ms, each later one twice as long, capped
+restarted. So is a critical member that exits cleanly (status 0) while the
+session is not stopping: its peers still run, so it did not finish anything.
+The first restart waits 50 ms, each later one twice as long, capped
 at 1 s. Critical nodes (including every actuator owner and the hardware bridge)
 never quarantine: they keep retrying with that capped backoff. Non-critical
 nodes may restart at most `max_restarts` times within a rolling 60-second
@@ -230,8 +232,11 @@ max_restarts = 5  # per node per rolling restart window; 0 disables restarts
 ```
 
 The key is optional (default 5) and must be an integer >= 0; `--max-restarts N`
-overrides it for one run. A clean exit (status 0) is a node that finished and
-is never restarted, and nothing is restarted once a signal or the
+overrides it for one run. A non-critical member's clean exit is a node that
+finished and is not restarted. When a critical member's clean-exit restart
+falls due and every other member's latest run also exited 0 (the whole roster
+completed, as one-shot fixtures do), it is dropped and the session ends.
+Nothing is restarted once a signal (requested stop, launcher shutdown) or the
 `--duration-s` deadline has started stopping the session. The backoff is
 scheduled inside the supervision loop, like the Studio bridge's retries, so a
 restarting node never delays another node or the deadline. Each restart prints

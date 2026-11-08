@@ -747,13 +747,19 @@ TEST(LauncherTest, EachRunGetsItsOwnLogPath) {
 }
 
 TEST(LauncherTest, ShouldRestartNodePredicate) {
-  EXPECT_TRUE(ShouldRestartNode(false, 5, false));
-  // A clean exit finished; it is not a crash.
-  EXPECT_FALSE(ShouldRestartNode(true, 5, false));
+  // A crash restarts a critical and a non-critical member alike.
+  EXPECT_TRUE(ShouldRestartNode(false, true, 5, false));
+  EXPECT_TRUE(ShouldRestartNode(false, false, 5, false));
+  // A critical member exiting 0 while its session runs on is lost, not done.
+  EXPECT_TRUE(ShouldRestartNode(true, true, 5, false));
+  // A non-critical member exiting 0 finished.
+  EXPECT_FALSE(ShouldRestartNode(true, false, 5, false));
   // Zero is a deliberate permanent stop, not a quarantine.
-  EXPECT_FALSE(ShouldRestartNode(false, 0, false));
-  // A stopping session (signal or deadline) restarts nothing.
-  EXPECT_FALSE(ShouldRestartNode(false, 5, true));
+  EXPECT_FALSE(ShouldRestartNode(false, true, 0, false));
+  EXPECT_FALSE(ShouldRestartNode(true, true, 0, false));
+  // A stopping session (signal, deadline, shutdown) restarts nothing.
+  EXPECT_FALSE(ShouldRestartNode(false, true, 5, true));
+  EXPECT_FALSE(ShouldRestartNode(true, true, 5, true));
 }
 
 TEST(LauncherTest, MaxRestartsComesFromFlagThenConfigThenDefault) {

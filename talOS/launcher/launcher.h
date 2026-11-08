@@ -992,9 +992,14 @@ inline std::string GraphToJson(
 // or by a signal -- while the session is not stopping is respawned after a
 // backoff of 50 ms, doubling within a rolling restart window, capped at 1 s.
 // max_restarts limits starts within that window, not the session lifetime.
-// A clean exit is a node that finished and stays finished. The backoff
-// is scheduled inside the supervision loop, so a restarting node never delays
-// another node or the session deadline. Every run writes its own event log.
+// A critical member that exits cleanly (status 0) while the session is not
+// stopping did not finish anything -- its peers still run -- so it restarts
+// on the same backoff; a non-critical clean exit is a node that finished.
+// When a clean exit's restart falls due and every other live member's latest
+// run also exited 0, the whole roster has completed and the restart is
+// dropped (see RosterContinues). The backoff is scheduled inside the
+// supervision loop, so a restarting node never delays another node or the
+// session deadline. Every run writes its own event log.
 // ---------------------------------------------------------------------------
 
 inline constexpr int kDefaultMaxRestarts = 5;
@@ -1019,11 +1024,13 @@ inline std::string NodeLogPath(const std::string& output_dir,
   return path + ".tlog";
 }
 
-// Crashes remain retryable after a budget quarantine; zero disables all
-// retries.
-inline bool ShouldRestartNode(bool clean_exit, int max_restarts,
+// Requested stop, the session deadline and launcher shutdown (`stopping`)
+// never restart; zero disables all retries. Crashes remain retryable after a
+// budget quarantine. A clean exit restarts only a critical member.
+inline bool ShouldRestartNode(bool clean_exit, bool critical, int max_restarts,
                               bool stopping) {
-  return !clean_exit && !stopping && max_restarts > 0;
+  if (stopping || max_restarts <= 0) return false;
+  return !clean_exit || critical;
 }
 
 // `--max-restarts` wins, then `[robot] max_restarts`, then the default.
@@ -1585,6 +1592,7 @@ class Launcher {
     std::vector<std::string> args;
     std::size_t log_arg{0};  // Index of the --log value in args; 0 for none.
     bool restart_pending{false};
+    bool last_exit_clean{false};  // Its latest run exited 0.
     bool critical{true};
     std::chrono::steady_clock::time_point restart_at{};
     std::deque<std::chrono::steady_clock::time_point> restart_times;
@@ -1669,7 +1677,7 @@ class Launcher {
     std::signal(SIGTERM, [](int) { stop_requested_ = true; });
   }
 
-  // Respawns a crashed node into a fresh event log.
+  // Respawns a crashed or unexpectedly exited node into a fresh event log.
   void Restart(NodeProcessInfo& proc, NodeLaunch& launch) {
     launch.restart_pending = false;
     if (proc.quarantined)
@@ -1700,6 +1708,23 @@ class Launcher {
     launch.last_heartbeat = 0;
     launch.last_dispatch = 0;
     launch.heartbeat_killed = false;
+  }
+
+  // Whether any member other than `self` (and the Studio bridge, a viewer)
+  // is still live -- running or awaiting a restart -- without having exited
+  // 0. A clean exit's restart that falls due when none is would only rerun
+  // a roster whose every member has already completed, so it is dropped.
+  static bool RosterContinues(const std::vector<NodeProcessInfo>& procs,
+                              const std::vector<NodeLaunch>& launches,
+                              const std::optional<StudioBridge>& studio,
+                              std::size_t self) {
+    for (std::size_t j = 0; j < procs.size(); ++j) {
+      if (j == self || (studio && j == studio->index())) continue;
+      if (launches[j].last_exit_clean) continue;
+      if (launches[j].restart_pending) return true;
+      if (procs[j].pid > 0 && !procs[j].exited) return true;
+    }
+    return false;
   }
 
   // Waits until every node has exited, SIGINTing them all once on a signal or
@@ -1798,7 +1823,9 @@ class Launcher {
         const bool is_bridge = studio && i == studio->index();
         if (is_bridge && studio->Starting(i)) continue;
         const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-        if (!is_bridge && ShouldRestartNode(clean, max_restarts_, stopping)) {
+        launch.last_exit_clean = clean;
+        if (!is_bridge && ShouldRestartNode(clean, launch.critical,
+                                            max_restarts_, stopping)) {
           const int recent = static_cast<int>(launch.restart_times.size());
           const auto backoff = RestartBackoff(recent + 1);
           proc.quarantined = !launch.critical && recent >= max_restarts_;
@@ -1838,7 +1865,16 @@ class Launcher {
           procs[i].retry_at_monotonic_ns = 0;
           PersistManifest(procs);
         } else if (now >= launch.restart_at) {
-          Restart(procs[i], launch);
+          if (launch.last_exit_clean &&
+              !RosterContinues(procs, launches, studio, i)) {
+            launch.restart_pending = false;
+            procs[i].retry_at_monotonic_ns = 0;
+            std::cout << "[launcher] " << procs[i].name
+                      << " finished with the rest of the roster; not "
+                         "restarted\n";
+          } else {
+            Restart(procs[i], launch);
+          }
           PersistManifest(procs);
         }
       }

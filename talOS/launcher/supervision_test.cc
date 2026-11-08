@@ -9,20 +9,26 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "talOS/launcher/launcher.h"
 
 namespace talos::launcher {
 namespace {
+
+using namespace std::chrono_literals;
 
 std::string TempPath(std::string_view name) {
   return ::testing::TempDir() + "/talos_supervision_" +
@@ -226,6 +232,67 @@ TEST(Supervision, CriticalCrashLoopExceedsBudgetWithBackoffCappedAtOneSecond) {
   ::remove(runs.c_str());
 }
 
+// A long-lived stub that exits 0 when the launcher stops it.
+constexpr std::string_view kRunUntilStopped =
+    "trap 'exit 0' INT TERM\nwhile :; do sleep 0.05; done\n";
+
+// A critical node that exits 0 while its peers run on is lost, not finished:
+// it restarts. Its restart then exits 0 at the deadline and is not restarted.
+TEST(Supervision, CriticalCleanExitRestartsButDeadlineStopDoesNot) {
+  auto options = BaseOptions("clean_exit");
+  options.duration_s = 2;
+  const auto runs = TempPath("clean_exit_runs");
+  ::remove(runs.c_str());
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "clean_exit_alpha",
+      RecordLogArgThen(runs, "case \"$log\" in *alpha.tlog) exit 0;; esac\n" +
+                                 std::string{kRunUntilStopped}));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("clean_exit_beta", kRunUntilStopped);
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_EQ(ReadLines(runs), (std::vector<std::string>{
+                                 options.output_dir + "/alpha.tlog",
+                                 options.output_dir + "/alpha.restart1.tlog"}));
+  const auto alpha =
+      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
+  EXPECT_NE(alpha.find("\"restart_count\": 1"), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"exit_code\": 0"), std::string::npos) << alpha;
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
+// A requested stop (SIGTERM to the launcher) restarts none of the members
+// that exit 0 while stopping.
+TEST(Supervision, RequestedStopDoesNotRestartCleanExits) {
+  auto options = BaseOptions("clean_stop");
+  const auto runs = TempPath("clean_stop_runs");
+  ::remove(runs.c_str());
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("clean_stop_alpha", RecordLogArgThen(runs, kRunUntilStopped));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("clean_stop_beta", kRunUntilStopped);
+  const pid_t launcher = ::fork();
+  ASSERT_GE(launcher, 0);
+  if (launcher == 0) ::_exit(Launcher{options}.Run());
+  const auto give_up = std::chrono::steady_clock::now() + 10s;
+  while (ReadLines(runs).empty() && std::chrono::steady_clock::now() < give_up)
+    std::this_thread::sleep_for(10ms);
+  std::this_thread::sleep_for(200ms);
+  ::kill(launcher, SIGTERM);
+  int status = 0;
+  while (::waitpid(launcher, &status, 0) < 0 && errno == EINTR) {
+  }
+  EXPECT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
+  const std::string dir =
+      options.output_dir + "/" + std::to_string(options.session_id);
+  EXPECT_EQ(ReadLines(runs), std::vector<std::string>{dir + "/alpha.tlog"});
+  const auto alpha = ManifestEntry(ReadFile(dir + "/manifest.json"), "alpha");
+  EXPECT_NE(alpha.find("\"restart_count\": 0"), std::string::npos) << alpha;
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
 TEST(Supervision, MissingConfigFailsFastWithClearError) {
   LauncherOptions options;
   options.output_dir = TempPath("missing_cfg_out");
@@ -300,7 +367,7 @@ TEST(Supervision, CrashingNodeQuarantinesUntilTheSessionStops) {
   options.binary_overrides["//example/alpha:node"] = WriteStub(
       "restart_alpha", RecordLogArgThen(alpha_runs, "kill -KILL $$\n"));
   options.binary_overrides["//example/beta:node"] =
-      WriteStub("restart_beta", RecordLogArgThen(beta_runs, "exit 0\n"));
+      WriteStub("restart_beta", RecordLogArgThen(beta_runs, kRunUntilStopped));
 
   EXPECT_NE(RunSession(options), 0);
 
