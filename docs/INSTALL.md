@@ -110,6 +110,13 @@ their reasons in `.bazelrc`. Run sanitizer builds in their own output base
 (`bazel --output_base=$HOME/.cache/bazel-talos-asan ...`) so they do not evict the
 default build's cache.
 
+These are partial-coverage checks, not proof that the excluded paths are safe.
+The ordinary suite also covers excluded Python-host and full-stack paths.
+AprilTag's uninstrumented union-find code and OpenCV's normal parallel execution
+still need race qualification; an algorithm's convergent result does not make
+unsynchronized C/C++ accesses race-free. Deterministic mutation corpora are not
+continuous coverage-guided fuzzing.
+
 ## Editor setup
 
 clangd needs a compilation database:

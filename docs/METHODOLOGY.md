@@ -140,12 +140,14 @@ There are exactly two kinds of input, and they are treated differently.
 
 1. Every actuator call sits inside one `drive` condition that includes
    `robot_enabled(node)`, target freshness, feedback validity and finite
-   demands. **[review; the devices flush backstops motors only]**
+   demands. **[review; the devices layer also gates motor, digital and PWM outputs]**
 2. Neutral is reached by **not** calling the actuator. Call `stop()` only to
    override a set made earlier in the same tick. **[review]**
-3. Digital and PWM outputs are **not** neutralized by the flush: they keep their
-   last value until the robot is disabled. Set them every tick inside `drive`,
-   and set the safe value explicitly otherwise. **[review; framework fix tracked in TODO.md]**
+3. Actuator setters apply for one flush. Unset motors default to neutral;
+   the bridge replaces omitted digital outputs with `false` and PWM outputs
+   with `0.0`. Disable gates explicitly set outputs too. PWM zero and
+   backend-wide pulse suppression are different operations; verify the
+   attached device's physical response. **[enforced; hardware qualification]**
 4. Never write `/hw/request/<node>` and never send hardware requests outside
    `update()`. **[enforced: graph lint, one writer]**
 5. Closed loops run on the Talon (`set_velocity`, `set_position`,
@@ -288,7 +290,7 @@ intake; the whole graph used ≈ 4.5 % of one core.
 
 | Rule | Budget | Status |
 |---|---|---|
-| `update()` p99 wall time | ≤ 10 % of `period_us` | [review]; read `max_latency` in the registry / Studio system view |
+| `update()` p99 wall time | ≤ 10 % of `period_us` | [review]; measure callback entry-to-exit duration in a dedicated benchmark, using a monotonic wall clock, and compute the percentile from those durations. Registry / Studio `max_latency` measures maximum dispatch-start lateness, not callback duration or p99. Benchmark clocks must not replace `node.now()` in control logic. |
 | Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | [review]; the drivetrain's `UpdateDoesNotAllocate` counts process-wide allocations (macOS only; §13) |
 | Python nodes | cost memory (≈ 30 MB) and add GC/interpreter jitter: hard 5 ms actuator loops belong in C++, while 20 ms supervisory/estimator nodes monitor age and watchdog timeouts | [review] |
 | Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [review]; producer → consumer is one hop (`Target` resolves lanes in the consumer) |
