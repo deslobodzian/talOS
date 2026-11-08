@@ -481,20 +481,24 @@ class PoseEstimator:
                 <= self.max_yaw_innovation_rad)
 
     def relocalizes(self, sample_ns, time_s, pose, camera):
-        """Confirm distinct, time-ordered candidates, not a replayed frame.
+        """Confirm distinct, mutually consistent candidates, not a replayed frame.
 
         Every candidate must agree with every other one, not just its neighbour,
         so a chain of individually small disagreements cannot authorize a jump.
         Both capture and arrival times must fit the confirmation window.
         With multiple configured cameras, at least two must confirm the jump.
+        Independent cameras may capture at the same instant, or arrive out of
+        capture order; only a camera repeating (or going back to) a capture
+        time it already contributed is a replay, and it adds no evidence.
         """
         candidates = self.relocalization_candidates
         now = self.node.now
+        if any(c[4] == camera and sample_ns <= c[0] for c in candidates):
+            return False
         if candidates:
-            first_ns, _, first_arrival, _, _ = candidates[0]
-            if (sample_ns <= candidates[-1][0]
-                    or (sample_ns - first_ns) / _NS > RELOCALIZATION_WINDOW_S
-                    or now - first_arrival > RELOCALIZATION_WINDOW_S):
+            times = [c[0] for c in candidates] + [sample_ns]
+            if ((max(times) - min(times)) / _NS > RELOCALIZATION_WINDOW_S
+                    or now - candidates[0][2] > RELOCALIZATION_WINDOW_S):
                 candidates.clear()
         odometry = _odometry_at(self.backend.samples, time_s)
         for _, candidate_odometry, _, candidate_pose, _ in candidates:

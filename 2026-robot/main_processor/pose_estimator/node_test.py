@@ -418,6 +418,32 @@ class EstimatorTest(unittest.TestCase):
                 self.assertEqual(self.counts(), (1, 5))
                 self.assertAlmostEqual(self.pose()[0], 4.0, delta=0.1)
 
+    def test_synchronized_cameras_confirm_localization(self):
+        """Independent cameras capturing at the same instant are independent
+        evidence (simulated cameras all render one physics sample); only a
+        camera repeating its own capture time is a replay. Enabled start:
+        first localization; disabled start: a large-innovation relocalization."""
+        for backend in BACKENDS:
+            for enabled in (True, False):
+                with self.subTest(backend=backend, enabled=enabled):
+                    chassis = self.start(backend, enabled=enabled)
+                    # One camera repeating a capture time adds nothing.
+                    time_ns = self.estimate().sample_time_ns
+                    for _ in range(4):
+                        self.observe("front_camera", x=4.0, time_ns=time_ns)
+                        chassis.hold(DT)
+                    if enabled:  # an untrusted seed accepts, but cannot confirm
+                        self.assertFalse(self.estimate().localized)
+                    else:
+                        self.assertPoseHeld((0.0, 0.0, 0.0))
+                    for _ in range(2):
+                        for camera in ("front_camera", "back_camera"):
+                            self.observe(camera, x=4.0,
+                                         std=(0.001, 0.001, 0.001))
+                        chassis.hold(DT)
+                    self.assertTrue(self.estimate().localized)
+                    self.assertAlmostEqual(self.pose()[0], 4.0, delta=0.1)
+
     def test_inconsistent_relocalization_candidates_do_not_move_pose(self):
         for backend in BACKENDS:
             # The last sequence agrees with its neighbours but not pairwise.
