@@ -129,7 +129,10 @@ class EventLoopBase {
   bool in_dispatch() const { return active_loop_ == this; }
   bool running() const { return running_; }
 
-  std::uint64_t dispatch_count() const { return dispatch_index_; }
+  // Safe from another thread (the introspection Reporter samples it).
+  std::uint64_t dispatch_count() const {
+    return dispatch_index_.load(std::memory_order_relaxed);
+  }
 
   // --- registration -------------------------------------------------------
   // All of these must happen before run(). Ids are handed out in call order
@@ -313,8 +316,8 @@ class EventLoopBase {
     // movable, which rules out growing a vector of these as sources register.
     counters_ = std::make_unique<SourceCounters[]>(manifest_.size());
 
+    dispatch_index_.store(0, std::memory_order_relaxed);
     running_ = true;
-    dispatch_index_ = 0;
     context_ = Context{};
     recorder_.start(manifest_, start);
   }
@@ -324,7 +327,7 @@ class EventLoopBase {
 
     Context exit_context{};
     exit_context.kind = EventKind::EXIT;
-    exit_context.dispatch_index = ++dispatch_index_;
+    exit_context.dispatch_index = next_dispatch_index();
     exit_context.event_time = now;
     exit_context.now = now;
 
@@ -338,7 +341,7 @@ class EventLoopBase {
     Context context{};
     context.kind = EventKind::TIMER;
     context.source_id = id;
-    context.dispatch_index = ++dispatch_index_;
+    context.dispatch_index = next_dispatch_index();
     context.event_time = deadline;
     context.now = now;
     context.sequence = cycles;
@@ -354,7 +357,7 @@ class EventLoopBase {
     Context context{};
     context.kind = EventKind::MESSAGE;
     context.source_id = id;
-    context.dispatch_index = ++dispatch_index_;
+    context.dispatch_index = next_dispatch_index();
     context.event_time = event_time;
     context.now = now;
     context.publish_time = publish_time;
@@ -475,7 +478,15 @@ class EventLoopBase {
   Recorder recorder_{};
 
   Context context_{};
-  std::uint64_t dispatch_index_{0};
+  // Written only by the loop thread; read by the Reporter thread. A plain
+  // load/store pair, not fetch_add: one writer needs no locked RMW per event.
+  std::atomic<std::uint64_t> dispatch_index_{0};
+  std::uint64_t next_dispatch_index() {
+    const std::uint64_t next =
+        dispatch_index_.load(std::memory_order_relaxed) + 1;
+    dispatch_index_.store(next, std::memory_order_relaxed);
+    return next;
+  }
   MonotonicTime start_time_{};
   inline static thread_local EventLoopBase* active_loop_{nullptr};
   std::atomic<bool> running_{false};
