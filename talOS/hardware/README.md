@@ -15,8 +15,9 @@ tests and `sim_gateway`.
 
 The bridge (`//talOS/bridge:hardware_node`) parses the robot's TOML
 configuration and pushes it to the gateway as chunked `kHardwareConfig`
-frames; `Endpoint` reassembles them, calls `Gateway::Reconfigure`, and answers
-with a `kHardwareConfigAck`. The manifest holds logical device IDs, names, CAN
+frames; `Endpoint` reassembles them, starts `Gateway::BeginReconfigure`, and
+answers with a `kHardwareConfigAck` when the worker finishes. The manifest holds
+logical device IDs, names, CAN
 addresses and bus names, inversion, encoder offsets, current/voltage limits,
 gearing, three gain slots, soft limits, and Motion Magic cruise velocity,
 acceleration, and jerk. Changed configurations require disabled operation;
@@ -27,6 +28,17 @@ The RoboRIO atomically saves successful configuration bytes with a CRC32 to
 Startup validates and restores them before reporting ready. Missing or corrupt
 files leave the gateway unconfigured. A stale file cannot accept commands from
 a different configuration ID.
+
+A structurally valid configuration succeeds in degraded mode when individual
+Phoenix devices time out or are absent. Failed devices publish invalid samples;
+their motors, remote-feedback consumers and followers stay neutral, while
+healthy devices continue accepting commands. Invalid samples feed the existing
+bridge motor fault mask; sanitized demands increment the neutralized-motor
+counter. Configuration CAN transactions run on a worker, never the 5 ms RIO
+loop. Unavailable devices retry through the same per-device restore worker
+after 250 ms, doubling to 2 s. Rejected whole configurations make the bridge
+back off from 100 ms to 2 s without stopping its command courier; a new gateway
+boot resets that delay.
 
 Logical IDs remain independent of CAN addresses. Pigeon2 `offset_rot` configures
 Phoenix MountPoseYaw (rotations in `[-0.5, 0.5)`); `inverted` reverses yaw and
@@ -98,13 +110,24 @@ outputs, analog inputs, quadrature and duty-cycle encoders, and PWM outputs.
 Phoenix and both sims implement all of them.
 
 CAN bus load and measured sensor age must be checked on the actual bus before
-choosing production frequencies. The backend configures every consumed signal,
-including the TalonFX fault field, at the manifest status rate, then calls
+choosing production frequencies. Motion feedback requests the manifest status
+rate; motor voltage, stator current and fault field request
+`min(status_hz, 50)` Hz. Phoenix applies the highest requested rate to signals
+sharing a frame: with the pinned vendor library, voltage/current still apply
+at 200 Hz alongside 200 Hz motion feedback, while the fault field applies at
+50 Hz. See [vendor signal frequency semantics](https://v6.docs.ctr-electronics.com/en/stable/docs/api-reference/api-usage/status-signals.html#changing-update-frequency).
+The backend then calls
 `OptimizeBusUtilization()` on each TalonFX, CANcoder, and Pigeon2. Per-device
 optimization keeps the explicitly selected signals while stopping unused
 default frames; it does not replace measuring the real bus. Reads refresh the
 cached signals non-blockingly. One-shot control requests are refreshed by the
 bridge heartbeat (at most 20 ms), not on every gateway tick.
+Disabled neutral refresh deliberately remains every gateway tick. `Neutral()`
+uses one-shot `NeutralOut` (`UpdateFreqHz = 0`), not an acknowledged persistent
+disable latch. A dropped CAN neutral or a device reset can occur during disable;
+without an established vendor guarantee covering both cases, reducing refresh
+to 50 Hz would extend the retry interval. The cheap bus reduction is therefore
+limited to telemetry signals, not safety-output refresh.
 
 References: [CTRE remote sensor control](https://v6.docs.ctr-electronics.com/en/latest/docs/api-reference/device-specific/talonfx/remote-sensors.html)
 and [Motion Magic](https://v6.docs.ctr-electronics.com/en/latest/docs/api-reference/device-specific/talonfx/motion-magic.html).
@@ -164,13 +187,15 @@ identical push) clears the latch. A transient status failure requires a fresh
 valid command after recovery.
 
 Each `Tick` polls `Backend::PollDeviceResets()` (Phoenix: `HasResetOccurred()`
-per TalonFX/CANcoder/Pigeon2). A reset invalidates outstanding commands and
-starts `BeginRestoreAfterReset()`. `PollRestore()` never blocks: Phoenix applies
-saved device configurations on a worker thread while ticks and state publication
-continue with outputs neutral. Failed restores retry after 250 ms, doubling
-the delay up to 2 s. The gateway stays neutral and keeps publishing state during
-backoff, then accepts fresh commands after a successful restore even if still
-enabled. `Gateway::restore_attempt_count()` counts all restore starts per boot.
+per TalonFX/CANcoder/Pigeon2). A reset neutralizes only affected motors and
+their followers or remote-feedback dependents before starting
+`BeginRestoreAfterReset(ids)`. The global epoch and unrelated commands survive;
+pre-reset observations cannot authorize the affected motors after recovery.
+`PollRestore()` never blocks: Phoenix reapplies only the affected device chain
+on a worker while ticks, state publication and unrelated outputs continue.
+Failed devices retry after 250 ms, doubling to 2 s. A successful restore requires
+a fresh command observation before resuming. `Gateway::restore_attempt_count()`
+counts all restore starts per boot.
 
 Fault scope: stale motor current/voltage zeroes the effort fields but keeps the
 sample valid; an invalid RIO encoder invalidates only that sample. Invalid motor
@@ -180,7 +205,8 @@ the same command continue driving. These neutralizations increment
 `neutralized_motor_count`. The backend remains healthy while any configured
 motor or CAN sensor has valid feedback (or none are configured). Total loss of
 all configured motor/CAN-sensor feedback neutralizes every output and advances
-the command epoch. Failed Apply/Configure also neutralizes every output.
+the command epoch. Failed Apply or structurally rejected Configure also
+neutralizes every output; individual device configuration failures do not.
 DIO/analog/PWM and RIO encoder validity never sink the backend.
 
 ## RoboRIO
@@ -192,6 +218,8 @@ The other direction -- the companion finding the gateway -- is
 `[robot] controller_address` in `robot.toml` (see `talOS/launcher/README.md`),
 overridden per launch by `launcher --remote`. Real hardware uses Driver Station
 enable and e-stop.
+The adapter retries a failed gateway socket open once per second from its main
+loop, ticking the gateway disabled (all outputs neutral) until the socket opens.
 
 Build without deploying:
 

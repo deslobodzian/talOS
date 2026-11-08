@@ -430,7 +430,8 @@ TEST(SimBelievability, ResetRestorePreservesPhysicalRotorPosition) {
   const double position = state.motors[0].position_rot;
   ASSERT_GT(position, 0.0);
   ASSERT_GT(state.motors[0].velocity_rps, 0.0);
-  backend.BeginRestoreAfterReset();
+  const std::array<uint16_t, 1> reset_ids{1};
+  backend.BeginRestoreAfterReset(reset_ids);
   ASSERT_TRUE(backend.Read(state));  // Same timestamp: inspect reset directly.
   EXPECT_DOUBLE_EQ(state.motors[0].position_rot, position);
   EXPECT_DOUBLE_EQ(state.motors[0].velocity_rps, 0.0);

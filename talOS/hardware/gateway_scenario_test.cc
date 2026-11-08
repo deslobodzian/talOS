@@ -102,9 +102,9 @@ class FaultyBackend : public Backend {
   bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override {
     return sim_.PollDeviceResets(reset_ids);
   }
-  void BeginRestoreAfterReset() override {
+  void BeginRestoreAfterReset(std::span<const uint16_t> ids) override {
     ++restore_attempts;
-    sim_.BeginRestoreAfterReset();
+    sim_.BeginRestoreAfterReset(ids);
   }
   RestoreStatus PollRestore() override {
     if (restore_failures_remaining > 0) {
@@ -248,17 +248,16 @@ TEST(GatewayScenario, ControllerRestartRequiresFreshEpoch) {
   const uint64_t epoch_before = gw.snapshot().epoch;
   backend.SimulateDeviceReset(kMotorId);
   gw.Tick(7000, true);
-  // Stop condition: the reset invalidated the demand (epoch bump). The next
-  // read off the restored device is zero, never the pre-reset demand.
-  EXPECT_GT(gw.snapshot().epoch, epoch_before);
-  EXPECT_FALSE(HasFlag(gw.snapshot(), kCommandActive));
+  // A reset invalidates only this motor's observation, not the global epoch.
+  EXPECT_EQ(gw.snapshot().epoch, epoch_before);
+  EXPECT_TRUE(HasFlag(gw.snapshot(), kCommandActive));
   gw.Tick(12000, true);
   EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 0.0);
-  // Resume requires the fresh epoch: the pre-reset command is stale forever.
-  Command stale = FreshCommand(gw, kBootId, Mode::kVelocity, 10.0, 12000, 2);
-  stale.epoch = epoch_before;
-  EXPECT_FALSE(gw.Accept(stale, 2, 12000));
-  EXPECT_TRUE(AcceptVel(gw, kBootId, 10.0, 12000, 2));
+  Command stale = FreshCommand(gw, kBootId, Mode::kVelocity, 10.0, 2000, 2);
+  EXPECT_TRUE(gw.Accept(stale, 2, 12000));
+  gw.Tick(13000, true);
+  EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 0.0);
+  EXPECT_TRUE(AcceptVel(gw, kBootId, 10.0, 13000, 3));
 }
 
 TEST(GatewayScenario, TransientApplyFailureRecoversOnFreshCommand) {
@@ -297,8 +296,8 @@ TEST(GatewayScenario, FailedRestoreStaysNeutralAndDropsDemand) {
   ASSERT_TRUE(AcceptVel(gw, kBootId, 10.0, 2000, 1));
   backend.SimulateDeviceReset(kMotorId);
   gw.Tick(7000, true);
-  EXPECT_TRUE(HasFlag(gw.snapshot(), kHardwareFault));
-  EXPECT_FALSE(HasFlag(gw.snapshot(), kCommandActive));
+  EXPECT_FALSE(HasFlag(gw.snapshot(), kHardwareFault));
+  EXPECT_FALSE(gw.snapshot().motors[0].valid);
   // The reset tick read before the restore ran; the next read off the
   // restored device is zero, never the pre-reset demand.
   gw.Tick(12000, true);
@@ -315,13 +314,13 @@ TEST(GatewayScenario, RestoreRetriesTwiceThenResumesWhileEnabled) {
   backend.SimulateDeviceReset(kMotorId);
   gw.Tick(2000, true);
   gw.Tick(3000, true);
-  EXPECT_FALSE(gw.configured());
+  EXPECT_TRUE(gw.configured());
   EXPECT_EQ(backend.restore_attempts, 1);
   gw.Tick(252999, true);
   EXPECT_EQ(backend.restore_attempts, 1);
   EXPECT_EQ(gw.snapshot().sample_time_us, 252999u);
   EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 0);
-  EXPECT_FALSE(AcceptVel(gw, kBootId, 10, 252999, 3));
+  EXPECT_TRUE(AcceptVel(gw, kBootId, 10, 252999, 3));
   gw.Tick(253000, true);
   EXPECT_EQ(backend.restore_attempts, 2);
   gw.Tick(254000, true);
@@ -335,6 +334,7 @@ TEST(GatewayScenario, RestoreRetriesTwiceThenResumesWhileEnabled) {
   EXPECT_FALSE(HasFlag(gw.snapshot(), kHardwareFault));
   EXPECT_EQ(gw.restore_attempt_count(), 3u);
   EXPECT_EQ(gw.snapshot().counters.device_reset_count, 1u);
+  EXPECT_TRUE(gw.snapshot().motors[0].valid);
   EXPECT_FALSE(gw.Accept(stale, 4, 755000));
   ASSERT_TRUE(AcceptVel(gw, kBootId, 10, 755000, 5));
   gw.Tick(756000, true);
@@ -358,7 +358,7 @@ TEST(GatewayScenario, RestoreBackoffCapsAtTwoSeconds) {
     EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 0);
     gw.Tick(now + delay, true);
     EXPECT_EQ(backend.restore_attempts, ++attempts);
-    EXPECT_FALSE(AcceptVel(gw, kBootId, 10, now + delay, attempts));
+    EXPECT_TRUE(AcceptVel(gw, kBootId, 10, now + delay, attempts));
     now += delay + 1;
   }
   EXPECT_EQ(gw.restore_attempt_count(), 6u);

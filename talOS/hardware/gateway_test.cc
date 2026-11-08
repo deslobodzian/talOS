@@ -122,6 +122,9 @@ class FakeBackend : public Backend {
     events.push_back("configure");
     return configure_ok;
   }
+  std::vector<uint16_t> UnavailableDevices() const override {
+    return unavailable;
+  }
   bool Read(State& s) override {
     for (auto& m : s.motors) m.valid = healthy && m.id != invalid_motor;
     for (auto& sensor : s.sensors) {
@@ -146,9 +149,18 @@ class FakeBackend : public Backend {
     resets.clear();
     return !ids.empty();
   }
-  void BeginRestoreAfterReset() override { events.push_back("restore"); }
+  void BeginRestoreAfterReset(std::span<const uint16_t> ids) override {
+    restoring_ids.assign(ids.begin(), ids.end());
+    events.push_back("restore");
+  }
   RestoreStatus PollRestore() override {
     if (pending_ticks-- > 0) return RestoreStatus::kPending;
+    if (restore_ok) {
+      std::erase_if(unavailable, [&](uint16_t id) {
+        return std::find(restoring_ids.begin(), restoring_ids.end(), id) !=
+               restoring_ids.end();
+      });
+    }
     return restore_ok ? RestoreStatus::kDone : RestoreStatus::kFailed;
   }
   int pending_ticks{};
@@ -158,6 +170,8 @@ class FakeBackend : public Backend {
   std::vector<MotorRequest> last_requests{};
   std::vector<std::string> events{};
   std::vector<uint16_t> resets{};
+  std::vector<uint16_t> restoring_ids;
+  std::vector<uint16_t> unavailable;
   std::optional<ConfigError> config_error{};
 };
 Command Request(const Gateway& g) {
@@ -871,11 +885,10 @@ TEST(ConfigWire, RejectsUnboundedChunkMetadataAndRecovers) {
   invalid.push_back(header);
 
   for (const auto& bad_header : invalid) {
-    SCOPED_TRACE(::testing::Message()
-                 << "bytes=" << bad_header.total_bytes
-                 << " count=" << bad_header.chunk_count
-                 << " index=" << bad_header.chunk_index
-                 << " payload=" << bad_header.chunk_bytes);
+    SCOPED_TRACE(::testing::Message() << "bytes=" << bad_header.total_bytes
+                                      << " count=" << bad_header.chunk_count
+                                      << " index=" << bad_header.chunk_index
+                                      << " payload=" << bad_header.chunk_bytes);
     std::vector<uint8_t> bad_chunk(sizeof(ConfigChunkHeader) +
                                    bad_header.chunk_bytes);
     std::memcpy(bad_chunk.data(), &bad_header, sizeof(bad_header));
@@ -883,8 +896,8 @@ TEST(ConfigWire, RejectsUnboundedChunkMetadataAndRecovers) {
     std::string error;
     // These headers must be rejected before starting an allocation-backed
     // transfer, rather than eventually failing CRC or deserialization.
-    static_assert(noexcept(
-        assembler.AddChunk(std::span<const uint8_t>{}, error)));
+    static_assert(
+        noexcept(assembler.AddChunk(std::span<const uint8_t>{}, error)));
     EXPECT_EQ(assembler.AddChunk(bad_chunk, error),
               ConfigAssembler::Status::kInvalidChunk);
     EXPECT_FALSE(error.empty());
@@ -1225,14 +1238,13 @@ TEST(Gateway, ResetWhileEnabledNeutralizesBeforeRestore) {
   // Enabled: reset recovery still runs — the device is already at defaults —
   // but from the safe state, not around live demand.
   g.Tick(2000, true);
-  ASSERT_GE(backend.events.size(), 2u);
-  EXPECT_EQ(backend.events[0], "neutral");
-  EXPECT_EQ(backend.events[1], "restore");
-  EXPECT_NE(g.snapshot().epoch, epoch);
-  EXPECT_FALSE(g.snapshot().flags & kCommandActive);
-  EXPECT_FALSE(g.Accept(stale, 2, 2000));
+  ASSERT_EQ(backend.events.size(), 1u);
+  EXPECT_EQ(backend.events[0], "restore");
+  EXPECT_EQ(g.snapshot().epoch, epoch);
+  EXPECT_TRUE(g.snapshot().flags & kCommandActive);
+  EXPECT_TRUE(g.Accept(stale, 2, 2000));
   g.Tick(3000, true);
-  EXPECT_TRUE(g.Accept(Request(g), 0, 3000));
+  EXPECT_TRUE(g.Accept(Request(g), 3, 3000));
 }
 
 TEST(Gateway, PhysicsResetPreservesPositionAndRejectsOldDemand) {
@@ -1254,33 +1266,84 @@ TEST(Gateway, PhysicsResetPreservesPositionAndRejectsOldDemand) {
   gateway.Tick(106000, true);
   const double position = gateway.snapshot().motors[0].position_rot;
   ASSERT_NE(position, 0.0);
-  EXPECT_NE(gateway.snapshot().epoch, epoch);
-  EXPECT_FALSE(gateway.Accept(stale, 200000, 106000));
+  EXPECT_EQ(gateway.snapshot().epoch, epoch);
+  EXPECT_TRUE(gateway.Accept(stale, 200000, 106000));
   gateway.Tick(111000, true);
   EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].position_rot, position);
   EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].velocity_rps, 0.0);
   EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].voltage, 0.0);
 }
 
-TEST(Gateway, FailedResetRestoreLatchesFaultAndReneutralizes) {
+TEST(Gateway, FailedDeviceConfigureAndRestoreLeaveOthersDriving) {
   FakeBackend backend;
+  const auto config = SwerveConfig(true);
+  const auto failed_id = config.motors[0].id;
+  backend.unavailable = {failed_id};
   backend.restore_ok = false;
-  Gateway g{SwerveConfig(true), backend, 1};
+  Gateway g{config, backend, 1};
   g.Tick(1000, true);
-  auto stale = Request(g);
-  ASSERT_TRUE(g.Accept(stale, 1, 1000));
-  backend.resets.push_back(1);
-  backend.events.clear();
+  ASSERT_TRUE(g.configured());
+  auto command = Request(g);
+  for (std::size_t i = 0; i < command.count; ++i)
+    command.motors[i] = {config.motors[i].id, Mode::kDutyCycle, 0, 0.2};
+  ASSERT_TRUE(g.Accept(command, 1, 1000));
+  EXPECT_EQ(backend.last_requests[0].mode, Mode::kNeutral);
+  EXPECT_EQ(backend.last_requests[1].mode, Mode::kDutyCycle);
+  EXPECT_FALSE(g.snapshot().motors[0].valid);
+  EXPECT_GT(g.snapshot().counters.neutralized_motor_count, 0u);
+  g.Tick(250000, true);
+  EXPECT_EQ(backend.restoring_ids, std::vector<uint16_t>{failed_id});
+  g.Tick(251000, true);
+  command.observed_time_us = 251000;
+  command.epoch = g.snapshot().epoch;
+  ASSERT_TRUE(g.Accept(command, 2, 251000));
+  EXPECT_EQ(backend.last_requests[0].mode, Mode::kNeutral);
+  EXPECT_EQ(backend.last_requests[1].mode, Mode::kDutyCycle);
+  backend.restore_ok = true;
+  g.Tick(501000, true);
+  g.Tick(502000, true);
+  command.observed_time_us = 502000;
+  command.epoch = g.snapshot().epoch;
+  ASSERT_TRUE(g.Accept(command, 3, 502000));
+  EXPECT_EQ(backend.last_requests[0].mode, Mode::kDutyCycle);
+  EXPECT_EQ(backend.last_requests[1].mode, Mode::kDutyCycle);
+}
+
+TEST(Gateway, RemoteSensorResetIsolatesItsMotorAndFollower) {
+  auto config = SwerveConfig(true);
+  const auto steer = std::find_if(
+      config.motors.begin(), config.motors.end(), [](const auto& motor) {
+        return motor.feedback == Feedback::kRemoteCANcoder;
+      });
+  ASSERT_NE(steer, config.motors.end());
+  const auto index = static_cast<std::size_t>(steer - config.motors.begin());
+  auto follower = *steer;
+  follower.id = 100;
+  follower.name = "steer_follower";
+  follower.can_id = 60;
+  follower.master_id = steer->id;
+  config.motors.push_back(follower);
+  FakeBackend backend;
+  backend.pending_ticks = 10;
+  Gateway g{config, backend, 1};
+  g.Tick(1000, true);
+  auto command = Request(g);
+  for (std::size_t i = 0; i < command.count; ++i)
+    command.motors[i] = {config.motors[i].id, Mode::kDutyCycle, 0, 0.2};
+  ASSERT_TRUE(g.Accept(command, 1, 1000));
+  backend.resets = {config.motors[index].feedback_sensor_id};
   g.Tick(2000, true);
-  g.Tick(3000, true);
-  // Neutralize before the restore and again after the failed device change,
-  // mirroring Reconfigure (plus the Tick-end neutral while faulted).
-  ASSERT_GE(backend.events.size(), 3u);
-  EXPECT_EQ(backend.events[0], "neutral");
-  EXPECT_EQ(backend.events[1], "restore");
-  EXPECT_EQ(backend.events[2], "neutral");
-  EXPECT_TRUE(g.snapshot().flags & kHardwareFault);
-  EXPECT_FALSE(g.Accept(stale, 2, 2000));
+  EXPECT_EQ(backend.last_requests[index].mode, Mode::kNeutral);
+  EXPECT_EQ(backend.last_requests.back().mode, Mode::kNeutral);
+  EXPECT_EQ(backend.last_requests[0].mode, Mode::kDutyCycle);
+  EXPECT_TRUE(g.Accept(command, 2, 2000));
+  EXPECT_EQ(backend.last_requests[index].mode, Mode::kNeutral);
+  EXPECT_EQ(backend.last_requests.back().mode, Mode::kNeutral);
+  EXPECT_EQ(backend.last_requests[0].mode, Mode::kDutyCycle);
+  g.Tick(3000, false);
+  EXPECT_FALSE(g.Accept(command, 3, 3000));
+  g.Tick(200000, true);
+  EXPECT_FALSE(g.Accept(command, 4, 200000));
 }
 
 std::optional<ConfigAckPayload> PushConfigAndAwaitAck(
@@ -1371,11 +1434,12 @@ TEST(Gateway, PendingRestoreKeepsPollingAndNeutral) {
   for (uint64_t now = 3000; now <= 5000; now += 1000) {
     g.Tick(now, true);
     EXPECT_EQ(g.snapshot().sample_time_us, now);
-    EXPECT_FALSE(g.Accept(Request(g), now, now));
-    EXPECT_TRUE(g.snapshot().flags & kHardwareFault);
+    EXPECT_TRUE(g.Accept(Request(g), now, now));
+    EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+    EXPECT_FALSE(g.snapshot().motors[0].valid);
   }
   g.Tick(6000, true);
-  EXPECT_TRUE(g.Accept(Request(g), 1, 6000));
+  EXPECT_TRUE(g.Accept(Request(g), 6000, 6000));
   EXPECT_EQ(g.snapshot().counters.device_reset_count, 2u);
 }
 
@@ -1459,6 +1523,59 @@ TEST(Endpoint, RestoredGatewayAcknowledgesIdenticalConfigWhileEnabled) {
   EXPECT_EQ(acknowledgement.status, ConfigAckStatus::kOk);
   EXPECT_EQ(backend.configure_calls, configure_calls);
   EXPECT_TRUE(gateway.Accept(Request(gateway), 1, 2000));
+}
+
+TEST(Endpoint, PendingDegradedConfigureDoesNotBlockTicksAndRecoversDevice) {
+  class PendingBackend : public FakeBackend {
+   public:
+    void BeginConfigure(const Config&) override { started = true; }
+    ConfigureStatus PollConfigure() override {
+      return complete ? ConfigureStatus::kDone : ConfigureStatus::kPending;
+    }
+    bool started{}, complete{};
+  } backend;
+  const auto config = SwerveConfig(true);
+  backend.unavailable = {config.motors[0].id};
+  Gateway gateway{backend, 3011};
+  Endpoint endpoint{gateway};
+  ASSERT_EQ(endpoint.Open("127.0.0.1", 15812, "127.0.0.1", 15813),
+            protocol::UdpStatus::kOk);
+  protocol::RuntimeUdpPeer companion;
+  ASSERT_EQ(companion.Open("127.0.0.1", 15813, "127.0.0.1", 15812),
+            protocol::UdpStatus::kOk);
+  EXPECT_FALSE(PushConfigAndAwaitAck(endpoint, companion, config).has_value());
+  EXPECT_TRUE(backend.started);
+  EXPECT_EQ(backend.configure_calls, 0);
+  EXPECT_TRUE(gateway.configuring());
+  endpoint.Tick(7000, true);
+  EXPECT_EQ(gateway.snapshot().sample_time_us, 7000u);
+  EXPECT_FALSE(gateway.Accept(Request(gateway), 1, 7000));
+  backend.complete = true;
+  endpoint.Tick(12000, true);
+  EXPECT_TRUE(gateway.configured());
+  EXPECT_FALSE(gateway.snapshot().motors[0].valid);
+  ConfigAckPayload ack{};
+  bool received = false;
+  protocol::DecodedFrame frame;
+  while (companion.TryReceive(&frame) == protocol::UdpStatus::kOk) {
+    if (frame.header.type != protocol::FrameType::kHardwareConfigAck) continue;
+    ASSERT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, ack));
+    received = true;
+  }
+  ASSERT_TRUE(received);
+  EXPECT_EQ(ack.status, ConfigAckStatus::kOk);
+  auto command = Request(gateway);
+  for (std::size_t i = 0; i < command.count; ++i)
+    command.motors[i] = {config.motors[i].id, Mode::kDutyCycle, 0, 0.2};
+  ASSERT_TRUE(gateway.Accept(command, 2, 12000));
+  EXPECT_EQ(backend.last_requests[0].mode, Mode::kNeutral);
+  EXPECT_EQ(backend.last_requests[1].mode, Mode::kDutyCycle);
+  endpoint.Tick(262000, true);
+  endpoint.Tick(267000, true);
+  command.observed_time_us = 267000;
+  command.epoch = gateway.snapshot().epoch;
+  ASSERT_TRUE(gateway.Accept(command, 3, 267000));
+  EXPECT_EQ(backend.last_requests[0].mode, Mode::kDutyCycle);
 }
 
 }  // namespace

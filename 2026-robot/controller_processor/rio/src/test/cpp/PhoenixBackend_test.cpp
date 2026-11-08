@@ -145,11 +145,11 @@ TEST(PhoenixBackendFaults, UndervoltageUsesBitThree) {
 TEST(PhoenixBackendFaults, UnknownHighBitsRetainTheirBitIndices) {
   EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(uint32_t{1} << 31),
             "UnknownBit31");
-  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(
-                (uint32_t{1} << 24) | (uint32_t{1} << 27) | (uint32_t{1} << 31)),
+  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits((uint32_t{1} << 24) |
+                                                 (uint32_t{1} << 27) |
+                                                 (uint32_t{1} << 31)),
             "UnknownBit24, UnknownBit27, UnknownBit31");
-  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(
-                (uint32_t{1} << 31) | 0x100),
+  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits((uint32_t{1} << 31) | 0x100),
             "SupplyCurrLimit (supply current limit active), UnknownBit31");
 }
 
@@ -591,7 +591,7 @@ TEST_P(PhoenixBackendFollower, FollowsMasterAndNeutralizesWithMaster) {
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(c));
   std::array<hw::MotorRequest, 2> commands{
-      Request(20, hw::Mode::kNeutral, 0.0),
+      Request(20, hw::Mode::kVoltage, 0.0),
       Request(10, hw::Mode::kVoltage, 6.0)};
   hw::State state;
   PumpReads(backend, state, commands, 30);
@@ -630,8 +630,8 @@ class PhoenixBackendFollowerFeedback
     : public ::testing::TestWithParam<std::tuple<bool, bool>> {
  protected:
   static ctre::phoenix6::BaseStatusSignal& StaleSignal(PhoenixBackend& backend,
-                                                     bool remote,
-                                                     bool position) {
+                                                       bool remote,
+                                                       bool position) {
     if (remote) {
       if (position)
         return backend.sensors_[0].encoder->GetAbsolutePosition(false);
@@ -652,7 +652,8 @@ class PhoenixBackendFollowerFeedback
   }
 };
 
-TEST_P(PhoenixBackendFollowerFeedback, StaleOwnFeedbackNeutralizesOnlyFollower) {
+TEST_P(PhoenixBackendFollowerFeedback,
+       StaleOwnFeedbackNeutralizesOnlyFollower) {
   EnsureHal();
   EnabledDs ds;
   const auto [remote, position] = GetParam();
@@ -675,7 +676,7 @@ TEST_P(PhoenixBackendFollowerFeedback, StaleOwnFeedbackNeutralizesOnlyFollower) 
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(config));
   const std::array<hw::MotorRequest, 2> commands{
-      Request(20, hw::Mode::kNeutral, 0.0),
+      Request(20, hw::Mode::kVoltage, 0.0),
       Request(10, hw::Mode::kVoltage, 6.0)};
   hw::State state;
   PumpReads(backend, state, commands, 30);
@@ -701,7 +702,8 @@ TEST_P(PhoenixBackendFollowerFeedback, StaleOwnFeedbackNeutralizesOnlyFollower) 
       2, ctre::phoenix6::CANBus{"rio"}};
   ctre::phoenix6::hardware::TalonFX master_device{
       1, ctre::phoenix6::CANBus{"rio"}};
-  EXPECT_NEAR(follower_device.GetSimState().GetMotorVoltage().value(), 0.0, 0.5);
+  EXPECT_NEAR(follower_device.GetSimState().GetMotorVoltage().value(), 0.0,
+              0.5);
   EXPECT_GT(master_device.GetSimState().GetMotorVoltage().value(), 3.0);
 
   // Refreshing the failed feedback restores following without reconfiguration.
@@ -710,6 +712,67 @@ TEST_P(PhoenixBackendFollowerFeedback, StaleOwnFeedbackNeutralizesOnlyFollower) 
   EXPECT_GT(state.motors[1].voltage, 3.0);
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    SourceAndSignal, PhoenixBackendFollowerFeedback,
-    ::testing::Combine(::testing::Bool(), ::testing::Bool()));
+INSTANTIATE_TEST_SUITE_P(SourceAndSignal, PhoenixBackendFollowerFeedback,
+                         ::testing::Combine(::testing::Bool(),
+                                            ::testing::Bool()));
+
+class PhoenixBackendRecovery : public ::testing::Test {
+ protected:
+  static auto& Motor(PhoenixBackend& backend, std::size_t i) {
+    return *backend.motors_[i];
+  }
+};
+
+TEST_F(PhoenixBackendRecovery, DiagnosticRatesRespectPhoenixSharedFrames) {
+  EnsureHal();
+  hw::Config config;
+  config.status_hz = 200;
+  config.motors.push_back(TestMotor(1, "motor", 1));
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  auto& motor = Motor(backend, 0);
+  EXPECT_DOUBLE_EQ(motor.GetPosition(false).GetAppliedUpdateFrequency().value(),
+                   200);
+  EXPECT_DOUBLE_EQ(motor.GetVelocity(false).GetAppliedUpdateFrequency().value(),
+                   200);
+  // Phoenix coalesces these with motion feedback at the highest requested
+  // frame rate; requesting 50 Hz cannot slow the control frame.
+  EXPECT_DOUBLE_EQ(
+      motor.GetMotorVoltage(false).GetAppliedUpdateFrequency().value(), 200);
+  EXPECT_DOUBLE_EQ(
+      motor.GetStatorCurrent(false).GetAppliedUpdateFrequency().value(), 200);
+  EXPECT_DOUBLE_EQ(
+      motor.GetFaultField(false).GetAppliedUpdateFrequency().value(), 50);
+}
+
+TEST_F(PhoenixBackendRecovery, RestoreDoesNotReconfigureUnrelatedMotor) {
+  EnsureHal();
+  hw::Config config;
+  auto first = TestMotor(1, "first", 1);
+  auto second = TestMotor(2, "second", 2);
+  first.slots[0].p = 3;
+  second.slots[0].p = 5;
+  config.motors = {first, second};
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ctre::phoenix6::configs::TalonFXConfiguration defaults;
+  ASSERT_TRUE(Motor(backend, 0).GetConfigurator().Apply(defaults).IsOK());
+  ASSERT_TRUE(Motor(backend, 1).GetConfigurator().Apply(defaults).IsOK());
+  const std::array<uint16_t, 1> ids{1};
+  backend.BeginRestoreAfterReset(ids);
+  auto result = hw::Backend::RestoreStatus::kPending;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  while (result == hw::Backend::RestoreStatus::kPending &&
+         std::chrono::steady_clock::now() < deadline) {
+    result = backend.PollRestore();
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  ASSERT_EQ(result, hw::Backend::RestoreStatus::kDone);
+  EXPECT_TRUE(backend.UnavailableDevices().empty());
+  ctre::phoenix6::configs::TalonFXConfiguration applied;
+  ASSERT_TRUE(Motor(backend, 0).GetConfigurator().Refresh(applied).IsOK());
+  EXPECT_DOUBLE_EQ(applied.Slot0.kP, 3);
+  ASSERT_TRUE(Motor(backend, 1).GetConfigurator().Refresh(applied).IsOK());
+  EXPECT_DOUBLE_EQ(applied.Slot0.kP, 0);
+}

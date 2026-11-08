@@ -29,10 +29,16 @@ class PhoenixBackend final : public talos::hardware::Backend {
  public:
   explicit PhoenixBackend(bool is_simulation = false);
 
-  // Decode the cached TalonFX FaultField (SPN 0x34c, frame 0xad), without CAN IO.
+  // Decode the cached TalonFX FaultField (SPN 0x34c, frame 0xad), without CAN
+  // IO.
   static std::string DecodeTalonFaultBits(uint32_t fault_flags);
 
   bool Configure(const talos::hardware::Config&) override;
+  void BeginConfigure(const talos::hardware::Config&) override;
+  ConfigureStatus PollConfigure() override;
+  std::vector<uint16_t> UnavailableDevices() const override {
+    return unavailable_;
+  }
   bool Read(talos::hardware::State&) override;
   bool Apply(std::span<const talos::hardware::MotorRequest>) override;
   bool ApplyOutputs(
@@ -44,11 +50,12 @@ class PhoenixBackend final : public talos::hardware::Backend {
       const override;
   // Per-device reset detection (HasResetOccurred) and restore.
   bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override;
-  void BeginRestoreAfterReset() override;
+  void BeginRestoreAfterReset(std::span<const uint16_t> ids) override;
   RestoreStatus PollRestore() override;
 
  private:
   friend class PhoenixBackendFollowerFeedback;
+  friend class PhoenixBackendRecovery;
   void UpdateSimulation(double dt);
 
   struct Sensor {
@@ -80,8 +87,14 @@ class PhoenixBackend final : public talos::hardware::Backend {
   std::vector<std::unique_ptr<frc::PWM>> pwm_outputs_;
 
   std::optional<talos::hardware::ConfigError> last_error_;
-  std::vector<std::function<bool()>> restore_operations_;
-  std::future<bool> restore_;
+  struct RestoreOperation {
+    uint16_t id;
+    std::function<bool()> apply;
+  };
+  std::vector<RestoreOperation> restore_operations_;
+  std::vector<uint16_t> signal_ids_;
+  std::vector<uint16_t> unavailable_;
+  std::vector<uint16_t> restoring_ids_;
 
   bool is_simulation_{false};
   std::optional<std::chrono::steady_clock::time_point> last_sim_time_;
@@ -93,4 +106,6 @@ class PhoenixBackend final : public talos::hardware::Backend {
   // voltage.
   std::array<bool, talos::hardware::kMaxMotors> sim_neutral_{};
   double sim_yaw_deg_{0.0};
+  std::future<bool> configure_;
+  std::future<std::vector<uint16_t>> restore_;
 };

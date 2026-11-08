@@ -205,6 +205,7 @@ class HardwareNode {
   uint64_t statuses_published_{0};
   uint64_t last_status_us_{0};
   uint64_t last_push_time_us_{0};
+  uint64_t config_push_backoff_us_{50000};
 
   // Explicit periodic scheduling: 1 kHz tick period as a
   // named deadline, not an implicit sleep constant.

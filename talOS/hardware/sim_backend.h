@@ -46,9 +46,14 @@ class SimBackend final : public Backend {
         for (std::size_t j = 0; j < config_.motors.size(); ++j) {
           if (config_.motors[j].id != cfg.master_id || !resolved[j]) continue;
           const double sign = cfg.oppose_master ? -1.0 : 1.0;
-          samples_[i].position_rot = samples_[j].position_rot * sign;
-          samples_[i].velocity_rps = samples_[j].velocity_rps * sign;
-          samples_[i].voltage = samples_[j].voltage * sign;
+          if (commands_[i].mode == Mode::kNeutral) {
+            samples_[i].velocity_rps = 0;
+            samples_[i].voltage = 0;
+          } else {
+            samples_[i].position_rot = samples_[j].position_rot * sign;
+            samples_[i].velocity_rps = samples_[j].velocity_rps * sign;
+            samples_[i].voltage = samples_[j].voltage * sign;
+          }
           resolved[i] = true;
           progress = true;
           break;
@@ -140,7 +145,11 @@ class SimBackend final : public Backend {
     pending_resets_.clear();
     return !reset_ids.empty();
   }
-  void BeginRestoreAfterReset() override { commands_ = {}; }
+  void BeginRestoreAfterReset(std::span<const uint16_t> ids) override {
+    for (std::size_t i = 0; i < config_.motors.size(); ++i)
+      if (std::find(ids.begin(), ids.end(), config_.motors[i].id) != ids.end())
+        commands_[i] = MotorRequest{};
+  }
   RestoreStatus PollRestore() override { return RestoreStatus::kDone; }
   void SetPowerHealth(double battery_v, bool brownout) {
     health_ = {true, battery_v, brownout, 0.0};

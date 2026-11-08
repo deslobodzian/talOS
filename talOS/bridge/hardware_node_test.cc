@@ -224,7 +224,7 @@ TEST(HardwareNodeTest, ForwardsDriverStationPacketsToIpc) {
 
   const auto send = [&](const uint8_t* bytes, std::size_t size) {
     ASSERT_EQ(gateway_peer.SendFrame(protocol::FrameType::kDriverStation, 2,
-                                    2000, bytes, size),
+                                     2000, bytes, size),
               protocol::UdpStatus::kOk);
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
     node.Tick(30000);
@@ -331,8 +331,8 @@ TEST(HardwareNodeTest, LastSubsystemTimeoutSendsOneFreshNeutralFrame) {
   request.epoch = 1;
   request.observed_time_us = 1000;
   request.count = 1;
-  request.motors[0] = {cfg.subsystems.at("intake").motors[0], Mode::kVoltage,
-                       0, 4.0, 1.0};
+  request.motors[0] = {cfg.subsystems.at("intake").motors[0], Mode::kVoltage, 0,
+                       4.0, 1.0};
   request.digital_output_count = 1;
   request.digital_outputs[0] = {cfg.hardware.digital_outputs[0].id, true};
   request.pwm_output_count = 1;
@@ -355,10 +355,12 @@ TEST(HardwareNodeTest, LastSubsystemTimeoutSendsOneFreshNeutralFrame) {
     for (int i = 0; i < 20; ++i) {
       protocol::DecodedFrame frame;
       while (gateway.TryReceive(&frame) == protocol::UdpStatus::kOk) {
-        if (frame.header.type != protocol::FrameType::kHardwareCommand) continue;
+        if (frame.header.type != protocol::FrameType::kHardwareCommand)
+          continue;
         Command command{};
-        EXPECT_TRUE(Decode(
-            std::span<const uint8_t>{frame.payload, frame.payload_size}, command));
+        EXPECT_TRUE(
+            Decode(std::span<const uint8_t>{frame.payload, frame.payload_size},
+                   command));
         commands.push_back(command);
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1559,6 +1561,63 @@ TEST(HardwareNodeTest, TimeoutNeutralizesOnlyTheSilentSubsystemsActuators) {
   EXPECT_EQ(neutral.pwm_outputs[0].id, strip);
   EXPECT_DOUBLE_EQ(neutral.pwm_outputs[0].output, 0.0);
   EXPECT_EQ(node.Status(1011001).timed_out_mask(), 0b10u);
+}
+
+TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {
+  auto cfg = config::ParseRobotConfigString(kTestToml);
+  HardwareNode node{cfg, "127.0.0.1", TestPort(26180), TestPort(26181), true};
+  ASSERT_TRUE(node.Open());
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(
+      gateway.Open("127.0.0.1", TestPort(26180), "127.0.0.1", TestPort(26181)),
+      protocol::UdpStatus::kOk);
+  const auto id = NodeConfigId(cfg);
+  uint64_t now = 1000000;
+  ASSERT_TRUE(InjectState(node, gateway, TrustState(id, 11, 1, now), now));
+  const auto drain_configs = [&] {
+    unsigned count = 0;
+    protocol::DecodedFrame frame;
+    while (gateway.TryReceive(&frame) == protocol::UdpStatus::kOk)
+      count += frame.header.type == protocol::FrameType::kHardwareConfig;
+    return count;
+  };
+  EXPECT_GT(drain_configs(), 0u);
+  ipc::Publisher<Packet> pub{RequestTopic("drivetrain")};
+  for (uint64_t delay :
+       {100000u, 200000u, 400000u, 800000u, 1600000u, 2000000u, 2000000u}) {
+    ConfigAckPayload ack{};
+    ack.config_id = id;
+    ack.status = ConfigAckStatus::kBackendFailed;
+    std::array<uint8_t, 128> bytes{};
+    const auto size = EncodeConfigAck(ack, bytes);
+    ASSERT_EQ(gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 0, now,
+                                bytes.data(), size),
+              protocol::UdpStatus::kOk);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    node.Tick(now);
+    EXPECT_EQ(drain_configs(), 0u);
+    const auto before = node.commands_sent();
+    ASSERT_TRUE(InjectState(node, gateway,
+                            TrustState(id, 11, 1, now + delay - 1),
+                            now + delay - 1));
+    EXPECT_EQ(drain_configs(), 0u);
+    Command request{};
+    request.config_id = id;
+    request.boot_id = 11;
+    request.epoch = 1;
+    request.observed_time_us = now + delay - 1;
+    request.count = 1;
+    request.motors[0] = {cfg.subsystems.at("drivetrain").motors[0],
+                         Mode::kDutyCycle, 0, 0.2};
+    PublishCommand(pub, request);
+    node.Tick(now + delay - 1);
+    EXPECT_GT(node.commands_sent(), before);
+    EXPECT_EQ(node.current_command().motors[0].mode, Mode::kDutyCycle);
+    EXPECT_EQ(drain_configs(), 0u);
+    now += delay;
+    ASSERT_TRUE(InjectState(node, gateway, TrustState(id, 11, 1, now), now));
+    EXPECT_GT(drain_configs(), 0u);
+  }
 }
 
 }  // namespace

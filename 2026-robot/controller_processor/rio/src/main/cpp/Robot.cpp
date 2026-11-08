@@ -189,14 +189,8 @@ void Robot::StartCompetition() {
       std::fprintf(stderr, "cannot persist hardware configuration\n");
   });
 
-  const auto status =
-      endpoint_->Open(IsSimulation() ? "127.0.0.1" : "0.0.0.0", 5802,
-                      IsSimulation() ? "127.0.0.1" : kCompanionAddress, 5803);
-  if (status != talos::protocol::UdpStatus::kOk) {
-    std::printf("hardware gateway socket failed: %s\n",
-                talos::protocol::UdpStatusName(status));
-    endpoint_.reset();
-  }
+  bool socket_open = false;
+  uint64_t next_socket_retry_us = 0;
 
   std::printf(
       "hardware gateway config=%llu commissioned=%d (waiting for config "
@@ -251,10 +245,20 @@ void Robot::StartCompetition() {
     const uint64_t now_us = NowUs();
     const uint32_t mode_flags = DriverStationModeFlags();
     ds_mode.Observe(mode_flags, now_us);
-    if (endpoint_) {
-      endpoint_->Tick(
-          now_us, (mode_flags & talos::driver_station::kEnabled) != 0 &&
-                      (mode_flags & talos::driver_station::kEStop) == 0);
+    if (!socket_open && now_us >= next_socket_retry_us) {
+      const auto status = endpoint_->Open(
+          IsSimulation() ? "127.0.0.1" : "0.0.0.0", 5802,
+          IsSimulation() ? "127.0.0.1" : kCompanionAddress, 5803);
+      socket_open = status == talos::protocol::UdpStatus::kOk;
+      next_socket_retry_us = now_us + 1000000;
+      if (!socket_open)
+        std::printf("hardware gateway socket failed: %s\n",
+                    talos::protocol::UdpStatusName(status));
+    }
+    if (socket_open) {
+      endpoint_->Tick(now_us,
+                      (mode_flags & talos::driver_station::kEnabled) != 0 &&
+                          (mode_flags & talos::driver_station::kEStop) == 0);
 
       // The Driver Station only produces new data at 50 Hz, so sampling it on
       // every hardware tick would put three duplicate packets on the link, and
@@ -272,7 +276,7 @@ void Robot::StartCompetition() {
         }
       }
     } else {
-      backend_->Neutral();
+      gateway_->Tick(now_us, false);
     }
 
     // An overrun must not turn into a burst of catch-up iterations that starve

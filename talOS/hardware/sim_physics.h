@@ -432,30 +432,31 @@ class PhysicsSimBackend final : public Backend {
   void SetEncoder(uint16_t id, double position_rot, double velocity_rps) {
     encoders_[id] = {position_rot, velocity_rps};
   }
-  // Fault injection for reset handling. The next gateway Tick
-  // reports these logical IDs as reset; BeginRestoreAfterReset re-applies the
-  // motor-to-sensor mapping while preserving physical rotor positions. Only
-  // velocities and outputs reset; the gateway drops obsolete demand separately
-  // via Neutral/epoch bump.
+  // Restore only reset motors, preserving positions and unrelated motion.
+  // The gateway neutralizes dependent motors before starting restoration.
   void SimulateDeviceReset(uint16_t id) { pending_resets_.push_back(id); }
   bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override {
     reset_ids = pending_resets_;
     pending_resets_.clear();
     return !reset_ids.empty();
   }
-  void BeginRestoreAfterReset() override {
-    for (auto& axis : axes_) axis.rotor_velocity_rps = 0.0;
-    profiles_.fill(Profile{});
-    commands_.fill(MotorRequest{});
-    applied_volts_.fill(0.0);
-    powered_.fill(false);
-    frozen_.fill(false);
-    motor_connected_.fill(true);
-    sensor_connected_.fill(true);
-    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-      held_[i] = MotorSample{};
-      held_[i].id = config_.motors[i].id;
-      held_[i].valid = true;
+  void BeginRestoreAfterReset(std::span<const uint16_t> ids) override {
+    for (auto id : ids) {
+      const int i = MotorIndex(id);
+      if (i >= 0) {
+        axes_[i].rotor_velocity_rps = 0.0;
+        profiles_[i] = Profile{};
+        commands_[i] = MotorRequest{};
+        applied_volts_[i] = 0.0;
+        powered_[i] = false;
+        frozen_[i] = false;
+        motor_connected_[i] = true;
+        held_[i] = MotorSample{};
+        held_[i].id = id;
+        held_[i].valid = true;
+      }
+      for (std::size_t j = 0; j < config_.sensors.size(); ++j)
+        if (config_.sensors[j].id == id) sensor_connected_[j] = true;
     }
   }
   RestoreStatus PollRestore() override {
@@ -726,7 +727,8 @@ class PhysicsSimBackend final : public Backend {
         if (master < 0 || !resolved[master]) continue;
         resolved[i] = true;
         progress = true;
-        powered_[i] = FeedbackValid(i) && powered_[master];
+        powered_[i] = commands_[i].mode != Mode::kNeutral && FeedbackValid(i) &&
+                      powered_[master];
         applied_volts_[i] = powered_[i] ? applied_volts_[master] *
                                               (m.oppose_master ? -1.0 : 1.0)
                                         : 0.0;

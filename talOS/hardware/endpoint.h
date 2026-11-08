@@ -27,6 +27,27 @@ class Endpoint {
   void SetSendEnabled(bool enabled) { send_enabled_ = enabled; }
   protocol::UdpStatus Tick(uint64_t now_us, bool enabled) {
     gateway_.Tick(now_us, enabled);
+    if (pending_ack_ && !gateway_.configuring()) {
+      ConfigAckPayload ack{};
+      ack.config_id = pending_config_id_;
+      ack.status = gateway_.configured() &&
+                           gateway_.snapshot().config_id == pending_config_id_
+                       ? ConfigAckStatus::kOk
+                       : ConfigAckStatus::kBackendFailed;
+      if (ack.status != ConfigAckStatus::kOk) {
+        const auto error = gateway_.config_error();
+        if (error)
+          std::snprintf(ack.reason, sizeof(ack.reason), "%s: %s",
+                        error->device_name.c_str(), error->message.c_str());
+      }
+      if (ack.status == ConfigAckStatus::kOk && on_configured_)
+        on_configured_(gateway_.config());
+      std::array<uint8_t, 128> bytes{};
+      const auto size = EncodeConfigAck(ack, bytes);
+      Send(protocol::FrameType::kHardwareConfigAck, pending_sequence_, now_us,
+           bytes.data(), size);
+      pending_ack_ = false;
+    }
     for (int i = 0; i < 16; ++i) {
       protocol::DecodedFrame frame;
       const auto result = peer_.TryReceive(&frame);
@@ -38,7 +59,20 @@ class Endpoint {
         auto status =
             assembler_.AddChunk({frame.payload, frame.payload_size}, err);
         if (status == ConfigAssembler::Status::kComplete) {
-          bool ok = gateway_.Reconfigure(assembler_.config());
+          if (gateway_.configuring()) continue;
+          bool ok = gateway_.BeginReconfigure(assembler_.config());
+          // Bounded backends can complete immediately; Phoenix only polls its
+          // worker here and returns without waiting for CAN transactions.
+          if (ok && gateway_.configuring()) gateway_.Tick(now_us, enabled);
+          if (ok && !gateway_.configuring())
+            ok = gateway_.configured() &&
+                 gateway_.snapshot().config_id == assembler_.config_id();
+          if (ok && gateway_.configuring()) {
+            pending_ack_ = true;
+            pending_config_id_ = assembler_.config_id();
+            pending_sequence_ = frame.header.sequence;
+            continue;
+          }
           ConfigAckPayload ack{};
           ack.config_id = assembler_.config_id();
           if (ok) {
@@ -110,6 +144,8 @@ class Endpoint {
   Gateway& gateway_;
   protocol::RuntimeUdpPeer peer_;
   ConfigAssembler assembler_;
+  bool pending_ack_{false};
+  uint64_t pending_config_id_{}, pending_sequence_{};
   std::function<void(const Config&)> on_configured_;
   std::array<uint8_t, protocol::kMaxPayloadSize> buffer_{};
 };

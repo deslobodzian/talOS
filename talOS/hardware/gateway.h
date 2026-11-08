@@ -16,10 +16,23 @@ class Backend {
  public:
   virtual ~Backend() = default;
   virtual bool Configure(const Config&) = 0;
+  enum class ConfigureStatus { kPending, kDone, kFailed };
+  // The default is suitable only for bounded, nonblocking backends.
+  virtual void BeginConfigure(const Config& config) {
+    configure_result_ = Configure(config);
+  }
+  virtual ConfigureStatus PollConfigure() {
+    return configure_result_ ? ConfigureStatus::kDone
+                             : ConfigureStatus::kFailed;
+  }
+  // A successful Configure may leave individual devices unavailable.
+  virtual std::vector<uint16_t> UnavailableDevices() const { return {}; }
   // Return false for a failed read pass or total motor/CAN-sensor feedback
   // loss, not an individual dropout. With no such devices configured, return
   // true. Individual sample validity gates only the affected motor in Accept().
   virtual bool Read(State&) = 0;
+  // Followers ignore demand values, but kNeutral explicitly gates their output.
+  // Gateway resolves a live follower's mode from its sanitized master.
   virtual bool Apply(std::span<const MotorRequest>) = 0;
   virtual bool ApplyOutputs(
       std::span<const DigitalOutputRequest> /*digital_outputs*/,
@@ -34,9 +47,8 @@ class Backend {
   }
   // Individual device resets. Returns true and fills reset_ids with
   // the logical IDs of devices that reset since the last poll. The gateway
-  // invalidates outstanding commands (epoch bump plus Neutral) BEFORE
-  // restoring configuration, so no obsolete demand resumes on a freshly
-  // reset device.
+  // neutralizes only affected motors and their dependents before restoring;
+  // their old observations cannot authorize motion after recovery.
   virtual bool PollDeviceResets(std::vector<uint16_t>& reset_ids) {
     reset_ids.clear();
     return false;
@@ -44,8 +56,11 @@ class Backend {
   enum class RestoreStatus { kPending, kDone, kFailed };
   // Start nonblocking restoration; PollRestore never waits for device traffic.
   // Failed restoration is retried by Gateway with capped exponential backoff.
-  virtual void BeginRestoreAfterReset() {}
+  virtual void BeginRestoreAfterReset(std::span<const uint16_t>) {}
   virtual RestoreStatus PollRestore() { return RestoreStatus::kDone; }
+
+ private:
+  bool configure_result_{false};
 };
 
 class Gateway {
@@ -69,6 +84,10 @@ class Gateway {
   // disabled/idempotent/validation/ceiling rejects above never block; only a
   // genuine disabled-side change blocks.
   bool Reconfigure(const Config& config);
+  // Nonblocking configuration path used by Endpoint. Completion is polled on
+  // Tick; no backend reads or writes race device construction.
+  bool BeginReconfigure(const Config& config);
+  bool configuring() const { return configuring_; }
   void Tick(uint64_t now_us, bool driver_station_enabled);
   // Structural errors reject all outputs; range errors or invalid motor/remote
   // CANcoder feedback neutralize only that motor. Total backend loss
@@ -88,6 +107,10 @@ class Gateway {
  private:
   void Invalidate();
   void PollResets();
+  bool DeviceUnavailable(uint16_t id) const;
+  void MaskUnavailable();
+  void NeutralUnavailable();
+  void CommitConfiguration(const Config& config);
   Config config_;
   Backend& backend_;
   State state_{};
@@ -97,6 +120,12 @@ class Gateway {
   bool restoring_{false};
   bool restore_waiting_{false};
   uint64_t restore_retry_at_{};
+  bool configuring_{false};
+  Config pending_config_;
+  std::vector<uint16_t> unavailable_;
+  std::vector<uint16_t> restoring_ids_;
+  std::array<MotorRequest, kMaxMotors> last_requests_{};
+  std::array<uint64_t, kMaxMotors> motor_reset_at_{};
   uint64_t restore_backoff_us_{kRestoreInitialBackoffUs};
   uint32_t restore_attempt_count_{};
   uint32_t consecutive_apply_failures_{};

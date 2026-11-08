@@ -84,8 +84,8 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
     tracker.devices = devs;
     tracker.period_us = config_.period_us;
     if (const auto* tbl = robot_config_.GetSubsystemTable(name)) {
-      tracker.period_us =
-          static_cast<uint32_t>((*tbl)["period_us"].value_or(config_.period_us));
+      tracker.period_us = static_cast<uint32_t>(
+          (*tbl)["period_us"].value_or(config_.period_us));
     }
     subsystems_[name] = std::move(tracker);
   }
@@ -281,8 +281,16 @@ void HardwareNode::Tick(uint64_t now_us) {
     if (frame.header.type == protocol::FrameType::kHardwareConfigAck) {
       ConfigAckPayload ack{};
       if (DecodeConfigAck({frame.payload, frame.payload_size}, ack)) {
-        if (ack.status == ConfigAckStatus::kOk && ack.config_id == config_id_) {
-          is_configured_ = true;
+        if (ack.config_id == config_id_) {
+          if (ack.status == ConfigAckStatus::kOk) {
+            is_configured_ = true;
+            config_push_backoff_us_ = 50000;
+          } else {
+            is_configured_ = false;
+            config_push_backoff_us_ =
+                std::min<uint64_t>(config_push_backoff_us_ * 2, 2000000);
+            last_push_time_us_ = now_us;
+          }
         }
       }
       continue;
@@ -297,9 +305,10 @@ void HardwareNode::Tick(uint64_t now_us) {
       // Every decoded frame feeds the clock mapping, whatever its config:
       // the gateway's clock does not depend on what it was configured with.
       clock_.Observe(state.boot_id, state.sample_time_us, now_us);
+      if (state.boot_id != last_boot_id_) config_push_backoff_us_ = 50000;
       if (state.boot_id != last_boot_id_ || state.config_id != config_id_ ||
           !is_configured_) {
-        if (now_us - last_push_time_us_ >= 50000 ||
+        if (now_us - last_push_time_us_ >= config_push_backoff_us_ ||
             state.boot_id != last_boot_id_) {
           PushConfig(now_us);
         }
@@ -479,8 +488,8 @@ void HardwareNode::Tick(uint64_t now_us) {
       if (cmd_pkt.size > 0) {
         if (cmd_pub_) cmd_pub_->write(cmd_pkt);
         if (peer_.SendFrame(protocol::FrameType::kHardwareCommand, 0, now_us,
-                            cmd_pkt.data.data(), cmd_pkt.size) ==
-            protocol::UdpStatus::kOk) {
+                            cmd_pkt.data.data(),
+                            cmd_pkt.size) == protocol::UdpStatus::kOk) {
           ++commands_sent_;
           LogPacket(1, cmd_pkt, now_us, commands_sent_);
           last_sent_cmd_ = full_cmd_;

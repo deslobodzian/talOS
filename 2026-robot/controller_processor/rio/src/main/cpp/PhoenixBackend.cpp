@@ -123,7 +123,11 @@ std::string PhoenixBackend::DecodeTalonFaultBits(uint32_t fault_flags) {
       nullptr,
       "RotorFault1 (rotor fault 1)",
       "RotorFault2 (rotor fault 2)",
-      nullptr, nullptr, nullptr, nullptr, nullptr};
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr};
   std::string faults;
   for (unsigned bit = 0; bit < names.size(); ++bit) {
     if ((fault_flags & (uint32_t{1} << bit)) == 0) continue;
@@ -141,9 +145,23 @@ std::optional<hw::ConfigError> PhoenixBackend::last_config_error() const {
   return last_error_;
 }
 
+void PhoenixBackend::BeginConfigure(const hw::Config& config) {
+  configure_ = std::async(std::launch::async,
+                          [this, config] { return Configure(config); });
+}
+
+PhoenixBackend::ConfigureStatus PhoenixBackend::PollConfigure() {
+  if (!configure_.valid()) return ConfigureStatus::kFailed;
+  if (configure_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
+    return ConfigureStatus::kPending;
+  return configure_.get() ? ConfigureStatus::kDone : ConfigureStatus::kFailed;
+}
+
 bool PhoenixBackend::Configure(const hw::Config& c) {
   hw::Validate(c);
   restore_operations_.clear();
+  unavailable_.clear();
+  signal_ids_.clear();
   last_error_.reset();
   last_fault_flags_.fill(0);
   last_motor_valid_.fill(true);
@@ -156,7 +174,16 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
                                    const std::string& bus, int can_id,
                                    const std::string& operation,
                                    const ctre::phoenix::StatusCode& code) {
-    if (code.IsOK() || last_error_.has_value()) return code.IsOK();
+    if (code.IsOK()) return true;
+    uint16_t id = 0;
+    for (const auto& m : config_.motors)
+      if (m.name == name) id = m.id;
+    for (const auto& s : config_.sensors)
+      if (s.name == name) id = s.id;
+    if (id != 0 && std::find(unavailable_.begin(), unavailable_.end(), id) ==
+                       unavailable_.end())
+      unavailable_.push_back(id);
+    if (last_error_.has_value()) return false;
     hw::ConfigError err;
     err.device_name = name;
     err.bus = bus;
@@ -227,9 +254,11 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       ok &= note_failure(
           s.name, s.bus, s.can_id, "apply_cancoder_config",
           Retry([&] { return device.encoder->GetConfigurator().Apply(cfg); }));
-      restore_operations_.push_back([ptr = device.encoder.get(), cfg] {
-        return Retry([&] { return ptr->GetConfigurator().Apply(cfg); }).IsOK();
-      });
+      restore_operations_.push_back(
+          {s.id, [ptr = device.encoder.get(), cfg] {
+             return Retry([&] { return ptr->GetConfigurator().Apply(cfg); })
+                 .IsOK();
+           }});
       signals_.push_back(&device.encoder->GetAbsolutePosition(false));
       signals_.push_back(&device.encoder->GetVelocity(false));
     } else {
@@ -240,12 +269,16 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       ok &= note_failure(
           s.name, s.bus, s.can_id, "apply_pigeon2_config",
           Retry([&] { return device.imu->GetConfigurator().Apply(cfg); }));
-      restore_operations_.push_back([ptr = device.imu.get(), cfg] {
-        return Retry([&] { return ptr->GetConfigurator().Apply(cfg); }).IsOK();
-      });
+      restore_operations_.push_back(
+          {s.id, [ptr = device.imu.get(), cfg] {
+             return Retry([&] { return ptr->GetConfigurator().Apply(cfg); })
+                 .IsOK();
+           }});
       signals_.push_back(&device.imu->GetYaw(false));
       signals_.push_back(&device.imu->GetAngularVelocityZWorld(false));
     }
+    signal_ids_.push_back(s.id);
+    signal_ids_.push_back(s.id);
     sensors_.push_back(std::move(device));
   }
   for (const auto& m : c.motors) {
@@ -292,14 +325,17 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     ok &= note_failure(
         m.name, m.bus, m.can_id, "apply_talonfx_config",
         Retry([&] { return motor->GetConfigurator().Apply(cfg); }));
-    restore_operations_.push_back([ptr = motor.get(), cfg] {
-      return Retry([&] { return ptr->GetConfigurator().Apply(cfg); }).IsOK();
-    });
+    restore_operations_.push_back(
+        {m.id, [ptr = motor.get(), cfg] {
+           return Retry([&] { return ptr->GetConfigurator().Apply(cfg); })
+               .IsOK();
+         }});
     signals_.push_back(&motor->GetPosition(false));
     signals_.push_back(&motor->GetVelocity(false));
     signals_.push_back(&motor->GetMotorVoltage(false));
     signals_.push_back(&motor->GetStatorCurrent(false));
     signals_.push_back(&motor->GetFaultField(false));
+    for (int i = 0; i < 5; ++i) signal_ids_.push_back(m.id);
     motors_.push_back(std::move(motor));
   }
 
@@ -337,40 +373,60 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     }
   }
 
-  for (auto* signal : signals_) {
-    const auto code = Retry([&] {
-      return signal->SetUpdateFrequency(units::hertz_t{c.status_hz});
-    });
-    ok &= note_failure("signal_rates", "", -1, "set_signal_frequency", code);
-    restore_operations_.push_back([signal, hz = c.status_hz] {
+  for (std::size_t i = 0; i < signals_.size(); ++i) {
+    auto* signal = signals_[i];
+    const uint16_t id = signal_ids_[i];
+    double hz = c.status_hz;
+    std::string name, bus;
+    int can_id = -1;
+    for (const auto& m : c.motors) {
+      if (m.id != id) continue;
+      name = m.name;
+      bus = m.bus;
+      can_id = m.can_id;
+      // Voltage, current and faults are diagnostics, not control feedback.
+      if (signal == &motors_[&m - c.motors.data()]->GetMotorVoltage(false) ||
+          signal == &motors_[&m - c.motors.data()]->GetStatorCurrent(false) ||
+          signal == &motors_[&m - c.motors.data()]->GetFaultField(false))
+        hz = std::min(hz, 50.0);
+    }
+    for (const auto& s : c.sensors) {
+      if (s.id != id) continue;
+      name = s.name;
+      bus = s.bus;
+      can_id = s.can_id;
+    }
+    const auto operation = [signal, hz] {
       return Retry(
-                 [&] { return signal->SetUpdateFrequency(units::hertz_t{hz}); })
-          .IsOK();
-    });
-  }
-  for (auto& motor : motors_) {
-    const auto code = Retry([&] { return motor->OptimizeBusUtilization(); });
-    ok &=
-        note_failure("signal_rates", "", -1, "optimize_bus_utilization", code);
-    restore_operations_.push_back([ptr = motor.get()] {
-      return Retry([&] { return ptr->OptimizeBusUtilization(); }).IsOK();
-    });
-  }
-  for (auto& sensor : sensors_) {
-    const auto code = Retry([&] {
-      return sensor.encoder ? sensor.encoder->OptimizeBusUtilization()
-                            : sensor.imu->OptimizeBusUtilization();
-    });
-    ok &=
-        note_failure("signal_rates", "", -1, "optimize_bus_utilization", code);
+          [&] { return signal->SetUpdateFrequency(units::hertz_t{hz}); });
+    };
+    ok &= note_failure(name, bus, can_id, "set_signal_frequency", operation());
     restore_operations_.push_back(
-        [encoder = sensor.encoder.get(), imu = sensor.imu.get()] {
-          return Retry([&] {
-                   return encoder ? encoder->OptimizeBusUtilization()
-                                  : imu->OptimizeBusUtilization();
-                 })
-              .IsOK();
-        });
+        {id, [operation] { return operation().IsOK(); }});
+  }
+  for (std::size_t i = 0; i < motors_.size(); ++i) {
+    const auto& m = c.motors[i];
+    const auto operation = [ptr = motors_[i].get()] {
+      return Retry([&] { return ptr->OptimizeBusUtilization(); });
+    };
+    ok &= note_failure(m.name, m.bus, m.can_id, "optimize_bus_utilization",
+                       operation());
+    restore_operations_.push_back(
+        {m.id, [operation] { return operation().IsOK(); }});
+  }
+  for (std::size_t i = 0; i < sensors_.size(); ++i) {
+    const auto& s = c.sensors[i];
+    const auto operation = [encoder = sensors_[i].encoder.get(),
+                            imu = sensors_[i].imu.get()] {
+      return Retry([&] {
+        return encoder ? encoder->OptimizeBusUtilization()
+                       : imu->OptimizeBusUtilization();
+      });
+    };
+    ok &= note_failure(s.name, s.bus, s.can_id, "optimize_bus_utilization",
+                       operation());
+    restore_operations_.push_back(
+        {s.id, [operation] { return operation().IsOK(); }});
   }
   if (!ok && last_error_) {
     const auto& error = *last_error_;
@@ -379,7 +435,9 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
               << ", op=" << error.operation << "): " << error.message
               << " (status=" << error.vendor_status << ")\n";
   }
-  return ok;
+  // Structural validity succeeded; unavailable devices are isolated and
+  // retried.
+  return true;
 }
 
 bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
@@ -411,14 +469,37 @@ bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
   return !reset_ids.empty();
 }
 
-void PhoenixBackend::BeginRestoreAfterReset() {
-  // Only immutable device configurations cross onto the worker. Device objects
-  // remain stable, so cached status reads and one-shot Neutral keep running.
-  std::cerr << "[phoenix] async device restore started\n";
-  restore_ = std::async(std::launch::async, [this] {
-    bool ok = true;
-    for (const auto& operation : restore_operations_) ok &= operation();
-    return ok;
+void PhoenixBackend::BeginRestoreAfterReset(std::span<const uint16_t> ids) {
+  restoring_ids_.assign(ids.begin(), ids.end());
+  // Re-apply the affected control chain, never unrelated device settings.
+  for (std::size_t pass = 0; pass < config_.motors.size(); ++pass) {
+    for (const auto& motor : config_.motors) {
+      const auto contains = [&](uint16_t id) {
+        return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
+               restoring_ids_.end();
+      };
+      if (!contains(motor.id) &&
+          ((motor.master_id != 0 && contains(motor.master_id)) ||
+           (motor.feedback == hw::Feedback::kRemoteCANcoder &&
+            contains(motor.feedback_sensor_id))))
+        restoring_ids_.push_back(motor.id);
+    }
+  }
+  for (auto id : restoring_ids_) {
+    if (std::find(unavailable_.begin(), unavailable_.end(), id) ==
+        unavailable_.end())
+      unavailable_.push_back(id);
+  }
+  restore_ = std::async(std::launch::async, [this, ids = restoring_ids_] {
+    std::vector<uint16_t> failures;
+    for (const auto& operation : restore_operations_) {
+      if (std::find(ids.begin(), ids.end(), operation.id) == ids.end())
+        continue;
+      if (!operation.apply() && std::find(failures.begin(), failures.end(),
+                                          operation.id) == failures.end())
+        failures.push_back(operation.id);
+    }
+    return failures;
   });
 }
 
@@ -426,10 +507,13 @@ PhoenixBackend::RestoreStatus PhoenixBackend::PollRestore() {
   if (!restore_.valid()) return RestoreStatus::kDone;
   if (restore_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
     return RestoreStatus::kPending;
-  const bool ok = restore_.get();
-  std::cerr << "[phoenix] async device restore "
-            << (ok ? "SUCCEEDED" : "FAILED") << "\n";
-  return ok ? RestoreStatus::kDone : RestoreStatus::kFailed;
+  const auto failures = restore_.get();
+  std::erase_if(unavailable_, [this, &failures](uint16_t id) {
+    return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
+               restoring_ids_.end() &&
+           std::find(failures.begin(), failures.end(), id) == failures.end();
+  });
+  return RestoreStatus::kDone;
 }
 
 bool PhoenixBackend::Read(hw::State& s) {
@@ -484,25 +568,27 @@ bool PhoenixBackend::Read(hw::State& s) {
       const uint32_t prev = last_fault_flags_[i];
       const uint32_t raised = out.fault_flags & ~prev;
       const uint32_t cleared = prev & ~out.fault_flags;
-      std::cerr << "[phoenix] motor " << motor_config.name
-                << " (mask_bit=" << i << ", id=" << motor_config.id
-                << ", bus=" << motor_config.bus
-                << ", can_id=" << motor_config.can_id
-                << ") fault_flags=0x" << std::hex << out.fault_flags
-                << " (was 0x" << prev << ")" << std::dec;
+      std::cerr << "[phoenix] motor " << motor_config.name << " (mask_bit=" << i
+                << ", id=" << motor_config.id << ", bus=" << motor_config.bus
+                << ", can_id=" << motor_config.can_id << ") fault_flags=0x"
+                << std::hex << out.fault_flags << " (was 0x" << prev << ")"
+                << std::dec;
       if (raised != 0)
         std::cerr << " raised=[" << DecodeTalonFaultBits(raised) << "]";
       if (cleared != 0)
         std::cerr << " cleared=[" << DecodeTalonFaultBits(cleared) << "]";
       std::cerr << " active=[" << DecodeTalonFaultBits(out.fault_flags) << "]"
-                << " pos=" << out.position_rot << " rot vel=" << out.velocity_rps
-                << " rps V=" << out.voltage << "V I=" << out.stator_current_a
+                << " pos=" << out.position_rot
+                << " rot vel=" << out.velocity_rps << " rps V=" << out.voltage
+                << "V I=" << out.stator_current_a
                 << "A (limits: supply=" << motor_config.supply_limit_a
                 << "A stator=" << motor_config.stator_limit_a << "A)\n";
       last_fault_flags_[i] = out.fault_flags;
     }
     out.valid = Fresh(p) && Fresh(v) && std::isfinite(out.position_rot) &&
-                std::isfinite(out.velocity_rps);
+                std::isfinite(out.velocity_rps) &&
+                std::find(unavailable_.begin(), unavailable_.end(),
+                          motor_config.id) == unavailable_.end();
     if (out.valid != last_motor_valid_[i]) {
       LogFeedbackChange("motor", motor_config.name, motor_config.id,
                         motor_config.bus, motor_config.can_id, out.valid, p, v);
@@ -656,6 +742,14 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
     auto& m = *motors_[i];
     ctre::phoenix::StatusCode result;
     const auto& config = config_.motors[i];
+    if (std::find(unavailable_.begin(), unavailable_.end(), config.id) !=
+        unavailable_.end()) {
+      // A missing device cannot acknowledge NeutralOut. Keep trying neutral,
+      // but do not turn its transport failure into a whole-robot Apply failure.
+      m.SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
+      sim_neutral_[i] = true;
+      continue;
+    }
     if (config.master_id != 0) {
       const auto master =
           std::find_if(config_.motors.begin(), config_.motors.end(),
@@ -682,7 +776,8 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
         }
         feedback_valid &= sensor_valid;
       }
-      const bool neutral = commands[master_index].mode == hw::Mode::kNeutral ||
+      const bool neutral = r.mode == hw::Mode::kNeutral ||
+                           commands[master_index].mode == hw::Mode::kNeutral ||
                            !ValidMotionFeedback(position, velocity) ||
                            !feedback_valid;
       sim_neutral_[i] = neutral;

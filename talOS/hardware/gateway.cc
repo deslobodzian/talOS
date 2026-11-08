@@ -48,6 +48,9 @@ Gateway::Gateway(Config config, Backend& backend, uint64_t boot_id)
   fault_ = !configured_;
   if (!configured_) config_error_ = backend_.last_config_error();
   backend_.Neutral();
+  unavailable_ = backend_.UnavailableDevices();
+  restore_waiting_ = !unavailable_.empty();
+  restore_retry_at_ = kRestoreInitialBackoffUs;
 }
 Gateway::Gateway(Backend& backend, uint64_t boot_id) : backend_{backend} {
   if (boot_id == 0) {
@@ -60,7 +63,7 @@ Gateway::Gateway(Backend& backend, uint64_t boot_id) : backend_{backend} {
   backend_.Neutral();
 }
 bool Gateway::Reconfigure(const Config& config) {
-  if (restoring_) return false;
+  if (restoring_ || configuring_) return false;
   // Repeated pushes never touch devices, including after a restart enabled.
   if (configured_ && config == config_) {
     if (enabled_ && fault_) return false;
@@ -91,6 +94,30 @@ bool Gateway::Reconfigure(const Config& config) {
     backend_.Neutral();
     return false;
   }
+  CommitConfiguration(config);
+  return true;
+}
+
+bool Gateway::BeginReconfigure(const Config& config) {
+  if (configuring_ || restoring_) return false;
+  if (configured_ && config == config_) return Reconfigure(config);
+  if (enabled_) return false;
+  try {
+    Validate(config);
+  } catch (...) {
+    return false;
+  }
+  if (!CheckCeilings(config).ok) return false;
+  Invalidate();
+  configured_ = false;
+  healthy_ = false;
+  pending_config_ = config;
+  configuring_ = true;
+  backend_.BeginConfigure(pending_config_);
+  return true;
+}
+
+void Gateway::CommitConfiguration(const Config& config) {
   config_ = config;
   state_.config_id = ConfigurationId(config_);
   state_.motor_count = config_.motors.size();
@@ -125,8 +152,13 @@ bool Gateway::Reconfigure(const Config& config) {
   fault_ = false;
   consecutive_apply_failures_ = 0;
   config_error_.reset();
+  unavailable_ = backend_.UnavailableDevices();
+  restore_waiting_ = !unavailable_.empty();
+  restore_retry_at_ = state_.sample_time_us + kRestoreInitialBackoffUs;
+  restore_backoff_us_ = kRestoreInitialBackoffUs;
+  last_requests_.fill(MotorRequest{});
+  motor_reset_at_.fill(0);
   Invalidate();
-  return true;
 }
 void Gateway::Invalidate() {
   active_ = false;
@@ -134,45 +166,112 @@ void Gateway::Invalidate() {
   ++state_.epoch;
   backend_.Neutral();
 }
-void Gateway::PollResets() {
-  if (restoring_) {
-    if (restore_waiting_) {
-      if (state_.sample_time_us < restore_retry_at_) return;
-      restore_waiting_ = false;
-      ++restore_attempt_count_;
-      backend_.BeginRestoreAfterReset();
-      return;
+bool Gateway::DeviceUnavailable(uint16_t id) const {
+  return std::find(unavailable_.begin(), unavailable_.end(), id) !=
+         unavailable_.end();
+}
+
+void Gateway::MaskUnavailable() {
+  for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
+    if (DeviceUnavailable(config_.sensors[i].id))
+      state_.sensors[i].valid = false;
+  }
+  for (std::size_t pass = 0; pass < config_.motors.size(); ++pass) {
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      const auto& motor = config_.motors[i];
+      bool unavailable = DeviceUnavailable(motor.id) ||
+                         (motor.feedback == Feedback::kRemoteCANcoder &&
+                          DeviceUnavailable(motor.feedback_sensor_id));
+      for (std::size_t j = 0; j < config_.motors.size(); ++j) {
+        if (motor.master_id != 0 && motor.master_id == config_.motors[j].id &&
+            !state_.motors[j].valid)
+          unavailable = true;
+      }
+      if (unavailable) {
+        state_.motors[i].valid = false;
+        motor_reset_at_[i] = state_.sample_time_us;
+      }
     }
+  }
+}
+
+void Gateway::NeutralUnavailable() {
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    if (!state_.motors[i].valid) {
+      last_requests_[i] = MotorRequest{config_.motors[i].id, Mode::kNeutral};
+    }
+  }
+  if (active_ &&
+      !backend_.Apply({last_requests_.data(), config_.motors.size()}))
+    Invalidate();
+}
+
+void Gateway::PollResets() {
+  if (!configured_) return;
+  if (restoring_) {
     const auto result = backend_.PollRestore();
-    if (result == Backend::RestoreStatus::kPending) return;
-    if (result == Backend::RestoreStatus::kFailed) {
-      configured_ = false;
-      config_error_ = backend_.last_config_error();
-      restore_waiting_ = true;
+    if (result != Backend::RestoreStatus::kPending) {
+      restoring_ = false;
+      if (result == Backend::RestoreStatus::kDone) {
+        const auto remaining = backend_.UnavailableDevices();
+        std::erase_if(unavailable_, [&](uint16_t id) {
+          return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
+                     restoring_ids_.end() &&
+                 std::find(remaining.begin(), remaining.end(), id) ==
+                     remaining.end();
+        });
+        for (auto id : remaining)
+          if (!DeviceUnavailable(id)) unavailable_.push_back(id);
+      }
+      restore_waiting_ = !unavailable_.empty();
       restore_retry_at_ = state_.sample_time_us + restore_backoff_us_;
       restore_backoff_us_ =
           std::min(restore_backoff_us_ * 2, kRestoreMaxBackoffUs);
-    } else {
-      restoring_ = false;
-      configured_ = true;
-      fault_ = false;
-      consecutive_apply_failures_ = 0;
-      config_error_.reset();
     }
-    return;
   }
-  if (!configured_) return;
+  // Keep detecting new resets even while a previous device is being restored.
   std::vector<uint16_t> reset_ids;
-  if (!backend_.PollDeviceResets(reset_ids) || reset_ids.empty()) return;
-  state_.counters.device_reset_count += reset_ids.size();
-  Invalidate();
-  restoring_ = true;
-  restore_backoff_us_ = kRestoreInitialBackoffUs;
-  ++restore_attempt_count_;
-  backend_.BeginRestoreAfterReset();
+  if (backend_.PollDeviceResets(reset_ids)) {
+    state_.counters.device_reset_count += reset_ids.size();
+    if (unavailable_.empty()) restore_backoff_us_ = kRestoreInitialBackoffUs;
+    for (auto id : reset_ids) {
+      std::erase(restoring_ids_, id);
+      if (!DeviceUnavailable(id)) unavailable_.push_back(id);
+    }
+    if (!reset_ids.empty()) {
+      restore_waiting_ = true;
+      restore_retry_at_ = state_.sample_time_us;
+    }
+  }
+  MaskUnavailable();
+  if (!reset_ids.empty()) NeutralUnavailable();
+  if (!restoring_ && restore_waiting_ &&
+      state_.sample_time_us >= restore_retry_at_) {
+    restore_waiting_ = false;
+    restoring_ = true;
+    ++restore_attempt_count_;
+    restoring_ids_ = unavailable_;
+    backend_.BeginRestoreAfterReset(restoring_ids_);
+  }
 }
 
 void Gateway::Tick(uint64_t now, bool enabled) {
+  state_.sample_time_us = now;
+  if (configuring_) {
+    const auto status = backend_.PollConfigure();
+    if (status == Backend::ConfigureStatus::kPending) {
+      enabled_ = enabled;
+      return;
+    }
+    configuring_ = false;
+    if (status == Backend::ConfigureStatus::kDone) {
+      CommitConfiguration(pending_config_);
+    } else {
+      fault_ = true;
+      config_error_ = backend_.last_config_error();
+      backend_.Neutral();
+    }
+  }
   if (enabled != enabled_) {
     if (enabled && !enabled_ &&
         consecutive_apply_failures_ >= kConsecutiveApplyFailureLimit) {
@@ -188,18 +287,18 @@ void Gateway::Tick(uint64_t now, bool enabled) {
     Invalidate();
   }
   state_.sample_time_us = now;
-  healthy_ = (configured_ || restoring_) && backend_.Read(state_);
+  healthy_ = configured_ && backend_.Read(state_);
   if (!healthy_ && active_) Invalidate();
   PollResets();
   if (!enabled_ || !config_.commissioned || fault_ || !healthy_ ||
-      !configured_ || restoring_) {
+      !configured_) {
     backend_.Neutral();
   }
 }
 
 bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   if (!configured_ || !config_.commissioned || !enabled_ || fault_ ||
-      restoring_ || !healthy_ || c.config_id != state_.config_id ||
+      configuring_ || !healthy_ || c.config_id != state_.config_id ||
       c.boot_id != state_.boot_id || c.epoch != state_.epoch ||
       c.observed_time_us > state_.sample_time_us || c.observed_time_us > now ||
       now - c.observed_time_us >= config_.command_timeout_us ||
@@ -219,7 +318,8 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
       return false;
     }
     requests[i] = r;
-    bool feedback_valid = state_.motors[i].valid;
+    bool feedback_valid =
+        state_.motors[i].valid && c.observed_time_us >= motor_reset_at_[i];
     if (m.feedback == Feedback::kRemoteCANcoder) {
       bool sensor_valid = false;
       for (std::size_t j = 0; j < state_.sensor_count; ++j) {
@@ -253,13 +353,22 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   for (std::size_t i = 0; i < c.count; ++i) {
     const auto master_id = config_.motors[i].master_id;
     if (master_id == 0) continue;
+    bool valid =
+        state_.motors[i].valid && c.observed_time_us >= motor_reset_at_[i];
+    if (config_.motors[i].feedback == Feedback::kRemoteCANcoder) {
+      bool sensor_valid = false;
+      for (std::size_t j = 0; j < state_.sensor_count; ++j)
+        if (state_.sensors[j].id == config_.motors[i].feedback_sensor_id)
+          sensor_valid = state_.sensors[j].valid;
+      valid &= sensor_valid;
+    }
     for (std::size_t j = 0; j < c.count; ++j) {
-      if (config_.motors[j].id == master_id &&
-          requests[j].mode == Mode::kNeutral) {
-        requests[i] =
-            MotorRequest{config_.motors[i].id, Mode::kNeutral, 0, 0, 0};
-        break;
-      }
+      if (config_.motors[j].id != master_id) continue;
+      // Backends follow the master's output only for a non-neutral follower
+      // request. Independent follower demands remain ignored.
+      requests[i] = MotorRequest{config_.motors[i].id,
+                                 valid ? requests[j].mode : Mode::kNeutral};
+      break;
     }
   }
   if (c.digital_output_count != config_.digital_outputs.size() ||
@@ -282,7 +391,8 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
     }
   }
   for (std::size_t i = 0; i < c.count; ++i) {
-    if (requests[i] != c.motors[i]) ++state_.counters.neutralized_motor_count;
+    if (requests[i].mode == Mode::kNeutral && requests[i] != c.motors[i])
+      ++state_.counters.neutralized_motor_count;
   }
   if (!backend_.Apply({requests.data(), c.count}) ||
       !backend_.ApplyOutputs({c.digital_outputs.data(), c.digital_output_count},
@@ -293,6 +403,7 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
     return false;
   }
   consecutive_apply_failures_ = 0;
+  last_requests_ = requests;
   active_ = true;
   have_sequence_ = true;
   accepted_at_ = now;
@@ -305,8 +416,7 @@ State Gateway::snapshot() const {
   s.flags = (configured_ && config_.commissioned ? kConfigured : 0u) |
             (configured_ && enabled_ ? kEnabled : 0u) |
             (active_ ? kCommandActive : 0u) |
-            (fault_ || restoring_ || (!healthy_ && configured_) ? kHardwareFault
-                                                                : 0u);
+            (fault_ || (!healthy_ && configured_) ? kHardwareFault : 0u);
   return s;
 }
 }  // namespace talos::hardware
