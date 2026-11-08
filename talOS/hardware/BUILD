@@ -96,3 +96,14 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "codec_fuzz_test",
+    size = "small",
+    srcs = ["codec_fuzz_test.cc"],
+    deps = [
+        ":hardware",
+        "//talOS/protocol:fuzz_corpus",
+        "@googletest//:gtest_main",
+    ],
+)

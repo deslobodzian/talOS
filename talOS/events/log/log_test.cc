@@ -120,8 +120,10 @@ void ExpectRecordEquals(const ExpectedRecord& expected,
   EXPECT_EQ(actual.header.sequence, expected.sequence);
   EXPECT_EQ(actual.header.aux, expected.aux);
   ASSERT_EQ(actual.payload.size(), expected.payload.size());
-  EXPECT_EQ(0, std::memcmp(actual.payload.data(), expected.payload.data(),
-                           expected.payload.size()));
+  if (!expected.payload.empty()) {
+    EXPECT_EQ(0, std::memcmp(actual.payload.data(), expected.payload.data(),
+                             expected.payload.size()));
+  }
 }
 
 // EXIT describes loop completion, not process teardown. Consumers must not

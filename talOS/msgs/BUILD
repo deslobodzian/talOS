@@ -38,6 +38,11 @@ py_test(
     size = "small",
     srcs = ["msgs_py_test.py"],
     legacy_create_init = False,
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
     deps = [
         ":control_py",
         ":geometry_py",

@@ -40,3 +40,21 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "fuzz_corpus",
+    testonly = True,
+    hdrs = ["fuzz_corpus.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "frame_fuzz_test",
+    size = "small",
+    srcs = ["frame_fuzz_test.cc"],
+    deps = [
+        ":fuzz_corpus",
+        ":protocol",
+        "@googletest//:gtest_main",
+    ],
+)

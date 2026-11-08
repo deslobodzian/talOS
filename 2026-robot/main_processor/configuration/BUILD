@@ -44,6 +44,11 @@ talos_graph_test(
     config = "robot.toml",
     data = CONFIG_FILES,
     nodes = NODES,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
 )
 
 # robot_manifest.bzl is generated from robot.toml; this fails when it is stale.
@@ -59,6 +64,11 @@ talos_graph_test(
     config = "robot_field.toml",
     data = FIELD_CONFIG_FILES,
     nodes = FIELD_NODES,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
 )
 
 manifest_sync_test(

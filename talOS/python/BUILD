@@ -53,6 +53,11 @@ py_test(
     size = "small",
     srcs = ["talos_test.py"],
     legacy_create_init = False,
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
     deps = [
         ":test_messages_py",
         ":testing",
@@ -93,6 +98,11 @@ py_test(
     data = [":messages_golden"],
     env = {"TALOS_MESSAGES_GOLDEN": "$(rlocationpath :messages_golden)"},
     legacy_create_init = False,
+    # Imports talos, loading instrumented ctypes libraries in a Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
     deps = [
         ":talos",
         ":test_messages_py",

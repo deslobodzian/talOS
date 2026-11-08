@@ -34,6 +34,25 @@ jobs:
     - name: Test
       run: bazel test //... --noshow_progress --test_output=errors
 
+  sanitizers:
+    name: Bazel (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, tsan]
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+    - name: Setup bazel-action
+      uses: bazel-contrib/setup-bazel@0.19.0
+      with:
+        bazelisk-cache: true
+        disk-cache: ${{ github.workflow }}-${{ matrix.sanitizer }}
+        repository-cache: true
+    - name: Test instrumented suite and bounded decoder corpora
+      run: bazel test --config=${{ matrix.sanitizer }} --test_tag_filters=-no_${{ matrix.sanitizer }} --test_output=errors //...
+
   build-macos:
     name: Bazel Build (macOS)
     runs-on: macos-latest

@@ -30,6 +30,11 @@ py_test(
     size = "small",
     srcs = ["messages_test.py"],
     main = "messages_test.py",
+    # Imports talos, loading instrumented ctypes libraries in a Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
     deps = [
         ":messages_py",
         "//talOS/python:talos",

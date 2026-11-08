@@ -34,6 +34,11 @@ py_test(
     ],
     env = {"NODE_BINARY": "$(rlocationpath :node)"},
     legacy_create_init = False,
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
     deps = [
         ":messages_py",
         "//talOS/python:testing",

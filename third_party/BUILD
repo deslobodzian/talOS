@@ -3,7 +3,10 @@
 # first-party code here.
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["apriltag_pose_ambiguity.patch"])
+exports_files([
+    "apriltag_pose_ambiguity.patch",
+    "tomlplusplus_parser_ub.patch",
+])
 
 alias(
     name = "apriltag",

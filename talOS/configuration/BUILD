@@ -33,3 +33,14 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "config_fuzz_test",
+    size = "small",
+    srcs = ["config_fuzz_test.cc"],
+    deps = [
+        ":configuration",
+        "//talOS/protocol:fuzz_corpus",
+        "@googletest//:gtest_main",
+    ],
+)

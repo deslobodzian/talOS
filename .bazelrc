@@ -25,3 +25,25 @@ build:macos --cxxopt=-std=c++23 --cxxopt=-O3
 build:macos --cxxopt=-fexperimental-library --linkopt=-fexperimental-library
 build:macos --macos_minimum_os=13.4
 build:windows --cxxopt=/std:c++23 --cxxopt=-O3
+
+# Linux sanitizer builds instrument both C and C++ dependencies and link the
+# matching runtime. Keep stack traces useful and make UB fail the test.
+build:asan --copt=-fsanitize=address,undefined --linkopt=-fsanitize=address,undefined
+build:asan --copt=-fno-omit-frame-pointer --copt=-fno-sanitize-recover=undefined
+build:asan --copt=-O1 --cxxopt=-O1
+# AprilTag 3.4.5's JPEG decoder (pjpeg.c, pjpeg-idct.c) shifts negative signed values.
+# Keep every other UBSan check and all project-code shift checks enabled.
+build:asan --per_file_copt=external/.*apriltag.*/common/pjpeg.*[.]c@-fno-sanitize=shift
+test:asan --test_tag_filters=-no_asan
+build:tsan --copt=-fsanitize=thread --linkopt=-fsanitize=thread
+build:tsan --copt=-fno-omit-frame-pointer --copt=-O1 --cxxopt=-O1
+test:tsan --test_tag_filters=-no_tsan
+# One third-party file is compiled without TSan instrumentation (no project
+# code is exempt). AprilTag 3.4.5's do_gradient_clusters tasks for adjacent row
+# bands path-compress the shared union-find while others read it; every write
+# replaces a parent with an ancestor on the same path, so all readers reach the
+# same root. OpenCV 4.12's cv::ThreadPool hands off jobs with a spin/condition
+# protocol TSan does not model, so TSan tests run OpenCV's parallel_for_
+# serially (OpenCV-internal threading only; project threads are unaffected).
+build:tsan --per_file_copt=external/.*apriltag.*/apriltag_quad_thresh[.]c@-fno-sanitize=thread
+test:tsan --test_env=OPENCV_FOR_THREADS_NUM=1

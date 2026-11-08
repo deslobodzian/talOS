@@ -87,6 +87,29 @@ bazel test //...
 ./sim.sh --sim-gateway --no-studio
 ```
 
+Linux CI also runs the C++ suite with AddressSanitizer + UndefinedBehaviorSanitizer
+and ThreadSanitizer:
+
+```sh
+bazel test --config=asan --test_tag_filters=-no_asan --test_output=errors //...
+bazel test --config=tsan --test_tag_filters=-no_tsan --test_output=errors //...
+```
+
+The decoder `*_fuzz_test` gtests run deterministic, bounded mutation corpora
+under ordinary `bazel test` too: every truncation, count/length-byte edits,
+bit flips, insertions, erasures and seeded random byte replacements. Successful
+decodes must survive a canonical encode/decode/encode round trip. Hardware
+config tests also exercise duplicate, out-of-order and cross-call chunk input.
+
+Tests loading native libraries into an uninstrumented Python process via ctypes
+carry `no_asan` and `no_tsan`, with the reason beside each BUILD tag. Pure Python
+tests and tests spawning instrumented C++ executables remain enabled. No
+project-code sanitizer findings are suppressed; the third-party exemptions (AprilTag
+JPEG shifts and union-find path compression, OpenCV's thread pool) are listed with
+their reasons in `.bazelrc`. Run sanitizer builds in their own output base
+(`bazel --output_base=$HOME/.cache/bazel-talos-asan ...`) so they do not evict the
+default build's cache.
+
 ## Editor setup
 
 clangd needs a compilation database:

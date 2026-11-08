@@ -42,6 +42,7 @@ cc_test(
 py_test(
     name = "startup_test",
     size = "medium",
+    timeout = "short",
     srcs = ["startup_test.py"],
     data = [
         ":sim_gateway",
@@ -50,8 +51,12 @@ py_test(
         "//talOS/launcher",
         "//talOS/launcher:log_dump",
     ] + CONFIG_FILES + NODES,
-    tags = ["exclusive"],
-    timeout = "short",
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "exclusive",
+        "no_asan",
+        "no_tsan",
+    ],
 )
 
 py_library(
@@ -77,6 +82,11 @@ py_binary(
 py_test(
     name = "accuracy_test",
     srcs = ["accuracy_test.py"],
-    tags = ["exclusive"],
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "exclusive",
+        "no_asan",
+        "no_tsan",
+    ],
     deps = [":accuracy"],
 )

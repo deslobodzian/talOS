@@ -38,6 +38,18 @@ use_repo(python, "python_3_11")
 # For configuration
 bazel_dep(name = "tomlplusplus", version = "3.4.0")
 
+# toml++ 3.4.0 has two parser UBs the patch removes: a table header whose
+# first character cannot start a key (`[#motors]`) asserts, or is UB under
+# NDEBUG; and any non-ASCII character in buckets its whitespace classifier
+# leaves unfiltered (U+00B1 '±' in our own vision.toml comments) reaches
+# TOML_UNREACHABLE. Regressions: //talOS/configuration:config_fuzz_test.
+single_version_override(
+    module_name = "tomlplusplus",
+    patch_strip = 1,
+    patches = ["//third_party:tomlplusplus_parser_ub.patch"],
+    version = "3.4.0",
+)
+
 # Hedron's Compile Commands Extractor for Bazel
 # https://github.com/hedronvision/bazel-compile-commands-extractor
 bazel_dep(name = "hedron_compile_commands", dev_dependency = True)

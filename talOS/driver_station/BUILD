@@ -32,3 +32,14 @@ cc_binary(
         "//talOS/process",
     ],
 )
+
+cc_test(
+    name = "codec_fuzz_test",
+    size = "small",
+    srcs = ["codec_fuzz_test.cc"],
+    deps = [
+        ":driver_station",
+        "//talOS/protocol:fuzz_corpus",
+        "@googletest//:gtest_main",
+    ],
+)

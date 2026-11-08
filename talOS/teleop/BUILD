@@ -49,6 +49,11 @@ py_test(
     srcs = ["teleop_test.py"],
     legacy_create_init = False,
     main = "teleop_test.py",
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
     deps = [
         "//talOS/msgs:control_py",
         "//talOS/python:teleop",

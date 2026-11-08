@@ -34,5 +34,10 @@ py_test(
         "//tools:deploy.sh",
     ],
     legacy_create_init = False,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
     deps = ["@rules_python//python/runfiles"],
 )
