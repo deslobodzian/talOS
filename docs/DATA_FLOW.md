@@ -166,10 +166,10 @@ There is no selective retransmission or hot-path fragmentation protocol. A lost
 chunk leaves an incomplete assembly with no success ACK; the bridge repeats the
 whole config at its 50 ms retry gate while State indicates mismatch or no matching
 success ACK. Lost ACK likewise causes a whole-push retry. Existing valid control
-configuration is not replaced by a partially assembled transfer. All frame flags
-are zero in these runtime send paths: AckRequested/Ack/Fragment are declared but
-unused; ConfigAck is a frame type, and chunking is payload-level, not the Fragment
-flag. Sequence numbers still expose datagram gaps.
+configuration is not replaced by a partially assembled transfer. Every runtime
+sender, including config ACKs, writes zero header flags (`kFlagNone`, the only
+declared flag): ConfigAck is a frame type, and chunking is payload-level.
+Sequence numbers still expose datagram gaps.
 
 **Known byte-order inconsistency:** ConfigChunkHeader and ConfigAckPayload are
 packed structs copied with `memcpy`, so they use host byte order. Serialized

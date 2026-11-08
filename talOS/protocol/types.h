@@ -15,11 +15,10 @@ enum class FrameType : uint16_t {
   kDriverStation = 24,
 };
 
+// No header flag has defined semantics yet: every sender writes kFlagNone.
+// ConfigAck is a frame type and config chunking is payload-level.
 enum FrameFlags : uint16_t {
   kFlagNone = 0,
-  kFlagAckRequested = 1u << 0,
-  kFlagAck = 1u << 1,
-  kFlagFragment = 1u << 2,
 };
 
 }  // namespace talos::protocol

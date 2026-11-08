@@ -1401,8 +1401,9 @@ std::optional<ConfigAckPayload> PushConfigAndAwaitAck(
     bool enabled = false) {
   auto chunks = CreateConfigChunks(cfg);
   for (std::size_t i = 0; i < chunks.size(); ++i) {
-    EXPECT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig, i + 1,
-                                  1000, chunks[i].data(), chunks[i].size()),
+    EXPECT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig,
+                                  protocol::kFlagNone, 1000, chunks[i].data(),
+                                  chunks[i].size()),
               protocol::UdpStatus::kOk);
   }
   std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -1472,6 +1473,49 @@ TEST(Endpoint, ConfigAckReasonFallsBackWithoutDetailedError) {
   }
   EXPECT_EQ(ack->status, ConfigAckStatus::kBackendFailed);
   EXPECT_EQ(std::string(ack->reason), "Backend configuration failed");
+}
+
+// The ACK is a frame type, not a flag: its header flags stay zero no matter
+// which incoming sequence it answers.
+TEST(Endpoint, ConfigAckFlagsIgnoreIncomingSequence) {
+  FakeBackend backend;
+  Gateway gateway{backend, 3005};
+  Endpoint endpoint{gateway};
+  ASSERT_EQ(endpoint.Open("127.0.0.1", 15814, "127.0.0.1", 15815),
+            protocol::UdpStatus::kOk);
+  protocol::RuntimeUdpPeer companion;
+  ASSERT_EQ(companion.Open("127.0.0.1", 15815, "127.0.0.1", 15814),
+            protocol::UdpStatus::kOk);
+  // Advance the companion's sequence so its low bits are nonzero flag bits if
+  // the incoming sequence leaked into the ACK header.
+  const std::array<uint8_t, 1> junk{};
+  for (int i = 0; i < 0xff; ++i) {
+    ASSERT_EQ(companion.SendFrame(protocol::FrameType::kDriverStation,
+                                  protocol::kFlagNone, 1000, junk.data(),
+                                  junk.size()),
+              protocol::UdpStatus::kOk);
+    if (i % 16 == 15) endpoint.Tick(1000, false);
+  }
+  for (const auto& chunk : CreateConfigChunks(SwerveConfig(true))) {
+    ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig,
+                                  protocol::kFlagNone, 1000, chunk.data(),
+                                  chunk.size()),
+              protocol::UdpStatus::kOk);
+  }
+  ASSERT_GT(companion.next_send_sequence(), 0xffu);
+  std::optional<uint16_t> ack_flags;
+  for (int tick = 0; tick < 100 && !ack_flags; ++tick) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    endpoint.Tick(2000 + tick, false);
+    protocol::DecodedFrame frame;
+    while (companion.TryReceive(&frame) == protocol::UdpStatus::kOk) {
+      EXPECT_EQ(frame.header.flags, protocol::kFlagNone);
+      if (frame.header.type == protocol::FrameType::kHardwareConfigAck)
+        ack_flags = frame.header.flags;
+    }
+  }
+  ASSERT_TRUE(ack_flags.has_value());
+  EXPECT_EQ(*ack_flags, protocol::kFlagNone);
 }
 
 TEST(Gateway, PendingRestoreKeepsPollingAndNeutral) {

@@ -10,9 +10,11 @@ namespace {
 
 TEST(FrameTest, EncodesAndDecodesHeader) {
   std::array<uint8_t, kMaxFrameSize> frame{};
+  // The codec carries the raw 16-bit field even though no flag is defined.
+  constexpr uint16_t kRawFlags = 0xA5C3;
   const std::size_t size =
-      EncodeFrame(FrameType::kHardwareConfigAck, kFlagAckRequested, 42, 123456,
-                  nullptr, 0, frame.data(), frame.size());
+      EncodeFrame(FrameType::kHardwareConfigAck, kRawFlags, 42, 123456, nullptr,
+                  0, frame.data(), frame.size());
 
   ASSERT_EQ(size, kFrameHeaderSize);
 
@@ -21,7 +23,7 @@ TEST(FrameTest, EncodesAndDecodesHeader) {
   EXPECT_EQ(decoded.header.magic, kFrameMagic);
   EXPECT_EQ(decoded.header.version, kProtocolVersion);
   EXPECT_EQ(decoded.header.type, FrameType::kHardwareConfigAck);
-  EXPECT_EQ(decoded.header.flags, kFlagAckRequested);
+  EXPECT_EQ(decoded.header.flags, kRawFlags);
   EXPECT_EQ(decoded.header.sequence, 42u);
   EXPECT_EQ(decoded.header.monotonic_time_us, 123456u);
   EXPECT_EQ(decoded.payload_size, 0u);

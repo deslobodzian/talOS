@@ -44,8 +44,7 @@ class Endpoint {
         on_configured_(gateway_.config());
       std::array<uint8_t, 128> bytes{};
       const auto size = EncodeConfigAck(ack, bytes);
-      Send(protocol::FrameType::kHardwareConfigAck, pending_sequence_, now_us,
-           bytes.data(), size);
+      Send(protocol::FrameType::kHardwareConfigAck, now_us, bytes.data(), size);
       pending_ack_ = false;
     }
     for (int i = 0; i < 16; ++i) {
@@ -70,7 +69,6 @@ class Endpoint {
           if (ok && gateway_.configuring()) {
             pending_ack_ = true;
             pending_config_id_ = assembler_.config_id();
-            pending_sequence_ = frame.header.sequence;
             continue;
           }
           ConfigAckPayload ack{};
@@ -96,8 +94,8 @@ class Endpoint {
           }
           std::array<uint8_t, 128> ack_buf{};
           const auto ack_size = EncodeConfigAck(ack, ack_buf);
-          Send(protocol::FrameType::kHardwareConfigAck, frame.header.sequence,
-               now_us, ack_buf.data(), ack_size);
+          Send(protocol::FrameType::kHardwareConfigAck, now_us, ack_buf.data(),
+               ack_size);
         } else if (status != ConfigAssembler::Status::kIncomplete) {
           ConfigAckPayload ack{};
           ack.config_id = assembler_.config_id();
@@ -111,8 +109,8 @@ class Endpoint {
           std::snprintf(ack.reason, sizeof(ack.reason), "%s", err.c_str());
           std::array<uint8_t, 128> ack_buf{};
           const auto ack_size = EncodeConfigAck(ack, ack_buf);
-          Send(protocol::FrameType::kHardwareConfigAck, frame.header.sequence,
-               now_us, ack_buf.data(), ack_size);
+          Send(protocol::FrameType::kHardwareConfigAck, now_us, ack_buf.data(),
+               ack_size);
         }
         continue;
       }
@@ -123,29 +121,31 @@ class Endpoint {
         gateway_.Accept(command, frame.header.sequence, now_us);
     }
     const auto size = Encode(gateway_.snapshot(), buffer_);
-    return Send(protocol::FrameType::kHardwareState, 0, now_us, buffer_.data(),
+    return Send(protocol::FrameType::kHardwareState, now_us, buffer_.data(),
                 size);
   }
   // Payload-agnostic passthrough for frames this endpoint does not own, so
   // their encoding stays with the caller rather than in the gateway layer.
   protocol::UdpStatus SendFrame(protocol::FrameType type, uint64_t now_us,
                                 const void* payload, std::size_t payload_size) {
-    return Send(type, 0, now_us, payload, payload_size);
+    return Send(type, now_us, payload, payload_size);
   }
 
  private:
-  protocol::UdpStatus Send(protocol::FrameType type, uint64_t sequence,
-                           uint64_t now_us, const void* payload,
-                           std::size_t payload_size) {
+  // The UDP peer assigns outgoing sequences; ACK is a frame type, so every
+  // frame goes out with no header flags.
+  protocol::UdpStatus Send(protocol::FrameType type, uint64_t now_us,
+                           const void* payload, std::size_t payload_size) {
     if (!send_enabled_) return protocol::UdpStatus::kOk;
-    return peer_.SendFrame(type, sequence, now_us, payload, payload_size);
+    return peer_.SendFrame(type, protocol::kFlagNone, now_us, payload,
+                           payload_size);
   }
   bool send_enabled_{true};
   Gateway& gateway_;
   protocol::RuntimeUdpPeer peer_;
   ConfigAssembler assembler_;
   bool pending_ack_{false};
-  uint64_t pending_config_id_{}, pending_sequence_{};
+  uint64_t pending_config_id_{};
   std::function<void(const Config&)> on_configured_;
   std::array<uint8_t, protocol::kMaxPayloadSize> buffer_{};
 };
