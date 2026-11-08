@@ -14,6 +14,7 @@ TEST(DriverStationTest, RoundTripEncoding) {
   DriverStationData original{};
   original.sample_time_us = 123456789;
   original.mode_since_us = 123400000;
+  original.boot_id = 0x0123456789abcdefULL;
   original.fms.flags = kDsAttached | kFmsAttached | kEnabled | kTeleop;
   original.fms.alliance = Alliance::kRed;
   original.fms.station = 2;
@@ -63,6 +64,7 @@ TEST(DriverStationTest, RoundTripEncoding) {
 
   EXPECT_EQ(decoded.sample_time_us, original.sample_time_us);
   EXPECT_EQ(decoded.mode_since_us, original.mode_since_us);
+  EXPECT_EQ(decoded.boot_id, original.boot_id);
   EXPECT_EQ(decoded.fms.flags, original.fms.flags);
   EXPECT_EQ(decoded.fms.alliance, original.fms.alliance);
   EXPECT_EQ(decoded.fms.station, original.fms.station);
@@ -99,6 +101,7 @@ TEST(DriverStationTest, FullyPopulatedEncodingReachesMaximumSize) {
   DriverStationData original{};
   original.sample_time_us = 123456789;
   original.mode_since_us = 123400000;
+  original.boot_id = 0xfedcba9876543211ULL;
   original.fms.flags = kDsAttached | kFmsAttached | kEnabled | kTeleop;
   original.fms.alliance = Alliance::kBlue;
   original.fms.station = 3;

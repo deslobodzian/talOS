@@ -110,6 +110,7 @@ std::size_t Encode(const DriverStationData& ds, std::span<uint8_t> data) {
   Writer w{data};
   w.Int(ds.sample_time_us, 8);
   w.Int(ds.mode_since_us, 8);
+  w.Int(ds.boot_id, 8);
 
   // FMS
   w.Int(ds.fms.flags, 4);
@@ -155,6 +156,7 @@ bool Decode(std::span<const uint8_t> data, DriverStationData& out) {
 
   ds.sample_time_us = r.Int(8);
   ds.mode_since_us = r.Int(8);
+  ds.boot_id = r.Int(8);
 
   // FMS
   ds.fms.flags = static_cast<uint32_t>(r.Int(4));

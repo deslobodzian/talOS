@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1337,6 +1338,75 @@ TEST(HardwareNodeTest, ReorderedAndRetiredBootStatesChangeNothing) {
   node.Tick(1010200);
   EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
   EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 18.0);
+}
+
+// Driver Station packets carry the gateway boot id. The bridge forwards only
+// the accepted State's boot, so a low-uptime boot B's packets go through
+// right after the reboot, and a boot-A packet delayed past it, or one from a
+// boot whose State has not arrived, does not.
+TEST(HardwareNodeTest, ForwardsDriverStationPacketsOnlyFromTheCurrentBoot) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  HardwareNode node{cfg, "127.0.0.1", TestPort(26202), TestPort(26203), true};
+  ASSERT_TRUE(node.Open());
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(
+      gateway.Open("127.0.0.1", TestPort(26202), "127.0.0.1", TestPort(26203)),
+      protocol::UdpStatus::kOk);
+  ipc::Subscriber<talos::hardware::Packet> ds_sub{kDriverStationTopic};
+
+  // Sends one packet, ticks until the node has taken the frame in, and
+  // returns the boot id of what it forwarded (nullopt: nothing).
+  const auto send = [&](uint64_t boot_id, uint64_t sample_time_us,
+                        uint64_t now_us) -> std::optional<uint64_t> {
+    driver_station::DriverStationData data{};
+    data.boot_id = boot_id;
+    data.sample_time_us = sample_time_us;
+    data.mode_since_us = sample_time_us;
+    data.fms.flags = driver_station::kDsAttached;
+    std::array<uint8_t, driver_station::kMaxEncodedSize> payload{};
+    const auto size = driver_station::Encode(data, payload);
+    EXPECT_GT(size, 0u);
+    EXPECT_EQ(gateway.SendFrame(protocol::FrameType::kDriverStation, 1, now_us,
+                                payload.data(), size),
+              protocol::UdpStatus::kOk);
+    // A State frame behind it marks when the node has drained the packet.
+    const auto marker = TrustState(config_id, node.clock().boot_id(), 1, 0);
+    talos::hardware::Packet buf{};
+    buf.size = static_cast<uint32_t>(Encode(marker, buf.data));
+    const uint64_t before = node.states_received();
+    EXPECT_EQ(gateway.SendFrame(protocol::FrameType::kHardwareState, 1, now_us,
+                                buf.data.data(), buf.size),
+              protocol::UdpStatus::kOk);
+    for (int i = 0; i < 200 && node.states_received() == before; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      node.Tick(now_us);
+    }
+    EXPECT_GT(node.states_received(), before);
+    const auto pkt = ds_sub.read();
+    if (!pkt) return std::nullopt;
+    driver_station::DriverStationData forwarded{};
+    EXPECT_TRUE(driver_station::Decode(pkt->bytes(), forwarded));
+    return forwarded.boot_id;
+  };
+  constexpr uint64_t kBootA = 0xA1, kBootB = 0xB1, kBootC = 0xC1;
+
+  ASSERT_TRUE(InjectState(
+      node, gateway, TrustState(config_id, kBootA, 1, 900'000'000), 1000000));
+  EXPECT_EQ(send(kBootA, 900'000'000, 1001000), kBootA);
+  // Boot C has sent no State: its packet is not forwarded yet.
+  EXPECT_EQ(send(kBootC, 500, 1002000), std::nullopt);
+
+  // Boot B: its State is accepted, so its low-uptime packets go through.
+  ASSERT_TRUE(InjectState(node, gateway, TrustState(config_id, kBootB, 1, 1000),
+                          1003000));
+  EXPECT_EQ(send(kBootB, 1000, 1004000), kBootB);
+  EXPECT_EQ(send(kBootB, 21000, 1005000), kBootB);
+  // A's packet, delayed past the reboot, and B's own reordered one: dropped.
+  EXPECT_EQ(send(kBootA, 900'020'000, 1006000), std::nullopt);
+  EXPECT_EQ(send(kBootB, 11000, 1007000), std::nullopt);
+  EXPECT_EQ(send(kBootB, 41000, 1008000), kBootB);
+  EXPECT_EQ(node.driver_station_packets_received(), 4u);
 }
 
 // Describe() must answer without a socket, a shared-memory segment or a

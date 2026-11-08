@@ -14,6 +14,7 @@
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
+#include "talOS/bridge/boot_history.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/hardware/gate.h"
 #include "talOS/hardware/packet.h"
@@ -689,15 +690,22 @@ class DriverStationLink {
   }
 
  private:
+  // Sample and mode times run on the sampling gateway's boot clock, so they
+  // order packets only within one boot. A boot never seen is a reboot (its
+  // clock restarted low): take it and start the ordering over. A boot left
+  // recently is a packet delayed across that reboot: never go back to it.
   void OnPacket(const void* data) {
     Packet packet{};
     std::memcpy(&packet, data, sizeof packet);
     driver_station::DriverStationData next{};
     if (!driver_station::Decode(packet.bytes(), next)) return;
-    if (have_ && next.sample_time_us > 0 && data_.sample_time_us > 0 &&
-        (next.sample_time_us < data_.sample_time_us ||
-         (next.mode_since_us != 0 &&
-          next.mode_since_us < data_.mode_since_us))) {
+    if (boots_.retired(next.boot_id)) return;
+    if (!boots_.current(next.boot_id)) {
+      boots_.Enter(next.boot_id);
+    } else if (next.sample_time_us > 0 && data_.sample_time_us > 0 &&
+               (next.sample_time_us < data_.sample_time_us ||
+                (next.mode_since_us != 0 &&
+                 next.mode_since_us < data_.mode_since_us))) {
       return;
     }
     data_ = next;
@@ -709,6 +717,7 @@ class DriverStationLink {
   Node& node_;
   driver_station::DriverStationData data_{};
   bool have_ = false;
+  hardware::BootHistory boots_;
   Time published_{};
   std::size_t subscription_ = 0;
   std::vector<std::function<void()>> listeners_;

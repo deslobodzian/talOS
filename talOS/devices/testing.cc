@@ -87,6 +87,10 @@ struct SimHardware::Impl {
 
   explicit Impl(Sim& s) : sim{s} {}
 
+  // The simulated gateway never reboots: one boot id, carried by its State
+  // and its Driver Station packets alike.
+  static constexpr std::uint64_t kBootId = 1;
+
   // The gateway clock, in its microseconds, `before` ago.
   std::uint64_t GatewayUs(Duration before = Duration{}) const {
     return static_cast<std::uint64_t>(
@@ -191,7 +195,7 @@ struct SimHardware::Impl {
     const auto& hw = config.hardware;
     hardware::State state{};
     state.config_id = config_id;
-    state.boot_id = 1;
+    state.boot_id = kBootId;
     state.epoch = 1;
     state.sample_time_us = GatewayUs(latency);
     state.flags = hardware::kConfigured | (enabled ? hardware::kEnabled : 0u);
@@ -310,6 +314,7 @@ struct SimHardware::Impl {
 
   void PublishDriverStation(driver_station::DriverStationData data) {
     data.sample_time_us = GatewayUs();
+    data.boot_id = kBootId;
     ds_mode.Stamp(data);
     Packet packet{};
     packet.size =

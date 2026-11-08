@@ -969,6 +969,66 @@ TEST(Devices, DriverStationRejectsReorderedSampleAndModeTimes) {
   EXPECT_EQ(pilot.packets, 2);
 }
 
+// A RoboRIO reboot restarts the gateway clock: boot B's sample and mode times
+// start low where boot A's were high. A running consumer takes B's packets
+// at once (no restart), keeps ordering within B, and never goes back to A,
+// not even for a packet of A's delayed past the reboot.
+TEST(Devices, DriverStationFollowsAGatewayRebootAndRetiresTheOldBoot) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& pilot = sim.add<Pilot>("watcher");
+  const auto publish = [&](uint64_t boot_id, uint64_t sample_time_us,
+                           uint64_t mode_since_us, uint32_t flags) {
+    auto data = TeleopStick();
+    data.fms.flags = flags;
+    data.boot_id = boot_id;
+    data.sample_time_us = sample_time_us;
+    data.mode_since_us = mode_since_us;
+    Packet packet{};
+    packet.size = driver_station::Encode(data, packet.data);
+    sim.publish(hardware::kDriverStationTopic, packet);
+    sim.step(10ms);
+  };
+  constexpr uint32_t kTeleop = driver_station::kDsAttached |
+                               driver_station::kEnabled |
+                               driver_station::kTeleop;
+  constexpr uint32_t kAuto = driver_station::kDsAttached |
+                             driver_station::kEnabled |
+                             driver_station::kAutonomous;
+  constexpr uint64_t kBootA = 0xA1, kBootB = 0xB1;
+
+  publish(kBootA, 900'000'000, 800'000'000, kTeleop);
+  ASSERT_EQ(pilot.packets, 1);
+  ASSERT_TRUE(pilot.ds.teleop());
+
+  // Boot B, low uptime, autonomous: taken although every time went back.
+  publish(kBootB, 1000, 1000, kAuto);
+  EXPECT_EQ(pilot.packets, 2);
+  EXPECT_TRUE(pilot.ds.autonomous());
+  EXPECT_FALSE(pilot.ds.teleop());
+  EXPECT_EQ(pilot.ds.data().boot_id, kBootB);
+  EXPECT_EQ(pilot.ds.data().mode_since_us, 1000u);
+
+  // A delayed boot-A packet cannot restore A's mode.
+  publish(kBootA, 900'020'000, 800'000'000, kTeleop);
+  EXPECT_EQ(pilot.packets, 2);
+  EXPECT_TRUE(pilot.ds.autonomous());
+  EXPECT_EQ(pilot.ds.data().boot_id, kBootB);
+
+  // Within boot B, ordering holds again.
+  publish(kBootB, 21000, 1000, kAuto);
+  EXPECT_EQ(pilot.packets, 3);
+  publish(kBootB, 11000, 1000, kTeleop);
+  EXPECT_EQ(pilot.packets, 3);
+  EXPECT_TRUE(pilot.ds.autonomous());
+
+  // Disabled in boot B reads disabled; silence reads disconnected.
+  publish(kBootB, 41000, 41000, driver_station::kDsAttached);
+  EXPECT_EQ(pilot.packets, 4);
+  EXPECT_FALSE(pilot.ds.enabled());
+  sim.step(150ms);  // past [robot] command_timeout_us
+  EXPECT_FALSE(pilot.ds.connected());
+  EXPECT_FALSE(pilot.ds.enabled());
+}
 
 }  // namespace
 }  // namespace talos

@@ -312,7 +312,11 @@ void HardwareNode::Tick(uint64_t now_us) {
         continue;
       }
       last_state_receipt_us_ = now_us;
-      if (state.boot_id != last_boot_id_) config_push_backoff_us_ = 50000;
+      if (state.boot_id != last_boot_id_) {
+        config_push_backoff_us_ = 50000;
+        // The new boot's Driver Station clock restarted with it.
+        last_ds_sample_time_us_ = 0;
+      }
       if (state.boot_id != last_boot_id_ || state.config_id != config_id_ ||
           !is_configured_) {
         if (now_us - last_push_time_us_ >= config_push_backoff_us_ ||
@@ -347,9 +351,13 @@ void HardwareNode::Tick(uint64_t now_us) {
       continue;
     }
 
+    // Driver Station packets are forwarded only from the boot the accepted
+    // State is in (a retired boot's delayed packet, or one from a boot whose
+    // State has not arrived yet, is dropped), in sample order within it.
     if (frame.header.type == protocol::FrameType::kDriverStation) {
       driver_station::DriverStationData data{};
       if (!driver_station::Decode({frame.payload, frame.payload_size}, data) ||
+          data.boot_id != last_boot_id_ ||
           data.sample_time_us < last_ds_sample_time_us_) {
         continue;
       }
@@ -707,7 +715,6 @@ void HardwareNode::NeutralizeAll() {
 
 void HardwareNode::InvalidateRequests() {
   NeutralizeAll();
-  last_ds_sample_time_us_ = 0;
   for (auto& [name, tracker] : subsystems_) {
     tracker.last_seen_us = 0;
     tracker.last_observed_time_us = 0;

@@ -115,6 +115,7 @@ class SimGatewayStartup(unittest.TestCase):
                     text=True) as proc:
                 phases = []
                 joystick_samples = []
+                boots = set()
                 previous_sample = None
                 deadline = time.monotonic() + 10
                 try:
@@ -126,18 +127,22 @@ class SimGatewayStartup(unittest.TestCase):
                                 break
                             continue
                         # Protocol v2: 40-byte frame header; DS payload begins
-                        # with sample time, mode generation, flags, alliance.
+                        # with sample time, mode generation, boot id, flags,
+                        # alliance.
                         frame_type = struct.unpack_from("<H", packet, 12)[0]
                         if frame_type != 24:
                             continue
-                        sample, generation, flags, alliance = struct.unpack_from(
-                            "<QQIB", packet, 40)
-                        # Empty FMS strings end at byte 32. Joystick axes and
+                        sample, generation, boot, flags, alliance = (
+                            struct.unpack_from("<QQQIB", packet, 40))
+                        # The gateway's random boot id (odd), one per run.
+                        self.assertEqual(boot & 1, 1)
+                        boots.add(boot)
+                        # Empty FMS strings end at byte 40. Joystick axes and
                         # POVs are variable-length, not native struct arrays.
                         connected, axes, buttons, povs, mask = struct.unpack_from(
-                            "<BBBBI", packet, 40 + 32)
-                        axis = struct.unpack_from("<f", packet, 40 + 44)[0]
-                        pov = struct.unpack_from("<h", packet, 40 + 52)[0]
+                            "<BBBBI", packet, 40 + 40)
+                        axis = struct.unpack_from("<f", packet, 40 + 52)[0]
+                        pov = struct.unpack_from("<h", packet, 40 + 60)[0]
                         joystick_samples.append(
                             (connected, axes, buttons, povs, mask, axis, pov))
                         if previous_sample is not None:
@@ -158,6 +163,7 @@ class SimGatewayStartup(unittest.TestCase):
                         proc.communicate()
                 self.assertEqual(proc.returncode, 0, stdout + stderr)
                 self.assertEqual([flags for flags, _ in phases], [1, 13, 21])
+                self.assertEqual(len(boots), 1)
                 generations = [generation for _, generation in phases]
                 self.assertEqual(generations, sorted(set(generations)))
                 self.assertIn((1, 3, 32, 1, 5, -0.5, 90), joystick_samples)
@@ -182,8 +188,8 @@ def motor_requests(row):
 
 def ds_snapshot(row):
     data = packet_bytes(row)
-    flags, = struct.unpack_from("<I", data, 16)
-    offset = 30
+    flags, = struct.unpack_from("<I", data, 24)
+    offset = 38
     for _ in range(2):  # Length-prefixed game message and event name.
         offset += 1 + data[offset]
     if not data[offset]:
@@ -194,7 +200,7 @@ def ds_snapshot(row):
 
 def ds_buttons(row):
     data = packet_bytes(row)
-    offset = 30
+    offset = 38
     for _ in range(2):
         offset += 1 + data[offset]
     return struct.unpack_from("<I", data, offset + 4)[0]

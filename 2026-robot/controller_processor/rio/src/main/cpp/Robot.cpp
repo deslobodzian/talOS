@@ -268,6 +268,9 @@ void Robot::StartCompetition() {
         last_ds_sample_us = now_us;
         auto ds = talos::driver_station::SampleDriverStation(now_us);
         ds_mode.Stamp(ds);
+        // The same boot id as this program's State: a consumer orders
+        // packets within one boot and starts over on a new one.
+        ds.boot_id = boot_id;
         // Encode() returns 0 if the payload will not fit; send nothing rather
         // than an empty frame the receiver would forward as a decode failure.
         if (const auto ds_size = talos::driver_station::Encode(ds, ds_buffer)) {

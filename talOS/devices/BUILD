@@ -19,6 +19,7 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//talOS/bridge:boot_history",
         "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/driver_station",

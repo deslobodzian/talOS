@@ -48,17 +48,17 @@ constexpr std::size_t kMaxEventNameLength = 32;
 // Encoded scalar fields and the two FMS string length prefixes. String
 // storage reserves one byte for NUL; each wire string adds one length byte.
 constexpr std::size_t kFixedEncodedSize =
-    8 + 8 + 4 + 1 + 1 + 1 + 2 + 1 + 4 + 1 + 1;
+    8 + 8 + 8 + 4 + 1 + 1 + 1 + 2 + 1 + 4 + 1 + 1;
 constexpr std::size_t kMaxJoystickEncodedSize =
     1 + 1 + 1 + 1 + 4 + 4 * kMaxAxes + 2 * kMaxPovs + kMaxNameLength;
 constexpr std::size_t kMaxEncodedSize =
     kFixedEncodedSize + (kMaxGameMessageLength - 1) +
     (kMaxEventNameLength - 1) + kMaxJoysticks * kMaxJoystickEncodedSize;
-static_assert(kFixedEncodedSize == 32,
+static_assert(kFixedEncodedSize == 40,
               "Driver Station fixed size changed; update docs/DATA_FLOW.md");
 static_assert(kMaxJoystickEncodedSize == 96,
               "Driver Station joystick size changed; update docs/DATA_FLOW.md");
-static_assert(kMaxEncodedSize == 670,
+static_assert(kMaxEncodedSize == 678,
               "Driver Station maximum size changed; update docs/DATA_FLOW.md");
 
 // The Driver Station itself only produces new data at 50 Hz, so sampling any
@@ -99,6 +99,12 @@ struct DriverStationData {
   // mode (ModeKey of the flags), never 0. Stamped by the sampler's ModeTracker;
   // a packet that never went through one carries 0, which no target accepts.
   uint64_t mode_since_us{0};
+  // The sampling gateway's boot id, the same one its hardware State carries
+  // (random per program start). Sample and mode times are on that boot's
+  // clock, so they order packets only within one boot: a consumer starts
+  // its ordering over on a new boot and ignores a recently retired one.
+  // 0 from a sampler with no gateway (send_joystick).
+  uint64_t boot_id{0};
   FmsData fms{};
   std::array<JoystickData, kMaxJoysticks> joysticks{};
 

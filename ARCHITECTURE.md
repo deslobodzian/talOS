@@ -115,7 +115,12 @@ mode from ever actuating. The RoboRIO program (and `SimHardware`,
 mode; the RoboRIO observes every hardware tick independently of the 20 ms packet
 publication cadence. Disabling, re-enabling, switching mode,
 e-stopping or re-attaching starts a new generation, and the bridge forwards it
-unchanged. `TargetLane::send` stamps the generation its own node last drained
+unchanged. Each packet also carries the gateway's boot id (the one its State
+carries): generations and sample times order packets only within one boot, so
+a consumer starts over on a RoboRIO reboot (whose clock restarts low) and
+ignores packets of recently retired boots, and the bridge forwards only the
+boot of its accepted State. `TargetLane::send` stamps the generation its own
+node last drained
 (0 while that view is stale, disabled or in no mode); `Target::get` accepts a
 lane only when its stamp is nonzero and equals the generation the consumer
 last drained. Receipt time cannot do this: a target queued before a mode

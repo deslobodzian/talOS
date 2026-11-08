@@ -89,7 +89,7 @@ need no IP fragmentation (`talOS/protocol/frame.h`, `frame.cc`, `types.h`).
 | Command, type 21 | `38 + 20M + 3DO + 10PWM` | 410 | 450 | 1022 |
 | Config chunk, type 22 | packed 24-byte header + ≤1408 data | 1432 | 1472 | 0 for full chunk |
 | ConfigAck, type 23 | packed u64 config_id + u8 status + char[64] reason | 73 | 113 | 1359 |
-| DriverStation, type 24 | 32 fixed + two FMS strings + six variable joysticks | 670 | 710 | 762 |
+| DriverStation, type 24 | 40 fixed + two FMS strings + six variable joysticks | 678 | 718 | 754 |
 
 State/Command maxima use caps **M=16, S=12, DI=8, DO=4, AI=4, E=4,
 PWM=4** (`talOS/hardware/config.h`). The 58-byte State prefix is five u64 +
@@ -139,13 +139,18 @@ capacity is not serialized. A State or Command is always wholly contained in
 one datagram. Invalid counts, truncated data, and trailing bytes are rejected
 by decoding; cap-sized encoder tests assert exact named worst-case lengths.
 
-**Driver Station:** The fixed portion is **32 B**, including sample/mode times,
-FMS fixed fields, two string-length bytes, and joystick count. Event and game
-message strings each transmit at most **31 B** (their storage is 32 including
-NUL). Each of the six joysticks is **1 B** when disconnected. Connected cost is
+**Driver Station:** The fixed portion is **40 B**: sample/mode times and the
+gateway boot id (three u64), FMS fixed fields, and the two string-length bytes.
+Event and game message strings each transmit at most **31 B** (their storage
+is 32 including NUL). Each of the six joysticks is **1 B** when disconnected.
+Connected cost is
 `1 connected + 3 counts + 4 buttons + 4×axes + 2×POVs + 1 name_length + name`.
 At caps (12 axes, 4 POVs, 31 name bytes) this is **96 B** each; maximum is
-`32 + 31 + 31 + 6×96` = **670 B**; empty strings/all disconnected is **38 B**.
+`40 + 31 + 31 + 6×96` = **678 B**; empty strings/all disconnected is **46 B**.
+The boot id is the one the same gateway stamps on its State; consumers order
+packets by sample/mode time only within one boot, start over on a new one, and
+ignore the last four retired boots (`talOS/bridge/boot_history.h`); the bridge
+forwards only packets of the boot its accepted State is in.
 Source: `talOS/driver_station/driver_station.h` and `.cc` (`Encode`).
 
 **Config:** `SerializeConfig` is a variable-length, count/string-prefixed codec.
@@ -206,7 +211,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 |---|---:|---|
 | `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data currently 705, ≤1412 |
 | `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data currently 238, ≤410 |
-| `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1448 | 1436 B Packet; DS occupied data 38–670 |
+| `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1448 | 1436 B Packet; DS occupied data 46–678 |
 | `/hw/request/<node>`: device owner → bridge | 1448 | 1436 B Packet; only that owner's actuator requests, not a full-capacity command |
 | `/hw/status`: bridge → telemetry/observers | 168 | 160 B fixed `bridge.BridgeStatus`, alignment 8 |
 | `/<sub>/target/<source>`: producer → target resolver | `align_up(16 + sizeof(message), 8) + 8` | TargetEnvelope payload: mode-generation/active header 16 + FlatBuffers struct; chassis/shooter/intake payload 40/24/20 B, slots 48/32/32 B |

@@ -310,6 +310,70 @@ TEST_F(TargetTest, FlapBetweenPublishedSamplesRejectsTheOldGeneration) {
   EXPECT_EQ(Seen(), 3.0);
 }
 
+// A RoboRIO reboot restarts the gateway clock: boot B's generations are low
+// where boot A's were high. A lane stamped under A's generation never drives
+// after the consumer has taken B's packets, not even after a delayed A packet
+// arrives, and B's own generation drives only while B is enabled and fresh.
+TEST_F(TargetTest, RebootedGatewayRetiresTheOldBootsGeneration) {
+  hw.stop_driver_station();
+  ds::ModeTracker boot_a, boot_b;
+  auto publish_ds = [&](ds::ModeTracker& tracker, uint64_t boot_id,
+                        uint64_t sample_time_us, uint32_t flags) {
+    auto data = DsPacket(flags);
+    data.boot_id = boot_id;
+    data.sample_time_us = sample_time_us;
+    tracker.Stamp(data);
+    hardware::Packet packet{};
+    packet.size = static_cast<uint32_t>(ds::Encode(data, packet.data));
+    sim.publish(hardware::kDriverStationTopic, packet);
+    return data.mode_since_us;
+  };
+  constexpr uint64_t kBootA = 0xA1, kBootB = 0xB1;
+
+  const uint64_t a = publish_ds(boot_a, kBootA, 900'000'000, kTeleop);
+  PublishTarget(sim, "lift", "teleop", Goal{1.0}, a);
+  sim.step(5ms);
+  ASSERT_EQ(Seen(), 1.0);
+
+  const uint64_t b = publish_ds(boot_b, kBootB, 1000, kTeleop);
+  ASSERT_LT(b, a);
+  PublishTarget(sim, "lift", "teleop", Goal{2.0}, a);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), std::nullopt);
+
+  // A's last packet, delayed past the reboot, cannot bring A's generation
+  // back.
+  publish_ds(boot_a, kBootA, 900'020'000, kTeleop);
+  PublishTarget(sim, "lift", "teleop", Goal{2.5}, a);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), std::nullopt);
+
+  publish_ds(boot_b, kBootB, 21000, kTeleop);
+  PublishTarget(sim, "lift", "teleop", Goal{3.0}, b);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), 3.0);
+
+  // Disabled in boot B: neutral, whatever generation the lane carries.
+  const uint64_t disabled = publish_ds(boot_b, kBootB, 41000, 0);
+  PublishTarget(sim, "lift", "teleop", Goal{3.5}, b);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), std::nullopt);
+  PublishTarget(sim, "lift", "teleop", Goal{3.5}, disabled);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), std::nullopt);
+
+  // Enabled again, then silent past command_timeout_us: stale is neutral.
+  const uint64_t again = publish_ds(boot_b, kBootB, 61000, kTeleop);
+  PublishTarget(sim, "lift", "teleop", Goal{4.0}, again);
+  sim.step(5ms);
+  ASSERT_EQ(Seen(), 4.0);
+  for (int i = 0; i < 30; ++i) {
+    PublishTarget(sim, "lift", "teleop", Goal{4.0}, again);
+    sim.step(5ms);
+  }
+  EXPECT_EQ(Seen(), std::nullopt);
+}
+
 TEST_F(TargetTest, TargetOfTheNewGenerationIsAcceptedInTheSameDrain) {
   ReenableBetweenTicks();
   // The operator interface derived this target from the re-enabling packet;
