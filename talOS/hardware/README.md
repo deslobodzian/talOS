@@ -122,12 +122,20 @@ optimization keeps the explicitly selected signals while stopping unused
 default frames; it does not replace measuring the real bus. Reads refresh the
 cached signals non-blockingly. One-shot control requests are refreshed by the
 bridge heartbeat (at most 20 ms), not on every gateway tick.
-Disabled neutral refresh deliberately remains every gateway tick. `Neutral()`
-uses one-shot `NeutralOut` (`UpdateFreqHz = 0`), not an acknowledged persistent
-disable latch. A dropped CAN neutral or a device reset can occur during disable;
-without an established vendor guarantee covering both cases, reducing refresh
-to 50 Hz would extend the retry interval. The cheap bus reduction is therefore
-limited to telemetry signals, not safety-output refresh.
+Neutral refresh deliberately remains every gateway tick whenever no accepted
+command is active: disabled, faulted, unhealthy, and after a command timeout
+or invalidation while enabled, until a fresh accepted command supersedes it.
+`Neutral()` uses one-shot `NeutralOut` (`UpdateFreqHz = 0`), not an
+acknowledged persistent disable latch. A dropped CAN neutral or a device reset
+can occur during disable or after a watchdog stop; without an established
+vendor guarantee covering both cases, reducing refresh to 50 Hz would extend
+the retry interval. The cheap bus reduction is therefore limited to telemetry
+signals, not safety-output refresh. Phoenix counts non-OK `NeutralOut` sends in
+`PhoenixBackend::neutral_send_failure_count()` and logs each motor's
+failing/recovered transition; `State` has no field for it, so this delivery
+uncertainty is RIO-local. Controller-side expiry of the last one-shot demand is
+not established by these tests; the bound on powered output after a watchdog
+stop is the gateway retry rate, not a measured device guarantee.
 
 References: [CTRE remote sensor control](https://v6.docs.ctr-electronics.com/en/latest/docs/api-reference/device-specific/talonfx/remote-sensors.html)
 and [Motion Magic](https://v6.docs.ctr-electronics.com/en/latest/docs/api-reference/device-specific/talonfx/motion-magic.html).
@@ -179,7 +187,8 @@ The bridge stamps receipt with `talos::event::Poller::now()`, the clock
 `Node::now()` reads.
 
 Driver Station disable/e-stop, command timeout, or total backend feedback loss
-neutralizes outputs. Enable transitions and timeout/backend stops invalidate
+neutralizes outputs, and neutral is refreshed every tick until a fresh command
+is accepted. Enable transitions and timeout/backend stops invalidate
 commands by advancing the epoch. Apply failures neutralize outputs and retry
 on the next fresh command; three consecutive failures latch a fault. A
 disabled-to-enabled transition or successful reconfiguration (including an

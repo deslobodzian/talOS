@@ -167,6 +167,7 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   last_motor_valid_.fill(true);
   last_sensor_valid_.fill(true);
   last_motor_fault_mask_ = 0;
+  neutral_send_failing_.fill(false);
   last_brownout_ = false;
   // The first failed device apply wins the precise error: device
   // name, bus, CAN ID, operation, and the raw vendor status value.
@@ -863,8 +864,23 @@ bool PhoenixBackend::ApplyOutputs(
   return true;
 }
 void PhoenixBackend::Neutral() {
-  for (auto& motor : motors_)
-    motor->SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
+  // Gateway refreshes neutral every tick without an active command, so a
+  // failed send here is retried on the next tick. Count every failure and log
+  // only each motor's ok<->failing transition to avoid a 200 Hz log flood.
+  for (std::size_t i = 0; i < motors_.size(); ++i) {
+    const auto status = motors_[i]->SetControl(
+        ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
+    const bool failed = !status.IsOK();
+    if (failed) ++neutral_send_failure_count_;
+    if (failed != neutral_send_failing_[i] && i < config_.motors.size()) {
+      const auto& motor = config_.motors[i];
+      std::cerr << "[phoenix] neutral send "
+                << (failed ? "failing" : "recovered") << " on motor "
+                << motor.name << " (can_id=" << motor.can_id
+                << "): " << status.GetName() << "\n";
+    }
+    neutral_send_failing_[i] = failed;
+  }
   for (auto& pwm : pwm_outputs_) pwm->SetDisabled();
   // Support matrix: DIO outputs de-energize on every safe-state transition.
   for (auto& dio : digital_outputs_) dio->Set(false);

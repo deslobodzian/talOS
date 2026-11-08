@@ -1247,6 +1247,56 @@ TEST(Gateway, ResetWhileEnabledNeutralizesBeforeRestore) {
   EXPECT_TRUE(g.Accept(Request(g), 3, 3000));
 }
 
+// A dropped watchdog neutral must not leave the last demand in force: every
+// Tick without an accepted command refreshes neutral until a fresh command
+// supersedes it, matching the disabled and unhealthy paths.
+TEST(Gateway, WatchdogNeutralRefreshesEveryTickUntilFreshCommand) {
+  FakeBackend backend;
+  const auto config = SwerveConfig(true);
+  Gateway g{config, backend, 1};
+  g.Tick(1000, true);
+  ASSERT_TRUE(g.Accept(Request(g), 1, 1000));
+  g.Tick(6000, true);
+  int neutrals = backend.neutral;
+  // Active command: no neutral refresh.
+  g.Tick(11000, true);
+  EXPECT_EQ(backend.neutral, neutrals);
+  uint64_t now = 1000 + config.command_timeout_us;
+  g.Tick(now, true);
+  ASSERT_FALSE(g.snapshot().flags & kCommandActive);
+  EXPECT_GT(backend.neutral, neutrals);
+  for (int i = 0; i < 5; ++i) {
+    neutrals = backend.neutral;
+    now += 5000;
+    g.Tick(now, true);
+    EXPECT_EQ(backend.neutral, neutrals + 1) << "tick " << i;
+  }
+  // A fresh accepted command supersedes the refresh.
+  ASSERT_TRUE(g.Accept(Request(g), 2, now));
+  neutrals = backend.neutral;
+  now += 5000;
+  g.Tick(now, true);
+  EXPECT_EQ(backend.neutral, neutrals);
+  EXPECT_TRUE(g.snapshot().flags & kCommandActive);
+
+  // Backend-unhealthy and disabled paths keep refreshing neutral too.
+  backend.healthy = false;
+  for (int i = 0; i < 3; ++i) {
+    neutrals = backend.neutral;
+    now += 5000;
+    g.Tick(now, true);
+    EXPECT_GE(backend.neutral, neutrals + 1);
+  }
+  backend.healthy = true;
+  for (int i = 0; i < 3; ++i) {
+    neutrals = backend.neutral;
+    now += 5000;
+    g.Tick(now, false);
+    EXPECT_GE(backend.neutral, neutrals + 1);
+    EXPECT_FALSE(g.Accept(Request(g), 10 + i, now));
+  }
+}
+
 TEST(Gateway, PhysicsResetPreservesPositionAndRejectsOldDemand) {
   sim::PhysicsSimBackend backend;
   Gateway gateway{SwerveConfig(true), backend, 1};

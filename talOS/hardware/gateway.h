@@ -39,6 +39,8 @@ class Backend {
       std::span<const PwmRequest> /*pwm_outputs*/) {
     return true;
   }
+  // Called every Tick while no accepted command is active (and on every
+  // safe-state transition); a dropped neutral is retried on the next Tick.
   virtual void Neutral() = 0;
   // Precise failure behind the last false Configure(). Absent when
   // the backend cannot say more than "it failed".

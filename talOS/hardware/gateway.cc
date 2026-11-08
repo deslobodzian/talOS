@@ -290,7 +290,10 @@ void Gateway::Tick(uint64_t now, bool enabled) {
   healthy_ = configured_ && backend_.Read(state_);
   if (!healthy_ && active_) Invalidate();
   PollResets();
-  if (!enabled_ || !config_.commissioned || fault_ || !healthy_ ||
+  // A watchdog stop is not a one-shot: with no accepted command in force,
+  // refresh neutral every tick (as disabled/fault do) so a dropped neutral is
+  // retried until a fresh command supersedes it.
+  if (!active_ || !enabled_ || !config_.commissioned || fault_ || !healthy_ ||
       !configured_) {
     backend_.Neutral();
   }

@@ -45,6 +45,13 @@ class PhoenixBackend final : public talos::hardware::Backend {
       std::span<const talos::hardware::DigitalOutputRequest> digital_outputs,
       std::span<const talos::hardware::PwmRequest> pwm_outputs) override;
   void Neutral() override;
+  // Motor NeutralOut sends that returned a non-OK status, cumulative since
+  // construction. State has no counter for this without a wire change, so it
+  // stays RIO-local (with a transition log line); Gateway retries neutral
+  // every tick while no command is active.
+  uint64_t neutral_send_failure_count() const {
+    return neutral_send_failure_count_;
+  }
   // Precise failure behind the last false Configure().
   std::optional<talos::hardware::ConfigError> last_config_error()
       const override;
@@ -69,6 +76,8 @@ class PhoenixBackend final : public talos::hardware::Backend {
   std::array<bool, talos::hardware::kMaxMotors> last_motor_valid_{};
   std::array<bool, talos::hardware::kMaxSensors> last_sensor_valid_{};
   uint32_t last_motor_fault_mask_{0};
+  std::array<bool, talos::hardware::kMaxMotors> neutral_send_failing_{};
+  uint64_t neutral_send_failure_count_{0};
   bool last_brownout_{false};
   std::vector<ctre::phoenix6::BaseStatusSignal*> signals_;
   std::vector<std::unique_ptr<frc::DigitalInput>> digital_inputs_;
