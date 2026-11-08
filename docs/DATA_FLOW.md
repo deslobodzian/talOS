@@ -258,20 +258,27 @@ a worst-case frame at startup and refuses an over-budget dictionary. Dictionary
 frames are larger/variable, bounded by the **16384 B** slot. First/every-100th-frame
 dictionaries allow late join/recovery in about a second at 100 Hz.
 
-The 2026 four-camera configuration excludes the cumulative captured, processed
-and range-rejected camera counters at channel level, retaining camera health,
-timing, dropped-frame and visible-tag diagnostics. The producer's
-`MeasureValueFrameBytes` over the original real declared graph measured
-**141 channels / 1216 B** before exclusions and **129 channels / 1120 B** after.
-The localization latch adds one scalar (8 B), yielding **130 channels / 1128 B**.
-In a physics-gateway session `/sim/state` adds **7 channels**: `sample_time_ns`,
-pose x/y/yaw and velocity vx/vy/omega. At 8 B/channel that is **137 channels /
-1184 B**, leaving **16 B headroom** under the 1200 B cap; no additional excludes
-are needed. Non-physics sessions use 130 channels / 1128 B. The full-stack
-startup test runs the declared physics graph, so telemetry's construction-time
-`CheckFrameBudget` enforces the cap on that graph. Topic-level includes remain
-unchanged; excludes match topics or individual dictionary channels, and only
-retained channels count toward the budget.
+The 2026 configuration excludes cumulative camera counters, the 64-bit
+`hw/status/clock_boot_id` (a double cannot carry it exactly) and the simulator's
+timestamp/velocity at channel level (`subsystems/telemetry.toml`), retaining
+camera health, timing, dropped-frame and visible-tag diagnostics. Excludes match
+topics or individual dictionary channels; only retained channels count.
+
+Current budget, measured 2026-11-08 with the producer's own
+`MeasureValueFrameBytes` / `MeasureDictionaryFrameBytes` (the telemetry node
+prints this line whenever it builds from a declared graph, so every
+`--describe-only` and every launch reports it):
+
+| Graph | Channels | Worst-case value frame | Spare channels | Dictionary frame |
+|---|---:|---:|---:|---:|
+| `robot.toml`, `robot_field.toml` | 130 | 1168 / 1200 B | 4 | 8984 / 16384 B |
+| `robot_physics_sim.toml` + `--start-sim-gateway --sim-gateway-arg --physics` | 133 | 1192 / 1200 B | 1 | 9152 / 16384 B |
+
+A graph over the cap makes telemetry refuse construction with the largest
+sources named; `--describe-only` then reports telemetry as not described and
+`talos_graph_test` fails, so the overflow is caught in CI rather than as missing
+Studio data. The physics-sim graph has one spare channel: a new state scalar
+needs an exclude (or a frame-format change) in the same commit.
 
 Studio's bridge forwards the occupied frame, not 16384 bytes of padding. At the
 value cap, `1200×8×100` = **0.96 Mbit/s per connected client**, before TCP/IP,

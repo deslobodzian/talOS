@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <random>
@@ -244,7 +245,7 @@ class Telemetry {
     values_.assign(dictionary_.size(),
                    std::numeric_limits<double>::quiet_NaN());
 
-    CheckFrameBudget();
+    CheckFrameBudget(graph != nullptr);
   }
 
   std::uint64_t stream_id() const { return stream_id_; }
@@ -459,7 +460,10 @@ class Telemetry {
     return dictionary_.size() - 1;
   }
 
-  void CheckFrameBudget() {
+  // Throws when a frame cannot fit; otherwise, for a graph-built dictionary
+  // (the launcher's --describe-only and every launch), reports the headroom
+  // so a config author sees it before a schema change crosses it.
+  void CheckFrameBudget(bool report) {
     const std::size_t worst_case = MeasureValueFrameBytes(dictionary_.size());
     if (worst_case > telemetry_wire::kMaxValueFrameBytes) {
       std::map<std::string, std::size_t> counts;
@@ -502,6 +506,18 @@ class Telemetry {
           " bytes, over the " + std::to_string(telemetry_wire::slot_bytes) +
           "-byte shared-memory slot budget");
     }
+    if (!report) return;
+    std::size_t spare_channels = 0;
+    while (MeasureValueFrameBytes(dictionary_.size() + spare_channels + 1) <=
+           telemetry_wire::kMaxValueFrameBytes) {
+      ++spare_channels;
+    }
+    std::cerr << "telemetry: " << dictionary_.size()
+              << " channels; worst-case value frame " << worst_case << " of "
+              << telemetry_wire::kMaxValueFrameBytes << " B (room for "
+              << spare_channels << " more channels); dictionary frame "
+              << dictionary_bytes << " of " << telemetry_wire::slot_bytes
+              << " B\n";
   }
 
   void BuildFromGraph(const introspect::DeclaredGraph& graph) {

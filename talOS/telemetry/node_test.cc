@@ -139,7 +139,11 @@ node = "//talOS/telemetry:node"
   ::testing::internal::CaptureStderr();
   auto& telemetry = sim.add<Telemetry>("telemetry");
   const std::string stderr_output = ::testing::internal::GetCapturedStderr();
-  EXPECT_TRUE(stderr_output.empty()) << stderr_output;
+  // Only the budget report; nothing about the excluded schema-less topic.
+  EXPECT_EQ(stderr_output.find("hw/state"), std::string::npos) << stderr_output;
+  EXPECT_NE(stderr_output.find("channels; worst-case value frame"),
+            std::string::npos)
+      << stderr_output;
 
   const auto dict = DictionaryMap(telemetry);
   EXPECT_TRUE(dict.contains("demo/state/position_m"));
