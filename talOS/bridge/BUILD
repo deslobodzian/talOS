@@ -12,6 +12,14 @@ talos_messages(
     topics = {"status": "/hw/status"},
 )
 
+# The gateway boots a stream has been in, current and recently retired: the
+# State ordering gate (via clock_offset) and every Driver Station consumer.
+cc_library(
+    name = "boot_history",
+    hdrs = ["boot_history.h"],
+    visibility = ["//visibility:public"],
+)
+
 # The gateway-to-node clock mapping the bridge publishes on /hw/status, also
 # run by talos::testing::SimHardware when it plays the bridge.
 cc_library(
@@ -19,6 +27,7 @@ cc_library(
     srcs = ["clock_offset.cc"],
     hdrs = ["clock_offset.h"],
     visibility = ["//visibility:public"],
+    deps = [":boot_history"],
 )
 
 cc_library(

@@ -301,10 +301,17 @@ void HardwareNode::Tick(uint64_t now_us) {
       if (!Decode({frame.payload, frame.payload_size}, state)) continue;
 
       ++states_received_;
+      // Ordering first, before anything is touched: the clock mapping takes
+      // a State only when it is newer than the last one of its gateway boot
+      // or opens a boot never seen. A duplicate, a reordered frame (with
+      // whatever older epoch or enable edge it carries) or a datagram delayed
+      // from a retired boot is dropped whole, counted in
+      // clock_ignored_count: it must not roll back the identity, refresh
+      // freshness, invalidate healthy requests or trigger a config push.
+      if (!clock_.Observe(state.boot_id, state.sample_time_us, now_us)) {
+        continue;
+      }
       last_state_receipt_us_ = now_us;
-      // Every decoded frame feeds the clock mapping, whatever its config:
-      // the gateway's clock does not depend on what it was configured with.
-      clock_.Observe(state.boot_id, state.sample_time_us, now_us);
       if (state.boot_id != last_boot_id_) config_push_backoff_us_ = 50000;
       if (state.boot_id != last_boot_id_ || state.config_id != config_id_ ||
           !is_configured_) {

@@ -91,6 +91,7 @@ class HardwareNode {
   // merge always refreshes the gateway well before it expires.
   uint64_t heartbeat_us() const { return heartbeat_us_; }
   // The gateway-to-node clock mapping, fed by every decoded /hw/state frame.
+  // It is also the State ordering gate: a frame it ignores is dropped.
   const ClockOffsetEstimator& clock() const { return clock_; }
 
   // The /hw/status message as of `now_us` (the bridge's monotonic clock, the

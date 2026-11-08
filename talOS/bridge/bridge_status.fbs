@@ -3,9 +3,10 @@ namespace bridge;
 // The hardware bridge's health, published by hardware_node on /hw/status every
 // 20 ms. The counters are cumulative since the bridge started.
 //
-// state_age_us is the bridge's monotonic now minus the moment it received the
+// state_age_us is the bridge's monotonic now minus the moment it accepted the
 // last /hw/state frame from the RoboRIO (bridge clock on both sides), and 0
-// before the first frame. timed_out_mask has bit i set when the i-th
+// before the first frame. states_received_count counts every decoded frame,
+// dropped ones included. timed_out_mask has bit i set when the i-th
 // actuator-owning subsystem, in sorted name order, has timed out; only the
 // first 32 fit. subsystem_count is the number of those subsystems.
 // configured is whether the RoboRIO acknowledged this bridge's configuration.
@@ -18,7 +19,9 @@ namespace bridge;
 // the window holds enough samples of that boot; clock_offset_spread_us is the
 // largest minus the smallest one-way delay in it; clock_window_count is how
 // many samples it holds. clock_resets_count counts restarts for a new gateway
-// boot and clock_ignored_count duplicate or reordered samples left out.
+// boot and clock_ignored_count duplicate, reordered or retired-boot samples
+// left out; the bridge drops each of those States whole (no identity,
+// freshness, request or config-push effect).
 // talos::HardwareLink::sample_time() applies the mapping.
 struct BridgeStatus {
   states_received_count:uint64;

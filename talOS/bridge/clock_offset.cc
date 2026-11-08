@@ -7,9 +7,13 @@ namespace talos::hardware {
 bool ClockOffsetEstimator::Observe(std::uint64_t boot_id,
                                    std::uint64_t sample_time_us,
                                    std::uint64_t receipt_us) {
-  if (boot_id != boot_id_) {
-    if (boot_id_ != 0) ++resets_;
-    boot_id_ = boot_id;
+  if (boots_.retired(boot_id)) {
+    ++ignored_;
+    return false;
+  }
+  if (!boots_.current(boot_id)) {
+    if (!boots_.empty()) ++resets_;
+    boots_.Enter(boot_id);
     next_ = 0;
     count_ = 0;
     offset_us_ = 0;

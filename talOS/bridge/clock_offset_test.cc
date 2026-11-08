@@ -69,6 +69,29 @@ TEST(ClockOffset, AGatewayRebootRestartsTheWindow) {
             static_cast<std::int64_t>(reboot_us - kGatewayStartUs) + 600);
 }
 
+// A datagram delayed from a boot the gateway has left must not restart the
+// window back onto it: it is ignored, however high its sample time. Only the
+// last BootHistory::kRetiredBoots boots are remembered.
+TEST(ClockOffset, ARetiredBootIsIgnored) {
+  Estimator clock;
+  ASSERT_TRUE(clock.Observe(3, 900'000'000, kBridgeStartUs));
+  ASSERT_TRUE(clock.Observe(4, 1000, kBridgeStartUs + 5000));
+  EXPECT_FALSE(clock.Observe(3, 900'005'000, kBridgeStartUs + 6000));
+  EXPECT_EQ(clock.boot_id(), 4u);
+  EXPECT_EQ(clock.window_count(), 1u);
+  EXPECT_EQ(clock.resets_count(), 1u);
+  EXPECT_EQ(clock.ignored_count(), 1u);
+  EXPECT_TRUE(clock.Observe(4, 6000, kBridgeStartUs + 10000));
+
+  // Boots 5..8 push boot 3 out of the retired set; boot 4 is still in it.
+  for (std::uint64_t boot = 5; boot <= 8; ++boot) {
+    ASSERT_TRUE(clock.Observe(boot, 1000, kBridgeStartUs + 20000 * boot));
+  }
+  EXPECT_FALSE(clock.Observe(4, 11000, kBridgeStartUs + 200000));
+  EXPECT_TRUE(clock.Observe(3, 1000, kBridgeStartUs + 210000));
+  EXPECT_EQ(clock.boot_id(), 3u);
+}
+
 TEST(ClockOffset, DuplicateAndReorderedSamplesAreIgnored) {
   Estimator clock;
   for (std::uint64_t i = 0; i < 10; ++i) {

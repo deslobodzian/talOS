@@ -1214,6 +1214,131 @@ TEST(HardwareNodeTest, RequiresFreshRequestsAfterControllerTransitions) {
   EXPECT_EQ(node.ownership_rejected(), 0u);
 }
 
+// A State is accepted only when it is newer than the last one accepted in its
+// gateway boot, or opens a boot the bridge has not seen. A duplicate, a
+// reordered sample (even one carrying an older epoch or enable edge) and a
+// datagram delayed from a boot the gateway has since left are dropped before
+// they reach identity, freshness, the cached requests, /hw/state or the config
+// push. A genuine new boot still recovers.
+TEST(HardwareNodeTest, ReorderedAndRetiredBootStatesChangeNothing) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  const uint16_t drive = cfg.hardware.motors[0].id;
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint64_t config_id = NodeConfigId(cfg);
+
+  HardwareNode node{cfg, "127.0.0.1", TestPort(26200), TestPort(26201), true};
+  ASSERT_TRUE(node.Open());
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(
+      gateway.Open("127.0.0.1", TestPort(26200), "127.0.0.1", TestPort(26201)),
+      protocol::UdpStatus::kOk);
+  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
+  ipc::Publisher<talos::hardware::Packet> drive_pub{RequestTopic("drivetrain")};
+  ipc::Subscriber<talos::hardware::Packet> state_sub{kStateTopic};
+  const auto drain_configs = [&] {
+    unsigned count = 0;
+    protocol::DecodedFrame frame;
+    while (gateway.TryReceive(&frame) == protocol::UdpStatus::kOk)
+      count += frame.header.type == protocol::FrameType::kHardwareConfig;
+    return count;
+  };
+  const auto publish = [&](uint64_t boot, uint64_t epoch, uint64_t observed,
+                           double demand) {
+    Command d{};
+    d.config_id = config_id;
+    d.boot_id = boot;
+    d.epoch = epoch;
+    d.observed_time_us = observed;
+    d.count = 1;
+    d.motors[0] = {drive, Mode::kVelocity, 0, demand, 0.0};
+    PublishCommand(drive_pub, d);
+    Command r = d;
+    r.motors[0] = {roller, Mode::kVelocity, 0, demand, 0.0};
+    PublishCommand(intake_pub, r);
+  };
+
+  // Boot 10 ran for a long time; boot 11 restarts the gateway clock low.
+  ASSERT_TRUE(InjectState(node, gateway,
+                          TrustState(config_id, 10, 1, 900'000'000), 1000000));
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 2, 1000), 1001000));
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 2, 2000), 1002000));
+  // Configured, so nothing but a transition pushes the configuration again.
+  ConfigAckPayload ack{};
+  ack.config_id = config_id;
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, 128> ack_bytes{};
+  const auto ack_size = EncodeConfigAck(ack, ack_bytes);
+  ASSERT_EQ(gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 0,
+                              1002000, ack_bytes.data(), ack_size),
+            protocol::UdpStatus::kOk);
+  for (int i = 0; i < 200 && !node.is_configured(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    node.Tick(1002000);
+  }
+  ASSERT_TRUE(node.is_configured());
+  publish(11, 2, 2000, 15.0);
+  node.Tick(1002500);
+  ASSERT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+  ASSERT_DOUBLE_EQ(node.current_command().motors[0].demand, 15.0);
+  while (state_sub.read()) {
+  }
+  drain_configs();
+  const uint64_t ignored_before = node.Status(1002500).clock_ignored_count();
+
+  State duplicate_new_epoch = TrustState(config_id, 11, 3, 2000);
+  State older_disabled = TrustState(config_id, 11, 1, 1500);
+  older_disabled.flags = kConfigured;
+  State retired = TrustState(config_id, 10, 1, 900'005'000);
+  uint64_t now_us = 1003000;
+  for (const State& stale : {duplicate_new_epoch, older_disabled, retired}) {
+    ASSERT_TRUE(InjectState(node, gateway, stale, now_us));
+    EXPECT_FALSE(state_sub.read()) << "boot " << stale.boot_id << " sample "
+                                   << stale.sample_time_us << " published";
+    EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+    EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+    EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 15.0);
+    EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 15.0);
+    EXPECT_TRUE(node.is_configured());
+    EXPECT_EQ(drain_configs(), 0u);
+    now_us += 500;
+  }
+  const bridge::BridgeStatus status = node.Status(now_us);
+  EXPECT_EQ(status.clock_ignored_count(), ignored_before + 3);
+  EXPECT_EQ(status.clock_boot_id(), 11u);
+  // Freshness was not refreshed by the dropped frames.
+  EXPECT_EQ(status.state_age_us(), now_us - 1002000);
+  // The identity still is boot 11, epoch 2, sample 2000: a request built from
+  // it merges, and one built from a dropped frame's words does not.
+  const uint64_t rejected_before = node.identity_rejected();
+  publish(11, 2, 2000, 16.0);
+  node.Tick(now_us);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 16.0);
+  EXPECT_EQ(node.identity_rejected(), rejected_before);
+  publish(11, 3, 2000, 17.0);
+  node.Tick(now_us + 100);
+  EXPECT_EQ(node.identity_rejected(), rejected_before + 2);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 16.0);
+
+  // A genuine reboot: a boot never seen before is accepted, published, pushes
+  // the configuration and invalidates every cached request.
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 12, 1, 500), 1010000));
+  EXPECT_TRUE(state_sub.read());
+  EXPECT_GT(drain_configs(), 0u);
+  node.Tick(1010100);
+  EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(node.Status(1010100).clock_boot_id(), 12u);
+  publish(12, 1, 500, 18.0);
+  node.Tick(1010200);
+  EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 18.0);
+}
+
 // Describe() must answer without a socket, a shared-memory segment or a
 // registry slot, because the launcher asks every binary in a config what it
 // would connect to before it spawns any of them. Open() is never called here;
