@@ -6,6 +6,7 @@
 import type {Snapshot} from '../core';
 import type {ChannelInfo, DriverStationMode, SystemState} from './types';
 import {discoverEstimators} from './discovery';
+import {liveNodeCount} from './freshness';
 
 export type RobotStatus = {
   ds: {
@@ -28,7 +29,9 @@ export type RobotStatus = {
     timedOutMask: number|null;
   };
   estimator: {valid: boolean|null; accepted: number|null; rejected: number|null}|null;
-  nodes: {alive: number; total: number}|null;
+  // `alive` is null when the graph is stale: `total` is last-known, the live
+  // count is not knowable.
+  nodes: {alive: number|null; total: number}|null;
 };
 
 const DS = 'hw/state/driver_station/';
@@ -102,9 +105,7 @@ export function robotStatus(snapshot: Snapshot|null, system: SystemState): Robot
   }
 
   const graph = system.graph;
-  const nodes = graph ?
-      {alive: graph.nodes.filter(n => n.alive).length, total: graph.nodes.length} :
-      null;
+  const nodes = graph ? {alive: liveNodeCount(system), total: graph.nodes.length} : null;
 
   return {
     ds: {

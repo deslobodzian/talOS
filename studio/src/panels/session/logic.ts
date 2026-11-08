@@ -28,7 +28,8 @@ export type ProcessRow = {
   pid: string|null;
   // Null is "the registry has nothing to say", not "not alive": a node that
   // never claimed a slot is absent from the registry, and answering "dead"
-  // for it would be inventing one.
+  // for it would be inventing one. A stale registry graph says nothing
+  // current either, so it is null then too.
   alive: boolean|null;
   // Whether a manifest node named this process (so the recorder/exit columns
   // can tell "no" from "the manifest did not say").
@@ -75,10 +76,12 @@ export function worstLatency(node: SystemNode): number|null {
   return latencies.length ? Math.max(...latencies) : null;
 }
 
+// `graphStale`: the registry graph is last-known (data/freshness.ts), so it
+// says who held a slot but not who is alive now.
 export function mergeProcesses(
     manifest: SessionManifest|null, graph: SystemGraph|null,
     declared: DeclaredGraph|null,
-    rates: Record<string, number>): ProcessRow[] {
+    rates: Record<string, number>, graphStale: boolean): ProcessRow[] {
   interface Parts {
     manifest?: ManifestNode;
     registry?: SystemNode;
@@ -105,7 +108,7 @@ export function mergeProcesses(
   const rows: ProcessRow[] = [];
   for (const [name, {manifest: m, registry: r, declared: d}] of byName) {
     const problems: ProcessProblem[] = [];
-    if (r && !r.alive) problems.push('dead');
+    if (r && !graphStale && !r.alive) problems.push('dead');
     if (m && m.restart_count > 0) problems.push('restarted');
     if (m && m.recorder_failed) problems.push('recorder_failed');
     if (m && m.exit_code > 0) problems.push('nonzero_exit');
@@ -118,7 +121,7 @@ export function mergeProcesses(
       name,
       target: m?.target ?? r?.target ?? d?.target ?? '',
       pid: r ? r.pid : (m ? String(m.pid) : null),
-      alive: r ? r.alive : null,
+      alive: r && !graphStale ? r.alive : null,
       hasManifest: m !== undefined,
       restarts: m?.restart_count ?? 0,
       exitCode: m && m.exit_code >= 0 ? m.exit_code : null,

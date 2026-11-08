@@ -5,9 +5,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {demoPacket} from '../src/demo';
-import {readingClock, sampleStale} from '../src/data/freshness';
-import type {PlaybackState, Snapshot} from '../src/data/types';
+import {demoPacket, demoSystemGraph} from '../src/demo';
+import {GRAPH_STALE_AFTER_MS, readingClock, sampleStale} from '../src/data/freshness';
+import type {PlaybackState, Snapshot, SystemState} from '../src/data/types';
 
 let now = 1000;
 type Listener = ((event: {data: unknown}) => void)|null;
@@ -25,9 +25,11 @@ class FakeSocket {
 }
 
 let playback: PlaybackState|null = null;
+let system: SystemState|null = null;
 let frames: Snapshot[] = [];
 function apply(m: Record<string, unknown>) {
   if (m.type === 'playback') playback = m.state as PlaybackState;
+  else if (m.type === 'system') system = m as unknown as SystemState;
   else if (m.type === 'frames') {
     if (m.reset) frames = [];
     frames.push(...(m.frames as Snapshot[]));
@@ -142,4 +144,47 @@ test('a reconnect does not revive cached values as current', () => {
   binary(again, demoPacket(101n));
   advance(40);
   assert.equal(latestCurrent(), true);
+});
+
+function text(socket: FakeSocket, data: string) {
+  socket.onmessage!({data});
+}
+
+test('a graph goes stale when graph messages stop, while telemetry continues', () => {
+  const socket = connect();
+  text(socket, demoSystemGraph(0n));
+  advance(8);
+  assert.ok(system!.graph);
+  assert.equal(system!.stale, false);
+  // Binary telemetry keeps flowing; text graphs stop.
+  let sequence = 0n;
+  for (let t = 0; t < GRAPH_STALE_AFTER_MS + 100; t += 20) {
+    binary(socket, demoPacket(sequence++));
+    advance(20);
+  }
+  advance(40);
+  assert.equal(latestCurrent(), true, 'telemetry is still current');
+  assert.equal(system!.stale, true, 'the graph is not');
+  assert.ok(system!.graph!.nodes.length > 0, 'the last-known graph is kept');
+  // A malformed replacement is no evidence about what runs now.
+  text(socket, '{"not": "a graph"}');
+  advance(8);
+  assert.ok(system!.error);
+  assert.equal(system!.stale, true);
+  // A good graph recovers immediately.
+  text(socket, demoSystemGraph(sequence));
+  advance(8);
+  assert.equal(system!.stale, false);
+  assert.equal(system!.error, '');
+});
+
+test('a graph goes stale the moment the socket drops', () => {
+  const socket = connect();
+  text(socket, demoSystemGraph(0n));
+  advance(8);
+  assert.equal(system!.stale, false);
+  captureTimeout(() => socket.onclose!());
+  advance(8);
+  assert.equal(system!.stale, true);
+  assert.ok(system!.graph, 'last-known graph stays inspectable');
 });

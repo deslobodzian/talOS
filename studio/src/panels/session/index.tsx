@@ -23,6 +23,7 @@ import type {SessionManifest} from '../../data/manifest';
 import type {SystemGraph} from '../../system';
 import {duration, hertz, integer} from '../../ui/formatters';
 import {EmptyState, StatusDot} from '../../ui/primitives';
+import {GraphFreshnessNotice} from '../../ui/FreshnessNotice';
 import type {PanelDefinition} from '../types';
 import {mergeProcesses, summarize, type ProcessProblem} from './logic';
 import './session.css';
@@ -146,8 +147,8 @@ function SessionPanel() {
 
   const rows = useMemo(
       () => mergeProcesses(manifest, system.graph, system.declared,
-                           system.rates),
-      [manifest, system.graph, system.declared, system.rates]);
+                           system.rates, system.stale),
+      [manifest, system.graph, system.declared, system.rates, system.stale]);
   const summary = useMemo(() => summarize(rows), [rows]);
 
   const copyPath = (path: string) => {
@@ -175,8 +176,9 @@ function SessionPanel() {
       <div className="card-heading">
         <h2>Processes</h2><span>MANIFEST ∪ REGISTRY ∪ DECLARED</span>
       </div>
+      <GraphFreshnessNotice/>
       <div className="system-counts session-counts">
-        <span>{summary.running}/{summary.total} processes running</span>
+        <span>{system.graph && system.stale ? '?' : summary.running}/{summary.total} processes running</span>
         <span>{summary.restarts} restart{summary.restarts === 1 ? '' : 's'}</span>
       </div>
       {rows.length === 0 ?

@@ -29,6 +29,7 @@ import {panelNode, splitNode} from '../src/layout/tree';
 import {filterCommands, relativeEventTime} from '../src/shell/commands';
 import {Timeline} from '../src/shell/Timeline';
 import {WorkspaceArea, type WorkspaceCallbacks} from '../src/shell/WorkspaceArea';
+import {StatusStrip} from '../src/shell/StatusStrip';
 
 const emptyPlayback: PlaybackState = {
   mode: 'PAUSED',
@@ -47,6 +48,7 @@ function state(declared = false): SystemState {
   for (const [key, value] of eventRates(graph, previous)) rates[key] = value;
   return {
     graph,
+    stale: false,
     rates,
     error: '',
     declared: declared ? parseDeclaredGraph(demoDeclaredGraph()) : null,
@@ -55,7 +57,7 @@ function state(declared = false): SystemState {
 }
 
 const noSystem: SystemState =
-    {graph: null, rates: {}, error: '', declared: null, declaredError: ''};
+    {graph: null, stale: true, rates: {}, error: '', declared: null, declaredError: ''};
 
 const render = (element: React.ReactElement) =>
     renderToStaticMarkup(element).replace(/<[^>]*>/g, '');
@@ -91,6 +93,39 @@ test('the system view surfaces the faults the demo deliberately carries', () => 
   assert.ok(html.includes('/shooter/state'), 'the orphaned topic is missing');
 });
 
+test('a stale graph stays inspectable but makes no live-node claim', () => {
+  const graph = parseSystemGraph(demoSystemGraph(4000n));
+  const total = graph.nodes.length;
+  assert.ok(graph.nodes.some(n => n.alive) && graph.nodes.some(n => !n.alive));
+  const system: SystemState =
+      {graph, stale: true, rates: {}, error: '', declared: null, declaredError: ''};
+
+  const view = renderPanel(systemPanel, system);
+  assert.ok(view.includes('SYSTEM GRAPH STALE'));
+  assert.ok(view.includes(`?/${total} nodes live`));
+  for (const node of graph.nodes) assert.ok(view.includes(node.name), node.name);
+  assert.ok(view.includes('UNKNOWN · last known alive'));
+  assert.ok(view.includes('UNKNOWN · last known stopped'));
+
+  const health = renderPanel(healthPanel, system);
+  assert.ok(health.includes('which nodes are alive is unknown'));
+  assert.ok(!health.includes('stopped heartbeating'));
+  assert.ok(health.includes(`unknown of ${total}`));
+
+  assert.ok(renderPanel(timingPanel, system).includes('SYSTEM GRAPH STALE'));
+
+  const strip = render(
+      <StudioProvider studio={createStaticStudio({system, playback: emptyPlayback})}>
+        <StatusStrip/>
+      </StudioProvider>);
+  assert.ok(strip.includes(`?/${total} · STALE`), strip);
+
+  // The same graph, current, says which node stopped.
+  const fresh = renderPanel(healthPanel, {...system, stale: false});
+  assert.ok(fresh.includes('stopped heartbeating'));
+  assert.ok(!fresh.includes('SYSTEM GRAPH STALE'));
+});
+
 test('a half-wired topic its own node declared is not shown as a fault', () => {
   const html = renderPanel(systemPanel, state());
   assert.ok(html.includes('bridged'), 'external endpoint status missing');
@@ -98,7 +133,7 @@ test('a half-wired topic its own node declared is not shown as a fault', () => {
   const system = state();
   const drivetrain = system.graph!.nodes.find(n => n.name === 'drivetrain')!;
   const wiring = render(<Wiring graph={system.graph!} node={drivetrain}
-                                rates={system.rates}/>);
+                                stale={false} rates={system.rates}/>);
   assert.ok(wiring.includes('optional'));
 });
 
@@ -110,6 +145,7 @@ test('a node that stopped heartbeating is marked stale, not merely absent',
 
        const html = renderPanel(systemPanel, {
          graph,
+         stale: false,
          rates: {},
          error: '',
          declared: null,
@@ -123,7 +159,7 @@ test('a node card says who drives its subsystem, and none when nobody does',
      () => {
        const card = (sequence: bigint, name: string) => {
          const graph = parseSystemGraph(demoSystemGraph(sequence));
-         return render(<NodeCard graph={graph}
+         return render(<NodeCard graph={graph} stale={false}
                                  node={graph.nodes.find(n => n.name === name)!}
                                  rates={{}} selected={false}
                                  onSelect={() => {}}/>);
@@ -135,7 +171,7 @@ test('a node card says who drives its subsystem, and none when nobody does',
        assert.ok(!card(50n, 'pose_estimator').includes('driven by'));
 
        const graph = parseSystemGraph(demoSystemGraph(50n));
-       const wiring = render(<Wiring graph={graph}
+       const wiring = render(<Wiring graph={graph} stale={false}
                                      node={graph.nodes.find(
                                          n => n.name === 'drivetrain')!}
                                      rates={{}}/>);
@@ -155,6 +191,7 @@ test('every view renders without a system graph and says why', () => {
 test('a malformed document is reported in place of the graph it replaced', () => {
   const html = renderPanel(systemPanel, {
     graph: null,
+    stale: true,
     rates: {},
     error: 'Invalid system graph: nodes[0].name must be a string',
     declared: null,
@@ -279,7 +316,7 @@ test('a bridge too old to state endpoint attributes says so, and still renders',
          }
        const graph = parseSystemGraph(JSON.stringify(older));
        const system: SystemState =
-           {graph, rates: {}, error: '', declared: null, declaredError: ''};
+           {graph, stale: false, rates: {}, error: '', declared: null, declaredError: ''};
 
        const html = renderPanel(systemPanel, system);
        assert.ok(html.includes('/hw/command'), 'the graph itself is missing');

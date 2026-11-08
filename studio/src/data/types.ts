@@ -37,7 +37,12 @@ export type PlaybackState = {
 // What the worker knows about the shape of the system, as opposed to what it
 // measured. Arrives at a few hertz, separately from frames.
 export type SystemState = {
+  // The last good graph. Kept when it goes stale, so the last-known evidence
+  // stays inspectable; read liveness through data/freshness.ts.
   graph: SystemGraph|null;
+  // The graph is not current: none has arrived, the newest is older than
+  // GRAPH_STALE_AFTER_MS, the socket is down, or the worker failed.
+  stale: boolean;
   rates: Record<string, number>;
   error: string;
   // Null is the ordinary case ("not offered"), not an error.

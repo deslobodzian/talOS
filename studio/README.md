@@ -88,6 +88,16 @@ inspectable at their own timestamps), but while it is the newest sample the
 live clock is unknown (`clock_ns: null`; `readingClock` in `data/freshness.ts`)
 and every reading is stale. The next live frame restores the clock at once.
 
+The system graph has its own freshness boundary, independent of telemetry:
+the worker records each good graph's local monotonic arrival and judges it
+**stale at age >= 1 second** (`GRAPH_STALE_AFTER_MS`; the bridge refreshes
+every 250 ms), or at once while the socket is down or after a worker failure.
+A malformed replacement does not refresh it. A stale graph stays on screen as
+last-known evidence, but every liveness conclusion -- node cards, node counts,
+"stopped heartbeating", session process liveness, subsystem "alive", the
+status strip -- reads unknown (`nodeLiveness`/`liveNodeCount` in
+`data/freshness.ts`), under a SYSTEM GRAPH STALE notice.
+
 Worker errors and message decoding failures reject all pending RPCs with
 `WorkerRpcError`. RPCs time out after 10 seconds. A five-second heartbeat
 detects silent termination after ten seconds without a reply. The status strip

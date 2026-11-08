@@ -39,8 +39,9 @@ const initialPlayback: PlaybackState = {
   connection: 'idle'
 };
 
-const initialSystem: SystemState =
-    {graph: null, rates: {}, error: '', declared: null, declaredError: ''};
+const initialSystem: SystemState = {
+  graph: null, stale: true, rates: {}, error: '', declared: null, declaredError: ''
+};
 
 const defaultScheduler = (cb: () => void): void => {
   if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => cb());
@@ -103,6 +104,8 @@ export function createWorkerStudio(): Studio {
       data => receive(data),
       error => {
         studio.playback = {...studio.playback, connection: 'error', status: error.message};
+        // A failed worker sends no more graphs: the last one is last-known.
+        studio.system = {...studio.system, stale: true};
         studio.notify();
       });
   const post = (data: object, transfer?: Transferable[]) => client.post(data, transfer);
@@ -161,6 +164,7 @@ export function createWorkerStudio(): Studio {
     } else if (data.type === 'system') {
       studio.system = {
         graph: data.graph ?? null,
+        stale: data.stale ?? true,
         rates: data.rates ?? {},
         error: data.error ?? '',
         declared: data.declared ?? null,
@@ -215,6 +219,7 @@ export function createStaticStudio(input: {
   };
   const system: SystemState = {
     graph: input.system?.graph ?? null,
+    stale: input.system?.stale ?? false,
     rates: input.system?.rates ?? {},
     error: input.system?.error ?? '',
     declared: input.system?.declared ?? null,

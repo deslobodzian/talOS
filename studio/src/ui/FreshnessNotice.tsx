@@ -1,5 +1,5 @@
 import {useMemo, useSyncExternalStore, type ReactNode} from 'react';
-import {useChannelStale, useDictionary, usePlayback} from '../data/hooks';
+import {useChannelStale, useDictionary, usePlayback, useSystem} from '../data/hooks';
 import {useStudio} from '../data/studio';
 import {readingClock, sampleStale} from '../data/freshness';
 import {Stat} from './primitives';
@@ -38,4 +38,14 @@ export function FreshnessNotice({prefix = ''}: {prefix?: string}) {
     <summary>STALE · {stale.length} channels (not current)</summary>
     {stale.map(value => <div key={value}><code>{value}</code> · stale</div>)}
   </details>;
+}
+
+// The system graph's counterpart: a stale graph is still shown, as last-known
+// evidence, but nothing it says about which nodes are alive is current.
+export function GraphFreshnessNotice() {
+  const system = useSystem();
+  if (!system.graph || !system.stale) return null;
+  return <p className="text-warn" role="status" aria-label="Stale system graph">
+    SYSTEM GRAPH STALE · node liveness unknown; showing the last-known graph
+  </p>;
 }

@@ -1,14 +1,16 @@
 // A single node card: liveness, cadence, dispatch count, and who drives its
 // subsystem. Pure at render (data arrives as props), so react-dom/server can
-// render it in tests.
+// render it in tests. `stale`: the graph is last-known, so liveness is unknown.
 
+import {nodeLiveness} from '../../data/freshness';
 import {drivenBy, isSubscriber, rateKey, type SystemGraph, type SystemNode} from '../../system';
 import {duration, hertz, integer, staleness} from '../../ui/formatters';
 import {Badge, StatusDot} from '../../ui/primitives';
 
 export function NodeCard(
-    {graph, node, rates, selected, onSelect}: {
-      graph: SystemGraph; node: SystemNode; rates: Record<string, number>;
+    {graph, node, stale, rates, selected, onSelect}: {
+      graph: SystemGraph; node: SystemNode; stale: boolean;
+      rates: Record<string, number>;
       selected: boolean;
       onSelect: () => void;
     }) {
@@ -25,17 +27,20 @@ export function NodeCard(
                       .filter((r): r is number => r !== undefined)
                       .sort((a, b) => b - a)[0];
   const driver = drivenBy(node);
+  const liveness = nodeLiveness(node, {stale});
 
   return <button
       className={'node-card' + (selected ? ' selected' : '') +
-                 (node.alive ? '' : ' dead')}
+                 (liveness === 'stopped' ? ' dead' : '')}
       onClick={onSelect} aria-pressed={selected}>
     <div className="node-card-head">
-      <StatusDot active={node.alive}/>
+      <StatusDot active={liveness === 'live'}/>
       <b>{node.name}</b>
       {node.simulation && <Badge tone="sim">SIM</Badge>}
       {node.replay && <Badge>REPLAY</Badge>}
-      {!node.alive && <Badge tone="dead">STALE</Badge>}
+      {liveness === 'stopped' && <Badge tone="dead">STALE</Badge>}
+      {liveness === 'unknown' &&
+       <Badge>{`UNKNOWN · last known ${node.alive ? 'alive' : 'stopped'}`}</Badge>}
     </div>
     <code>{node.target || '—'}</code>
     <dl>

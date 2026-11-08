@@ -5,9 +5,11 @@
 import {useMemo, useState} from 'react';
 
 import {useSystem} from '../../data/hooks';
+import {nodeLiveness} from '../../data/freshness';
 import {rateKey, type SystemSource} from '../../system';
 import {duration, hertz, integer} from '../../ui/formatters';
 import {EmptyState} from '../../ui/primitives';
+import {GraphFreshnessNotice} from '../../ui/FreshnessNotice';
 import type {PanelDefinition} from '../types';
 import './timing.css';
 
@@ -113,6 +115,7 @@ function TimingPanel() {
         </span>
       </div>
     </div>
+    <GraphFreshnessNotice/>
     <div className="table-scroll">
       <table className="grid">
         <thead>
@@ -131,7 +134,7 @@ function TimingPanel() {
         <tbody>
           {rows.map(({node, source, rate, declared}) =>
                         <tr key={node.name + '/' + source.kind + source.id}
-                            className={node.alive ? '' : 'dead'}>
+                            className={nodeLiveness(node, system) === 'stopped' ? 'dead' : ''}>
                           <td>{node.name}</td>
                           <td><em className={'kind ' + source.kind}>
                             {source.kind}

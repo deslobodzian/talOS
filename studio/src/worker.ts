@@ -3,6 +3,7 @@ import {handleRpc} from '../agent/rpc';
 import {ByteBuffer} from 'flatbuffers';
 
 import {Coordinator, JitterBuffer, TelemetryDecoder, Timeline, type Snapshot} from './core';
+import {graphStale} from './data/freshness';
 import {MAX_MANIFEST_BYTES, manifestUrl, parseManifest, type SessionManifest} from './data/manifest';
 import {type Connection, type PlaybackState} from './data/types';
 import {WorkerUpdateStream} from './data/worker-stream';
@@ -50,6 +51,14 @@ let system: SystemGraph|null = null, previousSystem: SystemGraph|null = null;
 const rateWindow = new RateWindow();
 let systemError = '';
 let nextDemoSystem = 0;
+// Monotonic receipt time of the last good graph, and the staleness last
+// posted. The graph carries the registry's wall clock, which is not this
+// machine's, so its age is measured from local arrival.
+let systemArrival: number|null = null;
+let postedSystemStale = true;
+function systemStale(now: number) {
+  return graphStale(systemArrival, now, connection === 'live' || connection === 'demo');
+}
 
 // The declared graph, fetched over HTTP rather than pushed: the launcher writes
 // it once before it spawns anything, so it does not change while a session
@@ -67,16 +76,19 @@ let nextManifestPoll = 0;
 let manifestBase: string|null = null;
 let lastManifestRaw: string|null = null;
 
-// Posted only when the graph changes, not on every telemetry tick: it is a few
-// tens of kilobytes and structure changes at 4 Hz, not at the 100 Hz frame rate.
+// Posted only when the graph changes or goes stale/fresh, not on every
+// telemetry tick: it is a few tens of kilobytes and structure changes at 4 Hz,
+// not at the 100 Hz frame rate.
 function postSystem() {
   const rates: Record<string, number> = {};
   for (const [key, value] of rateWindow.rates()) {
     rates[key] = value;
   }
+  postedSystemStale = systemStale(performance.now());
   updates.push({
     type: 'system',
     graph: system,
+    stale: postedSystemStale,
     rates,
     error: systemError,
     declared,
@@ -245,9 +257,11 @@ function ingestSystem(text: string) {
     system = graph;
     rateWindow.push(graph);
     systemError = '';
+    systemArrival = performance.now();
   } catch (e) {
     // One malformed document must not blank a working view. Keep the last good
-    // graph and say why the new one was refused.
+    // graph and say why the new one was refused. It is no evidence about what
+    // runs now, so the last good graph keeps ageing toward stale.
     systemError = String(e);
   }
   postSystem();
@@ -283,6 +297,7 @@ function reset() {
   system = null;
   previousSystem = null;
   rateWindow.reset();
+  systemArrival = null;
   systemError = '';
   declared = null;
   declaredError = '';
@@ -575,6 +590,9 @@ setInterval(() => {
   }
   coordinator.tick(BigInt(Math.max(0, Math.round((now - lastTick) * 1e6))));
   lastTick = now;
+  // A graph goes stale with time or a dropped socket, not only with a new
+  // document, so its freshness is re-judged every tick and posted on change.
+  if (systemStale(now) !== postedSystemStale) postSystem();
   postFrames();
   postPlayback(now);
   updates.flush();

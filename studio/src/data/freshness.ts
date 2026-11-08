@@ -1,4 +1,5 @@
-import type {PlaybackState} from './types';
+import type {SystemNode} from '../system';
+import type {PlaybackState, SystemState} from './types';
 
 // A sample exactly one second old is stale. Connection state never enters
 // this decision; paused/replay clocks are the playback cursor, not wall time.
@@ -15,4 +16,27 @@ export function sampleStale(sample_ns: string|null, clock_ns: string|null) {
 export function readingClock(
     playback: Pick<PlaybackState, 'clock_ns'|'cursor_ns'>): string|null {
   return playback.clock_ns === undefined ? playback.cursor_ns : playback.clock_ns;
+}
+
+// The bridge refreshes the system graph every 250 ms. Four missed refreshes
+// is not jitter: a graph this old, or one held while the socket is down, no
+// longer says what is running now.
+export const GRAPH_STALE_AFTER_MS = 1000;
+export function graphStale(received_ms: number|null, now_ms: number,
+                           connected: boolean): boolean {
+  return !connected || received_ms === null ||
+      now_ms - received_ms >= GRAPH_STALE_AFTER_MS;
+}
+
+// A node's liveness as far as a current graph can say. A stale graph's
+// `alive` is last-known evidence, not a claim about now: 'unknown'.
+export type Liveness = 'live'|'stopped'|'unknown';
+export function nodeLiveness(node: Pick<SystemNode, 'alive'>,
+                             system: Pick<SystemState, 'stale'>): Liveness {
+  return system.stale ? 'unknown' : node.alive ? 'live' : 'stopped';
+}
+// How many nodes are live, or null when the graph cannot say.
+export function liveNodeCount(system: Pick<SystemState, 'graph'|'stale'>): number|null {
+  return system.graph && !system.stale ?
+      system.graph.nodes.filter(n => n.alive).length : null;
 }

@@ -21,7 +21,7 @@ function snap(channels: Record<string, number>, labels: Record<string, string[]>
 
 const DS = 'hw/state/driver_station/';
 const noSystem: SystemState =
-    {graph: null, rates: {}, error: '', declared: null, declaredError: ''};
+    {graph: null, stale: true, rates: {}, error: '', declared: null, declaredError: ''};
 
 function node(name: string, alive: boolean): SystemNode {
   return {
@@ -107,7 +107,7 @@ test('robotStatus reads DS, power, link, estimator and nodes', () => {
     'pose_estimator/state/observation_rejected_count': 3
   }, {[DS + 'alliance']: ['red', 'blue']}), {
     graph: graph([node('a', true), node('b', false)]),
-    rates: {}, error: '', declared: null, declaredError: ''
+    stale: false, rates: {}, error: '', declared: null, declaredError: ''
   });
 
   assert.equal(status.ds.mode, 'teleop');
@@ -125,6 +125,14 @@ test('robotStatus reads DS, power, link, estimator and nodes', () => {
   assert.equal(status.link.timedOutMask, 0);
   assert.deepEqual(status.estimator, {valid: true, accepted: 42, rejected: 3});
   assert.deepEqual(status.nodes, {alive: 1, total: 2});
+});
+
+test('a stale graph keeps the node total but cannot count live nodes', () => {
+  const status = robotStatus(snap({}), {
+    graph: graph([node('a', true), node('b', false)]),
+    stale: true, rates: {}, error: '', declared: null, declaredError: ''
+  });
+  assert.deepEqual(status.nodes, {alive: null, total: 2});
 });
 
 test('alliance is null when the enum value is out of range', () => {

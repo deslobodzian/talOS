@@ -67,7 +67,10 @@ export function StatusStrip() {
       unknown={link.stateAge_us === null}
       value={link.stateAge_us === null ? '—' : duration(link.stateAge_us * 1e3)}/>
     <Item label="Nodes" unknown={nodes === null}
-          value={nodes === null ? '—' : `${nodes.alive}/${nodes.total}`}/>
+          tone={nodes !== null && nodes.alive === null ? 'warn' : undefined}
+          value={nodes === null ? '—' : nodes.alive === null ?
+              <>?/{nodes.total}<em className="text-warn"> · STALE</em></> :
+              `${nodes.alive}/${nodes.total}`}/>
     <Item label="Estimator"
           tone={estimator !== null && !estimator.valid ? 'warn' : undefined}
           unknown={estimator === null}

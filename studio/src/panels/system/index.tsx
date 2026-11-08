@@ -4,8 +4,10 @@
 import {useMemo, useState} from 'react';
 
 import {useSystem} from '../../data/hooks';
+import {liveNodeCount} from '../../data/freshness';
 import {endpointAttributesKnown} from '../../system';
 import {EmptyState} from '../../ui/primitives';
+import {GraphFreshnessNotice} from '../../ui/FreshnessNotice';
 import type {PanelDefinition} from '../types';
 import './system.css';
 import {DeclaredPanel} from './DeclaredPanel';
@@ -51,7 +53,10 @@ function SystemPanel() {
              placeholder="Filter nodes, targets, topics…" value={filter}
              onChange={e => setFilter(e.target.value)}/>
       <div className="system-counts">
-        <span>{graph.nodes.filter(n => n.alive).length}/{graph.nodes.length} nodes live</span>
+        <span className={system.stale ? 'text-warn' : undefined}>
+          {liveNodeCount(system) ?? '?'}/{graph.nodes.length} nodes live
+          {system.stale && ' · STALE'}
+        </span>
         {system.declared &&
          <span>{system.declared.nodes.length} declared</span>}
         <span>{graph.topics.length} topics</span>
@@ -68,6 +73,7 @@ function SystemPanel() {
          <span className="text-warn">{system.declaredError}</span>}
       </div>
     </div>
+    <GraphFreshnessNotice/>
 
     {system.declared &&
      <DeclaredPanel declared={system.declared} graph={graph}/>}
@@ -79,6 +85,7 @@ function SystemPanel() {
       <div className="node-grid">
         {nodes.map(node => <NodeCard key={node.name + node.generation}
                                      graph={graph} node={node}
+                                     stale={system.stale}
                                      rates={system.rates}
                                      selected={selected?.name === node.name}
                                      onSelect={() => setPicked(node.name)}/>)}
@@ -91,7 +98,8 @@ function SystemPanel() {
         <h2>Wiring{selected && <span className="handle"> · {selected.name}</span>}</h2>
         <span>PUBLISHERS AND SUBSCRIBERS</span>
       </div>
-      {selected ? <Wiring graph={graph} node={selected} rates={system.rates}/> :
+      {selected ? <Wiring graph={graph} node={selected} stale={system.stale}
+                          rates={system.rates}/> :
                   <EmptyState>Select a node.</EmptyState>}
     </section>
 

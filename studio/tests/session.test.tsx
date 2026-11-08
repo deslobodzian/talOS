@@ -122,7 +122,7 @@ test('mergeProcesses reads manifest-only rows', () => {
     mnode({name: 'b', pid: 2, exit_code: -1, restart_count: 3,
            recorder_failed: true})
   ]);
-  const rows = mergeProcesses(m, null, null, {});
+  const rows = mergeProcesses(m, null, null, {}, false);
   assert.equal(rows.length, 2);
 
   // Problems sort first, so 'b' leads.
@@ -157,7 +157,7 @@ test('mergeProcesses reads registry-only rows and measures rate/latency', () => 
     snode({name: 'gone', alive: false})
   ]);
   const rates = {'loop 0': 200, 'loop 1': 100};
-  const rows = mergeProcesses(null, g, null, rates);
+  const rows = mergeProcesses(null, g, null, rates, false);
   assert.equal(rows.length, 2);
   assert.equal(rows[0].name, 'gone');   // the problem sorts first
 
@@ -174,6 +174,16 @@ test('mergeProcesses reads registry-only rows and measures rate/latency', () => 
   assert.equal(gone.loopRate, null);
   assert.equal(gone.worstLatency, null);
   assert.deepEqual(gone.problems, ['dead']);
+
+  // A stale registry graph keeps who held a slot, but claims nobody is alive
+  // or dead now.
+  const stale = mergeProcesses(null, g, null, rates, true);
+  for (const row of stale) {
+    assert.equal(row.alive, null, `${row.name} liveness from a stale graph`);
+    assert.deepEqual(row.problems, []);
+  }
+  assert.equal(stale.find(r => r.name === 'loop')!.pid, '100');
+  assert.equal(summarize(stale).running, 0);
 });
 
 test('mergeProcesses joins manifest and registry by name', () => {
@@ -186,7 +196,7 @@ test('mergeProcesses joins manifest and registry by name', () => {
     snode({name: 'a', pid: '1', alive: false}),
     snode({name: 'c', pid: '3'})   // registry-only
   ]);
-  const rows = mergeProcesses(m, g, null, {});
+  const rows = mergeProcesses(m, g, null, {}, false);
   assert.equal(rows.length, 3);
 
   const a = rows.find(r => r.name === 'a')!;
@@ -214,7 +224,7 @@ test('mergeProcesses flags declared-but-never-registered and sorts it first',
          dnode('ok', '//2026:ok'),
          dnode('missing', '//2026:missing')
        ]);
-       const rows = mergeProcesses(m, g, d, {});
+       const rows = mergeProcesses(m, g, d, {}, false);
        assert.equal(rows.length, 2);
        assert.equal(rows[0].name, 'missing');
        assert.deepEqual(rows[0].problems, ['never_registered']);
@@ -228,7 +238,7 @@ test('never-registered is not claimed without a live registry', () => {
   // A declared graph with no registry to compare against cannot say "never
   // registered" — that is the same rule `declaredStatus` follows.
   const d = declared([dnode('missing', '//2026:missing')]);
-  const rows = mergeProcesses(null, null, d, {});
+  const rows = mergeProcesses(null, null, d, {}, false);
   assert.equal(rows.length, 1);
   assert.deepEqual(rows[0].problems, []);
 });
@@ -257,7 +267,7 @@ test('summarize counts running, total and restarts', () => {
     snode({name: 'b', alive: false}),
     snode({name: 'c', alive: true})
   ]);
-  const summary = summarize(mergeProcesses(m, g, null, {}));
+  const summary = summarize(mergeProcesses(m, g, null, {}, false));
   assert.equal(summary.total, 3);
   assert.equal(summary.running, 2);
   assert.equal(summary.restarts, 3);
