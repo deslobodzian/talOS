@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -623,7 +624,11 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
 
   struct Handler {
     std::uint64_t fired{0};
-    void OnTick(const event::Context&) { ++fired; }
+    std::function<void()> after_tick;
+    void OnTick(const event::Context&) {
+      ++fired;
+      if (after_tick) after_tick();
+    }
   } handler;
 
   auto timer =
@@ -654,21 +659,31 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
        .period = 20ms,
        .registry_path = path_}};
 
+  // Read the registry while the loop still runs: once it stops, the reporter
+  // releases the row, and a loaded host may get there before the test reads.
+  std::optional<std::vector<NodeSnapshot>> live;
+  handler.after_tick = [&] {
+    if (live || handler.fired < 20 || !reporter.published()) return;
+    auto reader = RegistryReader::open(path_);
+    if (!reader) return;
+    auto nodes = reader->nodes();
+    if (nodes.size() == 1 && nodes.front().dispatch_count > 0 &&
+        nodes.front().sources.size() == 3 &&
+        nodes.front().sources[0].events > 0) {
+      live = std::move(nodes);
+      loop.exit();
+    }
+  };
   timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
-  loop.run_for(220ms);
+  loop.run_for(5s);  // Bound only; exits as soon as a sample is visible.
 
   // Introspection must not appear in the manifest: it would change every
   // source id and make existing logs unreplayable.
   EXPECT_EQ(loop.manifest().size(), sources_before);
   ASSERT_TRUE(reporter.published()) << reporter.error();
   EXPECT_GT(handler.fired, 0u);
-
-  auto reader = RegistryReader::open(path_);
-  if (!reader.has_value()) {
-    FAIL() << "Expected registry reader";
-  }
-  const auto& registry = reader.value();
-  const auto nodes = registry.nodes();
+  ASSERT_TRUE(live) << "no registry sample while the loop ran";
+  const auto& nodes = *live;
   ASSERT_EQ(nodes.size(), 1u);
   const NodeSnapshot& node = nodes.front();
 
