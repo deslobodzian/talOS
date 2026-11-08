@@ -25,6 +25,18 @@ The launcher parses those manifests, assembles the graph they describe, and runs
 `naming::LintGraph` over it. Every finding is printed. If any of them is an
 error, nothing is spawned and the launcher exits non-zero.
 
+Subsystems default to `critical = true`. A failed probe (timeout, crash or
+import error) is fatal for a critical node. Set `[subsystem] critical = false`
+(inline: `[subsystems.<name>]`) only when the robot may run without that node.
+Its probe failure becomes a loud warning: the remaining graph starts and the
+node runs under normal restart supervision. The hardware bridge is always
+critical. A non-critical node owning motors, digital outputs or PWM outputs,
+or successfully describing a target-lane sender, is a graph error. Missing
+descriptions cannot prove a node's outputs, so unknown nodes fail closed;
+`critical = false` is an explicit deployment safety assertion, not inferred
+from a name. Naming and graph violations still refuse startup.
+`--describe-timeout-ms MS` sets each probe's deadline (default 15000 ms).
+
 **Phase two starts.** Only then does the launcher fork the roster and supervise
 it. It persists the session manifest before spawning and atomically replaces it
 as nodes start, restart, or exit; normal shutdown adds final log counts.
@@ -207,8 +219,10 @@ Studio.
 A roster member — `hardware_node`, every subsystem node, `sim_gateway` — that
 exits with a nonzero status or by a signal while the session is not stopping is
 restarted. The first restart waits 50 ms, each later one twice as long, capped
-at 1 s. Each node may restart at most `max_restarts` times within a rolling
-60-second window (not over the whole session):
+at 1 s. Critical nodes (including every actuator owner and the hardware bridge)
+never quarantine: they keep retrying with that capped backoff. Non-critical
+nodes may restart at most `max_restarts` times within a rolling 60-second
+window (not over the whole session):
 
 ```toml
 [robot]
@@ -225,7 +239,7 @@ one line:
 
     [launcher] alpha exited (signal 11); restart 1 in 50 ms
 
-When the rolling budget is exhausted, the node is **quarantined**, not
+When a non-critical node's rolling budget is exhausted, it is **quarantined**, not
 permanently abandoned. Exactly one retry is scheduled for the oldest restart
 plus the window and normal backoff. Quarantine and retry transitions are
 logged; the live manifest exposes `quarantined` and

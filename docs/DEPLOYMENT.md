@@ -91,6 +91,17 @@ run to use the same root, set `TALOS_LOG_DIR=/opt/talos/logs` or pass
 
 ## Supervision and service recovery
 
+Boot probes each node before spawning the graph. `[subsystem] critical = true`
+is the fail-closed default; failed probes refuse startup. Observation-only
+nodes may explicitly set `critical = false`: a timeout, crash or import failure
+then logs a warning without blocking the rest of the valid graph, and the
+node is launched under restart supervision. Motors, digital outputs, PWM
+outputs and described target-lane senders cannot be non-critical; the hardware
+bridge is always critical. Naming and graph errors remain fatal, so `run.sh`
+does not weaken the graph checks with `--allow-graph-errors`.
+`--describe-timeout-ms MS` adjusts the existing 15000 ms per-probe deadline
+and can be passed through `run.sh`.
+
 On Linux the launcher sends `READY=1` when the graph has started and enters
 supervision, then `WATCHDOG=1` on each supervision iteration (normally every
 20 ms). `WatchdogSec=3` leaves substantial scheduling and manifest-write
@@ -110,9 +121,11 @@ but has no `PR_SET_PDEATHSIG` or systemd watchdog: launchd's `KeepAlive`
 restarts an exited launcher, not a hung one. Nodes and helpers must remain in
 their assigned process group rather than daemonizing into another session.
 
-Exhausting a node's rolling restart budget quarantines it until the oldest
-restart ages out of the window, plus the normal backoff. Exactly one retry is
-pending, so clearing a transient fault can recover the node without a service
+Critical nodes never enter quarantine: crashes and heartbeat stalls retry with
+exponential backoff from 50 ms capped at 1 s, even after exhausting the rolling
+budget. Non-critical nodes retain the circuit breaker: exhausting their budget
+quarantines them until the oldest restart ages out, plus normal backoff.
+Exactly one retry is pending, so clearing a transient fault can recover without a service
 restart. The session manifest records `quarantined` and
 `retry_at_monotonic_ns`; a stopping session cancels pending retries.
 `max_restarts = 0` never restarts a node. Registry version 3

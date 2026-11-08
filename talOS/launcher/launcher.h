@@ -72,6 +72,8 @@ struct NodeSpec {
   std::string binary_path;
   // Forwarded unchanged to both --describe and runtime.
   std::vector<std::string> extra_args;
+  bool critical{true};
+  bool owns_actuators{false};
 };
 
 struct NodeProcessInfo {
@@ -391,7 +393,15 @@ inline std::vector<NodeSpec> DiscoverNodes(
     for (auto&& [key, value] : *subsystems) {
       if (const auto* table = value.as_table()) {
         if (auto node = (*table)["node"].value<std::string>()) {
-          specs.push_back(MakeNodeSpec(key.str(), *node, options));
+          auto spec = MakeNodeSpec(key.str(), *node, options);
+          spec.critical = (*table)["critical"].value_or(true);
+          if (const auto* devices =
+                  robot_config.GetDevices(std::string{key.str()})) {
+            spec.owns_actuators = !devices->motors.empty() ||
+                                  !devices->digital_outputs.empty() ||
+                                  !devices->pwm_outputs.empty();
+          }
+          specs.push_back(std::move(spec));
         }
       }
     }
@@ -436,8 +446,9 @@ inline uint16_t EffectiveStudioHttpPort(const config::RobotConfig& config,
 }
 
 // The launcher alone holds each lifetime pipe's writer. A tiny guardian in the
-// child's group kills the group on EOF, including when the launcher is SIGKILLed.
-// Descriptors are closed in other children and on exec; no node owns a writer.
+// child's group kills the group on EOF, including when the launcher is
+// SIGKILLed. Descriptors are closed in other children and on exec; no node owns
+// a writer.
 inline std::map<pid_t, int>& ProcessLifetimes() {
   static std::map<pid_t, int> lifetimes;
   return lifetimes;
@@ -671,11 +682,10 @@ inline naming::TargetModeSources TargetModeSourcesOf(
     const config::RobotConfig& robot_config) {
   naming::TargetModeSources sources;
   for (const auto& [subsystem, policy] : robot_config.subsystem_targets) {
-    sources.emplace(subsystem,
-                    naming::TargetModeSources::mapped_type{
-                        {"teleop", policy.teleop},
-                        {"autonomous", policy.autonomous},
-                        {"test", policy.test}});
+    sources.emplace(subsystem, naming::TargetModeSources::mapped_type{
+                                   {"teleop", policy.teleop},
+                                   {"autonomous", policy.autonomous},
+                                   {"test", policy.test}});
   }
   return sources;
 }
@@ -797,7 +807,21 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
   }
 
   std::vector<naming::NodeShape> shapes;
-  for (const auto& described : out) {
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    const auto& described = out[i];
+    const auto& spec = specs[i];
+    const bool writes_targets =
+        std::any_of(described.declared.sources.begin(),
+                    described.declared.sources.end(), [](const auto& source) {
+                      return source.kind == event::SourceKind::SENDER &&
+                             source.name.find("/target/") != std::string::npos;
+                    });
+    if (!spec.critical && (spec.owns_actuators || writes_targets)) {
+      probe_findings.push_back(
+          {naming::Severity::ERROR, described.roster_name,
+           "critical=false is forbidden for an actuator owner or target-lane "
+           "producer"});
+    }
     if (described.answered) {
       shapes.push_back({described.declared.name, described.declared.target,
                         described.declared.sources});
@@ -810,9 +834,15 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
       }
     } else {
       probe_findings.push_back(
-          {naming::Severity::ERROR, described.roster_name,
+          {spec.critical || spec.owns_actuators ? naming::Severity::ERROR
+                                                : naming::Severity::WARNING,
+           described.roster_name,
            "did not answer --describe (" + described.error +
-               "), so its topics are missing from the declared graph"});
+               "), so its topics are missing from the declared graph; " +
+               (spec.critical || spec.owns_actuators
+                    ? "critical node requires a successful probe"
+                    : "NON-CRITICAL NODE: launching under restart "
+                      "supervision")});
     }
   }
 
@@ -989,8 +1019,10 @@ inline std::string NodeLogPath(const std::string& output_dir,
   return path + ".tlog";
 }
 
-// Crashes remain retryable after a budget quarantine; zero disables all retries.
-inline bool ShouldRestartNode(bool clean_exit, int max_restarts, bool stopping) {
+// Crashes remain retryable after a budget quarantine; zero disables all
+// retries.
+inline bool ShouldRestartNode(bool clean_exit, int max_restarts,
+                              bool stopping) {
   return !clean_exit && !stopping && max_restarts > 0;
 }
 
@@ -1297,9 +1329,10 @@ class Launcher {
 
     // Phase one: describe and lint before anything starts.
     std::vector<NodeDescription> described;
-    auto diagnostics = DescribeGraph(
-        node_specs, options_, described, TargetSourcesOf(robot_config),
-        TargetModeSourcesOf(robot_config), robot_config.require_target_coverage);
+    auto diagnostics = DescribeGraph(node_specs, options_, described,
+                                     TargetSourcesOf(robot_config),
+                                     TargetModeSourcesOf(robot_config),
+                                     robot_config.require_target_coverage);
     for (auto& finding : LintParameterUnits(robot_config)) {
       diagnostics.push_back(std::move(finding));
     }
@@ -1390,6 +1423,7 @@ class Launcher {
     std::vector<NodeLaunch> launches(procs.size());
     for (std::size_t i = 0; i < procs.size(); ++i) {
       if (studio && i == studio->index()) continue;
+      launches[i].critical = node_specs[i].critical;
       auto& proc = procs[i];
       auto period_us =
           robot_config.toml_data["subsystems"][proc.name]["period_us"]
@@ -1551,6 +1585,7 @@ class Launcher {
     std::vector<std::string> args;
     std::size_t log_arg{0};  // Index of the --log value in args; 0 for none.
     bool restart_pending{false};
+    bool critical{true};
     std::chrono::steady_clock::time_point restart_at{};
     std::deque<std::chrono::steady_clock::time_point> restart_times;
     bool heartbeat_killed{false};
@@ -1766,7 +1801,7 @@ class Launcher {
         if (!is_bridge && ShouldRestartNode(clean, max_restarts_, stopping)) {
           const int recent = static_cast<int>(launch.restart_times.size());
           const auto backoff = RestartBackoff(recent + 1);
-          proc.quarantined = recent >= max_restarts_;
+          proc.quarantined = !launch.critical && recent >= max_restarts_;
           launch.restart_pending = true;
           launch.restart_at =
               (proc.quarantined
@@ -1778,13 +1813,14 @@ class Launcher {
               std::chrono::duration_cast<std::chrono::nanoseconds>(
                   launch.restart_at.time_since_epoch())
                   .count();
-          const auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
-              launch.restart_at - now);
+          const auto delay =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  launch.restart_at - now);
           std::cout << "[launcher] " << proc.name << " exited ("
                     << ExitReason(status) << "); "
                     << (proc.quarantined ? "quarantined; retry" : "restart")
-                    << " " << proc.restart_count + 1 << " in "
-                    << delay.count() << " ms\n";
+                    << " " << proc.restart_count + 1 << " in " << delay.count()
+                    << " ms\n";
           PersistManifest(procs);
           continue;
         }
@@ -1843,12 +1879,14 @@ class Launcher {
         shutdown_deadline = now + std::chrono::seconds{2};
         std::cout << "[launcher] Stopping children...\n";
         for (const auto& proc : procs) {
-          if (proc.pid > 0 && !proc.exited) SignalProcessGroup(proc.pid, SIGINT);
+          if (proc.pid > 0 && !proc.exited)
+            SignalProcessGroup(proc.pid, SIGINT);
         }
       }
       if (stop_sent && now >= shutdown_deadline) {
         for (const auto& proc : procs) {
-          if (proc.pid > 0 && !proc.exited) SignalProcessGroup(proc.pid, SIGKILL);
+          if (proc.pid > 0 && !proc.exited)
+            SignalProcessGroup(proc.pid, SIGKILL);
         }
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(20));

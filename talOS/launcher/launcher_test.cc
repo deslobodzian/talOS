@@ -383,8 +383,8 @@ introspect::naming::SourceShape Watcher(std::string topic,
 std::string ReadFile(const std::string& path);
 
 TEST(LauncherTest, DescribeDeadlineAppliesAfterStdoutCloses) {
-  const auto binary = WriteStubNode(
-      "describe_closed_stdout", "#!/bin/sh\nexec 1>&-\nexec sleep 30\n");
+  const auto binary = WriteStubNode("describe_closed_stdout",
+                                    "#!/bin/sh\nexec 1>&-\nexec sleep 30\n");
   introspect::Description description;
   std::string error;
   const auto started = std::chrono::steady_clock::now();
@@ -459,10 +459,9 @@ TEST(LauncherTest, FailingBridgeRetriesInLoopWithoutBlockingSession) {
   options.start_studio_bridge = true;
   options.describe_timeout_ms = 4000;
   options.config_path = WriteFixtureToml();
-  options.binary_overrides["//talOS/bridge:hardware_node"] =
-      WriteStubNode(tag + "_hardware",
-                    DescribingStub("hardware_node",
-                                   "//talOS/bridge:hardware_node", {}));
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      tag + "_hardware",
+      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
   options.binary_overrides["//example/alpha:node"] = WriteStubNode(
       tag + "_alpha", NodeDescribeThenSleep("alpha", "//example/alpha:node",
                                             {Sender("/alpha/state")}, 3));
@@ -516,10 +515,9 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   options.describe_timeout_ms = 4000;
   options.duration_s = 2;
   options.config_path = WriteFixtureToml();
-  options.binary_overrides["//talOS/bridge:hardware_node"] =
-      WriteStubNode(tag + "_hardware",
-                    DescribingStub("hardware_node",
-                                   "//talOS/bridge:hardware_node", {}));
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      tag + "_hardware",
+      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
   options.binary_overrides["//example/alpha:node"] = WriteStubNode(
       tag + "_alpha", NodeDescribeThenSleep("alpha", "//example/alpha:node",
                                             {Sender("/alpha/state")}, 30));
@@ -554,18 +552,16 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
   options.describe_timeout_ms = 4000;
   options.duration_s = 1;
   options.config_path = WriteFixtureToml();
-  options.binary_overrides["//talOS/bridge:hardware_node"] =
-      WriteStubNode(tag + "_hardware",
-                    DescribingStub("hardware_node",
-                                   "//talOS/bridge:hardware_node", {}));
-  auto stubborn = NodeDescribeThenSleep(
-      "alpha", "//example/alpha:node", {Sender("/alpha/state")}, 30);
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      tag + "_hardware",
+      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
+  auto stubborn = NodeDescribeThenSleep("alpha", "//example/alpha:node",
+                                        {Sender("/alpha/state")}, 30);
   stubborn.insert(stubborn.find("exec sleep"), "trap '' INT\n");
   const auto alpha = WriteStubNode(tag + "_alpha", stubborn);
   const auto beta = WriteStubNode(
-      tag + "_beta",
-      NodeDescribeThenSleep("beta", "//example/beta:node",
-                            {Watcher("/alpha/state")}, 30));
+      tag + "_beta", NodeDescribeThenSleep("beta", "//example/beta:node",
+                                           {Watcher("/alpha/state")}, 30));
   options.binary_overrides["//example/alpha:node"] = alpha;
   options.binary_overrides["//example/beta:node"] = beta;
   const auto started = std::chrono::steady_clock::now();
@@ -594,10 +590,9 @@ TEST(LauncherTest, StableBridgeJoinsSessionUntilDeadline) {
   options.describe_timeout_ms = 4000;
   options.duration_s = 3;
   options.config_path = WriteFixtureToml();
-  options.binary_overrides["//talOS/bridge:hardware_node"] =
-      WriteStubNode(tag + "_hardware",
-                    DescribingStub("hardware_node",
-                                   "//talOS/bridge:hardware_node", {}));
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      tag + "_hardware",
+      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
   options.binary_overrides["//example/alpha:node"] = WriteStubNode(
       tag + "_alpha", NodeDescribeThenSleep("alpha", "//example/alpha:node",
                                             {Sender("/alpha/state")}, 30));
@@ -729,7 +724,8 @@ TEST(LauncherTest, SessionManifestJsonFormatting) {
       << json;
   EXPECT_NE(json.find("\"restart_count\": 1"), std::string::npos) << json;
   EXPECT_NE(json.find("\"quarantined\": true"), std::string::npos) << json;
-  EXPECT_NE(json.find("\"retry_at_monotonic_ns\": 123456789"), std::string::npos)
+  EXPECT_NE(json.find("\"retry_at_monotonic_ns\": 123456789"),
+            std::string::npos)
       << json;
 }
 
@@ -937,10 +933,9 @@ struct GraphFixture {
     out_dir += "/" + std::to_string(options.session_id);
     options.config_path = WriteFixtureToml();
     options.describe_timeout_ms = 4000;
-    options.binary_overrides["//talOS/bridge:hardware_node"] =
-        WriteStubNode(std::string{tag} + "_hardware",
-                      DescribingStub("hardware_node",
-                                     "//talOS/bridge:hardware_node", {}));
+    options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+        std::string{tag} + "_hardware",
+        DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
     options.binary_overrides["//example/alpha:node"] =
         WriteStubNode(std::string{tag} + "_alpha", alpha_script);
     options.binary_overrides["//example/beta:node"] =
@@ -1060,6 +1055,82 @@ TEST(LauncherGraphTest, ANodeThatHangsOnDescribeDoesNotHangTheLaunch) {
   EXPECT_NE(fixture.graph_json().find("no answer within 250ms"),
             std::string::npos)
       << fixture.graph_json();
+}
+
+TEST(LauncherGraphTest, NonCriticalTargetProducerIsAnError) {
+  GraphFixture fixture{"optional_target",
+                       DescribingStub("alpha", "//example/alpha:node",
+                                      {Sender("/beta/target/teleop")}),
+                       DescribingStub("beta", "//example/beta:node",
+                                      {Watcher("/beta/target/teleop")})};
+  auto specs = DiscoverNodes(
+      config::ParseRobotConfig(fixture.options.config_path), fixture.options);
+  for (auto& spec : specs) {
+    if (spec.name == "alpha") {
+      spec.critical = false;
+      spec.owns_actuators = false;
+    }
+  }
+  std::vector<NodeDescription> described;
+  EXPECT_TRUE(naming::HasError(DescribeGraph(specs, fixture.options, described,
+                                             {{"beta", {"teleop"}}})));
+}
+
+TEST(LauncherGraphTest,
+     NonCriticalActuatorOwnersAreErrorsAfterSuccessfulProbe) {
+  GraphFixture fixture{"optional_actuator",
+                       DescribingStub("alpha", "//example/alpha:node", {}),
+                       DescribingStub("beta", "//example/beta:node", {})};
+  for (const auto* section : {"motors", "digital_outputs", "pwm_outputs"}) {
+    auto config = toml::parse_file(fixture.options.config_path);
+    auto* alpha = config["subsystems"]["alpha"].as_table();
+    alpha->erase("motors");
+    alpha->insert_or_assign("critical", false);
+    toml::table device;
+    device.insert(section == std::string_view{"motors"}            ? "can_id"
+                  : section == std::string_view{"digital_outputs"} ? "dio"
+                                                                   : "channel",
+                  1);
+    alpha->insert_or_assign(section,
+                            toml::table{{"output", std::move(device)}});
+    const auto parsed = config::ParseRobotConfigTable(std::move(config));
+    std::vector<NodeDescription> described;
+    EXPECT_TRUE(naming::HasError(DescribeGraph(
+        DiscoverNodes(parsed, fixture.options), fixture.options, described)))
+        << section;
+    ASSERT_TRUE(described.at(1).answered);
+  }
+}
+
+TEST(LauncherGraphTest, NonCriticalDescribeTimeoutAllowsPeersToLaunch) {
+  GraphFixture fixture{
+      "optional_timeout", kStubThatHangsOnDescribe,
+      DescribingStub("beta", "//example/beta:node", {Sender("/beta/state")})};
+  auto config = toml::parse_file(fixture.options.config_path);
+  auto* alpha = config["subsystems"]["alpha"].as_table();
+  alpha->erase("motors");
+  alpha->insert_or_assign("critical", false);
+  std::ofstream{fixture.options.config_path} << config;
+  fixture.options.describe_timeout_ms = 100;
+  fixture.options.max_restarts = 0;
+  EXPECT_EQ(Launcher{fixture.options}.Run(), 0);
+  EXPECT_TRUE(fixture.has_manifest());
+  EXPECT_EQ(fixture.graph_json().find("\"severity\": \"error\""),
+            std::string::npos);
+}
+
+TEST(LauncherGraphTest, NonCriticalDoesNotRelaxNamingRules) {
+  GraphFixture fixture{"optional_invalid",
+                       DescribingStub("alpha", "//example/alpha:node",
+                                      {Sender("/invalid/topic")}),
+                       DescribingStub("beta", "//example/beta:node", {})};
+  auto config = toml::parse_file(fixture.options.config_path);
+  auto* alpha = config["subsystems"]["alpha"].as_table();
+  alpha->erase("motors");
+  alpha->insert_or_assign("critical", false);
+  std::ofstream{fixture.options.config_path} << config;
+  EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+  EXPECT_FALSE(fixture.has_manifest());
 }
 
 TEST(LauncherGraphTest, DescribeOnlyLintsWithoutStartingAnything) {
@@ -1345,7 +1416,9 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   EXPECT_EQ(options.bundle_config_sha256, "abc123");
 
   // A manifest that is not TOML is an error, not a silently empty bundle.
-  { std::ofstream{bundle_dir + "/bundle_manifest.toml"} << "nodes = [\n"; }
+  {
+    std::ofstream{bundle_dir + "/bundle_manifest.toml"} << "nodes = [\n";
+  }
   LauncherOptions broken;
   broken.bundle_dir = bundle_dir;
   EXPECT_FALSE(LoadBundle(broken, error));
@@ -1457,12 +1530,12 @@ LauncherOptions SessionFixture(std::string_view tag) {
   options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
       std::string{tag} + "_hardware",
       DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
-  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
-      std::string{tag} + "_alpha",
-      DescribingStub("alpha", "//example/alpha:node", {}));
-  options.binary_overrides["//example/beta:node"] = WriteStubNode(
-      std::string{tag} + "_beta",
-      DescribingStub("beta", "//example/beta:node", {}));
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStubNode(std::string{tag} + "_alpha",
+                    DescribingStub("alpha", "//example/alpha:node", {}));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStubNode(std::string{tag} + "_beta",
+                    DescribingStub("beta", "//example/beta:node", {}));
   return options;
 }
 

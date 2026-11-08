@@ -4,6 +4,8 @@
 [subsystem]
 name = "pose_estimator"
 node = "//2026-robot/main_processor/pose_estimator:node"
+# Observation-only: the robot may run without this node.
+critical = false
 period_us = 20000
 # "kalman" (wpimath SwerveDrive4PoseEstimator) or "factor_graph" (GTSAM
 # fixed-lag smoother); [kalman] / [factor_graph] below tune each.

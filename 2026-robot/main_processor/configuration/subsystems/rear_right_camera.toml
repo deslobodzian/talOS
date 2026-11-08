@@ -1,6 +1,8 @@
 [subsystem]
 name = "rear_right_camera"
 node = "//2026-robot/main_processor/vision:rear_right_camera"
+# Observation-only: the robot may run without this node.
+critical = false
 defaults = "vision.toml"
 
 [camera]

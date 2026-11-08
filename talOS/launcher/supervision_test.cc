@@ -82,8 +82,7 @@ std::string WriteStub(std::string_view tag, std::string_view body,
       << "  if [ \"$arg\" = \"--describe\" ]; then\n";
   if (answers_describe) {
     out << "    cat <<'TALOS_DESCRIBE'\n"
-        << introspect::DescribeToJson(description)
-        << "TALOS_DESCRIBE\n"
+        << introspect::DescribeToJson(description) << "TALOS_DESCRIBE\n"
         << "    exit 0\n";
   } else {
     out << "    exit 1\n";
@@ -112,6 +111,14 @@ LauncherOptions BaseOptions(std::string_view tag,
   options.binary_overrides["//talOS/bridge:hardware_node"] =
       WriteStub(std::string{tag} + "_hardware", "exit 0\n", "hardware_node");
   return options;
+}
+
+void MakeAlphaNonCritical(const LauncherOptions& options) {
+  auto config = toml::parse_file(options.config_path);
+  auto* alpha = config["subsystems"]["alpha"].as_table();
+  alpha->erase("motors");
+  alpha->insert_or_assign("critical", false);
+  std::ofstream{options.config_path} << config;
 }
 
 int RunSession(LauncherOptions& options) {
@@ -147,6 +154,76 @@ std::string ManifestEntry(const std::string& manifest, std::string_view name) {
       manifest.find("\"name\": \"" + std::string{name} + "\"");
   if (start == std::string::npos) return {};
   return manifest.substr(start, manifest.find('}', start) - start);
+}
+
+TEST(Supervision,
+     NonCriticalDescribeFailureWarnsAndRestartsWithoutBlockingPeers) {
+  auto options = BaseOptions("optional_probe");
+  MakeAlphaNonCritical(options);
+  const auto runs = TempPath("optional_probe_runs");
+  ::remove(runs.c_str());
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "optional_alpha",
+      RecordLogArgThen(runs,
+                       "case \"$log\" in *restart1.tlog) exit 0;; esac\n"
+                       "exit 3\n"),
+      "alpha", false);
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("optional_beta", "exit 0\n");
+  const auto config = config::ParseRobotConfig(options.config_path);
+  std::vector<NodeDescription> described;
+  const auto findings =
+      DescribeGraph(DiscoverNodes(config, options), options, described);
+  EXPECT_FALSE(naming::HasError(findings));
+  EXPECT_TRUE(std::any_of(findings.begin(), findings.end(), [](const auto& d) {
+    return d.subject == "alpha" && d.severity == naming::Severity::WARNING;
+  }));
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_EQ(ReadLines(runs).size(), 2u);
+  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
+  EXPECT_NE(ManifestEntry(manifest, "beta").find("\"exit_code\": 0"),
+            std::string::npos);
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
+TEST(Supervision, ActuatorDescribeFailureRefusesEvenWhenMarkedNonCritical) {
+  auto options = BaseOptions("actuator_probe");
+  auto config = toml::parse_file(options.config_path);
+  config["subsystems"]["alpha"].as_table()->insert_or_assign("critical", false);
+  std::ofstream{options.config_path} << config;
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("actuator_alpha", "exit 0\n", "alpha", false);
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("actuator_beta", "exit 0\n");
+  EXPECT_EQ(RunSession(options), 1);
+  EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/manifest.json"));
+  std::filesystem::remove_all(options.output_dir);
+}
+
+TEST(Supervision, CriticalCrashLoopExceedsBudgetWithBackoffCappedAtOneSecond) {
+  auto options = BaseOptions("critical_loop", "max_restarts = 1\n");
+  options.duration_s = 6;
+  const auto runs = TempPath("critical_loop_runs");
+  ::remove(runs.c_str());
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "critical_loop_alpha",
+      RecordLogArgThen(runs,
+                       "case \"$log\" in *restart6.tlog) exit 0;; esac\n"
+                       "exit 3\n"));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("critical_loop_beta", "exit 0\n");
+  const auto started = std::chrono::steady_clock::now();
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_EQ(ReadLines(runs).size(), 7u);
+  EXPECT_LT(std::chrono::steady_clock::now() - started,
+            std::chrono::seconds{5});
+  for (int restart = 1; restart <= 100; ++restart) {
+    EXPECT_LE(RestartBackoff(restart), std::chrono::milliseconds{1000});
+  }
+  EXPECT_EQ(RestartBackoff(6), std::chrono::milliseconds{1000});
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
 }
 
 TEST(Supervision, MissingConfigFailsFastWithClearError) {
@@ -214,6 +291,7 @@ TEST(Supervision, CriticalFailurePropagatesExitCode) {
 // tight loop. Stopping the session cancels its one pending retry.
 TEST(Supervision, CrashingNodeQuarantinesUntilTheSessionStops) {
   LauncherOptions options = BaseOptions("restart_out", "max_restarts = 2\n");
+  MakeAlphaNonCritical(options);
   options.duration_s = 1;
   const std::string alpha_runs = TempPath("restart_alpha_runs");
   const std::string beta_runs = TempPath("restart_beta_runs");
@@ -295,6 +373,7 @@ TEST(Supervision, NegativeMaxRestartsRefusesToLaunch) {
 
 TEST(Supervision, RestartsOutsideRollingWindowDoNotExhaustBudget) {
   auto options = BaseOptions("window_out", "max_restarts = 1\n");
+  MakeAlphaNonCritical(options);
   options.restart_window_ms = 100;
   const auto runs = TempPath("window_runs");
   ::remove(runs.c_str());
@@ -313,23 +392,25 @@ TEST(Supervision, RestartsOutsideRollingWindowDoNotExhaustBudget) {
 
 TEST(Supervision, ExhaustedBudgetRetriesOnceAfterTheWindowAndRecovers) {
   auto options = BaseOptions("quarantine_out", "max_restarts = 1\n");
+  MakeAlphaNonCritical(options);
   options.restart_window_ms = 300;
   options.duration_s = 2;
   const auto runs = TempPath("quarantine_runs");
   const auto cleared = TempPath("quarantine_cleared");
   ::remove(runs.c_str());
   ::remove(cleared.c_str());
-  options.binary_overrides["//example/alpha:node"] = WriteStub(
-      "quarantine_alpha",
-      RecordLogArgThen(runs, "if [ -f " + cleared +
-                                 " ]; then exit 0; fi\nexit 3\n"));
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("quarantine_alpha",
+                RecordLogArgThen(runs, "if [ -f " + cleared +
+                                           " ]; then exit 0; fi\nexit 3\n"));
   options.binary_overrides["//example/beta:node"] =
       WriteStub("quarantine_beta", "exit 0\n");
   std::string quarantined;
   std::size_t runs_at_quarantine = 0;
   int64_t retry_at = 0;
   int64_t recovered_at = 0;
-  // RunSession rewrites options.output_dir on return; don't read it concurrently.
+  // RunSession rewrites options.output_dir on return; don't read it
+  // concurrently.
   const auto manifest = options.output_dir + "/" +
                         std::to_string(options.session_id) + "/manifest.json";
   std::jthread observer{[&](const std::stop_token& stop) {
@@ -389,9 +470,8 @@ TEST(Supervision, StalledNodeGroupKillStopsItsHelper) {
   ASSERT_EQ(::pipe(lifetime), 0);
   // The helper inherits this writer across exec. EOF proves it stopped, even
   // on hosts where an orphaned helper briefly remains as a zombie.
-  options.binary_overrides["//example/alpha:node"] =
-      WriteStub("helper_alpha",
-                "sleep 30 &\necho $! > " + helper_pid + "\nwait\n");
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "helper_alpha", "sleep 30 &\necho $! > " + helper_pid + "\nwait\n");
   options.binary_overrides["//example/beta:node"] =
       WriteStub("helper_beta", "exit 0\n");
   EXPECT_NE(RunSession(options), 0);
@@ -522,8 +602,9 @@ TEST(Supervision, NotifierSupportsAbstractSocketNames) {
   if (received > 0) size = ::recv(socket, buffer, sizeof(buffer), 0);
   int status = 0;
   ::waitpid(child, &status, 0);
-  EXPECT_EQ(std::string(buffer, static_cast<std::size_t>(std::max<ssize_t>(size, 0))),
-            "WATCHDOG=1");
+  EXPECT_EQ(
+      std::string(buffer, static_cast<std::size_t>(std::max<ssize_t>(size, 0))),
+      "WATCHDOG=1");
   ::close(socket);
 }
 #endif
@@ -604,10 +685,9 @@ TEST(Supervision, NeverRegisteredNodeIsKilledAndRestarted) {
   options.binary_overrides["//example/beta:node"] =
       WriteStub("unregistered_beta", "exit 0\n");
   EXPECT_EQ(RunSession(options), 0);
-  EXPECT_EQ(ReadLines(runs),
-            (std::vector<std::string>{options.output_dir + "/alpha.tlog",
-                                      options.output_dir +
-                                          "/alpha.restart1.tlog"}));
+  EXPECT_EQ(ReadLines(runs), (std::vector<std::string>{
+                                 options.output_dir + "/alpha.tlog",
+                                 options.output_dir + "/alpha.restart1.tlog"}));
   const auto alpha =
       ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
   EXPECT_NE(alpha.find("\"restart_count\": 1"), std::string::npos) << alpha;
@@ -650,18 +730,16 @@ TEST(Supervision, SimGatewayDoesNotRequireFrameworkRegistration) {
   options.duration_s = 3;
   const auto runs = TempPath("gateway_runs");
   ::remove(runs.c_str());
-  options.binary_overrides["//example/sim_gateway:node"] =
-      WriteStub("gateway", "echo run >> " + runs + "\nexec sleep 1\n",
-                "sim_gateway");
+  options.binary_overrides["//example/sim_gateway:node"] = WriteStub(
+      "gateway", "echo run >> " + runs + "\nexec sleep 1\n", "sim_gateway");
   options.binary_overrides["//example/alpha:node"] =
       WriteStub("gateway_alpha", "exit 0\n");
   options.binary_overrides["//example/beta:node"] =
       WriteStub("gateway_beta", "exit 0\n");
   EXPECT_EQ(RunSession(options), 0);
   EXPECT_EQ(ReadLines(runs).size(), 1u);
-  const auto gateway =
-      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"),
-                    "sim_gateway");
+  const auto gateway = ManifestEntry(
+      ReadFile(options.output_dir + "/manifest.json"), "sim_gateway");
   EXPECT_NE(gateway.find("\"described\": true"), std::string::npos) << gateway;
   EXPECT_NE(gateway.find("\"restart_count\": 0"), std::string::npos) << gateway;
   std::filesystem::remove_all(options.output_dir);

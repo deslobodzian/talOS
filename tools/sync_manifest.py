@@ -441,6 +441,9 @@ def effective(root, config, overrides=None, available=None):
             raise ManifestError(f"[subsystems.{name}] must be a table")
         if "node" in table:
             _non_empty(table, "node", f"[subsystems.{name}]")
+        if "critical" in table and not isinstance(table["critical"], bool):
+            raise ManifestError(
+                f"[subsystems.{name}] field 'critical' must be a boolean")
         if "teleop" in table:
             _check_teleop(table["teleop"], name)
         _check_devices(table, f"{config}: [subsystems.{name}]")

@@ -758,6 +758,8 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
       detail::ReadNonEmpty(*sub_tbl, "node", "",
                            ("[subsystems." + sub_name + "]").c_str());
     }
+    // Fail closed: unknown nodes are required for safe robot operation.
+    detail::Read<bool>(*sub_tbl, "critical", true);
     TargetPolicy& policy = result.subsystem_targets[sub_name] = result.targets;
     if (sub_tbl->contains("targets")) {
       const auto* targets = (*sub_tbl)["targets"].as_table();

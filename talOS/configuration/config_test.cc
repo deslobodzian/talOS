@@ -25,17 +25,30 @@ void ExpectRejected(std::string_view body) {
   EXPECT_THROW(Parse(body), std::invalid_argument) << body;
 }
 
+TEST(ConfigTest, CriticalIsAnOptionalBoolean) {
+  for (const auto value : {"false", "true"}) {
+    EXPECT_NO_THROW(
+        ParseRobotConfigString(std::string{"[subsystems.test]\ncritical = "} +
+                               value + std::string{kMotor}));
+  }
+  for (const auto value : {"0", "\"false\"", "[]", "{}"}) {
+    EXPECT_THROW(
+        ParseRobotConfigString(std::string{"[subsystems.test]\ncritical = "} +
+                               value + std::string{kMotor}),
+        std::invalid_argument);
+  }
+}
+
 TEST(ConfigTest, RejectsMalformedStructuralTablesAndUnknownMotorKeys) {
-  for (const auto* text : {
-           "robot = 1\n[subsystems.test]\n",
-           "[subsystems]\ntest = 1\n"}) {
+  for (const auto* text :
+       {"robot = 1\n[subsystems.test]\n", "[subsystems]\ntest = 1\n"}) {
     EXPECT_THROW(ParseRobotConfigString(text), std::invalid_argument);
   }
-  for (const auto* section : {"motors", "sensors", "digital_inputs",
-                              "digital_outputs", "analog_inputs", "encoders",
-                              "pwm_outputs"}) {
-    EXPECT_THROW(ParseRobotConfigString(
-                     std::string("[subsystems.test]\n") + section + " = 1\n"),
+  for (const auto* section :
+       {"motors", "sensors", "digital_inputs", "digital_outputs",
+        "analog_inputs", "encoders", "pwm_outputs"}) {
+    EXPECT_THROW(ParseRobotConfigString(std::string("[subsystems.test]\n") +
+                                        section + " = 1\n"),
                  std::invalid_argument);
   }
   ExpectRejected("canid = 2\n");
@@ -382,8 +395,7 @@ TEST_F(ManifestTest, UnknownDeviceKeyNamesSourceFileDeviceAndKey) {
   Write("subsystems/test.toml",
         "[subsystem]\nname = \"test\"\ndefaults = \"defaults.toml\"\n"
         "[sensors.encoder]\ncan_id = 2\n");
-  Write("subsystems/defaults.toml",
-        "[sensors.encoder]\noffest_rot = 0.25\n");
+  Write("subsystems/defaults.toml", "[sensors.encoder]\noffest_rot = 0.25\n");
   try {
     (void)ParseRobotConfig(Robot());
     FAIL() << "unknown sensor key was accepted";
@@ -687,7 +699,8 @@ defaults = "subsystems/mech_defaults.toml"
 TEST(ConfigTest, ParsesTeleopDefaultsWithAssignmentScalarTypes) {
   const auto cfg = Parse(
       "[subsystems.test.teleop]\n"
-      "defaults = { position_rot = 0.25, mode = 'HOLD', enabled = false, count = 2 }\n");
+      "defaults = { position_rot = 0.25, mode = 'HOLD', enabled = false, count "
+      "= 2 }\n");
   const auto& defaults = cfg.teleop_defaults.at("test");
   ASSERT_EQ(defaults.size(), 4u);
   EXPECT_EQ(defaults[0].first, "count");
@@ -782,7 +795,8 @@ TEST(ConfigTest, SharedResolutionCases) {
         (void)ParseRobotConfig(path);
         FAIL() << "invalid config was accepted";
       } catch (const std::invalid_argument& error) {
-        if (const auto expected = expect["error_contains"].value<std::string>()) {
+        if (const auto expected =
+                expect["error_contains"].value<std::string>()) {
           EXPECT_NE(std::string(error.what()).find(*expected),
                     std::string::npos)
               << error.what();

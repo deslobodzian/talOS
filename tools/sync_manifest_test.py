@@ -137,6 +137,22 @@ class SyncManifestTest(unittest.TestCase):
         self.assertEqual(sync_manifest.resolve(self.root, "bot/flat.toml"),
                          (["//a:node"], []))
 
+    def test_critical_is_an_optional_boolean(self):
+        for value in ("true", "false"):
+            with self.subTest(value=value):
+                subs, _ = sync_manifest.effective(
+                    self.root, "critical.toml",
+                    overrides={"critical.toml":
+                               f"[subsystems.arm]\ncritical = {value}\n"})
+                self.assertIs(subs["arm"]["critical"], value == "true")
+        for value in ("0", "1", '"false"', "[]", "{}"):
+            with self.subTest(value=value):
+                with self.assertRaises(sync_manifest.ManifestError):
+                    sync_manifest.effective(
+                        self.root, "critical.toml",
+                        overrides={"critical.toml":
+                                   f"[subsystems.arm]\ncritical = {value}\n"})
+
     def test_target_coverage_key_accepts_only_booleans(self):
         for value in ("true", "false"):
             with self.subTest(value=value):

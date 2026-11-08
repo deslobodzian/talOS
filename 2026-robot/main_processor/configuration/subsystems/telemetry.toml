@@ -3,6 +3,8 @@
 [subsystem]
 name = "telemetry"
 node = "//talOS/telemetry:node"
+# Observation-only: the robot may run without this node.
+critical = false
 period_us = 10000
 # Leave room below the 1200-byte value-frame cap by dropping cumulative
 # camera counters; retain health, timing, drops and visible-tag diagnostics.
