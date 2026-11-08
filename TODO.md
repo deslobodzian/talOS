@@ -10,7 +10,7 @@ valid" promised more than the code guaranteed. Each fix below is one commit on
 the branch; `git log` carries the Problem/Fix/Why. Deferred items keep the
 reason they were deferred so the next pass can pick them up.
 
-Re-rated 6.5/10 after the readiness pass (committed state: clean-worktree `bazel test //...` 134/135; the one failure, a timing-flaky vision test, fixed in `bd9e45a`): Red-alliance driving, auto selection, feed interlock and camera recovery are fixed, but the two gateway blockers below (one CAN device failing configure, or resetting, stops the whole robot) cap readiness until they land.
+Re-rated 7.5/10 after the readiness pass. Every match-losing gap the audit found in software is fixed and tested in simulation: one CAN device failing configure or resetting now costs only its mechanism, the drivetrain drives on three modules, odometry survives device reboots, optional nodes cannot block boot, Red-alliance driving is correct, autonomous is selectable at the field, feeding is interlocked to a ready shooter. Verified: default `bazel test //...` 139/139, `--config=asan` and `--config=tsan` 122/122 each, `./gradlew phoenixTest buildRio`, describe-only on all three 2026 configs. What keeps it below 9 is unmeasured hardware: CAN bus load, CAN ids/offsets, real-link timing and fault injection, camera calibration ("On the robot" below).
 
 Landed in the competition-readiness pass (2026-11-07; `git log` has each Problem/Fix/Why):
 
@@ -21,14 +21,11 @@ Landed in the competition-readiness pass (2026-11-07; `git log` has each Problem
 - [x] **Simulated transport fidelity** (`73c5c88`): RTMS-sized rings and drop accounting; `Sim::pause/resume` (C++, C ABI, Python). Dispatch is still serial.
 - [x] **Studio trust** (`d06ba4a`): per-sample staleness, worker failure surfaced, bounded updates, fault set vs clear.
 - [x] **Driver frame** (`e770ae2`): driver-relative heading on both alliances (Red flip removed), robot-relative fallback after neutral on heading loss.
-
-In progress (partial edits in the working tree, uncommitted; implementation paused when the subagent model's quota ran out):
-
-- [ ] **Gateway device isolation** (audit blockers): one CAN device failing configure leaves the whole robot unconfigured and the RIO loop re-runs a blocking full `Configure` every 50 ms push; one device reset rejects every command until all devices restore; RIO gateway socket open is never retried. Also lower telemetry-only Phoenix signal rates. Tree state: `Backend::BeginRestoreAfterReset` signature changed in `gateway.h` but not in backends/tests (does not compile).
-- [ ] **Drivetrain degrade** (audit): module liveness ignores its CANcoder (drive motor keeps pushing at a stuck angle); one dead module immobilizes the robot; drive-motor/Pigeon reset makes odometry jump. Tree state: implementation and README present, regression tests incomplete.
-- [ ] **Shooter readiness hysteresis** (audit): `at_speed` ±2 rps with no hysteresis and against the unclamped goal; a shot dip stops the feed. Tree state: implemented, `shooter.h` does not compile (missing `RobotConfig` include/dep).
-- [ ] **Launcher boot resilience** (audit): a non-actuating node failing `--describe` blocks the whole robot at boot; actuator nodes and the bridge can be quarantined up to the restart window. Design: `[subsystem] critical = false` (annotated on cameras, pose_estimator, telemetry). Tree state: parser test and `supervision_test.cc` fail.
-- [ ] **Sanitizers and fuzzing in CI.** `--config=asan/tsan`, seeded decoder mutation tests and CI jobs are in the tree. ASan found a null `memcpy` in `talOS/events/log/log_test.cc:123`, UB in third-party `apriltag` `pjpeg.c:597`, and `config_fuzz_test` aborts in toml++ `parse_key` on malformed input (cause not yet determined). Scaffold BUILD tags break `new_subsystem_test` goldens.
+- [x] **Gateway device isolation** (`5514a3e`): asynchronous configure that may leave individual devices unavailable (they and their dependents neutral, retried with backoff); per-device reset restore; bridge push backoff; RIO socket-open retry. Phoenix keeps MotorVoltage/StatorCurrent at 200 Hz (shared status frames); the 5 ms neutral refresh stays.
+- [x] **Drivetrain degrade** (`6831392`): module live only with drive, steer and CANcoder; drives on any well-conditioned subset of 2+ live modules; reset-continuous wheel distance and yaw; pose estimator rejects implausible odometry steps.
+- [x] **Shooter readiness hysteresis** (`c67a061`): entry band for N ticks, wider exit band, against the clamped demand; clears on target change, release, disable, disconnect. Bands need tuning on the real flywheel.
+- [x] **Launcher boot resilience** (`4f2cbb1`): `[subsystem] critical = false` nodes (cameras, pose_estimator, telemetry) cannot block boot and may not own actuators or write target lanes; critical nodes and the bridge are never quarantined (backoff capped at 1 s).
+- [x] **Sanitizers and decoder robustness in CI** (`bf30d9d`, `99dcff1`): ASan+UBSan and TSan configs and CI jobs; malformed-input tests for frame, State/Command/config, Driver Station and TOML decoders. Found and fixed: toml++ 3.4.0 abort on `[#x]`-style headers and UB on non-ASCII comments (our own `vision.toml` hit it every parse; patched), and a data race on the event loop's dispatch counter read by the registry reporter. Python-host tests are excluded under sanitizers (ctypes cannot load the runtime).
 
 Deferred (not started; in priority order):
 
