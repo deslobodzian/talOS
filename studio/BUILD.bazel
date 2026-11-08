@@ -131,6 +131,7 @@ STUDIO_TESTS = {
     "system_test": "system.test.ts",
     "view_test": "view.test.tsx",
     "vision_test": "vision.test.tsx",
+    "worker_test": "worker.test.ts",
 }
 
 [

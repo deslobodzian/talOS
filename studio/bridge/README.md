@@ -32,7 +32,10 @@ queue rejects a frame, exposing the gap downstream.
 
 On connect, a WebSocket client gets the system graph as a text frame and then
 the bridge's cached dictionary frame as a binary frame, so its first value
-frame is already decodable. Two HTTP views describe the same feed as JSON:
+frame is already decodable. The cached frame carries the values it was
+received with, however long ago; a client must not read them as current
+(Studio treats the first binary message on a socket as of unknown age).
+Two HTTP views describe the same feed as JSON:
 `GET /channels.json` returns the dictionary document
 (`talos.telemetry.channels`, version 2), and `GET /telemetry.json` returns
 the latest frame self-described (`talos.telemetry`, version 2) — `channels`

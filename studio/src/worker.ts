@@ -12,7 +12,15 @@ import {type DeclaredGraph, declaredUrl, MAX_DECLARED_BYTES, parseDeclaredGraph,
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
 const updates = new WorkerUpdateStream(message => ctx.postMessage(message));
-let sampleArrival = performance.now();
+// When the newest timeline sample arrived, the anchor for live session time.
+// Null when its age is unknown: then no live reading is current.
+let sampleArrival: number|null = null;
+// Sequence ids of frames whose age is unknown: the bridge's cached dictionary,
+// sent on every open, carries values from whenever the producer last wrote it
+// -- possibly long before this connection, if telemetry has stopped. It names
+// the channels, but its arrival time says nothing about its values' age.
+const unknownAge = new Set<string>();
+let firstBinary = false;
 let coordinator = new Coordinator(), jitter = new JitterBuffer(10);
 let decoder = new TelemetryDecoder();
 let streamId: string|null = null;
@@ -104,8 +112,10 @@ function postPlayback(now: number) {
     mode: coordinator.mode,
     cursor_ns: snapshot?.timestamp_ns ?? null,
     clock_ns: snapshot ? (coordinator.mode === 'LIVE_STREAMING' ?
-        BigInt(snapshot.timestamp_ns) + BigInt(Math.round((now - sampleArrival) * 1e6)) :
-        coordinator.cursor).toString() : null,
+        (sampleArrival === null ? null :
+             (BigInt(snapshot.timestamp_ns) +
+              BigInt(Math.round((now - sampleArrival) * 1e6))).toString()) :
+        coordinator.cursor.toString()) : null,
     bounds: coordinator.timeline.bounds(),
     stats: {...jitter.stats},
     status,
@@ -254,6 +264,7 @@ function resetStream(next: string) {
   latestDictRaw = null;
   needsReset = true;
   pendingFrames = [];
+  unknownAge.clear();
 }
 function reset() {
   coordinator = new Coordinator();
@@ -265,6 +276,8 @@ function reset() {
   latestDictRaw = null;
   needsReset = true;
   pendingFrames = [];
+  unknownAge.clear();
+  sampleArrival = null;
   // Whatever is being connected to next is a different system, so the old
   // topology is not evidence about it.
   system = null;
@@ -294,7 +307,8 @@ function close() {
   }
   demo = false;
 }
-function ingest(bytes: Uint8Array, now: number) {
+// `unknown`: the bytes' arrival says nothing about their age (see unknownAge).
+function ingest(bytes: Uint8Array, now: number, unknown = false) {
   try {
     // A value frame whose dictionary has not arrived decodes to nothing yet;
     // the decoder holds it and decodeAll returns it with the dictionary frame
@@ -304,6 +318,7 @@ function ingest(bytes: Uint8Array, now: number) {
         resetStream(frame.stream_id);
       else
         streamId = frame.stream_id;
+      if (unknown) unknownAge.add(frame.sequence_id);
       if (Frame.getSizePrefixedRootAsFrame(new ByteBuffer(raw))
               .dictionaryLength() > 0)
         latestDictRaw = raw;
@@ -331,6 +346,10 @@ function connect(url: string, gen: number) {
       if (gen !== generation) return;
       status = 'WebSocket connected';
       connection = 'live';
+      // The bridge answers an open with its graph and then, when it has one,
+      // its cached dictionary frame: the first binary message on a socket.
+      firstBinary = true;
+      unknownAge.clear();
       // Asked for on every open, not once per session: the bridge may have been
       // started after Studio was, and the first attempt would have found
       // nothing to answer it.
@@ -341,9 +360,10 @@ function connect(url: string, gen: number) {
       if (gen !== generation) return;
       // Binary is telemetry, text is the system graph. The bridge picks the
       // frame type, so neither side has to sniff the payload.
-      if (e.data instanceof ArrayBuffer)
-        ingest(new Uint8Array(e.data), performance.now());
-      else if (typeof e.data === 'string')
+      if (e.data instanceof ArrayBuffer) {
+        ingest(new Uint8Array(e.data), performance.now(), firstBinary);
+        firstBinary = false;
+      } else if (typeof e.data === 'string')
         ingestSystem(e.data);
     };
     socket.onclose = () => {
@@ -533,7 +553,7 @@ setInterval(() => {
       continue;
     }
     pendingFrames.push(f);
-    sampleArrival = now;
+    sampleArrival = unknownAge.delete(f.sequence_id) ? null : now;
     const raw = pendingBytes.get(f.sequence_id);
     if (raw) packets.set(f.sequence_id, raw);
     pendingBytes.delete(f.sequence_id);

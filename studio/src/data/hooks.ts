@@ -12,7 +12,7 @@ import type {Snapshot} from '../core';
 import {useStudio} from './studio';
 import type {RobotStatus} from './robot';
 import {robotStatus} from './robot';
-import {sampleStale} from './freshness';
+import {readingClock, sampleStale} from './freshness';
 import type {SessionManifest} from './manifest';
 import type {
   ChannelInfo,
@@ -58,7 +58,7 @@ export function useChannelStale(name: string): boolean {
   const studio = useStudio();
   const read = () => sampleStale(
       studio.store.channelSample(name, studio.playback.cursor_ns)?.timestamp_ns ?? null,
-      studio.playback.clock_ns ?? studio.playback.cursor_ns);
+      readingClock(studio.playback));
   return useSyncExternalStore(studio.subscribe, read, read);
 }
 

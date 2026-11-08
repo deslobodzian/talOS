@@ -324,7 +324,9 @@ int main(int argc, char** argv) try {
     ws->send(bridge.system_json, uWS::OpCode::TEXT);
     // Then the cached dictionary frame, so the client's first value frame
     // is already decodable instead of waiting up to a second for the next
-    // dictionary the producer schedules.
+    // dictionary the producer schedules. Its values are as old as the last
+    // telemetry received -- possibly from before telemetry stopped -- so the
+    // client treats this first binary message as of unknown age.
     if (bridge.telemetry_state.has_dictionary) {
       ws->send(bridge.telemetry_state.dictionary_frame, uWS::OpCode::BINARY);
     }

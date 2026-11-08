@@ -148,6 +148,18 @@ test('freshness uses each channel sample and the session clock at the exact boun
   assert.doesNotMatch(html, /fast: 99/);
 });
 
+test('an unknown session clock leaves no reading current, even at the cursor', () => {
+  // The worker posts clock_ns: null when the newest live sample's age is
+  // unknown (the bridge's connect-time dictionary). Falling back to the cursor
+  // would make that sample zero seconds old.
+  const studio = createStaticStudio({
+    frames: [snap(1, '5000000000', {fast: 99})],
+    playback: {connection: 'live', mode: 'LIVE_STREAMING', clock_ns: null}
+  });
+  const html = renderToStaticMarkup(<StudioProvider studio={studio}><FreshnessNotice/></StudioProvider>);
+  assert.match(html, /fast: 99/);
+});
+
 function fakeWorker(): WorkerPort {
   return {onmessage: null, onerror: null, onmessageerror: null,
     postMessage() {}, terminate() {}};

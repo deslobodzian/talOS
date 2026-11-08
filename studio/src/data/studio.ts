@@ -203,7 +203,10 @@ export function createStaticStudio(input: {
   const frames = input.frames ?? [];
   const playback: PlaybackState = {
     mode: input.playback?.mode ?? 'PAUSED',
-    clock_ns: input.playback?.clock_ns ?? input.playback?.cursor_ns ?? frames.at(-1)?.timestamp_ns ?? null,
+    // An explicit null clock is "no current time known"; only an absent one
+    // falls back to the cursor.
+    clock_ns: input.playback?.clock_ns !== undefined ? input.playback.clock_ns :
+        input.playback?.cursor_ns ?? frames.at(-1)?.timestamp_ns ?? null,
     cursor_ns: input.playback?.cursor_ns ?? frames.at(-1)?.timestamp_ns ?? null,
     bounds: input.playback?.bounds ?? boundsOf(frames),
     stats: input.playback?.stats ?? {dropped: 0, late: 0, invalid: 0},

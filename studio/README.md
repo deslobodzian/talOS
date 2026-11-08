@@ -80,6 +80,14 @@ views use the playback cursor. Status strip, Robot, Subsystems and Hardware
 show a STALE disclosure listing affected channels and their last values.
 Missing retained samples are stale/unknown, never a healthy zero.
 
+The bridge answers every WebSocket open with its cached dictionary frame, whose
+values are as old as the last telemetry it received -- possibly long before the
+connection. The worker treats the first binary message on each socket as of
+unknown age: it is retained (so its channels are discovered and its values
+inspectable at their own timestamps), but while it is the newest sample the
+live clock is unknown (`clock_ns: null`; `readingClock` in `data/freshness.ts`)
+and every reading is stale. The next live frame restores the clock at once.
+
 Worker errors and message decoding failures reject all pending RPCs with
 `WorkerRpcError`. RPCs time out after 10 seconds. A five-second heartbeat
 detects silent termination after ten seconds without a reply. The status strip

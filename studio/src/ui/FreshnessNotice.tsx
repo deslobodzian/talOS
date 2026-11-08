@@ -1,7 +1,7 @@
 import {useMemo, useSyncExternalStore, type ReactNode} from 'react';
 import {useChannelStale, useDictionary, usePlayback} from '../data/hooks';
 import {useStudio} from '../data/studio';
-import {sampleStale} from '../data/freshness';
+import {readingClock, sampleStale} from '../data/freshness';
 import {Stat} from './primitives';
 
 export function ChannelStat({channel, label, tone, children}: {
@@ -30,7 +30,7 @@ export function FreshnessNotice({prefix = ''}: {prefix?: string}) {
   const stale = useMemo(() => dictionary.filter(channel => channel.name.startsWith(prefix))
       .flatMap(channel => {
         const sample = studio.store.channelSample(channel.name, playback.cursor_ns);
-        return sampleStale(sample?.timestamp_ns ?? null, playback.clock_ns ?? playback.cursor_ns) ?
+        return sampleStale(sample?.timestamp_ns ?? null, readingClock(playback)) ?
             [`${channel.name}: ${sample?.value ?? '—'}`] : [];
       }), [dictionary, prefix, version, playback.clock_ns, playback.cursor_ns, studio.store]);
   if (!stale.length) return null;
