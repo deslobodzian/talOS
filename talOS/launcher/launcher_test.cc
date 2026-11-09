@@ -115,7 +115,6 @@ TEST(LauncherTest, SessionIdGenerationIsUniqueAndNonZero) {
   EXPECT_NE(id1, id3);
 }
 
-
 TEST(LauncherTest, SimGatewayComesFromRobotConfigNotTheFramework) {
   LauncherOptions options;
   options.simulation = true;
@@ -149,7 +148,6 @@ can_id = 1
                     [](const NodeSpec& n) { return n.name == "sim_gateway"; }),
       0);
 }
-
 
 TEST(LauncherTest, StudioBridgeNeedsFlagAndSim) {
   const auto has_bridge = [](const std::vector<NodeSpec>& nodes) {
@@ -187,7 +185,6 @@ TEST(LauncherTest, StudioBridgeNeedsFlagAndSim) {
     }
   }
 }
-
 
 TEST(LauncherTest, StudioBridgeWatchTopicFollowsDescribe) {
   // No description: the config's studio topic, else the default.
@@ -637,7 +634,6 @@ TEST(LauncherTest, MergedLogsRejectsSessionIdMismatch) {
   std::remove(path_b.c_str());
 }
 
-
 TEST(LauncherTest, RestartBackoffDoublesFrom50msCappedAt1s) {
   using std::chrono::milliseconds;
   EXPECT_EQ(RestartBackoff(1), milliseconds{50});
@@ -648,7 +644,6 @@ TEST(LauncherTest, RestartBackoffDoublesFrom50msCappedAt1s) {
   EXPECT_EQ(RestartBackoff(6), milliseconds{1000});
   EXPECT_EQ(RestartBackoff(1000), milliseconds{1000});
 }
-
 
 TEST(LauncherTest, ShouldRestartNodePredicate) {
   // A crash restarts a critical and a non-critical member alike.
@@ -697,7 +692,6 @@ TEST(LauncherTest, MaxRestartsComesFromFlagThenConfigThenDefault) {
   EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = \"3\"\n"), {},
                                   max, error));
 }
-
 
 // A stand-in for a node binary.
 //
@@ -920,7 +914,6 @@ TEST(LauncherGraphTest, ANodeThatHangsOnDescribeDoesNotHangTheLaunch) {
   const auto elapsed = std::chrono::steady_clock::now() - started;
   EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
             10);
-
 }
 
 TEST(LauncherGraphTest, NonCriticalTargetProducerIsAnError) {
@@ -1167,12 +1160,12 @@ TEST(LauncherGraphTest, AGraphReaderIsDescribedAgainWithTheOtherNodesGraph) {
   EXPECT_EQ(graph[0].sources.at(0).schema, "launcher_test.Message48");
 
   // An observer is not a consumer: alpha's state still has nobody reading it.
-  const bool unread = std::any_of(
-      diagnostics.begin(), diagnostics.end(),
-      [](const introspect::naming::Diagnostic& d) {
-        return d.subject == "/alpha/state" &&
-               d.severity == introspect::naming::Severity::WARNING;
-      });
+  const bool unread =
+      std::any_of(diagnostics.begin(), diagnostics.end(),
+                  [](const introspect::naming::Diagnostic& d) {
+                    return d.subject == "/alpha/state" &&
+                           d.severity == introspect::naming::Severity::WARNING;
+                  });
   EXPECT_TRUE(unread);
 
   std::filesystem::remove_all(record);
@@ -1180,7 +1173,6 @@ TEST(LauncherGraphTest, AGraphReaderIsDescribedAgainWithTheOtherNodesGraph) {
   std::remove(alpha.binary_path.c_str());
   std::remove(gamma.binary_path.c_str());
 }
-
 
 TEST(LauncherBundleTest, ResolveBinaryPrefersOverrideThenBazelBin) {
   std::map<std::string, std::string> overrides;
@@ -1314,7 +1306,6 @@ TEST(LauncherBundleTest, LauncherRunsFromBundleDirectoryWithDescribeOnly) {
 
   std::filesystem::remove_all(bundle_dir);
 }
-
 
 LauncherOptions SessionFixture(std::string_view tag) {
   LauncherOptions options;

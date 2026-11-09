@@ -356,7 +356,6 @@ TEST_F(AprilTagMetalAdapterTest, DecimatedImageParity) {
   image_u8_destroy(im);
 }
 
-
 #if defined(__APPLE__)
 TEST_F(AprilTagMetalAdapterTest, GpuGeneratedThreshimDetection) {
   MTL::Device* device = MTL::CreateSystemDefaultDevice();

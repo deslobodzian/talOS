@@ -211,7 +211,6 @@ TEST(RealtimeEventLoop, RejectsTimerChangesFromAnotherThread) {
   other.join();
 }
 
-
 TEST(RealtimeEventLoop, ReaderExhaustionFailsRegistrationAndAllowsRetry) {
   const std::string topic = "/full_" + std::to_string(::getpid());
   RTMSQueue keeper{topic, sizeof(EventsTest::SensorMessage),

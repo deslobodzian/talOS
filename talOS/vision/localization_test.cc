@@ -11,7 +11,6 @@
 namespace talos::vision {
 namespace {
 
-
 TEST(LocalizationTest, ReprojectionErrorCalculation) {
   CameraIntrinsics intr;
   intr.fx = 600.0;
@@ -50,7 +49,6 @@ TEST(LocalizationTest, ReprojectionErrorCalculation) {
   EXPECT_GT(noisy_err, 1.0);
   EXPECT_LT(noisy_err, 3.0);
 }
-
 
 TEST(LocalizationTest, RobotFieldPoseWithMountingOffset) {
   FieldLayout layout;
@@ -737,7 +735,6 @@ TEST(LocalizationTest, CandidateOrderingKeepsLowerErrorPrimary) {
                                                second_error),
                    1);
 }
-
 
 TEST(LocalizationTest, MultiTagSeedIgnoresFlippedPrimaryCandidate) {
   // Near the planar-ambiguity boundary a single tag's primary can be the wrong

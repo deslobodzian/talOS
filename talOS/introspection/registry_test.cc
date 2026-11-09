@@ -227,7 +227,8 @@ TEST_F(Registry, ConcurrentProcessesNeverReceiveTheSameSlot) {
           slots[i] = registrations.back()->slot();
         }
       } catch (...) {
-        slots.fill(kMaxNodes);  // Explicitly report a failed claim to the parent.
+        slots.fill(
+            kMaxNodes);  // Explicitly report a failed claim to the parent.
       }
       // One pipe-atomic report; registrations stay alive until all reports
       // have been checked, so releasing a slot cannot hide double assignment.
@@ -283,7 +284,6 @@ event::Manifest sample_manifest() {
                       .alignment = 8});
   return manifest;
 }
-
 
 // What Reporter::Selection carries into publish_selections: a policy's
 // sources.
@@ -558,7 +558,6 @@ TEST_F(Registry, SourcesBeyondCapacityAreCountedButNotStored) {
   EXPECT_EQ(nodes.front().sources.size(), kMaxSourcesPerNode);
   EXPECT_EQ(nodes.front().declared_source_count, manifest.size());
 }
-
 
 TEST_F(Registry, ReporterProgressCadenceLeavesRoomForSubTimeoutPause) {
   RegistryMapping mapping{path_};
@@ -893,7 +892,6 @@ TEST_F(Registry, AMisnamedTopicIsWarnedAboutAndStillPublished) {
   ASSERT_EQ(nodes.front().sources.size(), 2u);
   EXPECT_EQ(nodes.front().sources[1].name, "/hw/cmd");
 }
-
 
 // A sample parked open -- the heartbeat advanced but the sample never closed
 // -- must not wedge or drop the reader. The bounded retries give up and return

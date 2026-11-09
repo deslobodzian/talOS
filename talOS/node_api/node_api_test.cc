@@ -128,7 +128,6 @@ TEST_F(NodeApi, NodeSubscribesPublishesAndTicks) {
   EXPECT_EQ(talos_sim_now_ns(sim_), 25 * kMs);
 }
 
-
 // A second node on /relay/out with a same-size type of another schema.
 struct Impostor {
   int64_t in = -1;

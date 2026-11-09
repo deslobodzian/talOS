@@ -1,5 +1,6 @@
 // Replay applies detector overrides to recorded frames rendered without a robot
-// dependency, preserving valid observations unless the quality gate rejects them.
+// dependency, preserving valid observations unless the quality gate rejects
+// them.
 
 #include "talOS/vision/recording/replay.h"
 
@@ -136,7 +137,6 @@ class ReplayTest : public ::testing::Test {
   std::map<int, field_sim::TagPattern> patterns_;
   std::string error_;
 };
-
 
 TEST_F(ReplayTest, RaisingMinDecisionMarginReducesValidDetections) {
   FrameRecorder::Options opts;

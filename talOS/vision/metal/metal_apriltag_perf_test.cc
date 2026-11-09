@@ -57,11 +57,11 @@ TEST(MetalAprilTagPerfTest, GpuAndCpuDetectionParityOnHdFrame) {
     ASSERT_NE(actual, metal.detections.end());
     for (size_t coordinate = 0; coordinate < expected.corners.size();
          ++coordinate) {
-      EXPECT_NEAR(actual->corners[coordinate], expected.corners[coordinate], 0.1);
+      EXPECT_NEAR(actual->corners[coordinate], expected.corners[coordinate],
+                  0.1);
     }
   }
 }
-
 
 }  // namespace
 }  // namespace talos::vision::metal

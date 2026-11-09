@@ -104,9 +104,8 @@ class LogDumpTest : public testing::Test {
 };
 
 TEST_F(LogDumpTest, NodeFiltersSelectOnlyRequestedProcesses) {
-  for (const auto& selection :
-       std::vector<std::vector<std::string>>{{"--node", "alpha,beta"},
-                                             {"--node", "alpha", "--node", "beta"}}) {
+  for (const auto& selection : std::vector<std::vector<std::string>>{
+           {"--node", "alpha,beta"}, {"--node", "alpha", "--node", "beta"}}) {
     auto args = selection;
     args.insert(args.end(), {"--format", "jsonl"});
     const auto records = Run(args);
@@ -123,11 +122,11 @@ TEST_F(LogDumpTest, TopicFiltersAndInclusiveWindow) {
     const auto records = Run({"--format", "jsonl", "--topic", topic});
     EXPECT_EQ(std::count(records.begin(), records.end(), '\n'), 2);
     EXPECT_EQ(records.find(topic == "/alpha/state" ? "\"process\":\"beta\""
-                                                  : "\"process\":\"alpha\""),
+                                                   : "\"process\":\"alpha\""),
               std::string::npos);
   }
-  const auto records = Run({"--format", "jsonl", "--since-ms", "10",
-                            "--until-ms", "20"});
+  const auto records =
+      Run({"--format", "jsonl", "--since-ms", "10", "--until-ms", "20"});
   EXPECT_EQ(std::count(records.begin(), records.end(), '\n'), 2);
   EXPECT_NE(records.find("\"event_ms\":10,"), std::string::npos);
   EXPECT_NE(records.find("\"event_ms\":20,"), std::string::npos);

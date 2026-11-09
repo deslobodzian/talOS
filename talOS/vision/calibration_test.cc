@@ -101,6 +101,5 @@ TEST(CalibrationTest, CameraMounting) {
                   .isApprox(Eigen::Vector3d::UnitY()));
 }
 
-
 }  // namespace
 }  // namespace talos::vision

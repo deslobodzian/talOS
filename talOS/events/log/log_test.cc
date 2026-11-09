@@ -520,7 +520,6 @@ TEST(LogFormatErrors, BadMagicThrows) {
   ::unlink(path.c_str());
 }
 
-
 // Legacy and future log versions must be rejected before reading records.
 TEST(LogFormatErrors, RejectsUnsupportedVersions) {
   const std::string path = TempPath("unsupported_version");

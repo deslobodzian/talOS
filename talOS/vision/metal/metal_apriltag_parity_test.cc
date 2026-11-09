@@ -252,7 +252,6 @@ class MetalAprilTagParityTest : public ::testing::Test {
   std::unique_ptr<MetalAprilTagBackend> metal_backend_;
 };
 
-
 TEST_F(MetalAprilTagParityTest, FixtureDetectionAndPoseParity) {
   struct Fixture {
     const char* file;
@@ -270,7 +269,8 @@ TEST_F(MetalAprilTagParityTest, FixtureDetectionAndPoseParity) {
        }) {
     SCOPED_TRACE(fixture.file);
     const auto path = ResolveTestdataPath(fixture.file);
-    const auto cpu = cpu_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
+    const auto cpu =
+        cpu_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
     const auto metal =
         metal_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
     ASSERT_EQ(cpu.size(), fixture.count);
@@ -408,7 +408,6 @@ TEST_F(MetalAprilTagParityTest, RepeatedIdSpatialMatchingParity) {
   image_u8_destroy(tag_im);
   tag36h11_destroy(tf);
 }
-
 
 #if defined(__APPLE__)
 void AssertThresholdParity(MetalAprilTagBackend& backend, image_u8_t* im,

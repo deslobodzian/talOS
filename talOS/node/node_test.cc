@@ -115,13 +115,13 @@ TEST(Node, ArrayParamsRejectMissingAndMistypedValues) {
 
   EXPECT_THROW((void)node.param<Strings>("absent"), std::invalid_argument);
   EXPECT_THROW((void)node.param<Doubles>("cameras"), std::invalid_argument);
-  EXPECT_THROW((void)node.param<Strings>("offsets_m", {}), std::invalid_argument);
+  EXPECT_THROW((void)node.param<Strings>("offsets_m", {}),
+               std::invalid_argument);
   EXPECT_THROW((void)node.param<Doubles>("mixed"), std::invalid_argument);
   EXPECT_THROW((void)node.param<Strings>("tag"), std::invalid_argument);
   EXPECT_THROW((void)node.param<Doubles>("limits", {}), std::invalid_argument);
   EXPECT_THROW((void)node.param<std::string>("cameras"), std::invalid_argument);
 }
-
 
 // --- topics ----------------------------------------------------------------
 

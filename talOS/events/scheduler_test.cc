@@ -152,6 +152,5 @@ TEST(Scheduler, DisablingAPeriodicTimerStopsIt) {
   EXPECT_FALSE(scheduler.pop_expired(at(10'000), expiration));
 }
 
-
 }  // namespace
 }  // namespace talos::event

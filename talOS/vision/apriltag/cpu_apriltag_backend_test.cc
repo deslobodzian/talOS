@@ -175,7 +175,6 @@ void VerifyPhotographicFixture(const std::string& img_filename,
     const Eigen::Matrix3d r_rt =
         pose_est.rotation * pose_est.rotation.transpose();
     EXPECT_TRUE(r_rt.isApprox(Eigen::Matrix3d::Identity(), 1e-4));
-
   }
 }
 
@@ -187,11 +186,12 @@ TEST(CpuAprilTagBackendTest, PhotographicFixtures) {
     int count;
   };
   for (const auto& fixture : {Fixture{"33369213973_9d9bb4cc96_c", 12},
-                             Fixture{"34085369442_304b6bafd9_c", 25},
-                             Fixture{"34139872896_defdb2f8d9_c", 10}}) {
+                              Fixture{"34085369442_304b6bafd9_c", 25},
+                              Fixture{"34139872896_defdb2f8d9_c", 10}}) {
     SCOPED_TRACE(fixture.stem);
     VerifyPhotographicFixture(std::string(fixture.stem) + ".jpg",
-                              std::string(fixture.stem) + ".txt", fixture.count);
+                              std::string(fixture.stem) + ".txt",
+                              fixture.count);
   }
 }
 

@@ -202,7 +202,6 @@ TEST(RenderDetect, ExposureAccumulatesOnlySmallTagRegionsAndKeepsBackground) {
   EXPECT_EQ(output.back(), 255);
 }
 
-
 TEST(RenderDetect, RenderedTagDecodesThroughTheRealPipeline) {
   std::map<int, TagPattern> patterns;
   std::string error;
@@ -540,7 +539,6 @@ TEST(RenderDetect, YawBlurIncludesCameraMountLeverArm) {
   }
   EXPECT_LT(error_sum / (120 * 140), 1.5);
 }
-
 
 TEST(RenderDetect, ProductionSimCornerNoiseMatchesSolverPixelStd) {
   auto camera = RoundTripCamera();

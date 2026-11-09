@@ -17,7 +17,6 @@ std::string Topic(const char* name) {
 
 }  // namespace
 
-
 TEST(SubscriberTest, ReaderExhaustionRejectsAndRecoversAfterRelease) {
   const std::string topic = Topic("full");
   std::vector<std::unique_ptr<ipc::Subscriber<IPCMessage::TestMessage>>>

@@ -14,9 +14,7 @@ TEST(FrameTest, PixelFormatStorageSizes) {
   EXPECT_EQ(BytesPerPixel(PixelFormat::kBgr8), 3);
   EXPECT_EQ(BytesPerPixel(PixelFormat::kYuyv), 2);
   EXPECT_EQ(BytesPerPixel(PixelFormat::kBgra8), 4);
-
 }
-
 
 TEST(FrameTest, AllocatesPackedImageStorage) {
   const auto t0 = talos::event::MonotonicTime::from_nanos(123456789);
@@ -39,7 +37,6 @@ TEST(FrameTest, CustomStrideAndOwnedBuffer) {
   EXPECT_EQ(f.data()[0], 0xAB);
   EXPECT_FALSE(f.is_shared());
 }
-
 
 TEST(FrameTest, CloneAndShareSemantics) {
   Frame orig(0, 1, 10, talos::event::MonotonicTime::from_nanos(100), 10, 10,

@@ -316,7 +316,6 @@ TEST(SimCamera, GeometryProjectionDoesNotConsumeOrApplyObservationNoise) {
   EXPECT_DOUBLE_EQ(noiseless[0].corners[0].x(), 295);
 }
 
-
 TEST(SimCamera, ReusesCallerStorageAndClearsOldDetections) {
   std::vector<SimTagDetection> detections;
   detections.reserve(32);

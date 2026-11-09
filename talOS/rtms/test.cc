@@ -158,8 +158,11 @@ TEST(WriterOwnership, RefusesSecondLiveWriterAndReleasesOnClose) {
                      kSchema,
                      64,
                      {.publisher = true}};
-    EXPECT_THROW((RTMSQueue{path, sizeof(Message::TestMessage),
-                            alignof(Message::TestMessage), kSchema, 64,
+    EXPECT_THROW((RTMSQueue{path,
+                            sizeof(Message::TestMessage),
+                            alignof(Message::TestMessage),
+                            kSchema,
+                            64,
                             {.publisher = true}}),
                  std::runtime_error);
   }
@@ -211,7 +214,6 @@ TEST(WriterOwnership, ReclaimsCrashedWriterWithoutLosingReaders) {
   EXPECT_EQ(session.writer_sequence(), 2u);
   session.release_reader(*reader);
 }
-
 
 TEST(WrapTest, RTMSSequenceWrapsSlots) {
   const std::string path = make_test_path("wrap");
@@ -829,7 +831,6 @@ TEST(SingleProcess, DropNewestBufferFullThenRecovers) {
   queue.release_reader(id);
 }
 
-
 namespace {
 
 void WriteThread(const std::string& path, int iterations,
@@ -1191,7 +1192,6 @@ void FreeRunningReadThread(const std::string& path, std::size_t slots,
 }
 
 }  // namespace
-
 
 TEST(Concurrency, OverwriteOldestNoTornReadsMultiReader) {
   const std::string path = make_test_path("conc_multi");

@@ -12,7 +12,6 @@
 namespace deps_consumer {
 namespace {
 
-
 TEST(MessagesDepsTest, LayoutMatchesPythonBindings) {
   // Pose2d is 3 doubles; ConsumerState is Pose2d + double + bool padded to 8.
   EXPECT_EQ(sizeof(deps_geometry::Pose2d), 24u);

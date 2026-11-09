@@ -9,7 +9,6 @@
 #include <string>
 #include <vector>
 
-
 #if defined(__APPLE__)
 #include <Foundation/Foundation.hpp>
 #include <Metal/Metal.hpp>
@@ -69,7 +68,6 @@ std::string ResolveTestdataPath(const std::string& filename) {
 }
 
 #endif
-
 
 // Test Fixture
 class MetalCclClusteringTest : public ::testing::Test {
@@ -250,7 +248,6 @@ TEST_F(MetalCclClusteringTest,
   image_u8_destroy(dec_im);
 #endif
 }
-
 
 // TEST 2b: Label-native sparse clustering parity (Stage 2b).
 // Builds clusters from GPU CCL labels + GPU edge candidates with zero dense
@@ -606,7 +603,6 @@ TEST_F(MetalCclClusteringTest, SparseClustersPhotographicRotatedParity) {
 #endif
 }
 
-
 // Component-size filtering must agree with the CPU connected-components path.
 TEST_F(MetalCclClusteringTest, GpuConnectedComponentsParity) {
 #if !defined(__APPLE__)
@@ -665,45 +661,45 @@ TEST_F(MetalCclClusteringTest, GpuConnectedComponentsParity) {
   MTL::Size tg_1d = MTL::Size::Make(256, 1, 1);
   MTL::Size count_1d = MTL::Size::Make((total_pixels + 255) / 256, 1, 1);
 
-    MTL::CommandBuffer* cmd = queue_->commandBuffer();
-    MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
+  MTL::CommandBuffer* cmd = queue_->commandBuffer();
+  MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
 
-    // Stage 1: Init
-    enc->setComputePipelineState(pso_ccl_init_);
-    enc->setBuffer(thresh_buf, 0, 0);
-    enc->setBuffer(parent_buf, 0, 1);
-    enc->setBuffer(sizes_buf, 0, 2);
-    enc->setBytes(&mw, sizeof(mw), 3);
-    enc->setBytes(&mh, sizeof(mh), 4);
-    enc->setBytes(&ms, sizeof(ms), 5);
-    enc->dispatchThreadgroups(count_2d, tg_2d);
+  // Stage 1: Init
+  enc->setComputePipelineState(pso_ccl_init_);
+  enc->setBuffer(thresh_buf, 0, 0);
+  enc->setBuffer(parent_buf, 0, 1);
+  enc->setBuffer(sizes_buf, 0, 2);
+  enc->setBytes(&mw, sizeof(mw), 3);
+  enc->setBytes(&mh, sizeof(mh), 4);
+  enc->setBytes(&ms, sizeof(ms), 5);
+  enc->dispatchThreadgroups(count_2d, tg_2d);
 
-    // Stage 2: Union pass
-    enc->setComputePipelineState(pso_ccl_union_);
-    enc->setBuffer(thresh_buf, 0, 0);
-    enc->setBuffer(parent_buf, 0, 1);
-    enc->setBytes(&mw, sizeof(mw), 2);
-    enc->setBytes(&mh, sizeof(mh), 3);
-    enc->setBytes(&ms, sizeof(ms), 4);
-    enc->dispatchThreadgroups(count_2d, tg_2d);
+  // Stage 2: Union pass
+  enc->setComputePipelineState(pso_ccl_union_);
+  enc->setBuffer(thresh_buf, 0, 0);
+  enc->setBuffer(parent_buf, 0, 1);
+  enc->setBytes(&mw, sizeof(mw), 2);
+  enc->setBytes(&mh, sizeof(mh), 3);
+  enc->setBytes(&ms, sizeof(ms), 4);
+  enc->dispatchThreadgroups(count_2d, tg_2d);
 
-    // Stage 3: Flatten
-    enc->setComputePipelineState(pso_ccl_flatten_);
-    enc->setBuffer(parent_buf, 0, 0);
-    enc->setBytes(&tot_px, sizeof(tot_px), 1);
-    enc->dispatchThreadgroups(count_1d, tg_1d);
+  // Stage 3: Flatten
+  enc->setComputePipelineState(pso_ccl_flatten_);
+  enc->setBuffer(parent_buf, 0, 0);
+  enc->setBytes(&tot_px, sizeof(tot_px), 1);
+  enc->dispatchThreadgroups(count_1d, tg_1d);
 
-    // Stage 4: Compute component sizes
-    enc->setComputePipelineState(pso_ccl_sizes_);
-    enc->setBuffer(parent_buf, 0, 0);
-    enc->setBuffer(sizes_buf, 0, 1);
-    enc->setBytes(&tot_px, sizeof(tot_px), 2);
-    enc->dispatchThreadgroups(count_1d, tg_1d);
+  // Stage 4: Compute component sizes
+  enc->setComputePipelineState(pso_ccl_sizes_);
+  enc->setBuffer(parent_buf, 0, 0);
+  enc->setBuffer(sizes_buf, 0, 1);
+  enc->setBytes(&tot_px, sizeof(tot_px), 2);
+  enc->dispatchThreadgroups(count_1d, tg_1d);
 
-    enc->endEncoding();
+  enc->endEncoding();
 
-    cmd->commit();
-    cmd->waitUntilCompleted();
+  cmd->commit();
+  cmd->waitUntilCompleted();
 
   // Parity check: Compare component counts with size >= 25
   const uint32_t* gpu_parents =
@@ -722,7 +718,6 @@ TEST_F(MetalCclClusteringTest, GpuConnectedComponentsParity) {
       gpu_valid_components++;
     }
   }
-
 
   EXPECT_GT(gpu_valid_components, 0u);
   EXPECT_EQ(gpu_valid_components, cpu_valid_components);

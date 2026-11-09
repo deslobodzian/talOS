@@ -25,7 +25,6 @@ Topics simulated_topics() {
   return Topics{"/sim/sensor", "/sim/setpoint", "/sim/command"};
 }
 
-
 TEST(SimulatedEventLoop, RegistrationAfterRunIsRejected) {
   SimulationEnvironment environment;
   SimulatedEventLoop<> loop{environment};
@@ -350,7 +349,6 @@ TEST(SimulatedEventLoop, ExitStopsTheLoop) {
   loop.run_for(100ms);
   EXPECT_EQ(calls, 3);
 }
-
 
 }  // namespace
 }  // namespace talos::event

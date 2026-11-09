@@ -64,7 +64,6 @@ const reflection::Object& Reflected() {
   return *object;
 }
 
-
 TEST(Descriptor, EmbeddedSchemaMatchesTheCompiledLayout) {
   EXPECT_EQ(Reflected<schema_test::Inner>().bytesize(),
             sizeof(schema_test::Inner));
@@ -84,7 +83,6 @@ TEST(Descriptor, HashIsTheHashOfItsEmbeddedSchema) {
   EXPECT_EQ(Hash(Descriptor<schema_test::Arrays>::kBfbs, "schema_test.Arrays"),
             Descriptor<schema_test::Arrays>::kHash);
 }
-
 
 TEST(SchemaHash, CommentsAndFormattingDoNotChangeIt) {
   for (const char* name : {"schema_variant.Reading", "schema_variant.Holder"}) {

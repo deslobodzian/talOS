@@ -435,7 +435,6 @@ TEST(Supervision, SessionsAreIsolatedAndCleanOnlyOwnedDirs) {
   ::remove(sentinel.c_str());
 }
 
-
 // A persistent fault is quarantined at the rolling limit, not retried in a
 // tight loop. Stopping the session cancels its one pending retry.
 TEST(Supervision, CrashingNodeQuarantinesUntilTheSessionStops) {
