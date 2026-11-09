@@ -133,25 +133,19 @@ and YUYV-to-gray uses `extractChannel` rather than the color parallel dispatcher
 BGR/BGRA/RGB backend inputs and synthetic-image processing can reach OpenCV's
 parallel paths.
 
-The remaining dependency exemption is UBSan `shift` for AprilTag `pjpeg*.c`.
-Live Linux capture negotiates raw GREY/YUYV and `CpuAprilTagBackend::Execute`
-calls the raw-buffer `Detect` API; it never calls `DetectImageFile` or pjpeg.
-Configured detector parallelism (2) and decimation (2) do not change that.
-The offline/public `DetectImageFile` API **does** use pjpeg for JPEGs; the JPEG
-fixture reproduces `pjpeg.c:597: left shift of negative value -1` when shift
-instrumentation is restored. This path remains UB-unqualified, not proven safe
-by the passing filtered suite. The exemption covers both pjpeg C files, so later
-shift faults (including IDCT) are unverified after this first fail-fast report.
-Other UBSan checks and ASan remain enabled in those files. Reproduce explicitly:
-
-```sh
-bazel --output_base=$HOME/.cache/bazel-talos-asan test --config=asan \
-  '--per_file_copt=external/.*apriltag.*/common/pjpeg.*[.]c@-fsanitize=shift' \
-  --test_output=errors //talOS/vision/sanitizer:jpeg_loader_test
-```
-
-This command is expected to fail; ordinary sanitizer qualification uses the
-documented exemption. No live JPEG-input safety claim is made.
+The AprilTag JPEG decoder (`pjpeg.c`) has no exemption either. Live Linux
+capture negotiates raw GREY/YUYV and `CpuAprilTagBackend::Execute` calls the
+raw-buffer `Detect` API; only the offline `DetectImageFile` API decodes JPEGs.
+`third_party/apriltag_pjpeg_bounds.patch` fixes what corrupt input reached:
+signed shifts (sign extension and the IDCT), a zero run past coefficient 63
+(zigzag, quantization and block tables indexed out of range), int overflow in
+the IDCT and DC prediction, zero/oversized frame dimensions and sampling
+factors, out-of-range table selectors, and buffers leaked on error exits.
+Conforming images decode unchanged. `//talOS/vision/sanitizer:jpeg_loader_test`
+decodes a photograph and 64 deterministic corrupt-scan variants under
+ASan/UBSan; a one-off run of 3,000 variants from the scan and 3,000 across the
+whole file was clean. This is a deterministic corpus, not coverage-guided
+exploration.
 
 The ordinary suite also covers excluded Python-host and full-stack paths.
 Deterministic mutation corpora are not continuous coverage-guided fuzzing.

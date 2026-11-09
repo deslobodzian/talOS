@@ -132,6 +132,7 @@ vision_http_archive(
     patches = [
         "//third_party:apriltag_pose_ambiguity.patch",
         "//third_party:apriltag_unionfind_atomic.patch",
+        "//third_party:apriltag_pjpeg_bounds.patch",
     ],
     sha256 = "3749f48220db78c29c375a373861f4e1f4138e5dbae3c298584e96cfcc556515",
     strip_prefix = "apriltag-3.4.5",
