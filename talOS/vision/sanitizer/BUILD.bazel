@@ -13,3 +13,13 @@ cc_test(
         "@opencv//:imgproc",
     ],
 )
+
+cc_test(
+    name = "jpeg_loader_test",
+    srcs = ["jpeg_loader_test.cc"],
+    data = ["//talOS/vision/testdata"],
+    deps = [
+        "//talOS/vision/apriltag:cpu_apriltag_backend",
+        "@googletest//:gtest_main",
+    ],
+)

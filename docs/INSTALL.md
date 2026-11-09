@@ -91,8 +91,10 @@ Linux CI also runs the C++ suite with AddressSanitizer + UndefinedBehaviorSaniti
 and ThreadSanitizer:
 
 ```sh
-bazel test --config=asan --test_tag_filters=-no_asan --test_output=errors //...
-bazel test --config=tsan --test_tag_filters=-no_tsan --test_output=errors //...
+bazel --output_base=$HOME/.cache/bazel-talos-asan test --config=asan \
+  --test_tag_filters=-no_asan --test_output=errors //...
+bazel --output_base=$HOME/.cache/bazel-talos-tsan test --config=tsan \
+  --test_tag_filters=-no_tsan --test_output=errors //...
 ```
 
 The decoder `*_fuzz_test` gtests run deterministic, bounded mutation corpora
@@ -113,6 +115,8 @@ CPU settings (two detector workers, decimation 2, sigma 0, edge refinement).
 Before the patch, enabling instrumentation reproduced a `do_gradient_clusters`
 read/write data race; the patched test passes with instrumentation enabled.
 This is bounded fixture coverage, not proof of all possible detector inputs.
+Linux `metal` tests exercise CPU fallback, not Apple Metal execution; GPU-only
+tests are skipped or compiled out. These Linux results do not qualify Metal.
 
 Run sanitizer builds in their own output bases
 (`bazel --output_base=$HOME/.cache/bazel-talos-asan ...`, and `...-tsan`) so they
@@ -128,6 +132,27 @@ Linux V4L2 capture supplies GREY or YUYV (not JPEG/BGR); GREY bypasses OpenCV,
 and YUYV-to-gray uses `extractChannel` rather than the color parallel dispatcher.
 BGR/BGRA/RGB backend inputs and synthetic-image processing can reach OpenCV's
 parallel paths.
+
+The remaining dependency exemption is UBSan `shift` for AprilTag `pjpeg*.c`.
+Live Linux capture negotiates raw GREY/YUYV and `CpuAprilTagBackend::Execute`
+calls the raw-buffer `Detect` API; it never calls `DetectImageFile` or pjpeg.
+Configured detector parallelism (2) and decimation (2) do not change that.
+The offline/public `DetectImageFile` API **does** use pjpeg for JPEGs; the JPEG
+fixture reproduces `pjpeg.c:597: left shift of negative value -1` when shift
+instrumentation is restored. This path remains UB-unqualified, not proven safe
+by the passing filtered suite. The exemption covers both pjpeg C files, so later
+shift faults (including IDCT) are unverified after this first fail-fast report.
+Other UBSan checks and ASan remain enabled in those files. Reproduce explicitly:
+
+```sh
+bazel --output_base=$HOME/.cache/bazel-talos-asan test --config=asan \
+  '--per_file_copt=external/.*apriltag.*/common/pjpeg.*[.]c@-fsanitize=shift' \
+  --test_output=errors //talOS/vision/sanitizer:jpeg_loader_test
+```
+
+This command is expected to fail; ordinary sanitizer qualification uses the
+documented exemption. No live JPEG-input safety claim is made.
+
 The ordinary suite also covers excluded Python-host and full-stack paths.
 Deterministic mutation corpora are not continuous coverage-guided fuzzing.
 

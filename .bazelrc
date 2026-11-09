@@ -31,8 +31,10 @@ build:windows --cxxopt=/std:c++23 --cxxopt=-O3
 build:asan --copt=-fsanitize=address,undefined --linkopt=-fsanitize=address,undefined
 build:asan --copt=-fno-omit-frame-pointer --copt=-fno-sanitize-recover=undefined
 build:asan --copt=-O1 --cxxopt=-O1
-# AprilTag 3.4.5's JPEG decoder (pjpeg.c, pjpeg-idct.c) shifts negative signed values.
-# Keep every other UBSan check and all project-code shift checks enabled.
+# Remaining exemption: AprilTag 3.4.5 pjpeg*.c signed shifts. The offline JPEG
+# fixture reproduces pjpeg.c:597 shifting -1; JPEG decoding is NOT UB-qualified.
+# Live CPU detection receives raw GREY/YUYV camera buffers and calls Detect,
+# never DetectImageFile/pjpeg (Metal is off on Linux). Keep other UBSan checks.
 build:asan --per_file_copt=external/.*apriltag.*/common/pjpeg.*[.]c@-fno-sanitize=shift
 test:asan --test_tag_filters=-no_asan
 build:tsan --copt=-fsanitize=thread --linkopt=-fsanitize=thread
