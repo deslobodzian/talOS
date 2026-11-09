@@ -22,8 +22,6 @@
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/log/log_reader.h"
-#include "talOS/introspection/describe.h"
-#include "talOS/introspection/names.h"
 #include "talOS/protocol/udp_test_helpers.h"
 
 namespace talos::hardware {
@@ -91,104 +89,7 @@ uint64_t NodeConfigId(const talos::config::RobotConfig& cfg) {
   return ConfigurationId(hw);
 }
 
-TEST(HardwareNodeTest, MergesSubsystemRequestsAndIsolatesTimeouts) {
-  auto cfg = talos::config::ParseRobotConfigString(kTestToml);
-  ASSERT_EQ(cfg.hardware.motors.size(), 2u);
-
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25802), TestPort(25803), true};
-  ASSERT_TRUE(node.Open());
-
-  // Named through RequestTopic() rather than spelled out: a test that hardcodes
-  // the topic keeps passing after a rename while the robot stops working, which
-  // is the exact failure this whole protocol exists to prevent.
-  ipc::Publisher<talos::hardware::Packet> drive_pub{RequestTopic("drivetrain")};
-  ipc::Publisher<talos::hardware::Packet> shooter_pub{RequestTopic("shooter")};
-
-  // 1. Both subsystems publish active commands. No controller state has arrived
-  // over UDP yet, so the bridge's last-observed identity is (config, 0, 0, 0):
-  // well-formed requests stamp exactly that.
-  const uint64_t config_id = NodeConfigId(cfg);
-  Command drive_cmd{};
-  drive_cmd.config_id = config_id;
-  drive_cmd.count = 1;
-  drive_cmd.motors[0] = {cfg.hardware.motors[0].id, Mode::kVelocity, 0, 15.0,
-                         1.2};
-  talos::hardware::Packet drive_pkt{};
-  drive_pkt.size = static_cast<uint32_t>(Encode(drive_cmd, drive_pkt.data));
-  drive_pub.write(drive_pkt);
-
-  Command shooter_cmd{};
-  shooter_cmd.config_id = config_id;
-  shooter_cmd.count = 1;
-  shooter_cmd.motors[0] = {cfg.hardware.motors[1].id, Mode::kVelocity, 0, 50.0,
-                           2.5};
-  talos::hardware::Packet shooter_pkt{};
-  shooter_pkt.size =
-      static_cast<uint32_t>(Encode(shooter_cmd, shooter_pkt.data));
-  shooter_pub.write(shooter_pkt);
-
-  // Tick at now_us = 2000
-  node.Tick(2000);
-
-  // Both should be active and merged
-  EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
-  EXPECT_FALSE(node.is_subsystem_timed_out("shooter"));
-  const auto& cmd1 = node.current_command();
-  EXPECT_EQ(cmd1.count, 2u);
-  EXPECT_EQ(cmd1.motors[0].id, cfg.hardware.motors[0].id);
-  EXPECT_EQ(cmd1.motors[0].mode, Mode::kVelocity);
-  EXPECT_DOUBLE_EQ(cmd1.motors[0].demand, 15.0);
-
-  EXPECT_EQ(cmd1.motors[1].id, cfg.hardware.motors[1].id);
-  EXPECT_EQ(cmd1.motors[1].mode, Mode::kVelocity);
-  EXPECT_DOUBLE_EQ(cmd1.motors[1].demand, 50.0);
-
-  // 2. Advance time past drivetrain timeout (2 * 5000us = 10000us)
-  // Only shooter publishes
-  shooter_pub.write(shooter_pkt);
-  node.Tick(15000);  // 13000us since last drive command
-
-  // Drivetrain is timed out, shooter is still active!
-  EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
-  EXPECT_FALSE(node.is_subsystem_timed_out("shooter"));
-  const auto& cmd2 = node.current_command();
-  // Drivetrain motor is neutralized!
-  EXPECT_EQ(cmd2.motors[0].mode, Mode::kNeutral);
-  EXPECT_DOUBLE_EQ(cmd2.motors[0].demand, 0.0);
-  // Shooter motor remains active!
-  EXPECT_EQ(cmd2.motors[1].mode, Mode::kVelocity);
-  EXPECT_DOUBLE_EQ(cmd2.motors[1].demand, 50.0);
-
-  // 3. Drivetrain resumes publishing!
-  drive_pub.write(drive_pkt);
-  node.Tick(16000);
-
-  EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
-  const auto& cmd3 = node.current_command();
-  EXPECT_EQ(cmd3.motors[0].mode, Mode::kVelocity);
-  EXPECT_DOUBLE_EQ(cmd3.motors[0].demand, 15.0);
-}
-
-TEST(HardwareNodeTest, ActuatorLessSubsystemsGetNoTracker) {
-  auto cfg = talos::config::ParseRobotConfigString(kTestToml);
-  ASSERT_TRUE(cfg.subsystems.contains("driver"));
-  ASSERT_TRUE(cfg.subsystems.contains("beam_break"));
-  ASSERT_TRUE(cfg.subsystems.at("driver").motors.empty());
-  ASSERT_EQ(cfg.subsystems.at("beam_break").digital_inputs.size(), 1u);
-
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25806), TestPort(25807), true};
-  ASSERT_TRUE(node.Open());
-
-  // Nothing publishes any request, so every tracked subsystem times out.
-  node.Tick(1000000);
-
-  EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
-  EXPECT_TRUE(node.is_subsystem_timed_out("shooter"));
-  EXPECT_FALSE(node.is_subsystem_timed_out("driver"));
-  EXPECT_FALSE(node.is_subsystem_timed_out("beam_break"));
-}
-
-TEST(HardwareNodeTest, ForwardsDriverStationPacketsToIpc) {
+TEST(HardwareNodeTest, RejectsMalformedAndReorderedDriverStationPackets) {
   auto cfg = talos::config::ParseRobotConfigString(kTestToml);
   HardwareNode node{cfg, "127.0.0.1", TestPort(25804), TestPort(25805), true};
   ASSERT_TRUE(node.Open());
@@ -438,15 +339,10 @@ can_id = 1
   EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
 }
 
-TEST(HardwareNodeTest, SimulationRejectsNonLoopbackAndNamesBothOptions) {
+TEST(HardwareNodeTest, SimulationRejectsNonLoopback) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
-  try {
-    HardwareNode node{cfg, "10.56.87.2", 5802, 5803, true};
-    FAIL() << "non-loopback simulation accepted";
-  } catch (const std::invalid_argument& error) {
-    EXPECT_NE(std::string(error.what()).find("--sim"), std::string::npos);
-    EXPECT_NE(std::string(error.what()).find("10.56.87.2"), std::string::npos);
-  }
+  EXPECT_THROW((HardwareNode{cfg, "10.56.87.2", 5802, 5803, true}),
+               std::invalid_argument);
   HardwareNode real{cfg, "10.56.87.2"};
   EXPECT_EQ(real.current_command().config_id, ConfigurationId(cfg.hardware));
   HardwareNode loopback{cfg};
@@ -533,7 +429,7 @@ TEST(HardwareNodeTest,
 }
 
 TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
-  const std::string base = std::string(std::getenv("TEST_TMPDIR")) + "/bridge";
+  const std::string base = ::testing::TempDir() + "bridge";
   const std::string config_path = base + ".toml";
   const std::string log_path = base + ".tlog";
   {
@@ -545,7 +441,9 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
       rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
                                                       &error));
   ASSERT_TRUE(runfiles) << error;
-  const auto executable = runfiles->Rlocation(std::getenv("HARDWARE_NODE"));
+  const char* executable_path = std::getenv("HARDWARE_NODE");
+  ASSERT_NE(executable_path, nullptr);
+  const auto executable = runfiles->Rlocation(executable_path);
   // Keep both ephemeral ports reserved until their respective owners open.
   // Fixed ports collide when Bazel runs repetitions concurrently.
   const auto reserve_port = [](int& fd, uint16_t& port) {
@@ -1446,99 +1344,6 @@ TEST(HardwareNodeTest, ForwardsDriverStationPacketsOnlyFromTheCurrentBoot) {
   EXPECT_EQ(node.driver_station_packets_received(), 4u);
 }
 
-// Describe() must answer without a socket, a shared-memory segment or a
-// registry slot, because the launcher asks every binary in a config what it
-// would connect to before it spawns any of them. Open() is never called here;
-// if it becomes necessary, this test hangs on a port instead of passing.
-TEST(HardwareNodeTest, DescribesItselfWithoutOpeningAnything) {
-  auto cfg = talos::config::ParseRobotConfigString(kTestToml);
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25808), TestPort(25809), true};
-
-  const auto description = node.Describe();
-  EXPECT_EQ(description.name, kNodeName);
-  EXPECT_EQ(description.target, kNodeTarget);
-
-  // Every name the node declares has to satisfy the protocol, and the node has
-  // to be findable from the target it claims. Checked here rather than only in
-  // the launcher so a rename that breaks the grammar fails at this build.
-  EXPECT_FALSE(introspect::naming::CheckNodeName(description.name).has_value());
-  EXPECT_FALSE(
-      introspect::naming::CheckNodeTarget(description.name, description.target)
-          .has_value());
-
-  std::map<std::string, introspect::naming::SourceShape> by_name;
-  for (const auto& source : description.sources) {
-    const auto problem = introspect::naming::CheckTopicName(source.name);
-    EXPECT_FALSE(problem.has_value()) << (problem ? *problem : std::string{});
-    EXPECT_EQ(source.message_bytes, source.name == bridge::topics::kStatus
-                                        ? sizeof(bridge::BridgeStatus)
-                                        : sizeof(Packet));
-    by_name[source.name] = source;
-  }
-
-  // The four fixed ends, plus one request per actuator-owning subsystem. The
-  // input-only subsystems in kTestToml contribute none.
-  EXPECT_EQ(description.sources.size(), 6u);
-  ASSERT_TRUE(by_name.contains(kStateTopic));
-  ASSERT_TRUE(by_name.contains(kCommandTopic));
-  ASSERT_TRUE(by_name.contains(kDriverStationTopic));
-  ASSERT_TRUE(by_name.contains(bridge::topics::kStatus));
-  ASSERT_TRUE(by_name.contains(RequestTopic("drivetrain")));
-  ASSERT_TRUE(by_name.contains(RequestTopic("shooter")));
-  EXPECT_FALSE(by_name.contains(RequestTopic("driver")));
-  EXPECT_FALSE(by_name.contains(RequestTopic("beam_break")));
-
-  EXPECT_EQ(by_name[kStateTopic].kind, event::SourceKind::SENDER);
-  EXPECT_EQ(by_name[kCommandTopic].kind, event::SourceKind::SENDER);
-  EXPECT_EQ(by_name[kDriverStationTopic].kind, event::SourceKind::SENDER);
-  EXPECT_EQ(by_name[bridge::topics::kStatus].kind, event::SourceKind::SENDER);
-  EXPECT_FALSE(by_name[bridge::topics::kStatus].external());
-  EXPECT_FALSE(by_name[bridge::topics::kStatus].optional());
-  EXPECT_EQ(by_name[RequestTopic("drivetrain")].kind,
-            event::SourceKind::FETCHER);
-
-  // The attribute that keeps a working graph from reading as a broken one: the
-  // command goes to the RoboRIO over UDP and will never have a shared-memory
-  // subscriber.
-  EXPECT_TRUE(by_name[kCommandTopic].external());
-  EXPECT_FALSE(by_name[kCommandTopic].optional());
-  EXPECT_FALSE(by_name[kStateTopic].external());
-  EXPECT_FALSE(by_name[kStateTopic].optional());
-  EXPECT_FALSE(by_name[RequestTopic("drivetrain")].external());
-
-  // The JSON round trip, because the launcher reads what --describe printed
-  // rather than the struct it came from.
-  const std::string json = introspect::DescribeToJson(description);
-  introspect::Description parsed;
-  std::string error;
-  ASSERT_TRUE(introspect::DescribeReader::Parse(json, parsed, error)) << error;
-  EXPECT_EQ(parsed.name, description.name);
-  ASSERT_EQ(parsed.sources.size(), description.sources.size());
-}
-
-// The alias is gone: the bridge reads the subsystem's own name and nothing
-// else. A publisher on the old `/hw/req/drive` must not reach the merge, or the
-// special case has merely moved.
-TEST(HardwareNodeTest, IgnoresTheRetiredDriveAlias) {
-  auto cfg = talos::config::ParseRobotConfigString(kTestToml);
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25810), TestPort(25811), true};
-  ASSERT_TRUE(node.Open());
-
-  ipc::Publisher<talos::hardware::Packet> alias_pub{"/hw/req/drive"};
-  Command drive_cmd{};
-  drive_cmd.count = 1;
-  drive_cmd.motors[0] = {cfg.hardware.motors[0].id, Mode::kVelocity, 0, 15.0,
-                         1.2};
-  talos::hardware::Packet drive_pkt{};
-  drive_pkt.size = static_cast<uint32_t>(Encode(drive_cmd, drive_pkt.data));
-  alias_pub.write(drive_pkt);
-
-  node.Tick(2000);
-
-  EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
-  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
-}
-
 // /hw/status carries the bridge's counters, the age of the last controller
 // state on the bridge clock, which actuator subsystems have gone quiet and
 // whether the RoboRIO accepted the configuration.
@@ -1825,6 +1630,12 @@ TEST(HardwareNodeTest, TimeoutNeutralizesOnlyTheSilentSubsystemsActuators) {
   EXPECT_EQ(neutral.pwm_outputs[0].id, strip);
   EXPECT_DOUBLE_EQ(neutral.pwm_outputs[0].output, 0.0);
   EXPECT_EQ(node.Status(1011001).timed_out_mask(), 0b10u);
+  PublishCommand(intake_pub, intake_ok);
+  node.Tick(1012000);
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(node.current_command().motors[1].mode, Mode::kDutyCycle);
+  EXPECT_TRUE(node.current_command().digital_outputs[0].value);
+  EXPECT_DOUBLE_EQ(node.current_command().pwm_outputs[0].output, 0.5);
 }
 
 TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {

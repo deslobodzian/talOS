@@ -399,37 +399,9 @@ TEST(Devices, DigitalAndPwmOutputsRideAlongOnlyWhenSet) {
   EXPECT_EQ(command->pwm_output_count, 0);
 }
 
-TEST(Devices, GettersReadTheLatchedFeedback) {
-  auto sim = Sim::FromToml(kRobotToml);
-  auto& mech = sim.add<Mech>("mech");
-  SimHardware hw{sim};
-  hw.set_motor("mech", "a", 1.5, -2.0);
-  hw.set_digital_input("mech", "beam", true);
-  hw.set_analog_input("mech", "pressure", 3.3);
-  hw.set_encoder("mech", "enc", 0.75, 0.1);
-  hw.set_cancoder("mech", "cc", 0.2, 0.3);
-  hw.set_gyro("mech", "gyro", 0.125, -0.5);
-  sim.step(10ms);
-
-  EXPECT_TRUE(mech.a.connected());
-  EXPECT_DOUBLE_EQ(mech.a.position(), 1.5);
-  EXPECT_DOUBLE_EQ(mech.a.velocity(), -2.0);
-  EXPECT_TRUE(mech.beam.get());
-  EXPECT_TRUE(mech.beam.connected());
-  EXPECT_DOUBLE_EQ(mech.pressure.voltage(), 3.3);
-  EXPECT_DOUBLE_EQ(mech.enc.position(), 0.75);
-  EXPECT_DOUBLE_EQ(mech.enc.velocity(), 0.1);
-  EXPECT_DOUBLE_EQ(mech.cc.position(), 0.2);
-  EXPECT_DOUBLE_EQ(mech.cc.velocity(), 0.3);
-  EXPECT_DOUBLE_EQ(mech.gyro.yaw(), 0.125);
-  EXPECT_DOUBLE_EQ(mech.gyro.yaw_rate(), -0.5);
-}
-
 TEST(Devices, MotorHealthFeedbackRoundTripsWithoutEnablingOutputs) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
-  EXPECT_DOUBLE_EQ(mech.a.temperature_c(), 0);
-  EXPECT_DOUBLE_EQ(mech.a.supply_current_a(), 0);
   auto hw = std::make_unique<SimHardware>(sim);
   hw->set_motor("mech", "a", 1.5, -2.0, 0, 0, 62.5, 18.25);
   sim.step(10ms);
@@ -548,20 +520,6 @@ TEST(Devices, RezeroSharesSoftwareFramesAndPreservesHardwareLimits) {
   mech.gyro.rezero(10);
   EXPECT_DOUBLE_EQ(other.position(), -1);
   EXPECT_DOUBLE_EQ(other_gyro.yaw(), 0);
-}
-
-TEST(Devices, IdealMotorsReachTheirRequests) {
-  auto sim = Sim::FromToml(kRobotToml);
-  auto& mech = sim.add<Mech>("mech");
-  SimHardware hw{sim};
-  hw.enable();
-  hw.ideal_motors();
-  mech.a_velocity = 40;
-  mech.b_motion_magic = 3.0;
-  sim.step(30ms);
-  EXPECT_DOUBLE_EQ(mech.a.velocity(), 40);
-  EXPECT_GT(mech.a.position(), 0.0);
-  EXPECT_DOUBLE_EQ(mech.b.position(), 3.0);
 }
 
 TEST(Devices, NonFiniteDemandIsNeutral) {

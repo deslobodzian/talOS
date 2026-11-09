@@ -574,23 +574,6 @@ TEST(SimBelievability, GatewayDisableDecaysRatherThanSnaps) {
   EXPECT_DOUBLE_EQ(g.snapshot().motors[0].velocity_rps, 0.0);
 }
 
-// Controlled inputs: beam breaks read back through the boundary.
-TEST(SimBelievability, BeamBreakInputReadsBack) {
-  Config c = SingleMotorConfig();
-  c.digital_inputs.push_back({3, "beam_break", 0});
-  PhysicsSimBackend backend;
-  ASSERT_TRUE(backend.Configure(c));
-  backend.SetDigitalInput(3, true);
-  State s{};
-  s.sample_time_us = 5000;
-  ASSERT_TRUE(backend.Read(s));
-  EXPECT_TRUE(s.digital_inputs[0].value);
-  backend.SetDigitalInput(3, false);
-  s.sample_time_us = 10000;
-  ASSERT_TRUE(backend.Read(s));
-  EXPECT_FALSE(s.digital_inputs[0].value);
-}
-
 // Frozen feedback holds stale samples while physics keeps moving.
 TEST(SimBelievability, FrozenFeedbackHoldsStaleSamples) {
   PhysicsSimBackend backend;

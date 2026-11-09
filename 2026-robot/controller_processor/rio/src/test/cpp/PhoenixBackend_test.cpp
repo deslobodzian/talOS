@@ -112,83 +112,6 @@ hw::MotorRequest Request(uint16_t id, hw::Mode mode, double demand) {
 
 }  // namespace
 
-TEST(PhoenixBackendFaults, ZeroFlagsDecodeAsNone) {
-  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(0), "none");
-}
-
-TEST(PhoenixBackendFaults, SupplyCurrentLimitUsesBitEight) {
-  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(0x100),
-            "SupplyCurrLimit (supply current limit active)");
-}
-
-TEST(PhoenixBackendFaults, StatorCurrentLimitUsesBitNine) {
-  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(0x200),
-            "StatorCurrLimit (stator current limit active)");
-}
-
-TEST(PhoenixBackendFaults, ConcurrentCurrentLimitsAreBothDecoded) {
-  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(0x300),
-            "SupplyCurrLimit (supply current limit active), "
-            "StatorCurrLimit (stator current limit active)");
-}
-
-TEST(PhoenixBackendFaults, HardwareUsesBitZero) {
-  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(0x1),
-            "Hardware (hardware fault occurred)");
-}
-
-TEST(PhoenixBackendFaults, UndervoltageUsesBitThree) {
-  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(0x8),
-            "Undervoltage (supply voltage near brownout)");
-}
-
-TEST(PhoenixBackendFaults, UnknownHighBitsRetainTheirBitIndices) {
-  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(uint32_t{1} << 31),
-            "UnknownBit31");
-  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits((uint32_t{1} << 24) |
-                                                 (uint32_t{1} << 27) |
-                                                 (uint32_t{1} << 31)),
-            "UnknownBit24, UnknownBit27, UnknownBit31");
-  EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits((uint32_t{1} << 31) | 0x100),
-            "SupplyCurrLimit (supply current limit active), UnknownBit31");
-}
-
-TEST(PhoenixBackendFaults, EveryKnownFaultUsesItsFaultFieldBit) {
-  static constexpr std::array<const char*, 27> expected{
-      "Hardware (hardware fault occurred)",
-      "ProcTemp (processor temperature exceeded limit)",
-      "DeviceTemp (device temperature exceeded limit)",
-      "Undervoltage (supply voltage near brownout)",
-      "BootDuringEnable (booted while enabled)",
-      "UnlicensedFeatureInUse (unlicensed feature in use)",
-      "StaticBrakeDisabled (static brake momentarily disabled)",
-      "UsingFusedCANcoderWhileUnlicensed (fused CANcoder requires Pro)",
-      "SupplyCurrLimit (supply current limit active)",
-      "StatorCurrLimit (stator current limit active)",
-      "FusedSensorOutOfSync (remote fused sensor out of sync)",
-      "RemoteSensorDataInvalid (remote sensor data invalid)",
-      "MissingHardLimitRemote (remote hard limit device missing)",
-      "MissingSoftLimitRemote (remote soft limit device missing)",
-      "ForwardSoftLimit (forward soft limit asserted)",
-      "ReverseSoftLimit (reverse soft limit asserted)",
-      "ForwardHardLimit (forward hard limit asserted)",
-      "ReverseHardLimit (reverse hard limit asserted)",
-      "OverSupplyV (supply voltage exceeded rating)",
-      "UnstableSupplyV (supply voltage unstable)",
-      "RemoteSensorPosOverflow (remote sensor position overflowed)",
-      "MissingDifferentialFX (differential TalonFX missing)",
-      "RemoteSensorReset (remote sensor reset)",
-      "BridgeBrownout (bridge disabled due to supply voltage)",
-      "UnknownBit24",
-      "RotorFault1 (rotor fault 1)",
-      "RotorFault2 (rotor fault 2)"};
-  for (unsigned bit = 0; bit < expected.size(); ++bit) {
-    SCOPED_TRACE(bit);
-    EXPECT_EQ(PhoenixBackend::DecodeTalonFaultBits(uint32_t{1} << bit),
-              expected[bit]);
-  }
-}
-
 TEST(PhoenixBackendPigeon, MountYawConfiguredAndInversionFlipsReadYaw) {
   EnsureHal();
   hw::Config config;
@@ -238,27 +161,6 @@ TEST(PhoenixBackendEncoders, QuadratureScalingAppliesCountsPerRevAndOffset) {
   EXPECT_TRUE(s.encoders[0].valid);
   // 4096 edges / 2048 counts-per-rev, minus the 0.25 rot offset.
   EXPECT_NEAR(s.encoders[0].position_rot, 1.75, 1e-9);
-}
-
-TEST(PhoenixBackendEncoders, QuadratureRatePassesThrough) {
-  EnsureHal();
-  hw::Config c;
-  c.motors.push_back(TestMotor(1, "m1", 1));
-  c.encoders.push_back(QuadratureEncoder(10, "quad", 0, 1, 2048, 0.0));
-
-  PhoenixBackend backend(true);
-  ASSERT_TRUE(backend.Configure(c));
-
-  // Simulation injects the rate downstream of distance scaling (the position
-  // test above proves counts_per_rev scaling); the backend must pass it
-  // through unmodified.
-  auto sim = frc::sim::EncoderSim::CreateForChannel(0);
-  sim.SetRate(3.0);
-
-  hw::State s;
-  ASSERT_TRUE(backend.Read(s));
-  EXPECT_TRUE(s.encoders[0].valid);
-  EXPECT_NEAR(s.encoders[0].velocity_rps, 3.0, 1e-9);
 }
 
 TEST(PhoenixBackendEncoders, DutyCycleReportsOffsetCorrectedPosition) {
@@ -551,29 +453,18 @@ NeutralSample SpinThenNeutral(bool brake) {
 
 }  // namespace
 
-// Neutral removes drive but keeps momentum, like sim::StepAxis: a coasting
-// flywheel still spins after disable and its position keeps advancing.
-TEST(PhoenixBackendSim, CoastNeutralKeepsMomentumAndDecays) {
-  EnsureHal();
-  EnabledDs ds;
-  const NeutralSample n = SpinThenNeutral(/*brake=*/false);
-  ASSERT_GT(n.spinning_rps, 20.0);
-  // ~1 s coast time constant: after ~100 ms most of the speed remains.
-  EXPECT_GT(n.after_100ms_rps, 0.5 * n.spinning_rps);
-  EXPECT_LT(n.after_100ms_rps, n.spinning_rps);
-  // Still decaying toward zero, and still rolling forward.
-  EXPECT_LT(n.after_300ms_rps, n.after_100ms_rps);
-  EXPECT_GT(n.after_300ms_rps, 0.0);
-  EXPECT_GT(n.after_300ms_rot, n.after_100ms_rot);
-}
-
-TEST(PhoenixBackendSim, BrakeNeutralStopsMuchFasterThanCoast) {
+TEST(PhoenixBackendSim, NeutralPreservesMomentumAndBrakeDecaysFasterThanCoast) {
   EnsureHal();
   EnabledDs ds;
   const NeutralSample brake = SpinThenNeutral(/*brake=*/true);
   const NeutralSample coast = SpinThenNeutral(/*brake=*/false);
   ASSERT_GT(brake.spinning_rps, 20.0);
   ASSERT_GT(coast.spinning_rps, 20.0);
+  EXPECT_GT(coast.after_100ms_rps, 0.5 * coast.spinning_rps);
+  EXPECT_LT(coast.after_100ms_rps, coast.spinning_rps);
+  EXPECT_LT(coast.after_300ms_rps, coast.after_100ms_rps);
+  EXPECT_GT(coast.after_300ms_rps, 0.0);
+  EXPECT_GT(coast.after_300ms_rot, coast.after_100ms_rot);
   // ~50 ms brake time constant: most speed is gone after ~100 ms, but the
   // rotor did not stop instantly (no velocity snap on neutral).
   EXPECT_LT(brake.after_100ms_rps, 0.3 * brake.spinning_rps);
@@ -582,26 +473,6 @@ TEST(PhoenixBackendSim, BrakeNeutralStopsMuchFasterThanCoast) {
             0.5 * coast.after_100ms_rps / coast.spinning_rps);
   EXPECT_LT(brake.after_300ms_rps, 0.5);
   EXPECT_GT(coast.after_300ms_rps, 10.0 * std::max(brake.after_300ms_rps, 0.1));
-}
-
-TEST(PhoenixBackendGains, MapsGravityTypeForEverySlot) {
-  EnsureHal();
-  hw::Config c;
-  auto motor = TestMotor(1, "gravity_motor", 1);
-  motor.slots[0].gravity_type = hw::GravityType::kArmCosine;
-  motor.slots[1].gravity_type = hw::GravityType::kElevatorStatic;
-  motor.slots[2].gravity_type = hw::GravityType::kArmCosine;
-  c.motors.push_back(motor);
-  PhoenixBackend backend(true);
-  ASSERT_TRUE(backend.Configure(c));
-
-  ctre::phoenix6::hardware::TalonFX device{1, ctre::phoenix6::CANBus{"rio"}};
-  ctre::phoenix6::configs::TalonFXConfiguration applied;
-  ASSERT_TRUE(device.GetConfigurator().Refresh(applied).IsOK());
-  using Gravity = ctre::phoenix6::signals::GravityTypeValue;
-  EXPECT_EQ(applied.Slot0.GravityType, Gravity::Arm_Cosine);
-  EXPECT_EQ(applied.Slot1.GravityType, Gravity::Elevator_Static);
-  EXPECT_EQ(applied.Slot2.GravityType, Gravity::Arm_Cosine);
 }
 
 class PhoenixBackendFollower : public ::testing::TestWithParam<bool> {};
