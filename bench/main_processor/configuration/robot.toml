@@ -1,0 +1,28 @@
+[robot]
+name = "bench"
+period_us = 5000
+command_timeout_us = 100000
+status_hz = 200.0
+commissioned = false
+require_target_coverage = true
+controller_address = "127.0.0.1"
+controller_port = 5802
+local_port = 5803
+sim_gateway = "//2026-robot/main_processor/simulation:sim_gateway"
+
+[robot.targets]
+teleop = ["teleop"]
+autonomous = []
+test = []
+
+[[subsystems]]
+name = "motor"
+path = "subsystems/motor.toml"
+
+[[subsystems]]
+name = "teleop"
+path = "subsystems/teleop.toml"
+
+[[subsystems]]
+name = "telemetry"
+path = "subsystems/telemetry.toml"

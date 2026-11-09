@@ -1,0 +1,27 @@
+namespace motor;
+enum ControlMode : ubyte { NEUTRAL, VOLTAGE, VELOCITY }
+enum TargetSource : ubyte { NONE, TELEOP }
+struct MotorTarget {
+  mode:ControlMode;
+  voltage_v:double;
+  velocity_rps:double;
+  // Normalized teleop axis, scaled by max_bench_voltage_v in the node.
+  voltage_frac:double;
+}
+struct MotorState {
+  sample_time_ns:uint64;
+  position_rot:double;
+  velocity_rps:double;
+  applied_voltage_v:double;
+  stator_current_a:double;
+  hardware_age_us:uint64;
+  position_age_us:uint64;
+  velocity_age_us:uint64;
+  acquisition_valid:bool;
+  connected:bool;
+  fault:bool;
+  fault_valid:bool;
+  enabled:bool;
+  mode:ControlMode;
+  source:TargetSource;
+}
