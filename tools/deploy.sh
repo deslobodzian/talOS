@@ -88,6 +88,7 @@ Type=notify
 User=$user
 Environment=\"TALOS_LOG_DIR=$PREFIX/logs\"
 ExecStart=$PREFIX/current/run.sh
+TimeoutStartSec=1200
 WatchdogSec=3
 Restart=always
 RestartSec=2

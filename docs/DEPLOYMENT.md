@@ -106,6 +106,16 @@ does not weaken the graph checks with `--allow-graph-errors`.
 `--describe-timeout-ms MS` adjusts the existing 15000 ms per-probe deadline
 and can be passed through `run.sh`.
 
+The Linux unit sets `TimeoutStartSec=1200` (20 minutes), independently of
+the running watchdog. Budget startup as at most two sequential probes per
+roster member (initial description plus graph-reader re-probe), each with the
+default 15-second deadline: up to 32 members take at most 960 seconds of probe
+waiting, leaving 240 seconds for config/graph setup and process spawning.
+Larger graphs or `--describe-timeout-ms` overrides must fit this same finite
+budget or explicitly increase the installed unit's timeout. A genuinely hung
+startup is killed by systemd at the deadline; watchdog notifications only begin
+after READY, from the supervision loop, never an independent heartbeat.
+
 On Linux the launcher sends `READY=1` when the graph has started and enters
 supervision, then `WATCHDOG=1` on each supervision iteration (normally every
 20 ms). `WatchdogSec=3` leaves substantial scheduling and manifest-write
