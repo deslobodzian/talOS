@@ -40,9 +40,10 @@ TEST(ParallelDetector, AprilTagRowBands) {
 }
 
 // This is the actual backend's cvtColor path, not an unrelated parallel_for_.
-// Run with OPENCV_FOR_THREADS_NUM=4 to probe the unsuppressed pool; the default
-// TSan suite intentionally retains the documented OpenCV serial exemption.
+// Force four workers so this regression remains parallel on small CI hosts.
 TEST(ParallelDetector, OpenCvColorConversion) {
+  cv::setNumThreads(4);
+  ASSERT_EQ(cv::getNumThreads(), 4);
   const cv::Mat gray = Fixture();
   ASSERT_FALSE(gray.empty());
   cv::Mat large;

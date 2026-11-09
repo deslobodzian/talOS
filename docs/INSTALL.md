@@ -116,8 +116,18 @@ This is bounded fixture coverage, not proof of all possible detector inputs.
 
 Run sanitizer builds in their own output bases
 (`bazel --output_base=$HOME/.cache/bazel-talos-asan ...`, and `...-tsan`) so they
-do not evict the default build's cache. AprilTag JPEG signed-shift checks and
-OpenCV internal parallel execution remain exempt as described in `.bazelrc`.
+do not evict the default build's cache.
+
+OpenCV 4.12's pthread pool had a real race on its `volatile bool isActive`:
+running the color-conversion probe with four OpenCV workers reproduced a
+`cv::ThreadPool::run` read versus worker write through the production backend's
+`cvtColor(BGR2GRAY)` call. The dependency patch makes that flag atomic and removes
+upstream's Clang-only `thread_body` instrumentation suppression. TSan no longer
+forces `OPENCV_FOR_THREADS_NUM=1`; the probe explicitly selects four workers.
+Linux V4L2 capture supplies GREY or YUYV (not JPEG/BGR); GREY bypasses OpenCV,
+and YUYV-to-gray uses `extractChannel` rather than the color parallel dispatcher.
+BGR/BGRA/RGB backend inputs and synthetic-image processing can reach OpenCV's
+parallel paths.
 The ordinary suite also covers excluded Python-host and full-stack paths.
 Deterministic mutation corpora are not continuous coverage-guided fuzzing.
 

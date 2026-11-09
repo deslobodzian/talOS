@@ -40,6 +40,6 @@ build:tsan --copt=-fno-omit-frame-pointer --copt=-O1 --cxxopt=-O1
 test:tsan --test_tag_filters=-no_tsan
 # AprilTag parent accesses are patched to relaxed atomics; its quad-threshold
 # code remains TSan-instrumented, including parallel row-band clustering.
-# OpenCV's normal parallel cvtColor path still needs qualification; the serial
-# exemption below hides its pool races, not a proven false positive.
-test:tsan --test_env=OPENCV_FOR_THREADS_NUM=1
+# OpenCV's pthread worker activity flag is patched to atomic accesses, and its
+# upstream thread_body suppression is removed. Normal internal parallelism is
+# enabled under TSan; no OpenCV thread-count environment override is applied.
