@@ -23,6 +23,21 @@ say() { printf 'deploy: %s\n' "$*"; }
 die() { printf 'deploy: error: %s\n' "$*" >&2; exit 1; }
 run() { if [ "$DRY_RUN" = "1" ]; then printf '+ %s\n' "$*"; else "$@"; fi; }
 
+# Rename the link itself even when the destination names a directory.
+select_bundle() {
+  run python3 -c '
+import os, sys, uuid
+target, link = sys.argv[1:]
+temporary = link + ".tmp." + uuid.uuid4().hex
+try:
+    os.symlink(target, temporary)
+    os.replace(temporary, link)
+finally:
+    if os.path.lexists(temporary):
+        os.unlink(temporary)
+' "$1" "$2"
+}
+
 # --- install ---------------------------------------------------------------
 # Copies the bundle and flips `current` atomically, keeping `previous` for
 # rollback.
@@ -43,11 +58,10 @@ cmd_install() {
   run cp -RP "$bundle" "$dest"
   run chmod -R a-w "$dest" 2>/dev/null || true
   if [ -L "$PREFIX/current" ]; then
-    run rm -f "$PREFIX/previous"
-    run cp -P "$PREFIX/current" "$PREFIX/previous"
+    select_bundle "$(readlink "$PREFIX/current")" "$PREFIX/previous"
   fi
-  run ln -sfn "$dest" "$PREFIX/current"
-  say "current -> $dest (previous kept for rollback)"
+  select_bundle "$dest" "$PREFIX/current"
+  say "current -> $dest (previous kept); restart the service to activate"
 }
 
 # --- enable-boot ------------------------------------------------------------
@@ -220,9 +234,9 @@ EOF
 cmd_rollback() {
   [ -L "$PREFIX/previous" ] || die "no previous bundle to roll back to"
   local cur; cur="$(readlink "$PREFIX/current")"
-  run ln -sfn "$(readlink "$PREFIX/previous")" "$PREFIX/current"
-  run ln -sfn "$cur" "$PREFIX/previous"
-  say "rolled back: current -> $(readlink "$PREFIX/current")"
+  select_bundle "$(readlink "$PREFIX/previous")" "$PREFIX/current"
+  select_bundle "$cur" "$PREFIX/previous"
+  say "rolled back: current -> $(readlink "$PREFIX/current"); restart the service to activate"
 }
 
 usage() { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }

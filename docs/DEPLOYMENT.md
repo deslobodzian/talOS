@@ -57,8 +57,9 @@ launch; use `--remote-port` and `--local-port` if the ports also differ.
 ```
 
 - **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only,
-  symlinks kept), moves `current` to `previous`, and points `current` at the
-  new one.
+  symlinks kept), retains `previous`, and atomically replaces `current` using
+  a temporary sibling symlink and rename (Linux and macOS). This selects the
+  next bundle; restart the service to activate it.
 - **enable-boot** starts `<prefix>/current/run.sh` at boot as `--user`
   (default `talos`; the account must exist). Linux: writes and enables
   `/etc/systemd/system/talos.service` (`Type=notify`, `Restart=always`, a
@@ -81,7 +82,10 @@ launch; use `--remote-port` and `--local-port` if the ports also differ.
   directory to the analysis machine. Existing destination session names are
   rejected rather than merged; choose a fresh destination for each collection.
 - **rollback** swaps `current` and `previous`: the whole previous bundle, with
-  its own config.
+  its own config. Selection does not change already-running processes.
+  With the robot disabled, activate install/rollback with
+  `sudo systemctl restart talos` on Linux, or
+  `sudo launchctl kickstart -k system/org.talos.robot` on macOS.
 
 Run by hand: `/opt/talos/current/run.sh --duration-s 30`.
 
