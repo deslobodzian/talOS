@@ -67,7 +67,7 @@ int main(int argc, char** argv) try {
   // The segment exists now; tests wait for this line before starting a bridge.
   std::cout << "ready\n" << std::flush;
 
-  const std::vector<ChannelDef> dictionary = {
+  std::vector<ChannelDef> dictionary = {
       {"drive/velocity", "m/s", {}},
       {"intake/inhibit",
        "",
@@ -75,6 +75,14 @@ int main(int argc, char** argv) try {
         "FEEDBACK_INVALID", "DEMAND_NONFINITE"}},
       {"pose/valid", "", {}},
   };
+  const auto channels = argc > 2 ? std::stoul(argv[2]) : dictionary.size();
+  if (channels < dictionary.size() || channels > 64) {
+    throw std::runtime_error("mock channel count must be in [3, 64]");
+  }
+  while (dictionary.size() < channels) {
+    dictionary.push_back(
+        {"test/channel_" + std::to_string(dictionary.size()), "unit", {}});
+  }
   const std::uint32_t dictionary_id = DictionaryId(dictionary);
   std::random_device device;
   const std::uint64_t stream_id =
@@ -82,6 +90,7 @@ int main(int argc, char** argv) try {
 
   std::array<std::byte, wire::slot_bytes> slot{};
   flatbuffers::FlatBufferBuilder builder;
+  std::vector<double> samples(dictionary.size(), 1.0);
   auto next = std::chrono::steady_clock::now();
   for (std::uint64_t seq = 0; !stop; ++seq) {
     builder.Clear();
@@ -111,11 +120,15 @@ int main(int argc, char** argv) try {
     }
     const double inhibit =
         static_cast<double>((seq / 200) % dictionary[1].labels.size());
-    auto values = builder.CreateVector(
-        std::vector<double>{0.75 + 0.25 * std::sin(t), inhibit, 1.0});
+    samples[0] = 0.75 + 0.25 * std::sin(t);
+    samples[1] = inhibit;
+    auto values = builder.CreateVector(samples);
     auto frame = Talos::Telemetry::CreateFrame(
-        builder, stream_id, seq, seq * 5000000ULL, dictionary_id, &pose, values,
-        dictionary_offset);
+        builder, stream_id, seq,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count(),
+        dictionary_id, &pose, values, dictionary_offset);
     Talos::Telemetry::FinishSizePrefixedFrameBuffer(builder, frame);
     const auto size = builder.GetSize();
     if (size > slot.size()) throw std::runtime_error("frame exceeds slot");

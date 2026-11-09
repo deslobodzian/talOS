@@ -48,6 +48,8 @@ struct BridgeStats {
   std::uint64_t frames_forwarded{0};
   std::uint64_t invalid{0};
   std::uint64_t ws_drops{0};
+  std::uint64_t refused{0};
+  std::uint64_t egress_bytes{0};
 };
 
 inline void AppendEscaped(std::string& out, std::string_view value) {
@@ -397,6 +399,10 @@ inline std::string SystemGraphJson(const SystemGraphInput& input) {
   AppendU64(out, input.bridge.invalid);
   out += ",\"ws_drops\":";
   AppendU64(out, input.bridge.ws_drops);
+  out += ",\"refused\":";
+  AppendU64(out, input.bridge.refused);
+  out += ",\"egress_bytes\":";
+  AppendU64(out, input.bridge.egress_bytes);
   out += '}';
 
   out += ",\"nodes\":[";

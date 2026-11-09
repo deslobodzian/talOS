@@ -45,6 +45,73 @@ the wire) as `null`, and `age_ms` since the bridge received the frame. Both answ
 until a dictionary (and, for `/telemetry.json`, an aligned frame) has
 arrived: "not known yet" is not "the robot is doing nothing".
 
+## Radio operating limit
+
+Run exactly one bridge per robot. `[studio] max_clients = 4` is the default
+(integer 1–64); the launcher forwards its config, and a manual bridge reads it
+with `--config PATH`. Extra WebSocket upgrades receive HTTP **503 Studio client
+limit**, `Retry-After: 5`, and `Studio client limit reached`.
+
+The telemetry/pose binary stream, system graph text stream, and connect-time
+snapshots share a **160,000 bytes/s** WebSocket egress token bucket with a
+**64,000-byte** burst. Each client also has a `160000 / max_clients` bytes/s
+bucket (64,000-byte burst), so one busy reader cannot monopolize the stream.
+Bytes include conservative WebSocket framing; the shared bucket also bounds
+reconnect bursts. The steady ceiling is **1.28 Mbit/s**, leaving headroom under
+the whole-robot 4 Mbit/s field limit for IP/TCP/radio overhead, control and
+other traffic. This is not a whole-robot bandwidth guarantee: static assets,
+HTTP JSON requests, camera streams and other processes are outside this
+WebSocket budget. Load Studio assets over wired/local networking before a
+match; do not repeatedly fetch HTTP snapshots across the field radio.
+
+When budget is exhausted or a client has pending userspace output, the bridge
+drops that observation rather than adding old frames to its queue. A stalled
+client retains its client slot until disconnected; it does not stall IPC
+consumption or another reader. TCP may retain already accepted bytes for that
+client, so a viewer that resumes after stalling should reconnect for fresh
+data. `/system.json` and the system WebSocket graph expose `clients`,
+`refused`, `ws_drops` (budget/backpressure drops), and `egress_bytes`
+(cumulative accepted WebSocket bytes); counters are refreshed every 250 ticks
+and also printed on shutdown.
+
+Rerun the real-IPC load probe (Linux RSS, source-monotonic frame age, no frame
+format changes):
+
+```sh
+bazel build //studio/bridge:studio_bridge //studio/bridge:studio_mock
+python studio/bridge/bandwidth_test.py --measure bazel-bin/studio/bridge --seconds 8
+```
+
+The publisher emits 64 channels plus pose at 200 Hz, with a dictionary every
+100 frames. The probe runs one viewer, four viewers, four plus an excess
+connection, and three reading viewers plus one never-reading admitted viewer
+and an excess connection. The stalled socket has a 1 KiB receive buffer.
+Age excludes the intentionally cached first binary snapshot; egress measures
+WebSocket bytes, not Ethernet/IP overhead.
+
+Measured on the Linux development host, 2026-11-09, eight seconds per case:
+
+| Admitted / attempted | Read egress/client (kB/s) | Accepted total (kB/s) | RSS (KiB) | Worst p99 / max age (ms) | Drops / refused |
+|---|---:|---:|---:|---:|---:|
+| 1 / 1 | 45.4 | 45.7 | 6712 | 1.61 / 2.58 | 984 / 0 |
+| 4 / 4 | 24.8–45.5 | 154.6 | 6680 | 1.83 / 7.83 | 4100 / 0 |
+| 4 / 5 | 24.8–45.5 | 159.1 | 6588 | 2.05 / 6.96 | 4232 / 1 |
+| 4 (one stalled) / 5 | 44.7–47.6 | 165.1 | 6672 | 5.82 / 8.92 | 4424 / 1 |
+
+Decimal kB/s; total is the graph's accepted-byte counter divided by elapsed
+probe time, including bytes buffered for the stalled client. Counters can lag
+one refresh. The initial burst explains short-run rates above the steady
+per-client/aggregate rate. Before enforcement, the regression admitted five
+clients, reported zero drops, and each reading client received 132.3 kB/s
+(three reading clients alone consumed 3.18 Mbit/s, before the stalled/excess
+connections and network overhead). Four such readers exceed the whole-robot
+4 Mbit/s allowance. The same regression now checks refusal, drops, accepted
+bytes bounded by `160000 * elapsed_seconds + 64000`, p99 age <100 ms and max
+age <500 ms despite the admitted stalled socket. These are host-loopback
+measurements, not field-radio or macOS qualification; repeat the probe over
+the actual robot radio with other robot traffic before competition.
+
+
 ## The system graph
 
 Telemetry says what one node chose to publish. It does not say what is running,

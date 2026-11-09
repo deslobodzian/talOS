@@ -3,6 +3,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <filesystem>
@@ -25,7 +27,28 @@ namespace fs = std::filesystem;
 namespace {
 volatile std::sig_atomic_t stop = 0;
 void signal_handler(int) { stop = 1; }
-struct Client {};
+struct EgressBudget {
+  static constexpr double kBytesPerSecond = 160000;
+  static constexpr double kBurstBytes = 64000;
+  double tokens = kBurstBytes;
+  std::chrono::steady_clock::time_point updated =
+      std::chrono::steady_clock::now();
+
+  bool available(std::size_t bytes, double rate) {
+    const auto now = std::chrono::steady_clock::now();
+    tokens = std::min(
+        kBurstBytes,
+        tokens + std::chrono::duration<double>(now - updated).count() * rate);
+    updated = now;
+    return tokens >= static_cast<double>(bytes);
+  }
+};
+struct Client {
+  EgressBudget budget;
+  std::uint64_t stream_id = 0;
+  std::uint32_t dictionary_id = 0;
+  bool has_dictionary = false;
+};
 struct ReaderLease {
   RTMSQueue& queue;
   std::size_t id;
@@ -39,11 +62,45 @@ struct Bridge {
   std::set<Socket*> clients;
   us_listen_socket_t* listener = nullptr;
   std::uint64_t invalid = 0, ws_drops = 0, telemetry_ws_drops = 0, forwarded = 0;
+  std::size_t max_clients = 4;
+  std::uint64_t refused = 0, egress_bytes = 0;
+  EgressBudget budget;
+
+  bool send(Socket* client, std::string_view bytes, uWS::OpCode opcode) {
+    // Charge WebSocket framing too. Drop rather than queue old observations.
+    const auto size = bytes.size() + (bytes.size() < 126 ? 2 : 10);
+    auto& local = client->getUserData()->budget;
+    if (client->getBufferedAmount() != 0 ||
+        !local.available(size, EgressBudget::kBytesPerSecond / max_clients) ||
+        !budget.available(size, EgressBudget::kBytesPerSecond)) {
+      ++ws_drops;
+      if (opcode == uWS::OpCode::BINARY) ++telemetry_ws_drops;
+      return false;
+    }
+    if (client->send(bytes, opcode) == Socket::DROPPED) {
+      ++ws_drops;
+      if (opcode == uWS::OpCode::BINARY) ++telemetry_ws_drops;
+      return false;
+    }
+    local.tokens -= static_cast<double>(size);
+    budget.tokens -= static_cast<double>(size);
+    egress_bytes += size;
+    return true;
+  }
 
   // The decoded v2 feed: latest dictionary and latest aligned frame,
   // backing /telemetry.json, /channels.json and the dictionary a newly
   // connected WebSocket client is handed on open.
   studio::TelemetryState telemetry_state;
+
+  void send_dictionary(Socket* client) {
+    if (send(client, telemetry_state.dictionary_frame, uWS::OpCode::BINARY)) {
+      auto& state = *client->getUserData();
+      state.stream_id = telemetry_state.stream_id;
+      state.dictionary_id = telemetry_state.dictionary_id;
+      state.has_dictionary = true;
+    }
+  }
 
   // Opened lazily: the bridge may well start before any node, and a viewer
   // that refuses to run until the robot is up is a viewer you cannot use to
@@ -62,7 +119,9 @@ struct Bridge {
                     .clients = clients.size(),
                     .frames_forwarded = forwarded,
                     .invalid = invalid,
-                    .ws_drops = ws_drops};
+                    .ws_drops = ws_drops,
+                    .refused = refused,
+                    .egress_bytes = egress_bytes};
     input.wall_ns = talos::introspect::wall_now_ns();
     input.monotonic_ns = talos::introspect::monotonic_now_ns();
     if (registry) {
@@ -83,13 +142,7 @@ struct Bridge {
     // Text on the WebSocket, so a client tells the two message families apart
     // by frame type and needs no sniffing.
     for (auto* client : clients) {
-      if (client->getBufferedAmount() > 256 * 1024) {
-        ++ws_drops;
-        continue;
-      }
-      if (client->send(system_json, uWS::OpCode::TEXT) == Socket::DROPPED) {
-        ++ws_drops;
-      }
+      send(client, system_json, uWS::OpCode::TEXT);
     }
   }
 
@@ -150,15 +203,17 @@ struct Bridge {
             if (!aligned) return;
             ++forwarded;
             for (auto* client : clients) {
-              if (client->getBufferedAmount() > 256 * 1024) {
-                ++ws_drops;
-                ++telemetry_ws_drops;
+              const auto& state = *client->getUserData();
+              if (!state.has_dictionary ||
+                  state.stream_id != telemetry_state.stream_id ||
+                  state.dictionary_id != telemetry_state.dictionary_id) {
+                // A budget drop must not strand a viewer without its
+                // dictionary. Withhold values so its bucket can refill enough
+                // to retry.
+                send_dictionary(client);
                 continue;
               }
-              if (client->send(bytes, uWS::OpCode::BINARY) == Socket::DROPPED) {
-                ++ws_drops;
-                ++telemetry_ws_drops;
-              }
+              send(client, bytes, uWS::OpCode::BINARY);
             }
           })) {
         break;
@@ -225,10 +280,15 @@ int main(int argc, char** argv) try {
   std::vector<const char*> args;
   std::string declared_path;
   std::string manifest_path;
+  std::string config_path;
   for (int i = 0; i < argc; ++i) {
     const std::string_view argument = argv[i];
     static constexpr std::string_view kDeclared = "--declared";
     static constexpr std::string_view kManifest = "--manifest";
+    if (argument == "--config" && i + 1 < argc) {
+      config_path = argv[++i];
+      continue;
+    }
     if (argument == kDeclared && i + 1 < argc) {
       declared_path = argv[++i];
       continue;
@@ -260,6 +320,7 @@ int main(int argc, char** argv) try {
            "/declared.json\n"
            "       [--manifest PATH]   the launcher's manifest.json, served at "
            "/manifest.json\n"
+           "       [--config PATH]     reads [studio] max_clients\n"
            "       [--describe]          print the --describe envelope and "
            "exit\n"
            "The publisher MUST use DROP_NEWEST; RTMS does not store this "
@@ -323,22 +384,39 @@ int main(int argc, char** argv) try {
   };
   const auto root = fs::canonical(count > 4 ? at(4) : "studio/dist");
   Bridge bridge{queue, *reader, topic};
+  if (!config_path.empty()) {
+    bridge.max_clients =
+        talos::config::ParseRobotConfig(config_path).studio.max_clients;
+  }
   uWS::App app;
   uWS::App::WebSocketBehavior<Client> behavior{};
   behavior.maxPayloadLength = 1024;
   behavior.maxBackpressure = 512 * 1024;
+  behavior.upgrade = [&](auto* response, auto* request, auto* context) {
+    if (bridge.clients.size() >= bridge.max_clients) {
+      ++bridge.refused;
+      response->writeStatus("503 Studio client limit")
+          ->writeHeader("Retry-After", "5")
+          ->end("Studio client limit reached");
+      return;
+    }
+    response->template upgrade<Client>(
+        {}, request->getHeader("sec-websocket-key"),
+        request->getHeader("sec-websocket-protocol"),
+        request->getHeader("sec-websocket-extensions"), context);
+  };
   behavior.open = [&](auto* ws) {
     bridge.clients.insert(ws);
     // Send the current graph immediately: a client that has to wait for the
     // next refresh opens on an empty system view.
-    ws->send(bridge.system_json, uWS::OpCode::TEXT);
+    bridge.send(ws, bridge.system_json, uWS::OpCode::TEXT);
     // Then the cached dictionary frame, so the client's first value frame
     // is already decodable instead of waiting up to a second for the next
     // dictionary the producer schedules. Its values are as old as the last
     // telemetry received -- possibly from before telemetry stopped -- so the
     // client treats this first binary message as of unknown age.
     if (bridge.telemetry_state.has_dictionary) {
-      ws->send(bridge.telemetry_state.dictionary_frame, uWS::OpCode::BINARY);
+      bridge.send_dictionary(ws);
     }
   };
   behavior.close = [&](auto* ws, int, std::string_view) {
@@ -487,7 +565,8 @@ int main(int argc, char** argv) try {
   // running loop.
   app.run();
   std::cerr << "forwarded=" << bridge.forwarded << " invalid=" << bridge.invalid
-            << " ws_drops=" << bridge.ws_drops << '\n';
+            << " ws_drops=" << bridge.ws_drops << " refused=" << bridge.refused
+            << " egress_bytes=" << bridge.egress_bytes << '\n';
 } catch (const std::exception& e) {
   std::cerr << e.what() << '\n';
   return 1;

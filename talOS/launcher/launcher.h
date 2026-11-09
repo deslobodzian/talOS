@@ -1141,6 +1141,8 @@ class StudioBridge {
               StudioBridgeWatchTopic(described, robot_config),
               std::to_string(http_port_),
               robot_config.studio.webroot,
+              "--config",
+              options.config_path,
               "--declared",
               graph_path,
               "--manifest",

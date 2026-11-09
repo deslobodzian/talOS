@@ -106,6 +106,7 @@ struct RobotConfig {
   struct StudioConfig {
     std::string bridge{"//studio/bridge:studio_bridge"};
     uint16_t http_port{5800};
+    uint16_t max_clients{4};
     // Relative to the launcher's working directory.
     std::string webroot{"bazel-bin/studio/dist"};
     std::string topic{"/talos/telemetry"};
@@ -722,7 +723,7 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
     for (auto&& [k, v] : *studio) {
       if (k.str() != "bridge" && k.str() != "webroot" &&
           k.str() != "http_port" && k.str() != "topic" &&
-          k.str() != "pose_topic") {
+          k.str() != "pose_topic" && k.str() != "max_clients") {
         throw std::invalid_argument("[studio] unknown key '" +
                                     std::string(k.str()) + "'");
       }
@@ -732,6 +733,11 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
     s.webroot = detail::ReadNonEmpty(*studio, "webroot", s.webroot, "[studio]");
     s.http_port =
         detail::ReadPort(*studio, "http_port", s.http_port, "[studio]");
+    s.max_clients =
+        detail::ReadPort(*studio, "max_clients", s.max_clients, "[studio]");
+    if (s.max_clients > 64) {
+      throw std::invalid_argument("[studio] max_clients must be in [1, 64]");
+    }
     if (studio->contains("topic")) {
       s.topic = detail::ReadNonEmpty(*studio, "topic", "", "[studio]");
     }

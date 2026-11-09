@@ -100,6 +100,21 @@ py_test(
     tags = ["local"],
 )
 
+py_test(
+    name = "bandwidth_test",
+    size = "medium",
+    srcs = [
+        "bandwidth_test.py",
+        "integration_test.py",
+    ],
+    data = [
+        ":studio_bridge",
+        ":studio_mock",
+    ],
+    main = "bandwidth_test.py",
+    tags = ["local"],
+)
+
 # --describe answers with no ports, shm, or robot, so this stays hermetic.
 py_test(
     name = "describe_test",
