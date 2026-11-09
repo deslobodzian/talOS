@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -13,8 +14,10 @@
 #include <string_view>
 #include <vector>
 
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
+#include "talOS/hardware/packet.h"
 #include "talOS/launcher/launcher.h"
 #include "talOS/schema/decode.h"
 
@@ -187,7 +190,20 @@ void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
               << ",\"schema\":" << quote(schema)
               << ",\"payload_hex\":";
     ExportPayloadHex(r.payload);
-    std::cout << ",\"decoded\":" << quote(decoded) << "}\n";
+    std::cout << ",\"decoded\":" << quote(decoded);
+    if (r.source_name == talos::hardware::kDriverStationTopic &&
+        r.payload.size() == sizeof(talos::hardware::Packet)) {
+      talos::hardware::Packet packet{};
+      std::memcpy(&packet, r.payload.data(), sizeof(packet));
+      talos::driver_station::DriverStationData ds;
+      if (talos::driver_station::Decode(packet.bytes(), ds)) {
+        std::cout << ",\"ds_enabled\":"
+                  << ((ds.fms.flags & talos::driver_station::kEnabled) != 0
+                          ? "true"
+                          : "false");
+      }
+    }
+    std::cout << "}\n";
   } else {
     std::cout << quote(r.process_name) << ',' << r.header.dispatch_index << ','
               << quote(EventKindName(r.header.kind)) << ','

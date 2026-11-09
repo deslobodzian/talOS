@@ -1,6 +1,7 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
 
 cc_library(
@@ -36,8 +37,10 @@ cc_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":launcher_lib",
+        "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/hardware",
         "//talOS/schema:decode",
     ],
 )
@@ -54,6 +57,40 @@ cc_test(
         "//talOS/events:events_log",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
+    ],
+)
+
+py_binary(
+    name = "session_report",
+    srcs = ["session_report.py"],
+    data = [":log_dump"],
+    visibility = ["//visibility:public"],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+py_test(
+    name = "session_report_test",
+    size = "small",
+    srcs = [
+        "session_report.py",
+        "session_report_test.py",
+    ],
+    data = [
+        ":session_report",
+        ":session_report_fixture",
+    ],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+cc_binary(
+    name = "session_report_fixture",
+    testonly = True,
+    srcs = ["testdata/session_report_fixture.cc"],
+    deps = [
+        ":launcher_lib",
+        "//talOS/driver_station",
+        "//talOS/events:events_log",
+        "//talOS/hardware",
     ],
 )
 

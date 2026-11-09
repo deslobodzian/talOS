@@ -387,7 +387,7 @@ which creates every declared topic as a session-owned RTMS segment with its
 schema name, schema hash, alignment, and slots. Nodes only attach. When the
 session ends, the launcher destroys its queues and unlinks all session segments.
 
-Recorded logs (`.tlog` format version 5) embed descriptors for each logged topic.
+Recorded logs (`.tlog` format version 6) embed descriptors for each logged topic.
 `log_dump` (`//talOS/launcher:log_dump`) reads these descriptors and decodes
 recorded message payloads into named fields without requiring the original build
 environment.
@@ -425,6 +425,39 @@ Both export formats contain `process`, `dispatch_index`, `kind`, `source_id`,
 schema or payload, otherwise it contains the descriptor-decoded payload text.
 JSON strings are escaped; CSV fields containing commas, quotes, or newlines
 are quoted and embedded quotes are doubled.
+
+### Session measurements
+
+```sh
+bazel run //talOS/launcher:session_report -- --strict /tmp/logs/session
+bazel run //talOS/launcher:session_report -- --json /tmp/logs/session
+```
+
+The offline Python tool reuses `log_dump` and its events reader/embedded
+descriptor decoder, without robot-specific schemas. It reports manifest config
+identity, node exits/restarts/caps, state inter-arrival median/nearest-rank p99/max,
+enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
+lateness, and every scalar `/hw/status` field (including new clock fields).
+Counter deltas sum nonnegative increments and separately count resets.
+`clock_offset_valid` includes its observed valid fraction. JSONL `log_dump`
+exports additionally include `ds_enabled` for successfully decoded Driver Station
+packets, using the framework wire codec rather than guessed byte offsets.
+
+State timing selects one publisher stream (bridge IPC publications), or one
+consumer stream if there is no publisher recording; duplicate readers are never
+pooled. Enabled intervals hold the logged DS enabled bit until its next sample,
+not a reconstructed safety gate. A gap overlapping an enabled interval counts.
+Median “about 5 ms” uses an explicitly labeled 4–6 ms analysis tolerance; p99
+must be below 10 ms. `--strict` exits 2 for FAIL, 1 for input/reader errors,
+and 0 otherwise; NOT MEASURED is never a pass.
+
+Target receipt age is `now - publish_time`, not target age at a control tick.
+Polled subscriptions and the selected Target value are not recorded as tick
+inputs, so tick-age/timeout acceptance remains NOT MEASURED. Timer lateness has
+no specified acceptance threshold. Capped, truncated, unfinished recordings,
+DS silence, missing topics and unknown intervals limit acceptance; retain the
+raw session. Clock offset ranges measure the estimator, not absolute clock
+synchronization accuracy. See `docs/BRINGUP.md` for the bench checks.
 
 ## If you change the shape of `graph.json`
 
