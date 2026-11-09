@@ -203,9 +203,19 @@ int main(int argc, char** argv) try {
     talos::introspect::Description description;
     description.name = "studio_bridge";
     description.target = "//studio/bridge:studio_bridge";
-    description.sources.push_back(
-        {talos::event::SourceKind::WATCHER, topic,
-         static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes), 0});
+    // Every topic end names its schema and ring layout (the launcher creates
+    // the segment from them): the telemetry byte topic's, as its producer
+    // declares it and as the queue below attaches.
+    talos::introspect::naming::SourceShape source{
+        talos::event::SourceKind::WATCHER, topic,
+        static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes), 0};
+    const talos::schema::Identity bytes = talos::schema::Bytes();
+    source.schema = bytes.name;
+    source.schema_hash = bytes.hash;
+    source.alignment = 8;
+    source.slots =
+        static_cast<std::uint32_t>(talos::telemetry_wire::slot_count);
+    description.sources.push_back(std::move(source));
     std::cout << talos::introspect::DescribeToJson(description);
     return 0;
   }

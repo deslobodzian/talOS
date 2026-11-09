@@ -32,6 +32,14 @@ class BridgeDescribe(unittest.TestCase):
         self.assertEqual(doc["target"], "//studio/bridge:studio_bridge")
         kinds = [(s["kind"], s["name"]) for s in doc["sources"]]
         self.assertIn(("WATCHER", "/custom/studio_feed"), kinds)
+        # The launcher refuses a topic end without schema and ring layout
+        # (talOS/introspection/describe.h), which kept ./sim.sh with Studio
+        # from starting; they must match the telemetry byte topic.
+        source = doc["sources"][0]
+        self.assertEqual(source["schema"], "talos.Bytes")
+        self.assertTrue(source["schema_hash"].startswith("0x"))
+        self.assertEqual(source["alignment"], 8)
+        self.assertEqual(source["slots"], 64)
 
     def test_describe_without_config_uses_default_topic(self):
         proc = subprocess.run(

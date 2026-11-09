@@ -61,6 +61,17 @@ test('channels first declared later are NaN-backfilled', () => {
   assert.equal(store.snapshotAt('1')!.channels.b, undefined);
 });
 
+test('dictionary ids above 2^31 (uint32 on the wire) reconstruct', () => {
+  const store = new TelemetryStore(cb => cb());
+  const id = 0xdeadbeef;
+  store.ingest([{...snap(0, 1n, {a: 1}), dictionary_id: id,
+                 units: Object.assign(Object.create(null), {a: 'V'})}], true);
+  const snapshot = store.snapshotAt('1');
+  assert.ok(snapshot);
+  assert.equal(snapshot.dictionary_id, id);
+  assert.equal(snapshot.units.a, 'V');
+});
+
 test('reset clears the ring and the dictionary', () => {
   const store = new TelemetryStore(cb => cb());
   store.ingest([snap(0, 1n, {a: 1}), snap(1, 2n, {a: 2})], true);

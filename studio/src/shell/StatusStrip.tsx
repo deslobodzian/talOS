@@ -71,7 +71,7 @@ export function StatusStrip() {
           value={nodes === null ? '—' : nodes.alive === null ?
               <>?/{nodes.total}<em className="text-warn"> · STALE</em></> :
               `${nodes.alive}/${nodes.total}`}/>
-    <Item label="Estimator"
+    <Item label="Estimator" channel={estimator?.channel}
           tone={estimator !== null && !estimator.valid ? 'warn' : undefined}
           unknown={estimator === null}
           value={estimator === null ? '—' :

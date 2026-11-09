@@ -123,7 +123,8 @@ test('robotStatus reads DS, power, link, estimator and nodes', () => {
   assert.equal(status.link.configured, true);
   assert.equal(status.link.faultMask, 3);
   assert.equal(status.link.timedOutMask, 0);
-  assert.deepEqual(status.estimator, {valid: true, accepted: 42, rejected: 3});
+  assert.deepEqual(status.estimator, {valid: true, accepted: 42, rejected: 3,
+                                      channel: 'pose_estimator/state/valid'});
   assert.deepEqual(status.nodes, {alive: 1, total: 2});
 });
 

@@ -28,7 +28,9 @@ export type RobotStatus = {
     faultMask: number|null;
     timedOutMask: number|null;
   };
-  estimator: {valid: boolean|null; accepted: number|null; rejected: number|null}|null;
+  // `channel` names the validity channel, so the reading can be aged.
+  estimator: {valid: boolean|null; accepted: number|null; rejected: number|null;
+              channel: string}|null;
   // `alive` is null when the graph is stale: `total` is last-known, the live
   // count is not knowable.
   nodes: {alive: number|null; total: number}|null;
@@ -100,7 +102,8 @@ export function robotStatus(snapshot: Snapshot|null, system: SystemState): Robot
     estimator = {
       valid: flag(`${owner}/state/valid`),
       accepted: num(`${owner}/state/observation_accepted_count`),
-      rejected: num(`${owner}/state/observation_rejected_count`)
+      rejected: num(`${owner}/state/observation_rejected_count`),
+      channel: `${owner}/state/valid`
     };
   }
 

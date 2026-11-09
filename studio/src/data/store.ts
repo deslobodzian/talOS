@@ -40,7 +40,9 @@ export class TelemetryStore {
   private readonly timestamps: (string|null)[];
   private readonly streamIds: (string|null)[];
   private readonly sequenceIds: (string|null)[];
-  private readonly dictionaryIds: Int32Array;
+  // Telemetry dictionary ids are uint32: an Int32Array turned ids at or above
+  // 2^31 negative, so no dictionary matched and the first snapshot threw.
+  private readonly dictionaryIds: Float64Array;
   private readonly chassisX: Float64Array;
   private readonly chassisY: Float64Array;
   private readonly chassisZ: Float64Array;
@@ -81,7 +83,7 @@ export class TelemetryStore {
     this.timestamps = new Array<string|null>(capacity).fill(null);
     this.streamIds = new Array<string|null>(capacity).fill(null);
     this.sequenceIds = new Array<string|null>(capacity).fill(null);
-    this.dictionaryIds = new Int32Array(capacity).fill(-1);
+    this.dictionaryIds = new Float64Array(capacity).fill(-1);
     this.chassisX = new Float64Array(capacity);
     this.chassisY = new Float64Array(capacity);
     this.chassisZ = new Float64Array(capacity);
