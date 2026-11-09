@@ -79,14 +79,10 @@ and `ok` otherwise. Observer endpoints are listed separately from subscribers.
 
 ## WebSocket operating limits
 
-Run one bridge per robot. `[studio] max_clients` defaults to **4**, with an
-integer range of **1–64**. Extra upgrades receive HTTP **503 Studio client
-limit**, `Retry-After: 5`, and `Studio client limit reached`.
-
-All WebSocket sends share a **160,000 bytes/s** token bucket with a
-**64,000-byte** burst. Each client also has a `160000 / max_clients` bytes/s
-bucket with the same burst. Accounting includes conservative WebSocket framing.
-HTTP snapshots and static files are outside this budget, as are other processes.
+Run one bridge per robot. Extra upgrades past `[studio] max_clients` receive
+HTTP **503 Studio client limit**, `Retry-After: 5`, and
+`Studio client limit reached`. The client limit and the egress byte budget are
+in [Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary).
 
 The bridge drops observations when budget is exhausted or a client already has
 buffered userspace output; it does not queue old observations for that client.

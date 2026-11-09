@@ -322,6 +322,14 @@ room under a normal MTU, but TCP is a byte stream: segmentation/coalescing is no
 a guaranteed one-WebSocket-frame-per-IP-packet contract. Dictionary frames can
 span multiple TCP segments.
 
+Studio's bridge charges every WebSocket send, with conservative framing
+overhead, against a shared **160,000 B/s** token bucket with a **64,000 B**
+burst (`EgressBudget` in `studio/bridge/main.cc`). Each client also has a
+`160000 / max_clients` B/s bucket with the same burst; `[studio] max_clients`
+defaults to **4** (range **1–64**). HTTP snapshots and static files are outside
+this budget. Over budget, the bridge drops observations rather than queueing
+them.
+
 The `[studio]` HTTP/WebSocket port is **5800**. Browser traffic to a driver laptop
 crosses the robot radio and shares the team's field allocation with DS, other
 telemetry and video. RIO↔main-processor UDP stays on the robot's wired switch and
