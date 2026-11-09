@@ -65,7 +65,11 @@ launch; use `--remote-port` and `--local-port` if the ports also differ.
   three-second supervision watchdog). macOS: writes the
   LaunchDaemon `/Library/LaunchDaemons/org.talos.robot.plist` (`KeepAlive`)
   and bootstraps it into the system domain, so it starts without a login.
-  Both use sudo. `--dry-run` prints the unit or plist instead.
+  Both use sudo. Before enabling, it checks bundle read/traversal access as
+  the selected account and creates `<prefix>/logs` owned by that account,
+  mode 0755. Bundles stay read-only. An inaccessible bundle fails clearly;
+  fix ancestor traversal/read permissions rather than granting bundle writes.
+  `--dry-run` prints these provisioning/check commands and the unit or plist.
 - **logs** lists session directories under `<prefix>/logs` (or `LOG_ROOT`) and
   summarizes the newest manifest by modification time: session id, config path
   and hash, each node's exit code and log path. No installed bundle is needed

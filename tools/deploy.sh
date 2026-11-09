@@ -59,6 +59,25 @@ cmd_enable_boot() {
   while [ $# -gt 0 ]; do
     case "$1" in --user) user="$2"; shift 2 ;; *) break ;; esac
   done
+  # Check with the actual service identity, including ancestor traversal and
+  # symlink targets. Never make the immutable bundle writable to fix access.
+  run id -u "$user"
+  run sudo -u "$user" python3 -c '
+import os, sys
+root = sys.argv[1]
+def require(path, mode):
+    if not os.access(path, mode):
+        sys.exit("deploy: error: service account cannot read/traverse " + path)
+require(root, os.R_OK | os.X_OK)
+require(os.path.join(root, "run.sh"), os.R_OK | os.X_OK)
+for parent, dirs, files in os.walk(root, onerror=lambda e: sys.exit(str(e))):
+    for name in dirs:
+        require(os.path.join(parent, name), os.R_OK | os.X_OK)
+    for name in files:
+        require(os.path.join(parent, name), os.R_OK)
+' "$PREFIX/current"
+  run sudo install -d -m 0755 -o "$user" "$PREFIX/logs"
+  run sudo -u "$user" test -w "$PREFIX/logs"
   local unit="[Unit]
 Description=talOS robot bundle
 After=network-online.target
