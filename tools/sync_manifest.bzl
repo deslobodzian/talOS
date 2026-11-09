@@ -16,6 +16,7 @@ def manifest_freshness_stamp(ctx, config, manifest, config_files, tool):
       A stamp File that a bundle action must consume.
     """
     stamp = ctx.actions.declare_file(ctx.label.name + ".manifest_current")
+
     # Manifest labels and generated comments are relative to the config's own
     # repository, including when a standalone robot loads @talos's macros.
     workspace_root = ctx.attr.config.label.workspace_root
@@ -58,7 +59,8 @@ def manifest_sync_test(name, config, manifest, config_files, **kwargs):
         srcs = [Label("//tools:sync_manifest.py")],
         main = Label("//tools:sync_manifest.py"),
         args = ["--check", config_path],
-        data = [config, manifest] + list(config_files),
+        data = [config, manifest, Label("//talOS/configuration:resolve")] + list(config_files),
+        deps = [Label("@rules_python//python/runfiles")],
         legacy_create_init = False,
         **kwargs
     )

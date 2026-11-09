@@ -1,3 +1,4 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
@@ -11,6 +12,13 @@ cc_library(
         "//talOS/introspection:names",
         "@tomlplusplus//:toml++",
     ],
+)
+
+cc_binary(
+    name = "resolve",
+    srcs = ["resolve.cc"],
+    visibility = ["//visibility:public"],
+    deps = [":configuration"],
 )
 
 # Config trees with the expected parse decision, nodes and read files. The

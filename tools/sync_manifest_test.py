@@ -3,6 +3,7 @@
 import contextlib
 import io
 import os
+import json
 import tempfile
 import tomllib
 import unittest
@@ -18,6 +19,21 @@ def put(root, path, text):
         f.write(text)
 
 
+def check_teleop(test, teleop, name):
+    """Exercise validation through the actual CLI with a TOML inline table."""
+    def literal(value):
+        if isinstance(value, dict):
+            return "{ " + ", ".join(
+                json.dumps(key) + " = " + literal(item)
+                for key, item in value.items()) + " }"
+        if isinstance(value, list):
+            return "[" + ", ".join(literal(item) for item in value) + "]"
+        return json.dumps(value)
+    sync_manifest.effective(
+        test.root, "teleop.toml",
+        overrides={"teleop.toml": f"[subsystems.{name}]\nteleop = {literal(teleop)}\n"})
+
+
 class SyncManifestTest(unittest.TestCase):
     def test_rejects_structural_tables_and_unknown_motor_keys(self):
         bad = [
@@ -26,7 +42,9 @@ class SyncManifestTest(unittest.TestCase):
             "[subsystems.test.motors.m]\ncan_id = 1\ncanid = 2\n",
         ]
         bad += [f"[subsystems.test]\n{section} = 1\n"
-                for section in sync_manifest._DEVICE_SECTIONS]
+                for section in ("motors", "sensors", "digital_inputs",
+                                "digital_outputs", "analog_inputs",
+                                "encoders", "pwm_outputs")]
         for slot in ("slot0", "slot1", "slot2"):
             bad += [
                 f"[subsystems.test.motors.m]\ncan_id = 1\n{slot} = 1\n",
@@ -55,18 +73,18 @@ class SyncManifestTest(unittest.TestCase):
         self.assertIn("unknown sensor key 'offest_rot'", message)
 
     def test_teleop_defaults_use_assignment_scalar_types(self):
-        sync_manifest._check_teleop(
+        check_teleop(self,
             {"defaults": {"position_rot": 0.25, "mode": "HOLD",
                           "enabled": False, "count": 2}}, "arm")
         for defaults in (3, [], {"position_rot": []},
                          {"nested": {"position_rot": 0.25}}):
             with self.subTest(defaults=defaults):
                 with self.assertRaises(sync_manifest.ManifestError):
-                    sync_manifest._check_teleop({"defaults": defaults}, "arm")
+                    check_teleop(self, {"defaults": defaults}, "arm")
 
     def test_pov_toggle_validation(self):
         for angle in range(0, 360, 45):
-            sync_manifest._check_teleop(
+            check_teleop(self,
                 {"bindings": [{"pov": angle, "pov_index": 3,
                                "on_toggle": {"velocity_rps": 60.0}}]}, "roller")
         for entry in (
@@ -78,7 +96,7 @@ class SyncManifestTest(unittest.TestCase):
                 {"axis": 0, "field": "x", "scale": 1, "pov_index": 0}):
             with self.subTest(entry=entry):
                 with self.assertRaises(sync_manifest.ManifestError):
-                    sync_manifest._check_teleop({"bindings": [entry]}, "roller")
+                    check_teleop(self, {"bindings": [entry]}, "roller")
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -120,6 +138,22 @@ class SyncManifestTest(unittest.TestCase):
         self.assertIn('    "//shared:arm_defaults.toml",\n', text)
         self.assertIn('    "//bot:subsystems/wrist.toml",\n', text)
         self.assertIn("bazel run //tools:sync_manifest -- bot/robot.toml", text)
+
+    def test_cli_reports_effective_config_and_pending_file_provenance(self):
+        result = sync_manifest._resolved(
+            self.root, "pending/robot.toml", overrides={
+                "pending/robot.toml":
+                    '[[subsystems]]\nname = "wrist"\npath = "wrist.toml"\n'
+                    'node = "@wrist//:node"\n',
+                "pending/wrist.toml":
+                    '[subsystem]\nname = "wrist"\nperiod_us = 1000\n',
+            })
+        self.assertEqual(result["nodes"], ["@wrist//:node"])
+        self.assertEqual(result["files"], ["pending/wrist.toml"])
+        self.assertEqual(result["subsystem_paths"], {"wrist": "pending/wrist.toml"})
+        self.assertEqual(result["effective"]["subsystems"], result["subsystems"])
+        self.assertEqual(result["subsystems"]["wrist"]["period_us"], 1000)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "pending")))
 
     def test_include_merges_entries_by_name(self):
         put(self.root, "bot/robot_py.toml",

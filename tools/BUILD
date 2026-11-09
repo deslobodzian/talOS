@@ -40,12 +40,16 @@ py_test(
 py_binary(
     name = "sync_manifest",
     srcs = ["sync_manifest.py"],
+    data = ["//talOS/configuration:resolve"],
     visibility = ["//talOS/build:__pkg__"],
+    deps = ["@rules_python//python/runfiles"],
 )
 
 py_library(
     name = "sync_manifest_lib",
     srcs = ["sync_manifest.py"],
+    data = ["//talOS/configuration:resolve"],
+    deps = ["@rules_python//python/runfiles"],
 )
 
 py_test(

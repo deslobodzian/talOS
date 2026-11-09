@@ -346,15 +346,21 @@ its lane active.
   `<dir>/robot_manifest.bzl` beside the config (`<stem>_manifest.bzl` for
   other names, e.g. `robot_py_manifest.bzl`): `NODES`, the node labels, and
   `CONFIG_FILES`, every file the config reads besides itself (`include`,
-  `path`, `defaults`). It is a short Python `tomllib` script
-  (`tools/sync_manifest.py`), the only reader besides the C++ parser, and
-  ports the parser's resolution step for step: top-level and entry keys,
-  duplicate names, value types, and `include`/`node`/`defaults` precedence.
-  The cases under `talOS/configuration/testdata` (a config tree plus
-  `expect.toml`: accept or reject, nodes, files read) run through both
-  `//talOS/configuration:test` and `//tools:sync_manifest_test`, so the two
-  readers cannot disagree untested. It rejects absolute and
-  workspace-leaving paths, which have no Bazel label.
+  `path`, `defaults`). `tools/sync_manifest.py` consumes canonical JSON from
+  `//talOS/configuration:resolve`, the same C++ resolver and schema parser used
+  by the launcher; Python only renders labels and checks freshness. Build-time
+  planning permits incomplete hardware inventories; the launcher additionally
+  validates the complete hardware inventory before deployment.
+  Run the resolver from the workspace root with a workspace-relative config:
+  `bazel run //talOS/configuration:resolve -- <dir>/robot.toml`.
+  Its JSON contains `effective`, `subsystems`, `subsystem_paths`, sorted
+  `nodes` and sorted `files` (excluding the root). An optional overlay directory
+  supplies pending file contents for scaffold planning without modifying the workspace.
+  Shared cases under `talOS/configuration/testdata` run through
+  `//talOS/configuration:test` and the CLI via `//tools:sync_manifest_test`.
+  Build-time resolution rejects absolute and workspace-leaving paths, which
+  have no Bazel label. Bazel tests and bundle actions carry the resolver and
+  its runfiles as tool dependencies, including external-repository use.
 - `talos_bundle` (`nodes`, `config_files`) and `talos_graph_test` (`nodes`,
   `data`) take `NODES` and `CONFIG_FILES`.
 - `manifest_sync_test` (`tools/sync_manifest.bzl`) runs the script with

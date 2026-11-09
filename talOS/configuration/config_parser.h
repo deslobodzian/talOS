@@ -677,8 +677,10 @@ inline uint16_t ResolveLocalPort(const RobotConfig& config,
 }
 
 // Parses the canonical single-file view. toml_data keeps the table, which is
-// what GetSubsystemTable answers from.
-inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
+// what GetSubsystemTable answers from. Build-time resolution can parse an
+// incomplete hardware inventory; only runtime requires a deployable inventory.
+inline RobotConfig ParseRobotConfigTable(toml::table tbl,
+                                         bool validate_hardware = true) {
   using detail::Read;
   using detail::ReadRequired;
   detail::CheckTopLevelKeys(tbl);
@@ -798,10 +800,16 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
           throw std::invalid_argument(std::string(section) + " entry '" + name +
                                       "' must be a table");
         }
-        detail::RawDevice raw = parse(*dev_tbl, name);
-        raw.subsystem = sub_name;
-        raw.name = name;
-        raw_devices.push_back(std::move(raw));
+        try {
+          detail::RawDevice raw = parse(*dev_tbl, name);
+          raw.subsystem = sub_name;
+          raw.name = name;
+          raw_devices.push_back(std::move(raw));
+        } catch (const std::invalid_argument& error) {
+          throw std::invalid_argument("[subsystems." + sub_name + "]." +
+                                      section + "." + name + ": " +
+                                      error.what());
+        }
       }
     };
     each("motors", detail::ParseMotor);
@@ -955,7 +963,7 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
         dev.config);
   }
 
-  hardware::Validate(hw);
+  if (validate_hardware) hardware::Validate(hw);
   return result;
 }
 
@@ -1048,9 +1056,11 @@ inline void MergeManifests(toml::array& base_arr, const toml::array& child_arr,
   }
 }
 
+template <typename Reader = decltype(&ParseTomlFile)>
 inline toml::table ExpandManifest(const toml::array& manifest,
                                   const std::string& path,
-                                  bool paths_normalized = false) {
+                                  bool paths_normalized = false,
+                                  Reader read = ParseTomlFile) {
   namespace fs = std::filesystem;
   const fs::path base = fs::path(path).parent_path();
   auto resolve_entry_path = [&](std::string_view p) {
@@ -1091,7 +1101,7 @@ inline toml::table ExpandManifest(const toml::array& manifest,
           ReadNonEmpty(*entry, "defaults", "", "[[subsystems]] entry"));
     }
     const std::string file = resolve_entry_path(*rel_view);
-    toml::table sub_file = ParseTomlFile(file);
+    toml::table sub_file = read(file);
 
     auto* header = sub_file["subsystem"].as_table();
     if (!header || (*header)["name"].value<std::string_view>() != name) {
@@ -1116,7 +1126,7 @@ inline toml::table ExpandManifest(const toml::array& manifest,
       defaults_file = *entry_defaults;
     }
     if (defaults_file) {
-      toml::table merged = ParseTomlFile(*defaults_file);
+      toml::table merged = read(*defaults_file);
       MergeTables(merged, sub_file);
       sub_file = std::move(merged);
       header = sub_file["subsystem"].as_table();
@@ -1139,9 +1149,13 @@ inline toml::table ExpandManifest(const toml::array& manifest,
 
 }  // namespace detail
 
-inline RobotConfig ParseRobotConfig(const std::string& path) {
+// Resolve once for runtime and build tools. Readers may track dependencies or
+// supply pending file contents without changing include/manifest semantics.
+template <typename Reader = decltype(&detail::ParseTomlFile)>
+inline toml::table ResolveRobotConfig(const std::string& path,
+                                      Reader read = detail::ParseTomlFile) {
   namespace fs = std::filesystem;
-  toml::table tbl = detail::ParseTomlFile(path);
+  toml::table tbl = read(path);
   detail::CheckTopLevelKeys(tbl);
   if (auto* manifest = tbl["subsystems"].as_array()) {
     detail::NormalizeManifestPaths(*manifest, path);
@@ -1155,7 +1169,7 @@ inline RobotConfig ParseRobotConfig(const std::string& path) {
         (inc_rel.is_absolute() || base_dir.empty() ? inc_rel
                                                    : base_dir / inc_rel)
             .string();
-    toml::table base = detail::ParseTomlFile(inc_file);
+    toml::table base = read(inc_file);
     detail::CheckTopLevelKeys(base);
     if (base.contains("include")) {
       throw std::invalid_argument("nested 'include' is not supported in " +
@@ -1171,8 +1185,9 @@ inline RobotConfig ParseRobotConfig(const std::string& path) {
         tbl.erase("subsystems");
       } else if (tbl.contains("subsystems")) {
         base.insert_or_assign(
-            "subsystems", detail::ExpandManifest(*base_subs, inc_file,
-                                                 /*paths_normalized=*/true));
+            "subsystems",
+            detail::ExpandManifest(*base_subs, inc_file,
+                                   /*paths_normalized=*/true, read));
       }
     }
     detail::MergeTables(base, tbl);
@@ -1180,10 +1195,14 @@ inline RobotConfig ParseRobotConfig(const std::string& path) {
   }
   if (auto* manifest = tbl["subsystems"].as_array()) {
     tbl.insert_or_assign(
-        "subsystems",
-        detail::ExpandManifest(*manifest, path, /*paths_normalized=*/true));
+        "subsystems", detail::ExpandManifest(*manifest, path,
+                                             /*paths_normalized=*/true, read));
   }
-  return ParseRobotConfigTable(std::move(tbl));
+  return tbl;
+}
+
+inline RobotConfig ParseRobotConfig(const std::string& path) {
+  return ParseRobotConfigTable(ResolveRobotConfig(path));
 }
 
 }  // namespace talos::config
