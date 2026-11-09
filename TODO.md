@@ -24,7 +24,7 @@ Evidence labels:
 - **Incident:** previously observed failure with unresolved cause.
 - **Hardware:** requires the deployment computer, robot, controllers or radio.
 
-Verification of the closing state (2026-11-08): `bazel build //...`, `bazel test //...` 142/142; `--config=tsan` and `--config=asan` 125/125 each (no OpenCV serialization, AprilTag quad-threshold instrumented); `./gradlew phoenixTest buildRio`; `--describe-only` 13/13 nodes on robot/robot_field/robot_physics_sim, 5/5 superstructure; Studio `pnpm test` 315/315 and build; a live `./sim.sh --sim-gateway` session with Studio in a headless browser (15/15 nodes live; after stopping the sim every status chip, the node count and the system graph read STALE/unknown).
+Verification of the closing state (2026-11-08): `bazel build //...`, `bazel test //...` 142/142; `--config=tsan` and `--config=asan` 125/125 each (no OpenCV serialization, AprilTag quad-threshold instrumented); `./gradlew phoenixTest buildRio`; `--describe-only` 13/13 nodes on robot/robot_field/robot_physics_sim, 5/5 superstructure; Studio `pnpm test` 316/316 and build; a live `./sim.sh --sim-gateway` session with Studio in a headless browser (15/15 nodes live; after stopping the sim every status chip, the node count and the system graph read STALE/unknown).
 
 ## Closed in the 2026-11-08 pass
 
@@ -53,6 +53,7 @@ Verification of the closing state (2026-11-08): `bazel build //...`, `bazel test
 | OBS-1/2/3 Studio never shows cached, stale-graph or dead-worker readings as current | `25ae963`, `967a4d9`, `0fb4a3a` | Studio tests; live browser check |
 | OBS-4 telemetry prints its headroom at every launch/describe | `b0ff0bb` | robot 130 ch 1168/1200 B; physics sim 133 ch 1192/1200 B (1 spare) |
 | Studio blank page on live connect (uint32 dictionary id); bridge `--describe` refused by the launcher | `ca72565` | store/describe tests fail before; found by the live smoke |
+| Studio reported a new launcher session's processes as restarts | see `git log -- studio/src/data/detectors.ts` | events.test |
 
 ## Open software items
 
@@ -62,7 +63,6 @@ Verification of the closing state (2026-11-08): `bazel build //...`, `bazel test
   - Acceptance: measure total egress/age/drops/RSS at the supported client count plus one stalled/excess client; document the operating limit and enforce it if needed.
 - [ ] **VERIFY-2 — AprilTag offline JPEG decoding is UB-unqualified.** **Reproduced.** Restoring UBSan shift checks reproduces `pjpeg.c:597` shifting a negative value. Live Linux detection uses raw buffers and never reaches it; only offline JPEG decoding does. Fix or replace the decoder before any match path decodes JPEG.
 - [ ] **TELEMETRY-1 — One spare channel on the physics-sim graph.** **Measured.** Any new state scalar needs an exclude (or a frame-format change) in the same commit; an overflow already fails `talos_graph_test`. Multi-frame scheduling only if essential channels need it.
-- [ ] **OBS-5 — Studio labels a new session's processes "restarted".** **Reproduced (live smoke).** Its event engine compares pids across sessions; a restart event should require the same session id.
 
 ## Unresolved incidents — investigate, do not declare fixed by a rerun
 

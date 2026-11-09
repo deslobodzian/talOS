@@ -429,7 +429,8 @@ export const SYSTEM_DETECTORS: SystemDetector[] = [
       return drafts;
     }
   },
-  // pid or generation change: the node was replaced.
+  // pid or generation change within one launcher session: the node was
+  // replaced. A different session id is a new launch, not a restart.
   {
     id: 'node-restarted',
     detect(prev, next) {
@@ -437,7 +438,14 @@ export const SYSTEM_DETECTORS: SystemDetector[] = [
       for (const node of next.nodes) {
         const before = prev?.nodes.find(n => n.name === node.name);
         if (!before) continue;
-        if (before.pid !== node.pid || before.generation !== node.generation) {
+        if (before.session_id !== node.session_id) {
+          drafts.push({
+            severity: 'info',
+            category: 'system',
+            title: `${node.name} started in a new session`,
+            detail: `session ${before.session_id} → ${node.session_id}`
+          });
+        } else if (before.pid !== node.pid || before.generation !== node.generation) {
           drafts.push({
             severity: 'warn',
             category: 'system',

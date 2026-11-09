@@ -315,6 +315,17 @@ test('system detectors: liveness, restart and target selection', () => {
   assert.match(selection[1].title, /now driven by auto/);
 });
 
+test('a new launcher session is not reported as a restart', () => {
+  const engine = new EventEngine();
+  engine.pushFrame(frame(1, 1n, {[DS + 'connected']: 1}));
+  engine.pushSystem(graph([sysNode('drivetrain', true, {session_id: '1'})]));
+  engine.pushSystem(graph([sysNode('drivetrain', true, {session_id: '2', pid: '99'})]));
+  const events = engine.events.filter(e => e.id.startsWith('node-restarted:'));
+  assert.equal(events.length, 1);
+  assert.equal(events[0].severity, 'info');
+  assert.match(events[0].title, /new session/);
+});
+
 test('event ids are unique', () => {
   const engine = new EventEngine();
   engine.pushFrame(frame(1, 1n, {'hw/status/gateway_a_count': 1, 'hw/status/gateway_b_count': 1}));
