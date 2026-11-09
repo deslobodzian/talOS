@@ -197,6 +197,57 @@ TEST(SimulatedEventLoop, LatestSkipsBacklogButCallbacksKeepCappedSequence) {
   for (int i = 0; i < 130; ++i) EXPECT_EQ(ordered[i], i);
 }
 
+// Loops sharing an environment may be stepped to different times. A drain
+// delivers only what was published by the loop's own now: a latest-only
+// watcher takes the newest visible message (the skipped ones count as
+// dropped), an ordered one stops at the first message from its future.
+TEST(SimulatedEventLoop, DrainNeverDeliversAPublicationFromTheFuture) {
+  SimulationEnvironment environment;
+  SimulatedEventLoop<> ahead{environment};
+  SimulatedEventLoop<> behind{environment};
+  std::vector<Context> latest;
+  std::vector<Context> ordered;
+  auto on_latest = [&](const Context& context) { latest.push_back(context); };
+  auto on_message = [&](const Context& context, std::span<const std::byte>) {
+    ordered.push_back(context);
+  };
+  const auto schema = talos::schema::Of<EventsTest::SensorMessage>();
+  const auto latest_id = behind.register_watcher(
+      "/future", sizeof(EventsTest::SensorMessage),
+      alignof(EventsTest::SensorMessage), schema, make_thunk(&on_latest), true);
+  behind.register_watcher("/future", sizeof(EventsTest::SensorMessage),
+                          alignof(EventsTest::SensorMessage), schema,
+                          make_thunk(&on_message));
+
+  const MonotonicTime origin{};
+  ahead.run_until(origin + 1ms);
+  ahead.inject("/future", EventsTest::SensorMessage{0, 0.0F, 0.0F});
+  ahead.inject("/future", EventsTest::SensorMessage{1, 0.0F, 0.0F});
+  ahead.run_until(origin + 3ms);
+  ahead.inject("/future", EventsTest::SensorMessage{2, 0.0F, 0.0F});
+
+  behind.run_until(origin + 2ms);
+  ASSERT_EQ(latest.size(), 1u);
+  EXPECT_EQ(latest[0].sequence, 1u);
+  EXPECT_EQ(latest[0].dropped, 1u);
+  EXPECT_EQ(latest[0].now, origin + 1ms);
+  ASSERT_EQ(ordered.size(), 2u);
+  EXPECT_EQ(ordered[1].sequence, 1u);
+  for (const Context& context : ordered) {
+    EXPECT_LE(context.publish_time, context.now);
+  }
+
+  behind.run_until(origin + 3ms);
+  ASSERT_EQ(latest.size(), 2u);
+  EXPECT_EQ(latest[1].sequence, 2u);
+  EXPECT_EQ(latest[1].dropped, 0u);
+  EXPECT_EQ(latest[1].now, latest[1].publish_time);
+  ASSERT_EQ(ordered.size(), 3u);
+  EXPECT_EQ(ordered[2].sequence, 2u);
+  EXPECT_EQ(ordered[2].dropped, 0u);
+  EXPECT_EQ(behind.source_counters()[latest_id].dropped.load(), 1u);
+}
+
 TEST(SimulatedEventLoop, OverflowMatchesRtmsRetainedWindowAndDropCounts) {
   SimulationEnvironment environment;
   SimulatedEventLoop<> loop{environment};

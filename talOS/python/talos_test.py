@@ -172,6 +172,58 @@ can_id = 1
         self.assertEqual(watch.received, list(range(130)))
 
 
+    def test_loops_share_one_chronological_frontier_in_either_order(self):
+        """A 1 ms producer and a 500 us consumer never see the future; the
+        insertion order only decides who runs first at a shared instant."""
+        class Stamper:
+            def __init__(self, node):
+                self.node = node
+                self.out = node.publish(Goal, "/stamper/goal")
+
+            def update(self):  # tick_count: publication time in us
+                self.out.send(tick_count=round(self.node.now * 1e6))
+
+        class Reader:
+            def __init__(self, node):
+                self.node = node
+                self.goal = node.subscribe(Goal, "/stamper/goal")
+                self.seen = []  # (now, stamp, age) in us, and fresh
+
+            def update(self):
+                if self.goal.has_value:
+                    self.seen.append((round(self.node.now * 1e6),
+                                      self.goal.value.tick_count,
+                                      round(self.goal.age * 1e6),
+                                      self.goal.fresh()))
+
+        toml = """
+[robot]
+period_us = 1000
+command_timeout_us = 100000
+[subsystems.stamper]
+period_us = 1000
+[subsystems.reader]
+period_us = 500
+[subsystems.reader.motors.m]
+can_id = 1
+"""
+        for stamper_first in (True, False):
+            with self.subTest(stamper_first=stamper_first):
+                sim = Sim.from_toml(toml)
+                if stamper_first:
+                    sim.add(Stamper, "stamper")
+                reader = sim.add(Reader, "reader")
+                if not stamper_first:
+                    sim.add(Stamper, "stamper")
+                sim.step(0.02)
+                self.assertEqual(len(reader.seen), 39 if stamper_first else 38)
+                for now, stamp, age, fresh in reader.seen:
+                    newest = (now // 1000 * 1000 if stamper_first
+                              else (now + 999) // 1000 * 1000 - 1000)
+                    self.assertEqual((stamp, age, fresh),
+                                     (newest, now - newest, True), now)
+
+
 class SubscriptionErrorsTest(unittest.TestCase):
     def test_abi_errors_are_not_values_or_true_flags(self):
         sim = Sim.from_toml(ROBOT_TOML)

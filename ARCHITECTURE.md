@@ -148,9 +148,12 @@ and replay preserve publication-age semantics. Simulated topics retain RTMS's
 latest-value skips and sequence-drop accounting. `testing::Sim::pause(name,
 duration)` stops one node's drains and timers while its clock and peers advance;
 `resume(name)` resumes early. Overdue periodic timers coalesce on their original
-phase, as after SIGSTOP/SIGCONT. Simulation still dispatches nodes serially on
-deterministic 1 ms slices: it does not model concurrent copies, torn reads, OS
-scheduling jitter, or the CPU cost of handlers.
+phase, as after SIGSTOP/SIGCONT. Simulation dispatches nodes serially on one
+chronological frontier: each step runs every node's loop up to the earliest
+pending deadline of any of them, so no node sees a publication from its future,
+and at one instant nodes run in the order they were added. It does not model
+concurrent copies, torn reads, OS scheduling jitter, or the CPU cost of
+handlers.
 
 ## Topics and messages
 

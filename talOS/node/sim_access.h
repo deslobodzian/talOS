@@ -25,7 +25,7 @@ struct SimAccess {
   static void* add_instance(testing::Sim& sim, std::string_view node_name,
                             const InstanceFactory& make);
   static const std::string& config_path(const testing::Sim& sim);
-  // Runs `fn` now and then every `period` of virtual time, before the nodes
+  // Runs `fn` now and then every `period` of virtual time, after the nodes
   // run at that instant. Stop by letting `fn` return false.
   static void every(testing::Sim& sim, std::chrono::nanoseconds period,
                     std::function<bool()> fn);

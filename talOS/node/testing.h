@@ -12,10 +12,17 @@
 //
 // Each node runs on its own simulated loop, with the process's delivery
 // policy (see Node::subscribe) and bounded RTMS topic/drop semantics. Time is
-// virtual and advances in 1 ms slices: callbacks drain by the next slice,
-// other nodes at their next update() or every(). pause(name, duration) stops
-// only that node's timers and deliveries; resume(name) ends the pause early.
-// Hardware is a layer on top: talOS/devices/testing.h plays the bridge.
+// virtual and advances on one chronological frontier: step() repeatedly takes
+// the earliest pending deadline of any node's loop, periodic hook or pause
+// end, and runs every loop exactly up to it, so no node sees a publication
+// from its future. At one instant the nodes run in the order they were added
+// (an earlier-added node's publications reach a later-added one at that same
+// instant, the reverse at the reader's next drain), and the Sim's own
+// periodic hooks (SimHardware) after them. pause(name, duration) stops only
+// that node's timers and deliveries; resume(name) ends the pause early.
+// Serial stepping proves causality and ordering, not concurrent RTMS
+// behaviour or scheduler jitter. Hardware is a layer on top:
+// talOS/devices/testing.h plays the bridge.
 
 #include <cstddef>
 #include <cstdint>

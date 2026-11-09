@@ -23,11 +23,6 @@
 namespace talos::testing {
 namespace {
 
-using namespace std::chrono_literals;
-
-// The loops' message tick: a slice never spans two deliveries.
-constexpr Duration kSlice = 1ms;
-
 // An inline config written to a file, so config_path() means the same thing
 // in a test as under talos::Run. Removed with the Sim.
 std::string WriteTempConfig(std::string_view toml) {
@@ -204,6 +199,11 @@ std::optional<std::vector<std::byte>> Sim::latest_bytes(
   return found->second;
 }
 
+// One chronological frontier: each round finds the earliest pending instant
+// across every hosted loop's scheduler, Sim::every hooks and pause ends, and
+// runs each loop exactly up to it, in the order the nodes were added. No
+// loop therefore runs past a time another has not reached, and at one
+// instant an earlier-added node's publications are visible to later ones.
 void Sim::step(Duration d) {
   if (d < Duration::zero()) throw std::invalid_argument("Sim: negative step");
   Impl& impl = *impl_;
@@ -212,13 +212,19 @@ void Sim::step(Duration d) {
   for (;;) {
     impl.RunPeriodic();
     if (impl.now >= end) break;
-    Duration next = std::min(impl.now + kSlice, end);
+    Duration next = end;
     for (const auto& p : impl.periodic) next = std::min(next, p.next);
     for (const auto& hosted : impl.nodes) {
-      if (hosted->paused_until && *hosted->paused_until > now()) {
+      if (hosted->paused_until) {
         next = std::min(next, Duration{hosted->paused_until->nanos()});
+        continue;
       }
+      // Arms the loop's timers and poll tick, dispatching nothing later
+      // than now, so its next deadline counts.
+      if (!hosted->loop->started()) hosted->loop->run_until(now());
+      next = std::min(next, Duration{hosted->loop->next_deadline().nanos()});
     }
+    next = std::max(next, impl.now);
     const Time until = Time::from_nanos(next.count());
     for (const auto& hosted : impl.nodes) {
       if (hosted->paused_until) {

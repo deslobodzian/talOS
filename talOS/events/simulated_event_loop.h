@@ -198,6 +198,16 @@ class SimulatedEventLoop
 
   void run_for(Duration duration) { run_until(now_ + duration); }
 
+  // Whether the first run has begun, arming the manifest's timers (and the
+  // poll tick); before it next_deadline() is not yet meaningful.
+  bool started() const { return started_; }
+
+  // The earliest armed deadline: when the next run would first dispatch, or
+  // MonotonicTime::max() with nothing armed. A harness stepping several
+  // loops advances them all to the earliest of theirs, so none runs past a
+  // time another has not reached (talos::testing::Sim).
+  MonotonicTime next_deadline() const { return scheduler_.next_deadline(); }
+
   // A stopped process's clock advances without draining or firing timers.
   void advance_until(MonotonicTime end) {
     if (end < now_)
@@ -294,7 +304,11 @@ class SimulatedEventLoop
   }
 
   // Normally deadlines and observation times coincide; a paused process
-  // instead observes overdue dispatches with its advanced clock.
+  // instead observes overdue dispatches with its advanced clock. Only
+  // publications made by now_ are visible: loops sharing an environment may
+  // stand at different times, and a reader never sees its future. A
+  // latest-only watcher takes the newest visible message; an ordered one
+  // stops at the first invisible one.
   void drain_messages(MonotonicTime tick_deadline) {
     ++drains_;
     auto& sources = this->sources();
@@ -310,10 +324,17 @@ class SimulatedEventLoop
            drained < options_.max_messages_per_tick &&
            cursor.sequence < cursor.channel->next_sequence();
            ++drained) {
-        const std::uint64_t sequence =
-            sources[id].latest_only
-                ? cursor.channel->next_sequence() - 1
-                : std::max(cursor.sequence, cursor.channel->oldest_sequence());
+        const std::uint64_t first =
+            std::max(cursor.sequence, cursor.channel->oldest_sequence());
+        std::uint64_t sequence = first;
+        if (sources[id].latest_only) {
+          sequence = cursor.channel->next_sequence() - 1;
+          while (sequence > first &&
+                 cursor.channel->publish_time(sequence) > now_) {
+            --sequence;
+          }
+        }
+        if (cursor.channel->publish_time(sequence) > now_) break;
         const std::uint64_t dropped = sequence - cursor.sequence;
         cursor.channel->copy_to(sequence, sources[id].buffer);
         cursor.sequence = sequence + 1;

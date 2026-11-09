@@ -18,6 +18,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "node_test/node_test_message_generated.h"
@@ -337,6 +338,121 @@ TEST(Node, PlainSubscriptionSkipsBacklogWhileCallbacksKeepCappedSequence) {
     EXPECT_EQ(backlog.received[static_cast<std::size_t>(i)], i);
   }
   EXPECT_EQ(backlog.latest->tick_count(), 129);
+}
+
+// --- chronological causality ---------------------------------------------
+
+constexpr const char* kCausalToml = R"(
+[robot]
+period_us = 1000
+command_timeout_us = 100000
+
+[subsystems.producer]
+period_us = 1000
+
+[subsystems.consumer]
+period_us = 500
+
+[subsystems.hearer]
+period_us = 500
+
+[subsystems.mechanism.motors.unused]
+can_id = 1
+)";
+
+struct Producer {
+  explicit Producer(Node& n)
+      : node{n}, out{n.publish<Count>("/producer/state")} {}
+  void update() {
+    out.send(Count{static_cast<std::int64_t>(node.tick()), node.now().nanos()});
+  }
+  Node& node;
+  Publisher<Count> out;
+};
+
+// What one consumer update() saw: its time, and the newest message's
+// publication time (stamped by the producer) and age as delivered.
+struct Seen {
+  Duration now;
+  Duration stamp;
+  Duration age;
+  bool fresh;
+};
+
+// A plain subscription: the node drains right before each update().
+struct Consumer {
+  explicit Consumer(Node& n)
+      : node{n}, in{n.subscribe<Count>("/producer/state")} {}
+  void update() {
+    if (!in.has_value()) return;
+    seen.push_back({Duration{node.now().nanos()}, Duration{in->stamp_ns()},
+                    in.age(), in.fresh()});
+  }
+  Node& node;
+  Subscription<Count> in;
+  std::vector<Seen> seen;
+};
+
+// A callback subscription: the node drains every 1 ms tick, in sequence.
+struct Hearer {
+  explicit Hearer(Node& n)
+      : node{n},
+        in{n.subscribe<Count>("/producer/state", [this](const Count& c) {
+          heard.emplace_back(Duration{node.now().nanos()},
+                             Duration{c.stamp_ns()});
+        })} {}
+  Node& node;
+  Subscription<Count> in;
+  std::vector<std::pair<Duration, Duration>> heard;  // (delivered, stamp)
+};
+
+// A 1 ms producer and 500 us consumers in either insertion order: no
+// consumer ever sees a publication from its future, so no age is negative.
+// The only difference between the orders is the documented equal-time rule:
+// at an instant several nodes run, the earlier-added one runs first, so a
+// consumer added after the producer sees that instant's message at once, and
+// one added before sees it at its next drain.
+TEST(Sim, LoopsAdvanceOnOneChronologicalFrontierInEitherInsertionOrder) {
+  using std::chrono::milliseconds;
+  for (const bool producer_first : {true, false}) {
+    SCOPED_TRACE(producer_first ? "producer first" : "consumer first");
+    auto sim = Sim::FromToml(kCausalToml);
+    if (producer_first) sim.add<Producer>("producer");
+    auto& consumer = sim.add<Consumer>("consumer");
+    auto& hearer = sim.add<Hearer>("hearer");
+    if (!producer_first) sim.add<Producer>("producer");
+    sim.step(20ms);
+    sim.pause("consumer", 2500us);
+    sim.step(3ms);
+    sim.step(17ms);
+
+    // Every update from 1 ms (or 1.5 ms) on saw a message; the pause
+    // coalesced the five missed ticks into one at its end, 22.5 ms.
+    EXPECT_EQ(consumer.seen.size(), producer_first ? 75u : 74u);
+    for (const Seen& s : consumer.seen) {
+      SCOPED_TRACE(s.now.count());
+      EXPECT_GE(s.age, Duration::zero());
+      EXPECT_EQ(s.age, s.now - s.stamp);
+      // The newest publication by then: this instant's when the producer
+      // ran first, otherwise the previous millisecond's.
+      EXPECT_EQ(s.stamp, producer_first
+                             ? std::chrono::floor<milliseconds>(s.now)
+                             : std::chrono::ceil<milliseconds>(s.now) - 1ms);
+      EXPECT_TRUE(s.fresh);
+    }
+
+    // Every publication reaches the ordered subscriber once, at the first
+    // 1 ms drain that runs after it.
+    const auto latest = sim.latest<Count>("/producer/state");
+    ASSERT_TRUE(latest.has_value());
+    EXPECT_EQ(latest->tick_count(), 39);
+    ASSERT_EQ(hearer.heard.size(), producer_first ? 40u : 39u);
+    for (std::size_t i = 0; i < hearer.heard.size(); ++i) {
+      const auto [delivered, stamp] = hearer.heard[i];
+      EXPECT_EQ(stamp, milliseconds{i + 1});
+      EXPECT_EQ(delivered, producer_first ? stamp : stamp + 1ms);
+    }
+  }
 }
 
 struct RelativeWrist {
