@@ -15,7 +15,6 @@
 
 extern "C" {
 #include <apriltag.h>
-#include <apriltag_pose.h>
 #include <common/image_u8.h>
 #include <common/matd.h>
 #include <common/pjpeg.h>
@@ -30,27 +29,6 @@ extern "C" {
 }
 
 namespace talos::vision::apriltag {
-namespace {
-
-// The C solver reports poses in its own tag frame; everything downstream
-// uses the WPILib/layout frame (+X out of the face, +Z up). Keep the
-// struct's redundant members consistent with the converted pose.
-void ConvertToLayoutTagFrame(PoseEstimation* estimation) {
-  if (estimation == nullptr) return;
-  estimation->pose = SolverTagFrameToLayoutFrame(estimation->pose);
-  estimation->rotation = estimation->pose.rotation().rotationMatrix();
-  estimation->translation = estimation->pose.translation();
-  if (estimation->has_alternative) {
-    estimation->alternative_pose =
-        SolverTagFrameToLayoutFrame(estimation->alternative_pose);
-    estimation->alternative_rotation =
-        estimation->alternative_pose.rotation().rotationMatrix();
-    estimation->alternative_translation =
-        estimation->alternative_pose.translation();
-  }
-}
-
-}  // namespace
 
 struct CpuAprilTagBackend::Impl {
   apriltag_detector_t* td = nullptr;
@@ -313,120 +291,6 @@ PoseEstimation CpuAprilTagBackend::EstimatePose(
   result.alternative_rotation =
       result.alternative_pose.rotation().rotationMatrix();
   result.alternative_translation = result.alternative_pose.translation();
-  return result;
-}
-
-PoseEstimation CpuAprilTagBackend::EstimatePoseHomography(
-    const Detection& detection, const CameraIntrinsics& intrinsics,
-    double tag_size_meters) const {
-  apriltag_detection_t det;
-  det.H = matd_create(3, 3);
-  for (int r = 0; r < 3; ++r) {
-    for (int c = 0; c < 3; ++c) {
-      MATD_EL(det.H, r, c) = detection.homography(r, c);
-    }
-  }
-  for (int j = 0; j < 4; ++j) {
-    det.p[j][0] = detection.corners[j].x;
-    det.p[j][1] = detection.corners[j].y;
-  }
-
-  apriltag_detection_info_t info;
-  info.det = &det;
-  info.tagsize = tag_size_meters;
-  info.fx = intrinsics.fx;
-  info.fy = intrinsics.fy;
-  info.cx = intrinsics.cx;
-  info.cy = intrinsics.cy;
-
-  apriltag_pose_t pose;
-  estimate_pose_for_tag_homography(&info, &pose);
-
-  PoseEstimation result;
-  if (pose.R != nullptr && pose.t != nullptr) {
-    for (int r = 0; r < 3; ++r) {
-      for (int c = 0; c < 3; ++c) {
-        result.rotation(r, c) = MATD_EL(pose.R, r, c);
-      }
-    }
-    result.translation = Eigen::Vector3d(
-        MATD_EL(pose.t, 0, 0), MATD_EL(pose.t, 1, 0), MATD_EL(pose.t, 2, 0));
-    result.pose = talos::geometry::SE3<double>(
-        talos::geometry::SO3<double>(result.rotation), result.translation);
-    matd_destroy(pose.R);
-    matd_destroy(pose.t);
-  }
-
-  matd_destroy(det.H);
-  ConvertToLayoutTagFrame(&result);
-  return result;
-}
-
-PoseEstimation CpuAprilTagBackend::EstimatePoseOrthogonalIteration(
-    const Detection& detection, const CameraIntrinsics& intrinsics,
-    double tag_size_meters, int n_iters) const {
-  apriltag_detection_t det;
-  det.H = matd_create(3, 3);
-  for (int r = 0; r < 3; ++r) {
-    for (int c = 0; c < 3; ++c) {
-      MATD_EL(det.H, r, c) = detection.homography(r, c);
-    }
-  }
-  for (int j = 0; j < 4; ++j) {
-    det.p[j][0] = detection.corners[j].x;
-    det.p[j][1] = detection.corners[j].y;
-  }
-
-  apriltag_detection_info_t info;
-  info.det = &det;
-  info.tagsize = tag_size_meters;
-  info.fx = intrinsics.fx;
-  info.fy = intrinsics.fy;
-  info.cx = intrinsics.cx;
-  info.cy = intrinsics.cy;
-
-  double err1 = 0.0;
-  double err2 = 0.0;
-  apriltag_pose_t pose1;
-  apriltag_pose_t pose2;
-  estimate_tag_pose_orthogonal_iteration(&info, &err1, &pose1, &err2, &pose2,
-                                         n_iters);
-
-  PoseEstimation result;
-  result.error = err1;
-  if (pose1.R != nullptr && pose1.t != nullptr) {
-    for (int r = 0; r < 3; ++r) {
-      for (int c = 0; c < 3; ++c) {
-        result.rotation(r, c) = MATD_EL(pose1.R, r, c);
-      }
-    }
-    result.translation = Eigen::Vector3d(
-        MATD_EL(pose1.t, 0, 0), MATD_EL(pose1.t, 1, 0), MATD_EL(pose1.t, 2, 0));
-    result.pose = talos::geometry::SE3<double>(
-        talos::geometry::SO3<double>(result.rotation), result.translation);
-    matd_destroy(pose1.R);
-    matd_destroy(pose1.t);
-  }
-
-  if (pose2.R != nullptr && pose2.t != nullptr) {
-    result.has_alternative = true;
-    result.alternative_error = err2;
-    for (int r = 0; r < 3; ++r) {
-      for (int c = 0; c < 3; ++c) {
-        result.alternative_rotation(r, c) = MATD_EL(pose2.R, r, c);
-      }
-    }
-    result.alternative_translation = Eigen::Vector3d(
-        MATD_EL(pose2.t, 0, 0), MATD_EL(pose2.t, 1, 0), MATD_EL(pose2.t, 2, 0));
-    result.alternative_pose = talos::geometry::SE3<double>(
-        talos::geometry::SO3<double>(result.alternative_rotation),
-        result.alternative_translation);
-    matd_destroy(pose2.R);
-    matd_destroy(pose2.t);
-  }
-
-  matd_destroy(det.H);
-  ConvertToLayoutTagFrame(&result);
   return result;
 }
 

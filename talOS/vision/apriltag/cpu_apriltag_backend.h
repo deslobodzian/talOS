@@ -104,14 +104,6 @@ class CpuAprilTagBackend {
                               const CameraIntrinsics& intrinsics,
                               double tag_size_meters) const;
 
-  PoseEstimation EstimatePoseHomography(const Detection& detection,
-                                        const CameraIntrinsics& intrinsics,
-                                        double tag_size_meters) const;
-
-  PoseEstimation EstimatePoseOrthogonalIteration(
-      const Detection& detection, const CameraIntrinsics& intrinsics,
-      double tag_size_meters, int n_iters = 50) const;
-
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

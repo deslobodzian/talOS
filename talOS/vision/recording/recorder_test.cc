@@ -272,7 +272,7 @@ TEST_F(RecorderTest, ZeroRatesRecordNothing) {
   EXPECT_EQ(rec.recorded(), 0u);
 }
 
-TEST_F(RecorderTest, QueueFullDropsAreCountedWithoutBlocking) {
+TEST_F(RecorderTest, QueueOverflowAccountsForEverySubmission) {
   FrameRecorder::Options opts;
   opts.output_dir = dir_;
   opts.context = MakeContext();

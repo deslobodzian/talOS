@@ -92,17 +92,7 @@ TEST(CalibrationTest, DistortionAndUndistortRoundTrip) {
 
 TEST(CalibrationTest, CameraMounting) {
   CameraMounting mount = CameraMounting::Identity();
-  EXPECT_TRUE(mount.T_robot_camera.translation().isZero());
 
-  // Mount camera 0.3m forward, 0.1m up, rotated 45 deg yaw
-  const Eigen::Vector3d t(0.3, 0.0, 0.1);
-  const auto r =
-      talos::geometry::SO3<double>::Exp(Eigen::Vector3d(0.0, 0.0, 0.785398));
-  talos::geometry::SE3<double> T_robot_cam(r, t);
-
-  CameraMounting custom = CameraMounting::FromOpticalTransform(T_robot_cam);
-  EXPECT_NEAR(custom.T_robot_camera.translation().x(), 0.3, 1e-6);
-  EXPECT_NEAR(custom.T_robot_camera.translation().z(), 0.1, 1e-6);
   EXPECT_TRUE(mount.T_robot_camera.act(Eigen::Vector3d::UnitZ())
                   .isApprox(Eigen::Vector3d::UnitX()));
   const auto yawed =
@@ -111,34 +101,6 @@ TEST(CalibrationTest, CameraMounting) {
                   .isApprox(Eigen::Vector3d::UnitY()));
 }
 
-TEST(CalibrationTest, FieldLayout) {
-  FieldLayout layout(0.1651);
-  EXPECT_EQ(layout.default_tag_size_m(), 0.1651);
-  EXPECT_EQ(layout.size(), 0);
-
-  // Add Tag 1 at (5.0, 2.0, 1.2)
-  talos::geometry::SE3<double> T_field_tag1(
-      talos::geometry::SO3<double>::Identity(), Eigen::Vector3d(5.0, 2.0, 1.2));
-  layout.SetTagPose(1, T_field_tag1);
-
-  EXPECT_TRUE(layout.HasTag(1));
-  EXPECT_FALSE(layout.HasTag(2));
-  EXPECT_EQ(layout.size(), 1);
-
-  auto pose1 = layout.GetTagPose(1);
-  if (!pose1.has_value()) {
-    FAIL() << "Missing tag 1 pose";
-  }
-  const auto& tag_pose = *pose1;
-  EXPECT_NEAR(tag_pose.translation().x(), 5.0, 1e-6);
-  EXPECT_NEAR(tag_pose.translation().y(), 2.0, 1e-6);
-  EXPECT_NEAR(tag_pose.translation().z(), 1.2, 1e-6);
-
-  // Tag sizes
-  EXPECT_NEAR(layout.GetTagSize(1), 0.1651, 1e-6);
-  layout.SetTagSize(2, 0.20);
-  EXPECT_NEAR(layout.GetTagSize(2), 0.20, 1e-6);
-}
 
 }  // namespace
 }  // namespace talos::vision

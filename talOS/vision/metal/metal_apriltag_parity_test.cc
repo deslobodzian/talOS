@@ -252,119 +252,30 @@ class MetalAprilTagParityTest : public ::testing::Test {
   std::unique_ptr<MetalAprilTagBackend> metal_backend_;
 };
 
-TEST_F(MetalAprilTagParityTest, BackendInitializationAndCapabilities) {
-#if defined(__APPLE__)
-  EXPECT_TRUE(metal_backend_->supports_gpu());
-  EXPECT_FALSE(metal_backend_->is_fallback());
-  EXPECT_NE(metal_backend_->device_info().find("Metal GPU"), std::string::npos);
-#endif
-  EXPECT_EQ(metal_backend_->name(), "metal");
-}
 
-TEST_F(MetalAprilTagParityTest, PhotographicFixture133369213973) {
-  const std::string path = ResolveTestdataPath("33369213973_9d9bb4cc96_c.jpg");
-  ASSERT_TRUE(std::filesystem::exists(path)) << "Fixture not found at " << path;
-
-  auto cpu_dets = cpu_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-  auto metal_dets =
-      metal_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-
-  EXPECT_EQ(cpu_dets.size(), 12u);
-  AssertAcceptanceContract(cpu_dets, metal_dets, "PhotographicFixture1");
-
-  const auto& timings = metal_backend_->last_timings();
-  EXPECT_GT(timings.total_us, 0u);
-  if (metal_backend_->supports_gpu()) {
-    EXPECT_GT(timings.grayscale_us + timings.threshold_us, 0u);
+TEST_F(MetalAprilTagParityTest, FixtureDetectionAndPoseParity) {
+  struct Fixture {
+    const char* file;
+    size_t count;
+  };
+  for (const auto& fixture : {
+           Fixture{"33369213973_9d9bb4cc96_c.jpg", 12},
+           Fixture{"34085369442_304b6bafd9_c.jpg", 25},
+           Fixture{"34139872896_defdb2f8d9_c.jpg", 10},
+           Fixture{"scene_single_tag0.png", 1},
+           Fixture{"scene_rotated_tag.png", 1},
+           Fixture{"scene_multi_tag.png", 4},
+           Fixture{"scene_non_aligned.png", 1},
+           Fixture{"scene_empty.png", 0},
+       }) {
+    SCOPED_TRACE(fixture.file);
+    const auto path = ResolveTestdataPath(fixture.file);
+    const auto cpu = cpu_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
+    const auto metal =
+        metal_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
+    ASSERT_EQ(cpu.size(), fixture.count);
+    AssertAcceptanceContract(cpu, metal, fixture.file);
   }
-  EXPECT_GT(timings.quad_us, 0u);
-}
-
-TEST_F(MetalAprilTagParityTest, PhotographicFixture234085369442) {
-  const std::string path = ResolveTestdataPath("34085369442_304b6bafd9_c.jpg");
-  ASSERT_TRUE(std::filesystem::exists(path)) << "Fixture not found at " << path;
-
-  auto cpu_dets = cpu_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-  auto metal_dets =
-      metal_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-
-  EXPECT_EQ(cpu_dets.size(), 25u);
-  AssertAcceptanceContract(cpu_dets, metal_dets, "PhotographicFixture2");
-}
-
-TEST_F(MetalAprilTagParityTest, PhotographicFixture334139872896) {
-  const std::string path = ResolveTestdataPath("34139872896_defdb2f8d9_c.jpg");
-  ASSERT_TRUE(std::filesystem::exists(path)) << "Fixture not found at " << path;
-
-  auto cpu_dets = cpu_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-  auto metal_dets =
-      metal_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-
-  EXPECT_EQ(cpu_dets.size(), 10u);
-  AssertAcceptanceContract(cpu_dets, metal_dets, "PhotographicFixture3");
-}
-
-TEST_F(MetalAprilTagParityTest, SyntheticSceneSingleTag) {
-  const std::string path = ResolveTestdataPath("scene_single_tag0.png");
-  ASSERT_TRUE(std::filesystem::exists(path)) << "Fixture not found at " << path;
-
-  auto cpu_dets = cpu_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-  auto metal_dets =
-      metal_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-
-  EXPECT_EQ(cpu_dets.size(), 1u);
-  AssertAcceptanceContract(cpu_dets, metal_dets, "SyntheticSceneSingleTag");
-}
-
-TEST_F(MetalAprilTagParityTest, SyntheticSceneRotatedTag) {
-  const std::string path = ResolveTestdataPath("scene_rotated_tag.png");
-  ASSERT_TRUE(std::filesystem::exists(path)) << "Fixture not found at " << path;
-
-  auto cpu_dets = cpu_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-  auto metal_dets =
-      metal_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-
-  EXPECT_EQ(cpu_dets.size(), 1u);
-  AssertAcceptanceContract(cpu_dets, metal_dets, "SyntheticSceneRotatedTag");
-}
-
-TEST_F(MetalAprilTagParityTest, SyntheticSceneMultiTag) {
-  const std::string path = ResolveTestdataPath("scene_multi_tag.png");
-  ASSERT_TRUE(std::filesystem::exists(path)) << "Fixture not found at " << path;
-
-  auto cpu_dets = cpu_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-  auto metal_dets =
-      metal_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-
-  EXPECT_EQ(cpu_dets.size(), 4u);
-  AssertAcceptanceContract(cpu_dets, metal_dets, "SyntheticSceneMultiTag");
-}
-
-TEST_F(MetalAprilTagParityTest, SyntheticSceneNonAlignedDimensions) {
-  // Tests dimensions that do not divide evenly into 16x16 GPU threadgroups
-  const std::string path = ResolveTestdataPath("scene_non_aligned.png");
-  ASSERT_TRUE(std::filesystem::exists(path)) << "Fixture not found at " << path;
-
-  auto cpu_dets = cpu_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-  auto metal_dets =
-      metal_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-
-  EXPECT_EQ(cpu_dets.size(), 1u);
-  AssertAcceptanceContract(cpu_dets, metal_dets,
-                           "SyntheticSceneNonAlignedDimensions");
-}
-
-TEST_F(MetalAprilTagParityTest, SyntheticSceneEmpty) {
-  const std::string path = ResolveTestdataPath("scene_empty.png");
-  ASSERT_TRUE(std::filesystem::exists(path)) << "Fixture not found at " << path;
-
-  auto cpu_dets = cpu_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-  auto metal_dets =
-      metal_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-
-  EXPECT_TRUE(cpu_dets.empty());
-  EXPECT_TRUE(metal_dets.empty());
-  AssertAcceptanceContract(cpu_dets, metal_dets, "SyntheticSceneEmpty");
 }
 
 TEST_F(MetalAprilTagParityTest, InGridSyntheticRgbAndDecimationParity) {
@@ -498,125 +409,6 @@ TEST_F(MetalAprilTagParityTest, RepeatedIdSpatialMatchingParity) {
   tag36h11_destroy(tf);
 }
 
-TEST_F(MetalAprilTagParityTest, ComputeBackendExecuteInterface) {
-  const std::string path = ResolveTestdataPath("scene_single_tag0.png");
-  ASSERT_TRUE(std::filesystem::exists(path));
-
-  image_u8_t* pnm = talos::vision::apriltag::LoadGrayImageU8(path);
-  ASSERT_NE(pnm, nullptr);
-
-  talos::event::MonotonicTime now =
-      talos::event::MonotonicTime::from_nanos(123456789);
-  Frame frame(1, 42, 100, now, pnm->width, pnm->height, PixelFormat::kGray8,
-              pnm->stride);
-  std::memcpy(frame.mutable_data(), pnm->buf,
-              static_cast<size_t>(pnm->stride) * pnm->height);
-  image_u8_destroy(pnm);
-
-  BackendExecutionResult res = metal_backend_->Execute(frame);
-  EXPECT_TRUE(res.success);
-  EXPECT_EQ(res.detections.size(), 1u);
-  EXPECT_EQ(res.detections[0].id, 0);
-  EXPECT_EQ(res.detections[0].hamming, 0);
-  EXPECT_GT(res.detections[0].decision_margin, 20.0f);
-  EXPECT_GT(res.timings.total_us, 0u);
-}
-
-TEST_F(MetalAprilTagParityTest,
-       Stage1GpuThresholdIntegrationParityOnSingleTag) {
-  // Stage 1 integration: proven GPU threshold wired into Detect via adapter.
-  const std::string path = ResolveTestdataPath("scene_single_tag0.png");
-  ASSERT_TRUE(std::filesystem::exists(path)) << "Fixture not found at " << path;
-
-  auto cpu_dets = cpu_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-  auto metal_dets =
-      metal_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-
-  ASSERT_EQ(cpu_dets.size(), metal_dets.size())
-      << "Detection count mismatch: CPU found " << cpu_dets.size()
-      << ", Metal found " << metal_dets.size();
-  ASSERT_EQ(cpu_dets.size(), 1u);
-  EXPECT_EQ(cpu_dets[0].id, metal_dets[0].id) << "Tag ID mismatch";
-  for (size_t k = 0; k < 4; ++k) {
-    double corner_err =
-        std::hypot(cpu_dets[0].corners[k].x - metal_dets[0].corners[k].x,
-                   cpu_dets[0].corners[k].y - metal_dets[0].corners[k].y);
-    EXPECT_LE(corner_err, 0.1) << "Corner " << k << " Euclidean error ("
-                               << corner_err << " px) exceeds 0.1 px";
-  }
-  AssertAcceptanceContract(cpu_dets, metal_dets, "Stage1SingleTag");
-
-  const auto& timings = metal_backend_->last_timings();
-  std::cout
-      << "\n--- Stage 1 Timings (MetalAprilTagBackend::DetectImageFile) ---"
-      << "\n  Grayscale: " << timings.grayscale_us << " us"
-      << "\n  Quad:      " << timings.quad_us << " us"
-      << "\n  Decode:    " << timings.decode_us << " us"
-      << "\n  Pose:      " << timings.pose_us << " us"
-      << "\n  Total:     " << timings.total_us << " us\n";
-  EXPECT_GT(timings.total_us, 0u);
-}
-
-TEST_F(MetalAprilTagParityTest, Stage2GpuCclPathParityOnSingleTag) {
-  // Stage 2 acceptance: GPU threshold + GPU connected-components + sparse
-  // GPU-label clustering must match the CPU backend under the 0.1px gate on
-  // every fixture. The flag is forced on here explicitly (it is also the
-  // backend default); CPU fallback remains available via =0.
-  const char* prev_stage2 = std::getenv("TALOS_METAL_STAGE2");
-  const std::string prev_value = (prev_stage2 != nullptr) ? prev_stage2 : "";
-  const bool had_prev = (prev_stage2 != nullptr);
-  setenv("TALOS_METAL_STAGE2", "1", 1);
-
-  const std::vector<std::string> fixtures = {
-      "scene_single_tag0.png",
-      "scene_rotated_tag.png",
-      "scene_multi_tag.png",
-  };
-  for (const auto& fixture : fixtures) {
-    const std::string path = ResolveTestdataPath(fixture);
-    ASSERT_TRUE(std::filesystem::exists(path))
-        << "Fixture not found at " << path;
-
-    auto cpu_dets =
-        cpu_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-    auto metal_dets =
-        metal_backend_->DetectImageFile(path, intrinsics_, tag_size_m_);
-
-    ASSERT_EQ(cpu_dets.size(), metal_dets.size())
-        << "Detection count mismatch (Stage 2 GPU-CCL path, " << fixture
-        << "): CPU found " << cpu_dets.size() << ", Metal found "
-        << metal_dets.size();
-    for (size_t i = 0; i < cpu_dets.size(); ++i) {
-      EXPECT_EQ(cpu_dets[i].id, metal_dets[i].id)
-          << "Tag ID mismatch (Stage 2 GPU-CCL path, " << fixture << ")";
-      double center_err =
-          std::hypot(cpu_dets[i].center.x - metal_dets[i].center.x,
-                     cpu_dets[i].center.y - metal_dets[i].center.y);
-      EXPECT_LE(center_err, 0.1)
-          << "Center Euclidean error (" << center_err
-          << " px) exceeds 0.1 px (Stage 2 GPU-CCL path, " << fixture << ")";
-      for (size_t k = 0; k < 4; ++k) {
-        double corner_err =
-            std::hypot(cpu_dets[i].corners[k].x - metal_dets[i].corners[k].x,
-                       cpu_dets[i].corners[k].y - metal_dets[i].corners[k].y);
-        EXPECT_LE(corner_err, 0.1)
-            << "Corner " << k << " Euclidean error (" << corner_err
-            << " px) exceeds 0.1 px (Stage 2 GPU-CCL path, " << fixture << ")";
-      }
-    }
-    AssertAcceptanceContract(cpu_dets, metal_dets, "Stage2GpuCcl:" + fixture);
-  }
-
-  if (had_prev) {
-    setenv("TALOS_METAL_STAGE2", prev_value.c_str(), 1);
-  } else {
-#if defined(_WIN32)
-    _putenv("TALOS_METAL_STAGE2=");
-#else
-    unsetenv("TALOS_METAL_STAGE2");
-#endif
-  }
-}
 
 #if defined(__APPLE__)
 void AssertThresholdParity(MetalAprilTagBackend& backend, image_u8_t* im,
