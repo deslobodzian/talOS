@@ -130,8 +130,9 @@ class MatchRehearsal(unittest.TestCase):
 
             dumped = subprocess.run(
                 [str(root / "talOS/launcher/log_dump"), "--format", "jsonl",
-                 "--node", "drivetrain,intake,shooter,autonomous,teleop",
-                 "--topic", "/hw/request/*,/hw/state/driver_station,/drivetrain/target/*",
+                 "--node", "hardware_node,drivetrain,intake,shooter,autonomous,teleop",
+                 "--topic", "/hw/command,/hw/request/*,/hw/state/driver_station,"
+                 "/drivetrain/target/*",
                  str(session)], capture_output=True, text=True, check=True, timeout=15)
             (tmp / "match.jsonl").write_text(dumped.stdout)
             rows = [json.loads(line) for line in dumped.stdout.splitlines()]
@@ -143,7 +144,13 @@ class MatchRehearsal(unittest.TestCase):
                         r["topic"] == "/hw/request/drivetrain" and r["kind"] == "SEND"]
             ds = [r for r in rows if r["process"] == "intake" and
                   r["topic"] == "/hw/state/driver_station" and r["kind"] == "MESSAGE"]
-            self.assertGreater(len(ds), 500)
+            # Coverage, not a count: a slow host drains fewer packets, but no
+            # gap may reach the command timeout (that would itself neutralize).
+            ds_times = [r["now_ms"] for r in ds]
+            self.assertGreater(len(ds_times), 2)
+            self.assertLess(max(b - a for a, b in zip(ds_times, ds_times[1:])),
+                            robot["robot"]["command_timeout_us"] / 1000,
+                            "Driver Station stream gap")
             phases = []
             for row in ds:
                 flags, _ = support.ds_snapshot(row)
@@ -182,7 +189,12 @@ class MatchRehearsal(unittest.TestCase):
                                 any(m[0] != 0 and abs(m[2]) > 0.1 for m in
                                     support.motor_requests(r).values()) for r in intake),
                             "teleop mechanism buttons never actuated intake")
-            self.assert_driving(requests, kill - 150, kill, drive_ids)
+            # SIGKILL loses the killed process's unflushed recording (up to
+            # one recorder chunk), so pre-kill actuation is read from what the
+            # bridge actually sent to the gateway.
+            commands = [r for r in rows if r["process"] == "hardware_node" and
+                        r["topic"] == "/hw/command" and r["kind"] == "SEND"]
+            self.assert_driving(commands, kill - 150, kill, drive_ids)
             restarted = [r for r in requests if kill + 10 < r["now_ms"] < first_resume]
             self.assertGreater(len(restarted), 5, "consumer did not restart during pause")
             self.assert_neutral(requests, restarted[0]["now_ms"], first_resume, motor_ids)
