@@ -42,6 +42,14 @@ cc_test(
 )
 
 cc_library(
+    name = "udp_test_helpers",
+    testonly = True,
+    hdrs = ["udp_test_helpers.h"],
+    visibility = ["//visibility:public"],
+    deps = [":protocol"],
+)
+
+cc_library(
     name = "fuzz_corpus",
     testonly = True,
     hdrs = ["fuzz_corpus.h"],

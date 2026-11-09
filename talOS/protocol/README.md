@@ -46,6 +46,12 @@ Use `MutablePayloadBuffer()` plus `SendBufferedFrame()` to build the payload
 directly inside the outgoing datagram buffer, avoiding an extra copy.
 `SendFrame()` copies from a caller buffer.
 
+Loopback tests expecting a sent frame use the test-only
+`udp_test_helpers.h` `testing::ReceiveFrame()` delivery barrier. It bounds
+wall-clock waiting without advancing simulated time or resending, and returns
+socket/decode errors immediately. Negative receive assertions still use
+`TryReceive()` directly.
+
 ## Safety Boundary
 
 The protocol carries commands; it does not make them safe. The gateway must

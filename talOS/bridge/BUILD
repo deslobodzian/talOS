@@ -75,6 +75,7 @@ cc_test(
         "//talOS/events:events_log",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
+        "//talOS/protocol:udp_test_helpers",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

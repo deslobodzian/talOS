@@ -54,6 +54,7 @@ cc_test(
     srcs = ["gateway_test.cc"],
     deps = [
         ":hardware",
+        "//talOS/protocol:udp_test_helpers",
         "@googletest//:gtest_main",
     ],
 )

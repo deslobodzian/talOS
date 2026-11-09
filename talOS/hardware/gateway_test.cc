@@ -14,6 +14,7 @@
 #include "endpoint.h"
 #include "sim_backend.h"
 #include "sim_physics.h"
+#include "talOS/protocol/udp_test_helpers.h"
 
 namespace talos::hardware {
 namespace {
@@ -1072,7 +1073,8 @@ TEST(Endpoint, ClockProbeEchoUsesLaterSampleWhileDisabledAndUnconfigured) {
   for (uint64_t tick : {1000u, 6000u}) {
     ASSERT_EQ(endpoint.Tick(tick, false), protocol::UdpStatus::kOk);
     protocol::DecodedFrame frame;
-    ASSERT_EQ(companion.TryReceive(&frame), protocol::UdpStatus::kOk);
+    ASSERT_EQ(protocol::testing::ReceiveFrame(companion, &frame),
+              protocol::UdpStatus::kOk);
     State state;
     ASSERT_TRUE(Decode({frame.payload, frame.payload_size}, state));
     EXPECT_EQ(state.clock_probe_time_us, tick == 1000 ? 0u : 9000u);
@@ -1136,14 +1138,15 @@ TEST(Endpoint, OutboundBlackoutPreservesReceiveAndSafetyTicks) {
   ASSERT_EQ(endpoint.SendFrame(protocol::FrameType::kDriverStation, resumed_at,
                                ds_payload.data(), ds_payload.size()),
             protocol::UdpStatus::kOk);
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  ASSERT_EQ(companion.TryReceive(&frame), protocol::UdpStatus::kOk);
+  ASSERT_EQ(protocol::testing::ReceiveFrame(companion, &frame),
+            protocol::UdpStatus::kOk);
   EXPECT_EQ(frame.header.type, protocol::FrameType::kHardwareState);
   State state;
   ASSERT_TRUE(Decode({frame.payload, frame.payload_size}, state));
   EXPECT_EQ(state.sample_time_us, resumed_at);
   EXPECT_FALSE(state.flags & kEnabled);
-  ASSERT_EQ(companion.TryReceive(&frame), protocol::UdpStatus::kOk);
+  ASSERT_EQ(protocol::testing::ReceiveFrame(companion, &frame),
+            protocol::UdpStatus::kOk);
   EXPECT_EQ(frame.header.type, protocol::FrameType::kDriverStation);
   EXPECT_EQ(companion.TryReceive(&frame), protocol::UdpStatus::kWouldBlock);
 }
@@ -1159,21 +1162,12 @@ TEST(Endpoint, PushesConfigOverUdpAndHandlesEpochChangeOnRestart) {
   ASSERT_EQ(companion.Open("127.0.0.1", 15803, "127.0.0.1", 15802),
             protocol::UdpStatus::kOk);
 
-  auto poll_receive = [](protocol::RuntimeUdpPeer& peer,
-                         protocol::DecodedFrame* out) {
-    for (int i = 0; i < 50; ++i) {
-      auto status = peer.TryReceive(out);
-      if (status == protocol::UdpStatus::kOk) return status;
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return peer.TryReceive(out);
-  };
-
   // 1. Companion ticks and sees state with config_id = 0
   endpoint.Tick(1000, true);
 
   protocol::DecodedFrame frame;
-  ASSERT_EQ(poll_receive(companion, &frame), protocol::UdpStatus::kOk);
+  ASSERT_EQ(protocol::testing::ReceiveFrame(companion, &frame),
+            protocol::UdpStatus::kOk);
   EXPECT_EQ(frame.header.type, protocol::FrameType::kHardwareState);
   State state;
   ASSERT_TRUE(Decode({frame.payload, frame.payload_size}, state));
@@ -1197,7 +1191,8 @@ TEST(Endpoint, PushesConfigOverUdpAndHandlesEpochChangeOnRestart) {
 
   // 4. Companion receives ACK
   protocol::DecodedFrame ack_frame;
-  ASSERT_EQ(poll_receive(companion, &ack_frame), protocol::UdpStatus::kOk);
+  ASSERT_EQ(protocol::testing::ReceiveFrame(companion, &ack_frame),
+            protocol::UdpStatus::kOk);
   EXPECT_EQ(ack_frame.header.type, protocol::FrameType::kHardwareConfigAck);
   ConfigAckPayload ack{};
   ASSERT_TRUE(
@@ -1208,7 +1203,8 @@ TEST(Endpoint, PushesConfigOverUdpAndHandlesEpochChangeOnRestart) {
   // 5. Subsequent state from endpoint has config_id set and kConfigured set
   endpoint.Tick(3000, true);
   protocol::DecodedFrame state_frame;
-  ASSERT_EQ(poll_receive(companion, &state_frame), protocol::UdpStatus::kOk);
+  ASSERT_EQ(protocol::testing::ReceiveFrame(companion, &state_frame),
+            protocol::UdpStatus::kOk);
   EXPECT_EQ(state_frame.header.type, protocol::FrameType::kHardwareState);
   ASSERT_TRUE(Decode({state_frame.payload, state_frame.payload_size}, state));
   EXPECT_EQ(state.config_id, ConfigurationId(cfg));

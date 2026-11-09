@@ -24,6 +24,7 @@
 #include "talOS/events/log/log_reader.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
+#include "talOS/protocol/udp_test_helpers.h"
 
 namespace talos::hardware {
 namespace {
@@ -309,15 +310,16 @@ bool InjectState(HardwareNode& node, protocol::RuntimeUdpPeer& gateway,
 unsigned ReceiveConfigs(protocol::RuntimeUdpPeer& gateway) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-  unsigned count = 0;
-  do {
-    protocol::DecodedFrame frame;
+  protocol::DecodedFrame frame;
+  while (protocol::testing::ReceiveFrame(gateway, &frame, deadline) ==
+         protocol::UdpStatus::kOk) {
+    if (frame.header.type != protocol::FrameType::kHardwareConfig) continue;
+    unsigned count = 1;
     while (gateway.TryReceive(&frame) == protocol::UdpStatus::kOk)
       count += frame.header.type == protocol::FrameType::kHardwareConfig;
-    if (count != 0) return count;
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  } while (std::chrono::steady_clock::now() < deadline);
-  return count;
+    return count;
+  }
+  return 0;
 }
 
 State TrustState(uint64_t config_id, uint64_t boot_id, uint64_t epoch,
@@ -601,13 +603,22 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   request.motors[0] = {cfg.subsystems.at("intake").motors[0], Mode::kVoltage, 0,
                        3.5, 0.0};
   bool received_command = false;
+  bool published_request = false;
   for (int i = 0; i < 150; ++i) {
     gateway.SendFrame(protocol::FrameType::kHardwareState, 0, 1000,
                       packet.data.data(), packet.size);
-    PublishCommand(pub, request);
     protocol::DecodedFrame frame;
     while (gateway.TryReceive(&frame) == protocol::UdpStatus::kOk) {
       EXPECT_EQ(frame.header.flags, 0u);
+      // Configuration is sent only after accepting the gateway state. Wait
+      // for that identity barrier, then publish exactly once. Re-publishing
+      // while waiting for UDP receipt could legitimately reactivate a demand
+      // after its first subsystem timeout on a delayed parent process.
+      if (frame.header.type == protocol::FrameType::kHardwareConfig &&
+          !published_request) {
+        PublishCommand(pub, request);
+        published_request = true;
+      }
       if (frame.header.type == protocol::FrameType::kHardwareCommand) {
         received_command = true;
       }
@@ -620,6 +631,7 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   ASSERT_TRUE(WIFEXITED(status));
   ASSERT_EQ(WEXITSTATUS(status), 0);
   ASSERT_TRUE(received_command);
+  ASSERT_TRUE(published_request);
   event::log::LogReader reader(log_path);
   EXPECT_EQ(reader.format_version(), 6u);
   bool logged_command = false;
@@ -636,9 +648,8 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
       Command command{};
       ASSERT_TRUE(Decode(logged.bytes(), command));
       EXPECT_EQ(command.boot_id, 42u);
-      // The publisher can refresh the request before it observes the first
-      // UDP command. Those refreshes (and heartbeats) may legitimately log
-      // more than one active command; after timeout, motion must not resume.
+      // One publication may produce active heartbeats, then a final neutral
+      // command. With no subsequent requests it must never reactivate.
       if (command.motors[1].mode == Mode::kVoltage) {
         EXPECT_FALSE(logged_neutral);
         EXPECT_DOUBLE_EQ(command.motors[1].demand, 3.5);
@@ -1655,7 +1666,8 @@ TEST(HardwareNodeTest, TwoWayClockBoundNeedsNoActiveRequests) {
       protocol::UdpStatus::kOk);
   node.Tick(2000000);
   protocol::DecodedFrame probe;
-  ASSERT_EQ(gateway.TryReceive(&probe), protocol::UdpStatus::kOk);
+  ASSERT_EQ(protocol::testing::ReceiveFrame(gateway, &probe),
+            protocol::UdpStatus::kOk);
   ASSERT_EQ(probe.header.type, protocol::FrameType::kClockProbe);
   const auto sent = probe.header.monotonic_time_us;
   auto state = TrustState(NodeConfigId(cfg), 11, 1, 1000);
