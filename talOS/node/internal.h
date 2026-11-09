@@ -65,7 +65,9 @@ class LoopPort {
   // The world outside the loop: a byte topic, which the loop neither
   // dispatches nor logs. By default an RTMS queue created on the first write,
   // so building a node (as --describe does) opens no shared memory;
-  // testing::Sim keeps byte topics in memory instead.
+  // testing::Sim keeps byte topics in memory instead, and --replay and
+  // --replay-inputs discard them (offline runs never touch a live robot's
+  // shared memory, and replay cannot verify what was never logged).
   virtual std::unique_ptr<ByteTopic> open_byte_topic(
       std::string_view topic, std::size_t max_bytes,
       const BytePublishOptions& options);

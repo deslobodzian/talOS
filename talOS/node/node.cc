@@ -961,18 +961,19 @@ Hosted Host(Loop& loop, const char* node_name, const Flags& flags,
               make);
 }
 
-// A byte topic that goes nowhere. The loop never logged byte topics, and a
-// node replayed offline must not write into the shared memory of a robot
-// that may be running on this machine.
+// A byte topic that goes nowhere. The loop never logged byte topics, so
+// replay cannot verify them, and a node replayed offline must not attach to
+// or write into the shared memory of a robot that may be running on this
+// machine.
 class DiscardedByteTopic final : public ByteTopic {
  public:
   bool write(std::span<const std::byte>) override { return true; }
 };
 
-// The loop port under --replay-inputs: the simulated loop, with byte topics
-// discarded.
+// The loop port under --replay and --replay-inputs: the loop, with byte
+// topics discarded.
 template <class Loop>
-class InputReplayPort final : public LoopPortFor<Loop> {
+class OfflinePort final : public LoopPortFor<Loop> {
  public:
   using LoopPortFor<Loop>::LoopPortFor;
   std::unique_ptr<ByteTopic> open_byte_topic(
@@ -996,8 +997,8 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
       event::log::LogWriter{flags.log_path, node_name,
                             event::log::LogWriterOptions{}, flags.session_id},
       Loop::Options{.start = session.start()}};
-  const Hosted hosted = Host(std::make_unique<InputReplayPort<Loop>>(loop),
-                             node_name, flags, make);
+  const Hosted hosted =
+      Host(std::make_unique<OfflinePort<Loop>>(loop), node_name, flags, make);
   const event::InputReplayReport report =
       event::ReplayInputs(loop, environment, session);
 
@@ -1123,7 +1124,9 @@ int RunMain(int argc, char** argv, const char* node_name,
     if (!flags.replay_path.empty()) {
       event::log::LogReader reader{flags.replay_path};
       event::ReplayEventLoop<> loop{reader};
-      const Hosted hosted = Host(loop, node_name, flags, make);
+      const Hosted hosted =
+          Host(std::make_unique<OfflinePort<event::ReplayEventLoop<>>>(loop),
+               node_name, flags, make);
       loop.run();
       std::printf("replay: diverged=%d clean_exit=%d\n", loop.diverged(),
                   loop.reached_exit());

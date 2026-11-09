@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
@@ -904,18 +905,70 @@ TEST(Binary, AGraphReaderDescribesWhatTheGraphItWasGivenHolds) {
   EXPECT_NE(run.output.find("--graph"), std::string::npos) << run.output;
 }
 
-TEST(Binary, LoggedSimRunReplaysWithoutDivergence) {
-  const char* tmp = std::getenv("TEST_TMPDIR");
-  const std::string log =
-      std::string{tmp != nullptr ? tmp : "/tmp"} + "/talos_node_test.tlog";
+// Exact replay is offline: a robot (here a sentinel publisher) may own the
+// node's byte topic on this machine, and replay neither attaches to it nor
+// fails because of it. Byte topics are not logged, so replay does not verify
+// them; typed sends still are, and a changed parameter diverges.
+TEST(Binary, LoggedSimRunReplaysOfflineWithoutDivergence) {
+  const std::string log = TempFile("talos_node_test.tlog");
+  // Isolate the sentinel and child replay from live publishers, restoring
+  // the caller's namespace afterwards.
+  struct Namespace {
+    std::optional<std::string> previous;
+    Namespace() {
+      if (const char* value = std::getenv("TALOS_SHM_NAMESPACE"))
+        previous = value;
+      const std::string name = "replay_offline_" + std::to_string(::getpid());
+      ::setenv("TALOS_SHM_NAMESPACE", name.c_str(), 1);
+    }
+    ~Namespace() {
+      if (previous) {
+        ::setenv("TALOS_SHM_NAMESPACE", previous->c_str(), 1);
+      } else {
+        ::unsetenv("TALOS_SHM_NAMESPACE");
+      }
+    }
+  } isolated;
   const Result run =
       RunBinary("--sim --duration-s 1 --log '" + log + "' " + ConfigFlag());
   ASSERT_EQ(run.status, 0) << run.output;
-  const Result replay = RunBinary("--replay '" + log + "' " + ConfigFlag());
-  EXPECT_EQ(replay.status, 0) << replay.output;
-  EXPECT_NE(replay.output.find("diverged=0 clean_exit=1"), std::string::npos)
-      << replay.output;
-  // Both runs wrote the node's byte topic to shared memory.
+  {
+    RTMSQueue sentinel{
+        "/test_node/frames",
+        64,
+        kMessageAlignment,
+        schema::Bytes(),
+        16,
+        RTMSOptions{.overflow_policy = OverflowPolicy::DROP_NEWEST,
+                    .read_mode = ReadMode::SEQUENCE,
+                    .publisher = true}};
+    const std::uint64_t written = sentinel.writer_sequence();
+    const Result replay = RunBinary("--replay '" + log + "' " + ConfigFlag());
+    EXPECT_EQ(replay.status, 0) << replay.output;
+    EXPECT_NE(replay.output.find("diverged=0 clean_exit=1"), std::string::npos)
+        << replay.output;
+    EXPECT_EQ(sentinel.writer_sequence(), written);
+  }
+
+  std::string config;
+  {
+    std::ifstream in{Runfile("TALOS_TEST_CONFIG")};
+    config.assign(std::istreambuf_iterator<char>{in}, {});
+  }
+  const std::size_t step = config.find("step = 3");
+  ASSERT_NE(step, std::string::npos);
+  config.replace(step, 8, "step = 4");
+  const std::string changed = TempFile("talos_node_test_step4.toml");
+  std::ofstream{changed} << config;
+  const Result diverged =
+      RunBinary("--replay '" + log + "' --config '" + changed + "'");
+  EXPECT_NE(diverged.status, 0) << diverged.output;
+  EXPECT_NE(
+      diverged.output.find("replay diverged at dispatch 2: sent "
+                           "different bytes on source '/test_node/state'"),
+      std::string::npos)
+      << diverged.output;
+  // Only the --sim run wrote the node's byte topic to shared memory.
   ::shm_unlink(ShmObjectName("/test_node/frames").c_str());
 }
 

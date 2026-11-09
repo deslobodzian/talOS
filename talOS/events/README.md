@@ -162,7 +162,12 @@ if (replay.diverged()) { /* the program no longer does what it did */ }
 Replay verifies as it goes. Every send must match the recorded bytes, in order.
 A changed gain, a reordered branch or a missing send is reported as a
 divergence naming the dispatch and the topic. Set `Options{false}` to collect
-every divergence in one pass instead of throwing at the first.
+every divergence in one pass instead of throwing at the first. Only the loop's
+typed sends, timer changes and exit are verified: byte topics
+(`Node::publish_bytes`) are outside the loop and never logged, so a node
+binary's `--replay` (`talOS/node/node.cc`) discards them, exactly as
+`--replay-inputs` does below. Replay is offline either way: it never attaches
+to or writes the shared memory of a robot that may be running on this machine.
 
 Dispatch logs use `.tlog` version 6: 120 B file header, 112 B manifest entries,
 64 B record headers plus stored payloads. The extra publication timestamp is
@@ -247,8 +252,8 @@ Node binaries expose this as
 `--replay-inputs <session dir>` (`talOS/node/node.cc`, Python nodes included
 through the C ABI); the launcher as `--replay-inputs <dir> --only <node>`
 (`talOS/launcher/README.md`). Byte topics (`Node::publish_bytes`) are
-discarded there: the loop never logs them, and an offline run must not write
-into a live robot's shared memory.
+discarded there, as under `--replay`: the loop never logs them, and an offline
+run must not write into a live robot's shared memory.
 
 ## Log format
 
