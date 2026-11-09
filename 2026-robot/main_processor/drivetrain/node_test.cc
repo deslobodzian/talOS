@@ -673,9 +673,10 @@ TEST_F(DrivetrainTest, DrivesBeforeTheClockMappingConvergesButReportsNoSample) {
 }
 
 TEST_F(DrivetrainTest, SampleTimeIsTheMappedHardwareSampleTimeNotTheTickTime) {
-  // 1 ms link latency while the filter converges, then 4 ms: the minimum
-  // stays 1 ms for the window, so each state maps 3 ms before it arrived.
-  // A drivetrain stamping its own tick time would read within a tick of now.
+  // SimHardware reports the true gateway clock mapping, so a state sampled
+  // at gateway time maps exactly; it arrives 4 ms later and is consumed at
+  // the next 5 ms tick. A drivetrain stamping its own tick time would read
+  // within a tick of now, not at least the 4 ms link latency behind it.
   hw.set_gateway_clock(std::chrono::seconds{1000}, 1ms);
   Teleop();
   sim.step(kConverged);
@@ -686,8 +687,8 @@ TEST_F(DrivetrainTest, SampleTimeIsTheMappedHardwareSampleTimeNotTheTickTime) {
   ASSERT_TRUE(state.modules_valid());
   const std::int64_t lag_ns =
       sim.now().nanos() - static_cast<std::int64_t>(state.sample_time_ns());
-  EXPECT_GE(lag_ns, std::chrono::nanoseconds{3ms}.count());
-  EXPECT_LE(lag_ns, std::chrono::nanoseconds{3ms + 5ms}.count());
+  EXPECT_GE(lag_ns, std::chrono::nanoseconds{4ms}.count());
+  EXPECT_LE(lag_ns, std::chrono::nanoseconds{4ms + 5ms}.count());
 }
 
 TEST_F(DrivetrainTest, ModuleTimestampUsesOldestConsumedSignalAcquisition) {

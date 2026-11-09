@@ -446,13 +446,16 @@ class FullStackSimulation(unittest.TestCase):
             self.assert_driving(requests, blackout_center + 500,
                                 blackout_center + 850, drive_ids)
             invalid_states = []
+            # State payload (talOS/hardware/messages.cc Encode(State)): six
+            # u64 and a u32 flags put motor_count at 52; seven u16 counts
+            # put the motors at 66, 45 bytes each (u16 id, u8 valid first).
             for row in rows:
                 if row["process"] != "hardware_node" or row["topic"] != "/hw/state":
                     continue
                 data = packet_bytes(row)
-                count, = struct.unpack_from("<H", data, 44)
+                count, = struct.unpack_from("<H", data, 52)
                 for i in range(count):
-                    motor, valid = struct.unpack_from("<HB", data, 58 + 47 * i)
+                    motor, valid = struct.unpack_from("<HB", data, 66 + 45 * i)
                     if motor == fault_id and not valid:
                         invalid_states.append(row)
             self.assertGreater(len(invalid_states), 20, "motor disconnect not observed")
