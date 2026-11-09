@@ -75,6 +75,7 @@ Handles are named by their device key in the subsystem config
 | `talos::robot_enabled(node)` | `talos.robot_enabled(node)` |
 | `node.extension<talos::HardwareLink>().sample_time()`: node-clock `Time` the latest hardware state was sampled at, `nullopt` while stale or before the bridge's clock mapping converges (8 states) | `talos.hardware_sample_time_ns(node)` (int ns, or `None`) |
 | `node.extension<talos::HardwareLink>().fresh()` / `.fresh(max_age)` and `.age()` | `link = talos.HardwareLink(node)`; `link.fresh()` / `link.fresh(max_age)` (`None` uses command timeout; seconds or `datetime.timedelta`); `link.age` (float seconds, `math.inf` before the first state); `link.sample_time` (int ns or `None`) |
+| `Motor` / `CANcoder`: `position_time()`, `velocity_time()`; `Gyro`: `yaw_time()`, `yaw_rate_time()` | same names as properties: integer node-clock nanoseconds, or `None` |
 
 `Motor::rezero(position_rot = 0)` and `Gyro::rezero(yaw_rot = 0)` (same
 methods in Python) set a software offset shared by all handles for that device
@@ -84,6 +85,23 @@ Motor position and gyro yaw subtract the offset; velocity/rate are unchanged.
 Motor position and motion-magic goals translate back to hardware coordinates
 before clamping. Configured soft limits remain in the **hardware frame** and
 the gateway's safety checks are never bypassed.
+
+Signal acquisition times subtract the signal's existing gateway age (microseconds)
+from the mapped hardware State time. They are available while disabled, but
+absent for disconnected feedback, unknown age (`UINT32_MAX`), stale hardware or
+stale/invalid bridge clock mapping. They retain `sample_time()`'s one-sided
+transport-latency uncertainty; they do not synchronize clocks or interpolate
+measurements. Software rezero does not change these timestamps.
+`SimHardware.set_motor`, `.set_cancoder` accept optional `position_age_us`,
+`velocity_age_us`; `.set_gyro` accepts `yaw_age_us`, `yaw_rate_age_us` (C++ and
+Python). Defaults are zero; `UINT32_MAX` injects unknown acquisition age.
+
+The robot drivetrain timestamps odometry with the oldest consumed module/gyro
+acquisition time, rejecting measurements older than 50 ms or skewed by more
+than 20 ms rather than pretending they are simultaneous. Invalid module timing
+clears `modules_valid` (and integrated yaw); invalid gyro timing clears
+`yaw_valid`. This estimation policy does not gate actuation. See
+`2026-robot/main_processor/drivetrain/README.md` for details.
 
 
 Every motor not set during an `update()` is sent neutral, and all are neutral

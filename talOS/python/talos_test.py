@@ -468,6 +468,59 @@ can_id = 2
         sim.step(0.02)
         self.assertEqual(hw.motor_request("lift", "lift").demand, 4)
 
+    def test_signal_acquisition_times_preserve_unequal_ages(self):
+        class Signals:
+            def __init__(self, node):
+                self.motor = talos.Motor(node, "lift")
+                self.encoder = talos.CANcoder(node, "cc")
+                self.gyro = talos.Gyro(node, "gyro")
+
+        toml = ROBOT_TOML + """
+[subsystems.lift.sensors.cc]
+type = "CANcoder"
+can_id = 2
+[subsystems.lift.sensors.gyro]
+type = "Pigeon2"
+can_id = 3
+"""
+        sim = Sim.from_toml(toml)
+        signals = sim.add(Signals, "lift")
+        node = sim.node("lift")
+        hw = SimHardware(sim)
+        hw.set_gateway_clock(offset=2)
+        hw.set_motor("lift", "lift", 3, 2, 1000, 3000)
+        hw.set_cancoder("lift", "cc", 0.2, 0.3, 2000, 4000)
+        hw.set_gyro("lift", "gyro", 0.75, -0.5, 5000, 6000)
+        sim.step(0.02)
+        self.assertIsNone(signals.motor.position_time)
+        sim.step(0.08)
+        sampled = talos.hardware_sample_time_ns(node)
+        self.assertIsInstance(sampled, int)
+        self.assertFalse(talos.robot_enabled(node))
+        for actual, age in (
+                (signals.motor.position_time, 1000),
+                (signals.motor.velocity_time, 3000),
+                (signals.encoder.position_time, 2000),
+                (signals.encoder.velocity_time, 4000),
+                (signals.gyro.yaw_time, 5000),
+                (signals.gyro.yaw_rate_time, 6000)):
+            self.assertEqual(actual, sampled - age * 1000)
+        hw.set_motor("lift", "lift", 3, 2, 0xffffffff, 0)
+        hw.set_cancoder("lift", "cc", 0.2, 0.3, 0, 0xffffffff)
+        hw.set_gyro("lift", "gyro", 0.75, -0.5, 0xffffffff, 0)
+        sim.step(0.02)
+        self.assertIsNone(signals.motor.position_time)
+        self.assertIsNotNone(signals.motor.velocity_time)
+        self.assertIsNone(signals.encoder.velocity_time)
+        self.assertIsNone(signals.gyro.yaw_time)
+        hw.set_connected("lift", "lift", False)
+        sim.step(0.02)
+        self.assertIsNone(signals.motor.velocity_time)
+        del hw
+        sim.step(0.15)
+        self.assertIsNone(signals.encoder.position_time)
+        self.assertIsNone(signals.gyro.yaw_rate_time)
+
     def test_motor_clamping_is_exposed_as_a_property(self):
         class Shooter:
             def __init__(self, node):

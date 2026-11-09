@@ -64,9 +64,12 @@ class SimHardware {
   // to model voltage/duty-cycle drive.
   void ideal_motors(bool on = true);
 
-  // Feedback.
+  // Feedback. Ages are microseconds before the gateway State sample time;
+  // UINT32_MAX means unknown. Zero preserves simultaneous ideal feedback.
   void set_motor(std::string_view node, std::string_view device,
-                 double position, double velocity);
+                 double position, double velocity,
+                 std::uint32_t position_age_us = 0,
+                 std::uint32_t velocity_age_us = 0);
   void set_digital_input(std::string_view node, std::string_view device,
                          bool value);
   void set_analog_input(std::string_view node, std::string_view device,
@@ -74,9 +77,12 @@ class SimHardware {
   void set_encoder(std::string_view node, std::string_view device,
                    double position, double velocity);
   void set_cancoder(std::string_view node, std::string_view device,
-                    double position, double velocity);
+                    double position, double velocity,
+                    std::uint32_t position_age_us = 0,
+                    std::uint32_t velocity_age_us = 0);
   void set_gyro(std::string_view node, std::string_view device, double yaw,
-                double yaw_rate);
+                double yaw_rate, std::uint32_t yaw_age_us = 0,
+                std::uint32_t yaw_rate_age_us = 0);
   // The RoboRIO's clock and link: from now on the gateway clock reads sim
   // time + `gateway_offset` (states and Driver Station packets are stamped
   // with it), and each state is sampled `latency` before it goes out.

@@ -30,6 +30,8 @@ using Kind = detail::DeviceKind;
 struct Axis {
   double position = 0;
   double velocity = 0;
+  std::uint32_t position_age_us = 0;
+  std::uint32_t velocity_age_us = 0;
 };
 
 // Neutral decay, the same first-order rotor model and constants as the
@@ -216,7 +218,9 @@ struct SimHardware::Impl {
       return hardware::MotorSample{.id = c.id,
                                    .valid = true,
                                    .position_rot = axis.position,
-                                   .velocity_rps = axis.velocity};
+                                   .velocity_rps = axis.velocity,
+                                   .position_age_us = axis.position_age_us,
+                                   .velocity_age_us = axis.velocity_age_us};
     });
     fill(state.sensors, state.sensor_count, hw.sensors, [&](const auto& c) {
       if (!Connected(Kind::kCANcoder, c.id)) {
@@ -226,7 +230,9 @@ struct SimHardware::Impl {
       return hardware::SensorSample{.id = c.id,
                                     .valid = true,
                                     .position_rot = axis.position,
-                                    .velocity_rps = axis.velocity};
+                                    .velocity_rps = axis.velocity,
+                                    .position_age_us = axis.position_age_us,
+                                    .velocity_age_us = axis.velocity_age_us};
     });
     fill(state.digital_inputs, state.digital_input_count, hw.digital_inputs,
          [&](const auto& c) {
@@ -354,8 +360,11 @@ void SimHardware::enable(bool on) { impl_->enabled = on; }
 void SimHardware::ideal_motors(bool on) { impl_->ideal = on; }
 
 void SimHardware::set_motor(std::string_view node, std::string_view device,
-                            double position, double velocity) {
-  impl_->motors[impl_->Id(node, Kind::kMotor, device)] = {position, velocity};
+                            double position, double velocity,
+                            std::uint32_t position_age_us,
+                            std::uint32_t velocity_age_us) {
+  impl_->motors[impl_->Id(node, Kind::kMotor, device)] = {
+      position, velocity, position_age_us, velocity_age_us};
 }
 
 void SimHardware::set_digital_input(std::string_view node,
@@ -375,14 +384,19 @@ void SimHardware::set_encoder(std::string_view node, std::string_view device,
 }
 
 void SimHardware::set_cancoder(std::string_view node, std::string_view device,
-                               double position, double velocity) {
-  impl_->sensors[impl_->Id(node, Kind::kCANcoder, device)] = {position,
-                                                              velocity};
+                               double position, double velocity,
+                               std::uint32_t position_age_us,
+                               std::uint32_t velocity_age_us) {
+  impl_->sensors[impl_->Id(node, Kind::kCANcoder, device)] = {
+      position, velocity, position_age_us, velocity_age_us};
 }
 
 void SimHardware::set_gyro(std::string_view node, std::string_view device,
-                           double yaw, double yaw_rate) {
-  impl_->sensors[impl_->Id(node, Kind::kGyro, device)] = {yaw, yaw_rate};
+                           double yaw, double yaw_rate,
+                           std::uint32_t yaw_age_us,
+                           std::uint32_t yaw_rate_age_us) {
+  impl_->sensors[impl_->Id(node, Kind::kGyro, device)] = {
+      yaw, yaw_rate, yaw_age_us, yaw_rate_age_us};
 }
 
 void SimHardware::set_gateway_clock(Duration gateway_offset, Duration latency) {

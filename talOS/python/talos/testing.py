@@ -208,9 +208,10 @@ class SimHardware:
         below 0.01 rps it stops. Voltage/duty-cycle drive is not modeled."""
         _abi.ok(lib.talos_sim_hardware_ideal_motors(self._handle, bool(on)))
 
-    def set_motor(self, node, device, position, velocity):
+    def set_motor(self, node, device, position, velocity,
+                  position_age_us=0, velocity_age_us=0):
         self._set(lib.talos_sim_hardware_set_motor, node, device, position,
-                  velocity)
+                  velocity, position_age_us, velocity_age_us)
 
     def set_digital_input(self, node, device, value):
         self._set(lib.talos_sim_hardware_set_digital_input, node, device,
@@ -223,12 +224,15 @@ class SimHardware:
         self._set(lib.talos_sim_hardware_set_encoder, node, device, position,
                   velocity)
 
-    def set_cancoder(self, node, device, position, velocity):
+    def set_cancoder(self, node, device, position, velocity,
+                     position_age_us=0, velocity_age_us=0):
         self._set(lib.talos_sim_hardware_set_cancoder, node, device, position,
-                  velocity)
+                  velocity, position_age_us, velocity_age_us)
 
-    def set_gyro(self, node, device, yaw, yaw_rate):
-        self._set(lib.talos_sim_hardware_set_gyro, node, device, yaw, yaw_rate)
+    def set_gyro(self, node, device, yaw, yaw_rate,
+                 yaw_age_us=0, yaw_rate_age_us=0):
+        self._set(lib.talos_sim_hardware_set_gyro, node, device, yaw, yaw_rate,
+                  yaw_age_us, yaw_rate_age_us)
 
     def set_gateway_clock(self, offset=0.0, latency=0.0):
         """From now on the gateway clock reads sim time + `offset` seconds,

@@ -61,7 +61,8 @@ the hardware says:
   the driver to stop. No extra live-mask/count channels are added: the telemetry
   stream has a hard 1200-byte value-frame limit, and hardware health already
   identifies missing devices.
-- `modules_valid` requires all four complete modules and a known sample time.
+- `modules_valid` requires all four complete modules and usable acquisition
+  times for each drive position, drive velocity and steer position.
   Partial odometry is deliberately not offered to four-module consumers;
   missing module positions hold their last values while live ones update.
   Wheel distance and gyro yaw retain their frame across device reset counters
@@ -69,8 +70,9 @@ the hardware says:
   wheel free speed) and yaw steps (25 rad/s) are re-anchored, not integrated.
   Movement during invalid feedback is unknowable and discarded.
 - `yaw_rad` is the Pigeon's yaw converted from rotations, and `yaw_valid`
-  says whether the Pigeon reports. While it does not, `yaw_rad` holds the last
-  valid heading (0 before the first). Under `--sim` the default instead
+  requires usable yaw acquisition timing (including the skew check below).
+  Otherwise `yaw_rad` holds the last valid heading (0 before the first).
+  Under `--sim` the default instead
   integrates heading from module rotation, valid while the modules are,
   because WPILib/ideal sims report a valid, permanently zero Pigeon yaw.
   `integrate_heading = true|false` in `[subsystem]` overrides that choice.
@@ -79,13 +81,31 @@ the hardware says:
   `[subsystems.drivetrain] integrate_heading = false` to use that modeled yaw.
   `./sim.sh --sim-gateway` selects this config; WPILib keeps `robot.toml`
   and module-integrated heading.
-- `sample_time_ns` is `HardwareLink::sample_time()`: the gateway's sample
-  time of the `/hw/state` the tick read, mapped into the node clock by the
-  bridge's min-filtered offset (`talOS/hardware/README.md`). It reads later
-  than the true sample by the link's minimum latency, never earlier. It is 0,
-  with `modules_valid` and `yaw_valid` false, until the mapping converges
-  (8 hardware states) and whenever hardware is stale; the modules are still
-  driven then, since actuation does not need the time.
+- `sample_time_ns` is the oldest relevant **signal acquisition** time, not
+  packet assembly or tick time: `Motor::position_time()` and
+  `Motor::velocity_time()` for drive motors, `Motor::position_time()` for
+  steer motors, and `Gyro::yaw_time()` when using the Pigeon. These APIs
+  subtract the signal's reported age from `HardwareLink::sample_time()`,
+  mapped into the node clock by the bridge's min-filtered offset
+  (`talOS/hardware/README.md`). Unused steer velocity, CANcoder measurements
+  and gyro rate do not affect timing validity.
+  Each consumed time must be known, strictly positive, no later than the
+  tick, and at most **50 ms old**. Module acquisition times must span at most
+  **20 ms**. These fixed bounds permit normal asynchronous status updates
+  without claiming a coherent solution from arbitrarily old/skewed values;
+  no extrapolation is performed.
+  A bad module time clears `modules_valid` and module-integrated `yaw_valid`,
+  but an independently usable Pigeon yaw can remain valid. A bad yaw time
+  clears only `yaw_valid`; if otherwise usable modules and Pigeon yaw together
+  span more than 20 ms, modules take priority and yaw is rejected.
+  The timestamp is the oldest time contributing to either valid product
+  (modules or yaw), or 0 when neither is valid. No negative time is cast to
+  the unsigned message timestamp. Before clock convergence (8 hardware
+  states) or with stale hardware, neither product is valid.
+  Timing rejection does **not** alter connectivity-based degraded driving,
+  target freshness or enable gating. Rejected module times stop heading
+  integration; ideal simulation still accumulates an untrusted heading
+  during initial clock convergence, as before.
 
 ## Local Topics
 

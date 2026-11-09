@@ -117,6 +117,11 @@ class Motor {
   double voltage() const;   // applied volts
   double current() const;   // stator amps
   bool connected() const;   // sample valid and hardware state fresh
+  // Per-signal acquisition time on the node clock, with sample_time()'s
+  // one-sided mapping uncertainty. nullopt if disconnected, mapping/state
+  // stale or invalid, or age unknown (UINT32_MAX).
+  std::optional<Time> position_time() const;
+  std::optional<Time> velocity_time() const;
 
  private:
   HardwareLink* link_{nullptr};
@@ -130,6 +135,8 @@ class CANcoder {
   double position() const;  // rotations
   double velocity() const;  // rotations/s
   bool connected() const;   // sample valid and hardware state fresh
+  std::optional<Time> position_time() const;
+  std::optional<Time> velocity_time() const;
 
  private:
   HardwareLink* link_{nullptr};
@@ -146,6 +153,8 @@ class Gyro {  // Pigeon2
   double yaw() const;       // rotations, CCW+
   double yaw_rate() const;  // rotations/s, CCW+
   bool connected() const;   // sample valid and hardware state fresh
+  std::optional<Time> yaw_time() const;
+  std::optional<Time> yaw_rate_time() const;
 
  private:
   HardwareLink* link_{nullptr};

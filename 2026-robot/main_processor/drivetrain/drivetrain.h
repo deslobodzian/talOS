@@ -52,11 +52,11 @@ class Drivetrain {
   }
 
   void update() {
-    // Node-clock time the hardware sample this tick reads was taken; nullopt
-    // until the bridge's clock mapping converges or while hardware is stale.
-    // A measurement without a time is not usable, so it clears both flags;
-    // driving does not need it.
-    const std::optional<talos::Time> sample_time = link_.sample_time();
+    // Acquisition times, not packet assembly time, describe the measurements.
+    // Timing validity never changes the existing connectivity/target drive
+    // gate.
+    const auto now = node_.now();
+    MeasurementTimes module_times{now};
     const bool reset =
         status_.fresh() &&
         status_.value().gateway_device_reset_count() != reset_count_;
@@ -86,13 +86,16 @@ class Drivetrain {
         continue;
       live_mask |= 1U << i;
       measured[i] = {drive_[i].velocity(), steer_[i].position()};
+      module_times.add(drive_[i].position_time());
+      module_times.add(drive_[i].velocity_time());
+      module_times.add(steer_[i].position_time());
       modules_[i] = geometry::SwerveModulePosition{
           WheelTravel(drive_position_[i], geometry_.modules[i].wheel_radius_m),
           ToRadians(measured[i].steer_rot)};
     }
     const bool connected = live_mask == 15;
     const bool can_drive = kinematics_.UsableSubset(live_mask);
-    const bool modules_valid = connected && sample_time.has_value();
+    const bool modules_valid = connected && module_times.valid();
 
     ChassisSpeeds speeds{};
     const ChassisTarget* target = target_.get();
@@ -138,12 +141,12 @@ class Drivetrain {
     // yaw_rad_ keeps the last valid heading while the source is missing.
     bool yaw_valid = false;
     if (integrate_heading_) {
-      if (connected) {
+      if (modules_valid) {
         const double dt_s =
             std::chrono::duration<double>{node_.period()}.count();
-        if (sample_time.has_value()) {
+        {
           const auto sample_ns =
-              static_cast<std::uint64_t>(sample_time->nanos());
+              static_cast<std::uint64_t>(module_times.oldest_ns);
           if (sample_ns > last_integrated_sample_ns_) {
             const double elapsed_s =
                 last_integrated_sample_ns_ == 0
@@ -155,13 +158,26 @@ class Drivetrain {
             yaw_rad_ += speeds.omega_radps * elapsed_s;
             last_integrated_sample_ns_ = sample_ns;
           }
-        } else {
-          yaw_rad_ += speeds.omega_radps * dt_s;
         }
-        yaw_valid = modules_valid;
+        yaw_valid = true;
+      } else {
+        last_integrated_sample_ns_ = 0;
+        // Preserve the ideal-sim heading accumulated during clock convergence,
+        // but never integrate measurements rejected for their signal ages.
+        if (connected && !link_.sample_time())
+          yaw_rad_ += speeds.omega_radps * period_s;
       }
     } else {
-      const bool valid = sample_time.has_value() && gyro_.connected();
+      MeasurementTimes yaw_times{now};
+      yaw_times.add(gyro_.yaw_time());
+      bool valid = yaw_times.valid();
+      // One timestamp serves both products. Prefer the module solution when
+      // independently usable yaw is too far from any module acquisition.
+      if (valid && modules_valid) {
+        valid = std::max(module_times.newest_ns, yaw_times.newest_ns) -
+                    std::min(module_times.oldest_ns, yaw_times.oldest_ns) <=
+                kMaxMeasurementSkewNs;
+      }
       if (valid) {
         const double raw = ToRadians(gyro_.yaw());
         if (gyro_seen_ &&
@@ -172,18 +188,53 @@ class Drivetrain {
         yaw_rad_ = raw + yaw_offset_rad_;
         gyro_seen_ = true;
         yaw_valid = true;
+        if (!modules_valid || yaw_times.oldest_ns < module_times.oldest_ns)
+          module_times.oldest_ns = yaw_times.oldest_ns;
       }
       gyro_valid_ = valid;
     }
 
+    const auto sample_ns =
+        modules_valid || yaw_valid
+            ? static_cast<std::uint64_t>(module_times.oldest_ns)
+            : 0;
     state_.send(DrivetrainState{
-        sample_time ? static_cast<std::uint64_t>(sample_time->nanos()) : 0,
-        talos::robot_enabled(node_), modules_valid, yaw_valid, speeds.vx_mps,
-        speeds.vy_mps, speeds.omega_radps, yaw_rad_, modules_[0], modules_[1],
-        modules_[2], modules_[3]});
+        sample_ns, talos::robot_enabled(node_), modules_valid, yaw_valid,
+        speeds.vx_mps, speeds.vy_mps, speeds.omega_radps, yaw_rad_, modules_[0],
+        modules_[1], modules_[2], modules_[3]});
   }
 
  private:
+  // Ten control ticks of age and four of skew (at the usual 5 ms period)
+  // bound the error from publishing asynchronous values without extrapolation.
+  static constexpr std::int64_t kMaxMeasurementAgeNs = 50'000'000;
+  static constexpr std::int64_t kMaxMeasurementSkewNs = 20'000'000;
+
+  struct MeasurementTimes {
+    explicit MeasurementTimes(talos::Time now)
+        : now_ns{now.nanos()}, oldest_ns{now_ns} {}
+
+    void add(std::optional<talos::Time> time) {
+      if (!time || time->nanos() <= 0 || time->nanos() > now_ns ||
+          now_ns - time->nanos() > kMaxMeasurementAgeNs) {
+        known = false;
+        return;
+      }
+      oldest_ns = std::min(oldest_ns, time->nanos());
+      newest_ns = std::max(newest_ns, time->nanos());
+    }
+
+    bool valid() const {
+      return known && newest_ns > 0 &&
+             newest_ns - oldest_ns <= kMaxMeasurementSkewNs;
+    }
+
+    std::int64_t now_ns;
+    std::int64_t oldest_ns;
+    std::int64_t newest_ns{0};
+    bool known{true};
+  };
+
   talos::Node& node_;
   talos::HardwareLink& link_;
   SwerveGeometry geometry_;

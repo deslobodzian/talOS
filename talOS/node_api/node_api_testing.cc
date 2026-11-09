@@ -236,10 +236,12 @@ int32_t talos_sim_hardware_ideal_motors(TalosSimHardware* hw, int32_t on) {
 
 int32_t talos_sim_hardware_set_motor(TalosSimHardware* hw, const char* node,
                                      const char* device, double position,
-                                     double velocity) {
+                                     double velocity, uint32_t position_age_us,
+                                     uint32_t velocity_age_us) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     AsHardware(hw).set_motor(NonNull(node, "node"), NonNull(device, "device"),
-                             position, velocity);
+                             position, velocity, position_age_us,
+                             velocity_age_us);
     return TALOS_OK;
   });
 }
@@ -277,20 +279,24 @@ int32_t talos_sim_hardware_set_encoder(TalosSimHardware* hw, const char* node,
 
 int32_t talos_sim_hardware_set_cancoder(TalosSimHardware* hw, const char* node,
                                         const char* device, double position,
-                                        double velocity) {
+                                        double velocity,
+                                        uint32_t position_age_us,
+                                        uint32_t velocity_age_us) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     AsHardware(hw).set_cancoder(NonNull(node, "node"),
-                                NonNull(device, "device"), position, velocity);
+                                NonNull(device, "device"), position, velocity,
+                                position_age_us, velocity_age_us);
     return TALOS_OK;
   });
 }
 
 int32_t talos_sim_hardware_set_gyro(TalosSimHardware* hw, const char* node,
                                     const char* device, double yaw,
-                                    double yaw_rate) {
+                                    double yaw_rate, uint32_t yaw_age_us,
+                                    uint32_t yaw_rate_age_us) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     AsHardware(hw).set_gyro(NonNull(node, "node"), NonNull(device, "device"),
-                            yaw, yaw_rate);
+                            yaw, yaw_rate, yaw_age_us, yaw_rate_age_us);
     return TALOS_OK;
   });
 }

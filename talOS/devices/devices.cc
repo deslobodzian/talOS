@@ -474,6 +474,30 @@ hardware::SensorSample HardwareAccess::sensor_sample(const HardwareLink& link,
   return sample;
 }
 
+namespace {
+template <class Sample>
+std::optional<Time> AcquisitionTime(const HardwareLink& link,
+                                    const Sample& sample, bool velocity) {
+  const auto age = velocity ? sample.velocity_age_us : sample.position_age_us;
+  if (!sample.valid || age == UINT32_MAX) return std::nullopt;
+  const auto time = link.sample_time();
+  if (!time) return std::nullopt;
+  return *time - std::chrono::microseconds{age};
+}
+}  // namespace
+
+std::optional<Time> HardwareAccess::motor_time(const HardwareLink& link,
+                                               std::size_t index,
+                                               bool velocity) {
+  return AcquisitionTime(link, motor_sample(link, index), velocity);
+}
+
+std::optional<Time> HardwareAccess::sensor_time(const HardwareLink& link,
+                                                std::size_t index,
+                                                bool velocity) {
+  return AcquisitionTime(link, sensor_sample(link, index), velocity);
+}
+
 hardware::DigitalInputSample HardwareAccess::digital_input_sample(
     const HardwareLink& link, std::size_t index) {
   const auto& impl = *link.impl_;
@@ -575,6 +599,12 @@ double Motor::current() const {
 bool Motor::connected() const {
   return HardwareAccess::motor_sample(*link_, index_).valid;
 }
+std::optional<Time> Motor::position_time() const {
+  return HardwareAccess::motor_time(*link_, index_, false);
+}
+std::optional<Time> Motor::velocity_time() const {
+  return HardwareAccess::motor_time(*link_, index_, true);
+}
 
 CANcoder::CANcoder(Node& node, std::string_view name)
     : link_{LinkOf(node)},
@@ -587,6 +617,12 @@ double CANcoder::velocity() const {
 }
 bool CANcoder::connected() const {
   return HardwareAccess::sensor_sample(*link_, index_).valid;
+}
+std::optional<Time> CANcoder::position_time() const {
+  return HardwareAccess::sensor_time(*link_, index_, false);
+}
+std::optional<Time> CANcoder::velocity_time() const {
+  return HardwareAccess::sensor_time(*link_, index_, true);
 }
 
 Gyro::Gyro(Node& node, std::string_view name)
@@ -603,6 +639,12 @@ double Gyro::yaw_rate() const {
 }
 bool Gyro::connected() const {
   return HardwareAccess::sensor_sample(*link_, index_).valid;
+}
+std::optional<Time> Gyro::yaw_time() const {
+  return HardwareAccess::sensor_time(*link_, index_, false);
+}
+std::optional<Time> Gyro::yaw_rate_time() const {
+  return HardwareAccess::sensor_time(*link_, index_, true);
 }
 
 DigitalInput::DigitalInput(Node& node, std::string_view name)

@@ -559,6 +559,30 @@ int32_t talos_sensor_sample(TalosNode* node, int64_t index, TalosSample* out) {
   });
 }
 
+int32_t talos_motor_time(TalosNode* node, int64_t index, int32_t velocity,
+                         int64_t* out_ns) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
+    const auto time =
+        HardwareAccess::motor_time(Link(node), Index(index), velocity != 0);
+    if (!time) return 0;
+    *out_ns = time->nanos();
+    return 1;
+  });
+}
+
+int32_t talos_sensor_time(TalosNode* node, int64_t index, int32_t velocity,
+                          int64_t* out_ns) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
+    const auto time =
+        HardwareAccess::sensor_time(Link(node), Index(index), velocity != 0);
+    if (!time) return 0;
+    *out_ns = time->nanos();
+    return 1;
+  });
+}
+
 int32_t talos_digital_input_sample(TalosNode* node, int64_t index,
                                    TalosSample* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {

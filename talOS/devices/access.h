@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -56,6 +57,10 @@ struct HardwareAccess {
                            double position_rot);
   static void gyro_rezero(HardwareLink& link, std::size_t index,
                           double yaw_rot);
+  static std::optional<event::MonotonicTime> motor_time(
+      const HardwareLink& link, std::size_t index, bool velocity);
+  static std::optional<event::MonotonicTime> sensor_time(
+      const HardwareLink& link, std::size_t index, bool velocity);
   // The latched sample for a device; all zeros (valid == false) until an
   // accepted hardware state carries it.
   static hardware::MotorSample motor_sample(const HardwareLink& link,

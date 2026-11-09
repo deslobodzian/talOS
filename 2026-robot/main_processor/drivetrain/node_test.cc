@@ -690,6 +690,74 @@ TEST_F(DrivetrainTest, SampleTimeIsTheMappedHardwareSampleTimeNotTheTickTime) {
   EXPECT_LE(lag_ns, std::chrono::nanoseconds{3ms + 5ms}.count());
 }
 
+TEST_F(DrivetrainTest, ModuleTimestampUsesOldestConsumedSignalAcquisition) {
+  sim.step(kConverged);
+  for (int signal = 0; signal < 3; ++signal) {
+    SCOPED_TRACE(signal);
+    // Unequal ages distinguish drive position, drive velocity and azimuth.
+    // Steer velocity is not consumed and must not invalidate this solution.
+    hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0,
+                 signal == 0 ? 12'000 : 2'000, signal == 1 ? 12'000 : 3'000);
+    hw.set_motor("drivetrain", geometry.modules[0].steer, 0, 0,
+                 signal == 2 ? 12'000 : 4'000,
+                 std::numeric_limits<std::uint32_t>::max());
+    sim.step(20ms);
+    const auto state = State();
+    ASSERT_TRUE(state.modules_valid());
+    ASSERT_TRUE(state.yaw_valid());
+    const auto lag =
+        sim.now().nanos() - static_cast<std::int64_t>(state.sample_time_ns());
+    EXPECT_GE(lag, std::chrono::nanoseconds{12ms}.count());
+    EXPECT_LE(lag, std::chrono::nanoseconds{17ms}.count());
+  }
+}
+
+TEST_F(DrivetrainTest, InvalidSignalTimesDoNotChangeDriveOrSafetyGates) {
+  Teleop();
+  Hold(ChassisTarget{1, 0, 0}, 60ms);
+  for (const std::uint32_t age : {25'000U, 60'000U, 1'000'000U,
+                                  std::numeric_limits<std::uint32_t>::max()}) {
+    SCOPED_TRACE(age);
+    // Respectively excessive skew, excessive age, pre-origin time, unknown.
+    for (int signal = 0; signal < 3; ++signal) {
+      SCOPED_TRACE(signal);
+      hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0,
+                   signal == 0 ? age : 0, signal == 1 ? age : 0);
+      hw.set_motor("drivetrain", geometry.modules[0].steer, 0, 0,
+                   signal == 2 ? age : 0, 0);
+      Hold(ChassisTarget{1, 0, 0}, 20ms);
+      EXPECT_FALSE(State().modules_valid());
+      EXPECT_FALSE(State().yaw_valid());
+      EXPECT_EQ(State().sample_time_ns(), 0u);
+      EXPECT_EQ(Request(geometry.modules[0].drive).mode, Mode::kVelocity);
+    }
+  }
+  sim.step(150ms);
+  ExpectNeutral();  // stale target still wins despite live hardware
+  Hold(ChassisTarget{1, 0, 0}, 20ms);
+  ASSERT_EQ(Request(geometry.modules[0].drive).mode, Mode::kVelocity);
+  hw.enable(false);
+  Hold(ChassisTarget{1, 0, 0}, 20ms);
+  ExpectNeutral();
+  hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0);
+  hw.set_motor("drivetrain", geometry.modules[0].steer, 0, 0);
+  sim.step(20ms);
+  EXPECT_TRUE(State().modules_valid());
+  EXPECT_TRUE(State().yaw_valid());
+  ExpectNeutral();
+}
+
+TEST_F(DrivetrainTest, EquallyOldSignalsAreRejectedEvenWithoutSkew) {
+  for (const auto& module : geometry.modules) {
+    hw.set_motor("drivetrain", module.drive, 0, 0, 60'000, 60'000);
+    hw.set_motor("drivetrain", module.steer, 0, 0, 60'000, 0);
+  }
+  sim.step(200ms);
+  EXPECT_FALSE(State().modules_valid());
+  EXPECT_FALSE(State().yaw_valid());
+  EXPECT_EQ(State().sample_time_ns(), 0u);
+}
+
 TEST_F(DrivetrainTest, ADisconnectedMotorNeutralizesOnlyItsModule) {
   Teleop();
   for (std::size_t i = 0; i < kModuleCount; ++i) {
@@ -825,6 +893,25 @@ TEST_F(DrivetrainTest, SimulatedHeadingIntegratesTheRotationTheModulesMeasure) {
   EXPECT_NEAR(State().omega_radps(), 1.0, 1e-9);
 }
 
+TEST_F(DrivetrainTest, RejectedAcquisitionsDoNotAdvanceIntegratedHeading) {
+  SetRotating(hw, geometry, 1.0);
+  sim.step(kConverged);
+  ASSERT_TRUE(State().yaw_valid());
+  hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0, 0, 25'000);
+  sim.step(20ms);
+  EXPECT_FALSE(State().modules_valid());
+  EXPECT_FALSE(State().yaw_valid());
+  // The state already queued before the age change may integrate once.
+  const double held = State().yaw_rad();
+  sim.step(20ms);
+  EXPECT_EQ(State().yaw_rad(), held);
+  SetRotating(hw, geometry, 1.0);
+  sim.step(20ms);
+  EXPECT_TRUE(State().yaw_valid());
+  EXPECT_GT(State().yaw_rad(), held);
+  EXPECT_LE(State().yaw_rad() - held, 0.020 + 1e-9);
+}
+
 class DrivetrainOnImuTest : public DrivetrainTest {
  protected:
   DrivetrainOnImuTest()
@@ -840,6 +927,60 @@ TEST_F(DrivetrainOnImuTest, HeadingIsThePigeonYawInRadians) {
   EXPECT_NEAR(State().yaw_rad(), std::numbers::pi / 4, 1e-12);
   // The chassis rate is the modules', not the Pigeon's.
   EXPECT_NEAR(State().omega_radps(), 1.0, 1e-9);
+}
+
+TEST_F(DrivetrainOnImuTest, TimestampIncludesYawButNotUnusedYawRate) {
+  hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0, 3'000, 5'000);
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0, 12'000,
+              std::numeric_limits<std::uint32_t>::max());
+  sim.step(kConverged);
+  ASSERT_TRUE(State().modules_valid());
+  ASSERT_TRUE(State().yaw_valid());
+  auto lag =
+      sim.now().nanos() - static_cast<std::int64_t>(State().sample_time_ns());
+  EXPECT_GE(lag, std::chrono::nanoseconds{12ms}.count());
+  EXPECT_LE(lag, std::chrono::nanoseconds{17ms}.count());
+  // Conversely an older module, not the gyro, owns the shared timestamp.
+  hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0, 15'000, 5'000);
+  sim.step(20ms);
+  ASSERT_TRUE(State().modules_valid());
+  ASSERT_TRUE(State().yaw_valid());
+  lag = sim.now().nanos() - static_cast<std::int64_t>(State().sample_time_ns());
+  EXPECT_GE(lag, std::chrono::nanoseconds{15ms}.count());
+  EXPECT_LE(lag, std::chrono::nanoseconds{20ms}.count());
+}
+
+TEST_F(DrivetrainOnImuTest, InvalidYawTimingHoldsHeadingAndKeepsModulesUsable) {
+  Teleop();
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0);
+  sim.step(kConverged);
+  const double heading = State().yaw_rad();
+  for (const std::uint32_t age : {25'000U, 60'000U, 1'000'000U,
+                                  std::numeric_limits<std::uint32_t>::max()}) {
+    SCOPED_TRACE(age);
+    hw.set_gyro("drivetrain", "drivetrain_imu", 0.25, 0, age, 0);
+    Hold(ChassisTarget{1, 0, 0}, 20ms);
+    EXPECT_TRUE(State().modules_valid());
+    EXPECT_FALSE(State().yaw_valid());
+    EXPECT_EQ(State().yaw_rad(), heading);
+    const auto lag =
+        sim.now().nanos() - static_cast<std::int64_t>(State().sample_time_ns());
+    EXPECT_GE(lag, 0);
+    EXPECT_LE(lag, std::chrono::nanoseconds{5ms}.count());
+    EXPECT_EQ(Request(geometry.modules[0].drive).mode, Mode::kVelocity);
+  }
+  // A good yaw remains independently usable when a module time is unknown.
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.25, 0, 7'000, 0);
+  hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0,
+               std::numeric_limits<std::uint32_t>::max(), 0);
+  sim.step(20ms);
+  EXPECT_FALSE(State().modules_valid());
+  EXPECT_TRUE(State().yaw_valid());
+  const auto lag =
+      sim.now().nanos() - static_cast<std::int64_t>(State().sample_time_ns());
+  EXPECT_GE(lag, std::chrono::nanoseconds{7ms}.count());
+  EXPECT_LE(lag, std::chrono::nanoseconds{12ms}.count());
+  EXPECT_EQ(State().yaw_rad(), heading);
 }
 
 TEST_F(DrivetrainOnImuTest, ADisconnectedGyroIsInvalidAndHoldsTheLastHeading) {

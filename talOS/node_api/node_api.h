@@ -222,6 +222,13 @@ typedef struct TalosSample {
 int32_t talos_motor_sample(TalosNode* node, int64_t index, TalosSample* out);
 int32_t talos_sensor_sample(TalosNode* node, int64_t index,
                             TalosSample* out);  // CANcoder, gyro
+// Per-signal node-clock acquisition time: velocity selects rate rather than
+// position/yaw. Returns 1 with *out_ns, 0 if unavailable (including unknown
+// UINT32_MAX age), TALOS_ERR on error. Independent of robot enable.
+int32_t talos_motor_time(TalosNode* node, int64_t index, int32_t velocity,
+                         int64_t* out_ns);
+int32_t talos_sensor_time(TalosNode* node, int64_t index, int32_t velocity,
+                          int64_t* out_ns);
 int32_t talos_digital_input_sample(TalosNode* node, int64_t index,
                                    TalosSample* out);
 int32_t talos_analog_input_sample(TalosNode* node, int64_t index,
@@ -363,7 +370,8 @@ int32_t talos_sim_hardware_ideal_motors(TalosSimHardware* hw, int32_t on);
 // Feedback for (node, device), by the names the node uses.
 int32_t talos_sim_hardware_set_motor(TalosSimHardware* hw, const char* node,
                                      const char* device, double position,
-                                     double velocity);
+                                     double velocity, uint32_t position_age_us,
+                                     uint32_t velocity_age_us);
 int32_t talos_sim_hardware_set_digital_input(TalosSimHardware* hw,
                                              const char* node,
                                              const char* device, int32_t value);
@@ -375,10 +383,13 @@ int32_t talos_sim_hardware_set_encoder(TalosSimHardware* hw, const char* node,
                                        double velocity);
 int32_t talos_sim_hardware_set_cancoder(TalosSimHardware* hw, const char* node,
                                         const char* device, double position,
-                                        double velocity);
+                                        double velocity,
+                                        uint32_t position_age_us,
+                                        uint32_t velocity_age_us);
 int32_t talos_sim_hardware_set_gyro(TalosSimHardware* hw, const char* node,
                                     const char* device, double yaw,
-                                    double yaw_rate);
+                                    double yaw_rate, uint32_t yaw_age_us,
+                                    uint32_t yaw_rate_age_us);
 // SimHardware::set_gateway_clock: the gateway clock reads sim time +
 // gateway_offset_ns, and each state is sampled latency_ns before it goes out.
 int32_t talos_sim_hardware_set_gateway_clock(TalosSimHardware* hw,

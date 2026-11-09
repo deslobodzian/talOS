@@ -426,6 +426,47 @@ TEST(Devices, GettersReadTheLatchedFeedback) {
   EXPECT_DOUBLE_EQ(mech.gyro.yaw_rate(), -0.5);
 }
 
+TEST(Devices, AcquisitionTimesSubtractEachSignalsAge) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  const auto& link = sim.node("mech").extension<HardwareLink>();
+  auto hw = std::make_unique<SimHardware>(sim);
+  hw->set_gateway_clock(1250ms, 0ms);
+  hw->set_motor("mech", "a", 1.5, -2.0, 1000, 3000);
+  hw->set_cancoder("mech", "cc", 0.2, 0.3, 2000, 4000);
+  hw->set_gyro("mech", "gyro", 0.125, -0.5, 5000, 6000);
+  sim.step(10ms);
+  EXPECT_EQ(mech.a.position_time(), std::nullopt);
+  EXPECT_EQ(mech.cc.velocity_time(), std::nullopt);
+  EXPECT_EQ(mech.gyro.yaw_time(), std::nullopt);
+  sim.step(40ms);
+  ASSERT_TRUE(link.sample_time());
+  const Time sampled = *link.sample_time();
+  EXPECT_FALSE(robot_enabled(sim.node("mech")));
+  EXPECT_EQ(mech.a.position_time(), sampled - 1ms);
+  EXPECT_EQ(mech.a.velocity_time(), sampled - 3ms);
+  EXPECT_EQ(mech.cc.position_time(), sampled - 2ms);
+  EXPECT_EQ(mech.cc.velocity_time(), sampled - 4ms);
+  EXPECT_EQ(mech.gyro.yaw_time(), sampled - 5ms);
+  EXPECT_EQ(mech.gyro.yaw_rate_time(), sampled - 6ms);
+  hw->set_motor("mech", "a", 1.5, -2.0, UINT32_MAX, 0);
+  hw->set_cancoder("mech", "cc", 0.2, 0.3, 0, UINT32_MAX);
+  hw->set_gyro("mech", "gyro", 0.125, -0.5, UINT32_MAX, 0);
+  sim.step(10ms);
+  EXPECT_EQ(mech.a.position_time(), std::nullopt);
+  EXPECT_TRUE(mech.a.velocity_time());
+  EXPECT_EQ(mech.cc.velocity_time(), std::nullopt);
+  EXPECT_EQ(mech.gyro.yaw_time(), std::nullopt);
+  hw->set_connected("mech", "a", false);
+  sim.step(10ms);
+  EXPECT_EQ(mech.a.velocity_time(), std::nullopt);
+  hw.reset();
+  sim.step(150ms);
+  EXPECT_EQ(mech.a.position_time(), std::nullopt);
+  EXPECT_EQ(mech.cc.position_time(), std::nullopt);
+  EXPECT_EQ(mech.gyro.yaw_rate_time(), std::nullopt);
+}
+
 TEST(Devices, RezeroSharesSoftwareFramesAndPreservesHardwareLimits) {
   std::string toml{kRobotToml};
   toml.insert(toml.find("[subsystems.mech.digital_outputs"),

@@ -116,6 +116,23 @@ class _Input(_Device):
 class Motor(_Input):
     _KIND = _abi.DEVICE_MOTOR
     _SAMPLE = lib.talos_motor_sample
+    _TIME = lib.talos_motor_time
+
+    def _time(self, velocity):
+        sampled = ctypes.c_int64()
+        found = _abi.ok(self._TIME(
+            self._node, self._index, velocity, ctypes.byref(sampled)))
+        return sampled.value if found else None
+
+    @property
+    def position_time(self):
+        """Acquisition time, integer node-clock ns, or None if unavailable."""
+        return self._time(False)
+
+    @property
+    def velocity_time(self):
+        """Acquisition time, integer node-clock ns, or None if unavailable."""
+        return self._time(True)
 
     def rezero(self, position_rot=0):
         """Set the node-shared software position on connected finite feedback.
@@ -175,6 +192,10 @@ class Motor(_Input):
 class CANcoder(_Input):
     _KIND = _abi.DEVICE_CANCODER
     _SAMPLE = lib.talos_sensor_sample
+    _TIME = lib.talos_sensor_time
+    _time = Motor._time
+    position_time = Motor.position_time
+    velocity_time = Motor.velocity_time
 
     @property
     def position(self):  # rotations
@@ -189,6 +210,10 @@ class Gyro(_Input):
     """A Pigeon2. Rotations and rotations/s, CCW+."""
     _KIND = _abi.DEVICE_GYRO
     _SAMPLE = lib.talos_sensor_sample
+    _TIME = lib.talos_sensor_time
+    _time = Motor._time
+    yaw_time = Motor.position_time
+    yaw_rate_time = Motor.velocity_time
 
     def rezero(self, yaw_rot=0):
         """Set node-shared software yaw on connected finite feedback/input."""
