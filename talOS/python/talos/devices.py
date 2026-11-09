@@ -49,40 +49,53 @@ def hardware_sample_time_ns(node):
     return sampled.value if found else None
 
 
-class HardwareLink:
+class _OnNode:
+    """A wrapper over one native node's endpoint or device. It holds the
+    talos.Node (`_owner`), which holds the node's owner (a talos.testing.Sim),
+    so the native node lives as long as any wrapper that can reach it. Its
+    handle reads raise TalosError once the node has been torn down."""
+
+    def __init__(self, node):
+        self._owner = node
+
+    @property
+    def _node(self):
+        return self._owner._handle
+
+
+class HardwareLink(_OnNode):
     """Accepted hardware state; ages are seconds since publication."""
 
     def __init__(self, node):
-        self._node = node
+        super().__init__(node)
         # Attach the C++ extension during construction, before the loop starts.
-        _abi.ok(lib.talos_hardware_fresh(node._handle, -1))
+        _abi.ok(lib.talos_hardware_fresh(self._node, -1))
 
     def fresh(self, max_age=None) -> bool:
         """Whether state is younger than max_age (default command timeout)."""
         if isinstance(max_age, timedelta):
             max_age = max_age.total_seconds()
         ns = -1 if max_age is None else round(max_age * 1e9)
-        return bool(_abi.ok(lib.talos_hardware_fresh(self._node._handle, ns)))
+        return bool(_abi.ok(lib.talos_hardware_fresh(self._node, ns)))
 
     @property
     def age(self) -> float:
         """Seconds since the accepted state was published; inf before any."""
         ns = ctypes.c_int64()
-        found = _abi.ok(lib.talos_hardware_age(
-            self._node._handle, ctypes.byref(ns)))
+        found = _abi.ok(lib.talos_hardware_age(self._node, ctypes.byref(ns)))
         return ns.value / 1e9 if found else math.inf
 
     @property
     def sample_time(self):
         """Gateway sample time as integer node-clock nanoseconds, or None."""
-        return hardware_sample_time_ns(self._node)
+        return hardware_sample_time_ns(self._owner)
 
 
-class _Device:
+class _Device(_OnNode):
     _KIND = None
 
     def __init__(self, node, name):
-        self._node = node._handle
+        super().__init__(node)
         self._index = _abi.index(
             lib.talos_device(self._node, self._KIND, _abi.encode(name)))
 
@@ -284,7 +297,7 @@ class Joystick:
         return self._data.povs[index] if 0 <= index < _abi.DS_MAX_POVS else -1
 
 
-class DriverStation:
+class DriverStation(_OnNode):
     """The Driver Station packet the bridge forwards, decoded and latched.
 
         self.ds = talos.DriverStation(node)
@@ -298,7 +311,7 @@ class DriverStation:
     """
 
     def __init__(self, node, on_packet=None):
-        self._node = node._handle
+        super().__init__(node)
         callback = _abi.CALLBACK()
         if on_packet is not None:
             callback = node._keep(_abi.CALLBACK(
@@ -328,7 +341,7 @@ class DriverStation:
         return Joystick(self._read().joysticks[port])
 
 
-class Target:
+class Target(_OnNode):
     """The lanes of this node's target policy, resolved (talos::Target in
     talOS/devices/target.h). Take it in __init__:
 
@@ -346,7 +359,7 @@ class Target:
     """
 
     def __init__(self, node, msg):
-        self._node = node._handle
+        super().__init__(node)
         self._type = message_type(msg)
         self._index = _abi.index(lib.talos_target_open(
             self._node, self._type.size, self._type.alignment,
@@ -370,7 +383,7 @@ class Target:
             lambda name: name is None).decode()
 
 
-class TargetLane:
+class TargetLane(_OnNode):
     """One producer's lane, /<subsystem>/target/<source> (talos::TargetLane):
 
         self.lane = talos.TargetLane(node, PositionTarget, "wrist", "auto")
@@ -383,7 +396,7 @@ class TargetLane:
     """
 
     def __init__(self, node, msg, subsystem, source):
-        self._node = node._handle
+        super().__init__(node)
         self._type = message_type(msg)
         self._index = _abi.index(lib.talos_target_lane_open(
             self._node, _abi.encode(subsystem), _abi.encode(source),

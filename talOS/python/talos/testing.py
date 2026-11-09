@@ -47,7 +47,11 @@ def _generation(mode_since_us):
 
 
 class Sim:
-    """One simulated clock hosting several nodes; topics are in memory."""
+    """One simulated clock hosting several nodes; topics are in memory.
+
+    Every talos.Node it hosts keeps it alive, as does every wrapper made from
+    one (subscriptions, publishers, devices), so the native Sim is destroyed
+    only once nothing can reach its nodes."""
 
     def __init__(self, config_path=None, *, _handle=None):
         self._handle = _handle or _abi.handle(
@@ -67,20 +71,28 @@ class Sim:
             self._handle, None if path is None else _abi.encode(path)))
 
     def __del__(self):
-        if getattr(self, "_handle", None):
-            lib.talos_sim_destroy(self._handle)
+        handle = getattr(self, "_handle", None)
+        if handle:
             self._handle = None
+            # Garbage collection may finalize this Sim while other objects
+            # of the same unreachable cycle still hold its nodes: their
+            # handles now raise instead of reaching freed memory.
+            for node, _ in self._nodes:
+                node._native = None
+            lib.talos_sim_destroy(handle)
 
     def add(self, cls, node_name):
         """Builds cls on a node named node_name; returns the object."""
-        factory = talos._factory(cls, self._nodes)
+        factory = talos._factory(cls, self._nodes, self)
         _abi.handle(lib.talos_sim_add(self._handle, _abi.encode(node_name),
                                       factory, None))
         return self._nodes[-1][1]
 
     def node(self, node_name):
-        return talos.Node(_abi.handle(
-            lib.talos_sim_node(self._handle, _abi.encode(node_name))))
+        """The talos.Node add() built for node_name."""
+        handle = _abi.handle(
+            lib.talos_sim_node(self._handle, _abi.encode(node_name)))
+        return next(node for node, _ in self._nodes if node._native == handle)
 
     def step(self, seconds):
         """Advances virtual time, running every node's timers and messages."""

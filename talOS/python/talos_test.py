@@ -2,6 +2,9 @@
 
 import enum
 import math
+import subprocess
+import sys
+import textwrap
 from datetime import timedelta
 import unittest
 from unittest import mock
@@ -171,7 +174,6 @@ can_id = 1
         sim.step(0.001)
         self.assertEqual(watch.received, list(range(130)))
 
-
     def test_loops_share_one_chronological_frontier_in_either_order(self):
         """A 1 ms producer and a 500 us consumer never see the future; the
         insertion order only decides who runs first at a shared instant."""
@@ -222,6 +224,77 @@ can_id = 1
                               else (now + 999) // 1000 * 1000 - 1000)
                     self.assertEqual((stamp, age, fresh),
                                      (newest, now - newest, True), now)
+
+
+class BorrowedLifetimeTest(unittest.TestCase):
+    def test_wrappers_keep_sim_alive_until_native_teardown(self):
+        # A bad lifetime implementation may segfault: isolate the probe and
+        # check collection tears down the Sim after the last wrapper goes.
+        probe = textwrap.dedent("""
+            import gc
+            import weakref
+            import talos
+            from talos.testing import Sim
+            from demo.Goal import Goal
+
+            class Endpoints:
+                def __init__(self, node):
+                    self.node = node
+                    self.sub = node.subscribe(Goal, "/probe/input")
+                    self.pub = node.publish(Goal, "/probe/output")
+                    self.bytes = node.publish_bytes("/probe/bytes", 64)
+                    self.motor = talos.Motor(node, "m")
+                    self.hardware = talos.HardwareLink(node)
+                    self.ds = talos.DriverStation(node)
+                    self.target = talos.Target(node, Goal)
+                    self.lane = talos.TargetLane(node, Goal, "probe", "teleop")
+                    self.sm = talos.StateMachine(node, 0)
+
+            config = '''
+            [robot]
+            period_us = 1000
+            [subsystems.probe.motors.m]
+            can_id = 1
+            [subsystems.probe.targets]
+            teleop = ["teleop"]
+            '''
+            for kind in ("node", "lookup", "sub", "pub", "bytes", "motor",
+                         "hardware", "ds", "target", "lane", "sm"):
+                sim = Sim.from_toml(config)
+                obj = sim.add(Endpoints, "probe")
+                wrapper = sim.node("probe") if kind == "lookup" else getattr(obj, kind)
+                sim.step(0.002)
+                owner = weakref.ref(sim)
+                del obj, sim
+                gc.collect()
+                assert owner() is not None, kind
+                if kind in ("node", "lookup"):
+                    assert wrapper.name == "probe"
+                elif kind == "sub":
+                    assert not wrapper.has_value
+                elif kind == "pub":
+                    wrapper.send(tick_count=1)
+                elif kind == "bytes":
+                    assert wrapper.send(b"offline")
+                elif kind == "motor":
+                    assert not wrapper.connected
+                elif kind == "hardware":
+                    assert not wrapper.fresh()
+                elif kind == "ds":
+                    assert not wrapper.enabled
+                elif kind == "target":
+                    assert wrapper.get() is None
+                elif kind == "lane":
+                    wrapper.release()
+                elif kind == "sm":
+                    assert wrapper.state == 0
+                del wrapper
+                gc.collect()
+                assert owner() is None, kind
+        """)
+        result = subprocess.run([sys.executable, "-c", probe],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class SubscriptionErrorsTest(unittest.TestCase):

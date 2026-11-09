@@ -35,7 +35,8 @@ from talos._messages import Message, enum_names, message_type
 from talos.devices import (Alliance, AnalogInput, CANcoder, DigitalInput,
                            DigitalOutput, DriverStation, Encoder, Gyro, HardwareLink,
                            Joystick, Mode, Motor, PwmOutput, Target,
-                           TargetLane, hardware_sample_time_ns, robot_enabled)
+                           TargetLane, _OnNode, hardware_sample_time_ns,
+                           robot_enabled)
 
 __all__ = [
     "Alliance", "AnalogInput", "BytePublisher", "CANcoder", "DigitalInput",
@@ -67,11 +68,23 @@ def _param_kind(key, default):
 
 
 class Node:
-    """The framework's side of one node. Made by talos, handed to __init__."""
+    """The framework's side of one node. Made by talos, handed to __init__.
 
-    def __init__(self, handle):
-        self._handle = handle
+    A Node keeps its owner (the talos.testing.Sim hosting it) alive, and
+    every wrapper made from it keeps the Node, so the native node outlives
+    anything that can reach it.
+    """
+
+    def __init__(self, handle, owner=None):
+        self._native = handle
+        self._owner = owner
         self._callbacks = []  # C callbacks live as long as the node
+
+    @property
+    def _handle(self):
+        if self._native is None:
+            raise TalosError("this node's Sim has been destroyed")
+        return self._native
 
     @property
     def name(self):
@@ -172,7 +185,7 @@ class Node:
         return c_callback
 
 
-class Subscription:
+class Subscription(_OnNode):
     """Latest value on a topic, aged from publication, not delivery.
 
     Without a callback each drain skips to the newest message. With a callback
@@ -180,7 +193,8 @@ class Subscription:
     """
 
     def __init__(self, node, mtype, index):
-        self._node, self._type, self._index = node._handle, mtype, index
+        super().__init__(node)
+        self._type, self._index = mtype, index
 
     @property
     def value(self):
@@ -215,9 +229,10 @@ class Subscription:
             lib.talos_subscription_updated(self._node, self._index)))
 
 
-class Publisher:
+class Publisher(_OnNode):
     def __init__(self, node, mtype, index):
-        self._node, self._type, self._index = node._handle, mtype, index
+        super().__init__(node)
+        self._type, self._index = mtype, index
 
     def send(self, message=None, **fields):
         """send(field=value, ...) with the .fbs field names (missing ones
@@ -228,11 +243,12 @@ class Publisher:
             self._node, self._index, data, len(data))))
 
 
-class BytePublisher:
+class BytePublisher(_OnNode):
     """A variable-length message topic; see Node.publish_bytes."""
 
     def __init__(self, node, index):
-        self._node, self._index = node._handle, index
+        super().__init__(node)
+        self._index = index
 
     def send(self, data):
         """Publishes `data` (bytes, bytearray, or memoryview); False when
@@ -245,7 +261,7 @@ class BytePublisher:
             self._node, self._index, raw, len(raw))))
 
 
-class StateMachine:
+class StateMachine(_OnNode):
     """A state plus when it was entered, ticking with the node.
 
     States are enum.Enum members, or the int values of a flatc enum class
@@ -263,7 +279,7 @@ class StateMachine:
         self._states = states
         self._names = enum_names(states) if states is not None else None
         self._check(initial)
-        self._node = node._handle
+        super().__init__(node)
         self._enum_type = type(initial) if isinstance(initial, enum.Enum) else None
         self._index = _abi.index(lib.talos_state_machine_create(
             self._node, self._to_int(initial)))
@@ -320,14 +336,15 @@ class StateMachine:
         return bool(lib.talos_state_machine_just_entered(
             self._node, self._index))
 
-def _factory(cls, built):
+def _factory(cls, built, owner=None):
     """A C factory: builds cls on a new Node and installs its update().
 
     Appends (node, object) to `built`, which must outlive the C++ node: the
-    Node holds the C callbacks.
+    Node holds the C callbacks. `owner` is what owns the native node (a
+    talos.testing.Sim), kept alive by the Node.
     """
     def build(handle, _):
-        node = Node(handle)
+        node = Node(handle, owner)
         obj = cls(node)
         update = getattr(obj, "update", None)
         if update is not None:
