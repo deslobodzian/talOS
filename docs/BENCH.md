@@ -135,20 +135,21 @@ sleep precision. Releasing a lane is not a mechanical brake.
   neutralizes without the bridge; launcher restart policy is visible in the
   manifest. Disable/release before recovery. Record neutral delay, PID attempts,
   restart count and recovery behavior; no automatic motion is acceptable.
-- [ ] Capture representative enabled sessions; measure `/hw/state`
-  inter-arrival. Expected: median about 5 ms, p99 <10 ms, no 100 ms gap while
-  enabled. Record sample count, median/p99/max and every enabled gap; correlate
-  publications, motor drains and ticks, never treating drain time as publish
-  time. Target ages must stay below command timeout.
-- [ ] Inspect `/hw/status` clock fields: `clock_offset_valid`, `clock_offset_us`,
-  `clock_offset_spread_us`, `clock_window_count`, `clock_boot_id`,
-  `clock_resets_count`, `clock_ignored_count`, plus state age, timed_out_mask,
-  configured and rejection counters. Expected: mapping converges for the new
-  boot, rejection counters remain flat in healthy operation; offset is a
-  bounded transport-latency estimate, not proof of absolute synchronization.
-  Record mapping/acquisition uncertainty separately. Record per-node loop
-  lateness and scheduling acceptance on macOS; no node should report
-  `realtime scheduling incomplete`. Do not use `TALOS_REALTIME=0` for acceptance.
+- [ ] Capture representative enabled sessions, fetch them (below) and run
+  `bazel run //talOS/launcher:session_report -- --strict <session-dir>`.
+  Expected: `/hw/state` median about 5 ms, p99 <10 ms, no 100 ms gap while
+  enabled (PASS lines); `--strict` exits 2 on FAIL. Keep the report with the
+  session. Target age at the motor's tick is reported NOT MEASURED; receipt
+  ages are listed and must stay well below `command_timeout_us`.
+- [ ] In the same report's `/hw/status` section check `configured`, flat
+  rejection counters, `state_age_us`, `timed_out_mask`, and the clock fields:
+  `clock_offset_valid` (needs eight States and a live two-way probe exchange),
+  `clock_offset_uncertainty_us` and `clock_min_round_trip_us` (local logs
+  only, not radio telemetry). Expected: mapping valid after the new boot; the
+  uncertainty is the error bound, `clock_offset_spread_us` is not. Record the
+  bound and the round trip. Review per-node timer lateness in the report; no
+  node should log `realtime scheduling incomplete`. Do not use
+  `TALOS_REALTIME=0` for acceptance.
 - [ ] In a disposable session lower `[robot] log_max_bytes` and exceed each
   writer's share. Expected: control continues, logs stop at whole records,
   completed manifest reports `log_capped: true`. Record cap/file sizes and
