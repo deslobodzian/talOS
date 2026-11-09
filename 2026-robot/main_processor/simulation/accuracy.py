@@ -43,7 +43,7 @@ MOUNT_ERROR_PRESET = {
 }
 # At the routine's 2 m/s limit, 40 ms is 8 cm: above the 2 cm xy floor.
 TIMESTAMP_LAG_US = 40_000
-RUNS = ("odometry-only", "fused", "fused-lag-uncorrected",
+RUNS = ("odometry-only", "fused", "fused-live", "fused-lag-uncorrected",
         "fused-lag-corrected")
 
 
@@ -281,7 +281,7 @@ def timing_markdown(results):
         "| Run | Camera | frame_period_us | Dropped | Captured | Processed |",
         "|---|---|---:|---:|---:|---:|",
     ]
-    for name in RUNS[1:]:
+    for name in ("fused-live", "fused-lag-uncorrected", "fused-lag-corrected"):
         for camera in CAMERAS:
             timing = results[name][camera]
             lines.append(
@@ -424,7 +424,7 @@ def scenario_config(physics_config, min_yaw_std_rad=None,
 
 def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
                  lag_duration_s=None):
-    """Score baseline/replay and two lag sessions, retaining logs in output_dir."""
+    """Score paired input replays, their live source, and two lag sessions."""
     started = time.monotonic()
     if lag_duration_s is None:
         lag_duration_s = duration_s
@@ -483,24 +483,32 @@ def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
             drivetrain = session / "drivetrain.tlog"
             records = dump_records(dumper, cameras, drivetrain,
                                    session / "pose_estimator.tlog", env)
-            results[name] = score(records)
-            results["timing"][name] = camera_timing(records)
+            live_name = "fused-live" if name == "fused" else name
+            results[live_name] = score(records)
+            results["timing"][live_name] = camera_timing(records)
             if name != "fused":
                 continue
             results["cameras"] = score_cameras(records)
             derived = destination / "odometry_only.toml"
             derived.write_text(replay_config(config), encoding="utf-8")
-            run_launcher(
-                launcher,
-                ["--config", str(derived), "--replay-inputs", str(session),
-                 "--only", "pose_estimator", "--session-id", session.name,
-                 "--output-dir", str(destination / "odometry-only")],
-                cwd, env, destination / "odometry-only.txt", 90)
-            # Input replay writes the node log, not a live-session manifest.
-            odometry = destination / "odometry-only" / session.name
-            records = dump_records(dumper, cameras, drivetrain,
-                                   odometry / "pose_estimator.tlog", env)
-            results["odometry-only"] = score(records)
+            # Both estimators must run on the same virtual-clock schedule.
+            # Comparing live fusion with offline odometry also compares host
+            # scheduling: live polling can skip different drivetrain samples
+            # and deliver cameras at different odometry-buffer positions.
+            for replay_name, replay_path in (
+                    ("fused", live_config), ("odometry-only", derived)):
+                run_launcher(
+                    launcher,
+                    ["--config", str(replay_path),
+                     "--replay-inputs", str(session),
+                     "--only", "pose_estimator", "--session-id", session.name,
+                     "--output-dir", str(destination / f"{replay_name}-replay")],
+                    cwd, env, destination / f"{replay_name}-replay.txt", 90)
+                # Input replay writes a node log, not a session manifest.
+                replay = destination / f"{replay_name}-replay" / session.name
+                records = dump_records(dumper, cameras, drivetrain,
+                                       replay / "pose_estimator.tlog", env)
+                results[replay_name] = score(records)
     results["runtime_s"] = time.monotonic() - started
     (destination / "report.md").write_text(markdown(results) + "\n", encoding="utf-8")
     return results, destination

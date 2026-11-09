@@ -263,7 +263,7 @@ rotates the waypoint about the field centre. The moderate preset is
 The launcher owns the physics gateway and forwards the preset plus
 `--mode-schedule disabled:1,auto:N`. Duration and `--repeat` must be positive
 integers; the report tool defaults to three independent scenarios because
-single-session accuracy varies. Each retains its four-row and timing tables,
+single-session accuracy varies. Each retains its five-row and timing tables,
 followed by mean/min/max position and heading RMS for each row. `--output-dir`
 also retains `summary.md`. CI stays one short scenario, not the CLI repeat loop.
 Loopback ports and shared-memory namespaces are unique per physical session.
@@ -286,12 +286,13 @@ Only the renderer/projector sees the true mounting transform; localization
 keeps the configured mount. These deterministic camera-specific errors model
 calibration bias separately from pixel noise.
 
-The report has four rows:
+The report has five rows:
 
-- **odometry-only** re-runs the baseline estimator with
-  `launcher --replay-inputs SESSION --only pose_estimator`, receiving exactly
-  the **fused** row's recorded odometry, not a second physical trajectory.
-- **fused** is the normal live session, including the mount-error preset.
+- **odometry-only** and **fused** both re-run the baseline estimator with
+  `launcher --replay-inputs SESSION --only pose_estimator`, on the same
+  virtual-clock timer schedule and recorded drivetrain inputs. Only
+  **odometry-only** disables camera subscriptions.
+- **fused-live** is the original live session, including the mount-error preset.
 - **fused-lag-uncorrected** uses the same moderate/mount-error presets plus
   `camera.sim_timestamp_lag_us = 40000`, with `latency_offset_us = 0`.
 - **fused-lag-corrected** uses the same lag and
@@ -306,19 +307,21 @@ rejection. The normal physics config injects no lag. The sole lag constant is
 The existing per-camera consistency table is scored from the baseline fused run.
 The lag-session RMS comparison is reported, not gated: independent real-time
 sessions have scheduling variance larger than the correction gain. CI requires
-accepted observations in both lag runs; it still gates the paired baseline
-fused-vs-odometry improvement and the absolute 0.15 m / 3-degree RMS limits.
+accepted observations in both lag runs; it gates the paired virtual-clock
+fused-vs-odometry improvement and absolute 0.15 m / 3-degree RMS limits for both
+the fused replay and its live source.
 Timestamp correction arithmetic is covered by
 `VisionTest.CaptureTimestampCorrectionIsSharedWithLiveFrames`.
 
 Live and replay configs flatten `robot_physics_sim.toml` onto `robot.toml`,
 preserving all non-include override tables with `tomllib`. Live overlays add
-mount errors and timing settings; replay instead sets
-`[subsystems.pose_estimator] cameras = []`, with no camera-error overlay.
-Thus mount/timing errors cannot affect the odometry-only replay. Physics
-overrides have one source and no whole robot/subsystem files are copied.
+mount errors and timing settings; the fused replay reuses that live config,
+while odometry replay sets `[subsystems.pose_estimator] cameras = []` with no
+camera-error overlay. Mount/timing errors cannot affect odometry-only replay.
+Physics overrides have one source and no whole robot/subsystem files are copied.
 Replay reuses the session ID solely so the log merger aligns records with
-the original camera/drivetrain logs; output logs stay in a separate directory.
+the original camera/drivetrain logs; output logs stay in separate `*-replay`
+directories, never overwriting the live estimator log.
 All three physical runs use the requested autonomous duration (12 s by default),
 and the report includes total wall-clock runtime, including startup/replay/scoring.
 It also prints final `frame_period_us`, dropped, captured and processed counters
@@ -354,12 +357,17 @@ startup observations).
 The report command exits nonzero only for tool/session/scoring failures,
 not poor accuracy. The exclusive CI test uses the **same runner and scorer**
 with eight autonomous seconds for the baseline and four seconds for each lag
-session. Baseline assertions remain unchanged: fused position RMS less than
-odometry-only RMS and 0.15 m, heading RMS below 3 degrees, and at least one
-accepted observation. The lag sessions must both accept observations; their
-position RMS difference and ratio are printed as a report, not a CI gate.
-Scoring unit tests cover wrapped interpolation,
-timestamp deduplication, phase/validity filtering and all timing overlays.
+session. Fused replay must improve on odometry-only RMS with equal scored
+sample counts. Both replayed and live fusion must meet 0.15 m position and
+3-degree heading RMS limits and accept observations. Comparing live fusion
+against offline odometry alone is not a same-input experiment: live polling
+can skip drivetrain samples and process cameras at different odometry-buffer
+positions when the host is delayed. Both paired replays instead consume the
+same published inputs on the same simulated schedule, without changing the
+product's timestamp or latency compensation. The lag sessions must both accept
+observations; their RMS difference and ratio remain a report, not a CI gate.
+Scoring unit tests cover wrapped interpolation, timestamp deduplication,
+phase/validity filtering and all timing overlays.
 
 ### Measured baseline
 

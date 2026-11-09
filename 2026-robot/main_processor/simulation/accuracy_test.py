@@ -1,4 +1,4 @@
-"""Loose end-to-end fusion gate and focused scoring regression tests."""
+"""Paired virtual-clock fusion gate and live-stack accuracy/scoring regressions."""
 
 import json
 import math
@@ -125,9 +125,9 @@ class ScoringTest(unittest.TestCase):
             self.assertEqual(timing[camera].captured, 61)
             self.assertEqual(timing[camera].processed, 61)
         report = timing_markdown({
-            run: timing for run in ("fused", "fused-lag-uncorrected",
+            run: timing for run in ("fused-live", "fused-lag-uncorrected",
                                    "fused-lag-corrected")})
-        self.assertIn("| fused | front_left_camera | 16667 | 2 | 61 | 61 |",
+        self.assertIn("| fused-live | front_left_camera | 16667 | 2 | 61 | 61 |",
                       report)
         with self.assertRaisesRegex(ValueError, "missing camera status"):
             camera_timing([])
@@ -212,10 +212,14 @@ class AccuracyScenarioTest(unittest.TestCase):
             table = markdown(results)
             print("\n" + table, flush=True)
             fused, odometry = results["fused"], results["odometry-only"]
+            # These rows share virtual timer firings as well as recorded input
+            # payloads. The live source is separately subject to host scheduling.
+            self.assertEqual(fused.samples, odometry.samples, table)
             self.assertLess(fused.position_rms_m, odometry.position_rms_m, table)
-            self.assertLess(fused.position_rms_m, 0.15, table)
-            self.assertLess(fused.heading_rms_deg, 3, table)
-            self.assertGreater(fused.accepted, 0, table)
+            for result in (fused, results["fused-live"]):
+                self.assertLess(result.position_rms_m, 0.15, table)
+                self.assertLess(result.heading_rms_deg, 3, table)
+                self.assertGreater(result.accepted, 0, table)
             uncorrected = results["fused-lag-uncorrected"]
             corrected = results["fused-lag-corrected"]
             self.assertGreater(uncorrected.accepted, 0, table)
