@@ -1,13 +1,18 @@
 """Paired virtual-clock fusion gate and live-stack accuracy/scoring regressions."""
 
+from contextlib import redirect_stdout
+import io
 import json
 import math
+import os
 from pathlib import Path
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 
-from accuracy import (CAMERAS, MOUNT_ERROR_PRESET, RUNS, TIMESTAMP_LAG_US, Metrics,
+from accuracy import (CAMERAS, MOUNT_ERROR_PRESET, RUNS, TIMESTAMP_LAG_US,
+                      CameraTiming, Metrics, camera_health_issues,
                       camera_markdown, camera_timing, interpolate_truth, markdown,
                       replay_config, run_scenario, scenario_config, score,
                       score_cameras, summary_markdown, timing_markdown)
@@ -132,6 +137,50 @@ class ScoringTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing camera status"):
             camera_timing([])
 
+    def test_camera_health_is_per_camera_and_independent_of_fusion_error(self):
+        healthy = {camera: CameraTiming(25_000, 100, 200, 190)
+                   for camera in CAMERAS}
+        self.assertEqual(camera_health_issues(healthy), [])
+        for timing in (
+                CameraTiming(25_001, 100, 200, 190),
+                CameraTiming(25_000, 101, 200, 190),
+                CameraTiming(25_000, 100, 200, 189),
+                CameraTiming(0, 0, 0, 0),
+                # macOS follow-up: only ~28% of scheduled captures survived.
+                CameraTiming(58_710, 353, 141, 141)):
+            with self.subTest(timing=timing):
+                timings = dict(healthy, rear_right_camera=timing)
+                issues = camera_health_issues(timings)
+                self.assertEqual(len(issues), 1)
+                self.assertIn("rear_right_camera", issues[0])
+
+    def test_health_condition_reports_inversion_and_capable_host_fails(self):
+        # A worse fused RMS must fail on healthy inputs, but is not evidence
+        # of a fusion regression when the capture prerequisite is unmet.
+        results = {
+            name: Metrics(10, 0.10 if name == "odometry-only" else 0.11,
+                          0.12, 1, 2, 0.1, 1, 1, 0)
+            for name in RUNS}
+        timings = {camera: CameraTiming(16_667, 0, 500, 500)
+                   for camera in CAMERAS}
+        results["timing"] = {
+            name: timings for name in
+            ("fused-live", "fused-lag-uncorrected", "fused-lag-corrected")}
+        scenario = AccuracyScenarioTest(
+            "test_fusion_accuracy_and_healthy_same_input_improvement")
+        with patch(f"{__name__}.run_scenario", return_value=(results, None)), \
+                patch.dict(os.environ, TALOS_ACCURACY_REQUIRE_CAMERA_HEALTH="0"), \
+                redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(AssertionError):
+                scenario.test_fusion_accuracy_and_healthy_same_input_improvement()
+            timings["rear_right_camera"] = CameraTiming(58_710, 353, 141, 141)
+            scenario.test_fusion_accuracy_and_healthy_same_input_improvement()
+            self.assertIn("Fusion improvement NOT EVALUATED", output.getvalue())
+            self.assertIn("rear_right_camera: period=58710", output.getvalue())
+            with patch.dict(os.environ, TALOS_ACCURACY_REQUIRE_CAMERA_HEALTH="1"):
+                with self.assertRaisesRegex(AssertionError, "INSUFFICIENT"):
+                    scenario.test_fusion_accuracy_and_healthy_same_input_improvement()
+
     def test_repeat_summary_reports_mean_min_max_for_each_row(self):
         scenarios = []
         for position in (0.01, 0.03):
@@ -206,7 +255,7 @@ class ScoringTest(unittest.TestCase):
 
 
 class AccuracyScenarioTest(unittest.TestCase):
-    def test_fusion_improves_same_input_odometry(self):
+    def test_fusion_accuracy_and_healthy_same_input_improvement(self):
         with tempfile.TemporaryDirectory(prefix="accuracy-test-") as directory:
             results, _ = run_scenario(8, directory, lag_duration_s=4)
             table = markdown(results)
@@ -215,7 +264,16 @@ class AccuracyScenarioTest(unittest.TestCase):
             # These rows share virtual timer firings as well as recorded input
             # payloads. The live source is separately subject to host scheduling.
             self.assertEqual(fused.samples, odometry.samples, table)
-            self.assertLess(fused.position_rms_m, odometry.position_rms_m, table)
+            issues = camera_health_issues(results["timing"]["fused-live"])
+            if os.environ.get("TALOS_ACCURACY_REQUIRE_CAMERA_HEALTH") == "1":
+                self.assertFalse(issues, table)
+            improvement = odometry.position_rms_m - fused.position_rms_m
+            print(f"Paired fusion position RMS improvement: {improvement:.4f} m; "
+                  + ("REQUIRED (camera throughput sufficient)" if not issues else
+                     "NOT EVALUATED (INSUFFICIENT camera throughput)"),
+                  flush=True)
+            if not issues:
+                self.assertLess(fused.position_rms_m, odometry.position_rms_m, table)
             for result in (fused, results["fused-live"]):
                 self.assertLess(result.position_rms_m, 0.15, table)
                 self.assertLess(result.heading_rms_deg, 3, table)

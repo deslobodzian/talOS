@@ -276,6 +276,28 @@ def camera_timing(records):
         for name, (_, message) in latest.items()}
 
 
+def camera_health_issues(timings):
+    """Require >=40 of the requested 60 fps and >=95% processing per camera.
+
+    The deadline counters cover the whole session, unlike estimator accepts,
+    which also depend on visibility and innovation gating. This prerequisite
+    is independent of whether fusion happened to beat odometry.
+    """
+    issues = []
+    for camera in CAMERAS:
+        timing = timings[camera]
+        scheduled = timing.captured + timing.dropped
+        if (not scheduled or timing.captured * 3 < scheduled * 2
+                or not 0 < timing.frame_period_us <= 25_000
+                or not timing.captured
+                or timing.processed * 20 < timing.captured * 19):
+            issues.append(
+                f"{camera}: period={timing.frame_period_us} us, "
+                f"captured={timing.captured}/{scheduled} deadlines, "
+                f"processed={timing.processed}/{timing.captured}")
+    return issues
+
+
 def timing_markdown(results):
     lines = [
         "| Run | Camera | frame_period_us | Dropped | Captured | Processed |",
@@ -306,6 +328,11 @@ def markdown(results):
         lines.extend(["", camera_markdown(results["cameras"])])
     if "timing" in results:
         lines.extend(["", timing_markdown(results["timing"])])
+        issues = camera_health_issues(results["timing"]["fused-live"])
+        health = ("Fusion improvement NOT EVALUATED: INSUFFICIENT camera "
+                  "throughput: " + "; ".join(issues)) if issues else (
+                      "Camera throughput sufficient; fusion improvement required.")
+        lines.extend(["", health])
     if "runtime_s" in results:
         lines.extend(["", f"Total runtime: {results['runtime_s']:.1f} s"])
     return "\n".join(lines)
