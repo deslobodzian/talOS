@@ -29,8 +29,6 @@ build:macos --cxxopt=-fexperimental-library --linkopt=-fexperimental-library
 build:macos --host_cxxopt=-std=c++23 --host_cxxopt=-O3
 build:macos --host_cxxopt=-fexperimental-library --host_linkopt=-fexperimental-library
 build:macos --macos_minimum_os=13.4 --host_macos_minimum_os=13.4
-build:windows --cxxopt=/std:c++23 --cxxopt=-O3
-build:windows --host_cxxopt=/std:c++23 --host_cxxopt=-O3
 
 # Linux sanitizer builds instrument both C and C++ dependencies and link the
 # matching runtime. Keep stack traces useful and make UB fail the test.
