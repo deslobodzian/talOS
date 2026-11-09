@@ -59,6 +59,30 @@ py_test(
     ],
 )
 
+# Full graph match rehearsal, with an intentional critical-node restart.
+py_test(
+    name = "match_rehearsal_test",
+    size = "medium",
+    timeout = "moderate",
+    srcs = [
+        "match_rehearsal_test.py",
+        "startup_test.py",
+    ],
+    data = [
+        ":sim_gateway",
+        "//2026-robot/main_processor/configuration:robot_physics_sim.toml",
+        "//talOS/bridge:hardware_node",
+        "//talOS/launcher",
+        "//talOS/launcher:log_dump",
+    ] + CONFIG_FILES + NODES,
+    imports = ["."],
+    tags = [
+        "exclusive",
+        "no_asan",
+        "no_tsan",
+    ],
+)
+
 py_library(
     name = "accuracy",
     srcs = ["accuracy.py"],

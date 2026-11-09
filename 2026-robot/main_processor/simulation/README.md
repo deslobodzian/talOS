@@ -212,6 +212,26 @@ on macOS as well as Linux. Process groups are always reaped. On failure it
 prints and retains the temporary directory containing `sessions/`, launcher
 diagnostics and (when export succeeds) `match.jsonl`; successful runs remove it.
 
+`match_rehearsal_test` adds a 17-second full-graph rehearsal: disabled,
+four seconds of the configured autonomous routine, disabled, teleop with
+drive and shooter/feed buttons, then disabled. It kills drivetrain with
+`SIGKILL` while briefly pausing its driver producer, checks that only
+drivetrain restarts, and proves its resumed output follows a fresh,
+post-crash active target. A separate 250 ms driver pause must neutralize
+all drivetrain motors within `command_timeout_us + period_us`; held input
+cannot rearm until centered. The recording checks every motor request
+against its consumer's latest disabled DS snapshot, nonzero autonomous
+and teleop mechanism actuation, clean manifest closure, and all nodes'
+recorder/exit status. Node-log error lines are rejected except explicit
+host real-time privilege warnings. Failure artifacts are retained.
+
+Run the independent rehearsal three times for a stability check:
+
+```sh
+bazel test --test_output=errors --runs_per_test=3 \
+  //2026-robot/main_processor/simulation:match_rehearsal_test
+```
+
 ## Pose-estimator accuracy scenario
 
 ```sh
