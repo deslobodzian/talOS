@@ -297,16 +297,6 @@ export class TelemetryDecoder {
   }
 }
 
-// Shared decoder for callers that decode an ordered stream (tests, log
-// import). Stateful on purpose: bare value frames need the dictionary that
-// preceded them.
-const sharedDecoder = new TelemetryDecoder();
-export function decode(bytes: Uint8Array): Snapshot|null {
-  return sharedDecoder.decode(bytes);
-}
-export function resetSharedDecoder() {
-  sharedDecoder.reset();
-}
 
 export class JitterBuffer {
   private pending = new Map < bigint, {

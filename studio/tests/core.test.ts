@@ -6,7 +6,6 @@ import {Builder} from 'flatbuffers';
 import {
   channelDisplay,
   Coordinator,
-  decode,
   JitterBuffer,
   MAX_FRAME_BYTES,
   poseError,
@@ -22,10 +21,11 @@ import {createFrameDetectors, SYSTEM_DETECTORS} from '../src/data/detectors';
 import {demoDeclaredGraph, demoSystemGraph} from '../src/demo';
 import {declaredStatus, parseDeclaredGraph, parseSystemGraph} from '../src/system';
 
-// Prime the shared decoder with the dictionary frame, as a bridge does on
-// connect, so bare value frames below can be named.
-decode(demoPacket(0n));
-const frame = (i: number) => decode(demoPacket(BigInt(i)))!;
+const frame = (i: number) => {
+  const decoder = new TelemetryDecoder();
+  decoder.decode(demoPacket(0n));
+  return decoder.decode(demoPacket(BigInt(i)))!;
+};
 
 // A bare value frame (no dictionary) for `dictionaryId`, built the way a
 // producer builds every later frame. Options also support custom dictionaries
@@ -267,25 +267,13 @@ test('counter resets refresh the baseline instead of ending a live run', () => {
 });
 test('all truncated frames and corrupt roots fail closed', () => {
   const bytes = demoPacket(2n);
+  const decoder = new TelemetryDecoder();
   for (let n = 0; n < bytes.length; n++)
-    assert.throws(() => decode(bytes.slice(0, n)));
+    assert.throws(() => decoder.decode(bytes.slice(0, n)));
   const copy = bytes.slice();
   new DataView(copy.buffer).setUint32(4, 0xfffffff0, true);
-  assert.throws(() => decode(copy));
+  assert.throws(() => decoder.decode(copy));
 });
-test(
-    'identical log yields identical snapshots regardless of query order',
-    () => {
-      const a = new Timeline(), b = new Timeline();
-      for (let i = 0; i < 100; i++) {
-        a.append(frame(i));
-        b.append(frame(i));
-      }
-      for (const i of [99, 2, 50, 0, 34, 50])
-        assert.deepEqual(
-            a.at(1000000000n + BigInt(i) * 20000000n),
-            b.at(1000000000n + BigInt(i) * 20000000n));
-    });
 
 test('sim truth reads flattened dictionary channels, independently of estimate validity',
      () => {

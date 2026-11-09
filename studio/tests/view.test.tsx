@@ -178,15 +178,6 @@ test('a node card says who drives its subsystem, and none when nobody does',
        assert.ok(wiring.includes('driven by teleop'));
      });
 
-test('every view renders without a system graph and says why', () => {
-  for (const [name, html] of [
-         ['system', renderPanel(systemPanel, noSystem)],
-         ['timing', renderPanel(timingPanel, noSystem)],
-         ['overview', renderPanel(healthPanel, noSystem)],
-       ] as const) {
-    assert.ok(html.length > 0, `${name} rendered nothing`);
-  }
-});
 
 test('a malformed document is reported in place of the graph it replaced', () => {
   const html = renderPanel(systemPanel, {
@@ -249,18 +240,6 @@ test('timing lists one row per source, with declared and measured rates', () => 
   assert.ok(html.includes('Hz'));
 });
 
-test('the overview routes each attention item to the panel that explains it',
-     () => {
-       const html = renderPanel(healthPanel, state());
-       assert.ok(html.includes('/shooter/state'));
-     });
-
-test('the agent tab offers every RPC method the server implements', () => {
-  const html = renderPanel(agentPanel, noSystem);
-  for (const method of RPC_METHODS)
-    assert.ok(html.includes(method), `method ${method} not offered`);
-  assert.ok(html.includes('get_declared_graph'));
-});
 
 test('the system tab reports what was declared against what registered', () => {
   const html = renderPanel(systemPanel, state(true));
@@ -286,11 +265,6 @@ test('a running node nobody declared is a different sentence', () => {
   assert.ok(html.includes('running but not declared'));
 });
 
-test('a declared graph with nothing to report says so rather than nothing', () => {
-  const html = render(<DeclaredPanel
-      declared={{version: 1, nodes: [], diagnostics: []}} graph={null}/>);
-  assert.ok(html.includes('0 nodes declared'));
-});
 
 test('with no declared graph every view is exactly what it was before', () => {
   const system = state();

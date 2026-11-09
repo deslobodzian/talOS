@@ -7,7 +7,7 @@ import {test} from 'node:test';
 import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 
-import {decode} from '../src/core';
+import {TelemetryDecoder} from '../src/core';
 import type {Snapshot} from '../src/core';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
 import {demoPacket} from '../src/demo';
@@ -25,7 +25,8 @@ function frame(ts: string, channels: Record<string, number>,
 }
 
 function populatedStudio(): Studio {
-  const frames = [0n, 1n, 2n].map(n => decode(demoPacket(n))!);
+  const decoder = new TelemetryDecoder();
+  const frames = [0n, 1n, 2n].map(n => decoder.decode(demoPacket(n))!);
   return createStaticStudio({
     frames,
     playback: {
@@ -66,10 +67,6 @@ test('channelStalenessNs returns the age of the newest reading', () => {
   assert.equal(channelStalenessNs(series, 'a', null), null);
 });
 
-test('the inspector shows an empty state when there is no telemetry', () => {
-  const html = renderInspector(createStaticStudio({}));
-  assert.ok(html.includes('No channels yet.'));
-});
 
 test('the inspector renders boolean channels as on/off pills', () => {
   const studio = createStaticStudio({

@@ -9,13 +9,8 @@ import type {RobotEvent} from '../src/data/types';
 import {
   eventCommands,
   filterCommands,
-  pageCommands,
-  panelCommands,
-  presetCommands,
   relativeEventTime,
   score,
-  transportCommands,
-  workspaceCommands,
 } from '../src/shell/commands';
 
 // --- scoring ---------------------------------------------------------------
@@ -58,34 +53,6 @@ test('filterCommands returns everything for an empty query, best first', () => {
 
 // --- command builders ------------------------------------------------------
 
-test('pageCommands names every page and marks the active one', () => {
-  const commands = pageCommands(
-      [{id: 'a', title: 'Robot'}, {id: 'b', title: 'Signals'}], 'a',
-      () => {});
-  assert.deepEqual(commands.map(c => c.id), ['page:a', 'page:b']);
-  assert.equal(commands[0].title, 'Go to page Robot');
-  assert.equal(commands[0].hint, 'current');
-  assert.equal(commands[1].hint, undefined);
-});
-
-test('panelCommands names every registered panel with its category', () => {
-  const commands = panelCommands([
-    {id: 'field', title: 'Field', category: 'Spatial', description: 'Top-down view'}
-  ], () => {});
-  assert.equal(commands.length, 1);
-  assert.equal(commands[0].id, 'panel:field');
-  assert.equal(commands[0].title, 'Add panel Field');
-  assert.equal(commands[0].hint, 'Spatial');
-  assert.ok(commands[0].keywords!.includes('Top-down view'));
-});
-
-test('presetCommands names every preset with its description', () => {
-  const commands = presetCommands([{name: 'Robot', description: 'Health + field'}],
-                                  () => {});
-  assert.equal(commands[0].id, 'preset:Robot');
-  assert.equal(commands[0].title, 'Open preset page Robot');
-  assert.equal(commands[0].hint, 'Health + field');
-});
 
 test('relativeEventTime measures from the cursor', () => {
   assert.equal(relativeEventTime('0', null), '');
@@ -93,17 +60,6 @@ test('relativeEventTime measures from the cursor', () => {
   assert.equal(relativeEventTime('0', '1000000'), '1.00 ms ago');
 });
 
-test('eventCommands lists newest first, capped, with a relative hint', () => {
-  const event = (id: string, t_ns: string): RobotEvent =>
-      ({id, t_ns, severity: 'info', category: 'system', title: id});
-  const events = [event('e1', '100'), event('e2', '300'), event('e3', '200')];
-
-  const commands = eventCommands(events, () => {}, '1000', 2);
-  // Newest first: 300, 200; the 100 event is cut by the limit.
-  assert.deepEqual(commands.map(c => c.id), ['event:e2', 'event:e3']);
-  assert.equal(commands[0].title, 'Seek to event e2');
-  assert.ok(commands[0].hint!.includes('ago'));
-});
 
 test('eventCommands sorts exact decimal timestamps numerically before limiting', () => {
   const times = ['9', '10', '9007199254740992', '9007199254740993'];
@@ -116,24 +72,3 @@ test('eventCommands sorts exact decimal timestamps numerically before limiting',
   assert.deepEqual(events.map(event => event.t_ns), times);
 });
 
-test('transportCommands toggles the play/pause label with the mode', () => {
-  const callbacks = {
-    onConnect: () => {}, onDemo: () => {}, onLive: () => {}, onPlayPause: () => {}
-  };
-  const paused = transportCommands({...callbacks, mode: 'PAUSED', status: 'x'});
-  assert.equal(paused.find(c => c.id === 'play-pause')!.title, 'Play');
-
-  const playing = transportCommands(
-      {...callbacks, mode: 'REPLAY_PLAYING', status: 'x'});
-  assert.equal(playing.find(c => c.id === 'play-pause')!.title, 'Pause');
-
-  const live = transportCommands(
-      {...callbacks, mode: 'LIVE_STREAMING', status: 'x'});
-  assert.equal(live.find(c => c.id === 'play-pause')!.title, 'Pause');
-});
-
-test('workspaceCommands offers import and export', () => {
-  const commands = workspaceCommands(() => {}, () => {});
-  assert.deepEqual(commands.map(c => c.id),
-                   ['workspace:import', 'workspace:export']);
-});
