@@ -92,19 +92,6 @@ void DestroyFamily(const std::string& name, apriltag_family_t* tf) {
 // overhead exceeds the relocated fits; blur/pick/combos dominate and stay
 // CPU). Quad fitting therefore stays on CPU by measurement, not by default.
 
-// Stage 2 candidate point layout, locked to {x, y, gx, gy, slope} to match
-// FastGradientClustersFromCandidates (see metal_ccl_clustering_test.cc).
-// The GPU extract_edge_candidates kernel emits packed uint32 coords into the
-// same buffer (4 bytes/pt); the buffer is sized for the larger 12-byte point
-// so it fits either representation.
-struct Stage2ClusterPoint {
-  uint16_t x, y;
-  int16_t gx, gy;
-  float slope;
-};
-static_assert(sizeof(Stage2ClusterPoint) == 12,
-              "Stage2ClusterPoint layout must stay {x,y,gx,gy,slope}");
-
 }  // namespace
 
 struct MetalAprilTagBackend::Impl {

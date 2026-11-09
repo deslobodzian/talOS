@@ -201,17 +201,6 @@ TEST(SO3, RightJacobianMatchesFiniteDifferences) {
   }
 }
 
-TEST(SE3, Axioms) {
-  auto rng = Rng();
-  for (int i = 0; i < 500; ++i) {
-    const SE3<double> a = RandomSE3(rng), b = RandomSE3(rng),
-                      c = RandomSE3(rng);
-    EXPECT_TRUE(((a * b) * c).matrix().isApprox((a * (b * c)).matrix(), 1e-9));
-    EXPECT_TRUE(
-        (a * a.inverse()).matrix().isApprox(Eigen::Matrix4d::Identity(), 1e-9));
-  }
-}
-
 TEST(SE3, ExpLogRoundTrip) {
   auto rng = Rng();
   std::normal_distribution<double> n;
@@ -245,11 +234,14 @@ TEST(SE3, ExpLogRoundTrip) {
 }
 
 TEST(SE3, MatchesHomogeneousMatrices) {
-  // Composition and action against plain 4x4 math (no shared formulas).
+  // Composition, inverse and action against plain 4x4 math (no shared
+  // formulas). Matrix products are associative, so this also proves the group
+  // law.
   auto rng = Rng();
   for (int i = 0; i < 300; ++i) {
     const SE3<double> a = RandomSE3(rng), b = RandomSE3(rng);
     EXPECT_TRUE((a * b).matrix().isApprox(a.matrix() * b.matrix(), 1e-9));
+    EXPECT_TRUE(a.inverse().matrix().isApprox(a.matrix().inverse(), 1e-9));
     const Eigen::Vector3d p(0.5, -1.5, 2.5);
     Eigen::Vector4d ph;
     ph << p, 1.0;

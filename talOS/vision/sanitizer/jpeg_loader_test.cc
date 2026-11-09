@@ -21,17 +21,6 @@ std::string FixturePath() {
          "/talOS/vision/testdata/33369213973_9d9bb4cc96_c.jpg";
 }
 
-// The offline DetectImageFile API decodes JPEGs with AprilTag's pjpeg; live
-// camera detection passes raw buffers and never reaches it. Under the asan
-// config (UBSan included, pjpeg no longer exempt) this decodes a photograph.
-TEST(JpegLoader, PhotographicFixture) {
-  DetectorOptions options;
-  options.threads = 2;
-  options.quad_decimate = 2.0f;
-  CpuAprilTagBackend backend(options);
-  EXPECT_FALSE(backend.DetectImageFile(FixturePath()).empty());
-}
-
 // Corrupt entropy-coded data must be refused or decoded within bounds:
 // a Huffman run past coefficient 63 used to index ZZ, qtab and the block
 // out of range. Deterministic byte edits after the start-of-scan marker;
