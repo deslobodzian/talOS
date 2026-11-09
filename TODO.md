@@ -16,7 +16,7 @@ Five GPT-6.1 Sol medium source audits covered runtime/APIs, hardware/transport, 
 | Geometry, vision and reusable motion | 8 | 7.5 |
 | Telemetry and operator diagnostics | 8 | 7 |
 
-**Competition readiness remains unqualified until the physical gates below pass.** As of 2026-11-08 every software item the audit raised is fixed except TIME-2, RADIO-1 and the JPEG part of VERIFY-1; each closed item has a regression test that reproduces its failure path (see the table). No new physical unsafe actuation was demonstrated by the audit.
+**Competition readiness remains unqualified until the physical gates below pass.** As of 2026-11-09 every software item the audits raised is fixed; MAC-1 awaits a macOS CI run; each closed item has a regression test that reproduces its failure path (see the table). No new physical unsafe actuation was demonstrated by the audit.
 
 Evidence labels:
 - **Reproduced:** observed in a probe of current implementation.
@@ -24,7 +24,7 @@ Evidence labels:
 - **Incident:** previously observed failure with unresolved cause.
 - **Hardware:** requires the deployment computer, robot, controllers or radio.
 
-Verification of the closing state (2026-11-08): `bazel build //...`, `bazel test //...` 142/142; `--config=tsan` and `--config=asan` 125/125 each (no OpenCV serialization, AprilTag quad-threshold instrumented); `./gradlew phoenixTest buildRio`; `--describe-only` 13/13 nodes on robot/robot_field/robot_physics_sim, 5/5 superstructure; Studio `pnpm test` 316/316 and build; a live `./sim.sh --sim-gateway` session with Studio in a headless browser (15/15 nodes live; after stopping the sim every status chip, the node count and the system graph read STALE/unknown).
+Verification of the closing state (2026-11-09, Linux): `bazel build //...`, `bazel test //...` 151/151; `./gradlew phoenixTest buildRio`; `--describe-only` 13/13 on robot/robot_field, 15/15 physics sim (telemetry 133 channels, 1192/1200 B), 4/4 on both bench configs, 5/5 superstructure; Studio `pnpm test` 316/316 and build; match rehearsal 3/3. Sanitizer suites and macOS run in CI (PR #3).
 
 ## Closed in the 2026-11-08 pass
 
@@ -55,14 +55,27 @@ Verification of the closing state (2026-11-08): `bazel build //...`, `bazel test
 | Studio blank page on live connect (uint32 dictionary id); bridge `--describe` refused by the launcher | `ca72565` | store/describe tests fail before; found by the live smoke |
 | Studio reported a new launcher session's processes as restarts | `03eb210` | events.test |
 
+## Closed in the 2026-11-09 pass (bench preparation)
+
+| Item | Commit | Evidence |
+|---|---|---|
+| TIME-2 clock mapping has a real error bound: causal two-way probes, `clock_offset_uncertainty_us` / `clock_min_round_trip_us` in `/hw/status`, sample times valid only with a live exchange (protocol v3) | `146e78a` | old estimator: 3000 µs error at zero spread; bound contains true error under varied offset/delay/jitter/asymmetry/±1000 ppm |
+| RADIO-1 Studio viewers capped (default 4, `[studio] max_clients`), 160 kB/s shared WebSocket budget, stalled client isolated | `ea92e93` | bandwidth_test fails before; measurements in studio/bridge README |
+| VERIFY-2 AprilTag JPEG decoder safe on corrupt input; last sanitizer exemption removed | `ee6c35b` | corrupt-scan corpus fails before (index 64 out of bounds) |
+| Supervisor stall false positive: a 300 ms pause plus 250 ms-old progress crossed the 500 ms floor and restarted a healthy node | `f3df8a1` | registry_test fails before; found by the match rehearsal |
+| Match rehearsal: full 2026 graph through disabled/auto/teleop, SIGKILL of drivetrain, SIGSTOP of the driver, asserted from recorded data | `2c384ad` | 3/3 |
+| Motor `temperature_c` and `supply_current_a` end to end (protocol v4; int16 tenths; State max 1388 B) | `0bbc8ff` | C++/Python/RIO tests; phoenixTest |
+| Bench robot `bench/` (one Kraken), `docs/BENCH.md`, `session_report` tool | `ef12ba1`, `391c940`, `d829840`, `654aa81` | sim smoke; synthetic and real sessions |
+| macOS CI failures (bridge UDP receive barriers, replay dispatch index, OpenCV GCD thread count, accuracy comparison schedule) | `7ed7329`, `7fb0a9a`, `781a4c7`, `8b1c637` | Linux under 3 constrained CPUs; macOS rerun pending (MAC-1) |
+| CI clang-format job used version 18; local checks used 23 | `23ce6b3` | 46 files reformatted; use `pip install clang-format==18.1.8` |
+
+The RoboRIO program must be redeployed with this branch: protocol v4 refuses older State layouts.
+
 ## Open software items
 
-- [ ] **TIME-2 — Qualify clock-mapping accuracy, not just convergence.** **Source + Hardware.** `talOS/bridge/clock_offset.cc::Observe` estimates from one-way arrivals. A constant transport delay yields low spread while shifting mapped time; TIME-1 now makes acquisition times explicit, so the remaining error is the mapping itself.
-  - Acceptance: independently vary offset, constant delay, jitter and asymmetry; measure absolute error/uncertainty against fusion requirements. Use two-way timing or propagated uncertainty if necessary; spread is not an accuracy bound.
-- [ ] **RADIO-1 — Define and verify aggregate viewer bandwidth.** **Source policy gap + Hardware.** `studio/bridge/main.cc` bounds each slow client's queue but not the client count or total egress.
-  - Acceptance: measure total egress/age/drops/RSS at the supported client count plus one stalled/excess client; document the operating limit and enforce it if needed.
-- [ ] **VERIFY-2 — AprilTag offline JPEG decoding is UB-unqualified.** **Reproduced.** Restoring UBSan shift checks reproduces `pjpeg.c:597` shifting a negative value. Live Linux detection uses raw buffers and never reaches it; only offline JPEG decoding does. Fix or replace the decoder before any match path decodes JPEG.
+- [ ] **MAC-1 — macOS CI green on this branch.** **Reproduced (CI).** PR #3's first macOS run failed four targets that pass on Linux; fixes are in, a macOS rerun has to confirm them. The Mini is the deployment computer, so a red macOS job blocks the bench.
 - [ ] **TELEMETRY-1 — One spare channel on the physics-sim graph.** **Measured.** Any new state scalar needs an exclude (or a frame-format change) in the same commit; an overflow already fails `talos_graph_test`. Multi-frame scheduling only if essential channels need it.
+- [ ] **TIME-3 — Tick-time target age is not recorded.** **Source.** `session_report` measures receipt age but not the age of the target a consumer used at its tick (BRINGUP "about 25 ms at most"); that needs a logged per-tick selected-target timestamp.
 
 ## Unresolved incidents — investigate, do not declare fixed by a rerun
 
@@ -72,6 +85,8 @@ Verification of the closing state (2026-11-08): `bazel build //...`, `bazel test
 ## Physical and deployment qualification gates
 
 These are separate from software fixes, not evidence that a failure already exists. Agents must not change physical CAN IDs or set `commissioned = true`.
+
+The one-Kraken bench ([docs/BENCH.md](docs/BENCH.md), config `bench/`) can close the link/stop/timing parts of FIELD-1, FIELD-2, FIELD-3 and all of FIELD-5 before the robot exists; it cannot qualify a full CAN bus, cameras or the drivetrain. Run `session_report --strict` on every bench session.
 
 - [ ] **FIELD-1 — Network, electrical configuration and commissioning.** Verify Mini `10.56.87.11`, RIO `10.56.87.2`, field bundle selection, CAN IDs, encoder offsets, inversion and controller limits against the real robot. A responsible human commissions only after restrained disabled/enable tests; update configuration golden checks alongside deliberate hardware changes.
 - [ ] **FIELD-2 — Independent stop and fault measurements.** Measure DS disable/e-stop, companion stop/stall, Ethernet removal, RIO cold reboot, single Talon/CANcoder loss and total bus loss. Confirm affected-output/dependency isolation and safe fresh recovery. Measure voltage/current or independent motion/power evidence, not merely requested neutral or invalid feedback. Include PWM zero versus pulse-loss behavior and persisted-config boot restoration.
