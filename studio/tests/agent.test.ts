@@ -515,6 +515,27 @@ test('a reconnecting bridge 404 clears the previous declared graph', async () =>
   }
 });
 
+test('losing the bridge drops the live graph instead of reporting it alive',
+     async () => {
+       const bridge = await fakeBridge(demoDeclaredGraph());
+       const agent = startAgent(0, bridge.url);
+       try {
+         // The declared fetch happens on open, so this waits for a connection.
+         await settle(() => !!agent.context().declared, 'never connected');
+         agent.ingestSystemGraph(demoSystemGraph(500n));
+         assert.ok(agent.context().system);
+         bridge.reconnect(demoDeclaredGraph());
+         await settle(() => agent.context().system === null,
+                      'a lost connection kept its graph');
+         assert.throws(
+             () => dispatch(agent.context(), 'get_system_graph', {}),
+             (e: unknown) => e instanceof RpcFault && e.code === -32002);
+       } finally {
+         agent.close();
+         bridge.close();
+       }
+     });
+
 test('oversized RPC WebSocket payloads close only the offending client', async () => {
   const bridge = await fakeBridge(null);
   const agent = startAgent(0, bridge.url);

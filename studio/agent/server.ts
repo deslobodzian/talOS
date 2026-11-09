@@ -253,6 +253,10 @@ export function startAgent(
     });
     socket.on('error', () => {});
     socket.on('close', () => {
+      // A graph from a lost connection would keep reporting its nodes alive;
+      // get_system_graph answers "no graph" until the bridge sends a new one.
+      system = null;
+      previousSystem = null;
       if (!stopped) retry = setTimeout(connect, 1000);
     });
   }
