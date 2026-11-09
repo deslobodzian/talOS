@@ -1388,11 +1388,10 @@ TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
   using talos::vision::TimestampKind;
   auto device = std::make_shared<FakeCameraDevice>();
   LiveTestVision::device = device;
-  // Frames arrive only when the test emits them, and the acquisition worker is
-  // a real thread: on a loaded host (CI, parallel agents) it has been seen to
-  // need more than 1.9 s of simulated stepping for one frame. The stall timeout
-  // is therefore the 10 s maximum and each wait may step 9.5 s, so host speed
-  // cannot cause a "stall". Stall recovery has its own test above.
+  // Frames arrive only when the test emits them; the acquisition worker is a
+  // real thread, so waits step the simulated clock until the result appears.
+  // The 10 s stall timeout keeps a slow host from reading as a stall. Stall
+  // recovery has its own test above.
   auto sim = MakeSim(false, true,
                      "device = \"fake\"\nwidth = 160\nheight = 120\n"
                      "frame_timeout_us = 10000000\nexposure_ms = 4\n"
@@ -1400,27 +1399,41 @@ TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
                      "period_us = 1000\n");
   sim.add<LiveTestVision>("rear_right_camera");
   ASSERT_TRUE(AdvanceLiveUntil(sim, [&] { return device->starts == 1; }));
+  // Each frame is stamped 10 ms before now and corrected by up to 10 ms more.
+  // A fast worker starts within a few simulated milliseconds, which made those
+  // stamps negative: CaptureMidpoint then has no valid time, the observation
+  // carries 0 and the wait below could never match. Start from 30 ms.
+  AdvanceLive(sim, 30);
   // No DS, no targets: camera sensing/recovery also runs while disabled and
   // cannot depend on a fresh actuation target.
+  std::uint64_t processed = 0;
   for (auto kind : {TimestampKind::kStartOfExposure, TimestampKind::kEndOfFrame,
                     TimestampKind::kDelivery, TimestampKind::kPresentation}) {
     const auto stamp = sim.now().nanos() - 10000000;
     const auto correction = kind == TimestampKind::kStartOfExposure ? -2000000
                             : kind == TimestampKind::kEndOfFrame    ? 3000000
                                                                     : 10000000;
+    ASSERT_GT(stamp - correction, 0);
     device->Emit(stamp, kind);
-    // `latest` still holds the previous kind's observation until the worker
-    // finishes this frame, so wait for this frame's own timestamp.
-    EXPECT_TRUE(AdvanceLiveUntil(
+    // Wait for this frame's own result: the status that counts it is sent in
+    // the same update as its observation. Matching the timestamp alone could
+    // accept the previous observation, whose corrected time can coincide
+    // (end-of-frame minus 3 ms after a 7 ms wait equals delivery minus 10 ms).
+    ASSERT_TRUE(AdvanceLiveUntil(
         sim,
         [&] {
-          const auto observation =
-              sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
-          return observation &&
-                 observation->sample_time_ns() ==
-                     static_cast<std::uint64_t>(stamp - correction);
+          const auto status =
+              sim.latest<VisionStatus>("/rear_right_camera/status");
+          return status && status->frames_processed_count() == processed + 1;
         },
         9500))
+        << static_cast<int>(kind);
+    ++processed;
+    const auto observation =
+        sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
+    ASSERT_TRUE(observation);
+    EXPECT_EQ(observation->sample_time_ns(),
+              static_cast<std::uint64_t>(stamp - correction))
         << static_cast<int>(kind);
   }
   const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
