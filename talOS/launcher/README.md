@@ -1,19 +1,10 @@
 # Launching a robot
 
-A robot program is a set of processes that have to meet on a set of names. Each
-one is written on its own, builds on its own and runs on its own, and none of
-them can see the others: an RTMS topic is a POSIX shared-memory object addressed
-by exact string, so a publisher on `/drivetrain/target` and a subscriber on
-`/drivetrain/tgt` are both working perfectly. They simply never meet. Nothing in
-either process is in a position to notice, because from the inside there is no
-difference between a topic nobody has published to yet and a topic nobody will
-ever publish to.
-
-The launcher is the one place that can notice. It reads the roster out of
-`robot.toml` and starts every process in it, so for one moment it holds the
-whole graph — and it holds it before any of it exists, which is the only moment
-when refusing to continue is cheap.
-
+The launcher probes configured binaries with `--describe`, lints their declared
+graph, creates session-owned topics, and supervises the roster.
+Architecture and configuration invariants live in
+[ARCHITECTURE.md](../../ARCHITECTURE.md); graph naming rules live in
+[NAMING.md](../NAMING.md).
 ## Two phases
 
 **Phase one asks.** Every binary in the config is run with `--describe`. A node
@@ -44,87 +35,14 @@ as nodes start, restart, or exit; normal shutdown adds final log counts.
 `--describe-only` stops after phase one, which makes the check useful on its own
 — in CI, in a pit before a match, or after a rename that touched two packages.
 
-## Why the description comes from the binary
-
-The obvious alternative is to write the topology in the config file the launcher
-already reads. Each subsystem would list what it publishes and subscribes to,
-and phase one would be a loop over a table instead of eight forks.
-
-That would be a second declaration of the same fact. The topics are already
-declared, in each node's constructor, in the `make_sender` and `watch` calls
-that actually create the endpoints — and a second copy of a fact is a copy to
-forget to update. The failure mode of a stale topology table is precisely the
-failure the check exists to catch: someone renames a topic in one node, the
-table still says the old name, and the launcher confirms a graph that will not
-wire up. A check that is wrong in exactly the situation it was written for is
-worse than no check, because it is trusted.
-
-So the launcher asks the binary, and the binary answers from the constructor
-that builds the real loop. The only difference between the described graph and
-the running graph is which loop the node was handed. When they disagree, it is
-because the node behaves differently in simulation, which is an interesting fact
-about the node rather than a bookkeeping error about a file.
-
-The same reasoning is why identity comes from the binary too. Each node's `main`
-holds its name and its Bazel target in one pair of constants, used by both
-`--describe` and the `Reporter` that publishes into the live registry. The
-declared graph and the running graph therefore cannot disagree about who a node
-is, and a viewer can join one to the other on a name it knows is the same name.
-If the config's roster key and the binary's own name differ, the launcher says
-so — as a warning, since a confusing session is not a broken one.
-
-## What refuses a launch, and what only gets mentioned
-
-The severities come from `naming::LintGraph`, not from here; the launcher's only
-policy is that an error refuses.
-
-An error is something that cannot be right in any configuration: two writers on
-one topic, which makes the dispatch log unreplayable; one topic used with two
-message sizes; a subscriber whose topic nothing publishes; a target lane
-(`/<sub>/target/<source>`) whose source is in no mode of that subsystem's
-target policy, so nothing will ever read it. A warning is a state that is
-normal while a robot is being built, such as a feed nobody has subscribed to
-yet, or a policy lane nobody writes yet (`/drivetrain/target/auto` until
-autonomous exists). The launcher hands the lint every subsystem's policy
-sources from the config (`[robot.targets]` plus each subsystem's `[targets]`).
-
-Two things keep that distinction honest, and both of them matter more than they
-look:
-
-- A node declares endpoint attributes for the ends whose far side is not a node
-  in this session. A `talos::Target` subscribes to its policy lanes optional,
-  because a lane with no producer is normal (the lint still warns about it,
-  once, by name); the hardware bridge marks `/hw/command` external, because the
-  RoboRIO consumes it over UDP and no shared-memory subscriber will ever
-  appear. Without these the report would flag a known design decision as an
-  error on every single launch, and a report that always complains is a report
-  nobody reads — which costs exactly the finding it was built to deliver.
-
-- Timers are described but not linted. A timer is an event source with no far
-  end, and its name is a label like `swerve`, not a path, so measuring it
-  against the topic grammar would call every periodic node malformed.
-
-`--allow-graph-errors` launches anyway. It exists because the right answer in a
-competition queue is not the right answer at a desk: a robot that has to move in
-four minutes cannot be blocked by a linter, and the person launching it can see
-the errors printed above the decision. The default is still refusal, because the
-error being reported is silent at runtime — no log line, no exception, no
-timeout, just a topic with one end.
+`--allow-graph-errors` overrides graph-error refusal. Missing descriptions
+cannot create segments for undeclared topics.
 
 ## When a binary does not answer
 
-A binary that fails `--describe` produces a graph error and prevents launch
-unless `--allow-graph-errors` is supplied. Missing descriptions remain recorded
-per node in `graph.json` and the session manifest; overriding the error cannot
-create segments for undeclared topics.
-
-The probe has a timeout — fifteen seconds by default,
-`--describe-timeout-ms` to change it — after which the probe is killed and
-reported. A node that blocks in its constructor waiting for a device is a bug
-worth seeing, and it must cost the launch seconds rather than the session. The
-default leaves room for a Python node's first run from a freshly deployed
-bundle, when macOS checks each native library a wheel brings (several seconds
-for `robotpy-wpimath`; under one second afterwards).
+A failed critical probe is an error; a failed non-critical probe is a warning.
+`--describe-timeout-ms MS` sets the per-binary deadline. Missing descriptions
+remain recorded in `graph.json` and the session manifest.
 
 ## Controller addressing
 
@@ -139,8 +57,6 @@ controller_port = 5802             # gateway port on the controller
 local_port = 5803                  # bind port on the companion
 ```
 
-All three keys default to the loopback contract (`127.0.0.1:5802`, local
-`5803`), so simulation and loopback tests need no extra configuration.
 
 ```sh
 bazel run //talOS/launcher:launcher -- --config 2026-robot/main_processor/configuration/robot.toml
@@ -153,10 +69,9 @@ resolves the effective endpoint once per launch, prints it
 (`[launcher] Controller <addr>:<port> ...`), and always starts
 `hardware_node` with an explicit `--remote/--remote-port/--local-port` triple.
 Running the bridge standalone resolves identically: its own `--remote` wins,
-otherwise its `--config` supplies the address. No `--sim` on a real robot;
-under `--sim` (or against loopback) the bridge treats the config as
-commissioned, while on hardware the config's `commissioned` flag gates
-commands.
+otherwise its `--config` supplies the address. Simulation requires the loopback
+remote. On hardware, commissioning gates commands; see
+[hardware configuration](../hardware/README.md#configuration).
 
 ## Lightweight simulation gateway
 
@@ -172,12 +87,6 @@ bazel run //talOS/launcher -- \
   --sim-gateway-arg --wheel-radius-error --sim-gateway-arg 0.1
 ```
 
-Without `--physics`, the gateway uses ideal actuators and declares no truth
-sender; with it, the launcher creates `/sim/state` and telemetry observes it.
-The gateway registers its live identity with the session ID like other roster
-members, but heartbeat/stall supervision remains disabled for this process.
-`sim.sh --sim-gateway` supplies `--physics`; its repeatable `--gateway-arg ARG`
-forwards additional settings through the same launcher interface.
 
 ## Studio bridge
 
@@ -193,9 +102,8 @@ http_port = 5800                          # HTTP/WebSocket port
 webroot = "bazel-bin/studio/dist"         # static web directory, relative to the launcher's working directory
 ```
 
-Every key is optional; an absent `[studio]` table leaves these defaults. The
-watched topic is not repeated here: it comes from `[subsystems.telemetry]`
-topic, the same key the telemetry node reads. `--studio-http-port PORT`
+Every key shown is optional. The watched topic comes from `[studio] topic`,
+the same setting the telemetry node reads. `--studio-http-port PORT`
 overrides `[studio] http_port` for one run. Supervision is sim-only: without
 `--sim` the flag has no effect, since a deployed session has no build tree
 serving the webroot and no browser to open. The bridge answers `--describe`
@@ -259,27 +167,16 @@ manifest records each node's `restart_count` and every log in `log_paths`
 `log_dump` on the session directory merges every `*.tlog`, restarts included.
 A node's `exit_code` and `pid` are its last run's.
 
-Heartbeat supervision reads the introspection registry without modifying it.
-Registry heartbeats and stale-slot checks use host monotonic time, unaffected
-by NTP or manual wall-clock corrections.
 `--heartbeat-periods N` defaults to 10 periods, with a minimum timeout of
 500 ms. `--heartbeat-startup-grace-ms MS` defaults to 5000 ms for processes
 that have not registered. Such processes are killed once both that grace and
 the heartbeat timeout have elapsed; registration is required even when
 `--allow-graph-errors` permits a failed description.
 
-Live nodes publish their pid, name and session before calling user constructors,
-with the registry's `kFlagConstructing` lifecycle flag. A bookkeeping thread
-heartbeats this row without touching the partially constructed node. Studio
-readers see it as not yet active, with no endpoints. Construction (including
-waiting for the event loop to start) has a fixed **30-second deadline from
-process spawn**, independent of the startup grace: continued heartbeats cannot
-extend it. Missing construction heartbeats still trigger the normal stall
-timeout after the grace. Once the loop runs, the reporter publishes endpoints,
-clears the flag, and supervision requires both heartbeat and dispatch progress.
-Exceptions during construction are printed to stderr and exit nonzero.
-Construction timeouts and failures enter the ordinary restart/quarantine policy;
-an initializing non-critical camera does not delay control peers.
+Construction is visible in the registry before endpoints are available and has
+a fixed deadline from process spawn. See the
+[registry lifecycle](../introspection/README.md). Construction failures and
+timeouts enter the ordinary restart/quarantine policy.
 `--restart-window-ms MS` overrides the default 60000 ms rolling budget window.
 
 Every spawned child has its own process group; restart, stop and shutdown
@@ -315,25 +212,10 @@ bazel run //talOS/launcher -- \
 bazel run //talOS/launcher:log_dump -- /tmp/pose_estimator_replay/<new-session-id>
 ```
 
-The launcher starts the node's binary with `--sim --replay-inputs <dir>
---log <output_dir>/<node>.tlog --config <config>`, the flag every node binary
-takes (C++ and Python alike: both run `talos::Run`). The node builds as it
-would live, then runs on a simulated loop whose clock starts at the session's
-origin; every message the session logged on a topic it subscribes to arrives
-at its recorded time (`talOS/events/README.md`, "Replaying another session's
-inputs"). It prints what it was fed, from whose log, and the topics it
-subscribes to that nothing recorded. A topic recorded with another schema
-fails before the node runs, naming both types. The node may be one the
-session never ran, or a changed version of one that it did: its new outputs
-are its own log, not compared with anything, and two replays of one session
-write identical records. Replay feeds every input from the session origin,
-including messages the live node missed while initializing at startup, so its
-output can legitimately differ from the live log at the beginning of the run.
-Pass `--session-id <id>` if you need the output files to match in their
-`session_id` header field (otherwise only the random session id and host
-wall-clock start time in the 120-byte file header differ; all records and
-payloads are bit-identical). The output directory must not be the session's,
-whose logs are being read.
+Only the selected node starts; its output is a new log, not a comparison with
+the recorded outputs. The output directory must not be inside the input
+session. See [input replay](../events/README.md#replaying-another-sessions-inputs)
+for timing and schema checks.
 
 ## graph.json
 
@@ -344,9 +226,6 @@ and endpoint attributes, followed by every diagnostic. Studio's bridge serves it
 so a viewer can show the declared graph next to the live one and mark the
 difference.
 
-`uint64` values are written as decimal strings, which is the rule everywhere in
-this repo that emits JSON. A JSON number is a double, so a session id above 2⁵³
-comes back a different number, and an id that changes is not an id.
 
 ## Building
 
@@ -365,8 +244,6 @@ workspace as its working directory; `bazel run` starts a binary in its
 runfiles tree instead, and `main.cc` chases `BUILD_WORKSPACE_DIRECTORY` back so
 both spellings behave the same.
 
-`:launcher_lib` depends on `//talOS/introspection:describe` and `:names` — the
-format and the naming rules.
 
 ## Session segments and logs
 
@@ -378,11 +255,13 @@ atomically at each process lifecycle change; an interrupted session retains its
 last complete manifest (`end_wall_ns = 0` means no normal shutdown).
 
 At startup, retention removes the oldest recognized sessions (directories with
-a `manifest.json`) until `[robot] log_keep_sessions` (default 50, including the
-current session) and `log_max_bytes` (default 2 GiB) are satisfied. Both must be
-positive. The current session, symlinks, and unrelated directories are never
-deleted. The current session can itself grow beyond the budget; retention runs
-on the next launch. Event writers sync approximately once a second and at close.
+a `manifest.json`). `[robot] log_keep_sessions` defaults to 50, including the
+new session; `log_max_bytes` defaults to 2 GiB. Both must be positive.
+Half the byte budget is reserved for the new session's event logs and divided
+among logging members; restarts share their member's remaining budget.
+Older sessions are retained within the other half. Symlinks, unrelated
+directories and the current session are not deleted. Graph/manifest metadata
+and non-event captures are outside the event-writer caps.
 
 Simulation is only permitted with effective remote `127.0.0.1`. `--sim` with a
 different configured or overridden remote is refused before any process starts.
@@ -393,10 +272,10 @@ which creates every declared topic as a session-owned RTMS segment with its
 schema name, schema hash, alignment, and slots. Nodes only attach. When the
 session ends, the launcher destroys its queues and unlinks all session segments.
 
-Recorded logs (`.tlog` format version 6) embed descriptors for each logged topic.
-`log_dump` (`//talOS/launcher:log_dump`) reads these descriptors and decodes
-recorded message payloads into named fields without requiring the original build
-environment.
+`log_dump` reads embedded topic descriptors and decodes recorded payloads
+without the original robot build. Log format details live in
+[events](../events/README.md#log-format) and byte sizes in
+[DATA_FLOW.md](../../docs/DATA_FLOW.md#dispatch-logs).
 
 ### Filtering and exporting logs
 

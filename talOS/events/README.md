@@ -1,29 +1,14 @@
 # Event System
 
-## Purpose
+Periodic and message callbacks share an event loop. The package provides real,
+simulated and recorded-input execution through the same registration API.
+Node-level usage belongs in the
+[node development guide](../../docs/NODE_DEVELOPMENT_GUIDE.md).
 
-Robot logic does not happen in sequence. A motor is read continuously, a command
-is sent occasionally, a sensor fault has to interrupt whatever else was
-happening. Polling every condition burns cycles; the event loop waits instead,
-and runs a callback when something actually happens.
+## Dispatch and replay
 
-There are two kinds of event:
-
-* **Periodic** — a callback every N microseconds. Control loops live here.
-* **Message** — a callback when a topic publishes. Sensor data, setpoints,
-  faults.
-
-Both are dispatched by the same loop, on one thread, in a defined order.
-
-## The real goal: replay
-
-Anything that goes wrong on the field has to be reproducible at the bench. So
-the loop is built so that a recorded run can be replayed *exactly* — same
-handlers, same inputs, same outputs, byte for byte. That is a stronger property
-than logging, and it constrains the whole design.
-
-Replay is perfect only if the handlers are a pure function of what the loop
-gave them. Seven rules make that true:
+Replay requires handlers to derive their behavior from recorded inputs and the
+loop clock:
 
 1. **Single-threaded dispatch.** Callbacks run one at a time on the loop
    thread, never re-entrant. Sources are frozen once `run()` starts.
@@ -42,16 +27,9 @@ gave them. Seven rules make that true:
 6. **Fixed dispatch order.** Expired timers first, ordered by (deadline, id),
    then watched topics in registration order. The id tiebreak matters: two
    timers due in the same iteration must never swap.
-7. **The same code replays.** Robot code is a template on the loop type, so the
-   realtime, simulated and replay loops run identical handlers. There are no
-   virtual functions anywhere in the dispatch path.
-
-Point 7 is also a latency requirement. The loops are CRTP, the recorder is a
-template policy (`NullRecorder` compiles to nothing), the platform backend is
-chosen at compile time, and callbacks are `{object, thunk}` pairs rather than
-`std::function`. The realtime scheduler and background recorder preallocate
-before dispatch begins. User callbacks must manage their own allocation budget;
-simulation and replay are not allocation-free.
+7. **Shared handlers.** The loop implementations use CRTP and callback thunks;
+   a program templated on the loop can register the same handlers for real,
+   simulated and replay execution.
 
 Register and configure sources before starting the loop. A timer change made
 while the loop is running must come from inside a callback: anything else is
@@ -107,38 +85,6 @@ the same options and stamps messages at simulated send time. The node layer
 chooses delivery timing: see `NodeAccess::require_immediate_delivery` in
 `talOS/node/access.h`.
 
-## Writing a handler
-
-```cpp
-template <typename Loop>
-class Arm {
- public:
-  Arm(Loop& loop, float gain) : gain_{gain} {
-    watch<SensorMessage, &Arm::on_sensor>(loop, "/arm/sensor", this);
-    command_ = make_sender<CommandMessage>(loop, "/arm/command");
-    control_ = make_timer<&Arm::on_control>(loop, "control", this);
-  }
-
-  void start(MonotonicTime first_deadline) {
-    control_.setup_periodic(first_deadline, 1ms);
-  }
-
-  std::uint16_t control_id() const { return control_.id(); }
-
- private:
-  void on_sensor(const Context& context, const SensorMessage& message) {
-    position_ = message.position();
-    if (context.dropped > 0) { /* data was lost, not just delayed */ }
-  }
-
-  void on_control(const Context& context) {
-    command_.send(CommandMessage{gain_ * (target_ - position_)});
-  }
-};
-```
-
-Registration order defines the source ids, so keep it stable: reordering these
-lines invalidates existing logs.
 
 ## Recording and replaying
 
@@ -169,10 +115,8 @@ binary's `--replay` (`talOS/node/node.cc`) discards them, exactly as
 `--replay-inputs` does below. Replay is offline either way: it never attaches
 to or writes the shared memory of a robot that may be running on this machine.
 
-Dispatch logs use `.tlog` version 6: 120 B file header, 112 B manifest entries,
-64 B record headers plus stored payloads. The extra publication timestamp is
-required to reproduce ages; older versions are rejected with both version
-numbers in the error. Input replay injects messages at publication, not receipt.
+Log versions and byte sizes are recorded in
+[DATA_FLOW.md](../../docs/DATA_FLOW.md#dispatch-logs).
 
 Note that both snippets set the schedule up the same way. `monotonic_now()`
 before `run()` returns the loop's *origin*, which the realtime loop fixes at
@@ -189,13 +133,6 @@ current time instead, so a harness stepping a simulation sees time where it left
 it. Inside a dispatch it is always the frozen recorded `now`, which is the only
 form handlers ever see.
 
-One consequence worth knowing: the realtime loop's origin is the moment the loop
-object is constructed, so a first deadline of `monotonic_now() + 1ms` is one
-millisecond after *construction*, not after `run()`. If setup between the two
-takes longer than that, the first cycle is already late and fires once with a
-cycle count instead of bursting. That is deterministic and it replays, but if
-you want the first tick to land a period after the run begins, either construct
-the loop last or arm the timer inside the first dispatch.
 
 During callbacks, `ARM_TIMER` and `DISARM_TIMER` records validate scheduling
 calls and `HANDLER_EXIT` validates explicit shutdown. An early shutdown stops
@@ -238,15 +175,10 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   both types and who recorded it. Watched topics no log recorded are listed in
   `InputReplayReport::unrecorded`; nothing arrives on them.
 
-The loop is simulated and its inputs come from a file, so two replays of one
-session produce identical records. Replay feeds every input from the session
-origin (monotonic t = 0), including any messages the live node missed during
-process startup or native module imports, so replayed output can legitimately
-differ from the live log at the beginning of the run. To make the output
-`.tlog` files byte-identical in their headers across runs, pass an explicit
-`--session-id <id>` (otherwise only the generated `session_id` and the
-informational wall-clock `start_wall_ns` in `FileHeader` differ, with all
-records, schemas, and payloads 100% bit-identical).
+Replay feeds inputs from the session origin, including messages a live node
+missed during startup; its output may differ from the live log at the beginning.
+Pass an explicit `--session-id` to keep that header field stable. The log's
+wall-clock start timestamp remains informational.
 
 Node binaries expose this as
 `--replay-inputs <session dir>` (`talOS/node/node.cc`, Python nodes included
@@ -261,18 +193,14 @@ run must not write into a live robot's shared memory.
 append-only, with a CRC on the manifest and schema blocks, and on every record.
 The schema block carries each manifest entry's topic schema
 (`talOS/schema/identity.h`): its name and embedded `.bfbs` reflection schema
-bytes. A record is a 64-byte header plus its payload up to the last non-zero
-byte: fixed-size messages are mostly trailing zero padding, so the header keeps
-the payload's full size and the reader zero-fills it back, handing out exactly
-the bytes that were recorded. A log that ends mid-record is not corruption:
-everything before the cut still replays, which matters when a robot loses
-power. A record whose checksum is wrong *is* corruption and is refused.
+bytes. Stored payloads omit trailing zero bytes; readers restore the declared
+payload size with zero padding. Complete records before a truncated final
+record remain readable; checksum failures are rejected.
 
 Format details live in `log/format.h`. The version field is checked on read;
 readers reject a version they do not know rather than guessing.
-The current format is version 6, which adds each message's writer publication
-time to the schema identities introduced in version 5. Other versions are
-refused with both recorded and supported versions in the error.
+Readers reject unsupported versions with both recorded and supported versions
+in the error.
 Records are copied into preallocated chunks and handed to a background thread
 through an atomic ring. Dispatch does not lock, wait for disk, or resize buffers.
 The writer checks for new chunks every millisecond. If the pool is exhausted,
@@ -284,8 +212,7 @@ Capture never resumes, because resuming would put a hole in the middle of the
 log and replay would skip it without saying so. **Treat `failed()` as a robot
 fault**, next to a brownout or a lost CAN device: it means the rest of the match
 is not replayable. `error()` says why, and `capture_stopped()` distinguishes
-"the loop outran the writer" from a disk error. `//2026-robot/main_processor/drivetrain:node` exits
-non-zero and prints the reason; do the same in any process you add.
+"the loop outran the writer" from a disk error.
 
 `start()` sizes every chunk for the manifest's largest payload. A record larger
 than that capacity also stops capture without allocating. Header writing at
@@ -299,18 +226,14 @@ A handler can react to its own lateness straight from its context:
 timer means periods were missed, and `context.dropped > 0` on a message means
 data was lost rather than merely delayed. Treat both as faults.
 
-Message latency is bounded by the drain tick: worst case one tick, mean half a
-tick. Shorten the tick to trade CPU for message latency.
+The poll tick controls drain frequency under `Delivery::POLL`, not a hard
+end-to-end latency bound: callback execution and host scheduling can delay it.
 
 Each source also keeps lock-free `SourceCounters` (events, drops, last
 sequence, last and max latency) that the introspection reporter publishes
 while the loop runs.
 
-## Message rules
-
-Messages are flatbuffer **structs**, never tables: a slot has to have a size
-known at compile time, and replay has to compare payloads byte for byte.
-`LoopMessage` enforces this.
+Message conventions live in [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 ## Overflow
 

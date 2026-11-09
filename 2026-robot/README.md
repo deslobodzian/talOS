@@ -12,22 +12,22 @@
 | `drivetrain` | C++ | swerve kinematics and module control | `/drivetrain/target/teleop`, `/drivetrain/target/auto` | `/drivetrain/state` |
 | `shooter` | C++ | flywheel to target speed, beam break | `/shooter/target/teleop`, `/shooter/target/auto` | `/shooter/state` |
 | `intake` | Python | roller, beam break and shooter-ready feed permit | `/intake/target/teleop`, `/intake/target/auto`, `/shooter/state` | `/intake/state` |
-| `driver` | C++ | joystick 0 sticks to drivetrain teleop target lane (deadband, field-oriented) | `/hw/state/driver_station`, `/drivetrain/state` | `/drivetrain/target/teleop` |
-| `autonomous` | C++ | preload spinup/feed, alliance-relative waypoint and collection | `/hw/state/driver_station`, `/pose_estimator/state`, `/shooter/state`, `/intake/state` | `/drivetrain/target/auto`, `/shooter/target/auto`, `/intake/target/auto` |
+| `driver` | C++ | joystick 0 sticks to drivetrain teleop target lane (deadband, gyro-relative driver frame) | `/hw/state/driver_station`, `/drivetrain/state` | `/drivetrain/target/teleop` |
+| `autonomous` | C++ | preload spinup/feed, alliance-relative waypoint and collection | `/hw/state/driver_station`, `/pose_estimator/state`, `/shooter/state`, `/intake/state` | `/drivetrain/target/auto`, `/shooter/target/auto`, `/intake/target/auto`, `/autonomous/state` |
 | `teleop` (`//talOS/teleop:node`) | C++ | framework teleop node; maps joystick buttons and axes declared in `[[teleop.bindings]]` to mechanism target lanes | `/hw/state/driver_station` | `/shooter/target/teleop`, `/intake/target/teleop` |
 | `pose_estimator` | Python | field pose from swerve odometry and camera observations; backend `kalman` (wpimath) or `factor_graph` (GTSAM); runs while disabled | `/drivetrain/state`, `/<camera>/state` per `cameras` | `/pose_estimator/state` |
-| `front_left_camera`, `front_right_camera`, `rear_left_camera`, `rear_right_camera` | C++ | independent AprilTag localization at 20 Hz; shared vision implementation; runs while disabled | `/drivetrain/state` (optional simulated truth) | `/<camera>/state`, `/<camera>/status` |
+| `front_left_camera`, `front_right_camera`, `rear_left_camera`, `rear_right_camera` | C++ | independent AprilTag localization; capture rate from `camera.fps`, node/status tick from `period_us`; shared vision implementation; runs while disabled | `/sim/state` (optional, under `--sim`) | `/<camera>/state`, `/<camera>/status` |
 | `telemetry` (`//talOS/telemetry:node`) | C++ | framework telemetry node; Studio frames; the pose from `[studio] pose_topic` | the state and status topics, `/hw/state/driver_station`, `/hw/status` | `/talos/telemetry` |
-| `hardware_node` (`//talOS/bridge`) | C++ | UDP courier to the RoboRIO | `/hw/request/<node>` | `/hw/state`, `/hw/status` |
+| `hardware_node` (`//talOS/bridge:hardware_node`) | C++ | UDP courier to the RoboRIO | `/hw/request/<node>` | `/hw/state`, `/hw/state/driver_station`, `/hw/status`, `/hw/command` |
 
 Simulation stands in for the RoboRIO with `main_processor/simulation:sim_gateway`.
 
-Camera calibration is in `configuration/subsystems/<name>_camera.toml`, layered
-over shared defaults in `subsystems/vision.toml`. The field layout is embedded
+Camera calibration is in `main_processor/configuration/subsystems/<name>_camera.toml`,
+layered over shared defaults in `subsystems/vision.toml`. The field layout is embedded
 into each node binary, so deployed bundles require no vision runfiles.
 Only `--sim` enables synthetic images (`rasterize = true`) or fast projection
-(`rasterize = false`). Simulated ground truth integrates measured drivetrain
-motion, never estimator output. Without `--sim`, cameras capture real images
+(`rasterize = false`). Simulated ground truth comes from `/sim/state`,
+published by `sim_gateway --physics`, never estimator output. Without `--sim`, cameras capture real images
 on a bounded worker thread; unavailable devices report unhealthy status rather
 than synthetic observations. Describing the graph never opens cameras.
 
@@ -72,19 +72,15 @@ or link loss.
 
 ## Config
 
-`main_processor/configuration/robot.toml` is the manifest (`[robot]`,
-`[robot.targets]`, `[studio]`, and a `[[subsystems]]` list); each subsystem's devices and
-parameters are in `subsystems/<name>.toml`. `[robot.targets]` is the target
-policy: which lanes (`/<sub>/target/<source>`) each match mode reads, in
-priority order; each subsystem's `talos::Target` follows the first fresh,
-active one, and nothing while the Driver Station is disabled, e-stopped or
-silent. `config_golden_test` pins them.
+`main_processor/configuration/robot.toml` is the robot manifest.
+See [Configuration](../ARCHITECTURE.md#configuration) and
+[Targets](../ARCHITECTURE.md#targets) for the shared format and target policy.
 Devices are referred to by name; ids are assigned by sorting
 (subsystem, device).
 
 The deployable `//2026-robot/main_processor:robot_bundle` instead uses
 `main_processor/configuration/robot_field.toml`: it includes `robot.toml`
-and overrides only the controller address to the RoboRIO's `10.56.87.2`.
+and selects the RoboRIO address `10.56.87.2`.
 Simulation and tests retain `robot.toml`'s loopback address. For a different
 controller, launch the bundle with `./run.sh --remote <ip>`; see deployment
 instructions below.
@@ -106,11 +102,7 @@ Logs land in `/tmp/talos_logs/<session-id>/`. Deploying:
 
 ## Add a subsystem
 
-Follow [examples/superstructure/README.md](../examples/superstructure/README.md):
-messages and their `topics` with `talos_messages`, a class built with `talos_cc_node`
-or `talos_py_node` in `main_processor/<name>/`, then a `[[subsystems]]` entry in
-`robot.toml` and `subsystems/<name>.toml` with
-`node = "//2026-robot/main_processor/<name>:node"`, and the node in
-`main_processor/BUILD`'s `robot_bundle`. If it takes teleop or auto targets,
-read them with `talos::Target` / `talos.Target` and have each producer write
-its own `talos::TargetLane` (`/<name>/target/<source>`).
+Follow [examples/superstructure/README.md](../examples/superstructure/README.md)
+and [Where a new thing goes](../ARCHITECTURE.md#where-a-new-thing-goes).
+The bundle reads generated `NODES` and `CONFIG_FILES`; do not add each
+subsystem to `main_processor/BUILD` by hand.

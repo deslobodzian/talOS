@@ -3,7 +3,8 @@
 FlatBuffers schema identity, unit linting, and reflection decoding.
 
 - **Descriptors:** `talos_messages` emits a binary reflection schema (`.bfbs`)
-  per `.fbs` file, verifies unit suffixes on numeric fields (METHODOLOGY §6),
+  per `.fbs` file, verifies numeric field unit suffixes
+  ([methodology](../../docs/METHODOLOGY.md)),
   and generates `talos::Descriptor<M>` (`kName`, `kHash`, `kBfbs`;
   `descriptor.h`) and `TALOS_SCHEMA_NAME`/`HASH`/`BFBS` Python attributes.
 - **Identity:** `schema::Identity` (`identity.h`) bundles schema name, 64-bit

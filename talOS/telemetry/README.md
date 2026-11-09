@@ -2,8 +2,8 @@
 
 The Studio telemetry feed: one framework node (`//talOS/telemetry:node`)
 observes state and status topics in the declared graph and publishes
-size-prefixed FlatBuffer `Frame`s on the `/talos/telemetry` byte topic
-(configured via `[studio] topic`); the Studio bridge (`//studio/bridge`)
+size-prefixed FlatBuffer `Frame`s on the byte topic configured by `[studio] topic`
+(default `/talos/telemetry`); the Studio bridge (`//studio/bridge`)
 forwards them to browsers and agents. This package owns the framework node,
 `telemetry.fbs` (the frame schema), and `wire.h` (slot geometry and header validation).
 
@@ -39,44 +39,23 @@ carries the `intake::Inhibit` names). Out-of-range values have no label.
 
 ## Dictionary protocol
 
-The framework node builds its dictionary **once at construction** from the
-graph descriptors (all SENDER topics with role `state` or `status` matching
-include/exclude globs, plus Driver Station and `pose/valid`), and never
-changes it afterwards. It sends the dictionary:
-
-- on the **first** frame of the stream,
-- on **every 100th** frame after it (sequence 100, 200, ...),
-- **never otherwise**.
+The framework node builds its dictionary once at construction from reflected
+SENDER topics with role `state` or `status` matching include/exclude globs,
+the matching Driver Station topic, and `pose/valid`. Schema-less topics other
+than Driver Station contribute no channels. Dictionary frames repeat as
+specified in [DATA_FLOW.md](../../docs/DATA_FLOW.md).
 
 Consumers cache the latest dictionary keyed by `(stream_id, dictionary_id)`.
 A value-only frame is usable only when its `dictionary_id` matches the cached
 dictionary for its `stream_id`; until then the consumer waits (the bridge
-answers `503` on `/telemetry.json`). Because the dictionary repeats every 100
-frames (once per second at 100 Hz), a consumer that joins mid-stream or loses
-a dictionary frame recovers within a second, and a producer restart (new
-`stream_id`) re-sends one immediately.
+answers `503` on `/telemetry.json`).
 
-## Size and rate budget
+## Transport budget
 
-Value-only frames are capped at `kMaxValueFrameBytes = 1200` bytes **including
-the 4-byte prefix**, enforced by the producer at construction: it builds a
-worst-case all-channels-present frame with all scalar metadata fields serialized,
-measures it, and throws rather than start if the frame would exceed the cap.
-
-- One frame fits a 1500-byte MTU Ethernet frame with IPv4/TCP and WebSocket
-  framing overhead to spare, so a frame is never fragmented across packets.
-- At the 100 Hz telemetry rate: `1200 B x 8 bit/B x 100 /s = 0.96 Mbit/s` per
-  connected client — under 25% of the 4 Mbit/s FRC on-field radio floor that
-  rule R704 budgets around.
-- Dictionary frames are larger (they carry every name, unit and label) but
-  bounded by the 16384-byte slot, and at one frame per second their amortised
-  cost is negligible next to the value stream.
-- The topic ring is 64 slots x 16384 B, so the bridge can lag over half a
-  second at 100 Hz before DROP_NEWEST starts shedding the newest frames.
-
-If the channel count grows enough to threaten the 1200-byte cap, the
-construction-time check fails loudly at startup instead of the feed silently
-blowing the radio budget on the field.
+Frame caps, shared-memory geometry, dictionary cadence and configured rates
+live in [DATA_FLOW.md](../../docs/DATA_FLOW.md). Construction measures both
+worst-case value frames and dictionary frames and throws if either exceeds its
+budget. A WebSocket message boundary does not guarantee a TCP/IP packet boundary.
 
 ## Automatic channels and units
 
@@ -99,8 +78,7 @@ Channels are discovered automatically from the graph descriptors:
    from every camera without hiding its other status fields. Automatic
    channels such as `pose/valid` can also be excluded. Only retained channels
    contribute to the dictionary, values vector and construction-time budget.
-5. **Pose extraction**: When `[studio] pose_topic` is set, telemetry extracts
-   `x_m`, `y_m`, and `yaw_rad` from the `geometry.Pose2d` struct inside that topic via
-   reflection and sets `chassis`. When stale, `pose/valid` is 0 and chassis is 0.
-6. **Budget enforcement**: The 1200-byte worst-case frame budget is verified at
-   construction. If exceeded, construction throws naming the largest topics.
+5. **Pose extraction**: `[studio] pose_topic` selects a topic containing a
+   `geometry.Pose2d` struct. Telemetry extracts `x_m`, `y_m`, and `yaw_rad` via
+   reflection. Missing, stale, invalid or nonfinite pose data makes `pose/valid`
+   and `chassis` zero.

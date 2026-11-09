@@ -9,14 +9,10 @@ rates, exact payload/slot sizes, config chunking, and the current robot budget.
 
 ## Frames
 
-All traffic is UDP: the gateway listens on port 5802 and the companion on
-5803. Every datagram is one frame: a fixed 40 byte header
-(`kFrameHeaderSize`) followed by an optional payload of up to
-`kMaxPayloadSize` bytes, which is 1432: a 1472-byte frame fits inside the 1472
-bytes a 1500-byte Ethernet MTU leaves after the IPv4 and UDP headers, and
-`frame.h` has a static assertion to that effect. Multi-byte header fields are
-encoded little-endian explicitly by `EncodeFrame`; the C++ struct layout is not
-the wire layout.
+Each UDP datagram contains one frame. `EncodeFrame` explicitly encodes
+multi-byte header fields little-endian; native C++ layout is not the wire
+layout. Ports, protocol version, header and payload sizes are recorded in the
+[data-flow reference](../../docs/DATA_FLOW.md#udp-frame-and-payload-sizes).
 
 | `FrameType` | Value | Direction | Payload |
 |---|---|---|---|
@@ -28,8 +24,8 @@ the wire layout.
 | `kClockProbe` | 25 | companion → gateway | empty; header send time echoed in a subsequent State |
 
 Payload codecs live with the payload owners; this package only frames bytes.
-Version 3 adds the State clock-probe echo; older peers are rejected before
-decoding. The probe does not authorize actuation and works while disabled.
+The frame decoder rejects incompatible protocol versions before payload
+decoding. Clock probes do not authorize actuation and work while disabled.
 
 ## Low-Latency UDP API
 

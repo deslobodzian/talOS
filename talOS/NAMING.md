@@ -25,19 +25,18 @@ doubled or trailing `_`.
   | `request` | anyone but the owner | actuator instruction awaiting resolution |
   | `command` | anyone but the owner | actuator instruction, already resolved |
 
-- **qualifier**: the source or variant, e.g. `teleop`, `auto`. A target's
-  qualifier is the producer's lane: `/<sub>/target/<source>` carries a
-  `talos::TargetEnvelope` and is written by one `talos::TargetLane`. Sources
-  in `[robot.targets]` and `[targets]` follow the segment rules.
+- **qualifier**: the source or variant, e.g. `teleop`, `auto`. Target sources
+  in `[robot.targets]` and `[targets]` follow the segment rules; see
+  [target lanes](../ARCHITECTURE.md#targets).
 
 Abbreviations are rejected (`tgt`, `cmd`, `req`, `ds`, `dt`, `drive`, `odom`,
 `pos`, `vel`, …; use the full word), and so are direction suffixes (`_in`,
 `_out`, `_pub`, `_sub`, `_tx`, `_rx`, `_topic`, `_send`, `_recv`).
 
 The graph lint also rejects two writers on one topic, more than eight declared
-readers per topic (including observers), a read topic nobody writes (unless the
-subscription is `optional`), one topic used with two
-message sizes, and a target lane whose source is in no mode of that
+readers per topic (including observers), a read topic nobody writes (unless an
+endpoint declares it `optional` or `external`), conflicting schemas, message
+sizes or ring layouts, and a target lane whose source is in no mode of that
 subsystem's target policy. A topic nobody reads, a policy lane nobody writes
 yet, or a topic whose owner is not a node in the session, is a warning.
 
@@ -52,7 +51,7 @@ A node name follows the segment rules, is not a reserved owner, and is the
 the log file stem and the registry row. The node's Bazel label must match the
 name in its package leaf, its repository (at a repository root), or its rule:
 `//2026-robot/main_processor/shooter:node`, `@wrist//:node`,
-`//examples/superstructure/cpp:wrist`.
+`//examples/superstructure/cpp:elevator`.
 
 Message types are PascalCase in the package's FlatBuffers namespace
 (`shooter::ShooterTarget`); fields are `snake_case` with the unit in the name

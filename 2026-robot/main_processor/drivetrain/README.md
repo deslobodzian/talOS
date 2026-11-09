@@ -15,9 +15,7 @@ It selects the shorter steering path, cosine-scales drive speed by azimuth
 error, and desaturates wheel speeds. At zero requested speed it
 holds the measured steering angle. Drive requests
 use TalonFX velocity control; steering uses position control with continuous
-wrapping. The hardware API also supports Motion Magic when a subsystem needs
-profiled positions. This is not yet a trajectory follower or field-relative
-controller; pose estimation and vision run as separate nodes.
+wrapping. Pose estimation and vision run as separate nodes.
 
 Optional `[subsystem]` parameters `max_linear_accel_mps2` and
 `max_angular_accel_radps2` limit commanded chassis acceleration before
@@ -58,9 +56,7 @@ the hardware says:
   Coincident or ill-conditioned subsets are not driven or solved. With fewer
   than two modules every motor is neutral. This minimum assumes a failed module
   can passively roll; a mechanically jammed wheel still requires
-  the driver to stop. No extra live-mask/count channels are added: the telemetry
-  stream has a hard 1200-byte value-frame limit, and hardware health already
-  identifies missing devices.
+  the driver to stop. Hardware health identifies missing devices.
 - `modules_valid` requires all four complete modules and usable acquisition
   times for each drive position, drive velocity and steer position.
   Partial odometry is deliberately not offered to four-module consumers;
@@ -100,64 +96,32 @@ the hardware says:
   span more than 20 ms, modules take priority and yaw is rejected.
   The timestamp is the oldest time contributing to either valid product
   (modules or yaw), or 0 when neither is valid. No negative time is cast to
-  the unsigned message timestamp. Before clock convergence (8 hardware
-  states) or with stale hardware, neither product is valid.
+  the unsigned message timestamp. Before clock convergence or with stale
+  hardware, neither product is valid.
   Timing rejection does **not** alter connectivity-based degraded driving,
   target freshness or enable gating. Rejected module times stop heading
   integration; ideal simulation still accumulates an untrusted heading
-  during initial clock convergence, as before.
+  during initial clock convergence.
 
 ## Local Topics
 
-Names follow `talOS/NAMING.md`, which is normative for their grammar and for
-which end of a topic is allowed to publish it.
+Topic and target-lane conventions are defined in
+[NAMING](../../../talOS/NAMING.md) and
+[ARCHITECTURE](../../../ARCHITECTURE.md). This node consumes
+`ChassisTarget` targets and publishes `/drivetrain/state`.
+Chassis units are meters/second and radians/second; axes are forward X,
+left Y, CCW yaw.
 
-| Topic | Single publisher | Payload |
-|---|---|---|
-| `/drivetrain/target/<source>` | that source's producer (`teleop`: `driver`) | `talos::TargetEnvelope<ChassisTarget>` (mode generation + `active` + `ChassisTarget`) |
-| `/hw/state` | Hardware bridge | Canonical hardware state in fixed `Packet` |
-| `/hw/request/drivetrain` | Drivetrain | Partial command, this subsystem's devices only, in fixed `Packet` |
-| `/hw/command` | Hardware bridge | Canonical hardware command in fixed `Packet` |
-
-Each producer writes its own lane: `driver` publishes
-`/drivetrain/target/teleop`, an auto routine `/drivetrain/target/auto`. The
-node reads them through `talos::Target`, which follows the lane the robot's
-`[robot.targets]` policy names for the current Driver Station mode (nothing
-while the Driver Station is disabled, e-stopped or silent).
-
-The driver applies a circular stick deadband and caps translation radially.
-With a fresh heading, field-oriented translation is driver-relative: gyro zero
-at boot is away from this driver, with no alliance flip. Joystick 0's
-`rezero_button_id` (1-based, default 1; non-positive disables) latches the current
-fresh heading as driver-forward on its rising edge. Heading loss stops
-translation until the translation sticks are centred, then re-arms robot-relative
-drive. It stays robot-relative until heading is fresh **and** translation sticks
-are centred again; rotation remains available throughout. Frame transitions are
-logged by the driver. `heading_hold_radps` sets angular
-correction per radian of wrapped heading error (configured to 4.0, compiled
-default 0.0); manual rotation resets the held heading, and stale headings or
-disabled/disconnected Driver Station state cancel hold.
-
-Chassis units are meters/second and radians/second. Axes are forward X, left Y,
-CCW yaw. A released lane (`active = 0`), a lane older than the robot's
-`command_timeout_us` (by receive time), stale/invalid/disabled hardware state,
-or any module motor missing from the state produce neutral requests. Messages
-are bounded and go through the event loop recorder.
-
-The bridge merges each subsystem's request into the one whole-robot command,
-stamping it with the epoch and observed time from the last state the controller
-processor reported, so a command can never claim to answer a sample nobody saw.
-It never refreshes a lease on a subsystem's behalf: a request that stops
-arriving neutralizes that subsystem's devices and nothing else's. Another local
-process, such as drive estimation, can subscribe to the state topic. A separate
-remote observer service is not part of this change.
+See [DATA_FLOW](../../../docs/DATA_FLOW.md) for the hardware bridge and
+transport contracts.
 
 ## Run the Simulation
 
 Build and run the automated loopback-only integration test:
 
 ```sh
-bazel build //2026-robot/main_processor/drivetrain:all
+bazel build //2026-robot/main_processor/drivetrain:all \
+  //2026-robot/main_processor/simulation:sim_gateway //talOS/bridge:hardware_node
 python3 tools/test_drivetrain.py
 ```
 
@@ -177,47 +141,29 @@ python3 tools/test_drivetrain.py --wpilib
 
 This swaps `sim_gateway` for `./gradlew simulateNative` in `2026-robot/controller_processor/rio/` and
 makes the same assertions, because both run the same
-`talos::hardware::Gateway`. It also runs a second scenario the stand-in cannot:
+`talos::hardware::Gateway`. The harness also runs a second WPILib scenario:
 with the Driver Station never enabled, the drivetrain must not move at all.
-`sim_gateway` hardcodes enable, so it cannot tell a working safety gate from a
-missing one.
+The standalone gateway also supports disabled operation through
+`--mode-schedule`; see [simulation](../simulation/README.md).
 
-A headless run has no Driver Station and no GUI to click, so for automation the
-desktop build can stand in for one. It is off unless `TALOS_SIM_DS` is set:
-
-| Variable | Effect |
-|---|---|
-| `TALOS_SIM_DS=1` | enable in Teleoperated at startup |
-| `TALOS_SIM_DS=0` | attach a Driver Station but stay disabled |
-| `TALOS_SIM_DS_DISABLE_AFTER_MS=N` | ... then disable N ms in |
-| `TALOS_SIM_RUN_MS=N` | stop after N ms and print a summary line |
-
-None of this exists in the RoboRIO build: there the enable state comes from the
-real Driver Station and nothing in the program can forge it.
 
 ### Interactive
 
 Start each command in a separate terminal:
 
 ```sh
-bazel run //2026-robot/main_processor/simulation:sim_gateway    # or, in 2026-robot/controller_processor/rio/: ./gradlew simulateNative
-bazel run //talOS/bridge:hardware_node
-bazel run //2026-robot/main_processor/drivetrain:node -- --sim --log /tmp/drivetrain.tlog
+bazel run //2026-robot/main_processor/simulation:sim_gateway -- --config "$PWD/2026-robot/main_processor/configuration/robot.toml"
+bazel run //talOS/bridge:hardware_node -- --config "$PWD/2026-robot/main_processor/configuration/robot.toml"
+bazel run //2026-robot/main_processor/drivetrain:node -- --config "$PWD/2026-robot/main_processor/configuration/robot.toml" --sim --log /tmp/drivetrain.tlog
 bazel run //2026-robot/main_processor/drivetrain:send_target -- 1 0 0 2
 ```
 
 `send_target` is a sim/bench tool only: it writes a drivetrain lane
-(`--source NAME`, default `teleop`) directly, bypassing the operator
-interface, so the drivetrain follows it only while enabled in a Driver Station
-mode whose policy selects that source (Teleoperated for `teleop`). Like a
-`TargetLane`, it stamps each envelope with the mode generation of the newest
-`/hw/state/driver_station` packet, so it cannot drive an enable or mode it did
-not see; without Driver Station packets (the sim gateway sends none) it
-stamps 0 and the drivetrain stays neutral. On a robot, drive through the
-operator interface.
-
-Wait for the gateway to print `hardware gateway config=...` before starting the
-bridge; that line means its socket is open.
+(`--source NAME`, default `teleop`) directly. Its envelopes use the mode
+generation from the newest `/hw/state/driver_station` packet; without those
+packets it stamps 0 and the drivetrain stays neutral. The standalone gateway
+publishes Driver Station packets. On a robot, drive through the operator
+interface.
 
 ### Watching it work
 
@@ -230,33 +176,6 @@ safe to start and stop at any time, against a simulation or a real robot:
 bazel run //2026-robot/main_processor/drivetrain:monitor
 ```
 
-```text
-gateway   configured yes   enabled yes   commanding yes   fault  no
-          epoch 2   age 0 ms   199 Hz   seq 568
-
-target    teleop lane   vx   1.00 m/s   vy   0.00 m/s   omega   0.00 rad/s   active yes   age 0 ms
-
-command   age 0 ms   201 Hz   seq 567
-
-module          steer cmd   steer now     drive cmd     drive now   travelled
-                      rot         rot         rot/s         rot/s         rot
-front_left         0.0000      0.0000        3.1330        3.1330        4.09
-front_right        0.0000      0.0000        3.1330        3.1330        4.09
-back_left          0.0000      0.0000        3.1330        3.1330        4.09
-back_right         0.0000      0.0000        3.1330        3.1330        4.09
-```
-
-Read it top down. `enabled` is the Driver Station; until it says yes the gateway
-refuses everything and the drive columns stay `-`. `commanding` means a command
-lease is live. The Hz figures come from the publishers' sequence numbers rather
-than from how often the monitor polled, so they are the real link rates: a
-gateway that has stopped shows a rising `age` while the rate falls. `drive cmd`
-is what the node asked for and `drive now` is what the robot reports, so the two
-agreeing is the end-to-end proof. A dash means neutral, which is not the same as
-a commanded zero.
-
-The number to sanity-check by hand: 1 m/s through a 0.0508 m wheel is
-1 / (2π × 0.0508) = 3.133 rot/s, which is what `drive cmd` reads above.
 
 With `./gradlew simulateNative` as the gateway, the simulation GUI opens and the
 robot starts **disabled**, like any other WPILib robot. Enable it in the *Robot
@@ -266,14 +185,14 @@ back to Disabled neutralizes them again immediately. That gate is the real
 thing, not a simulation detail: it is the same check that runs on the robot.
 
 The last command requests forward motion at 1 m/s for two seconds, then
-releases its lane. The fake provides ideal actuator responses, not tire or
-motor physics. Gateway, bridge, and node run until Ctrl-C; `--duration-s N`
-provides bounded runs for tests.
+releases its lane. The default gateway uses ideal actuator responses;
+`--physics` selects motor/mechanism physics. Gateway, bridge, and node run
+until Ctrl-C; `--duration-s N` provides bounded runs.
 
 Replay after stopping the node:
 
 ```sh
-bazel run //2026-robot/main_processor/drivetrain:node -- --sim --replay /tmp/drivetrain.tlog
+bazel run //2026-robot/main_processor/drivetrain:node -- --config "$PWD/2026-robot/main_processor/configuration/robot.toml" --sim --replay /tmp/drivetrain.tlog
 ```
 
 Replay does not open hardware or shared-memory transports. It verifies the
@@ -281,16 +200,7 @@ same handler outputs against the recorded network inputs and chassis targets.
 
 ## Connect to RoboRIO
 
-Configure and build the shared hardware manifest first, following
-`talOS/hardware/README.md`. Run the companion bridge against the RoboRIO's
-address and start the node without `--sim`:
-
-```sh
-bazel run //talOS/bridge:hardware_node -- --remote 10.56.87.2
-bazel run //2026-robot/main_processor/drivetrain:node -- --log /tmp/drivetrain.tlog
-```
-
-The companion bridge pushes the parsed hardware configuration to the gateway
-over UDP (`talOS/hardware/README.md`). The supplied addresses, geometry, offsets and gains are
-examples. A successful build and simulated replay do not validate physical
-inversion, steering alignment, gearing, PID tuning, or CAN timing.
+Follow [hardware configuration](../../../talOS/hardware/README.md) and
+the [bring-up procedure](../../../docs/BRINGUP.md).
+A successful build and simulated replay do not validate physical inversion,
+steering alignment, gearing, PID tuning, or CAN timing.

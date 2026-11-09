@@ -16,10 +16,9 @@ capture rate, and simulation renderer selection.
 The official 2026 welded layout is embedded in the binary;
 installed bundles need no vision runfiles. Mounts map OpenCV optical coordinates
 to robot NWU using `Rz(yaw) Ry(pitch) Rx(roll)`. Positive pitch points a forward
-lens downward, preserving the previous calibration convention. The checked-in
-mounts are season-plausible defaults, not measured calibration.
+lens downward. Calibrate the mounts for the deployed robot.
 
-Shared detector and scheduling defaults (overridable per camera):
+Shared configuration defaults and code fallbacks (overridable per camera):
 
 | Key | Default | Units and meaning |
 | --- | --- | --- |
@@ -29,9 +28,9 @@ Shared detector and scheduling defaults (overridable per camera):
 | `camera.sim_timestamp_lag_us` | `0` | Sim only: stamp the rendered truth instant this many microseconds later, modeling a timestamp taken after exposure. Ignored live, but validated in both modes. |
 | `camera.readout_us` | `0` | Known sensor readout duration subtracted from live EOF timestamps (unknown readout is zero). |
 | `camera.frame_timeout_us` | `500000` | Live silence deadline; positive, at most 10,000,000 µs. Reopens a connected but silent camera on the worker. |
-| `camera.exposure_ms` | `0` | Manual exposure duration; zero leaves duration unspecified. Also controls simulated exposure blur. |
+| `camera.exposure_ms` | `5.0` | Shared manual exposure duration; also controls simulated exposure blur. Zero leaves duration unspecified. |
 | `camera.gain` | `0` | Backend-native manual gain; zero leaves gain unspecified. |
-| `camera.auto_exposure`, `camera.auto_gain` | `true` when duration/gain is zero | Live automatic-control selection. A positive manual value defaults its automatic mode to false. |
+| `camera.auto_exposure`, `camera.auto_gain` | `false`, `true` | Fallbacks are true only when duration/gain is zero; the shared exposure is positive and gain is zero. |
 | `camera.mount_angle_std_rad` | `0.0175` | Extrinsic mount-rotation calibration uncertainty in radians (≈1 deg), live **and** sim, not sim-only. Added to the published covariance: field x/y variance gains `(range × value)²`, yaw variance gains `value²`. |
 | `camera.mount_translation_std_m` | `0.01` | Extrinsic mount-translation calibration uncertainty in metres, live **and** sim, not sim-only. Added to the published field x/y variance. |
 | `detector.decimate` | `2.0` | Dimensionless quad-search downsampling factor; 2.0 searches at half resolution, then refines edges at full resolution. |
@@ -40,6 +39,7 @@ Shared detector and scheduling defaults (overridable per camera):
 | `detector.refine_edges` | `true` | Refine detected quad edges before decoding. |
 | `detector.hamming_threshold` | `1` | Maximum corrected tag-code bits (inclusive), passed to the decoder and checked for validity. |
 | `detector.min_decision_margin` | `30.0` | Minimum AprilTag decode-margin score (inclusive), measuring image-intensity contrast, not a probability or pose error. |
+| `subsystem.backend` | `"auto"` | Use Metal when available and supported, otherwise CPU. `"cpu"` forces CPU; `"metal"` requires Metal and rejects execution fallback. |
 
 Timing offsets and readout must be finite, nonnegative and strictly below
 1,000,000 µs; construction failures name the node and key. The single conversion
@@ -63,14 +63,6 @@ visible as failed rather than silently ignored. Capture continues on failure:
 whose requested controls could not be applied. Check these before commissioning
 timing. The exposure correction is omitted after a control failure.
 
-Both mount-uncertainty keys must be finite and nonnegative. They model the
-residual calibration error left after mounting each camera, which the corner
-noise cannot see: a mount rotation of `mount_angle_std_rad` tilts the optical
-axis and shifts the tag lever arm by `range × angle`, and `mount_translation_std_m`
-shifts it directly, so the published covariance adds both to field x/y (and the
-angle to yaw) before the uncertainty floors. Set them from the deployed robot's
-post-mounting calibration residual — a mount measured to ±0.5 deg and ±5 mm
-would use roughly half the defaults — not from the sim's synthetic error keys.
 
 The typed pipeline configuration carries `apriltag::DetectorOptions` and the
 minimum decision margin directly; there is no string parameter map. A detection
@@ -112,11 +104,11 @@ initialize the recorder logs once and leaves the camera running without it.
 | `recording.max_bytes` | `268435456` | Per-camera disk budget (256 MiB); oldest pairs deleted first. |
 
 `max_bytes` must be a nonnegative integer; the rates must be finite and
-nonnegative. Disk math: at ~2 frames/s (one sampled + one rejected at the
-defaults) and ~0.8 MB per PNG, 256 MiB holds roughly 160 s of recording per
-camera. Tune offline with
-`bazel run //talOS/vision/recording:frame_replay -- --frames <dir> --layout
-2026-robot/main_processor/vision/data/2026-rebuilt-welded.json`.
+nonnegative. Replay captured frames with:
+
+```sh
+bazel run //talOS/vision/recording:frame_replay -- --frames <dir> --layout 2026-robot/main_processor/vision/data/2026-rebuilt-welded.json
+```
 
 Shared pose-solver settings live in `[subsystem]` in `vision.toml`, with the
 same per-camera override mechanism. Both single-tag and multi-tag observations
@@ -125,12 +117,12 @@ directly.
 
 | Key | Default | Units and meaning |
 | --- | --- | --- |
-| `pixel_std_px` | `0.33` | Sim-measured corner-coordinate standard deviation in pixels; real cameras should use their calibration RMS. Independent of direct projection's `camera.pixel_noise_std`. |
+| `pixel_std_px` | `0.33` | Corner-coordinate standard deviation in pixels; real cameras should use their calibration RMS. Independent of direct projection's `camera.pixel_noise_std`. |
 | `floor_z_std_m` | `0.05` | Robot-height prior standard deviation in metres about the field floor. |
 | `floor_tilt_std_rad` | `0.05` | Robot roll/pitch prior standard deviation in radians about level. |
 | `huber_delta_px` | `2.0` | Huber robust-loss transition in pixels for corner residuals. |
 | `min_xy_std_m` | `0.02` | Minimum published x/y standard deviation in metres. |
-| `min_yaw_std_rad` | `0.035` | Minimum published yaw standard deviation in radians (about 2 degrees), selected against the accuracy preset's ±1-degree yaw mounting bias. |
+| `min_yaw_std_rad` | `0.035` | Minimum published yaw standard deviation in radians (about 2 degrees). |
 
 The raster/detect invariant test measures the sim pixel noise with fixed seed
 1000, production sensor/exposure settings, five offsets at each of 1.5, 2.5,
@@ -144,50 +136,11 @@ The test requires the measured standard deviation to stay within ±30% of
 This is a simulator calibration, not a claim about physical camera noise:
 set each real camera's `pixel_std_px` from its measured calibration RMS.
 
-Pixel-coordinate residuals are divided by `pixel_std_px`; the Huber transition
-is divided by the same value. Floor z and roll/pitch residuals are divided by
-their respective prior standard deviations, so all objective rows are
-dimensionless. The reported reprojection error remains unweighted RMS pixels.
-The covariance is the inverse final undamped `Jᵀ W J`, including the floor
-prior and final Huber IRLS weights. It is mapped from right-increment SE(3)
-coordinates into field-frame x/y/yaw before applying uncertainty floors.
+The solver returns field-frame x/y/yaw standard deviations after applying
+the configured uncertainty floors and mount-calibration uncertainty.
 Non-finite or non-positive-definite covariance invalidates the observation.
-The yaw floor deliberately lets the gyro dominate heading.
-The yaw floor was selected by a two-run-per-floor sweep with deterministic
-±1-degree yaw, ±0.5-degree pitch and ±0.01 m translation mounting errors:
-0.035 rad gave the lowest measured mean fused heading RMS without worsening
-mean position RMS among 0.018, 0.035, 0.07 and 0.1 rad.
-Mount errors are correlated bias, not independent per-frame noise; normalized
-observation RMS alone is not a calibration objective for the fused estimator.
-Rare ambiguous single-tag observations can still have heavy-tailed errors;
-the estimator's separate 15-degree single-tag yaw innovation gate rejects
-those jumps rather than inflating uncertainty floors to disguise them.
-
-The accuracy scenario's second table scores each camera's valid SEND
-observations once per sample timestamp during the same enabled window.
-Truth is interpolated at that timestamp. It reports RMS and the interpolated
-95th percentile of absolute normalized x/y/wrapped-yaw errors, plus raw yaw
-RMS in degrees. A consistent Gaussian uncertainty model has normalized RMS
-near 1 and absolute p95 near 1.96. When yaw normalized RMS exceeds 1, the table
-also reports the smallest additional yaw floor that would make that session
-consistent while retaining covariance standard deviations already above it.
-This diagnostic does not change the configured floor.
-
-With two pose candidates, ambiguity is the lower/higher reprojection-error
-ratio. The single-tag ambiguity limit is **0.2**, defined by
-`PoseValidationOptions`; multi-tag joint solves do not inherit this single-tag
-limit. The patched AprilTag ambiguity search reports its exact count of new
-minima: no alternate minimum means ambiguity `0`, whereas multiple new minima
-without a returned second pose mean unknown ambiguity `1`. Single-tag
-observations above the limit are rejected unless the floor-disambiguation
-check resolves them; an absent second pose alone cannot resolve that check.
-The floor check uses the norm of `(z/floor_z_std_m,
-roll/floor_tilt_std_rad, pitch/floor_tilt_std_rad)`. It is decisive only when
-one candidate is within a 3-sigma prior radius and the other outside 6 sigma.
-Only then may it replace the lower-reprojection primary or override the
-ambiguity rejection. A merely smaller height/tilt residual cannot select the
-other planar minimum. This prevents the pinned tag-32 near-edge observation
-from switching to a 24-degree-flipped pose under small mounting errors.
+Single-tag ambiguity rejection and floor-prior disambiguation are implemented
+in [localization.h](../../../talOS/vision/localization.h).
 
 Only `--sim` enables synthetic observations. `rasterize = true` (default) uses
 a preallocated image buffer, AprilTag detection, and 3D localization;
@@ -263,22 +216,6 @@ model exposure or image sensor noise. Neither path adds arbitrary pose jitter
 after solving; observation standard deviations describe uncertainty rather than
 perturbing the published pose a second time.
 
-The renderer also receives caller-owned `RenderScratch` retained beside the
-camera's pixel buffer. Motion integration reuses its detection vectors, instant
-image and accumulator across frames rather than hiding mutable state in camera
-configuration or allocating temporary frame buffers on each render.
-Motion blur initializes the static background once, then accumulates deviations
-only within disjoint regions covering visible tags' start/end projected bounds.
-Bounds include the projected 1.25× quiet zone and raster rounding margin, and
-extend for intermediate curved motion or newly visible tags. Pixels outside
-these regions retain the static background. A test-only full-frame integration
-oracle requires moving-pose results to agree within one gray level. Adjacent
-cells share a preprojected 11×11 vertex lattice rather than repeating four
-projections per cell.
-Image noise, gain and exposure accumulation use OpenCV kernels over reused
-matrices. The third-party AprilTag target is compiled with `-O2` in every Bazel
-mode, including `fastbuild`: noisy-image thresholding otherwise exceeds the
-camera period even when the surrounding simulation code is unoptimized.
 
 Without `--sim`, construction validates calibration and registers topics; it
 does not open a camera. Live capture requires a nonempty `camera.device` set to
@@ -319,12 +256,5 @@ when that bias is corrected. Invalid underflow/future timestamps report zero
 latency and never publish a valid pose. Simulation replay uses
 `--sim --replay <log>`; no wall clock enters its outputs.
 
-Framework telemetry supports every scalar in the status schema and observes all
-four camera streams. Its observers intentionally do not count as control
-consumers: graph lint reports the four status-only warnings. The robot telemetry
-excludes cumulative capture/process/range counters and the new recovery/control
-fields, retaining its existing byte budget. All fields remain available in
-shared-memory status and dispatch logs; status uses the enclosing log timestamp
-instead of duplicating it as a scalar. `range_rejected_count` counts detections
-culled before localization.
-There is no side-channel vision server.
+See [DATA_FLOW](../../../docs/DATA_FLOW.md) for telemetry transport and budgets.
+`range_rejected_count` counts detections culled before localization.

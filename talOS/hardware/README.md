@@ -152,10 +152,11 @@ the network format. The payload limit is `protocol::kMaxPayloadSize`, currently
 The gateway publishes its configuration ID, boot ID, control epoch, monotonic
 poll timestamp, last accepted command sequence, enable/configuration/fault
 flags, and identified motor/sensor samples. Motor samples contain mechanism
-position/velocity, voltage, stator current, and the Phoenix fault bitfield.
-State also carries valid power/CAN health (battery volts, brownout, and CAN
-utilization fraction) and per-boot gateway safety counters. Protocol version 2
-rejects older peers instead of interpreting the expanded state as an old layout.
+position/velocity, voltage, stator and supply current, temperature, and the
+Phoenix fault bitfield. State also carries valid power/CAN health (battery
+volts, brownout, and CAN utilization fraction) and per-boot gateway safety
+counters. Peers of another protocol version (`kProtocolVersion`, see
+[DATA_FLOW.md](../../docs/DATA_FLOW.md)) are rejected rather than decoded.
 CANcoder samples contain angle
 and velocity; Pigeon2 samples contain yaw and yaw rate, expressed in rotations.
 Position/velocity signal ages are included separately, in microseconds. Ages
@@ -172,7 +173,7 @@ supplies every configured motor in manifest order.
 The bridge neutralizes omitted subsystem actuators. `/hw/status` exposes the
 latest accepted health sample, motor fault mask, and gateway counters.
 `hardware_node --log PATH` records merged `/hw/command` and decoded `/hw/state`
-as raw `Packet` topics in a version-5 `.tlog`.
+as raw `Packet` topics in a `.tlog` (format in [talOS/events](../events/README.md)).
 
 Nodes read the gateway's poll timestamp in their own clock through
 `HardwareLink::sample_time()` (C `talos_hardware_sample_time`, Python

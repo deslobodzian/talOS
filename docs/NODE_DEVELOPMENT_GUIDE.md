@@ -24,34 +24,13 @@ the constructor; `update()` runs every period.
 | `node.publish_bytes(topic, max_bytes, {.drop_newest, .external})` → `send(span<const byte>)` | `node.publish_bytes(topic, max_bytes, drop_newest=..., external=...)` → `send(bytes)` | variable-length feed outside the loop (not logged); used by telemetry |
 | `TALOS_NODE(Class)` in one `.cc` | `talos_py_node(class_name = ...)` | |
 
-Messages are FlatBuffers **structs** (no tables or strings), at most 8-byte
-aligned. Topics are typed by schema identity (`Descriptor<M>`, name and
-schema hash): attaching with a mismatched schema fails, naming both types.
-Python publisher, target-lane, and simulation forwarding requires matching
-schema names, schema hashes, and byte sizes; mismatches raise `TypeError`
-before publication.
-A relative topic name (`"state"`, `"event/shot"`) expands to
-`"/<name>/<topic>"`; `[subsystems.<name>.remap]` can redirect relative or
-absolute topics without changing node code.
+Message, schema identity, relative topic and remapping contracts are in
+[Architecture: Topics and messages](../ARCHITECTURE.md#topics-and-messages)
+and [Configuration](../ARCHITECTURE.md#configuration).
 ### When messages arrive
 
-A subscription is updated when the node's loop drains its topics, and the
-drain point depends on the node:
-
-- A node with no message callback (no `subscribe(topic, fn)`, no
-  `DriverStation(node, on_packet)` listener) drains right before each of its
-  own timers, `update()` or `every()`. Every message published before that
-  timer is visible inside it, and the process sleeps between timers instead of
-  waking every millisecond.
-- A node with any message callback, or with no timer at all, drains every
-  1 ms, so a callback runs within 1 ms of the message.
-
-`age()` and `fresh()` count from the writer's publication timestamp: draining
-an expired message cannot revive it. Plain subscriptions without callbacks
-dispatch only the newest available message per drain (counting skipped messages
-as dropped), while callback subscriptions retain sequence delivery capped at 64
-messages per drain. `testing::Sim` and replay preserve publication-age
-semantics, so a test sees messages and ages as the robot would.
+See [Architecture: Targets](../ARCHITECTURE.md#targets) for drain scheduling
+and publication-age semantics.
 
 ### Realtime scheduling
 
@@ -105,23 +84,17 @@ Software rezero does not change these timestamps.
 `velocity_age_us`; `.set_gyro` accepts `yaw_age_us`, `yaw_rate_age_us` (C++ and
 Python). Defaults are zero; `UINT32_MAX` injects unknown acquisition age.
 
-The robot drivetrain timestamps odometry with the oldest consumed module/gyro
-acquisition time, rejecting measurements older than 50 ms or skewed by more
-than 20 ms rather than pretending they are simultaneous. Invalid module timing
-clears `modules_valid` (and integrated yaw); invalid gyro timing clears
-`yaw_valid`. This estimation policy does not gate actuation. See
-`2026-robot/main_processor/drivetrain/README.md` for details.
+The robot-specific odometry timing policy is documented in the
+[drivetrain README](../2026-robot/main_processor/drivetrain/README.md).
 
 
-Every motor not set during an `update()` is sent neutral, and all are neutral
-while the robot is disabled. Units are rotations, rotations/s, volts, amps.
+Actuator flush and disable semantics are in
+[Architecture: The tick](../ARCHITECTURE.md#the-tick).
 
 ## Targets
 
-What a subsystem is asked to do arrives on lanes `/<sub>/target/<source>`, one
-per producer, each carrying `talos::TargetEnvelope<M>` (a 16-byte header: the
-producer's Driver Station mode generation and `active`; then `M`). Header
-`talOS/devices/target.h` (included by `devices.h`).
+See [Architecture: Targets](../ARCHITECTURE.md#targets) for lane selection,
+mode generations and policy defaults. API:
 
 | C++ | Python |
 |---|---|
@@ -130,19 +103,6 @@ producer's Driver Station mode generation and `active`; then `M`). Header
 | `target_.source()`: `"teleop"`, `"auto"`, ... or `""` | `target.source` |
 | `talos::TargetLane<M> lane_{node, "wrist", "auto"}`: `send(M{...})` (stamped with this node's mode generation), `release()` | `talos.TargetLane(node, M, "wrist", "auto")`: `send(field=...)` or `send(message)`, `release()` |
 
-Which lanes count, highest priority first, is config:
-
-```toml
-# robot.toml: every subsystem (these are the defaults)
-[robot.targets]
-teleop = ["teleop"]
-autonomous = ["auto"]
-test = []
-
-# subsystems/drivetrain.toml: replaces only the modes it lists
-[targets]
-teleop = ["align", "teleop"]
-```
 
 ### Binding joystick buttons and axes via TOML
 
@@ -177,26 +137,10 @@ While held, toggled on or deflected past deadband, `teleop` publishes active
 targets with the bound fields encoded; released or in neutral, it calls
 `release()`.
 
-Sources follow the topic segment rules; an unknown mode is a config error. A
-consumer reads its lanes without a callback, so it keeps draining right before
-its timer. Republish a lane every period; `release()` hands control to the next
-lane on the consumer's next tick. The launcher refuses a lane whose source no
-mode lists and warns about a policy lane nobody writes. Each `get()` also
-records the selected source in the node's registry row, so Studio's system view
-shows who drives the subsystem ("driven by teleop", or "none") with nothing to
-add in the node.
-
-A lane drives only the Driver Station mode generation it was sent under: the
-RoboRIO stamps every Driver Station packet with `mode_since_us` (the first
-observation of the current enable and mode, tracked every hardware tick), a
-`TargetLane` stamps the generation its node last drained, and `Target` ignores
-any other. A target computed before a disable, re-enable, mode switch or
-re-attach never actuates after it,
-even if it arrives in the same drain as the packet that changed the mode; the
-producer's next send, made from the new packet, is accepted. In tests,
-`PublishTarget` / `sim.publish_target` stamp the generation of the newest
-Driver Station packet; pass `mode_since_us` (C++: the last argument) to stand
-in for a producer that has not seen it.
+Republish a lane every period; use `release()` when the producer has no target.
+In tests, `PublishTarget` / `sim.publish_target` stamp the newest Driver Station
+generation; pass `mode_since_us` (C++: the last argument) to model a producer
+that has not seen it.
 
 ## BUILD
 
@@ -226,7 +170,7 @@ lower_snake_case: `"vision_state"` is `kVisionState` in C++ and
 `Target` build them from the subsystem and source names.
 To use another package's types, list its `talos_messages` target in `deps`
 and include its schema by the dep's include prefix:
-`deps = ["//shared/geometry:messages"]` with
+`deps = ["//talOS/msgs:geometry"]` with
 `include "geometry/geometry.fbs";` in the `.fbs`, then C++ includes
 `"geometry/geometry_generated.h"`. Deps are transitive. At a repository root
 the package path is empty, so pass `include_prefix` explicitly there.
@@ -242,8 +186,8 @@ naming the field. Each struct also gets a schema descriptor
 64-bit schema hash that changes with any field name, type, offset, nested
 struct or enum value, but not with comments or formatting. Python's
 `talos_schema.struct_hash` computes the same hash from the same bytes.
-Logs (`.tlog` format version 5) carry these descriptors, and `log_dump`
-prints decoded fields.
+Logs carry these descriptors, and `log_dump` prints decoded fields.
+See [Data flow: Dispatch logs](DATA_FLOW.md#dispatch-logs) for the format.
 The node's name comes from `node_name`; add the node to the robot config as
 `node = "//path:node"`.
 

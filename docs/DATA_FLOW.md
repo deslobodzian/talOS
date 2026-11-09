@@ -32,11 +32,8 @@ flowchart LR
   SB <-->|HTTP / WebSocket 5800 via radio| UI[Studio browser / agents]
 ```
 
-All robot logic runs on the main processor. The RIO owns devices and the native
-Driver Station interface. Camera images go directly to the main processor, not
-through the RIO. All arrows between main-processor nodes are shared memory, not
-network sockets. The simulation gateway replaces the RIO; it does not add a
-second hop. See [architecture](../ARCHITECTURE.md#two-processors).
+For processor ownership and layer boundaries, see
+[Architecture: Two processors](../ARCHITECTURE.md#two-processors).
 
 ### Link rates and endpoints
 
@@ -60,14 +57,15 @@ second hop. See [architecture](../ARCHITECTURE.md#two-processors).
 | Nodes → telemetry → studio_bridge | Shared-memory states/statuses → `/talos/telemetry` byte topic | Telemetry period 10000 µs = 100 Hz; dictionary first frame and every 100th frame (1 Hz at this rate). |
 | studio_bridge ↔ browser/agent | HTTP + WebSocket, configured port 5800 | Forwards telemetry frames as available; initial graph/dictionary on connection. HTTP requests and graph refresh are not the 100 Hz value stream. |
 
-Camera observation timestamps describe exposure, not publication. Measure each
-camera's timestamp delay during bring-up and set its `[camera] latency_offset_us`
-(default 0): live and sim both subtract this offset from the capture stamp.
-`last_latency_us` measures node time minus that corrected stamp. Sim-only
-`camera.sim_timestamp_lag_us` (default 0, ignored live) adds known stamp bias and
-delays delivery until the biased stamp's instant; equal offset restores the
-original truth stamp without removing delivery delay. Both values must be
-finite, nonnegative and below one second. Underflow/future stamps publish invalid.
+Camera observation timestamps describe exposure, not publication. Measure
+timestamp bias during [camera bring-up](BRINGUP.md#camera-intrinsics-calibration).
+Live delivery/host-receipt and AVFoundation PTS stamps subtract
+`camera.latency_offset_us`; V4L2 SOE/EOF stamps instead use exposure midpoint
+correction and `camera.readout_us`. Simulation subtracts `latency_offset_us`.
+Sim-only `camera.sim_timestamp_lag_us` adds stamp bias and delays delivery;
+an equal offset restores the truth stamp without removing delivery delay.
+Both offsets default to zero and must be finite, nonnegative and below one
+second. Underflow/future stamps publish invalid.
 
 Timing sources: `2026-robot/main_processor/configuration/robot.toml:1-16`, its
 `subsystems/*.toml`, `talOS/bridge/node.cc` (`Tick`, `PushConfig`,
@@ -93,9 +91,9 @@ has no reflected radio channels; only the bench motor state adds these scalars.
 
 ## UDP frame and payload sizes
 
-One datagram contains exactly one protocol frame, version **4** (motor State
-layout changed; earlier peers are rejected). The explicit little-endian
-header is **40 B**: magic u64 (8), version/header_size/type/flags u16 (8 total),
+One datagram contains exactly one protocol frame, version **4**.
+The explicit little-endian header is **40 B**: magic u64 (8),
+version/header_size/type/flags u16 (8 total),
 sequence u64 (8), monotonic_time_us u64 (8), payload_size u32 (4), reserved u32
 (4). Payload maximum is **1432 B**; frame maximum **1472 B** = 1500-byte MTU −
 20-byte IPv4 header − 8-byte UDP header. Under this IPv4/MTU contract talOS frames
@@ -132,9 +130,7 @@ These are codec sizes (`talOS/hardware/messages.h`, `messages.cc`), not native
 struct padding. Position, velocity and voltage remain binary64. Motor stator
 current, supply current and device temperature use signed little-endian int16
 in 0.1 A / 0.1 °C units, rounded to nearest (ties away from zero), saturated
-to [-3276.8, 3276.7]; nonfinite inputs fail encoding. Compacting stator current
-alongside the two new readings keeps the unchanged device cap inside one UDP
-payload: motor samples shrink 47→45 B and maximum State shrinks 1420→1388 B.
+to [-3276.8, 3276.7]; nonfinite inputs fail encoding.
 
 ### Actual 2026 robot
 
@@ -153,11 +149,6 @@ and its subsystem files. Current device counts are **10 motors, 5 sensors,
 - State at 200 Hz: **146600 B/s** in talOS frames (`733×200`), or
   **1.1728 Mbit/s**, on the wired internal link, not the robot radio.
 
-Computed with a throwaway C++ program calling the production `ParseRobotConfig`,
-`SerializeConfig`, and `CreateConfigChunks`, and the named State/Command size
-formulas; source/binary were removed after measurement. `robot_field.toml`
-produced the same counts and sizes. This measures the real string/config codec,
-not a TOML text-length estimate.
 
 ## Dynamic and multi-frame messages
 
@@ -280,13 +271,6 @@ There is no specified fusion accuracy threshold, so report uncertainty rather
 than inventing one. This bounds clock mapping, not CAN acquisition-age error;
 bench qualification must validate the oscillator assumption and fusion budget.
 
-Autonomous phases are IDLE, SPINUP, FEED, DRIVE, HOLD, and ABORTED (append-only
-ubyte; state remains one byte). SPINUP and DRIVE abort after configured deadlines;
-FEED ends after its validated positive duration. Pose outages release the drive
-lane and pause trajectory progress without extending the DRIVE deadline. HOLD
-and ABORTED release all autonomous target lanes; leaving enabled-autonomous
-resets the routine to IDLE.
-
 Phoenix followers drive only while their master is permitted and their own
 cached position/velocity feedback—including configured remote CANcoder
 feedback—is fresh and finite; invalid feedback neutralizes the follower.
@@ -297,9 +281,8 @@ feedback—is fresh and finite; invalid feedback neutralizes the follower.
 and send, separate from event/dispatch time. Exact replay preserves publication
 age; input replay injects at the recorded publication time rather than receipt.
 Older formats are rejected with the recorded and supported versions. The packed
-file header remains **120 B**, manifest entry **112 B**, and record header grows
-from 56 to **64 B**, followed by the stored payload bytes. Matching assertions
-live in `talOS/events/log/format.h`.
+file header is **120 B**, manifest entry **112 B**, and record header **64 B**,
+followed by stored payload bytes (`talOS/events/log/format.h`).
 
 ## Telemetry, Studio, and the radio boundary
 
@@ -317,16 +300,13 @@ channel level (`subsystems/telemetry.toml`), retaining
 camera health, timing, dropped-frame and visible-tag diagnostics. Excludes match
 topics or individual dictionary channels; only retained channels count.
 
-Current budget, robot measured 2026-11-08 and physics/bench rechecked 2026-11-09,
-with the producer's own
-`MeasureValueFrameBytes` / `MeasureDictionaryFrameBytes` (the telemetry node
-prints this line whenever it builds from a declared graph, so every
-`--describe-only` and every launch reports it):
+The declared graphs report their budgets through the producer's
+`MeasureValueFrameBytes` / `MeasureDictionaryFrameBytes`:
 
 | Graph | Channels | Worst-case value frame | Spare channels | Dictionary frame |
 |---|---:|---:|---:|---:|
 | `robot.toml`, `robot_field.toml` | 130 | 1168 / 1200 B | 4 | 8984 / 16384 B |
-| `robot_physics_sim.toml` + `--start-sim-gateway --sim-gateway-arg --physics` | 133 | 1192 / 1200 B | 1 | 9152 / 16384 B |
+| `robot_physics_sim.toml` + `--sim --start-sim-gateway --sim-gateway-arg --physics` | 133 | 1192 / 1200 B | 1 | 9152 / 16384 B |
 | Bench `robot.toml`, `robot_bench.toml` (temperature/supply included) | 53 | 552 / 1200 B | 81 | 3408 / 16384 B |
 
 A graph over the cap makes telemetry refuse construction with the largest
@@ -348,20 +328,16 @@ telemetry and video. RIO↔main-processor UDP stays on the robot's wired switch 
 is not charged against wireless throughput. Local USB camera images also do not
 consume that budget unless separately streamed off-robot (this path does not).
 
-The existing telemetry README's R704 reference is supported by
-[WPILib's bandwidth guidance](https://docs.wpilib.org/en/stable/docs/networking/networking-introduction/measuring-bandwidth-usage.html),
-which explicitly identifies R704 in the 2026 manual and uses a 4-Mbit reference
-budget. Thus 0.96 Mbit/s is 24% of that **planning reference**, not a guaranteed
-per-client allowance or an overhead-inclusive measured total. The actual event's
-current radio/manual allocation remains authoritative; a wired internal link is
-not subject to the wireless allocation.
+The event's current radio/manual allocation remains authoritative. The
+calculation above is not an overhead-inclusive measured throughput total.
 
 ## What never crosses the hardware UDP link
 
-Only hardware State, merged actuator Command, Config chunks/ACK, and Driver
-Station snapshots cross ports 5802/5803. In this robot only **drivetrain, intake,
-and shooter** own devices and produce `/hw/request/<node>`; the bridge builds
-request subscriptions from device ownership. Vision, pose_estimator, autonomous,
+Hardware State, merged actuator Command, Config chunks/ACK, Driver Station
+snapshots and ClockProbe frames cross ports 5802/5803.
+In this robot only **drivetrain, intake, and shooter** own devices and produce
+`/hw/request/<node>`; the bridge builds request subscriptions from device ownership.
+Vision, pose_estimator, autonomous,
 teleop, driver, and telemetry do not produce hardware requests. Targets,
 camera images/observations/status, estimated pose, node state/status, and telemetry
 frames stay on the main processor (telemetry subsequently travels to Studio on a
@@ -378,9 +354,5 @@ wrong-identity commands, and disabled/stale-target actuation is neutralized.
 The configured command timeout is **100 ms**; a single loss does not imply an
 immediate timeout. The maximum frame fits the IPv4 MTU without fragmentation.
 
-The cost is a hard device-cap budget tied to one datagram: State has **44 B**
-worst-case headroom. Grow in this order if required: first narrow appropriate
-telemetry-only binary64 fields to float32 (an explicit wire/version change), then
-split State by CAN bus using an **all-parts-or-drop multipart snapshot** with a
-shared identity/time. Neither growth option is implemented today; silently
-raising caps or sending partial snapshots is not an acceptable substitute.
+The device caps are a hard one-datagram budget: State has **44 B**
+worst-case payload headroom.

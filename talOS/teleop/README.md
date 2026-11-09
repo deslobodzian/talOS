@@ -41,8 +41,9 @@ selects POVs 0–3; it is valid only for a POV trigger.
 Button and POV triggers require exactly one non-empty scalar assignment table:
 `while_held` or `on_toggle`. Values are checked against the target's reflected
 schema, including numeric types, booleans and enum labels; nested struct fields
-use slash-separated paths. Axis triggers instead require `field` and `scale`,
-with optional `deadband_frac` in [0, 1), and reject action tables and `pov_index`.
+use slash-separated paths. Axis triggers instead require a floating-point `field`
+and `scale`, with optional `deadband_frac` in [0, 1), and reject action tables
+and `pov_index`.
 
 Numeric assignments must be finite and representable by their destination
 fields. A nonfinite axis input or an axis output outside its destination field's
@@ -61,7 +62,7 @@ publish active teleop targets; a stale Driver Station also releases them.
 
 Teleop rearms before publishing again: at start, after the Driver Station was
 stale, disabled or outside teleop, after a bound joystick reconnects, and after
-the node's own evaluations stall for longer than `command_timeout_us`. While
+the node's own evaluations stall for at least `command_timeout_us`. While
 rearming it publishes no active target until every connected bound input is
 neutral (axes inside their deadband, buttons and POVs released) for one
 evaluation. A bound POV must centre even if held in a different direction than

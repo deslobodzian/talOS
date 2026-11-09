@@ -1,10 +1,9 @@
 # Engineering methodology
 
-How talos code is written, so that every subsystem is robust, reliable,
-performant and easy to work with in the same way. `.omp/RULES.md` holds the
-hard rules; this page holds the method behind them. API reference:
-[NODE_DEVELOPMENT_GUIDE.md](NODE_DEVELOPMENT_GUIDE.md). Planned framework
-changes this page refers to: [DESIGN_AUTOMATIC_WIRING.md](DESIGN_AUTOMATIC_WIRING.md).
+Working conventions for talos code. [`.omp/RULES.md`](../.omp/RULES.md) holds
+the hard rules; [ARCHITECTURE.md](../ARCHITECTURE.md) holds architecture,
+tick, target, topic and configuration contracts. API reference:
+[NODE_DEVELOPMENT_GUIDE.md](NODE_DEVELOPMENT_GUIDE.md).
 
 Each rule carries its status:
 
@@ -12,7 +11,6 @@ Each rule carries its status:
 |---|---|
 | **[enforced]** | the build, the graph lint or a test fails when it is broken |
 | **[review]** | a convention; reviewers (`WATCHDOG.md`) check it |
-| **[planned: Dn]** | needs design item Dn in DESIGN_AUTOMATIC_WIRING.md; follow the current form until then |
 
 ## 1. What the four goals mean here
 
@@ -93,13 +91,8 @@ class Wrist:
                         connected=feedback)
 ```
 
-`Target<M>::get()` folds `robot_enabled(node)`, the Driver Station mode and
-its generation, the lane priority, release and freshness into one null check,
-so target messages carry no `enabled` field. A target sent under an earlier
-enable or mode never passes it: each envelope carries the producer's mode
-generation (the RoboRIO's `mode_since_us`), and only the consumer's current one
-is accepted. **[enforced: `Target`, `target_test`, `talos_test`; the graph lint
-checks each lane against the policy]**
+For target selection and mode-generation semantics, see
+[Architecture: Targets](../ARCHITECTURE.md#targets).
 
 ## 3. Inputs
 
@@ -128,11 +121,7 @@ There are exactly two kinds of input, and they are treated differently.
   consumers, and they cannot tell why. **[review]**
 - Never publish NaN or infinity. Publish a validity flag and a finite
   placeholder instead. **[review]**
-- One writer per topic. Several producers of one target each write their own
-  `/<sub>/target/<source>` lane with `talos::TargetLane`, republished every
-  period; a producer with nothing to say calls `release()` rather than
-  sending zeros. **[enforced: graph lint, including a lane no policy mode
-  lists]**
+- Follow the [one-writer and target-lane contract](../ARCHITECTURE.md#targets).
 - Something that happened once (a shot fired, a piece acquired) goes on
   `/<me>/event`, not as a pulse in `state`. **[review]**
 
@@ -180,7 +169,7 @@ Rules:
 
 - **One quantity, one field.** A struct never carries the same quantity twice
   in two units (`DrivetrainState` carries the chassis rate once, as
-  `omega_radps`). **[review; lint planned: D2]**
+  `omega_radps`). **[review]**
 - **Conversions happen at a named boundary, once.** The device layer speaks
   shaft units (`_rot`). A node that turns a shaft angle into a field-frame
   angle (a gyro yaw into a heading) converts there and publishes `_rad`. In
@@ -208,22 +197,17 @@ Rules:
 
 - Look in `talOS/msgs` (`geometry`, `control`) before writing a new struct.
   Reuse beats a near-duplicate. **[review]**
-- Messages are FlatBuffers structs owned by one package, declared with
-  `talos_messages`. Never mirror a struct by hand (the earlier `GenericState`
-  and `GenericTarget` side doors have been deleted; D3 and D4 replaced
-  hard-coded subsystem lists with framework nodes). Each struct has a build-time
-  schema descriptor (`talos::Descriptor<M>`, `<Struct>.TALOS_SCHEMA_HASH`).
-  Attaching to a topic checks schema name and hash; a mismatch fails, naming
-  both types. **[enforced]**
+- Declare messages with `talos_messages`; see
+  [Architecture: Topics and messages](../ARCHITECTURE.md#topics-and-messages).
 - A measurement message carries `sample_time_ns`: when the measurement was
   taken, in the node clock, not when it was published (`DrivetrainState`,
   `geometry.PoseObservation`, `geometry.PoseEstimate`). A node reading
   hardware stamps it with `HardwareLink::sample_time()`
   (`talos.hardware_sample_time_ns(node)` in Python), the gateway's sample
-  time mapped through the bridge's clock offset; that is an upper-bounded
-  latency estimate, never earlier than the true sample, and unknown until
-  the mapping converges. A measurement without a known time is published
-  with its validity flags false. **[review]**
+  time mapped into the node clock, with the uncertainty described in
+  [Data flow: Gateway clock accuracy](DATA_FLOW.md#gateway-clock-accuracy).
+  The time is unknown until the mapping converges. Publish a measurement
+  without a known time with its validity flags false. **[review]**
 - A message carries validity next to the value it qualifies (`yaw_valid` next
   to `yaw_rad`), not one flag for the whole struct. **[review]**
 - Enums for states and reasons (`Inhibit`), with the zero value meaning
@@ -244,11 +228,8 @@ Rules:
 - Parameter keys follow §6 (`tolerance_rot`, `deadband_frac`,
   `heading_timeout_us`). Numeric keys without a suffix produce a
   `--describe-only` warning. **[enforced (warning)]**
-- Robot-wide wiring (which producers drive which subsystem, telemetry,
-  bindings) lives in TOML read by the framework. It is never a list of
-  subsystem names in code. Target lanes and telemetry are config-only
-  (`[robot.targets]`, `[targets]`, `[studio]`); teleop bindings are
-  **[done: D4]**.
+- Robot-wide wiring belongs in
+  [configuration](../ARCHITECTURE.md#configuration), not subsystem lists in code.
 
 ## 9. Time, determinism, restart
 
@@ -284,9 +265,6 @@ Rules:
 
 ## 10. Performance
 
-Measured on this stack (macOS, realtime scheduling, all cores loaded): timer
-lateness p99 ≈ 0.6 ms for C++ 5 ms nodes and 1.0 ms for the Python 20 ms
-intake; the whole graph used ≈ 4.5 % of one core.
 
 | Rule | Budget | Status |
 |---|---|---|
@@ -296,14 +274,9 @@ intake; the whole graph used ≈ 4.5 % of one core.
 | Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [review]; producer → consumer is one hop (`Target` resolves lanes in the consumer) |
 | Per-tick work | O(devices), never O(history); bound every loop | [review] |
 
-How a node receives messages decides its latency, regardless of language
-(`ARCHITECTURE.md`, "The tick"):
-
-- A node without callbacks sees a message at its next tick, up to one period
-  late, and sleeps otherwise.
-- A node with a callback polls every 1 ms.
-
-Pick the first unless 1 ms reaction is a requirement.
+For timer-drained and callback delivery, see
+[Architecture: The tick and Targets](../ARCHITECTURE.md#the-tick).
+Prefer timer-drained inputs unless prompt callback reaction is required.
 
 ## 11. Testing
 
@@ -347,23 +320,18 @@ producer that has drained it would.
 |---|---|---|
 | A mechanism | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py`; fill in the TOML; write the §11 tests | edit `operator_interface` or `telemetry` code |
 | A producer of a target (auto routine, auto-align) | a `talos::TargetLane` on `/<sub>/target/<source>`; list `<source>` in `[robot.targets]` or that subsystem's `[targets]` (the launcher refuses a lane no mode lists) | subscribe to another producer's lane, or write a lane someone else writes |
-| A process without hardware (pose estimator, vision, auto) | a node with no devices; subscribe to `state` topics; publish `/<me>/state` every tick with validity, while disabled too (no actuation gate on computation); reuse `talos::geometry`/`talOS/vision` in C++, RobotPy or GTSAM in Python (§14); `bazel run //tools:new_subsystem -- <name> --type estimator`; walkthrough in DESIGN_AUTOMATIC_WIRING.md §D6 | read `/hw/state` directly; duplicate shared geometry or hand-roll a Kalman filter |
+| A process without hardware (pose estimator, vision, auto) | a node with no devices; subscribe to `state` topics; publish state with validity while disabled too; [estimator walkthrough](NODE_DEVELOPMENT_GUIDE.md#adding-a-pose-estimator) | duplicate shared geometry or hand-roll a Kalman filter |
 | A message | the owning package's `.fbs` and `talos_messages(topics = ...)`; §6 and §7 | a hand-written C++/Python mirror |
 | A device type | `talOS/hardware`, `talOS/devices`, `devices.py`, the RoboRIO program, in one change | |
 | A node-API feature | `talOS/node` (or `devices`), `talOS/node_api`, `talOS/python/talos`, tests in both languages, in one change | a Python-only reimplementation |
 
-## 13. Current deviations
+## 13. Implementation qualifications
 
-These are the places where the code breaks this page today. Fix them when you
-touch the code, or under the design item named.
+The allocation-test limitation below is platform-specific.
 
 | Where | Deviation | Rule | Fix |
 |---|---|---|---|
-| `driver.h` | chassis-only teleop driving; mechanism bindings moved to `[[teleop.bindings]]` | §7, §8 | done: D4 |
-| `driver.toml` | `deadband_frac` | §6, §8 | done: D4 |
-| `intake.py:18` | fixed `INTAKE_RPS` ignores the requested speed | §3 | use the target's demand |
 | `drivetrain/node_test.cc` `UpdateDoesNotAllocate` | the process-wide allocation check (`malloc_logger`) runs on macOS only; on Linux it is skipped | §10 | a glibc-compatible allocation hook (glibc removed `__malloc_hook` in 2.34) |
-| `2026-robot/main_processor/vision/vision.h` simulation path | render/detect/solve runs synchronously in `update()`, allocating inside rasterization/detection/PnP within a configured 10 ms node period; this sim-only cost preserves deterministic replay (live work is off-thread) | §10 | reusable allocation-free detector/solver workspaces and deterministic simulated compute scheduling; fast-projection tag/detection buffers and the raster image are already reused |
 
 ## 14. Open source first
 
@@ -393,8 +361,6 @@ A dependency is adopted when it meets all of these:
 | Config | TOML: toml++ (C++), `tomllib` (Python stdlib) | in use |
 | Tests | googletest, `unittest` | in use |
 | Geometry, kinematics and pose estimation | C++: header-only `talos::geometry` SO2/SE2/SO3/SE3 on Eigen 3.4 (`@eigen3`); drivetrain inverse/forward swerve kinematics use it with per-module speed limits. Python: `robotpy-wpimath` 2026.2.1.1 | in use: shared C++ frame math and the Python pose estimator's `kalman` backend; `wpilib_lockstep_test` aligns GradleRIO with the RobotPy native/wrapper wheels only |
-| Smoothing and mapping (factor graphs) | GTSAM 4.3.0 (`gtsam` wheel on PyPI, BSD) | in use (D6): the pose estimator's `factor_graph` backend (`IncrementalFixedLagSmoother`). Python only: GTSAM has no Bazel module, and its C++ build is CMake with a large dependency surface |
+| Smoothing and mapping (factor graphs) | GTSAM 4.3.0 (`gtsam` wheel on PyPI, BSD) | the pose estimator's `factor_graph` backend (`IncrementalFixedLagSmoother`) |
 | Vision: AprilTag pose observations | `talOS/vision`: upstream AprilTag 3.4.5 (`@apriltag`), OpenCV 4.12 conversion/IO, Metal preprocessing/CCL on macOS, AVFoundation/V4L2 capture | in use: typed detector options, decode-margin/Hamming validity gates before localization, undistorted homography, robust joint single/multi-tag corner solving with floor/tilt priors, marginalized field-frame x/y/yaw covariance and configured uncertainty floors; ambiguity unknown=1, verified unique=0; one robot node per camera, 100 Hz status and up to 60 fps live observations, no side-channel server |
-| Autonomous paths | Choreo or PathPlanner trajectories, followed with wpimath controllers | candidate |
-| Log viewing | export `.tlog` to MCAP (Foxglove) or WPILOG (AdvantageScope) rather than building more viewer features | candidate |
 | RoboRIO hardware | WPILib HAL and Phoenix 6 | in use |

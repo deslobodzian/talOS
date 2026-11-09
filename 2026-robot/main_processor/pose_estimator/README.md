@@ -14,18 +14,8 @@ disabled. Telemetry draws it through `[subsystems.telemetry] pose_topic`.
 | `/<camera>/state`, per name in `cameras` | `geometry.PoseObservation` | optional subscriptions: a listed camera that is not running is no graph error |
 | `/pose_estimator/state` | `geometry.PoseEstimate` | pose at the newest integrated `sample_time_ns`, the drivetrain's chassis velocity, `valid`, `localized`, accepted/rejected observation counts |
 
-The configured sources are `front_left_camera`, `front_right_camera`,
-`rear_left_camera` and `rear_right_camera`, built from the shared C++ vision
-node. Each also publishes `vision.VisionStatus` on `/<camera>/status`.
-Live AVFoundation/V4L2 capture starts on the camera's first update and runs
-through a capture callback and processing worker. Under `--sim`, observations
-come from rendered/projected tags using absolute `/sim/state` truth from
-`sim_gateway --physics`, never this estimator's output or measured odometry.
-WPILib sim publishes no truth, so simulated camera observations remain invalid.
-The gateway owns the world's `--start-pose`; the estimator's independent
-`initial_*` seed may differ and be corrected by vision. Camera intrinsics,
-distortion, mounts and devices live in each camera's subsystem file;
-see [vision](../vision/README.md).
+Camera calibration and capture behavior are documented in
+[vision](../vision/README.md).
 
 The estimator also reads the Driver Station through `talos.DriverStation`.
 Only a fresh, attached packet can classify startup; an absent, stale or
@@ -33,8 +23,9 @@ detached Driver Station is not evidence of a normal disabled boot.
 
 ## Backends
 
-`backend` in `configuration/subsystems/pose_estimator.toml` (an unknown value
-fails at startup):
+`backend` in `configuration/subsystems/pose_estimator.toml` selects the
+implementation (an unknown value fails at startup). The robot config selects
+`"kalman"`.
 
 - `kalman`: Python `wpimath.estimator.SwerveDrive4PoseEstimator`, a steady-state
   Kalman gain with latency compensation by odometry replay. Tuned by `[kalman]
@@ -49,8 +40,8 @@ fails at startup):
   time, moved by the odometry between the two along the constant twist
   between the bracketing samples (exact for constant velocity within a
   sample interval; nearest-key attachment alone would be off by speed × half
-  an interval). Lag window = `max_observation_age_us`. gtsam is imported
-  only for this backend: it is 150 MB of native code with a slow cold start.
+  an interval). Lag window = `max_observation_age_us`. GTSAM is imported
+  only for this backend.
 
 ## Rules (both backends)
 
@@ -58,9 +49,9 @@ fails at startup):
   `initial_y_m`, and `initial_yaw_rad` (finite, default zero), independently
   of the gyro's initial reading; subsequent gyro deltas change that heading.
   The first fresh, attached Driver Station observation decides whether that
-  seed is trusted: disabled means normal pre-match boot, so the first
-  integrated sample is localized; enabled means a mid-match restart, so the
-  seed is untrusted. A later disable never changes that startup decision.
+  seed is trusted: disabled trusts the seed; enabled leaves it untrusted.
+  Localization becomes true once both a trusted startup decision and an
+  integrated sample exist. A later disable never changes the startup decision.
 - Field dimensions `field_length_m` (16.54) and `field_width_m` (8.21)
   must be finite and positive. Observations outside the inclusive field
   rectangle are rejected. Once localized, measurements use the position
@@ -79,8 +70,8 @@ fails at startup):
   counter; `observation_rejected_count` counts offered measurements refused.
 - A drivetrain sample is integrated once, when `sample_time_ns` increased,
   `modules_valid` and `yaw_valid` hold and every value is finite.
-  Each wheel's implied speed must be at most `max_odometry_speed_mps` (10 m/s,
-  over twice the 2026 wheel free speed); wrapped gyro steps must be at most
+  Each wheel's implied speed must be at most `max_odometry_speed_mps` (10 m/s);
+  wrapped gyro steps must be at most
   `max_odometry_yaw_rate_radps` (25 rad/s). Both limits must be positive and
   finite. Rejected steps hold the pose, invalidate that tick, and increment
   the node's `odometry_rejected_count` (not an observation rejection or an
@@ -107,11 +98,6 @@ fails at startup):
 - `module_x_m` / `module_y_m` repeat `[subsystems.drivetrain.geometry]
   .modules` (same order); `config_golden_test` fails if they drift.
 
-`PoseEstimate` remains 72 bytes with 8-byte alignment: `localized` occupies
-existing padding next to `valid`. Telemetry gains one double-valued channel
-(8 bytes per value frame); even the documented 1176-byte physics graph before
-the additional hardware/simulator exclusions remains below the 1200-byte cap
-at 1184 bytes. No additional exclusion is required.
 
 ## Tests
 

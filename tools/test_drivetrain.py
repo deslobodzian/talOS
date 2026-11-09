@@ -262,8 +262,9 @@ def run_driving_scenario(root, wpilib):
 def run_disabled_scenario(root):
     """The same drive request, with the Driver Station never enabled.
 
-    Only the WPILib path can check this: sim_gateway hardcodes enable, so it
-    cannot tell a working safety gate from a missing one.
+    Runs against the WPILib RoboRIO program, so it checks that program's own
+    Driver Station gating; sim_gateway's disabled schedules
+    (`--mode-schedule`) are covered by simulation:startup_test.
     """
     output = Path(tempfile.mkdtemp(prefix="talos-disabled-"))
 

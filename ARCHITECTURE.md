@@ -184,7 +184,7 @@ handlers.
   an existing `/~` name is idempotent. Production runs with neither variable
   retain their ordinary names; publishers, subscribers, launcher session
   cleanup, the registry and Studio all use the same mapping.
-- Dispatch logs (`.tlog` format version 5) carry each logged topic's schema
+- Dispatch logs (`.tlog` format version 6) carry each logged topic's schema
   descriptor, allowing `log_dump` to decode payloads to named fields without
   the recording build.
 - Every user topic's slot is 8-byte aligned, matching FlatBuffers struct rules.

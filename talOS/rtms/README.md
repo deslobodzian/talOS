@@ -1,18 +1,8 @@
 # Real Time Messaging System (RTMS)
 
-This will be a single producer, mutlti consumer architecture pub-sub system.
-
-Utilizing a Ring Buffer in shared memory for each topic. Goal is to be lock free.
-
-## Nameing scheme
-
-All topics will be broadcasted under `"/dev/rtms/topic_name"`
-
-## Messages
-
-All messages will use FlatBuffers for serialization.
-FlatBuffers **must** be structs! Tables are not allowed so the slot size is
-known at compile time.
+Single-producer, multi-consumer shared-memory ring buffers, one per topic.
+Topic naming and message conventions live in
+[NAMING.md](../NAMING.md) and [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 Every publication also stores an `int64_t` monotonic timestamp in its slot,
 separate from the message schema. `write(bytes)` samples the host clock used by
@@ -52,37 +42,10 @@ subscriptions. Dead readers are reclaimed before registration fails. The graph
 lint rejects declared reader counts above this limit before launch; standalone
 `ipc::Subscriber` construction throws with the topic and limit if exhausted.
 
-## Memory
+## Memory layout
 
-Each ring buffer is stored with a corresponding header in shared memory:
-
-`[rtms_header][data...]`
-
-### RTMS Header
-
-`RTMSHeader` (`talOS/rtms/rtms.h`) defines the state of the shared memory:
-- `slots`: Number of slots in the ring buffer (power of 2).
-- `message_bytes`: Size of the message struct in bytes.
-- `message_alignment`: Message struct alignment.
-- `schema_hash` and `schema_name`: Identity of the message schema.
-- `lifetime`: Atomic bitflag and refcount tracking session ownership and attached queues.
-- `writer`: `Writer` tracking sequence and owner pid.
-- `readers`: Array of `Reader` structs tracking reader sequences and pids.
-
-### Ring slots (segment version 5)
-
-For payload size `M` and message alignment `A`, each slot is:
-
-`[M payload bytes][padding to 8-byte boundary][int64 publish_time_ns][tail padding]`
-
-- Header size: 832 bytes (`sizeof(RTMSHeader)`, compile-time asserted).
-- Slot alignment: `max(A, alignof(int64_t))` (at least 8 bytes).
-- Timestamp offset: `align_up(M, 8)`.
-- Slot stride: `align_up(align_up(M, 8) + 8, max(A, 8))`.
-- Data offset: `align_up(sizeof(RTMSHeader), max(A, 8))`.
-- Segment bytes: `data_offset + slots * slot_stride` (before OS page rounding).
-
-An 8-byte payload aligned to 4 or 8 takes a 16-byte slot; a 16-byte payload
-aligned to 8 takes 24 bytes; aligned to 16 it takes 32 bytes. These sizes are
-compile-time asserted in `rtms.h`. Version 4 segments lack publication timestamps
-and cannot be attached by version 5 readers.
+`RTMSHeader` (`rtms.h`) records slot geometry, schema identity, lifetime state,
+writer ownership/sequence and reader positions. Publication timestamps are
+stored separately from message payloads. The exact segment version, header
+size, alignment and slot-stride formulas live in the
+[data-flow reference](../../docs/DATA_FLOW.md#main-processor-shared-memory-slots).
