@@ -104,18 +104,22 @@ config tests also exercise duplicate, out-of-order and cross-call chunk input.
 Tests loading native libraries into an uninstrumented Python process via ctypes
 carry `no_asan` and `no_tsan`, with the reason beside each BUILD tag. Pure Python
 tests and tests spawning instrumented C++ executables remain enabled. No
-project-code sanitizer findings are suppressed; the third-party exemptions (AprilTag
-JPEG shifts and union-find path compression, OpenCV's thread pool) are listed with
-their reasons in `.bazelrc`. Run sanitizer builds in their own output base
-(`bazel --output_base=$HOME/.cache/bazel-talos-asan ...`) so they do not evict the
-default build's cache.
+project-code sanitizer findings are suppressed. AprilTag 3.4.5's union-find
+parents are patched to relaxed atomic accesses: parallel gradient row bands
+compress overlapping paths after connected-component construction has finished.
+The quad-threshold translation unit is fully TSan-instrumented. The
+`//talOS/vision/sanitizer:parallel_detector_test` fixture runs the Linux production
+CPU settings (two detector workers, decimation 2, sigma 0, edge refinement).
+Before the patch, enabling instrumentation reproduced a `do_gradient_clusters`
+read/write data race; the patched test passes with instrumentation enabled.
+This is bounded fixture coverage, not proof of all possible detector inputs.
 
-These are partial-coverage checks, not proof that the excluded paths are safe.
+Run sanitizer builds in their own output bases
+(`bazel --output_base=$HOME/.cache/bazel-talos-asan ...`, and `...-tsan`) so they
+do not evict the default build's cache. AprilTag JPEG signed-shift checks and
+OpenCV internal parallel execution remain exempt as described in `.bazelrc`.
 The ordinary suite also covers excluded Python-host and full-stack paths.
-AprilTag's uninstrumented union-find code and OpenCV's normal parallel execution
-still need race qualification; an algorithm's convergent result does not make
-unsynchronized C/C++ accesses race-free. Deterministic mutation corpora are not
-continuous coverage-guided fuzzing.
+Deterministic mutation corpora are not continuous coverage-guided fuzzing.
 
 ## Editor setup
 

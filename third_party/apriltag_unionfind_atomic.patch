@@ -1,0 +1,59 @@
+--- a/common/unionfind.h
++++ b/common/unionfind.h
+@@ -78,29 +78,26 @@
+ }
+ */
+ 
+-// this one seems to be every-so-slightly faster than the recursive
+-// version above.
++// Parent updates during gradient clustering only shorten paths in a forest
++// completed before worker dispatch. Relaxed atomics prevent races between
++// overlapping row bands; the worker-pool barrier publishes the forest and sizes.
++// This does not make concurrent union operations on overlapping trees safe.
+ static inline uint32_t unionfind_get_representative(unionfind_t *uf, uint32_t id)
+ {
+-    uint32_t root = uf->parent[id];
+-    // unititialized node, so set to self
++    uint32_t root = __atomic_load_n(&uf->parent[id], __ATOMIC_RELAXED);
+     if (root == 0xffffffff) {
+-        uf->parent[id] = id;
++        __atomic_store_n(&uf->parent[id], id, __ATOMIC_RELAXED);
+         return id;
+     }
+ 
+-    // chase down the root
+-    while (uf->parent[root] != root) {
+-        root = uf->parent[root];
++    uint32_t next;
++    while ((next = __atomic_load_n(&uf->parent[root], __ATOMIC_RELAXED)) != root)
++        root = next;
++
++    while ((next = __atomic_load_n(&uf->parent[id], __ATOMIC_RELAXED)) != root) {
++        __atomic_store_n(&uf->parent[id], root, __ATOMIC_RELAXED);
++        id = next;
+     }
+-
+-    // go back and collapse the tree.
+-    while (uf->parent[id] != root) {
+-        uint32_t tmp = uf->parent[id];
+-        uf->parent[id] = root;
+-        id = tmp;
+-    }
+-
+     return root;
+ }
+ 
+@@ -134,11 +131,11 @@
+     // wasted effort -- the tree might be grafted onto another tree in
+     // a moment!
+     if (asize > bsize) {
+-        uf->parent[broot] = aroot;
++        __atomic_store_n(&uf->parent[broot], aroot, __ATOMIC_RELAXED);
+         uf->size[aroot] += bsize;
+         return aroot;
+     } else {
+-        uf->parent[aroot] = broot;
++        __atomic_store_n(&uf->parent[aroot], broot, __ATOMIC_RELAXED);
+         uf->size[broot] += asize;
+         return broot;
+     }
