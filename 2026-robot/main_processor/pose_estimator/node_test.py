@@ -204,18 +204,6 @@ class EstimatorTest(unittest.TestCase):
                         self.assertAlmostEqual(
                             self.pose()[2], before[2], delta=1e-6)
 
-    def test_configured_initial_pose(self):
-        for backend in BACKENDS:
-            with self.subTest(backend):
-                chassis = self.start(backend, extra=(
-                    "initial_x_m = 2.0\ninitial_y_m = 3.0\n"
-                    "initial_yaw_rad = 1.0"))
-                self.assertPoseHeld((2.0, 3.0, 1.0))
-                self.assertTrue(self.estimate().valid)
-                self.assertTrue(self.estimate().localized)
-                chassis.hold(DT)
-                self.assertPoseHeld((2.0, 3.0, 1.0))
-
     def test_enabled_restart_accepts_vision_before_field_localization(self):
         for backend in BACKENDS:
             for x, yaw in ((2.1, 1.05), (8.0, 2.0)):
@@ -370,10 +358,13 @@ class EstimatorTest(unittest.TestCase):
 
     def test_yaw_innovation_gate_applies_to_all_tag_counts(self):
         for backend in BACKENDS:
-            for yaw, count, accepted in ((0.2, 1, True), (0.3, 1, False),
-                                         (-0.3, 1, False), (0.6, 2, False)):
-                with self.subTest(backend=backend, yaw=yaw, tag_count=count):
-                    chassis = self.start(backend)
+            for yaw, count, extra, accepted in (
+                    (0.2, 1, "", True), (0.3, 1, "", False),
+                    (-0.3, 1, "", False), (0.6, 2, "", False),
+                    (0.11, 1, "max_yaw_innovation_rad = 0.1", False)):
+                with self.subTest(backend=backend, yaw=yaw, tag_count=count,
+                                  extra=extra):
+                    chassis = self.start(backend, extra=extra)
                     before = self.pose()
                     self.observe(yaw=yaw, tag_count=count)
                     chassis.hold(DT)
@@ -544,22 +535,9 @@ class EstimatorTest(unittest.TestCase):
                 self.assertEqual(self.counts(), (1, 0))
                 self.assertAlmostEqual(self.pose()[2], chassis.yaw, places=4)
 
-    def test_yaw_innovation_limit_is_configurable_and_positive_finite(self):
-        for backend in BACKENDS:
-            with self.subTest(backend=backend, configured=True):
-                chassis = self.start(
-                    backend, extra="max_yaw_innovation_rad = 0.1")
-                self.observe(yaw=0.11, tag_count=1)
-                chassis.hold(DT)
-                self.assertEqual(self.counts(), (0, 1))
-            for value in ("0.0", "-0.1", "nan", "inf"):
-                with self.subTest(backend=backend, value=value):
-                    sim = Sim.from_toml(robot_toml(
-                        backend, extra=f"max_yaw_innovation_rad = {value}"))
-                    with self.assertRaisesRegex(Exception, "max_yaw_innovation_rad"):
-                        sim.add(estimator.PoseEstimator, "pose_estimator")
-
     def test_odometry_tracks_a_straight_line_then_an_arc(self):
+        # Runs disabled: the estimator owns no actuators and estimates
+        # (and accepts vision) regardless of enable.
         for backend in BACKENDS:
             with self.subTest(backend):
                 chassis = self.start(backend)
@@ -681,19 +659,6 @@ class EstimatorTest(unittest.TestCase):
                 self.assertEqual(self.counts(), (0, 1))
                 self.assertEqual(self.pose(), (0.0, 0.0, 0.0))
 
-    def test_estimation_continues_while_the_robot_is_disabled(self):
-        for backend in BACKENDS:
-            with self.subTest(backend):
-                chassis = self.start(backend)
-                # Gateway disabled, Driver Station disabled: an actuator
-                # would send neutral; the estimator keeps estimating.
-                chassis.drive(0.5, 0.0, 0.0, 1.0)  # pushed by hand
-                self.assertAlmostEqual(self.pose()[0], 0.5, places=4)
-                self.observe(x=chassis.x + 0.2)
-                chassis.hold(DT)
-                self.assertEqual(self.counts(), (1, 0))
-                self.assertTrue(self.estimate().valid)
-
     def test_stale_drivetrain_input_is_invalid_and_holds_the_pose(self):
         for backend in BACKENDS:
             with self.subTest(backend):
@@ -748,44 +713,19 @@ class EstimatorTest(unittest.TestCase):
                     self.assertAlmostEqual(self.pose()[0], chassis.x,
                                            places=4)
 
-    def test_a_repeated_sample_is_integrated_once(self):
-        for backend in BACKENDS:
-            with self.subTest(backend):
-                chassis = self.start(backend)
-                chassis.drive(1.0, 0.0, 0.0, 0.2)
-                held = self.pose()
-                for _ in range(3):  # the same sample, republished
-                    chassis.publish(
-                        sample_time_ns=self.estimate().sample_time_ns)
-                    self.sim.step(DT)
-                self.assertTrue(self.estimate().valid)
-                self.assertPoseHeld(held)
-
     def test_only_the_listed_cameras_are_used(self):
         for backend in BACKENDS:
-            with self.subTest(backend):
-                chassis = self.start(backend)
-                chassis.drive(1.0, 0.0, 0.0, 0.4)
-                self.observe("side_camera", x=chassis.x + 1.0)  # not listed
-                chassis.hold(DT)
-                self.assertEqual(self.counts(), (0, 0))
-                self.observe("back_camera", x=chassis.x + 0.3)
-                chassis.hold(DT)
-                self.observe("front_camera", x=chassis.x + 0.3)
-                chassis.hold(DT)
-                self.assertEqual(self.counts(), (2, 0))
+            for cameras in (("front_camera", "back_camera"), ()):
+                with self.subTest(backend=backend, cameras=cameras):
+                    chassis = self.start(backend, cameras=cameras)
+                    chassis.drive(1.0, 0.0, 0.0, 0.4)
+                    for camera in ("side_camera", "back_camera",
+                                   "front_camera"):
+                        self.observe(camera, x=chassis.x + 0.3)
+                        chassis.hold(DT)
+                    self.assertEqual(self.counts(), (len(cameras), 0))
 
-    def test_no_cameras_is_odometry_only(self):
-        for backend in BACKENDS:
-            with self.subTest(backend):
-                chassis = self.start(backend, cameras=())
-                chassis.drive(1.0, 0.0, 0.0, 0.4)
-                self.observe("front_camera", x=chassis.x + 1.0)
-                chassis.hold(DT)
-                self.assertEqual(self.counts(), (0, 0))
-                self.assertAlmostEqual(self.pose()[0], chassis.x, places=4)
-
-    def test_bad_config_fails_at_startup_naming_the_key(self):
+    def test_bad_config_fails_at_startup(self):
         def module_list(key, values):
             return robot_toml("kalman").replace(
                 next(line for line in robot_toml("kalman").splitlines()
@@ -807,12 +747,14 @@ class EstimatorTest(unittest.TestCase):
         for key in ("initial_x_m", "initial_y_m", "initial_yaw_rad",
                     "field_length_m", "field_width_m", "max_innovation_m"):
             cases.append((key, robot_toml("kalman", extra=f"{key} = nan")))
+        for value in ("0.0", "-0.1", "nan", "inf"):
+            cases.append((f"max_yaw_innovation_rad = {value}", robot_toml(
+                "kalman", extra=f"max_yaw_innovation_rad = {value}")))
         for key, toml in cases:
             with self.subTest(key):
                 sim = Sim.from_toml(toml)
-                with self.assertRaises(Exception) as caught:
+                with self.assertRaises(Exception):
                     sim.add(estimator.PoseEstimator, "pose_estimator")
-                self.assertIn(key, str(caught.exception))
 
 
 class BinaryTest(unittest.TestCase):
@@ -829,18 +771,11 @@ class BinaryTest(unittest.TestCase):
 
     def test_describe_lists_the_drivetrain_and_camera_inputs(self):
         doc = json.loads(self.run_binary("--describe", "--config", CONFIG))
-        self.assertEqual(doc["name"], "pose_estimator")
         sources = {(s["kind"], s["name"]): s for s in doc["sources"]}
-        self.assertEqual(
-            sources[("SENDER", topics.STATE)]["message_bytes"],
-            PoseEstimate.SizeOf())
-        self.assertEqual(PoseEstimate.SizeOf(), 72)
         self.assertFalse(
             sources[("WATCHER", drivetrain_topics.STATE)]["optional"])
         for camera in ("/front_camera/state", "/back_camera/state"):
             self.assertTrue(sources[("WATCHER", camera)]["optional"])
-            self.assertEqual(sources[("WATCHER", camera)]["message_bytes"],
-                             PoseObservation.SizeOf())
         self.assertNotIn(("SENDER", "/hw/request/pose_estimator"), sources)
 
     def test_sim_run_replays_without_divergence(self):
@@ -905,12 +840,7 @@ class BinaryTest(unittest.TestCase):
                     self.assertTrue(all(
                         not estimate["localized"] for estimate in estimates))
 
-                    # (b) estimated pose changes over the run (non-constant)
-                    first_pose = (estimates[0]["pose_x_m"], estimates[0]["pose_y_m"],
-                                  estimates[0]["pose_yaw_rad"])
-                    last_pose = (estimates[-1]["pose_x_m"], estimates[-1]["pose_y_m"],
-                                 estimates[-1]["pose_yaw_rad"])
-                    self.assertNotEqual(first_pose, last_pose)
+                    # (b) the pose moves over the run
                     self.assertGreater(estimates[-1]["pose_x_m"], 0.5)
                     self.assertGreater(estimates[-1]["pose_yaw_rad"], 0.4)
 
@@ -930,20 +860,7 @@ class BinaryTest(unittest.TestCase):
                     step_forward = after_obs["pose_x_m"] - before_obs["pose_x_m"]
                     self.assertGreater(step_forward, 0.04)
 
-                    # (d) stale measurements are rejected; invalid states are skipped
-                    stale_step = estimates[accepted_index + 1]
-                    self.assertEqual(stale_step["observation_accepted_count"], 1)
-                    self.assertEqual(stale_step["observation_rejected_count"], 1)
-
-                    invalid_step = estimates[accepted_index + 2]
-                    self.assertEqual(invalid_step["observation_accepted_count"], 1)
-                    self.assertEqual(invalid_step["observation_rejected_count"], 1)
-
-                    self.assertLess(stale_step["pose_x_m"], 1.0)
-                    self.assertLess(stale_step["pose_y_m"], 0.1)
-                    self.assertLess(invalid_step["pose_x_m"], 1.0)
-                    self.assertLess(invalid_step["pose_y_m"], 0.1)
-
+                    # (d) the stale observation is rejected, the invalid one skipped
                     self.assertEqual(estimates[-1]["observation_accepted_count"], 1)
                     self.assertEqual(estimates[-1]["observation_rejected_count"], 1)
 

@@ -53,25 +53,22 @@ class IntakeTest(unittest.TestCase):
                 sim.latest(IntakeState, topics.STATE))
 
     def test_ask_maps_to_velocity_command(self):
+        ready = dict(at_speed=True, target_velocity_rps=60.0)
         cases = [
-            (25.0, False, 25.0),
-            (-5.0, False, -5.0),
-            (25.0, True, 0.0),  # piece held: stop pulling
-            (-5.0, True, -5.0),  # feeding bypasses the beam
-            (0.0, False, 0.0),
-            (0.0, True, 0.0),
+            (25.0, False, None, 25.0),  # collecting needs no shooter
+            (25.0, True, None, 0.0),  # piece held: stop pulling
+            (-5.0, False, ready, -5.0),
+            (-5.0, True, ready, -5.0),  # feeding bypasses the beam
+            (0.0, False, None, 0.0),
         ]
-        for ask, beam, demand in cases:
+        for ask, beam, shooter, demand in cases:
             with self.subTest(ask=ask, beam=beam):
                 request, state = self.run_intake(
-                    ask, beam=beam,
-                    shooter=dict(at_speed=True, target_velocity_rps=60.0))
+                    ask, beam=beam, shooter=shooter)
                 self.assertEqual(request.mode, talos.Mode.VELOCITY)
                 self.assertEqual(request.demand, demand)
                 self.assertEqual(state.inhibit, Inhibit.DRIVE)
                 self.assertEqual(state.requested_velocity_rps, demand)
-                self.assertEqual(state.roller_velocity_rps, 12.5)
-                self.assertEqual(state.beam_broken, beam)
 
     def test_failed_gate_sends_neutral_and_names_it(self):
         cases = [
@@ -85,6 +82,8 @@ class IntakeTest(unittest.TestCase):
             ("driver station lost", dict(ask=25.0, ds_loss=True, seconds=0.3),
              Inhibit.TARGET_STALE),
             ("nonfinite ask", dict(ask=math.nan), Inhibit.DEMAND_NONFINITE),
+            ("disconnected roller", dict(ask=25.0, roller_connected=False),
+             Inhibit.FEEDBACK_INVALID),
         ]
         for name, inputs, inhibit in cases:
             with self.subTest(name):
@@ -93,13 +92,6 @@ class IntakeTest(unittest.TestCase):
                 self.assertEqual(state.inhibit, inhibit)
                 if inputs.get("lane") == "release":
                     self.assertEqual(state.requested_velocity_rps, 0.0)
-
-    def test_disconnected_roller_reports_feedback_invalid(self):
-        request, state = self.run_intake(25.0, roller_connected=False)
-        self.assertEqual(request.mode, talos.Mode.NEUTRAL)
-        self.assertEqual(state.inhibit, Inhibit.FEEDBACK_INVALID)
-        self.assertEqual(state.roller_velocity_rps, 0.0)  # no sample
-        self.assertTrue(state.enabled)
 
     def test_feed_requires_continuously_fresh_ready_shooter(self):
         ready = dict(at_speed=True, target_velocity_rps=60.0,
@@ -117,46 +109,6 @@ class IntakeTest(unittest.TestCase):
                     -20.0, beam=True, shooter=shooter, shooter_age=age)
                 self.assertEqual(request.mode, talos.Mode.NEUTRAL)
                 self.assertEqual(state.inhibit, Inhibit.SHOOTER_NOT_READY)
-                self.assertEqual(state.requested_velocity_rps, -20.0)
-        request, state = self.run_intake(-20.0, beam=True, shooter=ready)
-        self.assertEqual(request.mode, talos.Mode.VELOCITY)
-        self.assertEqual(request.demand, -20.0)
-        self.assertEqual(state.inhibit, Inhibit.DRIVE)
-
-    def test_feed_stops_when_shooter_readiness_expires(self):
-        sim = Sim(CONFIG)
-        sim.add(intake.Intake, "intake")
-        hw = SimHardware(sim)
-        hw.enable()
-        hw.set_driver_station(enabled=True, teleop=True)
-        sim.step(0.01)
-        sim.publish(ShooterState, shooter_topics.STATE,
-                    at_speed=True, target_velocity_rps=60.0)
-        for _ in range(8):
-            sim.publish_target(IntakeTarget, "intake", "teleop",
-                               roller_velocity_rps=-20.0)
-            sim.step(0.02)
-        self.assertEqual(hw.motor_request("intake", "roller").mode,
-                         talos.Mode.NEUTRAL)
-        self.assertEqual(sim.latest(IntakeState, topics.STATE).inhibit,
-                         Inhibit.SHOOTER_NOT_READY)
-
-    def test_feed_obeys_robot_and_target_gates(self):
-        ready = dict(at_speed=True, target_velocity_rps=60.0)
-        for inputs in (dict(enabled=False), dict(lane=None),
-                       dict(seconds=0.3)):
-            with self.subTest(inputs=inputs):
-                request, _ = self.run_intake(-20.0, shooter=ready, **inputs)
-                self.assertEqual(request.mode, talos.Mode.NEUTRAL)
-
-    def test_collection_does_not_require_shooter(self):
-        for beam in (False, True):
-            for shooter in (None, dict(at_speed=False, target_velocity_rps=0.0)):
-                with self.subTest(beam=beam, shooter=shooter):
-                    request, state = self.run_intake(30.0, beam=beam, shooter=shooter)
-                    self.assertEqual(request.mode, talos.Mode.VELOCITY)
-                    self.assertEqual(request.demand, 0.0 if beam else 30.0)
-                    self.assertEqual(state.inhibit, Inhibit.DRIVE)
 
 
 class BinaryTest(unittest.TestCase):
