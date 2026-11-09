@@ -73,7 +73,8 @@ The RoboRIO program must be redeployed with this branch: protocol v4 refuses old
 
 ## Open software items
 
-- [ ] **MAC-1 — macOS CI green on this branch.** **Reproduced (CI).** PR #3's first macOS run failed four targets that pass on Linux; fixes are in, a macOS rerun has to confirm them. The Mini is the deployment computer, so a red macOS job blocks the bench.
+- [ ] **MAC-1 — CI green on this branch, macOS included.** **Reproduced (CI).** PR #3 runs 42565601869 and 42568853273 failed tests that pass locally: BSD loopback receive timing, a rehearsal that read a SIGKILLed recorder, a vision test with negative stamps, an ASan fixture race, an ASan calibration timeout and a host-dependent fusion premise. Each has a commit with a local reproduction; the next run must confirm. Two failures were infrastructure (Gradle wrapper and buildifier downloads, HTTP 504).
+- [ ] **LINT-1 — clang-tidy on branch-changed files.** **Reproduced (CI).** The clang-tidy job checks every file the branch touches, whole-file: 229 findings (90 unchecked optional access, mostly in tests after `ASSERT_TRUE`; 57 missing braces; 22 narrowing; 22 string concatenation; 17 enum-cast-out-of-range; a use-after-move and two empty catches worth reading first). Either fix them or check only changed lines (`clang-tidy-diff`); that is a CI policy decision.
 - [ ] **TELEMETRY-1 — One spare channel on the physics-sim graph.** **Measured.** Any new state scalar needs an exclude (or a frame-format change) in the same commit; an overflow already fails `talos_graph_test`. Multi-frame scheduling only if essential channels need it.
 - [ ] **TIME-3 — Tick-time target age is not recorded.** **Source.** `session_report` measures receipt age but not the age of the target a consumer used at its tick (BRINGUP "about 25 ms at most"); that needs a logged per-tick selected-target timestamp.
 
