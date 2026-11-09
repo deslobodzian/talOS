@@ -72,6 +72,16 @@ class LogReader {
   std::size_t record_count_{0};
 };
 
+// What LogReader would report after reading a log to its end -- record count
+// and whether the file ends mid record -- without holding the file: it
+// streams through a fixed buffer, so memory does not grow with the log. It
+// validates exactly what LogReader does and throws the same errors.
+struct LogSummary {
+  std::size_t record_count{0};
+  bool truncated{false};
+};
+LogSummary SummarizeLog(std::string_view path);
+
 // A session directory's event logs: every `*.tlog` in it (the launcher
 // writes one per node run, restarts included), sorted by path. A path that is
 // not a directory is returned as the one log it names.

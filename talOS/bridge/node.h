@@ -65,7 +65,7 @@ class HardwareNode {
                         std::string remote_ip = "127.0.0.1",
                         uint16_t remote_port = 5802, uint16_t local_port = 5803,
                         bool simulation = false, uint64_t session_id = 0,
-                        std::string log_path = {});
+                        std::string log_path = {}, uint64_t log_max_bytes = 0);
 
   ~HardwareNode() = default;
 
@@ -183,6 +183,7 @@ class HardwareNode {
   std::optional<introspect::NodeRegistration> registration_;
   uint64_t session_id_{0};
   std::string log_path_;
+  uint64_t log_max_bytes_{0};
   std::unique_ptr<event::log::LogWriter> log_;
   bool log_failure_reported_{false};
   State latest_state_{};

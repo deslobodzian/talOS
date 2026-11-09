@@ -500,6 +500,66 @@ TEST(LauncherTest, FailingBridgeRetriesInLoopWithoutBlockingSession) {
   ::remove(counter.c_str());
 }
 
+TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
+  const auto root = TempPath("budget_restart");
+  const auto attempts = root + "/attempts";
+  std::filesystem::create_directories(root);
+  LauncherOptions options;
+  options.output_dir = root;
+  options.session_id = 12345;
+  options.simulation = true;
+  options.duration_s = 2;
+  options.config_path = root + "/robot.toml";
+  std::string config{kFixtureToml};
+  config.insert(config.find("name ="), "log_max_bytes = 1200\n");
+  std::ofstream{options.config_path} << config;
+  const auto session = root + "/12345";
+  std::string script = NodeDescribeThenSleep("alpha", "//example/alpha:node",
+                                             {Sender("/alpha/state")}, 0);
+  script.erase(script.rfind("exec sleep"));
+  script +=
+      "log=''\ncap=''\n"
+      "while [ $# -gt 0 ]; do\n"
+      " case \"$1\" in\n"
+      " --log) shift; log=\"$1\" ;;\n"
+      " --log-max-bytes) shift; cap=\"$1\" ;;\n"
+      " esac\n shift\n done\n"
+      "echo \"$cap\" >> '" +
+      attempts +
+      "'\n"
+      "[ -n \"$cap\" ] || exit 2\n"
+      "if [ ! -f '" +
+      root +
+      "/once' ]; then\n"
+      " touch '" +
+      root +
+      "/once'\n"
+      " dd if=/dev/zero of=\"$log\" bs=1 count=100 2>/dev/null\n"
+      " ln -s /dev/full '" +
+      session +
+      "/manifest.json.tmp'\n"
+      " exit 1\nfi\n"
+      "touch \"$log.capped\"\nexec sleep 5\n";
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStubNode("budget_alpha", script);
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      "budget_beta", NodeDescribeThenSleep("beta", "//example/beta:node",
+                                           {Watcher("/alpha/state")}, 5));
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      "budget_hw", NodeDescribeThenSleep(
+                       "hardware_node", "//talOS/bridge:hardware_node", {}, 5));
+  ::testing::internal::CaptureStderr();
+  Launcher launcher{options};
+  launcher.Run();
+  const auto errors = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(errors.find("supervision continues"), std::string::npos) << errors;
+  EXPECT_EQ(ReadFile(attempts), "200\n100\n");
+  const auto manifest = ReadFile(session + "/manifest.json");
+  EXPECT_NE(manifest.find("\"restart_count\": 1"), std::string::npos);
+  EXPECT_NE(manifest.find("\"log_capped\": true"), std::string::npos);
+  std::filesystem::remove_all(root);
+}
+
 // The duration deadline starts with the session, not after the viewer: a
 // failing bridge plus long-lived nodes must still end near --duration-s.
 TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {

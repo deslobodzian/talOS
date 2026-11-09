@@ -25,7 +25,8 @@ static_assert(sizeof(bridge::BridgeStatus) == 160,
 HardwareNode::HardwareNode(config::RobotConfig robot_config,
                            std::string remote_ip, uint16_t remote_port,
                            uint16_t local_port, bool simulation,
-                           uint64_t session_id, std::string log_path)
+                           uint64_t session_id, std::string log_path,
+                           uint64_t log_max_bytes)
     : robot_config_{std::move(robot_config)},
       config_{robot_config_.hardware},
       remote_ip_{std::move(remote_ip)},
@@ -33,7 +34,8 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
       local_port_{local_port},
       simulation_{simulation},
       session_id_{session_id},
-      log_path_{std::move(log_path)} {
+      log_path_{std::move(log_path)},
+      log_max_bytes_{log_max_bytes} {
   if (simulation_ && remote_ip_ != "127.0.0.1") {
     throw std::invalid_argument(
         "--sim requires --remote 127.0.0.1, got --remote " + remote_ip_);
@@ -144,8 +146,10 @@ bool HardwareNode::Open() {
 
   BuildIntrospectionManifest();
   if (!log_path_.empty()) {
-    log_ = std::make_unique<event::log::LogWriter>(
-        log_path_, kNodeName, event::log::LogWriter::Options{}, session_id_);
+    event::log::LogWriter::Options options;
+    options.max_bytes = log_max_bytes_;
+    log_ = std::make_unique<event::log::LogWriter>(log_path_, kNodeName,
+                                                   options, session_id_);
     log_->start(introspection_manifest_, event::Poller::now());
   }
 
@@ -584,8 +588,8 @@ void HardwareNode::LogPacket(uint16_t source_id, const Packet& packet,
   const event::Context context{.event_time = now, .now = now};
   log_->send(context, source_id,
              std::as_bytes(std::span{&packet, std::size_t{1}}), 0, sequence);
-  if (log_->failed() && !log_failure_reported_) {
-    std::fprintf(stderr, "hardware_node: log capture failed: %s\n",
+  if (log_->capture_stopped() && !log_failure_reported_) {
+    std::fprintf(stderr, "hardware_node: log capture stopped: %s\n",
                  log_->error().c_str());
     log_failure_reported_ = true;
   }

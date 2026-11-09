@@ -29,6 +29,7 @@ LogWriter::LogWriter(std::string_view path, std::string_view process_name,
     options.chunk_count = 1;
   }
 
+  state_->path = std::string{path};
   state_->process_name = std::string{process_name};
   state_->session_id = session_id;
   state_->options = options;
@@ -124,6 +125,7 @@ void LogWriter::State::write_chunk(Chunk& chunk) noexcept {
 }
 
 void LogWriter::State::sync() noexcept {
+  if (fd < 0) return;
   int result;
   do {
     result = ::fsync(fd);
@@ -132,6 +134,23 @@ void LogWriter::State::sync() noexcept {
     set_error(std::string{"LogWriter: fsync failed: "} + std::strerror(errno));
   }
   last_sync = std::chrono::steady_clock::now();
+  mark_capped();
+}
+
+// Off the producer path: the periodic sync, drain and close call it.
+void LogWriter::State::mark_capped() noexcept {
+  if (capped_marked || capture_error.load() != CaptureError::BYTE_CAP) return;
+  capped_marked = true;
+  const std::string marker = CappedMarkerPath(path);
+  const int marker_fd =
+      ::open(marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (marker_fd < 0) {
+    set_error(std::string{"LogWriter: cannot create "} + marker + ": " +
+              std::strerror(errno));
+    return;
+  }
+  ::fsync(marker_fd);
+  ::close(marker_fd);
 }
 
 void LogWriter::State::submit_active() noexcept {
@@ -192,6 +211,10 @@ void LogWriter::State::append(RecordHeader header,
       payload.empty() ? crc_after_header : crc32(payload, crc_after_header);
 
   const std::size_t total = sizeof(RecordHeader) + payload.size();
+  if (options.max_bytes != 0 && accepted_bytes + total > options.max_bytes) {
+    capture_error.store(CaptureError::BYTE_CAP);
+    return;
+  }
 
   if (active == nullptr) {
     acquire_chunk();
@@ -221,6 +244,7 @@ void LogWriter::State::append(RecordHeader header,
                 payload.data(), payload.size());
   }
   active->used += total;
+  accepted_bytes += total;
   if (options.background) {
     active->committed.store(active->used, std::memory_order_release);
   } else if (std::chrono::steady_clock::now() - last_sync >=
@@ -314,6 +338,19 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
   header.schema_bytes = schemas.size();
   write_name(header.process_name, state.process_name);
 
+  const auto prefix_bytes =
+      sizeof(header) + manifest_bytes.size() + schemas.size();
+  if (state.options.max_bytes != 0 && prefix_bytes > state.options.max_bytes) {
+    // No valid log fits. Do not spend the budget on an unreadable prefix,
+    // and do not let a policy limit stop the node itself.
+    state.capture_error.store(State::CaptureError::BYTE_CAP);
+    ::close(state.fd);
+    state.fd = -1;
+    ::unlink(state.path.c_str());
+    state.mark_capped();
+    return;
+  }
+
   // Written inline, before the writer thread exists, so the header can never
   // race a buffered chunk to the front of the file.
   state.write_all(&header, sizeof(header));
@@ -323,6 +360,8 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
   if (!schemas.empty()) {
     state.write_all(schemas.data(), schemas.size());
   }
+  state.accepted_bytes =
+      sizeof(header) + manifest_bytes.size() + schemas.size();
 
   if (!state.options.background || state.writer.joinable()) {
     return;
@@ -417,8 +456,9 @@ void LogWriter::finish(const Context& context) noexcept {
 void LogWriter::flush() noexcept { state_->drain(); }
 
 bool LogWriter::failed() const noexcept {
-  return state_->failed ||
-         state_->capture_error.load() != State::CaptureError::NONE;
+  const auto capture = state_->capture_error.load();
+  return state_->failed || (capture != State::CaptureError::NONE &&
+                            capture != State::CaptureError::BYTE_CAP);
 }
 
 std::string LogWriter::error() const {
@@ -427,15 +467,26 @@ std::string LogWriter::error() const {
       return "LogWriter: buffer pool exhausted; capture stopped";
     case State::CaptureError::RECORD_TOO_LARGE:
       return "LogWriter: record exceeds preallocated capacity; capture stopped";
+    case State::CaptureError::BYTE_CAP:
     case State::CaptureError::NONE:
       break;
   }
   std::lock_guard lock{state_->error_mutex};
+  if (state_->error.empty() &&
+      state_->capture_error.load() == State::CaptureError::BYTE_CAP) {
+    return "LogWriter: byte cap of " +
+           std::to_string(state_->options.max_bytes) +
+           " reached; capture stopped";
+  }
   return state_->error;
 }
 
 bool LogWriter::capture_stopped() const noexcept {
   return state_->capture_error.load() != State::CaptureError::NONE;
+}
+
+bool LogWriter::capped() const noexcept {
+  return state_->capture_error.load() == State::CaptureError::BYTE_CAP;
 }
 
 }  // namespace talos::event::log

@@ -51,7 +51,21 @@ struct LogWriterOptions {
   // Without a background thread, the one-second sync is checked on append;
   // an idle synchronous writer must be flushed explicitly.
   bool background{true};
+
+  // Bytes the file may grow to: header, manifest and schema block included.
+  // A record that would cross the cap stops capture for good (capped()):
+  // the file keeps every whole record accepted before it, so it still reads,
+  // and `<path>.capped` (CappedMarkerPath) is created within about a second
+  // and at close, so whoever reads the file afterwards knows it is
+  // incomplete. Zero is unbounded. If the header/manifest cannot fit, no log
+  // is created; only the empty cap marker remains.
+  std::uint64_t max_bytes{0};
 };
+
+// The marker a byte-capped writer leaves next to its log (see max_bytes).
+inline std::string CappedMarkerPath(std::string_view log_path) {
+  return std::string{log_path} + ".capped";
+}
 
 class LogWriter {
  public:
@@ -97,18 +111,24 @@ class LogWriter {
   void flush() noexcept;
 
   // True once anything has gone wrong: the disk refused a write, or capture
-  // stopped. Treat it as a fault on the robot; a log that stops early is a log
-  // you cannot replay the rest of the match from.
+  // stopped because the writer fell behind. Treat it as a fault on the robot;
+  // a log that stops early is a log you cannot replay the rest of the match
+  // from. Reaching the configured byte cap is policy, not a fault: it shows
+  // in capped(), not here.
   bool failed() const noexcept;
   std::string error() const;
 
-  // True when the loop outran the writer and capture was abandoned, as opposed
-  // to a disk error. Sticky, because capture never resumes: doing so would
-  // leave a hole in the middle of the log and replay would silently skip it.
+  // True when capture was abandoned -- the loop outran the writer, a record
+  // was too large, or the byte cap was reached -- as opposed to a disk error.
+  // Sticky, because capture never resumes: doing so would leave a hole in the
+  // middle of the log and replay would silently skip it.
   //
   // This never waits and the producer never blocks on it, which is the whole
   // point: a control loop must not stall behind a slow disk.
   bool capture_stopped() const noexcept;
+
+  // True once a record would have crossed Options::max_bytes.
+  bool capped() const noexcept;
 
   std::uint64_t session_id() const noexcept;
 
@@ -132,14 +152,19 @@ class LogWriter {
     void write_chunk(Chunk& chunk) noexcept;
     void write_all(const void* data, std::size_t size);
     void sync() noexcept;
+    void mark_capped() noexcept;
     void drain() noexcept;
     void stop_writer() noexcept;
     void set_error(std::string message) noexcept;
 
     int fd{-1};
+    std::string path;
     std::string process_name;
     std::uint64_t session_id{0};
     Options options;
+    // File bytes accepted so far. Producer only, after start().
+    std::uint64_t accepted_bytes{0};
+    bool capped_marked{false};  // Under mutex (or the only thread).
 
     std::deque<Chunk> pool;
     std::chrono::steady_clock::time_point last_sync{
@@ -148,7 +173,7 @@ class LogWriter {
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<std::uint64_t> completed{0};
 
-    enum class CaptureError { NONE, POOL_FULL, RECORD_TOO_LARGE };
+    enum class CaptureError { NONE, POOL_FULL, RECORD_TOO_LARGE, BYTE_CAP };
     std::atomic<CaptureError> capture_error{CaptureError::NONE};
 
     mutable std::mutex mutex;

@@ -37,6 +37,7 @@
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
+#include "talOS/events/log/log_writer.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/registry.h"
@@ -91,6 +92,9 @@ struct NodeProcessInfo {
   bool quarantined{false};
   int64_t retry_at_monotonic_ns{0};  // Zero when no restart is pending.
   bool failed{false};
+  // A run's event log reached its share of the session log budget and stopped
+  // early (`<log>.capped`): the recording is incomplete, not corrupt.
+  bool log_capped{false};
   uint64_t record_count{0};
   // Whether this binary answered --describe: a session whose graph was never
   // checked otherwise reads exactly like one whose graph passed.
@@ -141,6 +145,8 @@ struct SessionManifest {
       ss << "      \"retry_at_monotonic_ns\": " << n.retry_at_monotonic_ns
          << ",\n";
       ss << "      \"recorder_failed\": " << (n.failed ? "true" : "false")
+         << ",\n";
+      ss << "      \"log_capped\": " << (n.log_capped ? "true" : "false")
          << ",\n";
       ss << "      \"described\": " << (n.described ? "true" : "false")
          << ",\n";
@@ -1310,7 +1316,7 @@ class Launcher {
           << effective_remote << "\n";
       return 1;
     }
-    ApplyRetention(robot_config);
+    const uint64_t session_log_budget = ApplyRetention(robot_config);
     std::string restart_error;
     if (!ResolveMaxRestarts(robot_config, options_, max_restarts_,
                             restart_error)) {
@@ -1408,6 +1414,13 @@ class Launcher {
       }
       if (!proc.log_path.empty()) proc.log_paths.push_back(proc.log_path);
     }
+    // Each logging member's share of the session's log budget; its restarts
+    // draw on what its earlier runs left (Restart).
+    const auto loggers = static_cast<uint64_t>(
+        std::count_if(procs.begin(), procs.end(),
+                      [](const auto& p) { return !p.log_path.empty(); }));
+    const uint64_t node_log_budget = std::max<uint64_t>(
+        1, session_log_budget / std::max<uint64_t>(1, loggers));
     PersistManifest(procs);
 
     InstallSignals();
@@ -1450,8 +1463,10 @@ class Launcher {
         args.insert(args.end(), {"--session-id",
                                  std::to_string(options_.session_id), "--log"});
         launches[i].log_arg = args.size();
-        args.insert(args.end(),
-                    {proc.log_path, "--config", options_.config_path});
+        launches[i].log_budget = node_log_budget;
+        args.insert(args.end(), {proc.log_path, "--log-max-bytes",
+                                 std::to_string(node_log_budget), "--config",
+                                 options_.config_path});
         if (options_.simulation) args.push_back("--sim");
         // Started with the graph it was described with (DescribeGraph).
         if (described[i].answered && described[i].declared.reads_graph) {
@@ -1491,14 +1506,14 @@ class Launcher {
     for (auto& proc : procs) {
       // Every run's log: a restarted node's records are the sum of its runs.
       for (const auto& path : proc.log_paths) {
+        if (std::filesystem::exists(event::log::CappedMarkerPath(path)))
+          proc.log_capped = true;
         if (!std::filesystem::exists(path)) continue;
+        // Streamed: shutdown memory does not grow with the logs' size.
         try {
-          event::log::LogReader reader{path};
-          event::log::LogReader::Record record;
-          while (reader.next(record)) {
-          }
-          proc.record_count += reader.record_count();
-          if (reader.truncated()) proc.failed = true;
+          const auto summary = event::log::SummarizeLog(path);
+          proc.record_count += summary.record_count;
+          if (summary.truncated) proc.failed = true;
         } catch (...) {
           proc.failed = true;
         }
@@ -1514,31 +1529,54 @@ class Launcher {
   }
 
  private:
+  // Never throws: a full disk (ENOSPC) or an unwritable session directory
+  // must not end supervision of a running robot. The last complete manifest
+  // stays in place, a partial temporary file is removed so it holds no disk,
+  // and the next lifecycle change retries. The first failure is logged once,
+  // and so is the recovery.
   void PersistManifest(const std::vector<NodeProcessInfo>& procs) {
     session_manifest_.nodes = procs;
     const std::string path = options_.output_dir + "/manifest.json";
     const std::string temporary = path + ".tmp";
+    const auto fail = [&](std::string_view step, int error) {
+      std::remove(temporary.c_str());
+      if (!manifest_failing_) {
+        std::cerr << "[launcher] cannot persist " << path << " (" << step
+                  << ": " << std::strerror(error)
+                  << "); supervision continues and retries at the next "
+                     "change\n";
+      }
+      manifest_failing_ = true;
+    };
     FILE* file = std::fopen(temporary.c_str(), "wb");
-    if (file == nullptr) throw std::runtime_error("cannot create " + temporary);
+    if (file == nullptr) return fail("create", errno);
     const std::string json = session_manifest_.ToJson();
-    const bool written =
-        std::fwrite(json.data(), 1, json.size(), file) == json.size();
-    const bool flushed = std::fflush(file) == 0;
-    const bool synced = ::fsync(::fileno(file)) == 0;
-    const bool closed = std::fclose(file) == 0;
-    if (!written || !flushed || !synced || !closed ||
-        std::rename(temporary.c_str(), path.c_str()) != 0) {
-      throw std::runtime_error("cannot persist " + path);
-    }
+    int error = 0;
+    if (std::fwrite(json.data(), 1, json.size(), file) != json.size() ||
+        std::fflush(file) != 0 || ::fsync(::fileno(file)) != 0)
+      error = errno;
+    if (std::fclose(file) != 0 && error == 0) error = errno;
+    if (error != 0) return fail("write", error);
+    if (std::rename(temporary.c_str(), path.c_str()) != 0)
+      return fail("rename", errno);
     const int directory = ::open(options_.output_dir.c_str(), O_RDONLY);
-    if (directory < 0)
-      throw std::runtime_error("cannot open session directory");
+    if (directory < 0) return fail("open session directory", errno);
     const int result = ::fsync(directory);
+    error = errno;
     ::close(directory);
-    if (result != 0) throw std::runtime_error("cannot sync session directory");
+    if (result != 0) return fail("sync session directory", error);
+    if (manifest_failing_) {
+      std::cerr << "[launcher] " << path << " persisted again\n";
+      manifest_failing_ = false;
+    }
   }
 
-  void ApplyRetention(const config::RobotConfig& config) {
+  // Removes the oldest recognized sessions until at most `log_keep_sessions`
+  // remain (the new one included) and they hold at most the half of
+  // `log_max_bytes` the new session does not get. Returns the new session's
+  // log budget: the other half, which its event writers are capped to.
+  // Graph/manifest metadata and non-event captures require separate headroom.
+  uint64_t ApplyRetention(const config::RobotConfig& config) {
     const auto robot = config.toml_data["robot"];
     const int64_t cap = robot["log_keep_sessions"].value_or(int64_t{50});
     const int64_t budget =
@@ -1546,6 +1584,9 @@ class Launcher {
     if (cap < 1 || budget < 1)
       throw std::runtime_error(
           "log_keep_sessions and log_max_bytes must be positive");
+    const auto session_budget = static_cast<uint64_t>(budget) / 2;
+    const uint64_t retained_budget =
+        static_cast<uint64_t>(budget) - session_budget;
     struct Session {
       std::filesystem::path path;
       std::filesystem::file_time_type time;
@@ -1578,19 +1619,22 @@ class Launcher {
     std::size_t count = sessions.size() + 1;
     for (const auto& session : sessions) {
       if (session.path == current) continue;
-      if (count <= static_cast<uint64_t>(cap) &&
-          total <= static_cast<uint64_t>(budget))
+      if (count <= static_cast<uint64_t>(cap) && total <= retained_budget)
         break;
       std::filesystem::remove_all(session.path);
       total -= session.bytes;
       --count;
     }
+    return session_budget;
   }
 
   // How one roster member is spawned, and its pending restart.
   struct NodeLaunch {
     std::vector<std::string> args;
     std::size_t log_arg{0};  // Index of the --log value in args; 0 for none.
+    // Bytes all of this member's runs may log together (its share of the
+    // session budget); a restart gets what earlier runs left.
+    uint64_t log_budget{0};
     bool restart_pending{false};
     bool last_exit_clean{false};  // Its latest run exited 0.
     bool critical{true};
@@ -1688,6 +1732,15 @@ class Launcher {
     if (launch.log_arg != 0) {
       launch.args[launch.log_arg] =
           NodeLogPath(options_.output_dir, proc.name, restart);
+      uint64_t used = 0;
+      for (const auto& path : proc.log_paths) {
+        std::error_code error;
+        const auto bytes = std::filesystem::file_size(path, error);
+        if (!error) used += bytes;
+      }
+      // 0 means unbounded to the writer; 1 means no valid header can fit.
+      launch.args[launch.log_arg + 2] = std::to_string(
+          used >= launch.log_budget ? 1 : launch.log_budget - used);
     }
     const pid_t pid = SpawnProcess(launch.args);
     if (pid < 0) {
@@ -1991,6 +2044,7 @@ class Launcher {
 
   LauncherOptions options_;
   SessionManifest session_manifest_;
+  bool manifest_failing_{false};
   int max_restarts_{kDefaultMaxRestarts};
   static inline volatile std::sig_atomic_t stop_requested_{false};
 };

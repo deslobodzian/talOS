@@ -97,6 +97,23 @@ restarts of the service never reuse a previous session folder. For a manual
 run to use the same root, set `TALOS_LOG_DIR=/opt/talos/logs` or pass
 `--output-dir /opt/talos/logs`; `logs LOG_ROOT` can inspect another output root.
 
+Event recording has a live byte budget: `[robot] log_max_bytes` (default
+2 GiB) reserves half for the active session and half for retained sessions.
+The active share is divided equally among event-logging nodes, including the
+hardware bridge; each restart receives only its node's unused bytes.
+Writers stop before a whole record would exceed their share, keep the valid
+readable prefix, and report `recording_capped=1`. An empty `<log>.capped`
+marker and manifest node `log_capped: true` mean incomplete capture, not a
+corrupt log or a reason to stop control. If even the header/manifest cannot
+fit, only the marker is created. Shutdown record counting streams through a
+fixed 64 KiB buffer instead of loading recordings into memory.
+`log_keep_sessions` (default 50) still bounds retained session count.
+This is an event-log byte budget, not a filesystem quota: graph/manifest
+metadata, Studio stdout and separately configured camera recordings need
+additional space. A manifest write failure (including ENOSPC) logs once per
+failure episode and leaves supervision running; the next lifecycle update
+retries without replacing the last complete manifest with a partial file.
+
 ## Supervision and service recovery
 
 Boot probes each node before spawning the graph. `[subsystem] critical = true`

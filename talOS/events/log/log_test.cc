@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -853,6 +854,148 @@ TEST(LogBackgroundWriter, RepeatedFlushReusesChunksInOrder) {
     EXPECT_EQ(record.payload.size(), 16);
   }
   EXPECT_FALSE(reader.next(record));
+  ::unlink(path.c_str());
+}
+
+// SummarizeLog agrees with LogReader read to its end, on a whole log, a
+// truncated one, and the corruptions LogReader rejects.
+TEST(LogSummary, MatchesTheReaderAndRejectsTheSameCorruption) {
+  const std::string path = TempPath("summary");
+  const std::vector<ExpectedRecord> expected =
+      WriteFixture(path, LogWriter::kDefaultBufferBytes);
+  LogSummary summary = SummarizeLog(path);
+  EXPECT_EQ(summary.record_count, expected.size());
+  EXPECT_FALSE(summary.truncated);
+
+  ASSERT_EQ(0,
+            ::truncate(path.c_str(), static_cast<off_t>(FileSize(path) - 20)));
+  summary = SummarizeLog(path);
+  LogReader reader{path};
+  LogReader::Record record;
+  while (reader.next(record)) {
+  }
+  EXPECT_EQ(summary.record_count, reader.record_count());
+  EXPECT_TRUE(summary.truncated);
+  EXPECT_TRUE(reader.truncated());
+
+  WriteFixture(path, LogWriter::kDefaultBufferBytes);
+  FlipByte(path, sizeof(FileHeader) + 10);  // the manifest block
+  EXPECT_THROW(SummarizeLog(path), std::runtime_error);
+
+  WriteFixture(path, LogWriter::kDefaultBufferBytes);
+  std::size_t offset = RecordsOffset();
+  for (const auto& entry : expected) {
+    if (StoredSize(entry.payload) != 0) break;
+    offset += sizeof(RecordHeader);
+  }
+  FlipByte(path, offset + sizeof(RecordHeader));  // first stored payload byte
+  EXPECT_THROW(SummarizeLog(path), std::runtime_error);
+
+  WriteFixture(path, LogWriter::kDefaultBufferBytes);
+  FlipByte(path, 0);
+  EXPECT_THROW(SummarizeLog(path), std::runtime_error);
+  ::unlink(path.c_str());
+}
+
+long PeakRssKiB() {
+  rusage usage{};
+  ::getrusage(RUSAGE_SELF, &usage);
+#ifdef __APPLE__
+  return usage.ru_maxrss / 1024;  // macOS reports bytes.
+#else
+  return usage.ru_maxrss;
+#endif
+}
+
+// Counting a log streams it: peak memory does not grow by the log's size.
+TEST(LogSummary, PeakMemoryDoesNotScaleWithTheLog) {
+  const std::string path = TempPath("summary_large");
+  constexpr std::size_t kRecords = 64 * 1024;
+  constexpr std::size_t kPayload = 1000;  // ~68 MB of records
+  {
+    Manifest manifest = MakeManifest();
+    manifest[1].message_bytes = kPayload;
+    LogWriter writer{path, "large",
+                     LogWriter::Options{1u << 20, 1, /*background=*/false}};
+    writer.start(manifest, {});
+    const std::vector<std::byte> payload = MakePayload(kPayload, 1);
+    Context context{};
+    context.source_id = 1;
+    for (std::size_t i = 0; i < kRecords; ++i) {
+      context.dispatch_index = i;
+      writer.dispatch(context, payload);
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+  ASSERT_GT(FileSize(path), 64u << 20);
+  const long before = PeakRssKiB();
+  const LogSummary summary = SummarizeLog(path);
+  const long grown = PeakRssKiB() - before;
+  EXPECT_EQ(summary.record_count, kRecords);
+  EXPECT_FALSE(summary.truncated);
+  EXPECT_LT(grown, 8 * 1024) << "peak RSS grew by " << grown << " KiB";
+  ::unlink(path.c_str());
+}
+
+// A writer at its byte cap stops appending, leaves a log that still reads in
+// full, is not failed(), and marks the log incomplete with `<path>.capped`.
+TEST(LogCapture, ByteCapStopsCaptureAndLeavesAValidMarkedLog) {
+  for (const bool background : {false, true}) {
+    SCOPED_TRACE(background);
+    const auto path = TempPath(background ? "capped_bg" : "capped_sync");
+    const std::string marker = CappedMarkerPath(path);
+    ::unlink(marker.c_str());
+    constexpr std::size_t kRecord = sizeof(RecordHeader) + 16;
+    const std::uint64_t cap = RecordsOffset() + 3 * kRecord + kRecord / 2;
+    {
+      LogWriter writer{path, "capped",
+                       LogWriter::Options{256, 4, background, cap}};
+      writer.start(MakeManifest(), {});
+      for (std::uint64_t i = 1; i <= 10; ++i) {
+        Context context{};
+        context.dispatch_index = i;
+        writer.dispatch(context, MakePayload(16, static_cast<int>(i)));
+      }
+      EXPECT_TRUE(writer.capped());
+      EXPECT_TRUE(writer.capture_stopped());
+      EXPECT_FALSE(writer.failed()) << writer.error();
+      EXPECT_NE(writer.error().find("byte cap"), std::string::npos);
+    }
+    EXPECT_LE(FileSize(path), cap);
+    EXPECT_TRUE(std::ifstream{marker}.good());
+    LogReader reader{path};
+    LogReader::Record record;
+    while (reader.next(record)) {
+    }
+    EXPECT_EQ(reader.record_count(), 3u);
+    EXPECT_FALSE(reader.truncated());
+    EXPECT_EQ(SummarizeLog(path).record_count, 3u);
+    ::unlink(path.c_str());
+    ::unlink(marker.c_str());
+  }
+}
+
+TEST(LogCapture, BudgetTooSmallForHeaderDoesNotGrowOrStopTheNode) {
+  const auto path = TempPath("no_header_budget");
+  {
+    LogWriter writer{path, "tiny", LogWriter::Options{256, 1, false, 1}};
+    writer.start(MakeManifest(), {});
+    writer.dispatch({}, MakePayload(16, 1));
+    writer.flush();
+    EXPECT_TRUE(writer.capped());
+    EXPECT_FALSE(writer.failed()) << writer.error();
+  }
+  EXPECT_FALSE(std::ifstream{path}.good());
+  EXPECT_TRUE(std::ifstream{CappedMarkerPath(path)}.good());
+  EXPECT_EQ(FileSize(CappedMarkerPath(path)), 0u);
+  ::unlink(CappedMarkerPath(path).c_str());
+}
+
+TEST(LogCapture, UncappedWriterLeavesNoMarker) {
+  const auto path = TempPath("uncapped");
+  WriteFixture(path, LogWriter::kDefaultBufferBytes);
+  EXPECT_FALSE(std::ifstream{CappedMarkerPath(path)}.good());
   ::unlink(path.c_str());
 }
 

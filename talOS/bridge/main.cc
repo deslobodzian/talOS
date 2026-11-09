@@ -20,6 +20,7 @@ int main(int argc, char** argv) {
     uint64_t session_id = 0;
     bool describe = false;
     std::string log_path;
+    uint64_t log_max_bytes = 0;
 
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
@@ -39,13 +40,16 @@ int main(int argc, char** argv) {
         describe = true;
       } else if (arg == "--log" && i + 1 < argc) {
         log_path = argv[++i];
+      } else if (arg == "--log-max-bytes" && i + 1 < argc) {
+        log_max_bytes = std::stoull(argv[++i]);
       } else if (arg == "--session-id" && i + 1 < argc) {
         session_id = std::stoull(argv[++i]);
       } else {
         throw std::invalid_argument(
             "usage: hardware_node --config PATH [--remote IP] "
             "[--remote-port PORT] [--local-port PORT] [--duration-s N] "
-            "[--sim] [--log PATH] [--session-id ID] [--describe]");
+            "[--sim] [--log PATH] [--log-max-bytes N] [--session-id ID] "
+            "[--describe]");
       }
     }
 
@@ -53,7 +57,8 @@ int main(int argc, char** argv) {
       throw std::invalid_argument(
           "usage: hardware_node --config PATH [--remote IP] "
           "[--remote-port PORT] [--local-port PORT] [--duration-s N] "
-          "[--sim] [--log PATH] [--session-id ID] [--describe]");
+          "[--sim] [--log PATH] [--log-max-bytes N] [--session-id ID] "
+          "[--describe]");
     }
 
     auto robot_config = talos::config::ParseRobotConfig(config_path);
@@ -69,7 +74,8 @@ int main(int argc, char** argv) {
                                        local_port,
                                        simulation,
                                        session_id,
-                                       std::move(log_path)};
+                                       std::move(log_path),
+                                       log_max_bytes};
 
     // --describe answers out of the constructor alone: no socket, no shared
     // memory, no registry slot, nothing the real node holds. That is what lets

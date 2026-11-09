@@ -842,6 +842,7 @@ struct Flags {
   std::string graph_path;
   int duration_s = 0;
   std::uint64_t session_id = 0;
+  std::uint64_t log_max_bytes = 0;  // --log-max-bytes; 0 is unbounded
   bool simulation = false;
   bool describe = false;
   bool log_set = false;  // --log was passed (vs. the /tmp default)
@@ -859,6 +860,8 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
     } else if (arg == "--log" && i + 1 < argc) {
       flags.log_path = argv[++i];
       flags.log_set = true;
+    } else if (arg == "--log-max-bytes" && i + 1 < argc) {
+      flags.log_max_bytes = std::stoull(argv[++i]);
     } else if (arg == "--session-id" && i + 1 < argc) {
       flags.session_id = std::stoull(argv[++i]);
     } else if (arg == "--config" && i + 1 < argc) {
@@ -874,8 +877,8 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
     } else {
       throw std::invalid_argument(
           "usage: node [--sim] [--describe] [--duration-s N] [--log PATH] "
-          "[--session-id ID] [--config PATH] [--graph PATH] [--replay PATH] "
-          "[--replay-inputs SESSION_DIR]");
+          "[--log-max-bytes N] [--session-id ID] [--config PATH] "
+          "[--graph PATH] [--replay PATH] [--replay-inputs SESSION_DIR]");
     }
   }
   if (!flags.replay_path.empty() && !flags.replay_inputs.empty()) {
@@ -1135,9 +1138,12 @@ int RunMain(int argc, char** argv, const char* node_name,
     if (!flags.replay_inputs.empty()) {
       return RunOnRecordedInputs(node_name, flags, make);
     }
+    // The launcher bounds each node's share of the session's log budget; at
+    // the cap capture stops and `<log>.capped` marks the log incomplete.
+    event::log::LogWriterOptions log_options;
+    log_options.max_bytes = flags.log_max_bytes;
     event::RealtimeEventLoop<event::log::LogWriter> loop{event::log::LogWriter{
-        flags.log_path, node_name, event::log::LogWriterOptions{},
-        flags.session_id}};
+        flags.log_path, node_name, log_options, flags.session_id}};
     const Hosted hosted = Host(loop, node_name, flags, make);
     process::InstallStopHandlers();
     // Publishes this node's topics and activity into the live registry, so
@@ -1174,9 +1180,10 @@ int RunMain(int argc, char** argv, const char* node_name,
       loop.run();
     }
     stopper.request_stop();
-    std::printf("%s: dispatches=%llu recording_failed=%d\n", node_name,
+    std::printf("%s: dispatches=%llu recording_failed=%d recording_capped=%d\n",
+                node_name,
                 static_cast<unsigned long long>(loop.dispatch_count()),
-                loop.recorder().failed());
+                loop.recorder().failed(), loop.recorder().capped());
     if (loop.recorder().failed()) {
       std::fprintf(stderr, "%s\n", loop.recorder().error().c_str());
       return 1;
