@@ -503,6 +503,7 @@ TEST(LauncherTest, FailingBridgeRetriesInLoopWithoutBlockingSession) {
 TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
   const auto root = TempPath("budget_restart");
   const auto attempts = root + "/attempts";
+  std::filesystem::remove_all(root);
   std::filesystem::create_directories(root);
   LauncherOptions options;
   options.output_dir = root;
@@ -535,9 +536,11 @@ TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
       root +
       "/once'\n"
       " dd if=/dev/zero of=\"$log\" bs=1 count=100 2>/dev/null\n"
-      " ln -s /dev/full '" +
+      // The launcher writes manifest.json.tmp itself and renames it; wait
+      // until its own temporary file is gone before planting /dev/full.
+      " until ln -s /dev/full '" +
       session +
-      "/manifest.json.tmp'\n"
+      "/manifest.json.tmp' 2>/dev/null; do sleep 0.01; done\n"
       " exit 1\nfi\n"
       "touch \"$log.capped\"\nexec sleep 5\n";
   options.binary_overrides["//example/alpha:node"] =
