@@ -90,6 +90,13 @@ The tool uses OpenCV 4.12's ChArUco detector: the BCR module exposes both
 `@opencv//:objdetect` and `@opencv//:calib3d`. Calibration uses the five-coefficient
 Brown–Conrady model (no rational/thin-prism extensions).
 
+The calibration integration test renders 48 distorted 960 × 720 board views,
+runs the real ChArUco detector, and fits the intrinsics with OpenCV's default
+SVD-based nonlinear solver. Sanitizer runs instrument OpenCV too, so the target
+is classified as a large test. Retain this full-resolution accuracy coverage
+rather than reducing the fixture or changing the production solver just to
+shorten CI.
+
 ## Vision frame recording and replay
 
 Every launched camera records frames while a session directory is present
