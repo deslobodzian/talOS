@@ -34,9 +34,10 @@ void SetGains(Slot& slot, const hw::Gains& gains) {
                          ? ph::signals::GravityTypeValue::Arm_Cosine
                          : ph::signals::GravityTypeValue::Elevator_Static;
 }
-bool Fresh(const ph::BaseStatusSignal& signal) {
+bool Fresh(const ph::BaseStatusSignal& signal,
+           units::second_t max_age = 50_ms) {
   return signal.GetStatus().IsOK() &&
-         signal.GetTimestamp().GetLatency() < 50_ms;
+         signal.GetTimestamp().GetLatency() < max_age;
 }
 template <typename Position, typename Velocity>
 bool ValidMotionFeedback(const Position& position, const Velocity& velocity) {
@@ -339,7 +340,9 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     signals_.push_back(&motor->GetMotorVoltage(false));
     signals_.push_back(&motor->GetStatorCurrent(false));
     signals_.push_back(&motor->GetFaultField(false));
-    for (int i = 0; i < 5; ++i) signal_ids_.push_back(m.id);
+    signals_.push_back(&motor->GetDeviceTemp(false));
+    signals_.push_back(&motor->GetSupplyCurrent(false));
+    for (int i = 0; i < 7; ++i) signal_ids_.push_back(m.id);
     motors_.push_back(std::move(motor));
   }
 
@@ -388,11 +391,16 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       name = m.name;
       bus = m.bus;
       can_id = m.can_id;
-      // Voltage, current and faults are diagnostics, not control feedback.
-      if (signal == &motors_[&m - c.motors.data()]->GetMotorVoltage(false) ||
-          signal == &motors_[&m - c.motors.data()]->GetStatorCurrent(false) ||
-          signal == &motors_[&m - c.motors.data()]->GetFaultField(false))
+      // Diagnostics request lower rates, but Phoenix applies the highest
+      // requested rate to every signal sharing a status frame. In SDK 26.3,
+      // StatorCurrent, SupplyCurrent and DeviceTemp are SupplyAndTemp SPNs.
+      auto& motor = *motors_[&m - c.motors.data()];
+      if (signal == &motor.GetMotorVoltage(false) ||
+          signal == &motor.GetStatorCurrent(false) ||
+          signal == &motor.GetSupplyCurrent(false) ||
+          signal == &motor.GetFaultField(false))
         hz = std::min(hz, 50.0);
+      if (signal == &motor.GetDeviceTemp(false)) hz = std::min(hz, 4.0);
     }
     for (const auto& s : c.sensors) {
       if (s.id != id) continue;
@@ -544,6 +552,8 @@ bool PhoenixBackend::Read(hw::State& s) {
     auto& v = motor.GetVelocity(false);
     auto& volts = motor.GetMotorVoltage(false);
     auto& amps = motor.GetStatorCurrent(false);
+    auto& temperature = motor.GetDeviceTemp(false);
+    auto& supply = motor.GetSupplyCurrent(false);
     out.position_rot = p.GetValue().value();
     out.velocity_rps = v.GetValue().value();
     out.position_age_us = Age(p);
@@ -568,6 +578,21 @@ bool PhoenixBackend::Read(hw::State& s) {
       }
     }
     out.stator_current_a = effort_ok ? amps.GetValue().value() : 0.0;
+    // Temperature can legitimately be 250 ms old at its requested 4 Hz.
+    // Neither health signal participates in motion-feedback validity.
+    out.temperature_c = Fresh(temperature, 500_ms) &&
+                                std::isfinite(temperature.GetValue().value())
+                            ? temperature.GetValue().value()
+                            : 0.0;
+    out.supply_current_a =
+        Fresh(supply) && std::isfinite(supply.GetValue().value())
+            ? supply.GetValue().value()
+            : 0.0;
+    if (is_simulation_) {
+      // Phoenix models supply current from rotor physics, but provides no
+      // temperature input. Report ambient, not a fictitious thermal model.
+      out.temperature_c = 25.0;
+    }
     if (out.fault_flags != last_fault_flags_[i]) {
       const uint32_t prev = last_fault_flags_[i];
       const uint32_t raised = out.fault_flags & ~prev;

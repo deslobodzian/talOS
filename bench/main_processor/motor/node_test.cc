@@ -84,12 +84,14 @@ TEST_F(MotorTest, ReleaseNeutralizes) {
 
 TEST_F(MotorTest, ReportsInjectedFeedbackAndAcquisitionAges) {
   Enable();
-  hw.set_motor("motor", "kraken", 4.5, -7.0, 2000, 1000);
+  hw.set_motor("motor", "kraken", 4.5, -7.0, 2000, 1000, 42.5, 6.25);
   sim.step(10ms);
   EXPECT_DOUBLE_EQ(State().position_rot(), 4.5);
   EXPECT_DOUBLE_EQ(State().velocity_rps(), -7.0);
   EXPECT_DOUBLE_EQ(State().applied_voltage_v(), 0.0);
   EXPECT_DOUBLE_EQ(State().stator_current_a(), 0.0);
+  EXPECT_DOUBLE_EQ(State().temperature_degc(), 42.5);
+  EXPECT_DOUBLE_EQ(State().supply_current_a(), 6.3);
   EXPECT_TRUE(State().connected());
   EXPECT_TRUE(State().acquisition_valid());
   EXPECT_EQ(State().position_age_us() - State().velocity_age_us(), 1000);
@@ -97,6 +99,26 @@ TEST_F(MotorTest, ReportsInjectedFeedbackAndAcquisitionAges) {
   sim.step(10ms);
   EXPECT_FALSE(State().connected());
   EXPECT_FALSE(State().acquisition_valid());
+  EXPECT_DOUBLE_EQ(State().temperature_degc(), 0.0);
+  EXPECT_DOUBLE_EQ(State().supply_current_a(), 0.0);
+}
+
+TEST_F(MotorTest, HealthFeedbackRemainsVisibleWithStaleTargetAndWhileDisabled) {
+  Enable();
+  hw.set_motor("motor", "kraken", 0.0, 0.0, 0, 0, 48.5, 3.25);
+  Send(MotorTarget{ControlMode::VELOCITY, 0.0, 10.0, 0.0});
+  EXPECT_DOUBLE_EQ(State().temperature_degc(), 48.5);
+  EXPECT_DOUBLE_EQ(State().supply_current_a(), 3.3);
+  sim.step(110ms);
+  Neutral();
+  EXPECT_DOUBLE_EQ(State().temperature_degc(), 48.5);
+  EXPECT_DOUBLE_EQ(State().supply_current_a(), 3.3);
+  hw.enable(false);
+  sim.step(10ms);
+  Neutral();
+  EXPECT_TRUE(State().connected());
+  EXPECT_DOUBLE_EQ(State().temperature_degc(), 48.5);
+  EXPECT_DOUBLE_EQ(State().supply_current_a(), 3.3);
 }
 
 TEST_F(MotorTest, NonFiniteAndDisconnectedInputsNeutralize) {

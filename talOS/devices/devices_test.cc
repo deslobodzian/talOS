@@ -426,6 +426,39 @@ TEST(Devices, GettersReadTheLatchedFeedback) {
   EXPECT_DOUBLE_EQ(mech.gyro.yaw_rate(), -0.5);
 }
 
+TEST(Devices, MotorHealthFeedbackRoundTripsWithoutEnablingOutputs) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  EXPECT_DOUBLE_EQ(mech.a.temperature_c(), 0);
+  EXPECT_DOUBLE_EQ(mech.a.supply_current_a(), 0);
+  auto hw = std::make_unique<SimHardware>(sim);
+  hw->set_motor("mech", "a", 1.5, -2.0, 0, 0, 62.5, 18.25);
+  sim.step(10ms);
+  EXPECT_FALSE(mech.enabled_in_update);
+  EXPECT_TRUE(mech.a.connected());
+  EXPECT_DOUBLE_EQ(mech.a.temperature_c(), 62.5);
+  EXPECT_DOUBLE_EQ(mech.a.supply_current_a(), 18.3);
+  EXPECT_DOUBLE_EQ(mech.a.current(), 0);
+
+  hw->set_connected("mech", "a", false);
+  sim.step(10ms);
+  EXPECT_FALSE(mech.a.connected());
+  EXPECT_DOUBLE_EQ(mech.a.temperature_c(), 0);
+  EXPECT_DOUBLE_EQ(mech.a.supply_current_a(), 0);
+
+  hw->set_connected("mech", "a", true);
+  hw->set_motor("mech", "a", 2.0, 3.0, 0, 0, 75.0, 9.5);
+  sim.step(10ms);
+  EXPECT_DOUBLE_EQ(mech.a.temperature_c(), 75.0);
+  EXPECT_DOUBLE_EQ(mech.a.supply_current_a(), 9.5);
+  hw.reset();
+  sim.step(150ms);
+  EXPECT_FALSE(mech.a.connected());
+  // Like the other numeric getters, stale feedback remains latched.
+  EXPECT_DOUBLE_EQ(mech.a.temperature_c(), 75.0);
+  EXPECT_DOUBLE_EQ(mech.a.supply_current_a(), 9.5);
+}
+
 TEST(Devices, AcquisitionTimesSubtractEachSignalsAge) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");

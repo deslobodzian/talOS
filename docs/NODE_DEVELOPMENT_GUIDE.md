@@ -69,13 +69,21 @@ Handles are named by their device key in the subsystem config
 
 | C++ | Python |
 |---|---|
-| `talos::Motor m{node, "roller"}`: `set_duty_cycle`, `set_voltage`, `set_velocity`, `set_position`, `set_motion_magic` (`ff_volts`, `slot`), `stop`; `position()`, `velocity()`, `voltage()`, `current()`, `connected()`, `clamped_count()` | `talos.Motor(node, "roller")`, getters as properties; demands/feedforward clamp to configured limits, non-finite input neutralizes the motor; `clamped_count` counts adjusted setter calls |
+| `talos::Motor m{node, "roller"}`: `set_duty_cycle`, `set_voltage`, `set_velocity`, `set_position`, `set_motion_magic` (`ff_volts`, `slot`), `stop`; `position()`, `velocity()`, `voltage()`, `current()` (stator A), `temperature_c()`, `supply_current_a()`, `connected()`, `clamped_count()` | `talos.Motor(node, "roller")`, getters as properties; demands/feedforward clamp to configured limits, non-finite input neutralizes the motor; `clamped_count` counts adjusted setter calls |
 | `CANcoder`, `Gyro` (`yaw`, `yaw_rate`), `Encoder`, `DigitalInput` (`get()`), `AnalogInput` (`voltage()`), `DigitalOutput`, `PwmOutput` (`set()`) | same names; `DigitalInput.value`; DIO/PWM commands are gated on `robot_enabled` (false/zero while disabled or state is stale) |
 | `talos::DriverStation ds{node}`: `connected()`, `enabled()`, `autonomous()`, `teleop()`, `test()`, `estop()`, `alliance()`, `match_time()`, `joystick(port)` → `axis(i)`, `button(n)` (1-based), `pov(i)` | `talos.DriverStation(node)`, same as properties/methods |
 | `talos::robot_enabled(node)` | `talos.robot_enabled(node)` |
 | `node.extension<talos::HardwareLink>().sample_time()`: node-clock `Time` the latest hardware state was sampled at, `nullopt` while stale or before the bridge's clock mapping converges (8 states) | `talos.hardware_sample_time_ns(node)` (int ns, or `None`) |
 | `node.extension<talos::HardwareLink>().fresh()` / `.fresh(max_age)` and `.age()` | `link = talos.HardwareLink(node)`; `link.fresh()` / `link.fresh(max_age)` (`None` uses command timeout; seconds or `datetime.timedelta`); `link.age` (float seconds, `math.inf` before the first state); `link.sample_time` (int ns or `None`) |
 | `Motor` / `CANcoder`: `position_time()`, `velocity_time()`; `Gyro`: `yaw_time()`, `yaw_rate_time()` | same names as properties: integer node-clock nanoseconds, or `None` |
+
+Motor `temperature_c` is device temperature in Celsius; `supply_current_a`
+is supply-side current, not `current` (stator current). All three use 0.1-unit
+wire resolution. They are observations, not automatic thermal derating.
+Check `connected`/link freshness before using readings; numeric getters latch
+the last received sample when the hardware link is stale. SimHardware
+`set_motor(..., temperature_c=..., supply_current_a=...)` injects diagnostics
+through the same wire codec (C++ takes these optional arguments after ages).
 
 `Motor::rezero(position_rot = 0)` and `Gyro::rezero(yaw_rot = 0)` (same
 methods in Python) set a software offset shared by all handles for that device

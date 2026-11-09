@@ -24,4 +24,6 @@ struct MotorState {
   enabled:bool;
   mode:ControlMode;
   source:TargetSource;
+  temperature_degc:double;
+  supply_current_a:double;
 }

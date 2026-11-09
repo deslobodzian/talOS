@@ -415,6 +415,37 @@ TEST_F(NodeApi, MotorClampCountUsesSharedDevicesImplementation) {
   EXPECT_EQ(talos_motor_clamped_count(node, roller.wheel, nullptr), TALOS_ERR);
 }
 
+TEST_F(NodeApi, MotorHealthFeedbackRoundTripsWhileDisabled) {
+  Roller roller;
+  TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
+  ASSERT_NE(node, nullptr);
+  TalosSample sample{};
+  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &sample), TALOS_OK);
+  EXPECT_EQ(sample.valid, 0);
+  EXPECT_DOUBLE_EQ(sample.temperature_c, 0);
+  EXPECT_DOUBLE_EQ(sample.supply_current_a, 0);
+  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
+  ASSERT_NE(hw, nullptr);
+  ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3, 2, 0, 0,
+                                         62.5, 18.25),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK);
+  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &sample), TALOS_OK);
+  EXPECT_EQ(sample.valid, 1);
+  EXPECT_EQ(roller.enabled, 0);
+  EXPECT_DOUBLE_EQ(sample.temperature_c, 62.5);
+  EXPECT_DOUBLE_EQ(sample.supply_current_a, 18.3);
+  EXPECT_DOUBLE_EQ(sample.current, 0);
+  ASSERT_EQ(talos_sim_hardware_set_connected(hw, "roller", "wheel", 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK);
+  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &sample), TALOS_OK);
+  EXPECT_EQ(sample.valid, 0);
+  EXPECT_DOUBLE_EQ(sample.temperature_c, 0);
+  EXPECT_DOUBLE_EQ(sample.supply_current_a, 0);
+  talos_sim_hardware_destroy(hw);
+}
+
 TEST_F(NodeApi, MotorRezeroUsesSharedSoftwareFrame) {
   Roller roller;
   TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
@@ -423,8 +454,9 @@ TEST_F(NodeApi, MotorRezeroUsesSharedSoftwareFrame) {
   const auto gyro = talos_device(node, TALOS_DEVICE_GYRO, "gyro");
   ASSERT_GE(gyro, 0);
   ASSERT_NE(hw, nullptr);
-  ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3, 2, 0, 0),
-            TALOS_OK);
+  ASSERT_EQ(
+      talos_sim_hardware_set_motor(hw, "roller", "wheel", 3, 2, 0, 0, 0, 0),
+      TALOS_OK);
   ASSERT_EQ(talos_sim_hardware_set_gyro(hw, "roller", "gyro", 0.75, -0.5, 0, 0),
             TALOS_OK);
   ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK);
@@ -448,8 +480,9 @@ TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {
   ASSERT_NE(node, nullptr) << talos_last_error();
   TalosSimHardware* hw = talos_sim_hardware_create(sim_);
   ASSERT_NE(hw, nullptr) << talos_last_error();
-  ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3.0, 1.5, 0, 0),
-            TALOS_OK);
+  ASSERT_EQ(
+      talos_sim_hardware_set_motor(hw, "roller", "wheel", 3.0, 1.5, 0, 0, 0, 0),
+      TALOS_OK);
 
   ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK) << talos_last_error();
   TalosMotorRequest request{};
@@ -501,8 +534,9 @@ TEST_F(NodeApi, DisconnectedDeviceSampleIsInvalid) {
   ASSERT_NE(node, nullptr) << talos_last_error();
   TalosSimHardware* hw = talos_sim_hardware_create(sim_);
   ASSERT_NE(hw, nullptr) << talos_last_error();
-  ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3.0, 1.5, 0, 0),
-            TALOS_OK);
+  ASSERT_EQ(
+      talos_sim_hardware_set_motor(hw, "roller", "wheel", 3.0, 1.5, 0, 0, 0, 0),
+      TALOS_OK);
   ASSERT_EQ(talos_sim_hardware_set_connected(hw, "roller", "wheel", 0),
             TALOS_OK);
   ASSERT_EQ(talos_sim_step(sim_, 15 * kMs), TALOS_OK) << talos_last_error();
@@ -530,9 +564,9 @@ TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   ASSERT_NE(hw, nullptr) << talos_last_error();
   const auto gyro = talos_device(node, TALOS_DEVICE_GYRO, "gyro");
   ASSERT_GE(gyro, 0);
-  ASSERT_EQ(
-      talos_sim_hardware_set_motor(hw, "roller", "wheel", 3, 2, 1000, 3000),
-      TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3, 2, 1000,
+                                         3000, 0, 0),
+            TALOS_OK);
   ASSERT_EQ(
       talos_sim_hardware_set_gyro(hw, "roller", "gyro", 0.75, -0.5, 5000, 6000),
       TALOS_OK);

@@ -184,6 +184,16 @@ class Motor(_Input):
     def current(self):  # stator amps
         return self._sample().current
 
+    @property
+    def temperature_c(self):
+        """Motor controller temperature in Celsius."""
+        return self._sample().temperature_c
+
+    @property
+    def supply_current_a(self):
+        """Supply current in amps, distinct from current (stator amps)."""
+        return self._sample().supply_current_a
+
     def _set(self, mode, demand, ff_volts=0.0, slot=0):
         _abi.ok(lib.talos_motor_set(self._node, self._index, mode, demand,
                                     ff_volts, slot))

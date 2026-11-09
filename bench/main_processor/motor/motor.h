@@ -13,6 +13,8 @@
 #include "talOS/node/node.h"
 
 namespace motor {
+static_assert(sizeof(MotorState) == 88);
+
 class BenchMotor {
  public:
   explicit BenchMotor(talos::Node& node)
@@ -66,7 +68,8 @@ class BenchMotor {
         fault_valid, enabled, mode,
         mode != ControlMode::NEUTRAL && target_.source() == "teleop"
             ? TargetSource::TELEOP
-            : TargetSource::NONE});
+            : TargetSource::NONE,
+        motor_.temperature_c(), motor_.supply_current_a()});
   }
 
  private:

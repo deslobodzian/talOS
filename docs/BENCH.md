@@ -95,11 +95,13 @@ release all controls, and explicitly re-enable only after checking recovery.
   may prevent reaching 30 rps under load; do not raise limits automatically.
 
 `/motor/state` exposes position, velocity, applied voltage, stator current,
+supply current (`supply_current_a`), motor temperature (`temperature_degc`),
 connected status, gateway motor fault with validity, active mode/source and
-hardware/acquisition ages. Supply voltage/current and temperature are not
-exposed by the public Motor handle and are not invented here; capture them
-separately in Phoenix Tuner X. Unknown/stale ages are UINT64_MAX;
-`acquisition_valid` requires connected feedback and a converged clock mapping.
+hardware/acquisition ages. Supply voltage is not exposed by the public Motor
+handle; capture it separately in Phoenix Tuner X. Temperature and supply current
+are observations only, not a thermal protection policy. Unknown/stale ages are
+UINT64_MAX; `acquisition_valid` requires connected feedback and a converged clock
+mapping.
 Fault validity is separate from a false fault value. Sample time in this state
 is the node observation time; acquisition ages use the mapped hardware clock.
 

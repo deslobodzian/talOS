@@ -596,6 +596,12 @@ double Motor::voltage() const {
 double Motor::current() const {
   return HardwareAccess::motor_sample(*link_, index_).stator_current_a;
 }
+double Motor::temperature_c() const {
+  return HardwareAccess::motor_sample(*link_, index_).temperature_c;
+}
+double Motor::supply_current_a() const {
+  return HardwareAccess::motor_sample(*link_, index_).supply_current_a;
+}
 bool Motor::connected() const {
   return HardwareAccess::motor_sample(*link_, index_).valid;
 }

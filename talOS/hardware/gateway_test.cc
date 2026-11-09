@@ -28,7 +28,7 @@ TEST(Messages, FullyCappedEncodingsHaveExactSizes) {
   state.encoder_count = kMaxEncoders;
   state.pwm_output_count = kMaxPwmOutputs;
   std::array<uint8_t, kMaxStateSize> state_bytes{};
-  ASSERT_EQ(Encode(state, state_bytes), 1420u);
+  ASSERT_EQ(Encode(state, state_bytes), 1388u);
   State decoded_state;
   ASSERT_TRUE(Decode(state_bytes, decoded_state));
   EXPECT_EQ(decoded_state, state);
@@ -47,6 +47,46 @@ TEST(Messages, FullyCappedEncodingsHaveExactSizes) {
   EXPECT_EQ(
       Encode(command, std::span{command_bytes}.first(command_bytes.size() - 1)),
       0u);
+}
+
+TEST(Messages, MotorDiagnosticsUseSaturatingSignedTenths) {
+  State state;
+  state.motor_count = 1;
+  auto& motor = state.motors[0];
+  motor.valid = true;
+  motor.temperature_c = 42.34;
+  motor.supply_current_a = -12.36;
+  motor.stator_current_a = 81.25;
+  std::array<uint8_t, kMaxStateSize> bytes{};
+  State decoded;
+  auto size = Encode(state, bytes);
+  ASSERT_NE(size, 0u);
+  ASSERT_TRUE(Decode(std::span{bytes}.first(size), decoded));
+  EXPECT_DOUBLE_EQ(decoded.motors[0].temperature_c, 42.3);
+  EXPECT_DOUBLE_EQ(decoded.motors[0].supply_current_a, -12.4);
+  EXPECT_DOUBLE_EQ(decoded.motors[0].stator_current_a, 81.3);
+
+  motor.temperature_c = -1e100;
+  motor.supply_current_a = 1e100;
+  motor.stator_current_a = 3276.7;
+  size = Encode(state, bytes);
+  ASSERT_TRUE(Decode(std::span{bytes}.first(size), decoded));
+  EXPECT_DOUBLE_EQ(decoded.motors[0].temperature_c, -3276.8);
+  EXPECT_DOUBLE_EQ(decoded.motors[0].supply_current_a, 3276.7);
+  EXPECT_DOUBLE_EQ(decoded.motors[0].stator_current_a, 3276.7);
+
+  for (double invalid : {std::numeric_limits<double>::infinity(),
+                         std::numeric_limits<double>::quiet_NaN()}) {
+    motor.temperature_c = invalid;
+    EXPECT_EQ(Encode(state, bytes), 0u);
+    motor.temperature_c = 25;
+    motor.supply_current_a = invalid;
+    EXPECT_EQ(Encode(state, bytes), 0u);
+    motor.supply_current_a = 0;
+    motor.stator_current_a = invalid;
+    EXPECT_EQ(Encode(state, bytes), 0u);
+    motor.stator_current_a = 0;
+  }
 }
 
 struct ModuleConfig {
@@ -715,7 +755,7 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   // The same per-device widths the payload-budget static_asserts in messages.cc
   // are built from, so raising a device cap moves both together or neither.
   constexpr std::size_t kWidestState =
-      52 + 14 + 34 + kMaxMotors * 47 + kMaxSensors * 27 +
+      52 + 14 + 34 + kMaxMotors * 45 + kMaxSensors * 27 +
       kMaxDigitalInputs * 4 + kMaxDigitalOutputs * 4 + kMaxAnalogInputs * 15 +
       kMaxEncoders * 23 + kMaxPwmOutputs * 11;
   ASSERT_EQ(state_size, kWidestState);

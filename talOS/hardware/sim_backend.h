@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <unordered_map>
 #include <vector>
 
@@ -66,6 +67,11 @@ class SimBackend final : public Backend {
         samples_[i].velocity_rps = 0.0;
         samples_[i].voltage = 0.0;
       }
+      // Placeholder effort current and constant ambient; not electrical or
+      // thermal models. The ideal backend only models explicit voltage.
+      samples_[i].temperature_c = 25.0;
+      samples_[i].supply_current_a = std::abs(samples_[i].voltage) / 12.0 *
+                                     config_.motors[i].supply_limit_a;
       state.motors[i] = samples_[i];
     }
     for (std::size_t i = 0; i < config_.sensors.size(); ++i) {

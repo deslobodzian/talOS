@@ -42,7 +42,7 @@ second hop. See [architecture](../ARCHITECTURE.md#two-processors).
 
 | Link / direction | Transport / port | Trigger or rate in the 2026 configuration |
 |---|---|---|
-| Devices ↔ RIO backend | CAN / local DIO, analog, encoder, PWM; no IP port | Gateway samples/applies on `Config.period_us`: 5000 µs = 200 Hz. Phoenix motion feedback requests `status_hz`; voltage/current/fault diagnostics request `min(status_hz, 50)` Hz. Shared vendor frames apply their highest requested rate: voltage/current remain 200 Hz with 200 Hz feedback; fault field applies 50 Hz. Disabled one-shot neutral refresh remains every hardware tick. No wire/size change. |
+| Devices ↔ RIO backend | CAN / local DIO, analog, encoder, PWM; no IP port | Gateway samples/applies on `Config.period_us`: 5000 µs = 200 Hz. Phoenix motion feedback requests `status_hz`; voltage/stator-current/supply-current/fault diagnostics request `min(status_hz, 50)` Hz; device temperature requests `min(status_hz, 4)` Hz. Shared vendor frames apply their highest requested rate: voltage/current/temperature remain 200 Hz with 200 Hz feedback; fault field applies 50 Hz. Disabled one-shot neutral refresh remains every hardware tick. |
 | Driver Station ↔ RIO | WPILib/FRC native control/status over radio; not talOS UDP | DS produces new data at 50 Hz; RIO refreshes WPILib each hardware tick, emits a talOS DS snapshot at most every 20000 µs. Mode generations observe every hardware tick, including transitions between published snapshots. Native FRC packet layouts are external to this repo. |
 | RIO → hardware_node: State (type 20) | UDP source gateway 5802 → bridge 5803, wired robot switch | One snapshot per gateway tick, 200 Hz; echoes clock probe send time only after a subsequent gateway tick. |
 | hardware_node → RIO: Command (21) | UDP 5803 → 5802 | Bridge polls every 1000 µs. Send immediately when merged command changes, otherwise heartbeat `clamp(command_timeout_us / 5, 5000, 20000)` µs: 20000 µs = 50 Hz with the configured 100000 µs timeout. Only after observed state and while a subsystem request is active; not unconditionally 1000 Hz. |
@@ -75,10 +75,26 @@ Timing sources: `2026-robot/main_processor/configuration/robot.toml:1-16`, its
 `2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp:221-258`, and
 `2026-robot/main_processor/simulation/sim_gateway.cc`.
 
+Phoenix 26.3.0 `CoreTalonFX.hpp` / `SpnValue.hpp` identify stator current,
+supply current and device temperature as `PRO_SupplyAndTemp` SPNs 1779–1783.
+[CTRE's shared-frame rule](https://v6.docs.ctr-electronics.com/en/stable/docs/api-reference/api-usage/status-signals.html)
+applies the highest requested rate to a shared frame. The Phoenix desktop
+rate test checks the effective rates: the new reads reuse the already-active
+200 Hz frame, adding no requested status-frame traffic. This is not a measured
+whole-bus utilization percentage: use `/hw/status` CAN utilization during
+physical bring-up, including all other devices and control traffic.
+Temperature older than 500 ms and supply current older than 50 ms read as zero
+without invalidating motion feedback, like existing effort diagnostics.
+Standalone ideal/physics simulation reports ambient 25 °C and placeholder
+supply current proportional to voltage effort; Phoenix desktop uses its SDK
+electrical-current model and ambient 25 °C. None is a thermal model or an
+automatic thermal derating policy. Raw `/hw/state` stays in local logs and
+has no reflected radio channels; only the bench motor state adds these scalars.
+
 ## UDP frame and payload sizes
 
-One datagram contains exactly one protocol frame, version **3** (State layout
-changed; version 2 peers are rejected). The explicit little-endian
+One datagram contains exactly one protocol frame, version **4** (motor State
+layout changed; earlier peers are rejected). The explicit little-endian
 header is **40 B**: magic u64 (8), version/header_size/type/flags u16 (8 total),
 sequence u64 (8), monotonic_time_us u64 (8), payload_size u32 (4), reserved u32
 (4). Payload maximum is **1432 B**; frame maximum **1472 B** = 1500-byte MTU −
@@ -87,7 +103,7 @@ need no IP fragmentation (`talOS/protocol/frame.h`, `frame.cc`, `types.h`).
 
 | Payload | Fixed vs dynamic formula (bytes) | Maximum payload | Maximum frame | Payload headroom |
 |---|---|---:|---:|---:|
-| State, type 20 | `66 + 47M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 34` | 1420 | 1460 | 12 |
+| State, type 20 | `66 + 45M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 34` | 1388 | 1428 | 44 |
 | Command, type 21 | `38 + 20M + 3DO + 10PWM` | 410 | 450 | 1022 |
 | Config chunk, type 22 | packed 24-byte header + ≤1408 data | 1432 | 1472 | 0 for full chunk |
 | ConfigAck, type 23 | packed u64 config_id + u8 status + char[64] reason | 73 | 113 | 1359 |
@@ -104,7 +120,7 @@ command acceptance, ACK sequence, epoch, or actuator watchdogs.
 
 | Device | State bytes / device | Command bytes / device | Encoded fields |
 |---|---:|---:|---|
-| Motor | 47 | 20 | State: id2 + valid1 + four doubles32 + three u32 fields12. Command: id2 + mode1 + slot1 + demand8 + feedforward8. |
+| Motor | 45 | 20 | State: id2 + valid1 + position/velocity/voltage doubles24 + stator-current int16(2) + three u32 fields12 + temperature int16(2) + supply-current int16(2). Command: id2 + mode1 + slot1 + demand8 + feedforward8. |
 | Sensor | 27 | — | id2 + valid1 + two doubles16 + two ages8 |
 | Digital input | 4 | — | id2 + valid1 + value1 |
 | Digital output | 4 | 3 | State id2 + valid1 + value1; command id2 + value1 |
@@ -113,7 +129,12 @@ command acceptance, ACK sequence, epoch, or actuator watchdogs.
 | PWM output | 11 | 10 | State id2 + valid1 + output8; command id2 + output8 |
 
 These are codec sizes (`talOS/hardware/messages.h`, `messages.cc`), not native
-struct padding. Binary64 values remain binary64 on the wire.
+struct padding. Position, velocity and voltage remain binary64. Motor stator
+current, supply current and device temperature use signed little-endian int16
+in 0.1 A / 0.1 °C units, rounded to nearest (ties away from zero), saturated
+to [-3276.8, 3276.7]; nonfinite inputs fail encoding. Compacting stator current
+alongside the two new readings keeps the unchanged device cap inside one UDP
+payload: motor samples shrink 47→45 B and maximum State shrinks 1420→1388 B.
 
 ### Actual 2026 robot
 
@@ -121,16 +142,16 @@ The canonical parser merges `2026-robot/main_processor/configuration/robot.toml`
 and its subsystem files. Current device counts are **10 motors, 5 sensors,
 2 digital inputs, 0 digital outputs, 0 analog inputs, 0 encoders, 0 PWM outputs**.
 
-- State: `66 + 10×47 + 5×27 + 2×4 + 34` = **713 B** payload,
-  **753 B** frame, **719 B** payload headroom.
+- State: `66 + 10×45 + 5×27 + 2×4 + 34` = **693 B** payload,
+  **733 B** frame, **739 B** payload headroom.
 - Command: `38 + 10×20` = **238 B** payload, **278 B** frame,
   **1194 B** payload headroom.
 - Serialized Config: **3231 B**; `ceil(3231 / 1408)` = **3 chunks**.
   Chunk data lengths **1408, 1408, 415 B**, payload lengths **1432, 1432,
   439 B**, datagram lengths **1472, 1472, 479 B**. One push is **3423 B**
   of talOS frames (`3231 + 3×24 + 3×40`), excluding UDP/IP headers.
-- State at 200 Hz: **150600 B/s** in talOS frames (`753×200`), or
-  **1.2048 Mbit/s**, on the wired internal link, not the robot radio.
+- State at 200 Hz: **146600 B/s** in talOS frames (`733×200`), or
+  **1.1728 Mbit/s**, on the wired internal link, not the robot radio.
 
 Computed with a throwaway C++ program calling the production `ParseRobotConfig`,
 `SerializeConfig`, and `CreateConfigChunks`, and the named State/Command size
@@ -215,7 +236,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 
 | Topic / owner → consumer | Slot bytes | Meaning / rate |
 |---|---:|---|
-| `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data currently 713, ≤1420 |
+| `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data currently 693, ≤1388 |
 | `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data currently 238, ≤410 |
 | `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1448 | 1436 B Packet; DS occupied data 46–678 |
 | `/hw/request/<node>`: device owner → bridge | 1448 | 1436 B Packet; only that owner's actuator requests, not a full-capacity command |
@@ -225,6 +246,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | `/drivetrain/state`: drivetrain → estimator/driver/telemetry | 120 | 112 B DrivetrainState: padded time/flags header 16 + chassis/yaw 32 + four module positions 64 |
 | `/intake/state`: intake → telemetry | 32 | 20 B IntakeState, including FlatBuffers padding |
 | `/shooter/state`: shooter → telemetry | 40 | 32 B ShooterState, including FlatBuffers padding |
+| `/motor/state` (bench only): motor → telemetry/logs | 96 | 88 B MotorState including device temperature and supply current; pinned in bench motor node |
 | `/<camera>/state`: each camera → estimator/telemetry | 72 | 64 B geometry.PoseObservation, including padding |
 | `/<camera>/status`: each camera → telemetry | 96 | 88 B vision.VisionStatus, pinned in vision.h; append-only reconnect/stall/control-failure counters and controls_applied are excluded from robot telemetry, preserving its value-frame budget |
 | `/pose_estimator/state`: estimator → telemetry | 80 | 72 B geometry.PoseEstimate; `valid` = fresh usable odometry, `localized` = established field-frame trust; `localized` sits in existing payload padding |
@@ -295,7 +317,8 @@ channel level (`subsystems/telemetry.toml`), retaining
 camera health, timing, dropped-frame and visible-tag diagnostics. Excludes match
 topics or individual dictionary channels; only retained channels count.
 
-Current budget, measured 2026-11-08 with the producer's own
+Current budget, robot measured 2026-11-08 and physics/bench rechecked 2026-11-09,
+with the producer's own
 `MeasureValueFrameBytes` / `MeasureDictionaryFrameBytes` (the telemetry node
 prints this line whenever it builds from a declared graph, so every
 `--describe-only` and every launch reports it):
@@ -304,6 +327,7 @@ prints this line whenever it builds from a declared graph, so every
 |---|---:|---:|---:|---:|
 | `robot.toml`, `robot_field.toml` | 130 | 1168 / 1200 B | 4 | 8984 / 16384 B |
 | `robot_physics_sim.toml` + `--start-sim-gateway --sim-gateway-arg --physics` | 133 | 1192 / 1200 B | 1 | 9152 / 16384 B |
+| Bench `robot.toml`, `robot_bench.toml` (temperature/supply included) | 53 | 552 / 1200 B | 81 | 3408 / 16384 B |
 
 A graph over the cap makes telemetry refuse construction with the largest
 sources named; `--describe-only` then reports telemetry as not described and
@@ -354,7 +378,7 @@ wrong-identity commands, and disabled/stale-target actuation is neutralized.
 The configured command timeout is **100 ms**; a single loss does not imply an
 immediate timeout. The maximum frame fits the IPv4 MTU without fragmentation.
 
-The cost is a hard device-cap budget tied to one datagram: State has only **20 B**
+The cost is a hard device-cap budget tied to one datagram: State has **44 B**
 worst-case headroom. Grow in this order if required: first narrow appropriate
 telemetry-only binary64 fields to float32 (an explicit wire/version change), then
 split State by CAN bus using an **all-parts-or-drop multipart snapshot** with a

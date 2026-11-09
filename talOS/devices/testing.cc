@@ -34,6 +34,11 @@ struct Axis {
   std::uint32_t velocity_age_us = 0;
 };
 
+struct MotorAxis : Axis {
+  double temperature_c = 0;
+  double supply_current_a = 0;
+};
+
 // Neutral decay, the same first-order rotor model and constants as the
 // Phoenix desktop sim (PhoenixBackend kSimNeutral*): brake shorts the windings
 // and stops the rotor quickly, coast rolls on; friction snaps a nearly-stopped
@@ -62,7 +67,8 @@ struct SimHardware::Impl {
   bool enabled = false;
   bool ideal = false;
 
-  std::map<std::uint16_t, Axis> motors, sensors, encoders;
+  std::map<std::uint16_t, MotorAxis> motors;
+  std::map<std::uint16_t, Axis> sensors, encoders;
   std::map<std::uint16_t, bool> digital_inputs;
   std::map<std::uint16_t, double> analog_inputs;
 
@@ -214,13 +220,15 @@ struct SimHardware::Impl {
       if (!Connected(Kind::kMotor, c.id)) {
         return hardware::MotorSample{.id = c.id};
       }
-      const Axis axis = ValueOr(motors, c.id, Axis{});
+      const MotorAxis axis = ValueOr(motors, c.id, MotorAxis{});
       return hardware::MotorSample{.id = c.id,
                                    .valid = true,
                                    .position_rot = axis.position,
                                    .velocity_rps = axis.velocity,
                                    .position_age_us = axis.position_age_us,
-                                   .velocity_age_us = axis.velocity_age_us};
+                                   .velocity_age_us = axis.velocity_age_us,
+                                   .temperature_c = axis.temperature_c,
+                                   .supply_current_a = axis.supply_current_a};
     });
     fill(state.sensors, state.sensor_count, hw.sensors, [&](const auto& c) {
       if (!Connected(Kind::kCANcoder, c.id)) {
@@ -365,9 +373,12 @@ void SimHardware::ideal_motors(bool on) { impl_->ideal = on; }
 void SimHardware::set_motor(std::string_view node, std::string_view device,
                             double position, double velocity,
                             std::uint32_t position_age_us,
-                            std::uint32_t velocity_age_us) {
+                            std::uint32_t velocity_age_us, double temperature_c,
+                            double supply_current_a) {
   impl_->motors[impl_->Id(node, Kind::kMotor, device)] = {
-      position, velocity, position_age_us, velocity_age_us};
+      {position, velocity, position_age_us, velocity_age_us},
+      temperature_c,
+      supply_current_a};
 }
 
 void SimHardware::set_digital_input(std::string_view node,

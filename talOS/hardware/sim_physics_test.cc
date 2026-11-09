@@ -55,6 +55,29 @@ void StepBackend(Backend& backend, State& s, uint64_t& now_us, uint64_t step_us,
   }
 }
 
+TEST(SimMotorDiagnostics, AmbientAndEffortPlaceholdersAcrossNeutral) {
+  auto cfg = SingleMotorConfig();
+  cfg.motors[0].supply_limit_a = 40.0;
+  SimBackend ideal;
+  PhysicsSimBackend physics;
+  for (Backend* backend :
+       {static_cast<Backend*>(&ideal), static_cast<Backend*>(&physics)}) {
+    ASSERT_TRUE(backend->Configure(cfg));
+    std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, 6.0, 0.0}}};
+    ASSERT_TRUE(backend->Apply(command));
+    State state;
+    state.motor_count = 1;
+    uint64_t now_us = 0;
+    StepBackend(*backend, state, now_us, 5000, 2);
+    EXPECT_DOUBLE_EQ(state.motors[0].temperature_c, 25.0);
+    EXPECT_DOUBLE_EQ(state.motors[0].supply_current_a, 20.0);
+    backend->Neutral();
+    StepBackend(*backend, state, now_us, 5000, 1);
+    EXPECT_DOUBLE_EQ(state.motors[0].temperature_c, 25.0);
+    EXPECT_DOUBLE_EQ(state.motors[0].supply_current_a, 0.0);
+  }
+}
+
 TEST(SimGravity, ClosedLoopUsesSelectedSlotAndMechanismAngle) {
   MotorConfig cfg = TestMotor(1, "arm", 1);
   cfg.slots[1].g = 3.0;

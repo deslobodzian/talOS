@@ -521,6 +521,39 @@ can_id = 3
         self.assertIsNone(signals.encoder.position_time)
         self.assertIsNone(signals.gyro.yaw_rate_time)
 
+    def test_motor_health_feedback_roundtrip(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        lift = sim.add(Lift, "lift")
+        motor = lift.lift
+        self.assertEqual(motor.temperature_c, 0)
+        self.assertEqual(motor.supply_current_a, 0)
+        hw = SimHardware(sim)
+        hw.set_motor("lift", "lift", 0.75, 2.0,
+                     temperature_c=62.5, supply_current_a=18.25)
+        sim.step(0.03)
+        self.assertFalse(lift.enabled)
+        self.assertTrue(motor.connected)
+        self.assertEqual(motor.temperature_c, 62.5)
+        self.assertEqual(motor.supply_current_a, 18.3)
+        self.assertEqual(motor.current, 0)
+        hw.set_connected("lift", "lift", False)
+        sim.step(0.03)
+        self.assertFalse(motor.connected)
+        self.assertEqual(motor.temperature_c, 0)
+        self.assertEqual(motor.supply_current_a, 0)
+        hw.set_connected("lift", "lift", True)
+        hw.set_motor("lift", "lift", 1.0, 3.0,
+                     temperature_c=75.0, supply_current_a=9.5)
+        sim.step(0.03)
+        self.assertEqual(motor.temperature_c, 75.0)
+        self.assertEqual(motor.supply_current_a, 9.5)
+        del hw
+        sim.step(0.15)
+        self.assertFalse(motor.connected)
+        # Stale numeric feedback stays latched, as with position/current.
+        self.assertEqual(motor.temperature_c, 75.0)
+        self.assertEqual(motor.supply_current_a, 9.5)
+
     def test_motor_clamping_is_exposed_as_a_property(self):
         class Shooter:
             def __init__(self, node):

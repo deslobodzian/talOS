@@ -544,6 +544,8 @@ int32_t talos_motor_sample(TalosNode* node, int64_t index, TalosSample* out) {
     o.velocity = s.velocity_rps;
     o.voltage = s.voltage;
     o.current = s.stator_current_a;
+    o.temperature_c = s.temperature_c;
+    o.supply_current_a = s.supply_current_a;
     return TALOS_OK;
   });
 }

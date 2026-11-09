@@ -66,7 +66,8 @@ class SimHardware {
   void set_motor(std::string_view node, std::string_view device,
                  double position, double velocity,
                  std::uint32_t position_age_us = 0,
-                 std::uint32_t velocity_age_us = 0);
+                 std::uint32_t velocity_age_us = 0, double temperature_c = 0,
+                 double supply_current_a = 0);
   void set_digital_input(std::string_view node, std::string_view device,
                          bool value);
   void set_analog_input(std::string_view node, std::string_view device,

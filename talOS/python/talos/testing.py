@@ -209,9 +209,12 @@ class SimHardware:
         _abi.ok(lib.talos_sim_hardware_ideal_motors(self._handle, bool(on)))
 
     def set_motor(self, node, device, position, velocity,
-                  position_age_us=0, velocity_age_us=0):
+                  position_age_us=0, velocity_age_us=0,
+                  temperature_c=0, supply_current_a=0):
+        """Inject feedback, including controller Celsius and supply amps."""
         self._set(lib.talos_sim_hardware_set_motor, node, device, position,
-                  velocity, position_age_us, velocity_age_us)
+                  velocity, position_age_us, velocity_age_us,
+                  temperature_c, supply_current_a)
 
     def set_digital_input(self, node, device, value):
         self._set(lib.talos_sim_hardware_set_digital_input, node, device,

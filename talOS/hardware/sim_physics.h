@@ -301,6 +301,8 @@ class PhysicsSimBackend final : public Backend {
         out.velocity_rps = 0;
         out.voltage = 0;
         out.stator_current_a = 0;
+        out.temperature_c = 0;
+        out.supply_current_a = 0;
         continue;
       }
       healthy = true;
@@ -317,6 +319,10 @@ class PhysicsSimBackend final : public Backend {
       out.voltage = powered_[i] ? applied_volts_[i] : 0.0;
       // Placeholder current proportional to effort; not a winding model.
       out.stator_current_a = std::abs(out.voltage) / 12.0 * m.stator_limit_a;
+      // Placeholder supply current proportional to effort and constant
+      // ambient temperature; not electrical or thermal models.
+      out.supply_current_a = std::abs(out.voltage) / 12.0 * m.supply_limit_a;
+      out.temperature_c = 25.0;
       EnforceSoftLimits(m, out, i);
       held_[i] = out;
     }

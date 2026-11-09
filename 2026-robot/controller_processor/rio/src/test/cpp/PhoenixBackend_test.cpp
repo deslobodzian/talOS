@@ -443,6 +443,34 @@ TEST(PhoenixBackendSim, ZeroVoltageVelocityRequestDoesNotSupplyDemand) {
   EXPECT_LT(std::abs(s.motors[0].voltage), 0.5);
 }
 
+TEST(PhoenixBackendSim, ReportsAmbientAndPhoenixSupplyCurrent) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  config.motors.push_back(TestMotor(1, "health_motor", 1));
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  const std::array<hw::MotorRequest, 1> commands{
+      Request(1, hw::Mode::kVoltage, 6.0)};
+  hw::State state;
+  PumpReads(backend, state, commands, 30);
+  ASSERT_TRUE(state.motors[0].valid);
+  EXPECT_DOUBLE_EQ(state.motors[0].temperature_c, 25.0);
+  EXPECT_TRUE(std::isfinite(state.motors[0].supply_current_a));
+  // The SDK calculates electrical current from the simulated rotor, rather
+  // than interpreting a motion target as current or aliasing stator current.
+  ctre::phoenix6::hardware::TalonFX device{1, ctre::phoenix6::CANBus{"rio"}};
+  EXPECT_NEAR(state.motors[0].supply_current_a,
+              device.GetSimState().GetSupplyCurrent().value(), 0.5);
+
+  backend.Neutral();
+  const std::array<hw::MotorRequest, 1> neutral{
+      Request(1, hw::Mode::kNeutral, 0.0)};
+  PumpReads(backend, state, neutral, 30);
+  EXPECT_DOUBLE_EQ(state.motors[0].temperature_c, 25.0);
+  EXPECT_NEAR(state.motors[0].supply_current_a, 0.0, 0.5);
+}
+
 TEST(PhoenixBackendSim, ZeroVoltagePositionRequestDoesNotTeleport) {
   EnsureHal();
   EnabledDs ds;
@@ -724,6 +752,15 @@ class PhoenixBackendRecovery : public ::testing::Test {
   static auto& MotorConfig(PhoenixBackend& backend, std::size_t i) {
     return backend.config_.motors[i];
   }
+  static void StopRefreshingHealth(PhoenixBackend& backend) {
+    auto& motor = Motor(backend, 0);
+    std::erase_if(backend.signals_, [&](auto* signal) {
+      return signal == &motor.GetDeviceTemp(false) ||
+             signal == &motor.GetSupplyCurrent(false);
+    });
+    // Exercise hardware telemetry handling, without the ambient sim override.
+    backend.is_simulation_ = false;
+  }
 };
 
 TEST_F(PhoenixBackendRecovery, DiagnosticRatesRespectPhoenixSharedFrames) {
@@ -744,8 +781,35 @@ TEST_F(PhoenixBackendRecovery, DiagnosticRatesRespectPhoenixSharedFrames) {
       motor.GetMotorVoltage(false).GetAppliedUpdateFrequency().value(), 200);
   EXPECT_DOUBLE_EQ(
       motor.GetStatorCurrent(false).GetAppliedUpdateFrequency().value(), 200);
+  // SDK 26.3 SupplyAndTemp contains all three signals; requesting 4 Hz for
+  // temperature and 50 Hz for supply current cannot slow their shared frame.
+  EXPECT_DOUBLE_EQ(
+      motor.GetSupplyCurrent(false).GetAppliedUpdateFrequency().value(), 200);
+  EXPECT_DOUBLE_EQ(
+      motor.GetDeviceTemp(false).GetAppliedUpdateFrequency().value(), 200);
   EXPECT_DOUBLE_EQ(
       motor.GetFaultField(false).GetAppliedUpdateFrequency().value(), 50);
+}
+
+TEST_F(PhoenixBackendRecovery, StaleHealthDoesNotInvalidateMotionFeedback) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  config.motors.push_back(TestMotor(1, "motor", 1));
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  const std::array<hw::MotorRequest, 1> commands{
+      Request(1, hw::Mode::kVoltage, 6.0)};
+  hw::State state;
+  PumpReads(backend, state, commands, 30);
+  ASSERT_TRUE(state.motors[0].valid);
+  StopRefreshingHealth(backend);
+  // Exceed both the 50 ms current and 500 ms temperature freshness windows.
+  PumpReads(backend, state, commands, 65);
+  EXPECT_TRUE(state.motors[0].valid);
+  EXPECT_GT(state.motors[0].voltage, 3.0);
+  EXPECT_DOUBLE_EQ(state.motors[0].temperature_c, 0.0);
+  EXPECT_DOUBLE_EQ(state.motors[0].supply_current_a, 0.0);
 }
 
 TEST_F(PhoenixBackendRecovery, RestoreDoesNotReconfigureUnrelatedMotor) {

@@ -1,5 +1,6 @@
 #include "messages.h"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <limits>
@@ -24,6 +25,15 @@ struct Writer {
     }
   }
   void Real(double x) { Int(std::bit_cast<uint64_t>(x), 8); }
+  void Tenths(double x) {
+    if (!std::isfinite(x)) {
+      ok = false;
+      return;
+    }
+    const auto value =
+        static_cast<int16_t>(std::round(std::clamp(x, -3276.8, 3276.7) * 10.0));
+    Int(static_cast<uint16_t>(value), 2);
+  }
 };
 struct Reader {
   std::span<const uint8_t> data;
@@ -44,6 +54,9 @@ struct Reader {
     const double x = std::bit_cast<double>(Int(8));
     ok &= std::isfinite(x);
     return x;
+  }
+  double Tenths() {
+    return std::bit_cast<int16_t>(static_cast<uint16_t>(Int(2))) / 10.0;
   }
   bool Done() const { return ok && pos == data.size(); }
 };
@@ -150,10 +163,12 @@ std::size_t Encode(const State& s, std::span<uint8_t> data) {
     w.Real(m.position_rot);
     w.Real(m.velocity_rps);
     w.Real(m.voltage);
-    w.Real(m.stator_current_a);
+    w.Tenths(m.stator_current_a);
     w.Int(m.position_age_us, 4);
     w.Int(m.velocity_age_us, 4);
     w.Int(m.fault_flags, 4);
+    w.Tenths(m.temperature_c);
+    w.Tenths(m.supply_current_a);
   }
   for (std::size_t i = 0; i < s.sensor_count; ++i) {
     const auto& x = s.sensors[i];
@@ -240,10 +255,12 @@ bool Decode(std::span<const uint8_t> data, State& out) {
     m.position_rot = r.Real();
     m.velocity_rps = r.Real();
     m.voltage = r.Real();
-    m.stator_current_a = r.Real();
+    m.stator_current_a = r.Tenths();
     m.position_age_us = r.Int(4);
     m.velocity_age_us = r.Int(4);
     m.fault_flags = r.Int(4);
+    m.temperature_c = r.Tenths();
+    m.supply_current_a = r.Tenths();
   }
   for (std::size_t i = 0; i < s.sensor_count; ++i) {
     auto& x = s.sensors[i];
