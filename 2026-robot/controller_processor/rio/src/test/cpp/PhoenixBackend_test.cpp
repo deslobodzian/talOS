@@ -721,6 +721,9 @@ class PhoenixBackendRecovery : public ::testing::Test {
   static auto& Motor(PhoenixBackend& backend, std::size_t i) {
     return *backend.motors_[i];
   }
+  static auto& MotorConfig(PhoenixBackend& backend, std::size_t i) {
+    return backend.config_.motors[i];
+  }
 };
 
 TEST_F(PhoenixBackendRecovery, DiagnosticRatesRespectPhoenixSharedFrames) {
@@ -775,4 +778,56 @@ TEST_F(PhoenixBackendRecovery, RestoreDoesNotReconfigureUnrelatedMotor) {
   EXPECT_DOUBLE_EQ(applied.Slot0.kP, 3);
   ASSERT_TRUE(Motor(backend, 1).GetConfigurator().Refresh(applied).IsOK());
   EXPECT_DOUBLE_EQ(applied.Slot0.kP, 0);
+}
+
+// A control send that fails on one motor neutralizes and reports only that
+// motor; unrelated motors keep driving instead of a whole-robot neutral.
+TEST_F(PhoenixBackendRecovery, SendFailureNeutralizesOnlyThatMotor) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto follower = TestMotor(20, "follower", 2);
+  follower.master_id = 10;
+  config.motors = {TestMotor(10, "master", 1), follower,
+                   TestMotor(30, "independent", 3)};
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  const std::array<hw::MotorRequest, 3> commands{
+      Request(10, hw::Mode::kVoltage, 6.0),
+      Request(20, hw::Mode::kVoltage, 0.0),
+      Request(30, hw::Mode::kVoltage, 6.0)};
+  hw::State state;
+  PumpReads(backend, state, commands, 30);
+  for (std::size_t i = 0; i < config.motors.size(); ++i)
+    ASSERT_TRUE(state.motors[i].valid) << i;
+  // Test-only fault injection: an out-of-range master CAN id makes Phoenix
+  // reject the follower's Follower request, a genuine SetControl failure.
+  MotorConfig(backend, 0).can_id = 99;
+  for (int i = 0; i < 30; ++i) {
+    ASSERT_TRUE(backend.Apply(commands));
+    const auto failed = backend.ApplyFailedDevices();
+    ASSERT_EQ(std::vector<uint16_t>(failed.begin(), failed.end()),
+              std::vector<uint16_t>{20});
+    backend.Read(state);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ctre::phoenix6::hardware::TalonFX master{1, ctre::phoenix6::CANBus{"rio"}};
+  ctre::phoenix6::hardware::TalonFX follower_device{
+      2, ctre::phoenix6::CANBus{"rio"}};
+  ctre::phoenix6::hardware::TalonFX independent{3,
+                                                ctre::phoenix6::CANBus{"rio"}};
+  EXPECT_GT(independent.GetSimState().GetMotorVoltage().value(), 3.0);
+  EXPECT_GT(master.GetSimState().GetMotorVoltage().value(), 3.0);
+  EXPECT_NEAR(follower_device.GetSimState().GetMotorVoltage().value(), 0.0,
+              0.5);
+
+  // The next successful send clears the report and following resumes.
+  MotorConfig(backend, 0).can_id = 1;
+  for (int i = 0; i < 30; ++i) {
+    ASSERT_TRUE(backend.Apply(commands));
+    EXPECT_TRUE(backend.ApplyFailedDevices().empty());
+    backend.Read(state);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_GT(follower_device.GetSimState().GetMotorVoltage().value(), 3.0);
 }

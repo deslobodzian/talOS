@@ -189,8 +189,14 @@ The bridge stamps receipt with `talos::event::Poller::now()`, the clock
 Driver Station disable/e-stop, command timeout, or total backend feedback loss
 neutralizes outputs, and neutral is refreshed every tick until a fresh command
 is accepted. Enable transitions and timeout/backend stops invalidate
-commands by advancing the epoch. Apply failures neutralize outputs and retry
-on the next fresh command; three consecutive failures latch a fault. A
+commands by advancing the epoch. A control-send failure on individual motors
+(`Backend::ApplyFailedDevices()`; Phoenix: a non-OK `SetControl`) is
+device-local: the backend tries neutral on that motor, the gateway still accepts
+the command, and quarantines the motor like a reset (below). Global apply
+failures (`Apply`/`ApplyOutputs` returning false, or every motor failing in one
+apply pass, including the dependent-neutralization pass) neutralize all outputs
+and retry on the next fresh command; three consecutive global failures latch a
+fault. A
 disabled-to-enabled transition or successful reconfiguration (including an
 identical push) clears the latch. A transient status failure requires a fresh
 valid command after recovery.
@@ -204,7 +210,13 @@ pre-reset observations cannot authorize the affected motors after recovery.
 on a worker while ticks, state publication and unrelated outputs continue.
 Failed devices retry after 250 ms, doubling to 2 s. A successful restore requires
 a fresh command observation before resuming. `Gateway::restore_attempt_count()`
-counts all restore starts per boot.
+counts all restore starts per boot. Motors whose control send failed join the
+same unavailable set: their followers and dependents go neutral at once, the
+rest of the command keeps applying, and restore re-applies the chain's config
+before a fresh command retries the send. A motor that keeps failing is
+re-isolated on that retry, at the restore backoff rate, without a global fault;
+repeat failures do not count as `apply_failure_count`, but the motor stays
+invalid and its demands count in `neutralized_motor_count`.
 
 Fault scope: stale motor current/voltage zeroes the effort fields but keeps the
 sample valid; an invalid RIO encoder invalidates only that sample. Invalid motor
@@ -214,8 +226,9 @@ the same command continue driving. These neutralizations increment
 `neutralized_motor_count`. The backend remains healthy while any configured
 motor or CAN sensor has valid feedback (or none are configured). Total loss of
 all configured motor/CAN-sensor feedback neutralizes every output and advances
-the command epoch. Failed Apply or structurally rejected Configure also
-neutralizes every output; individual device configuration failures do not.
+the command epoch. Failed global Apply or structurally rejected Configure also
+neutralizes every output; individual device configuration or control-send
+failures do not.
 DIO/analog/PWM and RIO encoder validity never sink the backend.
 
 ## RoboRIO

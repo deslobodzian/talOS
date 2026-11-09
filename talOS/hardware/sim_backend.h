@@ -110,6 +110,7 @@ class SimBackend final : public Backend {
     std::copy(commands.begin(), commands.end(), commands_.begin());
     return true;
   }
+  std::span<const uint16_t> ApplyFailedDevices() const override { return {}; }
   bool ApplyOutputs(std::span<const DigitalOutputRequest> digital_outputs,
                     std::span<const PwmRequest> pwm_outputs) override {
     for (const auto& d : digital_outputs) {

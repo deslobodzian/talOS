@@ -168,6 +168,9 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   last_sensor_valid_.fill(true);
   last_motor_fault_mask_ = 0;
   neutral_send_failing_.fill(false);
+  apply_failing_.fill(false);
+  apply_failed_.clear();
+  apply_failed_.reserve(c.motors.size());
   last_brownout_ = false;
   // The first failed device apply wins the precise error: device
   // name, bus, CAN ID, operation, and the raw vendor status value.
@@ -737,7 +740,28 @@ bool PhoenixBackend::Read(hw::State& s) {
   return healthy;
 }
 bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
+  apply_failed_.clear();
   if (commands.size() != motors_.size()) return false;
+  // A failed send is local to its motor: try neutral on that motor only, keep
+  // applying the rest, and report it so Gateway quarantines its chain. Log
+  // only ok<->failing transitions; an isolated motor is retried per command.
+  const auto note_send = [&](std::size_t i,
+                             const ctre::phoenix::StatusCode& status) {
+    const bool failed = !status.IsOK();
+    const auto& config = config_.motors[i];
+    if (failed != apply_failing_[i]) {
+      std::cerr << "[phoenix] apply control "
+                << (failed ? "failed" : "recovered") << " on motor "
+                << config.name << " (can_id=" << config.can_id
+                << "): " << status.GetName()
+                << (failed ? "; neutralizing only this motor" : "") << "\n";
+    }
+    apply_failing_[i] = failed;
+    if (!failed) return;
+    motors_[i]->SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
+    sim_neutral_[i] = true;
+    apply_failed_.push_back(config.id);
+  };
   for (std::size_t i = 0; i < commands.size(); ++i) {
     const auto& r = commands[i];
     auto& m = *motors_[i];
@@ -789,13 +813,7 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
             ph::controls::Follower{master->can_id, config.oppose_master}
                 .WithUpdateFreqHz(0_Hz));
       }
-      if (!result.IsOK()) {
-        Neutral();
-        std::cerr << "[phoenix] apply control failed on motor " << config.name
-                  << " (can_id=" << config.can_id << "): " << result.GetName()
-                  << "\n";
-        return false;
-      }
+      note_send(i, result);
       continue;
     }
     sim_neutral_[i] = r.mode == hw::Mode::kNeutral;
@@ -840,13 +858,7 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
       default:
         return false;
     }
-    if (!result.IsOK()) {
-      Neutral();
-      std::cerr << "[phoenix] apply control failed on motor " << config.name
-                << " (can_id=" << config.can_id << "): " << result.GetName()
-                << "\n";
-      return false;
-    }
+    note_send(i, result);
   }
   return true;
 }

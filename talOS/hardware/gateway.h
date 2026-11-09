@@ -33,7 +33,17 @@ class Backend {
   virtual bool Read(State&) = 0;
   // Followers ignore demand values, but kNeutral explicitly gates their output.
   // Gateway resolves a live follower's mode from its sanitized master.
+  // Return false only for a global failure (no motor output can be trusted).
+  // A send failure on an individual motor is device-local: try neutral on that
+  // motor, keep applying the rest, return true and report it through
+  // ApplyFailedDevices().
   virtual bool Apply(std::span<const MotorRequest>) = 0;
+  // Logical motor IDs whose control send failed during the last Apply() that
+  // returned true; valid until the next Apply(). Gateway isolates them (and
+  // their dependents) exactly like unavailable devices and restores them
+  // through BeginRestoreAfterReset(). Backends whose sends cannot fail per
+  // device return an empty span.
+  virtual std::span<const uint16_t> ApplyFailedDevices() const = 0;
   virtual bool ApplyOutputs(
       std::span<const DigitalOutputRequest> /*digital_outputs*/,
       std::span<const PwmRequest> /*pwm_outputs*/) {
@@ -94,9 +104,11 @@ class Gateway {
   // Structural errors reject all outputs; range errors or invalid motor/remote
   // CANcoder feedback neutralize only that motor. Total backend loss
   // neutralizes all outputs and invalidates outstanding commands by advancing
-  // the epoch. Apply failures invalidate commands and retry until the
-  // consecutive limit; re-enabling or any successful Reconfigure clears the
-  // apply-failure latch.
+  // the epoch. A device-local send failure (ApplyFailedDevices) isolates only
+  // that motor's chain and the command is still accepted. Global apply
+  // failures (Apply/ApplyOutputs false, or every motor failing) invalidate
+  // commands and retry until the consecutive limit; re-enabling or any
+  // successful Reconfigure clears the apply-failure latch.
   bool Accept(const Command& command, uint64_t sequence, uint64_t now_us);
   State snapshot() const;
   const Config& config() const { return config_; }
@@ -112,6 +124,8 @@ class Gateway {
   bool DeviceUnavailable(uint16_t id) const;
   void MaskUnavailable();
   void NeutralUnavailable();
+  bool ApplyMotors(std::span<const MotorRequest> requests);
+  bool IsolateFailedMotors();
   void CommitConfiguration(const Config& config);
   Config config_;
   Backend& backend_;

@@ -135,7 +135,29 @@ class FakeBackend : public Backend {
   bool Apply(std::span<const MotorRequest> requests) override {
     last_requests.assign(requests.begin(), requests.end());
     ++applied;
+    // Device-local send failures. last_requests keeps what the gateway asked
+    // for, so tests observe the gateway's own neutralization.
+    apply_failed.clear();
+    const bool fail_all =
+        fail_all_after_neutral &&
+        std::any_of(requests.begin(), requests.end(), [](const auto& request) {
+          return request.mode == Mode::kNeutral;
+        });
+    for (const auto& request : requests) {
+      if (fail_all || std::find(failing_motors.begin(), failing_motors.end(),
+                                request.id) != failing_motors.end())
+        apply_failed.push_back(request.id);
+    }
     return apply_ok;
+  }
+  std::span<const uint16_t> ApplyFailedDevices() const override {
+    return apply_failed;
+  }
+  bool ApplyOutputs(std::span<const DigitalOutputRequest> digital,
+                    std::span<const PwmRequest> pwm) override {
+    last_digital_outputs.assign(digital.begin(), digital.end());
+    last_pwm_outputs.assign(pwm.begin(), pwm.end());
+    return outputs_ok;
   }
   void Neutral() override {
     ++neutral;
@@ -165,6 +187,11 @@ class FakeBackend : public Backend {
   }
   int pending_ticks{};
   bool configure_ok{true}, healthy{true}, apply_ok{true}, restore_ok{true};
+  bool outputs_ok{true};
+  bool fail_all_after_neutral{false};
+  std::vector<uint16_t> failing_motors, apply_failed;
+  std::vector<DigitalOutputRequest> last_digital_outputs;
+  std::vector<PwmRequest> last_pwm_outputs;
   int applied{}, neutral{}, configure_calls{};
   uint16_t invalid_motor{}, invalid_sensor{};
   std::vector<MotorRequest> last_requests{};
@@ -1136,6 +1163,9 @@ TEST(SimBackend, NeutralTurnsOffEveryOutputOnDisableTimeoutAndFailure) {
     bool Apply(std::span<const MotorRequest> commands) override {
       return sim.Apply(commands);
     }
+    std::span<const uint16_t> ApplyFailedDevices() const override {
+      return sim.ApplyFailedDevices();
+    }
     bool ApplyOutputs(std::span<const DigitalOutputRequest> digital,
                       std::span<const PwmRequest> pwm) override {
       return sim.ApplyOutputs(digital, pwm);
@@ -1357,6 +1387,149 @@ TEST(Gateway, FailedDeviceConfigureAndRestoreLeaveOthersDriving) {
   ASSERT_TRUE(g.Accept(command, 3, 502000));
   EXPECT_EQ(backend.last_requests[0].mode, Mode::kDutyCycle);
   EXPECT_EQ(backend.last_requests[1].mode, Mode::kDutyCycle);
+}
+
+// A control-send failure on one motor quarantines only that motor and its
+// follower; the rest of the command, DIO and PWM keep applying and no global
+// fault latches however often it repeats. Restore brings the motor back.
+TEST(Gateway, DeviceLocalApplyFailureIsolatesOnlyThatChain) {
+  FakeBackend backend;
+  auto config = SwerveConfig(true);
+  config.motors[1].master_id = config.motors[0].id;
+  config.digital_outputs.push_back({40, "solenoid", 1});
+  config.pwm_outputs.push_back({41, "servo", 0});
+  const auto failed_id = config.motors[0].id;
+  Gateway g{config, backend, 1};
+  const auto command_at = [&](uint64_t now) {
+    auto c = Request(g);
+    c.observed_time_us = now;
+    for (std::size_t i = 0; i < c.count; ++i)
+      c.motors[i] = {config.motors[i].id, Mode::kDutyCycle, 0, 0.2};
+    c.digital_output_count = 1;
+    c.digital_outputs[0] = {40, true};
+    c.pwm_output_count = 1;
+    c.pwm_outputs[0] = {41, 0.5};
+    return c;
+  };
+  const auto expect_isolated = [&](const char* phase) {
+    SCOPED_TRACE(phase);
+    EXPECT_EQ(backend.last_requests[0].mode, Mode::kNeutral);
+    EXPECT_EQ(backend.last_requests[1].mode, Mode::kNeutral);
+    for (std::size_t m = 2; m < config.motors.size(); ++m)
+      EXPECT_EQ(backend.last_requests[m].mode, Mode::kDutyCycle) << m;
+    ASSERT_EQ(backend.last_digital_outputs.size(), 1u);
+    EXPECT_TRUE(backend.last_digital_outputs[0].value);
+    ASSERT_EQ(backend.last_pwm_outputs.size(), 1u);
+    EXPECT_DOUBLE_EQ(backend.last_pwm_outputs[0].output, 0.5);
+    const auto s = g.snapshot();
+    EXPECT_FALSE(s.motors[0].valid);
+    EXPECT_FALSE(s.motors[1].valid);
+    EXPECT_FALSE(s.flags & kHardwareFault);
+    EXPECT_TRUE(s.flags & kCommandActive);
+    EXPECT_EQ(s.counters.apply_failure_count, 0u);
+  };
+  backend.failing_motors = {failed_id};
+  uint64_t now = 1000;
+  uint64_t sequence = 0;
+  g.Tick(now, true);
+  const auto epoch = g.snapshot().epoch;
+  for (uint32_t i = 0; i < 2 * Gateway::kConsecutiveApplyFailureLimit; ++i) {
+    const int neutrals = backend.neutral;
+    ASSERT_TRUE(g.Accept(command_at(now), ++sequence, now)) << i;
+    expect_isolated("repeated failure");
+    EXPECT_EQ(backend.neutral, neutrals);  // No whole-robot neutral.
+    now += 5000;
+    g.Tick(now, true);
+  }
+  EXPECT_EQ(g.snapshot().epoch, epoch);
+
+  // Restore is attempted while the motor still fails: the next fresh
+  // observation retries it once and re-isolates it, still without a fault.
+  now = 250000;
+  g.Tick(now, true);
+  EXPECT_EQ(backend.restoring_ids, std::vector<uint16_t>{failed_id});
+  now += 5000;
+  g.Tick(now, true);
+  EXPECT_TRUE(g.snapshot().motors[0].valid);
+  ASSERT_TRUE(g.Accept(command_at(now), ++sequence, now));
+  expect_isolated("failure after restore");
+
+  // Once sends succeed, the backed-off restore recovers the chain.
+  backend.failing_motors.clear();
+  const auto restores = g.restore_attempt_count();
+  while (g.restore_attempt_count() == restores && now < 3000000) {
+    EXPECT_FALSE(g.snapshot().motors[0].valid);  // Neutral until restored.
+    now += 5000;
+    g.Tick(now, true);
+  }
+  ASSERT_GT(g.restore_attempt_count(), restores);
+  now += 5000;
+  g.Tick(now, true);
+  ASSERT_TRUE(g.snapshot().motors[0].valid);
+  ASSERT_TRUE(g.Accept(command_at(now), ++sequence, now));
+  for (std::size_t m = 0; m < config.motors.size(); ++m)
+    EXPECT_EQ(backend.last_requests[m].mode, Mode::kDutyCycle) << m;
+  EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+
+  // Neither a stale observation nor disable can revive recovered outputs.
+  const auto stale = command_at(now);
+  now += config.command_timeout_us;
+  const int before_timeout = backend.neutral;
+  g.Tick(now, true);
+  EXPECT_GT(backend.neutral, before_timeout);
+  EXPECT_FALSE(g.Accept(stale, ++sequence, now));
+  EXPECT_FALSE(g.snapshot().flags & kCommandActive);
+  g.Tick(++now, false);
+  const int applied = backend.applied;
+  EXPECT_FALSE(g.Accept(command_at(now), ++sequence, now));
+  EXPECT_EQ(backend.applied, applied);
+  EXPECT_FALSE(g.snapshot().flags & kCommandActive);
+}
+
+// Only a genuinely global failure keeps invalidate + three-strike latch.
+TEST(Gateway, EveryMotorOrOutputApplyFailureStillLatches) {
+  for (bool outputs : {false, true}) {
+    SCOPED_TRACE(outputs ? "outputs" : "every motor");
+    FakeBackend backend;
+    const auto config = SwerveConfig(true);
+    Gateway g{config, backend, 1};
+    g.Tick(1000, true);
+    if (outputs) {
+      backend.outputs_ok = false;
+    } else {
+      for (const auto& motor : config.motors)
+        backend.failing_motors.push_back(motor.id);
+    }
+    const int neutrals = backend.neutral;
+    for (uint32_t i = 0; i < Gateway::kConsecutiveApplyFailureLimit; ++i)
+      EXPECT_FALSE(g.Accept(Request(g), i + 1, 1000));
+    EXPECT_TRUE(g.snapshot().flags & kHardwareFault);
+    EXPECT_FALSE(g.snapshot().flags & kCommandActive);
+    EXPECT_EQ(g.snapshot().counters.apply_failure_count,
+              Gateway::kConsecutiveApplyFailureLimit);
+    EXPECT_GE(
+        backend.neutral,
+        neutrals + static_cast<int>(Gateway::kConsecutiveApplyFailureLimit));
+  }
+}
+
+TEST(Gateway, GlobalFailureDuringIsolationStillLatches) {
+  FakeBackend backend;
+  const auto config = SwerveConfig(true);
+  Gateway g{config, backend, 1};
+  g.Tick(1000, true);
+  backend.failing_motors = {config.motors[0].id};
+  backend.fail_all_after_neutral = true;
+  for (uint32_t i = 0; i < Gateway::kConsecutiveApplyFailureLimit; ++i) {
+    auto command = Request(g);
+    for (std::size_t m = 0; m < command.count; ++m)
+      command.motors[m] = {config.motors[m].id, Mode::kDutyCycle, 0, 0.2};
+    EXPECT_FALSE(g.Accept(command, i + 1, 1000));
+  }
+  EXPECT_TRUE(g.snapshot().flags & kHardwareFault);
+  EXPECT_FALSE(g.snapshot().flags & kCommandActive);
+  EXPECT_EQ(g.snapshot().counters.apply_failure_count,
+            Gateway::kConsecutiveApplyFailureLimit);
 }
 
 TEST(Gateway, RemoteSensorResetIsolatesItsMotorAndFollower) {

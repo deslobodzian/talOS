@@ -41,6 +41,9 @@ class PhoenixBackend final : public talos::hardware::Backend {
   }
   bool Read(talos::hardware::State&) override;
   bool Apply(std::span<const talos::hardware::MotorRequest>) override;
+  std::span<const uint16_t> ApplyFailedDevices() const override {
+    return apply_failed_;
+  }
   bool ApplyOutputs(
       std::span<const talos::hardware::DigitalOutputRequest> digital_outputs,
       std::span<const talos::hardware::PwmRequest> pwm_outputs) override;
@@ -78,6 +81,8 @@ class PhoenixBackend final : public talos::hardware::Backend {
   uint32_t last_motor_fault_mask_{0};
   std::array<bool, talos::hardware::kMaxMotors> neutral_send_failing_{};
   uint64_t neutral_send_failure_count_{0};
+  std::array<bool, talos::hardware::kMaxMotors> apply_failing_{};
+  std::vector<uint16_t> apply_failed_;
   bool last_brownout_{false};
   std::vector<ctre::phoenix6::BaseStatusSignal*> signals_;
   std::vector<std::unique_ptr<frc::DigitalInput>> digital_inputs_;

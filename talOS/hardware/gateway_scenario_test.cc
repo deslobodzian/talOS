@@ -94,6 +94,9 @@ class FaultyBackend : public Backend {
     if (fail_apply) return false;
     return sim_.Apply(commands);
   }
+  std::span<const uint16_t> ApplyFailedDevices() const override {
+    return sim_.ApplyFailedDevices();
+  }
   bool ApplyOutputs(std::span<const DigitalOutputRequest> digital_outputs,
                     std::span<const PwmRequest> pwm_outputs) override {
     return sim_.ApplyOutputs(digital_outputs, pwm_outputs);

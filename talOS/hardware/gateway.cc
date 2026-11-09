@@ -195,15 +195,55 @@ void Gateway::MaskUnavailable() {
   }
 }
 
+bool Gateway::ApplyMotors(std::span<const MotorRequest> requests) {
+  if (!backend_.Apply(requests)) return false;
+  const auto failed = backend_.ApplyFailedDevices();
+  // An empty motor configuration still allows independent DIO/PWM owners.
+  return requests.empty() ||
+         !std::all_of(requests.begin(), requests.end(), [&](const auto& r) {
+           return std::find(failed.begin(), failed.end(), r.id) != failed.end();
+         });
+}
+
 void Gateway::NeutralUnavailable() {
-  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-    if (!state_.motors[i].valid) {
-      last_requests_[i] = MotorRequest{config_.motors[i].id, Mode::kNeutral};
+  // A neutral pass may expose another failing motor; each extra pass isolates
+  // at least one more configured motor, so this is bounded by the motor count.
+  while (true) {
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      if (!state_.motors[i].valid) {
+        last_requests_[i] = MotorRequest{config_.motors[i].id, Mode::kNeutral};
+      }
     }
+    if (!active_) return;
+    if (!ApplyMotors({last_requests_.data(), config_.motors.size()})) {
+      ++state_.counters.apply_failure_count;
+      fault_ = ++consecutive_apply_failures_ >= kConsecutiveApplyFailureLimit;
+      Invalidate();
+      return;
+    }
+    if (!IsolateFailedMotors()) return;
+    MaskUnavailable();
   }
-  if (active_ &&
-      !backend_.Apply({last_requests_.data(), config_.motors.size()}))
-    Invalidate();
+}
+
+bool Gateway::IsolateFailedMotors() {
+  bool isolated = false;
+  for (const auto id : backend_.ApplyFailedDevices()) {
+    const bool motor =
+        std::any_of(config_.motors.begin(), config_.motors.end(),
+                    [id](const MotorConfig& m) { return m.id == id; });
+    if (!motor || DeviceUnavailable(id)) continue;
+    // Same quarantine as a device reset: masked, dependents neutral, restored
+    // with backoff, and only a post-isolation observation re-authorizes it.
+    std::erase(restoring_ids_, id);
+    unavailable_.push_back(id);
+    isolated = true;
+  }
+  if (isolated) {
+    restore_waiting_ = true;
+    restore_retry_at_ = std::max(restore_retry_at_, state_.sample_time_us);
+  }
+  return isolated;
 }
 
 void Gateway::PollResets() {
@@ -397,7 +437,7 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
     if (requests[i].mode == Mode::kNeutral && requests[i] != c.motors[i])
       ++state_.counters.neutralized_motor_count;
   }
-  if (!backend_.Apply({requests.data(), c.count}) ||
+  if (!ApplyMotors({requests.data(), c.count}) ||
       !backend_.ApplyOutputs({c.digital_outputs.data(), c.digital_output_count},
                              {c.pwm_outputs.data(), c.pwm_output_count})) {
     ++state_.counters.apply_failure_count;
@@ -405,14 +445,20 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
     Invalidate();
     return false;
   }
-  consecutive_apply_failures_ = 0;
   last_requests_ = requests;
   active_ = true;
   have_sequence_ = true;
   accepted_at_ = now;
   observed_at_ = c.observed_time_us;
   state_.last_command_sequence = sequence;
-  return true;
+  // Device-local send failures quarantine only the failed chain; the rest of
+  // this command stays applied.
+  if (IsolateFailedMotors()) {
+    MaskUnavailable();
+    NeutralUnavailable();
+  }
+  if (active_) consecutive_apply_failures_ = 0;
+  return active_;
 }
 State Gateway::snapshot() const {
   State s = state_;
