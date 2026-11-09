@@ -63,6 +63,10 @@ struct Bridge {
   us_listen_socket_t* listener = nullptr;
   std::uint64_t invalid = 0, ws_drops = 0, telemetry_ws_drops = 0,
                 forwarded = 0;
+  // read_next() copies each frame here first: forwarding commits side effects
+  // (client sends, counters), which a zero-copy read() callback must not.
+  std::vector<std::byte> frame =
+      std::vector<std::byte>(talos::telemetry_wire::slot_bytes);
   std::size_t max_clients = 4;
   std::uint64_t refused = 0, egress_bytes = 0;
   EgressBudget budget;
@@ -178,47 +182,48 @@ struct Bridge {
   void poll() {
     // Bound work so HTTP and client socket processing cannot starve.
     for (unsigned count = 0; count < 256; ++count) {
-      if (!queue.read(reader, [&](std::span<const std::byte> slot) {
-            auto bytes = talos::telemetry_wire::payload(slot);
-            if (bytes.empty()) {
-              ++invalid;
-              return;
-            }
-            if (!studio::IngestTelemetry(telemetry_state, bytes,
-                                         talos::introspect::wall_now_ns())) {
-              ++invalid;
-              return;
-            }
-            // Forward only frames a client can decode: one aligned with
-            // the cached dictionary (a dictionary frame aligns with
-            // itself). A value frame that arrives before any dictionary
-            // is ingested above but not sent, so the first binary frame
-            // every client sees is a dictionary frame.
-            const auto* decoded =
-                Talos::Telemetry::GetSizePrefixedFrame(bytes.data());
-            const bool aligned =
-                telemetry_state.has_dictionary && decoded != nullptr &&
-                decoded->stream_id() == telemetry_state.stream_id &&
-                decoded->dictionary_id() == telemetry_state.dictionary_id &&
-                decoded->values() != nullptr &&
-                decoded->values()->size() == telemetry_state.dictionary.size();
-            if (!aligned) return;
-            ++forwarded;
-            for (auto* client : clients) {
-              const auto& state = *client->getUserData();
-              if (!state.has_dictionary ||
-                  state.stream_id != telemetry_state.stream_id ||
-                  state.dictionary_id != telemetry_state.dictionary_id) {
-                // A budget drop must not strand a viewer without its
-                // dictionary. Withhold values so its bucket can refill enough
-                // to retry.
-                send_dictionary(client);
-                continue;
-              }
-              send(client, bytes, uWS::OpCode::BINARY);
-            }
-          })) {
-        break;
+      MessageInfo info;
+      const auto result = queue.read_next(reader, frame, info);
+      if (result == ReadResult::TORN) {
+        ++invalid;
+        continue;
+      }
+      if (result != ReadResult::OK) break;
+      auto bytes = talos::telemetry_wire::payload(frame);
+      if (bytes.empty()) {
+        ++invalid;
+        continue;
+      }
+      if (!studio::IngestTelemetry(telemetry_state, bytes,
+                                   talos::introspect::wall_now_ns())) {
+        ++invalid;
+        continue;
+      }
+      // Forward only frames a client can decode: one aligned with the cached
+      // dictionary (a dictionary frame aligns with itself). A value frame that
+      // arrives before any dictionary is ingested above but not sent, so the
+      // first binary frame every client sees is a dictionary frame.
+      const auto* decoded =
+          Talos::Telemetry::GetSizePrefixedFrame(bytes.data());
+      const bool aligned =
+          telemetry_state.has_dictionary && decoded != nullptr &&
+          decoded->stream_id() == telemetry_state.stream_id &&
+          decoded->dictionary_id() == telemetry_state.dictionary_id &&
+          decoded->values() != nullptr &&
+          decoded->values()->size() == telemetry_state.dictionary.size();
+      if (!aligned) continue;
+      ++forwarded;
+      for (auto* client : clients) {
+        const auto& state = *client->getUserData();
+        if (!state.has_dictionary ||
+            state.stream_id != telemetry_state.stream_id ||
+            state.dictionary_id != telemetry_state.dictionary_id) {
+          // A budget drop must not strand a viewer without its dictionary.
+          // Withhold values so its bucket can refill enough to retry.
+          send_dictionary(client);
+          continue;
+        }
+        send(client, bytes, uWS::OpCode::BINARY);
       }
     }
   }
