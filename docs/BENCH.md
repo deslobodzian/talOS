@@ -1,0 +1,172 @@
+# One-Kraken bench bring-up
+
+Use `bench/` for a RoboRIO, Mac mini and one restrained Kraken X60/TalonFX.
+The RIO runs the existing generic gateway; no 2026 robot mechanisms are launched.
+Every checked-in bench config is **uncommissioned**. CAN id 1 is a placeholder,
+not a claim about the connected motor. Keep a spotter at DS disable and a safe
+power disconnect; neutral output does not instantly stop a coasting rotor.
+
+For every trial record operator/date, config hash, Mini/RIO versions, wiring,
+DS mode, control inputs, session directory and RIO console output. Stop and
+investigate any unexpected motion before proceeding. Disable between trials,
+release all controls, and explicitly re-enable only after checking recovery.
+
+## Build, network and deployment
+
+- [ ] Secure the bare motor, remove loose couplings, guard its shaft, provide
+  appropriate fused power/CAN termination, and leave DS disabled. Expected:
+  no motion or exposed rotating hazards. Record wiring, power supply and guard.
+- [ ] Assign Mini `10.56.87.11` and RIO `10.56.87.2`; verify bidirectional
+  connectivity. The generic RIO's `kCompanionAddress` is the Mini address.
+  Inspect `bench/main_processor/configuration/robot_bench.toml`: it includes
+  `robot.toml` and overrides the controller address. Expected: boot needs no
+  `--remote` override. Record interface/subnet and connectivity results.
+- [ ] On the actual macOS Mini, from the repo root run `bazel build //...`
+  and `bazel test //...`. Expected: success on the deployment architecture,
+  not merely Linux CI. Record revision, architecture and command results.
+- [ ] Run `bazel test --test_output=errors //bench/...`, then
+  `bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot.toml --describe-only`
+  and repeat with `robot_bench.toml`. Expected: valid graphs. Record output.
+- [ ] Before hardware deployment, run
+  `bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot.toml --sim --start-sim-gateway --output-dir /tmp/bench-smoke --duration-s 20`.
+  Expected: motor, teleop, telemetry, hardware_node and the generic ideal sim
+  gateway remain running until normal shutdown; completed manifest has no
+  crashes/restarts or failed logs. Simulation overrides commissioning only in
+  memory; it does not prove physical safety or voltage dynamics. Record manifest.
+- [ ] From `2026-robot/controller_processor/rio`, run `./gradlew deploy`.
+  Expected: generic gateway starts on the RIO and targets the Mini. Record
+  deploy result and RIO console banner.
+- [ ] Build `bazel build //bench/main_processor:bench_bundle`; on the Mini run
+  `./tools/deploy.sh install bazel-bin/bench/main_processor/bench_bundle`.
+  Expected: `/opt/talos/current` selects a read-only bundle; previous bundle
+  remains available. Record installed version and config hash. Never edit the
+  installed bundle; rebuild/reinstall changes.
+- [ ] Inspect `./tools/deploy.sh enable-boot --user <service-account> --dry-run`,
+  then enable boot with the actual service account. Expected: bundle traversal
+  succeeds, `/opt/talos/logs` is writable by that account (0755), bundle remains
+  read-only. Record ownership and launchd configuration. Stop boot-managed
+  execution before starting a manual launcher: exactly one stack may run.
+- [ ] As that account start `/opt/talos/current/run.sh --output-dir /opt/talos/logs`.
+  Run `./tools/deploy.sh logs`. Expected: one unique session below the output
+  root, with the deployed config hash and each node's log paths. Record paths.
+
+## Uncommissioned and disabled checks
+
+- [ ] Keep `commissioned = false` and exercise controls while DS disabled.
+  Expected: RIO console reports `commissioned=0`, `/hw/status.configured` is
+  false, and no motor motion occurs. Record console and `/motor/state`.
+  Refusal is intentional, not a CAN fault to bypass.
+- [ ] Inspect `/hw/status`: receive counters should advance and identity and
+  ownership rejection counters should not grow. Expected: low state age once
+  frames actually arrive; zero age before the first frame proves nothing.
+  Record counters and state age, plus `/motor/state` connected/fault validity.
+
+## Human commissioning and first spin
+
+- [ ] With power safe and DS disabled, a human identifies the one physical
+  TalonFX in Phoenix Tuner X, checks firmware/CAN bus/id and inversion, and
+  sets the real CAN id/inversion in `configuration/subsystems/motor.toml`.
+  Expected: exactly the intended Kraken resolves; positive demand and feedback
+  direction agree after the supervised spin. Record measured id, inversion and
+  firmware. Do not reuse an unchecked placeholder.
+- [ ] Review supply 30 A, stator 40 A, hardware voltage ceiling 4 V, node
+  `max_bench_voltage_v = 2.0`, ratio 1.0, velocity ceiling 30 rps and provisional
+  slot0 gains (feedforward 0.12 V/rotor-rps). Expected: these match the bare
+  motor and power source. Record reviewed limits; raise deliberately only after
+  the first spin, never to hide a fault.
+- [ ] Only a human, after those checks, sets commissioning true in the base
+  and deployment configs and updates `config_golden_test.cc` to the measured
+  configuration in the same change. Repeat Mini build/test, bundle install and
+  launch. Expected: RIO acknowledges configuration, `/hw/status.configured`
+  becomes true. Record reviewed change/config hash and RIO acknowledgment.
+- [ ] With DS disabled move joystick 0 axis 1 and hold buttons 1/2. Expected:
+  neutral mode/source NONE, zero drive, no motion. Release all controls before
+  enabling teleop; startup/recovery requires a neutral-input evaluation. Record
+  state and physical observation.
+- [ ] Enable teleop, move axis 1 slightly (10% deadband, negative axis gives
+  positive voltage), then centre and disable. Expected: VOLTAGE/TELEOP only
+  while deflected, axis fraction times `max_bench_voltage_v`, bounded to ±2 V;
+  release and disable neutralize. Record applied voltage, direction, position,
+  velocity and stator current. Hardware limits still clamp all commands.
+- [ ] With axis centred, hold button 1 (10 rps), release, then button 2
+  (30 rps); release and disable. Expected: VELOCITY/TELEOP while held, neutral
+  on release. Button 1 wins if both are held; buttons override axis mode.
+  Record requested/measured speed, voltage, current and overshoot. A 4 V ceiling
+  may prevent reaching 30 rps under load; do not raise limits automatically.
+
+`/motor/state` exposes position, velocity, applied voltage, stator current,
+connected status, gateway motor fault with validity, active mode/source and
+hardware/acquisition ages. Supply voltage/current and temperature are not
+exposed by the public Motor handle and are not invented here; capture them
+separately in Phoenix Tuner X. Unknown/stale ages are UINT64_MAX;
+`acquisition_valid` requires connected feedback and a converged clock mapping.
+Fault validity is separate from a false fault value. Sample time in this state
+is the node observation time; acquisition ages use the mapped hardware clock.
+
+## Fault injection and timing
+
+Use the launcher's recorded PIDs (or Studio's system view); never signal an
+unidentified process. Measure actual pause durations rather than trusting shell
+sleep precision. Releasing a lane is not a mechanical brake.
+
+- [ ] While applying a small voltage, disable at DS, then repeat in velocity
+  mode. Expected: drive always neutralizes; remaining motion is coast-down,
+  not renewed demand. Record disable-to-neutral time and motor observations.
+- [ ] `kill -STOP <teleop-pid>`, then `kill -CONT <teleop-pid>` after measured
+  50 ms and 200 ms pauses, separately. Expected: an expired target neutralizes
+  within `command_timeout_us` (100 ms) plus one motor tick (5 ms); the 50 ms
+  pause is below timeout, so record whether it continues without assigning an
+  invented pass threshold. The 200 ms recovery must require neutral inputs
+  before teleop resumes. Record target publication/tick ages and drive timing.
+- [ ] Pause the motor node with SIGSTOP for 200 ms, then SIGCONT. Expected:
+  gateway per-owner request watchdog neutralizes within command timeout plus
+  its tick even though the node cannot execute; record actual delay and timeout
+  mask. Disable/release before resuming and verify no unintended motion.
+- [ ] While spinning slowly, unplug RIO Ethernet. Expected: gateway watchdog
+  neutralizes, Mini feedback becomes stale/disconnected and state age rises.
+  Disable and release before reconnecting. Expected after recovery: no
+  unintended motion. Record disconnect/neutral/recovery timestamps and counters.
+- [ ] Reboot the RIO while the Mini stays running. Expected: neutral during
+  outage; DS packets carry gateway `boot_id`, and consumers follow the new boot
+  despite restarted low timestamps. Old targets cannot revive motion. Disable
+  and release before any re-enable. Record old/new boot ids, clock reset count,
+  config acknowledgment and fresh DS/target acceptance after safe recovery.
+- [ ] Kill `hardware_node` while spinning slowly. Expected: RIO watchdog
+  neutralizes without the bridge; launcher restart policy is visible in the
+  manifest. Disable/release before recovery. Record neutral delay, PID attempts,
+  restart count and recovery behavior; no automatic motion is acceptable.
+- [ ] Capture representative enabled sessions; measure `/hw/state`
+  inter-arrival. Expected: median about 5 ms, p99 <10 ms, no 100 ms gap while
+  enabled. Record sample count, median/p99/max and every enabled gap; correlate
+  publications, motor drains and ticks, never treating drain time as publish
+  time. Target ages must stay below command timeout.
+- [ ] Inspect `/hw/status` clock fields: `clock_offset_valid`, `clock_offset_us`,
+  `clock_offset_spread_us`, `clock_window_count`, `clock_boot_id`,
+  `clock_resets_count`, `clock_ignored_count`, plus state age, timed_out_mask,
+  configured and rejection counters. Expected: mapping converges for the new
+  boot, rejection counters remain flat in healthy operation; offset is a
+  bounded transport-latency estimate, not proof of absolute synchronization.
+  Record mapping/acquisition uncertainty separately. Record per-node loop
+  lateness and scheduling acceptance on macOS; no node should report
+  `realtime scheduling incomplete`. Do not use `TALOS_REALTIME=0` for acceptance.
+- [ ] In a disposable session lower `[robot] log_max_bytes` and exceed each
+  writer's share. Expected: control continues, logs stop at whole records,
+  completed manifest reports `log_capped: true`. Record cap/file sizes and
+  manifest, restore normal limits and reserve disk for session metadata.
+- [ ] Stop the stack and fetch into a fresh destination with
+  `./tools/deploy.sh fetch <archive-directory>`. Expected: complete session
+  directories including restarted-node log attempts. Record config hash and
+  archive path; retain raw `.tlog` and RIO console logs.
+  `bazel run //talOS/launcher:log_dump -- <session-dir>` is the session decoder
+  and prints timestamped records with named payload fields.
+
+## Boot handoff
+
+- [ ] Disable/release, stop manual execution, and run
+  `./tools/deploy.sh enable-boot --user <service-account>`. Inspect
+  `sudo launchctl print system/org.talos.robot`, then reboot the Mini with
+  nobody logged in. Expected: one installed stack starts using the bench
+  address, logs are writable without repair, config hash matches, and the motor
+  remains neutral while disabled. Record launchd status, boot session and
+  disabled observations. For regression use `./tools/deploy.sh rollback`,
+  stop/restart, and recheck the selected whole-bundle hash before use.

@@ -1,5 +1,7 @@
 # Robot bring-up
 
+For the one-Kraken RoboRIO/Mini test bench, use [BENCH.md](BENCH.md).
+
 ## Network and Mini build
 
 - [ ] Restrain the robot, clear mechanisms, keep Driver Station disabled, and have an operator at the disable control. Expected: no actuator motion throughout the disabled checks.
