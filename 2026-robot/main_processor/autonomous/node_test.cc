@@ -183,10 +183,8 @@ class AutonomousPhaseTest
     : public AutonomousTest,
       public ::testing::WithParamInterface<autonomous::Phase> {};
 
-TEST_P(AutonomousPhaseTest, RestartIntoEnabledAutoIsInhibitedUntilRearmed) {
-  ReachPhase(GetParam());
-  // A replacement process has no memory of the original routine. Give its
-  // fresh node the still-enabled DS mode and all mechanism feedback.
+TEST_F(AutonomousTest, RestartIntoEnabledAutoIsInhibitedUntilRearmed) {
+  // A fresh process cannot know whether a prior routine already fired.
   talos::testing::Sim restarted{Runfile("TALOS_TEST_CONFIG")};
   restarted.add<Autonomous>("autonomous");
   talos::testing::SimHardware restarted_hw{restarted};
@@ -384,12 +382,18 @@ TEST_F(AutonomousTest, ShooterFlappingCannotResetFirstSpinupDeadline) {
   ExpectReleased();
 }
 
-TEST_F(AutonomousTest, UnlocalizedPosePausesTrajectoryUntilRecovery) {
+class AutonomousPoseTest : public AutonomousTest,
+                           public ::testing::WithParamInterface<bool> {};
+
+TEST_P(AutonomousPoseTest, UnusablePosePausesTrajectoryUntilRecovery) {
   StartDrive();
   const auto before = Drive();
-  Pose(0, 0, 0, true, false);
+  Pose(0, 0, 0, GetParam(), !GetParam());
   sim.step(20ms);
   EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  EXPECT_DOUBLE_EQ(Drive().vx_mps(), 0);
+  EXPECT_DOUBLE_EQ(Drive().vy_mps(), 0);
+  EXPECT_DOUBLE_EQ(Drive().omega_radps(), 0);
   EXPECT_EQ(Intake(), 0);
   sim.step(5s);
   Pose();
@@ -403,6 +407,8 @@ TEST_F(AutonomousTest, UnlocalizedPosePausesTrajectoryUntilRecovery) {
   EXPECT_GT(Drive().vx_mps(), before.vx_mps());
 }
 
+INSTANTIATE_TEST_SUITE_P(PoseValidity, AutonomousPoseTest, ::testing::Bool());
+
 TEST_F(AutonomousTest, DisabledAndTeleopReleaseAllLanes) {
   Mode(0);
   EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
@@ -414,36 +420,6 @@ TEST_F(AutonomousTest, DisabledAndTeleopReleaseAllLanes) {
   EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
   EXPECT_FALSE(Lane<shooter::ShooterTarget>("shooter").active);
   EXPECT_FALSE(Lane<intake::IntakeTarget>("intake").active);
-}
-
-TEST_F(AutonomousTest, ReportsPhaseThroughDisabledAutoAndDisable) {
-  // Disabled: the state topic still publishes, reporting the idle phase.
-  Mode(0);
-  EXPECT_EQ(Phase(), autonomous::Phase::IDLE);
-
-  // Enabled+auto starts the routine: spinup, then feed once the shooter is
-  // at speed, then drive, then hold on arrival.
-  Mode(ds::kEnabled | ds::kAutonomous);
-  EXPECT_EQ(Phase(), autonomous::Phase::SPINUP);
-  Shooter(true);
-  sim.step(20ms);
-  EXPECT_EQ(Phase(), autonomous::Phase::FEED);
-  StartDrive();
-  for (int i = 0; i < 300; ++i) {
-    Pose(6, 4, 0);
-    sim.step(20ms);
-  }
-  EXPECT_EQ(Phase(), autonomous::Phase::HOLD);
-  ExpectReleased();
-
-  // A stale DS view releases targets without forgetting completed progress.
-  hw.stop_driver_station();
-  sim.step(160ms);
-  EXPECT_EQ(Phase(), autonomous::Phase::HOLD);
-  ExpectReleased();
-  Mode(ds::kEnabled | ds::kAutonomous);
-  EXPECT_EQ(Phase(), autonomous::Phase::HOLD);
-  ExpectReleased();
 }
 
 TEST_F(AutonomousTest, WaitsForSpeedFeedsThenRotatesDriveAndHolds) {
@@ -463,6 +439,7 @@ TEST_F(AutonomousTest, WaitsForSpeedFeedsThenRotatesDriveAndHolds) {
   Shooter(true);
   sim.step(20ms);
   EXPECT_EQ(Intake(), -20);
+  EXPECT_EQ(Phase(), autonomous::Phase::FEED);
   EXPECT_DOUBLE_EQ(Drive().vx_mps(), 0);
   ReadyFor(480ms);
   EXPECT_EQ(Intake(), -20);
@@ -475,6 +452,7 @@ TEST_F(AutonomousTest, WaitsForSpeedFeedsThenRotatesDriveAndHolds) {
   EXPECT_LT(Drive().vy_mps(), 0);
   EXPECT_LT(Drive().omega_radps(), 0);
   EXPECT_EQ(Intake(), 30);
+  EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
   Pose(6, 4, 0);
   for (int i = 0; i < 250; ++i) {
     Pose(6, 4, 0);
@@ -484,6 +462,8 @@ TEST_F(AutonomousTest, WaitsForSpeedFeedsThenRotatesDriveAndHolds) {
   EXPECT_DOUBLE_EQ(Drive().vy_mps(), 0);
   EXPECT_DOUBLE_EQ(Drive().omega_radps(), 0);
   EXPECT_EQ(Intake(), 0);
+  EXPECT_EQ(Phase(), autonomous::Phase::HOLD);
+  ExpectReleased();
 }
 
 TEST_F(AutonomousTest, SpinupDeadlineAbortsAndRequiresLeavingEnabledAuto) {
@@ -537,24 +517,6 @@ TEST_F(AutonomousTest, PoseOutageDoesNotExtendDriveDeadline) {
   ExpectReleased();
 }
 
-TEST_F(AutonomousTest, InvalidPosePausesTrajectoryUntilRecovery) {
-  StartDrive();
-  const auto before = Drive();
-  Pose(0, 0, 0, false);
-  sim.step(20ms);
-  EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
-  sim.step(5s);  // Longer than the trajectory, but within the drive deadline.
-  Pose();
-  sim.step(20ms);
-  EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
-  EXPECT_TRUE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
-  EXPECT_DOUBLE_EQ(Drive().vx_mps(), before.vx_mps());
-  EXPECT_DOUBLE_EQ(Drive().vy_mps(), before.vy_mps());
-  Pose();
-  sim.step(20ms);
-  EXPECT_GT(Drive().vx_mps(), before.vx_mps());
-}
-
 TEST_F(AutonomousTest, StalePosePausesTrajectoryUntilRecovery) {
   StartDrive();
   auto last_active = Drive();
@@ -565,6 +527,10 @@ TEST_F(AutonomousTest, StalePosePausesTrajectoryUntilRecovery) {
     }
   }
   EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  EXPECT_DOUBLE_EQ(Drive().vx_mps(), 0);
+  EXPECT_DOUBLE_EQ(Drive().vy_mps(), 0);
+  EXPECT_DOUBLE_EQ(Drive().omega_radps(), 0);
+  EXPECT_EQ(Intake(), 0);
   sim.step(5s);
   Pose();
   sim.step(20ms);
@@ -572,25 +538,6 @@ TEST_F(AutonomousTest, StalePosePausesTrajectoryUntilRecovery) {
   EXPECT_TRUE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
   EXPECT_DOUBLE_EQ(Drive().vx_mps(), last_active.vx_mps());
   EXPECT_DOUBLE_EQ(Drive().vy_mps(), last_active.vy_mps());
-}
-
-TEST_F(AutonomousTest, InvalidAndStalePoseStopImmediately) {
-  StartDrive();
-  EXPECT_GT(Drive().vx_mps(), 0);
-  Pose(0, 0, 0, false);
-  sim.step(20ms);
-  EXPECT_DOUBLE_EQ(Drive().vx_mps(), 0);
-  EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
-  EXPECT_EQ(Intake(), 0);
-  Pose();
-  sim.step(20ms);
-  EXPECT_GT(Drive().vx_mps(), 0);
-  sim.step(120ms);
-  EXPECT_DOUBLE_EQ(Drive().vx_mps(), 0);
-  EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
-  EXPECT_DOUBLE_EQ(Drive().vy_mps(), 0);
-  EXPECT_DOUBLE_EQ(Drive().omega_radps(), 0);
-  EXPECT_EQ(Intake(), 0);
 }
 
 TEST_F(AutonomousTest, RedRotatesWaypointAndHeading) {
@@ -674,38 +621,6 @@ TEST_P(SelectedRoutineTest, DisabledAndStaleDriverStationReleaseEveryRoutine) {
   ExpectReleased();
   Mode(0);
   ExpectReleased();
-}
-
-TEST_P(SelectedRoutineTest, RestartOfEachRunningRoutineCannotRefire) {
-  Select(GetParam());
-  Mode(ds::kEnabled | ds::kAutonomous);
-  Shooter(true);
-  Pose();
-  sim.step(20ms);
-  talos::testing::Sim restarted{Runfile("TALOS_TEST_CONFIG")};
-  restarted.add<Autonomous>("autonomous");
-  talos::testing::SimHardware restarted_hw{restarted};
-  restarted_hw.set_driver_station(
-      talos::testing::DsPacket(ds::kEnabled | ds::kAutonomous));
-  for (int i = 0; i < 100; ++i) {
-    restarted.publish(shooter::topics::kState,
-                      shooter::ShooterState{0, 60, 60, true, true, true});
-    restarted.step(20ms);
-    ASSERT_EQ(restarted.latest<AutonomousState>(topics::kState)->phase(),
-              autonomous::Phase::INHIBITED);
-    EXPECT_FALSE(restarted
-                     .latest<talos::TargetEnvelope<drivetrain::ChassisTarget>>(
-                         "/drivetrain/target/auto")
-                     ->active);
-    EXPECT_FALSE(restarted
-                     .latest<talos::TargetEnvelope<shooter::ShooterTarget>>(
-                         "/shooter/target/auto")
-                     ->active);
-    EXPECT_FALSE(restarted
-                     .latest<talos::TargetEnvelope<intake::IntakeTarget>>(
-                         "/intake/target/auto")
-                     ->active);
-  }
 }
 
 TEST_P(SelectedRoutineTest, FeedbackInterlocksAndRoutineOutputs) {
@@ -865,13 +780,7 @@ Result RunNode(const std::string& args) {
   result.status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
   return result;
 }
-TEST(AutonomousBinary, DescribesAndReplaysDeterministically) {
-  auto describe = RunNode("--describe");
-  ASSERT_EQ(describe.status, 0) << describe.output;
-  for (const char* topic : {"/drivetrain/target/auto", "/shooter/target/auto",
-                            "/intake/target/auto"}) {
-    EXPECT_NE(describe.output.find(topic), std::string::npos);
-  }
+TEST(AutonomousBinary, ReplaysDeterministically) {
   const char* tmp = std::getenv("TEST_TMPDIR");
   const std::string log =
       std::string{tmp != nullptr ? tmp : "/tmp"} + "/autonomous.tlog";

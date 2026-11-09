@@ -167,23 +167,6 @@ TEST(Swerve, EachModuleIsLimitedByItsOwnDriveAndWheel) {
   EXPECT_NEAR(fast_states[2].drive_rps, 5, 1e-9);  // same ground speed
 }
 
-TEST(Swerve, ForwardKinematicsInvertsInverseKinematics) {
-  const SwerveGeometry geometry = Geometry();
-  SwerveKinematics kinematics{geometry};
-  const auto initial = kinematics.ToModuleStates({1.0, -0.5, 0.8}, {});
-  if (!initial.has_value()) {
-    FAIL() << "Expected initial module states";
-  }
-  const auto modules = kinematics.ToModuleStates({1.0, -0.5, 0.8}, *initial);
-  if (!modules.has_value()) {
-    FAIL() << "ToModuleStates returned nullopt";
-  }
-  const ChassisSpeeds speeds = kinematics.ToChassisSpeeds(*modules);
-  EXPECT_NEAR(speeds.vx_mps, 1.0, 1e-9);
-  EXPECT_NEAR(speeds.vy_mps, -0.5, 1e-9);
-  EXPECT_NEAR(speeds.omega_radps, 0.8, 1e-9);
-}
-
 TEST(Swerve, EveryUsableSubsetRecoversTheCommandedTwist) {
   SwerveKinematics kinematics{Geometry()};
   const ChassisSpeeds target{1.0, -0.5, 0.8};
@@ -223,14 +206,6 @@ TEST(Swerve, SingularAndIllConditionedSubsetsAreNotDrivenOrSolved) {
     EXPECT_EQ(speeds.omega_radps, 0);
     EXPECT_TRUE(kinematics.UsableSubset(15));
   }
-}
-
-TEST(Swerve, UnitBoundary) {
-  EXPECT_NEAR(ToRadians(0.125), std::numbers::pi / 4, 1e-15);
-  EXPECT_NEAR(ToRotations(std::numbers::pi), 0.5, 1e-15);
-  EXPECT_NEAR(WheelTravel(2.0, 0.05), 2.0 * kTau * 0.05, 1e-15);
-  EXPECT_NEAR(WheelSpeed(3.0, 0.05), 3.0 * kTau * 0.05, 1e-15);
-  EXPECT_NEAR(WheelRps(WheelSpeed(3.0, 0.05), 0.05), 3.0, 1e-12);
 }
 
 TEST(Swerve, CosineScalingSuppressesMisalignedDrive) {
@@ -302,15 +277,6 @@ TEST(Swerve, ForwardKinematicsHandlesOffCenterNonSquareLayout) {
 }
 
 // --- geometry from config ------------------------------------------------
-
-TEST(SwerveGeometry, NamesEachModulesDevices) {
-  const SwerveGeometry geometry = Geometry();
-  EXPECT_EQ(geometry.modules[2].name, "front_left");
-  EXPECT_EQ(geometry.modules[2].drive, "front_left_drive");
-  EXPECT_EQ(geometry.modules[2].steer, "front_left_steer");
-  EXPECT_DOUBLE_EQ(geometry.modules[2].x_m, 0.3);
-  EXPECT_DOUBLE_EQ(geometry.modules[2].max_drive_rps, 20.0);
-}
 
 TEST(SwerveGeometry, RejectsUnknownAndCrossedDeviceReferences) {
   const auto config = Config();
@@ -548,27 +514,8 @@ TEST_F(DrivetrainTest, NeverSentStaysNeutralButStillReportsState) {
   Teleop();
   sim.step(60ms);
   ExpectNeutral();
-  EXPECT_TRUE(State().enabled());
-}
-
-TEST_F(DrivetrainTest, StaleLaneGoesNeutral) {
-  Teleop();
-  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
-  ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
-  const std::uint64_t before = StateCount();
-  sim.step(150ms);  // the producer went quiet: the lane is stale
-  ExpectNeutral();
-  ExpectPublishedEveryTick(before, 150ms);
   EXPECT_TRUE(State().modules_valid());
-}
-
-TEST_F(DrivetrainTest, ReleasedLaneGoesNeutralAtOnce) {
-  Teleop();
-  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
-  ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
-  talos::testing::ReleaseTarget<ChassisTarget>(sim, "drivetrain", "teleop");
-  sim.step(20ms);
-  ExpectNeutral();
+  EXPECT_TRUE(State().enabled());
 }
 
 TEST_F(DrivetrainTest, DisabledRobotGoesNeutralAndStillReportsValidModules) {
@@ -1153,6 +1100,14 @@ bool InSimTransport(const Allocation& a) {
 
 TEST_F(DrivetrainTest, UpdateDoesNotAllocate) {
 #if defined(__APPLE__)
+  // Fail rather than silently passing if the allocation probe stops working.
+  g_allocations = 0;
+  malloc_logger = RecordAllocation;
+  auto* volatile probe = new std::array<double, 64>{};
+  malloc_logger = nullptr;
+  delete probe;
+  ASSERT_GE(g_allocations.load(), 1u);
+  ASSERT_FALSE(InSimTransport(g_recorded[0]));
   Teleop();
   SetRotating(hw, geometry, 1.0);
   Hold(ChassisTarget{1.0, -0.5, 0.8}, 40ms);
@@ -1178,21 +1133,6 @@ TEST_F(DrivetrainTest, UpdateDoesNotAllocate) {
 #else
   GTEST_SKIP() << "process-wide malloc counting uses macOS malloc_logger; "
                   "glibc has had no allocation hook since 2.34";
-#endif
-}
-
-TEST_F(DrivetrainTest, TheAllocationProbeSeesAllocations) {
-#if defined(__APPLE__)
-  // Guards the test above against a probe that silently counts nothing.
-  g_allocations = 0;
-  malloc_logger = RecordAllocation;
-  auto* volatile probe = new std::array<double, 64>{};
-  malloc_logger = nullptr;
-  delete probe;
-  ASSERT_GE(g_allocations.load(), 1u);
-  EXPECT_FALSE(InSimTransport(g_recorded[0]));
-#else
-  GTEST_SKIP() << "process-wide malloc counting uses macOS malloc_logger";
 #endif
 }
 

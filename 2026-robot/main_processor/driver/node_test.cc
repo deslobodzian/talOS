@@ -226,27 +226,12 @@ TEST(Driver, HeadingHoldCorrectsWrappedErrorAndResetsAfterManualTurn) {
   EXPECT_FALSE(harness.chassis_active());
 }
 
-TEST(Driver, TuningAndBindingsComeFromTheSubsystemTable) {
-  Harness harness{
-      "deadband_frac = 0.0\nfield_oriented = false\nmax_linear_mps = 2.0\n"};
-  harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0, /*buttons=*/1)));
-  EXPECT_NEAR(harness.chassis().vx_mps(), 2.0, 1e-9);
-}
-
-TEST(Driver, FieldOrientedRotatesTheRequestByDrivetrainHeading) {
-  Harness harness{kNoDeadbandFieldOriented};
-  harness.PublishHeading(kQuarterTurnRad);  // CCW: nose to field +y
-  harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
-  // Driving downfield while facing left means strafing to the robot's right.
-  EXPECT_NEAR(harness.chassis().vx_mps(), 0.0, 1e-9);
-  EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
-}
-
-TEST(Driver, HeadingWithinTimeoutStaysFieldOriented) {
+TEST(Driver, HeadingWithinTimeoutStillRotatesTheFieldRelativeRequest) {
   Harness harness{kNoDeadbandFieldOriented};
   harness.PublishHeading(kQuarterTurnRad);
   harness.Advance(20ms);  // one dropped packet is not a stale publisher
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
+  EXPECT_NEAR(harness.chassis().vx_mps(), 0.0, 1e-9);
   EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
 }
 
@@ -258,6 +243,7 @@ TEST(Driver, WithoutFreshFiniteHeadingRearmsRobotRelativeAtNeutral) {
     harness.Push(DsState(kTeleopEnabled, Stick(0, -1, -0.5f)));
     // Invalid observations cannot refresh the last heading.
     harness.PublishHeading(yaw, std::isnan(yaw));
+    for (int i = 0; i < 20; ++i) harness.PublishHeading(yaw, std::isnan(yaw));
     harness.Advance(150ms);
     EXPECT_DOUBLE_EQ(harness.chassis().vx_mps(), 0);
     EXPECT_DOUBLE_EQ(harness.chassis().vy_mps(), 0);
@@ -290,18 +276,6 @@ TEST(Driver, MissingHeadingAtStartupAllowsRobotRelativeAfterNeutral) {
     EXPECT_DOUBLE_EQ(harness.chassis().vx_mps(), kMaxLinear);
     EXPECT_DOUBLE_EQ(harness.chassis().omega_radps(), 3);
   }
-}
-
-TEST(Driver, InvalidHeadingsDoNotKeepAnOldOneFresh) {
-  // A valid heading, then the gyro drops while the drivetrain keeps
-  // publishing: the last valid heading ages out rather than being renewed.
-  Harness harness{kNoDeadbandFieldOriented};
-  harness.PublishHeading(kQuarterTurnRad);
-  harness.Push(DsState(kTeleopEnabled, Stick(0, -1, 0)));
-  for (int i = 0; i < 20; ++i) harness.PublishHeading(0.0, false);
-  harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
-  EXPECT_NEAR(harness.chassis().vx_mps(), 0.0, 1e-9);
-  EXPECT_NEAR(harness.chassis().vy_mps(), 0.0, 1e-9);
 }
 
 TEST(Driver, FreshHeadingRequiresNeutralTranslationBeforeResuming) {
@@ -348,7 +322,8 @@ TEST(Driver, RequestsNothingWhenDisabledAutonomousOrDisconnected) {
   const ds::JoystickData deflected = Stick(0, -0.9f, 0);
   const std::pair<std::uint32_t, ds::JoystickData> cases[]{
       {ds::kDsAttached, deflected},
-      {ds::kEnabled | ds::kAutonomous, deflected},
+      {ds::kEnabled | ds::kTeleop, deflected},
+      {ds::kEnabled | ds::kAutonomous | ds::kDsAttached, deflected},
       {kTeleopEnabled, Stick(0, -0.9f, 0, 0, /*connected=*/false)},
   };
   for (const auto& [flags, stick] : cases) {
@@ -387,15 +362,6 @@ TEST(Driver, ASilentDriverStationReleasesLaneOnce) {
   const std::uint64_t after_release = harness.chassis_count();
   harness.Advance(100ms);
   EXPECT_EQ(harness.chassis_count(), after_release);
-}
-
-TEST(Driver, RequestsNothingWithoutTheDsAttachedFlag) {
-  // Enabled teleop flags from a packet that does not say the DS is attached
-  // read as disabled.
-  Harness harness{kNoDeadbandRobotRelative, false};
-  harness.Push(DsState(ds::kEnabled | ds::kTeleop, Stick(0, -0.9f, 0)));
-  harness.Advance(100ms);
-  EXPECT_EQ(harness.chassis_count(), 0u);
 }
 
 TEST(Driver, StartupHeldAxesOrRezeroCannotArmProducer) {

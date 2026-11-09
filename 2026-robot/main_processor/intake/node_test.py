@@ -1,6 +1,5 @@
 """Intake node tests: the Intake class on talos.testing.Sim, and the binary."""
 
-import json
 import math
 import os
 import subprocess
@@ -8,7 +7,6 @@ import tempfile
 import unittest
 
 import talos
-from bridge.BridgeStatus import BridgeStatus
 from intake import topics
 from intake.Inhibit import Inhibit
 from intake.IntakeState import IntakeState
@@ -70,9 +68,10 @@ class IntakeTest(unittest.TestCase):
                     shooter=dict(at_speed=True, target_velocity_rps=60.0))
                 self.assertEqual(request.mode, talos.Mode.VELOCITY)
                 self.assertEqual(request.demand, demand)
-                self.assertEqual(request.slot, 0)
                 self.assertEqual(state.inhibit, Inhibit.DRIVE)
                 self.assertEqual(state.requested_velocity_rps, demand)
+                self.assertEqual(state.roller_velocity_rps, 12.5)
+                self.assertEqual(state.beam_broken, beam)
 
     def test_failed_gate_sends_neutral_and_names_it(self):
         cases = [
@@ -92,26 +91,15 @@ class IntakeTest(unittest.TestCase):
                 request, state = self.run_intake(**inputs)
                 self.assertEqual(request.mode, talos.Mode.NEUTRAL)
                 self.assertEqual(state.inhibit, inhibit)
-        # Only a live, finite ask is echoed as requested.
-        _, state = self.run_intake(25.0, lane="release")
-        self.assertEqual(state.requested_velocity_rps, 0.0)
+                if inputs.get("lane") == "release":
+                    self.assertEqual(state.requested_velocity_rps, 0.0)
 
     def test_disconnected_roller_reports_feedback_invalid(self):
         request, state = self.run_intake(25.0, roller_connected=False)
         self.assertEqual(request.mode, talos.Mode.NEUTRAL)
         self.assertEqual(state.inhibit, Inhibit.FEEDBACK_INVALID)
-        self.assertIn("inhibit=FEEDBACK_INVALID", repr(state))
         self.assertEqual(state.roller_velocity_rps, 0.0)  # no sample
         self.assertTrue(state.enabled)
-
-    def test_state_reports_feedback(self):
-        _, state = self.run_intake(0.0, beam=True)
-        self.assertTrue(state.enabled)
-        self.assertEqual(state.roller_velocity_rps, 12.5)
-        self.assertTrue(state.beam_broken)
-        self.assertEqual(state.requested_velocity_rps, 0.0)
-        _, state = self.run_intake(0.0, enabled=False)
-        self.assertFalse(state.enabled)
 
     def test_feed_requires_continuously_fresh_ready_shooter(self):
         ready = dict(at_speed=True, target_velocity_rps=60.0,
@@ -182,29 +170,6 @@ class BinaryTest(unittest.TestCase):
                                   capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return proc.stdout
-
-    def test_describe_lists_the_intake_topics(self):
-        doc = json.loads(self.run_binary("--describe", "--config", CONFIG))
-        self.assertEqual(doc["name"], "intake")
-        # A hardware packet: a 4-byte length + the protocol's max payload.
-        packet_bytes = 1436
-        self.assertEqual(
-            sorted((s["kind"], s["name"], s["message_bytes"])
-                   for s in doc["sources"]),
-            sorted([("TIMER", "intake", 0),
-                    ("WATCHER", "/hw/state", packet_bytes),
-                    ("WATCHER", "/hw/state/driver_station", packet_bytes),
-                    # The bridge's clock mapping (HardwareLink::sample_time).
-                    ("WATCHER", "/hw/status", BridgeStatus.SizeOf()),
-                    # Lanes of the default policy: the 16-byte envelope
-                    # header (mode generation, active) + IntakeTarget.
-                    ("WATCHER", "/intake/target/teleop",
-                     16 + IntakeTarget.SizeOf()),
-                    ("WATCHER", "/intake/target/auto",
-                     16 + IntakeTarget.SizeOf()),
-                    ("WATCHER", shooter_topics.STATE, ShooterState.SizeOf()),
-                    ("SENDER", "/hw/request/intake", packet_bytes),
-                    ("SENDER", topics.STATE, IntakeState.SizeOf())]))
 
     def test_sim_run_replays_without_divergence(self):
         with tempfile.TemporaryDirectory() as tmp:

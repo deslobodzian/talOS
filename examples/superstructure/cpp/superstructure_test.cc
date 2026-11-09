@@ -498,17 +498,12 @@ class ElevatorAlone : public ::testing::Test {
   SimHardware hw{sim};
 };
 
-TEST_F(ElevatorAlone, DrivesToTheLaneGoal) {
+TEST_F(ElevatorAlone, NeutralWhenTheLaneGoesStale) {
   Drive(kHighRot, 50ms);
-  EXPECT_EQ(Lift().mode, Mode::kMotionMagic);
   EXPECT_DOUBLE_EQ(Lift().demand, kHighRot);
   EXPECT_EQ(Status().state(), ElevatorState::AT_GOAL);
   EXPECT_TRUE(Status().at_goal());
   EXPECT_DOUBLE_EQ(Status().goal_rot(), kHighRot);
-}
-
-TEST_F(ElevatorAlone, NeutralWhenTheLaneGoesStale) {
-  Drive(kHighRot, 50ms);
   ASSERT_EQ(Lift().mode, Mode::kMotionMagic);
   // Nothing more: it does not hold the old goal past command_timeout_us.
   sim.step(110ms);
@@ -525,13 +520,10 @@ TEST_F(ElevatorAlone, NeutralWhenTheLaneIsReleased) {
   ExpectNeutral();
 }
 
-TEST_F(ElevatorAlone, NeutralWhenTheTargetWasNeverSent) {
+TEST_F(ElevatorAlone, NeutralBeforeAnyTargetAndWhenDisabled) {
   sim.step(100ms);
   ExpectNeutral();
-  EXPECT_EQ(Status().state(), ElevatorState::STOWED);  // at 0
-}
-
-TEST_F(ElevatorAlone, NeutralWhenDisabled) {
+  EXPECT_EQ(Status().state(), ElevatorState::STOWED);
   hw.enable(false);
   Drive(kHighRot, 100ms);
   ExpectNeutral();

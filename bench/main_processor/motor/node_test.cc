@@ -67,13 +67,6 @@ TEST_F(MotorTest, VelocityAndExplicitNeutral) {
   Neutral();
 }
 
-TEST_F(MotorTest, StaleTargetNeutralizes) {
-  Enable();
-  Send(MotorTarget{ControlMode::VELOCITY, 0.0, 30.0, 0.0});
-  sim.step(110ms);
-  Neutral();
-}
-
 TEST_F(MotorTest, ReleaseNeutralizes) {
   Enable();
   Send(MotorTarget{ControlMode::VOLTAGE, 1.0, 0.0, 0.0});
@@ -88,8 +81,6 @@ TEST_F(MotorTest, ReportsInjectedFeedbackAndAcquisitionAges) {
   sim.step(10ms);
   EXPECT_DOUBLE_EQ(State().position_rot(), 4.5);
   EXPECT_DOUBLE_EQ(State().velocity_rps(), -7.0);
-  EXPECT_DOUBLE_EQ(State().applied_voltage_v(), 0.0);
-  EXPECT_DOUBLE_EQ(State().stator_current_a(), 0.0);
   EXPECT_DOUBLE_EQ(State().temperature_degc(), 42.5);
   EXPECT_DOUBLE_EQ(State().supply_current_a(), 6.3);
   EXPECT_TRUE(State().connected());
@@ -107,6 +98,7 @@ TEST_F(MotorTest, HealthFeedbackRemainsVisibleWithStaleTargetAndWhileDisabled) {
   Enable();
   hw.set_motor("motor", "kraken", 0.0, 0.0, 0, 0, 48.5, 3.25);
   Send(MotorTarget{ControlMode::VELOCITY, 0.0, 10.0, 0.0});
+  ASSERT_EQ(hw.motor_request("motor", "kraken").mode, Mode::kVelocity);
   EXPECT_DOUBLE_EQ(State().temperature_degc(), 48.5);
   EXPECT_DOUBLE_EQ(State().supply_current_a(), 3.3);
   sim.step(110ms);

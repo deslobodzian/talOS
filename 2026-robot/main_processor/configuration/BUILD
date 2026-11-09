@@ -28,12 +28,12 @@ cc_test(
     size = "small",
     srcs = ["config_golden_test.cc"],
     data = [
+        "robot_field.toml",
         "robot_physics_sim.toml",
         ":robot_config",
     ] + PHYSICS_CONFIG_FILES,
     deps = [
         "//talOS/configuration",
-        "//talOS/hardware:config",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],

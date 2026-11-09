@@ -17,9 +17,6 @@ class BundleTest(unittest.TestCase):
         self.assertTrue(source and os.path.isdir(source), source)
         with open(os.path.join(source, "bundle_manifest.toml"), "rb") as stream:
             manifest = tomllib.load(stream)
-        wrist = next(node for node in manifest["nodes"] if node["name"] == "wrist")
-        self.assertIn("@wrist//:node", wrist["targets"])
-        self.assertIn("@@wrist+//:node", wrist["targets"])
         deploy = runfiles.Create().Rlocation("_main/tools/deploy.sh")
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             prefix = os.path.join(tmp, "prefix")

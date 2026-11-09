@@ -38,7 +38,7 @@ cc_test(
     ],
 )
 
-# Startup and a bounded scripted match with producer/link/device faults.
+# Startup and a bounded scripted match with link/device faults.
 py_test(
     name = "startup_test",
     size = "medium",

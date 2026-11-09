@@ -74,7 +74,6 @@ cc_test(
         ":vision",
         "//talOS/configuration",
         "//talOS/node:testing",
-        "//talOS/vision/recording:replay",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],

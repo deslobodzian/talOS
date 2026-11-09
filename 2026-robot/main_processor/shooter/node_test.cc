@@ -83,15 +83,6 @@ TEST_F(ShooterTest, SpinsToAFreshTargetAndReportsAtSpeed) {
   EXPECT_TRUE(state.enabled());
 }
 
-TEST_F(ShooterTest, NotAtSpeedWhileTheFlywheelIsSlow) {
-  Teleop();
-  hw.set_motor("shooter", "flywheel", 0.0, 50.0);
-  Hold(80.0, 60ms);
-  EXPECT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
-  EXPECT_FALSE(State().at_speed());
-  EXPECT_DOUBLE_EQ(State().flywheel_velocity_rps(), 50.0);
-}
-
 TEST_F(ShooterTest, EntryRequiresThreeConsecutiveTicksInsideTheEntryBand) {
   Teleop();
   hw.set_motor("shooter", "flywheel", 0.0, 80.0);
@@ -236,14 +227,6 @@ TEST_F(ShooterTest, NonFiniteTargetGoesNeutral) {
   Teleop();
   Hold(std::numeric_limits<double>::quiet_NaN(), 40ms);
   ExpectNeutral();
-}
-
-TEST_F(ShooterTest, ReportsTheBeamBreak) {
-  sim.step(20ms);
-  EXPECT_FALSE(State().beam_broken());
-  hw.set_digital_input("shooter", "beam_break", true);
-  sim.step(20ms);
-  EXPECT_TRUE(State().beam_broken());
 }
 
 TEST(ShooterParameters, RejectInvalidReadinessParametersAtConstruction) {

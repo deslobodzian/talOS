@@ -83,7 +83,11 @@ TEST_F(WristTest, DrivesTheMotorAtALiveLane) {
   EXPECT_TRUE(state.connected());
 }
 
-TEST_F(WristTest, DisabledRobotGoesNeutral) {
+TEST_F(WristTest, NeverSentAndDisabledRobotGoNeutral) {
+  Teleop();
+  sim.step(60ms);
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_FALSE(Latest().enabled());
   hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
   hw.enable(false);
   sim.step(10ms);
@@ -110,13 +114,6 @@ TEST_F(WristTest, ReleasedLaneGoesNeutral) {
   ReleaseTarget<Target>(sim, "wrist", "teleop");
   sim.step(40ms);
   EXPECT_EQ(Request(), Mode::kNeutral);
-}
-
-TEST_F(WristTest, NeverSentGoesNeutral) {
-  Teleop();
-  sim.step(60ms);
-  EXPECT_EQ(Request(), Mode::kNeutral);
-  EXPECT_FALSE(Latest().enabled());
 }
 
 TEST_F(WristTest, DriverStationLossGoesNeutral) {

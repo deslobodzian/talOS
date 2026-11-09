@@ -43,7 +43,6 @@ py_test(
     deps = [
         ":messages_py",
         "//2026-robot/main_processor/shooter:messages_py",
-        "//talOS/bridge:messages_py",
         "//talOS/python:testing",
         "@rules_python//python/runfiles",
     ],
