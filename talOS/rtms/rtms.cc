@@ -176,17 +176,20 @@ RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
       message_alignment_{message_alignment},
       data_offset_{is_pow_2(message_alignment)
                        ? align_up(sizeof(RTMSHeader),
-                                   rtms_slot_alignment(message_alignment)) : 0},
+                                  rtms_slot_alignment(message_alignment))
+                       : 0},
       publish_time_offset_{rtms_publish_time_offset(message_size)},
       stride_{is_pow_2(message_alignment)
-                  ? rtms_slot_stride(message_size, message_alignment) : 0},
+                  ? rtms_slot_stride(message_size, message_alignment)
+                  : 0},
       total_bytes_{data_offset_ + stride_ * slots_},
       options_{options} {
   if (message_size == 0 || !is_pow_2(message_alignment)) {
     throw std::invalid_argument("message size and alignment must be valid");
   }
   if (slots < 2 || slots > MAX_SLOTS || !is_pow_2(slots)) {
-    throw std::invalid_argument("slots must be a power of two in [2, MAX_SLOTS]");
+    throw std::invalid_argument(
+        "slots must be a power of two in [2, MAX_SLOTS]");
   }
 
   if (schema.name.empty() ||
@@ -204,8 +207,8 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
     return header.version == kRtmsVersion && header.slots == slots_ &&
            header.message_bytes == message_size_ &&
            header.message_alignment == message_alignment_ &&
-           header.data_offset == data_offset_ && header.slot_stride == stride_ &&
-           header.total_bytes == total_bytes_;
+           header.data_offset == data_offset_ &&
+           header.slot_stride == stride_ && header.total_bytes == total_bytes_;
   };
   const auto schema_matches = [&schema](const RTMSHeader& header) {
     return header.schema_hash == schema.hash &&
@@ -298,10 +301,10 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
           "with shm_unlink, and restart");
     }
     if (header->version != kRtmsVersion) {
-      throw std::runtime_error(
-          "RTMS shared-memory version mismatch on " + path_ +
-          ": segment version " + std::to_string(header->version) +
-          ", expected " + std::to_string(kRtmsVersion));
+      throw std::runtime_error("RTMS shared-memory version mismatch on " +
+                               path_ + ": segment version " +
+                               std::to_string(header->version) + ", expected " +
+                               std::to_string(kRtmsVersion));
     }
     if (!layout_matches(*header)) {
       throw std::runtime_error(
@@ -471,8 +474,9 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message) {
 #else
   ::clock_gettime(CLOCK_MONOTONIC, &now);
 #endif
-  return write(message, static_cast<std::int64_t>(now.tv_sec) * 1'000'000'000LL +
-                            now.tv_nsec);
+  return write(
+      message,
+      static_cast<std::int64_t>(now.tv_sec) * 1'000'000'000LL + now.tv_nsec);
 }
 
 WriteStatus RTMSQueue::write(std::span<const std::byte> message,

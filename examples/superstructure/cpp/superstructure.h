@@ -44,7 +44,7 @@ class Superstructure {
     // recovery must start from fresh observations, not resume an old eject.
     if (command == SuperstructureCommand::STOW || !fresh)
       sm_.go(intake_fresh && intake_->has_piece() ? State::HOLDING
-                                                 : State::STOWED);
+                                                  : State::STOWED);
     else
       advance(command);
 
@@ -84,8 +84,7 @@ class Superstructure {
           sm_.go(State::INTAKING);
         break;
       case State::INTAKING:
-        if (has_piece)
-          sm_.go(State::HOLDING);
+        if (has_piece) sm_.go(State::HOLDING);
         break;
       case State::HOLDING:
         if (!has_piece)
@@ -100,8 +99,7 @@ class Superstructure {
           sm_.go(State::SCORING);
         break;
       case State::SCORING:
-        if (!has_piece)
-          sm_.go(State::STOWED);
+        if (!has_piece) sm_.go(State::STOWED);
         break;
     }
   }

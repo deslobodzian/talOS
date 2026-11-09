@@ -241,8 +241,8 @@ TEST(InputReplay, ReaderOnlyLogFeedsAtPublicationRatherThanDelayedReceipt) {
   SimulatedEventLoop<> loop{
       environment, SimulatedEventLoop<>::Options{.start = session.start()}};
   MessageTimes replayed;
-  watch<EventsTest::SensorMessage, &MessageTimes::receive>(
-      loop, kTopics.sensor, &replayed);
+  watch<EventsTest::SensorMessage, &MessageTimes::receive>(loop, kTopics.sensor,
+                                                           &replayed);
   const auto report = ReplayInputs(loop, environment, session);
   ASSERT_EQ(report.fed.size(), 1u);
   EXPECT_EQ(report.fed[0].messages, 1u);

@@ -256,8 +256,8 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
         k != "forward_limit_rot" && k != "max_velocity_rps" &&
         k != "cruise_velocity_rps" && k != "acceleration_rps2" &&
         k != "jerk_rps3" && k != "follow" && k != "oppose_master" &&
-        k != "feedback" && k != "feedback_sensor" &&
-        k != "slot0" && k != "slot1" && k != "slot2") {
+        k != "feedback" && k != "feedback_sensor" && k != "slot0" &&
+        k != "slot1" && k != "slot2") {
       throw std::invalid_argument("unknown motor key '" + std::string(k) +
                                   "' for " + name);
     }
@@ -294,8 +294,8 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
     if (auto* slot = t["slot" + std::to_string(s)].as_table()) {
       for (auto&& [key, value] : *slot) {
         const auto k = key.str();
-        if (k != "p" && k != "i" && k != "d" && k != "s" &&
-            k != "v" && k != "a" && k != "g" && k != "gravity_type") {
+        if (k != "p" && k != "i" && k != "d" && k != "s" && k != "v" &&
+            k != "a" && k != "g" && k != "gravity_type") {
           throw std::invalid_argument("unknown motor slot key '" +
                                       std::string(k) + "' for " + name);
         }
@@ -348,9 +348,9 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   return raw;
 }
 
-inline void CheckDeviceKeys(
-    const toml::table& t, const std::string& name, std::string_view kind,
-    std::initializer_list<std::string_view> allowed) {
+inline void CheckDeviceKeys(const toml::table& t, const std::string& name,
+                            std::string_view kind,
+                            std::initializer_list<std::string_view> allowed) {
   for (auto&& [key, value] : t) {
     if (std::find(allowed.begin(), allowed.end(), key.str()) == allowed.end()) {
       std::string message = "unknown " + std::string(kind) + " key '" +
@@ -698,8 +698,8 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
         Read(*robot, "command_timeout_us", hw.command_timeout_us);
     hw.status_hz = Read(*robot, "status_hz", hw.status_hz);
     hw.commissioned = Read(*robot, "commissioned", hw.commissioned);
-    result.require_target_coverage = Read(
-        *robot, "require_target_coverage", result.require_target_coverage);
+    result.require_target_coverage =
+        Read(*robot, "require_target_coverage", result.require_target_coverage);
     result.controller_address = detail::ReadNonEmpty(
         *robot, "controller_address", result.controller_address, "[robot]");
     result.controller_port = detail::ReadPort(
@@ -757,7 +757,8 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
     const std::string sub_name(sub_key.str());
     auto* sub_tbl = sub_val.as_table();
     if (!sub_tbl) {
-      throw std::invalid_argument("[subsystems." + sub_name + "] must be a table");
+      throw std::invalid_argument("[subsystems." + sub_name +
+                                  "] must be a table");
     }
     result.subsystems[sub_name].subsystem = sub_name;
     // The launcher starts a subsystem's `node`; a malformed one must not
@@ -795,7 +796,8 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
       auto* devices = (*sub_tbl)[section].as_table();
       if (!devices) {
         if (sub_tbl->contains(section)) {
-          throw std::invalid_argument(std::string(section) + " must be a table");
+          throw std::invalid_argument(std::string(section) +
+                                      " must be a table");
         }
         return;
       }

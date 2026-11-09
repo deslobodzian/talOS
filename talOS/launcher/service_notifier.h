@@ -20,12 +20,12 @@ class ServiceNotifier {
     const char* path = std::getenv("NOTIFY_SOCKET");
     if (path == nullptr || path[0] == '\0') return;
     const std::size_t size = std::strlen(path);
-    if (size >= sizeof(address_.sun_path) ||
-        (path[0] != '/' && path[0] != '@'))
+    if (size >= sizeof(address_.sun_path) || (path[0] != '/' && path[0] != '@'))
       return;
     address_.sun_family = AF_UNIX;
     std::memcpy(address_.sun_path, path, size + 1);
-    length_ = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + size + 1);
+    length_ =
+        static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + size + 1);
     if (path[0] == '@') {
       address_.sun_path[0] = '\0';
       --length_;  // Abstract names have no terminating NUL.

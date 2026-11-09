@@ -347,7 +347,8 @@ inline bool IsTargetLane(std::string_view topic) {
 // unread topic, an owner not in this session, a policy lane nobody writes yet).
 // Required coverage additionally rejects a target-consuming subsystem with no
 // producer for a nonempty mode policy. Timers are skipped: their names are
-// labels, not topics. A subsystem absent from target_sources is not lane-checked.
+// labels, not topics. A subsystem absent from target_sources is not
+// lane-checked.
 inline std::vector<Diagnostic> LintGraph(
     const std::vector<NodeShape>& nodes,
     const TargetSources& target_sources = {},
@@ -566,12 +567,12 @@ inline std::vector<Diagnostic> LintGraph(
         std::vector<std::string> lanes;
         for (const auto& source : sources) {
           lanes.push_back("/" + node.name + "/target/" + source);
-          const auto topic = std::find_if(
-              topics.begin(), topics.end(), [&lanes](const TopicFacts& facts) {
-                return facts.name == lanes.back();
-              });
-          has_writer = has_writer ||
-                       (topic != topics.end() && !topic->writers.empty());
+          const auto topic = std::find_if(topics.begin(), topics.end(),
+                                          [&lanes](const TopicFacts& facts) {
+                                            return facts.name == lanes.back();
+                                          });
+          has_writer =
+              has_writer || (topic != topics.end() && !topic->writers.empty());
         }
         if (!has_writer) {
           add(Severity::ERROR, node.name,

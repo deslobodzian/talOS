@@ -132,15 +132,16 @@ inline void EncodeNumericBytes(std::byte* dest, reflection::BaseType type,
     std::memcpy(dest, &val, sizeof(double));
   } else {
     if (!std::isfinite(val) || std::trunc(val) != val) {
-      throw std::invalid_argument(std::string{where} +
-                                  ": non-finite or fractional value for integer field");
+      throw std::invalid_argument(
+          std::string{where} +
+          ": non-finite or fractional value for integer field");
     }
     if (type == BaseType::ULong) {
       // UINT64_MAX rounds up to 2^64 as a double, so use an exclusive
       // power-of-two upper bound before converting.
       if (val < 0.0 || val >= std::ldexp(1.0, 64)) {
-        throw std::invalid_argument(std::string{where} +
-                                    ": value does not fit unsigned integer field");
+        throw std::invalid_argument(
+            std::string{where} + ": value does not fit unsigned integer field");
       }
       const auto v = static_cast<std::uint64_t>(val);
       std::memcpy(dest, &v, sizeof(v));
@@ -256,8 +257,7 @@ struct AxisFieldAction {
   reflection::BaseType base_type{reflection::BaseType::None};
 };
 
-inline void EncodeAssignment(ButtonFieldAction& action,
-                             const ResolvedField& rf,
+inline void EncodeAssignment(ButtonFieldAction& action, const ResolvedField& rf,
                              const config::TeleopValue& fv,
                              const std::string& field_where) {
   if (rf.base_type == reflection::BaseType::Bool) {
@@ -395,10 +395,10 @@ class Teleop {
                            : stick.button(binding.button));
           binding.was_pressed = pressed;
           if (!stick.connected()) continue;
-          const bool released = binding.pov
-                                    ? stick.pov(binding.pov_index) < 0
-                                    : !pressed;
-          const double axis = binding.is_button ? 0.0 : stick.axis(binding.axis);
+          const bool released =
+              binding.pov ? stick.pov(binding.pov_index) < 0 : !pressed;
+          const double axis =
+              binding.is_button ? 0.0 : stick.axis(binding.axis);
           neutral = neutral && released && std::isfinite(axis) &&
                     std::abs(axis) <= binding.deadband_frac;
         }
@@ -631,7 +631,8 @@ class Teleop {
         if (rf.base_type != reflection::BaseType::Float &&
             rf.base_type != reflection::BaseType::Double) {
           throw std::invalid_argument(field_where + ": axis field '" +
-                                      rf.leaf_name + "' must be floating-point");
+                                      rf.leaf_name +
+                                      "' must be floating-point");
         }
 
         binding.axis_field.field_id = get_field_id(parsed_binding.field);
@@ -646,8 +647,8 @@ class Teleop {
     std::map<std::string, bool> default_fields;
     if (defaults_it != config.teleop_defaults.end()) {
       for (const auto& [path, value] : defaults_it->second) {
-        const std::string where = "[subsystems." + sub_name +
-                                  "] teleop.defaults." + path;
+        const std::string where =
+            "[subsystems." + sub_name + "] teleop.defaults." + path;
         const auto rf = detail::ResolveField(*schema, *object, path, where);
         detail::ButtonFieldAction action;
         action.offset = rf.offset;
@@ -663,16 +664,15 @@ class Teleop {
     for (const auto& path : paths) {
       // A lane publishes only while some binding is live, so a field is
       // always written when every binding writes it.
-      const bool always_assigned =
-          std::all_of(bindings.begin(), bindings.end(), [&](const auto& binding) {
+      const bool always_assigned = std::all_of(
+          bindings.begin(), bindings.end(), [&](const auto& binding) {
             if (binding.axis) return binding.field == path;
             const auto& assignments = binding.on_toggle.empty()
                                           ? binding.while_held
                                           : binding.on_toggle;
-            return std::any_of(assignments.begin(), assignments.end(),
-                               [&](const auto& entry) {
-                                 return entry.first == path;
-                               });
+            return std::any_of(
+                assignments.begin(), assignments.end(),
+                [&](const auto& entry) { return entry.first == path; });
           });
       if (!always_assigned && !default_fields.contains(path)) {
         throw std::invalid_argument(lane_topic + ": field '" + path +

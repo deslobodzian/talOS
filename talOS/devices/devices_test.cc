@@ -353,8 +353,7 @@ TEST(Devices, PwmClampsFiniteOutputsWithoutRejectingMotorCommands) {
   hw.enable();
   mech.a_velocity = 10;
   for (const auto [output, expected] :
-       {std::pair{2.0, 1.0}, std::pair{-2.0, -1.0},
-        std::pair{0.25, 0.25},
+       {std::pair{2.0, 1.0}, std::pair{-2.0, -1.0}, std::pair{0.25, 0.25},
         std::pair{std::numeric_limits<double>::infinity(), 0.0},
         std::pair{std::numeric_limits<double>::quiet_NaN(), 0.0}}) {
     SCOPED_TRACE(output);
@@ -643,8 +642,8 @@ can_id = 1
 
   sim.step(10ms);
   sim.publish(hardware::kStateTopic, StatePacket(id, 1000, true));
-  const auto ds = testing::DsPacket(driver_station::kEnabled |
-                                    driver_station::kTeleop);
+  const auto ds =
+      testing::DsPacket(driver_station::kEnabled | driver_station::kTeleop);
   Packet packet{};
   packet.size =
       static_cast<std::uint32_t>(driver_station::Encode(ds, packet.data));
@@ -729,7 +728,6 @@ TEST(Devices, SampleTimeRejectsStaleBridgeStatusWithFreshHardware) {
   ASSERT_TRUE(link.fresh());
   EXPECT_EQ(link.sample_time(), std::nullopt);
 }
-
 
 // SimHardware runs the bridge's filter: no sample time until it converges,
 // then the sim time each state was sampled at, whatever the gateway's own

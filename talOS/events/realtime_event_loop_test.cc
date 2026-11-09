@@ -104,24 +104,26 @@ TEST(RealtimeEventLoop, LatestBacklogDispatchesNewestWithPublicationAge) {
   RealtimeEventLoop<> loop;
   loop.set_delivery(Delivery::BEFORE_TIMERS);
   std::vector<Context> observed;
-  auto on_message = [&](const Context& context) { observed.push_back(context); };
-  const auto watcher = loop.register_watcher(
-      topic, sizeof(EventsTest::SensorMessage),
-      alignof(EventsTest::SensorMessage),
-      talos::schema::Of<EventsTest::SensorMessage>(), make_thunk(&on_message),
-      true);
+  auto on_message = [&](const Context& context) {
+    observed.push_back(context);
+  };
+  const auto watcher =
+      loop.register_watcher(topic, sizeof(EventsTest::SensorMessage),
+                            alignof(EventsTest::SensorMessage),
+                            talos::schema::Of<EventsTest::SensorMessage>(),
+                            make_thunk(&on_message), true);
   RTMSQueue publisher{topic, sizeof(EventsTest::SensorMessage),
                       alignof(EventsTest::SensorMessage),
                       talos::schema::Of<EventsTest::SensorMessage>()};
   const auto published = Poller::now() - 100ms;
   for (int i = 0; i < 130; ++i) {
     const EventsTest::SensorMessage message{i, 0.0F, 0.0F};
-    ASSERT_EQ(publisher.write(
-                  std::span<const std::byte>{
-                      reinterpret_cast<const std::byte*>(&message),
-                      sizeof(message)},
-                  published.nanos()),
-              WriteResult::SUCCESS);
+    ASSERT_EQ(
+        publisher.write(
+            std::span<const std::byte>{
+                reinterpret_cast<const std::byte*>(&message), sizeof(message)},
+            published.nanos()),
+        WriteResult::SUCCESS);
   }
   auto stop = [&](const Context&) { loop.exit(); };
   const auto timer = loop.register_timer("stop", make_thunk(&stop));

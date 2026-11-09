@@ -404,17 +404,17 @@ TEST(LintGraph, RequiredCoverageChecksEachModeRatherThanTheirUnion) {
        "//robot/drivetrain:node",
        {Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional),
         Watcher("/drivetrain/target/auto", 32, kSourceFlagOptional)}},
-      {"driver", "//robot/driver:node",
-       {Sender("/drivetrain/target/teleop")}},
+      {"driver", "//robot/driver:node", {Sender("/drivetrain/target/teleop")}},
   };
   const TargetSources sources{{"drivetrain", {"teleop", "auto", "align"}}};
-  const TargetModeSources modes{
-      {"drivetrain",
-       {{"teleop", {"teleop"}}, {"autonomous", {"auto", "align"}}, {"test", {}}}}};
+  const TargetModeSources modes{{"drivetrain",
+                                 {{"teleop", {"teleop"}},
+                                  {"autonomous", {"auto", "align"}},
+                                  {"test", {}}}}};
   const auto diagnostics = LintGraph(nodes, sources, modes, true);
   ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "drivetrain",
-                       "mode 'autonomous'"))
+  EXPECT_TRUE(
+      Mentions(diagnostics, Severity::ERROR, "drivetrain", "mode 'autonomous'"))
       << Describe(diagnostics);
   EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "drivetrain",
                        "/drivetrain/target/auto, /drivetrain/target/align"))
@@ -428,8 +428,8 @@ TEST(LintGraph, RequiredCoverageChecksEachModeRatherThanTheirUnion) {
   // Partial development launches retain the per-lane warning.
   const auto optional = LintGraph(nodes, sources, modes, false);
   EXPECT_FALSE(HasError(optional)) << Describe(optional);
-  EXPECT_TRUE(Mentions(optional, Severity::WARNING,
-                       "/drivetrain/target/auto", "nothing writes it yet"))
+  EXPECT_TRUE(Mentions(optional, Severity::WARNING, "/drivetrain/target/auto",
+                       "nothing writes it yet"))
       << Describe(optional);
 }
 
@@ -440,16 +440,18 @@ TEST(LintGraph, RequiredCoverageAllowsOneWriterPerModeAndOptionalLanes) {
        {Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional),
         Watcher("/drivetrain/target/auto", 32, kSourceFlagOptional),
         Watcher("/drivetrain/target/align", 32, kSourceFlagOptional)}},
-      {"driver", "//robot/driver:node",
-       {Sender("/drivetrain/target/teleop")}},
-      {"autonomous", "//robot/autonomous:node",
+      {"driver", "//robot/driver:node", {Sender("/drivetrain/target/teleop")}},
+      {"autonomous",
+       "//robot/autonomous:node",
        {Sender("/drivetrain/target/auto")}},
       {"telemetry", "//robot/telemetry:node", {}},
   };
   const auto diagnostics = LintGraph(
       nodes, {{"drivetrain", {"teleop", "auto", "align"}}},
       {{"drivetrain",
-        {{"teleop", {"teleop"}}, {"autonomous", {"align", "auto"}}, {"test", {}}}},
+        {{"teleop", {"teleop"}},
+         {"autonomous", {"align", "auto"}},
+         {"test", {}}}},
        {"telemetry", {{"teleop", {"teleop"}}, {"autonomous", {"auto"}}}}},
       true);
   EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
@@ -460,10 +462,10 @@ TEST(LintGraph, RequiredCoverageAllowsOneWriterPerModeAndOptionalLanes) {
 
 TEST(LintGraph, RequiredCoverageDetectsAnEntirelyUndeclaredModeLane) {
   const std::vector<NodeShape> nodes = {
-      {"drivetrain", "//robot/drivetrain:node",
+      {"drivetrain",
+       "//robot/drivetrain:node",
        {Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional)}},
-      {"driver", "//robot/driver:node",
-       {Sender("/drivetrain/target/teleop")}},
+      {"driver", "//robot/driver:node", {Sender("/drivetrain/target/teleop")}},
   };
   const auto diagnostics = LintGraph(
       nodes, {{"drivetrain", {"teleop", "auto"}}},
@@ -476,16 +478,16 @@ TEST(LintGraph, RequiredCoverageDetectsAnEntirelyUndeclaredModeLane) {
 
 TEST(LintGraph, RequiredCoverageChecksOptedInTestMode) {
   const std::vector<NodeShape> nodes = {
-      {"drivetrain", "//robot/drivetrain:node",
+      {"drivetrain",
+       "//robot/drivetrain:node",
        {Watcher("/drivetrain/target/pit", 32, kSourceFlagOptional)}},
   };
   const auto diagnostics = LintGraph(
       nodes, {{"drivetrain", {"pit"}}},
-      {{"drivetrain",
-        {{"teleop", {}}, {"autonomous", {}}, {"test", {"pit"}}}}},
+      {{"drivetrain", {{"teleop", {}}, {"autonomous", {}}, {"test", {"pit"}}}}},
       true);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "drivetrain",
-                       "mode 'test'"))
+  EXPECT_TRUE(
+      Mentions(diagnostics, Severity::ERROR, "drivetrain", "mode 'test'"))
       << Describe(diagnostics);
 }
 

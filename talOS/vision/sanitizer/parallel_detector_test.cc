@@ -41,7 +41,8 @@ TEST(ParallelDetector, AprilTagRowBands) {
 
 // This is the actual backend's cvtColor path, not an unrelated parallel_for_.
 // Request four workers for the patched pthread pool on Linux. Bundled OpenCV
-// selects GCD on Apple; it ignores setNumThreads and reports the CPU-count limit.
+// selects GCD on Apple; it ignores setNumThreads and reports the CPU-count
+// limit.
 TEST(ParallelDetector, OpenCvColorConversion) {
   cv::setNumThreads(4);
 #ifdef __APPLE__

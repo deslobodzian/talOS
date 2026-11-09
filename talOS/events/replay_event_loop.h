@@ -231,10 +231,9 @@ class ReplayEventLoop
     if (static_cast<EventKind>(header.kind) == EventKind::TIMER) {
       this->dispatch_timer(header.source_id, event_time, now_, header.sequence);
     } else {
-      this->dispatch_message(
-          header.source_id, event_time, now_, header.sequence, header.aux,
-          full_payload(record),
-          MonotonicTime::from_nanos(header.publish_time_ns));
+      this->dispatch_message(header.source_id, event_time, now_,
+                             header.sequence, header.aux, full_payload(record),
+                             MonotonicTime::from_nanos(header.publish_time_ns));
     }
 
     active_dispatch_ = 0;

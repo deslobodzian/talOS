@@ -99,8 +99,8 @@ class SimHardwareTest : public ::testing::Test {
   // remains alive to keep flushing neutral requests on its behalf.
   void Send(std::string_view node, const hardware::Command& command) {
     hardware::Packet packet{};
-    packet.size = static_cast<std::uint32_t>(
-        hardware::Encode(command, packet.data));
+    packet.size =
+        static_cast<std::uint32_t>(hardware::Encode(command, packet.data));
     ASSERT_GT(packet.size, 0u);
     sim.publish(hardware::RequestTopic(node), packet);
   }
@@ -126,8 +126,7 @@ TEST_F(SimHardwareTest, SilenceExpiresAllAppliedOutputsAtConfiguredDeadline) {
   EXPECT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kNeutral);
   EXPECT_FALSE(hw.applied_digital_output("mech", "led"));
   EXPECT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.0);
-  EXPECT_NEAR(Motor("braked").velocity_rps, 40.0 * (1.0 - 0.005 / 0.05),
-              1e-12);
+  EXPECT_NEAR(Motor("braked").velocity_rps, 40.0 * (1.0 - 0.005 / 0.05), 1e-12);
   EXPECT_NEAR(Motor("coasting").velocity_rps, 40.0 * (1.0 - 0.005 / 1.0),
               1e-12);
   const auto state = State();
@@ -176,8 +175,10 @@ TEST_F(SimHardwareTest, IdenticalPublicationRenewsOnlyItsOwnDeadline) {
   EXPECT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.0);
 }
 
-TEST_F(SimHardwareTest, LateCollectionAndInspectionDoNotRefreshPublicationTime) {
-  sim.step(1ms);  // Publish between hardware ticks; first collection is at 5 ms.
+TEST_F(SimHardwareTest,
+       LateCollectionAndInspectionDoNotRefreshPublicationTime) {
+  sim.step(
+      1ms);  // Publish between hardware ticks; first collection is at 5 ms.
   Send("mech", Drive());
   sim.step(28ms);
   EXPECT_EQ(hw.motor_request("mech", "braked").mode, Mode::kVelocity);
@@ -255,8 +256,7 @@ TEST_F(SimHardwareTest, ExplicitNeutralDecaysBrakeFasterThanCoast) {
   }
   Send("mech", command);
   sim.step(5ms);
-  EXPECT_NEAR(Motor("braked").velocity_rps, 40.0 * (1.0 - 0.005 / 0.05),
-              1e-12);
+  EXPECT_NEAR(Motor("braked").velocity_rps, 40.0 * (1.0 - 0.005 / 0.05), 1e-12);
   EXPECT_NEAR(Motor("coasting").velocity_rps, 40.0 * (1.0 - 0.005 / 1.0),
               1e-12);
   EXPECT_NEAR(Motor("braked").position_rot, braked.position_rot + 36.0 * 0.005,

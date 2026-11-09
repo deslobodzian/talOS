@@ -120,7 +120,7 @@ class Motor {
   double temperature_c() const;     // controller temperature, Celsius
   double supply_current_a() const;  // supply amps (not stator current)
 
-  bool connected() const;   // sample valid and hardware state fresh
+  bool connected() const;  // sample valid and hardware state fresh
   // Per-signal acquisition time on the node clock, with sample_time()'s
   // two-way mapping uncertainty. nullopt if disconnected, mapping/state
   // stale or invalid, or age unknown (UINT32_MAX).

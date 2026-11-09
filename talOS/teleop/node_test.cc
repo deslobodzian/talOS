@@ -753,8 +753,7 @@ TEST(TeleopNode, ConstructionRejectsInvalidFloatingPointButtonAssignments) {
   for (const std::string action : {"while_held", "on_toggle"}) {
     for (const std::string field : {"position_m", "inner/offset_m"}) {
       for (const std::string value : {"nan", "inf", "-inf", "1e40", "-1e40"}) {
-        if (field == "position_m" &&
-            (value == "1e40" || value == "-1e40")) {
+        if (field == "position_m" && (value == "1e40" || value == "-1e40")) {
           continue;  // These values fit a double.
         }
         SCOPED_TRACE(action + "." + field + " = " + value);
@@ -852,45 +851,39 @@ period_us = 20000
 TEST(TeleopNode, NumericIntegerEncodingChecksBoundsBeforeConversion) {
   using reflection::BaseType;
   std::array<std::byte, 8> bytes{};
-  for (const double value : {
-           std::numeric_limits<double>::quiet_NaN(),
-           std::numeric_limits<double>::infinity(),
-           -std::numeric_limits<double>::infinity(),
-           std::ldexp(1.0, 63),
-           std::nextafter(-std::ldexp(1.0, 63),
-                          -std::numeric_limits<double>::infinity())}) {
-    EXPECT_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::Long,
-                                             value),
-                 std::invalid_argument);
+  for (const double value :
+       {std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(), std::ldexp(1.0, 63),
+        std::nextafter(-std::ldexp(1.0, 63),
+                       -std::numeric_limits<double>::infinity())}) {
+    EXPECT_THROW(
+        detail::EncodeNumericBytes(bytes.data(), BaseType::Long, value),
+        std::invalid_argument);
   }
-  EXPECT_NO_THROW(detail::EncodeNumericBytes(
-      bytes.data(), BaseType::Long, -std::ldexp(1.0, 63)));
+  EXPECT_NO_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::Long,
+                                             -std::ldexp(1.0, 63)));
   std::int64_t signed_value{};
   std::memcpy(&signed_value, bytes.data(), sizeof(signed_value));
   EXPECT_EQ(signed_value, std::numeric_limits<std::int64_t>::min());
-  const double largest_signed =
-      std::nextafter(std::ldexp(1.0, 63), 0.0);
-  EXPECT_NO_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::Long,
-                                            largest_signed));
-  EXPECT_THROW(detail::EncodeNumericBytes(
-                   bytes.data(), BaseType::ULong, std::ldexp(1.0, 64)),
+  const double largest_signed = std::nextafter(std::ldexp(1.0, 63), 0.0);
+  EXPECT_NO_THROW(
+      detail::EncodeNumericBytes(bytes.data(), BaseType::Long, largest_signed));
+  EXPECT_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::ULong,
+                                          std::ldexp(1.0, 64)),
                std::invalid_argument);
-  EXPECT_THROW(
-      detail::EncodeNumericBytes(bytes.data(), BaseType::ULong, -1.0),
-      std::invalid_argument);
-  const double largest_unsigned =
-      std::nextafter(std::ldexp(1.0, 64), 0.0);
+  EXPECT_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::ULong, -1.0),
+               std::invalid_argument);
+  const double largest_unsigned = std::nextafter(std::ldexp(1.0, 64), 0.0);
   EXPECT_NO_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::ULong,
-                                            largest_unsigned));
+                                             largest_unsigned));
   std::uint64_t unsigned_value{};
   std::memcpy(&unsigned_value, bytes.data(), sizeof(unsigned_value));
   EXPECT_EQ(unsigned_value, static_cast<std::uint64_t>(largest_unsigned));
-  EXPECT_THROW(
-      detail::EncodeNumericBytes(bytes.data(), BaseType::Byte, 128.0),
-      std::invalid_argument);
-  EXPECT_THROW(
-      detail::EncodeNumericBytes(bytes.data(), BaseType::UInt, -1.0),
-      std::invalid_argument);
+  EXPECT_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::Byte, 128.0),
+               std::invalid_argument);
+  EXPECT_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::UInt, -1.0),
+               std::invalid_argument);
 }
 
 TEST(TeleopNode, ConstructionErrorUnknownFieldInButton) {

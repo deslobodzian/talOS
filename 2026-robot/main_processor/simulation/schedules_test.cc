@@ -1,9 +1,9 @@
 #include "schedules.h"
 
+#include <gtest/gtest.h>
+
 #include <array>
 #include <vector>
-
-#include <gtest/gtest.h>
 
 namespace robot::simulation {
 namespace {
@@ -24,21 +24,21 @@ TEST(Schedules, JoystickSnapshotsCarryAxesButtonsAndPov) {
 }
 
 TEST(Schedules, RejectsMalformedInputsRatherThanSilentlySkippingThem) {
-  for (const auto* spec : {
-           "", "nan:axes=0;buttons=0;pov=-1",
-           "-1:axes=0;buttons=0;pov=-1", "0:axes=2;buttons=0;pov=-1",
-           "0:axes=0;buttons=-1;pov=-1", "0:axes=0;buttons=4294967296;pov=-1",
-           "0:axes=0;buttons=0;pov=360", "0:axes=0;buttons=0;pov=0.5",
-           "0:axes=0;buttons=0", "0:axes=0;axes=0;buttons=0;pov=-1",
-           "0:axes=0;buttons=0;pov=-1|0:axes=0;buttons=0;pov=-1"}) {
+  for (const auto* spec :
+       {"", "nan:axes=0;buttons=0;pov=-1", "-1:axes=0;buttons=0;pov=-1",
+        "0:axes=2;buttons=0;pov=-1", "0:axes=0;buttons=-1;pov=-1",
+        "0:axes=0;buttons=4294967296;pov=-1", "0:axes=0;buttons=0;pov=360",
+        "0:axes=0;buttons=0;pov=0.5", "0:axes=0;buttons=0",
+        "0:axes=0;axes=0;buttons=0;pov=-1",
+        "0:axes=0;buttons=0;pov=-1|0:axes=0;buttons=0;pov=-1"}) {
     EXPECT_THROW(ParseJoysticks(spec), std::invalid_argument) << spec;
   }
-  for (const auto* spec : {
-           "", "1:1:reset:drive", "-1:2:reset:drive", "nan:2:reset:drive",
-           "0:inf:reset:drive", "0:1:unknown:drive",
-           "0:1:udp_blackout:drive", "0:1:supply_voltage:all:17",
-           "0:1:supply_voltage:drive:6", "0:1:supply_voltage:all",
-           "0:1:freeze:drive:4", "0:2:freeze:drive|1:3:freeze:drive"}) {
+  for (const auto* spec :
+       {"", "1:1:reset:drive", "-1:2:reset:drive", "nan:2:reset:drive",
+        "0:inf:reset:drive", "0:1:unknown:drive", "0:1:udp_blackout:drive",
+        "0:1:supply_voltage:all:17", "0:1:supply_voltage:drive:6",
+        "0:1:supply_voltage:all", "0:1:freeze:drive:4",
+        "0:2:freeze:drive|1:3:freeze:drive"}) {
     EXPECT_THROW(ParseFaults(spec), std::invalid_argument) << spec;
   }
 }

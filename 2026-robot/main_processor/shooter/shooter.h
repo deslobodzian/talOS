@@ -14,9 +14,9 @@
 
 namespace shooter {
 
-// Spins the flywheel to the selected target lane. Readiness requires consecutive
-// ticks in the entry band of the clamped demand, then tolerates the wider exit
-// band until the target changes or actuation is no longer allowed.
+// Spins the flywheel to the selected target lane. Readiness requires
+// consecutive ticks in the entry band of the clamped demand, then tolerates the
+// wider exit band until the target changes or actuation is no longer allowed.
 class Shooter {
  public:
   static constexpr double kTargetEpsilonRps = 1e-3;
@@ -43,10 +43,11 @@ class Shooter {
     const bool enabled = talos::robot_enabled(node_);
     const ShooterTarget* t = target_.get();
     const double requested = t ? t->target_velocity_rps() : 0.0;
-    const bool spin = enabled && t && flywheel_.connected() &&
-                      std::isfinite(requested);
+    const bool spin =
+        enabled && t && flywheel_.connected() && std::isfinite(requested);
     const double goal =
-        spin ? std::clamp(requested, -max_velocity_rps_, max_velocity_rps_) : 0.0;
+        spin ? std::clamp(requested, -max_velocity_rps_, max_velocity_rps_)
+             : 0.0;
     if (spin)
       flywheel_.set_velocity(goal);  // otherwise the flush sends neutral
 
@@ -76,8 +77,8 @@ class Shooter {
       }
     }
     state_.send(ShooterState{static_cast<std::uint64_t>(node_.now().nanos()),
-                             velocity, goal, at_speed_,
-                             beam_break_.get(), enabled});
+                             velocity, goal, at_speed_, beam_break_.get(),
+                             enabled});
   }
 
  private:

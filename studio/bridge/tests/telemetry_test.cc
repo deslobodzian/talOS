@@ -43,11 +43,9 @@ std::string FrameBytes(bool with_dictionary, double velocity, double inhibit,
   }
   Talos::Telemetry::Pose chassis{1.5, 2.5, 0, 0, 0, yaw};
   Talos::Telemetry::FinishSizePrefixedFrameBuffer(
-      builder,
-      Talos::Telemetry::CreateFrame(builder, stream_id, 7, 123456789,
-                                    dictionary_id,
-                                    missing_chassis ? nullptr : &chassis,
-                                    values, dictionary));
+      builder, Talos::Telemetry::CreateFrame(
+                   builder, stream_id, 7, 123456789, dictionary_id,
+                   missing_chassis ? nullptr : &chassis, values, dictionary));
   return {reinterpret_cast<const char*>(builder.GetBufferPointer()),
           builder.GetSize()};
 }
@@ -154,8 +152,7 @@ TEST(TelemetryJson, DictionaryWithoutValuesInvalidatesThePreviousFrame) {
     for (const bool changed_dictionary : {false, true}) {
       TelemetryState state;
       ASSERT_TRUE(IngestTelemetry(state, FrameBytes(true, 0.75, 1.0), 10));
-      const std::uint64_t stream_id =
-          changed_stream ? 55 : 9007199254740993ull;
+      const std::uint64_t stream_id = changed_stream ? 55 : 9007199254740993ull;
       const std::uint32_t dictionary_id = changed_dictionary ? 99 : 4242;
       ASSERT_TRUE(IngestTelemetry(
           state, FrameBytes(true, 0.0, 0.0, -1, stream_id, dictionary_id), 20));

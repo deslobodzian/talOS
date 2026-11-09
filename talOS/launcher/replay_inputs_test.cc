@@ -124,15 +124,14 @@ can_id = 1
     hardware.name = "hardware_node";
     hardware.target = "//talOS/bridge:hardware_node";
     const std::string stub = record_config_ + ".hardware.sh";
-    std::ofstream{stub}
-        << "#!/bin/sh\n"
-        << "for arg in \"$@\"; do\n"
-        << "  if [ \"$arg\" = \"--describe\" ]; then\n"
-        << "    cat <<'TALOS_DESCRIBE'\n"
-        << introspect::DescribeToJson(hardware)
-        << "TALOS_DESCRIBE\n"
-        << "  fi\n"
-        << "done\nexit 0\n";
+    std::ofstream{stub} << "#!/bin/sh\n"
+                        << "for arg in \"$@\"; do\n"
+                        << "  if [ \"$arg\" = \"--describe\" ]; then\n"
+                        << "    cat <<'TALOS_DESCRIBE'\n"
+                        << introspect::DescribeToJson(hardware)
+                        << "TALOS_DESCRIBE\n"
+                        << "  fi\n"
+                        << "done\nexit 0\n";
     std::filesystem::permissions(stub, std::filesystem::perms::owner_all);
   }
 

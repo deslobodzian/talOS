@@ -222,7 +222,8 @@ class RealtimeEventLoop
   SendOutcome send_impl(std::uint16_t id, std::span<const std::byte> bytes) {
     RTMSQueue& queue = *transports_[id].queue;
 
-    const WriteStatus status = queue.write(bytes, this->monotonic_now().nanos());
+    const WriteStatus status =
+        queue.write(bytes, this->monotonic_now().nanos());
 
     switch (status.result) {
       case WriteResult::SUCCESS:
@@ -260,10 +261,10 @@ class RealtimeEventLoop
         }
 
         now = Poller::now();
-        this->dispatch_message(
-            static_cast<std::uint16_t>(id), tick_deadline, now, info.sequence,
-            info.dropped, sources[id].buffer,
-            MonotonicTime::from_nanos(info.publish_time_ns));
+        this->dispatch_message(static_cast<std::uint16_t>(id), tick_deadline,
+                               now, info.sequence, info.dropped,
+                               sources[id].buffer,
+                               MonotonicTime::from_nanos(info.publish_time_ns));
 
         if (!this->running()) {
           return;

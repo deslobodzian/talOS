@@ -62,17 +62,18 @@ bool ValueSize(const reflection::Schema& schema, reflection::BaseType base,
   if (base == reflection::BaseType::Obj) {
     const auto* objects = schema.objects();
     if (objects == nullptr || index < 0 ||
-        static_cast<std::size_t>(index) >= objects->size()) return false;
+        static_cast<std::size_t>(index) >= objects->size())
+      return false;
     const auto* object = objects->Get(index);
     if (!object->is_struct() || object->bytesize() <= 0) return false;
     size = static_cast<std::size_t>(object->bytesize());
     return true;
   }
-  if (base < reflection::BaseType::UType ||
-      base > reflection::BaseType::Double) return false;
-  if (index >= 0 &&
-      (schema.enums() == nullptr ||
-       static_cast<std::size_t>(index) >= schema.enums()->size())) return false;
+  if (base < reflection::BaseType::UType || base > reflection::BaseType::Double)
+    return false;
+  if (index >= 0 && (schema.enums() == nullptr ||
+                     static_cast<std::size_t>(index) >= schema.enums()->size()))
+    return false;
   size = flatbuffers::GetTypeSize(base);
   return true;
 }
@@ -83,13 +84,14 @@ bool AppendStruct(const reflection::Schema& schema,
 
 // A scalar, enum or nested struct of `base`/`index` at `data`.
 bool AppendValue(const reflection::Schema& schema, reflection::BaseType base,
-                 std::int32_t index, const std::uint8_t* data,
-                 std::string& out, int depth) {
+                 std::int32_t index, const std::uint8_t* data, std::string& out,
+                 int depth) {
   using reflection::BaseType;
   std::size_t size;
   if (!ValueSize(schema, base, index, size)) return false;
   if (base == BaseType::Obj) {
-    return AppendStruct(schema, *schema.objects()->Get(index), data, out, depth);
+    return AppendStruct(schema, *schema.objects()->Get(index), data, out,
+                        depth);
   }
   if (base == BaseType::Float) {
     float value;
@@ -131,7 +133,8 @@ bool AppendStruct(const reflection::Schema& schema,
                   const reflection::Object& object, const std::uint8_t* data,
                   std::string& out, int depth) {
   if (depth >= kMaxDepth || !object.is_struct() || object.bytesize() <= 0 ||
-      object.fields() == nullptr) return false;
+      object.fields() == nullptr)
+    return false;
   // reflection lists fields by name; print them as declared.
   std::vector<const reflection::Field*> fields(object.fields()->begin(),
                                                object.fields()->end());
@@ -146,25 +149,29 @@ bool AppendStruct(const reflection::Schema& schema,
     const bool array = type.base_type() == reflection::BaseType::Array;
     std::size_t element_bytes;
     if (!ValueSize(schema, array ? type.element() : type.base_type(),
-                   type.index(), element_bytes)) return false;
+                   type.index(), element_bytes))
+      return false;
     const std::size_t count = array ? type.fixed_length() : 1;
     const auto bytes = static_cast<std::size_t>(object.bytesize());
     if (count == 0 || field.offset() > bytes ||
-        element_bytes > (bytes - field.offset()) / count) return false;
+        element_bytes > (bytes - field.offset()) / count)
+      return false;
     if (i != 0) out += ", ";
     out += field.name()->str();
     out += ": ";
     const std::uint8_t* at = data + field.offset();
     if (type.base_type() != reflection::BaseType::Array) {
       if (!AppendValue(schema, type.base_type(), type.index(), at, out,
-                       depth + 1)) return false;
+                       depth + 1))
+        return false;
       continue;
     }
     out += '[';
     for (std::uint16_t k = 0; k < type.fixed_length(); ++k) {
       if (k != 0) out += ", ";
       if (!AppendValue(schema, type.element(), type.index(),
-                       at + k * element_bytes, out, depth + 1)) return false;
+                       at + k * element_bytes, out, depth + 1))
+        return false;
     }
     out += ']';
   }
@@ -214,8 +221,8 @@ void AppendMessage(const std::string& bfbs, std::string_view name,
   }
   const std::size_t start = out.size();
   if (!AppendStruct(schema, *object,
-                    reinterpret_cast<const std::uint8_t*>(payload.data()),
-                    out, 0)) {
+                    reinterpret_cast<const std::uint8_t*>(payload.data()), out,
+                    0)) {
     out.resize(start);
     out += "<invalid struct schema>";
   }

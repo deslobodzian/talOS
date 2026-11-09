@@ -17,17 +17,18 @@ bool type_size(const reflection::Schema& schema, reflection::BaseType base,
   if (base == reflection::BaseType::Obj) {
     const auto* objects = schema.objects();
     if (objects == nullptr || index < 0 ||
-        static_cast<std::size_t>(index) >= objects->size()) return false;
+        static_cast<std::size_t>(index) >= objects->size())
+      return false;
     const auto* object = objects->Get(index);
     if (!object->is_struct() || object->bytesize() <= 0) return false;
     size = static_cast<std::size_t>(object->bytesize());
     return true;
   }
-  if (base < reflection::BaseType::UType ||
-      base > reflection::BaseType::Double) return false;
-  if (index >= 0 &&
-      (schema.enums() == nullptr ||
-       static_cast<std::size_t>(index) >= schema.enums()->size())) return false;
+  if (base < reflection::BaseType::UType || base > reflection::BaseType::Double)
+    return false;
+  if (index >= 0 && (schema.enums() == nullptr ||
+                     static_cast<std::size_t>(index) >= schema.enums()->size()))
+    return false;
   size = flatbuffers::GetTypeSize(base);
   return true;
 }
@@ -69,7 +70,8 @@ bool append_struct(const reflection::Schema& schema,
                    const reflection::Object& object, std::string& out,
                    int depth) {
   if (depth >= kMaxDepth || !object.is_struct() || object.bytesize() <= 0 ||
-      object.fields() == nullptr) return false;
+      object.fields() == nullptr)
+    return false;
   out += "struct ";
   out += object.name()->str();
   out += ' ';
@@ -82,11 +84,13 @@ bool append_struct(const reflection::Schema& schema,
     const bool array = type.base_type() == reflection::BaseType::Array;
     std::size_t size;
     if (!type_size(schema, array ? type.element() : type.base_type(),
-                   type.index(), size)) return false;
+                   type.index(), size))
+      return false;
     const std::size_t count = array ? type.fixed_length() : 1;
     const auto bytes = static_cast<std::size_t>(object.bytesize());
     if (count == 0 || field->offset() > bytes ||
-        size > (bytes - field->offset()) / count) return false;
+        size > (bytes - field->offset()) / count)
+      return false;
     out += field->name()->str();
     out += '@';
     out += std::to_string(field->offset());
@@ -100,7 +104,8 @@ bool append_struct(const reflection::Schema& schema,
       out += std::to_string(type.fixed_length());
       out += ']';
     } else {
-      if (!append_type(schema, type.base_type(), type.index(), out, depth + 1)) {
+      if (!append_type(schema, type.base_type(), type.index(), out,
+                       depth + 1)) {
         return false;
       }
     }

@@ -1,5 +1,5 @@
-#include <gtest/gtest.h>
 #include <fcntl.h>
+#include <gtest/gtest.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -12,10 +12,9 @@
 #include <format>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
-
-#include <string>
 
 namespace {
 bool fail_truncate = false;

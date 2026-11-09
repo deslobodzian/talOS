@@ -174,7 +174,8 @@ struct SimHardware::Impl {
       Axis& axis = motors[motor.id];
       switch (request.mode) {
         case hardware::Mode::kNeutral: {
-          const double tau = motor.brake ? kNeutralBrakeTauS : kNeutralCoastTauS;
+          const double tau =
+              motor.brake ? kNeutralBrakeTauS : kNeutralCoastTauS;
           axis.velocity *= 1.0 - std::min(1.0, dt / tau);
           if (std::abs(axis.velocity) < kNeutralStandstillRps) {
             axis.velocity = 0;
@@ -354,7 +355,7 @@ SimHardware::SimHardware(Sim& sim) : impl_{std::make_shared<Impl>(sim)} {
   for (const auto& [name, devices] : impl.config.subsystems) {
     impl.requests.emplace(
         name, Impl::RequestTracker{.topic = hardware::RequestTopic(name),
-                                  .last_seen = std::nullopt});
+                                   .last_seen = std::nullopt});
     impl.Neutralize(devices);
   }
   SimAccess::every(sim, impl.period, [weak = std::weak_ptr<Impl>{impl_}] {
@@ -487,14 +488,14 @@ hardware::MotorRequest SimHardware::applied_motor(
 }
 
 bool SimHardware::applied_digital_output(std::string_view node,
-                                        std::string_view device) const {
+                                         std::string_view device) const {
   const std::uint16_t id = impl_->Id(node, Kind::kDigitalOutput, device);
   impl_->Collect();
   return impl_->applied_digital_outputs.at(id);
 }
 
 double SimHardware::applied_pwm(std::string_view node,
-                               std::string_view device) const {
+                                std::string_view device) const {
   const std::uint16_t id = impl_->Id(node, Kind::kPwm, device);
   impl_->Collect();
   return impl_->applied_pwm_outputs.at(id);

@@ -146,7 +146,8 @@ TEST_F(ShooterTest, GoalAboveMotorLimitBecomesReadyAtClampedDemand) {
   EXPECT_TRUE(State().at_speed());
   talos::testing::PublishTarget(sim, "shooter", "teleop", ShooterTarget{160.0});
   sim.step(5ms);
-  EXPECT_FALSE(State().at_speed());  // changed even though demand clamps equally
+  EXPECT_FALSE(
+      State().at_speed());  // changed even though demand clamps equally
 }
 
 TEST_F(ShooterTest, ChangedTargetAndZeroTargetClearReadiness) {
@@ -156,7 +157,8 @@ TEST_F(ShooterTest, ChangedTargetAndZeroTargetClearReadiness) {
   ASSERT_TRUE(State().at_speed());
   talos::testing::PublishTarget(sim, "shooter", "teleop", ShooterTarget{81.0});
   sim.step(5ms);
-  EXPECT_FALSE(State().at_speed());  // still inside entry, but must qualify again
+  EXPECT_FALSE(
+      State().at_speed());  // still inside entry, but must qualify again
   Hold(81.0, 20ms);
   ASSERT_TRUE(State().at_speed());
   Hold(0.0, 20ms);
@@ -245,13 +247,13 @@ TEST_F(ShooterTest, ReportsTheBeamBreak) {
 }
 
 TEST(ShooterParameters, RejectInvalidReadinessParametersAtConstruction) {
-  for (const char* setting : {
-           "at_speed_entry_rps = 0", "at_speed_entry_rps = -1",
-           "at_speed_entry_rps = nan", "at_speed_entry_rps = inf",
-           "at_speed_exit_frac = 0", "at_speed_exit_frac = -0.1",
-           "at_speed_exit_frac = 1.1", "at_speed_exit_frac = nan",
-           "at_speed_exit_frac = inf", "at_speed_entry_tick_count = 0",
-           "at_speed_entry_tick_count = -1"}) {
+  for (const char* setting :
+       {"at_speed_entry_rps = 0", "at_speed_entry_rps = -1",
+        "at_speed_entry_rps = nan", "at_speed_entry_rps = inf",
+        "at_speed_exit_frac = 0", "at_speed_exit_frac = -0.1",
+        "at_speed_exit_frac = 1.1", "at_speed_exit_frac = nan",
+        "at_speed_exit_frac = inf", "at_speed_entry_tick_count = 0",
+        "at_speed_entry_tick_count = -1"}) {
     SCOPED_TRACE(setting);
     auto sim = Sim::FromToml(std::string{R"(
 [robot]

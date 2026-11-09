@@ -704,9 +704,9 @@ struct MetalAprilTagBackend::Impl {
           }
           if (cached_parent_buf != nullptr && cached_size_buf != nullptr &&
               cached_cand_buf != nullptr && cached_cand_count_buf != nullptr &&
-              cached_thresh_buf != nullptr &&
-              cached_parent_buf->contents() && cached_size_buf->contents() &&
-              cached_cand_buf->contents() && cached_cand_count_buf->contents() &&
+              cached_thresh_buf != nullptr && cached_parent_buf->contents() &&
+              cached_size_buf->contents() && cached_cand_buf->contents() &&
+              cached_cand_count_buf->contents() &&
               cached_thresh_buf->contents()) {
             *static_cast<uint32_t*>(cached_cand_count_buf->contents()) = 0;
             MTL::ComputeCommandEncoder* cenc = enc;
@@ -960,10 +960,10 @@ struct MetalAprilTagBackend::Impl {
       }
       out_thresh = cached_thresh_buf;
     }
-    if (!gray_buf->contents() ||
-        !cached_im_min_buf || !cached_im_min_buf->contents() ||
-        !cached_im_max_buf || !cached_im_max_buf->contents() ||
-        !out_thresh || !out_thresh->contents()) {
+    if (!gray_buf->contents() || !cached_im_min_buf ||
+        !cached_im_min_buf->contents() || !cached_im_max_buf ||
+        !cached_im_max_buf->contents() || !out_thresh ||
+        !out_thresh->contents()) {
       return false;
     }
 

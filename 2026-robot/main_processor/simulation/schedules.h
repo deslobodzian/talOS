@@ -70,7 +70,8 @@ inline std::vector<JoystickEvent> ParseJoysticks(const std::string& spec) {
         for (const auto& axis : Split(value, ',')) {
           const double x = Number(axis);
           if (stick.axis_count == stick.axes.size() || x < -1 || x > 1) {
-            throw std::invalid_argument("axes need at most 12 values in [-1,1]");
+            throw std::invalid_argument(
+                "axes need at most 12 values in [-1,1]");
           }
           stick.axes[stick.axis_count++] = static_cast<float>(x);
         }
@@ -78,7 +79,8 @@ inline std::vector<JoystickEvent> ParseJoysticks(const std::string& spec) {
         buttons = true;
         std::size_t used = 0;
         const auto mask = std::stoull(value, &used);
-        if (used != value.size() || value.starts_with('-') || mask > UINT32_MAX) {
+        if (used != value.size() || value.starts_with('-') ||
+            mask > UINT32_MAX) {
           throw std::invalid_argument("buttons must be a uint32 decimal mask");
         }
         stick.buttons = static_cast<uint32_t>(mask);
@@ -87,12 +89,14 @@ inline std::vector<JoystickEvent> ParseJoysticks(const std::string& spec) {
         const double angle = Number(value);
         if (angle != std::floor(angle) ||
             (angle != -1 && (angle < 0 || angle >= 360))) {
-          throw std::invalid_argument("pov must be -1 or integer degrees [0,359]");
+          throw std::invalid_argument(
+              "pov must be -1 or integer degrees [0,359]");
         }
         stick.pov_count = 1;
         stick.povs[0] = static_cast<int16_t>(angle);
       } else {
-        throw std::invalid_argument("unknown or repeated joystick field: " + key);
+        throw std::invalid_argument("unknown or repeated joystick field: " +
+                                    key);
       }
     }
     if (!axes || !buttons || !pov) {
@@ -153,7 +157,8 @@ inline std::vector<FaultEvent> ParseFaults(const std::string& spec) {
     }
     if (event.kind == FaultKind::kSupply) {
       if (fields.size() != 5 || event.target != "all") {
-        throw std::invalid_argument("supply_voltage needs target all and volts");
+        throw std::invalid_argument(
+            "supply_voltage needs target all and volts");
       }
       event.volts = Number(fields[4]);
       if (event.volts < 0 || event.volts > 16) {
@@ -175,16 +180,16 @@ inline std::vector<FaultEvent> ParseFaults(const std::string& spec) {
   }
   // Apply an ending interval's restoration before an adjacent interval's
   // activation, regardless of the order supplied on the command line.
-  std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
-    return a.start_s < b.start_s;
-  });
+  std::sort(events.begin(), events.end(),
+            [](const auto& a, const auto& b) { return a.start_s < b.start_s; });
   return events;
 }
 
 inline void ResolveFaults(std::vector<FaultEvent>& events,
                           const talos::hardware::Config& config) {
   for (auto& event : events) {
-    if (event.kind == FaultKind::kSupply || event.kind == FaultKind::kBlackout) {
+    if (event.kind == FaultKind::kSupply ||
+        event.kind == FaultKind::kBlackout) {
       continue;
     }
     bool found = false;

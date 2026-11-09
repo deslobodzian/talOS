@@ -187,8 +187,7 @@ void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
               << ",\"sequence\":" << r.header.sequence
               << ",\"aux\":" << r.header.aux
               << ",\"payload_bytes\":" << r.header.payload_bytes
-              << ",\"schema\":" << quote(schema)
-              << ",\"payload_hex\":";
+              << ",\"schema\":" << quote(schema) << ",\"payload_hex\":";
     ExportPayloadHex(r.payload);
     std::cout << ",\"decoded\":" << quote(decoded);
     if (r.source_name == talos::hardware::kDriverStationTopic &&

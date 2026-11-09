@@ -32,12 +32,13 @@ inline constexpr std::size_t rtms_slot_alignment(std::size_t alignment) {
   return alignment < alignof(std::int64_t) ? alignof(std::int64_t) : alignment;
 }
 
-inline constexpr std::size_t rtms_publish_time_offset(std::size_t message_size) {
+inline constexpr std::size_t rtms_publish_time_offset(
+    std::size_t message_size) {
   return align_up(message_size, alignof(std::int64_t));
 }
 
 inline constexpr std::size_t rtms_slot_stride(std::size_t message_size,
-                                             std::size_t alignment) {
+                                              std::size_t alignment) {
   return align_up(rtms_publish_time_offset(message_size) + sizeof(std::int64_t),
                   rtms_slot_alignment(alignment));
 }

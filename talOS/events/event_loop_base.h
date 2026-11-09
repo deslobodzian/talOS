@@ -154,8 +154,8 @@ class EventLoopBase {
   std::uint16_t register_watcher(std::string_view topic,
                                  std::uint32_t message_bytes,
                                  std::uint32_t alignment,
-                                 const schema::Identity& schema,
-                                 Thunk callback, bool latest_only = false) {
+                                 const schema::Identity& schema, Thunk callback,
+                                 bool latest_only = false) {
     return add_source(SourceKind::WATCHER, topic, message_bytes, alignment,
                       schema, callback, latest_only);
   }

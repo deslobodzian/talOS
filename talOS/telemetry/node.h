@@ -80,12 +80,13 @@ inline void FinishFrame(
     std::uint64_t sequence_id, std::uint64_t timestamp_ns,
     std::uint32_t dictionary_id, const Talos::Telemetry::Pose& chassis,
     flatbuffers::Offset<flatbuffers::Vector<double>> values,
-    flatbuffers::Offset<flatbuffers::Vector<
-        flatbuffers::Offset<Talos::Telemetry::ChannelInfo>>> dictionary = 0) {
+    flatbuffers::Offset<
+        flatbuffers::Vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>>>
+        dictionary = 0) {
   Talos::Telemetry::FinishSizePrefixedFrameBuffer(
-      builder, Talos::Telemetry::CreateFrame(
-                   builder, stream_id, sequence_id, timestamp_ns, dictionary_id,
-                   &chassis, values, dictionary));
+      builder, Talos::Telemetry::CreateFrame(builder, stream_id, sequence_id,
+                                             timestamp_ns, dictionary_id,
+                                             &chassis, values, dictionary));
 }
 
 }  // namespace detail
@@ -384,10 +385,10 @@ class Telemetry {
       dictionary_offset = builder.CreateVector(entries);
     }
 
-    detail::FinishFrame(
-        builder, stream_id_, sequence_,
-        static_cast<std::uint64_t>(node_.now().nanos()), dictionary_id_, chassis,
-        values_offset, dictionary_offset);
+    detail::FinishFrame(builder, stream_id_, sequence_,
+                        static_cast<std::uint64_t>(node_.now().nanos()),
+                        dictionary_id_, chassis, values_offset,
+                        dictionary_offset);
 
     studio_.send(std::as_bytes(
         std::span{builder.GetBufferPointer(), builder.GetSize()}));

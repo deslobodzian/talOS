@@ -303,8 +303,7 @@ TEST_F(SuperstructureAlone, StowWinsWhenRaisingArrivesAtScoringHeight) {
   Tick(SuperstructureCommand::STOW, kHolding, kUp);
   EXPECT_EQ(State(), SuperstructureState::HOLDING);
   EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
-  const auto intake =
-      LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+  const auto intake = LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
   ASSERT_TRUE(intake.has_value());
   EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
 }
@@ -366,7 +365,7 @@ TEST_F(SuperstructureAlone, StaleStatusWhileRaisingStowsImmediately) {
          stale_intake ? std::nullopt : std::optional{kHolding},
          stale_intake ? std::optional{kDown} : std::nullopt);
     EXPECT_EQ(State(), stale_intake ? SuperstructureState::STOWED
-                                   : SuperstructureState::HOLDING);
+                                    : SuperstructureState::HOLDING);
     ExpectLanesReleased();
 
     // Cancellation persists when the elevator reports its old high goal.
@@ -384,8 +383,7 @@ TEST_F(SuperstructureAlone, PieceLostWhileRaisingDoesNotStartEject) {
        IntakeStatus{IntakeState::IDLE, false}, kUp);
   EXPECT_EQ(State(), SuperstructureState::STOWED);
   EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
-  const auto intake =
-      LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+  const auto intake = LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
   ASSERT_TRUE(intake.has_value());
   EXPECT_EQ(intake->active, 1);
   EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
@@ -447,7 +445,8 @@ TEST_F(SuperstructureAlone, GoalLossAndDisableCancelWithStaleStatuses) {
     EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
     if (cancellation == 1) {
       hw.enable();
-      sim.step(20ms);  // Refresh hardware without shifting the 20 ms test phase.
+      sim.step(
+          20ms);  // Refresh hardware without shifting the 20 ms test phase.
     }
   }
 }

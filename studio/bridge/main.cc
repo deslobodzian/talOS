@@ -61,7 +61,8 @@ struct Bridge {
   std::string topic;
   std::set<Socket*> clients;
   us_listen_socket_t* listener = nullptr;
-  std::uint64_t invalid = 0, ws_drops = 0, telemetry_ws_drops = 0, forwarded = 0;
+  std::uint64_t invalid = 0, ws_drops = 0, telemetry_ws_drops = 0,
+                forwarded = 0;
   std::size_t max_clients = 4;
   std::uint64_t refused = 0, egress_bytes = 0;
   EgressBudget budget;

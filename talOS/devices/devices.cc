@@ -758,7 +758,8 @@ class DriverStationLink {
     }
     data_ = next;
     have_ = true;
-    published_ = node_.now() - NodeAccess::subscription_age(node_, subscription_);
+    published_ =
+        node_.now() - NodeAccess::subscription_age(node_, subscription_);
     for (const auto& listener : listeners_) listener();
   }
 

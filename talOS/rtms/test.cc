@@ -104,9 +104,8 @@ TEST(LayoutValidation, SlotsIncludeAlignedPublicationTime) {
     std::size_t time_offset;
     std::size_t stride;
   };
-  for (const Layout layout :
-       {Layout{1, 1, 8, 16}, Layout{8, 4, 8, 16}, Layout{16, 8, 16, 24},
-        Layout{16, 16, 16, 32}}) {
+  for (const Layout layout : {Layout{1, 1, 8, 16}, Layout{8, 4, 8, 16},
+                              Layout{16, 8, 16, 24}, Layout{16, 16, 16, 32}}) {
     const auto path =
         make_test_path("stamp_layout_" + std::to_string(layout.message_size) +
                        "_" + std::to_string(layout.alignment));
@@ -116,7 +115,8 @@ TEST(LayoutValidation, SlotsIncludeAlignedPublicationTime) {
     EXPECT_EQ(header->version, 5u);
     EXPECT_EQ(header->slot_stride, layout.stride);
     EXPECT_EQ(header->data_offset % rtms_slot_alignment(layout.alignment), 0u);
-    EXPECT_EQ(rtms_publish_time_offset(layout.message_size), layout.time_offset);
+    EXPECT_EQ(rtms_publish_time_offset(layout.message_size),
+              layout.time_offset);
     EXPECT_EQ(header->total_bytes, header->data_offset + 2 * layout.stride);
   }
 }
@@ -390,19 +390,23 @@ TEST(PublishTime, ExplicitTimestampsSurviveSequenceAndLatestReads) {
   for (const ReadMode mode : {ReadMode::SEQUENCE, ReadMode::LATEST}) {
     auto options = sequence_options();
     options.read_mode = mode;
-    const auto path = make_test_path(mode == ReadMode::SEQUENCE ? "stamp_seq"
-                                                               : "stamp_latest");
-    RTMSQueue queue{path, sizeof(Message::TestMessage),
-                    alignof(Message::TestMessage), kSchema, 4, options};
+    const auto path = make_test_path(
+        mode == ReadMode::SEQUENCE ? "stamp_seq" : "stamp_latest");
+    RTMSQueue queue{path,
+                    sizeof(Message::TestMessage),
+                    alignof(Message::TestMessage),
+                    kSchema,
+                    4,
+                    options};
     const auto reader = queue.register_reader();
     ASSERT_TRUE(reader.has_value());
     // Non-monotonic, negative, and zero values must be preserved verbatim.
-    constexpr std::array<std::int64_t, 4> times{
-        0, 9'876'543'210'123, -5'000'000'000, 42};
+    constexpr std::array<std::int64_t, 4> times{0, 9'876'543'210'123,
+                                                -5'000'000'000, 42};
     for (int batch = 0; batch < 3; ++batch) {
       for (int i = 0; i < 4; ++i) {
-        const Message::TestMessage message{
-            batch * 4 + i, static_cast<float>(i)};
+        const Message::TestMessage message{batch * 4 + i,
+                                           static_cast<float>(i)};
         ASSERT_EQ(queue.write(BytesOf(message), times[i]),
                   WriteResult::SUCCESS);
       }
@@ -410,10 +414,10 @@ TEST(PublishTime, ExplicitTimestampsSurviveSequenceAndLatestReads) {
       for (int i = first; i < 4; ++i) {
         Message::TestMessage received{};
         MessageInfo info{};
-        ASSERT_EQ(queue.read_next(
-                      *reader, std::as_writable_bytes(std::span{&received, 1}),
-                      info),
-                  ReadResult::OK);
+        ASSERT_EQ(
+            queue.read_next(
+                *reader, std::as_writable_bytes(std::span{&received, 1}), info),
+            ReadResult::OK);
         EXPECT_EQ(received.id(), batch * 4 + i);
         EXPECT_EQ(received.value(), static_cast<float>(i));
         EXPECT_EQ(info.sequence, static_cast<std::uint64_t>(batch * 4 + i));
@@ -437,7 +441,8 @@ TEST(PublishTime, ConvenienceWriteSamplesHostMonotonicClock) {
 #else
     ::clock_gettime(CLOCK_MONOTONIC, &now);
 #endif
-    return static_cast<std::int64_t>(now.tv_sec) * 1'000'000'000LL + now.tv_nsec;
+    return static_cast<std::int64_t>(now.tv_sec) * 1'000'000'000LL +
+           now.tv_nsec;
   };
   const auto before = now_ns();
   ASSERT_EQ(queue.write(BytesOf(Message::TestMessage{7, 7.0F})),
@@ -457,8 +462,8 @@ TEST(SingleProcess, ShortWritesZeroPadPreviouslyUsedSlots) {
   constexpr std::size_t slots = 4;
   std::array<std::byte, 16> full;
   full.fill(std::byte{0xa5});
-  RTMSQueue queue{make_test_path("short_pad"), full.size(), 8, kSchema,
-                  slots, overwrite_sequence_options()};
+  RTMSQueue queue{make_test_path("short_pad"), full.size(), 8, kSchema, slots,
+                  overwrite_sequence_options()};
   for (std::size_t i = 0; i < slots; ++i) {
     ASSERT_EQ(queue.write(full), WriteResult::SUCCESS);
   }
@@ -483,17 +488,24 @@ TEST(SingleProcess, ShortWritesZeroPadPreviouslyUsedSlots) {
 TEST(SingleProcess, MismatchedReaderPolicyRejectsOverwrittenSequence) {
   const auto path = make_test_path("policy_mismatch");
   constexpr std::size_t slots = 4;
-  RTMSQueue writer{path, sizeof(Message::TestMessage),
-                   alignof(Message::TestMessage), kSchema, slots,
+  RTMSQueue writer{path,
+                   sizeof(Message::TestMessage),
+                   alignof(Message::TestMessage),
+                   kSchema,
+                   slots,
                    overwrite_sequence_options()};
-  RTMSQueue subscriber{path, sizeof(Message::TestMessage),
-                       alignof(Message::TestMessage), kSchema, slots,
+  RTMSQueue subscriber{path,
+                       sizeof(Message::TestMessage),
+                       alignof(Message::TestMessage),
+                       kSchema,
+                       slots,
                        sequence_options()};
   const auto reader = subscriber.register_reader();
   ASSERT_TRUE(reader.has_value());
   for (std::size_t i = 0; i <= slots; ++i) {
-    ASSERT_EQ(writer.write(BytesOf(Message::TestMessage{
-                  static_cast<int>(i), static_cast<float>(i)}), 1'000 + i),
+    ASSERT_EQ(writer.write(BytesOf(Message::TestMessage{static_cast<int>(i),
+                                                        static_cast<float>(i)}),
+                           1'000 + i),
               WriteResult::SUCCESS);
   }
   std::array<std::byte, sizeof(Message::TestMessage)> received{};
@@ -509,22 +521,21 @@ TEST(SingleProcess, MismatchedReaderPolicyRejectsOverwrittenSequence) {
 
 TEST(SingleProcess, InProgressOverwriteRejectsMixedSlot) {
   for (const std::size_t slots : {2u, 4u}) {
-    const auto path =
-        make_test_path("inprog_" + std::to_string(slots));
+    const auto path = make_test_path("inprog_" + std::to_string(slots));
     std::array<std::byte, 16> original;
     original.fill(std::byte{0xa5});
     std::array<std::byte, 16> newer;
     newer.fill(std::byte{0x5a});
-    RTMSQueue writer{path, original.size(), 8, kSchema, slots,
-                     overwrite_sequence_options()};
+    RTMSQueue writer{path,    original.size(), 8,
+                     kSchema, slots,           overwrite_sequence_options()};
     // A mismatched DROP_NEWEST reader must validate its original sequence,
     // rather than skipping it before the post-copy validity check is reached.
-    RTMSQueue subscriber{path, original.size(), 8, kSchema, slots,
-                         sequence_options()};
-    RTMSQueue recovering{path, original.size(), 8, kSchema, slots,
-                         overwrite_sequence_options()};
-    RTMSQueue latest{path, original.size(), 8, kSchema, slots,
-                     latest_options()};
+    RTMSQueue subscriber{path,    original.size(), 8,
+                         kSchema, slots,           sequence_options()};
+    RTMSQueue recovering{
+        path, original.size(), 8, kSchema, slots, overwrite_sequence_options()};
+    RTMSQueue latest{path,    original.size(), 8,
+                     kSchema, slots,           latest_options()};
     const auto reader = subscriber.register_reader();
     const auto recovering_reader = recovering.register_reader();
     const auto latest_reader = latest.register_reader();
@@ -598,8 +609,8 @@ TEST(SingleProcess, OverwriteRevokesReliableFullRingGuarantee) {
     EXPECT_EQ(info.sequence, 0u);
   }
   {
-    RTMSQueue overwriting{path, message.size(), 8, kSchema, 2,
-                          overwrite_sequence_options()};
+    RTMSQueue overwriting{
+        path, message.size(), 8, kSchema, 2, overwrite_sequence_options()};
     ASSERT_EQ(overwriting.write(message), WriteResult::SUCCESS);
     EXPECT_EQ(header->writer.reliable_sequence.load(), 0u);
     MessageInfo info;

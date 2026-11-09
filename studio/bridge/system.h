@@ -286,7 +286,7 @@ inline void AppendSelection(std::string& out,
 }
 
 inline void AppendNode(std::string& out, const introspect::NodeSnapshot& node,
-                        std::int64_t wall_ns, std::int64_t monotonic_ns) {
+                       std::int64_t wall_ns, std::int64_t monotonic_ns) {
   out += "{\"name\":";
   AppendEscaped(out, node.name);
   out += ",\"target\":";

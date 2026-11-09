@@ -145,12 +145,10 @@ TEST(SchemaHash, RejectsWhatIsNotAStructInASchema) {
 
 // These buffers pass the FlatBuffers verifier: the invalid references and
 // inline layouts are semantic errors, not broken table encodings.
-std::vector<std::uint8_t> MalformedSchema(reflection::BaseType base,
-                                          std::int32_t index,
-                                          std::uint16_t offset = 0,
-                                          reflection::BaseType element =
-                                              reflection::BaseType::None,
-                                          std::uint16_t length = 0) {
+std::vector<std::uint8_t> MalformedSchema(
+    reflection::BaseType base, std::int32_t index, std::uint16_t offset = 0,
+    reflection::BaseType element = reflection::BaseType::None,
+    std::uint16_t length = 0) {
   flatbuffers::FlatBufferBuilder builder;
   const auto name = builder.CreateString("bad.Struct");
   const auto field_name = builder.CreateString("field");
@@ -186,20 +184,20 @@ std::vector<std::uint8_t> MalformedSchema(reflection::BaseType base,
 
 TEST(SchemaHash, RejectsInvalidReflectionIndicesLayoutsAndCycles) {
   using reflection::BaseType;
-  for (const auto& bytes : {
-           MalformedSchema(BaseType::Obj, -1),
-           MalformedSchema(BaseType::Obj, 1),
-           MalformedSchema(BaseType::Int, 0),
-           MalformedSchema(BaseType::Long, -1, 1),
-           MalformedSchema(BaseType::Array, -1, 0, BaseType::Long, 2),
-           MalformedSchema(BaseType::Array, 1, 0, BaseType::Obj, 1),
-           MalformedSchema(BaseType::Obj, 0)}) {
+  for (const auto& bytes :
+       {MalformedSchema(BaseType::Obj, -1), MalformedSchema(BaseType::Obj, 1),
+        MalformedSchema(BaseType::Int, 0),
+        MalformedSchema(BaseType::Long, -1, 1),
+        MalformedSchema(BaseType::Array, -1, 0, BaseType::Long, 2),
+        MalformedSchema(BaseType::Array, 1, 0, BaseType::Obj, 1),
+        MalformedSchema(BaseType::Obj, 0)}) {
     flatbuffers::Verifier verifier(bytes.data(), bytes.size());
     ASSERT_TRUE(reflection::VerifySchemaBuffer(verifier));
     EXPECT_FALSE(Hash(bytes, "bad.Struct"));
     const auto* schema = reflection::GetSchema(bytes.data());
-    EXPECT_TRUE(talos::schema::canonical_struct(
-                    *schema, *schema->objects()->Get(0)).empty());
+    EXPECT_TRUE(
+        talos::schema::canonical_struct(*schema, *schema->objects()->Get(0))
+            .empty());
   }
 }
 

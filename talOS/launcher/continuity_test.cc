@@ -145,15 +145,14 @@ can_id = 2
   introspect::Description hardware;
   hardware.name = "hardware_node";
   hardware.target = "//talOS/bridge:hardware_node";
-  std::ofstream{hardware_stub}
-      << "#!/bin/sh\n"
-      << "for arg in \"$@\"; do\n"
-      << "  if [ \"$arg\" = \"--describe\" ]; then\n"
-      << "    cat <<'TALOS_DESCRIBE'\n"
-      << introspect::DescribeToJson(hardware)
-      << "TALOS_DESCRIBE\n"
-      << "  fi\n"
-      << "done\nexit 0\n";
+  std::ofstream{hardware_stub} << "#!/bin/sh\n"
+                               << "for arg in \"$@\"; do\n"
+                               << "  if [ \"$arg\" = \"--describe\" ]; then\n"
+                               << "    cat <<'TALOS_DESCRIBE'\n"
+                               << introspect::DescribeToJson(hardware)
+                               << "TALOS_DESCRIBE\n"
+                               << "  fi\n"
+                               << "done\nexit 0\n";
   std::filesystem::permissions(hardware_stub,
                                std::filesystem::perms::owner_all);
 

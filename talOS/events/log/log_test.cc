@@ -553,9 +553,9 @@ TEST(LogFormatErrors, UnsupportedFormatsNameActualAndSupportedVersions) {
       FAIL() << "an unsupported log was accepted";
     } catch (const std::runtime_error& error) {
       const std::string what = error.what();
-      EXPECT_NE(what.find("unsupported format version " +
-                         std::to_string(version)),
-                std::string::npos)
+      EXPECT_NE(
+          what.find("unsupported format version " + std::to_string(version)),
+          std::string::npos)
           << what;
       EXPECT_NE(what.find("supported version 6"), std::string::npos) << what;
     }

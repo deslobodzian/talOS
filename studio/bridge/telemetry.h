@@ -90,10 +90,12 @@ inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
     for (const auto* info : *frame->dictionary()) {
       TelemetryChannelInfo channel;
       channel.name = info->name() != nullptr ? info->name()->str() : "";
-      if (!names.insert(info->name() != nullptr
-                            ? std::string_view(info->name()->c_str(),
-                                               info->name()->size())
-                            : std::string_view{}).second ||
+      if (!names
+               .insert(info->name() != nullptr
+                           ? std::string_view(info->name()->c_str(),
+                                              info->name()->size())
+                           : std::string_view{})
+               .second ||
           channel.name.starts_with("derived/")) {
         return false;
       }
@@ -131,7 +133,7 @@ inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
 
   state.sequence_id = frame->sequence_id();
   state.timestamp_ns = frame->timestamp_ns();
-  state.chassis = {chassis->x(),     chassis->y(),     chassis->z(),
+  state.chassis = {chassis->x(),    chassis->y(),     chassis->z(),
                    chassis->roll(), chassis->pitch(), chassis->yaw()};
   state.values.assign(frame->values()->begin(), frame->values()->end());
   state.received_wall_ns = wall_ns;

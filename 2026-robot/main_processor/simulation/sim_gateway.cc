@@ -12,8 +12,8 @@
 
 #include "geometry/geometry_descriptor.h"
 #include "geometry/geometry_generated.h"
-#include "sim/topics.h"
 #include "schedules.h"
+#include "sim/topics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/os/poller.h"

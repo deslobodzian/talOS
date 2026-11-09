@@ -383,11 +383,11 @@ static_assert(sizeof(ConfigAckPayload) == 73, "Update docs/DATA_FLOW.md");
 // also carry a two-byte length; the remaining sizes mirror SerializeConfig.
 inline constexpr std::size_t kMaxConfigTextBytes = 2 + 63;
 inline constexpr std::size_t kMaxSerializedConfigSize =
-    17 + 7 * 2 +
-    kMaxMotors * (275 + 2 * kMaxConfigTextBytes) +
+    17 + 7 * 2 + kMaxMotors * (275 + 2 * kMaxConfigTextBytes) +
     kMaxSensors * (16 + 2 * kMaxConfigTextBytes) +
     (kMaxDigitalInputs + kMaxDigitalOutputs + kMaxAnalogInputs +
-     kMaxPwmOutputs) * (6 + kMaxConfigTextBytes) +
+     kMaxPwmOutputs) *
+        (6 + kMaxConfigTextBytes) +
     kMaxEncoders * (27 + kMaxConfigTextBytes);
 static_assert(kMaxSerializedConfigSize == 10051,
               "Serialized config maximum changed; update docs/DATA_FLOW.md");
@@ -460,9 +460,8 @@ class ConfigAssembler {
       return Status::kInvalidChunk;
     }
 
-    if (hdr.total_bytes == 0 ||
-        hdr.total_bytes > kMaxSerializedConfigSize || hdr.chunk_count == 0 ||
-        hdr.chunk_count > kMaxConfigChunkCount ||
+    if (hdr.total_bytes == 0 || hdr.total_bytes > kMaxSerializedConfigSize ||
+        hdr.chunk_count == 0 || hdr.chunk_count > kMaxConfigChunkCount ||
         hdr.chunk_count > hdr.total_bytes ||
         hdr.chunk_index >= hdr.chunk_count) {
       error_reason = "invalid chunk index or count";
@@ -479,8 +478,7 @@ class ConfigAssembler {
         error_reason = "invalid final chunk size";
         return Status::kInvalidChunk;
       }
-      stride =
-          (hdr.total_bytes - hdr.chunk_bytes) / (hdr.chunk_count - 1);
+      stride = (hdr.total_bytes - hdr.chunk_bytes) / (hdr.chunk_count - 1);
     }
     const std::size_t offset = std::size_t{hdr.chunk_index} * stride;
     if (stride == 0 || stride > kMaxConfigChunkData ||
