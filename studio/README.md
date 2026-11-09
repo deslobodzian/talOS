@@ -96,8 +96,8 @@ transport and frame budgets.
 
 Every `tests/*.test.ts*` file runs under `pnpm test`, and under Bazel through
 the `STUDIO_TESTS` table in `BUILD.bazel` (add one line per new test file).
-Panels are tested with `createStaticStudio` and react-dom/server: an empty
-studio and one shaped like a real robot's dictionary, asserting what a person
-would read, plus unit tests for each panel's pure derivations. The data layer
+Panels are tested through their pure derivations, plus react-dom/server renders
+against `createStaticStudio` only where the rendered output carries a behaviour
+(staleness, unknown versus absent readings, parse errors). The data layer
 (store, events, discovery, robot status, manifest, hooks), the layout tree,
 the command palette and the registry have their own tests.

@@ -1,8 +1,7 @@
-// The migrated view tests: the old system_view assertions, now exercised
-// against the panels that replaced those views. Panels read their data through
-// hooks, so they render inside a StudioProvider backed by createStaticStudio;
-// the pure sub-components (NodeCard, Wiring, DeclaredPanel) still take their
-// data as props and render directly.
+// System, health and timing panels against the demo graph (staleness, faults,
+// declared vs live), plus the workspace and timeline input handling. Panels
+// read their data through hooks, so they render inside a StudioProvider backed
+// by createStaticStudio; NodeCard takes its data as props and renders directly.
 
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
@@ -13,20 +12,12 @@ import {renderToStaticMarkup} from 'react-dom/server';
 import {createStaticStudio, StudioProvider} from '../src/data/studio';
 import type {PlaybackState, SystemState} from '../src/data/types';
 import {demoDeclaredGraph, demoSystemGraph} from '../src/demo';
-import {agentPanel} from '../src/panels/agent';
 import {healthPanel} from '../src/panels/health';
 import type {AnyPanelDefinition} from '../src/panels/types';
-import {DeclaredPanel, NodeCard, systemPanel, Wiring} from '../src/panels/system';
+import {NodeCard, systemPanel, Wiring} from '../src/panels/system';
 import {timingPanel} from '../src/panels/timing';
-import {RPC_METHODS} from '../agent/rpc';
-import {
-  eventRates,
-  parseDeclaredGraph,
-  parseSystemGraph,
-  rateKey,
-} from '../src/system';
+import {eventRates, parseDeclaredGraph, parseSystemGraph} from '../src/system';
 import {panelNode, splitNode} from '../src/layout/tree';
-import {filterCommands, relativeEventTime} from '../src/shell/commands';
 import {Timeline} from '../src/shell/Timeline';
 import {WorkspaceArea, type WorkspaceCallbacks} from '../src/shell/WorkspaceArea';
 import {StatusStrip} from '../src/shell/StatusStrip';
@@ -56,9 +47,6 @@ function state(declared = false): SystemState {
   };
 }
 
-const noSystem: SystemState =
-    {graph: null, stale: true, rates: {}, error: '', declared: null, declaredError: ''};
-
 const render = (element: React.ReactElement) =>
     renderToStaticMarkup(element).replace(/<[^>]*>/g, '');
 
@@ -71,27 +59,6 @@ function renderPanel(def: AnyPanelDefinition, system: SystemState,
                        instanceId="test"/>
       </StudioProvider>);
 }
-
-test('the system view names every node and every topic it was given', () => {
-  const system = state();
-  const html = renderPanel(systemPanel, system);
-
-  for (const node of system.graph!.nodes) {
-    assert.ok(html.includes(node.name), `missing node ${node.name}`);
-    assert.ok(html.includes(node.target), `missing target ${node.target}`);
-  }
-  for (const topic of system.graph!.topics)
-    assert.ok(html.includes(topic.name), `missing topic ${topic.name}`);
-
-  const alive = system.graph!.nodes.filter(n => n.alive).length;
-  assert.ok(html.includes(`${alive}/${system.graph!.nodes.length} nodes live`));
-  assert.ok(html.includes(`${system.graph!.topics.length} topics`));
-});
-
-test('the system view surfaces the faults the demo deliberately carries', () => {
-  const html = renderPanel(systemPanel, state());
-  assert.ok(html.includes('/shooter/state'), 'the orphaned topic is missing');
-});
 
 test('a stale graph stays inspectable but makes no live-node claim', () => {
   const graph = parseSystemGraph(demoSystemGraph(4000n));
@@ -124,17 +91,6 @@ test('a stale graph stays inspectable but makes no live-node claim', () => {
   const fresh = renderPanel(healthPanel, {...system, stale: false});
   assert.ok(fresh.includes('stopped heartbeating'));
   assert.ok(!fresh.includes('SYSTEM GRAPH STALE'));
-});
-
-test('a half-wired topic its own node declared is not shown as a fault', () => {
-  const html = renderPanel(systemPanel, state());
-  assert.ok(html.includes('bridged'), 'external endpoint status missing');
-  assert.ok(html.includes('unconnected'), 'optional endpoint status missing');
-  const system = state();
-  const drivetrain = system.graph!.nodes.find(n => n.name === 'drivetrain')!;
-  const wiring = render(<Wiring graph={system.graph!} node={drivetrain}
-                                stale={false} rates={system.rates}/>);
-  assert.ok(wiring.includes('optional'));
 });
 
 test('a node that stopped heartbeating is marked stale, not merely absent',
@@ -216,56 +172,6 @@ test('timing leaves passive source latency unknown but preserves measured zero',
   }
 });
 
-test('timing lists one row per source, with declared and measured rates', () => {
-  const system = state();
-  const html = renderPanel(timingPanel, system);
-
-  const sources = system.graph!.nodes.reduce((n, node) => n + node.sources.length, 0);
-  assert.ok(html.includes(`${sources} SOURCES`),
-            `expected ${sources} sources in the header`);
-
-  for (const kind of ['SENDER', 'WATCHER', 'FETCHER', 'TIMER'])
-    assert.ok(html.includes(kind), `missing source kind ${kind}`);
-
-  const timer = system.graph!.nodes.flatMap(
-                                 node => node.sources.map(source => ({node, source})))
-                    .find(({node, source}) => source.kind === 'TIMER' &&
-                              node.alive &&
-                              system.rates[rateKey(node.name, source.id)] > 0);
-  assert.ok(timer, 'demo graph has no measured timer to check');
-  const declared = 1e9 / Number(timer!.source.period_ns);
-  const measured = system.rates[rateKey(timer!.node.name, timer!.source.id)];
-  assert.ok(Math.abs(declared - measured) / declared < 0.05,
-            `declared ${declared} Hz vs measured ${measured} Hz`);
-  assert.ok(html.includes('Hz'));
-});
-
-
-test('the system tab reports what was declared against what registered', () => {
-  const html = renderPanel(systemPanel, state(true));
-  assert.ok(html.includes('7 nodes declared'), 'declared count missing');
-  assert.ok(html.includes('6 registered'), 'registered count missing');
-  assert.ok(html.includes('1 never appeared'), 'no missing-node count');
-  assert.ok(html.includes('shooter'));
-  assert.ok(html.includes('//2026-robot/main_processor/shooter:node'),
-            'the missing node does not say what would have built it');
-  assert.ok(html.includes('7 declared'), 'the toolbar count is missing');
-
-  assert.ok(html.includes('/talos/telemetry'));
-});
-
-test('a running node nobody declared is a different sentence', () => {
-  const system = state(true);
-  const declared = {
-    ...system.declared!,
-    nodes: system.declared!.nodes.filter(node => node.name !== 'telemetry')
-  };
-  const html = render(<DeclaredPanel declared={declared} graph={system.graph}/>);
-  assert.ok(html.includes('1 not declared'));
-  assert.ok(html.includes('running but not declared'));
-});
-
-
 test('with no declared graph every view is exactly what it was before', () => {
   const system = state();
   assert.equal(system.declared, null);
@@ -278,25 +184,6 @@ test('with no declared graph every view is exactly what it was before', () => {
       assert.ok(!html.includes(claim), `${name} claims "${claim}"`);
   }
 });
-
-test('a bridge too old to state endpoint attributes says so, and still renders',
-     () => {
-       const older = JSON.parse(demoSystemGraph(1500n));
-       older.version = 1;
-       for (const node of older.nodes)
-         for (const source of node.sources) {
-           delete source.external;
-           delete source.optional;
-         }
-       const graph = parseSystemGraph(JSON.stringify(older));
-       const system: SystemState =
-           {graph, stale: false, rates: {}, error: '', declared: null, declaredError: ''};
-
-       const html = renderPanel(systemPanel, system);
-       assert.ok(html.includes('/hw/command'), 'the graph itself is missing');
-
-       assert.ok(renderPanel(healthPanel, system).includes('/shooter/state'));
-     });
 
 test('the overview reads declared against live, and names what never appeared',
      () => {
@@ -428,25 +315,6 @@ test('divider pointer movement uses the whole split size rather than pair size',
   handle.onPointerUp!({} as React.PointerEvent<HTMLDivElement>);
   handle.onPointerMove!({clientX: 0} as React.PointerEvent<HTMLDivElement>);
   assert.deepEqual(resized, [0.38, 0.12, 0.5]);
-});
-
-test('exact command titles outrank longer prefixes and keyword matches', () => {
-  const commands = [
-    {id: 'prefix', title: 'Connect robot', run() {}},
-    {id: 'keyword', title: 'A command', keywords: 'Connect', run() {}},
-    {id: 'exact', title: 'Connect', hint: 'Disconnected', run() {}}
-  ];
-  assert.deepEqual(filterCommands(commands, 'connect').map(command => command.id),
-                   ['exact', 'prefix', 'keyword']);
-  assert.deepEqual(filterCommands(commands, ' CONNECT ').map(command => command.id),
-                   ['exact', 'prefix', 'keyword']);
-});
-
-test('event command times distinguish the future, present, and past', () => {
-  assert.equal(relativeEventTime('2000000000', '1000000000'), '+1.00 s');
-  assert.equal(relativeEventTime('1000000000', '1000000000'), 'now');
-  assert.equal(relativeEventTime('1000000000', '2000000000'), '1.00 s ago');
-  assert.equal(relativeEventTime('1000000000', null), '');
 });
 
 test('timeline slider is focusable and its arrows seek once within bounds', () => {

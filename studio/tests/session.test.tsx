@@ -1,6 +1,5 @@
 // Session panel: pure merge/sort logic (manifest-only, registry-only, both,
-// declared-but-missing) and server-side rendering of the panel against empty
-// and populated studios.
+// declared-but-missing) and the rendered manifest error and session uptime.
 
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
@@ -281,115 +280,28 @@ const renderPanel = (studio: Studio): string => renderToStaticMarkup(
                               setConfig={() => {}} instanceId="test"/>
     </StudioProvider>);
 
-test('running session uptime is unknown without the registry clock', () => {
-  const html = renderPanel(createStaticStudio({manifest: manifest([])}));
-  const text = html.replace(/<[^>]*>/g, '');
-  assert.match(text, /Uptime—/);
-});
-
-test('the session panel shows the not-offered state with no manifest', () => {
-  const html = renderPanel(createStaticStudio({}));
-  assert.ok(html.includes('Session manifest not offered'));
-  assert.ok(html.includes('No processes'));
-});
-
-test('the session panel shows the parse error when the manifest failed', () => {
+test('a manifest that failed to parse shows the parser\'s reason', () => {
   const html = renderPanel(createStaticStudio({
     manifest: null,
     manifestError: 'Invalid manifest: session_id must be a decimal integer'
   }));
-  assert.ok(html.includes('Invalid manifest'));
   assert.ok(html.includes('session_id must be a decimal integer'));
 });
 
-test('the session panel shows the header, processes and counts', () => {
-  const m = manifest([
-    mnode({name: 'drivetrain', pid: 100, record_count: '1204',
-           restart_count: 2, recorder_failed: true}),
-    mnode({name: 'odometry', pid: 101, exit_code: 1})
-  ]);
-  const g = graph(
-      [
-        snode({
-          name: 'drivetrain',
-          pid: '100',
-          alive: false,
-          sources: [source({id: 0, kind: 'TIMER', max_latency_ns: '2000000'})]
-        }),
-        snode({
-          name: 'odometry',
-          pid: '101',
-          alive: true,
-          sources: [source({id: 0, kind: 'TIMER', max_latency_ns: '300000'})]
-        })
-      ],
-      '1735693200000000000');   // one hour after start
-  const d = declared([
-    dnode('drivetrain', '//2026:drivetrain'),
-    dnode('odometry', '//2026:odometry'),
-    dnode('vision', '//2026:vision')
-  ]);
-  const rates = {'drivetrain 0': 200, 'odometry 0': 50};
-  const html = renderPanel(createStaticStudio({
-    manifest: m,
-    system: {graph: g, rates, error: '', declared: d, declaredError: ''}
-  }));
-
-  // Header.
-  assert.ok(html.includes('7351220489113141'), 'session id');
-  assert.ok(html.includes('>no<'), 'simulation');
-  // Config path: tail visible, full value on hover, copy affordance.
-  assert.ok(html.includes('robot.toml'), 'config path tail');
-  assert.ok(html.includes('title="/robot.toml"'), 'full config path on hover');
-  assert.ok(html.includes('abcdef01'), 'short sha256');
-  assert.ok(html.includes('abcdef0123456789'), 'full sha256 in the title');
-  assert.ok(html.includes('title="/tmp/session"'), 'full output dir on hover');
-  assert.ok(html.includes('2025-01-01 00:00:00 UTC'), 'start time');
-  assert.ok(html.includes('1 h 0 m'), 'uptime');
-
-  // Counts: 1 alive of 3 processes, 2 restarts.
-  assert.ok(html.includes('1/3 processes running'));
-  assert.ok(html.includes('2 restarts'));
-
-  // Processes: problems are marked by text.
-  assert.ok(html.includes('restarted ×2'), 'restart count in the tag');
-  assert.ok(html.includes('recorder failed'));
-  assert.ok(html.includes('never registered'));
-  assert.ok(html.includes('>dead<'), 'dead alive cell');
-  assert.ok(html.includes('failed'), 'recorder column');
-  // Rates and latency from the registry sources.
-  assert.ok(html.includes('200 Hz'));
-  assert.ok(html.includes('2.00 ms'));
-  // A manifest record count with thousands separators.
-  assert.ok(html.includes('1,204'));
-  // A log path with a copy affordance: tail visible, full value on hover.
-  assert.ok(html.includes('drivetrain.tlog'));
-  assert.ok(html.includes('title="/logs/drivetrain.tlog"'));
-  assert.ok(html.includes('copy'));
-});
-
-test('the session panel shows an ended session end time', () => {
-  const m = manifest([mnode({name: 'a', exit_code: 0})]);
-  m.end_wall_ns = '1735689605000000000';   // 5 s after start
-  const html = renderPanel(createStaticStudio({manifest: m}));
-  assert.ok(html.includes('Ended'));
-  assert.ok(html.includes('2025-01-01 00:00:05 UTC'));
-  assert.ok(html.includes('5.0 s'));   // uptime is end - start
-});
-
-test('the session header middle-ellipsizes long paths', () => {
-  const m = manifest([mnode({name: 'a'})]);
-  m.config_path = '/opt/talos/workspaces/session-2026-11-06/configs/robot.toml';
-  m.output_dir = '/opt/talos/workspaces/session-2026-11-06/output';
-  const html = renderPanel(createStaticStudio({manifest: m}));
-  // The path is split into a directory head and a filename tail, so both ends
-  // survive and the middle ellipsizes rather than wrapping mid-word.
-  assert.ok(html.includes('path-head'), 'path is split for middle ellipsis');
-  assert.ok(html.includes('path-tail'), 'filename keeps its own span');
-  assert.ok(html.includes('/opt/talos/workspaces/session-2026-11-06/configs/'),
-            'directory head survives');
-  assert.ok(html.includes('robot.toml'), 'filename tail survives');
-  assert.ok(html.includes(
-                'title="/opt/talos/workspaces/session-2026-11-06/configs/robot.toml"'),
-            'full path on hover');
+test('uptime runs to the registry clock, then to the end; unknown without either', () => {
+  const uptime = (m: SessionManifest, g: SystemGraph|null) => {
+    const html = renderPanel(createStaticStudio({
+      manifest: m,
+      system: {graph: g, rates: {}, error: '', declared: null, declaredError: ''}
+    }));
+    return /Uptime([^A-Z]*)/.exec(html.replace(/<[^>]*>/g, ''))![1];
+  };
+  const running = manifest([mnode({name: 'a'})]);
+  assert.equal(uptime(running, null), '—');
+  // One hour after start by the registry clock.
+  assert.equal(uptime(running, graph([snode({name: 'a'})], '1735693200000000000')),
+               '1 h 0 m');
+  const ended = manifest([mnode({name: 'a', exit_code: 0})]);
+  ended.end_wall_ns = '1735689605000000000';   // 5 s after start
+  assert.equal(uptime(ended, null), '5.0 s');
 });

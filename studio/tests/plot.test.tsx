@@ -68,27 +68,18 @@ test('groupByUnit keeps first-seen order and sorts unitless last', () => {
       ]);
 });
 
-test('assignYAxes returns nothing for no channels', () => {
+test('assignYAxes puts one unit per side, enums left with their labels as ticks', () => {
   assert.deepEqual(assignYAxes([]), []);
-});
-
-test('assignYAxes puts a single numeric unit on the left axis', () => {
   assert.deepEqual(assignYAxes([pc('vx', 'm/s'), pc('vy', 'm/s')]), [
     {scale: 'y', side: 'left', label: 'm/s', units: ['m/s'], labels: null,
      channels: ['vx', 'vy']}
   ]);
-});
-
-test('assignYAxes splits two numeric units onto left and right axes', () => {
   assert.deepEqual(assignYAxes([pc('vx', 'm/s'), pc('yaw', 'rad')]), [
     {scale: 'y', side: 'left', label: 'm/s', units: ['m/s'], labels: null,
      channels: ['vx']},
     {scale: 'y2', side: 'right', label: 'rad', units: ['rad'], labels: null,
      channels: ['yaw']}
   ]);
-});
-
-test('assignYAxes gives enums the left axis with their labels as ticks', () => {
   assert.deepEqual(
       assignYAxes([pc('mode', '', ['idle', 'spin', 'feed']), pc('vx', 'm/s')]), [
         {scale: 'y', side: 'left', label: '', units: [''],

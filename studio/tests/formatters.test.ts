@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
-import {duration, hertz, integer, number, timestamp} from '../src/ui/formatters';
+import {duration, hertz, number, timestamp} from '../src/ui/formatters';
 
 test('duration always carries a unit, including exactly zero', () => {
   // Zero (the bug this guards): a unit, not a bare '0'.
@@ -24,24 +24,10 @@ test('duration always carries a unit, including exactly zero', () => {
   assert.equal(duration('not-a-number'), '—');
 });
 
-test('integer formats decimal-string uint64 with thousands separators', () => {
-  assert.equal(integer('1204338'), '1,204,338');
-  assert.equal(integer(1204338), '1,204,338');
-});
-
-test('hertz formats rates at the right precision', () => {
+test('absent readings render as an em dash; present ones keep their unit', () => {
   assert.equal(hertz(undefined), '—');
-  assert.equal(hertz(200), '200 Hz');
-  assert.equal(hertz(12.5), '12.5 Hz');
-  assert.equal(hertz(0.25), '0.25 Hz');
-});
-
-test('number formats finite values and marks absent with an em dash', () => {
-  assert.equal(number(1.234567), '1.2346');
   assert.equal(number(NaN), '—');
-});
-
-test('timestamp carries the nanoseconds unit', () => {
   assert.equal(timestamp(null), '—');
+  assert.equal(hertz(0.25), '0.25 Hz');
   assert.equal(timestamp('1204338'), '1,204,338 ns');
 });

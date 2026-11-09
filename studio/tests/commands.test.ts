@@ -49,17 +49,27 @@ test('filterCommands returns everything for an empty query, best first', () => {
 
   // No match yields none.
   assert.deepEqual(filterCommands(commands, 'zzz'), []);
+
+  // An exact title outranks a longer prefix and a keyword-only match, however
+  // the query is cased or padded.
+  const connect = [
+    {id: 'prefix', title: 'Connect robot', run() {}},
+    {id: 'keyword', title: 'A command', keywords: 'Connect', run() {}},
+    {id: 'exact', title: 'Connect', hint: 'Disconnected', run() {}}
+  ];
+  for (const query of ['connect', ' CONNECT '])
+    assert.deepEqual(filterCommands(connect, query).map(c => c.id),
+                     ['exact', 'prefix', 'keyword']);
 });
 
 // --- command builders ------------------------------------------------------
 
-
-test('relativeEventTime measures from the cursor', () => {
+test('relativeEventTime distinguishes the future, present and past', () => {
+  assert.equal(relativeEventTime('2000000000', '1000000000'), '+1.00 s');
+  assert.equal(relativeEventTime('1000000000', '1000000000'), 'now');
+  assert.equal(relativeEventTime('1000000000', '2000000000'), '1.00 s ago');
   assert.equal(relativeEventTime('0', null), '');
-  assert.equal(relativeEventTime('0', '0'), 'now');
-  assert.equal(relativeEventTime('0', '1000000'), '1.00 ms ago');
 });
-
 
 test('eventCommands sorts exact decimal timestamps numerically before limiting', () => {
   const times = ['9', '10', '9007199254740992', '9007199254740993'];

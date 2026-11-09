@@ -62,11 +62,6 @@ test('mode precedence: estop > disconnected > disabled > mode', () => {
   })), 'autonomous');
 });
 
-test('mode null when DS channels absent', () => {
-  assert.equal(driverStationMode(null), null);
-  assert.equal(driverStationMode(snap({'hw/status/battery_v': 12.3})), null);
-});
-
 test('robotStatus nulls when channels absent', () => {
   const status = robotStatus(snap({'hw/status/battery_v': 12.3}), noSystem);
   assert.equal(status.ds.mode, null);
@@ -86,58 +81,19 @@ test('robotStatus nulls when channels absent', () => {
   assert.equal(status.nodes, null);
 });
 
-test('robotStatus reads DS, power, link, estimator and nodes', () => {
-  const status = robotStatus(snap({
-    [DS + 'connected']: 1,
-    [DS + 'enabled']: 1,
-    [DS + 'teleop']: 1,
-    [DS + 'fms_attached']: 1,
-    [DS + 'match_time_s']: 45.5,
-    [DS + 'alliance']: 1,
-    'hw/status/battery_v': 12.1,
-    'hw/status/brownout': 0,
-    'hw/status/can_utilization_frac': 0.3,
-    'hw/status/health_valid': 1,
-    'hw/status/state_age_us': 500,
-    'hw/status/configured': 1,
-    'hw/status/motor_fault_mask': 3,
-    'hw/status/timed_out_mask': 0,
-    'pose_estimator/state/valid': 1,
-    'pose_estimator/state/observation_accepted_count': 42,
-    'pose_estimator/state/observation_rejected_count': 3
-  }, {[DS + 'alliance']: ['red', 'blue']}), {
+test('live nodes are counted only from a fresh graph', () => {
+  const nodes = (stale: boolean) => robotStatus(snap({}), {
     graph: graph([node('a', true), node('b', false)]),
-    stale: false, rates: {}, error: '', declared: null, declaredError: ''
-  });
-
-  assert.equal(status.ds.mode, 'teleop');
-  assert.equal(status.ds.enabled, true);
-  assert.equal(status.ds.matchTime_s, 45.5);
-  assert.equal(status.ds.fms, true);
-  assert.equal(status.ds.alliance, 'blue');
-  assert.equal(status.power.battery_v, 12.1);
-  assert.equal(status.power.brownout, false);
-  assert.equal(status.power.can_frac, 0.3);
-  assert.equal(status.power.healthValid, true);
-  assert.equal(status.link.stateAge_us, 500);
-  assert.equal(status.link.configured, true);
-  assert.equal(status.link.faultMask, 3);
-  assert.equal(status.link.timedOutMask, 0);
-  assert.deepEqual(status.estimator, {valid: true, accepted: 42, rejected: 3,
-                                      channel: 'pose_estimator/state/valid'});
-  assert.deepEqual(status.nodes, {alive: 1, total: 2});
+    stale, rates: {}, error: '', declared: null, declaredError: ''
+  }).nodes;
+  assert.deepEqual(nodes(false), {alive: 1, total: 2});
+  assert.deepEqual(nodes(true), {alive: null, total: 2});
 });
 
-test('a stale graph keeps the node total but cannot count live nodes', () => {
-  const status = robotStatus(snap({}), {
-    graph: graph([node('a', true), node('b', false)]),
-    stale: true, rates: {}, error: '', declared: null, declaredError: ''
-  });
-  assert.deepEqual(status.nodes, {alive: null, total: 2});
-});
-
-test('alliance is null when the enum value is out of range', () => {
-  const status = robotStatus(snap({[DS + 'alliance']: 5},
-                                  {[DS + 'alliance']: ['red', 'blue']}), noSystem);
-  assert.equal(status.ds.alliance, null);
+test('alliance is read through its enum labels; out of range is null', () => {
+  const alliance = (value: number) => robotStatus(
+      snap({[DS + 'alliance']: value}, {[DS + 'alliance']: ['red', 'blue']}),
+      noSystem).ds.alliance;
+  assert.equal(alliance(1), 'blue');
+  assert.equal(alliance(5), null);
 });

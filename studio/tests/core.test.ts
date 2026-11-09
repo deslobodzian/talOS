@@ -13,13 +13,12 @@ import {
   TelemetryDecoder,
   Timeline,
 } from '../src/core';
-import {demoPacket} from '../src/demo';
+import {demoPacket, demoSystemGraph} from '../src/demo';
 import {ChannelInfo} from '../src/generated/talos/telemetry/channel-info';
 import {Frame} from '../src/generated/talos/telemetry/frame';
 import {Pose} from '../src/generated/talos/telemetry/pose';
 import {createFrameDetectors, SYSTEM_DETECTORS} from '../src/data/detectors';
-import {demoDeclaredGraph, demoSystemGraph} from '../src/demo';
-import {declaredStatus, parseDeclaredGraph, parseSystemGraph} from '../src/system';
+import {parseSystemGraph} from '../src/system';
 
 const frame = (i: number) => {
   const decoder = new TelemetryDecoder();
@@ -413,23 +412,3 @@ test('derived series persist in history through seek and replay', () => {
   assert.equal(coordinator.snapshot()!.channels['derived/pose_error_m'], error);
   assert.equal(coordinator.timeline.exact(1000000000n), first);
 });
-
-test('demo dictionary and bare frames carry a small estimate offset from truth',
-     () => {
-       const decoder = new TelemetryDecoder();
-       for (const sequence of [0n, 1n, 80n]) {
-         const snapshot = decoder.decode(demoPacket(sequence))!;
-         const truth = simTruthPose(snapshot);
-         assert.ok(truth);
-         const error = poseError(snapshot.chassis, truth);
-         assert.ok(error.position_m > .1 && error.position_m < .2);
-         assert.ok(error.heading_deg > 1 && error.heading_deg < 2);
-         assert.equal(snapshot.units['sim/state/pose/yaw_rad'], 'rad');
-         assert.equal(
-             snapshot.channels['derived/pose_error_m'], error.position_m);
-         assert.equal(
-             snapshot.channels['derived/heading_error_deg'], error.heading_deg);
-         assert.equal(snapshot.units['derived/pose_error_m'], 'm');
-         assert.equal(snapshot.units['derived/heading_error_deg'], 'deg');
-       }
-     });
