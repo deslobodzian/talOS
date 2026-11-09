@@ -211,10 +211,20 @@ registration order, so an extra source shifts the id of everything registered
 after it and invalidates existing logs outright. Observability must not change
 the program being observed.
 
-So the reporter reads and never registers. It waits for `loop.running()`, which
-is safe to wait on: the loop allocates its counters array and then stores
-`running_`, and that store synchronizes with the reporter's load, so a visible
-`true` means both the frozen manifest and the counters exist. It then publishes
+The reporter claims its slot synchronously before user construction, setting
+`kFlagConstructing` in the existing atomic flags field (no layout change).
+`SlotState::ACTIVE` means the slot is owned; the lifecycle flag distinguishes
+construction from dispatching. A bookkeeping thread heartbeats identity only.
+`RegistryReader` includes these rows with `alive = false`, so Studio can show
+initialization without treating it as an active node.
+
+After construction, `Reporter::start(loop, ...)` waits for `loop.running()`
+while continuing identity heartbeats. The loop allocates its counters array
+before storing `running_`, synchronizing the reporter's load. The reporter
+publishes endpoints and clears the constructing flag only when the manifest
+and counters exist. The launcher bounds this entire phase to 30 seconds from
+spawn, even if heartbeats keep arriving; see its supervision documentation.
+It then publishes
 the manifest once and samples the counters every 250 ms, well inside the
 liveness timeout. It sleeps in short slices rather than one long one so that a
 node which exits leaves the viewer promptly, and takes a final sample on the way

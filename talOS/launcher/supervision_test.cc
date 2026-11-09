@@ -12,17 +12,20 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
+#include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/launcher/launcher.h"
 
 namespace talos::launcher {
@@ -160,6 +163,89 @@ std::string ManifestEntry(const std::string& manifest, std::string_view name) {
       manifest.find("\"name\": \"" + std::string{name} + "\"");
   if (start == std::string::npos) return {};
   return manifest.substr(start, manifest.find('}', start) - start);
+}
+
+LauncherOptions ConstructionOptions(std::string_view tag, int delay_ms) {
+  auto options = BaseOptions(tag, "max_restarts = 0\n");
+  auto config = toml::parse_file(options.config_path);
+  config["subsystems"]["alpha"].as_table()->insert_or_assign("construction_ms",
+                                                             delay_ms);
+  std::ofstream{options.config_path} << config;
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error)};
+  if (!runfiles) throw std::runtime_error(error);
+  options.binary_overrides["//example/alpha:node"] =
+      runfiles->Rlocation(std::getenv("TALOS_CONSTRUCTION_NODE"));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub(std::string{tag} + "_beta", "exit 0\n");
+  return options;
+}
+
+TEST(Supervision, SlowConstructorIsObservableAndBecomesActiveAfterOldGrace) {
+  auto options = ConstructionOptions("slow_construction", 6000);
+  options.duration_s = 9;
+  std::atomic<bool> constructing{false};
+  std::atomic<bool> active{false};
+  std::jthread observer{[&](std::stop_token stop) {
+    while (!stop.stop_requested()) {
+      try {
+        introspect::RegistryReader reader;
+        for (const auto& node : reader.nodes()) {
+          if (node.session_id != options.session_id || node.name != "alpha")
+            continue;
+          if ((node.flags & introspect::kFlagConstructing) != 0) {
+            constructing = true;
+            EXPECT_FALSE(node.alive);
+          } else if (node.alive && node.dispatch_count != 0) {
+            active = true;
+          }
+        }
+      } catch (const std::runtime_error&) {
+        // The child creates the registry on its first start.
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+  }};
+  EXPECT_EQ(RunSession(options), 0);
+  observer.request_stop();
+  observer.join();
+  EXPECT_TRUE(constructing);
+  EXPECT_TRUE(active);
+  const auto entry =
+      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
+  EXPECT_NE(entry.find("\"restart_count\": 0"), std::string::npos) << entry;
+  std::filesystem::remove_all(options.output_dir);
+}
+
+TEST(Supervision, HeartbeatingConstructorStillHasAFiniteDeadline) {
+  auto options = ConstructionOptions("hung_construction", 60000);
+  options.duration_s = 35;
+  const auto started = std::chrono::steady_clock::now();
+  ::testing::internal::CaptureStderr();
+  EXPECT_NE(RunSession(options), 0);
+  const auto errors = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(errors.find("construction deadline exceeded"), std::string::npos)
+      << errors;
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  EXPECT_GE(elapsed, introspect::kConstructionTimeout);
+  EXPECT_LT(elapsed, 35s);
+  std::filesystem::remove_all(options.output_dir);
+}
+
+TEST(Supervision, ConstructorFailureExitsNonzeroAndIsReported) {
+  auto options = ConstructionOptions("failed_construction", -1);
+  options.duration_s = 3;
+  ::testing::internal::CaptureStderr();
+  EXPECT_NE(RunSession(options), 0);
+  const auto entry =
+      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
+  EXPECT_NE(entry.find("\"exit_code\": 1"), std::string::npos) << entry;
+  EXPECT_NE(::testing::internal::GetCapturedStderr().find(
+                "construction fixture failure"),
+            std::string::npos);
+  std::filesystem::remove_all(options.output_dir);
 }
 
 TEST(Supervision,

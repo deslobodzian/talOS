@@ -1144,20 +1144,18 @@ int RunMain(int argc, char** argv, const char* node_name,
     log_options.max_bytes = flags.log_max_bytes;
     event::RealtimeEventLoop<event::log::LogWriter> loop{event::log::LogWriter{
         flags.log_path, node_name, log_options, flags.session_id}};
-    const Hosted hosted = Host(loop, node_name, flags, make);
-    process::InstallStopHandlers();
-    // Publishes this node's topics and activity into the live registry, so
-    // Studio and any agent can see what is running without being told.
-    // Declared after the loop and the node: reverse destruction order joins
-    // its thread before the counters it samples are destroyed.
-    introspect::Reporter reporter{loop,
-                                  {.name = node_name,
+    // Keep the hosted node alive until the reporting thread has joined, while
+    // publishing identity before any user constructor or backend
+    // initialization.
+    std::optional<Hosted> hosted;
+    introspect::Reporter reporter{{.name = node_name,
                                    .target = node_target,
                                    .session_id = flags.session_id,
-                                   .simulation = flags.simulation,
-                                   .extra = ByteTopicSources(*hosted.node),
-                                   .endpoints = Endpoints(*hosted.node),
-                                   .selections = Selections(*hosted.node)}};
+                                   .simulation = flags.simulation}};
+    hosted.emplace(Host(loop, node_name, flags, make));
+    process::InstallStopHandlers();
+    reporter.start(loop, ByteTopicSources(*hosted->node),
+                   Endpoints(*hosted->node), Selections(*hosted->node));
 
     std::jthread stopper{[&](const std::stop_token& stop) {
       while (!stop.stop_requested()) {
@@ -1172,7 +1170,7 @@ int RunMain(int argc, char** argv, const char* node_name,
     // bookkeeping and must not inherit the loop's realtime policy.
     if (!flags.simulation) {
       process::ConfigureRealtime(
-          {.period = hosted.node->period(), .priority = 50});
+          {.period = hosted->node->period(), .priority = 50});
     }
     if (flags.duration_s) {
       loop.run_for(std::chrono::seconds{flags.duration_s});

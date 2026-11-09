@@ -1823,6 +1823,7 @@ class Launcher {
         if (!stopping && !launch.heartbeat_killed &&
             !(studio && i == studio->index()) && proc.name != kSimGatewayName) {
           bool found = false;
+          bool constructing = false;
           if (registry) {
             for (const auto& record : registry->header()->nodes) {
               if (record.state.load(std::memory_order_acquire) !=
@@ -1837,14 +1838,16 @@ class Launcher {
                   record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
               const auto dispatch =
                   record.dispatch_count.load(std::memory_order_relaxed);
+              const auto flags = record.flags.load(std::memory_order_acquire);
               if (record.generation.load(std::memory_order_acquire) !=
                       generation ||
                   record.state.load(std::memory_order_acquire) !=
                       static_cast<uint64_t>(introspect::SlotState::ACTIVE))
                 continue;
               found = true;
+              constructing = (flags & introspect::kFlagConstructing) != 0;
               if (beat != launch.last_heartbeat &&
-                  dispatch != launch.last_dispatch) {
+                  (constructing || dispatch != launch.last_dispatch)) {
                 launch.heartbeat_changed_at = now;
                 launch.last_heartbeat = beat;
                 launch.last_dispatch = dispatch;
@@ -1857,11 +1860,17 @@ class Launcher {
               std::chrono::milliseconds{options_.heartbeat_startup_grace_ms};
           // Registration is part of startup, not an opt-in to supervision:
           // until a row arrives, the spawn time is the last progress time.
-          if (grace_over &&
-              now - launch.heartbeat_changed_at >= launch.heartbeat_timeout) {
+          const bool construction_expired =
+              constructing &&
+              now - launch.started_at >= introspect::kConstructionTimeout;
+          if (construction_expired ||
+              (grace_over &&
+               now - launch.heartbeat_changed_at >= launch.heartbeat_timeout)) {
             std::cerr << "[launcher] " << proc.name
-                      << (found ? " heartbeat/dispatch stalled"
-                                : " heartbeat missing")
+                      << (construction_expired
+                              ? " construction deadline exceeded"
+                          : found ? " heartbeat/dispatch stalled"
+                                  : " heartbeat missing")
                       << "; killing pid " << proc.pid << "\n";
             SignalProcessGroup(proc.pid, SIGKILL);
             launch.heartbeat_killed = true;

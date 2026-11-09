@@ -263,11 +263,23 @@ Heartbeat supervision reads the introspection registry without modifying it.
 Registry heartbeats and stale-slot checks use host monotonic time, unaffected
 by NTP or manual wall-clock corrections.
 `--heartbeat-periods N` defaults to 10 periods, with a minimum timeout of
-500 ms. `--heartbeat-startup-grace-ms MS` defaults to 5000 ms to allow node
-initialization. Stalled nodes, including nodes that never publish a registry row,
-are killed and enter the same restart policy once both the startup grace and
-heartbeat timeout have elapsed. Registration is required even when
+500 ms. `--heartbeat-startup-grace-ms MS` defaults to 5000 ms for processes
+that have not registered. Such processes are killed once both that grace and
+the heartbeat timeout have elapsed; registration is required even when
 `--allow-graph-errors` permits a failed description.
+
+Live nodes publish their pid, name and session before calling user constructors,
+with the registry's `kFlagConstructing` lifecycle flag. A bookkeeping thread
+heartbeats this row without touching the partially constructed node. Studio
+readers see it as not yet active, with no endpoints. Construction (including
+waiting for the event loop to start) has a fixed **30-second deadline from
+process spawn**, independent of the startup grace: continued heartbeats cannot
+extend it. Missing construction heartbeats still trigger the normal stall
+timeout after the grace. Once the loop runs, the reporter publishes endpoints,
+clears the flag, and supervision requires both heartbeat and dispatch progress.
+Exceptions during construction are printed to stderr and exit nonzero.
+Construction timeouts and failures enter the ordinary restart/quarantine policy;
+an initializing non-critical camera does not delay control peers.
 `--restart-window-ms MS` overrides the default 60000 ms rolling budget window.
 
 Every spawned child has its own process group; restart, stop and shutdown

@@ -120,6 +120,10 @@ enum class SlotState : std::uint64_t {
 // Bit flags describing how a node is running.
 inline constexpr std::uint32_t kFlagSimulation = 1u << 0;
 inline constexpr std::uint32_t kFlagReplay = 1u << 1;
+// Lifecycle flag: identity is visible, but construction/topology is incomplete.
+// SlotState::ACTIVE means the slot is owned, not that the node is dispatching.
+inline constexpr std::uint32_t kFlagConstructing = 1u << 2;
+inline constexpr std::chrono::seconds kConstructionTimeout{30};
 
 // One event source, as the owning node registered it. The descriptive fields
 // are written once, before the slot goes ACTIVE; the counters keep moving.
@@ -629,6 +633,12 @@ class NodeRegistration {
                                               std::memory_order_relaxed);
   }
 
+  void activate() {
+    if (owns_slot()) {
+      record_->flags.fetch_and(~kFlagConstructing, std::memory_order_release);
+    }
+  }
+
   const std::string& name() const { return identity_.name; }
   std::size_t slot() const {
     return static_cast<std::size_t>(record_ - mapping_.header()->nodes);
@@ -970,7 +980,8 @@ class RegistryReader {
           continue;
         }
         node->generation = generation;
-        node->alive = now - node->heartbeat_monotonic_ns < timeout;
+        node->alive = now - node->heartbeat_monotonic_ns < timeout &&
+                      (node->flags & kFlagConstructing) == 0;
         out.push_back(std::move(*node));
         break;
       }

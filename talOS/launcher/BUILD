@@ -70,14 +70,24 @@ cc_test(
     ],
 )
 
+talos_cc_node(
+    name = "alpha",
+    srcs = ["testdata/construction_node.cc"],
+    node_name = "alpha",
+    visibility = ["//visibility:private"],
+)
+
 cc_test(
     name = "supervision_test",
-    size = "small",
+    size = "medium",
     srcs = ["supervision_test.cc"],
+    data = [":alpha"],
+    env = {"TALOS_CONSTRUCTION_NODE": "$(rlocationpath :alpha)"},
     deps = [
         ":launcher_lib",
         "//talOS/introspection:registry",
         "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
 )
 

@@ -640,7 +640,6 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
   std::atomic<std::int32_t> selected{1};
 
   Reporter reporter{
-      loop,
       {.name = "probe",
        .target = "//talOS/introspection:registry_test",
        .session_id = 42,
@@ -658,6 +657,24 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
                        .selected = [&selected] { return selected.load(); }}},
        .period = 20ms,
        .registry_path = path_}};
+  {
+    RegistryReader reader{path_};
+    const auto nodes = reader.nodes();
+    ASSERT_EQ(nodes.size(), 1u);
+    EXPECT_TRUE(nodes.front().flags & kFlagConstructing);
+    EXPECT_FALSE(nodes.front().alive);
+    EXPECT_EQ(nodes.front().pid, static_cast<std::uint64_t>(::getpid()));
+    EXPECT_EQ(nodes.front().session_id, 42u);
+    EXPECT_TRUE(nodes.front().sources.empty());
+    const auto first_beat = nodes.front().heartbeat_monotonic_ns;
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (reader.nodes().front().heartbeat_monotonic_ns == first_beat &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(2ms);
+    }
+    EXPECT_GT(reader.nodes().front().heartbeat_monotonic_ns, first_beat);
+  }
+  reporter.start(loop);
 
   // Read the registry while the loop still runs: once it stops, the reporter
   // releases the row, and a loaded host may get there before the test reads.

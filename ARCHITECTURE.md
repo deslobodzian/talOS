@@ -67,6 +67,14 @@ Beside the stack:
 | `talOS/vision` | camera/frame/backend contracts, calibration, localization and pipeline; AprilTag 3.4.5 CPU detection, macOS Metal preprocessing/CCL, AVFoundation/V4L2 capture, field simulation and fixtures; OpenCV 4.12 image conversion/IO |
 | `talOS/python/requirements.txt` | Python `robotpy-wpimath` pose estimation and GTSAM factor graphs; `wpilib_lockstep_test` aligns GradleRIO with the RobotPy wheels, not C++ dependencies |
 
+Live node identity is registered before user construction, with the
+`kFlagConstructing` lifecycle flag and independent bookkeeping heartbeats.
+Endpoints and active-reader liveness appear only after the event loop starts.
+The launcher enforces a fixed 30-second construction deadline from spawn;
+processes with no registry row retain the ordinary 5-second startup grace.
+Neither initializing nor failed optional nodes block control peers.
+
+
 ## The tick
 
 A node's `update()` runs every `period_us` (the subsystem's, else `[robot]`).

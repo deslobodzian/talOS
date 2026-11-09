@@ -112,16 +112,59 @@ class Reporter {
     std::string registry_path{kRegistryPath};
   };
 
+  explicit Reporter(Options options) : options_{std::move(options)} {
+    try {
+      registration_.emplace(
+          NodeRegistration::Identity{
+              .name = options_.name,
+              .target = options_.target,
+              .session_id = options_.session_id,
+              .flags = static_cast<std::uint32_t>(
+                  kFlagConstructing |
+                  (options_.simulation ? kFlagSimulation : 0u) |
+                  (options_.replay ? kFlagReplay : 0u))},
+          options_.registry_path);
+    } catch (const std::exception& e) {
+      error_ = e.what();
+      std::fprintf(stderr, "%s: node registry unavailable: %s\n",
+                   options_.name.c_str(), e.what());
+    }
+    thread_ = std::jthread{[this](std::stop_token stop) {
+      while (!stop.stop_requested()) {
+        if (registration_) registration_->heartbeat();
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+      }
+    }};
+  }
+
   template <typename Loop>
-  Reporter(Loop& loop, Options options) : options_{std::move(options)} {
-    // Captured by pointer rather than reference so the lambda stays copyable
-    // and the intent -- this thread outlives no part of the loop -- stays
-    // visible at the call site.
+  Reporter(Loop& loop, Options options) : Reporter(std::move(options)) {
+    start(loop);
+  }
+
+  // Call after construction, before running the loop. The owner must keep the
+  // loop and every sampled node alive until this Reporter has been destroyed.
+  template <typename Loop>
+  void start(Loop& loop, std::vector<ExtraSource> extra,
+             std::vector<EndpointAttribute> endpoints,
+             std::vector<Selection> selections) {
+    stop();
+    options_.extra = std::move(extra);
+    options_.endpoints = std::move(endpoints);
+    options_.selections = std::move(selections);
+    start(loop);
+  }
+
+  template <typename Loop>
+  void start(Loop& loop) {
+    stop();
     thread_ =
         std::jthread{[this, &loop](std::stop_token stop) { run(loop, stop); }};
   }
 
-  ~Reporter() {
+  ~Reporter() { stop(); }
+
+  void stop() {
     thread_.request_stop();
     if (thread_.joinable()) {
       thread_.join();
@@ -145,29 +188,14 @@ class Reporter {
     // manifest is frozen and the counters exist.
     while (!stop.stop_requested() && !loop.running()) {
       std::this_thread::sleep_for(std::chrono::milliseconds{2});
+      if (registration_) registration_->heartbeat();
     }
     if (stop.stop_requested()) {
       return;
     }
 
-    std::optional<NodeRegistration> registration;
-    try {
-      registration.emplace(
-          NodeRegistration::Identity{
-              .name = options_.name,
-              .target = options_.target,
-              .session_id = options_.session_id,
-              .flags = static_cast<std::uint32_t>(
-                  (options_.simulation ? kFlagSimulation : 0u) |
-                  (options_.replay ? kFlagReplay : 0u)),
-          },
-          options_.registry_path);
-    } catch (const std::exception& e) {
-      error_ = e.what();
-      std::fprintf(stderr, "%s: node registry unavailable: %s\n",
-                   options_.name.c_str(), e.what());
-      return;
-    }
+    if (!registration_) return;
+    auto& registration = registration_;
 
     // The loop's own sources first, keeping their ids, then anything the node
     // owns outside the loop.
@@ -194,6 +222,7 @@ class Reporter {
 
     registration->publish(manifest, endpoints);
     registration->publish_selections(options_.selections);
+    registration->activate();
     published_.store(true, std::memory_order_release);
 
     while (!stop.stop_requested() && loop.running()) {
@@ -258,6 +287,7 @@ class Reporter {
   std::size_t loop_sources_{0};
   std::atomic<bool> published_{false};
   std::string error_;
+  std::optional<NodeRegistration> registration_;
   std::jthread thread_;
 };
 
