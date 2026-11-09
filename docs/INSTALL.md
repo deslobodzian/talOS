@@ -127,7 +127,11 @@ running the color-conversion probe with four OpenCV workers reproduced a
 `cv::ThreadPool::run` read versus worker write through the production backend's
 `cvtColor(BGR2GRAY)` call. The dependency patch makes that flag atomic and removes
 upstream's Clang-only `thread_body` instrumentation suppression. TSan no longer
-forces `OPENCV_FOR_THREADS_NUM=1`; the probe explicitly selects four workers.
+forces `OPENCV_FOR_THREADS_NUM=1`; the probe explicitly requests four workers
+and requires that exact pool size on the Linux pthread backend. Apple's GCD
+backend ignores the requested size and reports its CPU-count pool limit, so
+the probe checks that backend contract instead. Both exercise the same repeated
+production-backend color conversions; only pthread runs qualify the flag patch.
 Linux V4L2 capture supplies GREY or YUYV (not JPEG/BGR); GREY bypasses OpenCV,
 and YUYV-to-gray uses `extractChannel` rather than the color parallel dispatcher.
 BGR/BGRA/RGB backend inputs and synthetic-image processing can reach OpenCV's
