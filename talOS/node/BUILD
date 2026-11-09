@@ -104,6 +104,7 @@ cc_test(
         ":testing",
         "//talOS/configuration",
         "//talOS/events",
+        "//talOS/events:events_log",
         "//talOS/introspection:describe",
         "//talOS/memory:shared_memory",
         "//talOS/rtms",

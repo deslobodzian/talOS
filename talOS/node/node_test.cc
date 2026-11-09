@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -25,6 +26,7 @@
 #include "node_test/node_test_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/events/log/log_reader.h"
 #include "talOS/events/realtime_event_loop.h"
 #include "talOS/events/simulated_event_loop.h"
 #include "talOS/introspection/describe.h"
@@ -932,6 +934,36 @@ TEST(Binary, LoggedSimRunReplaysOfflineWithoutDivergence) {
   const Result run =
       RunBinary("--sim --duration-s 1 --log '" + log + "' " + ConfigFlag());
   ASSERT_EQ(run.status, 0) << run.output;
+  // --sim disables realtime policy, not the realtime scheduler. Extra timer
+  // callbacks can precede the second update (e.g. after a delayed wakeup).
+  // Derive the first changed SEND from this run's bytes, not a dispatch
+  // ordinal.
+  event::log::LogReader reader{log};
+  event::log::LogReader::Record record;
+  std::optional<std::uint64_t> first_changed_dispatch;
+  std::int64_t tick = 0;
+  while (reader.next(record)) {
+    if (static_cast<event::EventKind>(record.header.kind) !=
+            event::EventKind::SEND ||
+        reader.manifest().at(record.header.source_id).name !=
+            "/test_node/state")
+      continue;
+    ASSERT_EQ(record.payload.size(), sizeof(Count));
+    Count original;
+    std::memcpy(&original, record.payload.data(), sizeof original);
+    // Counter sends tick * step + beats + input. Only step changes, by one;
+    // update() increments tick once per call, even when timer cycles coalesce.
+    const Count changed_count{original.tick_count() + tick,
+                              original.stamp_ns()};
+    const auto changed_bytes = std::as_bytes(std::span{&changed_count, 1});
+    if (!std::equal(record.payload.begin(), record.payload.end(),
+                    changed_bytes.begin())) {
+      first_changed_dispatch = record.header.dispatch_index;
+      break;
+    }
+    ++tick;
+  }
+  ASSERT_TRUE(first_changed_dispatch.has_value());
   {
     RTMSQueue sentinel{
         "/test_node/frames",
@@ -963,10 +995,11 @@ TEST(Binary, LoggedSimRunReplaysOfflineWithoutDivergence) {
   const Result diverged =
       RunBinary("--replay '" + log + "' --config '" + changed + "'");
   EXPECT_NE(diverged.status, 0) << diverged.output;
-  EXPECT_NE(
-      diverged.output.find("replay diverged at dispatch 2: sent "
-                           "different bytes on source '/test_node/state'"),
-      std::string::npos)
+  EXPECT_NE(diverged.output.find(
+                "replay diverged at dispatch " +
+                std::to_string(*first_changed_dispatch) +
+                ": sent different bytes on source '/test_node/state'"),
+            std::string::npos)
       << diverged.output;
   // Only the --sim run wrote the node's byte topic to shared memory.
   ::shm_unlink(ShmObjectName("/test_node/frames").c_str());
