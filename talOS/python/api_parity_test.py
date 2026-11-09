@@ -1,4 +1,4 @@
-"""Compare the C ABI declarations with the ctypes signature tables, without loading it."""
+"""Compare exported C ABI names, argument counts and version without loading it."""
 
 import ast
 import os
@@ -10,7 +10,7 @@ from python.runfiles import runfiles
 
 
 class ApiParityTest(unittest.TestCase):
-    def test_exported_signatures(self):
+    def test_exported_names_argument_counts_and_version(self):
         files = runfiles.Create()
         header = Path(files.Rlocation(os.environ["TALOS_ABI_HEADER"])).read_text()
         source = Path(files.Rlocation(os.environ["TALOS_ABI_PYTHON"])).read_text()

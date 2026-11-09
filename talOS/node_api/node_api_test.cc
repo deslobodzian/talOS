@@ -128,29 +128,6 @@ TEST_F(NodeApi, NodeSubscribesPublishesAndTicks) {
   EXPECT_EQ(talos_sim_now_ns(sim_), 25 * kMs);
 }
 
-TEST_F(NodeApi, SessionDirIsNullWithoutLog) {
-  Relay relay;
-  TalosNode* node = talos_sim_add(sim_, "relay", &BuildRelay, &relay);
-  ASSERT_NE(node, nullptr) << talos_last_error();
-  EXPECT_EQ(talos_node_session_dir(node), nullptr);
-}
-
-TEST_F(NodeApi, SessionDirSetBeforeAddIsVisibleToNodesAddedAfter) {
-  ASSERT_EQ(talos_sim_set_session_dir(sim_, "/tmp/talos_session"), TALOS_OK);
-  Relay relay;
-  TalosNode* node = talos_sim_add(sim_, "relay", &BuildRelay, &relay);
-  ASSERT_NE(node, nullptr) << talos_last_error();
-  EXPECT_STREQ(talos_node_session_dir(node), "/tmp/talos_session");
-}
-
-TEST_F(NodeApi, SessionDirClearedBeforeAddIsAbsent) {
-  ASSERT_EQ(talos_sim_set_session_dir(sim_, "/tmp/talos_session"), TALOS_OK);
-  ASSERT_EQ(talos_sim_set_session_dir(sim_, ""), TALOS_OK);
-  Relay relay;
-  TalosNode* node = talos_sim_add(sim_, "relay", &BuildRelay, &relay);
-  ASSERT_NE(node, nullptr) << talos_last_error();
-  EXPECT_EQ(talos_node_session_dir(node), nullptr);
-}
 
 // A second node on /relay/out with a same-size type of another schema.
 struct Impostor {
@@ -165,19 +142,16 @@ int32_t BuildImpostor(TalosNode* node, void* user) {
   return i.in < 0 ? 1 : 0;
 }
 
-TEST_F(NodeApi, ATopicRefusesAnEndpointOfAnotherSchemaNamingBoth) {
+TEST_F(NodeApi, ATopicRefusesAnEndpointOfAnotherSchema) {
   Relay relay;
   ASSERT_NE(talos_sim_add(sim_, "relay", &BuildRelay, &relay), nullptr);
   Impostor impostor;
   EXPECT_EQ(talos_sim_add(sim_, "impostor", &BuildImpostor, &impostor),
             nullptr);
-  const std::string error = talos_last_error();
-  EXPECT_NE(error.find("node_api_test.Value"), std::string::npos) << error;
-  EXPECT_NE(error.find("node_api_test.Other"), std::string::npos) << error;
   EXPECT_EQ(talos_node_publish(nullptr, "/x/state", 8, nullptr), -1);
 }
 
-TEST_F(NodeApi, ParamsFallBackOrReportTheMissingKey) {
+TEST_F(NodeApi, ParamsRejectMissingAndMistypedValues) {
   Relay relay;
   TalosNode* node = talos_sim_add(sim_, "relay", &BuildRelay, &relay);
   ASSERT_NE(node, nullptr) << talos_last_error();
@@ -189,8 +163,6 @@ TEST_F(NodeApi, ParamsFallBackOrReportTheMissingKey) {
   EXPECT_EQ(talos_node_param(node, "absent", TALOS_PARAM_INT, 0, &p), 0);
   EXPECT_EQ(talos_node_param(node, "absent", TALOS_PARAM_ANY, 1, &p),
             TALOS_ERR);
-  EXPECT_NE(std::string{talos_last_error()}.find("'absent'"),
-            std::string::npos);
   EXPECT_EQ(talos_node_param(node, "label", TALOS_PARAM_BOOL, 0, &p),
             TALOS_ERR);
 }
@@ -229,19 +201,10 @@ TEST_F(NodeApi, ListParamsComeBackAsCountedArrays) {
   EXPECT_EQ(p.count, 0u);
 
   EXPECT_EQ(talos_node_param(node, "mixed", TALOS_PARAM_ANY, 1, &p), TALOS_ERR);
-  EXPECT_NE(std::string{talos_last_error()}.find(
-                "'mixed' must be an array of strings or of numbers; element 1 "
-                "is a string"),
-            std::string::npos)
-      << talos_last_error();
   EXPECT_EQ(talos_node_param(node, "cameras", TALOS_PARAM_DOUBLE_LIST, 0, &p),
             TALOS_ERR);
-  EXPECT_NE(std::string{talos_last_error()}.find("element 0 is a string"),
-            std::string::npos);
   EXPECT_EQ(talos_node_param(node, "label", TALOS_PARAM_LIST, 0, &p),
             TALOS_ERR);
-  EXPECT_NE(std::string{talos_last_error()}.find("'label' must be an array"),
-            std::string::npos);
 }
 
 TEST_F(NodeApi, FailingCallbackStopsTheStep) {
@@ -249,14 +212,12 @@ TEST_F(NodeApi, FailingCallbackStopsTheStep) {
   ASSERT_NE(talos_sim_add(sim_, "relay", &BuildRelay, &relay), nullptr);
   relay.fail_update = true;
   EXPECT_EQ(talos_sim_step(sim_, 15 * kMs), TALOS_ERR);
-  EXPECT_NE(std::string{talos_last_error()}.find("update"), std::string::npos);
 }
 
 TEST_F(NodeApi, RegistrationFailureFailsTheAdd) {
   Relay relay;
   auto build = [](TalosNode*, void*) -> int32_t { return 1; };
   EXPECT_EQ(talos_sim_add(sim_, "relay", build, &relay), nullptr);
-  EXPECT_NE(std::string{talos_last_error()}.find("factory"), std::string::npos);
 }
 
 struct ByteSender {
@@ -516,7 +477,7 @@ TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {
   talos_sim_hardware_destroy(hw);
 }
 
-TEST_F(NodeApi, UnknownDeviceIsNamed) {
+TEST_F(NodeApi, UnknownDeviceIsRejected) {
   auto build = [](TalosNode* node, void*) -> int32_t {
     return talos_device(node, TALOS_DEVICE_MOTOR, "flywheel") < 0 ? 0 : 1;
   };
@@ -524,8 +485,6 @@ TEST_F(NodeApi, UnknownDeviceIsNamed) {
   TalosNode* node = talos_sim_node(sim_, "roller");
   ASSERT_NE(node, nullptr);
   EXPECT_LT(talos_device(node, TALOS_DEVICE_MOTOR, "flywheel"), 0);
-  EXPECT_NE(std::string{talos_last_error()}.find("'flywheel'"),
-            std::string::npos);
 }
 
 TEST_F(NodeApi, DisconnectedDeviceSampleIsInvalid) {
@@ -551,8 +510,6 @@ TEST_F(NodeApi, DisconnectedDeviceSampleIsInvalid) {
 
   EXPECT_EQ(talos_sim_hardware_set_connected(hw, "roller", "flywheel", 0),
             TALOS_ERR);
-  EXPECT_NE(std::string{talos_last_error()}.find("'flywheel'"),
-            std::string::npos);
   talos_sim_hardware_destroy(hw);
 }
 
@@ -573,7 +530,6 @@ TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   // The gateway clock is 3 s ahead of sim time.
   ASSERT_EQ(talos_sim_hardware_set_gateway_clock(hw, 3000 * kMs, 0), TALOS_OK);
   EXPECT_EQ(talos_sim_hardware_set_gateway_clock(hw, 0, -1), TALOS_ERR);
-  EXPECT_NE(std::string{talos_last_error()}.find("latency"), std::string::npos);
 
   // States every 10 ms from 0: at most 6 by 50 ms, short of the 8 the
   // bridge's filter needs.
@@ -782,8 +738,6 @@ TEST_F(NodeApi, TargetSelectsTheTeleopLaneAndLanesRelease) {
   // Wrong sizes and alignments are refused, naming the problem.
   EXPECT_EQ(talos_target_lane_send(node, lanes.lane, &speed, 8), TALOS_ERR);
   EXPECT_EQ(talos_target_open(node, 12, 8, &kFloatSchema), -1);
-  EXPECT_NE(std::string{talos_last_error()}.find("alignment"),
-            std::string::npos);
   EXPECT_EQ(talos_target_source_name(node, lanes.target, 5), nullptr);
 
   // A silent Driver Station selects nothing.

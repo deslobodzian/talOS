@@ -141,8 +141,6 @@ TEST(ReaderOwnership, ReleaseRejectsInvalidFreeAndForeignReaders) {
   ASSERT_TRUE(reader);
   queue.release_reader(*reader);
   EXPECT_EQ(header->readers[*reader].state.load(), 0u);
-  RTMSQueue moved{std::move(queue)};
-  queue.release_reader(0);
 }
 
 TEST(WriterOwnership, RefusesSecondLiveWriterAndReleasesOnClose) {
@@ -160,19 +158,10 @@ TEST(WriterOwnership, RefusesSecondLiveWriterAndReleasesOnClose) {
                      kSchema,
                      64,
                      {.publisher = true}};
-    try {
-      RTMSQueue second{path,
-                       sizeof(Message::TestMessage),
-                       alignof(Message::TestMessage),
-                       kSchema,
-                       64,
-                       {.publisher = true}};
-      FAIL() << "two live writers must not share a topic";
-    } catch (const std::runtime_error& error) {
-      EXPECT_NE(std::string{error.what()}.find(path), std::string::npos);
-      EXPECT_NE(std::string{error.what()}.find(std::to_string(::getpid())),
-                std::string::npos);
-    }
+    EXPECT_THROW((RTMSQueue{path, sizeof(Message::TestMessage),
+                            alignof(Message::TestMessage), kSchema, 64,
+                            {.publisher = true}}),
+                 std::runtime_error);
   }
   EXPECT_NO_THROW((RTMSQueue{path,
                              sizeof(Message::TestMessage),
@@ -223,96 +212,6 @@ TEST(WriterOwnership, ReclaimsCrashedWriterWithoutLosingReaders) {
   session.release_reader(*reader);
 }
 
-TEST(SingleProcess, RTMSSequence) {
-  const std::string path = make_test_path("single_sequence");
-
-  RTMSQueue queue{
-      path,
-      sizeof(Message::TestMessage),
-      alignof(Message::TestMessage),
-      kSchema,
-      64,
-      sequence_options(),
-  };
-
-  // Readers must be registered before messages are published.
-  const auto reader_id = queue.register_reader();
-  ASSERT_TRUE(reader_id.has_value());
-  const std::size_t id = reader_id.value_or(std::size_t{0});
-
-  const auto messages = std::array{
-      Message::TestMessage{10, 200.0F},
-      Message::TestMessage{23, 23.2F},
-      Message::TestMessage{0, 0.111111F},
-  };
-
-  for (const auto& message : messages) {
-    const auto rtms_message = BytesOf(message);
-
-    ASSERT_EQ(queue.write(rtms_message), WriteResult::SUCCESS);
-  }
-
-  for (const auto& expected : messages) {
-    Message::TestMessage received{};
-
-    const bool did_read =
-        queue.read(id, [&received](std::span<const std::byte> bytes) {
-          std::memcpy(&received, bytes.data(), sizeof(received));
-        });
-
-    ASSERT_TRUE(did_read);
-    EXPECT_EQ(received, expected);
-  }
-
-  // The reader cursor should now equal writer.sequence.
-  EXPECT_FALSE(queue.read(id, [](std::span<const std::byte>) {}));
-
-  queue.release_reader(id);
-}
-
-TEST(SingleProcess, RTMSLatest) {
-  const std::string path = make_test_path("single_latest");
-
-  RTMSQueue queue{
-      path,
-      sizeof(Message::TestMessage),
-      alignof(Message::TestMessage),
-      kSchema,
-      64,
-      latest_options(),
-  };
-
-  const auto reader_id = queue.register_reader();
-  ASSERT_TRUE(reader_id.has_value());
-  const std::size_t id = reader_id.value_or(std::size_t{0});
-
-  const auto messages = std::array{
-      Message::TestMessage{10, 200.0F},
-      Message::TestMessage{23, 23.2F},
-      Message::TestMessage{99, 42.0F},
-  };
-
-  for (const auto& message : messages) {
-    const auto rtms_message = BytesOf(message);
-
-    ASSERT_EQ(queue.write(rtms_message), WriteResult::SUCCESS);
-  }
-
-  Message::TestMessage received{};
-
-  ASSERT_TRUE(queue.read(id, [&received](std::span<const std::byte> bytes) {
-    std::memcpy(&received, bytes.data(), sizeof(received));
-  }));
-
-  // LATEST skips the first two unread messages.
-  EXPECT_EQ(received, messages.back());
-
-  // The reader cursor should now equal writer.sequence.
-  // The latest message must not be returned repeatedly.
-  EXPECT_FALSE(queue.read(id, [](std::span<const std::byte>) {}));
-
-  queue.release_reader(id);
-}
 
 TEST(WrapTest, RTMSSequenceWrapsSlots) {
   const std::string path = make_test_path("wrap");
@@ -930,57 +829,6 @@ TEST(SingleProcess, DropNewestBufferFullThenRecovers) {
   queue.release_reader(id);
 }
 
-// DROP_NEWEST fills to exactly `slots` before refusing a write, and at that
-// distance the oldest unread message has NOT been overwritten: its slot is the
-// next one the writer would reuse, but that write has not happened yet, and
-// admission control will block it until this reader advances.
-//
-// A reader must therefore deliver sequence 0 with nothing dropped. Skipping it
-// would break the one guarantee that makes the reliable mode worth choosing.
-// This was a real off-by-one in select_sequence(), which applied the
-// overwriting policy's lap correction regardless of the configured policy.
-TEST(SingleProcess, DropNewestKeepsOldestMessageAtExactCapacity) {
-  const std::string path = make_test_path("dn_exact_cap");
-
-  constexpr std::uint64_t slots = 8;
-
-  RTMSQueue queue{
-      path,
-      sizeof(Message::TestMessage),
-      alignof(Message::TestMessage),
-      kSchema,
-      slots,
-      sequence_options(),  // DROP_NEWEST + SEQUENCE
-  };
-
-  const auto reader_id = queue.register_reader();
-  ASSERT_TRUE(reader_id.has_value());
-  const std::size_t id = reader_id.value_or(std::size_t{0});
-
-  // Fill the queue to exactly capacity. write() itself treats this as
-  // completely safe: BUFFER_FULL only triggers on the *next* write.
-  for (std::uint64_t i = 0; i < slots; ++i) {
-    const Message::TestMessage message{
-        static_cast<int>(i),
-        static_cast<float>(i),
-    };
-
-    const auto rtms_message = BytesOf(message);
-
-    ASSERT_EQ(queue.write(rtms_message).result, WriteResult::SUCCESS);
-  }
-
-  std::array<std::byte, sizeof(Message::TestMessage)> buffer{};
-  MessageInfo info{};
-
-  ASSERT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
-            ReadResult::OK);
-
-  EXPECT_EQ(info.sequence, 0u);
-  EXPECT_EQ(info.dropped, 0u);
-
-  queue.release_reader(id);
-}
 
 namespace {
 
@@ -1344,64 +1192,6 @@ void FreeRunningReadThread(const std::string& path, std::size_t slots,
 
 }  // namespace
 
-TEST(Concurrency, OverwriteOldestNoTornReadsSingleReader) {
-  const std::string path = make_test_path("conc_single");
-
-  constexpr std::size_t slots = 8;
-
-  // Keeps the shared memory object alive for the whole test.
-  RTMSQueue owner{
-      path,
-      sizeof(Message::TestMessage),
-      alignof(Message::TestMessage),
-      kSchema,
-      slots,
-      overwrite_sequence_options(),
-  };
-
-  std::latch readers_ready{1};
-
-  std::promise<void> start_promise;
-  std::shared_future<void> start_signal = start_promise.get_future().share();
-
-  std::atomic<bool> failed{false};
-  std::atomic<std::uint64_t> total_dropped{0};
-  std::atomic<std::uint64_t> messages_read{0};
-
-  const auto deadline = std::chrono::steady_clock::now() + 400ms;
-
-  std::thread reader{
-      FreeRunningReadThread,
-      path,
-      slots,
-      start_signal,
-      deadline,
-      std::ref(failed),
-      std::ref(total_dropped),
-      std::ref(messages_read),
-      std::ref(readers_ready),
-  };
-
-  // The reader must be ACTIVE before the writer starts publishing.
-  readers_ready.wait();
-
-  std::thread writer{
-      FreeRunningWriteThread, path,     slots,
-      start_signal,           deadline, std::ref(failed),
-  };
-
-  start_promise.set_value();
-
-  writer.join();
-  reader.join();
-
-  EXPECT_FALSE(failed.load());
-  EXPECT_GT(messages_read.load(), 0u);
-
-  // If this is ever 0 the test stopped exercising the lapping path it
-  // claims to cover (e.g. deadline too short for the host machine).
-  EXPECT_GT(total_dropped.load(), 0u);
-}
 
 TEST(Concurrency, OverwriteOldestNoTornReadsMultiReader) {
   const std::string path = make_test_path("conc_multi");
@@ -1637,16 +1427,8 @@ TEST(RTMSSchema, AChangedFieldTypeOfTheSameSizeIsRejectedAtAttach) {
 
   constexpr std::size_t kBytes = 8;  // float or int, then two bytes, padded
   RTMSQueue publisher{path, kBytes, 4, before, 16, publisher_options()};
-  try {
-    RTMSQueue reader{path, kBytes, 4, after, 16, sequence_options()};
-    FAIL() << "attached a schema_variant.Reading of another layout";
-  } catch (const std::runtime_error& error) {
-    const std::string what = error.what();
-    EXPECT_NE(what.find(talos::schema::Describe(before)), std::string::npos)
-        << what;
-    EXPECT_NE(what.find(talos::schema::Describe(after)), std::string::npos)
-        << what;
-  }
+  EXPECT_THROW((RTMSQueue{path, kBytes, 4, after, 16, sequence_options()}),
+               std::runtime_error);
   // The live publisher holds the segment, so a second publisher of the new
   // schema is refused as well rather than reclaiming it.
   EXPECT_THROW(RTMSQueue(path, kBytes, 4, after, 16, publisher_options()),

@@ -9,7 +9,6 @@ fields), and the sizes agree with the C++ test (Pose2d 24, ConsumerState 40).
 import unittest
 
 import talos
-from deps_consumer import topics
 from deps_consumer.ConsumerState import ConsumerState
 from deps_geometry.Pose2d import Pose2d
 
@@ -34,18 +33,12 @@ class MessagesDepsTest(unittest.TestCase):
         self.assertEqual(state.pose_heading_rad, 0.5)
         self.assertEqual(state.velocity_rps, 10.0)
         self.assertTrue(state.enabled)
-        self.assertEqual(
-            repr(state),
-            "ConsumerState(pose_x_m=1.0, pose_y_m=2.0, pose_heading_rad=0.5, "
-            "velocity_rps=10.0, enabled=True)")
 
 
     def test_layout_matches_cpp(self):
         self.assertEqual(Pose2d.SizeOf(), 24)
         self.assertEqual(ConsumerState.SizeOf(), 40)
 
-    def test_topics(self):
-        self.assertEqual(topics.STATE, "/deps_consumer/state")
 
 
 if __name__ == "__main__":

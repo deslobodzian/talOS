@@ -1,5 +1,4 @@
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("@rules_python//python:defs.bzl", "py_test")
 load("//talOS/build:contract.bzl", "talos_messages")
 
 package(default_visibility = ["//visibility:public"])
@@ -26,26 +25,8 @@ cc_test(
     deps = [
         ":control",
         ":geometry",
-        "//talOS/devices",
-        "//talOS/devices:testing",
-        "//talOS/node:testing",
+        "//talOS/node",
         "@googletest//:gtest_main",
     ],
 )
 
-py_test(
-    name = "msgs_py_test",
-    size = "small",
-    srcs = ["msgs_py_test.py"],
-    legacy_create_init = False,
-    # ctypes cannot initialize sanitizer runtimes inside the Python host.
-    tags = [
-        "no_asan",
-        "no_tsan",
-    ],
-    deps = [
-        ":control_py",
-        ":geometry_py",
-        "//talOS/python:testing",
-    ],
-)

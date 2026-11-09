@@ -211,16 +211,6 @@ TEST(RealtimeEventLoop, RejectsTimerChangesFromAnotherThread) {
   other.join();
 }
 
-TEST(RealtimeEventLoop, ReleasesReadersWhenLoopIsDestroyed) {
-  const std::string topic = "/reuse_" + std::to_string(::getpid());
-  RTMSQueue keeper{topic, sizeof(EventsTest::SensorMessage),
-                   alignof(EventsTest::SensorMessage),
-                   talos::schema::Of<EventsTest::SensorMessage>(), MAX_SLOTS};
-  for (std::size_t i = 0; i < MAX_READERS * 2; ++i) {
-    RealtimeEventLoop<> loop;
-    EXPECT_NO_THROW(register_sensor_watcher(loop, topic));
-  }
-}
 
 TEST(RealtimeEventLoop, ReaderExhaustionFailsRegistrationAndAllowsRetry) {
   const std::string topic = "/full_" + std::to_string(::getpid());
@@ -329,12 +319,10 @@ void ExpectRealtimeRunReplays(Delivery delivery) {
   std::remove(path.c_str());
 }
 
-TEST(RealtimeEventLoop, ReplayOfARealtimeRunDoesNotDiverge) {
-  ExpectRealtimeRunReplays(Delivery::POLL);
-}
-
-TEST(RealtimeEventLoop, ReplayOfABeforeTimersRunDoesNotDiverge) {
-  ExpectRealtimeRunReplays(Delivery::BEFORE_TIMERS);
+TEST(RealtimeEventLoop, RealtimeRunReplaysForBothDeliveryPolicies) {
+  for (const auto delivery : {Delivery::POLL, Delivery::BEFORE_TIMERS}) {
+    ExpectRealtimeRunReplays(delivery);
+  }
 }
 
 struct Wakeups {

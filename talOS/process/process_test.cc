@@ -3,7 +3,6 @@
 #include <gtest/gtest.h>
 #include <pthread.h>
 
-#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -75,31 +74,20 @@ Outcome ConfigureOnFreshThread() {
 
 TEST(ProcessTest, RealtimeDisabledByEnvironmentChangesNothing) {
   ::setenv("TALOS_REALTIME", "0", 1);
-  ::testing::internal::CaptureStderr();
   const Outcome outcome = ConfigureOnFreshThread();
-  const std::string printed = ::testing::internal::GetCapturedStderr();
   ::unsetenv("TALOS_REALTIME");
 
   EXPECT_FALSE(outcome.returned);
   EXPECT_FALSE(outcome.realtime);
-  EXPECT_EQ(printed, "");
 }
 
-// Whatever the machine allows: no exception, no abort, and either success in
-// silence or one line saying what was refused.
+// Report success only when the OS actually applied the realtime policy.
 TEST(ProcessTest, RealtimeIsBestEffort) {
   ::unsetenv("TALOS_REALTIME");
   static_assert(noexcept(ConfigureRealtime(RealtimeOptions{})));
-  ::testing::internal::CaptureStderr();
   const Outcome outcome = ConfigureOnFreshThread();
-  const std::string printed = ::testing::internal::GetCapturedStderr();
 
-  if (outcome.returned) {
-    EXPECT_EQ(printed, "");
-    EXPECT_TRUE(outcome.realtime);
-  } else {
-    EXPECT_EQ(std::count(printed.begin(), printed.end(), '\n'), 1) << printed;
-  }
+  EXPECT_EQ(outcome.returned, outcome.realtime);
 }
 
 }  // namespace

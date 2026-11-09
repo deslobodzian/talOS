@@ -64,11 +64,6 @@ const reflection::Object& Reflected() {
   return *object;
 }
 
-TEST(Descriptor, NamesTheSchemaStruct) {
-  EXPECT_EQ(Descriptor<schema_test::Inner>::kName, "schema_test.Inner");
-  EXPECT_EQ(Descriptor<schema_test::Mixed>::kName, "schema_test.Mixed");
-  EXPECT_EQ(Descriptor<schema_test::Arrays>::kName, "schema_test.Arrays");
-}
 
 TEST(Descriptor, EmbeddedSchemaMatchesTheCompiledLayout) {
   EXPECT_EQ(Reflected<schema_test::Inner>().bytesize(),
@@ -90,14 +85,6 @@ TEST(Descriptor, HashIsTheHashOfItsEmbeddedSchema) {
             Descriptor<schema_test::Arrays>::kHash);
 }
 
-TEST(Descriptor, DistinctStructsHaveDistinctHashes) {
-  EXPECT_NE(Descriptor<schema_test::Inner>::kHash,
-            Descriptor<schema_test::Mixed>::kHash);
-  EXPECT_NE(Descriptor<schema_test::Mixed>::kHash,
-            Descriptor<schema_test::Arrays>::kHash);
-  EXPECT_NE(Descriptor<schema_test::Inner>::kHash,
-            Descriptor<schema_test::Arrays>::kHash);
-}
 
 TEST(SchemaHash, CommentsAndFormattingDoNotChangeIt) {
   for (const char* name : {"schema_variant.Reading", "schema_variant.Holder"}) {

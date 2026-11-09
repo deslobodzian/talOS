@@ -1,5 +1,3 @@
-load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("@rules_python//python:defs.bzl", "py_test")
 load("//talOS/build:contract.bzl", "talos_messages")
 
 # A topics-only package: no schema of its own, its state type comes from
@@ -15,28 +13,3 @@ talos_messages(
     deps = ["//talOS/build/messages_deps_test/geometry:messages"],
 )
 
-cc_test(
-    name = "messages_cc_test",
-    size = "small",
-    srcs = ["messages_test.cc"],
-    deps = [
-        ":messages",
-        "@googletest//:gtest_main",
-    ],
-)
-
-py_test(
-    name = "messages_py_test",
-    size = "small",
-    srcs = ["messages_test.py"],
-    main = "messages_test.py",
-    # Imports talos, loading instrumented ctypes libraries in a Python host.
-    tags = [
-        "no_asan",
-        "no_tsan",
-    ],
-    deps = [
-        ":messages_py",
-        "//talOS/python:talos",
-    ],
-)

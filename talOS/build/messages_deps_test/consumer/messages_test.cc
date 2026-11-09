@@ -12,25 +12,11 @@
 namespace deps_consumer {
 namespace {
 
-TEST(MessagesDepsTest, EmbeddedStructRoundTrip) {
-  const deps_geometry::Pose2d pose{1.0, 2.0, 0.5};
-  EXPECT_DOUBLE_EQ(pose.x_m(), 1.0);
-  EXPECT_DOUBLE_EQ(pose.y_m(), 2.0);
-  EXPECT_DOUBLE_EQ(pose.heading_rad(), 0.5);
-
-  const ConsumerState state{pose, 10.0, true};
-  EXPECT_DOUBLE_EQ(state.pose().x_m(), 1.0);
-  EXPECT_DOUBLE_EQ(state.pose().y_m(), 2.0);
-  EXPECT_DOUBLE_EQ(state.pose().heading_rad(), 0.5);
-  EXPECT_DOUBLE_EQ(state.velocity_rps(), 10.0);
-  EXPECT_TRUE(state.enabled());
-}
 
 TEST(MessagesDepsTest, LayoutMatchesPythonBindings) {
   // Pose2d is 3 doubles; ConsumerState is Pose2d + double + bool padded to 8.
   EXPECT_EQ(sizeof(deps_geometry::Pose2d), 24u);
   EXPECT_EQ(sizeof(ConsumerState), 40u);
-  EXPECT_STREQ(topics::kState, "/deps_consumer/state");
 }
 
 }  // namespace

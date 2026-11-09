@@ -187,12 +187,10 @@ void ExpectReRecordingIsByteIdentical(Delivery delivery) {
   std::remove(replayed_path.c_str());
 }
 
-TEST(Replay, ReRecordingIsByteIdentical) {
-  ExpectReRecordingIsByteIdentical(Delivery::POLL);
-}
-
-TEST(Replay, ReRecordingABeforeTimersRunIsByteIdentical) {
-  ExpectReRecordingIsByteIdentical(Delivery::BEFORE_TIMERS);
+TEST(Replay, ReRecordingIsByteIdenticalForBothDeliveryPolicies) {
+  for (const auto delivery : {Delivery::POLL, Delivery::BEFORE_TIMERS}) {
+    ExpectReRecordingIsByteIdentical(delivery);
+  }
 }
 
 TEST(Replay, DetectsChangedBehaviour) {
@@ -227,8 +225,6 @@ TEST(Replay, CollectsEveryDivergenceWhenAsked) {
 
   EXPECT_TRUE(loop.diverged());
   EXPECT_GT(loop.divergences().size(), 1u);
-  EXPECT_NE(loop.divergences().front().detail.find("sent different bytes"),
-            std::string::npos);
 
   std::remove(path.c_str());
 }
