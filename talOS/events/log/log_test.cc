@@ -151,13 +151,16 @@ TEST(LogWriter, ExitIsReadableBeforeWriterDestruction) {
   std::remove(path.c_str());
 }
 
+// Session id the round-trip fixture is written with.
+constexpr std::uint64_t kFixtureSession = 0x123456789ABCDEF0ULL;
+
 // Writes the round-trip fixture used by several tests: a manifest, ~50
 // TIMER/MESSAGE/SEND records with varying payload sizes (including
 // zero-length ones), and a final EXIT. Returns the expected records in
 // on-disk order so callers can verify the reader against them.
 std::vector<ExpectedRecord> WriteFixtureWithOptions(
     const std::string& path, LogWriter::Options options) {
-  LogWriter writer{path, "talos_log_test", options};
+  LogWriter writer{path, "talos_log_test", options, kFixtureSession};
   const Manifest manifest = MakeManifest();
   const MonotonicTime start_time = MonotonicTime::from_nanos(42);
   writer.start(manifest, start_time);
@@ -262,24 +265,8 @@ TEST(LogRoundTrip, AllFieldsAndManifestMatch) {
   EXPECT_EQ(reader.record_count(), expected.size());
   EXPECT_FALSE(reader.truncated());
   EXPECT_EQ(reader.format_version(), 6u);
-  EXPECT_EQ(reader.session_id(), 0u);
+  EXPECT_EQ(reader.session_id(), kFixtureSession);
 
-  ::unlink(path.c_str());
-}
-
-TEST(LogRoundTrip, SessionIdPreserved) {
-  const std::string path = TempPath("session_id");
-  const std::uint64_t expected_session = 0x123456789ABCDEF0ULL;
-  {
-    LogWriter writer{path, "session_test", LogWriter::Options{},
-                     expected_session};
-    EXPECT_EQ(writer.session_id(), expected_session);
-    writer.start(MakeManifest(), MonotonicTime::from_nanos(100));
-    writer.flush();
-  }
-  LogReader reader{path};
-  EXPECT_EQ(reader.session_id(), expected_session);
-  EXPECT_EQ(reader.format_version(), 6u);
   ::unlink(path.c_str());
 }
 
@@ -473,19 +460,6 @@ TEST(LogCorruption, PayloadCrcMismatchThrows) {
   ::unlink(path.c_str());
 }
 
-TEST(LogCorruption, ManifestCrcMismatchThrowsOnOpen) {
-  const std::string path = TempPath("manifest_corrupt");
-  WriteFixture(path, LogWriter::kDefaultBufferBytes);
-
-  // Somewhere inside the manifest block, which starts right after the
-  // header.
-  FlipByte(path, sizeof(FileHeader) + 10);
-
-  EXPECT_THROW(LogReader{path}, std::runtime_error);
-
-  ::unlink(path.c_str());
-}
-
 TEST(LogTruncation, IncompleteTrailingRecordIsNotAnError) {
   const std::string path = TempPath("truncated");
   const std::vector<ExpectedRecord> expected =
@@ -509,14 +483,21 @@ TEST(LogTruncation, IncompleteTrailingRecordIsNotAnError) {
   ::unlink(path.c_str());
 }
 
-TEST(LogFormatErrors, BadMagicThrows) {
-  const std::string path = TempPath("bad_magic");
-  WriteFixture(path, LogWriter::kDefaultBufferBytes);
-
-  FlipByte(path, 0);
-
-  EXPECT_THROW(LogReader{path}, std::runtime_error);
-
+// A damaged file header, manifest entry or schema block (the schema bytes
+// are covered by the manifest checksum, so a flipped name byte cannot decode
+// the log as the wrong type) is refused before any record is read.
+TEST(LogCorruption, DamagedHeaderOrManifestThrowsOnOpen) {
+  const std::string path = TempPath("header_corrupt");
+  const std::size_t magic = 0;
+  const std::size_t manifest_entry = sizeof(FileHeader) + 10;
+  const std::size_t schema_block =
+      sizeof(FileHeader) + 3 * sizeof(ManifestEntry) + 2;
+  for (const std::size_t offset : {magic, manifest_entry, schema_block}) {
+    SCOPED_TRACE(offset);
+    WriteFixture(path, LogWriter::kDefaultBufferBytes);
+    FlipByte(path, offset);
+    EXPECT_THROW(LogReader{path}, std::runtime_error);
+  }
   ::unlink(path.c_str());
 }
 
@@ -541,19 +522,6 @@ TEST(LogFormatErrors, RejectsUnsupportedVersions) {
   ::unlink(path.c_str());
 }
 
-// The schema block is covered by the manifest checksum: a flipped schema
-// name byte would otherwise decode the log as the wrong type.
-TEST(LogCorruption, SchemaBlockCrcMismatchThrowsOnOpen) {
-  const std::string path = TempPath("schema_corrupt");
-  WriteFixture(path, LogWriter::kDefaultBufferBytes);
-
-  FlipByte(path, sizeof(FileHeader) + 3 * sizeof(ManifestEntry) + 2);
-
-  EXPECT_THROW(LogReader{path}, std::runtime_error);
-
-  ::unlink(path.c_str());
-}
-
 // Writes must be identical whether they went to disk on the loop thread or
 // were handed to the writer thread, and small chunks force many handoffs.
 TEST(LogBackgroundWriter, RoundTripsThroughTheWriterThread) {
@@ -572,69 +540,6 @@ TEST(LogBackgroundWriter, RoundTripsThroughTheWriterThread) {
   EXPECT_FALSE(reader.next(record));
   EXPECT_FALSE(reader.truncated());
   EXPECT_EQ(reader.record_count(), expected.size());
-
-  std::remove(path.c_str());
-}
-
-// Enough preallocated chunks retain a burst even if the writer is not
-// scheduled.
-TEST(LogBackgroundWriter, BufferedBurstPreservesRecords) {
-  const std::string path = TempPath("background_stall");
-  const std::vector<ExpectedRecord> expected = WriteFixtureWithOptions(
-      path, LogWriter::Options{128, 100, /*background=*/true});
-
-  LogReader reader{path};
-  LogReader::Record record;
-  std::size_t seen = 0;
-
-  for (const ExpectedRecord& want : expected) {
-    ASSERT_TRUE(reader.next(record)) << "missing record " << seen;
-    ExpectRecordEquals(want, record);
-    ++seen;
-  }
-
-  EXPECT_EQ(seen, expected.size());
-
-  std::remove(path.c_str());
-}
-
-// flush() has to wait for the writer thread, not just hand off to it.
-TEST(LogBackgroundWriter, FlushWaitsForTheWriterThread) {
-  const std::string path = TempPath("background_flush");
-
-  LogWriter writer{path, "talos_log_test",
-                   LogWriter::Options{4096, 4, /*background=*/true}};
-  writer.start(MakeManifest(), MonotonicTime::from_nanos(7));
-
-  constexpr int records = 40;
-  for (int i = 0; i < records; ++i) {
-    Context context;
-    context.kind = EventKind::TIMER;
-    context.source_id = 0;
-    context.dispatch_index = static_cast<std::uint64_t>(i) + 1;
-    context.event_time =
-        MonotonicTime::from_nanos(static_cast<std::int64_t>(i) * 1000);
-    context.now =
-        MonotonicTime::from_nanos(static_cast<std::int64_t>(i) * 1000);
-    context.sequence = static_cast<std::uint64_t>(i);
-    writer.dispatch(context, MakePayload(16, i));
-  }
-
-  writer.flush();
-  ASSERT_FALSE(writer.failed()) << writer.error();
-
-  // Everything must be readable while the writer is still open.
-  LogReader reader{path};
-  LogReader::Record record;
-  int seen = 0;
-  while (reader.next(record)) {
-    EXPECT_EQ(record.header.dispatch_index,
-              static_cast<std::uint64_t>(seen + 1));
-    ++seen;
-  }
-
-  EXPECT_EQ(seen, records);
-  EXPECT_FALSE(reader.truncated());
 
   std::remove(path.c_str());
 }

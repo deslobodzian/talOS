@@ -76,7 +76,7 @@ TEST(SharedMemory, FailedCloseUnmapsSuccessfulMapping) {
   shm_unlink(name.c_str());
 }
 
-TEST(SharedMemory, SharedMemoryPtr) {
+TEST(SharedMemory, SecondMappingAttachesAndNeitherUnlinksTheName) {
   // One path on both platforms. This was an #ifdef -- a flat name on Linux
   // and a slashed one elsewhere -- because glibc's shm_open rejects an
   // interior slash and macOS accepts one. ShmObjectName handles that at the

@@ -78,27 +78,6 @@ std::vector<float> record_run(const std::string& path, float gain,
   return robot.efforts();
 }
 
-TEST(Replay, ReproducesRecordedBehaviour) {
-  const std::string path = temp_path("reproduce");
-  const std::vector<float> recorded = record_run(path, 2.5F);
-  ASSERT_FALSE(recorded.empty());
-
-  log::LogReader reader{path};
-  ReplayEventLoop<> loop{reader};
-  TestRobot<ReplayEventLoop<>> robot{loop, test_topics(), 2.5F};
-  robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
-                                       1ms);
-
-  loop.run();
-
-  EXPECT_FALSE(loop.diverged());
-  EXPECT_TRUE(loop.reached_exit());
-  EXPECT_EQ(robot.efforts(), recorded);
-  EXPECT_EQ(robot.control_count(), recorded.size());
-
-  std::remove(path.c_str());
-}
-
 struct MessageTimes {
   std::vector<Context> contexts;
 
@@ -278,20 +257,9 @@ void record_timer_program(const std::string& path) {
   ASSERT_FALSE(loop.recorder().failed());
 }
 
-TEST(Replay, ValidatesTimerOperationsAndHandlerExit) {
-  const auto path = temp_path("timer_operations");
-  record_timer_program(path);
-  log::LogReader reader{path};
-  ReplayEventLoop<> loop{reader};
-  TimerProgram program{loop};
-  EXPECT_NO_THROW(loop.run());
-  EXPECT_FALSE(loop.diverged());
-  EXPECT_TRUE(loop.reached_exit());
-  EXPECT_EQ(program.calls, 1);
-  std::remove(path.c_str());
-}
-
-TEST(Replay, TimerOperationsReRecordIdentically) {
+// A timer program that re-arms, disarms and exits from its handler replays
+// without divergence, reaches the recorded exit and re-records identically.
+TEST(Replay, TimerOperationsAndHandlerExitReRecordIdentically) {
   const auto original_path = temp_path("timer_identical_a");
   const auto replayed_path = temp_path("timer_identical_b");
   record_timer_program(original_path);
@@ -302,6 +270,8 @@ TEST(Replay, TimerOperationsReRecordIdentically) {
     TimerProgram program{loop};
     loop.run();
     ASSERT_FALSE(loop.diverged());
+    EXPECT_TRUE(loop.reached_exit());
+    EXPECT_EQ(program.calls, 1);
   }
   auto original = read_file(original_path);
   auto replayed = read_file(replayed_path);

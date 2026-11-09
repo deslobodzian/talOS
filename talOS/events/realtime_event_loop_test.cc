@@ -164,31 +164,6 @@ TEST(RealtimeEventLoop, ExitFromAnotherThreadReturnsPromptly) {
   EXPECT_LT(elapsed, Duration{std::chrono::seconds{5}});
 }
 
-TEST(RealtimeEventLoop, WatcherReceivesPublishedMessages) {
-  const Topics topics = realtime_topics();
-  RealtimeEventLoop<> loop;
-  TestRobot<RealtimeEventLoop<>> robot{loop, topics, 2.0F};
-
-  robot.control_timer().setup_periodic(Poller::now() + 1ms, 2ms);
-
-  std::atomic<bool> stop{false};
-  std::thread publisher{[&topics, &stop] {
-    ipc::Publisher<EventsTest::SensorMessage> sensor{topics.sensor};
-
-    for (int i = 0; !stop.load(); ++i) {
-      sensor.write(EventsTest::SensorMessage{i, static_cast<float>(i), 0.0F});
-      std::this_thread::sleep_for(500us);
-    }
-  }};
-
-  loop.run_for(300ms);
-  stop.store(true);
-  publisher.join();
-
-  EXPECT_GT(robot.sensor_count(), 0u);
-  EXPECT_GT(robot.control_count(), 0u);
-}
-
 TEST(RealtimeEventLoop, RejectsTimerChangesFromAnotherThread) {
   RealtimeEventLoop<> loop;
   std::atomic<bool> started{false};

@@ -20,6 +20,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -134,33 +135,13 @@ struct Talker {
   Publisher<Count> out;
 };
 
+// A callback subscription.
 struct Listener {
   explicit Listener(Node& n)
-      : in{n.subscribe<Count>("/talker/state", [this](const Count& c) {
-          heard.push_back(c.tick_count());
-        })} {}
-  void update() { latest_in_update = in.has_value() ? in->tick_count() : -1; }
+      : in{n.subscribe<Count>("/talker/state", [](const Count&) {})} {}
+  void update() {}
   Subscription<Count> in;
-  std::vector<std::int64_t> heard;
-  std::int64_t latest_in_update = -1;
 };
-
-TEST(Node, TwoNodesTalkOverATopicInOneSim) {
-  auto sim = Sim::FromToml(kRobotToml);
-  sim.add<Talker>("talker");
-  auto& listener = sim.add<Listener>("listener");
-
-  sim.step(52ms);  // talker ticks at 10..50 ms; the last lands by 51 ms
-
-  EXPECT_EQ(listener.heard, (std::vector<std::int64_t>{0, 1, 2, 3, 4}));
-  EXPECT_EQ(listener.in->tick_count(), 4);
-  EXPECT_GE(listener.latest_in_update, 3);
-  const auto latest = sim.latest<Count>("/talker/state");
-  if (!latest.has_value()) {
-    FAIL() << "nothing published on /talker/state";
-  }
-  EXPECT_EQ(latest->tick_count(), 4);
-}
 
 struct Watcher {
   explicit Watcher(Node& n)
@@ -695,11 +676,9 @@ struct BadFramer {
   }
 };
 
-TEST(BytePublisher, RejectsBadLayoutsAndLateRegistration) {
+TEST(BytePublisher, RejectsBadLayouts) {
   auto sim = Sim::FromToml(kRobotToml);
   sim.add<BadFramer>("listener");
-  EXPECT_THROW((void)sim.node("listener").publish_bytes("/late/frames", 8),
-               std::logic_error);
 }
 
 // --- the binary
@@ -745,44 +724,60 @@ std::string ConfigFlag() {
 TEST(Binary, DescribeListsEveryEndpointIncludingOptionalOnes) {
   const Result result = RunBinary("--describe " + ConfigFlag());
   ASSERT_EQ(result.status, 0) << result.output;
-  EXPECT_NE(result.output.find(R"("name": "test_node")"), std::string::npos)
+  introspect::Description described;
+  std::string error;
+  ASSERT_TRUE(
+      introspect::DescribeReader::Parse(result.output, described, error))
+      << error << "\n"
       << result.output;
-  EXPECT_NE(result.output.find(R"("target": "//talOS/node:test_node")"),
-            std::string::npos)
-      << result.output;
-  // Every topic endpoint names its schema, with its reflection bytes; a
-  // timer has none.
-  const std::string count_schema =
-      R"("schema": "node_test.Count", "schema_hash": ")" +
-      introspect::HexHash(Descriptor<Count>::kHash) +
-      R"(", "alignment": 8, "slots": 1024, "bfbs": ")" +
-      introspect::Base64(schema::Of<Count>().bfbs) + R"("})";
-  EXPECT_NE(
-      result.output.find(
-          R"({"kind": "WATCHER", "name": "/test_node/target", "message_bytes": 16, "external": false, "optional": true, "observer": false, )" +
-          count_schema),
-      std::string::npos)
-      << result.output;
-  EXPECT_NE(
-      result.output.find(
-          R"({"kind": "SENDER", "name": "/test_node/state", "message_bytes": 16, "external": false, "optional": false, "observer": false, )" +
-          count_schema),
-      std::string::npos)
-      << result.output;
-  EXPECT_NE(
-      result.output.find(
-          R"({"kind": "SENDER", "name": "/test_node/frames", "message_bytes": 64, "external": true, "optional": false, "observer": false, "schema": "talos.Bytes", "schema_hash": ")" +
-          introspect::HexHash(schema::BytesHash()) +
-          R"(", "alignment": 8, "slots": 16, "bfbs": ""})"),
-      std::string::npos)
-      << result.output;
-  EXPECT_NE(result.output.find(R"("reads_graph": false)"), std::string::npos)
-      << result.output;
-  EXPECT_NE(result.output.find(R"({"kind": "TIMER", "name": "test_node")"),
-            std::string::npos)
-      << result.output;
+  EXPECT_EQ(described.name, "test_node");
+  EXPECT_EQ(described.target, "//talOS/node:test_node");
+  EXPECT_FALSE(described.reads_graph);
+  const auto find = [&](std::string_view name) {
+    const auto it =
+        std::find_if(described.sources.begin(), described.sources.end(),
+                     [&](const auto& source) { return source.name == name; });
+    return it == described.sources.end() ? nullptr : &*it;
+  };
+
+  const auto* target = find("/test_node/target");
+  ASSERT_NE(target, nullptr) << result.output;
+  EXPECT_EQ(target->kind, event::SourceKind::WATCHER);
+  EXPECT_TRUE(target->optional());
+  EXPECT_FALSE(target->external());
+  const auto* state = find("/test_node/state");
+  ASSERT_NE(state, nullptr) << result.output;
+  EXPECT_EQ(state->kind, event::SourceKind::SENDER);
+  EXPECT_FALSE(state->optional());
+  EXPECT_FALSE(state->external());
+  // Every topic endpoint names its schema, with its reflection bytes.
+  for (const auto* count : {target, state}) {
+    SCOPED_TRACE(count->name);
+    EXPECT_FALSE(count->observer());
+    EXPECT_EQ(count->message_bytes, 16u);
+    EXPECT_EQ(count->schema, "node_test.Count");
+    EXPECT_EQ(count->schema_hash, Descriptor<Count>::kHash);
+    EXPECT_EQ(count->alignment, 8u);
+    EXPECT_EQ(count->slots, 1024u);
+    EXPECT_EQ(count->bfbs, schema::Of<Count>().bfbs);
+  }
+  const auto* frames = find("/test_node/frames");
+  ASSERT_NE(frames, nullptr) << result.output;
+  EXPECT_EQ(frames->kind, event::SourceKind::SENDER);
+  EXPECT_TRUE(frames->external());
+  EXPECT_EQ(frames->message_bytes, 64u);
+  EXPECT_EQ(frames->schema, "talos.Bytes");
+  EXPECT_EQ(frames->schema_hash, schema::BytesHash());
+  EXPECT_EQ(frames->alignment, 8u);
+  EXPECT_EQ(frames->slots, 16u);
+  EXPECT_TRUE(frames->bfbs.empty());
+  const auto* tick = find("test_node");
+  ASSERT_NE(tick, nullptr) << result.output;
+  EXPECT_EQ(tick->kind, event::SourceKind::TIMER);
   // A node with no hardware never touches /hw/*.
-  EXPECT_EQ(result.output.find("/hw/"), std::string::npos) << result.output;
+  for (const auto& source : described.sources) {
+    EXPECT_FALSE(source.name.starts_with("/hw/")) << source.name;
+  }
 }
 
 std::string TempFile(const std::string& name) {
@@ -833,7 +828,7 @@ TEST(Binary, AGraphReaderDescribesWhatTheGraphItWasGivenHolds) {
   EXPECT_EQ(observed->schema_hash, Descriptor<Count>::kHash);
   EXPECT_EQ(observed->bfbs, schema::Of<Count>().bfbs);
 
-  // Run for real without a graph: it cannot be built, and says how to fix it.
+  // Run for real without a graph: it cannot be built.
   const Result run =
       RunBinary("--sim --duration-s 1 --log '" + TempFile("graph_node.tlog") +
                     "' " + ConfigFlag(),

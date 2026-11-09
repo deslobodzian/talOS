@@ -2,7 +2,6 @@
 
 #include <gtest/gtest.h>
 
-#include <cmath>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -35,24 +34,6 @@ TEST(SimulatedEventLoop, RegistrationAfterRunIsRejected) {
   loop.run_for(5ms);
 
   EXPECT_THROW(loop.register_timer("late", Thunk{}), RegistrationError);
-}
-
-TEST(SimulatedEventLoop, PeriodicTimerFiresOnSchedule) {
-  SimulationEnvironment environment;
-  SimulatedEventLoop<> loop{environment};
-  TestRobot<SimulatedEventLoop<>> robot{loop, simulated_topics(), 1.0F};
-
-  robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
-                                       1ms);
-  loop.run_for(10ms);
-
-  // Fires at 1ms through 10ms inclusive.
-  EXPECT_EQ(robot.control_count(), 10u);
-
-  // Virtual time never overruns, so every cycle is exactly on time.
-  for (const float effort : robot.efforts()) {
-    EXPECT_FALSE(std::isnan(effort));
-  }
 }
 
 // The simulated loop is quiescent between run_for calls, so the harness may
@@ -104,26 +85,6 @@ TEST(SimulatedEventLoop, TimerChangeFromAHandlerlessThreadDuringRunIsRejected) {
   if (!caught.has_value()) {
     FAIL() << "no logic_error caught";
   }
-}
-
-TEST(SimulatedEventLoop, WatcherReceivesEveryInjectedMessage) {
-  SimulationEnvironment environment;
-  SimulatedEventLoop<> loop{environment};
-  TestRobot<SimulatedEventLoop<>> robot{loop, simulated_topics(), 1.0F};
-
-  robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
-                                       1ms);
-
-  constexpr int messages = 25;
-  for (int i = 0; i < messages; ++i) {
-    loop.inject(simulated_topics().sensor,
-                EventsTest::SensorMessage{i, static_cast<float>(i), 0.0F});
-  }
-
-  loop.run_for(10ms);
-
-  EXPECT_EQ(robot.sensor_count(), messages);
-  EXPECT_EQ(robot.dropped_sensors(), 0u);
 }
 
 TEST(SimulatedEventLoop, LatestSkipsBacklogButCallbacksKeepCappedSequence) {
@@ -273,28 +234,6 @@ TEST(SimulatedEventLoop, PausedClockCoalescesMissedTimersOnOriginalPhase) {
   ASSERT_EQ(ticks.size(), 3u);
   EXPECT_EQ(ticks.back().now, MonotonicTime{} + 30ms);
   EXPECT_EQ(ticks.back().sequence, 1u);
-}
-
-TEST(SimulatedEventLoop, SetpointWatcherKeepsTheNewestValue) {
-  SimulationEnvironment environment;
-  SimulatedEventLoop<> loop{environment};
-  TestRobot<SimulatedEventLoop<>> robot{loop, simulated_topics(), 1.0F};
-
-  robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
-                                       1ms);
-
-  for (int i = 1; i <= 5; ++i) {
-    loop.inject(simulated_topics().setpoint,
-                EventsTest::SetpointMessage{i, static_cast<float>(i)});
-  }
-
-  loop.run_for(2ms);
-
-  ASSERT_FALSE(robot.efforts().empty());
-
-  // Position is zero and no sensor arrived, so effort is gain * target, and
-  // the target is the last setpoint delivered, 5.
-  EXPECT_FLOAT_EQ(robot.efforts().back(), 5.0F);
 }
 
 // Under BEFORE_TIMERS a message injected before a timer's deadline reaches

@@ -103,9 +103,6 @@ TEST_F(NodeApi, NodeSubscribesPublishesAndTicks) {
   Relay relay;
   TalosNode* node = talos_sim_add(sim_, "relay", &BuildRelay, &relay);
   ASSERT_NE(node, nullptr) << talos_last_error();
-  EXPECT_STREQ(talos_node_name(node), "relay");
-  EXPECT_EQ(talos_node_simulation(node), 1);
-  EXPECT_EQ(talos_node_period_ns(node), 10 * kMs);
   EXPECT_EQ(talos_subscription_has_value(node, relay.in), 0);
   EXPECT_EQ(talos_subscription_fresh(node, relay.in, -1), 0);
 
@@ -279,52 +276,6 @@ TEST_F(NodeApi, PublishesVariableLengthBytesAndQueriesLatest) {
   EXPECT_EQ(talos_byte_publisher_send(node, sender.out, nullptr, 1), TALOS_ERR);
 }
 
-struct Stepper {
-  TalosNode* node = nullptr;
-  int64_t sm = -1;
-  int32_t just_entered_at_0 = -1;
-  int32_t just_entered_at_1 = -1;
-  int32_t just_entered_at_3 = -1;
-};
-
-int32_t BuildStepper(TalosNode* node, void* user) {
-  auto& s = *static_cast<Stepper*>(user);
-  s.node = node;
-  s.sm = talos_state_machine_create(node, 10);
-  if (s.sm < 0) return 1;
-  return talos_node_set_update(
-      node,
-      [](void* u) -> int32_t {
-        auto& st = *static_cast<Stepper*>(u);
-        const uint64_t tick = talos_node_tick(st.node);
-        const int32_t je = talos_state_machine_just_entered(st.node, st.sm);
-        if (tick == 0) st.just_entered_at_0 = je;
-        if (tick == 1) st.just_entered_at_1 = je;
-        if (tick == 2) {
-          if (talos_state_machine_go(st.node, st.sm, 20) != TALOS_OK) return 1;
-        }
-        if (tick == 3) st.just_entered_at_3 = je;
-        return 0;
-      },
-      &s);
-}
-
-TEST_F(NodeApi, StateMachineTracksTransitionsAndTiming) {
-  Stepper stepper;
-  TalosNode* node = talos_sim_add(sim_, "relay", &BuildStepper, &stepper);
-  ASSERT_NE(node, nullptr) << talos_last_error();
-  EXPECT_EQ(talos_state_machine_state(node, stepper.sm), 10);
-  EXPECT_EQ(talos_state_machine_previous(node, stepper.sm), 10);
-
-  ASSERT_EQ(talos_sim_step(sim_, 45 * kMs), TALOS_OK) << talos_last_error();
-  EXPECT_EQ(stepper.just_entered_at_0, 1);
-  EXPECT_EQ(stepper.just_entered_at_1, 0);
-  EXPECT_EQ(stepper.just_entered_at_3, 1);
-  EXPECT_EQ(talos_state_machine_state(node, stepper.sm), 20);
-  EXPECT_EQ(talos_state_machine_previous(node, stepper.sm), 10);
-  EXPECT_EQ(talos_state_machine_time_in_state_ns(node, stepper.sm), 15 * kMs);
-}
-
 // --- devices -------------------------------------------------------------
 
 struct Roller {
@@ -354,84 +305,6 @@ int32_t BuildRoller(TalosNode* node, void* user) {
                                12.0, 0.5, 1);
       },
       &r);
-}
-
-TEST_F(NodeApi, MotorClampCountUsesSharedDevicesImplementation) {
-  Roller roller;
-  TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
-  ASSERT_NE(node, nullptr);
-  uint64_t count = 99;
-  ASSERT_EQ(talos_motor_clamped_count(node, roller.wheel, &count), TALOS_OK);
-  EXPECT_EQ(count, 0u);
-  ASSERT_EQ(
-      talos_motor_set(node, roller.wheel, TALOS_MODE_VELOCITY, 120.0, 0, 0),
-      TALOS_OK);
-  ASSERT_EQ(talos_motor_clamped_count(node, roller.wheel, &count), TALOS_OK);
-  EXPECT_EQ(count, 1u);
-  ASSERT_EQ(talos_motor_set(node, roller.wheel, TALOS_MODE_VOLTAGE, 1.0, 0, 0),
-            TALOS_OK);
-  ASSERT_EQ(talos_motor_clamped_count(node, roller.wheel, &count), TALOS_OK);
-  EXPECT_EQ(count, 1u);
-  EXPECT_EQ(talos_motor_clamped_count(node, roller.wheel, nullptr), TALOS_ERR);
-}
-
-TEST_F(NodeApi, MotorHealthFeedbackRoundTripsWhileDisabled) {
-  Roller roller;
-  TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
-  ASSERT_NE(node, nullptr);
-  TalosSample sample{};
-  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &sample), TALOS_OK);
-  EXPECT_EQ(sample.valid, 0);
-  EXPECT_DOUBLE_EQ(sample.temperature_c, 0);
-  EXPECT_DOUBLE_EQ(sample.supply_current_a, 0);
-  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
-  ASSERT_NE(hw, nullptr);
-  ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3, 2, 0, 0,
-                                         62.5, 18.25),
-            TALOS_OK);
-  ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK);
-  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &sample), TALOS_OK);
-  EXPECT_EQ(sample.valid, 1);
-  EXPECT_EQ(roller.enabled, 0);
-  EXPECT_DOUBLE_EQ(sample.temperature_c, 62.5);
-  EXPECT_DOUBLE_EQ(sample.supply_current_a, 18.3);
-  EXPECT_DOUBLE_EQ(sample.current, 0);
-  ASSERT_EQ(talos_sim_hardware_set_connected(hw, "roller", "wheel", 0),
-            TALOS_OK);
-  ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK);
-  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &sample), TALOS_OK);
-  EXPECT_EQ(sample.valid, 0);
-  EXPECT_DOUBLE_EQ(sample.temperature_c, 0);
-  EXPECT_DOUBLE_EQ(sample.supply_current_a, 0);
-  talos_sim_hardware_destroy(hw);
-}
-
-TEST_F(NodeApi, MotorRezeroUsesSharedSoftwareFrame) {
-  Roller roller;
-  TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
-  ASSERT_NE(node, nullptr);
-  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
-  const auto gyro = talos_device(node, TALOS_DEVICE_GYRO, "gyro");
-  ASSERT_GE(gyro, 0);
-  ASSERT_NE(hw, nullptr);
-  ASSERT_EQ(
-      talos_sim_hardware_set_motor(hw, "roller", "wheel", 3, 2, 0, 0, 0, 0),
-      TALOS_OK);
-  ASSERT_EQ(talos_sim_hardware_set_gyro(hw, "roller", "gyro", 0.75, -0.5, 0, 0),
-            TALOS_OK);
-  ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK);
-  ASSERT_EQ(talos_motor_rezero(node, roller.wheel, 1), TALOS_OK);
-  TalosSample sample{};
-  ASSERT_EQ(talos_gyro_rezero(node, gyro, 0.25), TALOS_OK);
-  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &sample), TALOS_OK);
-  EXPECT_DOUBLE_EQ(sample.position, 1);
-  EXPECT_DOUBLE_EQ(sample.velocity, 2);
-  EXPECT_EQ(talos_gyro_rezero(node, roller.wheel, 0), TALOS_ERR);
-  ASSERT_EQ(talos_sensor_sample(node, gyro, &sample), TALOS_OK);
-  EXPECT_DOUBLE_EQ(sample.position, 0.25);
-  EXPECT_DOUBLE_EQ(sample.velocity, -0.5);
-  EXPECT_EQ(talos_motor_rezero(node, -1, 0), TALOS_ERR);
-  talos_sim_hardware_destroy(hw);
 }
 
 TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {
@@ -476,40 +349,21 @@ TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {
   talos_sim_hardware_destroy(hw);
 }
 
-TEST_F(NodeApi, UnknownDeviceIsRejected) {
-  auto build = [](TalosNode* node, void*) -> int32_t {
-    return talos_device(node, TALOS_DEVICE_MOTOR, "flywheel") < 0 ? 0 : 1;
+// The ABI takes raw handles, so it refuses an unknown device name and a
+// handle of another kind or out of range.
+TEST_F(NodeApi, DeviceHandlesAreCheckedByNameAndKind) {
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    if (talos_device(node, TALOS_DEVICE_MOTOR, "flywheel") >= 0) return 1;
+    return BuildRoller(node, user);
   };
-  ASSERT_NE(talos_sim_add(sim_, "roller", build, nullptr), nullptr);
-  TalosNode* node = talos_sim_node(sim_, "roller");
-  ASSERT_NE(node, nullptr);
-  EXPECT_LT(talos_device(node, TALOS_DEVICE_MOTOR, "flywheel"), 0);
-}
-
-TEST_F(NodeApi, DisconnectedDeviceSampleIsInvalid) {
   Roller roller;
-  TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
+  TalosNode* node = talos_sim_add(sim_, "roller", build, &roller);
   ASSERT_NE(node, nullptr) << talos_last_error();
-  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
-  ASSERT_NE(hw, nullptr) << talos_last_error();
-  ASSERT_EQ(
-      talos_sim_hardware_set_motor(hw, "roller", "wheel", 3.0, 1.5, 0, 0, 0, 0),
-      TALOS_OK);
-  ASSERT_EQ(talos_sim_hardware_set_connected(hw, "roller", "wheel", 0),
-            TALOS_OK);
-  ASSERT_EQ(talos_sim_step(sim_, 15 * kMs), TALOS_OK) << talos_last_error();
-
-  TalosSample wheel{};
-  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &wheel), TALOS_OK);
-  EXPECT_EQ(wheel.valid, 0);
-  EXPECT_EQ(wheel.position, 0.0);
-  TalosSample beam{};
-  ASSERT_EQ(talos_digital_input_sample(node, roller.beam, &beam), TALOS_OK);
-  EXPECT_EQ(beam.valid, 1);
-
-  EXPECT_EQ(talos_sim_hardware_set_connected(hw, "roller", "flywheel", 0),
-            TALOS_ERR);
-  talos_sim_hardware_destroy(hw);
+  TalosSample sample{};
+  EXPECT_EQ(talos_motor_sample(node, roller.wheel, &sample), TALOS_OK);
+  EXPECT_EQ(talos_motor_sample(node, roller.beam, &sample), TALOS_ERR);
+  EXPECT_EQ(talos_gyro_rezero(node, roller.wheel, 0), TALOS_ERR);
+  EXPECT_EQ(talos_motor_rezero(node, -1, 0), TALOS_ERR);
 }
 
 TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {

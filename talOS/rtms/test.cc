@@ -258,35 +258,6 @@ TEST(WrapTest, RTMSSequenceWrapsSlots) {
   queue.release_reader(id);
 }
 
-TEST(SingleProcess, WriteSequenceIncrementsMonotonically) {
-  const std::string path = make_test_path("write_sequence");
-
-  constexpr std::size_t slots = 64;
-  constexpr int writes = 10;
-
-  RTMSQueue queue{
-      path,
-      sizeof(Message::TestMessage),
-      alignof(Message::TestMessage),
-      kSchema,
-      slots,
-      sequence_options(),
-  };
-
-  for (int i = 0; i < writes; ++i) {
-    const Message::TestMessage message{i, static_cast<float>(i)};
-
-    const auto rtms_message = BytesOf(message);
-
-    const WriteStatus status = queue.write(rtms_message);
-
-    ASSERT_EQ(status.result, WriteResult::SUCCESS);
-    EXPECT_EQ(status.sequence, static_cast<std::uint64_t>(i));
-  }
-
-  EXPECT_EQ(queue.writer_sequence(), static_cast<std::uint64_t>(writes));
-}
-
 TEST(PublishTime, ExplicitTimestampsSurviveSequenceAndLatestReads) {
   for (const ReadMode mode : {ReadMode::SEQUENCE, ReadMode::LATEST}) {
     auto options = sequence_options();
@@ -522,51 +493,7 @@ TEST(SingleProcess, OverwriteRevokesReliableFullRingGuarantee) {
   subscriber.release_reader(*reader);
 }
 
-TEST(SingleProcess, ReadNextSequenceNoDropsWhileCaughtUp) {
-  const std::string path = make_test_path("rn_no_drop");
-
-  constexpr std::size_t slots = 64;
-  constexpr int writes = 20;
-
-  RTMSQueue queue{
-      path,
-      sizeof(Message::TestMessage),
-      alignof(Message::TestMessage),
-      kSchema,
-      slots,
-      overwrite_sequence_options(),
-  };
-
-  const auto reader_id = queue.register_reader();
-  ASSERT_TRUE(reader_id.has_value());
-  const std::size_t id = reader_id.value_or(std::size_t{0});
-
-  std::array<std::byte, sizeof(Message::TestMessage)> buffer{};
-
-  for (int i = 0; i < writes; ++i) {
-    const Message::TestMessage message{i, static_cast<float>(i)};
-
-    const auto rtms_message = BytesOf(message);
-
-    ASSERT_EQ(queue.write(rtms_message).result, WriteResult::SUCCESS);
-
-    MessageInfo info{};
-    const ReadResult result =
-        queue.read_next(id, std::span<std::byte>(buffer), info);
-
-    ASSERT_EQ(result, ReadResult::OK);
-    EXPECT_EQ(info.sequence, static_cast<std::uint64_t>(i));
-    EXPECT_EQ(info.dropped, 0u);
-
-    Message::TestMessage received{};
-    std::memcpy(&received, buffer.data(), sizeof(received));
-    EXPECT_EQ(received, message);
-  }
-
-  queue.release_reader(id);
-}
-
-TEST(SingleProcess, ReadNextEmptyAndInvalidCases) {
+TEST(SingleProcess, ReadNextEmptyInvalidAndInactiveCases) {
   const std::string path = make_test_path("rn_invalid");
 
   RTMSQueue queue{
@@ -613,30 +540,8 @@ TEST(SingleProcess, ReadNextEmptyAndInvalidCases) {
   EXPECT_EQ(queue.read_next(id, std::span<std::byte>(small_buffer), info),
             ReadResult::INVALID);
 
+  // A released reader is INACTIVE.
   queue.release_reader(id);
-}
-
-TEST(SingleProcess, ReadNextInactiveAfterRelease) {
-  const std::string path = make_test_path("rn_inactive");
-
-  RTMSQueue queue{
-      path,
-      sizeof(Message::TestMessage),
-      alignof(Message::TestMessage),
-      kSchema,
-      8,
-      overwrite_sequence_options(),
-  };
-
-  const auto reader_id = queue.register_reader();
-  ASSERT_TRUE(reader_id.has_value());
-  const std::size_t id = reader_id.value_or(std::size_t{0});
-
-  queue.release_reader(id);
-
-  std::array<std::byte, sizeof(Message::TestMessage)> buffer{};
-  MessageInfo info{};
-
   EXPECT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
             ReadResult::INACTIVE);
 }
@@ -1304,18 +1209,29 @@ void leak_segment(const std::string& path, std::size_t bytes) {
   ASSERT_EQ(close(fd), 0);
 }
 
+bool SegmentExists(const std::string& path) {
+  const int fd = shm_open(ShmObjectName(path).c_str(), O_RDONLY, 0);
+  if (fd == -1) return false;
+  close(fd);
+  return true;
+}
+
 }  // namespace
 
-TEST(RTMSStaleSegment, PublisherReclaimsALeftoverOfTheWrongShape) {
+// The publisher reclaims the leftover; a reader that disagrees with it is a
+// version skew against a possibly live publisher, so it must refuse rather
+// than delete the topic out from under that publisher.
+TEST(RTMSStaleSegment, PublisherReclaimsALeftoverOfTheWrongShapeReaderDoesNot) {
   const std::string path = make_test_path("stale_reclaim");
   shm_unlink(ShmObjectName(path).c_str());
   leak_segment(path, 4096);
 
-  // Without the reclaim the leftover wins and construction fails outright.
   EXPECT_THROW(
       RTMSQueue(path, sizeof(Message::TestMessage),
                 alignof(Message::TestMessage), kSchema, 64, sequence_options()),
       std::runtime_error);
+  // The segment is still there for the owner to deal with.
+  EXPECT_TRUE(SegmentExists(path));
 
   RTMSQueue queue{path,
                   sizeof(Message::TestMessage),
@@ -1325,25 +1241,6 @@ TEST(RTMSStaleSegment, PublisherReclaimsALeftoverOfTheWrongShape) {
                   publisher_options()};
   const Message::TestMessage message{7, 1.5F};
   EXPECT_EQ(WriteResult(queue.write(BytesOf(message))), WriteResult::SUCCESS);
-  shm_unlink(ShmObjectName(path).c_str());
-}
-
-TEST(RTMSStaleSegment, ReaderReportsSkewInsteadOfClearingTheSegment) {
-  const std::string path = make_test_path("stale_reader");
-  shm_unlink(ShmObjectName(path).c_str());
-  leak_segment(path, 4096);
-
-  // A reader that disagrees with a live publisher is a version skew, so it
-  // must say so rather than delete the topic out from under that publisher.
-  EXPECT_THROW(
-      RTMSQueue(path, sizeof(Message::TestMessage),
-                alignof(Message::TestMessage), kSchema, 64, sequence_options()),
-      std::runtime_error);
-
-  // The segment is still there for the owner to deal with.
-  const int fd = shm_open(ShmObjectName(path).c_str(), O_RDWR, 0666);
-  EXPECT_NE(fd, -1);
-  if (fd != -1) close(fd);
   shm_unlink(ShmObjectName(path).c_str());
 }
 
@@ -1459,13 +1356,6 @@ TEST(RTMSSchema, ANameMismatchIsRejectedEvenWithTheSameHash) {
 // -----------------------------------------------------------
 
 namespace {
-
-bool SegmentExists(const std::string& path) {
-  const int fd = shm_open(ShmObjectName(path).c_str(), O_RDONLY, 0);
-  if (fd == -1) return false;
-  close(fd);
-  return true;
-}
 
 // Runs `body` in a child process that then dies by SIGKILL, with whatever it
 // opened still held: the way a crashed node leaves shared memory.

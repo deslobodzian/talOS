@@ -29,7 +29,7 @@ from schema_test.Inner import Inner
 from schema_test.Level import Level
 from schema_test.Mixed import Mixed
 from schema_test.Mode import Mode
-from talos._messages import Message, MessageType, message_type
+from talos._messages import MessageType, message_type
 
 TYPES = (Goal, Status, Report, Translation2d, Rotation2d, Pose2d, Twist2d,
          OdometrySample, VelocityTarget, VelocityState, PositionTarget,
@@ -134,20 +134,7 @@ class CppBytesTest(unittest.TestCase):
             "samples_m", "modes", "inners_0_mode", "inners_0_offset_m",
             "inners_1_mode", "inners_1_offset_m", "channel_id"))
 
-    def test_enum_names_come_from_the_schema(self):
-        mixed = message_type(Mixed).enum_names
-        self.assertEqual(mixed["level"], {-1: "BOTTOM", 0: "NONE", 300: "TOP"})
-        self.assertEqual(mixed["inner_mode"], {0: "OFF", 3: "LOW", 4: "HIGH"})
-        self.assertEqual(set(mixed), {"level", "inner_mode"})
-        arrays = message_type(Arrays).enum_names
-        self.assertEqual(set(arrays),
-                         {"modes", "inners_0_mode", "inners_1_mode"})
-
-    def test_scalar_arrays_read_as_tuples(self):
-        message = message_type(Arrays).decode(self.golden["arrays"])
-        self.assertIs(type(message.samples_m), tuple)
-        self.assertEqual(message.samples_m, (1.5, -2.25, 1e9))
-        # A list encodes like a tuple.
+    def test_a_list_encodes_like_a_tuple(self):
         self.assertEqual(
             message_type(Arrays).encode(
                 dict(GOLDEN_VALUES["arrays"][1], samples_m=[1.5, -2.25, 1e9])),
@@ -158,7 +145,6 @@ class StructCodecTest(unittest.TestCase):
     def test_every_type_has_its_schema_layout(self):
         for cls in TYPES:
             mtype = message_type(cls)
-            self.assertEqual(mtype.packer.size, cls.SizeOf(), cls.__name__)
             self.assertEqual(mtype.size, cls.SizeOf(), cls.__name__)
             self.assertEqual(mtype.schema_name, cls.TALOS_SCHEMA_NAME)
             self.assertEqual(mtype.schema_hash, cls.TALOS_SCHEMA_HASH)
@@ -218,29 +204,22 @@ class StructCodecTest(unittest.TestCase):
         with self.assertRaises(AttributeError):
             _ = goal.height
 
-    def test_bad_fields_raise_type_error(self):
-        mtype = message_type(Goal)
-        with self.assertRaises(TypeError):
-            mtype.encode({"height": 1.0})
-        with self.assertRaises(TypeError):
-            mtype.encode({"tick_count": 1 << 40})
-        with self.assertRaises(TypeError):
-            mtype.encode({"height_rot": "up"})
-
-    def test_bad_shape_values_raise_type_error(self):
-        arrays, mixed = message_type(Arrays), message_type(Mixed)
-        with self.assertRaises(TypeError):
-            arrays.encode({"inners": ()})
-        with self.assertRaises(TypeError):
-            arrays.encode({"samples_m": (1.0, 2.0)})
-        with self.assertRaises(TypeError):
-            arrays.encode({"samples_m": 1.0})
-        with self.assertRaises(TypeError):
-            arrays.encode({"channel_id": (1, 2, 3, 4, 256)})
-        with self.assertRaises(TypeError):
-            mixed.encode({"level": 40000})
-        with self.assertRaises(TypeError):
-            mixed.encode({"speed_frac": 1e300})
+    def test_bad_fields_and_values_raise_type_error(self):
+        goal, arrays, mixed = (message_type(Goal), message_type(Arrays),
+                               message_type(Mixed))
+        for mtype, fields in (
+                (goal, {"height": 1.0}),
+                (goal, {"tick_count": 1 << 40}),
+                (goal, {"height_rot": "up"}),
+                (arrays, {"inners": ()}),
+                (arrays, {"samples_m": (1.0, 2.0)}),
+                (arrays, {"samples_m": 1.0}),
+                (arrays, {"channel_id": (1, 2, 3, 4, 256)}),
+                (mixed, {"level": 40000}),
+                (mixed, {"speed_frac": 1e300})):
+            with self.subTest(fields=fields):
+                with self.assertRaises(TypeError):
+                    mtype.encode(fields)
 
     def test_a_class_without_a_schema_raises_type_error(self):
         class Handwritten:

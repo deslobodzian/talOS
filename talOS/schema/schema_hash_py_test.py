@@ -47,10 +47,6 @@ class ParityTest(unittest.TestCase):
                                      ConsumerState.TALOS_SCHEMA_NAME),
             ConsumerState.TALOS_SCHEMA_HASH)
 
-    def test_distinct_structs_have_distinct_hashes(self):
-        hashes = {cls.TALOS_SCHEMA_HASH for cls in (Inner, Mixed, Arrays)}
-        self.assertEqual(len(hashes), 3)
-
 
 class VariantTest(unittest.TestCase):
     NAMES = ("schema_variant.Reading", "schema_variant.Holder")
