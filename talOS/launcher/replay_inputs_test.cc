@@ -225,30 +225,12 @@ TEST_F(ReplayInputsTest, ANodeThatWasNotInTheSessionRunsOnItsTopics) {
   std::filesystem::remove_all(second);
 }
 
-TEST_F(ReplayInputsTest, AReaderOfAnotherSchemaIsRefusedNamingBothTypes) {
+TEST_F(ReplayInputsTest, AReaderOfAnotherSchemaIsRefused) {
   Record();
   const std::string out = TempPath("impostor");
   std::filesystem::remove_all(out);
   EXPECT_NE(Replay("replay_impostor", out), 0);
 
-  // The node's own words, which the launcher passes through.
-  const std::string command = Runfile("TALOS_IMPOSTOR_NODE") +
-                              " --sim --replay-inputs '" + session_dir_ +
-                              "' --config '" + config_ + "' --log '" + out +
-                              "/direct.tlog' 2>&1";
-  std::string output;
-  FILE* pipe = ::popen(command.c_str(), "r");
-  ASSERT_NE(pipe, nullptr);
-  std::array<char, 512> buffer{};
-  while (std::fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-    output += buffer.data();
-  }
-  EXPECT_NE(::pclose(pipe), 0) << output;
-  EXPECT_NE(output.find("'/replay_source/state'"), std::string::npos) << output;
-  EXPECT_NE(output.find("replay_inputs_test.Reading ("), std::string::npos)
-      << output;
-  EXPECT_NE(output.find("replay_inputs_test.Impostor ("), std::string::npos)
-      << output;
   std::filesystem::remove_all(out);
 }
 

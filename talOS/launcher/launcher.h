@@ -187,6 +187,9 @@ struct LauncherOptions {
   int restart_window_ms{60000};
   int heartbeat_periods{10};
   int heartbeat_startup_grace_ms{5000};
+  // Internal supervision seam; production uses the fixed registry deadline.
+  std::chrono::milliseconds construction_timeout{
+      introspect::kConstructionTimeout};
 
   // Launch a graph the linter called broken anyway. The default is refusal:
   // two spellings of one topic are silent at runtime.
@@ -270,8 +273,9 @@ inline bool LoadBundle(LauncherOptions& options, std::string& error) {
           }
         }
         if (const auto binary = (*node)["binary"].value<std::string>()) {
+          const std::string path = (root / *binary).string();
           for (const auto& key : keys) {
-            options.binary_overrides[key] = (root / *binary).string();
+            options.binary_overrides[key] = path;
           }
         }
       }
@@ -595,7 +599,7 @@ inline bool ProbeDescribe(const std::string& binary_path,
   std::string text;
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   bool timed_out = false;
-  constexpr std::size_t kMaxDescribeBytes = 4 * 1024 * 1024;
+  constexpr std::size_t kMaxDescribeBytes = std::size_t{4} * 1024 * 1024;
   for (;;) {
     const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
         deadline - std::chrono::steady_clock::now());
@@ -1811,6 +1815,8 @@ class Launcher {
           registry.emplace(introspect::kRegistryPath, true);
         } catch (const std::runtime_error&) {
           // Nodes create the registry asynchronously; never create it here.
+          // Left empty, the next pass retries the attach.
+          registry.reset();
         }
       }
       for (std::size_t i = 0; i < procs.size(); ++i) {
@@ -1864,7 +1870,7 @@ class Launcher {
           // until a row arrives, the spawn time is the last progress time.
           const bool construction_expired =
               constructing &&
-              now - launch.started_at >= introspect::kConstructionTimeout;
+              now - launch.started_at >= options_.construction_timeout;
           if (construction_expired ||
               (grace_over &&
                now - launch.heartbeat_changed_at >= launch.heartbeat_timeout)) {

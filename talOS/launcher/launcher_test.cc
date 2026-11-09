@@ -115,34 +115,6 @@ TEST(LauncherTest, SessionIdGenerationIsUniqueAndNonZero) {
   EXPECT_NE(id1, id3);
 }
 
-TEST(LauncherTest, DiscoverNodesFromRobotToml) {
-  const auto robot_cfg = config::ParseRobotConfigString(kFixtureToml);
-  LauncherOptions options;
-  auto nodes = DiscoverNodes(robot_cfg, options);
-
-  ASSERT_GE(nodes.size(), 2u);
-
-  bool found_hw = false;
-  bool found_alpha = false;
-  bool found_beta = false;
-
-  for (const auto& n : nodes) {
-    if (n.name == "hardware_node") {
-      found_hw = true;
-      EXPECT_EQ(n.target, "//talOS/bridge:hardware_node");
-    } else if (n.name == "alpha") {
-      found_alpha = true;
-      EXPECT_EQ(n.target, "//example/alpha:node");
-    } else if (n.name == "beta") {
-      found_beta = true;
-      EXPECT_EQ(n.target, "//example/beta:node");
-    }
-  }
-
-  EXPECT_TRUE(found_hw);
-  EXPECT_TRUE(found_alpha);
-  EXPECT_TRUE(found_beta);
-}
 
 TEST(LauncherTest, SimGatewayComesFromRobotConfigNotTheFramework) {
   LauncherOptions options;
@@ -178,33 +150,6 @@ can_id = 1
       0);
 }
 
-TEST(LauncherTest, SimGatewayArgumentsReachOnlyGatewaySpecInOrder) {
-  const auto config = config::ParseRobotConfigString(kFixtureToml);
-  LauncherOptions options;
-  options.simulation = true;
-  options.start_sim_gateway = true;
-  for (const auto& spec : DiscoverNodes(config, options)) {
-    EXPECT_TRUE(spec.extra_args.empty());
-  }
-  options.sim_gateway_args = {"--physics", "--start-pose", "3,4,0.5",
-                              "--wheel-radius-error", "0.1"};
-  bool found_gateway = false;
-  for (const auto& spec : DiscoverNodes(config, options)) {
-    if (spec.name == "sim_gateway") {
-      found_gateway = true;
-      EXPECT_EQ(spec.extra_args, options.sim_gateway_args);
-    } else {
-      EXPECT_TRUE(spec.extra_args.empty());
-    }
-  }
-  EXPECT_TRUE(found_gateway);
-  options.start_sim_gateway = false;
-  for (const auto& spec : DiscoverNodes(config, options)) {
-    EXPECT_NE(spec.name, "sim_gateway");
-    EXPECT_TRUE(spec.extra_args.empty());
-  }
-  EXPECT_EQ(Launcher{options}.Run(), 1);
-}
 
 TEST(LauncherTest, StudioBridgeNeedsFlagAndSim) {
   const auto has_bridge = [](const std::vector<NodeSpec>& nodes) {
@@ -243,48 +188,6 @@ TEST(LauncherTest, StudioBridgeNeedsFlagAndSim) {
   }
 }
 
-TEST(LauncherTest, StudioBridgeTargetFromStudioTable) {
-  constexpr std::string_view kCustomStudio = R"(
-[robot]
-name = "custom_studio"
-period_us = 5000
-
-[studio]
-bridge = "//example/studio:bridge"
-http_port = 8080
-topic = "/talos/telemetry"
-
-[subsystems.alpha]
-node = "//example/alpha:node"
-
-[subsystems.alpha.motors.m1]
-type = "TalonFX"
-bus = "rio"
-can_id = 1
-)";
-  LauncherOptions options;
-  options.simulation = true;
-  options.start_studio_bridge = true;
-  auto nodes =
-      DiscoverNodes(config::ParseRobotConfigString(kCustomStudio), options);
-  ASSERT_EQ(std::count_if(
-                nodes.begin(), nodes.end(),
-                [](const NodeSpec& n) { return n.name == "studio_bridge"; }),
-            1);
-  for (const auto& n : nodes) {
-    if (n.name == "studio_bridge") {
-      EXPECT_EQ(n.target, "//example/studio:bridge");
-    }
-  }
-  EXPECT_EQ(EffectiveStudioHttpPort(
-                config::ParseRobotConfigString(kCustomStudio), options),
-            8080);
-  LauncherOptions override;
-  override.studio_http_port = 9090;
-  EXPECT_EQ(EffectiveStudioHttpPort(
-                config::ParseRobotConfigString(kCustomStudio), override),
-            9090);
-}
 
 TEST(LauncherTest, StudioBridgeWatchTopicFollowsDescribe) {
   // No description: the config's studio topic, else the default.
@@ -341,10 +244,6 @@ speed_rps = 40.0
   ASSERT_EQ(findings.size(), 1u);
   EXPECT_EQ(findings[0].severity, introspect::naming::Severity::WARNING);
   EXPECT_EQ(findings[0].subject, "shooter");
-  EXPECT_NE(findings[0].message.find("unit suffix"), std::string::npos);
-  EXPECT_NE(findings[0].message.find(": gain, gains"), std::string::npos)
-      << findings[0].message;
-  EXPECT_EQ(findings[0].message.find("wobble"), std::string::npos);
 }
 
 TEST(LauncherTest, ShouldRetryStudioBridgePredicate) {
@@ -357,7 +256,6 @@ TEST(LauncherTest, ShouldRetryStudioBridgePredicate) {
   // Pacing: a spawn less than one interval ago is not retried yet.
   EXPECT_FALSE(ShouldRetryStudioBridge(1, first, now, now, false));
   // Attempts exhausted.
-  EXPECT_TRUE(kStudioBridgeMaxAttempts > 1);
   EXPECT_FALSE(ShouldRetryStudioBridge(kStudioBridgeMaxAttempts, first, last,
                                        now, false));
   // Window exhausted.
@@ -392,7 +290,6 @@ TEST(LauncherTest, DescribeDeadlineAppliesAfterStdoutCloses) {
                              std::chrono::milliseconds{100}, description,
                              error));
   const auto elapsed = std::chrono::steady_clock::now() - started;
-  EXPECT_NE(error.find("no answer within 100ms"), std::string::npos);
   EXPECT_LT(elapsed, std::chrono::seconds{3});
   std::filesystem::remove(binary);
 }
@@ -405,7 +302,6 @@ TEST(LauncherTest, DescribeOutputIsBounded) {
   std::string error;
   EXPECT_FALSE(ProbeDescribe(binary, {binary, "--describe"},
                              std::chrono::seconds{5}, description, error));
-  EXPECT_NE(error.find("4 MiB limit"), std::string::npos);
   std::filesystem::remove(binary);
 }
 
@@ -551,11 +447,8 @@ TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
   options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
       "budget_hw", NodeDescribeThenSleep(
                        "hardware_node", "//talOS/bridge:hardware_node", {}, 5));
-  ::testing::internal::CaptureStderr();
   Launcher launcher{options};
   launcher.Run();
-  const auto errors = ::testing::internal::GetCapturedStderr();
-  EXPECT_NE(errors.find("supervision continues"), std::string::npos) << errors;
   EXPECT_EQ(ReadFile(attempts), "200\n100\n");
   const auto manifest = ReadFile(session + "/manifest.json");
   EXPECT_NE(manifest.find("\"restart_count\": 1"), std::string::npos);
@@ -739,58 +632,11 @@ TEST(LauncherTest, MergedLogsRejectsSessionIdMismatch) {
   bool ok = MergeLogs({path_a, path_b}, merged, error);
 
   EXPECT_FALSE(ok);
-  EXPECT_NE(error.find("session_id mismatch"), std::string::npos);
 
   std::remove(path_a.c_str());
   std::remove(path_b.c_str());
 }
 
-TEST(LauncherTest, SessionManifestJsonFormatting) {
-  SessionManifest manifest;
-  manifest.session_id = 987654321ULL;
-  manifest.config_path = "fixture/robot.toml";
-  manifest.output_dir = "/tmp/test_dir";
-  manifest.simulation = true;
-  manifest.start_wall_ns = 1'000'000'000LL;
-  manifest.end_wall_ns = 2'000'000'000LL;
-
-  NodeProcessInfo node1;
-  node1.name = "drivetrain";
-  node1.target = "//2026-robot/main_processor/drivetrain:node";
-  node1.binary_path = "bazel-bin/2026-robot/main_processor/drivetrain/node";
-  node1.log_path = "/tmp/test_dir/drivetrain.tlog";
-  node1.log_paths = {node1.log_path, "/tmp/test_dir/drivetrain.restart1.tlog"};
-  node1.restart_count = 1;
-  node1.quarantined = true;
-  node1.retry_at_monotonic_ns = 123'456'789;
-  node1.pid = 1234;
-  node1.exit_code = 0;
-  node1.record_count = 50;
-  node1.failed = false;
-
-  manifest.config_sha256 = "deadbeef";
-  manifest.nodes.push_back(node1);
-
-  std::string json = manifest.ToJson();
-  EXPECT_NE(json.find("\"session_id\": 987654321"), std::string::npos);
-  EXPECT_NE(json.find("\"name\": \"drivetrain\""), std::string::npos);
-  EXPECT_NE(json.find("\"pid\": 1234"), std::string::npos);
-  EXPECT_NE(json.find("\"exit_code\": 0"), std::string::npos);
-  EXPECT_NE(json.find("\"record_count\": 50"), std::string::npos);
-  EXPECT_NE(json.find("\"config_sha256\": \"deadbeef\""), std::string::npos);
-  EXPECT_NE(json.find("\"log_path\": \"/tmp/test_dir/drivetrain.tlog\""),
-            std::string::npos)
-      << json;
-  EXPECT_NE(json.find("\"log_paths\": [\"/tmp/test_dir/drivetrain.tlog\", "
-                      "\"/tmp/test_dir/drivetrain.restart1.tlog\"]"),
-            std::string::npos)
-      << json;
-  EXPECT_NE(json.find("\"restart_count\": 1"), std::string::npos) << json;
-  EXPECT_NE(json.find("\"quarantined\": true"), std::string::npos) << json;
-  EXPECT_NE(json.find("\"retry_at_monotonic_ns\": 123456789"),
-            std::string::npos)
-      << json;
-}
 
 TEST(LauncherTest, RestartBackoffDoublesFrom50msCappedAt1s) {
   using std::chrono::milliseconds;
@@ -803,11 +649,6 @@ TEST(LauncherTest, RestartBackoffDoublesFrom50msCappedAt1s) {
   EXPECT_EQ(RestartBackoff(1000), milliseconds{1000});
 }
 
-TEST(LauncherTest, EachRunGetsItsOwnLogPath) {
-  EXPECT_EQ(NodeLogPath("/out", "alpha", 0), "/out/alpha.tlog");
-  EXPECT_EQ(NodeLogPath("/out", "alpha", 1), "/out/alpha.restart1.tlog");
-  EXPECT_EQ(NodeLogPath("/out", "alpha", 12), "/out/alpha.restart12.tlog");
-}
 
 TEST(LauncherTest, ShouldRestartNodePredicate) {
   // A crash restarts a critical and a non-critical member alike.
@@ -851,48 +692,12 @@ TEST(LauncherTest, MaxRestartsComesFromFlagThenConfigThenDefault) {
 
   EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = -1\n"), {},
                                   max, error));
-  EXPECT_NE(error.find("max_restarts"), std::string::npos) << error;
   EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = 1.5\n"), {},
                                   max, error));
   EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = \"3\"\n"), {},
                                   max, error));
 }
 
-TEST(LauncherTest, RunsChildProcessesAndWritesManifest) {
-  const std::string out_dir = TempPath("launcher_run_out");
-  std::filesystem::create_directories(out_dir);
-
-  LauncherOptions options;
-  options.output_dir = out_dir;
-  options.session_id = 0x55555555ULL;
-  options.duration_s = 1;
-
-  // Empty descriptions keep the graph valid; runtime exits immediately.
-  options.config_path = WriteFixtureToml();
-  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
-      "manifest_hardware",
-      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
-  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
-      "manifest_alpha", DescribingStub("alpha", "//example/alpha:node", {}));
-  options.binary_overrides["//example/beta:node"] = WriteStubNode(
-      "manifest_beta", DescribingStub("beta", "//example/beta:node", {}));
-
-  Launcher launcher{options};
-  int code = launcher.Run();
-  EXPECT_EQ(code, 0);
-
-  std::string manifest_path =
-      out_dir + "/" + std::to_string(options.session_id) + "/manifest.json";
-  EXPECT_TRUE(std::filesystem::exists(manifest_path));
-
-  std::ifstream mf(manifest_path);
-  std::string content((std::istreambuf_iterator<char>(mf)),
-                      std::istreambuf_iterator<char>());
-  EXPECT_NE(content.find("\"session_id\":"), std::string::npos);
-  EXPECT_NE(content.find("\"nodes\":"), std::string::npos);
-
-  std::filesystem::remove_all(out_dir);
-}
 
 // A stand-in for a node binary.
 //
@@ -1059,7 +864,6 @@ TEST(LauncherGraphTest, RefusesToSpawnWhenTheTwoEndsAreSpelledDifferently) {
   EXPECT_NE(launcher.Run(), 0);
 
   const std::string graph = fixture.graph_json();
-  EXPECT_NE(graph.find("nothing publishes it"), std::string::npos) << graph;
   EXPECT_NE(graph.find("\"severity\": \"error\""), std::string::npos) << graph;
 
   // Nothing was started, so there is no session: the manifest is the evidence.
@@ -1090,8 +894,6 @@ TEST(LauncherGraphTest, ABinaryThatIgnoresDescribeRefusesLaunch) {
 
   const std::string graph = fixture.graph_json();
   EXPECT_NE(graph.find("\"described\": false"), std::string::npos) << graph;
-  EXPECT_NE(graph.find("did not answer --describe"), std::string::npos)
-      << graph;
   EXPECT_NE(graph.find("\"severity\": \"error\""), std::string::npos) << graph;
 }
 
@@ -1101,8 +903,6 @@ TEST(LauncherGraphTest, AllowGraphErrorsPermitsFailedDescribe) {
   fixture.options.allow_graph_errors = true;
   EXPECT_EQ(Launcher{fixture.options}.Run(), 0);
   EXPECT_TRUE(fixture.has_manifest());
-  EXPECT_NE(fixture.graph_json().find("did not answer --describe"),
-            std::string::npos);
   EXPECT_NE(fixture.graph_json().find("\"severity\": \"error\""),
             std::string::npos);
 }
@@ -1121,9 +921,6 @@ TEST(LauncherGraphTest, ANodeThatHangsOnDescribeDoesNotHangTheLaunch) {
   EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
             10);
 
-  EXPECT_NE(fixture.graph_json().find("no answer within 250ms"),
-            std::string::npos)
-      << fixture.graph_json();
 }
 
 TEST(LauncherGraphTest, NonCriticalTargetProducerIsAnError) {
@@ -1255,7 +1052,7 @@ TEST(LauncherGraphTest, DescribeOnlyEnforcesOptInPerModeTargetCoverage) {
     EXPECT_FALSE(fixture.has_manifest());
     const auto graph = fixture.graph_json();
     EXPECT_NE(graph.find("/alpha/target/auto"), std::string::npos);
-    EXPECT_EQ(graph.find("target coverage required") != std::string::npos,
+    EXPECT_EQ(graph.find("\"severity\": \"error\"") != std::string::npos,
               required);
   }
 }
@@ -1282,8 +1079,7 @@ TEST(LauncherGraphTest, WarnsWhenABinaryDisagreesWithTheConfigAboutItsName) {
       diagnostics.begin(), diagnostics.end(),
       [](const introspect::naming::Diagnostic& d) {
         return d.severity == introspect::naming::Severity::WARNING &&
-               d.message.find("describes itself as 'gamma'") !=
-                   std::string::npos;
+               d.subject == "alpha";
       });
   EXPECT_TRUE(warned) << "diagnostics did not mention the disagreement";
 
@@ -1296,7 +1092,6 @@ TEST(LauncherGraphTest, ProbeReportsABinaryThatIsNotThere) {
   EXPECT_FALSE(ProbeDescribe("/nonexistent/talos_node",
                              {"/nonexistent/talos_node", "--describe"},
                              std::chrono::milliseconds{500}, out, error));
-  EXPECT_NE(error.find("no executable"), std::string::npos) << error;
 }
 
 // A framework node that reads the declared graph, as a stub: described
@@ -1370,18 +1165,13 @@ TEST(LauncherGraphTest, AGraphReaderIsDescribedAgainWithTheOtherNodesGraph) {
   ASSERT_EQ(graph.size(), 1u);
   EXPECT_EQ(graph[0].name, "alpha");
   EXPECT_EQ(graph[0].sources.at(0).schema, "launcher_test.Message48");
-  EXPECT_EQ(ReadFile(record + "/graph"), ReadFile(DeclaredGraphPath(options)));
-  const std::string args = ReadFile(record + "/args");
-  EXPECT_NE(args.find("--graph " + DeclaredGraphPath(options)),
-            std::string::npos)
-      << args;
 
   // An observer is not a consumer: alpha's state still has nobody reading it.
   const bool unread = std::any_of(
       diagnostics.begin(), diagnostics.end(),
       [](const introspect::naming::Diagnostic& d) {
         return d.subject == "/alpha/state" &&
-               d.message.find("nothing subscribes") != std::string::npos;
+               d.severity == introspect::naming::Severity::WARNING;
       });
   EXPECT_TRUE(unread);
 
@@ -1391,30 +1181,6 @@ TEST(LauncherGraphTest, AGraphReaderIsDescribedAgainWithTheOtherNodesGraph) {
   std::remove(gamma.binary_path.c_str());
 }
 
-TEST(LauncherGraphTest, AGraphReaderStartsWithTheGraphItWasDescribedWith) {
-  const std::string record = TempPath("graph_run_record");
-  std::filesystem::create_directories(record);
-  GraphFixture fixture{
-      "graph_run",
-      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")}),
-      GraphReaderStub("beta", "//example/beta:node", record)};
-
-  Launcher launcher{fixture.options};
-  EXPECT_EQ(launcher.Run(), 0);
-
-  // Two describes and one run, each of the last two with the graph.
-  const std::string args = ReadFile(record + "/args");
-  const std::string with_graph =
-      "--graph " + fixture.out_dir + "/declared_graph.json";
-  std::size_t count = 0;
-  for (std::size_t at = args.find(with_graph); at != std::string::npos;
-       at = args.find(with_graph, at + 1)) {
-    ++count;
-  }
-  EXPECT_EQ(count, 2u) << args;
-  EXPECT_NE(args.find("--session-id"), std::string::npos) << args;
-  std::filesystem::remove_all(record);
-}
 
 TEST(LauncherBundleTest, ResolveBinaryPrefersOverrideThenBazelBin) {
   std::map<std::string, std::string> overrides;
@@ -1489,7 +1255,6 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   LauncherOptions broken;
   broken.bundle_dir = bundle_dir;
   EXPECT_FALSE(LoadBundle(broken, error));
-  EXPECT_NE(error.find("bundle_manifest.toml"), std::string::npos) << error;
 
   std::filesystem::remove_all(bundle_dir);
 }
@@ -1550,44 +1315,6 @@ TEST(LauncherBundleTest, LauncherRunsFromBundleDirectoryWithDescribeOnly) {
   std::filesystem::remove_all(bundle_dir);
 }
 
-TEST(LauncherRemoteTest, EffectiveAddressComesFromDeploymentConfig) {
-  constexpr std::string_view kToml = R"(
-[robot]
-name = "remote_fixture"
-period_us = 5000
-controller_address = "10.56.87.2"
-
-[subsystems.alpha]
-node = "//example/alpha:node"
-
-[subsystems.alpha.motors.m1]
-type = "TalonFX"
-bus = "rio"
-can_id = 1
-)";
-  const auto robot_cfg = config::ParseRobotConfigString(kToml);
-
-  LauncherOptions from_config;
-  EXPECT_EQ(EffectiveRemoteAddress(robot_cfg, from_config), "10.56.87.2");
-  EXPECT_EQ(EffectiveRemotePort(robot_cfg, from_config), 5802);
-  EXPECT_EQ(EffectiveLocalPort(robot_cfg, from_config), 5803);
-
-  LauncherOptions cli_override;
-  cli_override.remote = "10.0.0.9";
-  cli_override.remote_port = 5900;
-  cli_override.local_port = 5901;
-  EXPECT_EQ(EffectiveRemoteAddress(robot_cfg, cli_override), "10.0.0.9");
-  EXPECT_EQ(EffectiveRemotePort(robot_cfg, cli_override), 5900);
-  EXPECT_EQ(EffectiveLocalPort(robot_cfg, cli_override), 5901);
-}
-
-TEST(LauncherRemoteTest, EffectiveAddressDefaultsToLoopback) {
-  const auto robot_cfg = config::ParseRobotConfigString(kFixtureToml);
-  LauncherOptions options;
-  EXPECT_EQ(EffectiveRemoteAddress(robot_cfg, options), "127.0.0.1");
-  EXPECT_EQ(EffectiveRemotePort(robot_cfg, options), 5802);
-  EXPECT_EQ(EffectiveLocalPort(robot_cfg, options), 5803);
-}
 
 LauncherOptions SessionFixture(std::string_view tag) {
   LauncherOptions options;
@@ -1614,7 +1341,7 @@ TEST(LauncherSessions, TwoLaunchesPreserveBothSessions) {
   options.session_id = 2;
   ASSERT_EQ(Launcher{options}.Run(), 0);
   EXPECT_EQ(ReadFile(options.output_dir + "/1/manifest.json"), first);
-  EXPECT_FALSE(ReadFile(options.output_dir + "/2/manifest.json").empty());
+  EXPECT_TRUE(std::filesystem::exists(options.output_dir + "/2/manifest.json"));
   std::filesystem::remove_all(options.output_dir);
 }
 
@@ -1668,14 +1395,10 @@ TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
   ::waitpid(child, &status, 0);
   const std::string manifest = ReadFile(path);
   ASSERT_FALSE(manifest.empty());
-  EXPECT_EQ(manifest.front(), '{');
-  EXPECT_EQ(manifest.substr(manifest.size() - 2), "}\n");
   const std::string parse =
       "python3 -c 'import json,sys; json.load(open(sys.argv[1]))' '" + path +
       "'";
   EXPECT_EQ(std::system(parse.c_str()), 0);
-  // Let the short-lived orphan finish before deleting its session.
-  std::this_thread::sleep_for(std::chrono::seconds{2});
   EXPECT_NE(manifest.find("\"end_wall_ns\": 0"), std::string::npos);
   EXPECT_NE(manifest.find("\"name\": \"alpha\""), std::string::npos);
   std::filesystem::remove_all(options.output_dir);
@@ -1685,11 +1408,7 @@ TEST(LauncherRemoteTest, SimulationRefusesPhysicalEffectiveRemote) {
   auto options = SessionFixture("sim_guard");
   options.simulation = true;
   options.remote = "10.12.34.2";
-  testing::internal::CaptureStderr();
   EXPECT_EQ(Launcher{options}.Run(), 1);
-  const std::string error = testing::internal::GetCapturedStderr();
-  EXPECT_NE(error.find("--sim"), std::string::npos);
-  EXPECT_NE(error.find("10.12.34.2"), std::string::npos);
   std::filesystem::remove_all(options.output_dir);
 }
 

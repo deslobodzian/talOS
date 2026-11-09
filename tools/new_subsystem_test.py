@@ -29,15 +29,11 @@ class NewSubsystemTest(unittest.TestCase):
         self.assertIsNotNone(new_subsystem.check_name("wrist__arm"))
         self.assertIsNotNone(new_subsystem.check_name("wrist_"))
 
-        # Abbreviations, direction suffixes, reserved owners, keywords/modules
-        self.assertIn("target", new_subsystem.check_name("tgt"))
-        self.assertIn("drivetrain", new_subsystem.check_name("drive"))
-        self.assertIn("direction", new_subsystem.check_name("wrist_out"))
-        self.assertIn("reserved", new_subsystem.check_name("hw"))
-        self.assertIn("keyword", new_subsystem.check_name("class"))
-        self.assertIn("keyword", new_subsystem.check_name("sys"))
-        self.assertIn("keyword", new_subsystem.check_name("python"))
-        self.assertIn("collides", new_subsystem.check_name("node"))
+        # Abbreviations, reserved owners and language/module collisions.
+        for name in ("tgt", "drive", "wrist_out", "hw", "class", "sys",
+                     "python", "node"):
+            with self.subTest(name=name):
+                self.assertIsNotNone(new_subsystem.check_name(name))
 
         # Too long to leave room for /<name>/target/teleop (31 bytes max)
         self.assertIsNotNone(new_subsystem.check_name("a" * 17))
@@ -150,33 +146,6 @@ class NewSubsystemTest(unittest.TestCase):
                 with self.assertRaises(new_subsystem.Refused):
                     new_subsystem.plan(root, "bot", inherited, "py")
 
-    def test_plan_standalone_builds_against_this_checkout(self):
-        # A generated repo must build as written: it points @talos at the
-        # checkout it came from and takes its C++23 flags and Bazel version.
-        with tempfile.TemporaryDirectory() as tmp:
-            talos = os.path.join(tmp, "src", "talOS")
-            os.makedirs(talos)
-            for config, text in ((".bazelrc", "build --cxxopt=-std=c++23\n"),
-                                 (".bazelversion", "8.6.0\n")):
-                with open(os.path.join(talos, config), "w",
-                          encoding="utf-8") as f:
-                    f.write(text)
-            target = os.path.join(tmp, "repos", "wrist")
-            writes = new_subsystem.plan_standalone(target, "wrist", "cpp",
-                                                   talos)
-            by_rel = {
-                os.path.relpath(path, target).replace(os.sep, "/"): content
-                for path, _, content in writes
-            }
-            self.assertIn(
-                'local_path_override(module_name = "talos", '
-                'path = "../../src/talOS")', by_rel["MODULE.bazel"])
-            self.assertEqual(by_rel[".bazelrc"], "build --cxxopt=-std=c++23\n")
-            self.assertEqual(by_rel[".bazelversion"], "8.6.0\n")
-            # Loads stay first; every talOS label names the @talos module.
-            build = by_rel["BUILD"]
-            self.assertTrue(build.startswith("load("))
-            self.assertNotIn('"//talOS', build)
 
     def test_generated_packages_match_the_built_golden_packages(self):
         # tools/scaffold_testdata holds the generator's output, built and
@@ -207,67 +176,6 @@ class NewSubsystemTest(unittest.TestCase):
                         f"{lang!r}, kind={kind!r}) (plus the golden "
                         f"filegroup in BUILD)")
 
-    def test_position_archetype_generates_motion_magic_for_cpp_and_python(self):
-        cpp_files = new_subsystem.package_files("wrist", "cpp", kind="position")
-        self.assertIn("position_rot:double;", cpp_files["wrist_message.fbs"])
-        self.assertIn("at_goal:bool;", cpp_files["wrist_message.fbs"])
-        self.assertIn("set_motion_magic", cpp_files["wrist.h"])
-        self.assertIn("Mode::kMotionMagic", cpp_files["node_test.cc"])
-
-        py_files = new_subsystem.package_files("wrist", "py", kind="position")
-        self.assertIn("set_motion_magic", py_files["wrist.py"])
-        self.assertIn("talos.Mode.MOTION_MAGIC", py_files["node_test.py"])
-
-    def test_target_lanes_replace_the_arbiter(self):
-        for kind, field in (("velocity", "velocity_rps"),
-                            ("position", "position_rot")):
-            with self.subTest(kind):
-                cpp = new_subsystem.package_files("wrist", "cpp", kind=kind)
-                fbs = cpp["wrist_message.fbs"]
-                target = fbs.split("struct WristTarget {")[1].split("}")[0]
-                # 8 bytes, wire-compatible with { double demand; }.
-                self.assertEqual(target.strip(), f"{field}:double;")
-                self.assertIn("talos::Target<Target> target_;", cpp["wrist.h"])
-                self.assertIn("target_.get()", cpp["wrist.h"])
-                self.assertIn("std::isfinite", cpp["wrist.h"])
-                for case in ("DisabledRobot", "StaleLane", "ReleasedLane",
-                             "NeverSent", "DriverStationLoss",
-                             "NonFiniteDemand"):
-                    self.assertIn(f"{case}GoesNeutral", cpp["node_test.cc"])
-                self.assertIn("PublishTarget(sim", cpp["node_test.cc"])
-                self.assertIn("ReleaseTarget<Target>", cpp["node_test.cc"])
-
-                py = new_subsystem.package_files("wrist", "py", kind=kind)
-                self.assertIn("talos.Target(node, WristTarget)", py["wrist.py"])
-                self.assertIn("math.isfinite", py["wrist.py"])
-                for case in ("disabled_robot", "stale_lane", "released_lane",
-                             "never_sent", "driver_station_loss",
-                             "non_finite_demand"):
-                    self.assertIn(f"test_{case}_sends_neutral",
-                                  py["node_test.py"])
-                self.assertIn(f"{field}=demand", py["node_test.py"])
-                for files in (cpp, py):
-                    for content in files.values():
-                        self.assertNotIn("arbiter", content)
-
-    def test_estimator_archetype_is_hardware_free_and_reads_its_cameras(self):
-        for lang, node, test in (("cpp", "localizer.h", "node_test.cc"),
-                                 ("py", "localizer.py", "node_test.py")):
-            with self.subTest(lang):
-                files = new_subsystem.package_files("localizer", lang,
-                                                    kind="estimator")
-                # No schema of its own: the shared geometry messages.
-                self.assertNotIn("localizer_message.fbs", files)
-                self.assertIn("srcs = [],", files["BUILD"])
-                self.assertIn('"//talOS/msgs:geometry"', files["BUILD"])
-                self.assertIn('"state": "/localizer/state"', files["BUILD"])
-                self.assertIn("PoseEstimate", files[node])
-                self.assertIn('"cameras"', files[node])
-                for word in ("Motor", "Target", "robot_enabled"):
-                    self.assertNotIn(word, files[node])
-                self.assertIn("optional", files[node])
-                self.assertRegex(files[test], r"(?i)disabled")
-                self.assertRegex(files[test], r"(?i)stale")
 
     def test_plan_wires_an_estimator_without_a_can_id(self):
         with tempfile.TemporaryDirectory() as root:

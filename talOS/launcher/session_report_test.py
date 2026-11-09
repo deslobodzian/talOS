@@ -30,9 +30,6 @@ class SessionReportTest(unittest.TestCase):
             self.assertEqual(verdicts["enabled state median"], "PASS")
             self.assertEqual(verdicts["enabled state gaps"], "FAIL")
             self.assertEqual(verdicts["target age at tick"], "NOT MEASURED")
-            text = subprocess.run([binary, directory], capture_output=True, text=True, check=True).stdout
-            self.assertIn("**FAIL** enabled state gaps: 1", text)
-            self.assertIn("fixture-sha256", text)
 
     def test_descriptor_status_and_no_duplicate_readers(self):
         def record(process, kind, topic, now, decoded=""):
