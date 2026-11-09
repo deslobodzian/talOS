@@ -34,3 +34,7 @@ receive; enforce them. These are the review-specific traps.
   stale-target cases.
 - Topic/node/config changes not checked with launcher `--describe-only`.
 - RoboRIO program edits without `./gradlew phoenixTest` / `buildRio`.
+- A change that leaves any doc or comment stating something no longer true
+  (see the documentation rule in `.omp/RULES.md`).
+- A test that pins wording, wiring or incidental defaults, or repeats a path
+  another test already covers.

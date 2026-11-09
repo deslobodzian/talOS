@@ -27,3 +27,15 @@
   covers the disabled and stale-target cases. Finish every change with
   `bazel build //...` and `bazel test --test_output=errors //...`, plus launcher
   `--describe-only` for graph/config changes.
+- Documentation describes the code as it is now. A change to behaviour, an
+  interface, a flag, a config key, a message, a wire format, a command or a
+  number that any doc states updates every such doc (READMEs, `docs/`,
+  ARCHITECTURE.md, NAMING.md, code comments) in the same commit. A statement
+  that cannot be kept true is deleted, not left stale. Docs hold no plans,
+  handoffs or history: open work goes in TODO.md, reasoning in the commit log.
+  State each fact once and link to it rather than copying it.
+- Tests are few and targeted: each one guards a behaviour, boundary, error or
+  safety invariant a consumer would notice breaking. No tests of wording,
+  wiring, forwarding, incidental defaults or tautologies, and no second test of
+  the same path; delete such tests when found. Never fix a test by raising a
+  timeout or deleting an assertion that guards a real behaviour.

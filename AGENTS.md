@@ -10,8 +10,7 @@ topics; the RoboRIO is only the hardware layer, reached over UDP.
 @talOS/NAMING.md
 
 API reference: `docs/NODE_DEVELOPMENT_GUIDE.md`. Method (units, node anatomy,
-test matrix, open source first): `docs/METHODOLOGY.md`. Planned wiring
-changes: `docs/DESIGN_AUTOMATIC_WIRING.md`. Mechanism walkthrough:
+test matrix, open source first): `docs/METHODOLOGY.md`. Mechanism walkthrough:
 `examples/superstructure/README.md`.
 
 ## Build, test, lint
@@ -63,6 +62,8 @@ bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configurat
 
 Hard rules live in `.omp/RULES.md` (also delivered to subagents). Place new code per
 "Where a new thing goes" above; do not invent a new layer or package convention.
+Every change updates the docs that describe what it changed, in the same commit;
+a doc statement that is no longer true is a bug (see `.omp/RULES.md`).
 
 ## Commit log (the project's reasoning record)
 
