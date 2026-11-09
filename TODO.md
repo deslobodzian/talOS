@@ -53,7 +53,7 @@ Verification of the closing state (2026-11-08): `bazel build //...`, `bazel test
 | OBS-1/2/3 Studio never shows cached, stale-graph or dead-worker readings as current | `25ae963`, `967a4d9`, `0fb4a3a` | Studio tests; live browser check |
 | OBS-4 telemetry prints its headroom at every launch/describe | `b0ff0bb` | robot 130 ch 1168/1200 B; physics sim 133 ch 1192/1200 B (1 spare) |
 | Studio blank page on live connect (uint32 dictionary id); bridge `--describe` refused by the launcher | `ca72565` | store/describe tests fail before; found by the live smoke |
-| Studio reported a new launcher session's processes as restarts | see `git log -- studio/src/data/detectors.ts` | events.test |
+| Studio reported a new launcher session's processes as restarts | `03eb210` | events.test |
 
 ## Open software items
 
