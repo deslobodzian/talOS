@@ -12,4 +12,3 @@ talos_messages(
     },
     deps = ["//talOS/build/messages_deps_test/geometry:messages"],
 )
-
