@@ -288,6 +288,12 @@ in each group watches a launcher-owned lifetime pipe and kills the group on
 EOF, including after launcher SIGKILL. Linux also uses `PR_SET_PDEATHSIG`;
 macOS relies on the pipe. Children must not daemonize out of their group.
 
+The requested-stop supervision test acknowledges installed signal handlers in
+all three stub nodes before signaling the launcher. Every stub stays alive until
+that stop, and the test checks zero restarts and clean exits for the whole roster.
+An immediately exiting hardware stub instead exercises an unrelated restart/stop
+race: a signal before its executable starts can legitimately terminate it.
+
 With `NOTIFY_SOCKET` set, the launcher sends `READY=1` on entry to supervision
 and `WATCHDOG=1` on every loop iteration, using nonblocking Unix datagrams
 (including Linux `@` abstract names). A hung loop therefore stops feeding the

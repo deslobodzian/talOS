@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -353,28 +354,49 @@ TEST(Supervision, RequestedStopDoesNotRestartCleanExits) {
   auto options = BaseOptions("clean_stop");
   const auto runs = TempPath("clean_stop_runs");
   ::remove(runs.c_str());
-  options.binary_overrides["//example/alpha:node"] =
-      WriteStub("clean_stop_alpha", RecordLogArgThen(runs, kRunUntilStopped));
-  options.binary_overrides["//example/beta:node"] =
-      WriteStub("clean_stop_beta", kRunUntilStopped);
+  // Every roster member must stay alive until shutdown. An exit-0 hardware
+  // stub otherwise restarts and can receive SIGINT before exec, where the
+  // default signal disposition correctly produces a nonzero session status.
+  for (const std::string name : {"hardware_node", "alpha", "beta"}) {
+    const std::string target = name == "hardware_node"
+                                   ? "//talOS/bridge:hardware_node"
+                                   : "//example/" + name + ":node";
+    options.binary_overrides[target] =
+        WriteStub("clean_stop_" + name,
+                  "trap 'exit 0' INT TERM\n" +
+                      RecordLogArgThen(runs, "while :; do sleep 0.05; done\n"),
+                  name);
+  }
   const pid_t launcher = ::fork();
   ASSERT_GE(launcher, 0);
   if (launcher == 0) ::_exit(Launcher{options}.Run());
   const auto give_up = std::chrono::steady_clock::now() + 10s;
-  while (ReadLines(runs).empty() && std::chrono::steady_clock::now() < give_up)
+  // A recorded log argument acknowledges an installed stop handler, not just
+  // a fork. Wait for all members rather than guessing with a fixed sleep.
+  while (ReadLines(runs).size() < 3 &&
+         std::chrono::steady_clock::now() < give_up)
     std::this_thread::sleep_for(10ms);
-  std::this_thread::sleep_for(200ms);
+  const bool ready = ReadLines(runs).size() == 3;
   ::kill(launcher, SIGTERM);
   int status = 0;
   while (::waitpid(launcher, &status, 0) < 0 && errno == EINTR) {
   }
+  EXPECT_TRUE(ready) << "not every node installed its stop handler";
   EXPECT_TRUE(WIFEXITED(status));
   EXPECT_EQ(WEXITSTATUS(status), 0);
   const std::string dir =
       options.output_dir + "/" + std::to_string(options.session_id);
-  EXPECT_EQ(ReadLines(runs), std::vector<std::string>{dir + "/alpha.tlog"});
-  const auto alpha = ManifestEntry(ReadFile(dir + "/manifest.json"), "alpha");
-  EXPECT_NE(alpha.find("\"restart_count\": 0"), std::string::npos) << alpha;
+  auto recorded = ReadLines(runs);
+  std::sort(recorded.begin(), recorded.end());
+  EXPECT_EQ(recorded,
+            (std::vector<std::string>{dir + "/alpha.tlog", dir + "/beta.tlog",
+                                      dir + "/hardware_node.tlog"}));
+  const auto manifest = ReadFile(dir + "/manifest.json");
+  for (const auto* name : {"hardware_node", "alpha", "beta"}) {
+    const auto entry = ManifestEntry(manifest, name);
+    EXPECT_NE(entry.find("\"restart_count\": 0"), std::string::npos) << entry;
+    EXPECT_NE(entry.find("\"exit_code\": 0"), std::string::npos) << entry;
+  }
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
 }
