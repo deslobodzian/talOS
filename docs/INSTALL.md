@@ -30,6 +30,12 @@ by `.bazelversion` (8.6.0) and fetched by bazelisk.
 | clang-format-18, clang-tidy-18, buildifier 8.2.1 | lint, matches CI | package / GitHub release (sha256-verified) | brew / GitHub release | in WSL |
 | WPILib 2026 | Glass, AdvantageScope, sim GUI | optional | optional | manual installer (not on winget) |
 
+Formatting differs between clang-format major versions, and CI checks with 18.
+Where the distribution ships another LLVM (Arch, Fedora), `setup.sh` installs
+that and warns; use the pinned wheel instead:
+`python3 -m venv ~/.local/share/clang-format-18 && ~/.local/share/clang-format-18/bin/pip install clang-format==18.1.8`,
+then format with `~/.local/share/clang-format-18/bin/clang-format -i <files>`.
+
 ## Flags
 
 | `setup.sh` | `setup.ps1` | Effect |
