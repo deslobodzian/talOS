@@ -104,6 +104,11 @@ struct ByteReader {
     }
     return val;
   }
+  // Signed 32-bit fields (CAN ids, DIO/PWM channels) travel as their
+  // two's-complement bits; the conversion back is modular (C++20).
+  int32_t Int32() {
+    return static_cast<int32_t>(static_cast<uint32_t>(Int(4)));
+  }
   double Real() {
     const double x = std::bit_cast<double>(Int(8));
     ok &= std::isfinite(x);
@@ -230,7 +235,7 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
     auto& m = c.motors[i];
     m.id = r.Int(2);
     m.name = r.Text();
-    m.can_id = r.Int(4);
+    m.can_id = r.Int32();
     m.bus = r.Text();
     m.inverted = (r.Int(1) == 1);
     m.brake = (r.Int(1) == 1);
@@ -286,7 +291,7 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
       return false;
     }
     s.kind = static_cast<SensorKind>(kind);
-    s.can_id = r.Int(4);
+    s.can_id = r.Int32();
     s.bus = r.Text();
     s.inverted = (r.Int(1) == 1);
     s.offset_rot = r.Real();
@@ -298,7 +303,7 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
   for (std::size_t i = 0; i < di_count; ++i) {
     c.digital_inputs[i].id = r.Int(2);
     c.digital_inputs[i].name = r.Text();
-    c.digital_inputs[i].dio = r.Int(4);
+    c.digital_inputs[i].dio = r.Int32();
   }
 
   const auto do_count = r.Int(2);
@@ -307,7 +312,7 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
   for (std::size_t i = 0; i < do_count; ++i) {
     c.digital_outputs[i].id = r.Int(2);
     c.digital_outputs[i].name = r.Text();
-    c.digital_outputs[i].dio = r.Int(4);
+    c.digital_outputs[i].dio = r.Int32();
   }
 
   const auto ai_count = r.Int(2);
@@ -316,7 +321,7 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
   for (std::size_t i = 0; i < ai_count; ++i) {
     c.analog_inputs[i].id = r.Int(2);
     c.analog_inputs[i].name = r.Text();
-    c.analog_inputs[i].channel = r.Int(4);
+    c.analog_inputs[i].channel = r.Int32();
   }
 
   const auto enc_count = r.Int(2);
@@ -331,8 +336,8 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
       return false;
     }
     c.encoders[i].kind = static_cast<EncoderKind>(kind);
-    c.encoders[i].dio_a = r.Int(4);
-    c.encoders[i].dio_b = r.Int(4);
+    c.encoders[i].dio_a = r.Int32();
+    c.encoders[i].dio_b = r.Int32();
     c.encoders[i].counts_per_rev = r.Real();
     c.encoders[i].offset_rot = r.Real();
   }
@@ -343,7 +348,7 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
   for (std::size_t i = 0; i < pwm_count; ++i) {
     c.pwm_outputs[i].id = r.Int(2);
     c.pwm_outputs[i].name = r.Text();
-    c.pwm_outputs[i].channel = r.Int(4);
+    c.pwm_outputs[i].channel = r.Int32();
   }
 
   if (!r.Done()) return false;

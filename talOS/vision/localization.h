@@ -93,13 +93,15 @@ inline bool EstimateTagPoseFromHomography(
     // Upstream detector p[0..3] corresponds to (-,+),(+,+),(+,-),(-,-).
     constexpr double ys[4] = {1, 1, -1, -1};
     for (int c = 0; c < 4; ++c) {
+      const Eigen::Index row = Eigen::Index{2} * c;
+      const auto corner = static_cast<std::size_t>(row);
       const auto uv = intrinsics.UndistortPoint(
-          {(*observed_corners)[2 * c], (*observed_corners)[2 * c + 1]});
+          {(*observed_corners)[corner], (*observed_corners)[corner + 1]});
       const double x = xs[c], y = ys[c], u = uv.x(), v = uv.y();
-      a.row(2 * c) << x, y, 1, 0, 0, 0, -u * x, -u * y;
-      a.row(2 * c + 1) << 0, 0, 0, x, y, 1, -v * x, -v * y;
-      b(2 * c) = u;
-      b(2 * c + 1) = v;
+      a.row(row) << x, y, 1, 0, 0, 0, -u * x, -u * y;
+      a.row(row + 1) << 0, 0, 0, x, y, 1, -v * x, -v * y;
+      b(row) = u;
+      b(row + 1) = v;
       temp_det.p[c][0] = u;
       temp_det.p[c][1] = v;
     }
@@ -571,7 +573,7 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
   for (const auto* t : tags) {
     const auto field = *layout.GetTagPose(t->tag_id);
     const auto corners = GetTagModelCorners(layout.GetTagSize(t->tag_id));
-    for (int j = 0; j < 4; ++j) {
+    for (std::size_t j = 0; j < 4; ++j) {
       points.push_back(field.act(corners[j]));
       pixels.push_back(intrinsics.UndistortPoint(
           {t->corners[2 * j], t->corners[2 * j + 1]}));
@@ -584,14 +586,15 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
   auto evaluate = [&](const auto& pose, Eigen::VectorXd& residual,
                       Eigen::MatrixXd* jacobian) {
     const auto robot_field = pose.inverse();
-    for (size_t i = 0; i < points.size(); ++i) {
+    for (std::size_t i = 0; i < points.size(); ++i) {
+      const auto row = static_cast<Eigen::Index>(2 * i);
       const auto p_robot = robot_field.act(points[i]);
       const auto p = camera_robot.act(p_robot);
       if (!p.allFinite() || p.z() <= options.min_z_m) return false;
-      residual(2 * i) =
+      residual(row) =
           (intrinsics.fx * p.x() / p.z() + intrinsics.cx - pixels[i].x()) /
           noise.pixel_std_px;
-      residual(2 * i + 1) =
+      residual(row + 1) =
           (intrinsics.fy * p.y() / p.z() + intrinsics.cy - pixels[i].y()) /
           noise.pixel_std_px;
       if (jacobian) {
@@ -602,7 +605,7 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
         Eigen::Matrix<double, 3, 6> tangent;
         tangent.leftCols<3>() = talos::geometry::SO3<double>::Hat(p_robot);
         tangent.rightCols<3>() = -Eigen::Matrix3d::Identity();
-        jacobian->block<2, 6>(2 * i, 0) =
+        jacobian->block<2, 6>(row, 0) =
             projection * camera_rotation * tangent / noise.pixel_std_px;
       }
     }
@@ -692,10 +695,10 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
     }
     est.tag_id = -1;
     est.tag_count = static_cast<int>(tags.size());
-    est.average_distance_m = distance_sum / tags.size();
+    est.average_distance_m = distance_sum / static_cast<double>(tags.size());
     est.reprojection_error_px =
-        noise.pixel_std_px *
-        std::sqrt(residual.head(pixel_rows).squaredNorm() / points.size());
+        noise.pixel_std_px * std::sqrt(residual.head(pixel_rows).squaredNorm() /
+                                       static_cast<double>(points.size()));
     est.ambiguity = 0;
     if (!detail::SetCovarianceStdDevs(normal, noise, &est)) return est;
     if (est.reprojection_error_px > options.max_reprojection_error_px) {
@@ -739,7 +742,7 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
       const double du = u - pixels[i].x(), dv = v - pixels[i].y();
       sum_sq += du * du + dv * dv;
     }
-    return std::sqrt(sum_sq / points.size());
+    return std::sqrt(sum_sq / static_cast<double>(points.size()));
   };
   struct SeedCandidate {
     talos::geometry::SE3<double> T_field_robot;

@@ -185,7 +185,7 @@ T ReadRequired(const toml::table& tbl, const char* key,
 
 inline std::string ReadNonEmpty(const toml::table& tbl, const char* key,
                                 std::string def, const char* table_name) {
-  std::string v = Read<std::string>(tbl, key, def);
+  std::string v = Read<std::string>(tbl, key, std::move(def));
   if (v.empty()) {
     throw std::invalid_argument(std::string(table_name) + " field '" + key +
                                 "' must be a non-empty string");
@@ -455,14 +455,14 @@ inline std::vector<std::pair<std::string, TeleopValue>> ParseTeleopAssignments(
   std::sort(keys.begin(), keys.end());
   for (const auto& key : keys) {
     const auto& value = table[key];
-    if (value.is_boolean()) {
-      assignments.emplace_back(key, *value.value<bool>());
-    } else if (value.is_integer()) {
-      assignments.emplace_back(key, *value.value<int64_t>());
-    } else if (value.is_floating_point()) {
-      assignments.emplace_back(key, *value.value<double>());
-    } else if (value.is_string()) {
-      assignments.emplace_back(key, *value.value<std::string>());
+    if (const auto* flag = value.as_boolean()) {
+      assignments.emplace_back(key, flag->get());
+    } else if (const auto* integer = value.as_integer()) {
+      assignments.emplace_back(key, integer->get());
+    } else if (const auto* real = value.as_floating_point()) {
+      assignments.emplace_back(key, real->get());
+    } else if (const auto* text = value.as_string()) {
+      assignments.emplace_back(key, text->get());
     } else {
       throw std::invalid_argument(where + "." + key + " must be a scalar");
     }

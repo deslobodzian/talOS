@@ -72,7 +72,8 @@ struct Bridge {
     const auto size = bytes.size() + (bytes.size() < 126 ? 2 : 10);
     auto& local = client->getUserData()->budget;
     if (client->getBufferedAmount() != 0 ||
-        !local.available(size, EgressBudget::kBytesPerSecond / max_clients) ||
+        !local.available(size, EgressBudget::kBytesPerSecond /
+                                   static_cast<double>(max_clients)) ||
         !budget.available(size, EgressBudget::kBytesPerSecond)) {
       ++ws_drops;
       if (opcode == uWS::OpCode::BINARY) ++telemetry_ws_drops;

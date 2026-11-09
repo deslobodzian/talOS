@@ -130,7 +130,7 @@ class Reporter {
       std::fprintf(stderr, "%s: node registry unavailable: %s\n",
                    options_.name.c_str(), e.what());
     }
-    thread_ = std::jthread{[this](std::stop_token stop) {
+    thread_ = std::jthread{[this](const std::stop_token& stop) {
       while (!stop.stop_requested()) {
         if (registration_) registration_->heartbeat();
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
@@ -159,8 +159,8 @@ class Reporter {
   template <typename Loop>
   void start(Loop& loop) {
     stop();
-    thread_ =
-        std::jthread{[this, &loop](std::stop_token stop) { run(loop, stop); }};
+    thread_ = std::jthread{
+        [this, &loop](const std::stop_token& stop) { run(loop, stop); }};
   }
 
   ~Reporter() { stop(); }
@@ -183,7 +183,7 @@ class Reporter {
 
  private:
   template <typename Loop>
-  void run(Loop& loop, std::stop_token stop) {
+  void run(Loop& loop, const std::stop_token& stop) {
     // The loop publishes its counters array before it stores running(), and
     // that store synchronizes with this load, so a visible `true` means the
     // manifest is frozen and the counters exist.

@@ -20,7 +20,9 @@ class SimBackend final : public Backend {
   bool Read(State& state) override {
     state.health = health_;
     const double dt =
-        previous_time_ ? (state.sample_time_us - previous_time_) * 1e-6 : 0;
+        previous_time_
+            ? static_cast<double>(state.sample_time_us - previous_time_) * 1e-6
+            : 0;
     previous_time_ = state.sample_time_us;
     std::array<bool, kMaxMotors> resolved{};
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {

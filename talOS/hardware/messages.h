@@ -144,7 +144,7 @@ inline constexpr std::size_t kMaxCommandSize =
     kMaxPwmOutputs * kPwmRequestSize;
 
 inline constexpr std::size_t kHealthSampleSize = 1 + 8 + 1 + 8;
-inline constexpr std::size_t kGatewayCountersSize = 4 * 4;
+inline constexpr std::size_t kGatewayCountersSize = std::size_t{4} * 4;
 inline constexpr std::size_t kStateBaseSize =
     6 * 8 + 4 + 7 * 2 + kHealthSampleSize + kGatewayCountersSize;
 // Current and temperature use signed tenths (saturating int16) on the wire.

@@ -173,7 +173,7 @@ class RealtimeEventLoop
     }
     ~Transport() { release(); }
     void release() {
-      if (reader_id) queue->release_reader(*reader_id);
+      if (reader_id && queue) queue->release_reader(*reader_id);
       reader_id.reset();
     }
     std::optional<RTMSQueue> queue;
@@ -220,7 +220,9 @@ class RealtimeEventLoop
   void on_handler_exit() {}
 
   SendOutcome send_impl(std::uint16_t id, std::span<const std::byte> bytes) {
-    RTMSQueue& queue = *transports_[id].queue;
+    std::optional<RTMSQueue>& slot = transports_[id].queue;
+    if (!slot) return SendOutcome{SendStatus::FAILED, 0};
+    RTMSQueue& queue = *slot;
 
     const WriteStatus status =
         queue.write(bytes, this->monotonic_now().nanos());
@@ -245,16 +247,18 @@ class RealtimeEventLoop
     // expects.
     for (const std::uint16_t id : watchers_) {
       Transport& transport = transports_[id];
-      if (!transport.reader_id) {
+      if (!transport.reader_id || !transport.queue) {
         continue;
       }
+      RTMSQueue& queue = *transport.queue;
+      const std::size_t reader_id = *transport.reader_id;
 
       for (std::size_t drained = 0; drained < options_.max_messages_per_tick;
            ++drained) {
         MessageInfo info{};
 
-        const ReadResult result = transport.queue->read_next(
-            *transport.reader_id, sources[id].buffer, info);
+        const ReadResult result =
+            queue.read_next(reader_id, sources[id].buffer, info);
 
         if (result != ReadResult::OK) {
           break;

@@ -1,19 +1,26 @@
+# Keep compiler diagnostics and stable, bug-finding analyzer families. Opt-in
+# analyses (notably EnumCastOutOfRange on third-party bitmask enums) are noisy.
 Checks: >
+  -*,
   clang-diagnostic-*,
   -clang-diagnostic-unused-command-line-argument,
-  clang-analyzer-*,
+  clang-analyzer-core.*,
+  clang-analyzer-cplusplus.*,
+  clang-analyzer-deadcode.*,
+  clang-analyzer-unix.*,
+  clang-analyzer-security.*,
   bugprone-*,
   -bugprone-exception-escape,
-  -bugprone-throwing-static-initialization,
-  performance-*,
-  portability-*,
-  google-*,
   -bugprone-easily-swappable-parameters,
-  -google-build-using-namespace,
-  -google-readability-todo,
-  -google-runtime-references,
+  performance-*,
   -performance-enum-size,
-  -portability-avoid-pragma-once
+  -performance-inefficient-string-concatenation,
+  portability-*,
+  google-explicit-constructor
+# An implicit converting constructor can silently change overload resolution;
+# the other google-* checks enforce style, which clang-format already covers.
+# String concatenation in diagnostics/tooling is not a hot-path defect.
 WarningsAsErrors: '*'
-HeaderFilterRegex: '^(talOS/|2026-robot/main_processor/|examples/|studio/bridge/)'
+HeaderFilterRegex: '^(\./)?(talOS/|2026-robot/main_processor/|bench/main_processor/|examples/|studio/bridge/)'
+SystemHeaders: false
 FormatStyle: file

@@ -479,8 +479,9 @@ class NodeRegistration {
     std::uint32_t flags{0};
   };
 
-  NodeRegistration(Identity identity, std::string_view path = kRegistryPath,
-                   const RegistryTestHooks* test_hooks = nullptr)
+  explicit NodeRegistration(Identity identity,
+                            std::string_view path = kRegistryPath,
+                            const RegistryTestHooks* test_hooks = nullptr)
       : mapping_{path, false, test_hooks}, identity_{std::move(identity)} {
     const RegistryLock lock{mapping_.path()};
     record_ = claim(mapping_.header(), identity_, test_hooks);

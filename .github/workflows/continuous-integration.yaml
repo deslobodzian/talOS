@@ -198,7 +198,7 @@ jobs:
           | xargs -0 -r clang-format-18 --dry-run --Werror
 
   clang-tidy:
-    name: clang-tidy (changed C++ files)
+    name: clang-tidy (changed production C++ files)
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Repository
@@ -245,25 +245,30 @@ jobs:
           ""|"0000000000000000000000000000000000000000") BASE="HEAD~1" ;;
         esac
         echo "Diff base: $BASE"
-        # .clang-tidy at the repo root is picked up automatically (checks,
-        # WarningsAsErrors, HeaderFilterRegex). Only .c/.cc/.cpp translation
-        # units present in compile_commands.json are analyzed; headers are
-        # covered through their including TUs. Files outside the Bazel graph
-        # are skipped.
-        CHANGED=$(git diff --name-only --diff-filter=d "$BASE" HEAD -- \
-          '*.c' '*.cc' '*.cpp')
-        python3 - "$BASE" $CHANGED <<'PYEOF'
-        import concurrent.futures, json, os, subprocess, sys
+        # Analyze production TUs in the Bazel graph; headers are covered by
+        # their includers. Tests run under the sanitizer jobs instead.
+        # NUL-delimited git output also handles paths containing whitespace.
+        python3 - "$BASE" <<'PYEOF'
+        import concurrent.futures, json, os, pathlib, subprocess, sys, time
+        changed = subprocess.check_output([
+            'git', 'diff', '--name-only', '--diff-filter=d', '-z',
+            sys.argv[1], 'HEAD', '--', '*.c', '*.cc', '*.cpp'
+        ]).decode().split('\0')
         with open('compile_commands.json') as f:
             db = json.load(f)
-        known = {os.path.realpath(e['file']) for e in db}
-        root = os.path.realpath(os.getcwd())
+        known = {os.path.realpath(os.path.join(e['directory'], e['file']))
+                 for e in db}
         targets = []
-        for rel in sys.argv[2:]:
-            if not rel:
+        for rel in changed:
+            path = pathlib.PurePosixPath(rel)
+            if (not rel or
+                {'test', 'tests', 'testing', 'testdata', 'external',
+                 'third_party'}.intersection(path.parts) or
+                path.stem in {'test', 'testing'} or
+                path.stem.endswith(('_test', '_testing')) or
+                'fuzz' in path.stem):
                 continue
-            abs_path = os.path.realpath(os.path.join(root, rel))
-            if abs_path in known:
+            if os.path.realpath(rel) in known:
                 targets.append(rel)
             else:
                 print(f'skip (no compilation database entry): {rel}')
@@ -276,6 +281,7 @@ jobs:
             return subprocess.run(['clang-tidy-18', '-p', '.', '--quiet', path],
                                   capture_output=True, text=True)
         failed = 0
+        start = time.monotonic()
         with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
             for path, r in zip(targets, pool.map(tidy, targets)):
                 if r.returncode != 0:
@@ -283,6 +289,7 @@ jobs:
                     print(f'::group::{path}')
                     print(r.stdout + r.stderr, end='')
                     print('::endgroup::')
-        print(f'clang-tidy: {len(targets)} files, {failed} with findings')
+        print(f'clang-tidy: {len(targets)} files, {failed} with findings, '
+              f'{time.monotonic() - start:.1f}s')
         sys.exit(1 if failed else 0)
         PYEOF
