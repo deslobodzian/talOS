@@ -220,16 +220,18 @@ TEST(Supervision, SlowConstructorIsObservableAndBecomesActiveAfterOldGrace) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// The construction deadline, not the session's end, stops a constructor that
+// keeps heartbeating: the run ends well before the 10 s session would.
 TEST(Supervision, HeartbeatingConstructorStillHasAFiniteDeadline) {
   auto options = ConstructionOptions("hung_construction", 60000);
   EXPECT_EQ(options.construction_timeout, 30s);
   options.construction_timeout = 150ms;
-  options.duration_s = 2;
+  options.duration_s = 10;
   const auto started = std::chrono::steady_clock::now();
   EXPECT_NE(RunSession(options), 0);
   const auto elapsed = std::chrono::steady_clock::now() - started;
   EXPECT_GE(elapsed, options.construction_timeout);
-  EXPECT_LT(elapsed, 1s);
+  EXPECT_LT(elapsed, 5s);
   std::filesystem::remove_all(options.output_dir);
 }
 

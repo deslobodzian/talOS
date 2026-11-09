@@ -588,20 +588,21 @@ TEST_F(Registry, ReporterProgressCadenceLeavesRoomForSubTimeoutPause) {
   } while (std::chrono::steady_clock::now() < deadline);
   ASSERT_EQ(nodes.size(), 1u);
   ASSERT_GT(nodes.front().dispatch_count, 0u);
-  // Stop near the end of the old 250 ms full-sample interval. Its retained
-  // sample would already be 200 ms old, so a 300 ms pause crosses the
-  // launcher's unchanged 500 ms floor before SIGCONT can be sent.
+  // Stop near the end of the old 250 ms full-sample interval, whose retained
+  // sample would already be 200 ms old: a short pause then crossed the
+  // launcher's 500 ms floor before SIGCONT could be sent. Progress is now
+  // refreshed every 10 ms, so the frozen heartbeat is recent at the stop.
   std::this_thread::sleep_for(200ms);
   ASSERT_EQ(::kill(pid, SIGSTOP), 0);
   int status = 0;
   ASSERT_EQ(Children::Wait(pid, &status, WUNTRACED), pid);
   ASSERT_TRUE(WIFSTOPPED(status));
-  std::this_thread::sleep_for(300ms);
+  const auto stopped_ns = monotonic_now_ns();
   nodes = reader.nodes();
   ASSERT_EQ(nodes.size(), 1u);
-  const auto age = std::chrono::nanoseconds{
-      monotonic_now_ns() - nodes.front().heartbeat_monotonic_ns};
-  EXPECT_LT(age, 450ms);
+  const auto age_at_stop = std::chrono::nanoseconds{
+      stopped_ns - nodes.front().heartbeat_monotonic_ns};
+  EXPECT_LT(age_at_stop, 100ms);
   ASSERT_EQ(::kill(pid, SIGCONT), 0);
 }
 
