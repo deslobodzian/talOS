@@ -19,7 +19,7 @@ namespace talos::hardware {
 // 8-byte alignment (talos::kMessageAlignment). ipc::Publisher lays the slot out
 // at alignof(Message), so the two agree only while this holds.
 static_assert(alignof(bridge::BridgeStatus) == 8);
-static_assert(sizeof(bridge::BridgeStatus) == 160,
+static_assert(sizeof(bridge::BridgeStatus) == 176,
               "BridgeStatus size changed; update docs/DATA_FLOW.md");
 
 HardwareNode::HardwareNode(config::RobotConfig robot_config,
@@ -273,6 +273,23 @@ void HardwareNode::PushConfig(uint64_t now_us) {
 }
 
 void HardwareNode::Tick(uint64_t now_us) {
+  // Tick's timestamp precedes socket reads. Complete the previous tick's
+  // exchange now, so the upper endpoint is definitely after receipt.
+  if (pending_probe_send_us_ != 0) {
+    clock_.ObserveExchange(pending_probe_boot_id_, pending_probe_send_us_,
+                           pending_probe_sample_us_, now_us);
+    pending_probe_send_us_ = 0;
+    probe_waiting_ = false;
+  }
+  if ((!probe_waiting_ &&
+       (last_probe_send_us_ == 0 || now_us - last_probe_send_us_ >= 20000)) ||
+      (probe_waiting_ && now_us - last_probe_send_us_ > 1'000'000)) {
+    if (peer_.SendFrame(protocol::FrameType::kClockProbe, 0, now_us, nullptr,
+                        0) == protocol::UdpStatus::kOk) {
+      last_probe_send_us_ = now_us;
+      probe_waiting_ = true;
+    }
+  }
   // 1. Process incoming UDP frames from Gateway. Bounded receive budget:
   // at most 32 frames per tick, so a burst under overload delays rather than
   // stalls the merge below.
@@ -314,6 +331,13 @@ void HardwareNode::Tick(uint64_t now_us) {
       // freshness, invalidate healthy requests or trigger a config push.
       if (!clock_.Observe(state.boot_id, state.sample_time_us, now_us)) {
         continue;
+      }
+      if (probe_waiting_ && state.clock_probe_time_us != 0 &&
+          state.clock_probe_time_us == last_probe_send_us_ &&
+          pending_probe_send_us_ == 0) {
+        pending_probe_send_us_ = state.clock_probe_time_us;
+        pending_probe_sample_us_ = state.sample_time_us;
+        pending_probe_boot_id_ = state.boot_id;
       }
       last_state_receipt_us_ = now_us;
       if (state.boot_id != last_boot_id_) {
@@ -562,12 +586,12 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       static_cast<uint32_t>(subsystems_.size()),
       is_configured_,
       clock_.boot_id(),
-      clock_.offset_us(),
+      clock_.accuracy_valid() ? clock_.bounded_offset_us() : clock_.offset_us(),
       clock_.spread_us(),
       clock_.resets_count(),
       clock_.ignored_count(),
       static_cast<uint32_t>(clock_.window_count()),
-      clock_.converged(),
+      clock_.converged() && clock_.accuracy_valid(),
       latest_state_.health.valid,
       latest_state_.health.battery_v,
       latest_state_.health.brownout,
@@ -577,6 +601,8 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       latest_state_.counters.neutralized_motor_count,
       latest_state_.counters.apply_failure_count,
       latest_state_.counters.device_reset_count,
+      clock_.uncertainty_us(),
+      clock_.round_trip_us(),
   };
 }
 

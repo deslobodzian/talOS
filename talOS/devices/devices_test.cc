@@ -729,8 +729,8 @@ TEST(Devices, SimHardwareSampleTimeConvergesFollowsLatencyAndGoesStale) {
   // gateway's clock 1.25 s off it.
   EXPECT_EQ(sampled_time.nanos() % 5'000'000, 0);
 
-  // States now leave 2 ms after they are sampled. The filter keeps the
-  // shorter delay it has seen, so each maps to its true sample time.
+  // States now leave 2 ms after sampling; the known simulated clock relation
+  // still maps each one to its true sample time.
   hw->set_gateway_clock(1250ms, 2ms);
   sim.step(20ms);
   const std::optional<Time> delayed = link.sample_time();

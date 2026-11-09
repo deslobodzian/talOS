@@ -1,8 +1,13 @@
 #pragma once
 
-// The gateway's sample clock mapped into the bridge's clock, which is the
-// clock every node runs on (talos::event::Poller::now(), the clock
-// Node::now() reads).
+// Gateway-to-node clock mapping. Production uses bounded_offset_us() from a
+// causal two-way exchange; offset_us()/spread_us() retain the legacy one-way
+// diagnostic below and MUST NOT be treated as an accuracy bound.
+// accuracy_valid() expires after one second of sample progress. Its error
+// bound assumes nonnegative delay and <=1000 ppm relative oscillator drift.
+// No fusion accuracy threshold has been specified.
+//
+// Legacy one-way diagnostic (not the production mapping):
 //
 // Each gateway state the bridge receives gives one one-way delay
 //
@@ -62,6 +67,17 @@ class ClockOffsetEstimator {
   bool Observe(std::uint64_t boot_id, std::uint64_t sample_time_us,
                std::uint64_t receipt_us);
 
+  // Causal two-way interval: probe sent at bridge t1, later gateway sample
+  // t2, bridge time t4 sampled AFTER receiving that State. No symmetry
+  // assumption: offset lies in [t1 - t2, t4 - t2]. Residence time is retained
+  // in RTT, making this looser but safer than subtracting guessed processing.
+  void ObserveExchange(std::uint64_t boot_id, std::uint64_t t1,
+                       std::uint64_t t2, std::uint64_t t4);
+  bool accuracy_valid() const { return exchange_valid_; }
+  std::int64_t bounded_offset_us() const { return bounded_offset_us_; }
+  std::uint64_t uncertainty_us() const { return uncertainty_us_; }
+  std::uint64_t round_trip_us() const { return round_trip_us_; }
+
   bool converged() const { return count_ >= kConvergedSamples; }
   // The gateway boot the window holds samples of; 0 before the first.
   std::uint64_t boot_id() const { return boots_.id(); }
@@ -86,6 +102,12 @@ class ClockOffsetEstimator {
   std::uint64_t spread_us_{0};
   std::uint64_t resets_{0};
   std::uint64_t ignored_{0};
+  bool exchange_valid_{false};
+  std::int64_t bounded_offset_us_{};
+  std::uint64_t uncertainty_us_{};
+  std::uint64_t round_trip_us_{};
+  std::uint64_t exchange_time_us_{};
+  std::uint64_t exchange_sample_us_{};
 };
 
 }  // namespace talos::hardware

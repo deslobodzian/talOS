@@ -19,6 +19,9 @@ exclude = [
     "*_camera/status/control_failure_count",
     "*_camera/status/controls_applied",
     "hw/status/clock_boot_id",
+    # Keep two-way clock diagnostics in local logs, not the radio budget.
+    "hw/status/clock_offset_uncertainty_us",
+    "hw/status/clock_min_round_trip_us",
     "sim/state/sample_time_ns",
     "sim/state/velocity/*",
 ]

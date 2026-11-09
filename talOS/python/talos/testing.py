@@ -182,10 +182,10 @@ class Sim:
 class SimHardware:
     """Plays the bridge for a Sim: publishes /hw/state every robot period
     (configured; enabled after enable()) and records each node's requests.
-    It also publishes /hw/status with the bridge's own gateway clock filter,
-    so talos.hardware_sample_time_ns(node) is None until the 8th state, then
-    each state's sim sample time plus the smallest latency the filter has
-    seen (its publication time while the latency is constant).
+    It also publishes /hw/status with the exact known simulated clock relation,
+    retaining the 8-State convergence gate. hardware_sample_time_ns(node) is None
+    until then, and subsequently gives the true simulated sample instant.
+    In-process clock uncertainty and RTT are zero (no transport estimation).
     Applied outputs expire after command_timeout_us without a publication;
     omitted outputs and disabled hardware are neutral. Raw inspection
     retains the last explicitly requested value for each device."""

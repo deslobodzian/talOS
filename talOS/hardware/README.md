@@ -177,14 +177,16 @@ as raw `Packet` topics in a version-5 `.tlog`.
 Nodes read the gateway's poll timestamp in their own clock through
 `HardwareLink::sample_time()` (C `talos_hardware_sample_time`, Python
 `talos.hardware_sample_time_ns(node)`). The bridge keeps the mapping
-(`talOS/bridge/clock_offset.h`) and publishes it on `/hw/status`: the offset is
-the minimum of `receipt time - sample_time_us` over the last 200 states of the
-current gateway boot, so a mapped sample time is later than the true one by the
-link's smallest latency -- a one-sided latency estimate, not clock
-synchronisation. A new boot restarts it, a state whose `sample_time_us` is not
-after the last one is left out, and it is valid from the 8th state of a boot.
-The bridge stamps receipt with `talos::event::Poller::now()`, the clock
-`Node::now()` reads.
+(`talOS/bridge/clock_offset.h`) and publishes it on `/hw/status`. Empty clock
+probes run at 50 Hz even while disabled/uncommissioned. A later State echoes
+the probe's bridge-clock send time; its gateway sample lies causally between
+that send and bridge receipt. The midpoint of the minimum-RTT interval estimates
+offset without assuming symmetric delay. `clock_offset_uncertainty_us` includes
+half RTT, timestamp quantization and <=1000 ppm relative clock drift; exchanges
+expire after one second. Eight ordered States and a live exchange are required.
+The old one-way spread remains diagnostic, not an accuracy bound. No fusion
+accuracy threshold is specified: measure uncertainty against fusion requirements
+on the bench. New boots reset the mapping; reordered/retired States are dropped.
 
 Driver Station disable/e-stop, command timeout, or total backend feedback loss
 neutralizes outputs, and neutral is refreshed every tick until a fresh command

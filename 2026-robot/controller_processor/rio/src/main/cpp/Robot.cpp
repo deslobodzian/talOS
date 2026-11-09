@@ -256,6 +256,8 @@ void Robot::StartCompetition() {
                     talos::protocol::UdpStatusName(status));
     }
     if (socket_open) {
+      // Endpoint handles clock probes even disabled/uncommissioned, echoing
+      // only on a subsequent tick so its sample stamp follows probe receipt.
       endpoint_->Tick(now_us,
                       (mode_flags & talos::driver_station::kEnabled) != 0 &&
                           (mode_flags & talos::driver_station::kEStop) == 0);

@@ -89,9 +89,10 @@ the gateway's safety checks are never bypassed.
 Signal acquisition times subtract the signal's existing gateway age (microseconds)
 from the mapped hardware State time. They are available while disabled, but
 absent for disconnected feedback, unknown age (`UINT32_MAX`), stale hardware or
-stale/invalid bridge clock mapping. They retain `sample_time()`'s one-sided
-transport-latency uncertainty; they do not synchronize clocks or interpolate
-measurements. Software rezero does not change these timestamps.
+stale/invalid bridge clock mapping. They retain `sample_time()`'s reported
+two-way clock uncertainty (`/hw/status/clock_offset_uncertainty_us`, assuming
+<=1000 ppm relative clock drift); they do not interpolate measurements.
+Software rezero does not change these timestamps.
 `SimHardware.set_motor`, `.set_cancoder` accept optional `position_age_us`,
 `velocity_age_us`; `.set_gyro` accepts `yaw_age_us`, `yaw_rate_age_us` (C++ and
 Python). Defaults are zero; `UINT32_MAX` injects unknown acquisition age.

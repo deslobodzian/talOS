@@ -11,18 +11,16 @@ namespace bridge;
 // first 32 fit. subsystem_count is the number of those subsystems.
 // configured is whether the RoboRIO acknowledged this bridge's configuration.
 //
-// The clock_* fields map the gateway's State.sample_time_us into the node
-// clock (talOS/bridge/clock_offset.h): the node-clock time of a sample of
-// gateway boot clock_boot_id is sample_time_us + clock_offset_us, later than
-// the truth by the smallest transport latency in the window (an upper-bounded
-// latency estimate, not clock synchronisation). clock_offset_valid is whether
-// the window holds enough samples of that boot; clock_offset_spread_us is the
-// largest minus the smallest one-way delay in it; clock_window_count is how
-// many samples it holds. clock_resets_count counts restarts for a new gateway
-// boot and clock_ignored_count duplicate, reordered or retired-boot samples
-// left out; the bridge drops each of those States whole (no identity,
-// freshness, request or config-push effect).
-// talos::HardwareLink::sample_time() applies the mapping.
+// clock_offset_us maps gateway sample time to node time. Valid only after
+// eight ordered States and a causal two-way probe exchange of this boot.
+// clock_offset_uncertainty_us bounds absolute mapping error assuming
+// nonnegative transport delay and <=1000 ppm relative oscillator drift.
+// clock_min_round_trip_us includes gateway residence and bridge scheduling.
+// Exchanges expire after one second; spread remains a one-way variability
+// diagnostic, never an accuracy bound. No fusion accuracy threshold is
+// specified, so uncertainty is reported rather than arbitrarily gated.
+// Resets count new boots; ignored counts reordered/retired States dropped whole.
+// HardwareLink::sample_time() applies this mapping.
 struct BridgeStatus {
   states_received_count:uint64;
   commands_sent_count:uint64;
@@ -50,4 +48,8 @@ struct BridgeStatus {
   gateway_neutralized_motor_count:uint32;
   gateway_apply_failure_count:uint32;
   gateway_device_reset_count:uint32;
+  // Causal two-way bound, including residence time, quantization and 1000 ppm
+  // relative oscillator drift. Local logs only (excluded from robot radio).
+  clock_offset_uncertainty_us:uint64;
+  clock_min_round_trip_us:uint64;
 }

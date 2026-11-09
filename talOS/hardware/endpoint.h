@@ -27,6 +27,9 @@ class Endpoint {
   void SetSendEnabled(bool enabled) { send_enabled_ = enabled; }
   protocol::UdpStatus Tick(uint64_t now_us, bool enabled) {
     gateway_.Tick(now_us, enabled);
+    // Only echo probes received on a previous tick: now_us was sampled before
+    // this tick's receive loop, so same-tick echo would violate causality.
+    const auto clock_probe_time_us = pending_probe_time_us_;
     if (pending_ack_ && !gateway_.configuring()) {
       ConfigAckPayload ack{};
       ack.config_id = pending_config_id_;
@@ -53,6 +56,11 @@ class Endpoint {
       if (result == protocol::UdpStatus::kWouldBlock) break;
       if (result != protocol::UdpStatus::kOk) continue;
 
+      if (frame.header.type == protocol::FrameType::kClockProbe &&
+          frame.payload_size == 0) {
+        pending_probe_time_us_ = frame.header.monotonic_time_us;
+        continue;
+      }
       if (frame.header.type == protocol::FrameType::kHardwareConfig) {
         std::string err;
         auto status =
@@ -120,7 +128,9 @@ class Endpoint {
       if (Decode({frame.payload, frame.payload_size}, command))
         gateway_.Accept(command, frame.header.sequence, now_us);
     }
-    const auto size = Encode(gateway_.snapshot(), buffer_);
+    auto state = gateway_.snapshot();
+    state.clock_probe_time_us = clock_probe_time_us;
+    const auto size = Encode(state, buffer_);
     return Send(protocol::FrameType::kHardwareState, now_us, buffer_.data(),
                 size);
   }
@@ -141,6 +151,7 @@ class Endpoint {
                            payload_size);
   }
   bool send_enabled_{true};
+  uint64_t pending_probe_time_us_{};
   Gateway& gateway_;
   protocol::RuntimeUdpPeer peer_;
   ConfigAssembler assembler_;

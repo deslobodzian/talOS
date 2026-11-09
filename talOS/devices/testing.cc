@@ -286,7 +286,8 @@ struct SimHardware::Impl {
     ++states_sent;
     if (ds_packet) PublishDriverStation(*ds_packet);
 
-    // What the bridge would report having received exactly this, now.
+    // In-process SimHardware knows the exact clock relation. Keep the normal
+    // convergence gate, but publish truth rather than a one-way delay guess.
     clock.Observe(state.boot_id, state.sample_time_us,
                   static_cast<std::uint64_t>(sim.now().nanos() / 1000));
     ::bridge::BridgeStatus status{
@@ -300,7 +301,7 @@ struct SimHardware::Impl {
         0,
         true,
         clock.boot_id(),
-        clock.offset_us(),
+        -gateway_offset.count() / 1000,
         clock.spread_us(),
         clock.resets_count(),
         clock.ignored_count(),
@@ -314,7 +315,9 @@ struct SimHardware::Impl {
         state.counters.rejected_command_count,
         state.counters.neutralized_motor_count,
         state.counters.apply_failure_count,
-        state.counters.device_reset_count};
+        state.counters.device_reset_count,
+        0,
+        0};
     sim.publish(::bridge::topics::kStatus, status);
   }
 

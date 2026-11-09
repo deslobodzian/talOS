@@ -25,8 +25,11 @@ the wire layout.
 | `kHardwareConfig` | 22 | companion → gateway | one chunk of the serialized `hardware::Config` (`config_wire.h`) |
 | `kHardwareConfigAck` | 23 | gateway → companion | `ConfigAckPayload` |
 | `kDriverStation` | 24 | gateway → companion | Driver Station snapshot (`talOS/driver_station`) |
+| `kClockProbe` | 25 | companion → gateway | empty; header send time echoed in a subsequent State |
 
 Payload codecs live with the payload owners; this package only frames bytes.
+Version 3 adds the State clock-probe echo; older peers are rejected before
+decoding. The probe does not authorize actuation and works while disabled.
 
 ## Low-Latency UDP API
 

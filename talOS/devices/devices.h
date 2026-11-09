@@ -73,9 +73,9 @@ class HardwareLink {
   // offset on /hw/status (talOS/bridge/clock_offset.h). nullopt before any
   // state, while that state is not fresh(), and until the bridge's mapping
   // for the state's gateway boot has converged. Independent of enabled().
-  // Later than the true sample time by the link's smallest latency (the
-  // bridge cannot observe it), so node.now() - sample_time() never exceeds
-  // the sample's true age: a one-sided estimate, not clock synchronisation.
+  // Absolute mapping error is bounded by /hw/status
+  // clock_offset_uncertainty_us, assuming <=1000 ppm relative clock drift.
+  // No application-specific fusion accuracy threshold is imposed here.
   std::optional<Time> sample_time() const;
   const config::RobotConfig& config() const;  // parsed node.config_path()
 
@@ -118,7 +118,7 @@ class Motor {
   double current() const;   // stator amps
   bool connected() const;   // sample valid and hardware state fresh
   // Per-signal acquisition time on the node clock, with sample_time()'s
-  // one-sided mapping uncertainty. nullopt if disconnected, mapping/state
+  // two-way mapping uncertainty. nullopt if disconnected, mapping/state
   // stale or invalid, or age unknown (UINT32_MAX).
   std::optional<Time> position_time() const;
   std::optional<Time> velocity_time() const;

@@ -180,5 +180,74 @@ TEST(ClockOffset, ALatencySpikeOnlyWidensTheSpreadUntilItAgesOut) {
   EXPECT_EQ(clock.offset_us(), kTrueOffsetUs + 250);
 }
 
+TEST(ClockOffset, ConstantDelaySpreadIsNotAnAccuracyBound) {
+  Estimator estimator;
+  for (uint64_t i = 0; i < 8; ++i) {
+    estimator.Observe(1, 1000 + i * 5000, 11000 + i * 5000);
+  }
+  ASSERT_TRUE(estimator.converged());
+  EXPECT_EQ(estimator.spread_us(), 0u);
+  // True offset is 7000 us; constant 3000 us transport delay is invisible.
+  EXPECT_GT(estimator.offset_us() - 7000,
+            static_cast<int64_t>(estimator.spread_us()));
+  EXPECT_FALSE(estimator.accuracy_valid());
+}
+
+TEST(ClockOffset, CausalBoundContainsErrorWithOffsetDelayJitterAndAsymmetry) {
+  for (const int64_t offset : {-500000, 0, 900000}) {
+    for (const uint64_t forward : {0u, 100u, 5000u, 30000u}) {
+      for (const uint64_t reverse : {0u, 300u, 7000u, 40000u}) {
+        Estimator estimator;
+        for (uint64_t i = 0; i < 500; ++i) {
+          const uint64_t send = 2000000 + i * 20000;
+          const uint64_t gateway_sample =
+              send + forward + (i * 97 % 1000) + 5000 - offset;
+          const uint64_t receive =
+              gateway_sample + offset + reverse + (i * 71 % 2000) + 1000;
+          ASSERT_TRUE(estimator.Observe(1, gateway_sample, receive));
+          estimator.ObserveExchange(1, send, gateway_sample, receive);
+          ASSERT_TRUE(estimator.accuracy_valid());
+          const auto error = estimator.bounded_offset_us() - offset;
+          EXPECT_LE(error, static_cast<int64_t>(estimator.uncertainty_us()));
+          EXPECT_GE(error, -static_cast<int64_t>(estimator.uncertainty_us()));
+        }
+        EXPECT_TRUE(estimator.converged());
+      }
+    }
+  }
+}
+
+TEST(ClockOffset, ExchangeExpiresAndResetsWithBoot) {
+  Estimator estimator;
+  estimator.Observe(1, 1000, 10000);
+  estimator.ObserveExchange(1, 8000, 1000, 10000);
+  ASSERT_TRUE(estimator.accuracy_valid());
+  estimator.Observe(1, 1001001, 1010001);
+  EXPECT_FALSE(estimator.accuracy_valid());
+  estimator.ObserveExchange(1, 1008000, 1001001, 1010001);
+  ASSERT_TRUE(estimator.accuracy_valid());
+  estimator.Observe(2, 1, 1015000);
+  EXPECT_FALSE(estimator.accuracy_valid());
+  estimator.ObserveExchange(1, 1010000, 1, 1015000);
+  EXPECT_FALSE(estimator.accuracy_valid());
+}
+
+TEST(ClockOffset, RetainedMinimumRoundTripBoundPropagatesOscillatorDrift) {
+  for (const int64_t drift_per_tick : {-10, 10}) {
+    Estimator estimator;
+    estimator.Observe(1, 1000000, 2000000);
+    estimator.ObserveExchange(1, 2000000, 1000000, 2000000);
+    for (uint64_t i = 1; i < 100; ++i) {
+      const uint64_t sample = 1000000 + i * 10000;
+      const int64_t offset = 1000000 + static_cast<int64_t>(i) * drift_per_tick;
+      estimator.Observe(1, sample, sample + offset);
+      ASSERT_TRUE(estimator.accuracy_valid());
+      const auto error = estimator.bounded_offset_us() - offset;
+      EXPECT_LE(error, static_cast<int64_t>(estimator.uncertainty_us()));
+      EXPECT_GE(error, -static_cast<int64_t>(estimator.uncertainty_us()));
+    }
+  }
+}
+
 }  // namespace
 }  // namespace talos::hardware

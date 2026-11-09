@@ -44,11 +44,12 @@ second hop. See [architecture](../ARCHITECTURE.md#two-processors).
 |---|---|---|
 | Devices ↔ RIO backend | CAN / local DIO, analog, encoder, PWM; no IP port | Gateway samples/applies on `Config.period_us`: 5000 µs = 200 Hz. Phoenix motion feedback requests `status_hz`; voltage/current/fault diagnostics request `min(status_hz, 50)` Hz. Shared vendor frames apply their highest requested rate: voltage/current remain 200 Hz with 200 Hz feedback; fault field applies 50 Hz. Disabled one-shot neutral refresh remains every hardware tick. No wire/size change. |
 | Driver Station ↔ RIO | WPILib/FRC native control/status over radio; not talOS UDP | DS produces new data at 50 Hz; RIO refreshes WPILib each hardware tick, emits a talOS DS snapshot at most every 20000 µs. Mode generations observe every hardware tick, including transitions between published snapshots. Native FRC packet layouts are external to this repo. |
-| RIO → hardware_node: State (type 20) | UDP source gateway 5802 → bridge 5803, wired robot switch | One snapshot per gateway tick, 200 Hz. |
+| RIO → hardware_node: State (type 20) | UDP source gateway 5802 → bridge 5803, wired robot switch | One snapshot per gateway tick, 200 Hz; echoes clock probe send time only after a subsequent gateway tick. |
 | hardware_node → RIO: Command (21) | UDP 5803 → 5802 | Bridge polls every 1000 µs. Send immediately when merged command changes, otherwise heartbeat `clamp(command_timeout_us / 5, 5000, 20000)` µs: 20000 µs = 50 Hz with the configured 100000 µs timeout. Only after observed state and while a subsystem request is active; not unconditionally 1000 Hz. |
 | hardware_node → RIO: Config chunks (22) | UDP 5803 → 5802 | Whole config push on observed boot/config mismatch or while unacknowledged; retry on State after ≥50000 µs, doubling after rejected ACKs from 100 ms to 2 s. A changed boot ID pushes immediately and resets backoff. Commands continue during backoff; no pushes after successful matching acknowledgment. |
 | RIO → hardware_node: ConfigAck (23) | UDP 5802 → 5803 | On completed assembly and asynchronous reconfiguration, or rejected chunk/config; no per-chunk ACK for incomplete assemblies. Per-device degraded configure succeeds, with invalid samples identifying unavailable devices. |
 | RIO → hardware_node: DriverStation (24) | UDP 5802 → 5803 | ≤50 Hz on real RIO and standalone `sim_gateway`: snapshots are gated to ≥20000 µs apart, independently of the hardware tick. |
+| hardware_node → RIO: ClockProbe (25) | UDP 5803 → 5802 | Empty payload; bridge send time in frame header. At most 50 Hz, one outstanding, retry after 1 s; independent of enable, commissioning and active requests. |
 | hardware_node → device-owning nodes / DS consumers / telemetry | Shared-memory `/hw/state`, `/hw/state/driver_station`, `/hw/status`; no port | State/DS on received frames; bridge status first tick then every 20000 µs (50 Hz, `node.h`'s `kStatusPeriodUs`). Consumers run at their own periods. |
 | drivetrain / shooter / intake → hardware_node | Shared-memory `/hw/request/<node>` | Devices-layer flush each update: drivetrain and shooter 5000 µs (200 Hz); intake 20000 µs (50 Hz). Bridge neutralizes an owner silent for >2× its period. |
 | driver / teleop / autonomous → actuator nodes | Shared-memory target lanes | 20000 µs (50 Hz); mode/freshness policy selects one lane. `driver` produces chassis control; `teleop` provides configured mechanism control; autonomous supplies auto lanes. |
@@ -76,7 +77,8 @@ Timing sources: `2026-robot/main_processor/configuration/robot.toml:1-16`, its
 
 ## UDP frame and payload sizes
 
-One datagram contains exactly one protocol frame. The explicit little-endian
+One datagram contains exactly one protocol frame, version **3** (State layout
+changed; version 2 peers are rejected). The explicit little-endian
 header is **40 B**: magic u64 (8), version/header_size/type/flags u16 (8 total),
 sequence u64 (8), monotonic_time_us u64 (8), payload_size u32 (4), reserved u32
 (4). Payload maximum is **1432 B**; frame maximum **1472 B** = 1500-byte MTU −
@@ -85,16 +87,20 @@ need no IP fragmentation (`talOS/protocol/frame.h`, `frame.cc`, `types.h`).
 
 | Payload | Fixed vs dynamic formula (bytes) | Maximum payload | Maximum frame | Payload headroom |
 |---|---|---:|---:|---:|
-| State, type 20 | `58 + 47M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 34` | 1412 | 1452 | 20 |
+| State, type 20 | `66 + 47M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 34` | 1420 | 1460 | 12 |
 | Command, type 21 | `38 + 20M + 3DO + 10PWM` | 410 | 450 | 1022 |
 | Config chunk, type 22 | packed 24-byte header + ≤1408 data | 1432 | 1472 | 0 for full chunk |
 | ConfigAck, type 23 | packed u64 config_id + u8 status + char[64] reason | 73 | 113 | 1359 |
 | DriverStation, type 24 | 40 fixed + two FMS strings + six variable joysticks | 678 | 718 | 754 |
+| ClockProbe, type 25 | empty; send timestamp uses existing frame header | 0 | 40 | 1432 |
 
 State/Command maxima use caps **M=16, S=12, DI=8, DO=4, AI=4, E=4,
-PWM=4** (`talOS/hardware/config.h`). The 58-byte State prefix is five u64 +
+PWM=4** (`talOS/hardware/config.h`). The 66-byte State prefix is six u64 +
 u32 flags + seven u16 counts; its 34-byte suffix is health (18) + four u32
 counters (16). Command prefix is four u64 + three u16 counts = 38.
+The sixth u64 is `clock_probe_time_us`, echoing a probe received before the
+current gateway tick began. Zero means no probe yet. It does not affect
+command acceptance, ACK sequence, epoch, or actuator watchdogs.
 
 | Device | State bytes / device | Command bytes / device | Encoded fields |
 |---|---:|---:|---|
@@ -115,16 +121,16 @@ The canonical parser merges `2026-robot/main_processor/configuration/robot.toml`
 and its subsystem files. Current device counts are **10 motors, 5 sensors,
 2 digital inputs, 0 digital outputs, 0 analog inputs, 0 encoders, 0 PWM outputs**.
 
-- State: `58 + 10×47 + 5×27 + 2×4 + 34` = **705 B** payload,
-  **745 B** frame, **727 B** payload headroom.
+- State: `66 + 10×47 + 5×27 + 2×4 + 34` = **713 B** payload,
+  **753 B** frame, **719 B** payload headroom.
 - Command: `38 + 10×20` = **238 B** payload, **278 B** frame,
   **1194 B** payload headroom.
 - Serialized Config: **3231 B**; `ceil(3231 / 1408)` = **3 chunks**.
   Chunk data lengths **1408, 1408, 415 B**, payload lengths **1432, 1432,
   439 B**, datagram lengths **1472, 1472, 479 B**. One push is **3423 B**
   of talOS frames (`3231 + 3×24 + 3×40`), excluding UDP/IP headers.
-- State at 200 Hz: **149000 B/s** in talOS frames (`745×200`), or
-  **1.192 Mbit/s**, on the wired internal link, not the robot radio.
+- State at 200 Hz: **150600 B/s** in talOS frames (`753×200`), or
+  **1.2048 Mbit/s**, on the wired internal link, not the robot radio.
 
 Computed with a throwaway C++ program calling the production `ParseRobotConfig`,
 `SerializeConfig`, and `CreateConfigChunks`, and the named State/Command size
@@ -209,11 +215,11 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 
 | Topic / owner → consumer | Slot bytes | Meaning / rate |
 |---|---:|---|
-| `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data currently 705, ≤1412 |
+| `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data currently 713, ≤1420 |
 | `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data currently 238, ≤410 |
 | `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1448 | 1436 B Packet; DS occupied data 46–678 |
 | `/hw/request/<node>`: device owner → bridge | 1448 | 1436 B Packet; only that owner's actuator requests, not a full-capacity command |
-| `/hw/status`: bridge → telemetry/observers | 168 | 160 B fixed `bridge.BridgeStatus`, alignment 8 |
+| `/hw/status`: bridge → telemetry/observers | 184 | 176 B fixed `bridge.BridgeStatus`, alignment 8 |
 | `/<sub>/target/<source>`: producer → target resolver | `align_up(16 + sizeof(message), 8) + 8` | TargetEnvelope payload: mode-generation/active header 16 + FlatBuffers struct; chassis/shooter/intake payload 40/24/20 B, slots 48/32/32 B |
 | `/autonomous/state`: autonomous → telemetry | 16 | 2 B AutonomousState: phase enum and selected/latched routine_index (ubyte); routine adds one 8 B telemetry scalar |
 | `/drivetrain/state`: drivetrain → estimator/driver/telemetry | 120 | 112 B DrivetrainState: padded time/flags header 16 + chassis/yaw 32 + four module positions 64 |
@@ -232,6 +238,25 @@ padding: they must not be inferred by simply adding scalar field widths.
 The `/sim/state` payload is pinned by `static_assert(sizeof(geometry::OdometrySample)
 == 56)` in `simulation/sim_gateway.cc`; RTMS adds its 8 B publication timestamp.
 This truth topic is local to the main processor and never crosses hardware UDP.
+
+### Gateway clock accuracy
+
+For a bridge probe sent at t1, echoed gateway sample t2, and bridge t4 sampled
+on the tick **after** State receipt, causality gives offset in
+`[t1 - t2, t4 - t2]`. The bridge publishes this interval's midpoint and
+`clock_offset_uncertainty_us` (half elapsed round trip rounded up, plus 2 us
+quantization and <=1000 ppm relative oscillator drift over RTT and sample age).
+Gateway and bridge each deliberately defer one tick: tick-start timestamps
+otherwise precede receive and cannot honestly bound the exchange.
+No symmetry assumption is needed; processing/residence time remains in the
+bound instead of requiring extra receive/transmit wire stamps.
+Select the minimum-RTT exchange for at most one second. A new boot resets it;
+eight ordered States and an unexpired exchange are required for
+`clock_offset_valid` / `HardwareLink::sample_time()`. One-way spread remains
+diagnostic only: constant delay produces zero spread but nonzero error.
+There is no specified fusion accuracy threshold, so report uncertainty rather
+than inventing one. This bounds clock mapping, not CAN acquisition-age error;
+bench qualification must validate the oscillator assumption and fusion budget.
 
 Autonomous phases are IDLE, SPINUP, FEED, DRIVE, HOLD, and ABORTED (append-only
 ubyte; state remains one byte). SPINUP and DRIVE abort after configured deadlines;
@@ -264,8 +289,9 @@ frames are larger/variable, bounded by the **16384 B** slot. First/every-100th-f
 dictionaries allow late join/recovery in about a second at 100 Hz.
 
 The 2026 configuration excludes cumulative camera counters, the 64-bit
-`hw/status/clock_boot_id` (a double cannot carry it exactly) and the simulator's
-timestamp/velocity at channel level (`subsystems/telemetry.toml`), retaining
+`hw/status/clock_boot_id` (a double cannot carry it exactly), the two new
+clock uncertainty/minimum-RTT fields, and the simulator's timestamp/velocity at
+channel level (`subsystems/telemetry.toml`), retaining
 camera health, timing, dropped-frame and visible-tag diagnostics. Excludes match
 topics or individual dictionary channels; only retained channels count.
 

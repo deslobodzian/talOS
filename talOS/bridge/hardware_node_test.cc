@@ -1619,10 +1619,41 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   EXPECT_TRUE(later.configured());
 }
 
-// /hw/status maps the gateway's sample clock into the bridge's: the minimum
-// one-way delay over the received states, valid once enough states of one
-// gateway boot have arrived, blind to a frame the gateway clock says is not
-// new, and restarted by a gateway reboot.
+TEST(HardwareNodeTest, TwoWayClockBoundNeedsNoActiveRequests) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  HardwareNode node{cfg, "127.0.0.1", TestPort(25834), TestPort(25835), true};
+  ASSERT_TRUE(node.Open());
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(
+      gateway.Open("127.0.0.1", TestPort(25834), "127.0.0.1", TestPort(25835)),
+      protocol::UdpStatus::kOk);
+  node.Tick(2000000);
+  protocol::DecodedFrame probe;
+  ASSERT_EQ(gateway.TryReceive(&probe), protocol::UdpStatus::kOk);
+  ASSERT_EQ(probe.header.type, protocol::FrameType::kClockProbe);
+  const auto sent = probe.header.monotonic_time_us;
+  auto state = TrustState(NodeConfigId(cfg), 11, 1, 1000);
+  state.flags = 0;
+  state.clock_probe_time_us = sent;
+  ASSERT_TRUE(InjectState(node, gateway, state, 2005000));
+  EXPECT_FALSE(node.Status(2005000).clock_offset_valid());
+  node.Tick(2006000);  // First known bridge-clock instant after receipt.
+  for (uint64_t i = 1; i < 8; ++i) {
+    state.sample_time_us = 1000 + i * 1000;
+    state.clock_probe_time_us = 0;
+    ASSERT_TRUE(InjectState(node, gateway, state, 2006000 + i * 1000));
+  }
+  const auto status = node.Status(2013000);
+  EXPECT_TRUE(status.clock_offset_valid());
+  EXPECT_EQ(status.clock_offset_us(), 2002000);
+  EXPECT_EQ(status.clock_min_round_trip_us(), 6000u);
+  EXPECT_GE(status.clock_offset_uncertainty_us(), 3000u);
+  EXPECT_EQ(node.commands_sent(), 0u);
+}
+
+// One-way spread is still published diagnostically, but even eight ordered
+// samples cannot make the production mapping valid without a two-way exchange.
+// Ordering and reboot handling remain shared by both clock paths.
 TEST(HardwareNodeTest, PublishesTheGatewayClockMapping) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
   HardwareNode node{cfg, "127.0.0.1", TestPort(25832), TestPort(25833), true};
@@ -1652,7 +1683,7 @@ TEST(HardwareNodeTest, PublishesTheGatewayClockMapping) {
         node, gateway, TrustState(config_id, 11, 1, 1000 + 5000 * i), now_us));
   }
   bridge::BridgeStatus status = node.Status(now_us);
-  EXPECT_TRUE(status.clock_offset_valid());
+  EXPECT_FALSE(status.clock_offset_valid());  // No two-way exchange yet.
   EXPECT_EQ(status.clock_boot_id(), 11u);
   EXPECT_EQ(status.clock_offset_us(), 2'000'000 - 1000 + 400);
   EXPECT_EQ(status.clock_offset_spread_us(), 1100u - 400u);
@@ -1672,7 +1703,7 @@ TEST(HardwareNodeTest, PublishesTheGatewayClockMapping) {
   EXPECT_EQ(status.clock_ignored_count(), 1u);
   EXPECT_EQ(status.clock_window_count(), 8u);
   EXPECT_EQ(status.clock_offset_spread_us(), 700u);
-  EXPECT_TRUE(status.clock_offset_valid());
+  EXPECT_FALSE(status.clock_offset_valid());
 
   // The gateway reboots: its clock restarts, and so does the mapping.
   ASSERT_TRUE(InjectState(node, gateway, TrustState(config_id, 12, 1, 1000),

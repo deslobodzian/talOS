@@ -28,7 +28,7 @@ TEST(Messages, FullyCappedEncodingsHaveExactSizes) {
   state.encoder_count = kMaxEncoders;
   state.pwm_output_count = kMaxPwmOutputs;
   std::array<uint8_t, kMaxStateSize> state_bytes{};
-  ASSERT_EQ(Encode(state, state_bytes), 1412u);
+  ASSERT_EQ(Encode(state, state_bytes), 1420u);
   State decoded_state;
   ASSERT_TRUE(Decode(state_bytes, decoded_state));
   EXPECT_EQ(decoded_state, state);
@@ -715,7 +715,7 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   // The same per-device widths the payload-budget static_asserts in messages.cc
   // are built from, so raising a device cap moves both together or neither.
   constexpr std::size_t kWidestState =
-      44 + 14 + 34 + kMaxMotors * 47 + kMaxSensors * 27 +
+      52 + 14 + 34 + kMaxMotors * 47 + kMaxSensors * 27 +
       kMaxDigitalInputs * 4 + kMaxDigitalOutputs * 4 + kMaxAnalogInputs * 15 +
       kMaxEncoders * 23 + kMaxPwmOutputs * 11;
   ASSERT_EQ(state_size, kWidestState);
@@ -1014,6 +1014,32 @@ TEST(Gateway, StartsUnconfiguredAndRefusesEnableUntilReconfigured) {
   EXPECT_TRUE(g.snapshot().flags & kConfigured);
   EXPECT_TRUE(g.snapshot().flags & kEnabled);
   EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+}
+
+TEST(Endpoint, ClockProbeEchoUsesLaterSampleWhileDisabledAndUnconfigured) {
+  SimBackend backend;
+  Gateway gateway{backend, 2003};
+  Endpoint endpoint{gateway};
+  ASSERT_EQ(endpoint.Open("127.0.0.1", 15814, "127.0.0.1", 15815),
+            protocol::UdpStatus::kOk);
+  protocol::RuntimeUdpPeer companion;
+  ASSERT_EQ(companion.Open("127.0.0.1", 15815, "127.0.0.1", 15814),
+            protocol::UdpStatus::kOk);
+  ASSERT_EQ(companion.SendFrame(protocol::FrameType::kClockProbe, 0, 9000,
+                                nullptr, 0),
+            protocol::UdpStatus::kOk);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  for (uint64_t tick : {1000u, 6000u}) {
+    ASSERT_EQ(endpoint.Tick(tick, false), protocol::UdpStatus::kOk);
+    protocol::DecodedFrame frame;
+    ASSERT_EQ(companion.TryReceive(&frame), protocol::UdpStatus::kOk);
+    State state;
+    ASSERT_TRUE(Decode({frame.payload, frame.payload_size}, state));
+    EXPECT_EQ(state.clock_probe_time_us, tick == 1000 ? 0u : 9000u);
+    EXPECT_EQ(state.sample_time_us, tick);
+    EXPECT_FALSE(state.flags & (kEnabled | kCommandActive));
+    EXPECT_EQ(state.counters.rejected_command_count, 0u);
+  }
 }
 
 TEST(Endpoint, OutboundBlackoutPreservesReceiveAndSafetyTicks) {

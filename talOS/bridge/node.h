@@ -204,6 +204,11 @@ class HardwareNode {
   // states_received_ is non-zero.
   uint64_t last_state_receipt_us_{0};
   ClockOffsetEstimator clock_;
+  uint64_t last_probe_send_us_{};
+  bool probe_waiting_{false};
+  uint64_t pending_probe_send_us_{};
+  uint64_t pending_probe_sample_us_{};
+  uint64_t pending_probe_boot_id_{};
   uint64_t statuses_published_{0};
   uint64_t last_status_us_{0};
   uint64_t last_push_time_us_{0};
