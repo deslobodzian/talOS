@@ -1388,13 +1388,14 @@ TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
   using talos::vision::TimestampKind;
   auto device = std::make_shared<FakeCameraDevice>();
   LiveTestVision::device = device;
-  // Frames arrive only when the test emits them, and a starved worker on a
-  // loaded host can take far longer than AdvanceLiveUntil's default bound, so
-  // each wait may use up to 1900 simulated ms, under the 2 s stall timeout.
-  // Stall recovery has its own test above.
+  // Frames arrive only when the test emits them, and the acquisition worker is
+  // a real thread: on a loaded host (CI, parallel agents) it has been seen to
+  // need more than 1.9 s of simulated stepping for one frame. The stall timeout
+  // is therefore the 10 s maximum and each wait may step 9.5 s, so host speed
+  // cannot cause a "stall". Stall recovery has its own test above.
   auto sim = MakeSim(false, true,
                      "device = \"fake\"\nwidth = 160\nheight = 120\n"
-                     "frame_timeout_us = 2000000\nexposure_ms = 4\n"
+                     "frame_timeout_us = 10000000\nexposure_ms = 4\n"
                      "readout_us = 1000\nlatency_offset_us = 10000\n",
                      "period_us = 1000\n");
   sim.add<LiveTestVision>("rear_right_camera");
@@ -1419,7 +1420,7 @@ TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
                  observation->sample_time_ns() ==
                      static_cast<std::uint64_t>(stamp - correction);
         },
-        1900))
+        9500))
         << static_cast<int>(kind);
   }
   const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
