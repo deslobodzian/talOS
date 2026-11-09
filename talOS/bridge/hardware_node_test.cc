@@ -303,6 +303,23 @@ bool InjectState(HardwareNode& node, protocol::RuntimeUdpPeer& gateway,
   return false;
 }
 
+// UDP send completion does not imply that the peer's receive queue is ready,
+// even on loopback (notably on BSD). Wait for the protocol event, without
+// advancing the bridge's simulated clock or causing another retry.
+unsigned ReceiveConfigs(protocol::RuntimeUdpPeer& gateway) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  unsigned count = 0;
+  do {
+    protocol::DecodedFrame frame;
+    while (gateway.TryReceive(&frame) == protocol::UdpStatus::kOk)
+      count += frame.header.type == protocol::FrameType::kHardwareConfig;
+    if (count != 0) return count;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  } while (std::chrono::steady_clock::now() < deadline);
+  return count;
+}
+
 State TrustState(uint64_t config_id, uint64_t boot_id, uint64_t epoch,
                  uint64_t sample_time_us) {
   State state{};
@@ -606,6 +623,7 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   event::log::LogReader reader(log_path);
   EXPECT_EQ(reader.format_version(), 6u);
   bool logged_command = false;
+  bool logged_neutral = false;
   bool logged_state = false;
   event::log::LogReader::Record record;
   while (reader.next(record)) {
@@ -618,12 +636,19 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
       Command command{};
       ASSERT_TRUE(Decode(logged.bytes(), command));
       EXPECT_EQ(command.boot_id, 42u);
-      if (!logged_command) {
+      // The publisher can refresh the request before it observes the first
+      // UDP command. Those refreshes (and heartbeats) may legitimately log
+      // more than one active command; after timeout, motion must not resume.
+      if (command.motors[1].mode == Mode::kVoltage) {
+        EXPECT_FALSE(logged_neutral);
         EXPECT_DOUBLE_EQ(command.motors[1].demand, 3.5);
+        logged_command = true;
       } else {
+        EXPECT_TRUE(logged_command);
+        EXPECT_EQ(command.motors[1].mode, Mode::kNeutral);
         EXPECT_DOUBLE_EQ(command.motors[1].demand, 0.0);
+        logged_neutral = true;
       }
-      logged_command = true;
     } else if (source.name == kStateTopic) {
       State decoded{};
       ASSERT_TRUE(Decode(logged.bytes(), decoded));
@@ -632,6 +657,7 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
     }
   }
   EXPECT_TRUE(logged_command);
+  EXPECT_TRUE(logged_neutral);
   EXPECT_TRUE(logged_state);
 }
 
@@ -1328,7 +1354,7 @@ TEST(HardwareNodeTest, ReorderedAndRetiredBootStatesChangeNothing) {
   ASSERT_TRUE(
       InjectState(node, gateway, TrustState(config_id, 12, 1, 500), 1010000));
   EXPECT_TRUE(state_sub.read());
-  EXPECT_GT(drain_configs(), 0u);
+  EXPECT_EQ(ReceiveConfigs(gateway), 1u);
   node.Tick(1010100);
   EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
   EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
@@ -1807,7 +1833,7 @@ TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {
       count += frame.header.type == protocol::FrameType::kHardwareConfig;
     return count;
   };
-  EXPECT_GT(drain_configs(), 0u);
+  ASSERT_EQ(ReceiveConfigs(gateway), 1u);
   ipc::Publisher<Packet> pub{RequestTopic("drivetrain")};
   for (uint64_t delay :
        {100000u, 200000u, 400000u, 800000u, 1600000u, 2000000u, 2000000u}) {
@@ -1819,8 +1845,10 @@ TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {
     ASSERT_EQ(gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 0, now,
                                 bytes.data(), size),
               protocol::UdpStatus::kOk);
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    node.Tick(now);
+    // The following state is an in-order receive barrier for the ACK: unlike
+    // sleeping, InjectState proves Tick consumed the preceding datagram.
+    ASSERT_TRUE(
+        InjectState(node, gateway, TrustState(id, 11, 1, now + 1), now));
     EXPECT_EQ(drain_configs(), 0u);
     const auto before = node.commands_sent();
     ASSERT_TRUE(InjectState(node, gateway,
@@ -1842,7 +1870,7 @@ TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {
     EXPECT_EQ(drain_configs(), 0u);
     now += delay;
     ASSERT_TRUE(InjectState(node, gateway, TrustState(id, 11, 1, now), now));
-    EXPECT_GT(drain_configs(), 0u);
+    ASSERT_EQ(ReceiveConfigs(gateway), 1u);
   }
 }
 
