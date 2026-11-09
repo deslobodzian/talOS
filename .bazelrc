@@ -7,6 +7,9 @@ build --enable_platform_specific_config
 build --test_env=PYTHONDONTWRITEBYTECODE=1
 
 build:linux --cxxopt=-std=c++23 --cxxopt=-O3
+# Build tools (the config resolver run inside bundle/manifest actions) compile
+# in the exec configuration, which ignores --cxxopt.
+build:linux --host_cxxopt=-std=c++23 --host_cxxopt=-O3
 # libjpeg-turbo 3.1.2 (BCR, via OpenCV) on x86-64 Linux defines its hidden
 # jpeg_nbits_table in the SIMD assembly library while the C library references
 # it; Bazel links test dependencies as separate shared objects, so every test
@@ -23,8 +26,11 @@ build:macos --cxxopt=-std=c++23 --cxxopt=-O3
 # than both, so without these the whole C++ tree fails to build here while
 # building fine on Linux CI.
 build:macos --cxxopt=-fexperimental-library --linkopt=-fexperimental-library
-build:macos --macos_minimum_os=13.4
+build:macos --host_cxxopt=-std=c++23 --host_cxxopt=-O3
+build:macos --host_cxxopt=-fexperimental-library --host_linkopt=-fexperimental-library
+build:macos --macos_minimum_os=13.4 --host_macos_minimum_os=13.4
 build:windows --cxxopt=/std:c++23 --cxxopt=-O3
+build:windows --host_cxxopt=/std:c++23 --host_cxxopt=-O3
 
 # Linux sanitizer builds instrument both C and C++ dependencies and link the
 # matching runtime. Keep stack traces useful and make UB fail the test.
