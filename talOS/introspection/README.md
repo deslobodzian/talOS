@@ -224,11 +224,17 @@ before storing `running_`, synchronizing the reporter's load. The reporter
 publishes endpoints and clears the constructing flag only when the manifest
 and counters exist. The launcher bounds this entire phase to 30 seconds from
 spawn, even if heartbeats keep arriving; see its supervision documentation.
-It then publishes
-the manifest once and samples the counters every 250 ms, well inside the
-liveness timeout. It sleeps in short slices rather than one long one so that a
-node which exits leaves the viewer promptly, and takes a final sample on the way
-out so the last cycle's counts are not lost.
+It then publishes the manifest once and samples source counters and selections
+every 250 ms. Between full samples it updates only heartbeat and dispatch
+progress every 10 ms, bracketed together by the sample sequence. The full
+display refresh cadence must not consume the launcher's unchanged 500 ms
+minimum stall window: previously a 300 ms process pause plus an already
+200–250 ms-old sample could trigger a restart before `SIGCONT`. With the new
+progress cadence, a pause plus the 10 ms reporting interval below that floor
+does not itself trigger a stall restart (subject to host scheduling delay).
+Full source counters can lag the progress pair until the next full sample.
+Short sleeps also let a node which exits leave the viewer promptly; a final
+full sample preserves its last counters.
 
 It must be constructed after the loop so that reverse destruction order joins
 the thread before the counters it samples are destroyed. `talos::Run`

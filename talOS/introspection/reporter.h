@@ -105,8 +105,9 @@ class Reporter {
     // The node's Targets, in the order it opened them.
     std::vector<Selection> selections;
 
-    // How often the slot is refreshed. Four times a second is well inside the
-    // liveness timeout and far below any rate a human or an agent polls at.
+    // Full source/selection refresh cadence. Supervisor progress is refreshed
+    // every 10 ms independently, so telemetry's cadence cannot consume most
+    // of the launcher's 500 ms minimum stall window.
     std::chrono::milliseconds period{250};
 
     std::string registry_path{kRegistryPath};
@@ -234,6 +235,13 @@ class Reporter {
       while (!stop.stop_requested() && loop.running() &&
              std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        // A 250 ms-old progress sample plus a short process suspension used
+        // to look like a 500 ms stall before the process could even resume.
+        // Keep this cheap: no source scan, allocation, or selection callbacks.
+        registration->begin_sample();
+        registration->heartbeat();
+        registration->set_dispatch_count(loop.dispatch_count());
+        registration->end_sample();
       }
     }
 
@@ -244,9 +252,8 @@ class Reporter {
 
   template <typename Loop>
   void sample(Loop& loop, NodeRegistration& registration) {
-    // One sample: the heartbeat, the dispatch count and every source move
-    // together behind sample_seq, so a reader never pairs a fresh heartbeat
-    // with the previous refresh's counts.
+    // One full source sample. Heartbeat and dispatch progress also move
+    // together between full samples, independently of the display cadence.
     registration.begin_sample();
     registration.heartbeat();
     registration.set_dispatch_count(loop.dispatch_count());

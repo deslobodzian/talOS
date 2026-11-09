@@ -617,6 +617,52 @@ TEST_F(Registry, RefusesToRegisterMoreNodesThanTheSegmentHolds) {
   EXPECT_NO_THROW(NodeRegistration({.name = "fits_now"}, path_));
 }
 
+TEST_F(Registry, ReporterProgressCadenceLeavesRoomForSubTimeoutPause) {
+  RegistryMapping mapping{path_};
+  Children children;
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    event::RealtimeEventLoop<> loop;
+    struct Handler {
+      void OnTick(const event::Context&) {}
+    } handler;
+    auto timer =
+        event::make_timer<&Handler::OnTick>(loop, "progress", &handler);
+    Reporter reporter{{.name = "paused", .registry_path = path_}};
+    reporter.start(loop);
+    timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
+    loop.run_for(5s);
+    ::_exit(0);
+  }
+  children.add(pid);
+  RegistryReader reader{path_};
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  std::vector<NodeSnapshot> nodes;
+  do {
+    nodes = reader.nodes();
+    if (!nodes.empty() && nodes.front().dispatch_count > 0) break;
+    std::this_thread::sleep_for(1ms);
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(nodes.size(), 1u);
+  ASSERT_GT(nodes.front().dispatch_count, 0u);
+  // Stop near the end of the old 250 ms full-sample interval. Its retained
+  // sample would already be 200 ms old, so a 300 ms pause crosses the
+  // launcher's unchanged 500 ms floor before SIGCONT can be sent.
+  std::this_thread::sleep_for(200ms);
+  ASSERT_EQ(::kill(pid, SIGSTOP), 0);
+  int status = 0;
+  ASSERT_EQ(Children::Wait(pid, &status, WUNTRACED), pid);
+  ASSERT_TRUE(WIFSTOPPED(status));
+  std::this_thread::sleep_for(300ms);
+  nodes = reader.nodes();
+  ASSERT_EQ(nodes.size(), 1u);
+  const auto age = std::chrono::nanoseconds{
+      monotonic_now_ns() - nodes.front().heartbeat_monotonic_ns};
+  EXPECT_LT(age, 450ms);
+  ASSERT_EQ(::kill(pid, SIGCONT), 0);
+}
+
 TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
   const std::string topic = "/probe/state/p" + std::to_string(::getpid());
   const std::string feed = "/probe/telemetry/p" + std::to_string(::getpid());
