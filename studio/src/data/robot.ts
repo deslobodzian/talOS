@@ -40,7 +40,9 @@ const DS = 'hw/state/driver_station/';
 
 // Precedence: e-stop outranks a lost link, which outranks a disabled robot,
 // which outranks the chosen mode. Null when the DS channels are absent from
-// the snapshot (which is a different statement from "disconnected").
+// the snapshot (which is a different statement from "disconnected"), and when
+// `enabled` is: a mode flag names the selected mode, not that the robot is
+// enabled in it.
 export function driverStationMode(snapshot: Snapshot|null): DriverStationMode|null {
   if (!snapshot) return null;
   const ch = snapshot.channels;
@@ -53,6 +55,7 @@ export function driverStationMode(snapshot: Snapshot|null): DriverStationMode|nu
     return null;
   if (estop === 1) return 'estop';
   if (connected === 0) return 'disconnected';
+  if (enabled === undefined) return null;
   if (enabled === 0) return 'disabled';
   if (autonomous === 1) return 'autonomous';
   if (teleop === 1) return 'teleop';

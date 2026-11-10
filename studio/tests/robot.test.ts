@@ -62,6 +62,15 @@ test('mode precedence: estop > disconnected > disabled > mode', () => {
   })), 'autonomous');
 });
 
+test('a mode flag without the enabled flag is unknown, not an enabled mode', () => {
+  for (const mode of ['autonomous', 'teleop', 'test'])
+    assert.equal(driverStationMode(snap({[DS + 'connected']: 1, [DS + mode]: 1})), null);
+  // E-stop and a lost link are facts without it.
+  assert.equal(driverStationMode(snap({[DS + 'estop']: 1, [DS + 'teleop']: 1})), 'estop');
+  assert.equal(driverStationMode(snap({[DS + 'connected']: 0, [DS + 'teleop']: 1})),
+               'disconnected');
+});
+
 test('robotStatus nulls when channels absent', () => {
   const status = robotStatus(snap({'hw/status/battery_v': 12.3}), noSystem);
   assert.equal(status.ds.mode, null);
