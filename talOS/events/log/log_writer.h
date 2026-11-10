@@ -28,9 +28,11 @@ namespace talos::event::log {
 // single-producer/single-consumer ring hands chunks to the background writer
 // without locking or waiting on the producer. Once per second the writer also
 // writes the committed prefix of the active chunk before fsync, so quiet logs
-// do not remain buffered indefinitely. If the pool fills, capture stops
-// permanently and failed() becomes true. Previously accepted chunks are
-// drained, preserving a prefix without holes.
+// do not remain buffered indefinitely; that fsync leaves the data in the
+// drive's write cache on macOS. flush() and destruction sync with
+// process::DurableSync, which also flushes that cache. If the pool fills,
+// capture stops permanently and failed() becomes true. Previously accepted
+// chunks are drained, preserving a prefix without holes.
 //
 // dispatch()/send()/finish() never throw: a full disk or a transient
 // EIO must not bring down a control loop that is otherwise healthy. Such
@@ -105,8 +107,9 @@ class LogWriter {
   // owning process is destroyed; it does not acknowledge resource release.
   void finish(const Context& context) noexcept;
 
-  // Pushes everything buffered to the file and fsyncs it before returning.
-  // Destruction also drains and fsyncs before closing the descriptor.
+  // Pushes everything buffered to the file and syncs it to disk
+  // (process::DurableSync) before returning. Destruction also drains and
+  // syncs before closing the descriptor.
   // Safe to call repeatedly, including after a failure.
   void flush() noexcept;
 
@@ -151,7 +154,9 @@ class LogWriter {
     void acquire_chunk() noexcept;
     void write_chunk(Chunk& chunk) noexcept;
     void write_all(const void* data, std::size_t size);
-    void sync() noexcept;
+    // `durable`: process::DurableSync (flush(), destruction); otherwise
+    // fsync (the periodic sync).
+    void sync(bool durable) noexcept;
     void mark_capped() noexcept;
     void drain() noexcept;
     void stop_writer() noexcept;
@@ -183,7 +188,7 @@ class LogWriter {
     bool stopping{false};
     std::atomic<bool> failed{false};  // Disk failure, independent of capture.
     // Error reporting also runs while the worker coordination mutex is held
-    // (fsync in drain/periodic sync), so it needs independent protection.
+    // (sync in drain/periodic sync), so it needs independent protection.
     mutable std::mutex error_mutex;
     std::string error;
   };

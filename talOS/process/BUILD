@@ -8,6 +8,12 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
+cc_library(
+    name = "durable_sync",
+    hdrs = ["durable_sync.h"],
+    visibility = ["//visibility:public"],
+)
+
 cc_test(
     name = "process_test",
     size = "small",

@@ -18,6 +18,7 @@ cc_library(
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
+        "//talOS/process:durable_sync",
         "//talOS/rtms",
         "//talOS/schema:unit_suffix",
         "@tomlplusplus//:toml++",

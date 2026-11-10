@@ -318,13 +318,16 @@ the root is `/tmp/talos_logs`. Use persistent storage on a deployed robot.
 when a node reports a stopped event log: a reader always sees one complete
 version, and a version is in place before any restart it records starts.
 Before anything starts, `graph.json`, `declared_graph.json` and the manifest of
-the roster about to start are synced (`fsync`, file then directory), and so is
-the final manifest; the launcher syncs nothing else. The supervision loop never
-waits for a sync, which can take hundreds of milliseconds while nodes write to
-the same disk, so the versions in between reach the disk when the OS writes
-them back. A killed launcher leaves its last version; a power loss can lose the
-versions the OS had not yet written back (`end_wall_ns = 0` means no normal
-shutdown).
+the roster about to start are synced (`talos::process::DurableSync`, file then
+directory: `fsync`, and on macOS `F_FULLFSYNC`, which also flushes the drive's
+write cache), and so is the final manifest; the launcher syncs nothing else.
+The supervision loop never waits for a sync, which can take hundreds of
+milliseconds while nodes write to the same disk, so the versions in between
+reach the disk when the OS writes them back. A killed launcher leaves its last
+version; a power loss can lose the versions the OS had not yet written back
+(`end_wall_ns = 0` means no normal shutdown). Each node's event log is synced
+the same way when its loop ends, and with a plain `fsync` once a second while
+it runs (`LogWriter`).
 
 At startup, retention removes the oldest sessions: directories holding a
 `manifest.json`, or, named by a session id, an event log whose header carries

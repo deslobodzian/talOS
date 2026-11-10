@@ -9,6 +9,8 @@
 #include <system_error>
 #include <utility>
 
+#include "talOS/process/durable_sync.h"
+
 namespace talos::event::log {
 
 namespace {
@@ -67,7 +69,7 @@ LogWriter::State::~State() {
     submit_active();
   }
   stop_writer();
-  sync();
+  sync(/*durable=*/true);
 
   if (fd >= 0) {
     ::close(fd);
@@ -124,12 +126,16 @@ void LogWriter::State::write_chunk(Chunk& chunk) noexcept {
   }
 }
 
-void LogWriter::State::sync() noexcept {
+void LogWriter::State::sync(bool durable) noexcept {
   if (fd < 0) return;
   int result;
-  do {
-    result = ::fsync(fd);
-  } while (result < 0 && errno == EINTR);
+  if (durable) {
+    result = process::DurableSync(fd);
+  } else {
+    do {
+      result = ::fsync(fd);
+    } while (result < 0 && errno == EINTR);
+  }
   if (result < 0) {
     set_error(std::string{"LogWriter: fsync failed: "} + std::strerror(errno));
   }
@@ -250,7 +256,7 @@ void LogWriter::State::append(RecordHeader header,
   } else if (std::chrono::steady_clock::now() - last_sync >=
              std::chrono::seconds{1}) {
     submit_active();
-    sync();
+    sync(/*durable=*/false);
   }
 }
 
@@ -258,7 +264,7 @@ void LogWriter::State::drain() noexcept {
   submit_active();
 
   if (!options.background) {
-    sync();
+    sync(/*durable=*/true);
     return;
   }
 
@@ -266,9 +272,9 @@ void LogWriter::State::drain() noexcept {
   pending_ready.notify_all();
   chunk_ready.wait(lock,
                    [this] { return completed.load() == submitted.load(); });
-  // All submitted chunks have reached the descriptor; serialize fsync with
-  // the worker's periodic sync, which also runs under this mutex.
-  sync();
+  // All submitted chunks have reached the descriptor; serialize the sync with
+  // the worker's periodic one, which also runs under this mutex.
+  sync(/*durable=*/true);
 }
 
 void LogWriter::State::stop_writer() noexcept {
@@ -405,7 +411,7 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
         raw->chunk_ready.notify_all();
       }
       if (sync_due) {
-        raw->sync();
+        raw->sync(/*durable=*/false);
       }
     }
   }};

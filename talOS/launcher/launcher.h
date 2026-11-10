@@ -45,6 +45,7 @@
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/launcher/service_notifier.h"
+#include "talOS/process/durable_sync.h"
 #include "talOS/rtms/rtms.h"
 #include "talOS/schema/unit_suffix.h"
 #include "toml.hpp"
@@ -70,8 +71,9 @@ inline std::string Quoted(std::string_view value) {
   return out;
 }
 
-// Syncs an open file or directory to disk, as ::fsync does (production; the
-// seam is LauncherOptions::sync_file). 0, or -1 with errno set.
+// Syncs an open file or directory to disk, as process::DurableSync does
+// (production; the seam is LauncherOptions::sync_file). 0, or -1 with errno
+// set.
 using SyncFunction = std::function<int(int fd)>;
 
 // Replaces `path` with `contents` so that a reader sees the old file or the
@@ -246,9 +248,10 @@ struct LauncherOptions {
   // fail as fork() does under EAGAIN. Production leaves it empty.
   std::map<std::string, int> spawn_failures;
   // Internal supervision seam: syncs an open session file or directory to
-  // disk; ::fsync in production. The supervision loop never calls it: the
-  // manifest versions it writes are not synced (PersistManifest).
-  SyncFunction sync_file{::fsync};
+  // disk; process::DurableSync in production. The supervision loop never
+  // calls it: the manifest versions it writes are not synced
+  // (PersistManifest).
+  SyncFunction sync_file{process::DurableSync};
 
   // Launch a graph the linter called broken anyway. The default is refusal:
   // two spellings of one topic are silent at runtime.

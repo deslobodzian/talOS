@@ -45,7 +45,10 @@ cc_library(
         "log/log_writer.h",
     ],
     visibility = ["//visibility:public"],
-    deps = [":events_core"],
+    deps = [
+        ":events_core",
+        "//talOS/process:durable_sync",
+    ],
 )
 
 cc_test(
