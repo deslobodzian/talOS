@@ -20,6 +20,9 @@ namespace {
 bool fail_truncate = false;
 bool fail_close = false;
 int unmap_calls = 0;
+// Set to have the next exclusive create find the name and its last holder
+// unlink it before the attach that follows.
+bool unlink_after_exists = false;
 
 int TestTruncate(int fd, off_t size) {
   if (std::exchange(fail_truncate, false)) {
@@ -42,16 +45,29 @@ int TestUnmap(void* address, std::size_t size) {
   ++unmap_calls;
   return ::munmap(address, size);
 }
+
+int TestShmOpen(const char* name, int oflag, mode_t mode) {
+  const int fd = ::shm_open(name, oflag, mode);
+  if (fd == -1 && errno == EEXIST &&
+      std::exchange(unlink_after_exists, false)) {
+    ::shm_unlink(name);
+    errno = EEXIST;
+  }
+  return fd;
+}
 }  // namespace
 
-// Inject only the OS failures needed to exercise otherwise unreachable cleanup.
+// Inject only the OS behaviour needed to reach otherwise unreachable paths:
+// failures that need cleanup, and a name unlinked in the middle of an open.
 #define ftruncate TestTruncate
 #define close TestClose
 #define munmap TestUnmap
+#define shm_open TestShmOpen
 #include "shared_memory_ptr.h"
 #undef ftruncate
 #undef close
 #undef munmap
+#undef shm_open
 
 TEST(SharedMemory, FailedCreatorTruncateRemovesPublishedName) {
   const std::string path = "/truncate_" + std::to_string(::getpid());
@@ -73,6 +89,24 @@ TEST(SharedMemory, FailedCloseUnmapsSuccessfulMapping) {
   fail_close = true;
   EXPECT_THROW((SharedMemoryPtr{path, 4096}), std::runtime_error);
   EXPECT_EQ(unmap_calls, before + 1);
+  shm_unlink(name.c_str());
+}
+
+// A name the exclusive create finds can be unlinked by its last holder before
+// the attach that follows. The name is then free, so the mapping creates it
+// rather than failing.
+TEST(SharedMemory, ANameUnlinkedBetweenCreateAndAttachIsCreated) {
+  const std::string path = "/vanish_" + std::to_string(::getpid());
+  const auto name = ShmObjectName(path);
+  shm_unlink(name.c_str());
+  const int fd = shm_open(name.c_str(), O_CREAT | O_RDWR, 0666);
+  ASSERT_NE(fd, -1);
+  ::close(fd);
+  unlink_after_exists = true;
+  SharedMemoryPtr mapping{path, 4096};
+  EXPECT_FALSE(unlink_after_exists) << "the unlink was never injected";
+  EXPECT_EQ(mapping.mode(), SharedMemoryMode::CREATE);
+  EXPECT_NE(mapping.ptr(), nullptr);
   shm_unlink(name.c_str());
 }
 

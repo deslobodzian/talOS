@@ -148,24 +148,25 @@ class SharedMemoryPtr {
     return static_cast<off_t>(size);
   }
 
-  void create_or_attach_shm_map(int& shm_fd, SharedMemoryMode& shm_mode,
-                                const char* name, int oflag, mode_t mode) {
-    shm_fd = shm_open(name, oflag, mode);
-    if (shm_fd == -1) {
-      if (errno == EEXIST) {
-        shm_mode = SharedMemoryMode::ATTACH;
-        create_or_attach_shm_map(shm_fd, shm_mode, name, O_RDWR, mode);
-      }
+  // Opens the name, creating it when absent; mode_ says which. A name found
+  // by the exclusive create (EEXIST) can be gone by the attach (ENOENT),
+  // unlinked by its last holder in between, and is then free to create, so
+  // the create is retried. -1 with errno set when neither succeeds.
+  int create_or_attach() {
+    for (int attempt = 0; attempt < kAttachAttempts; ++attempt) {
+      mode_ = SharedMemoryMode::CREATE;
+      int shm_fd = shm_open(shm_name_.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
+      if (shm_fd != -1 || errno != EEXIST) return shm_fd;
+      mode_ = SharedMemoryMode::ATTACH;
+      shm_fd = shm_open(shm_name_.c_str(), O_RDWR, 0666);
+      if (shm_fd != -1 || errno != ENOENT) return shm_fd;
     }
+    return -1;
   }
 
   int map_ptr() {
-    int shm_fd = -1;
-    int oflag = -1;
     const off_t file_size = to_off_t(size_);
-
-    oflag = O_CREAT | O_RDWR | O_EXCL;
-    create_or_attach_shm_map(shm_fd, mode_, shm_name_.c_str(), oflag, 0666);
+    const int shm_fd = create_or_attach();
 
     switch (mode_) {
       case SharedMemoryMode::CREATE:
@@ -186,13 +187,6 @@ class SharedMemoryPtr {
 
         break;
       case SharedMemoryMode::ATTACH: {
-        // create_or_attach_shm_map already opened the object on the
-        // EEXIST path; only open again if it did not.
-        if (shm_fd == -1) {
-          oflag = O_RDWR;
-          shm_fd = shm_open(shm_name_.c_str(), oflag, 0666);
-        }
-
         if (shm_fd == -1) {
           std::perror(std::format("shm_open failed on attach for {}", shm_name_)
                           .c_str());
