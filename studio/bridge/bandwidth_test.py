@@ -119,15 +119,23 @@ def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=active) as pool:
                 readers = [pool.submit(consume, index) for index in range(active)]
+                served_ns = None
                 try:
                     while True:
                         with urllib.request.urlopen(f"http://127.0.0.1:{port}/system.json") as response:
-                            stats = json.load(response)["bridge"]
+                            document = json.load(response)
+                        stats = document["bridge"]
                         if seconds is None:
                             # Finish on evidence, not an eight-second latency sample:
                             # every healthy reader has kept receiving beside the
                             # non-reading client.
-                            if all(event.is_set() for event in ready):
+                            if served_ns is None and all(event.is_set() for event in ready):
+                                served_ns = time.time_ns()
+                            # /system.json is the bridge's last refresh, taken
+                            # every 250 ms (main.cc), so it can predate the
+                            # clients connecting; finish on the first refresh
+                            # taken after every reader was served.
+                            if served_ns is not None and int(document["wall_ns"]) >= served_ns:
                                 break
                         if time.monotonic() >= end:
                             if seconds is None:
