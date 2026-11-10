@@ -204,7 +204,7 @@ the inconsistency without changing the wire format.
 
 Fixed message topics store their complete native FlatBuffers struct/envelope
 plus a writer publication timestamp; there is no UDP frame header. RTMS segment
-version **5** stores `[payload][padding to 8][i64 publish_time_ns][tail padding]`.
+version **6** stores `[payload][padding to 8][i64 publish_time_ns][tail padding]`.
 For payload size M and alignment A, timestamp offset is `align_up(M, 8)` and
 slot stride is `align_up(align_up(M, 8) + 8, max(A, 8))`. The **832 B** ring
 header is additional; data starts at `align_up(832, max(A, 8))`. These sizes
@@ -218,6 +218,8 @@ except that equality is accepted when the reliable-publication marker equals P.
 Overwriting writers invalidate this marker before modifying slot bytes. A
 standalone publisher reclaims incompatible unheld segments; attaching readers
 reject version mismatches. A new session owner replaces any prior segment.
+Writer and reader claims in the header record the pid plus the process start
+time (`kProcessPidBits` in `talOS/rtms/rtms.h`), so a reused pid holds no claim.
 
 `age()` and `fresh()` count from publication, never delivery. A stalled consumer
 cannot revive an expired command by draining it. Latest-value subscriptions

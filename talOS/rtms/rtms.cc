@@ -7,8 +7,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -17,9 +19,18 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 
 #include "talOS/memory/shared_memory_ptr.h"
+
+#if defined(__APPLE__)
+#include <sys/types.h>
+// kinfo_proc embeds struct extern_proc (p_stat, p_starttime, SZOMB).
+#include <sys/proc.h>
+#include <sys/sysctl.h>
+#endif
 
 namespace {
 
@@ -28,8 +39,12 @@ namespace {
 // will be" without masking either.
 constexpr int kInitAttempts = 200;
 constexpr useconds_t kInitRetryUs = 250;
-// How often open() retries a segment that its last holder is unlinking.
+// How often open() waits for the last holder of a closing segment to unlink
+// it before deciding that holder died first.
 constexpr int kOpenAttempts = 200;
+
+constexpr std::uint64_t kProcessPidMask = (1ULL << kProcessPidBits) - 1;
+constexpr std::uint64_t kProcessStartMask = (1ULL << kProcessStartBits) - 1;
 
 std::string ValidatePath(std::string_view path) {
   std::string_view name = path;
@@ -46,15 +61,111 @@ std::string ValidatePath(std::string_view path) {
   return std::string{path};
 }
 
-bool ProcessAlive(std::uint64_t pid) {
-  if (pid == 0 || pid > static_cast<std::uint64_t>(INT32_MAX)) return false;
-  return ::kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM;
+// What the kernel reports about a pid: whether a process with it runs -- a
+// zombie has exited and maps nothing -- and when it started, 0 when the
+// platform did not report it. A pid that exists but cannot be inspected
+// counts as running: only a process known to be gone may lose its claims.
+struct ProcessStart {
+  bool running{false};
+  std::uint64_t start{0};
+};
+
+#if defined(__APPLE__)
+// The start is in microseconds since the epoch, fixed when the process forked.
+ProcessStart InspectProcess(pid_t pid) {
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+  struct kinfo_proc info {};
+  std::size_t size = sizeof(info);
+  if (::sysctl(mib, 4, &info, &size, nullptr, 0) != 0) {
+    return {.running = ::kill(pid, 0) == 0 || errno == EPERM};
+  }
+  // An absent pid succeeds with nothing copied out.
+  if (size == 0 || info.kp_proc.p_stat == SZOMB) return {};
+  const struct timeval& start = info.kp_proc.p_starttime;
+  return {.running = true,
+          .start = static_cast<std::uint64_t>(start.tv_sec) * 1'000'000U +
+                   static_cast<std::uint64_t>(start.tv_usec)};
 }
+#else
+// /proc/<pid>/stat holds the state in field 3, the thread count in field 20
+// and the start, in clock ticks since boot, in field 22. The command name
+// (field 2) may hold spaces and parentheses, so fields are counted from its
+// closing ')'. kill() first, so another user's process hidden from /proc
+// (hidepid) still counts as running.
+ProcessStart InspectProcess(pid_t pid) {
+  if (::kill(pid, 0) != 0 && errno == ESRCH) return {};
+  std::array<char, 32> path{};
+  std::snprintf(path.data(), path.size(), "/proc/%d/stat",
+                static_cast<int>(pid));
+  const int fd = ::open(path.data(), O_RDONLY | O_CLOEXEC);
+  if (fd == -1) return {.running = true};
+  std::array<char, 1024> buffer{};
+  const ssize_t length = ::read(fd, buffer.data(), buffer.size());
+  ::close(fd);
+  if (length <= 0) return {.running = true};
+  const std::string_view line{buffer.data(), static_cast<std::size_t>(length)};
+  const std::size_t name_end = line.rfind(')');
+  if (name_end == std::string_view::npos || name_end + 2 >= line.size()) {
+    return {.running = true};
+  }
+  const char state = line[name_end + 2];
+  std::size_t at = name_end + 2;
+  int index = 3;
+  // Parses field `wanted`; a number that runs into the end of the read may
+  // have been cut short, so it must end in a space.
+  const auto field = [&](int wanted, std::uint64_t& value) {
+    for (; index < wanted; ++index) {
+      at = line.find(' ', at);
+      if (at == std::string_view::npos) return false;
+      ++at;
+    }
+    const char* const end = line.data() + line.size();
+    const auto [last, error] = std::from_chars(line.data() + at, end, value);
+    return error == std::errc{} && last != end && *last == ' ';
+  };
+  std::uint64_t threads = 0;
+  std::uint64_t start = 0;
+  if (!field(20, threads) || !field(22, start)) return {.running = true};
+  // A leader that exited while its other threads run (pthread_exit from
+  // main) shows as a zombie but its threads still map the segment.
+  if ((state == 'Z' && threads <= 1) || state == 'X' || state == 'x') {
+    return {};
+  }
+  return {.running = true, .start = start};
+}
+#endif
 
 std::uint64_t OwnPid() { return static_cast<std::uint64_t>(::getpid()); }
 
+// This process as the segment records it (kProcessPidBits). Cached per pid,
+// so a forked child records itself rather than its parent.
+std::uint64_t OwnProcess() {
+  static std::atomic<std::uint64_t> cached{0};
+  const std::uint64_t pid = OwnPid();
+  std::uint64_t word = cached.load(std::memory_order_relaxed);
+  if ((word & kProcessPidMask) != pid) {
+    const std::uint64_t start =
+        InspectProcess(static_cast<pid_t>(pid)).start & kProcessStartMask;
+    word = (start << kProcessPidBits) | pid;
+    cached.store(word, std::memory_order_relaxed);
+  }
+  return word;
+}
+
+// Whether the process a word records still runs: a process with its pid
+// runs and started when the recorded one did. A start either side does not
+// know compares the pid alone.
+bool ProcessAlive(std::uint64_t word) {
+  const std::uint64_t pid = word & kProcessPidMask;
+  if (pid == 0 || pid > static_cast<std::uint64_t>(INT32_MAX)) return false;
+  const ProcessStart process = InspectProcess(static_cast<pid_t>(pid));
+  const std::uint64_t recorded = word >> kProcessPidBits;
+  return process.running && (recorded == 0 || process.start == 0 ||
+                             recorded == (process.start & kProcessStartMask));
+}
+
 std::uint64_t ReaderWord(ReaderState state) {
-  return (OwnPid() << 2) | static_cast<std::uint64_t>(state);
+  return (OwnProcess() << 2) | static_cast<std::uint64_t>(state);
 }
 
 void ClaimWriter(RTMSHeader& header, const std::string& path) {
@@ -63,11 +174,11 @@ void ClaimWriter(RTMSHeader& header, const std::string& path) {
     if (owner != 0 && ProcessAlive(owner)) {
       throw std::runtime_error(
           "RTMS topic " + path + " already has writer pid " +
-          std::to_string(owner) + "; refusing writer pid " +
+          std::to_string(owner & kProcessPidMask) + "; refusing writer pid " +
           std::to_string(OwnPid()));
     }
     if (header.writer.owner_pid.compare_exchange_weak(
-            owner, OwnPid(), std::memory_order_acq_rel,
+            owner, OwnProcess(), std::memory_order_acq_rel,
             std::memory_order_acquire)) {
       return;
     }
@@ -224,7 +335,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
     ::shm_unlink(ShmObjectName(path_).c_str());
   }
 
-  for (int attempt = 0; attempt < kOpenAttempts; ++attempt) {
+  for (int attempt = 0; attempt <= kOpenAttempts; ++attempt) {
     if (options_.publisher && !options_.session_owner) {
       // Reclaims a segment this publisher cannot use, when nothing could be
       // harmed by removing it: not session-owned and held by no live process.
@@ -275,7 +386,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
                              std::memory_order_relaxed);
       counted_ = !options_.session_owner;
       header->writer.sequence.store(0, std::memory_order_relaxed);
-      header->writer.owner_pid.store(options_.publisher ? OwnPid() : 0,
+      header->writer.owner_pid.store(options_.publisher ? OwnProcess() : 0,
                                      std::memory_order_relaxed);
       header->writer.reliable_sequence.store(0, std::memory_order_relaxed);
       for (auto& reader : header->readers) {
@@ -344,8 +455,23 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
     if (closing) {
       // Its last holder is unlinking it; the next shm_open creates a fresh
       // segment once the name is gone.
-      ::usleep(kInitRetryUs);
-      continue;
+      if (attempt + 1 < kOpenAttempts) {
+        ::usleep(kInitRetryUs);
+        continue;
+      }
+      // A holder killed after marking it closing never will. Its count
+      // reached zero, so no queue is attached; once the wait is spent this
+      // segment -- never a newer one under the name -- is unlinked here,
+      // unless a live process still holds its writer claim or a reader slot.
+      if (attempt + 1 == kOpenAttempts && !HeldByLiveProcess(*header)) {
+        std::fprintf(stderr,
+                     "rtms: reclaiming shared memory %s, whose last holder "
+                     "died before unlinking it\n",
+                     path_.c_str());
+        UnlinkIfSame(path_, header->segment_id);
+        continue;
+      }
+      break;
     }
     if (options_.publisher) {
       try {
@@ -369,7 +495,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
 void RTMSQueue::close() noexcept {
   if (header_ == nullptr) return;
   if (options_.publisher) {
-    std::uint64_t expected = OwnPid();
+    std::uint64_t expected = OwnProcess();
     header_->writer.owner_pid.compare_exchange_strong(
         expected, 0, std::memory_order_acq_rel);
   }
@@ -570,15 +696,22 @@ bool RTMSQueue::select_sequence(const Reader& reader, MessageInfo& info) const {
 
   std::uint64_t message_sequence = reader_position;
 
-  // Under DROP_NEWEST the writer refuses to pass the slowest reader, so no
-  // unread slot can ever be overwritten and nothing may be skipped. Skipping
-  // here would silently break the guarantee that makes that mode worth having.
-  //
-  // Under an overwriting policy the writer is free to lap us. Published
-  // position P may already be writing sequence P, so only the last `slots - 1`
-  // published sequences are guaranteed intact; recovery skips the reused slot.
-  if (options_.overflow_policy != OverflowPolicy::DROP_NEWEST &&
-      writer_position - message_sequence >= header_->slots) {
+  // Published position P may already be writing sequence P, into the slot of
+  // P - slots, so only the last `slots - 1` published sequences are
+  // guaranteed intact. Under DROP_NEWEST the writer refuses to pass the
+  // slowest reader, so this reader may also take P - slots while the
+  // reliable-publication marker shows that slot's write completed: the full
+  // ring, nothing skipped. Otherwise a reader `slots` or more behind was
+  // lapped -- the writer overwrites, whatever this end's policy assumed --
+  // and skips to the oldest intact sequence, reporting the rest as dropped,
+  // rather than failing every read from then on.
+  const std::uint64_t distance = writer_position - message_sequence;
+  const bool full_ring =
+      options_.overflow_policy == OverflowPolicy::DROP_NEWEST &&
+      distance == header_->slots &&
+      header_->writer.reliable_sequence.load(std::memory_order_acquire) ==
+          writer_position;
+  if (distance >= header_->slots && !full_ring) {
     message_sequence = writer_position - header_->slots + 1;
   }
 

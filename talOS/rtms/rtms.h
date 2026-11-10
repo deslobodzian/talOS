@@ -54,9 +54,10 @@ static inline bool is_pow_2(std::size_t n) {
 }
 
 // A reader slot's state word holds the state in its low two bits and the
-// pid of the process that claimed it above them, so a slot whose process
-// died -- killed mid-read, or exited without releasing -- can be recognised
-// and freed (see RTMSQueue::reclaim_dead_readers). FREE is the word 0.
+// process word (kProcessPidBits) of the process that claimed it above them,
+// so a slot whose process died -- killed mid-read, or exited without
+// releasing -- can be recognised and freed (see
+// RTMSQueue::reclaim_dead_readers). FREE is the word 0.
 enum class ReaderState : std::uint64_t { FREE, CLAIMING, ACTIVE };
 
 enum class WriteResult {
@@ -84,15 +85,16 @@ struct WriteStatus {
 enum class ReadResult {
   OK,
   EMPTY,     // Caught up with the writer, nothing new.
-  INACTIVE,  // Reader slot is not registered.
+  INACTIVE,  // Reader slot is not registered, or was freed as dead.
   INVALID,   // Reader id out of range or destination too small.
   TORN,      // Writer lapped us mid-copy too many times to recover.
 };
 
 // Metadata that accompanies a message handed to a reader.
 // `dropped` counts messages the reader skipped past without observing, either
-// because the writer lapped it (OVERWRITE_OLDEST) or because ReadMode::LATEST
-// intentionally jumps to the newest message.
+// because the writer lapped it -- the writer overwrote them, whatever this
+// reader's own policy assumed -- or because ReadMode::LATEST intentionally
+// jumps to the newest message.
 struct MessageInfo {
   std::uint64_t sequence{0};
   std::uint64_t dropped{0};
@@ -115,7 +117,7 @@ struct RTMSOptions {
   OverflowPolicy overflow_policy{OverflowPolicy::OVERWRITE_OLDEST};
   ReadMode read_mode{ReadMode::LATEST};
 
-  // This end writes the topic. A publisher records its pid in the segment
+  // This end writes the topic. A publisher records itself in the segment
   // and owns the topic's layout outside a session: a segment it cannot use
   // -- one from an older build, or of another schema -- that is not
   // session-owned and that no live process holds (no live writer, no live
@@ -134,7 +136,7 @@ struct RTMSOptions {
 // The segment format, checked before any other header field is trusted.
 inline constexpr std::uint64_t kRtmsMagic =
     0x32534D54534F4C41ULL;  // "ALOSTMS2"
-inline constexpr std::uint64_t kRtmsVersion = 5;
+inline constexpr std::uint64_t kRtmsVersion = 6;
 
 // RTMSHeader::lifetime: a session-owned flag, a closing flag, and the count
 // of queues attached to a segment that is not session-owned.
@@ -142,9 +144,23 @@ inline constexpr std::uint64_t kLifetimeSessionOwned = 1ULL << 63;
 inline constexpr std::uint64_t kLifetimeClosing = 1ULL << 62;
 inline constexpr std::uint64_t kLifetimeCountMask = (1ULL << 32) - 1;
 
+// How the segment records a process -- the writer's owner and each reader
+// slot's claimant -- so that a pid reused after its process died is not
+// mistaken for that process: the pid in the low kProcessPidBits bits and,
+// above them, the low kProcessStartBits bits of the process's start time
+// (clock ticks since boot on Linux, microseconds since the epoch on macOS;
+// 0 where the platform did not report it, which compares the pid alone). A
+// recorded process is alive while a process with its pid runs -- a zombie
+// does not -- and started at the recorded time.
+inline constexpr unsigned kProcessPidBits = 32;
+inline constexpr unsigned kProcessStartBits = 30;
+// A reader's state word holds a process word above its two state bits.
+static_assert(kProcessPidBits + kProcessStartBits + 2 == 64);
+
 struct alignas(CACHE_LINE) Writer {
   std::atomic<uint64_t> sequence{};
-  // Exclusive publisher pid, 0 when unclaimed; dead owners may be replaced.
+  // Exclusive publisher, 0 when unclaimed; dead owners may be replaced.
+  // Despite its name, a process word: (start << kProcessPidBits) | pid.
   std::atomic<uint64_t> owner_pid{};
   // Exact completed DROP_NEWEST publication, or 0 when overwriting may have
   // touched its oldest slot. Allows reliable readers to use the full ring.
@@ -155,7 +171,7 @@ static_assert(sizeof(Writer) == CACHE_LINE);
 
 struct alignas(CACHE_LINE) Reader {
   std::atomic<uint64_t> sequence{};
-  std::atomic<uint64_t> state{};  // (pid << 2) | ReaderState
+  std::atomic<uint64_t> state{};  // (process word << 2) | ReaderState
 };
 
 struct RTMSHeader {
@@ -206,7 +222,10 @@ concept TakesSpan = std::invocable<F, std::span<T>>;
 // tests) the first queue to open a name creates the segment and the last
 // one to close it unlinks it; a segment whose last holder was killed stays
 // until a publisher reclaims it, a launcher session replaces it, or the
-// machine restarts, and is reused meanwhile.
+// machine restarts, and is reused meanwhile. A last holder killed between
+// marking the segment closing and unlinking it never unlinks it: the next
+// queue to open the name waits out that unlink and then, when no live
+// process holds the segment, unlinks it itself.
 class RTMSQueue {
  public:
   RTMSQueue(std::string_view path, std::size_t message_size,
@@ -324,7 +343,7 @@ class RTMSQueue {
 
   // Maps the segment (creating it when absent), initializes or validates the
   // header, and joins its lifetime. Retries while a closing segment is being
-  // unlinked.
+  // unlinked, and unlinks one its closer died before unlinking.
   void open(const talos::schema::Identity& schema);
   // Leaves the segment's lifetime: the last queue of a segment that is not
   // session-owned, or the session owner, unlinks it.

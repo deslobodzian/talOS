@@ -11,7 +11,9 @@ the event Poller (`CLOCK_MONOTONIC_RAW` on macOS, `CLOCK_MONOTONIC` elsewhere).
 and replay. `read_next()` returns that timestamp as `MessageInfo::publish_time_ns`
 alongside the sequence and dropped-message count. The payload and timestamp are
 copied before the same slot-validity check; an overwritten candidate exposes
-neither its timestamp nor its metadata as an accepted message.
+neither its timestamp nor its metadata as an accepted message. A reader the
+writer laps skips to the oldest message still intact and counts the skipped ones
+as dropped, whatever overflow policy the reader assumed.
 
 ## Schema identity
 
@@ -28,14 +30,23 @@ cleanly leaves its topics in place without disrupting subscribers.
 
 Without the launcher (tests, CLI tools), the first queue to open a name creates
 the segment and the last one to close unlinks it. Dead readers are reclaimed.
+If that last queue's process dies after marking the segment closing but before
+unlinking it, the next queue to open the name waits briefly for the unlink and
+then, when no live process holds the segment, unlinks it itself.
 
-Publishers (`RTMSOptions::publisher`) atomically claim the header's writer pid
-when opening. A second live publisher, including another publisher in the same
+Publishers (`RTMSOptions::publisher`) atomically claim the header's writer when
+opening. A second live publisher, including another publisher in the same
 process, is refused with the topic and both pids. A dead publisher's claim is
 reclaimed on open, allowing crash restarts without disconnecting live readers.
 Closing the publisher releases its claim.
 Low-level queues opened without `publisher` claim ownership on their first
 write, so omitting that option cannot bypass the single-writer guard.
+
+A writer or reader claim records its process as the pid plus the process start
+time (`/proc/<pid>/stat` on Linux, `sysctl(KERN_PROC_PID)` on macOS). The claim
+is dead once no process with that pid runs, the pid's process is a zombie, or
+the pid now belongs to a process that started at another time, so a pid reused
+after a crash does not keep the crashed process's claims.
 
 Each topic has eight reader slots (`MAX_READERS`), including observer
 subscriptions. Dead readers are reclaimed before registration fails. The graph

@@ -112,7 +112,7 @@ TEST(LayoutValidation, SlotsIncludeAlignedPublicationTime) {
     RTMSQueue queue{path, layout.message_size, layout.alignment, kSchema, 2};
     SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
     const auto* header = static_cast<const RTMSHeader*>(mapping.ptr());
-    EXPECT_EQ(header->version, 5u);
+    EXPECT_EQ(header->version, 6u);
     EXPECT_EQ(header->slot_stride, layout.stride);
     EXPECT_EQ(header->data_offset % rtms_slot_alignment(layout.alignment), 0u);
     EXPECT_EQ(rtms_publish_time_offset(layout.message_size),
@@ -357,7 +357,10 @@ TEST(SingleProcess, ShortWritesZeroPadPreviouslyUsedSlots) {
   queue.release_reader(*reader);
 }
 
-TEST(SingleProcess, MismatchedReaderPolicyRejectsOverwrittenSequence) {
+// A reader that assumes DROP_NEWEST, attached to a writer that overwrites, is
+// lapped like any other reader: it skips to the oldest intact sequence and
+// reports the rest as dropped, rather than failing every read from then on.
+TEST(SingleProcess, AReaderAssumingDropNewestResyncsPastAnOverwritingLap) {
   const auto path = make_test_path("policy_mismatch");
   constexpr std::size_t slots = 4;
   RTMSQueue writer{path,
@@ -380,14 +383,19 @@ TEST(SingleProcess, MismatchedReaderPolicyRejectsOverwrittenSequence) {
                            1'000 + i),
               WriteResult::SUCCESS);
   }
-  std::array<std::byte, sizeof(Message::TestMessage)> received{};
-  MessageInfo info{.publish_time_ns = 123};
-  // DROP_NEWEST readers do not skip sequences, but may not return bytes from
-  // a different sequence when the writer actually uses OVERWRITE_OLDEST.
-  EXPECT_EQ(subscriber.read_next(*reader, received, info), ReadResult::TORN);
-  EXPECT_EQ(info.sequence, 0u);
+  Message::TestMessage received{};
+  const auto destination = std::as_writable_bytes(std::span{&received, 1});
+  MessageInfo info{};
+  // Published position 5 may be writing sequence 5 into the slot of 1, so 2
+  // is the oldest sequence still intact.
+  ASSERT_EQ(subscriber.read_next(*reader, destination, info), ReadResult::OK);
+  EXPECT_EQ(info.sequence, 2u);
+  EXPECT_EQ(info.dropped, 2u);
+  EXPECT_EQ(info.publish_time_ns, 1'002);
+  EXPECT_EQ(received.id(), 2);
+  ASSERT_EQ(subscriber.read_next(*reader, destination, info), ReadResult::OK);
+  EXPECT_EQ(info.sequence, 3u);
   EXPECT_EQ(info.dropped, 0u);
-  EXPECT_EQ(info.publish_time_ns, 0);
   subscriber.release_reader(*reader);
 }
 
@@ -400,8 +408,8 @@ TEST(SingleProcess, InProgressOverwriteRejectsMixedSlot) {
     newer.fill(std::byte{0x5a});
     RTMSQueue writer{path,    original.size(), 8,
                      kSchema, slots,           overwrite_sequence_options()};
-    // A mismatched DROP_NEWEST reader must validate its original sequence,
-    // rather than skipping it before the post-copy validity check is reached.
+    // A reader assuming DROP_NEWEST may take the slot `slots` behind the
+    // writer only on a completed reliable publication, which this is not.
     RTMSQueue subscriber{path,    original.size(), 8,
                          kSchema, slots,           sequence_options()};
     RTMSQueue recovering{
@@ -438,11 +446,11 @@ TEST(SingleProcess, InProgressOverwriteRejectsMixedSlot) {
 
     std::array<std::byte, 16> received{};
     MessageInfo info{.publish_time_ns = 123};
-    EXPECT_EQ(subscriber.read_next(*reader, received, info), ReadResult::TORN);
-    EXPECT_EQ(subscriber.reader_sequence(*reader), 0u);
-    EXPECT_EQ(info.sequence, 0u);
-    EXPECT_EQ(info.dropped, 0u);
-    EXPECT_EQ(info.publish_time_ns, 0);
+    ASSERT_EQ(subscriber.read_next(*reader, received, info), ReadResult::OK);
+    EXPECT_EQ(info.sequence, 1u);
+    EXPECT_EQ(info.dropped, 1u);
+    EXPECT_EQ(info.publish_time_ns, 101);
+    EXPECT_EQ(received, newer);
 
     ASSERT_EQ(recovering.read_next(*recovering_reader, received, info),
               ReadResult::OK);
@@ -487,8 +495,11 @@ TEST(SingleProcess, OverwriteRevokesReliableFullRingGuarantee) {
     EXPECT_EQ(header->writer.reliable_sequence.load(), 0u);
     MessageInfo info;
     std::array<std::byte, 8> received{};
-    EXPECT_EQ(subscriber.read_next(*reader, received, info), ReadResult::TORN);
-    EXPECT_EQ(subscriber.reader_sequence(*reader), 1u);
+    // The revoked marker no longer vouches for the slot the writer may be
+    // reusing, so the reader skips it.
+    ASSERT_EQ(subscriber.read_next(*reader, received, info), ReadResult::OK);
+    EXPECT_EQ(info.sequence, 2u);
+    EXPECT_EQ(info.dropped, 1u);
   }
   subscriber.release_reader(*reader);
 }
@@ -1495,6 +1506,35 @@ TEST(RTMSLifetime, ASessionOwnedSegmentOutlivesEveryNodeUntilTheSessionEnds) {
   EXPECT_FALSE(SegmentExists(path));
 }
 
+// The last holder of a standalone segment can be killed between marking it
+// closing and unlinking it. The next queue to open the name then unlinks it
+// itself and starts a fresh segment, rather than every open failing.
+TEST(RTMSLifetime, ASegmentLeftClosingByAKilledHolderIsReclaimed) {
+  const std::string path = make_test_path("left_closing");
+  shm_unlink(ShmObjectName(path).c_str());
+  RunInChildThenKill([&path] {
+    // Leaked on purpose: the child dies inside its last close.
+    auto* queue = new RTMSQueue{path,
+                                sizeof(Message::TestMessage),
+                                alignof(Message::TestMessage),
+                                kSchema,
+                                16,
+                                publisher_options()};
+    if (queue->write(BytesOf({1, 1.0F})) != WriteResult::SUCCESS) _exit(1);
+    SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+    static_cast<RTMSHeader*>(mapping.ptr())
+        ->lifetime.store(kLifetimeClosing, std::memory_order_release);
+  });
+  RTMSQueue reopened{path,
+                     sizeof(Message::TestMessage),
+                     alignof(Message::TestMessage),
+                     kSchema,
+                     16,
+                     sequence_options()};
+  // A fresh segment, not the abandoned one holding the child's message.
+  EXPECT_EQ(reopened.writer_sequence(), 0u);
+}
+
 // --- dead readers
 // ---------------------------------------------------------------
 
@@ -1581,4 +1621,69 @@ TEST(RTMSDeadReader,
                       16,
                       publisher_options()};
   EXPECT_EQ(publisher.schema_name(), "Message.TestMessage");
+}
+
+// --- process identity
+// -----------------------------------------------------------
+
+// A pid alone does not identify a process. A node killed mid-session can have
+// its pid reused by the time it restarts (macOS wraps at 99,999), and a child
+// that exited stays a zombie until it is reaped; neither may keep the topic's
+// writer claim or a reader slot.
+TEST(RTMSProcessIdentity, NeitherAReusedPidNorAZombieKeepsAClaim) {
+  const std::string path = make_test_path("identity");
+  RTMSQueue session{path,
+                    sizeof(Message::TestMessage),
+                    alignof(Message::TestMessage),
+                    kSchema,
+                    16,
+                    {.session_owner = true}};
+  SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+  auto* header = static_cast<RTMSHeader*>(mapping.ptr());
+  ASSERT_NE(header, nullptr);
+
+  std::uint64_t live = 0;
+  {
+    RTMSQueue writer{path,
+                     sizeof(Message::TestMessage),
+                     alignof(Message::TestMessage),
+                     kSchema,
+                     16,
+                     publisher_options()};
+    live = header->writer.owner_pid.load();
+  }
+  ASSERT_EQ(live & ((1ULL << kProcessPidBits) - 1),
+            static_cast<std::uint64_t>(::getpid()));
+  ASSERT_NE(live >> kProcessPidBits, 0u) << "no process start time recorded";
+  // A writer that died, whose pid this process has since been given: the same
+  // pid, started at another time.
+  header->writer.owner_pid.store(live ^ (1ULL << kProcessPidBits));
+  EXPECT_NO_THROW((RTMSQueue{path, sizeof(Message::TestMessage),
+                             alignof(Message::TestMessage), kSchema, 16,
+                             publisher_options()}));
+
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    try {
+      RTMSQueue reader{path,
+                       sizeof(Message::TestMessage),
+                       alignof(Message::TestMessage),
+                       kSchema,
+                       16,
+                       sequence_options()};
+      // Skips destruction, so the slot is never released.
+      ::_exit(reader.register_reader().has_value() ? 0 : 1);
+    } catch (...) {
+      ::_exit(2);
+    }
+  }
+  // Exited but not reaped: a zombie still holding its reader slot.
+  siginfo_t exited{};
+  ASSERT_EQ(
+      ::waitid(P_PID, static_cast<id_t>(child), &exited, WEXITED | WNOWAIT), 0);
+  EXPECT_EQ(session.reclaim_dead_readers(), 1u);
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
