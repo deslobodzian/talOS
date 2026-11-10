@@ -291,7 +291,8 @@ constexpr std::string_view PoseInvalidReasonToString(PoseInvalidReason reason) {
 struct PoseValidity {
   bool valid{false};
   PoseInvalidReason reason{PoseInvalidReason::kValid};
-  std::string message;
+  // Always a string literal, so setting it never allocates.
+  std::string_view message;
 };
 
 struct ObservationStdDevs {
@@ -400,8 +401,7 @@ inline RobotPoseEstimate ComputeRobotFieldPose(
   out.reprojection_error_px = reprojection_error;
   out.ambiguity = ambiguity;
   auto reject = [&](PoseInvalidReason reason) {
-    out.validity = {false, reason,
-                    std::string(PoseInvalidReasonToString(reason))};
+    out.validity = {false, reason, PoseInvalidReasonToString(reason)};
     return out;
   };
   const auto field = layout.GetTagPose(tag_id);
@@ -523,12 +523,74 @@ inline bool SetCovarianceStdDevs(const PoseNormalMatrix& normal,
 // LM solve. Pixel rows and floor rows are whitened before Huber IRLS; the
 // undamped final information matrix, scaled by the fit's residual variance
 // factor below, supplies measurement covariance.
-inline RobotPoseEstimate SolveMultiTagRobotPose(
+//
+// The solver owns its scratch buffers and only ever grows them, so once it
+// has room for as many observations as the current call, Solve() makes no
+// heap allocation, valid or rejected. A caller that localizes every frame
+// keeps one solver; it is not thread-safe, so each thread needs its own.
+class MultiTagPoseSolver {
+ public:
+  // Reserves room for `max_observations` detections up front, so even the
+  // first Solve() with at most that many does not allocate.
+  explicit MultiTagPoseSolver(std::size_t max_observations = 0) {
+    Reserve(max_observations);
+  }
+
+  void Reserve(std::size_t observations) {
+    ids_.reserve(observations);
+    points_.reserve(4 * observations);
+    pixels_.reserve(4 * observations);
+    candidate_pixels_.reserve(4 * observations);
+    seeds_.reserve(2 * observations);
+    // Solve() sizes the rows itself; a one-shot solver skips this pass.
+    if (observations > 0)
+      ReserveRows(static_cast<Eigen::Index>(8 * observations + 3));
+  }
+
+  RobotPoseEstimate Solve(const std::vector<TagDetection3D>& observations,
+                          uint32_t camera_id, const CameraMounting& mounting,
+                          const FieldLayout& layout,
+                          const CameraIntrinsics& intrinsics,
+                          const PoseValidationOptions& options = {},
+                          const PoseSolverOptions& solver_options = {});
+
+ private:
+  static constexpr std::size_t kMaxDetectionsPerId = 3;
+  struct TagCandidates {
+    int tag_id{-1};
+    std::size_t count{0}, chosen{0}, first_pixel{0};
+    std::array<const TagDetection3D*, kMaxDetectionsPerId> detections{};
+    const TagDetection3D& Chosen() const { return *detections[chosen]; }
+  };
+  struct SeedCandidate {
+    talos::geometry::SE3<double> T_field_robot;
+    double residual;
+  };
+  // The LM residuals and Jacobians are maps over these, so their storage is
+  // laid out and aligned exactly as a VectorXd / MatrixXd of `rows` would be.
+  using ResidualMap = Eigen::Map<Eigen::VectorXd, Eigen::AlignedMax>;
+  using JacobianMap = Eigen::Map<Eigen::MatrixXd, Eigen::AlignedMax>;
+
+  void ReserveRows(Eigen::Index rows) {
+    for (auto* buffer : {&residual_, &trial_residual_, &weighted_residual_})
+      if (buffer->size() < rows) buffer->resize(rows);
+    for (auto* buffer : {&jacobian_, &weighted_jacobian_})
+      if (buffer->size() < 6 * rows) buffer->resize(6 * rows);
+  }
+
+  std::vector<TagCandidates> ids_;
+  std::vector<Eigen::Vector3d> points_;
+  std::vector<Eigen::Vector2d> candidate_pixels_, pixels_;
+  std::vector<SeedCandidate> seeds_;
+  Eigen::VectorXd residual_, trial_residual_, weighted_residual_;
+  Eigen::VectorXd jacobian_, weighted_jacobian_;
+};
+
+inline RobotPoseEstimate MultiTagPoseSolver::Solve(
     const std::vector<TagDetection3D>& observations, uint32_t camera_id,
     const CameraMounting& mounting, const FieldLayout& layout,
-    const CameraIntrinsics& intrinsics,
-    const PoseValidationOptions& options = {},
-    const PoseSolverOptions& solver_options = {}) {
+    const CameraIntrinsics& intrinsics, const PoseValidationOptions& options,
+    const PoseSolverOptions& solver_options) {
   RobotPoseEstimate out;
   out.camera_id = camera_id;
   auto reject = [&](PoseInvalidReason reason, const char* message) {
@@ -553,19 +615,13 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
   // detector's order of first appearance, keeps its kMaxDetectionsPerId
   // strongest usable decodes (higher decision margin, then lower per-tag
   // reprojection error), strongest first, as candidates for the seed search.
-  constexpr std::size_t kMaxDetectionsPerId = 3;
-  struct TagCandidates {
-    int tag_id{-1};
-    std::size_t count{0}, chosen{0}, first_pixel{0};
-    std::array<const TagDetection3D*, kMaxDetectionsPerId> detections{};
-    const TagDetection3D& Chosen() const { return *detections[chosen]; }
-  };
   auto stronger = [](const TagDetection3D& a, const TagDetection3D& b) {
     return a.decision_margin > b.decision_margin ||
            (a.decision_margin == b.decision_margin &&
             a.reprojection_error < b.reprojection_error);
   };
-  std::vector<TagCandidates> ids;
+  auto& ids = ids_;
+  ids.clear();
   ids.reserve(observations.size());
   for (const auto& t : observations) {
     const double d = t.T_camera_tag.translation().norm();
@@ -594,8 +650,10 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
 
   // Field corners, four per id, and the undistorted image corners of every
   // candidate detection, four each, starting at its id's first_pixel.
-  std::vector<Eigen::Vector3d> points;
-  std::vector<Eigen::Vector2d> candidate_pixels;
+  auto& points = points_;
+  auto& candidate_pixels = candidate_pixels_;
+  points.clear();
+  candidate_pixels.clear();
   points.reserve(4 * ids.size());
   candidate_pixels.reserve(4 * observations.size());
   for (auto& id : ids) {
@@ -650,11 +708,8 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
     }
     return std::sqrt(sum_sq / static_cast<double>(points.size()));
   };
-  struct SeedCandidate {
-    talos::geometry::SE3<double> T_field_robot;
-    double residual;
-  };
-  std::vector<SeedCandidate> seeds;
+  auto& seeds = seeds_;
+  seeds.clear();
   if (ids.size() > 1) {
     seeds.reserve(2 * observations.size());
     for (const auto& id : ids) {
@@ -683,7 +738,8 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
   }
 
   // The joint solve fits each id's chosen detection.
-  std::vector<Eigen::Vector2d> pixels;
+  auto& pixels = pixels_;
+  pixels.clear();
   pixels.reserve(points.size());
   double distance_sum = 0;
   for (const auto& id : ids) {
@@ -694,8 +750,8 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
   const int pixel_rows = static_cast<int>(2 * points.size());
   const int rows = pixel_rows + 3;
   const auto camera_rotation = camera_robot.rotation().rotationMatrix();
-  auto evaluate = [&](const auto& pose, Eigen::VectorXd& residual,
-                      Eigen::MatrixXd* jacobian) {
+  auto evaluate = [&](const auto& pose, ResidualMap& residual,
+                      JacobianMap* jacobian) {
     const auto robot_field = pose.inverse();
     for (std::size_t i = 0; i < points.size(); ++i) {
       const auto row = static_cast<Eigen::Index>(2 * i);
@@ -739,7 +795,7 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
     return residual.allFinite();
   };
   const double huber_delta = noise.huber_delta_px / noise.pixel_std_px;
-  auto cost = [&](const Eigen::VectorXd& r) {
+  auto cost = [&](const ResidualMap& r) {
     double value = r.tail<3>().squaredNorm();
     for (int i = 0; i < pixel_rows; ++i) {
       const double a = std::abs(r(i));
@@ -747,9 +803,14 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
     }
     return value;
   };
-  Eigen::VectorXd residual(rows), trial_residual(rows), weighted_residual(rows);
-  Eigen::MatrixXd jacobian(rows, 6), weighted_jacobian(rows, 6);
+  ReserveRows(rows);
+  ResidualMap residual(residual_.data(), rows);
+  ResidualMap trial_residual(trial_residual_.data(), rows);
+  ResidualMap weighted_residual(weighted_residual_.data(), rows);
+  JacobianMap jacobian(jacobian_.data(), rows, 6);
+  JacobianMap weighted_jacobian(weighted_jacobian_.data(), rows, 6);
   detail::PoseNormalMatrix normal;
+  Eigen::Matrix<double, 6, 1> gradient;
 
   // Runs the joint LM from `seed`, returning the refined estimate. The scratch
   // buffers are shared across seeds; each run reinitializes them via linearize.
@@ -781,8 +842,10 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
       }
       detail::PoseNormalMatrix damped = normal;
       damped.diagonal().array() += lambda;
-      const Eigen::Matrix<double, 6, 1> delta = damped.ldlt().solve(
-          -weighted_jacobian.transpose() * weighted_residual);
+      // Evaluated into a fixed-size vector: nested in solve(), the product
+      // of the dynamic-row Jacobian would be a heap temporary.
+      gradient.noalias() = -weighted_jacobian.transpose() * weighted_residual;
+      const Eigen::Matrix<double, 6, 1> delta = damped.ldlt().solve(gradient);
       if (!delta.allFinite()) {
         est.validity = {false, PoseInvalidReason::kInvalidCovariance,
                         "Invalid joint step"};
@@ -870,6 +933,18 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
     }
   }
   return best_estimate;
+}
+
+// One-shot form of MultiTagPoseSolver::Solve: allocates its scratch on every
+// call. A caller that localizes every frame keeps a MultiTagPoseSolver.
+inline RobotPoseEstimate SolveMultiTagRobotPose(
+    const std::vector<TagDetection3D>& observations, uint32_t camera_id,
+    const CameraMounting& mounting, const FieldLayout& layout,
+    const CameraIntrinsics& intrinsics,
+    const PoseValidationOptions& options = {},
+    const PoseSolverOptions& solver_options = {}) {
+  return MultiTagPoseSolver().Solve(observations, camera_id, mounting, layout,
+                                    intrinsics, options, solver_options);
 }
 
 }  // namespace talos::vision

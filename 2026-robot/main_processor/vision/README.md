@@ -171,8 +171,10 @@ Only `--sim` enables synthetic observations. `rasterize = true` (default)
 renders into a preallocated image buffer, then runs AprilTag detection, 3D
 localization and frame recording, all on the camera's worker thread, never in
 `update()`; `rasterize = false` projects visible tag corners directly into
-localization inside `update()`, which is bounded by the visible tag count and
-deterministic tick for tick.
+localization inside `update()`, which is bounded by the visible tag count,
+deterministic tick for tick, and allocation-free: the node keeps one
+`talos::vision::MultiTagPoseSolver`, whose scratch is reserved for every layout
+tag at construction.
 Each camera optionally subscribes to `/sim/state` (`geometry.OdometrySample`),
 published every physics tick only by `sim_gateway --physics`. Tags are rendered
 from its latest absolute true field pose, not integrated drivetrain odometry.

@@ -1634,6 +1634,40 @@ TEST(VisionTest, LiveUpdateDoesNotAllocate) {
             before->frames_processed_count() + 1);
 }
 
+// RULES.md 3: the direct-projection sim localizes inside update(); once
+// warmed, a capture allocates nothing.
+TEST(VisionTest, DirectProjectionUpdateDoesNotAllocate) {
+  if (const auto why = talos::testing::AllocationProbe::Unsupported();
+      !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  auto sim = MakeSim(false, false, "fps = 60\n", "period_us = 10000\n");
+  sim.add<Vision>("rear_right_camera");
+  for (int i = 0; i < 10; ++i) {
+    sim.publish(sim::topics::kState, Truth(sim));
+    sim.step(10ms);
+  }
+  const auto before = sim.latest<VisionStatus>("/rear_right_camera/status");
+  ASSERT_TRUE(before.has_value());
+  talos::testing::AllocationProbe probe;
+  std::uint64_t allocations = 0;
+  for (int i = 0; i < 6; ++i) {
+    const auto truth = Truth(sim);  // Built outside the window.
+    probe.start();
+    sim.publish(sim::topics::kState, truth);
+    sim.step(10ms);
+    allocations += probe.stop();
+  }
+  EXPECT_EQ(allocations, 0u) << probe.sites();
+  const auto after = sim.latest<VisionStatus>("/rear_right_camera/status");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_GT(after->frames_processed_count(), before->frames_processed_count());
+  const auto observation =
+      sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
+  ASSERT_TRUE(observation.has_value());
+  EXPECT_TRUE(observation->valid());
+}
+
 TEST(VisionTest, LiveStampOlderThanFrameTimeoutPublishesInvalid) {
   auto device = std::make_shared<FakeCameraDevice>();
   LiveTestVision::device = device;

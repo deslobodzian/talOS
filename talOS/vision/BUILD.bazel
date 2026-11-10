@@ -135,6 +135,7 @@ cc_test(
         ":calibration",
         ":localization",
         "//talOS/geometry",
+        "//talOS/node:allocation_probe",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],

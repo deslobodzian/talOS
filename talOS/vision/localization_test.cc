@@ -8,6 +8,8 @@
 #include <limits>
 #include <vector>
 
+#include "talOS/node/allocation_probe.h"
+
 namespace talos::vision {
 namespace {
 
@@ -192,6 +194,38 @@ TEST(LocalizationTest, SolverCovarianceShrinksWithTagsAndGrowsWithDistance) {
     EXPECT_GE(floored.std_devs.y_std_m, 0.02);
     EXPECT_GE(floored.std_devs.yaw_std_rad,
               PoseSolverOptions{}.min_yaw_std_rad);
+  }
+}
+
+// A per-frame caller keeps one solver (RULES.md 3). Reused after a larger
+// frame it must return exactly what a fresh solve returns, and once it has
+// room it allocates nothing, whether the solve is valid or rejected.
+TEST(LocalizationTest, ReusedSolverMatchesFreshSolveWithoutAllocating) {
+  const JointFixture six(3, 6);
+  const JointFixture one(3, 1);
+  const JointFixture none = [] {
+    JointFixture fixture(3, 1);
+    fixture.tags.front().valid = false;
+    return fixture;
+  }();
+  const bool counting = talos::testing::AllocationProbe::Unsupported().empty();
+  talos::testing::AllocationProbe probe;
+  MultiTagPoseSolver solver(six.tags.size());
+  for (const auto* fixture : {&six, &one, &none, &six}) {
+    if (counting) probe.start();
+    const auto reused = solver.Solve(fixture->tags, 1, fixture->mount,
+                                     fixture->layout, fixture->intr);
+    if (counting) EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+    const auto fresh = SolveMultiTagRobotPose(fixture->tags, 1, fixture->mount,
+                                              fixture->layout, fixture->intr);
+    EXPECT_EQ(reused.validity.valid, fixture != &none);
+    EXPECT_EQ(reused.validity.reason, fresh.validity.reason);
+    EXPECT_EQ(reused.tag_count, fresh.tag_count);
+    EXPECT_TRUE(reused.T_field_robot.matrix() == fresh.T_field_robot.matrix());
+    EXPECT_EQ(reused.std_devs.x_std_m, fresh.std_devs.x_std_m);
+    EXPECT_EQ(reused.std_devs.y_std_m, fresh.std_devs.y_std_m);
+    EXPECT_EQ(reused.std_devs.yaw_std_rad, fresh.std_devs.yaw_std_rad);
+    EXPECT_EQ(reused.reprojection_error_px, fresh.reprojection_error_px);
   }
 }
 
@@ -666,8 +700,8 @@ TEST(LocalizationTest, RepeatedTagIdKeepsTheDetectionConsistentWithTheFrame) {
     float decoy_margin;
   };
   for (const Case c : {Case{2, 120}, Case{1, 40}}) {
-    SCOPED_TRACE(testing::Message() << c.tag_count << " tags, decoy margin "
-                                    << c.decoy_margin << " vs 80");
+    SCOPED_TRACE(::testing::Message() << c.tag_count << " tags, decoy margin "
+                                      << c.decoy_margin << " vs 80");
     JointFixture fixture(3, c.tag_count);
     for (auto& tag : fixture.tags) tag.decision_margin = 80;
     auto decoy = fixture.tags.front();

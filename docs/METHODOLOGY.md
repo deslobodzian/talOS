@@ -280,7 +280,7 @@ Rules:
 | Rule | Budget | Status |
 |---|---|---|
 | `update()` p99 wall time | ≤ 10 % of `period_us` | [review]; measure callback entry-to-exit duration in a dedicated benchmark, using a monotonic wall clock, and compute the percentile from those durations. Registry / Studio `max_latency` measures maximum dispatch-start lateness, not callback duration or p99. Benchmark clocks must not replace `node.now()` in control logic. |
-| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | allocations [enforced: `talos::testing::AllocationProbe` (`//talOS/node:allocation_probe`) counts the loop thread's allocations over a window of steady-state ticks in the `drivetrain`, `shooter`, `autonomous`, `driver`, `vision` (live camera) and `talOS/teleop` `node_test`s; macOS and glibc, skipped under sanitizers; §13]; the rest [review] |
+| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | allocations [enforced: `talos::testing::AllocationProbe` (`//talOS/node:allocation_probe`) counts the loop thread's allocations over a window of steady-state ticks in the `drivetrain`, `shooter`, `autonomous`, `driver`, `vision` (live camera and direct-projection sim) and `talOS/teleop` `node_test`s; macOS and glibc, skipped under sanitizers; §13]; the rest [review] |
 | Python nodes | cost memory (≈ 30 MB) and add GC/interpreter jitter: hard 5 ms actuator loops belong in C++, while 20 ms supervisory/estimator nodes monitor age and watchdog timeouts | [review] |
 | Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [review]; producer → consumer is one hop (`Target` resolves lanes in the consumer) |
 | Per-tick work | O(devices), never O(history); bound every loop | [review] |
@@ -344,7 +344,6 @@ producer that has drained it would.
 | Where | Deviation | Rule | Fix |
 |---|---|---|---|
 | `talOS/node/allocation_probe.cc` | counts nothing under a sanitizer, whose allocator bypasses `malloc_logger` and cannot sit beside a replaced glibc `malloc`; those tests skip | §10 | none: plain builds run it |
-| `vision/vision.h` direct-projection sim capture | localizes inside `update()` through `talos::vision::SolveMultiTagRobotPose`, which builds its working vectors on every capture (simulation only: a live camera localizes on its worker, and `LiveUpdateDoesNotAllocate` checks its `update()`) | §10 | reusable scratch storage in `talOS/vision/localization.h` |
 | the bridge, `telemetry`, `intake`, `pose_estimator` | no allocation check: the bridge's tick is tested only over a real UDP link (`hardware_node_test`), `telemetry` has no probe window yet, and a Python tick allocates in the interpreter | §10 | a probe window around the bridge's ticks in `hardware_node_test` and around `talOS/telemetry`'s `Sim` ticks; Python nodes stay [review] |
 
 ## 14. Open source first

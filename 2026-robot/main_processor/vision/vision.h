@@ -80,6 +80,8 @@ class Vision {
       throw std::runtime_error("vision layout: " + error);
     }
     LoadCamera();
+    // Each layout tag in view once: the direct-projection sim's most.
+    solver_.Reserve(layout_.layout.size());
     if (simulated_ && sim_timestamp_lag_ns_ > 0) {
       // Reserve the capture-rate lag window plus boundary/scheduling margin.
       // The node/status tick may be much slower or faster than camera frames.
@@ -572,9 +574,9 @@ class Vision {
     }
     result.rejected_range = FilterDetections(detections, camera_.max_range_m);
     result.visible = static_cast<std::uint32_t>(detections.size());
-    const auto estimate = talos::vision::SolveMultiTagRobotPose(
-        detections, camera_id_, camera_.mounting, layout_.layout,
-        camera_.intrinsics, validation_options_, solver_options_);
+    const auto estimate =
+        solver_.Solve(detections, camera_id_, camera_.mounting, layout_.layout,
+                      camera_.intrinsics, validation_options_, solver_options_);
     result.observation = MakeObservation(estimate, capture_ns, success);
     if (record) {
       // The ambiguity gate applies only to single-tag observations; mark that
@@ -1087,6 +1089,9 @@ class Vision {
   talos::vision::CameraSourceConfig capture_config_;
   talos::vision::PoseValidationOptions validation_options_;
   talos::vision::PoseSolverOptions solver_options_;
+  // Localize()'s scratch, so a capture's solve does not allocate; used only
+  // by the one thread that localizes (the loop or the worker, see Simulate).
+  talos::vision::MultiTagPoseSolver solver_;
   std::mt19937_64 rng_;
   std::map<int, talos::vision::field_sim::TagPattern> patterns_;
   std::shared_ptr<std::vector<std::uint8_t>> pixels_;
