@@ -220,7 +220,7 @@ Overwriting writers invalidate this marker before modifying slot bytes. A
 standalone publisher reclaims incompatible unheld segments; attaching readers
 reject version mismatches. A new session owner replaces any prior segment.
 Writer and reader claims in the header record the pid plus the process start
-time (`kProcessPidBits` in `talOS/rtms/rtms.h`), so a reused pid holds no claim.
+time (`kProcessPidBits` in `talOS/rtms/process_liveness.h`), so a reused pid holds no claim.
 
 `age()` and `fresh()` count from publication, never delivery. A stalled consumer
 cannot revive an expired command by draining it. Latest-value subscriptions

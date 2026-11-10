@@ -7,12 +7,22 @@ flatbuffer_cc_library(
     srcs = ["test_message.fbs"],
 )
 
+# Whether a process recorded in shared memory (pid plus start time) still
+# runs: RTMS claims and the live registry's rows share this one check.
+cc_library(
+    name = "process_liveness",
+    srcs = ["process_liveness.cc"],
+    hdrs = ["process_liveness.h"],
+    visibility = ["//visibility:public"],
+)
+
 cc_library(
     name = "rtms",
     srcs = ["rtms.cc"],
     hdrs = ["rtms.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":process_liveness",
         "//talOS/memory:shared_memory",
         "//talOS/schema:identity",
     ],

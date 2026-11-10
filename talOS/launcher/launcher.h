@@ -45,6 +45,7 @@
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/launcher/service_notifier.h"
+#include "talOS/launcher/session_lock.h"
 #include "talOS/process/durable_sync.h"
 #include "talOS/rtms/rtms.h"
 #include "talOS/schema/unit_suffix.h"
@@ -1479,6 +1480,20 @@ class Launcher {
                    "together\n";
       return 1;
     }
+    // A run that starts the roster owns the namespace's topics and registry
+    // for its lifetime. --describe-only probes, and --replay-inputs runs one
+    // node on recorded topics, without shared memory (RunOnRecordedInputs).
+    const bool starts_roster =
+        !options_.describe_only && options_.replay_inputs.empty();
+    std::optional<SessionLock> session_lock;
+    if (starts_roster) {
+      std::string lock_error;
+      session_lock = SessionLock::Acquire(lock_error);
+      if (!session_lock) {
+        std::cerr << "launcher: " << lock_error << "\n";
+        return 1;
+      }
+    }
     std::filesystem::create_directories(options_.output_dir);
 
     config::RobotConfig robot_config;
@@ -1525,6 +1540,16 @@ class Launcher {
     }
     if (!options_.replay_inputs.empty()) {
       return RunOnRecordedInputs(node_specs);
+    }
+    // Before any probe, so an unusable registry refuses the launch at once
+    // rather than after the roster is described.
+    if (starts_roster) {
+      try {
+        introspect::PrepareRegistry();
+      } catch (const std::exception& e) {
+        std::cerr << "launcher: " << e.what() << "\n";
+        return 1;
+      }
     }
 
     // Phase one: describe and lint before anything starts.
@@ -2252,8 +2277,9 @@ class Launcher {
         try {
           registry.emplace(introspect::kRegistryPath, true);
         } catch (const std::runtime_error&) {
-          // Nodes create the registry asynchronously; never create it here.
-          // Left empty, the next pass retries the attach.
+          // Run prepared it before any node started (PrepareRegistry); this
+          // read-only attach never creates it. Left empty, the next pass
+          // retries the attach.
           registry.reset();
         }
       }

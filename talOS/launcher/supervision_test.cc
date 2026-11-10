@@ -958,6 +958,9 @@ TEST(Supervision, HeldRegistryLockDoesNotStallSupervision) {
                       RecordLogArgThen(runs, "while :; do sleep 0.05; done\n"),
                   name);
   }
+  // The launcher waits on this lock at startup only to create the registry
+  // (PrepareRegistry); here it exists, as after any earlier session.
+  introspect::PrepareRegistry();
   const introspect::RegistryLock held{ShmObjectName(introspect::kRegistryPath)};
   const pid_t launcher = ::fork();
   ASSERT_GE(launcher, 0);
@@ -979,6 +982,58 @@ TEST(Supervision, HeldRegistryLockDoesNotStallSupervision) {
   EXPECT_EQ(ReadLines(runs).size(), 3u);
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
+}
+
+// One session per shared-memory namespace: a second launcher would unlink the
+// running session's topics. It is refused before it writes or starts
+// anything, naming the holder; --describe-only, which starts nothing, still
+// runs; and the lock dies with its holder.
+TEST(Supervision, SecondLaunchInTheNamespaceIsRefused) {
+  int ready[2];
+  ASSERT_EQ(::pipe(ready), 0);
+  const pid_t holder = ::fork();
+  ASSERT_GE(holder, 0);
+  if (holder == 0) {
+    ::close(ready[0]);
+    std::string error;
+    const auto lock = SessionLock::Acquire(error);
+    const char held = lock ? 1 : 0;
+    if (::write(ready[1], &held, 1) != 1 || !lock) ::_exit(1);
+    for (;;) ::pause();
+  }
+  ::close(ready[1]);
+  char held = 0;
+  const bool reported = ::read(ready[0], &held, 1) == 1;
+  ::close(ready[0]);
+  const auto with_stubs = [](std::string_view tag, bool describe_only) {
+    auto options = BaseOptions(tag);
+    options.describe_only = describe_only;
+    options.binary_overrides["//example/alpha:node"] =
+        WriteStub(std::string{tag} + "_alpha", "exit 0\n");
+    options.binary_overrides["//example/beta:node"] =
+        WriteStub(std::string{tag} + "_beta", "exit 0\n");
+    return options;
+  };
+  auto second = with_stubs("second_launch", false);
+  auto describe = with_stubs("second_describe", true);
+  ::testing::internal::CaptureStderr();
+  const int refused = RunSession(second);
+  const std::string error = ::testing::internal::GetCapturedStderr();
+  const int described = RunSession(describe);
+  ::kill(holder, SIGKILL);
+  while (::waitpid(holder, nullptr, 0) < 0 && errno == EINTR) {
+  }
+  ASSERT_TRUE(reported && held == 1);
+  EXPECT_EQ(refused, 1);
+  EXPECT_NE(error.find("pid " + std::to_string(holder)), std::string::npos)
+      << error;
+  EXPECT_FALSE(std::filesystem::exists(second.output_dir));
+  EXPECT_EQ(described, 0);
+  auto after = with_stubs("after_holder", false);
+  EXPECT_EQ(RunSession(after), 0);
+  for (const auto* options : {&second, &describe, &after}) {
+    std::filesystem::remove_all(options->output_dir);
+  }
 }
 
 // The loop never waits for the disk to sync the manifest. With every sync
@@ -1080,6 +1135,7 @@ TEST(Supervision, StalledRegistryHeartbeatIsKilledAndRestarted) {
         row.state.store(static_cast<uint64_t>(introspect::SlotState::CLAIMING),
                         std::memory_order_release);
         row.pid = static_cast<uint64_t>(pid);
+        row.pid_start = 0;  // The stub's start is unknown: compare its pid.
         row.heartbeat_monotonic_ns.store(introspect::monotonic_now_ns());
         row.dispatch_count.store(1);
         row.state.store(static_cast<uint64_t>(introspect::SlotState::ACTIVE),

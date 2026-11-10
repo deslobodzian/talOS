@@ -211,9 +211,19 @@ def shm_name(topic, namespace):
     return f"/~{value:016x}"
 
 
+REGISTRY = "/talos_registry.4"  # talOS/introspection/registry.h kRegistryPath
+SESSION_LOCK = "/talos_session"  # talOS/launcher/session_lock.h kSessionLockName
+
+
+def lock_file(topic, namespace):
+    """talos::introspect::LockFilePath (talOS/introspection/lock_file.h)."""
+    directory = "/dev/shm" if sys.platform.startswith("linux") and os.path.isdir("/dev/shm") else "/tmp"
+    return Path(directory) / ("talos-" + shm_name(topic, namespace)[1:] + ".lock")
+
+
 def remove_segments(session, namespace):
-    """Unlinks the session's topics and registry left in its namespace."""
-    topics = {"/talos_registry.3"}  # talOS/introspection/registry.h kRegistryPath
+    """Unlinks the session's topics, registry and lock files left in its namespace."""
+    topics = {REGISTRY}
     def collect(value):
         if isinstance(value, dict):
             for key, item in value.items():
@@ -230,8 +240,8 @@ def remove_segments(session, namespace):
             shm_unlink(shm_name(topic, namespace))
         except OSError:
             pass
-    lock = Path("/tmp/talos-registry-" + shm_name("/talos_registry.3", namespace)[1:] + ".lock")
-    lock.unlink(missing_ok=True)
+    for name in (REGISTRY, SESSION_LOCK):
+        lock_file(name, namespace).unlink(missing_ok=True)
 
 
 def udp_ports():

@@ -9,6 +9,7 @@ cc_library(
     hdrs = [
         "launcher.h",
         "service_notifier.h",
+        "session_lock.h",
     ],
     visibility = ["//visibility:public"],
     deps = [
@@ -16,8 +17,10 @@ cc_library(
         "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/introspection:describe",
+        "//talOS/introspection:lock_file",
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
+        "//talOS/memory:shared_memory",
         "//talOS/process:durable_sync",
         "//talOS/rtms",
         "//talOS/schema:unit_suffix",

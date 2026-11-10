@@ -103,7 +103,12 @@ A relative `--prefix` is resolved against the working directory.
   and the ones `current` and `previous` select, however old. Prune after
   activating the selection, so the running bundle is among those kept.
 
-Run by hand: `/opt/talos/current/run.sh --duration-s 30`.
+Run by hand: `/opt/talos/current/run.sh --duration-s 30`. Stop the boot
+service first (`sudo systemctl stop talos`; on macOS
+`sudo launchctl bootout system/org.talos.robot`, and `enable-boot` again
+afterwards): only one launcher may run a session in a shared-memory namespace,
+so a second is refused with the running one's pid
+([one session per namespace](../talOS/launcher/README.md#one-session-per-namespace)).
 
 Boot services set `TALOS_LOG_DIR=<prefix>/logs`. The generated `run.sh` passes
 that directory as the launcher's output **root**, unless an explicit
@@ -165,8 +170,8 @@ oldest restart ages out, plus normal backoff.
 Exactly one retry is pending, so clearing a transient fault can recover without a service
 restart. The session manifest records `quarantined` and
 `retry_at_monotonic_ns`; a stopping session cancels pending retries.
-`max_restarts = 0` never restarts a node. Registry version 3
-(`/talos_registry.3`) uses host-monotonic heartbeat/liveness timestamps, so
+`max_restarts = 0` never restarts a node. Registry version 4
+(`/talos_registry.4`) uses host-monotonic heartbeat/liveness timestamps, so
 wall-clock corrections cannot falsely evict healthy nodes; deploy all node
 and viewer binaries together.
 

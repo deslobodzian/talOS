@@ -18,7 +18,11 @@ enum class UdpStatus : uint8_t {
 
 struct UdpSocketOptions {
   bool non_blocking = true;
-  bool reuse_address = true;
+  // SO_REUSEADDR. Off, so a second process cannot bind a port a live peer
+  // holds (on Linux it would then share the port's datagrams with it): a
+  // second hardware bridge fails to open instead. A peer killed and restarted
+  // rebinds without it, since UDP leaves no TIME_WAIT behind.
+  bool reuse_address = false;
   bool connect_peer = true;
   int receive_buffer_bytes = 256 * 1024;
   int send_buffer_bytes = 256 * 1024;

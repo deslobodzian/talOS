@@ -7,7 +7,7 @@ data.
 
 ## The segment
 
-The logical path is `/talos_registry.3`, and the trailing number is
+The logical path is `/talos_registry.4`, and the trailing number is
 `kRegistryVersion`. Registry opens and explicit unlinks apply `ShmObjectName`,
 just like topics: `TALOS_SHM_NAMESPACE` (or Bazel's `TEST_TMPDIR` fallback)
 isolates tests and their children, while production retains the ordinary name.
@@ -16,10 +16,16 @@ Heartbeats and stale-slot checks use host monotonic time; `start_wall_ns` is
 human-facing wall time.
 
 Writers serialize segment creation, sizing and initialization with an exclusive
-`flock` on a regular file, `/tmp/talos-registry-<mapped-name>.lock` (the mapped
-name without its leading slash). The name is the exact `ShmObjectName` result
-used for the segment, so `TALOS_SHM_NAMESPACE` and `TEST_TMPDIR` isolate the lock
-and the segment together; no second namespace or temp-directory rule applies.
+`flock` on a regular file, `<lock-dir>/talos-<mapped-name>.lock` (`lock_file.h`;
+the mapped name without its leading slash). The name is the exact
+`ShmObjectName` result used for the segment, so `TALOS_SHM_NAMESPACE` and
+`TEST_TMPDIR` isolate the lock and the segment together; no second namespace or
+temp-directory rule applies. The directory is `/dev/shm` on Linux, beside the
+segments, which a systemd `PrivateTmp=` service shares with everyone else, and
+`/tmp` on macOS. Both are sticky and world-writable, so an existing lock file
+is opened without `O_CREAT`: Linux's `fs.protected_regular` refuses `O_CREAT`
+on another user's file there, even to root. Its creator gives it mode `0666`
+whatever its umask.
 The lock is opened independently for each acquisition, serializing threads as
 well as processes, and is close-on-exec. The kernel releases it on close or
 process death, including SIGKILL. A normal file works on Linux and macOS:
@@ -112,10 +118,14 @@ claimant died before recording a pid or heartbeat. This also recovers a sweeper
 killed during its own temporary CLAIMING transition. Recovery takes one sweep
 (a fixed scan of 32 slots), not 32 restarts or a heartbeat timeout.
 
-Every new claim also sweeps ACTIVE slots whose host-monotonic heartbeat is at
-least `kLivenessTimeout`, five seconds old. The heartbeat is rechecked after
-the ACTIVE-to-CLAIMING transition so a refresh observed during the sweep can
-keep the row.
+Every new claim also sweeps ACTIVE slots whose claimant is gone: its process
+no longer runs, or its host-monotonic heartbeat is at least
+`kLivenessTimeout`, five seconds old. A row records its claimant as RTMS
+records a claim, the pid and the process start time (`pid_start`;
+`//talOS/rtms:process_liveness`), so a killed node's row is freed by the next
+claim, and a pid reused since does not keep it. Both are rechecked after the
+ACTIVE-to-CLAIMING transition so a refresh observed during the sweep can keep
+the row.
 
 Each claim bumps a generation counter before the slot goes ACTIVE. A reader
 snapshots the generation, copies the identity fields, and re-reads it; a change
@@ -126,7 +136,8 @@ count can see the records it describes.
 
 A registration releases its slot in its destructor, so a clean shutdown leaves
 no ghost row and a viewer sees the node disappear immediately. A node that is
-killed leaves its slot ACTIVE until the heartbeat goes stale.
+killed leaves its slot ACTIVE until the next claim, or until the heartbeat goes
+stale; a crash-looping roster therefore cannot fill the registry.
 
 ## Observing must not perturb
 
@@ -199,8 +210,23 @@ Refreshes are bracketed by a sample sequence. Readers retry inconsistent
 copies a bounded number of times rather than waiting for a stalled writer;
 these snapshots are observational, not control inputs.
 
-The mapping is requested with mode `0666` (subject to the process umask).
-It provides no authentication.
+A writer that owns the segment gives it mode `0666` (`kRegistryMode`)
+whatever its umask; on macOS `shm_open` applies none. It provides no
+authentication.
+
+## Prepared by the launcher
+
+A node runs on when it cannot register (above), but the launcher kills a node
+that has no row once its startup grace ends, so a registry its nodes cannot
+open would restart the whole roster forever. Before it starts any node, the
+launcher therefore calls `PrepareRegistry`: it opens the segment read-write,
+creating and initializing it when absent or uncommitted, gives the segment and
+its lock file their modes, and opens the lock file as every writer must. Nodes
+run as the launcher's user, so what it can open they can. It waits for the
+lock only to create or initialize the segment, and at most
+`kRegistryLockWait` (5 s). Anything it cannot open -- typically a segment or
+lock file another user created with a narrower mode -- refuses the launch with
+a message naming it, its owner and mode, and how to remove it.
 
 Naming rules and whole-graph linting live in [NAMING.md](../NAMING.md).
 
@@ -214,11 +240,15 @@ bazel test //talOS/introspection/...
 then SIGKILLed before the initialization or ACTIVE commit. `waitpid(WUNTRACED)`
 synchronizes the kill without sleeps. The tests verify initialization recovery,
 all 32 slots remaining usable after an abandoned claim, and eight concurrent
-processes holding distinct registrations across the entire registry.
+processes holding distinct registrations across the entire registry. A
+SIGKILLed claimant's row is freed by the next claim, before its heartbeat ages
+out, and `PrepareRegistry` gives the segment and lock file their modes under a
+restrictive umask and refuses a segment it cannot open read-write.
 
 `:registry` is the segment and both ends of it, and depends only on
-`//talOS/events:events_core` and `:names` — a reader such as Studio's bridge
-does not pull in an event loop. It does not depend on `:describe` either, and
+`//talOS/events:events_core`, `:names`, `:lock_file` and
+`//talOS/rtms:process_liveness` — a reader such as Studio's bridge does not
+pull in an event loop. It does not depend on `:describe` either, and
 `publish`'s attribute overload is a template on the container for that reason:
 the record of what is running should not have to include the description of what
 would run. `:reporter` adds the sampling thread and is needed only by processes

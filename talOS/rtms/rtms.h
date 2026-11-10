@@ -16,6 +16,7 @@
 #include <span>
 
 #include "talOS/memory/shared_memory_ptr.h"
+#include "talOS/rtms/process_liveness.h"
 #include "talOS/schema/identity.h"
 
 inline constexpr size_t CACHE_LINE = 64;  // C++ I think as a function for this.
@@ -147,16 +148,8 @@ inline constexpr std::uint64_t kLifetimeSessionOwned = 1ULL << 63;
 inline constexpr std::uint64_t kLifetimeClosing = 1ULL << 62;
 inline constexpr std::uint64_t kLifetimeCountMask = (1ULL << 32) - 1;
 
-// How the segment records a process -- the writer's owner and each reader
-// slot's claimant -- so that a pid reused after its process died is not
-// mistaken for that process: the pid in the low kProcessPidBits bits and,
-// above them, the low kProcessStartBits bits of the process's start time
-// (clock ticks since boot on Linux, microseconds since the epoch on macOS;
-// 0 where the platform did not report it, which compares the pid alone). A
-// recorded process is alive while a process with its pid runs -- a zombie
-// does not -- and started at the recorded time.
-inline constexpr unsigned kProcessPidBits = 32;
-inline constexpr unsigned kProcessStartBits = 30;
+// The segment records the writer's owner and each reader slot's claimant as
+// a process word (kProcessPidBits, process_liveness.h).
 // A reader's state word holds a process word above its two state bits.
 static_assert(kProcessPidBits + kProcessStartBits + 2 == 64);
 

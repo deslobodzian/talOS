@@ -34,10 +34,19 @@ cc_library(
     name = "registry",
     hdrs = ["registry.h"],
     deps = [
+        ":lock_file",
         ":names",
         "//talOS/events:events_core",
         "//talOS/memory:shared_memory",
+        "//talOS/rtms:process_liveness",
     ],
+)
+
+# Lock files beside a shared-memory namespace: the registry's writer lock and
+# the launcher's one-session-per-namespace lock.
+cc_library(
+    name = "lock_file",
+    hdrs = ["lock_file.h"],
 )
 
 # Publishes a running loop into the registry. Separate target because a reader

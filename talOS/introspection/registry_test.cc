@@ -1,7 +1,10 @@
 #include "talOS/introspection/registry.h"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -475,6 +478,89 @@ TEST_F(Registry, ANewClaimSweepsSlotsLeftBehindByACrashedNode) {
   const auto after = registry.nodes();
   ASSERT_EQ(after.size(), 1u);
   EXPECT_EQ(after.front().session_id, 1788u);
+}
+
+// A killed node's row is freed by the next claim, not once its heartbeat is
+// kLivenessTimeout old: a crash-looping roster leaves one row per run, and
+// those rows must not fill the registry for the restarts that follow.
+TEST_F(Registry, ADeadClaimantsRowIsFreedByTheNextClaim) {
+  Pipe ready;
+  Children children;
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    try {
+      NodeRegistration registration{{.name = "killed"}, path_};
+      const char token = 1;
+      if (!write_all(ready.writer(), &token, 1)) ::_exit(2);
+      for (;;) ::pause();
+    } catch (...) {
+      ::_exit(1);
+    }
+  }
+  children.add(pid);
+  char token = 0;
+  ASSERT_TRUE(read_all(ready.reader(), &token, 1));
+  ASSERT_EQ(::kill(pid, SIGKILL), 0);
+  children.reap(pid);
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  ASSERT_EQ(reader->nodes().size(), 1u);
+  EXPECT_TRUE(reader->nodes().front().alive) << "the heartbeat is still fresh";
+
+  std::vector<std::unique_ptr<NodeRegistration>> registrations;
+  for (std::size_t i = 0; i < kMaxNodes; ++i) {
+    registrations.push_back(std::make_unique<NodeRegistration>(
+        NodeRegistration::Identity{.name = "node" + std::to_string(i)}, path_));
+  }
+  const auto nodes = reader->nodes();
+  EXPECT_EQ(nodes.size(), kMaxNodes);
+  EXPECT_TRUE(std::none_of(nodes.begin(), nodes.end(),
+                           [](const auto& n) { return n.name == "killed"; }));
+}
+
+// The launcher prepares the registry before it starts a node. Created under a
+// service's restrictive umask, the segment and its writer lock file still get
+// the modes another user's nodes and tools need, and a node registers in it.
+TEST_F(Registry, PreparedRegistryIsOpenableWhateverTheUmask) {
+  const std::string mapped = ShmObjectName(path_);
+  const std::string lock = LockFilePath(mapped);
+  ::unlink(lock.c_str());  // An earlier test's file has its mode already.
+  const mode_t previous = ::umask(077);
+  PrepareRegistry(path_);
+  ::umask(previous);
+
+  const int fd = ::shm_open(mapped.c_str(), O_RDONLY, 0);
+  ASSERT_GE(fd, 0);
+  struct stat segment {};
+  ASSERT_EQ(::fstat(fd, &segment), 0);
+  ::close(fd);
+  EXPECT_EQ(segment.st_mode & 0777, kRegistryMode);
+  struct stat file {};
+  ASSERT_EQ(::stat(lock.c_str(), &file), 0);
+  EXPECT_EQ(file.st_mode & 0777, kLockFileMode);
+
+  NodeRegistration registration{{.name = "node"}, path_};
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  EXPECT_EQ(reader->nodes().size(), 1u);
+}
+
+// A registry this user cannot write -- another user's, created 0644 -- would
+// leave every node unregistered and killed; preparing it refuses, naming it.
+TEST_F(Registry, AnUnwritableRegistryRefusesPreparation) {
+  if (::geteuid() == 0) GTEST_SKIP() << "root writes any segment";
+  const std::string mapped = ShmObjectName(path_);
+  const int fd = ::shm_open(mapped.c_str(), O_CREAT | O_EXCL | O_RDWR, 0444);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  try {
+    PrepareRegistry(path_);
+    ADD_FAILURE() << "an unwritable registry was accepted";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string{e.what()}.find(mapped), std::string::npos)
+        << e.what();
+  }
 }
 
 TEST_F(Registry, HeartbeatAndSweepUseHostMonotonicTime) {

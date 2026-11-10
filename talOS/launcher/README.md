@@ -39,6 +39,30 @@ adds final log counts.
 `--allow-graph-errors` overrides graph-error refusal. Missing descriptions
 cannot create segments for undeclared topics.
 
+## One session per namespace
+
+A launch that starts the roster (anything but `--describe-only` and
+`--replay-inputs`, which use no shared memory) first takes the session lock of
+its shared-memory namespace (`session_lock.h`), before it writes anything. A
+session owns its namespace: it replaces every declared topic's segment at
+startup and unlinks them at its end, so a second launcher there would remove a
+running session's topics, and that session's restarted nodes would attach to
+segments its other nodes no longer share. The second launch is refused instead:
+
+    launcher: another launcher (pid 4242) is running a session in this shared-memory namespace (...)
+
+The namespace is `ShmObjectName`'s ([ARCHITECTURE.md](../../ARCHITECTURE.md#topics-and-messages)):
+sessions and test runs under their own `TALOS_SHM_NAMESPACE` or Bazel
+`TEST_TMPDIR` do not exclude one another. The lock is a POSIX record lock on
+`<lock-dir>/talos-<mapped name of /talos_session>.lock`, in the registry lock's
+[directory](../introspection/README.md#the-segment); the kernel releases it
+when the launcher exits or is killed, and nodes never inherit it.
+
+Next, before any probe, the launcher prepares the
+[live registry](../introspection/README.md#prepared-by-the-launcher), so every
+node it starts can register, or refuses the launch naming the segment or lock
+file that its nodes could not open.
+
 ## When a binary does not answer
 
 A failed critical probe is an error; a failed non-critical probe is a warning.
@@ -199,7 +223,10 @@ row reports it.
 500 ms. `--heartbeat-startup-grace-ms MS` defaults to 5000 ms for processes
 that have not registered. Such processes are killed once both that grace and
 the heartbeat timeout have elapsed; registration is required even when
-`--allow-graph-errors` permits a failed description.
+`--allow-graph-errors` permits a failed description. The launcher prepared the
+registry before starting them ([one session per namespace](#one-session-per-namespace)),
+and rows of killed runs are freed by the next claim, so a node fails to
+register only when 32 live processes hold every row.
 
 Construction is visible in the registry before endpoints are available and has
 a fixed deadline from process spawn. See the

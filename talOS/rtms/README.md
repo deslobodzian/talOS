@@ -46,7 +46,9 @@ A writer or reader claim records its process as the pid plus the process start
 time (`/proc/<pid>/stat` on Linux, `sysctl(KERN_PROC_PID)` on macOS). The claim
 is dead once no process with that pid runs, the pid's process is a zombie, or
 the pid now belongs to a process that started at another time, so a pid reused
-after a crash does not keep the crashed process's claims.
+after a crash does not keep the crashed process's claims. The check is
+`:process_liveness` (`process_liveness.h`), which the live node registry also
+uses for its rows.
 
 Each topic has eight reader slots (`MAX_READERS`), including observer
 subscriptions. Dead readers are reclaimed before registration fails. The graph

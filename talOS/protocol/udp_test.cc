@@ -1,6 +1,12 @@
 #include "udp.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <array>
+#include <cstdint>
 #include <cstring>
 
 #include "gtest/gtest.h"
@@ -59,6 +65,41 @@ TEST(RuntimeUdpTest, NonBlockingReceiveReportsWouldBlock) {
 
   DecodedFrame received;
   EXPECT_EQ(peer.TryReceive(&received), UdpStatus::kWouldBlock);
+}
+
+// A loopback UDP port the OS just handed out and released, so the test does
+// not depend on a fixed port in the ephemeral range staying free.
+uint16_t FreeLoopbackPort() {
+  const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0) return 0;
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t size = sizeof(address);
+  const bool bound =
+      ::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 &&
+      ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) == 0;
+  ::close(fd);
+  return bound ? ntohs(address.sin_port) : 0;
+}
+
+// A second process opening a live peer's port -- a second hardware bridge
+// on the RoboRIO port -- fails rather than sharing its datagrams, while a
+// restarted peer gets the port back as soon as the old one closed.
+TEST(RuntimeUdpTest, ALivePeersPortIsRefusedUntilItCloses) {
+  const uint16_t port = FreeLoopbackPort();
+  const uint16_t remote = FreeLoopbackPort();
+  ASSERT_NE(port, 0);
+  ASSERT_NE(remote, 0);
+  RuntimeUdpPeer first;
+  ASSERT_EQ(first.Open("127.0.0.1", port, "127.0.0.1", remote),
+            UdpStatus::kOk);
+  RuntimeUdpPeer second;
+  EXPECT_EQ(second.Open("127.0.0.1", port, "127.0.0.1", remote),
+            UdpStatus::kSocketError);
+  first.Close();
+  EXPECT_EQ(second.Open("127.0.0.1", port, "127.0.0.1", remote),
+            UdpStatus::kOk);
 }
 
 }  // namespace
