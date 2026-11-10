@@ -684,9 +684,11 @@ class Vision {
     // A live stamp older than the frame timeout describes an instant the
     // camera would already count as silent: publish it invalid, still
     // reporting its age as latency, with one diagnostic per transition.
+    // Only a valid stamp has an age, so an invalid one (future, underflow)
+    // neither ends nor starts a stale run.
     const bool stale =
         !simulated_ && age_ns > static_cast<std::uint64_t>(frame_timeout_ns_);
-    if (stale != stale_stamps_) {
+    if (timestamp_valid && stale != stale_stamps_) {
       stale_stamps_ = stale;
       if (stale) {
         std::fprintf(stderr,
