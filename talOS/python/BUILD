@@ -81,6 +81,9 @@ py_test(
         "TALOS_ABI_HEADER": "$(rlocationpath //talOS/node_api:node_api.h)",
         "TALOS_ABI_PYTHON": "$(rlocationpath talos/_abi.py)",
     },
+    # A generated empty talos/__init__.py here would collide with the tracked
+    # one in every other test's runfiles (see tools/check_runfiles_collisions.py).
+    legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],
 )
 

@@ -1,4 +1,10 @@
 common --enable_bzlmod
+# Never generate empty __init__.py files in runfiles. Bazel reuses sandbox
+# directories across tests; a generated empty file at a path where another
+# test links a tracked source is written through that stale link, truncating
+# the source (talOS/python/talos/__init__.py). tools/check_runfiles_collisions.py
+# guards this in CI.
+common --incompatible_default_to_explicit_init_py
 
 build --enable_platform_specific_config
 

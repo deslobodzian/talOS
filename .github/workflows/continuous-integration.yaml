@@ -37,20 +37,28 @@ jobs:
     - name: Build
       run: bazel build //... --noshow_progress --test_output=errors
 
+    - &runfiles-collisions
+      name: No runfiles path is both generated-empty and a source file
+      # A reused sandbox writes an empty generated file through a stale
+      # symlink left by another test's runfiles, truncating the source.
+      run: python3 tools/check_runfiles_collisions.py
+
     - name: Checked-in Studio bindings match the telemetry_ts genrule
       # pnpm and tsc read studio/src/generated; Bazel builds Studio from the
       # //studio:telemetry_ts genrule (the same pinned flatc `pnpm generate`
       # runs). A schema edit without `pnpm generate` fails here.
       run: diff -ru bazel-bin/studio/src/generated studio/src/generated
 
-    # The two INC-1 steps below are anchored and reused by build-macos.
+    # The two steps below are anchored and reused by build-macos.
     - &make-read-only
       name: Make tracked source files read-only
-      # TODO.md INC-1: talOS/python/talos/__init__.py was truncated to 0
-      # bytes during test runs and the writer is unknown. With every tracked
-      # regular file read-only, that writer fails with a traceback naming it
-      # instead of corrupting the checkout. Directories stay writable (Bazel's
-      # convenience symlinks); MODULE.bazel.lock stays writable.
+      # A reused Bazel sandbox once truncated talOS/python/talos/__init__.py
+      # by creating a generated empty file through a stale symlink to it
+      # (tools/check_runfiles_collisions.py now prevents that layout). With
+      # every tracked regular file read-only, a recurrence fails as "Could
+      # not copy inputs into sandbox: ... (Permission denied)" naming the
+      # test, instead of corrupting the checkout. Directories stay writable
+      # (Bazel's convenience symlinks); MODULE.bazel.lock stays writable.
       run: |
         python3 - <<'EOF'
         import os, subprocess
@@ -67,7 +75,7 @@ jobs:
 
     - &checkout-unchanged
       name: Checkout unchanged by the build and tests
-      # Runs after failed tests too: an INC-1 truncation fails the tests,
+      # Runs after failed tests too: a source truncation fails the tests,
       # and this is the evidence. Modified tracked files and untracked,
       # non-ignored files both fail it.
       if: ${{ !cancelled() }}
@@ -119,6 +127,8 @@ jobs:
 
     - name: Build
       run: bazel build //... --noshow_progress --test_output=errors
+
+    - *runfiles-collisions
 
     - *make-read-only
 
