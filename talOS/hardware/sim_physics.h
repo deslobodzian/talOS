@@ -21,6 +21,11 @@
 // slot; the volts then drive the rotor, whose position/velocity are written
 // back as mechanism units (rotor / gear ratio), per CTRE sim guidance that
 // sim state is fed from the device's voltage output, not from the demand.
+// Rotor state is physical (counterclockwise positive, the sim's mounting). A
+// TalonFX's `inverted` flips its output and its own position and velocity
+// together, as Phoenix 6's MotorOutput.Inverted does, so its closed loops run
+// in the configured positive direction; CANcoders and the chassis see the
+// physical rotor.
 //
 // Sensors cross the hardware boundary. CANcoder samples mirror the linked
 // mechanism. Swerve ground motion determines the true field pose; the Pigeon
@@ -316,8 +321,8 @@ class PhysicsSimBackend final : public Backend {
         continue;
       }
       const double gear = Gear(i);
-      const double mech_pos = axes_[i].rotor_position_rot / gear;
-      const double mech_vel = axes_[i].rotor_velocity_rps / gear;
+      const double mech_pos = axes_[i].rotor_position_rot * Direction(i) / gear;
+      const double mech_vel = axes_[i].rotor_velocity_rps * Direction(i) / gear;
       out.valid = true;
       out.position_rot = mech_pos;
       out.velocity_rps = mech_vel;
@@ -659,6 +664,12 @@ class PhysicsSimBackend final : public Backend {
     double velocity_rps{};
   };
 
+  // The configured positive direction of motor i in the physical rotor frame:
+  // Phoenix 6 inversion applies to output and rotor sensor alike.
+  double Direction(std::size_t i) const {
+    return config_.motors[i].inverted ? -1.0 : 1.0;
+  }
+
   double Gear(std::size_t i) const {
     const double gear = config_.motors[i].rotor_to_sensor_ratio *
                         config_.motors[i].sensor_to_mechanism_ratio;
@@ -680,7 +691,7 @@ class PhysicsSimBackend final : public Backend {
     const double gear = Gear(i);
     if (out.position_rot < lo || out.position_rot > hi) {
       const double clamped = std::clamp(out.position_rot, lo, hi);
-      axes_[i].rotor_position_rot = clamped * gear;
+      axes_[i].rotor_position_rot = clamped * Direction(i) * gear;
       out.position_rot = clamped;
       if ((out.position_rot <= lo && out.velocity_rps < 0) ||
           (out.position_rot >= hi && out.velocity_rps > 0)) {
@@ -723,8 +734,8 @@ class PhysicsSimBackend final : public Backend {
       mech.load = LoadKind::kRoller;
       double volts = 0.0;
       const double gear = mech.gear_ratio;
-      const double mech_pos = axes_[i].rotor_position_rot / gear;
-      const double mech_vel = axes_[i].rotor_velocity_rps / gear;
+      const double mech_pos = axes_[i].rotor_position_rot * Direction(i) / gear;
+      const double mech_vel = axes_[i].rotor_velocity_rps * Direction(i) / gear;
       auto& profile = profiles_[i];
       const auto& req = commands_[i];
       bool want_power;
@@ -779,7 +790,7 @@ class PhysicsSimBackend final : public Backend {
       mech.gear_ratio = Gear(i);
       mech.brake = m.brake;
       const double volts = applied_volts_[i];
-      const double rotor_volts = m.inverted ? -volts : volts;
+      const double rotor_volts = Direction(i) * volts;
       axes_[i] = StepAxis(motor, mech, axes_[i], rotor_volts, powered_[i],
                           supply_v_, dt_s);
     }

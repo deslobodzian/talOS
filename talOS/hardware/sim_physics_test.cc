@@ -302,9 +302,9 @@ TEST(SimBelievability, TunedVelocityLoopTracksDemand) {
   EXPECT_LE(s.motors[0].velocity_rps, 10.0);
 }
 
-// Gearing divides rotor speed into mechanism speed; inversion flips
-// direction; soft limits clamp and stop the axis.
-TEST(SimBelievability, GearingDirectionAndLimits) {
+// Gearing divides rotor speed into mechanism speed; soft limits clamp and
+// stop the axis.
+TEST(SimBelievability, GearingAndLimits) {
   // Gearing: identical volts, gear 2 must run half mechanism speed of gear 1.
   {
     PhysicsSimBackend geared, direct;
@@ -329,28 +329,6 @@ TEST(SimBelievability, GearingDirectionAndLimits) {
     EXPECT_NEAR(sg.motors[0].velocity_rps * 2.0, sd.motors[0].velocity_rps,
                 std::abs(sd.motors[0].velocity_rps) * 0.05 + 1e-6);
   }
-  // Direction: inverted spins the mechanism the opposite way.
-  {
-    PhysicsSimBackend fwd, rev;
-    Config c = SingleMotorConfig(), ci = SingleMotorConfig();
-    ci.motors[0].inverted = true;
-    ASSERT_TRUE(fwd.Configure(c));
-    ASSERT_TRUE(rev.Configure(ci));
-    std::array<MotorRequest, kMaxMotors> cmd{};
-    cmd[0] = Duty(1, 0.5);
-    ASSERT_TRUE(fwd.Apply(cmd));
-    ASSERT_TRUE(rev.Apply(cmd));
-    State sf{}, sr{};
-    uint64_t now_us = 0;
-    for (int i = 0; i < 100; ++i) {
-      now_us += 5000;
-      sf.sample_time_us = now_us;
-      sr.sample_time_us = now_us;
-      fwd.Read(sf);
-      rev.Read(sr);
-    }
-    EXPECT_NEAR(sr.motors[0].velocity_rps, -sf.motors[0].velocity_rps, 1e-6);
-  }
   // Limits: the axis clamps at the forward soft limit and stops.
   {
     Config c = SingleMotorConfig();
@@ -367,6 +345,49 @@ TEST(SimBelievability, GearingDirectionAndLimits) {
     StepBackend(backend, s, now_us, 5000, 600);
     EXPECT_LE(s.motors[0].position_rot, 1.0);
     EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 0.0);
+  }
+}
+
+// Phoenix 6's MotorOutput.Inverted flips the rotor sensor with the output, so
+// a TalonFX reports position and velocity in its configured positive
+// direction. Inverted or not, a closed loop converges and positive duty reads
+// positive; the inversion shows only on the physical rotor a CANcoder sees.
+TEST(SimBelievability, InvertedMotorReportsItsConfiguredDirection) {
+  for (const bool inverted : {false, true}) {
+    for (const auto mode : {Mode::kPosition, Mode::kMotionMagic}) {
+      Config c = SingleMotorConfig();
+      c.motors[0].inverted = inverted;
+      c.motors[0].cruise_velocity_rps = 2.0;
+      c.motors[0].acceleration_rps2 = 4.0;
+      c.motors[0].slots[0].p = 1.0;
+      c.motors[0].slots[0].d = 0.05;
+      c.motors[0].slots[0].v = 0.12;
+      PhysicsSimBackend backend;
+      ASSERT_TRUE(backend.Configure(c));
+      std::array<MotorRequest, 1> cmd{{{1, mode, 0, 2.0, 0.0}}};
+      ASSERT_TRUE(backend.Apply(cmd));
+      State s{};
+      uint64_t now_us = 0;
+      StepBackend(backend, s, now_us, 5000, 1000);
+      EXPECT_NEAR(s.motors[0].position_rot, 2.0, 0.01)
+          << "inverted=" << inverted << " mode=" << static_cast<int>(mode);
+      EXPECT_NEAR(s.motors[0].velocity_rps, 0.0, 0.01);
+    }
+    Config c = SingleMotorConfig();
+    c.motors[0].inverted = inverted;
+    c.sensors.push_back({2, "encoder", SensorKind::kCANcoder, 20, "rio"});
+    c.motors[0].feedback = Feedback::kRemoteCANcoder;
+    c.motors[0].feedback_sensor_id = 2;
+    PhysicsSimBackend backend;
+    ASSERT_TRUE(backend.Configure(c));
+    std::array<MotorRequest, 1> cmd{Duty(1, 0.5)};
+    ASSERT_TRUE(backend.Apply(cmd));
+    State s{};
+    uint64_t now_us = 0;
+    StepBackend(backend, s, now_us, 5000, 100);
+    EXPECT_GT(s.motors[0].velocity_rps, 10.0) << "inverted=" << inverted;
+    EXPECT_NEAR(s.sensors[0].velocity_rps,
+                (inverted ? -1.0 : 1.0) * s.motors[0].velocity_rps, 1e-9);
   }
 }
 
