@@ -307,9 +307,9 @@ void HardwareNode::Tick(uint64_t now_us) {
     pending_probe_send_us_ = 0;
     probe_waiting_ = false;
   }
-  if ((!probe_waiting_ &&
-       (last_probe_send_us_ == 0 || now_us - last_probe_send_us_ >= 20000)) ||
-      (probe_waiting_ && now_us - last_probe_send_us_ > 1'000'000)) {
+  if ((!probe_waiting_ && (last_probe_send_us_ == 0 ||
+                           now_us - last_probe_send_us_ >= kProbePeriodUs)) ||
+      (probe_waiting_ && now_us - last_probe_send_us_ > kProbeRetryUs)) {
     if (peer_.SendFrame(protocol::FrameType::kClockProbe, 0, now_us, nullptr,
                         0) == protocol::UdpStatus::kOk) {
       last_probe_send_us_ = now_us;

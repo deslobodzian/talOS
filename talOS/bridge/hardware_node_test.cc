@@ -1323,6 +1323,70 @@ TEST(HardwareNodeTest, TwoWayClockBoundNeedsNoActiveRequests) {
   EXPECT_EQ(node.commands_sent(), 0u);
 }
 
+// One lost probe must not open a gap: the bridge replaces it long before the
+// exchange it already holds (one second lifetime) expires, so the mapping
+// stays valid through the whole second after the last good exchange.
+TEST(HardwareNodeTest, OneLostClockProbeLeavesTheMappingValid) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  HardwareNode node{cfg, "127.0.0.1", TestPort(25836), TestPort(25837), true};
+  ASSERT_TRUE(node.Open());
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(
+      gateway.Open("127.0.0.1", TestPort(25836), "127.0.0.1", TestPort(25837)),
+      protocol::UdpStatus::kOk);
+  // The next clock probe the bridge sent, skipping config pushes.
+  const auto next_probe = [&gateway]() -> std::optional<uint64_t> {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    protocol::DecodedFrame frame;
+    while (protocol::testing::ReceiveFrame(gateway, &frame, deadline) ==
+           protocol::UdpStatus::kOk) {
+      if (frame.header.type == protocol::FrameType::kClockProbe) {
+        return frame.header.monotonic_time_us;
+      }
+    }
+    return std::nullopt;
+  };
+  // The gateway clock runs 2'004'000 us behind the bridge's.
+  constexpr uint64_t kBehindUs = 2'004'000;
+  auto state = TrustState(NodeConfigId(cfg), 11, 1, 0);
+  state.flags = 0;
+  const auto inject = [&](uint64_t bridge_us, uint64_t echo) {
+    state.sample_time_us = bridge_us - kBehindUs;
+    state.clock_probe_time_us = echo;
+    return InjectState(node, gateway, state, bridge_us);
+  };
+
+  // One answered exchange (completed on the 2'006'000 tick) and eight States.
+  node.Tick(2'000'000);
+  const auto first = next_probe();
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(inject(2'005'000, *first));
+  for (uint64_t t = 2'006'000; t <= 2'012'000; t += 1000) {
+    ASSERT_TRUE(inject(t, 0));
+  }
+  ASSERT_TRUE(node.Status(2'012'000).clock_offset_valid());
+
+  // The next probe is lost.
+  node.Tick(2'020'000);
+  ASSERT_TRUE(next_probe().has_value());
+
+  // A gateway that answers every later probe in its next State. The first
+  // exchange expires 1 s after 2'006'000; validity must not lapse.
+  uint64_t echo = 0;
+  for (uint64_t t = 2'030'000; t <= 3'040'000; t += 10'000) {
+    ASSERT_TRUE(inject(t, echo));
+    echo = 0;
+    EXPECT_TRUE(node.Status(t).clock_offset_valid()) << "at bridge " << t;
+    protocol::DecodedFrame frame;
+    while (gateway.TryReceive(&frame) == protocol::UdpStatus::kOk) {
+      if (frame.header.type == protocol::FrameType::kClockProbe) {
+        echo = frame.header.monotonic_time_us;
+      }
+    }
+  }
+}
+
 // A timed-out subsystem neutralizes exactly its own motors, digital outputs
 // and PWM channels; another subsystem's merged demand stays in place.
 TEST(HardwareNodeTest, TimeoutNeutralizesOnlyTheSilentSubsystemsActuators) {

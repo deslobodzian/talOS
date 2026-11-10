@@ -222,6 +222,14 @@ class HardwareNode {
   // named deadline, not an implicit sleep constant.
   static constexpr uint64_t kTickPeriodUs = 1000;
   static constexpr uint64_t kStatusPeriodUs = 20000;
+  // Clock probes: one outstanding, at most every kProbePeriodUs. An
+  // unanswered probe (or a lost echo) is replaced after kProbeRetryUs, well
+  // inside ClockOffsetEstimator::kExchangeLifetimeUs, so one lost datagram
+  // never leaves the estimator without an unexpired exchange. An echo whose
+  // round trip exceeds the retry interval is therefore never used.
+  static constexpr uint64_t kProbePeriodUs = 20'000;
+  static constexpr uint64_t kProbeRetryUs = 100'000;
+  static_assert(kProbeRetryUs * 5 <= ClockOffsetEstimator::kExchangeLifetimeUs);
   uint64_t heartbeat_us_{20000};
   Command last_sent_cmd_{};
   uint64_t last_send_us_{0};

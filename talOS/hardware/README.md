@@ -188,7 +188,8 @@ Nodes read the gateway's poll timestamp in their own clock through
 `talos.hardware_sample_time_ns(node)`). The bridge keeps the mapping
 (`talOS/bridge/clock_offset.h`) and publishes it on `/hw/status`. Empty clock
 probes run at most 50 Hz even while disabled/uncommissioned, with one probe
-outstanding at a time and an unanswered probe retried after one second.
+outstanding at a time and an unanswered probe replaced after 100 ms, so one
+lost probe or echo never outlasts the exchange already held.
 A later State echoes the probe's bridge-clock send time; its gateway sample
 lies causally between that send and bridge receipt. The midpoint of the
 minimum-RTT interval estimates
