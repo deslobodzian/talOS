@@ -205,9 +205,23 @@ struct NodeAccess {
                                   std::size_t bytes, std::size_t alignment,
                                   const schema::Identity& schema);
 
+  // Refuses (std::invalid_argument) a topic that resolves into the hardware
+  // request namespace (naming::IsHardwareRequest), as add_byte_publisher
+  // does: only add_hardware_request opens one.
   static std::size_t add_publisher(Node& node, std::string_view topic,
                                    std::size_t bytes, std::size_t alignment,
                                    const schema::Identity& schema);
+  // The devices layer's flush: this node's hardware request,
+  // naming::HardwareRequestTopic(name), never remapped, declared to describe
+  // and the registry with naming::kSourceFlagHardwareRequest (the graph lint
+  // refuses a request writer without it). Sent with publisher_send. Once per
+  // node; a second call throws std::logic_error.
+  static std::size_t add_hardware_request(Node& node, std::size_t bytes,
+                                          std::size_t alignment,
+                                          const schema::Identity& schema);
+  // The topic add_hardware_request registered, or empty: for describe and
+  // the registry.
+  static std::string_view hardware_request(const Node& node);
   static bool publisher_send(Node& node, std::size_t index, const void* data,
                              std::size_t bytes);
 

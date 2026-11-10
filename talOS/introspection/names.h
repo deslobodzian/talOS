@@ -22,6 +22,7 @@
 
 #include "talOS/events/manifest.h"
 #include "talOS/hardware/config.h"
+#include "talOS/hardware/packet.h"
 #include "talOS/rtms/rtms.h"
 
 namespace talos::introspect::naming {
@@ -85,6 +86,20 @@ inline constexpr std::uint32_t kSourceFlagObserver = 1u << 2;
 // the messages it skipped by design. Set by the Reporter from the loop, never
 // declared by a node, and absent from a `--describe`.
 inline constexpr std::uint32_t kSourceFlagLatestOnly = 1u << 3;
+// Not about the far end either: the publisher the devices layer's flush writes
+// its node's hardware request on (detail::NodeAccess::add_hardware_request),
+// set by the node from that registration, never declared by node code. The
+// graph lint refuses a `/hw/request` writer without it (RULES.md 2). A bit of
+// the existing flags word: an older registry reader ignores it, and an older
+// `--describe`, which never wrote it, reads as "not the flush".
+inline constexpr std::uint32_t kSourceFlagHardwareRequest = 1u << 4;
+
+// The hardware bridge's roster name: the launcher lists the bridge under it
+// (launcher kHardwareNodeName), whatever binary `[robot] hardware_node` names,
+// and the stock bridge describes itself by it (talOS/bridge kNodeName; both
+// are held to this one). The graph lint knows the bridge by its roster slot
+// (NodeShape::hardware_bridge), not by the name a binary describes.
+inline constexpr std::string_view kHardwareBridgeNode = "hardware_node";
 
 inline bool IsSender(event::SourceKind kind) {
   return kind == event::SourceKind::SENDER;
@@ -276,6 +291,10 @@ struct NodeShape {
   std::string name;
   std::string target;
   std::vector<SourceShape> sources;
+  // The roster's hardware bridge (the launcher marks the node in the
+  // kHardwareBridgeNode slot, whatever its binary calls itself): the one node
+  // that writes the `hw` namespace, except each node's own request.
+  bool hardware_bridge{false};
 };
 
 enum class Severity { WARNING, ERROR };
@@ -358,6 +377,24 @@ inline std::string JoinTargetLane(std::string_view subsystem,
 }
 }  // namespace detail
 
+// Whether `topic` is in the hardware request namespace: `/hw/request` or any
+// topic below it, well formed or not. Only a node's devices-layer flush
+// writes there (detail::NodeAccess::add_hardware_request); the generic
+// publishers refuse every such topic, however it was spelled or remapped.
+inline bool IsHardwareRequest(std::string_view topic) {
+  const auto segments = detail::Segments(topic);
+  return segments.size() >= 2 && segments[0] == "hw" &&
+         segments[1] == "request";
+}
+
+// The hardware request of node `node`: hardware::RequestTopic, the one
+// spelling the bridge also reads.
+inline std::string HardwareRequestTopic(std::string_view node) {
+  return hardware::RequestTopic(node);
+}
+static_assert(std::string_view{hardware::kRequestTopicPrefix} == "/hw/request/",
+              "IsHardwareRequest recognises the prefix the bridge reads");
+
 // Why `/<subsystem>/target/<source>` is not a target lane, or nullopt.
 inline std::optional<std::string> CheckTargetLane(std::string_view subsystem,
                                                   std::string_view source) {
@@ -377,17 +414,49 @@ inline std::string TargetLaneTopic(std::string_view subsystem,
   return detail::JoinTargetLane(subsystem, source);
 }
 
+namespace detail {
+// Why `node` may not write `source`, a topic of the `hw` namespace, or
+// nullopt (RULES.md 2). The bridge (NodeShape::hardware_bridge) writes the
+// namespace, except the requests:
+// `/hw/request/<node>` is written only by <node>'s devices-layer flush, which
+// gates every output on robot_enabled and update() and applies the motor
+// limits and position frames before it sends; a plain publisher would skip
+// all of that.
+inline std::optional<std::string> HardwareWriterProblem(
+    const NodeShape& node, const SourceShape& source) {
+  const std::string writer = "is written by '" + node.name + "'";
+  if (!IsHardwareRequest(source.name)) {
+    if (node.hardware_bridge) return std::nullopt;
+    return writer + "; the hw namespace is written only by the hardware " +
+           "bridge (the roster's '" + std::string{kHardwareBridgeNode} +
+           "'), except each node's own " + HardwareRequestTopic("<node>");
+  }
+  if (source.name != HardwareRequestTopic(node.name))
+    return writer + ", but the only hardware request a node writes is its " +
+           "own, " + HardwareRequestTopic(node.name);
+  if ((source.flags & kSourceFlagHardwareRequest) == 0)
+    return writer + " outside its devices layer; a hardware request " +
+           "leaves only through the devices-layer flush after update(), " +
+           "which gates it on robot_enabled and applies the motor limits " +
+           "(command the node's devices instead of publishing a request), " +
+           "or the binary predates the hardware_request attribute; rebuild " +
+           "it";
+  return std::nullopt;
+}
+}  // namespace detail
+
 // Everything checkable about a whole graph, errors first.
 //
 // Errors cannot be correct in any configuration (two writers, a reader with no
 // writer, two schemas or message sizes or ring layouts on one topic, a
-// malformed name, a lane its subsystem never
-// reads). Warnings are normal during development or in a partial launch (an
-// unread topic, an owner not in this session, a policy lane nobody writes yet).
-// Required coverage additionally rejects a target-consuming subsystem with no
-// producer for a nonempty mode policy. Timers are skipped: their names are
-// labels, not topics. A subsystem absent from target_sources is not
-// lane-checked.
+// malformed name, a lane its subsystem never reads, an `hw` topic written by
+// anything but the roster's bridge or, for `/hw/request/<node>`, <node>'s
+// devices-layer flush). Warnings are normal during development or in a
+// partial launch (an unread topic, an owner not in this session, a policy
+// lane nobody writes yet). Required coverage additionally rejects a
+// target-consuming subsystem with no producer for a nonempty mode policy.
+// Timers are skipped: their names are labels, not topics. A subsystem absent
+// from target_sources is not lane-checked.
 inline std::vector<Diagnostic> LintGraph(
     const std::vector<NodeShape>& nodes,
     const TargetSources& target_sources = {},
@@ -461,6 +530,10 @@ inline std::vector<Diagnostic> LintGraph(
         const auto segments = detail::Segments(source.name);
         const std::string owner{segments[0]};
         const std::string role{segments[1]};
+        if (owner == "hw") {
+          if (auto problem = detail::HardwareWriterProblem(node, source))
+            add(Severity::ERROR, source.name, *problem);
+        }
         if (!detail::OneOf(kReservedOwners, owner)) {
           if (detail::OneOf(kOwnerPublishedRoles, role) && owner != node.name)
             add(Severity::ERROR, source.name,

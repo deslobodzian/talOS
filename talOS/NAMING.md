@@ -42,9 +42,17 @@ Abbreviations are rejected (`tgt`, `cmd`, `req`, `ds`, `dt`, `drive`, `odom`,
 The graph lint also rejects two writers on one topic, more than eight declared
 readers per topic (including observers), a read topic nobody writes (unless an
 endpoint declares it `optional` or `external`), conflicting schemas, message
-sizes or ring layouts, and a target lane whose source is in no mode of that
-subsystem's target policy. A topic nobody reads, a policy lane nobody writes
-yet, or a topic whose owner is not a node in the session, is a warning.
+sizes or ring layouts, a target lane whose source is in no mode of that
+subsystem's target policy, and an `hw` topic written by anything but the
+hardware bridge (the launcher's `hardware_node` roster entry, whatever binary
+`[robot] hardware_node` names and whatever name it describes), except
+`/hw/request/<node>`, which only `<node>`'s devices-layer flush writes (its
+endpoint carries the `hardware_request` attribute; RULES.md 2). Independently
+of the lint, which `--allow-graph-errors` overrides, a node's `publish` and
+`publish_bytes` (C++, or Python through `talOS/node_api`) refuse any topic
+under `/hw/request`, remapped or not, at construction. A topic nobody reads, a
+policy lane nobody writes yet, or a topic whose owner is not a node in the
+session, is a warning.
 
 Examples: `/drivetrain/state`, `/drivetrain/target/teleop` (written by the
 operator interface), `/drivetrain/target/auto`, `/hw/state`,

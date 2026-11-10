@@ -670,7 +670,8 @@ inline bool LoadBundle(LauncherOptions& options, std::string& error) {
 // Roster
 // ---------------------------------------------------------------------------
 
-inline constexpr std::string_view kHardwareNodeName = "hardware_node";
+inline constexpr std::string_view kHardwareNodeName =
+    naming::kHardwareBridgeNode;
 inline constexpr std::string_view kSimGatewayName = "sim_gateway";
 inline constexpr std::string_view kStudioBridgeName = "studio_bridge";
 
@@ -2115,8 +2116,11 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
            "producer"});
     }
     if (described.answered) {
+      // The bridge is known by its roster slot, so a replacement bridge
+      // binary that describes itself by another name still owns `hw`.
       shapes.push_back({described.declared.name, described.declared.target,
-                        described.declared.sources});
+                        described.declared.sources,
+                        spec.name == kHardwareNodeName});
       if (described.declared.name != described.roster_name) {
         probe_findings.push_back(
             {naming::Severity::WARNING, described.roster_name,

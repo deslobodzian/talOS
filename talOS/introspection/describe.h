@@ -175,6 +175,9 @@ inline std::string DescribeToJson(const Description& description) {
     out += source.optional() ? "true" : "false";
     out += ", \"observer\": ";
     out += source.observer() ? "true" : "false";
+    // Only on the devices layer's request publisher; absent means false.
+    if ((source.flags & naming::kSourceFlagHardwareRequest) != 0)
+      out += ", \"hardware_request\": true";
     if (source.kind != event::SourceKind::TIMER) {
       // The hash as a hex string: a JSON number is a double.
       out += ", \"schema\": ";
@@ -346,6 +349,10 @@ class DescribeReader {
       attribute = 0;
       if (Field(entry, "observer", attribute) && Boolean(entry, attribute))
         source.flags |= naming::kSourceFlagObserver;
+      attribute = 0;
+      if (Field(entry, "hardware_request", attribute) &&
+          Boolean(entry, attribute))
+        source.flags |= naming::kSourceFlagHardwareRequest;
 
       // Every topic end names its schema and ring layout: the launcher
       // creates the segment from them.

@@ -412,9 +412,10 @@ std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
   // Input-only nodes publish no request: the bridge reads one only from
   // subsystems that own actuators, and an unread topic is a graph error.
   if (IsOutput(kind) && !impl.has_outputs) {
-    impl.request = detail::NodeAccess::add_publisher(
-        impl.node, hardware::RequestTopic(impl.node.name()), sizeof(Packet),
-        alignof(Packet), schema::Of<Packet>());
+    // hardware::RequestTopic(name), through the one registration the node
+    // layer lets write it (RULES.md 2).
+    impl.request = detail::NodeAccess::add_hardware_request(
+        impl.node, sizeof(Packet), alignof(Packet), schema::Of<Packet>());
     impl.node.after_update([&impl] { impl.Flush(); });
     impl.has_outputs = true;
   }

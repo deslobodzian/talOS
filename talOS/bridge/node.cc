@@ -5,15 +5,22 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <utility>
 
 #include "bridge/topics.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/os/poller.h"
+#include "talOS/introspection/names.h"
 #include "talOS/process/process.h"
 
 namespace talos::hardware {
+
+// The name the stock bridge describes itself by is the roster name the
+// launcher lists it under.
+static_assert(std::string_view{kNodeName} ==
+              introspect::naming::kHardwareBridgeNode);
 
 // /hw/status is read by talos::Node subscribers, which open every slot at
 // 8-byte alignment (talos::kMessageAlignment). ipc::Publisher lays the slot out

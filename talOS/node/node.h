@@ -162,6 +162,9 @@ class Node {
   // Topics. Call in the constructor: registration order is what replay
   // checks a log against. A relative topic ("state", "target/teleop") expands
   // to "/<name>/<topic>"; [subsystems.<name>.remap] can redirect any topic.
+  // publish and publish_bytes throw std::invalid_argument for a topic that
+  // resolves under /hw/request: only the devices layer writes a hardware
+  // request (talOS/devices, RULES.md 2), and its request is never remapped.
   // A node without message callbacks receives messages right before each of
   // its timers (update(), every()); passing `on_message` to any subscription
   // makes the node also drain every 1 ms, so the callback runs promptly.

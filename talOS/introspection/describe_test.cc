@@ -83,14 +83,16 @@ TEST(Describe, RoundTripsEveryField) {
                       .schema = {R"(odd."quoted)", 2}});
   Description written = DescribeManifest(
       R"(od"d)", R"(//example/od\d:node)", manifest, kSlots,
-      {{"/hw/request/drivetrain",
-        naming::kSourceFlagExternal | naming::kSourceFlagOptional},
+      {{"/hw/request/drivetrain", naming::kSourceFlagExternal |
+                                      naming::kSourceFlagOptional |
+                                      naming::kSourceFlagHardwareRequest},
        {"/drivetrain/target", naming::kSourceFlagOptional},
        {"/driver_station/state", naming::kSourceFlagObserver}});
   written.reads_graph = true;
   ASSERT_EQ(written.sources.size(), 5u);
-  ASSERT_EQ(written.sources[3].flags,
-            naming::kSourceFlagExternal | naming::kSourceFlagOptional);
+  ASSERT_EQ(written.sources[3].flags, naming::kSourceFlagExternal |
+                                          naming::kSourceFlagOptional |
+                                          naming::kSourceFlagHardwareRequest);
   ASSERT_EQ(written.sources[3].slots, kSlots);
   ASSERT_EQ(written.sources[1].bfbs, bytes);
 

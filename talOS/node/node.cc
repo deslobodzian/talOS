@@ -96,6 +96,8 @@ struct Node::Impl {
   bool reads_graph = false;
   // A publisher on a target lane (`/<sub>/target/<source>`) is registered.
   bool writes_target_lane = false;
+  // The topic add_hardware_request registered, or empty.
+  std::string hardware_request;
   Duration period{};
   Duration timeout{};
 
@@ -662,6 +664,21 @@ void CheckLayout(const std::string& node, std::string_view topic,
   }
 }
 
+// RULES.md 2: a hardware request leaves only through the devices layer's flush
+// after update() (add_hardware_request), which gates it on robot_enabled and
+// update() and applies the motor limits and position frames. A plain
+// publisher there would skip all of that, so none is opened, however the
+// topic was spelled or remapped, whatever --allow-graph-errors says.
+void RefuseHardwareRequest(const std::string& node, std::string_view topic) {
+  if (introspect::naming::IsHardwareRequest(topic)) {
+    throw std::invalid_argument(
+        node + ": cannot publish '" + std::string{topic} +
+        "': hardware requests are sent only by the devices layer's flush "
+        "after update(); command the node's devices (Motor, DigitalOutput, "
+        "PwmOutput) instead");
+  }
+}
+
 }  // namespace
 
 std::size_t NodeAccess::add_subscription(Node& node, std::string_view topic,
@@ -733,6 +750,7 @@ std::size_t NodeAccess::add_publisher(Node& node, std::string_view topic,
                                       const schema::Identity& schema) {
   Node::Impl& impl = *node.impl_;
   const std::string resolved = impl.ResolveTopic(topic);
+  RefuseHardwareRequest(impl.name, resolved);
   CheckLayout(impl.name, resolved, bytes, alignment);
   const std::uint16_t id =
       impl.loop->register_sender(resolved, static_cast<std::uint32_t>(bytes),
@@ -742,6 +760,28 @@ std::size_t NodeAccess::add_publisher(Node& node, std::string_view topic,
     impl.writes_target_lane = true;
   }
   return impl.publishers.size() - 1;
+}
+
+std::size_t NodeAccess::add_hardware_request(Node& node, std::size_t bytes,
+                                             std::size_t alignment,
+                                             const schema::Identity& schema) {
+  Node::Impl& impl = *node.impl_;
+  if (!impl.hardware_request.empty()) {
+    throw std::logic_error(impl.name + ": hardware request '" +
+                           impl.hardware_request + "' is already registered");
+  }
+  std::string topic = introspect::naming::HardwareRequestTopic(impl.name);
+  CheckLayout(impl.name, topic, bytes, alignment);
+  const std::uint16_t id =
+      impl.loop->register_sender(topic, static_cast<std::uint32_t>(bytes),
+                                 static_cast<std::uint32_t>(alignment), schema);
+  impl.publishers.push_back({id, bytes});
+  impl.hardware_request = std::move(topic);
+  return impl.publishers.size() - 1;
+}
+
+std::string_view NodeAccess::hardware_request(const Node& node) {
+  return node.impl_->hardware_request;
 }
 
 bool NodeAccess::publisher_send(Node& node, std::size_t index, const void* data,
@@ -809,6 +849,7 @@ std::size_t NodeAccess::add_byte_publisher(Node& node, std::string_view topic,
   Node::Impl& impl = *node.impl_;
   impl.CheckOpen("publish_bytes");
   std::string resolved = impl.ResolveTopic(topic);
+  RefuseHardwareRequest(impl.name, resolved);
   CheckLayout(impl.name, resolved, max_bytes, kMessageAlignment);
   if (!is_pow_2(options.slots) || options.slots > MAX_SLOTS) {
     throw std::invalid_argument(impl.name + ": byte topic '" + resolved +
@@ -1093,8 +1134,8 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
   return 0;
 }
 
-// Endpoint attributes of the loop's sources: the optional subscriptions and
-// the observers.
+// Endpoint attributes of the loop's sources: the optional subscriptions, the
+// observers and the devices layer's hardware request.
 std::vector<introspect::EndpointAttribute> Endpoints(const Node& node) {
   std::vector<introspect::EndpointAttribute> attributes;
   for (const std::string_view topic : NodeAccess::optional_topics(node)) {
@@ -1102,6 +1143,11 @@ std::vector<introspect::EndpointAttribute> Endpoints(const Node& node) {
   }
   for (const std::string_view topic : NodeAccess::observer_topics(node)) {
     attributes.push_back({topic, introspect::naming::kSourceFlagObserver});
+  }
+  if (const std::string_view topic = NodeAccess::hardware_request(node);
+      !topic.empty()) {
+    attributes.push_back(
+        {topic, introspect::naming::kSourceFlagHardwareRequest});
   }
   return attributes;
 }

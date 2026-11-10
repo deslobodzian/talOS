@@ -18,10 +18,11 @@
 // Handles are named by their device key in this subsystem's config
 // ([motors.roller] is "roller") and are taken in the constructor.
 //
-// A layer over talos::Node's public API, nothing more: the first handle
-// attaches this node's HardwareLink (node.extension<HardwareLink>()), which
-// subscribes to /hw/state and, on the first output, publishes
-// /hw/request/<name> and flushes after every update():
+// A layer over talos::Node: the first handle attaches this node's
+// HardwareLink (node.extension<HardwareLink>()), which subscribes to /hw/state
+// and, on the first output, publishes /hw/request/<name>
+// (detail::NodeAccess::add_hardware_request, the only publisher the node
+// layer opens on a request topic) and flushes after every update():
 //   - one command per tick once a hardware state has been accepted, echoing
 //     that state's identity words like hardware::NeutralCommand;
 //   - every owned motor neutral unless set during that update(), and all of

@@ -76,6 +76,15 @@ watcher's `dropped` includes skips by design. `--describe` does not carry it.
 It is a bit of the existing `flags` word, needing no layout or version
 change: an older writer leaves it clear, and an older reader ignores it.
 
+`kSourceFlagHardwareRequest` marks the publisher the devices layer's flush
+registers through `detail::NodeAccess::add_hardware_request`, the only way a
+node opens `/hw/request/<node>`. Node code does not declare it: the node layer
+sets it from that registration, and `--describe` writes it as
+`"hardware_request": true` on that endpoint alone (absent means false, so the
+format version is unchanged). `LintGraph` refuses a `/hw/request` writer
+without it. Like `kSourceFlagLatestOnly` it is a bit of the existing `flags`
+word with no registry layout or version change.
+
 
 `publish` checks node and topic names against `names.h` and prints findings to
 stderr without refusing publication. Timer labels are not checked as topics.

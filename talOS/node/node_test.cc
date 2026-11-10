@@ -555,6 +555,45 @@ state = 42
   EXPECT_THROW(sim.add<RelativeWrist>("wrist"), std::invalid_argument);
 }
 
+// RULES.md 2: a hardware request leaves only through the devices layer's
+// flush, which gates it on robot_enabled and update() and applies the motor
+// limits. A node publishing its own /hw/request with a plain publisher, typed
+// or bytes, spelled out or reached by remap, is refused at construction, which
+// --allow-graph-errors cannot override; the C ABI (Python) shares this path.
+struct PlainRequest {
+  explicit PlainRequest(Node& n)
+      : request{n.publish<Count>("/hw/request/plain")} {}
+  Publisher<Count> request;
+};
+struct ByteRequest {
+  explicit ByteRequest(Node& n)
+      : request{n.publish_bytes("/hw/request/bytes", 8)} {}
+  BytePublisher request;
+};
+struct RemappedRequest {
+  explicit RemappedRequest(Node& n) : request{n.publish<Count>("state")} {}
+  Publisher<Count> request;
+};
+
+TEST(Node, APlainPublisherOnAHardwareRequestIsRefused) {
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.plain]
+[subsystems.bytes]
+[subsystems.remapped.remap]
+state = "/hw/request/remapped"
+
+[subsystems.mechanism.motors.unused]
+can_id = 1
+)");
+  EXPECT_THROW(sim.add<PlainRequest>("plain"), std::invalid_argument);
+  EXPECT_THROW(sim.add<ByteRequest>("bytes"), std::invalid_argument);
+  EXPECT_THROW(sim.add<RemappedRequest>("remapped"), std::invalid_argument);
+}
+
 // --- state machines --------------------------------------------------------
 
 enum class Phase { kA, kB, kC };

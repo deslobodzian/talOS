@@ -30,9 +30,13 @@ talOS/rtms        shared-memory topics, on talOS/memory and talOS/ipc
 
 Allowed dependencies:
 
-- Each layer depends only on layers below it. `talOS/node` knows nothing about
-  hardware; `talOS/devices` is built on `Node`'s public API
-  (`extension<T>()`, `after_update()`).
+- Each layer depends only on layers below it. `talOS/node` drives no
+  hardware: it knows the hardware request topic, `/hw/request/<node>`, only to
+  open it for the devices layer's flush and refuse it to every other publisher
+  ([NAMING.md](talOS/NAMING.md#topics)), and reads the hardware config only
+  for timeouts and actuator ownership (its loop tier). `talOS/devices` is
+  built on `Node`'s public API (`extension<T>()`, `after_update()`) and the
+  framework hooks in `detail::NodeAccess`.
 - `talOS/` never depends on a robot, an example or `studio/`.
 - Python reaches talOS only through the C ABI in `talOS/node_api`; it does not
   reimplement a wire format, a memory layout, a state machine, or a C++ node
@@ -260,6 +264,8 @@ handlers.
   and follow [talOS/NAMING.md](talOS/NAMING.md).
 - One writer per topic. Several producers of a target each write their own
   lane, and the consumer picks one (see "Targets").
+- Who may write the `hw` namespace (the bridge, and each node's devices
+  layer for its own request) is in [NAMING.md](talOS/NAMING.md#topics).
 - The launcher refuses to start a graph that breaks a naming or graph rule
   (`--allow-graph-errors` overrides).
 

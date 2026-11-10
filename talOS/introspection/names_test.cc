@@ -207,14 +207,15 @@ TEST(LintGraph, ACorrectGraphProducesNoFindings) {
        // /hw/command is consumed over UDP.
        {Sender("/hw/state"), Sender("/hw/state/driver_station"),
         Sender("/hw/command", 32, kSourceFlagExternal),
-        Watcher("/hw/request/drivetrain")}},
+        Watcher("/hw/request/drivetrain")},
+       /*hardware_bridge=*/true},
       {"drivetrain",
        "//2026-robot/main_processor/drivetrain:node",
        {{SourceKind::TIMER, "swerve", 0, 0},
         Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional),
         Watcher("/drivetrain/state/vision", 32, kSourceFlagOptional),
         Watcher("/hw/state"),
-        Sender("/hw/request/drivetrain"),
+        Sender("/hw/request/drivetrain", 32, kSourceFlagHardwareRequest),
         Sender("/drivetrain/state")}},
       {"driver",
        "//2026-robot/main_processor/driver:node",
@@ -266,6 +267,49 @@ TEST(LintGraph, AReadTopicNobodyWritesIsAnError) {
   EXPECT_NE(Find(diagnostics, Severity::ERROR, "/hw/request/drivetrain"),
             nullptr)
       << Describe(diagnostics);
+}
+
+// RULES.md 2: the roster's bridge writes the hw namespace, and
+// /hw/request/<node> is written only by <node>'s devices-layer flush
+// (kSourceFlagHardwareRequest), the one path that gates a request on
+// robot_enabled and update(). A plain publisher on a node's own request, the
+// flush aimed at another node's, or a node faking the bridge's state are each
+// one error on that topic. The bridge is its roster slot, not its name: a
+// replacement bridge binary may call itself anything, and a node calling
+// itself hardware_node gains nothing.
+TEST(LintGraph, OnlyTheBridgeAndEachNodesFlushWriteTheHwNamespace) {
+  struct Case {
+    const char* writer;
+    bool bridge;
+    SourceShape source;
+    bool error;
+  };
+  for (const auto& [writer, bridge, source, error] : std::vector<Case>{
+           {"drivetrain", false,
+            Sender("/hw/request/drivetrain", 32, kSourceFlagHardwareRequest),
+            false},
+           {"drivetrain", false, Sender("/hw/request/drivetrain"), true},
+           {"rogue", false,
+            Sender("/hw/request/drivetrain", 32, kSourceFlagHardwareRequest),
+            true},
+           {"rogue", false, Sender("/hw/state"), true},
+           {"hardware_node", false, Sender("/hw/state"), true},
+           {"rio_bridge", true, Sender("/hw/state"), false},
+           {"hardware_node", true, Sender("/hw/request/drivetrain"), true},
+       }) {
+    const std::vector<NodeShape> nodes = {
+        {writer, std::string{"//robot/"} + writer + ":node", {source}, bridge},
+        {"reader", "//robot/reader:node", {Watcher(source.name)}},
+    };
+    const auto diagnostics = LintGraph(nodes);
+    const auto label = std::string{writer} + " writing " + source.name;
+    ASSERT_EQ(Errors(diagnostics), error ? 1 : 0)
+        << label << Describe(diagnostics);
+    if (error) {
+      EXPECT_NE(Find(diagnostics, Severity::ERROR, source.name), nullptr)
+          << label << Describe(diagnostics);
+    }
+  }
 }
 
 // One writer per topic keeps the dispatch log replayable. Both writers are
