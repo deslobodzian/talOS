@@ -10,6 +10,18 @@
 #include "gateway.h"
 
 namespace talos::hardware {
+// When an Endpoint last heard its peer, each the now_us of the Tick that
+// received it (0 before any): any valid frame (the bridge probes the clock
+// every 20 ms even with nothing to command), a command frame, and a frame of
+// another protocol version, with that version. Nothing in the gateway reads
+// these; the RoboRIO program reports them to the drive team.
+struct PeerContact {
+  uint64_t frame_us{};
+  uint64_t command_us{};
+  uint64_t version_mismatch_us{};
+  uint16_t mismatched_version{};
+};
+
 // The same endpoint runs under WPILib on RoboRIO and under a future platform
 // adapter on SystemCore. Each Tick has a bounded receive budget.
 class Endpoint {
@@ -60,7 +72,15 @@ class Endpoint {
       protocol::DecodedFrame frame;
       const auto result = peer_.TryReceive(&frame);
       if (result == protocol::UdpStatus::kWouldBlock) break;
+      if (result == protocol::UdpStatus::kDecodeError &&
+          peer_.stats().last_decode_status ==
+              protocol::DecodeStatus::kUnsupportedVersion) {
+        contact_.version_mismatch_us = now_us;
+        contact_.mismatched_version = peer_.stats().last_unsupported_version;
+        continue;
+      }
       if (result != protocol::UdpStatus::kOk) continue;
+      contact_.frame_us = now_us;
 
       if (frame.header.type == protocol::FrameType::kClockProbe &&
           frame.payload_size == 0) {
@@ -133,6 +153,7 @@ class Endpoint {
       if (have_command && frame.header.sequence <= command_sequence) continue;
       Command command;
       if (Decode({frame.payload, frame.payload_size}, command)) {
+        contact_.command_us = now_us;
         newest = command;
         have_command = true;
         command_sequence = frame.header.sequence;
@@ -145,6 +166,7 @@ class Endpoint {
     return Send(protocol::FrameType::kHardwareState, now_us, buffer_.data(),
                 size);
   }
+  const PeerContact& peer_contact() const { return contact_; }
   // Payload-agnostic passthrough for frames this endpoint does not own, so
   // their encoding stays with the caller rather than in the gateway layer.
   protocol::UdpStatus SendFrame(protocol::FrameType type, uint64_t now_us,
@@ -166,6 +188,7 @@ class Endpoint {
   // with one CAN write pass each.
   static constexpr int kReceiveBudget = 64;
   bool send_enabled_{true};
+  PeerContact contact_;
   uint64_t pending_probe_time_us_{};
   Gateway& gateway_;
   protocol::RuntimeUdpPeer peer_;

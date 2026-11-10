@@ -328,12 +328,34 @@ the period) and late ticks (a tick starting more than 1.5 periods after the
 previous, a starved loop however short its work), with that second's longest
 work and interval. `State` has no field for these, so they are RIO-local.
 
+The Driver Station shows green code and communications whether or not the
+companion is talking, so the adapter also reports the companion link
+(`src/main/include/CompanionLink.h`). Each tick the loop copies the
+endpoint's `PeerContact` (when it last received a valid frame, a command
+frame, and a frame of another protocol version, with that version) into
+atomics; a reporter thread at nice 19 reads them every 100 ms and publishes
+SmartDashboard values under `companion/`: `connected` (a valid frame within
+500 ms; the bridge probes the clock every 20 ms even with nothing to
+command), `protocol_ok` (no frame of another version within 500 ms),
+`protocol` and `peer_protocol`, `frame_age_s` and `command_age_s` (-1 before
+any; once a node has hardware state its devices flush a request every tick,
+neutral while disabled, and the bridge forwards the merge at least every
+20 ms, so on a healthy link both stay near 0.02 s), `configured`,
+`commissioned` and `config_id` (hex). It also sends one Driver Station
+message per change: an error when the link is lost, when nothing is heard
+30 s after robot code start, or when a frame of another protocol version
+arrives; a warning when the link comes up, when the mismatch clears, and when
+the link has been up 30 s (and robot code running 30 s) but no command frame
+arrived in the last 500 ms (actuator nodes down or crash-looping), once per
+such stretch. The
+drive team's use of these is the [pre-match checklist](../../docs/PRE_MATCH.md).
+
 Build without deploying:
 
 ```sh
 cd 2026-robot/controller_processor/rio
 ./gradlew buildRio
-./gradlew phoenixTest   # PhoenixBackend desktop simulation regressions
+./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink
 ```
 
 WPILib desktop simulation (`./gradlew simulateNative`) runs the same gateway

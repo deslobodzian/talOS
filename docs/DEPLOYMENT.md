@@ -200,5 +200,7 @@ reader's time namespace, so a node in another would judge live claims dead.
 Deploy it from the same checkout as the main-processor bundle: each side
 rejects frames of another protocol version (currently 6; see
 [DATA_FLOW.md](DATA_FLOW.md)), and `hardware_node` logs both versions once
-when that happens.
-Robot bring-up checklist: [BRINGUP.md](BRINGUP.md).
+when that happens; the RoboRIO reports it to the Driver Station
+(`companion/protocol_ok`, [RoboRIO](../talOS/hardware/README.md#roborio)).
+Robot bring-up checklist: [BRINGUP.md](BRINGUP.md); before each match:
+[PRE_MATCH.md](PRE_MATCH.md).

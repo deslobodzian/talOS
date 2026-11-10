@@ -1,6 +1,7 @@
 # Robot bring-up
 
-For the one-Kraken RoboRIO/Mini test bench, use [BENCH.md](BENCH.md).
+For the one-Kraken RoboRIO/Mini test bench, use [BENCH.md](BENCH.md). Before
+each match, the drive team runs [PRE_MATCH.md](PRE_MATCH.md).
 
 ## Network and Mini build
 
@@ -169,8 +170,10 @@ Pass `--max-range-m` to match a non-default `camera.max_range_m`.
 - [ ] On blocks, use the PIDs in Studio to send `SIGSTOP` then `SIGCONT` to `driver` (chassis) and, separately, `teleop` (mechanism buttons), with measured pauses of **50 ms** and **200 ms**. Pass for **200 ms**: each subsystem goes neutral within **`command_timeout_us` plus a tick**, timing out its own lane. Record the 50 ms behavior without inventing an extra pass threshold; disable between trials and verify safe recovery before re-enabling.
 - [ ] Pause drivetrain with `SIGSTOP` for **80 ms**, then resume with `SIGCONT`. Expected: record hardware response, target receipt/tick timing and recovery; no separate numeric pass threshold is specified for this pause. Keep the spotter ready to disable.
 - [ ] With wheels spinning on blocks, unplug RIO Ethernet. Expected: actuation goes neutral on link loss, stale hardware samples become invalid, and odometry does not run away; `state_age_us` grows and timeout diagnostics identify the affected owners. Disable before reconnecting and verify recovery without unintended motion.
+- [ ] Disabled, stop the stack on the Mini, then start it again. Expected: within a second of the stop the dashboard's `companion/connected` turns false and the Driver Station log shows one `companion lost` error; on restart `companion/connected` returns true with one `companion connected` warning, and no repeated messages while the link holds ([RoboRIO link report](../talOS/hardware/README.md#roborio)).
 - [ ] Measure and record stick-to-drive-request median on the real link; no real-link pass threshold is specified here.
 
 ## Boot operation
 
 - [ ] Disable, stop the manually launched stack, then run `./tools/deploy.sh enable-boot --user <mini account>`. Expected: `/Library/LaunchDaemons/org.talos.robot.plist` is loaded (`sudo launchctl print system/org.talos.robot`), and after a reboot with nobody logged in a single installed stack starts with no command-line addressing override. Recheck configuration, logs and disabled neutrality after restart. For a regression, `./tools/deploy.sh rollback` selects the previous whole bundle; stop/restart the stack and recheck its config hash before use.
+- [ ] Power the robot from cold several times (RoboRIO and Mini together, as at a match) and note on the Driver Station clock when robot code turns green and when `companion/connected` turns true. Expected: the Mini connects within the RoboRIO reporter's 30 s startup grace (`kStartupGraceUs`, `CompanionLink.h`) of robot code start, so no `companion not heard` error appears; record the times. If it routinely takes longer, the error fires on every cold boot: speed up the Mini's boot or raise the grace.

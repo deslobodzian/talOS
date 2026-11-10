@@ -5,11 +5,13 @@
 #include <atomic>
 #include <memory>
 
+#include "CompanionLink.h"
 #include "RioLog.h"
 #include "hardware/endpoint.h"
 
 // The entire RoboRIO program: a fixed-rate loop that reads the Driver Station,
-// runs the hardware gateway, and does nothing else. All control logic lives in
+// runs the hardware gateway, reports the companion link to the drive team
+// (CompanionLink.h), and does nothing else. All control logic lives in
 // talOS processes on the companion computer.
 //
 // This derives from frc::RobotBase rather than frc::TimedRobot on purpose.
@@ -30,6 +32,10 @@ class Robot : public frc::RobotBase {
   std::unique_ptr<talos::hardware::Backend> backend_;
   std::unique_ptr<talos::hardware::Gateway> gateway_;
   std::unique_ptr<talos::hardware::Endpoint> endpoint_;
+  // The loop thread observes; the reporter's own thread publishes. The sink
+  // outlives the reporter that writes to it.
+  std::unique_ptr<talos::rio::CompanionSink> companion_sink_;
+  std::unique_ptr<talos::rio::CompanionReporter> companion_;
 
   // Written by EndCompetition, which WPILib may call from another thread.
   std::atomic<bool> running_{true};

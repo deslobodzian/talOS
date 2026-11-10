@@ -1,12 +1,17 @@
 #include "gateway.h"
 
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1119,6 +1124,68 @@ TEST(Endpoint, OutboundBlackoutPreservesReceiveAndSafetyTicks) {
             protocol::UdpStatus::kOk);
   EXPECT_EQ(frame.header.type, protocol::FrameType::kDriverStation);
   EXPECT_EQ(companion.TryReceive(&frame), protocol::UdpStatus::kWouldBlock);
+}
+
+// The RoboRIO program reports to the drive team whether its companion is
+// talking, and in which protocol. A clock probe alone (all the bridge sends
+// while nothing is commanded) is contact; a frame of another protocol version
+// is recorded with that version, not dropped unseen.
+TEST(Endpoint, PeerContactRecordsProbesCommandsAndForeignProtocolVersions) {
+  SimBackend backend;
+  Gateway gateway{backend, 2004};
+  Endpoint endpoint{gateway};
+  ASSERT_EQ(endpoint.Open("127.0.0.1", 15818, "127.0.0.1", 15819),
+            protocol::UdpStatus::kOk);
+  // A raw socket, since RuntimeUdpPeer only sends this build's version.
+  const int companion = ::socket(AF_INET, SOCK_DGRAM, 0);
+  ASSERT_GE(companion, 0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_port = htons(15819);
+  ASSERT_EQ(
+      ::bind(companion, reinterpret_cast<sockaddr*>(&address), sizeof(address)),
+      0);
+  address.sin_port = htons(15818);
+  const auto send = [&](protocol::FrameType type, uint16_t version,
+                        std::span<const uint8_t> payload) {
+    std::array<uint8_t, protocol::kMaxFrameSize> frame{};
+    const auto size =
+        protocol::EncodeFrame(type, protocol::kFlagNone, 1, 0, payload.data(),
+                              payload.size(), frame.data(), frame.size());
+    frame[8] = static_cast<uint8_t>(version);
+    frame[9] = static_cast<uint8_t>(version >> 8);
+    return ::sendto(companion, frame.data(), size, 0,
+                    reinterpret_cast<const sockaddr*>(&address),
+                    sizeof(address)) == static_cast<ssize_t>(size);
+  };
+
+  ASSERT_TRUE(
+      send(protocol::FrameType::kClockProbe, protocol::kProtocolVersion, {}));
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  ASSERT_EQ(endpoint.Tick(1000, false), protocol::UdpStatus::kOk);
+  EXPECT_EQ(endpoint.peer_contact().frame_us, 1000u);
+  EXPECT_EQ(endpoint.peer_contact().command_us, 0u);
+
+  std::array<uint8_t, kMaxCommandSize> command{};
+  const auto command_size = Encode(Command{}, command);
+  ASSERT_GT(command_size, 0u);
+  ASSERT_TRUE(send(protocol::FrameType::kHardwareCommand,
+                   protocol::kProtocolVersion,
+                   std::span{command}.first(command_size)));
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  ASSERT_EQ(endpoint.Tick(2000, false), protocol::UdpStatus::kOk);
+  EXPECT_EQ(endpoint.peer_contact().command_us, 2000u);
+  EXPECT_EQ(endpoint.peer_contact().version_mismatch_us, 0u);
+
+  const auto foreign = static_cast<uint16_t>(protocol::kProtocolVersion + 1);
+  ASSERT_TRUE(send(protocol::FrameType::kClockProbe, foreign, {}));
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  ASSERT_EQ(endpoint.Tick(3000, false), protocol::UdpStatus::kOk);
+  EXPECT_EQ(endpoint.peer_contact().version_mismatch_us, 3000u);
+  EXPECT_EQ(endpoint.peer_contact().mismatched_version, foreign);
+  EXPECT_EQ(endpoint.peer_contact().frame_us, 2000u);
+  ::close(companion);
 }
 
 TEST(Endpoint, PushesConfigOverUdpAndAcknowledgesIt) {

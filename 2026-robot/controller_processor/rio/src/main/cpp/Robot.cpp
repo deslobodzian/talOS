@@ -105,6 +105,10 @@ void Robot::StartCompetition() {
   std::optional<talos::hardware::Config> unsaved;
   uint64_t saved_id = restoring_id;
   endpoint_ = std::make_unique<talos::hardware::Endpoint>(*gateway_);
+  companion_sink_ = talos::rio::MakeDashboardSink();
+  companion_ =
+      std::make_unique<talos::rio::CompanionReporter>(*companion_sink_);
+  companion_->Start();
   endpoint_->OnConfigured(
       [&unsaved, &saved_id](const talos::hardware::Config& config) {
         if (talos::hardware::ConfigurationId(config) != saved_id)
@@ -231,6 +235,21 @@ void Robot::StartCompetition() {
       gateway_->Tick(now_us, false);
     }
 
+    // What the endpoint last heard, for the drive team's link report; atomic
+    // stores only, the reporter thread does the publishing.
+    {
+      const auto& contact = endpoint_->peer_contact();
+      talos::rio::CompanionContact observed;
+      observed.frame_us = contact.frame_us;
+      observed.command_us = contact.command_us;
+      observed.version_mismatch_us = contact.version_mismatch_us;
+      observed.mismatched_version = contact.mismatched_version;
+      observed.configured = gateway_->configured();
+      observed.commissioned = gateway_->config().commissioned;
+      observed.config_id = gateway_->snapshot().config_id;
+      companion_->Observe(observed);
+    }
+
     if (unsaved && !(gateway_->snapshot().flags & talos::hardware::kEnabled)) {
       if (talos::rio::SaveConfigFile(kConfigPath, *unsaved))
         saved_id = talos::hardware::ConfigurationId(*unsaved);
@@ -283,6 +302,8 @@ void Robot::StartCompetition() {
   // here would be destroyed during static destruction at exit, racing the
   // Phoenix and HAL statics it depends on ("mutex lock failed" aborts). Release
   // the hardware while those libraries are still alive.
+  companion_.reset();
+  companion_sink_.reset();
   endpoint_.reset();
   gateway_.reset();
   backend_.reset();
