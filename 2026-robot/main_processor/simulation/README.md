@@ -193,6 +193,39 @@ bazel test --test_output=errors --runs_per_test=3 \
   //2026-robot/main_processor/simulation:match_rehearsal_test
 ```
 
+## Soak and chaos test
+
+```sh
+bazel test --test_output=errors --test_env=TALOS_SOAK_SECONDS=180 \
+  //2026-robot/main_processor/simulation:soak_test
+```
+
+`soak_test` is tagged `manual` (`bazel test //...` and `:all` skip it); CI's
+soak job runs it for 180 s of teleop on Linux and macOS for `hardening/**` and
+`feature/**` pushes. It launches the same full graph plus the Studio bridge,
+holds teleop for `TALOS_SOAK_SECONDS` (3 to 600; the test refuses more, so a
+run fits Bazel's 900 s `long` timeout) with the stick centred for the first
+0.5 s of every 3 s cycle, and each cycle either `SIGKILL`s a node
+(drivetrain, driver, intake, teleop, telemetry, `hardware_node`) or
+`SIGSTOP`s one for 300 ms (driver, drivetrain, shooter, telemetry,
+`hardware_node`, Studio bridge), in an order shuffled by `TALOS_SOAK_SEED`
+(default 0). From the recording it checks, over the whole run:
+
+- each actuator owner's request gaps stay within its bridge owner timeout
+  except across a fault on that node, and a killed owner sends again within
+  5 s;
+- no request actuates under a disabled Driver Station view, and no drivetrain
+  request actuates without an active teleop target published after its latest
+  crash and within `command_timeout_us + period_us`;
+- a stalled driver neutralizes the drivetrain's requests within that bound, a
+  stalled `hardware_node` within one more period, and a stalled drivetrain is
+  neutralized in `/hw/command` within its owner timeout plus a period;
+- the launcher exits 0, nothing is quarantined, and each node's
+  `restart_count` equals the number of times it was killed.
+
+It prints each owner's request-gap p99 and maximum. Failure artifacts are
+retained in the test's undeclared outputs.
+
 ## Pose-estimator accuracy scenario
 
 ```sh

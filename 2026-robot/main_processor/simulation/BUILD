@@ -114,3 +114,35 @@ py_test(
     ],
     deps = [":accuracy"],
 )
+
+# Minutes of the full graph (Studio bridge included) under SIGKILL/SIGSTOP
+# chaos; see soak_test.py. Manual: `bazel test //...` skips it, and the CI soak
+# job runs it on its own (TALOS_SOAK_SECONDS sets the teleop length).
+py_test(
+    name = "soak_test",
+    size = "large",
+    timeout = "long",
+    srcs = [
+        "soak_test.py",
+        "startup_test.py",
+    ],
+    data = [
+        ":sim_gateway",
+        "//2026-robot/main_processor/configuration:robot_physics_sim.toml",
+        # The bridge refuses to start without its webroot,
+        # [studio] webroot = bazel-bin/studio/dist.
+        "//studio:web_dist",
+        "//studio/bridge:studio_bridge",
+        "//talOS/bridge:hardware_node",
+        "//talOS/launcher",
+        "//talOS/launcher:log_dump",
+    ] + CONFIG_FILES + NODES,
+    imports = ["."],
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "exclusive",
+        "manual",
+        "no_asan",
+        "no_tsan",
+    ],
+)

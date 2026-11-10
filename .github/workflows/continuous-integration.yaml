@@ -127,6 +127,46 @@ jobs:
 
     - *checkout-unchanged
 
+  soak:
+    name: Soak (${{ matrix.os }})
+    # Minutes of the full simulated graph under SIGKILL/SIGSTOP chaos
+    # (2026-robot/main_processor/simulation/README.md); topic-branch pushes
+    # only. The target is `manual`, so `bazel test //...` never runs it.
+    if: >-
+      github.event_name == 'push' &&
+      (startsWith(github.ref, 'refs/heads/hardening/') ||
+       startsWith(github.ref, 'refs/heads/feature/'))
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+
+    - name: Setup bazel-action
+      uses: bazel-contrib/setup-bazel@0.19.0
+      with:
+        bazelisk-cache: true
+        disk-cache: ${{ github.workflow }}-soak
+        repository-cache: true
+
+    - name: Soak
+      run: >-
+        bazel test //2026-robot/main_processor/simulation:soak_test
+        --noshow_progress --test_output=all
+        --test_env=TALOS_SOAK_SECONDS=180
+
+    - name: Keep the failed session
+      if: ${{ failure() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: soak-${{ matrix.os }}
+        path: bazel-testlogs/2026-robot/main_processor/simulation/soak_test/
+        if-no-files-found: ignore
+
   rio-adapter:
     name: RIO adapter (GradleRIO)
     runs-on: ubuntu-latest
