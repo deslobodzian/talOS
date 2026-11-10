@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -566,8 +567,9 @@ TEST(LogBackgroundWriter, IdlePartialChunkReachesFileAndIsNotDuplicated) {
       const auto expected = static_cast<off_t>(sizeof(FileHeader) +
                                                i * (sizeof(RecordHeader) + 16));
       do {
-        ASSERT_EQ(::stat(path.c_str(), &status), 0);
-        if (status.st_size >= expected) break;
+        // The writer thread creates the file, so it may not exist yet.
+        if (::stat(path.c_str(), &status) == 0 && status.st_size >= expected)
+          break;
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
       } while (std::chrono::steady_clock::now() < deadline);
       ASSERT_EQ(status.st_size, expected);
@@ -592,9 +594,10 @@ TEST(LogBackgroundWriter, IdlePartialChunkReachesFileAndIsNotDuplicated) {
   ::unlink(path.c_str());
 }
 
-// Invalidate only this writer's descriptor after start() has written its
-// header. No descriptors may be opened until the writer is destroyed, since it
-// still owns the now-invalid descriptor number.
+// Invalidate only this writer's descriptor once its header is written
+// (after start() and, for a background writer, a flush()). No descriptors
+// may be opened until the writer is destroyed, since it still owns the
+// now-invalid descriptor number.
 bool CloseLogDescriptor(const std::string& path) {
   struct stat target {};
   if (::stat(path.c_str(), &target) != 0) return false;
@@ -615,6 +618,7 @@ TEST(LogDurability, FlushReportsFsyncFailure) {
     LogWriter writer{path, "sync_failure",
                      LogWriter::Options{4096, 2, background}};
     writer.start({}, {});
+    writer.flush();  // A background writer's thread creates the file.
     ASSERT_TRUE(CloseLogDescriptor(path));
     EXPECT_FALSE(writer.failed());
     writer.flush();
@@ -631,6 +635,7 @@ TEST(LogDurability, IdleBackgroundWriterFsyncsWithoutExplicitFlush) {
   {
     LogWriter writer{path, "periodic_sync"};
     writer.start({}, {});
+    writer.flush();  // The writer thread creates the file.
     ASSERT_TRUE(CloseLogDescriptor(path));
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds{3};
@@ -695,6 +700,96 @@ TEST(LogBackgroundWriter, BlockedDiskStopsCaptureWithoutBlockingProducer) {
   EXPECT_EQ(record.payload_bytes, payload_size);
   EXPECT_EQ(record.stored_bytes, payload_size);
   ::unlink(path.c_str());
+}
+
+// The loop thread never waits on its log file: constructing, starting and
+// recording into a background writer whose file cannot be opened yet (a FIFO
+// with no reader blocks open() the way a create can on a busy disk) all
+// return, and once the file opens it holds the header, then every record in
+// order.
+TEST(LogBackgroundWriter, ProducerNeverWaitsForTheLogFile) {
+  const auto path = TempPath("unopened_fifo");
+  ASSERT_EQ(::mkfifo(path.c_str(), 0600), 0);
+  std::optional<LogWriter> writer;
+  std::atomic<bool> recorded{false};
+  std::thread producer{[&] {
+    writer.emplace(path, "unopened", LogWriter::Options{4096, 2, true}, 9);
+    writer->start(MakeManifest(), MonotonicTime::from_nanos(42));
+    for (std::uint64_t i = 1; i <= 3; ++i) {
+      Context context{};
+      context.dispatch_index = i;
+      writer->dispatch(context, MakePayload(16, static_cast<int>(i)));
+    }
+    recorded.store(true);
+  }};
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (!recorded.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  const bool waited = !recorded.load();
+  // The reader lets the open finish, whichever thread is blocked in it.
+  std::vector<std::byte> bytes;
+  std::thread consumer{[&] {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return;
+    std::byte buffer[4096];
+    for (;;) {
+      const auto n = ::read(fd, buffer, sizeof(buffer));
+      if (n <= 0) break;
+      bytes.insert(bytes.end(), buffer, buffer + n);
+    }
+    ::close(fd);
+  }};
+  producer.join();
+  EXPECT_FALSE(waited) << "the producer blocked until the log file opened";
+  writer->flush();
+  EXPECT_FALSE(writer->failed()) << writer->error();
+  writer.reset();  // Closes the FIFO: the reader sees its end.
+  consumer.join();
+  ::unlink(path.c_str());
+
+  const auto copy = TempPath("unopened_copy");
+  {
+    std::ofstream out{copy, std::ios::binary};
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+  }
+  LogReader reader{copy};
+  EXPECT_EQ(reader.session_id(), 9u);
+  EXPECT_EQ(reader.start_time().nanos(), 42);
+  EXPECT_EQ(reader.manifest().size(), MakeManifest().size());
+  LogReader::Record record{};
+  for (std::uint64_t i = 1; i <= 3; ++i) {
+    ASSERT_TRUE(reader.next(record));
+    EXPECT_EQ(record.header.dispatch_index, i);
+  }
+  EXPECT_FALSE(reader.next(record));
+  EXPECT_FALSE(reader.truncated());
+  ::unlink(copy.c_str());
+}
+
+// A log file the writer cannot create does not stop the node: the
+// constructor returns, records are dropped rather than waited on, the
+// failure names the path, and the writer, with no file to sync, still stops
+// after its periodic sync (a writer spinning on it never returns from the
+// destructor).
+TEST(LogBackgroundWriter, UncreatableLogFailsWithoutThrowing) {
+  const std::string path = ::testing::TempDir() + "/talos_log_test_missing_" +
+                           std::to_string(::getpid()) + "/node.tlog";
+  std::optional<LogWriter> writer;
+  ASSERT_NO_THROW(
+      writer.emplace(path, "missing", LogWriter::Options{4096, 2, true}));
+  writer->start(MakeManifest(), {});
+  Context context{};
+  context.dispatch_index = 1;
+  writer->dispatch(context, MakePayload(16, 1));
+  writer->flush();
+  EXPECT_TRUE(writer->failed());
+  EXPECT_NE(writer->error().find(path), std::string::npos) << writer->error();
+  std::this_thread::sleep_for(std::chrono::milliseconds{1200});
+  writer->flush();
+  writer.reset();
 }
 
 TEST(LogCapture, OversizedRecordStopsCaptureAndPreservesPrefix) {
@@ -912,19 +1007,22 @@ TEST(LogCapture, ByteCapStopsCaptureAndLeavesAValidMarkedLog) {
 }
 
 TEST(LogCapture, BudgetTooSmallForHeaderDoesNotGrowOrStopTheNode) {
-  const auto path = TempPath("no_header_budget");
-  {
-    LogWriter writer{path, "tiny", LogWriter::Options{256, 1, false, 1}};
-    writer.start(MakeManifest(), {});
-    writer.dispatch({}, MakePayload(16, 1));
-    writer.flush();
-    EXPECT_TRUE(writer.capped());
-    EXPECT_FALSE(writer.failed()) << writer.error();
+  for (const bool background : {false, true}) {
+    SCOPED_TRACE(background);
+    const auto path = TempPath(background ? "no_header_bg" : "no_header_sync");
+    {
+      LogWriter writer{path, "tiny", LogWriter::Options{256, 1, background, 1}};
+      writer.start(MakeManifest(), {});
+      writer.dispatch({}, MakePayload(16, 1));
+      writer.flush();
+      EXPECT_TRUE(writer.capped());
+      EXPECT_FALSE(writer.failed()) << writer.error();
+    }
+    EXPECT_FALSE(std::ifstream{path}.good());
+    EXPECT_TRUE(std::ifstream{CappedMarkerPath(path)}.good());
+    EXPECT_EQ(FileSize(CappedMarkerPath(path)), 0u);
+    ::unlink(CappedMarkerPath(path).c_str());
   }
-  EXPECT_FALSE(std::ifstream{path}.good());
-  EXPECT_TRUE(std::ifstream{CappedMarkerPath(path)}.good());
-  EXPECT_EQ(FileSize(CappedMarkerPath(path)), 0u);
-  ::unlink(CappedMarkerPath(path).c_str());
 }
 
 TEST(LogCapture, UncappedWriterLeavesNoMarker) {

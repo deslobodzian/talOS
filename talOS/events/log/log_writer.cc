@@ -153,6 +153,9 @@ LogWriter::LogWriter(std::string_view path, std::string_view process_name,
 
   state_->active = &state_->pool.front();
 
+  // A background writer's file is created by its thread (open_file): the
+  // constructor runs on the thread that will run the loop.
+  if (options.background) return;
   state_->fd =
       ::open(std::string{path}.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
@@ -324,7 +327,13 @@ void LogWriter::State::rotate_to(std::uint64_t next) noexcept {
 }
 
 void LogWriter::State::sync(bool durable) noexcept {
-  if (fd < 0) return;
+  if (fd < 0) {
+    // No file (never created, or lost by a failed rotation): nothing to sync,
+    // but the periodic sync is still done, or the writer thread would find
+    // it due on every pass, spin, and never see `stopping`.
+    last_sync = std::chrono::steady_clock::now();
+    return;
+  }
   int result;
   if (durable) {
     result = process::DurableSync(fd);
@@ -491,13 +500,99 @@ void LogWriter::State::drain() noexcept {
     return;
   }
 
+  // Not started: nothing was handed over and no file exists.
+  if (!writer.joinable()) return;
+
   wake.post();
   std::unique_lock lock{mutex};
-  chunk_ready.wait(lock,
-                   [this] { return completed.load() == submitted.load(); });
+  chunk_ready.wait(lock, [this] {
+    return file_ready && completed.load() == submitted.load();
+  });
   // All submitted chunks have reached the descriptor; serialize the sync with
   // the worker's periodic one, which also runs under this mutex.
   sync(/*durable=*/true);
+}
+
+void LogWriter::State::open_file() noexcept {
+  if (prefix.empty()) {
+    mark_capped();
+    return;
+  }
+  fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    // Sticky: append() accepts nothing more, and write_chunk() drops what
+    // was already handed over, so drain() and destruction still return.
+    set_error("LogWriter: open failed for " + path + ": " +
+              std::strerror(errno));
+    return;
+  }
+  try {
+    write_all(prefix.data(), prefix.size());
+  } catch (const std::system_error& e) {
+    set_error(e.what());
+  }
+}
+
+void LogWriter::State::start_writer() {
+  if (writer.joinable()) return;
+
+  State* raw = this;
+  writer = std::thread{[raw] {
+    UseNormalScheduling();
+    // Before any chunk, so the prefix leads the file. Records handed over
+    // meanwhile wait in the pool; the producer never waits for this.
+    raw->open_file();
+    std::unique_lock lock{raw->mutex};
+    raw->file_ready = true;
+    raw->chunk_ready.notify_all();
+
+    for (;;) {
+      // Sleep, without the mutex, until a hand-off (the producer posts when
+      // it finds the writer idle), flush()/destruction (which always post),
+      // or the next periodic sync. A post that lands before the wait is kept
+      // by the semaphore, so none is lost; a stale one only makes the next
+      // wait return at once and the loop check again.
+      const auto sync_at = raw->last_sync + std::chrono::seconds{1};
+      lock.unlock();
+      raw->writer_idle.store(true, std::memory_order_seq_cst);
+      if (raw->completed.load() == raw->submitted.load() &&
+          !raw->stopping.load()) {
+        raw->wake.wait_until(sync_at);
+      }
+      raw->writer_idle.store(false, std::memory_order_seq_cst);
+      lock.lock();
+
+      const bool sync_due = std::chrono::steady_clock::now() - raw->last_sync >=
+                            std::chrono::seconds{1};
+      const auto next = raw->completed.load(std::memory_order_relaxed);
+      const bool submitted =
+          next != raw->submitted.load(std::memory_order_acquire);
+      if (!submitted && !sync_due) {
+        if (raw->stopping) {
+          return;
+        }
+        continue;
+      }
+
+      Chunk* chunk = &raw->pool[next % raw->pool.size()];
+
+      // The mutex is never held across the write, so a slow disk cannot make
+      // the loop thread's hand-off block behind it.
+      lock.unlock();
+      raw->write_chunk(*chunk);
+      lock.lock();
+
+      if (submitted) {
+        chunk->committed.store(0, std::memory_order_relaxed);
+        chunk->written = 0;
+        raw->completed.store(next + 1, std::memory_order_release);
+        raw->chunk_ready.notify_all();
+      }
+      if (sync_due) {
+        raw->sync(/*durable=*/false);
+      }
+    }
+  }};
 }
 
 void LogWriter::State::stop_writer() noexcept {
@@ -569,8 +664,14 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
       sizeof(header) + manifest_bytes.size() + schemas.size();
   if (state.options.max_bytes != 0 && prefix_bytes > state.options.max_bytes) {
     // No valid log fits. Do not spend the budget on an unreadable prefix,
-    // and do not let a policy limit stop the node itself.
+    // and do not let a policy limit stop the node itself. The thread that
+    // would have created the file creates the marker instead: this one when
+    // synchronous, else the writer thread (open_file, with no prefix).
     state.capture_error.store(State::CaptureError::BYTE_CAP);
+    if (state.options.background) {
+      state.start_writer();
+      return;
+    }
     ::close(state.fd);
     state.fd = -1;
     ::unlink(state.path.c_str());
@@ -598,66 +699,14 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
     }
   }
 
-  // Written inline, before the writer thread exists, so the header can never
-  // race a buffered chunk to the front of the file.
-  state.write_all(state.prefix.data(), state.prefix.size());
-
-  if (!state.options.background || state.writer.joinable()) {
+  if (state.options.background) {
+    // The writer thread opens the file and writes the prefix: this thread
+    // runs the loop and must not wait on the disk.
+    state.start_writer();
     return;
   }
-
-  State* raw = state_.get();
-  state.writer = std::thread{[raw] {
-    UseNormalScheduling();
-    std::unique_lock lock{raw->mutex};
-
-    for (;;) {
-      // Sleep, without the mutex, until a hand-off (the producer posts when
-      // it finds the writer idle), flush()/destruction (which always post),
-      // or the next periodic sync. A post that lands before the wait is kept
-      // by the semaphore, so none is lost; a stale one only makes the next
-      // wait return at once and the loop check again.
-      const auto sync_at = raw->last_sync + std::chrono::seconds{1};
-      lock.unlock();
-      raw->writer_idle.store(true, std::memory_order_seq_cst);
-      if (raw->completed.load() == raw->submitted.load() &&
-          !raw->stopping.load()) {
-        raw->wake.wait_until(sync_at);
-      }
-      raw->writer_idle.store(false, std::memory_order_seq_cst);
-      lock.lock();
-
-      const bool sync_due = std::chrono::steady_clock::now() - raw->last_sync >=
-                            std::chrono::seconds{1};
-      const auto next = raw->completed.load(std::memory_order_relaxed);
-      const bool submitted =
-          next != raw->submitted.load(std::memory_order_acquire);
-      if (!submitted && !sync_due) {
-        if (raw->stopping) {
-          return;
-        }
-        continue;
-      }
-
-      Chunk* chunk = &raw->pool[next % raw->pool.size()];
-
-      // The mutex is never held across the write, so a slow disk cannot make
-      // the loop thread's hand-off block behind it.
-      lock.unlock();
-      raw->write_chunk(*chunk);
-      lock.lock();
-
-      if (submitted) {
-        chunk->committed.store(0, std::memory_order_relaxed);
-        chunk->written = 0;
-        raw->completed.store(next + 1, std::memory_order_release);
-        raw->chunk_ready.notify_all();
-      }
-      if (sync_due) {
-        raw->sync(/*durable=*/false);
-      }
-    }
-  }};
+  // Synchronous: the constructor opened the file, and the prefix leads it.
+  state.write_all(state.prefix.data(), state.prefix.size());
 }
 
 void LogWriter::dispatch(const Context& context,

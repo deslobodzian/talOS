@@ -276,7 +276,10 @@ summary also names (`exit=-1 (signal 2 SIGINT)`); Studio's session panel
 shows it in the exit column and marks the node *killed by signal*.
 
 A run whose event log stops early says so in its registry row while it runs
-(see [event log state](../introspection/README.md#event-log-state)). The
+(see [event log state](../introspection/README.md#event-log-state)). A node
+creates its log on the writer thread once its loop starts, never on the loop
+thread, so one whose log cannot be created (a missing or unwritable session
+directory) keeps running with its row flagged, and exits 1 when stopped. The
 launcher prints one line per member and kind, and marks the member in the live
 manifest: `recorder_failed` for a failed log, `log_capped` for one whose byte
 share cost it records (its oldest segment deleted, or, with a share too small
@@ -341,14 +344,11 @@ less its offset (`run()`) and first `/hw/request/drivetrain` send:
 | SIGKILL → launcher reaps the exit | not yet measured | the SIGCHLD wakeup of the supervision loop |
 | reap → `fork` of the restart | not yet measured | restart bookkeeping; the manifest is written off the loop |
 | `fork` → first constructor | 1.2 (1.1–1.2) | group and guardian setup, exec, dynamic loading |
-| first constructor → event-loop origin | 0.4 (0.4–0.5) | flags, event-log file |
+| first constructor → event-loop origin | 0.4 (0.4–0.5) | flags; the event-log file is created on the log's writer thread, not here |
 | origin → `run()` | 1.5 (1.4–1.6) | robot config parse, topic attach |
 | `run()` → first tick | 5.0 | one `period_us` |
 | first tick → first `/hw/request/drivetrain` | 0.0 | that tick's flush, which needs a `/hw/state` received since the node attached |
 | **total** | not yet measured | |
-
-While eight other processes rewrote and synced 256 MiB files on the same disk,
-first constructor → origin took up to 29 ms.
 
 `restart_latency` repeats the `.tlog` part of this measurement on any host:
 SIGKILL → origin (the first four rows together), origin → `run()`, `run()` →
@@ -469,7 +469,9 @@ earlier runs' oldest log files (never the newest file of the run that just
 ended) and marks those runs `log_capped`. Older sessions are retained within the other half. A directory named
 by a session id that holds nothing, or only what a launch writes before it
 starts its nodes (`graph.json`, `declared_graph.json`, the `.tmp` of an
-interrupted write, empty `.tlog` files), is a launch that recorded nothing:
+interrupted write, and the empty `.tlog` a node leaves when it dies between
+its log writer creating the file and writing the header), is a launch that
+recorded nothing:
 `--describe-only`, a refused graph, or a launch that failed or died early. It
 never counts against `log_keep_sessions` or the byte budget, and it is removed
 once another session directory is newer: one newer than every other (a

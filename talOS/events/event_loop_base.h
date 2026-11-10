@@ -335,7 +335,8 @@ class EventLoopBase {
     EventLoopBase& loop_;
   };
 
-  // Freezes registration and opens the log. Every loop calls this once, first
+  // Freezes registration and starts the recorder (a background LogWriter
+  // opens its file on its own thread). Every loop calls this once, first
   // thing in run(), after set_start_time().
   void begin_run() {
     if (registration_closed_) {

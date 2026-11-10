@@ -46,6 +46,14 @@ namespace talos::event::log {
 // capture stops permanently and failed() becomes true. Previously accepted
 // chunks are drained, preserving a prefix without holes.
 //
+// With the background writer the thread that runs the loop never waits on
+// the log file: the writer thread creates `path` and writes the header,
+// manifest and schema block before the first chunk, so nothing exists at
+// `path` until start() and the writer have run (creating a file on a busy
+// disk can take hundreds of milliseconds). A file it cannot create is a
+// sticky failure like any other disk error: failed() names the path, and the
+// records already handed over are dropped, so flush() and destruction return.
+//
 // A byte cap (Options::max_bytes) keeps the newest records: the log is
 // written as up to kLogSegments segments, each a complete log of its own
 // (header, manifest and schema block, then whole records). The segment being
@@ -84,7 +92,7 @@ struct LogWriterOptions {
   // knows its head is missing. Where n < 2 the log cannot rotate: a record
   // that would cross the cap stops capture for good (capped()), keeping
   // every whole record before it. If the header/manifest cannot fit, no log
-  // is created; only the empty cap marker remains.
+  // file is left; only the empty cap marker is created.
   std::uint64_t max_bytes{0};
 };
 
@@ -105,9 +113,10 @@ class LogWriter {
 
   static constexpr std::size_t kDefaultBufferBytes = DEFAULT_CHUNK_BYTES;
 
-  // Opens (creating or truncating) `path` for writing. `process_name` is
-  // copied into the file header, truncated to MAX_SOURCE_NAME characters.
-  // Throws std::system_error if the file cannot be opened.
+  // A log written to `path`, created or truncated. `process_name` is copied
+  // into the file header, truncated to MAX_SOURCE_NAME characters. Without
+  // Options::background this opens the file and throws std::system_error if
+  // it cannot; with it, the writer thread opens it once start() runs.
   explicit LogWriter(std::string_view path, std::string_view process_name,
                      Options options = Options{}, std::uint64_t session_id = 0);
 
@@ -122,8 +131,11 @@ class LogWriter {
   LogWriter(LogWriter&& other) noexcept = default;
   LogWriter& operator=(LogWriter&& other) noexcept = default;
 
-  // Writes the file header and manifest block, then starts the writer thread.
-  // Throws std::system_error if the write fails.
+  // Builds the file header, manifest and schema block. Without
+  // Options::background it writes them and throws std::system_error if the
+  // write fails; with it, it starts the writer thread, which creates the file
+  // and writes them before any record, and reports a failure through
+  // failed().
   void start(const Manifest& manifest, MonotonicTime start_time);
 
   // MESSAGE dispatches preserve the producer's publish time independently of
@@ -217,6 +229,10 @@ class LogWriter {
     void sync(bool durable) noexcept;
     void mark_capped() noexcept;
     void drain() noexcept;
+    // Writer thread, first: creates `path` and writes the prefix, or (with
+    // no prefix: start() found no room for one) only the cap marker.
+    void open_file() noexcept;
+    void start_writer();
     void stop_writer() noexcept;
     void set_error(std::string message) noexcept;
 
@@ -261,6 +277,9 @@ class LogWriter {
 
     mutable std::mutex mutex;
     std::condition_variable chunk_ready;
+    // Under `mutex`: the writer thread has finished open_file(), so drain()
+    // syncs the file it made, not one still being created.
+    bool file_ready{false};
     std::thread writer;
     std::atomic<bool> stopping{false};
     std::atomic<bool> failed{false};  // Disk failure, independent of capture.
