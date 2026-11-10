@@ -53,6 +53,23 @@ on Linux, or under the Mach time-constraint policy for its period on macOS
 the OS refuses (no privilege, a memlock limit) the node prints one line to
 stderr and runs anyway. `TALOS_REALTIME=0` in the environment turns this off.
 
+### Python garbage collection
+
+`talos.run` (a `talos_py_node` binary, including under `--sim` and
+`--describe`) calls `gc.collect()` then `gc.freeze()` once the node object is
+built, before its loop runs: everything alive after construction (modules,
+config, the node and what its constructor built) moves to the collector's
+permanent generation, and later collections scan only objects allocated
+since. For the pose estimator (about 33 000 tracked objects after
+construction with the Kalman backend, 53 000 with the factor graph) a full
+collection drops from 1.9–2.5 ms (4.9 ms for the first in a run) to under
+15 µs, and the longest middle-generation collection from about 0.25 ms to
+0.05 ms (desktop Ryzen 9 7950X3D, CPython 3.11, `update_benchmark`).
+Young-generation collections still run, about 20 µs each. A reference cycle
+built before the freeze and dropped afterwards is never collected, so drop
+construction-time scratch inside the constructor. `talos.testing.Sim` does
+not freeze.
+
 ## Hardware
 
 Handles are named by their device key in the subsystem config

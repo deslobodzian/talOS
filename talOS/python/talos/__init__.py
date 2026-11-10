@@ -24,6 +24,7 @@ message fields such as sample_time_ns carry).
 
 import ctypes
 import enum
+import gc
 import importlib.util
 import math
 import os
@@ -336,12 +337,13 @@ class StateMachine(_OnNode):
         return bool(_abi.ok(lib.talos_state_machine_just_entered(
             self._node, self._index)))
 
-def _factory(cls, built, owner=None):
+def _factory(cls, built, owner=None, freeze=False):
     """A C factory: builds cls on a new Node and installs its update().
 
     Appends (node, object) to `built`, which must outlive the C++ node: the
     Node holds the C callbacks. `owner` is what owns the native node (a
-    talos.testing.Sim), kept alive by the Node.
+    talos.testing.Sim), kept alive by the Node. `freeze` calls
+    _freeze_construction() once the object is built.
     """
     def build(handle, _):
         node = Node(handle, owner)
@@ -353,21 +355,36 @@ def _factory(cls, built, owner=None):
                 node._keep(_abi.CALLBACK(_abi.callback(lambda _: update()))),
                 None))
         built.append((node, obj))
+        if freeze:
+            _freeze_construction()
     return _abi.FACTORY(_abi.callback(build))
+
+
+def _freeze_construction():
+    """Collects construction's garbage, then moves every surviving object
+    (modules, config, the node and what its constructor built) to the
+    collector's permanent generation, so no later collection rescans them.
+    A cycle created before this call and dropped after it is never freed.
+    """
+    gc.collect()
+    gc.freeze()
 
 
 def run(cls, node_name, node_target, argv=None):
     """Runs cls as this process's node (what talos_py_node's main calls).
 
     Same flags as a C++ node: --sim --describe --log --session-id --config
-    --replay --duration-s. Returns the exit code.
+    --replay --duration-s. Freezes the garbage collector's heap once the node
+    is built, before its loop runs (_freeze_construction). Returns the exit
+    code.
     """
     argv = sys.argv if argv is None else argv
     c_argv = (ctypes.c_char_p * (len(argv) + 1))(
         *[_abi.encode(a) for a in argv], None)
     built = []
     code = lib.talos_run(len(argv), c_argv, _abi.encode(node_name),
-                         _abi.encode(node_target), _factory(cls, built), None)
+                         _abi.encode(node_target),
+                         _factory(cls, built, freeze=True), None)
     if code != 0 and _abi.pending() is not None:
         _abi.fail()
     return code

@@ -150,10 +150,13 @@ final estimate is not valid and localized, i.e. the workload was not the
 one described; it never judges timing. `update_benchmark_test` runs it for
 3 s per backend.
 
-It measures `update()` alone in one process. It does not measure the node
-loop's dispatch or lateness, real-time scheduling, other nodes competing for
-the CPU, the production process's garbage-collection pattern (collections
-in this process do land in the measured ticks), or real camera timing.
+It measures `update()` alone in one process. Like `talos.run`, it freezes the
+garbage collector's heap once the estimator is built (see
+[Node API: Python garbage collection](../../../docs/NODE_DEVELOPMENT_GUIDE.md#python-garbage-collection)).
+It does not measure the node loop's dispatch or lateness, real-time
+scheduling, other nodes competing for the CPU, the production process's
+allocation pattern (the harness's allocations also trigger collections, which
+land in the measured ticks), or real camera timing.
 
 ## Tests
 

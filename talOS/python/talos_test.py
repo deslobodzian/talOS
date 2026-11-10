@@ -132,6 +132,35 @@ class TwoNodesTest(unittest.TestCase):
         self.assertAlmostEqual(sim.now, 0.055)
 
 
+class RunTest(unittest.TestCase):
+    def test_run_freezes_the_built_node_out_of_collection(self):
+        # gc.freeze is process-wide: run in a child process.
+        probe = textwrap.dedent("""
+            import gc, sys, tempfile
+            import talos
+
+            built = []
+
+            class Probe:
+                def __init__(self, node):
+                    assert gc.get_freeze_count() == 0
+                    built.append(self)
+
+            with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
+                config.write(sys.argv[1])
+                config.flush()
+                code = talos.run(Probe, "planner", "//talOS/python:probe",
+                                 ["probe", "--describe", "--config",
+                                  config.name])
+            assert code == 0, code
+            assert gc.get_freeze_count() > 0
+            assert not any(o is built[0] for o in gc.get_objects())
+        """)
+        result = subprocess.run([sys.executable, "-c", probe, ROBOT_TOML],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class BorrowedLifetimeTest(unittest.TestCase):
     def test_wrappers_keep_sim_alive_until_native_teardown(self):
         # A bad lifetime implementation may segfault: isolate the probe and

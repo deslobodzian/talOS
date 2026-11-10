@@ -211,6 +211,7 @@ def run(backend, seconds, estimator_class):
 def _run(sim, settings, drivetrain_period_us, seconds, backend,
          estimator_class):
     node = sim.add(timed(estimator_class), "pose_estimator")
+    talos._freeze_construction()  # what talos.run does once the node is built
     hw = SimHardware(sim)
     hw.enable(False)
     # Disabled-first Driver Station: the configured seed is trusted, so every
