@@ -17,6 +17,8 @@ import uuid
 
 from python.runfiles import runfiles
 
+import autonomous_progress
+
 
 CONFIG = "2026-robot/main_processor/configuration/robot_physics_sim.toml"
 ESTIMATE = "/pose_estimator/state"
@@ -545,8 +547,11 @@ def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
                     "--duration-s", str(seconds + 1)]
             for arg in gateway_args:
                 args.extend(["--sim-gateway-arg", arg])
-            run_launcher(launcher, args, cwd, env, destination / f"{name}.txt",
-                         seconds + 90)
+            try:
+                run_launcher(launcher, args, cwd, env,
+                             destination / f"{name}.txt", seconds + 90)
+            finally:
+                autonomous_progress.remove(env["TALOS_SHM_NAMESPACE"])
             session = session_directory(destination / name)
             cameras = [session / f"{camera}.tlog" for camera in CAMERAS]
             drivetrain = session / "drivetrain.tlog"

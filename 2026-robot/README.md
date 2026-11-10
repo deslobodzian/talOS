@@ -38,7 +38,8 @@ presses; a held POV at startup/reconnect is not a press. The configured order is
 `preload`, `none`, `shoot_only`, `taxi` (default `preload`). Selection survives a
 node restart within the launcher session; a new session or corrupt selection
 file uses the default. Studio is read-only: `autonomous/state/routine_index`
-reports the selected index while disabled and the latched index during auto.
+reports the selected index, or the latched one from the routine's arm until a
+new match (below); a selection made meanwhile applies from that match.
 Enabled inputs never change it. Tune the list, default, POV binding and
 `routine.<name>` action parameters in `subsystems/autonomous.toml`.
 
@@ -56,8 +57,42 @@ feedback inhibits collection. Reaching the waypoint releases all lanes until mod
 exit. Feed counts only commanded feeding time and continuously requires matching
 fresh shooter readiness. Spinup/feed share a wall-clock deadline; drive has its
 own, neither extended by outages. Disable, teleop or DS loss releases all lanes.
-A DS outage resumes the same generation without re-firing; a restarted node
-starts INHIBITED and must observe non-auto/disabled before a new auto can arm.
+
+A routine runs once per match. A DS outage, or a disable and re-enable in
+autonomous within the same match (a new mode generation), resumes the step it
+was on, so no action fires twice in a match: a resumed feed runs only its
+remaining time, a resumed drive re-plans from the current pose, and both
+deadlines keep counting through the pause. Leaving enabled autonomous counts as
+another match, and resets the routine to its first step, once any of these
+holds after the routine armed: the DS, attached, reports teleop or test (FMS
+runs teleop after auto); the FMS match type, number, replay or event differs
+from the routine's, both present (a routine armed before match data arrives
+adopts the first it sees, and missing data never counts); or
+`autonomous_period_us` (20 s, the game's autonomous period) has passed.
+
+The same holds across a restart of the node or of the launcher. The node
+records the armed routine's progress (match, arm time, step, feed time fed,
+spinup and drive start) in the shared-memory object `/autonomous/progress`
+(named through `ShmObjectName`, so `/autonomous.progress` in production). It
+is not a topic, so the launcher, which unlinks only declared topics' segments,
+leaves it in place; it lasts until reboot, whatever `--output-dir` a new
+session uses, and storing into it never waits on a disk. Times are on the
+boot's monotonic clock (Linux `CLOCK_MONOTONIC`, macOS `mach_continuous_time`)
+and the record names its boot (Linux `boot_id`, macOS `kern.bootsessionuuid`).
+A restarted node compares the record with its first Driver Station packet by
+the rules above: from the same match, it resumes the recorded step as after a
+disable; with no record, or one from another match or boot, it starts
+INHIBITED and must observe non-auto/disabled before a new auto can arm. While
+feeding, the record counts each commanded tick as fed for `command_timeout_us`,
+since a killed node's last feed lane drives the intake until it goes stale; a
+restarted feed therefore runs only what remains of the 500 ms even in that
+worst case, and may stop up to that much short of it. A record it cannot read
+(both of its two checksummed copies damaged, or naming routines the current
+list lacks) holds the routine in HOLD until another match: it may hide a shot
+already fired. Without a session directory (tests, `--describe`, `--replay`)
+nothing is recorded; sim harnesses that run under their own
+`TALOS_SHM_NAMESPACE` remove the record when done
+(`main_processor/simulation/autonomous_progress.py`).
 
 Teleop joystick 0: hold button **1** for the 60 rps flywheel, **2** to collect
 at +30 rps (stops at the intake beam), and **3** to feed at -20 rps past the
@@ -94,11 +129,17 @@ From the repository root:
 ```sh
 ./sim.sh --sim-gateway --no-studio   # nodes + lightweight simulator
 ./sim.sh                             # WPILib simulation (needs WPILib) + Studio
-./sim.sh --headless                  # WPILib without its GUI
+./sim.sh --headless                  # WPILib without its GUI, teleop enabled
+./sim.sh --headless --no-studio --mode-schedule teleop:60,auto:20,disabled:5
+                                     # scripted Driver Station modes
 python3 tools/test_drivetrain.py     # drivetrain smoke test with log replay
 ```
 
 With the WPILib simulation, its GUI is the Driver Station: enable Teleoperated.
+Headless, the RoboRIO program's desktop-only stand-in
+(`controller_processor/rio/src/main/include/SimDriverStation.h`) enables teleop
+once the gateway is configured, or runs `--mode-schedule` phases from that
+moment (the lightweight simulator's schedule runs from its start).
 Logs land in `/tmp/talos_logs/<session-id>/`. Deploying:
 [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md).
 

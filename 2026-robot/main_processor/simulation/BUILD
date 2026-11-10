@@ -38,6 +38,13 @@ cc_test(
     ],
 )
 
+# Removes the autonomous progress record a namespaced sim session leaves.
+py_library(
+    name = "autonomous_progress",
+    srcs = ["autonomous_progress.py"],
+    imports = ["."],
+)
+
 # Startup and a bounded scripted match with link/device faults.
 py_test(
     name = "startup_test",
@@ -57,6 +64,7 @@ py_test(
         "no_asan",
         "no_tsan",
     ],
+    deps = [":autonomous_progress"],
 )
 
 # Full graph match rehearsal, with an intentional critical-node restart.
@@ -81,6 +89,7 @@ py_test(
         "no_asan",
         "no_tsan",
     ],
+    deps = [":autonomous_progress"],
 )
 
 py_library(
@@ -94,7 +103,10 @@ py_library(
         "//talOS/launcher:log_dump",
     ] + CONFIG_FILES + NODES,
     imports = ["."],
-    deps = ["@rules_python//python/runfiles"],
+    deps = [
+        ":autonomous_progress",
+        "@rules_python//python/runfiles",
+    ],
 )
 
 py_binary(
@@ -145,4 +157,5 @@ py_test(
         "no_asan",
         "no_tsan",
     ],
+    deps = [":autonomous_progress"],
 )

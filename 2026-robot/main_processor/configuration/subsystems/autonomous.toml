@@ -26,6 +26,10 @@ field_width_m = 8.069
 # Feedback velocity per metre/radian of pose error.
 xy_feedback_per_m_mps = 1.0
 yaw_feedback_per_rad_radps = 1.0
+# The game's autonomous period. A re-enable in autonomous this long after the
+# routine armed belongs to another match and starts it over; sooner, in the
+# same match, it resumes (2026-robot/README.md).
+autonomous_period_us = 20000000
 
 [subsystem.routine.preload]
 shooter_velocity_rps = 60.0

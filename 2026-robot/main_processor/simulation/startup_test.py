@@ -16,6 +16,8 @@ from pathlib import Path
 import unittest
 import uuid
 
+import autonomous_progress
+
 
 def workspace():
     return Path(os.environ["TEST_SRCDIR"]) / os.environ.get(
@@ -450,6 +452,7 @@ class FullStackSimulation(unittest.TestCase):
                     except ProcessLookupError:
                         pass
                 launcher.wait(timeout=5)
+            autonomous_progress.remove(env["TALOS_SHM_NAMESPACE"])
             if success:
                 shutil.rmtree(tmp)
             else:

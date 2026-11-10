@@ -37,6 +37,7 @@ import time
 import unittest
 import uuid
 
+import autonomous_progress
 import startup_test as support
 
 CYCLE_S = 3.0
@@ -360,6 +361,7 @@ class Soak(unittest.TestCase):
                         pass
                 launcher.wait(timeout=10)
             (tmp / "bazel-bin").unlink(missing_ok=True)
+            autonomous_progress.remove(env["TALOS_SHM_NAMESPACE"])
             if success:
                 shutil.rmtree(tmp)
             else:

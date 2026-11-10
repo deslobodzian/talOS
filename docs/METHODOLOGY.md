@@ -252,14 +252,18 @@ Rules:
   `input_replay_test`, `replay_inputs_test`]**
 - **Restart safety.** A node can be restarted mid-match (`max_restarts`). Its
   initial state must be safe with every input present. One-shot autonomous
+  resumes its predecessor's recorded progress in the same match; otherwise it
   starts `INHIBITED` and arms only after this process observes a fresh disabled
-  or non-autonomous mode. Same-generation Driver Station outages release lanes
-  without restarting routine progress; new generations reset the routine.
+  or non-autonomous mode, and an unreadable record holds it in `HOLD`.
+  Driver Station outages and new generations within one match release lanes
+  without restarting routine progress; only another match resets the routine
+  (rule in `2026-robot/README.md`).
   Shooter readiness continuously gates feeding, whose accumulated duration
-  excludes released intervals. The preload deadline runs from the generation's
-  first `SPINUP` entry, including feed and readiness retries; `DRIVE` deadlines
-  include all outages. Autonomous field driving requires a fresh, valid,
-  localized pose; pose outages pause trajectory progress but not the deadline.
+  excludes released intervals. The preload deadline runs from the routine's
+  first `SPINUP` entry, including feed and readiness retries; it and the
+  `DRIVE` deadline include all outages and pauses. Autonomous field driving
+  requires a fresh, valid, localized pose; pose outages pause trajectory
+  progress but not the deadline.
   **[enforced: `autonomous` `node_test`]**
 - Config errors throw in the constructor, so the launcher reports them before
   the robot is enabled. **[review]**
@@ -270,7 +274,7 @@ Rules:
 | Rule | Budget | Status |
 |---|---|---|
 | `update()` p99 wall time | ≤ 10 % of `period_us` | [review]; measure callback entry-to-exit duration in a dedicated benchmark, using a monotonic wall clock, and compute the percentile from those durations. Registry / Studio `max_latency` measures maximum dispatch-start lateness, not callback duration or p99. Benchmark clocks must not replace `node.now()` in control logic. |
-| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | [review]; the drivetrain's `UpdateDoesNotAllocate` counts process-wide allocations (macOS only; §13) |
+| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | [review]; the drivetrain's `UpdateDoesNotAllocate` counts process-wide allocations (macOS only, and skipped under ASan/TSan, whose allocator bypasses the probe; §13) |
 | Python nodes | cost memory (≈ 30 MB) and add GC/interpreter jitter: hard 5 ms actuator loops belong in C++, while 20 ms supervisory/estimator nodes monitor age and watchdog timeouts | [review] |
 | Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [review]; producer → consumer is one hop (`Target` resolves lanes in the consumer) |
 | Per-tick work | O(devices), never O(history); bound every loop | [review] |

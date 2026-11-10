@@ -1,14 +1,18 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <numbers>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "autonomous/autonomous_message_generated.h"
+#include "autonomous/progress.h"
 #include "autonomous/selection.h"
 #include "autonomous/topics.h"
 #include "autonomous/trajectory.h"
@@ -18,6 +22,7 @@
 #include "intake/topics.h"
 #include "shooter/shooter_message_generated.h"
 #include "shooter/topics.h"
+#include "talOS/configuration/config_parser.h"
 #include "talOS/devices/devices.h"
 #include "talOS/node/node.h"
 
@@ -52,6 +57,9 @@ class Autonomous {
             node.param<int>("feed_duration_us", 500000)}},
         spinup_timeout_s_{PositiveSeconds(node, "spinup_timeout_s", 2.0)},
         drive_timeout_s_{PositiveSeconds(node, "drive_timeout_s", 10.0)},
+        autonomous_period_{std::chrono::microseconds{
+            node.param<int>("autonomous_period_us", 20000000)}},
+        command_timeout_{CommandTimeout(node)},
         routines_{LoadRoutines(node)},
         selection_{node.session_dir(), RoutineSignature(routines_),
                    static_cast<unsigned>(routines_.size()),
@@ -61,6 +69,7 @@ class Autonomous {
         selection_next_{node.param("selection_next_direction_index", 2)},
         selection_previous_{
             node.param("selection_previous_direction_index", 6)},
+        progress_{node.session_dir()},
         pose_{node.subscribe<geometry::PoseEstimate>("/pose_estimator/state")},
         shooter_state_{
             node.subscribe<shooter::ShooterState>(shooter::topics::kState)},
@@ -76,6 +85,10 @@ class Autonomous {
       throw std::invalid_argument(
           "autonomous: feed_duration_us must be positive");
     }
+    if (autonomous_period_ <= talos::Duration::zero()) {
+      throw std::invalid_argument(
+          "autonomous: autonomous_period_us must be positive");
+    }
     if (selection_port_ < 0 || selection_port_ > 5 || selection_pov_ < 0 ||
         selection_pov_ > 3 || !PovAngle(selection_next_) ||
         !PovAngle(selection_previous_) ||
@@ -83,6 +96,7 @@ class Autonomous {
       throw std::invalid_argument("autonomous: invalid selection input");
     }
     ValidateFinite();
+    signature_ = RoutineSignature(routines_);
   }
 
   void update() {
@@ -95,38 +109,57 @@ class Autonomous {
       trajectory_pose_available_ = false;
       selection_seeded_ = false;
       CheckDeadline(now);
-      ReleaseTargets();
-      PublishState();
+      Stop();
       return;
     }
+    // A restarted process learns from its predecessor's record what this
+    // match has already done, against the first Driver Station packet.
+    if (!restore_checked_) {
+      restore_checked_ = true;
+      Restore(now);
+    }
+    // An armed routine adopts the first FMS match data it sees, so data that
+    // arrives after the arm does not read as another match.
+    if (Armed() && match_ == MatchKey{}) match_ = MatchKey::Of(ds_.data().fms);
     SelectRoutine();
     if (!ds_.enabled() || !ds_.autonomous()) {
-      ResetRoutine();
-      ReleaseTargets();
-      PublishState();
+      // Leaving enabled auto pauses an armed routine for the rest of its
+      // match; only another match (NewMatch) starts over.
+      if (!Armed() || NewMatch(now)) ResetRoutine();
+      CheckDeadline(now);
+      Stop();
       return;
     }
-    // A new process must observe disabled/non-auto before it can arm. Merely
-    // receiving an already-running auto generation must never fire a piece.
+    // A new process without a record of this match must observe
+    // disabled/non-auto before it can arm. Merely receiving an already-running
+    // auto generation must never fire a piece.
     if (phase_.is(Phase::kInhibited)) {
-      ReleaseTargets();
-      PublishState();
+      Stop();
       return;
     }
-    if (generation_ != ds_.data().mode_since_us) ResetRoutine();
+    // A new generation in the same match resumes the step it paused on: a
+    // fired action never fires again in that match.
+    if (generation_ != ds_.data().mode_since_us && Armed()) {
+      if (NewMatch(now)) {
+        ResetRoutine();
+      } else {
+        Resume();
+      }
+    }
     if (phase_.is(Phase::kIdle)) {
       generation_ = ds_.data().mode_since_us;
+      armed_at_ = now;
+      match_ = MatchKey::Of(ds_.data().fms);
       red_ = ds_.alliance() == talos::driver_station::Alliance::kRed;
       latched_ = selection_.get();
       ApplyRoutine();
       action_ = 0;
       spinup_started_ = now;
-      phase_.go(CurrentAction().phase);
+      Enter(now);
     }
     CheckDeadline(now);
     if (phase_.is(Phase::kAborted) || phase_.is(Phase::kHold)) {
-      ReleaseTargets();
-      PublishState();
+      Stop();
       return;
     }
     const bool shooter_ready =
@@ -142,11 +175,11 @@ class Autonomous {
     }
     if (CurrentAction().completion == Completion::kShooterReady &&
         shooter_ready) {
-      Advance();
+      Advance(now);
     }
     if (CurrentAction().completion == Completion::kFeedDuration &&
         feed_elapsed_ >= feed_duration_) {
-      Advance();
+      Advance(now);
     }
     drivetrain::ChassisTarget drive{};
     double intake = 0;
@@ -189,7 +222,7 @@ class Autonomous {
         if (elapsed >= trajectory_.total_time_s() &&
             std::hypot(dx, dy) <= position_tolerance_ &&
             std::abs(da) <= yaw_tolerance_) {
-          Advance();
+          Advance(now);
         } else {
           drive =
               HolonomicController{kp_xy_, kp_yaw_, max_linear_, max_angular_}
@@ -204,10 +237,11 @@ class Autonomous {
       }
     }
     if (phase_.is(Phase::kHold)) {
-      ReleaseTargets();
-      PublishState();
+      Stop();
       return;
     }
+    // Write-ahead: the record holds this step before its commands go out.
+    Persist();
     if (phase_.is(Phase::kDrive) && !trajectory_pose_available_) {
       drive_.release();
     } else {
@@ -244,6 +278,36 @@ class Autonomous {
     Timeout timeout;
     Cancel cancel = Cancel::kReleaseAll;
   };
+  // The FMS match identity; all zero without FMS match data.
+  static_assert(sizeof(Progress::event_name) ==
+                    talos::driver_station::kMaxEventNameLength &&
+                sizeof(talos::driver_station::FmsData::event_name) ==
+                    talos::driver_station::kMaxEventNameLength);
+  struct MatchKey {
+    talos::driver_station::MatchType type{};
+    std::uint16_t number = 0;
+    std::uint8_t replay = 0;
+    std::array<char, talos::driver_station::kMaxEventNameLength> event{};
+    bool operator==(const MatchKey&) const = default;
+    static MatchKey Of(const talos::driver_station::FmsData& fms) {
+      MatchKey key{fms.match_type, fms.match_number, fms.replay_number, {}};
+      std::copy_n(fms.event_name,
+                  ::strnlen(fms.event_name, sizeof fms.event_name),
+                  key.event.begin());
+      return key;
+    }
+    static MatchKey Of(const Progress& progress) {
+      MatchKey key{
+          static_cast<talos::driver_station::MatchType>(progress.match_type),
+          progress.match_number,
+          progress.replay_number,
+          {}};
+      std::copy_n(progress.event_name,
+                  ::strnlen(progress.event_name, sizeof progress.event_name),
+                  key.event.begin());
+      return key;
+    }
+  };
   struct Routine {
     std::string name;
     std::vector<Action> actions;
@@ -262,6 +326,8 @@ class Autonomous {
   bool trajectory_started_ = false;
   talos::Duration feed_duration_;
   double spinup_timeout_s_, drive_timeout_s_;
+  talos::Duration autonomous_period_;
+  talos::Duration command_timeout_;  // [robot] command_timeout_us
   std::vector<Routine> routines_;
   Selection selection_;
   int selection_port_, selection_pov_, selection_next_, selection_previous_;
@@ -270,7 +336,13 @@ class Autonomous {
   std::uint8_t latched_ = 0;
   std::size_t action_ = 0;
   std::uint64_t generation_ = 0;
+  talos::Time armed_at_{};
+  MatchKey match_{};
   talos::Time spinup_started_{};
+  talos::Time drive_started_{};
+  ProgressStore progress_;
+  bool restore_checked_ = false;
+  std::uint64_t signature_ = 0;
   talos::Duration feed_elapsed_{};
   talos::Time feed_last_update_{};
   bool feeding_ = false;
@@ -284,6 +356,12 @@ class Autonomous {
   talos::StateMachine<Phase> phase_;
   talos::Publisher<AutonomousState> state_;
   bool red_ = false;
+
+  static talos::Duration CommandTimeout(talos::Node& node) {
+    return std::chrono::microseconds{
+        talos::config::ParseRobotConfig(node.config_path())
+            .hardware.command_timeout_us};
+  }
 
   static double PositiveSeconds(talos::Node& node, const char* key,
                                 double fallback) {
@@ -304,17 +382,130 @@ class Autonomous {
     feed_elapsed_ = talos::Duration::zero();
   }
 
+  bool Armed() const {
+    return !phase_.is(Phase::kIdle) && !phase_.is(Phase::kInhibited);
+  }
+
+  // Whether the routine armed at armed_at_ belongs to an earlier match:
+  //  - the Driver Station reported teleop or test (FMS runs teleop after
+  //    auto). Only with a DS attached: WPILib reads a lost DS as teleop;
+  //  - FMS match data (type, number, replay, event) differs from the
+  //    routine's. Only when both are present: missing data on either side is
+  //    not a new match, so an FMS blip, or data arriving after the arm,
+  //    cannot re-fire;
+  //  - autonomous_period_us has passed since the arm, so no autonomous
+  //    period that included it is still running.
+  bool NewMatch(talos::Time now) const {
+    const auto& fms = ds_.data().fms;
+    const bool attached = (fms.flags & talos::driver_station::kDsAttached) != 0;
+    const auto key = MatchKey::Of(fms);
+    return (attached && (ds_.teleop() || ds_.test())) ||
+           (key != MatchKey{} && match_ != MatchKey{} && key != match_) ||
+           now - armed_at_ >= autonomous_period_;
+  }
+
+  // The predecessor's record, against the first Driver Station packet:
+  //  - none (or cleared): stay INHIBITED, as a process that knows nothing;
+  //  - from the same match (NewMatch false for its arm time and match key,
+  //    on the same boot's monotonic clock): restore its paused step. The next
+  //    enabled-auto tick Resume()s it like any new generation;
+  //  - from another match: ignore it and stay INHIBITED;
+  //  - unreadable (both slots damaged, another record version, or indices
+  //    this routine list does not have): HoldForMatch.
+  void Restore(talos::Time now) {
+    using Loaded = ProgressStore::Loaded;
+    if (progress_.loaded() == Loaded::kNone) return;
+    const Progress& p = progress_.progress();
+    if (progress_.loaded() == Loaded::kCorrupt || p.signature != signature_ ||
+        p.routine >= routines_.size() ||
+        p.action >= routines_[p.routine].actions.size()) {
+      HoldForMatch(now);
+      return;
+    }
+    armed_at_ = talos::Time::from_nanos(p.armed_at_ns);
+    match_ = MatchKey::Of(p);
+    if (now < armed_at_ || NewMatch(now)) return;
+    latched_ = p.routine;
+    ApplyRoutine();
+    action_ = p.action;
+    spinup_started_ = talos::Time::from_nanos(p.spinup_started_ns);
+    drive_started_ = talos::Time::from_nanos(p.drive_started_ns);
+    feed_elapsed_ = talos::Duration{p.feed_elapsed_ns};
+    red_ = ds_.alliance() == talos::driver_station::Alliance::kRed;
+    phase_.go(p.aborted ? Phase::kAborted : CurrentAction().phase);
+    generation_ = 0;
+  }
+
+  // A record that cannot be trusted means some routine may have fired in
+  // this match at a step nobody can name. Starting fresh could fire it again,
+  // and INHIBITED would arm fresh at the next disable/re-enable; so treat
+  // everything as fired: HOLD, armed now in the current match, until NewMatch.
+  void HoldForMatch(talos::Time now) {
+    latched_ = selection_.get();
+    ApplyRoutine();
+    action_ = routines_[latched_].actions.size() - 1;  // every routine's HOLD
+    armed_at_ = now;
+    match_ = MatchKey::Of(ds_.data().fms);
+    generation_ = 0;
+    phase_.go(Phase::kHold);
+  }
+
+  // Record the routine's progress (write-ahead, before the tick's commands).
+  // INHIBITED writes nothing: the predecessor's record stays until this
+  // process knows better.
+  void Persist() {
+    if (phase_.is(Phase::kInhibited)) return;
+    Progress p{};
+    if (Armed()) {
+      p.armed = 1;
+      p.aborted = phase_.is(Phase::kAborted) ? 1 : 0;
+      p.signature = signature_;
+      p.armed_at_ns = armed_at_.nanos();
+      p.spinup_started_ns = spinup_started_.nanos();
+      p.drive_started_ns = drive_started_.nanos();
+      // A feed commanded this tick counts as fed until its lane goes stale:
+      // after a kill, the intake obeys it for up to command_timeout_us. So a
+      // restarted feed runs at most the remaining time, never more.
+      p.feed_elapsed_ns =
+          (feed_elapsed_ + (feeding_ ? command_timeout_ : talos::Duration{}))
+              .count();
+      p.action = static_cast<std::uint32_t>(action_);
+      p.routine = latched_;
+      p.match_type = static_cast<std::uint8_t>(match_.type);
+      p.match_number = match_.number;
+      p.replay_number = match_.replay;
+      std::copy(match_.event.begin(), match_.event.end(), p.event_name);
+    }
+    progress_.Write(p);
+  }
+
+  void Stop() {
+    Persist();
+    ReleaseTargets();
+    PublishState();
+  }
+
+  // Continue the paused step under the new generation. Deadlines keep their
+  // wall-clock start (spinup_started_, the DRIVE entry), feed keeps its
+  // accumulated time, and a drive re-plans from the current pose: the robot
+  // stopped, and may have been moved, while disabled.
+  void Resume() {
+    generation_ = ds_.data().mode_since_us;
+    trajectory_started_ = false;
+    trajectory_pose_available_ = false;
+  }
+
   void CheckDeadline(talos::Time now) {
     // One wall-clock preload budget from the FIRST spinup entry, including
-    // feed and readiness retries. Flapping readiness or a DS outage cannot
-    // postpone the deadline. Drive likewise includes every outage.
+    // feed and readiness retries. Flapping readiness, a DS outage or a pause
+    // cannot postpone the deadline. Drive likewise includes every outage.
     if (((phase_.is(Phase::kSpinup) || phase_.is(Phase::kFeed)) &&
          CurrentAction().timeout == Timeout::kPreload &&
          now - spinup_started_ >=
              std::chrono::duration<double>{spinup_timeout_s_}) ||
         (phase_.is(Phase::kDrive) &&
          CurrentAction().timeout == Timeout::kDrive &&
-         phase_.time_in_state() >=
+         now - drive_started_ >=
              std::chrono::duration<double>{drive_timeout_s_})) {
       phase_.go(Phase::kAborted);
     }
@@ -435,9 +626,14 @@ class Autonomous {
   const Action& CurrentAction() const {
     return routines_[latched_].actions[action_];
   }
-  void Advance() {
+  void Advance(talos::Time now) {
     ++action_;
+    Enter(now);
+  }
+  // Enter the current action's phase; DRIVE's deadline counts from here.
+  void Enter(talos::Time now) {
     phase_.go(CurrentAction().phase);
+    if (phase_.is(Phase::kDrive)) drive_started_ = now;
   }
   void SelectRoutine() {
     const auto stick = ds_.joystick(selection_port_);
@@ -462,11 +658,10 @@ class Autonomous {
     selection_seeded_ = true;
   }
   void PublishState() {
-    const bool running =
-        ds_.enabled() && ds_.autonomous() && !phase_.is(Phase::kInhibited);
-    state_.send(AutonomousState{WirePhase(), running || generation_ != 0
-                                                 ? latched_
-                                                 : selection_.get()});
+    // The latched routine from its arm until a new match resets it, so a
+    // paused routine reports what a re-enable resumes.
+    state_.send(
+        AutonomousState{WirePhase(), Armed() ? latched_ : selection_.get()});
   }
 
   autonomous::Phase WirePhase() const {
