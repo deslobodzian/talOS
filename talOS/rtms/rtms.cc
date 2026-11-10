@@ -534,7 +534,8 @@ RTMSQueue::RTMSQueue(RTMSQueue&& other) noexcept
       options_{other.options_},
       header_{std::exchange(other.header_, nullptr)},
       ptr_{std::move(other.ptr_)},
-      counted_{std::exchange(other.counted_, false)} {}
+      counted_{std::exchange(other.counted_, false)},
+      registered_{std::exchange(other.registered_, {})} {}
 
 RTMSQueue& RTMSQueue::operator=(RTMSQueue&& other) noexcept {
   if (this != &other) {
@@ -551,6 +552,7 @@ RTMSQueue& RTMSQueue::operator=(RTMSQueue&& other) noexcept {
     header_ = std::exchange(other.header_, nullptr);
     ptr_ = std::move(other.ptr_);
     counted_ = std::exchange(other.counted_, false);
+    registered_ = std::exchange(other.registered_, {});
   }
   return *this;
 }
@@ -752,11 +754,11 @@ ReadResult RTMSQueue::read_next(std::uint64_t reader_id,
     return ReadResult::INVALID;
   }
 
-  auto& reader = header_->readers[reader_id];
-
-  if (!is_active(reader)) {
+  if (!holds_reader(reader_id)) {
     return ReadResult::INACTIVE;
   }
+
+  auto& reader = header_->readers[reader_id];
 
   for (int attempt = 0; attempt < MAX_READ_ATTEMPTS; ++attempt) {
     MessageInfo candidate{};
@@ -785,6 +787,8 @@ ReadResult RTMSQueue::read_next(std::uint64_t reader_id,
 }
 
 std::optional<std::size_t> RTMSQueue::register_reader() {
+  const std::uint64_t claiming = ReaderWord(ReaderState::CLAIMING);
+  const std::uint64_t active = ReaderWord(ReaderState::ACTIVE);
   for (int pass = 0; pass < 2; ++pass) {
     for (std::size_t i = 0; i < MAX_READERS; ++i) {
       auto& reader = header_->readers[i];
@@ -793,9 +797,9 @@ std::optional<std::size_t> RTMSQueue::register_reader() {
       // The claim carries this process's pid, so a claimant that dies at any
       // point after it -- even before it marks the slot active -- leaves a
       // slot reclaim_dead_readers() can free.
-      if (!reader.state.compare_exchange_strong(
-              expected, ReaderWord(ReaderState::CLAIMING),
-              std::memory_order_acq_rel, std::memory_order_relaxed)) {
+      if (!reader.state.compare_exchange_strong(expected, claiming,
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_relaxed)) {
         continue;
       }
 
@@ -804,8 +808,15 @@ std::optional<std::size_t> RTMSQueue::register_reader() {
 
       reader.sequence.store(current, std::memory_order_relaxed);
 
-      reader.state.store(ReaderWord(ReaderState::ACTIVE),
-                         std::memory_order_release);
+      // Only while the claim is still this one: a process that judged this
+      // one dead may have freed it meanwhile, and another claimed the slot.
+      expected = claiming;
+      if (!reader.state.compare_exchange_strong(expected, active,
+                                                std::memory_order_release,
+                                                std::memory_order_relaxed)) {
+        continue;
+      }
+      registered_[i] = active;
       const auto writer_after =
           header_->writer.sequence.load(std::memory_order_acquire);
       if (writer_after > current && writer_after - current > header_->slots) {
@@ -820,7 +831,10 @@ std::optional<std::size_t> RTMSQueue::register_reader() {
 
 void RTMSQueue::release_reader(std::size_t id) {
   if (header_ == nullptr || id >= MAX_READERS) return;
-  auto expected = ReaderWord(ReaderState::ACTIVE);
+  // Only a slot this queue claimed in this process -- a forked child
+  // inherits its parent's registrations -- and only while it still holds it.
+  std::uint64_t expected = std::exchange(registered_[id], 0);
+  if (expected != ReaderWord(ReaderState::ACTIVE)) return;
   header_->readers[id].state.compare_exchange_strong(
       expected, 0, std::memory_order_acq_rel, std::memory_order_acquire);
 }

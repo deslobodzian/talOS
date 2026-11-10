@@ -7,6 +7,7 @@
  * https://csg.csail.mit.edu/6.823S17/StudyMaterials/quiz3/handouts/handout13-queue.pdf
  */
 
+#include <array>
 #include <atomic>
 #include <concepts>
 #include <cstddef>
@@ -85,7 +86,9 @@ struct WriteStatus {
 enum class ReadResult {
   OK,
   EMPTY,     // Caught up with the writer, nothing new.
-  INACTIVE,  // Reader slot is not registered, or was freed as dead.
+  INACTIVE,  // This queue does not hold the reader slot: never registered,
+             // released, or freed as dead (and maybe claimed by another
+             // process) since; stays so until register_reader() returns it.
   INVALID,   // Reader id out of range or destination too small.
   TORN,      // Writer lapped us mid-copy too many times to recover.
 };
@@ -242,8 +245,12 @@ class RTMSQueue {
 
   std::uint64_t minimum_read_position() const;
   // Claims a reader slot for this process. When none is free, slots held by
-  // processes that no longer exist are freed first.
+  // processes that no longer exist are freed first. The queue keeps the
+  // state word it claimed the slot with: once the slot holds another,
+  // read_next() reports INACTIVE and read() fails, rather than share another
+  // claimant's cursor.
   std::optional<std::size_t> register_reader();
+  // Frees reader slot `id` if this queue claimed it and still holds it.
   void release_reader(std::size_t id);
   // Frees every reader slot whose claiming process has died. Returns how
   // many it freed.
@@ -293,11 +300,11 @@ class RTMSQueue {
       return false;
     }
 
-    auto& reader = header_->readers[reader_id];
-
-    if (!is_active(reader)) {
+    if (!holds_reader(reader_id)) {
       return false;
     }
+
+    auto& reader = header_->readers[reader_id];
 
     for (int attempt = 0; attempt < MAX_READ_ATTEMPTS; ++attempt) {
       MessageInfo info{};
@@ -341,6 +348,20 @@ class RTMSQueue {
            static_cast<std::uint64_t>(ReaderState::ACTIVE);
   }
 
+  // Whether reader slot `reader_id` still holds the word this queue claimed
+  // it with. Another process that judged this one dead may have freed the
+  // slot and claimed it again: it then reads ACTIVE with that process's word.
+  // One acquire load. A registration found lost is forgotten, so a later
+  // claim of the slot by another queue of this process, with the same word,
+  // does not revive it.
+  bool holds_reader(std::uint64_t reader_id) {
+    const std::uint64_t word =
+        header_->readers[reader_id].state.load(std::memory_order_acquire);
+    if (word != 0 && word == registered_[reader_id]) return true;
+    registered_[reader_id] = 0;
+    return false;
+  }
+
   // Maps the segment (creating it when absent), initializes or validates the
   // header, and joins its lifetime. Retries while a closing segment is being
   // unlinked, and unlinks one its closer died before unlinking.
@@ -374,4 +395,7 @@ class RTMSQueue {
   RTMSHeader* header_{nullptr};
   SharedMemoryPtr ptr_;
   bool counted_{false};  // this queue holds one count of header_->lifetime
+  // The state word register_reader() claimed each reader slot with, 0 for a
+  // slot this queue does not hold.
+  std::array<std::uint64_t, MAX_READERS> registered_{};
 };

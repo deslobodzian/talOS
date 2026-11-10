@@ -143,6 +143,40 @@ TEST(ReaderOwnership, ReleaseRejectsInvalidFreeAndForeignReaders) {
   EXPECT_EQ(header->readers[*reader].state.load(), 0u);
 }
 
+// Another process can free a live reader's slot, having judged its process
+// dead, and claim it for itself: the slot then reads ACTIVE with that
+// process's word. The queue that registered it must find the slot lost
+// rather than share the new claimant's cursor.
+TEST(ReaderOwnership, ASlotAnotherProcessFreedAndClaimedIsInactive) {
+  const auto path = make_test_path("reclaimed");
+  RTMSQueue queue{path,
+                  sizeof(Message::TestMessage),
+                  alignof(Message::TestMessage),
+                  kSchema,
+                  8,
+                  overwrite_sequence_options()};
+  SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+  auto* header = static_cast<RTMSHeader*>(mapping.ptr());
+  ASSERT_NE(header, nullptr);
+  const auto reader = queue.register_reader();
+  ASSERT_TRUE(reader);
+  const std::size_t id = reader.value_or(std::size_t{0});
+  ASSERT_EQ(queue.write(BytesOf({1, 1.0F})), WriteResult::SUCCESS);
+  ASSERT_EQ(queue.write(BytesOf({2, 2.0F})), WriteResult::SUCCESS);
+  header->readers[id].state.store(
+      (static_cast<std::uint64_t>(::getpid() + 1) << 2) |
+      static_cast<std::uint64_t>(ReaderState::ACTIVE));
+
+  Message::TestMessage received{};
+  MessageInfo info{};
+  EXPECT_EQ(queue.read_next(id, std::as_writable_bytes(std::span{&received, 1}),
+                            info),
+            ReadResult::INACTIVE);
+  EXPECT_FALSE(queue.read(id, [](std::span<const std::byte>) {}));
+  // Neither read moved the slot's cursor, which is now the claimant's.
+  EXPECT_EQ(header->readers[id].sequence.load(), 0u);
+}
+
 TEST(WriterOwnership, RefusesSecondLiveWriterAndReleasesOnClose) {
   const auto path = make_test_path("writer");
   RTMSQueue session{path,
