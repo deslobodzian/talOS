@@ -43,6 +43,7 @@ cc_test(
         "//talOS/devices:testing",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

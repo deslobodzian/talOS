@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <span>
 #include <stdexcept>
@@ -77,12 +78,15 @@ class SimulatedChannel {
 // Topics shared between simulated loops in one test.
 class SimulationEnvironment {
  public:
+  // Looks the topic up without building a key string, so a harness that reads
+  // and writes topics every tick (SimHardware) does not allocate in a test's
+  // AllocationProbe window.
   SimulatedChannel& channel(std::string_view name,
                             std::uint32_t message_bytes) {
-    const auto [it, inserted] =
-        channels_.try_emplace(std::string{name}, message_bytes);
-
-    if (!inserted && it->second.message_bytes() != message_bytes) {
+    auto it = channels_.find(name);
+    if (it == channels_.end()) {
+      it = channels_.try_emplace(std::string{name}, message_bytes).first;
+    } else if (it->second.message_bytes() != message_bytes) {
       throw std::runtime_error("topic '" + std::string{name} +
                                "' used with two different message sizes");
     }
@@ -106,7 +110,7 @@ class SimulationEnvironment {
   }
 
  private:
-  std::map<std::string, SimulatedChannel> channels_;
+  std::map<std::string, SimulatedChannel, std::less<>> channels_;
 };
 
 // A loop on a virtual clock.

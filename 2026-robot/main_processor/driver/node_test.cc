@@ -19,6 +19,7 @@
 #include "talOS/devices/testing.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/messages.h"
+#include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
 
 namespace driver {
@@ -589,6 +590,24 @@ TEST_F(TeleopChain, DisablingOrLosingTheDriverStationStopsTheModules) {
   hw.stop_driver_station();
   sim.step(200ms);
   ExpectModulesNeutral();
+}
+
+// RULES.md 3: once the stick is held, each packet's evaluation and lane
+// write, the driver's update(), and the drivetrain's target read and module
+// requests allocate nothing. SimHardware forwards the held packet every
+// period through the window.
+TEST_F(TeleopChain, SteadyTeleopAllocatesNothing) {
+  if (const auto why = talos::testing::AllocationProbe::Unsupported();
+      !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  for (int i = 0; i < 10; ++i) Push(ForwardStick());
+  talos::testing::AllocationProbe probe;
+  probe.start();
+  sim.step(100ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  EXPECT_EQ(hw.motor_request("drivetrain", geometry.modules[0].drive).mode,
+            talos::hardware::Mode::kVelocity);
 }
 
 TEST_F(TeleopChain, AutonomousIgnoresTheSticks) {

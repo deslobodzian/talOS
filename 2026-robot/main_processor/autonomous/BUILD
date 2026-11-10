@@ -60,6 +60,7 @@ cc_test(
         ":autonomous",
         "//talOS/devices:testing",
         "//talOS/memory:shared_memory",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

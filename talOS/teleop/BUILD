@@ -71,6 +71,7 @@ cc_test(
         "//talOS/driver_station",
         "//talOS/hardware",
         "//talOS/msgs:control",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "//talOS/schema:test_messages",
         "@googletest//:gtest_main",

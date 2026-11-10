@@ -20,6 +20,7 @@
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/devices/testing.h"
 #include "talOS/memory/shared_memory_ptr.h"
+#include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
 
 namespace autonomous {
@@ -450,6 +451,27 @@ TEST_F(AutonomousTest, ResumedDriveReplansFromCurrentPose) {
   sim.step(20ms);
   EXPECT_GT(Drive().vx_mps(), 0);
   EXPECT_GT(Drive().vy_mps(), 0);
+}
+
+// RULES.md 3: a driving tick (trajectory sample, controller, progress
+// record, three lane writes, state publish) allocates nothing. The pose is
+// published before the window and stays fresh through it.
+TEST_F(AutonomousTest, DrivingTickDoesNotAllocate) {
+  if (const auto why = talos::testing::AllocationProbe::Unsupported();
+      !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  StartDrive();
+  Pose();
+  sim.step(20ms);
+  Pose();
+  talos::testing::AllocationProbe probe;
+  probe.start();
+  sim.step(60ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
+  EXPECT_TRUE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  EXPECT_GT(Drive().vx_mps(), 0);
 }
 
 // What happens between leaving enabled autonomous and re-entering it.

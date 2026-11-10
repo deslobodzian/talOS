@@ -1,14 +1,8 @@
 #include <gtest/gtest.h>
 #include <sys/wait.h>
 
-#if defined(__APPLE__)
-#include <dlfcn.h>
-#include <execinfo.h>
-#endif
-
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -17,7 +11,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <limits>
 #include <memory>
 #include <numbers>
@@ -30,6 +23,7 @@
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/testing.h"
+#include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
 
 namespace drivetrain {
@@ -1252,80 +1246,11 @@ TEST(Drivetrain, LinkDropKeepsPublishingInvalidStateAndHoldsPositions) {
 
 // --- allocation ------------------------------------------------------------
 
-// ASan and TSan serve every malloc from their own allocator, so
-// libsystem_malloc never calls malloc_logger and the probe below sees nothing.
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
-#define TALOS_SANITIZER_ALLOCATOR 1
-#endif
-#endif
-
-#if defined(__APPLE__) && !defined(TALOS_SANITIZER_ALLOCATOR)
-// Every malloc in the process, including those made inside linked libraries
-// (whose operator new binds to libc++, not to this binary). libsystem_malloc
-// calls malloc_logger, when set, on every allocation; each one's stack is kept
-// (backtrace() does not allocate) and symbolized afterwards.
-using MallocLogger = void(std::uint32_t, std::uintptr_t, std::uintptr_t,
-                          std::uintptr_t, std::uintptr_t, std::uint32_t);
-extern "C" MallocLogger* malloc_logger;
-
-struct Allocation {
-  void* frames[48];
-  int depth;
-};
-constexpr std::size_t kMaxRecorded = 64;
-Allocation g_recorded[kMaxRecorded];
-std::atomic<std::uint64_t> g_allocations{0};
-
-void RecordAllocation(std::uint32_t type, std::uintptr_t, std::uintptr_t,
-                      std::uintptr_t, std::uintptr_t, std::uint32_t) {
-  constexpr std::uint32_t kAllocate = 2;  // MALLOC_LOG_TYPE_ALLOCATE
-  if ((type & kAllocate) == 0) return;
-  const std::uint64_t n = g_allocations.fetch_add(1, std::memory_order_relaxed);
-  if (n < kMaxRecorded) {
-    Allocation& a = g_recorded[n];
-    a.depth = ::backtrace(a.frames, static_cast<int>(std::size(a.frames)));
-  }
-}
-
-// The Sim's in-memory topics keep every message ever published
-// (talOS/events/simulated_event_loop.h), so their storage grows
-// geometrically under any publisher. That is the test transport's
-// allocation, not the node's; the real transport is a preallocated ring.
-// SimulatedChannel::publish may be inlined into SimulatedEventLoop::send_impl,
-// which does nothing else, so either frame marks the transport. SimHardware
-// stands in for the bridge and RoboRIO (its publications look their topic up
-// by name); the node never runs beneath it.
-bool InSimTransport(const Allocation& a) {
-  for (int i = 0; i < a.depth; ++i) {
-    Dl_info info;
-    if (::dladdr(a.frames[i], &info) == 0 || info.dli_sname == nullptr) {
-      continue;
-    }
-    const std::string_view name{info.dli_sname};
-    if (name.find("SimulatedChannel") != std::string_view::npos ||
-        name.find("SimHardware") != std::string_view::npos ||
-        (name.find("SimulatedEventLoop") != std::string_view::npos &&
-         name.find("send_impl") != std::string_view::npos)) {
-      return true;
-    }
-  }
-  return false;
-}
-#endif
-
 TEST_F(DrivetrainTest, UpdateDoesNotAllocate) {
-#if defined(TALOS_SANITIZER_ALLOCATOR)
-  GTEST_SKIP() << "the sanitizer's allocator bypasses malloc_logger";
-#elif defined(__APPLE__)
-  // Fail rather than silently passing if the allocation probe stops working.
-  g_allocations = 0;
-  malloc_logger = RecordAllocation;
-  auto* volatile probe = new std::array<double, 64>{};
-  malloc_logger = nullptr;
-  delete probe;
-  ASSERT_GE(g_allocations.load(), 1u);
-  ASSERT_FALSE(InSimTransport(g_recorded[0]));
+  if (const auto why = talos::testing::AllocationProbe::Unsupported();
+      !why.empty()) {
+    GTEST_SKIP() << why;
+  }
   Teleop();
   SetRotating(hw, geometry, 1.0);
   Hold(ChassisTarget{1.0, -0.5, 0.8}, 40ms);
@@ -1338,25 +1263,11 @@ TEST_F(DrivetrainTest, UpdateDoesNotAllocate) {
   // the test's own publications are not counted.
   talos::testing::PublishTarget(sim, "drivetrain", "teleop",
                                 ChassisTarget{1.0, -0.5, 0.8});
-  g_allocations = 0;
-  malloc_logger = RecordAllocation;
+  talos::testing::AllocationProbe probe;
+  probe.start();
   sim.step(60ms);
-  malloc_logger = nullptr;
-
-  const std::uint64_t total = g_allocations.load();
-  ASSERT_LE(total, kMaxRecorded) << "far more than transport growth";
-  std::uint64_t outside_transport = 0;
-  for (std::uint64_t n = 0; n < total; ++n) {
-    if (InSimTransport(g_recorded[n])) continue;
-    ++outside_transport;
-    ::backtrace_symbols_fd(g_recorded[n].frames, g_recorded[n].depth, 2);
-  }
-  EXPECT_EQ(outside_transport, 0u);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
   EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
-#else
-  GTEST_SKIP() << "process-wide malloc counting uses macOS malloc_logger; "
-                  "glibc has had no allocation hook since 2.34";
-#endif
 }
 
 // --- binary --------------------------------------------------------------

@@ -12,6 +12,7 @@
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "shooter/shooter.h"
 #include "talOS/devices/testing.h"
+#include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
 
 namespace shooter {
@@ -227,6 +228,26 @@ TEST_F(ShooterTest, NonFiniteTargetGoesNeutral) {
   Teleop();
   Hold(std::numeric_limits<double>::quiet_NaN(), 40ms);
   ExpectNeutral();
+}
+
+// RULES.md 3: the steady-state tick (target read, readiness, velocity
+// request, flush, state publish) allocates nothing. The target is published
+// before the window and stays fresh through it (60 ms < command_timeout_us).
+TEST_F(ShooterTest, UpdateDoesNotAllocate) {
+  if (const auto why = talos::testing::AllocationProbe::Unsupported();
+      !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  Teleop();
+  hw.ideal_motors();
+  Hold(80.0, 40ms);
+  talos::testing::PublishTarget(sim, "shooter", "teleop", ShooterTarget{80.0});
+  talos::testing::AllocationProbe probe;
+  probe.start();
+  sim.step(60ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  EXPECT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
+  EXPECT_TRUE(State().at_speed());
 }
 
 TEST(ShooterParameters, RejectInvalidReadinessParametersAtConstruction) {

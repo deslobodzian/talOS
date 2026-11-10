@@ -58,6 +58,29 @@ cc_library(
     ],
 )
 
+# talos::testing::AllocationProbe: counts one thread's heap allocations, for
+# the RULES.md 3 check that a node's update() allocates nothing. On glibc it
+# replaces malloc, so it links into the test binary itself.
+cc_library(
+    name = "allocation_probe",
+    testonly = True,
+    srcs = ["allocation_probe.cc"],
+    hdrs = ["allocation_probe.h"],
+    alwayslink = True,
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "allocation_probe_test",
+    size = "small",
+    srcs = ["allocation_probe_test.cc"],
+    deps = [
+        ":allocation_probe",
+        "@googletest//:gtest_main",
+    ],
+)
+
 talos_messages(
     name = "test_messages",
     srcs = ["node_test_message.fbs"],

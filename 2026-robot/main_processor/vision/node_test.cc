@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
 #include "talOS/vision/recording/recording.h"
 #include "vision/vision.h"
@@ -1592,6 +1593,45 @@ std::shared_ptr<const std::vector<std::uint8_t>> RenderCameraView(
                 tag_size, {}, pixels.get()),
             0);
   return pixels;
+}
+
+// RULES.md 3: with a live camera, detection and localization run on the
+// worker; update() only hands the worker the time and publishes what it
+// finished, and allocates nothing. Only the test (loop) thread is counted.
+TEST(VisionTest, LiveUpdateDoesNotAllocate) {
+  if (const auto why = talos::testing::AllocationProbe::Unsupported();
+      !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  auto device = std::make_shared<FakeCameraDevice>();
+  LiveTestVision::device = device;
+  auto sim = MakeSim(false, true,
+                     "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "frame_timeout_us = 10000000\n",
+                     "period_us = 1000\n");
+  auto& camera = sim.add<LiveTestVision>("rear_right_camera");
+  ASSERT_TRUE(
+      AdvanceLiveUntil(sim, camera, [&] { return device->starts == 1; }));
+  AdvanceLive(sim, camera, 30);
+  const auto frame = [&] {
+    device->Emit(sim.now().nanos() - 10000000,
+                 talos::vision::TimestampKind::kDelivery);
+  };
+  for (int i = 0; i < 3; ++i) {
+    frame();
+    AdvanceLive(sim, camera, 10);
+  }
+  const auto before = sim.latest<VisionStatus>("/rear_right_camera/status");
+  ASSERT_TRUE(before.has_value());
+  frame();  // Emitted from this thread, so before the window.
+  talos::testing::AllocationProbe probe;
+  probe.start();
+  AdvanceLive(sim, camera, 10);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  const auto after = sim.latest<VisionStatus>("/rear_right_camera/status");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(after->frames_processed_count(),
+            before->frames_processed_count() + 1);
 }
 
 TEST(VisionTest, LiveStampOlderThanFrameTimeoutPublishesInvalid) {

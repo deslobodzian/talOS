@@ -20,6 +20,7 @@
 #include "talOS/devices/testing.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
 #include "talOS/teleop/deadband.h"
 #include "talOS/teleop/node.h"
@@ -356,6 +357,29 @@ TEST(TeleopNode, AxisDeadbandEdgeAndContinuousScaling) {
   }
   const auto& negative_axis = arm.seen.value();
   EXPECT_NEAR(negative_axis.velocity_rps(), -5.0, 1e-6);
+}
+
+// RULES.md 3: with a held axis, each tick's binding evaluation, field
+// encoding and lane write allocate nothing (nor does the consumer's Target).
+TEST(TeleopNode, HeldAxisTickDoesNotAllocate) {
+  if (const auto why = talos::testing::AllocationProbe::Unsupported();
+      !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  Sim sim = MakeSim(kAxisToml);
+  auto& arm = sim.add<ConsumerNode<control::VelocityTarget>>("arm");
+  sim.add<Teleop>("teleop");
+  SimHardware hw{sim};
+  hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(-0.5625f)));
+  ASSERT_TRUE(arm.seen.has_value());
+  talos::testing::AllocationProbe probe;
+  probe.start();
+  sim.step(100ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  ASSERT_TRUE(arm.seen.has_value());
+  EXPECT_NEAR(arm.seen->velocity_rps(), -5.0, 1e-6);
 }
 
 TEST(TeleopNode, OverflowingAxisOutputReleasesEntireLaneAndRecovers) {

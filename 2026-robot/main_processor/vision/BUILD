@@ -75,6 +75,7 @@ cc_test(
     deps = [
         ":vision",
         "//talOS/configuration",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
