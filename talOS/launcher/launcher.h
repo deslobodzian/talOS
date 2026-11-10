@@ -3013,9 +3013,9 @@ class Launcher {
   }
 
   static void InstallSignals() {
-    stop_requested_ = false;
-    std::signal(SIGINT, [](int) { stop_requested_ = true; });
-    std::signal(SIGTERM, [](int) { stop_requested_ = true; });
+    stop_requested_ = 0;
+    std::signal(SIGINT, [](int) { stop_requested_ = 1; });
+    std::signal(SIGTERM, [](int) { stop_requested_ = 1; });
   }
 
   // SpawnProcess for one run of a roster member: -1 with `error` naming the
@@ -3418,7 +3418,7 @@ class Launcher {
         return;
       }
 
-      if (!stop_sent && (stop_requested_ || past_deadline)) {
+      if (!stop_sent && (stop_requested_ != 0 || past_deadline)) {
         stop_sent = true;
         shutdown_deadline = now + std::chrono::seconds{2};
         std::cout << "[launcher] Stopping children...\n";
@@ -3511,7 +3511,11 @@ class Launcher {
   const SessionLock* session_lock_{nullptr};
   // Far inside macOS clean-tmps' 3 unused days (introspect::TouchLockFile).
   static constexpr std::chrono::hours kSessionLockRefresh{1};
-  static inline volatile std::sig_atomic_t stop_requested_{false};
+  // Set by the SIGINT/SIGTERM handler, which may run on any thread, and read
+  // by the supervision thread: a lock-free atomic is both async-signal-safe
+  // and race-free across threads, which volatile sig_atomic_t is not.
+  static inline std::atomic<int> stop_requested_{0};
+  static_assert(std::atomic<int>::is_always_lock_free);
 };
 
 // ---------------------------------------------------------------------------
