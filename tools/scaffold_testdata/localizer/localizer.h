@@ -1,7 +1,7 @@
 #pragma once
 
-#include <chrono>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>

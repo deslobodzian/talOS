@@ -94,7 +94,7 @@ class ProgressStore {
     const std::string name = ::ShmObjectName(kProgressObject);
     int fd = ::shm_open(name.c_str(), O_RDWR | O_CREAT, 0600);
     if (fd < 0) throw std::runtime_error("autonomous: open progress failed");
-    struct stat status{};
+    struct stat status {};
     bool damaged = false;
     // macOS rounds the size up to a page, so only a smaller object is
     // another layout. macOS sizes a shared-memory object only once, so

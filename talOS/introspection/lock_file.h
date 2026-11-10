@@ -45,7 +45,7 @@ inline const std::string& LockDirectory() {
       }
     }
 #if defined(__linux__)
-    struct stat status{};
+    struct stat status {};
     if (::stat("/dev/shm", &status) == 0 && S_ISDIR(status.st_mode)) {
       return std::string{"/dev/shm"};
     }
@@ -99,8 +99,8 @@ inline int OpenLockFile(const std::string& path, int access) {
 // by hand) excludes nobody who opens the path anew, so an acquirer that finds
 // this false closes the descriptor and acquires again.
 inline bool LockFileIsCurrent(int fd, const std::string& path) {
-  struct stat held{};
-  struct stat named{};
+  struct stat held {};
+  struct stat named {};
   return ::fstat(fd, &held) == 0 && ::lstat(path.c_str(), &named) == 0 &&
          held.st_dev == named.st_dev && held.st_ino == named.st_ino;
 }

@@ -136,7 +136,6 @@ std::map<std::string, double> DecodeChannels(const Telemetry& telemetry,
   return DecodeChannels(telemetry, holder.get());
 }
 
-
 TEST(TelemetryTest, SchemaLessStateIsSilentlyExcluded) {
   const std::string kConfig = R"(
 [robot]
@@ -166,8 +165,7 @@ node = "//talOS/telemetry:node"
   const std::string stderr_output = ::testing::internal::GetCapturedStderr();
   // Only the budget report; nothing about the excluded schema-less topic.
   EXPECT_EQ(stderr_output.find("hw/state"), std::string::npos) << stderr_output;
-  EXPECT_NE(stderr_output.find("value page(s) per tick"),
-            std::string::npos)
+  EXPECT_NE(stderr_output.find("value page(s) per tick"), std::string::npos)
       << stderr_output;
 
   const auto dict = DictionaryMap(telemetry);
@@ -662,8 +660,8 @@ channel_count = )"} +
 can_id = 1
 [subsystems.telemetry]
 node = "//talOS/telemetry:node"
-exclude = [)" + std::string{exclude} +
-           "]\n";
+exclude = [)" +
+           std::string{exclude} + "]\n";
   };
   // Two channels per topic plus pose/valid, less one excluded.
   Sim at_cap = Sim::FromToml(config(R"("budget/state/0/offset_m")"));
@@ -782,7 +780,8 @@ TEST(TelemetryTest, DictionaryPastOneSlotPagesAndOneChannelMustFitAPage) {
   // One channel whose entry alone outgrows a page cannot be paged; the
   // refusal names it.
   const std::vector<ChannelDef> oversized{
-      {"status/huge", "", std::vector<std::string>(1024, std::string(256, 'x'))}};
+      {"status/huge", "",
+       std::vector<std::string>(1024, std::string(256, 'x'))}};
   try {
     MeasurePages(oversized);
     ADD_FAILURE() << "a channel larger than a dictionary page was accepted";
@@ -1007,7 +1006,8 @@ node = "//talOS/telemetry:node"
       kExact, ::geometry::Pose2d{1.0, 2.0, 0.5},
       ::geometry::Twist2d{0.0, 0.0, 0.0}, true, true, 0, 0});
   sim.step(20ms);
-  const auto raw = DecodeRaw(telemetry, LatestFrame(sim, "/talos/telemetry").get());
+  const auto raw =
+      DecodeRaw(telemetry, LatestFrame(sim, "/talos/telemetry").get());
   EXPECT_EQ(raw.at("pose_estimator/state/sample_time_ns"), kExact);
 }
 

@@ -950,7 +950,7 @@ void DamageProgress(const std::function<void(ProgressFile&)>& damage) {
   const int fd = ::shm_open(ShmObjectName(kProgressObject).c_str(),
                             O_RDWR | O_CREAT, 0600);
   ASSERT_GE(fd, 0);
-  struct stat status{};
+  struct stat status {};
   ASSERT_EQ(::fstat(fd, &status), 0);
   if (status.st_size == 0) ASSERT_EQ(::ftruncate(fd, sizeof(ProgressFile)), 0);
   void* memory = ::mmap(nullptr, sizeof(ProgressFile), PROT_READ | PROT_WRITE,

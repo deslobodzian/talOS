@@ -441,8 +441,7 @@ inline SystemGraphDocument BuildSystemGraph(const SystemGraphInput& input) {
   out += ",\"bridge\":{\"topic\":";
   AppendEscaped(out, input.bridge.topic);
   out += ",\"clients\":";
-  AppendFast(out, &fast,
-             [&] { out += std::to_string(input.bridge.clients); });
+  AppendFast(out, &fast, [&] { out += std::to_string(input.bridge.clients); });
   out += ",\"frames_forwarded\":";
   AppendFast(out, &fast,
              [&] { AppendU64(out, input.bridge.frames_forwarded); });
@@ -544,7 +543,8 @@ class GraphFeed {
         return false;
       }
       message = document.json;
-    } else if (values_ != document.values && now_ns - updated_ns_ >= kUpdateNs) {
+    } else if (values_ != document.values &&
+               now_ns - updated_ns_ >= kUpdateNs) {
       update = "{\"kind\":\"talos.system_graph.update\",\"structure\":\"";
       update += document.structure;
       update += "\",\"values\":";

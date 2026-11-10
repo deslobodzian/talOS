@@ -6,8 +6,8 @@
 #include <cstring>
 #include <iostream>
 #include <random>
-#include <stdexcept>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -48,9 +48,9 @@ int main(int argc, char** argv) try {
   const auto channels = argc > 2 ? std::stoul(argv[2]) : dictionary.size();
   if (channels < dictionary.size() ||
       channels > talos::telemetry_wire::kMaxChannels) {
-    throw std::runtime_error("mock channel count must be in [3, " +
-                             std::to_string(talos::telemetry_wire::kMaxChannels) +
-                             "]");
+    throw std::runtime_error(
+        "mock channel count must be in [3, " +
+        std::to_string(talos::telemetry_wire::kMaxChannels) + "]");
   }
   // Extra channels all change every tick, like a robot in motion: the
   // heaviest change-only load per channel.
@@ -60,7 +60,8 @@ int main(int argc, char** argv) try {
                           {},
                           Talos::Telemetry::ChannelKind_Double});
   }
-  const std::uint32_t dictionary_id = talos::telemetry::DictionaryId(dictionary);
+  const std::uint32_t dictionary_id =
+      talos::telemetry::DictionaryId(dictionary);
   std::random_device device;
   const std::uint64_t stream_id =
       (static_cast<std::uint64_t>(device()) << 32) | device();
@@ -69,7 +70,8 @@ int main(int argc, char** argv) try {
   // The buffer already starts with its size prefix; the slot is that prefix
   // plus buffer followed by unused padding.
   const auto publish = [&](std::span<const std::uint8_t> page) {
-    if (page.size() > slot.size()) throw std::runtime_error("page exceeds slot");
+    if (page.size() > slot.size())
+      throw std::runtime_error("page exceeds slot");
     std::memcpy(slot.data(), page.data(), page.size());
     queue.write(std::span<const std::byte>{slot.data(), slot.size()});
   };
@@ -103,8 +105,8 @@ int main(int argc, char** argv) try {
     samples[1] = (seq / 200) % dictionary[1].labels.size();
     samples[2] = 1;
     for (std::size_t i = 3; i < samples.size(); ++i) {
-      samples[i] = talos::telemetry::RawFromDouble(
-          std::sin(t + static_cast<double>(i)));
+      samples[i] =
+          talos::telemetry::RawFromDouble(std::sin(t + static_cast<double>(i)));
     }
     if (!talos::telemetry::EncodeValuePages(
             builder, header, pose, true, indices, samples, {},

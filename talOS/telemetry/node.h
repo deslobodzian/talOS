@@ -412,8 +412,8 @@ class Telemetry {
     check_length("name", name);
     check_length("unit", unit);
     for (const std::string& label : labels) check_length("label", label);
-    dictionary_.push_back(ChannelDef{std::move(name), std::move(unit),
-                                     std::move(labels), kind});
+    dictionary_.push_back(
+        ChannelDef{std::move(name), std::move(unit), std::move(labels), kind});
     return dictionary_.size() - 1;
   }
 
@@ -438,8 +438,8 @@ class Telemetry {
     std::string names;
     for (std::size_t i = 0; i < largest.size() && i < 3; ++i) {
       if (i != 0) names += ", ";
-      names += largest[i].second + " (" + std::to_string(largest[i].first) +
-               ")";
+      names +=
+          largest[i].second + " (" + std::to_string(largest[i].first) + ")";
     }
     throw std::runtime_error(
         "telemetry: " + std::to_string(dictionary_.size()) +
@@ -621,10 +621,9 @@ class Telemetry {
     channels.estop = AddChannel("hw/state/driver_station/estop", kBool);
     channels.fms_attached =
         AddChannel("hw/state/driver_station/fms_attached", kBool);
-    channels.alliance =
-        AddChannel("hw/state/driver_station/alliance",
-                   Talos::Telemetry::ChannelKind_UInt, "",
-                   {"unknown", "red", "blue"});
+    channels.alliance = AddChannel("hw/state/driver_station/alliance",
+                                   Talos::Telemetry::ChannelKind_UInt, "",
+                                   {"unknown", "red", "blue"});
     channels.match_time_s =
         AddChannel("hw/state/driver_station/match_time_s",
                    Talos::Telemetry::ChannelKind_Double, "s");

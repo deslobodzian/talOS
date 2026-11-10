@@ -92,8 +92,7 @@ TEST(RuntimeUdpTest, ALivePeersPortIsRefusedUntilItCloses) {
   ASSERT_NE(port, 0);
   ASSERT_NE(remote, 0);
   RuntimeUdpPeer first;
-  ASSERT_EQ(first.Open("127.0.0.1", port, "127.0.0.1", remote),
-            UdpStatus::kOk);
+  ASSERT_EQ(first.Open("127.0.0.1", port, "127.0.0.1", remote), UdpStatus::kOk);
   RuntimeUdpPeer second;
   EXPECT_EQ(second.Open("127.0.0.1", port, "127.0.0.1", remote),
             UdpStatus::kSocketError);

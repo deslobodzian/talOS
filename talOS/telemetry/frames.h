@@ -277,8 +277,8 @@ void EncodeDictionaryPages(flatbuffers::FlatBufferBuilder& builder,
                            const PageHeader& header,
                            std::span<const ChannelDef> dictionary,
                            Emit&& emit) {
-  const std::size_t room =
-      telemetry_wire::kMaxDictionaryPageBytes - detail::DictionaryPageOverhead();
+  const std::size_t room = telemetry_wire::kMaxDictionaryPageBytes -
+                           detail::DictionaryPageOverhead();
   for (const ChannelDef& channel : dictionary) {
     if (detail::DictionaryEntryBytes(channel) > room) {
       throw std::runtime_error(
@@ -311,11 +311,10 @@ void EncodeDictionaryPages(flatbuffers::FlatBufferBuilder& builder,
     throw std::length_error("telemetry: dictionary needs over 65535 pages");
   }
   partition([&](std::size_t page, std::size_t first, std::size_t count) {
-    detail::FinishDictionaryPage(builder, header,
-                                 static_cast<std::uint16_t>(page),
-                                 static_cast<std::uint16_t>(page_count),
-                                 static_cast<std::uint32_t>(first),
-                                 dictionary.subspan(first, count));
+    detail::FinishDictionaryPage(
+        builder, header, static_cast<std::uint16_t>(page),
+        static_cast<std::uint16_t>(page_count),
+        static_cast<std::uint32_t>(first), dictionary.subspan(first, count));
     if (builder.GetSize() > telemetry_wire::kMaxDictionaryPageBytes) {
       throw std::logic_error("telemetry: dictionary page over its byte bound");
     }

@@ -46,9 +46,9 @@ struct UdpStats {
 // Connected UDP runtime peer for the Mac<->Rio hot path.
 //
 // The class owns fixed TX/RX datagram buffers. SendFrame() encodes into the TX
-// buffer and sends immediately. TryReceive() decodes in place from the RX buffer;
-// the returned DecodedFrame payload pointer stays valid until the next receive
-// call on this peer.
+// buffer and sends immediately. TryReceive() decodes in place from the RX
+// buffer; the returned DecodedFrame payload pointer stays valid until the next
+// receive call on this peer.
 class RuntimeUdpPeer {
  public:
   RuntimeUdpPeer();
