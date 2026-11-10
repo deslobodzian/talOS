@@ -264,6 +264,19 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "sim_gateway: node registry unavailable: %s\n",
                    e.what());
     }
+    // The gateway stands in for the RoboRIO, whose loop never waits behind the
+    // main processor's nodes, so it takes the bridge's tier whenever the node
+    // loops take theirs (TALOS_REALTIME=1 under --sim): left at timeshare, a
+    // host stall that the time-constraint nodes ride out would stop every
+    // State and expire their targets. Called last, from the only thread.
+    talos::process::RealtimeOutcome realtime{
+        .tier = talos::process::LoopTier::kBridge};
+    if (talos::process::RealtimeRequested(/*simulation=*/true)) {
+      realtime = talos::process::ConfigureRealtime(
+          {.period = std::chrono::microseconds{gateway.config().period_us},
+           .tier = realtime.tier});
+    }
+    if (registration) registration->set_realtime(realtime);
     auto next = std::chrono::steady_clock::now();
     // The mode, joystick and fault schedules and --duration-s count from one
     // node-clock time zero, so a harness that chose it times its own actions

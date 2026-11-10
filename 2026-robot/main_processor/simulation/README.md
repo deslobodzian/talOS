@@ -273,7 +273,10 @@ run fits Bazel's 900 s `long` timeout) with the stick centred for the first
 It prints each owner's request-gap p99 and maximum. Failure artifacts are
 retained in the test's undeclared outputs, and a failure prints the tails of
 the launcher's and the Studio bridge's logs (the bridge's own exit reason is
-only in its log).
+only in its log). The CI job also records the host once a second during the
+test (`vm_stat`/`vmstat`, `top`, and on macOS the busiest threads' priority
+and scheduling policy from `ps -M`) into `host/` beside the test's logs, kept
+with a failed session.
 
 ## Realtime scheduling in the full-graph tests on macOS
 
@@ -289,6 +292,14 @@ fallback cannot pass. Linux runs keep timeshare: they pass without it, and
 also prints the restarted drivetrain's kill → loop origin, origin → first
 dispatch (`run()`) and first dispatch → first request times, separating a
 slow exit and respawn from a slow node startup.
+
+`sim_gateway` honours the same variable (`talos::process::RealtimeRequested`):
+it stands in for the RoboRIO, so it takes the bridge's tier for its loop
+period (`[robot] period_us`) and reports the outcome in its registry row
+(`loop_tier = "bridge"` in the session manifest), so `startup_test` holds it
+to a full grant as it does `hardware_node`. A gateway left at timeshare beside time-constraint
+nodes stops sending State whenever the host stalls timeshare work, and the
+nodes then correctly expire their targets.
 
 ## Pose-estimator accuracy scenario
 
