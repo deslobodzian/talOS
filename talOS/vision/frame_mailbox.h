@@ -29,8 +29,9 @@ namespace talos::vision {
 // in the ready slot, frames that hold no image, and whatever the consumer
 // reports with CountDropped (driver-side losses, a retired capture session).
 //
-// Slot storage is allocated by Reserve() and grows only for a frame larger
-// than every earlier one, so steady-state publication does not allocate.
+// Slot storage grows only for a frame larger than every earlier one in that
+// slot, so after each slot's first frame (or a Reserve() large enough)
+// steady-state publication does not allocate.
 class FrameMailbox {
  public:
   FrameMailbox() {

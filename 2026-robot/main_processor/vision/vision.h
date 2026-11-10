@@ -190,15 +190,11 @@ class Vision {
     sim_tags_.reserve(256);
     detections_.reserve(256);
     if (CanCapture(simulated_, device_)) {
-      // Room for the widest delivered format (BGRA) at the configured size,
-      // so steady-state capture copies into the mailbox without allocating.
-      // The pixel format is negotiated only when the worker opens the
-      // source, after this; AVFoundation falls back to BGRA, while V4L2
-      // delivers at most 2 B/px, so on Linux this over-reserves by up to 2x.
-      mailbox_.Reserve(
-          static_cast<std::size_t>(capture_config_.width) *
-          capture_config_.height *
-          talos::vision::BytesPerPixel(talos::vision::PixelFormat::kBgra8));
+      // No up-front mailbox reservation: the pixel format (V4L2 at most
+      // 2 B/px, AVFoundation BGRA) is negotiated only when the worker opens
+      // the source, and frames may arrive before Start() returns. Each slot
+      // instead grows to the negotiated frame size the first time it is
+      // filled (three allocations), then capture copies without allocating.
       worker_ = std::thread([this] { Work(); });
     }
   }

@@ -270,8 +270,10 @@ Capture hands frames to the worker through one newest-wins triple buffer
 buffer it borrows (V4L2 mmap buffer, locked CoreVideo buffer) into the filling
 slot and swaps it with the ready slot; the worker swaps the ready slot with the
 one it processes. The worker therefore always gets the newest complete frame,
-and the frame it is processing is never overwritten. Slots are reserved for a
-BGRA image at the configured size, so steady-state capture does not allocate.
+and the frame it is processing is never overwritten. Each slot is sized by
+the first frame it holds, in the format the source negotiated when it opened
+(V4L2 delivers at most 2 B/px, AVFoundation BGRA 4 B/px), and grows only for a
+larger frame, so steady-state capture does not allocate.
 Processing replaces one fixed-size completed observation. `frames_dropped_count`
 is the mailbox's single count of every frame that never reached a published
 observation: a ready frame replaced before the worker took it, a frame without
