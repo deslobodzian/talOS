@@ -25,7 +25,12 @@
 // TalonFX's `inverted` flips its output and its own position and velocity
 // together, as Phoenix 6's MotorOutput.Inverted does, so its closed loops run
 // in the configured positive direction; CANcoders and the chassis see the
-// physical rotor.
+// physical rotor. A follower ignores its own `inverted`, as under Phoenix 6's
+// Follower request: it drives in its master's configured direction, reversed
+// by `oppose_master`, and reports in its master's frame, as PhoenixBackend
+// reports it. A motor whose feedback is a remote CANcoder reports, and closes
+// its loops on, that CANcoder's reading in the CANcoder's own direction, so a
+// motor/CANcoder direction mismatch runs away here as on a robot.
 //
 // Sensors cross the hardware boundary. CANcoder samples mirror the linked
 // mechanism. Swerve ground motion determines the true field pose; the Pigeon
@@ -321,8 +326,10 @@ class PhysicsSimBackend final : public Backend {
         continue;
       }
       const double gear = Gear(i);
-      const double mech_pos = axes_[i].rotor_position_rot * Direction(i) / gear;
-      const double mech_vel = axes_[i].rotor_velocity_rps * Direction(i) / gear;
+      const double mech_pos =
+          axes_[i].rotor_position_rot * FeedbackDirection(i) / gear;
+      const double mech_vel =
+          axes_[i].rotor_velocity_rps * FeedbackDirection(i) / gear;
       out.valid = true;
       out.position_rot = mech_pos;
       out.velocity_rps = mech_vel;
@@ -664,10 +671,37 @@ class PhysicsSimBackend final : public Backend {
     double velocity_rps{};
   };
 
-  // The configured positive direction of motor i in the physical rotor frame:
-  // Phoenix 6 inversion applies to output and rotor sensor alike.
+  // Phoenix 6 output direction of motor i in the physical rotor frame. A
+  // follower's own Inverted does not apply: the Follower request takes the
+  // master's configured direction, reversed when opposed.
+  double OutputDirection(std::size_t i) const {
+    double sign = 1.0;
+    for (std::size_t hop = 0; hop <= config_.motors.size(); ++hop) {
+      const auto& m = config_.motors[i];
+      const int master = m.master_id != 0 ? MotorIndex(m.master_id) : -1;
+      if (master < 0) return m.inverted ? -sign : sign;
+      if (m.oppose_master) sign = -sign;
+      i = static_cast<std::size_t>(master);
+    }
+    return sign;  // A follower cycle is never powered.
+  }
+
+  // The frame motor i's voltage and rotor feedback are reported in, in the
+  // physical rotor frame: its configured direction, or for a follower its
+  // master's, matching PhoenixBackend, which undoes the opposition Phoenix
+  // applies to an opposed follower's signals.
   double Direction(std::size_t i) const {
-    return config_.motors[i].inverted ? -1.0 : 1.0;
+    const auto& m = config_.motors[i];
+    return m.master_id != 0 && m.oppose_master ? -OutputDirection(i)
+                                               : OutputDirection(i);
+  }
+
+  // The direction of motor i's position and velocity feedback in the physical
+  // rotor frame: a remote CANcoder's own direction, else Direction(i).
+  double FeedbackDirection(std::size_t i) const {
+    const int sensor = motor_to_sensor_[i];
+    if (sensor < 0) return Direction(i);
+    return config_.sensors[sensor].inverted ? -1.0 : 1.0;
   }
 
   double Gear(std::size_t i) const {
@@ -691,7 +725,7 @@ class PhysicsSimBackend final : public Backend {
     const double gear = Gear(i);
     if (out.position_rot < lo || out.position_rot > hi) {
       const double clamped = std::clamp(out.position_rot, lo, hi);
-      axes_[i].rotor_position_rot = clamped * Direction(i) * gear;
+      axes_[i].rotor_position_rot = clamped * FeedbackDirection(i) * gear;
       out.position_rot = clamped;
       if ((out.position_rot <= lo && out.velocity_rps < 0) ||
           (out.position_rot >= hi && out.velocity_rps > 0)) {
@@ -734,8 +768,10 @@ class PhysicsSimBackend final : public Backend {
       mech.load = LoadKind::kRoller;
       double volts = 0.0;
       const double gear = mech.gear_ratio;
-      const double mech_pos = axes_[i].rotor_position_rot * Direction(i) / gear;
-      const double mech_vel = axes_[i].rotor_velocity_rps * Direction(i) / gear;
+      const double mech_pos =
+          axes_[i].rotor_position_rot * FeedbackDirection(i) / gear;
+      const double mech_vel =
+          axes_[i].rotor_velocity_rps * FeedbackDirection(i) / gear;
       auto& profile = profiles_[i];
       const auto& req = commands_[i];
       bool want_power;
@@ -790,6 +826,8 @@ class PhysicsSimBackend final : public Backend {
       mech.gear_ratio = Gear(i);
       mech.brake = m.brake;
       const double volts = applied_volts_[i];
+      // A follower's applied volts are its master's, reversed if opposed, so
+      // this is OutputDirection(i) times the master's volts.
       const double rotor_volts = Direction(i) * volts;
       axes_[i] = StepAxis(motor, mech, axes_[i], rotor_volts, powered_[i],
                           supply_v_, dt_s);

@@ -327,7 +327,7 @@ or without a live command. On the real backend, neutral disables PWM pulses
 | Velocity demand | Applies instantly, even with zero gains | P+FF loop produces volts; zero gains stall |
 | Position demand | Teleports | P-loop ramps through voltage; MotionMagic uses trapezoid profiles |
 | Neutral | Velocity snaps to 0 | Unpowered decay: brake stops fast, coast rolls on |
-| Gearing/inversion | Ignored | Rotor/gearing division, inversion flips direction |
+| Gearing/inversion | Ignored | Rotor/gearing division, inversion flips direction; a follower drives in its master's direction (reversed if opposed), ignoring its own `inverted`; a remote-CANcoder motor reports and closes its loops on the CANcoder in the CANcoder's direction |
 | Soft limits | Ignored | Clamped, axis stopped at the limit |
 | Pigeon yaw | Zero raw yaw, then mounting offset/inversion | True chassis yaw relative to boot, plus optional drift; explicit gyro overrides remain available |
 | Supply voltage | Ignored | Scales free speed (`SetSupplyVoltage`) |

@@ -350,8 +350,7 @@ TEST(SimBelievability, GearingAndLimits) {
 
 // Phoenix 6's MotorOutput.Inverted flips the rotor sensor with the output, so
 // a TalonFX reports position and velocity in its configured positive
-// direction. Inverted or not, a closed loop converges and positive duty reads
-// positive; the inversion shows only on the physical rotor a CANcoder sees.
+// direction: inverted or not, a closed loop converges.
 TEST(SimBelievability, InvertedMotorReportsItsConfiguredDirection) {
   for (const bool inverted : {false, true}) {
     for (const auto mode : {Mode::kPosition, Mode::kMotionMagic}) {
@@ -373,21 +372,84 @@ TEST(SimBelievability, InvertedMotorReportsItsConfiguredDirection) {
           << "inverted=" << inverted << " mode=" << static_cast<int>(mode);
       EXPECT_NEAR(s.motors[0].velocity_rps, 0.0, 0.01);
     }
-    Config c = SingleMotorConfig();
-    c.motors[0].inverted = inverted;
-    c.sensors.push_back({2, "encoder", SensorKind::kCANcoder, 20, "rio"});
-    c.motors[0].feedback = Feedback::kRemoteCANcoder;
-    c.motors[0].feedback_sensor_id = 2;
-    PhysicsSimBackend backend;
-    ASSERT_TRUE(backend.Configure(c));
-    std::array<MotorRequest, 1> cmd{Duty(1, 0.5)};
-    ASSERT_TRUE(backend.Apply(cmd));
-    State s{};
-    uint64_t now_us = 0;
-    StepBackend(backend, s, now_us, 5000, 100);
-    EXPECT_GT(s.motors[0].velocity_rps, 10.0) << "inverted=" << inverted;
-    EXPECT_NEAR(s.sensors[0].velocity_rps,
-                (inverted ? -1.0 : 1.0) * s.motors[0].velocity_rps, 1e-9);
+  }
+}
+
+// A remote CANcoder keeps its own direction, and a TalonFX fed back from it
+// reports and closes its loops on that reading. A loop whose motor and
+// CANcoder directions agree converges; a mismatch is positive feedback and
+// runs away, as it would on a robot.
+TEST(SimBelievability, RemoteCancoderFeedbackKeepsTheEncoderDirection) {
+  for (const bool motor_inverted : {false, true}) {
+    for (const bool sensor_inverted : {false, true}) {
+      Config c = SingleMotorConfig();
+      c.motors[0].inverted = motor_inverted;
+      SensorConfig encoder{2, "encoder", SensorKind::kCANcoder, 20, "rio"};
+      encoder.inverted = sensor_inverted;
+      c.sensors.push_back(encoder);
+      c.motors[0].feedback = Feedback::kRemoteCANcoder;
+      c.motors[0].feedback_sensor_id = 2;
+      c.motors[0].slots[0].p = 1.0;
+      c.motors[0].slots[0].d = 0.05;
+      PhysicsSimBackend backend;
+      ASSERT_TRUE(backend.Configure(c));
+      std::array<MotorRequest, 1> cmd{{{1, Mode::kPosition, 0, 2.0, 0.0}}};
+      ASSERT_TRUE(backend.Apply(cmd));
+      State s{};
+      uint64_t now_us = 0;
+      StepBackend(backend, s, now_us, 5000, 1000);
+      EXPECT_DOUBLE_EQ(s.motors[0].position_rot, s.sensors[0].position_rot);
+      if (motor_inverted == sensor_inverted) {
+        EXPECT_NEAR(s.motors[0].position_rot, 2.0, 0.01)
+            << "motor_inverted=" << motor_inverted;
+      } else {
+        EXPECT_LT(s.motors[0].position_rot, -100.0)
+            << "motor_inverted=" << motor_inverted;
+      }
+    }
+  }
+}
+
+// Under Phoenix 6's Follower request a follower drives in its master's
+// configured direction, reversed when opposed; its own Inverted does not
+// apply. CANcoders on each rotor show the physical direction.
+TEST(SimFollowers, FollowerTakesItsMasterDirectionNotItsOwnInverted) {
+  for (const bool master_inverted : {false, true}) {
+    for (const bool follower_inverted : {false, true}) {
+      for (const bool oppose : {false, true}) {
+        Config c = SingleMotorConfig();
+        c.motors[0].inverted = master_inverted;
+        auto follower = TestMotor(2, "follower", 2);
+        follower.master_id = 1;
+        follower.oppose_master = oppose;
+        follower.inverted = follower_inverted;
+        c.motors.push_back(follower);
+        for (std::size_t i = 0; i < 2; ++i) {
+          const auto id = static_cast<uint16_t>(10 + i);
+          c.sensors.push_back(
+              {id, i == 0 ? "master_encoder" : "follower_encoder",
+               SensorKind::kCANcoder, static_cast<int>(20 + i), "rio"});
+          c.motors[i].feedback = Feedback::kRemoteCANcoder;
+          c.motors[i].feedback_sensor_id = id;
+        }
+        PhysicsSimBackend backend;
+        ASSERT_TRUE(backend.Configure(c));
+        std::array<MotorRequest, kMaxMotors> cmd{};
+        cmd[0] = Duty(1, 0.5);
+        cmd[1] = Duty(2, 0.0);  // A follower runs only while not neutral.
+        ASSERT_TRUE(backend.Apply(cmd));
+        State s{};
+        uint64_t now_us = 0;
+        StepBackend(backend, s, now_us, 5000, 100);
+        const double master_rps = s.sensors[0].velocity_rps;
+        EXPECT_GT(master_rps * (master_inverted ? -1.0 : 1.0), 10.0);
+        EXPECT_NEAR(s.sensors[1].velocity_rps,
+                    master_rps * (oppose ? -1.0 : 1.0), 1e-9)
+            << "master_inverted=" << master_inverted
+            << " follower_inverted=" << follower_inverted
+            << " oppose=" << oppose;
+      }
+    }
   }
 }
 
