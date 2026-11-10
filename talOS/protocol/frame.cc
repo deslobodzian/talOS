@@ -1,28 +1,27 @@
 #include "frame.h"
 
 #include <concepts>
+#include <cstddef>
 #include <cstring>
 
 namespace talos::protocol {
 namespace {
 
+// The wire is little-endian on every host: bytes are placed by shift, never by
+// copying the host's object representation.
 template <std::unsigned_integral T>
 void WriteUInt(uint8_t* out, T value) {
-  std::memcpy(out, &value, sizeof(value));
+  for (std::size_t i = 0; i < sizeof(T); ++i) {
+    out[i] = static_cast<uint8_t>(value >> (8 * i));
+  }
 }
 
-/* memcpy and bit shift have same # of instructions when optimized
- "ReadUInt<uint16_t>(unsigned char const*)":
-        movzx   eax, WORD PTR [rdi]
-        ret
- "ReadUInt<uint16_t>memcpy(unsigned char const*)":
-        movzx   eax, WORD PTR [rdi]
-        ret
- */
 template <std::unsigned_integral T>
 T ReadUInt(const uint8_t* in) {
-  T out;
-  std::memcpy(&out, in, sizeof(T));
+  T out = 0;
+  for (std::size_t i = 0; i < sizeof(T); ++i) {
+    out = static_cast<T>(out | (T{in[i]} << (8 * i)));
+  }
   return out;
 }
 }  // namespace

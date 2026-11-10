@@ -914,6 +914,34 @@ TEST(ConfigWire, RejectsCeilingViolations) {
   EXPECT_EQ(status, ConfigAssembler::Status::kCeilingExceeded);
 }
 
+// Chunk headers and ACKs are little-endian on the wire whatever the host's
+// byte order, like every other payload (docs/DATA_FLOW.md).
+TEST(ConfigWire, ChunkHeaderAndAckAreLittleEndian) {
+  const auto config = SwerveConfig(true);
+  const auto chunks = CreateConfigChunks(config);
+  ASSERT_FALSE(chunks.empty());
+  const auto id = ConfigurationId(config);
+  const auto& first = chunks.front();
+  ASSERT_GE(first.size(), sizeof(ConfigChunkHeader));
+  for (int i = 0; i < 8; ++i)
+    EXPECT_EQ(first[i], static_cast<uint8_t>(id >> (8 * i)));
+  const auto total = static_cast<uint32_t>(SerializeConfig(config).size());
+  for (int i = 0; i < 4; ++i)
+    EXPECT_EQ(first[12 + i], static_cast<uint8_t>(total >> (8 * i)));
+  EXPECT_EQ(first[16], 0);  // chunk_index 0
+  EXPECT_EQ(first[17], 0);
+  EXPECT_EQ(first[18], static_cast<uint8_t>(chunks.size()));
+  EXPECT_EQ(first[19], 0);
+
+  ConfigAckPayload ack{};
+  ack.config_id = 0x0102030405060708ull;
+  ack.status = ConfigAckStatus::kBackendFailed;
+  std::array<uint8_t, sizeof(ConfigAckPayload)> bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, bytes), bytes.size());
+  const std::array<uint8_t, 9> expected{8, 7, 6, 5, 4, 3, 2, 1, 4};
+  EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin()));
+}
+
 TEST(Gateway, StartsUnconfiguredAndRefusesEnableUntilReconfigured) {
   SimBackend backend;
   Gateway g{backend, 1001};
@@ -1776,6 +1804,41 @@ TEST(Endpoint, PendingDegradedConfigureDoesNotBlockTicksAndRecoversDevice) {
   command.epoch = gateway.snapshot().epoch;
   ASSERT_TRUE(gateway.Accept(command, 3, 267000));
   EXPECT_EQ(backend.last_requests[0].mode, Mode::kDutyCycle);
+}
+
+// After a stall the socket holds a command backlog; replaying it would put
+// every superseded demand on the CAN bus back-to-back.
+TEST(Endpoint, AppliesOnlyTheNewestQueuedCommand) {
+  FakeBackend backend;
+  Gateway gateway{backend, 3012};
+  ASSERT_TRUE(gateway.Reconfigure(SwerveConfig(true)));
+  gateway.Tick(1000, true);
+  Endpoint endpoint{gateway};
+  ASSERT_EQ(endpoint.Open("127.0.0.1", 15816, "127.0.0.1", 15817),
+            protocol::UdpStatus::kOk);
+  protocol::RuntimeUdpPeer companion;
+  ASSERT_EQ(companion.Open("127.0.0.1", 15817, "127.0.0.1", 15816),
+            protocol::UdpStatus::kOk);
+  auto command = Request(gateway);
+  for (int demand = 1; demand <= 5; ++demand) {
+    command.motors[0].demand = demand;
+    std::array<uint8_t, kMaxCommandSize> bytes{};
+    const auto size = Encode(command, bytes);
+    ASSERT_GT(size, 0u);
+    ASSERT_EQ(
+        companion.SendFrame(protocol::FrameType::kHardwareCommand,
+                            protocol::kFlagNone, 1000, bytes.data(), size),
+        protocol::UdpStatus::kOk);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  const int applied_before = backend.applied;
+  ASSERT_EQ(endpoint.Tick(2000, true), protocol::UdpStatus::kOk);
+  EXPECT_EQ(backend.applied - applied_before, 1);
+  ASSERT_FALSE(backend.last_requests.empty());
+  EXPECT_DOUBLE_EQ(backend.last_requests[0].demand, 5.0);
+  EXPECT_EQ(gateway.snapshot().last_command_sequence,
+            companion.next_send_sequence() - 1);
+  EXPECT_EQ(gateway.snapshot().counters.rejected_command_count, 0u);
 }
 
 }  // namespace

@@ -384,6 +384,49 @@ struct ConfigAckPayload {
 static_assert(sizeof(ConfigChunkHeader) == 24, "Update docs/DATA_FLOW.md");
 static_assert(sizeof(ConfigAckPayload) == 73, "Update docs/DATA_FLOW.md");
 
+// The packed structs fix the sizes; their bytes travel field by field,
+// little-endian, like every other talOS wire payload, never as the host's
+// object representation.
+namespace detail {
+inline void PutLittleEndian(uint8_t* out, uint64_t value, int bytes) {
+  for (int i = 0; i < bytes; ++i) {
+    out[i] = static_cast<uint8_t>(value & 0xFF);
+    value >>= 8;
+  }
+}
+inline uint64_t GetLittleEndian(const uint8_t* in, int bytes) {
+  uint64_t value{};
+  for (int i = 0; i < bytes; ++i) value |= uint64_t{in[i]} << (i * 8);
+  return value;
+}
+}  // namespace detail
+
+inline void EncodeConfigChunkHeader(const ConfigChunkHeader& header,
+                                    uint8_t* out) {
+  detail::PutLittleEndian(out + 0, header.config_id, 8);
+  detail::PutLittleEndian(out + 8, header.total_crc32, 4);
+  detail::PutLittleEndian(out + 12, header.total_bytes, 4);
+  detail::PutLittleEndian(out + 16, header.chunk_index, 2);
+  detail::PutLittleEndian(out + 18, header.chunk_count, 2);
+  detail::PutLittleEndian(out + 20, header.chunk_bytes, 4);
+}
+
+inline ConfigChunkHeader DecodeConfigChunkHeader(const uint8_t* in) {
+  ConfigChunkHeader header;
+  header.config_id = detail::GetLittleEndian(in + 0, 8);
+  header.total_crc32 =
+      static_cast<uint32_t>(detail::GetLittleEndian(in + 8, 4));
+  header.total_bytes =
+      static_cast<uint32_t>(detail::GetLittleEndian(in + 12, 4));
+  header.chunk_index =
+      static_cast<uint16_t>(detail::GetLittleEndian(in + 16, 2));
+  header.chunk_count =
+      static_cast<uint16_t>(detail::GetLittleEndian(in + 18, 2));
+  header.chunk_bytes =
+      static_cast<uint32_t>(detail::GetLittleEndian(in + 20, 4));
+  return header;
+}
+
 // Validate() limits device names and CAN bus names to 63 bytes. Text fields
 // also carry a two-byte length; the remaining sizes mirror SerializeConfig.
 inline constexpr std::size_t kMaxConfigTextBytes = 2 + 63;
@@ -430,7 +473,7 @@ inline std::vector<std::vector<uint8_t>> CreateConfigChunks(
     hdr.chunk_count = chunk_count;
     hdr.chunk_bytes = static_cast<uint32_t>(chunk_size);
 
-    std::memcpy(chunk.data(), &hdr, sizeof(hdr));
+    EncodeConfigChunkHeader(hdr, chunk.data());
     std::memcpy(chunk.data() + sizeof(hdr), serialized.data() + offset,
                 chunk_size);
     chunks.push_back(std::move(chunk));
@@ -456,8 +499,7 @@ class ConfigAssembler {
       return Status::kInvalidChunk;
     }
 
-    ConfigChunkHeader hdr;
-    std::memcpy(&hdr, payload.data(), sizeof(hdr));
+    const ConfigChunkHeader hdr = DecodeConfigChunkHeader(payload.data());
 
     if (hdr.chunk_bytes == 0 || hdr.chunk_bytes > kMaxConfigChunkData ||
         payload.size() != sizeof(ConfigChunkHeader) + hdr.chunk_bytes) {
@@ -618,14 +660,18 @@ inline bool LoadPersistedConfig(std::span<const uint8_t> bytes,
 inline std::size_t EncodeConfigAck(const ConfigAckPayload& ack,
                                    std::span<uint8_t> out) {
   if (out.size() < sizeof(ConfigAckPayload)) return 0;
-  std::memcpy(out.data(), &ack, sizeof(ack));
-  return sizeof(ack);
+  detail::PutLittleEndian(out.data(), ack.config_id, 8);
+  out[8] = static_cast<uint8_t>(ack.status);
+  std::memcpy(out.data() + 9, ack.reason, sizeof(ack.reason));
+  return sizeof(ConfigAckPayload);
 }
 
 inline bool DecodeConfigAck(std::span<const uint8_t> in,
                             ConfigAckPayload& out) {
   if (in.size() < sizeof(ConfigAckPayload)) return false;
-  std::memcpy(&out, in.data(), sizeof(out));
+  out.config_id = detail::GetLittleEndian(in.data(), 8);
+  out.status = static_cast<ConfigAckStatus>(in[8]);
+  std::memcpy(out.reason, in.data() + 9, sizeof(out.reason));
   return true;
 }
 

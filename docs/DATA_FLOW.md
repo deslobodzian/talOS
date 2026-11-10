@@ -42,7 +42,7 @@ For processor ownership and layer boundaries, see
 | Devices ↔ RIO backend | CAN / local DIO, analog, encoder, PWM; no IP port | Gateway samples/applies on `Config.period_us`: 5000 µs = 200 Hz. Phoenix motion feedback requests `status_hz`; voltage/stator-current/supply-current/fault diagnostics request `min(status_hz, 50)` Hz; device temperature requests `min(status_hz, 4)` Hz. Shared vendor frames apply their highest requested rate: voltage/current/temperature remain 200 Hz with 200 Hz feedback; fault field applies 50 Hz. Disabled one-shot neutral refresh remains every hardware tick. |
 | Driver Station ↔ RIO | WPILib/FRC native control/status over radio; not talOS UDP | DS produces new data at 50 Hz; RIO refreshes WPILib and observes the mode generation each hardware tick; snapshot cadence is in row DriverStation (24). Native FRC packet layouts are external to this repo. |
 | RIO → hardware_node: State (type 20) | UDP source gateway 5802 → bridge 5803, wired robot switch | One snapshot per gateway tick, 200 Hz; echoes clock probe send time only after a subsequent gateway tick. |
-| hardware_node → RIO: Command (21) | UDP 5803 → 5802 | Bridge polls every 1000 µs. Send immediately when merged command changes, otherwise heartbeat `clamp(command_timeout_us / 5, 5000, 20000)` µs: 20000 µs = 50 Hz with the configured 100000 µs timeout. Only after observed state and while a subsystem request is active; not unconditionally 1000 Hz. |
+| hardware_node → RIO: Command (21) | UDP 5803 → 5802 | Bridge polls every 1000 µs. Send immediately when merged command changes, otherwise heartbeat `clamp(command_timeout_us / 5, 5000, 20000)` µs: 20000 µs = 50 Hz with the configured 100000 µs timeout. Only after observed state and while a subsystem request is active; not unconditionally 1000 Hz. The RIO applies only the highest-sequence command of each tick's received batch (`endpoint.h`), so a backlog queued during a RIO stall is skipped, not replayed. |
 | hardware_node → RIO: Config chunks (22) | UDP 5803 → 5802 | Whole config push on observed boot/config mismatch or while unacknowledged; retry on State after ≥50000 µs, doubling after rejected ACKs from 100 ms to 2 s. A changed boot ID pushes immediately and resets backoff. Commands continue during backoff; no pushes after successful matching acknowledgment. |
 | RIO → hardware_node: ConfigAck (23) | UDP 5802 → 5803 | On completed assembly and asynchronous reconfiguration, or rejected chunk/config; no per-chunk ACK for incomplete assemblies. Per-device degraded configure succeeds, with invalid samples identifying unavailable devices. |
 | RIO → hardware_node: DriverStation (24) | UDP 5802 → 5803 | 50 Hz on real RIO and standalone `sim_gateway`, independently of the hardware tick: snapshots are ≥20000 µs apart, except that the tick observing a new mode sends one at once. An enabled mode switch (autonomous to teleop) changes no State; only the new generation retires the old mode's target lanes. |
@@ -104,8 +104,8 @@ need no IP fragmentation (`talOS/protocol/frame.h`, `frame.cc`, `types.h`).
 |---|---|---:|---:|---:|
 | State, type 20 | `66 + 45M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 34` | 1388 | 1428 | 44 |
 | Command, type 21 | `38 + 20M + 3DO + 10PWM` | 410 | 450 | 1022 |
-| Config chunk, type 22 | packed 24-byte header + ≤1408 data | 1432 | 1472 | 0 for full chunk |
-| ConfigAck, type 23 | packed u64 config_id + u8 status + char[64] reason | 73 | 113 | 1359 |
+| Config chunk, type 22 | 24-byte header (config_id u64, total_crc32 u32, total_bytes u32, chunk_index u16, chunk_count u16, chunk_bytes u32) + ≤1408 data | 1432 | 1472 | 0 for full chunk |
+| ConfigAck, type 23 | u64 config_id + u8 status + char[64] reason | 73 | 113 | 1359 |
 | DriverStation, type 24 | 40 fixed + two FMS strings + six variable joysticks | 678 | 718 | 754 |
 | ClockProbe, type 25 | empty; send timestamp uses existing frame header | 0 | 40 | 1432 |
 
@@ -195,11 +195,10 @@ sender, including config ACKs, writes zero header flags (`kFlagNone`, the only
 declared flag): ConfigAck is a frame type, and chunking is payload-level.
 Sequence numbers still expose datagram gaps.
 
-**Known byte-order inconsistency:** ConfigChunkHeader and ConfigAckPayload are
-packed structs copied with `memcpy`, so they use host byte order. Serialized
-Config, State, Command, DS, and protocol frame fields explicitly write
-little-endian. Both current endpoints are little-endian; this document records
-the inconsistency without changing the wire format.
+Every multi-byte field on the link, frame header, chunk header and ACK
+included, is written little-endian byte by byte, never as the host's object
+representation (`frame.cc`, `config_wire.h`); the packed structs only fix the
+sizes asserted above.
 
 ## Main-processor shared-memory slots
 

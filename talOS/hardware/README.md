@@ -149,10 +149,16 @@ Phoenix 6 is pinned in `2026-robot/controller_processor/rio/vendordeps/Phoenix6.
 ## Runtime Contract
 
 Frame types `kHardwareState` and `kHardwareCommand` use the versioned UDP frame
-transport. Their payload codecs explicitly encode little-endian integers and
-IEEE-754 doubles, with exact length checks. Native C++ object layout is never
-the network format. The payload limit is `protocol::kMaxPayloadSize`, currently
-1432 bytes; `Packet` and the endpoint buffer are both sized from that constant.
+transport. Their payload codecs, like the config chunk header and ACK, explicitly
+encode little-endian integers and IEEE-754 doubles, with exact length checks.
+Native C++ object layout is never the network format. The payload limit is
+`protocol::kMaxPayloadSize`, currently 1432 bytes; `Packet` and the endpoint
+buffer are both sized from that constant.
+
+Each `Endpoint::Tick` drains a bounded batch of frames and hands the gateway
+only the highest-sequence command among them: superseded commands queued while
+the RoboRIO loop stalled are skipped, not applied back-to-back on the CAN bus,
+and are not counted as rejected.
 
 The gateway publishes its configuration ID, boot ID, control epoch, monotonic
 poll timestamp, last accepted command sequence, enable/configuration/fault

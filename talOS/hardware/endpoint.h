@@ -50,7 +50,13 @@ class Endpoint {
       Send(protocol::FrameType::kHardwareConfigAck, now_us, bytes.data(), size);
       pending_ack_ = false;
     }
-    for (int i = 0; i < 16; ++i) {
+    // Only the newest command of the drained batch reaches the gateway: after
+    // a stall the socket holds a backlog, and applying each queued command
+    // would replay superseded demands back-to-back as CAN bursts.
+    bool have_command = false;
+    uint64_t command_sequence = 0;
+    Command newest;
+    for (int i = 0; i < kReceiveBudget; ++i) {
       protocol::DecodedFrame frame;
       const auto result = peer_.TryReceive(&frame);
       if (result == protocol::UdpStatus::kWouldBlock) break;
@@ -124,10 +130,15 @@ class Endpoint {
       }
 
       if (frame.header.type != protocol::FrameType::kHardwareCommand) continue;
+      if (have_command && frame.header.sequence <= command_sequence) continue;
       Command command;
-      if (Decode({frame.payload, frame.payload_size}, command))
-        gateway_.Accept(command, frame.header.sequence, now_us);
+      if (Decode({frame.payload, frame.payload_size}, command)) {
+        newest = command;
+        have_command = true;
+        command_sequence = frame.header.sequence;
+      }
     }
+    if (have_command) gateway_.Accept(newest, command_sequence, now_us);
     auto state = gateway_.snapshot();
     state.clock_probe_time_us = clock_probe_time_us;
     const auto size = Encode(state, buffer_);
@@ -150,6 +161,10 @@ class Endpoint {
     return peer_.SendFrame(type, protocol::kFlagNone, now_us, payload,
                            payload_size);
   }
+  // Frames drained per Tick. Receiving only decodes and the gateway applies at
+  // most one command per Tick, so a post-stall backlog drains in a few Ticks
+  // with one CAN write pass each.
+  static constexpr int kReceiveBudget = 64;
   bool send_enabled_{true};
   uint64_t pending_probe_time_us_{};
   Gateway& gateway_;
