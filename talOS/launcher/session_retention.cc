@@ -117,6 +117,9 @@ SessionFacts InspectSession(const fs::path& dir) {
   if (parsed == std::errc{} && end == start.data() + start.size() &&
       start_ns > 0)
     facts.start_wall_ns = start_ns;
+  // The session's own, written before its runs' (SessionManifest::ToJson).
+  const std::string_view end_ns = JsonValue(manifest, "end_wall_ns");
+  facts.finished = !end_ns.empty() && end_ns != "0";
   if (JsonValue(manifest, "simulation") != "true")
     facts.verdict = RecordedMatch(dir);
   return facts;

@@ -40,14 +40,23 @@ inline constexpr std::string_view kSessionLockName = "/talos_session";
 class SessionLock {
  public:
   // Takes the lock, or returns nullopt with `error` saying who holds it.
-  static std::optional<SessionLock> Acquire(std::string& error) {
+  // Locking an existing lock file allocates nothing on disk; creating one
+  // does. When `no_room` is given, it is set to whether the failure was that
+  // the path named no file and its filesystem had no room to create one
+  // (ENOSPC, EDQUOT): macOS keeps the file in /tmp, emptied at boot, on the
+  // same container as a log root, so a full log disk can refuse the first
+  // launch after a reboot. No launcher holds the lock a new one would take
+  // then.
+  static std::optional<SessionLock> Acquire(std::string& error,
+                                            bool* no_room = nullptr) {
     const std::string path =
         introspect::LockFilePath(ShmObjectName(kSessionLockName));
+    if (no_room != nullptr) *no_room = false;
     // A lock taken on a file unlinked meanwhile (a /tmp cleaner, by hand)
     // excludes nobody who opens the path anew: take it again on the file the
     // path names.
     for (int attempt = 0; attempt < 10; ++attempt) {
-      auto lock = AcquireOnce(path, error);
+      auto lock = AcquireOnce(path, error, no_room);
       if (!lock || introspect::LockFileIsCurrent(lock->fd_, path)) return lock;
     }
     error = "cannot lock the session lock " + path +
@@ -87,10 +96,16 @@ class SessionLock {
   SessionLock(int fd, std::string path) : fd_{fd}, path_{std::move(path)} {}
 
   static std::optional<SessionLock> AcquireOnce(const std::string& path,
-                                                std::string& error) {
+                                                std::string& error,
+                                                bool* no_room) {
     const int fd = introspect::OpenLockFile(path, O_RDWR);
     if (fd < 0) {
       const int open_error = errno;
+      // OpenLockFile opens an existing file without O_CREAT, so only its
+      // create of an absent one runs out of room.
+      if (no_room != nullptr) {
+        *no_room = open_error == ENOSPC || open_error == EDQUOT;
+      }
       struct stat status {};
       error = "cannot open the session lock " + path + ": " +
               std::strerror(open_error);

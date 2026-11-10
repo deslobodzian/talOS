@@ -5,6 +5,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -51,6 +52,7 @@
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/introspection/describe.h"
+#include "talOS/introspection/lock_file.h"
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/launcher/file_digest.h"
@@ -544,6 +546,17 @@ struct LauncherOptions {
   // the log root, or nullopt when unknown; AvailableBytes in production.
   std::function<std::optional<uint64_t>(const std::filesystem::path&)>
       available_bytes{AvailableBytes};
+  // Internal session seam: SessionLock::Acquire.
+  std::function<std::optional<SessionLock>(std::string& error, bool* no_room)>
+      acquire_session_lock{SessionLock::Acquire};
+  // Internal retention seam: creates the session directory and its parents,
+  // setting the error when it cannot; std::filesystem::create_directories in
+  // production.
+  std::function<void(const std::filesystem::path&, std::error_code&)>
+      create_session_directory{
+          [](const std::filesystem::path& path, std::error_code& error) {
+            std::filesystem::create_directories(path, error);
+          }};
 
   // Launch a graph the linter called broken anyway. The default is refusal:
   // two spellings of one topic are silent at runtime.
@@ -2707,16 +2720,33 @@ class Launcher {
         !options_.describe_only && options_.replay_inputs.empty();
     session_lock_ = nullptr;
     std::optional<SessionLock> session_lock;
+    // The lock file is absent and the log root's full filesystem has no room
+    // to create it (SessionLock::Acquire, LockSharesLogFilesystem): retention,
+    // which may free that room, runs without the lock (Pruning::kUnlocked),
+    // and the lock is taken after it.
+    bool lock_needs_room = false;
+    std::string lock_error;
+    // False when the launch is refused: the lock is neither held nor waiting
+    // for room retention can free.
+    const auto take_lock = [&] {
+      bool no_room = false;
+      session_lock = options_.acquire_session_lock(lock_error, &no_room);
+      if (session_lock) session_lock_ = &*session_lock;
+      lock_needs_room = !session_lock && no_room && LockSharesLogFilesystem();
+      return session_lock.has_value() || lock_needs_room;
+    };
     if (starts_roster) {
-      std::string lock_error;
-      session_lock = SessionLock::Acquire(lock_error);
-      if (!session_lock) {
+      if (!take_lock()) {
         std::cerr << "launcher: " << lock_error << "\n";
         return 1;
       }
-      session_lock_ = &*session_lock;
+      if (lock_needs_room) {
+        std::cerr << "[launcher] " << lock_error
+                  << "; retention runs first, then the lock is taken\n";
+      }
     }
-    std::filesystem::create_directories(options_.output_dir);
+    // Nothing is written to the log root until retention has run: on a full
+    // log disk it is what makes room for the new session's directory.
 
     config::RobotConfig robot_config;
     try {
@@ -2764,8 +2794,27 @@ class Launcher {
       std::cerr << "launcher: no nodes declared in config\n";
       return 1;
     }
-    const uint64_t session_log_budget =
-        ApplyRetention(robot_config, node_specs.size());
+    // Checked again right before retention lists the log root: another
+    // launch may have taken the lock meanwhile.
+    if (lock_needs_room && !take_lock()) {
+      std::cerr << "launcher: " << lock_error << "\n";
+      return 1;
+    }
+    const Pruning pruning = session_lock      ? Pruning::kLocked
+                            : lock_needs_room ? Pruning::kUnlocked
+                                              : Pruning::kNone;
+    std::string retention_record;
+    const uint64_t session_log_budget = ApplyRetention(
+        robot_config, node_specs.size(), pruning, retention_record);
+    if (lock_needs_room && (!take_lock() || !session_lock)) {
+      std::cerr << "launcher: " << lock_error << "\n";
+      ReportUnwrittenRetention(retention_record);
+      return 1;
+    }
+    if (!CreateSessionDirectory(robot_config, node_specs.size(),
+                                pruning != Pruning::kNone, retention_record)) {
+      return 1;
+    }
     if (!options_.replay_inputs.empty()) {
       return RunOnRecordedInputs(node_specs);
     }
@@ -3070,6 +3119,13 @@ class Launcher {
     manifest_writer_->Write(json, durable);
   }
 
+  // Whether retention may remove anything (ApplyRetention).
+  enum class Pruning {
+    kNone,      // --describe-only, --replay-inputs.
+    kLocked,    // Holds the session lock.
+    kUnlocked,  // The lock file is absent and has no room to be created.
+  };
+
   // What retention makes of a directory under the log root.
   enum class Retained {
     kNo,         // Not a session: left alone.
@@ -3211,14 +3267,21 @@ class Launcher {
   // A session that cannot be read or removed (another user's, unreadable,
   // removed meanwhile) is passed over, never counted against the others:
   // retention never stops a launch.
-  // Only a launch holding the session lock removes anything: that proves no
-  // other launch in this shared-memory namespace is recording, so a manifest
-  // without an end_wall_ns is one whose launcher died (a power loss), not a
-  // live one.
-  // --describe-only and --replay-inputs run beside a live session and only
-  // get the budget.
-  uint64_t ApplyRetention(const config::RobotConfig& config,
-                          std::size_t roster) {
+  // Only a launch that may prune removes anything. Pruning::kLocked holds
+  // the session lock: that proves no other launch in this shared-memory
+  // namespace is recording, so a manifest without an end_wall_ns is one
+  // whose launcher died (a power loss), not a live one. Pruning::kUnlocked
+  // found the lock file absent with no room to create it, so no launcher
+  // holds the lock it would take, but one in the same state may take it
+  // while this lists: it removes only sessions whose manifest records an
+  // end_wall_ns, and no abandoned launch (which may be that launch
+  // describing). --describe-only and --replay-inputs (Pruning::kNone) run
+  // beside a live session and only get the budget.
+  // Runs before the new session's directory exists, so a full disk does not
+  // stop it; `record` gets kRetentionRecordFile's lines, which Run writes
+  // once that directory exists (CreateSessionDirectory).
+  uint64_t ApplyRetention(const config::RobotConfig& config, std::size_t roster,
+                          Pruning pruning, std::string& record) {
     namespace fs = std::filesystem;
     // Config load refuses a wrong type or a nonpositive value.
     const int64_t cap = config.log_keep_sessions;
@@ -3227,9 +3290,9 @@ class Launcher {
     const uint64_t retained_budget =
         static_cast<uint64_t>(budget) - session_budget;
     const uint64_t free_floor = FreeFloor(config, roster);
-    if (session_lock_ == nullptr) return session_budget;
+    if (pruning == Pruning::kNone) return session_budget;
+    const bool unlocked = pruning == Pruning::kUnlocked;
     const fs::path current{options_.output_dir};
-    std::string record;  // kRetentionRecordFile's lines.
     const auto note = [&record](const std::string& line, bool warn) {
       record += line + "\n";
       if (warn) std::cerr << "[launcher] " << line << "\n";
@@ -3239,17 +3302,6 @@ class Launcher {
       note("retention " + std::string{what} + " " + path.string() + " (" +
                error.message() + ")",
            true);
-    };
-    const auto finish = [&] {
-      if (record.empty()) return session_budget;
-      const std::string path =
-          (current / std::string{kRetentionRecordFile}).string();
-      std::string error;
-      if (!WriteFileAtomically(path, record, options_.sync_file, error)) {
-        std::cerr << "[launcher] retention cannot write " << path << " ("
-                  << error << ")\n";
-      }
-      return session_budget;
     };
     struct Session {
       fs::path path;
@@ -3278,6 +3330,11 @@ class Launcher {
     // than one per attempt, and evicts no recording.
     auto newest = fs::file_time_type::min();
     std::error_code error;
+    // No log root yet: nothing to remove.
+    if (fs::status(current.parent_path(), error).type() ==
+        fs::file_type::not_found)
+      return session_budget;
+    error.clear();
     for (fs::directory_iterator entry{current.parent_path(), error};
          !error && entry != fs::directory_iterator{}; entry.increment(error)) {
       if (entry->path() == current) continue;  // Counted below.
@@ -3301,9 +3358,10 @@ class Launcher {
       }
       newest = std::max(newest, time);
       if (kind == Retained::kAbandoned) {
-        abandoned.push_back({entry->path(), time, bytes});
+        if (!unlocked) abandoned.push_back({entry->path(), time, bytes});
         continue;
       }
+      if (unlocked && !facts.finished) continue;
       sessions.push_back(
           {entry->path(), time, bytes,
            facts.start_wall_ns > 0 ? facts.start_wall_ns : wall_ns(time),
@@ -3312,7 +3370,7 @@ class Launcher {
     if (error) {
       // A partial listing could remove a session newer than one it missed.
       report("removes nothing; cannot list", current.parent_path(), error);
-      return finish();
+      return session_budget;
     }
     for (const auto& launch : abandoned) {
       if (launch.time >= newest) continue;
@@ -3392,7 +3450,7 @@ class Launcher {
                current.parent_path().string() +
                "; removes nothing to keep room for the new session",
            true);
-      return finish();
+      return session_budget;
     }
     for (; next != sessions.end() && *available < free_floor; ++next) {
       if (remove_session(*next,
@@ -3411,7 +3469,81 @@ class Launcher {
                "remove",
            true);
     }
-    return finish();
+    return session_budget;
+  }
+
+  // Creates the new session's directory, then writes retention's `record`
+  // in it (kRetentionRecordFile, synced; none when empty). When the
+  // directory cannot be created, says why and returns false: nothing is
+  // started. When the disk is full after a launch that `pruned` removed what
+  // it could, that names the free space and the floor a new session of
+  // `roster` members may need (FreeFloor).
+  bool CreateSessionDirectory(const config::RobotConfig& config,
+                              std::size_t roster, bool pruned,
+                              const std::string& record) {
+    const std::filesystem::path current{options_.output_dir};
+    std::error_code error;
+    options_.create_session_directory(current, error);
+    if (error) {
+      std::cerr << "launcher: cannot create the session directory "
+                << current.string() << " (" << error.message() << ")";
+      if (pruned && IsNoRoom(error)) {
+        const std::optional<uint64_t> available =
+            options_.available_bytes(current.parent_path());
+        std::cerr << "; "
+                  << (available ? std::to_string(*available) + " bytes free"
+                                : std::string{"free space unknown"})
+                  << " under " << current.parent_path().string()
+                  << " once retention removed what it could, and a new "
+                     "session may need "
+                  << FreeFloor(config, roster)
+                  << " ([robot] log_max_bytes plus " << kChildOutputLogMaxBytes
+                  << " per roster member)";
+      }
+      std::cerr << "; nothing was started\n";
+      ReportUnwrittenRetention(record);
+      return false;
+    }
+    if (record.empty()) return true;
+    const std::string path =
+        (current / std::string{kRetentionRecordFile}).string();
+    std::string write_error;
+    if (!WriteFileAtomically(path, record, options_.sync_file, write_error)) {
+      std::cerr << "[launcher] retention cannot write " << path << " ("
+                << write_error << ")\n";
+      ReportUnwrittenRetention(record);
+    }
+    return true;
+  }
+
+  // Whether `error` says the filesystem has no room (ENOSPC, EDQUOT).
+  static bool IsNoRoom(const std::error_code& error) {
+    return error == std::errc::no_space_on_device ||
+           error == std::error_condition{EDQUOT, std::generic_category()};
+  }
+
+  // Whether the session lock's directory (introspect::LockDirectory) is on
+  // the filesystem holding the log root, or the nearest existing directory
+  // above it: only then can retention make room to create the lock file.
+  // Linux keeps it in /dev/shm, a tmpfs no log retention frees.
+  bool LockSharesLogFilesystem() const {
+    struct stat lock_dir {};
+    if (::stat(introspect::LockDirectory().c_str(), &lock_dir) != 0)
+      return false;
+    std::filesystem::path dir =
+        std::filesystem::path{options_.output_dir}.parent_path();
+    struct stat log_dir {};
+    while (::stat(dir.c_str(), &log_dir) != 0) {
+      if (errno != ENOENT || !dir.has_relative_path()) return false;
+      dir = dir.parent_path();
+    }
+    return lock_dir.st_dev == log_dir.st_dev;
+  }
+
+  // Puts on stderr a retention record no session directory holds.
+  static void ReportUnwrittenRetention(const std::string& record) {
+    if (record.empty()) return;
+    std::cerr << "[launcher] retention record, not written:\n" << record;
   }
 
   // How one roster member is spawned, and its pending restart.

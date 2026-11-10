@@ -66,6 +66,21 @@ three days never deletes it under a long session, and reports it if the path
 stops naming the locked file; acquiring it checks that it locked the file the
 path still names.
 
+Locking an existing lock file allocates nothing on disk; creating an absent
+one does. macOS empties `/tmp` at boot and keeps it on the same container as
+a log root on the internal disk, so on a full disk the first launch after a
+reboot cannot create the file (`ENOSPC`). When creating the absent file fails
+with `ENOSPC` or `EDQUOT` and the lock directory is on the log root's
+filesystem (same `st_dev`; never Linux's `/dev/shm`, a tmpfs log retention
+cannot free), no launcher holds the lock that launch would take: it tries the
+lock again once the config is read, runs
+[retention](#session-segments-and-logs) without it if there is still no
+room, then takes it, and is refused if it cannot. Another launch in the same
+state may take the lock and start recording while that retention runs, so
+retention without the lock removes only sessions whose manifest records an
+`end_wall_ns` (their launcher shut down) and no launch that recorded
+nothing. Any other lock failure refuses the launch before retention.
+
 Next, before any probe, the launcher prepares the
 [live registry](../introspection/README.md#prepared-by-the-launcher), so every
 node it starts can register, or refuses the launch naming the segment or lock
@@ -578,8 +593,17 @@ ended) and marks those runs `log_capped`. Older sessions are retained within
 the other half, every file in them counted (event logs, output logs, camera
 frames, metadata), except the protected matches below.
 
-Only a launch that starts the roster, and so holds the session lock,
-removes anything; `--describe-only` and `--replay-inputs` launches, which run
+Retention runs once the config and roster are read and before the launch
+writes anything to the log root, its session directory included: a flag or
+config refusal removes nothing, and a launch on a full log disk frees room
+before it needs any. The launch then creates `DIR/<session_id>/`; when it
+cannot, it is refused, and the retention record goes to stderr. When the
+disk is still full once retention removed what it could, the refusal names
+the free space and the free floor.
+
+Only a launch that starts the roster, and so holds the session lock (or
+finds its lock file absent with no room to create it, with the limits
+[above](#one-session-per-namespace)), removes anything; `--describe-only` and `--replay-inputs` launches, which run
 beside a live session, remove nothing. Holding the lock is what tells a
 session whose manifest has no `end_wall_ns` (its launcher lost power) from a
 live one in the same shared-memory namespace (`TALOS_SHM_NAMESPACE`); a
@@ -605,17 +629,17 @@ metadata. The launcher reads no node's parameters, so a session whose frame
 recording (each camera's `[recording] max_bytes`, summed) exceeds half of
 `log_max_bytes` is not covered by the floor.
 
-Each launch records in its own session directory's `retention.txt` (synced
-with `DurableSync`) every session it removed, with its size, its class and
-the limit it exceeded, every session it could not read or remove, a free
-floor it could not reach, and free space it could not read; a launch with
-nothing to record writes none. A directory holding a `retention.txt` is
-never removed as a launch that recorded nothing (below), so the record
-outlives a launch that died before its manifest. All but the removal of a
-session that ran no match are also a line on the launcher's stderr. Start
-times are the main processor's wall clock, so a coprocessor without a
-real-time clock or time sync orders sessions only as well as its clock
-survives a reboot.
+Each launch records in its own session directory's `retention.txt` (written
+once that directory exists, synced with `DurableSync`) every session it
+removed, with its size, its class and the limit it exceeded, every session
+it could not read or remove, a free floor it could not reach, and free space
+it could not read; a launch with nothing to record writes none. A
+directory holding a `retention.txt` is never removed as a launch that
+recorded nothing (below), so the record outlives a launch that died before
+its manifest. All but the removal of a session that ran no match are also a
+line on the launcher's stderr. Start times are the main processor's wall
+clock, so a coprocessor without a real-time clock or time sync orders
+sessions only as well as its clock survives a reboot.
 
 A session is a match when it has a launch manifest (so not `--replay-inputs`
 output, even of a match), its launch was not `--sim`, and any node's event

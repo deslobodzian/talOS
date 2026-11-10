@@ -40,6 +40,9 @@ struct SessionFacts {
   std::int64_t start_wall_ns{0};
   // RecordedMatch, for a non-simulation launch's manifest; kOther otherwise.
   MatchVerdict verdict{MatchVerdict::kOther};
+  // The manifest records a nonzero end_wall_ns: its launcher shut down, so
+  // the session is no longer recording. False without one.
+  bool finished{false};
 };
 
 // Reads `dir`'s manifest.json and, for a launch that was not a simulation,

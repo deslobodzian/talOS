@@ -18,6 +18,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -1761,13 +1762,14 @@ TEST(LauncherSessions, RetentionPrunesReplayOutputAndAbandonedLaunchesOnly) {
 }
 
 // The manifest a launch at `start_s` on the wall clock leaves in `dir`.
-void WriteSessionManifest(const std::string& dir, uint64_t id,
-                          int64_t start_s) {
+void WriteSessionManifest(const std::string& dir, uint64_t id, int64_t start_s,
+                          int64_t end_s = 0) {
   std::filesystem::create_directories(dir);
   SessionManifest manifest;
   manifest.session_id = id;
   manifest.output_dir = dir;
   manifest.start_wall_ns = start_s * 1'000'000'000;
+  manifest.end_wall_ns = end_s * 1'000'000'000;
   std::ofstream{dir + "/manifest.json"} << manifest.ToJson();
 }
 
@@ -1997,8 +1999,9 @@ TEST(LauncherSessions, RetentionRemovesProtectedMatchesLastForFreeSpace) {
   // One byte short of the floor once the pit session 3 and the oldest match
   // 1 are gone.
   const uintmax_t needed = DirectoryBytes(dir(3)) + DirectoryBytes(dir(1));
-  options.available_bytes = [floor, needed](const std::filesystem::path&) {
-    return std::optional<uint64_t>{floor - needed + 1};
+  options.available_bytes = [available = floor - needed +
+                                         1](const std::filesystem::path&) {
+    return std::optional<uint64_t>{available};
   };
   options.session_id = 6;
   ASSERT_EQ(Launcher{options}.Run(), 0);
@@ -2013,6 +2016,128 @@ TEST(LauncherSessions, RetentionRemovesProtectedMatchesLastForFreeSpace) {
   for (const int id : {1, 3}) {
     EXPECT_NE(record.find(dir(id) + " ("), std::string::npos) << record;
   }
+  std::filesystem::remove_all(root);
+}
+
+// On a full log disk, where not even the new session's directory can be
+// created, retention runs first and frees the room; the launch then creates
+// its session and records the removal there. When nothing it removes makes
+// room, the launch is refused instead of throwing.
+TEST(LauncherSessions, FullDiskLaunchFreesRoomBeforeCreatingItsSession) {
+  auto options = SessionFixture("full_disk");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  std::string configuration{kFixtureToml};
+  configuration.insert(configuration.find("period_us"),
+                       "log_max_bytes = 10000000\n");
+  std::ofstream{options.config_path} << configuration;
+  const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
+  WriteSessionManifest(dir(1), 1, 1001);
+  WriteDriverStationLog(dir(1), "late", 1, {false}, 1'000'000);
+  // The fixture's roster: hardware_node, alpha, beta.
+  const uint64_t floor = 10'000'000 + 3 * kChildOutputLogMaxBytes;
+  options.available_bytes = [available =
+                                 floor - 1](const std::filesystem::path&) {
+    return std::optional<uint64_t>{available};
+  };
+  // The disk is full until session 1 is gone.
+  const std::string old_session = dir(1);
+  options.create_session_directory =
+      [old_session](const std::filesystem::path& path, std::error_code& error) {
+        if (std::filesystem::exists(old_session)) {
+          error = std::make_error_code(std::errc::no_space_on_device);
+          return;
+        }
+        std::filesystem::create_directories(path, error);
+      };
+  options.session_id = 2;
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  EXPECT_FALSE(std::filesystem::exists(dir(1)));
+  EXPECT_TRUE(std::filesystem::exists(dir(2) + "/manifest.json"));
+  EXPECT_NE(ReadFile(dir(2) + "/" + std::string{kRetentionRecordFile})
+                .find(dir(1) + " ("),
+            std::string::npos);
+
+  options.create_session_directory = [](const std::filesystem::path&,
+                                        std::error_code& error) {
+    error = std::make_error_code(std::errc::no_space_on_device);
+  };
+  options.session_id = 3;
+  EXPECT_EQ(Launcher{options}.Run(), 1);
+  EXPECT_FALSE(std::filesystem::exists(dir(3)));
+  std::filesystem::remove_all(root);
+}
+
+// A session lock file that is absent and has no room to be created on the log
+// root's filesystem (macOS's /tmp after a reboot on a full disk) is held by
+// no launcher, so retention runs without it, then the lock is taken. Another
+// launch in the same state may take it meanwhile and start recording, so
+// that retention removes only sessions whose launcher shut down. Any other
+// lock failure refuses the launch before retention, and a lock still not
+// taken after it refuses the launch with the record on stderr.
+TEST(LauncherSessions, LockFileWithoutRoomPrunesOnlyFinishedSessions) {
+  auto options = SessionFixture("lock_no_room");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  std::string configuration{kFixtureToml};
+  configuration.insert(configuration.find("period_us"),
+                       "log_max_bytes = 10000000\n");
+  std::ofstream{options.config_path} << configuration;
+  const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
+  const auto write_finished = [&dir] {
+    WriteSessionManifest(dir(1), 1, 1001, 1101);
+    WriteDriverStationLog(dir(1), "late", 1, {false}, 1'000'000);
+  };
+  write_finished();
+  // Unfinished: a launch that lost power, or one recording now.
+  WriteSessionManifest(dir(2), 2, 1002);
+  WriteDriverStationLog(dir(2), "late", 2, {false}, 1'000'000);
+  const uint64_t floor = 10'000'000 + 3 * kChildOutputLogMaxBytes;
+  // Short of the floor until both are gone.
+  const uintmax_t both = DirectoryBytes(dir(1)) + DirectoryBytes(dir(2));
+  options.available_bytes = [available = floor - both +
+                                         1](const std::filesystem::path&) {
+    return std::optional<uint64_t>{available};
+  };
+  // The first `no_room` calls find no room; later ones take the lock.
+  const auto lock_after = [](int no_room_calls) {
+    return
+        [calls = 0, no_room_calls](std::string& error, bool* no_room) mutable {
+          if (calls++ < no_room_calls) {
+            error = "cannot open the session lock: No space left on device";
+            *no_room = true;
+            return std::optional<SessionLock>{};
+          }
+          return SessionLock::Acquire(error, no_room);
+        };
+  };
+
+  options.acquire_session_lock = [](std::string& error, bool* no_room) {
+    error = "cannot open the session lock: Permission denied";
+    *no_room = false;
+    return std::optional<SessionLock>{};
+  };
+  options.session_id = 3;
+  EXPECT_EQ(Launcher{options}.Run(), 1);
+  EXPECT_TRUE(std::filesystem::exists(dir(1)));
+  EXPECT_FALSE(std::filesystem::exists(dir(3)));
+
+  options.acquire_session_lock = lock_after(3);
+  ::testing::internal::CaptureStderr();
+  const int refused = Launcher{options}.Run();
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(refused, 1);
+  EXPECT_FALSE(std::filesystem::exists(dir(1)));
+  EXPECT_FALSE(std::filesystem::exists(dir(3)));
+  EXPECT_NE(stderr_text.find(dir(1) + " ("), std::string::npos) << stderr_text;
+
+  write_finished();
+  options.acquire_session_lock = lock_after(2);
+  options.session_id = 4;
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  EXPECT_FALSE(std::filesystem::exists(dir(1)));
+  EXPECT_TRUE(std::filesystem::exists(dir(2) + "/manifest.json"));
+  EXPECT_TRUE(std::filesystem::exists(dir(4) + "/manifest.json"));
   std::filesystem::remove_all(root);
 }
 
