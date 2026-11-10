@@ -5,8 +5,11 @@
 #
 #   tools/mac_qualify.sh [--log FILE]
 #
-# In order: host information; bazel build //...; bazel test
-# --test_output=errors //...; launcher --describe-only on every robot config;
+# In order: host information; on macOS the boot settings a robot that starts
+# with nobody logged in needs (tools/deploy.sh boot-check: FileVault off,
+# pmset autorestart 1 and sleep 0, automatic updates reported; read-only, no
+# sudo); bazel build //...; bazel test --test_output=errors //...; launcher
+# --describe-only on every robot config;
 # restart latency on the physics simulation, idle and under disk load
 # (//talOS/launcher:restart_latency); the pose_estimator update() benchmark
 # for both backends. Every step runs even after a failure; a summary lists
@@ -90,7 +93,7 @@ case "$(uname -s)" in
     echo "cpu: $(sysctl -n machdep.cpu.brand_string)"
     echo "cores: $(sysctl -n hw.physicalcpu) physical, $(sysctl -n hw.logicalcpu) logical"
     echo "memory: $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB"
-    pmset -g 2>/dev/null | grep -E '^ *(sleep|lowpowermode|powermode) '
+    pmset -g 2>/dev/null | grep -E '^ *(lowpowermode|powermode) '
     ;;
   *)
     sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | sed -n 1p
@@ -101,6 +104,9 @@ esac
 df -h "${TMPDIR:-/tmp}" | sed -n '1,2p'
 bazel --version
 
+if [ "$(uname -s)" = "Darwin" ]; then
+  run_step "boot settings" "$ROOT/tools/deploy.sh" boot-check
+fi
 run_step "bazel build //..." bazel build //...
 run_step "bazel test //..." bazel test --test_output=errors //...
 

@@ -6,6 +6,8 @@ tools/deploy.sh's bundle selection, pruning and session commands."""
 
 import json
 import os
+import plistlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -276,17 +278,43 @@ class BundleBuilderTest(unittest.TestCase):
 
 
 class DeployTest(unittest.TestCase):
-    def deploy(self, prefix, *args, cwd=None):
+    def deploy(self, prefix, *args, cwd=None, path=None):
         script = os.path.abspath(
             runfiles.Create().Rlocation("_main/tools/deploy.sh"))
+        env = dict(os.environ)
+        # Never the machine's own boot service log.
+        env["TALOS_LAUNCHD_STDERR"] = os.path.join(prefix, "launchd.stderr.log")
+        if path:
+            env["PATH"] = path + os.pathsep + env["PATH"]
         return subprocess.run(["bash", script, *args, "--prefix", prefix],
-                              cwd=cwd, capture_output=True, text=True)
+                              cwd=cwd, capture_output=True, text=True, env=env)
 
-    def session(self, prefix, name, timestamp):
+    def macos(self, tmp, filevault="FileVault is Off.", autorestart="1",
+              sleep="0"):
+        """A PATH directory faking macOS and its power settings. `sudo`
+        records its arguments and fails, so nothing privileged runs."""
+        bin_dir = os.path.join(tmp, "fake_bin")
+        scripts = {
+            "uname": "echo Darwin",
+            "fdesetup": f"echo '{filevault}'",
+            "pmset": ("printf 'Currently in use:\\n"
+                      f" autorestart          {autorestart}\\n"
+                      f" sleep                {sleep} (sleep prevented by x)"
+                      "\\n'"),
+            "defaults": "exit 1",
+            "sudo": f'echo "$*" >> "{tmp}/sudo.log"; exit 1',
+        }
+        for name, body in scripts.items():
+            put(os.path.join(bin_dir, name), f"#!/bin/sh\n{body}\n")
+            os.chmod(os.path.join(bin_dir, name), 0o755)
+        return bin_dir
+
+    def session(self, prefix, name, timestamp, start_ns=0, **fields):
         path = os.path.join(prefix, "logs", name)
         put(os.path.join(path, "manifest.json"), json.dumps({
             "session_id": name, "config_path": "config/robot.toml",
-            "config_sha256": "abcdef", "nodes": []}))
+            "config_sha256": "abcdef", "start_wall_ns": start_ns,
+            "nodes": [], **fields}))
         put(os.path.join(path, "arm.0.tlog"), "first attempt")
         put(os.path.join(path, "arm.1.tlog"), "restarted attempt")
         os.utime(os.path.join(path, "manifest.json"), ns=(timestamp, timestamp))
@@ -303,18 +331,117 @@ class DeployTest(unittest.TestCase):
         os.chmod(path, 0o555)
         return path
 
-    def test_logs_lists_sessions_and_selects_newest_manifest(self):
+    def test_logs_orders_sessions_by_start_time_and_reports_each(self):
+        second = 1_000_000_000
         with tempfile.TemporaryDirectory() as tmp:
-            # Names deliberately sort opposite to manifest modification time.
-            older = self.session(tmp, "z_old", 1_000_000_000)
-            newer = self.session(tmp, "a_new", 2_000_000_000)
+            # Names and manifest modification times both sort opposite to
+            # the recorded start times; an id is not a time.
+            newest = self.session(
+                tmp, "a_new", 1 * second, start_ns=1_700_000_300 * second,
+                git_revision="0123456789abcdef", git_dirty=True,
+                nodes=[{"name": "arm", "exit_code": 0, "restart_count": 1,
+                        "runs": [{"reason": "crash"}, {"reason": "stop"}]},
+                       {"name": "shooter", "exit_code": 0,
+                        "runs": [{"reason": "stop"}]}])
+            put(os.path.join(newest, "session_class"), "match 30\n")
+            oldest = self.session(tmp, "z_old", 3 * second,
+                                  start_ns=1_700_000_100 * second)
+            # No start time: ordered by the directory's modification time.
+            middle = self.session(tmp, "m_mid", 2 * second)
+            os.utime(middle, ns=(1_700_000_200 * second,) * 2)
             proc = self.deploy(tmp, "logs")
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn(older, proc.stdout)
-            self.assertIn(newer, proc.stdout)
-            self.assertIn(f"newest session manifest: {newer}/manifest.json",
+            out = proc.stdout
+            self.assertLess(out.index(oldest), out.index(middle))
+            self.assertLess(out.index(middle), out.index(newest))
+            self.assertIn(f"newest session manifest: {newest}/manifest.json",
+                          out)
+
+            def fields(prefix):
+                return next(line.split() for line in out.splitlines()
+                            if line.strip().startswith(prefix))
+
+            summary = fields("session a_new")
+            for field in ("0123456789ab", "dirty", "match"):
+                self.assertIn(field, summary)
+            self.assertRegex(" ".join(fields(newest)), r"\b1 crash, 2 stop\b")
+            self.assertIn("unstamped", fields(oldest))
+            self.assertIn("unclassified", fields(oldest))
+            self.assertIn("last=stop", fields("arm:"))
+            self.assertIn("restarts=1", fields("arm:"))
+            self.assertNotIn("left no manifest", out)
+
+    def test_logs_shows_launcher_stderr_a_failed_launch_left(self):
+        second = 1_000_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            self.session(tmp, "one", 1, start_ns=1_700_000_000 * second)
+            stderr_log = os.path.join(tmp, "launchd.stderr.log")
+            put(stderr_log, "older line\nconfig error: no [robot] table\n")
+            # Written before the newest session started: stale, not shown.
+            os.utime(stderr_log, ns=(1_600_000_000 * second,) * 2)
+            proc = self.deploy(tmp, "logs")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(f"launcher stderr under launchd: {stderr_log}",
                           proc.stdout)
-            self.assertIn("session a_new config config/robot.toml", proc.stdout)
+            self.assertNotIn("config error", proc.stdout)
+            # A later launch failed before it wrote any manifest.
+            os.utime(stderr_log, ns=(1_700_000_100 * second,) * 2)
+            proc = self.deploy(tmp, "logs")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("  | config error: no [robot] table", proc.stdout)
+
+    def test_enable_boot_on_macos_is_unthrottled_with_bounded_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = os.path.join(tmp, "prefix")
+            proc = self.deploy(prefix, "enable-boot", "--dry-run",
+                               path=self.macos(tmp))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = proc.stdout
+            plist = plistlib.loads(out[out.index("<?xml"):
+                                       out.index("</plist>") + 8].encode())
+            # Unset, launchd throttles the job's CPU and I/O.
+            self.assertEqual(plist["ProcessType"], "Interactive")
+            # Outside the log root the service account owns: root's
+            # newsyslog chowns rotated copies there by path.
+            stderr_log = "/Library/Logs/talos/launchd.stderr.log"
+            self.assertEqual(plist["StandardErrorPath"], stderr_log)
+            self.assertEqual(plist["StandardOutPath"], "/dev/null")
+            # newsyslog rotates it past 1024 KiB, keeping four copies, with
+            # no "turned over" line (B) and no process to signal (N).
+            self.assertRegex(
+                out, rf"(?m)^{re.escape(stderr_log)} \S+ 644 4 1024 \* NB$")
+            self.assertIn("+ sudo pmset -a autorestart 1 sleep 0", out)
+
+    def test_enable_boot_refuses_filevault_before_writing_anything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.deploy(os.path.join(tmp, "prefix"), "enable-boot",
+                               path=self.macos(tmp, "FileVault is On."))
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("FileVault is On.", proc.stderr)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "sudo.log")))
+
+    def test_boot_check_fails_unless_each_boot_setting_holds(self):
+        cases = {
+            "ok": ({}, 0),
+            "filevault pending": (
+                {"filevault": "FileVault is Off, but will be enabled after "
+                              "the next restart."}, 1),
+            "no autorestart": ({"autorestart": "0"}, 1),
+            "sleeps": ({"sleep": "10"}, 1),
+        }
+        for name, (settings, status) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                proc = self.deploy(tmp, "boot-check",
+                                   path=self.macos(tmp, **settings))
+                self.assertEqual(proc.returncode, status, proc.stdout)
+
+    def test_logs_with_no_sessions_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "logs"))
+            proc = self.deploy(tmp, "logs")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("no sessions yet", proc.stdout)
+            self.assertNotIn("left no manifest", proc.stdout)
 
     def test_logs_does_not_require_an_installed_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:

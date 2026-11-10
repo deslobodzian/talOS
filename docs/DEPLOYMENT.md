@@ -67,6 +67,7 @@ launch; use `--remote-port` and `--local-port` if the ports also differ.
 ```sh
 ./tools/deploy.sh install <bundle> [--prefix /opt/talos]
 ./tools/deploy.sh enable-boot [--prefix /opt/talos] [--user talos] [--dry-run]
+./tools/deploy.sh boot-check
 ./tools/deploy.sh logs [--prefix /opt/talos] [LOG_ROOT]
 ./tools/deploy.sh fetch [--prefix /opt/talos] DEST
 ./tools/deploy.sh rollback [--prefix /opt/talos]
@@ -86,19 +87,50 @@ A relative `--prefix` is resolved against the working directory.
   three-second supervision watchdog, `LimitRTPRIO=49` and
   `LimitMEMLOCK=infinity`, so the unprivileged service gets the
   [realtime scheduling](NODE_DEVELOPMENT_GUIDE.md#realtime-scheduling) its
-  nodes request). macOS: writes the
-  LaunchDaemon `/Library/LaunchDaemons/org.talos.robot.plist` (`KeepAlive`)
-  and bootstraps it into the system domain, so it starts without a login.
+  nodes request). macOS: refuses while FileVault is on (`fdesetup status`
+  is anything but `FileVault is Off.`), since the daemon then cannot start
+  until someone logs in; sets `pmset -a autorestart 1 sleep 0` (power back on
+  after a power loss, never sleep while idle); writes the
+  LaunchDaemon `/Library/LaunchDaemons/org.talos.robot.plist` (`KeepAlive`,
+  `ProcessType` `Interactive`, stderr to `/Library/Logs/talos/launchd.stderr.log`,
+  [below](#boot-service-output)) and the rotation rule
+  `/etc/newsyslog.d/org.talos.robot.conf`, bootstraps the daemon into the
+  system domain, so it starts without a login, and ends with `boot-check`.
+  `ProcessType` `Interactive` gives the launcher an app's resource limits,
+  that is none; without the key launchd applies light limits that throttle
+  the job's CPU and I/O (`man launchd.plist`), `Background` throttles harder,
+  and `Adaptive` follows XPC activity the launcher has none of.
   Both use sudo. Before enabling, it checks bundle read/traversal access as
   the selected account and creates `<prefix>/logs` owned by that account,
   mode 0755. Bundles stay read-only. An inaccessible bundle fails clearly;
   fix ancestor traversal/read permissions rather than granting bundle writes.
-  `--dry-run` prints these provisioning/check commands and the unit or plist.
-- **logs** lists session directories under `<prefix>/logs` (or `LOG_ROOT`) and
-  summarizes the newest manifest by modification time: session id, config path
-  and hash, each node's exit code (and the signal that ended it, if one did),
-  event log path and output log. No installed bundle is needed
-  to inspect retained sessions.
+  `--dry-run` prints these provisioning/check commands and the unit, or the
+  `pmset` command, plist and rotation rule (on macOS reporting, not refusing,
+  FileVault).
+- **boot-check** (macOS; elsewhere it only says so) checks, read-only and
+  without sudo, what a robot that boots with nobody logged in needs: FileVault
+  off and `pmset -g` showing `autorestart 1` and `sleep 0`; it exits 1 naming
+  each one that does not hold. It also reports the automatic-update settings
+  in `/Library/Preferences/com.apple.SoftwareUpdate`, warning when macOS
+  updates install on their own (which restarts the Mini); `enable-boot`
+  changes neither FileVault nor updates, which a person sets in System
+  Settings. `tools/mac_qualify.sh` runs it as a step.
+- **logs** lists session directories under `<prefix>/logs` (or `LOG_ROOT`),
+  oldest first by the `start_wall_ns` their manifest records (the directory's
+  modification time without one; session ids are not ordered in time), each
+  with its start, `git_revision` (and `dirty`), the launcher's match
+  classification from its `session_class` file (`match`, `other`, `unknown`,
+  or `unclassified` before retention has read it; a `--sim` session is never
+  classified, so it stays `unclassified`) and its runs counted by
+  `reason`. It then summarizes the newest manifest: session id, start, config
+  path and hash, revision, and per node its exit code (and the signal that
+  ended it, if one did), last run's reason, restarts, event log path and
+  output log. It says when there are no sessions yet or the newest session
+  directory has no manifest, and prints the last lines of
+  `/Library/Logs/talos/launchd.stderr.log` when that file was written after
+  the newest session started, as by a launch that failed before
+  recording anything. No installed bundle is needed to inspect retained
+  sessions.
 - **fetch** copies every session folder from `<prefix>/logs` into `DEST`,
   preserving its manifest, every node's event logs (restarted attempts
   included) and output logs.
@@ -134,12 +166,31 @@ run to use the same root, set `TALOS_LOG_DIR=/opt/talos/logs` or pass
 
 Each node's stdout and stderr, every run of it, land in
 `<prefix>/logs/<session-id>/<name>.log` ([node output](../talOS/launcher/README.md#node-output)).
-The macOS LaunchDaemon sets no `StandardOutPath` or `StandardErrorPath`, so
-the launcher's own lines (and its echo of node output) are discarded there;
-on Linux they go to the journal (`journalctl -u talos`).
 
 For event-log byte budgets, retention, capped recordings, manifest-write
 recovery and what is synced to disk when, see [session segments and logs](../talOS/launcher/README.md#session-segments-and-logs).
+
+### Boot service output
+
+The launcher's own output is the record of a launch that fails before it
+writes a session manifest (a bad config, a refused graph); its errors go to
+stderr. On Linux both streams go to the journal (`journalctl -u talos`). The
+macOS LaunchDaemon sends stderr to `/Library/Logs/talos/launchd.stderr.log`
+and stdout (progress lines, already in the manifest, and the uncapped echo
+of node output, already in each `<name>.log`) to `/dev/null`. Node output,
+including a node's `realtime scheduling incomplete` line, is in its
+`<session>/<name>.log`, not this file. launchd appends to it across
+launches without marking where one starts. newsyslog, which macOS runs
+hourly as root, renames it once it passes 1024 KiB and keeps four older
+copies (`launchd.stderr.log.0` to `.3`), adding no line of its own, so a
+crash loop, which launchd restarts at most every 10 s, cannot fill the disk;
+a running launcher keeps appending to the copy it opened until it restarts.
+newsyslog sets each new file's owner and mode by path, so the file lives in
+a root-owned directory (`enable-boot` creates it `root:wheel` 0755 and the
+file owned by the service account), never in the account's own log root,
+where the account could put a link to a root file in its place.
+`deploy.sh logs` shows the file's tail when it is newer than the newest
+session.
 
 ## Supervision and service recovery
 
