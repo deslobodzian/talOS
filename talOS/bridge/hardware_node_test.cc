@@ -119,7 +119,10 @@ TEST(HardwareNodeTest, RunKeepsRegistryHeartbeatCurrent) {
   }
   runner.join();
   ASSERT_GT(samples, 100);
-  EXPECT_LT(worst_age_ns, 50'000'000);
+  // The launcher kills the bridge once its progress is 500 ms old, and the
+  // soak stops it for 300 ms, so a refresh must land within 200 ms; 150 ms
+  // still fails the old 250 ms cadence without failing on a slow CI tick.
+  EXPECT_LT(worst_age_ns, 150'000'000);
 }
 
 TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
