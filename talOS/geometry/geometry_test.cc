@@ -303,7 +303,9 @@ TEST(SE2, DiscretizeMatchesIndependentLogOracle) {
 TEST(SE2, DiscretizedTwistIntegratesToRequestedPose) {
   auto rng = Rng();
   std::uniform_real_distribution<double> velocity(-3.0, 3.0);
-  std::uniform_real_distribution<double> period(0.001, 0.8);
+  // Periods up to 2 s take |omega * dt| past pi (yet below 2 pi): the rate
+  // must stay omega there instead of wrapping into the opposite turn.
+  std::uniform_real_distribution<double> period(0.001, 2.0);
   for (int i = 0; i < 500; ++i) {
     const double vx = velocity(rng), vy = velocity(rng);
     const double omega = velocity(rng), dt = period(rng);

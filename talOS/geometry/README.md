@@ -11,10 +11,12 @@ for spatial. Include `talOS/geometry/lie.h`.
   for SE(3).
 * `SO2` construction, composition and logarithms use angles in `(-pi, pi]`.
   `FromCosSin` accepts an unnormalized cosine/sine pair.
-* `SE2::Discretize(vx, vy, omega, dt)` takes the logarithm of the desired
-  finite-period pose `(omega * dt, {vx * dt, vy * dt})` and divides its twist
-  by `dt`. Integrating that twist with `Exp` reaches the requested pose;
-  nonpositive periods return the original velocities.
+* `SE2::Discretize(vx, vy, omega, dt)` returns the constant twist whose `Exp`
+  over `dt` reaches the finite-period pose `(omega * dt, {vx * dt, vy * dt})`.
+  Its rate stays `omega` for any `dt` (it never wraps past pi); only the linear
+  part goes through `V(omega * dt)^-1`, which grows without bound near the
+  nonzero multiples of 2 pi where no twist with that rate translates.
+  Nonpositive periods return the original velocities.
 * `SO3::FromMatrixNormalized` projects noisy matrices onto proper rotations
   using fixed-size SVD, including a determinant correction for reflections.
   `RightJacobianInverse` is the closed-form inverse of the right Jacobian.
