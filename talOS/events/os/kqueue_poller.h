@@ -61,6 +61,11 @@ class KqueuePoller {
   // not fds), so any fixed value works here.
   static constexpr std::uintptr_t kWakeIdent = 1;
 
+  // Identifier for the EVFILT_TIMER that wait_until() arms at its deadline.
+  // Timer idents are likewise their own namespace; one fixed ident is what
+  // lets each wait's EV_ADD replace the previous wait's timer.
+  static constexpr std::uintptr_t kDeadlineIdent = 2;
+
   void close_fd() noexcept;
 
   int kq_fd_{-1};

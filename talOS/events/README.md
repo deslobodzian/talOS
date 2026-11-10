@@ -54,10 +54,12 @@ Realtime and replay loop instances run once.
 | `SimulatedEventLoop` | Virtual, jumps to the next deadline | In-memory channels | Deterministic tests |
 | `ReplayEventLoop` | Timestamps from the log | The log itself | Reproducing a run |
 
-`RealtimeEventLoop` waits on kqueue (macOS) or epoll plus an absolute-deadline
-timerfd (Linux). Messages are drained rather than woken by the transport: RTMS
-carries no notification channel and adding one would change its shared-memory
-layout. `Options::delivery` (or `set_delivery()` before the run) picks when:
+`RealtimeEventLoop` waits on kqueue plus an absolute-deadline `EVFILT_TIMER`
+with `NOTE_CRITICAL` (macOS; a relative `kevent()` timeout is coalesced, waking
+1-2 ms late) or epoll plus an absolute-deadline timerfd (Linux). Messages are
+drained rather than woken by the transport: RTMS carries no notification
+channel and adding one would change its shared-memory layout.
+`Options::delivery` (or `set_delivery()` before the run) picks when:
 
 - `Delivery::POLL` (the default) drains on a fixed tick, 1 ms by default, so
   the tick bounds message latency.

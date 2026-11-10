@@ -2,13 +2,24 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "gtest/gtest.h"
 #include "talOS/events/time.h"
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
+#endif
 
 namespace talos::event {
 namespace {
@@ -159,6 +170,58 @@ TEST(PollerTest, MoveConstructionPreservesWatchedFdAndMovedFromIsSafe) {
   ::close(write_fd);
   ::close(read_fd);
 }
+
+#if defined(__APPLE__)
+// The time-constraint policy talos::process::ConfigureRealtime gives a node's
+// loop thread on macOS (set inline: talOS/events sits below talOS/process).
+bool SetTimeConstraintPolicy(Duration period) {
+  mach_timebase_info_data_t timebase{};
+  if (::mach_timebase_info(&timebase) != KERN_SUCCESS) return false;
+  const auto to_abs = [&](Duration duration) {
+    return static_cast<std::uint32_t>(duration.count() * timebase.denom /
+                                      timebase.numer);
+  };
+  thread_time_constraint_policy_data_t policy{};
+  policy.period = to_abs(period);
+  policy.computation = to_abs(period / 2);
+  policy.constraint = to_abs(period);
+  policy.preemptible = TRUE;
+  return ::thread_policy_set(::pthread_mach_thread_np(::pthread_self()),
+                             THREAD_TIME_CONSTRAINT_POLICY,
+                             reinterpret_cast<thread_policy_t>(&policy),
+                             THREAD_TIME_CONSTRAINT_POLICY_COUNT) ==
+         KERN_SUCCESS;
+}
+
+// A relative kevent() timeout is padded by macOS timer coalescing even on a
+// realtime thread (milliseconds late per 10 ms wait); the non-coalesced
+// absolute timer is not. The median bound is loose enough for a loaded
+// machine yet far below the coalescing leeway.
+TEST(PollerTest, RealtimeDeadlinesWakeWithoutCoalescingLeeway) {
+  constexpr Duration kPeriod = 10 * kMillisecond;
+  constexpr std::size_t kWaits = 40;
+  std::vector<Duration> lateness;
+  lateness.reserve(kWaits);
+  bool policy_set = false;
+
+  std::thread loop([&] {
+    policy_set = SetTimeConstraintPolicy(kPeriod);
+    Poller poller;
+    MonotonicTime deadline = Poller::now() + kPeriod;
+    for (std::size_t i = 0; i < kWaits; ++i, deadline += kPeriod) {
+      EXPECT_EQ(poller.wait_until(deadline), Poller::WakeReason::DEADLINE);
+      lateness.push_back(Poller::now() - deadline);
+    }
+  });
+  loop.join();
+
+  ASSERT_TRUE(policy_set);
+  ASSERT_EQ(lateness.size(), kWaits);
+  auto median = lateness.begin() + kWaits / 2;
+  std::nth_element(lateness.begin(), median, lateness.end());
+  EXPECT_LT(*median, kMillisecond / 2);
+}
+#endif
 
 }  // namespace
 }  // namespace talos::event
