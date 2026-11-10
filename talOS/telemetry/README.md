@@ -26,7 +26,7 @@ buffer with the slot's padding stripped.
 | Field | Meaning |
 | --- | --- |
 | `stream_id` | Random per producer process (fixed for its lifetime). A change means the producer restarted. |
-| `sequence_id` | Increments per frame, including frames DROP_NEWEST shed, so gaps are visible downstream. |
+| `sequence_id` | Increments per frame, so a reader that missed frames sees the gap. |
 | `timestamp_ns` | Producer monotonic clock, nanoseconds. |
 | `dictionary_id` | FNV-1a 32 over the dictionary (names, units, labels, in order). Identifies which dictionary `values` aligns with. |
 | `chassis` | Robot `Pose` (metres, radians); zeros until `pose/valid` reads 1. |
@@ -56,7 +56,10 @@ answers `503` on `/telemetry.json`).
 ## Transport budget
 
 Frame caps, dictionary limits, shared-memory geometry, dictionary cadence and
-configured rates live in [DATA_FLOW.md](../../docs/DATA_FLOW.md). Construction
+configured rates live in [DATA_FLOW.md](../../docs/DATA_FLOW.md). The topic
+overwrites (`kTopicOptions` in `node.h`): a reader that stalls is lapped and
+counts what it missed, and never stops publication for other readers. It is a
+viewer feed, not a record; each node's event log is the record. Construction
 measures both worst-case value frames and dictionary frames and throws if either
 exceeds its budget, naming the largest sources or dictionary channels. Studio
 refuses a whole dictionary over one channel it cannot decode, so construction

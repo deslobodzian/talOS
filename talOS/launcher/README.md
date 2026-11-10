@@ -140,8 +140,9 @@ as `--declared` and the session's `manifest.json` as `--manifest`; its stdout
 lands in `<output_dir>/<session_id>/studio_bridge.log`
 (plaintext, not a `.tlog`) beside the manifest.
 
-The bridge refuses to start before the telemetry publisher exists, so it is the
-one roster member supervised differently (`StudioBridge` in `launcher.h`). Its
+The bridge is the one roster member supervised differently (`StudioBridge` in
+`launcher.h`); it waits for the telemetry segment itself (see the
+[bridge README](../../studio/bridge/README.md#publisher-and-serving-constraints)). Its
 first attempt spawns with the nodes; a quick exit is retried at most once a
 second for up to 60 seconds, inside the supervision loop, so it never delays the
 session or its `--duration-s` deadline. While it is still starting it does not

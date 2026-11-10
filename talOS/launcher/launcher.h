@@ -1259,9 +1259,9 @@ inline std::string ExitReason(int status) {
 // Studio bridge
 //
 // The one roster member supervised differently. It takes positional args
-// rather than the node flags, logs plaintext to studio_bridge.log rather than
-// a .tlog, and refuses to start before the telemetry publisher exists -- so
-// its first attempts usually lose that race. It is retried at most once per
+// rather than the node flags, and logs plaintext to studio_bridge.log rather
+// than a .tlog. It waits for the telemetry topic itself, so an attempt that
+// exits quickly failed for some other reason. It is retried at most once per
 // interval, inside the supervision loop, within a bounded window; while it is
 // still starting it neither holds the session open nor reports its exits. A
 // bridge that survives one interval is stable and supervised like any node,
@@ -1319,7 +1319,6 @@ class StudioBridge {
         log_path_{options.output_dir + "/studio_bridge.log"},
         http_port_{EffectiveStudioHttpPort(robot_config, options)},
         args_{spec.binary_path,
-              "--drop-newest-publisher",
               StudioBridgeWatchTopic(described, robot_config),
               std::to_string(http_port_),
               robot_config.studio.webroot,
@@ -1392,7 +1391,7 @@ class StudioBridge {
       }
       if (attempts_ == 1 || attempts_ % 15 == 0) {
         std::cout << "[launcher] studio_bridge not up yet (exit " << last_code
-                  << "); waiting for the telemetry publisher...\n";
+                  << "); retrying...\n";
       }
       proc.pid = pid;
       proc.exited = false;

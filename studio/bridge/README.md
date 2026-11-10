@@ -13,14 +13,13 @@ separate terminals, from the repository root:
 
 ```sh
 bazel-bin/studio/bridge/studio_mock /talos/telemetry
-bazel-bin/studio/bridge/studio_bridge --drop-newest-publisher /talos/telemetry 5800 studio/dist
+bazel-bin/studio/bridge/studio_bridge /talos/telemetry 5800 studio/dist
 ```
 
 ## Arguments
 
-`--drop-newest-publisher` is required before positional arguments. The optional
-positions are topic (default `/talos/telemetry`), HTTP/WebSocket port (5800),
-and static web directory (`studio/dist`).
+The optional positions are topic (default `/talos/telemetry`), HTTP/WebSocket
+port (5800), and static web directory (`studio/dist`).
 
 These named options are removed before positional parsing:
 
@@ -104,7 +103,10 @@ buffered userspace output; it does not queue old observations for that client.
 A stalled client holds its slot until disconnected. Already accepted TCP bytes
 can still be buffered, so reconnect a stalled viewer for fresh data.
 The graph's bridge statistics include `clients`, `refused`, `ws_drops` and
-`egress_bytes`; the shutdown summary prints the cumulative counters.
+`egress_bytes`; the bridge's own telemetry source counts as `dropped` both
+frames the publisher overwrote before the bridge read them and telemetry frames
+dropped on the way to clients. The shutdown summary prints the cumulative
+counters, including `lapped`.
 
 ### Load probe
 
@@ -122,15 +124,25 @@ that no reader gets less than half the best-served reader's frames.
 
 ## Publisher and serving constraints
 
-The bridge requires a dedicated telemetry topic whose producer uses
-`OverflowPolicy::DROP_NEWEST`; RTMS does not store the overflow policy in shared
-memory. Reader configuration does not change the producer's policy. Do not
-attach the bridge to an overwrite/remove-slowest control-loop topic: the
-producer could change bytes during a send. See
+The bridge reads a dedicated telemetry byte topic in sequence. The publisher
+overwrites and never waits for it: a bridge that stalls is lapped, resumes at
+the oldest intact frame and counts the frames it missed, while publication
+continues for every other reader. Each frame is copied out of shared memory and
+checked against the writer's position before it is forwarded, so an overwrite
+during the copy is retried, never forwarded. See
 [DATA_FLOW](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary) for
 frame sizes and [shared-memory geometry](../../docs/DATA_FLOW.md#main-processor-shared-memory-slots).
 
-Start the publisher before the bridge and stop the bridge before replacing it.
+The bridge may start before the publisher. It serves HTTP and the system graph
+at once, checks for the topic's shared-memory segment every 100 poll ticks and
+attaches when it appears. It does not create the segment to wait on it: if the
+name is unlinked between that check and the attach, the attach creates an
+empty segment for an instant, sees the id change, closes it (removing it, as
+its only holder) and retries at the next check. Once attached it
+checks every 1000 ticks whether the name now holds a different segment (a new
+launcher session, or a publisher that recreated an incompatible one) and
+re-attaches. A segment whose name was unlinked is kept until a new one appears.
+Each wait, attachment and replacement is logged once to stderr.
 Graceful SIGINT/SIGTERM releases the reader slot. Static files are read
 synchronously on the thread that polls telemetry and capped at 4 MiB each
 (413 above it), a few times the built Studio bundle's largest asset. The server

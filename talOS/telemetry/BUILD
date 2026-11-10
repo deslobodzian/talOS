@@ -65,6 +65,8 @@ cc_test(
         "//talOS/hardware",
         "//talOS/msgs:geometry",
         "//talOS/node:testing",
+        "//talOS/rtms",
+        "//talOS/schema:identity",
         "//talOS/schema:test_messages",
         "@googletest//:gtest_main",
     ],

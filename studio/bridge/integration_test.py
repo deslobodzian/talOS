@@ -101,20 +101,16 @@ class BridgeIntegration(unittest.TestCase):
                 reservation.bind(("127.0.0.1", 0))
                 bare_port = reservation.getsockname()[1]
             try:
-                mock = subprocess.Popen([str(binaries / "studio_mock"), topic],
-                                        stdout=subprocess.PIPE, text=True)
-                processes.append(mock)
-                # The bridge refuses to start before the publisher's segment
-                # exists; the mock prints "ready" once it has created it.
-                self.assertEqual(mock.stdout.readline().strip(), "ready")
-                bridge = subprocess.Popen([str(binaries / "studio_bridge"), "--drop-newest-publisher", topic,
+                # The bridges start before the publisher: each serves HTTP and
+                # waits for the telemetry segment, then attaches to it.
+                bridge = subprocess.Popen([str(binaries / "studio_bridge"), topic,
                                            str(http_port), webroot, "--declared", str(declared),
                                            "--manifest", str(manifest)])
                 processes.append(bridge)
                 # The same bridge with no declared graph, to pin down what
                 # /declared.json does then. Started here so both are up while
                 # the deadline loop below waits.
-                bare = subprocess.Popen([str(binaries / "studio_bridge"), "--drop-newest-publisher", topic,
+                bare = subprocess.Popen([str(binaries / "studio_bridge"), topic,
                                          str(bare_port), webroot])
                 processes.append(bare)
                 # Wait until both bridges listen. A bridge signalled before it
@@ -123,7 +119,6 @@ class BridgeIntegration(unittest.TestCase):
                 deadline = time.monotonic() + 10
                 for port in (bare_port, http_port):
                     while True:
-                        self.assertIsNone(mock.poll(), "mock exited")
                         self.assertIsNone(bridge.poll(), "bridge exited")
                         self.assertIsNone(bare.poll(), "bridge without --declared exited")
                         try:
@@ -135,6 +130,10 @@ class BridgeIntegration(unittest.TestCase):
                             time.sleep(0.02)
                     if port == bare_port:
                         ws.close()
+                mock = subprocess.Popen([str(binaries / "studio_mock"), topic],
+                                        stdout=subprocess.PIPE, text=True)
+                processes.append(mock)
+                self.assertEqual(mock.stdout.readline().strip(), "ready")
                 with urllib.request.urlopen(f"http://127.0.0.1:{http_port}/", timeout=3) as response:
                     self.assertEqual(response.read(), b"studio integration")
                 with ws:

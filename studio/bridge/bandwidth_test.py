@@ -67,7 +67,7 @@ def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4)
             assert mock.stdout.readline().strip() == "ready"
             started = time.monotonic()
             bridge = subprocess.Popen([str(binaries / "studio_bridge"),
-                                       "--drop-newest-publisher", topic, str(port), root,
+                                       topic, str(port), root,
                                        "--config", str(config)])
             processes.append(bridge)
             deadline = time.monotonic() + 10

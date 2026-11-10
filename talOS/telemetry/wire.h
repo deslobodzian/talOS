@@ -28,8 +28,9 @@ static_assert(kMaxValueFrameBytes == 1200,
 
 // Slot geometry for the /talos/telemetry byte topic. A dictionary frame
 // (names, units, labels) is larger than a value frame but still bounded
-// by one slot; 64 slots at 100 Hz absorb over half a second of bridge
-// lag before DROP_NEWEST starts shedding frames.
+// by one slot; 64 slots at 100 Hz hold over half a second of frames, which a
+// reader that falls further behind loses (the writer overwrites; the reader
+// is told how many it missed).
 inline constexpr std::size_t slot_bytes = 16384;
 inline constexpr std::size_t slot_count = 64;
 

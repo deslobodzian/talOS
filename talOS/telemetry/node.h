@@ -219,6 +219,15 @@ inline bool MatchesGlobs(std::string_view topic,
 
 }  // namespace detail
 
+// How the telemetry node opens its byte topic. The stream is for viewers,
+// not a record (each node's event log is), so it overwrites: a stalled or
+// stopped reader is lapped and counts the frames it missed, and never makes
+// the writer refuse frames for every other reader.
+inline constexpr BytePublishOptions kTopicOptions{
+    .slots = telemetry_wire::slot_count,
+    .drop_newest = false,
+    .external = true};
+
 class Telemetry {
  public:
   explicit Telemetry(Node& node)
@@ -232,9 +241,7 @@ class Telemetry {
         topic_{ResolveTopic(node)},
         pose_topic_{ResolvePoseTopic(node)},
         studio_{node.publish_bytes(topic_, telemetry_wire::slot_bytes,
-                                   {.slots = telemetry_wire::slot_count,
-                                    .drop_newest = true,
-                                    .external = true})} {
+                                   kTopicOptions)} {
     using talos::detail::NodeAccess;
 
     idx_pose_valid_ = AddChannel("pose/valid");

@@ -1,6 +1,7 @@
 #include <App.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -53,16 +54,46 @@ struct Client {
   std::uint32_t dictionary_id = 0;
   bool has_dictionary = false;
 };
-struct ReaderLease {
-  RTMSQueue& queue;
-  std::size_t id;
-  ~ReaderLease() { queue.release_reader(id); }
-};
+// The id of the segment the shared-memory name `segment` holds now, or
+// nullopt while there is none or its creator has not finished initializing
+// it. Maps only the header, read-only, and keeps nothing open.
+std::optional<std::uint64_t> SegmentId(const std::string& segment) {
+  const int fd = ::shm_open(segment.c_str(), O_RDONLY, 0);
+  if (fd < 0) return std::nullopt;
+  std::optional<std::uint64_t> id;
+  struct stat status {};
+  // A segment still being sized is shorter than its header; mapping past
+  // its end would fault on the first read.
+  if (::fstat(fd, &status) == 0 &&
+      status.st_size >= static_cast<off_t>(sizeof(RTMSHeader))) {
+    void* mapped =
+        ::mmap(nullptr, sizeof(RTMSHeader), PROT_READ, MAP_SHARED, fd, 0);
+    if (mapped != MAP_FAILED) {
+      const auto* header = static_cast<const RTMSHeader*>(mapped);
+      if (header->magic.load(std::memory_order_acquire) == kRtmsMagic) {
+        id = header->segment_id;
+      }
+      ::munmap(mapped, sizeof(RTMSHeader));
+    }
+  }
+  ::close(fd);
+  return id;
+}
 using Socket = uWS::WebSocket<false, true, Client>;
 struct Bridge {
-  RTMSQueue& queue;
-  std::size_t reader;
   std::string topic;
+  // The telemetry topic, once its publisher's segment exists. The bridge
+  // serves HTTP and the system graph without it, waits for the segment
+  // rather than refusing to start, and re-attaches when the name comes to
+  // hold a different segment (a new launcher session, or a publisher that
+  // recreated an incompatible one).
+  std::string segment;
+  std::optional<RTMSQueue> queue;
+  std::size_t reader = 0;
+  std::uint64_t segment_id = 0;
+  unsigned watch_ticks = 0;
+  bool announced_wait = false;
+  std::string attach_error;
   std::vector<Socket*> clients;
   // Where the next fan-out starts. The shared bucket goes to whichever client
   // asks first, and every client's own burst equals the shared one, so in a
@@ -73,6 +104,9 @@ struct Bridge {
   us_listen_socket_t* listener = nullptr;
   std::uint64_t invalid = 0, ws_drops = 0, telemetry_ws_drops = 0,
                 forwarded = 0;
+  // Frames the publisher overwrote before this bridge read them: it never
+  // waits for the bridge, so a stalled bridge is lapped instead.
+  std::uint64_t lapped = 0;
   // read_next() copies each frame here first: forwarding commits side effects
   // (client sends, counters), which a zero-copy read() callback must not.
   std::vector<std::byte> frame =
@@ -80,6 +114,72 @@ struct Bridge {
   std::size_t max_clients = 4;
   std::uint64_t refused = 0, egress_bytes = 0;
   EgressBudget budget;
+
+  Bridge() = default;
+  Bridge(const Bridge&) = delete;
+  Bridge& operator=(const Bridge&) = delete;
+  ~Bridge() { detach(); }
+
+  void detach() {
+    if (!queue) return;
+    queue->release_reader(reader);
+    queue.reset();
+  }
+
+  // Attaches to segment `id` of the topic. False, logged once per distinct
+  // error, when the segment cannot be used yet; the next check retries.
+  bool attach(std::uint64_t id) {
+    try {
+      // A reader's policy only decides whether it may take the slot the
+      // writer is about to reuse; overwrite is right for any publisher.
+      RTMSQueue next(topic, talos::telemetry_wire::slot_bytes, 8,
+                     talos::schema::Bytes(), talos::telemetry_wire::slot_count,
+                     {OverflowPolicy::OVERWRITE_OLDEST, ReadMode::SEQUENCE});
+      // Replaced while attaching: which one `next` mapped is unknown.
+      if (SegmentId(segment) != id) return false;
+      const auto claimed = next.register_reader();
+      if (!claimed) throw std::runtime_error("RTMS reader slots exhausted");
+      detach();
+      queue.emplace(std::move(next));
+      reader = *claimed;
+      segment_id = id;
+      attach_error.clear();
+      std::cerr << "attached to " << topic << '\n';
+      return true;
+    } catch (const std::exception& e) {
+      if (attach_error != e.what()) {
+        attach_error = e.what();
+        std::cerr << "cannot attach to " << topic << " (" << e.what()
+                  << "); retrying\n";
+      }
+      return false;
+    }
+  }
+
+  // Attaches when the segment appears, re-attaches when the name holds a
+  // different one. A segment whose name was unlinked is kept: nothing
+  // replaces it until a new one appears.
+  void check_segment() {
+    const auto id = SegmentId(segment);
+    if (!id) {
+      if (!queue && !announced_wait) {
+        announced_wait = true;
+        std::cerr << "waiting for " << topic << " (start its publisher)\n";
+      }
+      return;
+    }
+    if (queue && *id == segment_id) return;
+    if (queue) std::cerr << topic << " was replaced; re-attaching\n";
+    attach(*id);
+  }
+
+  // Called every poll tick: checks every 100 ticks while waiting, every
+  // 1000 once attached (a replacement is rare; each check is a few syscalls).
+  void watch() {
+    if (++watch_ticks < (queue ? 1000u : 100u)) return;
+    watch_ticks = 0;
+    check_segment();
+  }
 
   bool send(Socket* client, std::string_view bytes, uWS::OpCode opcode) {
     // Charge WebSocket framing too. Drop rather than queue old observations.
@@ -202,28 +302,31 @@ struct Bridge {
     talos::introspect::SourceSnapshot source;
     // A watcher, not a fetcher: the reader is registered with
     // ReadMode::SEQUENCE, so it sees every frame in order rather than only the
-    // newest.
+    // newest, unless the publisher laps it. Both lapped frames and frames
+    // dropped on the way to clients count as dropped.
     source.kind = talos::event::SourceKind::WATCHER;
     source.name = topic;
     source.message_bytes =
         static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes);
     source.events = forwarded;
-    source.dropped = telemetry_ws_drops;
-    source.sequence = queue.writer_sequence();
+    source.dropped = telemetry_ws_drops + lapped;
+    source.sequence = queue ? queue->writer_sequence() : 0;
     node.sources.push_back(std::move(source));
     return node;
   }
 
   void poll() {
+    if (!queue) return;
     // Bound work so HTTP and client socket processing cannot starve.
     for (unsigned count = 0; count < 256; ++count) {
       MessageInfo info;
-      const auto result = queue.read_next(reader, frame, info);
+      const auto result = queue->read_next(reader, frame, info);
       if (result == ReadResult::TORN) {
         ++invalid;
         continue;
       }
       if (result != ReadResult::OK) break;
+      lapped += info.dropped;
       auto bytes = talos::telemetry_wire::payload(frame);
       if (bytes.empty()) {
         ++invalid;
@@ -361,9 +464,13 @@ int main(int argc, char** argv) try {
   const std::size_t count = args.size();
   const auto at = [&args](std::size_t i) { return args[i]; };
 
-  if (count < 2 || std::string_view(at(1)) != "--drop-newest-publisher") {
+  const bool unknown_option =
+      std::any_of(args.begin() + 1, args.end(), [](const char* argument) {
+        return std::string_view(argument).starts_with("--");
+      });
+  if (count > 4 || unknown_option) {
     std::cerr
-        << "Usage: studio_bridge --drop-newest-publisher "
+        << "Usage: studio_bridge "
            "[topic=/talos/telemetry] [HTTP=5800] [webroot=studio/dist]\n"
            "       [--declared PATH]   the launcher's graph.json, served at "
            "/declared.json\n"
@@ -371,14 +478,12 @@ int main(int argc, char** argv) try {
            "/manifest.json\n"
            "       [--config PATH]     reads [studio] max_clients\n"
            "       [--describe]          print the --describe envelope and "
-           "exit\n"
-           "The publisher MUST use DROP_NEWEST; RTMS does not store this "
-           "policy in shared memory.\n";
+           "exit\n";
     return 2;
   }
   std::signal(SIGINT, signal_handler);
   std::signal(SIGTERM, signal_handler);
-  const char* topic = count > 2 ? at(2) : "/talos/telemetry";
+  const char* topic = count > 1 ? at(1) : "/talos/telemetry";
 
   // The declared graph: what the launcher probed with `--describe` before it
   // spawned anything.
@@ -407,33 +512,21 @@ int main(int argc, char** argv) try {
                 << "; /declared.json will report it absent\n";
     }
   }
-  // Refuse a missing publisher instead of silently creating an empty ring.
-  //
-  // Opened by segment name, not by topic. A topic like /talos/telemetry has an
-  // interior slash, which POSIX does not allow in an shm name, so RTMS maps it
-  // (`ShmObjectName`) before touching the OS. Checking the raw topic here
-  // looked for a segment that never exists and reported a healthy publisher as
-  // missing -- on macOS, where the unmapped name happens to be legal, this
-  // failed only once the mapping was introduced.
-  const std::string segment = ShmObjectName(topic);
-  int existing = shm_open(segment.c_str(), O_RDWR, 0);
-  if (existing < 0) {
-    throw std::runtime_error("start the telemetry publisher before the bridge");
-  }
-  close(existing);
-  RTMSQueue queue(topic, talos::telemetry_wire::slot_bytes, 8,
-                  talos::schema::Bytes(), talos::telemetry_wire::slot_count,
-                  {OverflowPolicy::DROP_NEWEST, ReadMode::SEQUENCE});
-  auto reader = queue.register_reader();
-  if (!reader) throw std::runtime_error("RTMS reader slots exhausted");
-  ReaderLease lease{queue, *reader};
   auto port = [](const char* s) {
     auto p = std::stoul(s);
     if (p == 0 || p > 65535) throw std::runtime_error("invalid port");
     return static_cast<std::uint16_t>(p);
   };
-  const auto root = fs::canonical(count > 4 ? at(4) : "studio/dist");
-  Bridge bridge{queue, *reader, topic};
+  const auto root = fs::canonical(count > 3 ? at(3) : "studio/dist");
+  Bridge bridge;
+  bridge.topic = topic;
+  // Watched by segment name, not by topic. A topic like /talos/telemetry has
+  // an interior slash, which POSIX does not allow in an shm name, so RTMS maps
+  // it (`ShmObjectName`) before touching the OS. The bridge attaches only
+  // once the segment exists: an empty ring of its own would wait for a
+  // publisher that might disagree with its layout.
+  bridge.segment = ShmObjectName(topic);
+  bridge.check_segment();
   if (!config_path.empty()) {
     bridge.max_clients =
         talos::config::ParseRobotConfig(config_path).studio.max_clients;
@@ -578,7 +671,7 @@ int main(int argc, char** argv) try {
         ->end(body);
   });
   bool listening = false;
-  app.listen(count > 3 ? port(at(3)) : 5800, [&](auto* token) {
+  app.listen(count > 2 ? port(at(2)) : 5800, [&](auto* token) {
     listening = token != nullptr;
     bridge.listener = token;
   });
@@ -606,6 +699,7 @@ int main(int argc, char** argv) try {
           us_timer_close(t);
           return;
         }
+        b->watch();
         b->poll();
         if (++ticks >= kSystemRefreshTicks) {
           ticks = 0;
@@ -617,7 +711,8 @@ int main(int argc, char** argv) try {
   // running loop.
   app.run();
   std::cerr << "forwarded=" << bridge.forwarded << " invalid=" << bridge.invalid
-            << " ws_drops=" << bridge.ws_drops << " refused=" << bridge.refused
+            << " lapped=" << bridge.lapped << " ws_drops=" << bridge.ws_drops
+            << " refused=" << bridge.refused
             << " egress_bytes=" << bridge.egress_bytes << '\n';
 } catch (const std::exception& e) {
   std::cerr << e.what() << '\n';

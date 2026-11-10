@@ -61,10 +61,10 @@ int main(int argc, char** argv) try {
   std::signal(SIGTERM, signal_handler);
   RTMSQueue queue(argc > 1 ? argv[1] : "/talos/telemetry", wire::slot_bytes, 8,
                   talos::schema::Bytes(), wire::slot_count,
-                  {.overflow_policy = OverflowPolicy::DROP_NEWEST,
+                  {.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
                    .read_mode = ReadMode::SEQUENCE,
                    .publisher = true});
-  // The segment exists now; tests wait for this line before starting a bridge.
+  // The segment exists now; tests wait for this line.
   std::cout << "ready\n" << std::flush;
 
   std::vector<ChannelDef> dictionary = {

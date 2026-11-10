@@ -1,6 +1,7 @@
 #include "talOS/telemetry/node.h"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <cmath>
@@ -17,6 +18,8 @@
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/node/testing.h"
+#include "talOS/rtms/rtms.h"
+#include "talOS/schema/identity.h"
 #include "talOS/telemetry/wire.h"
 
 namespace talos::telemetry {
@@ -1064,6 +1067,47 @@ stale_timeout_us = 50000
   EXPECT_DOUBLE_EQ(channels.at("pose/valid"), 0.0);
   // Pose estimator channels are NaN when stale
   EXPECT_FALSE(channels.contains("pose_estimator/state/twist/vx_mps"));
+}
+
+// The viewer stream outlives its viewers: a reader that registered and then
+// stopped reading (a stalled Studio bridge) is lapped, not obeyed. Under
+// drop_newest the writer refused every frame past the ring, for every reader.
+// testing::Sim keeps byte topics in memory without a ring, so the topic is
+// exercised on RTMS directly, as Node::publish_bytes opens it without
+// drop_newest.
+TEST(TelemetryTopic, AStoppedReaderDoesNotStopPublication) {
+  ASSERT_FALSE(kTopicOptions.drop_newest);
+  const std::string topic = "/test/telemetry/p" + std::to_string(::getpid());
+  RTMSQueue writer{topic,
+                   telemetry_wire::slot_bytes,
+                   kMessageAlignment,
+                   schema::Bytes(),
+                   kTopicOptions.slots,
+                   {.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+                    .read_mode = ReadMode::SEQUENCE,
+                    .publisher = true}};
+  RTMSQueue stalled{topic,
+                    telemetry_wire::slot_bytes,
+                    kMessageAlignment,
+                    schema::Bytes(),
+                    telemetry_wire::slot_count,
+                    {.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+                     .read_mode = ReadMode::SEQUENCE}};
+  const auto reader = stalled.register_reader();
+  ASSERT_TRUE(reader.has_value());
+
+  const std::uint64_t frames = 3 * telemetry_wire::slot_count;
+  std::vector<std::byte> frame(64, std::byte{1});
+  for (std::uint64_t i = 0; i < frames; ++i) {
+    EXPECT_EQ(writer.write(frame).result, WriteResult::SUCCESS) << i;
+  }
+
+  // Resuming, the reader gets the oldest intact frame and the count it missed.
+  std::vector<std::byte> slot(telemetry_wire::slot_bytes);
+  MessageInfo info{};
+  ASSERT_EQ(stalled.read_next(*reader, slot, info), ReadResult::OK);
+  EXPECT_EQ(info.dropped, frames - (telemetry_wire::slot_count - 1));
+  stalled.release_reader(*reader);
 }
 
 }  // namespace

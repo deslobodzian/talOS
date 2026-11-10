@@ -245,7 +245,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | `/<camera>/status`: each camera → telemetry | 96 | 88 B vision.VisionStatus, pinned in vision.h; append-only reconnect/stall/control-failure counters and controls_applied are excluded from robot telemetry, preserving its value-frame budget |
 | `/pose_estimator/state`: estimator → telemetry | 80 | 72 B geometry.PoseEstimate; `valid` = fresh usable odometry, `localized` = established field-frame trust; `localized` sits in existing payload padding |
 | `/sim/state`: physics sim_gateway → four simulated cameras / telemetry | 64 | 56 B geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
-| `/talos/telemetry`: telemetry → studio_bridge | 16392 × 64 slots | 16384 B byte payload capacity; ring = 1049088 B of slot storage; actual frames have padding stripped before WebSocket forwarding |
+| `/talos/telemetry`: telemetry → studio_bridge | 16392 × 64 slots | 16384 B byte payload capacity; ring = 1049088 B of slot storage; the writer overwrites, so a reader more than 63 frames (0.63 s at 100 Hz) behind is lapped and counts the missed frames, and a stalled reader never stops publication; actual frames have padding stripped before WebSocket forwarding |
 
 Sources: `talOS/hardware/packet.h`, `talOS/bridge/bridge_status.fbs`,
 `talOS/devices/target.h`, `talOS/msgs/geometry.fbs`, robot `*_message.fbs`,
