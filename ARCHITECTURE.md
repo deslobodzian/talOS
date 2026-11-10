@@ -88,7 +88,11 @@ After each tick the devices layer flushes one hardware request for the node:
   `robot_enabled(node)` is true; otherwise DIO is false and PWM is zero;
 - motor demand and feedforward are clamped to that motor's configured limits;
   non-finite values neutralize only that motor. `Motor::clamped_count()` counts
-  adjusted setter calls for the lifetime of the device.
+  adjusted setter calls for the lifetime of the device;
+- a motor's position and motion-magic demands are sent neutral while its
+  `Motor::rezero` zero is lost (dropped on a gateway boot or device reset that
+  may have restarted its frame), or while its config sets `requires_zero` and
+  no rezero holds (see the node development guide).
 
 Output setters (motor, digital, PWM) are therefore accepted only inside
 `update()`; from the constructor, `every()` or a message callback they throw

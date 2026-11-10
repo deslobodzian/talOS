@@ -39,6 +39,8 @@ struct UdpStats {
   uint64_t sequence_gaps = 0;
   uint64_t last_received_sequence = 0;
   DecodeStatus last_decode_status = DecodeStatus::kOk;
+  // The header version of the last kUnsupportedVersion frame; 0 before one.
+  uint16_t last_unsupported_version = 0;
 };
 
 // Connected UDP runtime peer for the Mac<->Rio hot path.

@@ -117,6 +117,10 @@ struct State {
   uint64_t config_id{}, boot_id{}, epoch{}, sample_time_us{},
       last_command_sequence{};
   uint64_t clock_probe_time_us{};
+  // Gateway::Tick count within this boot, incremented at the top of every
+  // tick, so a consumer can tell consecutive States from a gap (a lost
+  // datagram, a tick with no socket, a reconfigure's extra tick).
+  uint64_t sequence{};
   uint32_t flags{};
   uint16_t motor_count{}, sensor_count{};
   uint16_t digital_input_count{}, digital_output_count{};
@@ -145,8 +149,10 @@ inline constexpr std::size_t kMaxCommandSize =
 
 inline constexpr std::size_t kHealthSampleSize = 1 + 8 + 1 + 8;
 inline constexpr std::size_t kGatewayCountersSize = std::size_t{4} * 4;
+// The State layout is also spelled by startup_test.py
+// (2026-robot/main_processor/simulation), which decodes logged States.
 inline constexpr std::size_t kStateBaseSize =
-    6 * 8 + 4 + 7 * 2 + kHealthSampleSize + kGatewayCountersSize;
+    7 * 8 + 4 + 7 * 2 + kHealthSampleSize + kGatewayCountersSize;
 // Current and temperature use signed tenths (saturating int16) on the wire.
 inline constexpr std::size_t kMotorSampleSize = 2 + 1 + 3 * 8 + 3 * 2 + 3 * 4;
 inline constexpr std::size_t kSensorSampleSize = 2 + 1 + 2 * 8 + 2 * 4;
@@ -164,7 +170,9 @@ inline constexpr std::size_t kMaxStateSize =
     kMaxEncoders * kEncoderSampleSize + kMaxPwmOutputs * kPwmSampleSize;
 
 static_assert(kMaxCommandSize == 410, "Update docs/DATA_FLOW.md");
-static_assert(kMaxStateSize == 1388, "Update docs/DATA_FLOW.md");
+static_assert(kStateBaseSize - kHealthSampleSize - kGatewayCountersSize == 74,
+              "Update docs/DATA_FLOW.md");
+static_assert(kMaxStateSize == 1396, "Update docs/DATA_FLOW.md");
 
 // Explicit little-endian codecs: no padding, native bool layout, or alignment
 // assumptions cross the RoboRIO/companion boundary.

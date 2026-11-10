@@ -8,7 +8,7 @@ import ctypes
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 21
+_EXPECTED_ABI_VERSION = 22
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -137,6 +137,8 @@ _SIGNATURES = {
     "talos_motor_clamped_count": (c_int32, [c_void_p, c_int64, _P(c_uint64)]),
     "talos_motor_rezero": (c_int32, [c_void_p, c_int64, c_double]),
     "talos_gyro_rezero": (c_int32, [c_void_p, c_int64, c_double]),
+    "talos_motor_zeroed": (c_int32, [c_void_p, c_int64]),
+    "talos_gyro_zeroed": (c_int32, [c_void_p, c_int64]),
     "talos_digital_output_set": (c_int32, [c_void_p, c_int64, c_int32]),
     "talos_pwm_set": (c_int32, [c_void_p, c_int64, c_double]),
     "talos_motor_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
@@ -207,6 +209,10 @@ _TESTING_SIGNATURES = {
                                                        c_int64]),
     "talos_sim_hardware_set_connected": (c_int32, [c_void_p, c_char_p,
                                                    c_char_p, c_int32]),
+    "talos_sim_hardware_reset_device": (c_int32, [c_void_p, c_char_p,
+                                                  c_char_p]),
+    "talos_sim_hardware_lose_states": (c_int32, [c_void_p, c_int32]),
+    "talos_sim_hardware_reboot": (c_int32, [c_void_p]),
     "talos_sim_hardware_set_driver_station": (
         c_int32, [c_void_p, _P(DriverStationPacket)]),
     "talos_sim_hardware_motor_request": (c_int32, [c_void_p, c_char_p,

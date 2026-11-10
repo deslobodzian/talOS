@@ -210,6 +210,9 @@ class HardwareNode {
   ClockOffsetEstimator clock_;
   uint64_t last_probe_send_us_{};
   bool probe_waiting_{false};
+  // Set once a frame of another protocol version is logged, until a frame
+  // of this version arrives.
+  bool version_mismatch_logged_{false};
   uint64_t pending_probe_send_us_{};
   uint64_t pending_probe_sample_us_{};
   uint64_t pending_probe_boot_id_{};

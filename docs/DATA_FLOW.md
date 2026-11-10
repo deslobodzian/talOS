@@ -92,7 +92,7 @@ has no reflected radio channels; only the bench motor state adds these scalars.
 
 ## UDP frame and payload sizes
 
-One datagram contains exactly one protocol frame, version **4**.
+One datagram contains exactly one protocol frame, version **5**.
 The explicit little-endian header is **40 B**: magic u64 (8),
 version/header_size/type/flags u16 (8 total),
 sequence u64 (8), monotonic_time_us u64 (8), payload_size u32 (4), reserved u32
@@ -102,7 +102,7 @@ need no IP fragmentation (`talOS/protocol/frame.h`, `frame.cc`, `types.h`).
 
 | Payload | Fixed vs dynamic formula (bytes) | Maximum payload | Maximum frame | Payload headroom |
 |---|---|---:|---:|---:|
-| State, type 20 | `66 + 45M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 34` | 1388 | 1428 | 44 |
+| State, type 20 | `74 + 45M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 34` | 1396 | 1436 | 36 |
 | Command, type 21 | `38 + 20M + 3DO + 10PWM` | 410 | 450 | 1022 |
 | Config chunk, type 22 | 24-byte header (config_id u64, total_crc32 u32, total_bytes u32, chunk_index u16, chunk_count u16, chunk_bytes u32) + ≤1408 data | 1432 | 1472 | 0 for full chunk |
 | ConfigAck, type 23 | u64 config_id + u8 status + char[64] reason | 73 | 113 | 1359 |
@@ -110,12 +110,16 @@ need no IP fragmentation (`talOS/protocol/frame.h`, `frame.cc`, `types.h`).
 | ClockProbe, type 25 | empty; send timestamp uses existing frame header | 0 | 40 | 1432 |
 
 State/Command maxima use caps **M=16, S=12, DI=8, DO=4, AI=4, E=4,
-PWM=4** (`talOS/hardware/config.h`). The 66-byte State prefix is six u64 +
+PWM=4** (`talOS/hardware/config.h`). The 74-byte State prefix is seven u64 +
 u32 flags + seven u16 counts; its 34-byte suffix is health (18) + four u32
 counters (16). Command prefix is four u64 + three u16 counts = 38.
 The sixth u64 is `clock_probe_time_us`, echoing a probe received before the
 current gateway tick began. Zero means no probe yet. It does not affect
 command acceptance, ACK sequence, epoch, or actuator watchdogs.
+The seventh u64 is `sequence`, the gateway's tick count within its boot,
+incremented at the top of every `Gateway::Tick` whether or not that tick's
+State is sent; the devices layer takes `sequence + 1` as proof that no State
+was missed (`Motor::zeroed`).
 
 | Device | State bytes / device | Command bytes / device | Encoded fields |
 |---|---:|---:|---|
@@ -139,16 +143,16 @@ The canonical parser merges `2026-robot/main_processor/configuration/robot.toml`
 and its subsystem files. Current device counts are **10 motors, 5 sensors,
 2 digital inputs, 0 digital outputs, 0 analog inputs, 0 encoders, 0 PWM outputs**.
 
-- State: `66 + 10×45 + 5×27 + 2×4 + 34` = **693 B** payload,
-  **733 B** frame, **739 B** payload headroom.
+- State: `74 + 10×45 + 5×27 + 2×4 + 34` = **701 B** payload,
+  **741 B** frame, **731 B** payload headroom.
 - Command: `38 + 10×20` = **238 B** payload, **278 B** frame,
   **1194 B** payload headroom.
 - Serialized Config: **3231 B**; `ceil(3231 / 1408)` = **3 chunks**.
   Chunk data lengths **1408, 1408, 415 B**, payload lengths **1432, 1432,
   439 B**, datagram lengths **1472, 1472, 479 B**. One push is **3423 B**
   of talOS frames (`3231 + 3×24 + 3×40`), excluding UDP/IP headers.
-- State at 200 Hz: **146600 B/s** in talOS frames (`733×200`), or
-  **1.1728 Mbit/s**, on the wired internal link, not the robot radio.
+- State at 200 Hz: **148200 B/s** in talOS frames (`741×200`), or
+  **1.1856 Mbit/s**, on the wired internal link, not the robot radio.
 
 
 ## Dynamic and multi-frame messages
@@ -233,7 +237,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 
 | Topic / owner → consumer | Slot bytes | Meaning / rate |
 |---|---:|---|
-| `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data currently 693, ≤1388 |
+| `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data currently 701, ≤1396 |
 | `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data currently 238, ≤410 |
 | `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1448 | 1436 B Packet; DS occupied data 46–678 |
 | `/hw/request/<node>`: device owner → bridge | 1448 | 1436 B Packet; only that owner's actuator requests, not a full-capacity command |
@@ -396,5 +400,5 @@ wrong-identity commands, and disabled/stale-target actuation is neutralized.
 The configured command timeout is **100 ms**; a single loss does not imply an
 immediate timeout. The maximum frame fits the IPv4 MTU without fragmentation.
 
-The device caps are a hard one-datagram budget: State has **44 B**
+The device caps are a hard one-datagram budget: State has **36 B**
 worst-case payload headroom.

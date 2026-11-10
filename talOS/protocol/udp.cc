@@ -293,6 +293,9 @@ UdpStatus RuntimeUdpPeer::TryReceive(DecodedFrame* out) {
   const DecodeStatus decode_status =
       DecodeFrame(rx_buffer_.data(), received_size, &decoded);
   stats_.last_decode_status = decode_status;
+  if (decode_status == DecodeStatus::kUnsupportedVersion) {
+    stats_.last_unsupported_version = decoded.header.version;
+  }
   if (decode_status != DecodeStatus::kOk) {
     ++stats_.decode_failures;
     return UdpStatus::kDecodeError;

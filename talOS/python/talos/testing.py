@@ -249,6 +249,25 @@ class SimHardware:
         self._set(lib.talos_sim_hardware_set_connected, node, device,
                   bool(connected))
 
+    def reset_device(self, node, device):
+        """A device reset as the gateway reports one: the next state counts
+        it in device_reset_count, and it and the state after mask the motor
+        or sensor of `node` named `device` with its followers and the motors
+        it feeds as a remote CANcoder. Raises TalosError when `node` has no
+        motor, CANcoder or gyro of that name."""
+        self._set(lib.talos_sim_hardware_reset_device, node, device)
+
+    def lose_states(self, count):
+        """The next `count` gateway ticks (and their sequence numbers) pass
+        with nothing published, as over a link outage."""
+        _abi.ok(lib.talos_sim_hardware_lose_states(self._handle, int(count)))
+
+    def reboot(self):
+        """A new gateway boot id from the next state on; the tick sequence,
+        the device reset count and the Driver Station mode generation start
+        over."""
+        _abi.ok(lib.talos_sim_hardware_reboot(self._handle))
+
     def set_driver_station(self, *, enabled=False, autonomous=False,
                            teleop=False, test=False, estop=False,
                            attached=True, fms_attached=False,

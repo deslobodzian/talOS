@@ -321,7 +321,23 @@ void HardwareNode::Tick(uint64_t now_us) {
     protocol::DecodedFrame frame;
     const auto status = peer_.TryReceive(&frame);
     if (status == protocol::UdpStatus::kWouldBlock) break;
+    if (status == protocol::UdpStatus::kDecodeError &&
+        peer_.stats().last_decode_status ==
+            protocol::DecodeStatus::kUnsupportedVersion) {
+      // Once per mismatch: a stale RoboRIO program floods every tick.
+      if (!version_mismatch_logged_) {
+        std::fprintf(
+            stderr,
+            "hardware_node: the gateway speaks protocol %u, this "
+            "build %u; deploy the RoboRIO program from this build\n",
+            static_cast<unsigned>(peer_.stats().last_unsupported_version),
+            static_cast<unsigned>(protocol::kProtocolVersion));
+        version_mismatch_logged_ = true;
+      }
+      continue;
+    }
     if (status != protocol::UdpStatus::kOk) continue;
+    version_mismatch_logged_ = false;
 
     if (frame.header.type == protocol::FrameType::kHardwareConfigAck) {
       ConfigAckPayload ack{};

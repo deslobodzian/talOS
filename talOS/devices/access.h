@@ -57,6 +57,11 @@ struct HardwareAccess {
                            double position_rot);
   static void gyro_rezero(HardwareLink& link, std::size_t index,
                           double yaw_rot);
+  // Whether a rezero holds: set by one that took, cleared as Motor::zeroed
+  // describes (boot change, a reset masking the device in the next State,
+  // any reset across a sequence gap).
+  static bool motor_zeroed(const HardwareLink& link, std::size_t index);
+  static bool gyro_zeroed(const HardwareLink& link, std::size_t index);
   static std::optional<event::MonotonicTime> motor_time(
       const HardwareLink& link, std::size_t index, bool velocity);
   static std::optional<event::MonotonicTime> sensor_time(

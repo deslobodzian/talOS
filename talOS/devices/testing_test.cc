@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -302,6 +303,35 @@ TEST_F(SimHardwareTest, ZeroVelocityIsAnActiveStopRatherThanNeutralDecay) {
   EXPECT_DOUBLE_EQ(Motor("braked").velocity_rps, 0.0);
   EXPECT_DOUBLE_EQ(Motor("braked").position_rot, position);
   EXPECT_GT(Motor("coasting").velocity_rps, 39.0);
+}
+
+TEST_F(SimHardwareTest, ResetAndRebootRefuseRequestsAsTheGatewayDoes) {
+  Send("mech", Drive());
+  sim.step(5ms);
+  ASSERT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
+  const hardware::Command before_reset = Drive();
+  hw.reset_device("mech", "braked");
+  sim.step(5ms);  // the first of two masking States
+  EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
+  EXPECT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kVelocity);
+  sim.step(10ms);  // restored
+  ASSERT_TRUE(Motor("braked").valid);
+  // A request observed before the reset never drives the reset motor.
+  Send("mech", before_reset);
+  EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
+  EXPECT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kVelocity);
+  Send("mech", Drive());
+  EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
+
+  // A request built from the previous boot's State is ignored.
+  hardware::Command old_boot = Drive();
+  old_boot.motors[0].demand = 10.0;
+  hw.reboot();
+  sim.step(5ms);
+  Send("mech", old_boot);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "braked").demand, 40.0);
+
+  EXPECT_THROW(hw.reset_device("mech", "led"), std::invalid_argument);
 }
 
 }  // namespace

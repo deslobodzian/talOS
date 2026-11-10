@@ -24,6 +24,14 @@ struct Gains {
   bool operator==(const Gains&) const = default;
 };
 
+// A motor setting only the main processor reads. It is not on the config
+// wire, so it compares equal whatever its value: Decode(Encode(c)) == c still
+// holds, and the gateway's same-config shortcut (Reconfigure) is unaffected.
+struct LocalMotorSetting {
+  bool value{false};
+  bool operator==(const LocalMotorSetting&) const { return true; }
+};
+
 struct MotorConfig {
   uint16_t id{};  // Logical ID, independent of CAN address and array index.
   std::string name;
@@ -46,6 +54,10 @@ struct MotorConfig {
   std::array<Gains, 3> slots{};
   uint16_t master_id{0};  // Zero denotes an independent motor.
   bool oppose_master{false};
+  // Main processor only (talOS/devices): position and motion-magic demands
+  // go out neutral until the owning node's Motor::rezero holds for this
+  // motor. Not sent to the controller and not part of ConfigurationId.
+  LocalMotorSetting requires_zero{};
   bool operator==(const MotorConfig&) const = default;
 };
 

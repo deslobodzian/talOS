@@ -519,6 +519,101 @@ TEST(Devices, RezeroSharesSoftwareFramesAndPreservesHardwareLimits) {
   EXPECT_DOUBLE_EQ(other_gyro.yaw(), 0);
 }
 
+// A zero holds only in the hardware frame it was taken in: a node restart
+// (a new node) starts unzeroed, a disconnect keeps it, a reset seen in
+// consecutive gateway States drops only the zero of the device it masked
+// (also when that device was already invalid, as after a power loss), and a
+// gateway boot change drops every zero. Dropping does not move position().
+TEST(Devices, RezeroIsDroppedWhenTheHardwareFrameMayHaveRestarted) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  SimHardware hw{sim};
+  hw.set_motor("mech", "b", 3, 0);
+  hw.set_gyro("mech", "gyro", 0.25, 0);
+  sim.step(10ms);
+  EXPECT_FALSE(mech.b.zeroed());
+  mech.a.rezero();
+  mech.b.rezero();
+  mech.gyro.rezero();
+  ASSERT_TRUE(mech.b.zeroed());
+
+  hw.set_connected("mech", "b", false);
+  sim.step(10ms);
+  hw.set_connected("mech", "b", true);
+  sim.step(10ms);
+  EXPECT_TRUE(mech.b.zeroed());
+
+  hw.reset_device("mech", "b");
+  sim.step(20ms);
+  ASSERT_TRUE(mech.b.connected());
+  EXPECT_FALSE(mech.b.zeroed());
+  EXPECT_DOUBLE_EQ(mech.b.position(), 0);
+  EXPECT_TRUE(mech.a.zeroed());
+  EXPECT_TRUE(mech.gyro.zeroed());
+
+  // Power loss: b is already invalid when the gateway counts its reset.
+  mech.b.rezero();
+  hw.set_connected("mech", "b", false);
+  sim.step(10ms);
+  hw.reset_device("mech", "b");
+  sim.step(10ms);
+  hw.set_connected("mech", "b", true);
+  sim.step(20ms);
+  EXPECT_FALSE(mech.b.zeroed());
+  EXPECT_TRUE(mech.a.zeroed());
+  EXPECT_TRUE(mech.gyro.zeroed());
+
+  hw.reboot();
+  sim.step(10ms);
+  EXPECT_FALSE(mech.a.zeroed());
+  EXPECT_FALSE(mech.gyro.zeroed());
+  EXPECT_DOUBLE_EQ(mech.gyro.yaw(), 0);
+}
+
+// Position goals need a frame: a dropped zero holds them neutral until the
+// node rezeroes, whatever requires_zero says, and requires_zero also holds
+// a motor that was never zeroed. Other modes are unaffected.
+TEST(Devices, PositionGoalsWaitForAZero) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_motor("mech", "b", 3, 0);
+  mech.a_velocity = 5;
+  mech.b_motion_magic = 1;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
+  mech.b.rezero();
+  sim.step(10ms);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "b").demand, 4);
+
+  // Another device's reset, but in States that were lost: a is masked and
+  // restored unseen, so nothing shows which device reset, and b's zero goes
+  // too.
+  hw.lose_states(2);
+  hw.reset_device("mech", "a");
+  sim.step(20ms);
+  EXPECT_FALSE(mech.b.zeroed());
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kNeutral);
+  EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kVelocity);
+  mech.b.rezero();
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
+
+  std::string toml{kRobotToml};
+  toml.insert(toml.find("can_id = 2\n") + 11, "requires_zero = true\n");
+  auto required = Sim::FromToml(toml);
+  auto& lift = required.add<Mech>("mech");
+  SimHardware lift_hw{required};
+  lift_hw.enable();
+  lift.b_motion_magic = 1;
+  required.step(10ms);
+  EXPECT_EQ(lift_hw.motor_request("mech", "b").mode, Mode::kNeutral);
+  lift.b.rezero();
+  required.step(10ms);
+  EXPECT_EQ(lift_hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
+}
+
 TEST(Devices, NonFiniteDemandIsNeutral) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");

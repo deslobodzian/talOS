@@ -324,6 +324,29 @@ int32_t talos_sim_hardware_set_connected(TalosSimHardware* hw, const char* node,
   });
 }
 
+int32_t talos_sim_hardware_reset_device(TalosSimHardware* hw, const char* node,
+                                        const char* device) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    AsHardware(hw).reset_device(NonNull(node, "node"),
+                                NonNull(device, "device"));
+    return TALOS_OK;
+  });
+}
+
+int32_t talos_sim_hardware_lose_states(TalosSimHardware* hw, int32_t count) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    AsHardware(hw).lose_states(count);
+    return TALOS_OK;
+  });
+}
+
+int32_t talos_sim_hardware_reboot(TalosSimHardware* hw) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    AsHardware(hw).reboot();
+    return TALOS_OK;
+  });
+}
+
 int32_t talos_sim_hardware_set_driver_station(
     TalosSimHardware* hw, const TalosDriverStationPacket* packet) {
   return Guard<int32_t>(TALOS_ERR, [&] {

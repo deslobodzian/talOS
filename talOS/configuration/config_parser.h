@@ -283,7 +283,7 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
         k != "cruise_velocity_rps" && k != "acceleration_rps2" &&
         k != "jerk_rps3" && k != "follow" && k != "oppose_master" &&
         k != "feedback" && k != "feedback_sensor" && k != "slot0" &&
-        k != "slot1" && k != "slot2") {
+        k != "slot1" && k != "slot2" && k != "requires_zero") {
       throw std::invalid_argument("unknown motor key '" + std::string(k) +
                                   "' for " + name);
     }
@@ -305,6 +305,7 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
       Read(t, "sensor_to_mechanism_ratio", m.sensor_to_mechanism_ratio);
   m.continuous_wrap = Read(t, "continuous_wrap", m.continuous_wrap);
   m.soft_limits = Read(t, "soft_limits", m.soft_limits);
+  m.requires_zero.value = Read(t, "requires_zero", m.requires_zero.value);
   m.reverse_limit_rot = Read(t, "reverse_limit_rot", m.reverse_limit_rot);
   m.forward_limit_rot = Read(t, "forward_limit_rot", m.forward_limit_rot);
   m.max_velocity_rps = Read(t, "max_velocity_rps", m.max_velocity_rps);

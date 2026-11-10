@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -166,7 +167,11 @@ struct HardwareLink::Impl {
     hardware::MotorRequest motor{};
     const hardware::MotorConfig* motor_config = nullptr;
     std::uint64_t clamped_count = 0;
-    double position_offset = 0;
+    double position_offset = 0;  // Motor/Gyro software zero
+    bool zeroed = false;         // position_offset was set by rezero
+    // A zero was dropped (ForgetZeros) and no rezero has replaced it: the
+    // offset is kept for reads, but position goals go out neutral.
+    bool zero_lost = false;
     bool digital = false;
     double pwm = 0;
     // Where this device's sample was in the state arrays last time it was
@@ -265,10 +270,53 @@ struct HardwareLink::Impl {
     hardware::State next{};
     if (!hardware::Decode(packet.bytes(), next)) return;
     if (!hardware::AcceptState(have_state, state, config_id, next)) return;
+    if (have_state) ForgetZeros(next);
     state = next;
     have_state = true;
     state_published = node.now() - detail::NodeAccess::subscription_age(
                                        node, state_subscription);
+  }
+
+  // A software zero holds only in the hardware frame it was taken in, and a
+  // gateway boot change or a device reset may have restarted that frame.
+  // ForgetZeros runs on each accepted state, with `state` still the one
+  // before it:
+  //   - a boot id change drops every zero (a new boot may come with
+  //     power-cycled devices);
+  //   - a device_reset_count change with next.sequence == state.sequence + 1
+  //     (the gateway tick right after the one seen last) drops the zeros of
+  //     this node's devices that `next` masks: the gateway counts a reset
+  //     and masks the device, with its followers and remote-sensor
+  //     consumers, in the same State;
+  //   - any other device_reset_count change drops every zero: the masking
+  //     State may have been lost (a link outage, a bridge restart, dropped
+  //     datagrams, a tick with no socket) and the device restored since.
+  // A dropped zero keeps its offset, so dropping does not move position()
+  // or yaw(); it reads zeroed() false and holds the motor's position goals
+  // neutral until the node rezeroes.
+  void ForgetZeros(const hardware::State& next) {
+    const bool reboot = next.boot_id != state.boot_id;
+    if (!reboot &&
+        next.counters.device_reset_count == state.counters.device_reset_count) {
+      return;
+    }
+    const bool consecutive = !reboot && next.sequence == state.sequence + 1;
+    for (Device& device : devices) {
+      if (!device.zeroed) continue;
+      if (consecutive && Valid(next, device)) continue;
+      device.zeroed = false;
+      device.zero_lost = true;
+    }
+  }
+
+  static bool Valid(const hardware::State& in, Device& device) {
+    return device.kind == Kind::kMotor
+               ? FindSample(in.motors, in.motor_count, device.id,
+                            device.sample_index)
+                     .valid
+               : FindSample(in.sensors, in.sensor_count, device.id,
+                            device.sample_index)
+                     .valid;
   }
 
   void Flush() {
@@ -396,6 +444,14 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
   const auto& config = *device.motor_config;
   if (mode == hardware::Mode::kPosition ||
       mode == hardware::Mode::kMotionMagic) {
+    // A position in a frame that may have restarted (a dropped zero), or
+    // that nobody established ([motors.*] requires_zero): neutral until a
+    // rezero holds. Other modes need no frame.
+    if (!device.zeroed && (device.zero_lost || config.requires_zero.value)) {
+      device.motor = {.id = device.id};
+      device.set = true;
+      return;
+    }
     demand += device.position_offset;
   }
   const double requested_demand = demand;
@@ -459,7 +515,13 @@ void HardwareAccess::motor_rezero(HardwareLink& link, std::size_t index,
   if (impl.Fresh() && sample.valid && std::isfinite(sample.position_rot) &&
       std::isfinite(position_rot) && std::isfinite(offset)) {
     device.position_offset = offset;
+    device.zeroed = true;
+    device.zero_lost = false;
   }
+}
+
+bool HardwareAccess::motor_zeroed(const HardwareLink& link, std::size_t index) {
+  return link.impl_->At(index, Kind::kMotor).zeroed;
 }
 
 void HardwareAccess::gyro_rezero(HardwareLink& link, std::size_t index,
@@ -473,7 +535,13 @@ void HardwareAccess::gyro_rezero(HardwareLink& link, std::size_t index,
   if (impl.Fresh() && sample.valid && std::isfinite(sample.position_rot) &&
       std::isfinite(yaw_rot) && std::isfinite(offset)) {
     device.position_offset = offset;
+    device.zeroed = true;
+    device.zero_lost = false;
   }
+}
+
+bool HardwareAccess::gyro_zeroed(const HardwareLink& link, std::size_t index) {
+  return link.impl_->At(index, Kind::kGyro).zeroed;
 }
 
 hardware::MotorSample HardwareAccess::motor_sample(const HardwareLink& link,
@@ -609,6 +677,9 @@ std::uint64_t Motor::clamped_count() const {
 void Motor::rezero(double position_rot) {
   HardwareAccess::motor_rezero(*link_, index_, position_rot);
 }
+bool Motor::zeroed() const {
+  return HardwareAccess::motor_zeroed(*link_, index_);
+}
 double Motor::position() const {
   return HardwareAccess::motor_sample(*link_, index_).position_rot;
 }
@@ -661,6 +732,9 @@ Gyro::Gyro(Node& node, std::string_view name)
       index_{HardwareAccess::add_device(*link_, Kind::kGyro, name)} {}
 void Gyro::rezero(double yaw_rot) {
   HardwareAccess::gyro_rezero(*link_, index_, yaw_rot);
+}
+bool Gyro::zeroed() const {
+  return HardwareAccess::gyro_zeroed(*link_, index_);
 }
 double Gyro::yaw() const {
   return HardwareAccess::sensor_sample(*link_, index_).position_rot;

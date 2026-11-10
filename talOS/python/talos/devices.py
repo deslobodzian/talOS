@@ -147,6 +147,18 @@ class Motor(_Input):
         _abi.ok(lib.talos_motor_rezero(self._node, self._index, position_rot))
 
     @property
+    def zeroed(self):
+        """Whether a rezero holds: False until one takes (a restarted node
+        starts unzeroed), and again once one is dropped: on a gateway boot
+        change, a reset that masks this motor in the next gateway State, or
+        any device reset across a sequence gap. A disconnect keeps it. A
+        dropped zero keeps its offset (dropping does not move position) but
+        holds set_position and set_motion_magic neutral until rezero();
+        requires_zero = true in the motor's config holds them the same way
+        before the first rezero."""
+        return bool(_abi.ok(lib.talos_motor_zeroed(self._node, self._index)))
+
+    @property
     def clamped_count(self):
         """Number of setter calls clamped or neutralized for non-finite input."""
         count = _abi.c_uint64()
@@ -232,6 +244,12 @@ class Gyro(_Input):
     def rezero(self, yaw_rot=0):
         """Set node-shared software yaw on connected finite feedback/input."""
         _abi.ok(lib.talos_gyro_rezero(self._node, self._index, yaw_rot))
+
+    @property
+    def zeroed(self):
+        """Whether a rezero holds; dropped like Motor.zeroed, keeping its
+        offset, so dropping does not move yaw."""
+        return bool(_abi.ok(lib.talos_gyro_zeroed(self._node, self._index)))
 
     @property
     def yaw(self):

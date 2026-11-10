@@ -126,6 +126,26 @@ Motor position and gyro yaw subtract the offset; velocity/rate are unchanged.
 Motor position and motion-magic goals translate back to hardware coordinates
 before clamping. Configured soft limits remain in the **hardware frame** and
 the gateway's safety checks are never bypassed.
+`zeroed()` (`zeroed` property in Python) is true while a rezero holds. The
+offset lives in the node, so a restarted node starts unzeroed. A zero is
+dropped when its hardware frame may have restarted:
+
+- a gateway boot id change drops every zero on the node;
+- a device reset count change in the State whose `sequence` is the previous
+  accepted State's plus one (the gateway's next tick) drops the zeros of the
+  node's devices that State masks; the gateway counts a reset and masks the
+  device, its followers and its remote-sensor consumers in the same State, so
+  another device's reset keeps them;
+- a device reset count change across any other sequence step (a lost State,
+  a link outage, a gateway tick with no socket) drops every zero on the node.
+
+A disconnect alone keeps the zero. A dropped zero keeps its offset, so
+dropping does not move `position()` or `yaw()`, but `zeroed()` reads false,
+and the motor's `set_position` and `set_motion_magic` demands go out neutral
+until the node rezeroes. A motor with `requires_zero = true` in its
+`[motors.<name>]` table is held the same way before its first rezero.
+Velocity, voltage and duty cycle are never held, and the substitution does
+not count in `clamped_count`.
 
 Signal acquisition times subtract the signal's existing gateway age (microseconds)
 from the mapped hardware State time. They are available while disabled, but
@@ -288,14 +308,23 @@ ReleaseTarget<ShooterTarget>(sim, "shooter", "teleop");
 `SimHardware` also has `set_motor`, `set_digital_input`, `set_analog_input`,
 `set_encoder`, `set_cancoder`, `set_gyro`, `set_driver_station`,
 `stop_driver_station()` (the DS goes silent), `set_connected(node, device,
-false)` (the device reports disconnected), `digital_output`, `pwm`.
+false)` (the device reports disconnected), `reset_device(node, device)` (the
+gateway reports that motor, CANcoder or gyro reset and masks it, with its
+followers and remote-sensor consumers, for two States; any other name throws),
+`lose_states(count)` (the next gateway ticks publish nothing), `reboot()` (a
+new gateway boot id),
+`digital_output`, `pwm`.
 `LatestTarget<M>(sim, sub, source)` reads a lane a node under test wrote.
 
 `motor_request`, `digital_output`, and `pwm` retain each device's last
 explicitly requested value. Use `applied_motor`, `applied_digital_output`, and
 `applied_pwm` to inspect effective outputs: requests expire after
 `[robot] command_timeout_us` without publication, omitted outputs are neutral,
-and disabled hardware applies neutral outputs. Inspection never refreshes
+and disabled hardware applies neutral outputs. As on the gateway, a request
+built from another boot's State is ignored, and a motor masked by
+`reset_device` applies neutral (so does a later request observed before the
+State that masked it); a motor disconnected with `set_connected` still
+applies its request. Inspection never refreshes
 freshness. With `ideal_motors()`, neutral velocity decays each tick by
 `min(1, period/tau)`, with `tau = 50 ms` for brake and `1 s` for coast;
 velocity below `0.01 rps` snaps to zero. Position continues integrating during

@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 21u
+#define TALOS_NODE_ABI_VERSION 22u
 
 enum {
   TALOS_OK = 0,
@@ -212,6 +212,13 @@ int32_t talos_motor_clamped_count(TalosNode* node, int64_t index,
 // applying configured soft limits, which remain in the hardware frame.
 int32_t talos_motor_rezero(TalosNode* node, int64_t index, double position_rot);
 int32_t talos_gyro_rezero(TalosNode* node, int64_t index, double yaw_rot);
+// Motor::zeroed / Gyro::zeroed: 1 while a rezero holds, 0 before one takes
+// and after one was dropped (a gateway boot change, a reset masking this
+// device in the next gateway State, or any reset across a sequence gap),
+// TALOS_ERR on error. A dropped motor zero holds position and motion-magic
+// demands neutral until talos_motor_rezero.
+int32_t talos_motor_zeroed(TalosNode* node, int64_t index);
+int32_t talos_gyro_zeroed(TalosNode* node, int64_t index);
 int32_t talos_digital_output_set(TalosNode* node, int64_t index, int32_t value);
 int32_t talos_pwm_set(TalosNode* node, int64_t index, double output);
 
@@ -410,6 +417,15 @@ int32_t talos_sim_hardware_set_gateway_clock(TalosSimHardware* hw,
 // (SimHardware::set_connected).
 int32_t talos_sim_hardware_set_connected(TalosSimHardware* hw, const char* node,
                                          const char* device, int32_t connected);
+// SimHardware::reset_device: the next state counts a reset of the motor or
+// sensor of `node` named `device`, and it and the state after mask it with
+// what the gateway masks along with it.
+int32_t talos_sim_hardware_reset_device(TalosSimHardware* hw, const char* node,
+                                        const char* device);
+// SimHardware::lose_states: the next `count` gateway ticks publish nothing.
+int32_t talos_sim_hardware_lose_states(TalosSimHardware* hw, int32_t count);
+// SimHardware::reboot: a new gateway boot id from the next state on.
+int32_t talos_sim_hardware_reboot(TalosSimHardware* hw);
 // The Driver Station packet to forward from now on
 // (SimHardware::set_driver_station); the rest of the packet is zero. NULL
 // stops forwarding: the Driver Station goes silent

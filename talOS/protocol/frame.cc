@@ -102,6 +102,7 @@ DecodeStatus DecodeFrame(const uint8_t* data, std::size_t size,
     return DecodeStatus::kBadMagic;
   }
   if (header.version != kProtocolVersion) {
+    out->header.version = header.version;
     return DecodeStatus::kUnsupportedVersion;
   }
   if (header.header_size != kFrameHeaderSize) {

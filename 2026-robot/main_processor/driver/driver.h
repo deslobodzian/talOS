@@ -192,6 +192,8 @@ class Driver {
     } else if (field_oriented_ && frame_ == Frame::kField) {
       // Gyro yaw is boot/rezero-relative, not field-absolute. Both alliances
       // use the latched driver-forward direction without an alliance flip.
+      // The drivetrain's heading re-anchors a restarted Pigeon count, so a
+      // gyro reset does not move the frame; no talos::Gyro zero is involved.
       const double yaw = yaw_rad_ - yaw_offset_rad_;
       const double robot_vx = vx * std::cos(yaw) + vy * std::sin(yaw);
       vy = -vx * std::sin(yaw) + vy * std::cos(yaw);

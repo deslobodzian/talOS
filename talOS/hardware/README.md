@@ -168,8 +168,11 @@ the RoboRIO loop stalled are skipped, not applied back-to-back on the CAN bus,
 and are not counted as rejected.
 
 The gateway publishes its configuration ID, boot ID, control epoch, monotonic
-poll timestamp, last accepted command sequence, enable/configuration/fault
-flags, and identified motor/sensor samples. Motor samples contain mechanism
+poll timestamp, last accepted command sequence, the echo of the last clock
+probe (the bridge's clock mapping), the tick sequence (one more each gateway
+tick within a boot, so a consumer can tell consecutive States from a gap; see
+[DATA_FLOW.md](../../docs/DATA_FLOW.md)), enable/configuration/fault flags,
+and identified motor/sensor samples. Motor samples contain mechanism
 position/velocity, voltage, stator and supply current, temperature, and the
 Phoenix fault bitfield. State also carries valid power/CAN health (battery
 volts, brownout, and CAN utilization fraction) and per-boot gateway safety

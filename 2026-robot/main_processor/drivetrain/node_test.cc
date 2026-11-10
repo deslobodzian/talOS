@@ -1135,6 +1135,23 @@ TEST_F(DrivetrainOnImuTest, UnannouncedPigeonResetDoesNotJumpHeading) {
   EXPECT_NEAR(State().yaw_rad(), before + ToRadians(0.01), 1e-9);
 }
 
+// The driver's field frame is this heading less the driver's own rezero, so
+// a Pigeon brownout must not move it. A restart near the old count is a
+// step the rate bound would take as turning; the reported reset re-anchors.
+TEST_F(DrivetrainOnImuTest, AReportedPigeonResetDoesNotMoveHeading) {
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.03, 0.0);
+  sim.step(kConverged);
+  const double before = State().yaw_rad();
+  hw.reset_device("drivetrain", "drivetrain_imu");
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.0, 0.0);
+  sim.step(20ms);
+  EXPECT_TRUE(State().yaw_valid());
+  EXPECT_NEAR(State().yaw_rad(), before, 1e-9);
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.01, 0.0);
+  sim.step(20ms);
+  EXPECT_NEAR(State().yaw_rad(), before + ToRadians(0.01), 1e-9);
+}
+
 TEST_F(DrivetrainOnImuTest, AGyroThatNeverReportedReadsAnInvalidZero) {
   hw.set_connected("drivetrain", "drivetrain_imu", false);
   hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0.0);

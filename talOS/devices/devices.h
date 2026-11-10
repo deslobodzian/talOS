@@ -115,6 +115,16 @@ class Motor {
   // both input and resulting offset are finite. No hardware reset is sent.
   // Position goals use this frame; soft limits remain in the hardware frame.
   void rezero(double position_rot = 0);
+  // Whether a rezero holds. The zero lives in this node, so a restarted node
+  // starts unzeroed. It is dropped when its frame may have restarted: on a
+  // gateway boot id change; on a device reset count change in the State
+  // right after the last one seen (sequence + 1) that masks this motor; on a
+  // device reset count change across any other sequence step. A disconnect
+  // keeps it. A dropped zero keeps its offset (dropping does not move
+  // position()) but holds set_position and set_motion_magic neutral until
+  // rezero(); [motors.*] requires_zero = true holds them the same way before
+  // the first rezero. Other modes are never held.
+  bool zeroed() const;
 
   double position() const;  // rotations
   double velocity() const;  // rotations/s
@@ -158,6 +168,9 @@ class Gyro {  // Pigeon2
   // Node-shared software yaw frame; connected, finite samples/inputs only.
   // No hardware reset is sent; yaw rate is unchanged.
   void rezero(double yaw_rot = 0);
+  // Whether a rezero holds; dropped like Motor::zeroed, keeping its offset,
+  // so dropping does not move yaw().
+  bool zeroed() const;
   double yaw() const;       // rotations, CCW+
   double yaw_rate() const;  // rotations/s, CCW+
   bool connected() const;   // sample valid and hardware state fresh

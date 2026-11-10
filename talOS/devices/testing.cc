@@ -85,6 +85,18 @@ struct SimHardware::Impl {
   };
   std::map<std::string, RequestTracker> requests;
   std::set<std::pair<Kind, std::uint16_t>> disconnected;
+  // Devices reset and not yet restored, with the States they stay masked
+  // for; `masked` adds what the gateway masks with them (MaskUnavailable):
+  // followers of a masked motor and motors fed by a masked remote CANcoder.
+  static constexpr int kRestoreStates = 2;
+  std::map<std::pair<Kind, std::uint16_t>, int> resetting;
+  std::set<std::pair<Kind, std::uint16_t>> masked;
+  // Per masked motor, the sample time of the last State that masked it: like
+  // the gateway, a request observed before it never drives that motor.
+  std::map<std::uint16_t, std::uint64_t> motor_reset_at;
+  std::uint32_t device_reset_count = 0;
+  std::uint64_t sequence = 0;  // gateway ticks this boot
+  int lost_states = 0;         // ticks whose State goes nowhere
   std::optional<driver_station::DriverStationData> ds_packet;
   driver_station::ModeTracker ds_mode;
   Duration gateway_offset{};
@@ -95,9 +107,9 @@ struct SimHardware::Impl {
 
   explicit Impl(Sim& s) : sim{s} {}
 
-  // The simulated gateway never reboots: one boot id, carried by its State
-  // and its Driver Station packets alike.
-  static constexpr std::uint64_t kBootId = 1;
+  // The gateway boot, carried by its State and its Driver Station packets
+  // alike; reboot() moves it on.
+  std::uint64_t boot_id = 1;
 
   // The gateway clock, in its microseconds, `before` ago.
   std::uint64_t GatewayUs(Duration before = Duration{}) const {
@@ -109,7 +121,29 @@ struct SimHardware::Impl {
     return detail::HardwareAccess::device_id(config, node, kind, device);
   }
   bool Connected(Kind kind, std::uint16_t id) const {
-    return !disconnected.contains({TableOf(kind), id});
+    return !disconnected.contains({TableOf(kind), id}) &&
+           !masked.contains({TableOf(kind), id});
+  }
+  // Every device of `node` named `device`, whatever its kind, keyed by
+  // table; throws std::invalid_argument when there is none.
+  std::vector<std::pair<Kind, std::uint16_t>> Keys(
+      std::string_view node, std::string_view device) const {
+    std::vector<std::pair<Kind, std::uint16_t>> keys;
+    for (const Kind kind : {Kind::kMotor, Kind::kCANcoder, Kind::kGyro,
+                            Kind::kDigitalInput, Kind::kDigitalOutput,
+                            Kind::kAnalogInput, Kind::kEncoder, Kind::kPwm}) {
+      try {
+        keys.emplace_back(TableOf(kind), Id(node, kind, device));
+      } catch (const std::invalid_argument&) {
+        // not a device of this kind
+      }
+    }
+    if (keys.empty()) {
+      throw std::invalid_argument(std::string{node} + ": no device named '" +
+                                  std::string{device} + "' in subsystem '" +
+                                  std::string{node} + "'");
+    }
+    return keys;
   }
 
   void Neutralize(const hardware::Devices& devices) {
@@ -136,14 +170,24 @@ struct SimHardware::Impl {
                             &packet);
         hardware::Command command{};
         if (!hardware::Decode(packet.bytes(), command)) continue;
+        // The gateway rejects a request built from another boot's State.
+        if (command.boot_id != boot_id) continue;
         tracker.last_seen = SimAccess::publish_time(
             sim, tracker.topic, sizeof packet, tracker.cursor);
         // Like the bridge, each request replaces this node's entire output.
         // Raw inspection still retains the last explicitly requested values.
         Neutralize(devices);
         for (std::size_t i = 0; i < command.count; ++i) {
-          motor_requests[command.motors[i].id] = command.motors[i];
-          applied_motors[command.motors[i].id] = command.motors[i];
+          const hardware::MotorRequest& request = command.motors[i];
+          motor_requests[request.id] = request;
+          // As the gateway does, a masked motor, or one masked after the
+          // State this request observed, applies neutral.
+          const bool unavailable =
+              masked.contains({Kind::kMotor, request.id}) ||
+              command.observed_time_us <
+                  ValueOr(motor_reset_at, request.id, std::uint64_t{0});
+          applied_motors[request.id] =
+              unavailable ? hardware::MotorRequest{.id = request.id} : request;
         }
         for (std::size_t i = 0; i < command.digital_output_count; ++i) {
           digital_outputs[command.digital_outputs[i].id] =
@@ -198,15 +242,42 @@ struct SimHardware::Impl {
     }
   }
 
+  void MaskResets() {
+    masked.clear();
+    for (const auto& [key, states] : resetting) masked.insert(key);
+    for (std::size_t pass = 0; pass < config.hardware.motors.size(); ++pass) {
+      for (const auto& m : config.hardware.motors) {
+        const bool master =
+            m.master_id != 0 && masked.contains({Kind::kMotor, m.master_id});
+        const bool sensor =
+            m.feedback == hardware::Feedback::kRemoteCANcoder &&
+            masked.contains({Kind::kCANcoder, m.feedback_sensor_id});
+        if (master || sensor) {
+          masked.insert({Kind::kMotor, m.id});
+        }
+      }
+    }
+    std::erase_if(resetting, [](auto& entry) { return --entry.second <= 0; });
+  }
+
   void Publish() {
     Collect();
     if (ideal) ApplyIdealMotors();
+    MaskResets();
     const auto& hw = config.hardware;
     hardware::State state{};
     state.config_id = config_id;
-    state.boot_id = kBootId;
+    state.boot_id = boot_id;
+    state.sequence = ++sequence;
+    state.counters.device_reset_count = device_reset_count;
     state.epoch = 1;
     state.sample_time_us = GatewayUs(latency);
+    // The gateway neutralizes a motor in the tick that masks it.
+    for (const auto& [kind, id] : masked) {
+      if (kind != Kind::kMotor) continue;
+      motor_reset_at[id] = state.sample_time_us;
+      applied_motors[id] = hardware::MotorRequest{.id = id};
+    }
     state.flags = hardware::kConfigured | (enabled ? hardware::kEnabled : 0u);
 
     auto fill = [](auto& samples, auto& count, const auto& configs,
@@ -288,6 +359,10 @@ struct SimHardware::Impl {
                                       ValueOr(applied_pwm_outputs, c.id, 0.0)};
          });
 
+    if (lost_states > 0) {
+      --lost_states;
+      return;
+    }
     Packet packet{};
     packet.size =
         static_cast<std::uint32_t>(hardware::Encode(state, packet.data));
@@ -332,7 +407,7 @@ struct SimHardware::Impl {
 
   void PublishDriverStation(driver_station::DriverStationData data) {
     data.sample_time_us = GatewayUs();
-    data.boot_id = kBootId;
+    data.boot_id = boot_id;
     ds_mode.Stamp(data);
     Packet packet{};
     packet.size =
@@ -428,29 +503,42 @@ void SimHardware::set_gateway_clock(Duration gateway_offset, Duration latency) {
 
 void SimHardware::set_connected(std::string_view node, std::string_view device,
                                 bool connected) {
-  bool found = false;
-  for (const Kind kind :
-       {Kind::kMotor, Kind::kCANcoder, Kind::kGyro, Kind::kDigitalInput,
-        Kind::kDigitalOutput, Kind::kAnalogInput, Kind::kEncoder, Kind::kPwm}) {
-    std::uint16_t id = 0;
-    try {
-      id = impl_->Id(node, kind, device);
-    } catch (const std::invalid_argument&) {
-      continue;  // not a device of this kind
-    }
-    found = true;
-    const std::pair key{TableOf(kind), id};
+  for (const auto& key : impl_->Keys(node, device)) {
     if (connected) {
       impl_->disconnected.erase(key);
     } else {
       impl_->disconnected.insert(key);
     }
   }
-  if (!found) {
-    throw std::invalid_argument(std::string{node} + ": no device named '" +
-                                std::string{device} + "' in subsystem '" +
-                                std::string{node} + "'");
+}
+
+void SimHardware::reset_device(std::string_view node, std::string_view device) {
+  bool found = false;
+  for (const auto& key : impl_->Keys(node, device)) {
+    if (key.first != Kind::kMotor && key.first != Kind::kCANcoder) continue;
+    impl_->resetting[key] = Impl::kRestoreStates;
+    ++impl_->device_reset_count;
+    found = true;
   }
+  if (!found) {
+    throw std::invalid_argument(std::string{node} + ": '" +
+                                std::string{device} +
+                                "' is not a motor, CANcoder or gyro");
+  }
+}
+
+void SimHardware::lose_states(int count) {
+  if (count < 0) throw std::invalid_argument("SimHardware: negative count");
+  impl_->lost_states += count;
+}
+
+void SimHardware::reboot() {
+  ++impl_->boot_id;
+  impl_->device_reset_count = 0;
+  impl_->sequence = 0;
+  impl_->resetting.clear();
+  impl_->motor_reset_at.clear();
+  impl_->ds_mode = driver_station::ModeTracker{};
 }
 
 void SimHardware::set_driver_station(

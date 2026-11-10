@@ -148,6 +148,7 @@ std::size_t Encode(const State& s, std::span<uint8_t> data) {
   w.Int(s.sample_time_us, 8);
   w.Int(s.last_command_sequence, 8);
   w.Int(s.clock_probe_time_us, 8);
+  w.Int(s.sequence, 8);
   w.Int(s.flags, 4);
   w.Int(s.motor_count, 2);
   w.Int(s.sensor_count, 2);
@@ -231,6 +232,7 @@ bool Decode(std::span<const uint8_t> data, State& out) {
   s.sample_time_us = r.Int(8);
   s.last_command_sequence = r.Int(8);
   s.clock_probe_time_us = r.Int(8);
+  s.sequence = r.Int(8);
   s.flags = r.Int(4);
   s.motor_count = r.Int(2);
   s.sensor_count = r.Int(2);

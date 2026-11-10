@@ -330,6 +330,9 @@ void Gateway::PollResets() {
 }
 
 void Gateway::Tick(uint64_t now, bool enabled) {
+  // Every tick, whether or not its State reaches the link, so a consumer
+  // that sees sequence + 1 knows it missed nothing in between.
+  ++state_.sequence;
   state_.sample_time_us = now;
   if (configuring_) {
     const auto status = backend_.PollConfigure();

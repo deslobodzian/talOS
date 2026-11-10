@@ -154,6 +154,15 @@ class SimGatewayStartup(unittest.TestCase):
                 self.assertIn((1, 3, 32, 1, 5, -0.5, 90), joystick_samples)
 
 
+# hardware::State wire layout, the one place this file spells it
+# (talOS/hardware/messages.h kStateBaseSize, messages.cc Encode(State)):
+# seven u64 and a u32 flags put motor_count first among the seven u16
+# counts; the motors follow them, 45 bytes each (u16 id, u8 valid first).
+STATE_MOTOR_COUNT_OFFSET = 7 * 8 + 4
+STATE_MOTORS_OFFSET = STATE_MOTOR_COUNT_OFFSET + 7 * 2
+STATE_MOTOR_BYTES = 45
+
+
 def packet_bytes(row):
     """Unwrap the fixed IPC Packet; decode only its canonical wire bytes."""
     payload = bytes.fromhex(row["payload_hex"])
@@ -403,16 +412,14 @@ class FullStackSimulation(unittest.TestCase):
             self.assert_driving(requests, blackout_center + 500,
                                 blackout_center + 850, drive_ids)
             invalid_states = []
-            # State payload (talOS/hardware/messages.cc Encode(State)): six
-            # u64 and a u32 flags put motor_count at 52; seven u16 counts
-            # put the motors at 66, 45 bytes each (u16 id, u8 valid first).
             for row in rows:
                 if row["process"] != "hardware_node" or row["topic"] != "/hw/state":
                     continue
                 data = packet_bytes(row)
-                count, = struct.unpack_from("<H", data, 52)
+                count, = struct.unpack_from("<H", data, STATE_MOTOR_COUNT_OFFSET)
                 for i in range(count):
-                    motor, valid = struct.unpack_from("<HB", data, 66 + 45 * i)
+                    motor, valid = struct.unpack_from(
+                        "<HB", data, STATE_MOTORS_OFFSET + STATE_MOTOR_BYTES * i)
                     if motor == fault_id and not valid:
                         invalid_states.append(row)
             self.assertGreater(len(invalid_states), 20, "motor disconnect not observed")
