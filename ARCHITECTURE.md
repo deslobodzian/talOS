@@ -91,10 +91,12 @@ After each tick the devices layer flushes one hardware request for the node:
 - motor demand and feedforward are clamped to that motor's configured limits;
   non-finite values neutralize only that motor. `Motor::clamped_count()` counts
   adjusted setter calls for the lifetime of the device;
-- a motor's position and motion-magic demands are sent neutral while its
-  `Motor::rezero` zero is lost (dropped on a gateway boot or device reset that
-  may have restarted its frame), or while its config sets `requires_zero` and
-  no rezero holds (see the node development guide).
+- a motor's position and motion-magic demands are sent neutral while no
+  `Motor::rezero` holds for it (never taken, or dropped on a gateway boot or
+  device reset that may have restarted its frame), unless its config sets
+  `position_frame = "absolute"` (a remote CANcoder's frame, which survives a
+  reset while one CANcoder rotation covers the travel; see
+  [position frames](docs/NODE_DEVELOPMENT_GUIDE.md#rezero-and-position-frames)).
 
 Output setters (motor, digital, PWM) are therefore accepted only inside
 `update()`; from the constructor, `every()` or a message callback they throw

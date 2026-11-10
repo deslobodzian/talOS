@@ -5,7 +5,9 @@
 //
 //   // in Wrist's constructor; lanes /wrist/target/<source> from the policy
 //   talos::Target<control::PositionTarget> target_{node};
-//   // in update()
+//   // in update(); motor_ needs a position frame (position_frame =
+//   // "absolute" on a remote CANcoder, or a rezero first: see
+//   // docs/NODE_DEVELOPMENT_GUIDE.md, "Rezero and position frames")
 //   if (const control::PositionTarget* t = target_.get()) {
 //     motor_.set_motion_magic(t->position_rot());
 //   }

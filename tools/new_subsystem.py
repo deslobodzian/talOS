@@ -323,18 +323,17 @@ namespace @NAME@ {
 // [robot.targets] or the subsystem's [targets].
 //
 // Positions count from the home switch at the reverse end of travel
-// (@NAME@_home), not from where the motor powered on. The motor sets
-// requires_zero, so its Motion Magic goals go out neutral until the switch
-// has zeroed it (Motor::rezero), and again after a motor reset or a RoboRIO
-// reboot drops that zero. While unzeroed with a live, finite target it homes:
-// it drives toward the switch at homing_v (negative: toward the reverse end;
-// a voltage request, which a dropped zero does not hold) until the switch
-// has read closed on home_samples consecutive ticks (default 3), then
-// rezeroes to 0 and goes to the target. One closed sample, a glitch
-// mid-travel, does not zero it: homing keeps driving and any open sample
-// restarts the count. Targets clamp to
-// 0..max_position_rot in the homed frame; the motor has no hardware soft
-// limits, which would act in its power-on frame and could stop homing.
+// (@NAME@_home), not from where the motor powered on. The motor keeps
+// position_frame = "rezero", so its Motion Magic goals go out neutral until the
+// switch has zeroed it (Motor::rezero), and again after a motor reset or a
+// RoboRIO reboot drops that zero. While unzeroed with a live, finite target it
+// homes: it drives toward the switch at homing_v (negative: toward the reverse
+// end; a voltage request, which a dropped zero does not hold) until the switch
+// has read closed on home_samples consecutive ticks (default 3), then rezeroes
+// to 0 and goes to the target. One closed sample, a glitch mid-travel, does not
+// zero it: homing keeps driving and any open sample restarts the count. Targets
+// clamp to 0..max_position_rot in the homed frame; the motor has no hardware
+// soft limits, which would act in its power-on frame and could stop homing.
 //
 // The switch is normally open, wired to ground, read through the input's
 // pull-up: closed reads false, and an open or cut wire reads "not home", so a
@@ -822,7 +821,7 @@ home_margin_rot = 0.5
 type = "TalonFX"
 bus = "rio"
 can_id = 1
-requires_zero = true
+position_frame = "rezero"
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
 [digital_inputs.@NAME@_home]
@@ -908,17 +907,17 @@ Producers write lanes /@NAME@/target/<source> with talos.TargetLane; the
 policy comes from [robot.targets] or the subsystem's [targets].
 
 Positions count from the home switch (@NAME@_home) at the reverse end of
-travel, not from where the motor powered on. The motor sets requires_zero, so
-its Motion Magic goals go out neutral until the switch has zeroed it
-(Motor.rezero), and again after a motor reset or a RoboRIO reboot drops that
-zero. While unzeroed with a live, finite target it homes: it drives toward
-the switch at homing_v (negative: toward the reverse end; a voltage request,
-which a dropped zero does not hold) until the switch has read closed on
-home_samples consecutive ticks (default 3), then rezeroes to 0 and goes to
-the target. One closed sample, a glitch mid-travel, does not zero it: homing
-keeps driving and any open sample restarts the count. Targets clamp to 0..max_position_rot in the homed
-frame; the motor has no hardware soft limits, which would act in its power-on
-frame and could stop homing.
+travel, not from where the motor powered on. The motor keeps position_frame =
+"rezero", so its Motion Magic goals go out neutral until the switch has zeroed
+it (Motor.rezero), and again after a motor reset or a RoboRIO reboot drops that
+zero. While unzeroed with a live, finite target it homes: it drives toward the
+switch at homing_v (negative: toward the reverse end; a voltage request, which
+a dropped zero does not hold) until the switch has read closed on home_samples
+consecutive ticks (default 3), then rezeroes to 0 and goes to the target. One
+closed sample, a glitch mid-travel, does not zero it: homing keeps driving and
+any open sample restarts the count. Targets clamp to 0..max_position_rot in the
+homed frame; the motor has no hardware soft limits, which would act in its
+power-on frame and could stop homing.
 
 The switch is normally open, wired to ground, read through the input's
 pull-up: closed reads False, and an open or cut wire reads "not home", so a
@@ -1278,7 +1277,7 @@ home_margin_rot = 0.5
 type = "TalonFX"
 bus = "test"
 can_id = 1
-requires_zero = true
+position_frame = "rezero"
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
 [subsystems.@NAME@.digital_inputs.@NAME@_home]
@@ -1418,8 +1417,9 @@ cruise_velocity_rps = 1.0
 acceleration_rps2 = 2.0
 # Positions count from the home switch, not from where the motor powered on:
 # Motion Magic goals go out neutral until the switch zeroes the motor, and
-# again after a motor reset or RoboRIO reboot drops that zero.
-requires_zero = true
+# again after a motor reset or RoboRIO reboot drops that zero. Only a remote
+# CANcoder's frame may be "absolute" (usable unzeroed, surviving a reset).
+position_frame = "rezero"
 # No hardware soft limits: the TalonFX applies them to its power-on position
 # in every control mode, so after a reset partway along the travel they sit
 # in the wrong place and can stop homing. max_position_rot bounds targets.
@@ -1518,7 +1518,7 @@ sensor_to_mechanism_ratio = 1.0
 max_velocity_rps = 100.0
 cruise_velocity_rps = 1.0
 acceleration_rps2 = 2.0
-requires_zero = true
+position_frame = "rezero"
 soft_limits = false
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 

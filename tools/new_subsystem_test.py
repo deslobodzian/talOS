@@ -205,7 +205,7 @@ class NewSubsystemTest(unittest.TestCase):
                 if path == os.path.join(configuration, "subsystems",
                                         "wrist.toml")))
         motor = subsystem["motors"]["wrist_motor"]
-        self.assertIs(motor["requires_zero"], True)
+        self.assertEqual(motor["position_frame"], "rezero")
         self.assertIs(motor["soft_limits"], False)
         params = subsystem["subsystem"]
         self.assertGreater(params["max_position_rot"], 0)

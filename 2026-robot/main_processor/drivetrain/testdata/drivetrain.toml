@@ -16,6 +16,7 @@ can_id = 2
 feedback = "RemoteCANcoder"
 feedback_sensor = "back_left_encoder"
 continuous_wrap = true
+position_frame = "absolute"
 max_velocity_rps = 100.0
 
 [sensors.back_left_encoder]
@@ -36,6 +37,7 @@ can_id = 4
 feedback = "RemoteCANcoder"
 feedback_sensor = "back_right_encoder"
 continuous_wrap = true
+position_frame = "absolute"
 max_velocity_rps = 100.0
 
 [sensors.back_right_encoder]
@@ -56,6 +58,7 @@ can_id = 6
 feedback = "RemoteCANcoder"
 feedback_sensor = "front_left_encoder"
 continuous_wrap = true
+position_frame = "absolute"
 max_velocity_rps = 100.0
 
 [sensors.front_left_encoder]
@@ -76,6 +79,7 @@ can_id = 8
 feedback = "RemoteCANcoder"
 feedback_sensor = "front_right_encoder"
 continuous_wrap = true
+position_frame = "absolute"
 max_velocity_rps = 100.0
 
 [sensors.front_right_encoder]

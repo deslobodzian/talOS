@@ -20,18 +20,17 @@ namespace position_cpp {
 // [robot.targets] or the subsystem's [targets].
 //
 // Positions count from the home switch at the reverse end of travel
-// (position_cpp_home), not from where the motor powered on. The motor sets
-// requires_zero, so its Motion Magic goals go out neutral until the switch
-// has zeroed it (Motor::rezero), and again after a motor reset or a RoboRIO
-// reboot drops that zero. While unzeroed with a live, finite target it homes:
-// it drives toward the switch at homing_v (negative: toward the reverse end;
-// a voltage request, which a dropped zero does not hold) until the switch
-// has read closed on home_samples consecutive ticks (default 3), then
-// rezeroes to 0 and goes to the target. One closed sample, a glitch
-// mid-travel, does not zero it: homing keeps driving and any open sample
-// restarts the count. Targets clamp to
-// 0..max_position_rot in the homed frame; the motor has no hardware soft
-// limits, which would act in its power-on frame and could stop homing.
+// (position_cpp_home), not from where the motor powered on. The motor keeps
+// position_frame = "rezero", so its Motion Magic goals go out neutral until the
+// switch has zeroed it (Motor::rezero), and again after a motor reset or a
+// RoboRIO reboot drops that zero. While unzeroed with a live, finite target it
+// homes: it drives toward the switch at homing_v (negative: toward the reverse
+// end; a voltage request, which a dropped zero does not hold) until the switch
+// has read closed on home_samples consecutive ticks (default 3), then rezeroes
+// to 0 and goes to the target. One closed sample, a glitch mid-travel, does not
+// zero it: homing keeps driving and any open sample restarts the count. Targets
+// clamp to 0..max_position_rot in the homed frame; the motor has no hardware
+// soft limits, which would act in its power-on frame and could stop homing.
 //
 // The switch is normally open, wired to ground, read through the input's
 // pull-up: closed reads false, and an open or cut wire reads "not home", so a

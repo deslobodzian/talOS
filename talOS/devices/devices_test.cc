@@ -239,6 +239,7 @@ TEST(Devices, MotorDemandsClampPerDeviceAndCountAdjustedCalls) {
   sim.step(10ms);
   EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kNeutral);
   EXPECT_GT(mech.a.clamped_count(), 0u);
+  mech.b.rezero();
   hw.enable();
   sim.step(10ms);
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, 100);
@@ -306,6 +307,7 @@ TEST(Devices, MotorVoltageDutyPositionAndFeedforwardUseConfiguredLimits) {
   limited.mode = Mode::kPosition;
   limited.demand = -10;
   limited.ff = 20;
+  limited.motor.rezero();
   sim.step(10ms);
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, -2);
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").feedforward_v, 6);
@@ -605,48 +607,69 @@ TEST(Devices, RezeroIsDroppedWhenTheHardwareFrameMayHaveRestarted) {
   EXPECT_DOUBLE_EQ(mech.gyro.yaw(), 0);
 }
 
-// Position goals need a frame: a dropped zero holds them neutral until the
-// node rezeroes, whatever requires_zero says, and requires_zero also holds
-// a motor that was never zeroed. Other modes are unaffected.
-TEST(Devices, PositionGoalsWaitForAZero) {
-  auto sim = Sim::FromToml(kRobotToml);
-  auto& mech = sim.add<Mech>("mech");
+// Position goals need a frame no reset has restarted. A rotor-feedback motor
+// has none until the node rezeroes it: never zeroed, or after a reset drops
+// the zero (its own, then an unattributable one in States that were lost);
+// other modes drive regardless. A remote CANcoder's absolute frame drives
+// from the first state and keeps its zero through its own reset.
+TEST(Devices, PositionGoalsWaitForARezeroUnlessTheFrameIsAbsolute) {
+  struct Positioner {
+    explicit Positioner(Node& n) : absolute{n, "a"}, rotor{n, "b"} {}
+    void update() {
+      absolute.set_position(0.25);
+      if (rotor_voltage) {
+        rotor.set_voltage(3);
+      } else {
+        rotor.set_motion_magic(1);
+      }
+    }
+    Motor absolute, rotor;
+    bool rotor_voltage = false;
+  };
+  std::string toml{kRobotToml};
+  toml.insert(toml.find("can_id = 1\n") + 11,
+              "feedback = \"RemoteCANcoder\"\nfeedback_sensor = \"cc\"\n"
+              "position_frame = \"absolute\"\n");
+  auto sim = Sim::FromToml(toml);
+  auto& mech = sim.add<Positioner>("mech");
   SimHardware hw{sim};
   hw.enable();
   hw.set_motor("mech", "b", 3, 0);
-  mech.a_velocity = 5;
-  mech.b_motion_magic = 1;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kNeutral);
+  EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kPosition);
+  mech.rotor_voltage = true;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kVoltage);
+  mech.rotor_voltage = false;
+
+  mech.rotor.rezero();
+  mech.absolute.rezero(-1);
   sim.step(10ms);
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
-  mech.b.rezero();
-  sim.step(10ms);
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "b").demand, 4);
 
-  // Another device's reset, but in States that were lost: a is masked and
-  // restored unseen, so nothing shows which device reset, and b's zero goes
-  // too.
+  hw.reset_device("mech", "b");
+  sim.step(20ms);
+  ASSERT_TRUE(mech.rotor.connected());
+  EXPECT_FALSE(mech.rotor.zeroed());
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kNeutral);
+  mech.rotor.rezero();
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
+
   hw.lose_states(2);
   hw.reset_device("mech", "a");
   sim.step(20ms);
-  EXPECT_FALSE(mech.b.zeroed());
+  ASSERT_TRUE(mech.absolute.connected());
+  EXPECT_FALSE(mech.rotor.zeroed());
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kNeutral);
-  EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kVelocity);
-  mech.b.rezero();
+  EXPECT_TRUE(mech.absolute.zeroed());
+  EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kPosition);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, 1.25);
+  mech.rotor.rezero();
   sim.step(10ms);
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
-
-  std::string toml{kRobotToml};
-  toml.insert(toml.find("can_id = 2\n") + 11, "requires_zero = true\n");
-  auto required = Sim::FromToml(toml);
-  auto& lift = required.add<Mech>("mech");
-  SimHardware lift_hw{required};
-  lift_hw.enable();
-  lift.b_motion_magic = 1;
-  required.step(10ms);
-  EXPECT_EQ(lift_hw.motor_request("mech", "b").mode, Mode::kNeutral);
-  lift.b.rezero();
-  required.step(10ms);
-  EXPECT_EQ(lift_hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
 }
 
 TEST(Devices, NonFiniteDemandIsNeutral) {

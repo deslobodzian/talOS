@@ -20,17 +20,17 @@ namespace demo {
 // acceleration) and gains are the motor's, in the robot config; the travel,
 // 0 to max_height_rot, is enforced here on the homed frame.
 //
-// Heights count from the bottom switch, not from where the TalonFX powered
-// on: until the switch has zeroed the lift (Motor::zeroed()), it is HOMING.
-// The lift's config keeps position_frame = "rezero", so a motion-magic goal
-// is never sent in an unhomed frame, and a TalonFX reset or a RoboRIO reboot
-// drops the zero and starts homing again. While HOMING with a live, finite target it drives
-// down at homing_v (a voltage request, which a dropped zero does not hold)
-// until the switch has read closed on home_samples consecutive ticks, then
-// rezeroes to 0 and resumes the goal. One closed sample (a glitch mid-travel)
-// does not zero the lift: homing keeps driving and any open sample restarts
-// the count. The switch zeroes an idle lift too: no motion is needed when it
-// starts at the bottom.
+// Heights count from the bottom switch, not from where the TalonFX powered on:
+// until the switch has zeroed the lift (Motor::zeroed()), it is HOMING. The
+// lift's config keeps position_frame = "rezero", so a motion-magic goal is
+// never sent in an unhomed frame, and a TalonFX reset or a RoboRIO reboot drops
+// the zero and starts homing again. While HOMING with a live, finite target it
+// drives down at homing_v (a voltage request, which a dropped zero does not
+// hold) until the switch has read closed on home_samples consecutive ticks,
+// then rezeroes to 0 and resumes the goal. One closed sample (a glitch
+// mid-travel) does not zero the lift: homing keeps driving and any open sample
+// restarts the count. The switch zeroes an idle lift too: no motion is needed
+// when it starts at the bottom.
 //
 // The switch is normally open, wired to ground, read through the input's
 // pull-up: closed reads false. An open, cut or unplugged wire reads true,

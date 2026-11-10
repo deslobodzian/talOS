@@ -159,6 +159,20 @@ inline SwerveGeometry BuildSwerveGeometry(
       throw std::invalid_argument(
           where + ": steer motor '" + module.steer +
           "' feedback sensor is not this module's encoder '" + encoder + "'");
+    // That azimuth survives a reset; without saying so, the devices layer
+    // would hold every steer position neutral until a rezero, which the
+    // drivetrain never does. It survives only at one encoder rotation per
+    // module rotation: a reset encoder rereads its angle within one
+    // rotation, which at any other ratio is a different module angle (at 2,
+    // a reset at 0.7 rereads -0.3, the module half a turn off).
+    if (!steer.absolute_position_frame.value)
+      throw std::invalid_argument(where + ": steer motor '" + module.steer +
+                                  "' needs position_frame = \"absolute\"");
+    if (steer.sensor_to_mechanism_ratio != 1.0)
+      throw std::invalid_argument(
+          where + ": steer motor '" + module.steer +
+          "' needs sensor_to_mechanism_ratio = 1 (one encoder rotation per "
+          "module rotation)");
   }
   return out;
 }

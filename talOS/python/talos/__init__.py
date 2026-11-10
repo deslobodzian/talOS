@@ -11,7 +11,7 @@
             self.status = node.publish(ElevatorStatus, "/elevator/status")
 
         def update(self):  # every node.period seconds
-            if self.goal.fresh():
+            if self.goal.fresh():  # neutral until the lift is rezeroed
                 self.lift.set_motion_magic(self.goal.value.height_rot)
             self.status.send(height_rot=self.lift.position)
 

@@ -70,10 +70,10 @@ A TalonFX counts rotations from where it powered on, and a reset (brownout,
 CAN fault) restarts that count at 0 wherever the carriage is. A goal of 10 in
 that frame is 10 rotations above the carriage, not 10 above the bottom. So
 heights count from a bottom limit switch (`[digital_inputs.bottom_limit]`),
-and the lift sets `requires_zero = true`: the devices layer sends its
-motion-magic goals neutral until `Motor::rezero` has zeroed it, and again
-whenever a TalonFX reset or a RoboRIO reboot drops that zero (`zeroed()`
-false; see the node development guide's rezero paragraph).
+and the lift keeps the default `position_frame = "rezero"`: the devices layer
+sends its motion-magic goals neutral until `Motor::rezero` has zeroed it, and
+again whenever a TalonFX reset or a RoboRIO reboot drops that zero
+(`zeroed()` false; see the node development guide's rezero paragraph).
 
 The switch is normally open and wired between the DIO signal pin and ground.
 The RoboRIO input's pull-up reads true while the carriage is off it and false
@@ -250,8 +250,8 @@ The package's `:messages` target uses `include_prefix = "wrist"` and declares
 It drives only a finite target with connected motor feedback. It homes the way
 the elevator does (see [Homing](#homing)), with the same switch wiring,
 `home_samples` debounce, failure latches and parameter checks: a home switch, `wrist_home`, at the
-reverse end of travel zeroes it, `requires_zero = true` holds its goals until
-then, and `/wrist/state` reports HOMING, HOMED or FAILED. Targets clamp to
+reverse end of travel zeroes it, `position_frame = "rezero"` holds its goals
+until then, and `/wrist/state` reports HOMING, HOMED or FAILED. Targets clamp to
 `0..max_position_rot`; the motor has no hardware soft limits.
 
 The subsystem file is

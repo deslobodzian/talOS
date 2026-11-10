@@ -151,11 +151,13 @@ class Motor(_Input):
         """Whether a rezero holds: False until one takes (a restarted node
         starts unzeroed), and again once one is dropped: on a gateway boot
         change, a reset that masks this motor in the next gateway State, or
-        any device reset across a sequence gap. A disconnect keeps it. A
-        dropped zero keeps its offset (dropping does not move position) but
-        holds set_position and set_motion_magic neutral until rezero();
-        requires_zero = true in the motor's config holds them the same way
-        before the first rezero."""
+        any device reset across a sequence gap. A disconnect keeps it, and so
+        does every reset of a motor whose config sets
+        position_frame = "absolute". A dropped zero keeps its offset
+        (dropping does not move position). set_position and set_motion_magic
+        go out neutral while no rezero holds, unless position_frame =
+        "absolute" (a remote CANcoder's frame, usable from the first
+        state)."""
         return bool(_abi.ok(lib.talos_motor_zeroed(self._node, self._index)))
 
     @property
@@ -419,7 +421,7 @@ class Target(_OnNode):
         self.target = talos.Target(node, PositionTarget)
         ...
         t = self.target.get()   # None: disabled, stale or no live lane
-        if t is not None:
+        if t is not None:       # motor needs a position frame (below)
             self.motor.set_motion_magic(t.position_rot)
 
     get() returns the message of the first lane, in the current Driver
@@ -427,6 +429,10 @@ class Target(_OnNode):
     [targets]), that is active, fresh and stamped with the current mode
     generation, while robot_enabled(node); otherwise None. `source` names
     that lane, or "".
+
+    Motion magic needs a position frame: position_frame = "absolute" on a
+    remote CANcoder, or a rezero first (docs/NODE_DEVELOPMENT_GUIDE.md,
+    "Rezero and position frames"); until then it goes out neutral.
     """
 
     def __init__(self, node, msg):

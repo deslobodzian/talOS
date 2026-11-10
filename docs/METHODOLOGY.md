@@ -91,6 +91,12 @@ class Wrist:
                         connected=feedback)
 ```
 
+The wrist's motor closes its loop on the `angle` CANcoder:
+`[motors.motor]` sets `feedback = "RemoteCANcoder"`, `feedback_sensor =
+"angle"` and `position_frame = "absolute"`. On rotor feedback its
+motion-magic goals stay neutral until the node homes and rezeroes it
+([position frames](NODE_DEVELOPMENT_GUIDE.md#rezero-and-position-frames)).
+
 For target selection and mode-generation semantics, see
 [Architecture: Targets](../ARCHITECTURE.md#targets).
 

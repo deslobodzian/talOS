@@ -85,6 +85,16 @@ rejected. Followers use the master's output rather than their own demand,
 and neutralize when the master is neutral or loses valid feedback.
 Both simulation backends support same-direction and opposed followers.
 
+`position_frame` is `"rezero"` (the default) or `"absolute"`, which config
+load accepts only with `feedback = "RemoteCANcoder"`, since a TalonFX reset
+restarts its rotor position. Only the main processor reads it (it is not in
+the wire format or the configuration fingerprint): the devices layer holds a
+rezero-frame motor's position and motion-magic demands neutral until the
+node's `Motor::rezero`, and again after a device reset or gateway boot, while
+an absolute-frame motor drives in the CANcoder's frame from its first state
+(see [position frames](../../docs/NODE_DEVELOPMENT_GUIDE.md#rezero-and-position-frames),
+including when that frame survives a CANcoder reset).
+
 `forward_limit_switch` and `reverse_limit_switch` set the switches wired to
 the TalonFX's own forward and reverse limit inputs: `"NormallyOpen"` (the
 default, and Phoenix's), `"NormallyClosed"` or `"Disabled"`. The TalonFX

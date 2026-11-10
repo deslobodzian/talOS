@@ -120,10 +120,12 @@ class Motor {
   // gateway boot id change; on a device reset count change in the State
   // right after the last one seen (sequence + 1) that masks this motor; on a
   // device reset count change across any other sequence step. A disconnect
-  // keeps it. A dropped zero keeps its offset (dropping does not move
-  // position()) but holds set_position and set_motion_magic neutral until
-  // rezero(); [motors.*] requires_zero = true holds them the same way before
-  // the first rezero. Other modes are never held.
+  // keeps it, and so does every reset of a motor whose config sets
+  // position_frame = "absolute". A dropped zero keeps its offset (dropping
+  // does not move position()). set_position and set_motion_magic go out
+  // neutral while no rezero holds, unless position_frame = "absolute" (a
+  // remote CANcoder's frame, usable from the first state). Other modes are
+  // never held.
   bool zeroed() const;
 
   double position() const;  // rotations

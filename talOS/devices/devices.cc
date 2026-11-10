@@ -169,9 +169,6 @@ struct HardwareLink::Impl {
     std::uint64_t clamped_count = 0;
     double position_offset = 0;  // Motor/Gyro software zero
     bool zeroed = false;         // position_offset was set by rezero
-    // A zero was dropped (ForgetZeros) and no rezero has replaced it: the
-    // offset is kept for reads, but position goals go out neutral.
-    bool zero_lost = false;
     bool digital = false;
     double pwm = 0;
     // Where this device's sample was in the state arrays last time it was
@@ -291,9 +288,11 @@ struct HardwareLink::Impl {
   //   - any other device_reset_count change drops every zero: the masking
   //     State may have been lost (a link outage, a bridge restart, dropped
   //     datagrams, a tick with no socket) and the device restored since.
-  // A dropped zero keeps its offset, so dropping does not move position()
-  // or yaw(); it reads zeroed() false and holds the motor's position goals
-  // neutral until the node rezeroes.
+  // A motor whose config sets position_frame = "absolute" keeps its zero:
+  // its remote CANcoder's frame survives a reset. A dropped zero keeps its
+  // offset, so dropping does not move position() or yaw(); it reads zeroed()
+  // false and holds the motor's position goals neutral until the node
+  // rezeroes.
   void ForgetZeros(const hardware::State& next) {
     const bool reboot = next.boot_id != state.boot_id;
     if (!reboot &&
@@ -302,11 +301,15 @@ struct HardwareLink::Impl {
     }
     const bool consecutive = !reboot && next.sequence == state.sequence + 1;
     for (Device& device : devices) {
-      if (!device.zeroed) continue;
+      if (!device.zeroed || AbsoluteFrame(device)) continue;
       if (consecutive && Valid(next, device)) continue;
       device.zeroed = false;
-      device.zero_lost = true;
     }
+  }
+
+  static bool AbsoluteFrame(const Device& device) {
+    return device.motor_config != nullptr &&
+           device.motor_config->absolute_position_frame.value;
   }
 
   static bool Valid(const hardware::State& in, Device& device) {
@@ -444,10 +447,12 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
   const auto& config = *device.motor_config;
   if (mode == hardware::Mode::kPosition ||
       mode == hardware::Mode::kMotionMagic) {
-    // A position in a frame that may have restarted (a dropped zero), or
-    // that nobody established ([motors.*] requires_zero): neutral until a
-    // rezero holds. Other modes need no frame.
-    if (!device.zeroed && (device.zero_lost || config.requires_zero.value)) {
+    // A position needs a frame that no reset has restarted since it was
+    // taken: a rezero that still holds, or a remote CANcoder's absolute frame
+    // ([motors.*] position_frame = "absolute"). The rotor position a TalonFX
+    // powers on or resets with is no frame: neutral until the node rezeroes.
+    // Other modes need no frame.
+    if (!device.zeroed && !config.absolute_position_frame.value) {
       device.motor = {.id = device.id};
       device.set = true;
       return;
@@ -516,7 +521,6 @@ void HardwareAccess::motor_rezero(HardwareLink& link, std::size_t index,
       std::isfinite(position_rot) && std::isfinite(offset)) {
     device.position_offset = offset;
     device.zeroed = true;
-    device.zero_lost = false;
   }
 }
 
@@ -536,7 +540,6 @@ void HardwareAccess::gyro_rezero(HardwareLink& link, std::size_t index,
       std::isfinite(yaw_rot) && std::isfinite(offset)) {
     device.position_offset = offset;
     device.zeroed = true;
-    device.zero_lost = false;
   }
 }
 

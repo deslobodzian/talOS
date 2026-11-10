@@ -66,10 +66,15 @@ struct MotorConfig {
   std::array<Gains, 3> slots{};
   uint16_t master_id{0};  // Zero denotes an independent motor.
   bool oppose_master{false};
-  // Main processor only (talOS/devices): position and motion-magic demands
-  // go out neutral until the owning node's Motor::rezero holds for this
-  // motor. Not sent to the controller and not part of ConfigurationId.
-  LocalMotorSetting requires_zero{};
+  // Main processor only (talOS/devices), not sent to the controller and not
+  // part of ConfigurationId: [motors.*] position_frame = "absolute" (true)
+  // or "rezero" (false, the default). A rezero-frame motor's position and
+  // motion-magic demands go out neutral until the owning node's
+  // Motor::rezero holds, and again once a device reset or gateway boot drops
+  // it. An absolute-frame motor (remote CANcoder feedback only) commands
+  // positions in the sensor's frame, which survives a reset, from its first
+  // state, and keeps its rezero across resets.
+  LocalMotorSetting absolute_position_frame{};
   bool operator==(const MotorConfig&) const = default;
 };
 

@@ -128,6 +128,9 @@ Handles are named by their device key in the subsystem config
 | `node.extension<talos::HardwareLink>().fresh()` / `.fresh(max_age)` and `.age()` | `link = talos.HardwareLink(node)`; `link.fresh()` / `link.fresh(max_age)` (`None` uses command timeout; seconds or `datetime.timedelta`); `link.age` (float seconds, `math.inf` before the first state); `link.sample_time` (int ns or `None`) |
 | `Motor` / `CANcoder`: `position_time()`, `velocity_time()`; `Gyro`: `yaw_time()`, `yaw_rate_time()` | same names as properties: integer node-clock nanoseconds, or `None` |
 
+Actuator flush and disable semantics are in
+[Architecture: The tick](../ARCHITECTURE.md#the-tick).
+
 Motor `temperature_c` is device temperature in Celsius; `supply_current_a`
 is supply-side current, not `current` (stator current). All three use 0.1-unit
 wire resolution. They are observations, not automatic thermal derating.
@@ -146,6 +149,8 @@ connected, the RoboRIO reports them only from a TalonFX FaultField signal under
 signal is staler. SimHardware `set_limit_switches(node, device, forward,
 reverse)` asserts them; it does not stop the request or the ideal motor.
 
+### Rezero and position frames
+
 `Motor::rezero(position_rot = 0)` and `Gyro::rezero(yaw_rot = 0)` (same
 methods in Python) set a software offset shared by all handles for that device
 on the node. They do not reset hardware and work while disabled. Disconnected,
@@ -156,7 +161,8 @@ before clamping. Configured soft limits remain in the **hardware frame** and
 the gateway's safety checks are never bypassed.
 `zeroed()` (`zeroed` property in Python) is true while a rezero holds. The
 offset lives in the node, so a restarted node starts unzeroed. A zero is
-dropped when its hardware frame may have restarted:
+dropped when its hardware frame may have restarted, except an
+absolute-frame motor's (below), which no reset or boot drops:
 
 - a gateway boot id change drops every zero on the node;
 - a device reset count change in the State whose `sequence` is the previous
@@ -168,12 +174,31 @@ dropped when its hardware frame may have restarted:
   a link outage, a gateway tick with no socket) drops every zero on the node.
 
 A disconnect alone keeps the zero. A dropped zero keeps its offset, so
-dropping does not move `position()` or `yaw()`, but `zeroed()` reads false,
-and the motor's `set_position` and `set_motion_magic` demands go out neutral
-until the node rezeroes. A motor with `requires_zero = true` in its
-`[motors.<name>]` table is held the same way before its first rezero.
+dropping does not move `position()` or `yaw()`, but `zeroed()` reads false.
+
+A position needs a frame no reset has restarted, which the motor's
+`[motors.<name>]` `position_frame` names:
+
+- `"rezero"` (the default): the frame `Motor::rezero` sets. A TalonFX counts
+  rotor rotations from where it powered on or last reset, wherever the
+  mechanism was, so `set_position` and `set_motion_magic` go out neutral
+  while no rezero holds: before the first and after a reset drops it. Home
+  against a switch or hard stop, then rezero.
+- `"absolute"`: the remote CANcoder's frame (`feedback = "RemoteCANcoder"`
+  only; config load refuses it on rotor feedback). Position goals drive from
+  the first state without a rezero, and a rezero, if taken, survives resets
+  and gateway boots. A reset CANcoder rereads its absolute angle within one
+  rotation, so this holds only while one CANcoder rotation covers the
+  mechanism's whole travel: the CANcoder turns at most once over the travel
+  without crossing its discontinuity, or, with `continuous_wrap`, once per
+  mechanism rotation (`sensor_to_mechanism_ratio = 1`, as on swerve
+  steering). Otherwise a reset shifts the mechanism frame by whole CANcoder
+  rotations: at a ratio of 2, a reset at 0.7 rereads -0.3, half a turn off.
+
 Velocity, voltage and duty cycle are never held, and the substitution does
 not count in `clamped_count`.
+
+### Signal acquisition times
 
 Signal acquisition times subtract the signal's existing gateway age (microseconds)
 from the mapped hardware State time. They are available while disabled, but
@@ -189,9 +214,6 @@ Python). Defaults are zero; `UINT32_MAX` injects unknown acquisition age.
 The robot-specific odometry timing policy is documented in the
 [drivetrain README](../2026-robot/main_processor/drivetrain/README.md).
 
-
-Actuator flush and disable semantics are in
-[Architecture: The tick](../ARCHITECTURE.md#the-tick).
 
 ## Targets
 

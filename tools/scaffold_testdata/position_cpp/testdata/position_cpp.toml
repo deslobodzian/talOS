@@ -12,7 +12,7 @@ home_margin_rot = 0.5
 type = "TalonFX"
 bus = "rio"
 can_id = 1
-requires_zero = true
+position_frame = "rezero"
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
 [digital_inputs.position_cpp_home]

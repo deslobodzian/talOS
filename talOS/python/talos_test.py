@@ -402,6 +402,7 @@ can_id = 3
         self.assertTrue(lift.lift.connected)
         self.assertEqual(lift.lift.position, 0.75)
 
+        lift.lift.rezero(0.75)  # a rotor frame: motion magic needs a zero
         hw.enable()
         sim.step(0.03)
         self.assertTrue(lift.enabled)

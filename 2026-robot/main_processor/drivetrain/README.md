@@ -50,9 +50,12 @@ ramp rather than resuming the previous command.
 - `geometry.h`: the geometry, read from `[subsystems.drivetrain.geometry]`;
   each module names its drive, steer and encoder devices, checked against
   this subsystem's devices at startup. A steer motor must have
-  `continuous_wrap = true` and `feedback = "RemoteCANcoder"` with
-  `feedback_sensor` naming its own module's encoder; anything else is
-  refused.
+  `continuous_wrap = true`, `feedback = "RemoteCANcoder"` with
+  `feedback_sensor` naming its own module's encoder,
+  `position_frame = "absolute"` and `sensor_to_mechanism_ratio = 1` (the
+  encoder's azimuth then survives a reset, so steering needs no rezero; see
+  [position frames](../../../docs/NODE_DEVELOPMENT_GUIDE.md#rezero-and-position-frames));
+  anything else is refused.
 - `drive_message.fbs` and the `topics` in `BUILD`: `drivetrain::ChassisTarget`,
   `drivetrain::DrivetrainState` and `drivetrain::topics::k*`,
   `//2026-robot/main_processor/drivetrain:messages`.

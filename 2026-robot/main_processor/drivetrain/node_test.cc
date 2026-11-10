@@ -353,6 +353,37 @@ TEST(SwerveGeometry, RejectsUnknownAndCrossedDeviceReferences) {
         << error.what();
   }
 
+  // A steer motor whose frame is not declared absolute: the devices layer
+  // would hold its positions neutral until a rezero that never comes.
+  auto relative = config;
+  for (auto& motor : relative.hardware.motors) {
+    if (motor.name == "front_left_steer") {
+      motor.absolute_position_frame.value = false;
+    }
+  }
+  try {
+    BuildSwerveGeometry(relative, "drivetrain", *geometry);
+    ADD_FAILURE() << "A steer motor without an absolute frame was accepted";
+  } catch (const std::invalid_argument& error) {
+    EXPECT_NE(std::string{error.what()}.find("position_frame"),
+              std::string::npos)
+        << error.what();
+  }
+
+  // An encoder geared to the module: its frame does not survive a reset.
+  auto geared = config;
+  for (auto& motor : geared.hardware.motors) {
+    if (motor.name == "front_left_steer") motor.sensor_to_mechanism_ratio = 2;
+  }
+  try {
+    BuildSwerveGeometry(geared, "drivetrain", *geometry);
+    ADD_FAILURE() << "A geared steer encoder was accepted";
+  } catch (const std::invalid_argument& error) {
+    EXPECT_NE(std::string{error.what()}.find("sensor_to_mechanism_ratio"),
+              std::string::npos)
+        << error.what();
+  }
+
   // A drive motor used as a steer motor (no continuous wrap).
   mutated = *geometry;
   mutated["modules"].as_array()->get(0)->as_table()->insert_or_assign(

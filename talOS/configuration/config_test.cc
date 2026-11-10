@@ -133,6 +133,13 @@ can_id = 2
 can_id = 3
 feedback_sensor = "enc"
 )");  // Rotor feedback naming a sensor.
+  // A rotor frame restarts with the TalonFX, so it is never absolute.
+  ExpectRejected(
+      "[subsystems.test.motors.m2]\ncan_id = 2\nposition_frame = "
+      "\"absolute\"\n");
+  ExpectRejected(
+      "[subsystems.test.motors.m2]\ncan_id = 2\nposition_frame = "
+      "\"power_on\"\n");
   ExpectRejected(R"(
 [subsystems.test.motors.steer]
 can_id = 2
