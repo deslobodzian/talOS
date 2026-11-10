@@ -230,9 +230,8 @@ class FactorGraphBackend:
     """
 
     def __init__(self, node, kinematics, lag_s):
-        # Loaded here, for this backend only: gtsam is 150 MB of native code
-        # that takes seconds to load on a cold start, longer than the
-        # launcher's --describe probe allows.
+        # Loaded here, for this backend only, so a kalman configuration never
+        # loads gtsam's ~150 MB of native code.
         self.gtsam = importlib.import_module("gtsam")
         self.kinematics = kinematics
         self.lag_s = lag_s
