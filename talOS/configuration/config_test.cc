@@ -163,7 +163,6 @@ dio_a = 3
 dio_b = 4
 )");
   ExpectRejected("[robot]\nperiod_us = 500\n");
-  ExpectRejected("[robot]\ncommand_timeout_us = 6000\n");
   ExpectRejected(
       "[subsystems.test.sensors.s]\ncan_id = 20\noffset_rot = 0.5\n");
   ExpectRejected(
@@ -180,6 +179,45 @@ feedback_sensor = "imu"
   EXPECT_THROW(
       ParseRobotConfigString("[subsystems.test.sensors.s]\ncan_id = 1\n"),
       std::invalid_argument);  // No motors.
+}
+
+// Every node's Driver Station view expires at command_timeout_us, and a packet
+// can follow the previous one by 20000 us plus a gateway period: the timeout
+// spans two such gaps, 2 * (20000 + period_us).
+TEST(ConfigTest, CommandTimeoutSpansTwoDriverStationPacketGaps) {
+  const auto robot = [](int period_us, int timeout_us) {
+    return Parse("[robot]\nperiod_us = " + std::to_string(period_us) +
+                 "\ncommand_timeout_us = " + std::to_string(timeout_us) + "\n");
+  };
+  EXPECT_THROW(robot(5000, 49999), std::invalid_argument);
+  EXPECT_NO_THROW(robot(5000, 50000));
+  EXPECT_THROW(robot(20000, 79999), std::invalid_argument);
+  EXPECT_NO_THROW(robot(20000, 80000));
+}
+
+// The bridge holds an actuator owner's last request for two of its periods,
+// and the gateway refuses a merged command whose oldest observation is
+// command_timeout_us old, so every owner's period is at most half of it.
+TEST(ConfigTest, ActuatorOwnerPeriodIsAtMostHalfTheCommandTimeout) {
+  const auto parse = [](const std::string& subsystems) {
+    return ParseRobotConfigString("[robot]\ncommand_timeout_us = 100000\n" +
+                                  subsystems);
+  };
+  EXPECT_NO_THROW(
+      parse("[subsystems.arm]\nperiod_us = 50000\n"
+            "[subsystems.arm.motors.m]\ncan_id = 1\n"));
+  EXPECT_THROW(parse("[subsystems.arm]\nperiod_us = 50001\n"
+                     "[subsystems.arm.motors.m]\ncan_id = 1\n"),
+               std::invalid_argument);
+  // A PWM output is an actuator too; a node that only reads may be slow.
+  EXPECT_THROW(parse("[subsystems.servo]\nperiod_us = 50001\n"
+                     "[subsystems.servo.pwm_outputs.p]\nchannel = 0\n" +
+                     std::string{kMotor}),
+               std::invalid_argument);
+  EXPECT_NO_THROW(
+      parse("[subsystems.camera]\nperiod_us = 200000\n"
+            "[subsystems.camera.digital_inputs.d]\ndio = 0\n" +
+            std::string{kMotor}));
 }
 
 TEST(ConfigTest, ControllerAddressOverridesAndRejectsInvalidEndpoints) {

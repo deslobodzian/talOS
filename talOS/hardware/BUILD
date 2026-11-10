@@ -21,6 +21,7 @@ cc_library(
     srcs = ["config.cc"],
     hdrs = ["config.h"],
     visibility = ["//visibility:public"],
+    deps = ["//talOS/driver_station"],
 )
 
 cc_library(

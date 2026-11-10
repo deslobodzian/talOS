@@ -14,7 +14,8 @@
 // encoders (type "QuadratureEncoder" or "DutyCycleEncoder"), pwm_outputs.
 // Logical ids are assigned 1..N sorted by (subsystem, device name). Ranges,
 // uniqueness, and exclusive ownership are enforced by hardware::Validate; the
-// parser only checks what Validate cannot see (types, names, references).
+// parser only checks what Validate cannot see (types, names, references, and
+// each actuator owner's period_us against command_timeout_us).
 
 #include <algorithm>
 #include <cstdint>
@@ -971,7 +972,29 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
         dev.config);
   }
 
-  if (validate_hardware) hardware::Validate(hw);
+  if (validate_hardware) {
+    hardware::Validate(hw);
+    // The bridge holds an actuator owner's last request for two of its
+    // periods, and the merged command carries the oldest observation it
+    // holds, which the gateway refuses once that is command_timeout_us old:
+    // an owner slower than half the timeout would expire every owner's
+    // command with its own.
+    for (const auto& [name, owned] : result.subsystems) {
+      if (owned.motors.empty() && owned.digital_outputs.empty() &&
+          owned.pwm_outputs.empty()) {
+        continue;
+      }
+      const auto period_us = Read(*result.GetSubsystemTable(name), "period_us",
+                                  int64_t{hw.period_us});
+      if (period_us > int64_t{hw.command_timeout_us / 2}) {
+        throw std::invalid_argument(
+            "[subsystems." + name + "] owns actuators, so its period_us (" +
+            std::to_string(period_us) +
+            ") must be at most half of [robot] command_timeout_us (" +
+            std::to_string(hw.command_timeout_us) + ")");
+      }
+    }
+  }
   return result;
 }
 

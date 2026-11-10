@@ -23,7 +23,7 @@ using Kind = detail::DeviceKind;
 constexpr std::string_view kRobotToml = R"(
 [robot]
 period_us = 5000
-command_timeout_us = 30000
+command_timeout_us = 50000
 
 [subsystems.mech.motors.braked]
 can_id = 1
@@ -114,7 +114,7 @@ class SimHardwareTest : public ::testing::Test {
 TEST_F(SimHardwareTest, SilenceExpiresAllAppliedOutputsAtConfiguredDeadline) {
   hw.ideal_motors();
   Send("mech", Drive());
-  sim.step(29ms);
+  sim.step(49ms);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
   EXPECT_TRUE(hw.applied_digital_output("mech", "led"));
   EXPECT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.75);
@@ -146,7 +146,7 @@ TEST_F(SimHardwareTest, OneNodesPublicationsCannotRefreshAnotherNodesRequest) {
   Send("mech", Drive());
   sim.step(20ms);
   Send("other", Drive("other"));
-  sim.step(10ms);
+  sim.step(30ms);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
   EXPECT_EQ(hw.applied_motor("other", "motor").mode, Mode::kVelocity);
   EXPECT_TRUE(hw.applied_digital_output("other", "other_led"));
@@ -165,7 +165,7 @@ TEST_F(SimHardwareTest, IdenticalPublicationRenewsOnlyItsOwnDeadline) {
   Send("mech", command);
   sim.step(25ms);
   Send("mech", command);
-  sim.step(29ms);
+  sim.step(49ms);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
   EXPECT_TRUE(hw.applied_digital_output("mech", "led"));
   EXPECT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.75);
@@ -180,7 +180,7 @@ TEST_F(SimHardwareTest,
   sim.step(
       1ms);  // Publish between hardware ticks; first collection is at 5 ms.
   Send("mech", Drive());
-  sim.step(28ms);
+  sim.step(48ms);
   EXPECT_EQ(hw.motor_request("mech", "braked").mode, Mode::kVelocity);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
   sim.step(1ms);

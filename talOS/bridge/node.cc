@@ -21,6 +21,9 @@ namespace talos::hardware {
 static_assert(alignof(bridge::BridgeStatus) == 8);
 static_assert(sizeof(bridge::BridgeStatus) == 176,
               "BridgeStatus size changed; update docs/DATA_FLOW.md");
+// Each actuator-owning subsystem owns at least one such device.
+static_assert(kMaxMotors + kMaxDigitalOutputs + kMaxPwmOutputs <= 32,
+              "BridgeStatus masks are 32 bits wide");
 
 HardwareNode::HardwareNode(config::RobotConfig robot_config,
                            std::string remote_ip, uint16_t remote_port,
@@ -47,7 +50,7 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
   // Heartbeat keeps a live-but-unchanged merge refreshing the gateway at 5x
   // margin inside the command timeout, whatever the config chose. The clamp
   // keeps steady-state traffic near the slowest actuator period (20 ms)
-  // without ever approaching the timeout floor (2x period).
+  // without ever approaching the timeout floor (hardware::Validate).
   heartbeat_us_ = std::clamp(config_.command_timeout_us / 5, uint32_t{5000},
                              uint32_t{20000});
 

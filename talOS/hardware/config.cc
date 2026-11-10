@@ -4,7 +4,10 @@
 #include <cmath>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+
+#include "../driver_station/driver_station.h"
 
 namespace talos::hardware {
 namespace {
@@ -37,10 +40,24 @@ void Validate(const Config& c) {
               c.encoders.size() <= kMaxEncoders &&
               c.pwm_outputs.size() <= kMaxPwmOutputs,
           "invalid hardware device count");
-  Require(c.period_us >= 1000 && c.period_us <= 20000 &&
-              c.command_timeout_us >= 2 * c.period_us &&
-              c.command_timeout_us <= 500000,
-          "invalid gateway period or command timeout");
+  Require(c.period_us >= 1000 && c.period_us <= 20000,
+          "invalid gateway period");
+  // Every node's Driver Station view expires at command_timeout_us. The
+  // gateway sends a Driver Station packet on its first tick at least
+  // kSamplePeriodUs after the previous one, so packets can be
+  // kSamplePeriodUs + period_us apart; two such gaps leave a whole gap of
+  // margin, where a shorter timeout can drop the mode between packets and
+  // every Target with it. That also covers two gateway periods.
+  const uint64_t min_timeout_us =
+      2 * (driver_station::kSamplePeriodUs + c.period_us);
+  if (c.command_timeout_us < min_timeout_us || c.command_timeout_us > 500000) {
+    throw std::invalid_argument(
+        "command_timeout_us " + std::to_string(c.command_timeout_us) +
+        " is outside [" + std::to_string(min_timeout_us) +
+        ", 500000]: it must span two Driver Station packet gaps of up to " +
+        std::to_string(driver_station::kSamplePeriodUs) +
+        " us + period_us each");
+  }
   Require(Positive(c.status_hz) && c.status_hz <= 1000,
           "invalid status frequency");
   std::set<uint16_t> ids;

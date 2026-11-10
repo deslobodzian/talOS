@@ -102,13 +102,13 @@ inline constexpr bool kTargetEnvelopeLayout =
 }  // namespace detail
 
 // The lanes of this node's target policy, resolved: see the top of this
-// file. A cheap copyable value; take it in the constructor.
+// file. A cheap copyable value bound to its node, which is why there is no
+// default constructor; take it in the node's constructor.
 template <Message M>
 class Target {
   static_assert(detail::kTargetEnvelopeLayout<M>);
 
  public:
-  Target() = default;
   explicit Target(Node& node)
       : node_{&node},
         index_{detail::TargetAccess::open_target(node, sizeof(M), alignof(M),
@@ -137,13 +137,13 @@ class Target {
 };
 
 // One producer's lane, /<subsystem>/target/<source>. Takes the node's
-// DriverStation, whose generation every send() stamps.
+// DriverStation, whose generation every send() stamps. Like Target, always
+// bound to its node: there is no default constructor.
 template <Message M>
 class TargetLane {
   static_assert(detail::kTargetEnvelopeLayout<M>);
 
  public:
-  TargetLane() = default;
   TargetLane(Node& node, std::string_view subsystem, std::string_view source)
       : node_{&node},
         index_{detail::TargetAccess::open_lane(

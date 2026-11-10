@@ -62,8 +62,8 @@ static_assert(kMaxEncodedSize == 678,
               "Driver Station maximum size changed; update docs/DATA_FLOW.md");
 
 // The Driver Station itself only produces new data at 50 Hz, so sampling any
-// faster only duplicates packets. Must stay in sync with the
-// [subsystems.driver_station] period_us in the robot configuration.
+// faster only duplicates packets. hardware::Validate sizes the shortest
+// [robot] command_timeout_us from it.
 inline constexpr uint64_t kSamplePeriodUs = 20000;
 
 struct JoystickData {

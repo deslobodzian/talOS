@@ -590,7 +590,7 @@ command_timeout_us = 100000
 period_us = 200000
 [subsystems.watcher.digital_inputs.switch]
 dio = 3
-[subsystems.watcher.motors.m]
+[subsystems.mech.motors.m]
 can_id = 1
 )");
   sim.add<PeriodicWatcher>("watcher");

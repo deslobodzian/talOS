@@ -8,6 +8,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "talOS/devices/devices.h"
@@ -38,6 +39,9 @@ using target_test::Goal;
 using target_test::Small;
 static_assert(sizeof(TargetEnvelope<Goal>) == 24);
 static_assert(sizeof(TargetEnvelope<Small>) == 20);
+// Neither handle exists without its node: get() and send() always have one.
+static_assert(!std::is_default_constructible_v<Target<Goal>>);
+static_assert(!std::is_default_constructible_v<TargetLane<Goal>>);
 
 // The lift lets auto-align preempt the driver in teleop (robot default); the
 // wrist overrides teleop and opts into test mode.
@@ -212,7 +216,7 @@ period_us = 5000
 command_timeout_us = 100000
 [subsystems.lift]
 period_us = 200000
-[subsystems.lift.motors.m]
+[subsystems.mech.motors.m]
 can_id = 1
 )");
   auto& lift = sim.add<Consumer<Goal>>("lift");
