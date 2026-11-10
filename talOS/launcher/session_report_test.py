@@ -126,7 +126,7 @@ class SessionReportTest(unittest.TestCase):
         text = session_report.markdown(session_report.analyze(manifest, []))
         runs = text[text.index("## Runs"):text.index("## Session completeness")]
         rows = [line for line in runs.splitlines() if line.startswith("| arm |")]
-        self.assertEqual([row.split(" | ")[1:3] for row in rows[:3]],
+        self.assertEqual([row.split(" | ")[2:4] for row in rows[:3]],
                          [["0", "10"], ["3", "13"], ["4", "14"]])
         self.assertIn("1.000 | -1 | 9 | stalled", rows[0])
         self.assertIn("running | -1 | 9 | running", rows[2])

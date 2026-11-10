@@ -1,9 +1,9 @@
 // The Session panel: what launched, from which config, and how every process
 // has fared. Three views over two documents plus the live registry:
 //
-//   Session   — the launcher's manifest: session id, simulation, config path +
-//               its hash, output dir, start time and uptime (end time when the
-//               session ended).
+//   Session   — the launcher's manifest: session id, source revision,
+//               simulation, config path + its hash, output dir, start time and
+//               uptime (end time when the session ended).
 //   Processes — one row per process, merging the manifest nodes, the live
 //               registry and the declared graph by name, so a process that
 //               crashed before claiming a slot still shows up (declared, never
@@ -124,6 +124,9 @@ function SessionHeader(
   const upNs = ended ? Number(end - start) :
       graph ? Math.max(0, Number(BigInt(graph.wall_ns) - start)) : null;
   const shortSha = manifest.config_sha256.slice(0, 8);
+  const revision = manifest.git_revision ?
+      manifest.git_revision.slice(0, 12) + (manifest.git_dirty ? ' (dirty)' : '') :
+      '—';
 
   return <div className="session-fields">
     <Field label="Config" wide>
@@ -136,6 +139,9 @@ function SessionHeader(
                  copied={copied === manifest.output_dir} onCopy={onCopy}/>
     </Field>
     <Field label="Session">{manifest.session_id}</Field>
+    <Field label="Revision">
+      <code className="sha" title={manifest.git_revision}>{revision}</code>
+    </Field>
     <Field label="Simulation">{manifest.simulation ? 'yes' : 'no'}</Field>
     <Field label="Started">{wallClock(manifest.start_wall_ns)}</Field>
     {ended && <Field label="Ended">{wallClock(manifest.end_wall_ns)}</Field>}

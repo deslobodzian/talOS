@@ -53,3 +53,9 @@ test:tsan --test_tag_filters=-no_tsan
 # OpenCV's pthread worker activity flag is patched to atomic accesses, and its
 # upstream thread_body suppression is removed. Normal internal parallelism is
 # enabled under TSan; no OpenCV thread-count environment override is applied.
+
+# A deployable bundle: `bazel build --config=release <bundle>` records the
+# source revision and dirty flag (tools/workspace_status.sh) in
+# bundle_manifest.toml, and from there in every session manifest. Unstamped
+# builds never read the status, so they stay cached across commits.
+build:release --stamp --workspace_status_command=tools/workspace_status.sh

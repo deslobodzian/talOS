@@ -157,6 +157,9 @@ def analyze(manifest, records, log_damage=()):
     issues += list(log_damage)
     return {"session_id": manifest.get("session_id"),
             "config_sha256": manifest.get("config_sha256") or "NOT RECORDED (non-bundle launch)",
+            # A --config=release bundle's source revision; older manifests lack it.
+            "git_revision": (manifest.get("git_revision") or "NOT RECORDED (unstamped or non-bundle)")
+                            + (" (dirty)" if manifest.get("git_dirty") else ""),
             # exit_signal is 0 unless a signal killed the node; older manifests lack it.
             "nodes": [{**{k: n.get(k) for k in ("name", "restart_count", "exit_code")},
                        "exit_signal": n.get("exit_signal", 0),
@@ -164,7 +167,8 @@ def analyze(manifest, records, log_damage=()):
                       for n in manifest["nodes"]],
             # Every run and why it ended (launcher README "Session manifest");
             # absent in manifests written before the launcher recorded runs.
-            "runs": {n.get("name"): {"runs": n.get("runs", []),
+            "runs": {n.get("name"): {"binary_sha256": n.get("binary_sha256", ""),
+                                     "runs": n.get("runs", []),
                                      "runs_dropped": n.get("runs_dropped", 0)}
                      for n in manifest["nodes"]},
             "session_issues": issues,
@@ -188,24 +192,25 @@ def strict_failures(report):
 
 def markdown(report):
     lines = ["# Session report", f"Session: {report['session_id']}",
-             f"Config SHA-256: {report['config_sha256']}", "", "## Nodes",
+             f"Config SHA-256: {report['config_sha256']}",
+             f"Source revision: {report['git_revision']}", "", "## Nodes",
              "| Node | Restarts | Exit code | Exit signal | quarantined | recorder_failed | log_capped |",
              "|---|---:|---:|---:|---|---|---|"]
     for n in report["nodes"]:
         lines.append("| " + " | ".join(str(n[k]) for k in n) + " |")
-    lines += ["", "## Runs", "| Node | Run | PID | Seconds | Exit code | Exit signal | Reason |",
-              "|---|---:|---:|---:|---:|---:|---|"]
+    lines += ["", "## Runs", "| Node | Binary SHA-256 | Run | PID | Seconds | Exit code | Exit signal | Reason |",
+              "|---|---|---:|---:|---:|---:|---:|---|"]
     for name, node in report["runs"].items():
         for index, run in enumerate(node["runs"]):
             ended = run["end_wall_ns"]
             seconds = f"{(ended - run['start_wall_ns']) / 1e9:.3f}" if ended else "running"
             # A run after the dropped ones is numbered as it was spawned.
             number = index if index == 0 else index + node["runs_dropped"]
-            lines.append(f"| {name} | {number} | "
+            lines.append(f"| {name} | {node['binary_sha256'][:12] or '—'} | {number} | "
                          f"{run['pid']} | {seconds} | {run['exit_code']} | "
                          f"{run['exit_signal']} | {run['reason']} |")
         if node["runs_dropped"]:
-            lines.append(f"| {name} | | | | | | {node['runs_dropped']} runs after the first dropped |")
+            lines.append(f"| {name} | | | | | | | {node['runs_dropped']} runs after the first dropped |")
     lines += ["", "## Session completeness"] + (
         ["- " + s for s in report["session_issues"]] or ["- complete"])
     lines += ["", "## Timing (ms)", f"State stream: {report['state_stream'] or 'NOT MEASURED'}",

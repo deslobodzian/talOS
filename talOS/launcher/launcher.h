@@ -50,6 +50,7 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/registry.h"
+#include "talOS/launcher/file_digest.h"
 #include "talOS/launcher/service_notifier.h"
 #include "talOS/launcher/session_lock.h"
 #include "talOS/process/durable_sync.h"
@@ -343,6 +344,9 @@ struct NodeProcessInfo {
   std::string name;
   std::string target;
   std::string binary_path;
+  // SHA-256 of binary_path when the session started (FileSha256); empty when
+  // it could not be read.
+  std::string binary_sha256;
   std::string log_path;  // First run's event log; empty for none.
   // Every event log the node wrote, first run first: log_path, then
   // `<name>.restart<k>.tlog` for restart k. Empty when log_path is.
@@ -413,6 +417,11 @@ struct SessionManifest {
   // sha256 over every staged file as config-relative path + bytes, from the
   // bundle manifest. Empty for non-bundle launches.
   std::string config_sha256;
+  // The source revision a --stamp build of the bundle recorded
+  // (bundle_manifest.toml git_revision), and whether its tree had
+  // uncommitted changes. Empty and false otherwise.
+  std::string git_revision;
+  bool git_dirty{false};
   std::string output_dir;
   bool simulation{false};
   int64_t start_wall_ns{0};
@@ -426,6 +435,8 @@ struct SessionManifest {
     ss << "  \"session_id\": " << session_id << ",\n";
     ss << "  \"config_path\": " << Quoted(config_path) << ",\n";
     ss << "  \"config_sha256\": " << Quoted(config_sha256) << ",\n";
+    ss << "  \"git_revision\": " << Quoted(git_revision) << ",\n";
+    ss << "  \"git_dirty\": " << (git_dirty ? "true" : "false") << ",\n";
     ss << "  \"output_dir\": " << Quoted(output_dir) << ",\n";
     ss << "  \"simulation\": " << (simulation ? "true" : "false") << ",\n";
     ss << "  \"start_wall_ns\": " << start_wall_ns << ",\n";
@@ -437,6 +448,7 @@ struct SessionManifest {
       ss << "      \"name\": " << Quoted(n.name) << ",\n";
       ss << "      \"target\": " << Quoted(n.target) << ",\n";
       ss << "      \"binary_path\": " << Quoted(n.binary_path) << ",\n";
+      ss << "      \"binary_sha256\": " << Quoted(n.binary_sha256) << ",\n";
       ss << "      \"log_path\": " << Quoted(n.log_path) << ",\n";
       ss << "      \"log_paths\": [";
       for (std::size_t j = 0; j < n.log_paths.size(); ++j) {
@@ -548,6 +560,10 @@ struct LauncherOptions {
   // The config identity hash from the bundle manifest, carried into the
   // session manifest.
   std::string bundle_config_sha256;
+  // The bundle's source revision and dirty flag (bundle_manifest.toml
+  // git_revision, git_dirty), present when it was built with --stamp.
+  std::string bundle_git_revision;
+  bool bundle_git_dirty{false};
 
   // Target or node name -> binary path. Filled from the bundle manifest, or
   // directly by tests.
@@ -592,6 +608,9 @@ inline bool LoadBundle(LauncherOptions& options, std::string& error) {
     }
     options.bundle_config_sha256 =
         manifest["config_sha256"].value_or(std::string{});
+    options.bundle_git_revision =
+        manifest["git_revision"].value_or(std::string{});
+    options.bundle_git_dirty = manifest["git_dirty"].value_or(false);
 
     if (const auto* nodes = manifest["nodes"].as_array()) {
       for (const auto& entry : *nodes) {
@@ -2529,6 +2548,18 @@ class Launcher {
       std::cerr << "launcher: --config PATH or --bundle PATH is required\n";
       return 1;
     }
+    // Recorded absolute (manifest.json, graph.json, every member's --config):
+    // a relative path names nothing once the launcher's working directory is
+    // forgotten.
+    const bool config_was_relative =
+        std::filesystem::path{options_.config_path}.is_relative();
+    {
+      std::error_code cwd_error;
+      const auto absolute =
+          std::filesystem::absolute(options_.config_path, cwd_error);
+      if (!cwd_error)
+        options_.config_path = absolute.lexically_normal().string();
+    }
     if (options_.replay_inputs.empty() != options_.only.empty()) {
       std::cerr << "launcher: --replay-inputs SESSION_DIR and --only NODE go "
                    "together\n";
@@ -2558,7 +2589,7 @@ class Launcher {
     } catch (const std::exception& e) {
       std::cerr << "launcher: failed to load config from "
                 << options_.config_path << ": " << e.what() << "\n";
-      if (std::filesystem::path{options_.config_path}.is_relative()) {
+      if (config_was_relative) {
         std::cerr << "launcher: working directory is "
                   << std::filesystem::current_path()
                   << "; run from the repository root or pass an absolute "
@@ -2685,6 +2716,8 @@ class Launcher {
     manifest.session_id = options_.session_id;
     manifest.config_path = options_.config_path;
     manifest.config_sha256 = options_.bundle_config_sha256;
+    manifest.git_revision = options_.bundle_git_revision;
+    manifest.git_dirty = options_.bundle_git_dirty;
     manifest.output_dir = options_.output_dir;
     manifest.simulation = options_.simulation;
     manifest.declared_topics = declared_topics;
@@ -2709,6 +2742,7 @@ class Launcher {
       proc.name = spec.name;
       proc.target = spec.target;
       proc.binary_path = spec.binary_path;
+      proc.binary_sha256 = FileSha256(spec.binary_path);
       // The gateway is started without --log, so it writes no event log.
       if (spec.name != kSimGatewayName) {
         proc.log_path = NodeLogPath(options_.output_dir, spec.name, 0);

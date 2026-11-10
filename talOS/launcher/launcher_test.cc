@@ -22,6 +22,7 @@
 #include "talOS/events/log/log_writer.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
+#include "talOS/launcher/file_digest.h"
 
 namespace talos::launcher {
 namespace {
@@ -1405,6 +1406,27 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   EXPECT_FALSE(LoadBundle(broken, error));
 
   std::filesystem::remove_all(bundle_dir);
+}
+
+// A binary's digest is the SHA-256 sha256sum and the bundle builder's
+// hashlib write, across the padding boundary and FileSha256's read chunks.
+TEST(LauncherBundleTest, FileSha256MatchesTheStandardDigest) {
+  const auto digest = [](std::string_view bytes) {
+    const std::string path = TempPath("sha256_input");
+    std::ofstream{path, std::ios::binary} << bytes;
+    std::string hex = FileSha256(path);
+    std::filesystem::remove(path);
+    return hex;
+  };
+  EXPECT_EQ(digest(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  EXPECT_EQ(digest("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  EXPECT_EQ(digest("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+  EXPECT_EQ(digest(std::string(1000000, 'a')),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+  EXPECT_EQ(FileSha256(TempPath("sha256_missing")), "");
 }
 
 // A member's run history is bounded: it keeps the first run, which says how

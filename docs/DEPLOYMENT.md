@@ -7,8 +7,13 @@ bundles, starts one on boot, shows logs, rolls back and prunes old bundles.
 ## Build a bundle
 
 ```sh
-bazel build //2026-robot/main_processor:robot_bundle
+bazel build --config=release //2026-robot/main_processor:robot_bundle
 ```
+
+`--config=release` (`.bazelrc`) stamps the build: the bundle records the git
+revision it was built from and whether the tree had uncommitted changes
+(`tools/workspace_status.sh`). Without it the bundle builds the same but
+records no revision.
 
 `talos_bundle` (`talOS/build/contract.bzl`) takes `nodes`, `config`
 (`robot_field.toml`) and `config_files`; the robot's BUILD passes the hardware
@@ -26,9 +31,16 @@ subsystems' nodes and its hardware node, `[robot] hardware_node` or by default
 | `bin/` | node binaries; a Python node's runfiles beside it (its wheels, e.g. `robotpy-wpimath` and `gtsam`, and `libtalos_node.so`) |
 | `lib/` | any shared libraries C++ nodes link, one copy per name; no C++ WPILib libraries are staged. `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
 | `config/` | `robot_field.toml` and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
-| `bundle_manifest.toml` | node names, targets, binaries, languages, config SHA-256 |
+| `bundle_manifest.toml` | node names, targets, binaries, each binary's SHA-256 (`binary_sha256`), languages, config SHA-256; in a stamped build `git_revision` and `git_dirty` |
 
-The config SHA-256 (`config_sha256`, copied into every session manifest) is
+The launcher copies `config_sha256`, `git_revision` and `git_dirty` into every
+session manifest, and records each member's binary SHA-256 again when the
+session starts ([session manifest](../talOS/launcher/README.md#session-manifest)).
+A digest covers only the file under `bin/`: not a C++ node's shared libraries
+in `lib/`, nor a Python node's runfiles beside its entry script. The bundle's
+revision covers those.
+
+The config SHA-256 is
 the identity of the staged config: every file under `config/`, the robot
 config included, contributes its path relative to `config/` and its bytes.
 Absolute and workspace locations never participate, so moving the whole

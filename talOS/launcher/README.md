@@ -466,6 +466,16 @@ anything starts.
 `<output_dir>/<session_id>/manifest.json` says what ran and how each run
 ended (when it is written: [session segments and logs](#session-segments-and-logs)).
 
+- `config_path`: the config, made absolute against the launcher's working
+  directory (also in `graph.json`, and passed to every member as `--config`).
+- `config_sha256`, `git_revision`, `git_dirty`: the bundle's config identity
+  and the source revision of a `--config=release` build
+  ([deployment](../../docs/DEPLOYMENT.md#build-a-bundle)); empty (and
+  `false`) outside a bundle or for an unstamped one. The RoboRIO program's
+  build is not recorded.
+- per node, `binary_sha256`: the SHA-256 of `binary_path` as the session
+  starts, empty if it cannot be read. It covers that file only: not the
+  shared libraries a C++ node loads, nor a Python node's runfiles.
 - per node, `runs`: one entry per run, spawn failures included: `pid` (-1
   when the spawn failed), `start_wall_ns`, `end_wall_ns` (0 while it runs),
   `exit_code`, `exit_signal` (as for the node's last run, above) and `reason`.
@@ -499,8 +509,9 @@ bazel run //talOS/launcher:launcher -- --config <path-to>/robot.toml --describe-
 Node targets resolve to `bazel-bin/<package>/<target>`, unless an override
 names the binary. A bundle's `bundle_manifest.toml` (written by
 `talOS/build/bundle_builder.py`, loaded by `--bundle` or found in the working
-directory) lists each node's name, targets, `bin/` copy and language,
-plus the config path and its SHA-256. The launcher also reads a
+directory) lists each node's name, targets, `bin/` copy, its SHA-256 and
+language, plus the config path and its SHA-256, and in a stamped build the
+source revision ([session manifest](#session-manifest)). The launcher also reads a
 workspace-relative config, so outside a bundle it only makes sense with the
 workspace as its working directory; `bazel run` starts a binary in its
 runfiles tree instead, and `main.cc` chases `BUILD_WORKSPACE_DIRECTORY` back so
@@ -596,9 +607,10 @@ decoded payloads, and summary. Paths can be combined with:
 - `--config robot.toml`: the config whose device names label the hardware
   packets (below). Without it, `log_dump` reads the `config_path` of the
   `manifest.json` in a session directory it was given, when that file still
-  parses; otherwise devices are identified by logical id only. A relative
-  path is resolved against `BUILD_WORKING_DIRECTORY` under `bazel run`, else
-  the working directory.
+  parses; otherwise devices are identified by logical id only. The launcher
+  records it absolute; a relative path (from a manifest written before it
+  did, or given here) is resolved against `BUILD_WORKING_DIRECTORY` under
+  `bazel run`, else the working directory.
 
 Repeat `--node` or `--topic`, or separate their values with commas, to select
 alternatives within that filter. Different filters are combined with AND.
@@ -668,9 +680,9 @@ bazel run //talOS/launcher:session_report -- --json /tmp/logs/session
 
 The offline Python tool reuses `log_dump` and its events reader/embedded
 descriptor decoder, without robot-specific schemas. It reports manifest config
-identity, node exits/restarts/quarantine/recorder failures/caps, each
-node's runs with the reason each ended ([session manifest](#session-manifest)),
-an unfinished
+identity and source revision, node exits/restarts/quarantine/recorder
+failures/caps, each node's binary digest and runs with the reason each ended
+([session manifest](#session-manifest)), an unfinished
 session, state inter-arrival median/nearest-rank p99/max,
 enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
 lateness, and every scalar `/hw/status` field.

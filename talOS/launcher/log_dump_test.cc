@@ -197,8 +197,9 @@ TEST_F(LogDumpTest, JsonExportsCompletePayloadBeyondDisplayHexLimit) {
 
 // A recorded request reads by device name from the config the session's
 // manifest names, with no flag; the bytes stay in payload_hex. A relative
-// config_path (sim.sh records one) is relative to where `bazel run` was run,
-// not to log_dump's runfiles directory.
+// config_path (as manifests written before the launcher recorded it absolute
+// hold) is relative to where `bazel run` was run, not to log_dump's runfiles
+// directory.
 TEST_F(LogDumpTest, HardwarePacketsDecodeWithTheSessionConfig) {
   constexpr std::string_view kToml = R"(
 [robot]

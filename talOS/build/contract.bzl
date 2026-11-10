@@ -1,5 +1,6 @@
 """Talos contract build rules and macros for FlatBuffers and multi-language messages."""
 
+load("@aspect_bazel_lib//lib:stamping.bzl", "STAMP_ATTRS", "maybe_stamp")
 load("@flatbuffers//:build_defs.bzl", "DEFAULT_INCLUDE_PATHS", "flatbuffer_cc_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
@@ -818,19 +819,28 @@ def _talos_bundle_impl(ctx):
     )
 
     direct_inputs.append(spec_file)
+    arguments = [
+        "--spec",
+        spec_file.path,
+        "--resolved",
+        resolved.path,
+        "--out",
+        bundle_dir.path,
+    ]
+
+    # The source revision only under --stamp (--config=release): the status
+    # file changes with every commit, so an unstamped bundle never reads it
+    # and stays cached.
+    stamp = maybe_stamp(ctx)
+    if stamp:
+        direct_inputs.append(stamp.stable_status_file)
+        arguments += ["--stable-status", stamp.stable_status_file.path]
 
     ctx.actions.run(
         executable = ctx.attr._builder[DefaultInfo].files_to_run,
         outputs = [bundle_dir],
         inputs = depset(direct = direct_inputs, transitive = transitive_inputs),
-        arguments = [
-            "--spec",
-            spec_file.path,
-            "--resolved",
-            resolved.path,
-            "--out",
-            bundle_dir.path,
-        ],
+        arguments = arguments,
         mnemonic = "TalosBundle",
         progress_message = "Assembling Talos bundle %s" % ctx.label.name,
     )
@@ -899,7 +909,7 @@ exec "${{BUNDLE_DIR}}/run.sh" "$@"
 _talos_bundle = rule(
     implementation = _talos_bundle_impl,
     executable = True,
-    attrs = {
+    attrs = dict({
         "nodes": attr.label_list(
             mandatory = True,
             doc = "Every node the config launches, each providing TalosNodeInfo or DefaultInfo: " +
@@ -942,7 +952,7 @@ _talos_bundle = rule(
             executable = True,
             cfg = "exec",
         ),
-    },
+    }, **STAMP_ATTRS),
 )
 
 def talos_bundle(name, config, **kwargs):
@@ -951,6 +961,10 @@ def talos_bundle(name, config, **kwargs):
     The build fails when the config's generated manifest is stale, or when
     `nodes` is not the hardware node ([robot] hardware_node, default
     //talOS/bridge:hardware_node) plus the manifest's NODES.
+
+    bundle_manifest.toml records each node binary's SHA-256 and, in a --stamp
+    build (--config=release), the source revision and dirty flag that
+    tools/workspace_status.sh reports.
 
     Args:
       name: bundle target name.

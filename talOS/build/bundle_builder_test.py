@@ -1,5 +1,6 @@
 """Tests bundle_builder.py's check of a bundle's nodes against its config,
-its config staging (relative layout and identity), its staging of runfiles
+its config staging (relative layout and identity), its manifest's binary
+digests and stamped revision, its staging of runfiles
 and of C++ nodes' shared libraries in lib/ and its run.sh, and
 tools/deploy.sh's bundle selection, pruning and session commands."""
 
@@ -32,11 +33,11 @@ def node(tmp, name, target=None):
 
 
 class BundleBuilderTest(unittest.TestCase):
-    def assemble(self, tmp, files, nodes, launches, robot=None):
+    def assemble(self, tmp, files, nodes, launches, robot=None, extra=()):
         """Runs the builder on `files` ({short_path: text}; the first is the
         config) and the node specs `nodes`, for a config whose subsystems
         launch the labels `launches` and whose effective [robot] table is
-        `robot`. Returns the finished process."""
+        `robot`, with `extra` arguments. Returns the finished process."""
         src = os.path.join(tmp, "src")
         entries = []
         for short_path, text in files.items():
@@ -58,10 +59,10 @@ class BundleBuilderTest(unittest.TestCase):
         builder = runfiles.Create().Rlocation("_main/talOS/build/bundle_builder.py")
         return subprocess.run([sys.executable, builder, "--spec", spec,
                                "--resolved", resolved,
-                               "--out", os.path.join(tmp, "out")],
+                               "--out", os.path.join(tmp, "out"), *extra],
                               capture_output=True, text=True)
 
-    def build(self, tmp, files, nodes=(), check=True):
+    def build(self, tmp, files, nodes=(), check=True, extra=()):
         """Bundles `files` ({short_path: text}); the first is the config.
         `nodes`: {name: {library basename: bytes}} C++ nodes and the shared
         libraries each links, which the config launches beside the default
@@ -76,7 +77,7 @@ class BundleBuilderTest(unittest.TestCase):
             specs.append(spec)
         proc = self.assemble(tmp, files,
                              [node(tmp, "hardware_node", HARDWARE_NODE)] + specs,
-                             [spec["target"] for spec in specs])
+                             [spec["target"] for spec in specs], extra=extra)
         if not check:
             return proc
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -141,6 +142,23 @@ class BundleBuilderTest(unittest.TestCase):
                 {"c/robot.toml": "[robot]\nx\n", "c/subsystems/a.toml": ""}):
             with self.subTest(changed):
                 self.assertNotEqual(sha(base), sha(changed))
+
+    def test_manifest_records_binary_digests_and_the_stamped_revision(self):
+        empty_sha256 = ("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b"
+                        "7852b855")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, manifest = self.build(tmp, {"c/robot.toml": "[robot]\n"})
+            self.assertIn(f'binary_sha256 = "{empty_sha256}"', manifest)
+            # Unstamped: no revision rather than a stale or made-up one.
+            self.assertNotIn("git_revision", manifest)
+        with tempfile.TemporaryDirectory() as tmp:
+            status = os.path.join(tmp, "stable-status.txt")
+            put(status, "BUILD_HOST h\nSTABLE_GIT_COMMIT 0123abcd\n"
+                "STABLE_GIT_DIRTY 1\n")
+            _, manifest = self.build(tmp, {"c/robot.toml": "[robot]\n"},
+                                     extra=("--stable-status", status))
+            self.assertIn('git_revision = "0123abcd"', manifest)
+            self.assertIn("git_dirty = true", manifest)
 
     def test_cpp_nodes_shared_libraries_land_once_in_lib(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -844,6 +844,33 @@ TEST(Supervision, SignalDeathRecordsTheSignal) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// A session records its config as an absolute path, in manifest.json and
+// graph.json, even when --config was relative: a relative one names nothing
+// once the launcher's working directory is forgotten.
+TEST(Supervision, ConfigPathIsRecordedAbsolute) {
+  LauncherOptions options = BaseOptions("absolute_config");
+  options.max_restarts = 0;
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("absolute_config_alpha", "exit 0\n", "alpha");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("absolute_config_beta", "exit 0\n");
+  const std::filesystem::path config = options.config_path;
+  const auto cwd = std::filesystem::current_path();
+  std::filesystem::current_path(config.parent_path());
+  options.config_path = config.filename().string();
+  // The working directory as getcwd spells it, symlinks resolved.
+  const auto expected = std::filesystem::current_path() / config.filename();
+  RunSession(options);
+  std::filesystem::current_path(cwd);
+
+  const std::string absolute = "\"config_path\": \"" + expected.string() + "\"";
+  EXPECT_NE(ReadFile(options.output_dir + "/manifest.json").find(absolute),
+            std::string::npos);
+  EXPECT_NE(ReadFile(options.output_dir + "/graph.json").find(absolute),
+            std::string::npos);
+  std::filesystem::remove_all(options.output_dir);
+}
+
 // A node's output never waits for the launcher's stdout: alpha writes 2 MiB
 // to stdout while the launcher's stdout is a pipe nobody reads, then records
 // that it got past the write. Inherited, that stdout would block it at 64 KiB.

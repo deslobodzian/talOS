@@ -105,12 +105,31 @@ def check_nodes(spec, resolved):
             [f"  in nodes but not launched: {label}" for label in extra]))
 
 
+def source_revision(path):
+    """The bundle_manifest.toml lines naming the source revision, from a --stamp
+    build's stable status file (tools/workspace_status.sh); none when it has
+    no STABLE_GIT_COMMIT (no git checkout, or no --workspace_status_command)."""
+    status = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            key, _, value = line.rstrip("\n").partition(" ")
+            status[key] = value
+    revision = status.get("STABLE_GIT_COMMIT", "")
+    if not revision:
+        return []
+    dirty = status.get("STABLE_GIT_DIRTY", "0") != "0"
+    return [f"git_revision = {json.dumps(revision)}",
+            f"git_dirty = {'true' if dirty else 'false'}"]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Assemble a Talos robot bundle.")
     parser.add_argument("--spec", required=True, help="Path to JSON specification")
     parser.add_argument("--resolved", required=True,
                         help="The configuration resolver's JSON for the config")
     parser.add_argument("--out", required=True, help="Output bundle directory")
+    parser.add_argument("--stable-status",
+                        help="Bazel's stable status file, in a --stamp build")
     args = parser.parse_args()
 
     with open(args.spec, "r") as f:
@@ -234,10 +253,13 @@ def main():
             elif seen[0] != digest:
                 sys.exit(f"bundle: nodes '{seen[1]}' and '{name}' link different "
                          f"shared libraries named {lib['name']}")
+        with open(bin_dest, "rb") as f:
+            binary_sha256 = hashlib.sha256(f.read()).hexdigest()
         manifest_nodes.append({
             "name": name,
             "targets": node_targets(node),
             "binary": bin_rel,
+            "binary_sha256": binary_sha256,
             "language": lang,
         })
 
@@ -248,6 +270,8 @@ def main():
         f"config_path = {json.dumps(config_rel)}",
         f"config_sha256 = {json.dumps(config_sha256)}",
     ]
+    if args.stable_status:
+        lines += source_revision(args.stable_status)
     for entry in manifest_nodes:
         lines += [
             "",
@@ -255,6 +279,7 @@ def main():
             f"name = {json.dumps(entry['name'])}",
             f"targets = [{', '.join(json.dumps(t) for t in entry['targets'])}]",
             f"binary = {json.dumps(entry['binary'])}",
+            f"binary_sha256 = {json.dumps(entry['binary_sha256'])}",
             f"language = {json.dumps(entry['language'])}",
         ]
     with open(os.path.join(out_dir, "bundle_manifest.toml"), "w") as f:

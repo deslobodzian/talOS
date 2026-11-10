@@ -97,10 +97,11 @@ test('parseManifest accepts string uint64 and missing optional flags', () => {
   assert.equal(m.nodes[0].exit_signal, 0);
 });
 
-test('parseManifest reads run history; older manifests lack it', () => {
+test('parseManifest reads run history and code identity; older manifests lack them', () => {
   const nodeJson = {
-    name: 'n', target: 't', binary_path: 'b', log_path: 'l', log_paths: ['l'],
-    pid: 8, exit_code: -1, restart_count: 1, record_count: 0, runs_dropped: 3,
+    name: 'n', target: 't', binary_path: 'b', binary_sha256: 'ff', log_path: 'l',
+    log_paths: ['l'], pid: 8, exit_code: -1, restart_count: 1, record_count: 0,
+    runs_dropped: 3,
     runs: [{pid: 7, start_wall_ns: 1735689600000000000,
             end_wall_ns: 1735689601000000000, exit_code: -1, exit_signal: 9,
             reason: 'stalled'},
@@ -109,18 +110,23 @@ test('parseManifest reads run history; older manifests lack it', () => {
   };
   const document = {
     session_id: '1', config_path: '/robot.toml', config_sha256: 'abc',
-    output_dir: '/tmp/session', simulation: false, start_wall_ns: '1',
-    end_wall_ns: '0', nodes: [nodeJson]
+    git_revision: '0123abcd', git_dirty: true, output_dir: '/tmp/session',
+    simulation: false, start_wall_ns: '1', end_wall_ns: '0', nodes: [nodeJson]
   };
   const m = parseManifest(JSON.stringify(document));
   // The top-level times, not a run's, which follow them in the text.
   assert.equal(m.start_wall_ns, '1');
   assert.equal(m.end_wall_ns, '0');
+  assert.equal(m.git_revision, '0123abcd');
+  assert.equal(m.git_dirty, true);
+  assert.equal(m.nodes[0].binary_sha256, 'ff');
   assert.equal(m.nodes[0].runs_dropped, 3);
   assert.deepEqual(m.nodes[0].runs!.map(r => [r.pid, r.exit_signal, r.reason]),
                    [[7, 9, 'stalled'], [8, 0, 'running']]);
-  const {runs: _runs, runs_dropped: _dropped, ...old} = nodeJson;
-  const legacy = parseManifest(JSON.stringify({...document, nodes: [old]}));
+  const {runs: _runs, runs_dropped: _dropped, binary_sha256: _sha, ...old} = nodeJson;
+  const {git_revision: _rev, git_dirty: _dirty, ...older} = document;
+  const legacy = parseManifest(JSON.stringify({...older, nodes: [old]}));
+  assert.equal(legacy.git_revision, undefined);
   assert.equal(legacy.nodes[0].runs, undefined);
   assert.throws(() => parseManifest(JSON.stringify(
       {...document, nodes: [{...nodeJson, runs: [{pid: 1}]}]})));

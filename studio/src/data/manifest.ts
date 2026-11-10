@@ -25,6 +25,7 @@ export type ManifestNode = {
   target: string;
   binary_path: string;
   // Absent in manifests written before the launcher recorded them.
+  binary_sha256?: string;
   runs?: ManifestRun[];
   runs_dropped?: number;
   log_path: string;
@@ -46,6 +47,9 @@ export type SessionManifest = {
   session_id: string;
   config_path: string;
   config_sha256: string;
+  // A --config=release bundle's source revision; absent in older manifests.
+  git_revision?: string;
+  git_dirty?: boolean;
   output_dir: string;
   simulation: boolean;
   start_wall_ns: string;
@@ -193,6 +197,8 @@ function parseNode(value: unknown, where: string): ManifestNode {
     name: str(source, 'name'),
     target: str(source, 'target'),
     binary_path: path(source, 'binary_path'),
+    ...('binary_sha256' in source ?
+            {binary_sha256: str(source, 'binary_sha256')} : {}),
     ...(runs ? {runs, runs_dropped: countNumber(source, 'runs_dropped')} : {}),
     log_path: path(source, 'log_path'),
     log_paths: list(source, 'log_paths', MAX_LOG_PATHS).map((entry, i) => {
@@ -220,6 +226,9 @@ export function parseManifest(raw: string): SessionManifest {
       session_id: u64Field(raw, source, 'session_id'),
       config_path: path(source, 'config_path'),
       config_sha256: path(source, 'config_sha256'),
+      ...('git_revision' in source ?
+              {git_revision: str(source, 'git_revision'),
+               git_dirty: flag(source, 'git_dirty')} : {}),
       output_dir: path(source, 'output_dir'),
       simulation: bool(source, 'simulation'),
       start_wall_ns: u64Field(raw, source, 'start_wall_ns'),
