@@ -4,6 +4,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -86,6 +87,39 @@ uint64_t NodeConfigId(const talos::config::RobotConfig& cfg) {
   Config hw = cfg.hardware;
   hw.commissioned = true;
   return ConfigurationId(hw);
+}
+
+// The launcher kills a node whose heartbeat or dispatch count stops for its
+// stall timeout (500 ms for the bridge). Run() must refresh them far more often
+// than its 250 ms counter publish, or a 300 ms pause on top of an old sample
+// reads as a stall.
+TEST(HardwareNodeTest, RunKeepsRegistryHeartbeatCurrent) {
+  auto cfg = talos::config::ParseRobotConfigString(kTestToml);
+  HardwareNode node{cfg, "127.0.0.1", TestPort(26300), TestPort(26301), true};
+  ASSERT_TRUE(node.Open());
+  std::thread runner([&node] { node.Run(1); });
+  std::optional<introspect::RegistryReader> reader;
+  std::int64_t worst_age_ns = 0;
+  int samples = 0;
+  const auto end = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+  while (std::chrono::steady_clock::now() < end) {
+    if (!reader) reader = introspect::RegistryReader::open();
+    if (reader) {
+      for (const auto& row : reader->nodes()) {
+        if (row.name != kNodeName ||
+            row.pid != static_cast<std::uint64_t>(getpid()) ||
+            row.heartbeat_monotonic_ns == 0)
+          continue;
+        worst_age_ns = std::max(worst_age_ns, introspect::monotonic_now_ns() -
+                                                  row.heartbeat_monotonic_ns);
+        ++samples;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  runner.join();
+  ASSERT_GT(samples, 100);
+  EXPECT_LT(worst_age_ns, 50'000'000);
 }
 
 TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {

@@ -249,15 +249,7 @@ void HardwareNode::BuildIntrospectionManifest() {
   }
 }
 
-void HardwareNode::PublishIntrospection() {
-  if (!registration_) {
-    return;
-  }
-
-  // One sample; see NodeRegistration::begin_sample.
-  registration_->begin_sample();
-  registration_->heartbeat();
-
+std::uint64_t HardwareNode::DispatchCount() const {
   // Every message this node moved, which is the sum of its per-topic counters.
   // Subsystem requests belong in it: dropping them was what let the aliased
   // /hw/req/drive traffic go uncounted for as long as it did.
@@ -267,7 +259,26 @@ void HardwareNode::PublishIntrospection() {
   for (const auto& [name, tracker] : subsystems_) {
     dispatches += tracker.requests;
   }
-  registration_->set_dispatch_count(dispatches);
+  return dispatches;
+}
+
+void HardwareNode::RefreshLiveness() {
+  if (!registration_) return;
+  registration_->begin_sample();
+  registration_->heartbeat();
+  registration_->set_dispatch_count(DispatchCount());
+  registration_->end_sample();
+}
+
+void HardwareNode::PublishIntrospection() {
+  if (!registration_) {
+    return;
+  }
+
+  // One sample; see NodeRegistration::begin_sample.
+  registration_->begin_sample();
+  registration_->heartbeat();
+  registration_->set_dispatch_count(DispatchCount());
   if (log_) registration_->set_recording(log_->failed(), log_->capped());
 
   const auto set = [this](std::size_t index, std::uint64_t events) {
@@ -692,12 +703,18 @@ int HardwareNode::Run(int duration_s) {
         static_cast<uint64_t>(talos::event::Poller::now().nanos() / 1000);
     Tick(now_us);
 
-    // Four times a second: often enough that the registry never looks stale,
-    // rare enough that it costs nothing against a 1 kHz tick.
+    // The per-source counters four times a second, which is enough for a
+    // viewer. Heartbeat and dispatch count every 10 ms, as the reporter thread
+    // does for event-loop nodes: the launcher's stall check samples them, and
+    // a sample up to 250 ms old plus a short pause would read as a stall.
     const auto steady_now = std::chrono::steady_clock::now();
     if (steady_now >= next_introspection_) {
       PublishIntrospection();
       next_introspection_ = steady_now + std::chrono::milliseconds{250};
+      next_liveness_ = steady_now + std::chrono::milliseconds{10};
+    } else if (steady_now >= next_liveness_) {
+      RefreshLiveness();
+      next_liveness_ = steady_now + std::chrono::milliseconds{10};
     }
 
     next_tick += std::chrono::microseconds{kTickPeriodUs};

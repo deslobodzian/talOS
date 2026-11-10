@@ -118,6 +118,12 @@ class HardwareNode {
   void PublishIntrospection();
 
  private:
+  // The sum of the per-topic counters: the registry's dispatch count.
+  std::uint64_t DispatchCount() const;
+  // Heartbeat and dispatch count alone, one registry sample; Run() calls it
+  // every 10 ms between PublishIntrospection() calls.
+  void RefreshLiveness();
+
   // Describes this node to the live registry. The hardware node predates the
   // event loop and drives its own tick, so it has no manifest to hand over --
   // it declares one, in the order Open() creates the transports.
@@ -192,6 +198,7 @@ class HardwareNode {
   bool log_failure_reported_{false};
   State latest_state_{};
   std::chrono::steady_clock::time_point next_introspection_{};
+  std::chrono::steady_clock::time_point next_liveness_{};
 
   bool is_configured_{false};
   uint64_t last_boot_id_{0};
