@@ -529,8 +529,6 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
     const CameraIntrinsics& intrinsics,
     const PoseValidationOptions& options = {},
     const PoseSolverOptions& solver_options = {}) {
-  std::vector<const TagDetection3D*> tags;
-  tags.reserve(observations.size());
   RobotPoseEstimate out;
   out.camera_id = camera_id;
   auto reject = [&](PoseInvalidReason reason, const char* message) {
@@ -550,49 +548,151 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
       noise.mount_translation_std_m < 0)
     return reject(PoseInvalidReason::kInvalidCovariance,
                   "Invalid solver noise");
+  // Layout ids are unique, so a repeated id is at most one real tag; the rest
+  // are false decodes or printed copies elsewhere in view. Each id, in the
+  // detector's order of first appearance, keeps its kMaxDetectionsPerId
+  // strongest usable decodes (higher decision margin, then lower per-tag
+  // reprojection error), strongest first, as candidates for the seed search.
+  constexpr std::size_t kMaxDetectionsPerId = 3;
+  struct TagCandidates {
+    int tag_id{-1};
+    std::size_t count{0}, chosen{0}, first_pixel{0};
+    std::array<const TagDetection3D*, kMaxDetectionsPerId> detections{};
+    const TagDetection3D& Chosen() const { return *detections[chosen]; }
+  };
+  auto stronger = [](const TagDetection3D& a, const TagDetection3D& b) {
+    return a.decision_margin > b.decision_margin ||
+           (a.decision_margin == b.decision_margin &&
+            a.reprojection_error < b.reprojection_error);
+  };
+  std::vector<TagCandidates> ids;
+  ids.reserve(observations.size());
   for (const auto& t : observations) {
     const double d = t.T_camera_tag.translation().norm();
     if (!t.valid || !layout.HasTag(t.tag_id) || !std::isfinite(d) ||
         d < options.min_distance_m || d > options.max_distance_m ||
         t.T_camera_tag.translation().z() <= options.min_z_m)
       continue;
-    // Layout ids are unique, so a repeated id is at most one real tag: keep
-    // the stronger decode (higher decision margin, then lower per-tag
-    // reprojection error) wherever the detector listed it.
-    const auto same =
-        std::find_if(tags.begin(), tags.end(),
-                     [&](const auto* q) { return q->tag_id == t.tag_id; });
-    if (same == tags.end()) {
-      tags.push_back(&t);
-    } else if (t.decision_margin > (*same)->decision_margin ||
-               (t.decision_margin == (*same)->decision_margin &&
-                t.reprojection_error < (*same)->reprojection_error)) {
-      *same = &t;
+    auto id = std::find_if(ids.begin(), ids.end(),
+                           [&](const auto& c) { return c.tag_id == t.tag_id; });
+    if (id == ids.end()) {
+      ids.push_back({.tag_id = t.tag_id});
+      id = ids.end() - 1;
     }
+    std::size_t slot = id->count;
+    while (slot > 0 && stronger(t, *id->detections[slot - 1])) --slot;
+    if (slot == kMaxDetectionsPerId) continue;  // weaker than every kept one
+    for (std::size_t k = std::min(id->count, kMaxDetectionsPerId - 1); k > slot;
+         --k)
+      id->detections[k] = id->detections[k - 1];
+    id->detections[slot] = &t;
+    id->count = std::min(id->count + 1, kMaxDetectionsPerId);
   }
-  double distance_sum = 0;
-  for (const auto* t : tags)
-    distance_sum += t->T_camera_tag.translation().norm();
-  if (tags.empty() || !intrinsics.IsValid())
+  if (ids.empty() || !intrinsics.IsValid())
     return reject(PoseInvalidReason::kDegenerateHomography,
                   "No usable PnP seed");
 
+  // Field corners, four per id, and the undistorted image corners of every
+  // candidate detection, four each, starting at its id's first_pixel.
   std::vector<Eigen::Vector3d> points;
-  std::vector<Eigen::Vector2d> pixels;
-  points.reserve(4 * tags.size());
-  pixels.reserve(4 * tags.size());
-  for (const auto* t : tags) {
-    const auto field = *layout.GetTagPose(t->tag_id);
-    const auto corners = GetTagModelCorners(layout.GetTagSize(t->tag_id));
-    for (std::size_t j = 0; j < 4; ++j) {
-      points.push_back(field.act(corners[j]));
-      pixels.push_back(intrinsics.UndistortPoint(
-          {t->corners[2 * j], t->corners[2 * j + 1]}));
+  std::vector<Eigen::Vector2d> candidate_pixels;
+  points.reserve(4 * ids.size());
+  candidate_pixels.reserve(4 * observations.size());
+  for (auto& id : ids) {
+    const auto field = *layout.GetTagPose(id.tag_id);
+    const auto corners = GetTagModelCorners(layout.GetTagSize(id.tag_id));
+    for (std::size_t j = 0; j < 4; ++j) points.push_back(field.act(corners[j]));
+    id.first_pixel = candidate_pixels.size();
+    for (std::size_t c = 0; c < id.count; ++c) {
+      const auto& t = *id.detections[c];
+      for (std::size_t j = 0; j < 4; ++j) {
+        candidate_pixels.push_back(intrinsics.UndistortPoint(
+            {t.corners[2 * j], t.corners[2 * j + 1]}));
+      }
     }
+  }
+  const auto camera_robot = mounting.T_robot_camera.inverse();
+
+  // Multi-tag: a single tag's primary is unreliable near the planar-ambiguity
+  // boundary, and a repeated id's stronger decode may be a printed copy
+  // elsewhere in view. So every pose candidate (primary and, when present,
+  // secondary) of every candidate detection proposes a robot pose, scored by
+  // the joint unweighted reprojection residual over all ids' corners (no LM),
+  // each id counting its best-fitting detection. The best proposal seeds the
+  // joint solve and picks each id's detection: a repeated id contributes the
+  // one consistent with the other tags, whatever its decode strength. A lone
+  // id has no other tag to check against and keeps its strongest decode.
+  auto joint_rms = [&](const talos::geometry::SE3<double>& T_field_robot,
+                       bool choose) {
+    const auto robot_field = T_field_robot.inverse();
+    double sum_sq = 0.0;
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      auto& id = ids[i];
+      std::array<double, kMaxDetectionsPerId> sq{};
+      for (std::size_t j = 0; j < 4; ++j) {
+        const auto p = camera_robot.act(robot_field.act(points[4 * i + j]));
+        if (!p.allFinite() || p.z() <= options.min_z_m)
+          return std::numeric_limits<double>::infinity();
+        const Eigen::Vector2d uv(intrinsics.fx * p.x() / p.z() + intrinsics.cx,
+                                 intrinsics.fy * p.y() / p.z() + intrinsics.cy);
+        for (std::size_t c = 0; c < id.count; ++c)
+          sq[c] +=
+              (uv - candidate_pixels[id.first_pixel + 4 * c + j]).squaredNorm();
+      }
+      double best = std::numeric_limits<double>::infinity();
+      for (std::size_t c = 0; c < id.count; ++c) {
+        if (sq[c] < best) {
+          best = sq[c];
+          if (choose) id.chosen = c;
+        }
+      }
+      sum_sq += best;
+    }
+    return std::sqrt(sum_sq / static_cast<double>(points.size()));
+  };
+  struct SeedCandidate {
+    talos::geometry::SE3<double> T_field_robot;
+    double residual;
+  };
+  std::vector<SeedCandidate> seeds;
+  if (ids.size() > 1) {
+    seeds.reserve(2 * observations.size());
+    for (const auto& id : ids) {
+      const auto field = *layout.GetTagPose(id.tag_id);
+      auto add = [&](const talos::geometry::SE3<double>& camera_tag) {
+        const auto robot =
+            field * camera_tag.inverse() * mounting.T_robot_camera.inverse();
+        const double residual = joint_rms(robot, /*choose=*/false);
+        if (std::isfinite(residual)) seeds.push_back({robot, residual});
+      };
+      for (std::size_t c = 0; c < id.count; ++c) {
+        const auto& t = *id.detections[c];
+        add(t.T_camera_tag);
+        if (t.secondary_reprojection_error_px >= 0.0 &&
+            std::isfinite(t.secondary_reprojection_error_px))
+          add(t.secondary_T_camera_tag);
+      }
+    }
+    if (seeds.empty())
+      return reject(PoseInvalidReason::kDegenerateHomography,
+                    "No usable PnP seed");
+    std::sort(seeds.begin(), seeds.end(), [](const auto& a, const auto& b) {
+      return a.residual < b.residual;
+    });
+    joint_rms(seeds.front().T_field_robot, /*choose=*/true);
+  }
+
+  // The joint solve fits each id's chosen detection.
+  std::vector<Eigen::Vector2d> pixels;
+  pixels.reserve(points.size());
+  double distance_sum = 0;
+  for (const auto& id : ids) {
+    distance_sum += id.Chosen().T_camera_tag.translation().norm();
+    for (std::size_t j = 0; j < 4; ++j)
+      pixels.push_back(candidate_pixels[id.first_pixel + 4 * id.chosen + j]);
   }
   const int pixel_rows = static_cast<int>(2 * points.size());
   const int rows = pixel_rows + 3;
-  const auto camera_robot = mounting.T_robot_camera.inverse();
   const auto camera_rotation = camera_robot.rotation().rotationMatrix();
   auto evaluate = [&](const auto& pose, Eigen::VectorXd& residual,
                       Eigen::MatrixXd* jacobian) {
@@ -705,8 +805,8 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
       return est;
     }
     est.tag_id = -1;
-    est.tag_count = static_cast<int>(tags.size());
-    est.average_distance_m = distance_sum / static_cast<double>(tags.size());
+    est.tag_count = static_cast<int>(ids.size());
+    est.average_distance_m = distance_sum / static_cast<double>(ids.size());
     est.reprojection_error_px =
         noise.pixel_std_px * std::sqrt(residual.head(pixel_rows).squaredNorm() /
                                        static_cast<double>(points.size()));
@@ -740,8 +840,8 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
   // A single tag keeps the ComputeRobotFieldPose path so the ambiguity gate
   // (and the floor-disambiguation override) decides the observation; the LM
   // then only refines and computes covariance.
-  if (tags.size() == 1) {
-    const auto& t = *tags.front();
+  if (ids.size() == 1) {
+    const auto& t = ids.front().Chosen();
     auto seed = ComputeRobotFieldPose(
         t.tag_id, camera_id, t.T_camera_tag, mounting, layout,
         t.reprojection_error, t.ambiguity, options, &t.secondary_T_camera_tag,
@@ -752,50 +852,6 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
     result.ambiguity = t.ambiguity;
     return result;
   }
-
-  // Multi-tag: a single tag's primary is unreliable near the planar-ambiguity
-  // boundary, so evaluate every pose candidate (primary and secondary, when
-  // present) of every tag by the joint unweighted reprojection residual over
-  // all tags' corners (no LM), and seed the joint solve from the best.
-  auto joint_rms = [&](const talos::geometry::SE3<double>& T_field_robot) {
-    const auto robot_field = T_field_robot.inverse();
-    double sum_sq = 0.0;
-    for (size_t i = 0; i < points.size(); ++i) {
-      const auto p = camera_robot.act(robot_field.act(points[i]));
-      if (!p.allFinite() || p.z() <= options.min_z_m)
-        return std::numeric_limits<double>::infinity();
-      const double u = intrinsics.fx * p.x() / p.z() + intrinsics.cx;
-      const double v = intrinsics.fy * p.y() / p.z() + intrinsics.cy;
-      const double du = u - pixels[i].x(), dv = v - pixels[i].y();
-      sum_sq += du * du + dv * dv;
-    }
-    return std::sqrt(sum_sq / static_cast<double>(points.size()));
-  };
-  struct SeedCandidate {
-    talos::geometry::SE3<double> T_field_robot;
-    double residual;
-  };
-  std::vector<SeedCandidate> seeds;
-  seeds.reserve(2 * tags.size());
-  for (const auto* t : tags) {
-    const auto field = *layout.GetTagPose(t->tag_id);
-    auto add = [&](const talos::geometry::SE3<double>& camera_tag) {
-      const auto robot =
-          field * camera_tag.inverse() * mounting.T_robot_camera.inverse();
-      const double residual = joint_rms(robot);
-      if (std::isfinite(residual)) seeds.push_back({robot, residual});
-    };
-    add(t->T_camera_tag);
-    if (t->secondary_reprojection_error_px >= 0.0 &&
-        std::isfinite(t->secondary_reprojection_error_px))
-      add(t->secondary_T_camera_tag);
-  }
-  if (seeds.empty())
-    return reject(PoseInvalidReason::kDegenerateHomography,
-                  "No usable PnP seed");
-  std::sort(seeds.begin(), seeds.end(), [](const auto& a, const auto& b) {
-    return a.residual < b.residual;
-  });
 
   RobotPoseEstimate best_estimate = solve_from(seeds.front().T_field_robot);
   double best_score = best_estimate.validity.valid

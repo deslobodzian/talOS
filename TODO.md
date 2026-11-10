@@ -10,7 +10,6 @@ This is an **open-work list**, not a changelog. Completed work and its reasoning
 - [ ] **TIME-3 — Tick-time target age is not recorded.** `session_report` measures target receipt age for MESSAGE dispatches, not the selected target's age at a consumer tick. Add per-tick evidence before claiming tick-time target-age acceptance.
 - [ ] **POSE-1 — Make the GTSAM `factor_graph` backend the default.** `configuration/subsystems/pose_estimator.toml` selects `kalman`; `factor_graph` is to become the default. `accuracy_test` already gates both backends on identical replays, and the node tests cover GTSAM failure containment and relocalization at the 1.5 s lag. Remaining before the switch: measure the worst-case `update()` duration (odometry plus four camera observations) on the deployment Mac mini within the 20 ms period.
 - [ ] **MAC-1 — Build and run the full suite on macOS.** The RTMS process-identity check has a macOS branch (`sysctl` `KERN_PROC_PID` start time in `talOS/rtms/rtms.cc`) that only the macOS CI job compiles; the Mac mini is the deployment host. Also confirm INC-3's restart latency there.
-- [ ] **VISION-2 — A stronger false decode of a repeated tag id still wins.** `SolveMultiTagRobotPose` keeps the repeated id with the higher decision margin; a printed copy of a field tag elsewhere can outscore the real one. Check each repeated detection against the other tags' fit before choosing.
 
 ## Unresolved incidents — investigate, do not declare fixed by a rerun
 

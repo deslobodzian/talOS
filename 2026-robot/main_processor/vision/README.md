@@ -73,9 +73,14 @@ distance no greater than the threshold, as well as passing geometric validity
 checks. Failed decode-quality checks mark the detection
 invalid, excluding it from both visibility counts and localization before range
 filtering or pose solving. A high margin alone does not guarantee a valid pose.
-A tag id decoded more than once in one frame enters localization once, as the
-detection with the higher decision margin (then the lower per-tag reprojection
-error).
+A tag id decoded more than once in one frame (a false decode, or a printed copy
+of a field tag elsewhere in view) enters localization once, as one of its three
+strongest decodes (higher decision margin, then lower per-tag reprojection
+error). Beside other ids it is the decode consistent with them, whatever its
+margin: each detection's single-tag poses propose robot poses, each scored by
+the joint reprojection residual with every id at its best-fitting decode, and
+the best proposal decides. A repeated id alone in the frame has nothing to
+check against and keeps its strongest decode.
 
 ## Frame recording
 

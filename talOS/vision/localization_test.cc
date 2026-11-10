@@ -656,20 +656,39 @@ TEST(LocalizationTest, InvalidDetectionCannotEnterJointSolve) {
   EXPECT_DOUBLE_EQ(mixed.std_devs.x_std_m, single.std_devs.x_std_m);
 }
 
-TEST(LocalizationTest, RepeatedTagIdKeepsTheStrongerDecode) {
-  // A weaker false decode repeating a real tag's id, listed first, must not
-  // stand in for that tag's corners in the joint solve.
-  JointFixture fixture(3, 2);
-  for (auto& tag : fixture.tags) tag.decision_margin = 80;
-  auto decoy = fixture.tags.front();
-  decoy.decision_margin = 40;
-  for (auto& coordinate : decoy.corners) coordinate += 40;
-  fixture.tags.insert(fixture.tags.begin(), decoy);
-  const auto result = fixture.Solve();
-  ASSERT_TRUE(result.validity.valid) << result.validity.message;
-  EXPECT_EQ(result.tag_count, 2);
-  EXPECT_TRUE(
-      result.T_field_robot.matrix().isApprox(fixture.robot.matrix(), 1e-4));
+TEST(LocalizationTest, RepeatedTagIdKeepsTheDetectionConsistentWithTheFrame) {
+  // A printed copy of tag 1 elsewhere in view decodes as a second tag 1 with
+  // its own consistent single-tag pose. Beside another tag, the copy must lose
+  // even with the stronger decode; a lone id has nothing to contradict either
+  // detection, so the stronger decode, here the real tag, is kept.
+  struct Case {
+    int tag_count;
+    float decoy_margin;
+  };
+  for (const Case c : {Case{2, 120}, Case{1, 40}}) {
+    SCOPED_TRACE(testing::Message() << c.tag_count << " tags, decoy margin "
+                                    << c.decoy_margin << " vs 80");
+    JointFixture fixture(3, c.tag_count);
+    for (auto& tag : fixture.tags) tag.decision_margin = 80;
+    auto decoy = fixture.tags.front();
+    decoy.decision_margin = c.decoy_margin;
+    decoy.T_camera_tag = SolverTagFrameToLayoutFrame(JointFixture::Pose(
+        talos::geometry::SO3<double>::Exp({0.1, 0.2, 0.05}), {0.6, 0.1, 2.6}));
+    const auto corners = GetTagModelCorners(fixture.layout.GetTagSize(1));
+    for (size_t j = 0; j < corners.size(); ++j) {
+      Eigen::Vector2d uv;
+      ASSERT_TRUE(
+          fixture.intr.ProjectPoint(decoy.T_camera_tag.act(corners[j]), &uv));
+      decoy.corners[2 * j] = static_cast<float>(uv.x());
+      decoy.corners[2 * j + 1] = static_cast<float>(uv.y());
+    }
+    fixture.tags.insert(fixture.tags.begin(), decoy);
+    const auto result = fixture.Solve();
+    ASSERT_TRUE(result.validity.valid) << result.validity.message;
+    EXPECT_EQ(result.tag_count, c.tag_count);
+    EXPECT_TRUE(
+        result.T_field_robot.matrix().isApprox(fixture.robot.matrix(), 1e-4));
+  }
 }
 
 void ExpectReplayedSingleTagRejected(const std::array<float, 8>& corners,
