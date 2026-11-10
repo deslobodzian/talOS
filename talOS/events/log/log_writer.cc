@@ -1,13 +1,24 @@
 #include "talOS/events/log/log_writer.h"
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <system_error>
 #include <utility>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
+#else
+#include <sched.h>
+#endif
 
 #include "talOS/process/durable_sync.h"
 
@@ -19,7 +30,106 @@ std::span<const std::byte> as_bytes(const void* data, std::size_t size) {
   return {reinterpret_cast<const std::byte*>(data), size};
 }
 
+// Puts the calling thread (the writer) under the normal time-sharing policy.
+// A thread created by one running under process::ConfigureRealtime inherits
+// SCHED_FIFO on Linux; the writer must not preempt control loops to write a
+// log. Best effort: leaving realtime needs no privilege, and a refusal is
+// reported to stderr, not as a log fault.
+void UseNormalScheduling() noexcept {
+#if defined(__APPLE__)
+  // Whether or not a time-constraint policy reached this thread, the
+  // standard policy replaces it.
+  thread_standard_policy_data_t policy{};
+  const kern_return_t result = ::thread_policy_set(
+      ::pthread_mach_thread_np(::pthread_self()), THREAD_STANDARD_POLICY,
+      reinterpret_cast<thread_policy_t>(&policy), THREAD_STANDARD_POLICY_COUNT);
+  if (result != KERN_SUCCESS) {
+    std::fprintf(stderr, "talos: log writer kept its scheduling policy (%d)\n",
+                 static_cast<int>(result));
+  }
+#else
+  int current = SCHED_OTHER;
+  sched_param param{};
+  if (::pthread_getschedparam(::pthread_self(), &current, &param) == 0 &&
+      current == SCHED_OTHER) {
+    return;
+  }
+  param = sched_param{};
+  param.sched_priority = 0;
+  const int result =
+      ::pthread_setschedparam(::pthread_self(), SCHED_OTHER, &param);
+  if (result != 0) {
+    std::fprintf(stderr, "talos: log writer kept its scheduling policy (%s)\n",
+                 std::strerror(result));
+  }
+#endif
+}
+
 }  // namespace
+
+#if defined(__APPLE__)
+
+LogWriter::Wakeup::Wakeup() noexcept
+    : semaphore_{::dispatch_semaphore_create(0)} {}
+
+LogWriter::Wakeup::~Wakeup() { ::dispatch_release(semaphore_); }
+
+void LogWriter::Wakeup::post() noexcept {
+  ::dispatch_semaphore_signal(semaphore_);
+}
+
+void LogWriter::Wakeup::wait_until(
+    std::chrono::steady_clock::time_point deadline) noexcept {
+  const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      deadline - std::chrono::steady_clock::now());
+  ::dispatch_semaphore_wait(
+      semaphore_, remaining.count() <= 0
+                      ? DISPATCH_TIME_NOW
+                      : ::dispatch_time(DISPATCH_TIME_NOW, remaining.count()));
+}
+
+#else
+
+LogWriter::Wakeup::Wakeup() noexcept { ::sem_init(&semaphore_, 0, 0); }
+
+LogWriter::Wakeup::~Wakeup() { ::sem_destroy(&semaphore_); }
+
+void LogWriter::Wakeup::post() noexcept { ::sem_post(&semaphore_); }
+
+void LogWriter::Wakeup::wait_until(
+    std::chrono::steady_clock::time_point deadline) noexcept {
+  const auto to_timespec = [](std::int64_t ns) {
+    timespec at{};
+    at.tv_sec = static_cast<std::time_t>(ns / 1'000'000'000);
+    at.tv_nsec = static_cast<long>(ns % 1'000'000'000);
+    return at;
+  };
+#if defined(__GLIBC__) && \
+    (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 30))
+  // steady_clock is CLOCK_MONOTONIC here, so a wall-clock step cannot stretch
+  // the wait past the periodic sync.
+  const timespec at =
+      to_timespec(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      deadline.time_since_epoch())
+                      .count());
+  while (::sem_clockwait(&semaphore_, CLOCK_MONOTONIC, &at) != 0 &&
+         errno == EINTR) {
+  }
+#else
+  // No sem_clockwait: the same remaining time, against the realtime clock.
+  timespec now{};
+  ::clock_gettime(CLOCK_REALTIME, &now);
+  const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      deadline - std::chrono::steady_clock::now());
+  const timespec at = to_timespec(
+      std::max<std::int64_t>(remaining.count(), 0) +
+      static_cast<std::int64_t>(now.tv_sec) * 1'000'000'000 + now.tv_nsec);
+  while (::sem_timedwait(&semaphore_, &at) != 0 && errno == EINTR) {
+  }
+#endif
+}
+
+#endif
 
 LogWriter::LogWriter(std::string_view path, std::string_view process_name,
                      Options options, std::uint64_t session_id)
@@ -175,8 +285,16 @@ void LogWriter::State::submit_active() noexcept {
     return;
   }
 
-  // Publishes both the chunk bytes and used count to the writer.
-  submitted.fetch_add(1, std::memory_order_release);
+  // Publishes both the chunk bytes and used count to the writer. Sequentially
+  // consistent, like the writer_idle check after it (see writer_idle).
+  submitted.fetch_add(1, std::memory_order_seq_cst);
+  // A post only when the writer may be asleep, so a busy writer costs the
+  // producer one atomic load per chunk. The post takes no lock and does not
+  // block; at most it wakes the writer.
+  if (writer_idle.load(std::memory_order_seq_cst) &&
+      writer_idle.exchange(false, std::memory_order_seq_cst)) {
+    wake.post();
+  }
 }
 
 // Only the producer selects free chunks. The consumer returns ownership by
@@ -268,8 +386,8 @@ void LogWriter::State::drain() noexcept {
     return;
   }
 
+  wake.post();
   std::unique_lock lock{mutex};
-  pending_ready.notify_all();
   chunk_ready.wait(lock,
                    [this] { return completed.load() == submitted.load(); });
   // All submitted chunks have reached the descriptor; serialize the sync with
@@ -282,12 +400,8 @@ void LogWriter::State::stop_writer() noexcept {
     return;
   }
 
-  {
-    std::lock_guard lock{mutex};
-    stopping = true;
-  }
-
-  pending_ready.notify_all();
+  stopping.store(true, std::memory_order_seq_cst);
+  wake.post();
   writer.join();
 }
 
@@ -375,14 +489,24 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
 
   State* raw = state_.get();
   state.writer = std::thread{[raw] {
+    UseNormalScheduling();
     std::unique_lock lock{raw->mutex};
 
     for (;;) {
-      // Polling keeps notifications and mutex acquisition off the producer
-      // path. flush()/destruction notify immediately and may wait for disk.
-      raw->pending_ready.wait_for(lock, std::chrono::milliseconds{1}, [raw] {
-        return raw->completed.load() != raw->submitted.load() || raw->stopping;
-      });
+      // Sleep, without the mutex, until a hand-off (the producer posts when
+      // it finds the writer idle), flush()/destruction (which always post),
+      // or the next periodic sync. A post that lands before the wait is kept
+      // by the semaphore, so none is lost; a stale one only makes the next
+      // wait return at once and the loop check again.
+      const auto sync_at = raw->last_sync + std::chrono::seconds{1};
+      lock.unlock();
+      raw->writer_idle.store(true, std::memory_order_seq_cst);
+      if (raw->completed.load() == raw->submitted.load() &&
+          !raw->stopping.load()) {
+        raw->wake.wait_until(sync_at);
+      }
+      raw->writer_idle.store(false, std::memory_order_seq_cst);
+      lock.lock();
 
       const bool sync_due = std::chrono::steady_clock::now() - raw->last_sync >=
                             std::chrono::seconds{1};

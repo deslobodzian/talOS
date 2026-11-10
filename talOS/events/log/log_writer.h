@@ -14,6 +14,12 @@
 #include <thread>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <dispatch/dispatch.h>
+#else
+#include <semaphore.h>
+#endif
+
 #include "talOS/events/context.h"
 #include "talOS/events/log/format.h"
 #include "talOS/events/manifest.h"
@@ -26,7 +32,13 @@ namespace talos::event::log {
 //
 // Records are copied into preallocated chunks. A
 // single-producer/single-consumer ring hands chunks to the background writer
-// without locking or waiting on the producer. Once per second the writer also
+// without locking or waiting on the producer. The writer sleeps on a
+// semaphore until a chunk is handed over or a sync is due; the producer posts
+// it only when it finds the writer idle, and a post neither blocks nor takes a
+// lock (sem_post on Linux, dispatch_semaphore_signal on macOS). The writer
+// runs under the normal scheduling policy whatever the thread that
+// started it runs under, so it never competes with a realtime loop thread
+// for the CPU. Once per second the writer also
 // writes the committed prefix of the active chunk before fsync, so quiet logs
 // do not remain buffered indefinitely; that fsync leaves the data in the
 // drive's write cache on macOS. flush() and destruction sync with
@@ -136,6 +148,27 @@ class LogWriter {
   std::uint64_t session_id() const noexcept;
 
  private:
+  // A counting semaphore: post() never blocks, never takes a lock and is never
+  // lost -- a post before the wait makes the wait return at once.
+  class Wakeup {
+   public:
+    Wakeup() noexcept;
+    ~Wakeup();
+    Wakeup(const Wakeup&) = delete;
+    Wakeup& operator=(const Wakeup&) = delete;
+
+    void post() noexcept;
+    // Returns after a post (consuming it) or at `deadline`.
+    void wait_until(std::chrono::steady_clock::time_point deadline) noexcept;
+
+   private:
+#if defined(__APPLE__)
+    dispatch_semaphore_t semaphore_;
+#else
+    sem_t semaphore_{};
+#endif
+  };
+
   struct Chunk {
     std::vector<std::byte> data;
     std::size_t used{0};
@@ -177,15 +210,22 @@ class LogWriter {
     Chunk* active{nullptr};
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<std::uint64_t> completed{0};
+    // Set by the writer before it checks for work and sleeps on `wake`; the
+    // producer clears it and posts `wake` only when it finds it set. Both
+    // sides use sequentially consistent operations on this and `submitted`,
+    // so either the writer sees the submission or the producer sees the
+    // writer idle and posts, and the semaphore keeps a post that lands before
+    // the wait.
+    std::atomic<bool> writer_idle{false};
+    Wakeup wake;
 
     enum class CaptureError { NONE, POOL_FULL, RECORD_TOO_LARGE, BYTE_CAP };
     std::atomic<CaptureError> capture_error{CaptureError::NONE};
 
     mutable std::mutex mutex;
-    std::condition_variable pending_ready;
     std::condition_variable chunk_ready;
     std::thread writer;
-    bool stopping{false};
+    std::atomic<bool> stopping{false};
     std::atomic<bool> failed{false};  // Disk failure, independent of capture.
     // Error reporting also runs while the worker coordination mutex is held
     // (sync in drain/periodic sync), so it needs independent protection.

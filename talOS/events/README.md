@@ -217,7 +217,14 @@ Readers reject unsupported versions with both recorded and supported versions
 in the error.
 Records are copied into preallocated chunks and handed to a background thread
 through an atomic ring. Dispatch does not lock, wait for disk, or resize buffers.
-The writer checks for new chunks every millisecond. If the pool is exhausted,
+The writer sleeps on a semaphore until a chunk is handed over or its
+once-per-second sync is due. Handing over a chunk costs the loop thread an
+atomic increment and load, plus, when the writer is idle, one semaphore post
+(`sem_post` on Linux, `dispatch_semaphore_signal` on macOS): it may enter the
+kernel to wake the writer, but never blocks or takes a lock, and a post made
+before the writer waits is kept. The writer runs under the normal scheduling
+policy (`SCHED_OTHER` on Linux, the standard policy on macOS) even when the
+thread that started it runs realtime. If the pool is exhausted,
 capture stops permanently: `failed()` becomes true and `error()` explains why.
 Previously accepted records are drained in order, leaving a prefix without a
 clean `EXIT`, rather than a log with holes.

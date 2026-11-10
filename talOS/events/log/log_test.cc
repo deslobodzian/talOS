@@ -1,4 +1,6 @@
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -10,9 +12,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -876,6 +881,93 @@ TEST(LogCapture, UncappedWriterLeavesNoMarker) {
   EXPECT_FALSE(std::ifstream{CappedMarkerPath(path)}.good());
   ::unlink(path.c_str());
 }
+
+#if defined(__linux__)
+// This process's thread ids (/proc/self/task).
+std::set<pid_t> ThreadIds() {
+  std::set<pid_t> ids;
+  for (const auto& entry :
+       std::filesystem::directory_iterator{"/proc/self/task"}) {
+    ids.insert(static_cast<pid_t>(std::stol(entry.path().filename().string())));
+  }
+  return ids;
+}
+
+// The one thread in ThreadIds() that is not in `before`, or 0.
+pid_t NewThread(const std::set<pid_t>& before) {
+  pid_t found = 0;
+  for (const pid_t id : ThreadIds()) {
+    if (before.contains(id)) continue;
+    if (found != 0) return 0;
+    found = id;
+  }
+  return found;
+}
+
+// How many times thread `id` has blocked and been woken.
+long VoluntarySwitches(pid_t id) {
+  std::ifstream status{"/proc/self/task/" + std::to_string(id) + "/status"};
+  std::string line;
+  constexpr std::string_view kKey = "voluntary_ctxt_switches:";
+  while (std::getline(status, line)) {
+    if (line.starts_with(kKey)) return std::stol(line.substr(kKey.size()));
+  }
+  return -1;
+}
+
+// A node calls process::ConfigureRealtime (SCHED_FIFO) on its loop thread
+// before the loop starts the log writer, and Linux threads inherit their
+// creator's policy: the writer must put itself back under SCHED_OTHER rather
+// than compete with control loops for the CPU.
+TEST(LogBackgroundWriter, WriterLeavesTheRealtimePolicyOfItsCreator) {
+  const auto path = TempPath("writer_policy");
+  bool realtime = false;
+  int writer_policy = -1;
+  std::thread creator{[&] {
+    sched_param fifo{};
+    fifo.sched_priority = ::sched_get_priority_min(SCHED_FIFO);
+    realtime =
+        ::pthread_setschedparam(::pthread_self(), SCHED_FIFO, &fifo) == 0;
+    if (!realtime) return;
+    const std::set<pid_t> before = ThreadIds();
+    LogWriter writer{path, "policy", LogWriter::Options{}};
+    writer.start({}, {});
+    // The writer sets its policy before it handles anything, so once this
+    // record has been written the policy is final.
+    Context context{};
+    context.dispatch_index = 1;
+    writer.dispatch(context, MakePayload(16, 1));
+    writer.flush();
+    const pid_t id = NewThread(before);
+    if (id != 0) writer_policy = ::sched_getscheduler(id);
+  }};
+  creator.join();
+  ::unlink(path.c_str());
+  if (!realtime) GTEST_SKIP() << "SCHED_FIFO refused; cannot test inheritance";
+  EXPECT_EQ(writer_policy, SCHED_OTHER);
+}
+
+// An idle writer sleeps until a hand-off or its periodic sync instead of
+// waking every millisecond.
+TEST(LogBackgroundWriter, IdleWriterDoesNotPoll) {
+  const auto path = TempPath("idle_wakeups");
+  {
+    const std::set<pid_t> before = ThreadIds();
+    LogWriter writer{path, "idle", LogWriter::Options{}};
+    writer.start({}, {});
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    const pid_t id = NewThread(before);
+    ASSERT_NE(id, 0);
+    const long start = VoluntarySwitches(id);
+    std::this_thread::sleep_for(std::chrono::milliseconds{500});
+    const long wakeups = VoluntarySwitches(id) - start;
+    ASSERT_GE(start, 0);
+    // About 1, for the periodic sync; polling every 1 ms gave about 500.
+    EXPECT_LT(wakeups, 50);
+  }
+  ::unlink(path.c_str());
+}
+#endif
 
 }  // namespace
 }  // namespace talos::event::log
