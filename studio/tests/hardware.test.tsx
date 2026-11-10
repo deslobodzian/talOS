@@ -26,8 +26,9 @@ test('counterRate measures a counter over its samples', () => {
   // One reading or a zero span cannot be measured.
   assert.equal(counterRate([0], [3]), null);
   assert.equal(counterRate([5, 5], [1, 2]), null);
-  // A wrapped (reset) counter is not a negative rate.
-  assert.equal(counterRate([0, 5], [100, 2]), null);
+  // A reset adds no increment: 10 -> 20, reset, 2 -> 12 is 20 units over
+  // 10 s, not the first-to-last 2 units nor a negative rate.
+  assert.equal(counterRate([0, 2, 5, 10], [10, 20, 2, 12]), 2);
   // NaN samples are skipped, not treated as zero.
   assert.equal(counterRate([0, 1, NaN, 5], [0, NaN, 4, 5]), 1);
 });

@@ -31,10 +31,13 @@ test('validObservationRate counts new observations, not repeated samples', () =>
   assert.equal(validObservationRate([10], [1]), null);
 });
 
-test('counterDelta takes the last finite reading minus the first', () => {
+test('counterDelta sums increments and ignores a reset', () => {
   assert.equal(counterDelta([100, 101, NaN, 103, 110]), 10);
   assert.equal(counterDelta([NaN, NaN]), null);
-  assert.equal(counterDelta([100, 50]), null);  // a reset, not a negative drop
+  // 100 -> 105, reset, 2 -> 104: 5 + 102 observed, never 104 - 100 = 4 nor a
+  // negative drop.
+  assert.equal(counterDelta([100, 105, 2, 104]), 107);
+  assert.equal(counterDelta([100, 50]), 0);
 });
 
 test('fpsFromPeriod converts microseconds to Hz', () => {
@@ -44,10 +47,13 @@ test('fpsFromPeriod converts microseconds to Hz', () => {
   assert.equal(fpsFromPeriod(NaN), null);
 });
 
-test('latestValidPose walks back to the most recent accepted pose', () => {
-  const x = [1, 2, 3, 4], y = [10, 20, 30, 40], v = [1, 0, 1, 0];
-  assert.deepEqual(latestValidPose(x, y, v), {x: 3, y: 30});
-  assert.equal(latestValidPose([], [], []), null);
+test('latestValidPose walks back to the most recent current accepted pose', () => {
+  const t = [0, 0.25, 0.5, 0.75], x = [1, 2, 3, 4], y = [10, 20, 30, 40];
+  assert.deepEqual(latestValidPose(t, x, y, [1, 0, 1, 0]), {x: 3, y: 30});
+  // The only accepted observation is a full second older than the cursor:
+  // the robot has moved since, so there is nothing to compare.
+  assert.equal(latestValidPose([0, 0.5, 1], x, y, [1, 0, 0]), null);
+  assert.equal(latestValidPose([], [], [], []), null);
 });
 
 test('acceptancePct divides accepted by the total, or null', () => {

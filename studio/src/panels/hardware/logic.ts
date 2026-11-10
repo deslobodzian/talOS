@@ -5,26 +5,29 @@
 // A contiguous span (seconds since the series origin) where a 0/1 flag read 1.
 export type Band = {start: number; end: number};
 
-// Rate of a cumulative counter over the samples given, in units per second.
+// Rate of a cumulative counter over the samples given, in units per second:
+// the sum of the nonnegative steps between consecutive finite readings over
+// the time from the first reading to the last. A reset (a step down, the
+// bridge restarted) adds nothing, so it reads neither as a negative rate nor
+// as a jump; increments hidden by the reset are unknown and excluded.
 //
-// Null when there are fewer than two readings, when the time span is zero, or
-// when the counter wrapped (the later value is lower than the earlier one):
-// "not measured" and "the bridge restarted" are different statements from a
-// real rate. A flat counter yields 0, which is the honest "not moving".
+// Null when there are fewer than two readings or the time span is zero: "not
+// measured" is a different statement from a real rate. A flat counter yields
+// 0, which is the honest "not moving".
 export function counterRate(
     times: ArrayLike<number>, values: ArrayLike<number>): number|null {
   let first = -1;
   let last = -1;
+  let dv = 0;
   for (let i = 0; i < values.length; i++) {
-    if (Number.isFinite(values[i])) {
-      if (first < 0) first = i;
-      last = i;
-    }
+    if (!Number.isFinite(values[i])) continue;
+    if (first < 0) first = i;
+    else if (values[i] > values[last]) dv += values[i] - values[last];
+    last = i;
   }
   if (first < 0 || last <= first) return null;
   const dt = times[last] - times[first];
-  const dv = values[last] - values[first];
-  if (!(dt > 0) || dv < 0) return null;
+  if (!(dt > 0)) return null;
   return dv / dt;
 }
 
