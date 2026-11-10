@@ -306,6 +306,10 @@ talos_cc_node(
 cc_test(
     name = "replay_inputs_test",
     size = "small",
+    # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
+    # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
+    # The Linux sanitizer legs still run this test.
+    tags = ["no_macos_sanitizer"],
     srcs = ["replay_inputs_test.cc"],
     data = [
         ":replay_consumer",

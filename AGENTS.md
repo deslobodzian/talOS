@@ -32,9 +32,11 @@ bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configurat
   not Bazel: `./gradlew phoenixTest` and `./gradlew buildRio` from that directory.
 - Studio (`studio/`): `pnpm test`, `pnpm build` (runs `tsc --noEmit`);
   regenerate TS bindings with `pnpm generate` after editing `talOS/telemetry/telemetry.fbs`.
-- CI also checks changed files with `clang-format-18 --dry-run --Werror`,
-  `clang-tidy-18` (repo `.clang-format` / `.clang-tidy`; a changed header is
-  analyzed through production sources that include it), and
+- CI also checks changed files (a pull request: since its merge base with
+  `main`; a push: since the previous push, or since the merge base with `main`
+  for a new branch or force push) with `clang-format-18 --dry-run --Werror`,
+  `clang-tidy-18` (repo `.clang-format` / `.clang-tidy`; tests included; a
+  changed header is analyzed through sources that include it), and
   `buildifier --mode=check --lint=warn` on changed BUILD, `.bzl` and
   `MODULE.bazel` files. Match them.
 

@@ -224,8 +224,9 @@ bazel test --test_output=errors --test_env=TALOS_SOAK_SECONDS=180 \
 
 `soak_test` is tagged `manual` (`bazel test //...` and `:all` skip it); CI's
 soak job runs it for 180 s of teleop on Linux and macOS for `hardening/**` and
-`feature/**` pushes. It launches the same full graph plus the Studio bridge,
-holds teleop for `TALOS_SOAK_SECONDS` (3 to 600; the test refuses more, so a
+`feature/**` pushes (seed 0) and for pushes to `main` (seed 1). It launches the
+same full graph plus the Studio bridge, holds teleop for `TALOS_SOAK_SECONDS`
+(3 to 600; the test refuses more, so a
 run fits Bazel's 900 s `long` timeout) with the stick centred for the first
 0.5 s of every 3 s cycle, and each cycle either `SIGKILL`s a node
 (drivetrain, driver, intake, teleop, telemetry, `hardware_node`) or

@@ -151,11 +151,14 @@ jobs:
   soak:
     name: Soak (${{ matrix.os }})
     # Minutes of the full simulated graph under SIGKILL/SIGSTOP chaos
-    # (2026-robot/main_processor/simulation/README.md); topic-branch pushes
-    # only. The target is `manual`, so `bazel test //...` never runs it.
+    # (2026-robot/main_processor/simulation/README.md); pushes only, with
+    # fault-order seed 0 on topic branches and seed 1 on main, so main runs
+    # an order the branches did not. The target is `manual`, so
+    # `bazel test //...` never runs it.
     if: >-
       github.event_name == 'push' &&
-      (startsWith(github.ref, 'refs/heads/hardening/') ||
+      (github.ref == 'refs/heads/main' ||
+       startsWith(github.ref, 'refs/heads/hardening/') ||
        startsWith(github.ref, 'refs/heads/feature/'))
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -179,6 +182,7 @@ jobs:
         bazel test //2026-robot/main_processor/simulation:soak_test
         --noshow_progress --test_output=all
         --test_env=TALOS_SOAK_SECONDS=180
+        --test_env=TALOS_SOAK_SEED=${{ github.ref == 'refs/heads/main' && '1' || '0' }}
 
     - name: Keep the failed session
       if: ${{ failure() }}
@@ -247,19 +251,40 @@ jobs:
         install -m 0755 "$RUNNER_TEMP/buildifier" /usr/local/bin/buildifier
         buildifier --version
 
+    - &diff-base
+      name: Choose the diff base
+      # Reused by clang-format and clang-tidy. A pull request checks every
+      # file its branch changed since it left the base branch, so a commit
+      # whose earlier run was cancelled or failed is checked again by every
+      # later run. A push checks the commits it pushed; on main, `before` is
+      # the old tip, which is the merge base of what was merged. A new branch
+      # (all-zero `before`) or a force push (`before` absent from the clone
+      # or not an ancestor of HEAD) falls back to the merge base with main;
+      # on main, where that merge base is HEAD itself, to HEAD's first parent.
+      env:
+        EVENT: ${{ github.event_name }}
+        BEFORE: ${{ github.event.before }}
+        BASE_REF: ${{ github.base_ref }}
+      run: |
+        if [ "$EVENT" = pull_request ]; then
+          base="$(git merge-base "origin/$BASE_REF" HEAD)"
+        elif [ -n "$BEFORE" ] &&
+             [ "$BEFORE" != 0000000000000000000000000000000000000000 ] &&
+             git merge-base --is-ancestor "$BEFORE" HEAD 2>/dev/null; then
+          base="$BEFORE"
+        else
+          base="$(git merge-base origin/main HEAD)"
+          if [ "$base" = "$(git rev-parse HEAD)" ]; then
+            base="$(git rev-parse HEAD~1)"
+          fi
+        fi
+        echo "Diff base: $(git log -1 --format='%H %s' "$base")"
+        echo "BASE=$base" >> "$GITHUB_ENV"
+
     - name: Check changed Starlark files
       run: |
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          BASE="${{ github.event.pull_request.base.sha }}"
-        else
-          BASE="${{ github.event.before }}"
-        fi
-        case "$BASE" in
-          ""|"0000000000000000000000000000000000000000") BASE="HEAD~1" ;;
-        esac
-        echo "Diff base: $BASE"
-        # Check mode only: never rewrites files. Scoped to files changed in
-        # this PR/push so pre-existing tree state stays untouched.
+        # Check mode only: never rewrites files. Scoped to the files changed
+        # since $BASE so pre-existing tree state stays untouched.
         git diff --name-only --diff-filter=d -z "$BASE" HEAD -- \
           'BUILD' 'BUILD.bazel' '*/BUILD' '*/BUILD.bazel' '*.bzl' \
           'MODULE.bazel' '*/MODULE.bazel' \
@@ -280,17 +305,10 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y clang-format-18
 
+    - *diff-base
+
     - name: Check changed C/C++ files
       run: |
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          BASE="${{ github.event.pull_request.base.sha }}"
-        else
-          BASE="${{ github.event.before }}"
-        fi
-        case "$BASE" in
-          ""|"0000000000000000000000000000000000000000") BASE="HEAD~1" ;;
-        esac
-        echo "Diff base: $BASE"
         # --dry-run --Werror: check only, never reformats. .clang-format at
         # the repo root is picked up automatically. third_party/ is vendored
         # upstream source (metal-cpp) and keeps its upstream formatting.
@@ -299,7 +317,7 @@ jobs:
           | xargs -0 -r clang-format-18 --dry-run --Werror
 
   clang-tidy:
-    name: clang-tidy (changed production C++ files)
+    name: clang-tidy (changed C++ files)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -336,46 +354,46 @@ jobs:
       # MODULE.bazel) generates compile_commands.json for clang-tidy.
       run: bazel run @hedron_compile_commands//:refresh_all --noshow_progress
 
+    - *diff-base
+
     - name: Run clang-tidy on changed sources and headers
       run: |
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          BASE="${{ github.event.pull_request.base.sha }}"
-        else
-          BASE="${{ github.event.before }}"
-        fi
-        case "$BASE" in
-          ""|"0000000000000000000000000000000000000000") BASE="HEAD~1" ;;
-        esac
-        echo "Diff base: $BASE"
-        # Analyze production TUs in the Bazel graph: each changed source,
-        # plus up to TUS_PER_HEADER production includers of each changed
-        # header (direct or transitive). A changed production source missing
-        # from the database fails the step. Tests run under the sanitizer
-        # jobs instead.
+        # Analyze TUs in the Bazel graph: each changed source, tests
+        # included, plus up to TUS_PER_HEADER includers of each changed
+        # header (direct or transitive; production includers for a
+        # production header). A changed source missing from the database
+        # fails the step.
         # NUL-delimited git output also handles paths containing whitespace.
         python3 - "$BASE" <<'PYEOF'
         import concurrent.futures, json, os, pathlib, re, subprocess, sys, time
         SOURCES = ('.c', '.cc', '.cpp')
         HEADERS = ('.h', '.hpp')
-        # Production sources the Linux build graph never compiles, so they have no
-        # compilation database entry: the GradleRIO program (rio-adapter job) and
-        # sources selected only for other platforms. Paths in .bazelignore are
-        # outside the graph too and are read from there.
+        # Sources the Linux build graph never compiles, so they have no
+        # compilation database entry: the GradleRIO program and its tests
+        # (rio-adapter job) and sources selected only for other platforms.
+        # Paths in .bazelignore are outside the graph too and are read from
+        # there.
         OFF_GRAPH = ('2026-robot/controller_processor/rio/',
                      'talOS/events/os/kqueue_poller.cc',
                      'talOS/vision/capture/unsupported_source.cc')
-        # A changed header is analyzed through at most this many production
-        # translation units that include it, nearest includers first.
+        # A changed header is analyzed through at most this many translation
+        # units that include it, nearest includers first.
         TUS_PER_HEADER = 4
+        # Test code reads an optional after gtest's ASSERT_TRUE(opt), which
+        # this check cannot see through; every other check applies to tests.
+        TEST_CHECKS = '-bugprone-unchecked-optional-access'
 
         def git(*args):
             return [p for p in subprocess.check_output(['git', *args]).decode().split('\0') if p]
 
+        def ours(rel):
+            return not {'external', 'third_party'}.intersection(
+                pathlib.PurePosixPath(rel).parts)
+
         def production(rel):
             path = pathlib.PurePosixPath(rel)
-            return not (
-                {'test', 'tests', 'testing', 'testdata', 'external',
-                 'third_party'}.intersection(path.parts) or
+            return ours(rel) and not (
+                {'test', 'tests', 'testing', 'testdata'}.intersection(path.parts) or
                 path.stem in {'test', 'testing'} or
                 path.stem.endswith(('_test', '_testing')) or
                 'fuzz' in path.stem)
@@ -390,12 +408,12 @@ jobs:
         for e in db:
             if e['file'].endswith(SOURCES):
                 rel = os.path.relpath(os.path.realpath(os.path.join(e['directory'], e['file'])), root)
-                if production(rel):
+                if ours(rel):
                     tus.add(rel)
 
         changed = [rel for rel in git('diff', '--name-only', '--diff-filter=d', '-z', sys.argv[1], 'HEAD',
                                       '--', *('*' + ext for ext in SOURCES + HEADERS))
-                   if production(rel) and not rel.startswith(ignored)]
+                   if ours(rel) and not rel.startswith(ignored)]
         targets, missing = [], []
         for rel in changed:
             if not rel.endswith(SOURCES):
@@ -437,25 +455,29 @@ jobs:
                     level = sorted({i for h in frontier for i in includers.get(h, ())} - seen,
                                    key=lambda p: (os.path.dirname(p) != os.path.dirname(header), p))
                     seen.update(level)
-                    found += [p for p in level if p in tus][:TUS_PER_HEADER - len(found)]
+                    found += [p for p in level if p in tus and
+                              (production(p) or not production(header))][:TUS_PER_HEADER - len(found)]
                     frontier = [p for p in level if p.endswith(HEADERS)]
                 if found:
                     print(f'{header}: via {", ".join(found)}')
                     targets += found
-                else:
+                elif production(header):
                     print(f'{header}: no production translation unit includes it; not analyzed')
+                else:
+                    print(f'{header}: no translation unit includes it; not analyzed')
         targets = list(dict.fromkeys(targets))
 
         for rel in missing:
-            print(f'::error file={rel}::changed production source has no compilation '
+            print(f'::error file={rel}::changed source has no compilation '
                   'database entry; add it to a Bazel target or to OFF_GRAPH in this step')
         if not targets:
-            print('No changed production C++ to analyze.')
+            print('No changed C++ to analyze.')
             sys.exit(1 if missing else 0)
         # One clang-tidy per core: a single process over a large PR's
         # translation units ran for most of an hour.
         def tidy(path):
-            return subprocess.run(['clang-tidy-18', '-p', '.', '--quiet', path],
+            checks = [] if production(path) else [f'--checks={TEST_CHECKS}']
+            return subprocess.run(['clang-tidy-18', '-p', '.', '--quiet', *checks, path],
                                   capture_output=True, text=True)
         failed = 0
         start = time.monotonic()

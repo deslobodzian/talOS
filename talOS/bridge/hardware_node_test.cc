@@ -10,7 +10,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <map>
 #include <optional>
 #include <string>
 #include <thread>
@@ -26,30 +25,81 @@
 
 namespace talos::hardware {
 namespace {
-// Resolve each endpoint label once per process to an OS-selected port.
-uint16_t TestPort(uint16_t label) {
-  static std::map<uint16_t, uint16_t> ports;
-  if (const auto it = ports.find(label); it != ports.end()) return it->second;
-  for (;;) {
-    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) throw std::runtime_error("cannot allocate test UDP socket");
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    socklen_t size = sizeof(address);
-    const bool ok =
-        bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 &&
-        getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) == 0;
+// Binds a loopback UDP socket to a port the OS chooses and connects it to
+// itself, so it accepts no datagram from another socket: a bridge sending to
+// the port sees it closed (ECONNREFUSED), as if nothing were bound, while no
+// other socket can be given the port. Returns the socket, or -1.
+int ReservePort(uint16_t& port) {
+  const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0) return -1;
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t size = sizeof(address);
+  if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+      getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) != 0 ||
+      connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) !=
+          0) {
     close(fd);
-    if (!ok) throw std::runtime_error("cannot allocate test UDP port");
-    const uint16_t port = ntohs(address.sin_port);
-    bool used = false;
-    for (const auto& [key, value] : ports) used |= value == port;
-    if (used) continue;
-    ports.emplace(label, port);
-    return port;
+    return -1;
   }
+  port = ntohs(address.sin_port);
+  return fd;
 }
+
+void Release(int& fd) {
+  if (fd >= 0) close(fd);
+  fd = -1;
+}
+
+// A bridge under test and the fake gateway on the other end of its UDP link,
+// each on a port the OS chose. A port stays reserved (ReservePort) until the
+// endpoint that owns it binds it, so a port picked earlier in the test is
+// never one another process has since been given. Another process can still
+// bind a port in the instant between the release and the bind; Open() then
+// starts over on a new pair, and a later OpenGateway() fails the test.
+struct Link {
+  Link() = default;
+  Link(const Link&) = delete;
+  Link& operator=(const Link&) = delete;
+  ~Link() {
+    Release(gateway_reservation);
+    Release(node_reservation);
+  }
+
+  // Opens the bridge and, when `open_gateway`, the gateway; a test whose
+  // bridge must first run with no gateway listening calls OpenGateway()
+  // later, keeping the gateway port reserved until then.
+  bool Open(const config::RobotConfig& cfg, bool open_gateway = true) {
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      node.reset();
+      gateway.Close();
+      Release(gateway_reservation);
+      Release(node_reservation);
+      gateway_reservation = ReservePort(gateway_port);
+      node_reservation = ReservePort(node_port);
+      if (gateway_reservation < 0 || node_reservation < 0) return false;
+      if (open_gateway && !OpenGateway()) continue;
+      Release(node_reservation);
+      node.emplace(cfg, "127.0.0.1", gateway_port, node_port, true);
+      if (node->Open()) return true;
+    }
+    return false;
+  }
+
+  bool OpenGateway() {
+    Release(gateway_reservation);
+    return gateway.Open("127.0.0.1", gateway_port, "127.0.0.1", node_port) ==
+           protocol::UdpStatus::kOk;
+  }
+
+  std::optional<HardwareNode> node;
+  protocol::RuntimeUdpPeer gateway;
+  uint16_t gateway_port = 0;
+  uint16_t node_port = 0;
+  int gateway_reservation = -1;
+  int node_reservation = -1;
+};
 
 constexpr std::string_view kTestToml = R"(
 [robot]
@@ -95,8 +145,9 @@ uint64_t NodeConfigId(const talos::config::RobotConfig& cfg) {
 // reads as a stall.
 TEST(HardwareNodeTest, RunKeepsRegistryHeartbeatCurrent) {
   auto cfg = talos::config::ParseRobotConfigString(kTestToml);
-  HardwareNode node{cfg, "127.0.0.1", TestPort(26300), TestPort(26301), true};
-  ASSERT_TRUE(node.Open());
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+  HardwareNode& node = link.node.value();
   std::thread runner([&node] { node.Run(1); });
   std::optional<introspect::RegistryReader> reader;
   std::int64_t worst_age_ns = 0;
@@ -127,13 +178,10 @@ TEST(HardwareNodeTest, RunKeepsRegistryHeartbeatCurrent) {
 
 TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
   auto cfg = talos::config::ParseRobotConfigString(kTestToml);
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25804), TestPort(25805), true};
-  ASSERT_TRUE(node.Open());
-
-  protocol::RuntimeUdpPeer gateway_peer;
-  ASSERT_EQ(gateway_peer.Open("127.0.0.1", TestPort(25804), "127.0.0.1",
-                              TestPort(25805)),
-            protocol::UdpStatus::kOk);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway_peer = link.gateway;
 
   ipc::Subscriber<talos::hardware::Packet> ds_sub{kDriverStationTopic};
 
@@ -261,12 +309,10 @@ State TrustState(uint64_t config_id, uint64_t boot_id, uint64_t epoch,
 
 TEST(HardwareNodeTest, LastSubsystemTimeoutSendsOneFreshNeutralFrame) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
-  HardwareNode node{cfg, "127.0.0.1", TestPort(26000), TestPort(26001), true};
-  ASSERT_TRUE(node.Open());
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(26000), "127.0.0.1", TestPort(26001)),
-      protocol::UdpStatus::kOk);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   const auto config_id = NodeConfigId(cfg);
   ASSERT_TRUE(
       InjectState(node, gateway, TrustState(config_id, 11, 1, 1000), 1000000));
@@ -358,8 +404,9 @@ TEST(HardwareNodeTest, OnlySimulationForcesCommissioning) {
 
 TEST(HardwareNodeTest, LatestRequestNeutralizesOmittedOutputs) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25940), TestPort(25941), true};
-  ASSERT_TRUE(node.Open());
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+  HardwareNode& node = link.node.value();
   node.Tick(1000000);
   ipc::Publisher<Packet> pub{RequestTopic("intake")};
   Command request{};
@@ -388,12 +435,10 @@ TEST(HardwareNodeTest, LatestRequestNeutralizesOmittedOutputs) {
 
 TEST(HardwareNodeTest, ReportsLatestGatewayHealthAndConfiguredMotorFaults) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25942), TestPort(25943), true};
-  ASSERT_TRUE(node.Open());
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(25942), "127.0.0.1", TestPort(25943)),
-      protocol::UdpStatus::kOk);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   State state = TrustState(NodeConfigId(cfg), 42, 1, 1000);
   state.health = {true, 9.5, true, 0.81};
   state.motor_count = 2;
@@ -458,39 +503,21 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   const auto executable = runfiles->Rlocation(executable_path);
   // Keep both ephemeral ports reserved until their respective owners open.
   // Fixed ports collide when Bazel runs repetitions concurrently.
-  const auto reserve_port = [](int& fd, uint16_t& port) {
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return false;
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
-      close(fd);
-      return false;
-    }
-    socklen_t size = sizeof(address);
-    if (getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) != 0) {
-      close(fd);
-      return false;
-    }
-    port = ntohs(address.sin_port);
-    return true;
-  };
-  int gateway_reservation = -1;
-  int node_reservation = -1;
   uint16_t gateway_port = 0;
   uint16_t node_port = 0;
-  ASSERT_TRUE(reserve_port(gateway_reservation, gateway_port));
-  const bool reserved_node = reserve_port(node_reservation, node_port);
-  close(gateway_reservation);
-  ASSERT_TRUE(reserved_node);
+  int gateway_reservation = ReservePort(gateway_port);
+  int node_reservation = ReservePort(node_port);
+  const bool reserved = gateway_reservation >= 0 && node_reservation >= 0;
+  Release(gateway_reservation);
+  if (!reserved) Release(node_reservation);
+  ASSERT_TRUE(reserved);
   const std::string gateway_port_arg = std::to_string(gateway_port);
   const std::string node_port_arg = std::to_string(node_port);
   protocol::RuntimeUdpPeer gateway;
   ASSERT_EQ(gateway.Open("127.0.0.1", gateway_port, "127.0.0.1", node_port),
             protocol::UdpStatus::kOk);
   ipc::Publisher<Packet> pub{RequestTopic("intake")};
-  close(node_reservation);
+  Release(node_reservation);
   const pid_t child = fork();
   ASSERT_GE(child, 0);
   if (child == 0) {
@@ -603,14 +630,13 @@ TEST(HardwareNodeTest, RejectsRequestsForDevicesOwnedByAnotherSubsystem) {
   ASSERT_TRUE(cfg.subsystems.at("intake").motors.size() == 1u &&
               cfg.subsystems.at("intake").motors[0] == roller);
 
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25812), TestPort(25813), true};
-  ASSERT_TRUE(node.Open());
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+  HardwareNode& node = link.node.value();
   node.Tick(999000);  // Drain any stale packet a previous test left behind.
 
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(25812), "127.0.0.1", TestPort(25813)),
-      protocol::UdpStatus::kOk);
+  ASSERT_TRUE(link.OpenGateway());
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   const uint64_t config_id = NodeConfigId(cfg);
   ASSERT_TRUE(
       InjectState(node, gateway, TrustState(config_id, 11, 1, 1000), 1000000));
@@ -717,14 +743,13 @@ TEST(HardwareNodeTest, RequestAgeIsBoundedByTheCommandTimeout) {
   const uint64_t config_id = NodeConfigId(cfg);
   const uint64_t timeout_us = cfg.hardware.command_timeout_us;
 
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25816), TestPort(25817), true};
-  ASSERT_TRUE(node.Open());
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+  HardwareNode& node = link.node.value();
   node.Tick(999000);
 
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(25816), "127.0.0.1", TestPort(25817)),
-      protocol::UdpStatus::kOk);
+  ASSERT_TRUE(link.OpenGateway());
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   ASSERT_TRUE(
       InjectState(node, gateway, TrustState(config_id, 11, 1, 5000), 1000000));
 
@@ -780,14 +805,13 @@ TEST(HardwareNodeTest, FreshSubsystemCannotRefreshStaleSubsystem) {
   const uint16_t roller = cfg.hardware.motors[1].id;
   const uint64_t config_id = NodeConfigId(cfg);
 
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25824), TestPort(25825), true};
-  ASSERT_TRUE(node.Open());
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+  HardwareNode& node = link.node.value();
   node.Tick(999000);
 
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(25824), "127.0.0.1", TestPort(25825)),
-      protocol::UdpStatus::kOk);
+  ASSERT_TRUE(link.OpenGateway());
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   ASSERT_TRUE(
       InjectState(node, gateway, TrustState(config_id, 11, 1, 5000), 1000000));
 
@@ -861,14 +885,13 @@ TEST(HardwareNodeTest, RejectsWrongIdentityWordsEvenWithinBound) {
   const uint16_t roller = cfg.hardware.motors[1].id;
   const uint64_t config_id = NodeConfigId(cfg);
 
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25826), TestPort(25827), true};
-  ASSERT_TRUE(node.Open());
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+  HardwareNode& node = link.node.value();
   node.Tick(999000);
 
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(25826), "127.0.0.1", TestPort(25827)),
-      protocol::UdpStatus::kOk);
+  ASSERT_TRUE(link.OpenGateway());
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   ASSERT_TRUE(
       InjectState(node, gateway, TrustState(config_id, 11, 1, 5000), 1000000));
 
@@ -923,14 +946,13 @@ TEST(HardwareNodeTest, RequiresFreshRequestsAfterControllerTransitions) {
   const uint16_t roller = cfg.hardware.motors[1].id;
   const uint64_t config_id = NodeConfigId(cfg);
 
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25818), TestPort(25819), true};
-  ASSERT_TRUE(node.Open());
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+  HardwareNode& node = link.node.value();
   node.Tick(999000);
 
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(25818), "127.0.0.1", TestPort(25819)),
-      protocol::UdpStatus::kOk);
+  ASSERT_TRUE(link.OpenGateway());
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
   ipc::Publisher<talos::hardware::Packet> drive_pub{RequestTopic("drivetrain")};
 
@@ -1048,12 +1070,10 @@ TEST(HardwareNodeTest, ReorderedAndRetiredBootStatesChangeNothing) {
   const uint16_t roller = cfg.hardware.motors[1].id;
   const uint64_t config_id = NodeConfigId(cfg);
 
-  HardwareNode node{cfg, "127.0.0.1", TestPort(26200), TestPort(26201), true};
-  ASSERT_TRUE(node.Open());
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(26200), "127.0.0.1", TestPort(26201)),
-      protocol::UdpStatus::kOk);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
   ipc::Publisher<talos::hardware::Packet> drive_pub{RequestTopic("drivetrain")};
   ipc::Subscriber<talos::hardware::Packet> state_sub{kStateTopic};
@@ -1168,12 +1188,10 @@ TEST(HardwareNodeTest, ReorderedAndRetiredBootStatesChangeNothing) {
 TEST(HardwareNodeTest, ForwardsDriverStationPacketsOnlyFromTheCurrentBoot) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
   const uint64_t config_id = NodeConfigId(cfg);
-  HardwareNode node{cfg, "127.0.0.1", TestPort(26202), TestPort(26203), true};
-  ASSERT_TRUE(node.Open());
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(26202), "127.0.0.1", TestPort(26203)),
-      protocol::UdpStatus::kOk);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   ipc::Subscriber<talos::hardware::Packet> ds_sub{kDriverStationTopic};
 
   // Sends one packet, ticks until the node has taken the frame in, and
@@ -1236,8 +1254,9 @@ TEST(HardwareNodeTest, ForwardsDriverStationPacketsOnlyFromTheCurrentBoot) {
 TEST(HardwareNodeTest, PublishesBridgeStatus) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
   const uint16_t drive = cfg.hardware.motors[0].id;
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25828), TestPort(25829), true};
-  ASSERT_TRUE(node.Open());
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+  HardwareNode& node = link.node.value();
   ipc::Subscriber<bridge::BridgeStatus> status_sub{
       bridge::topics::kStatus,
       RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
@@ -1257,10 +1276,8 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   const bridge::BridgeStatus first = published.value_or(bridge::BridgeStatus{});
   EXPECT_TRUE(first == initial);
 
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(25828), "127.0.0.1", TestPort(25829)),
-      protocol::UdpStatus::kOk);
+  ASSERT_TRUE(link.OpenGateway());
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   const uint64_t config_id = NodeConfigId(cfg);
 
   // The RoboRIO acknowledges this configuration.
@@ -1319,12 +1336,10 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
 
 TEST(HardwareNodeTest, TwoWayClockBoundNeedsNoActiveRequests) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25834), TestPort(25835), true};
-  ASSERT_TRUE(node.Open());
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(25834), "127.0.0.1", TestPort(25835)),
-      protocol::UdpStatus::kOk);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   node.Tick(2000000);
   protocol::DecodedFrame probe;
   ASSERT_EQ(protocol::testing::ReceiveFrame(gateway, &probe),
@@ -1355,12 +1370,10 @@ TEST(HardwareNodeTest, TwoWayClockBoundNeedsNoActiveRequests) {
 // stays valid through the whole second after the last good exchange.
 TEST(HardwareNodeTest, OneLostClockProbeLeavesTheMappingValid) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25836), TestPort(25837), true};
-  ASSERT_TRUE(node.Open());
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(25836), "127.0.0.1", TestPort(25837)),
-      protocol::UdpStatus::kOk);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   // The next clock probe the bridge sent, skipping config pushes.
   const auto next_probe = [&gateway]() -> std::optional<uint64_t> {
     const auto deadline =
@@ -1422,14 +1435,13 @@ TEST(HardwareNodeTest, TimeoutNeutralizesOnlyTheSilentSubsystemsActuators) {
   const uint16_t roller = cfg.hardware.motors[1].id;
   const uint16_t beacon = cfg.hardware.digital_outputs[0].id;
   const uint16_t strip = cfg.hardware.pwm_outputs[0].id;
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25830), TestPort(25831), true};
-  ASSERT_TRUE(node.Open());
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+  HardwareNode& node = link.node.value();
   node.Tick(999000);
 
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(25830), "127.0.0.1", TestPort(25831)),
-      protocol::UdpStatus::kOk);
+  ASSERT_TRUE(link.OpenGateway());
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   const uint64_t config_id = NodeConfigId(cfg);
   ASSERT_TRUE(
       InjectState(node, gateway, TrustState(config_id, 11, 1, 1000), 1000000));
@@ -1503,13 +1515,12 @@ TEST(HardwareNodeTest, OwnerSurvivesALateTickAndIsNeutralWithinItsTimeout) {
   ASSERT_EQ(cfg.hardware.command_timeout_us, 100000u);
   constexpr uint64_t kOwnerTimeoutUs = 50000;
   const uint16_t drive = cfg.hardware.motors[0].id;
-  HardwareNode node{cfg, "127.0.0.1", TestPort(26210), TestPort(26211), true};
-  ASSERT_TRUE(node.Open());
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+  HardwareNode& node = link.node.value();
   node.Tick(999000);
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(26210), "127.0.0.1", TestPort(26211)),
-      protocol::UdpStatus::kOk);
+  ASSERT_TRUE(link.OpenGateway());
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   const uint64_t config_id = NodeConfigId(cfg);
   ASSERT_TRUE(
       InjectState(node, gateway, TrustState(config_id, 11, 1, 1000), 1000000));
@@ -1553,12 +1564,10 @@ TEST(HardwareNodeTest, OwnerSurvivesALateTickAndIsNeutralWithinItsTimeout) {
 
 TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {
   auto cfg = config::ParseRobotConfigString(kTestToml);
-  HardwareNode node{cfg, "127.0.0.1", TestPort(26180), TestPort(26181), true};
-  ASSERT_TRUE(node.Open());
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(26180), "127.0.0.1", TestPort(26181)),
-      protocol::UdpStatus::kOk);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
   const auto id = NodeConfigId(cfg);
   uint64_t now = 1000000;
   ASSERT_TRUE(InjectState(node, gateway, TrustState(id, 11, 1, now), now));
