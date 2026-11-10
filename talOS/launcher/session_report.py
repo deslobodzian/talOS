@@ -83,9 +83,11 @@ def analyze(manifest, records):
             item["fraction"] = sum(values) / len(values)
         status_summary[field] = item
     verdicts = []
-    def verdict(name, measured, passes, detail):
+    def verdict(name, measured, passes, detail, required=True):
+        # --strict requires every required verdict to PASS. Informational rows
+        # have no recorded input or no acceptance threshold and never pass.
         verdicts.append({"measurement": name, "verdict": "NOT MEASURED" if not measured else
-                         "PASS" if passes else "FAIL", "detail": detail})
+                         "PASS" if passes else "FAIL", "required": required, "detail": detail})
     for name, values in (("overall", overall), ("enabled", enabled)):
         s = stats(values)
         verdict(name + " state median", s is not None,
@@ -96,13 +98,23 @@ def analyze(manifest, records):
     gaps = sum(v >= 100 for v in enabled)
     verdict("enabled state gaps", bool(enabled), gaps == 0, f"{gaps} gaps >= 100 ms")
     verdict("target age at tick", False, False,
-            "Polled subscriptions/selected Target values are not recorded as tick inputs; receipt age is shown only for MESSAGE dispatches. command_timeout_us is not in the session manifest.")
+            "Polled subscriptions/selected Target values are not recorded as tick inputs; receipt age is shown only for MESSAGE dispatches. command_timeout_us is not in the session manifest.",
+            required=False)
     verdict("timer lateness", False, False,
-            "Measured where TIMER dispatches exist; no acceptance threshold is specified.")
+            "Measured where TIMER dispatches exist; no acceptance threshold is specified.",
+            required=False)
+    issues = [] if manifest.get("end_wall_ns") else [
+        "session unfinished (end_wall_ns = 0: no normal shutdown)"]
+    # Only recording nodes (non-empty log_path) are acceptance evidence. Host
+    # processes without an event log (studio_bridge, sim_gateway) are not.
+    issues += [f"{n.get('name')}: {flag}" for n in manifest["nodes"] if n.get("log_path")
+               for flag in ("quarantined", "recorder_failed", "log_capped") if n.get(flag)]
     return {"session_id": manifest.get("session_id"),
             "config_sha256": manifest.get("config_sha256") or "NOT RECORDED (non-bundle launch)",
-            "nodes": [{k: n.get(k) for k in ("name", "restart_count", "exit_code", "log_capped")}
+            "nodes": [{k: n.get(k) for k in ("name", "restart_count", "exit_code", "quarantined",
+                                             "recorder_failed", "log_capped")}
                       for n in manifest["nodes"]],
+            "session_issues": issues,
             "state_stream": source, "state_overall": stats(overall),
             "state_enabled": stats(enabled), "enabled_gaps_ge_100_ms": gaps,
             "target_receipt_age": {k: stats(v) for k, v in sorted(targets.items())},
@@ -114,13 +126,21 @@ def analyze(manifest, records):
                             "Capped, truncated or unfinished sessions cannot establish whole-session acceptance; retain raw logs."]}
 
 
+def strict_failures(report):
+    """Reasons a --strict run rejects the session; empty means acceptance."""
+    return [f"{v['measurement']}: {v['verdict']}" for v in report["verdicts"]
+            if v["required"] and v["verdict"] != "PASS"] + report["session_issues"]
+
+
 def markdown(report):
     lines = ["# Session report", f"Session: {report['session_id']}",
              f"Config SHA-256: {report['config_sha256']}", "", "## Nodes",
-             "| Node | Restarts | Exit code | log_capped |",
-             "|---|---:|---:|---|"]
+             "| Node | Restarts | Exit code | quarantined | recorder_failed | log_capped |",
+             "|---|---:|---:|---|---|---|"]
     for n in report["nodes"]:
         lines.append("| " + " | ".join(str(n[k]) for k in n) + " |")
+    lines += ["", "## Session completeness"] + (
+        ["- " + s for s in report["session_issues"]] or ["- complete"])
     lines += ["", "## Timing (ms)", f"State stream: {report['state_stream'] or 'NOT MEASURED'}",
               "| Measurement | Count | Median | p99 | Max |", "|---|---:|---:|---:|---:|"]
     entries = {"/hw/state overall": report["state_overall"],
@@ -139,25 +159,41 @@ def markdown(report):
     for field, values in report["status"].items():
         lines.append(f"- {field}: " + ", ".join(f"{k}={v}" for k, v in values.items()))
     lines += ["", "## Verdicts"]
-    lines += [f"- **{v['verdict']}** {v['measurement']}: {v['detail']}" for v in report["verdicts"]]
+    lines += [f"- **{v['verdict']}** {v['measurement']}" +
+              ("" if v["required"] else " (informational, not required)") + f": {v['detail']}"
+              for v in report["verdicts"]]
     lines += ["", "## Measurement limits"] + ["- " + s for s in report["limitations"]]
     return "\n".join(lines)
+
+
+def log_dump_path():
+    files = runfiles.Create()
+    binary = files.Rlocation("_main/talOS/launcher/log_dump") if files else None
+    if not binary or not Path(binary).is_file():
+        raise FileNotFoundError(
+            "log_dump runfile not found; run with bazel run //talOS/launcher:session_report")
+    return binary
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("session", type=Path)
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--strict", action="store_true", help="exit 2 on any FAIL; NOT MEASURED is not a pass")
+    parser.add_argument("--strict", action="store_true",
+                        help="exit 2 unless every required verdict passes and the session is complete")
     args = parser.parse_args()
     try:
         manifest = json.loads((args.session / "manifest.json").read_text())
-        binary = runfiles.Create().Rlocation("_main/talOS/launcher/log_dump")
-        result = subprocess.run([binary, "--format", "jsonl", str(args.session)],
+        result = subprocess.run([log_dump_path(), "--format", "jsonl", str(args.session)],
                                 capture_output=True, text=True, check=True)
         report = analyze(manifest, [json.loads(line) for line in result.stdout.splitlines()])
         print(json.dumps(report, indent=2) if args.json else markdown(report))
-        return 2 if args.strict and any(v["verdict"] == "FAIL" for v in report["verdicts"]) else 0
+        if not args.strict:
+            return 0
+        failures = strict_failures(report)
+        for failure in failures:
+            print(f"session_report: strict: {failure}", file=sys.stderr)
+        return 2 if failures else 0
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
         print(f"session_report: {error}", file=sys.stderr)
         if isinstance(error, subprocess.CalledProcessError):

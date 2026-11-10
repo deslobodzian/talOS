@@ -320,7 +320,8 @@ bazel run //talOS/launcher:session_report -- --json /tmp/logs/session
 
 The offline Python tool reuses `log_dump` and its events reader/embedded
 descriptor decoder, without robot-specific schemas. It reports manifest config
-identity, node exits/restarts/caps, state inter-arrival median/nearest-rank p99/max,
+identity, node exits/restarts/quarantine/recorder failures/caps, an unfinished
+session, state inter-arrival median/nearest-rank p99/max,
 enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
 lateness, and every scalar `/hw/status` field (including new clock fields).
 Counter deltas sum nonnegative increments and separately count resets.
@@ -333,8 +334,14 @@ consumer stream if there is no publisher recording; duplicate readers are never
 pooled. Enabled intervals hold the logged DS enabled bit until its next sample,
 not a reconstructed safety gate. A gap overlapping an enabled interval counts.
 Median “about 5 ms” uses an explicitly labeled 4–6 ms analysis tolerance; p99
-must be below 10 ms. `--strict` exits 2 for FAIL, 1 for input/reader errors,
-and 0 otherwise; NOT MEASURED is never a pass.
+must be below 10 ms. `--strict` exits 2 unless every required verdict is PASS
+and the manifest shows a finished session (`end_wall_ns` nonzero) with no
+recording node (non-empty `log_path`) `quarantined`, `recorder_failed` or
+`log_capped`; host processes without an event log (`studio_bridge`,
+`sim_gateway`) are not acceptance evidence and are exempt. It names each reason
+on stderr. It exits 1 for input/reader errors (including a missing `log_dump`
+runfile) and 0 otherwise. NOT MEASURED is never a pass; only the tick-time
+target age and timer lateness rows are informational and not required.
 
 Target receipt age is `now - publish_time`, not target age at a control tick.
 Polled subscriptions and the selected Target value are not recorded as tick

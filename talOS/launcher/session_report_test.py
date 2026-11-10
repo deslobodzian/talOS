@@ -1,7 +1,9 @@
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from python.runfiles import runfiles
 from talOS.launcher import session_report
@@ -52,6 +54,34 @@ class SessionReportTest(unittest.TestCase):
     def test_empty_session_has_no_pass(self):
         report = session_report.analyze({"nodes": []}, [])
         self.assertTrue(all(v["verdict"] == "NOT MEASURED" for v in report["verdicts"]))
+
+    def test_strict_rejects_unmeasured_and_incomplete_sessions(self):
+        records = [dict(process="bridge", kind="SEND", topic="/hw/state/driver_station",
+                        now_ms=0, event_ms=0, publish_ms=0, decoded="", ds_enabled=True)]
+        records += [dict(process="bridge", kind="SEND", topic="/hw/state", now_ms=t,
+                         event_ms=t, publish_ms=t, decoded="") for t in range(0, 55, 5)]
+        flags = {"quarantined": True, "recorder_failed": True, "log_capped": True}
+        bridge = {"name": "bridge", "log_path": "/s/bridge.tlog"}
+        # A failed viewer without an event log is not acceptance evidence.
+        studio = {"name": "studio_bridge", "log_path": "", **flags}
+        cases = (
+            # Only the by-design NOT MEASURED rows remain, and they do not fail.
+            ({"end_wall_ns": 1, "nodes": [bridge, studio]}, records, 0),
+            # The hardware node recorded no /hw/state: five required verdicts.
+            ({"end_wall_ns": 1, "nodes": [bridge]}, [], 5),
+            ({"end_wall_ns": 0, "nodes": [{**bridge, **flags}, studio]}, records, 4),
+        )
+        for manifest, session, failures in cases:
+            self.assertEqual(len(session_report.strict_failures(
+                session_report.analyze(manifest, session))), failures, manifest)
+
+    def test_missing_log_dump_is_an_input_error(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(session_report.runfiles, "Create", return_value=None), \
+                mock.patch.object(sys, "argv", ["session_report", directory]):
+            with open(directory + "/manifest.json", "w") as manifest:
+                manifest.write('{"nodes": []}')
+            self.assertEqual(session_report.main(), 1)
 
 
 if __name__ == "__main__":
