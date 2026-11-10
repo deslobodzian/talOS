@@ -166,7 +166,7 @@ TEST(TelemetryJson, DictionaryWithoutValuesInvalidatesThePreviousFrame) {
       EXPECT_TRUE(state.has_frame);
       ASSERT_EQ(state.values.size(), 3);
       EXPECT_EQ(state.values[0], 2.0);
-      EXPECT_EQ(state.received_wall_ns, 30);
+      EXPECT_EQ(state.received_monotonic_ns, 30);
     }
   }
 }

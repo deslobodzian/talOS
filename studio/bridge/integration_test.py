@@ -266,6 +266,15 @@ class BridgeIntegration(unittest.TestCase):
                 with socket.create_connection(("127.0.0.1", http_port), timeout=3) as http:
                     http.sendall(b"GET /%2e%2e/secret HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
                     self.assertIn(b"400 Bad Request", http.recv(1024))
+                # Static files are read synchronously on the polling thread,
+                # so one past the 4 MiB cap is refused rather than read.
+                oversized = Path(webroot, "oversized.js")
+                with oversized.open("wb") as handle:
+                    handle.truncate(4 * 1024 * 1024 + 1)
+                with self.assertRaises(urllib.error.HTTPError) as too_large:
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{http_port}/oversized.js", timeout=3)
+                self.assertEqual(too_large.exception.code, 413)
             finally:
                 for process in reversed(processes):
                     if process.poll() is None:

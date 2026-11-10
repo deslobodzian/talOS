@@ -30,6 +30,11 @@ void signal_handler(int) { stop = 1; }
 struct EgressBudget {
   static constexpr double kBytesPerSecond = 160000;
   static constexpr double kBurstBytes = 64000;
+  // WebSocket framing is charged too, conservatively: a 2-byte header below
+  // 126 payload bytes, otherwise 10.
+  static constexpr std::size_t framed(std::size_t bytes) {
+    return bytes + (bytes < 126 ? 2 : 10);
+  }
   double tokens = kBurstBytes;
   std::chrono::steady_clock::time_point updated =
       std::chrono::steady_clock::now();
@@ -73,7 +78,7 @@ struct Bridge {
 
   bool send(Socket* client, std::string_view bytes, uWS::OpCode opcode) {
     // Charge WebSocket framing too. Drop rather than queue old observations.
-    const auto size = bytes.size() + (bytes.size() < 126 ? 2 : 10);
+    const auto size = EgressBudget::framed(bytes.size());
     auto& local = client->getUserData()->budget;
     if (client->getBufferedAmount() != 0 ||
         !local.available(size, EgressBudget::kBytesPerSecond /
@@ -113,6 +118,7 @@ struct Bridge {
   // watch the robot come up.
   std::optional<talos::introspect::RegistryReader> registry;
   std::string system_json = "{}";
+  bool system_json_oversized = false;
   std::int64_t started_wall_ns = talos::introspect::wall_now_ns();
 
   void refresh_system() {
@@ -144,6 +150,20 @@ struct Bridge {
     input.nodes.push_back(self());
 
     system_json = studio::SystemGraphJson(input);
+
+    // A send must fit the egress burst, so a larger graph is never delivered:
+    // every attempt counts as a ws_drop and Studio marks its last graph stale.
+    // Logged once per crossing, not on every refresh.
+    const bool oversized =
+        static_cast<double>(EgressBudget::framed(system_json.size())) >
+        EgressBudget::kBurstBytes;
+    if (oversized && !system_json_oversized) {
+      std::cerr << "system graph is " << system_json.size() << " B, over the "
+                << EgressBudget::kBurstBytes
+                << " B WebSocket egress burst; clients will not receive it "
+                   "(/system.json still serves it)\n";
+    }
+    system_json_oversized = oversized;
 
     // Text on the WebSocket, so a client tells the two message families apart
     // by frame type and needs no sniffing.
@@ -195,7 +215,7 @@ struct Bridge {
         continue;
       }
       if (!studio::IngestTelemetry(telemetry_state, bytes,
-                                   talos::introspect::wall_now_ns())) {
+                                   talos::introspect::monotonic_now_ns())) {
         ++invalid;
         continue;
       }
@@ -238,6 +258,13 @@ std::string mime(const fs::path& p) {
   if (ext == ".wasm") return "application/wasm";
   return "application/octet-stream";
 }
+// Static files and the manifest are read synchronously on the loop thread
+// that also polls RTMS, so each is capped. The static cap is a few times the
+// built Studio bundle's largest asset; the manifest cap is Studio's own
+// MAX_MANIFEST_BYTES (studio/src/data/manifest.ts), which rejects anything
+// larger anyway.
+constexpr std::uintmax_t kMaxStaticFileBytes = 4 * 1024 * 1024;
+constexpr std::uintmax_t kMaxManifestBytes = 1024 * 1024;
 }  // namespace
 int main(int argc, char** argv) try {
   // `--describe`: answer what this process is without touching shared memory,
@@ -442,7 +469,7 @@ int main(int argc, char** argv) try {
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
         ->end(studio::TelemetryJson(bridge.telemetry_state,
-                                    talos::introspect::wall_now_ns()));
+                                    talos::introspect::monotonic_now_ns()));
   });
   app.get("/channels.json", [&](auto* res, auto*) {
     if (!bridge.telemetry_state.has_dictionary) {
@@ -485,7 +512,7 @@ int main(int argc, char** argv) try {
       res->writeStatus("404 Not Found")->end();
       return;
     }
-    if (size > static_cast<std::uintmax_t>(32) * 1024 * 1024) {
+    if (size > kMaxManifestBytes) {
       res->writeStatus("413 Content Too Large")->end();
       return;
     }
@@ -520,8 +547,7 @@ int main(int argc, char** argv) try {
       return;
     }
     // Files are bounded; uWS owns buffered response bytes after end().
-    if (fs::file_size(file, error) >
-        static_cast<std::uintmax_t>(32) * 1024 * 1024) {
+    if (fs::file_size(file, error) > kMaxStaticFileBytes) {
       res->writeStatus("413 Content Too Large")->end();
       return;
     }
@@ -546,7 +572,10 @@ int main(int argc, char** argv) try {
   if (!timer) throw std::runtime_error("poll timer allocation failed");
   *static_cast<Bridge**>(us_timer_ext(timer)) = &bridge;
   // One timer at the telemetry rate; the system graph is structure, not
-  // signal, so it refreshes every 250th tick instead.
+  // signal, so it refreshes every 250th tick instead. Each refresh is re-sent
+  // even when the structure is unchanged: Studio marks the graph stale when
+  // none arrives within GRAPH_STALE_AFTER_MS (studio/src/data/freshness.ts),
+  // and measures node rates from successive graphs' counters.
   static constexpr unsigned kSystemRefreshTicks = 250;
   static unsigned ticks = 0;
   bridge.refresh_system();

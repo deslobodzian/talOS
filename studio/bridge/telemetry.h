@@ -55,7 +55,8 @@ struct TelemetryState {
   std::uint64_t timestamp_ns{0};
   TelemetryPose chassis{};
   std::vector<double> values;
-  std::int64_t received_wall_ns{0};
+  // Monotonic, so age_ms cannot be hidden or inflated by a wall-clock step.
+  std::int64_t received_monotonic_ns{0};
 };
 
 // Decodes one size-prefixed v2 payload (as telemetry_wire::payload returns
@@ -64,7 +65,7 @@ struct TelemetryState {
 // belongs to the cached (stream_id, dictionary_id) -- its own dictionary
 // counts. Returns false for bytes that are not a verifiable v2 Frame.
 inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
-                            std::int64_t wall_ns) {
+                            std::int64_t monotonic_ns) {
   flatbuffers::Verifier verifier{
       reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()};
   if (!Talos::Telemetry::VerifySizePrefixedFrameBuffer(verifier)) return false;
@@ -136,7 +137,7 @@ inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
   state.chassis = {chassis->x(),    chassis->y(),     chassis->z(),
                    chassis->roll(), chassis->pitch(), chassis->yaw()};
   state.values.assign(frame->values()->begin(), frame->values()->end());
-  state.received_wall_ns = wall_ns;
+  state.received_monotonic_ns = monotonic_ns;
   state.has_frame = true;
   return true;
 }
@@ -170,9 +171,10 @@ inline void AppendPose(std::string& out, const TelemetryPose& pose) {
 }
 
 // GET /telemetry.json. Precondition: has_dictionary && has_frame (the
-// route answers 503 until then).
+// route answers 503 until then). `now_monotonic_ns` is on the clock
+// IngestTelemetry was given.
 inline std::string TelemetryJson(const TelemetryState& state,
-                                 std::int64_t now_wall_ns) {
+                                 std::int64_t now_monotonic_ns) {
   std::string out;
   out.reserve(2048);
   out += "{\"kind\":\"talos.telemetry\",\"version\":";
@@ -187,8 +189,8 @@ inline std::string TelemetryJson(const TelemetryState& state,
   out += std::to_string(state.dictionary_id);
   out += ",\"age_ms\":";
   const std::int64_t age_ms =
-      now_wall_ns > state.received_wall_ns
-          ? (now_wall_ns - state.received_wall_ns) / 1'000'000
+      now_monotonic_ns > state.received_monotonic_ns
+          ? (now_monotonic_ns - state.received_monotonic_ns) / 1'000'000
           : 0;
   out += std::to_string(age_ms);
   out += ",\"chassis\":";

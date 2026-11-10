@@ -42,7 +42,7 @@ The manual runtime command still takes its topic positionally.
 | `/telemetry.json` | Latest dictionary-aligned frame, keyed by channel name | 503 until dictionary and aligned values arrive |
 | `/system.json` | Node registry and bridge statistics | Reports `registry.available: false` when the registry cannot be opened |
 | `/declared.json` | Startup copy of the declared graph file | 404 if absent, empty or unreadable |
-| `/manifest.json` | Current manifest file | 404 if absent or unreadable; 413 above 32 MiB |
+| `/manifest.json` | Current manifest file | 404 if absent or unreadable; 413 above 1 MiB (Studio's own manifest limit) |
 | `/telemetry` | WebSocket: binary telemetry and text system graphs | Excess clients receive 503 |
 
 For example:
@@ -58,8 +58,9 @@ Telemetry JSON has `kind: "talos.telemetry"`, `version: 2`, `stream_id`,
 `channels`. Stream, sequence and timestamp uint64 values are decimal strings.
 Each channel entry has `value` and `unit` (empty when unitless), plus `label`
 for an in-range integer enum value. Nonfinite readings become `null`.
-`age_ms` measures time since the bridge received the aligned frame; an old
-finite value does not automatically become null as wall time passes.
+`age_ms` measures time since the bridge received the aligned frame, on the
+bridge's monotonic clock, so a wall-clock step does not change it; an old
+finite value does not automatically become null as time passes.
 The dictionary JSON has `kind: "talos.telemetry.channels"` and `version: 2`.
 
 On WebSocket open the bridge attempts to send the current graph, then its
@@ -71,7 +72,14 @@ The bridge verifies and decodes frames for its JSON views before forwarding
 aligned telemetry.
 
 The system graph includes the bridge itself and refreshes every 250 poll ticks
-(the timer is scheduled at 1 ms). It opens the registry lazily. Topic health is
+(the timer is scheduled at 1 ms). Every refresh is re-sent to every client:
+Studio judges the graph stale from its arrival time, so the resend interval
+must stay below Studio's `GRAPH_STALE_AFTER_MS`
+([`freshness.ts`](../src/data/freshness.ts)). A graph larger than the egress
+burst ([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary))
+can never be sent; the bridge logs that once when the graph crosses the burst,
+counts each attempt in `ws_drops`, and still serves it at `/system.json`. It
+opens the registry lazily. Topic health is
 computed in [`system.h`](system.h): missing ends are `bridged` when external,
 otherwise `unconnected` when optional, otherwise `orphaned` or `unread`;
 connected topics are `lossy` when drops are recorded, `idle` before publication,
@@ -116,5 +124,7 @@ frame sizes and [shared-memory geometry](../../docs/DATA_FLOW.md#main-processor-
 
 Start the publisher before the bridge and stop the bridge before replacing it.
 Graceful SIGINT/SIGTERM releases the reader slot. Static files are read
-synchronously and capped at 32 MiB each. The server has no authentication or TLS;
-use it only on a trusted robot/development network.
+synchronously on the thread that polls telemetry and capped at 4 MiB each
+(413 above it), a few times the built Studio bundle's largest asset. The server
+has no authentication or TLS; use it only on a trusted robot/development
+network.
