@@ -1195,6 +1195,31 @@ TEST(LauncherGraphTest, ProbeReportsWhyABinaryCannotRun) {
   EXPECT_NE(error.find(std::strerror(ENOENT)), std::string::npos) << error;
 }
 
+// A probe is asked once per launch, so a fork refused for want of a process
+// slot (EAGAIN) must be retried, not reported as a binary that did not answer:
+// that refuses a critical node's launch (TODO.md INC-5).
+TEST(LauncherGraphTest, TransientProbeSpawnFailureIsRetried) {
+  NodeSpec spec;
+  spec.name = "alpha";
+  spec.target = "//example/alpha:node";
+  spec.binary_path = WriteStubNode(
+      "transient_alpha", DescribingStub("alpha", "//example/alpha:node",
+                                        {Sender("/alpha/state")}));
+
+  LauncherOptions options;
+  options.describe_timeout_ms = 4000;
+  options.probe_spawn_failures["alpha"] = 2;
+  std::vector<NodeDescription> described;
+  const auto diagnostics = DescribeGraph({spec}, options, described);
+
+  ASSERT_EQ(described.size(), 1u);
+  EXPECT_TRUE(described[0].answered) << described[0].error;
+  for (const auto& diagnostic : diagnostics)
+    EXPECT_NE(diagnostic.subject, "alpha") << diagnostic.message;
+
+  std::remove(spec.binary_path.c_str());
+}
+
 // A framework node that reads the declared graph, as a stub: described
 // without --graph it registers nothing but says it reads the graph; with
 // --graph it observes /alpha/state and keeps a copy of the graph it was

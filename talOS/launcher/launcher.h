@@ -426,6 +426,10 @@ struct LauncherOptions {
   // Internal supervision seam: the next N spawns of the named roster member
   // fail as fork() does under EAGAIN. Production leaves it empty.
   std::map<std::string, int> spawn_failures;
+  // Internal describe seam: the first N spawn attempts of each --describe
+  // probe of the named roster member fail as the guardian fork does under
+  // EAGAIN (ProbeDescribe). Production leaves it empty.
+  std::map<std::string, int> probe_spawn_failures;
   // Internal supervision seam: syncs an open session file or directory to
   // disk; process::DurableSync in production. The supervision loop never
   // calls it: the manifest writer's thread syncs the versions the loop
@@ -784,6 +788,26 @@ inline bool CloseOnExecPipe(int (&fds)[2]) {
   return false;
 }
 
+// Why SpawnProcess returned -1: the step that failed, as its error names it
+// ("fork", "fork (guardian)", "execv <path>", ...), and its errno.
+struct SpawnFailure {
+  std::string step;
+  int code{0};
+};
+
+// The step names of the two forks a spawn makes: the launcher's own, and the
+// child's fork of its group's guardian.
+inline constexpr std::string_view kForkStep = "fork";
+inline constexpr std::string_view kGuardianForkStep = "fork (guardian)";
+
+// A failure that a later attempt can avoid: a fork refused for want of a
+// process slot (EAGAIN, the per-user or system process limit) or memory
+// (ENOMEM). Every other step's failure repeats until something is changed.
+inline bool IsTransientSpawnFailure(const SpawnFailure& failure) {
+  return (failure.step == kForkStep || failure.step == kGuardianForkStep) &&
+         (failure.code == EAGAIN || failure.code == ENOMEM);
+}
+
 // The steps by which a forked child becomes its program; each can fail before
 // the program runs.
 enum class ChildStep : int {
@@ -820,7 +844,7 @@ inline std::string ChildStepName(ChildStep step, const std::string& program) {
     case ChildStep::kDeathSignal:
       return "prctl(PR_SET_PDEATHSIG)";
     case ChildStep::kGuardian:
-      return "fork (guardian)";
+      return std::string{kGuardianForkStep};
     case ChildStep::kOutput:
       return "redirect output";
     case ChildStep::kExec:
@@ -848,13 +872,16 @@ inline constexpr int kChildOutputPipeBytes = 256 * 1024;
 // shares with the launcher shows by closing. A child that fails before or at
 // its exec reports the step and errno there instead, exits 127 and is reaped;
 // then, as when a pipe or the fork fails here, this returns -1 with `error`
-// naming the step and its errno ("execv <path>: Permission denied"), and no
-// reader. Safe to call from several threads at once (SpawnMutex).
+// naming the step and its errno ("execv <path>: Permission denied"), the
+// same two in `*failure` when given, and no reader. Safe to call from several
+// threads at once (SpawnMutex).
 inline pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
                           SpawnOutput output = SpawnOutput::kInherit,
-                          int* reader = nullptr) {
-  const auto fail = [&error](std::string_view step, int code) {
+                          int* reader = nullptr,
+                          SpawnFailure* failure = nullptr) {
+  const auto fail = [&error, failure](std::string_view step, int code) {
     error = std::string{step} + ": " + std::strerror(code);
+    if (failure != nullptr) *failure = {std::string{step}, code};
     return pid_t{-1};
   };
   if (output != SpawnOutput::kInherit && reader == nullptr)
@@ -895,7 +922,7 @@ inline pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
     for (const int fd : {lifetime[0], lifetime[1], errors[0], errors[1],
                          child_output[0], child_output[1]})
       if (fd >= 0) ::close(fd);
-    return fail("fork", code);
+    return fail(kForkStep, code);
   }
   if (pid > 0) {
     ::close(lifetime[0]);
@@ -907,13 +934,13 @@ inline pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
     spawning.unlock();
     // EOF once the exec has closed the child's writer and the guardian its
     // copy, or once a child died without a report; a report otherwise.
-    ChildFailure failure{};
+    ChildFailure report{};
     ssize_t got = 0;
-    while ((got = ::read(errors[0], &failure, sizeof failure)) < 0 &&
+    while ((got = ::read(errors[0], &report, sizeof report)) < 0 &&
            errno == EINTR) {
     }
     ::close(errors[0]);
-    if (got != static_cast<ssize_t>(sizeof failure)) {
+    if (got != static_cast<ssize_t>(sizeof report)) {
       if (reader != nullptr) *reader = child_output[0];
       return pid;
     }
@@ -921,7 +948,7 @@ inline pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
     while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
     }
     FinishProcessGroup(pid);
-    return fail(ChildStepName(failure.step, args.front()), failure.code);
+    return fail(ChildStepName(report.step, args.front()), report.code);
   }
   // The child: only async-signal-safe calls from here to the exec.
   if (::setpgid(0, 0) != 0)
@@ -1504,17 +1531,58 @@ inline std::string SignalText(int signal) {
 // stdout, killing it after `timeout`: a node that blocks in its constructor
 // costs the launch that much and no more. stderr is left alone so a node that
 // throws says so. A binary that cannot be run says why (SpawnProcess).
+//
+// A spawn refused for want of a process slot or memory
+// (IsTransientSpawnFailure) is retried after a backoff that doubles from
+// kProbeSpawnRetryFirst to kProbeSpawnRetryMax, within the same `timeout`;
+// past it, `error` names the last failure and the attempts made, and a probe
+// that spawns after a retry says so on stderr. A probe is asked once per
+// launch, so a fork refused while the parallel probes briefly hold every
+// process the user may run would otherwise refuse a critical node's launch.
+// Every other spawn failure is reported at once.
+// `injected_spawn_failures` is a test seam: the first that many attempts fail
+// as the guardian fork does under EAGAIN, without spawning.
+inline constexpr std::chrono::milliseconds kProbeSpawnRetryFirst{5};
+inline constexpr std::chrono::milliseconds kProbeSpawnRetryMax{200};
+
 inline bool ProbeDescribe(const std::vector<std::string>& args,
                           std::chrono::milliseconds timeout,
-                          introspect::Description& out, std::string& error) {
+                          introspect::Description& out, std::string& error,
+                          int injected_spawn_failures = 0) {
   error.clear();
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
   int answer = -1;
-  const pid_t pid =
-      SpawnProcess(args, error, SpawnOutput::kStdoutPipe, &answer);
-  if (pid < 0) return false;
+  pid_t pid = -1;
+  auto backoff = kProbeSpawnRetryFirst;
+  for (int attempt = 1;; ++attempt) {
+    SpawnFailure failure;
+    if (injected_spawn_failures > 0) {
+      --injected_spawn_failures;
+      failure = {std::string{kGuardianForkStep}, EAGAIN};
+      error = failure.step + ": " + std::strerror(EAGAIN);
+    } else {
+      pid = SpawnProcess(args, error, SpawnOutput::kStdoutPipe, &answer,
+                         &failure);
+      if (pid >= 0) {
+        // Absorbed, but said: how often the process limit is reached.
+        if (attempt > 1)
+          std::cerr << "[launcher] probe of " << args.front() << " spawned on "
+                    << "attempt " << attempt << " (after " << error << ")\n";
+        error.clear();
+        break;
+      }
+    }
+    if (!IsTransientSpawnFailure(failure)) return false;
+    if (std::chrono::steady_clock::now() + backoff >= deadline) {
+      error += " (" + std::to_string(attempt) + " attempts within " +
+               std::to_string(timeout.count()) + "ms)";
+      return false;
+    }
+    std::this_thread::sleep_for(backoff);
+    backoff = std::min(backoff * 2, kProbeSpawnRetryMax);
+  }
 
   std::string text;
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
   bool timed_out = false;
   constexpr std::size_t kMaxDescribeBytes = std::size_t{4} * 1024 * 1024;
   for (;;) {
@@ -1725,10 +1793,13 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
     if (options.simulation) args.push_back("--sim");
     if (!graph_path.empty()) args.insert(args.end(), {"--graph", graph_path});
     args.insert(args.end(), spec.extra_args.begin(), spec.extra_args.end());
+    const auto injected = options.probe_spawn_failures.find(spec.name);
     try {
       described.answered = ProbeDescribe(
           args, std::chrono::milliseconds{options.describe_timeout_ms},
-          described.declared, described.error);
+          described.declared, described.error,
+          injected == options.probe_spawn_failures.end() ? 0
+                                                         : injected->second);
     } catch (const std::exception& e) {
       described.answered = false;
       described.error = e.what();

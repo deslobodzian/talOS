@@ -75,8 +75,14 @@ A failed critical probe is an error; a failed non-critical probe is a warning.
 `--describe-timeout-ms MS` sets the per-binary deadline. A binary that cannot
 be run at all is reported with the step and errno that stopped it, as a spawn
 is ([restarts](#restarts)): `did not answer --describe (execv <path>: Exec
-format error)`, not an exit code 127. Missing descriptions remain recorded in
-`graph.json` and the session manifest.
+format error)`, not an exit code 127. A probe is asked once, so a spawn
+refused for want of a process slot or memory (`EAGAIN` or `ENOMEM` at `fork`
+or `fork (guardian)`, as when the parallel probes reach the per-user process
+limit) is retried, after 5 ms and then twice as long each time up to 200 ms,
+until the describe deadline; past it the finding names that last cause and the
+attempts made, and a probe that spawns only after a retry prints `[launcher]
+probe of <binary> spawned on attempt N (after <step>: <errno>)`. Any other spawn failure is reported at once. Missing
+descriptions remain recorded in `graph.json` and the session manifest.
 
 ## Controller addressing
 

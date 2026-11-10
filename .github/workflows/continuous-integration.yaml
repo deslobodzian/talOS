@@ -135,6 +135,17 @@ jobs:
     - name: Test
       run: bazel test //... --noshow_progress --test_output=errors
 
+    - name: Process limits and counts after a failure
+      # TODO.md INC-5: a probe whose spawn names `fork (guardian)` or `fork`
+      # with EAGAIN ran out of process slots. These are the limits and what
+      # is still running once the tests end, not the peak.
+      if: ${{ failure() }}
+      run: |
+        sysctl kern.maxproc kern.maxprocperuid
+        echo "ulimit -u: $(ulimit -u)"
+        echo "processes: $(ps -A | wc -l)"
+        echo "processes of uid $(id -u): $(ps -U "$(id -u)" | wc -l)"
+
     - *checkout-unchanged
 
   soak:
