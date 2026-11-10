@@ -342,7 +342,7 @@ less its offset (`run()`) and first `/hw/request/drivetrain` send:
 | Stage | ms, median (range) | Set by |
 |---|---|---|
 | SIGKILL → launcher reaps the exit | not yet measured | the SIGCHLD wakeup of the supervision loop |
-| reap → `fork` of the restart | not yet measured | restart bookkeeping; the manifest is written off the loop |
+| reap → `fork` of the restart | not yet measured | restart bookkeeping (`RestartLogBudget` lists the session directory); the pass posts its manifest version to the writer thread after its restarts |
 | `fork` → first constructor | 1.2 (1.1–1.2) | group and guardian setup, exec, dynamic loading |
 | first constructor → event-loop origin | 0.4 (0.4–0.5) | flags; the event-log file is created on the log's writer thread, not here |
 | origin → `run()` | 1.5 (1.4–1.6) | robot config parse, topic attach |

@@ -3239,6 +3239,9 @@ class Launcher {
       const auto stop_arrived = [&] {
         return stopping || stop_requested_ != 0;
       };
+      // A pass posts at most one manifest version, after its restarts (see
+      // the post below).
+      bool manifest_changed = false;
       if (session_lock_ != nullptr && now >= next_lock_refresh) {
         next_lock_refresh = now + kSessionLockRefresh;
         if (!session_lock_->Refresh() && !lock_lost_reported) {
@@ -3308,7 +3311,7 @@ class Launcher {
               break;
             }
           }
-          if (NoteRecording(proc, launch, recording)) PersistManifest(procs);
+          if (NoteRecording(proc, launch, recording)) manifest_changed = true;
           const bool grace_over =
               now - launch.started_at >=
               std::chrono::milliseconds{options_.heartbeat_startup_grace_ms};
@@ -3336,7 +3339,7 @@ class Launcher {
         proc.exited = true;
         proc.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         proc.exit_signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
-        PersistManifest(procs);
+        manifest_changed = true;
         const bool is_bridge = studio && i == studio->index();
         if (is_bridge && studio->Starting(i)) continue;
         const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
@@ -3349,7 +3352,6 @@ class Launcher {
                     << (proc.quarantined ? "quarantined; retry" : "restart")
                     << " " << proc.restart_count + 1 << " in " << delay.count()
                     << " ms\n";
-          PersistManifest(procs);
           continue;
         }
         std::cout << "[launcher] Process " << proc.name << " (pid " << proc.pid
@@ -3363,7 +3365,7 @@ class Launcher {
           launch.restart_pending = false;
           procs[i].quarantined = false;
           procs[i].retry_at_monotonic_ns = 0;
-          PersistManifest(procs);
+          manifest_changed = true;
         } else if (now >= launch.restart_at) {
           if (launch.last_exit_clean &&
               !RosterContinues(procs, launches, studio, i)) {
@@ -3375,7 +3377,7 @@ class Launcher {
           } else {
             Restart(procs[i], launch, now);
           }
-          PersistManifest(procs);
+          manifest_changed = true;
         }
       }
       if (studio) {
@@ -3387,8 +3389,14 @@ class Launcher {
         const auto& after = procs[studio->index()];
         if (pid != after.pid || exited != after.exited ||
             failed != after.failed)
-          PersistManifest(procs);
+          manifest_changed = true;
       }
+      // Posted after the pass's restarts and the bridge's: the manifest
+      // writer's create in the session directory can stall a restart's
+      // directory reads (RestartLogBudget) and fork for tens to hundreds of
+      // milliseconds while nodes write to the same disk, and the version
+      // posted here carries every change of the pass anyway.
+      if (manifest_changed) PersistManifest(procs);
 
       bool all_done = true;
       for (std::size_t i = 0; i < procs.size(); ++i) {
