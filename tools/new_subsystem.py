@@ -908,7 +908,10 @@ path = "subsystems/@NAME@.toml"
 """
 
 STANDALONE_MODULE = """\
-module(name = "@NAME@", version = "0.1.0")
+module(
+    name = "@NAME@",
+    version = "0.1.0",
+)
 
 bazel_dep(name = "talos", version = "0.1.0")
 @EXTRA_DEPS@"""
@@ -1706,7 +1709,10 @@ def plan_standalone(target_dir, name, lang, talos_root, kind="velocity"):
     files["MODULE.bazel"] += (
         "\n# The talOS checkout this repository was generated from. Replace it\n"
         "# with a registry version once talos is published to one.\n"
-        f'local_path_override(module_name = "talos", path = "{talos_path}")\n')
+        "local_path_override(\n"
+        '    module_name = "talos",\n'
+        f'    path = "{talos_path}",\n'
+        ")\n")
     # talOS's C++23 flags and Bazel version are per workspace, not carried by
     # the module, so the new workspace takes the checkout's own.
     for config in (".bazelrc", ".bazelversion"):
