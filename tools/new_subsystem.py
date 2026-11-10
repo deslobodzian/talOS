@@ -1511,8 +1511,8 @@ runs whether the robot is enabled or not."""
 CC_ESTIMATOR_HEADER = """\
 #pragma once
 
-#include <chrono>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
