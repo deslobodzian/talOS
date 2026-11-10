@@ -320,7 +320,9 @@ struct RegistryTestHooks {
   void (*claiming)(NodeRecord*){nullptr};
 };
 
-// Use a regular file: Darwin's shm descriptors are not vnodes, so flock on
+// Serializes the writers: segment creation, sizing and initialization
+// (RegistryMapping) and slot claims (NodeRegistration); a reader never takes
+// it. Use a regular file: Darwin's shm descriptors are not vnodes, so flock on
 // them fails with ENOTSUP. Each acquisition opens a separate file description,
 // which also serializes threads in one process. close (including process death)
 // releases the lock. Never unlink this file: waiters must keep the same inode.
@@ -331,8 +333,8 @@ class RegistryLock {
     // has only a leading slash, which is removed for the regular filename.
     const std::string file_path =
         "/tmp/talos-registry-" + mapped_path.substr(1) + ".lock";
-    // flock does not require write access. Observers that can only read the
-    // shared segment must not need a writable lock file either.
+    // flock does not require write access, so the file is opened read-only:
+    // any process that may read it can lock it, whichever user created it.
     fd_ = ::open(file_path.c_str(), O_CREAT | O_RDONLY | O_CLOEXEC | O_NOFOLLOW,
                  0666);
     if (fd_ < 0) {
@@ -368,7 +370,15 @@ class RegistryMapping {
                            bool read_only = false,
                            const RegistryTestHooks* test_hooks = nullptr)
       : path_{ShmObjectName(path)} {
-    const RegistryLock lock{path_};
+    // Only a writer creates, sizes or initializes the segment, so only a
+    // writer takes RegistryLock. A reader validates the commit instead: kMagic
+    // is release-stored after every header field and never reset once stored,
+    // so a segment a writer is still creating or initializing opens as absent,
+    // too small or uncommitted, for the reader to retry. No lock holder -- a
+    // node stopped mid-registration, or a descriptor a fork inherited -- can
+    // therefore block a reader, such as the launcher's supervision loop.
+    std::optional<RegistryLock> lock;
+    if (!read_only) lock.emplace(path_);
     const std::size_t size = sizeof(RegistryHeader);
     const int flags = read_only ? O_RDONLY : (O_CREAT | O_RDWR);
 

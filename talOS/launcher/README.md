@@ -199,8 +199,11 @@ timeouts enter the ordinary restart/quarantine policy.
 Every spawned child has its own process group; restart, stop and shutdown
 signal the group, and even a clean exit removes remaining helpers. A guardian
 in each group watches a launcher-owned lifetime pipe and kills the group on
-EOF, including after launcher SIGKILL. Linux also uses `PR_SET_PDEATHSIG`;
-macOS relies on the pipe. Children must not daemonize out of their group.
+EOF, including after launcher SIGKILL. It never execs, so it closes every
+other descriptor it inherited: a lock or pipe end the launcher's process held
+at the spawn would otherwise stay held for as long as the node runs. Linux also
+uses `PR_SET_PDEATHSIG`; macOS relies on the pipe. Children must not daemonize
+out of their group.
 
 The requested-stop supervision test acknowledges installed signal handlers in
 all three stub nodes before signaling the launcher. Every stub stays alive until
@@ -211,8 +214,10 @@ race: a signal before its executable starts can legitimately terminate it.
 With `NOTIFY_SOCKET` set, the launcher sends `READY=1` on entry to supervision
 and `WATCHDOG=1` on every loop iteration, using nonblocking Unix datagrams
 (including Linux `@` abstract names). A hung loop therefore stops feeding the
-service watchdog. See [deployment](../../docs/DEPLOYMENT.md) for the generated
-systemd watchdog policy and macOS's launchd limitations.
+service watchdog. The loop waits on no lock a node can hold: its registry
+attach is read-only, which [takes no lock](../introspection/README.md#the-segment).
+See [deployment](../../docs/DEPLOYMENT.md) for the generated systemd watchdog
+policy and macOS's launchd limitations.
 
 ### Restart latency
 

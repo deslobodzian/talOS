@@ -5,7 +5,9 @@
 // so no two tests share state, ports, or shared memory. Stubs describe an
 // empty graph unless a test explicitly exercises a failed probe.
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -738,6 +740,36 @@ TEST(Supervision, KillingLauncherKillsNodeAndItsHelper) {
   ::close(output[0]);
 }
 
+// A guardian never execs, so a descriptor its launcher's process held at the
+// spawn would stay open in it for as long as the node runs, close-on-exec or
+// not: another thread's registry lock (close-on-exec, like this one) held that
+// way would block every later registration.
+TEST(Supervision, GuardianKeepsNoLockHeldAtSpawn) {
+  const std::string path = TempPath("guardian_lock");
+  const int held = ::open(path.c_str(), O_CREAT | O_RDONLY | O_CLOEXEC, 0600);
+  const int probe = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  ASSERT_GE(held, 0);
+  ASSERT_GE(probe, 0);
+  ASSERT_EQ(::flock(held, LOCK_EX), 0);
+  const pid_t node = SpawnProcess({"/bin/sh", "-c", "exec sleep 30"});
+  ::close(held);
+  ASSERT_GT(node, 0);
+  // The node's own copy closes at its exec; then nothing may hold the lock.
+  bool released = ::flock(probe, LOCK_EX | LOCK_NB) == 0;
+  for (const auto give_up = std::chrono::steady_clock::now() + 5s;
+       !released && std::chrono::steady_clock::now() < give_up;) {
+    std::this_thread::sleep_for(10ms);
+    released = ::flock(probe, LOCK_EX | LOCK_NB) == 0;
+  }
+  EXPECT_TRUE(released) << "the node's guardian still holds the lock";
+  ::close(probe);
+  SignalProcessGroup(node, SIGKILL);
+  while (::waitpid(node, nullptr, 0) < 0 && errno == EINTR) {
+  }
+  FinishProcessGroup(node);
+  ::remove(path.c_str());
+}
+
 // The real supervision loop, not a watchdog thread, must deliver READY before
 // its first WATCHDOG. A hung loop consequently cannot keep the unit healthy.
 TEST(Supervision, SendsReadyThenWatchdogDatagrams) {
@@ -786,7 +818,9 @@ TEST(Supervision, SendsReadyThenWatchdogDatagrams) {
 
 #ifdef __linux__
 TEST(Supervision, NotifierSupportsAbstractSocketNames) {
-  const std::string path = "@tn_" + std::to_string(::getpid());
+  // Abstract names live in the network namespace, which concurrent sandboxed
+  // runs of this test share while their pids repeat across PID namespaces.
+  const std::string path = "@tn_" + std::to_string(GenerateSessionId());
   const int socket = ::socket(AF_UNIX, SOCK_DGRAM, 0);
   ASSERT_GE(socket, 0);
   sockaddr_un address{};
@@ -819,6 +853,49 @@ TEST(Supervision, NotifierSupportsAbstractSocketNames) {
   ::close(socket);
 }
 #endif
+
+// The registry lock is a node's while it creates or claims in the registry,
+// and a node can hold it for good: stopped or stuck mid-registration. The
+// launcher's loop, which feeds the service watchdog, must not wait on it.
+// With the lock held all session, every member starts and the session still
+// ends at its deadline.
+TEST(Supervision, HeldRegistryLockDoesNotStallSupervision) {
+  auto options = BaseOptions("held_lock");
+  options.duration_s = 2;
+  const auto runs = TempPath("held_lock_runs");
+  ::remove(runs.c_str());
+  for (const std::string name : {"hardware_node", "alpha", "beta"}) {
+    const std::string target = name == "hardware_node"
+                                   ? "//talOS/bridge:hardware_node"
+                                   : "//example/" + name + ":node";
+    options.binary_overrides[target] =
+        WriteStub("held_lock_" + name,
+                  "trap 'exit 0' INT TERM\n" +
+                      RecordLogArgThen(runs, "while :; do sleep 0.05; done\n"),
+                  name);
+  }
+  const introspect::RegistryLock held{ShmObjectName(introspect::kRegistryPath)};
+  const pid_t launcher = ::fork();
+  ASSERT_GE(launcher, 0);
+  if (launcher == 0) ::_exit(Launcher{options}.Run());
+  int status = 0;
+  pid_t reaped = 0;
+  const auto give_up = std::chrono::steady_clock::now() + 20s;
+  while ((reaped = ::waitpid(launcher, &status, WNOHANG)) == 0 &&
+         std::chrono::steady_clock::now() < give_up)
+    std::this_thread::sleep_for(10ms);
+  if (reaped != launcher) {
+    ::kill(launcher, SIGKILL);
+    while (::waitpid(launcher, &status, 0) < 0 && errno == EINTR) {
+    }
+  }
+  EXPECT_EQ(reaped, launcher) << "supervision stalled on the registry lock";
+  EXPECT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
+  EXPECT_EQ(ReadLines(runs).size(), 3u);
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
 
 TEST(Supervision, StalledRegistryHeartbeatIsKilledAndRestarted) {
   auto options = BaseOptions("stalled_out", "max_restarts = 1\n");

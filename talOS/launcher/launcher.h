@@ -8,6 +8,7 @@
 
 #ifdef __linux__
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 #endif
 
 #include <algorithm>
@@ -501,8 +502,8 @@ inline uint16_t EffectiveStudioHttpPort(const config::RobotConfig& config,
 
 // The launcher alone holds each lifetime pipe's writer. A tiny guardian in the
 // child's group kills the group on EOF, including when the launcher is
-// SIGKILLed. Descriptors are closed in other children and on exec; no node owns
-// a writer.
+// SIGKILLed. Writers are close-on-exec and a guardian keeps no descriptor but
+// its own pipe's reader, so no node or guardian owns a writer.
 inline std::map<pid_t, int>& ProcessLifetimes() {
   static std::map<pid_t, int> lifetimes;
   return lifetimes;
@@ -520,6 +521,22 @@ inline void FinishProcessGroup(pid_t pid) {
   if (found != lifetimes.end()) {
     ::close(found->second);
     lifetimes.erase(found);
+  }
+}
+
+// Closes every descriptor but `keep`. System calls only, so it is safe in a
+// forked child of a multithreaded process.
+inline void CloseDescriptorsExcept(int keep) {
+#if defined(__linux__) && defined(SYS_close_range)
+  // Linux 5.9+: two calls, however high RLIMIT_NOFILE is.
+  const auto kept = static_cast<unsigned>(keep);
+  if ((keep == 0 || ::syscall(SYS_close_range, 0u, kept - 1, 0u) == 0) &&
+      ::syscall(SYS_close_range, kept + 1, ~0u, 0u) == 0)
+    return;
+#endif
+  const int limit = ::getdtablesize();
+  for (int fd = 0; fd < limit; ++fd) {
+    if (fd != keep) ::close(fd);
   }
 }
 
@@ -560,11 +577,6 @@ inline pid_t SpawnProcess(std::vector<std::string> args,
     }
     return pid;
   }
-  ::close(lifetime[1]);
-  for (const auto& [other_pid, fd] : ProcessLifetimes()) {
-    (void)other_pid;
-    ::close(fd);
-  }
   if (::setpgid(0, 0) != 0) ::_exit(127);
 #ifdef __linux__
   if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) ::_exit(127);
@@ -579,10 +591,10 @@ inline pid_t SpawnProcess(std::vector<std::string> args,
     // Graceful group signals belong to the node; the guardian waits for EOF.
     std::signal(SIGINT, SIG_IGN);
     std::signal(SIGTERM, SIG_IGN);
-    for (const int fd : {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO}) {
-      if (fd != lifetime[0]) ::close(fd);
-    }
-    if (stdout_fd > STDERR_FILENO) ::close(stdout_fd);
+    // Unlike the node it never execs, so any other descriptor of the
+    // launcher's process, close-on-exec or not, would stay open for as long
+    // as the node runs: another thread's registry lock would stay locked.
+    CloseDescriptorsExcept(lifetime[0]);
     char unused;
     while (::read(lifetime[0], &unused, 1) < 0 && errno == EINTR) {
     }
@@ -2111,6 +2123,8 @@ class Launcher {
       const auto now = std::chrono::steady_clock::now();
       const bool past_deadline = now >= deadline;
       const bool stopping = stop_requested_ != 0 || stop_sent || past_deadline;
+      // Read-only, the attach takes no lock (RegistryMapping): no node can
+      // stall this loop, and with it the service watchdog.
       if (!registry) {
         try {
           registry.emplace(introspect::kRegistryPath, true);

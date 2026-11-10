@@ -15,7 +15,7 @@ The header validates version and record sizes before a reader proceeds.
 Heartbeats and stale-slot checks use host monotonic time; `start_wall_ns` is
 human-facing wall time.
 
-Openers serialize segment creation, sizing and initialization with an exclusive
+Writers serialize segment creation, sizing and initialization with an exclusive
 `flock` on a regular file, `/tmp/talos-registry-<mapped-name>.lock` (the mapped
 name without its leading slash). The name is the exact `ShmObjectName` result
 used for the segment, so `TALOS_SHM_NAMESPACE` and `TEST_TMPDIR` isolate the lock
@@ -31,10 +31,13 @@ The writer resets any uncommitted segment under this lock, fills the header,
 then release-stores the magic word as the final commit. An initializer killed
 at any earlier instruction leaves an uncommitted segment: the next writer
 reinitializes it, without a timeout or manual `shm_unlink`. A committed but
-incompatible layout is still rejected, never reset. A read-only opener takes
-the startup lock and validates the commit; it cannot repair an incomplete
-segment and reports that a writer must initialize it. Polling an open reader
-never locks. Lock files deliberately persist, even across explicit segment
+incompatible layout is still rejected, never reset. A read-only opener takes no
+lock: it validates the commit, so a segment a writer is still creating, sizing
+or initializing at that moment opens as absent, too small or uncommitted, for
+the opener to retry. It cannot repair an incomplete segment and reports that a
+writer must initialize it. A process holding the lock, even one stopped while
+holding it, therefore cannot block a reader such as the launcher's supervision
+loop. Lock files deliberately persist, even across explicit segment
 unlinks: unlinking a lock file could split waiters between two inodes.
 
 
@@ -131,8 +134,9 @@ Writers only ever touch their own slot, which is padded to a cache line so two
 nodes updating counters do not contend on the same line. Every field a reader
 observes while a node runs is a lock-free atomic — there are static assertions
 to that effect, because a registry that fell back to a lock would be a registry
-that could block a control loop. `RegistryReader` writes nothing and locks only
-while opening, never while polling, so it is safe to poll at any rate.
+that could block a control loop. `RegistryReader` writes nothing and takes no
+lock, opening included ([the segment](#the-segment)), so it is safe to poll at
+any rate.
 `RegistryReader::open` returns `nullopt` instead of throwing when the segment
 does not exist: no nodes running is an ordinary viewer startup state.
 
