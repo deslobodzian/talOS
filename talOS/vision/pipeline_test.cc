@@ -3,10 +3,13 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "talOS/vision/metal/metal_apriltag_backend.h"
 #include "talOS/vision/synthetic_source.h"
@@ -53,6 +56,20 @@ TEST(PipelineTest, DetectionAndCameraRelativePose) {
   EXPECT_TRUE(det.valid) << "margin=" << det.decision_margin;
   EXPECT_GE(det.secondary_reprojection_error_px, 0);
   EXPECT_TRUE(det.secondary_T_camera_tag.matrix().allFinite());
+}
+
+TEST(PipelineTest, BackendRejectsFramesLargerThanTheirStorage) {
+  // A truncated buffer, or a stride shorter than one row, declares pixels the
+  // frame does not store: detection fails instead of reading past them.
+  const auto time = talos::event::MonotonicTime::from_nanos(1);
+  constexpr std::size_t kHalfImageBytes = std::size_t{640} * 480 / 2;
+  const Frame truncated(0, 1, 0, time, 640, 480, 640, PixelFormat::kGray8,
+                        std::vector<std::uint8_t>(kHalfImageBytes));
+  const Frame short_stride(0, 1, 0, time, 640, 480, 320, PixelFormat::kGray8,
+                           std::vector<std::uint8_t>(kHalfImageBytes));
+  CpuAprilTagBackend backend;
+  EXPECT_FALSE(backend.Execute(truncated).success);
+  EXPECT_FALSE(backend.Execute(short_stride).success);
 }
 
 // Keep the real decoded geometry, varying only the decode quality to exercise

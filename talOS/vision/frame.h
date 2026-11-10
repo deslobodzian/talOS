@@ -244,6 +244,8 @@ class Frame {
     return ptr;
   }
 
+  // Declared stride * height bytes, however many the storage holds (the
+  // storage size only while stride or height is zero); see holds_image().
   size_t size() const {
     if (stride_ > 0 && height_ > 0) {
       return static_cast<size_t>(stride_) * height_;
@@ -255,6 +257,19 @@ class Frame {
   }
 
   bool empty() const { return size() == 0; }
+
+  // True when the declared layout is a non-empty image the backing storage
+  // holds: nonzero width and height, a stride covering one row, and at least
+  // stride * height stored bytes. Read pixels only from such a frame.
+  bool holds_image() const {
+    if (width_ == 0 || height_ == 0 ||
+        stride_ < static_cast<size_t>(width_) * bytes_per_pixel()) {
+      return false;
+    }
+    const size_t stored =
+        shared_storage_ ? shared_storage_->size() : owned_storage_.size();
+    return stored >= size();
+  }
 
   // Returns true if buffer storage is shared with other handles.
   bool is_shared() const { return shared_storage_ != nullptr; }
