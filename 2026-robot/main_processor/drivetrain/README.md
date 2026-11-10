@@ -164,6 +164,10 @@ This swaps `sim_gateway` for `./gradlew simulateNative` in `2026-robot/controlle
 makes the same assertions, because both run the same
 `talos::hardware::Gateway`. The harness also runs a second WPILib scenario:
 with the Driver Station never enabled, the drivetrain must not move at all.
+It runs Gradle `--offline`, so the first run needs one online
+`./gradlew simulateNative` beforehand. CI's
+`rio-in-the-loop` job runs it on Linux with `--output-dir`, which puts each
+scenario's log directory under a directory it keeps when the run fails.
 The standalone gateway also supports disabled operation through
 `--mode-schedule`; see [simulation](../simulation/README.md).
 

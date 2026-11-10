@@ -12,6 +12,9 @@ Driver Station enable path, so it also runs a second scenario that the
 stand-alone gateway cannot: with the Driver Station never enabled, the
 drivetrain must not move at all.
 
+Logs go to a new directory under the system temporary directory, or under
+--output-dir when given (CI keeps that directory when the run fails).
+
 First build: bazel build //2026-robot/main_processor/drivetrain:all \
                          //2026-robot/main_processor/simulation:sim_gateway \
                          //talOS/bridge:hardware_node
@@ -35,6 +38,15 @@ from pathlib import Path
 GATEWAY_SECONDS = 10
 BRIDGE_SECONDS = 8
 NODE_SECONDS = 6
+
+# Under WPILib the bridge starts as soon as the robot's gateway socket opens,
+# but the node waits for the robot to enable. The simulated robot's loop has
+# stalled once for over 5 s (TODO.md CI-4), and a stall before the enable
+# outlived an 8-second bridge, so the drive ran with no bridge. These leave
+# room for one such stall and still end the bridge seconds before the robot,
+# so the neutral stop is observed.
+WPILIB_GATEWAY_SECONDS = 20
+WPILIB_BRIDGE_SECONDS = 15
 
 # Gradle, a JVM and WPILib startup. Generous, because a cold Gradle daemon on a
 # loaded machine is slow and starting the bridge early would fail the run for
@@ -220,9 +232,9 @@ def check_ports():
             probe.bind(("0.0.0.0", port))
 
 
-def run_driving_scenario(root, wpilib):
+def run_driving_scenario(root, wpilib, output_root):
     """The robot is enabled, is told to drive, and then loses its commands."""
-    output = Path(tempfile.mkdtemp(prefix="talos-drive-"))
+    output = Path(tempfile.mkdtemp(prefix="talos-drive-", dir=output_root))
     log_path = output / "drive.tlog"
 
     with Scenario(root, output) as scenario:
@@ -234,9 +246,9 @@ def run_driving_scenario(root, wpilib):
             # disables itself near the end so the summary below also covers
             # the Driver Station disable path.
             gateway = scenario.start_wpilib_gateway(
-                GATEWAY_SECONDS, enable_when_configured=True,
-                disable_after_ms=(GATEWAY_SECONDS - 1) * 1000)
-            scenario.start_bridge(BRIDGE_SECONDS)
+                WPILIB_GATEWAY_SECONDS, enable_when_configured=True,
+                disable_after_ms=(WPILIB_GATEWAY_SECONDS - 1) * 1000)
+            scenario.start_bridge(WPILIB_BRIDGE_SECONDS)
             scenario.wait_for("simulated Driver Station: enabling", gateway)
             scenario.start_node(log_path, NODE_SECONDS)
         else:
@@ -261,14 +273,14 @@ def run_driving_scenario(root, wpilib):
     return output
 
 
-def run_disabled_scenario(root):
+def run_disabled_scenario(root, output_root):
     """The same drive request, with the Driver Station never enabled.
 
     Runs against the WPILib RoboRIO program, so it checks that program's own
     Driver Station gating; sim_gateway's disabled schedules
     (`--mode-schedule`) are covered by simulation:startup_test.
     """
-    output = Path(tempfile.mkdtemp(prefix="talos-disabled-"))
+    output = Path(tempfile.mkdtemp(prefix="talos-disabled-", dir=output_root))
 
     with Scenario(root, output) as scenario:
         scenario.start_wpilib_gateway(6, enabled=False)
@@ -294,7 +306,14 @@ def main():
         action="store_true",
         help="use the RoboRIO program under WPILib simulation as the gateway",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="create each scenario's log directory under this directory",
+    )
     args = parser.parse_args()
+    if args.output_dir is not None:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
 
     root = Path(__file__).resolve().parents[1]
     binaries = root / "bazel-bin/2026-robot/main_processor/drivetrain"
@@ -319,11 +338,11 @@ def main():
             raise RuntimeError(f"No Gradle wrapper at {gradlew}")
 
     check_ports()
-    output = run_driving_scenario(root, args.wpilib)
+    output = run_driving_scenario(root, args.wpilib, args.output_dir)
 
     if args.wpilib:
         check_ports()
-        run_disabled_scenario(root)
+        run_disabled_scenario(root, args.output_dir)
         print(f"PASS (WPILib simulation): separate processes, motion, watchdog "
               f"stop, replay, and no motion while disabled. Logs: {output}")
     else:

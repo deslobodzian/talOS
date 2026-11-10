@@ -230,6 +230,72 @@ jobs:
       # the artifact `deploy` ships; it never runs in CI, it must compile.
       run: ./gradlew buildRio
 
+  rio-in-the-loop:
+    name: RoboRIO program in the loop (WPILib sim)
+    # The deployed RoboRIO program (Robot.cpp: its Driver Station loop,
+    # gateway and Phoenix 6 backend) run as a desktop simulation against the
+    # Bazel-built bridge and drivetrain node: tools/test_drivetrain.py
+    # --wpilib drives, checks the neutral stop when commands end, replays the
+    # node's log, and checks a never-enabled robot does not move. -Pheadless
+    # (set by the script) loads no simulation GUI, so no display is needed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+
+    - name: Setup bazel-action
+      uses: bazel-contrib/setup-bazel@0.19.0
+      with:
+        bazelisk-cache: true
+        disk-cache: ${{ github.workflow }}
+        repository-cache: true
+
+    - name: Setup Java (GradleRIO needs a JDK; the wrapper itself is pinned)
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
+
+    - name: Setup Gradle cache
+      uses: gradle/actions/setup-gradle@v4
+
+    - name: Build the main-processor side
+      run: >-
+        bazel build --noshow_progress
+        //2026-robot/main_processor/drivetrain:all
+        //talOS/bridge:hardware_node
+
+    - name: Install RoboRIO toolchain
+      # GradleRIO refuses to configure the project until it is installed,
+      # even for a desktop-only task.
+      working-directory: 2026-robot/controller_processor/rio
+      run: ./gradlew installRoboRioToolchain
+
+    - name: Build and start the desktop simulation once
+      # The test runs Gradle with --offline, so everything simulateNative
+      # resolves (WPILib and Phoenix simulation natives) is fetched here.
+      # The robot, disabled, stops itself after two seconds; the first
+      # launch of the program and its Phoenix simulation happens here
+      # rather than in the test.
+      working-directory: 2026-robot/controller_processor/rio
+      env:
+        TALOS_SIM_DS: '0'
+        TALOS_SIM_RUN_MS: '2000'
+      run: timeout 900 ./gradlew -Pheadless simulateNative
+
+    - name: Drivetrain against the RoboRIO program
+      timeout-minutes: 10
+      run: python3 tools/test_drivetrain.py --wpilib --output-dir "$RUNNER_TEMP/rio-in-the-loop"
+
+    - name: Keep the failed run's logs
+      if: ${{ failure() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: rio-in-the-loop
+        path: ${{ runner.temp }}/rio-in-the-loop/
+        if-no-files-found: ignore
+
   buildifier:
     name: Buildifier (changed Starlark files)
     runs-on: ubuntu-latest
