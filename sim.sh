@@ -16,7 +16,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 HEADLESS=0
 WANT_STUDIO=1
@@ -29,6 +29,9 @@ GATEWAY_ARGS=()
 # ([subsystems.telemetry] topic), read by the nodes that own each end, so this
 # script never spells it twice.
 HTTP_PORT=5800
+
+say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
+die() { printf '\033[1;31msim.sh:\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
   sed -n '3,${/^[^#]/q;p;}' "$0" | sed 's/^# \{0,1\}//'
@@ -91,15 +94,15 @@ mkdir -p "$LOG_DIR"
 PIDS=""
 NAMES=""
 
-# Kill a process and everything it spawned, children first. Gradle and the
+# Print a process and everything it spawned, children first. Gradle and the
 # launcher both fork, and killing only the parent orphans a simulation that
 # then holds the UDP port against the next run.
-kill_tree() {
-  local pid="$1" child
-  for child in $(pgrep -P "$pid" 2>/dev/null); do
-    kill_tree "$child"
+descendants() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    descendants "$child"
   done
-  kill -TERM "$pid" 2>/dev/null
+  echo "$1"
 }
 
 CLEANED=0
@@ -110,20 +113,20 @@ cleanup() {
   echo ""
   echo "sim.sh: shutting down"
   # Reverse start order, so the bridge stops before the graph it reads.
-  local ordered="" p
+  local ordered="" p tree=""
   for p in $PIDS; do ordered="$p $ordered"; done
-  for p in $ordered; do kill_tree "$p"; done
+  # Snapshot the trees before signalling: a parent that exits on TERM
+  # reparents its children, and they could no longer be found to KILL.
+  for p in $ordered; do tree="$tree $(descendants "$p")"; done
+  for p in $tree; do kill -TERM "$p" 2>/dev/null; done
   sleep 1
-  for p in $ordered; do kill -KILL "$p" 2>/dev/null; done
+  for p in $tree; do kill -KILL "$p" 2>/dev/null; done
   wait 2>/dev/null
   echo "sim.sh: session logs in $SESSION_DIR (launcher/RIO output in $LOG_DIR)"
 }
 trap cleanup EXIT INT TERM
 
 track() { PIDS="$PIDS $1"; NAMES="$NAMES $2"; }
-
-say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
-die() { printf '\033[1;31msim.sh:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --- build ------------------------------------------------------------------
 # One bazel invocation for everything, so a compile error stops the run before
@@ -140,23 +143,28 @@ bazel build $BUILD_TARGETS 2>&1 | tail -5 || die "build failed"
 if [ "$WANT_RIO" = "1" ]; then
   RIO_DIR="$ROOT/2026-robot/controller_processor/rio"
   [ -x "$RIO_DIR/gradlew" ] || die "no gradlew at $RIO_DIR"
-  GRADLE_ARGS="simulateNative"
-  [ "$HEADLESS" = "1" ] && GRADLE_ARGS="$GRADLE_ARGS -Pheadless"
+  # --no-daemon keeps the build, and the simulation it runs, inside this
+  # script's process tree; a Gradle daemon is detached, so cleanup could
+  # never reach a simulation it started.
+  GRADLE_ARGS=(simulateNative --no-daemon)
+  [ "$HEADLESS" = "1" ] && GRADLE_ARGS+=(-Pheadless)
   say "starting WPILib simulation (log: $LOG_DIR/rio.log)"
   if [ "$HEADLESS" = "1" ]; then
     say "  headless: enabling teleop through TALOS_SIM_DS=auto (once configured)"
-    ( cd "$RIO_DIR" && TALOS_SIM_DS=auto ./gradlew $GRADLE_ARGS ) \
+    ( cd "$RIO_DIR" && TALOS_SIM_DS=auto ./gradlew "${GRADLE_ARGS[@]}" ) \
       > "$LOG_DIR/rio.log" 2>&1 &
   else
-    ( cd "$RIO_DIR" && ./gradlew $GRADLE_ARGS ) > "$LOG_DIR/rio.log" 2>&1 &
+    ( cd "$RIO_DIR" && ./gradlew "${GRADLE_ARGS[@]}" ) > "$LOG_DIR/rio.log" 2>&1 &
   fi
   track $! "wpilib-sim"
   disown $! 2>/dev/null
   # Gradle has to resolve and compile before the simulation exists. Wait for
   # the task to actually be running rather than guessing with a fixed sleep.
   say "  waiting for the simulation to come up"
-  for i in $(seq 1 240); do
+  SIM_UP=0
+  for _ in $(seq 1 240); do
     if grep -q "Robot program starting" "$LOG_DIR/rio.log" 2>/dev/null; then
+      SIM_UP=1
       break
     fi
     if grep -qE "FAILURE:|BUILD FAILED" "$LOG_DIR/rio.log" 2>/dev/null; then
@@ -165,6 +173,10 @@ if [ "$WANT_RIO" = "1" ]; then
     fi
     sleep 0.5
   done
+  if [ "$SIM_UP" != "1" ]; then
+    tail -25 "$LOG_DIR/rio.log" >&2
+    die "the WPILib simulation did not start within 120 s (log: $LOG_DIR/rio.log)"
+  fi
   if [ "$HEADLESS" != "1" ]; then
     say "  enable the robot and pick Teleoperated in the sim GUI"
   fi
@@ -200,7 +212,7 @@ LAUNCHER_PID=$!
 track "$LAUNCHER_PID" "launcher"
 
 GRAPH="$SESSION_DIR/graph.json"
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
   [ -f "$GRAPH" ] && break
   sleep 0.5
 done
