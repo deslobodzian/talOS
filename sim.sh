@@ -10,6 +10,9 @@
 #   ./sim.sh --headless      no sim GUI; teleop enabled via TALOS_SIM_DS
 #   ./sim.sh --headless --mode-schedule teleop:60,auto:20,disabled:5
 #                            no sim GUI; scripted Driver Station modes
+#   ./sim.sh --headless --mode-schedule teleop:30,disabled:5 \
+#       --joystick-schedule '0:axes=0,0,0;buttons=0;pov=-1|3:axes=0,-0.5,0;buttons=0;pov=-1'
+#                            ... and a scripted joystick 0
 #   ./sim.sh --no-rio        use an existing controller (no WPILib, no gateway)
 #   ./sim.sh --sim-gateway   lightweight physics simulator instead of WPILib
 #   ./sim.sh --no-studio     robot only, no bridge and no browser
@@ -30,6 +33,8 @@ WANT_GATEWAY=0
 WANT_OPEN=1
 DURATION=""
 MODE_SCHEDULE=""
+JOYSTICK_SCHEDULE=""
+ALLIANCE=""
 GATEWAY_ARGS=()
 # HTTP port only: the telemetry topic lives in the robot config
 # ([subsystems.telemetry] topic), read by the nodes that own each end, so this
@@ -50,6 +55,13 @@ Options:
                     --headless it sets TALOS_SIM_DS_SCHEDULE, counted from the
                     gateway's configuration; with --sim-gateway it is that
                     simulator's --mode-schedule, counted from its start
+  --joystick-schedule S
+                    script joystick 0 as 'seconds:axes=A0,...;buttons=MASK;
+                    pov=DEG|...' snapshots (syntax: the lightweight
+                    simulator's README), on the same clock as
+                    --mode-schedule; requires --headless or --sim-gateway
+  --alliance A      blue or red (default blue): TALOS_SIM_DS_ALLIANCE with
+                    --headless, the simulator's --alliance with --sim-gateway
   --no-studio       skip the Studio bridge and the browser
   --no-rio          use an existing controller (skip WPILib sim and gateway)
   --sim-gateway     start the lightweight physics simulator instead of WPILib
@@ -81,6 +93,16 @@ while [ $# -gt 0 ]; do
       MODE_SCHEDULE="$2"
       shift
       ;;
+    --joystick-schedule)
+      [ $# -ge 2 ] || { echo "sim.sh: --joystick-schedule needs an argument" >&2; exit 2; }
+      JOYSTICK_SCHEDULE="$2"
+      shift
+      ;;
+    --alliance)
+      [ $# -ge 2 ] || { echo "sim.sh: --alliance needs an argument" >&2; exit 2; }
+      ALLIANCE="$2"
+      shift
+      ;;
     --http-port)   HTTP_PORT="$2"; shift ;;
     -h|--help)     usage; exit 0 ;;
     *) echo "sim.sh: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
@@ -98,6 +120,22 @@ if [ -n "$MODE_SCHEDULE" ]; then
     # With the GUI, its Robot State window is the Driver Station; with --no-rio
     # the existing controller's Driver Station is.
     echo "sim.sh: --mode-schedule requires --headless or --sim-gateway" >&2
+    exit 2
+  fi
+fi
+if [ -n "$JOYSTICK_SCHEDULE" ]; then
+  if [ "$WANT_GATEWAY" = "1" ]; then
+    GATEWAY_ARGS+=(--sim-gateway-arg --joystick-schedule --sim-gateway-arg "$JOYSTICK_SCHEDULE")
+  elif [ "$WANT_RIO" != "1" ] || [ "$HEADLESS" != "1" ]; then
+    echo "sim.sh: --joystick-schedule requires --headless or --sim-gateway" >&2
+    exit 2
+  fi
+fi
+if [ -n "$ALLIANCE" ]; then
+  if [ "$WANT_GATEWAY" = "1" ]; then
+    GATEWAY_ARGS+=(--sim-gateway-arg --alliance --sim-gateway-arg "$ALLIANCE")
+  elif [ "$WANT_RIO" != "1" ] || [ "$HEADLESS" != "1" ]; then
+    echo "sim.sh: --alliance requires --headless or --sim-gateway" >&2
     exit 2
   fi
 fi
@@ -174,14 +212,24 @@ if [ "$WANT_RIO" = "1" ]; then
   # never reach a simulation it started.
   GRADLE_ARGS=(simulateNative --no-daemon)
   [ "$HEADLESS" = "1" ] && GRADLE_ARGS+=(-Pheadless)
+  # Empty unless --joystick-schedule or --alliance; SimDriverStation reads
+  # each only when set.
+  RIO_ENV=()
+  if [ "$HEADLESS" = "1" ] && [ -n "$ALLIANCE" ]; then
+    RIO_ENV+=("TALOS_SIM_DS_ALLIANCE=$ALLIANCE")
+  fi
+  if [ "$HEADLESS" = "1" ] && [ -n "$JOYSTICK_SCHEDULE" ]; then
+    say "  headless: joystick 0 schedule $JOYSTICK_SCHEDULE (from configuration)"
+    RIO_ENV+=("TALOS_SIM_JOYSTICK_SCHEDULE=$JOYSTICK_SCHEDULE")
+  fi
   say "starting WPILib simulation (log: $LOG_DIR/rio.log)"
   if [ "$HEADLESS" = "1" ] && [ -n "$MODE_SCHEDULE" ]; then
     say "  headless: Driver Station schedule $MODE_SCHEDULE (from configuration)"
-    ( cd "$RIO_DIR" && TALOS_SIM_DS_SCHEDULE="$MODE_SCHEDULE" ./gradlew "${GRADLE_ARGS[@]}" ) \
+    ( cd "$RIO_DIR" && env ${RIO_ENV[@]+"${RIO_ENV[@]}"} TALOS_SIM_DS_SCHEDULE="$MODE_SCHEDULE" ./gradlew "${GRADLE_ARGS[@]}" ) \
       > "$LOG_DIR/rio.log" 2>&1 &
   elif [ "$HEADLESS" = "1" ]; then
     say "  headless: enabling teleop through TALOS_SIM_DS=auto (once configured)"
-    ( cd "$RIO_DIR" && TALOS_SIM_DS=auto ./gradlew "${GRADLE_ARGS[@]}" ) \
+    ( cd "$RIO_DIR" && env ${RIO_ENV[@]+"${RIO_ENV[@]}"} TALOS_SIM_DS=auto ./gradlew "${GRADLE_ARGS[@]}" ) \
       > "$LOG_DIR/rio.log" 2>&1 &
   else
     ( cd "$RIO_DIR" && ./gradlew "${GRADLE_ARGS[@]}" ) > "$LOG_DIR/rio.log" 2>&1 &

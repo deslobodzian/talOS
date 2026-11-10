@@ -139,6 +139,15 @@ The ideal backend and WPILib/RoboRIO simulation publish **no** `/sim/state`.
 Their simulated camera nodes emit invalid observations rather than inventing
 truth from odometry.
 
+Under WPILib the pose estimator therefore localizes only from its trusted
+seed ([seed rules](../pose_estimator/README.md)), which needs a disabled
+Driver Station view naming an alliance. The headless RoboRIO stand-in
+(`controller_processor/rio/src/main/include/SimDriverStation.h`) always names
+one: blue station 1, or red with `TALOS_SIM_DS_ALLIANCE=red`
+(`./sim.sh --headless --alliance red`). Start the mode schedule with a
+disabled phase (`--mode-schedule disabled:3,auto:15`) so the seed is trusted
+before autonomous drives.
+
 For ideal/physics backend behavior and model hooks, see
 [hardware simulation backends](../../../talOS/hardware/README.md).
 

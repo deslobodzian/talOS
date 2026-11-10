@@ -132,14 +132,23 @@ From the repository root:
 ./sim.sh --headless                  # WPILib without its GUI, teleop enabled
 ./sim.sh --headless --no-studio --mode-schedule teleop:60,auto:20,disabled:5
                                      # scripted Driver Station modes
+./sim.sh --headless --no-studio --mode-schedule teleop:30,disabled:5 \
+  --joystick-schedule '0:axes=0,0,0;buttons=0;pov=-1|3:axes=0,-0.5,0;buttons=0;pov=-1'
+                                     # ... and a scripted joystick 0
 python3 tools/test_drivetrain.py     # drivetrain smoke test with log replay
 ```
 
 With the WPILib simulation, its GUI is the Driver Station: enable Teleoperated.
 Headless, the RoboRIO program's desktop-only stand-in
-(`controller_processor/rio/src/main/include/SimDriverStation.h`) enables teleop
-once the gateway is configured, or runs `--mode-schedule` phases from that
+(`controller_processor/rio/src/main/include/SimDriverStation.h`) names the blue
+alliance (`--alliance red` for red), enables teleop once the gateway is
+configured, or runs `--mode-schedule` phases from that
 moment (the lightweight simulator's schedule runs from its start).
+`--joystick-schedule` scripts joystick 0 on the same clock, in the lightweight
+simulator's syntax ([simulation/README.md](main_processor/simulation/README.md#scripted-joystick-and-fault-schedules));
+headless it goes through WPILib's simulated Driver Station, so the gateway
+reads it as it would a real stick. The stick keeps its scripted value when the
+schedule disables; the robot goes neutral because it is disabled.
 Logs land in `/tmp/talos_logs/<session-id>/`. Deploying:
 [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md).
 
