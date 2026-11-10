@@ -40,14 +40,17 @@
 
 namespace vision {
 
-// One calibrated camera, one observation topic and one bounded live worker.
-// Construction only registers/configures: describing never opens hardware.
+// One calibrated camera, one observation topic and one bounded worker: live
+// capture, or the simulated raster render/detect chain. Construction only
+// registers/configures: describing never opens hardware.
 class Vision {
  public:
   using SourceFactory =
       std::function<std::unique_ptr<talos::vision::CameraSource>(
           const talos::vision::CameraSourceConfig&)>;
-  explicit Vision(talos::Node& node, SourceFactory factory = {})
+  // `backend`, when set, replaces the configured detector backend (tests).
+  explicit Vision(talos::Node& node, SourceFactory factory = {},
+                  std::shared_ptr<talos::vision::ComputeBackend> backend = {})
       : node_(node),
         simulated_(node.simulation() && !factory),
         rasterize_(node.param("rasterize", true)),
@@ -124,7 +127,8 @@ class Vision {
     config.deferred_gpu_init = true;
     config.log_name = std::string{node.name()};
     try {
-      pipeline_ = std::make_unique<talos::vision::AprilTagPipeline>(config);
+      pipeline_ = std::make_unique<talos::vision::AprilTagPipeline>(
+          config, std::move(backend));
     } catch (const std::invalid_argument& error) {
       throw std::invalid_argument(std::string(node.name()) + ": " +
                                   error.what());
@@ -196,6 +200,8 @@ class Vision {
       // instead grows to the negotiated frame size the first time it is
       // filled (three allocations), then capture copies without allocating.
       worker_ = std::thread([this] { Work(); });
+    } else if (simulated_ && rasterize_) {
+      worker_ = std::thread([this] { SimWork(); });
     }
   }
 
@@ -269,26 +275,19 @@ class Vision {
     if (truth_.has_value()) {
       if (truth_->fresh()) {
         truth_outage_ = false;
-        // Deliver ready frames before rendering or admitting a new capture.
+        // Deliver ready frames before admitting a new capture.
         DrainSimPending(now_ns);
+        if (rasterize_) CollectSimResult(completed);
         const auto& truth = truth_->value();
-        const auto stamp = truth.sample_time_ns();
-        if (SimCaptureDue(stamp)) {
-          auto capture = Simulate(truth);
-          ++captured_;
-          RecordProcessed(capture.capture_ns);
-          if (sim_pending_.empty()) {
-            completed = capture;
+        if (SimCaptureDue(truth.sample_time_ns())) {
+          if (rasterize_) {
+            // Rendering and detection run on the worker, never this loop.
+            PostSimRequest(truth);
           } else {
-            if (sim_pending_count_ == sim_pending_.size()) {
-              sim_pending_head_ = (sim_pending_head_ + 1) % sim_pending_.size();
-              --sim_pending_count_;
-              ++dropped_;
-            }
-            sim_pending_[(sim_pending_head_ + sim_pending_count_) %
-                         sim_pending_.size()] = capture;
-            ++sim_pending_count_;
+            // Bounded, O(visible tags): stays inline and deterministic.
+            AdmitSimCapture(Simulate(truth, captured_), completed);
           }
+          ++captured_;
         }
         DrainSimPending(now_ns);
       } else {
@@ -296,6 +295,9 @@ class Vision {
         completed = Completed{
             truth_->has_value() ? truth_->value().sample_time_ns() : 0};
         if (!truth_outage_) {
+          // Stale truth clears pending observations, including the ones the
+          // worker still holds: their results come back from an older epoch.
+          ++sim_epoch_;
           std::fprintf(
               stderr,
               "%.*s: no fresh /sim/state; simulated cameras need "
@@ -348,6 +350,18 @@ class Vision {
         talos::vision::TimestampKind::kExposure;
   };
   static_assert(std::is_trivially_copyable_v<Completed>);
+
+  // One due raster capture: the truth sample it renders, the outage epoch it
+  // was posted in, and its frame sequence number.
+  struct SimRequest {
+    geometry::OdometrySample truth;
+    std::uint64_t epoch = 0;
+    std::uint64_t sequence = 0;
+  };
+  struct SimResult {
+    Completed completed;
+    std::uint64_t epoch = 0;
+  };
 
   // What the recorder needs per frame beyond the detections already produced:
   // the gray frame (nullptr when there is none, e.g. the non-raster sim path)
@@ -596,7 +610,10 @@ class Vision {
     return completed;
   }
 
-  Completed Simulate(const geometry::OdometrySample& truth) {
+  // Raster: the worker's alone (pipeline_, rng_, pixels_, render_scratch_,
+  // recorder_). Direct projection: the loop's alone.
+  Completed Simulate(const geometry::OdometrySample& truth,
+                     std::uint64_t sequence) {
     namespace fs = talos::vision::field_sim;
     const auto& pose = truth.pose();
     const auto field_pose =
@@ -613,7 +630,7 @@ class Vision {
           velocity.omega_radps(), &rng_, &render_scratch_);
       const auto& intr = camera_.intrinsics;
       const talos::vision::Frame frame(
-          camera_id_, 1, captured_, capture_time, intr.image_width,
+          camera_id_, 1, sequence, capture_time, intr.image_width,
           intr.image_height, intr.image_width,
           talos::vision::PixelFormat::kGray8,
           std::shared_ptr<const std::vector<std::uint8_t>>(pixels_));
@@ -637,8 +654,85 @@ class Vision {
       }
       result = Localize(detections_, truth.sample_time_ns(), true);
     }
-    rejected_range_ += result.rejected_range;
     return result;
+  }
+
+  // Counts a processed capture and queues it behind the timestamp lag, or
+  // hands it to this update when there is none.
+  void AdmitSimCapture(const Completed& capture,
+                       std::optional<Completed>& completed) {
+    RecordProcessed(capture.capture_ns);
+    rejected_range_ += capture.rejected_range;
+    if (sim_pending_.empty()) {
+      completed = capture;
+      return;
+    }
+    if (sim_pending_count_ == sim_pending_.size()) {
+      sim_pending_head_ = (sim_pending_head_ + 1) % sim_pending_.size();
+      --sim_pending_count_;
+      ++dropped_;
+    }
+    sim_pending_[(sim_pending_head_ + sim_pending_count_) %
+                 sim_pending_.size()] = capture;
+    ++sim_pending_count_;
+  }
+
+  // Loop side of the raster worker. A request the worker has not taken when
+  // the next capture is due is replaced and counted, like a live frame.
+  void PostSimRequest(const geometry::OdometrySample& truth) {
+    {
+      std::lock_guard lock(mutex_);
+      if (sim_request_) ++dropped_;
+      sim_request_ = SimRequest{truth, sim_epoch_, captured_};
+    }
+    wake_.notify_one();
+  }
+
+  // Never waits for the worker: a result it is still storing is taken on a
+  // later tick. A result from before the latest truth outage is discarded.
+  void CollectSimResult(std::optional<Completed>& completed) {
+    std::optional<SimResult> result;
+    {
+      std::unique_lock lock(mutex_, std::try_to_lock);
+      if (!lock.owns_lock()) return;
+      result = sim_result_;
+      sim_result_.reset();
+      dropped_ += sim_results_replaced_;
+      sim_results_replaced_ = 0;
+    }
+    if (!result) return;
+    if (result->epoch != sim_epoch_) {
+      ++dropped_;
+      return;
+    }
+    AdmitSimCapture(result->completed, completed);
+  }
+
+  // Renders, detects, solves and records one requested capture at a time.
+  void SimWork() {
+    while (true) {
+      std::optional<SimRequest> request;
+      {
+        std::unique_lock lock(mutex_);
+        wake_.wait(lock, [this] {
+          return stopping_.load(std::memory_order_acquire) ||
+                 sim_request_.has_value();
+        });
+        if (stopping_.load(std::memory_order_acquire)) break;
+        request = std::exchange(sim_request_, std::nullopt);
+      }
+      if (!request) continue;
+      Completed result;
+      try {
+        result = Simulate(request->truth, request->sequence);
+      } catch (const std::exception&) {
+        result = Completed{request->truth.sample_time_ns()};
+      }
+      std::lock_guard lock(mutex_);
+      // The loop has not taken the previous result: it is lost.
+      if (sim_result_) ++sim_results_replaced_;
+      sim_result_ = SimResult{result, request->epoch};
+    }
   }
 
   void RecordProcessed(std::uint64_t capture_ns) {
@@ -975,6 +1069,11 @@ class Vision {
   bool healthy_ = false, stale_stamps_ = false;
   std::atomic<bool> stopping_{false}, connected_{false};
   std::atomic<std::int64_t> worker_now_ns_{-1};
+  // Raster sim handoff, guarded by mutex_. sim_epoch_ is the loop's alone.
+  std::optional<SimRequest> sim_request_;
+  std::optional<SimResult> sim_result_;
+  std::uint64_t sim_results_replaced_ = 0;
+  std::uint64_t sim_epoch_ = 0;
   std::uint64_t received_ = 0, worker_processed_ = 0;
   std::uint64_t worker_first_capture_ns_ = 0, worker_period_us_ = 0,
                 worker_rejected_range_ = 0;

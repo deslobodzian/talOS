@@ -165,9 +165,12 @@ Non-finite or non-positive-definite covariance invalidates the observation.
 Single-tag ambiguity rejection and floor-prior disambiguation are implemented
 in [localization.h](../../../talOS/vision/localization.h).
 
-Only `--sim` enables synthetic observations. `rasterize = true` (default) uses
-a preallocated image buffer, AprilTag detection, and 3D localization;
-`rasterize = false` projects visible tag corners directly into localization.
+Only `--sim` enables synthetic observations. `rasterize = true` (default)
+renders into a preallocated image buffer, then runs AprilTag detection, 3D
+localization and frame recording, all on the camera's worker thread, never in
+`update()`; `rasterize = false` projects visible tag corners directly into
+localization inside `update()`, which is bounded by the visible tag count and
+deterministic tick for tick.
 Each camera optionally subscribes to `/sim/state` (`geometry.OdometrySample`),
 published every physics tick only by `sim_gateway --physics`. Tags are rendered
 from its latest absolute true field pose, not integrated drivetrain odometry.
@@ -206,14 +209,27 @@ approximately 16.7 ms mean period. Identical truth cannot create duplicate
 frames. If a slow tick misses several deadlines, it captures once from real
 truth, advances past that truth time and counts skipped deadlines as drops;
 it never invents intermediate poses. Between captures only status publishes,
-unless lagged observations become due.
+unless lagged observations become due (or, rasterized, a worker result arrives).
+With `rasterize = true` a due capture posts one request, a copy of its
+`/sim/state` sample, into a single slot the worker takes from; a request still
+untaken when the next capture is due is replaced and counted in
+`frames_dropped_count`, as is a finished result the worker replaces before the
+loop collected it. Each update collects at most one finished result with a
+nonblocking try-lock and handles it like a direct-projection capture (counted
+processed, then the lag queue). Its observation therefore arrives one or more
+updates after its capture, still stamped with the truth instant it was rendered
+from; `last_latency_us` includes the render and detection time.
 Truth must pass `Subscription::fresh()` (younger than
 `[robot] command_timeout_us` since receipt).
 Missing or stale truth publishes `valid = false` and unhealthy status every
 update, with exactly one diagnostic naming each camera per outage. Fresh truth
-clears that outage. WPILib/RoboRIO simulation and the ideal gateway publish no
-truth: simulated cameras need `sim_gateway --physics`, and otherwise remain
-invalid rather than inventing a world.
+clears that outage. An outage also discards the captures the worker still
+holds: their results carry the outage epoch they were posted in, and the loop
+drops and counts any result from before the latest outage, so no observation
+is published from truth captured before stale truth was seen.
+WPILib/RoboRIO simulation and the ideal gateway publish no truth: simulated
+cameras need `sim_gateway --physics`, and otherwise remain invalid rather than
+inventing a world.
 
 Simulation camera keys live under `[camera]` (shared defaults in
 `vision.toml`, with per-camera overrides in the named camera files):
@@ -224,7 +240,7 @@ Simulation camera keys live under `[camera]` (shared defaults in
 | `sensor_noise_std_gray` | Independent sensor Gaussian standard deviation in 8-bit grayscale levels; rendered images only. Shared default: 2.0. |
 | `exposure_gain_std` | Dimensionless frame-wide multiplicative gain standard deviation; rendered images only. Shared default: 0.02. |
 | `exposure_ms` | Exposure duration in milliseconds for rendered motion blur. Shared default: 5.0 ms. |
-| `rng_seed` | Nonnegative integer replay seed; each `Vision` instance explicitly owns a persistent `std::mt19937_64`, seeded after camera configuration loads and passed to both simulation paths, so successive frames differ but replay remains repeatable. |
+| `rng_seed` | Nonnegative integer seed; each `Vision` instance explicitly owns a persistent `std::mt19937_64`, seeded after camera configuration loads and passed to both simulation paths, so successive frames differ. Replay is repeatable only with `rasterize = false`: which raster captures the worker renders, and when their results arrive, depend on its speed, as for live cameras. |
 
 All four noise/exposure magnitudes must be finite and nonnegative; zero disables
 the corresponding effect. These are plausible simulation settings, not measured
@@ -296,7 +312,8 @@ since the corrected truth stamp, not necessarily zero; it includes delivery lag
 when that bias is corrected. Invalid underflow/future timestamps report zero
 latency, stale live stamps report their age, and neither publishes a valid
 pose. Simulation replay uses
-`--sim --replay <log>`; no wall clock enters its outputs.
+`--sim --replay <log>`; with `rasterize = false` no wall clock enters its
+outputs.
 
 See [DATA_FLOW](../../../docs/DATA_FLOW.md) for telemetry transport and budgets.
 `range_rejected_count` counts detections culled before localization.
