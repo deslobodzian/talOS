@@ -61,7 +61,10 @@ export type ChannelInfo = {name: string; unit: string; labels: string[]};
 // ascending; each value array is index-aligned with `times` and holds NaN
 // where the channel had no reading (absent, stale, or not yet declared). A
 // NaN or infinite reading is itself; plots draw every non-finite value as a
-// gap, and the store's presence (channelSample) tells the two apart.
+// gap, and the store's presence (channelSample) tells the two apart. Between
+// the frames of two streams (a producer restart) the series holds one extra
+// sample, NaN for every channel, so plots break there rather than draw the
+// restart as continuous operation.
 export type Series = {
   t0_ns: string;
   times: Float64Array;

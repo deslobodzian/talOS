@@ -2,7 +2,8 @@ import {createServer} from 'node:http';
 import {pathToFileURL} from 'node:url';
 import {WebSocket, WebSocketServer} from 'ws';
 
-import {JitterBuffer, TelemetryDecoder, Timeline} from '../src/core';
+import {type Snapshot, TelemetryDecoder} from '../src/core';
+import {TelemetryHistory} from '../src/history';
 import {
   type DeclaredGraph,
   declaredStatus,
@@ -28,14 +29,18 @@ export function startAgent(
   // Reject DNS rebinding to loopback as well as browser-originated requests.
   const allowedHost = (host: string|undefined) =>
       !!host && /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host);
-  const timeline = new Timeline();
-  let jitter = new JitterBuffer(10);
   const decoder = new TelemetryDecoder();
-  let streamId: string|null = null;
-  // Sequence ids whose age is unknown, as in the Studio worker: the keyframe
-  // the bridge sends on every open carries the latest tick it holds --
-  // possibly long before this connection, if telemetry has stopped.
+  // Stream and sequence ids whose age is unknown, as in the Studio worker: the
+  // keyframe the bridge sends on every open carries the latest tick it holds
+  // -- possibly long before this connection, if telemetry has stopped.
   const unknownAge = new Set<string>();
+  const ageKey = (f: Snapshot) => `${f.stream_id}:${f.sequence_id}`;
+  // The same retained history as the Studio worker's (history.ts): a producer
+  // restart within a launcher session continues it, a new session replaces
+  // it. An arrival of 0 is Timeline's "no known arrival": get_latest then
+  // reports the age as null rather than as the age of the connection.
+  const history = new TelemetryHistory(
+      {arrival: f => unknownAge.delete(ageKey(f)) ? 0 : Date.now()});
   let firstUpdate = false;
 
   // `previousSystem` is the sample just before this one: what changed since
@@ -60,7 +65,7 @@ export function startAgent(
   let declaredError = '';
 
   const context = (): RpcContext => ({
-    timeline,
+    timeline: history.timeline,
     system,
     previousSystem,
     rateWindow,
@@ -124,6 +129,7 @@ export function startAgent(
       previousSystem = system;
       system = parsed;
       rateWindow.push(parsed);
+      history.observe(parsed);
     } catch {
       // A malformed document is counted and dropped. Blanking the last good
       // graph would turn one bad frame into "nothing is running", which is a
@@ -178,8 +184,8 @@ export function startAgent(
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({
         connected: socket?.readyState === WebSocket.OPEN,
-        frames: timeline.frames.length,
-        stats: jitter.stats,
+        frames: history.timeline.frames.length,
+        stats: history.jitter.stats,
         // Whether the shape of the system is known, separately from whether
         // telemetry is arriving: a node can be publishing frames while the
         // registry is unreadable, and the reverse.
@@ -271,19 +277,14 @@ export function startAgent(
             raw instanceof ArrayBuffer   ? new Uint8Array(raw) :
                                            raw;
         for (const frame of decoder.decodeAll(bytes)) {
-          // A new stream restarts sequence and timestamp, so retained history
-          // from the old producer would reject every new frame. Drop it.
-          if (streamId !== null && frame.stream_id !== streamId) {
-            timeline.clear();
-            jitter = new JitterBuffer(10);
-          }
-          streamId = frame.stream_id;
-          if (firstUpdate) unknownAge.add(frame.sequence_id);
+          if (!history.push(frame, decoder.currentDictionary(),
+                            performance.now()))
+            continue;
+          if (firstUpdate) unknownAge.add(ageKey(frame));
           firstUpdate = false;
-          jitter.push(frame, performance.now());
         }
       } catch {
-        jitter.stats.invalid++;
+        history.jitter.stats.invalid++;
       }
     });
     socket.on('open', () => {
@@ -308,10 +309,7 @@ export function startAgent(
     });
   }
   const tick = setInterval(() => {
-    // An arrival of 0 is Timeline's "no known arrival": get_latest then
-    // reports the age as null rather than as the age of the connection.
-    for (const frame of jitter.flush(performance.now()))
-      timeline.append(frame, unknownAge.delete(frame.sequence_id) ? 0 : Date.now());
+    history.flush(performance.now());
   }, 5);
   server.listen(
       port, '127.0.0.1',
@@ -329,7 +327,9 @@ export function startAgent(
   };
   return {
     server,
-    timeline,
+    get timeline() {
+      return history.timeline;
+    },
     close,
     graphs,
     // Exposed so a caller can inject a graph or read the current one without

@@ -98,6 +98,21 @@ export type SystemGraph = {
   topics: SystemTopic[];
 };
 
+// The launcher session of the live process publishing the bridge's telemetry
+// topic, from its registry row; null when the graph names none (no registry,
+// or the producer is between processes) or its live rows disagree. This is how
+// a viewer tells a producer restart within one session (the same session id)
+// from a new launcher session behind the same bridge: the manifest the bridge
+// serves is the file it was started with, so it cannot say.
+export function telemetrySession(graph: SystemGraph): string|null {
+  const publishers =
+      graph.topics.find(topic => topic.name === graph.bridge.topic)?.publishers ?? [];
+  const sessions = new Set(graph.nodes.filter(node => node.alive &&
+                                              publishers.includes(node.name))
+                               .map(node => node.session_id));
+  return sessions.size === 1 ? [...sessions][0] : null;
+}
+
 // Caps chosen well above anything the registry can hold (32 nodes, 64 sources
 // each) so a legitimate document never trips them, and far below anything that
 // could stall the renderer.

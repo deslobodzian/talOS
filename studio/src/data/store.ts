@@ -15,7 +15,7 @@
 // whether the channel had a reading in a frame is the presence column's, so a
 // NaN reading is never confused with absence.
 
-import type {Snapshot} from '../core';
+import {dictionaryKey, type Snapshot} from '../core';
 import {ChannelKind} from '../generated/talos/telemetry/channel-kind';
 import type {SystemGraph} from '../system';
 import type {SessionManifest} from './manifest';
@@ -39,6 +39,23 @@ const defaultScheduler = (cb: () => void): void => {
   else setTimeout(cb, 0);
 };
 
+// `column` with a sample inserted before each index in `breaks` (ascending):
+// `fill(i)` for the one before index i, NaN by default.
+function withBreaks(column: Float64Array, breaks: number[],
+                    fill: (i: number) => number = () => NaN): Float64Array {
+  if (!breaks.length) return column;
+  const out = new Float64Array(column.length + breaks.length);
+  let k = 0, from = 0;
+  for (const at of breaks) {
+    out.set(column.subarray(from, at), k);
+    k += at - from;
+    out[k++] = fill(at);
+    from = at;
+  }
+  out.set(column.subarray(from), k);
+  return out;
+}
+
 export class TelemetryStore {
   // Numeric ring columns. `head` indexes the oldest frame; a frame's logical
   // index i in [0, count) lives at physical index (head + i) % capacity.
@@ -50,6 +67,12 @@ export class TelemetryStore {
   // Telemetry dictionary ids are uint32: an Int32Array turned ids at or above
   // 2^31 negative, so no dictionary matched and the first snapshot threw.
   private readonly dictionaryIds: Float64Array;
+  // Each frame's `dictionaryKey`: the wire contract caches a dictionary by
+  // stream_id and dictionary_id, so the pair, not the id, names it.
+  private readonly dictionaryKeys: (string|null)[];
+  // 1 where a frame's stream differs from the frame before it: a producer
+  // restart, where series and mode bands break.
+  private readonly streamStarts: Uint8Array;
   private readonly chassisX: Float64Array;
   private readonly chassisY: Float64Array;
   private readonly chassisZ: Float64Array;
@@ -63,7 +86,7 @@ export class TelemetryStore {
   // rounded (|value| > 2^53), by ring slot.
   private readonly exacts = new Map<string, Map<number, string>>();
   private readonly infos = new Map<string, ChannelInfo>();
-  private readonly dictionaries = new Map<number, {
+  private readonly dictionaries = new Map<string, {
     infos: Map<string, ChannelInfo>;
     kinds: Readonly<Record<string, ChannelKind>>|undefined;
     frames: number;
@@ -98,6 +121,8 @@ export class TelemetryStore {
     this.streamIds = new Array<string|null>(capacity).fill(null);
     this.sequenceIds = new Array<string|null>(capacity).fill(null);
     this.dictionaryIds = new Float64Array(capacity).fill(-1);
+    this.dictionaryKeys = new Array<string|null>(capacity).fill(null);
+    this.streamStarts = new Uint8Array(capacity);
     this.chassisX = new Float64Array(capacity);
     this.chassisY = new Float64Array(capacity);
     this.chassisZ = new Float64Array(capacity);
@@ -220,16 +245,20 @@ export class TelemetryStore {
       start = Math.min(lo, end);
     }
 
+    const breaks: number[] = [];
+    for (let i = start + 1; i <= end; i++)
+      if (this.streamStarts[this.phys(i)]) breaks.push(i - start);
     const values: Record<string, Float64Array> = {};
     for (const name of channels) {
       const column = this.columns.get(name);
       values[name] = column ?
-          this.sliceColumn(column, start, end) :
-          new Float64Array(end - start + 1).fill(NaN);
+          withBreaks(this.sliceColumn(column, start, end), breaks) :
+          new Float64Array(end - start + 1 + breaks.length).fill(NaN);
     }
+    const times = this.sliceColumn(this.times, start, end);
     return {
       t0_ns: this.origin!.toString(),
-      times: this.sliceColumn(this.times, start, end),
+      times: withBreaks(times, breaks, i => (times[i - 1] + times[i]) / 2),
       values
     };
   }
@@ -275,7 +304,7 @@ export class TelemetryStore {
   }
 
   private reconstruct(slot: number): Snapshot {
-    const dictionary = this.dictionaries.get(this.dictionaryIds[slot])!;
+    const dictionary = this.dictionaries.get(this.dictionaryKeys[slot]!)!;
     const channels: Record<string, number> = Object.create(null);
     const exact: Record<string, string> = Object.create(null);
     for (const [name, column] of this.columns) {
@@ -321,11 +350,12 @@ export class TelemetryStore {
     if (this.origin === null) this.origin = ts;
 
     const slot = (this.head + this.count) % this.capacity;
-    const evictedDictionary = this.count === this.capacity ? this.dictionaryIds[slot] : null;
-    let dictionary = this.dictionaries.get(frame.dictionary_id);
+    const evictedDictionary = this.count === this.capacity ? this.dictionaryKeys[slot] : null;
+    const key = dictionaryKey(frame);
+    let dictionary = this.dictionaries.get(key);
     if (!dictionary) {
       dictionary = {infos: new Map(), kinds: frame.kinds, frames: 0};
-      this.dictionaries.set(frame.dictionary_id, dictionary);
+      this.dictionaries.set(key, dictionary);
     }
     dictionary.frames++;
     // Units declare channels even when their current reading is absent.
@@ -343,6 +373,10 @@ export class TelemetryStore {
     this.streamIds[slot] = frame.stream_id;
     this.sequenceIds[slot] = frame.sequence_id;
     this.dictionaryIds[slot] = frame.dictionary_id;
+    this.dictionaryKeys[slot] = key;
+    const previous = this.count > 0 ? this.phys(this.count - 1) : -1;
+    this.streamStarts[slot] =
+        previous >= 0 && this.streamIds[previous] !== frame.stream_id ? 1 : 0;
     this.chassisX[slot] = frame.chassis.x;
     this.chassisY[slot] = frame.chassis.y;
     this.chassisZ[slot] = frame.chassis.z;
@@ -382,13 +416,13 @@ export class TelemetryStore {
     }
 
     this.eventEngine.pushFrame(frame);
-    this.updateBands(frame);
+    this.updateBands(frame, this.streamStarts[slot] === 1);
   }
 
-  private releaseDictionary(id: number) {
-    const dictionary = this.dictionaries.get(id)!;
+  private releaseDictionary(key: string) {
+    const dictionary = this.dictionaries.get(key)!;
     if (--dictionary.frames > 0) return;
-    this.dictionaries.delete(id);
+    this.dictionaries.delete(key);
     for (const name of dictionary.infos.keys()) {
       const references = this.channelReferences.get(name)! - 1;
       if (references > 0) {
@@ -436,9 +470,11 @@ export class TelemetryStore {
       this.bands = [{...this.bands[0], start_ns: oldest}, ...this.bands.slice(1)];
   }
 
-  private updateBands(frame: Snapshot) {
+  private updateBands(frame: Snapshot, streamStart: boolean) {
     const mode = driverStationMode(frame);
     const ts = frame.timestamp_ns;
+    // A producer restart ends the band: nothing was observed in between.
+    if (streamStart) this.bandMode = null;
     if (mode === this.bandMode) {
       if (mode !== null && this.bands.length) {
         const last = this.bands[this.bands.length - 1];

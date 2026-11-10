@@ -434,27 +434,47 @@ export class TelemetryDecoder {
 }
 
 
-// A timeline as a TLM3 log: the dictionary pages, then each snapshot as a
-// keyframe, exact integers included. Derived channels are Studio's own and
-// are derived again on import.
-export function exportPages(frames: Snapshot[], dictionary: Dictionary):
+// The dictionary a snapshot was decoded against. The wire contract caches a
+// dictionary by stream_id and dictionary_id (talOS/telemetry/README.md), so
+// the pair names it.
+export function dictionaryKey(frame: Pick<Snapshot, 'stream_id'|'dictionary_id'>):
+    string {
+  return `${frame.stream_id}:${frame.dictionary_id}`;
+}
+
+// A timeline as a TLM3 log: each snapshot as a keyframe, exact integers
+// included, preceded by its dictionary's pages wherever the dictionary
+// differs from the previous snapshot's (a timeline that spans a producer
+// restart holds one per stream). `dictionaries` is keyed by `dictionaryKey`.
+// Derived channels are Studio's own and are derived again on import.
+export function exportPages(frames: Snapshot[],
+                            dictionaries: ReadonlyMap<string, Dictionary>):
     Uint8Array[] {
-  if (!frames.length) return [];
-  const channels: ChannelSpec[] = dictionary.names.map((name, i) => ({
-    name,
-    unit: dictionary.units[name],
-    labels: dictionary.labels[name],
-    kind: dictionary.kindList[i]
-  }));
-  const header = (f: Snapshot) => ({
-    streamId: BigInt(f.stream_id),
-    sequenceId: BigInt(f.sequence_id),
-    timestampNs: BigInt(f.timestamp_ns),
-    dictionaryId: dictionary.id,
-    channelCount: dictionary.names.length
-  });
-  const pages = encodeDictionaryPages(header(frames[0]), channels);
+  const pages: Uint8Array[] = [];
+  let current: Dictionary|null = null, currentKey = '';
   for (const f of frames) {
+    const header = (dictionary: Dictionary) => ({
+      streamId: BigInt(f.stream_id),
+      sequenceId: BigInt(f.sequence_id),
+      timestampNs: BigInt(f.timestamp_ns),
+      dictionaryId: dictionary.id,
+      channelCount: dictionary.names.length
+    });
+    const key = dictionaryKey(f);
+    if (current === null || key !== currentKey) {
+      const next = dictionaries.get(key);
+      if (!next) throw Error(`No dictionary for stream ${f.stream_id}`);
+      current = next;
+      currentKey = key;
+      const channels: ChannelSpec[] = current.names.map((name, i) => ({
+        name,
+        unit: next.units[name],
+        labels: next.labels[name],
+        kind: next.kindList[i]
+      }));
+      pages.push(...encodeDictionaryPages(header(current), channels));
+    }
+    const dictionary = current;
     const samples: [number, bigint][] = [];
     dictionary.names.forEach((name, i) => {
       const value = f.channels[name];
@@ -471,7 +491,7 @@ export function exportPages(frames: Snapshot[], dictionary: Dictionary):
           samples.push([i, BigInt(exact ?? value)]);
       }
     });
-    pages.push(...encodeValuePages(header(f), f.chassis, true, samples));
+    pages.push(...encodeValuePages(header(dictionary), f.chassis, true, samples));
   }
   return pages;
 }
@@ -501,6 +521,10 @@ export class JitterBuffer {
       return;
     }
     this.pending.set(seq, {frame, arrival: now});
+  }
+  // The frames waiting to be released.
+  held(): Snapshot[] {
+    return [...this.pending.values()].map(entry => entry.frame);
   }
   flush(now: number): Snapshot[] {
     const out: Snapshot[] = [];
@@ -538,10 +562,12 @@ export class Timeline {
   }
   append(frame: Snapshot, nowMs = Date.now()): boolean {
     const last = this.frames.at(-1);
-    if (last && last.stream_id !== frame.stream_id) return false;
+    // A new stream (a restarted producer) continues the timeline only if its
+    // clock does; its sequence restarts, so sequence order holds per stream.
     if (last &&
         (BigInt(frame.timestamp_ns) <= BigInt(last.timestamp_ns) ||
-         BigInt(frame.sequence_id) <= BigInt(last.sequence_id)))
+         (frame.stream_id === last.stream_id &&
+          BigInt(frame.sequence_id) <= BigInt(last.sequence_id))))
       return false;
     this.frames.push(frame);
     this.lastArrivalMs = nowMs;

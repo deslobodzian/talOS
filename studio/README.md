@@ -41,6 +41,25 @@ deferred one) for 1 second.
 [`src/data/studio.ts`](src/data/studio.ts) also invalidates the live clock and
 system graph when the worker has posted nothing for one second.
 
+### Producer restarts
+
+A new telemetry `stream_id` is a restarted producer. Within one launcher
+session the history continues across it, in the worker and in the headless
+agent alike ([`src/history.ts`](src/history.ts)): channels are matched by name,
+each frame keeps the dictionary it was decoded against, and an export carries
+each stream's dictionary. A "Producer restarted" event marks the boundary,
+plot lines and Driver Station mode bands break there, and detected events and
+the session manifest baseline are kept, so a restart counted in the manifest
+is still reported. The session is the one the system graph's live registry
+row for the publisher of the bridge's telemetry topic carries
+(`telemetrySession` in [`src/system.ts`](src/system.ts)); the manifest cannot
+say, because a bridge serves the manifest file it was started with. A graph
+naming another session replaces the history, keeping only a stream that
+started after the old session was last seen; frames of a stream retired that
+way are ignored until another stream appears. A new stream whose timestamps
+start behind the history (a simulated or replayed clock) also replaces it.
+With no graph naming the session (no registry), a restart always continues it.
+
 ## Add a panel
 
 1. Write `src/panels/<id>/index.tsx`, exporting a

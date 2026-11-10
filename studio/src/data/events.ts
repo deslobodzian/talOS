@@ -48,6 +48,8 @@ export class EventEngine {
   pushFrame(frame: Snapshot) {
     // A new stream is a producer restart. `lastStreamId` survives a reset, so
     // the first frame after a timeline replacement still reveals the change.
+    // History continues across it, so this event is the boundary plots mark;
+    // value detectors start over, since their state is about the old stream.
     if (this.lastStreamId !== null && this.lastStreamId !== frame.stream_id) {
       this.emit('stream', frame.timestamp_ns, {
         severity: 'info',
@@ -55,6 +57,7 @@ export class EventEngine {
         title: 'Producer restarted',
         detail: `stream ${frame.stream_id}`
       });
+      this.resetFrames();
     }
     const prev = this.carriedPrev();
     for (const detector of this.frameDetectors) {
@@ -132,21 +135,27 @@ export class EventEngine {
     this.prevManifest = manifest;
   }
 
-  // Timeline replaced (connect, demo, new stream, import): value detectors
-  // must not compare across streams, so `prev`, `prevSystem` and `prevManifest`
-  // reset. Events clear with the history they were read off. `lastStreamId` is
-  // kept so the stream detector can still report a producer restart.
+  // Timeline replaced (connect, demo, a new launcher session, import): value
+  // detectors must not compare across it, so `prev`, `prevSystem` and
+  // `prevManifest` reset. Events clear with the history they were read off.
+  // `lastStreamId` is kept so the stream detector can still report a producer
+  // restart. A producer restart within a session does not come here: see
+  // pushFrame.
   clear() {
-    this.prev = null;
+    this.resetFrames();
     this.prevSystem = null;
     this.prevManifest = null;
     this.lastTime = null;
+    this.replace([]);
+    this.seq.clear();
+  }
+
+  private resetFrames() {
+    this.prev = null;
     this.lastValues.clear();
     this.lastLabels.clear();
     for (const detector of this.frameDetectors)
       (detector as StatefulFrameDetector).reset?.();
-    this.replace([]);
-    this.seq.clear();
   }
 
   resetSystem() {

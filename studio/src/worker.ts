@@ -2,12 +2,13 @@
 import {handleRpc} from '../agent/rpc';
 
 import {concatPages} from './encode';
-import {checkExportFormat, Coordinator, type Dictionary, exportPages, JitterBuffer, TelemetryDecoder, Timeline, type Snapshot} from './core';
+import {checkExportFormat, Coordinator, type Dictionary, dictionaryKey, exportPages, TelemetryDecoder, Timeline, type Snapshot} from './core';
 import {graphStale} from './data/freshness';
 import {MAX_MANIFEST_BYTES, manifestUrl, parseManifest, type SessionManifest} from './data/manifest';
 import {type Connection, type PlaybackState} from './data/types';
 import {WorkerUpdateStream} from './data/worker-stream';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from './demo';
+import {type HistoryHooks, TelemetryHistory} from './history';
 import {type DeclaredGraph, declaredUrl, MAX_DECLARED_BYTES, parseDeclaredGraph, RateWindow, type SystemGraph, SystemGraphStream} from './system';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
@@ -15,28 +16,47 @@ const updates = new WorkerUpdateStream(message => ctx.postMessage(message));
 // When the newest timeline sample arrived, the anchor for live session time.
 // Null when its age is unknown: then no live reading is current.
 let sampleArrival: number|null = null;
-// Sequence ids of snapshots whose age is unknown: the keyframe the bridge
-// sends on every open carries the latest tick it holds -- possibly from long
-// before this connection, if telemetry has stopped -- so its arrival time
+// Stream and sequence ids of snapshots whose age is unknown: the keyframe the
+// bridge sends on every open carries the latest tick it holds -- possibly from
+// long before this connection, if telemetry has stopped -- so its arrival time
 // says nothing about its values' age.
 const unknownAge = new Set<string>();
+const ageKey = (f: Snapshot) => `${f.stream_id}:${f.sequence_id}`;
 let firstUpdate = false;
-let coordinator = new Coordinator(), jitter = new JitterBuffer(10);
+// Frames appended to the timeline since the previous `frames` post, in order.
+// `needsReset` is set whenever the timeline is replaced (connect, demo, a new
+// launcher session, import) so the next post carries `reset: true`.
+let pendingFrames: Snapshot[] = [];
+let needsReset = false;
+const historyHooks: HistoryHooks = {
+  // An arrival of 0 is Timeline's "no known arrival", so the Agent tab's
+  // get_latest reports the join keyframe's age as null too.
+  arrival: f => unknownAge.delete(ageKey(f)) ? 0 : Date.now(),
+  appended(f, arrivalMs) {
+    pendingFrames.push(f);
+    sampleArrival = arrivalMs === 0 ? null : performance.now();
+  },
+  replaced(kept) {
+    coordinator = new Coordinator(history.timeline);
+    pendingFrames = kept.slice();
+    needsReset = true;
+    // The render cache's events and manifest baseline go with its history.
+    // Posted now, the manifest follows the reset frames: a batch carries its
+    // frames before its other messages (WorkerUpdateStream.flush).
+    if (manifest) postManifest();
+  }
+};
+// The retained timeline, its jitter buffer and dictionaries, shared with the
+// headless agent (history.ts); `coordinator` plays its timeline.
+let history = new TelemetryHistory(historyHooks);
+let coordinator = new Coordinator(history.timeline);
 let decoder = new TelemetryDecoder();
-let streamId: string|null = null;
 let socket: WebSocket|null = null, demo = false, sequence = 0n,
             status = 'Disconnected';
-// The dictionary the timeline decodes against, for log export.
-let dictionary: Dictionary|null = null;
 let nextDemo = 0, lastTick = performance.now();
 let retry: ReturnType<typeof setTimeout>|undefined;
 let generation = 0;
 let connection: Connection = 'idle';
-// Frames appended to the timeline since the previous `frames` post, in order.
-// `needsReset` is set whenever the timeline is replaced (connect, demo, a new
-// stream_id, import) so the next post carries `reset: true`.
-let pendingFrames: Snapshot[] = [];
-let needsReset = false;
 let lastPlayback: PlaybackState|null = null;
 let lastPlaybackPost = 0;
 
@@ -132,7 +152,7 @@ function postPlayback(now: number) {
               BigInt(Math.round((now - sampleArrival) * 1e6))).toString()) :
         coordinator.cursor.toString()) : null,
     bounds: coordinator.timeline.bounds(),
-    stats: {...jitter.stats},
+    stats: {...history.jitter.stats},
     status,
     connection
   };
@@ -263,6 +283,7 @@ function ingestSystem(text: string) {
     }
     systemError = '';
     systemArrival = graphStream.arrival;
+    if (graph) history.observe(graph);
   } catch (e) {
     // One malformed document must not blank a working view. Keep the last good
     // graph and say why the new one was refused. It is no evidence about what
@@ -271,23 +292,10 @@ function ingestSystem(text: string) {
   }
   postSystem();
 }
-// A new stream_id means the producer restarted: sequence and timestamp
-// restart with it, so the old timeline and jitter state would reject or
-// misorder every frame of the new stream. Dictionaries are per-stream too.
-function resetStream(next: string) {
-  streamId = next;
-  coordinator = new Coordinator();
-  jitter = new JitterBuffer(10);
-  needsReset = true;
-  pendingFrames = [];
-  unknownAge.clear();
-}
 function reset() {
-  coordinator = new Coordinator();
-  jitter = new JitterBuffer(10);
+  history = new TelemetryHistory(historyHooks);
+  coordinator = new Coordinator(history.timeline);
   decoder = new TelemetryDecoder();
-  streamId = null;
-  dictionary = null;
   needsReset = true;
   pendingFrames = [];
   unknownAge.clear();
@@ -328,17 +336,12 @@ function close() {
 function ingest(bytes: Uint8Array, now: number) {
   try {
     for (const frame of decoder.decodeAll(bytes)) {
-      if (streamId !== null && frame.stream_id !== streamId)
-        resetStream(frame.stream_id);
-      else
-        streamId = frame.stream_id;
-      dictionary = decoder.currentDictionary();
-      if (firstUpdate) unknownAge.add(frame.sequence_id);
+      if (!history.push(frame, decoder.currentDictionary(), now)) continue;
+      if (firstUpdate) unknownAge.add(ageKey(frame));
       firstUpdate = false;
-      jitter.push(frame, now);
     }
   } catch {
-    jitter.stats.invalid++;
+    history.jitter.stats.invalid++;
   }
 }
 function connect(url: string, gen: number) {
@@ -454,11 +457,10 @@ ctx.onmessage = ({data}) => {
         coordinator.step(BigInt(data.dt_ns));
         break;
       case 'export': {
-        // Each retained snapshot as a keyframe after the dictionary, so the
+        // Each retained snapshot as a keyframe after its dictionary, so the
         // log decodes on its own however much history was trimmed.
-        const out = dictionary ?
-            concatPages(exportPages(coordinator.timeline.frames, dictionary)) :
-            new Uint8Array(0);
+        const out =
+            concatPages(exportPages(coordinator.timeline.frames, history.dictionaries));
         ctx.postMessage({type: 'export', buffer: out.buffer}, [out.buffer]);
         break;
       }
@@ -469,17 +471,21 @@ ctx.onmessage = ({data}) => {
         checkExportFormat(bytes);
         const imported = new Timeline();
         const importDecoder = new TelemetryDecoder();
+        const importedDictionaries = new Map<string, Dictionary>();
         // A value page before the dictionary is refused by the decoder.
         for (const f of importDecoder.decodeAll(bytes)) {
           if (!imported.append(f))
             throw Error('Log sequence/timestamps must strictly increase');
+          importedDictionaries.set(dictionaryKey(f),
+                                   importDecoder.currentDictionary()!);
         }
         // Commit only after the entire log validates. Deterministic import
         // ignores arrival time.
         close();
         reset();
+        history = new TelemetryHistory(historyHooks, imported,
+                                       importedDictionaries);
         coordinator = new Coordinator(imported);
-        dictionary = importDecoder.currentDictionary();
         coordinator.seek(BigInt(imported.bounds()?.start ?? '0'));
         status = 'Replay log loaded';
         connection = 'replay';
@@ -507,17 +513,7 @@ setInterval(() => {
       nextDemoSystem = now + 250;
     }
   }
-  for (const f of jitter.flush(now)) {
-    // An arrival of 0 is Timeline's "no known arrival", so the Agent tab's
-    // get_latest reports the join keyframe's age as null too.
-    const unknown = unknownAge.delete(f.sequence_id);
-    if (!coordinator.timeline.append(f, unknown ? 0 : Date.now())) {
-      jitter.stats.invalid++;
-      continue;
-    }
-    pendingFrames.push(f);
-    sampleArrival = unknown ? null : now;
-  }
+  history.flush(now);
   // The session manifest is re-read once a second while connected: it is a
   // live document, and the launcher replaces it atomically as nodes restart.
   if (manifestBase !== null && connection === 'live' && now >= nextManifestPoll) {
