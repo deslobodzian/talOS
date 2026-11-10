@@ -17,6 +17,8 @@
 #include <string_view>
 #include <utility>
 
+#include "talOS/memory/residency.h"
+
 // The name a topic gets in the operating system's shared-memory namespace.
 //
 // POSIX defines the portable form of an shm name as an initial slash followed
@@ -249,12 +251,21 @@ class SharedMemoryPtr {
       return -1;
     }
 
+    // Registered so a realtime loop keeps it resident (residency.h): made
+    // resident here when the process already asked, or when it asks later.
+    try {
+      talos::memory::TrackMapping(shm_addr, size_);
+    } catch (...) {
+      munmap(shm_addr, size_);
+      throw;
+    }
     ptr_ = shm_addr;
     return 0;
   }
 
   void reset() noexcept {
     if (ptr_ != nullptr) {
+      talos::memory::UntrackMapping(ptr_);
       if (munmap(ptr_, size_) == -1) {
         std::perror("munmap failed");
       }

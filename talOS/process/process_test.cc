@@ -9,6 +9,8 @@
 #include <string>
 #include <thread>
 
+#include "talOS/memory/residency.h"
+
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/thread_policy.h>
@@ -72,13 +74,21 @@ Outcome ConfigureOnFreshThread() {
   return outcome;
 }
 
+// In a re-executed child (the "threadsafe" death-test style runs the binary
+// afresh): whether rings are kept resident is process-wide and sticky, so a
+// ConfigureRealtime from another test, before this one or in an earlier
+// repeat, must not decide it.
 TEST(ProcessTest, RealtimeDisabledByEnvironmentChangesNothing) {
-  ::setenv("TALOS_REALTIME", "0", 1);
-  const Outcome outcome = ConfigureOnFreshThread();
-  ::unsetenv("TALOS_REALTIME");
-
-  EXPECT_FALSE(outcome.returned);
-  EXPECT_FALSE(outcome.realtime);
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(
+      {
+        ::setenv("TALOS_REALTIME", "0", 1);
+        const Outcome outcome = ConfigureOnFreshThread();
+        const bool unchanged = !outcome.returned && !outcome.realtime &&
+                               !memory::MappingsKeptResident();
+        std::_Exit(unchanged ? 0 : 1);
+      },
+      ::testing::ExitedWithCode(0), "");
 }
 
 // Simulation alone does not decide: TALOS_REALTIME=1 qualifies a --sim run
@@ -96,13 +106,17 @@ TEST(ProcessTest, RealtimeRequestFollowsSimulationUnlessTheEnvironmentSays) {
   ::unsetenv("TALOS_REALTIME");
 }
 
-// Report success only when the OS actually applied the realtime policy.
+// Report success only when the OS actually applied the realtime policy, and
+// never fail on the memory steps where the OS allows them: a host that grants
+// the policy here also grants the stack lock (no rings are mapped), so a
+// memory step that always failed would break the equality.
 TEST(ProcessTest, RealtimeIsBestEffort) {
   ::unsetenv("TALOS_REALTIME");
   static_assert(noexcept(ConfigureRealtime(RealtimeOptions{})));
   const Outcome outcome = ConfigureOnFreshThread();
 
   EXPECT_EQ(outcome.returned, outcome.realtime);
+  EXPECT_TRUE(memory::MappingsKeptResident());
 }
 
 // A helper thread doing unbounded work (camera capture, detection) must run

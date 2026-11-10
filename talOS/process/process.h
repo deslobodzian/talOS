@@ -51,8 +51,15 @@ struct RealtimeOptions {
 // asks. Nodes inherit the variable from the launcher's environment.
 bool RealtimeRequested(bool simulation) noexcept;
 
-// Best effort, for the calling thread: mlockall(MCL_CURRENT|MCL_FUTURE) (Linux
-// only; macOS has no working mlockall) plus
+// Best effort, for the calling thread. Memory: on Linux
+// mlockall(MCL_CURRENT|MCL_FUTURE); on macOS, which has no working mlockall,
+// a read of every page of the __TEXT segment of the image holding talOS (the
+// node binary, or libtalos_node.so under Python), prefaulted but not locked
+// because macOS refuses mlock of executable pages. On both, every
+// shared-memory ring (SharedMemoryPtr) mapped now or later is prefaulted for
+// writing and mlocked (memory::KeepMappingsResident), and the calling
+// thread's stack is prefaulted 256 KiB below this call (less on a smaller
+// stack) and mlocked up to its top. Scheduling:
 // SCHED_FIFO at `priority` (Linux) or THREAD_TIME_CONSTRAINT_POLICY derived
 // from `period` (macOS, where a non-positive period counts as 1 ms). Threads
 // created afterwards inherit the policy on Linux, so call it last, from the
@@ -60,9 +67,10 @@ bool RealtimeRequested(bool simulation) noexcept;
 //
 // Returns true when every step took effect. Returns false without touching
 // anything when the environment sets TALOS_REALTIME=0. Returns false and
-// prints one line to stderr when the OS refuses a step (no privilege, a
-// memlock limit, a refused Mach policy); the steps it could take
-// stay in effect. Never throws, never aborts.
+// prints one line to stderr when the OS refuses a step (no privilege,
+// RLIMIT_MEMLOCK or the wired-memory limit, a refused Mach policy); the
+// steps it could take stay in effect, and a refused lock still leaves the
+// rings and stack prefaulted. Never throws, never aborts.
 bool ConfigureRealtime(const RealtimeOptions& options) noexcept;
 
 // The nice value ConfigureBackgroundThread gives a thread on Linux.

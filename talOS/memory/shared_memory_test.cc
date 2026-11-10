@@ -1,6 +1,7 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -15,6 +16,8 @@
 #include <string>
 #include <string_view>
 #include <utility>
+
+#include "talOS/memory/residency.h"
 
 namespace {
 bool fail_truncate = false;
@@ -187,4 +190,69 @@ TEST(ShmObjectNameTest, NamespacesAreStableIsolatedAndIdempotent) {
   EXPECT_EQ(first.find_first_not_of("0123456789abcdef", 2), std::string::npos);
   EXPECT_NE(first, ShmObjectName("/hw/command", "run-a"));
   EXPECT_NE(ShmObjectName("/c", "ab"), ShmObjectName("/bc", "a"));
+}
+
+namespace {
+
+long MinorFaults() {
+  rusage usage{};
+  ::getrusage(RUSAGE_SELF, &usage);
+  return usage.ru_minflt;
+}
+
+// Writes one byte per cache line, as a ring's publishes eventually do.
+[[gnu::noinline]] void WriteEveryLine(SharedMemoryPtr& mapping,
+                                      std::size_t size) {
+  auto* bytes = static_cast<volatile unsigned char*>(mapping.ptr());
+  for (std::size_t offset = 0; offset < size; offset += 64) {
+    bytes[offset] = static_cast<unsigned char>(offset);
+  }
+}
+
+}  // namespace
+
+// A realtime loop's first publish into a ring page must not fault: after
+// KeepMappingsResident, rings mapped before it (a node's topics, opened in
+// its constructor) and after it are written with no minor fault. The control
+// mapping shows the same writes fault without it, so the count measures
+// something.
+TEST(SharedMemory, MappingsKeptResidentTakeNoFaultOnFirstWrite) {
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
+    __has_feature(memory_sanitizer)
+  // The sanitizer's shadow memory is mapped lazily, so the instrumented
+  // writes fault on shadow pages no matter what the ring does.
+  GTEST_SKIP() << "shadow memory faults under a sanitizer";
+#endif
+#endif
+  constexpr std::size_t kSize = 1 << 20;
+  const std::string base = "/resident_" + std::to_string(::getpid());
+  for (const char* suffix : {"_control", "_before", "_after"}) {
+    shm_unlink(ShmObjectName(base + suffix).c_str());
+  }
+  SharedMemoryPtr control{base + "_control", kSize};
+  SharedMemoryPtr before{base + "_before", kSize};
+
+  MinorFaults();
+  const long control_start = MinorFaults();
+  WriteEveryLine(control, kSize);
+  const long control_faults = MinorFaults() - control_start;
+
+  const talos::memory::Residency resident =
+      talos::memory::KeepMappingsResident();
+  EXPECT_GE(resident.ranges, 2u);
+  SharedMemoryPtr after{base + "_after", kSize};
+
+  const long start = MinorFaults();
+  WriteEveryLine(before, kSize);
+  WriteEveryLine(after, kSize);
+  const long faults = MinorFaults() - start;
+
+  EXPECT_GT(control_faults, 0);
+  EXPECT_EQ(faults, 0) << "mlock refused " << resident.failed << " of "
+                       << resident.ranges << " (errno " << resident.first_error
+                       << ")";
+  for (const char* suffix : {"_control", "_before", "_after"}) {
+    shm_unlink(ShmObjectName(base + suffix).c_str());
+  }
 }

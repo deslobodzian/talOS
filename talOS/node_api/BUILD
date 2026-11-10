@@ -93,6 +93,7 @@ cc_shared_library(
         "//talOS/events:input_replay",
         "//talOS/hardware",
         "//talOS/hardware:config",
+        "//talOS/memory:residency",
         "//talOS/node",
         "//talOS/process",
         "//talOS/protocol",

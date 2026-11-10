@@ -59,11 +59,30 @@ and publication-age semantics.
 ### Realtime scheduling
 
 On the robot (not `--sim`, `--describe` or `--replay`) a node binary runs its
-loop thread under `SCHED_FIFO` priority 50 with its memory locked (`mlockall`)
-on Linux, or under the Mach time-constraint policy for its period on macOS
-(which has no working `mlockall`); the bridge's loop runs at priority 60. When
-the OS refuses (no privilege, a memlock limit) the node prints one line to
-stderr and runs anyway. `TALOS_REALTIME=0` in the environment turns this off;
+loop thread under `SCHED_FIFO` priority 50 on Linux, or under the Mach
+time-constraint policy for its period on macOS; the bridge's loop runs at
+priority 60. It also keeps the memory its loop touches resident, so a tick
+does not take a page fault:
+
+- Linux: `mlockall(MCL_CURRENT | MCL_FUTURE)` locks every mapping, present
+  and future.
+- macOS has no working `mlockall`, so the node locks ranges: every
+  shared-memory ring and the loop thread's stack (below). Heap and other
+  mappings are not locked. The `__TEXT` segment of the image holding talOS
+  (the node binary, or `libtalos_node.so` in a Python node) is read in page
+  by page but not locked, since macOS refuses `mlock` of executable pages;
+  system libraries and the Python interpreter are left alone.
+- Both: every RTMS ring the process maps, before or after the loop starts,
+  is prefaulted for writing and `mlock`ed (`talOS/memory` `residency.h`), and
+  the loop thread's stack is prefaulted 256 KiB deeper than where the loop
+  starts (less on a smaller stack) and locked up to its top. On Linux this
+  keeps the rings and stack locked even when `mlockall` is refused.
+
+When the OS refuses a step (no privilege, `RLIMIT_MEMLOCK` or the wired-memory
+limit) the node prints one line to stderr and runs anyway, with whatever it
+could take; a ring or stack it could not lock stays prefaulted. A ring mapped
+after that line whose lock is refused is reported once more per process.
+`TALOS_REALTIME=0` in the environment turns all of this off;
 `TALOS_REALTIME=1` turns it on under `--sim` as well, so a host without a
 RoboRIO runs the actuated control path, its nodes and bridge under the
 production policy, against a simulated gateway (which itself never runs

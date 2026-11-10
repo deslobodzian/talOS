@@ -6,6 +6,7 @@ cc_library(
     srcs = ["process.cc"],
     hdrs = ["process.h"],
     visibility = ["//visibility:public"],
+    deps = ["//talOS/memory:residency"],
 )
 
 cc_library(
@@ -20,6 +21,7 @@ cc_test(
     srcs = ["process_test.cc"],
     deps = [
         ":process",
+        "//talOS/memory:residency",
         "@googletest//:gtest_main",
     ],
 )
