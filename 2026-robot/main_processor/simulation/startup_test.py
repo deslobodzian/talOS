@@ -128,17 +128,19 @@ class SimGatewayStartup(unittest.TestCase):
                         pov = struct.unpack_from("<h", packet, 40 + 60)[0]
                         joystick_samples.append(
                             (connected, axes, buttons, povs, mask, axis, pov))
-                        if previous_sample is not None:
-                            self.assertGreaterEqual(sample - previous_sample,
-                                                    20000)
-                        previous_sample = sample
                         self.assertEqual(alliance, 1)
                         self.assertGreater(generation, 0)
                         self.assertLessEqual(generation, sample)
                         if not phases or phases[-1][0] != flags:
+                            # A new mode goes out on the tick that observes
+                            # it, not at the next 20 ms slot.
+                            self.assertEqual(generation, sample)
                             phases.append((flags, generation))
                         else:
                             self.assertEqual(phases[-1][1], generation)
+                            self.assertGreaterEqual(sample - previous_sample,
+                                                    20000)
+                        previous_sample = sample
                     stdout, stderr = proc.communicate(timeout=5)
                 finally:
                     if proc.poll() is None:

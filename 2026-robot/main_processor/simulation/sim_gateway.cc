@@ -302,6 +302,7 @@ int main(int argc, char** argv) {
     std::array<uint8_t, talos::protocol::kMaxPayloadSize> ds_buffer{};
     uint64_t active_ticks = 0;
     uint64_t last_ds_us = 0;
+    uint32_t last_ds_mode = 0;  // ModeKey of the last packet sent
     uint64_t ticks = 0;
     uint64_t truth_samples = 0;
     uint64_t truth_dropped = 0;
@@ -346,13 +347,17 @@ int main(int argc, char** argv) {
           ++truth_dropped;
         }
       }
-      // Match the RoboRIO: no more than one DS snapshot every 20 ms,
-      // independently of the hardware/physics tick rate.
-      if (last_ds_us == 0 || now - last_ds_us >= 20000) {
+      // Match the RoboRIO: a DS snapshot every 20 ms, independently of the
+      // hardware/physics tick rate, and one at once on the tick that observes
+      // a new mode.
+      const uint32_t mode = ds::ModeKey(driver_station.fms.flags);
+      if (last_ds_us == 0 || mode != last_ds_mode ||
+          now - last_ds_us >= ds::kSamplePeriodUs) {
         const auto ds_size = ds::Encode(driver_station, ds_buffer);
         endpoint.SendFrame(talos::protocol::FrameType::kDriverStation, now,
                            ds_buffer.data(), ds_size);
         last_ds_us = now;
+        last_ds_mode = mode;
       }
       ++ticks;
       if (registration) {

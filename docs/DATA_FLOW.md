@@ -40,12 +40,12 @@ For processor ownership and layer boundaries, see
 | Link / direction | Transport / port | Trigger or rate in the 2026 configuration |
 |---|---|---|
 | Devices ↔ RIO backend | CAN / local DIO, analog, encoder, PWM; no IP port | Gateway samples/applies on `Config.period_us`: 5000 µs = 200 Hz. Phoenix motion feedback requests `status_hz`; voltage/stator-current/supply-current/fault diagnostics request `min(status_hz, 50)` Hz; device temperature requests `min(status_hz, 4)` Hz. Shared vendor frames apply their highest requested rate: voltage/current/temperature remain 200 Hz with 200 Hz feedback; fault field applies 50 Hz. Disabled one-shot neutral refresh remains every hardware tick. |
-| Driver Station ↔ RIO | WPILib/FRC native control/status over radio; not talOS UDP | DS produces new data at 50 Hz; RIO refreshes WPILib each hardware tick, emits a talOS DS snapshot at most every 20000 µs. Mode generations observe every hardware tick, including transitions between published snapshots. Native FRC packet layouts are external to this repo. |
+| Driver Station ↔ RIO | WPILib/FRC native control/status over radio; not talOS UDP | DS produces new data at 50 Hz; RIO refreshes WPILib and observes the mode generation each hardware tick; snapshot cadence is in row DriverStation (24). Native FRC packet layouts are external to this repo. |
 | RIO → hardware_node: State (type 20) | UDP source gateway 5802 → bridge 5803, wired robot switch | One snapshot per gateway tick, 200 Hz; echoes clock probe send time only after a subsequent gateway tick. |
 | hardware_node → RIO: Command (21) | UDP 5803 → 5802 | Bridge polls every 1000 µs. Send immediately when merged command changes, otherwise heartbeat `clamp(command_timeout_us / 5, 5000, 20000)` µs: 20000 µs = 50 Hz with the configured 100000 µs timeout. Only after observed state and while a subsystem request is active; not unconditionally 1000 Hz. |
 | hardware_node → RIO: Config chunks (22) | UDP 5803 → 5802 | Whole config push on observed boot/config mismatch or while unacknowledged; retry on State after ≥50000 µs, doubling after rejected ACKs from 100 ms to 2 s. A changed boot ID pushes immediately and resets backoff. Commands continue during backoff; no pushes after successful matching acknowledgment. |
 | RIO → hardware_node: ConfigAck (23) | UDP 5802 → 5803 | On completed assembly and asynchronous reconfiguration, or rejected chunk/config; no per-chunk ACK for incomplete assemblies. Per-device degraded configure succeeds, with invalid samples identifying unavailable devices. |
-| RIO → hardware_node: DriverStation (24) | UDP 5802 → 5803 | ≤50 Hz on real RIO and standalone `sim_gateway`: snapshots are gated to ≥20000 µs apart, independently of the hardware tick. |
+| RIO → hardware_node: DriverStation (24) | UDP 5802 → 5803 | 50 Hz on real RIO and standalone `sim_gateway`, independently of the hardware tick: snapshots are ≥20000 µs apart, except that the tick observing a new mode sends one at once. An enabled mode switch (autonomous to teleop) changes no State; only the new generation retires the old mode's target lanes. |
 | hardware_node → RIO: ClockProbe (25) | UDP 5803 → 5802 | Empty payload; bridge send time in frame header. At most 50 Hz, one outstanding, retry after 1 s; independent of enable, commissioning and active requests. |
 | hardware_node → device-owning nodes / DS consumers / telemetry | Shared-memory `/hw/state`, `/hw/state/driver_station`, `/hw/status`; no port | State/DS on received frames; bridge status first tick then every 20000 µs (50 Hz, `node.h`'s `kStatusPeriodUs`). Consumers run at their own periods. |
 | drivetrain / shooter / intake → hardware_node | Shared-memory `/hw/request/<node>` | Devices-layer flush each update: drivetrain and shooter 5000 µs (200 Hz); intake 20000 µs (50 Hz). Bridge neutralizes an owner silent for >2× its period. |
@@ -70,7 +70,7 @@ second. Underflow/future stamps publish invalid.
 Timing sources: `2026-robot/main_processor/configuration/robot.toml:1-16`, its
 `subsystems/*.toml`, `talOS/bridge/node.cc` (`Tick`, `PushConfig`,
 `ShouldSendCommand`), `talOS/hardware/endpoint.h:25-98`,
-`2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp:221-258`, and
+`2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp:221-302`, and
 `2026-robot/main_processor/simulation/sim_gateway.cc`.
 
 Phoenix 26.3.0 `CoreTalonFX.hpp` / `SpnValue.hpp` identify stator current,

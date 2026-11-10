@@ -34,8 +34,9 @@ stopped or `--duration-s` expires (zero or omitted means unbounded).
 scheduled mode and a new `mode_since_us` generation at each mode transition;
 the gateway's enable gate follows that same mode. The bridge publishes these
 packets on `/hw/state/driver_station`, just as it does for the RoboRIO.
-Packets are emitted at most every 20000 µs (50 Hz), matching the RoboRIO,
-even when physics and hardware snapshots run at 200 Hz.
+Packets are emitted every 20000 µs (50 Hz), and at once on the tick a new mode
+starts, matching the RoboRIO, even when physics and hardware snapshots run at
+200 Hz.
 `--port N` selects the gateway's loopback UDP listening port (default 5802);
 `--remote-port N` selects the bridge's receiving port (default 5803). Tests
 choose ephemeral ports so independent simulated stacks do not share sockets.

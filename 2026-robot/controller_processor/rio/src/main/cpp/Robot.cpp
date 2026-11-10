@@ -220,6 +220,8 @@ void Robot::StartCompetition() {
 
   std::array<uint8_t, talos::protocol::kMaxPayloadSize> ds_buffer{};
   uint64_t last_ds_sample_us = 0;
+  // The mode (ModeKey) of the last packet sent.
+  uint32_t last_ds_mode = 0;
   // Observe every hardware tick, including transitions between DS packets.
   // Real and desktop Driver Stations are both read back through WPILib.
   talos::driver_station::ModeTracker ds_mode;
@@ -264,10 +266,16 @@ void Robot::StartCompetition() {
 
       // The Driver Station only produces new data at 50 Hz, so sampling it on
       // every hardware tick would put three duplicate packets on the link, and
-      // in the dispatch log downstream, for every real one.
-      if (now_us - last_ds_sample_us >=
-          talos::driver_station::kSamplePeriodUs) {
+      // in the dispatch log downstream, for every real one. A new mode goes
+      // out on the tick that observes it: an enabled switch (autonomous to
+      // teleop) leaves the State unchanged, so until its generation arrives
+      // the old mode's target lanes still drive.
+      const uint32_t mode = talos::driver_station::ModeKey(mode_flags);
+      const bool sample_due =
+          now_us - last_ds_sample_us >= talos::driver_station::kSamplePeriodUs;
+      if (mode != last_ds_mode || sample_due) {
         last_ds_sample_us = now_us;
+        last_ds_mode = mode;
         auto ds = talos::driver_station::SampleDriverStation(now_us);
         ds_mode.Stamp(ds);
         // The same boot id as this program's State: a consumer orders
