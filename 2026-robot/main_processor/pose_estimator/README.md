@@ -115,6 +115,45 @@ implementation (an unknown value fails at startup). The robot config selects
 - `module_x_m` / `module_y_m` repeat `[subsystems.drivetrain.geometry]
   .modules` (same order); `config_golden_test` fails if they drift.
 
+## Update benchmark
+
+```sh
+bazel run //2026-robot/main_processor/pose_estimator:update_benchmark -- \
+  [--backend kalman|factor_graph|both] [--seconds N]
+```
+
+runs the `PoseEstimator` class on `talos.testing.Sim` over the production
+`robot.toml` with only `backend` replaced (default both, one after the
+other), and times every `update()` with `time.perf_counter_ns`. The
+workload, with a fixed seed, lasts `--seconds` simulated seconds per backend
+(default 900):
+
+- the drivetrain state at the drivetrain's configured period, from a
+  Lissajous sweep that starts at the configured initial pose (up to
+  ~3.7 m/s wheel speed, 1.35 rad/s), with per-wheel slip and gyro noise;
+- every configured camera capturing at ~60 Hz, each frame the true pose plus
+  noise (2–8 cm, 0.01–0.03 rad) that it reports as its std devs, arriving
+  20–35 ms after capture, 15 % of frames a further 20–100 ms late (after
+  newer frames, so they attach to past keys);
+- a disabled-first Driver Station, so the estimate is localized from the
+  first sample and every observation is fused.
+
+As in production, a tick sees only each camera's newest observation, so it
+fuses at most four. The report gives the host (platform, CPU model, Python,
+CPU count) and package versions, then per backend: ticks, p50, p99, p99.9
+and max `update()` duration, the fraction of ticks longer than the period
+(`>period`), observations fused per tick (mean, and the fraction of ticks
+that fused four), the maximum during the first lag window (warm-up,
+excluded from the other statistics) and the final position error. It
+exits non-zero when an observation or odometry step was rejected or the
+final estimate is not valid and localized, i.e. the workload was not the
+one described; it never judges timing. `update_benchmark_test` runs it for
+3 s per backend.
+
+It measures `update()` alone in one process. It does not measure the node
+loop's dispatch or lateness, real-time scheduling, other nodes competing for
+the CPU, the production process's garbage-collection pattern (collections
+in this process do land in the measured ticks), or real camera timing.
 
 ## Tests
 
