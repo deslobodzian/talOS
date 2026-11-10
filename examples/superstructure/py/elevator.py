@@ -1,4 +1,5 @@
-"""One motion-magic motor: the C++ demo::Elevator node wrapped for Python."""
+"""One motion-magic motor homed on a bottom switch: the C++ demo::Elevator
+node wrapped for Python."""
 
 import talos
 

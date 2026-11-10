@@ -54,6 +54,12 @@ class SuperstructureTest(unittest.TestCase):
         self.sim.add(elevator.Elevator, "elevator")
         self.sim.add(superstructure.Superstructure, "superstructure")
         self.hw = SimHardware(self.sim)
+        # The lift starts on its bottom switch, so it zeroes without moving,
+        # then leaves it as it rises. The switch is normally open to ground
+        # behind a pull-up: closed reads False.
+        self.hw.set_digital_input("elevator", "bottom_limit", False)
+        self.sim.step(0.01)
+        self.hw.set_digital_input("elevator", "bottom_limit", True)
 
     def hold(self, command, seconds):
         """Holds a driver command the way a driver node would: its teleop

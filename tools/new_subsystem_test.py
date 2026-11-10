@@ -175,10 +175,14 @@ class NewSubsystemTest(unittest.TestCase):
                 with self.assertRaises(new_subsystem.Refused):
                     new_subsystem.plan(root, "bot", inherited, "py")
 
-    def test_plan_confines_a_position_mechanism_until_its_travel_is_set(self):
-        # The gateway and the devices layer bound a position demand only
-        # with soft_limits, and validation refuses a zero range, so the
-        # placeholder travel is a window narrower than the at-goal tolerance.
+    def test_plan_homes_a_position_mechanism_and_confines_its_travel(self):
+        # Positions count from a home switch, never from the power-on frame:
+        # the motor requires a zero, has no hardware soft limits (which act
+        # in that frame and can stop homing), and its placeholder travel,
+        # clamped by the node, is narrower than the at-goal tolerance. The
+        # homing parameters pass the node's checks (homing_v toward the
+        # switch, positive bounds), and the switch gets the lowest free DIO
+        # channel, as the motor gets the lowest free CAN id.
         with tempfile.TemporaryDirectory() as root:
             configuration = os.path.join(root, "bot", "main_processor",
                                          "configuration")
@@ -188,7 +192,9 @@ class NewSubsystemTest(unittest.TestCase):
                     ("robot.toml", '[robot]\nname = "bot"\n\n[[subsystems]]\n'
                      'name = "shooter"\npath = "subsystems/shooter.toml"\n'),
                     ("subsystems/shooter.toml",
-                     '[subsystem]\nname = "shooter"\n')):
+                     '[subsystem]\nname = "shooter"\n'
+                     '[digital_inputs.beam]\ndio = 0\n'
+                     '[encoders.angle]\ndio_a = 1\ndio_b = 3\n')):
                 with open(os.path.join(configuration, path), "w",
                           encoding="utf-8") as f:
                     f.write(text)
@@ -199,11 +205,16 @@ class NewSubsystemTest(unittest.TestCase):
                 if path == os.path.join(configuration, "subsystems",
                                         "wrist.toml")))
         motor = subsystem["motors"]["wrist_motor"]
-        self.assertIs(motor["soft_limits"], True)
-        travel = motor["forward_limit_rot"] - motor["reverse_limit_rot"]
-        self.assertGreater(travel, 0)
-        self.assertLess(travel, subsystem["subsystem"]["tolerance_rot"])
-
+        self.assertIs(motor["requires_zero"], True)
+        self.assertIs(motor["soft_limits"], False)
+        params = subsystem["subsystem"]
+        self.assertGreater(params["max_position_rot"], 0)
+        self.assertLess(params["max_position_rot"], params["tolerance_rot"])
+        self.assertLess(params["homing_v"], 0)
+        for key in ("homing_timeout_us", "homing_stall_rps", "homing_stall_us",
+                    "home_margin_rot"):
+            self.assertGreater(params[key], 0, key)
+        self.assertEqual(subsystem["digital_inputs"]["wrist_home"]["dio"], 2)
 
     def test_generated_packages_match_the_built_golden_packages(self):
         # tools/scaffold_testdata holds the generator's output, built and

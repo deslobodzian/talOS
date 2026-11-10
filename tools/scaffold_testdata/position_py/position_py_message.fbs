@@ -7,10 +7,19 @@ struct PositionPyTarget {
   position_rot:double;
 }
 
-// What the position_py is doing, published every tick.
+// Whether positions count from the home switch yet: HOMING until the switch
+// zeroes the motor (it drives toward the switch only with a live target);
+// FAILED once homing timed out or stalled, or the switch read closed well
+// away from the zero (neutral until the Driver Station reports disabled).
+enum PositionPyHoming : ubyte { HOMING, HOMED, FAILED }
+
+// What the position_py is doing, published every tick. enabled: it drove the motor
+// this tick (homing or Motion Magic). position_rot counts from the home
+// switch once HOMED; before that it is the motor's unhomed position.
 struct PositionPyState {
   enabled:bool;
   position_rot:double;
   connected:bool;
   at_goal:bool;
+  homing:PositionPyHoming;
 }

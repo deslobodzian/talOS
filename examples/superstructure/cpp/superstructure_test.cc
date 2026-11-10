@@ -14,6 +14,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "examples/superstructure/cpp/elevator.h"
 #include "examples/superstructure/cpp/intake.h"
@@ -51,6 +53,10 @@ constexpr double kIntakeVolts = 8.0;
 constexpr double kHoldVolts = 1.0;
 constexpr double kEjectVolts = -10.0;
 constexpr double kHighRot = 10.0;
+constexpr double kMaxHeightRot = 12.0;
+constexpr double kHomingVolts = -3.0;
+constexpr auto kHomingTimeout = 6000ms;
+constexpr auto kHomingStall = 500ms;
 
 // Enables the robot and puts the Driver Station in enabled teleop: a Target
 // drives only with both. The 10 ms step lets the mode begin before the first
@@ -61,8 +67,22 @@ void EnableTeleop(Sim& sim, SimHardware& hw) {
   sim.step(10ms);
 }
 
+// The elevator's bottom switch closed: the lift starts at the bottom, so it
+// zeroes there (Motor::rezero) without moving. The switch is normally open to
+// ground behind a pull-up: closed reads false.
+void LiftAtBottom(SimHardware& hw, bool down = true) {
+  hw.set_digital_input("elevator", "bottom_limit", !down);
+}
+
 class SuperstructureTest : public ::testing::Test {
  protected:
+  // The lift zeroes on its switch, then leaves it as it rises.
+  SuperstructureTest() {
+    LiftAtBottom(hw);
+    sim.step(10ms);
+    LiftAtBottom(hw, false);
+  }
+
   // Holds a driver command the way a driver node would: its teleop lane
   // republished every 20 ms.
   void Hold(SuperstructureCommand command, std::chrono::milliseconds duration) {
@@ -462,12 +482,16 @@ TEST_F(SuperstructureAlone, AtGoalForAnEarlierHeightDoesNotCount) {
   EXPECT_EQ(State(), SuperstructureState::RAISING);
 }
 
-// The elevator on its own, driven through its superstructure lane by hand.
+// The elevator on its own, driven through its superstructure lane by hand,
+// homed at the bottom.
 class ElevatorAlone : public ::testing::Test {
  protected:
   void SetUp() override {
     EnableTeleop(sim, hw);
     hw.ideal_motors();
+    LiftAtBottom(hw);
+    sim.step(10ms);
+    LiftAtBottom(hw, false);
   }
 
   // The superstructure's lane, republished every 10 ms.
@@ -480,6 +504,38 @@ class ElevatorAlone : public ::testing::Test {
   }
   talos::hardware::MotorRequest Lift() const {
     return hw.motor_request("elevator", "lift");
+  }
+  // Drive(), checking the lift output the hardware applies after every
+  // gateway tick: true if any was a motion-magic goal. (A request the node
+  // built from a State before a reset is in the old frame; the gateway
+  // applies it neutral.)
+  bool DriveSawMotionMagic(double height_rot,
+                           std::chrono::milliseconds duration) {
+    bool seen = false;
+    for (auto t = 0ms; t < duration; t += 10ms) {
+      PublishTarget(sim, "elevator", "superstructure",
+                    ElevatorGoal{height_rot});
+      for (int i = 0; i < 2; ++i) {
+        sim.step(5ms);
+        seen |= hw.applied_motor("elevator", "lift").mode == Mode::kMotionMagic;
+      }
+    }
+    return seen;
+  }
+  // The carriage reaches its bottom stop, at `raw_rot` in the motor's frame.
+  // One elevator period on the closed switch, then the lift rises off it.
+  void ReachBottom(double raw_rot) {
+    hw.set_motor("elevator", "lift", raw_rot, 0.0);
+    LiftAtBottom(hw);
+    sim.step(10ms);
+    LiftAtBottom(hw, false);
+  }
+  void ExpectHoming() const {
+    EXPECT_EQ(Lift().mode, Mode::kVoltage);
+    EXPECT_DOUBLE_EQ(Lift().demand, kHomingVolts);
+    EXPECT_EQ(Status().state(), ElevatorState::HOMING);
+    EXPECT_DOUBLE_EQ(Status().goal_rot(), 0.0);
+    EXPECT_FALSE(Status().at_goal());
   }
   ElevatorStatus Status() const {
     const auto status = sim.latest<ElevatorStatus>(topics::kElevatorStatus);
@@ -547,6 +603,185 @@ TEST_F(ElevatorAlone, NeutralWithTheLiftDisconnected) {
 TEST_F(ElevatorAlone, NeutralOnANonFiniteGoal) {
   Drive(std::numeric_limits<double>::quiet_NaN(), 50ms);
   ExpectNeutral();
+}
+
+TEST_F(ElevatorAlone, ClampsGoalsToTheTravel) {
+  Drive(kMaxHeightRot + 8.0, 30ms);
+  EXPECT_EQ(Lift().mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(Lift().demand, kMaxHeightRot);
+  EXPECT_DOUBLE_EQ(Status().goal_rot(), kMaxHeightRot);
+  Drive(-3.0, 30ms);
+  EXPECT_DOUBLE_EQ(Lift().demand, 0.0);
+  EXPECT_DOUBLE_EQ(Status().goal_rot(), 0.0);
+}
+
+// A switch stuck closed zeroed the lift at the bottom; the first move up
+// shows it still closed well above 0, and the elevator stops.
+TEST_F(ElevatorAlone, AStuckSwitchStopsTheFirstMoveUp) {
+  LiftAtBottom(hw);
+  Drive(kHighRot, 30ms);  // ideal motors: up at once
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING_FAILED);
+  EXPECT_FALSE(Status().at_goal());
+  Drive(kHighRot, 100ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+}
+
+// Powered on away from the bottom, switch open: no zero yet. The lift moves
+// when pushed (velocity -1 rps), so homing does not count as stalled.
+class ElevatorHoming : public ElevatorAlone {
+ protected:
+  void SetUp() override {
+    LiftAtBottom(hw, false);
+    hw.set_motor("elevator", "lift", 0.0, -1.0);  // the power-on count
+    EnableTeleop(sim, hw);
+    hw.ideal_motors();
+  }
+  // The operator disables and re-enables at the Driver Station.
+  void DisableAndEnable() {
+    hw.set_driver_station(DsPacket(ds::kTeleop));
+    sim.step(20ms);
+    hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+    sim.step(10ms);
+  }
+};
+
+TEST_F(ElevatorHoming, HomesOnALiveTargetThenReachesTheGoal) {
+  // Unhomed: a goal drives the lift down, never to a motion-magic goal in
+  // the power-on frame.
+  EXPECT_FALSE(DriveSawMotionMagic(kHighRot, 100ms));
+  ExpectHoming();
+
+  // The switch closes 4 rotations below where the TalonFX powered on: that
+  // is height 0, and the goal goes out in the homed frame.
+  ReachBottom(-4.0);
+  Drive(kHighRot, 30ms);
+  EXPECT_EQ(Lift().mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(Lift().demand, kHighRot - 4.0);
+  EXPECT_EQ(Status().state(), ElevatorState::AT_GOAL);
+  EXPECT_DOUBLE_EQ(Status().height_rot(), kHighRot);
+  EXPECT_TRUE(Status().at_goal());
+}
+
+TEST_F(ElevatorAlone, AResetAtHeightRehomesBeforeAnyGoal) {
+  Drive(kHighRot, 50ms);
+  ASSERT_EQ(Status().state(), ElevatorState::AT_GOAL);
+  ASSERT_DOUBLE_EQ(Lift().demand, kHighRot);
+
+  // The TalonFX resets at height: its count restarts at 0 up there. A goal
+  // of kHighRot in that frame would drive the carriage 10 rotations past
+  // where it is; homing goes down to the switch first.
+  hw.reset_device("elevator", "lift");
+  hw.set_motor("elevator", "lift", 0.0, -1.0);
+  EXPECT_FALSE(DriveSawMotionMagic(kHighRot, 100ms));
+  ExpectHoming();
+
+  ReachBottom(-kHighRot);
+  Drive(kHighRot, 30ms);
+  EXPECT_EQ(Lift().mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(Lift().demand, 0.0);  // kHighRot above the switch
+  EXPECT_EQ(Status().state(), ElevatorState::AT_GOAL);
+  EXPECT_DOUBLE_EQ(Status().height_rot(), kHighRot);
+}
+
+TEST_F(ElevatorHoming, NoHomingMotionWithoutALiveFiniteTarget) {
+  sim.step(100ms);  // never sent
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING);
+
+  Drive(std::numeric_limits<double>::quiet_NaN(), 50ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+
+  hw.enable(false);
+  Drive(kHighRot, 100ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING);
+
+  hw.enable();
+  Drive(kHighRot, 50ms);
+  ExpectHoming();
+  sim.step(110ms);  // the lane goes stale
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+
+  Drive(kHighRot, 50ms);
+  ExpectHoming();
+  ReleaseTarget<ElevatorGoal>(sim, "elevator", "superstructure");
+  sim.step(20ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING);
+}
+
+TEST_F(ElevatorHoming, TimeoutStopsHomingUntilTheDriverStationDisables) {
+  Drive(kHighRot, kHomingTimeout - 100ms);
+  ExpectHoming();
+  Drive(kHighRot, 200ms);  // the switch never closes
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING_FAILED);
+  EXPECT_FALSE(Status().at_goal());
+
+  // Neither a live target nor a stale-link glitch (robot_enabled false for
+  // 150 ms) restarts it; a Driver Station disable does.
+  Drive(kHighRot, 500ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  hw.lose_states(30);
+  Drive(kHighRot, 150ms);
+  Drive(kHighRot, 100ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING_FAILED);
+  DisableAndEnable();
+  Drive(kHighRot, 30ms);
+  ExpectHoming();
+}
+
+TEST_F(ElevatorHoming, AStalledLiftStopsHoming) {
+  hw.set_motor("elevator", "lift", 0.0, 0.0);  // pushed, but not moving
+  Drive(kHighRot, kHomingStall - 100ms);
+  ExpectHoming();
+  Drive(kHighRot, 200ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING_FAILED);
+}
+
+// config/subsystems/elevator.toml's elevator, as a single-file config with
+// one [subsystem] key replaced.
+std::string ElevatorConfig(const std::string& key, const std::string& value) {
+  std::vector<std::pair<std::string, std::string>> params{
+      {"tolerance_rot", "0.1"},    {"max_height_rot", "12.0"},
+      {"homing_v", "-3.0"},        {"homing_timeout_us", "6000000"},
+      {"homing_stall_rps", "0.2"}, {"homing_stall_us", "500000"},
+      {"home_margin_rot", "0.5"}};
+  std::string toml =
+      "[robot]\nperiod_us = 5000\ncommand_timeout_us = 100000\n\n"
+      "[subsystems.elevator]\nperiod_us = 10000\n";
+  for (const auto& [k, v] : params)
+    toml += k + " = " + (k == key ? value : v) + "\n";
+  return toml + R"(
+[subsystems.elevator.motors.lift]
+type = "TalonFX"
+bus = "rio"
+can_id = 2
+requires_zero = true
+
+[subsystems.elevator.digital_inputs.bottom_limit]
+dio = 1
+)";
+}
+
+TEST(ElevatorConfig, RefusesUnsafeHomingParameters) {
+  {
+    auto sim = Sim::FromToml(ElevatorConfig("", ""));
+    EXPECT_NO_THROW(sim.add<demo::Elevator>("elevator"));
+  }
+  const std::vector<std::pair<std::string, std::string>> bad{
+      {"homing_v", "0.0"},        {"homing_v", "2.0"},
+      {"max_height_rot", "0.0"},  {"max_height_rot", "nan"},
+      {"homing_timeout_us", "0"}, {"homing_stall_rps", "0.0"},
+      {"homing_stall_us", "0"},   {"home_margin_rot", "-0.5"}};
+  for (const auto& [key, value] : bad) {
+    SCOPED_TRACE(key + " = " + value);
+    auto sim = Sim::FromToml(ElevatorConfig(key, value));
+    EXPECT_THROW(sim.add<demo::Elevator>("elevator"), std::invalid_argument);
+  }
 }
 
 TEST(IntakeAlone, EjectDurationUsesMicroseconds) {

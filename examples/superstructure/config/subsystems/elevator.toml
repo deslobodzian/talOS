@@ -1,9 +1,21 @@
-# One motion-magic TalonFX. Positions are drum rotations
-# (sensor_to_mechanism_ratio applies the gearbox on the controller).
+# One motion-magic TalonFX homed on a bottom limit switch. Positions are drum
+# rotations (sensor_to_mechanism_ratio applies the gearbox on the controller),
+# counted from the switch.
 [subsystem]
 name = "elevator"
 period_us = 10000
-tolerance_rot = 0.1  # at_goal when within this of the goal
+tolerance_rot = 0.1     # at_goal when within this of the goal
+max_height_rot = 12.0   # goals clamp to 0..this, in the homed frame
+# Homing: drives at homing_v (negative: down, toward the switch at the bottom)
+# until the switch closes. It gives up, neutral, after homing_timeout_us, or
+# once the lift has moved slower than homing_stall_rps for homing_stall_us.
+homing_v = -3.0
+homing_timeout_us = 6000000
+homing_stall_rps = 0.2
+homing_stall_us = 500000
+# A switch reading closed with the zeroed lift more than this above 0 is
+# stuck or miswired: the elevator stops, neutral.
+home_margin_rot = 0.5
 
 # Who drives the elevator, per Driver Station mode (highest priority first):
 # only the superstructure's lane, /elevator/target/superstructure, in both
@@ -26,8 +38,25 @@ max_velocity_rps = 11.0
 cruise_velocity_rps = 8.0
 acceleration_rps2 = 24.0
 jerk_rps3 = 0.0
-soft_limits = true
-reverse_limit_rot = 0.0
-forward_limit_rot = 12.0
+# No hardware soft limits: they act in the TalonFX's power-on frame on every
+# control mode, so after a reset at height the reverse limit (0 at that
+# height) would stop homing at once. max_height_rot bounds the goals instead.
+soft_limits = false
+# A switch on the TalonFX's own forward limit input stops upward output in
+# every control mode, whatever the frame. "NormallyOpen" is also Phoenix's
+# default, so nothing changes until one is wired; "NormallyClosed" also stops
+# the lift if the switch's wire breaks.
+forward_limit_switch = "NormallyOpen"
+# Position and motion-magic requests go out neutral until the bottom switch
+# has zeroed the lift (Motor::rezero), and again after a reset drops the zero.
+requires_zero = true
 # kG holds the carriage against gravity; kV/kA feed the motion-magic profile.
 slot0 = { p = 4.0, i = 0.0, d = 0.1, s = 0.1, v = 1.1, a = 0.02, g = 0.35 }
+
+# The bottom switch: normally open, between the DIO signal pin and ground, so
+# the input's pull-up reads true while the carriage is off it and false once
+# the carriage closes it. A cut or unplugged wire reads true, "not at the
+# bottom": homing then times out or stalls instead of zeroing mid-travel.
+# Placeholder DIO.
+[digital_inputs.bottom_limit]
+dio = 1
