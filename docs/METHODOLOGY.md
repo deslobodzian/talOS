@@ -336,7 +336,7 @@ The allocation-test limitation below is platform-specific.
 
 | Where | Deviation | Rule | Fix |
 |---|---|---|---|
-| `drivetrain/node_test.cc` `UpdateDoesNotAllocate` | the process-wide allocation check (`malloc_logger`) runs on macOS only; on Linux it is skipped | §10 | a glibc-compatible allocation hook (glibc removed `__malloc_hook` in 2.34) |
+| `drivetrain/node_test.cc` `UpdateDoesNotAllocate` | the process-wide allocation check (`malloc_logger`) runs on macOS only, and not under ASan/TSan; on Linux it is skipped | §10 | a glibc-compatible allocation hook (glibc removed `__malloc_hook` in 2.34) |
 
 ## 14. Open source first
 

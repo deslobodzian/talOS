@@ -1221,7 +1221,15 @@ TEST(Drivetrain, LinkDropKeepsPublishingInvalidStateAndHoldsPositions) {
 
 // --- allocation ------------------------------------------------------------
 
-#if defined(__APPLE__)
+// ASan and TSan serve every malloc from their own allocator, so
+// libsystem_malloc never calls malloc_logger and the probe below sees nothing.
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define TALOS_SANITIZER_ALLOCATOR 1
+#endif
+#endif
+
+#if defined(__APPLE__) && !defined(TALOS_SANITIZER_ALLOCATOR)
 // Every malloc in the process, including those made inside linked libraries
 // (whose operator new binds to libc++, not to this binary). libsystem_malloc
 // calls malloc_logger, when set, on every allocation; each one's stack is kept
@@ -1276,7 +1284,9 @@ bool InSimTransport(const Allocation& a) {
 #endif
 
 TEST_F(DrivetrainTest, UpdateDoesNotAllocate) {
-#if defined(__APPLE__)
+#if defined(TALOS_SANITIZER_ALLOCATOR)
+  GTEST_SKIP() << "the sanitizer's allocator bypasses malloc_logger";
+#elif defined(__APPLE__)
   // Fail rather than silently passing if the allocation probe stops working.
   g_allocations = 0;
   malloc_logger = RecordAllocation;
