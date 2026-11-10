@@ -979,7 +979,10 @@ TEST(LauncherGraphTest, NonCriticalDescribeTimeoutAllowsPeersToLaunch) {
   alpha->erase("motors");
   alpha->insert_or_assign("critical", false);
   std::ofstream{fixture.options.config_path} << config;
-  fixture.options.describe_timeout_ms = 100;
+  // Only alpha must miss the deadline. A freshly written stub's first exec
+  // alone can take about 100 ms (macOS, Bazel's darwin sandbox), so the
+  // answering peers need a deadline well above that.
+  fixture.options.describe_timeout_ms = 1000;
   fixture.options.max_restarts = 0;
   EXPECT_EQ(Launcher{fixture.options}.Run(), 0);
   EXPECT_TRUE(fixture.has_manifest());
