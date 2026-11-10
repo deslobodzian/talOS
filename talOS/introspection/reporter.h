@@ -11,6 +11,12 @@
  * -- its counters, and its recorder's capture state -- plus its manifest and
  * which watchers are latest-only, both immutable once the run has started.
  *
+ * The one exception is the row's dispatch count, the launcher's evidence that
+ * the node is not stalled. The loop thread stores it at every dispatch
+ * (event::DispatchObserver): this thread runs below every realtime loop, and
+ * a host busy with them can starve it for longer than the launcher's stall
+ * timeout while the loop itself keeps time.
+ *
  * Construct it after the loop, so that reverse destruction order joins this
  * thread before the loop's counters go away:
  *
@@ -37,6 +43,7 @@
 #include <utility>
 #include <vector>
 
+#include "talOS/events/dispatch_observer.h"
 #include "talOS/events/manifest.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
@@ -108,9 +115,8 @@ class Reporter {
     // The node's Targets, in the order it opened them.
     std::vector<Selection> selections;
 
-    // Full source/selection refresh cadence. Supervisor progress is refreshed
-    // every 10 ms independently, so telemetry's cadence cannot consume most
-    // of the launcher's 500 ms minimum stall window.
+    // Full refresh cadence: heartbeat, source counters and selections. The
+    // dispatch count the launcher supervises is the loop thread's own.
     std::chrono::milliseconds period{250};
 
     std::string registry_path{kRegistryPath};
@@ -147,7 +153,9 @@ class Reporter {
   }
 
   // Call after construction, before running the loop. The owner must keep the
-  // loop and every sampled node alive until this Reporter has been destroyed.
+  // loop and every sampled node alive until this Reporter has been destroyed,
+  // and destroy it only while the loop is not running: from then on the loop
+  // stores its dispatch count in this Reporter's row.
   template <typename Loop>
   void start(Loop& loop, std::vector<ExtraSource> extra,
              std::vector<EndpointAttribute> endpoints,
@@ -162,11 +170,20 @@ class Reporter {
   template <typename Loop>
   void start(Loop& loop) {
     stop();
+    detach();
+    if (registration_) {
+      progress_.registration = &*registration_;
+      loop.set_dispatch_observer(&progress_);
+      detach_ = [&loop] { loop.set_dispatch_observer(nullptr); };
+    }
     thread_ = std::jthread{
         [this, &loop](const std::stop_token& stop) { run(loop, stop); }};
   }
 
-  ~Reporter() { stop(); }
+  ~Reporter() {
+    stop();
+    detach();
+  }
 
   void stop() {
     thread_.request_stop();
@@ -248,13 +265,6 @@ class Reporter {
       while (!stop.stop_requested() && loop.running() &&
              std::chrono::steady_clock::now() < deadline) {
         pause(stop, std::chrono::milliseconds{10});
-        // A 250 ms-old progress sample plus a short process suspension used
-        // to look like a 500 ms stall before the process could even resume.
-        // Keep this cheap: no source scan, allocation, or selection callbacks.
-        registration->begin_sample();
-        registration->heartbeat();
-        registration->set_dispatch_count(loop.dispatch_count());
-        registration->end_sample();
       }
     }
 
@@ -265,11 +275,10 @@ class Reporter {
 
   template <typename Loop>
   void sample(Loop& loop, NodeRegistration& registration) {
-    // One full source sample. Heartbeat and dispatch progress also move
-    // together between full samples, independently of the display cadence.
+    // One full sample. The dispatch count is the loop thread's to store
+    // (ProgressObserver).
     registration.begin_sample();
     registration.heartbeat();
-    registration.set_dispatch_count(loop.dispatch_count());
     // Whether the event log stopped early, from a recorder that can say
     // (event::log::LogWriter, whose answers are lock-free loads); an
     // unlogged loop's NullRecorder cannot.
@@ -313,6 +322,19 @@ class Reporter {
     registration.end_sample();
   }
 
+  // Stores the loop's dispatch count in the row from the loop thread.
+  struct ProgressObserver final : event::DispatchObserver {
+    NodeRegistration* registration{nullptr};
+    void on_dispatch_count(std::uint64_t count) noexcept override {
+      registration->set_dispatch_count(count);
+    }
+  };
+
+  // Detaches ProgressObserver from the loop start() gave it, if any.
+  void detach() {
+    if (detach_) std::exchange(detach_, nullptr)();
+  }
+
   // Waits `period`, returning as soon as a stop is requested, so stop() --
   // and with it start(), which ends the construction heartbeat -- joins
   // without sitting out the rest of a sleep. Only the reporting thread waits.
@@ -326,6 +348,8 @@ class Reporter {
   std::atomic<bool> published_{false};
   std::string error_;
   std::optional<NodeRegistration> registration_;
+  ProgressObserver progress_;
+  std::function<void()> detach_;
   std::mutex pause_mutex_;
   std::condition_variable_any pause_;
   std::jthread thread_;

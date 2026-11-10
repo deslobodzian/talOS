@@ -11,6 +11,7 @@ cc_library(
         "callback.h",
         "context.h",
         "delivery.h",
+        "dispatch_observer.h",
         "manifest.h",
         "recorder.h",
         "scheduler.h",

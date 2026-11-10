@@ -6,7 +6,7 @@ with the stick centred for 0.5 s at the start of every 3 s cycle and driving
 the rest. Each cycle, 1.8 s in, one fault is injected into a running process,
 in a seeded order (TALOS_SOAK_SEED, default 0) that cycles through every kind:
 SIGKILL (restarted by the launcher) or a 300 ms SIGSTOP (below the 500 ms
-heartbeat floor, so the launcher must not restart it). The Studio bridge is
+progress floor, so the launcher must not restart it). The Studio bridge is
 launched too and only stalled: the launcher never restarts a stable bridge.
 
 Checked from the recorded session, over the whole run:

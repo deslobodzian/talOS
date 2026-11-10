@@ -700,9 +700,10 @@ int HardwareNode::Run(int duration_s) {
     Tick(now_us);
 
     // The per-source counters four times a second, which is enough for a
-    // viewer. Heartbeat and dispatch count every 10 ms, as the reporter thread
-    // does for event-loop nodes: the launcher's stall check samples them, and
-    // a sample up to 250 ms old plus a short pause would read as a stall.
+    // viewer. Heartbeat and dispatch count every 10 ms, from this loop, as an
+    // event-loop node's loop thread stores its own dispatch count: the
+    // launcher's stall check samples it, and a sample up to 250 ms old plus a
+    // short pause would read as a stall.
     const auto steady_now = std::chrono::steady_clock::now();
     if (steady_now >= next_introspection_) {
       PublishIntrospection();

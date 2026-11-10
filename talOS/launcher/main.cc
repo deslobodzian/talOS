@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
                "overrides [robot] max_restarts (default 5, 0 disables)\n"
                "  --restart-window-ms MS rolling restart window (default "
                "60000)\n"
-               "  --heartbeat-periods N  stalled heartbeat/dispatch timeout in "
+               "  --heartbeat-periods N  stall (no progress) timeout in "
                "node "
                "periods (default 10, minimum timeout 500ms)\n"
                "  --heartbeat-startup-grace-ms MS startup grace (default "

@@ -13,6 +13,7 @@
 #include "talOS/events/callback.h"
 #include "talOS/events/context.h"
 #include "talOS/events/delivery.h"
+#include "talOS/events/dispatch_observer.h"
 #include "talOS/events/manifest.h"
 #include "talOS/events/recorder.h"
 #include "talOS/events/time.h"
@@ -136,9 +137,21 @@ class EventLoopBase {
   bool in_dispatch() const { return active_loop_ == this; }
   bool running() const { return running_; }
 
-  // Safe from another thread (the introspection Reporter samples it).
+  // Safe from another thread. The registry row gets it through
+  // set_dispatch_observer instead, from the loop thread.
   std::uint64_t dispatch_count() const {
     return dispatch_index_.load(std::memory_order_relaxed);
+  }
+
+  // Reports the dispatch count to `observer` (null detaches) at every
+  // dispatch, from the loop thread itself. The introspection Reporter passes
+  // one that stores it in the node's registry row, so the launcher's stall
+  // check sees the loop's own progress, whatever the scheduling of the
+  // reporting thread. The observer is first called at the next dispatch. It
+  // must stay valid until it is detached while the loop is not dispatching
+  // (before or after run()).
+  void set_dispatch_observer(DispatchObserver* observer) {
+    dispatch_observer_.store(observer, std::memory_order_release);
   }
 
   // --- registration -------------------------------------------------------
@@ -520,13 +533,18 @@ class EventLoopBase {
   Recorder recorder_{};
 
   Context context_{};
-  // Written only by the loop thread; read by the Reporter thread. A plain
+  // Written only by the loop thread; any thread may read it. A plain
   // load/store pair, not fetch_add: one writer needs no locked RMW per event.
   std::atomic<std::uint64_t> dispatch_index_{0};
+  // set_dispatch_observer's; called only from this loop's thread.
+  std::atomic<DispatchObserver*> dispatch_observer_{nullptr};
   std::uint64_t next_dispatch_index() {
     const std::uint64_t next =
         dispatch_index_.load(std::memory_order_relaxed) + 1;
     dispatch_index_.store(next, std::memory_order_relaxed);
+    if (auto* observer = dispatch_observer_.load(std::memory_order_acquire)) {
+      observer->on_dispatch_count(next);
+    }
     return next;
   }
   MonotonicTime start_time_{};

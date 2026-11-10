@@ -337,6 +337,20 @@ marks a truncated, damaged or unreadable log `recorder_failed` and a capped one
 (`<log>.capped`) `log_capped`; a log whose capture stopped at a record
 boundary looks complete there, so only the live row reports it.
 
+A registered node is killed as stalled when its registry row shows no progress
+for its heartbeat timeout. Once running, progress is the row's dispatch count,
+which an event-loop node's loop thread stores at every dispatch (and the
+hardware bridge from its own loop), never the heartbeat: the reporting thread
+that heartbeats runs below every realtime loop, so a host busy with them can
+starve it for longer than the timeout while the loop keeps time. While a node
+constructs it has no loop yet, so its heartbeat (or a first dispatch) counts.
+The kill's stderr line names the signal that stopped: the dispatch count, and
+whether the heartbeat still moved or was unchanged too, or the construction
+heartbeat. The heartbeat still bounds a running node at 5 s
+(`introspect::kLivenessTimeout`): the next registry claim (a restart, or any
+node starting) frees an active row whose heartbeat is that old, so a node whose
+reporting thread is starved for 5 s loses its row, its loop stops storing the
+dispatch count, and it is killed as `heartbeat_missing`.
 `--heartbeat-periods N` defaults to 10 periods, with a minimum timeout of
 500 ms. `--heartbeat-startup-grace-ms MS` defaults to 5000 ms for processes
 that have not registered. Such processes are killed once both that grace and
@@ -492,7 +506,7 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
 | `running` | has not ended |
 | `exit` | exited 0 on its own |
 | `crash` | exited nonzero or by a signal, the session stopping or not, and is none of the rows below |
-| `stalled` | was killed (SIGKILL) because its registry heartbeat or dispatch count stopped |
+| `stalled` | was killed (SIGKILL) because its registry row stopped showing progress: its dispatch count once running, its heartbeat while constructing ([restarts](#restarts)) |
 | `heartbeat_missing` | was killed because no registry row of it was found once the startup grace and its heartbeat timeout had passed |
 | `construction_deadline` | was killed for constructing longer than the deadline |
 | `endpoint_mismatch` | was killed, or its session stopped, for [live endpoints](#live-endpoints) that differ from its probe |

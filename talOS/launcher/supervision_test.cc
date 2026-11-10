@@ -25,6 +25,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <regex>
@@ -1425,7 +1426,56 @@ TEST(Supervision, StuckManifestSyncDelaysNoRestartAndSyncsItLater) {
   ::remove(runs.c_str());
 }
 
-TEST(Supervision, StalledRegistryHeartbeatIsKilledAndRestarted) {
+// Supplies a shell stub's registry row from the fixture, without giving the
+// launcher a writable mapping or requiring a real framework node binary: once
+// the stub has written its pid to `pid_file`, claims a row, hands it to that
+// pid, and then calls `tick` on it every 5 ms, as a running node would.
+std::jthread PublishStubRow(const LauncherOptions& options,
+                            const std::string& pid_file,
+                            std::function<void(introspect::NodeRecord&)> tick) {
+  return std::jthread{[session_id = options.session_id, pid_file,
+                       tick = std::move(tick)](const std::stop_token& stop) {
+    pid_t pid = 0;
+    while (!stop.stop_requested()) {
+      std::ifstream input{pid_file};
+      if (input >> pid) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    if (pid <= 0) return;
+    introspect::NodeRegistration registration{
+        {"alpha", "//example/alpha:node", session_id, 0}};
+    introspect::RegistryMapping mapping;
+    introspect::NodeRecord* stub = nullptr;
+    for (auto& row : mapping.header()->nodes) {
+      if (row.state.load(std::memory_order_acquire) !=
+          static_cast<uint64_t>(introspect::SlotState::ACTIVE)) {
+        continue;
+      }
+      if (row.session_id == session_id &&
+          row.pid == static_cast<uint64_t>(::getpid())) {
+        row.state.store(static_cast<uint64_t>(introspect::SlotState::CLAIMING),
+                        std::memory_order_release);
+        row.pid = static_cast<uint64_t>(pid);
+        row.pid_start = 0;  // The stub's start is unknown: compare its pid.
+        row.heartbeat_monotonic_ns.store(introspect::monotonic_now_ns());
+        row.dispatch_count.store(1);
+        row.state.store(static_cast<uint64_t>(introspect::SlotState::ACTIVE),
+                        std::memory_order_release);
+        stub = &row;
+        break;
+      }
+    }
+    while (!stop.stop_requested()) {
+      if (stub != nullptr) tick(*stub);
+      std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+  }};
+}
+
+// A loop blocked inside the node while its reporting thread still heartbeats:
+// the dispatch count, which only the loop moves, stops, and the launcher kills
+// the run as stalled and restarts it.
+TEST(Supervision, StalledLoopIsKilledAndRestartedThoughItsHeartbeatMoves) {
   auto options = BaseOptions("stalled_out", "max_restarts = 1\n");
   options.heartbeat_startup_grace_ms = 0;
   options.duration_s = 3;
@@ -1441,41 +1491,10 @@ TEST(Supervision, StalledRegistryHeartbeatIsKilledAndRestarted) {
                            pid_file + "\nexec sleep 10\n"));
   options.binary_overrides["//example/beta:node"] =
       WriteStub("stalled_beta", "exit 0\n");
-  // Supply the stub's registry row from the fixture, without giving the
-  // launcher a writable mapping or requiring a real framework node binary.
-  std::jthread publisher{[&](const std::stop_token& stop) {
-    pid_t pid = 0;
-    while (!stop.stop_requested()) {
-      std::ifstream input{pid_file};
-      if (input >> pid) break;
-      std::this_thread::sleep_for(std::chrono::milliseconds{5});
-    }
-    if (pid <= 0) return;
-    introspect::NodeRegistration registration{
-        {"alpha", "//example/alpha:node", options.session_id, 0}};
-    introspect::RegistryMapping mapping;
-    for (auto& row : mapping.header()->nodes) {
-      if (row.state.load(std::memory_order_acquire) !=
-          static_cast<uint64_t>(introspect::SlotState::ACTIVE)) {
-        continue;
-      }
-      if (row.session_id == options.session_id &&
-          row.pid == static_cast<uint64_t>(::getpid())) {
-        row.state.store(static_cast<uint64_t>(introspect::SlotState::CLAIMING),
-                        std::memory_order_release);
-        row.pid = static_cast<uint64_t>(pid);
-        row.pid_start = 0;  // The stub's start is unknown: compare its pid.
+  auto publisher =
+      PublishStubRow(options, pid_file, [](introspect::NodeRecord& row) {
         row.heartbeat_monotonic_ns.store(introspect::monotonic_now_ns());
-        row.dispatch_count.store(1);
-        row.state.store(static_cast<uint64_t>(introspect::SlotState::ACTIVE),
-                        std::memory_order_release);
-        break;
-      }
-    }
-    while (!stop.stop_requested()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds{5});
-    }
-  }};
+      });
   EXPECT_EQ(RunSession(options), 0);
   publisher.request_stop();
   publisher.join();
@@ -1493,6 +1512,40 @@ TEST(Supervision, StalledRegistryHeartbeatIsKilledAndRestarted) {
       << history[0];
   EXPECT_NE(history[1].find("\"reason\": \"exit\""), std::string::npos)
       << history[1];
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(pid_file.c_str());
+  ::remove(runs.c_str());
+}
+
+// The converse: a loop that keeps dispatching while its reporting thread is
+// starved (below every realtime loop on a loaded host) and stops
+// heartbeating. Its progress is the loop's own, so it is not killed.
+TEST(Supervision, DispatchingLoopIsNotKilledWhenItsHeartbeatStops) {
+  auto options = BaseOptions("starved_out", "max_restarts = 1\n");
+  options.heartbeat_startup_grace_ms = 0;
+  options.duration_s = 2;
+  const auto pid_file = TempPath("starved_pid");
+  const auto runs = TempPath("starved_runs");
+  ::remove(pid_file.c_str());
+  ::remove(runs.c_str());
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "starved_alpha",
+      RecordLogArgThen(runs, "echo $$ > " + pid_file + "\nexec sleep 10\n"));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("starved_beta", "exit 0\n");
+  auto publisher =
+      PublishStubRow(options, pid_file, [](introspect::NodeRecord& row) {
+        row.dispatch_count.fetch_add(1, std::memory_order_relaxed);
+      });
+  RunSession(options);  // Ended by its duration, which stops alpha.
+  publisher.request_stop();
+  publisher.join();
+  EXPECT_EQ(ReadLines(runs).size(), 1u);
+  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto history = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(history.size(), 1u) << manifest;
+  EXPECT_EQ(history[0].find("\"reason\": \"stalled\""), std::string::npos)
+      << history[0];
   std::filesystem::remove_all(options.output_dir);
   ::remove(pid_file.c_str());
   ::remove(runs.c_str());

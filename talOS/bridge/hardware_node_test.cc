@@ -139,19 +139,22 @@ uint64_t NodeConfigId(const talos::config::RobotConfig& cfg) {
   return ConfigurationId(hw);
 }
 
-// The launcher kills a node whose heartbeat or dispatch count stops for its
-// stall timeout (500 ms for the bridge). Run() must refresh them far more often
-// than its 250 ms counter publish, or a 300 ms pause on top of an old sample
-// reads as a stall.
-TEST(HardwareNodeTest, RunKeepsRegistryHeartbeatCurrent) {
+// The launcher kills a running node whose dispatch count stops for its stall
+// timeout (500 ms for the bridge). Run() must store it far more often than
+// its 250 ms counter publish (RefreshLiveness), or a 300 ms pause on top of an
+// old sample reads as a stall. With no gateway the count still moves:
+// /hw/status is published every kStatusPeriodUs (20 ms).
+TEST(HardwareNodeTest, RunKeepsRegistryProgressCurrent) {
   auto cfg = talos::config::ParseRobotConfigString(kTestToml);
   Link link;
   ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
   HardwareNode& node = link.node.value();
   std::thread runner([&node] { node.Run(1); });
   std::optional<introspect::RegistryReader> reader;
-  std::int64_t worst_age_ns = 0;
-  int samples = 0;
+  std::optional<std::uint64_t> last_dispatch;
+  auto last_change = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::duration worst_gap{};
+  int changes = 0;
   const auto end = std::chrono::steady_clock::now() + std::chrono::seconds{1};
   while (std::chrono::steady_clock::now() < end) {
     if (!reader) reader = introspect::RegistryReader::open();
@@ -159,21 +162,28 @@ TEST(HardwareNodeTest, RunKeepsRegistryHeartbeatCurrent) {
       for (const auto& row : reader->nodes()) {
         if (row.name != kNodeName ||
             row.pid != static_cast<std::uint64_t>(getpid()) ||
-            row.heartbeat_monotonic_ns == 0)
+            row.dispatch_count == 0)
           continue;
-        worst_age_ns = std::max(worst_age_ns, introspect::monotonic_now_ns() -
-                                                  row.heartbeat_monotonic_ns);
-        ++samples;
+        const auto now = std::chrono::steady_clock::now();
+        if (last_dispatch && row.dispatch_count != *last_dispatch) {
+          worst_gap = std::max(worst_gap, now - last_change);
+          ++changes;
+        }
+        if (!last_dispatch || row.dispatch_count != *last_dispatch) {
+          last_dispatch = row.dispatch_count;
+          last_change = now;
+        }
       }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
   runner.join();
-  ASSERT_GT(samples, 100);
+  ASSERT_GT(changes, 10);
   // The launcher kills the bridge once its progress is 500 ms old, and the
-  // soak stops it for 300 ms, so a refresh must land within 200 ms; 150 ms
-  // still fails the old 250 ms cadence without failing on a slow CI tick.
-  EXPECT_LT(worst_age_ns, 150'000'000);
+  // soak stops it for 300 ms, so the count must move within 200 ms; 150 ms
+  // still fails the 250 ms full-sample cadence without failing on a slow CI
+  // tick.
+  EXPECT_LT(worst_gap, std::chrono::milliseconds{150});
 }
 
 TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {

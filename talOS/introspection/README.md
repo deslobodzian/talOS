@@ -169,11 +169,16 @@ before storing `running_`, synchronizing the reporter's load. The reporter
 publishes endpoints and clears the constructing flag only when the manifest
 and counters exist. The launcher bounds construction from process spawn;
 see [launcher supervision](../launcher/README.md#restarts).
-The reporter samples full source counters, selections and event log state
-every 250 ms and heartbeat/dispatch progress every 10 ms. Full counters can lag
-the progress pair until the next full sample.
-Short sleeps also let a node which exits leave the viewer promptly; a final
-full sample preserves its last counters.
+The reporter samples the heartbeat, source counters, selections and event log
+state every 250 ms. The dispatch count is not the reporter's: `start` attaches
+an `event::DispatchObserver` to the loop, and the loop thread stores the count
+in the row at every dispatch, outside the sample sequence. It is the launcher's
+evidence of progress ([supervision](../launcher/README.md#restarts)), and the
+reporting thread runs below every realtime loop, so a loaded host can starve it
+for longer than the stall timeout while the loop keeps time. Source counters
+can lag the dispatch count until the next full sample.
+Short sleeps let a node which exits leave the viewer promptly; a final full
+sample preserves its last counters.
 
 It must be constructed after the loop so that reverse destruction order joins
 the thread before the counters it samples are destroyed. `talos::Run`
@@ -211,7 +216,8 @@ than displacing a live one.
 `HardwareNode::BuildIntrospectionManifest` supplies the hardware bridge's
 manifest explicitly and its run loop refreshes the registry.
 
-Refreshes are bracketed by a sample sequence. Readers retry inconsistent
+Refreshes are bracketed by a sample sequence (an event-loop node's dispatch
+count, stored by its loop thread, is not). Readers retry inconsistent
 copies a bounded number of times rather than waiting for a stalled writer;
 these snapshots are observational, not control inputs.
 

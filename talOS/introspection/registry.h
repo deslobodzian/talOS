@@ -34,7 +34,10 @@
  * on, so a writer that dies mid-sample cannot wedge a viewer. The residual
  * staleness is bounded by one refresh period, which no consumer branches on:
  * liveness reads the heartbeat alone against a 5 s timeout, and health
- * aggregates cumulative gauges.
+ * aggregates cumulative gauges. An event-loop node's dispatch count is the
+ * exception: its loop thread stores it at every dispatch, outside the sample,
+ * because the launcher's stall check reads it as the loop's own progress
+ * and must not depend on when the reporting thread gets scheduled.
  */
 
 #include <fcntl.h>
@@ -228,14 +231,20 @@ struct alignas(64) NodeRecord {
   std::atomic<std::uint32_t> source_count;
   std::atomic<std::uint32_t> flags;
 
+  // The node's progress, which the launcher's stall check reads. An
+  // event-loop node's loop thread stores it at every dispatch
+  // (event::EventLoopBase::set_dispatch_observer), outside the sample
+  // sequence; a node with its own loop (the hardware bridge) stores it in its
+  // samples.
   std::atomic<std::uint64_t> dispatch_count;
 
   // How many sources the node registered, which exceeds source_count when it
   // registered more than this segment can hold.
   std::atomic<std::uint32_t> declared_source_count;
 
-  // Seqlock for one refresh: the writer brackets the heartbeat, dispatch,
-  // per-source counter and selection stores with begin_sample/end_sample (odd
+  // Seqlock for one refresh: the writer brackets the heartbeat, (for a node
+  // without an event loop) dispatch, per-source counter and selection stores
+  // with begin_sample/end_sample (odd
   // while a sample is landing, even when the slot is stable), and the reader
   // retries a copy taken across a change. This reuses the word `reserved`
   // held, so it moved no field; see kRegistryVersion for why that reuse is
@@ -769,7 +778,8 @@ class NodeRegistration {
   // per-source counter stores so a reader sees the whole sample or retries:
   // begin_sample, the stores, then end_sample. Adjacent samples must not
   // overlap; the reporting thread is the only writer, so plain bracketing is
-  // enough, with no RAII and no nesting.
+  // enough, with no RAII and no nesting. An event-loop node's loop thread
+  // stores the dispatch count itself, unbracketed (NodeRecord).
   void begin_sample() {
     if (!owns_slot()) return;
     record_->sample_seq.fetch_add(1, std::memory_order_relaxed);
@@ -788,6 +798,9 @@ class NodeRegistration {
                                           std::memory_order_relaxed);
   }
 
+  // Also called from an event loop's thread at every dispatch (the
+  // Reporter's DispatchObserver): one relaxed store, guarded like every
+  // other write against a slot that is no longer this registration's.
   void set_dispatch_count(std::uint64_t count) {
     if (!owns_slot()) return;
     record_->dispatch_count.store(count, std::memory_order_relaxed);

@@ -741,51 +741,64 @@ TEST_F(Registry, SourcesBeyondCapacityAreCountedButNotStored) {
   EXPECT_EQ(nodes.front().declared_source_count, manifest.size());
 }
 
-TEST_F(Registry, ReporterProgressCadenceLeavesRoomForSubTimeoutPause) {
-  RegistryMapping mapping{path_};
-  Children children;
-  const pid_t pid = ::fork();
-  ASSERT_GE(pid, 0);
-  if (pid == 0) {
-    event::RealtimeEventLoop<> loop;
-    struct Handler {
-      void OnTick(const event::Context&) {}
-    } handler;
-    auto timer =
-        event::make_timer<&Handler::OnTick>(loop, "progress", &handler);
-    Reporter reporter{{.name = "paused", .registry_path = path_}};
-    reporter.start(loop);
-    timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
-    loop.run_for(5s);
-    ::_exit(0);
-  }
-  children.add(pid);
+// The launcher's stall check reads the row's dispatch count as the loop's
+// progress. The loop thread stores it at every dispatch, so a reporting thread
+// that cannot run -- starved below the realtime loops of a loaded host; here
+// blocked in a selection callback mid-sample -- leaves it current. Before, the
+// reporting thread copied it every 10 ms, and a starved one froze the row of
+// a loop that kept time until the launcher killed the node as stalled.
+TEST_F(Registry, LoopStoresItsProgressWhileTheReporterIsBlocked) {
+  event::RealtimeEventLoop<> loop;
+  struct Handler {
+    std::function<void()> on_tick;
+    void OnTick(const event::Context&) { on_tick(); }
+  } handler;
+  auto timer = event::make_timer<&Handler::OnTick>(loop, "progress", &handler);
+  std::atomic<bool> hold{true};
+  std::atomic<bool> held{false};
+  Reporter reporter{{.name = "starved",
+                     .selections = {{.sources = {"teleop"},
+                                     .selected =
+                                         [&] {
+                                           held = true;
+                                           while (hold) {
+                                             std::this_thread::sleep_for(1ms);
+                                           }
+                                           return 0;
+                                         }}},
+                     .registry_path = path_}};
+  reporter.start(loop);
   RegistryReader reader{path_};
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
-  std::vector<NodeSnapshot> nodes;
-  do {
-    nodes = reader.nodes();
-    if (!nodes.empty() && nodes.front().dispatch_count > 0) break;
-    std::this_thread::sleep_for(1ms);
-  } while (std::chrono::steady_clock::now() < deadline);
-  ASSERT_EQ(nodes.size(), 1u);
-  ASSERT_GT(nodes.front().dispatch_count, 0u);
-  // Stop near the end of the old 250 ms full-sample interval, whose retained
-  // sample would already be 200 ms old: a short pause then crossed the
-  // launcher's 500 ms floor before SIGCONT could be sent. Progress is now
-  // refreshed every 10 ms, so the frozen heartbeat is recent at the stop.
-  std::this_thread::sleep_for(200ms);
-  ASSERT_EQ(::kill(pid, SIGSTOP), 0);
-  int status = 0;
-  ASSERT_EQ(Children::Wait(pid, &status, WUNTRACED), pid);
-  ASSERT_TRUE(WIFSTOPPED(status));
-  const auto stopped_ns = monotonic_now_ns();
-  nodes = reader.nodes();
-  ASSERT_EQ(nodes.size(), 1u);
-  const auto age_at_stop = std::chrono::nanoseconds{
-      stopped_ns - nodes.front().heartbeat_monotonic_ns};
-  EXPECT_LT(age_at_stop, 100ms);
-  ASSERT_EQ(::kill(pid, SIGCONT), 0);
+  const auto row = [&] {
+    const auto nodes = reader.nodes();
+    return nodes.size() == 1 ? nodes.front().dispatch_count : 0;
+  };
+  std::optional<std::uint64_t> at_hold;
+  int ticks_held = 0;
+  std::uint64_t after = 0;
+  std::uint64_t loop_count = 0;
+  handler.on_tick = [&] {
+    if (!held) return;
+    if (!at_hold) {
+      at_hold = row();
+      return;
+    }
+    // 100 ticks of 2 ms: longer than a 300 ms pause plus the old cadence
+    // needed to reach the launcher's 500 ms floor, at a fraction of the cost.
+    if (++ticks_held < 100) return;
+    after = row();
+    loop_count = loop.dispatch_count();
+    hold = false;
+    loop.exit();
+  };
+  timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
+  loop.run_for(5s);  // Bound only; exits once the reporter has been held.
+  hold = false;
+
+  ASSERT_TRUE(held) << reporter.error();
+  ASSERT_TRUE(at_hold) << "the loop never ticked with the reporter held";
+  EXPECT_GE(after, *at_hold + 100);
+  EXPECT_EQ(after, loop_count);
 }
 
 TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {

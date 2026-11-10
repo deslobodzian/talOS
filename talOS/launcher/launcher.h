@@ -3351,6 +3351,10 @@ class Launcher {
     bool heartbeat_killed{false};
     std::chrono::nanoseconds heartbeat_timeout{std::chrono::milliseconds{500}};
     std::chrono::steady_clock::time_point started_at{};
+    // When the run last made progress (its row's dispatch count moved, or,
+    // while it constructs, its heartbeat), and when its heartbeat last moved,
+    // which a stall report names.
+    std::chrono::steady_clock::time_point progress_changed_at{};
     std::chrono::steady_clock::time_point heartbeat_changed_at{};
     int64_t last_heartbeat{0};
     uint64_t last_dispatch{0};
@@ -3431,6 +3435,29 @@ class Launcher {
     std::cout << "[launcher] " << spec->name << " finished ("
               << ExitReason(status) << ")\n";
     return clean ? 0 : (WIFEXITED(status) ? WEXITSTATUS(status) : 1);
+  }
+
+  // Which signal of a found row stopped moving, for the stall kill's line:
+  // the heartbeat of a constructing run, or the dispatch count of a running
+  // one, with whether its reporting thread's heartbeat still moved or was
+  // unchanged too.
+  static std::string StallReport(const NodeLaunch& launch, bool constructing,
+                                 std::chrono::steady_clock::time_point now) {
+    const auto ms = [now](std::chrono::steady_clock::time_point since) {
+      return std::to_string(
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - since)
+              .count());
+    };
+    if (constructing) {
+      return " stalled: construction heartbeat unchanged for " +
+             ms(launch.heartbeat_changed_at) + " ms";
+    }
+    return " stalled: dispatch count unchanged for " +
+           ms(launch.progress_changed_at) + " ms (heartbeat " +
+           (now - launch.heartbeat_changed_at < launch.heartbeat_timeout
+                ? "still moving)"
+                : "unchanged too, for " + ms(launch.heartbeat_changed_at) +
+                      " ms)");
   }
 
   static void InstallSignals() {
@@ -3583,6 +3610,7 @@ class Launcher {
     proc.BeginRun(pid);
     launch.kill_reason = {};
     launch.started_at = std::chrono::steady_clock::now();
+    launch.progress_changed_at = launch.started_at;
     launch.heartbeat_changed_at = launch.started_at;
     launch.last_heartbeat = 0;
     launch.last_dispatch = 0;
@@ -3725,6 +3753,7 @@ class Launcher {
     const auto started = std::chrono::steady_clock::now();
     for (auto& launch : launches) {
       launch.started_at = started;
+      launch.progress_changed_at = started;
       launch.heartbeat_changed_at = started;
     }
     ServiceNotifier notifier;
@@ -3817,12 +3846,20 @@ class Launcher {
               live = std::move(published);
               constructing = (flags & introspect::kFlagConstructing) != 0;
               recording = flags;
-              if (beat != launch.last_heartbeat &&
-                  (constructing || dispatch != launch.last_dispatch)) {
+              // Progress is the loop's dispatch count, which an event-loop
+              // node's loop thread stores itself (introspect::Reporter), so a
+              // starved reporting thread cannot make a running loop look
+              // stalled. Its heartbeat, which that thread writes, counts only
+              // while it constructs and has no loop yet.
+              const bool beat_moved = beat != launch.last_heartbeat;
+              const bool dispatch_moved = dispatch != launch.last_dispatch;
+              if (beat_moved) {
                 launch.heartbeat_changed_at = now;
                 launch.last_heartbeat = beat;
-                launch.last_dispatch = dispatch;
               }
+              if (dispatch_moved) launch.last_dispatch = dispatch;
+              if (dispatch_moved || (constructing && beat_moved))
+                launch.progress_changed_at = now;
               break;
             }
           }
@@ -3842,12 +3879,12 @@ class Launcher {
               now - launch.started_at >= options_.construction_timeout;
           if (construction_expired ||
               (grace_over &&
-               now - launch.heartbeat_changed_at >= launch.heartbeat_timeout)) {
+               now - launch.progress_changed_at >= launch.heartbeat_timeout)) {
             std::cerr << "[launcher] " << proc.name
                       << (construction_expired
                               ? " construction deadline exceeded"
-                          : found ? " heartbeat/dispatch stalled"
-                                  : " heartbeat missing")
+                          : !found ? " heartbeat missing"
+                                   : StallReport(launch, constructing, now))
                       << "; killing pid " << proc.pid << "\n";
             SignalProcessGroup(proc.pid, SIGKILL);
             launch.heartbeat_killed = true;
