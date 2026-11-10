@@ -157,6 +157,8 @@ inline std::vector<uint8_t> SerializeConfig(const Config& c) {
     w.Int(m.soft_limits ? 1 : 0, 1);
     w.Real(m.reverse_limit_rot);
     w.Real(m.forward_limit_rot);
+    w.Int(static_cast<uint8_t>(m.forward_limit_switch), 1);
+    w.Int(static_cast<uint8_t>(m.reverse_limit_switch), 1);
     w.Real(m.max_velocity_rps);
     w.Real(m.cruise_velocity_rps);
     w.Real(m.acceleration_rps2);
@@ -259,6 +261,13 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
     m.soft_limits = (r.Int(1) == 1);
     m.reverse_limit_rot = r.Real();
     m.forward_limit_rot = r.Real();
+    const auto forward_switch = r.Int(1);
+    const auto reverse_switch = r.Int(1);
+    if (forward_switch > static_cast<uint8_t>(LimitSwitch::kDisabled) ||
+        reverse_switch > static_cast<uint8_t>(LimitSwitch::kDisabled))
+      return false;
+    m.forward_limit_switch = static_cast<LimitSwitch>(forward_switch);
+    m.reverse_limit_switch = static_cast<LimitSwitch>(reverse_switch);
     m.max_velocity_rps = r.Real();
     m.cruise_velocity_rps = r.Real();
     m.acceleration_rps2 = r.Real();
@@ -431,13 +440,13 @@ inline ConfigChunkHeader DecodeConfigChunkHeader(const uint8_t* in) {
 // also carry a two-byte length; the remaining sizes mirror SerializeConfig.
 inline constexpr std::size_t kMaxConfigTextBytes = 2 + 63;
 inline constexpr std::size_t kMaxSerializedConfigSize =
-    17 + 7 * 2 + kMaxMotors * (275 + 2 * kMaxConfigTextBytes) +
+    17 + 7 * 2 + kMaxMotors * (277 + 2 * kMaxConfigTextBytes) +
     kMaxSensors * (16 + 2 * kMaxConfigTextBytes) +
     (kMaxDigitalInputs + kMaxDigitalOutputs + kMaxAnalogInputs +
      kMaxPwmOutputs) *
         (6 + kMaxConfigTextBytes) +
     kMaxEncoders * (27 + kMaxConfigTextBytes);
-static_assert(kMaxSerializedConfigSize == 10051,
+static_assert(kMaxSerializedConfigSize == 10083,
               "Serialized config maximum changed; update docs/DATA_FLOW.md");
 inline constexpr std::size_t kMaxConfigChunkData =
     protocol::kMaxPayloadSize - sizeof(ConfigChunkHeader);

@@ -21,10 +21,10 @@ while a configure is still pending (every boot restore) is dropped without an
 ACK; the bridge pushes again after its 50 ms retry gate. The manifest holds
 logical device IDs, names, CAN
 addresses and bus names, inversion, encoder offsets, current/voltage limits,
-gearing, three gain slots, soft limits, and Motion Magic cruise velocity,
-acceleration, and jerk. Changed configurations require disabled operation.
-Identical pushes may succeed while enabled without device traffic, but not
-while faulted or while configuration/restoration is pending.
+gearing, three gain slots, soft limits, TalonFX limit switches, and Motion
+Magic cruise velocity, acceleration, and jerk. Changed configurations require
+disabled operation. Identical pushes may succeed while enabled without device
+traffic, but not while faulted or while configuration/restoration is pending.
 
 The RoboRIO atomically and durably (synced file, rename, synced directory)
 saves acknowledged configuration bytes with a CRC32 to
@@ -84,6 +84,23 @@ the same subsystem on the same CAN bus; self-follow and follower chains are
 rejected. Followers use the master's output rather than their own demand,
 and neutralize when the master is neutral or loses valid feedback.
 Both simulation backends support same-direction and opposed followers.
+
+`forward_limit_switch` and `reverse_limit_switch` set the switches wired to
+the TalonFX's own forward and reverse limit inputs: `"NormallyOpen"` (the
+default, and Phoenix's), `"NormallyClosed"` or `"Disabled"`. The TalonFX
+itself holds output toward an asserted switch neutral, in every control mode
+and whatever its position frame, so it guards travel that no software zero or
+soft limit can (a reset at height moves both). An absent key keeps Phoenix's
+default, so a motor with nothing on its limit pins is unchanged, and one that
+already has a switch there already obeys it. A normally closed setting with
+no switch wired reads asserted and stops that direction. Only the motor's own
+pins are supported (no remote CANcoder or CANdi source, no position autoset).
+Both settings are in the configuration fingerprint and wire format. The State
+has no switch field a node can read; an asserted switch shows only as the
+ForwardHardLimit/ReverseHardLimit bit of the motor's Phoenix fault bitfield.
+`sim::PhysicsSimBackend` holds forward or reverse output neutral while a test
+presses a switch (`SetForwardLimitPressed`/`SetReverseLimitPressed`); the ideal
+`SimBackend` and `sim_gateway` have no way to press one.
 
 Each `[subsystems.<sub>.motors.<motor>.slot0]` (also `slot1`, `slot2`) accepts
 `gravity_type = "ElevatorStatic"` (default; alias `"Elevator"`) or

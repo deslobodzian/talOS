@@ -92,7 +92,7 @@ has no reflected radio channels; only the bench motor state adds these scalars.
 
 ## UDP frame and payload sizes
 
-One datagram contains exactly one protocol frame, version **5**.
+One datagram contains exactly one protocol frame, version **6**.
 The explicit little-endian header is **40 B**: magic u64 (8),
 version/header_size/type/flags u16 (8 total),
 sequence u64 (8), monotonic_time_us u64 (8), payload_size u32 (4), reserved u32
@@ -147,10 +147,10 @@ and its subsystem files. Current device counts are **10 motors, 5 sensors,
   **741 B** frame, **731 B** payload headroom.
 - Command: `38 + 10×20` = **238 B** payload, **278 B** frame,
   **1194 B** payload headroom.
-- Serialized Config: **3231 B**; `ceil(3231 / 1408)` = **3 chunks**.
-  Chunk data lengths **1408, 1408, 415 B**, payload lengths **1432, 1432,
-  439 B**, datagram lengths **1472, 1472, 479 B**. One push is **3423 B**
-  of talOS frames (`3231 + 3×24 + 3×40`), excluding UDP/IP headers.
+- Serialized Config: **3251 B**; `ceil(3251 / 1408)` = **3 chunks**.
+  Chunk data lengths **1408, 1408, 435 B**, payload lengths **1432, 1432,
+  459 B**, datagram lengths **1472, 1472, 499 B**. One push is **3443 B**
+  of talOS frames (`3251 + 3×24 + 3×40`), excluding UDP/IP headers.
 - State at 200 Hz: **148200 B/s** in talOS frames (`741×200`), or
   **1.1856 Mbit/s**, on the wired internal link, not the robot radio.
 
@@ -184,9 +184,9 @@ checks CRC32, deserializes and validates caps, then reconfigures. A new config I
 replaces the assembly; inconsistent metadata or invalid assembled data is
 rejected. Completion/backend failure or malformed data produces the 73-byte ACK
 with status/reason (`config_wire.h`, `endpoint.h`).
-Hardware configuration assembly rejects serialized totals above **10,051 B**
+Hardware configuration assembly rejects serialized totals above **10,083 B**
 (`kMaxSerializedConfigSize`) before allocation. Chunk data is limited to
-**1,408 B**; chunk counts cannot exceed 10,051 or the serialized byte count.
+**1,408 B**; chunk counts cannot exceed 10,083 or the serialized byte count.
 Transfer metadata and chunk geometry must remain consistent, and assembler
 exceptions reject the transfer without escaping the gateway safety loop.
 

@@ -44,11 +44,11 @@ TEST(FrameTest, HeaderIsLittleEndianOnTheWire) {
   ASSERT_EQ(size, kFrameHeaderSize);
   const std::array<uint8_t, kFrameHeaderSize> expected{
       'T',  'A',  'L',  'O',  'S',  'R',  'I',  'O',   // magic
-      5,    0,    40,   0,    22,   0,    0x02, 0x01,  // version..flags
+      6,    0,    40,   0,    22,   0,    0x02, 0x01,  // version..flags
       0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,  // sequence
       0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,  // monotonic_time_us
       0,    0,    0,    0,    0,    0,    0,    0};    // payload_size, reserved
-  static_assert(kProtocolVersion == 5 && kFrameHeaderSize == 40);
+  static_assert(kProtocolVersion == 6 && kFrameHeaderSize == 40);
   EXPECT_EQ(std::memcmp(frame.data(), expected.data(), expected.size()), 0);
 
   frame[32] = 0x02;  // payload_size 0x0102 = 258, decoded little-endian

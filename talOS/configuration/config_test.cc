@@ -64,6 +64,23 @@ TEST(ConfigTest, RejectsInvalidFollowerAndGravityDeclarations) {
       "follow = \"other\"\n[subsystems.other.motors.other]\ncan_id = 2\n");
 }
 
+// An absent key keeps Phoenix's default (an enabled normally open switch), so
+// a robot that never names its limit inputs behaves as before the keys existed.
+TEST(ConfigTest, MotorLimitSwitchesDefaultToPhoenixAndRejectUnknownTypes) {
+  using hardware::LimitSwitch;
+  const auto defaults = Parse("").hardware.motors.at(0);
+  EXPECT_EQ(defaults.forward_limit_switch, LimitSwitch::kNormallyOpen);
+  EXPECT_EQ(defaults.reverse_limit_switch, LimitSwitch::kNormallyOpen);
+  const auto set = Parse(
+                       "forward_limit_switch = \"NormallyClosed\"\n"
+                       "reverse_limit_switch = \"Disabled\"\n")
+                       .hardware.motors.at(0);
+  EXPECT_EQ(set.forward_limit_switch, LimitSwitch::kNormallyClosed);
+  EXPECT_EQ(set.reverse_limit_switch, LimitSwitch::kDisabled);
+  ExpectRejected("forward_limit_switch = \"normally_open\"\n");
+  ExpectRejected("reverse_limit_switch = false\n");
+}
+
 TEST(ConfigTest, DeterministicOrderingIndependentOfTomlTableOrder) {
   const auto config = ParseRobotConfigString(R"(
 [subsystems.sub_z.motors.z_motor]

@@ -370,6 +370,38 @@ TEST(SimBelievability, GearingDirectionAndLimits) {
   }
 }
 
+// A pressed switch on the TalonFX's forward input holds forward output
+// neutral in every mode (here duty cycle, which soft limits in the gateway do
+// not check) while reverse output still drives off it; a disabled input does
+// nothing. Forward is the configured positive direction, inverted or not.
+TEST(SimLimitSwitches, PressedForwardSwitchStopsOnlyForwardOutput) {
+  for (const bool disabled : {false, true}) {
+    Config c = SingleMotorConfig();
+    c.motors[0].inverted = true;
+    if (disabled) c.motors[0].forward_limit_switch = LimitSwitch::kDisabled;
+    PhysicsSimBackend backend;
+    ASSERT_TRUE(backend.Configure(c));
+    backend.SetForwardLimitPressed(1, true);
+    std::array<MotorRequest, 1> cmd{Duty(1, 0.5)};
+    ASSERT_TRUE(backend.Apply(cmd));
+    State s{};
+    uint64_t now_us = 0;
+    StepBackend(backend, s, now_us, 5000, 100);
+    if (disabled) {
+      EXPECT_GT(backend.applied_voltage(0), 5.0);
+      EXPECT_GT(std::abs(s.motors[0].velocity_rps), 10.0);
+      continue;
+    }
+    EXPECT_DOUBLE_EQ(backend.applied_voltage(0), 0.0);
+    EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 0.0);
+    cmd[0] = Duty(1, -0.5);
+    ASSERT_TRUE(backend.Apply(cmd));
+    StepBackend(backend, s, now_us, 5000, 100);
+    EXPECT_LT(backend.applied_voltage(0), -5.0);
+    EXPECT_GT(std::abs(s.motors[0].velocity_rps), 10.0);
+  }
+}
+
 TEST(SimBelievability, PigeonMountOffsetPrecedesInversion) {
   for (const bool inverted : {false, true}) {
     Config config = SingleMotorConfig();

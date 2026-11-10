@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -287,6 +288,37 @@ TEST(Config, ValidatesFollowersAndFingerprintsTheirSettings) {
   // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
   c.motors[0].slots[0].gravity_type = static_cast<GravityType>(2);
   EXPECT_THROW(Validate(c), std::invalid_argument);
+}
+
+// The TalonFX applies limit-switch settings itself, so both endpoints must
+// agree on them: they travel on the config wire and change the config id.
+TEST(Config, LimitSwitchesTravelOnTheWireAndFingerprint) {
+  auto c = SwerveConfig(true);
+  const auto default_id = ConfigurationId(c);
+  c.motors[0].forward_limit_switch = LimitSwitch::kNormallyClosed;
+  const auto forward_id = ConfigurationId(c);
+  EXPECT_NE(forward_id, default_id);
+  c.motors[0].reverse_limit_switch = LimitSwitch::kDisabled;
+  EXPECT_NE(ConfigurationId(c), forward_id);
+  Config decoded;
+  ASSERT_TRUE(DeserializeConfig(SerializeConfig(c), decoded));
+  EXPECT_EQ(decoded, c);
+
+  // Out-of-range types are rejected by Validate and by the decoder.
+  auto bad = c;
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  bad.motors[0].reverse_limit_switch = static_cast<LimitSwitch>(3);
+  EXPECT_THROW(Validate(bad), std::invalid_argument);
+  // The one byte that differs from a normally open reverse switch is its type.
+  auto bytes = SerializeConfig(c);
+  auto open = c;
+  open.motors[0].reverse_limit_switch = LimitSwitch::kNormallyOpen;
+  const auto open_bytes = SerializeConfig(open);
+  ASSERT_EQ(bytes.size(), open_bytes.size());
+  const auto at = std::mismatch(bytes.begin(), bytes.end(), open_bytes.begin());
+  ASSERT_NE(at.first, bytes.end());
+  *at.first = 3;
+  EXPECT_FALSE(DeserializeConfig(bytes, decoded));
 }
 
 TEST(SimBackend, PigeonMountCalibrationReachesIdealBackend) {

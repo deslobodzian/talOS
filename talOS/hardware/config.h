@@ -17,6 +17,16 @@ inline constexpr std::size_t kMaxPwmOutputs = 4;
 enum class SensorKind : uint8_t { kCANcoder = 1, kPigeon2 = 2 };
 enum class Feedback : uint8_t { kRotor = 0, kRemoteCANcoder = 1 };
 enum class GravityType : uint8_t { kElevatorStatic = 0, kArmCosine = 1 };
+// A switch wired to the TalonFX's own forward or reverse limit input. While it
+// is asserted (a normally open switch closed, a normally closed one open) the
+// TalonFX itself holds output toward that direction neutral, in every control
+// mode and whatever the position frame; output away from it still drives.
+// kNormallyOpen, enabled, is Phoenix's default for both inputs.
+enum class LimitSwitch : uint8_t {
+  kNormallyOpen = 0,
+  kNormallyClosed = 1,
+  kDisabled = 2
+};
 
 struct Gains {
   double p{}, i{}, d{}, s{}, v{}, a{}, g{};
@@ -49,6 +59,8 @@ struct MotorConfig {
   bool continuous_wrap{false};
   bool soft_limits{false};
   double reverse_limit_rot{-1}, forward_limit_rot{1};
+  LimitSwitch forward_limit_switch{LimitSwitch::kNormallyOpen};
+  LimitSwitch reverse_limit_switch{LimitSwitch::kNormallyOpen};
   double max_velocity_rps{100};
   double cruise_velocity_rps{20}, acceleration_rps2{40}, jerk_rps3{0};
   std::array<Gains, 3> slots{};

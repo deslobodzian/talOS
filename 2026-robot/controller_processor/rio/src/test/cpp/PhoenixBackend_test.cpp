@@ -720,6 +720,33 @@ TEST_F(PhoenixBackendRecovery, DiagnosticRatesRespectPhoenixSharedFrames) {
       motor.GetFaultField(false).GetAppliedUpdateFrequency().value(), 50);
 }
 
+// The TalonFX enforces its limit pins itself, so the motor config must reach
+// the device: a normally closed forward switch, a disabled reverse one.
+TEST_F(PhoenixBackendRecovery, AppliesConfiguredHardwareLimitSwitches) {
+  EnsureHal();
+  hw::Config config;
+  auto lift = TestMotor(1, "lift", 1);
+  lift.forward_limit_switch = hw::LimitSwitch::kNormallyClosed;
+  lift.reverse_limit_switch = hw::LimitSwitch::kDisabled;
+  config.motors.push_back(lift);
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+  ctre::phoenix6::configs::TalonFXConfiguration applied;
+  ASSERT_TRUE(AwaitAnswer([&] {
+                return Motor(backend, 0).GetConfigurator().Refresh(applied);
+              }).IsOK());
+  using ctre::phoenix6::signals::ForwardLimitSourceValue;
+  using ctre::phoenix6::signals::ForwardLimitTypeValue;
+  const auto& limits = applied.HardwareLimitSwitch;
+  EXPECT_TRUE(limits.ForwardLimitEnable);
+  EXPECT_EQ(limits.ForwardLimitType.value,
+            ForwardLimitTypeValue::NormallyClosed);
+  EXPECT_EQ(limits.ForwardLimitSource.value,
+            ForwardLimitSourceValue::LimitSwitchPin);
+  EXPECT_FALSE(limits.ReverseLimitEnable);
+}
+
 TEST_F(PhoenixBackendRecovery, StaleHealthDoesNotInvalidateMotionFeedback) {
   EnsureHal();
   EnabledDs ds;

@@ -271,6 +271,21 @@ inline bool IsCANcoder(const RawDevice& d) {
   return s && s->kind == hardware::SensorKind::kCANcoder;
 }
 
+// A switch on the TalonFX's own limit input; absent keeps Phoenix's default,
+// an enabled normally open switch.
+inline hardware::LimitSwitch ReadLimitSwitch(const toml::table& t,
+                                             const char* key,
+                                             const std::string& name) {
+  const auto value = Read<std::string>(t, key, "NormallyOpen");
+  if (value == "NormallyOpen") return hardware::LimitSwitch::kNormallyOpen;
+  if (value == "NormallyClosed") return hardware::LimitSwitch::kNormallyClosed;
+  if (value == "Disabled") return hardware::LimitSwitch::kDisabled;
+  throw std::invalid_argument(std::string(key) + " for " + name +
+                              " must be \"NormallyOpen\", \"NormallyClosed\" "
+                              "or \"Disabled\", not \"" +
+                              value + "\"");
+}
+
 inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   for (auto&& [key, value] : t) {
     const auto k = key.str();
@@ -283,7 +298,8 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
         k != "cruise_velocity_rps" && k != "acceleration_rps2" &&
         k != "jerk_rps3" && k != "follow" && k != "oppose_master" &&
         k != "feedback" && k != "feedback_sensor" && k != "slot0" &&
-        k != "slot1" && k != "slot2" && k != "requires_zero") {
+        k != "slot1" && k != "slot2" && k != "requires_zero" &&
+        k != "forward_limit_switch" && k != "reverse_limit_switch") {
       throw std::invalid_argument("unknown motor key '" + std::string(k) +
                                   "' for " + name);
     }
@@ -308,6 +324,8 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   m.requires_zero.value = Read(t, "requires_zero", m.requires_zero.value);
   m.reverse_limit_rot = Read(t, "reverse_limit_rot", m.reverse_limit_rot);
   m.forward_limit_rot = Read(t, "forward_limit_rot", m.forward_limit_rot);
+  m.forward_limit_switch = ReadLimitSwitch(t, "forward_limit_switch", name);
+  m.reverse_limit_switch = ReadLimitSwitch(t, "reverse_limit_switch", name);
   m.max_velocity_rps = Read(t, "max_velocity_rps", m.max_velocity_rps);
   m.cruise_velocity_rps =
       Read(t, "cruise_velocity_rps", std::min(20.0, m.max_velocity_rps));

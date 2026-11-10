@@ -117,6 +117,9 @@ void Validate(const Config& c) {
                 std::isfinite(m.forward_limit_rot) &&
                 m.reverse_limit_rot < m.forward_limit_rot,
             "invalid soft limits");
+    Require(m.forward_limit_switch <= LimitSwitch::kDisabled &&
+                m.reverse_limit_switch <= LimitSwitch::kDisabled,
+            "unknown limit switch type");
     for (const auto& g : m.slots) {
       for (double x : {g.p, g.i, g.d, g.s, g.v, g.a, g.g}) {
         Require(std::isfinite(x) && x >= 0, "invalid gain");
@@ -214,6 +217,8 @@ uint64_t ConfigurationId(const Config& c) {
     h.Add(m.soft_limits);
     h.Number(m.reverse_limit_rot);
     h.Number(m.forward_limit_rot);
+    h.Add(static_cast<uint8_t>(m.forward_limit_switch));
+    h.Add(static_cast<uint8_t>(m.reverse_limit_switch));
     h.Number(m.max_velocity_rps);
     h.Number(m.cruise_velocity_rps);
     h.Number(m.acceleration_rps2);

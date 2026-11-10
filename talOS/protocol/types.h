@@ -4,8 +4,8 @@
 
 namespace talos::protocol {
 
-constexpr uint16_t kProtocolVersion = 5;
-static_assert(kProtocolVersion == 5,
+constexpr uint16_t kProtocolVersion = 6;
+static_assert(kProtocolVersion == 6,
               "Update docs/DATA_FLOW.md and docs/DEPLOYMENT.md");
 constexpr uint64_t kFrameMagic = 0x4F4952534F4C4154ull;  // "TALOSRIO" LE
 

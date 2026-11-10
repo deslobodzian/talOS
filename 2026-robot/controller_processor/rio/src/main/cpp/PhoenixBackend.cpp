@@ -318,6 +318,25 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
         units::turn_t{m.forward_limit_rot};
     cfg.SoftwareLimitSwitch.ReverseSoftLimitThreshold =
         units::turn_t{m.reverse_limit_rot};
+    // Switches on the TalonFX's own limit pins; the defaults (enabled,
+    // normally open) are Phoenix's, so an unconfigured motor is unchanged.
+    auto& limits = cfg.HardwareLimitSwitch;
+    limits.ForwardLimitSource =
+        ph::signals::ForwardLimitSourceValue::LimitSwitchPin;
+    limits.ForwardLimitEnable =
+        m.forward_limit_switch != hw::LimitSwitch::kDisabled;
+    limits.ForwardLimitType =
+        m.forward_limit_switch == hw::LimitSwitch::kNormallyClosed
+            ? ph::signals::ForwardLimitTypeValue::NormallyClosed
+            : ph::signals::ForwardLimitTypeValue::NormallyOpen;
+    limits.ReverseLimitSource =
+        ph::signals::ReverseLimitSourceValue::LimitSwitchPin;
+    limits.ReverseLimitEnable =
+        m.reverse_limit_switch != hw::LimitSwitch::kDisabled;
+    limits.ReverseLimitType =
+        m.reverse_limit_switch == hw::LimitSwitch::kNormallyClosed
+            ? ph::signals::ReverseLimitTypeValue::NormallyClosed
+            : ph::signals::ReverseLimitTypeValue::NormallyOpen;
     cfg.MotionMagic.MotionMagicCruiseVelocity =
         units::turns_per_second_t{m.cruise_velocity_rps};
     cfg.MotionMagic.MotionMagicAcceleration =

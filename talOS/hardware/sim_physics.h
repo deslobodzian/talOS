@@ -32,9 +32,12 @@
 // zero-velocity demand is instead an active standstill hold (when gains are
 // tuned); with zero gains it honestly cannot hold and coasts.
 //
-// Controlled inputs/faults. Beam breaks and limit-switch inputs via
-// SetDigitalInput, soft limits from MotorConfig enforced in physics, frozen
-// feedback, per-device disconnect, supply-voltage change, controller restart.
+// Controlled inputs/faults. Beam breaks and RoboRIO limit-switch inputs via
+// SetDigitalInput, switches on a TalonFX's own limit inputs via
+// Set{Forward,Reverse}LimitPressed (enforced per MotorConfig's
+// forward_limit_switch and reverse_limit_switch), soft limits from
+// MotorConfig enforced in physics, frozen feedback, per-device disconnect,
+// supply-voltage change, controller restart.
 //
 // Explicit sim clock, deterministic stepping. Read() derives dt from
 // state.sample_time_us deltas, so Gateway ticks with explicit timestamps are
@@ -247,6 +250,8 @@ class PhysicsSimBackend final : public Backend {
     motor_connected_.fill(true);
     sensor_connected_.fill(true);
     motor_to_sensor_.fill(-1);
+    forward_pressed_.fill(false);
+    reverse_pressed_.fill(false);
     previous_time_.reset();
     digital_inputs_.clear();
     digital_outputs_.clear();
@@ -433,6 +438,20 @@ class PhysicsSimBackend final : public Backend {
 
   // Controlled inputs/faults.
   void SetDigitalInput(uint16_t id, bool value) { digital_inputs_[id] = value; }
+  // The mechanism pressing the switch on a motor's forward or reverse TalonFX
+  // limit input. It models a correctly wired switch: an enabled one of either
+  // type is asserted while pressed, and the motor's output toward it goes
+  // neutral as on the TalonFX. A follower takes its master's output; its own
+  // switches are not modelled. The Phoenix fault bits for an asserted hard
+  // limit are not reported.
+  void SetForwardLimitPressed(uint16_t motor_id, bool pressed) {
+    if (const int i = MotorIndex(motor_id); i >= 0)
+      forward_pressed_[i] = pressed;
+  }
+  void SetReverseLimitPressed(uint16_t motor_id, bool pressed) {
+    if (const int i = MotorIndex(motor_id); i >= 0)
+      reverse_pressed_[i] = pressed;
+  }
   void SetAnalogInput(uint16_t id, double voltage) {
     analog_inputs_[id] = voltage;
   }
@@ -671,6 +690,16 @@ class PhysicsSimBackend final : public Backend {
     }
   }
 
+  // Output toward an asserted, enabled limit switch is held neutral; volts
+  // are in the motor's configured positive (forward) direction.
+  bool LimitSwitchBlocks(std::size_t i, double volts) const {
+    const auto& m = config_.motors[i];
+    return (volts > 0.0 && forward_pressed_[i] &&
+            m.forward_limit_switch != LimitSwitch::kDisabled) ||
+           (volts < 0.0 && reverse_pressed_[i] &&
+            m.reverse_limit_switch != LimitSwitch::kDisabled);
+  }
+
   bool FeedbackValid(std::size_t i) const {
     if (!motor_connected_[i]) return false;
     if (config_.motors[i].feedback != Feedback::kRemoteCANcoder) return true;
@@ -720,6 +749,7 @@ class PhysicsSimBackend final : public Backend {
         want_power = FeedbackValid(i) &&
                      DriveVoltage(req, m, mech_pos, mech_vel, supply_v_, volts);
       }
+      want_power = want_power && !LimitSwitchBlocks(i, volts);
       applied_volts_[i] = want_power ? volts : 0.0;
       powered_[i] = want_power;
     }
@@ -849,6 +879,8 @@ class PhysicsSimBackend final : public Backend {
   std::array<bool, kMaxMotors> frozen_{};
   std::array<MotorSample, kMaxMotors> held_{};
   std::array<bool, kMaxMotors> motor_connected_{};
+  std::array<bool, kMaxMotors> forward_pressed_{};
+  std::array<bool, kMaxMotors> reverse_pressed_{};
   std::array<bool, kMaxSensors> sensor_connected_{};
   // Filled with -1 by Configure; valid only after Configure.
   std::array<int, kMaxMotors> motor_to_sensor_;
