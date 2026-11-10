@@ -29,6 +29,7 @@ ROBOT_CONFIG="2026-robot/main_processor/configuration/robot.toml"
 # Pins. Bazel itself, Python 3.11, Node 22.14.0 and pnpm inside Bazel are
 # hermetic (MODULE.bazel); these are the tools that live outside it.
 BAZELISK_VERSION="v1.30.0"
+# CI reads BUILDIFIER_VERSION and BUILDIFIER_SHA256_amd64 from these lines.
 BUILDIFIER_VERSION="8.2.1"
 # sha256 of the GitHub release assets, checked before anything is installed.
 BAZELISK_SHA256_amd64="a248ae2b2b62b5baebb748f6fba7203bff1a27e5d01b55399a8406744cb539e8"
@@ -400,7 +401,9 @@ install_node() {
   local tmp rc
   case "$PM" in
     # Distro Node is older than 22 on most releases; NodeSource carries 22.x.
-    # Fetched as the user and checked before root runs it.
+    # Fetched as the user, and root runs it only after a complete, non-empty
+    # download. Its setup_<major>.x URL is unversioned and NodeSource updates
+    # the script in place, so it is not sha256-pinned.
     apt|dnf)
       local host=deb.nodesource.com
       [ "$PM" = dnf ] && host=rpm.nodesource.com
@@ -426,7 +429,7 @@ detect_pnpm() {
   case "$real" in
     *corepack*)
       # Running the shim would download pnpm; read corepack's pin instead.
-      if grep -Eq "\"pnpm\" *: *\"$PNPM_VERSION[+\"]" "$(corepack_home)/lastKnownGood.json" 2>/dev/null; then
+      if grep -Eq "\"pnpm\" *: *\"${PNPM_VERSION}[+\"]" "$(corepack_home)/lastKnownGood.json" 2>/dev/null; then
         DETAIL="pnpm $PNPM_VERSION via corepack"; return 0
       fi
       DETAIL="corepack pnpm not pinned to $PNPM_VERSION"; return 2 ;;
