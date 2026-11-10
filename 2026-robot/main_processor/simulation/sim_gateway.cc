@@ -16,6 +16,7 @@
 #include "sim/topics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/driver_station/schedule.h"
 #include "talOS/events/os/poller.h"
 #include "talOS/hardware/endpoint.h"
 #include "talOS/hardware/sim_backend.h"
@@ -67,11 +68,6 @@ void StartPose(const std::string& text,
   options.start_yaw_rad = FiniteNumber(text.substr(second + 1));
 }
 
-struct Phase {
-  uint32_t flags;
-  double end_s;
-};
-
 double Seconds(const std::string& text) {
   std::size_t used = 0;
   const double value = std::stod(text, &used);
@@ -88,43 +84,6 @@ uint16_t Port(const std::string& text) {
     throw std::invalid_argument("port must be between 1 and 65535");
   }
   return static_cast<uint16_t>(value);
-}
-
-std::vector<Phase> ParseSchedule(const std::string& spec) {
-  std::vector<Phase> phases;
-  std::size_t start = 0;
-  double end_s = 0;
-  while (start < spec.size()) {
-    const auto comma = spec.find(',', start);
-    const auto part = spec.substr(start, comma - start);
-    const auto colon = part.find(':');
-    if (colon == std::string::npos) {
-      throw std::invalid_argument("mode schedule needs mode:seconds phases");
-    }
-    const auto mode = part.substr(0, colon);
-    uint32_t flags = ds::kDsAttached;
-    if (mode == "auto" || mode == "autonomous") {
-      flags |= ds::kEnabled | ds::kAutonomous;
-    } else if (mode == "teleop") {
-      flags |= ds::kEnabled | ds::kTeleop;
-    } else if (mode == "test") {
-      flags |= ds::kEnabled | ds::kTest;
-    } else if (mode != "disabled") {
-      throw std::invalid_argument("unknown mode: " + mode);
-    }
-    end_s += Seconds(part.substr(colon + 1));
-    if (!std::isfinite(end_s)) {
-      throw std::invalid_argument("mode schedule duration overflow");
-    }
-    phases.push_back({flags, end_s});
-    if (comma == std::string::npos) break;
-    start = comma + 1;
-    if (start == spec.size()) {
-      throw std::invalid_argument("empty mode schedule phase");
-    }
-  }
-  if (phases.empty()) throw std::invalid_argument("empty mode schedule");
-  return phases;
 }
 
 talos::event::Manifest Manifest(bool physics) {
@@ -157,8 +116,8 @@ int main(int argc, char** argv) {
       describe |= std::string{argv[i]} == "--describe";
     }
     double duration_s = 0;
-    std::vector<Phase> phases;
-    std::vector<robot::simulation::JoystickEvent> joysticks;
+    std::vector<ds::SchedulePhase> phases;
+    std::vector<ds::JoystickEvent> joysticks;
     std::vector<robot::simulation::FaultEvent> faults;
     ds::Alliance alliance = ds::Alliance::kBlue;
     bool physics_options = false;
@@ -209,9 +168,9 @@ int main(int argc, char** argv) {
         const std::string value = argv[++i];
         duration_s = value == "0" ? 0 : Seconds(value);
       } else if (arg == "--mode-schedule" && i + 1 < argc) {
-        phases = ParseSchedule(argv[++i]);
+        phases = ds::ParseModeSchedule(argv[++i]);
       } else if (arg == "--joystick-schedule" && i + 1 < argc) {
-        joysticks = robot::simulation::ParseJoysticks(argv[++i]);
+        joysticks = ds::ParseJoystickSchedule(argv[++i]);
       } else if (arg == "--fault-schedule" && i + 1 < argc) {
         physics_options = true;
         faults = robot::simulation::ParseFaults(argv[++i]);
@@ -313,11 +272,14 @@ int main(int argc, char** argv) {
       const double elapsed_s =
           std::chrono::duration<double>(tick_time - start).count();
       if (duration_s > 0 && elapsed_s >= duration_s) break;
-      while (phase + 1 < phases.size() && elapsed_s >= phases[phase].end_s) {
+      const auto elapsed =
+          std::chrono::duration_cast<std::chrono::microseconds>(tick_time -
+                                                                start);
+      while (phase + 1 < phases.size() && elapsed >= phases[phase].end) {
         ++phase;
       }
       while (joystick_event < joysticks.size() &&
-             elapsed_s >= joysticks[joystick_event].start_s) {
+             elapsed >= joysticks[joystick_event].start) {
         driver_station.joysticks[0] = joysticks[joystick_event++].joystick;
       }
       endpoint.SetSendEnabled(

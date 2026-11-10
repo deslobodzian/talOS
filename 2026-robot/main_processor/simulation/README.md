@@ -27,7 +27,7 @@ The gateway prints `active_ticks`, `first_wheel_rotations`,
 logged to stderr (`backend=ideal|physics`).
 
 `--mode-schedule` accepts comma-separated `mode:seconds` phases with positive,
-finite fractional durations. Modes are `disabled`, `auto` (or `autonomous`),
+finite fractional durations totaling at most 1e9 s. Modes are `disabled`, `auto` (or `autonomous`),
 `teleop`, and `test`. After the schedule finishes, the final mode is held until
 stopped or `--duration-s` expires (zero or omitted means unbounded).
 `--alliance blue|red` defaults to blue. Driver Station packets carry the
@@ -47,12 +47,14 @@ Both schedules use seconds since the gateway's loop starts and run alongside
 `--mode-schedule`. Quote the argument so the shell does not interpret `|` or `;`.
 
 `--joystick-schedule 'time:axes=A0,A1,...;buttons=MASK;pov=DEG|...'`
-sets complete, connected joystick-0 snapshots. Times must be nonnegative and
-strictly increasing. Each snapshot is held until the next event; before the
+sets complete, connected joystick-0 snapshots. Times must be in `[0, 1e9]` s
+and strictly increasing at microsecond resolution. Each snapshot is held until the next event; before the
 first event the joystick is disconnected. All three fields are required.
 Axes are one to twelve finite values in `[-1,1]`; omitted axes are zero.
 Buttons are a decimal uint32 mask (bit 0 is button 1). POV is `-1` (released)
 or an integer in `[0,359]` degrees. Other joysticks remain disconnected.
+Both schedules are parsed by `talOS/driver_station/schedule.h`, which the
+headless WPILib simulation's stand-in Driver Station shares.
 For the 2026 driver, negative axis 1 is forward; center the stick in teleop
 before pushing it, and center again after stale DS input or a driver stall.
 

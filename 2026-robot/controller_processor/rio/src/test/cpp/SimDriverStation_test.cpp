@@ -18,8 +18,8 @@
 
 namespace {
 
-using talos::rio::ParseSimJoystickSchedule;
-using talos::rio::ParseSimSchedule;
+using talos::driver_station::ParseJoystickSchedule;
+using talos::driver_station::ParseModeSchedule;
 using talos::rio::SimDriverStation;
 using namespace std::chrono_literals;
 
@@ -63,7 +63,7 @@ TEST_F(SimDriverStationTest, ScheduleStartsAtConfigurationAndHoldsLastPhase) {
   const auto t0 = SimDriverStation::Clock::time_point{} + 1h;
   auto settings = Active();
   settings.schedule =
-      ParseSimSchedule("teleop:1,auto:0.5,disabled:0.25,teleop:2");
+      ParseModeSchedule("teleop:1,auto:0.5,disabled:0.25,teleop:2");
   SimDriverStation ds{settings, t0};
   ds.Update(t0 + 10s, false);
   EXPECT_FALSE(Published().enabled);
@@ -121,8 +121,8 @@ TEST_F(SimDriverStationTest, JoystickScheduleReachesDriverStationPacket) {
   namespace ds = talos::driver_station;
   const auto t0 = SimDriverStation::Clock::time_point{} + 1h;
   auto settings = Active();
-  settings.schedule = ParseSimSchedule("teleop:2,disabled:1");
-  settings.joysticks = ParseSimJoystickSchedule(
+  settings.schedule = ParseModeSchedule("teleop:2,disabled:1");
+  settings.joysticks = ParseJoystickSchedule(
       "0:axes=0,0,0;buttons=0;pov=-1|"
       "1:axes=0.25,-0.5,0;buttons=5;pov=90");
   SimDriverStation sim{settings, t0};
@@ -178,36 +178,6 @@ TEST_F(SimDriverStationTest, NamesTheConfiguredAlliance) {
                std::invalid_argument);
   ::unsetenv("TALOS_SIM_DS_ALLIANCE");
   ::unsetenv("TALOS_SIM_DS");
-}
-
-TEST(SimScheduleParse, RejectsMalformedJoystickSchedules) {
-  constexpr const char* kStick = "axes=0;buttons=0;pov=-1";
-  for (const std::string& spec :
-       {std::string{}, std::string{"0"}, std::string{"x:"} + kStick,
-        std::string{"-1:"} + kStick, std::string{"nan:"} + kStick,
-        std::string{"1:"} + kStick + "|1:" + kStick,
-        std::string{"0:"} + kStick + "|", std::string{"0:axes=0;buttons=0"},
-        std::string{"0:axes=1.5;buttons=0;pov=-1"},
-        std::string{"0:axes=0,0,0,0,0,0,0,0,0,0,0,0,0;buttons=0;pov=-1"},
-        std::string{"0:axes=0;buttons=-1;pov=-1"},
-        std::string{"0:axes=0;buttons=4294967296;pov=-1"},
-        std::string{"0:axes=0;buttons=0;pov=360"},
-        std::string{"0:axes=0;buttons=0;pov=45.5"},
-        std::string{"0:axes=0;axes=0;buttons=0;pov=-1"},
-        std::string{"0:axes=0;buttons=0;pov=-1;rumble=1"}}) {
-    EXPECT_THROW(ParseSimJoystickSchedule(spec), std::invalid_argument) << spec;
-  }
-  EXPECT_EQ(
-      ParseSimJoystickSchedule(std::string{"0:"} + kStick + "|0.5:" + kStick)
-          .size(),
-      2u);
-}
-
-TEST(SimScheduleParse, RejectsMalformedSchedules) {
-  for (const char* spec : {"", "teleop", "fly:1", "teleop:0", "teleop:-1",
-                           "teleop:nan", "teleop:1x", "teleop:1,", ",auto:1"}) {
-    EXPECT_THROW(ParseSimSchedule(spec), std::invalid_argument) << spec;
-  }
 }
 
 }  // namespace

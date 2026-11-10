@@ -11,6 +11,24 @@ cc_library(
     hdrs = ["driver_station.h"],
 )
 
+# The simulators' scripted mode and joystick schedules. Header only, so the
+# RoboRIO program's GradleRIO build compiles it too.
+cc_library(
+    name = "schedule",
+    hdrs = ["schedule.h"],
+    deps = [":driver_station"],
+)
+
+cc_test(
+    name = "schedule_test",
+    size = "small",
+    srcs = ["schedule_test.cc"],
+    deps = [
+        ":schedule",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "driver_station_test",
     size = "small",

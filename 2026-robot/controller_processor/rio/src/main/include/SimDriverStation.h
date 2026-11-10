@@ -29,27 +29,21 @@
 //   TALOS_SIM_RUN_MS=10000              stop after ten seconds and print a
 //                                       summary (read by Robot.cpp)
 //
-// Schedule modes are disabled, auto (or autonomous), teleop and test, with
-// positive, finite durations: the syntax of sim_gateway's --mode-schedule.
-// A schedule cannot be combined with TALOS_SIM_DS_DISABLE_AFTER_MS.
-//
-// The joystick schedule is sim_gateway's --joystick-schedule: `|`-separated
-// `seconds:axes=A0,A1,...;buttons=MASK;pov=DEG` events at nonnegative,
-// strictly increasing times, each a complete joystick-0 snapshot (one to
-// twelve axes in [-1,1], a decimal uint32 button mask with bit 0 as button 1,
-// POV -1 or integer degrees [0,359]) held until the next. Joystick 0 is
-// disconnected before the first event, including until the gateway is
-// configured. Like a real Driver Station it keeps reporting the stick in
-// every mode; disabling is what neutralizes the robot.
+// Both schedules use sim_gateway's --mode-schedule and --joystick-schedule
+// syntax and rules (talOS/driver_station/schedule.h). A mode schedule cannot be
+// combined with TALOS_SIM_DS_DISABLE_AFTER_MS. Joystick 0 is disconnected
+// before the first joystick event, including until the gateway is configured.
+// Like a real Driver Station it keeps reporting the stick in every mode;
+// disabling is what neutralizes the robot.
 
 #ifndef __FRC_ROBORIO__
 
 #include <chrono>
 #include <optional>
-#include <string_view>
 #include <vector>
 
 #include "driver_station/driver_station.h"
+#include "driver_station/schedule.h"
 
 namespace talos::rio {
 
@@ -60,25 +54,6 @@ struct SimMode {
 
   bool operator==(const SimMode&) const = default;
 };
-
-struct SimPhase {
-  SimMode mode;
-  // Cumulative: the phase ends this long after the schedule starts.
-  std::chrono::microseconds end;
-};
-
-// Parses `mode:seconds,...`; throws std::invalid_argument naming the problem.
-std::vector<SimPhase> ParseSimSchedule(std::string_view spec);
-
-struct SimJoystickEvent {
-  // From the schedule's start, like SimPhase::end.
-  std::chrono::microseconds start;
-  driver_station::JoystickData joystick;
-};
-
-// Parses `seconds:axes=...;buttons=MASK;pov=DEG|...`; throws
-// std::invalid_argument naming the problem.
-std::vector<SimJoystickEvent> ParseSimJoystickSchedule(std::string_view spec);
 
 class SimDriverStation {
  public:
@@ -91,10 +66,10 @@ class SimDriverStation {
     bool enable_when_configured{false};
     std::optional<std::chrono::milliseconds> disable_after;
     // When nonempty, replaces the three fields above.
-    std::vector<SimPhase> schedule;
+    std::vector<driver_station::SchedulePhase> schedule;
     // Joystick 0 over time, from the same start as the schedule (the
     // gateway's configuration); empty leaves it connected and centered.
-    std::vector<SimJoystickEvent> joysticks;
+    std::vector<driver_station::JoystickEvent> joysticks;
     // Never kUnknown: the pose estimator trusts its seed only after a
     // disabled Driver Station view that names an alliance.
     driver_station::Alliance alliance{driver_station::Alliance::kBlue};

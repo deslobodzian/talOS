@@ -14,6 +14,7 @@ cc_binary(
     deps = [
         "//talOS/configuration",
         "//talOS/driver_station",
+        "//talOS/driver_station:schedule",
         "//talOS/events:events_os",
         "//talOS/hardware",
         "//talOS/hardware:sim_messages",
@@ -32,7 +33,6 @@ cc_test(
         "schedules_test.cc",
     ],
     deps = [
-        "//talOS/driver_station",
         "//talOS/hardware",
         "@googletest//:gtest_main",
     ],

@@ -8,31 +8,7 @@
 namespace robot::simulation {
 namespace {
 
-TEST(Schedules, JoystickSnapshotsCarryAxesButtonsAndPov) {
-  const auto events = ParseJoysticks(
-      "0:axes=0,0,0;buttons=0;pov=-1|1.5:axes=0,-0.5,1;buttons=5;pov=90");
-  ASSERT_EQ(events.size(), 2u);
-  EXPECT_DOUBLE_EQ(events[1].start_s, 1.5);
-  const auto& stick = events[1].joystick;
-  EXPECT_TRUE(stick.connected);
-  EXPECT_EQ(stick.axis_count, 3);
-  EXPECT_FLOAT_EQ(stick.axes[1], -0.5f);
-  EXPECT_FLOAT_EQ(stick.axes[2], 1.0f);
-  EXPECT_EQ(stick.buttons, 5u);
-  EXPECT_EQ(stick.povs[0], 90);
-  EXPECT_EQ(events[0].joystick.povs[0], -1);
-}
-
-TEST(Schedules, RejectsMalformedInputsRatherThanSilentlySkippingThem) {
-  for (const auto* spec :
-       {"", "nan:axes=0;buttons=0;pov=-1", "-1:axes=0;buttons=0;pov=-1",
-        "0:axes=2;buttons=0;pov=-1", "0:axes=0;buttons=-1;pov=-1",
-        "0:axes=0;buttons=4294967296;pov=-1", "0:axes=0;buttons=0;pov=360",
-        "0:axes=0;buttons=0;pov=0.5", "0:axes=0;buttons=0",
-        "0:axes=0;axes=0;buttons=0;pov=-1",
-        "0:axes=0;buttons=0;pov=-1|0:axes=0;buttons=0;pov=-1"}) {
-    EXPECT_THROW(ParseJoysticks(spec), std::invalid_argument) << spec;
-  }
+TEST(Schedules, RejectsMalformedFaultsRatherThanSilentlySkippingThem) {
   for (const auto* spec :
        {"", "1:1:reset:drive", "-1:2:reset:drive", "nan:2:reset:drive",
         "0:inf:reset:drive", "0:1:unknown:drive", "0:1:udp_blackout:drive",

@@ -8,7 +8,6 @@
 #include <utility>
 #include <vector>
 
-#include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/sim_physics.h"
 
 namespace robot::simulation {
@@ -34,77 +33,6 @@ inline double Number(const std::string& text) {
     throw std::invalid_argument("schedule numbers must be finite");
   }
   return value;
-}
-
-struct JoystickEvent {
-  double start_s;
-  talos::driver_station::JoystickData joystick;
-};
-
-// Every event is a complete joystick-0 snapshot, held until the next event.
-inline std::vector<JoystickEvent> ParseJoysticks(const std::string& spec) {
-  std::vector<JoystickEvent> events;
-  for (const auto& entry : Split(spec, '|')) {
-    const auto colon = entry.find(':');
-    if (colon == std::string::npos) {
-      throw std::invalid_argument("joystick event needs time:fields");
-    }
-    JoystickEvent event{Number(entry.substr(0, colon)), {}};
-    if (event.start_s < 0 ||
-        (!events.empty() && event.start_s <= events.back().start_s)) {
-      throw std::invalid_argument("joystick times must increase from zero");
-    }
-    auto& stick = event.joystick;
-    stick.connected = true;
-    stick.button_count = 32;
-    bool axes = false, buttons = false, pov = false;
-    for (const auto& field : Split(entry.substr(colon + 1), ';')) {
-      const auto equal = field.find('=');
-      const auto key = field.substr(0, equal);
-      if (equal == std::string::npos) {
-        throw std::invalid_argument("joystick field needs key=value");
-      }
-      const auto value = field.substr(equal + 1);
-      if (key == "axes" && !axes) {
-        axes = true;
-        for (const auto& axis : Split(value, ',')) {
-          const double x = Number(axis);
-          if (stick.axis_count == stick.axes.size() || x < -1 || x > 1) {
-            throw std::invalid_argument(
-                "axes need at most 12 values in [-1,1]");
-          }
-          stick.axes[stick.axis_count++] = static_cast<float>(x);
-        }
-      } else if (key == "buttons" && !buttons) {
-        buttons = true;
-        std::size_t used = 0;
-        const auto mask = std::stoull(value, &used);
-        if (used != value.size() || value.starts_with('-') ||
-            mask > UINT32_MAX) {
-          throw std::invalid_argument("buttons must be a uint32 decimal mask");
-        }
-        stick.buttons = static_cast<uint32_t>(mask);
-      } else if (key == "pov" && !pov) {
-        pov = true;
-        const double angle = Number(value);
-        if (angle != std::floor(angle) ||
-            (angle != -1 && (angle < 0 || angle >= 360))) {
-          throw std::invalid_argument(
-              "pov must be -1 or integer degrees [0,359]");
-        }
-        stick.pov_count = 1;
-        stick.povs[0] = static_cast<int16_t>(angle);
-      } else {
-        throw std::invalid_argument("unknown or repeated joystick field: " +
-                                    key);
-      }
-    }
-    if (!axes || !buttons || !pov) {
-      throw std::invalid_argument("joystick event needs axes, buttons and pov");
-    }
-    events.push_back(event);
-  }
-  return events;
 }
 
 enum class FaultKind {
