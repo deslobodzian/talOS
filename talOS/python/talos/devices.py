@@ -27,12 +27,12 @@ from talos._messages import message_type
 
 class Mode(enum.IntEnum):
     """A motor request's control mode (talos::hardware::Mode)."""
-    NEUTRAL = 0
-    DUTY_CYCLE = 1
-    VOLTAGE = 2
-    VELOCITY = 3
-    POSITION = 4
-    MOTION_MAGIC = 5
+    NEUTRAL = _abi.MODE_NEUTRAL
+    DUTY_CYCLE = _abi.MODE_DUTY_CYCLE
+    VOLTAGE = _abi.MODE_VOLTAGE
+    VELOCITY = _abi.MODE_VELOCITY
+    POSITION = _abi.MODE_POSITION
+    MOTION_MAGIC = _abi.MODE_MOTION_MAGIC
 
 
 def robot_enabled(node):

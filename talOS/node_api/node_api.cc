@@ -70,6 +70,31 @@ hardware::Mode MotorMode(std::int32_t mode) {
   return static_cast<hardware::Mode>(mode);
 }
 
+// DeviceKindOf and MotorMode cast the ABI value straight to the C++ enum, so
+// every enumerator must match; Python takes these values from _abi.py, which
+// api_parity_test compares with node_api.h.
+constexpr bool SameKind(std::int32_t abi, detail::DeviceKind kind) {
+  return abi == static_cast<std::int32_t>(kind);
+}
+static_assert(
+    SameKind(TALOS_DEVICE_MOTOR, detail::DeviceKind::kMotor) &&
+    SameKind(TALOS_DEVICE_CANCODER, detail::DeviceKind::kCANcoder) &&
+    SameKind(TALOS_DEVICE_GYRO, detail::DeviceKind::kGyro) &&
+    SameKind(TALOS_DEVICE_DIGITAL_INPUT, detail::DeviceKind::kDigitalInput) &&
+    SameKind(TALOS_DEVICE_DIGITAL_OUTPUT, detail::DeviceKind::kDigitalOutput) &&
+    SameKind(TALOS_DEVICE_ANALOG_INPUT, detail::DeviceKind::kAnalogInput) &&
+    SameKind(TALOS_DEVICE_ENCODER, detail::DeviceKind::kEncoder) &&
+    SameKind(TALOS_DEVICE_PWM, detail::DeviceKind::kPwm));
+constexpr bool SameMode(std::int32_t abi, hardware::Mode mode) {
+  return abi == static_cast<std::int32_t>(mode);
+}
+static_assert(SameMode(TALOS_MODE_NEUTRAL, hardware::Mode::kNeutral) &&
+              SameMode(TALOS_MODE_DUTY_CYCLE, hardware::Mode::kDutyCycle) &&
+              SameMode(TALOS_MODE_VOLTAGE, hardware::Mode::kVoltage) &&
+              SameMode(TALOS_MODE_VELOCITY, hardware::Mode::kVelocity) &&
+              SameMode(TALOS_MODE_POSITION, hardware::Mode::kPosition) &&
+              SameMode(TALOS_MODE_MOTION_MAGIC, hardware::Mode::kMotionMagic));
+
 TalosSample* Out(TalosSample* out) {
   if (out == nullptr) throw std::invalid_argument("null TalosSample");
   *out = TalosSample{};

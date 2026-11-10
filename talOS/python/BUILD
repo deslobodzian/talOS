@@ -75,9 +75,11 @@ py_test(
     srcs = ["api_parity_test.py"],
     data = [
         "talos/_abi.py",
+        "talos/devices.py",
         "//talOS/node_api:node_api.h",
     ],
     env = {
+        "TALOS_ABI_DEVICES": "$(rlocationpath talos/devices.py)",
         "TALOS_ABI_HEADER": "$(rlocationpath //talOS/node_api:node_api.h)",
         "TALOS_ABI_PYTHON": "$(rlocationpath talos/_abi.py)",
     },

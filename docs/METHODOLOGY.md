@@ -317,7 +317,10 @@ producer that has drained it would.
 - A C ABI change keeps `node_api_test` and `talos_test` exercising the new
   symbol from both languages. `HardwareLink::fresh()` and `age()` are exposed
   in both languages; `//talOS/python:api_parity_test` enforces matching ABI
-  versions, exports and parameter counts between `node_api.h` and `_abi.py`.
+  versions, exports, return and parameter types, and `TALOS_*` constant
+  values between `node_api.h` and `_abi.py` (and that `talos.Mode` takes its
+  values from `_abi.py`); `node_api.cc` static_asserts the header's device
+  kinds, motor modes and Driver Station flags against the C++ enums.
 
 ## 12. Adding things
 
