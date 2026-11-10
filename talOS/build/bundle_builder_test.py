@@ -1,5 +1,6 @@
-"""Tests bundle_builder.py's config staging (relative layout and identity)
-and its lib/ staging of C++ nodes' shared libraries."""
+"""Tests bundle_builder.py's config staging (relative layout and identity),
+its lib/ staging of C++ nodes' shared libraries and its run.sh, and
+tools/deploy.sh's bundle selection, pruning and session commands."""
 
 import json
 import os
@@ -57,6 +58,11 @@ class BundleBuilderTest(unittest.TestCase):
         with open(os.path.join(out, "bundle_manifest.toml"), encoding="utf-8") as f:
             manifest = f.read()
         return out, manifest
+
+    def echo_launcher(self, out):
+        """Replaces the bundle's launcher with one that prints its argv."""
+        put(os.path.join(out, "launcher"), "#!/usr/bin/env python3\n"
+            "import json, sys\nprint(json.dumps(sys.argv[1:]))\n")
 
     def test_files_keep_their_paths_relative_to_the_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,9 +142,7 @@ class BundleBuilderTest(unittest.TestCase):
     def test_run_script_passes_output_root_without_a_session_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
             out, _ = self.build(tmp, {"c/robot.toml": "[robot]\n"})
-            launcher = os.path.join(out, "launcher")
-            put(launcher, "#!/usr/bin/env python3\n"
-                "import json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+            self.echo_launcher(out)
             env = dict(os.environ, TALOS_LOG_DIR=os.path.join(tmp, "log root"))
             for explicit in ([], ["--output-dir", os.path.join(tmp, "override")],
                              ["--output-dir=" + os.path.join(tmp, "override")]):
@@ -154,12 +158,29 @@ class BundleBuilderTest(unittest.TestCase):
                         self.assertEqual(args[args.index("--output-dir") + 1],
                                          env["TALOS_LOG_DIR"])
 
+    def test_run_script_through_a_link_passes_the_physical_bundle(self):
+        # The boot service starts <prefix>/current/run.sh. Node binaries come
+        # from --bundle, so a path through the link would restart nodes from
+        # whatever bundle `current` selects later.
+        with tempfile.TemporaryDirectory() as tmp:
+            out, _ = self.build(tmp, {"c/robot.toml": "[robot]\n"})
+            self.echo_launcher(out)
+            current = os.path.join(tmp, "current")
+            os.symlink(out, current)
+            proc = subprocess.run([os.path.join(current, "run.sh")],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            args = json.loads(proc.stdout)
+            self.assertEqual(args[args.index("--bundle") + 1],
+                             os.path.realpath(out))
 
-class DeploySessionsTest(unittest.TestCase):
-    def deploy(self, prefix, *args):
-        script = runfiles.Create().Rlocation("_main/tools/deploy.sh")
+
+class DeployTest(unittest.TestCase):
+    def deploy(self, prefix, *args, cwd=None):
+        script = os.path.abspath(
+            runfiles.Create().Rlocation("_main/tools/deploy.sh"))
         return subprocess.run(["bash", script, *args, "--prefix", prefix],
-                              capture_output=True, text=True)
+                              cwd=cwd, capture_output=True, text=True)
 
     def session(self, prefix, name, timestamp):
         path = os.path.join(prefix, "logs", name)
@@ -169,6 +190,17 @@ class DeploySessionsTest(unittest.TestCase):
         put(os.path.join(path, "arm.0.tlog"), "first attempt")
         put(os.path.join(path, "arm.1.tlog"), "restarted attempt")
         os.utime(os.path.join(path, "manifest.json"), ns=(timestamp, timestamp))
+        return path
+
+    def bundle(self, prefix, stamp):
+        """An installed bundle, read-only as install leaves it."""
+        path = os.path.join(prefix, "bundles", stamp)
+        put(os.path.join(path, "bin", "node"), "")
+        put(os.path.join(path, "run.sh"), "")
+        for parent, dirs, files in os.walk(path):
+            for name in dirs + files:
+                os.chmod(os.path.join(parent, name), 0o555)
+        os.chmod(path, 0o555)
         return path
 
     def test_logs_lists_sessions_and_selects_newest_manifest(self):
@@ -212,6 +244,42 @@ class DeploySessionsTest(unittest.TestCase):
             proc = self.deploy(prefix, "fetch", os.path.join(prefix, "logs", "copy"))
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("outside the log root", proc.stderr)
+
+    def test_install_with_a_relative_prefix_selects_the_copy(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            build = os.path.join(tmp, "build")
+            put(os.path.join(build, "run.sh"), "#!/bin/sh\n")
+            os.chmod(os.path.join(build, "run.sh"), 0o755)
+            proc = self.deploy("robot", "install", build, cwd=tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(os.path.isfile(
+                os.path.join(tmp, "robot", "current", "run.sh")))
+
+    def test_rollback_refuses_a_previous_bundle_that_is_gone(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            current = self.bundle(tmp, "20260102_000000_1")
+            os.symlink(current, os.path.join(tmp, "current"))
+            os.symlink(os.path.join(tmp, "bundles", "20260101_000000_1"),
+                       os.path.join(tmp, "previous"))
+            proc = self.deploy(tmp, "rollback")
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(os.readlink(os.path.join(tmp, "current")), current)
+
+    def test_prune_keeps_the_newest_and_the_selected_bundles(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            stamps = [f"2026010{day}_000000_1" for day in range(1, 7)]
+            for stamp in stamps:
+                self.bundle(tmp, stamp)
+            # Both selections older than the newest two, linked relatively:
+            # a selection is kept however its target is spelled.
+            os.symlink(os.path.join("bundles", stamps[0]),
+                       os.path.join(tmp, "current"))
+            os.symlink(os.path.join("bundles", stamps[2]),
+                       os.path.join(tmp, "previous"))
+            proc = self.deploy(tmp, "prune", "--keep", "2")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(sorted(os.listdir(os.path.join(tmp, "bundles"))),
+                             [stamps[0], stamps[2], stamps[4], stamps[5]])
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # talOS coprocessor deployment: install a bundle, start it on boot, inspect
-# session logs, roll back.
+# session logs, roll back, prune old bundles.
 #
 # Layout under the prefix (default /opt/talos):
 #   bundles/<stamp>/   one installed bundle each (immutable after install)
@@ -13,6 +13,7 @@
 #   ./tools/deploy.sh logs [--prefix DIR]
 #   ./tools/deploy.sh fetch [--prefix DIR] DEST
 #   ./tools/deploy.sh rollback [--prefix DIR]
+#   ./tools/deploy.sh prune [--prefix DIR] [--keep N]
 #
 set -euo pipefail
 
@@ -40,7 +41,8 @@ finally:
 
 # --- install ---------------------------------------------------------------
 # Copies the bundle and flips `current` atomically, keeping `previous` for
-# rollback.
+# rollback. Selects only a complete copy, synced to disk first: a power cut
+# right after the flip must not boot a half-written bundle.
 cmd_install() {
   local bundle="${1:?usage: deploy.sh install <bundle> [--prefix DIR]}"
   [ -x "$bundle/run.sh" ] || die "not a bundle (no executable run.sh): $bundle"
@@ -57,6 +59,9 @@ cmd_install() {
   # @executable_path/../lib/libpython3.11.dylib and every Python node fails.
   run cp -RP "$bundle" "$dest"
   run chmod -R a-w "$dest" 2>/dev/null || true
+  [ "$DRY_RUN" = "1" ] || [ -x "$dest/run.sh" ] ||
+    die "copy has no executable run.sh; current unchanged: $dest"
+  run sync
   if [ -L "$PREFIX/current" ]; then
     select_bundle "$(readlink "$PREFIX/current")" "$PREFIX/previous"
   fi
@@ -92,10 +97,16 @@ for parent, dirs, files in os.walk(root, onerror=lambda e: sys.exit(str(e))):
 ' "$PREFIX/current"
   run sudo install -d -m 0755 -o "$user" "$PREFIX/logs"
   run sudo -u "$user" test -w "$PREFIX/logs"
+  # StartLimitIntervalSec=0: systemd's default start limit (5 starts in 10 s,
+  # manual restarts included) would leave the unit failed and end
+  # Restart=always. LimitRTPRIO/LimitMEMLOCK let the unprivileged service
+  # take the realtime scheduling nodes request: SCHED_FIFO up to the bridge's
+  # priority 60, and mlockall (docs/NODE_DEVELOPMENT_GUIDE.md).
   local unit="[Unit]
 Description=talOS robot bundle
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
@@ -106,6 +117,8 @@ TimeoutStartSec=1200
 WatchdogSec=3
 Restart=always
 RestartSec=2
+LimitRTPRIO=60
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -230,21 +243,65 @@ EOF
 
 # --- rollback ---------------------------------------------------------------
 # Whole-bundle rollback with its matching configuration and runtime: swaps
-# `current` back to `previous`. Never mixes node versions across bundles.
+# `current` back to `previous`. Never mixes node versions across bundles, and
+# never selects a `previous` that no longer holds a bundle.
 cmd_rollback() {
-  [ -L "$PREFIX/previous" ] || die "no previous bundle to roll back to"
+  [ -L "$PREFIX/current" ] || die "no current bundle at $PREFIX/current"
+  [ -L "$PREFIX/previous" ] && [ -x "$PREFIX/previous/run.sh" ] ||
+    die "no previous bundle to roll back to ($PREFIX/previous missing or not a bundle)"
   local cur; cur="$(readlink "$PREFIX/current")"
   select_bundle "$(readlink "$PREFIX/previous")" "$PREFIX/current"
   select_bundle "$cur" "$PREFIX/previous"
   say "rolled back: current -> $(readlink "$PREFIX/current"); restart the service to activate"
 }
 
-usage() { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# --- prune ------------------------------------------------------------------
+# Deletes installed bundles except the newest --keep N (default 3) and the
+# ones `current` and `previous` select, however old. A running launcher
+# restarts nodes from the bundle it started from, so prune only after the
+# service has restarted into the current selection.
+cmd_prune() {
+  local synopsis="usage: deploy.sh prune [--prefix DIR] [--keep N]"
+  local keep=3
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep) [ $# -ge 2 ] || die "$synopsis"; keep="$2"; shift 2 ;;
+      *) die "$synopsis" ;;
+    esac
+  done
+  # At most nine digits: `[` cannot compare a larger integer, and a failed
+  # keep test below would remove the bundle instead of keeping it.
+  case "$keep" in ''|*[!0-9]*|??????????*) die "--keep takes a count, not '$keep'" ;; esac
+  # Stamps start with a fixed-width install time, so name order is install
+  # order. Real directories only: rm -rf must never follow a link out.
+  local dir newest_first=()
+  for dir in "$PREFIX"/bundles/*; do
+    if [ -d "$dir" ] && [ ! -L "$dir" ]; then
+      newest_first=("$dir" ${newest_first[@]+"${newest_first[@]}"})
+    fi
+  done
+  local seen=0
+  for dir in ${newest_first[@]+"${newest_first[@]}"}; do
+    seen=$((seen + 1))
+    # -ef compares the directories themselves, however a link spells them.
+    if [ "$seen" -le "$keep" ] || [ "$dir" -ef "$PREFIX/current" ] ||
+        [ "$dir" -ef "$PREFIX/previous" ]; then
+      continue
+    fi
+    say "removing $dir"
+    # Installed read-only; rm needs write access to each directory it empties
+    # and reports what it still cannot remove.
+    run chmod -R u+w "$dir" 2>/dev/null || true
+    run rm -rf "$dir"
+  done
+}
+
+usage() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local cmd="${1:-}"; shift || true
   # Global flags ride anywhere on the command line; subcommand flags
-  # (--user) are consumed by each subcommand below.
+  # (--user, --keep) are consumed by each subcommand below.
   local rest=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -253,6 +310,10 @@ main() {
       *) rest+=("$1"); shift ;;
     esac
   done
+  # Absolute: install writes it into the `current`/`previous` link targets
+  # and enable-boot into the unit; neither may depend on the caller's
+  # working directory.
+  case "$PREFIX" in /*) ;; *) PREFIX="$(pwd -P)/$PREFIX" ;; esac
   if [ "${#rest[@]}" -gt 0 ]; then
     set -- "${rest[@]}"
   else
@@ -264,6 +325,7 @@ main() {
     logs) cmd_logs "$@" ;;
     fetch) cmd_fetch "$@" ;;
     rollback) cmd_rollback "$@" ;;
+    prune) cmd_prune "$@" ;;
     *) usage; exit 2 ;;
   esac
 }

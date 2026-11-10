@@ -2,7 +2,7 @@
 
 The main processor runs a **bundle**: one directory with every node binary, the
 launcher, the config and the runtime libraries. `tools/deploy.sh` installs
-bundles, starts one on boot, shows logs and rolls back.
+bundles, starts one on boot, shows logs, rolls back and prunes old bundles.
 
 ## Build a bundle
 
@@ -18,7 +18,7 @@ bazel build //2026-robot/main_processor:robot_bundle
 
 | Entry | What |
 |---|---|
-| `run.sh` | runs `./launcher --bundle <dir> --config config/robot_field.toml "$@"`, adding `--output-dir "$TALOS_LOG_DIR"` when that is set; a `--config`/`--output-dir` argument replaces the default |
+| `run.sh` | runs `./launcher --bundle <dir> --config config/robot_field.toml "$@"` from `<dir>`, its own directory with symlinks resolved, adding `--output-dir "$TALOS_LOG_DIR"` when that is set; a `--config`/`--output-dir` argument replaces the default |
 | `launcher` | `//talOS/launcher` |
 | `bin/` | node binaries; a Python node's runfiles beside it (its wheels, e.g. `robotpy-wpimath` and `gtsam`, and `libtalos_node.so`) |
 | `lib/` | any shared libraries C++ nodes link, one copy per name; no C++ WPILib libraries are staged. `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
@@ -55,16 +55,23 @@ launch; use `--remote-port` and `--local-port` if the ports also differ.
 ./tools/deploy.sh logs [--prefix /opt/talos] [LOG_ROOT]
 ./tools/deploy.sh fetch [--prefix /opt/talos] DEST
 ./tools/deploy.sh rollback [--prefix /opt/talos]
+./tools/deploy.sh prune [--prefix /opt/talos] [--keep 3]
 ```
 
+A relative `--prefix` is resolved against the working directory.
+
 - **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only,
-  symlinks kept), retains `previous`, and atomically replaces `current` using
+  symlinks kept), checks that the copy has an executable `run.sh`, runs
+  `sync`, retains `previous`, and atomically replaces `current` using
   a temporary sibling symlink and rename (Linux and macOS). This selects the
   next bundle; restart the service to activate it.
 - **enable-boot** starts `<prefix>/current/run.sh` at boot as `--user`
   (default `talos`; the account must exist). Linux: writes and enables
   `/etc/systemd/system/talos.service` (`Type=notify`, `Restart=always`, a
-  three-second supervision watchdog). macOS: writes the
+  three-second supervision watchdog, `LimitRTPRIO=60` and
+  `LimitMEMLOCK=infinity`, so the unprivileged service gets the
+  [realtime scheduling](NODE_DEVELOPMENT_GUIDE.md#realtime-scheduling) its
+  nodes request). macOS: writes the
   LaunchDaemon `/Library/LaunchDaemons/org.talos.robot.plist` (`KeepAlive`)
   and bootstraps it into the system domain, so it starts without a login.
   Both use sudo. Before enabling, it checks bundle read/traversal access as
@@ -83,10 +90,15 @@ launch; use `--remote-port` and `--local-port` if the ports also differ.
   directory to the analysis machine. Existing destination session names are
   rejected rather than merged; choose a fresh destination for each collection.
 - **rollback** swaps `current` and `previous`: the whole previous bundle, with
-  its own config. Selection does not change already-running processes.
+  its own config. It refuses when `current` is missing or `previous` no longer
+  holds a bundle. Selection does not change already-running processes: a
+  running launcher restarts nodes from the bundle it started in.
   With the robot disabled, activate install/rollback with
   `sudo systemctl restart talos` on Linux, or
   `sudo launchctl kickstart -k system/org.talos.robot` on macOS.
+- **prune** deletes installed bundles except the newest `--keep N` (default 3)
+  and the ones `current` and `previous` select, however old. Prune after
+  activating the selection, so the running bundle is among those kept.
 
 Run by hand: `/opt/talos/current/run.sh --duration-s 30`.
 
@@ -126,7 +138,9 @@ supervision, then `WATCHDOG=1` on each supervision iteration (normally every
 notification as a hung launcher and restarts it, leaving ample scheduling and
 manifest-write headroom. A stalled loop cannot be masked by
 an independent watchdog thread. `Restart=always` starts a fresh session after
-either a watchdog failure or a launcher exit; `systemctl stop talos` still
+either a watchdog failure or a launcher exit, however often:
+`StartLimitIntervalSec=0` lifts systemd's start-rate limit (five starts in ten
+seconds by default, manual restarts included). `systemctl stop talos` still
 stops the service deliberately. Notifications use `NOTIFY_SOCKET` directly,
 including Linux abstract (`@...`) Unix datagram sockets, without libsystemd.
 

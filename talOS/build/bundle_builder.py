@@ -246,7 +246,9 @@ def main():
     with open(run_sh_path, "w") as f:
         f.write(f"""#!/usr/bin/env bash
 set -e
-SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+# Physical (pwd -P): started as <prefix>/current/run.sh, the launcher and
+# every node it restarts stay in this bundle when deploy.sh moves `current`.
+SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd -P)"
 export PATH="${{SCRIPT_DIR}}/bin:${{PATH}}"
 
 unset BUILD_WORKSPACE_DIRECTORY
