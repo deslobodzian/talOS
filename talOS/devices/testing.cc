@@ -20,6 +20,7 @@
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/introspection/names.h"
 
 namespace talos::testing {
 namespace {
@@ -676,12 +677,6 @@ driver_station::DriverStationData DsPacket(std::uint32_t flags) {
   return data;
 }
 
-namespace {
-std::string LaneTopic(std::string_view subsystem, std::string_view source) {
-  return "/" + std::string{subsystem} + "/target/" + std::string{source};
-}
-}  // namespace
-
 std::uint64_t DriverStationGeneration(const Sim& sim) {
   const std::uint64_t count = SimAccess::message_count(
       sim, hardware::kDriverStationTopic, sizeof(Packet));
@@ -704,15 +699,17 @@ void PublishTargetRaw(Sim& sim, std::string_view subsystem,
       detail::TargetEnvelopeBytes(bytes, alignment));
   detail::EncodeTargetEnvelope(mode_since_us, message != nullptr, message,
                                bytes, alignment, envelope);
-  SimAccess::publish_raw(sim, LaneTopic(subsystem, source), envelope.data(),
-                         envelope.size());
+  SimAccess::publish_raw(sim,
+                         introspect::naming::TargetLaneTopic(subsystem, source),
+                         envelope.data(), envelope.size());
 }
 
 bool LatestTargetRaw(const Sim& sim, std::string_view subsystem,
                      std::string_view source, void* out, std::size_t bytes,
                      std::size_t alignment,
                      detail::TargetEnvelopeHeader& header) {
-  const std::string topic = LaneTopic(subsystem, source);
+  const std::string topic =
+      introspect::naming::TargetLaneTopic(subsystem, source);
   std::vector<std::byte> envelope(
       detail::TargetEnvelopeBytes(bytes, alignment));
   const std::uint64_t count =

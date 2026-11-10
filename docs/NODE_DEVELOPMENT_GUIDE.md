@@ -334,8 +334,9 @@ talos_py_node(name = "node", node_name = "intake", main = "intake.py",
 ```
 
 `include_prefix` on `talos_messages` overrides the package-basename prefix;
-with `topics`, it must be the schema's namespace. Topic keys are
-lower_snake_case: `"vision_state"` is `kVisionState` in C++ and
+with `topics`, it must be the schema's namespace. Topic names follow
+[NAMING.md](../talOS/NAMING.md), checked when the `BUILD` file loads. Topic
+keys are lower_snake_case: `"vision_state"` is `kVisionState` in C++ and
 `VISION_STATE` in Python. Target lanes are not listed: `TargetLane` and
 `Target` build them from the subsystem and source names.
 To use another package's types, list its `talos_messages` target in `deps`

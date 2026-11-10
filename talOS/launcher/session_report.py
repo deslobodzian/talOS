@@ -41,7 +41,22 @@ def stream(records, topic):
     return "/".join(key), sorted(groups[key], key=lambda r: r["now_ms"])
 
 
-TARGET_LANE = re.compile(r"/[^/]+/target/[^/]+")
+# A target lane, /<subsystem>/target/<source>, by the segment rules of
+# talOS/NAMING.md (naming::IsTargetLane is the authority): each segment starts
+# with a lowercase letter and has no doubled or trailing underscore, and the
+# whole name fits kMaxTopicBytes, which also bounds both segments below
+# kMaxSegmentBytes. Abbreviations and direction suffixes are not re-checked:
+# the launcher refuses a graph that uses them.
+_SEGMENT = r"[a-z](?:_?[a-z0-9])*"
+_TARGET_LANE = re.compile(rf"/{_SEGMENT}/target/{_SEGMENT}")
+MAX_TOPIC_BYTES = 31
+
+
+def is_target_lane(topic):
+    return (len(topic) <= MAX_TOPIC_BYTES
+            and _TARGET_LANE.fullmatch(topic) is not None)
+
+
 # log_dump's text for a TargetEnvelope<M> starts with its header fields.
 ENVELOPE_HEADER = re.compile(r"\{mode_since_us: (\d+), active: (true|false)")
 TARGET_AGE_LIMIT_MS = 25
@@ -77,7 +92,7 @@ def analyze(manifest, records, log_damage=()):
     targets, timers, status, tick_ages = {}, {}, {}, {}
     enabled_lane_processes = set()
     for r in records:
-        if r["kind"] == "MESSAGE" and TARGET_LANE.fullmatch(r["topic"]):
+        if r["kind"] == "MESSAGE" and is_target_lane(r["topic"]):
             targets.setdefault(r["process"] + ":" + r["topic"], []).append(
                 r["now_ms"] - r["publish_ms"])
             # Only an active envelope stamped with a mode generation is one a
@@ -89,7 +104,7 @@ def analyze(manifest, records, log_damage=()):
                 enabled_lane_processes.add(r["process"])
         # Target::get records a READ for the lane it selects inside update():
         # now is when the selection was judged, publish the producer's time.
-        if r["kind"] == "READ" and TARGET_LANE.fullmatch(r["topic"]):
+        if r["kind"] == "READ" and is_target_lane(r["topic"]):
             tick_ages.setdefault(r["process"] + ":" + r["topic"], []).append(
                 r["now_ms"] - r["publish_ms"])
         if r["kind"] == "TIMER":

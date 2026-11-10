@@ -46,6 +46,7 @@ cc_library(
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/introspection:names",
         "//talOS/node:testing",
     ],
 )

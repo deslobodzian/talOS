@@ -1,7 +1,9 @@
 # Names
 
 `talOS/introspection/names.h` is the authority; the launcher checks every name
-before it spawns anything (`--describe-only` runs the same check and exits).
+before it spawns anything (`--describe-only` runs the same check and exits),
+and `talos_messages` refuses a malformed topic when its `BUILD` file loads
+(`contract.bzl`, held to `names.h` by `//talOS/build:topic_grammar_test`).
 
 ## Topics
 
@@ -26,7 +28,11 @@ doubled or trailing `_`.
   | `command` | anyone but the owner | actuator instruction, already resolved |
 
 - **qualifier**: the source or variant, e.g. `teleop`, `auto`. Target sources
-  in `[robot.targets]` and `[targets]` follow the segment rules; see
+  in `[robot.targets]` and `[targets]` follow the segment rules. A target
+  lane is exactly `/<subsystem>/target/<source>`, a valid name of three
+  segments (`naming::IsTargetLane`). Producers build it with
+  `naming::TargetLaneTopic`; the consumer subscribes to the relative
+  `target/<source>`, resolved by its node. See
   [target lanes](../ARCHITECTURE.md#targets).
 
 Abbreviations are rejected (`tgt`, `cmd`, `req`, `ds`, `dt`, `drive`, `odom`,

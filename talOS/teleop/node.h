@@ -525,7 +525,8 @@ class Teleop {
           "target policy");
     }
 
-    const std::string lane_topic = "/" + sub_name + "/target/teleop";
+    const std::string lane_topic =
+        introspect::naming::TargetLaneTopic(sub_name, "teleop");
     const introspect::naming::SourceShape* reader = nullptr;
     for (const auto& node_desc : graph) {
       for (const auto& src : node_desc.sources) {

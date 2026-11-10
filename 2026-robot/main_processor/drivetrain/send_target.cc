@@ -21,6 +21,7 @@
 #include "talOS/devices/target.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/introspection/names.h"
 #include "talOS/ipc/publisher.h"
 #include "talOS/ipc/subscriber.h"
 
@@ -66,7 +67,8 @@ int main(int argc, char** argv) {
       throw std::invalid_argument("invalid target");
     }
     using Envelope = talos::TargetEnvelope<drivetrain::ChassisTarget>;
-    ipc::Publisher<Envelope> publisher{"/drivetrain/target/" + source};
+    ipc::Publisher<Envelope> publisher{
+        talos::introspect::naming::TargetLaneTopic("drivetrain", source)};
     ipc::Subscriber<talos::hardware::Packet> driver_station{
         talos::hardware::kDriverStationTopic,
         RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};

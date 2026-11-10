@@ -71,6 +71,7 @@ cc_binary(
         "//talOS/driver_station",
         "//talOS/events:events_os",
         "//talOS/hardware",
+        "//talOS/introspection:names",
         "//talOS/ipc",
     ],
 )
@@ -84,6 +85,7 @@ cc_binary(
         ":swerve",
         "//talOS/devices",
         "//talOS/hardware",
+        "//talOS/introspection:names",
         "//talOS/ipc",
         "//talOS/process",
     ],

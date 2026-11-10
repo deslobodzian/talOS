@@ -228,12 +228,98 @@ _flatc_py_tree = rule(
     },
 )
 
+# The topic grammar of talOS/NAMING.md, mirroring naming::CheckTopicName in
+# talOS/introspection/names.h (the authority). //talOS/build:topic_grammar_test
+# checks that the two agree on a set of names and that these tables hold
+# exactly names.h's roles, abbreviations and direction suffixes.
+_MAX_TOPIC_BYTES = 31
+_MAX_SEGMENT_BYTES = 24
+TALOS_TOPIC_ROLES = ["state", "status", "event", "telemetry", "target", "request", "command"]
+TALOS_TOPIC_ABBREVIATIONS = {
+    "acc": "acceleration",
+    "cfg": "config",
+    "cmd": "command",
+    "cnt": "count",
+    "drive": "drivetrain",
+    "ds": "driver_station",
+    "dt": "drivetrain",
+    "idx": "index",
+    "msg": "message",
+    "odom": "odometry",
+    "pkt": "packet",
+    "pos": "position",
+    "req": "request",
+    "st": "state",
+    "stat": "status",
+    "tgt": "target",
+    "tlm": "telemetry",
+    "vel": "velocity",
+}
+TALOS_TOPIC_DIRECTION_SUFFIXES = ["_in", "_out", "_pub", "_sub", "_tx", "_rx", "_topic", "_send", "_recv"]
+_LOWERCASE = "abcdefghijklmnopqrstuvwxyz"
+_SEGMENT_CHARACTERS = _LOWERCASE + "0123456789_"
+_SEGMENT_KINDS = ["owner", "role", "qualifier", "qualifier"]
+
+def _segment_problem(segment, what):
+    quoted = "%s '%s'" % (what, segment)
+    if not segment:
+        return what + " is empty"
+    if len(segment) > _MAX_SEGMENT_BYTES:
+        return "%s is %d characters; the limit is %d" % (quoted, len(segment), _MAX_SEGMENT_BYTES)
+    if segment[0] not in _LOWERCASE.elems():
+        return quoted + " must start with a lowercase letter"
+    for c in segment.elems():
+        if c not in _SEGMENT_CHARACTERS.elems():
+            return quoted + " contains '%s'; segments are lowercase letters, digits and underscores" % c
+    if "__" in segment:
+        return quoted + " has a doubled underscore"
+    if segment.endswith("_"):
+        return quoted + " ends with an underscore"
+    if segment in TALOS_TOPIC_ABBREVIATIONS:
+        return quoted + " is an abbreviation; use '%s'" % TALOS_TOPIC_ABBREVIATIONS[segment]
+    for suffix in TALOS_TOPIC_DIRECTION_SUFFIXES:
+        if len(segment) > len(suffix) and segment.endswith(suffix):
+            return quoted + " encodes direction in '%s'; direction belongs to the endpoint, not the name" % suffix
+    return None
+
+def talos_topic_problem(topic):
+    """Why `topic` breaks the naming grammar (talOS/NAMING.md), or None.
+
+    Args:
+      topic: a topic name such as "/drivetrain/target/teleop".
+
+    Returns:
+      A message naming the broken rule, or None for a valid name.
+    """
+    quoted = "topic '%s'" % topic
+    if not topic:
+        return "topic name is empty"
+    if not topic.startswith("/"):
+        return quoted + " must start with '/'"
+    if len(topic) > _MAX_TOPIC_BYTES:
+        return "%s is %d characters; the limit is %d" % (quoted, len(topic), _MAX_TOPIC_BYTES)
+    if topic.endswith("/"):
+        return quoted + " ends with '/'"
+    if "//" in topic:
+        return quoted + " has an empty segment"
+    segments = topic[1:].split("/")
+    if len(segments) < 2 or len(segments) > 4:
+        return quoted + " has %d segments; the form is /owner/role[/qualifier[/qualifier]]" % len(segments)
+    for i, segment in enumerate(segments):
+        problem = _segment_problem(segment, _SEGMENT_KINDS[i])
+        if problem:
+            return quoted + ": " + problem
+    if segments[1] not in TALOS_TOPIC_ROLES:
+        return quoted + ": role '%s' is not one of %s" % (segments[1], ", ".join(TALOS_TOPIC_ROLES))
+    return None
+
 def _check_topics(topics):
     for key, topic in topics.items():
         if not key or not key[0].isalpha() or not key.replace("_", "a").isalnum() or key.lower() != key:
             fail("talos_messages: topic key %r must be a lower_snake_case name" % key)
-        if not topic.startswith("/") or not topic.replace("/", "a").replace("_", "a").replace("-", "a").replace(".", "a").isalnum():
-            fail("talos_messages: topic %r must be /-separated [A-Za-z0-9_.-] segments" % topic)
+        problem = talos_topic_problem(topic)
+        if problem:
+            fail("talos_messages: %s (talOS/NAMING.md)" % problem)
 
 def _heredoc_genrule(name, out, content):
     native.genrule(

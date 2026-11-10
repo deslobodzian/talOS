@@ -226,15 +226,11 @@ std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
                                     std::size_t alignment,
                                     const schema::Identity& message) {
   const std::size_t envelope = TargetEnvelopeBytes(bytes, alignment);
-  for (const auto& [segment, what] :
-       {std::pair{subsystem, "target lane subsystem"},
-        std::pair{source, "target lane source"}}) {
-    if (auto problem = introspect::naming::CheckSegmentName(segment, what)) {
-      throw std::invalid_argument(std::string{node.name()} + ": " + *problem);
-    }
+  if (auto problem = introspect::naming::CheckTargetLane(subsystem, source)) {
+    throw std::invalid_argument(std::string{node.name()} + ": " + *problem);
   }
   const std::string topic =
-      "/" + std::string{subsystem} + "/target/" + std::string{source};
+      introspect::naming::TargetLaneTopic(subsystem, source);
   auto& lanes = node.extension<Targets>().lanes;
   lanes.push_back(LaneState{
       .publisher = NodeAccess::add_publisher(

@@ -1959,7 +1959,7 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
         std::any_of(described.declared.sources.begin(),
                     described.declared.sources.end(), [](const auto& source) {
                       return source.kind == event::SourceKind::SENDER &&
-                             source.name.find("/target/") != std::string::npos;
+                             naming::IsTargetLane(source.name);
                     });
     if (!spec.critical && (spec.owns_actuators || writes_targets)) {
       probe_findings.push_back(

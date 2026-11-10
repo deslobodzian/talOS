@@ -14,6 +14,7 @@
 #include <iterator>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -337,10 +338,43 @@ using TargetModeSources =
              std::map<std::string, std::vector<std::string>, std::less<>>,
              std::less<>>;
 
-// A target lane is `/<sub>/target/<source>`.
+// A target lane is `/<subsystem>/target/<source>`: a valid topic name of
+// exactly three segments whose role is `target`. C++ recognises a lane only
+// through IsTargetLane, and producers and test helpers build one only through
+// TargetLaneTopic; a consumer (talos::Target) subscribes to the relative
+// `target/<source>`, which its node resolves (and may remap). session_report.py
+// and contract.bzl mirror the grammar.
 inline bool IsTargetLane(std::string_view topic) {
+  if (CheckTopicName(topic)) return false;
   const auto segments = detail::Segments(topic);
   return segments.size() == 3 && segments[1] == "target";
+}
+
+namespace detail {
+// Unchecked: LintGraph names a policy lane even when it would be malformed.
+inline std::string JoinTargetLane(std::string_view subsystem,
+                                  std::string_view source) {
+  return "/" + std::string{subsystem} + "/target/" + std::string{source};
+}
+}  // namespace detail
+
+// Why `/<subsystem>/target/<source>` is not a target lane, or nullopt.
+inline std::optional<std::string> CheckTargetLane(std::string_view subsystem,
+                                                  std::string_view source) {
+  if (auto problem = CheckSegmentName(subsystem, "target lane subsystem"))
+    return problem;
+  if (auto problem = CheckSegmentName(source, "target lane source"))
+    return problem;
+  return CheckTopicName(detail::JoinTargetLane(subsystem, source));
+}
+
+// The lane `/<subsystem>/target/<source>`; std::invalid_argument with
+// CheckTargetLane's reason when the parts do not make one.
+inline std::string TargetLaneTopic(std::string_view subsystem,
+                                   std::string_view source) {
+  if (auto problem = CheckTargetLane(subsystem, source))
+    throw std::invalid_argument(*problem);
+  return detail::JoinTargetLane(subsystem, source);
 }
 
 // Everything checkable about a whole graph, errors first.
@@ -571,7 +605,7 @@ inline std::vector<Diagnostic> LintGraph(
         bool has_writer = false;
         std::vector<std::string> lanes;
         for (const auto& source : sources) {
-          lanes.push_back("/" + node.name + "/target/" + source);
+          lanes.push_back(detail::JoinTargetLane(node.name, source));
           const auto topic = std::find_if(topics.begin(), topics.end(),
                                           [&lanes](const TopicFacts& facts) {
                                             return facts.name == lanes.back();

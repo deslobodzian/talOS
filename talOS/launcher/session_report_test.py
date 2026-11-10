@@ -132,6 +132,16 @@ class SessionReportTest(unittest.TestCase):
         self.assertIn("running | -1 | 9 | running", rows[2])
         self.assertIn("2 runs after the first dropped", rows[3])
 
+    def test_target_lanes_follow_the_naming_grammar(self):
+        # Mirrors naming::IsTargetLane: only a lane's records count as target
+        # traffic.
+        for topic in ("/lift/target/teleop", "/drivetrain/target/align_2"):
+            self.assertTrue(session_report.is_target_lane(topic), topic)
+        for topic in ("/Lift/target/teleop", "/lift/target/tele__op",
+                      "/lift/target/teleop_", "/lift/target/2nd",
+                      "/lift/target/" + "s" * 19, "/lift/target/teleop/x"):
+            self.assertFalse(session_report.is_target_lane(topic), topic)
+
     def test_empty_session_has_no_pass(self):
         report = session_report.analyze({"nodes": []}, [])
         self.assertTrue(all(v["verdict"] == "NOT MEASURED" for v in report["verdicts"]))

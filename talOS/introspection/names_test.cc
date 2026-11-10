@@ -8,9 +8,12 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -86,6 +89,38 @@ TEST(TopicName, AcceptsAndRejectsPerTheNamingRules) {
            std::string{"/odometry/state_topic"},
        }) {
     EXPECT_TRUE(CheckTopicName(name).has_value()) << name;
+  }
+}
+
+TEST(TargetLane, OneGrammarRecognisesAndBuildsLanes) {
+  EXPECT_EQ(TargetLaneTopic("drivetrain", "teleop"),
+            "/drivetrain/target/teleop");
+  EXPECT_TRUE(IsTargetLane("/drivetrain/target/teleop"));
+
+  // A source and subsystem must each be a segment, and the lane must fit the
+  // transport's 31 bytes.
+  for (const auto& [subsystem, source] :
+       std::initializer_list<std::pair<std::string_view, std::string_view>>{
+           {"drivetrain", "Teleop"},
+           {"drivetrain", "tele/op"},
+           {"drivetrain", ""},
+           {"drivetrain", "cmd"},
+           {"drivetrain", "auto_"},
+           {"Drivetrain", "teleop"},
+           {"drivetrain", "a_source_that_is_long"},
+       }) {
+    EXPECT_TRUE(CheckTargetLane(subsystem, source).has_value()) << source;
+    EXPECT_THROW(TargetLaneTopic(subsystem, source), std::invalid_argument)
+        << subsystem << " " << source;
+  }
+
+  // Not lanes, though each contains "target": the launcher's critical = false
+  // rule for target producers must not apply to their writers.
+  for (const auto* topic :
+       {"/target/state", "/drivetrain/target", "/drivetrain/target/a/b",
+        "/drivetrain/state/target/x", "/Drivetrain/target/teleop",
+        "/drivetrain/target/teleop_"}) {
+    EXPECT_FALSE(IsTargetLane(topic)) << topic;
   }
 }
 
