@@ -198,7 +198,7 @@ bazel test --test_output=errors --runs_per_test=3 \
 # Three independent twelve-second scenarios; print each report and mean/min/max.
 bazel run //2026-robot/main_processor/simulation:accuracy_scenario
 
-# Retain the original input logs, odometry replay, launcher diagnostics and report.
+# Retain the original input logs, every replay, launcher diagnostics and report.
 bazel run //2026-robot/main_processor/simulation:accuracy_scenario -- \
   --duration-s 12 --output-dir /tmp/talos-accuracy
 
@@ -223,9 +223,10 @@ rotates the waypoint about the field centre. The moderate preset is
 The launcher owns the physics gateway and forwards the preset plus
 `--mode-schedule disabled:1,auto:N`. Duration and `--repeat` must be positive
 integers; the report tool defaults to three independent scenarios because
-single-session accuracy varies. Each retains its five-row and timing tables,
-followed by mean/min/max position and heading RMS for each row. `--output-dir`
-also retains `summary.md`. CI stays one short scenario, not the CLI repeat loop.
+single-session accuracy varies. Each retains its run/backend and timing
+tables, followed by mean/min/max position and heading RMS for each run and
+backend. `--output-dir` also retains `summary.md`. CI stays one short
+scenario, not the CLI repeat loop.
 Loopback ports and shared-memory namespaces are unique per physical session.
 Negative radius error and acceleration-dependent slip both reduce ground
 travel relative to encoder-derived odometry, rather than partly cancelling.
@@ -246,16 +247,21 @@ Only the renderer/projector sees the true mounting transform; localization
 keeps the configured mount. These deterministic camera-specific errors model
 calibration bias separately from pixel noise.
 
-The report has five rows:
+The report has one row per run and `pose_estimator` backend (`kalman` and
+`factor_graph`, `BACKENDS` in `accuracy.py`). Every backend re-runs the
+estimator on the same recorded sessions with
+`launcher --replay-inputs SESSION --only pose_estimator`, on the same
+virtual-clock timer schedule and recorded inputs, so backend rows of one run
+compare identical inputs:
 
-- **odometry-only** and **fused** both re-run the baseline estimator with
-  `launcher --replay-inputs SESSION --only pose_estimator`, on the same
-  virtual-clock timer schedule and recorded drivetrain inputs. Only
+- **odometry-only** and **fused** replay the baseline session. Only
   **odometry-only** disables camera subscriptions.
-- **fused-live** is the original live session, including the mount-error preset.
-- **fused-lag-uncorrected** uses the same moderate/mount-error presets plus
-  `camera.sim_timestamp_lag_us = 40000`, with `latency_offset_us = 0`.
-- **fused-lag-corrected** uses the same lag and
+- **fused-live** is the original live baseline session, including the
+  mount-error preset. It runs the backend configured in
+  `subsystems/pose_estimator.toml` and has only that backend's row.
+- **fused-lag-uncorrected** replays a session with the same moderate/mount-error
+  presets plus `camera.sim_timestamp_lag_us = 40000`, with `latency_offset_us = 0`.
+- **fused-lag-corrected** replays a session with the same lag and
   `camera.latency_offset_us = 40000`, restoring exposure timestamps.
 
 The 40 ms lag corresponds to 8 cm at the routine's configured 2 m/s maximum,
@@ -264,20 +270,22 @@ physical session. Both delay delivery until exposure time + 40 ms, so the
 uncorrected case measures time-alignment error rather than future-stamp
 rejection. The normal physics config injects no lag. The sole lag constant is
 `TIMESTAMP_LAG_US` in `accuracy.py`; the overlay tool owns all three live configs.
-The existing per-camera consistency table is scored from the baseline fused run.
+The existing per-camera consistency table is scored from the baseline live session.
 The lag-session RMS comparison is reported, not gated: independent real-time
-sessions have scheduling variance larger than the correction gain. CI requires
-accepted observations in both lag runs; it gates paired virtual-clock
-fused-vs-odometry improvement when camera throughput is sufficient, and always
-gates absolute 0.15 m / 3-degree RMS limits for replay and live fusion.
+sessions have scheduling variance larger than the correction gain. For every
+backend, CI requires accepted observations in both lag runs; it gates paired
+virtual-clock fused-vs-odometry improvement when camera throughput is
+sufficient, and always gates absolute 0.15 m / 3-degree RMS limits for replay
+and (for the configured backend) live fusion.
 Timestamp correction arithmetic is covered by
 `VisionTest.CaptureTimestampCorrectionIsSharedWithLiveFrames`.
 
 Live and replay configs flatten `robot_physics_sim.toml` onto `robot.toml`,
 preserving all non-include override tables with `tomllib`. Live overlays add
-mount errors and timing settings; the fused replay reuses that live config,
-while odometry replay sets `[subsystems.pose_estimator] cameras = []` with no
-camera-error overlay. Mount/timing errors cannot affect odometry-only replay.
+mount errors and timing settings; each fused replay reuses its session's live
+overlay plus `[subsystems.pose_estimator] backend`, while odometry replay sets
+`[subsystems.pose_estimator] cameras = []` and `backend` with no camera-error
+overlay. Mount/timing errors cannot affect odometry-only replay.
 Physics overrides have one source and no whole robot/subsystem files are copied.
 Replay reuses the session ID solely so the log merger aligns records with
 the original camera/drivetrain logs; output logs stay in separate `*-replay`
@@ -317,25 +325,26 @@ startup observations).
 The report command exits nonzero only for tool/session/scoring failures,
 not poor accuracy. The exclusive CI test uses the **same runner and scorer**
 with eight autonomous seconds for the baseline and four seconds for each lag
-session. Fused replay must improve on odometry-only RMS when all baseline
+session. For each backend, fused replay must improve on that backend's
+odometry-only RMS when all baseline
 cameras capture at least two thirds of scheduled deadlines (at least 40 of the
 requested 60 fps), report a positive mean frame period no larger than 25 ms,
 and process at least 95% of captured frames. These are input-health prerequisites,
 chosen to require a majority of the requested stream and near-complete processing,
-not fitted to position RMS or CPU architecture. Every run reports the paired RMS
-difference; insufficient throughput prints **Fusion improvement NOT EVALUATED**
+not fitted to position RMS or CPU architecture. Every run reports each backend's
+paired RMS difference; insufficient throughput prints **Fusion improvement NOT EVALUATED**
 with per-camera period/capture/drop/processing evidence in the report and test
 output. This is not a skipped test: equal paired sample counts, accepted
 observations and both replayed/live 0.15 m position and 3-degree heading RMS
-limits remain unconditional. A host provisioned to sustain the camera pipeline
-can require health as well with
+limits remain unconditional, and the two backends' fused rows must differ.
+A host provisioned to sustain the camera pipeline can require health as well with
 `--test_env=TALOS_ACCURACY_REQUIRE_CAMERA_HEALTH=1`; generic CI does not infer
-host capacity from the OS or architecture.
+host capacity from the OS or architecture. Comparing live fusion
 against offline odometry alone is not a same-input experiment: live polling
 can skip drivetrain samples and process cameras at different odometry-buffer
-positions when the host is delayed. Both paired replays instead consume the
+positions when the host is delayed. All replays of a session instead consume the
 same published inputs on the same simulated schedule, without changing the
-product's timestamp or latency compensation. The lag sessions must both accept
+product's timestamp or latency compensation. Each backend's lag replays must both accept
 observations; their RMS difference and ratio remain a report, not a CI gate.
 The deterministic estimator regression
 `EstimatorTest.test_a_delayed_observation_corrects_the_estimate` remains an

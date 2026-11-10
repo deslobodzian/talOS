@@ -43,8 +43,11 @@ MOUNT_ERROR_PRESET = {
 }
 # At the routine's 2 m/s limit, 40 ms is 8 cm: above the 2 cm xy floor.
 TIMESTAMP_LAG_US = 40_000
+# Report row order; each row is scored once per backend that produced it.
 RUNS = ("odometry-only", "fused", "fused-live", "fused-lag-uncorrected",
         "fused-lag-corrected")
+# Every pose_estimator `backend`; each replays the same recorded sessions.
+BACKENDS = ("kalman", "factor_graph")
 
 
 @dataclass(frozen=True)
@@ -312,15 +315,21 @@ def timing_markdown(results):
     return "\n".join(lines)
 
 
+def rows(results):
+    """(run, backend) rows in RUNS order, with a run's backends adjacent."""
+    return [(run, backend) for run in RUNS for backend in BACKENDS
+            if (run, backend) in results["metrics"]]
+
+
 def markdown(results):
     lines = [
-        "| Run | Samples | Position RMS (m) | Position max (m) | Heading RMS (deg) | Heading max (deg) | Final position (m) | Final heading (deg) | Accepted | Rejected |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Run | Backend | Samples | Position RMS (m) | Position max (m) | Heading RMS (deg) | Heading max (deg) | Final position (m) | Final heading (deg) | Accepted | Rejected |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for name in RUNS:
-        m = results[name]
+    for run, backend in rows(results):
+        m = results["metrics"][(run, backend)]
         lines.append(
-            f"| {name} | {m.samples} | {m.position_rms_m:.4f} | "
+            f"| {run} | {backend} | {m.samples} | {m.position_rms_m:.4f} | "
             f"{m.position_max_m:.4f} | {m.heading_rms_deg:.3f} | "
             f"{m.heading_max_deg:.3f} | {m.final_position_m:.4f} | "
             f"{m.final_heading_deg:.3f} | {m.accepted} | {m.rejected} |")
@@ -343,14 +352,15 @@ def summary_markdown(scenarios):
     if not scenarios:
         raise ValueError("at least one scenario is required for a summary")
     lines = [
-        "| Run | Position RMS mean (m) | min (m) | max (m) | Heading RMS mean (deg) | min (deg) | max (deg) |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Run | Backend | Position RMS mean (m) | min (m) | max (m) | Heading RMS mean (deg) | min (deg) | max (deg) |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
-    for name in RUNS:
-        cells = [name]
+    for row in rows(scenarios[0]):
+        cells = list(row)
         for field, precision in (("position_rms_m", 4),
                                  ("heading_rms_deg", 3)):
-            values = [getattr(result[name], field) for result in scenarios]
+            values = [getattr(result["metrics"][row], field)
+                      for result in scenarios]
             cells.extend(f"{value:.{precision}f}" for value in
                          (sum(values) / len(values), min(values), max(values)))
         lines.append("| " + " | ".join(cells) + " |")
@@ -432,13 +442,33 @@ def overlay_config(physics_config, subsystem_overrides):
     return f"include = {json.dumps(str(base))}\n\n" + "\n".join(tables(overrides)) + "\n"
 
 
-def replay_config(physics_config):
+def configured_backend(physics_config):
+    """The backend a live session runs: the physics overlay's, else the one in
+    the pose_estimator subsystem file that the included robot config names."""
+    overrides = tomllib.loads(physics_config.read_text(encoding="utf-8"))
+    backend = overrides.get("subsystems", {}).get(
+        "pose_estimator", {}).get("backend")
+    if backend is not None:
+        return backend
+    base = physics_config.parent / overrides["include"]
+    for entry in tomllib.loads(base.read_text(encoding="utf-8")).get(
+            "subsystems", []):
+        if entry.get("name") == "pose_estimator":
+            subsystem = base.parent / entry["path"]
+            return tomllib.loads(subsystem.read_text(
+                encoding="utf-8"))["subsystem"]["backend"]
+    raise ValueError(f"no pose_estimator subsystem in {base}")
+
+
+def replay_config(physics_config, backend):
     # The replay has no camera consumers and receives no mounting-error overlay.
-    return overlay_config(physics_config, {"pose_estimator": {"cameras": []}})
+    return overlay_config(physics_config, {
+        "pose_estimator": {"cameras": [], "backend": backend}})
 
 
 def scenario_config(physics_config, min_yaw_std_rad=None,
-                    timestamp_lag_us=0, latency_offset_us=0):
+                    timestamp_lag_us=0, latency_offset_us=0, backend=None):
+    """Live camera overlays; `backend` also selects the estimator (replays)."""
     overrides = {
         name: {"camera": dict(error, sim_timestamp_lag_us=timestamp_lag_us,
                                latency_offset_us=latency_offset_us)}
@@ -446,12 +476,15 @@ def scenario_config(physics_config, min_yaw_std_rad=None,
     if min_yaw_std_rad is not None:
         for values in overrides.values():
             values["min_yaw_std_rad"] = min_yaw_std_rad
+    if backend is not None:
+        overrides["pose_estimator"] = {"backend": backend}
     return overlay_config(physics_config, overrides)
 
 
 def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
-                 lag_duration_s=None):
-    """Score paired input replays, their live source, and two lag sessions."""
+                 lag_duration_s=None, backends=BACKENDS):
+    """Score each backend's input replays of three live sessions, plus the
+    configured backend's live estimate of the baseline session."""
     started = time.monotonic()
     if lag_duration_s is None:
         lag_duration_s = duration_s
@@ -462,6 +495,8 @@ def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
     if min_yaw_std_rad is not None and (
             not math.isfinite(min_yaw_std_rad) or min_yaw_std_rad < 0):
         raise ValueError("yaw std floor must be finite and nonnegative")
+    if not backends or any(backend not in BACKENDS for backend in backends):
+        raise ValueError(f"backends must be a nonempty subset of {BACKENDS}")
     files = runfiles.Create()
     config = Path(files.Rlocation("_main/" + CONFIG))
     launcher = Path(files.Rlocation("_main/talOS/launcher/launcher"))
@@ -475,7 +510,8 @@ def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
                TALOS_SHM_NAMESPACE=f"accuracy-{uuid.uuid4().hex}")
     # Preserve the runfiles binary layout instead of using the source workspace.
     env.pop("BUILD_WORKSPACE_DIRECTORY", None)
-    results = {"timing": {}}
+    live_backend = configured_backend(config)
+    results = {"metrics": {}, "timing": {}}
     with tempfile.TemporaryDirectory(prefix="accuracy-launcher-") as temporary:
         cwd = Path(temporary)
         (cwd / "bazel-bin").symlink_to(root, target_is_directory=True)
@@ -511,31 +547,38 @@ def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
             records = dump_records(dumper, cameras, drivetrain,
                                    session / "pose_estimator.tlog", env)
             live_name = "fused-live" if name == "fused" else name
-            results[live_name] = score(records)
             results["timing"][live_name] = camera_timing(records)
-            if name != "fused":
-                continue
-            results["cameras"] = score_cameras(records)
-            derived = destination / "odometry_only.toml"
-            derived.write_text(replay_config(config), encoding="utf-8")
-            # Both estimators must run on the same virtual-clock schedule.
-            # Comparing live fusion with offline odometry also compares host
-            # scheduling: live polling can skip different drivetrain samples
-            # and deliver cameras at different odometry-buffer positions.
-            for replay_name, replay_path in (
-                    ("fused", live_config), ("odometry-only", derived)):
+            replays = [(name, backend, scenario_config(
+                config, min_yaw_std_rad, lag_us, offset_us, backend))
+                for backend in backends]
+            if name == "fused":
+                results["metrics"][("fused-live", live_backend)] = score(records)
+                results["cameras"] = score_cameras(records)
+                replays.extend(
+                    ("odometry-only", backend, replay_config(config, backend))
+                    for backend in backends)
+            # Every backend and odometry-only run on the same virtual-clock
+            # schedule and inputs. Comparing live fusion with offline odometry
+            # also compares host scheduling: live polling can skip different
+            # drivetrain samples and deliver cameras at different
+            # odometry-buffer positions.
+            for run, backend, text in replays:
+                label = f"{run}-{backend}-replay"
+                replay_config_path = destination / f"{label}.toml"
+                replay_config_path.write_text(text, encoding="utf-8")
                 run_launcher(
                     launcher,
-                    ["--config", str(replay_path),
+                    ["--config", str(replay_config_path),
                      "--replay-inputs", str(session),
                      "--only", "pose_estimator", "--session-id", session.name,
-                     "--output-dir", str(destination / f"{replay_name}-replay")],
-                    cwd, env, destination / f"{replay_name}-replay.txt", 90)
+                     "--output-dir", str(destination / label)],
+                    cwd, env, destination / f"{label}.txt", 90)
                 # Input replay writes a node log, not a session manifest.
-                replay = destination / f"{replay_name}-replay" / session.name
-                records = dump_records(dumper, cameras, drivetrain,
-                                       replay / "pose_estimator.tlog", env)
-                results[replay_name] = score(records)
+                replayed = dump_records(
+                    dumper, cameras, drivetrain,
+                    destination / label / session.name / "pose_estimator.tlog",
+                    env)
+                results["metrics"][(run, backend)] = score(replayed)
     results["runtime_s"] = time.monotonic() - started
     (destination / "report.md").write_text(markdown(results) + "\n", encoding="utf-8")
     return results, destination

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from accuracy import (CAMERAS, RUNS, CameraTiming, Metrics,
+from accuracy import (BACKENDS, CAMERAS, RUNS, CameraTiming, Metrics,
                       camera_health_issues, camera_timing, interpolate_truth,
                       markdown, run_scenario, score, score_cameras,
                       summary_markdown)
@@ -143,12 +143,15 @@ class ScoringTest(unittest.TestCase):
                 self.assertEqual(len(issues), 1)
 
     def test_health_condition_reports_inversion_and_capable_host_fails(self):
-        # A worse fused RMS must fail on healthy inputs, but is not evidence
-        # of a fusion regression when the capture prerequisite is unmet.
-        results = {
-            name: Metrics(10, 0.10 if name == "odometry-only" else 0.11,
-                          0.12, 1, 2, 0.1, 1, 1, 0)
-            for name in RUNS}
+        # A worse fused RMS from any backend must fail on healthy inputs, but
+        # is not evidence of a fusion regression when the capture
+        # prerequisite is unmet. Only factor_graph's fused replay is worse.
+        def metrics(run, backend):
+            rms = (0.10 if run == "odometry-only" else
+                   0.11 if (run, backend) == ("fused", "factor_graph") else 0.09)
+            return Metrics(10, rms, 0.12, 1, 2, 0.1, 1, 1, 0)
+        results = {"metrics": {(run, backend): metrics(run, backend)
+                               for run in RUNS for backend in BACKENDS}}
         timings = {camera: CameraTiming(16_667, 0, 500, 500)
                    for camera in CAMERAS}
         results["timing"] = {
@@ -180,32 +183,45 @@ class AccuracyScenarioTest(unittest.TestCase):
             results, _ = run_scenario(8, directory, lag_duration_s=4)
             table = markdown(results)
             print("\n" + table, flush=True)
-            fused, odometry = results["fused"], results["odometry-only"]
-            # These rows share virtual timer firings as well as recorded input
-            # payloads. The live source is separately subject to host scheduling.
-            self.assertEqual(fused.samples, odometry.samples, table)
+            metrics = results["metrics"]
             issues = camera_health_issues(results["timing"]["fused-live"])
             if os.environ.get("TALOS_ACCURACY_REQUIRE_CAMERA_HEALTH") == "1":
                 self.assertFalse(issues, table)
-            improvement = odometry.position_rms_m - fused.position_rms_m
-            print(f"Paired fusion position RMS improvement: {improvement:.4f} m; "
-                  + ("REQUIRED (camera throughput sufficient)" if not issues else
-                     "NOT EVALUATED (INSUFFICIENT camera throughput)"),
-                  flush=True)
-            if not issues:
-                self.assertLess(fused.position_rms_m, odometry.position_rms_m, table)
-            for result in (fused, results["fused-live"]):
-                self.assertLess(result.position_rms_m, 0.15, table)
-                self.assertLess(result.heading_rms_deg, 3, table)
-                self.assertGreater(result.accepted, 0, table)
-            uncorrected = results["fused-lag-uncorrected"]
-            corrected = results["fused-lag-corrected"]
-            self.assertGreater(uncorrected.accepted, 0, table)
-            self.assertGreater(corrected.accepted, 0, table)
-            print("Latency correction position RMS improvement: "
-                  f"{uncorrected.position_rms_m - corrected.position_rms_m:.4f} m "
-                  f"({uncorrected.position_rms_m / corrected.position_rms_m:.2f}x)",
-                  flush=True)
+            # Identical rows would mean the backend never reached the replay.
+            self.assertNotEqual(metrics[("fused", "kalman")],
+                                metrics[("fused", "factor_graph")], table)
+            for backend in BACKENDS:
+                with self.subTest(backend=backend):
+                    fused = metrics[("fused", backend)]
+                    odometry = metrics[("odometry-only", backend)]
+                    # These rows share virtual timer firings as well as
+                    # recorded input payloads. The live source is separately
+                    # subject to host scheduling.
+                    self.assertEqual(fused.samples, odometry.samples, table)
+                    improvement = odometry.position_rms_m - fused.position_rms_m
+                    print(f"{backend} paired fusion position RMS improvement: "
+                          f"{improvement:.4f} m; "
+                          + ("REQUIRED (camera throughput sufficient)"
+                             if not issues else
+                             "NOT EVALUATED (INSUFFICIENT camera throughput)"),
+                          flush=True)
+                    if not issues:
+                        self.assertLess(fused.position_rms_m,
+                                        odometry.position_rms_m, table)
+                    live = metrics.get(("fused-live", backend))
+                    for result in (fused,) if live is None else (fused, live):
+                        self.assertLess(result.position_rms_m, 0.15, table)
+                        self.assertLess(result.heading_rms_deg, 3, table)
+                        self.assertGreater(result.accepted, 0, table)
+                    uncorrected = metrics[("fused-lag-uncorrected", backend)]
+                    corrected = metrics[("fused-lag-corrected", backend)]
+                    self.assertGreater(uncorrected.accepted, 0, table)
+                    self.assertGreater(corrected.accepted, 0, table)
+                    print(f"{backend} latency correction position RMS "
+                          "improvement: "
+                          f"{uncorrected.position_rms_m - corrected.position_rms_m:.4f} m "
+                          f"({uncorrected.position_rms_m / corrected.position_rms_m:.2f}x)",
+                          flush=True)
 
 
 if __name__ == "__main__":
