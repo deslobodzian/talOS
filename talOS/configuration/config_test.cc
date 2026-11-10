@@ -374,6 +374,37 @@ TEST_F(ManifestTest, RejectsUnknownDeviceKeysInDefaults) {
   EXPECT_THROW(ParseRobotConfig(Robot()), std::invalid_argument);
 }
 
+// `[target]` for `[targets]` would otherwise parse as a node parameter and
+// leave the subsystem on the default target policy.
+TEST_F(ManifestTest, RefusesASingularSectionNamingTheKeyAndFile) {
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"arm\"\npath = \"subsystems/arm.toml\"\n");
+  const auto expect_refused = [this](const std::string& file) {
+    try {
+      ParseRobotConfig(Robot());
+      ADD_FAILURE() << "a [target] section in " << file << " was accepted";
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find(file), std::string::npos) << what;
+      EXPECT_NE(what.find("'target'"), std::string::npos) << what;
+    }
+  };
+  Write("subsystems/arm.toml",
+        "[subsystem]\nname = \"arm\"\n[target]\nteleop = [\"align\"]\n");
+  expect_refused("subsystems/arm.toml");
+  // In a defaults file, the error names the defaults file, not the
+  // subsystem file the key would have been merged into.
+  Write("subsystems/arm.toml",
+        "[subsystem]\nname = \"arm\"\ndefaults = \"base.toml\"\n");
+  Write("subsystems/base.toml", "[target]\nteleop = [\"align\"]\n");
+  expect_refused("subsystems/base.toml");
+  // The single-file form is refused too.
+  EXPECT_THROW(ParseRobotConfigString("[subsystems.arm.target]\nteleop = "
+                                      "[\"align\"]\n" +
+                                      std::string(kMotor)),
+               std::invalid_argument);
+}
+
 TEST_F(ManifestTest, MergesSubsystemFilesAndKeepsTopLevelTables) {
   Write("robot.toml", R"(
 [robot]

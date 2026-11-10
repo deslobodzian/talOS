@@ -242,6 +242,46 @@ inline void CheckTopLevelKeys(const toml::table& tbl) {
   }
 }
 
+// A subsystem table also carries its node's own parameters (Node::param), so
+// a key the framework does not know cannot be refused. A framework section
+// spelled in the singular can: `[subsystems.arm.target]` would otherwise
+// leave arm on the default target policy, and `[subsystems.arm.motor.x]`
+// would leave the motor unconfigured, both silently. `where` names the table
+// or the file holding it.
+inline void CheckSubsystemKeys(const toml::table& tbl,
+                               const std::string& where) {
+  static constexpr std::pair<std::string_view, std::string_view> kSections[] = {
+      {"target", "targets"},
+      {"motor", "motors"},
+      {"sensor", "sensors"},
+      {"encoder", "encoders"},
+      {"digital_input", "digital_inputs"},
+      {"digital_output", "digital_outputs"},
+      {"analog_input", "analog_inputs"},
+      {"pwm_output", "pwm_outputs"},
+  };
+  for (auto&& [k, v] : tbl) {
+    for (const auto& [wrong, right] : kSections) {
+      if (k.str() == wrong) {
+        throw std::invalid_argument(where + ": unknown key '" +
+                                    std::string(wrong) + "'; did you mean '" +
+                                    std::string(right) + "'?");
+      }
+    }
+  }
+}
+
+// A subsystem file (or its defaults file) before merging, so the error names
+// the file that holds the key: its top level and its [subsystem] header both
+// land in the subsystem's table.
+inline void CheckSubsystemFileKeys(const toml::table& file,
+                                   const std::string& path) {
+  CheckSubsystemKeys(file, path);
+  if (const auto* header = file["subsystem"].as_table()) {
+    CheckSubsystemKeys(*header, path + " [subsystem]");
+  }
+}
+
 inline void MergeTables(toml::table& base, const toml::table& over) {
   for (auto&& [k, v] : over) {
     if (auto* over_sub = v.as_table()) {
@@ -858,6 +898,7 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
                                   "] must be a table");
     }
     result.subsystems[sub_name].subsystem = sub_name;
+    detail::CheckSubsystemKeys(*sub_tbl, "[subsystems." + sub_name + "]");
     // The launcher starts a subsystem's `node`; a malformed one must not
     // silently leave the subsystem without a process.
     if (sub_tbl->contains("node")) {
@@ -1229,6 +1270,7 @@ inline toml::table ExpandManifest(const toml::array& manifest,
     }
     const std::string file = resolve_entry_path(*rel_view);
     toml::table sub_file = read(file);
+    CheckSubsystemFileKeys(sub_file, file);
 
     auto* header = sub_file["subsystem"].as_table();
     if (!header || (*header)["name"].value<std::string_view>() != name) {
@@ -1254,6 +1296,7 @@ inline toml::table ExpandManifest(const toml::array& manifest,
     }
     if (defaults_file) {
       toml::table merged = read(*defaults_file);
+      CheckSubsystemFileKeys(merged, *defaults_file);
       MergeTables(merged, sub_file);
       sub_file = std::move(merged);
       header = sub_file["subsystem"].as_table();
