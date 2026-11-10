@@ -448,6 +448,19 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
                                 " must be \"rezero\" or \"absolute\", not \"" +
                                 frame + "\"");
   }
+  // The TalonFX enforces its soft limits on its own position, in every
+  // control mode, from thresholds applied once at configuration. A reset
+  // restarts a rezero frame wherever the mechanism is, so those thresholds
+  // would then sit elsewhere in the travel (limits [0, 50] after a reset at
+  // 30 allow 30 more past the top), and no rezero can move them.
+  if (m.soft_limits && !m.absolute_position_frame.value) {
+    throw std::invalid_argument(
+        "soft_limits = true for " + name +
+        " is refused in a \"rezero\" position frame: a device reset restarts "
+        "it, moving the soft limits along the travel. Set soft_limits = "
+        "false, or use a remote CANcoder's absolute position frame "
+        "(feedback = \"RemoteCANcoder\", position_frame = \"absolute\")");
+  }
   raw.config = std::move(m);
   return raw;
 }

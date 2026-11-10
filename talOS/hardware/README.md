@@ -93,7 +93,11 @@ rezero-frame motor's position and motion-magic demands neutral until the
 node's `Motor::rezero`, and again after a device reset or gateway boot, while
 an absolute-frame motor drives in the CANcoder's frame from its first state
 (see [position frames](../../docs/NODE_DEVELOPMENT_GUIDE.md#rezero-and-position-frames),
-including when that frame survives a CANcoder reset).
+including when that frame survives a CANcoder reset). Config load refuses
+`soft_limits = true` on a `"rezero"` motor: the TalonFX enforces soft limits
+on its own position in every control mode, from thresholds applied once at
+configuration, so after a reset at 30 rotations limits of [0, 50] would allow
+30 rotations past the top, and no rezero moves them.
 
 `forward_limit_switch` and `reverse_limit_switch` set the switches wired to
 the TalonFX's own forward and reverse limit inputs: `"NormallyOpen"` (the

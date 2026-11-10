@@ -117,13 +117,16 @@ move is down, toward the stowed position the superstructure falls back to,
 slowly and time-bounded, and a separate request would leave an autonomous
 routine or a mid-match reset stuck until a driver noticed.
 
-The lift has no hardware soft limits (`soft_limits = false`). The gateway
-checks soft limits only against position and motion-magic demands and passes
+The lift has no hardware soft limits (`soft_limits = false`), and config
+load refuses `soft_limits = true` on its `"rezero"` frame. The gateway checks
+soft limits only against position and motion-magic demands and passes
 duty-cycle and voltage requests, but the TalonFX (and the physics simulator)
 enforces them on the measured position in every control mode, in its
-power-on frame. After a reset at height the reverse limit of 0 sits at the
-carriage, so it would stop homing at once, and the forward limit would allow
-travel past the top. `max_height_rot` bounds goals in the homed frame instead.
+power-on frame, from thresholds the RoboRIO applies once with the static
+motor config; no request carries them, so no rezero moves them. After a reset
+at height the reverse limit of 0 sits at the carriage, so it would stop
+homing at once, and the forward limit would allow travel past the top.
+`max_height_rot` bounds goals in the homed frame instead.
 
 In software that clamp is the only protection at the top of travel: it bounds
 the goals, not a carriage that overshoots, coasts or is driven by a bad gain.
@@ -132,8 +135,6 @@ to the TalonFX's own forward limit input stops upward output in every control
 mode, whatever the frame (see [talOS/hardware](../../talOS/hardware/README.md)).
 That is also Phoenix's default, so with no switch wired nothing changes; use
 `"NormallyClosed"` for a switch that also stops the lift when its wire breaks.
-talOS cannot move the soft-limit thresholds after a rezero: they are part of
-the static motor config the RoboRIO applies once, and no request carries them.
 
 ## Layout
 

@@ -203,8 +203,10 @@ on the node. They do not reset hardware and work while disabled. Disconnected,
 stale, or non-finite feedback and non-finite inputs leave the offset unchanged.
 Motor position and gyro yaw subtract the offset; velocity/rate are unchanged.
 Motor position and motion-magic goals translate back to hardware coordinates
-before clamping. Configured soft limits remain in the **hardware frame** and
-the gateway's safety checks are never bypassed.
+before clamping. Configured soft limits remain in the **hardware frame**,
+which no rezero moves, so config load accepts `soft_limits = true` only with
+`position_frame = "absolute"` (below); the gateway's safety checks are never
+bypassed.
 `zeroed()` (`zeroed` property in Python) is true while a rezero holds. The
 offset lives in the node, so a restarted node starts unzeroed. A zero is
 dropped when its hardware frame may have restarted, except an

@@ -1422,7 +1422,8 @@ acceleration_rps2 = 2.0
 position_frame = "rezero"
 # No hardware soft limits: the TalonFX applies them to its power-on position
 # in every control mode, so after a reset partway along the travel they sit
-# in the wrong place and can stop homing. max_position_rot bounds targets.
+# in the wrong place and can stop homing; config load refuses them unless
+# position_frame = "absolute". max_position_rot bounds targets.
 # Overtravel: that clamp is the only top-of-travel protection in software. At
 # the robot, wire a forward limit switch to the TalonFX's own limit input,
 # which stops forward output in every control mode whatever the frame, and

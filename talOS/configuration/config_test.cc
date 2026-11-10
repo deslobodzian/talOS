@@ -405,6 +405,41 @@ TEST_F(ManifestTest, RefusesASingularSectionNamingTheKeyAndFile) {
                std::invalid_argument);
 }
 
+// The TalonFX applies soft limits in its own position frame, which a reset
+// restarts unless it is a remote CANcoder's absolute frame.
+TEST_F(ManifestTest, RefusesSoftLimitsOutsideAnAbsolutePositionFrame) {
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"lift\"\npath = \"subsystems/lift.toml\"\n");
+  Write("subsystems/lift.toml",
+        "[subsystem]\nname = \"lift\"\n[motors.winch]\ncan_id = 1\n"
+        "soft_limits = true\n");
+  try {
+    ParseRobotConfig(Robot());
+    ADD_FAILURE() << "soft limits on a rezero-frame motor were accepted";
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find("winch"), std::string::npos) << what;
+    EXPECT_NE(what.find("position_frame = \"absolute\""), std::string::npos)
+        << what;
+  }
+  ExpectRejected("soft_limits = true\n");
+  const auto absolute = Parse(R"(
+[subsystems.test.sensors.encoder]
+can_id = 2
+[subsystems.test.motors.arm]
+can_id = 3
+feedback = "RemoteCANcoder"
+feedback_sensor = "encoder"
+position_frame = "absolute"
+soft_limits = true
+)");
+  const auto arm = std::find_if(
+      absolute.hardware.motors.begin(), absolute.hardware.motors.end(),
+      [](const auto& motor) { return motor.name == "arm"; });
+  ASSERT_NE(arm, absolute.hardware.motors.end());
+  EXPECT_TRUE(arm->soft_limits);
+}
+
 TEST_F(ManifestTest, MergesSubsystemFilesAndKeepsTopLevelTables) {
   Write("robot.toml", R"(
 [robot]

@@ -64,6 +64,11 @@ dio = 3
 
 constexpr const char* kRequestTopic = "/hw/request/mech";
 
+// Config load accepts soft limits only in a remote CANcoder's absolute frame.
+const std::string kAbsoluteFrame =
+    "feedback = \"RemoteCANcoder\"\nfeedback_sensor = \"cc\"\n"
+    "position_frame = \"absolute\"\n";
+
 // Every handle kind, with what update() commands switched from the test.
 struct Mech {
   explicit Mech(Node& n)
@@ -229,8 +234,9 @@ TEST(Devices, StaleStateForcesNeutralButKeepsFlushing) {
 TEST(Devices, MotorDemandsClampPerDeviceAndCountAdjustedCalls) {
   std::string toml{kRobotToml};
   toml.insert(toml.find("[subsystems.mech.digital_outputs"),
-              "soft_limits = true\nreverse_limit_rot = -0.5\n"
-              "forward_limit_rot = 0.5\n");
+              kAbsoluteFrame +
+                  "soft_limits = true\nreverse_limit_rot = -0.5\n"
+                  "forward_limit_rot = 0.5\n");
   auto sim = Sim::FromToml(toml);
   auto& mech = sim.add<Mech>("mech");
   SimHardware hw{sim};
@@ -285,9 +291,10 @@ TEST(Devices, MotorVoltageDutyPositionAndFeedforwardUseConfiguredLimits) {
   };
   std::string toml{kRobotToml};
   toml.insert(toml.find("[subsystems.mech.motors.b]"),
-              "max_voltage = 6\nmax_velocity_rps = 80\n"
-              "soft_limits = true\nreverse_limit_rot = -2\n"
-              "forward_limit_rot = 3\n");
+              kAbsoluteFrame +
+                  "max_voltage = 6\nmax_velocity_rps = 80\n"
+                  "soft_limits = true\nreverse_limit_rot = -2\n"
+                  "forward_limit_rot = 3\n");
   auto sim = Sim::FromToml(toml);
   auto& limited = sim.add<Limited>("mech");
   SimHardware hw{sim};
@@ -508,8 +515,9 @@ TEST(Devices, AcquisitionTimesSubtractEachSignalsAge) {
 TEST(Devices, RezeroSharesSoftwareFramesAndPreservesHardwareLimits) {
   std::string toml{kRobotToml};
   toml.insert(toml.find("[subsystems.mech.digital_outputs"),
-              "soft_limits = true\nreverse_limit_rot = -0.5\n"
-              "forward_limit_rot = 0.5\n");
+              kAbsoluteFrame +
+                  "soft_limits = true\nreverse_limit_rot = -0.5\n"
+                  "forward_limit_rot = 0.5\n");
   auto sim = Sim::FromToml(toml);
   auto& mech = sim.add<Mech>("mech");
   Motor other{sim.node("mech"), "b"};
