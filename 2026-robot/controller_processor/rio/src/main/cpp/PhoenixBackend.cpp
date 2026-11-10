@@ -577,7 +577,13 @@ bool PhoenixBackend::Read(hw::State& s) {
     out.velocity_rps = v.GetValue().value();
     out.position_age_us = Age(p);
     out.velocity_age_us = Age(v);
-    out.fault_flags = motor.GetFaultField(false).GetValue();
+    // FaultField is its own 50 Hz signal, separate from the motion feedback
+    // that sets `valid`. A stale FaultField reports no asserted limit, so a
+    // limit getter never reports an old switch state, but keeps its last
+    // fault bits: losing the signal must not un-fault a faulted motor.
+    auto& faults = motor.GetFaultField(false);
+    out.fault_flags = faults.GetValue();
+    if (!Fresh(faults)) out.fault_flags &= ~hw::kMotorLimitAssertedFlags;
     // Stale current/voltage is telemetry-only degradation. The
     // effort fields zero but the sample stays valid and the backend stays
     // healthy; lost motion feedback isolates only the affected motor.

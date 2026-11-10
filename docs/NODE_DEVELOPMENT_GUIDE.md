@@ -124,8 +124,10 @@ through the same wire codec (C++ takes these optional arguments after ages).
 enabled switch on the TalonFX's own forward or reverse limit input
 ([talOS/hardware](../talOS/hardware/README.md)) is asserted, so the TalonFX
 holds output that way neutral; homing can drive toward a switch until it reads
-true. Unlike the numeric getters they do not latch: they read false unless
-`connected()`. SimHardware `set_limit_switches(node, device, forward,
+true. Unlike the numeric getters they read false unless `connected()`; while
+connected, the RoboRIO reports them only from a TalonFX FaultField signal under
+50 ms old (2.5 periods at its 50 Hz rate) and reports them clear once that
+signal is staler. SimHardware `set_limit_switches(node, device, forward,
 reverse)` asserts them; it does not stop the request or the ideal motor.
 
 `Motor::rezero(position_rot = 0)` and `Gyro::rezero(yaw_rot = 0)` (same

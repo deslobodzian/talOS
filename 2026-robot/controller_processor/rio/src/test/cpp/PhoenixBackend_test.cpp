@@ -680,6 +680,10 @@ class PhoenixBackendRecovery : public ::testing::Test {
   static auto& MotorConfig(PhoenixBackend& backend, std::size_t i) {
     return backend.config_.motors[i];
   }
+  static void StopRefreshing(PhoenixBackend& backend,
+                             ctre::phoenix6::BaseStatusSignal& signal) {
+    std::erase(backend.signals_, &signal);
+  }
   static void StopRefreshingHealth(PhoenixBackend& backend) {
     auto& motor = Motor(backend, 0);
     std::erase_if(backend.signals_, [&](auto* signal) {
@@ -767,6 +771,31 @@ TEST_F(PhoenixBackendRecovery, StaleHealthDoesNotInvalidateMotionFeedback) {
   EXPECT_GT(state.motors[0].voltage, 3.0);
   EXPECT_DOUBLE_EQ(state.motors[0].temperature_c, 0.0);
   EXPECT_DOUBLE_EQ(state.motors[0].supply_current_a, 0.0);
+}
+
+// FaultField is a separate signal from the motion feedback that keeps the
+// sample valid, so a stale FaultField must not keep reporting a limit.
+TEST_F(PhoenixBackendRecovery, StaleFaultFieldReportsNoLimit) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  config.motors.push_back(TestMotor(1, "motor", 1));
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+  const std::array<hw::MotorRequest, 1> commands{
+      Request(1, hw::Mode::kVoltage, 2.0)};
+  hw::State state;
+  Motor(backend, 0).GetSimState().SetForwardLimit(true);
+  PumpReads(backend, state, commands, 30);
+  ASSERT_TRUE(state.motors[0].valid);
+  ASSERT_NE(state.motors[0].fault_flags & hw::kMotorForwardHardLimitFlag, 0u);
+  auto& faults = Motor(backend, 0).GetFaultField(false);
+  StopRefreshing(backend, faults);
+  PumpReads(backend, state, commands, 30);
+  ASSERT_GE(faults.GetTimestamp().GetLatency().value(), 0.05);
+  EXPECT_TRUE(state.motors[0].valid);
+  EXPECT_EQ(state.motors[0].fault_flags & hw::kMotorLimitAssertedFlags, 0u);
 }
 
 TEST_F(PhoenixBackendRecovery, RestoreDoesNotReconfigureUnrelatedMotor) {

@@ -213,13 +213,15 @@ class Motor(_Input):
     @property
     def forward_limit(self):
         """Whether the TalonFX's forward hardware limit switch is asserted
-        (Motor::forward_limit): False unless connected, never latched."""
+        (Motor::forward_limit): False unless connected; otherwise read from a
+        FaultField signal under 50 ms old (cleared once it is staler)."""
         return bool(self._sample().forward_limit)
 
     @property
     def reverse_limit(self):
         """Whether the TalonFX's reverse hardware limit switch is asserted
-        (Motor::reverse_limit): False unless connected, never latched."""
+        (Motor::reverse_limit): False unless connected; otherwise read from a
+        FaultField signal under 50 ms old (cleared once it is staler)."""
         return bool(self._sample().reverse_limit)
 
     def _set(self, mode, demand, ff_volts=0.0, slot=0):
