@@ -153,8 +153,7 @@ TEST(HardwareNodeTest, RunKeepsRegistryProgressCurrent) {
   std::optional<introspect::RegistryReader> reader;
   std::optional<std::uint64_t> last_dispatch;
   auto last_change = std::chrono::steady_clock::now();
-  std::chrono::steady_clock::duration worst_gap{};
-  int changes = 0;
+  std::vector<std::chrono::steady_clock::duration> gaps;
   const auto end = std::chrono::steady_clock::now() + std::chrono::seconds{1};
   while (std::chrono::steady_clock::now() < end) {
     if (!reader) reader = introspect::RegistryReader::open();
@@ -165,10 +164,8 @@ TEST(HardwareNodeTest, RunKeepsRegistryProgressCurrent) {
             row.dispatch_count == 0)
           continue;
         const auto now = std::chrono::steady_clock::now();
-        if (last_dispatch && row.dispatch_count != *last_dispatch) {
-          worst_gap = std::max(worst_gap, now - last_change);
-          ++changes;
-        }
+        if (last_dispatch && row.dispatch_count != *last_dispatch)
+          gaps.push_back(now - last_change);
         if (!last_dispatch || row.dispatch_count != *last_dispatch) {
           last_dispatch = row.dispatch_count;
           last_change = now;
@@ -178,12 +175,14 @@ TEST(HardwareNodeTest, RunKeepsRegistryProgressCurrent) {
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
   runner.join();
-  ASSERT_GT(changes, 10);
+  ASSERT_GT(gaps.size(), 10u);
   // The launcher kills the bridge once its progress is 500 ms old, and the
-  // soak stops it for 300 ms, so the count must move within 200 ms; 150 ms
-  // still fails the 250 ms full-sample cadence without failing on a slow CI
-  // tick.
-  EXPECT_LT(worst_gap, std::chrono::milliseconds{150});
+  // soak stops it for 300 ms, so the count must move within 200 ms. The
+  // median tells a 20 ms store from the 250 ms full-sample cadence however
+  // slowly a sanitizer build ticks; the worst gap is the requirement itself.
+  std::sort(gaps.begin(), gaps.end());
+  EXPECT_LT(gaps[gaps.size() / 2], std::chrono::milliseconds{100});
+  EXPECT_LT(gaps.back(), std::chrono::milliseconds{200});
 }
 
 TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
