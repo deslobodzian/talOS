@@ -757,7 +757,8 @@ bool PhoenixBackend::Read(hw::State& s) {
   }
   uint32_t motor_fault_mask = 0;
   for (std::size_t i = 0; i < motors_.size(); ++i) {
-    if (s.motors[i].fault_flags != 0) motor_fault_mask |= uint32_t{1} << i;
+    if (hw::MotorFaulted(s.motors[i].fault_flags))
+      motor_fault_mask |= uint32_t{1} << i;
   }
   if (motor_fault_mask != last_motor_fault_mask_) {
     std::cerr << "[phoenix] motor_fault_mask changed: 0x" << std::hex
@@ -765,7 +766,7 @@ bool PhoenixBackend::Read(hw::State& s) {
               << std::dec << " (active motors: ";
     bool first = true;
     for (std::size_t i = 0; i < motors_.size(); ++i) {
-      if (s.motors[i].fault_flags == 0) continue;
+      if (!hw::MotorFaulted(s.motors[i].fault_flags)) continue;
       if (!first) std::cerr << ", ";
       const auto& motor = config_.motors[i];
       std::cerr << i << ":" << motor.name << "(" << motor.can_id << ")";

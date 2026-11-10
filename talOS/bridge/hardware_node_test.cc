@@ -373,7 +373,9 @@ TEST(HardwareNodeTest, ReportsLatestGatewayHealthAndConfiguredMotorFaults) {
   EXPECT_DOUBLE_EQ(status.can_utilization_frac(), 0.81);
   EXPECT_EQ(status.motor_fault_mask(), 2u);
   state.health = {};
-  state.motors[0].fault_flags = 0;
+  // Soft and hard limits asserted (FaultField bits 14-17) are normal
+  // operation, such as a homed mechanism resting on its limit switch.
+  state.motors[0].fault_flags = 0x3C000;
   state.sample_time_us++;
   ASSERT_TRUE(InjectState(node, gateway, state, 1002000));
   EXPECT_FALSE(node.Status(1002000).health_valid());

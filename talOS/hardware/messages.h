@@ -59,6 +59,15 @@ struct MotorSample {
   double temperature_c{}, supply_current_a{};
   bool operator==(const MotorSample&) const = default;
 };
+// `fault_flags` is the Phoenix 6 TalonFX FaultField. Bits 14-17 (forward and
+// reverse soft limit, forward and reverse hard limit) say a limit is asserted:
+// a homed mechanism resting on its limit switch, or a motor held at a soft
+// limit, is operating normally, so these bits are not a fault.
+inline constexpr uint32_t kMotorLimitAssertedFlags = uint32_t{0xF} << 14;
+// Whether the controller reports a fault other than an asserted limit.
+inline constexpr bool MotorFaulted(uint32_t fault_flags) {
+  return (fault_flags & ~kMotorLimitAssertedFlags) != 0;
+}
 struct SensorSample {
   uint16_t id{};
   bool valid{};

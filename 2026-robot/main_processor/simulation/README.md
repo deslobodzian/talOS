@@ -73,7 +73,8 @@ Unknown devices and overlapping intervals of the same kind/target are rejected.
 Blackouts do not stop incoming commands, physics or gateway safety ticks;
 suppressed packets are discarded, never replayed after recovery.
 The bridge's `/hw/status.motor_fault_mask` uses configured motor order and
-marks invalid feedback as well as nonzero controller fault flags.
+marks invalid feedback as well as controller fault flags other than an
+asserted soft or hard limit (`talos::hardware::MotorFaulted`).
 
 ```sh
 bazel run //2026-robot/main_processor/simulation:sim_gateway -- \

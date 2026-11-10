@@ -605,7 +605,7 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
     for (std::size_t j = 0; j < latest_state_.motor_count; ++j) {
       if (latest_state_.motors[j].id == config_.motors[i].id &&
           (!latest_state_.motors[j].valid ||
-           latest_state_.motors[j].fault_flags != 0)) {
+           MotorFaulted(latest_state_.motors[j].fault_flags))) {
         motor_fault_mask |= uint32_t{1} << i;
       }
     }
