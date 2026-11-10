@@ -21,6 +21,9 @@
 #endif
 
 namespace talos::process {
+
+std::atomic<bool> stop_requested{false};
+
 namespace {
 
 // The refusals so far, as one line. Fixed storage: this runs where an

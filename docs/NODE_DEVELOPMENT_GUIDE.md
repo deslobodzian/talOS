@@ -245,6 +245,25 @@ See [Data flow: Dispatch logs](DATA_FLOW.md#dispatch-logs) for the format.
 The node's name comes from `node_name`; add the node to the robot config as
 `node = "//path:node"`.
 
+### C++ nodes hosted from Python
+
+A C++ node class can run inside a Python node: export it with
+`TALOS_EXPORT_NODE(name, Class)` in a library built by
+`talos_cc_shared_node(name = "libmechanisms.so", srcs = [...], deps = [...])`,
+and wrap it with `Intake = talos.cpp_node("<package>/libmechanisms.so",
+"intake")`. That library links the framework dynamically from
+`//talOS/node_api:libtalos_node.so`, which `import talos` has already loaded,
+so the hosted class runs on the process's one copy of `Node` and the devices
+layer: the loader matches the library's dependency to that image by its
+install name (macOS) or soname (Linux), even when a bundle holds two copies of
+the file. `libtalos_node.so` links every talOS library it carries whole, so a
+hosted class may call any of their functions; a symbol it does not define
+fails the library's link (on Linux the macro links with `-z defs`), not its
+load. Do not build it with `cc_binary(linkshared = True)`: that library would
+carry a private copy of the framework (its own statics and extension type
+identities) running against Python's `Node`. A library listing a target the
+framework already links but does not export fails at analysis.
+
 ## Testing
 
 `talos::testing::Sim` (`//talOS/node:testing`) runs nodes on one simulated clock

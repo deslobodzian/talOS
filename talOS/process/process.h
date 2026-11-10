@@ -10,7 +10,11 @@
 
 namespace talos::process {
 
-inline std::atomic<bool> stop_requested{false};
+// Defined once, in process.cc. An inline variable is defined in every shared
+// object that uses it, and one loaded RTLD_LOCAL binds to its own copy: a
+// node library hosted by talos.cpp_node would watch a flag libtalos_node.so
+// never sets.
+extern std::atomic<bool> stop_requested;
 static_assert(std::atomic<bool>::is_always_lock_free);
 inline void RequestStop(int) {
   stop_requested.store(true, std::memory_order_relaxed);

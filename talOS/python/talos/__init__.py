@@ -429,7 +429,12 @@ def _resolve_library(library_path):
 
 def cpp_node(library_path, name="main"):
     """Wraps a C++ node exported with TALOS_EXPORT_NODE(name, Class) as a
-    Python node class."""
+    Python node class.
+
+    The library must be a talos_cc_shared_node: it then needs
+    libtalos_node.so, which _abi loaded at import, and the loader reuses that
+    image (macOS by install name, Linux by soname) rather than a second copy
+    of the framework."""
     resolved = _resolve_library(library_path)
     cdll = ctypes.CDLL(resolved)
     fn = getattr(cdll, f"talos_cpp_node_{name}")

@@ -3,6 +3,7 @@
 load("@flatbuffers//:build_defs.bzl", "DEFAULT_INCLUDE_PATHS", "flatbuffer_cc_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_shared_library.bzl", "cc_shared_library")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("@rules_python//python:py_info.bzl", "PyInfo")
 load("//tools:sync_manifest.bzl", "manifest_freshness_stamp")
@@ -551,6 +552,67 @@ def talos_cc_node(
         node_target = node_target,
         language = "cpp",
         visibility = visibility if visibility != None else ["//visibility:public"],
+    )
+
+def talos_cc_shared_node(
+        name,
+        srcs,
+        deps = [],
+        visibility = None,
+        testonly = None,
+        tags = None,
+        **kwargs):
+    """A shared library of C++ nodes for talos.cpp_node.
+
+    The sources export node classes with TALOS_EXPORT_NODE(name, Class). The
+    library links the talOS framework dynamically, from
+    //talOS/node_api:libtalos_node.so: Python loads that library first, so the
+    hosted classes run on the process's one copy of Node, the devices layer
+    and their statics and extension types. A library that linked its own
+    copy would run that copy against libtalos_node's Node. Anything else in
+    `deps` is linked into the library.
+
+    On Linux the library carries its file name as its soname and links with
+    -z defs, so a symbol neither it nor libtalos_node.so defines fails the
+    link instead of the load (macOS's linker refuses one already).
+
+    Args:
+      name: the library's file name, e.g. "libmechanisms.so"; talos.cpp_node
+        takes "<package>/<name>".
+      srcs: C++ sources using TALOS_EXPORT_NODE.
+      deps: libraries the sources use (the node classes, messages, ...).
+      visibility: of the shared library.
+      testonly: of both rules.
+      tags: of both rules.
+      **kwargs: passed to the cc_library that compiles `srcs` (copts,
+        defines, hdrs, ...).
+    """
+    objects = name.removesuffix(".so") + "_exports"
+    cc_library(
+        name = objects,
+        srcs = srcs,
+        deps = deps + [Label("//talOS/node")],
+        # The talos_cpp_node_<name> entry points are referenced by nothing
+        # but dlsym.
+        alwayslink = True,
+        testonly = testonly,
+        tags = tags,
+        visibility = ["//visibility:private"],
+        **kwargs
+    )
+    cc_shared_library(
+        name = name,
+        shared_lib_name = name,
+        dynamic_deps = [Label("//talOS/node_api:libtalos_node.so")],
+        features = ["set_soname"],
+        user_link_flags = select({
+            Label("@platforms//os:linux"): ["-Wl,-z,defs"],
+            "//conditions:default": [],
+        }),
+        testonly = testonly,
+        tags = tags,
+        visibility = visibility,
+        deps = [":" + objects],
     )
 
 def talos_py_node(
