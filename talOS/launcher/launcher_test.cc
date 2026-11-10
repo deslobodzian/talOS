@@ -14,6 +14,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "talOS/events/input_replay.h"
@@ -988,6 +989,33 @@ TEST(LauncherGraphTest, ANodeThatHangsOnDescribeDoesNotHangTheLaunch) {
   const auto elapsed = std::chrono::steady_clock::now() - started;
   EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
             10);
+}
+
+// The roster is probed in parallel: three binaries that each take two
+// seconds to answer cost the launch about two seconds, not six.
+TEST(LauncherGraphTest, ProbesRunInParallel) {
+  if (std::thread::hardware_concurrency() < 3)
+    GTEST_SKIP() << "fewer than three hardware threads";
+  const auto slow = [](std::string_view node, std::string_view target) {
+    const std::string stub = DescribingStub(node, target, {});
+    const std::string shebang = "#!/bin/sh\n";
+    return shebang + "sleep 2\n" + stub.substr(shebang.size());
+  };
+  GraphFixture fixture{"parallel", slow("alpha", "//example/alpha:node"),
+                       slow("beta", "//example/beta:node")};
+  fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStubNode("parallel_hardware",
+                    slow("hardware_node", "//talOS/bridge:hardware_node"));
+  const auto specs = DiscoverNodes(
+      config::ParseRobotConfig(fixture.options.config_path), fixture.options);
+  ASSERT_EQ(specs.size(), 3u);
+  std::vector<NodeDescription> described;
+  const auto started = std::chrono::steady_clock::now();
+  DescribeGraph(specs, fixture.options, described);
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  for (const auto& node : described)
+    EXPECT_TRUE(node.answered) << node.roster_name << ": " << node.error;
+  EXPECT_LT(elapsed, std::chrono::milliseconds{4500});
 }
 
 TEST(LauncherGraphTest, NonCriticalTargetProducerIsAnError) {

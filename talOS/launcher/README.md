@@ -7,7 +7,9 @@ Architecture and configuration invariants live in
 [NAMING.md](../NAMING.md).
 ## Two phases
 
-**Phase one asks.** Every binary in the config is run with `--describe`. A node
+**Phase one asks.** Every binary in the config is run with `--describe`, up
+to one probe per hardware thread at a time, so the roster takes about as long
+as its slowest probe (graph readers, described again, as long as theirs). A node
 given that flag builds itself on a `SimulatedEventLoop`, prints the manifest its
 constructor registered as JSON, and exits zero. The simulated loop's channels
 live inside the process, so this touches no shared memory, no hardware and no
@@ -150,8 +152,9 @@ overrides `[studio] http_port` for one run. Supervision is sim-only: without
 serving the webroot and no browser to open. The bridge answers `--describe`
 like any other node, and the launcher starts it with the session's `graph.json`
 as `--declared` and the session's `manifest.json` as `--manifest`; its stdout
-lands in `<output_dir>/<session_id>/studio_bridge.log`
-(plaintext, not a `.tlog`) beside the manifest.
+and stderr land in `<output_dir>/<session_id>/studio_bridge.log`
+(plaintext, not a `.tlog`) beside the manifest, like every member's
+[output](#node-output), but are not echoed to the launcher's stdout.
 
 The bridge is the one roster member supervised differently (`StudioBridge` in
 `launcher.h`); it waits for the telemetry segment itself (see the
@@ -163,6 +166,35 @@ hold the session open. Once it has survived a second it is supervised like any
 node, except that it is never restarted under the policy below. If it never
 comes up it is marked failed in the manifest and the session runs on without
 Studio.
+
+## Node output
+
+Every roster member's stdout and stderr go to one pipe per run, which the
+launcher drains into `<output_dir>/<session_id>/<name>.log`: every run of the
+member appended to that one file after a line naming it, such as
+`[launcher] alpha run 1, pid 4242` for the run that writes
+`alpha.restart1.tlog`. Except for the Studio bridge, the output is also
+echoed to the launcher's stdout. A deployed robot therefore keeps its nodes'
+output beside their event logs, whatever happens to the launcher's own.
+
+A print never waits for a disk or for the launcher's stdout: a one-line write
+to a file on a loaded disk can take hundreds of milliseconds, far past a
+node's `command_timeout_us`. One launcher
+thread only reads the pipes into memory; others write the logs and the echo.
+While a writer is behind, up to 2 MiB per member (and 2 MiB of echo) waits in
+memory: a 1 MiB batch the writer has taken and a refilled 1 MiB pending buffer; beyond that output is dropped, and the log (or the echo) says how many
+bytes where they were lost, as does a launcher line at the end of the session.
+A member's log keeps at most 64 MiB per session, then says so and drops the
+rest. The child's end of the pipe stays blocking: a nonblocking one would make
+a full pipe an error inside the node (lost data and an error flag in stdio, a
+silenced `std::cout`/`std::cerr` in iostreams, `BlockingIOError` from Python's
+`print`). A node can still block if the launcher's reading thread is not
+scheduled while it fills its pipe (64 KiB on macOS, 256 KiB requested on
+Linux).
+
+stdout is a pipe, not a terminal, so C stdio and Python buffer it in blocks
+and a killed run loses what it had not flushed; write diagnostics to stderr.
+`--replay-inputs` runs its one node with the launcher's own stdout and stderr.
 
 ## Restarts
 
@@ -211,7 +243,7 @@ scheduled inside the supervision loop, like the Studio bridge's retries, so a
 restarting node never delays another node or the deadline. Each restart prints
 one line:
 
-    [launcher] alpha exited (signal 11); restart 1 in 0 ms
+    [launcher] alpha exited (signal 11 SIGSEGV); restart 1 in 0 ms
 
 When a non-critical node's rolling budget is exhausted, it is **quarantined**, not
 permanently abandoned. Exactly one retry is scheduled for the oldest restart
@@ -299,18 +331,17 @@ less its offset (`run()`) and first `/hw/request/drivetrain` send:
 
 | Stage | ms, median (range) | Set by |
 |---|---|---|
-| SIGKILL → launcher reaps the exit | 6.2 (1.4–20.5) | the supervision loop's 20 ms sleep |
-| reap → `fork` of the restart | 0.5 (0.4–0.7) | two manifest writes, renamed into place unsynced (0.2) |
+| SIGKILL → launcher reaps the exit | not yet measured | the SIGCHLD wakeup of the supervision loop |
+| reap → `fork` of the restart | not yet measured | restart bookkeeping; the manifest is written off the loop |
 | `fork` → first constructor | 1.2 (1.1–1.2) | group and guardian setup, exec, dynamic loading |
 | first constructor → event-loop origin | 0.4 (0.4–0.5) | flags, event-log file |
 | origin → `run()` | 1.5 (1.4–1.6) | robot config parse, topic attach |
 | `run()` → first tick | 5.0 | one `period_us` |
 | first tick → first `/hw/request/drivetrain` | 0.0 | that tick's flush, which needs a `/hw/state` received since the node attached |
-| **total** | **14.6 (10.1–29.0)** | |
+| **total** | not yet measured | |
 
 While eight other processes rewrote and synced 256 MiB files on the same disk,
-10 kills took 59.5 ms (13.8–76.5): reap → `fork` up to 27, of which its
-manifest renames up to 26, and first constructor → origin up to 29.
+first constructor → origin took up to 29 ms.
 
 `restart_latency` repeats the `.tlog` part of this measurement on any host:
 SIGKILL → origin (the first four rows together), origin → `run()`, `run()` →
@@ -442,8 +473,10 @@ directory instead of evicting recorded sessions. Symlinks, other directories
 other file), the current session and the session `--replay-inputs` reads are
 not deleted. A session retention cannot read or remove (another user's,
 unreadable, removed meanwhile) is reported and passed over; it never stops a
-launch. Graph/manifest metadata and non-event captures are outside the
-event-writer caps.
+launch. Graph/manifest metadata, non-event captures and the members' output
+logs (`<name>.log`, [node output](#node-output)) are outside the event-writer
+caps: each member's output log can reach 64 MiB per session, so reserve
+64 MiB per roster member per retained session beside `log_max_bytes`.
 
 Simulation is only permitted with effective remote `127.0.0.1`. `--sim` with a
 different configured or overridden remote is refused before any process starts.

@@ -27,6 +27,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -682,6 +683,117 @@ TEST(Supervision, MaxRestartsZeroDisablesRestarts) {
   ::remove(alpha_runs.c_str());
 }
 
+// A run a signal ended says which: exit_code -1 alone cannot tell a crash
+// from a stop the node never handled, or from the launcher's own SIGKILL.
+TEST(Supervision, SignalDeathRecordsTheSignal) {
+  LauncherOptions options = BaseOptions("signal_death");
+  options.max_restarts = 0;
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("signal_death_alpha", "kill -KILL $$\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("signal_death_beta", "exit 0\n");
+
+  EXPECT_NE(RunSession(options), 0);
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const std::string alpha = ManifestEntry(manifest, "alpha");
+  EXPECT_NE(alpha.find("\"exit_code\": -1"), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"exit_signal\": " + std::to_string(SIGKILL)),
+            std::string::npos)
+      << alpha;
+  const std::string beta = ManifestEntry(manifest, "beta");
+  EXPECT_NE(beta.find("\"exit_signal\": 0"), std::string::npos) << beta;
+  std::filesystem::remove_all(options.output_dir);
+}
+
+// A node's output never waits for the launcher's stdout: alpha writes 2 MiB
+// to stdout while the launcher's stdout is a pipe nobody reads, then records
+// that it got past the write. Inherited, that stdout would block it at 64 KiB.
+// Its output lands in alpha.log after the line naming the run, all of it or
+// with what was dropped marked.
+TEST(Supervision, NodeOutputNeverWaitsForTheLaunchersStdout) {
+  auto options = BaseOptions("output_drain");
+  const std::string written = TempPath("output_drain_written");
+  ::remove(written.c_str());
+  constexpr int kBytes = 2 * 1024 * 1024;
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStub("output_drain_hardware", kRunUntilStopped, "hardware_node");
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "output_drain_alpha", "head -c " + std::to_string(kBytes) +
+                                " /dev/zero | tr '\\0' x\necho done > " +
+                                written + "\n" + std::string{kRunUntilStopped});
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("output_drain_beta", kRunUntilStopped);
+  int launcher_stdout[2];
+  ASSERT_EQ(::pipe(launcher_stdout), 0);
+  const pid_t launcher = ::fork();
+  ASSERT_GE(launcher, 0);
+  if (launcher == 0) {
+    ::close(launcher_stdout[0]);
+    if (::dup2(launcher_stdout[1], STDOUT_FILENO) < 0) ::_exit(100);
+    ::close(launcher_stdout[1]);
+    ::_exit(Launcher{options}.Run());
+  }
+  ::close(launcher_stdout[1]);
+  bool got_past = false;
+  for (const auto give_up = std::chrono::steady_clock::now() + 20s;
+       !got_past && std::chrono::steady_clock::now() < give_up;) {
+    std::this_thread::sleep_for(20ms);
+    got_past = std::filesystem::exists(written);
+  }
+  // Now let the launcher's own lines out, so that it can stop.
+  std::thread drain{[fd = launcher_stdout[0]] {
+    char bytes[4096];
+    while (::read(fd, bytes, sizeof bytes) > 0) {
+    }
+  }};
+  ::kill(launcher, SIGTERM);
+  while (::waitpid(launcher, nullptr, 0) < 0 && errno == EINTR) {
+  }
+  drain.join();
+  ::close(launcher_stdout[0]);
+  EXPECT_TRUE(got_past) << "alpha blocked on its output";
+  const std::string log =
+      ReadFile(options.output_dir + "/" + std::to_string(options.session_id) +
+               "/alpha.log");
+  EXPECT_EQ(log.rfind("[launcher] alpha run 0, pid ", 0), 0u)
+      << log.substr(0, 200);
+  auto accounted = std::count(log.begin(), log.end(), 'x');
+  const std::regex dropped{"\\[launcher\\] ([0-9]+) bytes of output dropped"};
+  for (std::sregex_iterator it{log.begin(), log.end(), dropped}, end; it != end;
+       ++it)
+    accounted += std::stol((*it)[1].str());
+  EXPECT_EQ(accounted, kBytes);
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(written.c_str());
+}
+
+// A run's last output stays under its own header when the next run starts
+// at once: the old pipe still holds "last words" when the restart's pipe is
+// added, and the reader moves them out before writing the new header.
+TEST(Supervision, CrashOutputIsNotCreditedToTheRestart) {
+  const std::string path = TempPath("output_restart.log");
+  ::remove(path.c_str());
+  int first[2];
+  int second[2];
+  ASSERT_EQ(::pipe(first), 0);
+  ASSERT_EQ(::pipe(second), 0);
+  const std::string last_words = "last words\n";
+  ASSERT_EQ(::write(first[1], last_words.data(), last_words.size()),
+            static_cast<ssize_t>(last_words.size()));
+  {
+    ChildOutput output;
+    output.Add(first[0], path, "alpha", 100, false);
+    output.Add(second[0], path, "alpha", 101, false);
+    ::close(first[1]);
+    ::close(second[1]);
+    output.Stop();
+  }
+  EXPECT_EQ(ReadFile(path),
+            "[launcher] alpha run 0, pid 100\nlast words\n"
+            "[launcher] alpha run 1, pid 101\n");
+  ::remove(path.c_str());
+}
+
 // A negative [robot] max_restarts is a config error, caught before launch.
 TEST(Supervision, NegativeMaxRestartsRefusesToLaunch) {
   LauncherOptions options =
@@ -826,9 +938,10 @@ TEST(Supervision, KillingLauncherKillsNodeAndItsHelper) {
   if (launcher == 0) {
     ::close(output[0]);
     std::string error;
-    const auto node = SpawnProcess(
-        {"/bin/sh", "-c", "sleep 30 & echo $$; wait"}, error, "", output[1]);
+    if (::dup2(output[1], STDOUT_FILENO) < 0) ::_exit(1);
     ::close(output[1]);
+    const auto node =
+        SpawnProcess({"/bin/sh", "-c", "sleep 30 & echo $$; wait"}, error);
     if (node < 0) ::_exit(1);
     for (;;) ::pause();
   }

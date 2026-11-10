@@ -84,10 +84,12 @@ A relative `--prefix` is resolved against the working directory.
   `--dry-run` prints these provisioning/check commands and the unit or plist.
 - **logs** lists session directories under `<prefix>/logs` (or `LOG_ROOT`) and
   summarizes the newest manifest by modification time: session id, config path
-  and hash, each node's exit code and log path. No installed bundle is needed
+  and hash, each node's exit code (and the signal that ended it, if one did),
+  event log path and output log. No installed bundle is needed
   to inspect retained sessions.
 - **fetch** copies every session folder from `<prefix>/logs` into `DEST`,
-  preserving its manifest and all node logs, including restarted attempts.
+  preserving its manifest, every node's event logs (restarted attempts
+  included) and output logs.
   Run it on the main processor, for example
   `./tools/deploy.sh fetch /media/usb/robot-sessions`, then transfer that
   directory to the analysis machine. Existing destination session names are
@@ -117,6 +119,12 @@ every invocation, so recordings live in `<prefix>/logs/<session-id>/` and
 restarts of the service never reuse a previous session folder. For a manual
 run to use the same root, set `TALOS_LOG_DIR=/opt/talos/logs` or pass
 `--output-dir /opt/talos/logs`; `logs LOG_ROOT` can inspect another output root.
+
+Each node's stdout and stderr, every run of it, land in
+`<prefix>/logs/<session-id>/<name>.log` ([node output](../talOS/launcher/README.md#node-output)).
+The macOS LaunchDaemon sets no `StandardOutPath` or `StandardErrorPath`, so
+the launcher's own lines (and its echo of node output) are discarded there;
+on Linux they go to the journal (`journalctl -u talos`).
 
 For event-log byte budgets, retention, capped recordings, manifest-write
 recovery and what is synced to disk when, see [session segments and logs](../talOS/launcher/README.md#session-segments-and-logs).

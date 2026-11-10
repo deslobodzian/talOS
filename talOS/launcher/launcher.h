@@ -100,8 +100,15 @@ inline bool WriteFileAtomically(const std::string& path,
     error = std::string{step} + ": " + std::strerror(code);
     return false;
   };
-  FILE* file = std::fopen(temporary.c_str(), "wb");
-  if (file == nullptr) return fail("create", errno);
+  const int temporary_fd =
+      ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (temporary_fd < 0) return fail("create", errno);
+  FILE* file = ::fdopen(temporary_fd, "wb");
+  if (file == nullptr) {
+    const int fdopen_error = errno;
+    ::close(temporary_fd);
+    return fail("create", fdopen_error);
+  }
   int code = 0;
   if (std::fwrite(contents.data(), 1, contents.size(), file) !=
           contents.size() ||
@@ -114,7 +121,8 @@ inline bool WriteFileAtomically(const std::string& path,
   if (!sync) return true;
   const std::filesystem::path parent =
       std::filesystem::path{path}.parent_path();
-  const int directory = ::open(parent.empty() ? "." : parent.c_str(), O_RDONLY);
+  const int directory = ::open(parent.empty() ? "." : parent.c_str(),
+                               O_RDONLY | O_CLOEXEC | O_DIRECTORY);
   if (directory < 0) return fail("open directory", errno);
   const int result = sync(directory);
   code = errno;
@@ -304,7 +312,8 @@ struct NodeProcessInfo {
   std::vector<std::string> log_paths;
   int restart_count{0};
   pid_t pid{-1};
-  int exit_code{-1};
+  int exit_code{-1};   // -1 while it runs, and after a signal ended it.
+  int exit_signal{0};  // The signal that ended the last run, else 0.
   bool exited{false};
   bool quarantined{false};
   int64_t retry_at_monotonic_ns{0};  // Zero when no restart is pending.
@@ -362,6 +371,7 @@ struct SessionManifest {
       ss << "],\n";
       ss << "      \"pid\": " << n.pid << ",\n";
       ss << "      \"exit_code\": " << n.exit_code << ",\n";
+      ss << "      \"exit_signal\": " << n.exit_signal << ",\n";
       ss << "      \"restart_count\": " << n.restart_count << ",\n";
       ss << "      \"quarantined\": " << (n.quarantined ? "true" : "false")
          << ",\n";
@@ -718,6 +728,17 @@ inline std::map<pid_t, int>& ProcessLifetimes() {
   return lifetimes;
 }
 
+// Held by every thread that spawns (DescribeGraph probes in parallel) from
+// the creation of a spawn's pipes to the parent's close of the child's ends,
+// and around ProcessLifetimes. A child another thread forks inside that window
+// would otherwise inherit this spawn's pipe ends -- close-on-exec is set after
+// pipe() on macOS, which has no pipe2 -- and hold a writer open: a probe would
+// see no EOF, a drained output pipe no end, until that other child exited.
+inline std::mutex& SpawnMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
 inline void SignalProcessGroup(pid_t pid, int signal) {
   if (pid > 0) ::kill(-pid, signal);
 }
@@ -725,6 +746,7 @@ inline void SignalProcessGroup(pid_t pid, int signal) {
 // Call after reaping the leader: even a clean exit must not leave helpers.
 inline void FinishProcessGroup(pid_t pid) {
   SignalProcessGroup(pid, SIGKILL);
+  const std::lock_guard lock{SpawnMutex()};
   auto& lifetimes = ProcessLifetimes();
   const auto found = lifetimes.find(pid);
   if (found != lifetimes.end()) {
@@ -807,29 +829,36 @@ inline std::string ChildStepName(ChildStep step, const std::string& program) {
   return "child setup";
 }
 
-// fork + execv of args[0], in its own process group. stdout_fd is used only by
-// --describe; otherwise stdout/stderr can be appended to output_path. Returns
+// Where a spawned child's stdout and stderr go.
+enum class SpawnOutput {
+  kInherit,     // The launcher's own.
+  kStdoutPipe,  // stdout into a new pipe (a --describe answer); stderr is the
+                // launcher's.
+  kPipe,        // Both into one new pipe, for a ChildOutput to drain.
+};
+
+// The pipe capacity requested for a drained child's output where the OS
+// allows it (Linux F_SETPIPE_SZ; a macOS pipe grows to 64 KiB by itself):
+// what the child can write while the drain thread is not scheduled.
+inline constexpr int kChildOutputPipeBytes = 256 * 1024;
+
+// fork + execv of args[0], in its own process group, its output as `output`
+// says; for a pipe, `*reader` receives the read end (close-on-exec). Returns
 // the child's pid once it has exec'd, which the close-on-exec error pipe it
 // shares with the launcher shows by closing. A child that fails before or at
 // its exec reports the step and errno there instead, exits 127 and is reaped;
 // then, as when a pipe or the fork fails here, this returns -1 with `error`
-// naming the step and its errno ("execv <path>: Permission denied").
+// naming the step and its errno ("execv <path>: Permission denied"), and no
+// reader. Safe to call from several threads at once (SpawnMutex).
 inline pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
-                          const std::string& output_path = "",
-                          int stdout_fd = -1) {
+                          SpawnOutput output = SpawnOutput::kInherit,
+                          int* reader = nullptr) {
   const auto fail = [&error](std::string_view step, int code) {
     error = std::string{step} + ": " + std::strerror(code);
     return pid_t{-1};
   };
-  int lifetime[2];
-  if (!CloseOnExecPipe(lifetime)) return fail("pipe", errno);
-  int errors[2];
-  if (!CloseOnExecPipe(errors)) {
-    const int code = errno;
-    ::close(lifetime[0]);
-    ::close(lifetime[1]);
-    return fail("pipe", code);
-  }
+  if (output != SpawnOutput::kInherit && reader == nullptr)
+    return fail("output pipe", EINVAL);
   std::vector<char*> c_args;
   c_args.reserve(args.size() + 1);
   for (auto& arg : args) c_args.push_back(arg.data());
@@ -837,19 +866,45 @@ inline pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
   std::cout.flush();
   std::fflush(nullptr);
   const pid_t parent = ::getpid();
-  const pid_t pid = ::fork();
-  if (pid < 0) {
+  int lifetime[2];
+  int errors[2];
+  int child_output[2]{-1, -1};
+  std::unique_lock spawning{SpawnMutex()};
+  if (!CloseOnExecPipe(lifetime)) return fail("pipe", errno);
+  if (!CloseOnExecPipe(errors)) {
+    const int code = errno;
+    ::close(lifetime[0]);
+    ::close(lifetime[1]);
+    return fail("pipe", code);
+  }
+  if (output != SpawnOutput::kInherit && !CloseOnExecPipe(child_output)) {
     const int code = errno;
     for (const int fd : {lifetime[0], lifetime[1], errors[0], errors[1]})
       ::close(fd);
+    return fail("pipe", code);
+  }
+#if defined(__linux__) && defined(F_SETPIPE_SZ)
+  // Best effort: the default 64 KiB still never blocks a child that writes
+  // less than that between two of the drain thread's reads.
+  if (output == SpawnOutput::kPipe)
+    ::fcntl(child_output[1], F_SETPIPE_SZ, kChildOutputPipeBytes);
+#endif
+  const pid_t pid = ::fork();
+  if (pid < 0) {
+    const int code = errno;
+    for (const int fd : {lifetime[0], lifetime[1], errors[0], errors[1],
+                         child_output[0], child_output[1]})
+      if (fd >= 0) ::close(fd);
     return fail("fork", code);
   }
   if (pid > 0) {
     ::close(lifetime[0]);
     ::close(errors[1]);
+    if (child_output[1] >= 0) ::close(child_output[1]);
     // Both sides establish the group, closing the spawn/signal race.
     ::setpgid(pid, pid);
     ProcessLifetimes().emplace(pid, lifetime[1]);
+    spawning.unlock();
     // EOF once the exec has closed the child's writer and the guardian its
     // copy, or once a child died without a report; a report otherwise.
     ChildFailure failure{};
@@ -858,7 +913,11 @@ inline pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
            errno == EINTR) {
     }
     ::close(errors[0]);
-    if (got != static_cast<ssize_t>(sizeof failure)) return pid;
+    if (got != static_cast<ssize_t>(sizeof failure)) {
+      if (reader != nullptr) *reader = child_output[0];
+      return pid;
+    }
+    if (child_output[0] >= 0) ::close(child_output[0]);
     while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
     }
     FinishProcessGroup(pid);
@@ -895,20 +954,514 @@ inline pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
     ::_exit(0);
   }
   ::close(lifetime[0]);
-  if (stdout_fd >= 0) {
-    if (::dup2(stdout_fd, STDOUT_FILENO) < 0)
+  // dup2 clears close-on-exec on the copies; the pipe's own descriptors close
+  // at the exec. The writer stays blocking: see ChildOutput for why.
+  if (output != SpawnOutput::kInherit) {
+    if (::dup2(child_output[1], STDOUT_FILENO) < 0 ||
+        (output == SpawnOutput::kPipe &&
+         ::dup2(child_output[1], STDERR_FILENO) < 0))
       ReportChildFailure(errors[1], ChildStep::kOutput);
-    if (stdout_fd != STDOUT_FILENO) ::close(stdout_fd);
-  } else if (!output_path.empty()) {
-    const int output =
-        ::open(output_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0666);
-    if (output < 0 || ::dup2(output, STDOUT_FILENO) < 0 ||
-        ::dup2(output, STDERR_FILENO) < 0)
-      ReportChildFailure(errors[1], ChildStep::kOutput);
-    if (output > STDERR_FILENO) ::close(output);
   }
   ::execv(c_args[0], c_args.data());
   ReportChildFailure(errors[1], ChildStep::kExec);
+}
+
+// ---------------------------------------------------------------------------
+// Child output
+//
+// Every roster member writes its stdout and stderr into one pipe, which a
+// ChildOutput drains into the member's `<output_dir>/<name>.log`, every run
+// appended to the one file after a line naming the run and its pid, and,
+// except for the Studio bridge, echoes to the launcher's stdout.
+//
+// A child's write blocks only while its pipe is full, so the pipe is drained
+// by a thread that never waits for a disk: it only moves what arrives into a
+// bounded buffer in memory. A second thread writes those buffers to the log
+// files, and a third the echo to stdout: a one-line write to a file on a
+// loaded disk can take hundreds of milliseconds (222 ms at p99 with eight
+// disk writers on the Mac mini), and so can stdout when it is a file or a
+// pipe read slowly. While a writer is behind, a member's buffer (or the
+// echo's) grows to kChildOutputBufferBytes; what arrives beyond it is
+// dropped, counted, and marked where it was lost.
+//
+// The child's end of the pipe stays blocking. A nonblocking one would turn a
+// full pipe into EAGAIN inside the child: stdio loses the data and sets the
+// stream's error flag, iostreams set badbit, which silences std::cout or
+// std::cerr for the rest of the run, and Python raises BlockingIOError out of
+// print(). Losing output here is the gentler failure, and the one that can be
+// counted; a child still blocks if the drain thread is not scheduled while it
+// fills its pipe (64 KiB on macOS, kChildOutputPipeBytes on Linux).
+// ---------------------------------------------------------------------------
+
+// What one member's output, or the echo, may hold in memory while the writer
+// is behind.
+inline constexpr std::size_t kChildOutputBufferBytes = std::size_t{1} << 20;
+// What one member's output log may hold in a session; later output is
+// dropped, counted, and the log says so.
+inline constexpr uint64_t kChildOutputLogMaxBytes = uint64_t{64} << 20;
+
+// The log a member's stdout and stderr are drained into, all runs together.
+inline std::string NodeOutputPath(const std::string& output_dir,
+                                  std::string_view name) {
+  return output_dir + "/" + std::string{name} + ".log";
+}
+
+class ChildOutput {
+ public:
+  using Clock = std::chrono::steady_clock;
+
+  // Starts the reader, writer and echo threads, which block every signal so
+  // that the launcher's handlers run on its own threads. Throws
+  // std::system_error when a pipe or thread cannot be created.
+  ChildOutput() {
+    {
+      const std::lock_guard lock{SpawnMutex()};
+      if (!CloseOnExecPipe(wake_))
+        throw std::system_error(errno, std::generic_category(),
+                                "child output wake pipe");
+    }
+    for (const int fd : wake_)
+      ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
+    sigset_t all;
+    sigset_t previous;
+    sigfillset(&all);
+    ::pthread_sigmask(SIG_SETMASK, &all, &previous);
+    try {
+      reader_ = std::thread{[this] { ReadLoop(); }};
+      writer_ = std::thread{[this] { WriteLoop(); }};
+      echoer_ = std::thread{[this] { EchoLoop(); }};
+    } catch (...) {
+      ::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+      Stop();
+      throw;
+    }
+    ::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+  }
+  ~ChildOutput() { Stop(); }
+  ChildOutput(const ChildOutput&) = delete;
+  ChildOutput& operator=(const ChildOutput&) = delete;
+
+  // Drains `reader`, an output pipe SpawnProcess returned for `name`'s run
+  // `pid`, into `path`; with `echo`, also to the launcher's stdout. Takes the
+  // descriptor.
+  void Add(int reader, const std::string& path, std::string_view name,
+           pid_t pid, bool echo) {
+    ::fcntl(reader, F_SETFL, ::fcntl(reader, F_GETFL) | O_NONBLOCK);
+    {
+      const std::lock_guard lock{mutex_};
+      if (stopping_) {
+        ::close(reader);
+        return;
+      }
+      // The reader writes the header once it has drained the previous run's
+      // pipe, so that run's last output is not credited to this one.
+      Pending& pending = pending_[path];
+      added_.push_back({reader, path, echo,
+                        "[launcher] " + std::string{name} + " run " +
+                            std::to_string(pending.runs++) + ", pid " +
+                            std::to_string(pid) + "\n"});
+      dirty_ = true;
+    }
+    arrived_.notify_all();
+    Wake();
+  }
+
+  // Waits up to `linger` for every pipe to end -- its run has exited, but a
+  // descendant that left the process group can hold it open -- writes out
+  // everything that arrived, and stops the threads. The echo still waits for
+  // a stdout that does not drain, as every launcher line does. Idempotent.
+  void Stop(std::chrono::milliseconds linger = std::chrono::milliseconds{500}) {
+    {
+      const std::lock_guard lock{mutex_};
+      if (stopping_ && !reader_.joinable() && !writer_.joinable() &&
+          !echoer_.joinable())
+        return;
+      stopping_ = true;
+      linger_ = linger;
+    }
+    Wake();
+    if (reader_.joinable()) reader_.join();
+    {
+      const std::lock_guard lock{mutex_};
+      reader_done_ = true;
+    }
+    arrived_.notify_all();
+    if (writer_.joinable()) writer_.join();
+    if (echoer_.joinable()) echoer_.join();
+    for (int& fd : wake_) {
+      if (fd >= 0) ::close(fd);
+      fd = -1;
+    }
+  }
+
+  // Bytes of the output bound for `path` that were dropped so far: the
+  // writer fell behind, the log reached kChildOutputLogMaxBytes, or a write
+  // to it failed.
+  uint64_t Dropped(const std::string& path) const {
+    const std::lock_guard lock{mutex_};
+    const auto found = pending_.find(path);
+    return found == pending_.end() ? 0 : found->second.dropped_total;
+  }
+
+ private:
+  struct Stream {
+    int fd;
+    std::string path;
+    bool echo;
+    std::string header;  // Written to the log when the reader picks it up.
+  };
+  // Output bound for one path that the writer has not taken yet.
+  struct Pending {
+    std::string bytes;
+    uint64_t dropped{0};  // Since the writer last took `bytes`.
+    uint64_t dropped_total{0};
+    int runs{0};
+  };
+  struct LogFile {
+    int fd{-1};
+    uint64_t written{0};
+    bool capped{false};
+    bool reported{false};
+  };
+
+  // A full wake pipe already holds a wakeup.
+  void Wake() {
+    if (wake_[1] < 0) return;
+    const char byte = 0;
+    [[maybe_unused]] const ssize_t wrote = ::write(wake_[1], &byte, 1);
+  }
+
+  // A line marking `count` lost bytes, starting a line of its own.
+  static std::string DropNote(const std::string& before, uint64_t count,
+                              std::string_view why) {
+    std::string note = before.empty() || before.back() == '\n' ? "" : "\n";
+    return note + "[launcher] " + std::to_string(count) +
+           " bytes of output dropped here: " + std::string{why} + "\n";
+  }
+
+  // Moves `size` bytes read from `stream` into its buffers, dropping what
+  // they cannot hold.
+  void Deliver(const Stream& stream, const char* data, std::size_t size) {
+    {
+      const std::lock_guard lock{mutex_};
+      Pending& pending = pending_[stream.path];
+      const std::size_t room =
+          kChildOutputBufferBytes -
+          std::min(kChildOutputBufferBytes, pending.bytes.size());
+      const std::size_t kept = std::min(size, room);
+      pending.bytes.append(data, kept);
+      pending.dropped += size - kept;
+      pending.dropped_total += size - kept;
+      if (stream.echo) {
+        const std::size_t echo_room =
+            kChildOutputBufferBytes -
+            std::min(kChildOutputBufferBytes, echo_.size());
+        const std::size_t echoed = std::min(size, echo_room);
+        echo_.append(data, echoed);
+        echo_dropped_ += size - echoed;
+      }
+      dirty_ = true;
+    }
+    arrived_.notify_all();
+  }
+
+  // Reads every registered pipe until it ends, or, once stopping, until
+  // `linger_` has passed. Touches no file.
+  void ReadLoop() {
+    std::vector<Stream> streams;
+    std::vector<Stream> picked;
+    std::vector<::pollfd> fds;
+    std::vector<char> buffer(std::size_t{64} * 1024);
+    std::optional<Clock::time_point> give_up;
+    for (;;) {
+      {
+        const std::lock_guard lock{mutex_};
+        picked.swap(added_);
+        if (stopping_ && !give_up) give_up = Clock::now() + linger_;
+      }
+      for (auto& stream : picked) {
+        // An earlier run's pipe for the same log may still hold its last
+        // output (a restart can follow the exit at once): read what it holds
+        // before this run's header. Its descendants may keep it open.
+        for (auto& earlier : streams) {
+          if (earlier.fd < 0 || earlier.path != stream.path) continue;
+          for (;;) {
+            const ssize_t got =
+                ::read(earlier.fd, buffer.data(), buffer.size());
+            if (got > 0) {
+              Deliver(earlier, buffer.data(), static_cast<std::size_t>(got));
+            } else if (got < 0 && errno == EINTR) {
+              continue;
+            } else {
+              if (got == 0 || errno != EAGAIN) {
+                ::close(earlier.fd);
+                earlier.fd = -1;
+              }
+              break;
+            }
+          }
+        }
+        {
+          const std::lock_guard lock{mutex_};
+          pending_[stream.path].bytes += stream.header;
+          dirty_ = true;
+        }
+        arrived_.notify_all();
+        stream.header.clear();
+        streams.push_back(std::move(stream));
+      }
+      picked.clear();
+      std::erase_if(streams,
+                    [](const Stream& stream) { return stream.fd < 0; });
+      if (give_up && (streams.empty() || Clock::now() >= *give_up)) break;
+      fds.assign(1, ::pollfd{wake_[0], POLLIN, 0});
+      for (const auto& stream : streams)
+        fds.push_back(::pollfd{stream.fd, POLLIN, 0});
+      int timeout = -1;
+      if (give_up) {
+        timeout = static_cast<int>(std::max<int64_t>(
+            0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                   *give_up - Clock::now())
+                       .count() +
+                   1));
+      }
+      if (::poll(fds.data(), fds.size(), timeout) < 0) {
+        // Never give the pipes up while their children may still write.
+        if (errno != EINTR)
+          std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        continue;
+      }
+      if (fds[0].revents != 0) {
+        char drained[64];
+        while (::read(wake_[0], drained, sizeof drained) > 0) {
+        }
+      }
+      std::size_t kept = 0;
+      for (std::size_t i = 0; i < streams.size(); ++i) {
+        bool open = true;
+        if (fds[i + 1].revents != 0) {
+          const ssize_t got =
+              ::read(streams[i].fd, buffer.data(), buffer.size());
+          if (got > 0) {
+            Deliver(streams[i], buffer.data(), static_cast<std::size_t>(got));
+          } else if (got == 0 || (errno != EINTR && errno != EAGAIN)) {
+            open = false;
+          }
+        }
+        if (open) {
+          // Never a self-move, which may empty the path.
+          if (kept != i) streams[kept] = std::move(streams[i]);
+          ++kept;
+        } else {
+          ::close(streams[i].fd);
+        }
+      }
+      streams.resize(kept);
+    }
+    for (const auto& stream : streams) ::close(stream.fd);
+  }
+
+  // Appends `bytes` to `path`'s log up to kChildOutputLogMaxBytes. Returns
+  // the bytes it could not write.
+  static uint64_t WriteLog(LogFile& file, const std::string& path,
+                           std::string bytes) {
+    if (file.capped) return bytes.size();
+    if (file.fd < 0) {
+      file.fd =
+          ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+      if (file.fd < 0) {
+        if (!file.reported)
+          std::cerr << "[launcher] cannot open " << path << " ("
+                    << std::strerror(errno) << "); its output is dropped\n";
+        file.reported = true;
+        return bytes.size();
+      }
+    }
+    uint64_t lost = 0;
+    const std::string cap_note = "\n[launcher] output log reached " +
+                                 std::to_string(kChildOutputLogMaxBytes) +
+                                 " bytes; later output is dropped\n";
+    if (file.written + bytes.size() > kChildOutputLogMaxBytes) {
+      const uint64_t room = kChildOutputLogMaxBytes -
+                            std::min<uint64_t>(kChildOutputLogMaxBytes,
+                                               file.written + cap_note.size());
+      lost = bytes.size() - std::min<uint64_t>(room, bytes.size());
+      bytes.resize(bytes.size() - lost);
+      bytes += cap_note;
+      file.capped = true;
+    }
+    const std::size_t unwritten = WriteAll(file.fd, bytes);
+    file.written += bytes.size() - unwritten;
+    if (unwritten != 0 && !file.reported) {
+      std::cerr << "[launcher] cannot write " << path << " ("
+                << std::strerror(errno) << "); output is dropped\n";
+      file.reported = true;
+    }
+    return lost + unwritten;
+  }
+
+  // Writes all of `bytes` to `fd`. Returns the bytes left unwritten, with
+  // errno set, after an error.
+  static std::size_t WriteAll(int fd, std::string_view bytes) {
+    while (!bytes.empty()) {
+      const ssize_t wrote = ::write(fd, bytes.data(), bytes.size());
+      if (wrote < 0) {
+        if (errno == EINTR) continue;
+        return bytes.size();
+      }
+      bytes.remove_prefix(static_cast<std::size_t>(wrote));
+    }
+    return 0;
+  }
+
+  // Takes what the reader buffered and writes it out, until the reader has
+  // ended and nothing is left.
+  void WriteLoop() {
+    std::map<std::string, LogFile> files;
+    std::unique_lock lock{mutex_};
+    for (;;) {
+      arrived_.wait(lock, [this] { return dirty_ || reader_done_; });
+      if (!dirty_ && reader_done_) break;
+      dirty_ = false;
+      std::vector<std::pair<std::string, std::string>> batches;
+      for (auto& [path, pending] : pending_) {
+        if (pending.bytes.empty() && pending.dropped == 0) continue;
+        std::string bytes = std::move(pending.bytes);
+        pending.bytes.clear();
+        if (pending.dropped != 0) {
+          bytes += DropNote(bytes, pending.dropped,
+                            "the launcher's log writer fell behind");
+          pending.dropped = 0;
+        }
+        batches.emplace_back(path, std::move(bytes));
+      }
+      lock.unlock();
+      std::vector<std::pair<std::string, uint64_t>> lost;
+      for (auto& [path, bytes] : batches) {
+        const uint64_t count = WriteLog(files[path], path, std::move(bytes));
+        if (count != 0) lost.emplace_back(path, count);
+      }
+      lock.lock();
+      for (const auto& [path, count] : lost)
+        pending_[path].dropped_total += count;
+    }
+    lock.unlock();
+    for (auto& [path, file] : files)
+      if (file.fd >= 0) ::close(file.fd);
+  }
+
+  // Copies echoed output to the launcher's stdout, on its own thread: a
+  // stdout that is slow, or a pipe nobody reads, never holds up the logs.
+  void EchoLoop() {
+    std::unique_lock lock{mutex_};
+    for (;;) {
+      arrived_.wait(lock, [this] {
+        return !echo_.empty() || echo_dropped_ != 0 || reader_done_;
+      });
+      if (echo_.empty() && echo_dropped_ == 0) break;  // reader_done_
+      std::string echo = std::move(echo_);
+      echo_.clear();
+      if (echo_dropped_ != 0) {
+        echo +=
+            DropNote(echo, echo_dropped_, "the launcher's stdout fell behind");
+        echo_dropped_ = 0;
+      }
+      lock.unlock();
+      // Lost if stdout is closed.
+      WriteAll(STDOUT_FILENO, echo);
+      lock.lock();
+    }
+  }
+
+  int wake_[2]{-1, -1};
+  mutable std::mutex mutex_;
+  std::condition_variable arrived_;
+  // Guarded by mutex_.
+  std::vector<Stream> added_;
+  std::map<std::string, Pending> pending_;
+  std::string echo_;
+  uint64_t echo_dropped_{0};
+  bool dirty_{false};
+  bool stopping_{false};
+  bool reader_done_{false};
+  std::chrono::milliseconds linger_{0};
+  std::thread reader_;
+  std::thread writer_;
+  std::thread echoer_;
+};
+
+// While it lives, a SIGCHLD wakes Wait(): the supervision loop reaps an exit
+// as it happens rather than at its next pass. The self-pipe is created once
+// per process and never closed, so a late signal can never write into a
+// descriptor number another file has reused; the previous SIGCHLD action is
+// restored on destruction. The handler only writes one byte (SA_RESTART;
+// errno preserved), so it is safe on any thread that receives it.
+class ChildExitWakeup {
+ public:
+  ChildExitWakeup() {
+    {
+      const std::lock_guard lock{SpawnMutex()};
+      if (pipe_[0] < 0) {
+        int fds[2];
+        if (CloseOnExecPipe(fds)) {
+          for (const int fd : fds)
+            ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
+          pipe_[0] = fds[0];
+          pipe_[1] = fds[1];
+        }
+      }
+    }
+    if (pipe_[0] < 0) return;  // Wait() then sleeps, as a poll would.
+    struct sigaction action{};
+    action.sa_handler = &ChildExitWakeup::OnSignal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    installed_ = ::sigaction(SIGCHLD, &action, &previous_) == 0;
+  }
+  ~ChildExitWakeup() {
+    if (installed_) ::sigaction(SIGCHLD, &previous_, nullptr);
+  }
+  ChildExitWakeup(const ChildExitWakeup&) = delete;
+  ChildExitWakeup& operator=(const ChildExitWakeup&) = delete;
+
+  // Returns after `timeout`, or sooner once a child has exited since the
+  // last call.
+  void Wait(std::chrono::milliseconds timeout) const {
+    if (!installed_) {
+      std::this_thread::sleep_for(timeout);
+      return;
+    }
+    ::pollfd ready{pipe_[0], POLLIN, 0};
+    if (::poll(&ready, 1, static_cast<int>(timeout.count())) > 0) {
+      char drained[64];
+      while (::read(pipe_[0], drained, sizeof drained) > 0) {
+      }
+    }
+  }
+
+ private:
+  static void OnSignal(int /*signal*/) {
+    const int saved = errno;
+    const char byte = 0;
+    [[maybe_unused]] const ssize_t wrote = ::write(pipe_[1], &byte, 1);
+    errno = saved;
+  }
+
+  static inline int pipe_[2]{-1, -1};
+  struct sigaction previous_{};
+  bool installed_{false};
+};
+
+// SpawnProcess with the child's stdout and stderr drained into `path` by
+// `output` (echoed to the launcher's stdout with `echo`).
+inline pid_t SpawnDrained(std::vector<std::string> args, std::string& error,
+                          ChildOutput& output, const std::string& path,
+                          std::string_view name, bool echo) {
+  int reader = -1;
+  const pid_t pid =
+      SpawnProcess(std::move(args), error, SpawnOutput::kPipe, &reader);
+  if (pid > 0) output.Add(reader, path, name, pid, echo);
+  return pid;
 }
 
 // ---------------------------------------------------------------------------
@@ -925,6 +1478,28 @@ struct NodeDescription {
   introspect::Description declared;
 };
 
+// "9 SIGKILL": a signal's number, which differs between Linux and macOS
+// for some signals, and its name where it has a portable one.
+inline std::string SignalText(int signal) {
+  struct Named {
+    int signal;
+    const char* name;
+  };
+  static constexpr Named kNames[] = {
+      {SIGHUP, "SIGHUP"},   {SIGINT, "SIGINT"},   {SIGQUIT, "SIGQUIT"},
+      {SIGILL, "SIGILL"},   {SIGTRAP, "SIGTRAP"}, {SIGABRT, "SIGABRT"},
+      {SIGBUS, "SIGBUS"},   {SIGFPE, "SIGFPE"},   {SIGKILL, "SIGKILL"},
+      {SIGUSR1, "SIGUSR1"}, {SIGSEGV, "SIGSEGV"}, {SIGUSR2, "SIGUSR2"},
+      {SIGPIPE, "SIGPIPE"}, {SIGALRM, "SIGALRM"}, {SIGTERM, "SIGTERM"},
+      {SIGXCPU, "SIGXCPU"}, {SIGXFSZ, "SIGXFSZ"}, {SIGSYS, "SIGSYS"},
+  };
+  std::string text = std::to_string(signal);
+  for (const auto& named : kNames) {
+    if (named.signal == signal) return text + " " + named.name;
+  }
+  return text;
+}
+
 // Runs `args` (a binary and --describe) and parses the manifest from its
 // stdout, killing it after `timeout`: a node that blocks in its constructor
 // costs the launch that much and no more. stderr is left alone so a node that
@@ -933,18 +1508,10 @@ inline bool ProbeDescribe(const std::vector<std::string>& args,
                           std::chrono::milliseconds timeout,
                           introspect::Description& out, std::string& error) {
   error.clear();
-  int fds[2];
-  if (::pipe(fds) != 0) {
-    error = std::string{"pipe() failed: "} + std::strerror(errno);
-    return false;
-  }
-
-  const pid_t pid = SpawnProcess(args, error, "", fds[1]);
-  ::close(fds[1]);
-  if (pid < 0) {
-    ::close(fds[0]);
-    return false;
-  }
+  int answer = -1;
+  const pid_t pid =
+      SpawnProcess(args, error, SpawnOutput::kStdoutPipe, &answer);
+  if (pid < 0) return false;
 
   std::string text;
   const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -957,7 +1524,7 @@ inline bool ProbeDescribe(const std::vector<std::string>& args,
       timed_out = true;
       break;
     }
-    ::pollfd waiting{fds[0], POLLIN, 0};
+    ::pollfd waiting{answer, POLLIN, 0};
     const int ready = ::poll(&waiting, 1, static_cast<int>(left.count()));
     if (ready < 0) {
       if (errno == EINTR) continue;
@@ -969,7 +1536,7 @@ inline bool ProbeDescribe(const std::vector<std::string>& args,
       break;
     }
     char buffer[4096];
-    const ssize_t got = ::read(fds[0], buffer, sizeof(buffer));
+    const ssize_t got = ::read(answer, buffer, sizeof(buffer));
     if (got < 0) {
       if (errno == EINTR) continue;
       error = std::string{"read() failed: "} + std::strerror(errno);
@@ -982,7 +1549,7 @@ inline bool ProbeDescribe(const std::vector<std::string>& args,
     }
     text.append(buffer, static_cast<std::size_t>(got));
   }
-  ::close(fds[0]);
+  ::close(answer);
 
   int status = 0;
   if (!timed_out && error.empty()) {
@@ -1021,7 +1588,7 @@ inline bool ProbeDescribe(const std::vector<std::string>& args,
     if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
       error += "; exit code " + std::to_string(WEXITSTATUS(status));
     } else if (WIFSIGNALED(status)) {
-      error += "; killed by signal " + std::to_string(WTERMSIG(status));
+      error += "; killed by signal " + SignalText(WTERMSIG(status));
     }
     return false;
   }
@@ -1100,6 +1667,29 @@ inline std::string DeclaredGraphPath(const LauncherOptions& options) {
   return (dir / "declared_graph.json").string();
 }
 
+// Calls `run(i)` for every i below `count`, on up to one thread per hardware
+// thread, and returns when all have returned. `run` must not throw.
+inline void ForEachInParallel(std::size_t count,
+                              const std::function<void(std::size_t)>& run) {
+  const std::size_t width = std::min<std::size_t>(
+      count, std::max(1u, std::thread::hardware_concurrency()));
+  std::atomic<std::size_t> next{0};
+  const auto work = [&] {
+    for (std::size_t i = next++; i < count; i = next++) run(i);
+  };
+  std::vector<std::thread> threads;
+  threads.reserve(width > 0 ? width - 1 : 0);
+  for (std::size_t t = 1; t < width; ++t) {
+    try {
+      threads.emplace_back(work);
+    } catch (const std::system_error&) {
+      break;  // Fewer threads still run every index.
+    }
+  }
+  work();
+  for (auto& thread : threads) thread.join();
+}
+
 // Phase one of a launch: ask every binary in the roster what it is, assemble
 // the graph they describe, and lint it. The binaries, not the config, are the
 // source: a second declaration of the topology is a thing to forget to update.
@@ -1111,7 +1701,9 @@ inline std::string DeclaredGraphPath(const LauncherOptions& options) {
 // without a graph; then the descriptions of the nodes that do not read it
 // are written to DeclaredGraphPath, and each graph reader is described
 // again with `--graph` that file, which it is also started with. A graph
-// reader therefore sees every node but the graph readers.
+// reader therefore sees every node but the graph readers. Each pass probes
+// its binaries in parallel (ForEachInParallel), so a pass takes about as long
+// as its slowest probe rather than the sum of them.
 // Throws when that file cannot be written: a graph reader is never described,
 // or started, without the graph.
 inline std::vector<naming::Diagnostic> DescribeGraph(
@@ -1133,22 +1725,28 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
     if (options.simulation) args.push_back("--sim");
     if (!graph_path.empty()) args.insert(args.end(), {"--graph", graph_path});
     args.insert(args.end(), spec.extra_args.begin(), spec.extra_args.end());
-    described.answered = ProbeDescribe(
-        args, std::chrono::milliseconds{options.describe_timeout_ms},
-        described.declared, described.error);
+    try {
+      described.answered = ProbeDescribe(
+          args, std::chrono::milliseconds{options.describe_timeout_ms},
+          described.declared, described.error);
+    } catch (const std::exception& e) {
+      described.answered = false;
+      described.error = e.what();
+    }
   };
 
-  bool any_reader = false;
   for (const auto& spec : specs) {
-    NodeDescription described;
+    NodeDescription& described = out.emplace_back();
     described.roster_name = spec.name;
     described.target = spec.target;
     described.binary_path = spec.binary_path;
-    probe(spec, described, "");
-    any_reader =
-        any_reader || (described.answered && described.declared.reads_graph);
-    out.push_back(std::move(described));
   }
+  ForEachInParallel(specs.size(),
+                    [&](std::size_t i) { probe(specs[i], out[i], ""); });
+  const bool any_reader =
+      std::any_of(out.begin(), out.end(), [](const NodeDescription& node) {
+        return node.answered && node.declared.reads_graph;
+      });
 
   if (any_reader) {
     introspect::DeclaredGraph graph;
@@ -1166,10 +1764,13 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
       throw std::runtime_error("cannot write the declared graph " + graph_path +
                                " (" + error + ")");
     }
+    std::vector<std::size_t> readers;
     for (std::size_t i = 0; i < specs.size(); ++i) {
-      if (!out[i].answered || !out[i].declared.reads_graph) continue;
-      probe(specs[i], out[i], graph_path);
+      if (out[i].answered && out[i].declared.reads_graph) readers.push_back(i);
     }
+    ForEachInParallel(readers.size(), [&](std::size_t k) {
+      probe(specs[readers[k]], out[readers[k]], graph_path);
+    });
   }
 
   std::vector<naming::NodeShape> shapes;
@@ -1444,9 +2045,9 @@ inline bool ResolveMaxRestarts(const config::RobotConfig& robot_config,
   return true;
 }
 
-// "exit code N" or "signal N", from a waitpid status.
+// "exit code N" or "signal N SIGNAME", from a waitpid status.
 inline std::string ExitReason(int status) {
-  if (WIFSIGNALED(status)) return "signal " + std::to_string(WTERMSIG(status));
+  if (WIFSIGNALED(status)) return "signal " + SignalText(WTERMSIG(status));
   return "exit code " +
          std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
 }
@@ -1509,10 +2110,11 @@ class StudioBridge {
                const config::RobotConfig& robot_config,
                const LauncherOptions& options,
                const std::vector<NodeDescription>& described,
-               const std::string& graph_path)
+               const std::string& graph_path, ChildOutput& output)
       : index_{index},
         target_{spec.target},
-        log_path_{options.output_dir + "/studio_bridge.log"},
+        log_path_{NodeOutputPath(options.output_dir, kStudioBridgeName)},
+        output_{output},
         http_port_{EffectiveStudioHttpPort(robot_config, options)},
         args_{spec.binary_path,
               StudioBridgeWatchTopic(described, robot_config),
@@ -1547,7 +2149,7 @@ class StudioBridge {
     std::cout << "[launcher] Starting studio_bridge (target " << target_
               << ")...\n";
     std::string error;
-    const pid_t pid = SpawnProcess(args_, error, log_path_);
+    const pid_t pid = Spawn(error);
     if (pid < 0) {
       std::cerr << "[launcher] cannot spawn studio_bridge (" << error
                 << "); session runs without Studio\n";
@@ -1578,7 +2180,7 @@ class StudioBridge {
                                 stopping)) {
       const int last_code = proc.exit_code;
       std::string error;
-      const pid_t pid = SpawnProcess(args_, error, log_path_);
+      const pid_t pid = Spawn(error);
       if (pid < 0) {
         std::cerr << "[launcher] cannot spawn studio_bridge (" << error
                   << "); session runs without Studio\n";
@@ -1592,6 +2194,7 @@ class StudioBridge {
       proc.pid = pid;
       proc.exited = false;
       proc.exit_code = -1;
+      proc.exit_signal = 0;
       ++attempts_;
       last_spawn_ = now;
     } else if (now - last_spawn_ >= kStudioBridgeRetryInterval) {
@@ -1616,11 +2219,18 @@ class StudioBridge {
       }
       FinishProcessGroup(proc.pid);
       proc.exited = true;
+      proc.exit_signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
     }
     GiveUp(proc);
   }
 
  private:
+  // One attempt, its output drained into log_path_ only, never echoed.
+  pid_t Spawn(std::string& error) {
+    return SpawnDrained(args_, error, output_, log_path_, kStudioBridgeName,
+                        /*echo=*/false);
+  }
+
   void GiveUp(NodeProcessInfo& proc) {
     proc.failed = true;
     proc.exit_code = -1;
@@ -1630,6 +2240,7 @@ class StudioBridge {
   std::size_t index_;
   std::string target_;
   std::string log_path_;
+  ChildOutput& output_;
   uint16_t http_port_;
   std::vector<std::string> args_;
   int attempts_{0};
@@ -1833,6 +2444,14 @@ class Launcher {
     session_manifest_ = manifest;
     PersistManifest({});
 
+    // Every member's stdout and stderr, drained into its <name>.log.
+    try {
+      output_.emplace();
+    } catch (const std::exception& e) {
+      std::cerr << "launcher: " << e.what() << "; nothing was started\n";
+      return 1;
+    }
+
     std::vector<NodeProcessInfo> procs;
     procs.reserve(node_specs.size());
     std::optional<StudioBridge> studio;
@@ -1849,7 +2468,7 @@ class Launcher {
       proc.described = described[i].answered;
       if (spec.name == kStudioBridgeName) {
         studio.emplace(i, spec, proc, robot_config, options_, described,
-                       graph_path);
+                       graph_path, *output_);
       }
       if (!proc.log_path.empty()) proc.log_paths.push_back(proc.log_path);
     }
@@ -1955,6 +2574,14 @@ class Launcher {
 
     Supervise(procs, launches, studio, deadline);
     manifest.end_wall_ns = WallNanos();
+    // Every run has been reaped and its group killed, so the pipes end.
+    output_->Stop();
+    for (const auto& proc : procs) {
+      const std::string path = NodeOutputPath(options_.output_dir, proc.name);
+      if (const uint64_t dropped = output_->Dropped(path); dropped != 0)
+        std::cerr << "[launcher] " << proc.name << ": " << dropped
+                  << " bytes of output dropped (marked in " << path << ")\n";
+    }
 
     int exit_status = 0;
     for (auto& proc : procs) {
@@ -2331,7 +2958,9 @@ class Launcher {
       error = std::string{"fork: "} + std::strerror(EAGAIN);
       return -1;
     }
-    return SpawnProcess(launch.args, error);
+    return SpawnDrained(launch.args, error, *output_,
+                        NodeOutputPath(options_.output_dir, proc.name),
+                        proc.name, /*echo=*/true);
   }
 
   // Schedules `proc`'s next start: after a backoff that doubles with each
@@ -2450,6 +3079,7 @@ class Launcher {
     proc.pid = pid;
     proc.exited = false;
     proc.exit_code = -1;
+    proc.exit_signal = 0;
     launch.started_at = std::chrono::steady_clock::now();
     launch.heartbeat_changed_at = launch.started_at;
     launch.last_heartbeat = 0;
@@ -2522,6 +3152,7 @@ class Launcher {
       launch.heartbeat_changed_at = started;
     }
     ServiceNotifier notifier;
+    const ChildExitWakeup exits;  // A pass starts as soon as a child exits.
     notifier.Send("READY=1");
     auto next_lock_refresh = std::chrono::steady_clock::time_point::min();
     bool lock_lost_reported = false;
@@ -2631,6 +3262,7 @@ class Launcher {
         FinishProcessGroup(proc.pid);
         proc.exited = true;
         proc.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        proc.exit_signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
         PersistManifest(procs);
         const bool is_bridge = studio && i == studio->index();
         if (is_bridge && studio->Starting(i)) continue;
@@ -2648,8 +3280,7 @@ class Launcher {
           continue;
         }
         std::cout << "[launcher] Process " << proc.name << " (pid " << proc.pid
-                  << ") exited with code " << proc.exit_code;
-        std::cout << "\n";
+                  << ") exited (" << ExitReason(status) << ")\n";
       }
       for (std::size_t i = 0; i < procs.size(); ++i) {
         auto& launch = launches[i];
@@ -2721,7 +3352,7 @@ class Launcher {
             SignalProcessGroup(proc.pid, SIGKILL);
         }
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      exits.Wait(std::chrono::milliseconds(20));
     }
   }
 
@@ -2775,7 +3406,11 @@ class Launcher {
     std::cout << "Nodes (" << manifest.nodes.size() << "):\n";
     for (const auto& n : manifest.nodes) {
       std::cout << "  \u2022 " << n.name << " (pid=" << n.pid
-                << ", exit=" << n.exit_code << ", records=" << n.record_count
+                << ", exit=" << n.exit_code
+                << (n.exit_signal != 0
+                        ? " (signal " + SignalText(n.exit_signal) + ")"
+                        : std::string{})
+                << ", records=" << n.record_count
                 << ", restarts=" << n.restart_count
                 << ", failed=" << (n.failed ? "yes" : "no")
                 << ", log=" << n.log_path << ")\n";
@@ -2789,6 +3424,12 @@ class Launcher {
   SessionManifest session_manifest_;
   std::unique_ptr<ManifestWriter> manifest_writer_;  // PersistManifest
   int max_restarts_{kDefaultMaxRestarts};
+  // Drains every member's output for the session (Run); empty before it.
+  std::optional<ChildOutput> output_;
+  // Held by Run for the session, refreshed by Supervise; null without one.
+  const SessionLock* session_lock_{nullptr};
+  // Far inside macOS clean-tmps' 3 unused days (introspect::TouchLockFile).
+  static constexpr std::chrono::hours kSessionLockRefresh{1};
   static inline volatile std::sig_atomic_t stop_requested_{false};
 };
 

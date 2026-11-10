@@ -204,15 +204,20 @@ with open(manifest, encoding="utf-8") as source:
     m = json.load(source)
 print(f"session {m.get('session_id')} config {m.get('config_path')} "
       f"sha {m.get('config_sha256', '')[:16]}")
+session_dir = os.path.dirname(manifest)
 for n in m.get("nodes", []):
-    print(f"  {n.get('name')}: exit={n.get('exit_code')} "
+    signal = n.get("exit_signal") or 0  # Absent before the launcher wrote it.
+    ended = f" (signal {signal})" if signal else ""
+    print(f"  {n.get('name')}: exit={n.get('exit_code')}{ended} "
           f"failed={n.get('recorder_failed')} records={n.get('record_count')} "
-          f"{n.get('log_path')}")
+          f"{n.get('log_path')} "
+          f"output={os.path.join(session_dir, str(n.get('name')) + '.log')}")
 EOF
 }
 
 # --- fetch ------------------------------------------------------------------
-# Copy whole sessions, including manifests and every node's log attempts.
+# Copy whole sessions: manifests, every run's event log and each node's
+# output log (<name>.log).
 cmd_fetch() {
   [ $# -eq 1 ] || die "usage: deploy.sh fetch [--prefix DIR] DEST"
   python3 - "$PREFIX/logs" "$1" <<'EOF'
