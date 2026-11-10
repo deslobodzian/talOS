@@ -2,7 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdint>
+#include <deque>
 #include <iterator>
 
 namespace talos::hardware {
@@ -236,6 +238,110 @@ TEST(ClockOffset, RetainedMinimumRoundTripBoundPropagatesOscillatorDrift) {
       EXPECT_GE(error, -static_cast<int64_t>(estimator.uncertainty_us()));
     }
   }
+}
+
+// The bridge's real cadence (HardwareNode::Tick): a 1 ms bridge tick, one
+// probe outstanding and at most one every 20 ms, completed on the bridge tick
+// after the State that echoes it. The gateway samples every 5 ms of its own
+// clock and echoes a probe on the tick after the one that received it. Both
+// one-way delays jitter between 0.1 and 3.1 ms, so each exchange's RTT
+// differs, and the gateway clock runs 500 ppm fast. Once valid, the mapping
+// stays valid on every State for a minute, and its bound always holds.
+TEST(ClockOffset, BridgeCadenceExchangesKeepTheBoundValidWithoutGaps) {
+  constexpr std::uint64_t kBoot = 7;
+  // Gateway microseconds per bridge microsecond, and the bridge time of the
+  // gateway's clock zero.
+  constexpr double kGatewayRate = 1.0005;
+  constexpr std::uint64_t kGatewayBootUs = 40'000'000;
+  constexpr std::uint64_t kSimulatedUs = 60'000'000;
+  std::uint64_t seed = 1;
+  const auto delay_us = [&seed] {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return 100.0 + static_cast<double>((seed >> 33) % 3000);
+  };
+  const auto bridge_us = [](std::uint64_t gateway_us) {
+    return static_cast<double>(kGatewayBootUs) +
+           static_cast<double>(gateway_us) / kGatewayRate;
+  };
+
+  struct Datagram {
+    double arrival_us;       // bridge clock
+    std::uint64_t time_us;   // probe: bridge send time; State: gateway sample
+    std::uint64_t probe_us;  // State: the echoed probe's send time
+  };
+  std::deque<Datagram> probes;  // bridge -> gateway
+  std::deque<Datagram> states;  // gateway -> bridge
+  std::uint64_t gateway_tick_us = 0;
+  // The probe the gateway's next State echoes.
+  std::uint64_t gateway_probe_us = 0;
+  const auto run_gateway_until = [&](std::uint64_t bridge_now_us) {
+    for (; bridge_us(gateway_tick_us) <= static_cast<double>(bridge_now_us);
+         gateway_tick_us += 5000) {
+      const double tick_us = bridge_us(gateway_tick_us);
+      const double arrival_us = tick_us + delay_us();
+      states.push_back({arrival_us, gateway_tick_us, gateway_probe_us});
+      while (!probes.empty() && probes.front().arrival_us <= tick_us) {
+        gateway_probe_us = probes.front().time_us;
+        probes.pop_front();
+      }
+    }
+  };
+
+  Estimator clock;
+  std::uint64_t last_probe_us = 0;
+  bool probe_waiting = false;
+  bool exchange_pending = false;
+  std::uint64_t pending_t1 = 0;
+  std::uint64_t pending_t2 = 0;
+  std::uint64_t valid_from_us = 0;
+  std::uint64_t states_seen = 0;
+  std::uint64_t invalid_after_valid = 0;
+  std::uint64_t outside_bound = 0;
+  for (std::uint64_t now = kGatewayBootUs + 1000;
+       now < kGatewayBootUs + kSimulatedUs; now += 1000) {
+    if (exchange_pending) {
+      clock.ObserveExchange(kBoot, pending_t1, pending_t2, now);
+      exchange_pending = false;
+      probe_waiting = false;
+    }
+    if (!probe_waiting &&
+        (last_probe_us == 0 || now - last_probe_us >= 20000)) {
+      last_probe_us = now;
+      probe_waiting = true;
+      probes.push_back({static_cast<double>(now) + delay_us(), now, 0});
+    }
+    run_gateway_until(now);
+    while (!states.empty() &&
+           states.front().arrival_us <= static_cast<double>(now)) {
+      const Datagram state = states.front();
+      states.pop_front();
+      ASSERT_TRUE(clock.Observe(kBoot, state.time_us, now));
+      ++states_seen;
+      if (probe_waiting && !exchange_pending &&
+          state.probe_us == last_probe_us) {
+        exchange_pending = true;
+        pending_t1 = state.probe_us;
+        pending_t2 = state.time_us;
+      }
+      if (!clock.accuracy_valid()) {
+        invalid_after_valid += valid_from_us != 0;
+        continue;
+      }
+      if (valid_from_us == 0) valid_from_us = now;
+      const double true_offset_us =
+          bridge_us(state.time_us) - static_cast<double>(state.time_us);
+      const double error_us =
+          static_cast<double>(clock.bounded_offset_us()) - true_offset_us;
+      if (std::abs(error_us) > static_cast<double>(clock.uncertainty_us())) {
+        ++outside_bound;
+      }
+    }
+  }
+  EXPECT_GT(states_seen, 11'900u);
+  ASSERT_NE(valid_from_us, 0u);
+  EXPECT_LT(valid_from_us, kGatewayBootUs + 100'000);
+  EXPECT_EQ(invalid_after_valid, 0u);
+  EXPECT_EQ(outside_bound, 0u);
 }
 
 }  // namespace

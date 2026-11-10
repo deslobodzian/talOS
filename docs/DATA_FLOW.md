@@ -266,9 +266,12 @@ Gateway and bridge each deliberately defer one tick: tick-start timestamps
 otherwise precede receive and cannot honestly bound the exchange.
 No symmetry assumption is needed; processing/residence time remains in the
 bound instead of requiring extra receive/transmit wire stamps.
-Select the minimum-RTT exchange for at most one second. A new boot resets it;
-eight ordered States and an unexpired exchange are required for
-`clock_offset_valid` / `HardwareLink::sample_time()`. One-way spread remains
+Every exchange of the last second is kept (up to 64), and each State uses the
+minimum-RTT one that is at most one second old, so the next best is already
+held when the selected one expires and validity does not lapse while probes
+are answered. A new boot clears them; eight ordered States and an unexpired
+exchange are required for `clock_offset_valid` /
+`HardwareLink::sample_time()`. One-way spread remains
 diagnostic only: constant delay produces zero spread but nonzero error.
 There is no specified fusion accuracy threshold, so report uncertainty rather
 than inventing one. This bounds clock mapping, not CAN acquisition-age error;

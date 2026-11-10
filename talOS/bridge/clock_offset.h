@@ -3,9 +3,13 @@
 // Gateway-to-node clock mapping. Production uses bounded_offset_us() from a
 // causal two-way exchange; offset_us()/spread_us() are the one-way diagnostic
 // below and MUST NOT be treated as an accuracy bound.
-// accuracy_valid() expires after one second of sample progress. Its error
-// bound assumes nonnegative delay and <=1000 ppm relative oscillator drift.
-// No fusion accuracy threshold has been specified.
+// The estimator keeps every exchange of the current boot from the last
+// second (up to kExchangeSlots) and, at each State, uses the minimum-RTT one
+// that is still at most one second old. A kept exchange therefore expires
+// only while a younger one is held, and accuracy_valid() stays true as long
+// as exchanges keep arriving less than a second apart. Its error bound
+// assumes nonnegative delay and <=1000 ppm relative oscillator drift. No
+// fusion accuracy threshold has been specified.
 //
 // One-way diagnostic (not the production mapping):
 //
@@ -60,6 +64,10 @@ class ClockOffsetEstimator {
  public:
   static constexpr std::size_t kWindowSamples = 200;
   static constexpr std::size_t kConvergedSamples = 8;
+  // A second of exchanges at the bridge's 50 Hz probe rate, with margin. A
+  // faster caller overwrites the oldest; any exchange kept is still causal.
+  static constexpr std::size_t kExchangeSlots = 64;
+  static constexpr std::uint64_t kExchangeLifetimeUs = 1'000'000;
 
   // One received gateway state: its boot, its gateway-clock sample time and
   // the bridge-clock time it was received. Returns whether it entered the
@@ -71,6 +79,7 @@ class ClockOffsetEstimator {
   // t2, bridge time t4 sampled AFTER receiving that State. No symmetry
   // assumption: offset lies in [t1 - t2, t4 - t2]. Residence time is retained
   // in RTT, making this looser but safer than subtracting guessed processing.
+  // Ignored for another boot, t1 == 0, t4 < t1, or a round trip over 1 s.
   void ObserveExchange(std::uint64_t boot_id, std::uint64_t t1,
                        std::uint64_t t2, std::uint64_t t4);
   bool accuracy_valid() const { return exchange_valid_; }
@@ -93,6 +102,18 @@ class ClockOffsetEstimator {
   std::uint64_t ignored_count() const { return ignored_; }
 
  private:
+  struct Exchange {
+    std::int64_t offset_us;       // midpoint of [t1 - t2, t4 - t2]
+    std::uint64_t round_trip_us;  // t4 - t1
+    std::uint64_t sample_us;      // t2, gateway clock
+    std::uint64_t receipt_us;     // t4, bridge clock
+  };
+
+  // Picks the minimum-RTT kept exchange at most kExchangeLifetimeUs old at
+  // (bridge receipt_us, gateway sample_time_us), and sets accuracy_valid()
+  // and the bound from it.
+  void SelectExchange(std::uint64_t receipt_us, std::uint64_t sample_time_us);
+
   std::array<std::int64_t, kWindowSamples> delays_us_{};  // ring buffer
   std::size_t next_{0};   // where the next delay goes
   std::size_t count_{0};  // delays held, at most kWindowSamples
@@ -106,8 +127,9 @@ class ClockOffsetEstimator {
   std::int64_t bounded_offset_us_{};
   std::uint64_t uncertainty_us_{};
   std::uint64_t round_trip_us_{};
-  std::uint64_t exchange_time_us_{};
-  std::uint64_t exchange_sample_us_{};
+  std::array<Exchange, kExchangeSlots> exchanges_{};  // ring buffer
+  std::size_t next_exchange_{0};
+  std::size_t exchange_count_{0};
 };
 
 }  // namespace talos::hardware
