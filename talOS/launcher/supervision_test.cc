@@ -1371,31 +1371,5 @@ TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
   ::remove(runs.c_str());
 }
 
-TEST(Supervision, SimGatewayDoesNotRequireFrameworkRegistration) {
-  auto options = BaseOptions(
-      "gateway_out",
-      "max_restarts = 1\nsim_gateway = \"//example/sim_gateway:node\"\n");
-  options.simulation = true;
-  options.start_sim_gateway = true;
-  options.heartbeat_startup_grace_ms = 0;
-  options.duration_s = 3;
-  const auto runs = TempPath("gateway_runs");
-  ::remove(runs.c_str());
-  options.binary_overrides["//example/sim_gateway:node"] = WriteStub(
-      "gateway", "echo run >> " + runs + "\nexec sleep 1\n", "sim_gateway");
-  options.binary_overrides["//example/alpha:node"] =
-      WriteStub("gateway_alpha", "exit 0\n");
-  options.binary_overrides["//example/beta:node"] =
-      WriteStub("gateway_beta", "exit 0\n");
-  EXPECT_EQ(RunSession(options), 0);
-  EXPECT_EQ(ReadLines(runs).size(), 1u);
-  const auto gateway = ManifestEntry(
-      ReadFile(options.output_dir + "/manifest.json"), "sim_gateway");
-  EXPECT_NE(gateway.find("\"described\": true"), std::string::npos) << gateway;
-  EXPECT_NE(gateway.find("\"restart_count\": 0"), std::string::npos) << gateway;
-  std::filesystem::remove_all(options.output_dir);
-  ::remove(runs.c_str());
-}
-
 }  // namespace
 }  // namespace talos::launcher

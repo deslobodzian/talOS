@@ -3198,8 +3198,10 @@ class Launcher {
           launch.restart_times.pop_front();
         }
         if (proc.pid <= 0 || proc.exited) continue;
+        // Every member but Studio's bridge, which takes no registry row, is
+        // supervised by its row; the simulation gateway registers like a node.
         if (!stopping && !launch.heartbeat_killed &&
-            !(studio && i == studio->index()) && proc.name != kSimGatewayName) {
+            !(studio && i == studio->index())) {
           bool found = false;
           bool constructing = false;
           uint32_t recording = 0;
