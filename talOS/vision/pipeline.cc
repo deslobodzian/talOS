@@ -14,6 +14,7 @@
 #include <thread>
 #include <utility>
 
+#include "talOS/process/process.h"
 #include "talOS/vision/metal/metal_apriltag_backend.h"
 
 namespace talos::vision {
@@ -62,8 +63,7 @@ std::shared_ptr<ComputeBackend> MakeGpuBackend(const PipelineConfig& config) {
   if (config.gpu_backend_factory) {
     return config.gpu_backend_factory(config.detector_options);
   }
-  return std::make_shared<metal::MetalAprilTagBackend>(
-      config.detector_options);
+  return std::make_shared<metal::MetalAprilTagBackend>(config.detector_options);
 }
 
 std::shared_ptr<ComputeBackend> MakeBackend(const PipelineConfig& config) {
@@ -131,6 +131,8 @@ AprilTagPipeline::AprilTagPipeline(const PipelineConfig& config,
   // Detached: joining could block shutdown on the same lock construction
   // must not wait for.
   std::thread([init = gpu_init_, gpu_config = config_] {
+    // Compiling Metal pipelines takes seconds; the node loops come first.
+    talos::process::ConfigureBackgroundThread();
     const auto start = std::chrono::steady_clock::now();
     std::shared_ptr<ComputeBackend> gpu;
     std::string info;

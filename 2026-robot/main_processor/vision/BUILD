@@ -37,6 +37,7 @@ cc_library(
         "//talOS/hardware:sim_messages",
         "//talOS/msgs:geometry",
         "//talOS/node",
+        "//talOS/process",
         "//talOS/vision:camera_source",
         "//talOS/vision:frame_mailbox",
         "//talOS/vision:localization",

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -12,11 +13,18 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "talOS/geometry/se3.h"
+#include "talOS/process/process.h"
 #include "talOS/vision/apriltag/test_image_loader.h"
+
+extern "C" {
+#include <apriltag.h>
+#include <common/workerpool.h>
+}
 
 namespace talos::vision::apriltag {
 namespace {
@@ -422,6 +430,55 @@ TEST(CpuAprilTagBackendTest, PoseUsesUndistortedCorners) {
              Eigen::Matrix3d::Identity())
                 .norm(),
             1e-10);
+}
+
+namespace {
+
+// What each pool thread reports, one task per thread: a task waits until
+// every thread holds one, so no thread runs two.
+struct PoolProbe {
+  std::mutex mutex;
+  std::condition_variable arrived_all;
+  int threads = 0;
+  int arrived = 0;
+  int background = 0;
+};
+
+void ProbeThread(void* argument) {
+  auto& probe = *static_cast<PoolProbe*>(argument);
+  const bool background = talos::process::ThreadIsBackground();
+  std::unique_lock lock{probe.mutex};
+  probe.background += background ? 1 : 0;
+  if (++probe.arrived == probe.threads) {
+    probe.arrived_all.notify_all();
+    return;
+  }
+  probe.arrived_all.wait(lock,
+                         [&probe] { return probe.arrived == probe.threads; });
+}
+
+}  // namespace
+
+// The detector's pool threads (created by the library with default
+// attributes, from a thread at ordinary priority) must run below the node
+// loops, and the pool must be the size detection keeps, not one it replaces.
+TEST(CpuAprilTagBackendTest, DetectorPoolThreadsRunAtBackgroundPriority) {
+  apriltag_detector_t* td = apriltag_detector_create();
+  td->nthreads = 3;
+  EnsureBackgroundWorkerPool(td);
+  ASSERT_NE(td->wp, nullptr);
+  EXPECT_EQ(workerpool_get_nthreads(td->wp), td->nthreads);
+
+  PoolProbe probe;
+  probe.threads = td->nthreads;
+  for (int i = 0; i < td->nthreads; ++i) {
+    workerpool_add_task(td->wp, ProbeThread, &probe);
+  }
+  workerpool_run(td->wp);
+  apriltag_detector_destroy(td);
+
+  EXPECT_EQ(probe.arrived, 3);
+  EXPECT_EQ(probe.background, 3);
 }
 
 }  // namespace talos::vision::apriltag

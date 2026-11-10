@@ -70,6 +70,22 @@ production policy, against a simulated gateway (which itself never runs
 realtime) (`talOS/process` `RealtimeRequested`). Nodes and the bridge
 inherit the variable from the launcher.
 
+A thread the node starts must not run at the loop's priority. On Linux a
+thread created after the loop thread went realtime inherits `SCHED_FIFO`, so
+an unbounded helper (capture, detection, encoding) would preempt every control
+loop; under timeshare (`--sim`) it competes with them as an equal. A helper
+thread calls `talos::process::ConfigureBackgroundThread()` first: on Linux it
+leaves an inherited realtime policy for `SCHED_OTHER` at nice
+`kBackgroundNice` (10), which threads it creates inherit; on macOS it sets
+`QOS_CLASS_UTILITY`, which new threads do not inherit, so each thread calls it
+itself (a dispatch queue takes the QoS in its attributes). In the vision
+node the camera worker, the Metal compile thread and the frame recorder call
+it; the V4L2 capture thread inherits it from the worker, the AVFoundation
+capture queue is created at that QoS, and the AprilTag detector pool's
+threads, which the library creates, each call it from a task
+(`EnsureBackgroundWorkerPool`). Threads a Python node starts have no such
+call: start none whose work is unbounded.
+
 ### Stopping
 
 Once `talos::Run` / `talos.run` starts a live node, SIGINT or SIGTERM stops it

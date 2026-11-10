@@ -190,7 +190,12 @@ class Source final : public CameraSource {
       delegate_->callback = [this](CMSampleBufferRef sample) {
         Receive(sample);
       };
-      dispatch_ = dispatch_queue_create("talos.camera", DISPATCH_QUEUE_SERIAL);
+      // Frame delivery runs at the QoS that
+      // talos::process::ConfigureBackgroundThread gives camera workers,
+      // below every node loop.
+      dispatch_ = dispatch_queue_create(
+          "talos.camera", dispatch_queue_attr_make_with_qos_class(
+                              DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
       [output_ setSampleBufferDelegate:delegate_ queue:dispatch_];
       if (![session_ canAddOutput:output_]) {
         [session_ commitConfiguration];

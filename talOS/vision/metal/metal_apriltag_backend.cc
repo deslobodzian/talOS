@@ -785,6 +785,7 @@ struct MetalAprilTagBackend::Impl {
           stage2_sizes, stage2_cands, stage2_cand_count);
     }
 
+    talos::vision::apriltag::EnsureBackgroundWorkerPool(td);
     auto t_detect_start = std::chrono::steady_clock::now();
     zarray_t* raw_detections = nullptr;
     // Quad fitting stays on CPU by measurement: GPU line-fit terms, the

@@ -105,5 +105,62 @@ TEST(ProcessTest, RealtimeIsBestEffort) {
   EXPECT_EQ(outcome.returned, outcome.realtime);
 }
 
+// A helper thread doing unbounded work (camera capture, detection) must run
+// below every loop thread, which runs at the default timeshare priority under
+// --sim.
+TEST(ProcessTest, BackgroundThreadRunsBelowTheDefaultPriority) {
+  static_assert(noexcept(ConfigureBackgroundThread()));
+  bool before = true;
+  bool returned = false;
+  bool after = false;
+  std::thread worker{[&] {
+    before = ThreadIsBackground();
+    returned = ConfigureBackgroundThread();
+    after = ThreadIsBackground();
+  }};
+  worker.join();
+
+  EXPECT_FALSE(before);
+  EXPECT_TRUE(returned);
+  EXPECT_TRUE(after);
+}
+
+// A thread created by a realtime loop thread inherits SCHED_FIFO on Linux.
+// The helper must take it out of realtime, and so must keep any thread it
+// creates afterwards (a detector's worker pool) out of realtime too; on Linux
+// that thread also inherits the background nice value.
+TEST(ProcessTest, BackgroundThreadLeavesAnInheritedRealtimePolicy) {
+  ::unsetenv("TALOS_REALTIME");
+  bool parent_realtime = false;
+  bool returned = false;
+  bool child_realtime = true;
+  bool grandchild_realtime = true;
+  bool grandchild_background = false;
+  std::thread parent{[&] {
+    ConfigureRealtime({.period = 10ms, .priority = 1});
+    parent_realtime = ThreadIsRealtime();
+    if (!parent_realtime) return;
+    std::thread child{[&] {
+      returned = ConfigureBackgroundThread();
+      child_realtime = ThreadIsRealtime();
+      std::thread grandchild{[&] {
+        grandchild_realtime = ThreadIsRealtime();
+        grandchild_background = ThreadIsBackground();
+      }};
+      grandchild.join();
+    }};
+    child.join();
+  }};
+  parent.join();
+  if (!parent_realtime) GTEST_SKIP() << "realtime refused; nothing to inherit";
+
+  EXPECT_TRUE(returned);
+  EXPECT_FALSE(child_realtime);
+  EXPECT_FALSE(grandchild_realtime);
+#if !defined(__APPLE__)
+  EXPECT_TRUE(grandchild_background);
+#endif
+}
+
 }  // namespace
 }  // namespace talos::process

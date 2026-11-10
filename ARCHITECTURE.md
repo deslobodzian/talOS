@@ -57,7 +57,7 @@ Beside the stack:
 | `talOS/driver_station` | Driver Station codec |
 | `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed or stalled nodes per its [restart policy](talOS/launcher/README.md#restarts)); writes each session to `<output-dir>/<session_id>/` with a manifest kept current and old sessions pruned; `--describe-only` lints the graph |
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |
-| `talOS/process` | stop handlers and `ConfigureRealtime` for node binaries; `DurableSync`, the power-loss-safe sync of the launcher's session files and event logs |
+| `talOS/process` | stop handlers, `ConfigureRealtime` for node binaries and `ConfigureBackgroundThread` for their helper threads; `DurableSync`, the power-loss-safe sync of the launcher's session files and event logs |
 | `talOS/msgs` | shared geometry and control message structs (field and chassis angles in radians; `SwerveModulePosition`, `PoseObservation`, `PoseEstimate`) |
 | `talOS/telemetry` | `:node` framework node, telemetry frame schema, byte-topic wire format; schema-less `/hw/state` is excluded because `/hw/status` (`bridge::BridgeStatus`) already reports link health. |
 | `talOS/teleop` | `:node` framework teleop node; `:deadband` stick deadband calculation; declarative button/axis-to-lane mapping |
@@ -178,7 +178,9 @@ or a Driver Station listener, or with no timer, also drains every 1 ms.
 Off-simulation the loop thread runs under `SCHED_FIFO` (Linux) or the Mach
 time-constraint policy (macOS) with memory locked, best effort
 (`talOS/process`; `TALOS_REALTIME` overrides it, see the node development
-guide's realtime scheduling paragraph).
+guide's realtime scheduling paragraph). Helper threads, such as camera capture
+and AprilTag detection, run below every loop thread
+(`ConfigureBackgroundThread`).
 
 Messages become visible when the consumer drains its topics, but `age()` and
 `fresh()` count from the writer's publication timestamp. Draining an expired

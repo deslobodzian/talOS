@@ -1,16 +1,19 @@
 #include "talOS/vision/apriltag/cpu_apriltag_backend.h"
 
 #include <array>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <opencv2/imgcodecs.hpp>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "talOS/process/process.h"
 #include "talOS/vision/localization.h"
 
 extern "C" {
@@ -18,6 +21,7 @@ extern "C" {
 #include <common/image_u8.h>
 #include <common/matd.h>
 #include <common/pjpeg.h>
+#include <common/workerpool.h>
 #include <tag16h5.h>
 #include <tag25h9.h>
 #include <tag36h11.h>
@@ -29,6 +33,48 @@ extern "C" {
 }
 
 namespace talos::vision::apriltag {
+
+namespace {
+
+// One task per pool thread: each lowers its own thread, then waits until
+// every other thread has taken its task, so no thread takes two.
+struct PoolStart {
+  std::mutex mutex;
+  std::condition_variable arrived_all;
+  int arrived = 0;
+  int threads = 0;
+};
+
+void EnterBackground(void* argument) {
+  auto& start = *static_cast<PoolStart*>(argument);
+  talos::process::ConfigureBackgroundThread();
+  std::unique_lock lock{start.mutex};
+  if (++start.arrived == start.threads) {
+    start.arrived_all.notify_all();
+    return;
+  }
+  start.arrived_all.wait(lock,
+                         [&start] { return start.arrived == start.threads; });
+}
+
+}  // namespace
+
+void EnsureBackgroundWorkerPool(apriltag_detector_t* td) {
+  if (td->wp != nullptr && workerpool_get_nthreads(td->wp) == td->nthreads) {
+    return;
+  }
+  workerpool_destroy(td->wp);
+  // On failure the detection that follows retries and reports it.
+  td->wp = workerpool_create(td->nthreads);
+  // With one thread the pool runs its tasks on the caller.
+  if (td->wp == nullptr || td->nthreads <= 1) return;
+  PoolStart start;
+  start.threads = td->nthreads;
+  for (int i = 0; i < td->nthreads; ++i) {
+    workerpool_add_task(td->wp, EnterBackground, &start);
+  }
+  workerpool_run(td->wp);
+}
 
 struct CpuAprilTagBackend::Impl {
   apriltag_detector_t* td = nullptr;
@@ -126,6 +172,7 @@ static std::vector<Detection> ProcessDetections(
     const CpuAprilTagBackend& backend, apriltag_detector_t* td, image_u8_t* im,
     const CameraIntrinsics* intrinsics = nullptr,
     double tag_size_meters = 0.0) {
+  EnsureBackgroundWorkerPool(td);
   zarray_t* raw_detections = apriltag_detector_detect(td, im);
   std::vector<Detection> results;
   const int count = zarray_size(raw_detections);

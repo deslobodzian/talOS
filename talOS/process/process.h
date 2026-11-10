@@ -1,7 +1,8 @@
 #pragma once
 
 // Process-lifetime plumbing shared by every talOS node binary: stop signals
-// and the realtime scheduling of the thread that runs the loop.
+// the realtime scheduling of the thread that runs the loop, and the
+// background scheduling of helper threads.
 
 #include <signal.h>
 
@@ -28,7 +29,7 @@ inline void RequestStop(int) {
 // already installed restarting handlers, so behaviour after construction is
 // unchanged.
 inline void InstallStopHandlers() {
-  struct sigaction action{};
+  struct sigaction action {};
   action.sa_handler = RequestStop;
   sigemptyset(&action.sa_mask);
   action.sa_flags = SA_RESTART;
@@ -63,5 +64,27 @@ bool RealtimeRequested(bool simulation) noexcept;
 // memlock limit, a refused Mach policy); the steps it could take
 // stay in effect. Never throws, never aborts.
 bool ConfigureRealtime(const RealtimeOptions& options) noexcept;
+
+// The nice value ConfigureBackgroundThread gives a thread on Linux.
+inline constexpr int kBackgroundNice = 10;
+
+// Best effort, for the calling thread: puts it below every node loop thread,
+// for a helper thread doing unbounded work (camera capture and detection,
+// image encoding). On Linux it leaves any realtime policy it inherited (a
+// thread created after ConfigureRealtime inherits SCHED_FIFO) for SCHED_OTHER
+// and raises its nice value to at least kBackgroundNice; threads it creates
+// afterwards inherit both. On macOS it sets QOS_CLASS_UTILITY, below the
+// default QoS a loop thread runs at under timeshare; a thread created with
+// pthread_create starts at the default QoS again (macOS does not inherit
+// QoS or the time-constraint policy), so every thread calls this itself.
+// Independent of TALOS_REALTIME.
+//
+// Returns true when every step took effect; otherwise prints one line to
+// stderr and returns false. Never throws.
+bool ConfigureBackgroundThread() noexcept;
+
+// Whether the calling thread runs at the background priority
+// ConfigureBackgroundThread sets (or lower).
+bool ThreadIsBackground() noexcept;
 
 }  // namespace talos::process

@@ -87,6 +87,7 @@ cc_library(
         ":compute_backend",
         ":frame",
         ":localization",
+        "//talOS/process",
         "//talOS/vision/metal:metal_apriltag_backend",
     ],
 )

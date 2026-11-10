@@ -27,6 +27,7 @@
 #include "geometry/geometry_generated.h"
 #include "sim/topics.h"
 #include "talOS/node/node.h"
+#include "talOS/process/process.h"
 #include "talOS/vision/capture/avfoundation_source.h"
 #include "talOS/vision/field_sim/field_layout_loader.h"
 #include "talOS/vision/field_sim/tag_patterns.h"
@@ -199,9 +200,17 @@ class Vision {
       // the source, and frames may arrive before Start() returns. Each slot
       // instead grows to the negotiated frame size the first time it is
       // filled (three allocations), then capture copies without allocating.
-      worker_ = std::thread([this] { Work(); });
+      worker_ = std::thread([this] {
+        // Capture, detection and the threads they start run below every
+        // node loop (talOS/process ConfigureBackgroundThread).
+        talos::process::ConfigureBackgroundThread();
+        Work();
+      });
     } else if (simulated_ && rasterize_) {
-      worker_ = std::thread([this] { SimWork(); });
+      worker_ = std::thread([this] {
+        talos::process::ConfigureBackgroundThread();
+        SimWork();
+      });
     }
   }
 

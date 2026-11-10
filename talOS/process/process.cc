@@ -2,6 +2,7 @@
 
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -16,8 +17,11 @@
 #include <mach/mach_error.h>
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
+#include <pthread/qos.h>
 #else
 #include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace talos::process {
@@ -105,6 +109,64 @@ void SetThreadPolicy(const RealtimeOptions& options, Problems& problems) {
 
 #endif
 
+#if defined(__APPLE__)
+
+bool HasTimeConstraint() {
+  thread_time_constraint_policy_data_t policy{};
+  mach_msg_type_number_t count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+  boolean_t get_default = FALSE;
+  const kern_return_t result = ::thread_policy_get(
+      ::pthread_mach_thread_np(::pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
+      reinterpret_cast<thread_policy_t>(&policy), &count, &get_default);
+  return result == KERN_SUCCESS && get_default == FALSE;
+}
+
+void SetBackground(Problems& problems) {
+  const int result = ::pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+  if (result == 0) return;
+  problems.add("QOS_CLASS_UTILITY", std::strerror(result));
+  // The kernel refuses a QoS for a thread under an explicit Mach policy;
+  // leaving the time-constraint policy at least stops it preempting loops.
+  if (!HasTimeConstraint()) return;
+  thread_standard_policy_data_t standard{};
+  const kern_return_t dropped = ::thread_policy_set(
+      ::pthread_mach_thread_np(::pthread_self()), THREAD_STANDARD_POLICY,
+      reinterpret_cast<thread_policy_t>(&standard),
+      THREAD_STANDARD_POLICY_COUNT);
+  if (dropped != KERN_SUCCESS) {
+    problems.add("standard policy", ::mach_error_string(dropped));
+  }
+}
+
+#else
+
+bool IsRealtimePolicy(int policy) {
+  return policy == SCHED_FIFO || policy == SCHED_RR;
+}
+
+void SetBackground(Problems& problems) {
+  int policy = SCHED_OTHER;
+  sched_param param{};
+  if (::pthread_getschedparam(::pthread_self(), &policy, &param) == 0 &&
+      IsRealtimePolicy(policy)) {
+    param = sched_param{};
+    const int result =
+        ::pthread_setschedparam(::pthread_self(), SCHED_OTHER, &param);
+    if (result != 0) problems.add("SCHED_OTHER", std::strerror(result));
+  }
+  // Linux keeps a nice value per thread; PRIO_PROCESS with a thread id sets
+  // only that thread's. Never lowered: that would need privilege.
+  const auto tid = static_cast<id_t>(::syscall(SYS_gettid));
+  errno = 0;
+  const int nice = ::getpriority(PRIO_PROCESS, tid);
+  if (errno == 0 && nice >= kBackgroundNice) return;
+  if (::setpriority(PRIO_PROCESS, tid, kBackgroundNice) != 0) {
+    problems.add("nice", std::strerror(errno));
+  }
+}
+
+#endif
+
 }  // namespace
 
 bool RealtimeRequested(bool simulation) noexcept {
@@ -125,6 +187,34 @@ bool ConfigureRealtime(const RealtimeOptions& options) noexcept {
   std::fprintf(stderr, "talos: realtime scheduling incomplete: %s\n",
                problems.text());
   return false;
+}
+
+bool ConfigureBackgroundThread() noexcept {
+  Problems problems;
+  SetBackground(problems);
+  if (problems.empty()) return true;
+  std::fprintf(stderr, "talos: background scheduling incomplete: %s\n",
+               problems.text());
+  return false;
+}
+
+bool ThreadIsBackground() noexcept {
+#if defined(__APPLE__)
+  const qos_class_t qos = ::qos_class_self();
+  return !HasTimeConstraint() && qos != QOS_CLASS_UNSPECIFIED &&
+         qos <= QOS_CLASS_UTILITY;
+#else
+  int policy = SCHED_OTHER;
+  sched_param param{};
+  if (::pthread_getschedparam(::pthread_self(), &policy, &param) != 0 ||
+      IsRealtimePolicy(policy)) {
+    return false;
+  }
+  errno = 0;
+  const int nice =
+      ::getpriority(PRIO_PROCESS, static_cast<id_t>(::syscall(SYS_gettid)));
+  return errno == 0 && nice >= kBackgroundNice;
+#endif
 }
 
 }  // namespace talos::process
