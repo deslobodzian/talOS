@@ -16,7 +16,9 @@ tests and `sim_gateway`.
 The bridge (`//talOS/bridge:hardware_node`) parses the robot's TOML
 configuration and pushes it to the gateway as chunked `kHardwareConfig`
 frames; `Endpoint` reassembles them, starts `Gateway::BeginReconfigure`, and
-answers with a `kHardwareConfigAck` when the worker finishes. The manifest holds
+answers with a `kHardwareConfigAck` when the worker finishes. A push completed
+while a configure is still pending (every boot restore) is dropped without an
+ACK; the bridge pushes again after its 50 ms retry gate. The manifest holds
 logical device IDs, names, CAN
 addresses and bus names, inversion, encoder offsets, current/voltage limits,
 gearing, three gain slots, soft limits, and Motion Magic cruise velocity,
@@ -24,19 +26,24 @@ acceleration, and jerk. Changed configurations require disabled operation.
 Identical pushes may succeed while enabled without device traffic, but not
 while faulted or while configuration/restoration is pending.
 
-The RoboRIO atomically saves successful configuration bytes with a CRC32 to
-`/home/lvuser/talos_config.bin` (`talos_config.bin` in desktop simulation).
-Startup validates and restores them before reporting ready. Missing or corrupt
-files leave the gateway unconfigured. A stale file cannot accept commands from
-a different configuration ID.
+The RoboRIO atomically and durably (synced file, rename, synced directory)
+saves acknowledged configuration bytes with a CRC32 to
+`/home/lvuser/talos_config.bin` (`talos_config.bin` in desktop simulation;
+`ConfigStore` in the RoboRIO program), on its first disabled tick after the
+acknowledgement, since the storage sync blocks the loop. Startup validates
+them and starts their restoration on the configure worker without waiting for
+it, so robot code reports ready at once; the gateway stays unconfigured,
+refusing commands, until the worker finishes. Missing or corrupt files leave
+the gateway unconfigured. A stale file cannot accept commands from a different
+configuration ID.
 
 A structurally valid configuration succeeds in degraded mode when individual
 Phoenix devices time out or are absent. Failed devices publish invalid samples;
 their motors, remote-feedback consumers and followers stay neutral, while
 healthy devices continue accepting commands. Invalid samples feed the existing
 bridge motor fault mask; sanitized demands increment the neutralized-motor
-counter. Network configuration CAN transactions run on a worker, not the
-periodic RIO loop; persisted startup restoration runs before that loop.
+counter. Network and persisted startup configuration CAN transactions run on a
+worker, not the periodic RIO loop.
 Unavailable devices retry through the same per-device restore worker
 after 250 ms, doubling to 2 s. Rejected whole configurations make the bridge
 back off from 100 ms to 2 s without stopping its command courier; a new gateway

@@ -6,13 +6,11 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
-#include <fstream>
-#include <iterator>
+#include <optional>
 #include <random>
-#include <string>
 #include <thread>
-#include <vector>
 
+#include "ConfigStore.h"
 #include "DriverStationReader.h"
 #include "PhoenixBackend.h"
 
@@ -20,7 +18,6 @@
 #include <frc/simulation/DriverStationSim.h>
 
 #include <cstdlib>
-#include <optional>
 #include <string_view>
 #endif
 
@@ -166,41 +163,40 @@ void Robot::StartCompetition() {
   const uint64_t boot_id = (uint64_t{random()} << 32) | random() | 1;
 
   gateway_ = std::make_unique<talos::hardware::Gateway>(*backend_, boot_id);
-  std::ifstream saved{kConfigPath, std::ios::binary};
-  if (saved) {
-    const std::vector<uint8_t> bytes{std::istreambuf_iterator<char>{saved}, {}};
-    talos::hardware::Config restored;
-    if (talos::hardware::LoadPersistedConfig(bytes, restored))
-      gateway_->Reconfigure(restored);
-  }
+  // The persisted configuration configures devices on the backend's worker,
+  // polled by the loop below: a reboot with absent devices (each one a CAN
+  // timeout) must not hold back robot code start and the Driver Station
+  // watchdog. Until it completes the gateway is unconfigured and drives
+  // nothing.
+  const auto restoring = talos::rio::BeginRestore(*gateway_, kConfigPath);
+  const uint64_t restoring_id =
+      restoring ? talos::hardware::ConfigurationId(*restoring) : 0;
+  // An acknowledged configuration not yet on disk. The save syncs storage on
+  // this loop thread, so it waits for a disabled tick: an acknowledgement can
+  // come while enabled (a configure finishing after enable, or an identical
+  // push after a failed save), and nothing may stall the loop while devices
+  // hold their last demand.
+  std::optional<talos::hardware::Config> unsaved;
+  uint64_t saved_id = restoring_id;
   endpoint_ = std::make_unique<talos::hardware::Endpoint>(*gateway_);
-  endpoint_->OnConfigured([last_id = gateway_->snapshot().config_id](
-                              const talos::hardware::Config& config) mutable {
-    const auto id = talos::hardware::ConfigurationId(config);
-    if (id == last_id) return;
-    const auto bytes = talos::hardware::PersistedConfig(config);
-    const std::string temporary = std::string{kConfigPath} + ".tmp";
-    std::ofstream file{temporary, std::ios::binary | std::ios::trunc};
-    file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    file.close();
-    if (file && std::rename(temporary.c_str(), kConfigPath) == 0)
-      last_id = id;
-    else
-      std::fprintf(stderr, "cannot persist hardware configuration\n");
-  });
+  endpoint_->OnConfigured(
+      [&unsaved, &saved_id](const talos::hardware::Config& config) {
+        if (talos::hardware::ConfigurationId(config) != saved_id)
+          unsaved = config;
+      });
 
   bool socket_open = false;
   uint64_t next_socket_retry_us = 0;
 
+  // The configuration being restored, if any; the push still follows.
   std::printf(
       "hardware gateway config=%llu commissioned=%d (waiting for config "
       "push)\n",
-      static_cast<unsigned long long>(gateway_->snapshot().config_id),
-      gateway_->configured() ? gateway_->config().commissioned : 0);
+      static_cast<unsigned long long>(restoring_id),
+      restoring ? restoring->commissioned : 0);
 
-  // Tells the Driver Station that robot code is up. Everything that can block
-  // for a long time, in particular configuring devices over CAN, has happened
-  // by now.
+  // Tells the Driver Station that robot code is up. Nothing before this waits
+  // on CAN: device configuration runs on the backend's worker.
   HAL_ObserveUserProgramStarting();
 
   auto period = std::chrono::microseconds{5000};
@@ -292,6 +288,14 @@ void Robot::StartCompetition() {
       gateway_->Tick(now_us, false);
     }
 
+    if (unsaved && !(gateway_->snapshot().flags & talos::hardware::kEnabled)) {
+      if (talos::rio::SaveConfigFile(kConfigPath, *unsaved))
+        saved_id = talos::hardware::ConfigurationId(*unsaved);
+      else
+        std::fprintf(stderr, "cannot persist hardware configuration\n");
+      unsaved.reset();
+    }
+
     // An overrun must not turn into a burst of catch-up iterations that starve
     // the Driver Station refresh; give up the missed cycles and stay on phase.
     const auto now = std::chrono::steady_clock::now();
@@ -301,6 +305,13 @@ void Robot::StartCompetition() {
     std::this_thread::sleep_until(next);
   }
 
+  // A configure still running on the backend's worker (the boot restore or a
+  // push) owns the devices; neutralizing them now would race it. Poll it to
+  // completion disabled, then neutralize what it built.
+  while (gateway_->configuring()) {
+    gateway_->Tick(NowUs(), false);
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
   backend_->Neutral();
 
 #ifndef __FRC_ROBORIO__
