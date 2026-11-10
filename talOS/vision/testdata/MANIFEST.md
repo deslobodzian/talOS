@@ -1,20 +1,16 @@
 # talOS Vision Testdata Manifest
 
-This directory contains photographic fixtures, canonical tag family samples, and synthetic test scenes used for regression and differential parity testing of the AprilTag detection and pose estimation pipeline in talOS.
+Photographic fixtures, canonical `tag36h11` samples and synthetic scenes for
+the AprilTag detector tests (CPU backend, Metal parity, sanitizer fixtures).
 
-`2026-rebuilt-welded.json` is the shared 2026 field layout fixture copied from
-the robot vision data. Framework simulation consumes this package's exported
-fixture, never a dependency on robot code.
-
-Pose estimation uses OpenCV optical camera coordinates and NWU robot mounting
-extrinsics. Layout tag corners lie in the x=0 plane, in detector index order;
-distorted observations are undistorted into pinhole pixels before homography
-decomposition and joint multi-tag PnP. Reported uncertainty scales quadratically
-with range and inversely with the square root of the number of observed tags.
+`2026-rebuilt-welded.json` is a copy of the robot's
+`2026-robot/main_processor/vision/data/2026-rebuilt-welded.json`, exported so
+framework simulation tests do not depend on robot code.
 
 ## 1. Photographic Fixtures
 
-The three photographic test images and their expected detection ground truth files are sourced from the upstream AprilRobotics/apriltag repository (`test/data/` at release v3.4.5):
+The three photographs and their expected detection files come from
+[AprilRobotics/apriltag v3.4.5 test data](https://github.com/AprilRobotics/apriltag/tree/v3.4.5/test/data):
 
 - `33369213973_9d9bb4cc96_c.jpg` / `33369213973_9d9bb4cc96_c.txt`
 - `34085369442_304b6bafd9_c.jpg` / `34085369442_304b6bafd9_c.txt`
@@ -29,26 +25,23 @@ Source URLs:
 - https://www.flickr.com/photos/nasakennedy/34085369442/
 - https://www.flickr.com/photos/nasakennedy/34139872896/
 
-Upstream reference: [AprilRobotics/apriltag](https://github.com/AprilRobotics/apriltag) test suite.
+Attribution: [upstream fixture license](https://github.com/AprilRobotics/apriltag/blob/v3.4.5/test/data/README.md).
 
 ## 2. Canonical Tag Family Samples (`tag36h11`)
 
 Sample canonical tag images from the `tag36h11` family sourced from [AprilRobotics/apriltag-imgs](https://github.com/AprilRobotics/apriltag-imgs):
 
-- `tag36_11_00000.png`: Tag ID 0 (10x10 px, 1-bit border, 8x8 payload)
-- `tag36_11_00001.png`: Tag ID 1 (10x10 px, 1-bit border, 8x8 payload)
-- `tag36_11_00002.png`: Tag ID 2 (10x10 px, 1-bit border, 8x8 payload)
-- `tag36_11_00003.png`: Tag ID 3 (10x10 px, 1-bit border, 8x8 payload)
-- `tag36_11_00004.png`: Tag ID 4 (10x10 px, 1-bit border, 8x8 payload)
+- `tag36_11_00000.png` … `tag36_11_00004.png`: tag IDs 0–4, 10x10 px (1 px
+  white border, 1 px black border, 6x6 data bits)
 
 ## 3. Synthetic Test Scenes
 
 Deterministic test scenes generated for testing detection, corner extraction, homography, and non-aligned strides:
 
-- `scene_single_tag0.png`: 640x480 scene containing tag 0 centered at (240, 160) with size 160x160 px.
+- `scene_single_tag0.png`: 640x480 scene containing tag 0, 160x160 px with its top-left corner at (240, 160) (centred in the image).
 - `scene_multi_tag.png`: 800x600 scene containing tags 0, 1, 2, 3 in four quadrants.
-- `scene_rotated_tag.png`: 640x480 scene containing tag 4 rotated by 30 degrees.
-- `scene_non_aligned.png`: 643x487 scene with odd dimensions (not divisible by 16 or standard GPU threadgroups) containing tag 0 at (200, 150) with size 150x150 px.
+- `scene_rotated_tag.png`: 640x480 scene containing rotated tag 4.
+- `scene_non_aligned.png`: 643x487 scene with odd dimensions containing tag 0.
 - `scene_empty.png`: 640x480 blank scene testing negative detection (zero false positives).
 
 ## 4. SHA-256 Checksums

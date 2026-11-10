@@ -9,8 +9,9 @@ Development only. Deploying to the robot is [DEPLOYMENT.md](DEPLOYMENT.md) / `to
 | Linux, macOS | `./tools/setup.sh` |
 | Windows | `powershell -ExecutionPolicy Bypass -File tools\setup.ps1` |
 
-Both are idempotent: anything already present at an acceptable version is skipped.
-Each run ends with a summary table and next-step commands.
+The scripts check installed versions before installing components. Linux/macOS
+prints next-step commands only when no required component failed; Windows also
+prints recovery instructions when WSL needs initial setup.
 
 ## What Bazel provides vs what the host needs
 
@@ -21,27 +22,27 @@ by `.bazelversion` (8.6.0) and fetched by bazelisk.
 | Component | Why | Linux | macOS | Windows |
 |---|---|---|---|---|
 | bazelisk (as `bazel`) | runs pinned Bazel 8.6.0 | release binary (sha256-verified) → `/usr/local/bin/bazel` | `brew install bazelisk` | in WSL |
-| C++23 compiler | talOS (`std::format`, `std::jthread`) | GCC ≥ 13 (or clang ≥ 17 + libstdc++ 13) | Xcode CLT | in WSL |
+| C++23 compiler | talOS (`std::format`, `std::jthread`) | setup checks GCC ≥ 13 | Xcode CLT | in WSL |
 | git, curl, unzip, zip, build-essential | Bazel fetches, builds | apt/dnf/pacman | Xcode CLT / brew | WSL + `Git.Git` (winget) |
 | system `python3` | rules_python bootstrap, `tools/test_drivetrain.py`, clang-tidy script | package | Xcode CLT / brew | in WSL |
-| JDK 17 (Temurin) | RoboRIO Gradle project, `./sim.sh` WPILib sim | package | brew | in WSL + `EclipseAdoptium.Temurin.17.JDK` |
+| JDK 17 | RoboRIO Gradle project, `./sim.sh` WPILib sim | package (OpenJDK) | `brew install --cask temurin@17` | in WSL + `EclipseAdoptium.Temurin.17.JDK` |
 | Node 22 + pnpm 9.15.9 (corepack) | Studio dev loop outside Bazel | package | brew | in WSL + `OpenJS.NodeJS.22` |
 | `flatc` | none: `pnpm generate` runs Bazel's pinned `@flatbuffers//:flatc` (same as the `//studio:telemetry_ts` genrule) | – | – | run `pnpm generate` in WSL |
-| clang-format-18, clang-tidy-18, buildifier 8.2.1 | lint, matches CI | package / GitHub release (sha256-verified) | brew / GitHub release | in WSL |
+| clang-format-18, clang-tidy-18, buildifier | lint | package / GitHub release (sha256-verified) | brew (`llvm@18`, `buildifier`) | in WSL |
 | WPILib 2026 | Glass, AdvantageScope, sim GUI | optional | optional | manual installer (not on winget) |
 
-Formatting differs between clang-format major versions, and CI checks with 18.
-Where the distribution ships another LLVM (Arch, Fedora), `setup.sh` installs
-that and warns; use the pinned wheel instead:
+CI uses clang-format/clang-tidy 18 and buildifier 8.2.1. Homebrew buildifier and
+the distribution LLVM on Arch/Fedora may differ; setup warns about these.
+For clang-format 18, use the pinned wheel:
 `python3 -m venv ~/.local/share/clang-format-18 && ~/.local/share/clang-format-18/bin/pip install clang-format==18.1.8`,
 then format with `~/.local/share/clang-format-18/bin/clang-format -i <files>`.
 
 ## Flags
 
-| `setup.sh` | `setup.ps1` | Effect |
+| `tools/setup.sh` | `tools/setup.ps1` | Effect |
 |---|---|---|
 | `--check` | `-Check` | report each component ok/missing/wrong-version; install nothing; exit 1 if anything required is missing |
-| `--yes` | `-Yes` | non-interactive: answers prompts (incl. Homebrew install on macOS), passes `-y` to package managers |
+| `--yes` | `-Yes` | non-interactive: answers prompts (incl. Homebrew install on macOS), passes `-y`/`--noconfirm` to package managers |
 | `--no-studio` | `-NoStudio` | skip Node 22/pnpm |
 | `--no-rio` | `-NoRio` | skip JDK 17 and `./gradlew installRoboRioToolchain` |
 | `--no-lint` | `-NoLint` | skip clang-format-18, clang-tidy-18, buildifier |
@@ -52,14 +53,14 @@ then format with `~/.local/share/clang-format-18/bin/clang-format -i <files>`.
 
 Package managers: apt (Ubuntu/Debian), dnf (Fedora), pacman (Arch), brew (macOS).
 
-`setup.ps1` exit codes: 0 ok; 1 something missing/failed (or `setup.sh`'s code);
+`tools/setup.ps1` exit codes: 0 ok; 1 something missing/failed (or the shell script's code);
 2 reboot / first WSL launch / user creation needed, then rerun.
 
 ## Supported platforms
 
 | Platform | Notes |
 |---|---|
-| Ubuntu 24.04+, Debian 13+, Fedora 39+, Arch | Ubuntu 22.04 ships GCC 11/12: too old. Fedora 45 no longer packages JDK 17: install Temurin 17 by hand (or `--no-rio`), then rerun |
+| Ubuntu 24.04+, Debian 13+, Fedora 39+, Arch | Ubuntu 22.04 ships GCC 11/12: too old. Where the distro has no JDK 17 package, install Temurin 17 by hand (or `--no-rio`), then rerun |
 | macOS 13.4+ | Xcode Command Line Tools (`xcode-select --install`) |
 | Windows 11, Windows 10 22H2 | via WSL2 `Ubuntu-24.04` |
 
@@ -68,12 +69,12 @@ talOS does not build on native Windows: it uses POSIX shared memory
 
 ## Windows notes
 
-- `setup.ps1` installs WSL2 + the distro (`wsl --install -d Ubuntu-24.04`). If that
+- `tools/setup.ps1` installs WSL2 + the distro (`wsl --install -d Ubuntu-24.04`). If that
   needs a reboot or the first-launch user creation, it stops and says so; rerun after.
 - Clone inside the WSL home (`~/talos`), not `/mnt/c/...`: Bazel on `/mnt/c` is very
   slow. The script warns when the repo is on `/mnt/c`.
-- Line endings: `.gitattributes` forces LF on `*.sh` and `gradlew`; `setup.ps1` also
-  converts existing tracked `*.sh`/`gradlew` to LF in place (local edits kept).
+- Line endings: `.gitattributes` forces LF on text files except `*.bat`/`*.cmd`/`*.ps1`;
+  `tools/setup.ps1` also converts existing tracked `*.sh`/`gradlew` to LF in place (local edits kept).
 - The WPILib GUI sim (`./sim.sh`) inside WSL displays through WSLg (Windows 11).
 - To run the WPILib sim natively on Windows talking UDP to nodes in WSL, enable
   mirrored networking in `%UserProfile%\.wslconfig`, then `wsl --shutdown`:
@@ -94,71 +95,46 @@ bazel test //...
 ```
 
 Linux CI also runs the C++ suite with AddressSanitizer + UndefinedBehaviorSanitizer
-and ThreadSanitizer:
+and ThreadSanitizer. Run sanitizer builds in their own output bases so they do
+not evict the default build's cache (`--config=asan`/`tsan` already filter the
+`no_asan`/`no_tsan` tags):
 
 ```sh
-bazel --output_base=$HOME/.cache/bazel-talos-asan test --config=asan \
-  --test_tag_filters=-no_asan --test_output=errors //...
-bazel --output_base=$HOME/.cache/bazel-talos-tsan test --config=tsan \
-  --test_tag_filters=-no_tsan --test_output=errors //...
+bazel --output_base=$HOME/.cache/bazel-talos-asan test --config=asan --test_output=errors //...
+bazel --output_base=$HOME/.cache/bazel-talos-tsan test --config=tsan --test_output=errors //...
 ```
 
 The decoder `*_fuzz_test` gtests run deterministic, bounded mutation corpora
-under ordinary `bazel test` too: every truncation, count/length-byte edits,
-bit flips, insertions, erasures and seeded random byte replacements. Successful
-decodes must survive a canonical encode/decode/encode round trip. Hardware
-config tests also exercise duplicate, out-of-order and cross-call chunk input.
+(`talOS/protocol/fuzz_corpus.h`) under ordinary `bazel test` too: every
+truncation, count/length-byte edits, bit flips, insertions, erasures and seeded
+random byte replacements. Successful binary decodes must survive a canonical
+encode/decode/encode round trip. The hardware codec test also feeds each input
+to one `ConfigAssembler` twice and then shifted by one byte, so chunks persist
+across calls. This is not coverage-guided fuzzing.
 
 Tests loading native libraries into an uninstrumented Python process via ctypes
-carry `no_asan` and `no_tsan`, with the reason beside each BUILD tag. Pure Python
-tests and tests spawning instrumented C++ executables remain enabled. No
-project-code sanitizer findings are suppressed. AprilTag 3.4.5's union-find
-parents are patched to relaxed atomic accesses: parallel gradient row bands
-compress overlapping paths after connected-component construction has finished.
-The quad-threshold translation unit is fully TSan-instrumented. The
-`//talOS/vision/sanitizer:parallel_detector_test` fixture runs the Linux production
-CPU settings (two detector workers, decimation 2, sigma 0, edge refinement).
-Before the patch, enabling instrumentation reproduced a `do_gradient_clusters`
-read/write data race; the patched test passes with instrumentation enabled.
-This is bounded fixture coverage, not proof of all possible detector inputs.
-Linux `metal` tests exercise CPU fallback, not Apple Metal execution; GPU-only
-tests are skipped or compiled out. These Linux results do not qualify Metal.
+carry `no_asan` and `no_tsan`, with the reason beside each BUILD tag. No
+project-code sanitizer findings are suppressed. Linux `metal` tests exercise CPU
+fallback, not Apple Metal execution; GPU-only tests are skipped or compiled out.
 
-Run sanitizer builds in their own output bases
-(`bazel --output_base=$HOME/.cache/bazel-talos-asan ...`, and `...-tsan`) so they
-do not evict the default build's cache.
+Third-party patches in `third_party/` that sanitizer runs depend on:
 
-OpenCV 4.12's pthread pool had a real race on its `volatile bool isActive`:
-running the color-conversion probe with four OpenCV workers reproduced a
-`cv::ThreadPool::run` read versus worker write through the production backend's
-`cvtColor(BGR2GRAY)` call. The dependency patch makes that flag atomic and removes
-upstream's Clang-only `thread_body` instrumentation suppression. TSan no longer
-forces `OPENCV_FOR_THREADS_NUM=1`; the probe explicitly requests four workers
-and requires that exact pool size on the Linux pthread backend. Apple's GCD
-backend ignores the requested size and reports its CPU-count pool limit, so
-the probe checks that backend contract instead. Both exercise the same repeated
-production-backend color conversions; only pthread runs qualify the flag patch.
-Linux V4L2 capture supplies GREY or YUYV (not JPEG/BGR); GREY bypasses OpenCV,
-and YUYV-to-gray uses `extractChannel` rather than the color parallel dispatcher.
-BGR/BGRA/RGB backend inputs and synthetic-image processing can reach OpenCV's
-parallel paths.
-
-The AprilTag JPEG decoder (`pjpeg.c`) has no exemption either. Live Linux
-capture negotiates raw GREY/YUYV and `CpuAprilTagBackend::Execute` calls the
-raw-buffer `Detect` API; only the offline `DetectImageFile` API decodes JPEGs.
-`third_party/apriltag_pjpeg_bounds.patch` fixes what corrupt input reached:
-signed shifts (sign extension and the IDCT), a zero run past coefficient 63
-(zigzag, quantization and block tables indexed out of range), int overflow in
-the IDCT and DC prediction, zero/oversized frame dimensions and sampling
-factors, out-of-range table selectors, and buffers leaked on error exits.
-Conforming images decode unchanged. `//talOS/vision/sanitizer:jpeg_loader_test`
-decodes a photograph and 64 deterministic corrupt-scan variants under
-ASan/UBSan; a one-off run of 3,000 variants from the scan and 3,000 across the
-whole file was clean. This is a deterministic corpus, not coverage-guided
-exploration.
-
-The ordinary suite also covers excluded Python-host and full-stack paths.
-Deterministic mutation corpora are not continuous coverage-guided fuzzing.
+- `third_party/apriltag_unionfind_atomic.patch`: AprilTag 3.4.5's union-find parents use
+  relaxed atomic accesses, so parallel gradient row bands may compress
+  overlapping paths. `//talOS/vision/sanitizer:parallel_detector_test` runs the
+  Linux production CPU settings (two detector workers, decimation 2, sigma 0,
+  edge refinement) under TSan.
+- `third_party/opencv_thread_pool_atomic.patch`: OpenCV 4.12's pthread pool `isActive` flag
+  is atomic. The same test's OpenCV case requests four workers and converts
+  colour through `CpuAprilTagBackend::Execute`'s `cvtColor`; Apple's GCD
+  backend ignores the requested size, so only Linux runs exercise the patch.
+- `third_party/apriltag_pjpeg_bounds.patch`: bounds and overflow fixes in AprilTag's JPEG
+  decoder (`pjpeg.c`), used only by the offline `DetectImageFile` API; live
+  capture passes raw GREY/YUYV buffers to `Detect`.
+  `//talOS/vision/sanitizer:jpeg_loader_test` runs only 64 deterministic
+  corrupt-scan variants of one fixture photograph under ASan/UBSan (memory
+  safety only); intact photographs are decoded in
+  `//talOS/vision/apriltag:cpu_apriltag_backend_test`.
 
 ## Editor setup
 
@@ -174,5 +150,5 @@ bazel run @hedron_compile_commands//:refresh_all
 |---|---|
 | `std::format` / `jthread` not found, `-std=c++23` unknown | GCC < 13. Install `g++-13`+ or use a supported distro |
 | macOS libc++ / availability errors | `-fexperimental-library` and min macOS 13.4 are already in `.bazelrc`; update Xcode CLT |
-| RIO build can't find the roboRIO compiler | `cd 2026-robot/controller_processor/rio && ./gradlew installRoboRioToolchain` (JDK 17). It lands in `~/.gradle/toolchains/frc/2025/roborio` (toolchain year lags GradleRIO); with the WPILib installer present GradleRIO uses `~/wpilib/2026/roborio` instead |
+| RIO build can't find the roboRIO compiler | `cd 2026-robot/controller_processor/rio && ./gradlew installRoboRioToolchain` (JDK 17). Setup also recognizes a toolchain from the WPILib installer; see `tools/setup.sh` for discovery paths |
 | `$'\r': command not found`, `/usr/bin/env: 'bash\r'` | CRLF working copy. Windows: rerun `tools\setup.ps1`. WSL/Linux: `git ls-files -z -- '*.sh' '*gradlew' \| xargs -0 sed -i 's/\r$//'` |

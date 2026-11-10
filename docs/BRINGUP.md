@@ -18,7 +18,7 @@ For the one-Kraken RoboRIO/Mini test bench, use [BENCH.md](BENCH.md).
 - [ ] Start exactly one launcher with `/opt/talos/current/run.sh --output-dir /opt/talos/logs`; stop any boot-managed instance first. Expected: nodes stay running and a unique `/opt/talos/logs/<session-id>/` logging session is created. The launcher appends the session id; pass the output root, not a session path. Do not edit the installed bundle; rebuild and reinstall configuration changes.
 - [ ] Run `./tools/deploy.sh logs` (add `--prefix` for a custom installation). Expected: session directories are listed and the newest manifest identifies the deployed config hash and node log paths. Retain that session and the RIO console output for every check below.
 - [ ] On a disposable session with a small `[robot] log_max_bytes`, exceed each event writer's share. Expected: control processes continue, files stop at whole-record boundaries, and the completed manifest reports `log_capped: true` for incomplete captures. Reserve additional disk space for metadata, Studio stdout and camera captures.
-- [ ] For live inspection, run `bazel build //studio:web_dist`, then in another terminal `bazel run //studio/bridge:studio_bridge -- --drop-newest-publisher /talos/telemetry 5800 bazel-bin/studio/dist`. Open `http://127.0.0.1:5800` on the Mini and select Studio's system view. Expected: live node rows, source selections and loop timing are visible. Run only one Studio bridge; default `[studio] max_clients = 4` (manual override via `--config PATH`), excess viewers receive HTTP 503. WebSocket egress is capped at 160 kB/s plus a 64 kB burst; watch `/system.json` bridge `clients`, `refused`, `ws_drops`, `egress_bytes`. Preload assets locally/wired, avoid HTTP polling over the radio, and repeat the [bridge load probe](../studio/bridge/README.md#radio-operating-limit) on the field link with other traffic.
+- [ ] For live inspection, run `bazel build //studio:web_dist`, then in another terminal `bazel run //studio/bridge:studio_bridge -- --drop-newest-publisher /talos/telemetry 5800 bazel-bin/studio/dist`. Open `http://127.0.0.1:5800` on the Mini and select Studio's system view. Expected: live node rows, source selections and loop timing are visible. Run only one bridge; follow its [operating limits and load probe](../studio/bridge/README.md#websocket-operating-limits) on the field link with other traffic.
 
 ## Camera intrinsics calibration
 
@@ -45,13 +45,14 @@ For the one-Kraken RoboRIO/Mini test bench, use [BENCH.md](BENCH.md).
    diagnostic, and publishes invalid observations and unhealthy status until
    configured and restarted. `--sim` does not require device ids.
    Live capture requests the existing source default mode (1280 × 720). Match the resulting
-   width/height in deployment. Frames are sampled at the interval and accepted
-   only when their corresponding board points differ by at least 2.5% of image
-   width from previously accepted views.
+   width/height in deployment. Frames are sampled at the interval.
+   Near-duplicate rejection compares the RMS
+   displacement of corresponding board points when at least eight overlap;
+   the threshold is 2.5% of image width.
 4. Check the reported view count and RMS reprojection error in pixels. The tool
    refuses fewer than 12 views, coverage below 10 of 12 image grid cells, or RMS
-   above 1 pixel. Aim below 0.5 px; inspect/repeat captures rather than trusting a
-   low RMS alone. Verify coverage, focus and held-out images.
+   above 1 pixel. Inspect coverage, focus and held-out images rather than
+   trusting a low RMS alone.
 5. Re-run with `--update 2026-robot/main_processor/configuration/subsystems/front_left_camera.toml`
    (choose the actual camera file). The tool prints a `[camera]` TOML fragment
    and updates only fx, fy, cx, cy, k1, k2, k3, p1, p2, width and height within
@@ -67,9 +68,11 @@ For the one-Kraken RoboRIO/Mini test bench, use [BENCH.md](BENCH.md).
    alternative. Set `[camera] latency_offset_us` in that camera's TOML to the
    measured nonnegative delay (default 0, finite and below 1,000,000 µs).
    This offset applies only to delivery/host-receipt or AVFoundation PTS stamps.
-   V4L2 SOE adds half manual exposure; EOF subtracts half exposure plus configured
-   `readout_us` (default zero if unknown). Neither gets the delivery offset.
-   Do not subtract processing delay already excluded by a hardware timestamp.
+   V4L2 SOE adds half exposure; EOF subtracts half exposure plus configured
+   `readout_us` (default zero if unknown). Exposure contributes only when
+   requested controls succeeded and auto exposure is off. Neither V4L2 stamp
+   receives the delivery offset. Do not subtract processing delay already
+   excluded by a hardware timestamp.
    Rebuild/redeploy and repeat the motion check: timestamp alignment should
    improve, and status `last_latency_us` now includes the correction. Leave
    `sim_timestamp_lag_us = 0` on the robot; it is a sim-only injection, ignored
@@ -79,31 +82,26 @@ For the one-Kraken RoboRIO/Mini test bench, use [BENCH.md](BENCH.md).
    `controls_applied = true` and `control_failure_count = 0`; macOS does not
    expose custom duration/ISO, so manual requests report failure. Verify with a
    blink/motion test rather than assuming a configured value reached hardware.
-8. Test a USB stall/unplug while disabled. After `frame_timeout_us` of silence
-   (default 500,000 µs), `stall_count` increments and the worker closes/reopens
-   with 100 ms–8 s exponential backoff. `reconnect_count` increments on successful
-   recovery, not failed attempts. Confirm frames resume without restarting the
-   node. New recovery/control fields are logged locally, excluded from radio
-   telemetry to keep its byte budget unchanged.
+8. Test a USB stall/unplug while disabled. With a connected source,
+   `frame_timeout_us` of silence (default 500,000 µs) increments `stall_count`
+   and closes/reopens the source. A detected disconnect enters recovery
+   directly, without necessarily counting as a stall. Retries use 100 ms–8 s
+   exponential backoff; `reconnect_count` counts successful recovery, not failed
+   attempts. Confirm frames resume without restarting the node. These
+   recovery/control fields are excluded from the robot's radio telemetry.
 
 The tool uses OpenCV 4.12's ChArUco detector: the BCR module exposes both
 `@opencv//:objdetect` and `@opencv//:calib3d`. Calibration uses the five-coefficient
 Brown–Conrady model (no rational/thin-prism extensions).
 
-The calibration integration test renders 48 distorted 960 × 720 board views,
-runs the real ChArUco detector, and fits the intrinsics with OpenCV's default
-SVD-based nonlinear solver. Sanitizer runs instrument OpenCV too, so the target
-is classified as a large test. Retain this full-resolution accuracy coverage
-rather than reducing the fixture or changing the production solver just to
-shorten CI.
 
 ## Vision frame recording and replay
 
-Every launched camera records frames while a session directory is present
-(always, under the launcher): `recording.enabled = true` writes lossless 8-bit
-PNG frames and a detection-context JSON sidecar to
-`<session>/frames/<camera>/`, rate-limited by `recording.sample_hz` /
-`recording.rejected_hz` and capped by `recording.max_bytes` (oldest pairs
+With `recording.enabled = true` (the default) and a session directory, cameras
+record available frames as 8-bit grayscale PNGs with detection-context JSON
+sidecars in `<session>/frames/<camera>/`. Capture must be configured and recorder
+initialization must succeed. Recording is rate-limited by `recording.sample_hz`
+and `recording.rejected_hz` and capped by `recording.max_bytes` (oldest pairs
 deleted first). Fetch a session with `./tools/deploy.sh fetch` as usual; the
 frames come along. Re-run the detector and localization offline over a camera's
 frames with:
@@ -114,11 +112,14 @@ bazel run //talOS/vision/recording:frame_replay -- \
   --layout 2026-robot/main_processor/vision/data/2026-rebuilt-welded.json
 ```
 
-The tool prints a Markdown summary: valid observations and per-reason rejection
-counts before/after, plus position/yaw error RMS against the recorded truth.
-Override the recorded detector settings with `--decimate`, `--threads`,
-`--sigma`, `--refine-edges`, `--hamming`, `--min-decision-margin` and
-`--backend`; pass `--max-range-m` to match a non-default `camera.max_range_m`.
+The tool prints valid observations and per-reason rejection counts before/after.
+Position/yaw RMS uses only frames carrying truth and valid replay observations;
+physical captures have no truth. With no eligible samples, printed zero RMS
+does not indicate measured zero error.
+Override recorded detector settings with `--decimate`, `--threads`, `--sigma`,
+`--refine-edges`, `--hamming` and `--min-decision-margin`. Backend selection
+defaults to `auto`, not the recorded backend; choose it with `--backend`.
+Pass `--max-range-m` to match a non-default `camera.max_range_m`.
 
 ## Uncommissioned, then disabled
 
@@ -130,7 +131,7 @@ Override the recorded detector settings with `--decimate`, `--threads`,
 - [ ] In Phoenix Tuner X, compare every physical CAN id against `2026-robot/main_processor/configuration/subsystems/drivetrain.toml`, `2026-robot/main_processor/configuration/subsystems/shooter.toml` and `2026-robot/main_processor/configuration/subsystems/intake.toml`. Expected: each device resolves to the intended mechanism; a human corrects any mismatch.
 - [ ] Check each motor and encoder `inverted`; mechanically align all four swerve modules and measure all four CANcoder `offset_rot` against Phoenix Tuner X. Expected: positive demands and measured directions agree, with measured offsets rather than unchecked zero defaults.
 - [ ] Tune intake `slot0` before demanding roller velocity, and validate drivetrain gains and `sensor_to_mechanism_ratio`. Expected: intake gains are not all zero; drive feedforward is in mechanism units (`v = 0.81` V/rps with ratio `6.75`, derived from the Kraken X60's ~0.12 V per rotor rps; confirm against a measured free-speed run).
-- [ ] Measure the drivetrain's usable acceleration and replace the provisional `max_linear_accel_mps2 = 8.0` / `max_angular_accel_radps2 = 18.0` in `drivetrain.toml` (derived from stator limits, an assumed 60 kg and traction). Expected: full-stick steps and reversals do not slip the wheels or hold the drive motors in stator current limiting.
+- [ ] Measure the drivetrain's usable acceleration and replace the provisional `max_linear_accel_mps2 = 8.0` / `max_angular_accel_radps2 = 18.0` in [the drivetrain config](../2026-robot/main_processor/configuration/subsystems/drivetrain.toml) (derived from stator limits, an assumed 60 kg and traction). Expected: full-stick steps and reversals do not slip the wheels or hold the drive motors in stator current limiting.
 - [ ] Only after those checks, have a human set `commissioned = true` and update `2026-robot/main_processor/configuration/config_golden_test.cc` in the same change. Repeat Mini build/test, bundle build and install above. Expected: RIO accepts the new configuration; `/hw/status.configured` and monitor's configured flag become true.
 - [ ] Keep DS disabled while exercising sticks and mechanism buttons. Expected: monitor reports disabled, Studio shows no selected actuation source, and all actuators remain neutral. Then enable with controls released. Expected: no motion without a live target.
 
@@ -148,10 +149,10 @@ Override the recorded detector settings with `--decimate`, `--threads`,
 
 ## Autonomous selection
 
-- [ ] With the robot disabled (teleop or autonomous mode; FMS pre-match is disabled-autonomous), centre joystick 0 POV, then press right/left and release between presses. Expected: Studio's read-only `autonomous/state/routine_index` cycles `0 preload`, `1 none`, `2 shoot_only`, `3 taxi`; holding does not repeat. Check the deployed `autonomous.toml` for changed ordering or binding.
+- [ ] With the robot disabled (teleop or autonomous mode; FMS pre-match is disabled-autonomous), centre joystick 0 POV, then press right/left and release between presses. Expected: Studio's read-only `autonomous/state/routine_index` cycles `0 preload`, `1 none`, `2 shoot_only`, `3 taxi`; holding does not repeat. Check the deployed [autonomous config](../2026-robot/main_processor/configuration/subsystems/autonomous.toml) for changed ordering or binding.
 - [ ] Restart the autonomous node while disabled within the same launcher session. Expected: the selection survives. Starting a new launcher session uses `default_routine`; keep the session's `autonomous-selection` file with the logs.
 - [ ] With mechanisms safely restrained, select `none`, enter enabled autonomous and operate the POV. Expected: the index stays latched and all three lanes remain released. Disable before selecting any other routine.
-- [ ] Safely test `shoot_only` (preload then release, no drive), `taxi` (localized-pose waypoint drive only, no shooter/intake), then `preload` (shot, waypoint drive and collection). Confirm the blue-origin waypoint and Red rotation about field centre, starting pose, bounded deadlines and immediate neutral on disable, stale pose or DS outage. Shooter readiness loss must interrupt feeding.
+- [ ] Safely test `shoot_only` (preload then release, no drive), `taxi` (localized-pose waypoint drive only, no shooter/intake), then `preload` (shot, waypoint drive and collection). Confirm the blue-origin waypoint and Red rotation about field centre, starting pose, bounded deadlines and lane release on disable or DS outage. Stale pose releases the waypoint drive lane, not every mechanism lane. Shooter readiness loss must interrupt feeding.
 - [ ] Restart autonomous during enabled auto. Expected: `INHIBITED`, all lanes released, no second shot. Disable/non-auto and re-enable are required to arm a new routine; a DS outage alone preserves progress and cannot re-fire a completed shot.
 
 
@@ -162,12 +163,12 @@ Override the recorded detector settings with `--decimate`, `--threads`,
 - [ ] Review per-consumer target receipt ages where MESSAGE dispatches exist. Pass: target age at each tick is **about 25 ms at most**, **never `command_timeout_us`**. The report marks tick/selected-target age NOT MEASURED: polled subscription reads and selected Target values are not recorded as tick inputs, and `command_timeout_us` is absent from the session manifest. Correlate dedicated tick instrumentation for this acceptance check rather than treating receipt age as tick age. Freshness starts at the writer's publication timestamp; draining an expired message cannot revive it. Include paused-consumer cases when measuring age.
 - [ ] Check `DrivetrainState.sample_time_ns` against `HardwareLink::sample_time()`, not tick time or raw RIO uptime. Expected: odometry uses mapped hardware sample time; unconverged/stale mapping clears validity. Independently measure mapping error and CAN acquisition ages. The two-way uncertainty must contain observed mapping error; validate the <=1000 ppm relative oscillator assumption and compare the bound to fusion requirements (no numeric fusion threshold is specified).
 - [ ] Review per-node/per-timer lateness (`now - deadline`) in the session report; use Studio's system view on the Mini for live inspection. Expected: the Mach time-constraint policy is accepted for every node period and no node logs `realtime scheduling incomplete`. Record measured lateness; no numeric lateness threshold has been specified. Missing TIMER dispatches are NOT MEASURED. `TALOS_REALTIME=0` disables the realtime request and is not the acceptance configuration.
-- [ ] Inspect `/hw/status` alongside the timing trace. Expected: `configured` stays true, counters advance, rejections stay flat. Record `state_age_us`, `timed_out_mask`, `subsystem_count`, `clock_offset_valid`, `clock_offset_us`, `clock_offset_spread_us`, `clock_window_count`, `clock_boot_id`, `clock_resets_count`, `clock_ignored_count`, `clock_offset_uncertainty_us` and `clock_min_round_trip_us`. The last two stay in local logs, excluded from radio telemetry. Probes work disabled/uncommissioned; valid mapping needs eight States and a live two-way exchange. Delay/asymmetry may widen the bound; spread alone is never an accuracy bound.
+- [ ] Inspect `/hw/status` alongside the timing trace. Expected: `configured` stays true, counters advance, rejections stay flat. Record `state_age_us`, `timed_out_mask`, `subsystem_count` and the [clock mapping diagnostics](../talOS/hardware/README.md#runtime-contract). The robot's radio telemetry excludes `clock_offset_uncertainty_us` and `clock_min_round_trip_us`; inspect them in local logs.
 - [ ] On blocks, use the PIDs in Studio to send `SIGSTOP` then `SIGCONT` to `driver` (chassis) and, separately, `teleop` (mechanism buttons), with measured pauses of **50 ms** and **200 ms**. Pass for **200 ms**: each subsystem goes neutral within **`command_timeout_us` plus a tick**, timing out its own lane. Record the 50 ms behavior without inventing an extra pass threshold; disable between trials and verify safe recovery before re-enabling.
 - [ ] Pause drivetrain with `SIGSTOP` for **80 ms**, then resume with `SIGCONT`. Expected: record hardware response, target receipt/tick timing and recovery; no separate numeric pass threshold is specified for this pause. Keep the spotter ready to disable.
 - [ ] With wheels spinning on blocks, unplug RIO Ethernet. Expected: actuation goes neutral on link loss, stale hardware samples become invalid, and odometry does not run away; `state_age_us` grows and timeout diagnostics identify the affected owners. Disable before reconnecting and verify recovery without unintended motion.
-- [ ] Measure stick-to-drive-request median on the real link. Expected: report the measured median alongside the **2.99 ms simulation** result and **4.98 ms old-arbiter baseline**; neither reference is a specified real-link pass threshold.
+- [ ] Measure and record stick-to-drive-request median on the real link; no real-link pass threshold is specified here.
 
-## Boot handoff
+## Boot operation
 
 - [ ] Disable, stop the manually launched stack, then run `./tools/deploy.sh enable-boot --user <mini account>`. Expected: `/Library/LaunchDaemons/org.talos.robot.plist` is loaded (`sudo launchctl print system/org.talos.robot`), and after a reboot with nobody logged in a single installed stack starts with no command-line addressing override. Recheck configuration, logs and disabled neutrality after restart. For a regression, `./tools/deploy.sh rollback` selects the previous whole bundle; stop/restart the stack and recheck its config hash before use.

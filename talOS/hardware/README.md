@@ -249,7 +249,7 @@ DIO/analog/PWM and RIO encoder validity never sink the backend.
 adapter. Set its companion address before deployment; the example is
 `10.56.87.11`. Runtime ports are 5802 on the gateway and 5803 on the companion.
 The other direction -- the companion finding the gateway -- is
-`[robot] controller_address` in `robot.toml` (see `talOS/launcher/README.md`),
+`[robot] controller_address` in the robot config (see [launcher addressing](../launcher/README.md#controller-addressing)),
 overridden per launch by `launcher --remote`. Real hardware uses Driver Station
 enable and e-stop.
 The adapter retries a failed gateway socket open once per second from its main

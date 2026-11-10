@@ -19,14 +19,15 @@ release all controls, and explicitly re-enable only after checking recovery.
 - [ ] Assign Mini `10.56.87.11` and RIO `10.56.87.2`; verify bidirectional
   connectivity. The generic RIO's `kCompanionAddress` is the Mini address.
   Inspect `bench/main_processor/configuration/robot_bench.toml`: it includes
-  `robot.toml` and overrides the controller address. Expected: boot needs no
-  `--remote` override. Record interface/subnet and connectivity results.
+  the base [robot config](../bench/main_processor/configuration/robot.toml)
+  and overrides the controller address. Expected: boot needs no `--remote`
+  override. Record interface/subnet and connectivity results.
 - [ ] On the actual macOS Mini, from the repo root run `bazel build //...`
   and `bazel test //...`. Expected: success on the deployment architecture,
   not merely Linux CI. Record revision, architecture and command results.
 - [ ] Run `bazel test --test_output=errors //bench/...`, then
   `bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot.toml --describe-only`
-  and repeat with `robot_bench.toml`. Expected: valid graphs. Record output.
+  and repeat with `bench/main_processor/configuration/robot_bench.toml`. Expected: valid graphs. Record output.
 - [ ] Before hardware deployment, run
   `bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot.toml --sim --start-sim-gateway --output-dir /tmp/bench-smoke --duration-s 20`.
   Expected: motor, teleop, telemetry, hardware_node and the generic ideal sim
@@ -65,7 +66,7 @@ release all controls, and explicitly re-enable only after checking recovery.
 
 - [ ] With power safe and DS disabled, a human identifies the one physical
   TalonFX in Phoenix Tuner X, checks firmware/CAN bus/id and inversion, and
-  sets the real CAN id/inversion in `configuration/subsystems/motor.toml`.
+  sets the real CAN id/inversion in [the motor config](../bench/main_processor/configuration/subsystems/motor.toml).
   Expected: exactly the intended Kraken resolves; positive demand and feedback
   direction agree after the supervised spin. Record measured id, inversion and
   firmware. Do not reuse an unchecked placeholder.
@@ -75,7 +76,7 @@ release all controls, and explicitly re-enable only after checking recovery.
   motor and power source. Record reviewed limits; raise deliberately only after
   the first spin, never to hide a fault.
 - [ ] Only a human, after those checks, sets commissioning true in the base
-  and deployment configs and updates `config_golden_test.cc` to the measured
+  and deployment configs and updates [the golden config test](../bench/main_processor/configuration/config_golden_test.cc) to the measured
   configuration in the same change. Repeat Mini build/test, bundle install and
   launch. Expected: RIO acknowledges configuration, `/hw/status.configured`
   becomes true. Record reviewed change/config hash and RIO acknowledgment.
@@ -85,8 +86,9 @@ release all controls, and explicitly re-enable only after checking recovery.
   state and physical observation.
 - [ ] Enable teleop, move axis 1 slightly (10% deadband, negative axis gives
   positive voltage), then centre and disable. Expected: VOLTAGE/TELEOP only
-  while deflected, axis fraction times `max_bench_voltage_v`, bounded to ±2 V;
-  release and disable neutralize. Record applied voltage, direction, position,
+  while deflected, the deadband-removed/rescaled axis fraction times
+  `max_bench_voltage_v`, bounded to ±2 V; release and disable neutralize.
+  Record applied voltage, direction, position,
   velocity and stator current. Hardware limits still clamp all commands.
 - [ ] With axis centred, hold button 1 (10 rps), release, then button 2
   (30 rps); release and disable. Expected: VELOCITY/TELEOP while held, neutral
@@ -95,7 +97,7 @@ release all controls, and explicitly re-enable only after checking recovery.
   may prevent reaching 30 rps under load; do not raise limits automatically.
 
 `/motor/state` exposes position, velocity, applied voltage, stator current,
-supply current (`supply_current_a`), motor temperature (`temperature_degc`),
+supply current (`supply_current_a`), controller temperature (`temperature_degc`),
 connected status, gateway motor fault with validity, active mode/source and
 hardware/acquisition ages. Supply voltage is not exposed by the public Motor
 handle; capture it separately in Phoenix Tuner X. Temperature and supply current
@@ -142,14 +144,15 @@ sleep precision. Releasing a lane is not a mechanical brake.
   Expected: `/hw/state` median about 5 ms, p99 <10 ms, no 100 ms gap while
   enabled (PASS lines); `--strict` exits 2 on FAIL. Keep the report with the
   session. Target age at the motor's tick is reported NOT MEASURED; receipt
-  ages are listed and must stay well below `command_timeout_us`.
+  ages are available only for target MESSAGE dispatches and must stay well
+  below `command_timeout_us`.
 - [ ] In the same report's `/hw/status` section check `configured`, flat
   rejection counters, `state_age_us`, `timed_out_mask`, and the clock fields:
   `clock_offset_valid` (needs eight States and a live two-way probe exchange),
-  `clock_offset_uncertainty_us` and `clock_min_round_trip_us` (local logs
-  only, not radio telemetry). Expected: mapping valid after the new boot; the
-  uncertainty is the error bound, `clock_offset_spread_us` is not. Record the
-  bound and the round trip. Review per-node timer lateness in the report; no
+  `clock_offset_uncertainty_us` and `clock_min_round_trip_us`. Expected:
+  mapping valid after the new boot; the uncertainty is the error bound,
+  `clock_offset_spread_us` is not. Record the bound and the round trip.
+  Review per-node timer lateness in the report; no
   node should log `realtime scheduling incomplete`. Do not use
   `TALOS_REALTIME=0` for acceptance.
 - [ ] In a disposable session lower `[robot] log_max_bytes` and exceed each
@@ -163,7 +166,7 @@ sleep precision. Releasing a lane is not a mechanical brake.
   `bazel run //talOS/launcher:log_dump -- <session-dir>` is the session decoder
   and prints timestamped records with named payload fields.
 
-## Boot handoff
+## Boot operation
 
 - [ ] Disable/release, stop manual execution, and run
   `./tools/deploy.sh enable-boot --user <service-account>`. Inspect

@@ -12,13 +12,13 @@ bazel build //2026-robot/main_processor:robot_bundle
 
 `talos_bundle` (`talOS/build/contract.bzl`) takes `nodes`, `config`
 (`robot_field.toml`) and `config_files`; the robot's BUILD passes `NODES` and
-`CONFIG_FILES` from the generated `configuration/robot_field_manifest.bzl`
-(`bazel run //tools:sync_manifest -- <robot_field.toml>`). It writes
+`CONFIG_FILES` from the generated [field manifest](../2026-robot/main_processor/configuration/robot_field_manifest.bzl)
+(`bazel run //tools:sync_manifest -- 2026-robot/main_processor/configuration/robot_field.toml`). It writes
 `bazel-bin/2026-robot/main_processor/robot_bundle/`:
 
 | Entry | What |
 |---|---|
-| `run.sh` | runs `./launcher --bundle <dir> --config config/robot_field.toml "$@"` |
+| `run.sh` | runs `./launcher --bundle <dir> --config config/robot_field.toml "$@"`, adding `--output-dir "$TALOS_LOG_DIR"` when that is set; a `--config`/`--output-dir` argument replaces the default |
 | `launcher` | `//talOS/launcher` |
 | `bin/` | node binaries; a Python node's runfiles beside it (its wheels, e.g. `robotpy-wpimath` and `gtsam`, and `libtalos_node.so`) |
 | `lib/` | any shared libraries C++ nodes link, one copy per name; no C++ WPILib libraries are staged. `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
@@ -34,10 +34,11 @@ renaming or moving any one file relative to the others (the root config too)
 changes it.
 
 The bundle uses `2026-robot/main_processor/configuration/robot_field.toml`,
-which includes `robot.toml` and overrides only `[robot] controller_address`
-to the RoboRIO's `10.56.87.2`. Simulation and its tests keep using
-`robot.toml` with loopback (`127.0.0.1`); no source edits are needed when
-switching between simulation and the field bundle. The overlay does not
+which includes the base [robot config](../2026-robot/main_processor/configuration/robot.toml)
+and changes only `[robot] controller_address`, to the RoboRIO's `10.56.87.2`.
+Simulation and its tests keep using that base config with loopback (`127.0.0.1`);
+no source edits are needed when switching between
+simulation and the field bundle. The overlay does not
 change CAN ids or commissioning: hardware must still be checked and
 commissioned through the normal bring-up process.
 
@@ -97,22 +98,8 @@ restarts of the service never reuse a previous session folder. For a manual
 run to use the same root, set `TALOS_LOG_DIR=/opt/talos/logs` or pass
 `--output-dir /opt/talos/logs`; `logs LOG_ROOT` can inspect another output root.
 
-Event recording has a live byte budget: `[robot] log_max_bytes` (default
-2 GiB) reserves half for the active session and half for retained sessions.
-The active share is divided equally among event-logging nodes, including the
-hardware bridge; each restart receives only its node's unused bytes.
-Writers stop before a whole record would exceed their share, keep the valid
-readable prefix, and report `recording_capped=1`. An empty `<log>.capped`
-marker and manifest node `log_capped: true` mean incomplete capture, not a
-corrupt log or a reason to stop control. If even the header/manifest cannot
-fit, only the marker is created. Shutdown record counting streams through a
-fixed 64 KiB buffer instead of loading recordings into memory.
-`log_keep_sessions` (default 50) still bounds retained session count.
-This is an event-log byte budget, not a filesystem quota: graph/manifest
-metadata, Studio stdout and separately configured camera recordings need
-additional space. A manifest write failure (including ENOSPC) logs once per
-failure episode and leaves supervision running; the next lifecycle update
-retries without replacing the last complete manifest with a partial file.
+For event-log byte budgets, retention, capped recordings and manifest-write
+recovery, see [session segments and logs](../talOS/launcher/README.md#session-segments-and-logs).
 
 ## Supervision and service recovery
 
@@ -128,20 +115,16 @@ does not weaken the graph checks with `--allow-graph-errors`.
 and can be passed through `run.sh`.
 
 The Linux unit sets `TimeoutStartSec=1200` (20 minutes), independently of
-the running watchdog. Budget startup as at most two sequential probes per
-roster member (initial description plus graph-reader re-probe), each with the
-default 15-second deadline: up to 32 members take at most 960 seconds of probe
-waiting, leaving 240 seconds for config/graph setup and process spawning.
-Larger graphs or `--describe-timeout-ms` overrides must fit this same finite
-budget or explicitly increase the installed unit's timeout. A genuinely hung
-startup is killed by systemd at the deadline; watchdog notifications only begin
-after READY, from the supervision loop, never an independent heartbeat.
+the running watchdog. Description probes use the per-probe deadline above;
+larger graphs or deadline overrides must fit the unit's startup budget.
+Watchdog notifications begin only after READY, from the supervision loop,
+never an independent heartbeat.
 
 On Linux the launcher sends `READY=1` when the graph has started and enters
 supervision, then `WATCHDOG=1` on each supervision iteration (normally every
-20 ms). `WatchdogSec=3` leaves substantial scheduling and manifest-write
-headroom while recovering a hung launcher during a match; systemd expects a
-notification within half that interval. A stalled loop cannot be masked by
+20 ms). With `WatchdogSec=3`, systemd treats three seconds without a
+notification as a hung launcher and restarts it, leaving ample scheduling and
+manifest-write headroom. A stalled loop cannot be masked by
 an independent watchdog thread. `Restart=always` starts a fresh session after
 either a watchdog failure or a launcher exit; `systemctl stop talos` still
 stops the service deliberately. Notifications use `NOTIFY_SOCKET` directly,
@@ -171,6 +154,7 @@ and viewer binaries together.
 ## RoboRIO
 
 `2026-robot/controller_processor/rio` is deployed with GradleRIO
-(`./gradlew deploy` in that directory). Set `kCompanionAddress` in
-`src/main/cpp/Robot.cpp` to the main processor's address first.
+(`./gradlew deploy` in that directory). It sends to `kCompanionAddress`
+([Robot.cpp](../2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp),
+`10.56.87.11`), port 5803; change it if the main processor's address differs.
 Robot bring-up checklist: [BRINGUP.md](BRINGUP.md).
