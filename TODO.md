@@ -8,7 +8,7 @@ This is an **open-work list**, not a changelog. Completed work and its reasoning
 
 - [ ] **TELEMETRY-1 — Preserve telemetry headroom.** Review the configured exclusions before adding state scalars. The telemetry constructor enforces the value-frame budget; transport limits live in [docs/DATA_FLOW.md](docs/DATA_FLOW.md).
 - [ ] **TIME-3 — Tick-time target age is not recorded.** `session_report` measures target receipt age for MESSAGE dispatches, not the selected target's age at a consumer tick. Add per-tick evidence before claiming tick-time target-age acceptance.
-- [ ] **POSE-1 — Make the GTSAM `factor_graph` backend the default.** `configuration/subsystems/pose_estimator.toml` selects `kalman`; `factor_graph` is to become the default. Switch only when `accuracy_test` passes for `factor_graph` on identical replays, the node survives GTSAM exceptions and relocalizes at the production 1.5 s lag, and its worst-case `update()` duration (odometry plus four camera observations) has been measured on the deployment Mac mini within the 20 ms period.
+- [ ] **POSE-1 — Make the GTSAM `factor_graph` backend the default.** `configuration/subsystems/pose_estimator.toml` selects `kalman`; `factor_graph` is to become the default. `accuracy_test` already gates both backends on identical replays, and the node tests cover GTSAM failure containment and relocalization at the 1.5 s lag. Remaining before the switch: measure the worst-case `update()` duration (odometry plus four camera observations) on the deployment Mac mini within the 20 ms period.
 
 ## Unresolved incidents — investigate, do not declare fixed by a rerun
 
