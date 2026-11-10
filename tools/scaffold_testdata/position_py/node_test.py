@@ -33,7 +33,7 @@ class PositionPyTest(unittest.TestCase):
         teleop lane. Steps so the mode is current before any lane."""
         self.hw.enable(enabled)
         self.hw.set_driver_station(enabled=True, teleop=True)
-        self.sim.step(0.01)
+        self.sim.step(0.06)  # home_samples ticks on a switch
 
     def hold(self, demand, seconds):
         """Republishes the teleop lane every 20 ms, as a producer does."""
@@ -123,7 +123,7 @@ class PositionPyTest(unittest.TestCase):
         # is 0, and targets go out in that frame, clamped to the travel.
         self.hw.set_motor("position_py", "position_py_motor", -0.5, 0.0)
         self.set_home(True)
-        self.hold(30.0, 0.02)
+        self.hold(30.0, 0.06)  # home_samples (3) consecutive closed readings
         self.set_home(False)  # the motor leaves the switch
         self.hold(30.0, 0.02)
         request = self.hw.motor_request("position_py", "position_py_motor")
@@ -135,6 +135,18 @@ class PositionPyTest(unittest.TestCase):
         self.hold(-5.0, 0.04)  # position 0
         self.assertEqual(
             self.hw.motor_request("position_py", "position_py_motor").demand, -0.5)
+
+    def test_one_closed_sample_mid_travel_does_not_zero(self):
+        # A glitch on the switch wire is not home: homing keeps driving.
+        self.set_home(False)
+        self.teleop()
+        self.hold(30.0, 0.06)
+        self.set_home(True)
+        self.hold(30.0, 0.02)  # one tick
+        self.set_home(False)
+        self.hold(30.0, 0.06)
+        self.assertEqual(self.mode(), talos.Mode.VOLTAGE)
+        self.assertEqual(self.state().homing, PositionPyHoming.HOMING)
 
     def test_homing_needs_a_live_finite_target(self):
         self.set_home(False)

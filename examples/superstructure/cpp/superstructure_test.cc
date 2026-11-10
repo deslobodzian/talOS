@@ -57,6 +57,9 @@ constexpr double kMaxHeightRot = 12.0;
 constexpr double kHomingVolts = -3.0;
 constexpr auto kHomingTimeout = 6000ms;
 constexpr auto kHomingStall = 500ms;
+// The switch zeroes the lift once it has read closed for home_samples (3)
+// elevator periods.
+constexpr auto kHomeTime = 30ms;
 
 // Enables the robot and puts the Driver Station in enabled teleop: a Target
 // drives only with both. The 10 ms step lets the mode begin before the first
@@ -79,7 +82,7 @@ class SuperstructureTest : public ::testing::Test {
   // The lift zeroes on its switch, then leaves it as it rises.
   SuperstructureTest() {
     LiftAtBottom(hw);
-    sim.step(10ms);
+    sim.step(kHomeTime);
     LiftAtBottom(hw, false);
   }
 
@@ -490,7 +493,7 @@ class ElevatorAlone : public ::testing::Test {
     EnableTeleop(sim, hw);
     hw.ideal_motors();
     LiftAtBottom(hw);
-    sim.step(10ms);
+    sim.step(kHomeTime);
     LiftAtBottom(hw, false);
   }
 
@@ -523,11 +526,11 @@ class ElevatorAlone : public ::testing::Test {
     return seen;
   }
   // The carriage reaches its bottom stop, at `raw_rot` in the motor's frame.
-  // One elevator period on the closed switch, then the lift rises off it.
+  // Long enough on the closed switch to zero, then the lift rises off it.
   void ReachBottom(double raw_rot) {
     hw.set_motor("elevator", "lift", raw_rot, 0.0);
     LiftAtBottom(hw);
-    sim.step(10ms);
+    sim.step(kHomeTime);
     LiftAtBottom(hw, false);
   }
   void ExpectHoming() const {
@@ -663,6 +666,24 @@ TEST_F(ElevatorHoming, HomesOnALiveTargetThenReachesTheGoal) {
   EXPECT_TRUE(Status().at_goal());
 }
 
+// A one-tick closed reading mid-travel (EMI on the switch wire) is not the
+// bottom: homing keeps driving down and the lift stays unzeroed, so the next
+// goal does not go out in a frame zeroed partway up.
+TEST_F(ElevatorHoming, OneClosedSampleMidTravelDoesNotZero) {
+  Drive(kHighRot, 50ms);
+  hw.set_motor("elevator", "lift", -2.0, -1.0);  // partway down
+  LiftAtBottom(hw);
+  Drive(kHighRot, 10ms);  // one elevator period
+  LiftAtBottom(hw, false);
+  EXPECT_FALSE(DriveSawMotionMagic(kHighRot, 100ms));
+  ExpectHoming();
+
+  ReachBottom(-4.0);  // home_samples consecutive closed readings
+  Drive(kHighRot, 30ms);
+  EXPECT_EQ(Lift().mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(Lift().demand, kHighRot - 4.0);
+}
+
 TEST_F(ElevatorAlone, AResetAtHeightRehomesBeforeAnyGoal) {
   Drive(kHighRot, 50ms);
   ASSERT_EQ(Status().state(), ElevatorState::AT_GOAL);
@@ -749,7 +770,7 @@ std::string ElevatorConfig(const std::string& key, const std::string& value) {
       {"tolerance_rot", "0.1"},    {"max_height_rot", "12.0"},
       {"homing_v", "-3.0"},        {"homing_timeout_us", "6000000"},
       {"homing_stall_rps", "0.2"}, {"homing_stall_us", "500000"},
-      {"home_margin_rot", "0.5"}};
+      {"home_margin_rot", "0.5"},  {"home_samples", "3"}};
   std::string toml =
       "[robot]\nperiod_us = 5000\ncommand_timeout_us = 100000\n\n"
       "[subsystems.elevator]\nperiod_us = 10000\n";
@@ -760,7 +781,7 @@ std::string ElevatorConfig(const std::string& key, const std::string& value) {
 type = "TalonFX"
 bus = "rio"
 can_id = 2
-requires_zero = true
+position_frame = "rezero"
 
 [subsystems.elevator.digital_inputs.bottom_limit]
 dio = 1
@@ -776,7 +797,8 @@ TEST(ElevatorConfig, RefusesUnsafeHomingParameters) {
       {"homing_v", "0.0"},        {"homing_v", "2.0"},
       {"max_height_rot", "0.0"},  {"max_height_rot", "nan"},
       {"homing_timeout_us", "0"}, {"homing_stall_rps", "0.0"},
-      {"homing_stall_us", "0"},   {"home_margin_rot", "-0.5"}};
+      {"homing_stall_us", "0"},   {"home_margin_rot", "-0.5"},
+      {"home_samples", "0"}};
   for (const auto& [key, value] : bad) {
     SCOPED_TRACE(key + " = " + value);
     auto sim = Sim::FromToml(ElevatorConfig(key, value));

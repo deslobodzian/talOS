@@ -9,8 +9,10 @@ its Motion Magic goals go out neutral until the switch has zeroed it
 (Motor.rezero), and again after a motor reset or a RoboRIO reboot drops that
 zero. While unzeroed with a live, finite target it homes: it drives toward
 the switch at homing_v (negative: toward the reverse end; a voltage request,
-which a dropped zero does not hold) until the switch closes, then rezeroes to
-0 and goes to the target. Targets clamp to 0..max_position_rot in the homed
+which a dropped zero does not hold) until the switch has read closed on
+home_samples consecutive ticks (default 3), then rezeroes to 0 and goes to
+the target. One closed sample, a glitch mid-travel, does not zero it: homing
+keeps driving and any open sample restarts the count. Targets clamp to 0..max_position_rot in the homed
 frame; the motor has no hardware soft limits, which would act in its power-on
 frame and could stop homing.
 
@@ -59,6 +61,10 @@ class PositionPy:
         self.stall_rps = _positive(node, "homing_stall_rps")
         self.stall_s = _positive(node, "homing_stall_us") / 1e6
         self.home_margin_rot = _positive(node, "home_margin_rot")
+        self.home_samples = int(node.param("home_samples", 3))
+        if self.home_samples < 1:
+            raise ValueError("position_py: home_samples must be at least 1")
+        self.home_count = 0
         self.homing_since = None
         self.stalled_since = None
         self.failed = False
@@ -73,7 +79,12 @@ class PositionPy:
             self.failed = False
             self.homing_since = None
             self.stalled_since = None
+        # Debounced: home_samples consecutive closed readings while unzeroed.
         if not self.motor.zeroed and at_home:
+            self.home_count += 1
+        else:
+            self.home_count = 0
+        if self.home_count >= self.home_samples:
             self.motor.rezero(0.0)  # no-op while feedback is stale
         pos = self.motor.position
         if self.motor.zeroed:
@@ -83,8 +94,7 @@ class PositionPy:
                 self.failed = True  # a stuck switch
         if self.failed or not self.motor.zeroed:
             drive = (not self.failed and t is not None and connected
-                     and not at_home and math.isfinite(t.position_rot)
-                     and self._home())
+                     and math.isfinite(t.position_rot) and self._home())
             if not drive:
                 self.stalled_since = None  # counts only while pushing
             self.state.send(enabled=drive, position_rot=pos,

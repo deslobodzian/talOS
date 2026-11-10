@@ -329,7 +329,10 @@ namespace @NAME@ {
 // reboot drops that zero. While unzeroed with a live, finite target it homes:
 // it drives toward the switch at homing_v (negative: toward the reverse end;
 // a voltage request, which a dropped zero does not hold) until the switch
-// closes, then rezeroes to 0 and goes to the target. Targets clamp to
+// has read closed on home_samples consecutive ticks (default 3), then
+// rezeroes to 0 and goes to the target. One closed sample, a glitch
+// mid-travel, does not zero it: homing keeps driving and any open sample
+// restarts the count. Targets clamp to
 // 0..max_position_rot in the homed frame; the motor has no hardware soft
 // limits, which would act in its power-on frame and could stop homing.
 //
@@ -363,6 +366,7 @@ class @PASCAL@ {
         stall_time_{
             std::chrono::microseconds{node.param<int>("homing_stall_us")}},
         home_margin_rot_{node.param<double>("home_margin_rot")},
+        home_samples_{node.param<int>("home_samples", 3)},
         target_{node},
         state_{node.publish<State>(topics::kState)} {
     Check(max_position_rot_ > 0 && std::isfinite(max_position_rot_),
@@ -377,6 +381,7 @@ class @PASCAL@ {
           "homing_stall_us must be positive");
     Check(home_margin_rot_ > 0 && std::isfinite(home_margin_rot_),
           "home_margin_rot must be finite and positive");
+    Check(home_samples_ >= 1, "home_samples must be at least 1");
   }
 
   void update() {
@@ -389,7 +394,9 @@ class @PASCAL@ {
       homing_since_.reset();
       stalled_since_.reset();
     }
-    if (!motor_.zeroed() && at_home) motor_.rezero(0.0);  // no-op if stale
+    // Debounced: home_samples consecutive closed readings while unzeroed.
+    home_count_ = !motor_.zeroed() && at_home ? home_count_ + 1 : 0;
+    if (home_count_ >= home_samples_) motor_.rezero(0.0);  // no-op if stale
     const double pos = motor_.position();
     if (motor_.zeroed()) {
       homing_since_.reset();
@@ -397,7 +404,7 @@ class @PASCAL@ {
       if (connected && at_home && pos > home_margin_rot_) failed_ = true;
     }
     if (failed_ || !motor_.zeroed()) {
-      const bool drive = !failed_ && t != nullptr && connected && !at_home &&
+      const bool drive = !failed_ && t != nullptr && connected &&
                          std::isfinite(t->position_rot()) && home();
       if (!drive) stalled_since_.reset();  // counts only while pushing
       state_.send(State{drive, pos, connected, false,
@@ -451,6 +458,8 @@ class @PASCAL@ {
   double stall_rps_;
   talos::Duration stall_time_;
   double home_margin_rot_;
+  int home_samples_;
+  int home_count_ = 0;
   std::optional<talos::Time> homing_since_;
   std::optional<talos::Time> stalled_since_;
   bool failed_ = false;
@@ -680,8 +689,9 @@ TEST_F(@PASCAL@Test, HomesBeforeTheFirstGoal) {
   // The switch closes 0.5 rotations below where the motor powered on: that
   // is position 0, and targets go out in that frame, clamped to the travel.
   hw.set_motor("@NAME@", "@NAME@_motor", -0.5, 0.0);
+  // It zeroes after home_samples (3) consecutive closed readings.
   SetHome(true);
-  Hold(30.0, 20ms);
+  Hold(30.0, 60ms);
   SetHome(false);  // the motor leaves the switch
   Hold(30.0, 20ms);
   request = hw.motor_request("@NAME@", "@NAME@_motor");
@@ -694,6 +704,20 @@ TEST_F(@PASCAL@Test, HomesBeforeTheFirstGoal) {
   Hold(-5.0, 40ms);
   request = hw.motor_request("@NAME@", "@NAME@_motor");
   EXPECT_DOUBLE_EQ(request.demand, -0.5);  // position 0
+}
+
+// One closed reading mid-travel (a glitch on the switch wire) is not home:
+// homing keeps driving and the motor stays unzeroed.
+TEST_F(@PASCAL@Test, OneClosedSampleMidTravelDoesNotZero) {
+  StartOffHome();
+  Teleop();
+  Hold(30.0, 60ms);
+  SetHome(true);
+  Hold(30.0, 20ms);  // one tick
+  SetHome(false);
+  Hold(30.0, 60ms);
+  EXPECT_EQ(Request(), Mode::kVoltage);
+  EXPECT_EQ(Latest().homing(), @PASCAL@Homing::HOMING);
 }
 
 TEST_F(@PASCAL@Test, HomingNeedsALiveFiniteTarget) {
@@ -889,8 +913,10 @@ its Motion Magic goals go out neutral until the switch has zeroed it
 (Motor.rezero), and again after a motor reset or a RoboRIO reboot drops that
 zero. While unzeroed with a live, finite target it homes: it drives toward
 the switch at homing_v (negative: toward the reverse end; a voltage request,
-which a dropped zero does not hold) until the switch closes, then rezeroes to
-0 and goes to the target. Targets clamp to 0..max_position_rot in the homed
+which a dropped zero does not hold) until the switch has read closed on
+home_samples consecutive ticks (default 3), then rezeroes to 0 and goes to
+the target. One closed sample, a glitch mid-travel, does not zero it: homing
+keeps driving and any open sample restarts the count. Targets clamp to 0..max_position_rot in the homed
 frame; the motor has no hardware soft limits, which would act in its power-on
 frame and could stop homing.
 
@@ -939,6 +965,10 @@ class @PASCAL@:
         self.stall_rps = _positive(node, "homing_stall_rps")
         self.stall_s = _positive(node, "homing_stall_us") / 1e6
         self.home_margin_rot = _positive(node, "home_margin_rot")
+        self.home_samples = int(node.param("home_samples", 3))
+        if self.home_samples < 1:
+            raise ValueError("@NAME@: home_samples must be at least 1")
+        self.home_count = 0
         self.homing_since = None
         self.stalled_since = None
         self.failed = False
@@ -953,7 +983,12 @@ class @PASCAL@:
             self.failed = False
             self.homing_since = None
             self.stalled_since = None
+        # Debounced: home_samples consecutive closed readings while unzeroed.
         if not self.motor.zeroed and at_home:
+            self.home_count += 1
+        else:
+            self.home_count = 0
+        if self.home_count >= self.home_samples:
             self.motor.rezero(0.0)  # no-op while feedback is stale
         pos = self.motor.position
         if self.motor.zeroed:
@@ -963,8 +998,7 @@ class @PASCAL@:
                 self.failed = True  # a stuck switch
         if self.failed or not self.motor.zeroed:
             drive = (not self.failed and t is not None and connected
-                     and not at_home and math.isfinite(t.position_rot)
-                     and self._home())
+                     and math.isfinite(t.position_rot) and self._home())
             if not drive:
                 self.stalled_since = None  # counts only while pushing
             self.state.send(enabled=drive, position_rot=pos,
@@ -1148,7 +1182,7 @@ PY_POSITION_TESTS = '''
         # is 0, and targets go out in that frame, clamped to the travel.
         self.hw.set_motor("@NAME@", "@NAME@_motor", -0.5, 0.0)
         self.set_home(True)
-        self.hold(30.0, 0.02)
+        self.hold(30.0, 0.06)  # home_samples (3) consecutive closed readings
         self.set_home(False)  # the motor leaves the switch
         self.hold(30.0, 0.02)
         request = self.hw.motor_request("@NAME@", "@NAME@_motor")
@@ -1160,6 +1194,18 @@ PY_POSITION_TESTS = '''
         self.hold(-5.0, 0.04)  # position 0
         self.assertEqual(
             self.hw.motor_request("@NAME@", "@NAME@_motor").demand, -0.5)
+
+    def test_one_closed_sample_mid_travel_does_not_zero(self):
+        # A glitch on the switch wire is not home: homing keeps driving.
+        self.set_home(False)
+        self.teleop()
+        self.hold(30.0, 0.06)
+        self.set_home(True)
+        self.hold(30.0, 0.02)  # one tick
+        self.set_home(False)
+        self.hold(30.0, 0.06)
+        self.assertEqual(self.mode(), talos.Mode.VOLTAGE)
+        self.assertEqual(self.state().homing, @PASCAL@Homing.HOMING)
 
     def test_homing_needs_a_live_finite_target(self):
         self.set_home(False)
@@ -1329,6 +1375,9 @@ homing_stall_us = 500000
 # The switch reading closed with the zeroed motor more than this from it is a
 # stuck or miswired switch: the @NAME@ stops, neutral.
 home_margin_rot = 0.5
+# The switch zeroes the motor only after reading closed on this many
+# consecutive ticks, so one glitched sample mid-travel does not.
+home_samples = 3
 
 # Zero-code robot wiring: uncomment to have the teleop node write a
 # Driver Station button on the /@NAME@/target/teleop lane, without editing any
@@ -1455,6 +1504,7 @@ homing_timeout_us = 3000000
 homing_stall_rps = 0.05
 homing_stall_us = 500000
 home_margin_rot = 0.5
+home_samples = 3
 
 [motors.@NAME@_motor]
 type = "TalonFX"
@@ -2135,6 +2185,13 @@ def mechanism_files(name, lang, kind):
                 ("velocity_rps()", "position_rot()"),
                 ("  SimHardware hw{sim};\n};\n",
                  fill(CC_POSITION_FIXTURE, **values)),
+                # A motor on its home switch zeroes after home_samples ticks.
+                ("    sim.step(10ms);  // the mode is current before any lane "
+                 "arrives\n",
+                 "    // The mode is current before any lane arrives, and a "
+                 "motor on its home\n"
+                 "    // switch has zeroed (home_samples ticks).\n"
+                 "    sim.step(60ms);\n"),
                 # Moving off a switch that still reads closed is a fault.
                 ("  Teleop();\n  Hold(30.0, 60ms);\n",
                  "  Teleop();\n"
@@ -2177,6 +2234,9 @@ def mechanism_files(name, lang, kind):
         if kind == "position":
             py_test = edited(py_test, [
                 ("velocity_rps=demand", "position_rot=demand"),
+                # A motor on its home switch zeroes after home_samples ticks.
+                ("        self.sim.step(0.01)\n",
+                 "        self.sim.step(0.06)  # home_samples ticks on a switch\n"),
                 ("talos.Mode.VELOCITY", "talos.Mode.MOTION_MAGIC"),
                 ("state.velocity_rps, 12.5", "state.position_rot, 0.0"),
                 ('0.0, 12.5)\n',

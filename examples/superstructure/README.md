@@ -85,9 +85,12 @@ While unzeroed the elevator reports HOMING, with `goal_rot` 0 and `at_goal`
 false. With a live, finite target it drives the lift down at `homing_v` volts
 (negative: down, toward the switch), a voltage request, which a dropped zero
 does not hold and which the TalonFX bounds by the lift's current and voltage
-limits. When the switch closes it calls `rezero(0)` and goes on to the
-target's goal in the same tick. A lift already on the switch zeroes there
-without moving, whether or not the robot is enabled.
+limits. Once the switch has read closed on `home_samples` consecutive elevator
+periods (default 3) it calls `rezero(0)` and goes on to the target's goal in
+the same tick; until then homing keeps driving, and any open reading restarts
+the count, so a one-tick glitch mid-travel does not zero the lift partway up.
+A lift already on the switch zeroes there without moving, whether or not the
+robot is enabled.
 
 HOMING_FAILED latches, neutral, in three cases:
 
@@ -103,7 +106,8 @@ It clears only when the Driver Station reports disabled; the next enabled
 target retries. A stale hardware link, which also makes `robot_enabled` false,
 does not clear it. The constructor refuses a `homing_v` that is not negative
 and a `max_height_rot`, `homing_timeout_us`, `homing_stall_rps`,
-`homing_stall_us` or `home_margin_rot` that is not positive and finite.
+`homing_stall_us` or `home_margin_rot` that is not positive and finite, and a
+`home_samples` below 1.
 
 Homing runs on any live target while unzeroed rather than on a separate
 operator request. Like every other motion it needs `robot_enabled` and a
@@ -167,7 +171,8 @@ observations without replaying a completed score. The elevator alone goes
 neutral on a stale, released or never-sent lane, while disabled, on Driver
 Station loss, with the lift disconnected and on a non-finite goal, and clamps
 goals to its travel at both ends. Its homing tests start it unzeroed and home
-it on a live target before it reaches the goal, re-home it after
+it on a live target before it reaches the goal, keep homing through a
+one-tick closed reading mid-travel, re-home it after
 `SimHardware::reset_device` at height without applying a motion-magic goal in
 the restarted frame, keep it still while disabled or with a non-finite,
 stale, released or never-sent lane, and latch HOMING_FAILED on the timeout
@@ -244,7 +249,7 @@ The package's `:messages` target uses `include_prefix = "wrist"` and declares
 `wrist_motor`, Motion Magic, and `tolerance_rot` (default `0.05`).
 It drives only a finite target with connected motor feedback. It homes the way
 the elevator does (see [Homing](#homing)), with the same switch wiring,
-failure latches and parameter checks: a home switch, `wrist_home`, at the
+`home_samples` debounce, failure latches and parameter checks: a home switch, `wrist_home`, at the
 reverse end of travel zeroes it, `requires_zero = true` holds its goals until
 then, and `/wrist/state` reports HOMING, HOMED or FAILED. Targets clamp to
 `0..max_position_rot`; the motor has no hardware soft limits.

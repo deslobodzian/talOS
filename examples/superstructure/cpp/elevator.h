@@ -22,12 +22,15 @@ namespace demo {
 //
 // Heights count from the bottom switch, not from where the TalonFX powered
 // on: until the switch has zeroed the lift (Motor::zeroed()), it is HOMING.
-// The lift's config sets requires_zero, so a motion-magic goal is never sent
-// in an unhomed frame, and a TalonFX reset or a RoboRIO reboot drops the zero
-// and starts homing again. While HOMING with a live, finite target it drives
+// The lift's config keeps position_frame = "rezero", so a motion-magic goal
+// is never sent in an unhomed frame, and a TalonFX reset or a RoboRIO reboot
+// drops the zero and starts homing again. While HOMING with a live, finite target it drives
 // down at homing_v (a voltage request, which a dropped zero does not hold)
-// until the switch closes, then rezeroes to 0 and resumes the goal. The switch
-// zeroes an idle lift too: no motion is needed when it starts at the bottom.
+// until the switch has read closed on home_samples consecutive ticks, then
+// rezeroes to 0 and resumes the goal. One closed sample (a glitch mid-travel)
+// does not zero the lift: homing keeps driving and any open sample restarts
+// the count. The switch zeroes an idle lift too: no motion is needed when it
+// starts at the bottom.
 //
 // The switch is normally open, wired to ground, read through the input's
 // pull-up: closed reads false. An open, cut or unplugged wire reads true,
@@ -70,7 +73,8 @@ class Elevator {
         stall_rps_{node.param<double>("homing_stall_rps")},
         stall_time_{
             std::chrono::microseconds{node.param<int>("homing_stall_us")}},
-        home_margin_rot_{node.param<double>("home_margin_rot")} {
+        home_margin_rot_{node.param<double>("home_margin_rot")},
+        home_samples_{node.param<int>("home_samples", 3)} {
     Check(max_height_rot_ > 0 && std::isfinite(max_height_rot_),
           "max_height_rot must be finite and positive");
     Check(homing_volts_ < 0 && std::isfinite(homing_volts_),
@@ -83,6 +87,7 @@ class Elevator {
           "homing_stall_us must be positive");
     Check(home_margin_rot_ > 0 && std::isfinite(home_margin_rot_),
           "home_margin_rot must be finite and positive");
+    Check(home_samples_ >= 1, "home_samples must be at least 1");
   }
 
   void update() {
@@ -95,7 +100,9 @@ class Elevator {
       homing_since_.reset();
       stalled_since_.reset();
     }
-    if (!lift_.zeroed() && at_bottom) lift_.rezero(0.0);  // no-op if stale
+    // Debounced: home_samples consecutive closed readings while unzeroed.
+    home_count_ = !lift_.zeroed() && at_bottom ? home_count_ + 1 : 0;
+    if (home_count_ >= home_samples_) lift_.rezero(0.0);  // no-op if stale
     if (lift_.zeroed()) {
       homing_since_.reset();
       stalled_since_.reset();
@@ -106,8 +113,7 @@ class Elevator {
 
     const double height = lift_.position();
     if (!failed_ && !lift_.zeroed()) {
-      home(goal != nullptr && std::isfinite(goal->height_rot()) && connected &&
-           !at_bottom);
+      home(goal != nullptr && std::isfinite(goal->height_rot()) && connected);
     }
     if (failed_ || !lift_.zeroed()) {
       sm_.go(failed_ ? State::HOMING_FAILED : State::HOMING);
@@ -140,7 +146,8 @@ class Elevator {
   }
 
   // One unhomed tick: drives down while `move` (a live finite target,
-  // connected feedback, switch open) unless homing has failed. The timeout
+  // connected feedback) unless homing has failed, also while the switch
+  // reads closed but has not yet for home_samples ticks. The timeout
   // counts from the first homing command since the last zero or Driver
   // Station disable; losing the target pauses the motion, not that clock.
   // The stall clock counts only while homing pushes and the lift is still.
@@ -177,6 +184,8 @@ class Elevator {
   double stall_rps_;
   talos::Duration stall_time_;
   double home_margin_rot_;
+  int home_samples_;
+  int home_count_ = 0;
   std::optional<talos::Time> homing_since_;
   std::optional<talos::Time> stalled_since_;
   bool failed_ = false;

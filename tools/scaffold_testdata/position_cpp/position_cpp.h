@@ -26,7 +26,10 @@ namespace position_cpp {
 // reboot drops that zero. While unzeroed with a live, finite target it homes:
 // it drives toward the switch at homing_v (negative: toward the reverse end;
 // a voltage request, which a dropped zero does not hold) until the switch
-// closes, then rezeroes to 0 and goes to the target. Targets clamp to
+// has read closed on home_samples consecutive ticks (default 3), then
+// rezeroes to 0 and goes to the target. One closed sample, a glitch
+// mid-travel, does not zero it: homing keeps driving and any open sample
+// restarts the count. Targets clamp to
 // 0..max_position_rot in the homed frame; the motor has no hardware soft
 // limits, which would act in its power-on frame and could stop homing.
 //
@@ -60,6 +63,7 @@ class PositionCpp {
         stall_time_{
             std::chrono::microseconds{node.param<int>("homing_stall_us")}},
         home_margin_rot_{node.param<double>("home_margin_rot")},
+        home_samples_{node.param<int>("home_samples", 3)},
         target_{node},
         state_{node.publish<State>(topics::kState)} {
     Check(max_position_rot_ > 0 && std::isfinite(max_position_rot_),
@@ -74,6 +78,7 @@ class PositionCpp {
           "homing_stall_us must be positive");
     Check(home_margin_rot_ > 0 && std::isfinite(home_margin_rot_),
           "home_margin_rot must be finite and positive");
+    Check(home_samples_ >= 1, "home_samples must be at least 1");
   }
 
   void update() {
@@ -86,7 +91,9 @@ class PositionCpp {
       homing_since_.reset();
       stalled_since_.reset();
     }
-    if (!motor_.zeroed() && at_home) motor_.rezero(0.0);  // no-op if stale
+    // Debounced: home_samples consecutive closed readings while unzeroed.
+    home_count_ = !motor_.zeroed() && at_home ? home_count_ + 1 : 0;
+    if (home_count_ >= home_samples_) motor_.rezero(0.0);  // no-op if stale
     const double pos = motor_.position();
     if (motor_.zeroed()) {
       homing_since_.reset();
@@ -94,7 +101,7 @@ class PositionCpp {
       if (connected && at_home && pos > home_margin_rot_) failed_ = true;
     }
     if (failed_ || !motor_.zeroed()) {
-      const bool drive = !failed_ && t != nullptr && connected && !at_home &&
+      const bool drive = !failed_ && t != nullptr && connected &&
                          std::isfinite(t->position_rot()) && home();
       if (!drive) stalled_since_.reset();  // counts only while pushing
       state_.send(State{drive, pos, connected, false,
@@ -148,6 +155,8 @@ class PositionCpp {
   double stall_rps_;
   talos::Duration stall_time_;
   double home_margin_rot_;
+  int home_samples_;
+  int home_count_ = 0;
   std::optional<talos::Time> homing_since_;
   std::optional<talos::Time> stalled_since_;
   bool failed_ = false;

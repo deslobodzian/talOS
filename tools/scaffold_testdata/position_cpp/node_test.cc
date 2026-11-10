@@ -48,7 +48,9 @@ class PositionCppTest : public ::testing::Test {
   void Teleop() {
     hw.enable();
     hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
-    sim.step(10ms);  // the mode is current before any lane arrives
+    // The mode is current before any lane arrives, and a motor on its home
+    // switch has zeroed (home_samples ticks).
+    sim.step(60ms);
   }
   // Holds the teleop lane the way a producer does: republished every 20 ms.
   void Hold(double demand, std::chrono::milliseconds duration) {
@@ -168,8 +170,9 @@ TEST_F(PositionCppTest, HomesBeforeTheFirstGoal) {
   // The switch closes 0.5 rotations below where the motor powered on: that
   // is position 0, and targets go out in that frame, clamped to the travel.
   hw.set_motor("position_cpp", "position_cpp_motor", -0.5, 0.0);
+  // It zeroes after home_samples (3) consecutive closed readings.
   SetHome(true);
-  Hold(30.0, 20ms);
+  Hold(30.0, 60ms);
   SetHome(false);  // the motor leaves the switch
   Hold(30.0, 20ms);
   request = hw.motor_request("position_cpp", "position_cpp_motor");
@@ -182,6 +185,20 @@ TEST_F(PositionCppTest, HomesBeforeTheFirstGoal) {
   Hold(-5.0, 40ms);
   request = hw.motor_request("position_cpp", "position_cpp_motor");
   EXPECT_DOUBLE_EQ(request.demand, -0.5);  // position 0
+}
+
+// One closed reading mid-travel (a glitch on the switch wire) is not home:
+// homing keeps driving and the motor stays unzeroed.
+TEST_F(PositionCppTest, OneClosedSampleMidTravelDoesNotZero) {
+  StartOffHome();
+  Teleop();
+  Hold(30.0, 60ms);
+  SetHome(true);
+  Hold(30.0, 20ms);  // one tick
+  SetHome(false);
+  Hold(30.0, 60ms);
+  EXPECT_EQ(Request(), Mode::kVoltage);
+  EXPECT_EQ(Latest().homing(), PositionCppHoming::HOMING);
 }
 
 TEST_F(PositionCppTest, HomingNeedsALiveFiniteTarget) {

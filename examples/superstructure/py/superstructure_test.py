@@ -58,7 +58,7 @@ class SuperstructureTest(unittest.TestCase):
         # then leaves it as it rises. The switch is normally open to ground
         # behind a pull-up: closed reads False.
         self.hw.set_digital_input("elevator", "bottom_limit", False)
-        self.sim.step(0.01)
+        self.sim.step(0.03)  # home_samples (3) elevator periods
         self.hw.set_digital_input("elevator", "bottom_limit", True)
 
     def hold(self, command, seconds):

@@ -16,6 +16,9 @@ homing_stall_us = 500000
 # A switch reading closed with the zeroed lift more than this above 0 is
 # stuck or miswired: the elevator stops, neutral.
 home_margin_rot = 0.5
+# The switch zeroes the lift only after reading closed on this many
+# consecutive elevator periods, so one glitched sample mid-travel does not.
+home_samples = 3
 
 # Who drives the elevator, per Driver Station mode (highest priority first):
 # only the superstructure's lane, /elevator/target/superstructure, in both
@@ -48,8 +51,9 @@ soft_limits = false
 # the lift if the switch's wire breaks.
 forward_limit_switch = "NormallyOpen"
 # Position and motion-magic requests go out neutral until the bottom switch
-# has zeroed the lift (Motor::rezero), and again after a reset drops the zero.
-requires_zero = true
+# has zeroed the lift (Motor::rezero), and again after a reset drops the zero:
+# a rotor's frame restarts with the TalonFX (rezero is also the default).
+position_frame = "rezero"
 # kG holds the carriage against gravity; kV/kA feed the motion-magic profile.
 slot0 = { p = 4.0, i = 0.0, d = 0.1, s = 0.1, v = 1.1, a = 0.02, g = 0.35 }
 
