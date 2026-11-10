@@ -254,6 +254,22 @@ class Vision {
                               [this] { return !sim_request_ && !sim_busy_; });
   }
 
+  // Tests: blocks, in wall time, until the live capture worker has serviced
+  // the latest update() instant and every frame delivered to it and is waiting
+  // for more, so the next update() collects what it produced without
+  // simulated time passing meanwhile. False if `timeout` passes first; true at
+  // once for a node without a live capture worker.
+  bool WaitForLiveWorker(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return live_idle_.wait_for(lock, timeout, [this] {
+      return stopping_.load(std::memory_order_acquire) ||
+             (!live_busy_ &&
+              live_serviced_ns_ ==
+                  worker_now_ns_.load(std::memory_order_acquire) &&
+              !mailbox_.HasReady());
+    });
+  }
+
   bool AcceptEstimate(const talos::vision::RobotPoseEstimate& estimate) const {
     const auto& t = estimate.T_field_robot.translation();
     return estimate.validity.valid && t.allFinite() &&
@@ -941,12 +957,16 @@ class Vision {
     while (!stopping_.load(std::memory_order_acquire)) {
       {
         std::unique_lock lock(mutex_);
+        live_busy_ = false;
+        live_serviced_ns_ = serviced_ns;
+        live_idle_.notify_all();
         wake_.wait(lock, [this, serviced_ns] {
           return stopping_.load(std::memory_order_acquire) ||
                  mailbox_.HasReady() ||
                  worker_now_ns_.load(std::memory_order_acquire) != serviced_ns;
         });
         if (stopping_.load(std::memory_order_acquire)) break;
+        live_busy_ = true;
         serviced_ns = worker_now_ns_.load(std::memory_order_acquire);
         if (serviced_ns < 0) continue;
       }
@@ -1043,6 +1063,7 @@ class Vision {
       source_->Stop();
       source_.reset();
     }
+    live_idle_.notify_all();
   }
 
   talos::Node& node_;
@@ -1100,6 +1121,11 @@ class Vision {
   bool healthy_ = false, stale_stamps_ = false;
   std::atomic<bool> stopping_{false}, connected_{false};
   std::atomic<std::int64_t> worker_now_ns_{-1};
+  // Live worker progress for WaitForLiveWorker, guarded by mutex_: the
+  // update() instant it last serviced, and whether it is servicing one now.
+  std::int64_t live_serviced_ns_ = -1;
+  bool live_busy_ = false;
+  std::condition_variable live_idle_;  // Notified when the worker goes idle.
   // Raster sim handoff, guarded by mutex_. sim_epoch_ is the loop's alone.
   std::optional<SimRequest> sim_request_;
   std::optional<SimResult> sim_result_;

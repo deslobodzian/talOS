@@ -1403,26 +1403,26 @@ struct LiveTestVision : Vision {
         }) {}
 };
 
-void AdvanceLive(talos::testing::Sim& sim, int milliseconds) {
+// The acquisition worker is a real thread, whose wall time (long under load
+// or sanitizers) must not become simulated time: stall detection and retry
+// backoff run on the node clock it is handed. Step 1 ms at a time, and after
+// each step wait in wall time until the worker has serviced that instant and
+// every frame delivered to it, so the next step collects its result. The wall
+// bound only ends a failing run.
+void AdvanceLive(talos::testing::Sim& sim, Vision& camera, int milliseconds) {
   for (int i = 0; i < milliseconds; ++i) {
     sim.step(1ms);
-    // Give the real acquisition worker service opportunities on the simulated
-    // clock. No camera or wall-clock watchdog is involved.
-    std::this_thread::sleep_for(200us);
+    ASSERT_TRUE(camera.WaitForLiveWorker(60s));
   }
 }
 
-// The acquisition worker is a real thread; under a loaded test host it can
-// fall behind any fixed number of simulated milliseconds. Step until the
-// observable result exists, bounded so a real failure still fails. Each
-// waiting step gives the worker an extra wall millisecond, so a starved
-// worker does not watch simulated time race past its stall timeout.
+// Step until the observable result exists; bounded so a real failure fails.
 template <typename Ready>
-bool AdvanceLiveUntil(talos::testing::Sim& sim, Ready ready,
+bool AdvanceLiveUntil(talos::testing::Sim& sim, Vision& camera, Ready ready,
                       int max_milliseconds = 500) {
   for (int i = 0; i < max_milliseconds && !ready(); ++i) {
-    AdvanceLive(sim, 1);
-    if (!ready()) std::this_thread::sleep_for(1ms);
+    sim.step(1ms);
+    if (!camera.WaitForLiveWorker(60s)) return false;
   }
   return ready();
 }
@@ -1437,8 +1437,8 @@ TEST(VisionTest, LiveControlsReachBackendAndFailuresAppearInStatus) {
                        "exposure_ms = 4.5\ngain = 12\n"
                        "auto_exposure = false\nauto_gain = false\n",
                        "period_us = 1000\n");
-    sim.add<LiveTestVision>("rear_right_camera");
-    ASSERT_TRUE(AdvanceLiveUntil(sim, [&] {
+    auto& camera = sim.add<LiveTestVision>("rear_right_camera");
+    ASSERT_TRUE(AdvanceLiveUntil(sim, camera, [&] {
       const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
       return device->starts == 1 && status &&
              status->control_failure_count() == (applied ? 0u : 1u);
@@ -1457,7 +1457,7 @@ TEST(VisionTest, LiveControlsReachBackendAndFailuresAppearInStatus) {
     EXPECT_EQ(status->control_failure_count(), applied ? 0 : 1);
     const auto stamp = sim.now().nanos() - 10000000;
     device->Emit(stamp, talos::vision::TimestampKind::kEndOfFrame);
-    ASSERT_TRUE(AdvanceLiveUntil(sim, [&] {
+    ASSERT_TRUE(AdvanceLiveUntil(sim, camera, [&] {
       return sim.latest<geometry::PoseObservation>("/rear_right_camera/state")
           .has_value();
     }));
@@ -1474,21 +1474,21 @@ TEST(VisionTest, SilentLiveCameraReopensWithBackoffAndCountsRecovery) {
   auto sim =
       MakeSim(false, true, "device = \"fake\"\nframe_timeout_us = 50000\n",
               "period_us = 1000\n");
-  sim.add<LiveTestVision>("rear_right_camera");
-  AdvanceLive(sim, 30);
+  auto& camera = sim.add<LiveTestVision>("rear_right_camera");
+  AdvanceLive(sim, camera, 30);
   ASSERT_EQ(device->starts, 1);
   device->allow_start = false;
-  AdvanceLive(sim, 50);
+  AdvanceLive(sim, camera, 50);
   auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
   ASSERT_TRUE(status);
   EXPECT_EQ(status->stall_count(), 1);
   EXPECT_EQ(device->starts, 1);  // Initial 100 ms retry deadline.
-  AdvanceLive(sim, 50);
+  AdvanceLive(sim, camera, 50);
   EXPECT_EQ(device->starts, 2);
-  AdvanceLive(sim, 120);
+  AdvanceLive(sim, camera, 120);
   EXPECT_EQ(device->starts, 2);  // Failed reopen doubled backoff to 200 ms.
   device->allow_start = true;
-  AdvanceLive(sim, 90);
+  AdvanceLive(sim, camera, 90);
   ASSERT_EQ(device->starts, 3);
   status = sim.latest<VisionStatus>("/rear_right_camera/status");
   ASSERT_TRUE(status);
@@ -1501,22 +1501,22 @@ TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
   using talos::vision::TimestampKind;
   auto device = std::make_shared<FakeCameraDevice>();
   LiveTestVision::device = device;
-  // Frames arrive only when the test emits them; the acquisition worker is a
-  // real thread, so waits step the simulated clock until the result appears.
-  // The 10 s stall timeout keeps a slow host from reading as a stall. Stall
-  // recovery has its own test above.
+  // Frames arrive only when the test emits them; the 10 s stall timeout keeps
+  // the gaps between them from reading as a stall. Stall recovery has its own
+  // test above.
   auto sim = MakeSim(false, true,
                      "device = \"fake\"\nwidth = 160\nheight = 120\n"
                      "frame_timeout_us = 10000000\nexposure_ms = 4\n"
                      "readout_us = 1000\nlatency_offset_us = 10000\n",
                      "period_us = 1000\n");
-  sim.add<LiveTestVision>("rear_right_camera");
-  ASSERT_TRUE(AdvanceLiveUntil(sim, [&] { return device->starts == 1; }));
+  auto& camera = sim.add<LiveTestVision>("rear_right_camera");
+  ASSERT_TRUE(
+      AdvanceLiveUntil(sim, camera, [&] { return device->starts == 1; }));
   // Each frame is stamped 10 ms before now and corrected by up to 13 ms more.
   // A fast worker starts within a few simulated milliseconds, which made those
   // stamps negative: CaptureMidpoint then has no valid time, the observation
   // carries 0 and the wait below could never match. Start from 30 ms.
-  AdvanceLive(sim, 30);
+  AdvanceLive(sim, camera, 30);
   // No DS, no targets: camera sensing/recovery also runs while disabled and
   // cannot depend on a fresh actuation target.
   std::uint64_t processed = 0;
@@ -1535,7 +1535,7 @@ TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
     // accept the previous observation, whose corrected time can coincide
     // (a later frame minus a larger correction can equal an earlier one).
     ASSERT_TRUE(AdvanceLiveUntil(
-        sim,
+        sim, camera,
         [&] {
           const auto status =
               sim.latest<VisionStatus>("/rear_right_camera/status");
@@ -1597,11 +1597,11 @@ std::shared_ptr<const std::vector<std::uint8_t>> RenderCameraView(
 TEST(VisionTest, LiveStampOlderThanFrameTimeoutPublishesInvalid) {
   auto device = std::make_shared<FakeCameraDevice>();
   LiveTestVision::device = device;
-  // The maximum 10 s timeout keeps a slow host from reading as a stall.
+  // The maximum 10 s timeout, which the 10.5 s-old stamps below exceed.
   auto sim =
       MakeSim(false, true, "device = \"fake\"\nframe_timeout_us = 10000000\n",
               "period_us = 1000\n");
-  sim.add<LiveTestVision>("rear_right_camera");
+  auto& camera = sim.add<LiveTestVision>("rear_right_camera");
   // The pose CheckPose localizes from (blue-wall tags 29/30).
   device->pixels = RenderCameraView(sim.node("rear_right_camera"),
                                     geometry::Pose2d{2, 2, 0});
@@ -1609,7 +1609,8 @@ TEST(VisionTest, LiveStampOlderThanFrameTimeoutPublishesInvalid) {
   // timeout exists: the camera opens on its first tick after the pause.
   sim.pause("rear_right_camera", 11s);
   sim.step(11s);
-  ASSERT_TRUE(AdvanceLiveUntil(sim, [&] { return device->starts == 1; }));
+  ASSERT_TRUE(
+      AdvanceLiveUntil(sim, camera, [&] { return device->starts == 1; }));
   ::testing::internal::CaptureStderr();
   std::vector<bool> valid;
   std::uint64_t processed = 0;
@@ -1617,7 +1618,7 @@ TEST(VisionTest, LiveStampOlderThanFrameTimeoutPublishesInvalid) {
     device->Emit(sim.now().nanos() - std::chrono::nanoseconds(age).count(),
                  talos::vision::TimestampKind::kExposure);
     if (!AdvanceLiveUntil(
-            sim,
+            sim, camera,
             [&] {
               const auto status =
                   sim.latest<VisionStatus>("/rear_right_camera/status");
@@ -1649,15 +1650,16 @@ TEST(VisionTest, SlowWorkerProcessesNewestLiveFrameAndCountsDrops) {
                      "device = \"fake\"\nwidth = 160\nheight = 120\n"
                      "frame_timeout_us = 10000000\n",
                      "period_us = 1000\n");
-  sim.add<LiveTestVision>("rear_right_camera");
+  auto& camera = sim.add<LiveTestVision>("rear_right_camera");
   // Declared after sim, so a failed assertion releases the worker before the
   // node joins it.
   struct Release {
     FakeCameraDevice& device;
     ~Release() { device.Hold(false); }
   } release{*device};
-  ASSERT_TRUE(AdvanceLiveUntil(sim, [&] { return device->starts == 1; }));
-  AdvanceLive(sim, 30);
+  ASSERT_TRUE(
+      AdvanceLiveUntil(sim, camera, [&] { return device->starts == 1; }));
+  AdvanceLive(sim, camera, 30);
   constexpr std::uint64_t kFrames = 8;
   const std::int64_t first = sim.now().nanos() - 20000000;
   device->Hold(true);
@@ -1670,7 +1672,7 @@ TEST(VisionTest, SlowWorkerProcessesNewestLiveFrameAndCountsDrops) {
   device->Hold(false);
   const auto newest =
       static_cast<std::uint64_t>(first) + (kFrames - 1) * 1000000;
-  ASSERT_TRUE(AdvanceLiveUntil(sim, [&] {
+  ASSERT_TRUE(AdvanceLiveUntil(sim, camera, [&] {
     const auto observation =
         sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
     const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
@@ -1697,13 +1699,13 @@ TEST(VisionTest, FailingOpenLogsOncePerTransitionAndBackoffIsCapped) {
                      "device = \"fake\"\nwidth = 160\nheight = 120\n"
                      "frame_timeout_us = 10000000\n",
                      "period_us = 1000\n");
-  sim.add<LiveTestVision>("rear_right_camera");
+  auto& camera = sim.add<LiveTestVision>("rear_right_camera");
   // Attempts at about 0, 0.1, 0.3, 0.7, 1.5 and 2.5 s: the last gap is the
   // 1 s cap, where doubling would have waited 1.6 s.
   std::vector<std::int64_t> attempts_ns;
   int seen = 0;
   for (int i = 0; i < 3500 && seen < 6; ++i) {
-    AdvanceLive(sim, 1);
+    AdvanceLive(sim, camera, 1);
     if (device->starts > seen) {
       seen = device->starts;
       attempts_ns.push_back(sim.now().nanos());
@@ -1711,10 +1713,10 @@ TEST(VisionTest, FailingOpenLogsOncePerTransitionAndBackoffIsCapped) {
   }
   device->allow_start = true;
   const bool reopened =
-      AdvanceLiveUntil(sim, [&] { return device->starts == 7; }, 1500);
+      AdvanceLiveUntil(sim, camera, [&] { return device->starts == 7; }, 1500);
   device->Emit(sim.now().nanos(), talos::vision::TimestampKind::kExposure);
   // Processing follows the connected report, so the log is complete.
-  const bool processed = AdvanceLiveUntil(sim, [&] {
+  const bool processed = AdvanceLiveUntil(sim, camera, [&] {
     const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
     return status && status->frames_processed_count() == 1;
   });
@@ -1724,7 +1726,7 @@ TEST(VisionTest, FailingOpenLogsOncePerTransitionAndBackoffIsCapped) {
   ASSERT_TRUE(processed) << diagnostics;
   const auto capped_gap = attempts_ns[5] - attempts_ns[4];
   EXPECT_GE(capped_gap, 900000000) << capped_gap;
-  // Below the uncapped doubling (1.6 s); a loaded host only adds lag.
+  // Below the uncapped doubling (1.6 s).
   EXPECT_LT(capped_gap, 1600000000) << capped_gap;
   EXPECT_EQ(CountLines(diagnostics, "camera Error: fake camera unplugged"), 1u)
       << diagnostics;

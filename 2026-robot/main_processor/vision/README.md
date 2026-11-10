@@ -286,7 +286,10 @@ reason, the source's own (missing device, permission, unsupported mode, a
 failed V4L2 call with its errno) when it gives one; a retry that fails the same
 way logs nothing. The loop passes
 time atomically and uses a nonblocking result-slot try-lock; it never opens a
-device, spawns a thread, or waits for worker work.
+device, spawns a thread, or waits for worker work. A test driving a live
+source calls `Vision::WaitForLiveWorker` after each step, which blocks in wall
+time until the worker has serviced that tick and every delivered frame, so a
+slow build cannot let simulated time pass a stall or retry deadline unseen.
 
 Capture hands frames to the worker through one newest-wins triple buffer
 (`talos::vision::FrameMailbox`): the source's callback copies the driver
