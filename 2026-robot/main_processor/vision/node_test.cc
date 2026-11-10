@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numbers>
 #include <sstream>
 #include <stdexcept>
@@ -1055,14 +1057,50 @@ TEST(VisionTest, ShutdownWithRecordingActiveCompletesPromptly) {
       << std::chrono::duration<double>(elapsed).count() << " s";
 }
 
+std::size_t CountLines(const std::string& text, std::string_view needle) {
+  std::size_t count = 0;
+  std::istringstream lines(text);
+  for (std::string line; std::getline(lines, line);) {
+    if (line.find(needle) != std::string::npos) ++count;
+  }
+  return count;
+}
+
 struct FakeCameraDevice {
   std::mutex mutex;
   talos::vision::FrameCallback callback;
+  talos::vision::ConnectionCallback connection;
   talos::vision::CameraSourceConfig config;
   std::atomic<int> starts{0}, stops{0};
   std::atomic<bool> allow_start{true}, apply_controls{true};
+  // Reason a refused Start() reports through the connection callback.
+  std::string start_failure;
   // Gray8 image emitted at the configured size; blank when unset.
   std::shared_ptr<const std::vector<std::uint8_t>> pixels;
+
+  // While held, the worker blocks in its next IsRunning() call, as it would
+  // behind a detection slower than the frame period.
+  void Hold(bool hold) {
+    {
+      std::lock_guard lock(gate_mutex);
+      held = hold;
+    }
+    gate_changed.notify_all();
+  }
+  void WaitGate() {
+    std::unique_lock lock(gate_mutex);
+    blocked = held;
+    gate_changed.notify_all();
+    gate_changed.wait(lock, [this] { return !held; });
+    blocked = false;
+  }
+  bool WaitBlocked() {
+    std::unique_lock lock(gate_mutex);
+    return gate_changed.wait_for(lock, 5s, [this] { return blocked; });
+  }
+  std::mutex gate_mutex;
+  std::condition_variable gate_changed;
+  bool held = false, blocked = false;
 
   void Emit(std::int64_t stamp, talos::vision::TimestampKind kind) {
     std::lock_guard lock(mutex);
@@ -1103,10 +1141,24 @@ class FakeCameraSource final : public talos::vision::CameraSource {
     std::lock_guard lock(device_->mutex);
     device_->callback = std::move(callback);
   }
-  void SetConnectionCallback(talos::vision::ConnectionCallback) override {}
+  void SetConnectionCallback(
+      talos::vision::ConnectionCallback callback) override {
+    std::lock_guard lock(device_->mutex);
+    device_->connection = std::move(callback);
+  }
   bool Start() override {
     ++device_->starts;
     running_ = device_->allow_start;
+    talos::vision::ConnectionCallback connection;
+    std::string failure;
+    {
+      std::lock_guard lock(device_->mutex);
+      connection = device_->connection;
+      failure = device_->start_failure;
+    }
+    if (!running_ && connection && !failure.empty()) {
+      connection(talos::vision::ConnectionState::kError, failure);
+    }
     return running_;
   }
   void Stop() override {
@@ -1115,7 +1167,10 @@ class FakeCameraSource final : public talos::vision::CameraSource {
     std::lock_guard lock(device_->mutex);
     device_->callback = {};
   }
-  bool IsRunning() const override { return running_; }
+  bool IsRunning() const override {
+    device_->WaitGate();
+    return running_;
+  }
   bool IsConnected() const override { return running_; }
   bool controls_applied() const override { return device_->apply_controls; }
 
@@ -1363,8 +1418,100 @@ TEST(VisionTest, LiveStampOlderThanFrameTimeoutPublishesInvalid) {
   EXPECT_EQ(valid, (std::vector<bool>{false, false, true})) << diagnostics;
   // One diagnostic when stamps turn stale and one when they recover, not one
   // per stale frame.
-  EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(), '\n'), 2)
+  EXPECT_EQ(CountLines(diagnostics, "capture stamp"), 2u) << diagnostics;
+}
+
+// Detection slower than the camera: frames delivered while the worker is busy
+// replace each other, the worker then processes the newest, and every frame it
+// never published is counted in frames_dropped_count.
+TEST(VisionTest, SlowWorkerProcessesNewestLiveFrameAndCountsDrops) {
+  auto device = std::make_shared<FakeCameraDevice>();
+  LiveTestVision::device = device;
+  auto sim = MakeSim(false, true,
+                     "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "frame_timeout_us = 10000000\n",
+                     "period_us = 1000\n");
+  sim.add<LiveTestVision>("rear_right_camera");
+  // Declared after sim, so a failed assertion releases the worker before the
+  // node joins it.
+  struct Release {
+    FakeCameraDevice& device;
+    ~Release() { device.Hold(false); }
+  } release{*device};
+  ASSERT_TRUE(AdvanceLiveUntil(sim, [&] { return device->starts == 1; }));
+  AdvanceLive(sim, 30);
+  constexpr std::uint64_t kFrames = 8;
+  const std::int64_t first = sim.now().nanos() - 20000000;
+  device->Hold(true);
+  for (std::uint64_t i = 0; i < kFrames; ++i) {
+    device->Emit(first + static_cast<std::int64_t>(i) * 1000000,
+                 talos::vision::TimestampKind::kExposure);
+    // The first frame wakes the worker, which then stays busy.
+    if (i == 0) ASSERT_TRUE(device->WaitBlocked());
+  }
+  device->Hold(false);
+  const auto newest =
+      static_cast<std::uint64_t>(first) + (kFrames - 1) * 1000000;
+  ASSERT_TRUE(AdvanceLiveUntil(sim, [&] {
+    const auto observation =
+        sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
+    const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
+    return observation && observation->sample_time_ns() == newest && status &&
+           status->frames_captured_count() == kFrames;
+  }));
+  const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
+  ASSERT_TRUE(status);
+  // At most the frame already in hand when the worker stalled, and the newest,
+  // reach a result; the frames in between are counted, not silently lost.
+  EXPECT_GE(status->frames_dropped_count(), kFrames - 2);
+  EXPECT_LE(status->frames_processed_count(), 2u);
+}
+
+// A camera that keeps failing to open logs its reason once, not on every
+// retry; reconnecting logs once more. Retry backoff stops growing near 1 s.
+TEST(VisionTest, FailingOpenLogsOncePerTransitionAndBackoffIsCapped) {
+  auto device = std::make_shared<FakeCameraDevice>();
+  device->allow_start = false;
+  device->start_failure = "fake camera unplugged";
+  LiveTestVision::device = device;
+  ::testing::internal::CaptureStderr();
+  auto sim = MakeSim(false, true,
+                     "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "frame_timeout_us = 10000000\n",
+                     "period_us = 1000\n");
+  sim.add<LiveTestVision>("rear_right_camera");
+  // Attempts at about 0, 0.1, 0.3, 0.7, 1.5 and 2.5 s: the last gap is the
+  // 1 s cap, where doubling would have waited 1.6 s.
+  std::vector<std::int64_t> attempts_ns;
+  int seen = 0;
+  for (int i = 0; i < 3500 && seen < 6; ++i) {
+    AdvanceLive(sim, 1);
+    if (device->starts > seen) {
+      seen = device->starts;
+      attempts_ns.push_back(sim.now().nanos());
+    }
+  }
+  device->allow_start = true;
+  const bool reopened =
+      AdvanceLiveUntil(sim, [&] { return device->starts == 7; }, 1500);
+  device->Emit(sim.now().nanos(), talos::vision::TimestampKind::kExposure);
+  // Processing follows the connected report, so the log is complete.
+  const bool processed = AdvanceLiveUntil(sim, [&] {
+    const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
+    return status && status->frames_processed_count() == 1;
+  });
+  const auto diagnostics = ::testing::internal::GetCapturedStderr();
+  ASSERT_EQ(attempts_ns.size(), 6u) << diagnostics;
+  ASSERT_TRUE(reopened) << diagnostics;
+  ASSERT_TRUE(processed) << diagnostics;
+  const auto capped_gap = attempts_ns[5] - attempts_ns[4];
+  EXPECT_GE(capped_gap, 900000000) << capped_gap;
+  // Below the uncapped doubling (1.6 s); a loaded host only adds lag.
+  EXPECT_LT(capped_gap, 1600000000) << capped_gap;
+  EXPECT_EQ(CountLines(diagnostics, "camera Error: fake camera unplugged"), 1u)
       << diagnostics;
+  EXPECT_EQ(CountLines(diagnostics, "camera Error"), 1u) << diagnostics;
+  EXPECT_EQ(CountLines(diagnostics, "camera Connected"), 1u) << diagnostics;
 }
 }  // namespace
 }  // namespace vision

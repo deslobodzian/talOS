@@ -247,16 +247,32 @@ Simulation ignores this requirement. With a configured device, construction
 starts a worker waiting for the first node-clock tick.
 The worker owns all device open/start/stop calls and all detection/localization.
 A missing or disconnected configured device is recreated with node-clock
-backoff of 0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4, then at most 8 seconds,
-resetting after a processed frame. This also recovers permission denial,
+backoff of 0.1, 0.2, 0.4, 0.8, then at most 1 second, resetting after a
+processed frame. This also recovers permission denial,
 capture-loop exits, and connected cameras with no frame for `frame_timeout_us`.
 The silence timer starts at successful open and resets on frame receipt;
 `stall_count` counts silence retirements and `reconnect_count` counts successful
-opens after the first successful connection. The loop passes
+opens after the first successful connection. Each connection state change
+(`Connected`, `Disconnected`, `Error`) logs one line naming the node and the
+reason, the source's own (missing device, permission, unsupported mode, a
+failed V4L2 call with its errno) when it gives one; a retry that fails the same
+way logs nothing. The loop passes
 time atomically and uses a nonblocking result-slot try-lock; it never opens a
-device, spawns a thread, or waits for worker work. Capture replaces one pending
-frame, and processing replaces one fixed-size completed observation. Replacements
-in either slot count as dropped frames. Shutdown wakes and joins the worker,
+device, spawns a thread, or waits for worker work.
+
+Capture hands frames to the worker through one newest-wins triple buffer
+(`talos::vision::FrameMailbox`): the source's callback copies the driver
+buffer it borrows (V4L2 mmap buffer, locked CoreVideo buffer) into the filling
+slot and swaps it with the ready slot; the worker swaps the ready slot with the
+one it processes. The worker therefore always gets the newest complete frame,
+and the frame it is processing is never overwritten. Slots are reserved for a
+BGRA image at the configured size, so steady-state capture does not allocate.
+Processing replaces one fixed-size completed observation. `frames_dropped_count`
+is the mailbox's single count of every frame that never reached a published
+observation: a ready frame replaced before the worker took it, a frame without
+an image, errored or short driver buffers the source reports, frames discarded
+with a retired capture session, and a completed observation replaced before
+the loop published it. Shutdown wakes and joins the worker,
 which stops capture before exiting. `--describe` never opens a camera.
 
 One observation is published per processed frame delivered to the loop, stamped

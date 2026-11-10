@@ -31,6 +31,7 @@
 #include "talOS/vision/field_sim/field_layout_loader.h"
 #include "talOS/vision/field_sim/tag_patterns.h"
 #include "talOS/vision/field_sim/tag_rasterizer.h"
+#include "talOS/vision/frame_mailbox.h"
 #include "talOS/vision/pipeline.h"
 #include "talOS/vision/recording/recorder.h"
 #include "talOS/vision/recording/recording.h"
@@ -185,6 +186,15 @@ class Vision {
     sim_tags_.reserve(256);
     detections_.reserve(256);
     if (CanCapture(simulated_, device_)) {
+      // Room for the widest delivered format (BGRA) at the configured size,
+      // so steady-state capture copies into the mailbox without allocating.
+      // The pixel format is negotiated only when the worker opens the
+      // source, after this; AVFoundation falls back to BGRA, while V4L2
+      // delivers at most 2 B/px, so on Linux this over-reserves by up to 2x.
+      mailbox_.Reserve(
+          static_cast<std::size_t>(capture_config_.width) *
+          capture_config_.height *
+          talos::vision::BytesPerPixel(talos::vision::PixelFormat::kBgra8));
       worker_ = std::thread([this] { Work(); });
     }
   }
@@ -305,7 +315,7 @@ class Vision {
         completed_.reset();
         captured_ = received_;
         processed_ = worker_processed_;
-        dropped_ = worker_dropped_;
+        dropped_ = mailbox_.dropped();
         rejected_range_ = worker_rejected_range_;
         frame_period_us_ = worker_period_us_;
       }
@@ -723,50 +733,101 @@ class Vision {
         observation.valid() && timestamp_valid && !stale});
   }
 
+  // Logs a connection state once per change, with the reason for it; repeats
+  // of the current state (every failed retry, say) stay silent. Called by the
+  // worker and by a source's capture thread.
+  void ReportConnection(talos::vision::ConnectionState state,
+                        std::string_view reason) {
+    std::lock_guard lock(connection_mutex_);
+    if (logged_connection_ == state) return;
+    logged_connection_ = state;
+    const auto name = talos::vision::ConnectionStateToString(state);
+    std::fprintf(stderr, "%.*s: camera %.*s%s%.*s\n",
+                 static_cast<int>(node_.name().size()), node_.name().data(),
+                 static_cast<int>(name.size()), name.data(),
+                 reason.empty() ? "" : ": ", static_cast<int>(reason.size()),
+                 reason.data());
+  }
+
+  // Folds the current source's own losses (errored driver buffers) into the
+  // one drop count.
+  void CollectSourceDrops() {
+    if (!source_) return;
+    const auto dropped = source_->dropped_frames();
+    if (dropped > source_drops_seen_) {
+      mailbox_.CountDropped(dropped - source_drops_seen_);
+      source_drops_seen_ = dropped;
+    }
+  }
+
   // Only the worker owns camera lifecycle calls. Retry timing comes from the
   // node clock supplied by update(), never a wall-clock timer.
   bool OpenCamera() {
     if (!CanCapture(simulated_, device_)) return false;
     source_ = source_factory_(capture_config_);
-    if (!source_) return false;
+    source_drops_seen_ = 0;
+    if (!source_) {
+      ReportConnection(talos::vision::ConnectionState::kError,
+                       "no capture source on this platform");
+      return false;
+    }
+    source_->SetConnectionCallback(
+        [this](talos::vision::ConnectionState state, std::string_view reason) {
+          source_reports_.fetch_add(1, std::memory_order_relaxed);
+          ReportConnection(state, reason);
+        });
     source_->SetFrameCallback([this](const talos::vision::Frame& frame) {
+      if (stopping_.load(std::memory_order_acquire)) return;
+      // Copy out of the source's buffer. A frame the worker has not taken
+      // yet is replaced and counted: the worker always gets the newest one.
+      mailbox_.Publish(frame);
       {
         std::lock_guard lock(mutex_);
-        if (stopping_.load(std::memory_order_acquire)) return;
         ++received_;
         last_received_ns_.store(worker_now_ns_.load(std::memory_order_acquire),
                                 std::memory_order_release);
-        if (pending_) ++worker_dropped_;
-        pending_ = frame;
       }
       wake_.notify_one();
     });
+    const auto reports = source_reports_.load(std::memory_order_relaxed);
     const bool opened =
         source_->Start() && source_->IsRunning() && source_->IsConnected();
     controls_applied_.store(opened && source_->controls_applied());
     if (opened && !source_->controls_applied()) ++control_failures_;
+    if (opened) {
+      ReportConnection(talos::vision::ConnectionState::kConnected, "");
+    } else if (source_reports_.load(std::memory_order_relaxed) == reports) {
+      // The source gave no reason of its own.
+      ReportConnection(talos::vision::ConnectionState::kError,
+                       "capture did not start");
+    }
     return opened;
   }
+
+  static constexpr std::int64_t kFirstRetryNs = 100000000;
+  // Bounded so a camera plugged back in mid-match resumes within about 1 s.
+  static constexpr std::int64_t kMaxRetryNs = 1000000000;
 
   void Work() {
     std::int64_t serviced_ns = -1;
     std::int64_t retry_at_ns = 0;
-    std::int64_t retry_delay_ns = 100000000;
+    std::int64_t retry_delay_ns = kFirstRetryNs;
     bool opened_once = false;
     while (!stopping_.load(std::memory_order_acquire)) {
-      std::optional<talos::vision::Frame> frame;
       {
         std::unique_lock lock(mutex_);
         wake_.wait(lock, [this, serviced_ns] {
-          return stopping_.load(std::memory_order_acquire) || pending_ ||
+          return stopping_.load(std::memory_order_acquire) ||
+                 mailbox_.HasReady() ||
                  worker_now_ns_.load(std::memory_order_acquire) != serviced_ns;
         });
         if (stopping_.load(std::memory_order_acquire)) break;
         serviced_ns = worker_now_ns_.load(std::memory_order_acquire);
         if (serviced_ns < 0) continue;
-        frame = std::move(pending_);
-        pending_.reset();
       }
+      // Valid until the next TakeNewest(); only this thread takes.
+      const talos::vision::Frame* frame = mailbox_.TakeNewest();
+      CollectSourceDrops();
       const auto last_received =
           last_received_ns_.load(std::memory_order_acquire);
       const bool stalled = source_ && connected_.load() &&
@@ -774,35 +835,37 @@ class Vision {
                            serviced_ns - last_received >= frame_timeout_ns_;
       if (stalled) {
         ++stalls_;
+        ReportConnection(talos::vision::ConnectionState::kDisconnected,
+                         "no frame within camera.frame_timeout_us");
         source_->Stop();
       }
       if (!source_ || !source_->IsRunning() || !source_->IsConnected()) {
         const bool was_connected =
             connected_.exchange(false, std::memory_order_acq_rel);
         if (source_) {
+          ReportConnection(talos::vision::ConnectionState::kDisconnected,
+                           "capture stopped");
           source_->Stop();
+          CollectSourceDrops();
           source_.reset();
         }
         // Frames from the retired capture session cannot survive a reconnect.
-        {
+        mailbox_.DiscardReady();
+        if (frame != nullptr) {
+          mailbox_.CountDropped(1);
+          frame = nullptr;
+        }
+        if (was_connected) {
           std::lock_guard lock(mutex_);
-          if (pending_) {
-            ++worker_dropped_;
-            pending_.reset();
-          }
-          if (frame) {
-            ++worker_dropped_;
-            frame.reset();
-          }
-          if (was_connected) {
-            completed_ = Completed{static_cast<std::uint64_t>(serviced_ns)};
-          }
+          completed_ = Completed{static_cast<std::uint64_t>(serviced_ns)};
         }
         if (serviced_ns < retry_at_ns) continue;
         bool opened = false;
         try {
           opened = OpenCamera();
-        } catch (const std::exception&) {
+        } catch (const std::exception& error) {
+          ReportConnection(talos::vision::ConnectionState::kError,
+                           error.what());
           opened = false;
         }
         connected_.store(opened, std::memory_order_release);
@@ -812,7 +875,7 @@ class Vision {
           last_received_ns_.store(serviced_ns, std::memory_order_release);
         }
         retry_at_ns = serviced_ns + retry_delay_ns;
-        retry_delay_ns = std::min<std::int64_t>(retry_delay_ns * 2, 8000000000);
+        retry_delay_ns = std::min(retry_delay_ns * 2, kMaxRetryNs);
         if (!opened) {
           if (source_) {
             source_->Stop();
@@ -823,7 +886,7 @@ class Vision {
         }
         continue;
       }
-      if (!frame) continue;
+      if (frame == nullptr) continue;
       Completed result;
       try {
         result = Process(*frame);
@@ -831,11 +894,12 @@ class Vision {
         result = Completed{
             static_cast<std::uint64_t>(frame->capture_timestamp_ns())};
       }
-      retry_delay_ns = 100000000;
+      retry_delay_ns = kFirstRetryNs;
       retry_at_ns = serviced_ns + retry_delay_ns;
       {
         std::lock_guard lock(mutex_);
-        if (completed_) ++worker_dropped_;
+        // The loop has not published the previous result: it is lost.
+        if (completed_) mailbox_.CountDropped(1);
         if (worker_processed_ == 0)
           worker_first_capture_ns_ = result.capture_ns;
         ++worker_processed_;
@@ -901,12 +965,17 @@ class Vision {
   std::thread worker_;
   std::mutex mutex_;
   std::condition_variable wake_;
-  std::optional<talos::vision::Frame> pending_;
+  // Capture-to-worker handoff, and the camera's one drop count.
+  talos::vision::FrameMailbox mailbox_;
+  std::uint64_t source_drops_seen_ = 0;  // Worker only.
+  std::atomic<std::uint64_t> source_reports_{0};
+  std::mutex connection_mutex_;
+  std::optional<talos::vision::ConnectionState> logged_connection_;
   std::optional<Completed> completed_;
   bool healthy_ = false, stale_stamps_ = false;
   std::atomic<bool> stopping_{false}, connected_{false};
   std::atomic<std::int64_t> worker_now_ns_{-1};
-  std::uint64_t received_ = 0, worker_processed_ = 0, worker_dropped_ = 0;
+  std::uint64_t received_ = 0, worker_processed_ = 0;
   std::uint64_t worker_first_capture_ns_ = 0, worker_period_us_ = 0,
                 worker_rejected_range_ = 0;
   std::uint64_t captured_ = 0, processed_ = 0, dropped_ = 0,

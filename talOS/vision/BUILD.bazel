@@ -12,6 +12,15 @@ cc_library(
 )
 
 cc_library(
+    name = "frame_mailbox",
+    hdrs = ["frame_mailbox.h"],
+    deps = [
+        ":frame",
+        "//talOS/events:events_core",
+    ],
+)
+
+cc_library(
     name = "camera_source",
     hdrs = ["camera_source.h"],
     deps = [
@@ -88,6 +97,18 @@ cc_test(
     srcs = ["frame_test.cc"],
     deps = [
         ":frame",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "frame_mailbox_test",
+    size = "small",
+    srcs = ["frame_mailbox_test.cc"],
+    deps = [
+        ":frame",
+        ":frame_mailbox",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],

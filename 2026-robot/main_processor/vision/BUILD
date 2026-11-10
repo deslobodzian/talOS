@@ -38,6 +38,7 @@ cc_library(
         "//talOS/msgs:geometry",
         "//talOS/node",
         "//talOS/vision:camera_source",
+        "//talOS/vision:frame_mailbox",
         "//talOS/vision:localization",
         "//talOS/vision:pipeline",
         "//talOS/vision/capture",

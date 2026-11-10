@@ -51,7 +51,11 @@ constexpr std::string_view ConnectionStateToString(ConnectionState state) {
   return "Unknown";
 }
 
-// Callback types for frame and lifecycle notifications.
+// Callback types for frame and lifecycle notifications. A frame passed to a
+// FrameCallback may borrow the source's driver buffer (Frame::is_borrowed())
+// and is valid only until the callback returns; a consumer copies what it
+// keeps, e.g. into a FrameMailbox. A ConnectionCallback carries the reason for
+// a failed Start() or a lost connection.
 using FrameCallback = std::function<void(const Frame& frame)>;
 using ConnectionCallback =
     std::function<void(ConnectionState state, std::string_view message)>;
@@ -84,7 +88,8 @@ class CameraSource {
   virtual void Stop() = 0;
   virtual bool IsRunning() const = 0;
   virtual bool IsConnected() const = 0;
-  // Cumulative source-side drops, including exhausted reusable buffers.
+  // Cumulative frames the source itself lost (errored or unreadable driver
+  // buffers), for the consumer to fold into its own drop count.
   virtual uint64_t dropped_frames() const { return 0; }
   // False when requested controls could not be applied; capture may continue.
   virtual bool controls_applied() const { return true; }

@@ -21,6 +21,7 @@ cc_binary(
     srcs = ["main.cc"],
     deps = [
         ":calibration",
+        "//talOS/vision:frame_mailbox",
         "//talOS/vision/capture",
         "@opencv//:imgcodecs",
         "@opencv//:imgproc",

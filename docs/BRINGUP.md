@@ -85,9 +85,9 @@ For the one-Kraken RoboRIO/Mini test bench, use [BENCH.md](BENCH.md).
 8. Test a USB stall/unplug while disabled. With a connected source,
    `frame_timeout_us` of silence (default 500,000 µs) increments `stall_count`
    and closes/reopens the source. A detected disconnect enters recovery
-   directly, without necessarily counting as a stall. Retries use 100 ms–8 s
-   exponential backoff; `reconnect_count` counts successful recovery, not failed
-   attempts. Confirm frames resume without restarting the node. These
+   directly, without necessarily counting as a stall. Retries use 100 ms–1 s
+   exponential backoff, and each connection state change logs one line with its
+   reason; `reconnect_count` counts successful recovery, not failed attempts. Confirm frames resume without restarting the node. These
    recovery/control fields are excluded from the robot's radio telemetry.
 
 The tool uses OpenCV 4.12's ChArUco detector: the BCR module exposes both

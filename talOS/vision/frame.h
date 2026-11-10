@@ -159,6 +159,26 @@ class Frame {
         format_{format},
         shared_storage_{std::move(shared_buffer)} {}
 
+  // Constructs a Frame borrowing `borrowed_size` bytes it does not own, such
+  // as a capture driver's buffer for the duration of a FrameCallback. Copies
+  // borrow the same bytes, so a consumer that keeps the image copies them
+  // (FrameMailbox::Publish, Clone); Share() and mutable_data() copy first.
+  Frame(uint32_t camera_id, uint64_t session_id, uint64_t sequence_number,
+        talos::event::MonotonicTime capture_time, uint32_t width,
+        uint32_t height, uint32_t stride, PixelFormat format,
+        const uint8_t* borrowed, size_t borrowed_size)
+      : camera_id_{camera_id},
+        session_id_{session_id},
+        sequence_number_{sequence_number},
+        capture_time_{capture_time},
+        raw_timestamp_ns_{capture_time.nanos()},
+        width_{width},
+        height_{height},
+        stride_{stride},
+        format_{format},
+        borrowed_{borrowed},
+        borrowed_size_{borrowed != nullptr ? borrowed_size : 0} {}
+
   // Accessors
   uint32_t camera_id() const { return camera_id_; }
   void set_camera_id(uint32_t id) { camera_id_ = id; }
@@ -213,6 +233,7 @@ class Frame {
 
   // Buffer accessors
   const uint8_t* data() const {
+    if (borrowed_ != nullptr) return borrowed_;
     const uint8_t* ptr =
         shared_storage_ ? shared_storage_->data() : owned_storage_.data();
     if (ptr == nullptr) return nullptr;
@@ -228,7 +249,12 @@ class Frame {
   }
 
   uint8_t* mutable_data() {
-    if (shared_storage_) {
+    if (borrowed_ != nullptr) {
+      // Copy out of borrowed storage before mutating.
+      owned_storage_.assign(borrowed_, borrowed_ + borrowed_size_);
+      borrowed_ = nullptr;
+      borrowed_size_ = 0;
+    } else if (shared_storage_) {
       // Unshare to mutate (copy-on-write semantics)
       owned_storage_ = *shared_storage_;
       shared_storage_.reset();
@@ -250,10 +276,7 @@ class Frame {
     if (stride_ > 0 && height_ > 0) {
       return static_cast<size_t>(stride_) * height_;
     }
-    if (shared_storage_) {
-      return shared_storage_->size();
-    }
-    return owned_storage_.size();
+    return stored_size();
   }
 
   bool empty() const { return size() == 0; }
@@ -266,13 +289,15 @@ class Frame {
         stride_ < static_cast<size_t>(width_) * bytes_per_pixel()) {
       return false;
     }
-    const size_t stored =
-        shared_storage_ ? shared_storage_->size() : owned_storage_.size();
-    return stored >= size();
+    return stored_size() >= size();
   }
 
   // Returns true if buffer storage is shared with other handles.
   bool is_shared() const { return shared_storage_ != nullptr; }
+
+  // Returns true if the bytes belong to someone else (see the borrowing
+  // constructor).
+  bool is_borrowed() const { return borrowed_ != nullptr; }
 
   // Clones the frame, guaranteeing an owned, independent buffer.
   Frame Clone() const {
@@ -291,14 +316,19 @@ class Frame {
     cloned.format_ = format_;
     size_t bytes = static_cast<size_t>(stride_) * height_;
     cloned.owned_storage_.resize(bytes > 0 ? (bytes + 4096) : 0);
-    if (bytes > 0 && data() != nullptr) {
-      std::memcpy(cloned.mutable_data(), data(), bytes);
+    // A borrowed frame copies only the bytes it was lent.
+    const size_t copied =
+        borrowed_ != nullptr && borrowed_size_ < bytes ? borrowed_size_ : bytes;
+    if (copied > 0 && data() != nullptr) {
+      std::memcpy(cloned.mutable_data(), data(), copied);
     }
     return cloned;
   }
 
-  // Shares the buffer with a new Frame instance without copying data.
+  // Shares the buffer with a new Frame instance without copying data; a
+  // borrowed frame is cloned instead, since its bytes may not outlive it.
   Frame Share() const {
+    if (borrowed_ != nullptr) return Clone();
     if (!shared_storage_ && !owned_storage_.empty()) {
       shared_storage_ = std::make_shared<const std::vector<uint8_t>>(
           std::move(const_cast<std::vector<uint8_t>&>(owned_storage_)));
@@ -321,6 +351,11 @@ class Frame {
   }
 
  private:
+  size_t stored_size() const {
+    if (borrowed_ != nullptr) return borrowed_size_;
+    return shared_storage_ ? shared_storage_->size() : owned_storage_.size();
+  }
+
   uint32_t camera_id_{0};
   uint64_t session_id_{0};
   uint64_t sequence_number_{0};
@@ -338,6 +373,8 @@ class Frame {
 
   std::vector<uint8_t> owned_storage_;
   mutable std::shared_ptr<const std::vector<uint8_t>> shared_storage_;
+  const uint8_t* borrowed_{nullptr};
+  size_t borrowed_size_{0};
 };
 
 }  // namespace talos::vision

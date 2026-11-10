@@ -1,32 +1,11 @@
 #pragma once
 #include <memory>
-#include <mutex>
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "talOS/vision/camera_source.h"
 namespace talos::vision {
-// Single pending frame: publishing replaces old work rather than building
-// latency.
-class LatestFrameSlot {
- public:
-  void Publish(Frame frame) {
-    std::lock_guard lock(mutex_);
-    latest_ = std::move(frame);
-  }
-  std::optional<Frame> TakeLatest() {
-    std::lock_guard lock(mutex_);
-    auto frame = std::move(latest_);
-    latest_.reset();
-    return frame;
-  }
-
- private:
-  std::mutex mutex_;
-  std::optional<Frame> latest_;
-};
 struct CaptureDevice {
   std::string id, name;
   std::vector<CameraMode> modes;

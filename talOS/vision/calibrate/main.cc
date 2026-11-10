@@ -11,6 +11,7 @@
 
 #include "talOS/vision/calibrate/calibration.h"
 #include "talOS/vision/capture/avfoundation_source.h"
+#include "talOS/vision/frame_mailbox.h"
 
 int main(int argc, char** argv) {
   try {
@@ -91,10 +92,11 @@ int main(int argc, char** argv) {
         }
       }
     } else {
-      talos::vision::LatestFrameSlot slot;
+      talos::vision::FrameMailbox mailbox;
       auto source = talos::vision::CreateCaptureSource(0, device);
       if (!source) throw std::runtime_error("Unsupported capture platform");
-      source->SetFrameCallback([&](const auto& frame) { slot.Publish(frame); });
+      source->SetFrameCallback(
+          [&](const auto& frame) { mailbox.Publish(frame); });
       source->SetConnectionCallback(
           [](auto, auto message) { std::cerr << message << '\n'; });
       if (!source->Start()) throw std::runtime_error("Cannot start capture");
@@ -105,7 +107,7 @@ int main(int argc, char** argv) {
                  .count() < seconds) {
         const auto now = std::chrono::steady_clock::now();
         if (now >= next) {
-          if (auto frame = slot.TakeLatest()) {
+          if (const auto* frame = mailbox.TakeNewest()) {
             const auto format = frame->format();
             const int type =
                 format == talos::vision::PixelFormat::kGray8   ? CV_8UC1

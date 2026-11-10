@@ -10,7 +10,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cmath>
@@ -86,22 +85,22 @@ class Source final : public CameraSource {
     Stop();
     if (!mode_.width || !mode_.height || !std::isfinite(mode_.fps) ||
         mode_.fps <= 0 || mode_.fps > 1000000) {
-      return false;
+      return Fail("invalid capture mode", 0);
     }
     fd_ = open(device_id().c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd_ < 0) {
-      return Fail();
+      return Fail("open", errno);
     }
     v4l2_capability caps{};
     if (Ioctl(fd_, VIDIOC_QUERYCAP, &caps) < 0) {
-      return Fail();
+      return Fail("VIDIOC_QUERYCAP", errno);
     }
     const uint32_t capabilities = caps.capabilities & V4L2_CAP_DEVICE_CAPS
                                       ? caps.device_caps
                                       : caps.capabilities;
     if (!(capabilities & V4L2_CAP_VIDEO_CAPTURE) ||
         !(capabilities & V4L2_CAP_STREAMING)) {
-      return Fail();
+      return Fail("not a streaming video capture device", 0);
     }
     v4l2_format format{};
     bool selected = false;
@@ -125,12 +124,12 @@ class Source final : public CameraSource {
       }
     }
     if (!selected) {
-      return Fail();
+      return Fail("neither GREY nor YUYV is available", 0);
     }
     if (mode_.width > 0 && mode_.height > 0 &&
         (format.fmt.pix.width != mode_.width ||
          format.fmt.pix.height != mode_.height)) {
-      return Fail();
+      return Fail("requested width x height is not supported", 0);
     }
     mode_.width = format.fmt.pix.width;
     mode_.height = format.fmt.pix.height;
@@ -139,7 +138,7 @@ class Source final : public CameraSource {
                        : PixelFormat::kYuyv;
     stride_ = format.fmt.pix.bytesperline;
     if (!mode_.height || stride_ < mode_.width * BytesPerPixel(mode_.format)) {
-      return Fail();
+      return Fail("driver reported an invalid stride", 0);
     }
     const size_t size = static_cast<size_t>(stride_) * mode_.height;
     v4l2_streamparm parm{};
@@ -158,8 +157,11 @@ class Source final : public CameraSource {
     request.count = 4;
     request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     request.memory = V4L2_MEMORY_MMAP;
-    if (Ioctl(fd_, VIDIOC_REQBUFS, &request) < 0 || request.count < 2) {
-      return Fail();
+    if (Ioctl(fd_, VIDIOC_REQBUFS, &request) < 0) {
+      return Fail("VIDIOC_REQBUFS", errno);
+    }
+    if (request.count < 2) {
+      return Fail("driver granted fewer than 2 buffers", 0);
     }
     mappings_.resize(request.count);
     for (uint32_t i = 0; i < request.count; ++i) {
@@ -167,23 +169,23 @@ class Source final : public CameraSource {
       buffer.type = request.type;
       buffer.memory = request.memory;
       buffer.index = i;
-      if (Ioctl(fd_, VIDIOC_QUERYBUF, &buffer) < 0 || buffer.length < size) {
-        return Fail();
+      if (Ioctl(fd_, VIDIOC_QUERYBUF, &buffer) < 0) {
+        return Fail("VIDIOC_QUERYBUF", errno);
+      }
+      if (buffer.length < size) {
+        return Fail("driver buffer smaller than one frame", 0);
       }
       mappings_[i].size = buffer.length;
       mappings_[i].data = mmap(nullptr, buffer.length, PROT_READ | PROT_WRITE,
                                MAP_SHARED, fd_, buffer.m.offset);
       if (mappings_[i].data == MAP_FAILED ||
           Ioctl(fd_, VIDIOC_QBUF, &buffer) < 0) {
-        return Fail();
+        return Fail("mmap/VIDIOC_QBUF", errno);
       }
-    }
-    for (auto& buffer : pool_) {
-      buffer = std::make_shared<std::vector<uint8_t>>(size);
     }
     auto type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (Ioctl(fd_, VIDIOC_STREAMON, &type) < 0) {
-      return Fail();
+      return Fail("VIDIOC_STREAMON", errno);
     }
     streaming_ = true;
     session_ = event::steady_now().nanos();
@@ -220,22 +222,30 @@ class Source final : public CameraSource {
   }
 
  private:
-  bool Fail() {
+  // Reports why Start failed; `error` is the errno of the failed call, or 0.
+  bool Fail(const char* step, int error) {
     Stop();
     if (connection_) {
-      connection_(ConnectionState::kError, "Unable to configure V4L2 camera");
+      std::string message = device_id() + ": " + step;
+      if (error != 0) message += std::string(": ") + std::strerror(error);
+      connection_(ConnectionState::kError, message);
     }
     return false;
   }
   void Capture(const std::stop_token& stop) {
+    std::string reason = "capture stopped";
     while (!stop.stop_requested()) {
       pollfd poll_fd{fd_, POLLIN, 0};
       const int ready = poll(&poll_fd, 1, 100);
       if (ready < 0 && errno == EINTR) {
         continue;
       }
-      if (ready < 0 ||
-          (ready > 0 && (poll_fd.revents & (POLLERR | POLLHUP | POLLNVAL)))) {
+      if (ready < 0) {
+        reason = std::string("poll: ") + std::strerror(errno);
+        break;
+      }
+      if (ready > 0 && (poll_fd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        reason = "device error or hangup (unplugged?)";
         break;
       }
       if (!ready) {
@@ -248,6 +258,7 @@ class Source final : public CameraSource {
         if (errno == EAGAIN) {
           continue;
         }
+        reason = std::string("VIDIOC_DQBUF: ") + std::strerror(errno);
         break;
       }
       timespec now{};
@@ -264,24 +275,18 @@ class Source final : public CameraSource {
       const int64_t capture_end = driver_monotonic
                                       ? node_delivery - (delivery - driver_time)
                                       : node_delivery;
-      std::shared_ptr<std::vector<uint8_t>> bytes;
-      for (size_t i = 0; i < pool_.size(); ++i) {
-        size_t index = (next_ + i) % pool_.size();
-        if (pool_[index].use_count() == 1) {
-          bytes = pool_[index];
-          next_ = (index + 1) % pool_.size();
-          break;
-        }
-      }
-      if (bytes && buffer.index < mappings_.size() &&
-          !(buffer.flags & V4L2_BUF_FLAG_ERROR) &&
-          buffer.bytesused >= bytes->size()) {
-        std::memcpy(bytes->data(), mappings_[buffer.index].data, bytes->size());
+      const size_t size = static_cast<size_t>(stride_) * mode_.height;
+      if (buffer.index < mappings_.size() &&
+          !(buffer.flags & V4L2_BUF_FLAG_ERROR) && buffer.bytesused >= size) {
+        // The frame borrows the dequeued driver buffer until it is queued
+        // again below; the consumer copies what it keeps (FrameMailbox).
         // Preserve source meaning; the camera publication boundary converts
         // SOE/EOF to midpoint once, and delivery uses measured latency only.
         Frame frame(config_.camera_id, session_, sequence_++,
                     event::MonotonicTime::from_nanos(capture_end), mode_.width,
-                    mode_.height, stride_, mode_.format, bytes);
+                    mode_.height, stride_, mode_.format,
+                    static_cast<const uint8_t*>(mappings_[buffer.index].data),
+                    size);
         frame.set_raw_timestamp_ns(driver_monotonic ? driver_time : delivery);
         frame.set_timestamp_kind(V4L2TimestampKind(buffer.flags));
         frame.set_mapping_quality(TimestampMappingQuality::kEstimated);
@@ -289,15 +294,18 @@ class Source final : public CameraSource {
           callback_(frame);
         }
       } else {
+        // An errored or short driver buffer; counted by the consumer through
+        // dropped_frames().
         ++dropped_frames_;
       }
       if (Ioctl(fd_, VIDIOC_QBUF, &buffer) < 0) {
+        reason = std::string("VIDIOC_QBUF: ") + std::strerror(errno);
         break;
       }
     }
     running_ = false;
     if (!stop.stop_requested() && connection_) {
-      connection_(ConnectionState::kDisconnected, "V4L2 capture stopped");
+      connection_(ConnectionState::kDisconnected, device_id() + ": " + reason);
     }
   }
   struct Mapping {
@@ -316,8 +324,6 @@ class Source final : public CameraSource {
   std::atomic<uint64_t> dropped_frames_{0};
   std::jthread worker_;
   std::vector<Mapping> mappings_;
-  std::array<std::shared_ptr<std::vector<uint8_t>>, 2> pool_;
-  size_t next_{0};
   uint32_t stride_{0};
   uint64_t session_{0}, sequence_{0};
 };

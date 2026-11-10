@@ -77,22 +77,5 @@ TEST(Capture, MissingDeviceFailsAndStopIsIdempotent) {
   EXPECT_FALSE(source->Start());
   source->Stop();
 }
-TEST(Capture, LatestSlotReplacesAndConsumesPendingFrame) {
-  LatestFrameSlot slot;
-  EXPECT_FALSE(slot.TakeLatest().has_value());
-  Frame first;
-  first.set_sequence_number(1);
-  Frame second;
-  second.set_sequence_number(2);
-  slot.Publish(std::move(first));
-  slot.Publish(std::move(second));
-  const auto latest = slot.TakeLatest();
-  if (!latest.has_value()) {
-    FAIL() << "Expected the latest published frame";
-  }
-  const Frame& frame = *latest;
-  EXPECT_EQ(frame.sequence_number(), 2u);
-  EXPECT_FALSE(slot.TakeLatest().has_value());
-}
 }  // namespace
 }  // namespace talos::vision

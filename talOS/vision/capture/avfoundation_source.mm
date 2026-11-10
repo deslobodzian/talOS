@@ -2,11 +2,9 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
-#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -90,11 +88,18 @@ class Source final : public CameraSource {
     @autoreleasepool {
       if (device_id_.empty()) {
         const auto devices = DiscoverCaptureDevices();
-        if (id_ >= devices.size()) return false;
+        if (id_ >= devices.size())
+          return Fail(ConnectionState::kDisconnected,
+                      "no camera at index " + std::to_string(id_));
         device_id_ = devices[id_].id;
       }
       device_ = [AVCaptureDevice deviceWithUniqueID:@(device_id_.c_str())];
-      if (!device_ || !device_.connected) return false;
+      if (!device_)
+        return Fail(ConnectionState::kDisconnected,
+                    "no camera with uniqueID " + device_id_);
+      if (!device_.connected)
+        return Fail(ConnectionState::kDisconnected,
+                    "camera " + device_id_ + " is not connected");
       const auto permission =
           [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
       if (permission == AVAuthorizationStatusNotDetermined) {
@@ -106,31 +111,34 @@ class Source final : public CameraSource {
                                    completionHandler:^(BOOL granted){
                                    }];
         }
-        if (connection_)
-          connection_(ConnectionState::kDisconnected,
-                      "Waiting for macOS camera permission");
-        return false;
+        return Fail(ConnectionState::kDisconnected,
+                    "Waiting for macOS camera permission");
       }
       if (permission != AVAuthorizationStatusAuthorized) {
-        if (connection_)
-          connection_(ConnectionState::kError,
-                      "Camera access is not authorized for this process; "
-                      "enable camera access in macOS Privacy settings");
-        return false;
+        return Fail(ConnectionState::kError,
+                    "Camera access is not authorized for this process; "
+                    "enable camera access in macOS Privacy settings");
       }
       NSError* error = nil;
       session_ = [[AVCaptureSession alloc] init];
       [session_ beginConfiguration];
       AVCaptureDeviceInput* input =
           [AVCaptureDeviceInput deviceInputWithDevice:device_ error:&error];
-      if (!input || ![session_ canAddInput:input]) {
+      if (!input) {
         [session_ commitConfiguration];
-        return false;
+        return Fail(ConnectionState::kError,
+                    "cannot open camera input: " + Describe(error));
+      }
+      if (![session_ canAddInput:input]) {
+        [session_ commitConfiguration];
+        return Fail(ConnectionState::kError,
+                    "capture session refused the camera input (in use?)");
       }
       [session_ addInput:input];
       if (![device_ lockForConfiguration:&error]) {
         [session_ commitConfiguration];
-        return false;
+        return Fail(ConnectionState::kError,
+                    "cannot lock camera configuration: " + Describe(error));
       }
       bool selected = false;
       for (AVCaptureDeviceFormat* format in device_.formats) {
@@ -161,7 +169,10 @@ class Source final : public CameraSource {
       [device_ unlockForConfiguration];
       if (!selected) {
         [session_ commitConfiguration];
-        return false;
+        return Fail(ConnectionState::kError,
+                    "camera has no " + std::to_string(mode_.width) + "x" +
+                        std::to_string(mode_.height) + " format at " +
+                        std::to_string(mode_.fps) + " fps");
       }
       output_ = [[AVCaptureVideoDataOutput alloc] init];
       output_.alwaysDiscardsLateVideoFrames = YES;
@@ -175,9 +186,6 @@ class Source final : public CameraSource {
         requested = kCVPixelFormatType_32BGRA;
       output_.videoSettings =
           @{(id)kCVPixelBufferPixelFormatTypeKey : @(requested)};
-      for (auto& buffer : buffers_)
-        buffer = std::make_shared<std::vector<uint8_t>>(
-            static_cast<size_t>(mode_.width) * mode_.height * 4);
       delegate_ = [[TalosCaptureDelegate alloc] init];
       delegate_->callback = [this](CMSampleBufferRef sample) {
         Receive(sample);
@@ -186,7 +194,8 @@ class Source final : public CameraSource {
       [output_ setSampleBufferDelegate:delegate_ queue:dispatch_];
       if (![session_ canAddOutput:output_]) {
         [session_ commitConfiguration];
-        return false;
+        return Fail(ConnectionState::kError,
+                    "capture session refused the video output");
       }
       [session_ addOutput:output_];
       [session_ commitConfiguration];
@@ -196,9 +205,7 @@ class Source final : public CameraSource {
       [session_ startRunning];
       if (!session_.running) {
         running_ = false;
-        if (connection_)
-          connection_(ConnectionState::kError, "Capture session did not start");
-        return false;
+        return Fail(ConnectionState::kError, "Capture session did not start");
       }
       if (connection_) connection_(ConnectionState::kConnected, "");
       return true;
@@ -224,42 +231,41 @@ class Source final : public CameraSource {
   uint64_t dropped_frames() const override { return dropped_frames_.load(); }
 
  private:
+  // Reports why Start failed and returns false.
+  bool Fail(ConnectionState state, const std::string& message) {
+    if (connection_) connection_(state, device_id_ + ": " + message);
+    return false;
+  }
+  static std::string Describe(NSError* error) {
+    return error ? std::string(error.localizedDescription.UTF8String)
+                 : std::string("unknown error");
+  }
   void Receive(CMSampleBufferRef sample) {
     if (!running_) return;
     CVPixelBufferRef pixels = CMSampleBufferGetImageBuffer(sample);
-    if (!pixels || CVPixelBufferLockBaseAddress(
-                       pixels, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
+    if (!pixels ||
+        CVPixelBufferLockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly) !=
+            kCVReturnSuccess) {
+      // Counted by the consumer through dropped_frames().
+      ++dropped_frames_;
       return;
+    }
     const size_t size =
         CVPixelBufferGetBytesPerRow(pixels) * CVPixelBufferGetHeight(pixels);
-    std::shared_ptr<std::vector<uint8_t>> bytes;
-    for (size_t i = 0; i < buffers_.size(); ++i) {
-      const size_t index = (next_buffer_ + i) % buffers_.size();
-      if (buffers_[index].use_count() == 1) {
-        bytes = buffers_[index];
-        next_buffer_ = (index + 1) % buffers_.size();
-        break;
-      }
-    }
-    if (!bytes) {
-      ++dropped_frames_;
-      CVPixelBufferUnlockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly);
-      return;
-    }
-    bytes->resize(size);
     const auto pixel_type = CVPixelBufferGetPixelFormatType(pixels);
     const auto format = pixel_type == kCVPixelFormatType_OneComponent8
                             ? PixelFormat::kGray8
                         : pixel_type == kCVPixelFormatType_422YpCbCr8_yuvs
                             ? PixelFormat::kYuyv
                             : PixelFormat::kBgra8;
-    std::memcpy(bytes->data(), CVPixelBufferGetBaseAddress(pixels), size);
-    Frame frame(id_, session_id_, sequence_++, event::Poller::now(),
-                static_cast<uint32_t>(CVPixelBufferGetWidth(pixels)),
-                static_cast<uint32_t>(CVPixelBufferGetHeight(pixels)),
-                static_cast<uint32_t>(CVPixelBufferGetBytesPerRow(pixels)),
-                format, bytes);
-    CVPixelBufferUnlockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly);
+    // The frame borrows the locked pixel buffer until the callback returns;
+    // the consumer copies what it keeps (FrameMailbox).
+    Frame frame(
+        id_, session_id_, sequence_++, event::Poller::now(),
+        static_cast<uint32_t>(CVPixelBufferGetWidth(pixels)),
+        static_cast<uint32_t>(CVPixelBufferGetHeight(pixels)),
+        static_cast<uint32_t>(CVPixelBufferGetBytesPerRow(pixels)), format,
+        static_cast<const uint8_t*>(CVPixelBufferGetBaseAddress(pixels)), size);
     const CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
     frame.set_raw_timestamp_ns(
         CMTIME_IS_NUMERIC(pts) ? CMTimeGetSeconds(pts) * 1e9 : 0);
@@ -278,6 +284,7 @@ class Source final : public CameraSource {
       }
     }
     if (callback_) callback_(frame);
+    CVPixelBufferUnlockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly);
   }
   uint32_t id_;
   std::string device_id_;
@@ -289,8 +296,6 @@ class Source final : public CameraSource {
   std::atomic<uint64_t> dropped_frames_{0};
   bool controls_applied_{true};
   uint64_t session_id_ = 0, sequence_ = 0;
-  std::array<std::shared_ptr<std::vector<uint8_t>>, 2> buffers_;
-  size_t next_buffer_{0};
   AVCaptureDevice* device_ = nil;
   AVCaptureSession* session_ = nil;
   AVCaptureVideoDataOutput* output_ = nil;
