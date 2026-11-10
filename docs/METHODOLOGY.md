@@ -333,7 +333,7 @@ producer that has drained it would.
 | Adding | Do | Never |
 |---|---|---|
 | A mechanism | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py`; fill in the TOML; write the §11 tests | edit `operator_interface` or `telemetry` code |
-| A producer of a target (auto routine, auto-align) | a `talos::TargetLane` on `/<sub>/target/<source>`; list `<source>` in `[robot.targets]` or that subsystem's `[targets]` (the launcher refuses a lane no mode lists) | subscribe to another producer's lane, or write a lane someone else writes |
+| A producer of a target (auto routine, auto-align, operator input) | a `talos::TargetLane` on `/<sub>/target/<source>`, opened with a `talos::OperatorArming` for operator input; list `<source>` in `[robot.targets]` or that subsystem's `[targets]` (the launcher refuses a lane no mode lists) | subscribe to another producer's lane, or write a lane someone else writes |
 | A process without hardware (pose estimator, vision, auto) | a node with no devices; subscribe to `state` topics; publish state with validity while disabled too; [estimator walkthrough](NODE_DEVELOPMENT_GUIDE.md#adding-a-pose-estimator) | duplicate shared geometry or hand-roll a Kalman filter |
 | A message | the owning package's `.fbs` and `talos_messages(topics = ...)`; §6 and §7 | a hand-written C++/Python mirror |
 | A device type | `talOS/hardware`, `talOS/devices`, `devices.py`, the RoboRIO program, in one change | |

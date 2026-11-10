@@ -8,7 +8,7 @@ import ctypes
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 25
+_EXPECTED_ABI_VERSION = 26
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -190,10 +190,15 @@ _SIGNATURES = {
                                    _P(c_int32)]),
     "talos_target_source_name": (c_char_p, [c_void_p, c_int64, c_int32]),
     "talos_target_lane_open": (c_int64, [c_void_p, c_char_p, c_char_p,
-                                         c_uint32, c_uint32, _P(Schema)]),
+                                         c_uint32, c_uint32, _P(Schema),
+                                         c_int64]),
     "talos_target_lane_send": (c_int32, [c_void_p, c_int64, c_char_p,
                                          c_uint32]),
     "talos_target_lane_release": (c_int32, [c_void_p, c_int64]),
+    "talos_operator_arming_open": (c_int64, [c_void_p]),
+    "talos_operator_arming_evaluate": (c_int32, [c_void_p, c_int64, c_int32]),
+    "talos_operator_arming_armed": (c_int32, [c_void_p, c_int64]),
+    "talos_operator_arming_disarm": (c_int32, [c_void_p, c_int64]),
 }
 _TESTING_SIGNATURES = {
     "talos_sim_create": (c_void_p, [c_char_p]),

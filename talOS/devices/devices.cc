@@ -852,6 +852,7 @@ class DriverStationLink {
   std::uint64_t Generation() const {
     return Mode() != DsMode::kNone ? data_.mode_since_us : 0;
   }
+  std::uint64_t Recoveries() const { return recoveries_; }
 
  private:
   // Sample and mode times run on the sampling gateway's boot clock, so they
@@ -872,10 +873,16 @@ class DriverStationLink {
                  next.mode_since_us < data_.mode_since_us))) {
       return;
     }
+    const Time published =
+        node_.now() - NodeAccess::subscription_age(node_, subscription_);
+    // The link was stale in between, whether or not anyone sampled it then.
+    if (have_ &&
+        published - published_ >= NodeAccess::freshness_timeout(node_)) {
+      ++recoveries_;
+    }
     data_ = next;
     have_ = true;
-    published_ =
-        node_.now() - NodeAccess::subscription_age(node_, subscription_);
+    published_ = published;
     for (const auto& listener : listeners_) listener();
   }
 
@@ -884,6 +891,7 @@ class DriverStationLink {
   bool have_ = false;
   hardware::BootHistory boots_;
   Time published_{};
+  std::uint64_t recoveries_ = 0;
   std::size_t subscription_ = 0;
   std::vector<std::function<void()>> listeners_;
 };
@@ -906,6 +914,9 @@ DsMode DriverStationAccess::mode(const DriverStation& ds) {
 }
 std::uint64_t DriverStationAccess::generation(const DriverStation& ds) {
   return ds.link_->Generation();
+}
+std::uint64_t DriverStationAccess::recoveries(const DriverStation& ds) {
+  return ds.link_->Recoveries();
 }
 
 }  // namespace detail

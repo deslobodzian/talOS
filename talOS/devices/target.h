@@ -44,11 +44,34 @@
 //
 // Target subscribes without a callback, so the node keeps draining right
 // before its timer; selection runs on every get().
+//
+// The generation keeps an old target from driving a new enable; it does not
+// stop a producer from turning a joystick held through that enable into a
+// new target. A producer that maps operator input (a joystick, a button
+// board) therefore opens its lanes with an OperatorArming, and evaluates it
+// on every reading of those inputs:
+//
+//   talos::OperatorArming arming_{node};
+//   talos::TargetLane<climber::ClimbTarget> climb_{node, "climber",
+//                                                  "operator", arming_};
+//   // in update(), or wherever the inputs are read:
+//   const bool held = ds_.joystick(1).button(3);
+//   if (arming_.evaluate(/*neutral=*/!held) && held) {
+//     climb_.send(climber::ClimbTarget{...});
+//   } else {
+//     climb_.release();
+//   }
+//
+// The lane stays released until an evaluation has seen every input neutral
+// in the current Driver Station view; a TargetLane without an
+// OperatorArming is never held.
 
 #include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 
 #include "talOS/devices/access.h"
@@ -138,6 +161,53 @@ class Target {
   std::size_t index_{0};
 };
 
+template <Message M>
+class TargetLane;
+
+// Whether an operator-input producer may publish active targets: armed by
+// an evaluation that found every input neutral, and only for the Driver
+// Station view it was armed under. It is disarmed, and the next neutral
+// evaluation is needed again,
+//   - at construction (startup),
+//   - when the Driver Station shows no mode (stale, detached, disabled or
+//     e-stopped), a new mode generation or a new gateway boot -- so after a
+//     disable or mode switch however brief, even one no evaluation sampled,
+//   - after the link recovers from a stale spell (a packet arriving
+//     command_timeout_us or more after the one before), sampled or not,
+//   - when evaluations stop for command_timeout_us or more (a stalled or
+//     paused process), and
+//   - by disarm(), for producer-specific reasons (a joystick reconnecting).
+// A cheap copyable value bound to its node, like Target and TargetLane.
+class OperatorArming {
+ public:
+  explicit OperatorArming(Node& node)
+      : node_{&node}, index_{detail::TargetAccess::open_arming(node)} {}
+
+  // One reading of the producer's inputs; `neutral`: every input it maps is
+  // at rest (axes inside their deadband, buttons and POVs released). True
+  // when the producer may publish active targets on this reading: it was
+  // already armed and nothing above has disarmed it. Otherwise false, and
+  // a neutral reading while the Driver Station shows a mode arms it at once
+  // (send() on this reading is active; the reading itself was neutral).
+  // Call it on every reading, on the loop thread:
+  // gaps of command_timeout_us disarm.
+  bool evaluate(bool neutral) {
+    return detail::TargetAccess::arming_evaluate(*node_, index_, neutral);
+  }
+  // Whether it is armed now, without evaluating: what a lane opened with it
+  // checks on every send().
+  bool armed() const {
+    return detail::TargetAccess::arming_armed(*node_, index_);
+  }
+  void disarm() { detail::TargetAccess::arming_disarm(*node_, index_); }
+
+ private:
+  template <Message>
+  friend class TargetLane;
+  Node* node_{nullptr};
+  std::size_t index_{0};
+};
+
 // One producer's lane, /<subsystem>/target/<source>. Takes the node's
 // DriverStation, whose generation every send() stamps. Like Target, always
 // bound to its node: there is no default constructor.
@@ -150,12 +220,21 @@ class TargetLane {
       : node_{&node},
         index_{detail::TargetAccess::open_lane(
             node, subsystem, source, sizeof(M), alignof(M), schema::Of<M>())} {}
+  // A lane of an operator-input producer: send() publishes a release
+  // instead while `arming` (of this node) is not armed().
+  TargetLane(Node& node, std::string_view subsystem, std::string_view source,
+             const OperatorArming& arming)
+      : node_{&node},
+        index_{detail::TargetAccess::open_lane(
+            node, subsystem, source, sizeof(M), alignof(M), schema::Of<M>(),
+            SameNode(node, arming))} {}
 
   // Asks for `message` (active = 1) under the mode generation this node's
   // Driver Station shows now (0, which no consumer accepts, while it shows
   // none). Republish every period: a lane older than [robot]
   // command_timeout_us is stale, and one from an earlier generation is
-  // ignored.
+  // ignored. False when the transport dropped it, or when the lane's
+  // OperatorArming is not armed and it went out as a release.
   bool send(const M& message) {
     return detail::TargetAccess::lane_send(*node_, index_, &message, sizeof(M));
   }
@@ -164,6 +243,15 @@ class TargetLane {
   bool release() { return detail::TargetAccess::lane_release(*node_, index_); }
 
  private:
+  static std::size_t SameNode(const Node& node, const OperatorArming& arming) {
+    if (arming.node_ != &node) {
+      throw std::invalid_argument(
+          std::string{node.name()} +
+          ": a target lane's OperatorArming belongs to another node");
+    }
+    return arming.index_;
+  }
+
   Node* node_{nullptr};
   std::size_t index_{0};
 };

@@ -100,6 +100,10 @@ struct DriverStationAccess {
   // The current mode generation: the latest packet's mode_since_us while
   // mode() is not none, else 0.
   static std::uint64_t generation(const DriverStation& ds);
+  // How many accepted packets arrived [robot] command_timeout_us or more
+  // after the one before (by publication time): each is a recovery from a
+  // stale link, whether or not anything sampled it while stale.
+  static std::uint64_t recoveries(const DriverStation& ds);
 };
 
 // Target and TargetLane (target.h) over message bytes, so the C ABI drives
@@ -122,13 +126,25 @@ struct TargetAccess {
   static std::size_t target_bytes(Node& node, std::size_t target);
 
   // Subscribes to the Driver Station, whose generation lane_send stamps.
+  // With `arming` (an index from open_arming on this node), lane_send
+  // publishes a release instead while that arming is not armed.
   static std::size_t open_lane(Node& node, std::string_view subsystem,
                                std::string_view source, std::size_t bytes,
                                std::size_t alignment,
-                               const schema::Identity& message);
+                               const schema::Identity& message,
+                               std::optional<std::size_t> arming = {});
+  // Whether the envelope went out active: false when the transport dropped
+  // it or the lane's arming held it to a release.
   static bool lane_send(Node& node, std::size_t lane, const void* message,
                         std::size_t bytes);
   static bool lane_release(Node& node, std::size_t lane);
+
+  // OperatorArming (target.h): subscribes to the Driver Station.
+  static std::size_t open_arming(Node& node);
+  // OperatorArming::evaluate, armed and disarm.
+  static bool arming_evaluate(Node& node, std::size_t arming, bool neutral);
+  static bool arming_armed(Node& node, std::size_t arming);
+  static void arming_disarm(Node& node, std::size_t arming);
 };
 
 // sizeof(TargetEnvelope<M>) for a message of `bytes` and `alignment`: the

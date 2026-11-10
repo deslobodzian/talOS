@@ -3,10 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdint>
 #include <cstdio>
 #include <numbers>
-#include <optional>
 
 #include "drivetrain/drive_message_generated.h"
 #include "drivetrain/topics.h"
@@ -33,7 +31,8 @@ class Driver {
         heading_timeout_{HeadingTimeout(node)},
         rezero_button_id_{node.param("rezero_button_id", 1)},
         heading_hold_radps_{node.param("heading_hold_radps", 0.0)},
-        chassis_{node, "drivetrain", "teleop"},
+        arming_{node},
+        chassis_{node, "drivetrain", "teleop", arming_},
         ds_{node, [this] { OnDriver(); }} {
     // The drivetrain owns the heading. One it marks invalid (no gyro) or a
     // non-finite one carries no direction, so it is dropped and the previous
@@ -46,14 +45,15 @@ class Driver {
           measured_omega_radps_ = s.omega_radps();
           heading_at_ = node_.now();
           have_heading_ = true;
-          if (armed_ && translation_neutral_) SetFrame(Frame::kField);
+          if (arming_.armed() && translation_neutral_) {
+            SetFrame(Frame::kField);
+          }
         });
   }
 
   // A Driver Station that stops talking gets the same one release per lane
   // as a disable, instead of the last request aging out downstream.
   void update() {
-    CheckEvaluation();
     if (!ds_.connected()) Stop();
     if (field_oriented_ && !FreshHeading() && frame_ == Frame::kField)
       SetFrame(Frame::kWaitingForNeutral);
@@ -61,12 +61,6 @@ class Driver {
 
  private:
   enum class Frame { kWaitingForNeutral, kRobot, kField };
-
-  struct ModeGeneration {
-    std::uint64_t boot_id = 0;
-    std::uint64_t mode_since_us = 0;
-    bool operator==(const ModeGeneration&) const = default;
-  };
 
   // Measured rotation below which a turn has stopped and the heading hold
   // latches: the slew-limited coast left from there is negligible.
@@ -95,20 +89,15 @@ class Driver {
     return have_heading_ && node_.now() - heading_at_ < heading_timeout_;
   }
 
-  void CheckEvaluation() {
-    const auto now = node_.now();
-    if (last_evaluation_ &&
-        now - *last_evaluation_ >=
-            talos::detail::NodeAccess::freshness_timeout(node_)) {
-      Stop();
-    }
-    last_evaluation_ = now;
-  }
-
   // One release on the falling edge, so the drivetrain drops teleop at once
   // rather than timing the last request out.
   void Stop() {
-    armed_ = false;
+    arming_.disarm();
+    Reset();
+  }
+
+  // Everything an unarmed driver holds, short of disarming.
+  void Reset() {
     SetFrame(Frame::kWaitingForNeutral);
     translation_neutral_ = false;
     holding_heading_ = false;
@@ -118,7 +107,6 @@ class Driver {
   }
 
   void OnDriver() {
-    CheckEvaluation();
     const talos::Joystick stick = ds_.joystick(0);
     // Each Target also gates on mode, but a producer that keeps talking while
     // disabled would still be publishing live requests onto its lanes.
@@ -127,13 +115,6 @@ class Driver {
       Stop();
       return;
     }
-    // A packet lost between two others can be the only disabled one; its
-    // mode generation (per gateway boot) has moved on regardless, so arming
-    // holds only within the generation it was armed in.
-    const ModeGeneration generation{ds_.data().boot_id,
-                                    ds_.data().mode_since_us};
-    if (armed_ && generation != armed_generation_) Stop();
-
     const bool rezero =
         rezero_button_id_ > 0 && stick.button(rezero_button_id_);
     const double raw_x = -stick.axis(1);
@@ -148,15 +129,20 @@ class Driver {
       Stop();
       return;
     }
-    translation_neutral_ = translation_neutral;
-    if (!armed_) {
+    // The arming also disarms in every new mode generation or gateway boot
+    // (a packet lost between two others can be the only disabled one), after
+    // a stale link and after an evaluation gap of command_timeout_us.
+    if (!arming_.evaluate(neutral)) {
+      Reset();
+      translation_neutral_ = translation_neutral;
       // Seed edge history from the snapshot; a held button is not a press.
       rezero_pressed_ = rezero;
-      armed_ = neutral;
-      armed_generation_ = generation;
-      if (neutral) SetFrame(FreshHeading() ? Frame::kField : Frame::kRobot);
+      if (arming_.armed()) {
+        SetFrame(FreshHeading() ? Frame::kField : Frame::kRobot);
+      }
       return;
     }
+    translation_neutral_ = translation_neutral;
     if (rezero && !rezero_pressed_ && FreshHeading()) {
       yaw_offset_rad_ = yaw_rad_;
       hold_settling_ = true;
@@ -225,6 +211,7 @@ class Driver {
   talos::Duration heading_timeout_;
   int rezero_button_id_;
   double heading_hold_radps_;
+  talos::OperatorArming arming_;
   talos::TargetLane<drivetrain::ChassisTarget> chassis_;
   talos::DriverStation ds_;
   double yaw_rad_ = 0;
@@ -237,11 +224,8 @@ class Driver {
   talos::Time heading_at_{};
   bool have_heading_ = false;
   bool commanding_ = false;
-  bool armed_ = false;
-  ModeGeneration armed_generation_;
   Frame frame_ = Frame::kWaitingForNeutral;
   bool translation_neutral_ = false;
-  std::optional<talos::Time> last_evaluation_;
 };
 
 }  // namespace driver

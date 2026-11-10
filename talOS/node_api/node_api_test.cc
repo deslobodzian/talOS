@@ -528,7 +528,7 @@ int32_t BuildLanes(TalosNode* node, void* user) {
   // The roller writes its own subsystem's lane only in this test; the lint,
   // not the API, refuses that in a session.
   l.lane = talos_target_lane_open(node, "roller", "teleop", sizeof(float),
-                                  alignof(float), &kFloatSchema);
+                                  alignof(float), &kFloatSchema, -1);
   return l.target < 0 || l.lane < 0 ? 1 : 0;
 }
 

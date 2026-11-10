@@ -272,6 +272,24 @@ mode generations and policy defaults. API:
 | `const M* t = target_.get()`: null unless `robot_enabled(node)` and the current Driver Station mode has a lane that is active, fresh and stamped with the current mode generation | `t = target.get()` (`None`) |
 | `target_.source()`: `"teleop"`, `"auto"`, ... or `""` | `target.source` |
 | `talos::TargetLane<M> lane_{node, "wrist", "auto"}`: `send(M{...})` (stamped with this node's mode generation), `release()` | `talos.TargetLane(node, M, "wrist", "auto")`: `send(field=...)` or `send(message)`, `release()` |
+| `talos::OperatorArming arming_{node}`; `talos::TargetLane<M> lane_{node, "climber", "operator", arming_}`: `send()` goes out as a release (and returns false) while `arming_.armed()` is false | `talos.OperatorArming(node)`; `talos.TargetLane(node, M, "climber", "operator", arming=arming)` |
+| `arming_.evaluate(neutral)` on every reading of the inputs: true when this reading may publish; otherwise a neutral reading arms it at once (a send on that neutral reading is active). `disarm()` for producer-specific reasons (a joystick reconnecting) | `arming.evaluate(neutral)`, `arming.armed`, `arming.disarm()` |
+
+A producer that maps operator input (joysticks, a button board) opens its
+lanes with an `OperatorArming`, so a control held through a disable, reboot,
+Driver Station dropout or stall of the producer does not drive until it has
+been released once (the full list:
+[Architecture: Targets](../ARCHITECTURE.md#targets)):
+
+```cpp
+// in update(), with ds_ a talos::DriverStation:
+const bool held = ds_.joystick(1).button(3);
+if (arming_.evaluate(/*neutral=*/!held) && held) {
+  lane_.send(climber::ClimbTarget{...});
+} else {
+  lane_.release();
+}
+```
 
 
 ### Binding joystick buttons and axes via TOML

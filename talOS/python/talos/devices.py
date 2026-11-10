@@ -21,7 +21,7 @@ import math
 from datetime import timedelta
 
 from talos import _abi
-from talos._abi import lib
+from talos._abi import TalosError, lib
 from talos._messages import message_type
 
 
@@ -460,6 +460,49 @@ class Target(_OnNode):
             lambda name: name is None).decode()
 
 
+class OperatorArming(_OnNode):
+    """Whether an operator-input producer may publish active targets
+    (talos::OperatorArming): armed by a reading that found every input it
+    maps at rest, and only for the Driver Station view it was armed under.
+
+        self.arming = talos.OperatorArming(node)
+        self.climb = talos.TargetLane(node, ClimbTarget, "climber",
+                                      "operator", arming=self.arming)
+        ...
+        held = self.ds.joystick(1).button(3)
+        if self.arming.evaluate(neutral=not held) and held:
+            self.climb.send(...)
+        else:
+            self.climb.release()
+
+    evaluate() is True when this reading may publish: armed by an earlier
+    one, and not disarmed since. Otherwise it is False, and a neutral
+    reading under a Driver Station mode arms it at once. It disarms at
+    startup; when the Driver Station shows no mode, a new mode generation or
+    a new gateway boot (so after any disable or mode switch, sampled or
+    not); after the link recovers from a stale spell; when readings stop
+    for command_timeout_us; and on disarm(). Evaluate on every reading.
+    """
+
+    def __init__(self, node):
+        super().__init__(node)
+        self._index = _abi.index(lib.talos_operator_arming_open(self._node))
+
+    def evaluate(self, neutral) -> bool:
+        return bool(_abi.ok(lib.talos_operator_arming_evaluate(
+            self._node, self._index, 1 if neutral else 0)))
+
+    @property
+    def armed(self) -> bool:
+        """Armed now, without evaluating: what an armed lane's send()
+        checks."""
+        return bool(_abi.ok(lib.talos_operator_arming_armed(
+            self._node, self._index)))
+
+    def disarm(self):
+        _abi.ok(lib.talos_operator_arming_disarm(self._node, self._index))
+
+
 class TargetLane(_OnNode):
     """One producer's lane, /<subsystem>/target/<source> (talos::TargetLane):
 
@@ -469,19 +512,26 @@ class TargetLane(_OnNode):
 
     send() stamps the mode generation this node's Driver Station shows (0,
     which no consumer accepts, while it shows no mode), so a target from an
-    earlier enable or mode never drives this one.
+    earlier enable or mode never drives this one. A lane of operator input
+    takes arming=OperatorArming(node): while that is not armed, send()
+    publishes a release and returns False.
     """
 
-    def __init__(self, node, msg, subsystem, source):
+    def __init__(self, node, msg, subsystem, source, arming=None):
         super().__init__(node)
         self._type = message_type(msg)
+        if arming is not None and arming._owner is not node:
+            raise TalosError(f"{subsystem}/target/{source}: the lane's "
+                             "OperatorArming belongs to another node")
         self._index = _abi.index(lib.talos_target_lane_open(
             self._node, _abi.encode(subsystem), _abi.encode(source),
-            self._type.size, self._type.alignment, _abi.schema_of(self._type)))
+            self._type.size, self._type.alignment, _abi.schema_of(self._type),
+            -1 if arming is None else arming._index))
 
     def send(self, message=None, **fields):
         """send(field=value, ...) with the .fbs field names, or send(message)
-        to forward a received one."""
+        to forward a received one. False when the transport dropped it or the
+        lane's arming held it to a release."""
         data = self._type.forward(message) if message is not None else (
             self._type.encode(fields))
         return bool(_abi.ok(lib.talos_target_lane_send(

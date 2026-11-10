@@ -346,7 +346,10 @@ struct SubsystemState {
 
 class Teleop {
  public:
-  explicit Teleop(talos::Node& node) : node_{node}, ds_{node} {
+  explicit Teleop(talos::Node& node)
+      : node_{node},
+        ds_{node},
+        arming_{talos::detail::TargetAccess::open_arming(node)} {
     using talos::detail::NodeAccess;
 
     const introspect::DeclaredGraph* graph = NodeAccess::declared_graph(node);
@@ -364,61 +367,37 @@ class Teleop {
   void update() {
     using talos::detail::TargetAccess;
 
-    const auto now = node_.now();
-    if (last_evaluation_ &&
-        now - *last_evaluation_ >=
-            talos::detail::NodeAccess::freshness_timeout(node_)) {
-      armed_ = false;
-    }
-    last_evaluation_ = now;
-    if (!ds_.enabled() || !ds_.teleop()) armed_ = false;
-    // A disable or mode change shorter than one period is drained together
-    // with the packet that ends it, so update() may never sample it; the
-    // packet's mode generation still moves on, and arming holds only within
-    // the generation (and gateway boot) it was armed in.
-    const ModeGeneration generation{ds_.data().boot_id,
-                                    ds_.data().mode_since_us};
-    if (generation != armed_generation_) armed_ = false;
-
+    const bool ds_ok = ds_.enabled() && ds_.teleop();
+    if (!ds_ok) TargetAccess::arming_disarm(node_, arming_);
     // A stick that (re)appears may already be deflected; an absent spare
     // controller is no input and does not block the others.
     for (auto& sub : subsystems_) {
       for (auto& binding : sub.bindings) {
         const bool connected = ds_.joystick(binding.port).connected();
-        if (connected && !binding.connected) armed_ = false;
+        if (connected && !binding.connected) {
+          TargetAccess::arming_disarm(node_, arming_);
+        }
         binding.connected = connected;
       }
     }
-    if (!armed_) {
-      bool neutral = ds_.enabled() && ds_.teleop();
+    // The arming (talos::OperatorArming) also disarms on its own in every
+    // new mode generation or gateway boot, after a stale Driver Station
+    // link, and after this node's evaluations stall for command_timeout_us.
+    if (!TargetAccess::arming_evaluate(node_, arming_,
+                                       ds_ok && InputsNeutral())) {
       for (auto& sub : subsystems_) {
         for (auto& binding : sub.bindings) {
-          const auto stick = ds_.joystick(binding.port);
           binding.toggled = false;
           // Seed edge history; a button held through rearm is not a press.
-          const bool pressed =
-              binding.is_button &&
-              (binding.pov ? stick.pov(binding.pov_index) == *binding.pov
-                           : stick.button(binding.button));
-          binding.was_pressed = pressed;
-          if (!stick.connected()) continue;
-          const bool released =
-              binding.pov ? stick.pov(binding.pov_index) < 0 : !pressed;
-          const double axis =
-              binding.is_button ? 0.0 : stick.axis(binding.axis);
-          neutral = neutral && released && std::isfinite(axis) &&
-                    std::abs(axis) <= binding.deadband_frac;
+          binding.was_pressed = Pressed(binding, ds_.joystick(binding.port));
         }
         if (sub.commanding) {
           TargetAccess::lane_release(node_, sub.lane_index);
           sub.commanding = false;
         }
       }
-      armed_ = neutral;
-      armed_generation_ = generation;
       return;
     }
-    const bool ds_ok = ds_.enabled() && ds_.teleop();
     for (auto& sub : subsystems_) {
       bool any_stick_connected = false;
       for (const auto& b : sub.bindings) {
@@ -453,8 +432,7 @@ class Teleop {
           continue;
         }
         if (b.is_button) {
-          const bool pressed =
-              b.pov ? stick.pov(b.pov_index) == *b.pov : stick.button(b.button);
+          const bool pressed = Pressed(b, stick);
           if (b.on_toggle && !b.was_pressed && pressed) {
             b.toggled = !b.toggled;
           }
@@ -504,11 +482,32 @@ class Teleop {
   }
 
  private:
-  struct ModeGeneration {
-    std::uint64_t boot_id{0};
-    std::uint64_t mode_since_us{0};
-    bool operator==(const ModeGeneration&) const = default;
-  };
+  static bool Pressed(const detail::PrecomputedBinding& binding,
+                      const talos::Joystick& stick) {
+    return binding.is_button &&
+           (binding.pov ? stick.pov(binding.pov_index) == *binding.pov
+                        : stick.button(binding.button));
+  }
+
+  // Every connected bound input at rest: axes finite and inside their
+  // deadband, buttons released, POVs centred (a bound POV held in another
+  // direction is not at rest).
+  bool InputsNeutral() const {
+    for (const auto& sub : subsystems_) {
+      for (const auto& binding : sub.bindings) {
+        const talos::Joystick stick = ds_.joystick(binding.port);
+        if (!stick.connected()) continue;
+        const bool released = binding.pov ? stick.pov(binding.pov_index) < 0
+                                          : !Pressed(binding, stick);
+        const double axis = binding.is_button ? 0.0 : stick.axis(binding.axis);
+        if (!released || !std::isfinite(axis) ||
+            std::abs(axis) > binding.deadband_frac) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
 
   void BuildSubsystem(const std::string& sub_name,
                       const std::vector<config::TeleopBinding>& bindings,
@@ -575,7 +574,7 @@ class Teleop {
 
     const std::size_t lane_index =
         TargetAccess::open_lane(node_, sub_name, "teleop", inner_bytes,
-                                inner_alignment, inner_identity);
+                                inner_alignment, inner_identity, arming_);
 
     detail::SubsystemState state;
     state.name = sub_name;
@@ -705,10 +704,9 @@ class Teleop {
 
   talos::Node& node_;
   talos::DriverStation ds_;
+  // A talos::OperatorArming by index: the lanes are opened by index too.
+  std::size_t arming_;
   std::vector<detail::SubsystemState> subsystems_;
-  bool armed_{false};
-  ModeGeneration armed_generation_;
-  std::optional<talos::Time> last_evaluation_;
 };
 
 }  // namespace talos::teleop

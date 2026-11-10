@@ -60,11 +60,13 @@ the Driver Station or the binding's joystick disconnects. Re-enabling cannot
 resume an earlier latch. Only enabled teleop with a connected joystick can
 publish active teleop targets; a stale Driver Station also releases them.
 
-Teleop rearms before publishing again: at start, after the Driver Station was
-stale, disabled or outside teleop, in every new Driver Station mode generation
-or gateway boot (so after a disable shorter than one period, which no
-evaluation sampled), after a bound joystick reconnects, and after the node's
-own evaluations stall for at least `command_timeout_us`. While
+Teleop rearms before publishing again, through one `talos::OperatorArming`
+for all its lanes ([Architecture: Targets](../../ARCHITECTURE.md#targets)):
+at start, after the Driver Station was stale (sampled or not), disabled or
+outside teleop, in every new Driver Station mode generation or gateway boot
+(so after a disable shorter than one period, which no evaluation sampled),
+after a bound joystick reconnects, and after the node's own evaluations stall
+for at least `command_timeout_us`. While
 rearming it publishes no active target until every connected bound input is
 neutral (axes inside their deadband, buttons and POVs released) for one
 evaluation. A bound POV must centre even if held in a different direction than

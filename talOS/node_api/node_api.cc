@@ -828,11 +828,13 @@ const char* talos_target_source_name(TalosNode* node, int64_t target,
 
 int64_t talos_target_lane_open(TalosNode* node, const char* subsystem,
                                const char* source, uint32_t message_bytes,
-                               uint32_t alignment, const TalosSchema* schema) {
+                               uint32_t alignment, const TalosSchema* schema,
+                               int64_t arming) {
   return Guard<int64_t>(-1, [&] {
     return static_cast<int64_t>(TargetAccess::open_lane(
         AsNode(node), NonNull(subsystem, "subsystem"),
-        NonNull(source, "source"), message_bytes, alignment, Schema(schema)));
+        NonNull(source, "source"), message_bytes, alignment, Schema(schema),
+        arming < 0 ? std::nullopt : std::optional{Index(arming)}));
   });
 }
 
@@ -848,6 +850,35 @@ int32_t talos_target_lane_send(TalosNode* node, int64_t lane,
 int32_t talos_target_lane_release(TalosNode* node, int64_t lane) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     return TargetAccess::lane_release(AsNode(node), Index(lane)) ? 1 : 0;
+  });
+}
+
+int64_t talos_operator_arming_open(TalosNode* node) {
+  return Guard<int64_t>(-1, [&] {
+    return static_cast<int64_t>(TargetAccess::open_arming(AsNode(node)));
+  });
+}
+
+int32_t talos_operator_arming_evaluate(TalosNode* node, int64_t arming,
+                                       int32_t neutral) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    return TargetAccess::arming_evaluate(AsNode(node), Index(arming),
+                                         neutral != 0)
+               ? 1
+               : 0;
+  });
+}
+
+int32_t talos_operator_arming_armed(TalosNode* node, int64_t arming) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    return TargetAccess::arming_armed(AsNode(node), Index(arming)) ? 1 : 0;
+  });
+}
+
+int32_t talos_operator_arming_disarm(TalosNode* node, int64_t arming) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    TargetAccess::arming_disarm(AsNode(node), Index(arming));
+    return TALOS_OK;
   });
 }
 

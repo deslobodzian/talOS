@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 25u
+#define TALOS_NODE_ABI_VERSION 26u
 
 enum {
   TALOS_OK = 0,
@@ -315,7 +315,7 @@ int32_t talos_driver_station(TalosNode* node, TalosCallback on_packet,
 // Fills `out` from the node's DriverStation, taken by talos_driver_station.
 int32_t talos_driver_station_read(TalosNode* node, TalosDriverStation* out);
 
-// --- target lanes (talos::Target, talos::TargetLane) ----------------------
+// --- target lanes (talos::Target, talos::TargetLane, OperatorArming) ------
 
 // Opens this node's Target for a message of `message_bytes` aligned to
 // `alignment` (the struct's minimum alignment, a power of two <= 8) and of
@@ -333,15 +333,29 @@ int32_t talos_target_get(TalosNode* node, int64_t target, void* out,
 const char* talos_target_source_name(TalosNode* node, int64_t target,
                                      int32_t source_index);
 // Opens the lane /<subsystem>/target/<source>. Call while the factory runs.
+// `arming`: an index from talos_operator_arming_open on this node, whose
+// lane sends go out as releases while it is not armed; negative for none.
 int64_t talos_target_lane_open(TalosNode* node, const char* subsystem,
                                const char* source, uint32_t message_bytes,
-                               uint32_t alignment, const TalosSchema* schema);
+                               uint32_t alignment, const TalosSchema* schema,
+                               int64_t arming);
 // TargetLane::send (active = 1, stamped with this node's Driver Station mode
 // generation) and release (active = 0). Return 1 sent, 0 dropped by the
-// transport, TALOS_ERR.
+// transport (or, for send, held to a release by the lane's arming),
+// TALOS_ERR.
 int32_t talos_target_lane_send(TalosNode* node, int64_t lane,
                                const void* message, uint32_t size);
 int32_t talos_target_lane_release(TalosNode* node, int64_t lane);
+// talos::OperatorArming: opens one (call while the factory runs) and returns
+// its index. evaluate returns 1 when the producer may publish active targets
+// on this reading of its inputs (`neutral` nonzero: every input at rest), 0
+// otherwise; armed returns 1 or 0 without evaluating. All return TALOS_ERR on
+// error.
+int64_t talos_operator_arming_open(TalosNode* node);
+int32_t talos_operator_arming_evaluate(TalosNode* node, int64_t arming,
+                                       int32_t neutral);
+int32_t talos_operator_arming_armed(TalosNode* node, int64_t arming);
+int32_t talos_operator_arming_disarm(TalosNode* node, int64_t arming);
 
 // --- test harness (libtalos_node_testing.so only) ------------------------
 

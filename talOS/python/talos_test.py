@@ -553,6 +553,25 @@ class Driver:
             self.lane.release()
 
 
+class Operator:
+    """Sends the lift's teleop lane whenever joystick 0's button 1 is held,
+    ignoring evaluate(): its OperatorArming alone holds the lane released."""
+
+    def __init__(self, node):
+        self.ds = talos.DriverStation(node)
+        self.arming = talos.OperatorArming(node)
+        self.lane = talos.TargetLane(node, Goal, "lift", "teleop",
+                                     arming=self.arming)
+
+    def update(self):
+        held = self.ds.joystick(0).button(1)
+        self.arming.evaluate(neutral=not held)
+        if held:
+            self.lane.send(height_rot=0.5, enabled=True, tick_count=7)
+        else:
+            self.lane.release()
+
+
 class TargetTest(unittest.TestCase):
     """Target/TargetLane through Python; selection is target_test.cc's."""
 
@@ -620,6 +639,34 @@ class TargetTest(unittest.TestCase):
         sim.step(0.02)
         self.assertIsNone(sim.latest_target(Goal, "lift", "teleop"))
         self.assertIsNone(lift.seen)
+
+    def test_operator_arming_holds_a_button_held_through_re_enable(self):
+        """The arming is the C++ one (target_test.cc covers every break);
+        this is the binding, on the case it exists for."""
+        sim = Sim.from_toml(ROBOT_TOML)
+        sim.add(Operator, "planner")
+        lift = sim.add(Aimer, "lift")
+        hw = SimHardware(sim)
+        hw.enable()
+
+        def driver_station(held, enabled=True):
+            hw.set_driver_station(
+                enabled=enabled, teleop=True,
+                joysticks=[Stick(buttons=(1,) if held else ())])
+            sim.step(0.04)
+
+        driver_station(held=True)  # held from startup: never armed
+        self.assertIsNone(lift.seen)
+        driver_station(held=False)
+        driver_station(held=True)
+        self.assertEqual(lift.seen.height_rot, 0.5)
+        driver_station(held=True, enabled=False)
+        driver_station(held=True)  # re-enabled with the button still held
+        self.assertIsNone(sim.latest_target(Goal, "lift", "teleop"))
+        self.assertIsNone(lift.seen)
+        driver_station(held=False)
+        driver_station(held=True)
+        self.assertEqual(lift.seen.height_rot, 0.5)
 
 
 class StateMachineTest(unittest.TestCase):

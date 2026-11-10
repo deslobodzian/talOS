@@ -21,7 +21,7 @@ producer/consumer, rate, dynamic payload, and shared-memory slot size.
 
 ```
 robot code        2026-robot/main_processor/*, examples/*
-talOS/devices     Motor, CANcoder, Gyro, DigitalInput, ..., robot_enabled, Target, TargetLane, testing::SimHardware
+talOS/devices     Motor, CANcoder, Gyro, DigitalInput, ..., robot_enabled, Target, TargetLane, OperatorArming, testing::SimHardware
 talOS/node        Node, Subscription, Publisher, StateMachine, TALOS_NODE, testing::Sim
 talOS/python      the same API in Python, ctypes over talOS/node_api (libtalos_node.so)
 talOS/events      event loop, dispatch log, replay
@@ -170,11 +170,22 @@ lane only when its stamp is nonzero and equals the generation the consumer
 last drained. Receipt time cannot do this: a target queued before a mode
 change and the packet that changes the mode can be drained together, at one
 instant. A Driver Station link that drops and returns in the same mode keeps
-its generation. Driver and declarative teleop producers nevertheless require
-one neutral-input evaluation before publishing active targets in each new
-generation or gateway boot (so after a disable, however brief, even one they
-never sampled), after DS recovery, startup, or an evaluation gap reaching
-`command_timeout_us`.
+its generation.
+
+The generation does not stop a producer from turning a joystick held through
+a disable into a new target of the next generation. A producer of operator
+input therefore opens its lanes with a `talos::OperatorArming` (`target.h`;
+`talos.OperatorArming` in Python), as `driver` and the declarative `teleop`
+do, and evaluates it on every reading of its inputs. An evaluation that
+finds every input neutral, while the Driver Station shows a mode, arms it;
+until then the lane's `send()` goes out as a release. It disarms at startup;
+when the Driver Station shows no mode, a new generation or a new gateway
+boot (so after a disable, however brief, even one no evaluation sampled);
+when the link recovers from a stale spell (sampled or not); when the
+producer's evaluations stop for `command_timeout_us`; and on `disarm()`. A
+`TargetLane` without an `OperatorArming` is never held: the graph lint cannot tell operator input
+from an autonomous producer, so using `OperatorArming` is the producer's
+job.
 
 Messages reach a node when its loop drains its topics. Every node drains right
 before each of its own timers (`update()`, `every()`), so a timer sees what was
@@ -292,7 +303,7 @@ manifest fails the build with the regenerate command.
 | a mechanism in its own repository | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py --standalone DIR` writes a Bzlmod repo (overriding `@talos` with this checkout); the robot adds `bazel_dep` + `local_path_override`, a subsystem file naming `@<name>//:node`, and its `[[subsystems]]` entry |
 | a camera | its calibrated `configuration/subsystems/<camera>.toml`, a name in `vision/BUILD`'s `CAMERAS`, a `[[subsystems]]` entry and regenerated manifest; list it in the pose estimator's `cameras` |
 | a message or topic | the owning package's `.fbs` and `BUILD` declaration via `talos_messages(topics = ...)`, which generates `topics.h` |
-| a producer of an existing target | a `talos::TargetLane` on `/<sub>/target/<source>`, and `<source>` in that subsystem's policy (`[robot.targets]` or its `[targets]`); the launcher refuses a lane no mode lists |
+| a producer of an existing target | a `talos::TargetLane` on `/<sub>/target/<source>` (opened with a `talos::OperatorArming` when it maps operator input), and `<source>` in that subsystem's policy (`[robot.targets]` or its `[targets]`); the launcher refuses a lane no mode lists |
 | a device type | `talOS/hardware` (config + wire), `talOS/devices`, `talOS/python/talos/devices.py`, and the RoboRIO program |
 | a node-API feature | `talOS/node`, mirrored in `talOS/node_api` and `talOS/python/talos` |
 | a robot | a sibling of `2026-robot/` |

@@ -810,6 +810,112 @@ TEST(TargetLane, RejectsASourceThatIsNotATopicSegment) {
   EXPECT_THROW(sim.add<BadLane>("producer"), std::invalid_argument);
 }
 
+// An operator producer that sends whenever joystick 0's button 1 is held and
+// ignores what evaluate() says: its arming alone holds the lane released.
+// Its 20 ms period samples the Driver Station less often than the 5 ms
+// packets arrive.
+struct Operator {
+  explicit Operator(Node& node)
+      : ds{node}, arming{node}, lane{node, "lift", "teleop", arming} {}
+  void update() {
+    if (!ds.connected()) saw_stale = true;
+    const bool held = ds.joystick(0).button(1);
+    if (!paused) arming.evaluate(/*neutral=*/!held);
+    if (held) {
+      lane.send(Goal{0.5});
+    } else {
+      lane.release();
+    }
+  }
+  DriverStation ds;
+  OperatorArming arming;
+  TargetLane<Goal> lane;
+  bool paused = false;
+  bool saw_stale = false;
+};
+
+// A button held through any break in what the operator saw must be released
+// once, in the new view, before the lane drives again.
+TEST(OperatorArming, HeldInputWaitsForNeutralAfterEveryBreak) {
+  enum class Break { kDisable, kReboot, kEvaluationGap, kUnsampledRecovery };
+  for (const Break disturbance :
+       {Break::kDisable, Break::kReboot, Break::kEvaluationGap,
+        Break::kUnsampledRecovery}) {
+    SCOPED_TRACE(static_cast<int>(disturbance));
+    auto sim = Sim::FromToml(std::string{kRobotToml} +
+                             "[subsystems.operator]\nperiod_us = 20000\n");
+    auto& op = sim.add<Operator>("operator");
+    auto& lift = sim.add<Consumer<Goal>>("lift");
+    SimHardware hw{sim};
+    hw.enable();
+    const auto packet = [](std::uint32_t flags, bool held) {
+      auto data = DsPacket(flags);
+      data.joysticks[0].connected = true;
+      data.joysticks[0].button_count = 1;
+      data.joysticks[0].buttons = held ? 1u : 0u;
+      return data;
+    };
+    const auto active = [&] {
+      const auto envelope = LatestTarget<Goal>(sim, "lift", "teleop");
+      return envelope.has_value() && envelope->active != 0;
+    };
+
+    // Held from startup: never armed.
+    hw.set_driver_station(packet(kTeleop, true));
+    sim.step(60ms);
+    EXPECT_FALSE(active());
+    EXPECT_EQ(lift.seen, std::nullopt);
+    hw.set_driver_station(packet(kTeleop, false));
+    sim.step(40ms);
+    hw.set_driver_station(packet(kTeleop, true));
+    sim.step(40ms);
+    ASSERT_TRUE(active());
+    ASSERT_NE(lift.seen, std::nullopt);
+
+    switch (disturbance) {
+      case Break::kDisable:
+        hw.set_driver_station(packet(0, true));
+        sim.step(40ms);
+        hw.set_driver_station(packet(kTeleop, true));
+        break;
+      case Break::kReboot:
+        hw.reboot();
+        break;
+      case Break::kEvaluationGap:  // the Driver Station stays fresh
+        op.paused = true;
+        sim.step(120ms);
+        op.paused = false;
+        break;
+      case Break::kUnsampledRecovery: {
+        // Silent just past command_timeout_us, stale only between two of
+        // the operator's 20 ms evaluations (the last packet near 150 ms and
+        // the next near 255 ms, evaluations at 240 and 260 ms): the same
+        // generation and boot come back.
+        const std::uint64_t generation = DriverStationGeneration(sim);
+        sim.step(10ms);
+        op.saw_stale = false;
+        hw.stop_driver_station();
+        sim.step(102ms);
+        hw.set_driver_station(packet(kTeleop, true));
+        sim.step(20ms);
+        ASSERT_FALSE(op.saw_stale);
+        ASSERT_EQ(DriverStationGeneration(sim), generation);
+        break;
+      }
+    }
+    sim.step(60ms);
+    EXPECT_FALSE(active());
+    EXPECT_EQ(lift.seen, std::nullopt);
+
+    hw.set_driver_station(packet(kTeleop, false));
+    sim.step(40ms);
+    hw.set_driver_station(packet(kTeleop, true));
+    sim.step(40ms);
+    EXPECT_TRUE(active());
+    EXPECT_NE(lift.seen, std::nullopt);
+  }
+}
+
 TEST(TargetEnvelope, IsTheHeaderThenTheMessage) {
   EXPECT_EQ(detail::TargetEnvelopeBytes(24, 8), 40u);
   EXPECT_EQ(detail::TargetEnvelopeBytes(4, 4), 20u);
