@@ -297,9 +297,9 @@ struct EgressBudget {
   // Refills at `rate` B/s up to the burst; true when `bytes` fit now.
   bool available(std::size_t bytes, double rate, std::int64_t now_ns) {
     if (started && now_ns > updated_ns) {
-      tokens = std::min(kBurstBytes,
-                        tokens + static_cast<double>(now_ns - updated_ns) *
-                                     1e-9 * rate);
+      tokens = std::min(
+          kBurstBytes,
+          tokens + static_cast<double>(now_ns - updated_ns) * 1e-9 * rate);
     }
     if (!started || now_ns > updated_ns) updated_ns = now_ns;
     started = true;
@@ -318,12 +318,12 @@ class ClientFeed {
   static constexpr std::int64_t kHeartbeatNs = 100'000'000;
 
   // `afford(framed_bytes)` says whether a batch of that many framed bytes may
-  // be sent now; `send(page)` sends one page and returns false if it was not
-  // sent. A whole update is sent only when the budget affords all of it, so
-  // the client applies it as one tick. The dictionary is within
-  // telemetry_wire::kMaxChannels (IngestTelemetry), so the largest update, a
-  // keyframe of every channel, fits the burst and is affordable once the
-  // budget refills.
+  // be sent now, and spends nothing; `send(page)` sends one page, is charged
+  // for it, and returns false if it was not sent. A whole update is sent only
+  // when the budget affords all of it, so the client applies it as one tick.
+  // The dictionary is within telemetry_wire::kMaxChannels (IngestTelemetry), so
+  // the largest update, a keyframe of every channel, fits the burst and is
+  // affordable once the budget refills.
   template <class Afford, class Send>
   void Pump(const TelemetryState& state, std::int64_t now_ns, Afford&& afford,
             Send&& send) {
@@ -343,9 +343,8 @@ class ClientFeed {
       ++dictionary_pages_sent_;
     }
     // The client holds this tick: nothing to send until the heartbeat is due.
-    if (!state.has_frame ||
-        (has_values_ && sequence_id_ == state.sequence_id &&
-         now_ns - last_send_ns_ < kHeartbeatNs)) {
+    if (!state.has_frame || (has_values_ && sequence_id_ == state.sequence_id &&
+                             now_ns - last_send_ns_ < kHeartbeatNs)) {
       return;
     }
 
@@ -470,23 +469,30 @@ class ClientFeed {
 };
 
 // One WebSocket client's two feeds under one budget. The system graph goes
-// first: while a graph message waits for budget the client's telemetry is
-// thinned to one update per kHoldNs, so the budget refills for the graph
-// instead of telemetry, whose demand can exceed a client's share, taking
-// every byte as it arrives, while no reading waits long enough for Studio to
-// mark it stale (STALE_AFTER_NS, one second). Telemetry is change-only and
-// coalesces, so the pause costs it skipped samples, not values.
-// `afford(framed_bytes)` and the senders are as in ClientFeed.
+// first: from the moment a graph message waits for budget it reserves
+// kGraphShare of the client's refill, and the client's telemetry may spend
+// only what the budget affords beyond that reserve, at most one update per
+// kHoldNs. Telemetry, whose demand can exceed a client's share, can then
+// neither take every byte as it arrives nor drain each window's refill (an
+// update larger than a window's refill would otherwise do that forever), so
+// a waiting message of G framed bytes goes within
+//   (G + n) / (kGraphShare * rate - n / GraphFeed::kNoticeNs)
+// of the client's own share, n being one framed deferral notice
+// (docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary). Telemetry is
+// change-only and coalesces, so the thinning costs it skipped samples, never
+// values. `rate` is the client's share in B/s; `afford(framed_bytes)` and the
+// senders are as in ClientFeed.
 struct ClientFeeds {
   static constexpr std::int64_t kHoldNs = 250'000'000;
+  static constexpr double kGraphShare = 0.5;
 
   GraphFeed graph;
   ClientFeed telemetry;
 
   template <class Afford, class SendText, class SendBinary>
   void Pump(const SystemGraphDocument& document, const TelemetryState& state,
-            std::int64_t now_ns, Afford&& afford, SendText&& send_text,
-            SendBinary&& send_binary) {
+            std::int64_t now_ns, double rate, Afford&& afford,
+            SendText&& send_text, SendBinary&& send_binary) {
     const auto afford_text = [&afford](std::size_t bytes) {
       return afford(EgressBudget::framed(bytes));
     };
@@ -496,19 +502,33 @@ struct ClientFeeds {
       telemetry.Pump(state, now_ns, afford, send_binary);
       return;
     }
-    if (held_since_ns_ < 0) held_since_ns_ = now_ns;
-    if (now_ns - held_since_ns_ < kHoldNs) return;
+    if (held_since_ns_ < 0) held_since_ns_ = held_sent_ns_ = now_ns;
+    if (now_ns - held_sent_ns_ < kHoldNs) return;
+    // Every byte telemetry spends leaves at least the reserve in the bucket,
+    // which grows faster than the reserve, so the bucket never falls below
+    // the reserve less the notices sent since: once that reaches G the
+    // message is affordable.
+    const auto reserve = static_cast<std::size_t>(
+        std::min(EgressBudget::kBurstBytes,
+                 kGraphShare * rate * 1e-9 *
+                     static_cast<double>(now_ns - held_since_ns_)));
     bool sent = false;
-    telemetry.Pump(state, now_ns, afford, [&](std::string_view page) {
-      const bool ok = send_binary(page);
-      sent = sent || ok;
-      return ok;
-    });
-    if (sent) held_since_ns_ = now_ns;
+    telemetry.Pump(
+        state, now_ns,
+        [&afford, reserve](std::size_t bytes) {
+          return afford(bytes + reserve);
+        },
+        [&](std::string_view page) {
+          const bool ok = send_binary(page);
+          sent = sent || ok;
+          return ok;
+        });
+    if (sent) held_sent_ns_ = now_ns;
   }
 
  private:
-  std::int64_t held_since_ns_{-1};
+  std::int64_t held_since_ns_{-1};  // when the waiting graph message began
+  std::int64_t held_sent_ns_{0};    // telemetry's last send while it waits
 };
 
 static_assert(EgressBudget::framed(EgressBudget::kMaxPayloadBytes) <=

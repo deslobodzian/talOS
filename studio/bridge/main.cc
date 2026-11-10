@@ -163,16 +163,18 @@ struct Bridge {
     check_segment();
   }
 
+  // Each client's own refill rate, B/s.
+  double client_rate() const {
+    return EgressBudget::kBytesPerSecond / static_cast<double>(max_clients);
+  }
+
   // Whether `framed_bytes` fit the client's and the shared bucket now, and
   // the client has nothing buffered. Spends nothing.
   bool affordable(Socket* client, std::size_t framed_bytes) {
     const std::int64_t now = talos::introspect::monotonic_now_ns();
     auto& local = client->getUserData()->budget;
     if (client->getBufferedAmount() != 0 ||
-        !local.available(framed_bytes,
-                         EgressBudget::kBytesPerSecond /
-                             static_cast<double>(max_clients),
-                         now) ||
+        !local.available(framed_bytes, client_rate(), now) ||
         !budget.available(framed_bytes, EgressBudget::kBytesPerSecond, now)) {
       return false;
     }
@@ -197,6 +199,7 @@ struct Bridge {
   void pump(Socket* client) {
     client->getUserData()->feeds.Pump(
         system_graph, telemetry_state, talos::introspect::monotonic_now_ns(),
+        client_rate(),
         [this, client](std::size_t framed_bytes) {
           return affordable(client, framed_bytes);
         },
@@ -269,8 +272,7 @@ struct Bridge {
         EgressBudget::kBurstBytes;
     if (oversized && !system_json_oversized) {
       std::cerr << "system graph is " << system_graph.json.size()
-                << " B, over the "
-                << EgressBudget::kBurstBytes
+                << " B, over the " << EgressBudget::kBurstBytes
                 << " B WebSocket egress burst; clients will not receive it "
                    "(/system.json still serves it)\n";
     }

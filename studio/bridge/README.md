@@ -86,9 +86,13 @@ restarts), and otherwise `{"kind":"talos.system_graph.update","structure":...,
 client's document, at most every 500 ms and only when they changed. A whole
 document goes at most every 2 s (`GraphFeed::kResendNs`); structure changes
 in between, as in a crash loop, coalesce into the next. Graph messages go
-before telemetry: while one waits for budget, that client's telemetry is
-thinned to one update per 250 ms (`ClientFeeds::kHoldNs`), so the budget
-refills for the graph and no reading waits long enough to go stale. A deferred message
+before telemetry (`ClientFeeds` in [`telemetry.h`](telemetry.h)): while one
+waits for budget it reserves half of the client's refill
+(`ClientFeeds::kGraphShare`), and that client's telemetry may spend only what
+lies beyond the reserve, at most one update per 250 ms
+(`ClientFeeds::kHoldNs`), so however large a telemetry update the message goes
+within a bound ([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary):
+2.0 s for a 40 KB whole graph at the default share). A deferred message
 coalesces into the next; while the client has heard nothing for 750 ms it is
 sent
 `{"kind":"talos.system_graph.deferred","structure":...}`, so Studio, which

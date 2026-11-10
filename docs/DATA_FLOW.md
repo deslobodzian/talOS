@@ -384,18 +384,36 @@ only on connect and when its structure changes; otherwise its fast values
 (about 5.5 KB) go at most every 500 ms when they changed
 (`GraphFeed` in [`studio/bridge/system.h`](../studio/bridge/system.h);
 protocol in the [bridge README](../studio/bridge/README.md)). A client's graph
-messages go before its telemetry: while one waits for budget, telemetry is
-thinned to one update per 250 ms, so the graph is never starved and no
-reading goes stale; at the default share updates arrived every 500–720 ms
-and no deferral notice was needed. Both rows stay within their budget over
-the run; a single second can exceed the rate by up to the 64,000 B burst.
+messages go before its telemetry (`ClientFeeds` in
+[`studio/bridge/telemetry.h`](../studio/bridge/telemetry.h)): from the moment
+one waits for budget it reserves half of the client's refill, and telemetry
+may spend only what the budget holds beyond that reserve, at most one update
+per 250 ms. However large a telemetry update, a waiting graph message of G
+framed bytes therefore goes within
+
+(G + n) / (ρ / 2 − n / 0.75 s)
+
+on a client share of ρ B/s, where n is one framed deferral notice (71 B, sent
+at most every 750 ms while it waits): **2.0 s** for the 40 KB whole graph at
+the default 40,000 B/s share, and **55.5 s** for a graph at the 64,000 B burst
+at the 2,500 B/s share of `max_clients = 64`. The bound is on the client's own
+bucket: the shared bucket refills at the sum of every share, so it adds delay
+only while other clients spend bursts they saved, and a client whose socket
+still has output buffered is sent nothing until it drains. Telemetry keeps
+flowing beside the waiting graph, change-only, so the thinning skips samples,
+never values; while a graph waits, a reading goes stale only when one update costs more than
+about half of what the share refills in a second. At the default share updates
+arrived every 500–720 ms and no deferral notice was needed. Both rows stay
+within their budget over the run; a single second can exceed the rate by up to
+the 64,000 B burst.
 
 The cost falls on structure changes. A whole graph is about a second of the
 default share, so after a node starts, stops or restarts, that client's
-telemetry runs at four updates a second for about a second while the graph
-goes. A whole graph goes at most every 2 s: in a crash loop, a client's
-graph shows restarts up to 2 s late (marked deferred, not stale), and its
-telemetry is thinned for about a second of every two.
+telemetry runs at four updates a second for about a second (at most the
+2.0 s bound) while the graph goes. A whole graph goes at most every 2 s: in
+a crash loop, a client's graph shows restarts up to 2 s late (marked
+deferred, not stale), and its telemetry is thinned for about a second of
+every two.
 
 The value-page cap leaves room under a normal MTU, but TCP is a byte stream:
 segmentation and coalescing are not a guaranteed

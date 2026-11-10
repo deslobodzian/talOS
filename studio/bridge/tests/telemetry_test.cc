@@ -209,7 +209,8 @@ TEST(TelemetryJson, ValuePagesWithoutTheirDictionaryAreNotUsable) {
   // one; a repeat of the same dictionary does not.
   ASSERT_TRUE(IngestAll(state, DictionaryPages(SmallDictionary())));
   EXPECT_TRUE(state.has_frame);
-  ASSERT_TRUE(IngestAll(state, DictionaryPages(SmallDictionary(), kStream, 99)));
+  ASSERT_TRUE(
+      IngestAll(state, DictionaryPages(SmallDictionary(), kStream, 99)));
   EXPECT_FALSE(state.has_frame);
 }
 
@@ -218,8 +219,7 @@ TEST(TelemetryJson, RejectsInvalidPagesWithoutChangingCachedState) {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   const std::vector<std::vector<std::string>> invalid{
       // The chassis is a pose the field view draws, never a reading.
-      SmallTick(1.0, 0, nan),
-      SmallTick(1.0, 0, infinity),
+      SmallTick(1.0, 0, nan), SmallTick(1.0, 0, infinity),
       // A bool carries 0 or 1.
       TickPages(4, 8, {2}, {2}),
       // A channel index past the dictionary.
@@ -320,7 +320,8 @@ TEST(ClientFeed, ChannelThatLosesItsSampleIsSentAsAbsent) {
         });
   };
   pump(0);
-  ASSERT_TRUE(IngestAll(state, TickPages(4, 8, {1, 2, 3}, {1, 1, kBeyondDouble})));
+  ASSERT_TRUE(
+      IngestAll(state, TickPages(4, 8, {1, 2, 3}, {1, 1, kBeyondDouble})));
   sent.clear();
   pump(1);
   const auto pages = ValuePagesOf(sent);
@@ -350,8 +351,8 @@ TEST(ClientFeed, RefusedPageBringsAKeyframe) {
         });
   };
   pump(0);
-  ASSERT_TRUE(IngestAll(state, TickPages(4, 8, {0, 1, 2, 3},
-                                         {RawFromDouble(2.0), 0, 1, 1})));
+  ASSERT_TRUE(IngestAll(
+      state, TickPages(4, 8, {0, 1, 2, 3}, {RawFromDouble(2.0), 0, 1, 1})));
   refuse = true;
   pump(1);
   EXPECT_FALSE(feed.current(state));
@@ -467,8 +468,8 @@ TEST(ClientFeed, StarvedBudgetDefersChangesAndConvergesWithinBudget) {
 
   constexpr std::uint64_t kTicks = 300;  // 3 s at 100 Hz
   for (std::uint64_t tick = 1; tick <= kTicks; ++tick) {
-    ASSERT_TRUE(IngestAll(state, TickPages(kChannels, tick, channels,
-                                           tick_values(tick))));
+    ASSERT_TRUE(IngestAll(
+        state, TickPages(kChannels, tick, channels, tick_values(tick))));
     for (int ms = 0; ms < 10; ++ms, now += 1'000'000) pump();
   }
   EXPECT_LT(mirror.updates, kTicks / 4);
@@ -482,8 +483,9 @@ TEST(ClientFeed, StarvedBudgetDefersChangesAndConvergesWithinBudget) {
   EXPECT_TRUE(feed.current(state));
   EXPECT_TRUE(mirror.Equals(state));
   EXPECT_EQ(mirror.sequence_id, kTicks);
-  EXPECT_LE(static_cast<double>(sent),
-            EgressBudget::kBurstBytes + kRate * static_cast<double>(now) * 1e-9);
+  EXPECT_LE(
+      static_cast<double>(sent),
+      EgressBudget::kBurstBytes + kRate * static_cast<double>(now) * 1e-9);
 }
 
 // A registry of `nodes` nodes with eight sources each, its counters as of
@@ -509,8 +511,8 @@ SystemGraphInput Registry(int nodes, std::uint64_t refresh,
     for (std::uint16_t i = 0; i < 8; ++i) {
       node.sources.push_back(
           {.id = i,
-           .kind = i == 0 ? event::SourceKind::SENDER
-                          : event::SourceKind::WATCHER,
+           .kind =
+               i == 0 ? event::SourceKind::SENDER : event::SourceKind::WATCHER,
            .name = "/node_" + std::to_string((n + i) % nodes) + "/state",
            .message_bytes = 64,
            .alignment = 8,
@@ -580,7 +582,7 @@ TEST(ClientFeeds, StarvedClientKeepsTheGraphCurrentAndNeverStale) {
   };
   const auto pump = [&] {
     feeds.Pump(
-        document, state, now,
+        document, state, now, kRate,
         [&](std::size_t bytes) { return budget.available(bytes, kRate, now); },
         [&](std::string_view text) {
           spend(text);
@@ -594,14 +596,12 @@ TEST(ClientFeeds, StarvedClientKeepsTheGraphCurrentAndNeverStale) {
             held_values = document.values;
           } else if (text.starts_with(
                          "{\"kind\":\"talos.system_graph.update\"")) {
-            EXPECT_EQ(Between(text, "\"structure\":\"", "\""),
-                      held_structure);
+            EXPECT_EQ(Between(text, "\"structure\":\"", "\""), held_structure);
             held_values = Between(text, "\"values\":", "}");
           } else {
-            EXPECT_TRUE(text.starts_with(
-                "{\"kind\":\"talos.system_graph.deferred\""));
-            EXPECT_EQ(Between(text, "\"structure\":\"", "\""),
-                      held_structure);
+            EXPECT_TRUE(
+                text.starts_with("{\"kind\":\"talos.system_graph.deferred\""));
+            EXPECT_EQ(Between(text, "\"structure\":\"", "\""), held_structure);
             ++notices;
           }
           return true;
@@ -614,8 +614,8 @@ TEST(ClientFeeds, StarvedClientKeepsTheGraphCurrentAndNeverStale) {
   };
 
   for (std::uint64_t tick = 1; tick <= 1500; ++tick) {  // 15 s at 100 Hz
-    ASSERT_TRUE(IngestAll(state, TickPages(kChannels, tick, channels,
-                                           tick_values(tick))));
+    ASSERT_TRUE(IngestAll(
+        state, TickPages(kChannels, tick, channels, tick_values(tick))));
     if (tick % 25 == 0) {
       // A refresh every 250 ms; at 8 s every node restarts.
       restarts = tick >= 800 ? 1 : 0;
@@ -626,9 +626,9 @@ TEST(ClientFeeds, StarvedClientKeepsTheGraphCurrentAndNeverStale) {
       pump();
       if (!held_values.empty()) {
         worst_lag = std::max(
-            worst_lag, static_cast<std::int64_t>(refresh - refresh_of.at(
-                                                               held_values)) *
-                           250'000'000);
+            worst_lag,
+            static_cast<std::int64_t>(refresh - refresh_of.at(held_values)) *
+                250'000'000);
       }
     }
   }
@@ -651,8 +651,9 @@ TEST(ClientFeeds, StarvedClientKeepsTheGraphCurrentAndNeverStale) {
   EXPECT_EQ(held_structure, document.structure);
   EXPECT_EQ(held_values, document.values);
   EXPECT_TRUE(mirror.Equals(state));
-  EXPECT_LE(static_cast<double>(sent),
-            EgressBudget::kBurstBytes + kRate * static_cast<double>(now) * 1e-9);
+  EXPECT_LE(
+      static_cast<double>(sent),
+      EgressBudget::kBurstBytes + kRate * static_cast<double>(now) * 1e-9);
 }
 
 // The largest graph a client can be sent is the one whose framed size is the
@@ -672,17 +673,17 @@ TEST(ClientFeeds, GraphAtTheBurstGoesAndOneByteLargerNeverHoldsTelemetry) {
     std::int64_t last_page = 0, longest_gap = 0;
     for (std::int64_t now = 0; now <= 3'000'000'000; now += 1'000'000) {
       feeds.Pump(
-          document, state, now,
+          document, state, now, 40000,
           [&](std::size_t bytes) {
-            if (!budget.available(bytes, 40000, now)) return false;
-            budget.spend(bytes);
-            return true;
+            return budget.available(bytes, 40000, now);
           },
           [&](std::string_view text) {
+            budget.spend(EgressBudget::framed(text.size()));
             documents += text == document.json ? 1 : 0;
             return true;
           },
-          [&](std::string_view) {
+          [&](std::string_view page) {
+            budget.spend(EgressBudget::framed(page.size()));
             longest_gap = std::max(longest_gap, now - last_page);
             last_page = now;
             return true;
@@ -717,8 +718,8 @@ TEST(ClientFeeds, CrashLoopKeepsTelemetryAndGraphFresh) {
   const auto tick_values = [&](std::uint64_t tick) {
     std::vector<std::uint64_t> values;
     for (std::uint32_t i = 0; i < kChannels; ++i) {
-      values.push_back(RawFromDouble(
-          static_cast<double>(i % 3 == 0 ? tick * 1000 + i : i)));
+      values.push_back(
+          RawFromDouble(static_cast<double>(i % 3 == 0 ? tick * 1000 + i : i)));
     }
     return values;
   };
@@ -739,13 +740,10 @@ TEST(ClientFeeds, CrashLoopKeepsTelemetryAndGraphFresh) {
   std::int64_t text_gap = 0, page_gap = 0;
   const auto pump = [&] {
     feeds.Pump(
-        document, state, now,
-        [&](std::size_t bytes) {
-          if (!budget.available(bytes, kRate, now)) return false;
-          budget.spend(bytes);
-          return true;
-        },
+        document, state, now, kRate,
+        [&](std::size_t bytes) { return budget.available(bytes, kRate, now); },
         [&](std::string_view text) {
+          budget.spend(EgressBudget::framed(text.size()));
           text_gap = std::max(text_gap, now - last_text);
           last_text = now;
           if (text == document.json) {
@@ -754,13 +752,13 @@ TEST(ClientFeeds, CrashLoopKeepsTelemetryAndGraphFresh) {
             held_values = document.values;
           } else if (text.starts_with(
                          "{\"kind\":\"talos.system_graph.update\"")) {
-            EXPECT_EQ(Between(text, "\"structure\":\"", "\""),
-                      held_structure);
+            EXPECT_EQ(Between(text, "\"structure\":\"", "\""), held_structure);
             held_values = Between(text, "\"values\":", "}");
           }
           return true;
         },
         [&](std::string_view page) {
+          budget.spend(EgressBudget::framed(page.size()));
           page_gap = std::max(page_gap, now - last_page);
           last_page = now;
           mirror.Apply(page);
@@ -769,8 +767,8 @@ TEST(ClientFeeds, CrashLoopKeepsTelemetryAndGraphFresh) {
   };
 
   for (std::uint64_t tick = 1; tick <= 1200; ++tick) {  // 12 s at 100 Hz
-    ASSERT_TRUE(IngestAll(state, TickPages(kChannels, tick, channels,
-                                           tick_values(tick))));
+    ASSERT_TRUE(IngestAll(
+        state, TickPages(kChannels, tick, channels, tick_values(tick))));
     if (tick % 25 == 0) {
       // A refresh every 250 ms; from 1 s to 10 s every node restarts each
       // second.
@@ -796,6 +794,112 @@ TEST(ClientFeeds, CrashLoopKeepsTelemetryAndGraphFresh) {
   EXPECT_EQ(held_structure, document.structure);
   EXPECT_EQ(held_values, document.values);
   EXPECT_TRUE(mirror.Equals(state));
+}
+
+// One telemetry update costs more than a hold window's refill (here 850
+// changing channels, about 10.8 kB, against the 10 kB a 40 kB/s share refills
+// in ClientFeeds::kHoldNs) but less than the waiting whole graph: telemetry
+// alone could still afford one update per window and drain the bucket every
+// time, so the graph never went and the client kept the old structure
+// forever. The graph reserves its share of the refill instead, so it goes
+// within the derived bound, while telemetry keeps flowing beside it and every
+// update the client completes is still one whole producer tick.
+TEST(ClientFeeds, GraphGoesWithinItsBoundWhenAnUpdateOutcostsTheHoldWindow) {
+  constexpr std::uint32_t kChannels = 850;
+  std::vector<ChannelDef> dictionary;
+  std::vector<std::uint32_t> channels;
+  for (std::uint32_t i = 0; i < kChannels; ++i) {
+    dictionary.push_back({"test/state/channel_" + std::to_string(i),
+                          "",
+                          {},
+                          Talos::Telemetry::ChannelKind_Double});
+    channels.push_back(i);
+  }
+  const auto tick_values = [&](std::uint64_t tick) {
+    std::vector<std::uint64_t> values;
+    for (std::uint32_t i = 0; i < kChannels; ++i) {
+      values.push_back(RawFromDouble(static_cast<double>(tick * 1000 + i)));
+    }
+    return values;
+  };
+  constexpr double kRate = 40000;  // the default 4-client share
+  const talos::telemetry::PageBudget pages =
+      talos::telemetry::MeasurePages(dictionary);
+  const double update_bytes = static_cast<double>(
+      pages.value_bytes + pages.value_pages * EgressBudget::kMaxHeaderBytes);
+  constexpr std::size_t kGraphBytes = 40000;
+  ASSERT_GE(update_bytes, kRate * 1e-9 * ClientFeeds::kHoldNs);
+  ASSERT_LT(update_bytes, static_cast<double>(kGraphBytes));
+
+  // The client holds a small graph; at 3 s a node restart replaces it with a
+  // whole 40 kB one while telemetry has the bucket drained.
+  const SystemGraphDocument small{.json = std::string(1000, ' '),
+                                  .structure = "0123456789abcdef",
+                                  .values = "[]"};
+  const SystemGraphDocument large{.json = std::string(kGraphBytes, ' '),
+                                  .structure = "fedcba9876543210",
+                                  .values = "[]"};
+  // Bound: the graph reserves kGraphShare of the refill from the moment it
+  // waits, less the deferral notices it sends meanwhile.
+  const double notice_bytes = static_cast<double>(EgressBudget::framed(
+      std::string_view("{\"kind\":\"talos.system_graph.deferred\","
+                       "\"structure\":\"0123456789abcdef\"}")
+          .size()));
+  const double bound_s =
+      (static_cast<double>(EgressBudget::framed(kGraphBytes)) + notice_bytes) /
+      (ClientFeeds::kGraphShare * kRate -
+       notice_bytes / (GraphFeed::kNoticeNs * 1e-9));
+  const auto bound_ns = static_cast<std::int64_t>(bound_s * 1e9) + 1'000'000;
+  ASSERT_LT(bound_ns, 2'100'000'000);
+
+  TelemetryState state;
+  ASSERT_TRUE(IngestAll(state, DictionaryPages(dictionary)));
+  const SystemGraphDocument* document = &small;
+  ClientFeeds feeds;
+  EgressBudget budget;
+  Mirror mirror;
+  std::size_t coherent_updates = 0;
+  std::size_t updates_while_waiting = 0, updates_after = 0;
+  std::int64_t now = 0, large_sent = -1;
+  constexpr std::int64_t kChange = 3'000'000'000;
+  const auto pump = [&] {
+    feeds.Pump(
+        *document, state, now, kRate,
+        [&](std::size_t bytes) { return budget.available(bytes, kRate, now); },
+        [&](std::string_view text) {
+          budget.spend(EgressBudget::framed(text.size()));
+          if (text == large.json) large_sent = now;
+          return true;
+        },
+        [&](std::string_view page) {
+          budget.spend(EgressBudget::framed(page.size()));
+          const std::size_t updates = mirror.updates;
+          mirror.Apply(page);
+          if (mirror.updates != updates) {
+            if (mirror.values == tick_values(mirror.sequence_id)) {
+              ++coherent_updates;
+            }
+            if (large_sent >= 0) {
+              ++updates_after;
+            } else if (now >= kChange) {
+              ++updates_while_waiting;
+            }
+          }
+          return true;
+        });
+  };
+
+  for (std::uint64_t tick = 1; now < kChange + 2 * bound_ns; ++tick) {
+    if (now >= kChange) document = &large;
+    ASSERT_TRUE(IngestAll(
+        state, TickPages(kChannels, tick, channels, tick_values(tick))));
+    for (int ms = 0; ms < 10; ++ms, now += 1'000'000) pump();
+  }
+  ASSERT_GE(large_sent, kChange);
+  EXPECT_LE(large_sent - kChange, bound_ns);
+  EXPECT_GT(updates_while_waiting, 0u);  // thinned, not stopped
+  EXPECT_GT(updates_after, 0u);
+  EXPECT_EQ(coherent_updates, mirror.updates);
 }
 
 TEST(ChannelsJson, DescribesTheDictionaryOnItsOwn) {
