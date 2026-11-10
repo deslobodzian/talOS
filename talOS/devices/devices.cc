@@ -286,7 +286,9 @@ struct HardwareLink::Impl {
 
 HardwareLink::HardwareLink(Node& node) : impl_{std::make_unique<Impl>(node)} {
   Impl& impl = *impl_;
-  impl.config = config::ParseRobotConfig(node.config_path());
+  // A copy of the config the node already parsed, not a second parse: the
+  // commissioned bit below must not leak into the node's own view.
+  impl.config = detail::NodeAccess::robot_config(node);
   // The bridge treats the config as commissioned under --sim, and the
   // commissioned bit is part of the config id both ends compare.
   if (node.simulation()) impl.config.hardware.commissioned = true;
