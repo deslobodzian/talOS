@@ -168,6 +168,12 @@ It runs Gradle `--offline`, so the first run needs one online
 `./gradlew simulateNative` beforehand. CI's
 `rio-in-the-loop` job runs it on Linux with `--output-dir`, which puts each
 scenario's log directory under a directory it keeps when the run fails.
+Both modes fail a run during which the host slept (more than 50 ms of
+sleep), since a frozen host reads as a stalled robot; on macOS the harness
+holds `caffeinate -s` for the run, which also holds off a headless Mac's
+DarkWake maintenance sleep. `--wpilib` also fails when the RoboRIO loop's
+watchdog reports a stall or its timing report shows more than 250 ms between
+ticks, naming whether the tick overran or only started late.
 The standalone gateway also supports disabled operation through
 `--mode-schedule`; see [simulation](../simulation/README.md).
 

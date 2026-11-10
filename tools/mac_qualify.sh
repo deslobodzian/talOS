@@ -19,7 +19,10 @@
 # The config's nodes come from bazel-bin, so the build step must pass for the
 # later steps to mean anything. On macOS the restart-latency step asks for
 # sudo once (`sudo -v`) so it can `purge` the page cache before Python node
-# restarts; without it those spawn times are reported as warm.
+# restarts; without it those spawn times are reported as warm. On macOS the
+# whole run holds `caffeinate -s`: a headless Mac's DarkWake maintenance sleep
+# (pmset sleep above 0) freezes every process for seconds, which the timing
+# steps would report as latency.
 #
 # Portable to macOS's bash 3.2: no associative arrays, no mapfile.
 
@@ -46,6 +49,11 @@ while [ $# -gt 0 ]; do
 done
 
 exec > >(tee -a "$LOG") 2>&1
+
+if [ "$(uname -s)" = "Darwin" ]; then
+  # Ends with this script (-w); -i alone does not hold off maintenance sleep.
+  caffeinate -s -i -w $$ &
+fi
 
 CONFIGS="2026-robot/main_processor/configuration/robot.toml
 2026-robot/main_processor/configuration/robot_field.toml
