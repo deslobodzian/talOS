@@ -26,6 +26,10 @@ struct MotorState {
   enabled:bool;
   mode:ControlMode;
   source:TargetSource;
+  // TalonFX hardware limit switches (Motor::forward_limit/reverse_limit);
+  // false while the motor is disconnected or the state is stale.
+  forward_limit:bool;
+  reverse_limit:bool;
   temperature_degc:double;
   supply_current_a:double;
 }

@@ -247,7 +247,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | `/drivetrain/state`: drivetrain → estimator/driver/telemetry | 120 | 112 B DrivetrainState: padded time/flags header 16 + chassis/yaw 32 + four module positions 64 |
 | `/intake/state`: intake → telemetry | 32 | 20 B IntakeState, including FlatBuffers padding |
 | `/shooter/state`: shooter → telemetry | 40 | 32 B ShooterState, including FlatBuffers padding |
-| `/motor/state` (bench only): motor → telemetry/logs | 96 | 88 B MotorState including device temperature and supply current; pinned in bench motor node |
+| `/motor/state` (bench only): motor → telemetry/logs | 104 | 96 B MotorState including device temperature, supply current and limit switches; pinned in bench motor node |
 | `/<camera>/state`: each camera → estimator/telemetry | 72 | 64 B geometry.PoseObservation, including padding |
 | `/<camera>/status`: each camera → telemetry | 96 | 88 B vision.VisionStatus, pinned in vision.h; every field, counters included, reaches telemetry |
 | `/pose_estimator/state`: estimator → telemetry | 80 | 72 B geometry.PoseEstimate; `valid` = fresh usable odometry, `localized` = established field-frame trust; `localized` sits in existing payload padding |

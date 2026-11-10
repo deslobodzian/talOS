@@ -98,7 +98,9 @@ release all controls, and explicitly re-enable only after checking recovery.
 
 `/motor/state` exposes position, velocity, applied voltage, stator current,
 supply current (`supply_current_a`), controller temperature (`temperature_degc`),
-connected status, gateway motor fault with validity, active mode/source and
+connected status, gateway motor fault with validity, forward/reverse limit
+switches (`forward_limit`, `reverse_limit`; false while disconnected or
+stale), active mode/source and
 hardware/acquisition ages. Supply voltage is not exposed by the public Motor
 handle; capture it separately in Phoenix Tuner X. Temperature and supply current
 are observations only, not a thermal protection policy. Unknown/stale ages are

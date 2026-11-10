@@ -113,6 +113,23 @@ TEST_F(MotorTest, HealthFeedbackRemainsVisibleWithStaleTargetAndWhileDisabled) {
   EXPECT_DOUBLE_EQ(State().supply_current_a(), 3.3);
 }
 
+TEST_F(MotorTest, ReportsLimitSwitchesAndClearsThemOnStaleState) {
+  Enable();
+  hw.set_limit_switches("motor", "kraken", true, false);
+  sim.step(10ms);
+  EXPECT_TRUE(State().forward_limit());
+  EXPECT_FALSE(State().reverse_limit());
+  hw.set_limit_switches("motor", "kraken", false, true);
+  sim.step(10ms);
+  EXPECT_FALSE(State().forward_limit());
+  EXPECT_TRUE(State().reverse_limit());
+  hw.set_limit_switches("motor", "kraken", true, true);
+  hw.lose_states(1000);
+  sim.step(200ms);
+  EXPECT_FALSE(State().forward_limit());
+  EXPECT_FALSE(State().reverse_limit());
+}
+
 TEST_F(MotorTest, NonFiniteAndDisconnectedInputsNeutralize) {
   Enable();
   Send(MotorTarget{ControlMode::VOLTAGE,
