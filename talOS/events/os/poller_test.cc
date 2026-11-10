@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -172,6 +174,55 @@ TEST(PollerTest, MoveConstructionPreservesWatchedFdAndMovedFromIsSafe) {
 }
 
 #if defined(__APPLE__)
+// XNU delivers every EVFILT_TIMER through one shared thread_call worker; on a
+// loaded CI runner it stalled and every loop on the machine overslept its
+// deadline together. With the timer never armed (a delivery that never
+// comes), the kevent() timeout alone must end each wait: never before the
+// deadline, and not grossly after. Without that timeout the wait never
+// returns, so a guard wakes it and the test fails on the reason, not a hang.
+TEST(PollerTest, DeadlineHoldsWhenTimerDeliveryStalls) {
+  constexpr Duration kWait = 10 * kMillisecond;
+  constexpr std::size_t kWaits = 5;
+  Poller poller(Poller::DeadlineTimer::NOT_ARMED);
+
+  std::mutex mutex;
+  std::condition_variable finished;
+  bool done = false;
+  std::thread guard([&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (!finished.wait_for(lock, std::chrono::seconds(2),
+                           [&] { return done; })) {
+      poller.wake();
+    }
+  });
+
+  std::vector<Duration> lateness;
+  for (std::size_t i = 0; i < kWaits; ++i) {
+    const MonotonicTime deadline = Poller::now() + kWait;
+    const Poller::WakeReason reason = poller.wait_until(deadline);
+    lateness.push_back(Poller::now() - deadline);
+    if (reason != Poller::WakeReason::DEADLINE) {
+      ADD_FAILURE() << "wait " << i << " did not end at its deadline";
+      break;
+    }
+  }
+  {
+    const std::lock_guard<std::mutex> lock(mutex);
+    done = true;
+  }
+  finished.notify_one();
+  guard.join();
+
+  ASSERT_EQ(lateness.size(), kWaits);
+  for (const Duration late : lateness) EXPECT_GE(late, Duration::zero());
+  // A gross bound: the timeout's coalescing leeway is about a fifth of the
+  // wait, and a loaded runner adds scheduling delay; an unbounded wait is
+  // what this catches.
+  auto median = lateness.begin() + kWaits / 2;
+  std::nth_element(lateness.begin(), median, lateness.end());
+  EXPECT_LT(*median, 5 * kMillisecond);
+}
+
 // The time-constraint policy talos::process::ConfigureRealtime gives a control
 // node's or the bridge's loop thread on macOS (set inline: talOS/events sits
 // below talOS/process).

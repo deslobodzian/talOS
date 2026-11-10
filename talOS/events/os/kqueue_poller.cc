@@ -6,6 +6,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <ctime>
@@ -17,12 +18,17 @@ namespace talos::event {
 namespace {
 
 // The deadline is a one-shot EVFILT_TIMER armed at an absolute time, and
-// kevent() itself waits with no timeout (the same shape as the Linux
-// backend's TFD_TIMER_ABSTIME timerfd under epoll_wait(-1)). A relative
-// kevent() timeout is not used because macOS timer coalescing pads it with a
-// leeway that grows with the timeout, even on a THREAD_TIME_CONSTRAINT_POLICY
-// thread, so every timer would wake late by about a fifth of its wait.
-// NOTE_CRITICAL asks for no coalescing.
+// kevent() also waits with a relative timeout of the time left to it. The
+// timer is what wakes the loop on time: macOS timer coalescing pads a
+// relative kevent() timeout with a leeway that grows with the timeout, even
+// on a THREAD_TIME_CONSTRAINT_POLICY thread, so it wakes late by about a
+// fifth of its wait. NOTE_CRITICAL asks for no coalescing. The timeout is the
+// backstop: XNU delivers every EVFILT_TIMER through one shared "high"
+// thread_call worker (priority 93, below time-constraint threads at 97), so
+// while that worker does not run, every kqueue timer on the machine is late
+// together, without bound; the timeout expires the waiting thread's own wait
+// from the timer interrupt instead, so a stalled delivery costs at most the
+// timeout's leeway.
 //
 // NOTE_MACHTIME | NOTE_ABSOLUTE | NOTE_MACH_CONTINUOUS_TIME: `data` is an
 // absolute mach_continuous_time() value, the clock CLOCK_MONOTONIC_RAW (and
@@ -54,7 +60,9 @@ std::int64_t ToMachTicks(std::int64_t nanos) {
 
 }  // namespace
 
-KqueuePoller::KqueuePoller() : kq_fd_(::kqueue()) {
+KqueuePoller::KqueuePoller(DeadlineTimer deadline_timer)
+    : arm_deadline_timer_(deadline_timer == DeadlineTimer::ARMED),
+      kq_fd_(::kqueue()) {
   if (kq_fd_ == -1) {
     throw std::system_error(errno, std::generic_category(), "kqueue");
   }
@@ -94,13 +102,14 @@ void KqueuePoller::close_fd() noexcept {
 }
 
 KqueuePoller::KqueuePoller(KqueuePoller&& other) noexcept
-    : kq_fd_(other.kq_fd_) {
+    : arm_deadline_timer_(other.arm_deadline_timer_), kq_fd_(other.kq_fd_) {
   other.kq_fd_ = -1;
 }
 
 KqueuePoller& KqueuePoller::operator=(KqueuePoller&& other) noexcept {
   if (this != &other) {
     close_fd();
+    arm_deadline_timer_ = other.arm_deadline_timer_;
     kq_fd_ = other.kq_fd_;
     other.kq_fd_ = -1;
   }
@@ -156,16 +165,17 @@ KqueuePoller::WakeReason KqueuePoller::wait_until(MonotonicTime deadline) {
   //    READABLE or WOKEN first) is replaced by this EV_ADD, which re-arms the
   //    existing knote and discards its pending fire;
   //  - an infinite wait deletes the knote, pending fire included.
-  struct kevent timer;
+  struct kevent timer {};
   int nchanges = 0;
-  if (deadline == MonotonicTime::max()) {
+  const bool finite = deadline != MonotonicTime::max();
+  if (!finite) {
     EV_SET(&timer, kDeadlineIdent, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
     // A separate call: deleting a knote that is already gone (a delivered
     // one-shot) fails with ENOENT, which in the waiting call would come back
     // as an EV_ERROR event and end the wait at once. ENOENT is the expected
     // case and nothing else leaves a timer armed, so errors are ignored.
     ::kevent(kq_fd_, &timer, 1, nullptr, 0, nullptr);
-  } else {
+  } else if (arm_deadline_timer_) {
     // A deadline already past arms a timer that fires at once, so the wait
     // still returns promptly (after collecting any readable fd or wake).
     EV_SET(&timer, kDeadlineIdent, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
@@ -175,16 +185,29 @@ KqueuePoller::WakeReason KqueuePoller::wait_until(MonotonicTime deadline) {
 
   int n;
   for (;;) {
-    n = ::kevent(kq_fd_, &timer, nchanges, events, kMaxEvents, nullptr);
-    if (n != -1 || errno != EINTR) break;
-    // EINTR is retried, not surfaced: wait_until()'s contract is to return
-    // only for one of the three documented reasons, and a signal landing
-    // mid-wait is not one of them. Re-applying the same absolute EV_ADD on
-    // the retry is harmless: the deadline does not move.
-  }
-
-  if (n == -1) {
-    throw std::system_error(errno, std::generic_category(), "kevent");
+    // The backstop timeout, recomputed on every pass so a retry waits only
+    // for what is left. A deadline already past polls (a zero timeout).
+    struct timespec timeout {};
+    if (finite) {
+      const std::int64_t left =
+          std::max<std::int64_t>(0, (deadline - now()).count());
+      timeout.tv_sec = static_cast<time_t>(left / 1'000'000'000);
+      timeout.tv_nsec = static_cast<long>(left % 1'000'000'000);
+    }
+    n = ::kevent(kq_fd_, &timer, nchanges, events, kMaxEvents,
+                 finite ? &timeout : nullptr);
+    if (n == -1) {
+      // EINTR is retried, not surfaced: wait_until()'s contract is to return
+      // only for one of the three documented reasons, and a signal landing
+      // mid-wait is not one of them. Re-applying the same absolute EV_ADD on
+      // the retry is harmless: the deadline does not move.
+      if (errno == EINTR) continue;
+      throw std::system_error(errno, std::generic_category(), "kevent");
+    }
+    // The timeout runs on mach_absolute_time() and is converted to it by
+    // truncation, so it can expire a fraction of a tick before now() reaches
+    // the deadline; wait out the rest rather than report DEADLINE early.
+    if (n > 0 || !finite || now() >= deadline) break;
   }
 
   // A single kevent() call can report both a readable fd and the wake event
@@ -193,7 +216,8 @@ KqueuePoller::WakeReason KqueuePoller::wait_until(MonotonicTime deadline) {
   // observe, whereas a deferred WOKEN or DEADLINE simply surfaces on the
   // next call with no information lost (EV_CLEAR already reset the wake
   // event's state regardless of whether we act on it now). Otherwise the
-  // event is the EVFILT_TIMER: DEADLINE.
+  // event is the EVFILT_TIMER, or there is none because the timeout expired:
+  // DEADLINE.
   bool woken = false;
   for (int i = 0; i < n; ++i) {
     if ((events[i].flags & EV_ERROR) != 0) {

@@ -15,9 +15,15 @@ class KqueuePoller {
  public:
   enum class WakeReason { DEADLINE, READABLE, WOKEN };
 
+  // Whether wait_until() arms its deadline EVFILT_TIMER. NOT_ARMED leaves
+  // only the kevent() timeout backstop; tests use it to stand in for a kernel
+  // whose timer delivery has stalled (see kqueue_poller.cc).
+  enum class DeadlineTimer { ARMED, NOT_ARMED };
+
   // Throws std::system_error if the kqueue fd cannot be created or the
   // internal wake event cannot be registered.
-  KqueuePoller();
+  KqueuePoller() : KqueuePoller(DeadlineTimer::ARMED) {}
+  explicit KqueuePoller(DeadlineTimer deadline_timer);
   ~KqueuePoller();
 
   KqueuePoller(const KqueuePoller&) = delete;
@@ -31,7 +37,8 @@ class KqueuePoller {
   // Blocks until `deadline` (on the timeline returned by now()), until a
   // watched fd becomes readable, or until wake() is called. A deadline of
   // MonotonicTime::max() blocks indefinitely; a deadline already in the past
-  // returns DEADLINE immediately without blocking.
+  // returns DEADLINE immediately without blocking. Never returns DEADLINE
+  // before `deadline`.
   WakeReason wait_until(MonotonicTime deadline);
 
   // Thread-safe. May be called from any thread to break a concurrent or
@@ -68,6 +75,7 @@ class KqueuePoller {
 
   void close_fd() noexcept;
 
+  bool arm_deadline_timer_{true};
   int kq_fd_{-1};
 };
 

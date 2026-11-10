@@ -72,6 +72,13 @@ drains between timers:
   100 Hz that is about 20 of each over 200 ms against about 200 wakeups and
   220 drains under `POLL` (`RealtimeEventLoop.BeforeTimersWakesOnlyForTimers`).
 
+The macOS wait also passes `kevent()` that coalesced relative timeout, as a
+backstop: XNU delivers every `EVFILT_TIMER` through one shared kernel worker
+thread (priority 93, below time-constraint threads), and while it does not
+run every kqueue timer on the machine is late together, without bound. The
+timeout expires the waiting thread's own wait instead, so such a stall costs
+a wait at most the timeout's leeway, about a fifth of the wait.
+
 Each dispatch samples its own `now`, frozen for that callback; a slow timer
 callback cannot hide elapsed time from the next due timer. Messages retain the
 writer's publication time separately from their drain/dispatch time. Message
