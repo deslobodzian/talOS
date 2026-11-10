@@ -1234,15 +1234,16 @@ inline pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
       if (reader != nullptr) *reader = child_output[0];
       return pid;
     }
+    const ChildReport failure = *report;
     if (child_output[0] >= 0) ::close(child_output[0]);
     while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
     }
     FinishProcessGroup(pid);
     const pid_t failed =
-        fail(ChildStepName(report->step, args.front()), report->code);
-    if (report->step == ChildStep::kProcessGroup)
+        fail(ChildStepName(failure.step, args.front()), failure.code);
+    if (failure.step == ChildStep::kProcessGroup)
       error +=
-          " (" + DescribeProcessGroupRefusal(*report, launcher_group) + ")";
+          " (" + DescribeProcessGroupRefusal(failure, launcher_group) + ")";
     return failed;
   }
   // The child: only async-signal-safe calls from here to the exec.

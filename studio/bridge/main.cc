@@ -657,7 +657,8 @@ int main(int argc, char** argv) try {
   std::cout << "listening "
             << us_socket_local_port(
                    0, reinterpret_cast<us_socket_t*>(bridge.listener))
-            << std::endl;
+            << '\n'
+            << std::flush;
   auto* timer = us_create_timer(reinterpret_cast<us_loop_t*>(uWS::Loop::get()),
                                 0, sizeof(Bridge*));
   if (!timer) throw std::runtime_error("poll timer allocation failed");

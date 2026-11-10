@@ -431,6 +431,7 @@ class Telemetry {
       ++per_topic[channel.name.substr(0, role)];
     }
     std::vector<std::pair<std::size_t, std::string>> largest;
+    largest.reserve(per_topic.size());
     for (const auto& [topic, count] : per_topic) {
       largest.emplace_back(count, topic);
     }
