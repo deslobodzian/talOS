@@ -169,8 +169,10 @@ last drained. Receipt time cannot do this: a target queued before a mode
 change and the packet that changes the mode can be drained together, at one
 instant. A Driver Station link that drops and returns in the same mode keeps
 its generation. Driver and declarative teleop producers nevertheless require
-one neutral-input evaluation before publishing active targets after DS
-recovery, startup, or an evaluation gap reaching `command_timeout_us`.
+one neutral-input evaluation before publishing active targets in each new
+generation or gateway boot (so after a disable, however brief, even one they
+never sampled), after DS recovery, startup, or an evaluation gap reaching
+`command_timeout_us`.
 
 Messages reach a node when its loop drains its topics. Every node drains right
 before each of its own timers (`update()`, `every()`), so a timer sees what was

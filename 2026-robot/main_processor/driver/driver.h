@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <numbers>
 #include <optional>
@@ -60,6 +61,12 @@ class Driver {
 
  private:
   enum class Frame { kWaitingForNeutral, kRobot, kField };
+
+  struct ModeGeneration {
+    std::uint64_t boot_id = 0;
+    std::uint64_t mode_since_us = 0;
+    bool operator==(const ModeGeneration&) const = default;
+  };
 
   // Measured rotation below which a turn has stopped and the heading hold
   // latches: the slew-limited coast left from there is negligible.
@@ -120,6 +127,12 @@ class Driver {
       Stop();
       return;
     }
+    // A packet lost between two others can be the only disabled one; its
+    // mode generation (per gateway boot) has moved on regardless, so arming
+    // holds only within the generation it was armed in.
+    const ModeGeneration generation{ds_.data().boot_id,
+                                    ds_.data().mode_since_us};
+    if (armed_ && generation != armed_generation_) Stop();
 
     const bool rezero =
         rezero_button_id_ > 0 && stick.button(rezero_button_id_);
@@ -140,6 +153,7 @@ class Driver {
       // Seed edge history from the snapshot; a held button is not a press.
       rezero_pressed_ = rezero;
       armed_ = neutral;
+      armed_generation_ = generation;
       if (neutral) SetFrame(FreshHeading() ? Frame::kField : Frame::kRobot);
       return;
     }
@@ -224,6 +238,7 @@ class Driver {
   bool have_heading_ = false;
   bool commanding_ = false;
   bool armed_ = false;
+  ModeGeneration armed_generation_;
   Frame frame_ = Frame::kWaitingForNeutral;
   bool translation_neutral_ = false;
   std::optional<talos::Time> last_evaluation_;

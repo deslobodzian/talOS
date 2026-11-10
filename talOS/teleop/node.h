@@ -372,6 +372,13 @@ class Teleop {
     }
     last_evaluation_ = now;
     if (!ds_.enabled() || !ds_.teleop()) armed_ = false;
+    // A disable or mode change shorter than one period is drained together
+    // with the packet that ends it, so update() may never sample it; the
+    // packet's mode generation still moves on, and arming holds only within
+    // the generation (and gateway boot) it was armed in.
+    const ModeGeneration generation{ds_.data().boot_id,
+                                    ds_.data().mode_since_us};
+    if (generation != armed_generation_) armed_ = false;
 
     // A stick that (re)appears may already be deflected; an absent spare
     // controller is no input and does not block the others.
@@ -408,6 +415,7 @@ class Teleop {
         }
       }
       armed_ = neutral;
+      armed_generation_ = generation;
       return;
     }
     const bool ds_ok = ds_.enabled() && ds_.teleop();
@@ -496,6 +504,12 @@ class Teleop {
   }
 
  private:
+  struct ModeGeneration {
+    std::uint64_t boot_id{0};
+    std::uint64_t mode_since_us{0};
+    bool operator==(const ModeGeneration&) const = default;
+  };
+
   void BuildSubsystem(const std::string& sub_name,
                       const std::vector<config::TeleopBinding>& bindings,
                       const config::RobotConfig& config,
@@ -692,6 +706,7 @@ class Teleop {
   talos::DriverStation ds_;
   std::vector<detail::SubsystemState> subsystems_;
   bool armed_{false};
+  ModeGeneration armed_generation_;
   std::optional<talos::Time> last_evaluation_;
 };
 

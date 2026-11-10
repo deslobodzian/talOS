@@ -633,6 +633,31 @@ TEST(TeleopNode, OwnEvaluationGapRequiresNeutralEvenWithFreshDs) {
   ASSERT_TRUE(arm.seen);
 }
 
+// A disable shorter than one teleop period (a radio blip) is drained together
+// with the re-enable, so no update() samples it; the new mode generation alone
+// must disarm a held stick until it returns to neutral.
+TEST(TeleopNode, UnsampledDisableRequiresNeutralInTheNewGeneration) {
+  Sim sim = MakeSim(kAxisToml);
+  auto& arm = sim.add<ConsumerNode<control::VelocityTarget>>("arm");
+  auto& teleop = sim.add<PausableTeleop>("teleop");
+  SimHardware hw{sim};
+  hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1)));
+  ASSERT_TRUE(arm.seen);
+  // Two skipped evaluations stay well inside command_timeout_us, so only the
+  // generation can disarm.
+  teleop.paused = true;
+  Push(hw, sim, DsPacket(ds::kTeleop | ds::kDsAttached, MakeStick(1)), 20ms);
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1)), 20ms);
+  teleop.paused = false;
+  sim.step(60ms);
+  EXPECT_FALSE(arm.seen);
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(1)));
+  ASSERT_TRUE(arm.seen);
+}
+
 constexpr const char* kPartialToml = R"(
 [robot]
 period_us = 20000
