@@ -1,8 +1,10 @@
 #pragma once
 
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -40,6 +42,7 @@
 #include <system_error>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -925,22 +928,137 @@ enum class ChildStep : int {
   kExec,          // execv
 };
 
-// What a child that cannot become its program writes to its error pipe: one
-// write of a few bytes, so the launcher reads all of it or none.
-struct ChildFailure {
-  ChildStep step;
-  int code;  // errno
+// What a child writes to its error pipe: a failed step it cannot become its
+// program after (`fatal`), or a refused setpgid it recovered from. One write
+// of a few dozen bytes, below PIPE_BUF, so the launcher reads a whole report
+// or none.
+struct ChildReport {
+  ChildStep step{ChildStep::kExec};
+  int code{0};  // errno of the step's call; 0 when nothing was refused
+  bool fatal{false};
+  // kProcessGroup only: the setpgid calls made; the errno of the setsid
+  // fallback (0 when it succeeded or was not tried); whether the child leads
+  // a new session; and its ids when setpgid was last refused.
+  int attempts{0};
+  int session_code{0};
+  bool new_session{false};
+  pid_t pid{0};
+  pid_t pgrp{0};
+  pid_t sid{0};
+  pid_t ppid{0};
 };
+static_assert(sizeof(ChildReport) <= PIPE_BUF,
+              "one write of a ChildReport must be atomic");
+static_assert(std::is_trivially_copyable_v<ChildReport>,
+              "a ChildReport crosses the error pipe as bytes");
+
+// In a forked child: one write of `report`, async-signal-safe as every call
+// between a fork and an exec must be (the fork copied whatever locks other
+// threads held). Nothing can be done if it fails.
+inline void WriteChildReport(int errors, const ChildReport& report) {
+  [[maybe_unused]] const ssize_t written =
+      ::write(errors, &report, sizeof report);
+}
 
 // In a forked child, before its exec: reports `step` and errno to the
 // launcher, then exits 127, a shell's status for a command it cannot run.
-// write and _exit are async-signal-safe, as every call between a fork and an
-// exec must be: the fork copied whatever locks other threads held.
 [[noreturn]] inline void ReportChildFailure(int errors, ChildStep step) {
-  const ChildFailure failure{step, errno};
-  [[maybe_unused]] const ssize_t written =
-      ::write(errors, &failure, sizeof failure);
+  ChildReport report;
+  report.step = step;
+  report.code = errno;
+  report.fatal = true;
+  WriteChildReport(errors, report);
   ::_exit(127);
+}
+
+// The setpgid(0, 0) calls a child makes before it falls back to setsid.
+inline constexpr int kProcessGroupAttempts = 3;
+
+// In a forked child: makes it the leader of a process group of its own (pgid
+// = its pid), which is what the launcher signals and its guardian kills.
+// setpgid(0, 0) can only be refused with EPERM, which both Linux and XNU
+// return for a caller they hold to be its session's leader; a forked child
+// that never called setsid is not one, yet macOS CI has seen the refusal
+// (TODO.md INC-5, cause not established). So a refused call succeeds anyway
+// when the child already leads its own group (as it would if the launcher's
+// concurrent setpgid(pid, pid) had moved it; unconfirmed, which is why the
+// launcher prints that call's result with the refusal), is retried
+// kProcessGroupAttempts times, then falls back to setsid, which also makes it
+// the leader of a group of its own, in a new session without a controlling
+// terminal; a node in its own group never received the terminal's signals.
+// False when none of that worked. `report` records any refusal for the
+// launcher (code 0: none). getsid and sched_yield are not on POSIX's
+// async-signal-safe list but are bare system calls on Linux and macOS.
+inline bool EnterOwnProcessGroup(ChildReport& report) {
+  report = ChildReport{};
+  report.step = ChildStep::kProcessGroup;
+  const pid_t self = ::getpid();
+  for (int attempt = 1;; ++attempt) {
+    if (::setpgid(0, 0) == 0) return true;
+    report.code = errno;
+    report.attempts = attempt;
+    report.pid = self;
+    report.pgrp = ::getpgrp();
+    report.sid = ::getsid(0);
+    report.ppid = ::getppid();
+    if (report.pgrp == self) return true;
+    if (report.code != EPERM || attempt == kProcessGroupAttempts) break;
+    ::sched_yield();
+  }
+  if (report.code != EPERM) return false;
+  if (::setsid() >= 0) {
+    report.new_session = true;
+    return true;
+  }
+  report.session_code = errno;
+  return ::getpgrp() == self;
+}
+
+// What the launcher adds to a child's refused setpgid, to name its cause: the
+// child's last refused attempt and its ids, the setsid fallback's errno when
+// it was refused too, and the result of the launcher's own setpgid(pid, pid)
+// (`launcher_code`, 0 when it succeeded): "attempt 3 of 3; pid 812, pgrp 640,
+// sid 101, ppid 640; launcher's setpgid: ok".
+inline std::string DescribeProcessGroupRefusal(const ChildReport& report,
+                                               int launcher_code) {
+  std::string text = "attempt " + std::to_string(report.attempts) + " of " +
+                     std::to_string(kProcessGroupAttempts) + "; pid " +
+                     std::to_string(report.pid) + ", pgrp " +
+                     std::to_string(report.pgrp) + ", sid " +
+                     std::to_string(report.sid) + ", ppid " +
+                     std::to_string(report.ppid);
+  if (report.session_code != 0)
+    text += "; setsid: " + std::string{std::strerror(report.session_code)};
+  text += "; launcher's setpgid: ";
+  text += launcher_code == 0 ? std::string{"ok"}
+                             : std::string{std::strerror(launcher_code)};
+  return text;
+}
+
+// The launcher's side of a spawned child's error pipe `errors`: reads it until
+// EOF, which the child's exec (or its death without a report) leaves once the
+// guardian has closed its copy, or until a fatal report, which it returns.
+// Each report before that is a refused setpgid the child `program` (pid
+// `pid`) recovered from, written to `notes` with DescribeProcessGroupRefusal
+// and `launcher_code`. Nullopt at EOF: the child is its program.
+inline std::optional<ChildReport> ReadChildReports(int errors,
+                                                   const std::string& program,
+                                                   pid_t pid, int launcher_code,
+                                                   std::ostream& notes) {
+  for (;;) {
+    ChildReport report;
+    ssize_t got = 0;
+    while ((got = ::read(errors, &report, sizeof report)) < 0 &&
+           errno == EINTR) {
+    }
+    if (got != static_cast<ssize_t>(sizeof report)) return std::nullopt;
+    if (report.fatal) return report;
+    notes << "[launcher] " << program << " (pid " << pid
+          << "): setpgid: " << std::strerror(report.code) << " ("
+          << DescribeProcessGroupRefusal(report, launcher_code)
+          << (report.new_session ? "); it leads a new session instead\n"
+                                 : "); it leads its own group\n");
+  }
 }
 
 // How SpawnProcess names a child's failed step.
@@ -979,9 +1097,11 @@ inline constexpr int kChildOutputPipeBytes = 256 * 1024;
 // shares with the launcher shows by closing. A child that fails before or at
 // its exec reports the step and errno there instead, exits 127 and is reaped;
 // then, as when a pipe or the fork fails here, this returns -1 with `error`
-// naming the step and its errno ("execv <path>: Permission denied"), the
-// same two in `*failure` when given, and no reader. Safe to call from several
-// threads at once (SpawnMutex).
+// naming the step and its errno ("execv <path>: Permission denied"; a
+// refused setpgid adds DescribeProcessGroupRefusal), the same two in
+// `*failure` when given, and no reader. A refused setpgid the child recovered
+// from is written to stderr. Safe to call from several threads at once
+// (SpawnMutex).
 inline pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
                           SpawnOutput output = SpawnOutput::kInherit,
                           int* reader = nullptr,
@@ -1035,19 +1155,19 @@ inline pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
     ::close(lifetime[0]);
     ::close(errors[1]);
     if (child_output[1] >= 0) ::close(child_output[1]);
-    // Both sides establish the group, closing the spawn/signal race.
-    ::setpgid(pid, pid);
+    // Both sides establish the group. The child's own call is the one that
+    // counts: this returns only after the child's exec or death, so nothing
+    // signals the group before it exists. This one may let a child whose call
+    // is refused find itself its group's leader (EnterOwnProcessGroup); its
+    // result goes with any refusal the child reports, since whether it races
+    // the child's call into that refusal is not known (TODO.md INC-5).
+    const int launcher_group = ::setpgid(pid, pid) == 0 ? 0 : errno;
     ProcessLifetimes().emplace(pid, lifetime[1]);
     spawning.unlock();
-    // EOF once the exec has closed the child's writer and the guardian its
-    // copy, or once a child died without a report; a report otherwise.
-    ChildFailure report{};
-    ssize_t got = 0;
-    while ((got = ::read(errors[0], &report, sizeof report)) < 0 &&
-           errno == EINTR) {
-    }
+    const std::optional<ChildReport> report = ReadChildReports(
+        errors[0], args.front(), pid, launcher_group, std::cerr);
     ::close(errors[0]);
-    if (got != static_cast<ssize_t>(sizeof report)) {
+    if (!report) {
       if (reader != nullptr) *reader = child_output[0];
       return pid;
     }
@@ -1055,11 +1175,21 @@ inline pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
     while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
     }
     FinishProcessGroup(pid);
-    return fail(ChildStepName(report.step, args.front()), report.code);
+    const pid_t failed =
+        fail(ChildStepName(report->step, args.front()), report->code);
+    if (report->step == ChildStep::kProcessGroup)
+      error +=
+          " (" + DescribeProcessGroupRefusal(*report, launcher_group) + ")";
+    return failed;
   }
   // The child: only async-signal-safe calls from here to the exec.
-  if (::setpgid(0, 0) != 0)
-    ReportChildFailure(errors[1], ChildStep::kProcessGroup);
+  ChildReport own_group;
+  if (!EnterOwnProcessGroup(own_group)) {
+    own_group.fatal = true;
+    WriteChildReport(errors[1], own_group);
+    ::_exit(127);
+  }
+  if (own_group.code != 0) WriteChildReport(errors[1], own_group);
 #ifdef __linux__
   if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0)
     ReportChildFailure(errors[1], ChildStep::kDeathSignal);

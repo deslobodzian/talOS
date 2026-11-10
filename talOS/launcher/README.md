@@ -361,7 +361,12 @@ EOF, including after launcher SIGKILL. It never execs, so it closes every
 other descriptor it inherited: a lock or pipe end the launcher's process held
 at the spawn would otherwise stay held for as long as the node runs. Linux also
 uses `PR_SET_PDEATHSIG`; macOS relies on the pipe. Children must not daemonize
-out of their group.
+out of their group. A child whose `setpgid` is refused still runs if it already
+leads its own group, or else, after three refusals, as the leader of a new
+session (and so of its own group). For such a spawn the launcher prints one
+line: the errno and attempt number of the child's last refusal, the child's
+pid, process group, session and parent, and the result of the launcher's own
+`setpgid`; a spawn that fails there names the same in its error.
 
 The requested-stop supervision test acknowledges installed signal handlers in
 all three stub nodes before signaling the launcher. Every stub stays alive until

@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1198,6 +1199,83 @@ TEST(LauncherGraphTest, ProbeReportsWhyABinaryCannotRun) {
                              std::chrono::milliseconds{500}, out, error));
   EXPECT_NE(error.find("/nonexistent/talos_node"), std::string::npos) << error;
   EXPECT_NE(error.find(std::strerror(ENOENT)), std::string::npos) << error;
+}
+
+// A spawned child whose setpgid(0, 0) is refused but which already leads its
+// own group (as it would if the launcher's setpgid(pid, pid) had moved it, an
+// unconfirmed cause) has the group the launcher signals, so it must run, not
+// exit 127 as "cannot spawn" (TODO.md INC-5); the report names its ids. A
+// session leader is the one caller the kernel refuses (EPERM) while it leads
+// its own group.
+TEST(LauncherTest, ARefusedSetpgidOfAGroupLeaderStillEntersItsGroup) {
+  int results[2];
+  ASSERT_EQ(::pipe(results), 0);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::close(results[0]);
+    ChildReport report;
+    report.fatal = ::setsid() < 0 || !EnterOwnProcessGroup(report);
+    [[maybe_unused]] const ssize_t written =
+        ::write(results[1], &report, sizeof report);
+    ::_exit(0);
+  }
+  ::close(results[1]);
+  ChildReport report;
+  const ssize_t got = ::read(results[0], &report, sizeof report);
+  ::close(results[0]);
+  ::waitpid(child, nullptr, 0);
+  ASSERT_EQ(got, static_cast<ssize_t>(sizeof report));
+  EXPECT_FALSE(report.fatal);
+  EXPECT_EQ(report.code, EPERM);
+  EXPECT_EQ(report.attempts, 1);
+  EXPECT_FALSE(report.new_session);
+  EXPECT_EQ(report.pid, child);
+  EXPECT_EQ(report.pgrp, child);
+  EXPECT_EQ(report.sid, child);
+}
+
+// The launcher reads a child's error pipe past a recovered setpgid refusal: to
+// EOF, where the spawn succeeds and the note names the child's ids and the
+// launcher's own setpgid result (the evidence INC-5 waits for), or to a later
+// fatal report, which is the step the spawn failed at.
+TEST(LauncherTest, ChildReportsReadPastARecoveredRefusal) {
+  ChildReport refusal;
+  refusal.step = ChildStep::kProcessGroup;
+  refusal.code = EPERM;
+  refusal.attempts = 3;
+  refusal.new_session = true;
+  refusal.pid = 812;
+  refusal.pgrp = 640;
+  refusal.sid = 101;
+  refusal.ppid = 640;
+  ChildReport exec_failure;
+  exec_failure.code = ENOENT;
+  exec_failure.fatal = true;
+  for (const bool then_fails : {false, true}) {
+    int pipe_ends[2];
+    ASSERT_EQ(::pipe(pipe_ends), 0);
+    ASSERT_EQ(::write(pipe_ends[1], &refusal, sizeof refusal),
+              static_cast<ssize_t>(sizeof refusal));
+    if (then_fails) {
+      ASSERT_EQ(::write(pipe_ends[1], &exec_failure, sizeof exec_failure),
+                static_cast<ssize_t>(sizeof exec_failure));
+    }
+    ::close(pipe_ends[1]);
+    std::ostringstream notes;
+    const std::optional<ChildReport> fatal =
+        ReadChildReports(pipe_ends[0], "/bin/alpha", 812, EACCES, notes);
+    ::close(pipe_ends[0]);
+    EXPECT_NE(notes.str().find("pgrp 640, sid 101"), std::string::npos)
+        << notes.str();
+    EXPECT_NE(notes.str().find(std::strerror(EACCES)), std::string::npos)
+        << notes.str();
+    ASSERT_EQ(fatal.has_value(), then_fails);
+    if (then_fails) {
+      EXPECT_EQ(fatal->step, ChildStep::kExec);
+      EXPECT_EQ(fatal->code, ENOENT);
+    }
+  }
 }
 
 // A probe is asked once per launch, so a fork refused for want of a process
