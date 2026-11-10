@@ -2024,6 +2024,174 @@ inline std::vector<naming::Diagnostic> LintParameterUnits(
   return findings;
 }
 
+// One key of a parameter value as Node::param names it, and what the
+// config holds there, which decides what a read under it covers.
+struct ParameterKey {
+  enum class Kind { kValue, kArray, kEmptyTable };
+  std::string key;
+  Kind kind{Kind::kValue};
+};
+
+// The keys of one parameter value: a nested table's keys dotted
+// ("detector.sigma"), an array of tables' elements indexed
+// ("geometry.modules[0].x_m"). An empty table is one key, so an unknown
+// table is refused like an unknown key.
+inline void ParameterKeys(const toml::node& value, const std::string& path,
+                          std::vector<ParameterKey>& out) {
+  if (const toml::table* table = value.as_table()) {
+    if (table->empty()) {
+      out.push_back({path, ParameterKey::Kind::kEmptyTable});
+      return;
+    }
+    for (const auto& [key, child] : *table) {
+      ParameterKeys(child, path + "." + std::string{key.str()}, out);
+    }
+    return;
+  }
+  if (const toml::array* array = value.as_array()) {
+    if (!array->empty() && array->is_array_of_tables()) {
+      for (std::size_t i = 0; i < array->size(); ++i) {
+        ParameterKeys((*array)[i], path + "[" + std::to_string(i) + "]", out);
+      }
+      return;
+    }
+    out.push_back({path, ParameterKey::Kind::kArray});
+    return;
+  }
+  out.push_back({path, ParameterKey::Kind::kValue});
+}
+
+// Levenshtein distance, for the nearest declared key a finding suggests.
+inline std::size_t EditDistance(std::string_view a, std::string_view b) {
+  std::vector<std::size_t> row(b.size() + 1);
+  for (std::size_t j = 0; j <= b.size(); ++j) row[j] = j;
+  for (std::size_t i = 1; i <= a.size(); ++i) {
+    std::size_t diagonal = row[0];
+    row[0] = i;
+    for (std::size_t j = 1; j <= b.size(); ++j) {
+      const std::size_t above = row[j];
+      row[j] = std::min({row[j] + 1, row[j - 1] + 1,
+                         diagonal + (a[i - 1] == b[j - 1] ? 0 : 1)});
+      diagonal = above;
+    }
+  }
+  return row[b.size()];
+}
+
+// Every key of a [subsystems.<name>] table that is neither a framework key
+// (config::kFrameworkSubsystemKeys) nor read by any node's constructor
+// (introspect::Description::params, from its --describe probe) is an error
+// naming the subsystem, the key, the files that set it (when `config_path`
+// is given) and the nearest key a node read there. A key is read when a node
+// read it, an element of it when it is an array ("names[2]" reads "names"),
+// or a key inside it when it is an empty table; a read under a scalar
+// ("recording.enabled" where `recording = false`) reads nothing the config
+// set. A subsystem whose own node did not answer, or answered without a
+// params field (a binary built before it), is not checked. Only the latter
+// turns findings in other tables into warnings, since such a binary may read
+// them with param_of; a failed probe is already a finding of its own, so a
+// key nobody else reads stays an error that names it. Roster members that
+// are not subsystems (the bridge, the sim gateway, Studio's bridge) read no
+// parameters.
+inline std::vector<naming::Diagnostic> LintParameterKeys(
+    const config::RobotConfig& robot_config,
+    const std::vector<NodeDescription>& described,
+    const std::string& config_path = {}) {
+  std::vector<naming::Diagnostic> findings;
+  const toml::table* subsystems =
+      robot_config.toml_data["subsystems"].as_table();
+  if (subsystems == nullptr) return findings;
+
+  std::map<std::string, std::vector<std::string>, std::less<>> reads;
+  std::vector<std::string> unchecked;  // Subsystems whose node's reads are
+                                       // unknown.
+  std::string failed;                  // Did not answer --describe.
+  std::string silent;                  // Answered, without params.
+  const auto append = [](std::string& list, const std::string& name) {
+    list += (list.empty() ? "" : ", ") + name;
+  };
+  for (const auto& node : described) {
+    if (!subsystems->contains(node.roster_name)) continue;
+    if (!node.answered || !node.declared.params) {
+      unchecked.push_back(node.roster_name);
+      append(node.answered ? silent : failed, node.roster_name);
+      if (node.answered) {
+        findings.push_back(
+            {naming::Severity::WARNING, node.roster_name,
+             "its --describe reports no parameters (a binary built before "
+             "they were reported?), so its subsystem keys are not checked"});
+      }
+      continue;
+    }
+    for (const auto& read : *node.declared.params) {
+      reads[read.subsystem].push_back(read.key);
+    }
+  }
+
+  static const std::vector<std::string> kNone;
+  for (const auto& [name_key, value] : *subsystems) {
+    const std::string name{name_key.str()};
+    const toml::table* table = value.as_table();
+    if (table == nullptr ||
+        std::ranges::find(unchecked, name) != unchecked.end()) {
+      continue;
+    }
+    const auto found = reads.find(name);
+    const std::vector<std::string>& read =
+        found == reads.end() ? kNone : found->second;
+    const auto covered = [&read](const ParameterKey& set) {
+      const std::string& key = set.key;
+      const char under = set.kind == ParameterKey::Kind::kArray        ? '['
+                         : set.kind == ParameterKey::Kind::kEmptyTable ? '.'
+                                                                       : '\0';
+      return std::ranges::any_of(read, [&key, under](const std::string& r) {
+        return r == key || (under != '\0' && r.size() > key.size() &&
+                            r.starts_with(key) && r[key.size()] == under);
+      });
+    };
+    std::vector<ParameterKey> keys;
+    for (const auto& [key, child] : *table) {
+      if (config::IsFrameworkSubsystemKey(key.str())) continue;
+      ParameterKeys(child, std::string{key.str()}, keys);
+    }
+    for (const auto& set : keys) {
+      if (covered(set)) continue;
+      const std::string& key = set.key;
+      std::string message = "parameter '" + key + "'";
+      if (!config_path.empty()) {
+        const auto files = config::SubsystemKeyFiles(config_path, name, key);
+        for (std::size_t i = 0; i < files.size(); ++i) {
+          message += (i == 0 ? " (" : ", ") + files[i];
+        }
+        if (!files.empty()) message += ")";
+      }
+      message += " is read by no node's constructor (Node::param)";
+      const std::string* nearest = nullptr;
+      std::size_t distance = std::max<std::size_t>(2, key.size() / 3) + 1;
+      for (const auto& candidate : read) {
+        const std::size_t d = EditDistance(key, candidate);
+        if (d < distance) {
+          distance = d;
+          nearest = &candidate;
+        }
+      }
+      if (nearest != nullptr) message += "; did you mean '" + *nearest + "'?";
+      if (!failed.empty()) {
+        message += " (" + failed +
+                   " did not answer --describe; if it reads this key with "
+                   "param_of, fix its probe)";
+      }
+      if (!silent.empty()) {
+        message += " (a warning while " + silent + " reports no parameters)";
+      }
+      findings.push_back(
+          {silent.empty() ? naming::Severity::ERROR : naming::Severity::WARNING,
+           name, std::move(message)});
+    }
+  }
+  return findings;
+}
+
 // Where the launcher writes the declared graph that graph-reading nodes get
 // as `--graph` (introspect::DeclaredGraph): beside graph.json in the session
 // directory.
@@ -2904,6 +3072,10 @@ class Launcher {
       return 1;
     }
     for (auto& finding : LintParameterUnits(robot_config)) {
+      diagnostics.push_back(std::move(finding));
+    }
+    for (auto& finding :
+         LintParameterKeys(robot_config, described, options_.config_path)) {
       diagnostics.push_back(std::move(finding));
     }
     for (auto& finding : naming::CheckHardwareConfig(robot_config.hardware)) {

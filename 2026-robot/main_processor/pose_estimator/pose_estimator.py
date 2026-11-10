@@ -485,15 +485,20 @@ class PoseEstimator:
             node, "max_yaw_innovation_rad", 0.2618)
         initial = _initial_pose(node)
         backend = node.param("backend")
+        # Both backends' tables are read and validated whichever is
+        # selected: reading declares the keys (the launcher refuses a key no
+        # node reads), and switching backends cannot surface a bad value.
+        kalman_args = (initial, _std_devs(node, "kalman", "state_std",
+                                          (0.1, 0.1, 0.1)))
+        factor_graph_args = (
+            self.max_age_s, initial,
+            _std_devs(node, "factor_graph", "odometry_std",
+                      (0.01, 0.01, 0.005)),
+            _std_devs(node, "factor_graph", "prior_std", (1.0, 1.0, 0.5)))
         if backend == "kalman":
-            backend_args = (initial, _std_devs(node, "kalman", "state_std",
-                                               (0.1, 0.1, 0.1)))
+            backend_args = kalman_args
         elif backend == "factor_graph":
-            backend_args = (
-                self.max_age_s, initial,
-                _std_devs(node, "factor_graph", "odometry_std",
-                          (0.01, 0.01, 0.005)),
-                _std_devs(node, "factor_graph", "prior_std", (1.0, 1.0, 0.5)))
+            backend_args = factor_graph_args
         else:
             raise ValueError(f"pose_estimator: backend must be \"kalman\" or "
                              f"\"factor_graph\", got {backend!r}")

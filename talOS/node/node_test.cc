@@ -869,6 +869,9 @@ TEST(Binary, DescribeListsEveryEndpointIncludingOptionalOnes) {
   EXPECT_EQ(described.name, "test_node");
   EXPECT_EQ(described.target, "//talOS/node:test_node");
   EXPECT_FALSE(described.reads_graph);
+  // The constructor's one param read is the node's declared parameter.
+  EXPECT_EQ(described.params,
+            (std::vector<introspect::ParamRead>{{"test_node", "step"}}));
   const auto find = [&](std::string_view name) {
     const auto it =
         std::find_if(described.sources.begin(), described.sources.end(),

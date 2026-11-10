@@ -256,6 +256,100 @@ speed_rps = 40.0
   EXPECT_EQ(findings[0].subject, "shooter");
 }
 
+// ARCH-3: a misspelled parameter used to load and leave the node on its
+// fallback. A key no node's describe reports reading is an error naming its
+// file and the nearest read key; framework sections, an array read by
+// element, an empty table read inside, nested and array-of-table keys and
+// another node's param_of all count as read, but a read under a scalar
+// (`recording.enabled` where `recording = false`, `count[1]` where
+// `count = 5`) does not.
+TEST(LauncherTest, ASubsystemKeyNoNodeReadsIsAnErrorNamingTheNearestReadKey) {
+  constexpr std::string_view kToml = R"(
+[subsystems.elevator]
+node = "//e:elevator"
+period_us = 10000
+homing_vv = -3.0
+tolerance_rot = 0.1
+names = ["a", "b"]
+recording = false
+count = 5
+[subsystems.elevator.detector]
+sigma = 0.0
+[subsystems.elevator.routine.none]
+[subsystems.elevator.motors.lift]
+can_id = 2
+[[subsystems.elevator.geometry.modules]]
+x_m = 1.0
+
+[subsystems.drivetrain]
+node = "//d:drivetrain"
+offset_m = 0.5
+)";
+  const std::string path = TempPath("parameter_keys.toml");
+  std::ofstream{path} << kToml;
+  config::RobotConfig robot;
+  robot.toml_data = toml::parse(kToml);
+
+  NodeDescription elevator{.roster_name = "elevator", .answered = true};
+  elevator.declared.params = {{"elevator", "homing_v"},
+                              {"elevator", "tolerance_rot"},
+                              {"elevator", "names[1]"},
+                              {"elevator", "recording.enabled"},
+                              {"elevator", "count[1]"},
+                              {"elevator", "detector.sigma"},
+                              {"elevator", "routine.none.speed_rps"},
+                              {"elevator", "geometry.modules[0].x_m"},
+                              {"drivetrain", "offset_m"}};
+  NodeDescription drivetrain{.roster_name = "drivetrain", .answered = true};
+  drivetrain.declared.params.emplace();
+  // Not a subsystem, and its describe has no params: ignored.
+  const NodeDescription bridge{.roster_name = std::string{kHardwareNodeName},
+                               .answered = true};
+
+  const auto subjects = [](const std::vector<naming::Diagnostic>& findings) {
+    std::vector<std::string> keys;
+    for (const auto& finding : findings) {
+      const auto begin = finding.message.find('\'') + 1;
+      keys.push_back(finding.message.substr(
+          begin, finding.message.find('\'', begin) - begin));
+    }
+    return keys;
+  };
+  const auto findings =
+      LintParameterKeys(robot, {elevator, drivetrain, bridge}, path);
+  EXPECT_EQ(subjects(findings),
+            (std::vector<std::string>{"count", "homing_vv", "recording"}));
+  for (const auto& finding : findings) {
+    EXPECT_EQ(finding.severity, naming::Severity::ERROR) << finding.message;
+    EXPECT_EQ(finding.subject, "elevator");
+  }
+  ASSERT_EQ(findings.size(), 3u);
+  const std::string& typo = findings[1].message;  // Sorted by key.
+  EXPECT_NE(typo.find("'homing_vv' (" + path + ")"), std::string::npos) << typo;
+  EXPECT_NE(typo.find("did you mean 'homing_v'?"), std::string::npos) << typo;
+
+  // A failed probe leaves only its own table unchecked: a key nobody else
+  // reads stays an error, naming the node that might read it.
+  drivetrain.answered = false;
+  drivetrain.declared.params.reset();
+  const auto failed = LintParameterKeys(robot, {elevator, drivetrain}, path);
+  ASSERT_EQ(subjects(failed),
+            (std::vector<std::string>{"count", "homing_vv", "recording"}));
+  EXPECT_EQ(failed[0].severity, naming::Severity::ERROR);
+  EXPECT_NE(failed[0].message.find("drivetrain did not answer"),
+            std::string::npos)
+      << failed[0].message;
+
+  // A node that answered without a params field (an older binary): its own
+  // table goes unchecked, and since it may read another table with
+  // param_of, a key nobody else reads is only a warning.
+  drivetrain.answered = true;
+  const auto unsure = LintParameterKeys(robot, {elevator, drivetrain}, path);
+  EXPECT_EQ(unsure.size(), 4u);
+  EXPECT_FALSE(naming::HasError(unsure));
+  std::filesystem::remove(path);
+}
+
 TEST(LauncherTest, ShouldRetryStudioBridgePredicate) {
   using clock = std::chrono::steady_clock;
   const auto now = clock::now();

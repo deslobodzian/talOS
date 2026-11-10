@@ -30,6 +30,7 @@ struct RobotConfig;
 }  // namespace config
 namespace introspect {
 struct Description;
+struct ParamRead;
 }  // namespace introspect
 namespace process {
 enum class LoopTier : std::uint8_t;  // talOS/process/realtime_outcome.h
@@ -130,6 +131,10 @@ struct NodeAccess {
   // graph.
   static const DeclaredGraph* declared_graph(Node& node);
   static bool reads_graph(const Node& node);
+  // Every (subsystem, key) the constructor read with param or param_of, in
+  // first-read order: what --describe reports as the node's parameters.
+  static const std::vector<introspect::ParamRead>& params_read(
+      const Node& node);
   static const config::RobotConfig& robot_config(const Node& node);
   // The scheduling tier talos::Run gives the node's loop thread: control when
   // its own subsystem's devices own an actuator

@@ -115,9 +115,8 @@ struct RobotConfig {
 
   // Sim-session viewer. Studio's bridge is a host-side process, not a robot
   // node, so it is not a subsystem; this table carries what the launcher
-  // needs to start and supervise it in sim sessions. The watched topic is
-  // read from [subsystems.telemetry] topic, the same key the telemetry node
-  // reads, so the two ends cannot drift apart.
+  // needs to start and supervise it in sim sessions. `topic` is the topic it
+  // watches, the telemetry node's byte topic (/talos/telemetry).
   struct StudioConfig {
     std::string bridge{"//studio/bridge:studio_bridge"};
     uint16_t http_port{5800};
@@ -161,6 +160,22 @@ struct RobotConfig {
   std::map<std::string, std::vector<std::pair<std::string, TeleopValue>>>
       teleop_defaults;
 };
+
+// The keys of a [subsystems.<name>] table the framework reads: config load,
+// the launcher, talOS/node (period_us, remap) and the devices layer. Every
+// other key is a parameter of some node (Node::param, param_of), which the
+// launcher checks against the keys the nodes' --describe probes report.
+inline constexpr std::string_view kFrameworkSubsystemKeys[] = {
+    "node",        "critical",       "period_us",       "remap",
+    "targets",     "teleop",         "motors",          "sensors",
+    "encoders",    "digital_inputs", "digital_outputs", "analog_inputs",
+    "pwm_outputs",
+};
+
+constexpr bool IsFrameworkSubsystemKey(std::string_view key) {
+  return std::ranges::find(kFrameworkSubsystemKeys, key) !=
+         std::end(kFrameworkSubsystemKeys);
+}
 
 namespace detail {
 
@@ -245,7 +260,8 @@ inline void CheckTopLevelKeys(const toml::table& tbl) {
 }
 
 // A subsystem table also carries its node's own parameters (Node::param), so
-// a key the framework does not know cannot be refused. A framework section
+// a key the framework does not know cannot be refused here (the launcher
+// refuses one no node's --describe reports reading). A framework section
 // spelled in the singular can: `[subsystems.arm.target]` would otherwise
 // leave arm on the default target policy, and `[subsystems.arm.motor.x]`
 // would leave the motor unconfigured, both silently. `where` names the table
@@ -262,6 +278,9 @@ inline void CheckSubsystemKeys(const toml::table& tbl,
       {"analog_input", "analog_inputs"},
       {"pwm_output", "pwm_outputs"},
   };
+  static_assert(std::ranges::all_of(kSections, [](const auto& section) {
+    return IsFrameworkSubsystemKey(section.second);
+  }));
   for (auto&& [k, v] : tbl) {
     for (const auto& [wrong, right] : kSections) {
       if (k.str() == wrong) {
@@ -1388,6 +1407,38 @@ inline toml::table ResolveRobotConfig(const std::string& path,
 
 inline RobotConfig ParseRobotConfig(const std::string& path) {
   return ParseRobotConfigTable(ResolveRobotConfig(path));
+}
+
+// The files of the config at `path` (itself, its include, subsystem and
+// defaults files) that set `key` (a dotted path, "camera.fps") of
+// `subsystem`'s table, for a diagnostic to name: a [subsystems.<subsystem>]
+// table, or a subsystem file whose [subsystem] names it, or a defaults file
+// (whose [subsystem] names none). Empty when the config no longer resolves.
+inline std::vector<std::string> SubsystemKeyFiles(const std::string& path,
+                                                  std::string_view subsystem,
+                                                  std::string_view key) {
+  std::vector<std::string> out;
+  const auto read = [&](const std::string& file) {
+    toml::table document = detail::ParseTomlFile(file);
+    bool sets = false;
+    if (const auto* tables = document["subsystems"].as_table()) {
+      if (const auto* table = (*tables)[subsystem].as_table()) {
+        sets = static_cast<bool>(table->at_path(key));
+      }
+    } else if (const auto* header = document["subsystem"].as_table()) {
+      const auto name = (*header)["name"].value<std::string_view>();
+      sets = (!name || *name == subsystem) &&
+             (document.at_path(key) || header->at_path(key));
+    }
+    if (sets && std::ranges::find(out, file) == out.end()) out.push_back(file);
+    return document;
+  };
+  try {
+    ResolveRobotConfig(path, read);
+  } catch (const std::exception&) {
+    return {};
+  }
+  return out;
 }
 
 }  // namespace talos::config

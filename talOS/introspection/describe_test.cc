@@ -50,6 +50,7 @@ void ExpectSameDescription(const Description& written,
   EXPECT_EQ(read.name, written.name);
   EXPECT_EQ(read.target, written.target);
   EXPECT_EQ(read.reads_graph, written.reads_graph);
+  EXPECT_EQ(read.params, written.params);
   ASSERT_EQ(read.sources.size(), written.sources.size());
   for (std::size_t i = 0; i < written.sources.size(); ++i) {
     const auto& a = written.sources[i];
@@ -68,7 +69,8 @@ void ExpectSameDescription(const Description& written,
 
 // Every source kind, endpoint flags looked up by key (a missing key must not
 // shift onto the next source), schema bytes at every base64 padding length,
-// the full 64-bit hash, and names that need escaping.
+// the full 64-bit hash, names that need escaping, and parameter keys holding
+// the brackets, braces and field names a scanning reader would stop at.
 TEST(Describe, RoundTripsEveryField) {
   event::Manifest manifest = sample_manifest();
   std::string bytes;
@@ -89,6 +91,9 @@ TEST(Describe, RoundTripsEveryField) {
        {"/drivetrain/target", naming::kSourceFlagOptional},
        {"/driver_station/state", naming::kSourceFlagObserver}});
   written.reads_graph = true;
+  written.params = {{"drivetrain", "geometry.modules[0].x_m"},
+                    {R"(od"d)", "sources"},
+                    {"describe_version", R"(odd]}{["key)"}};
   ASSERT_EQ(written.sources.size(), 5u);
   ASSERT_EQ(written.sources[3].flags, naming::kSourceFlagExternal |
                                           naming::kSourceFlagOptional |
@@ -107,10 +112,13 @@ TEST(Describe, RoundTripsEveryField) {
 TEST(Describe, DeclaredGraphRoundTripsEveryNode) {
   event::Manifest manifest = sample_manifest();
   manifest[1].schema.bfbs = std::string{"\x00\x01{}[]\"", 7};
-  const DeclaredGraph written{
+  DeclaredGraph written{
       DescribeManifest("drivetrain", "//d:drivetrain", manifest, kSlots),
       DescribeManifest("empty", "//e:empty", event::Manifest{}, kSlots),
       DescribeManifest("shooter", "//s:shooter", sample_manifest(), kSlots)};
+  // Reported, reported as none, and not reported (nullopt) stay distinct.
+  written[0].params = {{"describe_version", "describe_version"}};
+  written[1].params.emplace();
   DeclaredGraph read;
   std::string error;
   ASSERT_TRUE(

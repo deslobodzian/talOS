@@ -101,6 +101,32 @@ attempts made, and a probe that spawns only after a retry prints `[launcher]
 probe of <binary> spawned on attempt N (after <step>: <errno>)`. Any other spawn failure is reported at once. Missing
 descriptions remain recorded in `graph.json` and the session manifest.
 
+## Parameter keys
+
+Each node's describe also lists every parameter key its constructor read with
+`param` or `param_of`, set or not
+([introspection](../introspection/README.md#describe)). After phase one the
+launcher checks every subsystem table against them (`LintParameterKeys`): a
+key that is not a framework key (`config::kFrameworkSubsystemKeys`) and that
+no node read is an error naming the subsystem, the key as `param` names it
+(`detector.sigma`, `geometry.modules[0].x_m`), the files that set it and,
+when one is close, the nearest key a node read there:
+
+    error: elevator: parameter 'homing_vv' (.../subsystems/elevator.toml) is read by no node's constructor (Node::param); did you mean 'homing_v'?
+
+A key counts as read when a node read it, an element of it when the config
+holds an array (`names[1]` reads `names`), or a key inside it when the config
+holds an empty table (`routine.none.x` reads `routine.none`); a read under a
+scalar (`recording.enabled` where `recording = false`) reads nothing the
+config set. An empty table is one key, so an unknown table is refused too.
+A subsystem whose own node did not answer its probe is not checked, and a
+finding elsewhere stays an error that names that node (it may read the key
+with `param_of`; fix its probe). A subsystem whose node answered without a
+params field (a hand-written describe, or a binary built before the field)
+is not checked either, which is a warning, and while any such node exists
+every finding is a warning. Probes run with the session's `--sim`, so a key a
+node reads only in simulation is unread on the robot.
+
 ## Live endpoints
 
 The lint checks the graph the probes declared, so a node must declare the same

@@ -167,11 +167,27 @@ struct Node::Impl {
   }
 
   const toml::table* Table() const { return config->GetSubsystemTable(name); }
+
+  // Every key the constructor read, present or not: what --describe reports
+  // the node reads (introspect::Description::params). Reads after the loop
+  // starts are not recorded, so update() allocates nothing for them.
+  mutable std::vector<introspect::ParamRead> params_read;
+
+  void RecordParam(std::string_view subsystem, std::string_view key) const {
+    if (started) return;
+    introspect::ParamRead read{std::string{subsystem}, std::string{key}};
+    if (std::find(params_read.begin(), params_read.end(), read) ==
+        params_read.end()) {
+      params_read.push_back(std::move(read));
+    }
+  }
+
   // `key` in this node's table, or in `subsystem`'s (param_of: read once,
   // in the constructor, from a subsystem the config must have).
   toml::node_view<const toml::node> Param(
       std::string_view key, std::optional<std::string_view> subsystem) const {
     if (!subsystem) {
+      RecordParam(name, key);
       const toml::table* table = Table();
       if (table == nullptr) return {};
       return table->at_path(key);
@@ -185,6 +201,7 @@ struct Node::Impl {
                                   std::string{key} + "'): no [subsystems." +
                                   std::string{*subsystem} + "] in the config");
     }
+    RecordParam(*subsystem, key);
     return table->at_path(key);
   }
 
@@ -415,6 +432,11 @@ const DeclaredGraph* NodeAccess::declared_graph(Node& node) {
 
 bool NodeAccess::reads_graph(const Node& node) {
   return node.impl_->reads_graph;
+}
+
+const std::vector<introspect::ParamRead>& NodeAccess::params_read(
+    const Node& node) {
+  return node.impl_->params_read;
 }
 
 const config::RobotConfig& NodeAccess::robot_config(const Node& node) {
@@ -1214,6 +1236,7 @@ introspect::Description DescribeNode(const Node& node, std::string_view target,
     description.sources.push_back(std::move(source));
   }
   description.reads_graph = NodeAccess::reads_graph(node);
+  description.params = NodeAccess::params_read(node);
   return description;
 }
 

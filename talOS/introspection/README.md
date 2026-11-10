@@ -89,6 +89,19 @@ word with no registry layout or version change.
 `publish` checks node and topic names against `names.h` and prints findings to
 stderr without refusing publication. Timer labels are not checked as topics.
 
+## Describe
+
+`describe.h` writes and reads a node's `--describe` answer
+(`DescribeToJson`, `DescribeReader`; format version 1): its name, target,
+`reads_graph`, `params` and `sources`. `params` lists every parameter key the
+node's constructor read (`Node::param`, `param_of`; set in the config or not),
+in first-read order, as `{"subsystem": ..., "key": ...}`; the launcher refuses
+a subsystem key no node lists
+([parameter keys](../launcher/README.md#parameter-keys)). It is optional, so
+the version is unchanged: a describe without it (Studio's bridge writes its
+own, and a binary built before the field) reads as `params` nullopt, "not
+reported", which the launcher does not judge, while `[]` reports none.
+
 ## Who drives a subsystem
 
 Each `SelectionRecord` describes one Target's policy source names and its

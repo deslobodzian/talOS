@@ -187,10 +187,30 @@ inline SwerveGeometry BuildSwerveGeometry(
   return BuildSwerveGeometry(config, subsystem, *geometry);
 }
 
-// The geometry of the subsystem `node` runs as, from its config.
+// Declares to `node`'s --describe every [geometry] key BuildSwerveGeometry
+// reads, by reading it with Node::param (the launcher refuses a subsystem
+// key no node reads). Called only after BuildSwerveGeometry accepted the
+// table, so every present key already has the type read here, and the one
+// parser stays BuildSwerveGeometry's. A key it reads but this does not
+// declare fails the launch, not silently.
+inline void DeclareSwerveGeometry(const talos::Node& node) {
+  node.param<double>("geometry.wheel_radius_m");
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    const std::string entry = "geometry.modules[" + std::to_string(i) + "].";
+    for (const char* key : {"name", "drive", "steer", "encoder"})
+      node.param<std::string>(entry + key);
+    for (const char* key : {"x_m", "y_m"}) node.param<double>(entry + key);
+    node.param<double>(entry + "wheel_radius_m", 0.0);
+  }
+}
+
+// The geometry of the subsystem `node` runs as, from its config, with its
+// keys declared (DeclareSwerveGeometry).
 inline SwerveGeometry LoadSwerveGeometry(talos::Node& node) {
-  return BuildSwerveGeometry(node.extension<talos::HardwareLink>().config(),
-                             node.name());
+  SwerveGeometry geometry = BuildSwerveGeometry(
+      node.extension<talos::HardwareLink>().config(), node.name());
+  DeclareSwerveGeometry(node);
+  return geometry;
 }
 
 }  // namespace drivetrain

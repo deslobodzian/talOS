@@ -29,9 +29,9 @@ test = []
 # Sim-session viewer. Studio's bridge is a host-side process, not a robot
 # node, so it is not a [[subsystems]] entry. The launcher starts and
 # supervises it when asked (--start-studio-bridge, which sim.sh passes unless
-# --no-studio) and carries it in the declared graph. The watched topic is not
-# repeated here: the bridge reads [subsystems.telemetry] topic, the same key
-# the telemetry node reads. All keys optional; shown values are the defaults.
+# --no-studio) and carries it in the declared graph. It watches `topic`, the
+# telemetry node's byte topic (/talos/telemetry). All keys optional; shown
+# values are the defaults.
 [studio]
 bridge = "//studio/bridge:studio_bridge"
 http_port = 5800

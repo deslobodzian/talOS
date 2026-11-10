@@ -2,6 +2,7 @@
 
 import ctypes
 import enum
+import json
 import math
 import os
 from pathlib import Path
@@ -159,6 +160,38 @@ class RunTest(unittest.TestCase):
         result = subprocess.run([sys.executable, "-c", probe, ROBOT_TOML],
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+    def test_describe_reports_every_param_the_constructor_read(self):
+        # The launcher refuses a subsystem key no node reads, so a Python
+        # node's reads (set or not, its own table or another's) must reach
+        # --describe through the C ABI.
+        probe = textwrap.dedent("""
+            import sys, tempfile
+            import talos
+
+            class Probe:
+                def __init__(self, node):
+                    node.param("height_rot")
+                    node.param("absent_v", 0.0)
+                    node.param_of("follower", "gain", 1.0)
+
+            with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
+                config.write(sys.argv[1])
+                config.flush()
+                sys.exit(talos.run(Probe, "planner", "//talOS/python:probe",
+                                   ["probe", "--describe", "--config",
+                                    config.name]))
+        """)
+        result = subprocess.run([sys.executable, "-c", probe, ROBOT_TOML],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        described = json.loads(result.stdout[result.stdout.index("{"):])
+        self.assertEqual(described["params"], [
+            {"subsystem": "planner", "key": "height_rot"},
+            {"subsystem": "planner", "key": "absent_v"},
+            {"subsystem": "follower", "key": "gain"},
+        ])
 
 
 class BorrowedLifetimeTest(unittest.TestCase):

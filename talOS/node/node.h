@@ -141,7 +141,11 @@ class Node {
   // int64_t/int, double, std::string, or a TOML array as
   // std::vector<std::string> or std::vector<double> (integer elements
   // convert; an empty array is valid). A present key of the wrong type, or
-  // an array element of the wrong type, throws.
+  // an array element of the wrong type, throws. Reading a key in the
+  // constructor declares it, present or not: --describe reports every key
+  // the constructor read, and the launcher refuses a subsystem key that no
+  // node read (docs/NODE_DEVELOPMENT_GUIDE.md#parameters). A key read only
+  // after construction (update(), a callback) is not declared.
   template <class T>
   T param(std::string_view key, T fallback) const;
   template <class T>

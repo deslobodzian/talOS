@@ -285,10 +285,14 @@ A manifest entry may also set `node = "//...:target"`, which overrides the
 subsystem file's `node`, so one set of subsystem files can serve two manifests
 (see `examples/superstructure/config/`). A single-file `robot.toml` with
 `[subsystems.<name>]` tables also works; most test configs use it. Devices are
-addressed by name. A subsystem key the framework does not own is its node's
-parameter, so config load refuses only a framework section spelled in the
-singular (`target`, `motor`, `sensor`, ...), naming the key and its
-subsystem file (or `[subsystems.<name>]` in a single-file config).
+addressed by name. A subsystem key the framework does not own
+(`config::kFrameworkSubsystemKeys`) is a node's parameter, so config load
+refuses only a framework section spelled in the singular (`target`, `motor`,
+`sensor`, ...), naming the key and its subsystem file (or
+`[subsystems.<name>]` in a single-file config). A node declares its
+parameters by reading them in its constructor (`param`, `param_of`), which
+its `--describe` reports, and the launcher refuses a key no node read
+([parameter keys](talOS/launcher/README.md#parameter-keys)).
 Example configs carry placeholder CAN ids; the robot's config carries the
 physical ones and sets `commissioned = true` only after checking them.
 

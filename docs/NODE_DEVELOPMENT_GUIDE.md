@@ -30,6 +30,21 @@ Message, schema identity, relative topic and remapping contracts are in
 [Architecture: Topics and messages](../ARCHITECTURE.md#topics-and-messages)
 and [Configuration](../ARCHITECTURE.md#configuration).
 
+### Parameters
+
+A `param` or `param_of` call in the constructor declares its key, whether
+the config sets it or not (C++, Python and `talos.cpp_node` alike):
+`--describe` lists every key the constructor read, and the launcher refuses
+a key in a subsystem table that no node read, naming the subsystem, the
+key, the file that sets it and the nearest declared key
+([graph lint](../talOS/launcher/README.md#parameter-keys)). Framework keys
+(`config::kFrameworkSubsystemKeys`: `node`, `period_us`, `motors`,
+`targets`, ...) are not parameters. So read every key a config may set in
+the constructor, including those of a branch the config does not select (the
+pose estimator validates both backends' tables); a key read only in
+`update()` or a callback is undeclared, and a table read without `param`
+declares nothing.
+
 ### Threads
 
 A node belongs to the thread that builds it, which also runs its loop (a

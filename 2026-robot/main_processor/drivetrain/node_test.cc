@@ -18,11 +18,14 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "drivetrain/drivetrain.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/testing.h"
+#include "talOS/introspection/describe.h"
+#include "talOS/node/access.h"
 #include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
 
@@ -477,6 +480,40 @@ class DrivetrainTest : public ::testing::Test {
   SimHardware hw{sim};
   const SwerveGeometry geometry = Geometry();
 };
+
+// The geometry is parsed from the table, not through Node::param, so the
+// node declares it separately (DeclareSwerveGeometry). Every geometry key
+// the config sets must be among the node's declared reads, or the launcher
+// refuses the robot's own config.
+TEST_F(DrivetrainTest, DeclaresEveryGeometryKeyTheConfigSets) {
+  std::vector<std::string> declared;
+  for (const auto& read :
+       talos::detail::NodeAccess::params_read(sim.node("drivetrain"))) {
+    if (read.subsystem == "drivetrain") declared.push_back(read.key);
+  }
+  const auto config = Config();
+  const toml::table* table = config.GetSubsystemTable("drivetrain", "geometry");
+  ASSERT_NE(table, nullptr);
+  std::vector<std::string> set;
+  for (const auto& [key, value] : *table) {
+    if (key.str() != "modules") {
+      set.push_back("geometry." + std::string{key.str()});
+      continue;
+    }
+    const toml::array& modules = *value.as_array();
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+      for (const auto& [field, _] : *modules[i].as_table()) {
+        set.push_back("geometry.modules[" + std::to_string(i) + "]." +
+                      std::string{field.str()});
+      }
+    }
+  }
+  ASSERT_FALSE(set.empty());
+  for (const auto& key : set) {
+    EXPECT_NE(std::find(declared.begin(), declared.end(), key), declared.end())
+        << key;
+  }
+}
 
 TEST_F(DrivetrainTest, DrivesEveryModuleToAFreshTarget) {
   Teleop();
