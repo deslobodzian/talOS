@@ -11,6 +11,7 @@
 
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/node/sim_access.h"
 
@@ -384,6 +385,36 @@ TEST_F(SimHardwareTest, ResetAndRebootRefuseRequestsAsTheGatewayDoes) {
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "braked").demand, 40.0);
 
   EXPECT_THROW(hw.reset_device("mech", "led"), std::invalid_argument);
+}
+
+// The RoboRIO observes the mode every tick, delivered or not: a disable lost
+// in transit still ends the generation, so the next enabled packet is not
+// mistaken for a continuation of the one before the outage.
+TEST_F(SimHardwareTest, ModeChangeOnALostTickStartsANewGeneration) {
+  const auto mode_since_us = [&] {
+    const auto packet =
+        sim.latest<hardware::Packet>(hardware::kDriverStationTopic);
+    EXPECT_TRUE(packet.has_value());
+    driver_station::DriverStationData data{};
+    if (packet) EXPECT_TRUE(driver_station::Decode(packet->bytes(), data));
+    return data.mode_since_us;
+  };
+  driver_station::DriverStationData teleop{};
+  teleop.fms.flags = driver_station::kEnabled | driver_station::kTeleop |
+                     driver_station::kDsAttached;
+  driver_station::DriverStationData disabled = teleop;
+  disabled.fms.flags &= ~driver_station::kEnabled;
+
+  hw.set_driver_station(teleop);
+  sim.step(10ms);
+  const std::uint64_t before = mode_since_us();
+  ASSERT_NE(before, 0u);
+  hw.set_driver_station(disabled);
+  hw.lose_states(1);
+  sim.step(5ms);
+  hw.set_driver_station(teleop);
+  sim.step(5ms);
+  EXPECT_GT(mode_since_us(), before);
 }
 
 }  // namespace

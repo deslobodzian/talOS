@@ -270,7 +270,8 @@ class SimHardware:
 
     def lose_states(self, count):
         """The next `count` gateway ticks (and their sequence numbers) pass
-        with nothing published, as over a link outage."""
+        with nothing published, as over a link outage. Each lost tick still
+        observes the Driver Station mode, as the RoboRIO does."""
         _abi.ok(lib.talos_sim_hardware_lose_states(self._handle, int(count)))
 
     def reboot(self):

@@ -414,6 +414,10 @@ struct SimHardware::Impl {
          });
 
     if (lost_states > 0) {
+      // The RoboRIO samples the Driver Station mode every tick whether or not
+      // the packet arrives, so a mode change inside an outage still starts a
+      // new generation.
+      if (ds_packet) ds_mode.Observe(ds_packet->fms.flags, GatewayUs());
       --lost_states;
       return;
     }

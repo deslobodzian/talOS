@@ -18,7 +18,7 @@
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/devices/testing.h"
 #include "talOS/driver_station/driver_station.h"
-#include "talOS/hardware/packet.h"
+#include "talOS/hardware/messages.h"
 #include "talOS/node/testing.h"
 
 namespace driver {
@@ -87,15 +87,10 @@ can_id = 1
   }
   // The bridge goes silent: no more Driver Station packets.
   void Silence() { hw_.reset(); }
-  // Forwards one packet stamped as given (boot_id, sample_time_us,
-  // mode_since_us), for sequences SimHardware does not send; Silence() first.
-  void Forward(const ds::DriverStationData& state) {
-    talos::hardware::Packet packet{};
-    packet.size = static_cast<std::uint32_t>(ds::Encode(state, packet.data));
-    sim_.publish(talos::hardware::kDriverStationTopic, packet);
-    sim_.step(10ms);
-  }
   void Reconnect() { hw_ = std::make_unique<SimHardware>(sim_); }
+  // The next `count` gateway ticks reach nobody (5 ms each).
+  void LoseStates(int count) { hw_->lose_states(count); }
+  void Reboot() { hw_->reboot(); }
   // `omega_radps` is the rotation the drivetrain's modules measure.
   void PublishHeading(double yaw_rad, bool yaw_valid = true,
                       double omega_radps = 0) {
@@ -463,29 +458,21 @@ TEST(Driver, OwnEvaluationGapRequiresNeutralWithoutObservingStaleDs) {
 // reboot likewise starts a new generation, whatever its mode_since_us. Either
 // way a held stick must return to neutral before it drives.
 TEST(Driver, HeldStickWaitsForNeutralInEveryNewModeGeneration) {
-  Harness harness{kNoDeadbandRobotRelative, false};
-  harness.Silence();
-  std::uint64_t sample_time_us = 1'000'000;
-  auto forward = [&](std::uint64_t boot_id, std::uint64_t mode_since_us,
-                     float axis1) {
-    ds::DriverStationData state = DsState(kTeleopEnabled, Stick(0, axis1, 0));
-    state.boot_id = boot_id;
-    state.sample_time_us = sample_time_us += 10'000;
-    state.mode_since_us = mode_since_us;
-    harness.Forward(state);
-  };
-  forward(0xB0, 500'000, 0);
-  forward(0xB0, 500'000, -1);
+  Harness harness{kNoDeadbandRobotRelative};
+  const ds::DriverStationData held = DsState(kTeleopEnabled, Stick(0, -1, 0));
+  harness.Push(held);
   ASSERT_TRUE(harness.chassis_active());
-  struct Generation {
-    std::uint64_t boot_id, mode_since_us;
-  };
-  for (const Generation next : {Generation{0xB0, 900'000},     // lost disable
-                                Generation{0xB1, 900'000}}) {  // reboot
-    forward(next.boot_id, next.mode_since_us, -1);
+  for (const bool reboot : {false, true}) {
+    if (reboot) {
+      harness.Reboot();
+    } else {  // a disable lost in transit: both ticks of the next 10 ms
+      harness.LoseStates(2);
+      harness.Push(DsState(ds::kTeleop | ds::kDsAttached, Stick(0, -1, 0)));
+    }
+    harness.Push(held);
     EXPECT_FALSE(harness.chassis_active());
-    forward(next.boot_id, next.mode_since_us, 0);
-    forward(next.boot_id, next.mode_since_us, -1);
+    harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+    harness.Push(held);
     EXPECT_DOUBLE_EQ(harness.chassis().vx_mps(), kMaxLinear);
   }
 }

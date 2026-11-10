@@ -124,7 +124,9 @@ class SimHardware {
   void reset_device(std::string_view node, std::string_view device);
   // The next `count` gateway ticks happen (their sequence numbers are used)
   // but their States, Driver Station packets and /hw/status go nowhere, as
-  // over a link outage.
+  // over a link outage. Each lost tick still observes the Driver Station mode,
+  // as the RoboRIO does, so a mode change inside the outage starts a new
+  // generation on the next delivered packet.
   void lose_states(int count);
   // A RoboRIO reboot: every output goes neutral until a node sends a request
   // built from a State of the new boot, later states and Driver Station

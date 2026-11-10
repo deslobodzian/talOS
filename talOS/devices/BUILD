@@ -58,6 +58,7 @@ cc_test(
         ":devices",
         ":testing",
         "//talOS/configuration",
+        "//talOS/driver_station",
         "//talOS/hardware",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
