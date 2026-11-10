@@ -54,8 +54,10 @@ Example addresses and zero gains are not commissioned settings. After matching
 the manifest to the physical robot and tuning it, explicitly set the hardware
 `commissioned` flag. Until then telemetry is available but commands are
 refused.
-Only a loopback remote (`127.0.0.1`) may bypass commissioning; `--sim` rejects
-non-loopback remotes.
+On the main processor only `--sim` bypasses commissioning, in memory, and the
+bridge and every node apply it under that same flag: the bit is part of the
+configuration ID they compare. `--sim` rejects non-loopback remotes; a loopback
+remote without it keeps the configured value.
 
 Both endpoints compute a canonical configuration fingerprint. Changing a CAN
 address, offset, limit, or gain changes that ID; commands with a different ID

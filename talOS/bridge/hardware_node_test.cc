@@ -81,7 +81,7 @@ period_us = 5000
 dio = 3
 )";
 
-// The loopback node forces commissioned, which participates in the config ID.
+// A --sim node forces commissioned, which participates in the config ID.
 uint64_t NodeConfigId(const talos::config::RobotConfig& cfg) {
   Config hw = cfg.hardware;
   hw.commissioned = true;
@@ -327,16 +327,21 @@ can_id = 1
   EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
 }
 
-TEST(HardwareNodeTest, SimulationRejectsNonLoopback) {
+// Commissioning is forced by --sim alone, the flag every node also reads
+// (HardwareLink). A loopback bridge without --sim keeps the config's own id,
+// as nodes launched without --sim do, or they would drop every State.
+TEST(HardwareNodeTest, OnlySimulationForcesCommissioning) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   EXPECT_THROW((HardwareNode{cfg, "10.56.87.2", 5802, 5803, true}),
                std::invalid_argument);
+  const uint64_t own_id = ConfigurationId(cfg.hardware);
   HardwareNode real{cfg, "10.56.87.2"};
-  EXPECT_EQ(real.current_command().config_id, ConfigurationId(cfg.hardware));
+  EXPECT_EQ(real.current_command().config_id, own_id);
   HardwareNode loopback{cfg};
-  EXPECT_EQ(loopback.current_command().config_id, NodeConfigId(cfg));
-  EXPECT_NE(loopback.current_command().config_id,
-            real.current_command().config_id);
+  EXPECT_EQ(loopback.current_command().config_id, own_id);
+  HardwareNode simulation{cfg, "127.0.0.1", 5802, 5803, true};
+  EXPECT_EQ(simulation.current_command().config_id, NodeConfigId(cfg));
+  EXPECT_NE(NodeConfigId(cfg), own_id);
 }
 
 TEST(HardwareNodeTest, LatestRequestNeutralizesOmittedOutputs) {

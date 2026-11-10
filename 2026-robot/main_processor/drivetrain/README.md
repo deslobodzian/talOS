@@ -153,7 +153,7 @@ Start each command in a separate terminal:
 
 ```sh
 bazel run //2026-robot/main_processor/simulation:sim_gateway -- --config "$PWD/2026-robot/main_processor/configuration/robot.toml"
-bazel run //talOS/bridge:hardware_node -- --config "$PWD/2026-robot/main_processor/configuration/robot.toml"
+bazel run //talOS/bridge:hardware_node -- --config "$PWD/2026-robot/main_processor/configuration/robot.toml" --sim
 bazel run //2026-robot/main_processor/drivetrain:node -- --config "$PWD/2026-robot/main_processor/configuration/robot.toml" --sim --log /tmp/drivetrain.tlog
 bazel run //2026-robot/main_processor/drivetrain:send_target -- 1 0 0 2
 ```

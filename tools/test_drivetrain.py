@@ -137,8 +137,10 @@ class Scenario:
 
     def start_bridge(self, bridge_seconds):
         # --config is required: without it the bridge exits with a usage error
-        # before any simulation traffic exists.
-        self.start("bridge", [str(self.bridge),
+        # before any simulation traffic exists. --sim, as on the node, treats
+        # the config as commissioned; one without the other would give them
+        # different config ids, and the node would drop every State.
+        self.start("bridge", [str(self.bridge), "--sim",
                               "--config", str(self.config),
                               "--duration-s", str(bridge_seconds)])
 

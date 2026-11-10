@@ -43,9 +43,11 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
     throw std::invalid_argument(
         "--sim requires --remote 127.0.0.1, got --remote " + remote_ip_);
   }
-  if (remote_ip_ == "127.0.0.1") {
-    config_.commissioned = true;
-  }
+  // Simulation stands in for commissioned hardware, in memory only. Nodes do
+  // the same under the same --sim flag (HardwareLink), and the commissioned
+  // bit is part of the config id both ends compare: the loopback address
+  // alone must not decide it, since nodes never see the remote.
+  if (simulation_) config_.commissioned = true;
   config_id_ = ConfigurationId(config_);
   // Heartbeat keeps a live-but-unchanged merge refreshing the gateway at 5x
   // margin inside the command timeout, whatever the config chose. The clamp
