@@ -61,14 +61,27 @@ class MatchRehearsal(unittest.TestCase):
         kill_ns = None
         paused = None
         success = False
+        # The gateway's schedules and the harness's signals share one
+        # node-clock time zero, which the harness picks only once every node's
+        # loop runs, so slow startup delays the match instead of eating into
+        # it. The gateway holds its time-zero state (disabled, centered stick)
+        # until then.
+        start_file = tmp / "schedule_start"
         try:
             (tmp / "bazel-bin").symlink_to(root, target_is_directory=True)
+            # Nodes stamp records with CLOCK_MONOTONIC_RAW on macOS, which
+            # counts host sleep; time.monotonic does not. Their difference
+            # grows only while the host sleeps (on Linux both are the same).
+            clock_skew_ns = support.node_clock_ns() - time.monotonic_ns()
             args = [str(root / "talOS/launcher/launcher"), "--config", str(config),
                     "--sim", "--start-sim-gateway", "--remote", "127.0.0.1",
                     "--remote-port", str(gw_port), "--local-port", str(bridge_port),
-                    "--output-dir", str(output), "--duration-s", "17"]
+                    # A backstop only: the harness stops the session itself
+                    # 17 s after the start it picks.
+                    "--output-dir", str(output), "--duration-s", "120"]
             gateway_args = [
                 "--physics", "--port", str(gw_port), "--remote-port", str(bridge_port),
+                "--schedule-start-file", str(start_file),
                 "--mode-schedule", "disabled:1,auto:4,disabled:1,teleop:9,disabled:2",
                 "--joystick-schedule",
                 "0:axes=0,0,0;buttons=0;pov=-1|"
@@ -83,31 +96,34 @@ class MatchRehearsal(unittest.TestCase):
                 launcher = subprocess.Popen(args, cwd=tmp, env=env, stdout=log,
                                             stderr=subprocess.STDOUT,
                                             start_new_session=True)
-                deadline = time.monotonic() + 20
+                # The gateway spawns last; a node creates its log once its
+                # loop starts. Construction may take the launcher's 30 s
+                # deadline, so wait past it.
+                deadline = time.monotonic() + 40
                 while time.monotonic() < deadline:
                     manifests = list(output.glob("*/manifest.json"))
                     if manifests:
                         manifest_path = manifests[0]
                         manifest = json.loads(manifest_path.read_text())
                         nodes = {n["name"]: n for n in manifest["nodes"]}
-                        if nodes.get("sim_gateway", {}).get("pid", 0) > 0:
+                        if (nodes.get("sim_gateway", {}).get("pid", 0) > 0 and
+                                all(Path(n["log_paths"][-1]).exists()
+                                    for n in nodes.values() if n.get("log_paths"))):
                             break
                     self.assertIsNone(launcher.poll(), "launcher exited during startup")
                     time.sleep(0.01)
                 else:
-                    self.fail("gateway never started")
-                # Time zero is when the harness sees the gateway's pid in the
-                # manifest, which can trail the gateway's own schedule start
-                # (its mode and stick times) by up to a second; the recording
-                # checks below that this lag left the schedule intact.
-                anchor = time.monotonic()
-                # Nodes stamp records with CLOCK_MONOTONIC_RAW on macOS, which
-                # counts host sleep; time.monotonic does not. Their difference
-                # grows only while the host sleeps (on Linux both are the same).
-                clock_skew_ns = support.node_clock_ns() - time.monotonic_ns()
+                    self.fail("the stack never started")
+                # One second for the gateway to read the start and the stack to
+                # receive a disabled packet before it.
+                start_ns = support.node_clock_ns() + 1_000_000_000
+                pending = start_file.with_suffix(".tmp")
+                pending.write_text(str(start_ns))
+                pending.replace(start_file)  # atomic: the gateway reads all or none
 
                 def at(seconds):
-                    time.sleep(max(0, anchor + seconds - time.monotonic()))
+                    time.sleep(max(0, (start_ns + seconds * 1e9 -
+                                       support.node_clock_ns()) / 1e9))
                     self.assertIsNone(launcher.poll(), "launcher exited during match")
 
                 # Freeze the producer before killing the consumer: its restarted
@@ -133,6 +149,8 @@ class MatchRehearsal(unittest.TestCase):
                 resume_ns = support.node_clock_ns()
                 os.kill(paused, signal.SIGCONT)
                 paused = None
+                at(17)
+                launcher.send_signal(signal.SIGINT)
                 launcher.wait(timeout=15)
                 slept_ms = (support.node_clock_ns() - time.monotonic_ns() -
                             clock_skew_ns) / 1e6
@@ -165,9 +183,9 @@ class MatchRehearsal(unittest.TestCase):
             (tmp / "match.jsonl").write_text(dumped.stdout)
             rows = [json.loads(line) for line in dumped.stdout.splitlines()]
             baseline = support.log_baseline_ns(session)
-            kill, first_resume, stop, resume = [
+            start, kill, first_resume, stop, resume = [
                 (stamp - baseline) / 1e6 for stamp in
-                (kill_ns, first_resume_ns, stop_ns, resume_ns)]
+                (start_ns, kill_ns, first_resume_ns, stop_ns, resume_ns)]
             requests = [r for r in rows if r["process"] == "drivetrain" and
                         r["topic"] == "/hw/request/drivetrain" and r["kind"] == "SEND"]
             ds = [r for r in rows if r["process"] == "intake" and
@@ -184,21 +202,29 @@ class MatchRehearsal(unittest.TestCase):
             print(f"largest Driver Station receipt gap: {gap:.1f} ms at {at:.1f} ms",
                   flush=True)
             self.assertLess(gap, 1000, "Driver Station stream outage")
+            # The schedule opens with 1 s disabled; the stack must be up
+            # before it ends, or the phases below lose their first entry.
+            self.assertLess(ds_times[0], start + 1000,
+                            f"first Driver Station receipt {ds_times[0] - start:.0f} ms "
+                            f"after the schedule start")
             phases = []
             for row in ds:
                 flags, _ = support.ds_snapshot(row)
                 if not phases or phases[-1][1] != flags:
                     phases.append((row["now_ms"], flags))
             self.assertEqual([f for _, f in phases], [1, 13, 1, 21, 1])
-            # The second producer pause ends 12.25 s after the harness's time
-            # zero; the gateway centers the stick 13 s after its own (7 s into
-            # teleop). The center-to-rearm checks below need the pause over at
-            # least 100 ms before the stick centers.
-            anchor_lag = resume - phases[3][0] - 6250
-            self.assertLess(resume, phases[3][0] + 7000 - 100,
-                            f"harness time zero trailed the gateway's schedule by "
-                            f"about {anchor_lag:.0f} ms; the producer pause ended "
-                            f"too close to the stick centering")
+            # The gateway switches to autonomous 1 s after the shared start;
+            # the receipt may trail it by drain latency, never precede it.
+            auto_lag = phases[1][0] - (start + 1000)
+            self.assertTrue(0 <= auto_lag < 1000,
+                            f"autonomous began {auto_lag:.0f} ms after the gateway's "
+                            f"scheduled time; it did not honor --schedule-start-file")
+            # The second producer pause ends 12.25 s after the shared start and
+            # the gateway centers the stick at 13 s. The center-to-rearm checks
+            # below need the pause over at least 100 ms before the centering.
+            self.assertLess(resume, start + 13000 - 100,
+                            f"the harness resumed the producer {resume - start - 12250:.0f} "
+                            f"ms late, too close to the stick centering")
             # SIGKILL loses the killed process's unflushed recording (up to
             # one recorder chunk), so pre-kill actuation is read from what the
             # bridge actually sent to the gateway.

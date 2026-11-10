@@ -150,6 +150,30 @@ inline void ResolveFaults(std::vector<FaultEvent>& events,
   }
 }
 
+// A gateway joining its schedule partway (its start already past) treats the
+// intervals that ended before it joined as history: none of them acts, so a
+// past `reset` is not a spurious device reset. Call once, when it joins.
+inline void SkipPastFaults(std::vector<FaultEvent>& events, double elapsed_s) {
+  for (auto& event : events) {
+    if (event.end_s <= elapsed_s) event.finished = true;
+  }
+}
+
+// The schedule start a harness writes for --schedule-start-file: a node-clock
+// time in decimal nanoseconds, optionally followed by one newline.
+inline int64_t ParseScheduleStart(std::string text) {
+  if (text.ends_with('\n')) text.pop_back();
+  const bool digits = !text.empty() && text.size() <= 18 &&
+                      std::all_of(text.begin(), text.end(),
+                                  [](char c) { return c >= '0' && c <= '9'; });
+  if (!digits) {
+    throw std::invalid_argument(
+        "schedule start must be a non-negative integer nanosecond time, got '" +
+        text + "'");
+  }
+  return std::stoll(text);
+}
+
 inline bool ApplyFaults(std::vector<FaultEvent>& events, double elapsed_s,
                         talos::hardware::sim::PhysicsSimBackend& backend) {
   bool blackout = false;

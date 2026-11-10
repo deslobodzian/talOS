@@ -1,9 +1,12 @@
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <random>
 #include <string>
@@ -40,7 +43,8 @@ constexpr const char* kUsage =
     "[--mode-schedule mode:seconds,...] [--alliance blue|red] "
     "[--joystick-schedule 'time:axes=...;buttons=MASK;pov=DEG|...'] "
     "[--fault-schedule 'start:end:kind:target[:volts]|...'] "
-    "[--port N] [--remote-port N] [--session-id N]";
+    "[--schedule-start-file PATH] [--port N] [--remote-port N] [--session-id "
+    "N]";
 
 // Shared-memory slot contract: docs/DATA_FLOW.md.
 static_assert(sizeof(geometry::OdometrySample) == 56);
@@ -122,6 +126,9 @@ int main(int argc, char** argv) {
     ds::Alliance alliance = ds::Alliance::kBlue;
     bool physics_options = false;
     uint64_t session_id = 0;
+    // Where a harness writes the node-clock time the schedules count from;
+    // unset, they count from the loop's start.
+    std::optional<std::string> schedule_start_file;
     talos::hardware::sim::PhysicsOptions options{.start_x_m = 2.0,
                                                  .start_y_m = 2.0};
     const char* config_path = nullptr;
@@ -160,6 +167,8 @@ int main(int argc, char** argv) {
           throw std::invalid_argument(
               "--session-id must be an unsigned integer");
         }
+      } else if (arg == "--schedule-start-file" && i + 1 < argc) {
+        schedule_start_file = argv[++i];
       } else if (arg == "--port" && i + 1 < argc) {
         local_port = Port(argv[++i]);
       } else if (arg == "--remote-port" && i + 1 < argc) {
@@ -250,8 +259,13 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "sim_gateway: node registry unavailable: %s\n",
                    e.what());
     }
-    const auto start = std::chrono::steady_clock::now();
-    auto next = start;
+    auto next = std::chrono::steady_clock::now();
+    // The mode, joystick and fault schedules and --duration-s count from one
+    // node-clock time zero, so a harness that chose it times its own actions
+    // from the same instant. Until it is known and reached, the gateway holds
+    // the schedules' time-zero state.
+    std::optional<int64_t> start_ns;
+    if (!schedule_start_file) start_ns = talos::event::Poller::now().nanos();
     std::size_t phase = 0;
     std::size_t joystick_event = 0;
     ds::ModeTracker mode_tracker;
@@ -269,12 +283,36 @@ int main(int argc, char** argv) {
     int64_t last_truth_ns = 0;
     while (!talos::process::stop_requested.load()) {
       const auto tick_time = std::chrono::steady_clock::now();
-      const double elapsed_s =
-          std::chrono::duration<double>(tick_time - start).count();
+      if (!start_ns) {
+        // Written atomically by the harness (rename), so a read sees all of
+        // it or no file.
+        std::ifstream file{*schedule_start_file};
+        if (file) {
+          try {
+            start_ns = robot::simulation::ParseScheduleStart(
+                std::string{std::istreambuf_iterator<char>{file}, {}});
+          } catch (const std::invalid_argument& e) {
+            throw std::invalid_argument(*schedule_start_file + ": " + e.what());
+          }
+          const int64_t late_ns =
+              talos::event::Poller::now().nanos() - *start_ns;
+          if (late_ns > 0) {
+            std::fprintf(stderr,
+                         "sim_gateway: schedule start is %.1f ms in the past\n",
+                         static_cast<double>(late_ns) / 1e6);
+            robot::simulation::SkipPastFaults(
+                faults, static_cast<double>(late_ns) / 1e9);
+          }
+        }
+      }
+      const int64_t since_ns =
+          start_ns ? std::max<int64_t>(
+                         0, talos::event::Poller::now().nanos() - *start_ns)
+                   : 0;
+      const auto elapsed = std::chrono::floor<std::chrono::microseconds>(
+          std::chrono::nanoseconds{since_ns});
+      const double elapsed_s = std::chrono::duration<double>(elapsed).count();
       if (duration_s > 0 && elapsed_s >= duration_s) break;
-      const auto elapsed =
-          std::chrono::duration_cast<std::chrono::microseconds>(tick_time -
-                                                                start);
       while (phase + 1 < phases.size() && elapsed >= phases[phase].end) {
         ++phase;
       }

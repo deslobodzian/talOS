@@ -40,11 +40,24 @@ starts, matching the RoboRIO, even when physics and hardware snapshots run at
 `--port N` selects the gateway's loopback UDP listening port (default 5802);
 `--remote-port N` selects the bridge's receiving port (default 5803). Tests
 choose ephemeral ports so independent simulated stacks do not share sockets.
+The schedules and `--duration-s` count from one time zero on the
+main-processor node clock (`talos::event::Poller::now()`: `CLOCK_MONOTONIC` on
+Linux, `CLOCK_MONOTONIC_RAW` on macOS, which counts host sleep). By default it
+is the gateway's loop start. `--schedule-start-file PATH` instead takes it from
+`PATH`, which a harness writes (atomically, by rename) with the time in
+decimal nanoseconds, so it can start the match once the stack is up and time
+its own actions from the same instant. Until the file exists and its time
+arrives, the gateway holds the schedules' time-zero state (first mode phase,
+time-0 joystick and fault events). Content that is not a non-negative integer
+stops the gateway with an error naming the file. A start already past (logged
+to stderr) joins the schedule partway, as does a restarted gateway: fault
+intervals that already ended are skipped, not replayed.
 
 ## Scripted joystick and fault schedules
 
-Both schedules use seconds since the gateway's loop starts and run alongside
-`--mode-schedule`. Quote the argument so the shell does not interpret `|` or `;`.
+Both schedules use seconds since the schedule's time zero (above) and run
+alongside `--mode-schedule`. Quote the argument so the shell does not
+interpret `|` or `;`.
 
 `--joystick-schedule 'time:axes=A0,A1,...;buttons=MASK;pov=DEG|...'`
 sets complete, connected joystick-0 snapshots. Times must be in `[0, 1e9]` s
@@ -209,11 +222,15 @@ and teleop mechanism actuation, clean manifest closure, and all nodes'
 recorder/exit status. Each actuator owner must send one request per period
 from the first Driver Station receipt to the bridge's last command, less 1 s
 (the recording a `SIGKILL` discards) and, for drivetrain, its restart gap.
-The harness times its signals from when it sees the gateway's pid, which can
-trail the gateway's schedule; the test fails naming that lag if the second
-pause does not end at least 100 ms before the stick centers, and fails with
-`host slept N ms; rerun` if the host slept during the match (on macOS node
-time counts sleep and the harness's does not). Failure artifacts are retained.
+Once every node's loop runs (its log exists) and the gateway is up, the
+harness writes a node-clock start 1 s ahead to the gateway's
+`--schedule-start-file`, times its signals from it and stops the session 17 s
+after it. It fails naming the delay if the first Driver Station receipt misses
+the opening disabled second, if autonomous does not begin within 1 s after
+its scheduled time, or if the second pause does not end at least 100 ms
+before the stick centers, and fails with `host slept N ms; rerun` if the host
+slept during the match (on macOS node time counts sleep and the harness's
+does not). Failure artifacts are retained.
 
 Run the independent rehearsal three times for a stability check:
 

@@ -109,6 +109,33 @@ TEST(Schedules, LimitSwitchIntervalsPressTheMotorsSwitch) {
   EXPECT_EQ(flags_at(3), 0u);
 }
 
+// A gateway that joins its schedule partway must not replay what already
+// ended (a spurious device reset), yet still applies an interval in progress.
+TEST(Schedules, JoiningPartwaySkipsEndedFaultsOnly) {
+  talos::hardware::Config config;
+  config.motors.push_back({.id = 1, .name = "drive", .can_id = 1});
+  talos::hardware::sim::PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(config));
+  auto events = ParseFaults("1:2:reset:drive|2:4:motor_disconnect:drive");
+  ResolveFaults(events, config);
+  SkipPastFaults(events, 3);
+  ApplyFaults(events, 3, backend);
+  std::vector<uint16_t> resets;
+  EXPECT_FALSE(backend.PollDeviceResets(resets));
+  talos::hardware::State state;
+  ASSERT_FALSE(backend.Read(state));
+  EXPECT_FALSE(state.motors[0].valid);
+}
+
+TEST(Schedules, ScheduleStartIsANonNegativeIntegerTime) {
+  EXPECT_EQ(ParseScheduleStart("0"), 0);
+  EXPECT_EQ(ParseScheduleStart("123456789012\n"), 123456789012);
+  for (const auto* text : {"", "\n", "-5", "+5", "1.5", "12abc", " 1", "abc",
+                           "1234567890123456789"}) {
+    EXPECT_THROW(ParseScheduleStart(text), std::invalid_argument) << text;
+  }
+}
+
 TEST(Schedules, AdjacentFaultsRestoreBeforeActivatingInAnyInputOrder) {
   talos::hardware::Config config;
   config.motors.push_back({.id = 1, .name = "drive", .can_id = 1});
