@@ -676,11 +676,17 @@ void HardwareNode::LogPacket(uint16_t source_id, const Packet& packet,
   const event::Context context{.event_time = now, .now = now};
   log_->send(context, source_id,
              std::as_bytes(std::span{&packet, std::size_t{1}}), 0, sequence);
-  if (log_->capture_stopped() && !log_failure_reported_) {
-    std::fprintf(stderr, "hardware_node: log capture stopped: %s\n",
-                 log_->error().c_str());
-    log_failure_reported_ = true;
-  }
+  ReportLogFailure();
+}
+
+void HardwareNode::ReportLogFailure() {
+  // The writer thread creates the file, so an open failure surfaces as
+  // failed(), not capture_stopped(); report either once, with its reason.
+  if (!log_ || log_failure_reported_) return;
+  if (!log_->capture_stopped() && !log_->failed()) return;
+  std::fprintf(stderr, "hardware_node: log capture stopped: %s\n",
+               log_->error().c_str());
+  log_failure_reported_ = true;
 }
 
 bool HardwareNode::ShouldSendCommand(uint64_t now_us) {
@@ -750,7 +756,14 @@ int HardwareNode::Run(int duration_s) {
                 name.c_str(), static_cast<unsigned long long>(tracker.requests),
                 tracker.timed_out ? 1 : 0);
   }
-  return states_received_ > 0 ? 0 : 1;
+  // A log that failed exits 1, as RunMain does for event-loop nodes.
+  bool log_failed = false;
+  if (log_) {
+    log_->flush();
+    ReportLogFailure();
+    log_failed = log_->failed();
+  }
+  return states_received_ > 0 && !log_failed ? 0 : 1;
 }
 
 bool HardwareNode::HasRequestIdentity(const SubsystemTracker& tracker,

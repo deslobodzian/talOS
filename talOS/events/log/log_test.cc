@@ -743,8 +743,9 @@ TEST(LogBackgroundWriter, ProducerNeverWaitsForTheLogFile) {
   }};
   producer.join();
   EXPECT_FALSE(waited) << "the producer blocked until the log file opened";
+  // No failed() check: Linux's fsync() refuses a FIFO (EINVAL), so the
+  // durable flush reports an error there. The bytes below are the invariant.
   writer->flush();
-  EXPECT_FALSE(writer->failed()) << writer->error();
   writer.reset();  // Closes the FIFO: the reader sees its end.
   consumer.join();
   ::unlink(path.c_str());

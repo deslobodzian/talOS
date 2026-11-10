@@ -279,8 +279,8 @@ A run whose event log stops early says so in its registry row while it runs
 (see [event log state](../introspection/README.md#event-log-state)). A node
 creates its log on the writer thread once its loop starts, never on the loop
 thread, so one whose log cannot be created (a missing or unwritable session
-directory) keeps running with its row flagged, and exits 1 when stopped. The
-launcher prints one line per member and kind, and marks the member in the live
+directory) keeps running with its row flagged, and exits 1 when stopped; the
+hardware bridge also prints the reason once. The launcher prints one line per member and kind, and marks the member in the live
 manifest: `recorder_failed` for a failed log, `log_capped` for one whose byte
 share cost it records (its oldest segment deleted, or, with a share too small
 for two segments, capture stopped at the share). At normal shutdown it also

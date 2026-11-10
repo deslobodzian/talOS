@@ -166,6 +166,9 @@ class HardwareNode {
   bool ShouldSendCommand(uint64_t now_us);
   void LogPacket(uint16_t source_id, const Packet& packet, uint64_t now_us,
                  uint64_t sequence);
+  // Prints the packet log's error once, whether capture stopped or the log
+  // failed (e.g. its file could not be created).
+  void ReportLogFailure();
 
   config::RobotConfig robot_config_;
   Config config_;
