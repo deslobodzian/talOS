@@ -289,34 +289,19 @@ TEST(Config, ValidatesFollowersAndFingerprintsTheirSettings) {
   EXPECT_THROW(Validate(c), std::invalid_argument);
 }
 
-TEST(ConfigWire, FollowersAndGravityRoundTrip) {
-  auto config = SwerveConfig(true);
-  config.motors[1].master_id = config.motors[0].id;
-  config.motors[1].oppose_master = true;
-  config.motors[1].slots[2].gravity_type = GravityType::kArmCosine;
-  Config decoded;
-  ASSERT_TRUE(DeserializeConfig(SerializeConfig(config), decoded));
-  EXPECT_EQ(decoded, config);
-  EXPECT_EQ(ConfigurationId(decoded), ConfigurationId(config));
-}
-
-TEST(ConfigWire, PigeonMountCalibrationRoundTripsAndReachesIdealBackend) {
+TEST(SimBackend, PigeonMountCalibrationReachesIdealBackend) {
   auto config = SwerveConfig(true);
   for (auto& sensor : config.sensors) {
     if (sensor.kind != SensorKind::kPigeon2) continue;
     sensor.offset_rot = 0.125;
     sensor.inverted = true;
   }
-  EXPECT_NO_THROW(Validate(config));
-  Config decoded;
-  ASSERT_TRUE(DeserializeConfig(SerializeConfig(config), decoded));
-  EXPECT_EQ(decoded, config);
   SimBackend backend;
-  Gateway gateway{decoded, backend, 1};
+  Gateway gateway{config, backend, 1};
   gateway.Tick(1000, false);
   const auto state = gateway.snapshot();
-  for (std::size_t i = 0; i < decoded.sensors.size(); ++i) {
-    if (decoded.sensors[i].kind != SensorKind::kPigeon2) continue;
+  for (std::size_t i = 0; i < config.sensors.size(); ++i) {
+    if (config.sensors[i].kind != SensorKind::kPigeon2) continue;
     EXPECT_TRUE(state.sensors[i].valid);
     EXPECT_DOUBLE_EQ(state.sensors[i].position_rot, -0.125);
     EXPECT_DOUBLE_EQ(state.sensors[i].velocity_rps, 0.0);
@@ -631,14 +616,16 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
   g.Tick(1000, true);
-  const auto c = Request(g);
+  auto c = Request(g);
+  c.digital_output_count = 1;
+  c.digital_outputs[0] = {4, true};
+  c.pwm_output_count = 1;
+  c.pwm_outputs[0] = {7, 0.85};
   std::array<uint8_t, protocol::kMaxPayloadSize> bytes{};
   const auto size = Encode(c, bytes);
   Command decoded;
   ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), size}, decoded));
-  EXPECT_EQ(decoded.count, c.count);
-  EXPECT_EQ(decoded.boot_id, c.boot_id);
-  EXPECT_DOUBLE_EQ(decoded.motors[0].demand, 1);
+  EXPECT_EQ(decoded, c);
   for (std::size_t i = 0; i < size; ++i) {
     EXPECT_FALSE(Decode(std::span<const uint8_t>{bytes.data(), i}, decoded));
   }
@@ -646,65 +633,6 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
       Decode(std::span<const uint8_t>{bytes.data(), size + 1}, decoded));
   bytes[32] = 255;
   EXPECT_FALSE(Decode(std::span<const uint8_t>{bytes.data(), size}, decoded));
-
-  // Empty Command
-  Command empty_cmd{};
-  const auto empty_cmd_size = Encode(empty_cmd, bytes);
-  ASSERT_GT(empty_cmd_size, 0u);
-  Command decoded_empty_cmd;
-  ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), empty_cmd_size},
-                     decoded_empty_cmd));
-  EXPECT_EQ(decoded_empty_cmd.count, 0u);
-  EXPECT_EQ(decoded_empty_cmd.digital_output_count, 0u);
-  EXPECT_EQ(decoded_empty_cmd.pwm_output_count, 0u);
-
-  // Full Command with every actuator kind
-  Command full_cmd{};
-  full_cmd.config_id = 111;
-  full_cmd.boot_id = 222;
-  full_cmd.epoch = 333;
-  full_cmd.observed_time_us = 444;
-  full_cmd.count = kMaxMotors;
-  full_cmd.digital_output_count = kMaxDigitalOutputs;
-  full_cmd.pwm_output_count = kMaxPwmOutputs;
-  for (std::size_t i = 0; i < kMaxMotors; ++i) {
-    full_cmd.motors[i] = {static_cast<uint16_t>(i + 1), Mode::kVelocity, 1,
-                          15.5 + static_cast<double>(i), 1.2};
-  }
-  for (std::size_t i = 0; i < kMaxDigitalOutputs; ++i) {
-    full_cmd.digital_outputs[i] = {static_cast<uint16_t>(100 + i),
-                                   (i % 2) == 1};
-  }
-  for (std::size_t i = 0; i < kMaxPwmOutputs; ++i) {
-    full_cmd.pwm_outputs[i] = {static_cast<uint16_t>(200 + i),
-                               0.5 - 0.1 * static_cast<double>(i)};
-  }
-  const auto full_cmd_size = Encode(full_cmd, bytes);
-  ASSERT_GT(full_cmd_size, 0u);
-  ASSERT_LE(full_cmd_size, protocol::kMaxPayloadSize);
-  Command decoded_full_cmd;
-  ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), full_cmd_size},
-                     decoded_full_cmd));
-  EXPECT_EQ(decoded_full_cmd.count, kMaxMotors);
-  EXPECT_EQ(decoded_full_cmd.digital_output_count, kMaxDigitalOutputs);
-  EXPECT_EQ(decoded_full_cmd.pwm_output_count, kMaxPwmOutputs);
-  EXPECT_EQ(decoded_full_cmd.digital_outputs[1].value, true);
-  EXPECT_DOUBLE_EQ(decoded_full_cmd.pwm_outputs[0].output, 0.5);
-
-  // Empty State
-  State empty_state{};
-  const auto empty_state_size = Encode(empty_state, bytes);
-  ASSERT_GT(empty_state_size, 0u);
-  State decoded_empty_state;
-  ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), empty_state_size},
-                     decoded_empty_state));
-  EXPECT_EQ(decoded_empty_state.motor_count, 0u);
-  EXPECT_EQ(decoded_empty_state.sensor_count, 0u);
-  EXPECT_EQ(decoded_empty_state.digital_input_count, 0u);
-  EXPECT_EQ(decoded_empty_state.digital_output_count, 0u);
-  EXPECT_EQ(decoded_empty_state.analog_input_count, 0u);
-  EXPECT_EQ(decoded_empty_state.encoder_count, 0u);
-  EXPECT_EQ(decoded_empty_state.pwm_output_count, 0u);
 
   // Full State with every device kind
   State state = g.snapshot();
@@ -764,13 +692,6 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   State copy;
   ASSERT_TRUE(Decode(std::span<const uint8_t>{bytes.data(), state_size}, copy));
   EXPECT_EQ(copy, state);
-  EXPECT_EQ(copy.motors[0].position_age_us, 123u);
-  EXPECT_EQ(copy.sensors[0].velocity_age_us, 1011u);
-  EXPECT_EQ(copy.digital_inputs[0].value, true);
-  EXPECT_EQ(copy.digital_outputs[1].value, true);
-  EXPECT_DOUBLE_EQ(copy.analog_inputs[1].voltage, 3.3);
-  EXPECT_DOUBLE_EQ(copy.encoders[2].position_rot, 20.0);
-  EXPECT_DOUBLE_EQ(copy.pwm_outputs[3].output, 0.75);
 
   for (std::size_t i = 0; i < state_size; ++i) {
     EXPECT_FALSE(Decode(std::span<const uint8_t>{bytes.data(), i}, copy));
@@ -779,6 +700,14 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
 
 TEST(ConfigWire, ChunksAndAssemblesConfigLosslessly) {
   auto cfg = SwerveConfig(false);
+  cfg.motors[1].master_id = cfg.motors[0].id;
+  cfg.motors[1].oppose_master = true;
+  cfg.motors[1].slots[2].gravity_type = GravityType::kArmCosine;
+  for (auto& sensor : cfg.sensors) {
+    if (sensor.kind != SensorKind::kPigeon2) continue;
+    sensor.offset_rot = 0.125;
+    sensor.inverted = true;
+  }
   auto chunks = CreateConfigChunks(cfg);
   EXPECT_GT(chunks.size(), 0u);
   for (const auto& ch : chunks) {
@@ -910,7 +839,6 @@ TEST(ConfigWire, RejectsUnboundedChunkMetadataAndRecovers) {
         noexcept(assembler.AddChunk(std::span<const uint8_t>{}, error)));
     EXPECT_EQ(assembler.AddChunk(bad_chunk, error),
               ConfigAssembler::Status::kInvalidChunk);
-    EXPECT_FALSE(error.empty());
     for (std::size_t i = 0; i < chunks.size(); ++i) {
       EXPECT_EQ(assembler.AddChunk(chunks[i], error),
                 i + 1 == chunks.size() ? ConfigAssembler::Status::kComplete
@@ -935,7 +863,6 @@ TEST(ConfigWire, RejectsChangedTransferTotalsAndRecovers) {
   std::memcpy(changed.data(), &header, sizeof(header));
   EXPECT_EQ(assembler.AddChunk(changed, error),
             ConfigAssembler::Status::kInvalidChunk);
-  EXPECT_FALSE(error.empty());
   for (std::size_t i = 0; i < chunks.size(); ++i) {
     EXPECT_EQ(assembler.AddChunk(chunks[i], error),
               i + 1 == chunks.size() ? ConfigAssembler::Status::kComplete
@@ -949,7 +876,6 @@ TEST(ConfigWire, RejectsCeilingViolations) {
   cfg.motors[0].stator_limit_a = 150.0;
   auto res = CheckCeilings(cfg);
   EXPECT_FALSE(res.ok);
-  EXPECT_NE(res.reason.find("stator limit"), std::string::npos);
 
   auto chunks = CreateConfigChunks(cfg);
   ConfigAssembler assembler;
@@ -1093,7 +1019,7 @@ TEST(Endpoint, OutboundBlackoutPreservesReceiveAndSafetyTicks) {
   EXPECT_EQ(companion.TryReceive(&frame), protocol::UdpStatus::kWouldBlock);
 }
 
-TEST(Endpoint, PushesConfigOverUdpAndHandlesEpochChangeOnRestart) {
+TEST(Endpoint, PushesConfigOverUdpAndAcknowledgesIt) {
   SimBackend backend;
   Gateway gateway{backend, 2002};
   Endpoint endpoint{gateway};

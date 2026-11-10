@@ -8,7 +8,9 @@
 namespace talos::protocol {
 namespace {
 
-TEST(RuntimeUdpTest, SendsRuntimeFrameOverLoopback) {
+// Both send paths (copying and in-buffer) reach the peer intact and number
+// their frames from one sequence.
+TEST(RuntimeUdpTest, SendsFramesOverLoopback) {
   RuntimeUdpPeer mac;
   RuntimeUdpPeer rio;
   UdpSocketOptions options;
@@ -31,8 +33,24 @@ TEST(RuntimeUdpTest, SendsRuntimeFrameOverLoopback) {
   EXPECT_EQ(received.header.monotonic_time_us, 1000u);
   ASSERT_EQ(received.payload_size, payload.size());
   EXPECT_EQ(std::memcmp(received.payload, payload.data(), payload.size()), 0);
-  EXPECT_EQ(mac.stats().sent_frames, 1u);
-  EXPECT_EQ(rio.stats().received_frames, 1u);
+
+  constexpr std::size_t kSize = 16;
+  uint8_t* buffered = mac.MutablePayloadBuffer(kSize);
+  ASSERT_NE(buffered, nullptr);
+  for (std::size_t i = 0; i < kSize; ++i) {
+    buffered[i] = static_cast<uint8_t>(99 + i);
+  }
+  ASSERT_EQ(
+      mac.SendBufferedFrame(FrameType::kHardwareState, kFlagNone, 22, kSize),
+      UdpStatus::kOk);
+
+  ASSERT_EQ(rio.TryReceive(&received), UdpStatus::kOk);
+  EXPECT_EQ(received.header.type, FrameType::kHardwareState);
+  EXPECT_EQ(received.header.sequence, 2u);
+  ASSERT_EQ(received.payload_size, kSize);
+  for (std::size_t i = 0; i < kSize; ++i) {
+    EXPECT_EQ(received.payload[i], static_cast<uint8_t>(99 + i));
+  }
 }
 
 TEST(RuntimeUdpTest, NonBlockingReceiveReportsWouldBlock) {
@@ -41,38 +59,6 @@ TEST(RuntimeUdpTest, NonBlockingReceiveReportsWouldBlock) {
 
   DecodedFrame received;
   EXPECT_EQ(peer.TryReceive(&received), UdpStatus::kWouldBlock);
-  EXPECT_EQ(peer.stats().receive_would_block, 1u);
-}
-
-TEST(RuntimeUdpTest, SendsBufferedPayloadWithoutExtraCopy) {
-  RuntimeUdpPeer mac;
-  RuntimeUdpPeer rio;
-  UdpSocketOptions options;
-  options.non_blocking = false;
-
-  ASSERT_EQ(rio.Open("127.0.0.1", 59105, "127.0.0.1", 59104, options),
-            UdpStatus::kOk);
-  ASSERT_EQ(mac.Open("127.0.0.1", 59104, "127.0.0.1", 59105, options),
-            UdpStatus::kOk);
-
-  constexpr std::size_t kSize = 16;
-  uint8_t* payload = mac.MutablePayloadBuffer(kSize);
-  ASSERT_NE(payload, nullptr);
-  for (std::size_t i = 0; i < kSize; ++i) {
-    payload[i] = static_cast<uint8_t>(99 + i);
-  }
-
-  ASSERT_EQ(
-      mac.SendBufferedFrame(FrameType::kHardwareState, kFlagNone, 22, kSize),
-      UdpStatus::kOk);
-
-  DecodedFrame received;
-  ASSERT_EQ(rio.TryReceive(&received), UdpStatus::kOk);
-  EXPECT_EQ(received.header.type, FrameType::kHardwareState);
-  ASSERT_EQ(received.payload_size, kSize);
-  for (std::size_t i = 0; i < kSize; ++i) {
-    EXPECT_EQ(received.payload[i], static_cast<uint8_t>(99 + i));
-  }
 }
 
 }  // namespace

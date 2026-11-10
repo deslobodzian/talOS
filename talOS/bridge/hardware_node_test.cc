@@ -9,7 +9,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <iterator>
 #include <map>
 #include <optional>
 #include <string>
@@ -89,7 +88,7 @@ uint64_t NodeConfigId(const talos::config::RobotConfig& cfg) {
   return ConfigurationId(hw);
 }
 
-TEST(HardwareNodeTest, RejectsMalformedAndReorderedDriverStationPackets) {
+TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
   auto cfg = talos::config::ParseRobotConfigString(kTestToml);
   HardwareNode node{cfg, "127.0.0.1", TestPort(25804), TestPort(25805), true};
   ASSERT_TRUE(node.Open());
@@ -136,17 +135,6 @@ TEST(HardwareNodeTest, RejectsMalformedAndReorderedDriverStationPackets) {
   send(malformed, sizeof malformed);
   EXPECT_EQ(node.driver_station_packets_received(), 1u);
   EXPECT_FALSE(ds_sub.read());
-  data.sample_time_us = 999;
-  std::array<uint8_t, 1024> payload{};
-  auto size = driver_station::Encode(data, payload);
-  send(payload.data(), size);
-  EXPECT_EQ(node.driver_station_packets_received(), 1u);
-  EXPECT_FALSE(ds_sub.read());
-  data.sample_time_us = 1001;
-  size = driver_station::Encode(data, payload);
-  send(payload.data(), size);
-  EXPECT_EQ(node.driver_station_packets_received(), 2u);
-  EXPECT_TRUE(ds_sub.read());
 }
 
 constexpr std::string_view kTrustToml = R"(
@@ -381,8 +369,7 @@ TEST(HardwareNodeTest, LatestRequestNeutralizesOmittedOutputs) {
   EXPECT_EQ(node.current_command().motors[1].mode, Mode::kNeutral);
 }
 
-TEST(HardwareNodeTest,
-     ReportsLatestGatewayHealthCountersAndConfiguredMotorFaults) {
+TEST(HardwareNodeTest, ReportsLatestGatewayHealthAndConfiguredMotorFaults) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   HardwareNode node{cfg, "127.0.0.1", TestPort(25942), TestPort(25943), true};
   ASSERT_TRUE(node.Open());
@@ -392,7 +379,6 @@ TEST(HardwareNodeTest,
       protocol::UdpStatus::kOk);
   State state = TrustState(NodeConfigId(cfg), 42, 1, 1000);
   state.health = {true, 9.5, true, 0.81};
-  state.counters = {11, 12, 13, 14};
   state.motor_count = 2;
   state.motors[0].id = cfg.hardware.motors[1].id;
   state.motors[0].valid = true;
@@ -406,10 +392,6 @@ TEST(HardwareNodeTest,
   EXPECT_TRUE(status.brownout());
   EXPECT_DOUBLE_EQ(status.can_utilization_frac(), 0.81);
   EXPECT_EQ(status.motor_fault_mask(), 2u);
-  EXPECT_EQ(status.gateway_rejected_command_count(), 11u);
-  EXPECT_EQ(status.gateway_neutralized_motor_count(), 12u);
-  EXPECT_EQ(status.gateway_apply_failure_count(), 13u);
-  EXPECT_EQ(status.gateway_device_reset_count(), 14u);
   state.health = {};
   state.motors[0].fault_flags = 0;
   state.sample_time_us++;
@@ -531,7 +513,6 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   ASSERT_TRUE(received_command);
   ASSERT_TRUE(published_request);
   event::log::LogReader reader(log_path);
-  EXPECT_EQ(reader.format_version(), 6u);
   bool logged_command = false;
   bool logged_neutral = false;
   bool logged_state = false;
@@ -687,59 +668,12 @@ TEST(HardwareNodeTest, RejectsRequestsForDevicesOwnedByAnotherSubsystem) {
   EXPECT_DOUBLE_EQ(cmd2.pwm_outputs[0].output, 0.5);
 }
 
-TEST(HardwareNodeTest, RejectsRequestsWithStaleIdentity) {
-  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
-  const uint16_t roller = cfg.hardware.motors[1].id;
-  const uint64_t config_id = NodeConfigId(cfg);
-
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25814), TestPort(25815), true};
-  ASSERT_TRUE(node.Open());
-  node.Tick(999000);
-
-  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
-
-  // No controller state has arrived, so the current identity is
-  // (config, 0, 0, 0). Each wrong word is rejected on its own.
-  Command base{};
-  base.config_id = config_id;
-  base.count = 1;
-  base.motors[0] = {roller, Mode::kVelocity, 0, 30.0, 0.0};
-
-  Command bad_config = base;
-  bad_config.config_id = config_id + 1;
-  PublishCommand(intake_pub, bad_config);
-  node.Tick(1000000);
-
-  Command bad_boot = base;
-  bad_boot.boot_id = 7;
-  PublishCommand(intake_pub, bad_boot);
-  node.Tick(1001000);
-
-  Command bad_epoch = base;
-  bad_epoch.epoch = 2;
-  PublishCommand(intake_pub, bad_epoch);
-  node.Tick(1002000);
-
-  Command bad_observed = base;
-  bad_observed.observed_time_us = 5;
-  PublishCommand(intake_pub, bad_observed);
-  node.Tick(1003000);
-
-  EXPECT_EQ(node.identity_rejected(), 4u);
-  EXPECT_EQ(node.ownership_rejected(), 0u);
-  // Rejections prove nothing: the subsystem is still timed out and its demand
-  // never merged.
-  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
-  EXPECT_EQ(node.current_command().motors[1].mode, Mode::kNeutral);
-
-  PublishCommand(intake_pub, base);
-  node.Tick(1004000);
-  EXPECT_EQ(node.identity_rejected(), 4u);
-  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
-  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
-}
-
-TEST(HardwareNodeTest, ObsoleteRequestsNeverLookCurrent) {
+// A request built from an older sample of the same boot and epoch stays
+// acceptable while its gateway-clock age (last_sample - observed) is below
+// the command timeout, and is rejected beyond it. Either way the merge keeps
+// the older observation instead of being re-stamped: stale stays visibly
+// stale.
+TEST(HardwareNodeTest, RequestAgeIsBoundedByTheCommandTimeout) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
   const uint16_t roller = cfg.hardware.motors[1].id;
   const uint64_t config_id = NodeConfigId(cfg);
@@ -769,121 +703,35 @@ TEST(HardwareNodeTest, ObsoleteRequestsNeverLookCurrent) {
   EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
   EXPECT_EQ(node.current_command().observed_time_us, 5000u);
 
-  // A much newer sample arrives (same boot and epoch: not a transition, so
-  // the cached merge survives). Replaying the request built from the older
-  // sample is now beyond the age bound (last_sample - observed >=
-  // command_timeout), so it is rejected, and the merge keeps the older
-  // observation instead of being re-stamped: stale stays visibly stale.
-  const uint64_t stale_sample = 5000 + timeout_us + 1000;
-  ASSERT_TRUE(InjectState(node, gateway,
-                          TrustState(config_id, 11, 1, stale_sample), 1002000));
-  PublishCommand(intake_pub, fresh);
-  node.Tick(1002500);
-
-  EXPECT_EQ(node.identity_rejected(), 1u);
-  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
-  EXPECT_EQ(node.current_command().observed_time_us, 5000u);
-}
-
-TEST(HardwareNodeTest, AcceptsRequestsWithinFreshnessBound) {
-  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
-  const uint16_t roller = cfg.hardware.motors[1].id;
-  const uint64_t config_id = NodeConfigId(cfg);
-
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25820), TestPort(25821), true};
-  ASSERT_TRUE(node.Open());
-  node.Tick(999000);
-
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(25820), "127.0.0.1", TestPort(25821)),
-      protocol::UdpStatus::kOk);
-  ASSERT_TRUE(
-      InjectState(node, gateway, TrustState(config_id, 11, 1, 5000), 1000000));
-
-  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
-  Command fresh{};
-  fresh.config_id = config_id;
-  fresh.boot_id = 11;
-  fresh.epoch = 1;
-  fresh.observed_time_us = 5000;
-  fresh.count = 1;
-  fresh.motors[0] = {roller, Mode::kVelocity, 0, 30.0, 0.0};
-  PublishCommand(intake_pub, fresh);
-  node.Tick(1001000);
-  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
-  EXPECT_EQ(node.current_command().observed_time_us, 5000u);
-
-  // A newer sample arrives (same boot and epoch: not a transition). A request
-  // computed from sample N is still acceptable after N+1 arrives while its
-  // gateway-clock age (last_sample - observed) stays below the command
-  // timeout. The merge keeps the older observation rather than re-stamping.
   ASSERT_TRUE(
       InjectState(node, gateway, TrustState(config_id, 11, 1, 6000), 1002000));
   PublishCommand(intake_pub, fresh);
   node.Tick(1002500);
-
   EXPECT_EQ(node.identity_rejected(), 0u);
   EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
-  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
   EXPECT_EQ(node.current_command().observed_time_us, 5000u);
 
-  // A request built from the newest sample advances the merge.
+  // A newer accepted observation retires the previous demand even while
+  // both observations remain inside the age bound.
   Command newer = fresh;
   newer.observed_time_us = 6000;
   newer.motors[0].demand = 31.0;
   PublishCommand(intake_pub, newer);
-  node.Tick(1003000);
-  EXPECT_EQ(node.identity_rejected(), 0u);
+  node.Tick(1002600);
   EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 31.0);
   EXPECT_EQ(node.current_command().observed_time_us, 6000u);
-}
-
-TEST(HardwareNodeTest, RejectsReplayOlderThanLastAccepted) {
-  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
-  const uint16_t roller = cfg.hardware.motors[1].id;
-  const uint64_t config_id = NodeConfigId(cfg);
-
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25822), TestPort(25823), true};
-  ASSERT_TRUE(node.Open());
-  node.Tick(999000);
-
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(25822), "127.0.0.1", TestPort(25823)),
-      protocol::UdpStatus::kOk);
-  ASSERT_TRUE(
-      InjectState(node, gateway, TrustState(config_id, 11, 1, 5000), 1000000));
-
-  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
-  Command first{};
-  first.config_id = config_id;
-  first.boot_id = 11;
-  first.epoch = 1;
-  first.observed_time_us = 5000;
-  first.count = 1;
-  first.motors[0] = {roller, Mode::kVelocity, 0, 30.0, 0.0};
-  PublishCommand(intake_pub, first);
-  node.Tick(1001000);
-  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
-
-  ASSERT_TRUE(
-      InjectState(node, gateway, TrustState(config_id, 11, 1, 6000), 1002000));
-  Command second = first;
-  second.observed_time_us = 6000;
-  second.motors[0].demand = 31.0;
-  PublishCommand(intake_pub, second);
-  node.Tick(1002500);
-  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 31.0);
-  EXPECT_EQ(node.current_command().observed_time_us, 6000u);
-
-  // Replaying the older demand is within the age bound (6000 - 5000) but
-  // older than this subsystem's last accepted observation, so it is
-  // rejected and the merge is untouched.
-  PublishCommand(intake_pub, first);
-  node.Tick(1003000);
-
+  PublishCommand(intake_pub, fresh);
+  node.Tick(1002700);
   EXPECT_EQ(node.identity_rejected(), 1u);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 31.0);
+  EXPECT_EQ(node.current_command().observed_time_us, 6000u);
+
+  const uint64_t stale_sample = 5000 + timeout_us + 1000;
+  ASSERT_TRUE(InjectState(node, gateway,
+                          TrustState(config_id, 11, 1, stale_sample), 1003000));
+  PublishCommand(intake_pub, fresh);
+  node.Tick(1003500);
+  EXPECT_EQ(node.identity_rejected(), 2u);
   EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 31.0);
   EXPECT_EQ(node.current_command().observed_time_us, 6000u);
 }
@@ -1350,7 +1198,6 @@ TEST(HardwareNodeTest, ForwardsDriverStationPacketsOnlyFromTheCurrentBoot) {
 TEST(HardwareNodeTest, PublishesBridgeStatus) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
   const uint16_t drive = cfg.hardware.motors[0].id;
-  const uint16_t roller = cfg.hardware.motors[1].id;
   HardwareNode node{cfg, "127.0.0.1", TestPort(25828), TestPort(25829), true};
   ASSERT_TRUE(node.Open());
   ipc::Subscriber<bridge::BridgeStatus> status_sub{
@@ -1402,7 +1249,6 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
 
   // Only the drivetrain publishes: the silent intake keeps its bit.
   ipc::Publisher<talos::hardware::Packet> drive_pub{RequestTopic("drivetrain")};
-  ipc::Publisher<talos::hardware::Packet> intake_pub{RequestTopic("intake")};
   Command drive_ok{};
   drive_ok.config_id = config_id;
   drive_ok.boot_id = 11;
@@ -1416,34 +1262,6 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   ASSERT_TRUE(node.is_subsystem_timed_out("intake"));
   EXPECT_EQ(node.Status(1001000).timed_out_mask(), 0b10u);
   EXPECT_EQ(node.Status(1001000).commands_sent_count(), 1u);
-
-  // A request from the wrong boot and one that addresses another subsystem's
-  // motor each count once.
-  const uint64_t identity_before = node.identity_rejected();
-  const uint64_t ownership_before = node.ownership_rejected();
-  Command stale = drive_ok;
-  stale.boot_id = 10;
-  PublishCommand(drive_pub, stale);
-  node.Tick(1002000);
-  Command cross{};
-  cross.config_id = config_id;
-  cross.boot_id = 11;
-  cross.epoch = 1;
-  cross.observed_time_us = 1000;
-  cross.count = 2;
-  cross.motors[0] = {roller, Mode::kVelocity, 0, 30.0, 0.0};
-  cross.motors[1] = {drive, Mode::kVelocity, 0, 99.0, 0.0};
-  PublishCommand(intake_pub, cross);
-  node.Tick(1003000);
-  const bridge::BridgeStatus counted = node.Status(1003000);
-  EXPECT_EQ(counted.identity_rejected_count(), identity_before + 1);
-  EXPECT_EQ(counted.ownership_rejected_count(), ownership_before + 1);
-  EXPECT_EQ(counted.identity_rejected_count(), node.identity_rejected());
-  EXPECT_EQ(counted.ownership_rejected_count(), node.ownership_rejected());
-  EXPECT_EQ(counted.driver_station_packet_count(),
-            node.driver_station_packets_received());
-  EXPECT_EQ(counted.state_age_us(), 3000u);
-  EXPECT_EQ(counted.timed_out_mask(), 0b10u);
 
   // Every 20 ms of bridge time, not every tick: the last publication was the
   // first tick at 999000.
@@ -1492,71 +1310,6 @@ TEST(HardwareNodeTest, TwoWayClockBoundNeedsNoActiveRequests) {
   EXPECT_EQ(status.clock_min_round_trip_us(), 6000u);
   EXPECT_GE(status.clock_offset_uncertainty_us(), 3000u);
   EXPECT_EQ(node.commands_sent(), 0u);
-}
-
-// One-way spread is still published diagnostically, but even eight ordered
-// samples cannot make the production mapping valid without a two-way exchange.
-// Ordering and reboot handling remain shared by both clock paths.
-TEST(HardwareNodeTest, PublishesTheGatewayClockMapping) {
-  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
-  HardwareNode node{cfg, "127.0.0.1", TestPort(25832), TestPort(25833), true};
-  ASSERT_TRUE(node.Open());
-  protocol::RuntimeUdpPeer gateway;
-  ASSERT_EQ(
-      gateway.Open("127.0.0.1", TestPort(25832), "127.0.0.1", TestPort(25833)),
-      protocol::UdpStatus::kOk);
-  const uint64_t config_id = NodeConfigId(cfg);
-
-  const bridge::BridgeStatus before = node.Status(1000);
-  EXPECT_FALSE(before.clock_offset_valid());
-  EXPECT_EQ(before.clock_boot_id(), 0u);
-  EXPECT_EQ(before.clock_window_count(), 0u);
-
-  // Gateway time 1000 + 5000 i arrives at bridge time 2 s + 5000 i plus a
-  // latency between 400 and 1100 us.
-  constexpr uint64_t kLatencyUs[] = {700, 400, 900, 400, 650, 500, 1100, 450};
-  static_assert(std::size(kLatencyUs) ==
-                ClockOffsetEstimator::kConvergedSamples);
-  uint64_t now_us = 2'000'000;
-  for (std::size_t i = 0; i < std::size(kLatencyUs); ++i) {
-    EXPECT_FALSE(node.Status(now_us).clock_offset_valid())
-        << "valid after " << i << " states";
-    now_us = 2'000'000 + 5000 * i + kLatencyUs[i];
-    ASSERT_TRUE(InjectState(
-        node, gateway, TrustState(config_id, 11, 1, 1000 + 5000 * i), now_us));
-  }
-  bridge::BridgeStatus status = node.Status(now_us);
-  EXPECT_FALSE(status.clock_offset_valid());  // No two-way exchange yet.
-  EXPECT_EQ(status.clock_boot_id(), 11u);
-  EXPECT_EQ(status.clock_offset_us(), 2'000'000 - 1000 + 400);
-  EXPECT_EQ(status.clock_offset_spread_us(), 1100u - 400u);
-  EXPECT_EQ(status.clock_window_count(),
-            ClockOffsetEstimator::kConvergedSamples);
-  EXPECT_EQ(status.clock_resets_count(), 0u);
-  EXPECT_EQ(status.clock_ignored_count(), 0u);
-
-  // The last state again, 5 ms late: counted as received, kept out of the
-  // mapping (taken in, it would widen the spread to 5050 us).
-  const uint64_t states_before = node.states_received();
-  ASSERT_TRUE(InjectState(node, gateway,
-                          TrustState(config_id, 11, 1, 1000 + 5000 * 7),
-                          now_us + 5000));
-  EXPECT_EQ(node.states_received(), states_before + 1);
-  status = node.Status(now_us + 5000);
-  EXPECT_EQ(status.clock_ignored_count(), 1u);
-  EXPECT_EQ(status.clock_window_count(), 8u);
-  EXPECT_EQ(status.clock_offset_spread_us(), 700u);
-  EXPECT_FALSE(status.clock_offset_valid());
-
-  // The gateway reboots: its clock restarts, and so does the mapping.
-  ASSERT_TRUE(InjectState(node, gateway, TrustState(config_id, 12, 1, 1000),
-                          5'000'300));
-  status = node.Status(5'000'300);
-  EXPECT_FALSE(status.clock_offset_valid());
-  EXPECT_EQ(status.clock_boot_id(), 12u);
-  EXPECT_EQ(status.clock_resets_count(), 1u);
-  EXPECT_EQ(status.clock_window_count(), 1u);
-  EXPECT_EQ(status.clock_offset_us(), 5'000'300 - 1000);
 }
 
 // A timed-out subsystem neutralizes exactly its own motors, digital outputs

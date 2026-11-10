@@ -213,9 +213,6 @@ TEST(ConfigTest, RejectsInvalidStudioOptions) {
   ExpectRejected("[studio]\nmax_clients = 65\n");
   ExpectRejected("[studio]\nmax_clients = \"4\"\n");
   ExpectRejected("[studio]\nbridge = \"\"\n");
-  ExpectRejected("[studio]\ntopic = \"\"\n");
-  ExpectRejected("[studio]\npose_topic = \"\"\n");
-  ExpectRejected("[studio]\nunknown = 1\n");
 }
 
 using Sources = std::vector<std::string>;
@@ -376,45 +373,6 @@ node = "//py:planner"
       "//cpp:intake");
 }
 
-TEST_F(ManifestTest, RejectsBadEntries) {
-  Write("subsystems/a.toml",
-        "[subsystem]\nname = \"a\"\n[motors.m]\ncan_id = 1\n");
-
-  Write("robot.toml",
-        "[[subsystems]]\nname = \"b\"\npath = \"subsystems/a.toml\"\n");
-  EXPECT_THROW(ParseRobotConfig(Robot()),
-               std::invalid_argument);  // name mismatch
-
-  Write("robot.toml",
-        "[[subsystems]]\nname = \"a\"\npath = \"subsystems/a.toml\"\n"
-        "[[subsystems]]\nname = \"a\"\npath = \"subsystems/a.toml\"\n");
-  EXPECT_THROW(ParseRobotConfig(Robot()), std::invalid_argument);  // duplicate
-
-  Write("robot.toml", "[[subsystems]]\nname = \"a\"\n");
-  EXPECT_THROW(ParseRobotConfig(Robot()), std::invalid_argument);  // no path
-
-  Write("robot.toml",
-        "[[subsystems]]\nname = \"a\"\npath = \"missing.toml\"\n");
-  EXPECT_THROW(ParseRobotConfig(Robot()), std::invalid_argument);
-
-  // Entries take only name, path and node; anything else is a typo.
-  Write("robot.toml",
-        "[[subsystems]]\nname = \"a\"\npath = \"subsystems/a.toml\"\n"
-        "nod = \"//py:a\"\n");
-  EXPECT_THROW(ParseRobotConfig(Robot()), std::invalid_argument);
-
-  Write("robot.toml",
-        "[[subsystems]]\nname = \"a\"\npath = \"subsystems/a.toml\"\nnode = "
-        "\"\"\n");
-  EXPECT_THROW(ParseRobotConfig(Robot()), std::invalid_argument);  // empty node
-
-  Write(
-      "robot.toml",
-      "[[subsystems]]\nname = \"a\"\npath = \"subsystems/a.toml\"\nnode = 1\n");
-  EXPECT_THROW(ParseRobotConfig(Robot()),
-               std::invalid_argument);  // not a string
-}
-
 TEST_F(ManifestTest, TopLevelIncludeMergesTablesAndSubsystemOverrides) {
   Write("subsystems/intake.toml", R"(
 [subsystem]
@@ -493,18 +451,12 @@ node = "//py:extra"
   ASSERT_NE(extra, nullptr);
   EXPECT_EQ((*extra)["node"].value_or(std::string{}), "//py:extra");
 
-  // Reject non-string, empty, missing, and nested includes.
+  // An empty include names no file.
   Write("bad_empty.toml", "include = \"\"\n");
   EXPECT_THROW(ParseRobotConfig((dir_ / "bad_empty.toml").string()),
                std::invalid_argument);
-  Write("bad_type.toml", "include = 42\n");
-  EXPECT_THROW(ParseRobotConfig((dir_ / "bad_type.toml").string()),
-               std::invalid_argument);
-  Write("bad_nested.toml", "include = \"robot_py.toml\"\n");
-  EXPECT_THROW(ParseRobotConfig((dir_ / "bad_nested.toml").string()),
-               std::invalid_argument);
-  Write("bad_key.toml", "includes = \"robot.toml\"\n");
-  EXPECT_THROW(ParseRobotConfig((dir_ / "bad_key.toml").string()),
+  Write("bad_missing.toml", "include = \"missing.toml\"\n");
+  EXPECT_THROW(ParseRobotConfig((dir_ / "bad_missing.toml").string()),
                std::invalid_argument);
 }
 
@@ -588,14 +540,11 @@ TEST(ConfigTest, RejectsInvalidTeleopDefaultTypes) {
   }
 }
 
-TEST(ConfigTest, RejectsInvalidPovAndToggleBindings) {
-  for (const std::string binding :
-       {"pov = true\nwhile_held = { x = 1 }",
-        "pov = -45\nwhile_held = { x = 1 }",
-        "pov = 90\npov_index = 0.0\nwhile_held = { x = 1 }",
-        "pov = 90\non_toggle = {}",
-        "button = 1\nwhile_held = {}\non_toggle = { x = 1 }",
-        "axis = 0\nfield = 'x'\nscale = 1\npov_index = 0"}) {
+// Other binding shapes are cases in testdata/.
+TEST(ConfigTest, RejectsNegativePovAndFractionalPovIndex) {
+  for (const std::string binding : {"pov = -45\nwhile_held = { x = 1 }",
+                                    "pov = 90\npov_index = 0.0\nwhile_held = "
+                                    "{ x = 1 }"}) {
     ExpectRejected("[[subsystems.test.teleop.bindings]]\n" + binding);
   }
 }

@@ -21,32 +21,19 @@ State TestState() {
   return state;
 }
 
-TEST(GateTest, FirstStateGatedOnConfigOnly) {
-  const State next = TestState();
-  EXPECT_TRUE(AcceptState(false, State{}, 7, next));
-  EXPECT_TRUE(AcceptState(false, State{}, 0, next));
-  EXPECT_FALSE(AcceptState(false, State{}, 99, next));
-}
-
-TEST(GateTest, ConfigIdMismatchRejected) {
+TEST(GateTest, AcceptStateRejectsOtherConfigAndStaleSamplesOfOneBoot) {
   const State prev = TestState();
-  State next = TestState();
-  next.config_id = 8;
-  next.sample_time_us = 2000;
-  EXPECT_FALSE(AcceptState(true, prev, 7, next));
-}
+  // The first sample is gated on the config id only; zero accepts any.
+  EXPECT_TRUE(AcceptState(false, State{}, 7, prev));
+  EXPECT_TRUE(AcceptState(false, State{}, 0, prev));
+  EXPECT_FALSE(AcceptState(false, State{}, 99, prev));
 
-TEST(GateTest, ZeroConfigIdAcceptsAny) {
-  const State prev = TestState();
-  State next = TestState();
-  next.config_id = 1234;
-  next.sample_time_us = 2000;
-  EXPECT_TRUE(AcceptState(false, State{}, 0, next));
-  EXPECT_TRUE(AcceptState(true, prev, 0, next));
-}
+  State other_config = TestState();
+  other_config.config_id = 8;
+  other_config.sample_time_us = 2000;
+  EXPECT_FALSE(AcceptState(true, prev, 7, other_config));
+  EXPECT_TRUE(AcceptState(true, prev, 0, other_config));
 
-TEST(GateTest, StaleOrDuplicateSampleRejected) {
-  const State prev = TestState();
   State older = TestState();
   older.sample_time_us = 999;
   EXPECT_FALSE(AcceptState(true, prev, 7, older));
@@ -55,14 +42,9 @@ TEST(GateTest, StaleOrDuplicateSampleRejected) {
   State newer = TestState();
   newer.sample_time_us = 1001;
   EXPECT_TRUE(AcceptState(true, prev, 7, newer));
-}
-
-TEST(GateTest, NewBootAcceptsOlderTimestamp) {
-  const State prev = TestState();
-  State rebooted = TestState();
-  rebooted.boot_id = 4;
-  rebooted.sample_time_us = 10;
-  EXPECT_TRUE(AcceptState(true, prev, 7, rebooted));
+  // A new boot restarts the clock.
+  older.boot_id = 4;
+  EXPECT_TRUE(AcceptState(true, prev, 7, older));
 }
 
 TEST(GateTest, GatewayReadyNeedsConfiguredAndEnabledWithoutFault) {
@@ -76,7 +58,7 @@ TEST(GateTest, GatewayReadyNeedsConfiguredAndEnabledWithoutFault) {
   EXPECT_FALSE(GatewayReady(State{}));
 }
 
-TEST(GateTest, NeutralCommandEchoesStateAndCoasts) {
+TEST(GateTest, NeutralCommandEchoesStateAndCoastsAtMostMaxMotors) {
   const State state = TestState();
   const std::array<uint16_t, 2> ids{2, 5};
   const Command command = NeutralCommand(state, ids);
@@ -91,13 +73,9 @@ TEST(GateTest, NeutralCommandEchoesStateAndCoasts) {
     EXPECT_EQ(command.motors[i].mode, Mode::kNeutral);
     EXPECT_EQ(command.motors[i].demand, 0.0);
   }
-}
 
-TEST(GateTest, NeutralCommandClampsToMaxMotors) {
-  const State state = TestState();
-  std::vector<uint16_t> ids(kMaxMotors + 4, 1);
-  const Command command = NeutralCommand(state, ids);
-  EXPECT_EQ(command.count, kMaxMotors);
+  const std::vector<uint16_t> too_many(kMaxMotors + 4, 1);
+  EXPECT_EQ(NeutralCommand(state, too_many).count, kMaxMotors);
 }
 
 }  // namespace

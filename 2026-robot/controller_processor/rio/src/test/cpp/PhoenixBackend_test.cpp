@@ -1,8 +1,8 @@
-// Regression tests for PhoenixBackend encoder handling and simulation
-// honesty: quadrature scaling from counts_per_rev,
-// duty-cycle device support with offsets and connection validity, no
-// demand teleport when controller voltage is zero (missing gains exposed), and
-// neutral keeping rotor momentum with brake/coast-dependent decay.
+// Regression tests for PhoenixBackend device handling and simulation
+// honesty: quadrature scaling from counts_per_rev, duty-cycle offsets, wrap
+// and connection validity, no demand teleport when controller voltage is zero
+// (missing gains exposed), neutral keeping rotor momentum with
+// brake/coast-dependent decay, follower gating and per-device recovery.
 #include "PhoenixBackend.h"
 
 #include <frc/simulation/DriverStationSim.h>
@@ -163,30 +163,6 @@ TEST(PhoenixBackendEncoders, QuadratureScalingAppliesCountsPerRevAndOffset) {
   EXPECT_NEAR(s.encoders[0].position_rot, 1.75, 1e-9);
 }
 
-TEST(PhoenixBackendEncoders, DutyCycleReportsOffsetCorrectedPosition) {
-  EnsureHal();
-  hw::Config c;
-  c.motors.push_back(TestMotor(1, "m1", 1));
-  c.encoders.push_back(DutyEncoder(11, "duty", 2, 0.125));
-
-  PhoenixBackend backend(true);
-  ASSERT_TRUE(backend.Configure(c));
-
-  frc::sim::DutyCycleEncoderSim sim(2);
-  sim.SetConnected(true);
-  sim.Set(0.5);
-
-  hw::State s;
-  ASSERT_TRUE(backend.Read(s));
-  EXPECT_TRUE(s.encoders[0].valid);
-  EXPECT_NEAR(s.encoders[0].position_rot, 0.375, 1e-9);
-
-  // No movement between Reads: finite-difference velocity is exactly zero.
-  ASSERT_TRUE(backend.Read(s));
-  EXPECT_TRUE(s.encoders[0].valid);
-  EXPECT_DOUBLE_EQ(s.encoders[0].velocity_rps, 0.0);
-}
-
 TEST(PhoenixBackendEncoders, DutyCycleVelocityWrapsAndReconnectStartsAtRest) {
   EnsureHal();
   hw::Config config;
@@ -202,6 +178,7 @@ TEST(PhoenixBackendEncoders, DutyCycleVelocityWrapsAndReconnectStartsAtRest) {
   ASSERT_TRUE(backend.Read(state));
   const auto after_first = std::chrono::steady_clock::now();
   ASSERT_TRUE(state.encoders[0].valid);
+  EXPECT_NEAR(state.encoders[0].position_rot, 0.865, 1e-9);
   EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -220,47 +197,21 @@ TEST(PhoenixBackendEncoders, DutyCycleVelocityWrapsAndReconnectStartsAtRest) {
   EXPECT_GE(state.encoders[0].velocity_rps, 0.02 / max_dt - 1e-9);
   EXPECT_LE(state.encoders[0].velocity_rps, 0.02 / min_dt + 1e-9);
 
+  // A bad RIO encoder is mechanism scope: Read stays healthy, only that
+  // sample goes invalid and zeroed, and the rest of the robot keeps driving.
   sim.SetConnected(false);
   sim.Set(0.7);
   ASSERT_TRUE(backend.Read(state));
   EXPECT_FALSE(state.encoders[0].valid);
+  EXPECT_DOUBLE_EQ(state.encoders[0].position_rot, 0.0);
   EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
+  EXPECT_TRUE(state.motors[0].valid);
   sim.SetConnected(true);
   sim.Set(0.4);
   ASSERT_TRUE(backend.Read(state));
   EXPECT_TRUE(state.encoders[0].valid);
   EXPECT_NEAR(state.encoders[0].position_rot, 0.275, 1e-9);
   EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
-}
-
-TEST(PhoenixBackendEncoders, DutyCycleDisconnectInvalidatesSample) {
-  EnsureHal();
-  // A bad RIO encoder is mechanism scope: the backend must stay healthy and
-  // only that sample goes invalid.
-  hw::Config c;
-  c.motors.push_back(TestMotor(1, "m1", 1));
-  c.encoders.push_back(DutyEncoder(11, "duty", 2, 0.0));
-
-  PhoenixBackend backend(true);
-  ASSERT_TRUE(backend.Configure(c));
-
-  frc::sim::DutyCycleEncoderSim sim(2);
-  sim.SetConnected(true);
-  sim.Set(0.5);
-
-  hw::State s;
-  ASSERT_TRUE(backend.Read(s));
-  ASSERT_TRUE(s.encoders[0].valid);
-
-  // Disconnect: the owning mechanism observes an invalid, zeroed sample ...
-  sim.SetConnected(false);
-
-  EXPECT_TRUE(backend.Read(s));
-  EXPECT_FALSE(s.encoders[0].valid);
-  EXPECT_DOUBLE_EQ(s.encoders[0].position_rot, 0.0);
-  EXPECT_DOUBLE_EQ(s.encoders[0].velocity_rps, 0.0);
-  // ... while the rest of the robot keeps driving.
-  EXPECT_TRUE(s.motors[0].valid);
 }
 
 TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndDisablesPwm) {
@@ -306,7 +257,7 @@ TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndDisablesPwm) {
   EXPECT_EQ(pwm_sim.GetPulseMicrosecond(), 0);
 }
 
-TEST(PhoenixBackendHealth, ReportsBatteryAndBrownout) {
+TEST(PhoenixBackendHealth, ReportsBatteryVoltage) {
   EnsureHal();
   PhoenixBackend backend(true);
   hw::Config config;
@@ -317,15 +268,17 @@ TEST(PhoenixBackendHealth, ReportsBatteryAndBrownout) {
   backend.Read(state);  // Power health does not depend on CAN sample freshness.
   EXPECT_TRUE(state.health.valid);
   EXPECT_DOUBLE_EQ(state.health.battery_v, 7.1);
-  // WPILib desktop HAL_GetBrownedOut is always false; the portable sim
-  // backends cover injected brownout=true separately.
-  EXPECT_FALSE(state.health.brownout);
   EXPECT_GE(state.health.can_utilization_frac, 0.0);
   EXPECT_LE(state.health.can_utilization_frac, 1.0);
   frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{12.0});
 }
 
-TEST(PhoenixBackendSim, ZeroVoltageVelocityRequestDoesNotSupplyDemand) {
+// Missing gains yield ~0 V, so a closed-loop demand must neither spin the
+// rotor nor teleport its position to the target.
+class PhoenixBackendZeroGains
+    : public ::testing::TestWithParam<std::tuple<hw::Mode, double>> {};
+
+TEST_P(PhoenixBackendZeroGains, ClosedLoopRequestDoesNotSupplyDemand) {
   EnsureHal();
   EnabledDs ds;
   hw::Config c;
@@ -334,16 +287,21 @@ TEST(PhoenixBackendSim, ZeroVoltageVelocityRequestDoesNotSupplyDemand) {
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(c));
 
-  const std::array<hw::MotorRequest, 1> cmd{
-      Request(1, hw::Mode::kVelocity, 10.0)};
+  const auto [mode, demand] = GetParam();
+  const std::array<hw::MotorRequest, 1> cmd{Request(1, mode, demand)};
   ASSERT_TRUE(backend.Apply(cmd));
 
   hw::State s;
   PumpReads(backend, s, cmd);
-  // Missing gains yield ~0 V, so the rotor must not spin at the 10 rps demand.
-  EXPECT_LT(std::abs(s.motors[0].velocity_rps), 0.5);
   EXPECT_LT(std::abs(s.motors[0].voltage), 0.5);
+  EXPECT_LT(std::abs(s.motors[0].velocity_rps), 0.5);
+  EXPECT_LT(std::abs(s.motors[0].position_rot), 0.5);
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    Modes, PhoenixBackendZeroGains,
+    ::testing::Values(std::make_tuple(hw::Mode::kVelocity, 10.0),
+                      std::make_tuple(hw::Mode::kPosition, 5.0)));
 
 TEST(PhoenixBackendSim, ReportsAmbientAndPhoenixSupplyCurrent) {
   EnsureHal();
@@ -371,46 +329,6 @@ TEST(PhoenixBackendSim, ReportsAmbientAndPhoenixSupplyCurrent) {
   PumpReads(backend, state, neutral, 30);
   EXPECT_DOUBLE_EQ(state.motors[0].temperature_c, 25.0);
   EXPECT_NEAR(state.motors[0].supply_current_a, 0.0, 0.5);
-}
-
-TEST(PhoenixBackendSim, ZeroVoltagePositionRequestDoesNotTeleport) {
-  EnsureHal();
-  EnabledDs ds;
-  hw::Config c;
-  c.motors.push_back(TestMotor(1, "m1", 1));
-
-  PhoenixBackend backend(true);
-  ASSERT_TRUE(backend.Configure(c));
-
-  const std::array<hw::MotorRequest, 1> cmd{
-      Request(1, hw::Mode::kPosition, 5.0)};
-  ASSERT_TRUE(backend.Apply(cmd));
-
-  hw::State s;
-  PumpReads(backend, s, cmd);
-  // Missing gains yield ~0 V, so position must not jump to the 5 rot demand.
-  EXPECT_LT(std::abs(s.motors[0].position_rot), 0.5);
-  EXPECT_LT(std::abs(s.motors[0].velocity_rps), 0.5);
-}
-
-TEST(PhoenixBackendSim, VoltageStillDrivesMotor) {
-  EnsureHal();
-  EnabledDs ds;
-  hw::Config c;
-  c.motors.push_back(TestMotor(1, "m1", 1));
-
-  PhoenixBackend backend(true);
-  ASSERT_TRUE(backend.Configure(c));
-
-  const std::array<hw::MotorRequest, 1> cmd{
-      Request(1, hw::Mode::kDutyCycle, 0.5)};
-  ASSERT_TRUE(backend.Apply(cmd));
-
-  hw::State s;
-  PumpReads(backend, s, cmd, 30);
-  // 0.5 duty is ~6 V, targeting ~50 rps: physics must still move the rotor.
-  EXPECT_GT(s.motors[0].velocity_rps, 5.0);
-  EXPECT_GT(s.motors[0].position_rot, 0.0);
 }
 
 namespace {

@@ -20,8 +20,9 @@ answers with a `kHardwareConfigAck` when the worker finishes. The manifest holds
 logical device IDs, names, CAN
 addresses and bus names, inversion, encoder offsets, current/voltage limits,
 gearing, three gain slots, soft limits, and Motion Magic cruise velocity,
-acceleration, and jerk. Changed configurations require disabled operation;
-identical pushes succeed even while enabled without device traffic.
+acceleration, and jerk. Changed configurations require disabled operation.
+Identical pushes may succeed while enabled without device traffic, but not
+while faulted or while configuration/restoration is pending.
 
 The RoboRIO atomically saves successful configuration bytes with a CRC32 to
 `/home/lvuser/talos_config.bin` (`talos_config.bin` in desktop simulation).
@@ -34,8 +35,9 @@ Phoenix devices time out or are absent. Failed devices publish invalid samples;
 their motors, remote-feedback consumers and followers stay neutral, while
 healthy devices continue accepting commands. Invalid samples feed the existing
 bridge motor fault mask; sanitized demands increment the neutralized-motor
-counter. Configuration CAN transactions run on a worker, never the 5 ms RIO
-loop. Unavailable devices retry through the same per-device restore worker
+counter. Network configuration CAN transactions run on a worker, not the
+periodic RIO loop; persisted startup restoration runs before that loop.
+Unavailable devices retry through the same per-device restore worker
 after 250 ms, doubling to 2 s. Rejected whole configurations make the bridge
 back off from 100 ms to 2 s without stopping its command courier; a new gateway
 boot resets that delay.
@@ -82,10 +84,10 @@ angle measured in mechanism rotations and zero at horizontal. These fields
 and follower settings participate in the configuration fingerprint and wire
 format, so both endpoints must use the matching software version.
 
-A rejected configuration latches a `ConfigError` (`config_error.h`) on the
-gateway (`Gateway::config_error()`, cleared by the next success): device name,
-CAN bus, CAN ID, the operation attempted (e.g. `apply_talonfx_config`), the raw
-vendor status value, and a message.
+Backend configuration failures can latch a detailed `ConfigError`
+(`config_error.h`) on the gateway (`Gateway::config_error()`, cleared by the
+next success): device name, CAN bus, CAN ID, operation, vendor status and
+message. Rejections before backend configuration need not populate it.
 
 ## Supported Hardware Requests
 
@@ -122,9 +124,10 @@ optimization keeps the explicitly selected signals while stopping unused
 default frames; it does not replace measuring the real bus. Reads refresh the
 cached signals non-blockingly. One-shot control requests are refreshed by the
 bridge heartbeat (at most 20 ms), not on every gateway tick.
-Neutral refresh deliberately remains every gateway tick whenever no accepted
-command is active: disabled, faulted, unhealthy, and after a command timeout
-or invalidation while enabled, until a fresh accepted command supersedes it.
+Outside pending asynchronous configuration, neutral refresh remains every
+gateway tick whenever no accepted command is active: disabled, faulted,
+unhealthy, or after command timeout/invalidation, until a fresh accepted
+command supersedes it.
 `Neutral()` uses one-shot `NeutralOut` (`UpdateFreqHz = 0`), not an
 acknowledged persistent disable latch. A dropped CAN neutral or a device reset
 can occur during disable or after a watchdog stop; without an established
@@ -179,9 +182,11 @@ Nodes read the gateway's poll timestamp in their own clock through
 `HardwareLink::sample_time()` (C `talos_hardware_sample_time`, Python
 `talos.hardware_sample_time_ns(node)`). The bridge keeps the mapping
 (`talOS/bridge/clock_offset.h`) and publishes it on `/hw/status`. Empty clock
-probes run at 50 Hz even while disabled/uncommissioned. A later State echoes
-the probe's bridge-clock send time; its gateway sample lies causally between
-that send and bridge receipt. The midpoint of the minimum-RTT interval estimates
+probes run at most 50 Hz even while disabled/uncommissioned, with one probe
+outstanding at a time and an unanswered probe retried after one second.
+A later State echoes the probe's bridge-clock send time; its gateway sample
+lies causally between that send and bridge receipt. The midpoint of the
+minimum-RTT interval estimates
 offset without assuming symmetric delay. `clock_offset_uncertainty_us` includes
 half RTT, timestamp quantization and <=1000 ppm relative clock drift; exchanges
 expire after one second. Eight ordered States and a live exchange are required.
@@ -190,8 +195,9 @@ accuracy threshold is specified: measure uncertainty against fusion requirements
 on the bench. New boots reset the mapping; reordered/retired States are dropped.
 
 Driver Station disable/e-stop, command timeout, or total backend feedback loss
-neutralizes outputs, and neutral is refreshed every tick until a fresh command
-is accepted. Enable transitions and timeout/backend stops invalidate
+neutralizes outputs. Outside pending asynchronous configuration, neutral is
+refreshed every tick until a fresh command is accepted.
+Enable transitions and timeout/backend stops invalidate
 commands by advancing the epoch. A control-send failure on individual motors
 (`Backend::ApplyFailedDevices()`; Phoenix: a non-OK `SetControl`) is
 device-local: the backend tries neutral on that motor, the gateway still accepts
@@ -200,11 +206,13 @@ failures (`Apply`/`ApplyOutputs` returning false, or every motor failing in one
 apply pass, including the dependent-neutralization pass) neutralize all outputs
 and retry on the next fresh command; three consecutive global failures latch a
 fault. A
-disabled-to-enabled transition or successful reconfiguration (including an
-identical push) clears the latch. A transient status failure requires a fresh
-valid command after recovery.
+disabled-to-enabled transition or successful disabled reconfiguration
+(including an identical push) clears the latch. An identical enabled push
+does not clear a fault. A transient status failure requires a fresh valid
+command after recovery.
 
-Each `Tick` polls `Backend::PollDeviceResets()` (Phoenix: `HasResetOccurred()`
+Outside pending asynchronous configuration, each `Tick` polls
+`Backend::PollDeviceResets()` (Phoenix: `HasResetOccurred()`
 per TalonFX/CANcoder/Pigeon2). A reset neutralizes only affected motors and
 their followers or remote-feedback dependents before starting
 `BeginRestoreAfterReset(ids)`. The global epoch and unrelated commands survive;
@@ -229,9 +237,10 @@ the same command continue driving. These neutralizations increment
 `neutralized_motor_count`. The backend remains healthy while any configured
 motor or CAN sensor has valid feedback (or none are configured). Total loss of
 all configured motor/CAN-sensor feedback neutralizes every output and advances
-the command epoch. Failed global Apply or structurally rejected Configure also
+the command epoch. Failed global Apply or backend configuration failure also
 neutralizes every output; individual device configuration or control-send
-failures do not.
+failures do not. A rejected configuration push need not invalidate the active
+configuration.
 DIO/analog/PWM and RIO encoder validity never sink the backend.
 
 ## RoboRIO
@@ -257,8 +266,8 @@ cd 2026-robot/controller_processor/rio
 WPILib desktop simulation (`./gradlew simulateNative`) runs the same gateway
 against `PhoenixBackend` with Phoenix sim state. The RoboRIO program derives
 from `frc::RobotBase`, not `frc::TimedRobot`, and runs its own fixed-rate
-loop; the only WPILib calls in it are the DS mode observations that keep the
-watchdog fed.
+loop. It refreshes and forwards Driver Station data and reports the current
+mode to feed the Driver Station watchdog.
 
 ## Simulation Backends: Ideal vs Physics-Backed
 
@@ -280,7 +289,7 @@ or without a live command. On the real backend, neutral disables PWM pulses
 | Neutral | Velocity snaps to 0 | Unpowered decay: brake stops fast, coast rolls on |
 | Gearing/inversion | Ignored | Rotor/gearing division, inversion flips direction |
 | Soft limits | Ignored | Clamped, axis stopped at the limit |
-| Pigeon yaw | Zero | True chassis yaw relative to boot, plus optional drift; explicit gyro overrides remain available |
+| Pigeon yaw | Zero raw yaw, then mounting offset/inversion | True chassis yaw relative to boot, plus optional drift; explicit gyro overrides remain available |
 | Supply voltage | Ignored | Scales free speed (`SetSupplyVoltage`) |
 | Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback, per-device disconnect, controller restart |
 

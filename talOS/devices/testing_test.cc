@@ -224,10 +224,15 @@ TEST_F(SimHardwareTest, LatestRequestNeutralizesOmittedOutputsButPreservesRaw) {
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "braked").demand, 11.0);
 }
 
+// Disabled hardware applies neutral, so even ideal motors decay instead of
+// following the raw request it keeps.
 TEST_F(SimHardwareTest, DisableNeutralizesAppliedOutputsWithoutChangingRaw) {
+  hw.ideal_motors();
   Send("mech", Drive());
   sim.step(5ms);
   ASSERT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
+  ASSERT_DOUBLE_EQ(Motor("braked").velocity_rps, 40.0);
+  ASSERT_DOUBLE_EQ(Motor("coasting").velocity_rps, 40.0);
   hw.enable(false);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
   EXPECT_FALSE(hw.applied_digital_output("mech", "led"));
@@ -236,6 +241,8 @@ TEST_F(SimHardwareTest, DisableNeutralizesAppliedOutputsWithoutChangingRaw) {
   EXPECT_TRUE(hw.digital_output("mech", "led"));
   EXPECT_DOUBLE_EQ(hw.pwm("mech", "servo"), 0.75);
   sim.step(5ms);
+  EXPECT_NEAR(Motor("braked").velocity_rps, 36.0, 1e-12);
+  EXPECT_NEAR(Motor("coasting").velocity_rps, 39.8, 1e-12);
   EXPECT_FALSE(State().digital_outputs[0].value);
   EXPECT_DOUBLE_EQ(State().pwm_outputs[0].output, 0.0);
 }
@@ -267,21 +274,6 @@ TEST_F(SimHardwareTest, ExplicitNeutralDecaysBrakeFasterThanCoast) {
   sim.step(500ms);  // 101 brake ticks: 40 * 0.9^101 < 0.01 rps snaps to 0.
   EXPECT_DOUBLE_EQ(Motor("braked").velocity_rps, 0.0);
   EXPECT_GT(Motor("coasting").velocity_rps, 20.0);  // ~40 * 0.995^101
-}
-
-TEST_F(SimHardwareTest, DisabledIdealMotorsDecayInsteadOfFollowingRawDemand) {
-  hw.ideal_motors();
-  Send("mech", Drive());
-  sim.step(5ms);
-  ASSERT_DOUBLE_EQ(Motor("braked").velocity_rps, 40.0);
-  ASSERT_DOUBLE_EQ(Motor("coasting").velocity_rps, 40.0);
-
-  hw.enable(false);
-  sim.step(5ms);
-  EXPECT_EQ(hw.motor_request("mech", "braked").mode, Mode::kVelocity);
-  EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
-  EXPECT_NEAR(Motor("braked").velocity_rps, 36.0, 1e-12);
-  EXPECT_NEAR(Motor("coasting").velocity_rps, 39.8, 1e-12);
 }
 
 TEST_F(SimHardwareTest, NeutralDecaysEvenBeforeAnyMotorRequest) {

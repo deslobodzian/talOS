@@ -128,33 +128,22 @@ TEST(ClockOffset, TheFirstSampleOfABootMayBeAtGatewayTimeZero) {
   EXPECT_EQ(clock.offset_us(), static_cast<std::int64_t>(kBridgeStartUs));
 }
 
-// A bridge clock that runs fast against the gateway's raises the one-way
-// delay a little every sample: the old minimum must age out of the window
-// rather than pin the offset to where the clocks were long ago.
-TEST(ClockOffset, FollowsABridgeClockThatRunsFast) {
-  Estimator clock;
+// Either sign of clock drift must move the window's minimum: fast clocks
+// retire the old minimum, while slow clocks immediately use the newest.
+TEST(ClockOffset, FollowsBridgeClockDriftInEitherDirection) {
   const std::uint64_t n = 3 * Estimator::kWindowSamples;
-  for (std::uint64_t i = 0; i < n; ++i) {
-    // 5000 us of gateway time is 5001 us of bridge time: 200 ppm.
-    clock.Observe(3, kGatewayStartUs + 5000 * i, kBridgeStartUs + 5001 * i);
+  for (const std::int64_t drift : {-1, 1}) {
+    Estimator clock;
+    for (std::uint64_t i = 0; i < n; ++i) {
+      clock.Observe(3, kGatewayStartUs + 5000 * i,
+                    kBridgeStartUs + (5000 + drift) * i);
+    }
+    const std::int64_t minimum_index =
+        drift > 0 ? n - Estimator::kWindowSamples : n - 1;
+    EXPECT_EQ(clock.offset_us(), kTrueOffsetUs + drift * minimum_index);
+    EXPECT_EQ(clock.spread_us(), Estimator::kWindowSamples - 1);
+    EXPECT_EQ(clock.window_count(), Estimator::kWindowSamples);
   }
-  // The oldest sample in the window is i = n - kWindowSamples, whose delay
-  // is the true starting offset plus i us.
-  const std::int64_t oldest = n - Estimator::kWindowSamples;
-  EXPECT_EQ(clock.offset_us(), kTrueOffsetUs + oldest);
-  EXPECT_EQ(clock.spread_us(), Estimator::kWindowSamples - 1);
-  EXPECT_EQ(clock.window_count(), Estimator::kWindowSamples);
-}
-
-// One that runs slow lowers the delay every sample, and the newest sample
-// is the minimum at once.
-TEST(ClockOffset, FollowsABridgeClockThatRunsSlow) {
-  Estimator clock;
-  for (std::uint64_t i = 0; i < 50; ++i) {
-    clock.Observe(3, kGatewayStartUs + 5000 * i, kBridgeStartUs + 4999 * i);
-  }
-  EXPECT_EQ(clock.offset_us(), kTrueOffsetUs - 49);
-  EXPECT_EQ(clock.spread_us(), 49u);
 }
 
 // A single slow frame widens the spread but never moves the offset, and it

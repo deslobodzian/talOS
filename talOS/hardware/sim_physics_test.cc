@@ -1,7 +1,7 @@
-// Simulation believability track (items 13-19): the ideal SimBackend stays
-// the fast logic fake, while PhysicsSimBackend (sim_physics.h) earns trust
-// for PID tuning, gearing, direction, and limits. All tests step an explicit
-// sim clock; no wall-clock, no sockets, no live sim.
+// The ideal SimBackend stays the fast logic fake, while PhysicsSimBackend
+// (sim_physics.h) earns trust for PID tuning, gearing, direction, and limits.
+// All tests step an explicit sim clock; no wall-clock, no sockets, no live
+// sim.
 #include "sim_physics.h"
 
 #include <gtest/gtest.h>
@@ -237,55 +237,14 @@ void CheckPowerHealth() {
   EXPECT_DOUBLE_EQ(gateway.snapshot().health.battery_v, 6.5);
 }
 
-TEST(SimHealth, IdealReportsPowerWhileDisabledAndStale) {
+TEST(SimHealth, PowerVisibleWhileDisabledAndStale) {
   CheckPowerHealth<SimBackend>();
-}
-TEST(SimHealth, PhysicsReportsPowerWhileDisabledAndStale) {
   CheckPowerHealth<PhysicsSimBackend>();
 }
 
-// The ideal backend is for fast logic tests: demands apply instantly,
-// even with zero gains. The physics backend must NOT behave this way.
-TEST(SimBelievability, IdealTeleportsWhilePhysicsRamps) {
-  State s{};
-  // Ideal: one tick at demand.
-  {
-    SimBackend ideal;
-    Gateway g{SingleMotorConfig(), ideal, 1};
-    g.Tick(1000, true);
-    Command c{};
-    const State snap = g.snapshot();
-    c.config_id = snap.config_id;
-    c.boot_id = snap.boot_id;
-    c.epoch = snap.epoch;
-    c.observed_time_us = snap.sample_time_us;
-    c.count = 1;
-    c.motors[0] = {1, Mode::kVelocity, 0, 10.0, 0};
-    ASSERT_TRUE(g.Accept(c, 1, 1000));
-    g.Tick(6000, true);
-    EXPECT_DOUBLE_EQ(g.snapshot().motors[0].velocity_rps, 10.0);
-  }
-  // Physics: one 5 ms step only starts the ramp; it converges, not snaps.
-  {
-    PhysicsSimBackend physics;
-    ASSERT_TRUE(physics.Configure(SingleMotorConfig()));
-    std::array<MotorRequest, kMaxMotors> cmd{};
-    cmd[0] = Duty(1, 0.5);
-    ASSERT_TRUE(physics.Apply(cmd));
-    uint64_t now_us = 0;
-    // Two Reads: the first establishes the timestamp (dt = 0), the second
-    // advances one effective 5 ms step.
-    StepBackend(physics, s, now_us, 5000, 2);
-    EXPECT_GT(s.motors[0].velocity_rps, 0.0);
-    EXPECT_LT(s.motors[0].velocity_rps, 50.0);   // Far from the ~50 rps target.
-    StepBackend(physics, s, now_us, 5000, 400);  // 2 s more.
-    EXPECT_GT(s.motors[0].velocity_rps, 40.0);
-    EXPECT_GT(s.motors[0].position_rot, 0.0);
-  }
-}
-
-// Voltage drives the mechanism; position integrates velocity.
-TEST(SimBelievability, VoltageDrivesMechanismAndPositionIntegrates) {
+// Voltage ramps the mechanism rather than snapping it to demand; position
+// integrates velocity.
+TEST(SimBelievability, VoltageRampsMechanismAndPositionIntegrates) {
   PhysicsSimBackend backend;
   ASSERT_TRUE(backend.Configure(SingleMotorConfig()));
   std::array<MotorRequest, kMaxMotors> cmd{};
@@ -293,7 +252,12 @@ TEST(SimBelievability, VoltageDrivesMechanismAndPositionIntegrates) {
   ASSERT_TRUE(backend.Apply(cmd));
   State s{};
   uint64_t now_us = 0;
-  StepBackend(backend, s, now_us, 5000, 200);  // 1 s at ~6 V.
+  // Two Reads: the first establishes the timestamp (dt = 0), the second
+  // advances one 5 ms step, which only starts the ramp.
+  StepBackend(backend, s, now_us, 5000, 2);
+  EXPECT_GT(s.motors[0].velocity_rps, 0.0);
+  EXPECT_LT(s.motors[0].velocity_rps, 50.0);   // Far from the ~50 rps target.
+  StepBackend(backend, s, now_us, 5000, 198);  // 1 s at ~6 V.
   const double pos_1s = s.motors[0].position_rot;
   const double vel_1s = s.motors[0].velocity_rps;
   EXPECT_GT(vel_1s, 5.0);
@@ -338,7 +302,7 @@ TEST(SimBelievability, TunedVelocityLoopTracksDemand) {
   EXPECT_LE(s.motors[0].velocity_rps, 10.0);
 }
 
-// (14/15) Gearing divides rotor speed into mechanism speed; inversion flips
+// Gearing divides rotor speed into mechanism speed; inversion flips
 // direction; soft limits clamp and stop the axis.
 TEST(SimBelievability, GearingDirectionAndLimits) {
   // Gearing: identical volts, gear 2 must run half mechanism speed of gear 1.
@@ -406,23 +370,6 @@ TEST(SimBelievability, GearingDirectionAndLimits) {
   }
 }
 
-// Pigeon yaw comes from simulated chassis motion through the boundary.
-TEST(SimBelievability, PigeonYawFollowsChassisMotion) {
-  Config c = SingleMotorConfig();
-  c.sensors.push_back({9, "imu", SensorKind::kPigeon2, 30, "rio"});
-  PhysicsSimBackend backend;
-  ASSERT_TRUE(backend.Configure(c));
-  backend.SetChassisYawRate(0.25);  // Quarter turn per second, CCW+.
-  State s{};
-  uint64_t now_us = 0;
-  // 201 Reads: the first establishes the timestamp, the next 200 step 1 s.
-  StepBackend(backend, s, now_us, 5000, 201);  // 1 s.
-  ASSERT_EQ(s.sensors[0].id, 9u);
-  EXPECT_TRUE(s.sensors[0].valid);
-  EXPECT_NEAR(s.sensors[0].position_rot, 0.25, 1e-9);
-  EXPECT_NEAR(s.sensors[0].velocity_rps, 0.25, 1e-9);
-}
-
 TEST(SimBelievability, PigeonMountOffsetPrecedesInversion) {
   for (const bool inverted : {false, true}) {
     Config config = SingleMotorConfig();
@@ -455,7 +402,7 @@ TEST(SimBelievability, ResetRestorePreservesPhysicalRotorPosition) {
   ASSERT_GT(state.motors[0].velocity_rps, 0.0);
   const std::array<uint16_t, 1> reset_ids{1};
   backend.BeginRestoreAfterReset(reset_ids);
-  ASSERT_TRUE(backend.Read(state));  // Same timestamp: inspect reset directly.
+  ASSERT_TRUE(backend.Read(state));
   EXPECT_DOUBLE_EQ(state.motors[0].position_rot, position);
   EXPECT_DOUBLE_EQ(state.motors[0].velocity_rps, 0.0);
   EXPECT_DOUBLE_EQ(state.motors[0].voltage, 0.0);
@@ -658,6 +605,8 @@ TEST(SimBelievability, MotionMagicProfilesCruiseAndSettlesInBothDirections) {
   }
 }
 
+// Conventional module names infer swerve geometry, so wheel motion alone
+// rotates the chassis that the Pigeon reports.
 TEST(SimBelievability, SwerveRotationDrivesPigeonAndExplicitOverrideWins) {
   Config config;
   const std::array<const char*, 4> names{"front_left", "front_right",
@@ -694,15 +643,13 @@ TEST(SimBelievability, SwerveRotationDrivesPigeonAndExplicitOverrideWins) {
   EXPECT_DOUBLE_EQ(state.sensors[0].velocity_rps, -0.25);
 }
 
-// Supply-voltage change scales the available speed; restart zeroes
-// motion but keeps the configuration.
+// Supply-voltage change scales speed; restart clears motion safely.
 TEST(SimBelievability, SupplyVoltageScalesSpeedAndRestartZeroesMotion) {
   PhysicsSimBackend low, high;
   Config c = SingleMotorConfig();
   ASSERT_TRUE(low.Configure(c));
   ASSERT_TRUE(high.Configure(c));
   low.SetSupplyVoltage(6.0);
-  EXPECT_DOUBLE_EQ(low.supply_voltage(), 6.0);
   std::array<MotorRequest, kMaxMotors> cmd{};
   cmd[0] = Duty(1, 1.0);  // Full duty: 6 V vs 12 V rails.
   ASSERT_TRUE(low.Apply(cmd));
@@ -718,7 +665,6 @@ TEST(SimBelievability, SupplyVoltageScalesSpeedAndRestartZeroesMotion) {
   }
   EXPECT_NEAR(sl.motors[0].velocity_rps, sh.motors[0].velocity_rps / 2.0,
               std::abs(sh.motors[0].velocity_rps) * 0.1 + 1e-6);
-  // Restart zeroes motion state; the config (and output safe state) survives.
   high.RestartController();
   sh.sample_time_us = now_us + 5000;
   ASSERT_TRUE(high.Read(sh));

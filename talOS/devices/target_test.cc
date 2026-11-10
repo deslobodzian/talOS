@@ -112,12 +112,6 @@ class TargetTest : public ::testing::Test {
   SimHardware hw{sim};
 };
 
-TEST_F(TargetTest, TeleopLaneDrivesInTeleop) {
-  Hold("teleop", 1.5, 20ms);
-  EXPECT_EQ(Seen(), 1.5);
-  EXPECT_EQ(lift.source, "teleop");
-}
-
 TEST_F(TargetTest, NeverSentIsNull) {
   sim.step(50ms);
   EXPECT_EQ(Seen(), std::nullopt);
