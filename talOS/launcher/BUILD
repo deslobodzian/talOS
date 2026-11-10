@@ -95,6 +95,38 @@ cc_binary(
     ],
 )
 
+# bazel run //talOS/launcher:restart_latency -- --config <robot.toml> [...]
+# Per-stage SIGKILL-to-first-request restart latency; see README "Restart
+# latency". The config's nodes come from the workspace's bazel-bin.
+py_binary(
+    name = "restart_latency",
+    srcs = ["restart_latency.py"],
+    data = [":launcher"],
+    visibility = ["//visibility:public"],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+py_test(
+    name = "restart_latency_test",
+    size = "small",
+    srcs = [
+        "restart_latency.py",
+        "restart_latency_test.py",
+    ],
+    data = [":restart_latency_fixture"],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+cc_binary(
+    name = "restart_latency_fixture",
+    testonly = True,
+    srcs = ["testdata/restart_latency_fixture.cc"],
+    deps = [
+        "//talOS/events:events_log",
+        "//talOS/hardware",
+    ],
+)
+
 cc_test(
     name = "launcher_test",
     size = "small",

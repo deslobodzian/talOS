@@ -256,6 +256,34 @@ While eight other processes rewrote and synced 256 MiB files on the same disk,
 10 kills took 59.5 ms (13.8–76.5): reap → `fork` up to 27, of which its
 manifest renames up to 26, and first constructor → origin up to 29.
 
+`restart_latency` repeats the `.tlog` part of this measurement on any host:
+SIGKILL → origin (the first four rows together), origin → `run()`, `run()` →
+first tick, first tick → first request and the total, as median (range). The
+config's nodes come from `bazel-bin`, so build them first:
+
+```sh
+bazel run //talOS/launcher:restart_latency -- \
+  --config 2026-robot/main_processor/configuration/robot_physics_sim.toml \
+  --start-sim-gateway --sim-gateway-arg=--physics \
+  --sim-gateway-arg=--port --sim-gateway-arg={remote_port} \
+  --sim-gateway-arg=--remote-port --sim-gateway-arg={local_port}
+```
+
+It runs the session on loopback ports it picks (`{remote_port}` and
+`{local_port}` in gateway arguments) under its own `TALOS_SHM_NAMESPACE`,
+kills `--node` (default `drivetrain`) `--kills` times (default 10), spaced
+500 ms past `--restart-window-ms` (default 1500), and removes the session and
+its segments afterwards (`--keep` keeps the directory). The session lives in
+`TMPDIR`, which selects the disk (a tmpfs `/tmp` is not one). `--disk-load N`
+adds N processes rewriting and fsyncing 256 MiB files beside the session
+during the kills. It then kills each Python node `--python-kills` times
+(default 3) and reports its spawn (the process start time; 10 ms resolution
+on Linux, 1 µs on macOS) to the restarted run's event-loop origin, after
+which the node claims its registry row; the first launch is reported too,
+which follows its `--describe` probe. `--evict-cache` drops the node's files
+from the page cache between the kill and the restart (macOS: `sudo purge`);
+pages another live process maps stay cached.
+
 ## Replaying a session into one node
 
 `--replay-inputs <session dir> --only <node>` runs one roster member of the
