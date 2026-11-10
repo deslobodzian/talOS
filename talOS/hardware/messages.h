@@ -163,8 +163,6 @@ inline constexpr std::size_t kMaxCommandSize =
 
 inline constexpr std::size_t kHealthSampleSize = 1 + 8 + 1 + 8;
 inline constexpr std::size_t kGatewayCountersSize = std::size_t{4} * 4;
-// The State layout is also spelled by startup_test.py
-// (2026-robot/main_processor/simulation), which decodes logged States.
 inline constexpr std::size_t kStateBaseSize =
     7 * 8 + 4 + 7 * 2 + kHealthSampleSize + kGatewayCountersSize;
 // Current and temperature use signed tenths (saturating int16) on the wire.

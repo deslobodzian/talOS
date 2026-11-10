@@ -67,7 +67,7 @@ FAULTS = [
     ("kill", "teleop"),
 ]
 OWNERS = ("drivetrain", "intake", "shooter")
-NEUTRAL = (0, 0, 0.0, 0.0)
+NEUTRAL = support.NEUTRAL
 
 
 def tcp_port():
@@ -120,7 +120,7 @@ class Soak(unittest.TestCase):
     def driving(self, rows, start, end, drive_ids, what):
         window = [m for t, m in rows if start <= t < end]
         self.assertGreater(len(window), 2, f"{what}: no outputs in [{start:.1f}, {end:.1f})")
-        self.assertTrue(all(m[i][0] == 3 and abs(m[i][2]) > 0.1
+        self.assertTrue(all(m[i][0] == "velocity" and abs(m[i][2]) > 0.1
                             for m in window for i in drive_ids),
                         f"{what}: not driving in [{start:.1f}, {end:.1f})")
 
@@ -308,7 +308,7 @@ class Soak(unittest.TestCase):
             crashes = sorted(s for a, n, s, _ in events
                              if a == "kill" and n == "drivetrain")
             for t, motors in requests["drivetrain"]:
-                if all(m[0] == 0 for m in motors.values()):
+                if all(m[0] == "neutral" for m in motors.values()):
                     continue
                 crash = crashes[bisect.bisect_right(crashes, t) - 1] if (
                     crashes and crashes[0] <= t) else float("-inf")

@@ -16,8 +16,11 @@
 #include "continuity_test/continuity_message_descriptor.h"
 #include "continuity_test/continuity_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "talOS/configuration/config_parser.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/hardware/messages.h"
+#include "talOS/hardware/packet.h"
 
 namespace {
 
@@ -154,11 +157,11 @@ TEST_F(LogDumpTest, MachineReadableFormatsEscapeAndDecode) {
   EXPECT_TRUE(
       csv.starts_with("process,dispatch_index,kind,source_id,topic,event_ms,"
                       "now_ms,publish_ms,sequence,aux,payload_bytes,schema,"
-                      "decoded\r\n"));
+                      "decoded,hardware\r\n"));
   EXPECT_NE(csv.find("beta,1,TIMER,1,\"/beta/"
                      "quote,\"\"\n\",10,10,7,1,0,8,continuity_test.Count,"),
             std::string::npos);
-  EXPECT_NE(csv.find("\"{run_index: 7, sequence_count: 9}\"\r\n"),
+  EXPECT_NE(csv.find("\"{run_index: 7, sequence_count: 9}\",\r\n"),
             std::string::npos);
   EXPECT_EQ(csv.find("summary"), std::string::npos);
 }
@@ -190,6 +193,71 @@ TEST_F(LogDumpTest, JsonExportsCompletePayloadBeyondDisplayHexLimit) {
   expected += "00\"";
   EXPECT_NE(Run({"--format", "jsonl", "--node", "raw"}).find(expected),
             std::string::npos);
+}
+
+// A recorded request reads by device name from the config the session's
+// manifest names, with no flag; the bytes stay in payload_hex. A relative
+// config_path (sim.sh records one) is relative to where `bazel run` was run,
+// not to log_dump's runfiles directory.
+TEST_F(LogDumpTest, HardwarePacketsDecodeWithTheSessionConfig) {
+  constexpr std::string_view kToml = R"(
+[robot]
+period_us = 5000
+
+[subsystems.shooter]
+period_us = 10000
+
+[subsystems.shooter.motors.flywheel]
+type = "TalonFX"
+can_id = 2
+)";
+  std::filesystem::create_directories(directory_ + "/configuration");
+  std::ofstream{directory_ + "/configuration/robot.toml"} << kToml;
+  std::ofstream{directory_ + "/manifest.json"}
+      << "{\n  \"session_id\": 42,\n  \"config_path\": "
+         "\"configuration/robot.toml\",\n  \"nodes\": []\n}\n";
+  ASSERT_EQ(setenv("BUILD_WORKING_DIRECTORY", directory_.c_str(), 1), 0);
+  const auto config = talos::config::ParseRobotConfigString(kToml).hardware;
+
+  using D = talos::Descriptor<talos::hardware::Packet>;
+  talos::event::Registration source;
+  source.id = 1;
+  source.kind = talos::event::SourceKind::SENDER;
+  source.name = talos::hardware::RequestTopic("shooter");
+  source.message_bytes = sizeof(talos::hardware::Packet);
+  source.schema = {std::string{D::kName}, D::kHash, {}};
+  talos::event::log::LogWriter writer{
+      directory_ + "/shooter.tlog", "shooter",
+      talos::event::log::LogWriterOptions{8192, 1, false}, 42};
+  writer.start({source},
+               talos::event::MonotonicTime::from_nanos(1'000'000'000));
+  talos::hardware::Command command;
+  command.config_id = talos::hardware::ConfigurationId(config);
+  command.count = 1;
+  command.motors[0] = {config.motors.at(0).id, talos::hardware::Mode::kVoltage,
+                       0, 6.0, 0.0};
+  talos::hardware::Packet packet{};
+  packet.size =
+      static_cast<std::uint32_t>(talos::hardware::Encode(command, packet.data));
+  talos::event::Context ctx{};
+  ctx.kind = talos::event::EventKind::SEND;
+  ctx.source_id = 1;
+  ctx.dispatch_index = 1;
+  ctx.event_time = talos::event::MonotonicTime::from_nanos(1'000'000'000);
+  ctx.now = ctx.event_time;
+  writer.dispatch(ctx, std::as_bytes(std::span{&packet, 1}));
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
+
+  const auto json = Run({"--format", "jsonl", "--node", "shooter"});
+  unsetenv("BUILD_WORKING_DIRECTORY");
+  EXPECT_NE(json.find("\"payload_hex\":\""), std::string::npos) << json;
+  EXPECT_NE(json.find("\"hardware\":{\"type\":\"command\""), std::string::npos)
+      << json;
+  EXPECT_NE(json.find("\"name\":\"flywheel\",\"mode\":\"voltage\",\"slot\":0,"
+                      "\"demand\":6,"),
+            std::string::npos)
+      << json;
 }
 
 TEST_F(LogDumpTest, RejectsInvalidOptions) {

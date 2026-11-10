@@ -563,6 +563,12 @@ decoded payloads, and summary. Paths can be combined with:
 - `--format text|jsonl|csv`: default `text`; `jsonl` emits one JSON object per
   matching record; `csv` emits a header and RFC-4180 rows. Machine-readable
   formats omit the human-readable preamble and summary.
+- `--config robot.toml`: the config whose device names label the hardware
+  packets (below). Without it, `log_dump` reads the `config_path` of the
+  `manifest.json` in a session directory it was given, when that file still
+  parses; otherwise devices are identified by logical id only. A relative
+  path is resolved against `BUILD_WORKING_DIRECTORY` under `bazel run`, else
+  the working directory.
 
 Repeat `--node` or `--topic`, or separate their values with commas, to select
 alternatives within that filter. Different filters are combined with AND.
@@ -582,12 +588,46 @@ bazel run //talOS/launcher:log_dump -- /tmp/logs/session \
 ```
 
 Both export formats contain `process`, `dispatch_index`, `kind`, `source_id`,
-`topic`, `event_ms`, `now_ms`, `sequence`, `aux`, `payload_bytes`, `schema`, and
-`decoded`. Times keep the same session baseline regardless of filters.
-`schema` is empty when the source has no schema; `decoded` is empty without a
-schema or payload, otherwise it contains the descriptor-decoded payload text.
-JSON strings are escaped; CSV fields containing commas, quotes, or newlines
-are quoted and embedded quotes are doubled.
+`topic`, `event_ms`, `now_ms`, `publish_ms`, `sequence`, `aux`,
+`payload_bytes`, `schema`, `decoded` and `hardware`; JSONL also carries
+`payload_hex`, the complete payload. Times keep the same session baseline
+regardless of filters. `schema` is empty when the source has no schema;
+`decoded` is empty without a schema or payload, otherwise it contains the
+descriptor-decoded payload text (for a schema-less hardware Packet, a
+truncated hex preview). JSON strings are escaped; CSV fields containing
+commas, quotes, or newlines are quoted and embedded quotes are doubled.
+
+The hardware packet topics (`/hw/state`, `/hw/command`, `/hw/request/<node>`,
+`/hw/state/driver_station`) have no FlatBuffers schema, so `hardware` holds
+them decoded with the wire codecs themselves (`hardware_record.h`): a JSON
+object in JSONL, its text in CSV and the text dump, absent (JSONL) or empty
+(CSV) for every other record. `type` is `state`, `command` or
+`driver_station`:
+
+- `command` (requests and the merged command): `config_id`, `boot_id`,
+  `epoch`, `observed_time_us`, and per motor `id`, `name`, `mode`
+  (`neutral`, `duty_cycle`, `voltage`, `velocity`, `position`,
+  `motion_magic`), `slot`, `demand`, `feedforward_v`; digital and PWM outputs.
+- `state`: the flags (`configured`, `enabled`, `command_active`,
+  `hardware_fault`), and per motor `valid`, position, velocity, applied
+  `voltage`, stator/supply current, temperature, sample ages, `fault_flags`,
+  `faulted` (a fault other than an asserted limit), `forward_limit` and
+  `reverse_limit` (hard limit switches); every other device's samples, health
+  and gateway counters.
+- `driver_station`: `mode` (`teleop`, `autonomous`, `test`, `none`),
+  `enabled`, `estop`, attachment, alliance, station and match fields, and each
+  connected joystick's `port`, `name`, `axes`, `buttons` (bit i is button
+  i + 1) and `povs`.
+
+64-bit ids are decimal strings. A device's `name` appears only when the
+packet's `config_id` is that config's (as written, or commissioned as `--sim`
+runs it), so a config edited after the match never mislabels a device. A
+payload that will not decode gives `{"type": ..., "error": "..."}` and the
+export continues. Driver Station strings are cut at a fixed length, so a byte
+that does not begin a complete UTF-8 character is written as `\u00XX`. The
+codecs are the reading build's: the Packet's schema identity hashes only its
+size, so a log recorded before a wire change that kept that size decodes with
+the new layout, wrongly or as an error; `payload_hex` keeps the bytes.
 
 ### Session measurements
 
@@ -604,8 +644,8 @@ enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
 lateness, and every scalar `/hw/status` field.
 Counter deltas sum nonnegative increments and separately count resets.
 `clock_offset_valid` includes its observed valid fraction. JSONL `log_dump`
-exports additionally include `ds_enabled` for successfully decoded Driver Station
-packets, using the framework wire codec rather than guessed byte offsets.
+exports also carry `ds_enabled`, the Driver Station `hardware.enabled` bit,
+for each Driver Station packet that decodes.
 
 State timing selects one publisher stream (bridge IPC publications), or one
 consumer stream if there is no publisher recording; duplicate readers are never

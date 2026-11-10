@@ -195,17 +195,17 @@ class MatchRehearsal(unittest.TestCase):
                     index = bisect.bisect_right(times, row["now_ms"]) - 1
                     enabled = index >= 0 and support.ds_snapshot(snapshots[index])[0] & 4
                     if not enabled:
-                        self.assertTrue(all(m == (0, 0, 0.0, 0.0) for m in
+                        self.assertTrue(all(m == support.NEUTRAL for m in
                                             support.motor_requests(row).values()), row)
             auto_start, auto_end = phases[1][0], phases[2][0]
             self.assertTrue(any(auto_start < r["now_ms"] < auto_end and
-                                any(m[0] != 0 and abs(m[2]) > 0.1 for m in
+                                any(m[0] != "neutral" and abs(m[2]) > 0.1 for m in
                                     support.motor_requests(r).values()) for r in requests),
                             "autonomous routine never drove")
             intake = [r for r in rows if r["process"] == "intake" and
                       r["topic"] == "/hw/request/intake" and r["kind"] == "SEND"]
             self.assertTrue(any(phases[3][0] + 800 < r["now_ms"] < kill and
-                                any(m[0] != 0 and abs(m[2]) > 0.1 for m in
+                                any(m[0] != "neutral" and abs(m[2]) > 0.1 for m in
                                     support.motor_requests(r).values()) for r in intake),
                             "teleop mechanism buttons never actuated intake")
             # SIGKILL loses the killed process's unflushed recording (up to
@@ -223,7 +223,7 @@ class MatchRehearsal(unittest.TestCase):
                        r["topic"] == "/drivetrain/target/teleop" and
                        r["kind"] == "MESSAGE" and r["now_ms"] > kill]
             for row in requests:
-                if row["now_ms"] <= kill or not any(m[0] != 0 for m in
+                if row["now_ms"] <= kill or not any(m[0] != "neutral" for m in
                                                                   support.motor_requests(row).values()):
                     continue
                 fresh = [t for t in targets if t["now_ms"] <= row["now_ms"] and

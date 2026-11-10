@@ -36,12 +36,40 @@ cc_binary(
     deps = [":launcher_lib"],
 )
 
+# The hardware packet topics decoded with their wire codecs, for log_dump.
+cc_library(
+    name = "hardware_record",
+    srcs = ["hardware_record.cc"],
+    hdrs = ["hardware_record.h"],
+    deps = [
+        "//talOS/driver_station",
+        "//talOS/hardware",
+        "//talOS/hardware:config",
+        "//talOS/schema:identity",
+    ],
+)
+
+cc_test(
+    name = "hardware_record_test",
+    size = "small",
+    srcs = ["hardware_record_test.cc"],
+    deps = [
+        ":hardware_record",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/hardware",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_binary(
     name = "log_dump",
     srcs = ["log_dump.cc"],
     visibility = ["//visibility:public"],
     deps = [
+        ":hardware_record",
         ":launcher_lib",
+        "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
@@ -58,8 +86,10 @@ cc_test(
     env = {"TALOS_LOG_DUMP": "$(rlocationpath :log_dump)"},
     deps = [
         ":continuity_message",
+        "//talOS/configuration",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/hardware",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],

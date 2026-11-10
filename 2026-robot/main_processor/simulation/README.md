@@ -173,9 +173,10 @@ bazel test --test_output=errors //2026-robot/main_processor/simulation:all
 launcher, robot processes and physics gateway, with ephemeral UDP ports and
 unique shared-memory names. It checks disabled/autonomous/teleop operation,
 clean process exits and no restarts/recorder failures.
-It then decodes the complete JSONL `payload_hex` bytes from `log_dump` (the
-human-readable `decoded` packet preview is intentionally truncated).
-Additional JSONL fields, including publication timestamps, are tolerated.
+It then reads hardware requests, States and Driver Station packets from the
+JSONL `hardware` objects `log_dump` decodes with the wire codecs
+([log_dump export](../../../talOS/launcher/README.md#filtering-and-exporting-logs));
+`match_rehearsal_test` and `soak_test` use the same helpers.
 
 The match proves nonzero drivetrain velocity requests before each injection:
 

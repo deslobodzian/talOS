@@ -156,50 +156,38 @@ class SimGatewayStartup(unittest.TestCase):
                 self.assertIn((1, 3, 32, 1, 5, -0.5, 90), joystick_samples)
 
 
-# hardware::State wire layout, the one place this file spells it
-# (talOS/hardware/messages.h kStateBaseSize, messages.cc Encode(State)):
-# seven u64 and a u32 flags put motor_count first among the seven u16
-# counts; the motors follow them, 45 bytes each (u16 id, u8 valid first).
-STATE_MOTOR_COUNT_OFFSET = 7 * 8 + 4
-STATE_MOTORS_OFFSET = STATE_MOTOR_COUNT_OFFSET + 7 * 2
-STATE_MOTOR_BYTES = 45
+NEUTRAL = ("neutral", 0, 0.0, 0.0)
 
 
-def packet_bytes(row):
-    """Unwrap the fixed IPC Packet; decode only its canonical wire bytes."""
-    payload = bytes.fromhex(row["payload_hex"])
-    size, = struct.unpack_from("<I", payload)
-    if size > len(payload) - 4:
-        raise ValueError("truncated hardware Packet")
-    return payload[4:4 + size]
+def hardware(row):
+    """log_dump's decoded hardware packet (talOS/launcher/hardware_record.h)."""
+    decoded = row.get("hardware")
+    if decoded is None or "error" in decoded:
+        raise ValueError(f"undecoded hardware packet: {decoded}")
+    return decoded
 
 
 def motor_requests(row):
-    data = packet_bytes(row)
-    count, = struct.unpack_from("<H", data, 32)
-    return {motor[0]: motor[1:] for motor in (
-        struct.unpack_from("<HBBdd", data, 38 + 20 * i)
-        for i in range(count))}
+    """Each requested motor's (mode, slot, demand, feedforward_v), by id."""
+    return {m["id"]: (m["mode"], m["slot"], m["demand"], m["feedforward_v"])
+            for m in hardware(row)["motors"]}
+
+
+def joystick(row, port=0):
+    data = hardware(row)
+    stick = next((j for j in data["joysticks"] if j["port"] == port), None)
+    if stick is None:
+        raise ValueError("scripted joystick disconnected")
+    return data, stick
 
 
 def ds_snapshot(row):
-    data = packet_bytes(row)
-    flags, = struct.unpack_from("<I", data, 24)
-    offset = 38
-    for _ in range(2):  # Length-prefixed game message and event name.
-        offset += 1 + data[offset]
-    if not data[offset]:
-        raise ValueError("scripted joystick disconnected")
-    axis1, = struct.unpack_from("<f", data, offset + 12)
-    return flags, axis1
+    data, stick = joystick(row)
+    return data["flags"], stick["axes"][1]
 
 
 def ds_buttons(row):
-    data = packet_bytes(row)
-    offset = 38
-    for _ in range(2):
-        offset += 1 + data[offset]
-    return struct.unpack_from("<I", data, offset + 4)[0]
+    return joystick(row)[1]["buttons"]
 
 
 def log_baseline_ns(session):
@@ -314,7 +302,7 @@ class FullStackSimulation(unittest.TestCase):
     def assert_driving(self, rows, start, end, drive_ids):
         samples = self.window(rows, start, end)
         self.assertTrue(all(all(
-            motor_requests(row)[i][0] == 3 and
+            motor_requests(row)[i][0] == "velocity" and
             abs(motor_requests(row)[i][2]) > 0.1 for i in drive_ids)
                             for row in samples), "missing nonzero velocity requests")
 
@@ -322,12 +310,12 @@ class FullStackSimulation(unittest.TestCase):
         for row in self.window(rows, start, end):
             requests = motor_requests(row)
             for motor in motor_ids:
-                self.assertEqual(requests[motor], (0, 0, 0.0, 0.0),
+                self.assertEqual(requests[motor], NEUTRAL,
                                  f"motor {motor} active at {row['now_ms']} ms")
 
     def assert_neutral_by(self, rows, start, deadline, end, motor_ids):
         neutral = [row for row in rows if start <= row["now_ms"] <= deadline and
-                   all(motor_requests(row)[i] == (0, 0, 0.0, 0.0)
+                   all(motor_requests(row)[i] == NEUTRAL
                        for i in motor_ids)]
         self.assertTrue(neutral, f"no neutral request by {deadline} ms")
         self.assert_neutral(rows, neutral[0]["now_ms"], end, motor_ids)
@@ -441,7 +429,7 @@ class FullStackSimulation(unittest.TestCase):
             feeding = self.window(intake_requests, ready[0]["now_ms"] + 80,
                                   ready[0]["now_ms"] + 200)
             self.assertTrue(all(
-                motor_requests(r)[roller_id][0] == 3 and
+                motor_requests(r)[roller_id][0] == "velocity" and
                 motor_requests(r)[roller_id][2] == -20.0 for r in feeding),
                 "ready shooter plus held buttons 1+3 did not feed")
             centers = []
@@ -471,13 +459,9 @@ class FullStackSimulation(unittest.TestCase):
             for row in rows:
                 if row["process"] != "hardware_node" or row["topic"] != "/hw/state":
                     continue
-                data = packet_bytes(row)
-                count, = struct.unpack_from("<H", data, STATE_MOTOR_COUNT_OFFSET)
-                for i in range(count):
-                    motor, valid = struct.unpack_from(
-                        "<HB", data, STATE_MOTORS_OFFSET + STATE_MOTOR_BYTES * i)
-                    if motor == fault_id and not valid:
-                        invalid_states.append(row)
+                if any(m["id"] == fault_id and not m["valid"]
+                       for m in hardware(row)["motors"]):
+                    invalid_states.append(row)
             self.assertGreater(len(invalid_states), 20, "motor disconnect not observed")
             disconnected = invalid_states[0]["now_ms"]
             restored = invalid_states[-1]["now_ms"]

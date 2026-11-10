@@ -6,19 +6,24 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/launcher/hardware_record.h"
 #include "talOS/launcher/launcher.h"
 #include "talOS/schema/decode.h"
 
@@ -38,6 +43,7 @@ struct Options {
   std::vector<std::string> nodes;
   std::vector<std::string> topics;
   std::vector<std::string> paths;
+  std::string config;
   std::string format{"text"};
   double since_ms{-std::numeric_limits<double>::infinity()};
   double until_ms{std::numeric_limits<double>::infinity()};
@@ -65,7 +71,7 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error) {
       continue;
     }
     if (arg != "--node" && arg != "--topic" && arg != "--since-ms" &&
-        arg != "--until-ms" && arg != "--format") {
+        arg != "--until-ms" && arg != "--format" && arg != "--config") {
       error = "unknown flag: " + arg;
       return false;
     }
@@ -78,6 +84,8 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error) {
       AddPatterns(options.nodes, value);
     } else if (arg == "--topic") {
       AddPatterns(options.topics, value);
+    } else if (arg == "--config") {
+      options.config = value;
     } else if (arg == "--format") {
       if (value != "text" && value != "jsonl" && value != "csv") {
         error = "invalid --format: " + value;
@@ -166,9 +174,21 @@ void ExportPayloadHex(std::span<const std::byte> payload) {
   std::cout << '"';
 }
 
+// The hardware packet topics' decoded JSON object (hardware_record.h), or
+// empty for any other record.
+std::string HardwareJson(const talos::launcher::MergedRecord& r,
+                         const talos::launcher::DeviceNames* names) {
+  if (r.source == nullptr || r.payload.empty()) return "";
+  const auto kind =
+      talos::launcher::HardwareRecordOf(r.source_name, r.source->schema.name);
+  if (kind == talos::launcher::HardwareRecord::kNone) return "";
+  return talos::launcher::HardwareRecordJson(kind, r.payload, names);
+}
+
 void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
-                  bool json) {
+                  bool json, const talos::launcher::DeviceNames* names) {
   const std::string schema = r.source == nullptr ? "" : r.source->schema.name;
+  const std::string hardware = HardwareJson(r, names);
   const std::string decoded =
       !schema.empty() && !r.payload.empty()
           ? talos::schema::DecodeToText(r.source->schema, r.payload)
@@ -191,6 +211,7 @@ void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
               << ",\"schema\":" << quote(schema) << ",\"payload_hex\":";
     ExportPayloadHex(r.payload);
     std::cout << ",\"decoded\":" << quote(decoded);
+    if (!hardware.empty()) std::cout << ",\"hardware\":" << hardware;
     if (r.source_name == talos::hardware::kDriverStationTopic &&
         r.payload.size() == sizeof(talos::hardware::Packet)) {
       talos::hardware::Packet packet{};
@@ -213,7 +234,73 @@ void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
               << ToMillis(base_ns, r.header.publish_time_ns) << ','
               << r.header.sequence << ',' << r.header.aux << ','
               << r.header.payload_bytes << ',' << quote(schema) << ','
-              << quote(decoded) << "\r\n";
+              << quote(decoded) << ',' << quote(hardware) << "\r\n";
+  }
+}
+
+// The "config_path" string of a session's manifest.json (launcher.h
+// SessionManifest::ToJson, escaped by introspect::AppendJsonString), or empty.
+std::string ManifestConfigPath(const std::filesystem::path& session) {
+  std::ifstream stream{session / "manifest.json"};
+  const std::string text{std::istreambuf_iterator<char>{stream}, {}};
+  constexpr std::string_view kKey = "\"config_path\"";
+  auto at = text.find(kKey);
+  if (at == std::string::npos) return "";
+  at = text.find('"', text.find(':', at + kKey.size()));
+  if (at == std::string::npos) return "";
+  std::string value;
+  for (std::size_t i = at + 1; i < text.size(); ++i) {
+    const char c = text[i];
+    if (c == '"') return value;
+    if (c != '\\') {
+      value += c;
+    } else if (i + 1 < text.size() && text[i + 1] != 'u') {
+      value += text[++i];
+    } else if (i + 5 < text.size()) {
+      value += static_cast<char>(
+          std::strtol(text.substr(i + 2, 4).c_str(), nullptr, 16));
+      i += 5;
+    }
+  }
+  return "";
+}
+
+// A relative config path is the launcher's or the user's, relative to where
+// they ran: under `bazel run` that is BUILD_WORKING_DIRECTORY, since this
+// binary then runs in its runfiles directory; otherwise the working directory.
+std::string ResolveConfigPath(const std::string& path) {
+  const char* base = std::getenv("BUILD_WORKING_DIRECTORY");
+  if (path.empty() || std::filesystem::path{path}.is_absolute() ||
+      base == nullptr || *base == '\0') {
+    return path;
+  }
+  return (std::filesystem::path{base} / path).string();
+}
+
+// Device names for the hardware packets: from --config, else from the config
+// a session directory's manifest names, when that file can still be read.
+// Without one, devices are identified by logical id only.
+std::optional<talos::launcher::DeviceNames> LoadDeviceNames(
+    const Options& options) {
+  std::string path = options.config;
+  if (path.empty()) {
+    for (const auto& input : options.paths) {
+      std::error_code ec;
+      if (!std::filesystem::is_directory(input, ec)) continue;
+      path = ManifestConfigPath(input);
+      if (!path.empty()) break;
+    }
+    if (path.empty()) return std::nullopt;
+  }
+  path = ResolveConfigPath(path);
+  try {
+    return talos::launcher::DeviceNames::FromConfig(
+        talos::config::ParseRobotConfig(path).hardware);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr,
+                 "log_dump: hardware devices by id only, config %s: %s\n",
+                 path.c_str(), e.what());
+    return std::nullopt;
   }
 }
 
@@ -227,6 +314,7 @@ int main(int argc, char** argv) {
                  "log_dump: %s\nusage: %s [--node name[,name...]] "
                  "[--topic pattern[,pattern...]] [--since-ms ms] "
                  "[--until-ms ms] [--format text|jsonl|csv] "
+                 "[--config robot.toml] "
                  "<log-file-or-dir> [more-log-files...]\n",
                  error.c_str(), argv[0]);
     return 1;
@@ -249,6 +337,10 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  const auto device_names = LoadDeviceNames(options);
+  const talos::launcher::DeviceNames* names =
+      device_names ? &*device_names : nullptr;
+
   std::vector<talos::launcher::MergedRecord> records;
   if (!talos::launcher::MergeLogs(log_files, records, error)) {
     std::fprintf(stderr, "log_dump error: %s\n", error.c_str());
@@ -267,11 +359,12 @@ int main(int argc, char** argv) {
     if (options.format == "csv") {
       std::cout
           << "process,dispatch_index,kind,source_id,topic,event_ms,now_ms,"
-             "publish_ms,sequence,aux,payload_bytes,schema,decoded\r\n";
+             "publish_ms,sequence,aux,payload_bytes,schema,decoded,"
+             "hardware\r\n";
     }
     for (const auto& r : records) {
       if (Matches(options, r, base_ns)) {
-        ExportRecord(r, base_ns, options.format == "jsonl");
+        ExportRecord(r, base_ns, options.format == "jsonl", names);
       }
     }
     return 0;
@@ -320,6 +413,9 @@ int main(int argc, char** argv) {
       std::printf(
           "      %s %s\n", r.source->schema.name.c_str(),
           talos::schema::DecodeToText(r.source->schema, r.payload).c_str());
+    }
+    if (const auto hardware = HardwareJson(r, names); !hardware.empty()) {
+      std::printf("      hardware %s\n", hardware.c_str());
     }
   }
 
