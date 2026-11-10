@@ -119,6 +119,10 @@ class Vision {
     config.mounting = camera_.mounting;
     config.layout = layout_.layout;
     config.validation_options = validation_options_;
+    // Never hold construction hostage to Metal's shared compiler-cache lock
+    // (INC-7): "auto" detects on the CPU until Metal is ready.
+    config.deferred_gpu_init = true;
+    config.log_name = std::string{node.name()};
     try {
       pipeline_ = std::make_unique<talos::vision::AprilTagPipeline>(config);
     } catch (const std::invalid_argument& error) {

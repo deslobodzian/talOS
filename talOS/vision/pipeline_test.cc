@@ -2,13 +2,17 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "talOS/vision/metal/metal_apriltag_backend.h"
@@ -158,6 +162,78 @@ TEST(PipelineTest, DoesNotInventASecondPoseWhenAmbiguitySearchFails) {
   ASSERT_EQ(result.detections.size(), 1);
   EXPECT_DOUBLE_EQ(result.detections[0].ambiguity, 1);
   EXPECT_TRUE(std::isinf(result.detections[0].secondary_reprojection_error_px));
+}
+
+// Stands in for Metal: its construction blocks until the gate opens, like
+// pipeline compilation waiting on Apple's compiler-cache lock (INC-7).
+struct Gate {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool open = false;
+  void Open() {
+    {
+      std::lock_guard lock(mutex);
+      open = true;
+    }
+    cv.notify_all();
+  }
+  void Wait() {
+    std::unique_lock lock(mutex);
+    cv.wait(lock, [this] { return open; });
+  }
+};
+
+class SlowGpuBackend : public ComputeBackend {
+ public:
+  explicit SlowGpuBackend(const std::shared_ptr<Gate>& gate) { gate->Wait(); }
+  std::string name() const override { return "metal"; }
+  std::string device_info() const override { return "test gpu"; }
+  bool supports_gpu() const override { return true; }
+  BackendExecutionResult Execute(const Frame& frame) override {
+    auto result = cpu_.Execute(frame);
+    result.effective_backend = "metal";
+    return result;
+  }
+
+ private:
+  CpuAprilTagBackend cpu_;
+};
+
+TEST(PipelineTest, DeferredGpuInitNeverBlocksConstruction) {
+  auto gate = std::make_shared<Gate>();
+  auto config = Config();
+  config.backend_name = "auto";
+  config.deferred_gpu_init = true;
+  config.gpu_backend_factory = [gate](const apriltag::DetectorOptions&) {
+    return std::make_shared<SlowGpuBackend>(gate);
+  };
+  // Returns while the GPU backend is still blocked, and detects on the CPU.
+  AprilTagPipeline pipeline(config);
+  const auto frame = TagFrame();
+  auto result = pipeline.ProcessFrame(frame);
+  ASSERT_TRUE(result.success) << result.error_message;
+  EXPECT_EQ(result.backend, "cpu");
+  EXPECT_EQ(result.detections.size(), 1);
+  // Once the GPU backend exists, the next frame runs on it.
+  gate->Open();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (pipeline.backend_name() != "metal" &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    result = pipeline.ProcessFrame(frame);
+  }
+  EXPECT_EQ(pipeline.ProcessFrame(frame).backend, "metal");
+
+  // A required GPU waits only gpu_init_timeout, then construction fails.
+  auto stuck = std::make_shared<Gate>();
+  config.backend_name = "metal";
+  config.gpu_init_timeout = std::chrono::milliseconds(20);
+  config.gpu_backend_factory = [stuck](const apriltag::DetectorOptions&) {
+    return std::make_shared<SlowGpuBackend>(stuck);
+  };
+  EXPECT_THROW(AprilTagPipeline{config}, std::invalid_argument);
+  stuck->Open();
 }
 
 void ExpectInvalid(const PipelineConfig& config, const char* field) {

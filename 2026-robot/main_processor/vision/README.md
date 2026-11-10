@@ -39,7 +39,7 @@ Shared configuration defaults and code fallbacks (overridable per camera):
 | `detector.refine_edges` | `true` | Refine detected quad edges before decoding. |
 | `detector.hamming_threshold` | `1` | Maximum corrected tag-code bits (inclusive), passed to the decoder and checked for validity. |
 | `detector.min_decision_margin` | `30.0` | Minimum AprilTag decode-margin score (inclusive), measuring image-intensity contrast, not a probability or pose error. |
-| `subsystem.backend` | `"auto"` | Use Metal when available and supported, otherwise CPU. `"cpu"` forces CPU; `"metal"` requires Metal and rejects execution fallback. |
+| `subsystem.backend` | `"auto"` | Use Metal when available and supported, otherwise CPU (always CPU off macOS). On macOS, Metal pipelines compile on a background thread and the camera detects on the CPU until they are ready. `"cpu"` forces CPU; `"metal"` requires Metal, rejects execution fallback, and fails construction if the pipelines are not compiled within 5 s. On macOS, with `auto` or `metal`, the node logs the backend it starts on and each switch. |
 
 Timing offsets and readout must be finite, nonnegative and strictly below
 1,000,000 µs; construction failures name the node and key. The single conversion
