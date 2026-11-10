@@ -1832,7 +1832,13 @@ TEST(Endpoint, PendingDegradedConfigureDoesNotBlockTicksAndRecoversDevice) {
   ConfigAckPayload ack{};
   bool received = false;
   protocol::DecodedFrame frame;
-  while (companion.TryReceive(&frame) == protocol::UdpStatus::kOk) {
+  // Loopback delivery is not immediate (notably under sanitizers): wait for
+  // the ack, skipping the state frames sent before it.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds{200};
+  while (!received &&
+         protocol::testing::ReceiveFrame(companion, &frame, deadline) ==
+             protocol::UdpStatus::kOk) {
     if (frame.header.type != protocol::FrameType::kHardwareConfigAck) continue;
     ASSERT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, ack));
     received = true;
