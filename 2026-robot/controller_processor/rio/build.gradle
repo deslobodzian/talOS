@@ -73,6 +73,12 @@ if (OperatingSystem.current().isWindows()) {
         it.cppCompiler.args.add('-pedantic')
         it.cppCompiler.args.add('-Werror')
         it.cppCompiler.args.add('-Wno-unused-parameter')
+        if (OperatingSystem.current().isMacOsX()) {
+            // Apple clang 21 warns inside WPILib's bundled gtest-printers.h
+            // (char8_t -> char32_t); older clangs do not know the flag.
+            it.cppCompiler.args.add('-Wno-unknown-warning-option')
+            it.cppCompiler.args.add('-Wno-character-conversion')
+        }
     }
 }
 
