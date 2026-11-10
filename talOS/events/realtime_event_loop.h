@@ -20,12 +20,13 @@ namespace talos::event {
 //
 // Timers come from the OS clock through the poller; messages are drained
 // rather than woken by the transport, because RTMS carries no notification
-// channel and adding one would change the shared-memory layout. Under
-// Delivery::POLL the drain runs on a fixed tick, which bounds message latency;
-// under Delivery::BEFORE_TIMERS it runs right before each timer dispatch, so a
-// periodic program wakes once per period instead of once per tick. Either way
-// every drained message is timestamped with the drain that observed it, which
-// is exactly what replay needs to reproduce.
+// channel and adding one would change the shared-memory layout. A drain runs
+// right before each timer dispatch, so a timer handler sees what was published
+// by its deadline whatever the delivery. Delivery::POLL also drains on a fixed
+// tick, which bounds message latency; under Delivery::BEFORE_TIMERS nothing
+// else drains, so a periodic program wakes once per period instead of once per
+// tick. Either way every drained message is timestamped with the drain that
+// observed it, which is exactly what replay needs to reproduce.
 template <RecorderPolicy Recorder = NullRecorder>
 class RealtimeEventLoop
     : public EventLoopBase<RealtimeEventLoop<Recorder>, Recorder> {
@@ -34,8 +35,9 @@ class RealtimeEventLoop
 
  public:
   struct Options {
-    // How often watched topics are drained under Delivery::POLL. 1 ms bounds
-    // message latency at one control cycle for a 1 kHz loop.
+    // How often watched topics are drained under Delivery::POLL, besides
+    // before each timer. 1 ms bounds message latency at one control cycle for
+    // a 1 kHz loop.
     Duration tick_period{std::chrono::milliseconds{1}};
 
     // Cap on messages drained per topic per drain, so one flooded topic
@@ -119,8 +121,7 @@ class RealtimeEventLoop
     // are recorded at the deadlines used and replay takes them from the log,
     // so the manifest's origin-relative offsets and replay are unchanged.
     scheduler_.shift(now - this->start_time());
-    const bool poll = options_.delivery == Delivery::POLL;
-    if (poll) {
+    if (options_.delivery == Delivery::POLL) {
       scheduler_.schedule(INTERNAL_POLL_TIMER_ID, now + options_.tick_period,
                           options_.tick_period);
     }
@@ -140,10 +141,11 @@ class RealtimeEventLoop
           drain_messages(expiration.deadline, now);
           continue;
         }
-        if (!poll) {
-          drain_messages(expiration.deadline, now);
-          if (!this->running()) break;
-        }
+        // Under POLL too: the poll tick due at this deadline would otherwise
+        // run after the timer (ties break on id), and update() would see
+        // inputs one tick late, and later than a node without callbacks.
+        drain_messages(expiration.deadline, now);
+        if (!this->running()) break;
         now = Poller::now();
         this->dispatch_timer(expiration.id, expiration.deadline, now,
                              expiration.cycles);

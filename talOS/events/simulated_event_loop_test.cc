@@ -236,11 +236,13 @@ TEST(SimulatedEventLoop, PausedClockCoalescesMissedTimersOnOriginalPhase) {
   EXPECT_EQ(ticks.back().sequence, 1u);
 }
 
-// Under BEFORE_TIMERS a message injected before a timer's deadline reaches
-// the handler that timer runs, and nothing drains in between; under POLL the
-// timer at the same instant runs first and the drain follows it.
-TEST(SimulatedEventLoop, BeforeTimersDrainsRightBeforeEachTimer) {
-  const auto first_effort = [](Delivery delivery) {
+// Under either delivery a message injected before a timer's deadline reaches
+// the handler that timer runs, even when a POLL tick is due at the same
+// instant (the tick loses the tie to the timer). BEFORE_TIMERS
+// drains only there; POLL also drains on every 1 ms tick.
+TEST(SimulatedEventLoop, EveryDeliveryDrainsRightBeforeEachTimer) {
+  for (const auto delivery : {Delivery::BEFORE_TIMERS, Delivery::POLL}) {
+    SCOPED_TRACE(delivery == Delivery::POLL ? "POLL" : "BEFORE_TIMERS");
     SimulationEnvironment environment;
     SimulatedEventLoop<> loop{environment};
     loop.set_delivery(delivery);
@@ -249,17 +251,15 @@ TEST(SimulatedEventLoop, BeforeTimersDrainsRightBeforeEachTimer) {
                                          10ms);
     loop.inject(simulated_topics().setpoint,
                 EventsTest::SetpointMessage{1, 5.0F});
-    loop.run_for(25ms);
-    EXPECT_EQ(robot.control_count(), 3u);
-    if (delivery == Delivery::BEFORE_TIMERS) {
-      EXPECT_EQ(loop.drains(), robot.control_count());
-    } else {
-      EXPECT_EQ(loop.drains(), 25u);
-    }
-    return robot.efforts().front();
-  };
-  EXPECT_FLOAT_EQ(first_effort(Delivery::BEFORE_TIMERS), 5.0F);
-  EXPECT_FLOAT_EQ(first_effort(Delivery::POLL), 0.0F);
+    loop.run_for(10ms);
+    loop.inject(simulated_topics().setpoint,
+                EventsTest::SetpointMessage{2, 7.0F});
+    loop.run_for(15ms);
+    ASSERT_EQ(robot.control_count(), 3u);
+    EXPECT_EQ(loop.drains(), delivery == Delivery::POLL ? 25u + 3u : 3u);
+    EXPECT_FLOAT_EQ(robot.efforts()[0], 5.0F);
+    EXPECT_FLOAT_EQ(robot.efforts()[1], 7.0F);
+  }
 }
 
 TEST(SimulatedEventLoop, DeliveryIsFixedOnceTheRunStarts) {

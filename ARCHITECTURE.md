@@ -168,12 +168,14 @@ its generation. Driver and declarative teleop producers nevertheless require
 one neutral-input evaluation before publishing active targets after DS
 recovery, startup, or an evaluation gap reaching `command_timeout_us`.
 
-Messages reach a node when its loop drains its topics. A node without message
-callbacks drains right before each of its own timers (`update()`, `every()`)
-and otherwise sleeps; a node with a `subscribe` callback or a Driver Station
-listener, or with no timer, drains every 1 ms. Off-simulation the loop thread
-runs under `SCHED_FIFO` (Linux) or the Mach time-constraint policy (macOS) with
-memory locked, best effort (`talOS/process`).
+Messages reach a node when its loop drains its topics. Every node drains right
+before each of its own timers (`update()`, `every()`), so a timer sees what was
+published by its deadline whether or not the node has callbacks. A node
+without message callbacks otherwise sleeps; a node with a `subscribe` callback
+or a Driver Station listener, or with no timer, also drains every 1 ms.
+Off-simulation the loop thread runs under `SCHED_FIFO` (Linux) or the Mach
+time-constraint policy (macOS) with memory locked, best effort
+(`talOS/process`).
 
 Messages become visible when the consumer drains its topics, but `age()` and
 `fresh()` count from the writer's publication timestamp. Draining an expired

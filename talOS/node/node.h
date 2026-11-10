@@ -145,7 +145,7 @@ class Node {
   // to "/<name>/<topic>"; [subsystems.<name>.remap] can redirect any topic.
   // A node without message callbacks receives messages right before each of
   // its timers (update(), every()); passing `on_message` to any subscription
-  // makes the node drain every 1 ms instead, so the callback runs promptly.
+  // makes the node also drain every 1 ms, so the callback runs promptly.
   // Without a callback, each drain keeps only the newest available message
   // and counts skipped messages as dropped. Callbacks receive messages in
   // sequence, up to 64 per topic per drain. age() counts from publication,

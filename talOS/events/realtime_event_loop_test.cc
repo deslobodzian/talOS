@@ -420,6 +420,30 @@ TEST(RealtimeEventLoop, BeforeTimersWakesOnlyForTimers) {
   EXPECT_LT(before.activity.wakeups, 50u);
 }
 
+// Under POLL a poll tick due at a timer's deadline loses the tie to the timer
+// (ties break on id), yet the timer must not run without a drain. The control
+// timer here is due on the first poll tick, after a setpoint publication; it
+// must see that setpoint.
+TEST(RealtimeEventLoop, PollDeliveryDrainsBeforeATimerDueWithTheTick) {
+  RealtimeEventLoop<> loop;
+  ASSERT_EQ(loop.delivery(), Delivery::POLL);
+  const Topics topics = realtime_topics();
+  TestRobot<RealtimeEventLoop<>> robot{loop, topics, 1.0F};
+  auto stop = [&loop](const Context&) { loop.exit(); };
+  const auto stop_id = loop.register_timer("stop", make_thunk(&stop));
+  // The run moves the schedule's origin to its start and arms the poll tick a
+  // tick_period later, so origin + 1 ms is that tick's deadline. The stop
+  // timer's higher id runs it after the control timer at the same instant.
+  robot.control_timer().setup_periodic(loop.start_time() + 1ms, 10ms);
+  loop.arm_timer(stop_id, loop.start_time() + 1ms, Duration::zero());
+  ipc::Publisher<EventsTest::SetpointMessage> setpoint{topics.setpoint};
+  setpoint.write(EventsTest::SetpointMessage{1, 5.0F});
+  loop.run_for(5s);  // Bound only; the stop timer exits.
+  ASSERT_EQ(robot.control_count(), 1u);
+  // 5 less the dispatch latency in seconds; 0 less it without the drain.
+  EXPECT_GT(robot.efforts().front(), 4.0F);
+}
+
 TEST(RealtimeEventLoop, DeliveryIsFixedOnceTheRunStarts) {
   RealtimeEventLoop<> loop;
   auto handler = [&loop](const Context&) {

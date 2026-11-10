@@ -257,9 +257,8 @@ compare identical inputs:
 
 - **odometry-only** and **fused** replay the baseline session. Only
   **odometry-only** withholds camera observations: it keeps the estimator's
-  camera subscriptions (whose callbacks set its 1 ms drain, and so which
-  drivetrain sample each `update()` sees) but remaps them to unrecorded
-  topics.
+  camera subscriptions, so its graph matches the fused replay's, but remaps
+  them to unrecorded topics.
 - **fused-live** is the original live baseline session, including the
   mount-error preset. It runs the backend configured in
   `subsystems/pose_estimator.toml` and has only that backend's row.

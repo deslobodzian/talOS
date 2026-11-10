@@ -247,10 +247,9 @@ class SimulatedEventLoop
           drain_messages(expiration.deadline);
           continue;
         }
-        if (options_.delivery == Delivery::BEFORE_TIMERS) {
-          drain_messages(expiration.deadline);
-          if (!this->running_state()) break;
-        }
+        // Under either delivery, as on the realtime loop.
+        drain_messages(expiration.deadline);
+        if (!this->running_state()) break;
         this->dispatch_timer(expiration.id, expiration.deadline, now_,
                              expiration.cycles);
       }

@@ -59,15 +59,18 @@ with `NOTE_CRITICAL` (macOS; a relative `kevent()` timeout is coalesced, waking
 1-2 ms late) or epoll plus an absolute-deadline timerfd (Linux). Messages are
 drained rather than woken by the transport: RTMS carries no notification
 channel and adding one would change its shared-memory layout.
-`Options::delivery` (or `set_delivery()` before the run) picks when:
+Every loop drains immediately before each timer dispatch, so a timer handler
+sees what was published by its deadline under either delivery.
+`Options::delivery` (or `set_delivery()` before the run) picks whether it also
+drains between timers:
 
-- `Delivery::POLL` (the default) drains on a fixed tick, 1 ms by default, so
-  the tick bounds message latency.
-- `Delivery::BEFORE_TIMERS` arms no poll timer and drains immediately before
-  each timer dispatch, so a loop with only periodic work wakes once per period.
-  `activity()` counts wakeups and drains; at 100 Hz that is about 20 of each
-  over 200 ms against about 200 under `POLL`
-  (`RealtimeEventLoop.BeforeTimersWakesOnlyForTimers`).
+- `Delivery::POLL` (the default) also drains on a fixed tick, 1 ms by default,
+  so the tick bounds message latency. A tick due at a timer's deadline adds
+  nothing to that timer: the timer's own drain ran first.
+- `Delivery::BEFORE_TIMERS` arms no poll timer, so a loop with only periodic
+  work wakes once per period. `activity()` counts wakeups and drains; at
+  100 Hz that is about 20 of each over 200 ms against about 200 wakeups and
+  220 drains under `POLL` (`RealtimeEventLoop.BeforeTimersWakesOnlyForTimers`).
 
 Each dispatch samples its own `now`, frozen for that callback; a slow timer
 callback cannot hide elapsed time from the next due timer. Messages retain the
