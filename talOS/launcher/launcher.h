@@ -1057,17 +1057,21 @@ inline std::string GraphToJson(
 // A roster member other than the Studio bridge that crashes -- exits nonzero
 // or by a signal -- while the session is not stopping is respawned after a
 // backoff of 50 ms, doubling within a rolling restart window, capped at 1 s.
+// A critical member's first crash in that window restarts it at once: the
+// robot cannot run without it, and a crash loop still backs off from its
+// second restart on.
 // max_restarts limits starts within that window, not the session lifetime.
 // A critical member that exits cleanly (status 0) while the session is not
-// stopping did not finish anything -- its peers still run -- so it restarts
-// on the same backoff; a non-critical clean exit is a node that finished.
+// stopping did not finish anything -- its peers still run -- so it restarts,
+// always after the backoff; a non-critical clean exit is a node that finished.
 // A run that cannot be spawned at all (fork or pipe failing, as under EAGAIN
 // or EMFILE) is rescheduled like a crash, against the same budget, so a
 // transient shortage never leaves a member down for the rest of a session
 // the launcher -- and so its service -- outlives.
 // When a clean exit's restart falls due and every other live member's latest
 // run also exited 0, the whole roster has completed and the restart is
-// dropped (see RosterContinues). The backoff is scheduled inside the
+// dropped (see RosterContinues); the backoff gives such a roster's other
+// members the time to exit. The backoff is scheduled inside the
 // supervision loop, so a restarting node never delays another node or the
 // session deadline. Every run writes its own event log.
 // ---------------------------------------------------------------------------
@@ -1076,8 +1080,13 @@ inline constexpr int kDefaultMaxRestarts = 5;
 inline constexpr std::chrono::milliseconds kRestartInitialBackoff{50};
 inline constexpr std::chrono::milliseconds kRestartMaxBackoff{1000};
 
-// The wait before restart `restart` (1 for the first).
-inline std::chrono::milliseconds RestartBackoff(int restart) {
+// The wait before restart `restart` (1 for the first in the rolling window)
+// of a `critical` member or not, after a `clean_exit` or a crash.
+inline std::chrono::milliseconds RestartBackoff(int restart, bool clean_exit,
+                                                bool critical) {
+  if (restart == 1 && critical && !clean_exit) {
+    return std::chrono::milliseconds{0};
+  }
   std::chrono::milliseconds backoff = kRestartInitialBackoff;
   for (int i = 1; i < restart && backoff < kRestartMaxBackoff; ++i) {
     backoff *= 2;
@@ -1944,9 +1953,10 @@ class Launcher {
   }
 
   // Schedules `proc`'s next start: after a backoff that doubles with each
-  // start in the rolling window or, for a non-critical member that has spent
-  // its budget there, quarantined until the oldest of those starts leaves the
-  // window. Only for a restart ShouldRestartNode allows. Returns the delay.
+  // start in the rolling window (none for a critical member's first crash
+  // there) or, for a non-critical member that has spent its budget there,
+  // quarantined until the oldest of those starts leaves the window. Only for
+  // a restart ShouldRestartNode allows. Returns the delay.
   std::chrono::milliseconds ScheduleRestart(
       NodeProcessInfo& proc, NodeLaunch& launch,
       std::chrono::steady_clock::time_point now) {
@@ -1958,7 +1968,7 @@ class Launcher {
              ? launch.restart_times.front() +
                    std::chrono::milliseconds{options_.restart_window_ms}
              : now) +
-        RestartBackoff(recent + 1);
+        RestartBackoff(recent + 1, launch.last_exit_clean, launch.critical);
     proc.retry_at_monotonic_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             launch.restart_at.time_since_epoch())

@@ -156,10 +156,12 @@ but has no `PR_SET_PDEATHSIG` or systemd watchdog: launchd's `KeepAlive`
 restarts an exited launcher, not a hung one. Nodes and helpers must remain in
 their assigned process group rather than daemonizing into another session.
 
-Critical nodes never enter quarantine: crashes and heartbeat stalls retry with
-exponential backoff from 50 ms capped at 1 s, even after exhausting the rolling
-budget. Non-critical nodes retain the circuit breaker: exhausting their budget
-quarantines them until the oldest restart ages out, plus normal backoff.
+Critical nodes never enter quarantine: crashes and heartbeat stalls keep
+restarting on the capped [restart backoff](../talOS/launcher/README.md#restarts),
+even after exhausting the rolling budget, and only a critical node's first
+crash or stall in the rolling window restarts it at once. Non-critical nodes
+retain the circuit breaker: exhausting their budget quarantines them until the
+oldest restart ages out, plus normal backoff.
 Exactly one retry is pending, so clearing a transient fault can recover without a service
 restart. The session manifest records `quarantined` and
 `retry_at_monotonic_ns`; a stopping session cancels pending retries.

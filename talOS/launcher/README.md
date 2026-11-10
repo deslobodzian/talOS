@@ -133,11 +133,14 @@ A run that cannot be spawned (fork or pipe failing, as under `EAGAIN` or
 `EMFILE`), a first run included, is retried the same way and marks the member
 `recorder_failed`. Every restart attempt counts against the budget below,
 spawned or not; the retry keeps that run's log name and restart number.
-The first restart waits 50 ms, each later one twice as long, capped
-at 1 s. Critical nodes (including every actuator owner and the hardware bridge)
-never quarantine: they keep retrying with that capped backoff. Non-critical
-nodes may restart at most `max_restarts` times within a rolling 60-second
-window (not over the whole session):
+The first restart waits 50 ms, each later one twice as long, capped at 1 s,
+except that a critical member's first crash in the restart window restarts it
+at once (its next restart there waits 100 ms). A clean exit always waits the
+backoff, which gives a roster that is completing the time to finish (below).
+Critical nodes (including every actuator owner and the hardware bridge) never
+quarantine: they keep retrying with that capped backoff. Non-critical nodes may
+restart at most `max_restarts` times within a rolling 60-second window (not
+over the whole session):
 
 ```toml
 [robot]
@@ -155,7 +158,7 @@ scheduled inside the supervision loop, like the Studio bridge's retries, so a
 restarting node never delays another node or the deadline. Each restart prints
 one line:
 
-    [launcher] alpha exited (signal 11); restart 1 in 50 ms
+    [launcher] alpha exited (signal 11); restart 1 in 0 ms
 
 When a non-critical node's rolling budget is exhausted, it is **quarantined**, not
 permanently abandoned. Exactly one retry is scheduled for the oldest restart
@@ -210,6 +213,26 @@ and `WATCHDOG=1` on every loop iteration, using nonblocking Unix datagrams
 (including Linux `@` abstract names). A hung loop therefore stops feeding the
 service watchdog. See [deployment](../../docs/DEPLOYMENT.md) for the generated
 systemd watchdog policy and macOS's launchd limitations.
+
+### Restart latency
+
+From SIGKILL of a critical member to its first hardware request, measured on
+a Linux x86-64 desktop (8 threads) by killing `drivetrain` 20 times in a
+`--sim` session of `robot_physics_sim.toml` with the physics gateway, session
+directory on btrfs. Stages are `CLOCK_MONOTONIC` stamps of the launcher's
+`waitpid` and `fork` and the node's `execv`, first constructor and file opens
+(an `LD_PRELOAD` shim), and of the restarted run's `.tlog`:
+
+| Stage | ms, median (range) | Set by |
+|---|---|---|
+| SIGKILL → launcher reaps the exit | 12.0 (3.8–19.6) | the supervision loop's 20 ms sleep |
+| reap → `fork` of the restart | 3.0 (2.7–4.3) | two manifest writes; their four `fsync`s take 2.4 |
+| `fork` → first constructor | 1.3 (1.2–1.8) | group and guardian setup, exec, dynamic loading |
+| first constructor → event-loop origin | 0.4 (0.4–3.0) | flags, event-log file |
+| origin → `run()` | 10.3 (10.3–11.0) | config parse 2.1 (`Host` and `HardwareLink` each parse the robot config: 18 file reads apiece), topic attach 0.6, then 7.3 in `Reporter::start` joining the construction heartbeat thread, which checks for a stop every 10 ms |
+| `run()` → first tick | 5.0 | one `period_us` |
+| first tick → first `/hw/request/drivetrain` | 0.0 | that tick's flush, which needs a `/hw/state` received since the node attached |
+| **total** | **33.0 (24.0–39.4)** | |
 
 ## Replaying a session into one node
 
