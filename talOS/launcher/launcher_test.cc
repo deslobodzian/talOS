@@ -1383,9 +1383,8 @@ TEST(LauncherSessions, RetentionDeletesOnlyOldSessions) {
 }
 
 // Retention passes over an old session it cannot read or cannot remove and
-// prunes the rest, a --describe-only session (graph.json alone) included;
-// neither stops the launch.
-TEST(LauncherSessions, RetentionPassesOverLockedSessionsAndPrunesGraphOnly) {
+// prunes the rest; neither stops the launch.
+TEST(LauncherSessions, RetentionPassesOverLockedSessions) {
   if (::geteuid() == 0) GTEST_SKIP() << "root reads and removes any directory";
   auto options = SessionFixture("locked_sessions");
   std::filesystem::remove_all(options.output_dir);
@@ -1393,14 +1392,12 @@ TEST(LauncherSessions, RetentionPassesOverLockedSessionsAndPrunesGraphOnly) {
   configuration.insert(configuration.find("period_us"),
                        "log_keep_sessions = 1\n");
   std::ofstream{options.config_path} << configuration;
-  // Oldest first: unreadable, unremovable, then --describe-only.
+  // Oldest first: unreadable, unremovable, then removable.
   const auto now = std::filesystem::file_time_type::clock::now();
-  for (const auto& [id, file] :
-       {std::pair{1, "manifest.json"}, std::pair{2, "manifest.json"},
-        std::pair{3, "graph.json"}}) {
+  for (const int id : {1, 2, 3}) {
     const std::string dir = options.output_dir + "/" + std::to_string(id);
     std::filesystem::create_directories(dir);
-    std::ofstream{dir + "/" + file} << "{}\n";
+    std::ofstream{dir + "/manifest.json"} << "{}\n";
     std::filesystem::last_write_time(dir, now - std::chrono::hours{4 - id});
   }
   const std::string unreadable = options.output_dir + "/1";
@@ -1415,6 +1412,62 @@ TEST(LauncherSessions, RetentionPassesOverLockedSessionsAndPrunesGraphOnly) {
   EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/3"));
   EXPECT_TRUE(std::filesystem::exists(options.output_dir + "/4/manifest.json"));
   std::filesystem::remove_all(options.output_dir);
+}
+
+// A directory named by a session id holding that session's event log, as
+// --replay-inputs leaves, is a session: counted, and pruned oldest first. One
+// holding nothing, or only what a launch writes before it starts its nodes
+// (graph.json too: --describe-only, a refused graph), is an abandoned launch:
+// never counted, and removed once another session directory is newer, so the
+// newest stays. Another session's log or any other file leaves a directory
+// alone, only session directories decide the newest, and the session a
+// replay reads is never removed under it.
+TEST(LauncherSessions, RetentionPrunesReplayOutputAndAbandonedLaunchesOnly) {
+  auto options = SessionFixture("leftovers");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  std::string configuration{kFixtureToml};
+  configuration.insert(configuration.find("period_us"),
+                       "log_keep_sessions = 2\n");
+  std::ofstream{options.config_path} << configuration;
+  const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
+  for (const int id : {6, 7, 8, 9, 10, 11, 12, 13, 2026}) {
+    std::filesystem::create_directories(dir(id));
+  }
+  WriteTestLog(dir(6) + "/consumer.tlog", "consumer", 6, {1'000'000});
+  std::ofstream{dir(7) + "/manifest.json"} << "{}\n";
+  std::ofstream{dir(9) + "/declared_graph.json"} << "[]\n";
+  // A run stopped before writing its log's header.
+  std::ofstream{dir(9) + "/consumer.tlog"}.close();
+  std::ofstream{dir(10) + "/manifest.json"} << "{}\n";
+  WriteTestLog(dir(12) + "/other.tlog", "other", 99, {1'000'000});
+  std::ofstream{dir(13) + "/graph.json"} << "{}\n";
+  std::ofstream{dir(13) + "/declared_graph.json"} << "[]\n";
+  std::ofstream{dir(2026) + "/photo.jpg"} << "not a session";
+  // Oldest first, after the files: each write moves its directory's time.
+  const auto now = std::filesystem::file_time_type::clock::now();
+  for (const auto& [id, age] :
+       {std::pair{12, 9}, std::pair{6, 8}, std::pair{7, 7}, std::pair{8, 6},
+        std::pair{9, 5}, std::pair{10, 4}, std::pair{13, 3}, std::pair{11, 2},
+        std::pair{2026, 1}}) {
+    std::filesystem::last_write_time(dir(id), now - std::chrono::hours{age});
+  }
+  // A replay of the older recorded session, into the same root.
+  options.session_id = 14;
+  options.replay_inputs = dir(7);
+  options.only = "alpha";
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  // 14 and 10 fill log_keep_sessions = 2 beside the replayed 7, so the replay
+  // output 6 goes; the abandoned 8, 9 and 13 count for nothing and are older
+  // than 11.
+  for (const int id : {6, 8, 9, 13}) {
+    EXPECT_FALSE(std::filesystem::exists(dir(id))) << id;
+  }
+  for (const int id : {7, 10, 11, 12, 14}) {
+    EXPECT_TRUE(std::filesystem::exists(dir(id))) << id;
+  }
+  EXPECT_EQ(ReadFile(dir(2026) + "/photo.jpg"), "not a session");
+  std::filesystem::remove_all(root);
 }
 
 TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {

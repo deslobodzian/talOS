@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -126,9 +127,14 @@ struct NodeProcessInfo {
   bool exited{false};
   bool quarantined{false};
   int64_t retry_at_monotonic_ns{0};  // Zero when no restart is pending.
+  // `recorder_failed`: a run could not be spawned (or the Studio bridge never
+  // came up), or a run's event log failed -- seen live in the node's registry
+  // row (introspect::kFlagRecorderFailed), or unreadable or truncated at
+  // shutdown.
   bool failed{false};
   // A run's event log reached its share of the session log budget and stopped
-  // early (`<log>.capped`): the recording is incomplete, not corrupt.
+  // early (`<log>.capped`, or live, introspect::kFlagLogCapped): the
+  // recording is incomplete, not corrupt.
   bool log_capped{false};
   uint64_t record_count{0};
   // Whether this binary answered --describe: a session whose graph was never
@@ -1625,22 +1631,86 @@ class Launcher {
     }
   }
 
-  // Whether `entry` is a session directory: a directory, not a symlink,
-  // holding the manifest.json of a launch, or only the graph.json that
-  // --describe-only and a refused graph leave. Sets `error` when that cannot
-  // be read.
-  static bool IsSessionDirectory(const std::filesystem::directory_entry& entry,
-                                 std::error_code& error) {
+  // What retention makes of a directory under the log root.
+  enum class Retained {
+    kNo,         // Not a session: left alone.
+    kSession,    // A recording: counted against log_keep_sessions and the
+                 // byte budget, oldest removed first.
+    kAbandoned,  // A launch that started no node and recorded nothing:
+                 // never counted, removed once another session directory
+                 // is newer.
+  };
+
+  // The id a session directory is named by -- std::to_string of a nonzero
+  // session id, as the constructor names it -- or nullopt for any other name.
+  static std::optional<uint64_t> SessionIdNamed(std::string_view name) {
+    uint64_t id = 0;
+    const char* const end = name.data() + name.size();
+    const auto [stop, error] = std::from_chars(name.data(), end, id);
+    if (error != std::errc{} || stop != end || id == 0 ||
+        std::to_string(id) != name)
+      return std::nullopt;
+    return id;
+  }
+
+  // The session id in the header of the event log at `path`
+  // (talOS/events/log/format.h), or 0 when the file does not start with one.
+  // Reads the fixed-size header only.
+  static uint64_t LogSessionId(const std::filesystem::path& path) {
+    event::log::FileHeader header{};
+    std::ifstream in{path, std::ios::binary};
+    if (!in.read(reinterpret_cast<char*>(&header), sizeof(header)) ||
+        std::memcmp(header.magic, event::log::FILE_MAGIC,
+                    sizeof(header.magic)) != 0)
+      return 0;
+    return header.session_id;
+  }
+
+  // Classifies `entry`, one entry of the log root; a symlink is never a
+  // session. A session is a directory holding the manifest.json of a launch,
+  // or, named by a session id, an event log whose header carries that id
+  // (what --replay-inputs leaves). A directory named by a session id that
+  // holds nothing, or only what a launch writes before it starts its nodes
+  // -- graph.json, the declared graph, an interrupted atomic write's
+  // temporary, an empty event log -- is an abandoned launch: --describe-only,
+  // a refused graph, or a launch that failed or died before its manifest.
+  // Any other content (another session's log, any other file or directory)
+  // makes it no session. Sets `error` when it cannot be read.
+  static Retained Classify(const std::filesystem::directory_entry& entry,
+                           std::error_code& error) {
     namespace fs = std::filesystem;
     if (entry.symlink_status(error).type() != fs::file_type::directory)
-      return false;
-    for (const char* name : {"manifest.json", "graph.json"}) {
-      const fs::file_type type = fs::status(entry.path() / name, error).type();
-      if (type == fs::file_type::regular) return true;
-      if (type != fs::file_type::not_found) return false;
-      error.clear();  // Absent is an answer, not an error.
+      return Retained::kNo;
+    const fs::file_type manifest =
+        fs::status(entry.path() / "manifest.json", error).type();
+    if (manifest == fs::file_type::regular) return Retained::kSession;
+    if (manifest != fs::file_type::not_found) return Retained::kNo;
+    error.clear();  // Absent is an answer, not an error.
+    const auto id = SessionIdNamed(entry.path().filename().string());
+    if (!id) return Retained::kNo;
+    constexpr std::string_view kLaunchFiles[] = {
+        "graph.json", "declared_graph.json", "graph.json.tmp",
+        "declared_graph.json.tmp", "manifest.json.tmp"};
+    bool abandoned = true;
+    for (fs::directory_iterator file{entry.path(), error};
+         !error && file != fs::directory_iterator{}; file.increment(error)) {
+      const fs::file_type type = file->symlink_status(error).type();
+      if (error) break;
+      const std::string name = file->path().filename().string();
+      if (type != fs::file_type::regular) {
+        abandoned = false;
+      } else if (name.ends_with(".tlog")) {
+        if (LogSessionId(file->path()) == *id) return Retained::kSession;
+        const uintmax_t bytes = file->file_size(error);
+        if (error) break;
+        abandoned = abandoned && bytes == 0;
+      } else if (std::ranges::find(kLaunchFiles, std::string_view{name}) ==
+                 std::ranges::end(kLaunchFiles)) {
+        abandoned = false;
+      }
     }
-    return false;
+    if (error) return Retained::kNo;
+    return abandoned ? Retained::kAbandoned : Retained::kNo;
   }
 
   // Bytes in the regular files under `dir`, symlinks not followed. Sets
@@ -1663,14 +1733,16 @@ class Launcher {
     return bytes;
   }
 
-  // Removes the oldest recognized sessions until at most `log_keep_sessions`
+  // Removes the oldest sessions (Classify) until at most `log_keep_sessions`
   // remain (the new one included) and they hold at most the half of
-  // `log_max_bytes` the new session does not get. Returns the new session's
-  // log budget: the other half, which its event writers are capped to.
+  // `log_max_bytes` the new session does not get, and every abandoned launch
+  // older than another session directory. Returns the new session's log
+  // budget: the other half, which its event writers are capped to.
   // Graph/manifest metadata and non-event captures require separate headroom.
   // A session that cannot be read or removed (another user's, unreadable,
   // removed meanwhile) is reported and passed over, never counted against
-  // the others: retention never stops a launch.
+  // the others: retention never stops a launch. The session --replay-inputs
+  // reads is passed over too: this launch is about to read it.
   uint64_t ApplyRetention(const config::RobotConfig& config) {
     namespace fs = std::filesystem;
     const auto robot = config.toml_data["robot"];
@@ -1694,22 +1766,41 @@ class Launcher {
       uintmax_t bytes;
     };
     std::vector<Session> sessions;
+    std::vector<Session> abandoned;
+    // The newest session directory other than the new one. A launch still
+    // describing has no manifest.json yet and reads as abandoned; one is
+    // removed only when another session directory is newer, so the newest
+    // launch before this one is kept, and a crash loop of launches that stop
+    // before their nodes (refused graphs included) leaves one behind rather
+    // than one per attempt, and evicts no recording.
+    auto newest = fs::file_time_type::min();
     uintmax_t total = 0;
     const fs::path current{options_.output_dir};
     std::error_code error;
     for (fs::directory_iterator entry{current.parent_path(), error};
          !error && entry != fs::directory_iterator{}; entry.increment(error)) {
       if (entry->path() == current) continue;  // Counted below.
+      std::error_code ignored;  // An input that is gone is the replay's error.
+      if (!options_.replay_inputs.empty() &&
+          fs::equivalent(entry->path(), options_.replay_inputs, ignored))
+        continue;
       std::error_code unreadable;
-      if (!IsSessionDirectory(*entry, unreadable)) {
+      const Retained kind = Classify(*entry, unreadable);
+      if (kind == Retained::kNo) {
         if (unreadable) report("skips", entry->path(), unreadable);
         continue;
       }
       const auto time = entry->last_write_time(unreadable);
-      const uintmax_t bytes =
-          unreadable ? 0 : TreeBytes(entry->path(), unreadable);
+      const uintmax_t bytes = unreadable || kind == Retained::kAbandoned
+                                  ? 0
+                                  : TreeBytes(entry->path(), unreadable);
       if (unreadable) {
         report("skips", entry->path(), unreadable);
+        continue;
+      }
+      newest = std::max(newest, time);
+      if (kind == Retained::kAbandoned) {
+        abandoned.push_back({entry->path(), time, bytes});
         continue;
       }
       total += bytes;
@@ -1719,6 +1810,12 @@ class Launcher {
       // A partial listing could remove a session newer than one it missed.
       report("removes nothing; cannot list", current.parent_path(), error);
       return session_budget;
+    }
+    for (const auto& launch : abandoned) {
+      if (launch.time >= newest) continue;
+      std::error_code removal;
+      fs::remove_all(launch.path, removal);
+      if (removal) report("cannot remove", launch.path, removal);
     }
     std::sort(
         sessions.begin(), sessions.end(),
@@ -1757,6 +1854,8 @@ class Launcher {
     std::chrono::steady_clock::time_point heartbeat_changed_at{};
     int64_t last_heartbeat{0};
     uint64_t last_dispatch{0};
+    // Event log flags of its registry rows already reported (NoteRecording).
+    uint32_t recording_reported{0};
   };
 
   static int64_t WallNanos() {
@@ -1931,6 +2030,36 @@ class Launcher {
     launch.heartbeat_killed = false;
   }
 
+  // A run's registry row says its event log stopped early
+  // (introspect::kFlagRecorderFailed, kFlagLogCapped): the rest of that run
+  // is not recorded. Reported once per member and kind, and recorded as the
+  // member's recorder_failed or log_capped while the node still runs -- in
+  // the live manifest Studio reads, and so in the final one, where a log
+  // that stopped at a record boundary would otherwise read as complete.
+  // Returns whether `proc` changed.
+  static bool NoteRecording(NodeProcessInfo& proc, NodeLaunch& launch,
+                            uint32_t flags) {
+    const uint32_t fresh =
+        flags & ~launch.recording_reported &
+        (introspect::kFlagRecorderFailed | introspect::kFlagLogCapped);
+    if (fresh == 0) return false;
+    launch.recording_reported |= fresh;
+    const std::string& log =
+        proc.log_paths.empty() ? proc.log_path : proc.log_paths.back();
+    if ((fresh & introspect::kFlagRecorderFailed) != 0) {
+      proc.failed = true;
+      std::cerr << "[launcher] " << proc.name << " event log " << log
+                << " failed; the rest of this run is not recorded\n";
+    }
+    if ((fresh & introspect::kFlagLogCapped) != 0) {
+      proc.log_capped = true;
+      std::cerr << "[launcher] " << proc.name << " event log " << log
+                << " reached its byte budget; the rest of this run is not "
+                   "recorded\n";
+    }
+    return true;
+  }
+
   // Whether any member other than `self` (and the Studio bridge, a viewer)
   // is still live -- running or awaiting a restart -- without having exited
   // 0. A clean exit's restart that falls due when none is would only rerun
@@ -1994,6 +2123,7 @@ class Launcher {
             !(studio && i == studio->index()) && proc.name != kSimGatewayName) {
           bool found = false;
           bool constructing = false;
+          uint32_t recording = 0;
           if (registry) {
             for (const auto& record : registry->header()->nodes) {
               if (record.state.load(std::memory_order_acquire) !=
@@ -2016,6 +2146,7 @@ class Launcher {
                 continue;
               found = true;
               constructing = (flags & introspect::kFlagConstructing) != 0;
+              recording = flags;
               if (beat != launch.last_heartbeat &&
                   (constructing || dispatch != launch.last_dispatch)) {
                 launch.heartbeat_changed_at = now;
@@ -2025,6 +2156,7 @@ class Launcher {
               break;
             }
           }
+          if (NoteRecording(proc, launch, recording)) PersistManifest(procs);
           const bool grace_over =
               now - launch.started_at >=
               std::chrono::milliseconds{options_.heartbeat_startup_grace_ms};

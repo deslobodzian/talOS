@@ -8,7 +8,8 @@
  * on would refuse to replay against a build with it off, and every node's
  * source ids would shift. Observability must not change the program being
  * observed. So this runs on its own thread and reads only the loop's atomics
- * plus its manifest, which is immutable once the run has started.
+ * -- its counters, and its recorder's capture state -- plus its manifest,
+ * which is immutable once the run has started.
  *
  * Construct it after the loop, so that reverse destruction order joins this
  * thread before the loop's counters go away:
@@ -257,6 +258,16 @@ class Reporter {
     registration.begin_sample();
     registration.heartbeat();
     registration.set_dispatch_count(loop.dispatch_count());
+    // Whether the event log stopped early, from a recorder that can say
+    // (event::log::LogWriter, whose answers are lock-free loads); an
+    // unlogged loop's NullRecorder cannot.
+    if constexpr (requires {
+                    loop.recorder().failed();
+                    loop.recorder().capped();
+                  }) {
+      registration.set_recording(loop.recorder().failed(),
+                                 loop.recorder().capped());
+    }
 
     const event::SourceCounters* counters = loop.source_counters();
     const std::size_t count = loop.source_counter_count();

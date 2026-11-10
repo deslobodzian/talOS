@@ -250,6 +250,7 @@ void HardwareNode::PublishIntrospection() {
     dispatches += tracker.requests;
   }
   registration_->set_dispatch_count(dispatches);
+  if (log_) registration_->set_recording(log_->failed(), log_->capped());
 
   const auto set = [this](std::size_t index, std::uint64_t events) {
     registration_->set_source(static_cast<std::uint32_t>(index), events,

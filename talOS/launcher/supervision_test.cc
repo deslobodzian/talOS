@@ -245,6 +245,42 @@ TEST(Supervision, ConstructorFailureExitsNonzeroAndIsReported) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// A run whose event log stops early is in the live manifest while it still
+// runs, not first at shutdown: its reporter flags the registry row and the
+// launcher records it. A 2-byte log_max_bytes leaves this session 1 byte, so
+// each logging member gets the 1-byte minimum share and the real node's log
+// is capped before its header; a cap is log_capped, not recorder_failed.
+TEST(Supervision, StoppedEventLogReachesTheLiveManifest) {
+  auto options = ConstructionOptions("stopped_log", 0);
+  auto config = toml::parse_file(options.config_path);
+  config["robot"].as_table()->insert_or_assign("log_max_bytes", 2);
+  std::ofstream{options.config_path} << config;
+  options.duration_s = 3;
+  // RunSession rewrites options.output_dir on return; don't read it
+  // concurrently.
+  const auto manifest = options.output_dir + "/" +
+                        std::to_string(options.session_id) + "/manifest.json";
+  std::string live;  // alpha's entry from a manifest of the running session
+  std::jthread observer{[&](const std::stop_token& stop) {
+    while (!stop.stop_requested()) {
+      const std::string text = ReadFile(manifest);
+      auto entry = ManifestEntry(text, "alpha");
+      if (text.find("\"end_wall_ns\": 0,") != std::string::npos &&
+          entry.find("\"log_capped\": true") != std::string::npos) {
+        live = std::move(entry);
+        return;
+      }
+      std::this_thread::sleep_for(2ms);
+    }
+  }};
+  EXPECT_EQ(RunSession(options), 0);
+  observer.request_stop();
+  observer.join();
+  ASSERT_FALSE(live.empty()) << "no live manifest recorded the capped log";
+  EXPECT_NE(live.find("\"recorder_failed\": false"), std::string::npos) << live;
+  std::filesystem::remove_all(options.output_dir);
+}
+
 TEST(Supervision,
      NonCriticalDescribeFailureWarnsAndRestartsWithoutBlockingPeers) {
   auto options = BaseOptions("optional_probe");

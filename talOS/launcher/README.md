@@ -30,7 +30,8 @@ from a name. Naming and graph violations still refuse startup.
 
 **Phase two starts.** Only then does the launcher fork the roster and supervise
 it. It persists the session manifest before spawning and atomically replaces it
-as nodes start, restart, or exit; normal shutdown adds final log counts.
+as nodes start, restart or exit, or report a stopped event log; normal shutdown
+adds final log counts.
 
 `--describe-only` stops after phase one, which makes the check useful on its own
 — in CI, in a pit before a match, or after a rename that touched two packages.
@@ -171,6 +172,15 @@ manifest records each node's `restart_count` and every log in `log_paths`
 `log_dump` on the session directory merges every `*.tlog`, restarts included.
 A node's `exit_code` and `pid` are its last run's.
 
+A run whose event log stops early says so in its registry row while it runs
+(see [event log state](../introspection/README.md#event-log-state)). The
+launcher prints one line per member and kind, and marks the member in the live
+manifest: `recorder_failed` for a failed log, `log_capped` for one at its byte
+budget. At normal shutdown it also marks a truncated or unreadable log
+`recorder_failed` and a capped one (`<log>.capped`) `log_capped`; a log whose
+capture stopped at a record boundary looks complete there, so only the live
+row reports it.
+
 `--heartbeat-periods N` defaults to 10 periods, with a minimum timeout of
 500 ms. `--heartbeat-startup-grace-ms MS` defaults to 5000 ms for processes
 that have not registered. Such processes are killed once both that grace and
@@ -259,20 +269,32 @@ both spellings behave the same.
 `DIR/<session_id>/`, including deployed `TALOS_LOG_DIR` roots. Without the flag,
 the root is `/tmp/talos_logs`. Use persistent storage on a deployed robot.
 `manifest.json` is written before nodes start, flushed and synced, then replaced
-atomically at each process lifecycle change; an interrupted session retains its
-last complete manifest (`end_wall_ns = 0` means no normal shutdown).
+atomically at each process lifecycle change and when a node reports a stopped
+event log; an interrupted session retains its last complete manifest
+(`end_wall_ns = 0` means no normal shutdown).
 
-At startup, retention removes the oldest recognized sessions: directories
-holding a `manifest.json`, or only the `graph.json` that `--describe-only` and a
-refused graph leave. `[robot] log_keep_sessions` defaults to 50, including the
-new session; `log_max_bytes` defaults to 2 GiB. Both must be positive.
-Half the byte budget is reserved for the new session's event logs and divided
-among logging members; restarts share their member's remaining budget.
-Older sessions are retained within the other half. Symlinks, unrelated
-directories and the current session are not deleted. A session retention
-cannot read or remove (another user's, unreadable, removed meanwhile) is
-reported and passed over; it never stops a launch. Graph/manifest metadata
-and non-event captures are outside the event-writer caps.
+At startup, retention removes the oldest sessions: directories holding a
+`manifest.json`, or, named by a session id, an event log whose header carries
+that id (what `--replay-inputs` leaves). `[robot] log_keep_sessions` defaults
+to 50, including the new session; `log_max_bytes` defaults to 2 GiB. Both must
+be positive. Half the byte budget is reserved for the new session's event logs
+and divided among logging members; restarts share their member's remaining
+budget. Older sessions are retained within the other half. A directory named
+by a session id that holds nothing, or only what a launch writes before it
+starts its nodes (`graph.json`, `declared_graph.json`, the `.tmp` of an
+interrupted write, empty `.tlog` files), is a launch that recorded nothing:
+`--describe-only`, a refused graph, or a launch that failed or died early. It
+never counts against `log_keep_sessions` or the byte budget, and it is removed
+once another session directory is newer: one newer than every other (a
+`--describe-only` result just written, or a launch still describing) survives
+the next launch, and a crash loop, refused graphs included, leaves one such
+directory instead of evicting recorded sessions. Symlinks, other directories
+(including one named by a session id that holds another session's log or any
+other file), the current session and the session `--replay-inputs` reads are
+not deleted. A session retention cannot read or remove (another user's,
+unreadable, removed meanwhile) is reported and passed over; it never stops a
+launch. Graph/manifest metadata and non-event captures are outside the
+event-writer caps.
 
 Simulation is only permitted with effective remote `127.0.0.1`. `--sim` with a
 different configured or overridden remote is refused before any process starts.

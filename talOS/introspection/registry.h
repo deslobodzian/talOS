@@ -11,11 +11,12 @@
  * This is where every node says so. One shared-memory segment holds a fixed
  * array of slots; a node claims one at startup, writes its event-loop manifest
  * into it -- every timer, watcher, fetcher and sender, by name and message size
- * -- and then keeps a heartbeat, a set of counters and the lane each of its
- * Targets selected current while it runs. Studio and any agent map the segment
- * read-only and get the whole system: which processes exist, which topics each
- * one publishes and subscribes to, how much traffic has actually moved, and who
- * drives each subsystem.
+ * -- and then, while it runs, keeps current a heartbeat, a set of counters,
+ * the lane each of its Targets selected and whether its event log stopped
+ * early. Studio and any agent map the segment read-only and get the whole
+ * system: which processes exist, which topics each one publishes and
+ * subscribes to, how much traffic has actually moved, who drives each
+ * subsystem, and which recordings are incomplete.
  *
  * The layout is frozen and the version is part of the segment name, so a node
  * from an older build cannot be misread by a newer reader: it lands in a
@@ -90,6 +91,11 @@ namespace talos::introspect {
 // rather than misreading the new records, until it is rebuilt.
 // Version 3 changes the heartbeat epoch from wall time to the host monotonic
 // clock. Mixing epochs would make healthy nodes appear stale.
+//
+// The event log flags (kFlagRecorderFailed, kFlagLogCapped) did not bump it:
+// they are bits of `flags` that every earlier writer left clear, which reads
+// as "no stopped log seen" -- all an earlier build could have said -- and
+// every earlier reader tests only the bits it knows.
 inline constexpr std::uint32_t kRegistryVersion = 3;
 inline constexpr const char* kRegistryPath = "/talos_registry.3";
 
@@ -124,6 +130,15 @@ inline constexpr std::uint32_t kFlagReplay = 1u << 1;
 // SlotState::ACTIVE means the slot is owned, not that the node is dispatching.
 inline constexpr std::uint32_t kFlagConstructing = 1u << 2;
 inline constexpr std::chrono::seconds kConstructionTimeout{30};
+
+// Event log flags: the node's event log stopped early, so the rest of its run
+// is not recorded. kFlagRecorderFailed mirrors LogWriter::failed() -- a disk
+// error, or capture abandoned because the writer fell behind or a record did
+// not fit -- and kFlagLogCapped mirrors capped(), the log reaching its byte
+// budget. Set while the node runs (NodeRegistration::set_recording) and never
+// cleared, because capture never resumes; a new claim starts without them.
+inline constexpr std::uint32_t kFlagRecorderFailed = 1u << 3;
+inline constexpr std::uint32_t kFlagLogCapped = 1u << 4;
 
 // One event source, as the owning node registered it. The descriptive fields
 // are written once, before the slot goes ACTIVE; the counters keep moving.
@@ -632,6 +647,15 @@ class NodeRegistration {
     }
     record_->selections[index].selected.store(selected,
                                               std::memory_order_relaxed);
+  }
+
+  // Sets kFlagRecorderFailed / kFlagLogCapped for an event log that failed or
+  // reached its cap; neither is ever cleared. Called inside a sample.
+  void set_recording(bool failed, bool capped) {
+    if (!owns_slot()) return;
+    const std::uint32_t flags =
+        (failed ? kFlagRecorderFailed : 0u) | (capped ? kFlagLogCapped : 0u);
+    if (flags != 0) record_->flags.fetch_or(flags, std::memory_order_relaxed);
   }
 
   void activate() {

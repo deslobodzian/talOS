@@ -1,8 +1,9 @@
 # Live node registry
 
 `registry.h` exposes a shared-memory registry of node identities, endpoints,
-heartbeats, source counters and Target selections. `RegistryReader` maps it
-read-only; `Reporter` publishes a node's event-loop data.
+heartbeats, source counters, Target selections and event log state.
+`RegistryReader` maps it read-only; `Reporter` publishes a node's event-loop
+data.
 
 ## The segment
 
@@ -74,6 +75,20 @@ holds `kMaxSelectionsPerNode` Targets and `kMaxSelectionSources` names each;
 the declared counts say when a node or a policy had more, and a selected source
 past the name table reads as `#<index>` rather than as nobody.
 
+## Event log state
+
+A node's event log can stop early, and capture never resumes: `LogWriter`
+reports `failed()` for a disk error or for capture abandoned (the writer fell
+behind, or a record did not fit), and `capped()` for a log that reached its
+byte budget. The `Reporter` copies both into the row's `flags` in each full
+sample, when the loop's recorder reports them, as `kFlagRecorderFailed` and
+`kFlagLogCapped`; the hardware bridge does the same for its own log
+(`NodeRegistration::set_recording`). They are bits of the existing `flags`
+word, which needs no layout or version change: an older writer leaves them
+clear, and an older reader ignores them. Once set they stay set until the slot
+is claimed again. The launcher records them in the session manifest while the
+node runs ([launcher supervision](../launcher/README.md#restarts)).
+
 
 ## Claiming a slot, and liveness
 
@@ -127,9 +142,9 @@ before storing `running_`, synchronizing the reporter's load. The reporter
 publishes endpoints and clears the constructing flag only when the manifest
 and counters exist. The launcher bounds construction from process spawn;
 see [launcher supervision](../launcher/README.md#restarts).
-The reporter samples full source counters and selections every 250 ms and
-heartbeat/dispatch progress every 10 ms. Full counters can lag the progress
-pair until the next full sample.
+The reporter samples full source counters, selections and event log state
+every 250 ms and heartbeat/dispatch progress every 10 ms. Full counters can lag
+the progress pair until the next full sample.
 Short sleeps also let a node which exits leave the viewer promptly; a final
 full sample preserves its last counters.
 
