@@ -369,6 +369,11 @@ class Soak(unittest.TestCase):
                 launcher_log = tmp / "launcher.txt"
                 if launcher_log.exists():
                     print(launcher_log.read_text(errors="replace")[-20000:], flush=True)
+                # The launcher reports only a starting bridge's exit code; its
+                # own reason (webroot, HTTP listen, config) is in its log.
+                for bridge_log in output.glob("*/studio_bridge.log"):
+                    print(f"{bridge_log}:\n" +
+                          bridge_log.read_text(errors="replace")[-4000:], flush=True)
 
 
 if __name__ == "__main__":

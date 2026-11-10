@@ -224,7 +224,9 @@ run fits Bazel's 900 s `long` timeout) with the stick centred for the first
   `restart_count` equals the number of times it was killed.
 
 It prints each owner's request-gap p99 and maximum. Failure artifacts are
-retained in the test's undeclared outputs.
+retained in the test's undeclared outputs, and a failure prints the tails of
+the launcher's and the Studio bridge's logs (the bridge's own exit reason is
+only in its log).
 
 ## Pose-estimator accuracy scenario
 
