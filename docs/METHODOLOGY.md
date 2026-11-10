@@ -1,6 +1,6 @@
 # Engineering methodology
 
-Working conventions for talos code. [`.omp/RULES.md`](../.omp/RULES.md) holds
+Working conventions for talos code. [RULES.md](../RULES.md) holds
 the hard rules; [ARCHITECTURE.md](../ARCHITECTURE.md) holds architecture,
 tick, target, topic and configuration contracts. API reference:
 [NODE_DEVELOPMENT_GUIDE.md](NODE_DEVELOPMENT_GUIDE.md).
@@ -10,7 +10,7 @@ Each rule carries its status:
 | Mark | Meaning |
 |---|---|
 | **[enforced]** | the build, the graph lint or a test fails when it is broken |
-| **[review]** | a convention; reviewers (`WATCHDOG.md`) check it |
+| **[review]** | a convention; the `reviewer` agent (`.claude/agents/reviewer.md`) checks it |
 
 ## 1. What the four goals mean here
 

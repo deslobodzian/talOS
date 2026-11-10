@@ -4,7 +4,7 @@ This is the wire/slot contract, not the native `sizeof(State)` or a claim about
 Ethernet airtime. Bytes below exclude UDP/IP/Ethernet overhead unless explicitly
 included. Changes to a frame, codec, device cap, slot, or telemetry budget must
 update this document and its matching compile-time assert in the same change
-([hard rule](../.omp/RULES.md)). Fully populated encoder tests pin the State,
+([hard rule](../RULES.md)). Fully populated encoder tests pin the State,
 Command, and Driver Station formulas to the actual encoders.
 
 ## Processes and links
