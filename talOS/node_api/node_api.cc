@@ -283,6 +283,11 @@ int32_t talos_node_simulation(const TalosNode* node) {
                         [&] { return AsNode(node).simulation() ? 1 : 0; });
 }
 
+int32_t talos_node_describing(const TalosNode* node) {
+  return Guard<int32_t>(TALOS_ERR,
+                        [&] { return AsNode(node).describing() ? 1 : 0; });
+}
+
 int64_t talos_node_now_ns(const TalosNode* node) {
   return Guard<int64_t>(0, [&] { return AsNode(node).now().nanos(); });
 }

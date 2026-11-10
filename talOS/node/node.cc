@@ -89,6 +89,7 @@ struct Node::Impl {
   std::string config_path;
   std::shared_ptr<const config::RobotConfig> config;
   bool simulation = false;
+  bool describing = false;
   detail::LoopPort* loop = nullptr;
   detail::GraphSource graph;
   std::optional<std::filesystem::path> session_dir;
@@ -259,6 +260,7 @@ Node::Node(detail::NodeSetup setup) : impl_{std::make_unique<Impl>()} {
   impl.config_path = std::move(setup.config_path);
   impl.config = std::move(setup.config);
   impl.simulation = setup.simulation;
+  impl.describing = setup.describing;
   impl.loop = setup.loop;
   impl.graph = std::move(setup.graph);
   impl.session_dir = std::move(setup.session_dir);
@@ -289,6 +291,7 @@ Node::~Node() {
 
 std::string_view Node::name() const { return impl_->name; }
 bool Node::simulation() const { return impl_->simulation; }
+bool Node::describing() const { return impl_->describing; }
 Time Node::now() const { return impl_->loop->now(); }
 std::uint64_t Node::tick() const { return impl_->ticks; }
 Duration Node::period() const { return impl_->period; }
@@ -995,6 +998,7 @@ Hosted Host(std::unique_ptr<LoopPort> port, const char* node_name,
   setup.config = std::make_shared<const config::RobotConfig>(
       config::ParseRobotConfig(flags.config_path));
   setup.simulation = flags.simulation;
+  setup.describing = flags.describe;
   setup.loop = hosted.port.get();
   setup.graph = GraphFromFlags(flags, node_name);
   setup.session_dir = std::move(session_dir);
@@ -1158,10 +1162,12 @@ int RunMain(int argc, char** argv, const char* node_name,
   try {
     const Flags flags = ParseFlags(argc, argv, node_name);
     // --describe builds the node for real and prints what its constructor
-    // registered. The loop is the only difference: a simulated loop's
-    // channels live in this process and its byte topics are discarded, so no
-    // shared memory, no hardware and no network is touched, and the launcher
-    // can ask what a node is without starting a robot, or while one runs.
+    // registered. The loop and Node::describing() are the only differences:
+    // a simulated loop's channels live in this process and its byte topics
+    // are discarded, so no shared memory, no hardware and no network is
+    // touched, and the launcher can ask what a node is without starting a
+    // robot, or while one runs. The loop never runs, so no update() or
+    // callback sees a node built without its backends.
     if (flags.describe) {
       event::SimulationEnvironment environment;
       event::SimulatedEventLoop<> loop{environment};

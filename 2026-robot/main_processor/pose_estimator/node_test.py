@@ -920,16 +920,43 @@ class EstimatorTest(unittest.TestCase):
 
 
 class BinaryTest(unittest.TestCase):
-    def run_binary(self, *argv):
+    def start_binary(self, *argv, **extra_env):
         resolver = runfiles.Create()
         binary = resolver.Rlocation(os.environ["POSE_ESTIMATOR_BINARY"])
-        env = dict(os.environ, **resolver.EnvVars())
+        env = dict(os.environ, **resolver.EnvVars(), **extra_env)
         env.pop("PYTHONPATH", None)
         with tempfile.TemporaryDirectory() as cwd:
-            proc = subprocess.run([binary, *argv], cwd=cwd, env=env,
+            return subprocess.run([binary, *argv], cwd=cwd, env=env,
                                   capture_output=True, text=True, timeout=120)
+
+    def run_binary(self, *argv):
+        proc = self.start_binary(*argv)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return proc.stdout
+
+    def test_describe_validates_the_config_without_loading_a_backend(self):
+        """The launcher's --describe probe must answer within its deadline
+        under load: wpimath and gtsam are most of a cold describe, so the
+        probe declares the endpoints without importing either, and still
+        refuses a configuration the backend would refuse."""
+        proc = self.start_binary("--describe", "--config", CONFIG,
+                                 PYTHONPROFILEIMPORTTIME="1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        imported = {line.rsplit("|", 1)[-1].strip().split(".")[0]
+                    for line in proc.stderr.splitlines()
+                    if line.startswith("import time:")}
+        self.assertIn("talos", imported)  # import profiling took effect
+        self.assertNotIn("wpimath", imported)
+        self.assertNotIn("gtsam", imported)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = os.path.join(tmp, "robot.toml")
+            with open(config, "w", encoding="utf-8") as f:
+                f.write(robot_toml("factor_graph",
+                                   extra="factor_graph.prior_std_x_m = 0.0"))
+            proc = self.start_binary("--describe", "--config", config)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("prior_std_x_m", proc.stderr)
 
     def test_describe_lists_the_drivetrain_and_camera_inputs(self):
         doc = json.loads(self.run_binary("--describe", "--config", CONFIG))

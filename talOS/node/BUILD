@@ -83,6 +83,14 @@ talos_cc_node(
     deps = ["//talOS/introspection:describe"],
 )
 
+# A node that prints Node::describing() from its constructor.
+talos_cc_node(
+    name = "describing_node",
+    srcs = ["testdata/describing_node.cc"],
+    node_name = "describing_node",
+    visibility = ["//visibility:private"],
+)
+
 # A node whose constructor blocks until stdin closes, for the stop-during-
 # construction test.
 talos_cc_node(
@@ -99,12 +107,14 @@ cc_test(
     data = [
         "testdata/robot.toml",
         ":blocked_node",
+        ":describing_node",
         ":graph_node",
         ":test_node",
     ],
     env = {
         "TALOS_TEST_NODE": "$(rlocationpath :test_node)",
         "TALOS_BLOCKED_NODE": "$(rlocationpath :blocked_node)",
+        "TALOS_DESCRIBING_NODE": "$(rlocationpath :describing_node)",
         "TALOS_GRAPH_NODE": "$(rlocationpath :graph_node)",
         "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
     },

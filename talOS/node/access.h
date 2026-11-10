@@ -52,6 +52,7 @@ struct NodeSetup {
   std::string config_path;
   std::shared_ptr<const config::RobotConfig> config;  // parsed config_path
   bool simulation = false;
+  bool describing = false;  // --describe: Node::describing()
   LoopPort* loop = nullptr;
   GraphSource graph;  // unset: no graph (null)
   // The session output directory the launcher started this node under (the

@@ -888,6 +888,28 @@ TEST(Binary, AGraphReaderDescribesWhatTheGraphItWasGivenHolds) {
   EXPECT_NE(run.status, 0);
 }
 
+// Node::describing() is set only for the launcher's --describe probe: a run
+// (and a Sim) builds the node with it clear, so no node skips its backends
+// for real.
+TEST(Binary, OnlyTheDescribeProbeBuildsANodeThatIsDescribing) {
+  const Result described =
+      RunBinary("--describe " + ConfigFlag(), "TALOS_DESCRIBING_NODE");
+  ASSERT_EQ(described.status, 0) << described.output;
+  EXPECT_NE(described.output.find("describing=1"), std::string::npos)
+      << described.output;
+
+  const Result run =
+      RunBinary("--sim --duration-s 1 --log '" +
+                    TempFile("describing_node.tlog") + "' " + ConfigFlag(),
+                "TALOS_DESCRIBING_NODE");
+  ASSERT_EQ(run.status, 0) << run.output;
+  EXPECT_NE(run.output.find("describing=0"), std::string::npos) << run.output;
+
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Silent>("listener");
+  EXPECT_FALSE(sim.node("listener").describing());
+}
+
 // SIGINT while the constructor is blocked in a system call does not kill the
 // node: the call keeps waiting, and once the constructor returns the node
 // exits cleanly without running its loop.

@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 23u
+#define TALOS_NODE_ABI_VERSION 24u
 
 enum {
   TALOS_OK = 0,
@@ -74,6 +74,8 @@ int32_t talos_run(int32_t argc, char** argv, const char* node_name,
 
 const char* talos_node_name(const TalosNode* node);
 int32_t talos_node_simulation(const TalosNode* node);
+// 1 while the node is built to answer --describe (Node::describing()).
+int32_t talos_node_describing(const TalosNode* node);
 int64_t talos_node_now_ns(const TalosNode* node);
 uint64_t talos_node_tick(const TalosNode* node);
 // The update() index state machines stamp a transition with.

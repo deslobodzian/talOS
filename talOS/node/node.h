@@ -120,6 +120,12 @@ class Node {
 
   std::string_view name() const;  // subsystem name (== node_name)
   bool simulation() const;        // --sim
+  // True only while the binary builds this node to answer --describe (the
+  // launcher's probe), which prints what the constructor registered and exits
+  // without running update(). A node may skip building heavy native backends
+  // then, but validates every parameter and declares exactly the endpoints it
+  // declares otherwise. False under testing::Sim, in replay and in a run.
+  bool describing() const;
   Time now() const;
   std::uint64_t tick() const;  // update() calls completed so far
   Duration period() const;     // [subsystem] period_us, else [robot] period_us

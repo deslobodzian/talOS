@@ -46,6 +46,11 @@ uses the same gates after compensating for intervening odometry. With multiple
 configured cameras, at least two distinct cameras must supply that evidence.
 A confirmed large innovation resets the backend to that measurement, so the
 evidence for the old pose cannot outvote it.
+
+While the node is built for the launcher's --describe probe
+(node.describing), it validates its configuration and declares its endpoints
+but builds no backend and imports neither wpimath nor gtsam: those imports
+are most of a cold describe. The probe never runs update().
 """
 
 import bisect
@@ -62,10 +67,10 @@ from drivetrain.DrivetrainState import DrivetrainState
 from geometry.PoseEstimate import PoseEstimate
 from geometry.PoseObservation import PoseObservation
 from pose_estimator import topics
-from wpimath.estimator import SwerveDrive4PoseEstimator
-from wpimath.geometry import (Pose2d, Rotation2d, Transform2d, Translation2d,
-                              Twist2d)
-from wpimath.kinematics import SwerveDrive4Kinematics, SwerveModulePosition
+
+# wpimath, bound by _load_wpimath() when the backend is built.
+Pose2d = Rotation2d = Transform2d = Translation2d = Twist2d = None
+SwerveDrive4PoseEstimator = SwerveDrive4Kinematics = SwerveModulePosition = None
 
 # wpimath's pose buffer (SwerveDrivePoseEstimator kBufferDuration): an older
 # observation could not be replayed against odometry.
@@ -97,6 +102,17 @@ MAX_PENDING_OBSERVATIONS = 64
 _KNOWN_ALLIANCES = (talos.Alliance.BLUE, talos.Alliance.RED)
 
 
+def _load_wpimath():
+    global Pose2d, Rotation2d, Transform2d, Translation2d, Twist2d
+    global SwerveDrive4PoseEstimator, SwerveDrive4Kinematics
+    global SwerveModulePosition
+    from wpimath.estimator import SwerveDrive4PoseEstimator
+    from wpimath.geometry import (Pose2d, Rotation2d, Transform2d,
+                                  Translation2d, Twist2d)
+    from wpimath.kinematics import (SwerveDrive4Kinematics,
+                                    SwerveModulePosition)
+
+
 def _positive(node, key, default):
     value = node.param(key, default)
     if not (math.isfinite(value) and value > 0):
@@ -106,13 +122,14 @@ def _positive(node, key, default):
 
 
 def _initial_pose(node):
+    """(x_m, y_m, yaw_rad) of the configured startup seed."""
     values = []
     for key in ("initial_x_m", "initial_y_m", "initial_yaw_rad"):
         value = node.param(key, 0.0)
         if not math.isfinite(value):
             raise ValueError(f"pose_estimator: {key} must be finite, got {value}")
         values.append(value)
-    return Pose2d(values[0], values[1], Rotation2d(values[2]))
+    return tuple(values)
 
 
 def _std_devs(node, table, prefix, defaults):
@@ -182,12 +199,12 @@ def _odometry_at(samples, time_s):
 class KalmanBackend:
     """wpimath.estimator.SwerveDrive4PoseEstimator."""
 
-    def __init__(self, node, kinematics):
+    def __init__(self, kinematics, initial, state_std):
         self.kinematics = kinematics
-        self.state_std = _std_devs(node, "kalman", "state_std",
-                                   (0.1, 0.1, 0.1))
+        self.state_std = state_std
         self.estimator = None
-        self.initial_pose = _initial_pose(node)
+        self.initial_pose = Pose2d(initial[0], initial[1],
+                                   Rotation2d(initial[2]))
         self.samples = collections.deque()
         self.yaw = Rotation2d()
         self.positions = None
@@ -275,17 +292,16 @@ class FactorGraphBackend:
     is kept; a failed observation is dropped and reported as not fused.
     """
 
-    def __init__(self, node, kinematics, lag_s):
+    def __init__(self, kinematics, lag_s, initial, odometry_std, prior_std):
         # Loaded here, for this backend only, so a kalman configuration never
         # loads gtsam's ~150 MB of native code.
         self.gtsam = importlib.import_module("gtsam")
         self.kinematics = kinematics
         self.lag_s = lag_s
-        self.odometry_noise = self.gtsam.noiseModel.Diagonal.Sigmas(np.array(
-            _std_devs(node, "factor_graph", "odometry_std",
-                      (0.01, 0.01, 0.005))))
-        self.prior_noise = self.gtsam.noiseModel.Diagonal.Sigmas(np.array(
-            _std_devs(node, "factor_graph", "prior_std", (1.0, 1.0, 0.5))))
+        self.odometry_noise = self.gtsam.noiseModel.Diagonal.Sigmas(
+            np.array(odometry_std))
+        self.prior_noise = self.gtsam.noiseModel.Diagonal.Sigmas(
+            np.array(prior_std))
         self.smoother = None
         # The samples whose keys are still in the smoother, plus the newest
         # marginalized one as the interpolation anchor just past the window
@@ -296,7 +312,8 @@ class FactorGraphBackend:
         self.yaw = Rotation2d()
         self.positions = None
         self.estimate = Pose2d()
-        self.initial_pose = _initial_pose(node)
+        self.initial_pose = Pose2d(initial[0], initial[1],
+                                   Rotation2d(initial[2]))
         # kind: (failures since the last report, that report's sample time)
         self.failures = {}
 
@@ -443,8 +460,7 @@ class FactorGraphBackend:
 class PoseEstimator:
     def __init__(self, node):
         self.node = node
-        kinematics = SwerveDrive4Kinematics(*(
-            Translation2d(x, y) for x, y in _module_offsets(node)))
+        module_offsets = _module_offsets(node)
         max_age_us = node.param("max_observation_age_us",
                                 MAX_OBSERVATION_AGE_LIMIT_US)
         if not 0 < max_age_us <= MAX_OBSERVATION_AGE_LIMIT_US:
@@ -467,14 +483,29 @@ class PoseEstimator:
         self.max_innovation_m = _positive(node, "max_innovation_m", 3.0)
         self.max_yaw_innovation_rad = _positive(
             node, "max_yaw_innovation_rad", 0.2618)
+        initial = _initial_pose(node)
         backend = node.param("backend")
         if backend == "kalman":
-            self.backend = KalmanBackend(node, kinematics)
+            backend_args = (initial, _std_devs(node, "kalman", "state_std",
+                                               (0.1, 0.1, 0.1)))
         elif backend == "factor_graph":
-            self.backend = FactorGraphBackend(node, kinematics, self.max_age_s)
+            backend_args = (
+                self.max_age_s, initial,
+                _std_devs(node, "factor_graph", "odometry_std",
+                          (0.01, 0.01, 0.005)),
+                _std_devs(node, "factor_graph", "prior_std", (1.0, 1.0, 0.5)))
         else:
             raise ValueError(f"pose_estimator: backend must be \"kalman\" or "
                              f"\"factor_graph\", got {backend!r}")
+        # The --describe probe never runs update(), so it needs no backend.
+        self.backend = None
+        if not node.describing:
+            _load_wpimath()
+            kinematics = SwerveDrive4Kinematics(*(
+                Translation2d(x, y) for x, y in module_offsets))
+            backend_class = (KalmanBackend if backend == "kalman"
+                             else FactorGraphBackend)
+            self.backend = backend_class(kinematics, *backend_args)
         self.drive = node.subscribe(DrivetrainState, drivetrain_topics.STATE)
         cameras = node.param("cameras")
         if (not isinstance(cameras, list)

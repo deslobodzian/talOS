@@ -111,6 +111,13 @@ class Node:
         return bool(lib.talos_node_simulation(self._handle))
 
     @property
+    def describing(self):
+        """True only while the node is built to answer --describe: skip
+        building heavy native backends, but validate every parameter and
+        declare the same endpoints as in a run."""
+        return bool(lib.talos_node_describing(self._handle))
+
+    @property
     def now(self):
         return lib.talos_node_now_ns(self._handle) / _NS
 
