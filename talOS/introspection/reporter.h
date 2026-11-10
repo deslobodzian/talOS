@@ -26,8 +26,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -134,7 +136,7 @@ class Reporter {
     thread_ = std::jthread{[this](const std::stop_token& stop) {
       while (!stop.stop_requested()) {
         if (registration_) registration_->heartbeat();
-        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        pause(stop, std::chrono::milliseconds{10});
       }
     }};
   }
@@ -189,7 +191,7 @@ class Reporter {
     // that store synchronizes with this load, so a visible `true` means the
     // manifest is frozen and the counters exist.
     while (!stop.stop_requested() && !loop.running()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds{2});
+      pause(stop, std::chrono::milliseconds{2});
       if (registration_) registration_->heartbeat();
     }
     if (stop.stop_requested()) {
@@ -239,13 +241,13 @@ class Reporter {
 
     while (!stop.stop_requested() && loop.running()) {
       sample(loop, *registration);
-      // Short sleeps rather than one long one, so shutdown is prompt: a node
-      // that has exited should leave the viewer immediately, not a quarter
-      // second later.
+      // Short waits rather than one long one, so the end of the loop is seen
+      // promptly: a node that has exited should leave the viewer immediately,
+      // not a quarter second later. stop() itself wakes the wait.
       const auto deadline = std::chrono::steady_clock::now() + options_.period;
       while (!stop.stop_requested() && loop.running() &&
              std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        pause(stop, std::chrono::milliseconds{10});
         // A 250 ms-old progress sample plus a short process suspension used
         // to look like a 500 ms stall before the process could even resume.
         // Keep this cheap: no source scan, allocation, or selection callbacks.
@@ -311,11 +313,21 @@ class Reporter {
     registration.end_sample();
   }
 
+  // Waits `period`, returning as soon as a stop is requested, so stop() --
+  // and with it start(), which ends the construction heartbeat -- joins
+  // without sitting out the rest of a sleep. Only the reporting thread waits.
+  void pause(const std::stop_token& stop, std::chrono::milliseconds period) {
+    std::unique_lock lock{pause_mutex_};
+    pause_.wait_for(lock, stop, period, [] { return false; });
+  }
+
   Options options_;
   std::size_t loop_sources_{0};
   std::atomic<bool> published_{false};
   std::string error_;
   std::optional<NodeRegistration> registration_;
+  std::mutex pause_mutex_;
+  std::condition_variable_any pause_;
   std::jthread thread_;
 };
 
