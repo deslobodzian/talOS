@@ -220,6 +220,12 @@ void LogWriter::State::write_chunk(Chunk& chunk) noexcept {
                                : chunk.used;
 
   if (failed || size == 0) return;
+  // The chunk's segment is read only once it holds records: the producer set
+  // it before committing the first.
+  if (chunk.written == 0 && chunk.segment != file_segment) {
+    rotate_to(chunk.segment);
+    if (failed) return;
+  }
 
   while (chunk.written < size) {
     const ssize_t n =
@@ -234,6 +240,87 @@ void LogWriter::State::write_chunk(Chunk& chunk) noexcept {
     }
     chunk.written += static_cast<std::size_t>(n);
   }
+}
+
+// Syncs the directory holding `path`, so renames, creations and unlinks in
+// it survive a power loss. 0, or -1 with errno set.
+static int SyncDirectoryOf(const std::string& path) noexcept {
+  const auto slash = path.rfind('/');
+  const std::string directory =
+      slash == std::string::npos ? "." : path.substr(0, slash == 0 ? 1 : slash);
+  const int fd = ::open(directory.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  const int result = process::DurableSync(fd);
+  const int code = errno;
+  ::close(fd);
+  errno = code;
+  return result;
+}
+
+// Runs where write_chunk does, before the chunk's first byte. A rename and a
+// fresh file rather than a rewrite: every segment stays an append-only log
+// that a power loss can only shorten. The order makes every cut leave whole
+// segments: the finished one is synced durably; the next one's prefix is
+// written and synced under a name no reader takes for a log (`.next`) before
+// it is renamed into place; the cap marker is durable before the oldest
+// segment goes; the directory is synced last.
+void LogWriter::State::rotate_to(std::uint64_t next) noexcept {
+  sync(/*durable=*/true);
+  ::close(fd);
+  fd = -1;
+  const auto fail = [this](std::string_view step, const std::string& what) {
+    set_error("LogWriter: cannot " + std::string{step} + " " + what + ": " +
+              std::strerror(errno));
+  };
+
+  const std::string staged = path + ".next";
+  int next_fd =
+      ::open(staged.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (next_fd < 0) return fail("open", staged);
+  std::swap(fd, next_fd);  // write_all writes to fd.
+  try {
+    write_all(prefix.data(), prefix.size());
+  } catch (const std::system_error& e) {
+    set_error(e.what());
+  }
+  std::swap(fd, next_fd);
+  if (failed || process::DurableSync(next_fd) != 0) {
+    if (!failed) fail("sync", staged);
+    ::close(next_fd);
+    ::unlink(staged.c_str());
+    return;
+  }
+
+  // At most segment_count segments, the new one included: those the last
+  // rotation kept that now fall out are deleted, after the marker that says
+  // the log lost its head is on disk.
+  const bool drop = next >= segment_count;
+  if (drop && !capped_marked) {
+    head_dropped.store(true);
+    mark_capped();
+    if (SyncDirectoryOf(path) != 0) {
+      ::close(next_fd);
+      return fail("sync the directory of", path);
+    }
+  }
+  if (::rename(path.c_str(), LogSegmentPath(path, file_segment).c_str()) != 0) {
+    ::close(next_fd);
+    return fail("rename", path);
+  }
+  if (::rename(staged.c_str(), path.c_str()) != 0) {
+    ::close(next_fd);
+    return fail("rename", staged);
+  }
+  fd = next_fd;
+  file_segment = next;
+  if (drop) {
+    for (std::uint64_t old = dropped_through; old <= next - segment_count;
+         ++old) {
+      ::unlink(LogSegmentPath(path, old).c_str());
+    }
+    dropped_through = next - segment_count + 1;
+  }
+  if (SyncDirectoryOf(path) != 0) fail("sync the directory of", path);
 }
 
 void LogWriter::State::sync(bool durable) noexcept {
@@ -255,7 +342,9 @@ void LogWriter::State::sync(bool durable) noexcept {
 
 // Off the producer path: the periodic sync, drain and close call it.
 void LogWriter::State::mark_capped() noexcept {
-  if (capped_marked || capture_error.load() != CaptureError::BYTE_CAP) return;
+  if (capped_marked ||
+      (!head_dropped.load() && capture_error.load() != CaptureError::BYTE_CAP))
+    return;
   capped_marked = true;
   const std::string marker = CappedMarkerPath(path);
   const int marker_fd =
@@ -312,6 +401,7 @@ void LogWriter::State::acquire_chunk() noexcept {
 
   active = &pool[next % pool.size()];
   active->used = 0;
+  active->segment = segment;
 }
 
 void LogWriter::State::append(RecordHeader header,
@@ -335,9 +425,24 @@ void LogWriter::State::append(RecordHeader header,
       payload.empty() ? crc_after_header : crc32(payload, crc_after_header);
 
   const std::size_t total = sizeof(RecordHeader) + payload.size();
-  if (options.max_bytes != 0 && accepted_bytes + total > options.max_bytes) {
-    capture_error.store(CaptureError::BYTE_CAP);
-    return;
+  const std::uint64_t limit =
+      segment_bytes != 0 ? segment_bytes : options.max_bytes;
+  if (limit != 0 && segment_used + total > limit) {
+    if (segment_bytes == 0 || prefix.size() + total > segment_bytes) {
+      capture_error.store(CaptureError::BYTE_CAP);
+      return;
+    }
+    // This record starts the next segment, in a chunk of its own; the writer
+    // rotates the file before writing it.
+    submit_active();
+    ++segment;
+    segment_used = prefix.size();
+    if (active != nullptr) {
+      active->segment = segment;  // Synchronous: the same, emptied chunk.
+    } else {
+      acquire_chunk();
+      if (active == nullptr) return;
+    }
   }
 
   if (active == nullptr) {
@@ -368,7 +473,7 @@ void LogWriter::State::append(RecordHeader header,
                 payload.data(), payload.size());
   }
   active->used += total;
-  accepted_bytes += total;
+  segment_used += total;
   if (options.background) {
     active->committed.store(active->used, std::memory_order_release);
   } else if (std::chrono::steady_clock::now() - last_sync >=
@@ -408,11 +513,13 @@ void LogWriter::State::stop_writer() noexcept {
 void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
   State& state = *state_;
 
-  std::size_t capacity =
-      std::max(state.options.chunk_bytes, sizeof(RecordHeader));
+  std::size_t largest_record = sizeof(RecordHeader);
   for (const auto& reg : manifest) {
-    capacity = std::max(capacity, sizeof(RecordHeader) + reg.message_bytes);
+    largest_record =
+        std::max(largest_record, sizeof(RecordHeader) + reg.message_bytes);
   }
+  const std::size_t capacity =
+      std::max(state.options.chunk_bytes, largest_record);
   for (auto& chunk : state.pool) chunk.data.resize(capacity);
 
   std::vector<ManifestEntry> entries;
@@ -471,17 +578,29 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
     return;
   }
 
+  // Kept for every later segment's start (rotate_to).
+  state.prefix.reserve(prefix_bytes);
+  const auto header_bytes = as_bytes(&header, sizeof(header));
+  state.prefix.insert(state.prefix.end(), header_bytes.begin(),
+                      header_bytes.end());
+  state.prefix.insert(state.prefix.end(), manifest_bytes.begin(),
+                      manifest_bytes.end());
+  state.prefix.insert(state.prefix.end(), schemas.begin(), schemas.end());
+  state.segment_used = prefix_bytes;
+  if (state.options.max_bytes != 0) {
+    // Segments that each hold the prefix and the largest record.
+    const std::uint64_t smallest = prefix_bytes + largest_record;
+    const std::uint64_t count =
+        std::min(kLogSegments, state.options.max_bytes / smallest);
+    if (count >= 2) {
+      state.segment_count = count;
+      state.segment_bytes = state.options.max_bytes / count;
+    }
+  }
+
   // Written inline, before the writer thread exists, so the header can never
   // race a buffered chunk to the front of the file.
-  state.write_all(&header, sizeof(header));
-  if (!manifest_bytes.empty()) {
-    state.write_all(manifest_bytes.data(), manifest_bytes.size());
-  }
-  if (!schemas.empty()) {
-    state.write_all(schemas.data(), schemas.size());
-  }
-  state.accepted_bytes =
-      sizeof(header) + manifest_bytes.size() + schemas.size();
+  state.write_all(state.prefix.data(), state.prefix.size());
 
   if (!state.options.background || state.writer.joinable()) {
     return;
@@ -616,7 +735,8 @@ bool LogWriter::capture_stopped() const noexcept {
 }
 
 bool LogWriter::capped() const noexcept {
-  return state_->capture_error.load() == State::CaptureError::BYTE_CAP;
+  return state_->head_dropped.load() ||
+         state_->capture_error.load() == State::CaptureError::BYTE_CAP;
 }
 
 }  // namespace talos::event::log

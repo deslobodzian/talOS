@@ -46,6 +46,13 @@ namespace talos::event::log {
 // capture stops permanently and failed() becomes true. Previously accepted
 // chunks are drained, preserving a prefix without holes.
 //
+// A byte cap (Options::max_bytes) keeps the newest records: the log is
+// written as up to kLogSegments segments, each a complete log of its own
+// (header, manifest and schema block, then whole records). The segment being
+// written is always at `path`; a full one is renamed to LogSegmentPath(path,
+// k) and the oldest is deleted once the cap would be crossed, all on the
+// writer thread. The producer only decides where a segment ends.
+//
 // dispatch()/send()/finish() never throw: a full disk or a transient
 // EIO must not bring down a control loop that is otherwise healthy. Such
 // failures are sticky and surfaced through failed()/error() instead.
@@ -66,12 +73,17 @@ struct LogWriterOptions {
   // an idle synchronous writer must be flushed explicitly.
   bool background{true};
 
-  // Bytes the file may grow to: header, manifest and schema block included.
-  // A record that would cross the cap stops capture for good (capped()):
-  // the file keeps every whole record accepted before it, so it still reads,
-  // and `<path>.capped` (CappedMarkerPath) is created within about a second
-  // and at close, so whoever reads the file afterwards knows it is
-  // incomplete. Zero is unbounded. If the header/manifest cannot fit, no log
+  // Bytes the log's segments may take together, each segment's header,
+  // manifest and schema block included. Zero is unbounded (one file, never
+  // rotated). Capped, the log is split into n = min(kLogSegments,
+  // max_bytes / (prefix + largest record)) segments of max_bytes / n bytes;
+  // when the newest is full it is renamed and a new one started, and once
+  // n segments exist the oldest is deleted, so the log keeps the session's
+  // tail. Deleting the first segment makes capped() true and creates
+  // `<path>.capped` (CappedMarkerPath), so whoever reads the log afterwards
+  // knows its head is missing. Where n < 2 the log cannot rotate: a record
+  // that would cross the cap stops capture for good (capped()), keeping
+  // every whole record before it. If the header/manifest cannot fit, no log
   // is created; only the empty cap marker remains.
   std::uint64_t max_bytes{0};
 };
@@ -80,6 +92,12 @@ struct LogWriterOptions {
 inline std::string CappedMarkerPath(std::string_view log_path) {
   return std::string{log_path} + ".capped";
 }
+
+// The most segments a byte-capped log is split into (see max_bytes). Once it
+// rotates, the log holds n - 1 full segments and the one being written, so
+// it never keeps less than about (n - 1) / n of its cap; each segment repeats
+// the header, manifest and schema block.
+inline constexpr std::uint64_t kLogSegments = 8;
 
 class LogWriter {
  public:
@@ -142,7 +160,9 @@ class LogWriter {
   // point: a control loop must not stall behind a slow disk.
   bool capture_stopped() const noexcept;
 
-  // True once a record would have crossed Options::max_bytes.
+  // True once the log is missing records because of Options::max_bytes: its
+  // oldest segment was deleted, or (where it cannot rotate) a record would
+  // have crossed the cap.
   bool capped() const noexcept;
 
   std::uint64_t session_id() const noexcept;
@@ -174,6 +194,9 @@ class LogWriter {
     std::size_t used{0};
     std::atomic<std::size_t> committed{0};
     std::size_t written{0};  // Consumer only.
+    // The log segment its records belong to. Set by the producer when it
+    // takes the chunk, before any record is committed to it.
+    std::uint64_t segment{0};
   };
 
   // All state lives behind a pointer so that moving a LogWriter never has to
@@ -186,6 +209,8 @@ class LogWriter {
     void submit_active() noexcept;
     void acquire_chunk() noexcept;
     void write_chunk(Chunk& chunk) noexcept;
+    // Writer side: ends the file's segment and starts `segment` at `path`.
+    void rotate_to(std::uint64_t segment) noexcept;
     void write_all(const void* data, std::size_t size);
     // `durable`: process::DurableSync (flush(), destruction); otherwise
     // fsync (the periodic sync).
@@ -200,9 +225,21 @@ class LogWriter {
     std::string process_name;
     std::uint64_t session_id{0};
     Options options;
-    // File bytes accepted so far. Producer only, after start().
-    std::uint64_t accepted_bytes{0};
-    bool capped_marked{false};  // Under mutex (or the only thread).
+    // The header, manifest and schema block every segment starts with.
+    std::vector<std::byte> prefix;
+    // Bytes per segment; zero when the log does not rotate.
+    std::uint64_t segment_bytes{0};
+    std::uint64_t segment_count{1};
+    // Producer only, after start(): the segment records are accepted into,
+    // and its bytes so far, prefix included.
+    std::uint64_t segment{0};
+    std::uint64_t segment_used{0};
+    // Writer only (or the only thread): the segment `fd` holds.
+    std::uint64_t file_segment{0};
+    // Writer only: the oldest segment rotation has not deleted yet.
+    std::uint64_t dropped_through{0};
+    std::atomic<bool> head_dropped{false};
+    bool capped_marked{false};  // Writer thread, or drain after it is idle.
 
     std::deque<Chunk> pool;
     std::chrono::steady_clock::time_point last_sync{

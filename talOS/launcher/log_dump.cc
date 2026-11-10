@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -233,7 +234,13 @@ int main(int argc, char** argv) {
 
   std::vector<std::string> log_files;
   for (const auto& path : options.paths) {
-    auto found = talos::event::log::FindLogFiles(path);
+    // A directory is every *.tlog in it; a log file is that log's kept
+    // segments too, oldest first (LogSegmentFiles).
+    std::error_code ec;
+    auto found = std::filesystem::is_directory(path, ec)
+                     ? talos::event::log::FindLogFiles(path)
+                     : talos::event::log::LogSegmentFiles(path);
+    if (found.empty()) found.push_back(path);  // Reported when opened.
     log_files.insert(log_files.end(), found.begin(), found.end());
   }
 

@@ -225,17 +225,26 @@ Every run writes its own event log rather than truncating the last one: the
 first run `<name>.tlog`, restart `k` `<name>.restart<k>.tlog`. The session
 manifest records each node's `restart_count` and every log in `log_paths`
 (`log_path` stays the first run's), and its `record_count` sums all of them.
-`log_dump` on the session directory merges every `*.tlog`, restarts included.
-A node's `exit_code` and `pid` are its last run's.
+A log that reaches its byte share keeps its newest records: it is written in
+segments, the one being written at its own path and older ones beside it as
+`<stem>.segment<k>.tlog`, the oldest deleted to stay within the share
+(`LogWriterOptions::max_bytes`); `record_count` sums the kept segments.
+`log_dump` on the session directory merges every `*.tlog`, restarts and
+segments included.
+A node's `exit_code`, `exit_signal` and `pid` are its last run's:
+`exit_code` is -1 while a run is live and after a signal ended it, and
+`exit_signal` is that signal's number (0 for none), which the end-of-session
+summary also names (`exit=-1 (signal 2 SIGINT)`).
 
 A run whose event log stops early says so in its registry row while it runs
 (see [event log state](../introspection/README.md#event-log-state)). The
 launcher prints one line per member and kind, and marks the member in the live
-manifest: `recorder_failed` for a failed log, `log_capped` for one at its byte
-budget. At normal shutdown it also marks a truncated or unreadable log
-`recorder_failed` and a capped one (`<log>.capped`) `log_capped`; a log whose
-capture stopped at a record boundary looks complete there, so only the live
-row reports it.
+manifest: `recorder_failed` for a failed log, `log_capped` for one whose byte
+share cost it records (its oldest segment deleted, or, with a share too small
+for two segments, capture stopped at the share). At normal shutdown it also
+marks a truncated or unreadable log `recorder_failed` and a capped one
+(`<log>.capped`) `log_capped`; a log whose capture stopped at a record
+boundary looks complete there, so only the live row reports it.
 
 `--heartbeat-periods N` defaults to 10 periods, with a minimum timeout of
 500 ms. `--heartbeat-startup-grace-ms MS` defaults to 5000 ms for processes
@@ -391,26 +400,35 @@ the root is `/tmp/talos_logs`. Use persistent storage on a deployed robot.
 `manifest.json` is written before nodes start, then replaced atomically
 (written beside it, then renamed over it) at each process lifecycle change and
 when a node reports a stopped event log: a reader always sees one complete
-version, and a version is in place before any restart it records starts.
-Before anything starts, `graph.json`, `declared_graph.json` and the manifest of
-the roster about to start are synced (`talos::process::DurableSync`, file then
-directory: `fsync`, and on macOS `F_FULLFSYNC`, which also flushes the drive's
-write cache), and so is the final manifest; the launcher syncs nothing else.
-The supervision loop never waits for a sync, which can take hundreds of
-milliseconds while nodes write to the same disk, so the versions in between
-reach the disk when the OS writes them back. A killed launcher leaves its last
-version; a power loss can lose the versions the OS had not yet written back
-(`end_wall_ns = 0` means no normal shutdown). Each node's event log is synced
-the same way when its loop ends, and with a plain `fsync` once a second while
-it runs (`LogWriter`).
+version. `graph.json`, `declared_graph.json` and every manifest version from
+the roster about to start on are synced (`talos::process::DurableSync`, file
+then directory: `fsync`, and on macOS `F_FULLFSYNC`, which also flushes the
+drive's write cache), so a power loss mid-match keeps the last lifecycle
+change whose sync finished. The supervision loop never touches the disk for
+them: a write or sync can take hundreds of milliseconds while nodes write to
+the same disk, so the loop hands each version to the manifest writer's thread
+and moves on, and that thread writes the newest one (skipping versions
+superseded while it was busy). A reader therefore sees a version shortly
+after the change it records, not before. A killed launcher leaves its last
+written version (`end_wall_ns = 0` means no normal shutdown). Each node's
+event log file is synced with `DurableSync` when its loop ends (the file, not
+its directory), and with a plain `fsync` once a second while it runs; a
+capped log's rotation also syncs the finished segment and the next one's
+header with `DurableSync`, then the directory, so a power loss leaves whole
+segments (`LogWriter`).
 
 At startup, retention removes the oldest sessions: directories holding a
 `manifest.json`, or, named by a session id, an event log whose header carries
 that id (what `--replay-inputs` leaves). `[robot] log_keep_sessions` defaults
 to 50, including the new session; `log_max_bytes` defaults to 2 GiB. Both must
-be positive. Half the byte budget is reserved for the new session's event logs
-and divided among logging members; restarts share their member's remaining
-budget. Older sessions are retained within the other half. A directory named
+be positive integers; config load refuses another type or value. Half the byte budget is reserved for the new session's event logs
+and divided among logging members: a quarter of it equally, the rest by each
+member's expected record rate (one record per declared source per
+`period_us` tick, byte topics excluded since they are never logged;
+`SplitLogBudget`). Restarts share their member's remaining budget, but never
+get less than half of its share: to make that room the launcher deletes the
+earlier runs' oldest log files (never the newest file of the run that just
+ended) and marks those runs `log_capped`. Older sessions are retained within the other half. A directory named
 by a session id that holds nothing, or only what a launch writes before it
 starts its nodes (`graph.json`, `declared_graph.json`, the `.tmp` of an
 interrupted write, empty `.tlog` files), is a launch that recorded nothing:

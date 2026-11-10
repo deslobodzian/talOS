@@ -23,6 +23,7 @@ cc_library(
         "//talOS/memory:shared_memory",
         "//talOS/process:durable_sync",
         "//talOS/rtms",
+        "//talOS/schema:identity",
         "//talOS/schema:unit_suffix",
         "@tomlplusplus//:toml++",
     ],
@@ -137,6 +138,7 @@ cc_test(
     deps = [
         ":launcher_lib",
         "//talOS/events:events_log",
+        "//talOS/events:input_replay",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "@googletest//:gtest_main",

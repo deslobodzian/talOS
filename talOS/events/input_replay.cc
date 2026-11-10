@@ -1,7 +1,9 @@
 #include "talOS/events/input_replay.h"
 
 #include <algorithm>
+#include <iostream>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -34,7 +36,15 @@ RecordedSession::RecordedSession(const std::string& path)
   bool first = true;
 
   for (const std::string& log_path : log_paths_) {
-    log::LogReader reader{log_path};
+    std::optional<log::LogReader> opened;
+    try {
+      opened.emplace(log_path);
+    } catch (const log::IncompleteLogHeader& e) {
+      // A log cut while it was being created holds no records.
+      std::cerr << "warning: skipping " << log_path << ": " << e.what() << "\n";
+      continue;
+    }
+    log::LogReader& reader = *opened;
     if (first) {
       session_id_ = reader.session_id();
       start_ = reader.start_time();
@@ -116,6 +126,7 @@ RecordedSession::RecordedSession(const std::string& path)
       ++topics_[topic].message_count;
     }
   }
+  if (first) throw std::runtime_error("no readable .tlog files in " + path);
 
   std::sort(messages_.begin(), messages_.end(),
             [this](const RecordedMessage& a, const RecordedMessage& b) {

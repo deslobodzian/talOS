@@ -1160,7 +1160,8 @@ int RunMain(int argc, char** argv, const char* node_name,
     // grace bounds that.
     process::InstallStopHandlers();
     // The launcher bounds each node's share of the session's log budget; at
-    // the cap capture stops and `<log>.capped` marks the log incomplete.
+    // the cap the log drops its oldest segments to keep the newest records
+    // (LogWriterOptions::max_bytes) and `<log>.capped` marks it incomplete.
     event::log::LogWriterOptions log_options;
     log_options.max_bytes = flags.log_max_bytes;
     event::RealtimeEventLoop<event::log::LogWriter> loop{event::log::LogWriter{

@@ -1068,11 +1068,12 @@ TEST(Supervision, SecondLaunchInTheNamespaceIsRefused) {
   }
 }
 
-// The loop never waits for the disk to sync the manifest. With every sync
-// stuck from alpha's first run on, the critical alpha's crash is restarted at
-// once and the live manifest already records the restart: the loop only
-// renames each version into place (PersistManifest).
-TEST(Supervision, StuckManifestSyncDelaysNoRestart) {
+// The loop never waits for the disk, yet every mid-session manifest is
+// synced. With every sync stuck from alpha's first run on, the critical
+// alpha's crash is still restarted at once; once the disk recovers, a synced
+// manifest of the running session records the restart (PersistManifest,
+// ManifestWriter).
+TEST(Supervision, StuckManifestSyncDelaysNoRestartAndSyncsItLater) {
   auto options = BaseOptions("stuck_sync");
   // The stubs never register; no heartbeat kill may restart them meanwhile.
   options.heartbeat_startup_grace_ms = 60'000;
@@ -1086,28 +1087,39 @@ TEST(Supervision, StuckManifestSyncDelaysNoRestart) {
                                  std::string{kRunUntilStopped}));
   options.binary_overrides["//example/beta:node"] =
       WriteStub("stuck_sync_beta", kRunUntilStopped);
-  std::mutex mutex;
-  std::condition_variable release;
-  bool released = false;
-  options.sync_file = [&](int fd) {
-    if (!ReadLines(runs).empty()) {
-      std::unique_lock lock{mutex};
-      release.wait(lock, [&] { return released; });
-    }
-    return ::fsync(fd);
-  };
   // RunSession rewrites options.output_dir on return; don't read it
   // concurrently.
   const auto live_manifest = options.output_dir + "/" +
                              std::to_string(options.session_id) +
                              "/manifest.json";
+  std::mutex mutex;
+  std::condition_variable release;
+  bool released = false;
+  std::atomic<bool> synced_restart{false};
+  options.sync_file = [&](int fd) {
+    if (!ReadLines(runs).empty()) {
+      std::unique_lock lock{mutex};
+      release.wait(lock, [&] { return released; });
+    }
+    const int result = ::fsync(fd);
+    // The directory is synced after the rename: manifest.json is the
+    // version just made durable.
+    struct stat status{};
+    if (::fstat(fd, &status) == 0 && S_ISDIR(status.st_mode)) {
+      const std::string text = ReadFile(live_manifest);
+      if (ManifestEntry(text, "alpha").find("\"restart_count\": 1,") !=
+              std::string::npos &&
+          text.find("\"end_wall_ns\": 0,") != std::string::npos)
+        synced_restart = true;
+    }
+    return result;
+  };
   bool restarted = false;
   std::jthread stopper{[&](const std::stop_token& stop) {
     const auto give_up = std::chrono::steady_clock::now() + 20s;
     while (!stop.stop_requested() &&
            std::chrono::steady_clock::now() < give_up) {
-      if (ManifestEntry(ReadFile(live_manifest), "alpha")
-              .find("\"restart_count\": 1,") != std::string::npos) {
+      if (ReadLines(runs).size() >= 2) {
         restarted = true;
         break;
       }
@@ -1118,12 +1130,18 @@ TEST(Supervision, StuckManifestSyncDelaysNoRestart) {
       released = true;
     }
     release.notify_all();
+    while (!stop.stop_requested() && !synced_restart &&
+           std::chrono::steady_clock::now() < give_up) {
+      std::this_thread::sleep_for(2ms);
+    }
     if (!stop.stop_requested()) ::kill(::getpid(), SIGTERM);
   }};
   RunSession(options);
   stopper.request_stop();
   stopper.join();
   EXPECT_TRUE(restarted) << "the restart waited for a manifest sync";
+  EXPECT_TRUE(synced_restart)
+      << "no manifest synced mid-session recorded the restart";
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
 }

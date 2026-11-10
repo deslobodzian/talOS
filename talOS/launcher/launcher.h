@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -12,9 +13,11 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -27,11 +30,13 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -48,6 +53,7 @@
 #include "talOS/launcher/session_lock.h"
 #include "talOS/process/durable_sync.h"
 #include "talOS/rtms/rtms.h"
+#include "talOS/schema/identity.h"
 #include "talOS/schema/unit_suffix.h"
 #include "toml.hpp"
 
@@ -117,6 +123,167 @@ inline bool WriteFileAtomically(const std::string& path,
   return true;
 }
 
+// Keeps one session file (manifest.json) current and durable without making
+// its caller wait for the disk. While started, Post() hands over the newest
+// contents and returns; a worker thread writes each with WriteFileAtomically
+// and `sync`, so every version it writes survives a power loss, and skips a
+// version a newer one replaced while it was busy. Writes and syncs on a disk
+// under load take hundreds of milliseconds each, which the supervision loop,
+// restarting crashed nodes and feeding the service watchdog, cannot spend.
+//
+// Write() writes on the calling thread instead, for the versions before the
+// worker starts and after it stops. A failed write is reported once on
+// stderr, and so is the recovery; the last complete file stays in place and
+// the next version retries.
+class ManifestWriter {
+ public:
+  ManifestWriter(std::string path, SyncFunction sync)
+      : path_{std::move(path)}, sync_{std::move(sync)} {}
+  ~ManifestWriter() { Stop(); }
+  ManifestWriter(const ManifestWriter&) = delete;
+  ManifestWriter& operator=(const ManifestWriter&) = delete;
+
+  bool running() const { return worker_.joinable(); }
+
+  // Only while the worker is not running.
+  void Write(const std::string& contents, bool durable) {
+    Persist(contents, durable ? sync_ : SyncFunction{});
+  }
+
+  // The worker starts with every signal blocked, so the launcher's stop
+  // signals are always handled by the supervision thread.
+  void Start() {
+    if (running()) return;
+    stopping_ = false;
+    sigset_t all;
+    sigset_t previous;
+    sigfillset(&all);
+    ::pthread_sigmask(SIG_SETMASK, &all, &previous);
+    worker_ = std::thread{[this] { Run(); }};
+    ::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+  }
+
+  // Never waits for the disk: the worker holds the mutex only to take the
+  // pending version, never across a write.
+  void Post(std::string contents) {
+    {
+      const std::lock_guard lock{mutex_};
+      pending_ = std::move(contents);
+    }
+    wake_.notify_one();
+  }
+
+  // Writes the pending version, if any, then stops the worker. Waits for the
+  // disk.
+  void Stop() {
+    if (!running()) return;
+    {
+      const std::lock_guard lock{mutex_};
+      stopping_ = true;
+    }
+    wake_.notify_one();
+    worker_.join();
+  }
+
+ private:
+  void Run() {
+    std::unique_lock lock{mutex_};
+    for (;;) {
+      wake_.wait(lock, [this] { return pending_ || stopping_; });
+      if (!pending_) return;
+      const std::string contents = std::move(*pending_);
+      pending_.reset();
+      lock.unlock();
+      Persist(contents, sync_);
+      lock.lock();
+    }
+  }
+
+  void Persist(const std::string& contents, const SyncFunction& sync) {
+    std::string error;
+    if (!WriteFileAtomically(path_, contents, sync, error)) {
+      if (!failing_) {
+        std::cerr << "[launcher] cannot persist " << path_ << " (" << error
+                  << "); supervision continues and retries at the next "
+                     "change\n";
+      }
+      failing_ = true;
+      return;
+    }
+    if (failing_) {
+      std::cerr << "[launcher] " << path_ << " persisted again\n";
+      failing_ = false;
+    }
+  }
+
+  const std::string path_;
+  const SyncFunction sync_;
+  std::mutex mutex_;
+  std::condition_variable wake_;
+  std::optional<std::string> pending_;  // Under mutex_.
+  bool stopping_{false};                // Under mutex_.
+  bool failing_{false};  // The worker's, or the caller's while it is stopped.
+  std::thread worker_;
+};
+
+// A member's expected event-log bytes per second, from what it declared
+// (--describe): one record per source per `period_us` tick, each a record
+// header plus the source's message. Byte topics (Node::publish_bytes) are
+// left out: the loop never logs them. An estimate to weight log shares by,
+// not a bound: callback topics can record more often, idle ones less.
+inline double ExpectedLogRate(const introspect::Description& declared,
+                              int64_t period_us) {
+  double per_tick = sizeof(event::log::RecordHeader);
+  for (const auto& source : declared.sources) {
+    if (source.schema_hash == schema::BytesHash()) continue;
+    per_tick += sizeof(event::log::RecordHeader) + source.message_bytes;
+  }
+  return per_tick * 1e6 / static_cast<double>(std::max<int64_t>(period_us, 1));
+}
+
+// Splits a session's log budget among the members that write an event log
+// (`logs[i]`): a quarter of it in equal parts, so no member starves, and the
+// rest by expected rate (`rates[i]`; negative when unknown, as for a member
+// that did not answer --describe, which is weighted as the mean of the
+// known). Every logging member gets at least 1 byte; others get 0.
+inline std::vector<uint64_t> SplitLogBudget(uint64_t budget,
+                                            const std::vector<bool>& logs,
+                                            const std::vector<double>& rates) {
+  std::vector<uint64_t> shares(logs.size(), 0);
+  std::size_t loggers = 0;
+  std::size_t known = 0;
+  double known_sum = 0;
+  for (std::size_t i = 0; i < logs.size(); ++i) {
+    if (!logs[i]) continue;
+    ++loggers;
+    if (rates[i] >= 0) {
+      ++known;
+      known_sum += rates[i];
+    }
+  }
+  if (loggers == 0) return shares;
+  const double mean = known > 0 ? known_sum / static_cast<double>(known) : 1;
+  double total = 0;
+  std::vector<double> weights(logs.size(), 0);
+  for (std::size_t i = 0; i < logs.size(); ++i) {
+    if (!logs[i]) continue;
+    weights[i] = rates[i] >= 0 ? rates[i] : mean;
+    total += weights[i];
+  }
+  const double equal =
+      static_cast<double>(budget) / 4.0 / static_cast<double>(loggers);
+  const double weighted =
+      static_cast<double>(budget) - equal * static_cast<double>(loggers);
+  for (std::size_t i = 0; i < logs.size(); ++i) {
+    if (!logs[i]) continue;
+    const double share =
+        equal + (total > 0 ? weighted * weights[i] / total
+                           : weighted / static_cast<double>(loggers));
+    shares[i] = std::max<uint64_t>(1, static_cast<uint64_t>(share));
+  }
+  return shares;
+}
+
 struct NodeSpec {
   std::string name;
   std::string target;  // e.g. "//2026-robot/main_processor/drivetrain:node"
@@ -146,9 +313,10 @@ struct NodeProcessInfo {
   // row (introspect::kFlagRecorderFailed), or unreadable or truncated at
   // shutdown.
   bool failed{false};
-  // A run's event log reached its share of the session log budget and stopped
-  // early (`<log>.capped`, or live, introspect::kFlagLogCapped): the
-  // recording is incomplete, not corrupt.
+  // A run's event log reached its share of the session log budget and lost
+  // records: its oldest segments were deleted to keep the newest, or, with a
+  // share too small to rotate, it stopped early (`<log>.capped`, or live,
+  // introspect::kFlagLogCapped). The recording is incomplete, not corrupt.
   bool log_capped{false};
   uint64_t record_count{0};
   // Whether this binary answered --describe: a session whose graph was never
@@ -250,8 +418,8 @@ struct LauncherOptions {
   std::map<std::string, int> spawn_failures;
   // Internal supervision seam: syncs an open session file or directory to
   // disk; process::DurableSync in production. The supervision loop never
-  // calls it: the manifest versions it writes are not synced
-  // (PersistManifest).
+  // calls it: the manifest writer's thread syncs the versions the loop
+  // hands it (PersistManifest).
   SyncFunction sync_file{process::DurableSync};
 
   // Launch a graph the linter called broken anyway. The default is refusal:
@@ -1685,15 +1853,28 @@ class Launcher {
       }
       if (!proc.log_path.empty()) proc.log_paths.push_back(proc.log_path);
     }
-    // Each logging member's share of the session's log budget; its restarts
-    // draw on what its earlier runs left (Restart).
-    const auto loggers = static_cast<uint64_t>(
-        std::count_if(procs.begin(), procs.end(),
-                      [](const auto& p) { return !p.log_path.empty(); }));
-    const uint64_t node_log_budget = std::max<uint64_t>(
-        1, session_log_budget / std::max<uint64_t>(1, loggers));
-    // The one version synced before any node starts (PersistManifest).
+    // Each logging member's share of the session's log budget, weighted by
+    // its expected record rate (SplitLogBudget); its restarts draw on what
+    // its earlier runs left (Restart).
+    std::vector<uint64_t> log_budgets;
+    {
+      std::vector<bool> logs(procs.size());
+      std::vector<double> rates(procs.size(), -1);
+      for (std::size_t i = 0; i < procs.size(); ++i) {
+        logs[i] = !procs[i].log_path.empty();
+        if (!described[i].answered) continue;
+        const auto period_us =
+            robot_config.toml_data["subsystems"][procs[i].name]["period_us"]
+                .value_or<int64_t>(robot_config.toml_data["robot"]["period_us"]
+                                       .value_or<int64_t>(5000));
+        rates[i] = ExpectedLogRate(described[i].declared, period_us);
+      }
+      log_budgets = SplitLogBudget(session_log_budget, logs, rates);
+    }
+    // Synced before any node starts; from here on every version is synced,
+    // off this thread (PersistManifest).
     PersistManifest(procs, /*durable=*/true);
+    manifest_writer_->Start();
 
     InstallSignals();
 
@@ -1735,9 +1916,9 @@ class Launcher {
         args.insert(args.end(), {"--session-id",
                                  std::to_string(options_.session_id), "--log"});
         launches[i].log_arg = args.size();
-        launches[i].log_budget = node_log_budget;
+        launches[i].log_budget = log_budgets[i];
         args.insert(args.end(), {proc.log_path, "--log-max-bytes",
-                                 std::to_string(node_log_budget), "--config",
+                                 std::to_string(log_budgets[i]), "--config",
                                  options_.config_path});
         if (options_.simulation) args.push_back("--sim");
         // Started with the graph it was described with (DescribeGraph).
@@ -1781,14 +1962,20 @@ class Launcher {
       for (const auto& path : proc.log_paths) {
         if (std::filesystem::exists(event::log::CappedMarkerPath(path)))
           proc.log_capped = true;
-        if (!std::filesystem::exists(path)) continue;
-        // Streamed: shutdown memory does not grow with the logs' size.
-        try {
-          const auto summary = event::log::SummarizeLog(path);
-          proc.record_count += summary.record_count;
-          if (summary.truncated) proc.failed = true;
-        } catch (...) {
-          proc.failed = true;
+        // The segments a capped log kept, then the newest (LogSegmentFiles).
+        for (const auto& file : event::log::LogSegmentFiles(path)) {
+          // Streamed: shutdown memory does not grow with the logs' size.
+          try {
+            const auto summary = event::log::SummarizeLog(file);
+            proc.record_count += summary.record_count;
+            if (summary.truncated) proc.failed = true;
+          } catch (const event::log::IncompleteLogHeader& e) {
+            // Cut while it was being created: no records to count.
+            std::cerr << "[launcher] skipping " << file << ": " << e.what()
+                      << "\n";
+          } catch (...) {
+            proc.failed = true;
+          }
         }
       }
       if (proc.exit_code != 0) exit_status = proc.exit_code;
@@ -1802,13 +1989,16 @@ class Launcher {
   }
 
  private:
-  // Replaces manifest.json with the session's state and `procs`. The new
-  // version is in place when this returns, so a reader (Studio, a test) sees
-  // it before any restart it records starts. Only a `durable` one is also
-  // synced: the roster before the first node starts, and the final manifest.
-  // The supervision loop's versions are not: a sync can take hundreds of
-  // milliseconds while other processes write to the same disk, and the loop
-  // restarts crashed nodes and feeds the service watchdog.
+  // Replaces manifest.json with the session's state and `procs`. Before the
+  // first node starts, and for the final manifest, it is written here and in
+  // place when this returns; only a `durable` one is synced (the roster
+  // before the first node starts, and the final manifest). Once Run starts
+  // the manifest writer, every version is synced, so a power loss mid-match
+  // keeps the lifecycle it had reached, and none is written here: the
+  // supervision loop restarts crashed nodes and feeds the service watchdog,
+  // and a write or sync can take hundreds of milliseconds while other
+  // processes write to the same disk (ManifestWriter). A reader (Studio, a
+  // test) then sees a version shortly after, not before, what it records.
   //
   // Never throws: a full disk (ENOSPC) or an unwritable session directory
   // must not end supervision of a running robot. The last complete manifest
@@ -1817,25 +2007,18 @@ class Launcher {
   void PersistManifest(const std::vector<NodeProcessInfo>& procs,
                        bool durable = false) {
     session_manifest_.nodes = procs;
-    const std::string path = options_.output_dir + "/manifest.json";
-    const std::string json = session_manifest_.ToJson();
-    std::string error;
-    const bool written =
-        durable ? WriteFileAtomically(path, json, options_.sync_file, error)
-                : WriteFileAtomically(path, json, {}, error);
-    if (!written) {
-      if (!manifest_failing_) {
-        std::cerr << "[launcher] cannot persist " << path << " (" << error
-                  << "); supervision continues and retries at the next "
-                     "change\n";
-      }
-      manifest_failing_ = true;
+    if (!manifest_writer_) {
+      manifest_writer_ = std::make_unique<ManifestWriter>(
+          options_.output_dir + "/manifest.json", options_.sync_file);
+    }
+    std::string json = session_manifest_.ToJson();
+    if (manifest_writer_->running() && !durable) {
+      manifest_writer_->Post(std::move(json));
       return;
     }
-    if (manifest_failing_) {
-      std::cerr << "[launcher] " << path << " persisted again\n";
-      manifest_failing_ = false;
-    }
+    // A durable version is the last word on every version posted before it.
+    manifest_writer_->Stop();
+    manifest_writer_->Write(json, durable);
   }
 
   // What retention makes of a directory under the log root.
@@ -2200,6 +2383,45 @@ class Launcher {
   // Starts `proc`'s pending run: restart `restart_count + 1` into a fresh
   // event log or, when no run has spawned yet, the first. The attempt counts
   // against the rolling budget whether or not it spawns.
+  // The byte cap for a member's next run: what its earlier runs left of its
+  // share `budget`, but never less than half of it, so a run restarted after
+  // one that used the whole share still records the match's tail. To make
+  // that room it deletes the earlier runs' oldest files (whole segments,
+  // oldest run first), never the newest file of the last run, and marks each
+  // run it shortened capped (`<log>.capped`, `log_capped`).
+  static uint64_t RestartLogBudget(NodeProcessInfo& proc, uint64_t budget) {
+    struct File {
+      std::string path;
+      std::string run;  // The run's log path, for its cap marker.
+      uint64_t bytes;
+    };
+    std::vector<File> files;
+    uint64_t used = 0;
+    for (const auto& run : proc.log_paths) {
+      for (auto& file : event::log::LogSegmentFiles(run)) {
+        std::error_code error;
+        const auto bytes = std::filesystem::file_size(file, error);
+        if (error) continue;
+        used += bytes;
+        files.push_back({std::move(file), run, bytes});
+      }
+    }
+    const uint64_t floor = budget / 2;
+    // The last file is the newest of the run that just ended: kept.
+    for (std::size_t i = 0;
+         i + 1 < files.size() && (used >= budget || budget - used < floor);
+         ++i) {
+      std::error_code error;
+      if (!std::filesystem::remove(files[i].path, error) || error) continue;
+      used -= files[i].bytes;
+      std::ofstream{event::log::CappedMarkerPath(files[i].run)};
+      proc.log_capped = true;
+    }
+    // 0 means unbounded to the writer, so never less than 1.
+    return std::max<uint64_t>(
+        {1, floor, used >= budget ? uint64_t{0} : budget - used});
+  }
+
   void Restart(NodeProcessInfo& proc, NodeLaunch& launch,
                std::chrono::steady_clock::time_point now) {
     launch.restart_pending = false;
@@ -2212,15 +2434,8 @@ class Launcher {
     if (launch.log_arg != 0) {
       launch.args[launch.log_arg] =
           NodeLogPath(options_.output_dir, proc.name, restart);
-      uint64_t used = 0;
-      for (const auto& path : proc.log_paths) {
-        std::error_code error;
-        const auto bytes = std::filesystem::file_size(path, error);
-        if (!error) used += bytes;
-      }
-      // 0 means unbounded to the writer; 1 means no valid header can fit.
-      launch.args[launch.log_arg + 2] = std::to_string(
-          used >= launch.log_budget ? 1 : launch.log_budget - used);
+      launch.args[launch.log_arg + 2] =
+          std::to_string(RestartLogBudget(proc, launch.log_budget));
     }
     launch.restart_times.push_back(now);
     std::string error;
@@ -2572,7 +2787,7 @@ class Launcher {
 
   LauncherOptions options_;
   SessionManifest session_manifest_;
-  bool manifest_failing_{false};
+  std::unique_ptr<ManifestWriter> manifest_writer_;  // PersistManifest
   int max_restarts_{kDefaultMaxRestarts};
   static inline volatile std::sig_atomic_t stop_requested_{false};
 };
@@ -2625,6 +2840,10 @@ inline bool MergeLogs(const std::vector<std::string>& log_paths,
     ReaderState state;
     try {
       state.reader = std::make_unique<event::log::LogReader>(path);
+    } catch (const event::log::IncompleteLogHeader& e) {
+      // A log cut while it was being created holds no records.
+      std::cerr << "warning: skipping " << path << ": " << e.what() << "\n";
+      continue;
     } catch (const std::exception& e) {
       error = "failed to open " + path + ": " + e.what();
       return false;

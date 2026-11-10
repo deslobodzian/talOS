@@ -12,9 +12,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
+#include "talOS/events/input_replay.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
@@ -424,12 +426,10 @@ TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
       attempts +
       "'\n"
       "[ -n \"$cap\" ] || exit 2\n"
-      "if [ ! -f '" +
-      root +
-      "/once' ]; then\n"
-      " touch '" +
-      root +
-      "/once'\n"
+      "runs=$(wc -l < '" +
+      attempts +
+      "')\n"
+      "if [ \"$runs\" -eq 1 ]; then\n"
       " dd if=/dev/zero of=\"$log\" bs=1 count=100 2>/dev/null\n"
       // The launcher writes manifest.json.tmp itself and renames it; wait
       // until its own temporary file is gone before planting /dev/full.
@@ -437,7 +437,11 @@ TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
       session +
       "/manifest.json.tmp' 2>/dev/null; do sleep 0.01; done\n"
       " exit 1\nfi\n"
-      "touch \"$log.capped\"\nexec sleep 5\n";
+      // The second run fills what it was given.
+      "if [ \"$runs\" -eq 2 ]; then\n"
+      " dd if=/dev/zero of=\"$log\" bs=1 count=\"$cap\" 2>/dev/null\n"
+      " exit 1\nfi\n"
+      "exec sleep 5\n";
   options.binary_overrides["//example/alpha:node"] =
       WriteStubNode("budget_alpha", script);
   options.binary_overrides["//example/beta:node"] = WriteStubNode(
@@ -448,9 +452,23 @@ TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
                        "hardware_node", "//talOS/bridge:hardware_node", {}, 5));
   Launcher launcher{options};
   launcher.Run();
-  EXPECT_EQ(ReadFile(attempts), "200\n100\n");
+  // The first restart gets alpha's rate-weighted share less the 100 bytes
+  // its first run wrote. The second, with the share used up, gets half of
+  // it: the first run's log is deleted (and marked capped) to make room,
+  // the second run's, the newest, is kept, and half is the floor.
+  std::istringstream caps{ReadFile(attempts)};
+  uint64_t first = 0;
+  uint64_t second = 0;
+  uint64_t third = 0;
+  ASSERT_TRUE(caps >> first >> second >> third);
+  EXPECT_GT(first, 200u);
+  EXPECT_EQ(second, first - 100);
+  EXPECT_EQ(third, first / 2);
+  EXPECT_FALSE(std::filesystem::exists(session + "/alpha.tlog"));
+  EXPECT_TRUE(std::filesystem::exists(session + "/alpha.tlog.capped"));
+  EXPECT_TRUE(std::filesystem::exists(session + "/alpha.restart1.tlog"));
   const auto manifest = ReadFile(session + "/manifest.json");
-  EXPECT_NE(manifest.find("\"restart_count\": 1"), std::string::npos);
+  EXPECT_NE(manifest.find("\"restart_count\": 2"), std::string::npos);
   EXPECT_NE(manifest.find("\"log_capped\": true"), std::string::npos);
   std::filesystem::remove_all(root);
 }
@@ -617,6 +635,50 @@ TEST(LauncherTest, MergedLogsMonotonicOrder) {
 
   std::remove(path_a.c_str());
   std::remove(path_b.c_str());
+}
+
+// A log cut while it was being created (a short or zero-filled header) is
+// skipped by every session reader, not taken for corruption of the session.
+TEST(LauncherTest, SessionReadersSkipALogCutBeforeItsHeader) {
+  const std::string dir = TempPath("cut_header");
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const uint64_t session_id = 77;
+  WriteTestLog(dir + "/whole.tlog", "whole", session_id, {1'000'000});
+  WriteTestLog(dir + "/short.tlog", "short", session_id, {2'000'000});
+  std::filesystem::resize_file(dir + "/short.tlog",
+                               sizeof(event::log::FileHeader) / 2);
+  std::ofstream{dir + "/zeros.tlog", std::ios::binary}
+      << std::string(sizeof(event::log::FileHeader) + 64, '\0');
+
+  std::vector<MergedRecord> merged;
+  std::string error;
+  ASSERT_TRUE(MergeLogs(event::log::FindLogFiles(dir), merged, error)) << error;
+  ASSERT_EQ(merged.size(), 1u);
+  EXPECT_EQ(merged[0].process_name, "whole");
+
+  const event::RecordedSession session{dir};
+  EXPECT_EQ(session.session_id(), session_id);
+
+  EXPECT_THROW(event::log::SummarizeLog(dir + "/zeros.tlog"),
+               event::log::IncompleteLogHeader);
+  std::filesystem::remove_all(dir);
+}
+
+// A quarter of the budget is split equally, the rest by rate; an unknown
+// rate weighs as the mean of the known ones; a member without a log gets
+// nothing; the shares never exceed the budget.
+TEST(LauncherTest, SplitLogBudgetWeightsByRateAboveAnEqualFloor) {
+  const uint64_t budget = 4000;
+  const auto shares = SplitLogBudget(budget, {true, true, true, false},
+                                     {300.0, 0.0, -1.0, 500.0});
+  ASSERT_EQ(shares.size(), 4u);
+  // Floor 4000 / 4 / 3 = 333; the 3000 left go 2:0:1 (unknown = mean 150).
+  EXPECT_EQ(shares[0], 333u + 2000u);
+  EXPECT_EQ(shares[1], 333u);
+  EXPECT_EQ(shares[2], 333u + 1000u);
+  EXPECT_EQ(shares[3], 0u);
+  EXPECT_LE(shares[0] + shares[1] + shares[2], budget);
 }
 
 TEST(LauncherTest, MergedLogsRejectsSessionIdMismatch) {

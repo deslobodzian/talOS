@@ -6,12 +6,14 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <optional>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 
 namespace talos::event::log {
 
@@ -61,6 +63,12 @@ std::vector<std::byte> read_whole_file(std::string_view path) {
 // Magic first, then version, so an older log -- whose header is shorter --
 // is reported as one, not as a truncated file.
 void check_identity(const FileHeader& header) {
+  // A file whose length reached the disk before its bytes did reads back
+  // zero-filled: cut while it was being created, not damaged.
+  constexpr char kZeros[sizeof(header.magic)] = {};
+  if (std::memcmp(header.magic, kZeros, sizeof(header.magic)) == 0) {
+    throw IncompleteLogHeader("LogReader: file header is zero-filled");
+  }
   if (std::memcmp(header.magic, FILE_MAGIC, sizeof(header.magic)) != 0) {
     throw std::runtime_error("LogReader: bad file magic");
   }
@@ -162,7 +170,7 @@ class LogStream {
 LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
   constexpr std::size_t kVersionEnd = offsetof(FileHeader, header_bytes);
   if (data_.size() < kVersionEnd) {
-    throw std::runtime_error("LogReader: file too short for a header");
+    throw IncompleteLogHeader("LogReader: file too short for a header");
   }
 
   FileHeader header{};
@@ -170,7 +178,7 @@ LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
   check_identity(header);
   if (header.header_bytes < sizeof(FileHeader) ||
       data_.size() < header.header_bytes) {
-    throw std::runtime_error("LogReader: file too short for its header");
+    throw IncompleteLogHeader("LogReader: file too short for its header");
   }
 
   const std::size_t manifest_bytes_size =
@@ -180,7 +188,7 @@ LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
 
   if (data_.size() < schema_offset ||
       data_.size() - schema_offset < header.schema_bytes) {
-    throw std::runtime_error("LogReader: file too short for its manifest");
+    throw IncompleteLogHeader("LogReader: file too short for its manifest");
   }
 
   const std::span<const std::byte> manifest_bytes{
@@ -290,14 +298,14 @@ LogSummary SummarizeLog(std::string_view path) {
   FileHeader header{};
   const std::size_t header_read = stream.read(header);
   if (header_read < kVersionEnd) {
-    throw std::runtime_error("LogReader: file too short for a header");
+    throw IncompleteLogHeader("LogReader: file too short for a header");
   }
   check_identity(header);
   std::uint32_t ignored = 0;
   if (header.header_bytes < sizeof(FileHeader) ||
       header_read < sizeof(FileHeader) ||
       !stream.fold(header.header_bytes - sizeof(FileHeader), ignored)) {
-    throw std::runtime_error("LogReader: file too short for its header");
+    throw IncompleteLogHeader("LogReader: file too short for its header");
   }
 
   // The manifest entries stream one at a time, the schema block in chunks.
@@ -307,7 +315,7 @@ LogSummary SummarizeLog(std::string_view path) {
   for (std::uint32_t i = 0; i < header.manifest_count; ++i) {
     ManifestEntry entry{};
     if (stream.read(entry) < sizeof(entry)) {
-      throw std::runtime_error("LogReader: file too short for its manifest");
+      throw IncompleteLogHeader("LogReader: file too short for its manifest");
     }
     crc = crc32(
         std::span<const std::byte>{reinterpret_cast<const std::byte*>(&entry),
@@ -317,7 +325,7 @@ LogSummary SummarizeLog(std::string_view path) {
     if (!overrun && schemas > header.schema_bytes) overrun = i;
   }
   if (!stream.fold(header.schema_bytes, crc)) {
-    throw std::runtime_error("LogReader: file too short for its manifest");
+    throw IncompleteLogHeader("LogReader: file too short for its manifest");
   }
   if (crc != header.crc32) {
     throw std::runtime_error("manifest checksum mismatch");
@@ -361,6 +369,39 @@ std::vector<std::string> FindLogFiles(const std::string& path_or_dir) {
     }
   }
   std::sort(result.begin(), result.end());
+  return result;
+}
+
+std::vector<std::string> LogSegmentFiles(const std::string& log_path) {
+  // A segment's name is LogSegmentPath(log_path, k): split it around k.
+  const std::string probe = LogSegmentPath(log_path, 0);
+  const std::filesystem::path probe_path{probe};
+  const std::string probe_name = probe_path.filename().string();
+  const std::string head = probe_name.substr(0, probe_name.size() - 6);
+  const std::string tail = ".tlog";
+  std::filesystem::path directory = probe_path.parent_path();
+  if (directory.empty()) directory = ".";
+
+  std::vector<std::pair<std::uint64_t, std::string>> segments;
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
+    const std::string name = entry.path().filename().string();
+    if (name.size() <= head.size() + tail.size() || !name.starts_with(head) ||
+        !name.ends_with(tail))
+      continue;
+    const std::string_view digits{name.data() + head.size(),
+                                  name.size() - head.size() - tail.size()};
+    std::uint64_t k = 0;
+    const auto [end, error] =
+        std::from_chars(digits.data(), digits.data() + digits.size(), k);
+    if (error != std::errc{} || end != digits.data() + digits.size()) continue;
+    segments.emplace_back(k, entry.path().string());
+  }
+  std::sort(segments.begin(), segments.end());
+  std::vector<std::string> result;
+  result.reserve(segments.size() + 1);
+  for (auto& [k, path] : segments) result.push_back(std::move(path));
+  if (std::filesystem::exists(log_path, ec)) result.push_back(log_path);
   return result;
 }
 

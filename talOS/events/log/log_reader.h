@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -12,6 +13,15 @@
 #include "talOS/events/time.h"
 
 namespace talos::event::log {
+
+// Thrown (by LogReader and SummarizeLog) for a file that ends, or reads back
+// zero-filled, before its header, manifest and schema block are complete: a
+// log cut by a power loss while it was being created. It holds no records,
+// so a reader of a whole session skips it with a warning rather than failing.
+class IncompleteLogHeader : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
 
 // Reads a dispatch log written by LogWriter.
 //
@@ -86,5 +96,10 @@ LogSummary SummarizeLog(std::string_view path);
 // writes one per node run, restarts included), sorted by path. A path that is
 // not a directory is returned as the one log it names.
 std::vector<std::string> FindLogFiles(const std::string& path_or_dir);
+
+// The files the log written at `log_path` is kept in, oldest first: the
+// segments a byte cap rotated out (LogSegmentPath) and still kept, then
+// `log_path` itself; only those that exist.
+std::vector<std::string> LogSegmentFiles(const std::string& log_path);
 
 }  // namespace talos::event::log

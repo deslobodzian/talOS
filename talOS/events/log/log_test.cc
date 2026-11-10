@@ -822,8 +822,60 @@ TEST(LogSummary, PeakMemoryDoesNotScaleWithTheLog) {
   ::unlink(path.c_str());
 }
 
-// A writer at its byte cap stops appending, leaves a log that still reads in
-// full, is not failed(), and marks the log incomplete with `<path>.capped`.
+// A capped log keeps the session's tail: past its cap the oldest segment
+// goes, every kept file still reads in full, the kept records run without a
+// gap to the last one written, and `<path>.capped` marks the missing head.
+TEST(LogCapture, ByteCapKeepsTheNewestRecords) {
+  for (const bool background : {false, true}) {
+    SCOPED_TRACE(background);
+    const auto path = TempPath(background ? "tail_bg" : "tail_sync");
+    const std::string marker = CappedMarkerPath(path);
+    ::unlink(marker.c_str());
+    // Four segments, each the prefix and two 16-byte records (the largest
+    // source, 128 bytes, sets the segment count).
+    const std::uint64_t cap =
+        4 * (RecordsOffset() + sizeof(RecordHeader) + 128);
+    constexpr std::uint64_t kRecords = 40;
+    {
+      LogWriter writer{path, "tail",
+                       LogWriter::Options{256, 64, background, cap}};
+      writer.start(MakeManifest(), {});
+      for (std::uint64_t i = 1; i <= kRecords; ++i) {
+        Context context{};
+        context.dispatch_index = i;
+        writer.dispatch(context, MakePayload(16, static_cast<int>(i)));
+      }
+      writer.flush();
+      EXPECT_TRUE(writer.capped());
+      EXPECT_FALSE(writer.capture_stopped());
+      EXPECT_FALSE(writer.failed()) << writer.error();
+    }
+    const std::vector<std::string> files = LogSegmentFiles(path);
+    ASSERT_EQ(files.size(), 4u);
+    EXPECT_EQ(files.back(), path);
+    std::uint64_t total = 0;
+    std::vector<std::uint64_t> kept;
+    for (const auto& file : files) {
+      total += FileSize(file);
+      LogReader reader{file};
+      LogReader::Record record;
+      while (reader.next(record)) kept.push_back(record.header.dispatch_index);
+      EXPECT_FALSE(reader.truncated()) << file;
+    }
+    EXPECT_LE(total, cap);
+    ASSERT_GE(kept.size(), 6u);
+    for (std::size_t i = 0; i < kept.size(); ++i) {
+      EXPECT_EQ(kept[i], kRecords - kept.size() + 1 + i);
+    }
+    EXPECT_TRUE(std::ifstream{marker}.good());
+    for (const auto& file : files) ::unlink(file.c_str());
+    ::unlink(marker.c_str());
+  }
+}
+
+// A cap too small for two segments cannot rotate: the writer stops at it,
+// leaves a log that still reads in full, is not failed(), and marks the log
+// incomplete with `<path>.capped`.
 TEST(LogCapture, ByteCapStopsCaptureAndLeavesAValidMarkedLog) {
   for (const bool background : {false, true}) {
     SCOPED_TRACE(background);

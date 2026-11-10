@@ -98,8 +98,8 @@ past the name table reads as `#<index>` rather than as nobody.
 
 A node's event log can stop early, and capture never resumes: `LogWriter`
 reports `failed()` for a disk error or for capture abandoned (the writer fell
-behind, or a record did not fit), and `capped()` for a log that reached its
-byte budget. The `Reporter` copies both into the row's `flags` in each full
+behind, or a record did not fit), and `capped()` for a log whose byte budget
+cost it records (its oldest segment deleted, or capture stopped at the cap). The `Reporter` copies both into the row's `flags` in each full
 sample, when the loop's recorder reports them, as `kFlagRecorderFailed` and
 `kFlagLogCapped`; the hardware bridge does the same for its own log
 (`NodeRegistration::set_recording`). They are bits of the existing `flags`

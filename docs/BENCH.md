@@ -158,8 +158,10 @@ sleep precision. Releasing a lane is not a mechanical brake.
   node should log `realtime scheduling incomplete`. Do not use
   `TALOS_REALTIME=0` for acceptance.
 - [ ] In a disposable session lower `[robot] log_max_bytes` and exceed each
-  writer's share. Expected: control continues, logs stop at whole records,
-  completed manifest reports `log_capped: true`. Record cap/file sizes and
+  writer's share. Expected: control continues, each log keeps its newest
+  records in whole-record segments within its share (oldest
+  `<stem>.segment<k>.tlog` deleted), completed manifest reports
+  `log_capped: true`. Record cap/file sizes and
   manifest, restore normal limits and reserve disk for session metadata.
 - [ ] Stop the stack and fetch into a fresh destination with
   `./tools/deploy.sh fetch <archive-directory>`. Expected: complete session
