@@ -9,6 +9,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#include <sched.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -519,6 +525,82 @@ TEST_F(Registry, ADeadClaimantsRowIsFreedByTheNextClaim) {
   EXPECT_EQ(nodes.size(), kMaxNodes);
   EXPECT_TRUE(std::none_of(nodes.begin(), nodes.end(),
                            [](const auto& n) { return n.name == "killed"; }));
+}
+
+// A node in another pid namespace that shares /dev/shm (a container run with
+// --ipc=host) has a pid that names another process, or none, in this one. Its
+// row must survive this namespace's sweep while its heartbeat is fresh, or a
+// live node loses its row to every claim on the host. The node runs as pid 1
+// of a new pid namespace with its own /proc, as in a container; where this
+// process may not create one, the test is skipped.
+TEST_F(Registry, AClaimantInAnotherPidNamespaceKeepsItsRow) {
+#if !defined(__linux__)
+  GTEST_SKIP() << "pid namespaces are Linux-only";
+#else
+  Pipe forked;
+  Pipe ready;
+  Children children;
+  const pid_t outer = ::fork();
+  ASSERT_GE(outer, 0);
+  if (outer == 0) {
+    // Unprivileged where user namespaces allow it, else as root.
+    if (::unshare(CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS) != 0 &&
+        ::unshare(CLONE_NEWPID | CLONE_NEWNS) != 0) {
+      const std::int32_t error = -errno;
+      ::_exit(write_all(forked.writer(), &error, sizeof(error)) ? 0 : 2);
+    }
+    const pid_t node = ::fork();
+    if (node == 0) {
+      ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+      // Best effort: without its own /proc the node cannot check pids, but
+      // its row is still recorded from the new namespace.
+      if (::mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) == 0) {
+        ::mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                nullptr);
+      }
+      char token = 0;
+      try {
+        NodeRegistration registration{{.name = "contained"}, path_};
+        token = 1;
+        if (!write_all(ready.writer(), &token, 1)) ::_exit(2);
+        for (;;) ::pause();
+      } catch (...) {
+        write_all(ready.writer(), &token, 1);
+        ::_exit(1);
+      }
+    }
+    const std::int32_t sent = node;
+    if (node < 0 || !write_all(forked.writer(), &sent, sizeof(sent))) {
+      ::_exit(2);
+    }
+    int status = 0;
+    while (::waitpid(node, &status, 0) < 0 && errno == EINTR) {
+    }
+    ::_exit(0);
+  }
+  children.add(outer);
+  std::int32_t node = 0;
+  ASSERT_TRUE(read_all(forked.reader(), &node, sizeof(node)));
+  if (node < 0) {
+    children.reap(outer);
+    GTEST_SKIP() << "cannot create a pid namespace: errno " << -node;
+  }
+  char token = 0;
+  const bool registered = read_all(ready.reader(), &token, 1) && token == 1;
+  if (!registered) ::kill(node, SIGKILL);
+  ASSERT_TRUE(registered) << "the contained node did not register";
+
+  // This claim sweeps the registry from this namespace.
+  NodeRegistration host{{.name = "host"}, path_};
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto nodes = reader->nodes();
+  ::kill(node, SIGKILL);
+  EXPECT_EQ(nodes.size(), 2u);
+  EXPECT_TRUE(std::any_of(nodes.begin(), nodes.end(), [](const auto& n) {
+    return n.name == "contained" && n.alive;
+  })) << "the live contained node's row was swept";
+#endif
 }
 
 // The launcher prepares the registry before it starts a node. Created under a

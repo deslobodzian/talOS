@@ -112,7 +112,7 @@ TEST(LayoutValidation, SlotsIncludeAlignedPublicationTime) {
     RTMSQueue queue{path, layout.message_size, layout.alignment, kSchema, 2};
     SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
     const auto* header = static_cast<const RTMSHeader*>(mapping.ptr());
-    EXPECT_EQ(header->version, 6u);
+    EXPECT_EQ(header->version, 7u);
     EXPECT_EQ(header->slot_stride, layout.stride);
     EXPECT_EQ(header->data_offset % rtms_slot_alignment(layout.alignment), 0u);
     EXPECT_EQ(rtms_publish_time_offset(layout.message_size),
@@ -1538,7 +1538,8 @@ TEST(RTMSProcessIdentity, NeitherAReusedPidNorAZombieKeepsAClaim) {
   }
   ASSERT_EQ(live & ((1ULL << kProcessPidBits) - 1),
             static_cast<std::uint64_t>(::getpid()));
-  ASSERT_NE(live >> kProcessPidBits, 0u) << "no process start time recorded";
+  ASSERT_NE((live >> kProcessPidBits) & kProcessStartMask, 0u)
+      << "no process start time recorded";
   // A writer that died, whose pid this process has since been given: the same
   // pid, started at another time.
   header->writer.owner_pid.store(live ^ (1ULL << kProcessPidBits));

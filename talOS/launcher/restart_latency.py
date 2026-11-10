@@ -211,7 +211,7 @@ def shm_name(topic, namespace):
     return f"/~{value:016x}"
 
 
-REGISTRY = "/talos_registry.4"  # talOS/introspection/registry.h kRegistryPath
+REGISTRY = "/talos_registry.5"  # talOS/introspection/registry.h kRegistryPath
 SESSION_LOCK = "/talos_session"  # talOS/launcher/session_lock.h kSessionLockName
 
 

@@ -7,8 +7,9 @@ flatbuffer_cc_library(
     srcs = ["test_message.fbs"],
 )
 
-# Whether a process recorded in shared memory (pid plus start time) still
-# runs: RTMS claims and the live registry's rows share this one check.
+# Whether a process recorded in shared memory (pid, start time and pid
+# namespace) still runs: RTMS claims and the live registry's rows share this
+# one check.
 cc_library(
     name = "process_liveness",
     srcs = ["process_liveness.cc"],
@@ -25,6 +26,16 @@ cc_library(
         ":process_liveness",
         "//talOS/memory:shared_memory",
         "//talOS/schema:identity",
+    ],
+)
+
+cc_test(
+    name = "process_liveness_test",
+    size = "small",
+    srcs = ["process_liveness_test.cc"],
+    deps = [
+        ":process_liveness",
+        "@googletest//:gtest_main",
     ],
 )
 

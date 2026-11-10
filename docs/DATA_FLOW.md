@@ -204,7 +204,7 @@ sizes asserted above.
 
 Fixed message topics store their complete native FlatBuffers struct/envelope
 plus a writer publication timestamp; there is no UDP frame header. RTMS segment
-version **6** stores `[payload][padding to 8][i64 publish_time_ns][tail padding]`.
+version **7** stores `[payload][padding to 8][i64 publish_time_ns][tail padding]`.
 For payload size M and alignment A, timestamp offset is `align_up(M, 8)` and
 slot stride is `align_up(align_up(M, 8) + 8, max(A, 8))`. The **832 B** ring
 header is additional; data starts at `align_up(832, max(A, 8))`. These sizes
@@ -218,8 +218,12 @@ except that equality is accepted when the reliable-publication marker equals P.
 Overwriting writers invalidate this marker before modifying slot bytes. Every
 attach, publisher or reader, rejects a segment of another version, layout or
 schema. A new session owner replaces any prior segment.
-Writer and reader claims in the header record the pid plus the process start
-time (`kProcessPidBits` in `talOS/rtms/process_liveness.h`), so a reused pid holds no claim.
+Writer and reader claims in the header record one 64-bit process word: the pid
+(22 bits), the low 20 bits of the process start time (Linux clock ticks, macOS
+milliseconds) and a 20-bit pid-namespace code (`kProcessPidBits` in
+`talOS/rtms/process_liveness.h`), so a reused pid
+holds no claim and a claim from another pid namespace sharing `/dev/shm` is
+never probed in this one; a reader state word is that word above 2 state bits.
 
 `age()` and `fresh()` count from publication, never delivery. A stalled consumer
 cannot revive an expired command by draining it. Latest-value subscriptions

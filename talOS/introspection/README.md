@@ -7,7 +7,7 @@ data.
 
 ## The segment
 
-The logical path is `/talos_registry.4`, and the trailing number is
+The logical path is `/talos_registry.5`, and the trailing number is
 `kRegistryVersion`. Registry opens and explicit unlinks apply `ShmObjectName`,
 just like topics: `TALOS_SHM_NAMESPACE` (or Bazel's `TEST_TMPDIR` fallback)
 isolates tests and their children, while production retains the ordinary name.
@@ -124,11 +124,13 @@ killed during its own temporary CLAIMING transition. Recovery takes one sweep
 Every new claim also sweeps ACTIVE slots whose claimant is gone: its process
 no longer runs, or its host-monotonic heartbeat is at least
 `kLivenessTimeout`, five seconds old. A row records its claimant as RTMS
-records a claim, the pid and the process start time (`pid_start`;
-`//talOS/rtms:process_liveness`), so a killed node's row is freed by the next
-claim, and a pid reused since does not keep it. Both are rechecked after the
-ACTIVE-to-CLAIMING transition so a refresh observed during the sweep can keep
-the row.
+records a claim, the pid, the process start time and the pid namespace
+(`pid_start`; `//talOS/rtms:process_liveness`), so a killed node's row is freed
+by the next claim, and a pid reused since does not keep it. A claimant in
+another pid namespace sharing `/dev/shm` cannot be looked up from this one, so
+its row is freed only once its heartbeat is `kLivenessTimeout` old. Both are
+rechecked after the ACTIVE-to-CLAIMING transition so a refresh observed during
+the sweep can keep the row.
 
 Each claim bumps a generation counter before the slot goes ACTIVE. A reader
 snapshots the generation, copies the identity fields, and re-reads it; a change
@@ -245,8 +247,10 @@ synchronizes the kill without sleeps. The tests verify initialization recovery,
 all 32 slots remaining usable after an abandoned claim, and eight concurrent
 processes holding distinct registrations across the entire registry. A
 SIGKILLed claimant's row is freed by the next claim, before its heartbeat ages
-out, and `PrepareRegistry` gives the segment and lock file their modes under a
-restrictive umask and refuses a segment it cannot open read-write.
+out; on Linux, where the test may create one, a claimant running as pid 1 of
+its own pid namespace keeps its row through that claim; and `PrepareRegistry`
+gives the segment and lock file their modes under a restrictive umask and
+refuses a segment it cannot open read-write.
 
 `:registry` is the segment and both ends of it, and depends only on
 `//talOS/events:events_core`, `:names`, `:lock_file` and

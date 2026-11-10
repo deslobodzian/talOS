@@ -179,10 +179,14 @@ Exactly one retry is pending, so clearing a transient fault can recover without 
 restart. The session manifest records `quarantined` and
 `retry_at_monotonic_ns`; a stopping session cancels pending retries.
 `--max-restarts 0` never restarts a node; `[robot] max_restarts` must be at
-least 1. Registry version 4
-(`/talos_registry.4`) uses host-monotonic heartbeat/liveness timestamps, so
+least 1. Registry version 5
+(`/talos_registry.5`) uses host-monotonic heartbeat/liveness timestamps, so
 wall-clock corrections cannot falsely evict healthy nodes; deploy all node
-and viewer binaries together.
+and viewer binaries together. Run one session's nodes in one pid namespace: a
+node in another (a container sharing `/dev/shm` with `--ipc=host`) cannot be
+restarted, because its dead topic claims stay until the session ends. Keep
+them in one time namespace too: Linux shows process start times shifted by the
+reader's time namespace, so a node in another would judge live claims dead.
 
 ## RoboRIO
 

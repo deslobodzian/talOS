@@ -134,7 +134,7 @@ struct RTMSOptions {
 // The segment format, checked before any other header field is trusted.
 inline constexpr std::uint64_t kRtmsMagic =
     0x32534D54534F4C41ULL;  // "ALOSTMS2"
-inline constexpr std::uint64_t kRtmsVersion = 6;
+inline constexpr std::uint64_t kRtmsVersion = 7;
 
 // RTMSHeader::lifetime: a session-owned flag, a closing flag, and the count
 // of queues attached to a segment that is not session-owned.
@@ -143,14 +143,16 @@ inline constexpr std::uint64_t kLifetimeClosing = 1ULL << 62;
 inline constexpr std::uint64_t kLifetimeCountMask = (1ULL << 32) - 1;
 
 // The segment records the writer's owner and each reader slot's claimant as
-// a process word (kProcessPidBits, process_liveness.h).
-// A reader's state word holds a process word above its two state bits.
-static_assert(kProcessPidBits + kProcessStartBits + 2 == 64);
+// a process word (kProcessPidBits, process_liveness.h): pid, start time and
+// pid namespace. A reader's state word holds a process word above its two
+// state bits.
+static_assert(kProcessPidBits + kProcessStartBits + kProcessNamespaceBits + 2 ==
+              64);
 
 struct alignas(CACHE_LINE) Writer {
   std::atomic<uint64_t> sequence{};
   // Exclusive publisher, 0 when unclaimed; dead owners may be replaced.
-  // Despite its name, a process word: (start << kProcessPidBits) | pid.
+  // Despite its name, a process word (process_liveness.h), not a bare pid.
   std::atomic<uint64_t> owner_pid{};
   // Exact completed DROP_NEWEST publication, or 0 when overwriting may have
   // touched its oldest slot. Allows reliable readers to use the full ring.

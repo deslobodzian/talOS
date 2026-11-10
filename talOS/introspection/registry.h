@@ -96,6 +96,9 @@ namespace talos::introspect {
 // clock. Mixing epochs would make healthy nodes appear stale.
 // Version 4 adds NodeRecord::pid_start, so a row whose claimant died is
 // freed at once and a reused pid does not keep a dead claimant's row.
+// Version 5 narrows the pid to 22 bits of the process word and records the
+// claimant's pid namespace above its start (process_liveness.h): a version-4
+// reader would misread the start and free live rows.
 //
 // The event log flags (kFlagRecorderFailed, kFlagLogCapped) did not bump it:
 // they are bits of `flags` that every earlier writer left clear, which reads
@@ -105,8 +108,8 @@ namespace talos::introspect {
 // Nor did naming::kSourceFlagLatestOnly: a bit of SourceRecord::flags that
 // every earlier writer left clear, which reads as "every drop is a loss" --
 // what an earlier reader assumed of every source.
-inline constexpr std::uint32_t kRegistryVersion = 4;
-inline constexpr const char* kRegistryPath = "/talos_registry.4";
+inline constexpr std::uint32_t kRegistryVersion = 5;
+inline constexpr const char* kRegistryPath = "/talos_registry.5";
 // The segment's mode, whatever the creator's umask: every node registers,
 // whichever user runs it, and the registry provides no authentication.
 inline constexpr mode_t kRegistryMode = 0666;
@@ -242,8 +245,8 @@ struct alignas(64) NodeRecord {
 
   std::int64_t start_wall_ns;
   std::uint64_t pid;
-  // The claimant's start time as its process word records it (the bits above
-  // kProcessPidBits, talOS/rtms/process_liveness.h); 0 compares the pid alone.
+  // The claimant's process word above kProcessPidBits: its start time and
+  // pid namespace (talOS/rtms/process_liveness.h); 0 compares the pid alone.
   std::uint64_t pid_start;
   std::uint64_t session_id;
   char name[kMaxNameBytes];
@@ -937,8 +940,9 @@ class NodeRegistration {
 
   // Frees every slot whose owner is gone: its process no longer runs
   // (process_liveness.h: no process with its pid, a zombie, or a pid reused
-  // by a process that started later), or it stopped heartbeating long enough
-  // ago to be considered gone. So crash residue from an earlier session never
+  // by a process that started later; never decided for an owner in another
+  // pid namespace), or it stopped heartbeating long enough ago to be
+  // considered gone. So crash residue from an earlier session never
   // lingers as a permanent "stopped heartbeating" row in the viewer, and
   // SIGKILLed nodes -- a crash-looping roster leaves one row per run -- never
   // fill the registry for the restarts that follow. Runs on every claim -- a
