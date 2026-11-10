@@ -42,6 +42,14 @@ implementation (an unknown value fails at startup). The robot config selects
   sample interval; nearest-key attachment alone would be off by speed × half
   an interval). Lag window = `max_observation_age_us`. GTSAM is imported
   only for this backend.
+  No GTSAM exception (`RuntimeError`; `IndexError` for a missing key)
+  leaves `update()`. A failed update leaves iSAM2 unusable, so the smoother
+  restarts holding only the newest sample, at the last good estimate under
+  the `prior_std_*` prior: a failed odometry step is kept, a failed
+  observation is rejected (counted). Older keys and observation priors are
+  dropped; an observation taken before the restart attaches to the restart
+  sample. stderr gets at most one line per failure kind (odometry,
+  observation) per 5 s of sample time.
 
 ## Rules (both backends)
 
@@ -66,6 +74,11 @@ implementation (an unknown value fails at startup). The robot config selects
   capture and arrival time, compared after odometry compensation; with
   multiple configured cameras they must include at least two distinct
   cameras, with exactly one camera three consistent observations suffice.
+  Accepting a large innovation resets the backend to that measurement,
+  moved by odometry to the newest sample: wpimath's `resetPosition` there,
+  or the factor-graph restart above at that pose plus the measurement's own
+  prior. Evidence for the old pose, up to a full lag window of factor-graph
+  priors, cannot outvote it.
   Invalid or no-tag camera states are skipped without incrementing either
   counter; `observation_rejected_count` counts offered measurements refused.
 - A drivetrain sample is integrated once, when `sample_time_ns` increased,
@@ -90,7 +103,9 @@ implementation (an unknown value fails at startup). The robot config selects
   field-pose consumers must require both `valid` and `localized`.
 - An observation is read once (`updated`). Invalid or no-tag camera states
   are skipped; offered measurements are rejected (counted) when a value is
-  non-finite, a std dev is not positive, no odometry has been integrated, it
+  non-finite, a std dev is below 1e-4 m (x, y) or 1e-4 rad (yaw), finer
+  than any camera resolves (in the factor graph such a sigma only
+  ill-conditions the system), no odometry has been integrated, it
   predates the first odometry sample, is more than
   `observation_future_tolerance_us` newer than the latest
   odometry sample, or older than `max_observation_age_us` (at most 1.5 s,
@@ -101,16 +116,19 @@ implementation (an unknown value fails at startup). The robot config selects
 
 ## Tests
 
-`bazel test //2026-robot/main_processor/pose_estimator:node_test` runs every
+`bazel test //2026-robot/main_processor/pose_estimator:node_test` runs each
 scenario against both backends on `talos.testing.Sim`: a straight line then
 an arc against the closed-form pose; a delayed observation correcting
 wheel-slip drift; an observation between samples placed at its own time;
 each rejection case leaving the pose alone; yaw acceptance, rejection and ±π
 wrapping, including multi-tag outlier rejection, sustained (multi-camera)
-relocalization, inconsistent/expired/replayed evidence, motion compensation,
+relocalization, relocalization against a full 1.5 s window of observations
+of the old pose, inconsistent/expired/replayed evidence, motion compensation,
 and skipped non-measurements; disabled-first seed trust, enabled-first restart
 recovery without seed innovation gating, cross-camera startup confirmation,
 missing/detached DS startup and process-lifetime localization latching;
 estimation while disabled; stale, frozen and invalid drivetrain input; repeated samples; `cameras`
 wiring; startup errors naming the bad key; `--describe` and a logged sim run
-replaying without divergence.
+replaying without divergence. For `factor_graph` alone (Kalman has no such
+failure), a raising smoother update rejects that observation or keeps that
+odometry step, and stale input still invalidates the estimate afterwards.

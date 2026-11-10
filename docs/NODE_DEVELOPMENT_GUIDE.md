@@ -273,7 +273,7 @@ observation once (`updated`). Rules every estimator keeps:
 `2026-robot/main_processor/pose_estimator` is the full example: swerve
 odometry plus cameras, with `backend = "kalman"` (wpimath
 `SwerveDrive4PoseEstimator`) or `"factor_graph"` (a GTSAM fixed-lag
-smoother), and tests that run every scenario against both.
+smoother), and tests that run its scenarios against both.
 
 Tune or verify offline with `launcher --replay-inputs <session> --only <node>`.
 The node runs on a simulated loop fed recorded inputs from the session origin

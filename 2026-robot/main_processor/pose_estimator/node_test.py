@@ -1,6 +1,7 @@
 """Pose estimator tests: both backends on talos.testing.Sim, and the binary.
 
-Every scenario runs once per backend. A simulated swerve chassis publishes
+Every scenario runs once per backend, except GTSAM failure containment, which
+only the factor graph has. A simulated swerve chassis publishes
 DrivetrainState the way the drivetrain does (module positions, gyro yaw,
 sample time); the expected poses are closed-form, not another estimator.
 """
@@ -31,8 +32,16 @@ DT = 0.02
 MODULES = ((-0.30, 0.30), (-0.30, -0.30), (0.30, 0.30), (0.30, -0.30))
 
 
+class RaisingSmoother:
+    """In place of the factor graph's smoother: update() raises the way GTSAM
+    reports an indeterminant linear system or a marginalized key."""
+
+    def update(self, *_):
+        raise RuntimeError("Indeterminant linear system detected")
+
+
 def robot_toml(backend, *, cameras=("front_camera", "back_camera"),
-               extra=""):
+               max_observation_age_us=500_000, extra=""):
     names = ", ".join(f'"{c}"' for c in cameras)
     return f"""
 [robot]
@@ -46,7 +55,7 @@ backend = "{backend}"
 cameras = [{names}]
 module_x_m = [{", ".join(str(x) for x, _ in MODULES)}]
 module_y_m = [{", ".join(str(y) for _, y in MODULES)}]
-max_observation_age_us = 500000
+max_observation_age_us = {max_observation_age_us}
 {extra}
 
 # A robot config needs one motor: the drivetrain's, whose state the tests
@@ -495,6 +504,30 @@ class EstimatorTest(unittest.TestCase):
                         self.assertEqual(self.counts(), (0, index + 1))
                 self.assertEqual(self.counts(), (1, 2))
 
+    def test_relocalization_outweighs_a_full_window_at_the_production_lag(self):
+        """1.5 s of accepted observations of the old pose (for the factor
+        graph, a window of priors) must not hold back a confirmed
+        relocalization: the estimate is at the new pose on that tick."""
+        old, new = (2.0, 2.0, 0.0), (6.0, 2.0, 0.6)
+        window_ticks = 75  # 1.5 s at DT
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(
+                    backend, max_observation_age_us=1_500_000,
+                    extra=f"initial_x_m = {old[0]}\ninitial_y_m = {old[1]}")
+                for _ in range(window_ticks):
+                    for camera in ("front_camera", "back_camera"):
+                        self.observe(camera, x=old[0], y=old[1], yaw=old[2])
+                    chassis.hold(DT)
+                self.assertEqual(self.counts(), (2 * window_ticks, 0))
+                for camera in ("front_camera", "back_camera", "front_camera"):
+                    self.observe(camera, x=new[0], y=new[1], yaw=new[2])
+                    chassis.hold(DT)
+                self.assertEqual(self.counts(), (2 * window_ticks + 1, 2))
+                x, y, yaw = self.pose()
+                self.assertLess(math.hypot(x - new[0], y - new[1]), 0.1)
+                self.assertAlmostEqual(yaw, new[2], delta=0.02)
+
     def test_invalid_and_no_tag_camera_states_are_not_measurements(self):
         for backend in BACKENDS:
             with self.subTest(backend=backend):
@@ -608,7 +641,7 @@ class EstimatorTest(unittest.TestCase):
             ("non-finite pose", dict(y=nan)),
             ("infinite yaw", dict(yaw=inf)),
             ("non-finite std", dict(std=(0.05, nan, 0.05))),
-            ("zero std", dict(std=(0.05, 0.05, 0.0))),
+            ("std below the physical floor", dict(std=(0.05, 0.05, 1e-5))),
             ("negative std", dict(std=(-0.05, 0.05, 0.05))),
             ("from the future", dict(age_s=-0.1)),
             ("older than the age limit", dict(age_s=0.55)),
@@ -713,6 +746,39 @@ class EstimatorTest(unittest.TestCase):
                     self.assertAlmostEqual(self.pose()[0], chassis.x,
                                            places=4)
 
+    def test_a_raising_factor_graph_update_is_contained(self):
+        """GTSAM raising inside update() costs that observation (rejected)
+        and none of the odometry, never the node; stale input still
+        invalidates the estimate afterwards. Kalman has no such path."""
+        chassis = self.start("factor_graph")
+        chassis.drive(1.0, 0.0, 0.0, 0.2)
+        backend = self.node.backend
+        before = self.pose()
+        # No new drivetrain sample: this tick's only update is the observation.
+        backend.smoother = RaisingSmoother()
+        self.observe(x=chassis.x + 0.3)
+        self.sim.step(DT)
+        self.assertEqual(self.counts(), (0, 1))
+        self.assertTrue(self.estimate().valid)
+        self.assertPoseHeld(before)
+        # The odometry step whose update raised is kept, on a new smoother.
+        backend.smoother = RaisingSmoother()
+        chassis.drive(1.0, 0.0, 0.0, DT)
+        self.assertTrue(self.estimate().valid)
+        self.assertAlmostEqual(self.pose()[0], chassis.x, places=4)
+        chassis.drive(1.0, 0.0, 0.0, 0.2)
+        # An observation taken before that restart is fused at a live key.
+        self.observe(age_s=0.25, x=chassis.x - 0.25 + 0.3)
+        chassis.drive(1.0, 0.0, 0.0, DT)
+        self.assertEqual(self.counts(), (1, 1))
+        self.assertGreater(self.pose()[0], chassis.x + 0.2)
+        held = self.pose()
+        for _ in range(10):  # the drivetrain falls silent
+            chassis.advance(1.0, 0.0, 0.0)
+            self.sim.step(DT)
+        self.assertFalse(self.estimate().valid)
+        self.assertPoseHeld(held)
+
     def test_only_the_listed_cameras_are_used(self):
         for backend in BACKENDS:
             for cameras in (("front_camera", "back_camera"), ()):
@@ -733,8 +799,7 @@ class EstimatorTest(unittest.TestCase):
         cases = [
             ("backend", robot_toml("particle_filter")),
             ("max_observation_age_us",
-             robot_toml("kalman").replace("max_observation_age_us = 500000",
-                                          "max_observation_age_us = 2000000")),
+             robot_toml("kalman", max_observation_age_us=2_000_000)),
             ("module_x_m", module_list("module_x_m", "[0.3, 0.3, -0.3]")),
             ("cameras", robot_toml("kalman").replace(
                 'cameras = ["front_camera", "back_camera"]', "cameras = [1]")),
@@ -744,6 +809,10 @@ class EstimatorTest(unittest.TestCase):
              robot_toml("factor_graph",
                         extra="factor_graph.odometry_std_yaw_rad = -1.0")),
         ]
+        for axis in ("x_m", "y_m", "yaw_rad"):
+            key = f"factor_graph.prior_std_{axis}"
+            cases.append((key, robot_toml("factor_graph",
+                                          extra=f"{key} = 0.0")))
         for key in ("initial_x_m", "initial_y_m", "initial_yaw_rad",
                     "field_length_m", "field_width_m", "max_innovation_m"):
             cases.append((key, robot_toml("kalman", extra=f"{key} = nan")))

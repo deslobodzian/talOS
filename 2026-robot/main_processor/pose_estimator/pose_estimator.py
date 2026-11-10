@@ -14,23 +14,31 @@ Two backends share this shell, its checks and its tests; `backend` picks one:
 - "factor_graph": a GTSAM fixed-lag smoother (iSAM2) over one Pose2 per
   integrated drivetrain sample: wheel-odometry BetweenFactors, a prior on the
   first pose, and one PriorFactor per accepted observation. The lag window
-  is max_observation_age_us.
+  is max_observation_age_us. No GTSAM exception leaves update(): the
+  smoother restarts at the last good estimate, and an observation whose
+  update failed is rejected.
 
 Invalid/no-tag camera states carry no measurement and are skipped. A measurement
-is rejected (and counted) when it carries a non-finite value or a non-positive
-standard deviation, arrives before any odometry, was taken before the first
-odometry sample, is too old or too far in the future, or is outside the field.
+is rejected (and counted) when it carries a non-finite value or a standard
+deviation below MIN_OBSERVATION_STD_M / MIN_OBSERVATION_STD_RAD, arrives before
+any odometry, was taken before the first odometry sample, is too old or too far
+in the future, or is outside the field.
 Once localized, measurements pass position and wrapped-yaw innovation gates
 against the estimate at their sample time. An untrusted startup seed does not
 gate measurements. Localization (and large innovations once localized) requires
 three consecutive, mutually consistent measurements within 0.5 s; agreement
 uses the same gates after compensating for intervening odometry. With multiple
 configured cameras, at least two distinct cameras must supply that evidence.
+A confirmed large innovation resets the backend to that measurement, so the
+evidence for the old pose cannot outvote it.
 """
 
+import bisect
 import collections
 import importlib
 import math
+import operator
+import sys
 
 import numpy as np
 import talos
@@ -51,8 +59,19 @@ MODULE_COUNT = 4
 # Relocalization requires sustained evidence, independent of reported confidence.
 RELOCALIZATION_COUNT = 3
 RELOCALIZATION_WINDOW_S = 0.5
+# A smaller observation standard deviation is no camera's real precision; in
+# the factor graph it would only make the linear system ill-conditioned.
+MIN_OBSERVATION_STD_M = 1e-4
+MIN_OBSERVATION_STD_RAD = 1e-4
+# GTSAM's C++ exceptions as pybind11 raises them: its own (an indeterminant
+# linear system, a missing or duplicate key) as RuntimeError, std::out_of_range
+# key lookups as IndexError. Either leaves the smoother unusable.
+_GTSAM_ERRORS = (RuntimeError, IndexError)
+# One stderr line per factor-graph failure kind per this much sample time.
+_FAILURE_REPORT_INTERVAL_S = 5.0
 _NS = 1e9
 _US = 1e6
+_SAMPLE_TIME = operator.attrgetter("time_s")
 
 
 def _positive(node, key, default):
@@ -104,11 +123,18 @@ def module_positions(state):
     return tuple(positions)
 
 
+def _bracket(samples, time_s):
+    """(before, after): the retained samples around time_s (equal at the
+    ends). Sample times strictly increase, so a binary search finds them."""
+    index = min(bisect.bisect_left(samples, time_s, key=_SAMPLE_TIME),
+                len(samples) - 1)
+    after = samples[index]
+    return (samples[index - 1] if index else after), after
+
+
 def _odometry_at(samples, time_s):
     """Interpolate retained odometry with the samples' constant-twist arc."""
-    after = next((s for s in samples if s.time_s >= time_s), samples[-1])
-    index = samples.index(after)
-    before = samples[index - 1] if index > 0 else after
+    before, after = _bracket(samples, time_s)
     span = after.time_s - before.time_s
     if span <= 0:
         return after.odometry
@@ -153,6 +179,16 @@ class KalmanBackend:
 
     def add_observation(self, time_s, pose, std_devs):
         self.estimator.addVisionMeasurement(pose, time_s, std_devs)
+        return True
+
+    def reset(self, yaw, positions, pose=None):
+        """Adopts (yaw, positions) as the odometry baseline without
+        integrating the step to them; with `pose`, the estimate continues
+        from there. wpimath clears its pose buffer either way, so an
+        observation added before the next odometry sample is dropped."""
+        self.estimator.resetPosition(
+            yaw, positions, self.pose() if pose is None else pose)
+        self.yaw, self.positions = yaw, positions
 
     def pose(self):
         return self.estimator.getEstimatedPosition()
@@ -186,6 +222,11 @@ class FactorGraphBackend:
     under extreme acceleration at 20 ms samples), plus nothing of the time
     offset, which nearest-key attachment alone would cost: speed times half
     an interval, 4 cm at 4 m/s.
+
+    A GTSAM exception leaves iSAM2 unusable (the failed factor stays in its
+    graph and every later update fails), so none escapes: the smoother
+    restarts (_restart) at the last good estimate. A failed odometry step
+    is kept; a failed observation is dropped and reported as not fused.
     """
 
     def __init__(self, node, kinematics, lag_s):
@@ -200,23 +241,23 @@ class FactorGraphBackend:
                       (0.01, 0.01, 0.005))))
         self.prior_noise = self.gtsam.noiseModel.Diagonal.Sigmas(np.array(
             _std_devs(node, "factor_graph", "prior_std", (1.0, 1.0, 0.5))))
-        self.smoother = self.gtsam.IncrementalFixedLagSmoother(
-            lag_s, self.gtsam.ISAM2Params())
+        self.smoother = None
         # The samples whose keys are still in the smoother, plus the newest
-        # marginalized one as the interpolation anchor just past the window.
+        # marginalized one as the interpolation anchor just past the window
+        # and, after a restart, older ones kept for their odometry only.
         self.samples = collections.deque()
+        self.origin = None  # the sample the smoother (re)started at
         self.next_key = 0
         self.yaw = Rotation2d()
         self.positions = None
         self.estimate = Pose2d()
         self.initial_pose = _initial_pose(node)
+        # kind: (failures since the last report, that report's sample time)
+        self.failures = {}
 
     def start(self, time_s, yaw, positions):
-        origin = self.initial_pose
-        graph = self.gtsam.NonlinearFactorGraph()
-        graph.add(self.gtsam.PriorFactorPose2(0, self._pose2(origin),
-                                              self.prior_noise))
-        self._add_sample(graph, time_s, origin, origin)
+        self._append(time_s, self.initial_pose)
+        self._restart(self.initial_pose)
         self.yaw, self.positions = yaw, positions
 
     def add_odometry(self, time_s, yaw, positions):
@@ -225,14 +266,19 @@ class FactorGraphBackend:
         wheels = self.kinematics.toTwist2d(self.positions, positions)
         twist = Twist2d(wheels.dx, wheels.dy,
                         (yaw - self.yaw).radians())
-        step = Pose2d().exp(twist)
         previous = self.samples[-1]
+        guess = self.estimate.exp(twist)
+        sample = self._append(time_s, previous.odometry.exp(twist))
         graph = self.gtsam.NonlinearFactorGraph()
         graph.add(self.gtsam.BetweenFactorPose2(
-            previous.key, self.next_key, self._pose2(step),
+            previous.key, sample.key, self._pose2(Pose2d().exp(twist)),
             self.odometry_noise))
-        self._add_sample(graph, time_s, previous.odometry.exp(twist),
-                         self.estimate.exp(twist))
+        values = self.gtsam.Values()
+        values.insert(sample.key, self._pose2(guess))
+        stamps = self.gtsam.FixedLagSmootherKeyTimestampMap()
+        stamps.insert((sample.key, time_s))
+        if not self._update(graph, values, stamps, "odometry"):
+            self._restart(guess)
         self.yaw, self.positions = yaw, positions
 
     def add_observation(self, time_s, pose, std_devs):
@@ -244,9 +290,20 @@ class FactorGraphBackend:
         graph.add(self.gtsam.PriorFactorPose2(
             sample.key, self._pose2(moved),
             self.gtsam.noiseModel.Diagonal.Sigmas(np.array(std_devs))))
-        self.smoother.update(graph, self.gtsam.Values(),
-                             self.gtsam.FixedLagSmootherKeyTimestampMap())
-        self._read_estimate()
+        if self._update(graph, self.gtsam.Values(),
+                        self.gtsam.FixedLagSmootherKeyTimestampMap(),
+                        "observation"):
+            return True
+        self._restart(self.estimate)
+        return False
+
+    def reset(self, yaw, positions, pose=None):
+        """Adopts (yaw, positions) as the odometry baseline: each step's
+        factor is built from differences, so the graph needs nothing else.
+        With `pose`, the smoother restarts there."""
+        if pose is not None:
+            self._restart(pose)
+        self.yaw, self.positions = yaw, positions
 
     def pose(self):
         return self.estimate
@@ -258,44 +315,84 @@ class FactorGraphBackend:
     def _pose2(self, pose):
         return self.gtsam.Pose2(pose.X(), pose.Y(), pose.rotation().radians())
 
-    def _add_sample(self, graph, time_s, odometry, guess):
-        values = self.gtsam.Values()
-        values.insert(self.next_key, self._pose2(guess))
-        stamps = self.gtsam.FixedLagSmootherKeyTimestampMap()
-        stamps.insert((self.next_key, time_s))
-        self.smoother.update(graph, values, stamps)
-        self.samples.append(_Sample(self.next_key, time_s, odometry))
+    def _append(self, time_s, odometry):
+        sample = _Sample(self.next_key, time_s, odometry)
+        self.samples.append(sample)
         self.next_key += 1
         # The smoother marginalizes keys stamped before latest - lag.
         cutoff = time_s - self.lag_s
         while len(self.samples) > 1 and self.samples[1].time_s < cutoff:
             self.samples.popleft()
+        return sample
+
+    def _restart(self, pose):
+        """A new smoother holding only the newest sample, at `pose` under the
+        prior_std prior, as at startup. Every older key and observation
+        prior is gone; older samples keep only their odometry."""
+        self.origin = self.samples[-1]
+        self.smoother = self.gtsam.IncrementalFixedLagSmoother(
+            self.lag_s, self.gtsam.ISAM2Params())
+        graph = self.gtsam.NonlinearFactorGraph()
+        graph.add(self.gtsam.PriorFactorPose2(
+            self.origin.key, self._pose2(pose), self.prior_noise))
+        values = self.gtsam.Values()
+        values.insert(self.origin.key, self._pose2(pose))
+        stamps = self.gtsam.FixedLagSmootherKeyTimestampMap()
+        stamps.insert((self.origin.key, self.origin.time_s))
+        self.smoother.update(graph, values, stamps)
         self._read_estimate()
 
-    def _alive(self, sample):
-        return sample.time_s >= self.samples[-1].time_s - self.lag_s
+    def _update(self, graph, values, stamps, kind):
+        """Folds the factors into the smoother and reads the new estimate;
+        False, after a report, when GTSAM raised."""
+        try:
+            self.smoother.update(graph, values, stamps)
+            self._read_estimate()
+        except _GTSAM_ERRORS as error:
+            self._report(kind, error)
+            return False
+        return True
 
-    def _bracket(self, time_s):
-        """(before, after): the samples around time_s (equal at the ends)."""
-        after = next((s for s in self.samples if s.time_s >= time_s),
-                     self.samples[-1])
-        index = self.samples.index(after)
-        before = self.samples[index - 1] if index > 0 else after
-        return before, after
+    def _report(self, kind, error):
+        """At most one stderr line per kind and _FAILURE_REPORT_INTERVAL_S
+        of sample time, counting the failures since the last one."""
+        now_s = self.samples[-1].time_s
+        count, reported_s = self.failures.get(kind, (0, -math.inf))
+        count += 1
+        if now_s - reported_s >= _FAILURE_REPORT_INTERVAL_S:
+            message = str(error).strip().split("\n", 1)[0]
+            print(f"pose_estimator: {count} factor_graph {kind} update "
+                  f"failure(s), smoother restarted at the last good "
+                  f"estimate: {message}", file=sys.stderr)
+            count, reported_s = 0, now_s
+        self.failures[kind] = (count, reported_s)
+
+    def _alive(self, sample):
+        """Whether sample's key is in the smoother: neither older than its
+        (re)start nor marginalized."""
+        return (sample.key >= self.origin.key
+                and sample.time_s >= self.samples[-1].time_s - self.lag_s)
 
     def _attach(self, time_s):
-        before, after = self._bracket(time_s)
+        before, after = _bracket(self.samples, time_s)
         nearer = (before if time_s - before.time_s <= after.time_s - time_s
                   else after)
-        return nearer if self._alive(nearer) else after
+        if self._alive(nearer):
+            return nearer
+        # nearer was marginalized, or the smoother restarted after it: the
+        # next live sample stands in (the restart sample when after
+        # predates the restart too).
+        return after if self._alive(after) else self.origin
 
     def _odometry_at(self, time_s):
         return _odometry_at(self.samples, time_s)
 
     def _read_estimate(self):
         latest = self.smoother.calculateEstimatePose2(self.samples[-1].key)
-        self.estimate = Pose2d(latest.x(), latest.y(),
-                               Rotation2d(latest.theta()))
+        x, y, theta = latest.x(), latest.y(), latest.theta()
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(theta)):
+            raise RuntimeError(f"non-finite estimate ({x}, {y}, {theta})")
+        self.estimate = Pose2d(x, y, Rotation2d(theta))
 
 
 class PoseEstimator:
@@ -414,10 +511,7 @@ class PoseEstimator:
                         or yaw_step > self.max_odometry_yaw_rate_radps * dt):
                     self.odometry_rejected_count += 1
                     # Adopt the new frame without integrating its jump.
-                    if isinstance(self.backend, KalmanBackend):
-                        self.backend.estimator.resetPosition(
-                            yaw, positions, self.backend.pose())
-                    self.backend.yaw, self.backend.positions = yaw, positions
+                    self.backend.reset(yaw, positions)
                     self.checked_ns = d.sample_time_ns
                     return None
                 self.backend.add_odometry(time_s, yaw, positions)
@@ -431,11 +525,10 @@ class PoseEstimator:
     def observe(self, o, camera):
         if not o.valid or o.tag_count < 1:
             return
-        if self.acceptable(o, camera):
-            self.backend.add_observation(
+        if self.acceptable(o, camera) and self.backend.add_observation(
                 o.sample_time_ns / _NS,
                 Pose2d(o.pose_x_m, o.pose_y_m, Rotation2d(o.pose_yaw_rad)),
-                (o.x_std_m, o.y_std_m, o.yaw_std_rad))
+                (o.x_std_m, o.y_std_m, o.yaw_std_rad)):
             self.accepted += 1
         else:
             self.rejected += 1
@@ -446,7 +539,9 @@ class PoseEstimator:
         if not all(map(math.isfinite, values + std_devs)):
             self.relocalization_candidates.clear()
             return False
-        if min(std_devs) <= 0 or self.first_ns is None:
+        if (min(o.x_std_m, o.y_std_m) < MIN_OBSERVATION_STD_M
+                or o.yaw_std_rad < MIN_OBSERVATION_STD_RAD
+                or self.first_ns is None):
             self.relocalization_candidates.clear()
             return False
         if (not 0.0 <= o.pose_x_m <= self.field_length_m
@@ -471,7 +566,17 @@ class PoseEstimator:
         if self.poses_agree(pose, reference):
             self.relocalization_candidates.clear()
             return True
-        return self.relocalizes(o.sample_time_ns, reference_time, pose, camera)
+        if not self.relocalizes(o.sample_time_ns, reference_time, pose, camera):
+            return False
+        # A confirmed new pose: the backend restarts there (moved by the
+        # odometry since, to the newest sample), so the evidence for the old
+        # pose cannot outvote it.
+        samples = self.backend.samples
+        self.backend.reset(self.backend.yaw, self.backend.positions,
+                           pose.transformBy(Transform2d(
+                               _odometry_at(samples, reference_time),
+                               samples[-1].odometry)))
+        return True
 
     def poses_agree(self, pose, reference):
         yaw_delta = (pose.rotation() - reference.rotation()).radians()

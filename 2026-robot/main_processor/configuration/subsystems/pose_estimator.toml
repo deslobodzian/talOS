@@ -45,7 +45,8 @@ state_std_y_m = 0.1
 state_std_yaw_rad = 0.1
 
 # One sigma of each odometry step (one drivetrain sample) and of the prior on
-# the first pose (the configured initial field pose).
+# the pose the smoother starts from: the configured initial field pose, or
+# where it restarts (a relocalization, a contained GTSAM failure).
 [factor_graph]
 odometry_std_x_m = 0.01
 odometry_std_y_m = 0.01
