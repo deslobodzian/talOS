@@ -598,11 +598,14 @@ TEST(Supervision, RestartsOutsideRollingWindowDoNotExhaustBudget) {
   ::remove(runs.c_str());
 }
 
+// Quarantine needs both crashes inside one window, and a restart that has left
+// the window no longer counts, so the window holds two restart-to-crash cycles
+// of a stalled launcher (under TSan on CI one cycle can exceed 300 ms).
 TEST(Supervision, ExhaustedBudgetRetriesOnceAfterTheWindowAndRecovers) {
   auto options = BaseOptions("quarantine_out", "max_restarts = 1\n");
   MakeAlphaNonCritical(options);
-  options.restart_window_ms = 300;
-  options.duration_s = 2;
+  options.restart_window_ms = 2000;
+  options.duration_s = 6;
   const auto runs = TempPath("quarantine_runs");
   const auto cleared = TempPath("quarantine_cleared");
   ::remove(runs.c_str());
@@ -652,9 +655,9 @@ TEST(Supervision, ExhaustedBudgetRetriesOnceAfterTheWindowAndRecovers) {
   EXPECT_FALSE(quarantined.empty());
   EXPECT_EQ(runs_at_quarantine, 2u);
   EXPECT_GT(retry_at, 0);
-  // Initial 50 ms backoff, the 300 ms rolling window, then normal 100 ms
+  // Initial 50 ms backoff, the 2 s rolling window, then normal 100 ms
   // backoff for the second restart; quarantine cannot turn into a quick retry.
-  EXPECT_GE(retry_at, session_started_at + 450'000'000);
+  EXPECT_GE(retry_at, session_started_at + 2'150'000'000);
   EXPECT_GE(recovered_at, retry_at);
   EXPECT_EQ(ReadLines(runs).size(), 3u);
   const auto alpha =
