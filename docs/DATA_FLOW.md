@@ -340,9 +340,9 @@ construction (`MeasurePages` in `talOS/telemetry/frames.h`):
 
 | Graph | Channels | Value pages per tick (worst case) | Dictionary |
 |---|---:|---:|---:|
-| `robot.toml`, `robot_field.toml` | 161 | 2, 2248 B (largest 1192 / 1200 B) | 2 pages, 10400 B |
-| `robot_physics_sim.toml` + `--sim --start-sim-gateway --sim-gateway-arg --physics` | 168 | 2, 2336 B (largest 1192 / 1200 B) | 2 pages, 10800 B |
-| Bench `robot.toml`, `robot_bench.toml` | 54 | 1, 808 B | 1 page, 3200 B |
+| `robot.toml`, `robot_field.toml` | 163 | 2, 2272 B (largest 1168 / 1200 B) | 2 pages, 10504 B |
+| `robot_physics_sim.toml` + `--sim --start-sim-gateway --sim-gateway-arg --physics` | 170 | 3, 2520 B (largest 1168 / 1200 B) | 2 pages, 10912 B |
+| Bench `robot.toml`, `robot_bench.toml` | 58 | 1, 856 B | 1 page, 3408 B |
 
 Studio's bridge sends each client its own updates
 (`ClientFeed` in [`studio/bridge/telemetry.h`](../studio/bridge/telemetry.h)):
@@ -378,7 +378,7 @@ viewer):
 | 160,000 B/s (`max_clients = 1`) | 46,700–72,200 disabled/autonomous; 57,700–62,600 teleop | 5,500–12,000 | 96–100 (every tick) | 69,500 B/s |
 | 40,000 B/s (default 4-client share) | 27,500–34,300 | 5,600–11,900 | 37–94, typically 45–55 | 39,700 B/s |
 
-A full keyframe every tick would be 2336 B, 233,600 B/s. The system graph
+A full keyframe every tick would be 2520 B, 252,000 B/s. The system graph
 (about 40 KB whole: 15 nodes, 94 sources, 28 topics) goes to a client whole
 only on connect and when its structure changes; otherwise its fast values
 (about 5.5 KB) go at most every 500 ms when they changed
