@@ -94,6 +94,26 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
       tracker.period_us = static_cast<uint32_t>(
           (*tbl)["period_us"].value_or(config_.period_us));
     }
+    // Owner timeout. Upper side: the merged command carries the oldest
+    // observation of any live owner, and the gateway invalidates every
+    // output (a new epoch) once that is command_timeout_us old, so a silent
+    // owner must leave the merge before then. That holds only while its last
+    // request's observation was younger than command_timeout_us minus this
+    // timeout when accepted: half the timeout when 2 x period_us <=
+    // command_timeout_us / 2, less for a slower owner, and nothing for one at
+    // the period_us = command_timeout_us / 2 limit (timeout == the whole
+    // command timeout). Past that, one silent owner stops every output; the
+    // former 2 x period_us timeout allowed about 90 ms for a 5 ms owner at
+    // 100 ms, traded here for tolerating request gaps up to half the timeout
+    // (INC-6). Lower side: one late or missed tick must not brake the
+    // subsystem, so never less than two of its periods. The configuration
+    // refuses an actuator owner whose period exceeds half the timeout, so the
+    // result never exceeds the timeout; the clamp keeps that true for an
+    // unvalidated config.
+    const uint64_t timeout_us = config_.command_timeout_us;
+    const uint64_t floor_us =
+        std::max(2 * static_cast<uint64_t>(tracker.period_us), timeout_us / 2);
+    tracker.timeout_us = std::min(floor_us, timeout_us);
     subsystems_[name] = std::move(tracker);
   }
   IndexActuators();
@@ -474,10 +494,9 @@ void HardwareNode::Tick(uint64_t now_us) {
       }
     }
 
-    // Check timeout: > 2x period
-    const uint64_t timeout_us = 2 * static_cast<uint64_t>(tracker.period_us);
+    // Owner timeout, on the bridge clock since the last accepted request.
     if (tracker.last_seen_us == 0 ||
-        (now_us - tracker.last_seen_us > timeout_us)) {
+        (now_us - tracker.last_seen_us > tracker.timeout_us)) {
       tracker.timed_out = true;
       // Neutralize actuators owned by this subsystem
       for (auto j : tracker.motor_slots) {

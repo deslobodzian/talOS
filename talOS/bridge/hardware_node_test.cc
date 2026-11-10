@@ -253,9 +253,10 @@ TEST(HardwareNodeTest, LastSubsystemTimeoutSendsOneFreshNeutralFrame) {
       InjectState(node, gateway, TrustState(config_id, 11, 1, 12000), 1011000));
   EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
 
-  // The last active subsystem expires before the heartbeat is due. Its neutral
-  // command must reference the new state, not the old request's observation.
-  node.Tick(1011001);
+  // The last active subsystem expires after its 50 ms owner timeout. Its
+  // neutral command must reference the new state, not the old request's
+  // observation.
+  node.Tick(1051001);
   EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
   ASSERT_EQ(node.commands_sent(), 2u);
 
@@ -294,17 +295,22 @@ TEST(HardwareNodeTest, LastSubsystemTimeoutSendsOneFreshNeutralFrame) {
   ASSERT_EQ(neutral.pwm_output_count, 1u);
   EXPECT_DOUBLE_EQ(neutral.pwm_outputs[0].output, 0);
 
-  for (uint64_t now_us = 1012000; now_us <= 1112000; now_us += 1000) {
+  for (uint64_t now_us = 1052000; now_us <= 1152000; now_us += 1000) {
     node.Tick(now_us);
   }
   EXPECT_EQ(node.commands_sent(), 2u);
   EXPECT_TRUE(receive_commands().empty());
 }
 
-TEST(HardwareNodeTest, SubsystemTimeoutInheritsRobotPeriod) {
+// A slow actuator owner keeps two of its own periods when that is longer
+// than half the command timeout: its ordinary cadence must not neutralize it.
+TEST(HardwareNodeTest, SlowOwnerTimeoutIsTwoOfItsPeriods) {
   auto cfg = config::ParseRobotConfigString(R"(
 [robot]
 period_us = 20000
+command_timeout_us = 100000
+[subsystems.mech]
+period_us = 40000
 [subsystems.mech.motors.motor]
 can_id = 1
 )");
@@ -317,12 +323,12 @@ can_id = 1
   request.motors[0] = {cfg.hardware.motors[0].id, Mode::kVoltage, 0, 4.0, 0.0};
   PublishCommand(pub, request);
   node.Tick(1000);
-  node.Tick(11001);  // Past the former hardcoded 2 * 5000 us timeout.
+  node.Tick(51001);  // Past half the command timeout.
   EXPECT_FALSE(node.is_subsystem_timed_out("mech"));
   EXPECT_EQ(node.current_command().motors[0].mode, Mode::kVoltage);
-  node.Tick(41000);
+  node.Tick(81000);
   EXPECT_FALSE(node.is_subsystem_timed_out("mech"));
-  node.Tick(41001);
+  node.Tick(81001);
   EXPECT_TRUE(node.is_subsystem_timed_out("mech"));
   EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
 }
@@ -1278,8 +1284,8 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   ASSERT_TRUE(published.has_value());
   const bridge::BridgeStatus later = published.value_or(bridge::BridgeStatus{});
   EXPECT_TRUE(later == node.Status(1019000));
-  // By now the drivetrain has been quiet past twice its period as well.
-  EXPECT_EQ(later.timed_out_mask(), 0b11u);
+  // The drivetrain, quiet for 18 ms, is still inside its owner timeout.
+  EXPECT_EQ(later.timed_out_mask(), 0b10u);
   EXPECT_EQ(later.state_age_us(), 19000u);
   EXPECT_TRUE(later.configured());
 }
@@ -1367,12 +1373,14 @@ TEST(HardwareNodeTest, TimeoutNeutralizesOnlyTheSilentSubsystemsActuators) {
   EXPECT_TRUE(merged.digital_outputs[0].value);
   EXPECT_DOUBLE_EQ(merged.pwm_outputs[0].output, 0.5);
 
-  // The intake goes quiet past twice its 5 ms period; the drivetrain keeps
-  // publishing.
+  // The intake goes quiet past its 50 ms owner timeout; the drivetrain keeps
+  // publishing every 5 ms.
+  for (uint64_t now_us = 1006000; now_us <= 1051000; now_us += 5000) {
+    PublishCommand(drive_pub, drive_ok);
+    node.Tick(now_us);
+  }
   PublishCommand(drive_pub, drive_ok);
-  node.Tick(1006000);
-  PublishCommand(drive_pub, drive_ok);
-  node.Tick(1011001);
+  node.Tick(1051001);
 
   EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
   EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
@@ -1387,13 +1395,69 @@ TEST(HardwareNodeTest, TimeoutNeutralizesOnlyTheSilentSubsystemsActuators) {
   EXPECT_FALSE(neutral.digital_outputs[0].value);
   EXPECT_EQ(neutral.pwm_outputs[0].id, strip);
   EXPECT_DOUBLE_EQ(neutral.pwm_outputs[0].output, 0.0);
-  EXPECT_EQ(node.Status(1011001).timed_out_mask(), 0b10u);
+  EXPECT_EQ(node.Status(1051001).timed_out_mask(), 0b10u);
   PublishCommand(intake_pub, intake_ok);
-  node.Tick(1012000);
+  node.Tick(1052000);
   EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
   EXPECT_EQ(node.current_command().motors[1].mode, Mode::kDutyCycle);
   EXPECT_TRUE(node.current_command().digital_outputs[0].value);
   EXPECT_DOUBLE_EQ(node.current_command().pwm_outputs[0].output, 0.5);
+}
+
+// A 5 ms owner's request gap of one missed tick plus bridge lateness (12 ms)
+// keeps its demand in the merge on every bridge tick; once it goes silent, it
+// is neutral on the first tick after command_timeout_us / 2 (50 ms).
+TEST(HardwareNodeTest, OwnerSurvivesALateTickAndIsNeutralWithinItsTimeout) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  ASSERT_EQ(cfg.hardware.command_timeout_us, 100000u);
+  constexpr uint64_t kOwnerTimeoutUs = 50000;
+  const uint16_t drive = cfg.hardware.motors[0].id;
+  HardwareNode node{cfg, "127.0.0.1", TestPort(26210), TestPort(26211), true};
+  ASSERT_TRUE(node.Open());
+  node.Tick(999000);
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(
+      gateway.Open("127.0.0.1", TestPort(26210), "127.0.0.1", TestPort(26211)),
+      protocol::UdpStatus::kOk);
+  const uint64_t config_id = NodeConfigId(cfg);
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 1000), 1000000));
+
+  ipc::Publisher<talos::hardware::Packet> drive_pub{RequestTopic("drivetrain")};
+  Command request{};
+  request.config_id = config_id;
+  request.boot_id = 11;
+  request.epoch = 1;
+  request.observed_time_us = 1000;
+  request.count = 1;
+  request.motors[0] = {drive, Mode::kVelocity, 0, 15.0, 0.0};
+  const auto driving = [&] {
+    return !node.is_subsystem_timed_out("drivetrain") &&
+           node.current_command().motors[0].mode == Mode::kVelocity;
+  };
+  PublishCommand(drive_pub, request);
+  node.Tick(1001000);
+  ASSERT_TRUE(driving());
+  // The ticks due at 1006000 and 1011000 never publish; the next request
+  // arrives at 1013000.
+  for (uint64_t now_us = 1002000; now_us < 1013000; now_us += 1000) {
+    node.Tick(now_us);
+    EXPECT_TRUE(driving()) << "neutral merge at " << now_us;
+  }
+  PublishCommand(drive_pub, request);
+  node.Tick(1013000);
+  EXPECT_TRUE(driving());
+
+  // Silent from here on.
+  for (uint64_t now_us = 1014000; now_us <= 1013000 + kOwnerTimeoutUs;
+       now_us += 1000) {
+    node.Tick(now_us);
+    EXPECT_TRUE(driving()) << "neutral merge at " << now_us;
+  }
+  node.Tick(1013000 + kOwnerTimeoutUs + 1000);
+  EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 0.0);
 }
 
 TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {

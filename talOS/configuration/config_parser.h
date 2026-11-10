@@ -977,8 +977,8 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
 
   if (validate_hardware) {
     hardware::Validate(hw);
-    // The bridge holds an actuator owner's last request for two of its
-    // periods, and the merged command carries the oldest observation it
+    // The bridge holds an actuator owner's last request for at least two of
+    // its periods, and the merged command carries the oldest observation it
     // holds, which the gateway refuses once that is command_timeout_us old:
     // an owner slower than half the timeout would expire every owner's
     // command with its own.

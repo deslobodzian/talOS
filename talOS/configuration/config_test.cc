@@ -195,8 +195,8 @@ TEST(ConfigTest, CommandTimeoutSpansTwoDriverStationPacketGaps) {
   EXPECT_NO_THROW(robot(20000, 80000));
 }
 
-// The bridge holds an actuator owner's last request for two of its periods,
-// and the gateway refuses a merged command whose oldest observation is
+// The bridge holds an actuator owner's last request for at least two of its
+// periods, and the gateway refuses a merged command whose oldest observation is
 // command_timeout_us old, so every owner's period is at most half of it.
 TEST(ConfigTest, ActuatorOwnerPeriodIsAtMostHalfTheCommandTimeout) {
   const auto parse = [](const std::string& subsystems) {

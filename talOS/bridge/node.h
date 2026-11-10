@@ -35,6 +35,10 @@ struct SubsystemTracker {
   std::string name;
   Devices devices;
   uint32_t period_us{5000};
+  // How long the bridge keeps merging this subsystem's last request after it
+  // goes quiet: max(2 x period_us, command_timeout_us / 2), never more than
+  // command_timeout_us (HardwareNode's constructor explains the bound).
+  uint64_t timeout_us{0};
   uint64_t last_seen_us{0};
   bool timed_out{true};
   // Last accepted Command::observed_time_us for this subsystem (gateway
