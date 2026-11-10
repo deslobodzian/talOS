@@ -500,7 +500,13 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
                        3.5, 0.0};
   bool received_command = false;
   bool published_request = false;
-  for (int i = 0; i < 150; ++i) {
+  // Send until the child has answered or exited: its one second starts only
+  // after its startup, which a loaded host can stretch past any fixed window.
+  int status = 0;
+  bool reaped = false;
+  const auto give_up =
+      std::chrono::steady_clock::now() + std::chrono::seconds{20};
+  while (!reaped && std::chrono::steady_clock::now() < give_up) {
     gateway.SendFrame(protocol::FrameType::kHardwareState, 0, 1000,
                       packet.data.data(), packet.size);
     protocol::DecodedFrame frame;
@@ -520,10 +526,12 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
       }
     }
     if (received_command) break;
+    reaped = waitpid(child, &status, WNOHANG) == child;
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
-  int status = 0;
-  ASSERT_EQ(waitpid(child, &status, 0), child);
+  if (!reaped) {
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+  }
   ASSERT_TRUE(WIFEXITED(status));
   ASSERT_EQ(WEXITSTATUS(status), 0);
   ASSERT_TRUE(received_command);
