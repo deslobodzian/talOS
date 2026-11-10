@@ -1062,10 +1062,7 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
     // gateway's limit; a slower owner would hold it longer and expire every
     // owner's command with its own.
     for (const auto& [name, owned] : result.subsystems) {
-      if (owned.motors.empty() && owned.digital_outputs.empty() &&
-          owned.pwm_outputs.empty()) {
-        continue;
-      }
+      if (!owned.owns_actuators()) continue;
       const auto period_us = Read(*result.GetSubsystemTable(name), "period_us",
                                   int64_t{hw.period_us});
       if (period_us > int64_t{hw.command_timeout_us / 4}) {

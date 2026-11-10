@@ -135,6 +135,13 @@ struct Devices {
   std::vector<uint16_t> analog_inputs;
   std::vector<uint16_t> encoders;
   std::vector<uint16_t> pwm_outputs;
+  // Whether this subsystem drives an output (motor, digital output or PWM
+  // output): the bridge merges and times out its requests, the configuration
+  // bounds its period_us, and the launcher treats it as an actuator owner. A
+  // new output kind joins here first.
+  bool owns_actuators() const {
+    return !motors.empty() || !digital_outputs.empty() || !pwm_outputs.empty();
+  }
   bool operator==(const Devices&) const = default;
 };
 

@@ -660,9 +660,7 @@ inline std::vector<NodeSpec> DiscoverNodes(
           spec.critical = (*table)["critical"].value_or(true);
           if (const auto* devices =
                   robot_config.GetDevices(std::string{key.str()})) {
-            spec.owns_actuators = !devices->motors.empty() ||
-                                  !devices->digital_outputs.empty() ||
-                                  !devices->pwm_outputs.empty();
+            spec.owns_actuators = devices->owns_actuators();
           }
           specs.push_back(std::move(spec));
         }

@@ -221,17 +221,20 @@ TEST(ConfigTest, ActuatorOwnerPeriodIsAtMostAQuarterOfTheCommandTimeout) {
     return ParseRobotConfigString("[robot]\ncommand_timeout_us = 100000\n" +
                                   subsystems);
   };
-  EXPECT_NO_THROW(
-      parse("[subsystems.arm]\nperiod_us = 25000\n"
-            "[subsystems.arm.motors.m]\ncan_id = 1\n"));
-  EXPECT_THROW(parse("[subsystems.arm]\nperiod_us = 25001\n"
-                     "[subsystems.arm.motors.m]\ncan_id = 1\n"),
-               std::invalid_argument);
-  // A PWM output is an actuator too; a node that only reads may be slow.
-  EXPECT_THROW(parse("[subsystems.servo]\nperiod_us = 25001\n"
-                     "[subsystems.servo.pwm_outputs.p]\nchannel = 0\n" +
-                     std::string{kMotor}),
-               std::invalid_argument);
+  // Each output kind alone makes its subsystem an actuator owner (the config
+  // needs a motor somewhere, so the others sit beside kMotor's).
+  for (const std::string device :
+       {"motors.m]\ncan_id = 2\n", "digital_outputs.d]\ndio = 0\n",
+        "pwm_outputs.p]\nchannel = 0\n"}) {
+    const auto owner = [&](int period_us) {
+      return parse(
+          "[subsystems.arm]\nperiod_us = " + std::to_string(period_us) +
+          "\n[subsystems.arm." + device + std::string{kMotor});
+    };
+    EXPECT_NO_THROW(owner(25000)) << device;
+    EXPECT_THROW(owner(25001), std::invalid_argument) << device;
+  }
+  // A node that only reads may be slow.
   EXPECT_NO_THROW(
       parse("[subsystems.camera]\nperiod_us = 200000\n"
             "[subsystems.camera.digital_inputs.d]\ndio = 0\n" +

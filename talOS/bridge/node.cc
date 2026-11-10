@@ -82,10 +82,7 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
   // Setup subsystem trackers. Input-only subsystems own no actuators, so they
   // publish nothing under kRequestTopicPrefix and have nothing to neutralize.
   for (const auto& [name, devs] : robot_config_.subsystems) {
-    if (devs.motors.empty() && devs.digital_outputs.empty() &&
-        devs.pwm_outputs.empty()) {
-      continue;
-    }
+    if (!devs.owns_actuators()) continue;
     SubsystemTracker tracker;
     tracker.name = name;
     tracker.devices = devs;
