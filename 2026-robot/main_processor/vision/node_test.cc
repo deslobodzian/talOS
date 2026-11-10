@@ -920,6 +920,57 @@ TEST(VisionTest, SlowSimDetectorNeverHoldsTheLoop) {
   EXPECT_TRUE(observer.frames.back().observation.valid());
 }
 
+// A raster result the worker returns more than frame_timeout_us after its
+// truth instant is dropped and counted, never published valid with its old
+// stamp; the next result, inside the timeout, still publishes.
+TEST(VisionTest, SimResultOlderThanFrameTimeoutIsDropped) {
+  auto backend = std::make_shared<GatedBackend>();
+  GatedSimVision::backend = backend;
+  auto sim =
+      MakeSim(true, true, "frame_timeout_us = 300000\n", "period_us = 10000\n");
+  sim.add<GatedSimVision>("rear_right_camera");
+  auto& observer = sim.add<CameraObserver>("pose_estimator");
+  struct Release {
+    GatedBackend& backend;
+    ~Release() { backend.Hold(false); }
+  } release{*backend};
+  backend->Hold(true);
+  // One capture enters the detector; republishing the same truth keeps it
+  // fresh without making another capture due.
+  const auto truth = Truth(sim);
+  for (int i = 0; i < 35; ++i) {
+    sim.publish(sim::topics::kState, truth);
+    sim.step(10ms);
+    // The capture must be in the detector before its hold counts.
+    for (int w = 0; i == 0 && w < 2000 && backend->frames().empty(); ++w) {
+      std::this_thread::sleep_for(1ms);
+    }
+  }
+  ASSERT_EQ(backend->frames(),
+            std::vector<std::uint64_t>{truth.sample_time_ns()});
+  auto dropped = [&] {
+    return sim.latest<VisionStatus>("/rear_right_camera/status")
+        ->frames_dropped_count();
+  };
+  const auto dropped_before = dropped();
+  backend->Hold(false);
+  // 350 ms after its truth instant the result is collected: dropped, not
+  // published.
+  ASSERT_TRUE(AdvanceSimUntil(sim, truth, [&] {
+    return !observer.frames.empty() || dropped() > dropped_before;
+  }));
+  EXPECT_TRUE(observer.frames.empty());
+  EXPECT_EQ(dropped(), dropped_before + 1);
+  // A result inside the timeout still publishes valid.
+  const auto next = Truth(sim);
+  ASSERT_TRUE(AdvanceSimUntil(sim, next, [&] {
+    return !observer.frames.empty() &&
+           observer.frames.back().observation.sample_time_ns() ==
+               next.sample_time_ns();
+  }));
+  EXPECT_TRUE(observer.frames.back().observation.valid());
+}
+
 TEST(VisionTest, RejectsOutOfBoundsHighErrorAndNonfiniteEstimates) {
   auto sim = MakeSim(false);
   auto& node = sim.add<Vision>("front_left_camera");

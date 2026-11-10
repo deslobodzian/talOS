@@ -27,7 +27,7 @@ Shared configuration defaults and code fallbacks (overridable per camera):
 | `camera.latency_offset_us` | `0` | The camera's measured stamp bias, subtracted from every live timestamp kind (after its exposure/readout correction) and from simulated timestamps. |
 | `camera.sim_timestamp_lag_us` | `0` | Sim only: stamp the rendered truth instant this many microseconds later, modeling a timestamp taken after exposure. Ignored live, but validated in both modes. |
 | `camera.readout_us` | `0` | Known sensor readout duration subtracted from live EOF timestamps (unknown readout is zero). |
-| `camera.frame_timeout_us` | `500000` | Live silence deadline; positive, at most 10,000,000 µs. Reopens a connected but silent camera on the worker, and is the maximum live stamp age (see timestamps below). |
+| `camera.frame_timeout_us` | `500000` | Live silence deadline; positive, at most 10,000,000 µs. Reopens a connected but silent camera on the worker, and is the maximum live stamp age (see timestamps below) and the maximum age of a rasterized sim result. |
 | `camera.exposure_ms` | `5.0` | Shared manual exposure duration; also controls simulated exposure blur. Zero leaves duration unspecified. |
 | `camera.gain` | `0` | Backend-native manual gain; zero leaves gain unspecified. |
 | `camera.auto_exposure`, `camera.auto_gain` | `false`, `true` | Fallbacks are true only when duration/gain is zero; the shared exposure is positive and gain is zero. |
@@ -218,7 +218,9 @@ loop collected it. Each update collects at most one finished result with a
 nonblocking try-lock and handles it like a direct-projection capture (counted
 processed, then the lag queue). Its observation therefore arrives one or more
 updates after its capture, still stamped with the truth instant it was rendered
-from; `last_latency_us` includes the render and detection time.
+from; `last_latency_us` includes the render and detection time. A result
+collected more than `frame_timeout_us` after its truth instant (node clock) is
+dropped and counted in `frames_dropped_count`, never published.
 Truth must pass `Subscription::fresh()` (younger than
 `[robot] command_timeout_us` since receipt).
 Missing or stale truth publishes `valid = false` and unhealthy status every

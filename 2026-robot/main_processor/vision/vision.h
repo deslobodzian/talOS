@@ -277,7 +277,7 @@ class Vision {
         truth_outage_ = false;
         // Deliver ready frames before admitting a new capture.
         DrainSimPending(now_ns);
-        if (rasterize_) CollectSimResult(completed);
+        if (rasterize_) CollectSimResult(now_ns, completed);
         const auto& truth = truth_->value();
         if (SimCaptureDue(truth.sample_time_ns())) {
           if (rasterize_) {
@@ -689,8 +689,11 @@ class Vision {
   }
 
   // Never waits for the worker: a result it is still storing is taken on a
-  // later tick. A result from before the latest truth outage is discarded.
-  void CollectSimResult(std::optional<Completed>& completed) {
+  // later tick. A result from before the latest truth outage, or whose truth
+  // stamp is older than frame_timeout_us on the node clock (a worker that
+  // fell that far behind), is discarded and counted as dropped.
+  void CollectSimResult(std::uint64_t now_ns,
+                        std::optional<Completed>& completed) {
     std::optional<SimResult> result;
     {
       std::unique_lock lock(mutex_, std::try_to_lock);
@@ -701,7 +704,10 @@ class Vision {
       sim_results_replaced_ = 0;
     }
     if (!result) return;
-    if (result->epoch != sim_epoch_) {
+    const auto capture_ns = result->completed.capture_ns;
+    if (result->epoch != sim_epoch_ ||
+        (capture_ns <= now_ns &&
+         now_ns - capture_ns > static_cast<std::uint64_t>(frame_timeout_ns_))) {
       ++dropped_;
       return;
     }
