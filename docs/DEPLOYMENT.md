@@ -11,9 +11,12 @@ bazel build //2026-robot/main_processor:robot_bundle
 ```
 
 `talos_bundle` (`talOS/build/contract.bzl`) takes `nodes`, `config`
-(`robot_field.toml`) and `config_files`; the robot's BUILD passes `NODES` and
-`CONFIG_FILES` from the generated [field manifest](../2026-robot/main_processor/configuration/robot_field_manifest.bzl)
-(`bazel run //tools:sync_manifest -- 2026-robot/main_processor/configuration/robot_field.toml`). It writes
+(`robot_field.toml`) and `config_files`; the robot's BUILD passes the hardware
+node plus `NODES`, and `CONFIG_FILES`, from the generated [field manifest](../2026-robot/main_processor/configuration/robot_field_manifest.bzl)
+(`bazel run //tools:sync_manifest -- 2026-robot/main_processor/configuration/robot_field.toml`).
+The build fails unless `nodes` is exactly what the config launches: its
+subsystems' nodes and its hardware node, `[robot] hardware_node` or by default
+`//talOS/bridge:hardware_node`. It writes
 `bazel-bin/2026-robot/main_processor/robot_bundle/`:
 
 | Entry | What |

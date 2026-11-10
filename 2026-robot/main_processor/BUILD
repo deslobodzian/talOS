@@ -31,6 +31,7 @@ py_test(
     data = [
         ":relocation_bundle",
         ":robot_bundle",
+        "//bench/main_processor:bench_bundle",
         "//tools:deploy.sh",
     ],
     legacy_create_init = False,

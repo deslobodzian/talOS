@@ -618,6 +618,49 @@ def talos_py_node(
         visibility = visibility if visibility != None else ["//visibility:public"],
     )
 
+# The bridge the launcher starts unless the config's [robot] hardware_node
+# names another.
+_HARDWARE_NODE = Label("//talOS/bridge:hardware_node")
+
+def _bundle_label(label):
+    """`label` as a bundle manifest spells it.
+
+    That is //pkg:name in the main repository, @@repo//pkg:name in any other.
+    """
+    raw = str(label)
+    if raw.startswith("@@//"):
+        return raw[2:]
+    if raw.startswith("@//"):
+        return raw[1:]
+    return raw
+
+def _resolve_config(ctx, manifest_stamp):
+    """Runs the configuration resolver on ctx's config; returns its JSON.
+
+    The JSON names every subsystem's node and holds the effective config, so
+    the bundle builder can compare `nodes` with what the config launches. The
+    manifest check's stamp is an input: a stale manifest reports itself, with
+    the regenerate command, before the resolver meets a file it was not given.
+    """
+    resolved = ctx.actions.declare_file(ctx.label.name + "_resolved.json")
+
+    # As in the manifest check, the resolver reads the config's files by
+    # their paths from the root of the config's repository.
+    workspace_root = ctx.attr.config.label.workspace_root
+    config_path = ctx.file.config.path
+    if workspace_root:
+        config_path = config_path.removeprefix(workspace_root + "/")
+    ctx.actions.run_shell(
+        inputs = depset([ctx.file.config, manifest_stamp] + ctx.files.config_files),
+        tools = [ctx.attr._resolve[DefaultInfo].files_to_run],
+        outputs = [resolved],
+        command = 'root="$PWD"; cd "$root/$4" && "$root/$1" "$2" > "$root/$3"',
+        arguments = [ctx.executable._resolve.path, config_path, resolved.path, workspace_root],
+        mnemonic = "TalosResolveConfig",
+        progress_message = "Resolving the config of %{label}",
+    )
+    return resolved
+
 def _talos_bundle_impl(ctx):
     bundle_dir = ctx.actions.declare_directory(ctx.label.name)
     run_script = ctx.actions.declare_file(ctx.label.name + ".sh")
@@ -632,7 +675,8 @@ def _talos_bundle_impl(ctx):
         ctx.files.config_files,
         ctx.attr._manifest_sync[DefaultInfo].files_to_run,
     )
-    direct_inputs = [launcher_exec, ctx.file.config, manifest_stamp]
+    resolved = _resolve_config(ctx, manifest_stamp)
+    direct_inputs = [launcher_exec, ctx.file.config, manifest_stamp, resolved]
     direct_inputs.extend(ctx.files.config_files)
     transitive_inputs = [launcher_runfiles]
 
@@ -649,13 +693,7 @@ def _talos_bundle_impl(ctx):
             default_info = node[DefaultInfo]
             n_exec = default_info.files_to_run.executable
             n_rf = default_info.default_runfiles
-            raw_target = str(node.label)
-            if raw_target.startswith("@@//"):
-                n_target = raw_target[2:]
-            elif raw_target.startswith("@//"):
-                n_target = raw_target[1:]
-            else:
-                n_target = raw_target
+            n_target = _bundle_label(node.label)
             if node.label.name == "node":
                 n_name = node.label.package.split("/")[-1]
             else:
@@ -684,17 +722,10 @@ def _talos_bundle_impl(ctx):
                 for f in n_rf.files.to_list():
                     if f.extension in ("dylib", "so") or ".so." in f.basename:
                         lib_list.append({"src_path": f.path, "name": f.basename})
-        raw_label = str(node.label)
-        clean_label = raw_label
-        if clean_label.startswith("@@//"):
-            clean_label = clean_label[2:]
-        elif clean_label.startswith("@//"):
-            clean_label = clean_label[1:]
-
         nodes_spec.append({
             "name": n_name,
             "target": n_target,
-            "label": clean_label,
+            "label": _bundle_label(node.label),
             "language": n_lang,
             "src_path": n_exec.path,
             "runfiles": rf_list,
@@ -715,6 +746,7 @@ def _talos_bundle_impl(ctx):
         "config": {"src_path": ctx.file.config.path, "short_path": ctx.file.config.short_path},
         "config_files": config_files_spec,
         "nodes": nodes_spec,
+        "default_hardware_node": _bundle_label(_HARDWARE_NODE),
     }
 
     spec_file = ctx.actions.declare_file(ctx.label.name + "_spec.json")
@@ -723,16 +755,18 @@ def _talos_bundle_impl(ctx):
         content = json.encode(spec),
     )
 
-    builder_tool = ctx.file._builder
-    direct_inputs.extend([spec_file, builder_tool])
+    direct_inputs.append(spec_file)
 
-    ctx.actions.run_shell(
+    ctx.actions.run(
+        executable = ctx.attr._builder[DefaultInfo].files_to_run,
         outputs = [bundle_dir],
         inputs = depset(direct = direct_inputs, transitive = transitive_inputs),
-        command = 'python3 "$1" --spec "$2" --out "$3"',
         arguments = [
-            builder_tool.path,
+            "--spec",
             spec_file.path,
+            "--resolved",
+            resolved.path,
+            "--out",
             bundle_dir.path,
         ],
         mnemonic = "TalosBundle",
@@ -806,7 +840,9 @@ _talos_bundle = rule(
     attrs = {
         "nodes": attr.label_list(
             mandatory = True,
-            doc = "List of node labels providing TalosNodeInfo or DefaultInfo",
+            doc = "Every node the config launches, each providing TalosNodeInfo or DefaultInfo: " +
+                  "the hardware node ([robot] hardware_node, default //talOS/bridge:hardware_node) " +
+                  "and the NODES of its generated manifest. The build fails on any other set.",
         ),
         "config": attr.label(
             mandatory = True,
@@ -830,8 +866,14 @@ _talos_bundle = rule(
             doc = "The launcher binary",
         ),
         "_builder": attr.label(
-            default = Label("//talOS/build:bundle_builder.py"),
-            allow_single_file = True,
+            default = Label("//talOS/build:bundle_builder"),
+            executable = True,
+            cfg = "exec",
+        ),
+        "_resolve": attr.label(
+            default = Label("//talOS/configuration:resolve"),
+            executable = True,
+            cfg = "exec",
         ),
         "_manifest_sync": attr.label(
             default = Label("//tools:sync_manifest"),
@@ -842,13 +884,17 @@ _talos_bundle = rule(
 )
 
 def talos_bundle(name, config, **kwargs):
-    """Assembles a deployable bundle only after checking manifest freshness.
+    """Assembles a deployable bundle of exactly the nodes `config` launches.
+
+    The build fails when the config's generated manifest is stale, or when
+    `nodes` is not the hardware node ([robot] hardware_node, default
+    //talOS/bridge:hardware_node) plus the manifest's NODES.
 
     Args:
       name: bundle target name.
       config: robot TOML label; its generated manifest must live beside it.
-      **kwargs: passed to the bundle rule, including nodes and config_files
-        from the manifest's NODES and CONFIG_FILES.
+      **kwargs: passed to the bundle rule: nodes, the hardware node plus the
+        manifest's NODES, and config_files, its CONFIG_FILES.
     """
     config_label = native.package_relative_label(config)
     manifest = config_label.same_package_label(
@@ -864,6 +910,9 @@ def talos_graph_test(
         **kwargs):
     """Probes every node in `config` with `launcher --describe-only` and lints the graph.
 
+    The graph must list the hardware node and one node per entry of `nodes`,
+    each of them described.
+
     Args:
       name: test target name.
       config: the robot.toml file or label.
@@ -871,6 +920,14 @@ def talos_graph_test(
       data: every file `config` reads besides itself: the manifest's CONFIG_FILES.
       **kwargs: passed to py_test.
     """
+
+    # The roster is the hardware node and one node per NODES entry: a binary
+    # registers under one name and the launcher refuses two nodes of one name,
+    # so no two subsystems of a passing graph share an entry.
+    expected_nodes = len({
+        native.package_relative_label(item): True
+        for item in ["//talOS/bridge:hardware_node"] + list(nodes)
+    })
     config_label = native.package_relative_label(config)
     config_rel = (config_label.package + "/" + config_label.name) if config_label.package else config_label.name
     runner_py = name + "_graph_test.py"
@@ -922,7 +979,9 @@ def talos_graph_test(
         "            self.assertEqual(len(sessions), 1, sessions)\n" +
         "            with open(os.path.join(sessions[0], \"graph.json\"), \"r\") as f:\n" +
         "                graph = json.load(f)\n" +
-        "            for node in graph.get(\"nodes\", []):\n" +
+        "            nodes = graph[\"nodes\"]\n" +
+        "            self.assertEqual(len(nodes), %d, [n.get(\"name\") for n in nodes])\n" % expected_nodes +
+        "            for node in nodes:\n" +
         "                self.assertTrue(\n" +
         "                    node.get(\"described\"),\n" +
         "                    f\"node {node.get('name')} ({node.get('target')}) failed --describe: {node.get('describe_error')}\",\n" +

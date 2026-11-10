@@ -11,29 +11,23 @@ import sys
 
 
 def make_executable(path):
-    try:
-        mode = os.stat(path).st_mode
-        os.chmod(path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    except Exception:
-        pass
+    mode = os.stat(path).st_mode
+    os.chmod(path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
 def make_writable(path):
-    try:
-        if os.path.isdir(path) and not os.path.islink(path):
-            os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
-            for root, dirs, files in os.walk(path):
-                for d in dirs:
-                    p = os.path.join(root, d)
+    if os.path.isdir(path) and not os.path.islink(path):
+        os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
+        for root, dirs, files in os.walk(path):
+            for d in dirs:
+                p = os.path.join(root, d)
+                os.chmod(p, os.stat(p).st_mode | stat.S_IWUSR)
+            for f in files:
+                p = os.path.join(root, f)
+                if not os.path.islink(p):
                     os.chmod(p, os.stat(p).st_mode | stat.S_IWUSR)
-                for f in files:
-                    p = os.path.join(root, f)
-                    if not os.path.islink(p):
-                        os.chmod(p, os.stat(p).st_mode | stat.S_IWUSR)
-        elif os.path.exists(path) and not os.path.islink(path):
-            os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
-    except Exception:
-        pass
+    elif os.path.exists(path) and not os.path.islink(path):
+        os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
 
 
 def safe_copy(src, dest):
@@ -67,14 +61,62 @@ def safe_symlink(target, link_path):
     os.symlink(target, link_path)
 
 
+def node_targets(node):
+    """Every label the robot config may name `node` by."""
+    targets = []
+    for label in (node["target"], node.get("label")):
+        if not label:
+            continue
+        targets.append(label)
+        if label.startswith("@"):
+            repo, package = label.lstrip("@").split("//", 1)
+            # The config uses an apparent module name; node metadata uses
+            # Bazel's canonical repository name. Preserve both spellings.
+            targets.append("@" + repo.split("+", 1)[0] + "//" + package)
+    return list(dict.fromkeys(targets))
+
+
+def check_nodes(spec, resolved):
+    """Exits unless the bundle's nodes are exactly the ones its config
+    launches. `resolved` is the configuration resolver's JSON for the config:
+    `nodes` holds every subsystem's node (the generated manifest's NODES), and
+    the effective [robot] table's `hardware_node` names the bridge, the
+    launcher's default `spec["default_hardware_node"]` when it is unset. The
+    launcher finds a node's binary by label and, failing that, by the node's
+    name, so a node missing here either stops the robot at boot or silently
+    runs another binary of that name: the default bridge in place of a
+    [robot] hardware_node, say."""
+    hardware = resolved["effective"].get("robot", {}).get("hardware_node")
+    if not isinstance(hardware, str):  # as the launcher reads it
+        hardware = spec["default_hardware_node"]
+    launched = set(resolved["nodes"]) | {hardware}
+    bundled = [(node.get("label") or node["target"], node_targets(node))
+               for node in spec["nodes"]]
+    missing = sorted(label for label in launched
+                     if not any(label in targets for _, targets in bundled))
+    extra = sorted(label for label, targets in bundled
+                   if launched.isdisjoint(targets))
+    if missing or extra:
+        sys.exit("\n".join(
+            [f"bundle: nodes must be what {spec['config']['short_path']} "
+             f"launches: its generated manifest's NODES and its hardware node "
+             f"{hardware}"] +
+            [f"  launched but not in nodes: {label}" for label in missing] +
+            [f"  in nodes but not launched: {label}" for label in extra]))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Assemble a Talos robot bundle.")
     parser.add_argument("--spec", required=True, help="Path to JSON specification")
+    parser.add_argument("--resolved", required=True,
+                        help="The configuration resolver's JSON for the config")
     parser.add_argument("--out", required=True, help="Output bundle directory")
     args = parser.parse_args()
 
     with open(args.spec, "r") as f:
         spec = json.load(f)
+    with open(args.resolved, "r") as f:
+        check_nodes(spec, json.load(f))
 
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
@@ -137,9 +179,9 @@ def main():
     # library, but never two different libraries under one name.
     lib_dir = os.path.join(out_dir, "lib")
     staged_libs = {}
+    bundle_root = os.path.realpath(out_dir) + os.sep
     for node in spec.get("nodes", []):
         name = node["name"]
-        target = node["target"]
         lang = node["language"]
         src_path = node["src_path"]
         bin_rel = f"bin/{name}"
@@ -147,50 +189,38 @@ def main():
         safe_copy(src_path, bin_dest)
         make_executable(bin_dest)
 
-        # Runfiles
+        # Runfiles. Each is an input of this action, so one that does not
+        # exist is a symlink Bazel declared unresolved, such as a py_binary
+        # venv's bin/python3. Its target is relative to the runfiles tree, so
+        # it is staged as the same link after the files, and must then resolve
+        # inside the bundle.
         rf_entries = node.get("runfiles", [])
         if rf_entries:
             rf_dir = os.path.join(bin_dir, f"{name}.runfiles")
             os.makedirs(rf_dir, exist_ok=True)
             repo_mapping_src = None
-            python_bin_path = None
-
+            links = []
             for rf in rf_entries:
                 rf_src = rf["src_path"]
                 rf_rel = rf["rf_rel"]
-                dest = os.path.join(rf_dir, rf_rel)
-                parent = os.path.dirname(dest)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-
-                if rf_rel.endswith("bin/python3") and ".venv" in rf_rel:
-                    # Defer venv python3 until target hermetic python binary is copied
+                if os.path.islink(rf_src) and not os.path.exists(rf_src):
+                    links.append((rf_rel, os.readlink(rf_src)))
                     continue
-
-                if os.path.exists(rf_src):
-                    safe_copy(rf_src, dest)
-
-                if rf_rel.endswith("bin/python3") and "rules_python" in rf_rel and ".venv" not in rf_rel:
-                    python_bin_path = dest
+                if not os.path.exists(rf_src):
+                    sys.exit(f"bundle: node '{name}': runfile {rf_rel} is "
+                             f"missing: {rf_src}")
+                safe_copy(rf_src, os.path.join(rf_dir, rf_rel))
                 if rf_rel.endswith(".repo_mapping") or rf_rel == "_repo_mapping":
                     repo_mapping_src = rf_src
+            for rf_rel, link in links:
+                dest = os.path.join(rf_dir, rf_rel)
+                safe_symlink(link, dest)
+                real = os.path.realpath(dest)
+                if not (real.startswith(bundle_root) and os.path.exists(real)):
+                    sys.exit(f"bundle: node '{name}': runfile {rf_rel} links "
+                             f"to {link}, which the bundle does not hold")
 
-            # Link any venv python3 to the bundled hermetic python3
-            for rf in rf_entries:
-                rf_rel = rf["rf_rel"]
-                if rf_rel.endswith("bin/python3") and ".venv" in rf_rel:
-                    dest = os.path.join(rf_dir, rf_rel)
-                    parent = os.path.dirname(dest)
-                    if parent:
-                        os.makedirs(parent, exist_ok=True)
-                    if python_bin_path and os.path.exists(python_bin_path):
-                        rel_py = os.path.relpath(python_bin_path, os.path.dirname(dest))
-                        if os.path.islink(dest) or os.path.exists(dest):
-                            os.remove(dest)
-                        os.symlink(rel_py, dest)
-                        make_executable(dest)
-
-            if repo_mapping_src and os.path.exists(repo_mapping_src):
+            if repo_mapping_src:
                 safe_copy(repo_mapping_src, os.path.join(rf_dir, "_repo_mapping"))
                 safe_copy(repo_mapping_src, os.path.join(bin_dir, f"{name}.repo_mapping"))
         for lib in node.get("shared_libs", []):
@@ -204,20 +234,9 @@ def main():
             elif seen[0] != digest:
                 sys.exit(f"bundle: nodes '{seen[1]}' and '{name}' link different "
                          f"shared libraries named {lib['name']}")
-        # Every label the robot config may name this node by.
-        targets = []
-        for label in (target, node.get("label")):
-            if not label:
-                continue
-            targets.append(label)
-            if label.startswith("@"):
-                repo, package = label.lstrip("@").split("//", 1)
-                # The config uses an apparent module name; node metadata uses
-                # Bazel's canonical repository name. Preserve both spellings.
-                targets.append("@" + repo.split("+", 1)[0] + "//" + package)
         manifest_nodes.append({
             "name": name,
-            "targets": list(dict.fromkeys(targets)),
+            "targets": node_targets(node),
             "binary": bin_rel,
             "language": lang,
         })

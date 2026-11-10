@@ -1,10 +1,14 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
-load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 
-exports_files([
-    "contract.bzl",
-    "bundle_builder.py",
-])
+exports_files(["contract.bzl"])
+
+# talos_bundle's assembly step, run in the exec configuration's hermetic
+# Python.
+py_binary(
+    name = "bundle_builder",
+    srcs = ["bundle_builder.py"],
+)
 
 py_test(
     name = "bundle_builder_test",

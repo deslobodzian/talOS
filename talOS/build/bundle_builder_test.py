@@ -1,5 +1,6 @@
-"""Tests bundle_builder.py's config staging (relative layout and identity),
-its lib/ staging of C++ nodes' shared libraries and its run.sh, and
+"""Tests bundle_builder.py's check of a bundle's nodes against its config,
+its config staging (relative layout and identity), its staging of runfiles
+and of C++ nodes' shared libraries in lib/ and its run.sh, and
 tools/deploy.sh's bundle selection, pruning and session commands."""
 
 import json
@@ -18,11 +19,24 @@ def put(path, text):
         f.write(text)
 
 
+HARDWARE_NODE = "//talOS/bridge:hardware_node"
+
+
+def node(tmp, name, target=None):
+    """The spec of a C++ node `name`, whose binary is an empty file."""
+    binary = os.path.join(tmp, "src", "bin", name)
+    put(binary, "")
+    return {"name": name, "target": target or f"//{name}:node",
+            "language": "cpp", "src_path": binary,
+            "runfiles": [], "shared_libs": []}
+
+
 class BundleBuilderTest(unittest.TestCase):
-    def build(self, tmp, files, nodes=(), check=True):
-        """Bundles `files` ({short_path: text}); the first is the config.
-        `nodes`: {name: {library basename: bytes}} C++ nodes and the shared
-        libraries each links."""
+    def assemble(self, tmp, files, nodes, launches, robot=None):
+        """Runs the builder on `files` ({short_path: text}; the first is the
+        config) and the node specs `nodes`, for a config whose subsystems
+        launch the labels `launches` and whose effective [robot] table is
+        `robot`. Returns the finished process."""
         src = os.path.join(tmp, "src")
         entries = []
         for short_path, text in files.items():
@@ -31,30 +45,42 @@ class BundleBuilderTest(unittest.TestCase):
                             "short_path": short_path})
         launcher = os.path.join(src, "launcher")
         put(launcher, "")
-        node_specs = []
-        for name, libs in dict(nodes).items():
-            binary = os.path.join(src, "bin", name)
-            put(binary, "")
-            shared = []
-            for lib, text in libs.items():
-                path = os.path.join(src, "solib", name, lib)
-                put(path, text)
-                shared.append({"src_path": path, "name": lib})
-            node_specs.append({"name": name, "target": f"//{name}:node",
-                               "language": "cpp", "src_path": binary,
-                               "runfiles": [], "shared_libs": shared})
         spec = os.path.join(tmp, "spec.json")
         with open(spec, "w", encoding="utf-8") as f:
             json.dump({"bundle_name": "b", "launcher_path": launcher,
                        "config": entries[0], "config_files": entries[1:],
-                       "nodes": node_specs}, f)
-        out = os.path.join(tmp, "out")
+                       "nodes": list(nodes),
+                       "default_hardware_node": HARDWARE_NODE}, f)
+        resolved = os.path.join(tmp, "resolved.json")
+        with open(resolved, "w", encoding="utf-8") as f:
+            json.dump({"nodes": list(launches),
+                       "effective": {"robot": robot or {}}}, f)
         builder = runfiles.Create().Rlocation("_main/talOS/build/bundle_builder.py")
-        proc = subprocess.run([sys.executable, builder, "--spec", spec,
-                               "--out", out], capture_output=True, text=True)
+        return subprocess.run([sys.executable, builder, "--spec", spec,
+                               "--resolved", resolved,
+                               "--out", os.path.join(tmp, "out")],
+                              capture_output=True, text=True)
+
+    def build(self, tmp, files, nodes=(), check=True):
+        """Bundles `files` ({short_path: text}); the first is the config.
+        `nodes`: {name: {library basename: bytes}} C++ nodes and the shared
+        libraries each links, which the config launches beside the default
+        hardware node."""
+        specs = []
+        for name, libs in dict(nodes).items():
+            spec = node(tmp, name)
+            for lib, text in libs.items():
+                path = os.path.join(tmp, "src", "solib", name, lib)
+                put(path, text)
+                spec["shared_libs"].append({"src_path": path, "name": lib})
+            specs.append(spec)
+        proc = self.assemble(tmp, files,
+                             [node(tmp, "hardware_node", HARDWARE_NODE)] + specs,
+                             [spec["target"] for spec in specs])
         if not check:
             return proc
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = os.path.join(tmp, "out")
         with open(os.path.join(out, "bundle_manifest.toml"), encoding="utf-8") as f:
             manifest = f.read()
         return out, manifest
@@ -138,6 +164,62 @@ class BundleBuilderTest(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("libwpimath.so", proc.stderr)
             self.assertIn("'a'", proc.stderr)
+
+    def test_nodes_are_exactly_what_the_config_launches(self):
+        # The launcher finds a node's binary by label, else by its name: a
+        # bundle short of a node stops the robot at boot, or runs the default
+        # bridge in place of the config's [robot] hardware_node.
+        bridge = {"hardware_node": "//bot:bridge"}
+        for bundled, launches, robot, problem in (
+                ((HARDWARE_NODE,), ("//arm:node",), {}, "//arm:node"),
+                ((HARDWARE_NODE, "//arm:node"), (), {}, "//arm:node"),
+                ((HARDWARE_NODE, "//arm:node"), ("//arm:node",), bridge,
+                 "//bot:bridge"),
+                (("//bot:bridge", "//arm:node"), ("//arm:node",), bridge, None)):
+            with self.subTest(bundled=bundled, launches=launches, robot=robot), \
+                    tempfile.TemporaryDirectory() as tmp:
+                nodes = [node(tmp, label.split(":")[1], label) for label in bundled]
+                proc = self.assemble(tmp, {"c/robot.toml": "[robot]\n"}, nodes,
+                                     launches, robot)
+                if problem is None:
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                else:
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertIn(problem, proc.stderr)
+
+    def test_runfiles_the_bundle_cannot_hold_fail(self):
+        # A Python node imports from its runfiles only on the robot. A link
+        # Bazel left unresolved (a py_binary venv's bin/python3) points into
+        # the runfiles tree, so it is staged as a link that must resolve there.
+        interpreter = "rules_python++python+python_3_11/bin/python3"
+        venv_python = "_main/py/_node_bin.venv/bin/python3"
+        gone = "_main/py/gone.py"
+        for staged, problem in (((interpreter, venv_python), None),
+                                ((venv_python,), venv_python),
+                                ((gone,), gone)):
+            with self.subTest(staged=staged), tempfile.TemporaryDirectory() as tmp:
+                put(os.path.join(tmp, "src", "python3"), "")
+                # Up from the venv's bin/ to the runfiles root, as Bazel
+                # declares it; from src/venv/bin it resolves nowhere.
+                link = os.path.join(tmp, "src", "venv", "bin", "python3")
+                os.makedirs(os.path.dirname(link))
+                os.symlink("../../../../" + interpreter, link)
+                sources = {interpreter: os.path.join(tmp, "src", "python3"),
+                           venv_python: link,
+                           gone: os.path.join(tmp, "src", "gone.py")}
+                py = dict(node(tmp, "py"), language="python", runfiles=[
+                    {"src_path": sources[rel], "rf_rel": rel} for rel in staged])
+                proc = self.assemble(tmp, {"c/robot.toml": "[robot]\n"},
+                                     [node(tmp, "hardware_node", HARDWARE_NODE), py],
+                                     ["//py:node"])
+                if problem is not None:
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertIn(problem, proc.stderr)
+                    continue
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                tree = os.path.join(tmp, "out", "bin", "py.runfiles")
+                self.assertEqual(os.path.realpath(os.path.join(tree, venv_python)),
+                                 os.path.realpath(os.path.join(tree, interpreter)))
 
     def test_run_script_passes_output_root_without_a_session_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:

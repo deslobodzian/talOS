@@ -4,7 +4,8 @@ Each bundle is installed the way the robot gets it (tools/deploy.sh install
 into a fresh prefix), then --describe runs every node binary from there, so a
 C++ node that cannot load a shared library it links, a
 Python node that cannot import its wheels or start its interpreter, or an
-install that breaks the bundle's relative symlinks fails here."""
+install that breaks the bundle's relative symlinks fails here. The bench
+rig's bundle, which link and stop qualification install, is checked too."""
 
 import json
 import os
@@ -15,7 +16,11 @@ import unittest
 
 from python.runfiles import runfiles
 
-BUNDLES = ("robot_bundle", "relocation_bundle")
+BUNDLES = (
+    "2026-robot/main_processor/robot_bundle",
+    "2026-robot/main_processor/relocation_bundle",
+    "bench/main_processor/bench_bundle",
+)
 
 
 def describe(bundle, prefix):
@@ -49,7 +54,7 @@ class BundleTest(unittest.TestCase):
             # Bazel clears TEST_TMPDIR.
             with self.subTest(name), tempfile.TemporaryDirectory(
                     ignore_cleanup_errors=True) as tmp:
-                src = r.Rlocation(f"_main/2026-robot/main_processor/{name}")
+                src = r.Rlocation(f"_main/{name}")
                 self.assertTrue(src and os.path.isdir(src), src)
                 with open(os.path.join(src, "bundle_manifest.toml"), "rb") as f:
                     manifest = tomllib.load(f)
@@ -57,6 +62,9 @@ class BundleTest(unittest.TestCase):
                 out = proc.stdout + "\n" + proc.stderr
                 self.assertEqual(proc.returncode, 0, out)
                 self.assertIsNotNone(graph, out)
+                # The bundle holds exactly the nodes its config launches, so
+                # the graph lists each of them.
+                self.assertEqual(len(graph["nodes"]), len(manifest["nodes"]), out)
                 for node in graph["nodes"]:
                     self.assertTrue(node.get("described"),
                                     f"{node.get('name')}: {node.get('describe_error')}\n{out}")
