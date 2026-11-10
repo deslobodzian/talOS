@@ -300,6 +300,13 @@ def index(result):
     return check(result, lambda r: r < 0)
 
 
+def value(result, failure):
+    """For returns whose failure value is also a valid result (0 from
+    talos_state_machine_state): the call failed only when it also left a
+    talos_last_error(), which a call that succeeds clears."""
+    return check(result, lambda r: r == failure and lib.talos_last_error())
+
+
 def handle(pointer):
     return check(pointer, lambda p: not p)
 

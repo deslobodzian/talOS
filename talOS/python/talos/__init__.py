@@ -292,13 +292,13 @@ class StateMachine(_OnNode):
 
     @property
     def state(self):
-        return self._from_int(
-            lib.talos_state_machine_state(self._node, self._index))
+        return self._from_int(_abi.value(
+            lib.talos_state_machine_state(self._node, self._index), 0))
 
     @property
     def previous(self):
-        return self._from_int(
-            lib.talos_state_machine_previous(self._node, self._index))
+        return self._from_int(_abi.value(
+            lib.talos_state_machine_previous(self._node, self._index), 0))
 
     def is_(self, state):
         return self.state == state
@@ -327,14 +327,14 @@ class StateMachine(_OnNode):
 
     @property
     def time_in_state(self):
-        return lib.talos_state_machine_time_in_state_ns(
-            self._node, self._index) / _NS
+        return _abi.value(lib.talos_state_machine_time_in_state_ns(
+            self._node, self._index), 0) / _NS
 
     @property
     def just_entered(self):
         """True during the first update() tick that starts in this state."""
-        return bool(lib.talos_state_machine_just_entered(
-            self._node, self._index))
+        return bool(_abi.ok(lib.talos_state_machine_just_entered(
+            self._node, self._index)))
 
 def _factory(cls, built, owner=None):
     """A C factory: builds cls on a new Node and installs its update().

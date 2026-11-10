@@ -1,7 +1,11 @@
 """The talos package, end to end through libtalos_node on talos.testing.Sim."""
 
+import ctypes
 import enum
 import math
+import os
+from pathlib import Path
+import re
 import subprocess
 import sys
 import textwrap
@@ -9,7 +13,9 @@ from datetime import timedelta
 import unittest
 from unittest import mock
 
+from python.runfiles import runfiles
 import talos
+from talos import _abi
 from talos.testing import Sim, SimHardware, Stick
 from demo.Goal import Goal
 from demo.Phase import Phase
@@ -220,6 +226,33 @@ class SubscriptionErrorsTest(unittest.TestCase):
                                        return_value=None):
                     with self.assertRaises(talos.TalosError):
                         _ = subscription.value
+
+
+class AbiLayoutTest(unittest.TestCase):
+    def test_ctypes_mirrors_match_the_layouts_node_api_pins(self):
+        # node_api.cc pins each ABI struct's size and field offsets with
+        # static_asserts; the ctypes mirror must read the same bytes.
+        source = Path(runfiles.Create().Rlocation(
+            os.environ["TALOS_ABI_SOURCE"])).read_text()
+        sizes = {name: int(size) for name, size in re.findall(
+            r"static_assert\(\s*sizeof\((Talos\w+)\)\s*==\s*(\d+)\s*\);",
+            source)}
+        offsets = {}
+        for name, field, offset in re.findall(
+                r"static_assert\(\s*offsetof\((Talos\w+),\s*(\w+)\)\s*==\s*"
+                r"(\d+)\s*\);", source):
+            offsets.setdefault(name, {})[field] = int(offset)
+        mirrors = {"Talos" + cls.__name__: cls for cls in vars(_abi).values()
+                   if isinstance(cls, type)
+                   and issubclass(cls, ctypes.Structure)}
+        self.assertEqual(sorted(mirrors), sorted(sizes))
+        self.assertEqual(sorted(mirrors), sorted(offsets))
+        for name, cls in mirrors.items():
+            with self.subTest(struct=name):
+                self.assertEqual(ctypes.sizeof(cls), sizes[name])
+                self.assertEqual({field: getattr(cls, field).offset
+                                  for field, _ in cls._fields_},
+                                 offsets[name])
 
 
 class DevicesTest(unittest.TestCase):
@@ -531,6 +564,15 @@ class StateMachineTest(unittest.TestCase):
             mover.sm.go(3)
         with self.assertRaises(ValueError):
             talos.StateMachine(sim.node("planner"), 7, states=Phase)
+
+    def test_abi_errors_raise_rather_than_read_as_states(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        stepper = sim.add(Stepper, "planner")
+        stepper.sm._index = 99  # no such state machine: every C call fails
+        for name in ("state", "previous", "time_in_state", "just_entered"):
+            with self.subTest(name=name):
+                with self.assertRaises(talos.TalosError):
+                    getattr(stepper.sm, name)
 
 
 class ParamTest(unittest.TestCase):

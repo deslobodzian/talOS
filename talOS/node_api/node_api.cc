@@ -91,6 +91,66 @@ static_assert(SameFlag(TALOS_DS_ATTACHED, driver_station::kDsAttached) &&
               SameFlag(TALOS_DS_TEST, driver_station::kTest) &&
               SameFlag(TALOS_DS_ESTOP, driver_station::kEStop));
 
+// Every struct this ABI passes, field by field, as talOS/python/talos/_abi.py
+// mirrors it with ctypes: talos_test.py reads these lines and checks the
+// mirror against them. A layout change changes the ABI, so these numbers, the
+// mirror and TALOS_NODE_ABI_VERSION change together.
+static_assert(sizeof(TalosSchema) == 32);
+static_assert(offsetof(TalosSchema, name) == 0);
+static_assert(offsetof(TalosSchema, hash) == 8);
+static_assert(offsetof(TalosSchema, bfbs) == 16);
+static_assert(offsetof(TalosSchema, bfbs_size) == 24);
+static_assert(sizeof(TalosParam) == 56);
+static_assert(offsetof(TalosParam, kind) == 0);
+static_assert(offsetof(TalosParam, boolean) == 4);
+static_assert(offsetof(TalosParam, integer) == 8);
+static_assert(offsetof(TalosParam, number) == 16);
+static_assert(offsetof(TalosParam, string) == 24);
+static_assert(offsetof(TalosParam, count) == 32);
+static_assert(offsetof(TalosParam, numbers) == 40);
+static_assert(offsetof(TalosParam, strings) == 48);
+static_assert(sizeof(TalosSample) == 56);
+static_assert(offsetof(TalosSample, valid) == 0);
+static_assert(offsetof(TalosSample, value) == 4);
+static_assert(offsetof(TalosSample, position) == 8);
+static_assert(offsetof(TalosSample, velocity) == 16);
+static_assert(offsetof(TalosSample, voltage) == 24);
+static_assert(offsetof(TalosSample, current) == 32);
+static_assert(offsetof(TalosSample, temperature_c) == 40);
+static_assert(offsetof(TalosSample, supply_current_a) == 48);
+static_assert(sizeof(TalosJoystick) == 116);
+static_assert(offsetof(TalosJoystick, connected) == 0);
+static_assert(offsetof(TalosJoystick, axis_count) == 4);
+static_assert(offsetof(TalosJoystick, button_count) == 8);
+static_assert(offsetof(TalosJoystick, pov_count) == 12);
+static_assert(offsetof(TalosJoystick, buttons) == 16);
+static_assert(offsetof(TalosJoystick, axes) == 20);
+static_assert(offsetof(TalosJoystick, povs) == 68);
+static_assert(offsetof(TalosJoystick, name) == 84);
+static_assert(sizeof(TalosDriverStation) == 744);
+static_assert(offsetof(TalosDriverStation, connected) == 0);
+static_assert(offsetof(TalosDriverStation, enabled) == 4);
+static_assert(offsetof(TalosDriverStation, autonomous) == 8);
+static_assert(offsetof(TalosDriverStation, teleop) == 12);
+static_assert(offsetof(TalosDriverStation, test) == 16);
+static_assert(offsetof(TalosDriverStation, estop) == 20);
+static_assert(offsetof(TalosDriverStation, fms_attached) == 24);
+static_assert(offsetof(TalosDriverStation, alliance) == 28);
+static_assert(offsetof(TalosDriverStation, station) == 32);
+static_assert(offsetof(TalosDriverStation, match_time_s) == 40);
+static_assert(offsetof(TalosDriverStation, joysticks) == 48);
+static_assert(sizeof(TalosDriverStationPacket) == 712);
+static_assert(offsetof(TalosDriverStationPacket, flags) == 0);
+static_assert(offsetof(TalosDriverStationPacket, alliance) == 4);
+static_assert(offsetof(TalosDriverStationPacket, station) == 8);
+static_assert(offsetof(TalosDriverStationPacket, match_time_s) == 12);
+static_assert(offsetof(TalosDriverStationPacket, joysticks) == 16);
+static_assert(sizeof(TalosMotorRequest) == 24);
+static_assert(offsetof(TalosMotorRequest, mode) == 0);
+static_assert(offsetof(TalosMotorRequest, slot) == 4);
+static_assert(offsetof(TalosMotorRequest, demand) == 8);
+static_assert(offsetof(TalosMotorRequest, ff_volts) == 16);
+
 TalosJoystick JoystickOf(const Joystick& joystick) {
   TalosJoystick out{};
   out.connected = joystick.connected();

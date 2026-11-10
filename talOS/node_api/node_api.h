@@ -56,7 +56,10 @@ typedef struct TalosSchema {
 } TalosSchema;
 
 uint32_t talos_abi_version(void);
-// Last error on this thread; valid until the next call. Never NULL.
+// Last error on this thread: set by the call that failed, empty after one
+// that succeeded, so it tells a failure from a failure value that is also a
+// valid result (talos_state_machine_state's 0). Valid until the next call.
+// Never NULL.
 const char* talos_last_error(void);
 
 // --- running a node ------------------------------------------------------

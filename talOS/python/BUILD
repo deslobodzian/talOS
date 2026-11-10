@@ -52,6 +52,10 @@ py_test(
     name = "talos_test",
     size = "small",
     srcs = ["talos_test.py"],
+    # node_api.cc's static_asserts are the struct layouts the ctypes mirror
+    # is checked against.
+    data = ["//talOS/node_api:node_api.cc"],
+    env = {"TALOS_ABI_SOURCE": "$(rlocationpath //talOS/node_api:node_api.cc)"},
     legacy_create_init = False,
     # ctypes cannot initialize sanitizer runtimes inside the Python host.
     tags = [
@@ -61,6 +65,7 @@ py_test(
     deps = [
         ":test_messages_py",
         ":testing",
+        "@rules_python//python/runfiles",
     ],
 )
 
