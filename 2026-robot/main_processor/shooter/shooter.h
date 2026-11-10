@@ -14,6 +14,10 @@
 
 namespace shooter {
 
+// Shared-memory slot contract for /shooter/state: docs/DATA_FLOW.md.
+static_assert(sizeof(ShooterState) == 32,
+              "ShooterState size changed; update docs/DATA_FLOW.md");
+
 // Spins the flywheel to the selected target lane. Readiness requires
 // consecutive ticks in the entry band of the clamped demand, then tolerates the
 // wider exit band until the target changes or actuation is no longer allowed.

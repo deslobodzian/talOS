@@ -23,9 +23,12 @@
 
 namespace autonomous {
 
-// Shared-memory slot contract for /autonomous/state: docs/DATA_FLOW.md.
+// Shared-memory slot contracts: docs/DATA_FLOW.md. /autonomous/state is this
+// node's; /intake/state comes from a Python node, so its C++ consumer pins it.
 static_assert(sizeof(AutonomousState) == 2,
               "AutonomousState size changed; update docs/DATA_FLOW.md");
+static_assert(sizeof(intake::IntakeState) == 20,
+              "IntakeState size changed; update docs/DATA_FLOW.md");
 
 class Autonomous {
  public:

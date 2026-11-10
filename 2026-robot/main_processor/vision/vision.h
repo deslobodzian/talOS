@@ -320,6 +320,9 @@ class Vision {
   }
 
   static_assert(sizeof(VisionStatus) == 88);
+  // Shared-memory slot contract for /<camera>/state: docs/DATA_FLOW.md.
+  static_assert(sizeof(geometry::PoseObservation) == 64,
+                "PoseObservation size changed; update docs/DATA_FLOW.md");
 
  private:
   struct Completed {

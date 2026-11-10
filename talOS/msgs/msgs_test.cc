@@ -6,6 +6,11 @@
 
 namespace talos::msgs {
 namespace {
+// PoseEstimate's shared-memory slot contract is recorded in docs/DATA_FLOW.md.
+static_assert(sizeof(geometry::PoseEstimate) == 72,
+              "PoseEstimate size changed; update docs/DATA_FLOW.md");
+static_assert(alignof(geometry::PoseEstimate) == 8,
+              "PoseEstimate alignment changed; update docs/DATA_FLOW.md");
 
 TEST(StandardMessages, WireLayoutCompatibility) {
   EXPECT_TRUE(Message<geometry::Translation2d>);
@@ -16,9 +21,6 @@ TEST(StandardMessages, WireLayoutCompatibility) {
   EXPECT_TRUE(Message<geometry::SwerveModulePosition>);
   EXPECT_TRUE(Message<geometry::PoseObservation>);
   EXPECT_TRUE(Message<geometry::PoseEstimate>);
-  // PoseEstimate's shared-memory ABI is recorded in docs/DATA_FLOW.md.
-  EXPECT_EQ(sizeof(geometry::PoseEstimate), 72u);
-  EXPECT_EQ(alignof(geometry::PoseEstimate), 8u);
   EXPECT_TRUE(Message<control::VelocityTarget>);
   EXPECT_TRUE(Message<control::VelocityState>);
   EXPECT_TRUE(Message<control::PositionTarget>);

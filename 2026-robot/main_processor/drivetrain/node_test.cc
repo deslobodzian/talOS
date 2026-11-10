@@ -1203,14 +1203,7 @@ TEST_F(DrivetrainTest, UpdateDoesNotAllocate) {
 #endif
 }
 
-// --- wire and binary -----------------------------------------------------
-
-// These structs cross every chassis topic on the robot, so a layout change
-// is a new contract (whole-bundle rollback), never a silent edit.
-TEST(Messages, WireSizesAreFrozen) {
-  EXPECT_EQ(sizeof(ChassisTarget), 24u);
-  EXPECT_EQ(sizeof(DrivetrainState), 112u);
-}
+// --- binary --------------------------------------------------------------
 
 struct Result {
   int status;

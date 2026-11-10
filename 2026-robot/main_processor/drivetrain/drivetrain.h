@@ -20,6 +20,15 @@
 
 namespace drivetrain {
 
+// Shared-memory slot contracts for /drivetrain/state and the chassis target
+// lanes: docs/DATA_FLOW.md. These structs cross every chassis topic on the
+// robot, so a layout change is a new contract (whole-bundle rollback), never a
+// silent edit.
+static_assert(sizeof(ChassisTarget) == 24,
+              "ChassisTarget size changed; update docs/DATA_FLOW.md");
+static_assert(sizeof(DrivetrainState) == 112,
+              "DrivetrainState size changed; update docs/DATA_FLOW.md");
+
 // Swerve drive: turns the selected chassis target lane into a drive velocity
 // and a steer position per module, and reports, every tick, the chassis
 // motion and module positions the modules measure together with the robot
