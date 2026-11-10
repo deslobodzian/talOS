@@ -27,6 +27,9 @@ struct TargetState {
   std::vector<std::int32_t> test;
   DriverStation ds;
   std::size_t selection = 0;  // NodeAccess::add_selection: who drives
+  // NodeAccess::next_update of the update() that last logged a READ (0:
+  // none; inside update() it is at least 1).
+  std::uint64_t read_update = 0;
 };
 
 struct LaneState {
@@ -158,7 +161,7 @@ std::size_t TargetAccess::open_target(Node& node, std::size_t bytes,
 const void* TargetAccess::target_get(Node& node, std::size_t target,
                                      std::int32_t& source) {
   source = -1;
-  const TargetState& state = TargetAt(node, target);
+  TargetState& state = TargetAt(node, target);
   const ReportSelection report{node, state.selection, source};
   if (!robot_enabled(node)) return nullptr;
   const std::vector<std::int32_t>* lanes = nullptr;
@@ -194,6 +197,16 @@ const void* TargetAccess::target_get(Node& node, std::size_t target,
       continue;
     }
     source = lane;
+    // A selection inside update() is what that tick acts on, through its
+    // outputs or a command topic: the dispatch log records which message it
+    // was (an EventKind::READ record), which is how a session's tick-time
+    // target age is measured. Only the first selecting get() or source() of
+    // each update() logs one, so a tick is one READ however often it asks.
+    if (NodeAccess::in_update(node) &&
+        state.read_update != NodeAccess::next_update(node)) {
+      state.read_update = NodeAccess::next_update(node);
+      NodeAccess::record_read(node, subscription);
+    }
     return envelope + kTargetEnvelopeHeaderBytes;
   }
   return nullptr;

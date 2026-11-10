@@ -282,16 +282,19 @@ feedback—is fresh and finite; invalid feedback neutralizes the follower.
 
 ## Dispatch logs
 
-`.tlog` version **6** carries a publication timestamp on each message dispatch
+`.tlog` version **7** carries a publication timestamp on each message dispatch
 and send, separate from event/dispatch time. Exact replay preserves publication
 age; input replay injects at the recorded publication time rather than receipt.
 Older formats are rejected with the recorded and supported versions. The packed
 file header is **120 B**, manifest entry **112 B**, and record header **64 B**,
 followed by stored payload bytes (`talOS/events/log/format.h`).
+`Target::get` adds one payload-free READ record (a 64 B header) per `Target`
+per `update()` that selects a lane, however often it calls `get()` or
+`source()`: 6.4 KB/s for a 100 Hz consumer of one target.
 
 A byte-capped log (`LogWriterOptions::max_bytes`, the launcher's per-member
 share of `[robot] log_max_bytes`) is split into n = min(8, cap / (prefix +
-largest record)) segments of cap / n bytes, each a complete version-6 log
+largest record)) segments of cap / n bytes, each a complete version-7 log
 (its own header, manifest and schema block, then whole records). The newest
 is at the log's path, older ones at `<stem>.segment<k>.tlog`, and starting
 segment n + 1 deletes the oldest, so the log keeps its tail within the cap.

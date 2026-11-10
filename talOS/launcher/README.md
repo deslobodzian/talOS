@@ -522,13 +522,22 @@ recording node (non-empty `log_path`) `quarantined`, `recorder_failed` or
 `log_capped`; host processes without an event log (`studio_bridge`,
 `sim_gateway`) are not acceptance evidence and are exempt. It names each reason
 on stderr. It exits 1 for input/reader errors (including a missing `log_dump`
-runfile) and 0 otherwise. NOT MEASURED is never a pass; only the tick-time
-target age and timer lateness rows are informational and not required.
+runfile) and 0 otherwise. NOT MEASURED is never a pass; only the timer
+lateness row is informational and not required.
 
-Target receipt age is `now - publish_time`, not target age at a control tick.
-Polled subscriptions and the selected Target value are not recorded as tick
-inputs, so tick-age/timeout acceptance remains NOT MEASURED. Timer lateness has
-no specified acceptance threshold. Capped, truncated, unfinished recordings,
+Target receipt age is `now - publish_time` of a target MESSAGE dispatch, not
+target age at a control tick. Target age at the tick comes from the READ record
+`Target::get` logs for the lane it first selects in each `update()` (`now - publish_time`
+per `process:/<sub>/target/<source>`). Its required verdict interprets "about
+25 ms at most" as a 25 ms maximum (an analysis interpretation) and names the
+worst lane. It is NOT MEASURED when no target lane was dispatched or lanes were
+dispatched only while disabled or released, and FAIL when a process was
+dispatched active target lanes (envelope `active` with a nonzero
+`mode_since_us`) while enabled but never selected one (for example a mode
+generation mismatch). An age at or past `command_timeout_us` is
+never recorded, because `Target` never selects such a lane; a producer stall
+shows as ages rising toward the timeout. Timer lateness has no specified
+acceptance threshold. Capped, truncated, unfinished recordings,
 DS silence, missing topics and unknown intervals limit acceptance; retain the
 raw session. Clock offset ranges measure the estimator, not absolute clock
 synchronization accuracy. See `docs/BRINGUP.md` for the bench checks.

@@ -145,9 +145,10 @@ sleep precision. Releasing a lane is not a mechanical brake.
   enabled (PASS lines); `--strict` exits 2 unless every required verdict
   passes and the manifest shows a finished session with no quarantined,
   recorder-failed or log-capped recording node (Studio is exempt). Keep the
-  report with the session. Target age at the motor's tick is reported NOT
-  MEASURED (informational, not required); receipt ages are available only for
-  target MESSAGE dispatches and must stay well below `command_timeout_us`.
+  report with the session. Target age at the tick (from `Target::get` READ
+  records) is required to be at most 25 ms on every lane; see
+  [session_report](../talOS/launcher/README.md) for its NOT MEASURED and FAIL
+  cases.
 - [ ] In the same report's `/hw/status` section check `configured`, flat
   rejection counters, `state_age_us`, `timed_out_mask`, and the clock fields:
   `clock_offset_valid` (needs eight States and a live two-way probe exchange),

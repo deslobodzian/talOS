@@ -209,6 +209,28 @@ class EventLoopBase {
     derived().on_exit_requested();
   }
 
+  // Records that the current dispatch used the value of watcher `source_id`
+  // that was published at `publish_time` with RTMS `sequence`, as of `now`.
+  // A measurement: it changes nothing the program sees, and exact replay
+  // checks that the replayed program reads the same value. Outside a dispatch,
+  // or for a source that is not a watcher, it does nothing.
+  void record_read(std::uint16_t source_id, MonotonicTime now,
+                   MonotonicTime publish_time, std::uint64_t sequence) {
+    if (!in_dispatch() || source_id >= manifest_.size() ||
+        manifest_[source_id].kind != SourceKind::WATCHER) {
+      return;
+    }
+    derived().on_read(source_id, now, publish_time, sequence);
+    Context read = context_;
+    read.kind = EventKind::READ;
+    read.source_id = source_id;
+    read.now = now;
+    read.publish_time = publish_time;
+    read.sequence = sequence;
+    read.dropped = 0;
+    recorder_.dispatch(read, {});
+  }
+
  protected:
   ~EventLoopBase() = default;
 
@@ -226,6 +248,10 @@ class EventLoopBase {
   const std::vector<Source>& sources() const { return sources_; }
 
   Source& source(std::uint16_t id) { return sources_[id]; }
+
+  // Called by record_read() before the record is written. The replay loop
+  // hides this to check the read against the log; other loops need nothing.
+  void on_read(std::uint16_t, MonotonicTime, MonotonicTime, std::uint64_t) {}
 
   void record_operation(EventKind kind, std::uint16_t id,
                         MonotonicTime deadline = {}, Duration period = {}) {

@@ -41,12 +41,23 @@ def stream(records, topic):
     return "/".join(key), sorted(groups[key], key=lambda r: r["now_ms"])
 
 
+TARGET_LANE = re.compile(r"/[^/]+/target/[^/]+")
+# log_dump's text for a TargetEnvelope<M> starts with its header fields.
+ENVELOPE_HEADER = re.compile(r"\{mode_since_us: (\d+), active: (true|false)")
+TARGET_AGE_LIMIT_MS = 25
+
+
 def analyze(manifest, records):
     source, states = stream(records, "/hw/state")
     _, ds = stream(records, "/hw/state/driver_station")
     ds = [r for r in ds if "ds_enabled" in r]
     ds_times = [r["now_ms"] for r in ds]
     overall, enabled = [], []
+
+    def enabled_at(time):
+        # The logged DS enabled bit, held until its next observation.
+        index = bisect.bisect_right(ds_times, time) - 1
+        return index >= 0 and ds[index]["ds_enabled"]
     for previous, current in zip(states, states[1:]):
         start, end = previous["now_ms"], current["now_ms"]
         gap = end - start
@@ -58,10 +69,23 @@ def analyze(manifest, records):
         transitions = ds[max(index + 1, 0):bisect.bisect_left(ds_times, end)]
         if active or any(r["ds_enabled"] for r in transitions):
             enabled.append(gap)
-    targets, timers, status = {}, {}, {}
+    targets, timers, status, tick_ages = {}, {}, {}, {}
+    enabled_lane_processes = set()
     for r in records:
-        if r["kind"] == "MESSAGE" and re.fullmatch(r"/[^/]+/target/[^/]+", r["topic"]):
+        if r["kind"] == "MESSAGE" and TARGET_LANE.fullmatch(r["topic"]):
             targets.setdefault(r["process"] + ":" + r["topic"], []).append(
+                r["now_ms"] - r["publish_ms"])
+            # Only an active envelope stamped with a mode generation is one a
+            # Target could select: declarative teleop releases its lane every
+            # tick while the sticks are neutral.
+            header = ENVELOPE_HEADER.match(r["decoded"])
+            if (header and int(header[1]) != 0 and header[2] == "true"
+                    and enabled_at(r["now_ms"])):
+                enabled_lane_processes.add(r["process"])
+        # Target::get records a READ for the lane it selects inside update():
+        # now is when the selection was judged, publish the producer's time.
+        if r["kind"] == "READ" and TARGET_LANE.fullmatch(r["topic"]):
+            tick_ages.setdefault(r["process"] + ":" + r["topic"], []).append(
                 r["now_ms"] - r["publish_ms"])
         if r["kind"] == "TIMER":
             timers.setdefault(r["process"] + ":" + r["topic"], []).append(
@@ -97,9 +121,24 @@ def analyze(manifest, records):
                 s is not None and s["p99_ms"] < 10, "p99 < 10 ms; nearest rank")
     gaps = sum(v >= 100 for v in enabled)
     verdict("enabled state gaps", bool(enabled), gaps == 0, f"{gaps} gaps >= 100 ms")
-    verdict("target age at tick", False, False,
-            "Polled subscriptions/selected Target values are not recorded as tick inputs; receipt age is shown only for MESSAGE dispatches. command_timeout_us is not in the session manifest.",
-            required=False)
+    worst = max(((max(v), k) for k, v in tick_ages.items()), default=None)
+    unselected = sorted(enabled_lane_processes - {k.split(":", 1)[0] for k in tick_ages})
+    bound = (f"selected target age at the tick <= {TARGET_AGE_LIMIT_MS} ms per process:lane "
+             "(\"about 25 ms at most\" interpreted as a 25 ms maximum; analysis "
+             "interpretation), from Target::get READ records; an age at or past "
+             "command_timeout_us is invisible (Target never selects such a lane), so a "
+             "producer stall shows as ages rising toward the timeout")
+    if unselected:
+        detail = (f"{bound}; FAIL: {', '.join(unselected)} dispatched active target lanes "
+                  "while enabled but Target never selected one (e.g. a mode generation mismatch)")
+    elif worst is not None:
+        detail = f"{bound}; worst {worst[1]} = {worst[0]:.6g} ms"
+    elif not targets:
+        detail = f"{bound}; no target-lane MESSAGE records"
+    else:
+        detail = f"{bound}; no active target lane dispatched while enabled"
+    verdict("target age at tick", worst is not None or bool(unselected),
+            worst is not None and not unselected and worst[0] <= TARGET_AGE_LIMIT_MS, detail)
     verdict("timer lateness", False, False,
             "Measured where TIMER dispatches exist; no acceptance threshold is specified.",
             required=False)
@@ -111,13 +150,16 @@ def analyze(manifest, records):
                for flag in ("quarantined", "recorder_failed", "log_capped") if n.get(flag)]
     return {"session_id": manifest.get("session_id"),
             "config_sha256": manifest.get("config_sha256") or "NOT RECORDED (non-bundle launch)",
-            "nodes": [{k: n.get(k) for k in ("name", "restart_count", "exit_code", "quarantined",
-                                             "recorder_failed", "log_capped")}
+            # exit_signal is 0 unless a signal killed the node; older manifests lack it.
+            "nodes": [{**{k: n.get(k) for k in ("name", "restart_count", "exit_code")},
+                       "exit_signal": n.get("exit_signal", 0),
+                       **{k: n.get(k) for k in ("quarantined", "recorder_failed", "log_capped")}}
                       for n in manifest["nodes"]],
             "session_issues": issues,
             "state_stream": source, "state_overall": stats(overall),
             "state_enabled": stats(enabled), "enabled_gaps_ge_100_ms": gaps,
             "target_receipt_age": {k: stats(v) for k, v in sorted(targets.items())},
+            "target_age_at_tick": {k: stats(v) for k, v in sorted(tick_ages.items())},
             "timer_lateness": {k: stats(v) for k, v in sorted(timers.items())},
             "status_stream": status_source, "status": status_summary, "verdicts": verdicts,
             "limitations": ["State timing is bridge IPC publication or one consumer dispatch stream, not raw UDP arrival; never pooled duplicate readers.",
@@ -135,8 +177,8 @@ def strict_failures(report):
 def markdown(report):
     lines = ["# Session report", f"Session: {report['session_id']}",
              f"Config SHA-256: {report['config_sha256']}", "", "## Nodes",
-             "| Node | Restarts | Exit code | quarantined | recorder_failed | log_capped |",
-             "|---|---:|---:|---|---|---|"]
+             "| Node | Restarts | Exit code | Exit signal | quarantined | recorder_failed | log_capped |",
+             "|---|---:|---:|---:|---|---|---|"]
     for n in report["nodes"]:
         lines.append("| " + " | ".join(str(n[k]) for k in n) + " |")
     lines += ["", "## Session completeness"] + (
@@ -146,12 +188,15 @@ def markdown(report):
     entries = {"/hw/state overall": report["state_overall"],
                "/hw/state enabled": report["state_enabled"],
                **{"receipt " + k: v for k, v in report["target_receipt_age"].items()},
+               **{"target at tick " + k: v for k, v in report["target_age_at_tick"].items()},
                **{"timer " + k: v for k, v in report["timer_lateness"].items()}}
     for name, s in entries.items():
         lines.append(f"| {name} | " + ("NOT MEASURED | — | — | — |" if s is None else
                      f"{s['count']} | {s['median_ms']:.6g} | {s['p99_ms']:.6g} | {s['max_ms']:.6g} |"))
     if not report["target_receipt_age"]:
         lines.append("Target receipt age: NOT MEASURED (no target MESSAGE dispatches).")
+    if not report["target_age_at_tick"]:
+        lines.append("Target age at tick: NOT MEASURED (no Target selected a lane).")
     for n in report["nodes"]:
         if not any(k.startswith(n["name"] + ":") for k in report["timer_lateness"]):
             lines.append(f"{n['name']} timer lateness: NOT MEASURED (no TIMER dispatches).")

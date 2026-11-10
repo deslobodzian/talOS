@@ -190,10 +190,23 @@ class ReplayEventLoop
   void on_handler_exit() {
     take(EventKind::HANDLER_EXIT, this->context().source_id);
   }
+  // Hides EventLoopBase::on_read: the program must read the recorded source,
+  // and the same value of it, at the same time.
+  void on_read(std::uint16_t id, MonotonicTime now, MonotonicTime publish_time,
+               std::uint64_t sequence) {
+    const Recorded* recorded = take(EventKind::READ, id);
+    if (recorded && (recorded->header.now_ns != now.nanos() ||
+                     recorded->header.publish_time_ns != publish_time.nanos() ||
+                     recorded->header.sequence != sequence)) {
+      report(Divergence{active_dispatch_, id,
+                        "read a different value of source " + source_name(id)});
+    }
+  }
 
   static bool is_operation(EventKind kind) {
     return kind == EventKind::SEND || kind == EventKind::ARM_TIMER ||
-           kind == EventKind::DISARM_TIMER || kind == EventKind::HANDLER_EXIT;
+           kind == EventKind::DISARM_TIMER || kind == EventKind::HANDLER_EXIT ||
+           kind == EventKind::READ;
   }
 
   std::string source_name(std::uint16_t id) const {

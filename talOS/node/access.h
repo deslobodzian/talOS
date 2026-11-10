@@ -172,6 +172,12 @@ struct NodeAccess {
   static bool subscription_fresh(const Node& node, std::size_t index,
                                  std::chrono::nanoseconds max_age);
   static bool subscription_updated(const Node& node, std::size_t index);
+  // Logs, in the dispatch log of the handler running now, that it acted on
+  // subscription `index`'s latched message: an EventKind::READ record with
+  // the watcher, now, that message's publish time and its RTMS sequence.
+  // Nothing without a value or outside a dispatch. Target::get() calls it for
+  // the lane an update() selects.
+  static void record_read(Node& node, std::size_t index);
   // A subscription that observes a topic rather than consuming it: what a
   // framework node that reads every state topic in the declared graph opens.
   // The graph lint does not count it as a reader (names.h

@@ -31,7 +31,7 @@ import uuid
 
 from python.runfiles import runfiles
 
-# talOS/events/log/format.h (version 6). EventKind (events/context.h) and
+# talOS/events/log/format.h (version 7). EventKind (events/context.h) and
 # SourceKind (events/manifest.h) both number TIMER 1; EventKind SEND is 4.
 _FILE = struct.Struct("<8sIIQqqII64sQ")
 _ENTRY = struct.Struct("<HHIIIqq64sQII")
@@ -77,8 +77,8 @@ def read_tlog(path):
             raise ValueError(f"{path}: truncated file header")
         (magic, version, header_bytes, _, origin, _, count, _, process,
          schema_bytes) = _FILE.unpack(header)
-        if magic != b"TALOSLOG" or version != 6:
-            raise ValueError(f"{path}: not a version 6 .tlog")
+        if magic != b"TALOSLOG" or version != 7:
+            raise ValueError(f"{path}: not a version 7 .tlog")
         stream.seek(header_bytes)
         sources = {}
         for _ in range(count):

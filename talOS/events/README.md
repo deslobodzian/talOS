@@ -120,7 +120,7 @@ Replay verifies as it goes. Every send must match the recorded bytes, in order.
 A changed gain, a reordered branch or a missing send is reported as a
 divergence naming the dispatch and the topic. Set `Options{false}` to collect
 every divergence in one pass instead of throwing at the first. Only the loop's
-typed sends, timer changes and exit are verified: byte topics
+typed sends, timer changes, recorded reads and exit are verified: byte topics
 (`Node::publish_bytes`) are outside the loop and never logged, so a node
 binary's `--replay` (`talOS/node/node.cc`) discards them, exactly as
 `--replay-inputs` does below. Replay is offline either way: it never attaches
@@ -154,7 +154,11 @@ form handlers ever see.
 
 
 During callbacks, `ARM_TIMER` and `DISARM_TIMER` records validate scheduling
-calls and `HANDLER_EXIT` validates explicit shutdown. An early shutdown stops
+calls and `HANDLER_EXIT` validates explicit shutdown. A `READ` record
+(`record_read()`) notes that the dispatch used a watcher's current value: its
+`now`, that value's publication time and sequence, and no payload. It changes
+nothing the program sees, and replay checks the source and value read. Outside
+a dispatch `record_read()` records nothing. An early shutdown stops
 further dispatch even when collecting divergences. External shutdown is
 represented by the terminal `EXIT` record.
 

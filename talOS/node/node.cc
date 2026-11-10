@@ -48,10 +48,12 @@ struct Node::Impl {
     bool optional;
     bool observer = false;
     detail::MessageCallback on_message;
+    std::uint16_t watcher = 0;  // the loop's source id
     bool has_value = false;
     Time published{};
-    bool pending = false;  // arrived since the last update() began
-    bool updated = false;  // what update() sees: pending at its start
+    std::uint64_t sequence = 0;  // RTMS sequence of the latched message
+    bool pending = false;        // arrived since the last update() began
+    bool updated = false;        // what update() sees: pending at its start
   };
   struct PublisherSlot {
     std::uint16_t id;
@@ -203,6 +205,7 @@ struct Node::Impl {
     std::memset(slot->data.get() + copied, 0, slot->bytes - copied);
     slot->has_value = true;
     slot->published = context.publish_time;
+    slot->sequence = context.sequence;
     slot->pending = true;
     if (slot->on_message) slot->on_message(slot->data.get());
   }
@@ -636,10 +639,10 @@ std::size_t NodeAccess::add_subscription(Node& node, std::string_view topic,
   slot->data = std::make_unique<std::byte[]>(bytes);
   slot->optional = optional;
   slot->on_message = std::move(on_message);
-  impl.loop->register_watcher(slot->topic, static_cast<std::uint32_t>(bytes),
-                              static_cast<std::uint32_t>(alignment), schema,
-                              event::Thunk{slot.get(), &Node::Impl::OnMessage},
-                              !slot->on_message);
+  slot->watcher = impl.loop->register_watcher(
+      slot->topic, static_cast<std::uint32_t>(bytes),
+      static_cast<std::uint32_t>(alignment), schema,
+      event::Thunk{slot.get(), &Node::Impl::OnMessage}, !slot->on_message);
   impl.subscriptions.push_back(std::move(slot));
   return impl.subscriptions.size() - 1;
 }
@@ -657,6 +660,13 @@ Duration NodeAccess::subscription_age(const Node& node, std::size_t index) {
   const auto& slot = node.impl_->SubscriptionAt(index);
   if (!slot.has_value) return Duration::max();
   return node.now() - slot.published;
+}
+
+void NodeAccess::record_read(Node& node, std::size_t index) {
+  const auto& slot = node.impl_->SubscriptionAt(index);
+  if (!slot.has_value) return;
+  node.impl_->loop->record_read(slot.watcher, node.now(), slot.published,
+                                slot.sequence);
 }
 
 bool NodeAccess::subscription_fresh(const Node& node, std::size_t index,

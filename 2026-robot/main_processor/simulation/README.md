@@ -169,7 +169,7 @@ not merely one eventual zero demand. Without stale-target neutralization,
 the pre-proven forward request remains active past the deadline and fails;
 without rearming, resumed held input fails the continued-neutral window.
 Zero-demand velocity mode is **not** accepted as neutral. The test uses the
-node clock and v6 log record timestamps to align signal injection precisely
+node clock and v7 log record timestamps to align signal injection precisely
 on macOS as well as Linux. Process groups are always reaped. On failure it
 prints and retains the temporary directory containing `sessions/`, launcher
 diagnostics and (when export succeeds) `match.jsonl`; successful runs remove it.

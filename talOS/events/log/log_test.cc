@@ -269,7 +269,7 @@ TEST(LogRoundTrip, AllFieldsAndManifestMatch) {
   EXPECT_EQ(index, expected.size());
   EXPECT_EQ(reader.record_count(), expected.size());
   EXPECT_FALSE(reader.truncated());
-  EXPECT_EQ(reader.format_version(), 6u);
+  EXPECT_EQ(reader.format_version(), 7u);
   EXPECT_EQ(reader.session_id(), kFixtureSession);
 
   ::unlink(path.c_str());
@@ -509,7 +509,7 @@ TEST(LogCorruption, DamagedHeaderOrManifestThrowsOnOpen) {
 // Legacy and future log versions must be rejected before reading records.
 TEST(LogFormatErrors, RejectsUnsupportedVersions) {
   const std::string path = TempPath("unsupported_version");
-  for (const std::uint32_t version : {4u, 5u, 7u}) {
+  for (const std::uint32_t version : {4u, 6u, 8u}) {
     SCOPED_TRACE(version);
     WriteFixture(path, LogWriter::kDefaultBufferBytes);
     {

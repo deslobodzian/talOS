@@ -58,6 +58,11 @@ class LoopPort {
   virtual void arm_timer(std::uint16_t id, Time first, Duration period) = 0;
   virtual bool send(std::uint16_t id, std::span<const std::byte> bytes) = 0;
   virtual Time now() const = 0;
+  // Logs that the running handler read watcher `source_id`'s message
+  // `sequence`, published at `publish_time` (EventKind::READ); nothing
+  // outside a dispatch.
+  virtual void record_read(std::uint16_t source_id, Time now, Time publish_time,
+                           std::uint64_t sequence) = 0;
   // Chosen by NodeAccess::start, once the node has registered everything.
   // A loop that has no choice (replay delivers what the log says) ignores it.
   virtual void set_delivery(event::Delivery delivery) = 0;
@@ -105,6 +110,10 @@ class LoopPortFor : public LoopPort {
     return loop_.send_message(id, bytes);
   }
   Time now() const override { return loop_.monotonic_now(); }
+  void record_read(std::uint16_t source_id, Time now, Time publish_time,
+                   std::uint64_t sequence) override {
+    loop_.record_read(source_id, now, publish_time, sequence);
+  }
   void set_delivery(event::Delivery delivery) override {
     if constexpr (requires { loop_.set_delivery(delivery); }) {
       loop_.set_delivery(delivery);

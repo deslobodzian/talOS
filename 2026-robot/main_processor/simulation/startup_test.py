@@ -194,7 +194,7 @@ def ds_buttons(row):
 def log_baseline_ns(session):
     """Find log_dump's exact origin without assuming a Python/C++ clock epoch.
 
-    Walk v6 record headers only (events/log/format.h); payload decoding remains
+    Walk v7 record headers only (events/log/format.h); payload decoding remains
     log_dump's job. On macOS Node time is MONOTONIC_RAW, not steady_clock.
     """
     baseline = None
@@ -202,7 +202,7 @@ def log_baseline_ns(session):
         with path.open("rb") as stream:
             header = stream.read(120)
             magic, version, header_bytes = struct.unpack_from("<8sII", header)
-            if magic != b"TALOSLOG" or version != 6:
+            if magic != b"TALOSLOG" or version != 7:
                 raise ValueError(f"unsupported log format: {path}")
             manifests, = struct.unpack_from("<I", header, 40)
             schema_bytes, = struct.unpack_from("<Q", header, 112)

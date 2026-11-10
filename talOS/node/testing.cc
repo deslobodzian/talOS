@@ -55,11 +55,13 @@ class LatestBytes final : public detail::ByteTopic {
 };
 
 // A node's port in the Sim: byte topics stay in memory, where latest_bytes
-// reads them, rather than in shared memory.
+// reads them, rather than in shared memory. The loop records nothing, so the
+// port keeps what a dispatch log's READ records would say, bounded to a
+// count and the newest (SimAccess::reads).
 class SimPort final : public detail::LoopPortFor<event::SimulatedEventLoop<>> {
  public:
   SimPort(event::SimulatedEventLoop<>& loop, ByteTopics& byte_topics)
-      : LoopPortFor{loop}, byte_topics_{byte_topics} {}
+      : LoopPortFor{loop}, loop_{loop}, byte_topics_{byte_topics} {}
 
   std::unique_ptr<detail::ByteTopic> open_byte_topic(
       std::string_view topic, std::size_t, const BytePublishOptions&) override {
@@ -67,8 +69,27 @@ class SimPort final : public detail::LoopPortFor<event::SimulatedEventLoop<>> {
         byte_topics_.try_emplace(std::string{topic}).first->second);
   }
 
+  void record_read(std::uint16_t source_id, Time now, Time publish_time,
+                   std::uint64_t sequence) override {
+    LoopPortFor::record_read(source_id, now, publish_time, sequence);
+    // As the loop does: only inside a dispatch, only for a watcher.
+    const event::Manifest& manifest = loop_.manifest();
+    if (!loop_.in_dispatch() || source_id >= manifest.size() ||
+        manifest[source_id].kind != event::SourceKind::WATCHER) {
+      return;
+    }
+    ++reads_.count;
+    reads_.topic = manifest[source_id].name;
+    reads_.now = now;
+    reads_.publish_time = publish_time;
+    reads_.sequence = sequence;
+  }
+  const detail::SimReads& reads() const { return reads_; }
+
  private:
+  event::SimulatedEventLoop<>& loop_;
   ByteTopics& byte_topics_;
+  detail::SimReads reads_;
 };
 
 }  // namespace
@@ -77,7 +98,7 @@ struct Sim::Impl {
   struct Hosted {
     std::string name;
     std::unique_ptr<event::SimulatedEventLoop<>> loop;
-    std::unique_ptr<detail::LoopPort> port;
+    std::unique_ptr<SimPort> port;
     std::unique_ptr<Node> node;
     detail::Instance user;
     // What this node got from NodeAccess::declared_graph, if it asked.
@@ -326,6 +347,14 @@ void SimAccess::read_raw(const Sim& sim, std::string_view topic,
   }
   channel.copy_to(sequence,
                   std::span<std::byte>{static_cast<std::byte*>(out), bytes});
+}
+
+SimReads SimAccess::reads(const Sim& sim, std::string_view node_name) {
+  for (const auto& hosted : sim.impl_->nodes) {
+    if (hosted->name == node_name) return hosted->port->reads();
+  }
+  throw std::invalid_argument("Sim: no node named '" + std::string{node_name} +
+                              "'");
 }
 
 Time SimAccess::publish_time(const Sim& sim, std::string_view topic,

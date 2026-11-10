@@ -31,7 +31,12 @@ class SessionReportTest(unittest.TestCase):
             verdicts = {v["measurement"]: v["verdict"] for v in report["verdicts"]}
             self.assertEqual(verdicts["enabled state median"], "PASS")
             self.assertEqual(verdicts["enabled state gaps"], "FAIL")
-            self.assertEqual(verdicts["target age at tick"], "NOT MEASURED")
+            self.assertEqual(report["target_age_at_tick"],
+                             {"fixture:/fixture/target/test":
+                                  {"count": 1, "median_ms": 4, "p99_ms": 4, "max_ms": 4}})
+            # The manifest's signal death reaches the node summary.
+            self.assertEqual(report["nodes"][0]["exit_signal"], 9)
+            self.assertEqual(verdicts["target age at tick"], "PASS")
 
     def test_descriptor_status_and_no_duplicate_readers(self):
         def record(process, kind, topic, now, decoded=""):
@@ -51,6 +56,34 @@ class SessionReportTest(unittest.TestCase):
         self.assertEqual(report["status"]["clock_offset_valid"]["fraction"], 2 / 3)
         self.assertEqual(report["status"]["clock_uncertainty_us"]["min"], 2)
 
+    def test_target_age_at_tick_limit(self):
+        def record(kind, topic, now, age_ms=0, **extra):
+            return dict(process="lift", kind=kind, topic=topic, now_ms=now, event_ms=now,
+                        publish_ms=now - age_ms, decoded="", **extra)
+        enabled = [record("SEND", "/hw/state/driver_station", 0, ds_enabled=True)]
+        def lane(mode_since_us, active):
+            message = record("MESSAGE", "/lift/target/teleop", 1)
+            message["decoded"] = (f"{{mode_since_us: {mode_since_us}, active: {active}, "
+                                  "message: {position_rot: 0.5}}")
+            return [message]
+        live = lane(1200, "true")
+        def read(age_ms):
+            return record("READ", "/lift/target/teleop", 2, age_ms)
+        for session, verdict in ((live + [read(0), read(25)], "PASS"),
+                                 (live + [read(25.001)], "FAIL"),
+                                 # Active while enabled, never selected: a
+                                 # real finding such as a generation mismatch.
+                                 (enabled + live, "FAIL"),
+                                 # Released (neutral declarative teleop) or
+                                 # unstamped: nothing a Target could select.
+                                 (enabled + lane(1200, "false"), "NOT MEASURED"),
+                                 (enabled + lane(0, "true"), "NOT MEASURED"),
+                                 # Nothing to select from.
+                                 (enabled, "NOT MEASURED")):
+            report = session_report.analyze({"nodes": []}, session)
+            self.assertEqual({v["measurement"]: v["verdict"] for v in report["verdicts"]}
+                             ["target age at tick"], verdict, session)
+
     def test_empty_session_has_no_pass(self):
         report = session_report.analyze({"nodes": []}, [])
         self.assertTrue(all(v["verdict"] == "NOT MEASURED" for v in report["verdicts"]))
@@ -65,11 +98,12 @@ class SessionReportTest(unittest.TestCase):
         # A failed viewer without an event log is not acceptance evidence.
         studio = {"name": "studio_bridge", "log_path": "", **flags}
         cases = (
-            # Only the by-design NOT MEASURED rows remain, and they do not fail.
-            ({"end_wall_ns": 1, "nodes": [bridge, studio]}, records, 0),
-            # The hardware node recorded no /hw/state: five required verdicts.
-            ({"end_wall_ns": 1, "nodes": [bridge]}, [], 5),
-            ({"end_wall_ns": 0, "nodes": [{**bridge, **flags}, studio]}, records, 4),
+            # No target lane was dispatched: only that required row is
+            # NOT MEASURED; timer lateness is informational.
+            ({"end_wall_ns": 1, "nodes": [bridge, studio]}, records, 1),
+            # The hardware node recorded no /hw/state: six required verdicts.
+            ({"end_wall_ns": 1, "nodes": [bridge]}, [], 6),
+            ({"end_wall_ns": 0, "nodes": [{**bridge, **flags}, studio]}, records, 5),
         )
         for manifest, session, failures in cases:
             self.assertEqual(len(session_report.strict_failures(

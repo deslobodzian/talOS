@@ -35,9 +35,10 @@
 namespace talos::event::log {
 
 inline constexpr char FILE_MAGIC[8] = {'T', 'A', 'L', 'O', 'S', 'L', 'O', 'G'};
+// 7: READ records (EventKind::READ) note which watcher value a dispatch used.
 // 6: RecordHeader::publish_time_ns preserves producer time separately from
 // receipt/dispatch time. Version 5 introduced message schemas.
-inline constexpr std::uint32_t FORMAT_VERSION = 6;
+inline constexpr std::uint32_t FORMAT_VERSION = 7;
 
 // Marks the start of every record so a damaged log can be resynchronised.
 inline constexpr std::uint32_t RECORD_MAGIC = 0x54524543;  // "TREC"
@@ -121,6 +122,19 @@ inline void write_name(char (&field)[64], std::string_view name) {
   const std::size_t length = std::min(name.size(), MAX_SOURCE_NAME);
   std::memset(field, 0, sizeof(field));
   std::memcpy(field, name.data(), length);
+}
+
+// Where segment `segment` (0 first) of the byte-capped log at `log_path` is
+// kept once a newer one has started (LogWriterOptions::max_bytes):
+// `<stem>.segment<k>.tlog` beside it, so a session directory's `*.tlog`
+// (FindLogFiles) includes it. Each segment is a complete log.
+inline std::string LogSegmentPath(std::string_view log_path,
+                                  std::uint64_t segment) {
+  constexpr std::string_view kExtension = ".tlog";
+  std::string_view stem = log_path;
+  if (stem.ends_with(kExtension)) stem.remove_suffix(kExtension.size());
+  return std::string{stem} + ".segment" + std::to_string(segment) +
+         std::string{kExtension};
 }
 
 inline std::string read_name(const char (&field)[64]) {

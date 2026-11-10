@@ -16,6 +16,9 @@ enum class EventKind : std::uint16_t {
   ARM_TIMER = 6,
   DISARM_TIMER = 7,
   HANDLER_EXIT = 8,
+  // A handler used the current value of watcher `source_id` (published at
+  // `publish_time`, RTMS `sequence`). A measurement, not an input or output.
+  READ = 9,
 };
 
 constexpr const char* to_string(EventKind kind) {
@@ -34,6 +37,8 @@ constexpr const char* to_string(EventKind kind) {
       return "DISARM_TIMER";
     case EventKind::HANDLER_EXIT:
       return "HANDLER_EXIT";
+    case EventKind::READ:
+      return "READ";
   }
   return "UNKNOWN";
 }

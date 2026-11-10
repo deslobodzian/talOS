@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <fstream>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -392,6 +393,115 @@ TEST(Replay, EarlyExitStopsDispatchEvenWhenCollectingDivergences) {
   EXPECT_TRUE(loop.diverged());
   EXPECT_FALSE(loop.reached_exit());
   EXPECT_EQ(calls, 1);
+  std::remove(path.c_str());
+}
+
+// Reads one of two watchers from a timer, the way a node's update() reads its
+// target, and records which value it used.
+template <typename Loop>
+struct ReadProgram {
+  struct Read {
+    Context tick;
+    Context used;
+  };
+
+  Loop& loop;
+  bool read_setpoint{false};
+  std::uint16_t sensor;
+  std::uint16_t setpoint;
+  std::uint16_t timer;
+  std::optional<Context> last_sensor;
+  std::optional<Context> last_setpoint;
+  std::vector<Read> reads;
+
+  explicit ReadProgram(Loop& event_loop) : loop{event_loop} {
+    sensor = watch<EventsTest::SensorMessage, &ReadProgram::on_sensor>(
+        loop, test_topics().sensor, this);
+    setpoint = watch<EventsTest::SetpointMessage, &ReadProgram::on_setpoint>(
+        loop, test_topics().setpoint, this);
+    timer =
+        loop.register_timer("control", make_thunk<&ReadProgram::tick>(this));
+    loop.arm_timer(timer, MonotonicTime::from_nanos(2'000'000), 1ms);
+  }
+  void on_sensor(const Context& context, const EventsTest::SensorMessage&) {
+    last_sensor = context;
+  }
+  void on_setpoint(const Context& context, const EventsTest::SetpointMessage&) {
+    last_setpoint = context;
+  }
+  void tick(const Context& context) {
+    const std::optional<Context>& used =
+        read_setpoint ? last_setpoint : last_sensor;
+    if (!used) return;
+    loop.record_read(read_setpoint ? setpoint : sensor, context.now,
+                     used->publish_time, used->sequence);
+    reads.push_back(Read{context, *used});
+  }
+};
+
+std::vector<ReadProgram<SimulatedEventLoop<log::LogWriter>>::Read>
+record_read_program(const std::string& path) {
+  SimulationEnvironment environment;
+  SimulatedEventLoop<log::LogWriter> loop{environment,
+                                          log::LogWriter{path, "reads"}};
+  ReadProgram program{loop};
+  // Published after the origin, so a read's publish time differs from its
+  // timer dispatch's.
+  loop.run_for(1ms);
+  loop.inject(test_topics().sensor, EventsTest::SensorMessage{1, 2.0F, 3.0F});
+  loop.inject(test_topics().setpoint, EventsTest::SetpointMessage{1, 4.0F});
+  loop.run_for(3ms);
+  loop.finish();
+  EXPECT_FALSE(loop.recorder().failed()) << loop.recorder().error();
+  return program.reads;
+}
+
+// A READ record carries the reading dispatch and the value it used, so a
+// session report can measure the value's age at that dispatch from the log.
+TEST(Replay, ReadRecordRoundTripsWithItsFields) {
+  const auto path = temp_path("read_fields");
+  const auto reads = record_read_program(path);
+  ASSERT_GE(reads.size(), 2u);
+
+  log::LogReader reader{path};
+  log::LogReader::Record record;
+  std::size_t index = 0;
+  while (reader.next(record)) {
+    if (static_cast<EventKind>(record.header.kind) != EventKind::READ) continue;
+    ASSERT_LT(index, reads.size());
+    const auto& [tick, used] = reads[index++];
+    EXPECT_EQ(record.header.source_id, 0u);  // the sensor watcher
+    EXPECT_EQ(record.header.dispatch_index, tick.dispatch_index);
+    EXPECT_EQ(record.header.event_time_ns, tick.event_time.nanos());
+    EXPECT_EQ(record.header.now_ns, tick.now.nanos());
+    EXPECT_EQ(record.header.publish_time_ns, used.publish_time.nanos());
+    EXPECT_NE(used.publish_time, tick.publish_time);
+    EXPECT_EQ(record.header.sequence, used.sequence);
+    EXPECT_EQ(record.header.aux, 0u);
+    EXPECT_EQ(record.header.payload_bytes, 0u);
+  }
+  EXPECT_EQ(index, reads.size());
+  std::remove(path.c_str());
+}
+
+// Exact replay holds a program to the reads it recorded: the unchanged program
+// replays cleanly, and one that reads another source diverges.
+TEST(Replay, DetectsAReadOfADifferentSource) {
+  const auto path = temp_path("read_source");
+  ASSERT_FALSE(record_read_program(path).empty());
+  for (const bool read_setpoint : {false, true}) {
+    log::LogReader reader{path};
+    ReplayEventLoop<> loop{reader};
+    ReadProgram program{loop};
+    program.read_setpoint = read_setpoint;
+    if (read_setpoint) {
+      EXPECT_THROW(loop.run(), ReplayDivergence);
+    } else {
+      loop.run();
+      EXPECT_FALSE(loop.diverged());
+      EXPECT_TRUE(loop.reached_exit());
+    }
+  }
   std::remove(path.c_str());
 }
 

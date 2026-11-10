@@ -209,6 +209,78 @@ TEST(Target, PausedConsumerNeverActuatesOnExpiredQueuedTargetAfterResume) {
   EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kNeutral);
 }
 
+// Each update() that selects a lane logs one READ record of that lane's
+// message (its publish time), the dispatch-log evidence of the target age a
+// tick acted on; a stale or released lane, or a disabled robot, selects
+// nothing and logs nothing.
+// Asks its Target twice per update(), as a node that also reports source().
+struct RepeatedlyAskingConsumer {
+  explicit RepeatedlyAskingConsumer(Node& node)
+      : target{node}, motor{node, "m"} {}
+  void update() {
+    for (int i = 0; i < 2; ++i) {
+      if (const auto* goal = target.get())
+        motor.set_duty_cycle(goal->position_rot());
+      static_cast<void>(target.source());
+    }
+    ++updates;
+  }
+  Target<Goal> target;
+  Motor motor;
+  int updates = 0;
+};
+
+TEST(Target, EachSelectingUpdateLogsOneReadOfTheLane) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& lift = sim.add<RepeatedlyAskingConsumer>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(12ms);  // off the tick grid
+  const auto reads = [&] { return detail::SimAccess::reads(sim, "lift"); };
+  ASSERT_EQ(reads().count, 0U);
+  // 20 ms of updates that log no READ.
+  const auto expect_no_reads = [&](const char* why) {
+    const std::uint64_t count = reads().count;
+    const int updates = lift.updates;
+    sim.step(20ms);
+    EXPECT_GT(lift.updates, updates) << why;
+    EXPECT_EQ(reads().count, count) << why;
+  };
+
+  const Time published = sim.now();
+  PublishTarget(sim, "lift", "teleop", Goal{0.5});
+  int updates = lift.updates;
+  sim.step(15ms);
+  ASSERT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kDutyCycle);
+  EXPECT_GT(lift.updates, updates);
+  EXPECT_EQ(reads().count, static_cast<std::uint64_t>(lift.updates - updates));
+  EXPECT_EQ(reads().topic, "/lift/target/teleop");
+  EXPECT_EQ(reads().publish_time, published);
+
+  sim.step(100ms);  // the lane passes command_timeout_us
+  expect_no_reads("stale lane");
+
+  PublishTarget(sim, "lift", "teleop", Goal{0.5});
+  sim.step(5ms);
+  const std::uint64_t fresh = reads().count;
+  ReleaseTarget<Goal>(sim, "lift", "teleop");
+  sim.step(5ms);
+  EXPECT_GT(fresh, 0U);
+  expect_no_reads("released lane");
+
+  PublishTarget(sim, "lift", "teleop", Goal{0.5});
+  updates = lift.updates;
+  const std::uint64_t before = reads().count;
+  sim.step(5ms);
+  EXPECT_EQ(reads().count - before,
+            static_cast<std::uint64_t>(lift.updates - updates));
+  hw.enable(false);
+  sim.step(5ms);
+  PublishTarget(sim, "lift", "teleop", Goal{0.5});
+  expect_no_reads("disabled");
+}
+
 TEST(Target, FirstDrainAfterCommandTimeoutDoesNotReviveAnOldTarget) {
   auto sim = Sim::FromToml(R"(
 [robot]

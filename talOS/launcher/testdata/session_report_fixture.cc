@@ -1,4 +1,6 @@
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <span>
@@ -19,7 +21,8 @@ int main(int argc, char** argv) {
   manifest.end_wall_ns = 1;
   talos::launcher::NodeProcessInfo node;
   node.name = "fixture";
-  node.exit_code = 0;
+  node.exit_code = -1;   // a signal ended it
+  node.exit_signal = 9;  // SIGKILL
   node.exited = true;
   manifest.nodes.push_back(node);
   std::ofstream{directory + "/manifest.json"} << manifest.ToJson();
@@ -64,6 +67,7 @@ int main(int argc, char** argv) {
                                    ? std::span<const std::byte>{}
                                    : std::as_bytes(std::span{&packet, 1}));
     }
+    return context;
   };
   auto driver_station = [&](int ms, bool enabled) {
     talos::driver_station::DriverStationData data;
@@ -77,8 +81,17 @@ int main(int argc, char** argv) {
   for (int ms : {0, 5, 10, 130, 135}) record(ms, 0, EventKind::SEND, {});
   driver_station(140, false);
   for (int ms : {140, 340, 345}) record(ms, 0, EventKind::SEND, {});
-  record(346, 2, EventKind::TIMER, {});
-  record(347, 3, EventKind::MESSAGE, {});
+  const Context lane = record(346, 3, EventKind::MESSAGE, {});
+  const Context update = record(347, 2, EventKind::TIMER, {});
+  // Target::get selecting that lane inside the update: a READ record with an
+  // empty payload in the update's dispatch (its index, now and event time),
+  // carrying the selected message's publish time and sequence, 4 ms before.
+  Context read = update;
+  read.kind = EventKind::READ;
+  read.source_id = 3;
+  read.publish_time = lane.publish_time;
+  read.sequence = lane.sequence;
+  writer.dispatch(read, {});
   writer.flush();
   return writer.failed() ? 1 : 0;
 }
