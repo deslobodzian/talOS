@@ -121,7 +121,9 @@ test('mergeProcesses reads manifest-only rows', () => {
   const m = manifest([
     mnode({name: 'a', pid: 1, exit_code: 0, record_count: '42'}),
     mnode({name: 'b', pid: 2, exit_code: -1, restart_count: 3,
-           recorder_failed: true})
+           recorder_failed: true, runs_dropped: 0, runs: [
+             {pid: 2, start_wall_ns: 1, end_wall_ns: 2, exit_code: -1,
+              exit_signal: 9, reason: 'stalled'}]})
   ]);
   const rows = mergeProcesses(m, null, null, {}, false);
   assert.equal(rows.length, 2);
@@ -136,6 +138,7 @@ test('mergeProcesses reads manifest-only rows', () => {
   assert.equal(a.exitCode, 0);
   assert.equal(a.records, '42');
   assert.equal(a.hasManifest, true);
+  assert.equal(a.endReason, null);  // no run history: an older manifest
   assert.deepEqual(a.problems, []);
 
   const b = rows.find(r => r.name === 'b')!;
@@ -143,6 +146,8 @@ test('mergeProcesses reads manifest-only rows', () => {
   assert.equal(b.exitCode, null);   // -1 means not exited, not "exit 0"
   assert.equal(b.restarts, 3);
   assert.equal(b.recorderFailed, true);
+  // The launcher's kill reason, not just its signal, reaches the row.
+  assert.equal(b.endReason, 'stalled');
   assert.deepEqual(b.problems, ['restarted', 'recorder_failed']);
 });
 

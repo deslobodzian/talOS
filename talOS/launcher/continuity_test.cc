@@ -109,12 +109,13 @@ std::multiset<std::uint32_t> RunsReceived(const std::string& path) {
   return runs;
 }
 
-// One node's object in manifest.json, from its name to the closing brace.
+// One node's object in manifest.json, from its name to its run history.
 std::string ManifestEntry(const std::string& manifest, std::string_view name) {
   const std::size_t start =
       manifest.find("\"name\": \"" + std::string{name} + "\"");
   if (start == std::string::npos) return {};
-  return manifest.substr(start, manifest.find('}', start) - start);
+  // Its run history comes last; its runs repeat keys such as exit_code.
+  return manifest.substr(start, manifest.find("\"runs\": [", start) - start);
 }
 
 TEST(SessionSegments, SubscribersOutliveAKilledAndACleanlyExitedPublisher) {

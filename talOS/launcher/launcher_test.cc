@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1406,6 +1407,42 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   std::filesystem::remove_all(bundle_dir);
 }
 
+// A member's run history is bounded: it keeps the first run, which says how
+// the trouble started, and the newest, and counts what it dropped between.
+TEST(LauncherTest, RunHistoryKeepsFirstAndNewestRunsAndCountsTheRest) {
+  NodeProcessInfo proc;
+  const int total = static_cast<int>(kMaxRecordedRuns) + 8;
+  for (int pid = 1; pid <= total; ++pid) {
+    proc.BeginRun(pid);
+    proc.exit_signal = SIGKILL;
+    proc.EndRun(kRunStalled);
+  }
+  ASSERT_EQ(proc.runs.size(), kMaxRecordedRuns);
+  EXPECT_EQ(proc.runs_dropped, 8u);
+  EXPECT_EQ(proc.runs.front().pid, 1);
+  EXPECT_EQ(proc.runs[1].pid, 10);
+  EXPECT_EQ(proc.runs.back().pid, total);
+  EXPECT_EQ(proc.runs.back().reason, kRunStalled);
+  EXPECT_EQ(proc.runs.back().exit_signal, SIGKILL);
+}
+
+// A launcher kill names its run whatever the status; a stop names only the
+// endings a stop asks for, so a crash while stopping stays a crash.
+TEST(LauncherTest, RunEndReasonKeepsACrashDuringAStop) {
+  const auto exited = [](int code) { return code << 8; };  // WIFEXITED
+  EXPECT_EQ(RunEndReason({}, false, exited(0)), kRunExit);
+  EXPECT_EQ(RunEndReason({}, false, SIGSEGV), kRunCrash);
+  EXPECT_EQ(RunEndReason(kRunStalled, false, SIGKILL), kRunStalled);
+  EXPECT_EQ(RunEndReason(kRunEndpointMismatch, true, exited(0)),
+            kRunEndpointMismatch);
+  EXPECT_EQ(RunEndReason(kRunStop, true, exited(0)), kRunStop);
+  EXPECT_EQ(RunEndReason({}, true, SIGTERM), kRunStop);
+  EXPECT_EQ(RunEndReason(kRunStop, true, SIGABRT), kRunCrash);
+  EXPECT_EQ(RunEndReason(kRunStop, true, exited(1)), kRunCrash);
+  EXPECT_EQ(RunEndReason(kRunStopTimeout, true, SIGKILL), kRunStopTimeout);
+  EXPECT_EQ(RunEndReason(kRunStopTimeout, true, SIGINT), kRunStop);
+}
+
 TEST(LauncherBundleTest, LauncherRunsFromBundleDirectoryWithDescribeOnly) {
   const std::string bundle_dir = TempPath("test_bundle_run");
   std::filesystem::create_directories(bundle_dir + "/config");
@@ -1619,7 +1656,7 @@ TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
   do {
     before = ReadFile(path);
     if (before.find("\"name\": \"alpha\"") != std::string::npos &&
-        before.find("\"pid\": -1") == std::string::npos) {
+        before.find("\n      \"pid\": -1") == std::string::npos) {
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds{10});
@@ -1633,7 +1670,7 @@ TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
       "python3 -c 'import json,sys; json.load(open(sys.argv[1]))' '" + path +
       "'";
   EXPECT_EQ(std::system(parse.c_str()), 0);
-  EXPECT_NE(manifest.find("\"end_wall_ns\": 0"), std::string::npos);
+  EXPECT_NE(manifest.find("\n  \"end_wall_ns\": 0"), std::string::npos);
   EXPECT_NE(manifest.find("\"name\": \"alpha\""), std::string::npos);
   std::filesystem::remove_all(options.output_dir);
 }

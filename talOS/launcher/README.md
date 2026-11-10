@@ -316,7 +316,9 @@ segments, the one being written at its own path and older ones beside it as
 (`LogWriterOptions::max_bytes`); `record_count` sums the kept segments.
 `log_dump` on the session directory merges every `*.tlog`, restarts and
 segments included.
-A node's `exit_code`, `exit_signal` and `pid` are its last run's:
+A node's `exit_code`, `exit_signal` and `pid` are its last run's (every
+run's are in its `runs`, with the reason it ended; see
+[session manifest](#session-manifest)):
 `exit_code` is -1 while a run is live and after a signal ended it, and
 `exit_signal` is that signal's number (0 for none), which the end-of-session
 summary also names (`exit=-1 (signal 2 SIGINT)`); Studio's session panel
@@ -458,6 +460,34 @@ It is written to a temporary file and renamed into place, as is the
 started with as `--graph`. A launch that cannot write either exits 1 before
 anything starts.
 
+
+## Session manifest
+
+`<output_dir>/<session_id>/manifest.json` says what ran and how each run
+ended (when it is written: [session segments and logs](#session-segments-and-logs)).
+
+- per node, `runs`: one entry per run, spawn failures included: `pid` (-1
+  when the spawn failed), `start_wall_ns`, `end_wall_ns` (0 while it runs),
+  `exit_code`, `exit_signal` (as for the node's last run, above) and `reason`.
+  At most 32 are kept, the first run and the newest; `runs_dropped` counts
+  those dropped between them.
+
+| `reason` | the run |
+|---|---|
+| `running` | has not ended |
+| `exit` | exited 0 on its own |
+| `crash` | exited nonzero or by a signal, the session stopping or not, and is none of the rows below |
+| `stalled` | was killed (SIGKILL) because its registry heartbeat or dispatch count stopped |
+| `heartbeat_missing` | was killed because no registry row of it was found once the startup grace and its heartbeat timeout had passed |
+| `construction_deadline` | was killed for constructing longer than the deadline |
+| `endpoint_mismatch` | was killed, or its session stopped, for [live endpoints](#live-endpoints) that differ from its probe |
+| `stop` | ended as the session's stop (signal, `--duration-s`) asks: exit 0, SIGINT or SIGTERM |
+| `stop_timeout` | outlived the 2 s after the stop's SIGINT and was killed (SIGKILL) |
+| `spawn_failed` | could not be spawned (`exit_code` -1, `exit_signal` 0) |
+
+A kill of the launcher's own (`stalled`, `heartbeat_missing`,
+`construction_deadline`, `endpoint_mismatch`) names its run whatever exit or
+signal is then observed, which `exit_code` and `exit_signal` still record.
 
 ## Building
 
@@ -638,7 +668,9 @@ bazel run //talOS/launcher:session_report -- --json /tmp/logs/session
 
 The offline Python tool reuses `log_dump` and its events reader/embedded
 descriptor decoder, without robot-specific schemas. It reports manifest config
-identity, node exits/restarts/quarantine/recorder failures/caps, an unfinished
+identity, node exits/restarts/quarantine/recorder failures/caps, each
+node's runs with the reason each ended ([session manifest](#session-manifest)),
+an unfinished
 session, state inter-arrival median/nearest-rank p99/max,
 enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
 lateness, and every scalar `/hw/status` field.

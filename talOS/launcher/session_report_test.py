@@ -115,6 +115,23 @@ class SessionReportTest(unittest.TestCase):
             self.assertEqual({v["measurement"]: v["verdict"] for v in report["verdicts"]}
                              ["target age at tick"], verdict, session)
 
+    def test_runs_after_dropped_ones_keep_their_spawn_numbers(self):
+        # The launcher keeps the first run and the newest; the ones between
+        # are counted in runs_dropped, so the newest kept are runs 3 and 4.
+        def run(pid, reason, end=2_000_000_000):
+            return {"pid": pid, "start_wall_ns": 1_000_000_000, "end_wall_ns": end,
+                    "exit_code": -1, "exit_signal": 9, "reason": reason}
+        manifest = {"nodes": [{"name": "arm", "runs_dropped": 2, "runs": [
+            run(10, "stalled"), run(13, "crash"), run(14, "running", end=0)]}]}
+        text = session_report.markdown(session_report.analyze(manifest, []))
+        runs = text[text.index("## Runs"):text.index("## Session completeness")]
+        rows = [line for line in runs.splitlines() if line.startswith("| arm |")]
+        self.assertEqual([row.split(" | ")[1:3] for row in rows[:3]],
+                         [["0", "10"], ["3", "13"], ["4", "14"]])
+        self.assertIn("1.000 | -1 | 9 | stalled", rows[0])
+        self.assertIn("running | -1 | 9 | running", rows[2])
+        self.assertIn("2 runs after the first dropped", rows[3])
+
     def test_empty_session_has_no_pass(self):
         report = session_report.analyze({"nodes": []}, [])
         self.assertTrue(all(v["verdict"] == "NOT MEASURED" for v in report["verdicts"]))

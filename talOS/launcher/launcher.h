@@ -304,6 +304,41 @@ struct NodeSpec {
   bool owns_actuators{false};
 };
 
+// Why a run of a roster member ended (NodeRun::reason), as the supervisor
+// saw it. The first five are the launcher's own kills.
+inline constexpr std::string_view kRunStalled = "stalled";
+inline constexpr std::string_view kRunHeartbeatMissing = "heartbeat_missing";
+inline constexpr std::string_view kRunConstructionDeadline =
+    "construction_deadline";
+inline constexpr std::string_view kRunEndpointMismatch = "endpoint_mismatch";
+inline constexpr std::string_view kRunStopTimeout = "stop_timeout";
+inline constexpr std::string_view kRunStop = "stop";  // The session stopped.
+inline constexpr std::string_view kRunExit = "exit";  // Exited 0 on its own.
+// Exited nonzero, or a signal the launcher did not send ended it.
+inline constexpr std::string_view kRunCrash = "crash";
+inline constexpr std::string_view kRunSpawnFailed = "spawn_failed";
+inline constexpr std::string_view kRunRunning = "running";
+
+// A member's run history keeps its first run and its newest ones, at most
+// this many in all; older ones are counted in runs_dropped.
+inline constexpr std::size_t kMaxRecordedRuns = 32;
+
+// One run of a roster member: one spawn attempt, and how it ended.
+struct NodeRun {
+  pid_t pid{-1};  // -1 for a spawn that failed.
+  int64_t start_wall_ns{0};
+  int64_t end_wall_ns{0};  // 0 while it runs.
+  int exit_code{-1};       // -1 while it runs, and after a signal ended it.
+  int exit_signal{0};
+  std::string_view reason{kRunRunning};
+};
+
+inline int64_t WallClockNanos() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
 struct NodeProcessInfo {
   std::string name;
   std::string target;
@@ -337,6 +372,39 @@ struct NodeProcessInfo {
   // from what its --describe probe declared (EndpointMismatch): that run ran
   // under a graph the lint never checked. Never cleared by a later run.
   bool endpoint_mismatch{false};
+  // Every run, first first, capped at kMaxRecordedRuns: the first run and
+  // the newest; `runs_dropped` counts the ones between that were dropped.
+  std::vector<NodeRun> runs;
+  uint64_t runs_dropped{0};
+
+  // Records the start of a run (`pid` -1 for a spawn that failed).
+  void BeginRun(pid_t run_pid) {
+    if (runs.size() >= kMaxRecordedRuns) {
+      runs.erase(runs.begin() + 1);
+      ++runs_dropped;
+    }
+    NodeRun& run = runs.emplace_back();
+    run.pid = run_pid;
+    run.start_wall_ns = WallClockNanos();
+  }
+
+  // Ends the newest run with this process's exit_code and exit_signal.
+  void EndRun(std::string_view reason) {
+    if (runs.empty() || runs.back().end_wall_ns != 0) return;
+    NodeRun& run = runs.back();
+    run.end_wall_ns = WallClockNanos();
+    run.exit_code = exit_code;
+    run.exit_signal = exit_signal;
+    run.reason = reason;
+  }
+
+  // Records a run that could not be spawned: it has no exit of its own.
+  void RecordSpawnFailure() {
+    BeginRun(-1);
+    NodeRun& run = runs.back();
+    run.end_wall_ns = run.start_wall_ns;
+    run.reason = kRunSpawnFailed;
+  }
 };
 
 struct SessionManifest {
@@ -391,7 +459,20 @@ struct SessionManifest {
          << ",\n";
       ss << "      \"endpoint_mismatch\": "
          << (n.endpoint_mismatch ? "true" : "false") << ",\n";
-      ss << "      \"record_count\": " << n.record_count << "\n";
+      ss << "      \"record_count\": " << n.record_count << ",\n";
+      ss << "      \"runs_dropped\": " << n.runs_dropped << ",\n";
+      // Last: a run is the only nested object in a node's entry.
+      ss << "      \"runs\": [";
+      for (std::size_t j = 0; j < n.runs.size(); ++j) {
+        const NodeRun& run = n.runs[j];
+        ss << (j ? ",\n        {" : "\n        {") << "\"pid\": " << run.pid
+           << ", \"start_wall_ns\": " << run.start_wall_ns
+           << ", \"end_wall_ns\": " << run.end_wall_ns
+           << ", \"exit_code\": " << run.exit_code
+           << ", \"exit_signal\": " << run.exit_signal
+           << ", \"reason\": " << Quoted(run.reason) << "}";
+      }
+      ss << (n.runs.empty() ? "]\n" : "\n      ]\n");
       ss << "    }" << (i + 1 < nodes.size() ? "," : "") << "\n";
     }
     ss << "  ]\n";
@@ -2185,6 +2266,26 @@ inline bool ResolveMaxRestarts(const config::RobotConfig& robot_config,
   return true;
 }
 
+// Why a run ended, for its NodeRun, from the reason the launcher ended it
+// (`kill_reason`, empty when it did not try), whether the session is
+// stopping, and its waitpid status. A kill of the launcher's own (stalled,
+// endpoint_mismatch, ...) names the run whatever the status says. A stop
+// does only for the endings a stop asks for -- exit 0, SIGINT, SIGTERM, or
+// stop_timeout's SIGKILL -- so a node that crashes while stopping (a
+// nonzero exit, SIGABRT) is a crash.
+inline std::string_view RunEndReason(std::string_view kill_reason,
+                                     bool stopping, int status) {
+  const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  const int signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+  if (kill_reason.empty() && !stopping) return clean ? kRunExit : kRunCrash;
+  if (!kill_reason.empty() && kill_reason != kRunStop &&
+      kill_reason != kRunStopTimeout)
+    return kill_reason;
+  if (kill_reason == kRunStopTimeout && signal == SIGKILL)
+    return kRunStopTimeout;
+  return clean || signal == SIGINT || signal == SIGTERM ? kRunStop : kRunCrash;
+}
+
 // "exit code N" or "signal N SIGNAME", from a waitpid status.
 inline std::string ExitReason(int status) {
   if (WIFSIGNALED(status)) return "signal " + SignalText(WTERMSIG(status));
@@ -2284,6 +2385,7 @@ class StudioBridge {
                 << (binary.empty() ? target_ : binary)
                 << "'; session runs without Studio\n";
       proc.failed = true;
+      proc.RecordSpawnFailure();
       return;
     }
     std::cout << "[launcher] Starting studio_bridge (target " << target_
@@ -2294,10 +2396,12 @@ class StudioBridge {
       std::cerr << "[launcher] cannot spawn studio_bridge (" << error
                 << "); session runs without Studio\n";
       proc.failed = true;
+      proc.RecordSpawnFailure();
       return;
     }
     const auto now = Clock::now();
     proc.pid = pid;
+    proc.BeginRun(pid);
     attempts_ = 1;
     first_attempt_ = now;
     last_spawn_ = now;
@@ -2324,6 +2428,7 @@ class StudioBridge {
       if (pid < 0) {
         std::cerr << "[launcher] cannot spawn studio_bridge (" << error
                   << "); session runs without Studio\n";
+        proc.RecordSpawnFailure();
         GiveUp(proc);
         return;
       }
@@ -2335,6 +2440,7 @@ class StudioBridge {
       proc.exited = false;
       proc.exit_code = -1;
       proc.exit_signal = 0;
+      proc.BeginRun(pid);
       ++attempts_;
       last_spawn_ = now;
     } else if (now - last_spawn_ >= kStudioBridgeRetryInterval) {
@@ -2349,9 +2455,10 @@ class StudioBridge {
   }
 
   // The session ended while the bridge was still starting: it never served
-  // Studio. A stop-driven ending is not a bridge failure.
+  // Studio. An attempt still running is killed and reaped, so its run ends
+  // with the session. A stop-driven ending is not a bridge failure.
   void Finish(NodeProcessInfo& proc, bool stop_requested) {
-    if (!active_ || stable_ || stop_requested) return;
+    if (!active_ || stable_) return;
     if (proc.pid > 0 && !proc.exited) {
       SignalProcessGroup(proc.pid, SIGKILL);
       int status = 0;
@@ -2360,8 +2467,9 @@ class StudioBridge {
       FinishProcessGroup(proc.pid);
       proc.exited = true;
       proc.exit_signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+      proc.EndRun(kRunStop);
     }
-    GiveUp(proc);
+    if (!stop_requested) GiveUp(proc);
   }
 
  private:
@@ -2580,7 +2688,7 @@ class Launcher {
     manifest.output_dir = options_.output_dir;
     manifest.simulation = options_.simulation;
     manifest.declared_topics = declared_topics;
-    manifest.start_wall_ns = WallNanos();
+    manifest.start_wall_ns = WallClockNanos();
     session_manifest_ = manifest;
     PersistManifest({});
 
@@ -2707,6 +2815,7 @@ class Launcher {
         continue;
       }
       proc.pid = pid;
+      proc.BeginRun(pid);
       PersistManifest(procs);
       std::cout << "[launcher] Started " << proc.name << " (pid " << pid
                 << ", target " << proc.target << ")\n";
@@ -2715,7 +2824,7 @@ class Launcher {
     PersistManifest(procs);
 
     Supervise(procs, launches, studio, deadline);
-    manifest.end_wall_ns = WallNanos();
+    manifest.end_wall_ns = WallClockNanos();
     // Every run has been reaped and its group killed, so the pipes end.
     output_->Stop();
     for (const auto& proc : procs) {
@@ -3020,13 +3129,10 @@ class Launcher {
     std::vector<naming::SourceShape> declared;
     // A non-critical member killed for a mismatch: never restarted.
     bool endpoints_stopped{false};
+    // Why the launcher ended the current run (kRunStalled, kRunStop, ...);
+    // empty while it has not tried. Its run is recorded with this reason.
+    std::string_view kill_reason;
   };
-
-  static int64_t WallNanos() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-  }
 
   // --replay-inputs: runs the one roster member --only names on the topics
   // the session in options_.replay_inputs logged, by starting its binary with
@@ -3152,6 +3258,7 @@ class Launcher {
                    std::chrono::steady_clock::time_point now,
                    const std::string& error) {
     proc.failed = true;
+    proc.RecordSpawnFailure();
     std::cerr << "[launcher] cannot spawn " << proc.name << " (" << error
               << "); ";
     // Never `stopping` here: Supervise cancels a pending restart once the
@@ -3238,6 +3345,8 @@ class Launcher {
     proc.exited = false;
     proc.exit_code = -1;
     proc.exit_signal = 0;
+    proc.BeginRun(pid);
+    launch.kill_reason = {};
     launch.started_at = std::chrono::steady_clock::now();
     launch.heartbeat_changed_at = launch.started_at;
     launch.last_heartbeat = 0;
@@ -3333,11 +3442,13 @@ class Launcher {
     } else if (!launch.critical) {
       launch.endpoints_stopped = true;
       launch.heartbeat_killed = true;
+      launch.kill_reason = kRunEndpointMismatch;
       SignalProcessGroup(proc.pid, SIGKILL);
       std::cerr << "non-critical: killing it, without restarts this "
                    "session\n";
     } else if (proc.restart_count == 0) {
       endpoints_refused_ = true;
+      launch.kill_reason = kRunEndpointMismatch;
       std::cerr << "stopping the session. A node must declare the same "
                    "endpoints whether or not Node::describing(); pass "
                    "--allow-graph-errors to run anyway.\n";
@@ -3505,6 +3616,9 @@ class Launcher {
                       << "; killing pid " << proc.pid << "\n";
             SignalProcessGroup(proc.pid, SIGKILL);
             launch.heartbeat_killed = true;
+            launch.kill_reason = construction_expired ? kRunConstructionDeadline
+                                 : found              ? kRunStalled
+                                                      : kRunHeartbeatMissing;
           }
         }
         int status = 0;
@@ -3514,9 +3628,10 @@ class Launcher {
         proc.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         proc.exit_signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
         manifest_changed = true;
+        const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        proc.EndRun(RunEndReason(launch.kill_reason, stop_arrived(), status));
         const bool is_bridge = studio && i == studio->index();
         if (is_bridge && studio->Starting(i)) continue;
-        const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
         launch.last_exit_clean = clean;
         if (!is_bridge && !launch.endpoints_stopped &&
             ShouldRestartNode(clean, launch.critical, max_restarts_,
@@ -3598,15 +3713,21 @@ class Launcher {
         stop_sent = true;
         shutdown_deadline = now + std::chrono::seconds{2};
         std::cout << "[launcher] Stopping children...\n";
-        for (const auto& proc : procs) {
-          if (proc.pid > 0 && !proc.exited)
-            SignalProcessGroup(proc.pid, SIGINT);
+        for (std::size_t i = 0; i < procs.size(); ++i) {
+          const auto& proc = procs[i];
+          if (proc.pid <= 0 || proc.exited) continue;
+          SignalProcessGroup(proc.pid, SIGINT);
+          if (launches[i].kill_reason.empty())
+            launches[i].kill_reason = kRunStop;
         }
       }
       if (stop_sent && now >= shutdown_deadline) {
-        for (const auto& proc : procs) {
-          if (proc.pid > 0 && !proc.exited)
-            SignalProcessGroup(proc.pid, SIGKILL);
+        for (std::size_t i = 0; i < procs.size(); ++i) {
+          const auto& proc = procs[i];
+          if (proc.pid <= 0 || proc.exited) continue;
+          SignalProcessGroup(proc.pid, SIGKILL);
+          if (launches[i].kill_reason == kRunStop)
+            launches[i].kill_reason = kRunStopTimeout;
         }
       }
       exits.Wait(std::chrono::milliseconds(20));

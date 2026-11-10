@@ -166,12 +166,31 @@ std::vector<std::string> ReadLines(const std::string& path) {
   return lines;
 }
 
-// One node's object in manifest.json, from its name to the closing brace.
+// One node's object in manifest.json, from its name to its run history.
 std::string ManifestEntry(const std::string& manifest, std::string_view name) {
   const std::size_t start =
       manifest.find("\"name\": \"" + std::string{name} + "\"");
   if (start == std::string::npos) return {};
-  return manifest.substr(start, manifest.find('}', start) - start);
+  // Its run history comes last; its runs repeat keys such as exit_code.
+  return manifest.substr(start, manifest.find("\"runs\": [", start) - start);
+}
+
+// One node's run history in manifest.json: each run's object, first first.
+std::vector<std::string> ManifestRuns(const std::string& manifest,
+                                      std::string_view name) {
+  const std::size_t node =
+      manifest.find("\"name\": \"" + std::string{name} + "\"");
+  if (node == std::string::npos) return {};
+  const std::size_t start = manifest.find("\"runs\": [", node);
+  if (start == std::string::npos) return {};
+  const std::string runs =
+      manifest.substr(start, manifest.find(']', start) - start);
+  std::vector<std::string> out;
+  for (std::size_t at = runs.find('{'); at != std::string::npos;
+       at = runs.find('{', at + 1)) {
+    out.push_back(runs.substr(at, runs.find('}', at) - at + 1));
+  }
+  return out;
 }
 
 LauncherOptions ConstructionOptions(std::string_view tag, int delay_ms) {
@@ -223,7 +242,8 @@ LauncherOptions EndpointOptions(std::string_view tag, bool drift) {
 // first spawn (after the probes) to its end.
 std::chrono::nanoseconds SessionLength(const std::string& manifest) {
   const auto field = [&manifest](std::string_view key) -> int64_t {
-    const std::string name = "\"" + std::string{key} + "\": ";
+    // Top level: its runs repeat these keys.
+    const std::string name = "\n  \"" + std::string{key} + "\": ";
     const std::size_t at = manifest.find(name);
     if (at == std::string::npos) return 0;
     return std::stoll(manifest.substr(at + name.size()));
@@ -370,7 +390,7 @@ TEST(Supervision, StoppedEventLogReachesTheLiveManifest) {
     while (!stop.stop_requested()) {
       const std::string text = ReadFile(manifest);
       auto entry = ManifestEntry(text, "alpha");
-      if (text.find("\"end_wall_ns\": 0,") != std::string::npos &&
+      if (text.find("\n  \"end_wall_ns\": 0,") != std::string::npos &&
           entry.find("\"log_capped\": true") != std::string::npos) {
         live = std::move(entry);
         return;
@@ -448,6 +468,20 @@ TEST(Supervision, CriticalCrashLoopIsNeverQuarantined) {
       WriteStub("critical_loop_beta", "exit 0\n");
   EXPECT_EQ(RunSession(options), 0);
   EXPECT_EQ(ReadLines(runs).size(), 7u);
+  // Every run is in the manifest, each with how it ended.
+  const auto history =
+      ManifestRuns(ReadFile(options.output_dir + "/manifest.json"), "alpha");
+  ASSERT_EQ(history.size(), 7u);
+  for (std::size_t i = 0; i + 1 < history.size(); ++i) {
+    EXPECT_NE(history[i].find("\"exit_code\": 3, \"exit_signal\": 0, "
+                              "\"reason\": \"crash\""),
+              std::string::npos)
+        << history[i];
+  }
+  EXPECT_NE(history.back().find("\"exit_code\": 0, \"exit_signal\": 0, "
+                                "\"reason\": \"exit\""),
+            std::string::npos)
+      << history.back();
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
 }
@@ -543,13 +577,22 @@ TEST(Supervision, ExecFailureIsASpawnFailureThatNamesItsCause) {
   while (::waitpid(launcher, nullptr, 0) < 0 && errno == EINTR) {
   }
   EXPECT_FALSE(reported.empty()) << ReadFile(log);
-  const auto entry = ManifestEntry(
+  const auto manifest =
       ReadFile(options.output_dir + "/" + std::to_string(options.session_id) +
-               "/manifest.json"),
-      "alpha");
+               "/manifest.json");
+  const auto entry = ManifestEntry(manifest, "alpha");
   EXPECT_NE(entry.find("\"restart_count\": 0,"), std::string::npos) << entry;
   EXPECT_NE(entry.find("\"recorder_failed\": true"), std::string::npos)
       << entry;
+  // The failed spawn is a run of its own, with no exit of its own: not the
+  // previous run's exit code 3.
+  const auto history = ManifestRuns(manifest, "alpha");
+  ASSERT_GE(history.size(), 2u) << manifest;
+  EXPECT_NE(history[1].find("{\"pid\": -1,"), std::string::npos) << history[1];
+  EXPECT_NE(history[1].find("\"exit_code\": -1, \"exit_signal\": 0, "
+                            "\"reason\": \"spawn_failed\""),
+            std::string::npos)
+      << history[1];
   std::filesystem::remove_all(options.output_dir);
   ::remove(log.c_str());
 }
@@ -1318,7 +1361,7 @@ TEST(Supervision, StuckManifestSyncDelaysNoRestartAndSyncsItLater) {
       const std::string text = ReadFile(live_manifest);
       if (ManifestEntry(text, "alpha").find("\"restart_count\": 1,") !=
               std::string::npos &&
-          text.find("\"end_wall_ns\": 0,") != std::string::npos)
+          text.find("\n  \"end_wall_ns\": 0,") != std::string::npos)
         synced_restart = true;
     }
     return result;
@@ -1410,9 +1453,19 @@ TEST(Supervision, StalledRegistryHeartbeatIsKilledAndRestarted) {
   publisher.request_stop();
   publisher.join();
   EXPECT_EQ(ReadLines(runs).size(), 2u);
-  const auto alpha =
-      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
+  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto alpha = ManifestEntry(manifest, "alpha");
   EXPECT_NE(alpha.find("\"restart_count\": 1"), std::string::npos);
+  // The kill is in the session, not only on the launcher's stderr: the
+  // stalled run ended by the launcher's SIGKILL, for a stall.
+  const auto history = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(history.size(), 2u) << manifest;
+  EXPECT_NE(history[0].find("\"exit_signal\": " + std::to_string(SIGKILL) +
+                            ", \"reason\": \"stalled\""),
+            std::string::npos)
+      << history[0];
+  EXPECT_NE(history[1].find("\"reason\": \"exit\""), std::string::npos)
+      << history[1];
   std::filesystem::remove_all(options.output_dir);
   ::remove(pid_file.c_str());
   ::remove(runs.c_str());

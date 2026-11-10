@@ -42,6 +42,10 @@ export type ProcessRow = {
   // The signal that ended the last run, as the launcher reports it
   // ("signal 9 SIGKILL"), else null.
   exitSignal: string|null;
+  // Why the launcher ended the last run ('stalled', 'stop', ...; launcher
+  // README "Session manifest"), when it ended and was not a plain exit.
+  // Null for a manifest from before runs were recorded.
+  endReason: string|null;
   recorderFailed: boolean;
   records: string|null;
   loopRate: number|null;
@@ -137,6 +141,7 @@ export function mergeProcesses(
     // `declaredStatus` follows).
     if (graph && d && !r) problems.push('never_registered');
 
+    const lastRun = m?.runs?.at(-1);
     rows.push({
       name,
       target: m?.target ?? r?.target ?? d?.target ?? '',
@@ -146,6 +151,8 @@ export function mergeProcesses(
       restarts: m?.restart_count ?? 0,
       exitCode: m && m.exit_code >= 0 ? m.exit_code : null,
       exitSignal: m && m.exit_signal > 0 ? signalText(m.exit_signal) : null,
+      endReason: lastRun && lastRun.reason !== 'running' &&
+              lastRun.reason !== 'exit' ? lastRun.reason : null,
       recorderFailed: m?.recorder_failed ?? false,
       records: m ? m.record_count : null,
       loopRate: r ? loopRate(r, rates) : null,

@@ -8,7 +8,8 @@
 //               registry and the declared graph by name, so a process that
 //               crashed before claiming a slot still shows up (declared, never
 //               registered) and a process started outside the launcher is not
-//               lost (registry only).
+//               lost (registry only). The exit column adds why the launcher
+//               ended the last run (stalled, stop, ...) when it says.
 //   Counts    — running / total processes and total restarts.
 //
 // The manifest is served by the bridge at /manifest.json only when it was
@@ -233,6 +234,9 @@ function SessionPanel() {
                       ((row.exitCode !== null && row.exitCode > 0) ||
                        row.exitSignal !== null ? ' warn' : '')}>
                     {row.exitSignal ?? (row.exitCode === null ? '—' : row.exitCode)}
+                    {row.endReason &&
+                     <span>{' · '}{
+                         row.endReason.replaceAll('_', ' ')}</span>}
                   </td>
                   <td className={row.recorderFailed ? 'text-warn' : ''}>
                     {!row.hasManifest ? '—' :
