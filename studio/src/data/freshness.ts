@@ -33,9 +33,11 @@ export function chassisReading(
   };
 }
 
-// The bridge refreshes the system graph every 250 ms. Four missed refreshes
-// is not jitter: a graph this old, or one held while the socket is down, no
-// longer says what is running now.
+// The bridge sends each client its graph's changes at most every 500 ms, and
+// a deferral notice at least every 750 ms while it holds one back (for the
+// radio budget, or a whole graph within 2 s of the last). A second with
+// neither is not jitter or budget: a graph that old, or one held while the
+// socket is down, no longer says what is running now.
 export const GRAPH_STALE_AFTER_MS = 1000;
 export function graphStale(received_ms: number|null, now_ms: number,
                            connected: boolean): boolean {

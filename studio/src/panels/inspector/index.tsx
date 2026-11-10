@@ -40,8 +40,12 @@ function kindOf(info: ChannelInfo, value: number|undefined): Kind {
 // A numeric sample with precision that follows its magnitude: integers and
 // counters print whole (with thousands separators), everything else prints
 // just enough decimals with trailing zeros trimmed — never "1204.0000".
-function formatValue(value: number): string {
-  if (!Number.isFinite(value)) return '—';
+// An integer channel shows its exact decimal (`exact`), since its number is
+// rounded past 2^53.
+function formatValue(value: number, exact?: string): string {
+  if (exact !== undefined) return integer(exact);
+  // A non-finite reading is shown as what it is: NaN, Infinity, -Infinity.
+  if (!Number.isFinite(value)) return String(value);
   if (Number.isInteger(value)) return integer(value);
   const abs = Math.abs(value);
   const places = abs >= 100 ? 1 : abs >= 10 ? 2 : abs >= 1 ? 3 :
@@ -161,7 +165,7 @@ function InspectorPanel() {
                           kind === 'enum' && Number.isInteger(value) &&
                                   value >= 0 && value < c.labels.length ?
                               c.labels[value] :
-                              formatValue(value)}</b>}</td>
+                              formatValue(value, snapshot?.exact?.[c.name])}</b>}</td>
                   <td>{c.unit || <span className="text-muted">—</span>}</td>
                   <td>{age === null ?
                       <span className="text-muted">—</span> :

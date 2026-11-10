@@ -127,7 +127,7 @@ function workerStudio() {
   const playback = (state: Partial<PlaybackState>) => ({type: 'playback', state: {
     mode: 'LIVE_STREAMING', cursor_ns: '5000000000', clock_ns: '5000000001',
     bounds: {start: '5000000000', end: '5000000000'},
-    stats: {dropped: 0, late: 0, invalid: 0}, status: 'WebSocket connected',
+    stats: {skipped: 0, late: 0, invalid: 0}, status: 'WebSocket connected',
     connection: 'live', ...state
   }});
   const current = () => !sampleStale(

@@ -21,15 +21,16 @@ cc_library(
     ],
 )
 
-# The telemetry JSON views: the latest v2 frame and its dictionary as
-# self-describing documents. Header-only, like :system, so both can be
-# tested without a socket.
+# The telemetry feed's bridge side: page assembly, per-client change-only
+# updates under the egress budget, and the JSON views. Header-only, like
+# :system, so all of it can be tested without a socket.
 cc_library(
     name = "telemetry",
     hdrs = ["telemetry.h"],
     visibility = ["//visibility:public"],
     deps = [
         ":system",
+        "//talOS/telemetry:frames",
         "//talOS/telemetry:schema",
         "@flatbuffers",
     ],
@@ -40,7 +41,10 @@ cc_test(
     size = "small",
     srcs = ["tests/telemetry_test.cc"],
     deps = [
+        ":system",
         ":telemetry",
+        "//talOS/introspection:registry",
+        "//talOS/telemetry:frames",
         "//talOS/telemetry:schema",
         "@flatbuffers",
         "@googletest//:gtest_main",
@@ -67,6 +71,7 @@ cc_binary(
     srcs = ["mock.cc"],
     deps = [
         "//talOS/rtms",
+        "//talOS/telemetry:frames",
         "//talOS/telemetry:schema",
         "//talOS/telemetry:wire",
         "@flatbuffers",

@@ -3,4 +3,3 @@ name = "telemetry"
 node = "//talOS/telemetry:node"
 critical = false
 period_us = 10000
-exclude = ["hw/status/clock_boot_id"]

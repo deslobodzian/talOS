@@ -4,6 +4,9 @@
 
 import * as flatbuffers from 'flatbuffers';
 
+import { ChannelKind } from '../../talos/telemetry/channel-kind.js';
+
+
 export class ChannelInfo {
   bb: flatbuffers.ByteBuffer|null = null;
   bb_pos = 0;
@@ -48,8 +51,13 @@ labelsLength():number {
   return offset ? this.bb!.__vector_len(this.bb_pos + offset) : 0;
 }
 
+kind():ChannelKind {
+  const offset = this.bb!.__offset(this.bb_pos, 10);
+  return offset ? this.bb!.readUint8(this.bb_pos + offset) : ChannelKind.Double;
+}
+
 static startChannelInfo(builder:flatbuffers.Builder) {
-  builder.startObject(3);
+  builder.startObject(4);
 }
 
 static addName(builder:flatbuffers.Builder, nameOffset:flatbuffers.Offset) {
@@ -76,17 +84,22 @@ static startLabelsVector(builder:flatbuffers.Builder, numElems:number) {
   builder.startVector(4, numElems, 4);
 }
 
+static addKind(builder:flatbuffers.Builder, kind:ChannelKind) {
+  builder.addFieldInt8(3, kind, ChannelKind.Double);
+}
+
 static endChannelInfo(builder:flatbuffers.Builder):flatbuffers.Offset {
   const offset = builder.endObject();
   builder.requiredField(offset, 4) // name
   return offset;
 }
 
-static createChannelInfo(builder:flatbuffers.Builder, nameOffset:flatbuffers.Offset, unitOffset:flatbuffers.Offset, labelsOffset:flatbuffers.Offset):flatbuffers.Offset {
+static createChannelInfo(builder:flatbuffers.Builder, nameOffset:flatbuffers.Offset, unitOffset:flatbuffers.Offset, labelsOffset:flatbuffers.Offset, kind:ChannelKind):flatbuffers.Offset {
   ChannelInfo.startChannelInfo(builder);
   ChannelInfo.addName(builder, nameOffset);
   ChannelInfo.addUnit(builder, unitOffset);
   ChannelInfo.addLabels(builder, labelsOffset);
+  ChannelInfo.addKind(builder, kind);
   return ChannelInfo.endChannelInfo(builder);
 }
 }

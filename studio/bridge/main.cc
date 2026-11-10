@@ -5,7 +5,6 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <filesystem>
@@ -27,32 +26,12 @@ namespace fs = std::filesystem;
 namespace {
 volatile std::sig_atomic_t stop = 0;
 void signal_handler(int) { stop = 1; }
-struct EgressBudget {
-  static constexpr double kBytesPerSecond = 160000;
-  static constexpr double kBurstBytes = 64000;
-  // WebSocket framing is charged too, conservatively: a 2-byte header below
-  // 126 payload bytes, otherwise 10.
-  static constexpr std::size_t framed(std::size_t bytes) {
-    return bytes + (bytes < 126 ? 2 : 10);
-  }
-  double tokens = kBurstBytes;
-  std::chrono::steady_clock::time_point updated =
-      std::chrono::steady_clock::now();
-
-  bool available(std::size_t bytes, double rate) {
-    const auto now = std::chrono::steady_clock::now();
-    tokens = std::min(
-        kBurstBytes,
-        tokens + std::chrono::duration<double>(now - updated).count() * rate);
-    updated = now;
-    return tokens >= static_cast<double>(bytes);
-  }
-};
+using studio::EgressBudget;
 struct Client {
   EgressBudget budget;
-  std::uint64_t stream_id = 0;
-  std::uint32_t dictionary_id = 0;
-  bool has_dictionary = false;
+  // What this client has been sent of the graph and the telemetry; its
+  // updates carry only what changed.
+  studio::ClientFeeds feeds;
 };
 // The id of the segment the shared-memory name `segment` holds now, or
 // nullopt while there is none or its creator has not finished initializing
@@ -102,13 +81,16 @@ struct Bridge {
   // client first claim in turn.
   std::size_t first_client = 0;
   us_listen_socket_t* listener = nullptr;
-  std::uint64_t invalid = 0, ws_drops = 0, telemetry_ws_drops = 0,
-                forwarded = 0;
+  // ws_drops counts messages the socket refused; that client is then
+  // resynchronized (the whole graph, a telemetry keyframe). A graph or
+  // telemetry update the budget defers is not counted: the client's next
+  // update carries its changes. forwarded counts complete producer ticks.
+  std::uint64_t invalid = 0, ws_drops = 0, forwarded = 0;
   // Frames the publisher overwrote before this bridge read them: it never
   // waits for the bridge, so a stalled bridge is lapped instead.
   std::uint64_t lapped = 0;
-  // read_next() copies each frame here and validates the copy before
-  // forwarding commits side effects (client sends, counters).
+  // read_next() copies each page here and validates the copy before
+  // ingesting commits side effects (client sends, counters).
   std::vector<std::byte> frame =
       std::vector<std::byte>(talos::telemetry_wire::slot_bytes);
   std::size_t max_clients = 4;
@@ -181,27 +163,49 @@ struct Bridge {
     check_segment();
   }
 
-  bool send(Socket* client, std::string_view bytes, uWS::OpCode opcode) {
-    // Charge WebSocket framing too. Drop rather than queue old observations.
-    const auto size = EgressBudget::framed(bytes.size());
+  // Whether `framed_bytes` fit the client's and the shared bucket now, and
+  // the client has nothing buffered. Spends nothing.
+  bool affordable(Socket* client, std::size_t framed_bytes) {
+    const std::int64_t now = talos::introspect::monotonic_now_ns();
     auto& local = client->getUserData()->budget;
     if (client->getBufferedAmount() != 0 ||
-        !local.available(size, EgressBudget::kBytesPerSecond /
-                                   static_cast<double>(max_clients)) ||
-        !budget.available(size, EgressBudget::kBytesPerSecond)) {
-      ++ws_drops;
-      if (opcode == uWS::OpCode::BINARY) ++telemetry_ws_drops;
+        !local.available(framed_bytes,
+                         EgressBudget::kBytesPerSecond /
+                             static_cast<double>(max_clients),
+                         now) ||
+        !budget.available(framed_bytes, EgressBudget::kBytesPerSecond, now)) {
       return false;
     }
+    return true;
+  }
+
+  // Sends one message the caller found affordable and charges it.
+  bool send_now(Socket* client, std::string_view bytes, uWS::OpCode opcode) {
     if (client->send(bytes, opcode) == Socket::DROPPED) {
       ++ws_drops;
-      if (opcode == uWS::OpCode::BINARY) ++telemetry_ws_drops;
       return false;
     }
-    local.tokens -= static_cast<double>(size);
-    budget.tokens -= static_cast<double>(size);
+    const auto size = EgressBudget::framed(bytes.size());
+    client->getUserData()->budget.spend(size);
+    budget.spend(size);
     egress_bytes += size;
     return true;
+  }
+
+  // Brings one client toward the latest graph and tick: each whole on join,
+  // then change-only updates, the graph first (studio::ClientFeeds).
+  void pump(Socket* client) {
+    client->getUserData()->feeds.Pump(
+        system_graph, telemetry_state, talos::introspect::monotonic_now_ns(),
+        [this, client](std::size_t framed_bytes) {
+          return affordable(client, framed_bytes);
+        },
+        [this, client](std::string_view text) {
+          return send_now(client, text, uWS::OpCode::TEXT);
+        },
+        [this, client](std::string_view page) {
+          return send_now(client, page, uWS::OpCode::BINARY);
+        });
   }
 
   template <typename Send>
@@ -214,25 +218,16 @@ struct Bridge {
     }
   }
 
-  // The decoded v2 feed: latest dictionary and latest aligned frame,
-  // backing /telemetry.json, /channels.json and the dictionary a newly
-  // connected WebSocket client is handed on open.
+  // The decoded feed: latest dictionary and latest complete tick, backing
+  // /telemetry.json, /channels.json and every client's updates.
   studio::TelemetryState telemetry_state;
-
-  void send_dictionary(Socket* client) {
-    if (send(client, telemetry_state.dictionary_frame, uWS::OpCode::BINARY)) {
-      auto& state = *client->getUserData();
-      state.stream_id = telemetry_state.stream_id;
-      state.dictionary_id = telemetry_state.dictionary_id;
-      state.has_dictionary = true;
-    }
-  }
 
   // Opened lazily: the bridge may well start before any node, and a viewer
   // that refuses to run until the robot is up is a viewer you cannot use to
   // watch the robot come up.
   std::optional<talos::introspect::RegistryReader> registry;
-  std::string system_json = "{}";
+  // The latest refresh; empty until the first, so no client is sent "{}".
+  studio::SystemGraphDocument system_graph;
   bool system_json_oversized = false;
   std::int64_t started_wall_ns = talos::introspect::wall_now_ns();
 
@@ -264,27 +259,24 @@ struct Bridge {
     // view exists to surface -- a false one is worse than none.
     input.nodes.push_back(self());
 
-    system_json = studio::SystemGraphJson(input);
+    system_graph = studio::BuildSystemGraph(input);
 
-    // A send must fit the egress burst, so a larger graph is never delivered:
-    // every attempt counts as a ws_drop and Studio marks its last graph stale.
-    // Logged once per crossing, not on every refresh.
+    // A send must fit the egress burst, so a larger graph is never delivered
+    // whole: a client that needs it gets nothing, and Studio marks its last
+    // graph stale. Logged once per crossing, not on every refresh.
     const bool oversized =
-        static_cast<double>(EgressBudget::framed(system_json.size())) >
+        static_cast<double>(EgressBudget::framed(system_graph.json.size())) >
         EgressBudget::kBurstBytes;
     if (oversized && !system_json_oversized) {
-      std::cerr << "system graph is " << system_json.size() << " B, over the "
+      std::cerr << "system graph is " << system_graph.json.size()
+                << " B, over the "
                 << EgressBudget::kBurstBytes
                 << " B WebSocket egress burst; clients will not receive it "
                    "(/system.json still serves it)\n";
     }
     system_json_oversized = oversized;
-
-    // Text on the WebSocket, so a client tells the two message families apart
-    // by frame type and needs no sniffing.
-    for_each_client([this](Socket* client) {
-      send(client, system_json, uWS::OpCode::TEXT);
-    });
+    // Clients are sent it by pump(), as text on the WebSocket, so a client
+    // tells the two message families apart by frame type.
   }
 
   // This process as the registry would have described it, had it a slot.
@@ -301,69 +293,55 @@ struct Bridge {
 
     talos::introspect::SourceSnapshot source;
     // A watcher, not a fetcher: the reader is registered with
-    // ReadMode::SEQUENCE, so it sees every frame in order rather than only the
-    // newest, unless the publisher laps it. Both lapped frames and frames
-    // dropped on the way to clients count as dropped.
+    // ReadMode::SEQUENCE, so it sees every page in order rather than only the
+    // newest, unless the publisher laps it. Lapped pages and the ticks they
+    // left incomplete count as dropped; a deferred client update loses
+    // nothing, so it does not.
     source.kind = talos::event::SourceKind::WATCHER;
     source.name = topic;
     source.message_bytes =
         static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes);
     source.events = forwarded;
-    source.dropped = telemetry_ws_drops + lapped;
+    source.dropped = lapped + telemetry_state.incomplete_ticks;
     source.sequence = queue ? queue->writer_sequence() : 0;
     node.sources.push_back(std::move(source));
     return node;
   }
 
   void poll() {
-    if (!queue) return;
-    // Bound work so HTTP and client socket processing cannot starve.
-    for (unsigned count = 0; count < 256; ++count) {
-      MessageInfo info;
-      const auto result = queue->read_next(reader, frame, info);
-      if (result == ReadResult::TORN) {
-        ++invalid;
-        continue;
-      }
-      if (result != ReadResult::OK) break;
-      lapped += info.dropped;
-      auto bytes = talos::telemetry_wire::payload(frame);
-      if (bytes.empty()) {
-        ++invalid;
-        continue;
-      }
-      if (!studio::IngestTelemetry(telemetry_state, bytes,
-                                   talos::introspect::monotonic_now_ns())) {
-        ++invalid;
-        continue;
-      }
-      // Forward only frames a client can decode: one aligned with the cached
-      // dictionary (a dictionary frame aligns with itself). A value frame that
-      // arrives before any dictionary is ingested above but not sent, so the
-      // first binary frame every client sees is a dictionary frame.
-      const auto* decoded =
-          Talos::Telemetry::GetSizePrefixedFrame(bytes.data());
-      const bool aligned =
-          telemetry_state.has_dictionary && decoded != nullptr &&
-          decoded->stream_id() == telemetry_state.stream_id &&
-          decoded->dictionary_id() == telemetry_state.dictionary_id &&
-          decoded->values() != nullptr &&
-          decoded->values()->size() == telemetry_state.dictionary.size();
-      if (!aligned) continue;
-      ++forwarded;
-      for_each_client([this, bytes](Socket* client) {
-        const auto& state = *client->getUserData();
-        if (!state.has_dictionary ||
-            state.stream_id != telemetry_state.stream_id ||
-            state.dictionary_id != telemetry_state.dictionary_id) {
-          // A budget drop must not strand a viewer without its dictionary.
-          // Withhold values so its bucket can refill enough to retry.
-          send_dictionary(client);
-          return;
+    if (queue) {
+      // Bound work so HTTP and client socket processing cannot starve.
+      for (unsigned count = 0; count < 256; ++count) {
+        MessageInfo info;
+        const auto result = queue->read_next(reader, frame, info);
+        if (result == ReadResult::TORN) {
+          ++invalid;
+          continue;
         }
-        send(client, bytes, uWS::OpCode::BINARY);
-      });
+        if (result != ReadResult::OK) break;
+        lapped += info.dropped;
+        auto bytes = talos::telemetry_wire::payload(frame);
+        if (bytes.empty()) {
+          ++invalid;
+          continue;
+        }
+        const bool had_frame = telemetry_state.has_frame;
+        const std::uint64_t sequence = telemetry_state.sequence_id;
+        if (!studio::IngestTelemetry(telemetry_state, bytes,
+                                     talos::introspect::monotonic_now_ns())) {
+          ++invalid;
+          continue;
+        }
+        if (telemetry_state.has_frame &&
+            (!had_frame || telemetry_state.sequence_id != sequence)) {
+          ++forwarded;
+        }
+      }
     }
+    // Every poll, not only on a new tick: an update the budget deferred goes
+    // out as soon as the budget refills, and a quiet stream still sends its
+    // heartbeat.
+    for_each_client([this](Socket* client) { pump(client); });
   }
 };
 std::string mime(const fs::path& p) {
@@ -550,17 +528,13 @@ int main(int argc, char** argv) try {
   };
   behavior.open = [&](auto* ws) {
     bridge.clients.push_back(ws);
-    // Send the current graph immediately: a client that has to wait for the
-    // next refresh opens on an empty system view.
-    bridge.send(ws, bridge.system_json, uWS::OpCode::TEXT);
-    // Then the cached dictionary frame, so the client's first value frame
-    // is already decodable instead of waiting up to a second for the next
-    // dictionary the producer schedules. Its values are as old as the last
-    // telemetry received -- possibly from before telemetry stopped -- so the
-    // client treats this first binary message as of unknown age.
-    if (bridge.telemetry_state.has_dictionary) {
-      bridge.send_dictionary(ws);
-    }
+    // The current graph at once, so the client does not open on an empty
+    // system view, then the dictionary and a keyframe of the latest tick, so
+    // it starts with every channel instead of waiting for the next dictionary
+    // the producer schedules. That tick is as old as the last telemetry
+    // received -- possibly from before telemetry stopped -- so the client
+    // treats its first update as of unknown age.
+    bridge.pump(ws);
   };
   behavior.close = [&](auto* ws, int, std::string_view) {
     std::erase(bridge.clients, ws);
@@ -592,7 +566,7 @@ int main(int argc, char** argv) try {
   app.get("/system.json", [&](auto* res, auto*) {
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
-        ->end(bridge.system_json);
+        ->end(bridge.system_graph.json);
   });
   app.get("/declared.json", [&](auto* res, auto*) {
     // 404 rather than an empty document: "no declared graph was given" and "the
@@ -681,12 +655,14 @@ int main(int argc, char** argv) try {
   if (!timer) throw std::runtime_error("poll timer allocation failed");
   *static_cast<Bridge**>(us_timer_ext(timer)) = &bridge;
   // One timer at the telemetry rate; the system graph is structure, not
-  // signal, so it refreshes every 250th tick instead. Each refresh is re-sent
-  // even when the structure is unchanged: Studio marks the graph stale when
-  // none arrives within GRAPH_STALE_AFTER_MS (studio/src/data/freshness.ts),
-  // and measures node rates from successive graphs' counters.
-  static constexpr unsigned kSystemRefreshTicks = 250;
-  static unsigned ticks = 0;
+  // signal, so it refreshes every 250 ms instead, by the clock: under load a
+  // 1 ms timer fires late, and counting ticks stretched the refresh past
+  // GRAPH_STALE_AFTER_MS (studio/src/data/freshness.ts). Each client is sent
+  // its changed counters at most every GraphFeed::kUpdateNs (or a deferral
+  // notice), so Studio keeps measuring node rates from successive graphs'
+  // counters and never marks a merely deferred graph stale.
+  static constexpr std::int64_t kSystemRefreshNs = 250'000'000;
+  static std::int64_t refreshed_ns = talos::introspect::monotonic_now_ns();
   bridge.refresh_system();
   us_timer_set(
       timer,
@@ -701,8 +677,9 @@ int main(int argc, char** argv) try {
         }
         b->watch();
         b->poll();
-        if (++ticks >= kSystemRefreshTicks) {
-          ticks = 0;
+        const std::int64_t now_ns = talos::introspect::monotonic_now_ns();
+        if (now_ns - refreshed_ns >= kSystemRefreshNs) {
+          refreshed_ns = now_ns;
           b->refresh_system();
         }
       },

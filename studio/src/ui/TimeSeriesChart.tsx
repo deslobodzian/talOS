@@ -17,7 +17,7 @@ export type ChartLine = {
   color: string;
   dash?: boolean;               // dashed stroke
   times?: ArrayLike<number>;    // x positions; omit to use the sample index
-  values: ArrayLike<number>;    // y; NaN = a gap (the line breaks)
+  values: ArrayLike<number>;    // y; NaN or infinite = a gap (the line breaks)
 };
 
 export type ChartBand = {start: number; end: number};  // in the x domain

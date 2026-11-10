@@ -226,7 +226,7 @@ function populatedStudio(passiveOnly = false): Studio {
     playback: {
       mode: 'PAUSED', cursor_ns: frames[2].timestamp_ns,
       bounds: {start: frames[0].timestamp_ns, end: frames[2].timestamp_ns},
-      stats: {dropped: 0, late: 0, invalid: 0}, status: 'Demo',
+      stats: {skipped: 0, late: 0, invalid: 0}, status: 'Demo',
       connection: 'demo'
     },
     system: {

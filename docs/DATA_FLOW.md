@@ -54,8 +54,8 @@ For processor ownership and layer boundaries, see
 | Camera nodes → pose_estimator / telemetry | Shared-memory `/<camera>/state`, `/<camera>/status` | Four configured camera nodes: status each 100 Hz node tick; live observations once per processed frame, up to 60 fps, not republished at the node rate. |
 | drivetrain → pose_estimator | Shared-memory `/drivetrain/state` | 200 Hz publication; estimator updates every 20000 µs (50 Hz), fusing latest odometry and every valid camera observation delivered since the previous update (in sequence, queued by subscription callbacks). |
 | `sim_gateway --physics` → simulated cameras / telemetry | Shared-memory `/sim/state` | Every physics/hardware tick (200 Hz); main-processor node-clock timestamp, true field pose and field-frame velocity. No writer under ideal or WPILib/RoboRIO simulation. |
-| Nodes → telemetry → studio_bridge | Shared-memory states/statuses → `/talos/telemetry` byte topic | Telemetry period 10000 µs = 100 Hz; dictionary first frame and every 100th frame (1 Hz at this rate). |
-| studio_bridge ↔ browser/agent | HTTP + WebSocket, configured port 5800 | Forwards telemetry frames as available; initial graph/dictionary on connection. HTTP requests and graph refresh are not the 100 Hz value stream. |
+| Nodes → telemetry → studio_bridge | Shared-memory states/statuses → `/talos/telemetry` byte topic | Telemetry period 10000 µs = 100 Hz, each tick as one or more value pages; dictionary pages before the first tick and every 100th (1 Hz at this rate). |
+| studio_bridge ↔ browser/agent | HTTP + WebSocket, configured port 5800 | Per client: graph, dictionary pages and a keyframe on connection, then change-only telemetry updates of at most one per producer tick and system-graph value updates of at most one per 500 ms (the whole graph again when its structure changes), deferred and coalesced when the egress budget is short. HTTP requests are not the value stream. |
 
 Camera observation timestamps describe exposure, not publication. Measure
 timestamp bias during [camera bring-up](BRINGUP.md#camera-intrinsics-calibration).
@@ -249,10 +249,10 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | `/shooter/state`: shooter → telemetry | 40 | 32 B ShooterState, including FlatBuffers padding |
 | `/motor/state` (bench only): motor → telemetry/logs | 96 | 88 B MotorState including device temperature and supply current; pinned in bench motor node |
 | `/<camera>/state`: each camera → estimator/telemetry | 72 | 64 B geometry.PoseObservation, including padding |
-| `/<camera>/status`: each camera → telemetry | 96 | 88 B vision.VisionStatus, pinned in vision.h; append-only reconnect/stall/control-failure counters and controls_applied are excluded from robot telemetry, preserving its value-frame budget |
+| `/<camera>/status`: each camera → telemetry | 96 | 88 B vision.VisionStatus, pinned in vision.h; every field, counters included, reaches telemetry |
 | `/pose_estimator/state`: estimator → telemetry | 80 | 72 B geometry.PoseEstimate; `valid` = fresh usable odometry, `localized` = established field-frame trust; `localized` sits in existing payload padding |
 | `/sim/state`: physics sim_gateway → four simulated cameras / telemetry | 64 | 56 B geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
-| `/talos/telemetry`: telemetry → studio_bridge | 16392 × 64 slots | 16384 B byte payload capacity; ring = 1049088 B of slot storage; the writer overwrites, so a reader more than 63 frames (0.63 s at 100 Hz) behind is lapped and counts the missed frames, and a stalled reader never stops publication; actual frames have padding stripped before WebSocket forwarding |
+| `/talos/telemetry`: telemetry → studio_bridge | 16392 × 64 slots | 16384 B byte payload capacity; ring = 1049088 B of slot storage; the writer overwrites, so a reader more than 63 pages behind (about 0.3 s at 100 Hz with two value pages a tick) is lapped and counts the missed pages, and a stalled reader never stops publication; the bridge never applies a tick it lost a page of |
 
 Sources: `talOS/hardware/packet.h`, `talOS/bridge/bridge_status.fbs`,
 `talOS/devices/target.h`, `talOS/msgs/geometry.fbs`, robot `*_message.fbs`,
@@ -317,56 +317,90 @@ stops capture at the cap instead.
 
 ## Telemetry, Studio, and the radio boundary
 
-Telemetry emits size-prefixed FlatBuffers `Frame`s: a **4-byte** little-endian
-length followed by a `TLM2` buffer. Value-only frames are dynamically sized by
-channel count but limited to **1200 B including the prefix**; the producer builds
-a worst-case frame at startup and refuses an over-budget dictionary. Dictionary
-frames are larger/variable, bounded by the **16384 B** slot. Each dictionary
-name, unit and enum label is at most **256 B**, and an enum channel carries at
-most **1024** labels (`wire.h`); Studio's decoder accepts exactly these limits,
-and the producer never emits past them
-([telemetry README](../talOS/telemetry/README.md#transport-budget)).
-First/every-100th-frame dictionaries allow late join/recovery in about a second
-at 100 Hz.
+Telemetry emits size-prefixed FlatBuffers `Frame` pages: a **4-byte**
+little-endian length followed by a `TLM3` buffer. A tick is as many **value
+pages** as its channels need, each at most **1200 B including the prefix**
+(12 B per sample); a dictionary is as many **dictionary pages** as it needs,
+each at most one **16384 B** slot. A dictionary holds at most **2048**
+channels (`kMaxChannels`): a keyframe of that many, at most 25 pages with
+WebSocket framing, is at most 30,250 B, inside the bridge's **64,000 B** burst,
+which an update must fit to be sent whole (`static_assert` in `wire.h`). The
+producer refuses construction past the cap, naming the largest sources, and
+refuses a channel whose dictionary entry alone cannot fit one page. Each dictionary name, unit and enum label is at most **256 B**, and an
+enum channel carries at most **1024** labels (`wire.h`); Studio's decoder
+accepts exactly these limits, and the producer never emits past them
+([telemetry README](../talOS/telemetry/README.md#transport-budget)). Dictionary
+pages before the first tick and every 100th allow late join and recovery in
+about a second at 100 Hz. Integer fields travel as exact 64-bit integers, so no
+channel is excluded for precision either.
 
-The 2026 configuration excludes cumulative camera counters, the 64-bit
-`hw/status/clock_boot_id` (a double cannot carry it exactly),
-`hw/status/clock_offset_uncertainty_us`, `hw/status/clock_min_round_trip_us`,
-and the simulator's timestamp/velocity at
-channel level (`subsystems/telemetry.toml`), retaining
-camera health, timing, dropped-frame and visible-tag diagnostics. Excludes match
-topics or individual dictionary channels; only retained channels count.
+Every 2026 and bench state and status channel is published; the telemetry
+configs exclude nothing. The declared graphs report their pages at
+construction (`MeasurePages` in `talOS/telemetry/frames.h`):
 
-The declared graphs report their budgets through the producer's
-`MeasureValueFrameBytes` / `MeasureDictionaryFrameBytes`:
+| Graph | Channels | Value pages per tick (worst case) | Dictionary |
+|---|---:|---:|---:|
+| `robot.toml`, `robot_field.toml` | 161 | 2, 2248 B (largest 1192 / 1200 B) | 2 pages, 10400 B |
+| `robot_physics_sim.toml` + `--sim --start-sim-gateway --sim-gateway-arg --physics` | 168 | 2, 2336 B (largest 1192 / 1200 B) | 2 pages, 10800 B |
+| Bench `robot.toml`, `robot_bench.toml` | 54 | 1, 808 B | 1 page, 3200 B |
 
-| Graph | Channels | Worst-case value frame | Spare channels | Dictionary frame |
-|---|---:|---:|---:|---:|
-| `robot.toml`, `robot_field.toml` | 130 | 1168 / 1200 B | 4 | 8984 / 16384 B |
-| `robot_physics_sim.toml` + `--sim --start-sim-gateway --sim-gateway-arg --physics` | 133 | 1192 / 1200 B | 1 | 9152 / 16384 B |
-| Bench `robot.toml`, `robot_bench.toml` (temperature/supply included) | 53 | 552 / 1200 B | 81 | 3408 / 16384 B |
-
-A graph over the cap makes telemetry refuse construction with the largest
-sources named; `--describe-only` then reports telemetry as not described and
-`talos_graph_test` fails, so the overflow is caught in CI rather than as missing
-Studio data. The physics-sim graph has one spare channel: a new state scalar
-needs an exclude (or a frame-format change) in the same commit.
-
-Studio's bridge forwards the occupied frame, not 16384 bytes of padding. At the
-value cap, `1200×8×100` = **0.96 Mbit/s per connected client**, before TCP/IP,
-WebSocket, retransmission, dictionary and graph overhead. The value cap leaves
-room under a normal MTU, but TCP is a byte stream: segmentation/coalescing is not
-a guaranteed one-WebSocket-frame-per-IP-packet contract. Dictionary frames can
-span multiple TCP segments.
+Studio's bridge sends each client its own updates
+(`ClientFeed` in [`studio/bridge/telemetry.h`](../studio/bridge/telemetry.h)):
+the dictionary pages and a keyframe of the latest tick on connection, then
+only the channels whose value or presence changed since what that client last
+received, stamped with the tick's `sequence_id` and `timestamp_ns`, and an
+empty update every 100 ms when nothing changed. An update goes out only when
+the budget affords all of it; otherwise it waits and the next one carries
+every change since, so a client's view is always one whole producer tick.
+**The live view therefore
+skips intermediate samples whenever the budget is short; each node's event log
+is the complete record.**
 
 Studio's bridge charges every WebSocket send, with conservative framing
 overhead, against a shared **160,000 B/s** token bucket with a **64,000 B**
-burst (`EgressBudget` in `studio/bridge/main.cc`). Each client also has a
+burst (`EgressBudget` in `studio/bridge/telemetry.h`). Each client also has a
 `160000 / max_clients` B/s bucket with the same burst; `[studio] max_clients`
-defaults to **4** (range **1–64**). Each send to the clients starts one client
-later than the last, so every client gets first claim on the shared bucket in
-turn. HTTP snapshots and static files are outside this budget. Over budget,
-the bridge drops observations rather than queueing them.
+defaults to **4** (range **1–64**). Each pass over the clients starts one
+client later than the last, so every client gets first claim on the shared
+bucket in turn. HTTP snapshots and static files are outside this budget.
+
+160,000 B/s is **1.28 Mbit/s, 32 %** of the **4 Mbit/s** per-team field
+bandwidth limit that WPILib's networking documentation and the FMS whitepaper
+state, citing 2026 manual rule R704. Both the figure and the rule number are
+unverified against the 2026 manual text itself; the event's current
+allocation is authoritative. Before
+TCP/IP and WebSocket overhead, measured in a scripted physics-sim match
+(`robot_physics_sim.toml`, disabled 3 s / autonomous 14 s / teleop 30 s, one
+viewer):
+
+| Viewer budget | Telemetry bytes/s | System graph bytes/s | Telemetry updates/s | Total, whole run |
+|---|---:|---:|---:|---:|
+| 160,000 B/s (`max_clients = 1`) | 46,700–72,200 disabled/autonomous; 57,700–62,600 teleop | 5,500–12,000 | 96–100 (every tick) | 69,500 B/s |
+| 40,000 B/s (default 4-client share) | 27,500–34,300 | 5,600–11,900 | 37–94, typically 45–55 | 39,700 B/s |
+
+A full keyframe every tick would be 2336 B, 233,600 B/s. The system graph
+(about 40 KB whole: 15 nodes, 94 sources, 28 topics) goes to a client whole
+only on connect and when its structure changes; otherwise its fast values
+(about 5.5 KB) go at most every 500 ms when they changed
+(`GraphFeed` in [`studio/bridge/system.h`](../studio/bridge/system.h);
+protocol in the [bridge README](../studio/bridge/README.md)). A client's graph
+messages go before its telemetry: while one waits for budget, telemetry is
+thinned to one update per 250 ms, so the graph is never starved and no
+reading goes stale; at the default share updates arrived every 500–720 ms
+and no deferral notice was needed. Both rows stay within their budget over
+the run; a single second can exceed the rate by up to the 64,000 B burst.
+
+The cost falls on structure changes. A whole graph is about a second of the
+default share, so after a node starts, stops or restarts, that client's
+telemetry runs at four updates a second for about a second while the graph
+goes. A whole graph goes at most every 2 s: in a crash loop, a client's
+graph shows restarts up to 2 s late (marked deferred, not stale), and its
+telemetry is thinned for about a second of every two.
+
+The value-page cap leaves room under a normal MTU, but TCP is a byte stream:
+segmentation and coalescing are not a guaranteed
+one-WebSocket-frame-per-IP-packet contract, and dictionary pages span several
+TCP segments.
 
 The `[studio]` HTTP/WebSocket port is **5800**. Browser traffic to a driver laptop
 crosses the robot radio and shares the team's field allocation with DS, other
@@ -374,8 +408,8 @@ telemetry and video. RIO↔main-processor UDP stays on the robot's wired switch 
 is not charged against wireless throughput. Local USB camera images also do not
 consume that budget unless separately streamed off-robot (this path does not).
 
-The event's current radio/manual allocation remains authoritative. The
-calculation above is not an overhead-inclusive measured throughput total.
+The rates above are WebSocket payload plus frame headers, measured on
+loopback; they exclude TCP/IP overhead and retransmission.
 
 ## What never crosses the hardware UDP link
 

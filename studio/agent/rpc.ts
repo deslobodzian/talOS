@@ -77,8 +77,18 @@ function timestamp(value: unknown): bigint {
   return parsed;
 }
 
+// A channel's value: its number, or for an integer channel whose number is
+// not exact (past 2^53) its exact decimal string. A NaN or infinite reading
+// is its number here; `answer` spells it for JSON. Other topics walk the
+// snapshot.
 function topicValue(frame: Snapshot, topic: string): unknown {
-  if (Object.hasOwn(frame.channels, topic)) return frame.channels[topic];
+  if (Object.hasOwn(frame.channels, topic)) {
+    const value = frame.channels[topic];
+    const exact = frame.exact;
+    return exact && Object.hasOwn(exact, topic) && !Number.isSafeInteger(value) ?
+        exact[topic] :
+        value;
+  }
   let value: unknown = frame;
   for (const part of topic.split('.')) {
     if (['__proto__', 'prototype', 'constructor'].includes(part) || !value ||
@@ -88,6 +98,67 @@ function topicValue(frame: Snapshot, topic: string): unknown {
   }
   return value;
 }
+
+// A value as an answer carries it: JSON has no NaN or infinities, which
+// JSON.stringify would turn into null (absence), so they are the strings
+// "NaN", "Infinity" and "-Infinity", as in the bridge's JSON.
+const answer = (value: unknown) =>
+    typeof value === 'number' && !Number.isFinite(value) ? String(value) : value;
+
+const KIND_NAMES = ['double', 'int', 'uint', 'bool'];
+
+// A snapshot as an answer: channels as `topicValue` reads them, spelled by
+// `answer`, and each channel's kind by name. (The exact decimals are in
+// `channels`, so `exact` is not repeated.)
+function snapshotAnswer(frame: Snapshot): Record<string, unknown> {
+  const {exact: _exact, kinds, channels, ...rest} = frame;
+  const out: Record<string, unknown> = {...rest};
+  const values: Record<string, unknown> = Object.create(null);
+  for (const name of Object.keys(channels))
+    values[name] = answer(topicValue(frame, name));
+  out.channels = values;
+  if (kinds) {
+    const names: Record<string, string> = Object.create(null);
+    for (const [name, kind] of Object.entries(kinds))
+      names[name] = KIND_NAMES[kind] ?? 'unknown';
+    out.kinds = names;
+  }
+  return out;
+}
+
+// -1, 0 or 1 as `value` is below, at or above `limit`, null when it is not a
+// number or is NaN (which orders with nothing); an exact integer string
+// compares exactly against an integer limit.
+function compare(value: unknown, limit: number): number|null {
+  if (typeof value === 'string' && /^-?\d+$/.test(value)) {
+    if (Number.isInteger(limit)) {
+      const a = BigInt(value), b = BigInt(limit);
+      return a < b ? -1 : a > b ? 1 : 0;
+    }
+    value = Number(value);
+  }
+  if (typeof value !== 'number' || Number.isNaN(value)) return null;
+  return value < limit ? -1 : value > limit ? 1 : 0;
+}
+
+// Equality with an exact integer string accepts the same integer as a
+// number or as its decimal string.
+function same(value: unknown, limit: unknown): boolean {
+  if (typeof value === 'string' && typeof limit === 'number' &&
+      Number.isInteger(limit) && /^-?\d+$/.test(value))
+    return BigInt(value) === BigInt(limit);
+  return value === limit;
+}
+
+// Whether two successive readings differ: NaN is the same reading as NaN.
+const differs = (value: unknown, previous: unknown) =>
+    value !== previous &&
+    !(Number.isNaN(value as number) && Number.isNaN(previous as number) &&
+      typeof value === 'number' && typeof previous === 'number');
+
+const truthy = (value: unknown) =>
+    typeof value === 'string' && /^-?\d+$/.test(value) ? BigInt(value) !== 0n :
+                                                        Boolean(value);
 
 function topicList(value: unknown): string[] {
   if (!Array.isArray(value) || value.some(t => typeof t !== 'string') ||
@@ -134,9 +205,10 @@ export function dispatch(
     const ageMs = timeline.lastArrivalMs ?
         Math.max(0, Date.now() - timeline.lastArrivalMs) :
         null;
+    const snapshot = snapshotAnswer(frame);
     return {
-      ...frame,
-      snapshot: frame,
+      ...snapshot,
+      snapshot,
       age_ms: ageMs,
       age_ns: ageMs === null ? null : String(Math.round(ageMs * 1e6))
     };
@@ -173,12 +245,12 @@ export function dispatch(
     if (!frame ||
         (params.mode !== 'at_or_before' && BigInt(frame.timestamp_ns) !== t))
       throw new RpcFault(-32001, 'No retained sample at requested timestamp');
-    if (params.topics === undefined) return frame;
+    if (params.topics === undefined) return snapshotAnswer(frame);
     const values: Record<string, unknown> = {};
     for (const topic of topicList(params.topics)) {
       const value = topicValue(frame, topic);
       if (value === undefined) invalid(`Unknown topic: ${topic}`);
-      Object.defineProperty(values, topic, {value, enumerable: true});
+      Object.defineProperty(values, topic, {value: answer(value), enumerable: true});
     }
     return {
       timestamp_ns: frame.timestamp_ns,
@@ -226,31 +298,31 @@ export function dispatch(
       if (value !== undefined && inBounds) {
         switch (op) {
           case 'gt':
-            matches = typeof value === 'number' && value > (limit as number);
+            matches = (compare(value, limit as number) ?? 0) > 0;
             break;
           case 'gte':
-            matches = typeof value === 'number' && value >= (limit as number);
+            matches = (compare(value, limit as number) ?? -1) >= 0;
             break;
           case 'lt':
-            matches = typeof value === 'number' && value < (limit as number);
+            matches = (compare(value, limit as number) ?? 0) < 0;
             break;
           case 'lte':
-            matches = typeof value === 'number' && value <= (limit as number);
+            matches = (compare(value, limit as number) ?? 1) <= 0;
             break;
           case 'eq':
-            matches = value === limit;
+            matches = same(value, limit);
             break;
           case 'ne':
-            matches = value !== limit;
+            matches = !same(value, limit);
             break;
           case 'changed':
-            matches = seen && value !== previous;
+            matches = seen && differs(value, previous);
             break;
           case 'rising':
-            matches = seen && !previous && Boolean(value);
+            matches = seen && !truthy(previous) && truthy(value);
             break;
           case 'falling':
-            matches = seen && Boolean(previous) && !value;
+            matches = seen && truthy(previous) && !truthy(value);
             break;
         }
       }

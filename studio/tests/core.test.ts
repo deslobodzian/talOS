@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
-import {Builder} from 'flatbuffers';
+import {Builder, ByteBuffer} from 'flatbuffers';
 
 import {
   channelDisplay,
@@ -15,6 +15,7 @@ import {
   Timeline,
 } from '../src/core';
 import {demoPacket, demoSystemGraph} from '../src/demo';
+import {ChannelKind, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
 import {ChannelInfo} from '../src/generated/talos/telemetry/channel-info';
 import {Frame} from '../src/generated/talos/telemetry/frame';
 import {Pose} from '../src/generated/talos/telemetry/pose';
@@ -27,40 +28,74 @@ const frame = (i: number) => {
   return decoder.decode(demoPacket(BigInt(i)))!;
 };
 
-// A bare value frame (no dictionary) for `dictionaryId`, built the way a
-// producer builds every later frame. Options also support custom dictionaries,
-// one label vector every dictionary entry shares, and chassis headings for
-// decoder-level tests.
+const DEMO_CHANNEL_COUNT = 11;
+
+// One keyframe value page for `dictionaryId` (a number is a double sample,
+// NaN and the infinities included; null is absent; a bigint is an integer
+// channel's raw sample), preceded by a
+// dictionary page when `options.dictionary` names its channels. Options also
+// support one label vector every dictionary entry shares, per-channel kinds,
+// and chassis headings for decoder-level tests.
 function valueFrame(sequence: bigint, dictionaryId: number,
-                    values: number[], streamId = 42n,
-                    options: {dictionary?: string[]; labels?: string[]; yaw?: number;
+                    values: (number|bigint|null)[], streamId = 42n,
+                    options: {dictionary?: string[]; labels?: string[];
+                              kinds?: ChannelKind[]; yaw?: number;
                               missingChassis?: boolean} = {}): Uint8Array {
+  const count = options.dictionary?.length ??
+      (dictionaryId === 1 ? DEMO_CHANNEL_COUNT : values.length);
   const b = new Builder(256);
-  const labels = options.labels &&
-      ChannelInfo.createLabelsVector(
-          b, options.labels.map(label => b.createString(label)));
-  const dictionary = options.dictionary ?
-      Frame.createDictionaryVector(b, options.dictionary.map(name => {
-        const text = b.createString(name);
-        ChannelInfo.startChannelInfo(b);
-        ChannelInfo.addName(b, text);
-        if (labels !== undefined) ChannelInfo.addLabels(b, labels);
-        return ChannelInfo.endChannelInfo(b);
-      })) :
-      undefined;
-  const vector = Frame.createValuesVector(b, values);
+  const header = (frameBuilder: Builder) => {
+    Frame.addStreamId(frameBuilder, streamId);
+    Frame.addSequenceId(frameBuilder, sequence);
+    Frame.addTimestampNs(frameBuilder, 1000000000n + sequence * 20000000n);
+    Frame.addDictionaryId(frameBuilder, dictionaryId);
+    Frame.addPageCount(frameBuilder, 1);
+    Frame.addChannelCount(frameBuilder, count);
+  };
+  const pages: Uint8Array[] = [];
+  if (options.dictionary) {
+    const labels = options.labels &&
+        ChannelInfo.createLabelsVector(
+            b, options.labels.map(label => b.createString(label)));
+    const dictionary = Frame.createDictionaryVector(
+        b, options.dictionary.map((name, i) => {
+          const text = b.createString(name);
+          ChannelInfo.startChannelInfo(b);
+          ChannelInfo.addName(b, text);
+          if (labels !== undefined) ChannelInfo.addLabels(b, labels);
+          ChannelInfo.addKind(b, options.kinds?.[i] ?? ChannelKind.Double);
+          return ChannelInfo.endChannelInfo(b);
+        }));
+    Frame.startFrame(b);
+    header(b);
+    Frame.addDictionary(b, dictionary);
+    Frame.finishSizePrefixedFrameBuffer(b, Frame.endFrame(b));
+    pages.push(b.asUint8Array().slice());
+    b.clear();
+  }
+  const carried = values.flatMap((value, i): [number, bigint][] =>
+      typeof value === 'bigint' ? [[i, value]] :
+      value === null            ? [] :
+                                  [[i, rawFromDouble(value)]]);
+  const channels = Frame.createChannelsVector(b, carried.map(([i]) => i));
+  const raws = Frame.createValuesVector(b, carried.map(([, raw]) => raw));
   Frame.startFrame(b);
-  Frame.addStreamId(b, streamId);
-  Frame.addSequenceId(b, sequence);
-  Frame.addTimestampNs(b, 1000000000n + sequence * 20000000n);
-  Frame.addDictionaryId(b, dictionaryId);
-  Frame.addValues(b, vector);
-  if (dictionary !== undefined) Frame.addDictionary(b, dictionary);
+  header(b);
+  Frame.addKeyframe(b, true);
+  Frame.addChannels(b, channels);
+  Frame.addValues(b, raws);
   if (!options.missingChassis)
     Frame.addChassis(
         b, Pose.createPose(b, 1, 2, 0, 0, 0, options.yaw ?? 0));
   Frame.finishSizePrefixedFrameBuffer(b, Frame.endFrame(b));
-  return b.asUint8Array();
+  pages.push(b.asUint8Array().slice());
+  const out = new Uint8Array(pages.reduce((n, page) => n + page.length, 0));
+  let p = 0;
+  for (const page of pages) {
+    out.set(page, p);
+    p += page.length;
+  }
+  return out;
 }
 
 test(
@@ -70,7 +105,7 @@ test(
       assert.ok(decoder.decode(demoPacket(0n)));
       const f = decoder.decode(valueFrame(
           9007199254740993n, 1,
-          [1.75, 0, 12, 2, 0, 0, 0, 1]))!;
+          [1.75, 0, 12, 2, 0, 0, 0, 1n]))!;
       assert.equal(f.sequence_id, '9007199254740993');
       assert.equal(f.stream_id, '42');
       assert.equal(f.dictionary_id, 1);
@@ -83,56 +118,119 @@ test(
       assert.deepEqual(f.labels.mode, ['disabled', 'teleop', 'auto']);
       assert.equal(channelDisplay(f, 'mode'), 'teleop');
     });
-test('a value frame with an unknown dictionary is held, not fatal', () => {
+// No channel cap: an update spread over several pages is one snapshot, at
+// its last page, carrying every channel; integers keep every digit.
+test('a paged update decodes to one snapshot with exact integers', () => {
+  const channels = Array.from({length: 200}, (_, i) => ({
+    name: `test/state/channel_${i}`, unit: '',
+    kind: i === 0 ? ChannelKind.UInt : i === 1 ? ChannelKind.Int :
+                                         ChannelKind.Double
+  }));
+  const header = {streamId: 7n, sequenceId: 5n, timestampNs: 9n,
+                  dictionaryId: 3, channelCount: channels.length};
+  const samples: [number, bigint][] = channels.map((_, i) => [
+    i, i === 0 ? 2n ** 64n - 1n :
+       i === 1 ? BigInt.asUintN(64, -(2n ** 63n)) :
+                 rawFromDouble(i + .5)
+  ]);
+  const pages = encodeValuePages(
+      header, {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0}, true, samples);
+  assert.ok(pages.length >= 3);
   const decoder = new TelemetryDecoder();
-  assert.equal(decoder.decode(valueFrame(5n, 9, [3])), null);
-  assert.equal(decoder.heldCount, 1);
-  const resolved = decoder.decodeAll(demoPacket(0n));
-  // demoPacket(0) uses dictionary 1, so the held frame for 9 stays held.
-  assert.equal(resolved.length, 1);
-  const other = new TelemetryDecoder();
-  assert.equal(other.decode(valueFrame(5n, 1, [3, 0, 12, 2, 0, 0, 0, 0])), null);
-  const unblocked = other.decodeAll(demoPacket(0n));
-  assert.equal(unblocked.length, 2);
-  assert.equal(unblocked[1].sequence_id, '5');
-  assert.equal(unblocked[1].channels.velocity, 3);
-});
-test('held frames and their dictionary frame resolve in sequence order', () => {
-  const decoder = new TelemetryDecoder();
-  const later = valueFrame(9007199254740993n, 9, [2]);
-  const earlier = valueFrame(9007199254740992n, 9, [1]);
-  assert.deepEqual(decoder.decodeFrames(later), []);
-  assert.deepEqual(decoder.decodeFrames(earlier), []);
-  const dictionary = valueFrame(9007199254740994n, 9, [3], 42n,
-                                {dictionary: ['velocity']});
-  const recovered = decoder.decodeFrames(dictionary);
-  assert.deepEqual(recovered.map(({frame}) => frame.sequence_id),
-                   ['9007199254740992', '9007199254740993', '9007199254740994']);
-  assert.deepEqual(recovered.map(({raw}) => raw), [earlier, later, dictionary]);
-  assert.equal(decoder.heldCount, 0);
-  const timeline = new Timeline();
-  for (const {frame} of recovered) assert.equal(timeline.append(frame), true);
+  for (const page of encodeDictionaryPages(header, channels))
+    assert.equal(decoder.decode(page), null);
+  for (const page of pages.slice(0, -1))
+    assert.equal(decoder.decode(page), null);
+  const snapshot = decoder.decode(pages.at(-1)!)!;
+  assert.equal(Object.keys(snapshot.channels).length, 200);
+  assert.equal(snapshot.channels['test/state/channel_199'], 199.5);
+  assert.equal(snapshot.exact!['test/state/channel_0'], '18446744073709551615');
+  assert.equal(channelDisplay(snapshot, 'test/state/channel_0'),
+               '18446744073709551615');
+  assert.equal(channelDisplay(snapshot, 'test/state/channel_1'),
+               '-9223372036854775808');
 });
 
-test('NaN samples are omitted and oversize frames are refused', () => {
+// The bridge's change-only updates: what a page does not carry keeps its
+// value, an absent channel loses it, and nothing applies before the keyframe
+// it builds on.
+test('change-only updates apply onto the keyframe', () => {
+  const channels = [{name: 'a', unit: ''}, {name: 'b', unit: ''},
+                    {name: 'c', unit: ''}];
+  const header = (sequenceId: bigint) => ({
+    streamId: 7n, sequenceId, timestampNs: sequenceId, dictionaryId: 3,
+    channelCount: 3
+  });
+  const chassis = {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0};
+  const update = encodeValuePages(header(2n), chassis, false,
+                                  [[1, rawFromDouble(20)]], [2]);
+  const decoder = new TelemetryDecoder();
+  for (const page of encodeDictionaryPages(header(0n), channels))
+    decoder.decode(page);
+  assert.throws(() => decoder.decode(update[0]), /before a keyframe/);
+  decoder.decode(encodeValuePages(
+      header(1n), chassis, true,
+      [[0, rawFromDouble(1)], [1, rawFromDouble(2)], [2, rawFromDouble(3)]])[0]);
+  const snapshot = decoder.decode(update[0])!;
+  assert.deepEqual({...snapshot.channels}, {a: 1, b: 20});
+  assert.equal(snapshot.sequence_id, '2');
+  assert.throws(() => new TelemetryDecoder().decode(update[0]),
+                /before its dictionary/);
+});
+
+test('NaN and infinities are readings, absence is not, and oversize frames are refused', () => {
   const decoder = new TelemetryDecoder();
   decoder.decode(demoPacket(0n));
-  const f = decoder.decode(
-      valueFrame(1n, 1, [Number.NaN, 0, 12, 2, 0, 0, 0, 0]))!;
+  for (const [reading, shown] of [[Number.NaN, 'NaN'], [Infinity, 'Infinity'],
+                                  [-Infinity, '-Infinity']] as const) {
+    const f = decoder.decode(
+        valueFrame(1n, 1, [reading, 0, 12, 2, 0, 0, 0, 0]))!;
+    assert.ok('velocity' in f.channels);
+    assert.equal(channelDisplay(f, 'velocity'), shown);
+  }
+  const f = decoder.decode(valueFrame(2n, 1, [null, 0, 12, 2, 0, 0, 0, 0]))!;
   assert.equal('velocity' in f.channels, false);
   assert.equal(f.channels.voltage, 12);
   assert.equal(MAX_FRAME_BYTES, 16384);
   assert.throws(() => decoder.decode(new Uint8Array(16385)));
 });
 
+// Studio's own pages (demo, export) obey the producer's page cap however an
+// update mixes samples and absent channels, and decode to what was encoded.
+test('encoded value pages stay within the page cap with absent channels', () => {
+  const header = {streamId: 5n, sequenceId: 1n, timestampNs: 2n,
+                  dictionaryId: 9, channelCount: 1000};
+  const chassis = {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0};
+  for (const carried of [0, 1, 80, 83, 84, 200])
+    for (const lost of [0, 1, 249, 250, 251, 700]) {
+      const samples = Array.from({length: carried},
+                                 (_, i): [number, bigint] => [i, 0xffffffffffffffffn]);
+      const absent = Array.from({length: lost}, (_, i) => 999 - i);
+      const pages = encodeValuePages(header, chassis, false, samples, absent);
+      let seenSamples = 0, seenAbsent = 0;
+      pages.forEach((page, i) => {
+        assert.ok(page.length <= 1200, `${carried}+${lost}: page ${i} is ${page.length} B`);
+        const f = Frame.getSizePrefixedRootAsFrame(new ByteBuffer(page));
+        assert.equal(f.page(), i);
+        assert.equal(f.pageCount(), pages.length);
+        seenSamples += f.channelsLength();
+        seenAbsent += f.absentLength();
+      });
+      assert.equal(seenSamples, carried);
+      assert.equal(seenAbsent, lost);
+    }
+});
+
 test('every dictionary the producer may emit decodes; one past its limits does not', () => {
-  const decode = (values: number[], options: {dictionary: string[]; labels: string[]}) =>
-      new TelemetryDecoder().decode(valueFrame(0n, 7, values, 42n, options));
+  const decode = (values: bigint[], options: {dictionary: string[]; labels: string[]}) =>
+      new TelemetryDecoder().decode(valueFrame(
+          0n, 7, values, 42n,
+          {...options, kinds: options.dictionary.map(() => ChannelKind.UInt)}));
   // Base-36 indices keep the producer's largest enum inside one frame.
   const labels = Array.from({length: MAX_ENUM_LABELS}, (_, i) => i.toString(36));
-  const state = decode([MAX_ENUM_LABELS - 1], {dictionary: ['fault'], labels})!;
+  const state = decode([BigInt(MAX_ENUM_LABELS - 1)], {dictionary: ['fault'], labels})!;
   assert.equal(channelDisplay(state, 'fault'), labels.at(-1));
-  assert.throws(() => decode([0], {dictionary: ['fault'], labels: [...labels, 'z']}),
+  assert.throws(() => decode([0n], {dictionary: ['fault'], labels: [...labels, 'z']}),
                 /Too many labels/);
   // The producer writes each string once: offsets shared to multiply a frame's
   // text past the frame itself are a decode bomb, not a dictionary.
@@ -142,7 +240,8 @@ test('every dictionary the producer may emit decodes; one past its limits does n
 test('a new stream invalidates the old dictionary', () => {
   const decoder = new TelemetryDecoder();
   decoder.decode(demoPacket(0n));
-  assert.equal(decoder.decode(valueFrame(0n, 1, [1], 77n)), null);
+  assert.throws(() => decoder.decode(valueFrame(0n, 1, [1], 77n)),
+                /before its dictionary/);
 });
 
 test('explicitly empty dictionaries replace cached dictionaries', () => {
@@ -153,52 +252,27 @@ test('explicitly empty dictionaries replace cached dictionaries', () => {
   assert.throws(() => decoder.decode(valueFrame(2n, 9, [1])));
 });
 
-test('invalid candidates cannot replace dictionaries, streams or held frames', () => {
+test('an invalid page changes neither the dictionary, the stream nor the values', () => {
+  const kinds = [ChannelKind.Double, ChannelKind.Bool];
   const invalid = [
     valueFrame(2n, 9, [1, 2], 77n, {dictionary: ['duplicate', 'duplicate']}),
     valueFrame(2n, 9, [1], 77n, {dictionary: ['derived/spoof']}),
-    valueFrame(2n, 9, [1, 2], 77n, {dictionary: ['new']}),
-    valueFrame(2n, 9, [Infinity], 77n, {dictionary: ['new']}),
-    valueFrame(2n, 9, [-Infinity], 77n, {dictionary: ['new']}),
-    valueFrame(2n, 9, [1], 77n, {dictionary: ['new'], yaw: NaN}),
-    valueFrame(2n, 9, [1], 77n, {dictionary: ['new'], missingChassis: true})
+    // The chassis is a pose, never a reading: it must be finite.
+    valueFrame(2n, 5, [1, null], 42n, {yaw: NaN}),
+    valueFrame(2n, 5, [1, null], 42n, {missingChassis: true}),
+    // A bool carries 0 or 1.
+    valueFrame(2n, 5, [1, 2n])
   ];
   for (const bytes of invalid) {
     const decoder = new TelemetryDecoder();
-    decoder.decode(valueFrame(0n, 1, [1], 42n, {dictionary: ['old']}));
-    decoder.decode(valueFrame(1n, 9, [3]));
+    decoder.decode(valueFrame(0n, 5, [1, 1n], 42n,
+                              {dictionary: ['old', 'flag'], kinds}));
     assert.throws(() => decoder.decode(bytes));
-    assert.equal(decoder.heldCount, 1);
-    assert.equal(decoder.decode(valueFrame(3n, 1, [2]))!.channels.old, 2);
-    const recovered = decoder.decodeAll(
-        valueFrame(4n, 9, [4], 42n, {dictionary: ['held']}));
-    assert.deepEqual(recovered.map(s => s.channels.held), [3, 4]);
+    const next = decoder.decode(valueFrame(3n, 5, [2, null]))!;
+    assert.deepEqual({...next.channels}, {old: 2});
   }
-  const decoder = new TelemetryDecoder();
-  decoder.decode(valueFrame(0n, 9, [1], 42n, {dictionary: ['old']}));
-  assert.throws(() => decoder.decode(
-      valueFrame(1n, 9, [Infinity], 42n, {dictionary: ['new']})));
-  assert.equal(decoder.decode(valueFrame(2n, 9, [2]))!.channels.old, 2);
 });
 
-test('a malformed held frame cannot abort dictionary recovery', () => {
-  const decoder = new TelemetryDecoder();
-  decoder.decode(valueFrame(1n, 9, [1, 2]));
-  decoder.decode(valueFrame(2n, 9, [3]));
-  const recovered = decoder.decodeAll(
-      valueFrame(3n, 9, [4], 42n, {dictionary: ['value']}));
-  assert.deepEqual(recovered.map(s => s.sequence_id), ['2', '3']);
-  assert.equal(decoder.heldCount, 0);
-});
-
-test('a value frame past the hold limit is refused, not silently dropped', () => {
-  const decoder = new TelemetryDecoder();
-  const waiting = valueFrame(1n, 9, [1]);
-  for (let i = 0; i < 4096; i++) assert.equal(decoder.decode(waiting), null);
-  // Refused, so the worker counts it as invalid instead of losing it unseen.
-  assert.throws(() => decoder.decode(waiting), /awaiting a dictionary/);
-  assert.equal(decoder.heldCount, 4096);
-});
 test('jitter sorts, deduplicates, counts gaps and rejects late packets', () => {
   const j = new JitterBuffer(10);
   j.push(frame(2), 0);
@@ -210,7 +284,7 @@ test('jitter sorts, deduplicates, counts gaps and rejects late packets', () => {
   j.push(frame(4), 11);
   assert.deepEqual(j.flush(21).map(f => f.sequence_id), ['4']);
   j.push(frame(3), 22);
-  assert.equal(j.stats.dropped, 1);
+  assert.equal(j.stats.skipped, 1);
   assert.equal(j.stats.late, 1);
 });
 test('exact lookup and held state never interpolate; bounded history', () => {
@@ -326,7 +400,7 @@ test('sim truth is absent without all three current finite pose readings', () =>
   assert.equal(simTruthPose(undefined), null);
   assert.equal(simTruthPose({...snapshot, channels: {}}), null);
   // Units describe dictionary presence, but cannot stand in for a current
-  // reading: TelemetryDecoder omits NaN (absent/stale) values from channels.
+  // reading: TelemetryDecoder omits absent (stale) channels from channels.
   const decoder = new TelemetryDecoder();
   decoder.decode(demoPacket(0n));
   const missing = decoder.decode(

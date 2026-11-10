@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -32,104 +33,11 @@
 #include "talOS/node/node.h"
 #include "talOS/schema/identity.h"
 #include "talOS/schema/unit_suffix.h"
+#include "talOS/telemetry/frames.h"
 #include "talOS/telemetry/telemetry_generated.h"
 #include "talOS/telemetry/wire.h"
 
 namespace talos::telemetry {
-
-// One dictionary entry, in wire order.
-struct ChannelDef {
-  std::string name;
-  std::string unit;
-  std::vector<std::string> labels;  // non-empty: enum channel
-};
-
-// FNV-1a 32 over names, units and labels in dictionary order, with NUL
-// separators between fields and 0xFF between channels.
-inline std::uint32_t DictionaryId(const std::vector<ChannelDef>& dictionary) {
-  std::uint32_t hash = 2166136261u;
-  auto mix = [&hash](std::string_view text) {
-    for (const char c : text) {
-      hash ^= static_cast<std::uint8_t>(c);
-      hash *= 16777619u;
-    }
-  };
-  auto separator = [&hash](std::uint8_t byte) {
-    hash ^= byte;
-    hash *= 16777619u;
-  };
-  for (const ChannelDef& channel : dictionary) {
-    mix(channel.name);
-    separator(0);
-    mix(channel.unit);
-    separator(0);
-    for (const std::string& label : channel.labels) {
-      mix(label);
-      separator(0);
-    }
-    separator(0xff);
-  }
-  return hash;
-}
-
-namespace detail {
-
-// Keep measured and live frames on the same serialization path.
-inline void FinishFrame(
-    flatbuffers::FlatBufferBuilder& builder, std::uint64_t stream_id,
-    std::uint64_t sequence_id, std::uint64_t timestamp_ns,
-    std::uint32_t dictionary_id, const Talos::Telemetry::Pose& chassis,
-    flatbuffers::Offset<flatbuffers::Vector<double>> values,
-    flatbuffers::Offset<
-        flatbuffers::Vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>>>
-        dictionary = 0) {
-  Talos::Telemetry::FinishSizePrefixedFrameBuffer(
-      builder, Talos::Telemetry::CreateFrame(builder, stream_id, sequence_id,
-                                             timestamp_ns, dictionary_id,
-                                             &chassis, values, dictionary));
-}
-
-}  // namespace detail
-
-// Size in bytes (prefix included) of a value-only frame with every channel
-// present. FlatBuffers vector size does not depend on the values, so this
-// is the worst case the construction-time budget check measures.
-inline std::size_t MeasureValueFrameBytes(std::size_t channel_count) {
-  flatbuffers::FlatBufferBuilder builder{1024};
-  const std::vector<double> values(channel_count, 0.0);
-  const auto values_offset = builder.CreateVector(values.data(), values.size());
-  const Talos::Telemetry::Pose chassis{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-  // Scalars have fixed widths, but zero defaults would omit their fields.
-  detail::FinishFrame(builder, 1, 1, 1, 1, chassis, values_offset);
-  return builder.GetSize();
-}
-
-// Dictionary frames carry the full value vector as well as channel metadata.
-inline std::size_t MeasureDictionaryFrameBytes(
-    const std::vector<ChannelDef>& dictionary) {
-  flatbuffers::FlatBufferBuilder builder{1024};
-  const std::vector<double> values(dictionary.size(), 0.0);
-  const auto values_offset = builder.CreateVector(values);
-  std::vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>> entries;
-  entries.reserve(dictionary.size());
-  for (const ChannelDef& channel : dictionary) {
-    std::vector<flatbuffers::Offset<flatbuffers::String>> labels;
-    labels.reserve(channel.labels.size());
-    for (const std::string& label : channel.labels) {
-      labels.push_back(builder.CreateString(label));
-    }
-    entries.push_back(Talos::Telemetry::CreateChannelInfo(
-        builder, builder.CreateString(channel.name),
-        channel.unit.empty() ? 0 : builder.CreateString(channel.unit),
-        channel.labels.empty() ? 0 : builder.CreateVector(labels)));
-  }
-  const auto dictionary_offset = builder.CreateVector(entries);
-  const Talos::Telemetry::Pose chassis{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-  // Nonzero scalars include every field serialized by a live dictionary frame.
-  detail::FinishFrame(builder, 1, 1, 1, 1, chassis, values_offset,
-                      dictionary_offset);
-  return builder.GetSize();
-}
 
 namespace detail {
 
@@ -140,35 +48,75 @@ inline T Read(const std::uint8_t* data) {
   return value;
 }
 
-inline double ReadScalarAsDouble(reflection::BaseType base,
-                                 const std::uint8_t* data) {
+// The channel kind a reflected scalar travels as: integers keep their
+// width's exact value, floats become doubles.
+inline ChannelKind KindOf(reflection::BaseType base) {
   using reflection::BaseType;
   switch (base) {
     case BaseType::Bool:
-      return Read<std::uint8_t>(data) != 0 ? 1.0 : 0.0;
+      return Talos::Telemetry::ChannelKind_Bool;
+    case BaseType::Byte:
+    case BaseType::Short:
+    case BaseType::Int:
+    case BaseType::Long:
+      return Talos::Telemetry::ChannelKind_Int;
     case BaseType::UByte:
     case BaseType::UType:
-      return static_cast<double>(Read<std::uint8_t>(data));
-    case BaseType::Byte:
-      return static_cast<double>(Read<std::int8_t>(data));
-    case BaseType::Short:
-      return static_cast<double>(Read<std::int16_t>(data));
     case BaseType::UShort:
-      return static_cast<double>(Read<std::uint16_t>(data));
-    case BaseType::Int:
-      return static_cast<double>(Read<std::int32_t>(data));
     case BaseType::UInt:
-      return static_cast<double>(Read<std::uint32_t>(data));
-    case BaseType::Long:
-      return static_cast<double>(Read<std::int64_t>(data));
     case BaseType::ULong:
-      return static_cast<double>(Read<std::uint64_t>(data));
-    case BaseType::Float:
-      return static_cast<double>(Read<float>(data));
-    case BaseType::Double:
-      return Read<double>(data);
+      return Talos::Telemetry::ChannelKind_UInt;
     default:
-      return std::numeric_limits<double>::quiet_NaN();
+      return Talos::Telemetry::ChannelKind_Double;
+  }
+}
+
+// The raw sample of one reflected scalar, or false for a type telemetry does
+// not carry. A NaN or infinite float travels as itself: a reading, not an
+// absence.
+inline bool ReadScalarRaw(reflection::BaseType base, const std::uint8_t* data,
+                          std::uint64_t& raw) {
+  using reflection::BaseType;
+  const auto signed_raw = [](std::int64_t value) {
+    return static_cast<std::uint64_t>(value);
+  };
+  switch (base) {
+    case BaseType::Bool:
+      raw = Read<std::uint8_t>(data) != 0 ? 1 : 0;
+      return true;
+    case BaseType::UByte:
+    case BaseType::UType:
+      raw = Read<std::uint8_t>(data);
+      return true;
+    case BaseType::Byte:
+      raw = signed_raw(Read<std::int8_t>(data));
+      return true;
+    case BaseType::Short:
+      raw = signed_raw(Read<std::int16_t>(data));
+      return true;
+    case BaseType::UShort:
+      raw = Read<std::uint16_t>(data);
+      return true;
+    case BaseType::Int:
+      raw = signed_raw(Read<std::int32_t>(data));
+      return true;
+    case BaseType::UInt:
+      raw = Read<std::uint32_t>(data);
+      return true;
+    case BaseType::Long:
+      raw = signed_raw(Read<std::int64_t>(data));
+      return true;
+    case BaseType::ULong:
+      raw = Read<std::uint64_t>(data);
+      return true;
+    case BaseType::Float:
+      raw = RawFromDouble(Read<float>(data));
+      return true;
+    case BaseType::Double:
+      raw = RawFromDouble(Read<double>(data));
+      return true;
+    default:
+      return false;
   }
 }
 
@@ -244,19 +192,22 @@ class Telemetry {
                                    kTopicOptions)} {
     using talos::detail::NodeAccess;
 
-    idx_pose_valid_ = AddChannel("pose/valid");
+    idx_pose_valid_ =
+        AddChannel("pose/valid", Talos::Telemetry::ChannelKind_Bool);
 
     const introspect::DeclaredGraph* graph = NodeAccess::declared_graph(node);
     if (graph != nullptr) {
       BuildFromGraph(*graph);
     }
 
+    CheckChannelCap();
     dictionary_id_ = DictionaryId(dictionary_);
     stream_id_ = RandomStreamId();
-    values_.assign(dictionary_.size(),
-                   std::numeric_limits<double>::quiet_NaN());
+    // update() fills these without reallocating.
+    tick_channels_.reserve(dictionary_.size());
+    tick_values_.reserve(dictionary_.size());
 
-    CheckFrameBudget(graph != nullptr);
+    ReportPages(graph != nullptr);
   }
 
   std::uint64_t stream_id() const { return stream_id_; }
@@ -304,10 +255,10 @@ class Telemetry {
     if (!any_source_fresh && !last_frame_had_fresh_) return;
     last_frame_had_fresh_ = any_source_fresh;
 
-    std::fill(values_.begin(), values_.end(),
-              std::numeric_limits<double>::quiet_NaN());
+    tick_channels_.clear();
+    tick_values_.clear();
 
-    SetValue(idx_pose_valid_, pose_ok ? 1.0 : 0.0);
+    SetBool(idx_pose_valid_, pose_ok);
 
     for (const auto& topic : observed_topics_) {
       const bool fresh =
@@ -322,86 +273,55 @@ class Telemetry {
         driver_station::DriverStationData ds_data;
         if (driver_station::Decode(packet->bytes(), ds_data)) {
           const uint32_t flags = ds_data.fms.flags;
-          const bool connected = (flags & driver_station::kDsAttached) != 0;
-          if (topic.ds_channels.connected < dictionary_.size()) {
-            SetValue(topic.ds_channels.connected, connected ? 1.0 : 0.0);
-          }
-          if (topic.ds_channels.enabled < dictionary_.size()) {
-            SetValue(topic.ds_channels.enabled,
-                     (flags & driver_station::kEnabled) != 0 ? 1.0 : 0.0);
-          }
-          if (topic.ds_channels.autonomous < dictionary_.size()) {
-            SetValue(topic.ds_channels.autonomous,
-                     (flags & driver_station::kAutonomous) != 0 ? 1.0 : 0.0);
-          }
-          if (topic.ds_channels.teleop < dictionary_.size()) {
-            SetValue(topic.ds_channels.teleop,
-                     (flags & driver_station::kTeleop) != 0 ? 1.0 : 0.0);
-          }
-          if (topic.ds_channels.test < dictionary_.size()) {
-            SetValue(topic.ds_channels.test,
-                     (flags & driver_station::kTest) != 0 ? 1.0 : 0.0);
-          }
-          if (topic.ds_channels.estop < dictionary_.size()) {
-            SetValue(topic.ds_channels.estop,
-                     (flags & driver_station::kEStop) != 0 ? 1.0 : 0.0);
-          }
-          if (topic.ds_channels.fms_attached < dictionary_.size()) {
-            SetValue(topic.ds_channels.fms_attached,
-                     (flags & driver_station::kFmsAttached) != 0 ? 1.0 : 0.0);
-          }
-          if (topic.ds_channels.alliance < dictionary_.size()) {
-            SetValue(topic.ds_channels.alliance,
-                     static_cast<double>(
-                         static_cast<std::uint8_t>(ds_data.fms.alliance)));
-          }
-          if (topic.ds_channels.match_time_s < dictionary_.size()) {
-            SetValue(topic.ds_channels.match_time_s,
-                     static_cast<double>(ds_data.fms.match_time_s));
-          }
+          const auto& channels = topic.ds_channels;
+          SetBool(channels.connected,
+                  (flags & driver_station::kDsAttached) != 0);
+          SetBool(channels.enabled, (flags & driver_station::kEnabled) != 0);
+          SetBool(channels.autonomous,
+                  (flags & driver_station::kAutonomous) != 0);
+          SetBool(channels.teleop, (flags & driver_station::kTeleop) != 0);
+          SetBool(channels.test, (flags & driver_station::kTest) != 0);
+          SetBool(channels.estop, (flags & driver_station::kEStop) != 0);
+          SetBool(channels.fms_attached,
+                  (flags & driver_station::kFmsAttached) != 0);
+          SetRaw(channels.alliance,
+                 static_cast<std::uint8_t>(ds_data.fms.alliance));
+          SetRaw(channels.match_time_s,
+                 RawFromDouble(ds_data.fms.match_time_s));
         }
       } else {
         for (const auto& reader : topic.readers) {
-          const double val =
-              detail::ReadScalarAsDouble(reader.base_type, raw + reader.offset);
-          SetValue(reader.channel_index, val);
+          std::uint64_t value = 0;
+          if (detail::ReadScalarRaw(reader.base_type, raw + reader.offset,
+                                    value)) {
+            SetRaw(reader.channel_index, value);
+          }
         }
       }
     }
 
-    flatbuffers::FlatBufferBuilder& builder = builder_;
-    builder.Clear();
-    const auto values_offset =
-        builder.CreateVector(values_.data(), values_.size());
-    flatbuffers::Offset<
-        flatbuffers::Vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>>>
-        dictionary_offset = 0;
-
-    // First frame and every 100th frame; never otherwise.
+    const PageHeader header{
+        .stream_id = stream_id_,
+        .sequence_id = sequence_,
+        .timestamp_ns = static_cast<std::uint64_t>(node_.now().nanos()),
+        .dictionary_id = dictionary_id_,
+        .channel_count = static_cast<std::uint32_t>(dictionary_.size())};
+    const auto send = [this](std::span<const std::uint8_t> page) {
+      studio_.send(std::as_bytes(page));
+    };
+    // The dictionary on the first tick and every 100th, before its values.
     if (sequence_ % 100 == 0) {
-      std::vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>> entries;
-      entries.reserve(dictionary_.size());
-      for (const ChannelDef& channel : dictionary_) {
-        std::vector<flatbuffers::Offset<flatbuffers::String>> labels;
-        labels.reserve(channel.labels.size());
-        for (const std::string& label : channel.labels) {
-          labels.push_back(builder.CreateString(label));
-        }
-        entries.push_back(Talos::Telemetry::CreateChannelInfo(
-            builder, builder.CreateString(channel.name),
-            channel.unit.empty() ? 0 : builder.CreateString(channel.unit),
-            channel.labels.empty() ? 0 : builder.CreateVector(labels)));
-      }
-      dictionary_offset = builder.CreateVector(entries);
+      EncodeDictionaryPages(builder_, header, dictionary_, send);
     }
-
-    detail::FinishFrame(builder, stream_id_, sequence_,
-                        static_cast<std::uint64_t>(node_.now().nanos()),
-                        dictionary_id_, chassis, values_offset,
-                        dictionary_offset);
-
-    studio_.send(std::as_bytes(
-        std::span{builder.GetBufferPointer(), builder.GetSize()}));
+    // A producer tick is a keyframe: a channel it does not carry is absent.
+    // It cannot fail: every page is bounded (frames_test) and the dictionary
+    // is within kMaxChannels (construction).
+    const bool encoded = EncodeValuePages(
+        builder_, header, chassis, true, tick_channels_, tick_values_, {},
+        [&send](std::span<const std::uint8_t> page, const PageSpan&) {
+          send(page);
+        });
+    static_cast<void>(encoded);
     ++sequence_;
   }
 
@@ -449,13 +369,17 @@ class Telemetry {
     return id != 0 ? id : 1;
   }
 
-  void SetValue(std::size_t index, double value) {
-    if (index < values_.size() && std::isfinite(value)) {
-      values_[index] = value;
-    }
+  // Carries channel `index` this tick; an excluded channel (index past the
+  // dictionary) carries nothing.
+  void SetRaw(std::size_t index, std::uint64_t raw) {
+    if (index >= dictionary_.size()) return;
+    tick_channels_.push_back(static_cast<std::uint32_t>(index));
+    tick_values_.push_back(raw);
   }
+  void SetBool(std::size_t index, bool value) { SetRaw(index, value ? 1 : 0); }
 
-  std::size_t AddChannel(std::string name, std::string unit = "",
+  std::size_t AddChannel(std::string name, ChannelKind kind,
+                         std::string unit = "",
                          std::vector<std::string> labels = {}) {
     if (detail::MatchesAnyGlob(name, exclude_globs_)) {
       return std::numeric_limits<std::size_t>::max();
@@ -488,88 +412,57 @@ class Telemetry {
     check_length("name", name);
     check_length("unit", unit);
     for (const std::string& label : labels) check_length("label", label);
-    dictionary_.push_back(
-        ChannelDef{std::move(name), std::move(unit), std::move(labels)});
+    dictionary_.push_back(ChannelDef{std::move(name), std::move(unit),
+                                     std::move(labels), kind});
     return dictionary_.size() - 1;
   }
 
-  // Throws when a frame cannot fit; otherwise, for a graph-built dictionary
-  // (the launcher's --describe-only and every launch), reports the headroom
-  // so a config author sees it before a schema change crosses it.
-  void CheckFrameBudget(bool report) {
-    const std::size_t worst_case = MeasureValueFrameBytes(dictionary_.size());
-    if (worst_case > telemetry_wire::kMaxValueFrameBytes) {
-      std::map<std::string, std::size_t> counts;
-      for (const auto& topic : observed_topics_) {
-        if (topic.is_driver_station) {
-          const auto& channels = topic.ds_channels;
-          for (const auto index :
-               {channels.connected, channels.enabled, channels.autonomous,
-                channels.teleop, channels.test, channels.estop,
-                channels.fms_attached, channels.alliance,
-                channels.match_time_s}) {
-            if (index < dictionary_.size()) ++counts[topic.name];
-          }
-        } else {
-          counts[topic.name] = topic.readers.size();
-        }
-      }
-      std::vector<std::pair<std::string, std::size_t>> sorted_counts(
-          counts.begin(), counts.end());
-      std::sort(
-          sorted_counts.begin(), sorted_counts.end(),
-          [](const auto& a, const auto& b) { return a.second > b.second; });
-      std::string err =
-          "telemetry: worst-case value frame is " + std::to_string(worst_case) +
-          " bytes, over the " +
-          std::to_string(telemetry_wire::kMaxValueFrameBytes) +
-          "-byte budget (see talOS/telemetry/README.md). Largest sources: ";
-      for (std::size_t i = 0; i < sorted_counts.size(); ++i) {
-        if (i > 0) err += ", ";
-        err += sorted_counts[i].first + " (" +
-               std::to_string(sorted_counts[i].second) + " channels)";
-      }
-      throw std::runtime_error(err);
+  // Studio's bridge sends a client an update only whole, so the largest one,
+  // a keyframe of every channel, must fit its burst: refuse a dictionary past
+  // kMaxChannels, naming the topics with the most channels to exclude.
+  void CheckChannelCap() const {
+    if (dictionary_.size() <= telemetry_wire::kMaxChannels) return;
+    std::map<std::string, std::size_t> per_topic;
+    for (const ChannelDef& channel : dictionary_) {
+      const std::size_t owner = channel.name.find('/');
+      const std::size_t role = owner == std::string::npos
+                                   ? std::string::npos
+                                   : channel.name.find('/', owner + 1);
+      ++per_topic[channel.name.substr(0, role)];
     }
-    const std::size_t dictionary_bytes =
-        MeasureDictionaryFrameBytes(dictionary_);
-    if (dictionary_bytes > telemetry_wire::slot_bytes) {
-      // A channel's share: the frame it would make alone, less an empty one.
-      const std::size_t empty = MeasureDictionaryFrameBytes({});
-      std::vector<std::pair<std::size_t, std::string_view>> shares;
-      shares.reserve(dictionary_.size());
-      for (const ChannelDef& channel : dictionary_) {
-        shares.emplace_back(MeasureDictionaryFrameBytes({channel}) - empty,
-                            channel.name);
-      }
-      std::stable_sort(
-          shares.begin(), shares.end(),
-          [](const auto& a, const auto& b) { return a.first > b.first; });
-      std::string err =
-          "telemetry: dictionary frame is " + std::to_string(dictionary_bytes) +
-          " bytes, over the " + std::to_string(telemetry_wire::slot_bytes) +
-          "-byte shared-memory slot budget (see talOS/telemetry/README.md). "
-          "Largest channels: ";
-      for (std::size_t i = 0; i < std::min<std::size_t>(shares.size(), 3);
-           ++i) {
-        if (i > 0) err += ", ";
-        err += std::string{shares[i].second} + " (" +
-               std::to_string(shares[i].first) + " B)";
-      }
-      throw std::runtime_error(err);
+    std::vector<std::pair<std::size_t, std::string>> largest;
+    for (const auto& [topic, count] : per_topic) {
+      largest.emplace_back(count, topic);
     }
+    std::sort(largest.begin(), largest.end(), std::greater<>{});
+    std::string names;
+    for (std::size_t i = 0; i < largest.size() && i < 3; ++i) {
+      if (i != 0) names += ", ";
+      names += largest[i].second + " (" + std::to_string(largest[i].first) +
+               ")";
+    }
+    throw std::runtime_error(
+        "telemetry: " + std::to_string(dictionary_.size()) +
+        " channels, over the " + std::to_string(telemetry_wire::kMaxChannels) +
+        "-channel cap; largest sources: " + names +
+        "; exclude channels in telemetry.toml (see "
+        "talOS/telemetry/README.md)");
+  }
+
+  // Pages the dictionary once, which throws, naming the channel, when one
+  // channel's entry cannot fit a dictionary page alone. For a graph-built
+  // dictionary (the launcher's --describe-only and every launch) it reports
+  // the pages a tick takes, so a config author sees the cost of a channel.
+  void ReportPages(bool report) const {
+    const PageBudget budget = MeasurePages(dictionary_);
     if (!report) return;
-    std::size_t spare_channels = 0;
-    while (MeasureValueFrameBytes(dictionary_.size() + spare_channels + 1) <=
-           telemetry_wire::kMaxValueFrameBytes) {
-      ++spare_channels;
-    }
-    std::cerr << "telemetry: " << dictionary_.size()
-              << " channels; worst-case value frame " << worst_case << " of "
-              << telemetry_wire::kMaxValueFrameBytes << " B (room for "
-              << spare_channels << " more channels); dictionary frame "
-              << dictionary_bytes << " of " << telemetry_wire::slot_bytes
-              << " B\n";
+    std::cerr << "telemetry: " << dictionary_.size() << " channels; "
+              << budget.value_pages << " value page(s) per tick, "
+              << budget.value_bytes << " B worst case (largest "
+              << budget.largest_value_page << " of "
+              << telemetry_wire::kMaxValueFrameBytes << " B); dictionary "
+              << budget.dictionary_pages << " page(s), "
+              << budget.dictionary_bytes << " B\n";
   }
 
   void BuildFromGraph(const introspect::DeclaredGraph& graph) {
@@ -717,20 +610,24 @@ class Telemetry {
     topic.sub_index = sub_idx;
     topic.is_driver_station = true;
 
-    topic.ds_channels.connected =
-        AddChannel("hw/state/driver_station/connected");
-    topic.ds_channels.enabled = AddChannel("hw/state/driver_station/enabled");
-    topic.ds_channels.autonomous =
-        AddChannel("hw/state/driver_station/autonomous");
-    topic.ds_channels.teleop = AddChannel("hw/state/driver_station/teleop");
-    topic.ds_channels.test = AddChannel("hw/state/driver_station/test");
-    topic.ds_channels.estop = AddChannel("hw/state/driver_station/estop");
-    topic.ds_channels.fms_attached =
-        AddChannel("hw/state/driver_station/fms_attached");
-    topic.ds_channels.alliance = AddChannel("hw/state/driver_station/alliance",
-                                            "", {"unknown", "red", "blue"});
-    topic.ds_channels.match_time_s =
-        AddChannel("hw/state/driver_station/match_time_s", "s");
+    constexpr auto kBool = Talos::Telemetry::ChannelKind_Bool;
+    auto& channels = topic.ds_channels;
+    channels.connected = AddChannel("hw/state/driver_station/connected", kBool);
+    channels.enabled = AddChannel("hw/state/driver_station/enabled", kBool);
+    channels.autonomous =
+        AddChannel("hw/state/driver_station/autonomous", kBool);
+    channels.teleop = AddChannel("hw/state/driver_station/teleop", kBool);
+    channels.test = AddChannel("hw/state/driver_station/test", kBool);
+    channels.estop = AddChannel("hw/state/driver_station/estop", kBool);
+    channels.fms_attached =
+        AddChannel("hw/state/driver_station/fms_attached", kBool);
+    channels.alliance =
+        AddChannel("hw/state/driver_station/alliance",
+                   Talos::Telemetry::ChannelKind_UInt, "",
+                   {"unknown", "red", "blue"});
+    channels.match_time_s =
+        AddChannel("hw/state/driver_station/match_time_s",
+                   Talos::Telemetry::ChannelKind_Double, "s");
 
     observed_topics_.push_back(std::move(topic));
   }
@@ -853,7 +750,8 @@ class Telemetry {
     }
 
     const std::size_t channel_idx =
-        AddChannel(std::move(channel_name), std::move(unit), std::move(labels));
+        AddChannel(std::move(channel_name), detail::KindOf(base),
+                   std::move(unit), std::move(labels));
     if (channel_idx == std::numeric_limits<std::size_t>::max()) return;
     readers.push_back(FieldReader{
         .channel_index = channel_idx,
@@ -873,8 +771,10 @@ class Telemetry {
   std::vector<ChannelDef> dictionary_;
   std::uint32_t dictionary_id_{0};
   std::uint64_t stream_id_{0};
-  std::vector<double> values_;
-  flatbuffers::FlatBufferBuilder builder_{1024};
+  // This tick's carried channels and their raw samples, index-aligned.
+  std::vector<std::uint32_t> tick_channels_;
+  std::vector<std::uint64_t> tick_values_;
+  flatbuffers::FlatBufferBuilder builder_{2048};
   std::uint64_t sequence_ = 0;
   bool last_frame_had_fresh_{false};
 

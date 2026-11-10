@@ -1,35 +1,33 @@
 /// <reference lib="webworker" />
 import {handleRpc} from '../agent/rpc';
-import {ByteBuffer} from 'flatbuffers';
 
-import {Coordinator, JitterBuffer, TelemetryDecoder, Timeline, type Snapshot} from './core';
+import {concatPages} from './encode';
+import {checkExportFormat, Coordinator, type Dictionary, exportPages, JitterBuffer, TelemetryDecoder, Timeline, type Snapshot} from './core';
 import {graphStale} from './data/freshness';
 import {MAX_MANIFEST_BYTES, manifestUrl, parseManifest, type SessionManifest} from './data/manifest';
 import {type Connection, type PlaybackState} from './data/types';
 import {WorkerUpdateStream} from './data/worker-stream';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from './demo';
-import {Frame} from './generated/talos/telemetry/frame';
-import {type DeclaredGraph, declaredUrl, MAX_DECLARED_BYTES, parseDeclaredGraph, parseSystemGraph, RateWindow, type SystemGraph} from './system';
+import {type DeclaredGraph, declaredUrl, MAX_DECLARED_BYTES, parseDeclaredGraph, RateWindow, type SystemGraph, SystemGraphStream} from './system';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
 const updates = new WorkerUpdateStream(message => ctx.postMessage(message));
 // When the newest timeline sample arrived, the anchor for live session time.
 // Null when its age is unknown: then no live reading is current.
 let sampleArrival: number|null = null;
-// Sequence ids of frames whose age is unknown: the bridge's cached dictionary,
-// sent on every open, carries values from whenever the producer last wrote it
-// -- possibly long before this connection, if telemetry has stopped. It names
-// the channels, but its arrival time says nothing about its values' age.
+// Sequence ids of snapshots whose age is unknown: the keyframe the bridge
+// sends on every open carries the latest tick it holds -- possibly from long
+// before this connection, if telemetry has stopped -- so its arrival time
+// says nothing about its values' age.
 const unknownAge = new Set<string>();
-let firstBinary = false;
+let firstUpdate = false;
 let coordinator = new Coordinator(), jitter = new JitterBuffer(10);
 let decoder = new TelemetryDecoder();
 let streamId: string|null = null;
 let socket: WebSocket|null = null, demo = false, sequence = 0n,
             status = 'Disconnected';
-let packets = new Map<string, Uint8Array>(),
-    pendingBytes = new Map<string, Uint8Array>();
-let latestDictRaw: Uint8Array|null = null;
+// The dictionary the timeline decodes against, for log export.
+let dictionary: Dictionary|null = null;
 let nextDemo = 0, lastTick = performance.now();
 let retry: ReturnType<typeof setTimeout>|undefined;
 let generation = 0;
@@ -51,9 +49,12 @@ let system: SystemGraph|null = null, previousSystem: SystemGraph|null = null;
 const rateWindow = new RateWindow();
 let systemError = '';
 let nextDemoSystem = 0;
-// Monotonic receipt time of the last good graph, and the staleness last
-// posted. The graph carries the registry's wall clock, which is not this
-// machine's, so its age is measured from local arrival.
+// The graph as the bridge's whole documents and updates build it, and the
+// monotonic receipt time of its last message (a graph, an update, or a notice
+// that one is deferred by the radio budget). The graph carries the
+// registry's wall clock, which is not this machine's, so its age is measured
+// from local arrival.
+const graphStream = new SystemGraphStream();
 let systemArrival: number|null = null;
 let postedSystemStale = true;
 // A held graph is only current while the source that sent it is.
@@ -254,12 +255,14 @@ async function fetchManifest(url: string, gen: number) {
 
 function ingestSystem(text: string) {
   try {
-    const graph = parseSystemGraph(text);
-    previousSystem = system;
-    system = graph;
-    rateWindow.push(graph);
+    const graph = graphStream.ingest(text, performance.now());
+    if (graph) {
+      previousSystem = system;
+      system = graph;
+      rateWindow.push(graph);
+    }
     systemError = '';
-    systemArrival = performance.now();
+    systemArrival = graphStream.arrival;
   } catch (e) {
     // One malformed document must not blank a working view. Keep the last good
     // graph and say why the new one was refused. It is no evidence about what
@@ -275,9 +278,6 @@ function resetStream(next: string) {
   streamId = next;
   coordinator = new Coordinator();
   jitter = new JitterBuffer(10);
-  packets.clear();
-  pendingBytes.clear();
-  latestDictRaw = null;
   needsReset = true;
   pendingFrames = [];
   unknownAge.clear();
@@ -287,9 +287,7 @@ function reset() {
   jitter = new JitterBuffer(10);
   decoder = new TelemetryDecoder();
   streamId = null;
-  packets.clear();
-  pendingBytes.clear();
-  latestDictRaw = null;
+  dictionary = null;
   needsReset = true;
   pendingFrames = [];
   unknownAge.clear();
@@ -299,6 +297,7 @@ function reset() {
   system = null;
   previousSystem = null;
   rateWindow.reset();
+  graphStream.reset();
   systemArrival = null;
   systemError = '';
   declared = null;
@@ -324,25 +323,19 @@ function close() {
   }
   demo = false;
 }
-// `unknown`: the bytes' arrival says nothing about their age (see unknownAge).
-function ingest(bytes: Uint8Array, now: number, unknown = false) {
+// One WebSocket message: a dictionary page or an update page. A snapshot
+// comes out at each update's last page.
+function ingest(bytes: Uint8Array, now: number) {
   try {
-    // A value frame whose dictionary has not arrived decodes to nothing yet;
-    // the decoder holds it and decodeAll returns it with the dictionary frame
-    // that names its channels. Held is not invalid.
-    for (const {frame, raw} of decoder.decodeFrames(bytes)) {
+    for (const frame of decoder.decodeAll(bytes)) {
       if (streamId !== null && frame.stream_id !== streamId)
         resetStream(frame.stream_id);
       else
         streamId = frame.stream_id;
-      if (unknown) unknownAge.add(frame.sequence_id);
-      if (Frame.getSizePrefixedRootAsFrame(new ByteBuffer(raw))
-              .dictionaryLength() > 0)
-        latestDictRaw = raw;
+      dictionary = decoder.currentDictionary();
+      if (firstUpdate) unknownAge.add(frame.sequence_id);
+      firstUpdate = false;
       jitter.push(frame, now);
-      pendingBytes.set(frame.sequence_id, raw);
-      if (pendingBytes.size > 4096)
-        pendingBytes.delete(pendingBytes.keys().next().value!);
     }
   } catch {
     jitter.stats.invalid++;
@@ -363,9 +356,9 @@ function connect(url: string, gen: number) {
       if (gen !== generation) return;
       status = 'WebSocket connected';
       connection = 'live';
-      // The bridge answers an open with its graph and then, when it has one,
-      // its cached dictionary frame: the first binary message on a socket.
-      firstBinary = true;
+      // The bridge answers an open with its graph and then, when it has
+      // them, the dictionary and a keyframe: the first update on a socket.
+      firstUpdate = true;
       unknownAge.clear();
       // Asked for on every open, not once per session: the bridge may have been
       // started after Studio was, and the first attempt would have found
@@ -378,8 +371,7 @@ function connect(url: string, gen: number) {
       // Binary is telemetry, text is the system graph. The bridge picks the
       // frame type, so neither side has to sniff the payload.
       if (e.data instanceof ArrayBuffer) {
-        ingest(new Uint8Array(e.data), performance.now(), firstBinary);
-        firstBinary = false;
+        ingest(new Uint8Array(e.data), performance.now());
       } else if (typeof e.data === 'string')
         ingestSystem(e.data);
     };
@@ -462,19 +454,11 @@ ctx.onmessage = ({data}) => {
         coordinator.step(BigInt(data.dt_ns));
         break;
       case 'export': {
-        const chunks =
-            coordinator.timeline.frames.map(f => packets.get(f.sequence_id))
-                .filter((x): x is Uint8Array => !!x);
-        if (chunks.length > 0 && latestDictRaw &&
-            Frame.getSizePrefixedRootAsFrame(new ByteBuffer(chunks[0]))
-                    .dictionaryLength() === 0)
-          chunks.unshift(latestDictRaw);
-        const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
-        let p = 0;
-        for (const c of chunks) {
-          out.set(c, p);
-          p += c.length;
-        }
+        // Each retained snapshot as a keyframe after the dictionary, so the
+        // log decodes on its own however much history was trimmed.
+        const out = dictionary ?
+            concatPages(exportPages(coordinator.timeline.frames, dictionary)) :
+            new Uint8Array(0);
         ctx.postMessage({type: 'export', buffer: out.buffer}, [out.buffer]);
         break;
       }
@@ -482,62 +466,20 @@ ctx.onmessage = ({data}) => {
         const bytes = new Uint8Array(data.buffer);
         if (bytes.length > 256 * 1024 * 1024)
           throw Error('Log exceeds 256 MiB');
+        checkExportFormat(bytes);
         const imported = new Timeline();
-        const raw = new Map<string, Uint8Array>();
         const importDecoder = new TelemetryDecoder();
-        let importedDictRaw: Uint8Array|null = null;
-        let leadingDictionary: {frame: Snapshot; raw: Uint8Array}|null = null;
-        const appendImported = (f: Snapshot, frameRaw: Uint8Array) => {
+        // A value page before the dictionary is refused by the decoder.
+        for (const f of importDecoder.decodeAll(bytes)) {
           if (!imported.append(f))
             throw Error('Log sequence/timestamps must strictly increase');
-          raw.set(f.sequence_id, frameRaw);
-        };
-        let p = 0;
-        while (p < bytes.length) {
-          if (p + 4 > bytes.length) throw Error('Truncated log');
-          const size = new DataView(bytes.buffer, bytes.byteOffset + p, 4)
-                           .getUint32(0, true) +
-              4;
-          if (size < 16 || p + size > bytes.length)
-            throw Error('Truncated log frame');
-          const chunk = bytes.slice(p, p + size);
-          const decoded = importDecoder.decodeFrames(chunk);
-          if (leadingDictionary && decoded.length > 0) {
-            // Export may prepend a dictionary newer than the retained start.
-            // It seeds decoding only; its snapshot, if retained, comes later
-            // in the chronological slice.
-            if (BigInt(leadingDictionary.frame.sequence_id) <
-                BigInt(decoded[0].frame.sequence_id))
-              appendImported(leadingDictionary.frame, leadingDictionary.raw);
-            leadingDictionary = null;
-          }
-          for (const entry of decoded) {
-            if (p === 0 &&
-                Frame.getSizePrefixedRootAsFrame(new ByteBuffer(chunk))
-                        .dictionaryLength() > 0)
-              leadingDictionary = entry;
-            else
-              appendImported(entry.frame, entry.raw);
-          }
-          if (Frame.getSizePrefixedRootAsFrame(new ByteBuffer(chunk))
-                  .dictionaryLength() > 0)
-            importedDictRaw = chunk;
-          p += size;
         }
-        if (leadingDictionary)
-          appendImported(leadingDictionary.frame, leadingDictionary.raw);
-        if (importDecoder.heldCount > 0)
-          throw Error('Log ends before its channel dictionary');
-        const retained = new Set(imported.frames.map(f => f.sequence_id));
-        for (const sequenceId of raw.keys())
-          if (!retained.has(sequenceId)) raw.delete(sequenceId);
         // Commit only after the entire log validates. Deterministic import
         // ignores arrival time.
         close();
         reset();
         coordinator = new Coordinator(imported);
-        packets = raw;
-        latestDictRaw = importedDictRaw;
+        dictionary = importDecoder.currentDictionary();
         coordinator.seek(BigInt(imported.bounds()?.start ?? '0'));
         status = 'Replay log loaded';
         connection = 'replay';
@@ -567,7 +509,7 @@ setInterval(() => {
   }
   for (const f of jitter.flush(now)) {
     // An arrival of 0 is Timeline's "no known arrival", so the Agent tab's
-    // get_latest reports the cached dictionary's age as null too.
+    // get_latest reports the join keyframe's age as null too.
     const unknown = unknownAge.delete(f.sequence_id);
     if (!coordinator.timeline.append(f, unknown ? 0 : Date.now())) {
       jitter.stats.invalid++;
@@ -575,18 +517,6 @@ setInterval(() => {
     }
     pendingFrames.push(f);
     sampleArrival = unknown ? null : now;
-    const raw = pendingBytes.get(f.sequence_id);
-    if (raw) packets.set(f.sequence_id, raw);
-    pendingBytes.delete(f.sequence_id);
-  }
-  const first = coordinator.timeline.frames[0];
-  if (first) {
-    for (const key of packets.keys()) {
-      if (BigInt(key) < BigInt(first.sequence_id))
-        packets.delete(key);
-      else
-        break;
-    }
   }
   // The session manifest is re-read once a second while connected: it is a
   // live document, and the launcher replaces it atomically as nodes restart.

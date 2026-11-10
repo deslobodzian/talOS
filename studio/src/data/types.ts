@@ -18,7 +18,11 @@ export type {Mode, Snapshot};
 
 export type Bounds = {start: string; end: string};
 
-export type StreamStats = {dropped: number; late: number; invalid: number};
+// skipped: producer ticks the live view never showed, because nothing
+// changed or the bridge's egress budget coalesced them into a later update
+// (each node's event log keeps every tick). late: updates that arrived out of
+// order.
+export type StreamStats = {skipped: number; late: number; invalid: number};
 
 export type Connection = 'idle'|'connecting'|'live'|'demo'|'replay'|'error';
 
@@ -55,7 +59,9 @@ export type ChannelInfo = {name: string; unit: string; labels: string[]};
 
 // Columnar history for plotting. `times` are seconds since `t0_ns`, strictly
 // ascending; each value array is index-aligned with `times` and holds NaN
-// where the channel had no reading (absent, stale, or not yet declared).
+// where the channel had no reading (absent, stale, or not yet declared). A
+// NaN or infinite reading is itself; plots draw every non-finite value as a
+// gap, and the store's presence (channelSample) tells the two apart.
 export type Series = {
   t0_ns: string;
   times: Float64Array;

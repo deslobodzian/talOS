@@ -3,5 +3,6 @@
 /* eslint-disable @typescript-eslint/no-unused-vars, @typescript-eslint/no-explicit-any, @typescript-eslint/no-non-null-assertion */
 
 export { ChannelInfo } from './telemetry/channel-info.js';
+export { ChannelKind } from './telemetry/channel-kind.js';
 export { Frame } from './telemetry/frame.js';
 export { Pose } from './telemetry/pose.js';

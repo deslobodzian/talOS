@@ -37,8 +37,8 @@ The manual runtime command still takes its topic positionally.
 
 | Endpoint | Contents | Unavailable response |
 |---|---|---|
-| `/channels.json` | Dictionary: channel names, units and enum labels | 503 until a dictionary arrives |
-| `/telemetry.json` | Latest dictionary-aligned frame, keyed by channel name | 503 until dictionary and aligned values arrive |
+| `/channels.json` | Dictionary: channel names, units, kinds and enum labels | 503 until a dictionary arrives |
+| `/telemetry.json` | Latest complete tick, keyed by channel name | 503 until a dictionary and a complete tick for it arrive |
 | `/system.json` | Node registry and bridge statistics | Reports `registry.available: false` when the registry cannot be opened |
 | `/declared.json` | Startup copy of the declared graph file | 404 if absent, empty or unreadable |
 | `/manifest.json` | Current manifest file | 404 if absent or unreadable; 413 above 1 MiB (Studio's own manifest limit) |
@@ -52,33 +52,53 @@ curl localhost:5800/channels.json
 curl localhost:5800/system.json
 ```
 
-Telemetry JSON has `kind: "talos.telemetry"`, `version: 2`, `stream_id`,
+Telemetry JSON has `kind: "talos.telemetry"`, `version: 3`, `stream_id`,
 `sequence_id`, `timestamp_ns`, `dictionary_id`, `age_ms`, `chassis` and
 `channels`. Stream, sequence and timestamp uint64 values are decimal strings.
 Each channel entry has `value` and `unit` (empty when unitless), plus `label`
-for an in-range integer enum value. Nonfinite readings become `null`.
-`age_ms` measures time since the bridge received the aligned frame, on the
-bridge's monotonic clock, so a wall-clock step does not change it; an old
-finite value does not automatically become null as time passes.
-The dictionary JSON has `kind: "talos.telemetry.channels"` and `version: 2`.
+for an in-range integer enum value. An integer value beyond ±2^53 is a decimal
+string, so it stays exact; a NaN or infinite reading is the string `"NaN"`,
+`"Infinity"` or `"-Infinity"`; a `Bool` value is `0` or `1`; a channel absent
+in the tick (its topic was not published) is `null`. `age_ms` measures time since the bridge completed the
+tick, on the bridge's monotonic clock, so a wall-clock step does not change
+it; an old value does not automatically become null as time passes.
+The dictionary JSON has `kind: "talos.telemetry.channels"`, `version: 3`, and
+per channel `kind` (`double`, `int`, `uint` or `bool`).
 
-On WebSocket open the bridge attempts to send the current graph, then its
-cached dictionary frame. These sends are budgeted and can be dropped. It
-withholds value frames from clients missing the matching dictionary and retries
-the dictionary on subsequent aligned telemetry frames. Cached dictionary values
-retain their original timestamps; they are not fresh connect-time readings.
-The bridge verifies and decodes frames for its JSON views before forwarding
-aligned telemetry.
+The bridge verifies every page, assembles dictionaries and ticks, and applies
+a tick only when all of its pages arrived. On WebSocket open it attempts to
+send the current graph, then the client's telemetry feed starts: the dictionary
+pages and a keyframe of the latest tick, then change-only updates
+([telemetry README](../../talOS/telemetry/README.md#the-live-view-and-the-record)).
+Each update goes out only when the budget affords all of it; otherwise it is
+deferred and the next update carries the changes, so a slow or starved client
+sees fewer, never inconsistent, ticks. A page the socket refuses resynchronizes
+that client with a fresh keyframe.
 
-The system graph includes the bridge itself and refreshes every 250 poll ticks
-(the timer is scheduled at 1 ms). Every refresh is re-sent to every client:
-Studio judges the graph stale from its arrival time, so the resend interval
-must stay below Studio's `GRAPH_STALE_AFTER_MS`
-([`freshness.ts`](../src/data/freshness.ts)). A graph larger than the egress
-burst ([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary))
-can never be sent; the bridge logs that once when the graph crosses the burst,
-counts each attempt in `ws_drops`, and still serves it at `/system.json`. It
-opens the registry lazily. Topic health is
+The system graph includes the bridge itself and refreshes every 250 ms of
+the monotonic clock, checked on the 1 ms poll timer. `/system.json` serves the whole document,
+with a `structure` id covering everything but its fast values (wall time,
+counters, heartbeats, liveness, selected sources, topic verdicts). Each
+WebSocket client (`GraphFeed` in [`system.h`](system.h)) is sent the whole
+document on connect and when the structure changes (a node starts, stops or
+restarts), and otherwise `{"kind":"talos.system_graph.update","structure":...,
+"values":[...]}`: the fast values in document order, written over the
+client's document, at most every 500 ms and only when they changed. A whole
+document goes at most every 2 s (`GraphFeed::kResendNs`); structure changes
+in between, as in a crash loop, coalesce into the next. Graph messages go
+before telemetry: while one waits for budget, that client's telemetry is
+thinned to one update per 250 ms (`ClientFeeds::kHoldNs`), so the budget
+refills for the graph and no reading waits long enough to go stale. A deferred message
+coalesces into the next; while the client has heard nothing for 750 ms it is
+sent
+`{"kind":"talos.system_graph.deferred","structure":...}`, so Studio, which
+marks the graph stale after `GRAPH_STALE_AFTER_MS`
+([`freshness.ts`](../src/data/freshness.ts)) without a graph message, does
+not mark a late graph stale. A whole graph larger than the egress burst
+([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary))
+can never be sent: the bridge logs that once when the graph crosses the
+burst, sends no notice (the client's graph goes stale, which is the truth),
+and still serves it at `/system.json`. It opens the registry lazily. Topic health is
 computed in [`system.h`](system.h): missing ends are `bridged` when external,
 otherwise `unconnected` when optional, otherwise `orphaned` or `unread`;
 connected topics are `lossy` when an end lost messages, `idle` before
@@ -98,15 +118,18 @@ HTTP **503 Studio client limit**, `Retry-After: 5`, and
 `Studio client limit reached`. The client limit and the egress byte budget are
 in [Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary).
 
-The bridge drops observations when budget is exhausted or a client already has
-buffered userspace output; it does not queue old observations for that client.
-A stalled client holds its slot until disconnected. Already accepted TCP bytes
-can still be buffered, so reconnect a stalled viewer for fresh data.
-The graph's bridge statistics include `clients`, `refused`, `ws_drops` and
-`egress_bytes`; the bridge's own telemetry source counts as `dropped` both
-frames the publisher overwrote before the bridge read them and telemetry frames
-dropped on the way to clients. The shutdown summary prints the cumulative
-counters, including `lapped`.
+The bridge sends nothing to a client that already has buffered userspace
+output, and never queues old observations for it: its telemetry waits and
+resumes from the latest values. A stalled client holds its slot until
+disconnected. Already accepted TCP bytes can still be buffered, so reconnect a
+stalled viewer for fresh data.
+The graph's bridge statistics include `clients`, `refused`, `ws_drops`,
+`frames_forwarded` (complete producer ticks) and `egress_bytes`. `ws_drops`
+counts only sends the socket refused (graph messages and telemetry pages); a
+graph message or telemetry update the budget deferred is not a drop. The bridge's own
+telemetry source counts as `dropped` the pages the publisher overwrote before
+the bridge read them plus the ticks it discarded for a missing page. The
+shutdown summary prints the cumulative counters, including `lapped`.
 
 ### Load probe
 
@@ -126,12 +149,12 @@ that no reader gets less than half the best-served reader's frames.
 
 The bridge reads a dedicated telemetry byte topic in sequence. The publisher
 overwrites and never waits for it: a bridge that stalls is lapped, resumes at
-the oldest intact frame and counts the frames it missed, while publication
-continues for every other reader. Each frame is copied out of shared memory and
-checked against the writer's position before it is forwarded, so an overwrite
-during the copy is retried, never forwarded. See
+the oldest intact page and counts the pages it missed, while publication
+continues for every other reader. Each page is copied out of shared memory and
+checked against the writer's position before it is ingested, so an overwrite
+during the copy is retried, never applied. See
 [DATA_FLOW](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary) for
-frame sizes and [shared-memory geometry](../../docs/DATA_FLOW.md#main-processor-shared-memory-slots).
+page sizes and [shared-memory geometry](../../docs/DATA_FLOW.md#main-processor-shared-memory-slots).
 
 The bridge may start before the publisher. It serves HTTP and the system graph
 at once, checks for the topic's shared-memory segment every 100 poll ticks and

@@ -26,7 +26,7 @@ const emptyPlayback: PlaybackState = {
   mode: 'PAUSED',
   cursor_ns: null,
   bounds: null,
-  stats: {dropped: 0, late: 0, invalid: 0},
+  stats: {skipped: 0, late: 0, invalid: 0},
   status: 'Disconnected',
   connection: 'idle'
 };

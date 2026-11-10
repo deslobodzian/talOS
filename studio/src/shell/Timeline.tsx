@@ -134,8 +134,8 @@ export function Timeline({stepNs, onStepNs, transportError, onTransportError}: {
     </label>
     <button onClick={actions.exportLog}>Export log ↗</button>
     <div className="stream-stats">
-      <div><small>DROPPED / LATE</small>
-        <b>{playback.stats.dropped} <span>/ {playback.stats.late}</span></b></div>
+      <div><small>SKIPPED / LATE</small>
+        <b>{playback.stats.skipped} <span>/ {playback.stats.late}</span></b></div>
       <div><small>INVALID</small><b>{playback.stats.invalid}</b></div>
     </div>
     {transportError && <div className="alert-error">{transportError}</div>}

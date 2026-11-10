@@ -15,6 +15,7 @@ import {
 } from '../agent/rpc';
 import {MAX_BATCH, startAgent} from '../agent/server';
 import {TelemetryDecoder, Timeline} from '../src/core';
+import {ChannelKind} from '../src/generated/talos/telemetry/channel-kind';
 import {GRAPH_STALE_AFTER_MS} from '../src/data/freshness';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from '../src/demo';
 import {
@@ -74,6 +75,83 @@ test(
               {timestamp_ns: '18446744073709551616'}),
           /uint64/);
     });
+// A 64-bit integer channel answers exactly: 2^53 and 2^53 + 1 are one double,
+// so a rounded value would hide both the reading and the change.
+test('RPC answers integer channels with their exact value', () => {
+  const timeline = new Timeline();
+  const decoder = new TelemetryDecoder();
+  const boot = ['9007199254740992', '9007199254740992', '9007199254740993'];
+  boot.forEach((id, i) => {
+    const frame = decoder.decode(demoPacket(BigInt(i)))!;
+    frame.channels['hw/status/clock_boot_id'] = Number(id);
+    frame.exact = {...frame.exact, 'hw/status/clock_boot_id': id};
+    timeline.append(frame);
+  });
+  const last = timeline.frames.at(-1)!;
+  const response = dispatch(ctx(timeline), 'query_state_at', {
+                     timestamp_ns: last.timestamp_ns,
+                     topics: ['hw/status/clock_boot_id']
+                   }) as any;
+  assert.equal(response.topics['hw/status/clock_boot_id'], '9007199254740993');
+  const first = dispatch(ctx(timeline), 'query_state_at', {
+                  timestamp_ns: timeline.frames[0].timestamp_ns,
+                  topics: ['hw/status/clock_boot_id']
+                }) as any;
+  assert.equal(first.topics['hw/status/clock_boot_id'], '9007199254740992');
+  const changed = dispatch(ctx(timeline), 'scan_channel_events', {
+                    topic: 'hw/status/clock_boot_id',
+                    condition: {op: 'changed'}
+                  }) as any;
+  assert.deepEqual(changed.ranges, [
+    {start_ns: last.timestamp_ns, end_ns: last.timestamp_ns, samples: 1}
+  ]);
+  const above = dispatch(ctx(timeline), 'scan_channel_events', {
+                  topic: 'hw/status/clock_boot_id',
+                  condition: {op: 'gt', value: 9007199254740992}
+                }) as any;
+  assert.equal(above.ranges.length, 1);
+});
+// NaN and the infinities are readings: an answer spells them as the bridge's
+// JSON does, since JSON.stringify would turn them into null (absence). NaN
+// orders with nothing, so no threshold matches it, and NaN after NaN is no
+// change. An integer channel is a number while that number is exact.
+test('RPC answers NaN and infinities as readings and integers as numbers when exact', () => {
+  const timeline = new Timeline();
+  const decoder = new TelemetryDecoder();
+  const readings = [1, NaN, NaN, Infinity, -Infinity, 2];
+  readings.forEach((x, i) => {
+    const frame = decoder.decode(demoPacket(BigInt(i)))!;
+    frame.channels['test/state/x'] = x;
+    frame.channels['test/state/count'] = 5;
+    frame.exact = {...frame.exact, 'test/state/count': '5'};
+    frame.kinds = {...frame.kinds, 'test/state/x': ChannelKind.Double,
+                   'test/state/count': ChannelKind.UInt};
+    timeline.append(frame);
+  });
+  const at = (i: number) => timeline.frames[i].timestamp_ns;
+  const value = (i: number) => (dispatch(ctx(timeline), 'query_state_at', {
+    timestamp_ns: at(i), topics: ['test/state/x', 'test/state/count']
+  }) as any).topics;
+  assert.deepEqual(value(1), {'test/state/x': 'NaN', 'test/state/count': 5});
+  assert.equal(value(3)['test/state/x'], 'Infinity');
+  assert.equal(value(4)['test/state/x'], '-Infinity');
+  const whole = JSON.parse(JSON.stringify(
+      dispatch(ctx(timeline), 'query_state_at', {timestamp_ns: at(1)})));
+  assert.equal(whole.channels['test/state/x'], 'NaN');
+  assert.equal(whole.channels['test/state/count'], 5);
+  assert.equal(whole.kinds['test/state/count'], 'uint');
+  const latest = JSON.parse(JSON.stringify(dispatch(ctx(timeline), 'get_latest')));
+  assert.equal(latest.channels['test/state/x'], 2);
+
+  const ranges = (condition: object) =>
+      (dispatch(ctx(timeline), 'scan_channel_events',
+                {topic: 'test/state/x', condition}) as any)
+          .ranges.map((r: any) => [r.start_ns, r.end_ns]);
+  assert.deepEqual(ranges({op: 'gte', value: 0}),
+                   [[at(0), at(0)], [at(3), at(3)], [at(5), at(5)]]);
+  assert.deepEqual(ranges({op: 'lte', value: 0}), [[at(4), at(4)]]);
+  assert.deepEqual(ranges({op: 'changed'}), [[at(1), at(1)], [at(3), at(5)]]);
+});
 test('RPC exposes the same derived pose-error series stored in history', () => {
   const timeline = history();
   const snapshot = timeline.exact(1020000000n)!;
@@ -428,7 +506,7 @@ test('every advertised method exists, and nothing else does', () => {
 // view permanently empty and nothing would say why.
 
 // `greeting` is sent as a binary message on every open, as the bridge sends
-// its cached dictionary frame.
+// a new client the dictionary pages and a keyframe of the latest tick.
 async function fakeBridge(declared: string|null, greeting?: Uint8Array) {
   const server = createServer((request, response) => {
     if (request.url === '/declared.json' && declared !== null) {

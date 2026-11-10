@@ -23,6 +23,31 @@ cc_library(
     hdrs = ["wire.h"],
 )
 
+# Page encoding: the producer, the Studio bridge and the mock build every
+# TLM3 page through it.
+cc_library(
+    name = "frames",
+    hdrs = ["frames.h"],
+    deps = [
+        ":schema",
+        ":wire",
+        "@flatbuffers//:runtime_cc",
+    ],
+)
+
+cc_test(
+    name = "frames_test",
+    size = "small",
+    srcs = ["tests/frames_test.cc"],
+    deps = [
+        ":frames",
+        ":schema",
+        ":wire",
+        "@flatbuffers//:runtime_cc",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "wire_test",
     srcs = ["tests/wire_test.cc"],
@@ -33,6 +58,7 @@ cc_library(
     name = "telemetry",
     hdrs = ["node.h"],
     deps = [
+        ":frames",
         ":schema",
         ":wire",
         "//talOS/configuration",
@@ -59,6 +85,7 @@ cc_test(
     size = "small",
     srcs = ["node_test.cc"],
     deps = [
+        ":frames",
         ":telemetry",
         ":wire",
         "//talOS/driver_station",

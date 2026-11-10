@@ -30,7 +30,8 @@ than `127.0.0.1` or `localhost` (optionally with a port) are rejected.
 
 `GET /health` returns upstream connectivity, retained frame count and jitter
 statistics, plus separate `system` and `declared` blocks. The system block
-reports received/rejected graph counts, node counts and registry availability.
+reports received/rejected graph counts (a whole graph or an update to it),
+deferral notices (`deferred`), node counts and registry availability.
 The declared block reports whether a declared graph was received and its
 comparison counts when available.
 
@@ -41,27 +42,37 @@ samples without interpolation.
 
 | Method | Parameters | Result |
 |---|---|---|
-| `get_latest` | `{}` | Latest snapshot, also under `snapshot`, plus `age_ms` and `age_ns` since timeline arrival; both are null when the latest sample is the bridge's cached dictionary frame sent on connect, whose values may be arbitrarily old |
+| `get_latest` | `{}` | Latest snapshot, also under `snapshot`, plus `age_ms` and `age_ns` since timeline arrival; both are null when the latest sample is the keyframe the bridge sends on connect, whose values may be arbitrarily old |
 | `get_schema_tree` | `{}` | Observed leaf paths and JavaScript types, direct channel aliases, retained bounds, frame count and timestamp encoding |
 | `query_state_at` | `timestamp_ns`, optional `topics`, optional `mode` | Snapshot, or timestamped topic map; mode defaults to `exact`, with `at_or_before` selecting the preceding sample |
 | `scan_channel_events` | `topic`, `condition`, optional inclusive `start_ns` / `end_ns` | Contiguous matching retained-sample ranges with inclusive endpoints and sample counts |
-| `get_system_graph` | `{}` | Last received live graph, source event rates and topic-health summary, plus `age_ms` since it arrived and `stale` |
+| `get_system_graph` | `{}` | Last received live graph, source event rates and topic-health summary, plus `age_ms` since the bridge last spoke about it and `stale` |
 | `describe_topic` | `topic` | One graph topic, its health and named endpoints with counters and rates |
 | `get_declared_graph` | `{}` | Declared nodes and diagnostics, summary and comparison against the live graph; comparison is null until a live graph arrives |
 
-A snapshot includes `channels` (name → number), `units`, `labels`,
-`sequence_id`, `stream_id` and `timestamp_ns`. Channel aliases such as
+A snapshot includes `channels`, `kinds` (name → `double`, `int`, `uint` or
+`bool`), `units`, `labels`, `sequence_id`, `stream_id` and `timestamp_ns`. A
+channel value, in a snapshot or a `topics` map, is a number, except that an
+`int` or `uint` value beyond ±2^53 − 1 (which a JSON number would round) is
+its exact decimal string, and a NaN or infinite reading is the string
+`"NaN"`, `"Infinity"` or `"-Infinity"`. A channel absent from the tick (its
+topic was not published) has no entry. Channel aliases such as
 `intake/state/current_a` can be used directly in `topics`; nested snapshot
 fields use dot paths such as `chassis.x`.
 
 Scan conditions have `op` and, for comparisons, `value`. Supported operators:
-`gt`, `gte`, `lt`, `lte`, `eq`, `ne`, `changed`, `rising`, `falling`. Rising and
+`gt`, `gte`, `lt`, `lte`, `eq`, `ne`, `changed`, `rising`, `falling`. Integer
+channels compare exactly against an integer `value`. NaN matches no ordering
+comparison, and NaN following NaN is not `changed`. Rising and
 falling compare truthiness, not numeric slope. Edge comparisons use the preceding
 retained sample even when it is before `start_ns`. Missing packets are not
 inferred to match. No arbitrary expression evaluation is accepted.
 
 Source rates are null until a rate can be measured. Graph queries return the
-last received graph. `get_system_graph` marks it `stale` once it is
+last received graph: the bridge's whole graph with its later value updates
+applied ([bridge README](../bridge/README.md)). Its age counts from the last
+graph message, including a notice that the radio budget deferred an update.
+`get_system_graph` marks it `stale` once that is
 `GRAPH_STALE_AFTER_MS` (1 s, [`freshness.ts`](../src/data/freshness.ts)) old;
 a stale graph's `alive` flags are last-known, not current. The agent drops the
 graph when the bridge connection closes.

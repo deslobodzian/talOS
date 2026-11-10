@@ -104,22 +104,22 @@ function latestCurrent() {
 
 test('a connect-time dictionary names channels without presenting its values as current', () => {
   const socket = connect();
-  // The bridge's cached dictionary frame: its values are as old as the
-  // telemetry that stopped producing it, which the client cannot see.
+  // The bridge's connect-time dictionary and keyframe: its values are as old
+  // as the telemetry that stopped producing them, which the client cannot see.
   binary(socket, demoPacket(100n));
   advance(40);
-  assert.equal(frames.length, 1, 'channels are discovered from the cached dictionary');
+  assert.equal(frames.length, 1, 'channels are discovered from the connect-time dictionary');
   assert.ok(Object.keys(frames[0].units).length > 0);
   assert.equal(playback!.connection, 'live');
   assert.equal(latestCurrent(), false, 'cached values are not current');
   advance(3000);
   assert.equal(latestCurrent(), false);
 
-  // A live value frame recovers immediately.
+  // A live update recovers immediately.
   binary(socket, demoPacket(101n));
   advance(40);
   assert.equal(frames.at(-1)!.sequence_id, '101');
-  assert.equal(latestCurrent(), true, 'a fresh value frame is current');
+  assert.equal(latestCurrent(), true, 'a fresh update is current');
 });
 
 test('a reconnect does not revive cached values as current', () => {
@@ -129,7 +129,7 @@ test('a reconnect does not revive cached values as current', () => {
   advance(40);
   assert.equal(latestCurrent(), true);
   // The socket drops; the producer ran on and stopped while it was down, so
-  // the bridge's cached dictionary is newer than anything this viewer saw.
+  // the bridge's connect-time keyframe is newer than anything this viewer saw.
   const retry = captureTimeout(() => socket.onclose!());
   advance(2500);
   assert.equal(latestCurrent(), false);
@@ -140,7 +140,7 @@ test('a reconnect does not revive cached values as current', () => {
   binary(again, demoPacket(100n));
   advance(40);
   assert.equal(frames.at(-1)!.sequence_id, '100');
-  assert.equal(latestCurrent(), false, 'the cached dictionary is not current');
+  assert.equal(latestCurrent(), false, 'the connect-time keyframe is not current');
   binary(again, demoPacket(101n));
   advance(40);
   assert.equal(latestCurrent(), true);
@@ -187,4 +187,16 @@ test('a graph goes stale the moment the socket drops', () => {
   advance(8);
   assert.equal(system!.stale, true);
   assert.ok(system!.graph, 'last-known graph stays inspectable');
+});
+
+// An export from an older telemetry format is refused by name, not decoded
+// into an unhelpful page error (studio/README.md: export compatibility).
+test('an export of an older telemetry format is refused by name', () => {
+  const old = new Uint8Array(32);
+  new DataView(old.buffer).setUint32(0, old.length - 4, true);
+  old.set([...'TLM2'].map(c => c.charCodeAt(0)), 8);
+  send({type: 'import', buffer: old.buffer});
+  advance(40);
+  assert.match(playback!.status, /^Error: .*TLM2/);
+  assert.match(playback!.status, /TLM3/);
 });

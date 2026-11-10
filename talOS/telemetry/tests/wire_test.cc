@@ -10,10 +10,10 @@ void Check(bool ok) {
   if (!ok) std::abort();
 }
 
-// Writes a fake size-prefixed TLM2 header: n = FlatBuffer bytes after the
+// Writes a fake size-prefixed TLM3 header: n = FlatBuffer bytes after the
 // 4-byte prefix, identifier at bytes [8, 12).
 void Header(std::span<std::byte> slot, std::uint32_t n,
-            const char* identifier = "TLM2") {
+            const char* identifier = "TLM3") {
   for (unsigned i = 0; i < 4; ++i) {
     slot[i] = static_cast<std::byte>((n >> (8 * i)) & 0xff);
   }
@@ -25,8 +25,7 @@ void Header(std::span<std::byte> slot, std::uint32_t n,
 int main() {
   using talos::telemetry_wire::payload;
 
-  // The contract constants: value frames fit an MTU and the R704 budget;
-  // slots hold even the largest dictionary frame.
+  // The contract constants: value pages fit an MTU; a slot holds one page.
   Check(talos::telemetry_wire::kMaxValueFrameBytes == 1200);
   Check(talos::telemetry_wire::slot_bytes == 16384);
   Check(talos::telemetry_wire::slot_count == 64);
@@ -50,8 +49,10 @@ int main() {
   Header(bytes, 7);
   Check(payload(bytes).empty());
 
-  // The v1 identifier is not v2.
+  // Earlier versions' identifiers are not v3.
   Header(bytes, 8, "TLMS");
+  Check(payload(bytes).empty());
+  Header(bytes, 8, "TLM2");
   Check(payload(bytes).empty());
   Header(bytes, 8, "XXXX");
   Check(payload(bytes).empty());

@@ -43,6 +43,25 @@ def frame(sock):
     return first, receive(sock, length)
 
 
+# The system graph's fast values in document order (studio/bridge/system.h
+# BuildSystemGraph; studio/src/system.ts walks the same order). An update's
+# `values` are written over these slots of the client's document.
+def fast_slots(document):
+    slots = [(document, "wall_ns")]
+    slots += [(document["bridge"], key) for key in
+              ("clients", "frames_forwarded", "invalid", "ws_drops", "refused", "egress_bytes")]
+    for node in document["nodes"]:
+        slots += [(node, key) for key in ("heartbeat_wall_ns", "dispatch_count", "alive")]
+        for source in node["sources"]:
+            slots += [(source, key) for key in
+                      ("events", "dropped", "sequence", "last_monotonic_ns",
+                       "last_latency_ns", "max_latency_ns")]
+        slots += [(selection, "selected") for selection in node["selections"]]
+    for topic in document["topics"]:
+        slots += [(topic, key) for key in ("published", "received", "dropped", "health")]
+    return slots
+
+
 def frame_of(sock, opcode, limit=20):
     """The next frame of one family, skipping the other."""
     for _ in range(limit):
@@ -158,17 +177,17 @@ class BridgeIntegration(unittest.TestCase):
                     self.assertIn(topic, [t["name"] for t in graph["topics"]])
 
                     # The first binary frame is the dictionary: the bridge
-                    # hands a new client its cached dictionary frame on
-                    # open, so values are decodable from the start.
+                    # hands a new client the dictionary and then a keyframe
+                    # on open, so values are decodable from the start.
                     packet = frame_of(ws, BINARY)
                     self.assertEqual(struct.unpack_from("<I", packet)[0], len(packet) - 4)
-                    self.assertEqual(packet[8:12], b"TLM2")
+                    self.assertEqual(packet[8:12], b"TLM3")
                     self.assertIn(b"drive/velocity", packet)
                     self.assertIn(b"intake/inhibit", packet)
-                    # Value frames decode against that dictionary: they
+                    # Value pages decode against that dictionary: they
                     # carry no channel names and are far smaller.
                     following = frame_of(ws, BINARY)
-                    self.assertEqual(following[8:12], b"TLM2")
+                    self.assertEqual(following[8:12], b"TLM3")
                     self.assertNotIn(b"drive/velocity", following)
                     self.assertLess(len(following), len(packet))
                     self.assertNotEqual(following, packet)
@@ -178,7 +197,7 @@ class BridgeIntegration(unittest.TestCase):
                             f"http://127.0.0.1:{http_port}/channels.json", timeout=3) as response:
                         channels_doc = json.loads(response.read())
                     self.assertEqual(channels_doc["kind"], "talos.telemetry.channels")
-                    self.assertEqual(channels_doc["version"], 2)
+                    self.assertEqual(channels_doc["version"], 3)
                     names = [c["name"] for c in channels_doc["channels"]]
                     self.assertIn("drive/velocity", names)
                     inhibit = next(c for c in channels_doc["channels"]
@@ -189,7 +208,7 @@ class BridgeIntegration(unittest.TestCase):
                             f"http://127.0.0.1:{http_port}/telemetry.json", timeout=3) as response:
                         telemetry_doc = json.loads(response.read())
                     self.assertEqual(telemetry_doc["kind"], "talos.telemetry")
-                    self.assertEqual(telemetry_doc["version"], 2)
+                    self.assertEqual(telemetry_doc["version"], 3)
                     # uint64 leaves as decimal strings (JSON numbers are
                     # doubles and would lose precision past 2^53).
                     self.assertIsInstance(telemetry_doc["stream_id"], str)
@@ -200,14 +219,32 @@ class BridgeIntegration(unittest.TestCase):
                     self.assertIn("value", channels_now["drive/velocity"])
                     self.assertEqual(channels_now["drive/velocity"]["unit"], "m/s")
 
-                    # The graph is refreshed on the open socket every 250 ms,
-                    # not only sent on connect, and it counts the frames the
-                    # bridge has forwarded by then. At the mock's 200 Hz that
-                    # is roughly 50 telemetry frames to skip.
-                    refreshed = json.loads(frame_of(ws, TEXT, limit=2000).decode())
-                    self.assertEqual(refreshed["kind"], "talos.system_graph")
-                    self.assertGreater(int(refreshed["bridge"]["frames_forwarded"]), 0)
-                    self.assertEqual(refreshed["bridge"]["clients"], 1)
+                    # After the whole graph, the open socket gets only its
+                    # fast values (counters, heartbeats), for the structure it
+                    # holds: written over the document's fast fields in
+                    # order, value for value of the same JSON type, they make
+                    # the current graph, which counts the producer ticks the
+                    # bridge has assembled by then.
+                    # (A node registering meanwhile changes the structure, which
+                    # brings the whole graph again.) Applied in turn, updates
+                    # reach a graph counting the ticks forwarded since.
+                    for _ in range(20):
+                        update = json.loads(frame_of(ws, TEXT, limit=2000).decode())
+                        if update["kind"] == "talos.system_graph":
+                            graph = update
+                            continue
+                        self.assertEqual(update["kind"], "talos.system_graph.update")
+                        self.assertEqual(update["structure"], graph["structure"])
+                        slots = fast_slots(graph)
+                        self.assertEqual(len(update["values"]), len(slots))
+                        for (owner, key), value in zip(slots, update["values"]):
+                            if owner[key] is not None and value is not None:
+                                self.assertIs(type(value), type(owner[key]), key)
+                            owner[key] = value
+                        if int(graph["bridge"]["frames_forwarded"]) > 0:
+                            break
+                    self.assertGreater(int(graph["bridge"]["frames_forwarded"]), 0)
+                    self.assertEqual(graph["bridge"]["clients"], 1)
 
                 with urllib.request.urlopen(
                         f"http://127.0.0.1:{http_port}/system.json", timeout=3) as response:

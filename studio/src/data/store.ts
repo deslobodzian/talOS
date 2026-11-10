@@ -5,11 +5,18 @@
 //
 // Memory: one Float64Array per channel plus one for times and six for the
 // chassis pose, each `STORE_CAPACITY` wide -- `(channels + 7) × capacity × 8 B`
-// for the numeric columns, plus a handful of per-frame strings (timestamp,
-// stream, sequence) kept only for exact lookup and snapshot reconstruction.
-// At the default capacity of 30,000 that is 240 KB per channel.
+// for the numeric columns, a presence byte per channel and frame, a handful of
+// per-frame strings (timestamp, stream, sequence) kept only for exact lookup
+// and snapshot reconstruction, and the exact decimal of an integer reading
+// only where its number is not exact (past 2^53). At the default capacity of
+// 30,000 that is 270 KB per channel.
+//
+// A value column holds every reading as it is, NaN and infinities included;
+// whether the channel had a reading in a frame is the presence column's, so a
+// NaN reading is never confused with absence.
 
 import type {Snapshot} from '../core';
+import {ChannelKind} from '../generated/talos/telemetry/channel-kind';
 import type {SystemGraph} from '../system';
 import type {SessionManifest} from './manifest';
 import {driverStationMode} from './robot';
@@ -50,9 +57,16 @@ export class TelemetryStore {
   private readonly chassisPitch: Float64Array;
   private readonly chassisYaw: Float64Array;
   private readonly columns = new Map<string, Float64Array>();
+  // 1 where the channel had a reading in that frame, beside its value column.
+  private readonly presence = new Map<string, Uint8Array>();
+  // Per channel, the exact decimal of the integer readings whose number is
+  // rounded (|value| > 2^53), by ring slot.
+  private readonly exacts = new Map<string, Map<number, string>>();
   private readonly infos = new Map<string, ChannelInfo>();
   private readonly dictionaries = new Map<number, {
-    infos: Map<string, ChannelInfo>; frames: number;
+    infos: Map<string, ChannelInfo>;
+    kinds: Readonly<Record<string, ChannelKind>>|undefined;
+    frames: number;
   }>();
   private readonly channelReferences = new Map<string, number>();
   private dictionaryCache: ChannelInfo[]|null = null;
@@ -157,13 +171,16 @@ export class TelemetryStore {
     return this.snapshotAtCursor()?.channels[name];
   }
 
+  // The channel's newest reading at or before the cursor, whatever its value
+  // (a NaN or infinite reading is a reading), or null if it has none.
   channelSample(name: string, cursor_ns: string|null = this.cursor) {
     if (cursor_ns === null) return null;
     const column = this.columns.get(name);
-    if (!column) return null;
+    const present = this.presence.get(name);
+    if (!column || !present) return null;
     for (let i = this.indexOf(BigInt(cursor_ns)); i >= 0; i--) {
       const slot = this.phys(i);
-      if (Number.isFinite(column[slot]))
+      if (present[slot])
         return {value: column[slot], timestamp_ns: this.timestamps[slot]!};
     }
     return null;
@@ -258,14 +275,22 @@ export class TelemetryStore {
   }
 
   private reconstruct(slot: number): Snapshot {
+    const dictionary = this.dictionaries.get(this.dictionaryIds[slot])!;
     const channels: Record<string, number> = Object.create(null);
+    const exact: Record<string, string> = Object.create(null);
     for (const [name, column] of this.columns) {
+      if (!this.presence.get(name)![slot]) continue;
       const value = column[slot];
-      if (!Number.isNaN(value)) channels[name] = value;
+      channels[name] = value;
+      // Integer kinds carry their exact decimal, as the decoded frame did.
+      const kind = dictionary.kinds?.[name];
+      if (kind !== undefined && kind !== ChannelKind.Double &&
+          kind !== ChannelKind.Bool)
+        exact[name] = this.exacts.get(name)?.get(slot) ?? BigInt(value).toString();
     }
     const units: Record<string, string> = Object.create(null);
     const labels: Record<string, string[]> = Object.create(null);
-    for (const [name, info] of this.dictionaries.get(this.dictionaryIds[slot])!.infos) {
+    for (const [name, info] of dictionary.infos) {
       units[name] = info.unit;
       if (info.labels.length) labels[name] = info.labels;
     }
@@ -280,6 +305,7 @@ export class TelemetryStore {
         yaw: this.chassisYaw[slot]
       },
       channels,
+      ...(dictionary.kinds ? {exact, kinds: dictionary.kinds} : {}),
       units,
       labels
     };
@@ -298,7 +324,7 @@ export class TelemetryStore {
     const evictedDictionary = this.count === this.capacity ? this.dictionaryIds[slot] : null;
     let dictionary = this.dictionaries.get(frame.dictionary_id);
     if (!dictionary) {
-      dictionary = {infos: new Map(), frames: 0};
+      dictionary = {infos: new Map(), kinds: frame.kinds, frames: 0};
       this.dictionaries.set(frame.dictionary_id, dictionary);
     }
     dictionary.frames++;
@@ -325,16 +351,27 @@ export class TelemetryStore {
     this.chassisYaw[slot] = frame.chassis.yaw;
     this.memo[slot] = null;
 
-    // A reused ring slot must not keep the overwritten frame's value for a
-    // channel this frame does not carry (absent, stale, or NaN-omitted).
+    // A reused ring slot must not keep the overwritten frame's reading for a
+    // channel this frame does not carry (its topic was not published). The
+    // value column reads NaN there too, so a plot shows absence as a gap.
     for (const column of this.columns.values()) column[slot] = NaN;
+    for (const present of this.presence.values()) present[slot] = 0;
+    for (const exact of this.exacts.values()) exact.delete(slot);
     for (const [name, value] of Object.entries(frame.channels)) {
       let column = this.columns.get(name);
       if (!column) {
         column = new Float64Array(this.capacity).fill(NaN);
         this.columns.set(name, column);
+        this.presence.set(name, new Uint8Array(this.capacity));
       }
       column[slot] = value;
+      this.presence.get(name)![slot] = 1;
+      const exact = frame.exact?.[name];
+      if (exact !== undefined && exact !== String(value)) {
+        let side = this.exacts.get(name);
+        if (!side) this.exacts.set(name, side = new Map());
+        side.set(slot, exact);
+      }
     }
 
     if (this.count < this.capacity) {
@@ -359,6 +396,8 @@ export class TelemetryStore {
       } else {
         this.channelReferences.delete(name);
         this.columns.delete(name);
+        this.presence.delete(name);
+        this.exacts.delete(name);
         this.infos.delete(name);
         this.dictionaryCache = null;
       }
@@ -370,6 +409,8 @@ export class TelemetryStore {
     this.count = 0;
     this.origin = null;
     this.columns.clear();
+    this.presence.clear();
+    this.exacts.clear();
     this.infos.clear();
     this.dictionaries.clear();
     this.channelReferences.clear();

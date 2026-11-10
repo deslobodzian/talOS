@@ -35,7 +35,7 @@ const initialPlayback: PlaybackState = {
   mode: 'LIVE_STREAMING',
   cursor_ns: null,
   bounds: null,
-  stats: {dropped: 0, late: 0, invalid: 0},
+  stats: {skipped: 0, late: 0, invalid: 0},
   status: 'Disconnected',
   connection: 'idle'
 };
@@ -240,7 +240,7 @@ export function createStaticStudio(input: {
         input.playback?.cursor_ns ?? frames.at(-1)?.timestamp_ns ?? null,
     cursor_ns: input.playback?.cursor_ns ?? frames.at(-1)?.timestamp_ns ?? null,
     bounds: input.playback?.bounds ?? boundsOf(frames),
-    stats: input.playback?.stats ?? {dropped: 0, late: 0, invalid: 0},
+    stats: input.playback?.stats ?? {skipped: 0, late: 0, invalid: 0},
     status: input.playback?.status ?? 'Static studio',
     connection: input.playback?.connection ?? 'replay'
   };

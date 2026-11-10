@@ -108,7 +108,7 @@ function HealthPanel() {
         out.push({
           severity: 'note',
           text: `bridge dropped ${
-              integer(graph.bridge.ws_drops)} frames to slow clients`,
+              integer(graph.bridge.ws_drops)} messages to slow clients`,
           panel: 'system'
         });
       if (!endpointAttributesKnown(graph))
@@ -135,9 +135,9 @@ function HealthPanel() {
         <Stat label="Mode">{playback.mode.replaceAll('_', ' ')}</Stat>
         <Stat label="Connection">{playback.connection}</Stat>
         <Stat label="Sequence">{s?.sequence_id ?? '—'}</Stat>
-        <Stat label="Dropped / late" tone={
-          playback.stats.dropped || playback.stats.late ? 'warn' : undefined}>
-          {playback.stats.dropped} / {playback.stats.late}
+        <Stat label="Skipped / late" tone={
+          playback.stats.late ? 'warn' : undefined}>
+          {playback.stats.skipped} / {playback.stats.late}
         </Stat>
         <Stat label="Invalid" tone={playback.stats.invalid ? 'warn' : undefined}>
           {playback.stats.invalid}

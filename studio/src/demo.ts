@@ -1,8 +1,4 @@
-import {Builder} from 'flatbuffers';
-
-import {ChannelInfo} from './generated/talos/telemetry/channel-info';
-import {Frame} from './generated/talos/telemetry/frame';
-import {Pose} from './generated/talos/telemetry/pose';
+import {ChannelKind, type ChannelSpec, concatPages, encodeDictionaryPages, encodeValuePages, type PageHeader, rawFromDouble} from './encode';
 import {
   type DeclaredGraph,
   type DeclaredNode,
@@ -19,7 +15,7 @@ import {
 export const DEMO_STREAM_ID = 42n;
 export const DEMO_DICTIONARY_ID = 1;
 
-const DEMO_CHANNELS: {name: string; unit: string; labels?: string[]}[] = [
+const DEMO_CHANNELS: ChannelSpec[] = [
   {name: 'velocity', unit: 'm/s'},
   {name: 'heading', unit: 'rad'},
   {name: 'voltage', unit: 'V'},
@@ -27,56 +23,45 @@ const DEMO_CHANNELS: {name: string; unit: string; labels?: string[]}[] = [
   {name: 'error', unit: 'm/s'},
   {name: 'vx', unit: 'm/s'},
   {name: 'vy', unit: 'm/s'},
-  {name: 'mode', unit: '', labels: ['disabled', 'teleop', 'auto']},
+  {name: 'mode', unit: '', labels: ['disabled', 'teleop', 'auto'],
+   kind: ChannelKind.UInt},
   {name: 'sim/state/pose/x_m', unit: 'm'},
   {name: 'sim/state/pose/y_m', unit: 'm'},
   {name: 'sim/state/pose/yaw_rad', unit: 'rad'},
 ];
 
+// One demo tick as the bridge would send it to a client that has just
+// joined: the dictionary pages (on the first tick of each hundred) followed
+// by a keyframe of every channel, back to back in one buffer.
 export function demoPacket(sequence: bigint): Uint8Array {
-  const b = new Builder(2048);
   const t = Number(sequence % 100000n) * .02;
   const x = 8 + 5 * Math.cos(t * .35), y = 4 + 2.5 * Math.sin(t * .35),
         yaw = t * .35 + Math.PI / 2;
-  // The dictionary rides the first frame of each hundred, as the bridge's
-  // cached dictionary frame does on connect; the rest are bare values.
-  let dictionary: ReturnType<typeof Frame.createDictionaryVector>|undefined;
-  if (sequence % 100n === 0n) {
-    const entries = DEMO_CHANNELS.map(channel => {
-      // Strings and vectors first: nothing may be built while a table is open.
-      const name = b.createString(channel.name);
-      const unit = channel.unit ? b.createString(channel.unit) : undefined;
-      const labels = channel.labels ?
-          ChannelInfo.createLabelsVector(
-              b, channel.labels.map(label => b.createString(label))) :
-          undefined;
-      ChannelInfo.startChannelInfo(b);
-      ChannelInfo.addName(b, name);
-      if (unit !== undefined) ChannelInfo.addUnit(b, unit);
-      if (labels !== undefined) ChannelInfo.addLabels(b, labels);
-      return ChannelInfo.endChannelInfo(b);
-    });
-    dictionary = Frame.createDictionaryVector(b, entries);
-  }
-  const values = Frame.createValuesVector(b, [
+  const header: PageHeader = {
+    streamId: DEMO_STREAM_ID,
+    sequenceId: sequence,
+    timestampNs: 1000000000n + sequence * 20000000n,
+    dictionaryId: DEMO_DICTIONARY_ID,
+    channelCount: DEMO_CHANNELS.length
+  };
+  const doubles = [
     1.75, yaw, 12.4 - .8 * Math.sin(t * .7), 2, .2 * Math.sin(t * 2),
-    -1.75 * Math.sin(t * .35), .875 * Math.cos(t * .35),
-    Number(sequence / 50n % 3n),
+    -1.75 * Math.sin(t * .35), .875 * Math.cos(t * .35)
+  ];
+  const samples: [number, bigint][] = [
+    ...doubles.map((value, i): [number, bigint] => [i, rawFromDouble(value)]),
+    [7, sequence / 50n % 3n],
     // The estimate has a small translation/heading bias relative to truth.
     // The shared decoder turns this into the derived/ pose-error series,
     // exactly as it does for live telemetry and imported recordings.
-    x - .12 - .03 * Math.sin(t * .2), y + .08, yaw - .025
-  ]);
-  Frame.startFrame(b);
-  Frame.addStreamId(b, DEMO_STREAM_ID);
-  Frame.addSequenceId(b, sequence);
-  Frame.addTimestampNs(b, 1000000000n + sequence * 20000000n);
-  Frame.addDictionaryId(b, DEMO_DICTIONARY_ID);
-  Frame.addValues(b, values);
-  if (dictionary !== undefined) Frame.addDictionary(b, dictionary);
-  Frame.addChassis(b, Pose.createPose(b, x, y, .15, 0, 0, yaw));
-  Frame.finishSizePrefixedFrameBuffer(b, Frame.endFrame(b));
-  return b.asUint8Array();
+    ...[x - .12 - .03 * Math.sin(t * .2), y + .08, yaw - .025].map(
+        (value, i): [number, bigint] => [8 + i, rawFromDouble(value)])
+  ];
+  const pages = sequence % 100n === 0n ?
+      encodeDictionaryPages(header, DEMO_CHANNELS) : [];
+  pages.push(...encodeValuePages(
+      header, {x, y, z: .15, roll: 0, pitch: 0, yaw}, true, samples));
+  return concatPages(pages);
 }
 
 // --- system graph ----------------------------------------------------------

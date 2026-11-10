@@ -6,53 +6,22 @@
 #include <cstring>
 #include <iostream>
 #include <random>
+#include <stdexcept>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "talOS/rtms/rtms.h"
-#include "talOS/telemetry/telemetry_generated.h"
+#include "talOS/telemetry/frames.h"
 #include "talOS/telemetry/wire.h"
 
 namespace wire = talos::telemetry_wire;
+using talos::telemetry::ChannelDef;
 namespace {
 
 volatile std::sig_atomic_t stop = 0;
 void signal_handler(int) { stop = 1; }
-
-// The mock's fixed dictionary, mirroring the producer's FNV-1a scheme
-// (talOS/telemetry/README.md) so its frames carry a matching dictionary_id.
-struct ChannelDef {
-  std::string name;
-  std::string unit;
-  std::vector<std::string> labels;
-};
-
-std::uint32_t DictionaryId(const std::vector<ChannelDef>& dictionary) {
-  std::uint32_t hash = 2166136261u;
-  auto mix = [&hash](const std::string& text) {
-    for (const char c : text) {
-      hash ^= static_cast<std::uint8_t>(c);
-      hash *= 16777619u;
-    }
-  };
-  auto separator = [&hash](std::uint8_t byte) {
-    hash ^= byte;
-    hash *= 16777619u;
-  };
-  for (const ChannelDef& channel : dictionary) {
-    mix(channel.name);
-    separator(0);
-    mix(channel.unit);
-    separator(0);
-    for (const std::string& label : channel.labels) {
-      mix(label);
-      separator(0);
-    }
-    separator(0xff);
-  }
-  return hash;
-}
 
 }  // namespace
 
@@ -68,74 +37,81 @@ int main(int argc, char** argv) try {
   std::cout << "ready\n" << std::flush;
 
   std::vector<ChannelDef> dictionary = {
-      {"drive/velocity", "m/s", {}},
+      {"drive/velocity", "m/s", {}, Talos::Telemetry::ChannelKind_Double},
       {"intake/inhibit",
        "",
        {"DRIVE", "GATEWAY_NOT_READY", "TARGET_DISABLED", "TARGET_STALE",
-        "FEEDBACK_INVALID", "DEMAND_NONFINITE"}},
-      {"pose/valid", "", {}},
+        "FEEDBACK_INVALID", "DEMAND_NONFINITE"},
+       Talos::Telemetry::ChannelKind_UInt},
+      {"pose/valid", "", {}, Talos::Telemetry::ChannelKind_Bool},
   };
   const auto channels = argc > 2 ? std::stoul(argv[2]) : dictionary.size();
-  if (channels < dictionary.size() || channels > 64) {
-    throw std::runtime_error("mock channel count must be in [3, 64]");
+  if (channels < dictionary.size() ||
+      channels > talos::telemetry_wire::kMaxChannels) {
+    throw std::runtime_error("mock channel count must be in [3, " +
+                             std::to_string(talos::telemetry_wire::kMaxChannels) +
+                             "]");
   }
+  // Extra channels all change every tick, like a robot in motion: the
+  // heaviest change-only load per channel.
   while (dictionary.size() < channels) {
-    dictionary.push_back(
-        {"test/channel_" + std::to_string(dictionary.size()), "unit", {}});
+    dictionary.push_back({"test/channel_" + std::to_string(dictionary.size()),
+                          "unit",
+                          {},
+                          Talos::Telemetry::ChannelKind_Double});
   }
-  const std::uint32_t dictionary_id = DictionaryId(dictionary);
+  const std::uint32_t dictionary_id = talos::telemetry::DictionaryId(dictionary);
   std::random_device device;
   const std::uint64_t stream_id =
       (static_cast<std::uint64_t>(device()) << 32) | device();
 
   std::array<std::byte, wire::slot_bytes> slot{};
+  // The buffer already starts with its size prefix; the slot is that prefix
+  // plus buffer followed by unused padding.
+  const auto publish = [&](std::span<const std::uint8_t> page) {
+    if (page.size() > slot.size()) throw std::runtime_error("page exceeds slot");
+    std::memcpy(slot.data(), page.data(), page.size());
+    queue.write(std::span<const std::byte>{slot.data(), slot.size()});
+  };
   flatbuffers::FlatBufferBuilder builder;
-  std::vector<double> samples(dictionary.size(), 1.0);
+  std::vector<std::uint32_t> indices(dictionary.size());
+  std::vector<std::uint64_t> samples(dictionary.size());
+  for (std::size_t i = 0; i < indices.size(); ++i) {
+    indices[i] = static_cast<std::uint32_t>(i);
+  }
   auto next = std::chrono::steady_clock::now();
   for (std::uint64_t seq = 0; !stop; ++seq) {
-    builder.Clear();
     const double t = static_cast<double>(seq) * 0.005;
-    Talos::Telemetry::Pose pose(8 + 3 * std::cos(t * .25),
-                                4 + 2 * std::sin(t * .25), 0, 0, 0,
-                                t * .25 + 1.5707963267948966);
-    flatbuffers::Offset<
-        flatbuffers::Vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>>>
-        dictionary_offset = 0;
-    // Dictionary on the first frame and every 100th, never otherwise.
+    const Talos::Telemetry::Pose pose(8 + 3 * std::cos(t * .25),
+                                      4 + 2 * std::sin(t * .25), 0, 0, 0,
+                                      t * .25 + 1.5707963267948966);
+    const talos::telemetry::PageHeader header{
+        .stream_id = stream_id,
+        .sequence_id = seq,
+        .timestamp_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count()),
+        .dictionary_id = dictionary_id,
+        .channel_count = static_cast<std::uint32_t>(dictionary.size())};
+    // Dictionary on the first tick and every 100th, never otherwise.
     if (seq % 100 == 0) {
-      std::vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>> entries;
-      entries.reserve(dictionary.size());
-      for (const ChannelDef& channel : dictionary) {
-        std::vector<flatbuffers::Offset<flatbuffers::String>> labels;
-        labels.reserve(channel.labels.size());
-        for (const std::string& label : channel.labels) {
-          labels.push_back(builder.CreateString(label));
-        }
-        entries.push_back(Talos::Telemetry::CreateChannelInfo(
-            builder, builder.CreateString(channel.name),
-            channel.unit.empty() ? 0 : builder.CreateString(channel.unit),
-            channel.labels.empty() ? 0 : builder.CreateVector(labels)));
-      }
-      dictionary_offset = builder.CreateVector(entries);
+      talos::telemetry::EncodeDictionaryPages(builder, header, dictionary,
+                                              publish);
     }
-    const double inhibit =
-        static_cast<double>((seq / 200) % dictionary[1].labels.size());
-    samples[0] = 0.75 + 0.25 * std::sin(t);
-    samples[1] = inhibit;
-    auto values = builder.CreateVector(samples);
-    auto frame = Talos::Telemetry::CreateFrame(
-        builder, stream_id, seq,
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count(),
-        dictionary_id, &pose, values, dictionary_offset);
-    Talos::Telemetry::FinishSizePrefixedFrameBuffer(builder, frame);
-    const auto size = builder.GetSize();
-    if (size > slot.size()) throw std::runtime_error("frame exceeds slot");
-    // The buffer already starts with its size prefix; the slot is that
-    // prefix plus buffer followed by unused padding.
-    std::memcpy(slot.data(), builder.GetBufferPointer(), size);
-    queue.write(std::span<const std::byte>{slot.data(), slot.size()});
+    samples[0] = talos::telemetry::RawFromDouble(0.75 + 0.25 * std::sin(t));
+    samples[1] = (seq / 200) % dictionary[1].labels.size();
+    samples[2] = 1;
+    for (std::size_t i = 3; i < samples.size(); ++i) {
+      samples[i] = talos::telemetry::RawFromDouble(
+          std::sin(t + static_cast<double>(i)));
+    }
+    if (!talos::telemetry::EncodeValuePages(
+            builder, header, pose, true, indices, samples, {},
+            [&publish](std::span<const std::uint8_t> page,
+                       const talos::telemetry::PageSpan&) { publish(page); })) {
+      throw std::logic_error("mock: a value page outgrew its bound");
+    }
     next += std::chrono::milliseconds(5);
     std::this_thread::sleep_until(next);
   }

@@ -35,7 +35,9 @@ The complete panel list is [`src/panels/registry.ts`](src/panels/registry.ts).
 
 [`src/data/freshness.ts`](src/data/freshness.ts) marks a reading stale at age
 >= 1 second, or when its sample timestamp or reading clock is unknown.
-The system graph is stale at age >= 1 second or while disconnected.
+The system graph is stale while disconnected or when the bridge has said
+nothing about it (a whole graph, an update, or a notice that the radio budget
+deferred one) for 1 second.
 [`src/data/studio.ts`](src/data/studio.ts) also invalidates the live clock and
 system graph when the worker has posted nothing for one second.
 
@@ -68,6 +70,14 @@ system graph when the worker has posted nothing for one second.
 2. Add its import and array entry to `src/panels/registry.ts`.
 3. Import panel-specific CSS from the module. Scope selectors under the panel's
    root class to avoid affecting other panels.
+
+### Exports
+
+An exported log is the telemetry format (`TLM3` pages) of the Studio that
+wrote it, and only a Studio of the same format version imports it; an older
+export is refused by name. A match from before a format change stays
+readable through the nodes' event logs (`log_dump`), which are the complete
+record, unlike the live view.
 
 ## Run
 
