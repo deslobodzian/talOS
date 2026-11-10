@@ -21,6 +21,11 @@ Checks: >
 # the other google-* checks enforce style, which clang-format already covers.
 # String concatenation in diagnostics/tooling is not a hot-path defect.
 WarningsAsErrors: '*'
-HeaderFilterRegex: '^(\./)?(talOS/|2026-robot/main_processor/|bench/main_processor/|examples/|studio/bridge/)'
+# Our headers, both in the source tree and as a TU sees them through a Bazel
+# include_prefix/strip_include_prefix copy (bazel-out/<cfg>/bin/<package>/
+# _virtual_includes/<target>/...). The trailing alternation matches any .h
+# whose name does not end in _generated.h, so flatc output stays excluded
+# (clang-tidy 18 has no ExcludeHeaderFilterRegex).
+HeaderFilterRegex: '^((\./)?(talOS|2026-robot/main_processor|bench/main_processor|examples|studio/bridge)/|bazel-out/[^/]+/bin/(talOS|2026-robot/main_processor|bench/main_processor|examples|studio/bridge)/([^/]+/)*_virtual_includes/([^/]+/)+([^/]{0,9}|[^/]*([^d/]|[^e/]d|[^t/]ed|[^a/]ted|[^r/]ated|[^e/]rated|[^n/]erated|[^e/]nerated|[^g/]enerated|[^_/]generated))\.h$)'
 SystemHeaders: false
 FormatStyle: file

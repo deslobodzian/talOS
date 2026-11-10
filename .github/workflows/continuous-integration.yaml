@@ -10,10 +10,14 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Bazel Build
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
@@ -31,7 +35,9 @@ jobs:
     - name: Build
       run: bazel build //... --noshow_progress --test_output=errors
 
-    - name: Make tracked source files read-only
+    # The two INC-1 steps below are anchored and reused by build-macos.
+    - &make-read-only
+      name: Make tracked source files read-only
       # TODO.md INC-1: talOS/python/talos/__init__.py was truncated to 0
       # bytes during test runs and the writer is unknown. With every tracked
       # regular file read-only, that writer fails with a traceback naming it
@@ -51,12 +57,24 @@ jobs:
     - name: Test
       run: bazel test //... --noshow_progress --test_output=errors
 
-    - name: Tracked sources unchanged by the build and tests
-      run: git diff --exit-code --stat
+    - &checkout-unchanged
+      name: Checkout unchanged by the build and tests
+      # Runs after failed tests too: an INC-1 truncation fails the tests,
+      # and this is the evidence. Modified tracked files and untracked,
+      # non-ignored files both fail it.
+      if: ${{ !cancelled() }}
+      run: |
+        status="$(git status --porcelain --untracked-files=all)"
+        if [ -n "$status" ]; then
+          printf '%s\n' "$status"
+          git diff --stat
+          exit 1
+        fi
 
   sanitizers:
     name: Bazel (${{ matrix.sanitizer }})
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -76,6 +94,7 @@ jobs:
   build-macos:
     name: Bazel Build (macOS)
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
@@ -90,12 +109,17 @@ jobs:
     - name: Build
       run: bazel build //... --noshow_progress --test_output=errors
 
+    - *make-read-only
+
     - name: Test
       run: bazel test //... --noshow_progress --test_output=errors
+
+    - *checkout-unchanged
 
   rio-adapter:
     name: RIO adapter (GradleRIO)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: 2026-robot/controller_processor/rio
@@ -131,8 +155,9 @@ jobs:
       run: ./gradlew buildRio
 
   buildifier:
-    name: Buildifier (changed BUILD files)
+    name: Buildifier (changed Starlark files)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
@@ -141,14 +166,16 @@ jobs:
         fetch-depth: 0
 
     - name: Install buildifier
+      # Version and sha256 are pinned once, in tools/setup.sh.
       run: |
-        BUILDIFIER_VERSION=8.2.1
-        curl -sSL -o /usr/local/bin/buildifier \
-          "https://github.com/bazelbuild/buildtools/releases/download/v${BUILDIFIER_VERSION}/buildifier-linux-amd64"
-        chmod +x /usr/local/bin/buildifier
+        eval "$(grep -E '^BUILDIFIER_(VERSION|SHA256_amd64)=' tools/setup.sh)"
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/buildifier" \
+          "https://github.com/bazelbuild/buildtools/releases/download/v${BUILDIFIER_VERSION:?}/buildifier-linux-amd64"
+        echo "${BUILDIFIER_SHA256_amd64:?}  $RUNNER_TEMP/buildifier" | sha256sum -c -
+        install -m 0755 "$RUNNER_TEMP/buildifier" /usr/local/bin/buildifier
         buildifier --version
 
-    - name: Check changed BUILD files
+    - name: Check changed Starlark files
       run: |
         if [ "${{ github.event_name }}" = "pull_request" ]; then
           BASE="${{ github.event.pull_request.base.sha }}"
@@ -162,12 +189,14 @@ jobs:
         # Check mode only: never rewrites files. Scoped to files changed in
         # this PR/push so pre-existing tree state stays untouched.
         git diff --name-only --diff-filter=d -z "$BASE" HEAD -- \
-          'BUILD' 'BUILD.bazel' '*/BUILD' '*/BUILD.bazel' \
+          'BUILD' 'BUILD.bazel' '*/BUILD' '*/BUILD.bazel' '*.bzl' \
+          'MODULE.bazel' '*/MODULE.bazel' \
           | xargs -0 -r buildifier --mode=check --lint=warn
 
   clang-format:
     name: clang-format (changed C++ files)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
@@ -200,6 +229,7 @@ jobs:
   clang-tidy:
     name: clang-tidy (changed production C++ files)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
@@ -234,7 +264,7 @@ jobs:
       # MODULE.bazel) generates compile_commands.json for clang-tidy.
       run: bazel run @hedron_compile_commands//:refresh_all --noshow_progress
 
-    - name: Run clang-tidy on changed sources
+    - name: Run clang-tidy on changed sources and headers
       run: |
         if [ "${{ github.event_name }}" = "pull_request" ]; then
           BASE="${{ github.event.pull_request.base.sha }}"
@@ -245,36 +275,111 @@ jobs:
           ""|"0000000000000000000000000000000000000000") BASE="HEAD~1" ;;
         esac
         echo "Diff base: $BASE"
-        # Analyze production TUs in the Bazel graph; headers are covered by
-        # their includers. Tests run under the sanitizer jobs instead.
+        # Analyze production TUs in the Bazel graph: each changed source,
+        # plus up to TUS_PER_HEADER production includers of each changed
+        # header (direct or transitive). A changed production source missing
+        # from the database fails the step. Tests run under the sanitizer
+        # jobs instead.
         # NUL-delimited git output also handles paths containing whitespace.
         python3 - "$BASE" <<'PYEOF'
-        import concurrent.futures, json, os, pathlib, subprocess, sys, time
-        changed = subprocess.check_output([
-            'git', 'diff', '--name-only', '--diff-filter=d', '-z',
-            sys.argv[1], 'HEAD', '--', '*.c', '*.cc', '*.cpp'
-        ]).decode().split('\0')
-        with open('compile_commands.json') as f:
-            db = json.load(f)
-        known = {os.path.realpath(os.path.join(e['directory'], e['file']))
-                 for e in db}
-        targets = []
-        for rel in changed:
+        import concurrent.futures, json, os, pathlib, re, subprocess, sys, time
+        SOURCES = ('.c', '.cc', '.cpp')
+        HEADERS = ('.h', '.hpp')
+        # Production sources the Linux build graph never compiles, so they have no
+        # compilation database entry: the GradleRIO program (rio-adapter job) and
+        # sources selected only for other platforms. Paths in .bazelignore are
+        # outside the graph too and are read from there.
+        OFF_GRAPH = ('2026-robot/controller_processor/rio/',
+                     'talOS/events/os/kqueue_poller.cc',
+                     'talOS/vision/capture/unsupported_source.cc')
+        # A changed header is analyzed through at most this many production
+        # translation units that include it, nearest includers first.
+        TUS_PER_HEADER = 4
+
+        def git(*args):
+            return [p for p in subprocess.check_output(['git', *args]).decode().split('\0') if p]
+
+        def production(rel):
             path = pathlib.PurePosixPath(rel)
-            if (not rel or
+            return not (
                 {'test', 'tests', 'testing', 'testdata', 'external',
                  'third_party'}.intersection(path.parts) or
                 path.stem in {'test', 'testing'} or
                 path.stem.endswith(('_test', '_testing')) or
-                'fuzz' in path.stem):
+                'fuzz' in path.stem)
+
+        with open('.bazelignore') as f:
+            ignored = tuple(line.strip().rstrip('/') + '/' for line in f
+                            if line.strip() and not line.startswith('#'))
+        with open('compile_commands.json') as f:
+            db = json.load(f)
+        root = os.getcwd()
+        tus = set()
+        for e in db:
+            if e['file'].endswith(SOURCES):
+                rel = os.path.relpath(os.path.realpath(os.path.join(e['directory'], e['file'])), root)
+                if production(rel):
+                    tus.add(rel)
+
+        changed = [rel for rel in git('diff', '--name-only', '--diff-filter=d', '-z', sys.argv[1], 'HEAD',
+                                      '--', *('*' + ext for ext in SOURCES + HEADERS))
+                   if production(rel) and not rel.startswith(ignored)]
+        targets, missing = [], []
+        for rel in changed:
+            if not rel.endswith(SOURCES):
                 continue
-            if os.path.realpath(rel) in known:
+            if rel in tus:
                 targets.append(rel)
-            else:
-                print(f'skip (no compilation database entry): {rel}')
+            elif not rel.startswith(OFF_GRAPH):
+                missing.append(rel)
+
+        headers = [rel for rel in changed if rel.endswith(HEADERS)]
+        if headers:
+            # Reverse include graph over tracked files. A quoted include next to its
+            # includer resolves there; otherwise to every tracked header whose path
+            # ends with the spelling, which over-approximates when two headers share
+            # a suffix: an extra includer is analyzed, none missed.
+            tracked = git('ls-files', '-z', *('*' + ext for ext in SOURCES + HEADERS))
+            tracked_set = set(tracked)
+            by_name = {}
+            for rel in tracked:
+                if rel.endswith(HEADERS):
+                    by_name.setdefault(os.path.basename(rel), []).append(rel)
+            include = re.compile(rb'^\s*#\s*include\s*(["<])([^">]+)[">]', re.M)
+            includers = {}
+            for rel in tracked:
+                with open(rel, 'rb') as f:
+                    for quote, spelled in include.findall(f.read()):
+                        spelled = spelled.decode(errors='replace')
+                        local = os.path.normpath(os.path.join(os.path.dirname(rel), spelled))
+                        if quote == b'"' and local in tracked_set:
+                            resolved = [local]
+                        else:
+                            resolved = [h for h in by_name.get(os.path.basename(spelled), ())
+                                        if h == spelled or h.endswith('/' + spelled)]
+                        for header in resolved:
+                            includers.setdefault(header, set()).add(rel)
+            for header in headers:
+                found, seen, frontier = [], {header}, [header]
+                while frontier and len(found) < TUS_PER_HEADER:
+                    level = sorted({i for h in frontier for i in includers.get(h, ())} - seen,
+                                   key=lambda p: (os.path.dirname(p) != os.path.dirname(header), p))
+                    seen.update(level)
+                    found += [p for p in level if p in tus][:TUS_PER_HEADER - len(found)]
+                    frontier = [p for p in level if p.endswith(HEADERS)]
+                if found:
+                    print(f'{header}: via {", ".join(found)}')
+                    targets += found
+                else:
+                    print(f'{header}: no production translation unit includes it; not analyzed')
+        targets = list(dict.fromkeys(targets))
+
+        for rel in missing:
+            print(f'::error file={rel}::changed production source has no compilation '
+                  'database entry; add it to a Bazel target or to OFF_GRAPH in this step')
         if not targets:
-            print('No changed sources with compilation database entries; skipping.')
-            sys.exit(0)
+            print('No changed production C++ to analyze.')
+            sys.exit(1 if missing else 0)
         # One clang-tidy per core: a single process over a large PR's
         # translation units ran for most of an hour.
         def tidy(path):
@@ -291,5 +396,5 @@ jobs:
                     print('::endgroup::')
         print(f'clang-tidy: {len(targets)} files, {failed} with findings, '
               f'{time.monotonic() - start:.1f}s')
-        sys.exit(1 if failed else 0)
+        sys.exit(1 if failed or missing else 0)
         PYEOF
