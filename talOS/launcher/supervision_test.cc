@@ -174,7 +174,8 @@ std::string ManifestEntry(const std::string& manifest, std::string_view name) {
 }
 
 LauncherOptions ConstructionOptions(std::string_view tag, int delay_ms) {
-  auto options = BaseOptions(tag, "max_restarts = 0\n");
+  auto options = BaseOptions(tag);
+  options.max_restarts = 0;
   auto config = toml::parse_file(options.config_path);
   config["subsystems"]["alpha"].as_table()->insert_or_assign("construction_ms",
                                                              delay_ms);
@@ -516,6 +517,37 @@ TEST(Supervision, MissingConfigFailsFastWithClearError) {
   Launcher launcher{options};
   EXPECT_EQ(launcher.Run(), 1);
   EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/graph.json"));
+}
+
+// Registry rows held by live processes outside the session are never swept, so
+// a roster that cannot get a row per node is refused before anything starts
+// rather than run until its unregistered nodes are killed.
+TEST(Supervision, RosterThatDoesNotFitTheRegistryIsRefused) {
+  auto options = BaseOptions("registry_full");
+  const auto runs = TempPath("registry_full_runs");
+  ::remove(runs.c_str());
+  for (const std::string name : {"alpha", "beta"}) {
+    options.binary_overrides["//example/" + name + ":node"] = WriteStub(
+        "registry_full_" + name, RecordLogArgThen(runs, "exit 0\n"), name);
+  }
+  // The roster registers three nodes (hardware_node, alpha, beta): one too
+  // many once 30 of the 32 rows are held.
+  std::vector<std::unique_ptr<introspect::NodeRegistration>> held;
+  for (int i = 0; i < 30; ++i) {
+    held.push_back(std::make_unique<introspect::NodeRegistration>(
+        introspect::NodeRegistration::Identity{.name = "held" +
+                                                       std::to_string(i)}));
+  }
+  EXPECT_EQ(RunSession(options), 1);
+  EXPECT_TRUE(ReadLines(runs).empty());
+  held.pop_back();
+  options.output_dir = TempPath("registry_full");
+  options.session_id = GenerateSessionId();
+  options.duration_s = 2;
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_GE(ReadLines(runs).size(), 2u);
+  std::filesystem::remove_all(TempPath("registry_full"));
+  ::remove(runs.c_str());
 }
 
 TEST(Supervision, SessionsAreIsolatedAndCleanOnlyOwnedDirs) {

@@ -56,7 +56,11 @@ sessions and test runs under their own `TALOS_SHM_NAMESPACE` or Bazel
 `TEST_TMPDIR` do not exclude one another. The lock is a POSIX record lock on
 `<lock-dir>/talos-<mapped name of /talos_session>.lock`, in the registry lock's
 [directory](../introspection/README.md#the-segment); the kernel releases it
-when the launcher exits or is killed, and nodes never inherit it.
+when the launcher exits or is killed, and nodes never inherit it. The launcher
+touches the file hourly, so macOS's daily cleanup of `/tmp` files unused for
+three days never deletes it under a long session, and reports it if the path
+stops naming the locked file; acquiring it checks that it locked the file the
+path still names.
 
 Next, before any probe, the launcher prepares the
 [live registry](../introspection/README.md#prepared-by-the-launcher), so every
@@ -92,7 +96,10 @@ bazel run //talOS/launcher:launcher -- --config 2026-robot/main_processor/config
 ```
 
 `--remote` overrides `[robot] controller_address`; `--remote-port` and
-`--local-port` override their config counterparts the same way. The launcher
+`--local-port` override their config counterparts the same way. The address
+must be an IPv4 literal (the bridge's socket resolves no hostname), and a port,
+in the config or a flag, is an integer in [1, 65535]; config load or flag
+parsing refuses anything else. The launcher
 resolves the effective endpoint once per launch, prints it
 (`[launcher] Controller <addr>:<port> ...`), and always starts
 `hardware_node` with an explicit `--remote/--remote-port/--local-port` triple.
@@ -186,16 +193,20 @@ over the whole session):
 
 ```toml
 [robot]
-max_restarts = 5  # per node per rolling restart window; 0 disables restarts
+max_restarts = 5  # per node per rolling restart window
 ```
 
-The key is optional (default 5) and must be an integer >= 0; `--max-restarts N`
-overrides it for one run. A non-critical member's clean exit is a node that
+The key is optional (default 5) and must be an integer >= 1; `--max-restarts N`
+overrides it for one run, and only `--max-restarts 0` disables every restart,
+critical members' included, so a deployed config cannot leave the robot
+without its drivetrain after one crash. A non-critical member's clean exit is a node that
 finished and is not restarted. When a critical member's clean-exit restart
 falls due and every other member's latest run also exited 0 (the whole roster
 completed, as one-shot fixtures do), it is dropped and the session ends.
 Nothing is restarted once a signal (requested stop, launcher shutdown) or the
-`--duration-s` deadline has started stopping the session. The backoff is
+`--duration-s` deadline has started stopping the session; each restart
+decision reads the stop flag again, so a node killed by the same `systemctl
+stop` that is stopping the launcher is not restarted. The backoff is
 scheduled inside the supervision loop, like the Studio bridge's retries, so a
 restarting node never delays another node or the deadline. Each restart prints
 one line:
@@ -207,7 +218,7 @@ permanently abandoned. Exactly one retry is scheduled for the oldest restart
 plus the window and normal backoff. Quarantine and retry transitions are
 logged; the live manifest exposes `quarantined` and
 `retry_at_monotonic_ns` (zero with no pending restart). Stopping cancels the
-retry; `max_restarts = 0` never schedules one. A persistent fault remains
+retry; `--max-restarts 0` never schedules one. A persistent fault remains
 rate-limited, while a cleared fault can recover later in the same session.
 
 Every run writes its own event log rather than truncating the last one: the
@@ -232,8 +243,10 @@ that have not registered. Such processes are killed once both that grace and
 the heartbeat timeout have elapsed; registration is required even when
 `--allow-graph-errors` permits a failed description. The launcher prepared the
 registry before starting them ([one session per namespace](#one-session-per-namespace)),
-and rows of killed runs are freed by the next claim, so a node fails to
-register only when 32 live processes hold every row.
+and rows of killed runs are freed by the next claim. Rows held by live
+processes outside the session are not, so a launch whose roster (every member
+but Studio's bridge, which takes no row) does not fit beside them in the 32
+rows is refused before anything starts, naming the holders.
 
 Construction is visible in the registry before endpoints are available and has
 a fixed deadline from process spawn. See the

@@ -196,21 +196,22 @@ TEST(ConfigTest, CommandTimeoutSpansTwoDriverStationPacketGaps) {
 }
 
 // The bridge holds an actuator owner's last request for at least two of its
-// periods, and the gateway refuses a merged command whose oldest observation is
-// command_timeout_us old, so every owner's period is at most half of it.
-TEST(ConfigTest, ActuatorOwnerPeriodIsAtMostHalfTheCommandTimeout) {
+// periods and at least half the command timeout, and the gateway refuses a
+// merged command whose oldest observation is command_timeout_us old, so every
+// owner's period is at most a quarter of it.
+TEST(ConfigTest, ActuatorOwnerPeriodIsAtMostAQuarterOfTheCommandTimeout) {
   const auto parse = [](const std::string& subsystems) {
     return ParseRobotConfigString("[robot]\ncommand_timeout_us = 100000\n" +
                                   subsystems);
   };
   EXPECT_NO_THROW(
-      parse("[subsystems.arm]\nperiod_us = 50000\n"
+      parse("[subsystems.arm]\nperiod_us = 25000\n"
             "[subsystems.arm.motors.m]\ncan_id = 1\n"));
-  EXPECT_THROW(parse("[subsystems.arm]\nperiod_us = 50001\n"
+  EXPECT_THROW(parse("[subsystems.arm]\nperiod_us = 25001\n"
                      "[subsystems.arm.motors.m]\ncan_id = 1\n"),
                std::invalid_argument);
   // A PWM output is an actuator too; a node that only reads may be slow.
-  EXPECT_THROW(parse("[subsystems.servo]\nperiod_us = 50001\n"
+  EXPECT_THROW(parse("[subsystems.servo]\nperiod_us = 25001\n"
                      "[subsystems.servo.pwm_outputs.p]\nchannel = 0\n" +
                      std::string{kMotor}),
                std::invalid_argument);
@@ -238,6 +239,25 @@ local_port = 5805
 
   ExpectRejected("[robot]\ncontroller_port = 0\n");
   ExpectRejected("[robot]\ncontroller_address = \"\"\n");
+  // The bridge's socket takes an IPv4 literal and resolves no hostname.
+  ExpectRejected("[robot]\ncontroller_address = \"roborio-5687-frc.local\"\n");
+  EXPECT_THROW(ResolveControllerAddress(config, "roborio.local"),
+               std::invalid_argument);
+  // Port flags: a decimal port in range, never wrapped or truncated.
+  EXPECT_EQ(ParsePortFlag("--remote-port", "5802"), 5802);
+  for (const char* bad : {"0", "65536", "70000", "-1", "5802x", ""}) {
+    EXPECT_THROW(ParsePortFlag("--remote-port", bad), std::invalid_argument)
+        << bad;
+  }
+}
+
+// Log retention keys of the wrong type or sign are refused, not defaulted.
+TEST(ConfigTest, RejectsInvalidLogRetention) {
+  EXPECT_EQ(Parse("[robot]\nlog_keep_sessions = 3\n").log_keep_sessions, 3);
+  ExpectRejected("[robot]\nlog_keep_sessions = \"3\"\n");
+  ExpectRejected("[robot]\nlog_keep_sessions = 0\n");
+  ExpectRejected("[robot]\nlog_max_bytes = 1.5\n");
+  ExpectRejected("[robot]\nlog_max_bytes = -1\n");
 }
 
 TEST(ConfigTest, RejectsNonBooleanTargetCoverage) {

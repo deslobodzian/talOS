@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <signal.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -544,6 +546,48 @@ TEST_F(Registry, PreparedRegistryIsOpenableWhateverTheUmask) {
   auto reader = RegistryReader::open(path_);
   ASSERT_TRUE(reader.has_value());
   EXPECT_EQ(reader->nodes().size(), 1u);
+}
+
+// A writer that wins the lock on a file a /tmp cleaner unlinked while it
+// waited takes the lock again on the file the path now names, so a writer
+// opening the path anew is still excluded. A Bazel test's lock files live in
+// its TEST_TMPDIR, which Bazel removes, rather than accumulating in /dev/shm.
+TEST_F(Registry, AWriterNeverHoldsAnUnlinkedLockFile) {
+  const std::string mapped = ShmObjectName(path_);
+  const std::string lock = LockFilePath(mapped);
+  const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+  ASSERT_NE(test_tmpdir, nullptr);
+  EXPECT_TRUE(lock.starts_with(std::string{test_tmpdir} + "/")) << lock;
+  int holder = OpenLockFile(lock, O_RDONLY);
+  ASSERT_GE(holder, 0);
+  ASSERT_EQ(::flock(holder, LOCK_EX), 0);
+  std::atomic<bool> locked{false};
+  std::atomic<bool> release{false};
+  std::jthread waiter{[&] {
+    const RegistryLock writer{mapped};
+    locked = true;
+    // Released once the main thread has tried the path's file.
+    while (!release) std::this_thread::sleep_for(1ms);
+  }};
+  // Destroyed before `waiter` joins, so a failed ASSERT below unblocks the
+  // waiter (its lock freed, its hold released) instead of hanging the test.
+  struct Unblock {
+    int& holder;
+    std::atomic<bool>& release;
+    ~Unblock() {
+      if (holder >= 0) ::close(holder);
+      release = true;
+    }
+  } unblock{holder, release};
+  std::this_thread::sleep_for(100ms);  // The waiter blocks on `holder`'s file.
+  ASSERT_EQ(::unlink(lock.c_str()), 0);
+  ::close(holder);
+  holder = -1;
+  while (!locked) std::this_thread::sleep_for(1ms);
+  const int newcomer = OpenLockFile(lock, O_RDONLY);
+  ASSERT_GE(newcomer, 0);
+  EXPECT_NE(::flock(newcomer, LOCK_EX | LOCK_NB), 0);
+  ::close(newcomer);
 }
 
 // A registry this user cannot write -- another user's, created 0644 -- would

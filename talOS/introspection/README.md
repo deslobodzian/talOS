@@ -20,12 +20,15 @@ Writers serialize segment creation, sizing and initialization with an exclusive
 the mapped name without its leading slash). The name is the exact
 `ShmObjectName` result used for the segment, so `TALOS_SHM_NAMESPACE` and
 `TEST_TMPDIR` isolate the lock and the segment together; no second namespace or
-temp-directory rule applies. The directory is `/dev/shm` on Linux, beside the
-segments, which a systemd `PrivateTmp=` service shares with everyone else, and
-`/tmp` on macOS. Both are sticky and world-writable, so an existing lock file
-is opened without `O_CREAT`: Linux's `fs.protected_regular` refuses `O_CREAT`
-on another user's file there, even to root. Its creator gives it mode `0666`
-whatever its umask.
+temp-directory rule applies. The directory is the test's `TEST_TMPDIR` under
+Bazel's namespace (no `TALOS_SHM_NAMESPACE`), so a test run's lock files go
+with it instead of accumulating until reboot; otherwise `/dev/shm` on Linux,
+beside the segments, which a systemd `PrivateTmp=` service shares with
+everyone else, and `/tmp` on macOS. `/dev/shm` and `/tmp` are sticky and
+world-writable, so an existing lock file is opened without `O_CREAT`: Linux's
+`fs.protected_regular` refuses `O_CREAT` on another user's file there, even to root. Its creator gives it mode `0666`
+whatever its umask. A writer that locked a file something unlinked meanwhile
+(a `/tmp` cleaner) locks the file the path now names instead.
 The lock is opened independently for each acquisition, serializing threads as
 well as processes, and is close-on-exec. The kernel releases it on close or
 process death, including SIGKILL. A normal file works on Linux and macOS:

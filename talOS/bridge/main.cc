@@ -29,9 +29,9 @@ int main(int argc, char** argv) {
       } else if (arg == "--remote" && i + 1 < argc) {
         remote_cli = argv[++i];
       } else if (arg == "--remote-port" && i + 1 < argc) {
-        remote_port_cli = static_cast<uint16_t>(std::stoi(argv[++i]));
+        remote_port_cli = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--local-port" && i + 1 < argc) {
-        local_port_cli = static_cast<uint16_t>(std::stoi(argv[++i]));
+        local_port_cli = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--duration-s" && i + 1 < argc) {
         duration_s = std::stoi(argv[++i]);
       } else if (arg == "--sim") {

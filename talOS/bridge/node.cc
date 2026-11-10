@@ -97,19 +97,17 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
     // Owner timeout. Upper side: the merged command carries the oldest
     // observation of any live owner, and the gateway invalidates every
     // output (a new epoch) once that is command_timeout_us old, so a silent
-    // owner must leave the merge before then. That holds only while its last
+    // owner must leave the merge before then. That holds while its last
     // request's observation was younger than command_timeout_us minus this
-    // timeout when accepted: half the timeout when 2 x period_us <=
-    // command_timeout_us / 2, less for a slower owner, and nothing for one at
-    // the period_us = command_timeout_us / 2 limit (timeout == the whole
-    // command timeout). Past that, one silent owner stops every output; the
-    // former 2 x period_us timeout allowed about 90 ms for a 5 ms owner at
-    // 100 ms, traded here for tolerating request gaps up to half the timeout
-    // (INC-6). Lower side: one late or missed tick must not brake the
-    // subsystem, so never less than two of its periods. The configuration
-    // refuses an actuator owner whose period exceeds half the timeout, so the
-    // result never exceeds the timeout; the clamp keeps that true for an
-    // unvalidated config.
+    // timeout when accepted. The configuration refuses an actuator owner
+    // whose period exceeds a quarter of the timeout, so 2 x period_us never
+    // exceeds half of it and every validated owner's timeout is exactly half
+    // the timeout: a silent owner whose last observation was younger than
+    // that leaves the merge in time; one with an older observation stops
+    // every output, the cost of tolerating request gaps up to half the
+    // timeout (INC-6). Lower side: one late or missed tick must not brake the
+    // subsystem, so never less than two of its periods; with the clamp to
+    // the whole timeout, that bound only matters for an unvalidated config.
     const uint64_t timeout_us = config_.command_timeout_us;
     const uint64_t floor_us =
         std::max(2 * static_cast<uint64_t>(tracker.period_us), timeout_us / 2);

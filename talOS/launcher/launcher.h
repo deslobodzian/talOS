@@ -518,6 +518,29 @@ inline uint16_t EffectiveStudioHttpPort(const config::RobotConfig& config,
                                        : config.studio.http_port;
 }
 
+// Empty when `registering` more nodes can each claim a registry row now, else
+// why not. Rows held by live processes outside this session (a viewer's test
+// node, another namespace user's tools) are not swept, and a node that cannot
+// claim a row runs unregistered until supervision kills it as missing, so a
+// roster that does not fit is refused before anything starts.
+inline std::string RegistryCapacityError(
+    const introspect::RegistryReader& reader, std::size_t registering) {
+  const auto held = reader.held_rows();
+  if (held.size() + registering <= introspect::kMaxNodes) return {};
+  std::string holders;
+  for (const auto& row : held) {
+    if (!holders.empty()) holders += ", ";
+    holders += (row.name.empty() ? std::string{"?"} : row.name) + " (pid " +
+               std::to_string(row.pid) + ")";
+  }
+  return "the node registry has " + std::to_string(held.size()) + " of " +
+         std::to_string(introspect::kMaxNodes) +
+         " rows held by live processes (" + holders + "), and this roster's " +
+         std::to_string(registering) +
+         " nodes need a row each; a node without one would be killed as "
+         "unregistered. Stop those processes first";
+}
+
 // The launcher alone holds each lifetime pipe's writer. A tiny guardian in the
 // child's group kills the group on EOF, including when the launcher is
 // SIGKILLed. Writers are close-on-exec and a guardian keeps no descriptor but
@@ -1222,6 +1245,9 @@ inline bool ShouldRestartNode(bool clean_exit, bool critical, int max_restarts,
 }
 
 // `--max-restarts` wins, then `[robot] max_restarts`, then the default.
+// Only the flag may be 0, which disables every restart, critical members'
+// included: a robot config that did so would leave the robot without its
+// drivetrain after one crash, so the key must be at least 1.
 inline bool ResolveMaxRestarts(const config::RobotConfig& robot_config,
                                const LauncherOptions& options, int& out,
                                std::string& error) {
@@ -1239,9 +1265,11 @@ inline bool ResolveMaxRestarts(const config::RobotConfig& robot_config,
     return true;
   }
   const auto* value = node.as_integer();
-  if (value == nullptr || value->get() < 0 ||
+  if (value == nullptr || value->get() < 1 ||
       value->get() > std::numeric_limits<int>::max()) {
-    error = "[robot] max_restarts must be an integer >= 0";
+    error =
+        "[robot] max_restarts must be an integer >= 1 (only --max-restarts 0 "
+        "disables restarts)";
     return false;
   }
   out = static_cast<int>(value->get());
@@ -1484,6 +1512,7 @@ class Launcher {
     // node on recorded topics, without shared memory (RunOnRecordedInputs).
     const bool starts_roster =
         !options_.describe_only && options_.replay_inputs.empty();
+    session_lock_ = nullptr;
     std::optional<SessionLock> session_lock;
     if (starts_roster) {
       std::string lock_error;
@@ -1492,6 +1521,7 @@ class Launcher {
         std::cerr << "launcher: " << lock_error << "\n";
         return 1;
       }
+      session_lock_ = &*session_lock;
     }
     std::filesystem::create_directories(options_.output_dir);
 
@@ -1509,8 +1539,13 @@ class Launcher {
       }
       return 1;
     }
-    const std::string effective_remote =
-        EffectiveRemoteAddress(robot_config, options_);
+    std::string effective_remote;
+    try {
+      effective_remote = EffectiveRemoteAddress(robot_config, options_);
+    } catch (const std::exception& e) {
+      std::cerr << "launcher: " << e.what() << "\n";
+      return 1;
+    }
     if (options_.simulation && effective_remote != "127.0.0.1") {
       std::cerr
           << "launcher: --sim requires remote 127.0.0.1; effective remote "
@@ -1545,6 +1580,18 @@ class Launcher {
     if (starts_roster) {
       try {
         introspect::PrepareRegistry();
+        // Every member but Studio's bridge registers a row; the sim gateway
+        // registers its own.
+        const auto registering = static_cast<std::size_t>(std::count_if(
+            node_specs.begin(), node_specs.end(), [](const NodeSpec& spec) {
+              return spec.name != kStudioBridgeName;
+            }));
+        const std::string full =
+            RegistryCapacityError(introspect::RegistryReader{}, registering);
+        if (!full.empty()) {
+          std::cerr << "launcher: " << full << "\n";
+          return 1;
+        }
       } catch (const std::exception& e) {
         std::cerr << "launcher: " << e.what() << "\n";
         return 1;
@@ -1905,13 +1952,9 @@ class Launcher {
   // reads is passed over too: this launch is about to read it.
   uint64_t ApplyRetention(const config::RobotConfig& config) {
     namespace fs = std::filesystem;
-    const auto robot = config.toml_data["robot"];
-    const int64_t cap = robot["log_keep_sessions"].value_or(int64_t{50});
-    const int64_t budget =
-        robot["log_max_bytes"].value_or(int64_t{2LL * 1024 * 1024 * 1024});
-    if (cap < 1 || budget < 1)
-      throw std::runtime_error(
-          "log_keep_sessions and log_max_bytes must be positive");
+    // Config load refuses a wrong type or a nonpositive value.
+    const int64_t cap = config.log_keep_sessions;
+    const int64_t budget = config.log_max_bytes;
     const auto session_budget = static_cast<uint64_t>(budget) / 2;
     const uint64_t retained_budget =
         static_cast<uint64_t>(budget) - session_budget;
@@ -2265,11 +2308,29 @@ class Launcher {
     }
     ServiceNotifier notifier;
     notifier.Send("READY=1");
+    auto next_lock_refresh = std::chrono::steady_clock::time_point::min();
+    bool lock_lost_reported = false;
     for (;;) {
       notifier.Send("WATCHDOG=1");
       const auto now = std::chrono::steady_clock::now();
       const bool past_deadline = now >= deadline;
       const bool stopping = stop_requested_ != 0 || stop_sent || past_deadline;
+      // A stop signal can land after `stopping` was sampled: systemctl stop
+      // signals the launcher and then every node, so a node killed by it can
+      // be reaped in this pass. Restart decisions read the flag again, so
+      // once shutdown starts nothing is restarted.
+      const auto stop_arrived = [&] {
+        return stopping || stop_requested_ != 0;
+      };
+      if (session_lock_ != nullptr && now >= next_lock_refresh) {
+        next_lock_refresh = now + kSessionLockRefresh;
+        if (!session_lock_->Refresh() && !lock_lost_reported) {
+          lock_lost_reported = true;
+          std::cerr << "[launcher] the session lock " << session_lock_->path()
+                    << " was removed; a second launcher in this namespace "
+                       "would no longer be refused\n";
+        }
+      }
       // Read-only, the attach takes no lock (RegistryMapping): no node can
       // stall this loop, and with it the service watchdog.
       if (!registry) {
@@ -2361,7 +2422,7 @@ class Launcher {
         const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
         launch.last_exit_clean = clean;
         if (!is_bridge && ShouldRestartNode(clean, launch.critical,
-                                            max_restarts_, stopping)) {
+                                            max_restarts_, stop_arrived())) {
           const auto delay = ScheduleRestart(proc, launch, now);
           std::cout << "[launcher] " << proc.name << " exited ("
                     << ExitReason(status) << "); "
@@ -2379,7 +2440,7 @@ class Launcher {
         auto& launch = launches[i];
         if (!launch.restart_pending) continue;
         // A stopping session ends with the crash as the node's last word.
-        if (stopping) {
+        if (stop_arrived()) {
           launch.restart_pending = false;
           procs[i].quarantined = false;
           procs[i].retry_at_monotonic_ns = 0;
@@ -2403,7 +2464,7 @@ class Launcher {
         const auto pid = before.pid;
         const bool exited = before.exited;
         const bool failed = before.failed;
-        studio->Supervise(procs[studio->index()], now, stopping);
+        studio->Supervise(procs[studio->index()], now, stop_arrived());
         const auto& after = procs[studio->index()];
         if (pid != after.pid || exited != after.exited ||
             failed != after.failed)

@@ -106,22 +106,20 @@ bridge's 1 ms tick; a shorter gap, such as a late or missed tick, keeps its
 last demand. Whatever the bridge does, the RoboRIO neutralizes it within
 `command_timeout_us` of the State its last request was built from, but by
 invalidating every output: the merged command carries the oldest observation
-of any owner still merged. The owner timeout therefore keeps one silent node
-from stopping the others only while the State its last request was built from
-was younger than `command_timeout_us` minus the owner timeout when the bridge
-accepted it: younger than half the timeout (50 ms) for an owner with
-`period_us` ≤ `command_timeout_us / 4`, less for a slower owner, and never for
-an owner at the `command_timeout_us / 2` period limit, whose owner timeout is
-the whole timeout. A silent owner whose last request already observed an older
-State stops every output; with the former `2 × period_us` owner timeout that
-took a State about 90 ms old for a 5 ms owner at the 100 ms timeout, the cost
+of any owner still merged. Because an actuator owner's `period_us` is at most
+`command_timeout_us / 4` (below), its owner timeout is half the timeout, so
+the owner timeout keeps one silent node from stopping the others while the
+State its last request was built from was younger than half the timeout
+(50 ms at 100 ms) when the bridge accepted it. A silent owner whose last
+request already observed an older State stops every output; that is the cost
 of tolerating request gaps up to half the timeout.
 
 Config load refuses a `command_timeout_us` shorter than two Driver Station
 packet gaps, `2 × (20000 + [robot] period_us)` µs (a node's Driver Station view
 expires at the timeout, and consecutive packets can be 20 ms plus one gateway
 tick apart), or longer than 500000 µs. It also refuses a subsystem owning a
-motor, digital output or PWM output whose `period_us` exceeds half the timeout.
+motor, digital output or PWM output whose `period_us` exceeds a quarter of the
+timeout.
 
 ## Targets
 

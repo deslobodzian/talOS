@@ -216,7 +216,7 @@ SESSION_LOCK = "/talos_session"  # talOS/launcher/session_lock.h kSessionLockNam
 
 
 def lock_file(topic, namespace):
-    """talos::introspect::LockFilePath (talOS/introspection/lock_file.h)."""
+    """talos::introspect::LockFilePath (talOS/introspection/lock_file.h) under TALOS_SHM_NAMESPACE."""
     directory = "/dev/shm" if sys.platform.startswith("linux") and os.path.isdir("/dev/shm") else "/tmp"
     return Path(directory) / ("talos-" + shm_name(topic, namespace)[1:] + ".lock")
 

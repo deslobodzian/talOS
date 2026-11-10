@@ -335,8 +335,9 @@ struct RegistryTestHooks {
 // it. Use a regular file (LockFilePath): Darwin's shm descriptors are not
 // vnodes, so flock on them fails with ENOTSUP. Each acquisition opens a
 // separate file description, which also serializes threads in one process.
-// close (including process death) releases the lock. Never unlink this file:
-// waiters must keep the same inode.
+// close (including process death) releases the lock. Nothing in talos
+// unlinks this file; if something else does, an acquirer that wins the old
+// inode finds it no longer current and starts over.
 class RegistryLock {
  public:
   explicit RegistryLock(const std::string& mapped_path)
@@ -349,33 +350,42 @@ class RegistryLock {
     // Namespace selection is entirely ShmObjectName's job: the lock file is
     // named after its mapped result.
     const std::string file_path = LockFilePath(mapped_path);
-    // flock does not require write access, so the file is opened read-only:
-    // any process that may read it can lock it, whichever user created it.
-    fd_ = OpenLockFile(file_path, O_RDONLY);
-    if (fd_ < 0) {
-      throw std::runtime_error("registry lock open failed for " + file_path +
-                               ": " + std::strerror(errno));
-    }
     const auto waited = wait.value_or(std::chrono::milliseconds::zero());
     const auto deadline = std::chrono::steady_clock::now() + waited;
     const int operation = wait ? (LOCK_EX | LOCK_NB) : LOCK_EX;
-    while (::flock(fd_, operation) < 0) {
-      const int error = errno;
-      if (error == EINTR) continue;
-      if (error == EWOULDBLOCK && std::chrono::steady_clock::now() < deadline) {
-        ::usleep(1000);
-        continue;
+    // A lock on a file unlinked meanwhile (a /tmp cleaner) excludes nobody
+    // who opens the path anew, so it is taken again on the file the path
+    // names (LockFileIsCurrent).
+    for (;;) {
+      // flock does not require write access, so the file is opened
+      // read-only: any process that may read it can lock it, whichever user
+      // created it.
+      fd_ = OpenLockFile(file_path, O_RDONLY);
+      if (fd_ < 0) {
+        throw std::runtime_error("registry lock open failed for " + file_path +
+                                 ": " + std::strerror(errno));
       }
+      while (::flock(fd_, operation) < 0) {
+        const int error = errno;
+        if (error == EINTR) continue;
+        if (error == EWOULDBLOCK &&
+            std::chrono::steady_clock::now() < deadline) {
+          ::usleep(1000);
+          continue;
+        }
+        ::close(fd_);
+        if (error == EWOULDBLOCK) {
+          throw std::runtime_error("registry lock " + file_path +
+                                   " has been held for " +
+                                   std::to_string(waited.count()) +
+                                   " ms by another process, likely one "
+                                   "stopped while it registered a node");
+        }
+        throw std::runtime_error("registry lock failed for " + file_path +
+                                 ": " + std::strerror(error));
+      }
+      if (LockFileIsCurrent(fd_, file_path)) return;
       ::close(fd_);
-      if (error == EWOULDBLOCK) {
-        throw std::runtime_error("registry lock " + file_path +
-                                 " has been held for " +
-                                 std::to_string(waited.count()) +
-                                 " ms by another process, likely one stopped "
-                                 "while it registered a node");
-      }
-      throw std::runtime_error("registry lock failed for " + file_path + ": " +
-                               std::strerror(error));
     }
   }
 
@@ -1148,6 +1158,38 @@ class RegistryReader {
   }
   std::uint32_t source_capacity() const {
     return mapping_.header()->source_capacity;
+  }
+
+  // The rows a claim cannot take: ACTIVE rows whose owner still runs and
+  // heartbeated within kLivenessTimeout, constructing or not -- what
+  // NodeRegistration's sweep keeps. kMaxNodes minus their count is how many
+  // nodes can register now. Owner liveness is the sweep's own test, so a
+  // reader takes no lock here either.
+  std::vector<NodeSnapshot> held_rows() const {
+    std::vector<NodeSnapshot> out;
+    const RegistryHeader* header = mapping_.header();
+    const std::int64_t now = monotonic_now_ns();
+    const std::int64_t timeout =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
+            .count();
+    for (std::size_t i = 0; i < kMaxNodes; ++i) {
+      const NodeRecord& record = header->nodes[i];
+      if (record.state.load(std::memory_order_acquire) !=
+          static_cast<std::uint64_t>(SlotState::ACTIVE)) {
+        continue;
+      }
+      const std::uint64_t claimant =
+          (record.pid_start << kProcessPidBits) | record.pid;
+      if (now - record.heartbeat_monotonic_ns.load(std::memory_order_relaxed) >=
+              timeout ||
+          !talos::ProcessWordAlive(claimant)) {
+        continue;
+      }
+      NodeSnapshot node = copy(record, i);
+      node.alive = (node.flags & kFlagConstructing) == 0;
+      out.push_back(std::move(node));
+    }
+    return out;
   }
 
   std::vector<NodeSnapshot> nodes() const {

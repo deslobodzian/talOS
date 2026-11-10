@@ -41,9 +41,9 @@ int main(int argc, char** argv) {
       } else if (arg == "--remote" && i + 1 < argc) {
         options.remote = argv[++i];
       } else if (arg == "--remote-port" && i + 1 < argc) {
-        options.remote_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        options.remote_port = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--local-port" && i + 1 < argc) {
-        options.local_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        options.local_port = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--duration-s" && i + 1 < argc) {
         options.duration_s = std::stoi(argv[++i]);
       } else if (arg == "--session-id" && i + 1 < argc) {
@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
       } else if (arg == "--start-studio-bridge") {
         options.start_studio_bridge = true;
       } else if (arg == "--studio-http-port" && i + 1 < argc) {
-        options.studio_http_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        options.studio_http_port = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--allow-graph-errors") {
         options.allow_graph_errors = true;
       } else if (arg == "--describe-only") {

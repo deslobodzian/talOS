@@ -12,6 +12,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 
@@ -21,20 +22,37 @@ namespace talos::introspect {
 // register a node or run a launcher can open it. A lock file holds no data.
 inline constexpr mode_t kLockFileMode = 0666;
 
-// Where lock files live. On Linux, /dev/shm, beside the segments themselves:
-// every process that shares the segments shares the directory (a service with
-// systemd's PrivateTmp= has a /tmp of its own, not a /dev/shm), and the tmpfs
-// is emptied at boot with them. macOS keeps shared memory in the kernel, so
-// there it is /tmp, which launchd daemons and logged-in users share. Both are
-// sticky and world-writable; OpenLockFile is why that is safe.
-inline const char* LockDirectory() {
+// Where lock files live. Under Bazel's TEST_TMPDIR namespace (no
+// TALOS_SHM_NAMESPACE, the same precedence as ShmObjectName), the test's own
+// temporary directory: it is the namespace, every process in it inherits it,
+// and Bazel removes it with the test, so a test run's lock files do not
+// accumulate until reboot. Otherwise, on Linux, /dev/shm, beside the segments
+// themselves: every process that shares the segments shares the directory (a
+// service with systemd's PrivateTmp= has a /tmp of its own, not a /dev/shm),
+// and the tmpfs is emptied at boot with them. macOS keeps shared memory in the
+// kernel, so there it is /tmp, which launchd daemons and logged-in users share
+// and which is emptied at boot; its tmp_cleaner deletes files whose atime,
+// mtime and ctime are all older than 3 days, so a lock held longer is touched
+// by its holder (TouchLockFile) and every acquisition checks it locked the
+// file the path still names (LockFileIsCurrent). /dev/shm and /tmp are sticky
+// and world-writable; OpenLockFile is why that is safe.
+inline const std::string& LockDirectory() {
+  static const std::string directory = [] {
+    if (std::getenv("TALOS_SHM_NAMESPACE") == nullptr) {
+      if (const char* test = std::getenv("TEST_TMPDIR");
+          test != nullptr && *test != '\0') {
+        return std::string{test};
+      }
+    }
 #if defined(__linux__)
-  struct stat status {};
-  if (::stat("/dev/shm", &status) == 0 && S_ISDIR(status.st_mode)) {
-    return "/dev/shm";
-  }
+    struct stat status{};
+    if (::stat("/dev/shm", &status) == 0 && S_ISDIR(status.st_mode)) {
+      return std::string{"/dev/shm"};
+    }
 #endif
-  return "/tmp";
+    return std::string{"/tmp"};
+  }();
+  return directory;
 }
 
 // The lock file of the shared-memory object `mapped` (a ShmObjectName
@@ -42,8 +60,7 @@ inline const char* LockDirectory() {
 // file never takes a segment's name in /dev/shm.
 inline std::string LockFilePath(std::string_view mapped) {
   while (mapped.starts_with('/')) mapped.remove_prefix(1);
-  return std::string{LockDirectory()} + "/talos-" + std::string{mapped} +
-         ".lock";
+  return LockDirectory() + "/talos-" + std::string{mapped} + ".lock";
 }
 
 // Opens a lock file for `access` (O_RDONLY or O_RDWR), creating it when
@@ -76,6 +93,23 @@ inline int OpenLockFile(const std::string& path, int access) {
   errno = EEXIST;
   return -1;
 }
+
+// True while `path` names the file open on `fd`. A lock taken on a file that
+// was unlinked meanwhile (by its last holder never, but by a /tmp cleaner, or
+// by hand) excludes nobody who opens the path anew, so an acquirer that finds
+// this false closes the descriptor and acquires again.
+inline bool LockFileIsCurrent(int fd, const std::string& path) {
+  struct stat held{};
+  struct stat named{};
+  return ::fstat(fd, &held) == 0 && ::lstat(path.c_str(), &named) == 0 &&
+         held.st_dev == named.st_dev && held.st_ino == named.st_ino;
+}
+
+// Marks a lock file just used, so a cleaner of unused /tmp files (macOS's
+// tmp_cleaner: atime, mtime and ctime all older than 3 days) passes it over
+// while it is held. Needs the file's owner or write access, which kLockFileMode
+// gives.
+inline bool TouchLockFile(int fd) { return ::futimens(fd, nullptr) == 0; }
 
 // "owner uid U, mode 0MMM" of a file, for a diagnostic.
 inline std::string DescribeOwner(const struct stat& status) {

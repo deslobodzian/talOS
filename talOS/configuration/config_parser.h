@@ -17,7 +17,10 @@
 // parser only checks what Validate cannot see (types, names, references, and
 // each actuator owner's period_us against command_timeout_us).
 
+#include <arpa/inet.h>
+
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -92,9 +95,16 @@ struct RobotConfig {
   // lives as seen from this companion. Loopback by default, so simulation and
   // loopback tests work with no extra configuration. Set to the RIO address
   // (e.g. "10.56.87.2") for a real robot, either here or via --remote.
+  // An IPv4 literal: the bridge's socket (talOS/protocol/udp.h) takes one
+  // and never resolves a hostname, so config load refuses anything else.
   std::string controller_address{"127.0.0.1"};
   uint16_t controller_port{5802};
   uint16_t local_port{5803};
+
+  // Launcher log retention: sessions kept under the log root (the new one
+  // included) and the root's byte budget. Both positive integers.
+  int64_t log_keep_sessions{50};
+  int64_t log_max_bytes{int64_t{2} * 1024 * 1024 * 1024};
 
   // Refuse a described graph with no producer for an actuated subsystem's mode.
   bool require_target_coverage{false};
@@ -190,6 +200,21 @@ inline std::string ReadNonEmpty(const toml::table& tbl, const char* key,
   if (v.empty()) {
     throw std::invalid_argument(std::string(table_name) + " field '" + key +
                                 "' must be a non-empty string");
+  }
+  return v;
+}
+
+inline bool IsIpv4Address(const std::string& address) {
+  in_addr parsed{};
+  return inet_pton(AF_INET, address.c_str(), &parsed) == 1;
+}
+
+inline int64_t ReadPositive(const toml::table& tbl, const char* key,
+                            int64_t def, const char* table_name) {
+  const int64_t v = Read(tbl, key, def);
+  if (v < 1) {
+    throw std::invalid_argument(std::string(table_name) + " field '" + key +
+                                "' must be a positive integer");
   }
   return v;
 }
@@ -658,12 +683,34 @@ inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
 
 }  // namespace detail
 
+// A port flag's value: a decimal integer in [1, 65535], else
+// std::invalid_argument naming `flag` (std::stoi would accept "5802x" and a
+// uint16_t cast would wrap 70000 to 4464).
+inline uint16_t ParsePortFlag(std::string_view flag, std::string_view value) {
+  int port = 0;
+  const auto* end = value.data() + value.size();
+  const auto [ptr, ec] = std::from_chars(value.data(), end, port);
+  if (value.empty() || ec != std::errc{} || ptr != end || port < 1 ||
+      port > 65535) {
+    throw std::invalid_argument(std::string(flag) +
+                                " must be a port in [1, 65535], not '" +
+                                std::string(value) + "'");
+  }
+  return static_cast<uint16_t>(port);
+}
+
 // Effective controller endpoint: an explicit CLI value wins, otherwise the
-// deployment configuration. A zero CLI port means "not given".
+// deployment configuration. A zero CLI port means "not given". A CLI address
+// that is not an IPv4 literal throws std::invalid_argument, as config load
+// does for controller_address.
 inline std::string ResolveControllerAddress(const RobotConfig& config,
                                             const std::string& cli_override) {
-  if (!cli_override.empty()) return cli_override;
-  return config.controller_address;
+  if (cli_override.empty()) return config.controller_address;
+  if (!detail::IsIpv4Address(cli_override)) {
+    throw std::invalid_argument("--remote must be an IPv4 address, not '" +
+                                cli_override + "'");
+  }
+  return cli_override;
 }
 
 inline uint16_t ResolveControllerPort(const RobotConfig& config,
@@ -703,10 +750,20 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
         Read(*robot, "require_target_coverage", result.require_target_coverage);
     result.controller_address = detail::ReadNonEmpty(
         *robot, "controller_address", result.controller_address, "[robot]");
+    if (!detail::IsIpv4Address(result.controller_address)) {
+      throw std::invalid_argument(
+          "[robot] field 'controller_address' must be an IPv4 address such "
+          "as \"10.56.87.2\", not '" +
+          result.controller_address + "': the bridge resolves no hostname");
+    }
     result.controller_port = detail::ReadPort(
         *robot, "controller_port", result.controller_port, "[robot]");
     result.local_port =
         detail::ReadPort(*robot, "local_port", result.local_port, "[robot]");
+    result.log_keep_sessions = detail::ReadPositive(
+        *robot, "log_keep_sessions", result.log_keep_sessions, "[robot]");
+    result.log_max_bytes = detail::ReadPositive(
+        *robot, "log_max_bytes", result.log_max_bytes, "[robot]");
     if (robot->contains("targets")) {
       const auto* targets = (*robot)["targets"].as_table();
       if (targets == nullptr) {
@@ -977,11 +1034,14 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
 
   if (validate_hardware) {
     hardware::Validate(hw);
-    // The bridge holds an actuator owner's last request for at least two of
-    // its periods, and the merged command carries the oldest observation it
-    // holds, which the gateway refuses once that is command_timeout_us old:
-    // an owner slower than half the timeout would expire every owner's
-    // command with its own.
+    // The bridge holds an actuator owner's last request for
+    // max(2 x period_us, command_timeout_us / 2), and the merged command
+    // carries the oldest observation it holds, which the gateway refuses once
+    // that is command_timeout_us old. At period_us <= command_timeout_us / 4
+    // the owner timeout is half the timeout, so a silent owner leaves the
+    // merge while its last observation can still be younger than the
+    // gateway's limit; a slower owner would hold it longer and expire every
+    // owner's command with its own.
     for (const auto& [name, owned] : result.subsystems) {
       if (owned.motors.empty() && owned.digital_outputs.empty() &&
           owned.pwm_outputs.empty()) {
@@ -989,11 +1049,11 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
       }
       const auto period_us = Read(*result.GetSubsystemTable(name), "period_us",
                                   int64_t{hw.period_us});
-      if (period_us > int64_t{hw.command_timeout_us / 2}) {
+      if (period_us > int64_t{hw.command_timeout_us / 4}) {
         throw std::invalid_argument(
             "[subsystems." + name + "] owns actuators, so its period_us (" +
             std::to_string(period_us) +
-            ") must be at most half of [robot] command_timeout_us (" +
+            ") must be at most a quarter of [robot] command_timeout_us (" +
             std::to_string(hw.command_timeout_us) + ")");
       }
     }

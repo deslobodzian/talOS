@@ -302,37 +302,6 @@ TEST(HardwareNodeTest, LastSubsystemTimeoutSendsOneFreshNeutralFrame) {
   EXPECT_TRUE(receive_commands().empty());
 }
 
-// A slow actuator owner keeps two of its own periods when that is longer
-// than half the command timeout: its ordinary cadence must not neutralize it.
-TEST(HardwareNodeTest, SlowOwnerTimeoutIsTwoOfItsPeriods) {
-  auto cfg = config::ParseRobotConfigString(R"(
-[robot]
-period_us = 20000
-command_timeout_us = 100000
-[subsystems.mech]
-period_us = 40000
-[subsystems.mech.motors.motor]
-can_id = 1
-)");
-  HardwareNode node{cfg, "127.0.0.1", TestPort(26002), TestPort(26003), true};
-  ASSERT_TRUE(node.Open());
-  ipc::Publisher<Packet> pub{RequestTopic("mech")};
-  Command request{};
-  request.config_id = NodeConfigId(cfg);
-  request.count = 1;
-  request.motors[0] = {cfg.hardware.motors[0].id, Mode::kVoltage, 0, 4.0, 0.0};
-  PublishCommand(pub, request);
-  node.Tick(1000);
-  node.Tick(51001);  // Past half the command timeout.
-  EXPECT_FALSE(node.is_subsystem_timed_out("mech"));
-  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kVoltage);
-  node.Tick(81000);
-  EXPECT_FALSE(node.is_subsystem_timed_out("mech"));
-  node.Tick(81001);
-  EXPECT_TRUE(node.is_subsystem_timed_out("mech"));
-  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
-}
-
 // Commissioning is forced by --sim alone, the flag every node also reads
 // (HardwareLink). A loopback bridge without --sim keeps the config's own id,
 // as nodes launched without --sim do, or they would drop every State.

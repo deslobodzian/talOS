@@ -170,7 +170,8 @@ oldest restart ages out, plus normal backoff.
 Exactly one retry is pending, so clearing a transient fault can recover without a service
 restart. The session manifest records `quarantined` and
 `retry_at_monotonic_ns`; a stopping session cancels pending retries.
-`max_restarts = 0` never restarts a node. Registry version 4
+`--max-restarts 0` never restarts a node; `[robot] max_restarts` must be at
+least 1. Registry version 4
 (`/talos_registry.4`) uses host-monotonic heartbeat/liveness timestamps, so
 wall-clock corrections cannot falsely evict healthy nodes; deploy all node
 and viewer binaries together.

@@ -43,6 +43,51 @@ class SessionLock {
   static std::optional<SessionLock> Acquire(std::string& error) {
     const std::string path =
         introspect::LockFilePath(ShmObjectName(kSessionLockName));
+    // A lock taken on a file unlinked meanwhile (a /tmp cleaner, by hand)
+    // excludes nobody who opens the path anew: take it again on the file the
+    // path names.
+    for (int attempt = 0; attempt < 10; ++attempt) {
+      auto lock = AcquireOnce(path, error);
+      if (!lock || introspect::LockFileIsCurrent(lock->fd_, path)) return lock;
+    }
+    error = "cannot lock the session lock " + path +
+            ": it was removed every time it was locked";
+    return std::nullopt;
+  }
+
+  // Keeps the held lock file from looking unused (introspect::TouchLockFile),
+  // so a cleaner of old /tmp files does not delete it under a long session.
+  // False when the path no longer names the locked file: a second launcher
+  // could then start in this namespace. Call it at least daily.
+  bool Refresh() const {
+    introspect::TouchLockFile(fd_);
+    return introspect::LockFileIsCurrent(fd_, path_);
+  }
+
+  ~SessionLock() {
+    if (fd_ >= 0) ::close(fd_);
+  }
+
+  SessionLock(const SessionLock&) = delete;
+  SessionLock& operator=(const SessionLock&) = delete;
+  SessionLock(SessionLock&& other) noexcept
+      : fd_{std::exchange(other.fd_, -1)}, path_{std::move(other.path_)} {}
+  SessionLock& operator=(SessionLock&& other) noexcept {
+    if (this != &other) {
+      if (fd_ >= 0) ::close(fd_);
+      fd_ = std::exchange(other.fd_, -1);
+      path_ = std::move(other.path_);
+    }
+    return *this;
+  }
+
+  const std::string& path() const { return path_; }
+
+ private:
+  SessionLock(int fd, std::string path) : fd_{fd}, path_{std::move(path)} {}
+
+  static std::optional<SessionLock> AcquireOnce(const std::string& path,
+                                                std::string& error) {
     const int fd = introspect::OpenLockFile(path, O_RDWR);
     if (fd < 0) {
       const int open_error = errno;
@@ -83,28 +128,6 @@ class SessionLock {
     ::close(fd);
     return std::nullopt;
   }
-
-  ~SessionLock() {
-    if (fd_ >= 0) ::close(fd_);
-  }
-
-  SessionLock(const SessionLock&) = delete;
-  SessionLock& operator=(const SessionLock&) = delete;
-  SessionLock(SessionLock&& other) noexcept
-      : fd_{std::exchange(other.fd_, -1)}, path_{std::move(other.path_)} {}
-  SessionLock& operator=(SessionLock&& other) noexcept {
-    if (this != &other) {
-      if (fd_ >= 0) ::close(fd_);
-      fd_ = std::exchange(other.fd_, -1);
-      path_ = std::move(other.path_);
-    }
-    return *this;
-  }
-
-  const std::string& path() const { return path_; }
-
- private:
-  SessionLock(int fd, std::string path) : fd_{fd}, path_{std::move(path)} {}
 
   static struct flock Whole(int type) {
     struct flock lock {};

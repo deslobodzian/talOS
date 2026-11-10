@@ -696,6 +696,9 @@ TEST(LauncherTest, MaxRestartsComesFromFlagThenConfigThenDefault) {
 
   EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = -1\n"), {},
                                   max, error));
+  // A config cannot turn off critical members' restarts; only the flag can.
+  EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = 0\n"), {},
+                                  max, error));
   EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = 1.5\n"), {},
                                   max, error));
   EXPECT_FALSE(ResolveMaxRestarts(with_robot_keys("max_restarts = \"3\"\n"), {},
