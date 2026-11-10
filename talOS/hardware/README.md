@@ -313,6 +313,21 @@ enable and e-stop.
 The adapter retries a failed gateway socket open once per second from its main
 loop, ticking the gateway disabled (all outputs neutral) until the socket opens.
 
+That loop is the only runtime enforcer of the command timeout and output
+neutral, so it never writes a report itself. `PhoenixBackend` and the adapter
+post fixed-size events (fault-field, feedback-validity, apply and neutral
+send transitions, device resets, brownout) to `RioLog`
+(`src/main/include/RioLog.h`): a preallocated 256-event queue that never
+waits, dropping and counting events when full. A logger thread at nice 19
+(Linux) writes them to stderr, at most one line per second for each kind and
+device: the first change at once, then, while changes continue, one line a
+second with their count and, for the fault field, the bits that toggled. Once
+in any second that saw them, it also prints the dropped-event count and the
+loop's timing faults: overruns (a tick's work, from wake to sleep, longer than
+the period) and late ticks (a tick starting more than 1.5 periods after the
+previous, a starved loop however short its work), with that second's longest
+work and interval. `State` has no field for these, so they are RIO-local.
+
 Build without deploying:
 
 ```sh

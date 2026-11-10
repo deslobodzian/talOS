@@ -2,9 +2,11 @@ import org.gradle.internal.os.OperatingSystem
 
 // The RoboRIO program is deliberately small: a Driver Station loop and the
 // hardware gateway. Everything else in talOS builds with Bazel, and the tests
-// for the gateway live there (//talOS/hardware:gateway_test). The only
-// GradleRIO tests are desktop simulation regressions for the Phoenix
-// backend itself (src/test/cpp); there is no command-based framework.
+// for the gateway live there (//talOS/hardware:gateway_test). The GradleRIO
+// tests (src/test/cpp) cover only this program's own sources: desktop
+// simulation regressions for the Phoenix backend, the config store, the
+// simulated Driver Station and the logger; there is no command-based
+// framework.
 plugins {
     id "cpp"
     id "google-test"
@@ -147,8 +149,9 @@ model {
         }
     }
     testSuites {
-        // Desktop simulation tests for the hardware gateway backend
-        // (PhoenixBackend encoder + sim honesty regressions in src/test/cpp).
+        // Desktop tests of this program's sources (src/test/cpp): the
+        // PhoenixBackend simulation regressions, ConfigStore,
+        // SimDriverStation and RioLog.
         // The suite itself is auto-created per component by the google-test
         // plugin; this only points it at our sources and dependencies.
         frcUserProgramTest {
@@ -171,12 +174,12 @@ tasks.register("buildRio") {
     dependsOn 'frcUserProgramLinuxathenaReleaseExecutable'
 }
 
-// Stable entry point for the PhoenixBackend desktop simulation regressions in
-// src/test/cpp. The google-test plugin creates one RunTestExecutable task per
+// Stable entry point for the desktop tests in src/test/cpp (PhoenixBackend
+// simulation regressions, ConfigStore, SimDriverStation, RioLog). The google-test plugin creates one RunTestExecutable task per
 // desktop variant (runFrcUserProgramTest<Platform><BuildType>GoogleTestExe),
 // so CI pins this aggregator instead of a platform-specific variant name.
 tasks.register("phoenixTest") {
-    description = 'Run the PhoenixBackend desktop simulation tests'
+    description = 'Run the RoboRIO program desktop tests (PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog)'
     group = 'verification'
     def runTasks = tasks.matching { it.name.startsWith('runFrcUserProgramTest') }
     dependsOn runTasks

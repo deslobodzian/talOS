@@ -5,6 +5,7 @@
 #include <atomic>
 #include <memory>
 
+#include "RioLog.h"
 #include "hardware/endpoint.h"
 
 // The entire RoboRIO program: a fixed-rate loop that reads the Driver Station,
@@ -23,6 +24,9 @@ class Robot : public frc::RobotBase {
   void EndCompetition() override;
 
  private:
+  // Every report the loop thread makes goes through this queue to its logger
+  // thread; it outlives the backend, which posts to it.
+  std::unique_ptr<talos::rio::RioLog> log_;
   std::unique_ptr<talos::hardware::Backend> backend_;
   std::unique_ptr<talos::hardware::Gateway> gateway_;
   std::unique_ptr<talos::hardware::Endpoint> endpoint_;

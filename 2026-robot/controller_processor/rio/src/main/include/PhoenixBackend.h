@@ -23,15 +23,16 @@
 #include <string>
 #include <vector>
 
+#include "RioLog.h"
 #include "hardware/gateway.h"
 
 class PhoenixBackend final : public talos::hardware::Backend {
  public:
-  explicit PhoenixBackend(bool is_simulation = false);
-
-  // Decode the cached TalonFX FaultField (SPN 0x34c, frame 0xad), without CAN
-  // IO.
-  static std::string DecodeTalonFaultBits(uint32_t fault_flags);
+  // Reports go to `log`, which must outlive the backend; without one the
+  // backend starts its own. Read, Apply and Neutral run on the RoboRIO loop
+  // thread, so they only post fixed-size events (RioLog.h), never write.
+  explicit PhoenixBackend(bool is_simulation = false,
+                          talos::rio::RioLog* log = nullptr);
 
   bool Configure(const talos::hardware::Config&) override;
   void BeginConfigure(const talos::hardware::Config&) override;
@@ -67,6 +68,11 @@ class PhoenixBackend final : public talos::hardware::Backend {
   friend class PhoenixBackendFollowerFeedback;
   friend class PhoenixBackendRecovery;
   void UpdateSimulation(double dt);
+
+  // Declared first, so destroyed last: the configure worker (configure_) may
+  // still post while the backend is destroyed.
+  std::unique_ptr<talos::rio::RioLog> owned_log_;
+  talos::rio::RioLog* log_;
 
   struct Sensor {
     std::unique_ptr<ctre::phoenix6::hardware::CANcoder> encoder;

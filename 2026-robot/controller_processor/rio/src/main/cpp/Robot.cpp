@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <optional>
 #include <random>
+#include <string_view>
 #include <thread>
 
 #include "ConfigStore.h"
@@ -35,6 +36,18 @@ constexpr const char* kConfigPath = "/home/lvuser/talos_config.bin";
 #else
 constexpr const char* kConfigPath = "talos_config.bin";
 #endif
+
+// RioLog kMessage indices (rate-limit keys) of this file's reports; index 0 is
+// PhoenixBackend's configure failure.
+constexpr uint16_t kSocketMessage = 1;
+constexpr uint16_t kPersistMessage = 2;
+
+void Report(talos::rio::RioLog& log, uint16_t index, std::string_view text) {
+  talos::rio::LogEvent event;
+  event.index = index;
+  event.SetText(text);
+  log.Post(event);
+}
 
 // The Driver Station's watchdog: it must hear the current mode every loop, or
 // it decides robot code has hung and disables the robot. This is the one piece
@@ -66,7 +79,9 @@ uint32_t DriverStationModeFlags() {
 }  // namespace
 
 void Robot::StartCompetition() {
-  backend_ = std::make_unique<PhoenixBackend>(IsSimulation());
+  log_ = std::make_unique<talos::rio::RioLog>();
+  log_->Start();
+  backend_ = std::make_unique<PhoenixBackend>(IsSimulation(), log_.get());
 
   // A fresh boot id every start, so a command built against a previous boot's
   // state can never be accepted after a code restart.
@@ -134,7 +149,19 @@ void Robot::StartCompetition() {
   // Real and desktop Driver Stations are both read back through WPILib.
   talos::driver_station::ModeTracker ds_mode;
 
+  // Tick starts, so the logger can report a loop woken late (starved of the
+  // CPU) even when each tick's own work is short.
+  std::optional<std::chrono::steady_clock::time_point> previous_tick_start;
   while (running_.load(std::memory_order_relaxed)) {
+    const auto tick_start = std::chrono::steady_clock::now();
+    const uint64_t tick_interval_us =
+        previous_tick_start
+            ? static_cast<uint64_t>(
+                  std::chrono::duration_cast<std::chrono::microseconds>(
+                      tick_start - *previous_tick_start)
+                      .count())
+            : 0;
+    previous_tick_start = tick_start;
     if (gateway_->configured()) {
       period = std::chrono::microseconds{gateway_->config().period_us};
     }
@@ -162,9 +189,12 @@ void Robot::StartCompetition() {
           IsSimulation() ? "127.0.0.1" : kCompanionAddress, 5803);
       socket_open = status == talos::protocol::UdpStatus::kOk;
       next_socket_retry_us = now_us + 1000000;
-      if (!socket_open)
-        std::printf("hardware gateway socket failed: %s\n",
-                    talos::protocol::UdpStatusName(status));
+      if (!socket_open) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "hardware gateway socket failed: %s",
+                      talos::protocol::UdpStatusName(status));
+        Report(*log_, kSocketMessage, text);
+      }
     }
     if (socket_open) {
       // Endpoint handles clock probes even disabled/uncommissioned, echoing
@@ -205,13 +235,22 @@ void Robot::StartCompetition() {
       if (talos::rio::SaveConfigFile(kConfigPath, *unsaved))
         saved_id = talos::hardware::ConfigurationId(*unsaved);
       else
-        std::fprintf(stderr, "cannot persist hardware configuration\n");
+        Report(*log_, kPersistMessage, "cannot persist hardware configuration");
       unsaved.reset();
     }
 
     // An overrun must not turn into a burst of catch-up iterations that starve
     // the Driver Station refresh; give up the missed cycles and stay on phase.
     const auto now = std::chrono::steady_clock::now();
+    // Start-to-start interval and wake-to-sleep work against the period,
+    // which the logger thread reports once a second as late ticks and
+    // overruns.
+    log_->RecordTick(tick_interval_us,
+                     static_cast<uint64_t>(
+                         std::chrono::duration_cast<std::chrono::microseconds>(
+                             now - tick_start)
+                             .count()),
+                     static_cast<uint64_t>(period.count()));
     if (next < now) {
       next = now;
     }
@@ -247,6 +286,7 @@ void Robot::StartCompetition() {
   endpoint_.reset();
   gateway_.reset();
   backend_.reset();
+  log_.reset();
 }
 
 void Robot::EndCompetition() {

@@ -11,8 +11,6 @@
 #include <ctre/phoenix6/controls/PositionVoltage.hpp>
 #include <ctre/phoenix6/controls/VelocityVoltage.hpp>
 #include <ctre/phoenix6/controls/VoltageOut.hpp>
-#include <iomanip>
-#include <iostream>
 #include <limits>
 #include <string>
 
@@ -52,17 +50,25 @@ uint32_t Age(const ph::BaseStatusSignal& signal) {
   return static_cast<uint32_t>(std::max(0.0, std::ceil(age)));
 }
 
-void LogFeedbackChange(const char* kind, const std::string& name, uint16_t id,
+// Posts a feedback validity change: the loop thread only copies it.
+void LogFeedbackChange(talos::rio::RioLog& log, talos::rio::LogKind kind,
+                       std::size_t index, const std::string& name, uint16_t id,
                        const std::string& bus, int can_id, bool valid,
                        const ph::BaseStatusSignal& p,
                        const ph::BaseStatusSignal& v) {
-  std::cerr << "[phoenix] " << kind << " " << name << " (id=" << id
-            << ", bus=" << bus << ", can_id=" << can_id << ") feedback "
-            << (valid ? "RECOVERED" : "INVALID/STALE")
-            << " (position_status=" << p.GetStatus().GetName()
-            << ", velocity_status=" << v.GetStatus().GetName()
-            << ", position_age_us=" << Age(p) << ", velocity_age_us=" << Age(v)
-            << ")\n";
+  talos::rio::LogEvent event;
+  event.kind = kind;
+  event.index = static_cast<uint16_t>(index);
+  event.id = id;
+  event.can_id = can_id;
+  event.flag = valid;
+  event.status = p.GetStatus().GetName();
+  event.status2 = v.GetStatus().GetName();
+  event.age_us = Age(p);
+  event.age2_us = Age(v);
+  event.SetName(name);
+  event.SetBus(bus);
+  log.Post(event);
 }
 
 // A config apply or a signal-rate change can miss its reply window while a
@@ -88,58 +94,15 @@ constexpr double kSimNeutralCoastTauS = 1.0;
 // Friction holds a nearly-stopped unpowered rotor instead of creeping forever
 // (same standstill snap as StepAxis).
 constexpr double kSimNeutralStandstillRps = 0.01;
+// RioLog kMessage index of the configure-failure line (its rate-limit key).
+constexpr uint16_t kConfigureFailedMessage = 0;
 }  // namespace
 
-PhoenixBackend::PhoenixBackend(bool is_simulation)
-    : is_simulation_{is_simulation} {}
-
-std::string PhoenixBackend::DecodeTalonFaultBits(uint32_t fault_flags) {
-  if (fault_flags == 0) return "none";
-  // Phoenix 6 TalonFX FaultField, SPN 0x34c / CAN frame 0xad.
-  static constexpr std::array<const char*, 32> names{
-      "Hardware (hardware fault occurred)",
-      "ProcTemp (processor temperature exceeded limit)",
-      "DeviceTemp (device temperature exceeded limit)",
-      "Undervoltage (supply voltage near brownout)",
-      "BootDuringEnable (booted while enabled)",
-      "UnlicensedFeatureInUse (unlicensed feature in use)",
-      "StaticBrakeDisabled (static brake momentarily disabled)",
-      "UsingFusedCANcoderWhileUnlicensed (fused CANcoder requires Pro)",
-      "SupplyCurrLimit (supply current limit active)",
-      "StatorCurrLimit (stator current limit active)",
-      "FusedSensorOutOfSync (remote fused sensor out of sync)",
-      "RemoteSensorDataInvalid (remote sensor data invalid)",
-      "MissingHardLimitRemote (remote hard limit device missing)",
-      "MissingSoftLimitRemote (remote soft limit device missing)",
-      "ForwardSoftLimit (forward soft limit asserted)",
-      "ReverseSoftLimit (reverse soft limit asserted)",
-      "ForwardHardLimit (forward hard limit asserted)",
-      "ReverseHardLimit (reverse hard limit asserted)",
-      "OverSupplyV (supply voltage exceeded rating)",
-      "UnstableSupplyV (supply voltage unstable)",
-      "RemoteSensorPosOverflow (remote sensor position overflowed)",
-      "MissingDifferentialFX (differential TalonFX missing)",
-      "RemoteSensorReset (remote sensor reset)",
-      "BridgeBrownout (bridge disabled due to supply voltage)",
-      nullptr,
-      "RotorFault1 (rotor fault 1)",
-      "RotorFault2 (rotor fault 2)",
-      nullptr,
-      nullptr,
-      nullptr,
-      nullptr,
-      nullptr};
-  std::string faults;
-  for (unsigned bit = 0; bit < names.size(); ++bit) {
-    if ((fault_flags & (uint32_t{1} << bit)) == 0) continue;
-    if (!faults.empty()) faults += ", ";
-    if (names[bit]) {
-      faults += names[bit];
-    } else {
-      faults += "UnknownBit" + std::to_string(bit);
-    }
-  }
-  return faults;
+PhoenixBackend::PhoenixBackend(bool is_simulation, talos::rio::RioLog* log)
+    : owned_log_{log ? nullptr : std::make_unique<talos::rio::RioLog>()},
+      log_{log ? log : owned_log_.get()},
+      is_simulation_{is_simulation} {
+  if (owned_log_) owned_log_->Start();
 }
 
 std::optional<hw::ConfigError> PhoenixBackend::last_config_error() const {
@@ -461,10 +424,12 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   }
   if (!ok && last_error_) {
     const auto& error = *last_error_;
-    std::cerr << "[phoenix] configure failed on " << error.device_name
-              << " (bus=" << error.bus << ", can_id=" << error.can_id
-              << ", op=" << error.operation << "): " << error.message
-              << " (status=" << error.vendor_status << ")\n";
+    // Configure runs on the configure worker; it still posts, so its line
+    // stays ordered with the loop thread's.
+    talos::rio::LogEvent event;
+    event.index = kConfigureFailedMessage;
+    event.SetText("[phoenix] " + hw::FormatConfigError(error));
+    log_->Post(event);
   }
   // Structural validity succeeded; unavailable devices are isolated and
   // retried.
@@ -479,9 +444,14 @@ bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
     if (motors_[i]->HasResetOccurred()) {
       const auto& motor = config_.motors[i];
       reset_ids.push_back(motor.id);
-      std::cerr << "[phoenix] device reset detected: motor " << motor.name
-                << " (id=" << motor.id << ", bus=" << motor.bus
-                << ", can_id=" << motor.can_id << ")\n";
+      talos::rio::LogEvent event;
+      event.kind = talos::rio::LogKind::kDeviceReset;
+      event.index = static_cast<uint16_t>(i);
+      event.id = motor.id;
+      event.can_id = motor.can_id;
+      event.SetName(motor.name);
+      event.SetBus(motor.bus);
+      log_->Post(event);
     }
   }
   for (std::size_t i = 0; i < sensors_.size() && i < config_.sensors.size();
@@ -492,9 +462,16 @@ bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
     if (reset) {
       const auto& sensor = config_.sensors[i];
       reset_ids.push_back(sensor.id);
-      std::cerr << "[phoenix] device reset detected: sensor " << sensor.name
-                << " (id=" << sensor.id << ", bus=" << sensor.bus
-                << ", can_id=" << sensor.can_id << ")\n";
+      talos::rio::LogEvent event;
+      event.kind = talos::rio::LogKind::kDeviceReset;
+      // Sensor slots follow the motor slots in the rate-limit key.
+      event.index = static_cast<uint16_t>(hw::kMaxMotors + i);
+      event.flag = true;
+      event.id = sensor.id;
+      event.can_id = sensor.can_id;
+      event.SetName(sensor.name);
+      event.SetBus(sensor.bus);
+      log_->Post(event);
     }
   }
   return !reset_ids.empty();
@@ -619,24 +596,24 @@ bool PhoenixBackend::Read(hw::State& s) {
       out.temperature_c = 25.0;
     }
     if (out.fault_flags != last_fault_flags_[i]) {
-      const uint32_t prev = last_fault_flags_[i];
-      const uint32_t raised = out.fault_flags & ~prev;
-      const uint32_t cleared = prev & ~out.fault_flags;
-      std::cerr << "[phoenix] motor " << motor_config.name << " (mask_bit=" << i
-                << ", id=" << motor_config.id << ", bus=" << motor_config.bus
-                << ", can_id=" << motor_config.can_id << ") fault_flags=0x"
-                << std::hex << out.fault_flags << " (was 0x" << prev << ")"
-                << std::dec;
-      if (raised != 0)
-        std::cerr << " raised=[" << DecodeTalonFaultBits(raised) << "]";
-      if (cleared != 0)
-        std::cerr << " cleared=[" << DecodeTalonFaultBits(cleared) << "]";
-      std::cerr << " active=[" << DecodeTalonFaultBits(out.fault_flags) << "]"
-                << " pos=" << out.position_rot
-                << " rot vel=" << out.velocity_rps << " rps V=" << out.voltage
-                << "V I=" << out.stator_current_a
-                << "A (limits: supply=" << motor_config.supply_limit_a
-                << "A stator=" << motor_config.stator_limit_a << "A)\n";
+      // Current-limit bits toggle at the fault-field rate under hard
+      // acceleration: post only, and let the logger coalesce them.
+      talos::rio::LogEvent event;
+      event.kind = talos::rio::LogKind::kMotorFault;
+      event.index = static_cast<uint16_t>(i);
+      event.id = motor_config.id;
+      event.can_id = motor_config.can_id;
+      event.value = out.fault_flags;
+      event.previous = last_fault_flags_[i];
+      event.a = out.position_rot;
+      event.b = out.velocity_rps;
+      event.c = out.voltage;
+      event.d = out.stator_current_a;
+      event.limit1 = motor_config.supply_limit_a;
+      event.limit2 = motor_config.stator_limit_a;
+      event.SetName(motor_config.name);
+      event.SetBus(motor_config.bus);
+      log_->Post(event);
       last_fault_flags_[i] = out.fault_flags;
     }
     out.valid = Fresh(p) && Fresh(v) && std::isfinite(out.position_rot) &&
@@ -644,8 +621,9 @@ bool PhoenixBackend::Read(hw::State& s) {
                 std::find(unavailable_.begin(), unavailable_.end(),
                           motor_config.id) == unavailable_.end();
     if (out.valid != last_motor_valid_[i]) {
-      LogFeedbackChange("motor", motor_config.name, motor_config.id,
-                        motor_config.bus, motor_config.can_id, out.valid, p, v);
+      LogFeedbackChange(*log_, talos::rio::LogKind::kMotorFeedback, i,
+                        motor_config.name, motor_config.id, motor_config.bus,
+                        motor_config.can_id, out.valid, p, v);
       last_motor_valid_[i] = out.valid;
     }
     healthy |= out.valid;
@@ -687,9 +665,9 @@ bool PhoenixBackend::Read(hw::State& s) {
         std::isfinite(out.position_rot) && std::isfinite(out.velocity_rps);
     if (out.valid != last_sensor_valid_[i]) {
       const auto& sensor = config_.sensors[i];
-      LogFeedbackChange("sensor", sensor.name, sensor.id, sensor.bus,
-                        sensor.can_id, out.valid, *position_signal,
-                        *velocity_signal);
+      LogFeedbackChange(*log_, talos::rio::LogKind::kSensorFeedback, i,
+                        sensor.name, sensor.id, sensor.bus, sensor.can_id,
+                        out.valid, *position_signal, *velocity_signal);
       last_sensor_valid_[i] = out.valid;
     }
     healthy |= out.valid;
@@ -767,25 +745,19 @@ bool PhoenixBackend::Read(hw::State& s) {
       motor_fault_mask |= uint32_t{1} << i;
   }
   if (motor_fault_mask != last_motor_fault_mask_) {
-    std::cerr << "[phoenix] motor_fault_mask changed: 0x" << std::hex
-              << last_motor_fault_mask_ << " -> 0x" << motor_fault_mask
-              << std::dec << " (active motors: ";
-    bool first = true;
-    for (std::size_t i = 0; i < motors_.size(); ++i) {
-      if (!hw::MotorFaulted(s.motors[i].fault_flags)) continue;
-      if (!first) std::cerr << ", ";
-      const auto& motor = config_.motors[i];
-      std::cerr << i << ":" << motor.name << "(" << motor.can_id << ")";
-      first = false;
-    }
-    if (first) std::cerr << "none";
-    std::cerr << ")\n";
+    talos::rio::LogEvent event;
+    event.kind = talos::rio::LogKind::kMotorFaultMask;
+    event.value = motor_fault_mask;
+    event.previous = last_motor_fault_mask_;
+    log_->Post(event);
     last_motor_fault_mask_ = motor_fault_mask;
   }
   if (s.health.brownout != last_brownout_) {
-    std::cerr << "[phoenix] power brownout "
-              << (s.health.brownout ? "ACTIVE" : "CLEARED")
-              << " (battery_v=" << s.health.battery_v << "V)\n";
+    talos::rio::LogEvent event;
+    event.kind = talos::rio::LogKind::kBrownout;
+    event.flag = s.health.brownout;
+    event.a = s.health.battery_v;
+    log_->Post(event);
     last_brownout_ = s.health.brownout;
   }
   return healthy;
@@ -801,11 +773,14 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
     const bool failed = !status.IsOK();
     const auto& config = config_.motors[i];
     if (failed != apply_failing_[i]) {
-      std::cerr << "[phoenix] apply control "
-                << (failed ? "failed" : "recovered") << " on motor "
-                << config.name << " (can_id=" << config.can_id
-                << "): " << status.GetName()
-                << (failed ? "; neutralizing only this motor" : "") << "\n";
+      talos::rio::LogEvent event;
+      event.kind = talos::rio::LogKind::kApplyControl;
+      event.index = static_cast<uint16_t>(i);
+      event.can_id = config.can_id;
+      event.flag = failed;
+      event.status = status.GetName();
+      event.SetName(config.name);
+      log_->Post(event);
     }
     apply_failing_[i] = failed;
     if (!failed) return;
@@ -937,10 +912,14 @@ void PhoenixBackend::Neutral() {
     if (failed) ++neutral_send_failure_count_;
     if (failed != neutral_send_failing_[i] && i < config_.motors.size()) {
       const auto& motor = config_.motors[i];
-      std::cerr << "[phoenix] neutral send "
-                << (failed ? "failing" : "recovered") << " on motor "
-                << motor.name << " (can_id=" << motor.can_id
-                << "): " << status.GetName() << "\n";
+      talos::rio::LogEvent event;
+      event.kind = talos::rio::LogKind::kNeutralSend;
+      event.index = static_cast<uint16_t>(i);
+      event.can_id = motor.can_id;
+      event.flag = failed;
+      event.status = status.GetName();
+      event.SetName(motor.name);
+      log_->Post(event);
     }
     neutral_send_failing_[i] = failed;
   }
