@@ -98,6 +98,9 @@ pins are supported (no remote CANcoder or CANdi source, no position autoset).
 Both settings are in the configuration fingerprint and wire format. The State
 has no switch field a node can read; an asserted switch shows only as the
 ForwardHardLimit/ReverseHardLimit bit of the motor's Phoenix fault bitfield.
+Those bits are not counted as faults (`MotorFaulted`), so a normally closed
+switch whose wire is cut holds its direction neutral without raising
+`/hw/status` `motor_fault_mask`; only the RoboRIO's per-motor fault log shows it.
 `sim::PhysicsSimBackend` holds forward or reverse output neutral while a test
 presses a switch (`SetForwardLimitPressed`/`SetReverseLimitPressed`); the ideal
 `SimBackend` and `sim_gateway` have no way to press one.
