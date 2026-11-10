@@ -94,9 +94,10 @@ bazel test //...
 ./sim.sh --sim-gateway --no-studio
 ```
 
-Linux CI also runs the C++ suite with AddressSanitizer + UndefinedBehaviorSanitizer
-and ThreadSanitizer. Run sanitizer builds in their own output bases so they do
-not evict the default build's cache (`--config=asan`/`tsan` already filter the
+The CI workflow's `sanitizers` job runs the C++ suite with AddressSanitizer +
+UndefinedBehaviorSanitizer and ThreadSanitizer, with one leg per sanitizer on
+Linux and on macOS (newly added). Run sanitizer builds in their own output
+bases so they do not evict the default build's cache (`--config=asan`/`tsan` already filter the
 `no_asan`/`no_tsan` tags):
 
 ```sh

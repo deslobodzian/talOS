@@ -37,6 +37,12 @@ jobs:
     - name: Build
       run: bazel build //... --noshow_progress --test_output=errors
 
+    - name: Checked-in Studio bindings match the telemetry_ts genrule
+      # pnpm and tsc read studio/src/generated; Bazel builds Studio from the
+      # //studio:telemetry_ts genrule (the same pinned flatc `pnpm generate`
+      # runs). A schema edit without `pnpm generate` fails here.
+      run: diff -ru bazel-bin/studio/src/generated studio/src/generated
+
     # The two INC-1 steps below are anchored and reused by build-macos.
     - &make-read-only
       name: Make tracked source files read-only
@@ -74,12 +80,15 @@ jobs:
         fi
 
   sanitizers:
-    name: Bazel (${{ matrix.sanitizer }})
-    runs-on: ubuntu-latest
+    name: Bazel (${{ matrix.sanitizer }}, ${{ matrix.os }})
+    # macOS is the deployment OS: its RTMS process-identity and F_FULLFSYNC
+    # paths compile only there.
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         sanitizer: [asan, tsan]
     steps:
     - name: Checkout Repository
@@ -88,7 +97,7 @@ jobs:
       uses: bazel-contrib/setup-bazel@0.19.0
       with:
         bazelisk-cache: true
-        disk-cache: ${{ github.workflow }}-${{ matrix.sanitizer }}
+        disk-cache: ${{ github.workflow }}-${{ matrix.os }}-${{ matrix.sanitizer }}
         repository-cache: true
     - name: Test instrumented suite and bounded decoder corpora
       run: bazel test --config=${{ matrix.sanitizer }} --test_tag_filters=-no_${{ matrix.sanitizer }} --test_output=errors //...

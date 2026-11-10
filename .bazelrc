@@ -30,7 +30,7 @@ build:macos --host_cxxopt=-std=c++23 --host_cxxopt=-O3
 build:macos --host_cxxopt=-fexperimental-library --host_linkopt=-fexperimental-library
 build:macos --macos_minimum_os=13.4 --host_macos_minimum_os=13.4
 
-# Linux sanitizer builds instrument both C and C++ dependencies and link the
+# Sanitizer builds instrument both C and C++ dependencies and link the
 # matching runtime. Keep stack traces useful and make UB fail the test.
 build:asan --copt=-fsanitize=address,undefined --linkopt=-fsanitize=address,undefined
 build:asan --copt=-fno-omit-frame-pointer --copt=-fno-sanitize-recover=undefined
