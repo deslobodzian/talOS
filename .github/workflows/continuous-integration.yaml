@@ -108,7 +108,7 @@ jobs:
         disk-cache: ${{ github.workflow }}-${{ matrix.os }}-${{ matrix.sanitizer }}
         repository-cache: true
     - name: Test instrumented suite and bounded decoder corpora
-      run: bazel test --config=${{ matrix.sanitizer }} --test_tag_filters=-no_${{ matrix.sanitizer }} --test_output=errors //...
+      run: bazel test --config=${{ matrix.sanitizer }} --test_tag_filters=-no_${{ matrix.sanitizer }}${{ runner.os == 'macOS' && ',-no_macos_sanitizer' || '' }} --test_output=errors //...
 
   build-macos:
     name: Bazel Build (macOS)

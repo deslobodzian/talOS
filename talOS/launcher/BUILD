@@ -134,6 +134,10 @@ cc_binary(
 cc_test(
     name = "launcher_test",
     size = "small",
+    # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
+    # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
+    # The Linux sanitizer legs still run this test.
+    tags = ["no_macos_sanitizer"],
     srcs = ["launcher_test.cc"],
     deps = [
         ":launcher_lib",
@@ -155,6 +159,10 @@ talos_cc_node(
 cc_test(
     name = "supervision_test",
     size = "medium",
+    # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
+    # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
+    # The Linux sanitizer legs still run this test.
+    tags = ["no_macos_sanitizer"],
     srcs = ["supervision_test.cc"],
     data = [":alpha"],
     env = {"TALOS_CONSTRUCTION_NODE": "$(rlocationpath :alpha)"},

@@ -114,7 +114,12 @@ to one `ConfigAssembler` twice and then shifted by one byte, so chunks persist
 across calls. This is not coverage-guided fuzzing.
 
 Tests loading native libraries into an uninstrumented Python process via ctypes
-carry `no_asan` and `no_tsan`, with the reason beside each BUILD tag. No
+carry `no_asan` and `no_tsan`, with the reason beside each BUILD tag.
+`talOS/launcher` session tests that time fork-heavy launches carry
+`no_macos_sanitizer`: under macOS ASan/TSan one `fork()` costs about 30/375 ms,
+so their windows cannot hold. The macOS CI legs filter that tag (locally, add
+`--test_tag_filters=-no_asan,-no_macos_sanitizer` or the `tsan` equivalent);
+the Linux legs run them. No
 project-code sanitizer findings are suppressed. Linux `metal` tests exercise CPU
 fallback, not Apple Metal execution; GPU-only tests are skipped or compiled out.
 
