@@ -103,7 +103,9 @@ struct RobotConfig {
 
   // Launcher log retention: sessions kept under the log root (the new one
   // included; the newest matches and unclassifiable sessions may exceed it)
-  // and the root's byte budget.
+  // and the byte budget: half for the new session's event logs, half for
+  // older sessions but those matches, and the space kept free on the root's
+  // filesystem, which alone removes them.
   // Both positive integers. See talOS/launcher/README.md.
   int64_t log_keep_sessions{50};
   int64_t log_max_bytes{int64_t{2} * 1024 * 1024 * 1024};

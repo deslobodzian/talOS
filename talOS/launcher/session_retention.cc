@@ -1,5 +1,7 @@
 #include "talOS/launcher/session_retention.h"
 
+#include <sys/statvfs.h>
+
 #include <algorithm>
 #include <charconv>
 #include <cstring>
@@ -199,6 +201,13 @@ MatchVerdict RecordedMatch(const fs::path& dir) {
       break;
   }
   return verdict;
+}
+
+std::optional<std::uint64_t> AvailableBytes(const fs::path& path) {
+  struct statvfs stats {};
+  if (::statvfs(path.c_str(), &stats) != 0) return std::nullopt;
+  return static_cast<std::uint64_t>(stats.f_bavail) *
+         static_cast<std::uint64_t>(stats.f_frsize);
 }
 
 }  // namespace talos::launcher

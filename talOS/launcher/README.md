@@ -574,7 +574,9 @@ member's expected record rate (one record per declared source per
 `SplitLogBudget`). Restarts share their member's remaining budget, but never
 get less than half of its share: to make that room the launcher deletes the
 earlier runs' oldest log files (never the newest file of the run that just
-ended) and marks those runs `log_capped`. Older sessions are retained within the other half.
+ended) and marks those runs `log_capped`. Older sessions are retained within
+the other half, every file in them counted (event logs, output logs, camera
+frames, metadata), except the protected matches below.
 
 Only a launch that starts the roster, and so holds the session lock,
 removes anything; `--describe-only` and `--replay-inputs` launches, which run
@@ -589,14 +591,31 @@ order, each group oldest first by the `start_wall_ns` its manifest records
 `--replay-inputs` output), never by the modification time of a session that
 has one: sessions that ran no match, together with unprotected
 unclassifiable ones; then unprotected matches; then the protected. The
-protected are kept even beyond `log_keep_sessions`; one is removed only while
-the older sessions still exceed their half of `log_max_bytes` once nothing
-else is left, so that half stays the hard bound on retained event logs.
-Removing a match or an unclassifiable session prints a `WARNING` to the
-launcher's stderr naming it, its size and the limit it exceeded. Start times
-are the main processor's wall clock, so a coprocessor without a real-time
-clock or time sync orders sessions only as well as its clock survives a
-reboot.
+unprotected go while there are more than `log_keep_sessions` sessions or
+they hold more than their half of `log_max_bytes`. The protected count
+toward `log_keep_sessions` but are never removed for it, and do not count
+toward the byte budget, so a match larger than that half survives the next
+launch. They go only when the filesystem holding the log root (`statvfs`)
+has less free than the free floor once those limits are met: then sessions
+continue in the same order, protected last, each removal counted as freeing
+its bytes, until the floor is free. The floor is `log_max_bytes` plus
+64 MiB per roster member: the new session's event-log half, an output log
+of 64 MiB per member, and the other half for its camera frames and
+metadata. The launcher reads no node's parameters, so a session whose frame
+recording (each camera's `[recording] max_bytes`, summed) exceeds half of
+`log_max_bytes` is not covered by the floor.
+
+Each launch records in its own session directory's `retention.txt` (synced
+with `DurableSync`) every session it removed, with its size, its class and
+the limit it exceeded, every session it could not read or remove, a free
+floor it could not reach, and free space it could not read; a launch with
+nothing to record writes none. A directory holding a `retention.txt` is
+never removed as a launch that recorded nothing (below), so the record
+outlives a launch that died before its manifest. All but the removal of a
+session that ran no match are also a line on the launcher's stderr. Start
+times are the main processor's wall clock, so a coprocessor without a
+real-time clock or time sync orders sessions only as well as its clock
+survives a reboot.
 
 A session is a match when it has a launch manifest (so not `--replay-inputs`
 output, even of a match), its launch was not `--sim`, and any node's event
@@ -626,10 +645,20 @@ directory instead of evicting recorded sessions. Symlinks, other directories
 (including one named by a session id that holds another session's log or any
 other file) and the current session are not deleted. A session retention
 cannot read or remove (another user's, unreadable, removed meanwhile) is
-reported and passed over; it never stops a launch. Graph/manifest metadata, non-event captures and the members' output
-logs (`<name>.log`, [node output](#node-output)) are outside the event-writer
-caps: each member's output log can reach 64 MiB per session, so reserve
-64 MiB per roster member per retained session beside `log_max_bytes`.
+reported and passed over; it never stops a launch.
+
+Sizing: the new session's event logs stay within half of `log_max_bytes`,
+but its members' output logs (`<name>.log`, [node output](#node-output), up
+to 64 MiB each), its camera frames (each camera's `[recording] max_bytes`)
+and its metadata are outside the event-writer caps. Older unprotected
+sessions, everything counted, stay within the other half. The 16 protected
+sessions are bounded only by their number, each up to one session's size.
+Reserve the free floor (which covers the new session only while its frames
+and metadata fit in half of `log_max_bytes`), the unprotected half, and 16
+sessions of that size; when the disk holds less, the floor removes the
+oldest sessions, matches last. At the default 2 GiB, four cameras recording
+256 MiB each fill exactly the half the floor reserves for frames, and one
+such pit session fills the unprotected half, so it goes at the next launch.
 
 Simulation is only permitted with effective remote `127.0.0.1`. `--sim` with a
 different configured or overridden remote is refused before any process starts.

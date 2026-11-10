@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -1616,6 +1617,10 @@ LauncherOptions SessionFixture(std::string_view tag) {
   options.binary_overrides["//example/beta:node"] =
       WriteStubNode(std::string{tag} + "_beta",
                     DescribingStub("beta", "//example/beta:node", {}));
+  // Whatever the test machine's disk holds, retention sees room to spare.
+  options.available_bytes = [](const std::filesystem::path&) {
+    return std::optional{std::numeric_limits<uint64_t>::max()};
+  };
   return options;
 }
 
@@ -1693,9 +1698,11 @@ TEST(LauncherSessions, RetentionPassesOverLockedSessions) {
 // (graph.json too: --describe-only, a refused graph), is an abandoned launch:
 // never counted, and removed once another session directory is newer, so the
 // newest stays. Another session's log or any other file leaves a directory
-// alone, and only session directories decide the newest. Only a launch that
-// holds the session lock removes anything: a replay (or --describe-only) runs
-// beside a live session that may look like any of these.
+// alone, and so does a retention record, which a launch that died before its
+// manifest leaves only when it removed something. Only session directories
+// decide the newest. Only a launch that holds the session lock removes
+// anything: a replay (or --describe-only) runs beside a live session that may
+// look like any of these.
 TEST(LauncherSessions, RetentionPrunesReplayOutputAndAbandonedLaunchesOnly) {
   auto options = SessionFixture("leftovers");
   const std::string root = options.output_dir;
@@ -1705,9 +1712,11 @@ TEST(LauncherSessions, RetentionPrunesReplayOutputAndAbandonedLaunchesOnly) {
                        "log_keep_sessions = 2\n");
   std::ofstream{options.config_path} << configuration;
   const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
-  for (const int id : {6, 7, 8, 9, 10, 11, 12, 13, 2026}) {
+  for (const int id : {5, 6, 7, 8, 9, 10, 11, 12, 13, 2026}) {
     std::filesystem::create_directories(dir(id));
   }
+  std::ofstream{dir(5) + "/" + std::string{kRetentionRecordFile}}
+      << "retention removes session\n";
   WriteTestLog(dir(6) + "/consumer.tlog", "consumer", 6, {1'000'000});
   std::ofstream{dir(7) + "/manifest.json"} << "{}\n";
   std::ofstream{dir(9) + "/declared_graph.json"} << "[]\n";
@@ -1721,9 +1730,9 @@ TEST(LauncherSessions, RetentionPrunesReplayOutputAndAbandonedLaunchesOnly) {
   // Oldest first, after the files: each write moves its directory's time.
   const auto now = std::filesystem::file_time_type::clock::now();
   for (const auto& [id, age] :
-       {std::pair{12, 9}, std::pair{6, 8}, std::pair{7, 7}, std::pair{8, 6},
-        std::pair{9, 5}, std::pair{10, 4}, std::pair{13, 3}, std::pair{11, 2},
-        std::pair{2026, 1}}) {
+       {std::pair{5, 10}, std::pair{12, 9}, std::pair{6, 8}, std::pair{7, 7},
+        std::pair{8, 6}, std::pair{9, 5}, std::pair{10, 4}, std::pair{13, 3},
+        std::pair{11, 2}, std::pair{2026, 1}}) {
     std::filesystem::last_write_time(dir(id), now - std::chrono::hours{age});
   }
   // A replay of the older recorded session, into the same root.
@@ -1744,7 +1753,7 @@ TEST(LauncherSessions, RetentionPrunesReplayOutputAndAbandonedLaunchesOnly) {
   for (const int id : {6, 7, 8, 9, 11, 13}) {
     EXPECT_FALSE(std::filesystem::exists(dir(id))) << id;
   }
-  for (const int id : {10, 12, 14, 15}) {
+  for (const int id : {5, 10, 12, 14, 15}) {
     EXPECT_TRUE(std::filesystem::exists(dir(id))) << id;
   }
   EXPECT_EQ(ReadFile(dir(2026) + "/photo.jpg"), "not a session");
@@ -1907,9 +1916,20 @@ TEST(LauncherSessions, RetentionProtectsOnlyTheNewestUnclassifiableSessions) {
   std::filesystem::remove_all(root);
 }
 
-// The newest matches outlast log_keep_sessions, and yield, oldest first, only
-// to the byte budget older sessions get (half of log_max_bytes).
-TEST(LauncherSessions, RetentionRemovesAMatchOnlyForTheByteBudget) {
+// Bytes in the regular files under `dir`.
+uintmax_t DirectoryBytes(const std::string& dir) {
+  uintmax_t bytes = 0;
+  for (const auto& file : std::filesystem::recursive_directory_iterator{dir}) {
+    if (file.is_regular_file()) bytes += file.file_size();
+  }
+  return bytes;
+}
+
+// The newest matches outlast log_keep_sessions and the byte budget, which
+// counts only the sessions retention may remove for it: a pit reboot after a
+// match larger than the half older sessions get keeps that match, and keeps
+// pit sessions within that half beside it.
+TEST(LauncherSessions, RetentionKeepsTheNewestMatchesBeyondTheBudgets) {
   auto options = SessionFixture("match_floor");
   const std::string root = options.output_dir;
   std::filesystem::remove_all(root);
@@ -1933,13 +1953,66 @@ TEST(LauncherSessions, RetentionRemovesAMatchOnlyForTheByteBudget) {
   EXPECT_TRUE(std::filesystem::exists(dir(1)));
   EXPECT_TRUE(std::filesystem::exists(dir(2)));
 
-  // 1.5 MB for older sessions: the two matches' 2 MB no longer fit.
-  configure("log_keep_sessions = 1\nlog_max_bytes = 3000000\n");
-  options.session_id = 5;
+  // Older sessions get 1.5 MB: the matches alone hold more, and two pit
+  // sessions (5, 6) push the unprotected past it.
+  for (const int id : {5, 6}) {
+    WriteSessionManifest(dir(id), id, 1000 + id);
+    WriteDriverStationLog(dir(id), "late", id, {false}, 1'000'000);
+  }
+  ASSERT_GT(DirectoryBytes(dir(1)) + DirectoryBytes(dir(2)), 1'500'000U);
+  configure("log_max_bytes = 3000000\n");
+  options.session_id = 7;
   ASSERT_EQ(Launcher{options}.Run(), 0);
-  EXPECT_FALSE(std::filesystem::exists(dir(1)));
-  EXPECT_FALSE(std::filesystem::exists(dir(4)));
-  EXPECT_TRUE(std::filesystem::exists(dir(2) + "/manifest.json"));
+  EXPECT_FALSE(std::filesystem::exists(dir(5)));
+  for (const int id : {1, 2, 4, 6, 7}) {
+    EXPECT_TRUE(std::filesystem::exists(dir(id) + "/manifest.json")) << id;
+  }
+  std::filesystem::remove_all(root);
+}
+
+// When the log root's filesystem lacks room for the new session (log_max_bytes
+// and 64 MiB of output log per roster member), sessions go in retention's
+// order, a pit session before older matches and the protected matches oldest
+// first, only until removing them frees enough; the launch records each
+// removal in its own session directory.
+TEST(LauncherSessions, RetentionRemovesProtectedMatchesLastForFreeSpace) {
+  auto options = SessionFixture("free_floor");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  std::string configuration{kFixtureToml};
+  // Older sessions get 5 MB, more than they hold: only free space removes.
+  configuration.insert(configuration.find("period_us"),
+                       "log_max_bytes = 10000000\n");
+  std::ofstream{options.config_path} << configuration;
+  const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
+  for (const int id : {1, 2, 4}) {
+    WriteSessionManifest(dir(id), id, 1000 + id);
+    WriteDriverStationLog(dir(id), "late", id, {true}, 1'000'000);
+  }
+  // The pit session 3 is the newest.
+  WriteSessionManifest(dir(3), 3, 1005);
+  WriteDriverStationLog(dir(3), "late", 3, {false}, 1'000'000);
+  // The fixture's roster: hardware_node, alpha, beta.
+  const uint64_t floor = 10'000'000 + 3 * kChildOutputLogMaxBytes;
+  // One byte short of the floor once the pit session 3 and the oldest match
+  // 1 are gone.
+  const uintmax_t needed = DirectoryBytes(dir(3)) + DirectoryBytes(dir(1));
+  options.available_bytes = [floor, needed](const std::filesystem::path&) {
+    return std::optional<uint64_t>{floor - needed + 1};
+  };
+  options.session_id = 6;
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  for (const int id : {1, 3}) {
+    EXPECT_FALSE(std::filesystem::exists(dir(id))) << id;
+  }
+  for (const int id : {2, 4}) {
+    EXPECT_TRUE(std::filesystem::exists(dir(id) + "/manifest.json")) << id;
+  }
+  const std::string record =
+      ReadFile(dir(6) + "/" + std::string{kRetentionRecordFile});
+  for (const int id : {1, 3}) {
+    EXPECT_NE(record.find(dir(id) + " ("), std::string::npos) << record;
+  }
   std::filesystem::remove_all(root);
 }
 

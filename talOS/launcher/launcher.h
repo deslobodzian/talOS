@@ -540,6 +540,10 @@ struct LauncherOptions {
   // calls it: the manifest writer's thread syncs the versions the loop
   // hands it (PersistManifest).
   SyncFunction sync_file{process::DurableSync};
+  // Internal retention seam: the bytes still free on the filesystem holding
+  // the log root, or nullopt when unknown; AvailableBytes in production.
+  std::function<std::optional<uint64_t>(const std::filesystem::path&)>
+      available_bytes{AvailableBytes};
 
   // Launch a graph the linter called broken anyway. The default is refusal:
   // two spellings of one topic are silent at runtime.
@@ -2741,7 +2745,6 @@ class Launcher {
           << effective_remote << "\n";
       return 1;
     }
-    const uint64_t session_log_budget = ApplyRetention(robot_config);
     std::string restart_error;
     if (!ResolveMaxRestarts(robot_config, options_, max_restarts_,
                             restart_error)) {
@@ -2761,6 +2764,8 @@ class Launcher {
       std::cerr << "launcher: no nodes declared in config\n";
       return 1;
     }
+    const uint64_t session_log_budget =
+        ApplyRetention(robot_config, node_specs.size());
     if (!options_.replay_inputs.empty()) {
       return RunOnRecordedInputs(node_specs);
     }
@@ -3108,8 +3113,9 @@ class Launcher {
   // -- graph.json, the declared graph, an interrupted atomic write's
   // temporary, an empty event log -- is an abandoned launch: --describe-only,
   // a refused graph, or a launch that failed or died before its manifest.
-  // Any other content (another session's log, any other file or directory)
-  // makes it no session. Sets `error` when it cannot be read.
+  // Any other content (another session's log, a retention record of what
+  // that launch removed, any other file or directory) makes it no session.
+  // Sets `error` when it cannot be read.
   static Retained Classify(const std::filesystem::directory_entry& entry,
                            std::error_code& error) {
     namespace fs = std::filesystem;
@@ -3123,8 +3129,9 @@ class Launcher {
     const auto id = SessionIdNamed(entry.path().filename().string());
     if (!id) return Retained::kNo;
     constexpr std::string_view kLaunchFiles[] = {
-        "graph.json", "declared_graph.json", "graph.json.tmp",
-        "declared_graph.json.tmp", "manifest.json.tmp"};
+        "graph.json",        "declared_graph.json",
+        "graph.json.tmp",    "declared_graph.json.tmp",
+        "manifest.json.tmp", "retention.txt.tmp"};
     bool abandoned = true;
     for (fs::directory_iterator file{entry.path(), error};
          !error && file != fs::directory_iterator{}; file.increment(error)) {
@@ -3167,30 +3174,51 @@ class Launcher {
     return bytes;
   }
 
+  // The free space retention keeps on the log root's filesystem for a new
+  // session of `roster` members, without reading any node's parameters: its
+  // event-log half of `log_max_bytes`, kChildOutputLogMaxBytes of output log
+  // per member, and the other half for camera frames and metadata. A
+  // session whose frame recording exceeds that half is not covered.
+  static uint64_t FreeFloor(const config::RobotConfig& config,
+                            std::size_t roster) {
+    return static_cast<uint64_t>(config.log_max_bytes) +
+           kChildOutputLogMaxBytes * static_cast<uint64_t>(roster);
+  }
+
   // Removes sessions (Classify) until at most `log_keep_sessions` remain (the
-  // new one included) and they hold at most the half of `log_max_bytes` the
-  // new session does not get, and every abandoned launch older than another
-  // session directory. Returns the new session's log budget: the other half,
-  // which its event writers are capped to.
+  // new one included), or only protected sessions are left, and those not
+  // protected hold at most the half of `log_max_bytes` the new session does
+  // not get; then until the log root's filesystem has room for the new
+  // session of `roster` members (FreeFloor); and every abandoned launch older
+  // than another session directory. Returns the new session's log budget:
+  // the other half, which its event writers are capped to.
+  // Every file under a session counts toward its bytes: event logs, output
+  // logs, camera captures, metadata.
   // The newest kProtectedMatches of the sessions that ran a match or that
-  // this build cannot classify (InspectSession) are protected. Sessions go in
-  // order, each group oldest first by the start time its manifest records
-  // (the directory's modification time without one): those that ran no
-  // match and unprotected unclassifiable ones, then unprotected matches,
-  // then the protected, which are never removed for the count, only while
-  // the byte budget is still exceeded once nothing else is left. Removing a
-  // match or an unclassifiable session is reported as a warning.
-  // Graph/manifest metadata and non-event captures require separate headroom.
+  // this build cannot classify (InspectSession) are protected: counted
+  // toward log_keep_sessions but not the byte budget, and removed for neither
+  // limit, only for the free space. Sessions go in order, each group oldest
+  // first by the start time its manifest records (the directory's modification
+  // time without one): those that ran no match and unprotected unclassifiable
+  // ones, then unprotected matches, then the protected. Free space is read once
+  // the limits are met, and each later removal is counted as freeing its bytes,
+  // so a filesystem that frees nothing at once (a snapshot holding the
+  // blocks) does not empty the log root.
+  // Every removal, and every session that could not be read or removed, is
+  // recorded in the new session's kRetentionRecordFile, written durably;
+  // removing a match or an unclassifiable session is also a warning on
+  // stderr.
   // A session that cannot be read or removed (another user's, unreadable,
-  // removed meanwhile) is reported and passed over, never counted against
-  // the others: retention never stops a launch.
+  // removed meanwhile) is passed over, never counted against the others:
+  // retention never stops a launch.
   // Only a launch holding the session lock removes anything: that proves no
   // other launch in this shared-memory namespace is recording, so a manifest
   // without an end_wall_ns is one whose launcher died (a power loss), not a
   // live one.
   // --describe-only and --replay-inputs run beside a live session and only
   // get the budget.
-  uint64_t ApplyRetention(const config::RobotConfig& config) {
+  uint64_t ApplyRetention(const config::RobotConfig& config,
+                          std::size_t roster) {
     namespace fs = std::filesystem;
     // Config load refuses a wrong type or a nonpositive value.
     const int64_t cap = config.log_keep_sessions;
@@ -3198,11 +3226,30 @@ class Launcher {
     const auto session_budget = static_cast<uint64_t>(budget) / 2;
     const uint64_t retained_budget =
         static_cast<uint64_t>(budget) - session_budget;
+    const uint64_t free_floor = FreeFloor(config, roster);
     if (session_lock_ == nullptr) return session_budget;
-    const auto report = [](std::string_view what, const fs::path& path,
-                           const std::error_code& error) {
-      std::cerr << "[launcher] retention " << what << " " << path.string()
-                << " (" << error.message() << ")\n";
+    const fs::path current{options_.output_dir};
+    std::string record;  // kRetentionRecordFile's lines.
+    const auto note = [&record](const std::string& line, bool warn) {
+      record += line + "\n";
+      if (warn) std::cerr << "[launcher] " << line << "\n";
+    };
+    const auto report = [&note](std::string_view what, const fs::path& path,
+                                const std::error_code& error) {
+      note("retention " + std::string{what} + " " + path.string() + " (" +
+               error.message() + ")",
+           true);
+    };
+    const auto finish = [&] {
+      if (record.empty()) return session_budget;
+      const std::string path =
+          (current / std::string{kRetentionRecordFile}).string();
+      std::string error;
+      if (!WriteFileAtomically(path, record, options_.sync_file, error)) {
+        std::cerr << "[launcher] retention cannot write " << path << " ("
+                  << error << ")\n";
+      }
+      return session_budget;
     };
     struct Session {
       fs::path path;
@@ -3230,8 +3277,6 @@ class Launcher {
     // before their nodes (refused graphs included) leaves one behind rather
     // than one per attempt, and evicts no recording.
     auto newest = fs::file_time_type::min();
-    uintmax_t total = 0;
-    const fs::path current{options_.output_dir};
     std::error_code error;
     for (fs::directory_iterator entry{current.parent_path(), error};
          !error && entry != fs::directory_iterator{}; entry.increment(error)) {
@@ -3259,7 +3304,6 @@ class Launcher {
         abandoned.push_back({entry->path(), time, bytes});
         continue;
       }
-      total += bytes;
       sessions.push_back(
           {entry->path(), time, bytes,
            facts.start_wall_ns > 0 ? facts.start_wall_ns : wall_ns(time),
@@ -3268,7 +3312,7 @@ class Launcher {
     if (error) {
       // A partial listing could remove a session newer than one it missed.
       report("removes nothing; cannot list", current.parent_path(), error);
-      return session_budget;
+      return finish();
     }
     for (const auto& launch : abandoned) {
       if (launch.time >= newest) continue;
@@ -3300,40 +3344,74 @@ class Launcher {
                        };
                        return group(a) < group(b);
                      });
-    // The new session counts too, before it holds anything.
-    std::size_t count = sessions.size() + 1;
-    for (const auto& session : sessions) {
-      const bool over_bytes = total > retained_budget;
-      if (count <= static_cast<uint64_t>(cap) && !over_bytes) break;
-      // A protected match yields only to the byte budget, the disk's floor.
-      if (session.protected_match && !over_bytes) break;
-      if (session.verdict != MatchVerdict::kOther) {
-        std::cerr << "[launcher] WARNING: retention removes "
-                  << (session.verdict == MatchVerdict::kMatch
-                          ? "match session "
-                          : "session (match or not, unreadable by this "
-                            "build) ")
-                  << session.path.string() << " (" << session.bytes
-                  << " bytes): "
-                  << (over_bytes ? "older sessions exceed half of "
-                                   "[robot] log_max_bytes"
-                                 : "more than [robot] log_keep_sessions")
-                  << (session.protected_match
-                          ? ", although it is one of the newest " +
-                                std::to_string(kProtectedMatches) +
-                                " matches or unclassifiable sessions"
-                          : std::string{})
-                  << "\n";
-      }
+    // Removes `session`; false when it stays in place, which passes it over
+    // like an unreadable one rather than costing a newer session its place.
+    const auto remove_session = [&](const Session& session,
+                                    const std::string& why) {
+      const bool warn = session.verdict != MatchVerdict::kOther;
+      note(std::string{warn ? "WARNING: " : ""} + "retention removes " +
+               (session.verdict == MatchVerdict::kMatch ? "match session "
+                : warn ? "session (match or not, unreadable by this build) "
+                       : "session ") +
+               session.path.string() + " (" + std::to_string(session.bytes) +
+               " bytes): " + why +
+               (session.protected_match
+                    ? ", although it is one of the newest " +
+                          std::to_string(kProtectedMatches) +
+                          " matches or unclassifiable sessions"
+                    : std::string{}),
+           warn);
       std::error_code removal;
       fs::remove_all(session.path, removal);
-      // One left in place is passed over like an unreadable one, rather than
-      // costing a newer session its place.
       if (removal) report("cannot remove", session.path, removal);
-      total -= session.bytes;
+      return !removal;
+    };
+    // The new session counts too, before it holds anything.
+    std::size_t count = sessions.size() + 1;
+    uintmax_t total = 0;  // The unprotected sessions' bytes.
+    for (const auto& session : sessions) {
+      if (!session.protected_match) total += session.bytes;
+    }
+    auto next = sessions.begin();
+    for (; next != sessions.end() && !next->protected_match; ++next) {
+      const bool over_bytes = total > retained_budget;
+      if (count <= static_cast<uint64_t>(cap) && !over_bytes) break;
+      remove_session(*next, over_bytes
+                                ? "unprotected older sessions exceed half of "
+                                  "[robot] log_max_bytes"
+                                : "more than [robot] log_keep_sessions");
+      total -= next->bytes;
       --count;
     }
-    return session_budget;
+    // The disk's floor: what is left goes, protected last, only while the
+    // filesystem lacks room for another session.
+    std::optional<uint64_t> available =
+        options_.available_bytes(current.parent_path());
+    if (!available) {
+      note("WARNING: retention cannot read the free space under " +
+               current.parent_path().string() +
+               "; removes nothing to keep room for the new session",
+           true);
+      return finish();
+    }
+    for (; next != sessions.end() && *available < free_floor; ++next) {
+      if (remove_session(*next,
+                         std::to_string(*available) + " bytes free under " +
+                             current.parent_path().string() + ", less than " +
+                             std::to_string(free_floor) +
+                             " the new session may need")) {
+        *available += next->bytes;
+      }
+    }
+    if (*available < free_floor) {
+      note("WARNING: retention leaves " + std::to_string(*available) +
+               " bytes free under " + current.parent_path().string() +
+               ", less than " + std::to_string(free_floor) +
+               " the new session may need, with no older session it can "
+               "remove",
+           true);
+    }
+    return finish();
   }
 
   // How one roster member is spawned, and its pending restart.
