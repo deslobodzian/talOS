@@ -16,13 +16,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -400,6 +405,57 @@ TEST(Supervision, FailedSpawnIsRetriedNotAbandoned) {
   ::remove(runs.c_str());
 }
 
+// A run whose exec fails is a spawn failure that names its cause, as the
+// child reports it, rather than a run that exited 127: alpha's first run takes
+// its binary's execute permission away, so its restart cannot exec, and that
+// restart is retried, not counted as a run, and marks alpha recorder_failed.
+TEST(Supervision, ExecFailureIsASpawnFailureThatNamesItsCause) {
+  auto options = BaseOptions("exec_failure", "max_restarts = 1\n");
+  MakeAlphaNonCritical(options);
+  const std::string alpha =
+      WriteStub("exec_failure_alpha", "chmod a-x \"$0\"\nexit 3\n");
+  options.binary_overrides["//example/alpha:node"] = alpha;
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("exec_failure_beta", kRunUntilStopped);
+  const auto log = TempPath("exec_failure_stderr");
+  const pid_t launcher = ::fork();
+  ASSERT_GE(launcher, 0);
+  if (launcher == 0) {
+    const int fd = ::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || ::dup2(fd, STDERR_FILENO) < 0) ::_exit(100);
+    ::_exit(Launcher{options}.Run());
+  }
+  // The launcher's line for the failed restart: alpha's binary and the errno.
+  const std::string cause = std::strerror(EACCES);
+  const auto report = [&] {
+    std::istringstream lines{ReadFile(log)};
+    for (std::string line; std::getline(lines, line);) {
+      if (line.find(alpha) != std::string::npos &&
+          line.find(cause) != std::string::npos)
+        return line;
+    }
+    return std::string{};
+  };
+  std::string reported = report();
+  for (const auto give_up = std::chrono::steady_clock::now() + 20s;
+       reported.empty() && std::chrono::steady_clock::now() < give_up;
+       reported = report())
+    std::this_thread::sleep_for(10ms);
+  ::kill(launcher, SIGTERM);
+  while (::waitpid(launcher, nullptr, 0) < 0 && errno == EINTR) {
+  }
+  EXPECT_FALSE(reported.empty()) << ReadFile(log);
+  const auto entry = ManifestEntry(
+      ReadFile(options.output_dir + "/" + std::to_string(options.session_id) +
+               "/manifest.json"),
+      "alpha");
+  EXPECT_NE(entry.find("\"restart_count\": 0,"), std::string::npos) << entry;
+  EXPECT_NE(entry.find("\"recorder_failed\": true"), std::string::npos)
+      << entry;
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(log.c_str());
+}
+
 // A requested stop (SIGTERM to the launcher) restarts none of the members
 // that exit 0 while stopping.
 TEST(Supervision, RequestedStopDoesNotRestartCleanExits) {
@@ -499,10 +555,9 @@ TEST(Supervision, SessionsAreIsolatedAndCleanOnlyOwnedDirs) {
 
 // A persistent fault is quarantined at the rolling limit, not retried in a
 // tight loop. Stopping the session cancels its one pending retry. The session
-// stops once alpha has stayed quarantined for 500 ms, not at a deadline: a
-// launcher stalled in its manifest fsyncs (seconds on a host busy writing to
-// the same disk) can reach any deadline before alpha's third run. The stubs
-// never register, so their startup grace outlasts the 20 s give-up.
+// stops once alpha has stayed quarantined for 500 ms, not at a deadline, which
+// a stalled host can reach before alpha's third run. The stubs never register,
+// so their startup grace outlasts the 20 s give-up.
 TEST(Supervision, CrashingNodeQuarantinesUntilTheSessionStops) {
   LauncherOptions options = BaseOptions("restart_out", "max_restarts = 2\n");
   MakeAlphaNonCritical(options);
@@ -738,8 +793,9 @@ TEST(Supervision, KillingLauncherKillsNodeAndItsHelper) {
   ASSERT_GE(launcher, 0);
   if (launcher == 0) {
     ::close(output[0]);
+    std::string error;
     const auto node = SpawnProcess(
-        {"/bin/sh", "-c", "sleep 30 & echo $$; wait"}, "", output[1]);
+        {"/bin/sh", "-c", "sleep 30 & echo $$; wait"}, error, "", output[1]);
     ::close(output[1]);
     if (node < 0) ::_exit(1);
     for (;;) ::pause();
@@ -778,9 +834,10 @@ TEST(Supervision, GuardianKeepsNoLockHeldAtSpawn) {
   ASSERT_GE(held, 0);
   ASSERT_GE(probe, 0);
   ASSERT_EQ(::flock(held, LOCK_EX), 0);
-  const pid_t node = SpawnProcess({"/bin/sh", "-c", "exec sleep 30"});
+  std::string error;
+  const pid_t node = SpawnProcess({"/bin/sh", "-c", "exec sleep 30"}, error);
   ::close(held);
-  ASSERT_GT(node, 0);
+  ASSERT_GT(node, 0) << error;
   // The node's own copy closes at its exec; then nothing may hold the lock.
   bool released = ::flock(probe, LOCK_EX | LOCK_NB) == 0;
   for (const auto give_up = std::chrono::steady_clock::now() + 5s;
@@ -920,6 +977,66 @@ TEST(Supervision, HeldRegistryLockDoesNotStallSupervision) {
   EXPECT_TRUE(WIFEXITED(status));
   EXPECT_EQ(WEXITSTATUS(status), 0);
   EXPECT_EQ(ReadLines(runs).size(), 3u);
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
+// The loop never waits for the disk to sync the manifest. With every sync
+// stuck from alpha's first run on, the critical alpha's crash is restarted at
+// once and the live manifest already records the restart: the loop only
+// renames each version into place (PersistManifest).
+TEST(Supervision, StuckManifestSyncDelaysNoRestart) {
+  auto options = BaseOptions("stuck_sync");
+  // The stubs never register; no heartbeat kill may restart them meanwhile.
+  options.heartbeat_startup_grace_ms = 60'000;
+  const auto runs = TempPath("stuck_sync_runs");
+  ::remove(runs.c_str());
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStub("stuck_sync_hardware", kRunUntilStopped, "hardware_node");
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "stuck_sync_alpha",
+      RecordLogArgThen(runs, "case \"$log\" in *alpha.tlog) exit 3;; esac\n" +
+                                 std::string{kRunUntilStopped}));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("stuck_sync_beta", kRunUntilStopped);
+  std::mutex mutex;
+  std::condition_variable release;
+  bool released = false;
+  options.sync_file = [&](int fd) {
+    if (!ReadLines(runs).empty()) {
+      std::unique_lock lock{mutex};
+      release.wait(lock, [&] { return released; });
+    }
+    return ::fsync(fd);
+  };
+  // RunSession rewrites options.output_dir on return; don't read it
+  // concurrently.
+  const auto live_manifest = options.output_dir + "/" +
+                             std::to_string(options.session_id) +
+                             "/manifest.json";
+  bool restarted = false;
+  std::jthread stopper{[&](const std::stop_token& stop) {
+    const auto give_up = std::chrono::steady_clock::now() + 20s;
+    while (!stop.stop_requested() &&
+           std::chrono::steady_clock::now() < give_up) {
+      if (ManifestEntry(ReadFile(live_manifest), "alpha")
+              .find("\"restart_count\": 1,") != std::string::npos) {
+        restarted = true;
+        break;
+      }
+      std::this_thread::sleep_for(2ms);
+    }
+    {
+      const std::lock_guard lock{mutex};
+      released = true;
+    }
+    release.notify_all();
+    if (!stop.stop_requested()) ::kill(::getpid(), SIGTERM);
+  }};
+  RunSession(options);
+  stopper.request_stop();
+  stopper.join();
+  EXPECT_TRUE(restarted) << "the restart waited for a manifest sync";
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
 }

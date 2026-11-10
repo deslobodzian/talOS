@@ -42,8 +42,11 @@ cannot create segments for undeclared topics.
 ## When a binary does not answer
 
 A failed critical probe is an error; a failed non-critical probe is a warning.
-`--describe-timeout-ms MS` sets the per-binary deadline. Missing descriptions
-remain recorded in `graph.json` and the session manifest.
+`--describe-timeout-ms MS` sets the per-binary deadline. A binary that cannot
+be run at all is reported with the step and errno that stopped it, as a spawn
+is ([restarts](#restarts)): `did not answer --describe (execv <path>: Exec
+format error)`, not an exit code 127. Missing descriptions remain recorded in
+`graph.json` and the session manifest.
 
 ## Controller addressing
 
@@ -129,10 +132,18 @@ A roster member — `hardware_node`, every subsystem node, `sim_gateway` — tha
 exits with a nonzero status or by a signal while the session is not stopping is
 restarted. So is a critical member that exits cleanly (status 0) while the
 session is not stopping: its peers still run, so it did not finish anything.
-A run that cannot be spawned (fork or pipe failing, as under `EAGAIN` or
-`EMFILE`), a first run included, is retried the same way and marks the member
-`recorder_failed`. Every restart attempt counts against the budget below,
-spawned or not; the retry keeps that run's log name and restart number.
+A run that cannot be spawned, a first run included, is retried the same way
+and marks the member `recorder_failed`: a pipe or the fork failing (as under
+`EAGAIN` or `EMFILE`), or the child failing before or at its exec (its process
+group, guardian or output redirection, or `execv` itself: `ENOENT`, `EACCES`,
+`ENOEXEC`, `ETXTBSY`). The child reports such a failure through a
+close-on-exec pipe, which the launcher reads until the exec closes it, so the
+line names the step and its errno where an exit status would only say 127:
+
+    [launcher] cannot spawn alpha (execv /opt/talos/current/bin/alpha: Permission denied); retry in 50 ms
+
+Every restart attempt counts against the budget below, spawned or not; the
+retry keeps that run's log name and restart number.
 The first restart waits 50 ms, each later one twice as long, capped at 1 s,
 except that a critical member's first crash in the restart window restarts it
 at once (its next restart there waits 100 ms). A clean exit always waits the
@@ -222,26 +233,28 @@ policy and macOS's launchd limitations.
 ### Restart latency
 
 From SIGKILL of a critical member to its first hardware request, measured on
-a Linux x86-64 desktop (8 threads) by killing `drivetrain` in a `--sim`
-session of `robot_physics_sim.toml` with the physics gateway, session
-directory on btrfs. The stages up to the event-loop origin are
-`CLOCK_MONOTONIC` stamps of the launcher's `waitpid` and `fork` and the node's
-`execv`, first constructor and file opens (an `LD_PRELOAD` shim) over 20 kills.
-The later stages and the total come from 10 kills under
-`--restart-window-ms 1500`, so each is a first restart: the killer's
-`CLOCK_MONOTONIC` stamp, and the restarted run's `.tlog` origin, first tick
-deadline less its offset (`run()`) and first `/hw/request/drivetrain` send:
+a Linux x86-64 desktop (8 threads) by killing `drivetrain` 20 times in a
+`--sim` session of `robot_physics_sim.toml` with the physics gateway under
+`--restart-window-ms 1500`, so each is a first restart, session directory on
+btrfs. The stages come from `CLOCK_MONOTONIC` stamps: the killer's, the
+launcher's `waitpid` and `fork` and the restarted node's first constructor (an
+`LD_PRELOAD` shim), and the restarted run's `.tlog` origin, first tick deadline
+less its offset (`run()`) and first `/hw/request/drivetrain` send:
 
 | Stage | ms, median (range) | Set by |
 |---|---|---|
-| SIGKILL → launcher reaps the exit | 12.0 (3.8–19.6) | the supervision loop's 20 ms sleep |
-| reap → `fork` of the restart | 3.0 (2.7–4.3) | two manifest writes; their four `fsync`s take 2.4 |
-| `fork` → first constructor | 1.3 (1.2–1.8) | group and guardian setup, exec, dynamic loading |
-| first constructor → event-loop origin | 0.4 (0.4–3.0) | flags, event-log file |
-| origin → `run()` | 1.5 (1.5–1.8) | robot config parse, topic attach |
+| SIGKILL → launcher reaps the exit | 6.2 (1.4–20.5) | the supervision loop's 20 ms sleep |
+| reap → `fork` of the restart | 0.5 (0.4–0.7) | two manifest writes, renamed into place unsynced (0.2) |
+| `fork` → first constructor | 1.2 (1.1–1.2) | group and guardian setup, exec, dynamic loading |
+| first constructor → event-loop origin | 0.4 (0.4–0.5) | flags, event-log file |
+| origin → `run()` | 1.5 (1.4–1.6) | robot config parse, topic attach |
 | `run()` → first tick | 5.0 | one `period_us` |
 | first tick → first `/hw/request/drivetrain` | 0.0 | that tick's flush, which needs a `/hw/state` received since the node attached |
-| **total** | **22.4 (13.9–40.1)** | |
+| **total** | **14.6 (10.1–29.0)** | |
+
+While eight other processes rewrote and synced 256 MiB files on the same disk,
+10 kills took 59.5 ms (13.8–76.5): reap → `fork` up to 27, of which its
+manifest renames up to 26, and first constructor → origin up to 29.
 
 ## Replaying a session into one node
 
@@ -300,10 +313,18 @@ both spellings behave the same.
 `--output-dir DIR` always names a root: each launch writes to
 `DIR/<session_id>/`, including deployed `TALOS_LOG_DIR` roots. Without the flag,
 the root is `/tmp/talos_logs`. Use persistent storage on a deployed robot.
-`manifest.json` is written before nodes start, flushed and synced, then replaced
-atomically at each process lifecycle change and when a node reports a stopped
-event log; an interrupted session retains its last complete manifest
-(`end_wall_ns = 0` means no normal shutdown).
+`manifest.json` is written before nodes start, then replaced atomically
+(written beside it, then renamed over it) at each process lifecycle change and
+when a node reports a stopped event log: a reader always sees one complete
+version, and a version is in place before any restart it records starts.
+Before anything starts, `graph.json`, `declared_graph.json` and the manifest of
+the roster about to start are synced (`fsync`, file then directory), and so is
+the final manifest; the launcher syncs nothing else. The supervision loop never
+waits for a sync, which can take hundreds of milliseconds while nodes write to
+the same disk, so the versions in between reach the disk when the OS writes
+them back. A killed launcher leaves its last version; a power loss can lose the
+versions the OS had not yet written back (`end_wall_ns = 0` means no normal
+shutdown).
 
 At startup, retention removes the oldest sessions: directories holding a
 `manifest.json`, or, named by a session id, an event log whose header carries

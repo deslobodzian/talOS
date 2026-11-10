@@ -5,9 +5,11 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -283,7 +285,7 @@ TEST(LauncherTest, DescribeDeadlineAppliesAfterStdoutCloses) {
   introspect::Description description;
   std::string error;
   const auto started = std::chrono::steady_clock::now();
-  EXPECT_FALSE(ProbeDescribe(binary, {binary, "--describe"},
+  EXPECT_FALSE(ProbeDescribe({binary, "--describe"},
                              std::chrono::milliseconds{100}, description,
                              error));
   const auto elapsed = std::chrono::steady_clock::now() - started;
@@ -297,8 +299,8 @@ TEST(LauncherTest, DescribeOutputIsBounded) {
       "#!/bin/sh\nexec dd if=/dev/zero bs=4096 count=1025 2>/dev/null\n");
   introspect::Description description;
   std::string error;
-  EXPECT_FALSE(ProbeDescribe(binary, {binary, "--describe"},
-                             std::chrono::seconds{5}, description, error));
+  EXPECT_FALSE(ProbeDescribe({binary, "--describe"}, std::chrono::seconds{5},
+                             description, error));
   std::filesystem::remove(binary);
 }
 
@@ -1086,12 +1088,15 @@ TEST(LauncherGraphTest, WarnsWhenABinaryDisagreesWithTheConfigAboutItsName) {
   std::remove(spec.binary_path.c_str());
 }
 
-TEST(LauncherGraphTest, ProbeReportsABinaryThatIsNotThere) {
+// A binary that cannot be run is reported with the reason its exec failed,
+// not as a node that exited 127.
+TEST(LauncherGraphTest, ProbeReportsWhyABinaryCannotRun) {
   introspect::Description out;
   std::string error;
-  EXPECT_FALSE(ProbeDescribe("/nonexistent/talos_node",
-                             {"/nonexistent/talos_node", "--describe"},
+  EXPECT_FALSE(ProbeDescribe({"/nonexistent/talos_node", "--describe"},
                              std::chrono::milliseconds{500}, out, error));
+  EXPECT_NE(error.find("/nonexistent/talos_node"), std::string::npos) << error;
+  EXPECT_NE(error.find(std::strerror(ENOENT)), std::string::npos) << error;
 }
 
 // A framework node that reads the declared graph, as a stub: described

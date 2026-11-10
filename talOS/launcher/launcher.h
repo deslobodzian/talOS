@@ -22,6 +22,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -69,13 +70,21 @@ inline std::string Quoted(std::string_view value) {
   return out;
 }
 
+// Syncs an open file or directory to disk, as ::fsync does (production; the
+// seam is LauncherOptions::sync_file). 0, or -1 with errno set.
+using SyncFunction = std::function<int(int fd)>;
+
 // Replaces `path` with `contents` so that a reader sees the old file or the
-// new one, never part of one: written to `<path>.tmp`, flushed and synced,
-// renamed over `path`, then the directory synced. On failure `path` is as it
-// was, the temporary file is removed so it holds no disk, and `error` names
-// the failed step and its errno.
+// new one, never part of one: written to `<path>.tmp`, flushed, and renamed
+// over `path`. Given a `sync`, it also syncs the temporary file before the
+// rename and the directory after it, so that a power loss leaves the new file
+// too; with an empty one, the new file reaches the disk whenever the OS writes
+// it back. A failure before the rename leaves `path` as it was and removes the
+// temporary file so it holds no disk; `error` names the failed step and its
+// errno.
 inline bool WriteFileAtomically(const std::string& path,
-                                std::string_view contents, std::string& error) {
+                                std::string_view contents,
+                                const SyncFunction& sync, std::string& error) {
   const std::string temporary = path + ".tmp";
   const auto fail = [&](std::string_view step, int code) {
     std::remove(temporary.c_str());
@@ -87,17 +96,18 @@ inline bool WriteFileAtomically(const std::string& path,
   int code = 0;
   if (std::fwrite(contents.data(), 1, contents.size(), file) !=
           contents.size() ||
-      std::fflush(file) != 0 || ::fsync(::fileno(file)) != 0)
+      std::fflush(file) != 0 || (sync && sync(::fileno(file)) != 0))
     code = errno;
   if (std::fclose(file) != 0 && code == 0) code = errno;
   if (code != 0) return fail("write", code);
   if (std::rename(temporary.c_str(), path.c_str()) != 0)
     return fail("rename", errno);
+  if (!sync) return true;
   const std::filesystem::path parent =
       std::filesystem::path{path}.parent_path();
   const int directory = ::open(parent.empty() ? "." : parent.c_str(), O_RDONLY);
   if (directory < 0) return fail("open directory", errno);
-  const int result = ::fsync(directory);
+  const int result = sync(directory);
   code = errno;
   ::close(directory);
   if (result != 0) return fail("sync directory", code);
@@ -235,6 +245,10 @@ struct LauncherOptions {
   // Internal supervision seam: the next N spawns of the named roster member
   // fail as fork() does under EAGAIN. Production leaves it empty.
   std::map<std::string, int> spawn_failures;
+  // Internal supervision seam: syncs an open session file or directory to
+  // disk; ::fsync in production. The supervision loop never calls it: the
+  // manifest versions it writes are not synced (PersistManifest).
+  SyncFunction sync_file{::fsync};
 
   // Launch a graph the linter called broken anyway. The default is refusal:
   // two spellings of one topic are silent at runtime.
@@ -540,21 +554,86 @@ inline void CloseDescriptorsExcept(int keep) {
   }
 }
 
+// A pipe whose ends both close on exec. False with errno set.
+inline bool CloseOnExecPipe(int (&fds)[2]) {
+  if (::pipe(fds) != 0) return false;
+  if (::fcntl(fds[0], F_SETFD, FD_CLOEXEC) == 0 &&
+      ::fcntl(fds[1], F_SETFD, FD_CLOEXEC) == 0)
+    return true;
+  const int error = errno;
+  ::close(fds[0]);
+  ::close(fds[1]);
+  errno = error;
+  return false;
+}
+
+// The steps by which a forked child becomes its program; each can fail before
+// the program runs.
+enum class ChildStep : int {
+  kProcessGroup,  // setpgid
+  kDeathSignal,   // prctl(PR_SET_PDEATHSIG), Linux only
+  kGuardian,      // the fork of the group's guardian
+  kOutput,        // the stdout (and stderr) redirection
+  kExec,          // execv
+};
+
+// What a child that cannot become its program writes to its error pipe: one
+// write of a few bytes, so the launcher reads all of it or none.
+struct ChildFailure {
+  ChildStep step;
+  int code;  // errno
+};
+
+// In a forked child, before its exec: reports `step` and errno to the
+// launcher, then exits 127, a shell's status for a command it cannot run.
+// write and _exit are async-signal-safe, as every call between a fork and an
+// exec must be: the fork copied whatever locks other threads held.
+[[noreturn]] inline void ReportChildFailure(int errors, ChildStep step) {
+  const ChildFailure failure{step, errno};
+  [[maybe_unused]] const ssize_t written =
+      ::write(errors, &failure, sizeof failure);
+  ::_exit(127);
+}
+
+// How SpawnProcess names a child's failed step.
+inline std::string ChildStepName(ChildStep step, const std::string& program) {
+  switch (step) {
+    case ChildStep::kProcessGroup:
+      return "setpgid";
+    case ChildStep::kDeathSignal:
+      return "prctl(PR_SET_PDEATHSIG)";
+    case ChildStep::kGuardian:
+      return "fork (guardian)";
+    case ChildStep::kOutput:
+      return "redirect output";
+    case ChildStep::kExec:
+      return "execv " + program;
+  }
+  return "child setup";
+}
+
 // fork + execv of args[0], in its own process group. stdout_fd is used only by
 // --describe; otherwise stdout/stderr can be appended to output_path. Returns
-// -1 with errno set when the lifetime pipe or the fork fails.
-inline pid_t SpawnProcess(std::vector<std::string> args,
+// the child's pid once it has exec'd, which the close-on-exec error pipe it
+// shares with the launcher shows by closing. A child that fails before or at
+// its exec reports the step and errno there instead, exits 127 and is reaped;
+// then, as when a pipe or the fork fails here, this returns -1 with `error`
+// naming the step and its errno ("execv <path>: Permission denied").
+inline pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
                           const std::string& output_path = "",
                           int stdout_fd = -1) {
+  const auto fail = [&error](std::string_view step, int code) {
+    error = std::string{step} + ": " + std::strerror(code);
+    return pid_t{-1};
+  };
   int lifetime[2];
-  if (::pipe(lifetime) != 0) return -1;
-  if (::fcntl(lifetime[0], F_SETFD, FD_CLOEXEC) < 0 ||
-      ::fcntl(lifetime[1], F_SETFD, FD_CLOEXEC) < 0) {
-    const int error = errno;
+  if (!CloseOnExecPipe(lifetime)) return fail("pipe", errno);
+  int errors[2];
+  if (!CloseOnExecPipe(errors)) {
+    const int code = errno;
     ::close(lifetime[0]);
     ::close(lifetime[1]);
-    errno = error;
-    return -1;
+    return fail("pipe", code);
   }
   std::vector<char*> c_args;
   c_args.reserve(args.size() + 1);
@@ -564,30 +643,49 @@ inline pid_t SpawnProcess(std::vector<std::string> args,
   std::fflush(nullptr);
   const pid_t parent = ::getpid();
   const pid_t pid = ::fork();
-  if (pid != 0) {
-    const int error = errno;  // fork's, kept across the closes
-    ::close(lifetime[0]);
-    if (pid < 0) {
-      ::close(lifetime[1]);
-      errno = error;
-    } else {
-      // Both sides establish the group, closing the spawn/signal race.
-      ::setpgid(pid, pid);
-      ProcessLifetimes().emplace(pid, lifetime[1]);
-    }
-    return pid;
+  if (pid < 0) {
+    const int code = errno;
+    for (const int fd : {lifetime[0], lifetime[1], errors[0], errors[1]})
+      ::close(fd);
+    return fail("fork", code);
   }
-  if (::setpgid(0, 0) != 0) ::_exit(127);
+  if (pid > 0) {
+    ::close(lifetime[0]);
+    ::close(errors[1]);
+    // Both sides establish the group, closing the spawn/signal race.
+    ::setpgid(pid, pid);
+    ProcessLifetimes().emplace(pid, lifetime[1]);
+    // EOF once the exec has closed the child's writer and the guardian its
+    // copy, or once a child died without a report; a report otherwise.
+    ChildFailure failure{};
+    ssize_t got = 0;
+    while ((got = ::read(errors[0], &failure, sizeof failure)) < 0 &&
+           errno == EINTR) {
+    }
+    ::close(errors[0]);
+    if (got != static_cast<ssize_t>(sizeof failure)) return pid;
+    while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
+    }
+    FinishProcessGroup(pid);
+    return fail(ChildStepName(failure.step, args.front()), failure.code);
+  }
+  // The child: only async-signal-safe calls from here to the exec.
+  if (::setpgid(0, 0) != 0)
+    ReportChildFailure(errors[1], ChildStep::kProcessGroup);
 #ifdef __linux__
-  if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) ::_exit(127);
+  if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0)
+    ReportChildFailure(errors[1], ChildStep::kDeathSignal);
 #endif
+  // The launcher died first, so nothing reads a report.
   if (::getppid() != parent) ::_exit(127);
   std::signal(SIGINT, SIG_DFL);
   std::signal(SIGTERM, SIG_DFL);
   const pid_t group = ::getpid();
   const pid_t guardian = ::fork();
-  if (guardian < 0) ::_exit(127);
+  if (guardian < 0) ReportChildFailure(errors[1], ChildStep::kGuardian);
   if (guardian == 0) {
+    // The launcher waits for every copy of the error pipe's writer to close.
+    ::close(errors[1]);
     // Graceful group signals belong to the node; the guardian waits for EOF.
     std::signal(SIGINT, SIG_IGN);
     std::signal(SIGTERM, SIG_IGN);
@@ -603,16 +701,19 @@ inline pid_t SpawnProcess(std::vector<std::string> args,
   }
   ::close(lifetime[0]);
   if (stdout_fd >= 0) {
-    if (::dup2(stdout_fd, STDOUT_FILENO) < 0) ::_exit(127);
+    if (::dup2(stdout_fd, STDOUT_FILENO) < 0)
+      ReportChildFailure(errors[1], ChildStep::kOutput);
     if (stdout_fd != STDOUT_FILENO) ::close(stdout_fd);
   } else if (!output_path.empty()) {
-    std::freopen(output_path.c_str(), "a", stdout);
-    std::freopen(output_path.c_str(), "a", stderr);
+    const int output =
+        ::open(output_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (output < 0 || ::dup2(output, STDOUT_FILENO) < 0 ||
+        ::dup2(output, STDERR_FILENO) < 0)
+      ReportChildFailure(errors[1], ChildStep::kOutput);
+    if (output > STDERR_FILENO) ::close(output);
   }
   ::execv(c_args[0], c_args.data());
-  std::fprintf(stderr, "[launcher] execv failed for %s: %s\n", c_args[0],
-               std::strerror(errno));
-  ::_exit(127);
+  ReportChildFailure(errors[1], ChildStep::kExec);
 }
 
 // ---------------------------------------------------------------------------
@@ -629,33 +730,26 @@ struct NodeDescription {
   introspect::Description declared;
 };
 
-// Runs `binary --describe` and parses the manifest from its stdout, killing it
-// after `timeout`: a node that blocks in its constructor costs the launch that
-// much and no more. stderr is left alone so a node that throws says so.
-inline bool ProbeDescribe(const std::string& binary_path,
-                          const std::vector<std::string>& args,
+// Runs `args` (a binary and --describe) and parses the manifest from its
+// stdout, killing it after `timeout`: a node that blocks in its constructor
+// costs the launch that much and no more. stderr is left alone so a node that
+// throws says so. A binary that cannot be run says why (SpawnProcess).
+inline bool ProbeDescribe(const std::vector<std::string>& args,
                           std::chrono::milliseconds timeout,
                           introspect::Description& out, std::string& error) {
   error.clear();
-  if (::access(binary_path.c_str(), X_OK) != 0) {
-    error = "no executable at " + binary_path;
-    return false;
-  }
-
   int fds[2];
   if (::pipe(fds) != 0) {
     error = std::string{"pipe() failed: "} + std::strerror(errno);
     return false;
   }
 
-  const pid_t pid = SpawnProcess(args, "", fds[1]);
+  const pid_t pid = SpawnProcess(args, error, "", fds[1]);
+  ::close(fds[1]);
   if (pid < 0) {
-    error = std::string{"fork() failed: "} + std::strerror(errno);
     ::close(fds[0]);
-    ::close(fds[1]);
     return false;
   }
-  ::close(fds[1]);
 
   std::string text;
   const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -844,10 +938,9 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
     if (options.simulation) args.push_back("--sim");
     if (!graph_path.empty()) args.insert(args.end(), {"--graph", graph_path});
     args.insert(args.end(), spec.extra_args.begin(), spec.extra_args.end());
-    described.answered =
-        ProbeDescribe(spec.binary_path, args,
-                      std::chrono::milliseconds{options.describe_timeout_ms},
-                      described.declared, described.error);
+    described.answered = ProbeDescribe(
+        args, std::chrono::milliseconds{options.describe_timeout_ms},
+        described.declared, described.error);
   };
 
   bool any_reader = false;
@@ -874,7 +967,7 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
         std::filesystem::path{graph_path}.parent_path());
     std::string error;
     if (!WriteFileAtomically(graph_path, introspect::DeclaredGraphToJson(graph),
-                             error)) {
+                             options.sync_file, error)) {
       throw std::runtime_error("cannot write the declared graph " + graph_path +
                                " (" + error + ")");
     }
@@ -1254,9 +1347,11 @@ class StudioBridge {
     }
     std::cout << "[launcher] Starting studio_bridge (target " << target_
               << ")...\n";
-    const pid_t pid = SpawnProcess(args_, log_path_);
+    std::string error;
+    const pid_t pid = SpawnProcess(args_, error, log_path_);
     if (pid < 0) {
-      std::cerr << "[launcher] fork() failed for studio_bridge\n";
+      std::cerr << "[launcher] cannot spawn studio_bridge (" << error
+                << "); session runs without Studio\n";
       proc.failed = true;
       return;
     }
@@ -1283,9 +1378,11 @@ class StudioBridge {
     if (ShouldRetryStudioBridge(attempts_, first_attempt_, last_spawn_, now,
                                 stopping)) {
       const int last_code = proc.exit_code;
-      const pid_t pid = SpawnProcess(args_, log_path_);
+      std::string error;
+      const pid_t pid = SpawnProcess(args_, error, log_path_);
       if (pid < 0) {
-        std::cerr << "[launcher] fork() failed for studio_bridge\n";
+        std::cerr << "[launcher] cannot spawn studio_bridge (" << error
+                  << "); session runs without Studio\n";
         GiveUp(proc);
         return;
       }
@@ -1453,7 +1550,7 @@ class Launcher {
             graph_path,
             GraphToJson(options_.session_id, options_.config_path, described,
                         diagnostics, options_.bundle_config_sha256),
-            graph_error)) {
+            options_.sync_file, graph_error)) {
       std::cerr << "launcher: cannot write " << graph_path << " ("
                 << graph_error << "); nothing was started\n";
       return 1;
@@ -1521,7 +1618,8 @@ class Launcher {
                       [](const auto& p) { return !p.log_path.empty(); }));
     const uint64_t node_log_budget = std::max<uint64_t>(
         1, session_log_budget / std::max<uint64_t>(1, loggers));
-    PersistManifest(procs);
+    // The one version synced before any node starts (PersistManifest).
+    PersistManifest(procs, /*durable=*/true);
 
     InstallSignals();
 
@@ -1585,10 +1683,11 @@ class Launcher {
                     {"--duration-s", std::to_string(options_.duration_s)});
       }
 
-      const pid_t pid = SpawnNode(proc, launches[i]);
+      std::string spawn_error;
+      const pid_t pid = SpawnNode(proc, launches[i], spawn_error);
       if (pid < 0) {
-        const int error = errno;
-        SpawnFailed(proc, launches[i], std::chrono::steady_clock::now(), error);
+        SpawnFailed(proc, launches[i], std::chrono::steady_clock::now(),
+                    spawn_error);
         continue;
       }
       proc.pid = pid;
@@ -1623,21 +1722,34 @@ class Launcher {
     manifest.nodes = std::move(procs);
 
     session_manifest_ = manifest;
-    PersistManifest(manifest.nodes);
+    PersistManifest(manifest.nodes, /*durable=*/true);
     PrintManifest(manifest);
     return exit_status;
   }
 
  private:
+  // Replaces manifest.json with the session's state and `procs`. The new
+  // version is in place when this returns, so a reader (Studio, a test) sees
+  // it before any restart it records starts. Only a `durable` one is also
+  // synced: the roster before the first node starts, and the final manifest.
+  // The supervision loop's versions are not: a sync can take hundreds of
+  // milliseconds while other processes write to the same disk, and the loop
+  // restarts crashed nodes and feeds the service watchdog.
+  //
   // Never throws: a full disk (ENOSPC) or an unwritable session directory
   // must not end supervision of a running robot. The last complete manifest
   // stays in place (WriteFileAtomically) and the next lifecycle change
   // retries. The first failure is logged once, and so is the recovery.
-  void PersistManifest(const std::vector<NodeProcessInfo>& procs) {
+  void PersistManifest(const std::vector<NodeProcessInfo>& procs,
+                       bool durable = false) {
     session_manifest_.nodes = procs;
     const std::string path = options_.output_dir + "/manifest.json";
+    const std::string json = session_manifest_.ToJson();
     std::string error;
-    if (!WriteFileAtomically(path, session_manifest_.ToJson(), error)) {
+    const bool written =
+        durable ? WriteFileAtomically(path, json, options_.sync_file, error)
+                : WriteFileAtomically(path, json, {}, error);
+    if (!written) {
       if (!manifest_failing_) {
         std::cerr << "[launcher] cannot persist " << path << " (" << error
                   << "); supervision continues and retries at the next "
@@ -1927,12 +2039,15 @@ class Launcher {
     std::cout << "[launcher] Replaying session " << options_.replay_inputs
               << " into " << spec->name << " (" << spec->target << "); log "
               << log_path << "\n";
+    std::string error;
     const pid_t pid = SpawnProcess(
         {spec->binary_path, "--replay-inputs", options_.replay_inputs,
          "--session-id", std::to_string(options_.session_id), "--log", log_path,
-         "--config", options_.config_path, "--sim"});
+         "--config", options_.config_path, "--sim"},
+        error);
     if (pid < 0) {
-      std::cerr << "[launcher] fork() failed for node " << spec->name << "\n";
+      std::cerr << "[launcher] cannot spawn " << spec->name << " (" << error
+                << ")\n";
       return 1;
     }
     int status = 0;
@@ -1952,16 +2067,18 @@ class Launcher {
     std::signal(SIGTERM, [](int) { stop_requested_ = true; });
   }
 
-  // SpawnProcess for one run of a roster member: -1 with errno set when fork
-  // or pipe fails, or while the spawn_failures seam names the member.
-  pid_t SpawnNode(const NodeProcessInfo& proc, const NodeLaunch& launch) {
+  // SpawnProcess for one run of a roster member: -1 with `error` naming the
+  // failed step when it fails, or while the spawn_failures seam names the
+  // member.
+  pid_t SpawnNode(const NodeProcessInfo& proc, const NodeLaunch& launch,
+                  std::string& error) {
     const auto injected = options_.spawn_failures.find(proc.name);
     if (injected != options_.spawn_failures.end() && injected->second > 0) {
       --injected->second;
-      errno = EAGAIN;
+      error = std::string{"fork: "} + std::strerror(EAGAIN);
       return -1;
     }
-    return SpawnProcess(launch.args);
+    return SpawnProcess(launch.args, error);
   }
 
   // Schedules `proc`'s next start: after a backoff that doubles with each
@@ -1991,11 +2108,13 @@ class Launcher {
 
   // A run that cannot be spawned is rescheduled like a crash (see Restarts
   // above); with restarts disabled it stays down, as a crashed one does.
+  // `error` names the failed step and its errno (SpawnProcess).
   void SpawnFailed(NodeProcessInfo& proc, NodeLaunch& launch,
-                   std::chrono::steady_clock::time_point now, int error) {
+                   std::chrono::steady_clock::time_point now,
+                   const std::string& error) {
     proc.failed = true;
-    std::cerr << "[launcher] cannot spawn " << proc.name << " ("
-              << std::strerror(error) << "); ";
+    std::cerr << "[launcher] cannot spawn " << proc.name << " (" << error
+              << "); ";
     // Never `stopping` here: Supervise cancels a pending restart once the
     // session stops.
     if (!ShouldRestartNode(/*clean_exit=*/false, launch.critical, max_restarts_,
@@ -2034,9 +2153,10 @@ class Launcher {
           used >= launch.log_budget ? 1 : launch.log_budget - used);
     }
     launch.restart_times.push_back(now);
-    const pid_t pid = SpawnNode(proc, launch);
+    std::string error;
+    const pid_t pid = SpawnNode(proc, launch, error);
     if (pid < 0) {
-      SpawnFailed(proc, launch, now, errno);
+      SpawnFailed(proc, launch, now, error);
       return;
     }
     if (launch.log_arg != 0 && restart > 0)
