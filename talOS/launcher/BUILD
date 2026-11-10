@@ -169,11 +169,11 @@ cc_binary(
 cc_test(
     name = "launcher_test",
     size = "small",
+    srcs = ["launcher_test.cc"],
     # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
     # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
     # The Linux sanitizer legs still run this test.
     tags = ["no_macos_sanitizer"],
-    srcs = ["launcher_test.cc"],
     deps = [
         ":launcher_lib",
         "//talOS/driver_station",
@@ -207,11 +207,11 @@ talos_cc_node(
 cc_test(
     name = "supervision_test",
     size = "medium",
+    srcs = ["supervision_test.cc"],
     # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
     # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
     # The Linux sanitizer legs still run this test.
     tags = ["no_macos_sanitizer"],
-    srcs = ["supervision_test.cc"],
     data = [
         ":alpha",
         ":endpoint_drift",
@@ -313,11 +313,11 @@ talos_cc_node(
 cc_test(
     name = "replay_inputs_test",
     size = "small",
+    srcs = ["replay_inputs_test.cc"],
     # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
     # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
     # The Linux sanitizer legs still run this test.
     tags = ["no_macos_sanitizer"],
-    srcs = ["replay_inputs_test.cc"],
     data = [
         ":replay_consumer",
         ":replay_impostor",
