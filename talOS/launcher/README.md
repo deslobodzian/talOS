@@ -217,11 +217,15 @@ systemd watchdog policy and macOS's launchd limitations.
 ### Restart latency
 
 From SIGKILL of a critical member to its first hardware request, measured on
-a Linux x86-64 desktop (8 threads) by killing `drivetrain` 20 times in a
-`--sim` session of `robot_physics_sim.toml` with the physics gateway, session
-directory on btrfs. Stages are `CLOCK_MONOTONIC` stamps of the launcher's
-`waitpid` and `fork` and the node's `execv`, first constructor and file opens
-(an `LD_PRELOAD` shim), and of the restarted run's `.tlog`:
+a Linux x86-64 desktop (8 threads) by killing `drivetrain` in a `--sim`
+session of `robot_physics_sim.toml` with the physics gateway, session
+directory on btrfs. The stages up to the event-loop origin are
+`CLOCK_MONOTONIC` stamps of the launcher's `waitpid` and `fork` and the node's
+`execv`, first constructor and file opens (an `LD_PRELOAD` shim) over 20 kills.
+The later stages and the total come from 10 kills under
+`--restart-window-ms 1500`, so each is a first restart: the killer's
+`CLOCK_MONOTONIC` stamp, and the restarted run's `.tlog` origin, first tick
+deadline less its offset (`run()`) and first `/hw/request/drivetrain` send:
 
 | Stage | ms, median (range) | Set by |
 |---|---|---|
@@ -229,10 +233,10 @@ directory on btrfs. Stages are `CLOCK_MONOTONIC` stamps of the launcher's
 | reap → `fork` of the restart | 3.0 (2.7–4.3) | two manifest writes; their four `fsync`s take 2.4 |
 | `fork` → first constructor | 1.3 (1.2–1.8) | group and guardian setup, exec, dynamic loading |
 | first constructor → event-loop origin | 0.4 (0.4–3.0) | flags, event-log file |
-| origin → `run()` | 10.3 (10.3–11.0) | config parse 2.1 (`Host` and `HardwareLink` each parse the robot config: 18 file reads apiece), topic attach 0.6, then 7.3 in `Reporter::start` joining the construction heartbeat thread, which checks for a stop every 10 ms |
+| origin → `run()` | 1.5 (1.5–1.8) | robot config parse, topic attach |
 | `run()` → first tick | 5.0 | one `period_us` |
 | first tick → first `/hw/request/drivetrain` | 0.0 | that tick's flush, which needs a `/hw/state` received since the node attached |
-| **total** | **33.0 (24.0–39.4)** | |
+| **total** | **22.4 (13.9–40.1)** | |
 
 ## Replaying a session into one node
 
