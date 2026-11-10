@@ -9,6 +9,9 @@ This is an **open-work list**, not a changelog. Completed work and its reasoning
 - [ ] **TELEMETRY-1 — Preserve telemetry headroom.** Review the configured exclusions before adding state scalars. The telemetry constructor enforces the value-frame budget; transport limits live in [docs/DATA_FLOW.md](docs/DATA_FLOW.md).
 - [ ] **TIME-3 — Tick-time target age is not recorded.** `session_report` measures target receipt age for MESSAGE dispatches, not the selected target's age at a consumer tick. Add per-tick evidence before claiming tick-time target-age acceptance.
 - [ ] **POSE-1 — Make the GTSAM `factor_graph` backend the default.** `configuration/subsystems/pose_estimator.toml` selects `kalman`; `factor_graph` is to become the default. `accuracy_test` already gates both backends on identical replays, and the node tests cover GTSAM failure containment and relocalization at the 1.5 s lag. Remaining before the switch: measure the worst-case `update()` duration (odometry plus four camera observations) on the deployment Mac mini within the 20 ms period.
+- [ ] **MAC-1 — Build and run the full suite on macOS.** The RTMS process-identity check has a macOS branch (`sysctl` `KERN_PROC_PID` start time in `talOS/rtms/rtms.cc`) that only the macOS CI job compiles; the Mac mini is the deployment host. Also confirm INC-3's restart latency there.
+- [ ] **VISION-2 — A stronger false decode of a repeated tag id still wins.** `SolveMultiTagRobotPose` keeps the repeated id with the higher decision margin; a printed copy of a field tag elsewhere can outscore the real one. Check each repeated detection against the other tags' fit before choosing.
+- [ ] **RTMS-2 — A reader slot freed and re-claimed by another process is not detected.** `read_next` checks only the slot's state bits, so two processes could share one cursor after a reclaim.
 
 ## Unresolved incidents — investigate, do not declare fixed by a rerun
 
@@ -35,5 +38,6 @@ Use the one-Kraken bench ([docs/BENCH.md](docs/BENCH.md), config `bench/`) for l
 - Direction-aware mount covariance and Metal performance tuning: optimize only after measured calibration and target-host timing justify it.
 - Consumer-receipt/drop replay and schema migration adapters.
 - Studio live images, command publishing and launcher-session replay.
+- Studio replay mode: `get_latest` ages count from log import time, not from the recorded clock.
 - Extract Studio label/webroot/launch policy from framework configuration/launcher.
 
