@@ -64,6 +64,7 @@ const PROBLEM_META: Record<ProcessProblem, {label: string; cls: string}> = {
   restarted: {label: 'restarted', cls: 'restarted'},
   recorder_failed: {label: 'recorder failed', cls: 'recorder'},
   nonzero_exit: {label: 'nonzero exit', cls: 'exit'},
+  killed_by_signal: {label: 'killed by signal', cls: 'exit'},
   never_registered: {label: 'never registered', cls: 'missing'}
 };
 
@@ -228,8 +229,9 @@ function SessionPanel() {
                   <td className={'right' +
                       (row.restarts > 0 ? ' warn' : '')}>{row.restarts}</td>
                   <td className={'right' +
-                      (row.exitCode !== null && row.exitCode > 0 ? ' warn' : '')}>
-                    {row.exitCode === null ? '—' : row.exitCode}
+                      ((row.exitCode !== null && row.exitCode > 0) ||
+                       row.exitSignal !== null ? ' warn' : '')}>
+                    {row.exitSignal ?? (row.exitCode === null ? '—' : row.exitCode)}
                   </td>
                   <td className={row.recorderFailed ? 'text-warn' : ''}>
                     {!row.hasManifest ? '—' :

@@ -272,7 +272,8 @@ segments included.
 A node's `exit_code`, `exit_signal` and `pid` are its last run's:
 `exit_code` is -1 while a run is live and after a signal ended it, and
 `exit_signal` is that signal's number (0 for none), which the end-of-session
-summary also names (`exit=-1 (signal 2 SIGINT)`).
+summary also names (`exit=-1 (signal 2 SIGINT)`); Studio's session panel
+shows it in the exit column and marks the node *killed by signal*.
 
 A run whose event log stops early says so in its registry row while it runs
 (see [event log state](../introspection/README.md#event-log-state)). The

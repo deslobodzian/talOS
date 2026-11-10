@@ -18,7 +18,8 @@ import {rateKey, type DeclaredGraph, type SystemGraph, type SystemNode} from '..
 // A problem worth the top of the list and a visible mark, in the order a
 // person cares about them.
 export type ProcessProblem =
-    'dead'|'restarted'|'recorder_failed'|'nonzero_exit'|'never_registered';
+    'dead'|'restarted'|'recorder_failed'|'nonzero_exit'|'killed_by_signal'|
+    'never_registered';
 
 export type ProcessRow = {
   name: string;
@@ -38,6 +39,9 @@ export type ProcessRow = {
   // The manifest's exit_code when it is non-negative (the process exited),
   // else null. A null never reads as zero: "exited cleanly" is exit 0.
   exitCode: number|null;
+  // The signal that ended the last run, as the launcher reports it
+  // ("signal 9 SIGKILL"), else null.
+  exitSignal: string|null;
   recorderFailed: boolean;
   records: string|null;
   loopRate: number|null;
@@ -45,6 +49,20 @@ export type ProcessRow = {
   logPath: string|null;
   problems: ProcessProblem[];
 };
+
+// Signal numbers that Linux and macOS share; any other is shown by number
+// only, since the viewer cannot tell which host's numbering the launcher used.
+const SIGNAL_NAMES: Record<number, string> = {
+  1: 'SIGHUP', 2: 'SIGINT', 3: 'SIGQUIT', 4: 'SIGILL', 5: 'SIGTRAP',
+  6: 'SIGABRT', 8: 'SIGFPE', 9: 'SIGKILL', 11: 'SIGSEGV', 13: 'SIGPIPE',
+  14: 'SIGALRM', 15: 'SIGTERM'
+};
+
+// The launcher's own spelling (SignalText in talOS/launcher/launcher.h).
+export function signalText(signal: number): string {
+  const name = SIGNAL_NAMES[signal];
+  return name ? `signal ${signal} ${name}` : `signal ${signal}`;
+}
 
 export type ProcessSummary = {
   running: number;
@@ -112,6 +130,7 @@ export function mergeProcesses(
     if (m && m.restart_count > 0) problems.push('restarted');
     if (m && m.recorder_failed) problems.push('recorder_failed');
     if (m && m.exit_code > 0) problems.push('nonzero_exit');
+    if (m && m.exit_signal > 0) problems.push('killed_by_signal');
     // Declared but never registered is only a claim when there is a registry
     // to compare against; with no live graph it cannot be made (the same rule
     // `declaredStatus` follows).
@@ -125,6 +144,7 @@ export function mergeProcesses(
       hasManifest: m !== undefined,
       restarts: m?.restart_count ?? 0,
       exitCode: m && m.exit_code >= 0 ? m.exit_code : null,
+      exitSignal: m && m.exit_signal > 0 ? signalText(m.exit_signal) : null,
       recorderFailed: m?.recorder_failed ?? false,
       records: m ? m.record_count : null,
       loopRate: r ? loopRate(r, rates) : null,

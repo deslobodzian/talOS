@@ -31,6 +31,7 @@ const mnode = (overrides: Partial<ManifestNode> = {}): ManifestNode => ({
   log_paths: ['/logs/drivetrain.tlog'],
   pid: 100,
   exit_code: -1,
+  exit_signal: 0,
   restart_count: 0,
   recorder_failed: false,
   described: true,
@@ -189,14 +190,15 @@ test('mergeProcesses joins manifest and registry by name', () => {
   const m = manifest([
     mnode({name: 'a', pid: 1, exit_code: 3, restart_count: 1,
            record_count: '10'}),
-    mnode({name: 'b', pid: 2})
+    mnode({name: 'b', pid: 2}),
+    mnode({name: 'd', pid: 4, exit_signal: 9})
   ]);
   const g = graph([
     snode({name: 'a', pid: '1', alive: false}),
     snode({name: 'c', pid: '3'})   // registry-only
   ]);
   const rows = mergeProcesses(m, g, null, {}, false);
-  assert.equal(rows.length, 3);
+  assert.equal(rows.length, 4);
 
   const a = rows.find(r => r.name === 'a')!;
   assert.equal(a.alive, false);
@@ -208,6 +210,12 @@ test('mergeProcesses joins manifest and registry by name', () => {
   assert.equal(b.alive, null);   // launched, never registered — not "dead"
   assert.equal(b.pid, '2');
   assert.deepEqual(b.problems, []);
+
+  // A signal death reads as one, not as "exit -1" or as no exit at all.
+  const d = rows.find(r => r.name === 'd')!;
+  assert.equal(d.exitCode, null);
+  assert.equal(d.exitSignal, 'signal 9 SIGKILL');
+  assert.deepEqual(d.problems, ['killed_by_signal']);
 
   const c = rows.find(r => r.name === 'c')!;
   assert.equal(c.hasManifest, false);

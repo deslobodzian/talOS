@@ -313,7 +313,7 @@ test('clear suppresses untimed system and manifest events but retains fresh base
     session_id: '1', config_path: '', config_sha256: '', output_dir: '',
     simulation: true, start_wall_ns: '0', end_wall_ns: '0',
     nodes: [{name: 'node', target: 't', binary_path: '', log_path: '', log_paths: [],
-      pid: 1, exit_code: 0, restart_count, recorder_failed: false,
+      pid: 1, exit_code: 0, exit_signal: 0, restart_count, recorder_failed: false,
       described: true, record_count: '0'}]
   });
   engine.pushFrame(frame(0, 999n, {}));

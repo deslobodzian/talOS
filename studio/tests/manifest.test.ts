@@ -15,6 +15,7 @@ const node = (overrides: Partial<ManifestNode> = {}): ManifestNode => ({
   log_paths: ['/logs/drivetrain.tlog'],
   pid: 1,
   exit_code: -1,
+  exit_signal: 0,
   restart_count: 0,
   recorder_failed: false,
   described: true,
@@ -57,7 +58,7 @@ test('parseManifest recovers uint64 spelling exactly', () => {
     "end_wall_ns": 1735689600000000789,
     "nodes": [
       {"name":"drivetrain","target":"//2026:drivetrain","binary_path":"/bin/d",
-       "log_path":"/l","log_paths":["/l"],"pid":1,"exit_code":-1,
+       "log_path":"/l","log_paths":["/l"],"pid":1,"exit_code":-1,"exit_signal":0,
        "restart_count":2,"recorder_failed":false,"described":true,"record_count":5000}
     ]
   }`;
@@ -90,6 +91,8 @@ test('parseManifest accepts string uint64 and missing optional flags', () => {
   // Absent optional booleans read as false, not an error.
   assert.equal(m.nodes[0].recorder_failed, false);
   assert.equal(m.nodes[0].described, false);
+  // A manifest from before exit_signal existed reads as no signal death.
+  assert.equal(m.nodes[0].exit_signal, 0);
 });
 
 test('parseManifest rejects malformed documents', () => {

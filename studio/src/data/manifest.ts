@@ -13,6 +13,8 @@ export type ManifestNode = {
   log_paths: string[];
   pid: number;
   exit_code: number;
+  // The signal that ended the last run, else 0 (exit_code is -1 then).
+  exit_signal: number;
   restart_count: number;
   recorder_failed: boolean;
   described: boolean;
@@ -142,6 +144,8 @@ function parseNode(value: unknown, where: string): ManifestNode {
     }),
     pid: integer(source, 'pid'),
     exit_code: integer(source, 'exit_code'),
+    // Absent in manifests written before the launcher recorded it.
+    exit_signal: 'exit_signal' in source ? integer(source, 'exit_signal') : 0,
     restart_count: integer(source, 'restart_count'),
     recorder_failed: flag(source, 'recorder_failed'),
     described: flag(source, 'described'),
