@@ -79,27 +79,31 @@ enum class TimestampMappingQuality {
 };
 
 // One timing boundary: mapped source time -> estimated integration midpoint.
-// Presentation time has no guaranteed exposure relationship, so like delivery
-// it uses only the measured host-latency correction, never half an exposure.
+// The kind's own geometry comes first: start of exposure adds half the
+// exposure, end of frame subtracts readout and half the exposure, and every
+// other kind (a known midpoint, delivery, presentation time, which has no
+// guaranteed exposure relationship) gets none. Then the camera's measured
+// stamp bias, `latency_offset_ns`, is subtracted from every kind: a source's
+// label does not prove its stamp is unbiased. nullopt on overflow/underflow.
 inline std::optional<uint64_t> CaptureMidpoint(uint64_t stamp_ns,
                                                TimestampKind kind,
                                                uint64_t exposure_ns,
                                                uint64_t readout_ns,
-                                               uint64_t delivery_offset_ns) {
+                                               uint64_t latency_offset_ns) {
+  uint64_t later = 0;
+  uint64_t earlier = latency_offset_ns;
   if (kind == TimestampKind::kStartOfExposure) {
-    if (stamp_ns > UINT64_MAX - exposure_ns / 2) return std::nullopt;
-    return stamp_ns + exposure_ns / 2;
-  }
-  uint64_t correction = 0;
-  if (kind == TimestampKind::kEndOfFrame) {
+    later = exposure_ns / 2;
+  } else if (kind == TimestampKind::kEndOfFrame) {
     if (readout_ns > UINT64_MAX - exposure_ns / 2) return std::nullopt;
-    correction = readout_ns + exposure_ns / 2;
-  } else if (kind == TimestampKind::kDelivery ||
-             kind == TimestampKind::kPresentation) {
-    correction = delivery_offset_ns;
+    const uint64_t geometry = readout_ns + exposure_ns / 2;
+    if (geometry > UINT64_MAX - earlier) return std::nullopt;
+    earlier += geometry;
   }
-  if (stamp_ns < correction) return std::nullopt;
-  return stamp_ns - correction;
+  if (stamp_ns > UINT64_MAX - later) return std::nullopt;
+  const uint64_t shifted = stamp_ns + later;
+  if (shifted < earlier) return std::nullopt;
+  return shifted - earlier;
 }
 
 // Carries camera identification, capture timing, dimensions, format,

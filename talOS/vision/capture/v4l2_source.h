@@ -6,6 +6,7 @@
 #include <linux/videodev2.h>
 
 #include <cmath>
+#include <string_view>
 
 namespace talos::vision {
 // Injectable control writer keeps device units and failure handling testable.
@@ -35,13 +36,20 @@ bool ApplyV4L2Controls(const CameraControls& controls, WriteControl write) {
   return applied;
 }
 
-inline TimestampKind V4L2TimestampKind(uint32_t flags) {
+// uvcvideo labels its buffers SOE, but unless the module's hwtimestamps
+// parameter is set (default off) the stamp is the host arrival time of the
+// frame's first USB packet, after exposure has started; adding half an
+// exposure would move it the wrong way. It is a delivery stamp, corrected by
+// the camera's measured latency_offset_us only.
+inline TimestampKind V4L2TimestampKind(uint32_t flags,
+                                       std::string_view driver = {}) {
   if ((flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) !=
       V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC)
     return TimestampKind::kDelivery;
-  return (flags & V4L2_BUF_FLAG_TSTAMP_SRC_MASK) == V4L2_BUF_FLAG_TSTAMP_SRC_SOE
-             ? TimestampKind::kStartOfExposure
-             : TimestampKind::kEndOfFrame;
+  if ((flags & V4L2_BUF_FLAG_TSTAMP_SRC_MASK) != V4L2_BUF_FLAG_TSTAMP_SRC_SOE)
+    return TimestampKind::kEndOfFrame;
+  return driver == "uvcvideo" ? TimestampKind::kDelivery
+                              : TimestampKind::kStartOfExposure;
 }
 }  // namespace talos::vision
 #endif

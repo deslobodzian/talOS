@@ -59,9 +59,9 @@ For processor ownership and layer boundaries, see
 
 Camera observation timestamps describe exposure, not publication. Measure
 timestamp bias during [camera bring-up](BRINGUP.md#camera-intrinsics-calibration).
-Live delivery/host-receipt and AVFoundation PTS stamps subtract
-`camera.latency_offset_us`; V4L2 SOE/EOF stamps instead use exposure midpoint
-correction and `camera.readout_us`. Simulation subtracts `latency_offset_us`.
+Every live and simulated stamp subtracts `camera.latency_offset_us`, after
+the per-kind exposure/readout correction described in the
+[vision README](../2026-robot/main_processor/vision/README.md#camera-localization-nodes).
 Sim-only `camera.sim_timestamp_lag_us` adds stamp bias and delays delivery;
 an equal offset restores the truth stamp without removing delivery delay.
 Both offsets default to zero and must be finite, nonnegative and below one

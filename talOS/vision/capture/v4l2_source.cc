@@ -102,6 +102,9 @@ class Source final : public CameraSource {
         !(capabilities & V4L2_CAP_STREAMING)) {
       return Fail("not a streaming video capture device", 0);
     }
+    driver_.assign(reinterpret_cast<const char*>(caps.driver),
+                   strnlen(reinterpret_cast<const char*>(caps.driver),
+                           sizeof(caps.driver)));
     v4l2_format format{};
     bool selected = false;
     const uint32_t preferred = mode_.format == PixelFormat::kGray8
@@ -281,14 +284,14 @@ class Source final : public CameraSource {
         // The frame borrows the dequeued driver buffer until it is queued
         // again below; the consumer copies what it keeps (FrameMailbox).
         // Preserve source meaning; the camera publication boundary converts
-        // SOE/EOF to midpoint once, and delivery uses measured latency only.
+        // it to a midpoint once (CaptureMidpoint).
         Frame frame(config_.camera_id, session_, sequence_++,
                     event::MonotonicTime::from_nanos(capture_end), mode_.width,
                     mode_.height, stride_, mode_.format,
                     static_cast<const uint8_t*>(mappings_[buffer.index].data),
                     size);
         frame.set_raw_timestamp_ns(driver_monotonic ? driver_time : delivery);
-        frame.set_timestamp_kind(V4L2TimestampKind(buffer.flags));
+        frame.set_timestamp_kind(V4L2TimestampKind(buffer.flags, driver_));
         frame.set_mapping_quality(TimestampMappingQuality::kEstimated);
         if (callback_) {
           callback_(frame);
@@ -326,6 +329,7 @@ class Source final : public CameraSource {
   std::vector<Mapping> mappings_;
   uint32_t stride_{0};
   uint64_t session_{0}, sequence_{0};
+  std::string driver_;  // VIDIOC_QUERYCAP driver name; set before streaming.
 };
 }  // namespace
 std::unique_ptr<CameraSource> CreatePlatformCameraSource(

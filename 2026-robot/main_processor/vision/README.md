@@ -24,7 +24,7 @@ Shared configuration defaults and code fallbacks (overridable per camera):
 | --- | --- | --- |
 | `subsystem.period_us` | `10000` | Node/status period in microseconds (100 Hz), not the capture period. |
 | `camera.fps` | `60` | Requested live capture rate and maximum simulated capture rate, in frames per second. Must be finite and positive. |
-| `camera.latency_offset_us` | `0` | Subtracted only from live delivery/PTS timestamps, and from simulated timestamps. Never applied again to SOE/EOF or known midpoint stamps. |
+| `camera.latency_offset_us` | `0` | The camera's measured stamp bias, subtracted from every live timestamp kind (after its exposure/readout correction) and from simulated timestamps. |
 | `camera.sim_timestamp_lag_us` | `0` | Sim only: stamp the rendered truth instant this many microseconds later, modeling a timestamp taken after exposure. Ignored live, but validated in both modes. |
 | `camera.readout_us` | `0` | Known sensor readout duration subtracted from live EOF timestamps (unknown readout is zero). |
 | `camera.frame_timeout_us` | `500000` | Live silence deadline; positive, at most 10,000,000 µs. Reopens a connected but silent camera on the worker, and is the maximum live stamp age (see timestamps below). |
@@ -46,13 +46,18 @@ Timing offsets and readout must be finite, nonnegative and strictly below
 boundary is observation publication (`CaptureMidpoint`): mapped V4L2 SOE adds
 half the successfully configured manual exposure; EOF subtracts half exposure
 plus known readout. Unknown/automatic exposure contributes zero, never a guessed
-duration. Delivery/host receipt and AVFoundation mapped PTS (which does not
-guarantee exposure semantics) subtract only `latency_offset_us`. Known midpoint
-stamps are unchanged. V4L2 non-monotonic timestamps fall back to host receipt;
+duration. Delivery/host receipt, AVFoundation mapped PTS (which does not
+guarantee exposure semantics) and known midpoint stamps get no exposure
+correction. Every kind then subtracts `latency_offset_us`. uvcvideo stamps are
+always treated as delivery stamps: the driver labels its buffers SOE, but with
+its default `hwtimestamps=0` stamps the host arrival of the frame's first USB
+packet. With `hwtimestamps=1` its bias is still absorbed only by
+`latency_offset_us`.
+V4L2 non-monotonic timestamps fall back to host receipt;
 AVFoundation without a synchronized sample clock does likewise. Backends retain
 the source kind rather than claiming these are all exposure timestamps.
-Measure delivery/PTS bias per camera; do not subtract processing/transport delay
-already excluded by a hardware source timestamp. Underflow or future stamps
+Measure each camera's remaining stamp bias; do not subtract processing/transport
+delay already excluded by a hardware source timestamp. Underflow or future stamps
 publish invalid observations, never an unsigned-wrapped future timestamp. So
 does a live stamp older than `frame_timeout_us` when published; one diagnostic
 names the camera when its stamps turn stale and one when they recover.

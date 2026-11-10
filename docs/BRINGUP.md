@@ -67,12 +67,12 @@ For the one-Kraken RoboRIO/Mini test bench, use [BENCH.md](BENCH.md).
    shift from fixed mounting bias. A timestamped LED/blink exposure test is an
    alternative. Set `[camera] latency_offset_us` in that camera's TOML to the
    measured nonnegative delay (default 0, finite and below 1,000,000 µs).
-   This offset applies only to delivery/host-receipt or AVFoundation PTS stamps.
+   This offset applies to every stamp kind, after the kind's own correction:
    V4L2 SOE adds half exposure; EOF subtracts half exposure plus configured
    `readout_us` (default zero if unknown). Exposure contributes only when
-   requested controls succeeded and auto exposure is off. Neither V4L2 stamp
-   receives the delivery offset. Do not subtract processing delay already
-   excluded by a hardware timestamp.
+   requested controls succeeded and auto exposure is off. uvcvideo cameras'
+   SOE-labelled stamps are host arrival times and get no exposure correction.
+   Do not subtract processing delay already excluded by a hardware timestamp.
    Rebuild/redeploy and repeat the motion check: timestamp alignment should
    improve, and status `last_latency_us` now includes the correction. Leave
    `sim_timestamp_lag_us = 0` on the robot; it is a sim-only injection, ignored

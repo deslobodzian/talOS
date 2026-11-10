@@ -1296,7 +1296,7 @@ TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
                      "period_us = 1000\n");
   sim.add<LiveTestVision>("rear_right_camera");
   ASSERT_TRUE(AdvanceLiveUntil(sim, [&] { return device->starts == 1; }));
-  // Each frame is stamped 10 ms before now and corrected by up to 10 ms more.
+  // Each frame is stamped 10 ms before now and corrected by up to 13 ms more.
   // A fast worker starts within a few simulated milliseconds, which made those
   // stamps negative: CaptureMidpoint then has no valid time, the observation
   // carries 0 and the wait below could never match. Start from 30 ms.
@@ -1307,15 +1307,17 @@ TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
   for (auto kind : {TimestampKind::kStartOfExposure, TimestampKind::kEndOfFrame,
                     TimestampKind::kDelivery, TimestampKind::kPresentation}) {
     const auto stamp = sim.now().nanos() - 10000000;
-    const auto correction = kind == TimestampKind::kStartOfExposure ? -2000000
-                            : kind == TimestampKind::kEndOfFrame    ? 3000000
+    // Half the 4 ms exposure and the 1 ms readout, then the 10 ms latency
+    // offset, which applies to every kind.
+    const auto correction = kind == TimestampKind::kStartOfExposure ? 8000000
+                            : kind == TimestampKind::kEndOfFrame    ? 13000000
                                                                     : 10000000;
     ASSERT_GT(stamp - correction, 0);
     device->Emit(stamp, kind);
     // Wait for this frame's own result: the status that counts it is sent in
     // the same update as its observation. Matching the timestamp alone could
     // accept the previous observation, whose corrected time can coincide
-    // (end-of-frame minus 3 ms after a 7 ms wait equals delivery minus 10 ms).
+    // (a later frame minus a larger correction can equal an earlier one).
     ASSERT_TRUE(AdvanceLiveUntil(
         sim,
         [&] {

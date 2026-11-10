@@ -9,20 +9,23 @@
 namespace talos::vision {
 namespace {
 TEST(Capture, TimestampKindsConvertAtOneBoundary) {
+  // exposure 200, readout 50, latency offset 300: each kind's geometry, then
+  // the camera's measured offset, which applies to every kind.
   EXPECT_EQ(
       CaptureMidpoint(1000, TimestampKind::kStartOfExposure, 200, 50, 300),
-      1100);
+      800);
   EXPECT_EQ(CaptureMidpoint(1000, TimestampKind::kEndOfFrame, 200, 50, 300),
-            850);
-  EXPECT_EQ(CaptureMidpoint(1000, TimestampKind::kExposure, 200, 50, 300),
-            1000);
-  for (auto kind : {TimestampKind::kDelivery, TimestampKind::kPresentation}) {
+            550);
+  for (auto kind : {TimestampKind::kExposure, TimestampKind::kDelivery,
+                    TimestampKind::kPresentation}) {
     EXPECT_EQ(CaptureMidpoint(1000, kind, 200, 50, 300), 700);
     EXPECT_FALSE(CaptureMidpoint(299, kind, 200, 50, 300));
   }
   EXPECT_FALSE(
+      CaptureMidpoint(199, TimestampKind::kStartOfExposure, 200, 50, 300));
+  EXPECT_FALSE(
       CaptureMidpoint(UINT64_MAX, TimestampKind::kStartOfExposure, 200, 0, 0));
-  EXPECT_FALSE(CaptureMidpoint(149, TimestampKind::kEndOfFrame, 200, 50, 0));
+  EXPECT_FALSE(CaptureMidpoint(449, TimestampKind::kEndOfFrame, 200, 50, 300));
 }
 
 #if defined(__linux__)
@@ -34,6 +37,10 @@ TEST(Capture, LinuxTimestampFlagsRetainSourceMeaning) {
                               V4L2_BUF_FLAG_TSTAMP_SRC_EOF),
             TimestampKind::kEndOfFrame);
   EXPECT_EQ(V4L2TimestampKind(V4L2_BUF_FLAG_TSTAMP_SRC_SOE),
+            TimestampKind::kDelivery);
+  EXPECT_EQ(V4L2TimestampKind(V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC |
+                                  V4L2_BUF_FLAG_TSTAMP_SRC_SOE,
+                              "uvcvideo"),
             TimestampKind::kDelivery);
 }
 
