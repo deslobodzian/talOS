@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 
 namespace talos::process {
 
@@ -37,11 +38,64 @@ inline void InstallStopHandlers() {
   sigaction(SIGTERM, &action, nullptr);
 }
 
-struct RealtimeOptions {
-  std::chrono::nanoseconds
-      period{};       // loop period (Mach time-constraint policy)
-  int priority = 50;  // SCHED_FIFO priority on Linux, 1..99
+// Which loop wins when loops compete for a CPU, lowest first. A process
+// decides its own tier from what it already knows: the hardware bridge is
+// kBridge; a node on the actuation path is kControl: its own subsystem config
+// owns an actuator (hardware::Devices::owns_actuators: a motor, digital
+// output or PWM output) or it writes a target lane (`/<sub>/target/<source>`:
+// driver, teleop, auto); every other node (telemetry, cameras, the pose
+// estimator) is kObserver.
+enum class LoopTier : std::uint8_t {
+  kObserver,
+  kControl,
+  kBridge,
 };
+
+struct RealtimeOptions {
+  std::chrono::nanoseconds period{};  // loop period (Mach time-constraint)
+  LoopTier tier = LoopTier::kObserver;
+};
+
+// SCHED_FIFO priorities per tier on Linux. All below 50, where PREEMPT_RT
+// runs every threaded interrupt handler (the NIC's, which delivers the
+// RoboRIO's UDP to the bridge, among them), so an interrupt is never held off
+// by a loop; all above every SCHED_OTHER thread. Gaps leave room for a tier
+// between them.
+//
+// Not every wakeup a loop waits for comes from those handlers. On
+// PREEMPT_RT a timerfd's hrtimer expires in softirq context, in ktimers/N at
+// SCHED_FIFO 1 (ksoftirqd, SCHED_OTHER, on some older RT kernels), so a node's
+// event-loop tick (talOS/events epoll_poller, a timerfd) can wait behind
+// any loop running on that CPU, a lower tier included, until it sleeps. The
+// bridge's tick sleeps in clock_nanosleep, which PREEMPT_RT expires in hard
+// interrupt context for a realtime thread. On a kernel without PREEMPT_RT
+// hrtimers expire in hard interrupt context, but softirq work deferred to
+// ksoftirqd (SCHED_OTHER), such as network receive under load, waits behind
+// every loop on that CPU. TODO.md RT-4.
+inline constexpr int kObserverFifoPriority = 40;
+inline constexpr int kControlFifoPriority = 45;
+inline constexpr int kBridgeFifoPriority = 49;
+
+// The scheduling ConfigureRealtime asks the OS for, for both OSes, so the
+// mapping is checked anywhere without privilege.
+struct LoopPolicy {
+  int fifo_priority = 0;  // Linux SCHED_FIFO priority
+  // macOS: THREAD_TIME_CONSTRAINT_POLICY with the three durations below, or,
+  // when false, timeshare at QOS_CLASS_USER_INTERACTIVE. Every
+  // time-constraint thread runs above every timeshare thread, but the public
+  // policy has no priority (the kernel orders those threads by deadline, wake
+  // time plus constraint), so on macOS only observers are ordered: they stay
+  // off the time-constraint band, which the bridge and kControl loops share.
+  bool time_constraint = false;
+  std::chrono::nanoseconds period{};
+  std::chrono::nanoseconds computation{};
+  std::chrono::nanoseconds constraint{};
+};
+
+// The policy for `options`: the tier's FIFO priority; for the bridge and
+// kControl, a time-constraint period of options.period (1 ms when not
+// positive), computation half of it and constraint all of it.
+LoopPolicy PolicyFor(const RealtimeOptions& options) noexcept;
 
 // Whether a node binary (talos::Run, the hardware bridge) asks for realtime
 // scheduling of its loop thread. By default it does on the robot and not
@@ -59,16 +113,15 @@ bool RealtimeRequested(bool simulation) noexcept;
 // shared-memory ring (SharedMemoryPtr) mapped now or later is prefaulted for
 // writing and mlocked (memory::KeepMappingsResident), and the calling
 // thread's stack is prefaulted 256 KiB below this call (less on a smaller
-// stack) and mlocked up to its top. Scheduling:
-// SCHED_FIFO at `priority` (Linux) or THREAD_TIME_CONSTRAINT_POLICY derived
-// from `period` (macOS, where a non-positive period counts as 1 ms). Threads
-// created afterwards inherit the policy on Linux, so call it last, from the
-// thread that runs the loop.
+// stack) and mlocked up to its top. Scheduling: PolicyFor(options), SCHED_FIFO
+// on Linux, the time-constraint policy or QOS_CLASS_USER_INTERACTIVE on macOS.
+// Threads created afterwards inherit the policy on Linux, so call it last,
+// from the thread that runs the loop.
 //
 // Returns true when every step took effect. Returns false without touching
 // anything when the environment sets TALOS_REALTIME=0. Returns false and
 // prints one line to stderr when the OS refuses a step (no privilege,
-// RLIMIT_MEMLOCK or the wired-memory limit, a refused Mach policy); the
+// RLIMIT_MEMLOCK or the wired-memory limit, a refused Mach policy or QoS); the
 // steps it could take stay in effect, and a refused lock still leaves the
 // rings and stack prefaulted. Never throws, never aborts.
 bool ConfigureRealtime(const RealtimeOptions& options) noexcept;

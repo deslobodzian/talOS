@@ -83,7 +83,7 @@ A relative `--prefix` is resolved against the working directory.
 - **enable-boot** starts `<prefix>/current/run.sh` at boot as `--user`
   (default `talos`; the account must exist). Linux: writes and enables
   `/etc/systemd/system/talos.service` (`Type=notify`, `Restart=always`, a
-  three-second supervision watchdog, `LimitRTPRIO=60` and
+  three-second supervision watchdog, `LimitRTPRIO=49` and
   `LimitMEMLOCK=infinity`, so the unprivileged service gets the
   [realtime scheduling](NODE_DEVELOPMENT_GUIDE.md#realtime-scheduling) its
   nodes request). macOS: writes the

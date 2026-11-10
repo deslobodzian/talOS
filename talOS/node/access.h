@@ -31,6 +31,9 @@ struct RobotConfig;
 namespace introspect {
 struct Description;
 }  // namespace introspect
+namespace process {
+enum class LoopTier : std::uint8_t;  // talOS/process/process.h
+}  // namespace process
 }  // namespace talos
 
 namespace talos::detail {
@@ -128,6 +131,11 @@ struct NodeAccess {
   static const DeclaredGraph* declared_graph(Node& node);
   static bool reads_graph(const Node& node);
   static const config::RobotConfig& robot_config(const Node& node);
+  // The scheduling tier talos::Run gives the node's loop thread: control when
+  // its own subsystem's devices own an actuator
+  // (hardware::Devices::owns_actuators) or it has registered a publisher on a
+  // target lane, otherwise observer. Read after construction.
+  static process::LoopTier loop_tier(const Node& node);
   // The session output directory (parent of --log), or nullopt without --log.
   static std::optional<std::filesystem::path> session_dir(const Node& node);
 

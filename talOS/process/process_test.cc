@@ -14,6 +14,7 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/thread_policy.h>
+#include <pthread/qos.h>
 #else
 #include <sched.h>
 #endif
@@ -38,10 +39,33 @@ TEST(ProcessTest, StopHandlersSetStopRequestedOnSigintAndSigterm) {
   stop_requested.store(false, std::memory_order_relaxed);
 }
 
-// Whether the calling thread runs under the realtime policy
-// ConfigureRealtime sets.
-bool ThreadIsRealtime() {
+// Bridge above control above observers on Linux, all below the SCHED_FIFO 50
+// of PREEMPT_RT's threaded interrupt handlers (a loop must not hold off the
+// NIC delivering the RoboRIO's packets). On macOS, whose public
+// time-constraint policy has no priority, observers stay off the
+// time-constraint band so they cannot delay a control loop.
+TEST(ProcessTest, TiersMapToOrderedPolicies) {
+  const LoopPolicy bridge =
+      PolicyFor({.period = 1ms, .tier = LoopTier::kBridge});
+  const LoopPolicy control =
+      PolicyFor({.period = 20ms, .tier = LoopTier::kControl});
+  const LoopPolicy observer =
+      PolicyFor({.period = 20ms, .tier = LoopTier::kObserver});
+
+  EXPECT_LT(0, observer.fifo_priority);
+  EXPECT_LT(observer.fifo_priority, control.fifo_priority);
+  EXPECT_LT(control.fifo_priority, bridge.fifo_priority);
+  EXPECT_LT(bridge.fifo_priority, 50);
+
+  EXPECT_TRUE(bridge.time_constraint);
+  EXPECT_TRUE(control.time_constraint);
+  EXPECT_FALSE(observer.time_constraint);
+  // An unknown period must not become a zero-length constraint.
+  EXPECT_GT(PolicyFor({.tier = LoopTier::kControl}).constraint, 0ns);
+}
+
 #if defined(__APPLE__)
+bool HasTimeConstraint() {
   thread_time_constraint_policy_data_t policy{};
   mach_msg_type_number_t count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
   boolean_t get_default = FALSE;
@@ -49,6 +73,14 @@ bool ThreadIsRealtime() {
       ::pthread_mach_thread_np(::pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
       reinterpret_cast<thread_policy_t>(&policy), &count, &get_default);
   return result == KERN_SUCCESS && get_default == FALSE;
+}
+#endif
+
+// Whether the calling thread runs under a realtime policy (SCHED_FIFO, or
+// the Mach time-constraint policy).
+bool ThreadIsRealtime() {
+#if defined(__APPLE__)
+  return HasTimeConstraint();
 #else
   int policy = 0;
   sched_param param{};
@@ -57,18 +89,34 @@ bool ThreadIsRealtime() {
 #endif
 }
 
+// Whether the calling thread runs under exactly the policy PolicyFor gives
+// `tier`.
+bool ThreadHasTierPolicy(LoopTier tier) {
+  const LoopPolicy expected = PolicyFor({.period = 10ms, .tier = tier});
+#if defined(__APPLE__)
+  if (expected.time_constraint) return HasTimeConstraint();
+  return !HasTimeConstraint() &&
+         ::qos_class_self() == QOS_CLASS_USER_INTERACTIVE;
+#else
+  int policy = 0;
+  sched_param param{};
+  ::pthread_getschedparam(::pthread_self(), &policy, &param);
+  return policy == SCHED_FIFO && param.sched_priority == expected.fifo_priority;
+#endif
+}
+
 // Runs ConfigureRealtime on a fresh thread, so the test's own thread keeps
 // its scheduling, and reports what it returned and whether that thread ended
-// up realtime.
+// up under the tier's policy.
 struct Outcome {
   bool returned = false;
-  bool realtime = false;
+  bool applied = false;
 };
-Outcome ConfigureOnFreshThread() {
+Outcome ConfigureOnFreshThread(LoopTier tier) {
   Outcome outcome;
-  std::thread worker{[&outcome] {
-    outcome.returned = ConfigureRealtime({.period = 10ms, .priority = 50});
-    outcome.realtime = ThreadIsRealtime();
+  std::thread worker{[&outcome, tier] {
+    outcome.returned = ConfigureRealtime({.period = 10ms, .tier = tier});
+    outcome.applied = ThreadHasTierPolicy(tier);
   }};
   worker.join();
   return outcome;
@@ -83,8 +131,8 @@ TEST(ProcessTest, RealtimeDisabledByEnvironmentChangesNothing) {
   EXPECT_EXIT(
       {
         ::setenv("TALOS_REALTIME", "0", 1);
-        const Outcome outcome = ConfigureOnFreshThread();
-        const bool unchanged = !outcome.returned && !outcome.realtime &&
+        const Outcome outcome = ConfigureOnFreshThread(LoopTier::kControl);
+        const bool unchanged = !outcome.returned && !outcome.applied &&
                                !memory::MappingsKeptResident();
         std::_Exit(unchanged ? 0 : 1);
       },
@@ -106,16 +154,19 @@ TEST(ProcessTest, RealtimeRequestFollowsSimulationUnlessTheEnvironmentSays) {
   ::unsetenv("TALOS_REALTIME");
 }
 
-// Report success only when the OS actually applied the realtime policy, and
+// Report success only when the OS actually applied the tier's policy, and
 // never fail on the memory steps where the OS allows them: a host that grants
 // the policy here also grants the stack lock (no rings are mapped), so a
 // memory step that always failed would break the equality.
-TEST(ProcessTest, RealtimeIsBestEffort) {
+TEST(ProcessTest, RealtimeIsBestEffortForEveryTier) {
   ::unsetenv("TALOS_REALTIME");
   static_assert(noexcept(ConfigureRealtime(RealtimeOptions{})));
-  const Outcome outcome = ConfigureOnFreshThread();
-
-  EXPECT_EQ(outcome.returned, outcome.realtime);
+  for (const LoopTier tier :
+       {LoopTier::kObserver, LoopTier::kControl, LoopTier::kBridge}) {
+    const Outcome outcome = ConfigureOnFreshThread(tier);
+    EXPECT_EQ(outcome.returned, outcome.applied)
+        << "tier " << static_cast<int>(tier);
+  }
   EXPECT_TRUE(memory::MappingsKeptResident());
 }
 
@@ -151,7 +202,7 @@ TEST(ProcessTest, BackgroundThreadLeavesAnInheritedRealtimePolicy) {
   bool grandchild_realtime = true;
   bool grandchild_background = false;
   std::thread parent{[&] {
-    ConfigureRealtime({.period = 10ms, .priority = 1});
+    ConfigureRealtime({.period = 10ms, .tier = LoopTier::kControl});
     parent_realtime = ThreadIsRealtime();
     if (!parent_realtime) return;
     std::thread child{[&] {

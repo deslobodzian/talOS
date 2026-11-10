@@ -172,8 +172,9 @@ TEST(PollerTest, MoveConstructionPreservesWatchedFdAndMovedFromIsSafe) {
 }
 
 #if defined(__APPLE__)
-// The time-constraint policy talos::process::ConfigureRealtime gives a node's
-// loop thread on macOS (set inline: talOS/events sits below talOS/process).
+// The time-constraint policy talos::process::ConfigureRealtime gives a control
+// node's or the bridge's loop thread on macOS (set inline: talOS/events sits
+// below talOS/process).
 bool SetTimeConstraintPolicy(Duration period) {
   mach_timebase_info_data_t timebase{};
   if (::mach_timebase_info(&timebase) != KERN_SUCCESS) return false;

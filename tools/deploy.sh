@@ -101,7 +101,7 @@ for parent, dirs, files in os.walk(root, onerror=lambda e: sys.exit(str(e))):
   # manual restarts included) would leave the unit failed and end
   # Restart=always. LimitRTPRIO/LimitMEMLOCK let the unprivileged service
   # take the realtime scheduling nodes request: SCHED_FIFO up to the bridge's
-  # priority 60, and mlockall (docs/NODE_DEVELOPMENT_GUIDE.md).
+  # priority 49, and mlockall (docs/NODE_DEVELOPMENT_GUIDE.md).
   local unit="[Unit]
 Description=talOS robot bundle
 After=network-online.target
@@ -117,7 +117,7 @@ TimeoutStartSec=1200
 WatchdogSec=3
 Restart=always
 RestartSec=2
-LimitRTPRIO=60
+LimitRTPRIO=49
 LimitMEMLOCK=infinity
 
 [Install]

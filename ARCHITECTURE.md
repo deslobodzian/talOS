@@ -181,12 +181,18 @@ before each of its own timers (`update()`, `every()`), so a timer sees what was
 published by its deadline whether or not the node has callbacks. A node
 without message callbacks otherwise sleeps; a node with a `subscribe` callback
 or a Driver Station listener, or with no timer, also drains every 1 ms.
-Off-simulation the loop thread runs under `SCHED_FIFO` (Linux) or the Mach
-time-constraint policy (macOS), best effort, with its shared-memory rings and
-stack prefaulted and locked; Linux also locks all other memory (`mlockall`),
-while macOS only prefaults the talOS code (`talOS/process`; what is locked on
-each OS and `TALOS_REALTIME`'s override are in the node development guide's
-realtime scheduling paragraph). Helper threads, such as camera capture
+Off-simulation the loop thread runs realtime, best effort, in one of three
+tiers the process picks itself: the bridge above control nodes (a node whose
+own subsystem owns a motor, digital or PWM output, or that writes a target
+lane) above observers (every other node). Linux gives each tier its own
+`SCHED_FIFO` priority below PREEMPT_RT's interrupt threads; macOS runs the
+bridge and control nodes under the Mach time-constraint policy, which has no
+priority among them, and observers timeshare below it. The loop's
+shared-memory rings and stack are prefaulted and locked; Linux also locks
+all other memory (`mlockall`), while macOS only prefaults the talOS code
+(`talOS/process`; the priorities, what is locked on each OS and
+`TALOS_REALTIME`'s override are in the node development guide's realtime
+scheduling paragraph). Helper threads, such as camera capture
 and AprilTag detection, run below every loop thread
 (`ConfigureBackgroundThread`).
 

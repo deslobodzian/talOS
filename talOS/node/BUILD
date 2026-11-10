@@ -128,6 +128,7 @@ cc_test(
         "//talOS/events:events_log",
         "//talOS/introspection:describe",
         "//talOS/memory:shared_memory",
+        "//talOS/process",
         "//talOS/rtms",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

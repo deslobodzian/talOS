@@ -94,6 +94,8 @@ struct Node::Impl {
   detail::GraphSource graph;
   std::optional<std::filesystem::path> session_dir;
   bool reads_graph = false;
+  // A publisher on a target lane (`/<sub>/target/<source>`) is registered.
+  bool writes_target_lane = false;
   Duration period{};
   Duration timeout{};
 
@@ -417,6 +419,15 @@ const config::RobotConfig& NodeAccess::robot_config(const Node& node) {
   return *node.impl_->config;
 }
 
+process::LoopTier NodeAccess::loop_tier(const Node& node) {
+  const Node::Impl& impl = *node.impl_;
+  const hardware::Devices* devices = impl.config->GetDevices(impl.name);
+  const bool owns_actuators = devices != nullptr && devices->owns_actuators();
+  return owns_actuators || impl.writes_target_lane
+             ? process::LoopTier::kControl
+             : process::LoopTier::kObserver;
+}
+
 std::optional<std::filesystem::path> NodeAccess::session_dir(const Node& node) {
   return node.impl_->session_dir;
 }
@@ -727,6 +738,9 @@ std::size_t NodeAccess::add_publisher(Node& node, std::string_view topic,
       impl.loop->register_sender(resolved, static_cast<std::uint32_t>(bytes),
                                  static_cast<std::uint32_t>(alignment), schema);
   impl.publishers.push_back({id, bytes});
+  if (introspect::naming::IsTargetLane(resolved)) {
+    impl.writes_target_lane = true;
+  }
   return impl.publishers.size() - 1;
 }
 
@@ -1237,7 +1251,8 @@ int RunMain(int argc, char** argv, const char* node_name,
     // bookkeeping and must not inherit the loop's realtime policy.
     if (process::RealtimeRequested(flags.simulation)) {
       process::ConfigureRealtime(
-          {.period = hosted->node->period(), .priority = 50});
+          {.period = hosted->node->period(),
+           .tier = NodeAccess::loop_tier(*hosted->node)});
     }
     if (flags.duration_s) {
       loop.run_for(std::chrono::seconds{flags.duration_s});

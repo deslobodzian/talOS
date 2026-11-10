@@ -667,13 +667,20 @@ bool HardwareNode::ShouldSendCommand(uint64_t now_us) {
 
 int HardwareNode::Run(int duration_s) {
   talos::process::InstallStopHandlers();
-  // The 1 kHz merge runs above the nodes (priority 50) so a busy node cannot
-  // delay the command the RoboRIO is waiting for. Best effort: a refusal is
-  // reported once and the bridge runs unprivileged. Simulation stays an
-  // ordinary process unless TALOS_REALTIME=1 asks otherwise.
+  // The 1 kHz merge runs in the highest loop tier: on Linux above every
+  // node's SCHED_FIFO priority, so a busy node cannot delay the command the
+  // RoboRIO is waiting for (its tick sleeps in clock_nanosleep, a hard
+  // hrtimer for a realtime thread on PREEMPT_RT). macOS has no priority among
+  // time-constraint threads, so there the bridge shares that band with the
+  // control nodes and is ahead only of the observers (talOS/process
+  // LoopPolicy). Best
+  // effort: a refusal is reported once and the bridge runs unprivileged.
+  // Simulation stays an ordinary process unless TALOS_REALTIME=1 asks
+  // otherwise.
   if (talos::process::RealtimeRequested(simulation_)) {
     talos::process::ConfigureRealtime(
-        {.period = std::chrono::microseconds{kTickPeriodUs}, .priority = 60});
+        {.period = std::chrono::microseconds{kTickPeriodUs},
+         .tier = talos::process::LoopTier::kBridge});
   }
   const auto end =
       std::chrono::steady_clock::now() + std::chrono::seconds{duration_s};

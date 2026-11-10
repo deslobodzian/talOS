@@ -36,6 +36,7 @@
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/node/internal.h"
 #include "talOS/node/testing.h"
+#include "talOS/process/process.h"
 #include "talOS/rtms/rtms.h"
 
 namespace talos {
@@ -98,6 +99,50 @@ TEST(Node, ReadsParamsWithFallbacksAndRejectsMissingOrMistyped) {
   EXPECT_THROW((void)node.param<int>("gain", 0), std::invalid_argument);
   EXPECT_EQ(node.param<std::uint8_t>("whole"), 3);
   EXPECT_THROW((void)node.param<std::uint8_t>("big"), std::invalid_argument);
+}
+
+// The actuation path picks a loop's scheduling tier: a node whose own
+// subsystem has a motor, or that writes a target lane, runs above the
+// observers (sensors only, or publishing only its own topics), wherever the
+// other subsystems' actuators are.
+struct LanePublisher {
+  explicit LanePublisher(Node& n)
+      : lane{n.publish<Count>("/arm/target/auto")} {}
+  Publisher<Count> lane;
+};
+struct StatePublisher {
+  explicit StatePublisher(Node& n) : state{n.publish<Count>("state")} {}
+  Publisher<Count> state;
+};
+
+TEST(Node, LoopTierFollowsTheActuationPath) {
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.arm.motors.lift]
+can_id = 1
+
+[subsystems.gate.digital_inputs.beam]
+dio = 3
+
+[subsystems.autonomous]
+[subsystems.estimator]
+)");
+  sim.add<Empty>("arm");
+  sim.add<LanePublisher>("autonomous");
+  sim.add<Empty>("gate");
+  sim.add<StatePublisher>("estimator");
+
+  EXPECT_EQ(detail::NodeAccess::loop_tier(sim.node("arm")),
+            process::LoopTier::kControl);
+  EXPECT_EQ(detail::NodeAccess::loop_tier(sim.node("autonomous")),
+            process::LoopTier::kControl);
+  EXPECT_EQ(detail::NodeAccess::loop_tier(sim.node("gate")),
+            process::LoopTier::kObserver);
+  EXPECT_EQ(detail::NodeAccess::loop_tier(sim.node("estimator")),
+            process::LoopTier::kObserver);
 }
 
 TEST(Node, ArrayParamsRejectMissingAndMistypedValues) {

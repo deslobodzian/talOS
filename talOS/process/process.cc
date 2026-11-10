@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -182,24 +183,31 @@ void LockMemory(Problems& problems) {
 
 #if defined(__APPLE__)
 
-void SetThreadPolicy(const RealtimeOptions& options, Problems& problems) {
+void SetThreadPolicy(const LoopPolicy& loop, Problems& problems) {
+  if (!loop.time_constraint) {
+    // Timeshare, so below every time-constraint loop and above helper
+    // threads (QOS_CLASS_UTILITY).
+    const int result =
+        ::pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    if (result != 0) {
+      problems.add("QOS_CLASS_USER_INTERACTIVE", std::strerror(result));
+    }
+    return;
+  }
   mach_timebase_info_data_t timebase{};
   if (::mach_timebase_info(&timebase) != KERN_SUCCESS || timebase.numer == 0) {
     problems.add("time constraint", "no mach timebase");
     return;
   }
-  const std::int64_t period_ns =
-      options.period.count() > 0 ? options.period.count() : 1'000'000;
-  const auto to_abs = [&](std::int64_t ns) {
-    return static_cast<std::uint32_t>(
-        std::min<std::int64_t>(ns * timebase.denom / timebase.numer,
-                               std::numeric_limits<std::uint32_t>::max()));
+  const auto to_abs = [&](std::chrono::nanoseconds duration) {
+    return static_cast<std::uint32_t>(std::min<std::int64_t>(
+        duration.count() * timebase.denom / timebase.numer,
+        std::numeric_limits<std::uint32_t>::max()));
   };
-  // Up to half the period of work, which must finish within the period.
   thread_time_constraint_policy_data_t policy{};
-  policy.period = to_abs(period_ns);
-  policy.computation = to_abs(period_ns / 2);
-  policy.constraint = to_abs(period_ns);
+  policy.period = to_abs(loop.period);
+  policy.computation = to_abs(loop.computation);
+  policy.constraint = to_abs(loop.constraint);
   policy.preemptible = TRUE;
   const kern_return_t result = ::thread_policy_set(
       ::pthread_mach_thread_np(::pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
@@ -212,11 +220,11 @@ void SetThreadPolicy(const RealtimeOptions& options, Problems& problems) {
 
 #else
 
-void SetThreadPolicy(const RealtimeOptions& options, Problems& problems) {
+void SetThreadPolicy(const LoopPolicy& loop, Problems& problems) {
   const int low = ::sched_get_priority_min(SCHED_FIFO);
   const int high = ::sched_get_priority_max(SCHED_FIFO);
   sched_param param{};
-  param.sched_priority = std::clamp(options.priority, low, high);
+  param.sched_priority = std::clamp(loop.fifo_priority, low, high);
   const int result =
       ::pthread_setschedparam(::pthread_self(), SCHED_FIFO, &param);
   if (result != 0) {
@@ -293,13 +301,33 @@ bool RealtimeRequested(bool simulation) noexcept {
   return !simulation;
 }
 
+LoopPolicy PolicyFor(const RealtimeOptions& options) noexcept {
+  LoopPolicy policy;
+  if (options.tier == LoopTier::kBridge) {
+    policy.fifo_priority = kBridgeFifoPriority;
+  } else if (options.tier == LoopTier::kControl) {
+    policy.fifo_priority = kControlFifoPriority;
+  } else {
+    policy.fifo_priority = kObserverFifoPriority;
+    return policy;
+  }
+  // Up to half the period of work, which must finish within the period.
+  policy.time_constraint = true;
+  policy.period = options.period.count() > 0
+                      ? options.period
+                      : std::chrono::nanoseconds{std::chrono::milliseconds{1}};
+  policy.computation = policy.period / 2;
+  policy.constraint = policy.period;
+  return policy;
+}
+
 bool ConfigureRealtime(const RealtimeOptions& options) noexcept {
   const char* setting = std::getenv("TALOS_REALTIME");
   if (setting != nullptr && std::strcmp(setting, "0") == 0) return false;
 
   Problems problems;
   LockMemory(problems);
-  SetThreadPolicy(options, problems);
+  SetThreadPolicy(PolicyFor(options), problems);
   if (problems.empty()) return true;
   std::fprintf(stderr, "talos: realtime scheduling incomplete: %s\n",
                problems.text());

@@ -59,10 +59,37 @@ and publication-age semantics.
 ### Realtime scheduling
 
 On the robot (not `--sim`, `--describe` or `--replay`) a node binary runs its
-loop thread under `SCHED_FIFO` priority 50 on Linux, or under the Mach
-time-constraint policy for its period on macOS; the bridge's loop runs at
-priority 60. It also keeps the memory its loop touches resident, so a tick
-does not take a page fault:
+loop thread under a realtime policy chosen by its tier
+(`talos::process::LoopTier`), which the process decides itself: the bridge
+(`hardware_node`) is the highest tier; a node on the actuation path, whose own
+subsystem owns a motor, digital output or PWM output or which writes a target
+lane (`driver`, `teleop`, `auto`), is a control node; every other node
+(telemetry, cameras, the pose estimator, Python observers) is an observer.
+
+- Linux: `SCHED_FIFO` priority 49 for the bridge, 45 for control nodes and 40
+  for observers, so a runnable loop preempts every loop of a lower tier. All
+  are below the `SCHED_FIFO` 50 PREEMPT_RT gives threaded interrupt handlers
+  (among them the NIC's, which carries the RoboRIO's packets), so no loop
+  holds off an interrupt. A wakeup that does not come from those handlers is
+  not ordered by tier: on PREEMPT_RT a node's tick timer (a timerfd) expires
+  in `ktimers/N` at `SCHED_FIFO` 1 (`ksoftirqd`, `SCHED_OTHER`, on some
+  older RT kernels), so a control node's tick can wait until whatever loop
+  holds that CPU, an observer included, sleeps; the bridge's tick sleeps in
+  `clock_nanosleep`, which PREEMPT_RT expires in hard interrupt context. On a
+  kernel without PREEMPT_RT timers expire in hard interrupt context, but
+  softirq work deferred to `ksoftirqd` (`SCHED_OTHER`), such as network
+  receive under load, waits behind every loop on that CPU (TODO.md RT-4).
+- macOS: the bridge and control nodes run under the Mach time-constraint
+  policy for their period (computation half of it, constraint all of it);
+  observers run timeshare at `QOS_CLASS_USER_INTERACTIVE`, below every
+  time-constraint thread and above helper threads. The public time-constraint
+  policy has no priority (the variant with one is private, and refused
+  without a boot argument): the kernel orders those threads by deadline (wake
+  time plus constraint), not by tier, so on macOS the bridge does not take
+  precedence over the control nodes; only observers are ordered below them.
+
+The node also keeps the memory its loop touches resident, so a tick does not
+take a page fault:
 
 - Linux: `mlockall(MCL_CURRENT | MCL_FUTURE)` locks every mapping, present
   and future.
