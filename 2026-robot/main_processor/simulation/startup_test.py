@@ -230,6 +230,59 @@ def log_baseline_ns(session):
     return baseline
 
 
+def launcher_env(**extra):
+    """The launcher environment for a full-graph sim test.
+
+    On macOS the loop threads request realtime scheduling (the production
+    policy): at timeshare priority a saturated runner delayed 5 ms loops by
+    10-50 ms and broke the request-gap bounds. Linux passes without it, and
+    SCHED_FIFO there has no per-thread fail-safe.
+    """
+    env = dict(os.environ, **extra)
+    if sys.platform == "darwin":
+        env["TALOS_REALTIME"] = "1"
+    return env
+
+
+def assert_realtime(test, launcher_output):
+    """Fail a macOS run whose nodes silently fell back to timeshare."""
+    if sys.platform == "darwin":
+        test.assertNotIn("talos: realtime scheduling incomplete", launcher_output)
+
+
+def restart_timeline(path, topic):
+    """(loop origin, first record, first SEND on topic) node-clock ns of a tlog.
+
+    The first record is the first dispatch after run() starts. Walks v7 record
+    headers like log_baseline_ns; any value may be None for a truncated log.
+    """
+    with Path(path).open("rb") as stream:
+        header = stream.read(120)
+        origin, = struct.unpack_from("<q", header, 24)
+        header_bytes, = struct.unpack_from("<I", header, 12)
+        manifests, = struct.unpack_from("<I", header, 40)
+        schema_bytes, = struct.unpack_from("<Q", header, 112)
+        stream.seek(header_bytes)
+        ids = set()
+        for _ in range(manifests):
+            entry = stream.read(112)
+            name = entry[32:96].split(b"\0", 1)[0].decode(errors="replace")
+            if name == topic:
+                ids.add(struct.unpack_from("<H", entry, 0)[0])
+        stream.seek(header_bytes + 112 * manifests + schema_bytes)
+        first = send = None
+        while (record := stream.read(64)) and len(record) == 64:
+            kind, source = struct.unpack_from("<HH", record, 4)
+            now, = struct.unpack_from("<q", record, 24)
+            first = now if first is None else first
+            if kind == 4 and source in ids:  # EventKind::SEND
+                send = now
+                break
+            stored, = struct.unpack_from("<I", record, 60)
+            stream.seek(stored, 1)
+    return origin, first, send
+
+
 def node_clock_ns():
     clock = time.CLOCK_MONOTONIC_RAW if sys.platform == "darwin" else time.CLOCK_MONOTONIC
     return time.clock_gettime_ns(clock)
@@ -298,7 +351,7 @@ class FullStackSimulation(unittest.TestCase):
         motor_order = [i for i, _, _, kind in layout if kind == "motors"]
         fault_bit = 1 << motor_order.index(fault_id)
         gw_port, bridge_port = udp_ports()
-        env = dict(os.environ, TALOS_SHM_NAMESPACE=f"full-stack-{uuid.uuid4().hex}")
+        env = launcher_env(TALOS_SHM_NAMESPACE=f"full-stack-{uuid.uuid4().hex}")
         tmp = Path(tempfile.mkdtemp(prefix="talos-scripted-match-"))
         output = tmp / "sessions"
         launcher = None
@@ -347,6 +400,7 @@ class FullStackSimulation(unittest.TestCase):
                 launcher_log.seek(0)
                 diagnostics = launcher_log.read()
             self.assertEqual(launcher.returncode, 0, diagnostics)
+            assert_realtime(self, diagnostics)
             manifests = list(output.glob("*/manifest.json"))
             self.assertEqual(len(manifests), 1, diagnostics)
             session = manifests[0].parent

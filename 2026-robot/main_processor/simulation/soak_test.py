@@ -163,7 +163,7 @@ class Soak(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp(prefix="talos-soak-",
                                     dir=os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")))
         output = tmp / "sessions"
-        env = dict(os.environ, TALOS_SHM_NAMESPACE=f"soak-{uuid.uuid4().hex}")
+        env = support.launcher_env(TALOS_SHM_NAMESPACE=f"soak-{uuid.uuid4().hex}")
         launcher = None
         stopped = None
         success = False
@@ -242,6 +242,7 @@ class Soak(unittest.TestCase):
                 log.seek(0)
                 diagnostics = log.read()
             self.assertEqual(launcher.returncode, 0, diagnostics[-20000:])
+            support.assert_realtime(self, diagnostics)
 
             session = manifest_path.parent
             final = self.read_nodes(manifest_path)

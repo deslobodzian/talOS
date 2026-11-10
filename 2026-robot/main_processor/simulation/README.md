@@ -238,6 +238,21 @@ retained in the test's undeclared outputs, and a failure prints the tails of
 the launcher's and the Studio bridge's logs (the bridge's own exit reason is
 only in its log).
 
+## Realtime scheduling in the full-graph tests on macOS
+
+`--sim` does not request realtime scheduling, so on macOS `startup_test`,
+`match_rehearsal_test` and `soak_test` set `TALOS_REALTIME=1`, the production
+policy (see the node development guide's realtime scheduling paragraph). The
+graph alone uses about 2.5 cores (p90 about 4.6), more than a 3-vCPU macOS
+runner has free; at timeshare priority 5 ms loops then waited 10–50 ms and
+`/hw/request` gaps passed the tests' 30 ms bound. A macOS run fails if the
+launcher log reports `talos: realtime scheduling incomplete`, so a silent
+fallback cannot pass. Linux runs keep timeshare: they pass without it, and
+`SCHED_FIFO` has no per-thread fail-safe. A failed `match_rehearsal_test`
+also prints the restarted drivetrain's kill → loop origin, origin → first
+dispatch (`run()`) and first dispatch → first request times, separating a
+slow exit and respawn from a slow node startup.
+
 ## Pose-estimator accuracy scenario
 
 ```sh

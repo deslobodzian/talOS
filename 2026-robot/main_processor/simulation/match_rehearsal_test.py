@@ -22,6 +22,20 @@ class MatchRehearsal(unittest.TestCase):
     assert_neutral = support.FullStackSimulation.assert_neutral
     assert_neutral_by = support.FullStackSimulation.assert_neutral_by
 
+    def print_restart_timeline(self, manifest_path, kill_ns):
+        """Show whether the old exit/spawn or the new node's startup was slow."""
+        try:
+            nodes = {n["name"]: n for n in
+                     json.loads(manifest_path.read_text())["nodes"]}
+            origin, first, send = support.restart_timeline(
+                nodes["drivetrain"]["log_paths"][-1], "/hw/request/drivetrain")
+            ms = lambda a, b: "n/a" if a is None or b is None else f"{(b - a) / 1e6:.1f} ms"
+            print(f"drivetrain restart: kill->loop origin {ms(kill_ns, origin)}, "
+                  f"origin->run() {ms(origin, first)}, "
+                  f"run()->first request {ms(first, send)}", flush=True)
+        except Exception as error:  # diagnostics must not mask the failure
+            print(f"drivetrain restart timeline unavailable: {error!r}", flush=True)
+
     def test_match_restarts_only_killed_node_and_rejects_stale_targets(self):
         root = support.workspace()
         config_dir = root / "2026-robot/main_processor/configuration"
@@ -41,8 +55,10 @@ class MatchRehearsal(unittest.TestCase):
             prefix="talos-match-rehearsal-",
             dir=os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")))
         output = tmp / "sessions"
-        env = dict(os.environ, TALOS_SHM_NAMESPACE=f"rehearsal-{uuid.uuid4().hex}")
+        env = support.launcher_env(TALOS_SHM_NAMESPACE=f"rehearsal-{uuid.uuid4().hex}")
         launcher = None
+        manifest_path = None
+        kill_ns = None
         paused = None
         success = False
         try:
@@ -113,6 +129,7 @@ class MatchRehearsal(unittest.TestCase):
                 log.seek(0)
                 diagnostics = log.read()
             self.assertEqual(launcher.returncode, 0, diagnostics)
+            support.assert_realtime(self, diagnostics)
             session = manifest_path.parent
             manifest = json.loads(manifest_path.read_text())
             self.assertGreater(manifest["end_wall_ns"], manifest["start_wall_ns"])
@@ -141,9 +158,9 @@ class MatchRehearsal(unittest.TestCase):
                         r["topic"] == "/hw/request/drivetrain" and r["kind"] == "SEND"]
             ds = [r for r in rows if r["process"] == "intake" and
                   r["topic"] == "/hw/state/driver_station" and r["kind"] == "MESSAGE"]
-            # Coverage, not a count: a slow host drains fewer packets. This
-            # unprivileged --sim run has no realtime scheduling, and a loaded
-            # 3-vCPU macOS runner delayed the intake's drains by 260 ms, so the
+            # Coverage, not a count: a slow host drains fewer packets. A
+            # loaded 3-vCPU macOS runner at timeshare priority (Linux still
+            # runs so) delayed the intake's drains by 260 ms, so the
             # bound is an outage (1 s), not jitter; the neutral/driving windows
             # below check behaviour, and session_report measures jitter on a
             # real host.
@@ -243,6 +260,7 @@ class MatchRehearsal(unittest.TestCase):
                 shutil.rmtree(tmp)
             else:
                 print(f"Match rehearsal artifacts retained: {tmp}", flush=True)
+                self.print_restart_timeline(manifest_path, kill_ns)
                 print((tmp / "launcher.txt").read_text(), flush=True)
 
 
