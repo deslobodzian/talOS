@@ -58,6 +58,7 @@ cc_test(
         "//talOS/protocol:udp_test_helpers",
         "@googletest//:gtest_main",
     ],
+    tags = ["exclusive"],
 )
 
 cc_test(

@@ -39,6 +39,7 @@ cc_test(
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
+    tags = ["exclusive"],
 )
 
 cc_library(
