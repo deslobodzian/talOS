@@ -24,9 +24,9 @@
 // /hw/request/<name> and flushes after every update():
 //   - one command per tick once a hardware state has been accepted, echoing
 //     that state's identity words like hardware::NeutralCommand;
-//   - every owned motor neutral unless set since the last flush, and all of
+//   - every owned motor neutral unless set during that update(), and all of
 //     them neutral whenever robot_enabled() is false;
-//   - digital/PWM outputs set since the last flush included as set.
+//   - digital/PWM outputs set during that update() included as set.
 // Incoming states pass hardware::AcceptState for this config's id and are
 // latched with their publication time; getters read the latched state (0 before
 // the first one), while connected() requires both a valid sample and a
@@ -90,9 +90,13 @@ class HardwareLink {
 // constructor.
 bool robot_enabled(Node& node);
 
-// Hardware handles: cheap copyable values. Commands apply to the next flush;
-// anything not set by then is neutral. Feedback is in mechanism units
-// (sensor_to_mechanism_ratio is applied on the controller).
+// Hardware handles: cheap copyable values. Output setters (Motor's set_* and
+// stop(), DigitalOutput::set, PwmOutput::set) are taken only inside the
+// node's update() and apply to the flush right after it; anything not set in
+// that update() is neutral. From the constructor, every() or a message
+// callback they throw std::logic_error naming the device, since such a
+// command would reach the hardware for at most one tick. Feedback is in
+// mechanism units (sensor_to_mechanism_ratio is applied on the controller).
 class Motor {
  public:
   Motor() = default;

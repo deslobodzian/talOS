@@ -19,7 +19,7 @@ the constructor; `update()` runs every period.
 | `session_dir()` → `std::optional<std::filesystem::path>` | `node.session_dir` → `str \| None` | the session output directory the launcher started this node under (the parent of `--log`), `nullopt`/`None` without `--log` (tests, `--describe`, `--replay`). Nodes that record per-session artifacts (e.g. vision frame recording) write under `<session_dir>/<artifact>/` |
 | `sub.value()`, `sub->field()`, `has_value()` | `sub.value` (`None` before the first), `has_value` | |
 | `sub.fresh()`, `fresh(max_age)`, `age()`, `updated()` | `sub.fresh()`, `fresh(max_age)`, `age`, `updated` | fresh: younger than `[robot] command_timeout_us` |
-| `pub.send(M{...})` | `pub.send(field=value, ...)` or `send(message)` | |
+| `pub.send(M{...})` | `pub.send(field=value, ...)` or `send(message)` | Python names every field, as the C++ constructor takes every one: an omitted field raises `TypeError` naming it (also for `TargetLane.send`, `sim.publish`, `sim.publish_target`) |
 | `StateMachine<S> sm{node, S::A}`: `state()`, `is()`, `go()`, `previous()`, `time_in_state()`, `just_entered()` | `talos.StateMachine(node, A, states=S)`: same, `is_()`; `states=` (optional) makes reprs and errors show names | |
 | `node.publish_bytes(topic, max_bytes, {.drop_newest, .external})` → `send(span<const byte>)` | `node.publish_bytes(topic, max_bytes, drop_newest=..., external=...)` → `send(bytes)` | variable-length feed outside the loop (not logged); used by telemetry |
 | `TALOS_NODE(Class)` in one `.cc` | `talos_py_node(class_name = ...)` | |
@@ -38,6 +38,16 @@ publisher, byte topic or `TargetLane`, and `release`) and device commands
 `every()` and message callbacks. From any other thread they throw
 `std::logic_error` (`TalosError` in Python, whose C calls release the GIL), so
 a worker thread hands its results to `update()` instead.
+
+Output commands (`Motor` setters and `stop`, `DigitalOutput.set`,
+`PwmOutput.set`) are narrower: they are accepted only inside `update()`. The
+flush after each `update()` sends neutral for every output that `update()` did
+not set, so a command from the constructor, `every()` or a callback would
+reach the hardware for at most one tick (a 20 ms `every()` on a 5 ms node
+would drive a 25% duty cycle). They throw `std::logic_error` there
+(`TalosError` in Python), naming the device; an `every()` or callback stores
+what it decided and `update()` applies it. Sends and `rezero` stay legal
+anywhere on the loop thread.
 
 ### When messages arrive
 

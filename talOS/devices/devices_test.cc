@@ -821,6 +821,40 @@ TEST(Devices, UnknownDeviceThrows) {
                std::invalid_argument);
 }
 
+// The flush after each update() sends neutral for every output that update()
+// did not set, so a 20 ms every() on a 5 ms node would drive its motor one
+// tick in four. Outputs set outside update() are refused, naming the device;
+// a constructor command (flushed at most once, on the first tick) is too.
+TEST(Devices, OutputSettersOutsideUpdateThrow) {
+  struct Pulser {
+    explicit Pulser(Node& node) : motor{node, "a"} {
+      node.every(20ms, [this] { motor.set_voltage(6); });
+    }
+    void update() {}
+    Motor motor;
+  };
+  struct EagerLed {
+    explicit EagerLed(Node& node) : led{node, "led"} { led.set(true); }
+    void update() {}
+    DigitalOutput led;
+  };
+  {
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<Pulser>("mech");
+    try {
+      sim.step(50ms);
+      ADD_FAILURE() << "a motor command in every() was accepted";
+    } catch (const std::logic_error& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find("motor 'a'"), std::string::npos) << what;
+      EXPECT_NE(what.find("set outputs in update()"), std::string::npos)
+          << what;
+    }
+  }
+  auto sim = Sim::FromToml(kRobotToml);
+  EXPECT_THROW(sim.add<EagerLed>("mech"), std::logic_error);
+}
+
 TEST(Devices, DisconnectedDevicesReadInvalidAndZero) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");

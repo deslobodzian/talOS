@@ -31,7 +31,11 @@
 // and the commands of layers built on it (motors, target lanes), are taken
 // only from that thread: the constructor, update(), every() and message
 // callbacks. From any other thread they throw std::logic_error; a worker
-// thread hands its results to update() instead.
+// thread hands its results to update() instead. Hardware outputs (motor,
+// digital and PWM setters, talOS/devices) are narrower still: they are taken
+// only inside update(), because the flush after each update() sends neutral
+// for every output it did not set; anywhere else they throw
+// std::logic_error.
 
 #include <chrono>
 #include <concepts>

@@ -19,6 +19,10 @@ from talos.testing import Sim, SimHardware
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(HERE, "testdata", "robot.toml")
 intake = talos.load(os.path.join(HERE, "intake.py"))
+# A send names every field; cases override the ones the intake reads.
+SHOOTER_IDLE = dict(timestamp_ns=0, flywheel_velocity_rps=0.0,
+                    target_velocity_rps=0.0, at_speed=False,
+                    beam_broken=False, enabled=False)
 
 
 class IntakeTest(unittest.TestCase):
@@ -36,8 +40,9 @@ class IntakeTest(unittest.TestCase):
         hw.set_connected("intake", "roller", roller_connected)
         hw.set_digital_input("intake", "intake_beam", beam)
         sim.step(0.01)  # the teleop mode is current before the lane speaks
-        if shooter is not None:
-            sim.publish(ShooterState, shooter_topics.STATE, **shooter)
+        if shooter is not None:  # the fields a case names, over an idle one
+            sim.publish(ShooterState, shooter_topics.STATE,
+                        **dict(SHOOTER_IDLE, **shooter))
         sim.step(shooter_age)
         if lane is not None:
             sim.publish_target(IntakeTarget, "intake", "teleop",

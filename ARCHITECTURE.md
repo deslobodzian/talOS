@@ -90,6 +90,11 @@ After each tick the devices layer flushes one hardware request for the node:
   non-finite values neutralize only that motor. `Motor::clamped_count()` counts
   adjusted setter calls for the lifetime of the device.
 
+Output setters (motor, digital, PWM) are therefore accepted only inside
+`update()`; from the constructor, `every()` or a message callback they throw
+`std::logic_error` naming the device (`TalosError` in Python), since such a
+command would reach the hardware for at most one tick.
+
 A subscription's `fresh()` means a value younger than `command_timeout_us`, so
 a node that stops hearing its target goes neutral on its own.
 

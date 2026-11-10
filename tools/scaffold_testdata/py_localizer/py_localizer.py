@@ -64,6 +64,8 @@ class PyLocalizer:
                  and self.node.now - self.last_accepted_s <= self.timeout_s)
         x, y, yaw = self.pose
         self.state.send(sample_time_ns=self.sample_time_ns, pose_x_m=x,
-                        pose_y_m=y, pose_yaw_rad=yaw, valid=valid, localized=False,
+                        pose_y_m=y, pose_yaw_rad=yaw, velocity_vx_mps=0.0,
+                        velocity_vy_mps=0.0, velocity_omega_radps=0.0,
+                        valid=valid, localized=False,
                         observation_accepted_count=self.accepted,
                         observation_rejected_count=self.rejected)

@@ -4,11 +4,15 @@
     self.beam = talos.DigitalInput(node, "beam")  # [digital_inputs.beam]
     self.ds = talos.DriverStation(node)          # what the bridge forwards
 
-Take handles in __init__. Commands apply to the next flush after update();
-motors not commanded by then are neutral. Motors, digital outputs and PWM
-outputs are neutral while talos.robot_enabled(node) is false. Motor demands
-clamp to configured limits; non-finite input neutralizes the motor. Feedback
-is in mechanism units and reads 0 (connected False) until the first state.
+Take handles in __init__. Output commands (Motor.set_* and stop(),
+DigitalOutput.set, PwmOutput.set) are taken only inside update() and apply
+to the flush right after it; outputs that update() did not set are neutral.
+From __init__, an every() timer or a callback they raise TalosError naming
+the device, since such a command would reach the hardware for at most one
+tick. Motors, digital outputs and PWM outputs are neutral while
+talos.robot_enabled(node) is false. Motor demands clamp to configured
+limits; non-finite input neutralizes the motor. Feedback is in mechanism
+units and reads 0 (connected False) until the first state.
 """
 
 import ctypes
@@ -422,7 +426,7 @@ class TargetLane(_OnNode):
     """One producer's lane, /<subsystem>/target/<source> (talos::TargetLane):
 
         self.lane = talos.TargetLane(node, PositionTarget, "wrist", "auto")
-        self.lane.send(position_rot=0.25)   # republish every period
+        self.lane.send(position_rot=0.25, feedforward_v=0.0)  # every period
         self.lane.release()                 # nothing to say
 
     send() stamps the mode generation this node's Driver Station shows (0,

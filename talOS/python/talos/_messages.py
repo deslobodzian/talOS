@@ -17,9 +17,11 @@ send(**fields) use them, in declaration (memory) order:
   (inners_0_mode, inners_1_offset_m).
 
 Enum-typed fields (and enum arrays) read as plain ints; repr names them.
-An omitted field encodes as zero. An unknown field, an array of the wrong
-length, or a value its type cannot hold raises TypeError naming the field
-and value.
+Encoding takes every field, as C++'s struct constructor does: an omitted
+field (an array included) raises TypeError naming each one, so a target
+never actuates with a forgotten field at zero. An unknown field, an array of
+the wrong length, or a value its type cannot hold raises TypeError naming
+the field and value.
 
 Encoding and decoding run through one little-endian struct.Struct per type,
 with explicit zero pad bytes, so the bytes are exactly flatc C++'s.
@@ -188,17 +190,18 @@ class MessageType:
             raise TypeError(f"{self.cls.__name__} has no field "
                             f"{', '.join(sorted(unknown))}; it has "
                             f"{', '.join(self.fields)}")
-        get = fields.get
+        if len(fields) != len(self.fields):
+            missing = [field for field in self.fields if field not in fields]
+            raise TypeError(f"{self.cls.__name__}: missing field"
+                            f"{'s' if len(missing) > 1 else ''} "
+                            f"{', '.join(missing)}; every field is required")
         if self._arrays:
             values = []
             for field in self.fields:
                 count = self._arrays.get(field)
+                value = fields[field]
                 if count is None:
-                    values.append(get(field, 0))
-                    continue
-                value = get(field)
-                if value is None:
-                    values.extend((0,) * count)
+                    values.append(value)
                     continue
                 try:
                     length = len(value)
@@ -210,7 +213,7 @@ class MessageType:
                                     f"{count} items")
                 values.extend(value)
         else:
-            values = [get(field, 0) for field in self.fields]
+            values = [fields[field] for field in self.fields]
         try:
             return self.packer.pack(*values)
         except (struct.error, OverflowError):

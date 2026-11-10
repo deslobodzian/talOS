@@ -39,10 +39,18 @@ _INT_BITS = {"b": (8, True), "B": (8, False), "h": (16, True),
              "H": (16, False), "i": (32, True), "I": (32, False),
              "q": (64, True), "Q": (64, False)}
 
+
+def zero_fields(cls):
+    """Every field of cls at zero: encode takes no omitted field."""
+    mtype = message_type(cls)
+    return {field: (0,) * mtype._arrays[field] if field in mtype._arrays
+            else 0 for field in mtype.fields}
+
+
 # The values messages_golden.cc encodes with flatc C++, by its labels.
 GOLDEN_VALUES = {
     "inner": (Inner, {"mode": Mode.HIGH, "offset_m": -1.5}),
-    "mixed_zero": (Mixed, {}),
+    "mixed_zero": (Mixed, zero_fields(Mixed)),
     "mixed_top": (Mixed, {
         "flag": True, "position_m": 1234.5678, "level": Level.TOP,
         "sample_count": 4000000000, "inner_mode": Mode.LOW,
@@ -56,7 +64,7 @@ GOLDEN_VALUES = {
         "inners_0_mode": Mode.LOW, "inners_0_offset_m": 3.5,
         "inners_1_mode": Mode.HIGH, "inners_1_offset_m": -0.125,
         "channel_id": (1, 2, 3, 254, 255)}),
-    "arrays_zero": (Arrays, {}),
+    "arrays_zero": (Arrays, zero_fields(Arrays)),
 }
 
 
@@ -157,18 +165,14 @@ class StructCodecTest(unittest.TestCase):
         rng = random.Random(1234)
         for cls in TYPES:
             mtype = message_type(cls)
-            self.assertEqual(mtype.encode({}),
-                             builder_bytes(cls, mtype, {}), cls.__name__)
+            zeros = zero_fields(cls)
+            self.assertEqual(mtype.encode(zeros),
+                             builder_bytes(cls, mtype, zeros), cls.__name__)
             for _ in range(200):
                 fields = random_fields(rng, mtype)
                 self.assertEqual(mtype.encode(fields),
                                  builder_bytes(cls, mtype, fields),
                                  (cls.__name__, fields))
-                # A subset defaults the rest to 0/False.
-                subset = dict(list(fields.items())[::2])
-                self.assertEqual(mtype.encode(subset),
-                                 builder_bytes(cls, mtype, subset),
-                                 (cls.__name__, subset))
 
     def test_decoding_round_trips(self):
         rng = random.Random(5678)
@@ -188,8 +192,9 @@ class StructCodecTest(unittest.TestCase):
         self.assertEqual(mtype.fields, (
             "sample_time_ns", "pose_x_m", "pose_y_m", "pose_yaw_rad",
             "velocity_vx_mps", "velocity_vy_mps", "velocity_omega_radps"))
-        data = mtype.encode({"sample_time_ns": 42, "pose_x_m": 1.25,
-                             "velocity_omega_radps": 0.25})
+        data = mtype.encode(dict(zero_fields(OdometrySample),
+                                 sample_time_ns=42, pose_x_m=1.25,
+                                 velocity_omega_radps=0.25))
         sample = mtype.decode(data)
         self.assertEqual(sample.sample_time_ns, 42)
         self.assertEqual(sample.pose_x_m, 1.25)
@@ -200,7 +205,8 @@ class StructCodecTest(unittest.TestCase):
         self.assertEqual(raw.Pose(Pose2d()).XM(), 1.25)
 
     def test_unknown_message_attribute_is_rejected(self):
-        goal = message_type(Goal).decode(message_type(Goal).encode({}))
+        goal = message_type(Goal).decode(
+            message_type(Goal).encode(zero_fields(Goal)))
         with self.assertRaises(AttributeError):
             _ = goal.height
 
@@ -219,7 +225,22 @@ class StructCodecTest(unittest.TestCase):
                 (mixed, {"speed_frac": 1e300})):
             with self.subTest(fields=fields):
                 with self.assertRaises(TypeError):
-                    mtype.encode(fields)
+                    mtype.encode(dict(zero_fields(mtype.cls), **fields))
+
+    def test_omitted_fields_raise_type_error_naming_them(self):
+        # C++ constructs a struct from every field; a Python send that left
+        # one at zero would actuate a target with it at zero.
+        for cls, omitted in ((Goal, ("enabled",)),
+                             (Arrays, ("samples_m", "inners_1_mode")),
+                             (OdometrySample, ("pose_yaw_rad",))):
+            fields = zero_fields(cls)
+            for field in omitted:
+                del fields[field]
+            with self.subTest(cls=cls.__name__):
+                with self.assertRaises(TypeError) as raised:
+                    message_type(cls).encode(fields)
+                for field in omitted:
+                    self.assertIn(field, str(raised.exception))
 
     def test_a_class_without_a_schema_raises_type_error(self):
         class Handwritten:

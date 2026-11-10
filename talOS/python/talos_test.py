@@ -208,7 +208,7 @@ class BorrowedLifetimeTest(unittest.TestCase):
                 elif kind == "sub":
                     assert not wrapper.has_value
                 elif kind == "pub":
-                    wrapper.send(tick_count=1)
+                    wrapper.send(height_rot=0.0, enabled=False, tick_count=1)
                 elif kind == "bytes":
                     assert wrapper.send(b"offline")
                 elif kind == "motor":
@@ -391,6 +391,23 @@ can_id = 3
         self.assertEqual(hw.motor_request("lift", "lift"),
                          (talos.Mode.MOTION_MAGIC, 1.5, 0.25, 2))
 
+    def test_motor_command_outside_update_raises(self):
+        # The flush after each update() sends neutral for every motor that
+        # update() did not set, so a command from every() would pulse.
+        class Pulser:
+            def __init__(self, node):
+                self.lift = talos.Motor(node, "lift")
+                node.every(0.02, lambda: self.lift.set_voltage(6.0))
+
+            def update(self):
+                pass
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        sim.add(Pulser, "lift")
+        with self.assertRaisesRegex(talos.TalosError,
+                                    r"motor 'lift'.*outside update\(\)"):
+            sim.step(0.05)
+
     def test_hardware_link_freshness_and_age(self):
         class Watcher:
             def __init__(self, node):
@@ -513,7 +530,7 @@ class Driver:
 
     def update(self):
         if self.talking:
-            self.lane.send(height_rot=0.5, tick_count=7)
+            self.lane.send(height_rot=0.5, enabled=True, tick_count=7)
         else:
             self.lane.release()
 
@@ -534,7 +551,8 @@ class TargetTest(unittest.TestCase):
 
     def hold(self, source, height, seconds=0.03):
         for _ in range(round(seconds / 0.01)):
-            self.sim.publish_target(Goal, "lift", source, height_rot=height)
+            self.sim.publish_target(Goal, "lift", source, height_rot=height,
+                                    enabled=True, tick_count=0)
             self.sim.step(0.01)
 
     def seen(self):
@@ -721,8 +739,10 @@ class MessageTest(unittest.TestCase):
         goal_type = message_type(Goal)
         report_type = message_type(Report)
         self.assertEqual(goal_type.size, report_type.size)
-        goal = goal_type.decode(goal_type.encode({"height_rot": 2.5}))
-        report = report_type.decode(report_type.encode({"height_rot": 9.0}))
+        goal = goal_type.decode(goal_type.encode(
+            {"height_rot": 2.5, "enabled": True, "tick_count": 0}))
+        report = report_type.decode(report_type.encode(
+            {"phase": Phase.IDLE, "height_rot": 9.0}))
 
         paths = (
             ("publisher", outputs.publisher.send, "talos_publisher_send"),

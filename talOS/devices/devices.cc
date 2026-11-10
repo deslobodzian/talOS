@@ -161,7 +161,8 @@ struct HardwareLink::Impl {
   struct Device {
     Kind kind;
     std::uint16_t id;
-    bool set = false;  // commanded since the last flush
+    std::string name;  // the config key the first handle named
+    bool set = false;  // commanded in the current update()
     hardware::MotorRequest motor{};
     const hardware::MotorConfig* motor_config = nullptr;
     std::uint64_t clamped_count = 0;
@@ -227,6 +228,24 @@ struct HardwareLink::Impl {
   }
   const Device& At(std::size_t index, Kind kind) const {
     return const_cast<Impl*>(this)->At(index, kind);
+  }
+  // The device an output setter commands. Outputs are taken only on the
+  // loop thread, inside update(): Flush() runs after each update() and sends
+  // neutral for every output that update() did not set, so a command from
+  // the constructor, every() or a message callback would reach the hardware
+  // for at most one tick (from a timer slower than the tick, a pulse).
+  Device& Output(std::size_t index, Kind kind, std::string_view setter) {
+    detail::NodeAccess::require_loop_thread(node, setter);
+    Device& device = At(index, kind);
+    if (!detail::NodeAccess::in_update(node)) {
+      throw std::logic_error(
+          std::string{node.name()} + ": " + std::string{setter} + " on " +
+          KindLabel(kind) + " '" + device.name +
+          "' called outside update(); set outputs in update(), since the "
+          "flush after each update() sends neutral for every output it did "
+          "not set");
+    }
+    return device;
   }
   const Device& SensorAt(std::size_t index) const {
     if (index < devices.size() && (devices[index].kind == Kind::kGyro ||
@@ -352,7 +371,7 @@ std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
     impl.motor_ids.push_back(id);
     impl.motor_devices.push_back(impl.devices.size());
   }
-  impl.devices.push_back({.kind = kind, .id = id});
+  impl.devices.push_back({.kind = kind, .id = id, .name = std::string{name}});
   if (kind == Kind::kMotor) {
     for (const auto& motor : impl.config.hardware.motors) {
       if (motor.id == id) {
@@ -367,8 +386,8 @@ std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
 void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
                                hardware::Mode mode, double demand,
                                double ff_volts, int slot) {
-  detail::NodeAccess::require_loop_thread(link.impl_->node, "a motor command");
-  HardwareLink::Impl::Device& device = link.impl_->At(index, Kind::kMotor);
+  HardwareLink::Impl::Device& device =
+      link.impl_->Output(index, Kind::kMotor, "Motor command");
   if (slot < 0 || slot > 2) {
     throw std::invalid_argument(std::string{link.impl_->node.name()} +
                                 ": motor slot " + std::to_string(slot) +
@@ -537,17 +556,15 @@ hardware::EncoderSample HardwareAccess::encoder_sample(const HardwareLink& link,
 
 void HardwareAccess::digital_output_set(HardwareLink& link, std::size_t index,
                                         bool value) {
-  detail::NodeAccess::require_loop_thread(link.impl_->node,
-                                          "DigitalOutput::set");
-  auto& device = link.impl_->At(index, Kind::kDigitalOutput);
+  auto& device =
+      link.impl_->Output(index, Kind::kDigitalOutput, "DigitalOutput::set");
   device.digital = value;
   device.set = true;
 }
 
 void HardwareAccess::pwm_set(HardwareLink& link, std::size_t index,
                              double output) {
-  detail::NodeAccess::require_loop_thread(link.impl_->node, "PwmOutput::set");
-  auto& device = link.impl_->At(index, Kind::kPwm);
+  auto& device = link.impl_->Output(index, Kind::kPwm, "PwmOutput::set");
   device.pwm = std::isfinite(output) ? std::clamp(output, -1.0, 1.0) : 0.0;
   device.set = true;
 }

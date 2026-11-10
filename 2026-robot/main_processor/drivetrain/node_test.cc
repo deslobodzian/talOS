@@ -1147,7 +1147,9 @@ void RecordAllocation(std::uint32_t type, std::uintptr_t, std::uintptr_t,
 // geometrically under any publisher. That is the test transport's
 // allocation, not the node's; the real transport is a preallocated ring.
 // SimulatedChannel::publish may be inlined into SimulatedEventLoop::send_impl,
-// which does nothing else, so either frame marks the transport.
+// which does nothing else, so either frame marks the transport. SimHardware
+// stands in for the bridge and RoboRIO (its publications look their topic up
+// by name); the node never runs beneath it.
 bool InSimTransport(const Allocation& a) {
   for (int i = 0; i < a.depth; ++i) {
     Dl_info info;
@@ -1156,6 +1158,7 @@ bool InSimTransport(const Allocation& a) {
     }
     const std::string_view name{info.dli_sname};
     if (name.find("SimulatedChannel") != std::string_view::npos ||
+        name.find("SimHardware") != std::string_view::npos ||
         (name.find("SimulatedEventLoop") != std::string_view::npos &&
          name.find("send_impl") != std::string_view::npos)) {
       return true;
@@ -1181,10 +1184,15 @@ TEST_F(DrivetrainTest, UpdateDoesNotAllocate) {
   ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
   ASSERT_TRUE(State().modules_valid());
   // Both kinematics directions, the unit boundary, the target read, the
-  // motor requests and the publish, as on every tick the node runs.
+  // motor requests, the flush and the publish, on ticks the loop runs
+  // (outputs are taken only inside update()). The target is published before
+  // the window and stays fresh through it (60 ms < command_timeout_us), so
+  // the test's own publications are not counted.
+  talos::testing::PublishTarget(sim, "drivetrain", "teleop",
+                                ChassisTarget{1.0, -0.5, 0.8});
   g_allocations = 0;
   malloc_logger = RecordAllocation;
-  for (int i = 0; i < 200; ++i) drivetrain.update();
+  sim.step(60ms);
   malloc_logger = nullptr;
 
   const std::uint64_t total = g_allocations.load();

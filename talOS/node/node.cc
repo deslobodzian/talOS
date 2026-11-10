@@ -346,6 +346,8 @@ void NodeAccess::require_loop_thread(const Node& node, std::string_view what) {
                          " must run on the node's loop thread");
 }
 
+bool NodeAccess::in_update(const Node& node) { return node.impl_->in_update; }
+
 void NodeAccess::require_immediate_delivery(Node& node) {
   node.impl_->CheckOpen("subscribe with a callback");
   node.impl_->immediate_delivery = true;

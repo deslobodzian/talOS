@@ -198,7 +198,10 @@ int32_t talos_hardware_fresh(TalosNode* node, int64_t max_age_ns);
 // accepted hardware state, 0 when none has arrived, TALOS_ERR on error.
 int32_t talos_hardware_age(TalosNode* node, int64_t* out_ns);
 
-// One motor command for the next flush (Motor::set_* / stop).
+// One motor command for the flush after this update() (Motor::set_* /
+// stop). Like talos_digital_output_set and talos_pwm_set, it fails (naming
+// the device) outside the node's update() callback: the flush sends neutral
+// for every output that update() did not set.
 int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
                         double demand, double ff_volts, int32_t slot);
 // Monotonic per-device count of adjusted/neutralized motor setter calls.

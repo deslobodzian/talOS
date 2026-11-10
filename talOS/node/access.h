@@ -92,6 +92,12 @@ struct NodeAccess {
   // and log, the transport, a device's pending request): publisher_send,
   // byte_publisher_send and the devices layer's commands call it first.
   static void require_loop_thread(const Node& node, std::string_view what);
+  // Whether the node's update() is running now: false in the constructor,
+  // in every() timers, message callbacks and after_update hooks. The devices
+  // layer refuses an output command outside it, because its flush after
+  // each update() sends neutral for every output that update() did not set.
+  // Read it only on the loop thread (after require_loop_thread).
+  static bool in_update(const Node& node);
   // Some handler must see each message as it arrives (a subscribe callback,
   // a Driver Station listener), so the loop drains every tick. Without it,
   // a node with a timer (update(), an after_update hook or every()) drains
