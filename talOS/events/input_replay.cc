@@ -125,6 +125,12 @@ RecordedSession::RecordedSession(const std::string& path)
       bytes_.insert(bytes_.end(), record.payload.begin(), record.payload.end());
       ++topics_[topic].message_count;
     }
+    // The intact records still replay; say what was skipped.
+    if (const std::string damage = log::DescribeDamage(reader.damage());
+        !damage.empty()) {
+      std::cerr << "warning: damaged log " << log_path << ": " << damage
+                << "; replaying the intact records\n";
+    }
   }
   if (first) throw std::runtime_error("no readable .tlog files in " + path);
 

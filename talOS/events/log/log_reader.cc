@@ -5,11 +5,14 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <system_error>
@@ -81,13 +84,6 @@ void check_identity(const FileHeader& header) {
   }
 }
 
-void check_record_magic(const RecordHeader& header, std::size_t index) {
-  if (header.magic != RECORD_MAGIC) {
-    throw std::runtime_error("LogReader: record " + std::to_string(index) +
-                             ": bad magic");
-  }
-}
-
 // The CRC of a record's header with its crc32 field zeroed: the seed its
 // stored bytes are folded into.
 std::uint32_t record_header_crc(RecordHeader header) {
@@ -96,19 +92,190 @@ std::uint32_t record_header_crc(RecordHeader header) {
       reinterpret_cast<const std::byte*>(&header), sizeof(header)});
 }
 
-void check_record(const RecordHeader& header, std::uint32_t crc,
-                  std::size_t index) {
-  if (crc != header.crc32) {
-    throw std::runtime_error("LogReader: record " + std::to_string(index) +
-                             ": checksum mismatch");
+// The least payload a record found by a resynchronising scan may claim
+// (LogReader); the manifest's largest message raises it. It bounds the
+// checksumming one false magic can cost.
+constexpr std::uint64_t kMinScanPayloadBytes = 64u << 10;
+constexpr std::uint64_t kAnyPayload = std::numeric_limits<std::uint64_t>::max();
+
+// A log's bytes, read through view(): a whole file in memory (SpanSource) or
+// an open file through a fixed window (FileSource).
+class SpanSource {
+ public:
+  static constexpr std::size_t kChunk = 1u << 20;
+  explicit SpanSource(std::span<const std::byte> data) : data_{data} {}
+  std::uint64_t size() const noexcept { return data_.size(); }
+  // Up to `n` (at most kChunk) bytes at `offset`; fewer only at the end.
+  std::span<const std::byte> view(std::uint64_t offset, std::size_t n) const {
+    if (offset >= data_.size()) return {};
+    const auto at = static_cast<std::size_t>(offset);
+    return data_.subspan(at, std::min(n, data_.size() - at));
   }
-  if (header.stored_bytes > header.payload_bytes) {
-    throw std::runtime_error("LogReader: record " + std::to_string(index) +
-                             ": stores more bytes than its payload");
+
+ private:
+  std::span<const std::byte> data_;
+};
+
+class FileSource {
+ public:
+  static constexpr std::size_t kChunk = 64u << 10;
+  explicit FileSource(int fd) : fd_{fd} {
+    struct stat st {};
+    if (::fstat(fd_, &st) != 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "LogReader: fstat failed");
+    }
+    size_ = static_cast<std::uint64_t>(st.st_size);
   }
+  std::uint64_t size() const noexcept { return size_; }
+  // Up to `n` (at most kChunk) bytes at `offset`, valid until the next call;
+  // fewer only at the end of the file.
+  std::span<const std::byte> view(std::uint64_t offset, std::size_t n) {
+    if (offset < window_offset_ ||
+        offset + n > window_offset_ + window_.size()) {
+      fill(offset);
+    }
+    if (offset < window_offset_ || offset >= window_offset_ + window_.size()) {
+      return {};
+    }
+    const auto at = static_cast<std::size_t>(offset - window_offset_);
+    return std::span<const std::byte>{window_}.subspan(
+        at, std::min(n, window_.size() - at));
+  }
+
+ private:
+  void fill(std::uint64_t offset) {
+    window_offset_ = offset;
+    window_.resize(static_cast<std::size_t>(
+        std::min<std::uint64_t>(kChunk, size_ - std::min(offset, size_))));
+    std::size_t got = 0;
+    while (got < window_.size()) {
+      const ssize_t n = ::pread(fd_, window_.data() + got, window_.size() - got,
+                                static_cast<off_t>(offset + got));
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        throw std::system_error(errno, std::generic_category(),
+                                "LogReader: read failed");
+      }
+      if (n == 0) break;  // Shrank under us: what is there is the file.
+      got += static_cast<std::size_t>(n);
+    }
+    window_.resize(got);
+  }
+
+  int fd_;
+  std::uint64_t size_{0};
+  std::uint64_t window_offset_{0};
+  std::vector<std::byte> window_;
+};
+
+// Folds the `size` bytes at `offset` into `crc`. False if the file ends
+// first.
+template <typename Source>
+bool fold(Source& source, std::uint64_t offset, std::uint64_t size,
+          std::uint32_t& crc) {
+  while (size > 0) {
+    const auto want =
+        static_cast<std::size_t>(std::min<std::uint64_t>(size, Source::kChunk));
+    const std::span<const std::byte> bytes = source.view(offset, want);
+    crc = crc32(bytes, crc);
+    if (bytes.size() < want) return false;
+    offset += want;
+    size -= want;
+  }
+  return true;
 }
 
-// A log file read front to back through one fixed buffer.
+// The offset of the first RECORD_MAGIC at or after `from`; size() if none.
+template <typename Source>
+std::uint64_t find_magic(Source& source, std::uint64_t from) {
+  std::array<std::byte, sizeof(RECORD_MAGIC)> magic{};
+  std::memcpy(magic.data(), &RECORD_MAGIC, magic.size());
+  while (from < source.size() && source.size() - from >= magic.size()) {
+    const std::span<const std::byte> bytes = source.view(from, Source::kChunk);
+    const auto found =
+        std::search(bytes.begin(), bytes.end(), magic.begin(), magic.end());
+    if (found != bytes.end()) {
+      return from + static_cast<std::uint64_t>(found - bytes.begin());
+    }
+    if (bytes.size() < magic.size()) break;
+    // The next window overlaps this one by a partial magic's length.
+    from += bytes.size() - (magic.size() - 1);
+  }
+  return source.size();
+}
+
+// Whether an intact record -- magic, lengths and checksum -- starts at
+// `offset` and ends within the file, claiming at most `max_payload` bytes.
+template <typename Source>
+bool intact_at(Source& source, std::uint64_t offset, std::uint64_t max_payload,
+               RecordHeader& header) {
+  const std::span<const std::byte> bytes =
+      source.view(offset, sizeof(RecordHeader));
+  if (bytes.size() < sizeof(RecordHeader)) return false;
+  std::memcpy(&header, bytes.data(), sizeof(header));
+  if (header.magic != RECORD_MAGIC ||
+      header.stored_bytes > header.payload_bytes ||
+      header.payload_bytes > max_payload) {
+    return false;
+  }
+  const std::uint64_t body = offset + sizeof(RecordHeader);
+  if (source.size() - body < header.stored_bytes) return false;
+  std::uint32_t crc = record_header_crc(header);
+  return fold(source, body, header.stored_bytes, crc) && crc == header.crc32;
+}
+
+// Whether a record a scan found can follow `last`, the record accepted
+// before the damage, in the log that wrote it: dispatch indices never go
+// back, and a later dispatch was not dispatched earlier. Within one dispatch
+// a READ carries the time it was taken, so a later record of that dispatch
+// may carry an earlier one. An intact record that fails this belongs to
+// another log (old disk blocks a power loss exposed) and is skipped.
+bool can_follow(const RecordHeader& record,
+                const std::optional<RecordHeader>& last) {
+  if (!last || record.dispatch_index == last->dispatch_index) return true;
+  return record.dispatch_index > last->dispatch_index &&
+         record.now_ns >= last->now_ns;
+}
+
+// The intact record at `cursor`, or the next one a scan finds that can
+// follow `last`, moving `cursor` to it, setting `last` to it and counting
+// what was skipped in `damage`. Empty, with `cursor` at the end, once no
+// intact record is left.
+template <typename Source>
+std::optional<RecordHeader> locate(Source& source, std::uint64_t& cursor,
+                                   std::uint64_t scan_payload_bytes,
+                                   LogDamage& damage,
+                                   std::optional<RecordHeader>& last) {
+  if (cursor >= source.size()) return std::nullopt;
+  RecordHeader header{};
+  if (intact_at(source, cursor, kAnyPayload, header)) {
+    last = header;
+    return header;
+  }
+
+  // A damaged length cannot be trusted to skip by: scan from the next byte.
+  const std::uint64_t start = cursor;
+  for (std::uint64_t at = find_magic(source, start + 1); at < source.size();
+       at = find_magic(source, at + 1)) {
+    if (intact_at(source, at, scan_payload_bytes, header) &&
+        can_follow(header, last)) {
+      if (damage.spans == 0) damage.first_offset = start;
+      ++damage.spans;
+      damage.skipped_bytes += at - start;
+      cursor = at;
+      last = header;
+      return header;
+    }
+  }
+  damage.tail_offset = start;
+  damage.tail_bytes = source.size() - start;
+  cursor = source.size();
+  return std::nullopt;
+}
+
+// A log file's header, manifest and schema block, read front to back
+// through one fixed buffer.
 class LogStream {
  public:
   explicit LogStream(std::string_view path)
@@ -122,6 +289,8 @@ class LogStream {
   ~LogStream() { ::close(fd_); }
   LogStream(const LogStream&) = delete;
   LogStream& operator=(const LogStream&) = delete;
+
+  int fd() const noexcept { return fd_; }
 
   // Fills `out`; fewer bytes only at the end of the file.
   std::size_t read(std::span<std::byte> out) {
@@ -244,50 +413,43 @@ LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
   session_id_ = header.session_id;
   process_name_ = read_name(header.process_name);
 
+  scan_payload_bytes_ = kMinScanPayloadBytes;
+  for (const Registration& reg : manifest_) {
+    scan_payload_bytes_ =
+        std::max<std::uint64_t>(scan_payload_bytes_, reg.message_bytes);
+  }
   records_offset_ = schema_offset + schema_bytes.size();
   cursor_ = records_offset_;
 }
 
 void LogReader::rewind() noexcept {
   cursor_ = records_offset_;
-  truncated_ = false;
+  damage_ = LogDamage{};
+  last_.reset();
   record_count_ = 0;
 }
 
 bool LogReader::next(Record& out) {
-  const std::size_t remaining = data_.size() - cursor_;
-  if (remaining < sizeof(RecordHeader)) {
-    if (remaining > 0) {
-      truncated_ = true;
-    }
-    return false;
-  }
-
-  RecordHeader header{};
-  std::memcpy(&header, data_.data() + cursor_, sizeof(header));
-  check_record_magic(header, record_count_);
-
-  const std::size_t total = sizeof(RecordHeader) + header.stored_bytes;
-  if (remaining < total) {
-    truncated_ = true;
-    return false;
-  }
+  SpanSource source{data_};
+  std::uint64_t cursor = cursor_;
+  const std::optional<RecordHeader> header =
+      locate(source, cursor, scan_payload_bytes_, damage_, last_);
+  cursor_ = static_cast<std::size_t>(cursor);
+  if (!header) return false;
 
   const std::span<const std::byte> stored{
-      data_.data() + cursor_ + sizeof(RecordHeader), header.stored_bytes};
-  check_record(header, crc32(stored, record_header_crc(header)), record_count_);
-
-  out.header = header;
-  if (header.stored_bytes == header.payload_bytes) {
+      data_.data() + cursor_ + sizeof(RecordHeader), header->stored_bytes};
+  out.header = *header;
+  if (header->stored_bytes == header->payload_bytes) {
     out.payload = stored;
   } else {
-    payload_.assign(header.payload_bytes, std::byte{0});
+    payload_.assign(header->payload_bytes, std::byte{0});
     if (!stored.empty()) {
       std::memcpy(payload_.data(), stored.data(), stored.size());
     }
     out.payload = payload_;
   }
-  cursor_ += total;
+  cursor_ += sizeof(RecordHeader) + header->stored_bytes;
   ++record_count_;
   return true;
 }
@@ -312,6 +474,7 @@ LogSummary SummarizeLog(std::string_view path) {
   std::uint32_t crc = 0;
   std::uint64_t schemas = 0;
   std::optional<std::uint32_t> overrun;
+  std::uint64_t scan_payload_bytes = kMinScanPayloadBytes;
   for (std::uint32_t i = 0; i < header.manifest_count; ++i) {
     ManifestEntry entry{};
     if (stream.read(entry) < sizeof(entry)) {
@@ -323,6 +486,8 @@ LogSummary SummarizeLog(std::string_view path) {
         crc);
     schemas += std::uint64_t{entry.schema_name_bytes} + entry.schema_bfbs_bytes;
     if (!overrun && schemas > header.schema_bytes) overrun = i;
+    scan_payload_bytes =
+        std::max<std::uint64_t>(scan_payload_bytes, entry.message_bytes);
   }
   if (!stream.fold(header.schema_bytes, crc)) {
     throw IncompleteLogHeader("LogReader: file too short for its manifest");
@@ -339,23 +504,38 @@ LogSummary SummarizeLog(std::string_view path) {
         "LogReader: schema block longer than its manifest's schemas");
   }
 
+  // The records, through a fixed window that a resynchronising scan can
+  // also move back over.
+  FileSource source{stream.fd()};
+  std::uint64_t cursor =
+      std::uint64_t{header.header_bytes} +
+      std::uint64_t{header.manifest_count} * sizeof(ManifestEntry) +
+      header.schema_bytes;
   LogSummary summary;
-  for (;;) {
-    RecordHeader record{};
-    const std::size_t got = stream.read(record);
-    if (got < sizeof(record)) {
-      summary.truncated = got > 0;
-      return summary;
-    }
-    check_record_magic(record, summary.record_count);
-    std::uint32_t record_crc = record_header_crc(record);
-    if (!stream.fold(record.stored_bytes, record_crc)) {
-      summary.truncated = true;
-      return summary;
-    }
-    check_record(record, record_crc, summary.record_count);
+  std::optional<RecordHeader> last;
+  while (const std::optional<RecordHeader> record =
+             locate(source, cursor, scan_payload_bytes, summary.damage, last)) {
+    cursor += sizeof(RecordHeader) + record->stored_bytes;
     ++summary.record_count;
   }
+  summary.truncated = summary.damage.tail_bytes != 0;
+  return summary;
+}
+
+std::string DescribeDamage(const LogDamage& damage) {
+  std::string text;
+  if (damage.spans != 0) {
+    text = std::to_string(damage.spans) + " damaged span(s) skipped (" +
+           std::to_string(damage.skipped_bytes) + " bytes, first at byte " +
+           std::to_string(damage.first_offset) + ")";
+  }
+  if (damage.tail_bytes != 0) {
+    if (!text.empty()) text += "; ";
+    text += "no intact record in the last " +
+            std::to_string(damage.tail_bytes) + " bytes (from byte " +
+            std::to_string(damage.tail_offset) + ")";
+  }
+  return text;
 }
 
 std::vector<std::string> FindLogFiles(const std::string& path_or_dir) {

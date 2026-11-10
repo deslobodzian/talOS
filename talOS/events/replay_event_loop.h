@@ -166,6 +166,14 @@ class ReplayEventLoop
       const auto bytes = record.payload.first(record.header.stored_bytes);
       stored_.insert(stored_.end(), bytes.begin(), bytes.end());
     }
+    // Records lost between intact ones would replay as a divergence at best,
+    // and at worst as a run the program never made. A damaged tail only
+    // shortens the log, like a truncated one: the prefix still replays.
+    if (reader.damage().spans != 0) {
+      throw ReplayError("log is missing damaged records (" +
+                        log::DescribeDamage(reader.damage()) +
+                        "); exact replay needs every record");
+    }
   }
 
   struct Recorded {

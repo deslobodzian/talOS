@@ -28,7 +28,8 @@
 // what they hand out is byte-identical to what was recorded.
 // Everything but the schema block is fixed-size and little-endian, so the
 // records can be walked without a parser, and a truncated tail costs at most
-// one record.
+// one record. A damaged record costs only itself: LogReader scans past it to
+// the next RECORD_MAGIC whose header and checksum validate.
 //
 // The format is versioned and never rewritten in place. Readers must reject a
 // version they do not know rather than guessing.
@@ -40,7 +41,9 @@ inline constexpr char FILE_MAGIC[8] = {'T', 'A', 'L', 'O', 'S', 'L', 'O', 'G'};
 // receipt/dispatch time. Version 5 introduced message schemas.
 inline constexpr std::uint32_t FORMAT_VERSION = 7;
 
-// Marks the start of every record so a damaged log can be resynchronised.
+// Marks the start of every record so a damaged log can be resynchronised
+// (LogReader); the record's checksum tells a real record from these bytes
+// inside a payload.
 inline constexpr std::uint32_t RECORD_MAGIC = 0x54524543;  // "TREC"
 
 #pragma pack(push, 1)

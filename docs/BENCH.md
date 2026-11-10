@@ -146,7 +146,8 @@ sleep precision. Releasing a lane is not a mechanical brake.
   Expected: `/hw/state` median about 5 ms, p99 <10 ms, no 100 ms gap while
   enabled (PASS lines); `--strict` exits 2 unless every required verdict
   passes and the manifest shows a finished session with no quarantined,
-  recorder-failed or log-capped recording node (Studio is exempt). Keep the
+  recorder-failed or log-capped recording node (Studio is exempt) and no
+  damaged log. Keep the
   report with the session. Target age at the tick (from `Target::get` READ
   records) is required to be at most 25 ms on every lane; see
   [session_report](../talOS/launcher/README.md) for its NOT MEASURED and FAIL

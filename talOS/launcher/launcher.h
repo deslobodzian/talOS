@@ -321,8 +321,8 @@ struct NodeProcessInfo {
   int64_t retry_at_monotonic_ns{0};  // Zero when no restart is pending.
   // `recorder_failed`: a run could not be spawned (or the Studio bridge never
   // came up), or a run's event log failed -- seen live in the node's registry
-  // row (introspect::kFlagRecorderFailed), or unreadable or truncated at
-  // shutdown.
+  // row (introspect::kFlagRecorderFailed), or unreadable, truncated or
+  // damaged (event::log::LogDamage) at shutdown.
   bool failed{false};
   // A run's event log reached its share of the session log budget and lost
   // records: its oldest segments were deleted to keep the newest, or, with a
@@ -2737,7 +2737,7 @@ class Launcher {
           try {
             const auto summary = event::log::SummarizeLog(file);
             proc.record_count += summary.record_count;
-            if (summary.truncated) proc.failed = true;
+            if (!summary.damage.clean()) proc.failed = true;
           } catch (const event::log::IncompleteLogHeader& e) {
             // Cut while it was being created: no records to count.
             std::cerr << "[launcher] skipping " << file << ": " << e.what()
@@ -3734,6 +3734,7 @@ inline bool MergeLogs(const std::vector<std::string>& log_paths,
   }
 
   struct ReaderState {
+    std::string path;
     std::unique_ptr<event::log::LogReader> reader;
     std::shared_ptr<const event::Manifest> manifest;
     event::log::LogReader::Record current;
@@ -3741,6 +3742,19 @@ inline bool MergeLogs(const std::vector<std::string>& log_paths,
   };
   std::vector<ReaderState> states;
   states.reserve(log_paths.size());
+  // Reads the next intact record. A log the reader skipped damage in still
+  // merges, and its damage is named once, when it ends; session_report
+  // parses this line.
+  const auto advance = [](ReaderState& state) {
+    state.has_record = state.reader->next(state.current);
+    if (state.has_record) return;
+    if (const std::string damage =
+            event::log::DescribeDamage(state.reader->damage());
+        !damage.empty()) {
+      std::cerr << "warning: damaged log " << state.path << ": " << damage
+                << "\n";
+    }
+  };
 
   for (const auto& path : log_paths) {
     ReaderState state;
@@ -3763,7 +3777,8 @@ inline bool MergeLogs(const std::vector<std::string>& log_paths,
     }
     state.manifest =
         std::make_shared<const event::Manifest>(state.reader->manifest());
-    state.has_record = state.reader->next(state.current);
+    state.path = path;
+    advance(state);
     states.push_back(std::move(state));
   }
 
@@ -3793,7 +3808,7 @@ inline bool MergeLogs(const std::vector<std::string>& log_paths,
     record.payload.assign(best->current.payload.begin(),
                           best->current.payload.end());
     out_records.push_back(std::move(record));
-    best->has_record = best->reader->next(best->current);
+    advance(*best);
   }
 }
 

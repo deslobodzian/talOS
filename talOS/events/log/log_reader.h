@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -23,11 +24,43 @@ class IncompleteLogHeader : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+// What a reader skipped because it was not an intact record (format.h): a
+// power loss can leave a garbage or zero-filled tail, and a damaged disk
+// block can break a record anywhere. Offsets are byte offsets in the file.
+struct LogDamage {
+  // Damaged stretches skipped because an intact record follows them. Each
+  // one lost at least one record; how many is unknowable.
+  std::size_t spans{0};
+  std::uint64_t skipped_bytes{0};  // in those stretches
+  std::uint64_t first_offset{0};   // where the first one starts
+  // Bytes after the last intact record that hold no intact record: a record
+  // cut mid-write, or a garbage or zero-filled tail.
+  std::uint64_t tail_bytes{0};
+  std::uint64_t tail_offset{0};  // where they start
+
+  bool clean() const noexcept { return spans == 0 && tail_bytes == 0; }
+};
+
+// One line naming what `damage` skipped, offsets included; empty if clean.
+std::string DescribeDamage(const LogDamage& damage);
+
 // Reads a dispatch log written by LogWriter.
 //
 // The whole file is read into memory up front: these logs are meant to be
 // replayed on the same class of machine that could run the loop in real
 // time, so they are small enough that mmap would only add complexity.
+//
+// Records are resynchronised past damage. Where the next record's magic,
+// lengths or checksum are wrong, or it runs past the end of the file, the
+// reader scans forward for the next RECORD_MAGIC whose header and checksum
+// validate and whose dispatch index and time can follow the last record it
+// returned (one from another log, in disk blocks a power loss exposed,
+// cannot), resumes there, and counts what it skipped in damage(). Bytes
+// with no intact record after them end the log (truncated()). A record found
+// by the scan may claim at most the larger of the manifest's largest message
+// and 64 KiB, so one false magic costs at most that much checksumming. A
+// caller that must not see a gap (exact replay) refuses a log whose
+// damage().spans is nonzero.
 class LogReader {
  public:
   struct Record {
@@ -49,19 +82,19 @@ class LogReader {
   std::uint32_t format_version() const noexcept { return format_version_; }
   std::uint64_t session_id() const noexcept { return session_id_; }
 
-  // Advances to the next record. Returns false once there is nothing left to
-  // read, whether that is a clean end of file or a file that ends mid
-  // record (see truncated()). Throws std::runtime_error, naming the record
-  // index, if a record's magic or checksum is wrong: that is corruption, not
-  // an ordinary end of file, and must not be replayed silently.
+  // Advances to the next intact record, skipping damage (see above). Returns
+  // false once no intact record is left.
   bool next(Record& out);
 
   void rewind() noexcept;
 
-  // True once next() has stopped because the file ended without enough
-  // bytes left for a full record. A robot that lost power mid-write leaves
-  // a log like this; everything before the cut still replays.
-  bool truncated() const noexcept { return truncated_; }
+  // True once next() has stopped on bytes that hold no intact record
+  // (damage().tail_bytes). A robot that lost power mid-write leaves a log
+  // like this; everything before the cut still replays.
+  bool truncated() const noexcept { return damage_.tail_bytes != 0; }
+
+  // What next() has skipped since construction or the last rewind().
+  const LogDamage& damage() const noexcept { return damage_; }
 
   // Number of records next() has returned since construction or the last
   // rewind(); call after iterating to completion for the file's total.
@@ -78,17 +111,20 @@ class LogReader {
   std::string process_name_;
   std::size_t records_offset_{0};
   std::size_t cursor_{0};
-  bool truncated_{false};
+  std::uint64_t scan_payload_bytes_{0};
+  LogDamage damage_;
+  std::optional<RecordHeader> last_;  // the last record next() returned
   std::size_t record_count_{0};
 };
 
-// What LogReader would report after reading a log to its end -- record count
-// and whether the file ends mid record -- without holding the file: it
-// streams through a fixed buffer, so memory does not grow with the log. It
-// validates exactly what LogReader does and throws the same errors.
+// What LogReader would report after reading a log to its end -- record
+// count, truncation and damage -- without holding the file: it reads through
+// a fixed buffer, so memory does not grow with the log. It validates exactly
+// what LogReader does and throws the same errors.
 struct LogSummary {
   std::size_t record_count{0};
   bool truncated{false};
+  LogDamage damage;
 };
 LogSummary SummarizeLog(std::string_view path);
 

@@ -47,7 +47,12 @@ ENVELOPE_HEADER = re.compile(r"\{mode_since_us: (\d+), active: (true|false)")
 TARGET_AGE_LIMIT_MS = 25
 
 
-def analyze(manifest, records):
+# log_dump's stderr line for a log whose reader skipped damaged records or a
+# damaged tail: the file, then its byte offsets (LogReader, DescribeDamage).
+DAMAGED_LOG = re.compile(r"^warning: (damaged log .*)$", re.MULTILINE)
+
+
+def analyze(manifest, records, log_damage=()):
     source, states = stream(records, "/hw/state")
     _, ds = stream(records, "/hw/state/driver_station")
     ds = [r for r in ds if "ds_enabled" in r]
@@ -148,6 +153,8 @@ def analyze(manifest, records):
     # processes without an event log (studio_bridge, sim_gateway) are not.
     issues += [f"{n.get('name')}: {flag}" for n in manifest["nodes"] if n.get("log_path")
                for flag in ("quarantined", "recorder_failed", "log_capped") if n.get(flag)]
+    # A record the reader skipped is missing from every measurement above.
+    issues += list(log_damage)
     return {"session_id": manifest.get("session_id"),
             "config_sha256": manifest.get("config_sha256") or "NOT RECORDED (non-bundle launch)",
             # exit_signal is 0 unless a signal killed the node; older manifests lack it.
@@ -231,7 +238,8 @@ def main():
         manifest = json.loads((args.session / "manifest.json").read_text())
         result = subprocess.run([log_dump_path(), "--format", "jsonl", str(args.session)],
                                 capture_output=True, text=True, check=True)
-        report = analyze(manifest, [json.loads(line) for line in result.stdout.splitlines()])
+        report = analyze(manifest, [json.loads(line) for line in result.stdout.splitlines()],
+                         DAMAGED_LOG.findall(result.stderr))
         print(json.dumps(report, indent=2) if args.json else markdown(report))
         if not args.strict:
             return 0

@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <optional>
 #include <span>
@@ -542,6 +544,37 @@ TEST(Replay, ReplaysTheCompletePrefixOfATruncatedLog) {
 
   std::remove(path.c_str());
   std::remove(truncated_path.c_str());
+}
+
+// Records lost between intact ones would replay a run the program never
+// made, so exact replay refuses the log; input replay is what uses the rest.
+TEST(Replay, RefusesALogMissingADamagedRecord) {
+  const std::string path = temp_path("damaged");
+  record_run(path, 2.5F);
+
+  std::vector<char> bytes = read_file(path);
+  std::array<char, sizeof(log::RECORD_MAGIC)> magic{};
+  std::memcpy(magic.data(), &log::RECORD_MAGIC, magic.size());
+  std::vector<std::size_t> records;
+  for (auto at = bytes.begin();
+       (at = std::search(at, bytes.end(), magic.begin(), magic.end())) !=
+       bytes.end();
+       ++at) {
+    records.push_back(static_cast<std::size_t>(at - bytes.begin()));
+  }
+  ASSERT_GT(records.size(), 4u);
+  bytes[records[records.size() / 2] +
+        offsetof(log::RecordHeader, dispatch_index)] ^= 1;
+  {
+    std::ofstream out{path, std::ios::binary | std::ios::trunc};
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  }
+
+  log::LogReader reader{path};
+  EXPECT_THROW((ReplayEventLoop<>{reader}), ReplayError);
+  EXPECT_EQ(reader.damage().spans, 1u);
+
+  std::remove(path.c_str());
 }
 
 // Mostly trailing zeros, like a hardware packet: the log stores only the

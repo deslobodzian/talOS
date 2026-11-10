@@ -1,4 +1,6 @@
 import json
+import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -37,6 +39,35 @@ class SessionReportTest(unittest.TestCase):
             # The manifest's signal death reaches the node summary.
             self.assertEqual(report["nodes"][0]["exit_signal"], 9)
             self.assertEqual(verdicts["target age at tick"], "PASS")
+
+    def test_strict_names_a_damaged_log_and_its_offset(self):
+        files = runfiles.Create()
+        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
+        binary = files.Rlocation("_main/talOS/launcher/session_report")
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run([fixture, directory], check=True)
+            log = os.path.join(directory, "fixture.tlog")
+            with open(log, "r+b") as file:
+                data = file.read()
+                # FileHeader (format.h): header_bytes at 12, manifest_count
+                # at 40, schema_bytes at 112; then 112-byte manifest entries
+                # and the schema block.
+                (header,) = struct.unpack_from("<I", data, 12)
+                (count,) = struct.unpack_from("<I", data, 40)
+                (schemas,) = struct.unpack_from("<Q", data, 112)
+                offset = header + 112 * count + schemas
+                # Damage the second record's dispatch index; its checksum no
+                # longer matches, and intact records follow it.
+                (stored,) = struct.unpack_from("<I", data, offset + 60)
+                offset += 64 + stored
+                file.seek(offset + 8)
+                file.write(bytes([data[offset + 8] ^ 0xFF]))
+            result = subprocess.run([binary, "--json", "--strict", directory],
+                                    capture_output=True, text=True)
+            damaged = [issue for issue in json.loads(result.stdout)["session_issues"]
+                       if issue.startswith("damaged log " + log)]
+            self.assertEqual(len(damaged), 1, result.stderr)
+            self.assertIn(f"first at byte {offset})", damaged[0])
 
     def test_descriptor_status_and_no_duplicate_readers(self):
         def record(process, kind, topic, now, decoded=""):

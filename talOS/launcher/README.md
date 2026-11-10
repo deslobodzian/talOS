@@ -331,7 +331,7 @@ hardware bridge also prints the reason once. The launcher prints one line per me
 manifest: `recorder_failed` for a failed log, `log_capped` for one whose byte
 share cost it records (its oldest segment deleted, or, with a share too small
 for two segments, capture stopped at the share). At normal shutdown it also
-marks a truncated or unreadable log `recorder_failed` and a capped one
+marks a truncated, damaged or unreadable log `recorder_failed` and a capped one
 (`<log>.capped`) `log_capped`; a log whose capture stopped at a record
 boundary looks complete there, so only the live row reports it.
 
@@ -569,6 +569,12 @@ alternatives within that filter. Different filters are combined with AND.
 Use `--` before a path beginning with `--`. Unknown flags and invalid values
 are usage errors.
 
+A damaged log does not stop the dump: its intact records are merged (the
+reader skips a damaged record or a tail with no intact record, as a power loss
+can leave; see [log format](../events/README.md#log-format)), and once it ends
+`log_dump` prints `warning: damaged log <path>: <what was skipped, with byte
+offsets>` on stderr, which `session_report` reads.
+
 ```sh
 bazel run //talOS/launcher:log_dump -- /tmp/logs/session \
   --node drivetrain,pose_estimator --topic '/drivetrain/*' \
@@ -610,8 +616,9 @@ must be below 10 ms. `--strict` exits 2 unless every required verdict is PASS
 and the manifest shows a finished session (`end_wall_ns` nonzero) with no
 recording node (non-empty `log_path`) `quarantined`, `recorder_failed` or
 `log_capped`; host processes without an event log (`studio_bridge`,
-`sim_gateway`) are not acceptance evidence and are exempt. It names each reason
-on stderr. It exits 1 for input/reader errors (including a missing `log_dump`
+`sim_gateway`) are not acceptance evidence and are exempt, and with no log
+`log_dump` reports damaged (above), each named with its file and byte offsets.
+It names each reason on stderr. It exits 1 for input/reader errors (including a missing `log_dump`
 runfile) and 0 otherwise. NOT MEASURED is never a pass; only the timer
 lateness row is informational and not required.
 

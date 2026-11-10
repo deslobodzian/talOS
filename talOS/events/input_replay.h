@@ -53,7 +53,9 @@ class RecordedSession {
  public:
   // `path` is a session directory (every *.tlog in it, restarts included)
   // or one log. Throws std::runtime_error on an unreadable log, on logs from
-  // two sessions, and on a topic the logs record with two schemas.
+  // two sessions, and on a topic the logs record with two schemas. A log's
+  // damaged records are skipped (log::LogReader), and what was skipped is
+  // printed to stderr as a warning naming the file and byte offsets.
   explicit RecordedSession(const std::string& path);
 
   const std::vector<std::string>& log_paths() const { return log_paths_; }

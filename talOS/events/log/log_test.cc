@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <set>
 #include <span>
@@ -392,7 +393,7 @@ TEST(LogPadding, TrailingZerosAreNotStoredButReadBack) {
 
 // A header whose checksum is right but which claims to store more bytes than
 // its payload holds came from a broken writer; the reader must not guess.
-TEST(LogPadding, StoredBytesBeyondThePayloadThrow) {
+TEST(LogPadding, StoredBytesBeyondThePayloadIsNotARecord) {
   const std::string path = TempPath("overstored");
   {
     LogWriter writer{path, "overstored", LogWriter::kDefaultBufferBytes};
@@ -428,40 +429,128 @@ TEST(LogPadding, StoredBytesBeyondThePayloadThrow) {
 
   LogReader reader{path};
   LogReader::Record record;
-  EXPECT_THROW(reader.next(record), std::runtime_error);
+  EXPECT_FALSE(reader.next(record));
+  EXPECT_EQ(reader.damage().tail_bytes, sizeof(RecordHeader) + 8);
 
   ::unlink(path.c_str());
 }
 
-TEST(LogCorruption, PayloadCrcMismatchThrows) {
+// Where record `index` of the round-trip fixture begins.
+std::size_t FixtureRecordOffset(const std::vector<ExpectedRecord>& expected,
+                                std::size_t index) {
+  std::size_t offset = RecordsOffset();
+  for (std::size_t i = 0; i < index; ++i) {
+    offset += sizeof(RecordHeader) + StoredSize(expected[i].payload);
+  }
+  return offset;
+}
+
+// One damaged record mid-log costs only itself: the reader resynchronises at
+// the next intact record and counts the bytes it skipped.
+TEST(LogCorruption, DamagedRecordIsSkippedAndCounted) {
   const std::string path = TempPath("payload_corrupt");
   const std::vector<ExpectedRecord> expected =
       WriteFixture(path, LogWriter::kDefaultBufferBytes);
 
-  // The manifest block ends where the first record begins. Walk forward
-  // (skipping the records that store no bytes at the start of the fixture) to
-  // find the first record that actually has stored bytes to corrupt.
-  ASSERT_FALSE(expected.empty());
-  std::size_t offset = RecordsOffset();
-  std::size_t target_index = 0;
-  for (; target_index < expected.size(); ++target_index) {
-    if (StoredSize(expected[target_index].payload) != 0) {
-      break;
-    }
-    offset += sizeof(RecordHeader) + StoredSize(expected[target_index].payload);
-  }
-  ASSERT_LT(target_index, expected.size())
-      << "fixture has no record with a payload";
-
-  // Corrupt the first byte of that record's payload.
-  FlipByte(path, offset + sizeof(RecordHeader));
+  std::size_t target = expected.size() / 2;
+  while (StoredSize(expected[target].payload) == 0) ++target;
+  const std::size_t offset = FixtureRecordOffset(expected, target);
+  FlipByte(path, offset + sizeof(RecordHeader));  // its first stored byte
 
   LogReader reader{path};
   LogReader::Record record;
-  for (std::size_t i = 0; i < target_index; ++i) {
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (i == target) continue;
+    SCOPED_TRACE(i);
     ASSERT_TRUE(reader.next(record));
+    ExpectRecordEquals(expected[i], record);
   }
-  EXPECT_THROW(reader.next(record), std::runtime_error);
+  EXPECT_FALSE(reader.next(record));
+  EXPECT_FALSE(reader.truncated());
+  EXPECT_EQ(reader.damage().spans, 1u);
+  EXPECT_EQ(reader.damage().first_offset, offset);
+  EXPECT_EQ(reader.damage().skipped_bytes,
+            sizeof(RecordHeader) + StoredSize(expected[target].payload));
+
+  ::unlink(path.c_str());
+}
+
+// A power loss can leave the file longer than what reached the disk: a
+// zero-filled or garbage tail. It ends the log after every intact record.
+TEST(LogCorruption, DamagedTailEndsTheLogAfterEveryIntactRecord) {
+  const std::string path = TempPath("damaged_tail");
+  for (const bool zeros : {true, false}) {
+    SCOPED_TRACE(zeros);
+    const std::vector<ExpectedRecord> expected =
+        WriteFixture(path, LogWriter::kDefaultBufferBytes);
+    const std::size_t intact = FileSize(path);
+    std::vector<std::byte> tail = MakePayload(4096, 7);
+    if (zeros) std::fill(tail.begin(), tail.end(), std::byte{0});
+    {
+      std::ofstream out{path, std::ios::binary | std::ios::app};
+      out.write(reinterpret_cast<const char*>(tail.data()),
+                static_cast<std::streamsize>(tail.size()));
+    }
+
+    LogReader reader{path};
+    LogReader::Record record;
+    for (const ExpectedRecord& want : expected) {
+      ASSERT_TRUE(reader.next(record));
+      ExpectRecordEquals(want, record);
+    }
+    EXPECT_FALSE(reader.next(record));
+    EXPECT_TRUE(reader.truncated());
+    EXPECT_EQ(reader.damage().spans, 0u);
+    EXPECT_EQ(reader.damage().tail_offset, intact);
+    EXPECT_EQ(reader.damage().tail_bytes, tail.size());
+  }
+  ::unlink(path.c_str());
+}
+
+// Record magic inside a payload, with a plausible header after it, is not a
+// record unless its checksum says so: a scan that starts inside a damaged
+// record must not resume at it.
+TEST(LogCorruption, FalseMagicInsideAPayloadIsNotARecord) {
+  const std::string path = TempPath("false_magic");
+  RecordHeader fake{};
+  fake.magic = RECORD_MAGIC;
+  fake.kind = static_cast<std::uint16_t>(EventKind::MESSAGE);
+  fake.source_id = 1;
+  fake.dispatch_index = 99;
+  fake.payload_bytes = 8;
+  fake.stored_bytes = 8;
+  fake.crc32 = 0x12345678;  // not the checksum of this header and its bytes
+  std::vector<std::byte> carrier = MakePayload(128, 3);
+  std::memcpy(carrier.data() + 16, &fake, sizeof(fake));
+  {
+    LogWriter writer{path, "false_magic", LogWriter::kDefaultBufferBytes};
+    writer.start(MakeManifest(), MonotonicTime::from_nanos(1));
+    for (std::uint64_t i = 1; i <= 3; ++i) {
+      Context context;
+      context.kind = EventKind::MESSAGE;
+      context.source_id = 1;
+      context.dispatch_index = i;
+      writer.dispatch(context, i == 2 ? carrier : MakePayload(128, 1));
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+  // Damage the carrier's header, so the scan starts inside it.
+  const std::size_t carrier_offset =
+      RecordsOffset() + sizeof(RecordHeader) + StoredSize(MakePayload(128, 1));
+  FlipByte(path, carrier_offset + offsetof(RecordHeader, dispatch_index));
+
+  LogReader reader{path};
+  LogReader::Record record;
+  ASSERT_TRUE(reader.next(record));
+  EXPECT_EQ(record.header.dispatch_index, 1u);
+  ASSERT_TRUE(reader.next(record));
+  EXPECT_EQ(record.header.dispatch_index, 3u);
+  EXPECT_FALSE(reader.next(record));
+  EXPECT_EQ(reader.damage().spans, 1u);
+  EXPECT_EQ(reader.damage().skipped_bytes,
+            sizeof(RecordHeader) + StoredSize(carrier));
+  EXPECT_FALSE(reader.truncated());
 
   ::unlink(path.c_str());
 }
@@ -837,8 +926,58 @@ TEST(LogBackgroundWriter, RepeatedFlushReusesChunksInOrder) {
   ::unlink(path.c_str());
 }
 
+// An intact record from another log -- old disk blocks a power loss exposed
+// -- is not where a scan resumes: its dispatch index and time go back.
+TEST(LogCorruption, ScanSkipsAnIntactRecordFromAnotherLog) {
+  const std::string path = TempPath("foreign_record");
+  const std::string other = TempPath("foreign_record_source");
+  const std::vector<ExpectedRecord> expected =
+      WriteFixture(path, LogWriter::kDefaultBufferBytes);
+  WriteFixture(other, LogWriter::kDefaultBufferBytes);
+
+  const auto read_bytes = [](const std::string& file) {
+    std::ifstream in{file, std::ios::binary};
+    return std::vector<char>{std::istreambuf_iterator<char>{in},
+                             std::istreambuf_iterator<char>{}};
+  };
+  const std::vector<char> log = read_bytes(path);
+  const std::vector<char> source = read_bytes(other);
+  // The other log's second record (dispatch 1), after garbage, inserted
+  // before this log's record `target`, a later dispatch.
+  const std::size_t target = expected.size() / 2;
+  ASSERT_GT(expected[target].dispatch_index, 1u);
+  const std::size_t foreign_offset = FixtureRecordOffset(expected, 1);
+  const std::size_t foreign_bytes =
+      sizeof(RecordHeader) + StoredSize(expected[1].payload);
+  const std::size_t at = FixtureRecordOffset(expected, target);
+  const std::vector<char> garbage(16, '\xff');
+  {
+    std::ofstream out{path, std::ios::binary | std::ios::trunc};
+    out.write(log.data(), static_cast<std::streamsize>(at));
+    out.write(garbage.data(), static_cast<std::streamsize>(garbage.size()));
+    out.write(source.data() + foreign_offset,
+              static_cast<std::streamsize>(foreign_bytes));
+    out.write(log.data() + at, static_cast<std::streamsize>(log.size() - at));
+  }
+
+  LogReader reader{path};
+  LogReader::Record record;
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    SCOPED_TRACE(i);
+    ASSERT_TRUE(reader.next(record));
+    ExpectRecordEquals(expected[i], record);
+  }
+  EXPECT_FALSE(reader.next(record));
+  EXPECT_EQ(reader.damage().spans, 1u);
+  EXPECT_EQ(reader.damage().first_offset, at);
+  EXPECT_EQ(reader.damage().skipped_bytes, garbage.size() + foreign_bytes);
+
+  ::unlink(path.c_str());
+  ::unlink(other.c_str());
+}
+
 // SummarizeLog agrees with LogReader read to its end, on a whole log, a
-// truncated one, and the corruptions LogReader rejects.
+// truncated one, a damaged one, and the corruptions LogReader rejects.
 TEST(LogSummary, MatchesTheReaderAndRejectsTheSameCorruption) {
   const std::string path = TempPath("summary");
   const std::vector<ExpectedRecord> expected =
@@ -862,14 +1001,25 @@ TEST(LogSummary, MatchesTheReaderAndRejectsTheSameCorruption) {
   FlipByte(path, sizeof(FileHeader) + 10);  // the manifest block
   EXPECT_THROW(SummarizeLog(path), std::runtime_error);
 
+  // A damaged record mid-log, then a zero-filled tail.
   WriteFixture(path, LogWriter::kDefaultBufferBytes);
-  std::size_t offset = RecordsOffset();
-  for (const auto& entry : expected) {
-    if (StoredSize(entry.payload) != 0) break;
-    offset += sizeof(RecordHeader);
+  FlipByte(path, FixtureRecordOffset(expected, expected.size() / 2) + 8);
+  {
+    const std::vector<char> zeros(1000);
+    std::ofstream out{path, std::ios::binary | std::ios::app};
+    out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
   }
-  FlipByte(path, offset + sizeof(RecordHeader));  // first stored payload byte
-  EXPECT_THROW(SummarizeLog(path), std::runtime_error);
+  summary = SummarizeLog(path);
+  LogReader damaged{path};
+  while (damaged.next(record)) {
+  }
+  EXPECT_EQ(summary.record_count, expected.size() - 1);
+  EXPECT_EQ(summary.record_count, damaged.record_count());
+  EXPECT_TRUE(summary.truncated);
+  EXPECT_EQ(summary.damage.spans, 1u);
+  EXPECT_EQ(summary.damage.first_offset, damaged.damage().first_offset);
+  EXPECT_EQ(summary.damage.skipped_bytes, damaged.damage().skipped_bytes);
+  EXPECT_EQ(summary.damage.tail_bytes, 1000u);
 
   WriteFixture(path, LogWriter::kDefaultBufferBytes);
   FlipByte(path, 0);

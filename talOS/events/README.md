@@ -218,7 +218,14 @@ The schema block carries each manifest entry's topic schema
 (`talOS/schema/identity.h`): its name and embedded `.bfbs` reflection schema
 bytes. Stored payloads omit trailing zero bytes; readers restore the declared
 payload size with zero padding. Complete records before a truncated final
-record remain readable; checksum failures are rejected.
+record remain readable. A record whose magic, lengths or checksum are wrong is
+skipped: the reader scans to the next record magic whose header and checksum
+validate, and counts what it skipped (`LogReader::damage()`), so one damaged
+record, or a garbage or zero-filled tail left by a power loss, costs only
+itself. `--replay-inputs` replays the intact records and warns with the file
+and byte offsets; exact replay (`ReplayEventLoop`, `--replay`) refuses a log
+with records missing between intact ones, and replays a damaged tail's prefix
+as it does a truncated log's.
 
 Format details live in `log/format.h`. The version field is checked on read;
 readers reject a version they do not know rather than guessing.
