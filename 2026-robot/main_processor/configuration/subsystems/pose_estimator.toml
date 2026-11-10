@@ -31,8 +31,11 @@ drivetrain_timeout_us = 100000
 initial_x_m = 2.0
 initial_y_m = 2.0
 initial_yaw_rad = 0.0
-field_length_m = 16.54
-field_width_m = 8.21
+# Field size: field-dimensions of the tag layout
+# 2026-robot/main_processor/vision/data/2026-rebuilt-welded.json
+# (config_golden_test checks they match).
+field_length_m = 16.541
+field_width_m = 8.069
 max_innovation_m = 3.0
 # Once-localized wrapped yaw innovation limit; radians (15 degrees).
 max_yaw_innovation_rad = 0.2618

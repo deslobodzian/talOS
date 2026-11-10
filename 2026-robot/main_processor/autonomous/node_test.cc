@@ -30,9 +30,9 @@ TEST(TrajectoryTest, InterpolatesMultipleSamplesAndCompletes) {
   EXPECT_DOUBLE_EQ(trajectory.total_time_s(), 2);
   EXPECT_DOUBLE_EQ(trajectory.SampleAt(2).x_m, 2);
   EXPECT_DOUBLE_EQ(trajectory.SampleAt(3).x_m, 2);
-  trajectory.FlipForRed(16.54, 8.21);
-  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).x_m, 16.54);
-  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).y_m, 8.21);
+  trajectory.FlipForRed(16.541, 8.069);
+  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).x_m, 16.541);
+  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).y_m, 8.069);
   EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).vx_mps, -1);
 }
 

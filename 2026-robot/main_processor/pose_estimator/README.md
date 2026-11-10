@@ -60,7 +60,7 @@ implementation (an unknown value fails at startup). The robot config selects
   seed is trusted: disabled trusts the seed; enabled leaves it untrusted.
   Localization becomes true once both a trusted startup decision and an
   integrated sample exist. A later disable never changes the startup decision.
-- Field dimensions `field_length_m` (16.54) and `field_width_m` (8.21)
+- Field dimensions `field_length_m` (16.541) and `field_width_m` (8.069)
   must be finite and positive. Observations outside the inclusive field
   rectangle are rejected. Once localized, measurements use the position
   (`max_innovation_m`, 3.0 m) and wrapped-yaw (`max_yaw_innovation_rad`,

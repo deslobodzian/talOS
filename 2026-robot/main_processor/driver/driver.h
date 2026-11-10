@@ -42,6 +42,7 @@ class Driver {
         [this](const drivetrain::DrivetrainState& s) {
           if (!s.yaw_valid() || !std::isfinite(s.yaw_rad())) return;
           yaw_rad_ = s.yaw_rad();
+          measured_omega_radps_ = s.omega_radps();
           heading_at_ = node_.now();
           have_heading_ = true;
           if (armed_ && translation_neutral_) SetFrame(Frame::kField);
@@ -59,6 +60,10 @@ class Driver {
 
  private:
   enum class Frame { kWaitingForNeutral, kRobot, kField };
+
+  // Measured rotation below which a turn has stopped and the heading hold
+  // latches: the slew-limited coast left from there is negligible.
+  static constexpr double kTurnStoppedRadps = 0.1;
 
   void SetFrame(Frame next) {
     if (!field_oriented_) next = Frame::kRobot;
@@ -140,8 +145,7 @@ class Driver {
     }
     if (rezero && !rezero_pressed_ && FreshHeading()) {
       yaw_offset_rad_ = yaw_rad_;
-      hold_yaw_rad_ = yaw_rad_;
-      holding_heading_ = true;
+      hold_settling_ = true;
     }
     rezero_pressed_ = rezero;
     const bool fresh_heading = FreshHeading();
@@ -159,8 +163,18 @@ class Driver {
     double omega = talos::teleop::Deadband(raw_rotation, deadband_frac_) *
                    max_angular_radps_;
     if (fresh_heading) {
-      if (omega != 0 || !holding_heading_) hold_yaw_rad_ = yaw_rad_;
-      if (omega == 0 && holding_heading_) {
+      // The hold follows the heading while the driver turns and, after a
+      // release, a re-zero or a stale heading, until the drivetrain measures
+      // that the robot has stopped turning: its slew limit carries the robot
+      // on after a release, and that coast is where the driver turned to, not
+      // an error to drive back. A non-finite measurement reads as stopped.
+      // Once latched, the hold's own correction never moves its target.
+      if (omega != 0 || !holding_heading_) hold_settling_ = true;
+      if (hold_settling_) {
+        hold_yaw_rad_ = yaw_rad_;
+        hold_settling_ =
+            omega != 0 || std::abs(measured_omega_radps_) >= kTurnStoppedRadps;
+      } else {
         const double error =
             std::remainder(hold_yaw_rad_ - yaw_rad_, 2 * std::numbers::pi);
         omega = std::clamp(heading_hold_radps_ * error, -max_angular_radps_,
@@ -198,9 +212,11 @@ class Driver {
   talos::TargetLane<drivetrain::ChassisTarget> chassis_;
   talos::DriverStation ds_;
   double yaw_rad_ = 0;
+  double measured_omega_radps_ = 0;
   double yaw_offset_rad_ = 0;
   double hold_yaw_rad_ = 0;
   bool holding_heading_ = false;
+  bool hold_settling_ = false;
   bool rezero_pressed_ = false;
   talos::Time heading_at_{};
   bool have_heading_ = false;

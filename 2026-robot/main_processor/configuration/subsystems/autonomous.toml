@@ -15,8 +15,11 @@ yaw_tolerance_rad = 0.05
 max_linear_mps = 2.0
 max_angular_radps = 3.0
 # Common controller limits; each routine below owns its action parameters.
-field_length_m = 16.54
-field_width_m = 8.21
+# Field size: field-dimensions of the tag layout
+# 2026-robot/main_processor/vision/data/2026-rebuilt-welded.json
+# (config_golden_test checks they match).
+field_length_m = 16.541
+field_width_m = 8.069
 # Feedback velocity per metre/radian of pose error.
 xy_feedback_per_m_mps = 1.0
 yaw_feedback_per_rad_radps = 1.0

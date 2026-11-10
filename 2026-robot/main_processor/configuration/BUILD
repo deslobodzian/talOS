@@ -33,7 +33,9 @@ cc_test(
         ":robot_config",
     ] + PHYSICS_CONFIG_FILES,
     deps = [
+        "//2026-robot/main_processor/vision/data:field_layout_2026",
         "//talOS/configuration",
+        "//talOS/vision/field_sim",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],

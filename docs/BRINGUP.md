@@ -138,6 +138,7 @@ Pass `--max-range-m` to match a non-default `camera.max_range_m`.
 ## Drivetrain on blocks
 
 - [ ] Lift and secure all drive wheels. With a spotter, enable teleop and apply small forward, strafe and rotation inputs separately, then release and disable. Expected: module angles and wheel directions agree with the requested chassis motion; release stops the demand and disable always neutralizes it.
+- [ ] With the robot disabled, turn it a quarter turn on its blocks, then enable teleop and apply small forward. Expected: the modules steer a quarter turn from the robot's front, because driver-forward did not turn with it. Press button 4 (`rezero_button_id` in [the driver config](../2026-robot/main_processor/configuration/subsystems/driver.toml)) and apply forward again. Expected: the modules steer to the robot's front. Release and disable.
 - [ ] If isolating the chassis from the driver, pause the `driver` process first (use its PID in Studio) so there is only one writer on the teleop lane. Bench only, while enabled in teleop, run `bazel run //2026-robot/main_processor/drivetrain:send_target -- 0.1 0 0 2`. Expected: a small forward demand for two seconds, then lane release and neutral. Never use this tool at a match; it bypasses the operator interface and is not in the bundle. End the bench test disabled before resuming the driver.
 - [ ] Watch drivetrain monitor and Studio while repeating release/disable. Expected: measured velocities respond in the correct direction, no hardware fault appears, and the selected target disappears when disabled or stale.
 

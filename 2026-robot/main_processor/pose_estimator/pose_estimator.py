@@ -417,8 +417,8 @@ class PoseEstimator:
             node, "max_odometry_speed_mps", 10.0)
         self.max_odometry_yaw_rate_radps = _positive(
             node, "max_odometry_yaw_rate_radps", 25.0)
-        self.field_length_m = _positive(node, "field_length_m", 16.54)
-        self.field_width_m = _positive(node, "field_width_m", 8.21)
+        self.field_length_m = _positive(node, "field_length_m", 16.541)
+        self.field_width_m = _positive(node, "field_width_m", 8.069)
         self.max_innovation_m = _positive(node, "max_innovation_m", 3.0)
         self.max_yaw_innovation_rad = _positive(
             node, "max_yaw_innovation_rad", 0.2618)

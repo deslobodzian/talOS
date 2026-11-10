@@ -41,8 +41,8 @@ class Autonomous {
         yaw_tolerance_{node.param("yaw_tolerance_rad", 0.05)},
         max_linear_{node.param("max_linear_mps", 2.0)},
         max_angular_{node.param("max_angular_radps", 3.0)},
-        field_length_{node.param("field_length_m", 16.54)},
-        field_width_{node.param("field_width_m", 8.21)},
+        field_length_{node.param("field_length_m", 16.541)},
+        field_width_{node.param("field_width_m", 8.069)},
         kp_xy_{node.param("xy_feedback_per_m_mps", 1.0)},
         kp_yaw_{node.param("yaw_feedback_per_rad_radps", 1.0)},
         feed_duration_{std::chrono::microseconds{

@@ -67,6 +67,8 @@ Every negative intake target, autonomous or teleop, requires fresh shooter
 `at_speed` with a positive shooter target on every tick; otherwise the roller
 is neutral and `/intake/state.inhibit` reports `SHOOTER_NOT_READY`.
 `requested_velocity_rps` retains the withheld feed ask for diagnosis.
+Press **4** to re-zero driver-forward to the robot's current heading
+(`rezero_button_id` in `subsystems/driver.toml`).
 Release the buttons and enable with controls neutral to rearm after a disable
 or link loss.
 

@@ -86,11 +86,12 @@ can_id = 1
   // The bridge goes silent: no more Driver Station packets.
   void Silence() { hw_.reset(); }
   void Reconnect() { hw_ = std::make_unique<SimHardware>(sim_); }
-  void PublishHeading(double yaw_rad, bool yaw_valid = true) {
-    sim_.publish(
-        drivetrain::topics::kState,
-        drivetrain::DrivetrainState{
-            0, true, true, yaw_valid, 0, 0, 0, yaw_rad, {}, {}, {}, {}});
+  // `omega_radps` is the rotation the drivetrain's modules measure.
+  void PublishHeading(double yaw_rad, bool yaw_valid = true,
+                      double omega_radps = 0) {
+    const drivetrain::DrivetrainState state{
+        0, true, true, yaw_valid, 0, 0, omega_radps, yaw_rad, {}, {}, {}, {}};
+    sim_.publish(drivetrain::topics::kState, state);
     sim_.step(10ms);
   }
   void Advance(talos::Duration d) { sim_.step(d); }
@@ -219,11 +220,32 @@ TEST(Driver, HeadingHoldCorrectsWrappedErrorAndResetsAfterManualTurn) {
   EXPECT_NEAR(harness.chassis().omega_radps(), 3, 1e-9);
   harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
   EXPECT_NEAR(harness.chassis().omega_radps(), 0, 1e-9);
-  harness.Advance(1s);
+}
+
+TEST(Driver, HeadingHoldLatchesWhereAReleasedTurnStops) {
+  Harness harness{"deadband_frac = 0.0\nheading_hold_radps = 4.0\n"};
+  harness.PublishHeading(0);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, 0, -1)));
+  harness.PublishHeading(0.5, true, kMaxAngular);
+  // Released at 0.5 rad while the drivetrain's slew limit still turns the
+  // robot: the coast is not an error to drive back.
   harness.Push(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+  harness.PublishHeading(1.2, true, 3);
   EXPECT_NEAR(harness.chassis().omega_radps(), 0, 1e-9);
-  harness.Push(DsState(ds::kDsAttached, Stick(0, 0, 0)));
-  EXPECT_FALSE(harness.chassis_active());
+  // Latched where the turn stopped; the hold's own correction, measured as
+  // rotation, does not move it.
+  harness.PublishHeading(1.5, true, 0.05);
+  harness.PublishHeading(1.4, true, 0.4);
+  EXPECT_NEAR(harness.chassis().omega_radps(), 4 * 0.1, 1e-9);
+  // A stale drivetrain state commands no correction, and one fresh again
+  // mid-turn restarts the hold where that turn stops.
+  harness.Advance(150ms);
+  EXPECT_NEAR(harness.chassis().omega_radps(), 0, 1e-9);
+  harness.PublishHeading(2.0, true, 2);
+  EXPECT_NEAR(harness.chassis().omega_radps(), 0, 1e-9);
+  harness.PublishHeading(2.3, true, 0);
+  harness.PublishHeading(2.2, true, 0);
+  EXPECT_NEAR(harness.chassis().omega_radps(), 4 * 0.1, 1e-9);
 }
 
 TEST(Driver, HeadingWithinTimeoutStillRotatesTheFieldRelativeRequest) {
