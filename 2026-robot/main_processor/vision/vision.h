@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -241,6 +242,16 @@ class Vision {
 
   const talos::vision::CameraSourceConfig& capture_config() const {
     return capture_config_;
+  }
+
+  // Tests: blocks, in wall time, until the raster sim worker holds no request
+  // and has stored the result of the one it took, so the next update()
+  // collects it without simulated time passing meanwhile. False if `timeout`
+  // passes first; true at once for a node without a raster sim worker.
+  bool WaitForSimWorker(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return sim_idle_.wait_for(lock, timeout,
+                              [this] { return !sim_request_ && !sim_busy_; });
   }
 
   bool AcceptEstimate(const talos::vision::RobotPoseEstimate& estimate) const {
@@ -735,6 +746,7 @@ class Vision {
         });
         if (stopping_.load(std::memory_order_acquire)) break;
         request = std::exchange(sim_request_, std::nullopt);
+        sim_busy_ = request.has_value();
       }
       if (!request) continue;
       Completed result;
@@ -743,10 +755,14 @@ class Vision {
       } catch (const std::exception&) {
         result = Completed{request->truth.sample_time_ns()};
       }
-      std::lock_guard lock(mutex_);
-      // The loop has not taken the previous result: it is lost.
-      if (sim_result_) ++sim_results_replaced_;
-      sim_result_ = SimResult{result, request->epoch};
+      {
+        std::lock_guard lock(mutex_);
+        // The loop has not taken the previous result: it is lost.
+        if (sim_result_) ++sim_results_replaced_;
+        sim_result_ = SimResult{result, request->epoch};
+        sim_busy_ = false;
+      }
+      sim_idle_.notify_all();
     }
   }
 
@@ -1087,6 +1103,8 @@ class Vision {
   // Raster sim handoff, guarded by mutex_. sim_epoch_ is the loop's alone.
   std::optional<SimRequest> sim_request_;
   std::optional<SimResult> sim_result_;
+  bool sim_busy_ = false;  // The worker is simulating a request it took.
+  std::condition_variable sim_idle_;  // Notified when sim_busy_ clears.
   std::uint64_t sim_results_replaced_ = 0;
   std::uint64_t sim_epoch_ = 0;
   std::uint64_t received_ = 0, worker_processed_ = 0;

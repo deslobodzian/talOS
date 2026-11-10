@@ -331,6 +331,15 @@ inline int RenderFieldView(
   cv::Mat output(height, width, CV_8UC1, gray_out->data());
   if (rng != nullptr && cam.sensor_noise_std_gray > 0.0) {
     scratch->sensor_noise.create(output.size(), CV_32FC1);
+    // OpenCV fills its normal-distribution tables on first use behind an
+    // unsynchronized static flag. One fill under this thread-safe static
+    // builds them before any renderer thread reads them, so cameras rendering
+    // on concurrent threads only read the tables.
+    [[maybe_unused]] static const bool normal_tables_ready = [] {
+      cv::Mat warm(1, 1, CV_32FC1);
+      cv::RNG(1).fill(warm, cv::RNG::NORMAL, 0.0, 1.0);
+      return true;
+    }();
     // Local OpenCV state avoids its thread-global RNG and derives each frame's
     // deterministic sensor stream from the camera's explicit generator.
     cv::RNG sensor_rng((*rng)());

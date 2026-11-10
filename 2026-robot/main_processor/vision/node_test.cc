@@ -102,18 +102,24 @@ struct CameraObserver {
   talos::Subscription<geometry::PoseObservation> state;
 };
 
-// A raster sim camera renders and detects on its worker thread, which can fall
-// behind any fixed number of simulated milliseconds. Step until `ready`,
-// republishing `truth` so it stays fresh without becoming a new capture, and
-// give the worker wall time between steps; bounded so a real failure fails.
+// A raster sim camera renders and detects on its worker thread, whose wall
+// time (long under sanitizers) must not become simulated time: production
+// drops a result older than frame_timeout_us. Step 1 ms at a time until
+// `ready`, republishing `truth` so it stays fresh without becoming a new
+// capture, and after each step wait in wall time for every camera's worker to
+// store its result, which the next step collects. So each result reaches
+// update() at most 1 ms of simulated time after its request, however slow the
+// worker. Both bounds only end a failing run.
 template <typename Ready>
 bool AdvanceSimUntil(talos::testing::Sim& sim,
-                     const geometry::OdometrySample& truth, Ready ready,
-                     int max_milliseconds = 10000) {
-  for (int i = 0; i < max_milliseconds && !ready(); ++i) {
+                     const std::vector<Vision*>& cameras,
+                     const geometry::OdometrySample& truth, Ready ready) {
+  for (int i = 0; i < 1000 && !ready(); ++i) {
     sim.publish(sim::topics::kState, truth);
     sim.step(1ms);
-    if (!ready()) std::this_thread::sleep_for(1ms);
+    for (auto* camera : cameras) {
+      if (!camera->WaitForSimWorker(60s)) return false;
+    }
   }
   return ready();
 }
@@ -130,7 +136,8 @@ void CheckPose(bool rasterize) {
   // Isolate direct-projection geometry from corner noise; the raster path
   // retains production sensor/exposure noise.
   auto sim = MakeSim(rasterize, !rasterize);
-  for (const auto* name : kCameras) sim.add<Vision>(name);
+  std::vector<Vision*> cameras;
+  for (const auto* name : kCameras) cameras.push_back(&sim.add<Vision>(name));
   // No driver station, targets, estimator or drivetrain: sensing runs disabled
   // from gateway truth, without requiring fresh actuation.
   sim.step(1ms);
@@ -140,7 +147,7 @@ void CheckPose(bool rasterize) {
   sim.publish(sim::topics::kState, truth);
   sim.step(50ms);
   if (rasterize) {
-    ASSERT_TRUE(AdvanceSimUntil(sim, truth, [&] {
+    ASSERT_TRUE(AdvanceSimUntil(sim, cameras, truth, [&] {
       return std::all_of(kCameras.begin(), kCameras.end(),
                          [&](auto name) { return Observed(sim, name, truth); });
     }));
@@ -793,12 +800,13 @@ TEST(VisionTest, SlowTicksCountSkippedDeadlinesWithoutSynthesizingCaptures) {
 
 TEST(VisionTest, ConfiguredMarginExcludesWeakDecodesFromLocalization) {
   auto sim = WithCameraOverride(".detector", "min_decision_margin", "1000.0");
-  sim.add<Vision>("front_left_camera");
+  auto& camera = sim.add<Vision>("front_left_camera");
   const auto truth = Truth(sim);
   sim.publish(sim::topics::kState, truth);
   sim.step(50ms);
-  ASSERT_TRUE(AdvanceSimUntil(
-      sim, truth, [&] { return Observed(sim, "front_left_camera", truth); }));
+  ASSERT_TRUE(AdvanceSimUntil(sim, {&camera}, truth, [&] {
+    return Observed(sim, "front_left_camera", truth);
+  }));
   const auto status = sim.latest<VisionStatus>("/front_left_camera/status");
   if (!status.has_value()) {
     FAIL() << "missing camera status";
@@ -871,7 +879,7 @@ TEST(VisionTest, SlowSimDetectorNeverHoldsTheLoop) {
   auto backend = std::make_shared<GatedBackend>();
   GatedSimVision::backend = backend;
   auto sim = MakeSim(true, true, {}, "period_us = 10000\n");
-  sim.add<GatedSimVision>("rear_right_camera");
+  auto& camera = sim.add<GatedSimVision>("rear_right_camera");
   auto& observer = sim.add<CameraObserver>("pose_estimator");
   // Declared after sim, so a failed assertion releases the worker before the
   // node joins it.
@@ -902,7 +910,7 @@ TEST(VisionTest, SlowSimDetectorNeverHoldsTheLoop) {
   EXPECT_GE(status->frames_dropped_count(), captured - 2);
   EXPECT_TRUE(observer.frames.empty());
   backend->Hold(false);
-  ASSERT_TRUE(AdvanceSimUntil(sim, truth, [&] {
+  ASSERT_TRUE(AdvanceSimUntil(sim, {&camera}, truth, [&] {
     return !observer.frames.empty() &&
            observer.frames.back().observation.sample_time_ns() ==
                truth.sample_time_ns();
@@ -928,7 +936,7 @@ TEST(VisionTest, SimResultOlderThanFrameTimeoutIsDropped) {
   GatedSimVision::backend = backend;
   auto sim =
       MakeSim(true, true, "frame_timeout_us = 300000\n", "period_us = 10000\n");
-  sim.add<GatedSimVision>("rear_right_camera");
+  auto& camera = sim.add<GatedSimVision>("rear_right_camera");
   auto& observer = sim.add<CameraObserver>("pose_estimator");
   struct Release {
     GatedBackend& backend;
@@ -956,14 +964,14 @@ TEST(VisionTest, SimResultOlderThanFrameTimeoutIsDropped) {
   backend->Hold(false);
   // 350 ms after its truth instant the result is collected: dropped, not
   // published.
-  ASSERT_TRUE(AdvanceSimUntil(sim, truth, [&] {
+  ASSERT_TRUE(AdvanceSimUntil(sim, {&camera}, truth, [&] {
     return !observer.frames.empty() || dropped() > dropped_before;
   }));
   EXPECT_TRUE(observer.frames.empty());
   EXPECT_EQ(dropped(), dropped_before + 1);
   // A result inside the timeout still publishes valid.
   const auto next = Truth(sim);
-  ASSERT_TRUE(AdvanceSimUntil(sim, next, [&] {
+  ASSERT_TRUE(AdvanceSimUntil(sim, {&camera}, next, [&] {
     return !observer.frames.empty() &&
            observer.frames.back().observation.sample_time_ns() ==
                next.sample_time_ns();
@@ -1112,15 +1120,16 @@ TEST(VisionTest, RecordsSampledFramesWithTruthWhenSessionDirIsSet) {
   {
     auto sim = MakeSim(true, true);
     sim.set_session_dir(session);
-    sim.add<Vision>("rear_right_camera");
+    auto& camera = sim.add<Vision>("rear_right_camera");
     sim.step(1ms);
     sim.publish(sim::topics::kState, Truth(sim));
     sim.step(50ms);
     const auto truth = Truth(sim);
     sim.publish(sim::topics::kState, truth);
     sim.step(50ms);
-    ASSERT_TRUE(AdvanceSimUntil(
-        sim, truth, [&] { return Observed(sim, "rear_right_camera", truth); }));
+    ASSERT_TRUE(AdvanceSimUntil(sim, {&camera}, truth, [&] {
+      return Observed(sim, "rear_right_camera", truth);
+    }));
   }
   const auto frames =
       ReadRecordedFrames(session / "frames" / "rear_right_camera");
@@ -1140,15 +1149,16 @@ TEST(VisionTest, RecordsRejectedFramesWhenAllTagsAreRangeRejected) {
   {
     auto sim = MakeSim(true, true, "max_range_m = 0.1\n");
     sim.set_session_dir(session);
-    sim.add<Vision>("rear_right_camera");
+    auto& camera = sim.add<Vision>("rear_right_camera");
     sim.step(1ms);
     sim.publish(sim::topics::kState, Truth(sim));
     sim.step(50ms);
     const auto truth = Truth(sim);
     sim.publish(sim::topics::kState, truth);
     sim.step(50ms);
-    ASSERT_TRUE(AdvanceSimUntil(
-        sim, truth, [&] { return Observed(sim, "rear_right_camera", truth); }));
+    ASSERT_TRUE(AdvanceSimUntil(sim, {&camera}, truth, [&] {
+      return Observed(sim, "rear_right_camera", truth);
+    }));
   }
   const auto frames =
       ReadRecordedFrames(session / "frames" / "rear_right_camera");
@@ -1172,7 +1182,7 @@ TEST(VisionTest, RecorderAttributesAmbiguityOnlyToSingleTagRejections) {
   {
     auto sim = MakeSim(true, true);
     sim.set_session_dir(session);
-    sim.add<Vision>("rear_right_camera");
+    auto& camera = sim.add<Vision>("rear_right_camera");
     sim.step(1ms);
     geometry::OdometrySample truth;
     for (int i = 0; i < 8; ++i) {
@@ -1180,8 +1190,9 @@ TEST(VisionTest, RecorderAttributesAmbiguityOnlyToSingleTagRejections) {
       sim.publish(sim::topics::kState, truth);
       sim.step(50ms);
     }
-    ASSERT_TRUE(AdvanceSimUntil(
-        sim, truth, [&] { return Observed(sim, "rear_right_camera", truth); }));
+    ASSERT_TRUE(AdvanceSimUntil(sim, {&camera}, truth, [&] {
+      return Observed(sim, "rear_right_camera", truth);
+    }));
   }
   const auto frames =
       ReadRecordedFrames(session / "frames" / "rear_right_camera");
@@ -1207,13 +1218,14 @@ TEST(VisionTest, RecordingDisabledWritesNothing) {
   {
     auto sim = MakeSim(true, true, {}, "recording.enabled = false\n");
     sim.set_session_dir(disabled);
-    sim.add<Vision>("rear_right_camera");
+    auto& camera = sim.add<Vision>("rear_right_camera");
     sim.step(1ms);
     const auto truth = Truth(sim);
     sim.publish(sim::topics::kState, truth);
     sim.step(50ms);
-    ASSERT_TRUE(AdvanceSimUntil(
-        sim, truth, [&] { return Observed(sim, "rear_right_camera", truth); }));
+    ASSERT_TRUE(AdvanceSimUntil(sim, {&camera}, truth, [&] {
+      return Observed(sim, "rear_right_camera", truth);
+    }));
   }
   EXPECT_FALSE(std::filesystem::exists(disabled / "frames"));
 }

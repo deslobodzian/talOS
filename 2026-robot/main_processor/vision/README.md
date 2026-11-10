@@ -223,6 +223,9 @@ updates after its capture, still stamped with the truth instant it was rendered
 from; `last_latency_us` includes the render and detection time. A result
 collected more than `frame_timeout_us` after its truth instant (node clock) is
 dropped and counted in `frames_dropped_count`, never published.
+A test that needs a raster result calls `Vision::WaitForSimWorker` after a
+step, which blocks in wall time until the worker has stored its result, so a
+slow build (sanitizers) cannot age results past that limit in simulated time.
 Truth must pass `Subscription::fresh()` (younger than
 `[robot] command_timeout_us` since receipt).
 Missing or stale truth publishes `valid = false` and unhealthy status every
