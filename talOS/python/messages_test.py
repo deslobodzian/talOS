@@ -11,7 +11,6 @@ import unittest
 import flatbuffers
 from python.runfiles import runfiles
 
-from control.ChassisTarget import ChassisTarget
 from control.PositionState import PositionState
 from control.PositionTarget import PositionTarget
 from control.VelocityState import VelocityState
@@ -33,7 +32,7 @@ from talos._messages import MessageType, message_type
 
 TYPES = (Goal, Status, Report, Translation2d, Rotation2d, Pose2d, Twist2d,
          OdometrySample, VelocityTarget, VelocityState, PositionTarget,
-         PositionState, ChassisTarget)
+         PositionState)
 
 _INT_BITS = {"b": (8, True), "B": (8, False), "h": (16, True),
              "H": (16, False), "i": (32, True), "I": (32, False),

@@ -25,7 +25,6 @@ TEST(StandardMessages, WireLayoutCompatibility) {
   EXPECT_TRUE(Message<control::VelocityState>);
   EXPECT_TRUE(Message<control::PositionTarget>);
   EXPECT_TRUE(Message<control::PositionState>);
-  EXPECT_TRUE(Message<control::ChassisTarget>);
 }
 
 }  // namespace
