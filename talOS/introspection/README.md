@@ -57,6 +57,13 @@ loop. The same attributes appear in `--describe` output, so the declared graph
 the launcher checks and the live graph a viewer shows agree about which
 dead ends are designed.
 
+`kSourceFlagLatestOnly` is the one source flag the node does not declare: the
+`Reporter` sets it from the loop (`EventLoopBase::latest_only`) for each
+watcher that delivers only the newest message, so a reader can tell that
+watcher's `dropped` includes skips by design. `--describe` does not carry it.
+It is a bit of the existing `flags` word, needing no layout or version
+change: an older writer leaves it clear, and an older reader ignores it.
+
 
 `publish` checks node and topic names against `names.h` and prints findings to
 stderr without refusing publication. Timer labels are not checked as topics.
@@ -168,7 +175,8 @@ dispatch latency and the worst latency seen.
 timer or a watcher, and messages accepted by the transport for a sender.
 A sender's dropped count is the publishes the transport refused; what a
 watcher's dropped count includes, intentional latest-only skips among it, is in
-[the event system's Lateness section](../events/README.md#lateness).
+[the event system's Lateness section](../events/README.md#lateness). A source
+flagged `kSourceFlagLatestOnly` has those skips in its count.
 
 These are atomics so another thread can read them mid-run without a data race.
 

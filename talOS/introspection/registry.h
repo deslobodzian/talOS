@@ -52,6 +52,7 @@
 #include <cstring>
 #include <new>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -96,6 +97,10 @@ namespace talos::introspect {
 // they are bits of `flags` that every earlier writer left clear, which reads
 // as "no stopped log seen" -- all an earlier build could have said -- and
 // every earlier reader tests only the bits it knows.
+//
+// Nor did naming::kSourceFlagLatestOnly: a bit of SourceRecord::flags that
+// every earlier writer left clear, which reads as "every drop is a loss" --
+// what an earlier reader assumed of every source.
 inline constexpr std::uint32_t kRegistryVersion = 3;
 inline constexpr const char* kRegistryPath = "/talos_registry.3";
 
@@ -150,7 +155,8 @@ struct SourceRecord {
 
   // naming::kSourceFlagExternal, naming::kSourceFlagOptional: how this end's
   // far end is expected to behave, so a graph tool can tell a designed dead
-  // end from a fault. Written once with the descriptive fields, never after.
+  // end from a fault. naming::kSourceFlagLatestOnly: `dropped` below includes
+  // skips by design. Written once with the descriptive fields, never after.
   //
   // This field was `reserved`. See kRegistryVersion for why reusing it needed
   // no version bump.
@@ -165,8 +171,8 @@ struct SourceRecord {
   std::atomic<std::uint64_t> events;
 
   // Messages the transport lapped before this source could read them, messages
-  // a latest-only watcher skipped by design, publishes the transport refused,
-  // or reads it failed (SourceCounters).
+  // a latest-only watcher (kSourceFlagLatestOnly) skipped by design, publishes
+  // the transport refused, or reads it failed (SourceCounters).
   std::atomic<std::uint64_t> dropped;
 
   // Transport sequence last observed, which is what makes a subscriber's lag
@@ -518,10 +524,14 @@ class NodeRegistration {
   // the event loop has closed registration: the manifest is fixed from then on,
   // so it can be read from another thread without synchronization.
   void publish(const event::Manifest& manifest) {
-    write_sources(manifest, [](std::string_view) { return std::uint32_t{0}; });
+    write_sources(manifest, [](std::size_t, std::string_view) {
+      return std::uint32_t{0};
+    });
   }
 
-  // The same, plus endpoint attributes keyed by topic name.
+  // The same, plus endpoint attributes keyed by topic name, and flags the loop
+  // holds per source (naming::kSourceFlagLatestOnly) indexed like the
+  // manifest; `source_flags` may be shorter than it, and the rest get none.
   //
   // The attributes cannot come from the manifest, because the loop does not
   // know them: `/hw/command` looks like any other sender to it. They come from
@@ -539,9 +549,12 @@ class NodeRegistration {
   // elements have `.topic` and `.flags` fits, which is exactly
   // `introspect::EndpointAttribute` -- what the Reporter passes.
   template <typename Attributes>
-  void publish(const event::Manifest& manifest, const Attributes& attributes) {
-    write_sources(manifest, [&attributes](std::string_view name) {
-      std::uint32_t flags = 0;
+  void publish(const event::Manifest& manifest, const Attributes& attributes,
+               std::span<const std::uint32_t> source_flags = {}) {
+    write_sources(manifest, [&attributes, source_flags](std::size_t index,
+                                                        std::string_view name) {
+      std::uint32_t flags =
+          index < source_flags.size() ? source_flags[index] : 0u;
       for (const auto& attribute : attributes) {
         if (attribute.topic == name) {
           flags |= attribute.flags;
@@ -696,7 +709,7 @@ class NodeRegistration {
       source.kind = static_cast<std::uint16_t>(registration.kind);
       source.message_bytes = registration.message_bytes;
       source.alignment = registration.alignment;
-      source.flags = flags_for(registration.name);
+      source.flags = flags_for(i, registration.name);
       source.period_ns = registration.period_ns;
       copy_name(source.name, kMaxNameBytes, registration.name);
       source.events.store(0, std::memory_order_relaxed);
@@ -913,6 +926,9 @@ struct SourceSnapshot {
   bool external() const { return (flags & naming::kSourceFlagExternal) != 0; }
   bool optional() const { return (flags & naming::kSourceFlagOptional) != 0; }
   bool observer() const { return (flags & naming::kSourceFlagObserver) != 0; }
+  bool latest_only() const {
+    return (flags & naming::kSourceFlagLatestOnly) != 0;
+  }
 };
 
 // One Target of a node: the lanes its policy names and the one it selected

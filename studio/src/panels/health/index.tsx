@@ -94,7 +94,7 @@ function HealthPanel() {
         if (topic.dropped !== '0')
           out.push({
             severity: 'warn',
-            text: `${topic.name} lapped ${integer(topic.dropped)} messages`,
+            text: `${topic.name} lost ${integer(topic.dropped)} messages`,
             panel: 'timing'
           });
         if (state === 'unread' && !linted.has(topic.name))

@@ -579,6 +579,7 @@ TEST_F(Registry, ReporterProgressCadenceLeavesRoomForSubTimeoutPause) {
 TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
   const std::string topic = "/probe/state/p" + std::to_string(::getpid());
   const std::string feed = "/probe/telemetry/p" + std::to_string(::getpid());
+  const std::string watched = "/probe/status/p" + std::to_string(::getpid());
   event::RealtimeEventLoop<> loop;
 
   struct Handler {
@@ -594,6 +595,10 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
       event::make_timer<&Handler::OnTick>(loop, "introspect_tick", &handler);
   const std::uint16_t sender = loop.register_sender(
       topic, /*message_bytes=*/8, /*alignment=*/8, kCountSchema);
+  // No callback, so latest-only: its dropped count includes skips by design.
+  const std::uint16_t latest =
+      loop.register_watcher(watched, /*message_bytes=*/8, /*alignment=*/8,
+                            kCountSchema, event::Thunk{});
   const std::size_t sources_before = loop.manifest().size();
   // What the node's Target last selected: index 1, "auto".
   std::atomic<std::int32_t> selected{1};
@@ -644,7 +649,7 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
     if (!reader) return;
     auto nodes = reader->nodes();
     if (nodes.size() == 1 && nodes.front().dispatch_count > 0 &&
-        nodes.front().sources.size() == 3 &&
+        nodes.front().sources.size() == 4 &&
         nodes.front().sources[0].events > 0) {
       live = std::move(nodes);
       loop.exit();
@@ -669,7 +674,7 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
   EXPECT_TRUE(node.alive);
   EXPECT_GT(node.dispatch_count, 0u);
 
-  ASSERT_EQ(node.sources.size(), 3u);
+  ASSERT_EQ(node.sources.size(), 4u);
   EXPECT_EQ(node.sources[0].kind, event::SourceKind::TIMER);
   EXPECT_EQ(node.sources[0].name, "introspect_tick");
   EXPECT_GT(node.sources[0].events, 0u);
@@ -685,10 +690,16 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
   EXPECT_EQ(node.sources[1].events, 0u);
   EXPECT_TRUE(node.sources[1].external());
   EXPECT_FALSE(node.sources[1].optional());
+  EXPECT_FALSE(node.sources[1].latest_only());
 
-  EXPECT_EQ(node.sources[2].name, feed);
-  EXPECT_TRUE(node.sources[2].optional());
-  EXPECT_FALSE(node.sources[2].external());
+  // Only the loop knows which watchers skip to the newest message; the
+  // reporter publishes it so a viewer does not call those skips loss.
+  EXPECT_EQ(node.sources[2].id, latest);
+  EXPECT_EQ(node.sources[2].flags, naming::kSourceFlagLatestOnly);
+
+  EXPECT_EQ(node.sources[3].name, feed);
+  EXPECT_TRUE(node.sources[3].optional());
+  EXPECT_FALSE(node.sources[3].external());
 
   ASSERT_EQ(node.selections.size(), 1u);
   EXPECT_EQ(node.selections[0].sources,

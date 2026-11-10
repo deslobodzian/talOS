@@ -79,6 +79,11 @@ inline constexpr std::string_view kDirectionSuffixes[] = {
 inline constexpr std::uint32_t kSourceFlagExternal = 1u << 0;
 inline constexpr std::uint32_t kSourceFlagOptional = 1u << 1;
 inline constexpr std::uint32_t kSourceFlagObserver = 1u << 2;
+// Not about the far end: a watcher that delivers only the newest message
+// (event::EventLoopBase::latest_only), whose dropped count therefore includes
+// the messages it skipped by design. Set by the Reporter from the loop, never
+// declared by a node, and absent from a `--describe`.
+inline constexpr std::uint32_t kSourceFlagLatestOnly = 1u << 3;
 
 inline bool IsSender(event::SourceKind kind) {
   return kind == event::SourceKind::SENDER;

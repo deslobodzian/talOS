@@ -322,6 +322,44 @@ TEST(TopicHealth, KeepsTheVerdictsThatAlreadyWorkedForConnectedTopics) {
   EXPECT_EQ(HealthOf(*Row(topics, "/odometry/event")), TopicHealth::LOSSY);
 }
 
+// A latest-only watcher skips to the newest message by design and counts the
+// skips as dropped: a 50 Hz reader of a 200 Hz topic drops three in four. That
+// is not loss. A sequence watcher's drops are.
+TEST(TopicHealth, LossyCountsOnlyDropsThatAreNotLatestOnlySkips) {
+  introspect::NodeSnapshot writer;
+  writer.name = "drivetrain";
+  writer.sources = {
+      {.id = 0,
+       .kind = event::SourceKind::SENDER,
+       .name = "/drivetrain/state",
+       .events = 800},
+      {.id = 1,
+       .kind = event::SourceKind::SENDER,
+       .name = "/drivetrain/event",
+       .events = 800},
+  };
+  introspect::NodeSnapshot reader;
+  reader.name = "pose_estimator";
+  reader.sources = {
+      {.id = 0,
+       .kind = event::SourceKind::WATCHER,
+       .name = "/drivetrain/state",
+       .flags = naming::kSourceFlagLatestOnly,
+       .events = 200,
+       .dropped = 600},
+      {.id = 1,
+       .kind = event::SourceKind::WATCHER,
+       .name = "/drivetrain/event",
+       .events = 798,
+       .dropped = 2},
+  };
+
+  const std::vector<TopicRow> topics = TopicsOf({writer, reader});
+  EXPECT_EQ(HealthOf(*Row(topics, "/drivetrain/state")), TopicHealth::OK);
+  EXPECT_EQ(Row(topics, "/drivetrain/state")->dropped, 0u);
+  EXPECT_EQ(HealthOf(*Row(topics, "/drivetrain/event")), TopicHealth::LOSSY);
+}
+
 TEST(SystemGraph, CarriesEndpointAttributesOnEverySourceAndTopic) {
   SystemGraphInput input;
   introspect::NodeSnapshot drivetrain;

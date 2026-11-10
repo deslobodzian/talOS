@@ -120,6 +120,12 @@ struct TopicRow {
   std::vector<std::string> observers;
   std::uint64_t published{0};
   std::uint64_t received{0};
+
+  // Messages lost: the dropped counts of every end except latest-only
+  // watchers (naming::kSourceFlagLatestOnly). A latest-only watcher's count
+  // mixes its skips by design with its torn and slot-lost reads in one
+  // counter, so none of it is loss this row can claim; its own source entry
+  // still carries the whole count.
   std::uint64_t dropped{0};
 
   // True when any end of this topic said so, which is how naming::LintGraph
@@ -144,9 +150,7 @@ enum class TopicHealth {
   UNREAD,       // Published, and nothing in this system reads it.
   BRIDGED,      // The absent end is outside talOS; there is nothing to find.
   UNCONNECTED,  // The absent end is declared optional; absence is the design.
-  // Some end recorded drops. Includes a latest-only reader's intentional skips:
-  // the registry neither marks latest-only sources nor separates skips from
-  // lost reads (talOS/events/README.md, Lateness).
+  // A non-latest-only end lost messages (TopicRow::dropped).
   LOSSY,
   IDLE,
 };
@@ -199,7 +203,7 @@ inline std::vector<TopicRow> TopicsOf(
       TopicRow& row = rows[source.name];
       row.name = source.name;
       row.message_bytes = std::max(row.message_bytes, source.message_bytes);
-      row.dropped += source.dropped;
+      if (!source.latest_only()) row.dropped += source.dropped;
       row.external = row.external || source.external();
       row.optional = row.optional || source.optional();
 
@@ -242,6 +246,11 @@ inline void AppendSource(std::string& out,
   out += source.optional() ? "true" : "false";
   out += ",\"observer\":";
   out += source.observer() ? "true" : "false";
+  // Not a version bump: a reader that predates it ignores it. Its absence
+  // means an older bridge, whose topic `dropped` still counts latest-only
+  // skips.
+  out += ",\"latest_only\":";
+  out += source.latest_only() ? "true" : "false";
   out += ",\"period_ns\":";
   AppendI64(out, source.period_ns);
   out += ",\"events\":";

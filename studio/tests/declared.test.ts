@@ -26,7 +26,7 @@ import {demoSystemGraph} from '../src/demo';
 
 const fixture = readFileSync(new URL('./launcher_graph.json', import.meta.url), 'utf8');
 
-// The same robot with the historical `/hw/req/drive` misspelling put back, so
+// The same robot with `/hw/req/drive` written for `/hw/request/drivetrain`, so
 // the diagnostic path is pinned against real launcher output too. A parser that
 // only ever sees clean documents is untested on the one case that matters.
 const faults =

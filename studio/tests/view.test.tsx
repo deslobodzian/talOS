@@ -199,7 +199,7 @@ test('the overview reads declared against live, and names what never appeared',
 test('the attention list flags real orphans and leaves the design alone', () => {
   const html = renderPanel(healthPanel, state(true));
   assert.ok(html.includes('/shooter/state'), 'a real orphan was not flagged');
-  assert.ok(html.includes('lapped'), 'the lossy topic was not flagged');
+  assert.ok(/ lost [^<]* messages/.test(html), 'the lossy topic was not flagged');
 
   for (const quiet of ['/hw/command', '/drivetrain/target/auto',
                        '/shooter/target/auto'])

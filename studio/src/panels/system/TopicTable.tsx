@@ -17,7 +17,7 @@ import {EmptyState} from '../../ui/primitives';
 const HEALTH_NOTE: Record<TopicHealth, string> = {
   orphaned: 'subscribed but nothing publishes it',
   unread: 'published but nobody reads it',
-  lossy: 'messages were lapped before a reader saw them',
+  lossy: 'an end lost messages: lapped, refused or torn (latest-value skips are not loss)',
   idle: 'wired up, nothing published yet',
   ok: 'publishing and being read',
   bridged: 'one end is outside talOS; no shared-memory peer will appear',

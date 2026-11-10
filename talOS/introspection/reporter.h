@@ -8,8 +8,8 @@
  * on would refuse to replay against a build with it off, and every node's
  * source ids would shift. Observability must not change the program being
  * observed. So this runs on its own thread and reads only the loop's atomics
- * -- its counters, and its recorder's capture state -- plus its manifest,
- * which is immutable once the run has started.
+ * -- its counters, and its recorder's capture state -- plus its manifest and
+ * which watchers are latest-only, both immutable once the run has started.
  *
  * Construct it after the loop, so that reverse destruction order joins this
  * thread before the loop's counters go away:
@@ -222,7 +222,17 @@ class Reporter {
       }
     }
 
-    registration->publish(manifest, endpoints);
+    // What only the loop knows about its own sources, by id: which watchers
+    // skip to the newest message, so a viewer does not read their skips as
+    // loss.
+    std::vector<std::uint32_t> source_flags(loop_sources_, 0u);
+    for (std::size_t id = 0; id < loop_sources_; ++id) {
+      if (loop.latest_only(static_cast<std::uint16_t>(id))) {
+        source_flags[id] = naming::kSourceFlagLatestOnly;
+      }
+    }
+
+    registration->publish(manifest, endpoints, source_flags);
     registration->publish_selections(options_.selections);
     registration->activate();
     published_.store(true, std::memory_order_release);

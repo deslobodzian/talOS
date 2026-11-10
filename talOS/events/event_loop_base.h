@@ -108,6 +108,11 @@ class EventLoopBase {
     return counters_ ? manifest_.size() : 0;
   }
 
+  // Whether source `id` is a latest-only watcher (register_watcher), whose
+  // dropped counter includes the messages it skipped by design. Fixed once
+  // registration closes, so a reporting thread may read it during the run.
+  bool latest_only(std::uint16_t id) const { return sources_[id].latest_only; }
+
   // The only clock a handler may read. Frozen for the duration of a dispatch
   // so that two reads inside one callback cannot disagree, which is what makes
   // the recorded value sufficient to reproduce the run.
