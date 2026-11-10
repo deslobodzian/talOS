@@ -63,6 +63,7 @@ cameras = ["front", "back"]
 offsets_m = [0.5, 1, -2.25]
 none = []
 mixed = [1.0, "back"]
+modules = [{ x_m = 0.3 }, { x_m = -0.25 }]
 [subsystems.listener.limits]
 max = 4.0
 
@@ -124,6 +125,55 @@ TEST(Node, ArrayParamsRejectMissingAndMistypedValues) {
   EXPECT_THROW((void)node.param<Strings>("tag"), std::invalid_argument);
   EXPECT_THROW((void)node.param<Doubles>("limits", {}), std::invalid_argument);
   EXPECT_THROW((void)node.param<std::string>("cameras"), std::invalid_argument);
+}
+
+// One subsystem reads a value another owns, so it is configured once; a
+// wrong subsystem or key fails construction, not a later tick.
+TEST(Node, ParamOfReadsAnotherSubsystemOnlyInTheConstructor) {
+  struct Reader {
+    explicit Reader(Node& n)
+        : gain{n.param_of<double>("listener", "gain")},
+          second_x_m{n.param_of<double>("listener", "modules[1].x_m")},
+          past_end{n.param_of<double>("listener", "modules[2].x_m", 9.5)},
+          cameras{n.param_of<std::vector<std::string>>("listener", "cameras")} {
+    }
+    double gain;
+    double second_x_m;
+    double past_end;
+    std::vector<std::string> cameras;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  const auto& reader = sim.add<Reader>("talker");
+  EXPECT_DOUBLE_EQ(reader.gain, 2.5);
+  EXPECT_DOUBLE_EQ(reader.second_x_m, -0.25);
+  EXPECT_DOUBLE_EQ(reader.past_end, 9.5);
+  EXPECT_EQ(reader.cameras, (std::vector<std::string>{"front", "back"}));
+  // After construction the dependency is fixed.
+  EXPECT_THROW((void)sim.node("talker").param_of<double>("listener", "gain"),
+               std::logic_error);
+
+  struct MissingKey {
+    explicit MissingKey(Node& n) { (void)n.param_of<double>("listener", "x"); }
+  };
+  struct MissingSubsystem {
+    explicit MissingSubsystem(Node& n) {
+      (void)n.param_of<double>("absent", "gain", 1.0);
+    }
+  };
+  struct Mistyped {
+    explicit Mistyped(Node& n) { (void)n.param_of<bool>("listener", "tag"); }
+  };
+  try {
+    sim.add<MissingKey>("missing_key");
+    ADD_FAILURE() << "a missing key constructed";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string{e.what()}.find("in [subsystems.listener]"),
+              std::string::npos)
+        << e.what();
+  }
+  EXPECT_THROW(sim.add<MissingSubsystem>("missing_subsystem"),
+               std::invalid_argument);
+  EXPECT_THROW(sim.add<Mistyped>("mistyped"), std::invalid_argument);
 }
 
 // --- topics ----------------------------------------------------------------

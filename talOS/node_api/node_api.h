@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 22u
+#define TALOS_NODE_ABI_VERSION 23u
 
 enum {
   TALOS_OK = 0,
@@ -114,6 +114,12 @@ typedef struct TalosParam {
 // offending element's index and type).
 int32_t talos_node_param(const TalosNode* node, const char* key, int32_t kind,
                          int32_t required, TalosParam* out);
+// talos_node_param on another subsystem's table (talos::Node::param_of):
+// only while the factory runs; a subsystem the config lacks is TALOS_ERR
+// whether or not the key is `required`.
+int32_t talos_node_param_of(const TalosNode* node, const char* subsystem,
+                            const char* key, int32_t kind, int32_t required,
+                            TalosParam* out);
 
 // Registration: call while the factory runs. Indexes are >= 0; -1 is an
 // error. `schema` names the message type; the topic refuses another.

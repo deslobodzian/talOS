@@ -130,15 +130,28 @@ class Node {
   std::optional<std::filesystem::path> session_dir() const;
 
   // Custom keys of this subsystem's TOML table. Dotted keys reach nested
-  // tables ("geometry.wheelbase_m"). T: bool, int64_t/int, double,
-  // std::string, or a TOML array as std::vector<std::string> or
-  // std::vector<double> (integer elements convert; an empty array is valid).
-  // A present key of the wrong type, or an array element of the wrong type,
-  // throws.
+  // tables ("geometry.wheelbase_m") and an index reaches an array element
+  // ("geometry.modules[0].x_m"; past the end is absent). T: bool,
+  // int64_t/int, double, std::string, or a TOML array as
+  // std::vector<std::string> or std::vector<double> (integer elements
+  // convert; an empty array is valid). A present key of the wrong type, or
+  // an array element of the wrong type, throws.
   template <class T>
   T param(std::string_view key, T fallback) const;
   template <class T>
   T param(std::string_view key) const;  // throws if missing
+
+  // The same, read from another subsystem's table ([subsystems.<subsystem>]),
+  // for a value that subsystem owns (the drivetrain's module offsets), so it
+  // is configured once. Read-only and constructor-only: from update(),
+  // every() or a callback it throws std::logic_error. A subsystem the config
+  // lacks throws std::invalid_argument, even with a fallback.
+  template <class T>
+  T param_of(std::string_view subsystem, std::string_view key,
+             T fallback) const;
+  template <class T>
+  T param_of(std::string_view subsystem,
+             std::string_view key) const;  // throws if missing
 
   // Topics. Call in the constructor: registration order is what replay
   // checks a log against. A relative topic ("state", "target/teleop") expands
@@ -280,26 +293,29 @@ int Run(int argc, char** argv);
 namespace detail {
 
 template <class T>
-std::optional<T> FindParam(const Node& node, std::string_view key) {
+std::optional<T> FindParam(const Node& node, std::string_view key,
+                           NodeAccess::ParamTable subsystem = {}) {
   if constexpr (std::is_same_v<T, bool>) {
-    return NodeAccess::find_bool(node, key);
+    return NodeAccess::find_bool(node, key, subsystem);
   } else if constexpr (std::is_integral_v<T>) {
-    const std::optional<std::int64_t> value = NodeAccess::find_int(node, key);
+    const std::optional<std::int64_t> value =
+        NodeAccess::find_int(node, key, subsystem);
     if (!value) return std::nullopt;
     if (!std::in_range<T>(*value)) {
-      NodeAccess::param_error(node, key, "is out of range");
+      NodeAccess::param_error(node, key, "is out of range", subsystem);
     }
     return static_cast<T>(*value);
   } else if constexpr (std::is_floating_point_v<T>) {
-    const std::optional<double> value = NodeAccess::find_double(node, key);
+    const std::optional<double> value =
+        NodeAccess::find_double(node, key, subsystem);
     if (!value) return std::nullopt;
     return static_cast<T>(*value);
   } else if constexpr (std::is_same_v<T, std::string>) {
-    return NodeAccess::find_string(node, key);
+    return NodeAccess::find_string(node, key, subsystem);
   } else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
-    return NodeAccess::find_string_list(node, key);
+    return NodeAccess::find_string_list(node, key, subsystem);
   } else if constexpr (std::is_same_v<T, std::vector<double>>) {
-    return NodeAccess::find_double_list(node, key);
+    return NodeAccess::find_double_list(node, key, subsystem);
   } else {
     static_assert(sizeof(T) == 0,
                   "param<T>: T must be bool, an integer, double, std::string, "
@@ -348,6 +364,22 @@ template <class T>
 T Node::param(std::string_view key) const {
   std::optional<T> value = detail::FindParam<T>(*this, key);
   if (!value) detail::NodeAccess::param_error(*this, key, "is missing");
+  return *std::move(value);
+}
+
+template <class T>
+T Node::param_of(std::string_view subsystem, std::string_view key,
+                 T fallback) const {
+  std::optional<T> value = detail::FindParam<T>(*this, key, subsystem);
+  return value ? *std::move(value) : std::move(fallback);
+}
+
+template <class T>
+T Node::param_of(std::string_view subsystem, std::string_view key) const {
+  std::optional<T> value = detail::FindParam<T>(*this, key, subsystem);
+  if (!value) {
+    detail::NodeAccess::param_error(*this, key, "is missing", subsystem);
+  }
   return *std::move(value);
 }
 

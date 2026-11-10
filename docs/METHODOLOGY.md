@@ -111,7 +111,8 @@ There are exactly two kinds of input, and they are treated differently.
   publishing. **[review]**
 - Use a message callback (`subscribe(topic, fn)`) only when the node must react
   within 1 ms. A callback switches the node to 1 ms polling (§10). **[review]**
-- Read another subsystem only through its messages and topics. Never include
+- Read another subsystem only through its messages and topics, or a configured
+  value it owns through `param_of` in the constructor. Never include
   its headers beyond `<pkg>/*_generated.h` and `<pkg>/topics.h`. **[enforced: Bazel visibility, review]**
 
 ## 4. Outputs

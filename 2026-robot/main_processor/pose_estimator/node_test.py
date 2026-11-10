@@ -44,8 +44,10 @@ class RaisingSmoother:
 
 
 def robot_toml(backend, *, cameras=("front_camera", "back_camera"),
-               max_observation_age_us=500_000, extra=""):
+               max_observation_age_us=500_000, extra="", modules=MODULES):
     names = ", ".join(f'"{c}"' for c in cameras)
+    module_rows = "".join(f"  {{ x_m = {x}, y_m = {y} }},\n"
+                          for x, y in modules)
     return f"""
 [robot]
 name = "pose_estimator_test"
@@ -56,13 +58,16 @@ command_timeout_us = 100000
 period_us = 20000
 backend = "{backend}"
 cameras = [{names}]
-module_x_m = [{", ".join(str(x) for x, _ in MODULES)}]
-module_y_m = [{", ".join(str(y) for _, y in MODULES)}]
 max_observation_age_us = {max_observation_age_us}
 {extra}
 
-# A robot config needs one motor: the drivetrain's, whose state the tests
+# The estimator reads the module offsets from the drivetrain's geometry. A
+# robot config needs one motor: the drivetrain's, whose state the tests
 # publish themselves.
+[subsystems.drivetrain.geometry]
+modules = [
+{module_rows}]
+
 [subsystems.drivetrain.motors.front_left_drive]
 type = "TalonFX"
 bus = "test"
@@ -869,16 +874,26 @@ class EstimatorTest(unittest.TestCase):
                         chassis.hold(DT)
                     self.assertEqual(self.counts(), (len(cameras), 0))
 
+    def test_module_offsets_come_from_the_drivetrain_geometry(self):
+        modules = ((-0.25, 0.35), (-0.25, -0.35), (0.4, 0.35), (0.4, -0.35))
+        seen = []
+
+        class Reader:
+            def __init__(self, node):
+                seen.extend(estimator._module_offsets(node))
+
+        sim = Sim.from_toml(robot_toml("kalman", modules=modules))
+        sim.add(Reader, "pose_estimator")
+        self.assertEqual(seen, list(modules))
+
     def test_bad_config_fails_at_startup(self):
-        def module_list(key, values):
-            return robot_toml("kalman").replace(
-                next(line for line in robot_toml("kalman").splitlines()
-                     if line.startswith(key)), f"{key} = {values}")
         cases = [
             ("backend", robot_toml("particle_filter")),
             ("max_observation_age_us",
              robot_toml("kalman", max_observation_age_us=2_000_000)),
-            ("module_x_m", module_list("module_x_m", "[0.3, 0.3, -0.3]")),
+            ("three modules", robot_toml("kalman", modules=MODULES[:3])),
+            ("non-finite module",
+             robot_toml("kalman", modules=(("nan", 0.3),) + MODULES[1:])),
             ("cameras", robot_toml("kalman").replace(
                 'cameras = ["front_camera", "back_camera"]', "cameras = [1]")),
             ("kalman.state_std_x_m",

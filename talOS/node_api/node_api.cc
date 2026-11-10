@@ -208,31 +208,32 @@ void Fill(TalosParam& out, detail::ParamValue value) {
 
 std::optional<detail::ParamValue> FindParam(const Node& node,
                                             std::string_view key,
-                                            std::int32_t kind) {
+                                            std::int32_t kind,
+                                            NodeAccess::ParamTable subsystem) {
   auto wrap = [](auto found) -> std::optional<detail::ParamValue> {
     if (!found) return std::nullopt;
     return detail::ParamValue{*std::move(found)};
   };
   switch (kind) {
     case TALOS_PARAM_ANY:
-      return NodeAccess::find_param(node, key);
+      return NodeAccess::find_param(node, key, subsystem);
     case TALOS_PARAM_BOOL:
-      return wrap(NodeAccess::find_bool(node, key));
+      return wrap(NodeAccess::find_bool(node, key, subsystem));
     case TALOS_PARAM_INT:
-      return wrap(NodeAccess::find_int(node, key));
+      return wrap(NodeAccess::find_int(node, key, subsystem));
     case TALOS_PARAM_DOUBLE:
-      return wrap(NodeAccess::find_double(node, key));
+      return wrap(NodeAccess::find_double(node, key, subsystem));
     case TALOS_PARAM_STRING:
-      return wrap(NodeAccess::find_string(node, key));
+      return wrap(NodeAccess::find_string(node, key, subsystem));
     case TALOS_PARAM_STRING_LIST:
-      return wrap(NodeAccess::find_string_list(node, key));
+      return wrap(NodeAccess::find_string_list(node, key, subsystem));
     case TALOS_PARAM_DOUBLE_LIST:
-      return wrap(NodeAccess::find_double_list(node, key));
+      return wrap(NodeAccess::find_double_list(node, key, subsystem));
     case TALOS_PARAM_LIST: {
-      auto value = NodeAccess::find_param(node, key);
+      auto value = NodeAccess::find_param(node, key, subsystem);
       if (value && !std::holds_alternative<std::vector<std::string>>(*value) &&
           !std::holds_alternative<std::vector<double>>(*value)) {
-        NodeAccess::param_error(node, key, "must be an array");
+        NodeAccess::param_error(node, key, "must be an array", subsystem);
       }
       return value;
     }
@@ -313,20 +314,37 @@ const char* talos_node_session_dir(const TalosNode* node) {
   });
 }
 
+// talos_node_param and talos_node_param_of: `key` of this node's table, or
+// of `subsystem`'s.
+static int32_t ReadParam(const TalosNode* node,
+                         NodeAccess::ParamTable subsystem, const char* key,
+                         int32_t kind, int32_t required, TalosParam* out) {
+  const talos::Node& n = AsNode(node);
+  const std::string_view k = NonNull(key, "key");
+  if (out == nullptr) throw std::invalid_argument("null TalosParam");
+  *out = TalosParam{};
+  auto value = FindParam(n, k, kind, subsystem);
+  if (!value) {
+    if (required != 0) NodeAccess::param_error(n, k, "is missing", subsystem);
+    return 0;
+  }
+  Fill(*out, *std::move(value));
+  return 1;
+}
+
 int32_t talos_node_param(const TalosNode* node, const char* key, int32_t kind,
                          int32_t required, TalosParam* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
-    const talos::Node& n = AsNode(node);
-    const std::string_view k = NonNull(key, "key");
-    if (out == nullptr) throw std::invalid_argument("null TalosParam");
-    *out = TalosParam{};
-    auto value = FindParam(n, k, kind);
-    if (!value) {
-      if (required != 0) NodeAccess::param_error(n, k, "is missing");
-      return 0;
-    }
-    Fill(*out, *std::move(value));
-    return 1;
+    return ReadParam(node, std::nullopt, key, kind, required, out);
+  });
+}
+
+int32_t talos_node_param_of(const TalosNode* node, const char* subsystem,
+                            const char* key, int32_t kind, int32_t required,
+                            TalosParam* out) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    return ReadParam(node, NonNull(subsystem, "subsystem"), key, kind, required,
+                     out);
   });
 }
 

@@ -14,11 +14,7 @@ backend = "factor_graph"
 # /<name>/status. Each camera's subsystem file holds its calibration/device.
 # Under --sim they use /sim/state from sim_gateway --physics, never this estimator.
 cameras = ["front_left_camera", "front_right_camera", "rear_left_camera", "rear_right_camera"]
-# Module offsets from the robot centre, in the order of
-# [subsystems.drivetrain.geometry].modules (back_left, back_right,
-# front_left, front_right). config_golden_test checks they match.
-module_x_m = [-0.30, -0.30, 0.30, 0.30]
-module_y_m = [0.30, -0.30, 0.30, -0.30]
+# Module offsets: read from [subsystems.drivetrain.geometry].modules.
 # Observations older than this, relative to the newest drivetrain sample, are
 # rejected; at most 1.5 s (wpimath's pose buffer). The factor graph's lag.
 max_observation_age_us = 1500000

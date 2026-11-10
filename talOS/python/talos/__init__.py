@@ -68,6 +68,21 @@ def _param_kind(key, default):
                     "or only numbers")
 
 
+def _param_value(out):
+    """The Python value of a found talos_node_param result."""
+    if out.kind == _abi.PARAM_BOOL:
+        return bool(out.boolean)
+    if out.kind == _abi.PARAM_INT:
+        return out.integer
+    if out.kind == _abi.PARAM_DOUBLE:
+        return out.number
+    if out.kind == _abi.PARAM_STRING_LIST:
+        return [out.strings[i].decode() for i in range(out.count)]
+    if out.kind == _abi.PARAM_DOUBLE_LIST:
+        return [out.numbers[i] for i in range(out.count)]
+    return out.string.decode()
+
+
 class Node:
     """The framework's side of one node. Made by talos, handed to __init__.
 
@@ -121,28 +136,31 @@ class Node:
     def param(self, key, default=_REQUIRED):
         """A key of this subsystem's config table, typed like `default`.
 
-        Without a default the key must exist. Dotted keys reach nested tables.
-        A TOML array comes back as a list: of str, or of float (integer
-        elements convert). A list default asks for an array; its elements
-        pick the element type, and [] accepts either.
+        Without a default the key must exist. Dotted keys reach nested tables
+        and an index reaches an array element ("geometry.modules[0].x_m";
+        past the end is absent). A TOML array comes back as a list: of str,
+        or of float (integer elements convert). A list default asks for an
+        array; its elements pick the element type, and [] accepts either.
         """
         kind = _param_kind(key, default)
         out = _abi.Param()
         found = _abi.ok(lib.talos_node_param(
             self._handle, _abi.encode(key), kind, default is _REQUIRED, out))
-        if not found:
-            return default
-        if out.kind == _abi.PARAM_BOOL:
-            return bool(out.boolean)
-        if out.kind == _abi.PARAM_INT:
-            return out.integer
-        if out.kind == _abi.PARAM_DOUBLE:
-            return out.number
-        if out.kind == _abi.PARAM_STRING_LIST:
-            return [out.strings[i].decode() for i in range(out.count)]
-        if out.kind == _abi.PARAM_DOUBLE_LIST:
-            return [out.numbers[i] for i in range(out.count)]
-        return out.string.decode()
+        return _param_value(out) if found else default
+
+    def param_of(self, subsystem, key, default=_REQUIRED):
+        """param() of another subsystem's table, [subsystems.<subsystem>].
+
+        For a value that subsystem owns, so it is configured once. Read-only
+        and only in __init__; a subsystem the config lacks raises TalosError
+        even with a default.
+        """
+        kind = _param_kind(key, default)
+        out = _abi.Param()
+        found = _abi.ok(lib.talos_node_param_of(
+            self._handle, _abi.encode(subsystem), _abi.encode(key), kind,
+            default is _REQUIRED, out))
+        return _param_value(out) if found else default
 
     def subscribe(self, msg, topic, callback=None, optional=False):
         """The latest `msg` on `topic`; callback(message) on each arrival.

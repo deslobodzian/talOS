@@ -71,6 +71,8 @@ from wpimath.kinematics import SwerveDrive4Kinematics, SwerveModulePosition
 # observation could not be replayed against odometry.
 MAX_OBSERVATION_AGE_LIMIT_US = 1_500_000
 MODULE_COUNT = 4
+# The subsystem whose state this node reads and whose geometry it uses.
+DRIVETRAIN = "drivetrain"
 # Relocalization requires sustained evidence, independent of reported confidence.
 RELOCALIZATION_COUNT = 3
 RELOCALIZATION_WINDOW_S = 0.5
@@ -119,16 +121,27 @@ def _std_devs(node, table, prefix, defaults):
 
 
 def _module_offsets(node):
-    """(x_m, y_m) per module, in drivetrain geometry module order."""
-    lists = {}
-    for key in ("module_x_m", "module_y_m"):
-        values = node.param(key)
-        if (not isinstance(values, list) or len(values) != MODULE_COUNT
-                or not all(math.isfinite(v) for v in values)):
-            raise ValueError(f"pose_estimator: {key} must list "
-                             f"{MODULE_COUNT} finite offsets, got {values!r}")
-        lists[key] = values
-    return list(zip(lists["module_x_m"], lists["module_y_m"]))
+    """(x_m, y_m) per module, read from the drivetrain's own geometry.
+
+    [subsystems.drivetrain.geometry].modules is the one source: its order is
+    the order of the module fields in DrivetrainState.
+    """
+    offsets = []
+    while True:
+        prefix = f"geometry.modules[{len(offsets)}]"
+        x = node.param_of(DRIVETRAIN, f"{prefix}.x_m", None)
+        if x is None:
+            break
+        y = node.param_of(DRIVETRAIN, f"{prefix}.y_m")
+        if not (math.isfinite(x) and math.isfinite(y)):
+            raise ValueError(f"pose_estimator: {DRIVETRAIN} {prefix} offset "
+                             f"must be finite, got ({x}, {y})")
+        offsets.append((x, y))
+    if len(offsets) != MODULE_COUNT:
+        raise ValueError(f"pose_estimator: [subsystems.{DRIVETRAIN}.geometry] "
+                         f"must list {MODULE_COUNT} modules with x_m, got "
+                         f"{len(offsets)}")
+    return offsets
 
 
 def module_positions(state):

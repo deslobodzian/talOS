@@ -140,8 +140,10 @@ implementation (an unknown value fails at startup). The robot config selects
   `observation_future_tolerance_us` newer than the latest
   odometry sample, or older than `max_observation_age_us` (at most 1.5 s,
   wpimath's pose buffer).
-- `module_x_m` / `module_y_m` repeat `[subsystems.drivetrain.geometry]
-  .modules` (same order); `config_golden_test` fails if they drift.
+- The module offsets are the drivetrain's own, read with
+  `node.param_of("drivetrain", "geometry.modules[i].x_m")` (and `y_m`) from
+  `[subsystems.drivetrain.geometry].modules`, in that order; it must list
+  four modules.
 
 ## Update benchmark
 

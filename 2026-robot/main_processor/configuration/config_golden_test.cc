@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
-#include <cstddef>
 #include <string>
 
 #include "drivetrain/geometry.h"
@@ -49,37 +48,6 @@ TEST(ConfigTest, DriverRezeroButtonHasNoTeleopBinding) {
             << subsystem << " binds the driver's re-zero button " << *rezero;
       }
     }
-  }
-}
-
-// The estimator and drivetrain independently consume these tables. Different
-// geometry would make odometry disagree with the commanded wheel motion.
-TEST(ConfigTest, PoseEstimatorGeometryMatchesDrivetrain) {
-  const auto config =
-      ParseRobotConfig("2026-robot/main_processor/configuration/robot.toml");
-  const toml::table& root = config.toml_data;
-  const auto* modules =
-      root.at_path("subsystems.drivetrain.geometry.modules").as_array();
-  const auto* xs =
-      root.at_path("subsystems.pose_estimator.module_x_m").as_array();
-  const auto* ys =
-      root.at_path("subsystems.pose_estimator.module_y_m").as_array();
-  ASSERT_NE(modules, nullptr);
-  ASSERT_NE(xs, nullptr);
-  ASSERT_NE(ys, nullptr);
-  ASSERT_EQ(modules->size(), 4u);
-  ASSERT_EQ(xs->size(), modules->size());
-  ASSERT_EQ(ys->size(), modules->size());
-  for (std::size_t i = 0; i < modules->size(); ++i) {
-    SCOPED_TRACE(i);
-    const auto* module = (*modules)[i].as_table();
-    ASSERT_NE(module, nullptr);
-    const auto x = (*module)["x_m"].value<double>();
-    const auto y = (*module)["y_m"].value<double>();
-    ASSERT_TRUE(x.has_value());
-    ASSERT_TRUE(y.has_value());
-    EXPECT_EQ((*xs)[i].value<double>(), x);
-    EXPECT_EQ((*ys)[i].value<double>(), y);
   }
 }
 

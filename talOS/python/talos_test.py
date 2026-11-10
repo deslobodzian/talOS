@@ -724,6 +724,37 @@ class ParamTest(unittest.TestCase):
             Sim.from_toml(ROBOT_TOML).add(reading("cameras", ["a", 1.0]),
                                           "vision")
 
+    def test_param_of_reads_another_subsystem_only_in_init(self):
+        seen = {}
+
+        class Reader:
+            def __init__(self, node):
+                self.node = node
+                seen["gain"] = node.param_of("follower", "gain")
+                seen["offsets_m"] = node.param_of("vision", "offsets_m")
+                seen["absent"] = node.param_of("follower", "absent", 7.5)
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        reader = sim.add(Reader, "planner")
+        self.assertEqual(seen, {"gain": 2.0, "offsets_m": [0.5, 1.0, -2.25],
+                                "absent": 7.5})
+        with self.assertRaises(talos.TalosError):
+            reader.node.param_of("follower", "gain")
+
+        def reading(subsystem, key, *default):
+            class Reader:
+                def __init__(self, node):
+                    node.param_of(subsystem, key, *default)
+            return Reader
+
+        for subsystem, key, default in (("follower", "absent", ()),
+                                         ("absent", "gain", (1.0,)),
+                                         ("follower", "mode", (0.0,))):
+            with self.subTest(subsystem=subsystem, key=key):
+                with self.assertRaises(talos.TalosError):
+                    Sim.from_toml(ROBOT_TOML).add(
+                        reading(subsystem, key, *default), "planner")
+
 
 class MessageTest(unittest.TestCase):
     def test_forwarding_checks_schema_and_payload_in_every_send_path(self):

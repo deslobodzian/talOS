@@ -179,7 +179,7 @@ def timed(estimator_class):
 def production_config(directory, backend):
     """Copies the production robot config into `directory` with the
     pose_estimator backend replaced; returns (robot.toml, pose_estimator
-    settings, drivetrain period_us)."""
+    settings, drivetrain settings)."""
     source = runfiles.Create().Rlocation(CONFIG)
     shutil.copytree(os.path.dirname(source), directory, dirs_exist_ok=True)
     subsystems = os.path.join(directory, "subsystems")
@@ -195,20 +195,19 @@ def production_config(directory, backend):
         f.write(text)
     settings = tomllib.loads(text)["subsystem"]
     with open(os.path.join(subsystems, "drivetrain.toml"), "rb") as f:
-        drivetrain_period_us = tomllib.load(f)["subsystem"]["period_us"]
-    return os.path.join(directory, "robot.toml"), settings, drivetrain_period_us
+        drivetrain = tomllib.load(f)
+    return os.path.join(directory, "robot.toml"), settings, drivetrain
 
 
 def run(backend, seconds, estimator_class):
     """Runs one backend; returns (steady ticks, warm-up ticks, workload)."""
     with tempfile.TemporaryDirectory(prefix="pose_benchmark_") as directory:
-        config, settings, drivetrain_period_us = production_config(
-            directory, backend)
-        return _run(Sim(config), settings, drivetrain_period_us, seconds,
-                    backend, estimator_class)
+        config, settings, drivetrain = production_config(directory, backend)
+        return _run(Sim(config), settings, drivetrain, seconds, backend,
+                    estimator_class)
 
 
-def _run(sim, settings, drivetrain_period_us, seconds, backend,
+def _run(sim, settings, drivetrain_settings, seconds, backend,
          estimator_class):
     node = sim.add(timed(estimator_class), "pose_estimator")
     talos._freeze_construction()  # what talos.run does once the node is built
@@ -223,7 +222,9 @@ def _run(sim, settings, drivetrain_period_us, seconds, backend,
     path = Path(settings.get("initial_x_m", 0.0), settings.get("initial_y_m", 0.0),
                 settings.get("initial_yaw_rad", 0.0), settings["field_length_m"],
                 settings["field_width_m"])
-    modules = list(zip(settings["module_x_m"], settings["module_y_m"]))
+    modules = [(m["x_m"], m["y_m"])
+               for m in drivetrain_settings["geometry"]["modules"]]
+    drivetrain_period_us = drivetrain_settings["subsystem"]["period_us"]
     drivetrain = Drivetrain(sim, path, modules, rng)
     period_s = settings["period_us"] / 1e6
     lag_s = settings["max_observation_age_us"] / 1e6

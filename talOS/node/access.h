@@ -130,29 +130,39 @@ struct NodeAccess {
   // The session output directory (parent of --log), or nullopt without --log.
   static std::optional<std::filesystem::path> session_dir(const Node& node);
 
-  // A parameter of this node's subsystem table, or nullopt when absent. A
+  // A parameter of this node's subsystem table, or, with `subsystem`, of
+  // that subsystem's table (Node::param_of: constructor only, and a
+  // subsystem the config lacks throws). nullopt when the key is absent. A
   // present key of another type throws, naming it.
-  static std::optional<bool> find_bool(const Node& node, std::string_view key);
+  using ParamTable = std::optional<std::string_view>;
+  static std::optional<bool> find_bool(const Node& node, std::string_view key,
+                                       ParamTable subsystem = {});
   static std::optional<std::int64_t> find_int(const Node& node,
-                                              std::string_view key);
+                                              std::string_view key,
+                                              ParamTable subsystem = {});
   static std::optional<double> find_double(const Node& node,
-                                           std::string_view key);
+                                           std::string_view key,
+                                           ParamTable subsystem = {});
   static std::optional<std::string> find_string(const Node& node,
-                                                std::string_view key);
+                                                std::string_view key,
+                                                ParamTable subsystem = {});
   // A TOML array: of strings, or of numbers (integers convert). An empty
   // array is valid. A non-array, or an element of another type, throws
   // naming the element's index and type.
   static std::optional<std::vector<std::string>> find_string_list(
-      const Node& node, std::string_view key);
+      const Node& node, std::string_view key, ParamTable subsystem = {});
   static std::optional<std::vector<double>> find_double_list(
-      const Node& node, std::string_view key);
+      const Node& node, std::string_view key, ParamTable subsystem = {});
   // Whatever type the key has (bool, integer, float, string, or an array of
   // strings or of numbers; an empty array is an empty double list).
   static std::optional<ParamValue> find_param(const Node& node,
-                                              std::string_view key);
-  // Throws std::invalid_argument naming the node, the key and the problem.
+                                              std::string_view key,
+                                              ParamTable subsystem = {});
+  // Throws std::invalid_argument naming the node, the key, the problem and
+  // the subsystem table read.
   [[noreturn]] static void param_error(const Node& node, std::string_view key,
-                                       std::string_view problem);
+                                       std::string_view problem,
+                                       ParamTable subsystem = {});
 
   // `schema` is the topic's identity (talOS/schema/identity.h): what the
   // segment checks at attach, describe reports and the log records.
