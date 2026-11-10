@@ -61,7 +61,12 @@ loop thread under `SCHED_FIFO` priority 50 with its memory locked (`mlockall`)
 on Linux, or under the Mach time-constraint policy for its period on macOS
 (which has no working `mlockall`); the bridge's loop runs at priority 60. When
 the OS refuses (no privilege, a memlock limit) the node prints one line to
-stderr and runs anyway. `TALOS_REALTIME=0` in the environment turns this off.
+stderr and runs anyway. `TALOS_REALTIME=0` in the environment turns this off;
+`TALOS_REALTIME=1` turns it on under `--sim` as well, so a host without a
+RoboRIO runs the actuated control path, its nodes and bridge under the
+production policy, against a simulated gateway (which itself never runs
+realtime) (`talOS/process` `RealtimeRequested`). Nodes and the bridge
+inherit the variable from the launcher.
 
 ### Stopping
 

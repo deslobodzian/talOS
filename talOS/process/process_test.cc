@@ -81,6 +81,21 @@ TEST(ProcessTest, RealtimeDisabledByEnvironmentChangesNothing) {
   EXPECT_FALSE(outcome.realtime);
 }
 
+// Simulation alone does not decide: TALOS_REALTIME=1 qualifies a --sim run
+// under the production policy, and =0 keeps even the robot unprivileged.
+TEST(ProcessTest, RealtimeRequestFollowsSimulationUnlessTheEnvironmentSays) {
+  ::unsetenv("TALOS_REALTIME");
+  EXPECT_TRUE(RealtimeRequested(false));
+  EXPECT_FALSE(RealtimeRequested(true));
+  ::setenv("TALOS_REALTIME", "1", 1);
+  EXPECT_TRUE(RealtimeRequested(true));
+  EXPECT_TRUE(RealtimeRequested(false));
+  ::setenv("TALOS_REALTIME", "0", 1);
+  EXPECT_FALSE(RealtimeRequested(false));
+  EXPECT_FALSE(RealtimeRequested(true));
+  ::unsetenv("TALOS_REALTIME");
+}
+
 // Report success only when the OS actually applied the realtime policy.
 TEST(ProcessTest, RealtimeIsBestEffort) {
   ::unsetenv("TALOS_REALTIME");

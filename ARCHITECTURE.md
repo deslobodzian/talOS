@@ -175,7 +175,8 @@ without message callbacks otherwise sleeps; a node with a `subscribe` callback
 or a Driver Station listener, or with no timer, also drains every 1 ms.
 Off-simulation the loop thread runs under `SCHED_FIFO` (Linux) or the Mach
 time-constraint policy (macOS) with memory locked, best effort
-(`talOS/process`).
+(`talOS/process`; `TALOS_REALTIME` overrides it, see the node development
+guide's realtime scheduling paragraph).
 
 Messages become visible when the consumer drains its topics, but `age()` and
 `fresh()` count from the writer's publication timestamp. Draining an expired

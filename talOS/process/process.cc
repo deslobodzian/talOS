@@ -104,6 +104,13 @@ void SetThreadPolicy(const RealtimeOptions& options, Problems& problems) {
 
 }  // namespace
 
+bool RealtimeRequested(bool simulation) noexcept {
+  const char* setting = std::getenv("TALOS_REALTIME");
+  if (setting != nullptr && std::strcmp(setting, "0") == 0) return false;
+  if (setting != nullptr && std::strcmp(setting, "1") == 0) return true;
+  return !simulation;
+}
+
 bool ConfigureRealtime(const RealtimeOptions& options) noexcept {
   const char* setting = std::getenv("TALOS_REALTIME");
   if (setting != nullptr && std::strcmp(setting, "0") == 0) return false;

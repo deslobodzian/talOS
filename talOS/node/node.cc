@@ -1193,7 +1193,7 @@ int RunMain(int argc, char** argv, const char* node_name,
     }};
     // Last, from this thread: the reporter and the stopper above are
     // bookkeeping and must not inherit the loop's realtime policy.
-    if (!flags.simulation) {
+    if (process::RealtimeRequested(flags.simulation)) {
       process::ConfigureRealtime(
           {.period = hosted->node->period(), .priority = 50});
     }

@@ -115,6 +115,12 @@ bazel run //talOS/launcher -- \
   --sim-gateway-arg --wheel-radius-error --sim-gateway-arg 0.1
 ```
 
+A `--sim` session runs its nodes and the bridge without
+[realtime scheduling](../../docs/NODE_DEVELOPMENT_GUIDE.md#realtime-scheduling)
+unless the launcher's environment sets `TALOS_REALTIME=1`, which every child
+inherits: then the simulated gateway, commissioned in memory under `--sim`,
+is driven under the robot's scheduling policy.
+
 
 ## Studio bridge
 

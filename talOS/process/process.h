@@ -38,6 +38,14 @@ struct RealtimeOptions {
   int priority = 50;  // SCHED_FIFO priority on Linux, 1..99
 };
 
+// Whether a node binary (talos::Run, the hardware bridge) asks for realtime
+// scheduling of its loop thread. By default it does on the robot and not
+// under --sim. TALOS_REALTIME=1 asks under --sim as well, so a host without a
+// RoboRIO runs the control path against a simulated (in-memory commissioned)
+// gateway under the production scheduling policy; TALOS_REALTIME=0 never
+// asks. Nodes inherit the variable from the launcher's environment.
+bool RealtimeRequested(bool simulation) noexcept;
+
 // Best effort, for the calling thread: mlockall(MCL_CURRENT|MCL_FUTURE) (Linux
 // only; macOS has no working mlockall) plus
 // SCHED_FIFO at `priority` (Linux) or THREAD_TIME_CONSTRAINT_POLICY derived

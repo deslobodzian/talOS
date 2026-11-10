@@ -656,8 +656,8 @@ int HardwareNode::Run(int duration_s) {
   // The 1 kHz merge runs above the nodes (priority 50) so a busy node cannot
   // delay the command the RoboRIO is waiting for. Best effort: a refusal is
   // reported once and the bridge runs unprivileged. Simulation stays an
-  // ordinary process.
-  if (!simulation_) {
+  // ordinary process unless TALOS_REALTIME=1 asks otherwise.
+  if (talos::process::RealtimeRequested(simulation_)) {
     talos::process::ConfigureRealtime(
         {.period = std::chrono::microseconds{kTickPeriodUs}, .priority = 60});
   }
