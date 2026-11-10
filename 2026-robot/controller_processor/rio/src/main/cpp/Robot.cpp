@@ -15,10 +15,9 @@
 #include "PhoenixBackend.h"
 
 #ifndef __FRC_ROBORIO__
-#include <frc/simulation/DriverStationSim.h>
-
 #include <cstdlib>
-#include <string_view>
+
+#include "SimDriverStation.h"
 #endif
 
 namespace {
@@ -63,94 +62,6 @@ uint32_t DriverStationModeFlags() {
   if (frc::DriverStation::IsEStopped()) flags |= ds::kEStop;
   return flags;
 }
-
-#ifndef __FRC_ROBORIO__
-// An automated stand-in for the Driver Station, for tests that run this program
-// headless. It is off unless TALOS_SIM_DS is set, so an interactive
-// `./gradlew simulateNative` behaves like any other WPILib robot: it starts
-// disabled and you enable it and pick Teleoperated in the simulation GUI.
-//
-//   TALOS_SIM_DS=1                        enable in teleop at startup
-//   TALOS_SIM_DS=0                        attach a Driver Station, stay
-//   disabled TALOS_SIM_DS=auto                     stay disabled until the
-//   gateway is
-//                                         configured, then enable in teleop
-//   TALOS_SIM_DS_DISABLE_AFTER_MS=2000    ... then disable two seconds in
-//   TALOS_SIM_RUN_MS=10000                stop after ten seconds and report
-//
-// This exists only in the desktop build. On the RoboRIO the enable state comes
-// from the real Driver Station and nothing here can forge it.
-class SimDriverStation {
- public:
-  explicit SimDriverStation(const talos::hardware::Gateway& gateway)
-      : gateway_(gateway) {
-    const char* requested = std::getenv("TALOS_SIM_DS");
-    if (requested == nullptr) {
-      return;  // Leave the Driver Station to the GUI or to a real one.
-    }
-
-    active_ = true;
-    const std::string_view mode{requested};
-    if (mode == "auto") {
-      // Without a persisted configuration the first push still requires
-      // disabled operation. A restored configuration can start enabled.
-      enabled_ = false;
-      enable_when_configured_ = true;
-    } else {
-      enabled_ = mode != "0";
-    }
-
-    if (const char* after = std::getenv("TALOS_SIM_DS_DISABLE_AFTER_MS")) {
-      disable_after_ = std::chrono::milliseconds{std::atoi(after)};
-    }
-
-    // Teleoperated: neither autonomous nor test. The gateway does not care
-    // which mode it is, only whether the robot is enabled, but the Driver
-    // Station watchdog and any future mode-dependent code do.
-    frc::sim::DriverStationSim::SetAutonomous(false);
-    frc::sim::DriverStationSim::SetTest(false);
-    frc::sim::DriverStationSim::SetDsAttached(true);
-    frc::sim::DriverStationSim::SetJoystickAxisCount(0, 4);
-    frc::sim::DriverStationSim::SetJoystickButtonCount(0, 10);
-    frc::sim::DriverStationSim::SetJoystickPOVCount(0, 1);
-    Publish();
-  }
-
-  void Update() {
-    if (!active_) {
-      return;
-    }
-    if (enable_when_configured_ && !enabled_ && gateway_.configured()) {
-      std::printf("simulated Driver Station: enabling (gateway configured)\n");
-      enabled_ = true;
-      Publish();
-    }
-    if (!enabled_ || !disable_after_) {
-      return;
-    }
-    if (std::chrono::steady_clock::now() - started_ < *disable_after_) {
-      return;
-    }
-    std::printf("simulated Driver Station: disabling\n");
-    enabled_ = false;
-    Publish();
-  }
-
- private:
-  void Publish() const {
-    frc::sim::DriverStationSim::SetEnabled(enabled_);
-    frc::sim::DriverStationSim::NotifyNewData();
-  }
-
-  const talos::hardware::Gateway& gateway_;
-  bool active_{false};
-  bool enabled_{false};
-  bool enable_when_configured_{false};
-  std::optional<std::chrono::milliseconds> disable_after_;
-  std::chrono::steady_clock::time_point started_{
-      std::chrono::steady_clock::now()};
-};
-#endif
 
 }  // namespace
 
@@ -203,7 +114,8 @@ void Robot::StartCompetition() {
   auto next = std::chrono::steady_clock::now();
 
 #ifndef __FRC_ROBORIO__
-  SimDriverStation simulated_driver_station{*gateway_};
+  talos::rio::SimDriverStation simulated_driver_station{
+      talos::rio::SimDriverStation::SettingsFromEnvironment(), next};
 
   // A bounded simulation run, so an automated test does not have to race a
   // kill signal to get a clean summary out.
@@ -229,7 +141,8 @@ void Robot::StartCompetition() {
     next += period;
 
 #ifndef __FRC_ROBORIO__
-    simulated_driver_station.Update();
+    simulated_driver_station.Update(std::chrono::steady_clock::now(),
+                                    gateway_->configured());
     if (stop_at && std::chrono::steady_clock::now() >= *stop_at) {
       break;
     }

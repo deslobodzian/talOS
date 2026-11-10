@@ -8,6 +8,8 @@
 #
 #   ./sim.sh                 WPILib GUI simulation + node graph + Studio
 #   ./sim.sh --headless      no sim GUI; teleop enabled via TALOS_SIM_DS
+#   ./sim.sh --headless --mode-schedule teleop:60,auto:20,disabled:5
+#                            no sim GUI; scripted Driver Station modes
 #   ./sim.sh --no-rio        use an existing controller (no WPILib, no gateway)
 #   ./sim.sh --sim-gateway   lightweight physics simulator instead of WPILib
 #   ./sim.sh --no-studio     robot only, no bridge and no browser
@@ -27,6 +29,7 @@ WANT_RIO=1
 WANT_GATEWAY=0
 WANT_OPEN=1
 DURATION=""
+MODE_SCHEDULE=""
 GATEWAY_ARGS=()
 # HTTP port only: the telemetry topic lives in the robot config
 # ([subsystems.telemetry] topic), read by the nodes that own each end, so this
@@ -42,6 +45,11 @@ usage() {
 
 Options:
   --headless        run the WPILib sim without its GUI (sets TALOS_SIM_DS=auto)
+  --mode-schedule S script the Driver Station as mode:seconds phases
+                    (disabled, auto, teleop, test; the last is held). With
+                    --headless it sets TALOS_SIM_DS_SCHEDULE, counted from the
+                    gateway's configuration; with --sim-gateway it is that
+                    simulator's --mode-schedule, counted from its start
   --no-studio       skip the Studio bridge and the browser
   --no-rio          use an existing controller (skip WPILib sim and gateway)
   --sim-gateway     start the lightweight physics simulator instead of WPILib
@@ -68,6 +76,11 @@ while [ $# -gt 0 ]; do
       ;;
     --no-open)     WANT_OPEN=0 ;;
     --duration-s)  DURATION="$2"; shift ;;
+    --mode-schedule)
+      [ $# -ge 2 ] || { echo "sim.sh: --mode-schedule needs an argument" >&2; exit 2; }
+      MODE_SCHEDULE="$2"
+      shift
+      ;;
     --http-port)   HTTP_PORT="$2"; shift ;;
     -h|--help)     usage; exit 0 ;;
     *) echo "sim.sh: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
@@ -77,6 +90,16 @@ done
 if [ "${#GATEWAY_ARGS[@]}" -gt 0 ] && [ "$WANT_GATEWAY" != "1" ]; then
   echo "sim.sh: --gateway-arg requires --sim-gateway" >&2
   exit 2
+fi
+if [ -n "$MODE_SCHEDULE" ]; then
+  if [ "$WANT_GATEWAY" = "1" ]; then
+    GATEWAY_ARGS+=(--sim-gateway-arg --mode-schedule --sim-gateway-arg "$MODE_SCHEDULE")
+  elif [ "$WANT_RIO" != "1" ] || [ "$HEADLESS" != "1" ]; then
+    # With the GUI, its Robot State window is the Driver Station; with --no-rio
+    # the existing controller's Driver Station is.
+    echo "sim.sh: --mode-schedule requires --headless or --sim-gateway" >&2
+    exit 2
+  fi
 fi
 
 # Three explicit controller modes (never combine WPILib + gateway: two
@@ -152,7 +175,11 @@ if [ "$WANT_RIO" = "1" ]; then
   GRADLE_ARGS=(simulateNative --no-daemon)
   [ "$HEADLESS" = "1" ] && GRADLE_ARGS+=(-Pheadless)
   say "starting WPILib simulation (log: $LOG_DIR/rio.log)"
-  if [ "$HEADLESS" = "1" ]; then
+  if [ "$HEADLESS" = "1" ] && [ -n "$MODE_SCHEDULE" ]; then
+    say "  headless: Driver Station schedule $MODE_SCHEDULE (from configuration)"
+    ( cd "$RIO_DIR" && TALOS_SIM_DS_SCHEDULE="$MODE_SCHEDULE" ./gradlew "${GRADLE_ARGS[@]}" ) \
+      > "$LOG_DIR/rio.log" 2>&1 &
+  elif [ "$HEADLESS" = "1" ]; then
     say "  headless: enabling teleop through TALOS_SIM_DS=auto (once configured)"
     ( cd "$RIO_DIR" && TALOS_SIM_DS=auto ./gradlew "${GRADLE_ARGS[@]}" ) \
       > "$LOG_DIR/rio.log" 2>&1 &

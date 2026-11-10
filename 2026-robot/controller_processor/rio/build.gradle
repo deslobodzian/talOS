@@ -45,8 +45,8 @@ wpi.cpp.debugSimulation = false
 // The simulation GUI is the only way to enable the robot and choose Teleoperated
 // when no real Driver Station is attached, so an interactive `simulateNative`
 // gets it. Automated runs pass -Pheadless and drive the Driver Station through
-// the TALOS_SIM_DS environment variables instead; see
-// 2026-robot/main_processor/drivetrain/README.md.
+// the TALOS_SIM_DS* environment variables instead; see
+// src/main/include/SimDriverStation.h.
 if (!project.hasProperty("headless")) {
     wpi.sim.addGui().defaultEnabled = true
 }
