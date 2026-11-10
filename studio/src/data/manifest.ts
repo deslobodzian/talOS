@@ -18,6 +18,9 @@ export type ManifestNode = {
   restart_count: number;
   recorder_failed: boolean;
   described: boolean;
+  // A run's live endpoints differed from its --describe probe (the launcher
+  // README's "Live endpoints").
+  endpoint_mismatch: boolean;
   record_count: string;
 };
 
@@ -149,6 +152,7 @@ function parseNode(value: unknown, where: string): ManifestNode {
     restart_count: integer(source, 'restart_count'),
     recorder_failed: flag(source, 'recorder_failed'),
     described: flag(source, 'described'),
+    endpoint_mismatch: flag(source, 'endpoint_mismatch'),
     record_count: countString(source, 'record_count')
   };
 }

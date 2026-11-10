@@ -19,6 +19,7 @@ const node = (overrides: Partial<ManifestNode> = {}): ManifestNode => ({
   restart_count: 0,
   recorder_failed: false,
   described: true,
+  endpoint_mismatch: false,
   record_count: '0',
   ...overrides
 });
@@ -91,6 +92,7 @@ test('parseManifest accepts string uint64 and missing optional flags', () => {
   // Absent optional booleans read as false, not an error.
   assert.equal(m.nodes[0].recorder_failed, false);
   assert.equal(m.nodes[0].described, false);
+  assert.equal(m.nodes[0].endpoint_mismatch, false);
   // A manifest from before exit_signal existed reads as no signal death.
   assert.equal(m.nodes[0].exit_signal, 0);
 });

@@ -27,6 +27,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -244,7 +245,8 @@ inline double ExpectedLogRate(const introspect::Description& declared,
   double per_tick = sizeof(event::log::RecordHeader);
   for (const auto& source : declared.sources) {
     if (source.schema_hash == schema::BytesHash()) continue;
-    per_tick += sizeof(event::log::RecordHeader) + source.message_bytes;
+    per_tick += static_cast<double>(sizeof(event::log::RecordHeader) +
+                                    source.message_bytes);
   }
   return per_tick * 1e6 / static_cast<double>(std::max<int64_t>(period_us, 1));
 }
@@ -331,6 +333,10 @@ struct NodeProcessInfo {
   // Whether this binary answered --describe: a session whose graph was never
   // checked otherwise reads exactly like one whose graph passed.
   bool described{false};
+  // A run's live endpoints, once its registry row published them, differed
+  // from what its --describe probe declared (EndpointMismatch): that run ran
+  // under a graph the lint never checked. Never cleared by a later run.
+  bool endpoint_mismatch{false};
 };
 
 struct SessionManifest {
@@ -383,6 +389,8 @@ struct SessionManifest {
          << ",\n";
       ss << "      \"described\": " << (n.described ? "true" : "false")
          << ",\n";
+      ss << "      \"endpoint_mismatch\": "
+         << (n.endpoint_mismatch ? "true" : "false") << ",\n";
       ss << "      \"record_count\": " << n.record_count << "\n";
       ss << "    }" << (i + 1 < nodes.size() ? "," : "") << "\n";
     }
@@ -1439,7 +1447,7 @@ class ChildExitWakeup {
       }
     }
     if (pipe_[0] < 0) return;  // Wait() then sleeps, as a poll would.
-    struct sigaction action{};
+    struct sigaction action {};
     action.sa_handler = &ChildExitWakeup::OnSignal;
     sigemptyset(&action.sa_mask);
     action.sa_flags = SA_RESTART | SA_NOCLDSTOP;
@@ -1475,7 +1483,7 @@ class ChildExitWakeup {
   }
 
   static inline int pipe_[2]{-1, -1};
-  struct sigaction previous_{};
+  struct sigaction previous_ {};
   bool installed_{false};
 };
 
@@ -1889,6 +1897,69 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
   diagnostics.insert(diagnostics.end(), probe_findings.begin(),
                      probe_findings.end());
   return diagnostics;
+}
+
+// How a run's live endpoints differ from what its --describe probe declared,
+// or empty when they agree. An endpoint is a topic end: its kind (SENDER,
+// WATCHER, ...), topic, message size, alignment and the graph lint's
+// attributes (external, optional, observer). Timers are not endpoints, and
+// kSourceFlagLatestOnly is the loop's delivery detail, which no probe
+// reports. The schema is not compared because the registry does not carry
+// it: a declared topic's session segment was created with its declared
+// schema, so a live end with another one already failed at attach, and an
+// undeclared topic differs here by name. Ends are compared as multisets.
+// `live_complete` is false when the registry row held only part of the
+// node's sources (kMaxSourcesPerNode): only live-only ends are reported then.
+inline std::string EndpointMismatch(
+    const std::vector<naming::SourceShape>& declared,
+    const std::vector<naming::SourceShape>& live, bool live_complete = true) {
+  using Key =
+      std::tuple<std::string, int, std::uint32_t, std::uint32_t, std::uint32_t>;
+  constexpr std::uint32_t kLinted = naming::kSourceFlagExternal |
+                                    naming::kSourceFlagOptional |
+                                    naming::kSourceFlagObserver;
+  const auto keys = [](const std::vector<naming::SourceShape>& sources) {
+    std::vector<Key> out;
+    for (const auto& source : sources) {
+      if (source.kind == event::SourceKind::TIMER) continue;
+      out.emplace_back(source.name, static_cast<int>(source.kind),
+                       source.message_bytes, source.alignment,
+                       source.flags & kLinted);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+  const auto text = [](const std::vector<Key>& ends) {
+    std::string out;
+    for (const auto& [name, kind, bytes, alignment, flags] : ends) {
+      if (!out.empty()) out += ", ";
+      out += event::to_string(static_cast<event::SourceKind>(kind));
+      out += " " + name + " (" + std::to_string(bytes) + " B, align " +
+             std::to_string(alignment);
+      if ((flags & naming::kSourceFlagExternal) != 0) out += ", external";
+      if ((flags & naming::kSourceFlagOptional) != 0) out += ", optional";
+      if ((flags & naming::kSourceFlagObserver) != 0) out += ", observer";
+      out += ")";
+    }
+    return out;
+  };
+  const auto described = keys(declared);
+  const auto running = keys(live);
+  std::vector<Key> live_only;
+  std::vector<Key> described_only;
+  std::set_difference(running.begin(), running.end(), described.begin(),
+                      described.end(), std::back_inserter(live_only));
+  if (live_complete) {
+    std::set_difference(described.begin(), described.end(), running.begin(),
+                        running.end(), std::back_inserter(described_only));
+  }
+  std::string out;
+  if (!live_only.empty()) out = "live only: " + text(live_only);
+  if (!described_only.empty()) {
+    out += (out.empty() ? "" : "; ") + std::string{"described only: "} +
+           text(described_only);
+  }
+  return out;
 }
 
 // Distinct topics in a declared graph. Timers are not topics.
@@ -2587,6 +2658,8 @@ class Launcher {
     for (std::size_t i = 0; i < procs.size(); ++i) {
       if (studio && i == studio->index()) continue;
       launches[i].critical = node_specs[i].critical;
+      launches[i].compare_endpoints = described[i].answered;
+      launches[i].declared = described[i].declared.sources;
       auto& proc = procs[i];
       auto period_us =
           robot_config.toml_data["subsystems"][proc.name]["period_us"]
@@ -2678,6 +2751,7 @@ class Launcher {
       }
       if (proc.exit_code != 0) exit_status = proc.exit_code;
     }
+    if (endpoints_refused_) exit_status = 1;
     manifest.nodes = std::move(procs);
 
     session_manifest_ = manifest;
@@ -2940,6 +3014,14 @@ class Launcher {
     uint64_t last_dispatch{0};
     // Event log flags of its registry rows already reported (NoteRecording).
     uint32_t recording_reported{0};
+    // The member answered --describe: its runs' live endpoints are compared
+    // with `declared` (CheckEndpoints), once per run, after the run's row
+    // has published them; `endpoints_checked` says this run's was.
+    bool compare_endpoints{false};
+    bool endpoints_checked{false};
+    std::vector<naming::SourceShape> declared;
+    // A non-critical member killed for a mismatch: never restarted.
+    bool endpoints_stopped{false};
   };
 
   static int64_t WallNanos() {
@@ -3029,6 +3111,12 @@ class Launcher {
       error = std::string{"fork: "} + std::strerror(EAGAIN);
       return -1;
     }
+    // Run starts the drain before the first spawn; without one there is
+    // nowhere to send the member's output.
+    if (!output_) {
+      error = "no output drain";
+      return -1;
+    }
     return SpawnDrained(launch.args, error, *output_,
                         NodeOutputPath(options_.output_dir, proc.name),
                         proc.name, /*echo=*/true);
@@ -3114,7 +3202,8 @@ class Launcher {
       std::error_code error;
       if (!std::filesystem::remove(files[i].path, error) || error) continue;
       used -= files[i].bytes;
-      std::ofstream{event::log::CappedMarkerPath(files[i].run)};
+      // Creating the marker is the point; the stream closes at once.
+      const std::ofstream marker{event::log::CappedMarkerPath(files[i].run)};
       proc.log_capped = true;
     }
     // 0 means unbounded to the writer, so never less than 1.
@@ -3156,6 +3245,7 @@ class Launcher {
     launch.last_heartbeat = 0;
     launch.last_dispatch = 0;
     launch.heartbeat_killed = false;
+    launch.endpoints_checked = false;
   }
 
   // A run's registry row says its event log stopped early
@@ -3184,6 +3274,77 @@ class Launcher {
       std::cerr << "[launcher] " << proc.name << " event log " << log
                 << " reached its byte budget; the rest of this run is not "
                    "recorded\n";
+    }
+    return true;
+  }
+
+  // The topic ends a registry row published, or nullopt while it has
+  // published none: a row is visible from its claim, and a writer that never
+  // sets kFlagConstructing (the hardware bridge, the simulation gateway)
+  // publishes its sources just after. Sources are written once per claim,
+  // before the count (NodeRegistration::publish), so the acquire below sees
+  // them whole. `complete` is false when the row could not hold them all.
+  static std::optional<std::vector<naming::SourceShape>> PublishedEndpoints(
+      const introspect::NodeRecord& record, bool& complete) {
+    const uint32_t count = record.source_count.load(std::memory_order_acquire);
+    if (count == 0) return std::nullopt;
+    const auto held = std::min<uint32_t>(
+        count, static_cast<uint32_t>(introspect::kMaxSourcesPerNode));
+    complete =
+        record.declared_source_count.load(std::memory_order_relaxed) <= held;
+    std::vector<naming::SourceShape> out;
+    out.reserve(held);
+    for (uint32_t s = 0; s < held; ++s) {
+      const introspect::SourceRecord& source = record.sources[s];
+      naming::SourceShape& shape = out.emplace_back();
+      shape.kind = static_cast<event::SourceKind>(source.kind);
+      shape.name =
+          introspect::read_name(source.name, introspect::kMaxNameBytes);
+      shape.message_bytes = source.message_bytes;
+      shape.alignment = source.alignment;
+      shape.flags = source.flags;
+    }
+    return out;
+  }
+
+  // Compares a run's published endpoints with its member's probe. The graph
+  // lint checked only what the probe declared (Node::describing() must not
+  // change a node's endpoints), so a run that differs runs a graph nobody
+  // checked: a second writer, a reader of a topic nobody writes. Always
+  // reported on stderr and as the member's endpoint_mismatch. Without
+  // --allow-graph-errors it is then refused as the critical/non-critical
+  // split already treats a failure (README "Live endpoints"): a non-critical
+  // member is killed and not restarted, and the session runs on; a critical
+  // member's first run stops the session, as the lint refuses to start one;
+  // a critical member's restart, in a session that may be driving, is only
+  // reported, since the launcher cannot tell whether the robot is enabled.
+  // Returns whether `proc` changed.
+  bool CheckEndpoints(NodeProcessInfo& proc, NodeLaunch& launch,
+                      const std::vector<naming::SourceShape>& live,
+                      bool complete) {
+    const std::string mismatch =
+        EndpointMismatch(launch.declared, live, complete);
+    if (mismatch.empty()) return false;
+    proc.endpoint_mismatch = true;
+    std::cerr << "[launcher] error: " << proc.name << " (pid " << proc.pid
+              << "): live endpoints differ from its --describe probe, the "
+                 "graph the lint checked: "
+              << mismatch << "; ";
+    if (options_.allow_graph_errors) {
+      std::cerr << "running anyway (--allow-graph-errors)\n";
+    } else if (!launch.critical) {
+      launch.endpoints_stopped = true;
+      launch.heartbeat_killed = true;
+      SignalProcessGroup(proc.pid, SIGKILL);
+      std::cerr << "non-critical: killing it, without restarts this "
+                   "session\n";
+    } else if (proc.restart_count == 0) {
+      endpoints_refused_ = true;
+      std::cerr << "stopping the session. A node must declare the same "
+                   "endpoints whether or not Node::describing(); pass "
+                   "--allow-graph-errors to run anyway.\n";
+    } else {
+      std::cerr << "a critical member's restart: the session keeps running\n";
     }
     return true;
   }
@@ -3237,7 +3398,7 @@ class Launcher {
       // be reaped in this pass. Restart decisions read the flag again, so
       // once shutdown starts nothing is restarted.
       const auto stop_arrived = [&] {
-        return stopping || stop_requested_ != 0;
+        return stopping || stop_requested_ != 0 || endpoints_refused_;
       };
       // A pass posts at most one manifest version, after its restarts (see
       // the post below).
@@ -3279,6 +3440,8 @@ class Launcher {
           bool found = false;
           bool constructing = false;
           uint32_t recording = 0;
+          std::optional<std::vector<naming::SourceShape>> live;
+          bool live_complete = true;
           if (registry) {
             for (const auto& record : registry->header()->nodes) {
               if (record.state.load(std::memory_order_acquire) !=
@@ -3294,12 +3457,20 @@ class Launcher {
               const auto dispatch =
                   record.dispatch_count.load(std::memory_order_relaxed);
               const auto flags = record.flags.load(std::memory_order_acquire);
+              // Once per run, from the pass that first sees its row active
+              // with its endpoints published (CheckEndpoints).
+              std::optional<std::vector<naming::SourceShape>> published;
+              if (launch.compare_endpoints && !launch.endpoints_checked &&
+                  (flags & introspect::kFlagConstructing) == 0) {
+                published = PublishedEndpoints(record, live_complete);
+              }
               if (record.generation.load(std::memory_order_acquire) !=
                       generation ||
                   record.state.load(std::memory_order_acquire) !=
                       static_cast<uint64_t>(introspect::SlotState::ACTIVE))
                 continue;
               found = true;
+              live = std::move(published);
               constructing = (flags & introspect::kFlagConstructing) != 0;
               recording = flags;
               if (beat != launch.last_heartbeat &&
@@ -3312,6 +3483,11 @@ class Launcher {
             }
           }
           if (NoteRecording(proc, launch, recording)) manifest_changed = true;
+          if (live) {
+            launch.endpoints_checked = true;
+            if (CheckEndpoints(proc, launch, *live, live_complete))
+              manifest_changed = true;
+          }
           const bool grace_over =
               now - launch.started_at >=
               std::chrono::milliseconds{options_.heartbeat_startup_grace_ms};
@@ -3344,8 +3520,9 @@ class Launcher {
         if (is_bridge && studio->Starting(i)) continue;
         const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
         launch.last_exit_clean = clean;
-        if (!is_bridge && ShouldRestartNode(clean, launch.critical,
-                                            max_restarts_, stop_arrived())) {
+        if (!is_bridge && !launch.endpoints_stopped &&
+            ShouldRestartNode(clean, launch.critical, max_restarts_,
+                              stop_arrived())) {
           const auto delay = ScheduleRestart(proc, launch, now);
           std::cout << "[launcher] " << proc.name << " exited ("
                     << ExitReason(status) << "); "
@@ -3418,7 +3595,8 @@ class Launcher {
         return;
       }
 
-      if (!stop_sent && (stop_requested_ != 0 || past_deadline)) {
+      if (!stop_sent &&
+          (stop_requested_ != 0 || past_deadline || endpoints_refused_)) {
         stop_sent = true;
         shutdown_deadline = now + std::chrono::seconds{2};
         std::cout << "[launcher] Stopping children...\n";
@@ -3509,6 +3687,10 @@ class Launcher {
   std::optional<ChildOutput> output_;
   // Held by Run for the session, refreshed by Supervise; null without one.
   const SessionLock* session_lock_{nullptr};
+  // A critical member's first run's live endpoints differed from its probe
+  // and --allow-graph-errors was not given (CheckEndpoints): Supervise stops
+  // the session and Run returns 1.
+  bool endpoints_refused_{false};
   // Far inside macOS clean-tmps' 3 unused days (introspect::TouchLockFile).
   static constexpr std::chrono::hours kSessionLockRefresh{1};
   // Set by the SIGINT/SIGTERM handler, which may run on any thread, and read

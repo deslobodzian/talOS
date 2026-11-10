@@ -196,6 +196,102 @@ LauncherOptions ConstructionOptions(std::string_view tag, int delay_ms) {
   return options;
 }
 
+// alpha is the endpoint drift fixture (testdata/endpoint_drift_node.cc),
+// which publishes /alpha/event only live, and only with `drift` set.
+LauncherOptions EndpointOptions(std::string_view tag, bool drift) {
+  auto options = BaseOptions(tag);
+  options.max_restarts = 0;
+  options.duration_s = 3;
+  auto config = toml::parse_file(options.config_path);
+  config["subsystems"]["alpha"].as_table()->insert_or_assign("drift",
+                                                             drift ? 1 : 0);
+  std::ofstream{options.config_path} << config;
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error)};
+  if (!runfiles) throw std::runtime_error(error);
+  const char* node = std::getenv("TALOS_ENDPOINT_DRIFT_NODE");
+  if (node == nullptr) throw std::runtime_error("missing drift node runfile");
+  options.binary_overrides["//example/alpha:node"] = runfiles->Rlocation(node);
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub(std::string{tag} + "_beta", "exit 0\n");
+  return options;
+}
+
+// How long a finished session ran, from its manifest: from just before its
+// first spawn (after the probes) to its end.
+std::chrono::nanoseconds SessionLength(const std::string& manifest) {
+  const auto field = [&manifest](std::string_view key) -> int64_t {
+    const std::string name = "\"" + std::string{key} + "\": ";
+    const std::size_t at = manifest.find(name);
+    if (at == std::string::npos) return 0;
+    return std::stoll(manifest.substr(at + name.size()));
+  };
+  return std::chrono::nanoseconds{field("end_wall_ns") -
+                                  field("start_wall_ns")};
+}
+
+// A run whose live endpoints differ from its probe's is reported, recorded
+// in the manifest, and stops the session (exit 1) before its 3 s duration;
+// --allow-graph-errors records it and runs the session out.
+TEST(Supervision, LiveEndpointsThatDifferFromTheProbeStopTheSession) {
+  auto options = EndpointOptions("endpoint_drift", true);
+  EXPECT_EQ(RunSession(options), 1);
+  auto manifest = ReadFile(options.output_dir + "/manifest.json");
+  EXPECT_LT(SessionLength(manifest), 3s);
+  auto alpha = ManifestEntry(manifest, "alpha");
+  EXPECT_NE(alpha.find("\"endpoint_mismatch\": true"), std::string::npos)
+      << alpha;
+  std::filesystem::remove_all(options.output_dir);
+
+  auto allowed = EndpointOptions("endpoint_drift_allowed", true);
+  allowed.allow_graph_errors = true;
+  // Not stopped: the session runs out (its exit status is alpha's, which a
+  // slow log sync at shutdown can turn into a SIGKILL under disk load).
+  RunSession(allowed);
+  manifest = ReadFile(allowed.output_dir + "/manifest.json");
+  EXPECT_GE(SessionLength(manifest), 3s);
+  alpha = ManifestEntry(manifest, "alpha");
+  EXPECT_NE(alpha.find("\"endpoint_mismatch\": true"), std::string::npos)
+      << alpha;
+  std::filesystem::remove_all(allowed.output_dir);
+}
+
+// A non-critical member's mismatch costs only that member: it is killed and,
+// though restarts are enabled, not restarted, while the session (beta, which
+// runs until stopped) runs out its 3 s.
+TEST(Supervision, LiveEndpointMismatchStopsOnlyANonCriticalMember) {
+  auto options = EndpointOptions("endpoint_drift_optional", true);
+  MakeAlphaNonCritical(options);
+  options.max_restarts = 5;
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("endpoint_drift_optional_beta", "exec sleep 10\n");
+  RunSession(options);
+  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
+  EXPECT_GE(SessionLength(manifest), 3s);
+  const auto alpha = ManifestEntry(manifest, "alpha");
+  EXPECT_NE(alpha.find("\"endpoint_mismatch\": true"), std::string::npos)
+      << alpha;
+  EXPECT_NE(alpha.find("\"exit_signal\": 9"), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"restart_count\": 0"), std::string::npos) << alpha;
+  std::filesystem::remove_all(options.output_dir);
+}
+
+// The same node without drift: its live ends (a publication and a
+// latest-only subscription, which the loop flags and the probe does not)
+// compare equal to its probe's, and the session runs out undisturbed.
+TEST(Supervision, LiveEndpointsThatMatchTheProbeAreNotReported) {
+  auto options = EndpointOptions("endpoint_match", false);
+  RunSession(options);  // Not stopped: the session runs out (as above).
+  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
+  EXPECT_GE(SessionLength(manifest), 3s);
+  const auto alpha = ManifestEntry(manifest, "alpha");
+  EXPECT_NE(alpha.find("\"endpoint_mismatch\": false"), std::string::npos)
+      << alpha;
+  std::filesystem::remove_all(options.output_dir);
+}
+
 TEST(Supervision, SlowConstructorIsObservableAndBecomesActiveAfterOldGrace) {
   auto options = ConstructionOptions("slow_construction", 6000);
   options.duration_s = 9;
@@ -1217,7 +1313,7 @@ TEST(Supervision, StuckManifestSyncDelaysNoRestartAndSyncsItLater) {
     const int result = ::fsync(fd);
     // The directory is synced after the rename: manifest.json is the
     // version just made durable.
-    struct stat status{};
+    struct stat status {};
     if (::fstat(fd, &status) == 0 && S_ISDIR(status.st_mode)) {
       const std::string text = ReadFile(live_manifest);
       if (ManifestEntry(text, "alpha").find("\"restart_count\": 1,") !=

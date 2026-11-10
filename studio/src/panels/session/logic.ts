@@ -19,7 +19,7 @@ import {rateKey, type DeclaredGraph, type SystemGraph, type SystemNode} from '..
 // person cares about them.
 export type ProcessProblem =
     'dead'|'restarted'|'recorder_failed'|'nonzero_exit'|'killed_by_signal'|
-    'never_registered';
+    'endpoint_mismatch'|'never_registered';
 
 export type ProcessRow = {
   name: string;
@@ -131,6 +131,7 @@ export function mergeProcesses(
     if (m && m.recorder_failed) problems.push('recorder_failed');
     if (m && m.exit_code > 0) problems.push('nonzero_exit');
     if (m && m.exit_signal > 0) problems.push('killed_by_signal');
+    if (m && m.endpoint_mismatch) problems.push('endpoint_mismatch');
     // Declared but never registered is only a claim when there is a registry
     // to compare against; with no live graph it cannot be made (the same rule
     // `declaredStatus` follows).

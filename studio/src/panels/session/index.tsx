@@ -65,6 +65,7 @@ const PROBLEM_META: Record<ProcessProblem, {label: string; cls: string}> = {
   recorder_failed: {label: 'recorder failed', cls: 'recorder'},
   nonzero_exit: {label: 'nonzero exit', cls: 'exit'},
   killed_by_signal: {label: 'killed by signal', cls: 'exit'},
+  endpoint_mismatch: {label: 'endpoint mismatch', cls: 'missing'},
   never_registered: {label: 'never registered', cls: 'missing'}
 };
 

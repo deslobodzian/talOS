@@ -69,7 +69,9 @@ Beside the stack:
 
 Live node identity is registered before user construction, with the
 `kFlagConstructing` lifecycle flag and independent bookkeeping heartbeats.
-Endpoints and active-reader liveness appear only after the event loop starts.
+Endpoints and active-reader liveness appear only after the event loop starts;
+the launcher then compares each run's endpoints with its `--describe` probe
+once ([live endpoints](talOS/launcher/README.md#live-endpoints)).
 The launcher enforces a fixed 30-second construction deadline from spawn;
 processes with no registry row retain the ordinary 5-second startup grace.
 Neither initializing nor failed optional nodes block control peers.

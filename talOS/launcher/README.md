@@ -32,14 +32,16 @@ from a name. Naming and graph violations still refuse startup.
 
 **Phase two starts.** Only then does the launcher fork the roster and supervise
 it. It persists the session manifest before spawning and atomically replaces it
-as nodes start, restart or exit, or report a stopped event log; normal shutdown
-adds final log counts.
+as nodes start, restart or exit, report a stopped event log, or run endpoints
+that differ from their probe's ([live endpoints](#live-endpoints)); normal
+shutdown adds final log counts.
 
 `--describe-only` stops after phase one, which makes the check useful on its own
 — in CI, in a pit before a match, or after a rename that touched two packages.
 
-`--allow-graph-errors` overrides graph-error refusal. Missing descriptions
-cannot create segments for undeclared topics.
+`--allow-graph-errors` overrides graph-error refusal, and the refusal of a
+[live endpoint mismatch](#live-endpoints). Missing descriptions cannot create
+segments for undeclared topics.
 
 ## One session per namespace
 
@@ -83,6 +85,51 @@ until the describe deadline; past it the finding names that last cause and the
 attempts made, and a probe that spawns only after a retry prints `[launcher]
 probe of <binary> spawned on attempt N (after <step>: <errno>)`. Any other spawn failure is reported at once. Missing
 descriptions remain recorded in `graph.json` and the session manifest.
+
+## Live endpoints
+
+The lint checks the graph the probes declared, so a node must declare the same
+endpoints whether or not `Node::describing()`
+([node development guide](../../docs/NODE_DEVELOPMENT_GUIDE.md)). The launcher
+checks that each run did. Once per run of every member that answered
+`--describe`, in the first supervision pass that finds the run's registry row
+active with its sources published, it compares the row's topic ends with the
+probe's: kind, topic, message size, alignment and the `external`, `optional`
+and `observer` attributes, as multisets. Timers are not endpoints, and the
+loop's latest-only flag is not declared by a probe. The schema hash is not in
+the registry; it needs no comparison, because every declared topic's
+session-owned segment was created with its declared schema and an end with
+another one fails at attach, while an undeclared topic differs by name. A row
+publishes its sources once per claim, before it clears `kFlagConstructing`
+(or, for the hardware bridge and the simulation gateway, which never set it,
+before any source shows), so the comparison never sees a half-written table;
+a run that registers no source at all is not compared.
+
+A difference is one error line naming the member, its pid and each end only
+the live run or only the probe holds:
+
+    [launcher] error: alpha (pid 4242): live endpoints differ from its --describe probe, the graph the lint checked: live only: SENDER /alpha/event (8 B, align 8); stopping the session. ...
+
+and marks the member `endpoint_mismatch` in the live manifest (Studio's
+session panel shows *endpoint mismatch*). The run's graph was never checked
+(a second writer of a topic, a reader nothing writes), so it is then refused
+the way the critical split already treats a failed probe
+([two phases](#two-phases)) and a crash ([restarts](#restarts)):
+
+- A non-critical member is killed (SIGKILL to its group) and not restarted
+  for the rest of the session, which runs on without it, as it would after
+  that member's failed probe. A session that may be driving never stops for
+  an observation-only node.
+- A critical member's first run stops the session, as a lint error refuses to
+  start one: every member gets SIGINT, as on a requested stop, no restart is
+  scheduled, and the launcher exits 1. A first run activates while the
+  session starts.
+- A critical member's restart that differs is only reported: the session may
+  be driving, the launcher does not read the Driver Station to know, and
+  stopping it or that member would take the robot down mid-match.
+
+`--allow-graph-errors` keeps every member running with the mismatch reported
+and recorded.
 
 ## Controller addressing
 
@@ -436,10 +483,11 @@ both spellings behave the same.
 `DIR/<session_id>/`, including deployed `TALOS_LOG_DIR` roots. Without the flag,
 the root is `/tmp/talos_logs`. Use persistent storage on a deployed robot.
 `manifest.json` is written before nodes start, then replaced atomically
-(written beside it, then renamed over it) at each process lifecycle change and
-when a node reports a stopped event log: a reader always sees one complete
-version. `graph.json`, `declared_graph.json` and every manifest version from
-the roster about to start on are synced (`talos::process::DurableSync`, file
+(written beside it, then renamed over it) at each process lifecycle change,
+when a node reports a stopped event log and when a run's endpoints differ from
+its probe: a reader always sees one complete version. `graph.json`,
+`declared_graph.json` and every manifest version from the roster about to
+start on are synced (`talos::process::DurableSync`, file
 then directory: `fsync`, and on macOS `F_FULLFSYNC`, which also flushes the
 drive's write cache), so a power loss mid-match keeps the last lifecycle
 change whose sync finished. The supervision loop never touches the disk for

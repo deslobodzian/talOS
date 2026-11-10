@@ -156,6 +156,17 @@ talos_cc_node(
     visibility = ["//visibility:private"],
 )
 
+# Run as `alpha`: publishes an endpoint its --describe probe did not declare
+# when its config sets `drift = 1` (supervision_test's endpoint check).
+talos_cc_node(
+    name = "endpoint_drift",
+    srcs = ["testdata/endpoint_drift_node.cc"],
+    node_name = "alpha",
+    node_target = "//example/alpha:node",
+    visibility = ["//visibility:private"],
+    deps = [":continuity_message"],
+)
+
 cc_test(
     name = "supervision_test",
     size = "medium",
@@ -164,8 +175,14 @@ cc_test(
     # The Linux sanitizer legs still run this test.
     tags = ["no_macos_sanitizer"],
     srcs = ["supervision_test.cc"],
-    data = [":alpha"],
-    env = {"TALOS_CONSTRUCTION_NODE": "$(rlocationpath :alpha)"},
+    data = [
+        ":alpha",
+        ":endpoint_drift",
+    ],
+    env = {
+        "TALOS_CONSTRUCTION_NODE": "$(rlocationpath :alpha)",
+        "TALOS_ENDPOINT_DRIFT_NODE": "$(rlocationpath :endpoint_drift)",
+    },
     deps = [
         ":launcher_lib",
         "//talOS/introspection:registry",

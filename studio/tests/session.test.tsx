@@ -35,6 +35,7 @@ const mnode = (overrides: Partial<ManifestNode> = {}): ManifestNode => ({
   restart_count: 0,
   recorder_failed: false,
   described: true,
+  endpoint_mismatch: false,
   record_count: '5000',
   ...overrides
 });
@@ -191,14 +192,15 @@ test('mergeProcesses joins manifest and registry by name', () => {
     mnode({name: 'a', pid: 1, exit_code: 3, restart_count: 1,
            record_count: '10'}),
     mnode({name: 'b', pid: 2}),
-    mnode({name: 'd', pid: 4, exit_signal: 9})
+    mnode({name: 'd', pid: 4, exit_signal: 9}),
+    mnode({name: 'e', pid: 5, endpoint_mismatch: true})
   ]);
   const g = graph([
     snode({name: 'a', pid: '1', alive: false}),
     snode({name: 'c', pid: '3'})   // registry-only
   ]);
   const rows = mergeProcesses(m, g, null, {}, false);
-  assert.equal(rows.length, 4);
+  assert.equal(rows.length, 5);
 
   const a = rows.find(r => r.name === 'a')!;
   assert.equal(a.alive, false);
@@ -216,6 +218,10 @@ test('mergeProcesses joins manifest and registry by name', () => {
   assert.equal(d.exitCode, null);
   assert.equal(d.exitSignal, 'signal 9 SIGKILL');
   assert.deepEqual(d.problems, ['killed_by_signal']);
+
+  // A run whose live endpoints differed from its probe is marked.
+  assert.deepEqual(rows.find(r => r.name === 'e')!.problems,
+                   ['endpoint_mismatch']);
 
   const c = rows.find(r => r.name === 'c')!;
   assert.equal(c.hasManifest, false);
