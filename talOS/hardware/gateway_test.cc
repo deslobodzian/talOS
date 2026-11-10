@@ -36,7 +36,7 @@ TEST(Messages, FullyCappedEncodingsHaveExactSizes) {
   state.encoder_count = kMaxEncoders;
   state.pwm_output_count = kMaxPwmOutputs;
   std::array<uint8_t, kMaxStateSize> state_bytes{};
-  ASSERT_EQ(Encode(state, state_bytes), 1396u);
+  ASSERT_EQ(Encode(state, state_bytes), 1406u);
   State decoded_state;
   ASSERT_TRUE(Decode(state_bytes, decoded_state));
   EXPECT_EQ(decoded_state, state);
@@ -55,6 +55,31 @@ TEST(Messages, FullyCappedEncodingsHaveExactSizes) {
   EXPECT_EQ(
       Encode(command, std::span{command_bytes}.first(command_bytes.size() - 1)),
       0u);
+}
+
+// The build identity sits after the seven u64 words of the State prefix. A
+// program value this build does not know, or a dirty byte other than 0 or 1,
+// is a malformed State, not a guess; and an unknown program never encodes.
+TEST(Messages, GatewayBuildRejectsUnknownProgramsAndNonBooleanDirty) {
+  State state;
+  state.build = {0xfedcba9876543210ull, GatewayProgram::kSimGateway, false};
+  std::array<uint8_t, kMaxStateSize> bytes{};
+  const auto size = Encode(state, bytes);
+  ASSERT_NE(size, 0u);
+  const auto encoded = std::span{bytes}.first(size);
+  EXPECT_EQ(bytes[56], 0x10);  // revision, little-endian
+  EXPECT_EQ(bytes[63], 0xfe);
+  EXPECT_EQ(bytes[64], static_cast<uint8_t>(GatewayProgram::kSimGateway));
+  State decoded;
+  bytes[64] = static_cast<uint8_t>(static_cast<int>(kLastGatewayProgram) + 1);
+  EXPECT_FALSE(Decode(encoded, decoded));
+  bytes[64] = static_cast<uint8_t>(GatewayProgram::kRoboRio);
+  bytes[65] = 2;
+  EXPECT_FALSE(Decode(encoded, decoded));
+
+  state.build.program = static_cast<GatewayProgram>(
+      static_cast<uint8_t>(kLastGatewayProgram) + 1);
+  EXPECT_EQ(Encode(state, bytes), 0u);
 }
 
 TEST(Messages, MotorDiagnosticsUseSaturatingSignedTenths) {
@@ -753,6 +778,7 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   state.health = {true, 9.2, true, 0.73};
   state.counters = {1, 2, 3, 4};
   state.sequence = 0x0102030405060708;
+  state.build = {0x0123456789abcdefull, GatewayProgram::kRoboRio, true};
 
   for (std::size_t i = 0; i < kMaxMotors; ++i) {
     const auto x = static_cast<double>(i);
@@ -792,7 +818,7 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   // The same per-device widths the payload-budget static_asserts in messages.cc
   // are built from, so raising a device cap moves both together or neither.
   constexpr std::size_t kWidestState =
-      60 + 14 + 34 + kMaxMotors * 45 + kMaxSensors * 27 +
+      70 + 14 + 34 + kMaxMotors * 45 + kMaxSensors * 27 +
       kMaxDigitalInputs * 4 + kMaxDigitalOutputs * 4 + kMaxAnalogInputs * 15 +
       kMaxEncoders * 23 + kMaxPwmOutputs * 11;
   ASSERT_EQ(state_size, kWidestState);

@@ -263,7 +263,7 @@ reader's time namespace, so a node in another would judge live claims dead.
 ([Robot.cpp](../2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp),
 `10.56.87.11`), port 5803; change it if the main processor's address differs.
 Deploy it from the same checkout as the main-processor bundle: each side
-rejects frames of another protocol version (currently 6; see
+rejects frames of another protocol version (currently 7; see
 [DATA_FLOW.md](DATA_FLOW.md)), and `hardware_node` logs both versions once
 when that happens; the RoboRIO reports it to the Driver Station
 (`companion/protocol_ok`, [RoboRIO](../talOS/hardware/README.md#roborio)).

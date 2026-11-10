@@ -179,6 +179,19 @@ void Samples(Json& json, std::string_view key, const Array& samples,
 void StateJson(Json& json, const hardware::State& s, const DeviceNames* n) {
   json.Key("config_id").Id(s.config_id);
   json.Key("boot_id").Id(s.boot_id);
+  // The build that sent it: the program, the first 16 hex digits of its git
+  // commit (null when unknown) and whether that checkout was dirty.
+  json.Key("gateway_program")
+      .Text(hardware::GatewayProgramName(s.build.program));
+  if (s.build.revision == 0) {
+    json.Key("gateway_build_id").Raw("null");
+  } else {
+    char revision[17];
+    std::snprintf(revision, sizeof(revision), "%016llx",
+                  static_cast<unsigned long long>(s.build.revision));
+    json.Key("gateway_build_id").Text(revision);
+  }
+  json.Key("gateway_build_dirty").Bool(s.build.dirty);
   json.Key("epoch").UInt(s.epoch);
   json.Key("sample_time_us").UInt(s.sample_time_us);
   json.Key("sequence").UInt(s.sequence);

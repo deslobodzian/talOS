@@ -516,7 +516,9 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   and the source revision of a `--config=release` build
   ([deployment](../../docs/DEPLOYMENT.md#build-a-bundle)); empty (and
   `false`) outside a bundle or for an unstamped one. The RoboRIO program's
-  build is not recorded.
+  build is not here: every `/hw/state` record of the bridge's log carries it
+  (`log_dump`'s `hardware` field,
+  [filtering and exporting logs](#filtering-and-exporting-logs)).
 - per node, `binary_sha256`: the SHA-256 of `binary_path` as the session
   starts, empty if it cannot be read. It covers that file only: not the
   shared libraries a C++ node loads, nor a Python node's runfiles.
@@ -773,12 +775,15 @@ object in JSONL, its text in CSV and the text dump, absent (JSONL) or empty
   `epoch`, `observed_time_us`, and per motor `id`, `name`, `mode`
   (`neutral`, `duty_cycle`, `voltage`, `velocity`, `position`,
   `motion_magic`), `slot`, `demand`, `feedforward_v`; digital and PWM outputs.
-- `state`: the flags (`configured`, `enabled`, `command_active`,
-  `hardware_fault`), and per motor `valid`, position, velocity, applied
-  `voltage`, stator/supply current, temperature, sample ages, `fault_flags`,
-  `faulted` (a fault other than an asserted limit), `forward_limit` and
-  `reverse_limit` (hard limit switches); every other device's samples, health
-  and gateway counters.
+- `state`: the gateway build that sent it (`gateway_program`: `roborio`,
+  `roborio_simulation`, `sim_gateway` or `unknown`; `gateway_build_id`, the
+  first 16 hex digits of its git commit, null when unknown;
+  `gateway_build_dirty`), the flags (`configured`, `enabled`,
+  `command_active`, `hardware_fault`), and per motor `valid`, position,
+  velocity, applied `voltage`, stator/supply current, temperature, sample
+  ages, `fault_flags`, `faulted` (a fault other than an asserted limit),
+  `forward_limit` and `reverse_limit` (hard limit switches); every other
+  device's samples, health and gateway counters.
 - `driver_station`: `mode` (`teleop`, `autonomous`, `test`, `none`),
   `enabled`, `estop`, attachment, alliance, station and match fields, and each
   connected joystick's `port`, `name`, `axes`, `buttons` (bit i is button

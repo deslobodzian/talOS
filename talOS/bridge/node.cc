@@ -26,7 +26,7 @@ static_assert(std::string_view{kNodeName} ==
 // 8-byte alignment (talos::kMessageAlignment). ipc::Publisher lays the slot out
 // at alignof(Message), so the two agree only while this holds.
 static_assert(alignof(bridge::BridgeStatus) == 8);
-static_assert(sizeof(bridge::BridgeStatus) == 184,
+static_assert(sizeof(bridge::BridgeStatus) == 192,
               "BridgeStatus size changed; update docs/DATA_FLOW.md");
 // Each actuator-owning subsystem owns at least one such device.
 static_assert(kMaxMotors + kMaxDigitalOutputs + kMaxPwmOutputs <= 32,
@@ -358,7 +358,19 @@ void HardwareNode::Tick(uint64_t now_us) {
 
     if (frame.header.type == protocol::FrameType::kHardwareState) {
       State state;
-      if (!Decode({frame.payload, frame.payload_size}, state)) continue;
+      if (!Decode({frame.payload, frame.payload_size}, state)) {
+        // Once per stretch: a gateway sending malformed States sends them
+        // every tick, and dropping them silently looks like a dead link.
+        if (!state_decode_failure_logged_) {
+          std::fprintf(stderr,
+                       "hardware_node: dropping a State that does not decode "
+                       "(%zu bytes)\n",
+                       frame.payload_size);
+          state_decode_failure_logged_ = true;
+        }
+        continue;
+      }
+      state_decode_failure_logged_ = false;
 
       ++states_received_;
       // Ordering first, before anything is touched: the clock mapping takes
@@ -383,6 +395,7 @@ void HardwareNode::Tick(uint64_t now_us) {
         config_push_backoff_us_ = 50000;
         // The new boot's Driver Station clock restarted with it.
         last_ds_sample_time_us_ = 0;
+        ReportGatewayBuild(state);
       }
       if (state.boot_id != last_boot_id_ || state.config_id != config_id_ ||
           !is_configured_) {
@@ -579,6 +592,20 @@ void HardwareNode::Tick(uint64_t now_us) {
   }
 }
 
+// /hw/status carries the State's program value as is.
+static_assert(static_cast<uint8_t>(bridge::GatewayProgram::UNKNOWN) ==
+              static_cast<uint8_t>(GatewayProgram::kUnknown));
+static_assert(static_cast<uint8_t>(bridge::GatewayProgram::ROBORIO) ==
+              static_cast<uint8_t>(GatewayProgram::kRoboRio));
+static_assert(
+    static_cast<uint8_t>(bridge::GatewayProgram::ROBORIO_SIMULATION) ==
+    static_cast<uint8_t>(GatewayProgram::kRoboRioSimulation));
+static_assert(static_cast<uint8_t>(bridge::GatewayProgram::SIM_GATEWAY) ==
+              static_cast<uint8_t>(GatewayProgram::kSimGateway));
+static_assert(bridge::GatewayProgram::MAX ==
+                  bridge::GatewayProgram::SIM_GATEWAY &&
+              kLastGatewayProgram == GatewayProgram::kSimGateway);
+
 bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
   uint32_t timed_out_mask = 0;
   uint32_t bit = 0;
@@ -641,9 +668,24 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       latest_state_.counters.neutralized_motor_count,
       latest_state_.counters.apply_failure_count,
       latest_state_.counters.device_reset_count,
+      static_cast<bridge::GatewayProgram>(latest_state_.build.program),
+      latest_state_.build.dirty,
+      latest_state_.build.revision,
       clock_.uncertainty_us(),
       clock_.round_trip_us(),
   };
+}
+
+void HardwareNode::ReportGatewayBuild(const State& state) {
+  char revision[17] = "unknown";
+  if (state.build.revision != 0) {
+    std::snprintf(revision, sizeof(revision), "%016llx",
+                  static_cast<unsigned long long>(state.build.revision));
+  }
+  std::fprintf(stderr, "hardware_node: gateway boot %llu: %s build %s%s\n",
+               static_cast<unsigned long long>(state.boot_id),
+               GatewayProgramName(state.build.program), revision,
+               state.build.dirty ? " (dirty)" : "");
 }
 
 void HardwareNode::LogPacket(uint16_t source_id, const Packet& packet,

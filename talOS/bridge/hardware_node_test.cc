@@ -494,6 +494,35 @@ TEST(HardwareNodeTest, ReportsLatestGatewayHealthAndConfiguredMotorFaults) {
   EXPECT_EQ(node.Status(1004000).motor_reverse_limit_mask(), 2u);
 }
 
+// /hw/status names the build of the gateway boot the bridge accepted, and a
+// new boot's build replaces it: after a RoboRIO rollback the record shows the
+// build that drove the robot, not the first one the bridge heard.
+TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  EXPECT_EQ(node.Status(999000).gateway_program(),
+            bridge::GatewayProgram::UNKNOWN);
+  EXPECT_EQ(node.Status(999000).gateway_build_id(), 0u);
+
+  State state = TrustState(NodeConfigId(cfg), 42, 1, 1000);
+  state.build = {0x0123456789abcdefull, GatewayProgram::kRoboRio, true};
+  ASSERT_TRUE(InjectState(node, link.gateway, state, 1000000));
+  auto status = node.Status(1000000);
+  EXPECT_EQ(status.gateway_program(), bridge::GatewayProgram::ROBORIO);
+  EXPECT_TRUE(status.gateway_build_dirty());
+  EXPECT_EQ(status.gateway_build_id(), 0x0123456789abcdefull);
+
+  State rollback = TrustState(NodeConfigId(cfg), 43, 1, 50);
+  rollback.build = {0x00fedcba98765432ull, GatewayProgram::kRoboRio, false};
+  ASSERT_TRUE(InjectState(node, link.gateway, rollback, 1001000));
+  status = node.Status(1001000);
+  EXPECT_EQ(status.gateway_program(), bridge::GatewayProgram::ROBORIO);
+  EXPECT_FALSE(status.gateway_build_dirty());
+  EXPECT_EQ(status.gateway_build_id(), 0x00fedcba98765432ull);
+}
+
 TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   const std::string base = ::testing::TempDir() + "bridge";
   const std::string config_path = base + ".toml";

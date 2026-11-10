@@ -138,7 +138,8 @@ std::size_t Encode(const State& s, std::span<uint8_t> data) {
       s.digital_input_count > kMaxDigitalInputs ||
       s.digital_output_count > kMaxDigitalOutputs ||
       s.analog_input_count > kMaxAnalogInputs ||
-      s.encoder_count > kMaxEncoders || s.pwm_output_count > kMaxPwmOutputs) {
+      s.encoder_count > kMaxEncoders || s.pwm_output_count > kMaxPwmOutputs ||
+      s.build.program > kLastGatewayProgram) {
     return 0;
   }
   Writer w{data};
@@ -149,6 +150,9 @@ std::size_t Encode(const State& s, std::span<uint8_t> data) {
   w.Int(s.last_command_sequence, 8);
   w.Int(s.clock_probe_time_us, 8);
   w.Int(s.sequence, 8);
+  w.Int(s.build.revision, 8);
+  w.Int(static_cast<uint8_t>(s.build.program), 1);
+  w.Int(s.build.dirty ? 1 : 0, 1);
   w.Int(s.flags, 4);
   w.Int(s.motor_count, 2);
   w.Int(s.sensor_count, 2);
@@ -233,6 +237,14 @@ bool Decode(std::span<const uint8_t> data, State& out) {
   s.last_command_sequence = r.Int(8);
   s.clock_probe_time_us = r.Int(8);
   s.sequence = r.Int(8);
+  s.build.revision = r.Int(8);
+  const auto program = r.Int(1);
+  const auto dirty = r.Int(1);
+  if (program > static_cast<uint8_t>(kLastGatewayProgram) || dirty > 1) {
+    return false;
+  }
+  s.build.program = static_cast<GatewayProgram>(program);
+  s.build.dirty = dirty == 1;
   s.flags = r.Int(4);
   s.motor_count = r.Int(2);
   s.sensor_count = r.Int(2);

@@ -103,6 +103,9 @@ class Gateway {
   void SetClock(uint64_t (*clock)()) { clock_ = clock; }
   Gateway(Config config, Backend& backend, uint64_t boot_id);
   Gateway(Backend& backend, uint64_t boot_id);
+  // The program and build every State of this boot reports. Identification
+  // only: nothing in the gateway or the bridge acts on it.
+  void SetBuild(const GatewayBuild& build) { state_.build = build; }
   // Replaces the active hardware configuration. Safe-reconfiguration rules:
   // - Changed configurations require disabled operation.
   // - Identical pushes succeed even while enabled without device traffic or

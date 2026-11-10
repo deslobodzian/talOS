@@ -210,7 +210,10 @@ The gateway publishes its configuration ID, boot ID, control epoch, monotonic
 poll timestamp, last accepted command sequence, the echo of the last clock
 probe (the bridge's clock mapping), the tick sequence (one more each gateway
 tick within a boot, so a consumer can tell consecutive States from a gap; see
-[DATA_FLOW.md](../../docs/DATA_FLOW.md)), enable/configuration/fault flags,
+[DATA_FLOW.md](../../docs/DATA_FLOW.md)), its build (`GatewayBuild`: the
+program, RoboRIO or WPILib simulation of it or `sim_gateway`, the git
+revision it was built from and whether that checkout was dirty; set with
+`Gateway::SetBuild`, never acted on), enable/configuration/fault flags,
 and identified motor/sensor samples. Motor samples contain mechanism
 position/velocity, voltage, stator and supply current, temperature, and the
 Phoenix fault bitfield. State also carries valid power/CAN health (battery
@@ -234,7 +237,12 @@ uncommissioned or unconfigured: the bridge keeps forwarding those while the
 robot cannot drive. Each command supplies every configured motor in manifest
 order.
 The bridge neutralizes omitted subsystem actuators. `/hw/status` exposes the
-latest accepted health sample, motor fault mask, and gateway counters.
+latest accepted health sample, motor fault mask, gateway counters and gateway
+build (`gateway_program`, `gateway_build_id`, `gateway_build_dirty`), and the
+bridge prints the build once for each new gateway boot
+(`hardware_node: gateway boot <id>: roborio build <revision>`). A State
+that does not decode is dropped, with one stderr line until a State decodes
+again.
 `hardware_node --log PATH` records merged `/hw/command` and decoded `/hw/state`
 as raw `Packet` topics in a `.tlog` (format in [talOS/events](../events/README.md)).
 
@@ -404,6 +412,17 @@ the link has been up 30 s (and robot code running 30 s) but no command frame
 arrived in the last 500 ms (actuator nodes down or crash-looping), once per
 such stretch. The
 drive team's use of these is the [pre-match checklist](../../docs/PRE_MATCH.md).
+
+Every State names the program's build. `build.gradle`'s `generateRioBuild`
+task, which every compile depends on, writes `build/generated/talos/include/RioBuild.h`
+with the checkout's git commit and whether it has uncommitted changes,
+untracked files included; without git or outside a checkout the commit is
+`unknown` and the State's revision 0. It reads only the local repository, so
+`--offline` builds get it, and rewrites the header only when it changes. The
+program prints the commit on its console at start (`hardware gateway build
+<commit>`), and the State reports its first 16 hex digits
+([DATA_FLOW.md](../../docs/DATA_FLOW.md#udp-frame-and-payload-sizes)), as
+`ROBORIO`, or `ROBORIO_SIMULATION` under WPILib simulation, on `/hw/status`.
 
 Build without deploying:
 

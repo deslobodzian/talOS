@@ -1,5 +1,15 @@
 namespace bridge;
 
+// The program running the gateway, as its State reports it
+// (hardware::GatewayProgram; the values match, and a new one comes with a
+// protocol version bump, since an older decoder rejects it).
+enum GatewayProgram : ubyte {
+  UNKNOWN,
+  ROBORIO,
+  ROBORIO_SIMULATION,
+  SIM_GATEWAY,
+}
+
 // The hardware bridge's health, published by hardware_node on /hw/status every
 // 20 ms. The counters are cumulative since the bridge started.
 //
@@ -56,6 +66,13 @@ struct BridgeStatus {
   gateway_neutralized_motor_count:uint32;
   gateway_apply_failure_count:uint32;
   gateway_device_reset_count:uint32;
+  // The gateway build of the last accepted State (hardware::GatewayBuild),
+  // UNKNOWN and 0 before the first: the program, whether it was built with
+  // uncommitted changes, and the first 16 hex digits of its git commit read
+  // as one number (0 when unknown; print it with %016llx).
+  gateway_program:GatewayProgram;
+  gateway_build_dirty:bool;
+  gateway_build_id:uint64;
   // Causal two-way bound, including residence time, quantization and 1000 ppm
   // relative oscillator drift. Local logs only (excluded from robot radio).
   clock_offset_uncertainty_us:uint64;

@@ -158,6 +158,9 @@ class HardwareNode {
   bool ShouldSendCommand(uint64_t now_us);
   void LogPacket(uint16_t source_id, const Packet& packet, uint64_t now_us,
                  uint64_t sequence);
+  // One stderr line per gateway boot naming its program and build (the
+  // launcher keeps it in the node's session log; /hw/status carries it too).
+  static void ReportGatewayBuild(const State& state);
   // Prints the packet log's error once, whether capture stopped or the log
   // failed (e.g. its file could not be created).
   void ReportLogFailure();
@@ -215,6 +218,8 @@ class HardwareNode {
   // Set once a frame of another protocol version is logged, until a frame
   // of this version arrives.
   bool version_mismatch_logged_{false};
+  // Set once an undecodable State is logged, until a State decodes.
+  bool state_decode_failure_logged_{false};
   uint64_t pending_probe_send_us_{};
   uint64_t pending_probe_sample_us_{};
   uint64_t pending_probe_boot_id_{};

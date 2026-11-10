@@ -462,6 +462,9 @@ struct SimHardware::Impl {
         state.counters.neutralized_motor_count,
         state.counters.apply_failure_count,
         state.counters.device_reset_count,
+        static_cast<::bridge::GatewayProgram>(state.build.program),
+        state.build.dirty,
+        state.build.revision,
         0,
         0};
     sim.publish(::bridge::topics::kStatus, status);

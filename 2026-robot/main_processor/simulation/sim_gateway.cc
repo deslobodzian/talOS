@@ -221,6 +221,11 @@ int main(int argc, char** argv) {
     // One boot id for the State and the Driver Station packets alike.
     const uint64_t boot_id = (uint64_t{random()} << 32) | random() | 1;
     talos::hardware::Gateway gateway{backend, boot_id};
+    // No revision: it builds with the main processor's nodes, from the same
+    // Bazel checkout, so it names only the program.
+    gateway.SetBuild({.revision = 0,
+                      .program = talos::hardware::GatewayProgram::kSimGateway,
+                      .dirty = false});
     // Configure from the robot manifest before the loop: an unconfigured
     // gateway stamps config_id 0 and no configured flag, which every
     // mechanism's AcceptState/GatewayReady gates reject, so nothing

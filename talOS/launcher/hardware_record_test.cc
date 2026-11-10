@@ -167,10 +167,16 @@ TEST_F(HardwareRecordTest, StateAndCommandNameDevicesOfTheRunConfig) {
   sample.voltage = 11.25;
   sample.stator_current_a = 30.5;
   sample.fault_flags = talos::hardware::kMotorForwardHardLimitFlag;
+  state.build = {0x00ab0123456789cdULL,
+                 talos::hardware::GatewayProgram::kRoboRio, true};
   const auto state_json = Members(
       HardwareRecordJson(HardwareRecord::kState, Encoded(state), &names_));
   EXPECT_EQ(state_json.at("type"), "\"state\"");
   EXPECT_EQ(state_json.at("enabled"), "true");
+  // The RoboRIO build that drove the match, as its git revision reads.
+  EXPECT_EQ(state_json.at("gateway_program"), "\"roborio\"");
+  EXPECT_EQ(state_json.at("gateway_build_id"), "\"00ab0123456789cd\"");
+  EXPECT_EQ(state_json.at("gateway_build_dirty"), "true");
   auto motor = Find(state_json.at("motors"), "name", "\"flywheel\"");
   EXPECT_EQ(motor["valid"], "true");
   EXPECT_EQ(motor["velocity_rps"], "42.5");
