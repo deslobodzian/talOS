@@ -22,6 +22,13 @@ Typed single-producer / multi-consumer pub/sub on top of
   `Received<Message>{message, sequence, dropped}` so consumers can
   detect laps; `read()` discards that metadata but uses the same read mode
   (sequence delivery by default), not a latest-value shortcut.
+- `read_next()` and `read()` return `nullopt` when nothing new was
+  published and when a read fails: the writer tore it, or a process that
+  judged this one dead freed its reader slot. Failed reads count in
+  `failed_reads()`. A freed slot is claimed again by the read that finds it
+  gone, or by a later one while none is free (`registered()` is false
+  meanwhile); messages published while the subscriber had no slot count in
+  the next `Received::dropped`.
 - The publisher owns the topic layout outside a launcher session: it
   passes `RTMSOptions::publisher`, so it reclaims a segment of another
   build or schema that no live process holds. A live publisher exclusively
