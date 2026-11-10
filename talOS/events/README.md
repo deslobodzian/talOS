@@ -79,6 +79,12 @@ subscriptions retain sequence delivery with `max_messages_per_tick` (64 by
 default) bounding each drain. The node's internal storage callback does not
 turn a plain latest-value subscription into sequence delivery.
 
+A watcher whose reader slot another process frees (having judged this one dead)
+claims one again when a drain finds it gone, and at each later drain while none
+is free; messages published while it had no slot count in the next delivery's
+`Context::dropped`. That failed read, and any read the writer tears, also count
+in the source's `SourceCounters::dropped`.
+
 The log records dispatch and publication times and the resulting order, so
 replay reproduces both delivery policies and ages. `SimulatedEventLoop` takes
 the same options and stamps messages at simulated send time. The node layer

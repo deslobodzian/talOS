@@ -149,8 +149,8 @@ struct SourceRecord {
   // its job.
   std::atomic<std::uint64_t> events;
 
-  // Messages the transport lapped before this source could read them, or
-  // publishes the transport refused.
+  // Messages the transport lapped before this source could read them,
+  // publishes the transport refused, or reads it failed (SourceCounters).
   std::atomic<std::uint64_t> dropped;
 
   // Transport sequence last observed, which is what makes a subscriber's lag

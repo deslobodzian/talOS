@@ -162,12 +162,16 @@ class RealtimeEventLoop
     Transport& operator=(const Transport&) = delete;
     Transport(Transport&& other) noexcept
         : queue{std::move(other.queue)},
-          reader_id{std::exchange(other.reader_id, std::nullopt)} {}
+          reader_id{std::exchange(other.reader_id, std::nullopt)},
+          next_sequence{other.next_sequence},
+          lost{other.lost} {}
     Transport& operator=(Transport&& other) noexcept {
       if (this != &other) {
         release();
         queue = std::move(other.queue);
         reader_id = std::exchange(other.reader_id, std::nullopt);
+        next_sequence = other.next_sequence;
+        lost = other.lost;
       }
       return *this;
     }
@@ -178,6 +182,10 @@ class RealtimeEventLoop
     }
     std::optional<RTMSQueue> queue;
     std::optional<std::size_t> reader_id;
+    // A watcher's next undelivered sequence, and the messages published
+    // while it had no reader slot, owed to its next delivery's dropped count.
+    std::uint64_t next_sequence{0};
+    std::uint64_t lost{0};
   };
 
   void on_register(const Registration& registration) {
@@ -208,6 +216,8 @@ class RealtimeEventLoop
         throw RegistrationError("no reader slots available for '" +
                                 registration.name + "'");
       }
+      transport.next_sequence =
+          transport.queue->reader_sequence(*transport.reader_id);
       // Collected once so the drain runs over just the watchers instead of
       // re-scanning every source on every tick.
       watchers_.push_back(registration.id);
@@ -247,10 +257,17 @@ class RealtimeEventLoop
     // expects.
     for (const std::uint16_t id : watchers_) {
       Transport& transport = transports_[id];
-      if (!transport.reader_id || !transport.queue) {
+      if (!transport.queue) {
         continue;
       }
       RTMSQueue& queue = *transport.queue;
+      // Left without a slot by a failed rejoin below: keep trying.
+      if (!transport.reader_id) {
+        rejoin(queue, transport);
+      }
+      if (!transport.reader_id) {
+        continue;
+      }
       const std::size_t reader_id = *transport.reader_id;
 
       for (std::size_t drained = 0; drained < options_.max_messages_per_tick;
@@ -261,14 +278,26 @@ class RealtimeEventLoop
             queue.read_next(reader_id, sources[id].buffer, info);
 
         if (result != ReadResult::OK) {
+          // EMPTY ends the drain. A read the writer tore, or one that found
+          // the reader slot freed by another process that judged this one
+          // dead, is counted as dropped rather than ending the subscription
+          // silently; a freed slot is claimed again.
+          if (result == ReadResult::TORN || result == ReadResult::INACTIVE) {
+            this->count_dropped(id, 1);
+          }
+          if (result == ReadResult::INACTIVE) {
+            transport.reader_id.reset();
+            rejoin(queue, transport);
+          }
           break;
         }
 
+        transport.next_sequence = info.sequence + 1;
         now = Poller::now();
-        this->dispatch_message(static_cast<std::uint16_t>(id), tick_deadline,
-                               now, info.sequence, info.dropped,
-                               sources[id].buffer,
-                               MonotonicTime::from_nanos(info.publish_time_ns));
+        this->dispatch_message(
+            static_cast<std::uint16_t>(id), tick_deadline, now, info.sequence,
+            info.dropped + std::exchange(transport.lost, 0), sources[id].buffer,
+            MonotonicTime::from_nanos(info.publish_time_ns));
 
         if (!this->running()) {
           return;
@@ -276,6 +305,21 @@ class RealtimeEventLoop
         if (sources[id].latest_only) break;
       }
     }
+  }
+
+  // Claims a reader slot again for a watcher whose slot was freed under it.
+  // The new slot starts at the writer, so what was published since the last
+  // delivery is owed to the next one's dropped count.
+  static void rejoin(RTMSQueue& queue, Transport& transport) {
+    transport.reader_id = queue.register_reader();
+    if (!transport.reader_id) {
+      return;
+    }
+    const std::uint64_t start = queue.reader_sequence(*transport.reader_id);
+    if (start > transport.next_sequence) {
+      transport.lost += start - transport.next_sequence;
+    }
+    transport.next_sequence = start;
   }
 
   Options options_;

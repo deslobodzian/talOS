@@ -49,8 +49,9 @@ struct SourceCounters {
   // this source did its job.
   std::atomic<std::uint64_t> events{0};
 
-  // Messages the transport lapped before this source read them, plus publishes
-  // the transport refused.
+  // Messages the transport lapped before this source read them, publishes it
+  // refused, and reads it failed: torn by the writer, or finding the reader
+  // slot freed under this watcher.
   std::atomic<std::uint64_t> dropped{0};
 
   // Last transport sequence this source observed, which is what makes a
@@ -365,6 +366,14 @@ class EventLoopBase {
     context.dropped = dropped;
 
     invoke(context, payload);
+  }
+
+  // Counts a loss the transport reported outside any dispatch against a
+  // source: the realtime loop's failed reads.
+  void count_dropped(std::uint16_t id, std::uint64_t count) {
+    if (SourceCounters* counters = counter(id)) {
+      counters->dropped.fetch_add(count, std::memory_order_relaxed);
+    }
   }
 
  private:

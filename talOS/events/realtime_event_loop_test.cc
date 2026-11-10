@@ -211,6 +211,59 @@ TEST(RealtimeEventLoop, ReaderExhaustionFailsRegistrationAndAllowsRetry) {
   for (auto reader : readers) keeper.release_reader(reader);
 }
 
+// Another process can free a watcher's reader slot, having judged this one
+// dead. The subscription must claim a slot again rather than go quiet, and
+// count the failed read and what was published while it had no slot.
+TEST(RealtimeEventLoop, AWatcherWhoseSlotIsFreedClaimsOneAgain) {
+  const std::string topic = "/freed_" + std::to_string(::getpid());
+  RealtimeEventLoop<> loop;
+  loop.set_delivery(Delivery::BEFORE_TIMERS);
+  std::vector<Context> delivered;
+  auto on_message = [&](const Context& context) {
+    delivered.push_back(context);
+  };
+  const auto watcher = loop.register_watcher(
+      topic, sizeof(EventsTest::SensorMessage),
+      alignof(EventsTest::SensorMessage),
+      talos::schema::Of<EventsTest::SensorMessage>(), make_thunk(&on_message));
+  RTMSQueue publisher{topic, sizeof(EventsTest::SensorMessage),
+                      alignof(EventsTest::SensorMessage),
+                      talos::schema::Of<EventsTest::SensorMessage>()};
+  SharedMemoryPtr mapping{topic, sizeof(RTMSHeader)};
+  auto* header = static_cast<RTMSHeader*>(mapping.ptr());
+  ASSERT_NE(header, nullptr);
+  const auto publish = [&publisher](int value) {
+    const EventsTest::SensorMessage message{value, 0.0F, 0.0F};
+    return publisher.write(std::span<const std::byte>{
+               reinterpret_cast<const std::byte*>(&message),
+               sizeof(message)}) == WriteResult::SUCCESS;
+  };
+  ASSERT_TRUE(publish(0));
+  // Each timer runs after the drain that precedes it.
+  auto free_slot = [&](const Context&) {
+    for (auto& reader : header->readers) reader.state.store(0);
+    EXPECT_TRUE(publish(1));
+    EXPECT_TRUE(publish(2));
+  };
+  auto publish_more = [&](const Context&) { EXPECT_TRUE(publish(3)); };
+  auto stop = [&](const Context&) { loop.exit(); };
+  const auto first = loop.register_timer("free", make_thunk(&free_slot));
+  const auto second = loop.register_timer("more", make_thunk(&publish_more));
+  const auto third = loop.register_timer("stop", make_thunk(&stop));
+  const auto origin = loop.monotonic_now();
+  loop.arm_timer(first, origin, {});
+  loop.arm_timer(second, origin + 1ms, {});
+  loop.arm_timer(third, origin + 2ms, {});
+  loop.run_for(1s);
+  ASSERT_EQ(delivered.size(), 2u);
+  EXPECT_EQ(delivered[0].sequence, 0u);
+  EXPECT_EQ(delivered[0].dropped, 0u);
+  EXPECT_EQ(delivered[1].sequence, 3u);
+  EXPECT_EQ(delivered[1].dropped, 2u);  // 1 and 2, published without a slot
+  // That failed read, plus the two messages it never saw.
+  EXPECT_EQ(loop.source_counters()[watcher].dropped.load(), 3u);
+}
+
 // The point of the whole design: the realtime run is full of jitter, dropped
 // messages and scheduling noise, and replaying its log still reproduces every
 // output exactly, whichever way the run delivered its messages.
