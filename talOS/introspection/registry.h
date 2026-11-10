@@ -644,7 +644,7 @@ inline void PrepareRegistry(
   try {
     const RegistryMapping ready{path, /*read_only=*/true};
     return;
-  } catch (const std::runtime_error&) {
+  } catch (const std::runtime_error&) {  // NOLINT(bugprone-empty-catch)
     // Too small, uncommitted or another layout: a writer settles which.
   }
   if (!lock) lock.emplace(mapped, lock_wait);
