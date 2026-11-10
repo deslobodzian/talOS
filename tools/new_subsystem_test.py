@@ -1,7 +1,9 @@
 """Unit tests for //tools:new_subsystem."""
 
 import os
+import re
 import tempfile
+import tomllib
 import unittest
 
 from tools import new_subsystem
@@ -38,6 +40,33 @@ class NewSubsystemTest(unittest.TestCase):
         # Too long to leave room for /<name>/target/teleop (31 bytes max)
         self.assertIsNotNone(new_subsystem.check_name("a" * 17))
         self.assertIsNone(new_subsystem.check_name("a" * 16))
+
+    def test_check_name_uses_the_rules_of_names_h(self):
+        # check_name copies talOS/introspection/names.h's limits and lists;
+        # a rule changed on one side only fails here.
+        with open(os.path.join("talOS", "introspection", "names.h"),
+                  encoding="utf-8") as f:
+            header = f.read()
+
+        def number(constant):
+            return int(re.search(rf"\b{constant} = (\d+);", header).group(1))
+
+        def strings(array):
+            body = re.search(rf"\b{array}\[\] = \{{(.*?)\}};", header,
+                             re.DOTALL).group(1)
+            return re.findall(r'"([^"]*)"', body)
+
+        self.assertEqual(number("kMaxSegmentBytes"),
+                         new_subsystem.MAX_SEGMENT_BYTES)
+        self.assertEqual(number("kMaxTopicBytes"),
+                         new_subsystem.MAX_TOPIC_BYTES)
+        self.assertEqual(set(strings("kReservedOwners")),
+                         new_subsystem.RESERVED_OWNERS)
+        pairs = strings("kAbbreviations")
+        self.assertEqual(dict(zip(pairs[::2], pairs[1::2])),
+                         new_subsystem.ABBREVIATIONS)
+        self.assertEqual(set(strings("kDirectionSuffixes")),
+                         set(new_subsystem.DIRECTION_SUFFIXES))
 
     def test_plan_scaffolds_into_custom_robot_and_assigns_lowest_free_can_id(self):
         with tempfile.TemporaryDirectory() as root:
@@ -146,6 +175,35 @@ class NewSubsystemTest(unittest.TestCase):
                 with self.assertRaises(new_subsystem.Refused):
                     new_subsystem.plan(root, "bot", inherited, "py")
 
+    def test_plan_confines_a_position_mechanism_until_its_travel_is_set(self):
+        # The gateway and the devices layer bound a position demand only
+        # with soft_limits, and validation refuses a zero range, so the
+        # placeholder travel is a window narrower than the at-goal tolerance.
+        with tempfile.TemporaryDirectory() as root:
+            configuration = os.path.join(root, "bot", "main_processor",
+                                         "configuration")
+            os.makedirs(os.path.join(configuration, "subsystems"))
+            for path, text in (
+                    ("BUILD", ""),
+                    ("robot.toml", '[robot]\nname = "bot"\n\n[[subsystems]]\n'
+                     'name = "shooter"\npath = "subsystems/shooter.toml"\n'),
+                    ("subsystems/shooter.toml",
+                     '[subsystem]\nname = "shooter"\n')):
+                with open(os.path.join(configuration, path), "w",
+                          encoding="utf-8") as f:
+                    f.write(text)
+            writes, _ = new_subsystem.plan(root, "bot", "wrist", "cpp",
+                                           kind="position")
+            subsystem = tomllib.loads(next(
+                new for path, _, new in writes
+                if path == os.path.join(configuration, "subsystems",
+                                        "wrist.toml")))
+        motor = subsystem["motors"]["wrist_motor"]
+        self.assertIs(motor["soft_limits"], True)
+        travel = motor["forward_limit_rot"] - motor["reverse_limit_rot"]
+        self.assertGreater(travel, 0)
+        self.assertLess(travel, subsystem["subsystem"]["tolerance_rot"])
+
 
     def test_generated_packages_match_the_built_golden_packages(self):
         # tools/scaffold_testdata holds the generator's output, built and
@@ -154,6 +212,8 @@ class NewSubsystemTest(unittest.TestCase):
         # one filegroup, which hands the files to this test.
         for name, lang, kind in (("gripper", "cpp", "velocity"),
                                  ("scaffold_py", "py", "velocity"),
+                                 ("position_cpp", "cpp", "position"),
+                                 ("position_py", "py", "position"),
                                  ("localizer", "cpp", "estimator"),
                                  ("py_localizer", "py", "estimator")):
             golden = os.path.join("tools", "scaffold_testdata", name)

@@ -1,0 +1,16 @@
+namespace position_cpp;
+
+// What a producer asks for on its lane, /position_cpp/target/<source>. The node
+// drives the motor with Motion Magic only while the robot is enabled and a
+// lane of its target policy is live.
+struct PositionCppTarget {
+  position_rot:double;
+}
+
+// What the position_cpp is doing, published every tick.
+struct PositionCppState {
+  enabled:bool;
+  position_rot:double;
+  connected:bool;
+  at_goal:bool;
+}

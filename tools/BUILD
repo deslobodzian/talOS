@@ -25,8 +25,11 @@ py_test(
         "new_subsystem_test.py",
     ],
     data = [
+        "//talOS/introspection:names.h",
         "//tools/scaffold_testdata/gripper:golden",
         "//tools/scaffold_testdata/localizer:golden",
+        "//tools/scaffold_testdata/position_cpp:golden",
+        "//tools/scaffold_testdata/position_py:golden",
         "//tools/scaffold_testdata/py_localizer:golden",
         "//tools/scaffold_testdata/scaffold_py:golden",
     ],

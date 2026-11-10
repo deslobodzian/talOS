@@ -163,7 +163,10 @@ The subsystem file is
 `2026-robot/main_processor/configuration/subsystems/wrist.toml`: it contains
 `node = "//2026-robot/main_processor/wrist:node"`, a 20000 µs node period,
 and a TalonFX with the lowest unused CAN id in `1..62`, explicitly marked
-as a placeholder. The generator appends the subsystem name and path to
+as a placeholder. Its travel is a placeholder too: `soft_limits = true` with
+`reverse_limit_rot = 0.0` and `forward_limit_rot = 0.001` clamps every target
+into that window (validation refuses an empty range) until you set the
+measured travel. The generator appends the subsystem name and path to
 `configuration/robot.toml` and regenerates that config's manifest plus
 manifests of configs that include it.
 

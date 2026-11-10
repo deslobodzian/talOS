@@ -1,0 +1,16 @@
+namespace position_py;
+
+// What a producer asks for on its lane, /position_py/target/<source>. The node
+// drives the motor with Motion Magic only while the robot is enabled and a
+// lane of its target policy is live.
+struct PositionPyTarget {
+  position_rot:double;
+}
+
+// What the position_py is doing, published every tick.
+struct PositionPyState {
+  enabled:bool;
+  position_rot:double;
+  connected:bool;
+  at_goal:bool;
+}

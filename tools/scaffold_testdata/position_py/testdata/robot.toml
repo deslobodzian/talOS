@@ -1,0 +1,11 @@
+# PositionPy test robot: one subsystem, one motor.
+[robot]
+name = "position_py_test"
+period_us = 20000
+command_timeout_us = 100000
+
+[subsystems.position_py.motors.position_py_motor]
+type = "TalonFX"
+bus = "test"
+can_id = 1
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
