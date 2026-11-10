@@ -62,8 +62,8 @@ class Problems {
 // How much of the loop thread's stack below ConfigureRealtime's frame is
 // prefaulted and locked, so a deeper update() than construction reached does
 // not fault. Less when the thread's stack has less room (kStackSpare kept).
-constexpr std::size_t kStackResidentBytes = 256 * 1024;
-constexpr std::size_t kStackSpare = 64 * 1024;
+constexpr std::size_t kStackResidentBytes = std::size_t{256} * 1024;
+constexpr std::size_t kStackSpare = std::size_t{64} * 1024;
 
 // The calling thread's stack, [low, high).
 bool StackBounds(char*& low, char*& high) {

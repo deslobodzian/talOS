@@ -664,7 +664,8 @@ TEST_F(Registry, AWriterNeverHoldsAnUnlinkedLockFile) {
   std::this_thread::sleep_for(100ms);  // The waiter blocks on `holder`'s file.
   ASSERT_EQ(::unlink(lock.c_str()), 0);
   ::close(holder);
-  holder = -1;
+  // Read by `unblock`'s destructor, which the analyzer cannot see.
+  holder = -1;  // NOLINT(clang-analyzer-deadcode.DeadStores)
   while (!locked) std::this_thread::sleep_for(1ms);
   const int newcomer = OpenLockFile(lock, O_RDONLY);
   ASSERT_GE(newcomer, 0);

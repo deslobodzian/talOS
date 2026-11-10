@@ -66,9 +66,9 @@ cc_library(
     testonly = True,
     srcs = ["allocation_probe.cc"],
     hdrs = ["allocation_probe.h"],
-    alwayslink = True,
     linkstatic = True,
     visibility = ["//visibility:public"],
+    alwayslink = True,
 )
 
 cc_test(

@@ -209,10 +209,6 @@ cc_test(
     name = "supervision_test",
     size = "medium",
     srcs = ["supervision_test.cc"],
-    # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
-    # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
-    # The Linux sanitizer legs still run this test.
-    tags = ["no_macos_sanitizer"],
     data = [
         ":alpha",
         ":endpoint_drift",
@@ -221,6 +217,10 @@ cc_test(
         "TALOS_CONSTRUCTION_NODE": "$(rlocationpath :alpha)",
         "TALOS_ENDPOINT_DRIFT_NODE": "$(rlocationpath :endpoint_drift)",
     },
+    # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
+    # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
+    # The Linux sanitizer legs still run this test.
+    tags = ["no_macos_sanitizer"],
     deps = [
         ":launcher_lib",
         "//talOS/introspection:registry",
@@ -315,10 +315,6 @@ cc_test(
     name = "replay_inputs_test",
     size = "small",
     srcs = ["replay_inputs_test.cc"],
-    # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
-    # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
-    # The Linux sanitizer legs still run this test.
-    tags = ["no_macos_sanitizer"],
     data = [
         ":replay_consumer",
         ":replay_impostor",
@@ -329,6 +325,10 @@ cc_test(
         "TALOS_CONSUMER_NODE": "$(rlocationpath :replay_consumer)",
         "TALOS_IMPOSTOR_NODE": "$(rlocationpath :replay_impostor)",
     },
+    # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
+    # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
+    # The Linux sanitizer legs still run this test.
+    tags = ["no_macos_sanitizer"],
     deps = [
         ":launcher_lib",
         ":replay_message",

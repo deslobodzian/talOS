@@ -118,13 +118,25 @@ _GRAMMAR_NAMES = [
 ]
 
 _GRAMMAR_PROBES = [("name", "-", topic) for topic in _GRAMMAR_NAMES] + [
-    ("role", role, "/hw/" + role)
+    (
+        "role",
+        role,
+        "/hw/" + role,
+    )
     for role in TALOS_TOPIC_ROLES
 ] + [
-    ("abbreviation", wrong + ">" + right, "/hw/state/" + wrong)
+    (
+        "abbreviation",
+        wrong + ">" + right,
+        "/hw/state/" + wrong,
+    )
     for wrong, right in TALOS_TOPIC_ABBREVIATIONS.items()
 ] + [
-    ("suffix", suffix, "/hw/state/x" + suffix)
+    (
+        "suffix",
+        suffix,
+        "/hw/state/x" + suffix,
+    )
     for suffix in TALOS_TOPIC_DIRECTION_SUFFIXES
 ]
 
@@ -132,7 +144,12 @@ genrule(
     name = "topic_grammar_verdicts",
     outs = ["topic_grammar_verdicts.txt"],
     cmd = "cat << 'EOF' > $@\n" + "".join([
-        "%s %s %s %s\n" % (kind, entry, "bad" if talos_topic_problem(topic) else "ok", topic)
+        "%s %s %s %s\n" % (
+            kind,
+            entry,
+            "bad" if talos_topic_problem(topic) else "ok",
+            topic,
+        )
         for kind, entry, topic in _GRAMMAR_PROBES
     ]) + "EOF\n",
     visibility = ["//visibility:private"],

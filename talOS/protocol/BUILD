@@ -34,12 +34,12 @@ cc_test(
     name = "udp_test",
     size = "small",
     srcs = ["udp_test.cc"],
+    tags = ["exclusive"],
     deps = [
         ":protocol",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
-    tags = ["exclusive"],
 )
 
 cc_library(
