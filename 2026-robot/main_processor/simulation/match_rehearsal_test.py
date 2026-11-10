@@ -96,7 +96,15 @@ class MatchRehearsal(unittest.TestCase):
                     time.sleep(0.01)
                 else:
                     self.fail("gateway never started")
+                # Time zero is when the harness sees the gateway's pid in the
+                # manifest, which can trail the gateway's own schedule start
+                # (its mode and stick times) by up to a second; the recording
+                # checks below that this lag left the schedule intact.
                 anchor = time.monotonic()
+                # Nodes stamp records with CLOCK_MONOTONIC_RAW on macOS, which
+                # counts host sleep; time.monotonic does not. Their difference
+                # grows only while the host sleeps (on Linux both are the same).
+                clock_skew_ns = support.node_clock_ns() - time.monotonic_ns()
 
                 def at(seconds):
                     time.sleep(max(0, anchor + seconds - time.monotonic()))
@@ -126,6 +134,12 @@ class MatchRehearsal(unittest.TestCase):
                 os.kill(paused, signal.SIGCONT)
                 paused = None
                 launcher.wait(timeout=15)
+                slept_ms = (support.node_clock_ns() - time.monotonic_ns() -
+                            clock_skew_ns) / 1e6
+                # A sleeping host stops every process while the gateway's
+                # schedule clock runs on, so the recorded phases are unusable.
+                self.assertLess(slept_ms, 100,
+                                f"host slept {slept_ms:.0f} ms during the match; rerun")
                 log.seek(0)
                 diagnostics = log.read()
             self.assertEqual(launcher.returncode, 0, diagnostics)
@@ -176,6 +190,20 @@ class MatchRehearsal(unittest.TestCase):
                 if not phases or phases[-1][1] != flags:
                     phases.append((row["now_ms"], flags))
             self.assertEqual([f for _, f in phases], [1, 13, 1, 21, 1])
+            # The second producer pause ends 12.25 s after the harness's time
+            # zero; the gateway centers the stick 13 s after its own (7 s into
+            # teleop). The center-to-rearm checks below need the pause over at
+            # least 100 ms before the stick centers.
+            anchor_lag = resume - phases[3][0] - 6250
+            self.assertLess(resume, phases[3][0] + 7000 - 100,
+                            f"harness time zero trailed the gateway's schedule by "
+                            f"about {anchor_lag:.0f} ms; the producer pause ended "
+                            f"too close to the stick centering")
+            # SIGKILL loses the killed process's unflushed recording (up to
+            # one recorder chunk), so pre-kill actuation is read from what the
+            # bridge actually sent to the gateway.
+            commands = [r for r in rows if r["process"] == "hardware_node" and
+                        r["topic"] == "/hw/command" and r["kind"] == "SEND"]
             # For each node, join each outgoing request to that node's actual
             # latest DS receipt. This includes transitions, not a hand-picked
             # settled subset, and checks every motor (including mechanisms).
@@ -190,7 +218,21 @@ class MatchRehearsal(unittest.TestCase):
                     (config_dir / "subsystems" / f"{name}.toml").read_text())
                 period_us = subsystem["subsystem"].get(
                     "period_us", robot["robot"]["period_us"])
-                self.assertGreater(len(outgoing), 16_000_000 / period_us, name)
+                # Coverage: one request per period from the first Driver
+                # Station receipt to the bridge's last command, less 1 s. The
+                # window starts at the first DS receipt, not launch, because
+                # nodes spawn one at a time with the gateway last. The 1 s
+                # covers the recording a SIGKILL discards (the log writer syncs
+                # its active chunk once a second); for drivetrain its single
+                # largest gap (the kill and restart) is also excluded. A node
+                # that stops early or stalls over 1 s still fails.
+                sent = [r["now_ms"] for r in outgoing]
+                self.assertGreater(len(sent), 1, name)
+                covered = commands[-1]["now_ms"] - ds_times[0]
+                if name == "drivetrain":
+                    covered -= max(b - a for a, b in zip(sent, sent[1:]))
+                self.assertGreater(len(sent), (covered - 1000) * 1000 / period_us,
+                                   name)
                 for row in outgoing:
                     index = bisect.bisect_right(times, row["now_ms"]) - 1
                     enabled = index >= 0 and support.ds_snapshot(snapshots[index])[0] & 4
@@ -208,11 +250,6 @@ class MatchRehearsal(unittest.TestCase):
                                 any(m[0] != "neutral" and abs(m[2]) > 0.1 for m in
                                     support.motor_requests(r).values()) for r in intake),
                             "teleop mechanism buttons never actuated intake")
-            # SIGKILL loses the killed process's unflushed recording (up to
-            # one recorder chunk), so pre-kill actuation is read from what the
-            # bridge actually sent to the gateway.
-            commands = [r for r in rows if r["process"] == "hardware_node" and
-                        r["topic"] == "/hw/command" and r["kind"] == "SEND"]
             self.assert_driving(commands, kill - 150, kill, drive_ids)
             restarted = [r for r in requests if kill + 10 < r["now_ms"] < first_resume]
             self.assertGreater(len(restarted), 5, "consumer did not restart during pause")

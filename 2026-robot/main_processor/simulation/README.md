@@ -206,7 +206,14 @@ all drivetrain motors within `command_timeout_us + period_us`; held input
 cannot rearm until centered. The recording checks every motor request
 against its consumer's latest disabled DS snapshot, nonzero autonomous
 and teleop mechanism actuation, clean manifest closure, and all nodes'
-recorder/exit status. Failure artifacts are retained.
+recorder/exit status. Each actuator owner must send one request per period
+from the first Driver Station receipt to the bridge's last command, less 1 s
+(the recording a `SIGKILL` discards) and, for drivetrain, its restart gap.
+The harness times its signals from when it sees the gateway's pid, which can
+trail the gateway's schedule; the test fails naming that lag if the second
+pause does not end at least 100 ms before the stick centers, and fails with
+`host slept N ms; rerun` if the host slept during the match (on macOS node
+time counts sleep and the harness's does not). Failure artifacts are retained.
 
 Run the independent rehearsal three times for a stability check:
 
