@@ -6,6 +6,7 @@ raise, with the C++ message, or with the Python exception a callback raised.
 
 import ctypes
 import os
+import threading
 
 _EXPECTED_ABI_VERSION = 21
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
@@ -258,28 +259,34 @@ def _load():
 
 lib = _load()
 
-# The first exception a Python callback raised during the current C call.
-_pending = None
+# The first exception a Python callback raised during the current C call, per
+# thread like talos_last_error(): a callback runs on the thread whose C call
+# ran it, and a failure there is raised by that call, never by another
+# thread's.
+_local = threading.local()
 
 
 def callback(fn):
     """fn as a C callback body: an exception is kept and reported as 1."""
     def body(*args):
-        global _pending
         try:
             fn(*args)
             return 0
         except BaseException as error:  # noqa: B902 - re-raised by fail()
-            if _pending is None:
-                _pending = error
+            if pending() is None:
+                _local.pending = error
             return 1
     return body
 
 
+def pending():
+    """The exception a callback raised during this thread's C call, or None."""
+    return getattr(_local, "pending", None)
+
+
 def fail():
-    """Raise what made the last C call fail."""
-    global _pending
-    error, _pending = _pending, None
+    """Raise what made this thread's last C call fail."""
+    error, _local.pending = pending(), None
     if error is not None:
         raise error
     raise TalosError(lib.talos_last_error().decode())

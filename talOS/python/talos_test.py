@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import threading
 from datetime import timedelta
 import unittest
 from unittest import mock
@@ -226,6 +227,31 @@ class SubscriptionErrorsTest(unittest.TestCase):
                                        return_value=None):
                     with self.assertRaises(talos.TalosError):
                         _ = subscription.value
+
+
+class CallbackErrorTest(unittest.TestCase):
+    def test_a_callback_exception_is_raised_only_on_its_thread(self):
+        # Like the C error string, a callback's exception belongs to the
+        # thread whose C call ran it: another thread's failed call must not
+        # raise it, nor take it from the call it failed.
+        def boom(_):
+            raise ValueError("boom")
+
+        self.assertEqual(_abi.callback(boom)(None), 1)
+        raised = []
+
+        def other_thread():
+            try:
+                _abi.fail()
+            except BaseException as error:  # noqa: B902 - inspected below
+                raised.append(error)
+
+        thread = threading.Thread(target=other_thread)
+        thread.start()
+        thread.join()
+        with self.assertRaises(ValueError):
+            _abi.fail()
+        self.assertEqual([type(error) for error in raised], [talos.TalosError])
 
 
 class AbiLayoutTest(unittest.TestCase):

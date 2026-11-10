@@ -368,7 +368,7 @@ def run(cls, node_name, node_target, argv=None):
     built = []
     code = lib.talos_run(len(argv), c_argv, _abi.encode(node_name),
                          _abi.encode(node_target), _factory(cls, built), None)
-    if code != 0 and _abi._pending is not None:
+    if code != 0 and _abi.pending() is not None:
         _abi.fail()
     return code
 
