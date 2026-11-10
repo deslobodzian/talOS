@@ -210,6 +210,18 @@ class Motor(_Input):
         """Supply current in amps, distinct from current (stator amps)."""
         return self._sample().supply_current_a
 
+    @property
+    def forward_limit(self):
+        """Whether the TalonFX's forward hardware limit switch is asserted
+        (Motor::forward_limit): False unless connected, never latched."""
+        return bool(self._sample().forward_limit)
+
+    @property
+    def reverse_limit(self):
+        """Whether the TalonFX's reverse hardware limit switch is asserted
+        (Motor::reverse_limit): False unless connected, never latched."""
+        return bool(self._sample().reverse_limit)
+
     def _set(self, mode, demand, ff_volts=0.0, slot=0):
         _abi.ok(lib.talos_motor_set(self._node, self._index, mode, demand,
                                     ff_volts, slot))

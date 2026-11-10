@@ -8,7 +8,7 @@ import ctypes
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 24
+_EXPECTED_ABI_VERSION = 25
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -45,7 +45,8 @@ class Sample(ctypes.Structure):
     _fields_ = [("valid", c_int32), ("value", c_int32), ("position", c_double),
                 ("velocity", c_double), ("voltage", c_double),
                 ("current", c_double), ("temperature_c", c_double),
-                ("supply_current_a", c_double)]
+                ("supply_current_a", c_double), ("forward_limit", c_int32),
+                ("reverse_limit", c_int32)]
 
 
 class MotorRequest(ctypes.Structure):
@@ -196,6 +197,9 @@ _TESTING_SIGNATURES = {
                                                c_double, c_double,
                                                c_uint32, c_uint32,
                                                c_double, c_double]),
+    "talos_sim_hardware_set_limit_switches": (c_int32, [c_void_p, c_char_p,
+                                                        c_char_p, c_int32,
+                                                        c_int32]),
     "talos_sim_hardware_set_digital_input": (c_int32, [c_void_p, c_char_p,
                                                        c_char_p, c_int32]),
     "talos_sim_hardware_set_analog_input": (c_int32, [c_void_p, c_char_p,

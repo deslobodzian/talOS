@@ -104,7 +104,7 @@ Handles are named by their device key in the subsystem config
 
 | C++ | Python |
 |---|---|
-| `talos::Motor m{node, "roller"}`: `set_duty_cycle`, `set_voltage`, `set_velocity`, `set_position`, `set_motion_magic` (`ff_volts`, `slot`), `stop`; `position()`, `velocity()`, `voltage()`, `current()` (stator A), `temperature_c()`, `supply_current_a()`, `connected()`, `clamped_count()` | `talos.Motor(node, "roller")`, getters as properties; demands/feedforward clamp to configured limits, non-finite input neutralizes the motor; `clamped_count` counts adjusted setter calls |
+| `talos::Motor m{node, "roller"}`: `set_duty_cycle`, `set_voltage`, `set_velocity`, `set_position`, `set_motion_magic` (`ff_volts`, `slot`), `stop`; `position()`, `velocity()`, `voltage()`, `current()` (stator A), `temperature_c()`, `supply_current_a()`, `connected()`, `clamped_count()`, `forward_limit()`, `reverse_limit()` | `talos.Motor(node, "roller")`, getters as properties; demands/feedforward clamp to configured limits, non-finite input neutralizes the motor; `clamped_count` counts adjusted setter calls |
 | `CANcoder`, `Gyro` (`yaw`, `yaw_rate`), `Encoder`, `DigitalInput` (`get()`), `AnalogInput` (`voltage()`), `DigitalOutput`, `PwmOutput` (`set()`) | same names; `DigitalInput.value`; DIO/PWM commands are gated on `robot_enabled` (false/zero while disabled or state is stale) |
 | `talos::DriverStation ds{node}`: `connected()`, `enabled()`, `autonomous()`, `teleop()`, `test()`, `estop()`, `alliance()`, `match_time()`, `joystick(port)` → `axis(i)`, `button(n)` (1-based), `pov(i)` | `talos.DriverStation(node)`, same as properties/methods |
 | `talos::robot_enabled(node)` | `talos.robot_enabled(node)` |
@@ -119,6 +119,14 @@ Check `connected`/link freshness before using readings; numeric getters latch
 the last received sample when the hardware link is stale. SimHardware
 `set_motor(..., temperature_c=..., supply_current_a=...)` injects diagnostics
 through the same wire codec (C++ takes these optional arguments after ages).
+
+`forward_limit()` / `reverse_limit()` (properties in Python) are true while an
+enabled switch on the TalonFX's own forward or reverse limit input
+([talOS/hardware](../talOS/hardware/README.md)) is asserted, so the TalonFX
+holds output that way neutral; homing can drive toward a switch until it reads
+true. Unlike the numeric getters they do not latch: they read false unless
+`connected()`. SimHardware `set_limit_switches(node, device, forward,
+reverse)` asserts them; it does not stop the request or the ideal motor.
 
 `Motor::rezero(position_rot = 0)` and `Gyro::rezero(yaw_rot = 0)` (same
 methods in Python) set a software offset shared by all handles for that device

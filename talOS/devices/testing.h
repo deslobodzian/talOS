@@ -75,6 +75,13 @@ class SimHardware {
                  std::uint32_t position_age_us = 0,
                  std::uint32_t velocity_age_us = 0, double temperature_c = 0,
                  double supply_current_a = 0);
+  // The motor's TalonFX limit switches, asserted or not, reported from the
+  // next state on as its ForwardHardLimit/ReverseHardLimit fault bits
+  // (Motor::forward_limit, reverse_limit) while it is connected. Reported
+  // only: like soft limits, an asserted switch does not stop the request or
+  // the ideal motor.
+  void set_limit_switches(std::string_view node, std::string_view device,
+                          bool forward, bool reverse);
   void set_digital_input(std::string_view node, std::string_view device,
                          bool value);
   void set_analog_input(std::string_view node, std::string_view device,

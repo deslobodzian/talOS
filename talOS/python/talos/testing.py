@@ -216,6 +216,13 @@ class SimHardware:
                   velocity, position_age_us, velocity_age_us,
                   temperature_c, supply_current_a)
 
+    def set_limit_switches(self, node, device, forward=False, reverse=False):
+        """The motor's TalonFX limit switches, asserted or not, from the next
+        state on (SimHardware::set_limit_switches); reported only, the
+        request and the ideal motor are not stopped."""
+        self._set(lib.talos_sim_hardware_set_limit_switches, node, device,
+                  bool(forward), bool(reverse))
+
     def set_digital_input(self, node, device, value):
         self._set(lib.talos_sim_hardware_set_digital_input, node, device,
                   bool(value))

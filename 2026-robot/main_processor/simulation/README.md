@@ -70,13 +70,21 @@ Device targets use logical TOML device names, not physical CAN IDs.
 | `supply_voltage` | `all` | Require fifth field, volts in `[0,16]`; restore 12 V at end |
 | `reset` | Motor or sensor name | One device-reset edge on the first tick at/after start |
 | `udp_blackout` | `bridge` | Drop **all outbound UDP**, including DS, hardware state and config ACKs |
+| `forward_limit` | Motor name | Press the switch on its TalonFX forward limit input until the interval ends |
+| `reverse_limit` | Motor name | Press the switch on its TalonFX reverse limit input until the interval ends |
 
 Unknown devices and overlapping intervals of the same kind/target are rejected.
 Blackouts do not stop incoming commands, physics or gateway safety ticks;
 suppressed packets are discarded, never replayed after recovery.
+A pressed switch that the motor's config enables holds output toward it
+neutral and reports the asserted limit (`Motor::forward_limit()` /
+`reverse_limit()`); a disabled one does nothing. Hold a switch pressed for the
+whole run to rehearse a normally closed switch with a cut wire.
 The bridge's `/hw/status.motor_fault_mask` uses configured motor order and
 marks invalid feedback as well as controller fault flags other than an
-asserted soft or hard limit (`talos::hardware::MotorFaulted`).
+asserted soft or hard limit (`talos::hardware::MotorFaulted`);
+`motor_forward_limit_mask` and `motor_reverse_limit_mask`, in the same order,
+mark the asserted switches.
 
 ```sh
 bazel run //2026-robot/main_processor/simulation:sim_gateway -- \

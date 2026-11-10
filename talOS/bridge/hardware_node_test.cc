@@ -410,23 +410,34 @@ TEST(HardwareNodeTest, ReportsLatestGatewayHealthAndConfiguredMotorFaults) {
   EXPECT_DOUBLE_EQ(status.can_utilization_frac(), 0.81);
   EXPECT_EQ(status.motor_fault_mask(), 2u);
   state.health = {};
+  EXPECT_EQ(status.motor_forward_limit_mask(), 0u);
+  EXPECT_EQ(status.motor_reverse_limit_mask(), 0u);
   // Soft and hard limits asserted (FaultField bits 14-17) are normal
-  // operation, such as a homed mechanism resting on its limit switch.
+  // operation, such as a homed mechanism resting on its limit switch, but
+  // the hard-limit bits are reported per direction: a normally closed switch
+  // with a cut wire reads asserted forever and is a fault in nothing else.
   state.motors[0].fault_flags = 0x3C000;
   state.sample_time_us++;
   ASSERT_TRUE(InjectState(node, gateway, state, 1002000));
   EXPECT_FALSE(node.Status(1002000).health_valid());
   EXPECT_EQ(node.Status(1002000).motor_fault_mask(), 0u);
-  // An invalid sample needs attention even without a controller fault code.
-  // IDs are deliberately in reverse order: mask bits follow configuration.
+  EXPECT_EQ(node.Status(1002000).motor_forward_limit_mask(), 2u);
+  EXPECT_EQ(node.Status(1002000).motor_reverse_limit_mask(), 2u);
+  // An invalid sample needs attention even without a controller fault code,
+  // and its limit bits say nothing. IDs are deliberately in reverse order:
+  // mask bits follow configuration.
   state.motors[1].valid = false;
+  state.motors[1].fault_flags = kMotorForwardHardLimitFlag;
   state.sample_time_us++;
   ASSERT_TRUE(InjectState(node, gateway, state, 1003000));
   EXPECT_EQ(node.Status(1003000).motor_fault_mask(), 1u);
+  EXPECT_EQ(node.Status(1003000).motor_forward_limit_mask(), 2u);
   state.motors[1].valid = true;
   state.sample_time_us++;
   ASSERT_TRUE(InjectState(node, gateway, state, 1004000));
   EXPECT_EQ(node.Status(1004000).motor_fault_mask(), 0u);
+  EXPECT_EQ(node.Status(1004000).motor_forward_limit_mask(), 3u);
+  EXPECT_EQ(node.Status(1004000).motor_reverse_limit_mask(), 2u);
 }
 
 TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {

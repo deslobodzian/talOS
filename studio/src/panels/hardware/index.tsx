@@ -158,7 +158,9 @@ function HardwarePanel() {
       {seconds: 120});
   const age = useSeries([`${HW}state_age_us`], {seconds: 120});
   const masks = useSeries(
-      [`${HW}timed_out_mask`, `${HW}motor_fault_mask`], 'all');
+      [`${HW}timed_out_mask`, `${HW}motor_fault_mask`,
+       `${HW}motor_forward_limit_mask`, `${HW}motor_reverse_limit_mask`],
+      'all');
 
   const present = useMemo(() => new Set(dictionary.map(c => c.name)), [dictionary]);
   const counterNames = useMemo(
@@ -216,6 +218,10 @@ function HardwarePanel() {
   const timedOutBits = bitHistory(
       masks.times, masks.values[`${HW}timed_out_mask`], subsystemCount ?? 32);
   const faultBits = bitHistory(masks.times, masks.values[`${HW}motor_fault_mask`]);
+  const forwardLimitBits = bitHistory(
+      masks.times, masks.values[`${HW}motor_forward_limit_mask`]);
+  const reverseLimitBits = bitHistory(
+      masks.times, masks.values[`${HW}motor_reverse_limit_mask`]);
 
   return <div className="hardware">
     <FreshnessNotice prefix={HW}/>
@@ -315,6 +321,22 @@ function HardwarePanel() {
                bits={faultBits} prefix="motor"
                empty="No motor fault flags are set."
                endSec={endSec}/>
+    </section>
+
+    <section className="card wide">
+      <div className="card-heading"><h2>Motor limit switches</h2><span>ASSERTED</span></div>
+      <BitList title="Forward limit (config order)" channel={`${HW}motor_forward_limit_mask`}
+               bits={forwardLimitBits} prefix="motor"
+               empty="No forward limit switch is asserted."
+               endSec={endSec}/>
+      <BitList title="Reverse limit (config order)" channel={`${HW}motor_reverse_limit_mask`}
+               bits={reverseLimitBits} prefix="motor"
+               empty="No reverse limit switch is asserted."
+               endSec={endSec}/>
+      <p className="chart-note">
+        A switch asserted at the end of travel is normal; one that stays
+        asserted away from it is a normally closed switch with a cut wire.
+      </p>
     </section>
   </div>;
 }

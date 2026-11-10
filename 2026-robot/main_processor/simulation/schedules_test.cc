@@ -14,7 +14,8 @@ TEST(Schedules, RejectsMalformedFaultsRatherThanSilentlySkippingThem) {
         "0:inf:reset:drive", "0:1:unknown:drive", "0:1:udp_blackout:drive",
         "0:1:supply_voltage:all:17", "0:1:supply_voltage:drive:6",
         "0:1:supply_voltage:all", "0:1:freeze:drive:4",
-        "0:2:freeze:drive|1:3:freeze:drive"}) {
+        "0:2:freeze:drive|1:3:freeze:drive", "0:1:forward_limit:drive:4",
+        "0:2:reverse_limit:drive|1:3:reverse_limit:drive"}) {
     EXPECT_THROW(ParseFaults(spec), std::invalid_argument) << spec;
   }
 }
@@ -74,6 +75,38 @@ TEST(Schedules, FrozenFeedbackHoldsThenReleasesTheSample) {
   ApplyFaults(events, 2, backend);
   ASSERT_TRUE(backend.Read(state));
   EXPECT_GT(state.motors[0].velocity_rps, 0);
+}
+
+// A pressed switch is what the TalonFX sees: output toward it is held neutral
+// and the motor reports the asserted limit, for the interval only.
+TEST(Schedules, LimitSwitchIntervalsPressTheMotorsSwitch) {
+  talos::hardware::Config config;
+  config.motors.push_back({.id = 1, .name = "drive", .can_id = 1});
+  config.sensors.push_back({.id = 2, .name = "encoder", .can_id = 2});
+  talos::hardware::sim::PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(config));
+  auto sensor = ParseFaults("0:1:forward_limit:encoder");
+  EXPECT_THROW(ResolveFaults(sensor, config), std::invalid_argument);
+  auto events = ParseFaults("1:2:forward_limit:drive|2:3:reverse_limit:drive");
+  ResolveFaults(events, config);
+  const std::array<talos::hardware::MotorRequest, 1> request{{
+      {1, talos::hardware::Mode::kVoltage, 0, 6, 0},
+  }};
+  ASSERT_TRUE(backend.Apply(request));
+  talos::hardware::State state;
+  const auto flags_at = [&](double elapsed_s) {
+    ApplyFaults(events, elapsed_s, backend);
+    backend.Step(0.01);
+    EXPECT_TRUE(backend.Read(state));
+    return state.motors[0].fault_flags;
+  };
+  EXPECT_EQ(flags_at(0), 0u);
+  EXPECT_GT(backend.applied_voltage(0), 0);
+  EXPECT_EQ(flags_at(1), talos::hardware::kMotorForwardHardLimitFlag);
+  EXPECT_DOUBLE_EQ(backend.applied_voltage(0), 0);
+  EXPECT_EQ(flags_at(2), talos::hardware::kMotorReverseHardLimitFlag);
+  EXPECT_GT(backend.applied_voltage(0), 0);
+  EXPECT_EQ(flags_at(3), 0u);
 }
 
 TEST(Schedules, AdjacentFaultsRestoreBeforeActivatingInAnyInputOrder) {

@@ -373,6 +373,23 @@ can_id = 3
         self.assertIsNone(signals.encoder.position_time)
         self.assertIsNone(signals.gyro.yaw_rate_time)
 
+    def test_limit_switches_read_only_from_a_connected_sample(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        lift = sim.add(Lift, "lift").lift
+        hw = SimHardware(sim)
+        hw.set_limit_switches("lift", "lift", forward=True)
+        sim.step(0.02)
+        self.assertEqual((lift.forward_limit, lift.reverse_limit),
+                         (True, False))
+        hw.set_limit_switches("lift", "lift", reverse=True)
+        sim.step(0.02)
+        self.assertEqual((lift.forward_limit, lift.reverse_limit),
+                         (False, True))
+        del hw
+        sim.step(0.15)  # past [robot] command_timeout_us
+        self.assertFalse(lift.connected)
+        self.assertFalse(lift.reverse_limit)
+
     def test_neutral_when_disabled_and_requests_when_enabled(self):
         sim = Sim.from_toml(ROBOT_TOML)
         lift = sim.add(Lift, "lift")

@@ -318,6 +318,7 @@ class PhysicsSimBackend final : public Backend {
         out.stator_current_a = 0;
         out.temperature_c = 0;
         out.supply_current_a = 0;
+        out.fault_flags = 0;
         continue;
       }
       healthy = true;
@@ -340,6 +341,7 @@ class PhysicsSimBackend final : public Backend {
       // ambient temperature; not electrical or thermal models.
       out.supply_current_a = std::abs(out.voltage) / 12.0 * m.supply_limit_a;
       out.temperature_c = 25.0;
+      out.fault_flags = HardLimitFlags(i);
       EnforceSoftLimits(m, out, i);
       held_[i] = out;
     }
@@ -454,8 +456,10 @@ class PhysicsSimBackend final : public Backend {
   // limit input. It models a correctly wired switch: an enabled one of either
   // type is asserted while pressed, and the motor's output toward it goes
   // neutral as on the TalonFX. A follower takes its master's output; its own
-  // switches are not modelled. The Phoenix fault bits for an asserted hard
-  // limit are not reported.
+  // switches are not modelled. While such a switch is asserted the motor
+  // reports its ForwardHardLimit or ReverseHardLimit fault bit
+  // (kMotorForwardHardLimitFlag, kMotorReverseHardLimitFlag), as PhoenixBackend
+  // reports the TalonFX's FaultField.
   void SetForwardLimitPressed(uint16_t motor_id, bool pressed) {
     if (const int i = MotorIndex(motor_id); i >= 0)
       forward_pressed_[i] = pressed;
@@ -743,6 +747,19 @@ class PhysicsSimBackend final : public Backend {
             m.forward_limit_switch != LimitSwitch::kDisabled) ||
            (volts < 0.0 && reverse_pressed_[i] &&
             m.reverse_limit_switch != LimitSwitch::kDisabled);
+  }
+
+  // The FaultField bits of motor i's asserted, enabled limit switches; a
+  // follower's own switches are not modelled.
+  uint32_t HardLimitFlags(std::size_t i) const {
+    const auto& m = config_.motors[i];
+    if (m.master_id != 0) return 0;
+    uint32_t flags = 0;
+    if (forward_pressed_[i] && m.forward_limit_switch != LimitSwitch::kDisabled)
+      flags |= kMotorForwardHardLimitFlag;
+    if (reverse_pressed_[i] && m.reverse_limit_switch != LimitSwitch::kDisabled)
+      flags |= kMotorReverseHardLimitFlag;
+    return flags;
   }
 
   bool FeedbackValid(std::size_t i) const {

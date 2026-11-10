@@ -457,6 +457,7 @@ TEST(SimFollowers, FollowerTakesItsMasterDirectionNotItsOwnInverted) {
 // neutral in every mode (here duty cycle, which soft limits in the gateway do
 // not check) while reverse output still drives off it; a disabled input does
 // nothing. Forward is the configured positive direction, inverted or not.
+// The asserted switch is reported as the FaultField's ForwardHardLimit bit.
 TEST(SimLimitSwitches, PressedForwardSwitchStopsOnlyForwardOutput) {
   for (const bool disabled : {false, true}) {
     Config c = SingleMotorConfig();
@@ -473,15 +474,21 @@ TEST(SimLimitSwitches, PressedForwardSwitchStopsOnlyForwardOutput) {
     if (disabled) {
       EXPECT_GT(backend.applied_voltage(0), 5.0);
       EXPECT_GT(std::abs(s.motors[0].velocity_rps), 10.0);
+      EXPECT_EQ(s.motors[0].fault_flags, 0u);
       continue;
     }
     EXPECT_DOUBLE_EQ(backend.applied_voltage(0), 0.0);
     EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 0.0);
+    EXPECT_EQ(s.motors[0].fault_flags, kMotorForwardHardLimitFlag);
+    EXPECT_FALSE(MotorFaulted(s.motors[0].fault_flags));
     cmd[0] = Duty(1, -0.5);
     ASSERT_TRUE(backend.Apply(cmd));
     StepBackend(backend, s, now_us, 5000, 100);
     EXPECT_LT(backend.applied_voltage(0), -5.0);
     EXPECT_GT(std::abs(s.motors[0].velocity_rps), 10.0);
+    backend.SetForwardLimitPressed(1, false);
+    StepBackend(backend, s, now_us, 5000, 1);
+    EXPECT_EQ(s.motors[0].fault_flags, 0u);
   }
 }
 

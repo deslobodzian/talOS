@@ -68,6 +68,7 @@ struct SimHardware::Impl {
   bool ideal = false;
 
   std::map<std::uint16_t, MotorAxis> motors;
+  std::map<std::uint16_t, std::uint32_t> motor_limit_flags;
   std::map<std::uint16_t, Axis> sensors, encoders;
   std::map<std::uint16_t, bool> digital_inputs;
   std::map<std::uint16_t, double> analog_inputs;
@@ -293,14 +294,16 @@ struct SimHardware::Impl {
         return hardware::MotorSample{.id = c.id};
       }
       const MotorAxis axis = ValueOr(motors, c.id, MotorAxis{});
-      return hardware::MotorSample{.id = c.id,
-                                   .valid = true,
-                                   .position_rot = axis.position,
-                                   .velocity_rps = axis.velocity,
-                                   .position_age_us = axis.position_age_us,
-                                   .velocity_age_us = axis.velocity_age_us,
-                                   .temperature_c = axis.temperature_c,
-                                   .supply_current_a = axis.supply_current_a};
+      return hardware::MotorSample{
+          .id = c.id,
+          .valid = true,
+          .position_rot = axis.position,
+          .velocity_rps = axis.velocity,
+          .position_age_us = axis.position_age_us,
+          .velocity_age_us = axis.velocity_age_us,
+          .fault_flags = ValueOr(motor_limit_flags, c.id, 0u),
+          .temperature_c = axis.temperature_c,
+          .supply_current_a = axis.supply_current_a};
     });
     fill(state.sensors, state.sensor_count, hw.sensors, [&](const auto& c) {
       if (!Connected(Kind::kCANcoder, c.id)) {
@@ -396,6 +399,8 @@ struct SimHardware::Impl {
         state.health.brownout,
         state.health.can_utilization_frac,
         0,
+        0,
+        0,
         state.counters.rejected_command_count,
         state.counters.neutralized_motor_count,
         state.counters.apply_failure_count,
@@ -455,6 +460,14 @@ void SimHardware::set_motor(std::string_view node, std::string_view device,
       {position, velocity, position_age_us, velocity_age_us},
       temperature_c,
       supply_current_a};
+}
+
+void SimHardware::set_limit_switches(std::string_view node,
+                                     std::string_view device, bool forward,
+                                     bool reverse) {
+  impl_->motor_limit_flags[impl_->Id(node, Kind::kMotor, device)] =
+      (forward ? hardware::kMotorForwardHardLimitFlag : 0u) |
+      (reverse ? hardware::kMotorReverseHardLimitFlag : 0u);
 }
 
 void SimHardware::set_digital_input(std::string_view node,

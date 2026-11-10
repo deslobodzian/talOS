@@ -427,6 +427,41 @@ TEST(Devices, MotorHealthFeedbackRoundTripsWithoutEnablingOutputs) {
   EXPECT_DOUBLE_EQ(mech.a.supply_current_a(), 9.5);
 }
 
+// The TalonFX's own limit switches read as asserted only from a connected
+// sample; unlike the numeric getters, a stale or invalid one is not latched.
+TEST(Devices, MotorLimitSwitchesReadOnlyFromAConnectedSample) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  auto hw = std::make_unique<SimHardware>(sim);
+  sim.step(10ms);
+  EXPECT_TRUE(mech.a.connected());
+  EXPECT_FALSE(mech.a.forward_limit());
+  EXPECT_FALSE(mech.a.reverse_limit());
+
+  hw->set_limit_switches("mech", "a", true, false);
+  sim.step(10ms);
+  EXPECT_TRUE(mech.a.forward_limit());
+  EXPECT_FALSE(mech.a.reverse_limit());
+  EXPECT_FALSE(mech.b.forward_limit());
+
+  hw->set_limit_switches("mech", "a", false, true);
+  sim.step(10ms);
+  EXPECT_FALSE(mech.a.forward_limit());
+  EXPECT_TRUE(mech.a.reverse_limit());
+
+  hw->set_connected("mech", "a", false);
+  sim.step(10ms);
+  EXPECT_FALSE(mech.a.reverse_limit());
+  hw->set_connected("mech", "a", true);
+  sim.step(10ms);
+  EXPECT_TRUE(mech.a.reverse_limit());
+
+  hw.reset();
+  sim.step(150ms);
+  EXPECT_FALSE(mech.a.connected());
+  EXPECT_FALSE(mech.a.reverse_limit());
+}
+
 TEST(Devices, AcquisitionTimesSubtractEachSignalsAge) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");

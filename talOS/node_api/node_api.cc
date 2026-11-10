@@ -109,7 +109,7 @@ static_assert(offsetof(TalosParam, string) == 24);
 static_assert(offsetof(TalosParam, count) == 32);
 static_assert(offsetof(TalosParam, numbers) == 40);
 static_assert(offsetof(TalosParam, strings) == 48);
-static_assert(sizeof(TalosSample) == 56);
+static_assert(sizeof(TalosSample) == 64);
 static_assert(offsetof(TalosSample, valid) == 0);
 static_assert(offsetof(TalosSample, value) == 4);
 static_assert(offsetof(TalosSample, position) == 8);
@@ -118,6 +118,8 @@ static_assert(offsetof(TalosSample, voltage) == 24);
 static_assert(offsetof(TalosSample, current) == 32);
 static_assert(offsetof(TalosSample, temperature_c) == 40);
 static_assert(offsetof(TalosSample, supply_current_a) == 48);
+static_assert(offsetof(TalosSample, forward_limit) == 56);
+static_assert(offsetof(TalosSample, reverse_limit) == 60);
 static_assert(sizeof(TalosJoystick) == 116);
 static_assert(offsetof(TalosJoystick, connected) == 0);
 static_assert(offsetof(TalosJoystick, axis_count) == 4);
@@ -635,7 +637,9 @@ int32_t talos_pwm_set(TalosNode* node, int64_t index, double output) {
 int32_t talos_motor_sample(TalosNode* node, int64_t index, TalosSample* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     TalosSample& o = *Out(out);
-    const auto s = HardwareAccess::motor_sample(Link(node), Index(index));
+    const auto& link = Link(node);
+    const auto i = Index(index);
+    const auto s = HardwareAccess::motor_sample(link, i);
     o.valid = s.valid;
     o.position = s.position_rot;
     o.velocity = s.velocity_rps;
@@ -643,6 +647,8 @@ int32_t talos_motor_sample(TalosNode* node, int64_t index, TalosSample* out) {
     o.current = s.stator_current_a;
     o.temperature_c = s.temperature_c;
     o.supply_current_a = s.supply_current_a;
+    o.forward_limit = HardwareAccess::motor_hard_limit(link, i, true);
+    o.reverse_limit = HardwareAccess::motor_hard_limit(link, i, false);
     return TALOS_OK;
   });
 }

@@ -248,6 +248,19 @@ int32_t talos_sim_hardware_set_motor(TalosSimHardware* hw, const char* node,
   });
 }
 
+int32_t talos_sim_hardware_set_limit_switches(TalosSimHardware* hw,
+                                              const char* node,
+                                              const char* device,
+                                              int32_t forward,
+                                              int32_t reverse) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    AsHardware(hw).set_limit_switches(NonNull(node, "node"),
+                                      NonNull(device, "device"), forward != 0,
+                                      reverse != 0);
+    return TALOS_OK;
+  });
+}
+
 int32_t talos_sim_hardware_set_digital_input(TalosSimHardware* hw,
                                              const char* node,
                                              const char* device,

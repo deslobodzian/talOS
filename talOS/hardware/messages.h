@@ -64,6 +64,11 @@ struct MotorSample {
 // a homed mechanism resting on its limit switch, or a motor held at a soft
 // limit, is operating normally, so these bits are not a fault.
 inline constexpr uint32_t kMotorLimitAssertedFlags = uint32_t{0xF} << 14;
+// ForwardHardLimit and ReverseHardLimit: an enabled switch on the TalonFX's
+// own forward or reverse limit input is asserted, and the TalonFX holds output
+// toward it neutral (Motor::forward_limit, reverse_limit).
+inline constexpr uint32_t kMotorForwardHardLimitFlag = uint32_t{1} << 16;
+inline constexpr uint32_t kMotorReverseHardLimitFlag = uint32_t{1} << 17;
 // Whether the controller reports a fault other than an asserted limit.
 inline constexpr bool MotorFaulted(uint32_t fault_flags) {
   return (fault_flags & ~kMotorLimitAssertedFlags) != 0;

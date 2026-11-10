@@ -95,15 +95,20 @@ default, so a motor with nothing on its limit pins is unchanged, and one that
 already has a switch there already obeys it. A normally closed setting with
 no switch wired reads asserted and stops that direction. Only the motor's own
 pins are supported (no remote CANcoder or CANdi source, no position autoset).
-Both settings are in the configuration fingerprint and wire format. The State
-has no switch field a node can read; an asserted switch shows only as the
-ForwardHardLimit/ReverseHardLimit bit of the motor's Phoenix fault bitfield.
-Those bits are not counted as faults (`MotorFaulted`), so a normally closed
-switch whose wire is cut holds its direction neutral without raising
-`/hw/status` `motor_fault_mask`; only the RoboRIO's per-motor fault log shows it.
-`sim::PhysicsSimBackend` holds forward or reverse output neutral while a test
-presses a switch (`SetForwardLimitPressed`/`SetReverseLimitPressed`); the ideal
-`SimBackend` and `sim_gateway` have no way to press one.
+Both settings are in the configuration fingerprint and wire format. An
+asserted switch is the ForwardHardLimit/ReverseHardLimit bit of the motor's
+Phoenix fault bitfield (`kMotorForwardHardLimitFlag`,
+`kMotorReverseHardLimitFlag`), which a node reads as `Motor::forward_limit()` /
+`reverse_limit()`. Those bits are not counted as faults (`MotorFaulted`): a
+normally closed switch whose wire is cut holds its direction neutral without
+raising `/hw/status` `motor_fault_mask`, but it shows, as a switch that stays
+asserted away from the end of travel, in `motor_forward_limit_mask` /
+`motor_reverse_limit_mask`.
+`sim::PhysicsSimBackend` holds forward or reverse output neutral, and reports
+the bit, while a test presses a switch
+(`SetForwardLimitPressed`/`SetReverseLimitPressed`; `sim_gateway`'s
+`forward_limit`/`reverse_limit` fault schedule); the ideal `SimBackend` has no
+way to press one.
 
 Each `[subsystems.<sub>.motors.<motor>.slot0]` (also `slot1`, `slot2`) accepts
 `gravity_type = "ElevatorStatic"` (default; alias `"Elevator"`) or

@@ -45,6 +45,13 @@ struct BridgeStatus {
   // Bit i (configured motor order): invalid feedback or controller fault flags
   // other than an asserted soft or hard limit (hardware::MotorFaulted).
   motor_fault_mask:uint32;
+  // Bit i (configured motor order): a valid sample reports the TalonFX's
+  // forward (reverse) hardware limit switch asserted
+  // (hardware::kMotorForwardHardLimitFlag, kMotorReverseHardLimitFlag), so it
+  // holds output that way neutral. Normal at the end of travel; a bit that
+  // stays set away from it is a normally closed switch with a cut wire.
+  motor_forward_limit_mask:uint32;
+  motor_reverse_limit_mask:uint32;
   gateway_rejected_command_count:uint32;
   gateway_neutralized_motor_count:uint32;
   gateway_apply_failure_count:uint32;

@@ -41,7 +41,9 @@ enum class FaultKind {
   kFreeze,
   kSupply,
   kReset,
-  kBlackout
+  kBlackout,
+  kForwardLimit,
+  kReverseLimit
 };
 
 struct FaultEvent {
@@ -80,6 +82,10 @@ inline std::vector<FaultEvent> ParseFaults(const std::string& spec) {
       event.kind = FaultKind::kReset;
     } else if (kind == "udp_blackout") {
       event.kind = FaultKind::kBlackout;
+    } else if (kind == "forward_limit") {
+      event.kind = FaultKind::kForwardLimit;
+    } else if (kind == "reverse_limit") {
+      event.kind = FaultKind::kReverseLimit;
     } else {
       throw std::invalid_argument("unknown fault: " + kind);
     }
@@ -166,6 +172,10 @@ inline bool ApplyFaults(std::vector<FaultEvent>& events, double elapsed_s,
       }
     } else if (event.kind == FaultKind::kSupply) {
       backend.SetSupplyVoltage(active ? event.volts : 12.0);
+    } else if (event.kind == FaultKind::kForwardLimit) {
+      backend.SetForwardLimitPressed(event.id, active);
+    } else if (event.kind == FaultKind::kReverseLimit) {
+      backend.SetReverseLimitPressed(event.id, active);
     } else {
       blackout |= active;
     }

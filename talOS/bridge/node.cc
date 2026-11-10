@@ -19,7 +19,7 @@ namespace talos::hardware {
 // 8-byte alignment (talos::kMessageAlignment). ipc::Publisher lays the slot out
 // at alignof(Message), so the two agree only while this holds.
 static_assert(alignof(bridge::BridgeStatus) == 8);
-static_assert(sizeof(bridge::BridgeStatus) == 176,
+static_assert(sizeof(bridge::BridgeStatus) == 184,
               "BridgeStatus size changed; update docs/DATA_FLOW.md");
 // Each actuator-owning subsystem owns at least one such device.
 static_assert(kMaxMotors + kMaxDigitalOutputs + kMaxPwmOutputs <= 32,
@@ -612,12 +612,22 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
     ++bit;
   }
   uint32_t motor_fault_mask = 0;
+  uint32_t forward_limit_mask = 0;
+  uint32_t reverse_limit_mask = 0;
   for (std::size_t i = 0; i < config_.motors.size() && i < 32; ++i) {
     for (std::size_t j = 0; j < latest_state_.motor_count; ++j) {
-      if (latest_state_.motors[j].id == config_.motors[i].id &&
-          (!latest_state_.motors[j].valid ||
-           MotorFaulted(latest_state_.motors[j].fault_flags))) {
-        motor_fault_mask |= uint32_t{1} << i;
+      const MotorSample& sample = latest_state_.motors[j];
+      if (sample.id != config_.motors[i].id) continue;
+      const uint32_t motor_bit = uint32_t{1} << i;
+      if (!sample.valid || MotorFaulted(sample.fault_flags)) {
+        motor_fault_mask |= motor_bit;
+      }
+      if (!sample.valid) continue;
+      if ((sample.fault_flags & kMotorForwardHardLimitFlag) != 0) {
+        forward_limit_mask |= motor_bit;
+      }
+      if ((sample.fault_flags & kMotorReverseHardLimitFlag) != 0) {
+        reverse_limit_mask |= motor_bit;
       }
     }
   }
@@ -647,6 +657,8 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       latest_state_.health.brownout,
       latest_state_.health.can_utilization_frac,
       motor_fault_mask,
+      forward_limit_mask,
+      reverse_limit_mask,
       latest_state_.counters.rejected_command_count,
       latest_state_.counters.neutralized_motor_count,
       latest_state_.counters.apply_failure_count,

@@ -70,6 +70,10 @@ struct HardwareAccess {
   // accepted hardware state carries it.
   static hardware::MotorSample motor_sample(const HardwareLink& link,
                                             std::size_t index);
+  // Motor::forward_limit / reverse_limit: the sample's hardware-limit fault
+  // bit, false unless the sample is valid and the hardware state fresh.
+  static bool motor_hard_limit(const HardwareLink& link, std::size_t index,
+                               bool forward);
   static hardware::SensorSample sensor_sample(const HardwareLink& link,
                                               std::size_t index);
   static hardware::DigitalInputSample digital_input_sample(

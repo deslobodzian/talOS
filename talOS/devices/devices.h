@@ -135,6 +135,14 @@ class Motor {
   double supply_current_a() const;  // supply amps (not stator current)
 
   bool connected() const;  // sample valid and hardware state fresh
+  // Whether an enabled switch on the TalonFX's own forward (reverse) limit
+  // input is asserted, so the TalonFX holds output that way neutral: the
+  // motor's ForwardHardLimit (ReverseHardLimit) fault bit. Unlike the numeric
+  // getters it does not latch: false unless connected(), since a stale or
+  // invalid sample says nothing about the switch. A normally closed switch
+  // whose wire is cut reads asserted.
+  bool forward_limit() const;
+  bool reverse_limit() const;
   // Per-signal acquisition time on the node clock, with sample_time()'s
   // two-way mapping uncertainty. nullopt if disconnected, mapping/state
   // stale or invalid, or age unknown (UINT32_MAX).

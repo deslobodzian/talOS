@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 24u
+#define TALOS_NODE_ABI_VERSION 25u
 
 enum {
   TALOS_OK = 0,
@@ -242,6 +242,10 @@ typedef struct TalosSample {
 
   double temperature_c;     // controller temperature, Celsius (motor)
   double supply_current_a;  // supply amps (motor), distinct from stator amps
+  // Motor::forward_limit / reverse_limit: 1 while that TalonFX hardware limit
+  // switch is asserted; 0 unless the sample is valid and the state fresh.
+  int32_t forward_limit;
+  int32_t reverse_limit;
 } TalosSample;
 int32_t talos_motor_sample(TalosNode* node, int64_t index, TalosSample* out);
 int32_t talos_sensor_sample(TalosNode* node, int64_t index,
@@ -398,6 +402,12 @@ int32_t talos_sim_hardware_set_motor(TalosSimHardware* hw, const char* node,
                                      uint32_t velocity_age_us,
                                      double temperature_c,
                                      double supply_current_a);
+// SimHardware::set_limit_switches: the motor's forward and reverse TalonFX
+// limit switches, asserted (nonzero) or not, from the next state on.
+int32_t talos_sim_hardware_set_limit_switches(TalosSimHardware* hw,
+                                              const char* node,
+                                              const char* device,
+                                              int32_t forward, int32_t reverse);
 int32_t talos_sim_hardware_set_digital_input(TalosSimHardware* hw,
                                              const char* node,
                                              const char* device, int32_t value);
