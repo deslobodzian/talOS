@@ -141,6 +141,39 @@ sleep precision. Releasing a lane is not a mechanical brake.
   neutralizes without the bridge; launcher restart policy is visible in the
   manifest. Disable/release before recovery. Record neutral delay, PID attempts,
   restart count and recovery behavior; no automatic motion is acceptable.
+- [ ] Stall the RoboRIO loop (its watchdog). Over SSH on the RoboRIO as
+  `admin`, record every thread's scheduling class and realtime priority
+  (`ps -eLo pid,tid,cls,rtprio,comm`): the robot program's loop thread
+  (default, `TS`), `talos_watchdog` (`FF` 30), the CAN and Driver Station
+  (netcomm) threads and the interrupt threads; note whether `talos_watchdog`
+  sits above the threads that carry CAN frames. While applying a small
+  voltage, starve every default-scheduled thread with one `SCHED_FIFO` 20
+  spinner per core for a measured 300 ms:
+  `for c in 0 1; do taskset -c $c chrt -f 20 timeout 0.3 sh -c 'while :; do :; done' & done; wait`
+  (if the image lacks `taskset` or `chrt`, record that and skip). Expected:
+  the motor goes neutral within two loop periods plus 5 ms of the command's
+  expiry (`command_timeout_us`, 100 ms, after the older of its acceptance and
+  the State it was built from) even though the loop cannot run; with a DIO
+  output set and a PWM output driven (if the config has them), DIO false and
+  PWM disabled; one `talos loop watchdog` Driver Station error per stall with
+  the silence and the stall count; late ticks on the RIO console; after the
+  spinners exit, the loop takes the outputs back through its own checks.
+  Repeat at least 20 times and record every trial's stall-to-neutral time,
+  not only the first: a stall that preempts the loop inside a device call
+  leaves the watchdog waiting on that device's lock until the spinners exit.
+  Also record what the Driver Station showed during the stall (mode, robot
+  code, communications) and whether it disabled the robot: this is the
+  check of whether a lapse in the program's mode reports disables it, so
+  note which threads the listing shows the spinners also starved. Disable
+  and release before any re-enable.
+- [ ] RoboRIO loop priority. The loop runs at default scheduling. In the
+  same enabled session as the representative captures below, record the RIO
+  console's late-tick and longest-interval summaries over several minutes
+  of driving, then repeat the session and the stall check above with a
+  disposable build whose loop thread calls
+  `frc::SetCurrentThreadPriority(true, 20)` (below the watchdog's 30) before
+  its loop. Record late ticks, Driver Station and CAN health under both;
+  the decision is TODO.md RT-5.
 - [ ] Capture representative enabled sessions, fetch them (below) and run
   `bazel run //talOS/launcher:session_report -- --strict <session-dir>`.
   Expected: `/hw/state` median about 5 ms, p99 <10 ms, no 100 ms gap while

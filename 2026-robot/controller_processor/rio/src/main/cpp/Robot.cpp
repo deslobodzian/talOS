@@ -49,9 +49,10 @@ void Report(talos::rio::RioLog& log, uint16_t index, std::string_view text) {
   log.Post(event);
 }
 
-// The Driver Station's watchdog: it must hear the current mode every loop, or
-// it decides robot code has hung and disables the robot. This is the one piece
-// of TimedRobot's job that genuinely has to be done.
+// Reports the mode this program is running in, which the Driver Station
+// displays: the one piece of TimedRobot's job that has to be done. Whether a
+// lapse in these reports disables the robot is not established (docs/BENCH.md,
+// loop stall check); a stalled loop's outputs are LoopWatchdog's.
 void ObserveMode() {
   if (frc::DriverStation::IsDisabled()) {
     HAL_ObserveUserProgramDisabled();
@@ -76,12 +77,43 @@ uint32_t DriverStationModeFlags() {
   return flags;
 }
 
+// The loop watchdog's SCHED_FIFO priority: any realtime priority runs above
+// the loop thread (default scheduling). This one is meant to stay below the
+// kernel's threaded interrupt handlers (SCHED_FIFO 50 by default on
+// PREEMPT_RT), which may carry the CAN frames its NeutralOut needs; the
+// RoboRIO's actual thread priorities are unrecorded (docs/BENCH.md, loop stall
+// check). Desktop simulation keeps the default scheduling.
+#ifdef __FRC_ROBORIO__
+constexpr int kWatchdogPriority = 30;
+#else
+constexpr int kWatchdogPriority = 0;
+#endif
+
+class RioWatchdogOutputs final : public talos::rio::WatchdogOutputs {
+ public:
+  explicit RioWatchdogOutputs(PhoenixBackend& backend) : backend_{backend} {}
+  bool Neutralize() override { return backend_.WatchdogNeutral(); }
+  void Report(std::string_view text) override {
+    char details[256];
+    std::snprintf(details, sizeof(details), "%.*s",
+                  static_cast<int>(text.size()), text.data());
+    // printMsg also copies it to the console (the RoboRIO's netconsole log).
+    HAL_SendError(1, 1, 0, details, "talos loop watchdog", "", 1);
+  }
+
+ private:
+  PhoenixBackend& backend_;
+};
+
 }  // namespace
 
 void Robot::StartCompetition() {
   log_ = std::make_unique<talos::rio::RioLog>();
   log_->Start();
-  backend_ = std::make_unique<PhoenixBackend>(IsSimulation(), log_.get());
+  auto phoenix = std::make_unique<PhoenixBackend>(IsSimulation(), log_.get());
+  watchdog_outputs_ = std::make_unique<RioWatchdogOutputs>(*phoenix);
+  watchdog_ = std::make_unique<talos::rio::LoopWatchdog>(*watchdog_outputs_);
+  backend_ = std::move(phoenix);
 
   // A fresh boot id every start, so a command built against a previous boot's
   // state can never be accepted after a code restart.
@@ -91,8 +123,8 @@ void Robot::StartCompetition() {
   gateway_ = std::make_unique<talos::hardware::Gateway>(*backend_, boot_id);
   // The persisted configuration configures devices on the backend's worker,
   // polled by the loop below: a reboot with absent devices (each one a CAN
-  // timeout) must not hold back robot code start and the Driver Station
-  // watchdog. Until it completes the gateway is unconfigured and drives
+  // timeout) must not hold back robot code start or this loop's reports of
+  // its mode. Until it completes the gateway is unconfigured and drives
   // nothing.
   const auto restoring = talos::rio::BeginRestore(*gateway_, kConfigPath);
   const uint64_t restoring_id =
@@ -128,6 +160,9 @@ void Robot::StartCompetition() {
   // Tells the Driver Station that robot code is up. Nothing before this waits
   // on CAN: device configuration runs on the backend's worker.
   HAL_ObserveUserProgramStarting();
+
+  // Disarmed until a tick ends with a command in force.
+  watchdog_->Start(NowUs, kWatchdogPriority);
 
   auto period = std::chrono::microseconds{5000};
   auto next = std::chrono::steady_clock::now();
@@ -235,6 +270,17 @@ void Robot::StartCompetition() {
       gateway_->Tick(now_us, false);
     }
 
+    // Arms the watchdog only while a command is in force (a tick without one
+    // neutralized every output itself), with the time by which this loop's
+    // next tick would have invalidated it and beaten again: the gateway's
+    // expiry, plus one period for the tick that sees it and one more for that
+    // tick's own work before its beat, so an on-time loop is never acted on.
+    const uint64_t expiry_us = gateway_->command_expiry_us();
+    watchdog_->Beat(
+        now_us, expiry_us == 0
+                    ? 0
+                    : expiry_us + 2 * static_cast<uint64_t>(period.count()));
+
     // What the endpoint last heard, for the drive team's link report; atomic
     // stores only, the reporter thread does the publishing.
     {
@@ -276,6 +322,9 @@ void Robot::StartCompetition() {
     std::this_thread::sleep_until(next);
   }
 
+  // The loop no longer beats; the shutdown below neutralizes on its own.
+  watchdog_->Stop();
+
   // A configure still running on the backend's worker (the boot restore or a
   // push) owns the devices; neutralizing them now would race it. Poll it to
   // completion disabled, then neutralize what it built.
@@ -304,6 +353,8 @@ void Robot::StartCompetition() {
   // the hardware while those libraries are still alive.
   companion_.reset();
   companion_sink_.reset();
+  watchdog_.reset();
+  watchdog_outputs_.reset();
   endpoint_.reset();
   gateway_.reset();
   backend_.reset();

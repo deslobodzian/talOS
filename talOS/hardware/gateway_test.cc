@@ -468,6 +468,23 @@ TEST(Gateway, RejectsOldBootEpochSequenceAndDelayedCommands) {
   EXPECT_TRUE(
       g.Accept(Request(g), 0, 101000));  // A restarted companion can reconnect.
 }
+// The RoboRIO's loop watchdog arms on command_expiry_us, so it must be the
+// first tick time that invalidates the command, counted from the older of its
+// acceptance and the State it was built from.
+TEST(Gateway, CommandExpiryIsTheFirstTickThatInvalidatesTheCommand) {
+  FakeBackend backend;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, true);
+  EXPECT_EQ(g.command_expiry_us(), 0u);
+  ASSERT_TRUE(g.Accept(Request(g), 1, 30000));
+  const uint64_t expiry = g.command_expiry_us();
+  EXPECT_EQ(expiry, 1000 + g.config().command_timeout_us);
+  g.Tick(expiry - 1, true);
+  EXPECT_TRUE(g.snapshot().flags & kCommandActive);
+  g.Tick(expiry, true);
+  EXPECT_FALSE(g.snapshot().flags & kCommandActive);
+  EXPECT_EQ(g.command_expiry_us(), 0u);
+}
 TEST(Gateway, DisableAndTelemetryFailureInvalidateOutstandingCommands) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};

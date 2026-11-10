@@ -12,11 +12,12 @@
 
 // Diagnostics for the RoboRIO program, kept off its loop thread.
 //
-// That one thread is the only runtime enforcer of the command timeout and of
-// DIO/PWM neutral (Gateway::Tick). A report written from it (std::cerr is
-// unit-buffered: one write syscall per <<) can block on the console, and fault
-// bits such as the current limits toggle at the fault-field rate while the
-// robot accelerates hard. So the loop thread only copies a fixed-size
+// That one thread enforces the command timeout and DIO/PWM neutral
+// (Gateway::Tick); LoopWatchdog only backstops it once it stops ticking with
+// a command in force. A report written from it (std::cerr is unit-buffered:
+// one write syscall per <<) can block on the console, and fault bits such as
+// the current limits toggle at the fault-field rate while the robot
+// accelerates hard. So the loop thread only copies a fixed-size
 // LogEvent into a preallocated bounded queue, never waiting: a full queue
 // drops the event and counts it. A low-priority logger thread formats and
 // writes, at most one line per second for each (kind, device): the first

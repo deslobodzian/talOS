@@ -2,7 +2,8 @@
 // honesty: quadrature scaling from counts_per_rev, duty-cycle offsets, wrap
 // and connection validity, no demand teleport when controller voltage is zero
 // (missing gains exposed), neutral keeping rotor momentum with
-// brake/coast-dependent decay, follower gating and per-device recovery.
+// brake/coast-dependent decay, follower gating, per-device recovery and the
+// loop watchdog's neutral.
 #include "PhoenixBackend.h"
 
 #include <frc/simulation/DriverStationSim.h>
@@ -20,7 +21,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <span>
+#include <string_view>
 #include <thread>
 #include <tuple>
 
@@ -890,4 +893,72 @@ TEST_F(PhoenixBackendRecovery, SendFailureNeutralizesOnlyThatMotor) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   EXPECT_GT(follower_device.GetSimState().GetMotorVoltage().value(), 3.0);
+}
+
+class PhoenixBackendWatchdog : public ::testing::Test {
+ protected:
+  static std::mutex& DevicesMutex(PhoenixBackend& backend) {
+    return backend.devices_mutex_;
+  }
+  static std::string_view AppliedControl(PhoenixBackend& backend,
+                                         std::size_t i) {
+    return backend.motors_[i]->GetAppliedControl()->GetName();
+  }
+};
+
+// The loop watchdog's neutral, from its own thread: while a configure holds
+// the device lists it touches nothing and says so; otherwise every TalonFX
+// takes NeutralOut, DIO goes false and PWM disabled.
+TEST_F(PhoenixBackendWatchdog, NeutralizesEveryOutputUnlessAConfigureHoldsIt) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config c;
+  c.motors = {TestMotor(10, "left", 1), TestMotor(20, "right", 2)};
+  hw::DigitalOutputConfig d;
+  d.id = 40;
+  d.name = "solenoid";
+  d.dio = 5;
+  c.digital_outputs.push_back(d);
+  hw::PwmConfig p;
+  p.id = 50;
+  p.name = "servo";
+  p.channel = 0;
+  c.pwm_outputs.push_back(p);
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(c));
+  ASSERT_TRUE(AwaitReady(backend, c));
+
+  const std::array<hw::MotorRequest, 2> commands{
+      Request(10, hw::Mode::kVoltage, 6.0),
+      Request(20, hw::Mode::kVoltage, 6.0)};
+  ASSERT_TRUE(backend.ApplyOutputs(
+      std::array<hw::DigitalOutputRequest, 1>{{{40, true}}},
+      std::array<hw::PwmRequest, 1>{{{50, 0.75}}}));
+  hw::State state;
+  PumpReads(backend, state, commands, 5);
+  frc::sim::PWMSim pwm_sim{0};
+  ASSERT_GT(pwm_sim.GetPulseMicrosecond(), 0);
+
+  const auto neutral_from_another_thread = [&backend] {
+    bool sent = false;
+    std::thread watchdog{[&] { sent = backend.WatchdogNeutral(); }};
+    watchdog.join();
+    return sent;
+  };
+  {
+    const std::lock_guard configuring{DevicesMutex(backend)};
+    EXPECT_FALSE(neutral_from_another_thread());
+  }
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_TRUE(state.digital_outputs[0].value);
+  EXPECT_GT(pwm_sim.GetPulseMicrosecond(), 0);
+  EXPECT_EQ(AppliedControl(backend, 0), "VoltageOut");
+
+  EXPECT_TRUE(neutral_from_another_thread());
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_FALSE(state.digital_outputs[0].value);
+  EXPECT_DOUBLE_EQ(state.pwm_outputs[0].output, 0.0);
+  EXPECT_EQ(pwm_sim.GetPulseMicrosecond(), 0);
+  for (std::size_t i = 0; i < c.motors.size(); ++i)
+    EXPECT_EQ(AppliedControl(backend, i), "NeutralOut") << i;
 }

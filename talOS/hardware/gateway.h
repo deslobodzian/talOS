@@ -113,6 +113,15 @@ class Gateway {
   State snapshot() const;
   const Config& config() const { return config_; }
   bool configured() const { return configured_; }
+  // While a command is in force, the time (on Tick's clock) from which Tick
+  // invalidates it: its acceptance or the State it was built from, whichever
+  // is older, plus command_timeout_us. 0 while none is. The RoboRIO's loop
+  // watchdog arms on it.
+  uint64_t command_expiry_us() const {
+    if (!active_) return 0;
+    return (accepted_at_ < observed_at_ ? accepted_at_ : observed_at_) +
+           config_.command_timeout_us;
+  }
   // Precise failure behind the last rejected configuration, if the
   // backend could say more than "it failed".
   std::optional<ConfigError> config_error() const { return config_error_; }

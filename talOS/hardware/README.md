@@ -317,8 +317,8 @@ enable and e-stop.
 The adapter retries a failed gateway socket open once per second from its main
 loop, ticking the gateway disabled (all outputs neutral) until the socket opens.
 
-That loop is the only runtime enforcer of the command timeout and output
-neutral, so it never writes a report itself. `PhoenixBackend` and the adapter
+That loop enforces the command timeout and output neutral, so it never
+writes a report itself. `PhoenixBackend` and the adapter
 post fixed-size events (fault-field, feedback-validity, apply and neutral
 send transitions, device resets, brownout) to `RioLog`
 (`src/main/include/RioLog.h`): a preallocated 256-event queue that never
@@ -331,6 +331,39 @@ loop's timing faults: overruns (a tick's work, from wake to sleep, longer than
 the period) and late ticks (a tick starting more than 1.5 periods after the
 previous, a starved loop however short its work), with that second's longest
 work and interval. `State` has no field for these, so they are RIO-local.
+
+If the loop stops ticking right after it applied a command, nothing else
+stops the outputs: its TalonFX controls are one-shot (their device-side
+expiry is unmeasured), and DIO and PWM outputs hold their last value. So
+each tick ends with a beat to a loop watchdog
+(`src/main/include/LoopWatchdog.h`) carrying, while a command is still in
+force, the time by which the loop's next tick would have invalidated it: the
+gateway's `command_expiry_us()` (the older of the command's acceptance and
+the State it was built from, plus `command_timeout_us`) plus two loop
+periods (one for the tick that sees the expiry, one for that tick's work
+before its beat); with no command in force it carries nothing (that tick neutralized
+every output itself). The watchdog's own thread, at `SCHED_FIFO` 30 on the
+RoboRIO (above the loop's default scheduling), checks every 5 ms. Once that
+time has passed it disables PWM outputs, sets DIO outputs false and sends
+`NeutralOut` to every motor, on every check until a beat moves the time (so
+outputs a resumed loop re-applies on a stale clock reading before stalling
+again are neutralized again), and sends one Driver Station error per stall,
+`talos loop watchdog`, with the silence and a stall count. It touches only
+the device handles (Phoenix 6 serializes each device's control sends behind
+a per-device mutex; HAL DIO and PWM writes are safe from any thread), skips
+devices a configure is rebuilding, and does not act while the loop ticks on
+time. It is not a hard bound: if the loop was preempted inside a device call
+holding that device's lock (Phoenix's control mutex, the HAL DIO mutex;
+neither inherits priority), the watchdog waits there until the loop runs
+again, and so does every output after it. A refused realtime priority is
+reported the same way.
+
+The loop thread itself keeps default scheduling. A realtime loop would no
+longer be starved by ordinary processes, but it does UDP I/O, refreshes the
+Driver Station and, while disabled, syncs the configuration file, and a
+realtime thread that overruns or spins starves every thread below it,
+which may include the Driver Station link and CAN handling; its effect on
+late ticks is unmeasured ([bench check](../../docs/BENCH.md#fault-injection-and-timing)).
 
 The Driver Station shows green code and communications whether or not the
 companion is talking, so the adapter also reports the companion link
@@ -359,14 +392,17 @@ Build without deploying:
 ```sh
 cd 2026-robot/controller_processor/rio
 ./gradlew buildRio
-./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink
+./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog
 ```
 
 WPILib desktop simulation (`./gradlew simulateNative`) runs the same gateway
 against `PhoenixBackend` with Phoenix sim state. The RoboRIO program derives
 from `frc::RobotBase`, not `frc::TimedRobot`, and runs its own fixed-rate
-loop. It refreshes and forwards Driver Station data and reports the current
-mode to feed the Driver Station watchdog.
+loop. It refreshes and forwards Driver Station data and reports the mode it
+is running in, which the Driver Station displays; whether the Driver Station
+disables the robot when those reports stop is unverified (the loop stall
+check in [BENCH.md](../../docs/BENCH.md#fault-injection-and-timing)), and
+the loop watchdog does not rely on it.
 
 ## Simulation Backends: Ideal vs Physics-Backed
 

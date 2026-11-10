@@ -19,6 +19,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -49,6 +50,15 @@ class PhoenixBackend final : public talos::hardware::Backend {
       std::span<const talos::hardware::DigitalOutputRequest> digital_outputs,
       std::span<const talos::hardware::PwmRequest> pwm_outputs) override;
   void Neutral() override;
+  // The loop watchdog's thread (LoopWatchdog.h), while the loop thread is
+  // stalled: PWM outputs disabled, DIO outputs false, then NeutralOut to every
+  // motor. It touches only the device handles, never the loop thread's
+  // bookkeeping, and posts nothing. False when a configure holds the device
+  // lists or a NeutralOut send failed. A loop preempted inside a device call
+  // can hold that device's lock (Phoenix's per-device control mutex, the HAL
+  // DIO mutex; neither inherits priority), and then this waits until the
+  // loop runs again, and so does every output after it.
+  bool WatchdogNeutral();
   // Motor NeutralOut sends that returned a non-OK status, cumulative since
   // construction. State has no counter for this without a wire change, so it
   // stays RIO-local (with a transition log line); Gateway retries neutral
@@ -67,6 +77,7 @@ class PhoenixBackend final : public talos::hardware::Backend {
  private:
   friend class PhoenixBackendFollowerFeedback;
   friend class PhoenixBackendRecovery;
+  friend class PhoenixBackendWatchdog;
   void UpdateSimulation(double dt);
 
   // Declared first, so destroyed last: the configure worker (configure_) may
@@ -126,6 +137,11 @@ class PhoenixBackend final : public talos::hardware::Backend {
   // voltage.
   std::array<bool, talos::hardware::kMaxMotors> sim_neutral_{};
   double sim_yaw_deg_{0.0};
+  // Held by Configure while it rebuilds the device lists, and by
+  // WatchdogNeutral, which only tries it: it never waits on a configure.
+  // Declared before configure_, whose destruction waits for a Configure
+  // still holding it.
+  std::mutex devices_mutex_;
   std::future<bool> configure_;
   std::future<std::vector<uint16_t>> restore_;
 };

@@ -112,8 +112,10 @@ accepted request is older than its owner timeout,
 `command_timeout_us` (50 ms for every 2026-robot subsystem), checked on the
 bridge's 1 ms tick; a shorter gap, such as a late or missed tick, keeps its
 last demand. Whatever the bridge does, the RoboRIO neutralizes it within
-`command_timeout_us` of the State its last request was built from, but by
-invalidating every output: the merged command carries the oldest observation
+`command_timeout_us` of the State its last request was built from (plus
+the RoboRIO loop's lateness; if that loop stalls, its
+[watchdog](talOS/hardware/README.md) acts two loop periods and one 5 ms
+poll later), but by invalidating every output: the merged command carries the oldest observation
 of any owner still merged. Because an actuator owner's `period_us` is at most
 `command_timeout_us / 4` (below), its owner timeout is half the timeout, so
 the owner timeout keeps one silent node from stopping the others while the

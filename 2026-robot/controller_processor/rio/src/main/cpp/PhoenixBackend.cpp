@@ -122,6 +122,7 @@ PhoenixBackend::ConfigureStatus PhoenixBackend::PollConfigure() {
 }
 
 bool PhoenixBackend::Configure(const hw::Config& c) {
+  const std::lock_guard devices_lock{devices_mutex_};
   hw::Validate(c);
   restore_operations_.clear();
   unavailable_.clear();
@@ -928,6 +929,24 @@ void PhoenixBackend::Neutral() {
   for (auto& dio : digital_outputs_) dio->Set(false);
   // Sim: neutral keeps rotor momentum; UpdateSimulation decays it per brake.
   if (is_simulation_) sim_neutral_.fill(true);
+}
+
+bool PhoenixBackend::WatchdogNeutral() {
+  const std::unique_lock devices_lock{devices_mutex_, std::try_to_lock};
+  if (!devices_lock.owns_lock()) return false;
+  // Phoenix 6 serializes SetControl per device (ParentDevice's control lock)
+  // and the HAL DIO and PWM writes are safe from any thread, so this may run
+  // beside the loop thread's own sends; the last one sent wins. PWM and DIO
+  // first: a motor whose control lock the stalled loop holds would hold them
+  // back too.
+  for (auto& pwm : pwm_outputs_) pwm->SetDisabled();
+  for (auto& dio : digital_outputs_) dio->Set(false);
+  bool sent = true;
+  for (auto& motor : motors_) {
+    sent &= motor->SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz))
+                .IsOK();
+  }
+  return sent;
 }
 
 void PhoenixBackend::UpdateSimulation(double dt) {
