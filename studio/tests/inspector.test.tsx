@@ -1,27 +1,34 @@
-// Inspector: the per-channel staleness derivation.
+// Inspector: the per-channel age derivation.
 
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
-import {channelStalenessNs} from '../src/panels/inspector/staleness';
+import type {Snapshot} from '../src/core';
+import {TelemetryStore} from '../src/data/store';
+import {channelAge} from '../src/panels/inspector/staleness';
 
-test('channelStalenessNs returns the age of the newest reading', () => {
-  const series = {
-    t0_ns: '0',
-    times: new Float64Array([0, 0.02, 0.04]),
-    values: {
-      a: new Float64Array([1, 2, NaN]),   // last reading at 0.02 s
-      b: new Float64Array([NaN, NaN, NaN])
-    }
+function frame(t_ns: bigint, channels: Record<string, number>): Snapshot {
+  return {
+    stream_id: '1', sequence_id: String(t_ns), timestamp_ns: String(t_ns),
+    dictionary_id: 1, chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+    channels, units: {a: ''}, labels: {}
   };
-  // cursor at 60 ms: age of channel a's 20 ms reading is 40 ms.
-  assert.equal(channelStalenessNs(series, 'a', '60000000'), '40000000');
-  // cursor at the reading itself is fresh.
-  assert.equal(channelStalenessNs(series, 'a', '20000000'), '0');
-  // a cursor before the reading clamps to fresh rather than a negative age.
-  assert.equal(channelStalenessNs(series, 'a', '10000000'), '0');
-  // a channel that never had a value, an unknown channel, and a null cursor.
-  assert.equal(channelStalenessNs(series, 'b', '60000000'), null);
-  assert.equal(channelStalenessNs(series, 'missing', '60000000'), null);
-  assert.equal(channelStalenessNs(series, 'a', null), null);
+}
+
+test('channelAge measures against the live clock, not the cursor', () => {
+  const store = new TelemetryStore(() => {});
+  store.ingest([frame(0n, {a: 1}), frame(20_000_000n, {a: 2})], true);
+  const last = '20000000';
+  // Telemetry stopped: the cursor holds the last frame while the live clock
+  // runs on. The channel's reading at the cursor is 2 s old, and stale.
+  assert.deepEqual(channelAge(store, 'a', {cursor_ns: last, clock_ns: '2020000000'}),
+                   {age_ns: '2000000000', stale: true});
+  // A live clock at the reading is fresh.
+  assert.deepEqual(channelAge(store, 'a', {cursor_ns: last, clock_ns: last}),
+                   {age_ns: '0', stale: false});
+  // No current time known: the age is unknown, so the reading is not current.
+  assert.deepEqual(channelAge(store, 'a', {cursor_ns: last, clock_ns: null}),
+                   {age_ns: null, stale: true});
+  // A channel with no reading at the cursor has no age at all.
+  assert.equal(channelAge(store, 'missing', {cursor_ns: last, clock_ns: last}), null);
 });
