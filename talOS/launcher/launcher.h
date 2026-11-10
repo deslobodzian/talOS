@@ -1697,15 +1697,15 @@ class Launcher {
       const fs::file_type type = file->symlink_status(error).type();
       if (error) break;
       const std::string name = file->path().filename().string();
-      if (type != fs::file_type::regular) {
-        abandoned = false;
-      } else if (name.ends_with(".tlog")) {
+      const bool regular = type == fs::file_type::regular;
+      if (regular && name.ends_with(".tlog")) {
         if (LogSessionId(file->path()) == *id) return Retained::kSession;
         const uintmax_t bytes = file->file_size(error);
         if (error) break;
         abandoned = abandoned && bytes == 0;
-      } else if (std::ranges::find(kLaunchFiles, std::string_view{name}) ==
-                 std::ranges::end(kLaunchFiles)) {
+      } else if (!regular ||
+                 std::ranges::find(kLaunchFiles, std::string_view{name}) ==
+                     std::ranges::end(kLaunchFiles)) {
         abandoned = false;
       }
     }

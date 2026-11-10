@@ -263,8 +263,8 @@ std::string mime(const fs::path& p) {
 // built Studio bundle's largest asset; the manifest cap is Studio's own
 // MAX_MANIFEST_BYTES (studio/src/data/manifest.ts), which rejects anything
 // larger anyway.
-constexpr std::uintmax_t kMaxStaticFileBytes = 4 * 1024 * 1024;
-constexpr std::uintmax_t kMaxManifestBytes = 1024 * 1024;
+constexpr std::uintmax_t kMaxStaticFileBytes = std::uintmax_t{4} * 1024 * 1024;
+constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{1024} * 1024;
 }  // namespace
 int main(int argc, char** argv) try {
   // `--describe`: answer what this process is without touching shared memory,

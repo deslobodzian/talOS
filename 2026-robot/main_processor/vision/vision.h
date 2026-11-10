@@ -151,8 +151,10 @@ class Vision {
         recorder_options.rejected_hz = recording_rejected_hz_;
         recorder_options.max_bytes = recording_max_bytes_;
         recorder_options.context.camera = std::string{node.name()};
-        recorder_options.context.width = camera_.intrinsics.image_width;
-        recorder_options.context.height = camera_.intrinsics.image_height;
+        recorder_options.context.width =
+            static_cast<int>(camera_.intrinsics.image_width);
+        recorder_options.context.height =
+            static_cast<int>(camera_.intrinsics.image_height);
         recorder_options.context.intrinsics = camera_.intrinsics;
         recorder_options.context.mounting = extrinsics_;
         recorder_options.context.detector = {
@@ -253,7 +255,8 @@ class Vision {
     const auto now = node_.now();
     const auto now_ns = static_cast<std::uint64_t>(now.nanos());
     std::optional<Completed> completed;
-    if (simulated_) {
+    // truth_ exists exactly when simulated_.
+    if (truth_.has_value()) {
       if (truth_->fresh()) {
         truth_outage_ = false;
         // Deliver ready frames before rendering or admitting a new capture.
@@ -298,7 +301,7 @@ class Vision {
       wake_.notify_one();
       std::unique_lock lock(mutex_, std::try_to_lock);
       if (lock.owns_lock()) {
-        completed = std::move(completed_);
+        completed = completed_;
         completed_.reset();
         captured_ = received_;
         processed_ = worker_processed_;
@@ -337,12 +340,12 @@ class Vision {
   // the gray frame (nullptr when there is none, e.g. the non-raster sim path)
   // and, under --sim, the /sim/state pose the frame was rendered from.
   struct RecordingFeed {
+    RecordingFeed() : gray{nullptr} {}
+    RecordingFeed(const talos::vision::Frame* g,
+                  std::optional<talos::vision::recording::TruthRecord> t)
+        : gray{g}, truth{t} {}
     const talos::vision::Frame* gray;
     std::optional<talos::vision::recording::TruthRecord> truth;
-    RecordingFeed(
-        const talos::vision::Frame* g = nullptr,
-        std::optional<talos::vision::recording::TruthRecord> t = std::nullopt)
-        : gray{g}, truth{std::move(t)} {}
   };
 
   bool SimCaptureDue(std::uint64_t stamp) {
@@ -562,7 +565,8 @@ class Vision {
     recording_frame_.observation.x_std_m = observation.x_std_m();
     recording_frame_.observation.y_std_m = observation.y_std_m();
     recording_frame_.observation.yaw_std_rad = observation.yaw_std_rad();
-    recording_frame_.observation.tag_count = observation.tag_count();
+    recording_frame_.observation.tag_count =
+        static_cast<int>(observation.tag_count());
     recording_frame_.truth = truth;
     recording_frame_.reason =
         std::string{talos::vision::recording::FrameReason(recording_frame_)};
@@ -612,9 +616,9 @@ class Vision {
         detection.tag_id = tag.tag_id;
         detection.T_camera_tag = tag.T_camera_tag;
         detection.ambiguity = tag.ambiguity;
-        for (int c = 0; c < 4; ++c) {
-          detection.corners[2 * c] = tag.corners[c].x();
-          detection.corners[2 * c + 1] = tag.corners[c].y();
+        for (std::size_t c = 0; c < 4; ++c) {
+          detection.corners[2 * c] = static_cast<float>(tag.corners[c].x());
+          detection.corners[2 * c + 1] = static_cast<float>(tag.corners[c].y());
         }
         detections_.push_back(detection);
       }
@@ -839,7 +843,7 @@ class Vision {
                       (worker_processed_ - 1) / 1000
                 : 0;
         worker_rejected_range_ += result.rejected_range;
-        completed_ = std::move(result);
+        completed_ = result;
       }
     }
     connected_.store(false, std::memory_order_release);

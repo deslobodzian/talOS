@@ -610,6 +610,11 @@ class Teleop {
           binding.button_fields.push_back(action);
         }
       } else {
+        if (!parsed_binding.axis.has_value()) {
+          throw std::invalid_argument(
+              entry_where +
+              ": binding must specify exactly one of button/axis/pov");
+        }
         binding.is_button = false;
         binding.axis = *parsed_binding.axis;
         binding.scale = parsed_binding.scale;
