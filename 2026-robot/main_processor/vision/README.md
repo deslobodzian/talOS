@@ -18,26 +18,28 @@ installed bundles need no vision runfiles. Mounts map OpenCV optical coordinates
 to robot NWU using `Rz(yaw) Ry(pitch) Rx(roll)`. Positive pitch points a forward
 lens downward. Calibrate the mounts for the deployed robot.
 
-Shared configuration defaults and code fallbacks (overridable per camera):
+Defaults (overridable per camera): **Shared** is the value in
+`configuration/subsystems/vision.toml` (— when it sets none); **Fallback** is
+the code's value when no file sets the key.
 
-| Key | Default | Units and meaning |
-| --- | --- | --- |
-| `subsystem.period_us` | `10000` | Node/status period in microseconds (100 Hz), not the capture period. |
-| `camera.fps` | `60` | Requested live capture rate and maximum simulated capture rate, in frames per second. Must be finite and positive. |
-| `camera.latency_offset_us` | `0` | The camera's measured stamp bias, subtracted from every live timestamp kind (after its exposure/readout correction) and from simulated timestamps. |
-| `camera.sim_timestamp_lag_us` | `0` | Sim only: stamp the rendered truth instant this many microseconds later, modeling a timestamp taken after exposure. Ignored live, but validated in both modes. |
-| `camera.readout_us` | `0` | Known sensor readout duration subtracted from live EOF timestamps (unknown readout is zero). |
-| `camera.frame_timeout_us` | `500000` | Live silence deadline; positive, at most 10,000,000 µs. Reopens a connected but silent camera on the worker, and is the maximum live stamp age (see timestamps below) and the maximum age of a rasterized sim result. |
-| `camera.exposure_ms` | `5.0` | Shared manual exposure duration; also controls simulated exposure blur. Zero leaves duration unspecified. |
-| `camera.gain` | `0` | Backend-native manual gain; zero leaves gain unspecified. |
-| `camera.auto_exposure`, `camera.auto_gain` | `false`, `true` | Fallbacks are true only when duration/gain is zero; the shared exposure is positive and gain is zero. |
-| `camera.mount_angle_std_rad` | `0.0175` | Extrinsic mount-rotation calibration uncertainty in radians (≈1 deg), live **and** sim, not sim-only. Added to the published covariance: field x/y variance gains `(range × value)²`, yaw variance gains `value²`. |
-| `camera.mount_translation_std_m` | `0.01` | Extrinsic mount-translation calibration uncertainty in metres, live **and** sim, not sim-only. Added to the published field x/y variance. |
-| `detector.decimate` | `2.0` | Dimensionless quad-search downsampling factor; 2.0 searches at half resolution, then refines edges at full resolution. |
-| `detector.threads` | `2` | Integer detector worker count. |
-| `detector.sigma` | `0.0` | Quad-search Gaussian blur sigma in pixels; zero disables blur. |
-| `detector.refine_edges` | `true` | Refine detected quad edges before decoding. |
-| `detector.hamming_threshold` | `1` | Maximum corrected tag-code bits (inclusive), passed to the decoder and checked for validity. |
+| Key | Shared | Fallback | Units and meaning |
+| --- | --- | --- | --- |
+| `subsystem.period_us` | `10000` | `[robot] period_us` | Node/status period in microseconds (100 Hz), not the capture period. |
+| `camera.fps` | `60` | `60` | Requested live capture rate and maximum simulated capture rate, in frames per second. Must be finite and positive. |
+| `camera.latency_offset_us` | `0` | `0` | The camera's measured stamp bias, subtracted from every live timestamp kind (after its exposure/readout correction) and from simulated timestamps. |
+| `camera.sim_timestamp_lag_us` | `0` | `0` | Sim only: stamp the rendered truth instant this many microseconds later, modeling a timestamp taken after exposure. Ignored live, but validated in both modes. |
+| `camera.readout_us` | — | `0` | Known sensor readout duration subtracted from live EOF timestamps (unknown readout is zero). |
+| `camera.frame_timeout_us` | — | `500000` | Live silence deadline; positive, at most 10,000,000 µs. Reopens a connected but silent camera on the worker, and is the maximum live stamp age (see timestamps below) and the maximum age of a rasterized sim result. |
+| `camera.exposure_ms` | `5.0` | `0` | Shared manual exposure duration; also controls simulated exposure blur. Zero leaves duration unspecified. |
+| `camera.gain` | — | `0` | Backend-native manual gain; zero leaves gain unspecified. |
+| `camera.auto_exposure`, `camera.auto_gain` | — | `exposure_ms == 0`, `gain == 0` | True only when duration/gain is zero; with the shared values auto exposure is off and auto gain on. |
+| `camera.mount_angle_std_rad` | `0.0175` | `0.0175` | Extrinsic mount-rotation calibration uncertainty in radians (≈1 deg), live **and** sim, not sim-only. Added to the published covariance: field x/y variance gains `(range × value)²`, yaw variance gains `value²`. |
+| `camera.mount_translation_std_m` | `0.01` | `0.01` | Extrinsic mount-translation calibration uncertainty in metres, live **and** sim, not sim-only. Added to the published field x/y variance. |
+| `detector.decimate` | `2.0` | `1.0` | Dimensionless quad-search downsampling factor; 2.0 searches at half resolution, then refines edges at full resolution. |
+| `detector.threads` | `2` | `1` | Integer detector worker count. |
+| `detector.sigma` | `0.0` | `0.0` | Quad-search Gaussian blur sigma in pixels; zero disables blur. |
+| `detector.refine_edges` | `true` | `true` | Refine detected quad edges before decoding. |
+| `detector.hamming_threshold` | `1` | `1` | Maximum corrected tag-code bits (inclusive), passed to the decoder and checked for validity. |
 | `detector.min_decision_margin` | `30.0` | Minimum AprilTag decode-margin score (inclusive), measuring image-intensity contrast, not a probability or pose error. |
 | `subsystem.backend` | `"auto"` | Use Metal when available and supported, otherwise CPU (always CPU off macOS). On macOS, Metal pipelines compile on a background thread and the camera detects on the CPU until they are ready. `"cpu"` forces CPU; `"metal"` requires Metal, rejects execution fallback, and fails construction if the pipelines are not compiled within 5 s. On macOS, with `auto` or `metal`, the node logs the backend it starts on and each switch. |
 
@@ -130,8 +132,8 @@ same per-camera override mechanism. Both single-tag and multi-tag observations
 use the joint corner solver and publish its returned standard deviations
 directly.
 
-| Key | Default | Units and meaning |
-| --- | --- | --- |
+| Key | Shared | Fallback | Units and meaning |
+| --- | --- | --- | --- |
 | `pixel_std_px` | `0.33` | Nominal corner-coordinate standard deviation in pixels, the lower bound of the residual scaling below; real cameras should use their calibration RMS. Independent of direct projection's `camera.pixel_noise_std`. |
 | `floor_z_std_m` | `0.05` | Robot-height prior standard deviation in metres about the field floor. |
 | `floor_tilt_std_rad` | `0.05` | Robot roll/pitch prior standard deviation in radians about level. |

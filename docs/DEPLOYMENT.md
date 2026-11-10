@@ -38,7 +38,7 @@ changes it.
 
 The bundle uses `2026-robot/main_processor/configuration/robot_field.toml`,
 which includes the base [robot config](../2026-robot/main_processor/configuration/robot.toml)
-and changes only `[robot] controller_address`, to the RoboRIO's `10.56.87.2`.
+and changes only `[robot] controller_address`, to the RoboRIO's `10.56.87.2` (it also restates the base's `require_target_coverage = true`).
 Simulation and its tests keep using that base config with loopback (`127.0.0.1`);
 no source edits are needed when switching between
 simulation and the field bundle. The overlay does not

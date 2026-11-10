@@ -69,8 +69,9 @@ second. Underflow/future stamps publish invalid.
 
 Timing sources: `2026-robot/main_processor/configuration/robot.toml:1-16`, its
 `subsystems/*.toml`, `talOS/bridge/node.cc` (`Tick`, `PushConfig`,
-`ShouldSendCommand`), `talOS/hardware/endpoint.h:25-98`,
-`2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp:221-302`, and
+`ShouldSendCommand`), `talOS/hardware/endpoint.h` (`Endpoint::Tick`),
+`2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp`
+(`Robot::StartCompetition`), and
 `2026-robot/main_processor/simulation/sim_gateway.cc`.
 
 Phoenix 26.3.0 `CoreTalonFX.hpp` / `SpnValue.hpp` identify stator current,
