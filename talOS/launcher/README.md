@@ -128,6 +128,10 @@ A roster member — `hardware_node`, every subsystem node, `sim_gateway` — tha
 exits with a nonzero status or by a signal while the session is not stopping is
 restarted. So is a critical member that exits cleanly (status 0) while the
 session is not stopping: its peers still run, so it did not finish anything.
+A run that cannot be spawned (fork or pipe failing, as under `EAGAIN` or
+`EMFILE`), a first run included, is retried the same way and marks the member
+`recorder_failed`. Every restart attempt counts against the budget below,
+spawned or not; the retry keeps that run's log name and restart number.
 The first restart waits 50 ms, each later one twice as long, capped
 at 1 s. Critical nodes (including every actuator owner and the hardware bridge)
 never quarantine: they keep retrying with that capped backoff. Non-critical
@@ -225,6 +229,10 @@ name, target, whether it answered, and each source's kind, name, message size
 and endpoint attributes, followed by every diagnostic. Studio's bridge serves it
 so a viewer can show the declared graph next to the live one and mark the
 difference.
+It is written to a temporary file and renamed into place, as is the
+`declared_graph.json` beside it that graph-reading nodes are described and
+started with as `--graph`. A launch that cannot write either exits 1 before
+anything starts.
 
 
 ## Building
@@ -254,13 +262,16 @@ the root is `/tmp/talos_logs`. Use persistent storage on a deployed robot.
 atomically at each process lifecycle change; an interrupted session retains its
 last complete manifest (`end_wall_ns = 0` means no normal shutdown).
 
-At startup, retention removes the oldest recognized sessions (directories with
-a `manifest.json`). `[robot] log_keep_sessions` defaults to 50, including the
+At startup, retention removes the oldest recognized sessions: directories
+holding a `manifest.json`, or only the `graph.json` that `--describe-only` and a
+refused graph leave. `[robot] log_keep_sessions` defaults to 50, including the
 new session; `log_max_bytes` defaults to 2 GiB. Both must be positive.
 Half the byte budget is reserved for the new session's event logs and divided
 among logging members; restarts share their member's remaining budget.
 Older sessions are retained within the other half. Symlinks, unrelated
-directories and the current session are not deleted. Graph/manifest metadata
+directories and the current session are not deleted. A session retention
+cannot read or remove (another user's, unreadable, removed meanwhile) is
+reported and passed over; it never stops a launch. Graph/manifest metadata
 and non-event captures are outside the event-writer caps.
 
 Simulation is only permitted with effective remote `127.0.0.1`. `--sim` with a

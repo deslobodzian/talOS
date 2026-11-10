@@ -67,6 +67,41 @@ inline std::string Quoted(std::string_view value) {
   return out;
 }
 
+// Replaces `path` with `contents` so that a reader sees the old file or the
+// new one, never part of one: written to `<path>.tmp`, flushed and synced,
+// renamed over `path`, then the directory synced. On failure `path` is as it
+// was, the temporary file is removed so it holds no disk, and `error` names
+// the failed step and its errno.
+inline bool WriteFileAtomically(const std::string& path,
+                                std::string_view contents, std::string& error) {
+  const std::string temporary = path + ".tmp";
+  const auto fail = [&](std::string_view step, int code) {
+    std::remove(temporary.c_str());
+    error = std::string{step} + ": " + std::strerror(code);
+    return false;
+  };
+  FILE* file = std::fopen(temporary.c_str(), "wb");
+  if (file == nullptr) return fail("create", errno);
+  int code = 0;
+  if (std::fwrite(contents.data(), 1, contents.size(), file) !=
+          contents.size() ||
+      std::fflush(file) != 0 || ::fsync(::fileno(file)) != 0)
+    code = errno;
+  if (std::fclose(file) != 0 && code == 0) code = errno;
+  if (code != 0) return fail("write", code);
+  if (std::rename(temporary.c_str(), path.c_str()) != 0)
+    return fail("rename", errno);
+  const std::filesystem::path parent =
+      std::filesystem::path{path}.parent_path();
+  const int directory = ::open(parent.empty() ? "." : parent.c_str(), O_RDONLY);
+  if (directory < 0) return fail("open directory", errno);
+  const int result = ::fsync(directory);
+  code = errno;
+  ::close(directory);
+  if (result != 0) return fail("sync directory", code);
+  return true;
+}
+
 struct NodeSpec {
   std::string name;
   std::string target;  // e.g. "//2026-robot/main_processor/drivetrain:node"
@@ -190,6 +225,9 @@ struct LauncherOptions {
   // Internal supervision seam; production uses the fixed registry deadline.
   std::chrono::milliseconds construction_timeout{
       introspect::kConstructionTimeout};
+  // Internal supervision seam: the next N spawns of the named roster member
+  // fail as fork() does under EAGAIN. Production leaves it empty.
+  std::map<std::string, int> spawn_failures;
 
   // Launch a graph the linter called broken anyway. The default is refusal:
   // two spellings of one topic are silent at runtime.
@@ -480,7 +518,8 @@ inline void FinishProcessGroup(pid_t pid) {
 }
 
 // fork + execv of args[0], in its own process group. stdout_fd is used only by
-// --describe; otherwise stdout/stderr can be appended to output_path.
+// --describe; otherwise stdout/stderr can be appended to output_path. Returns
+// -1 with errno set when the lifetime pipe or the fork fails.
 inline pid_t SpawnProcess(std::vector<std::string> args,
                           const std::string& output_path = "",
                           int stdout_fd = -1) {
@@ -488,8 +527,10 @@ inline pid_t SpawnProcess(std::vector<std::string> args,
   if (::pipe(lifetime) != 0) return -1;
   if (::fcntl(lifetime[0], F_SETFD, FD_CLOEXEC) < 0 ||
       ::fcntl(lifetime[1], F_SETFD, FD_CLOEXEC) < 0) {
+    const int error = errno;
     ::close(lifetime[0]);
     ::close(lifetime[1]);
+    errno = error;
     return -1;
   }
   std::vector<char*> c_args;
@@ -501,9 +542,11 @@ inline pid_t SpawnProcess(std::vector<std::string> args,
   const pid_t parent = ::getpid();
   const pid_t pid = ::fork();
   if (pid != 0) {
+    const int error = errno;  // fork's, kept across the closes
     ::close(lifetime[0]);
     if (pid < 0) {
       ::close(lifetime[1]);
+      errno = error;
     } else {
       // Both sides establish the group, closing the spawn/signal race.
       ::setpgid(pid, pid);
@@ -762,6 +805,8 @@ inline std::string DeclaredGraphPath(const LauncherOptions& options) {
 // are written to DeclaredGraphPath, and each graph reader is described
 // again with `--graph` that file, which it is also started with. A graph
 // reader therefore sees every node but the graph readers.
+// Throws when that file cannot be written: a graph reader is never described,
+// or started, without the graph.
 inline std::vector<naming::Diagnostic> DescribeGraph(
     const std::vector<NodeSpec>& specs, const LauncherOptions& options,
     std::vector<NodeDescription>& out,
@@ -809,7 +854,12 @@ inline std::vector<naming::Diagnostic> DescribeGraph(
     const std::string graph_path = DeclaredGraphPath(options);
     std::filesystem::create_directories(
         std::filesystem::path{graph_path}.parent_path());
-    std::ofstream{graph_path} << introspect::DeclaredGraphToJson(graph);
+    std::string error;
+    if (!WriteFileAtomically(graph_path, introspect::DeclaredGraphToJson(graph),
+                             error)) {
+      throw std::runtime_error("cannot write the declared graph " + graph_path +
+                               " (" + error + ")");
+    }
     for (std::size_t i = 0; i < specs.size(); ++i) {
       if (!out[i].answered || !out[i].declared.reads_graph) continue;
       probe(specs[i], out[i], graph_path);
@@ -1005,6 +1055,10 @@ inline std::string GraphToJson(
 // A critical member that exits cleanly (status 0) while the session is not
 // stopping did not finish anything -- its peers still run -- so it restarts
 // on the same backoff; a non-critical clean exit is a node that finished.
+// A run that cannot be spawned at all (fork or pipe failing, as under EAGAIN
+// or EMFILE) is rescheduled like a crash, against the same budget, so a
+// transient shortage never leaves a member down for the rest of a session
+// the launcher -- and so its service -- outlives.
 // When a clean exit's restart falls due and every other live member's latest
 // run also exited 0, the whole roster has completed and the restart is
 // dropped (see RosterContinues). The backoff is scheduled inside the
@@ -1348,10 +1402,16 @@ class Launcher {
 
     // Phase one: describe and lint before anything starts.
     std::vector<NodeDescription> described;
-    auto diagnostics = DescribeGraph(node_specs, options_, described,
-                                     TargetSourcesOf(robot_config),
-                                     TargetModeSourcesOf(robot_config),
-                                     robot_config.require_target_coverage);
+    std::vector<naming::Diagnostic> diagnostics;
+    try {
+      diagnostics = DescribeGraph(node_specs, options_, described,
+                                  TargetSourcesOf(robot_config),
+                                  TargetModeSourcesOf(robot_config),
+                                  robot_config.require_target_coverage);
+    } catch (const std::exception& e) {
+      std::cerr << "launcher: " << e.what() << "\n";
+      return 1;
+    }
     for (auto& finding : LintParameterUnits(robot_config)) {
       diagnostics.push_back(std::move(finding));
     }
@@ -1361,9 +1421,16 @@ class Launcher {
     const std::size_t declared_topics = CountDeclaredTopics(described);
 
     const std::string graph_path = options_.output_dir + "/graph.json";
-    std::ofstream{graph_path}
-        << GraphToJson(options_.session_id, options_.config_path, described,
-                       diagnostics, options_.bundle_config_sha256);
+    std::string graph_error;
+    if (!WriteFileAtomically(
+            graph_path,
+            GraphToJson(options_.session_id, options_.config_path, described,
+                        diagnostics, options_.bundle_config_sha256),
+            graph_error)) {
+      std::cerr << "launcher: cannot write " << graph_path << " ("
+                << graph_error << "); nothing was started\n";
+      return 1;
+    }
     PrintDeclaredGraph(described, diagnostics, declared_topics, graph_path);
 
     if (naming::HasError(diagnostics) && !options_.allow_graph_errors) {
@@ -1491,10 +1558,10 @@ class Launcher {
                     {"--duration-s", std::to_string(options_.duration_s)});
       }
 
-      const pid_t pid = SpawnProcess(args);
+      const pid_t pid = SpawnNode(proc, launches[i]);
       if (pid < 0) {
-        std::cerr << "[launcher] fork() failed for node " << proc.name << "\n";
-        proc.failed = true;
+        const int error = errno;
+        SpawnFailed(proc, launches[i], std::chrono::steady_clock::now(), error);
         continue;
       }
       proc.pid = pid;
@@ -1537,44 +1604,63 @@ class Launcher {
  private:
   // Never throws: a full disk (ENOSPC) or an unwritable session directory
   // must not end supervision of a running robot. The last complete manifest
-  // stays in place, a partial temporary file is removed so it holds no disk,
-  // and the next lifecycle change retries. The first failure is logged once,
-  // and so is the recovery.
+  // stays in place (WriteFileAtomically) and the next lifecycle change
+  // retries. The first failure is logged once, and so is the recovery.
   void PersistManifest(const std::vector<NodeProcessInfo>& procs) {
     session_manifest_.nodes = procs;
     const std::string path = options_.output_dir + "/manifest.json";
-    const std::string temporary = path + ".tmp";
-    const auto fail = [&](std::string_view step, int error) {
-      std::remove(temporary.c_str());
+    std::string error;
+    if (!WriteFileAtomically(path, session_manifest_.ToJson(), error)) {
       if (!manifest_failing_) {
-        std::cerr << "[launcher] cannot persist " << path << " (" << step
-                  << ": " << std::strerror(error)
+        std::cerr << "[launcher] cannot persist " << path << " (" << error
                   << "); supervision continues and retries at the next "
                      "change\n";
       }
       manifest_failing_ = true;
-    };
-    FILE* file = std::fopen(temporary.c_str(), "wb");
-    if (file == nullptr) return fail("create", errno);
-    const std::string json = session_manifest_.ToJson();
-    int error = 0;
-    if (std::fwrite(json.data(), 1, json.size(), file) != json.size() ||
-        std::fflush(file) != 0 || ::fsync(::fileno(file)) != 0)
-      error = errno;
-    if (std::fclose(file) != 0 && error == 0) error = errno;
-    if (error != 0) return fail("write", error);
-    if (std::rename(temporary.c_str(), path.c_str()) != 0)
-      return fail("rename", errno);
-    const int directory = ::open(options_.output_dir.c_str(), O_RDONLY);
-    if (directory < 0) return fail("open session directory", errno);
-    const int result = ::fsync(directory);
-    error = errno;
-    ::close(directory);
-    if (result != 0) return fail("sync session directory", error);
+      return;
+    }
     if (manifest_failing_) {
       std::cerr << "[launcher] " << path << " persisted again\n";
       manifest_failing_ = false;
     }
+  }
+
+  // Whether `entry` is a session directory: a directory, not a symlink,
+  // holding the manifest.json of a launch, or only the graph.json that
+  // --describe-only and a refused graph leave. Sets `error` when that cannot
+  // be read.
+  static bool IsSessionDirectory(const std::filesystem::directory_entry& entry,
+                                 std::error_code& error) {
+    namespace fs = std::filesystem;
+    if (entry.symlink_status(error).type() != fs::file_type::directory)
+      return false;
+    for (const char* name : {"manifest.json", "graph.json"}) {
+      const fs::file_type type = fs::status(entry.path() / name, error).type();
+      if (type == fs::file_type::regular) return true;
+      if (type != fs::file_type::not_found) return false;
+      error.clear();  // Absent is an answer, not an error.
+    }
+    return false;
+  }
+
+  // Bytes in the regular files under `dir`, symlinks not followed. Sets
+  // `error` when any of the tree cannot be read.
+  static uintmax_t TreeBytes(const std::filesystem::path& dir,
+                             std::error_code& error) {
+    namespace fs = std::filesystem;
+    uintmax_t bytes = 0;
+    fs::recursive_directory_iterator file{dir, error};
+    while (!error && file != fs::recursive_directory_iterator{}) {
+      const fs::file_type type = file->symlink_status(error).type();
+      if (error) break;
+      if (type == fs::file_type::regular) {
+        const uintmax_t size = file->file_size(error);
+        if (error) break;
+        bytes += size;
+      }
+      file.increment(error);
+    }
+    return bytes;
   }
 
   // Removes the oldest recognized sessions until at most `log_keep_sessions`
@@ -1582,7 +1668,11 @@ class Launcher {
   // `log_max_bytes` the new session does not get. Returns the new session's
   // log budget: the other half, which its event writers are capped to.
   // Graph/manifest metadata and non-event captures require separate headroom.
+  // A session that cannot be read or removed (another user's, unreadable,
+  // removed meanwhile) is reported and passed over, never counted against
+  // the others: retention never stops a launch.
   uint64_t ApplyRetention(const config::RobotConfig& config) {
+    namespace fs = std::filesystem;
     const auto robot = config.toml_data["robot"];
     const int64_t cap = robot["log_keep_sessions"].value_or(int64_t{50});
     const int64_t budget =
@@ -1593,41 +1683,56 @@ class Launcher {
     const auto session_budget = static_cast<uint64_t>(budget) / 2;
     const uint64_t retained_budget =
         static_cast<uint64_t>(budget) - session_budget;
+    const auto report = [](std::string_view what, const fs::path& path,
+                           const std::error_code& error) {
+      std::cerr << "[launcher] retention " << what << " " << path.string()
+                << " (" << error.message() << ")\n";
+    };
     struct Session {
-      std::filesystem::path path;
-      std::filesystem::file_time_type time;
+      fs::path path;
+      fs::file_time_type time;
       uintmax_t bytes;
     };
     std::vector<Session> sessions;
     uintmax_t total = 0;
-    const auto current = std::filesystem::path{options_.output_dir};
-    for (const auto& entry :
-         std::filesystem::directory_iterator(current.parent_path())) {
-      // A session is recognized by its manifest; unrelated folders and symlinks
-      // are never retention candidates.
-      if (entry.is_symlink() || !entry.is_directory() ||
-          !std::filesystem::is_regular_file(entry.path() / "manifest.json"))
+    const fs::path current{options_.output_dir};
+    std::error_code error;
+    for (fs::directory_iterator entry{current.parent_path(), error};
+         !error && entry != fs::directory_iterator{}; entry.increment(error)) {
+      if (entry->path() == current) continue;  // Counted below.
+      std::error_code unreadable;
+      if (!IsSessionDirectory(*entry, unreadable)) {
+        if (unreadable) report("skips", entry->path(), unreadable);
         continue;
-      uintmax_t bytes = 0;
-      for (const auto& file :
-           std::filesystem::recursive_directory_iterator(entry.path())) {
-        if (!file.is_symlink() && file.is_regular_file())
-          bytes += file.file_size();
+      }
+      const auto time = entry->last_write_time(unreadable);
+      const uintmax_t bytes =
+          unreadable ? 0 : TreeBytes(entry->path(), unreadable);
+      if (unreadable) {
+        report("skips", entry->path(), unreadable);
+        continue;
       }
       total += bytes;
-      sessions.push_back({entry.path(), entry.last_write_time(), bytes});
+      sessions.push_back({entry->path(), time, bytes});
+    }
+    if (error) {
+      // A partial listing could remove a session newer than one it missed.
+      report("removes nothing; cannot list", current.parent_path(), error);
+      return session_budget;
     }
     std::sort(
         sessions.begin(), sessions.end(),
         [](const Session& a, const Session& b) { return a.time < b.time; });
-    // Include the newly created current session even before its manifest
-    // exists.
+    // The new session counts too, before it holds anything.
     std::size_t count = sessions.size() + 1;
     for (const auto& session : sessions) {
-      if (session.path == current) continue;
       if (count <= static_cast<uint64_t>(cap) && total <= retained_budget)
         break;
-      std::filesystem::remove_all(session.path);
+      std::error_code removal;
+      fs::remove_all(session.path, removal);
+      // One left in place is passed over like an unreadable one, rather than
+      // costing a newer session its place.
+      if (removal) report("cannot remove", session.path, removal);
       total -= session.bytes;
       --count;
     }
@@ -1727,14 +1832,73 @@ class Launcher {
     std::signal(SIGTERM, [](int) { stop_requested_ = true; });
   }
 
-  // Respawns a crashed or unexpectedly exited node into a fresh event log.
-  void Restart(NodeProcessInfo& proc, NodeLaunch& launch) {
+  // SpawnProcess for one run of a roster member: -1 with errno set when fork
+  // or pipe fails, or while the spawn_failures seam names the member.
+  pid_t SpawnNode(const NodeProcessInfo& proc, const NodeLaunch& launch) {
+    const auto injected = options_.spawn_failures.find(proc.name);
+    if (injected != options_.spawn_failures.end() && injected->second > 0) {
+      --injected->second;
+      errno = EAGAIN;
+      return -1;
+    }
+    return SpawnProcess(launch.args);
+  }
+
+  // Schedules `proc`'s next start: after a backoff that doubles with each
+  // start in the rolling window or, for a non-critical member that has spent
+  // its budget there, quarantined until the oldest of those starts leaves the
+  // window. Only for a restart ShouldRestartNode allows. Returns the delay.
+  std::chrono::milliseconds ScheduleRestart(
+      NodeProcessInfo& proc, NodeLaunch& launch,
+      std::chrono::steady_clock::time_point now) {
+    const int recent = static_cast<int>(launch.restart_times.size());
+    proc.quarantined = !launch.critical && recent >= max_restarts_;
+    launch.restart_pending = true;
+    launch.restart_at =
+        (proc.quarantined
+             ? launch.restart_times.front() +
+                   std::chrono::milliseconds{options_.restart_window_ms}
+             : now) +
+        RestartBackoff(recent + 1);
+    proc.retry_at_monotonic_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            launch.restart_at.time_since_epoch())
+            .count();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        launch.restart_at - now);
+  }
+
+  // A run that cannot be spawned is rescheduled like a crash (see Restarts
+  // above); with restarts disabled it stays down, as a crashed one does.
+  void SpawnFailed(NodeProcessInfo& proc, NodeLaunch& launch,
+                   std::chrono::steady_clock::time_point now, int error) {
+    proc.failed = true;
+    std::cerr << "[launcher] cannot spawn " << proc.name << " ("
+              << std::strerror(error) << "); ";
+    // Never `stopping` here: Supervise cancels a pending restart once the
+    // session stops.
+    if (!ShouldRestartNode(/*clean_exit=*/false, launch.critical, max_restarts_,
+                           /*stopping=*/false)) {
+      std::cerr << "restarts are disabled\n";
+      return;
+    }
+    const auto delay = ScheduleRestart(proc, launch, now);
+    std::cerr << (proc.quarantined ? "quarantined; retry" : "retry") << " in "
+              << delay.count() << " ms\n";
+  }
+
+  // Starts `proc`'s pending run: restart `restart_count + 1` into a fresh
+  // event log or, when no run has spawned yet, the first. The attempt counts
+  // against the rolling budget whether or not it spawns.
+  void Restart(NodeProcessInfo& proc, NodeLaunch& launch,
+               std::chrono::steady_clock::time_point now) {
     launch.restart_pending = false;
     if (proc.quarantined)
       std::cout << "[launcher] " << proc.name << " retrying after quarantine\n";
     proc.quarantined = false;
     proc.retry_at_monotonic_ns = 0;
-    const int restart = proc.restart_count + 1;
+    // Only a spawned run sets a pid.
+    const int restart = proc.pid > 0 ? proc.restart_count + 1 : 0;
     if (launch.log_arg != 0) {
       launch.args[launch.log_arg] =
           NodeLogPath(options_.output_dir, proc.name, restart);
@@ -1748,20 +1912,18 @@ class Launcher {
       launch.args[launch.log_arg + 2] = std::to_string(
           used >= launch.log_budget ? 1 : launch.log_budget - used);
     }
-    const pid_t pid = SpawnProcess(launch.args);
+    launch.restart_times.push_back(now);
+    const pid_t pid = SpawnNode(proc, launch);
     if (pid < 0) {
-      std::cerr << "[launcher] fork() failed restarting node " << proc.name
-                << "\n";
-      proc.failed = true;
+      SpawnFailed(proc, launch, now, errno);
       return;
     }
-    if (launch.log_arg != 0)
+    if (launch.log_arg != 0 && restart > 0)
       proc.log_paths.push_back(launch.args[launch.log_arg]);
     proc.restart_count = restart;
     proc.pid = pid;
     proc.exited = false;
     proc.exit_code = -1;
-    launch.restart_times.push_back(std::chrono::steady_clock::now());
     launch.started_at = std::chrono::steady_clock::now();
     launch.heartbeat_changed_at = launch.started_at;
     launch.last_heartbeat = 0;
@@ -1896,23 +2058,7 @@ class Launcher {
         launch.last_exit_clean = clean;
         if (!is_bridge && ShouldRestartNode(clean, launch.critical,
                                             max_restarts_, stopping)) {
-          const int recent = static_cast<int>(launch.restart_times.size());
-          const auto backoff = RestartBackoff(recent + 1);
-          proc.quarantined = !launch.critical && recent >= max_restarts_;
-          launch.restart_pending = true;
-          launch.restart_at =
-              (proc.quarantined
-                   ? launch.restart_times.front() +
-                         std::chrono::milliseconds{options_.restart_window_ms}
-                   : now) +
-              backoff;
-          proc.retry_at_monotonic_ns =
-              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  launch.restart_at.time_since_epoch())
-                  .count();
-          const auto delay =
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  launch.restart_at - now);
+          const auto delay = ScheduleRestart(proc, launch, now);
           std::cout << "[launcher] " << proc.name << " exited ("
                     << ExitReason(status) << "); "
                     << (proc.quarantined ? "quarantined; retry" : "restart")
@@ -1943,7 +2089,7 @@ class Launcher {
                       << " finished with the rest of the roster; not "
                          "restarted\n";
           } else {
-            Restart(procs[i], launch);
+            Restart(procs[i], launch, now);
           }
           PersistManifest(procs);
         }

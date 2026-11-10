@@ -1174,6 +1174,28 @@ TEST(LauncherGraphTest, AGraphReaderIsDescribedAgainWithTheOtherNodesGraph) {
   std::remove(gamma.binary_path.c_str());
 }
 
+// A graph file the launch cannot write -- the declared graph its graph
+// readers are described and started with, or graph.json -- refuses the launch
+// before anything starts.
+TEST(LauncherGraphTest, AGraphFileThatCannotBeWrittenRefusesTheLaunch) {
+  const std::string record = TempPath("unwritable_graph_record");
+  std::filesystem::create_directories(record);
+  for (const auto& [tag, file] :
+       {std::pair{"unwritable_declared_graph", "declared_graph.json"},
+        std::pair{"unwritable_graph", "graph.json"}}) {
+    GraphFixture fixture{
+        tag,
+        DescribingStub("alpha", "//example/alpha:node",
+                       {Sender("/alpha/state")}),
+        GraphReaderStub("beta", "//example/beta:node", record)};
+    // A directory where the file belongs: no write replaces it, even as root.
+    std::filesystem::create_directories(fixture.out_dir + "/" + file);
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1) << file;
+    EXPECT_FALSE(fixture.has_manifest()) << file;
+  }
+  std::filesystem::remove_all(record);
+}
+
 TEST(LauncherBundleTest, ResolveBinaryPrefersOverrideThenBazelBin) {
   std::map<std::string, std::string> overrides;
   overrides["//example/alpha:node"] = "/bin/alpha";
@@ -1357,6 +1379,41 @@ TEST(LauncherSessions, RetentionDeletesOnlyOldSessions) {
   EXPECT_TRUE(std::filesystem::exists(options.output_dir + "/2/manifest.json"));
   EXPECT_TRUE(std::filesystem::exists(options.output_dir + "/3/manifest.json"));
   EXPECT_EQ(ReadFile(options.output_dir + "/unrelated/keep"), "untouched");
+  std::filesystem::remove_all(options.output_dir);
+}
+
+// Retention passes over an old session it cannot read or cannot remove and
+// prunes the rest, a --describe-only session (graph.json alone) included;
+// neither stops the launch.
+TEST(LauncherSessions, RetentionPassesOverLockedSessionsAndPrunesGraphOnly) {
+  if (::geteuid() == 0) GTEST_SKIP() << "root reads and removes any directory";
+  auto options = SessionFixture("locked_sessions");
+  std::filesystem::remove_all(options.output_dir);
+  std::string configuration{kFixtureToml};
+  configuration.insert(configuration.find("period_us"),
+                       "log_keep_sessions = 1\n");
+  std::ofstream{options.config_path} << configuration;
+  // Oldest first: unreadable, unremovable, then --describe-only.
+  const auto now = std::filesystem::file_time_type::clock::now();
+  for (const auto& [id, file] :
+       {std::pair{1, "manifest.json"}, std::pair{2, "manifest.json"},
+        std::pair{3, "graph.json"}}) {
+    const std::string dir = options.output_dir + "/" + std::to_string(id);
+    std::filesystem::create_directories(dir);
+    std::ofstream{dir + "/" + file} << "{}\n";
+    std::filesystem::last_write_time(dir, now - std::chrono::hours{4 - id});
+  }
+  const std::string unreadable = options.output_dir + "/1";
+  const std::string unremovable = options.output_dir + "/2";
+  ASSERT_EQ(::chmod(unreadable.c_str(), 0), 0);
+  ASSERT_EQ(::chmod(unremovable.c_str(), 0555), 0);
+  options.session_id = 4;
+  const int result = Launcher{options}.Run();
+  ::chmod(unreadable.c_str(), 0755);
+  ::chmod(unremovable.c_str(), 0755);
+  EXPECT_EQ(result, 0);
+  EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/3"));
+  EXPECT_TRUE(std::filesystem::exists(options.output_dir + "/4/manifest.json"));
   std::filesystem::remove_all(options.output_dir);
 }
 

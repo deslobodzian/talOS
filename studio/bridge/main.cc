@@ -385,8 +385,9 @@ int main(int argc, char** argv) try {
     } else {
       // Logged once, then the bridge carries on. A viewer that cannot show
       // declared-against-actual is a much smaller failure than a bridge that
-      // will not start, and the launcher writes this file concurrently with
-      // spawning us.
+      // will not start. Under the launcher this file is written atomically
+      // before anything spawns, so this path means a standalone run with a
+      // wrong --declared path.
       std::cerr << "declared graph unreadable at " << declared_path
                 << "; /declared.json will report it absent\n";
     }

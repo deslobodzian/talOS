@@ -340,6 +340,28 @@ TEST(Supervision, CriticalCleanExitRestartsButDeadlineStopDoesNot) {
   ::remove(runs.c_str());
 }
 
+// A run that cannot be spawned -- fork or pipe failing, as under EAGAIN -- is
+// retried on the restart backoff instead of abandoned: a critical member whose
+// first spawn and first retry both fail still runs, as its first run.
+TEST(Supervision, FailedSpawnIsRetriedNotAbandoned) {
+  auto options = BaseOptions("spawn_failure");
+  options.duration_s = 2;
+  options.spawn_failures["alpha"] = 2;
+  const auto runs = TempPath("spawn_failure_runs");
+  ::remove(runs.c_str());
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStub("spawn_failure_hardware", kRunUntilStopped, "hardware_node");
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "spawn_failure_alpha", RecordLogArgThen(runs, kRunUntilStopped));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("spawn_failure_beta", kRunUntilStopped);
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_EQ(ReadLines(runs),
+            std::vector<std::string>{options.output_dir + "/alpha.tlog"});
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
 // A requested stop (SIGTERM to the launcher) restarts none of the members
 // that exit 0 while stopping.
 TEST(Supervision, RequestedStopDoesNotRestartCleanExits) {
