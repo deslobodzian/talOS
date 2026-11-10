@@ -17,6 +17,9 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
 #include <span>
 #include <thread>
 #include <tuple>
@@ -28,7 +31,23 @@ namespace hw = talos::hardware;
 // The GradleRIO google-test wiring links libgtest but not gtest_main.
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
+#ifdef __linux__
+  // Phoenix's simulator runs every simulated device on one thread, which also
+  // rewrites each device's persisted state under ctre_sim/ in the working
+  // directory on every config write. With the disk under write-back load (CI
+  // builds the other variant meanwhile) one rewrite blocks that thread, and
+  // every device, for hundreds of milliseconds. A fresh RAM-backed directory
+  // per run avoids the disk and keeps an earlier run's device state out.
+  char dir[] = "/dev/shm/talos_phoenix_test_XXXXXX";
+  const bool in_ram = mkdtemp(dir) != nullptr;
+  if (in_ram) std::filesystem::current_path(dir);
+#endif
+  const int result = RUN_ALL_TESTS();
+#ifdef __linux__
+  std::error_code ignored;
+  if (in_ram) std::filesystem::remove_all(dir, ignored);
+#endif
+  return result;
 }
 
 namespace {
@@ -63,6 +82,113 @@ void PumpReads(PhoenixBackend& backend, hw::State& s,
     backend.Read(s);
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
+}
+
+// Because one simulator thread serves every device (see main()), anything that
+// delays it (host scheduling, or disk I/O where no RAM directory exists) stops
+// every device from answering requests (TxFailed, RxTimeout) and publishing
+// status frames. kReadyTimeout bounds each wait for the simulator to catch up.
+constexpr std::chrono::seconds kReadyTimeout{10};
+
+// Reads every 10 ms, as PumpReads does, until `done()` holds; false once
+// kReadyTimeout has passed.
+template <typename Done>
+bool ReadUntil(PhoenixBackend& backend, hw::State& state, Done done) {
+  const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
+  while (true) {
+    backend.Read(state);
+    if (done()) return true;
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+}
+
+bool IsTransportTimeout(int status) {
+  using ctre::phoenix::StatusCode;
+  return status == StatusCode::TxFailed || status == StatusCode::RxTimeout ||
+         status == StatusCode::TxTimeout;
+}
+
+// Re-sends a config request that a stalled simulator dropped (a transport
+// timeout; waiting longer for the same request does not help) until
+// kReadyTimeout has passed. Any other status returns at once.
+template <typename Request>
+ctre::phoenix::StatusCode AwaitAnswer(Request request) {
+  const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
+  auto status = request();
+  while (IsTransportTimeout(status) &&
+         std::chrono::steady_clock::now() < deadline)
+    status = request();
+  return status;
+}
+
+// Gateway holds outputs neutral after Configure() and restores devices that
+// Configure() left unavailable when its bounded retries ran out. There is no
+// Gateway here, so do both through the same backend calls, then wait until
+// every CAN motor and sensor reports fresh feedback and every motor reports
+// zero output: a simulated device outlives its backend and resumes the
+// previous test's last request once the robot is enabled. A config error other
+// than a transport timeout fails at once; a device not ready at the deadline
+// fails with its state.
+::testing::AssertionResult AwaitReady(PhoenixBackend& backend,
+                                      const hw::Config& config) {
+  if (const auto error = backend.last_config_error();
+      error && !IsTransportTimeout(error->vendor_status))
+    return ::testing::AssertionFailure() << hw::FormatConfigError(*error);
+  const auto start = std::chrono::steady_clock::now();
+  hw::State state{};
+  bool restoring = false;
+  bool restored = false;
+  const bool ready = ReadUntil(backend, state, [&] {
+    backend.Neutral();  // Refreshed on every pass, as Gateway does per tick.
+    if (restoring)
+      restoring = backend.PollRestore() == hw::Backend::RestoreStatus::kPending;
+    if (!restoring && !backend.UnavailableDevices().empty()) {
+      backend.BeginRestoreAfterReset(backend.UnavailableDevices());
+      restoring = restored = true;
+    }
+    if (restoring) return false;
+    for (std::size_t i = 0; i < config.motors.size(); ++i)
+      if (!state.motors[i].valid || state.motors[i].voltage != 0.0)
+        return false;
+    for (std::size_t i = 0; i < config.sensors.size(); ++i)
+      if (!state.sensors[i].valid) return false;
+    return true;
+  });
+  const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+  if (!ready) {
+    auto failure = ::testing::AssertionFailure()
+                   << "Phoenix devices not ready after " << waited_ms << " ms";
+    for (const auto id : backend.UnavailableDevices())
+      failure << "; device " << id << " unavailable";
+    if (const auto error = backend.last_config_error())
+      failure << "; first Configure failure: " << hw::FormatConfigError(*error);
+    for (std::size_t i = 0; i < config.motors.size(); ++i) {
+      const auto& motor = state.motors[i];
+      if (!motor.valid)
+        failure << "; motor " << config.motors[i].name
+                << " feedback invalid (position age " << motor.position_age_us
+                << " us)";
+      else if (motor.voltage != 0.0)
+        failure << "; motor " << config.motors[i].name << " still at "
+                << motor.voltage << " V";
+    }
+    for (std::size_t i = 0; i < config.sensors.size(); ++i)
+      if (!state.sensors[i].valid)
+        failure << "; sensor " << config.sensors[i].name
+                << " feedback invalid (position age "
+                << state.sensors[i].position_age_us << " us)";
+    return failure;
+  }
+  // Keep the simulator's timing visible in CI logs when it was slow.
+  if (restored || waited_ms >= 100)
+    std::cerr << "[test] Phoenix devices ready after " << waited_ms << " ms"
+              << (restored ? ", restoring devices Configure left unavailable"
+                           : "")
+              << "\n";
+  return ::testing::AssertionSuccess();
 }
 
 hw::MotorConfig TestMotor(uint16_t id, const std::string& name, int can_id) {
@@ -122,22 +248,25 @@ TEST(PhoenixBackendPigeon, MountYawConfiguredAndInversionFlipsReadYaw) {
   config.sensors.push_back(imu);
   PhoenixBackend backend(false);
   ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
 
   // A second handle observes the same simulated CAN device/configurator.
   ctre::phoenix6::hardware::Pigeon2 observer(30, ctre::phoenix6::CANBus{"rio"});
   ctre::phoenix6::configs::Pigeon2Configuration applied;
-  ASSERT_TRUE(observer.GetConfigurator().Refresh(applied).IsOK());
+  ASSERT_TRUE(AwaitAnswer([&] {
+                return observer.GetConfigurator().Refresh(applied);
+              }).IsOK());
   EXPECT_NEAR(applied.MountPose.MountPoseYaw.value(), 45.0, 1e-3);
   observer.GetSimState().SetSupplyVoltage(units::volt_t{12.0});
   observer.GetSimState().SetRawYaw(units::degree_t{90.0});
+  // The simulated yaw starts at zero, so a nonzero sample carries the new one.
   hw::State state{};
-  for (int i = 0; i < 30; ++i) {
-    backend.Read(state);
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+  ASSERT_TRUE(ReadUntil(backend, state, [&] {
+    return state.sensors[0].valid &&
+           std::abs(state.sensors[0].position_rot) > 1.0 / 360.0;
+  })) << "no fresh yaw sample reflected the simulated raw yaw";
   auto& yaw = observer.GetYaw();
   ASSERT_TRUE(yaw.Refresh().GetStatus().IsOK());
-  ASSERT_TRUE(state.sensors[0].valid);
   ASSERT_GT(std::abs(yaw.GetValue().value()), 1.0);
   EXPECT_NEAR(state.sensors[0].position_rot, -yaw.GetValue().value() / 360.0,
               1e-6);
@@ -151,6 +280,7 @@ TEST(PhoenixBackendEncoders, QuadratureScalingAppliesCountsPerRevAndOffset) {
 
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(c));
+  ASSERT_TRUE(AwaitReady(backend, c));
 
   // k4X decoding counts every edge, so counts_per_rev is edges per rev.
   auto sim = frc::sim::EncoderSim::CreateForChannel(0);
@@ -173,6 +303,9 @@ TEST(PhoenixBackendEncoders, DutyCycleVelocityWrapsAndReconnectStartsAtRest) {
   frc::sim::DutyCycleEncoderSim sim(2);
   sim.SetConnected(true);
   sim.Set(0.99);
+  // Wait after positioning the encoder, so readiness reads seed its velocity
+  // history with this position rather than another one.
+  ASSERT_TRUE(AwaitReady(backend, config));
   hw::State state{};
   const auto before_first = std::chrono::steady_clock::now();
   ASSERT_TRUE(backend.Read(state));
@@ -231,6 +364,7 @@ TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndDisablesPwm) {
 
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(c));
+  ASSERT_TRUE(AwaitReady(backend, c));
 
   const std::array<hw::DigitalOutputRequest, 1> dos{
       hw::DigitalOutputRequest{20, true}};
@@ -286,6 +420,7 @@ TEST_P(PhoenixBackendZeroGains, ClosedLoopRequestDoesNotSupplyDemand) {
 
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(c));
+  ASSERT_TRUE(AwaitReady(backend, c));
 
   const auto [mode, demand] = GetParam();
   const std::array<hw::MotorRequest, 1> cmd{Request(1, mode, demand)};
@@ -310,6 +445,7 @@ TEST(PhoenixBackendSim, ReportsAmbientAndPhoenixSupplyCurrent) {
   config.motors.push_back(TestMotor(1, "health_motor", 1));
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
   const std::array<hw::MotorRequest, 1> commands{
       Request(1, hw::Mode::kVoltage, 6.0)};
   hw::State state;
@@ -351,6 +487,7 @@ NeutralSample SpinThenNeutral(bool brake) {
   c.motors.push_back(motor);
   PhoenixBackend backend(true);
   EXPECT_TRUE(backend.Configure(c));
+  EXPECT_TRUE(AwaitReady(backend, c));
 
   std::array<hw::MotorRequest, 1> cmd{Request(1, hw::Mode::kDutyCycle, 0.5)};
   hw::State s;
@@ -407,6 +544,7 @@ TEST_P(PhoenixBackendFollower, FollowsMasterAndNeutralizesWithMaster) {
   c.motors.push_back(TestMotor(10, "master", 1));
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(c));
+  ASSERT_TRUE(AwaitReady(backend, c));
   std::array<hw::MotorRequest, 2> commands{
       Request(20, hw::Mode::kVoltage, 0.0),
       Request(10, hw::Mode::kVoltage, 6.0)};
@@ -492,6 +630,7 @@ TEST_P(PhoenixBackendFollowerFeedback,
   config.motors.push_back(TestMotor(10, "master", 1));
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
   const std::array<hw::MotorRequest, 2> commands{
       Request(20, hw::Mode::kVoltage, 0.0),
       Request(10, hw::Mode::kVoltage, 6.0)};
@@ -559,6 +698,7 @@ TEST_F(PhoenixBackendRecovery, DiagnosticRatesRespectPhoenixSharedFrames) {
   config.motors.push_back(TestMotor(1, "motor", 1));
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
   auto& motor = Motor(backend, 0);
   EXPECT_DOUBLE_EQ(motor.GetPosition(false).GetAppliedUpdateFrequency().value(),
                    200);
@@ -587,6 +727,7 @@ TEST_F(PhoenixBackendRecovery, StaleHealthDoesNotInvalidateMotionFeedback) {
   config.motors.push_back(TestMotor(1, "motor", 1));
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
   const std::array<hw::MotorRequest, 1> commands{
       Request(1, hw::Mode::kVoltage, 6.0)};
   hw::State state;
@@ -611,9 +752,14 @@ TEST_F(PhoenixBackendRecovery, RestoreDoesNotReconfigureUnrelatedMotor) {
   config.motors = {first, second};
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
   ctre::phoenix6::configs::TalonFXConfiguration defaults;
-  ASSERT_TRUE(Motor(backend, 0).GetConfigurator().Apply(defaults).IsOK());
-  ASSERT_TRUE(Motor(backend, 1).GetConfigurator().Apply(defaults).IsOK());
+  ASSERT_TRUE(AwaitAnswer([&] {
+                return Motor(backend, 0).GetConfigurator().Apply(defaults);
+              }).IsOK());
+  ASSERT_TRUE(AwaitAnswer([&] {
+                return Motor(backend, 1).GetConfigurator().Apply(defaults);
+              }).IsOK());
   const std::array<uint16_t, 1> ids{1};
   backend.BeginRestoreAfterReset(ids);
   auto result = hw::Backend::RestoreStatus::kPending;
@@ -627,9 +773,13 @@ TEST_F(PhoenixBackendRecovery, RestoreDoesNotReconfigureUnrelatedMotor) {
   ASSERT_EQ(result, hw::Backend::RestoreStatus::kDone);
   EXPECT_TRUE(backend.UnavailableDevices().empty());
   ctre::phoenix6::configs::TalonFXConfiguration applied;
-  ASSERT_TRUE(Motor(backend, 0).GetConfigurator().Refresh(applied).IsOK());
+  ASSERT_TRUE(AwaitAnswer([&] {
+                return Motor(backend, 0).GetConfigurator().Refresh(applied);
+              }).IsOK());
   EXPECT_DOUBLE_EQ(applied.Slot0.kP, 3);
-  ASSERT_TRUE(Motor(backend, 1).GetConfigurator().Refresh(applied).IsOK());
+  ASSERT_TRUE(AwaitAnswer([&] {
+                return Motor(backend, 1).GetConfigurator().Refresh(applied);
+              }).IsOK());
   EXPECT_DOUBLE_EQ(applied.Slot0.kP, 0);
 }
 
@@ -645,6 +795,7 @@ TEST_F(PhoenixBackendRecovery, SendFailureNeutralizesOnlyThatMotor) {
                    TestMotor(30, "independent", 3)};
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
   const std::array<hw::MotorRequest, 3> commands{
       Request(10, hw::Mode::kVoltage, 6.0),
       Request(20, hw::Mode::kVoltage, 0.0),
