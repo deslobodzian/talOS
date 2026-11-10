@@ -83,17 +83,28 @@ talos_cc_node(
     deps = ["//talOS/introspection:describe"],
 )
 
+# A node whose constructor blocks until stdin closes, for the stop-during-
+# construction test.
+talos_cc_node(
+    name = "blocked_node",
+    srcs = ["testdata/blocked_node.cc"],
+    node_name = "blocked_node",
+    visibility = ["//visibility:private"],
+)
+
 cc_test(
     name = "node_test",
     size = "small",
     srcs = ["node_test.cc"],
     data = [
         "testdata/robot.toml",
+        ":blocked_node",
         ":graph_node",
         ":test_node",
     ],
     env = {
         "TALOS_TEST_NODE": "$(rlocationpath :test_node)",
+        "TALOS_BLOCKED_NODE": "$(rlocationpath :blocked_node)",
         "TALOS_GRAPH_NODE": "$(rlocationpath :graph_node)",
         "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
     },

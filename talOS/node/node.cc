@@ -1153,6 +1153,12 @@ int RunMain(int argc, char** argv, const char* node_name,
     if (!flags.replay_inputs.empty()) {
       return RunOnRecordedInputs(node_name, flags, make);
     }
+    // Before anything slow: a stop (SIGINT/SIGTERM) during construction is
+    // recorded instead of killing the process, and honoured once the
+    // constructor returns. A constructor blocked in a restartable system call
+    // stays blocked (the handlers restart it); the launcher's SIGKILL after its
+    // grace bounds that.
+    process::InstallStopHandlers();
     // The launcher bounds each node's share of the session's log budget; at
     // the cap capture stops and `<log>.capped` marks the log incomplete.
     event::log::LogWriterOptions log_options;
@@ -1168,7 +1174,11 @@ int RunMain(int argc, char** argv, const char* node_name,
                                    .session_id = flags.session_id,
                                    .simulation = flags.simulation}};
     hosted.emplace(Host(loop, node_name, flags, make));
-    process::InstallStopHandlers();
+    if (process::stop_requested.load()) {
+      // Stopped while constructing: a clean stop, without running the loop.
+      std::printf("%s: stopped during construction\n", node_name);
+      return 0;
+    }
     reporter.start(loop, ByteTopicSources(*hosted->node),
                    Endpoints(*hosted->node), Selections(*hosted->node));
 

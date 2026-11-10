@@ -63,6 +63,16 @@ on Linux, or under the Mach time-constraint policy for its period on macOS
 the OS refuses (no privilege, a memlock limit) the node prints one line to
 stderr and runs anyway. `TALOS_REALTIME=0` in the environment turns this off.
 
+### Stopping
+
+Once `talos::Run` / `talos.run` starts a live node, SIGINT or SIGTERM stops it
+cleanly. A stop received while the constructor runs is held until the
+constructor returns; the binary then exits 0 without running its loop. A
+constructor blocked in a restartable system call keeps blocking (the call
+restarts), so the launcher's SIGKILL after its stop grace is what ends one that
+never returns. Before that point (a Python node's interpreter startup and
+imports, `--describe`, `--replay`) signals keep their default action.
+
 ### Python garbage collection
 
 `talos.run` (a `talos_py_node` binary, including under `--sim` and

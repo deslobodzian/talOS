@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -835,6 +836,62 @@ TEST(Binary, AGraphReaderDescribesWhatTheGraphItWasGivenHolds) {
                     "' " + ConfigFlag(),
                 "TALOS_GRAPH_NODE");
   EXPECT_NE(run.status, 0);
+}
+
+// SIGINT while the constructor is blocked in a system call does not kill the
+// node: the call keeps waiting, and once the constructor returns the node
+// exits cleanly without running its loop.
+TEST(Binary, StopDuringConstructionExitsCleanlyOnceConstructed) {
+  const std::string binary = Runfile("TALOS_BLOCKED_NODE");
+  const std::string config = Runfile("TALOS_TEST_CONFIG");
+  const std::string log = TempFile("blocked_node.tlog");
+  int input[2];
+  int output[2];
+  ASSERT_EQ(::pipe(input), 0);
+  ASSERT_EQ(::pipe(output), 0);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::dup2(input[0], STDIN_FILENO);
+    ::dup2(output[1], STDOUT_FILENO);
+    ::close(input[0]);
+    ::close(input[1]);
+    ::close(output[0]);
+    ::close(output[1]);
+    ::execl(binary.c_str(), binary.c_str(), "--sim", "--duration-s", "1",
+            "--log", log.c_str(), "--config", config.c_str(), nullptr);
+    ::_exit(127);
+  }
+  ::close(input[0]);
+  ::close(output[1]);
+  std::string printed;
+  const auto read_some = [&] {
+    char buffer[256];
+    const ssize_t got = ::read(output[0], buffer, sizeof buffer);
+    if (got > 0) printed.append(buffer, static_cast<std::size_t>(got));
+    return got > 0;
+  };
+  while (printed.find("constructing\n") == std::string::npos && read_some()) {
+  }
+  const bool blocked = printed.find("constructing\n") != std::string::npos;
+  if (blocked) {
+    EXPECT_EQ(::kill(child, SIGINT), 0);
+    // Let the signal land while the constructor is still blocked.
+    std::this_thread::sleep_for(100ms);
+  }
+  ::close(input[1]);  // the constructor's read returns
+  while (read_some()) {
+  }
+  ::close(output[0]);
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(blocked) << printed;
+  ASSERT_TRUE(WIFEXITED(status))
+      << "killed by signal " << (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+  EXPECT_EQ(WEXITSTATUS(status), 0) << printed;
+  EXPECT_NE(printed.find("stopped during construction"), std::string::npos)
+      << printed;
+  EXPECT_EQ(printed.find("dispatches="), std::string::npos) << printed;
 }
 
 // Describing and exact replay are offline: a robot (here a sentinel

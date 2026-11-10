@@ -3,9 +3,10 @@
 // Process-lifetime plumbing shared by every talOS node binary: stop signals
 // and the realtime scheduling of the thread that runs the loop.
 
+#include <signal.h>
+
 #include <atomic>
 #include <chrono>
-#include <csignal>
 
 namespace talos::process {
 
@@ -14,9 +15,21 @@ static_assert(std::atomic<bool>::is_always_lock_free);
 inline void RequestStop(int) {
   stop_requested.store(true, std::memory_order_relaxed);
 }
+// SIGINT and SIGTERM set stop_requested instead of ending the process. The
+// handlers restart an interrupted system call (SA_RESTART): a stop must not
+// turn a blocking call in progress, such as a node constructor waiting on a
+// lock, into a spurious error. A restartable call keeps blocking until it
+// returns on its own (poll, select, sleeps and timed socket calls still return
+// EINTR); the launcher escalates to SIGKILL after its grace period. std::signal
+// already installed restarting handlers, so behaviour after construction is
+// unchanged.
 inline void InstallStopHandlers() {
-  std::signal(SIGINT, RequestStop);
-  std::signal(SIGTERM, RequestStop);
+  struct sigaction action{};
+  action.sa_handler = RequestStop;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = SA_RESTART;
+  sigaction(SIGINT, &action, nullptr);
+  sigaction(SIGTERM, &action, nullptr);
 }
 
 struct RealtimeOptions {
