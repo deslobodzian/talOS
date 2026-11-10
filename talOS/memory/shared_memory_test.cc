@@ -217,11 +217,14 @@ long MinorFaults() {
 // mapping shows the same writes fault without it, so the count measures
 // something.
 TEST(SharedMemory, MappingsKeptResidentTakeNoFaultOnFirstWrite) {
-#if defined(__has_feature)
+  // The sanitizer's shadow memory is mapped lazily, so the instrumented
+  // writes fault on shadow pages no matter what the ring does. GCC marks
+  // sanitizer builds with __SANITIZE_*__; clang with __has_feature.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+  GTEST_SKIP() << "shadow memory faults under a sanitizer";
+#elif defined(__has_feature)
 #if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
     __has_feature(memory_sanitizer)
-  // The sanitizer's shadow memory is mapped lazily, so the instrumented
-  // writes fault on shadow pages no matter what the ring does.
   GTEST_SKIP() << "shadow memory faults under a sanitizer";
 #endif
 #endif
