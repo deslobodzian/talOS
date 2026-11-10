@@ -275,7 +275,25 @@ command after recovery.
 
 Outside pending asynchronous configuration, each `Tick` polls
 `Backend::PollDeviceResets()` (Phoenix: `HasResetOccurred()`
-per TalonFX/CANcoder/Pigeon2). A reset neutralizes only affected motors and
+per TalonFX/CANcoder/Pigeon2). Phoenix can deliver a reset TalonFX's restarted
+position frames before that latch, so the gateway also counts as a reset a
+rotor-feedback motor whose valid position stepped farther since its last
+valid sample than `Gateway::kMaxRotorRps` (250 rotor rps, twice the fastest
+TalonFX motor's free speed) allows over their interval, divided by
+`sensor_to_mechanism_ratio` (and by `rotor_to_sensor_ratio` when below 1).
+The interval runs from the earlier sample's tick minus its age to when this
+tick's feedback was read (`Gateway::SetClock`, which the RoboRIO program
+sets; without it, the tick's time), plus `kPositionJumpSlackUs` (20 ms), so a
+held frame, a gap of invalid samples or a late read widens the bound. The
+step is taken modulo `kPositionSpanRot` (32768, the span of Phoenix's
+fixed-point position), so a wrap is never a jump. The reference restarts
+whenever the gateway masks the motor (a restored motor's first sample is not
+compared with its pre-reset one). It catches only a restart farther from zero
+than that bound; the latch, when it follows, counts once more. Remote
+CANcoder motors are not checked: their frame may be absolute, which the
+gateway cannot see, and their position steps legitimately when the TalonFX's remote sensor frames resume. A backend
+whose positions are not physical (the ideal `SimBackend`) opts out through
+`Backend::PositionsArePhysical()`. A reset neutralizes only affected motors and
 their followers or remote-feedback dependents before starting
 `BeginRestoreAfterReset(ids)`. The global epoch and unrelated commands survive;
 pre-reset observations cannot authorize the affected motors after recovery.
@@ -420,13 +438,13 @@ or without a live command. On the real backend, neutral disables PWM pulses
 |---|---|---|
 | Use for | Fast logic tests: wiring, sequencing, timeouts | PID/gearing/direction/limit believability |
 | Velocity demand | Applies instantly, even with zero gains | P+FF loop produces volts; zero gains stall |
-| Position demand | Teleports | P-loop ramps through voltage; MotionMagic uses trapezoid profiles |
+| Position demand | Teleports (no position-jump reset check) | P-loop ramps through voltage; MotionMagic uses trapezoid profiles |
 | Neutral | Velocity snaps to 0 | Unpowered decay: brake stops fast, coast rolls on |
 | Gearing/inversion | Ignored | Rotor/gearing division, inversion flips direction; a follower drives in its master's direction (reversed if opposed), ignoring its own `inverted`; a remote-CANcoder motor reports and closes its loops on the CANcoder in the CANcoder's direction |
 | Soft limits | Ignored | Clamped, axis stopped at the limit |
 | Pigeon yaw | Zero raw yaw, then mounting offset/inversion | True chassis yaw relative to boot, plus optional drift; explicit gyro overrides remain available |
 | Supply voltage | Ignored | Scales free speed (`SetSupplyVoltage`) |
-| Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback, per-device disconnect, controller restart |
+| Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback (valid, its age growing), per-device disconnect, controller restart |
 
 Tests live in `sim_physics_test.cc`. The standalone `sim_gateway` runs the
 ideal backend by default and the physics backend with `--physics` (see

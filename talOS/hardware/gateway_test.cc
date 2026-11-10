@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -173,7 +174,15 @@ class FakeBackend : public Backend {
     return unavailable;
   }
   bool Read(State& s) override {
-    for (auto& m : s.motors) m.valid = healthy && m.id != invalid_motor;
+    for (auto& m : s.motors) {
+      m.valid = healthy && m.id != invalid_motor;
+      if (const auto it = positions.find(m.id); it != positions.end()) {
+        m.position_rot = it->second;
+      }
+      if (const auto it = position_ages.find(m.id); it != position_ages.end()) {
+        m.position_age_us = it->second;
+      }
+    }
     for (auto& sensor : s.sensors) {
       sensor.valid = healthy && sensor.id != invalid_sensor;
     }
@@ -247,6 +256,9 @@ class FakeBackend : public Backend {
   std::vector<uint16_t> restoring_ids;
   std::vector<uint16_t> unavailable;
   std::optional<ConfigError> config_error{};
+  // Reported motor positions and position ages by id; others keep theirs.
+  std::map<uint16_t, double> positions;
+  std::map<uint16_t, uint32_t> position_ages;
 };
 Command Request(const Gateway& g) {
   const auto s = g.snapshot();
@@ -1468,6 +1480,108 @@ TEST(Gateway, PhysicsResetPreservesPositionAndRejectsOldDemand) {
   EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].position_rot, position);
   EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].velocity_rps, 0.0);
   EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].voltage, 0.0);
+}
+
+std::size_t MotorIndex(const Config& config, Feedback feedback) {
+  const auto motor = std::find_if(
+      config.motors.begin(), config.motors.end(),
+      [feedback](const auto& m) { return m.feedback == feedback; });
+  return static_cast<std::size_t>(motor - config.motors.begin());
+}
+
+// A TalonFX reset restarts its rotor position at zero, and the restarted
+// frames can reach the gateway before HasResetOccurred() does. A rotor-
+// feedback motor whose position steps farther than its motor can turn is
+// masked, counted and restored in that State, across a gap of stale frames,
+// so a command observed before it never drives the restarted frame. The
+// restored motor's first sample starts a new reference rather than reading
+// as another jump; the late latch is counted as one more reset.
+TEST(Gateway, RotorPositionJumpIsAResetBeforeItsLatchArrives) {
+  const auto config = SwerveConfig(true);
+  const auto index = MotorIndex(config, Feedback::kRotor);
+  const auto other = MotorIndex(config, Feedback::kRemoteCANcoder);
+  const uint16_t id = config.motors[index].id;
+  FakeBackend backend;
+  backend.pending_ticks = 2;
+  Gateway g{config, backend, 1};
+  backend.positions[id] = 30;
+  g.Tick(1000, true);
+  const auto before = Request(g);
+  ASSERT_TRUE(g.Accept(before, 1, 1000));
+  backend.invalid_motor = id;  // The TalonFX reboots: its frames go stale.
+  g.Tick(2000, true);
+  EXPECT_EQ(g.snapshot().counters.device_reset_count, 0u);
+  backend.invalid_motor = 0;
+  backend.positions[id] = 0;  // Restarted frames, no reset latch yet.
+  g.Tick(3000, true);
+  EXPECT_FALSE(g.snapshot().motors[index].valid);
+  EXPECT_EQ(g.snapshot().counters.device_reset_count, 1u);
+  EXPECT_EQ(backend.restoring_ids, std::vector<uint16_t>{id});
+  EXPECT_EQ(backend.last_requests[index].mode, Mode::kNeutral);
+
+  uint64_t now = 3000;
+  while (!g.snapshot().motors[index].valid && now < 20000) {
+    now += 1000;
+    g.Tick(now, true);
+  }
+  ASSERT_TRUE(g.snapshot().motors[index].valid);
+  ASSERT_TRUE(g.Accept(before, 2, now));
+  EXPECT_EQ(backend.last_requests[index].mode, Mode::kNeutral);
+  EXPECT_EQ(backend.last_requests[other].mode, Mode::kVelocity);
+  backend.positions[id] = 0.1;
+  now += 1000;
+  g.Tick(now, true);
+  EXPECT_TRUE(g.snapshot().motors[index].valid);
+  EXPECT_EQ(g.snapshot().counters.device_reset_count, 1u);
+  ASSERT_TRUE(g.Accept(Request(g), 3, now));
+  EXPECT_EQ(backend.last_requests[index].mode, Mode::kVelocity);
+
+  backend.resets = {id};
+  now += 1000;
+  g.Tick(now, true);
+  EXPECT_FALSE(g.snapshot().motors[index].valid);
+  EXPECT_EQ(g.snapshot().counters.device_reset_count, 2u);
+}
+
+uint64_t late_read_us = 0;
+uint64_t LateReadClock() { return late_read_us; }
+
+// No reset for a step the motor can make: across a wrap of Phoenix's
+// fixed-point position, after a held frame whose age widens the interval, or
+// over a tick whose feedback was read late; nor for any step of a remote
+// CANcoder motor, whose frame may be absolute and steps when its remote
+// frames resume.
+TEST(Gateway, PositionStepsWithinMotorSpeedOrOnRemoteFeedbackAreNoReset) {
+  const auto config = SwerveConfig(true);
+  const auto drive = MotorIndex(config, Feedback::kRotor);
+  const auto steer = MotorIndex(config, Feedback::kRemoteCANcoder);
+  ASSERT_EQ(config.motors[drive].sensor_to_mechanism_ratio, 6.75);
+  const uint16_t drive_id = config.motors[drive].id;
+  FakeBackend backend;
+  Gateway g{config, backend, 1};
+  backend.positions[drive_id] = 16383.8;
+  g.Tick(1000000, true);
+  // 1 ms plus 20 ms of slack at 250 / 6.75 rps allows 0.78 rotations; this
+  // 0.75 wraps past 16384.
+  backend.positions[drive_id] = -16383.45;
+  backend.positions[config.motors[steer].id] = 5;
+  g.Tick(1001000, true);
+  // A frame held for 40 ms: the next one may come 61 ms of travel later.
+  backend.position_ages[drive_id] = 40000;
+  g.Tick(1002000, true);
+  backend.position_ages[drive_id] = 0;
+  backend.positions[drive_id] = -16381.45;
+  g.Tick(1003000, true);
+  // Read 100 ms after the tick began: 121 ms of travel.
+  g.SetClock(LateReadClock);
+  late_read_us = 1104000;
+  backend.positions[drive_id] = -16377.95;
+  g.Tick(1004000, true);
+  const auto s = g.snapshot();
+  EXPECT_EQ(s.counters.device_reset_count, 0u);
+  EXPECT_TRUE(s.motors[drive].valid);
+  EXPECT_TRUE(s.motors[steer].valid);
+  EXPECT_TRUE(backend.restoring_ids.empty());
 }
 
 TEST(Gateway, FailedDeviceConfigureAndRestoreLeaveOthersDriving) {

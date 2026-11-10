@@ -160,6 +160,8 @@ class SimBackend final : public Backend {
         commands_[i] = MotorRequest{};
   }
   RestoreStatus PollRestore() override { return RestoreStatus::kDone; }
+  // Position demands teleport, so a step says nothing about a reset.
+  bool PositionsArePhysical() const override { return false; }
   void SetPowerHealth(double battery_v, bool brownout) {
     health_ = {true, battery_v, brownout, 0.0};
   }

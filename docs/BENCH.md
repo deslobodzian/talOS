@@ -137,6 +137,15 @@ sleep precision. Releasing a lane is not a mechanical brake.
   despite restarted low timestamps. Old targets cannot revive motion. Disable
   and release before any re-enable. Record old/new boot ids, clock reset count,
   config acknowledgment and fresh DS/target acceptance after safe recovery.
+- [ ] Reset the TalonFX alone (briefly interrupt its power) while DS is
+  disabled and the motor rests at least 10 rotations from 0, with
+  `hardware_node --log` recording. Expected: in the first State whose motor
+  position has restarted near 0, the motor is invalid and
+  `device_reset_count` has risen, whether Phoenix's reset latch (the RIO
+  console's device reset line) came first or the gateway's position-jump
+  check caught it; the node's `zeroed()` is false. Record, per reset over at
+  least 10 trials, the States from the first restarted position frame to the
+  latch: this measures the order TODO.md RESET-1 rests on.
 - [ ] Kill `hardware_node` while spinning slowly. Expected: RIO watchdog
   neutralizes without the bridge; launcher restart policy is visible in the
   manifest. Disable/release before recovery. Record neutral delay, PID attempts,

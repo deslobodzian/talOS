@@ -121,6 +121,7 @@ void Robot::StartCompetition() {
   const uint64_t boot_id = (uint64_t{random()} << 32) | random() | 1;
 
   gateway_ = std::make_unique<talos::hardware::Gateway>(*backend_, boot_id);
+  gateway_->SetClock(NowUs);
   // The persisted configuration configures devices on the backend's worker,
   // polled by the loop below: a reboot with absent devices (each one a CAN
   // timeout) must not hold back robot code start or this loop's reports of

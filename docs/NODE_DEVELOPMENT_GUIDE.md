@@ -215,9 +215,11 @@ absolute-frame motor's (below), which no reset or boot drops:
 - a gateway boot id change drops every zero on the node;
 - a device reset count change in the State whose `sequence` is the previous
   accepted State's plus one (the gateway's next tick) drops the zeros of the
-  node's devices that State masks; the gateway counts a reset and masks the
-  device, its followers and its remote-sensor consumers in the same State, so
-  another device's reset keeps them;
+  node's devices that State masks; the gateway counts a reset (a device's
+  reset latch, or a rotor-feedback motor whose position stepped farther than
+  its motor can turn; see [talOS/hardware](../talOS/hardware/README.md)) and
+  masks the device, its followers and its remote-sensor consumers in the same
+  State, so another device's reset keeps them;
 - a device reset count change across any other sequence step (a lost State,
   a link outage, a gateway tick with no socket) drops every zero on the node.
 

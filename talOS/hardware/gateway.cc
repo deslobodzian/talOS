@@ -192,6 +192,7 @@ void Gateway::CommitConfiguration(const Config& config) {
   restore_backoff_us_ = kRestoreInitialBackoffUs;
   last_requests_.fill(MotorRequest{});
   motor_reset_at_.fill(0);
+  position_reference_.fill(PositionReference{});
   Invalidate();
 }
 void Gateway::Invalidate() {
@@ -224,6 +225,9 @@ void Gateway::MaskUnavailable() {
       if (unavailable) {
         state_.motors[i].valid = false;
         motor_reset_at_[i] = state_.sample_time_us;
+        // Its frame may restart before it returns: the first sample after
+        // that is a new reference, not a jump from this one.
+        position_reference_[i].valid = false;
       }
     }
   }
@@ -305,17 +309,17 @@ void Gateway::PollResets() {
   }
   // Keep detecting new resets even while a previous device is being restored.
   std::vector<uint16_t> reset_ids;
-  if (backend_.PollDeviceResets(reset_ids)) {
+  if (!backend_.PollDeviceResets(reset_ids)) reset_ids.clear();
+  FindPositionJumps(reset_ids);
+  if (!reset_ids.empty()) {
     state_.counters.device_reset_count += reset_ids.size();
     if (unavailable_.empty()) restore_backoff_us_ = kRestoreInitialBackoffUs;
     for (auto id : reset_ids) {
       std::erase(restoring_ids_, id);
       if (!DeviceUnavailable(id)) unavailable_.push_back(id);
     }
-    if (!reset_ids.empty()) {
-      restore_waiting_ = true;
-      restore_retry_at_ = state_.sample_time_us;
-    }
+    restore_waiting_ = true;
+    restore_retry_at_ = state_.sample_time_us;
   }
   MaskUnavailable();
   if (!reset_ids.empty()) NeutralUnavailable();
@@ -326,6 +330,59 @@ void Gateway::PollResets() {
     ++restore_attempt_count_;
     restoring_ids_ = unavailable_;
     backend_.BeginRestoreAfterReset(restoring_ids_);
+  }
+}
+
+// A TalonFX reset restarts its rotor position at zero wherever the mechanism
+// is, and Phoenix can deliver the restarted position frames before
+// HasResetOccurred() reports the reset. A rotor-feedback motor (always a
+// "rezero" position frame) whose valid position moved farther since its last
+// valid sample than kMaxRotorRps allows is therefore a reset too. The
+// interval runs from the earliest time the earlier sample can have been taken
+// (its tick minus its age), so a held frame or a gap of invalid samples
+// widens the bound instead of tripping it, to when this tick's feedback was
+// read. A step is taken modulo kPositionSpanRot, so a wrap of Phoenix's
+// fixed-point position is never a jump. Remote CANcoder motors are
+// not checked: the gateway cannot tell an absolute frame from a rezero one,
+// and their position can step legitimately when the TalonFX's remote sensor
+// frames resume.
+void Gateway::FindPositionJumps(std::vector<uint16_t>& reset_ids) {
+  if (!backend_.PositionsArePhysical()) return;
+  const uint64_t now = state_.sample_time_us;
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    const auto& m = config_.motors[i];
+    const auto& sample = state_.motors[i];
+    auto& reference = position_reference_[i];
+    // An invalid sample keeps the reference, so a reset is still caught when
+    // feedback returns; a masked motor's reference is dropped when masked.
+    if (m.feedback != Feedback::kRotor || DeviceUnavailable(m.id) ||
+        !sample.valid || !std::isfinite(sample.position_rot) ||
+        std::find(reset_ids.begin(), reset_ids.end(), m.id) !=
+            reset_ids.end()) {
+      continue;
+    }
+    if (reference.valid && read_us_ >= reference.earliest_us) {
+      // Phoenix applies only SensorToMechanismRatio to rotor feedback; the
+      // physics simulator divides by both ratios, faster when the rotor
+      // ratio is below 1.
+      const double rotor_per_mechanism =
+          m.sensor_to_mechanism_ratio * std::min(1.0, m.rotor_to_sensor_ratio);
+      const double interval_s =
+          static_cast<double>(read_us_ - reference.earliest_us +
+                              kPositionJumpSlackUs) *
+          1e-6;
+      const double step = std::remainder(
+          sample.position_rot - reference.position_rot, kPositionSpanRot);
+      if (std::abs(step) > kMaxRotorRps / rotor_per_mechanism * interval_s) {
+        reset_ids.push_back(m.id);
+        reference.valid = false;
+        continue;
+      }
+    }
+    reference = {
+        .valid = true,
+        .position_rot = sample.position_rot,
+        .earliest_us = now - std::min<uint64_t>(now, sample.position_age_us)};
   }
 }
 
@@ -365,6 +422,7 @@ void Gateway::Tick(uint64_t now, bool enabled) {
   }
   state_.sample_time_us = now;
   healthy_ = configured_ && backend_.Read(state_);
+  read_us_ = clock_ != nullptr ? std::max(now, clock_()) : now;
   if (!healthy_ && active_) Invalidate();
   PollResets();
   // A watchdog stop is not a one-shot: with no accepted command in force,

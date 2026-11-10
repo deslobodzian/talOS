@@ -70,6 +70,10 @@ class Backend {
   // Failed restoration is retried by Gateway with capped exponential backoff.
   virtual void BeginRestoreAfterReset(std::span<const uint16_t>) {}
   virtual RestoreStatus PollRestore() { return RestoreStatus::kDone; }
+  // Whether a valid motor position moves only as fast as the motor turns it,
+  // so the gateway can read a larger step as a reset (Gateway::kMaxRotorRps).
+  // The ideal SimBackend, whose position demands apply instantly, says no.
+  virtual bool PositionsArePhysical() const { return true; }
 
  private:
   bool configure_result_{false};
@@ -80,6 +84,23 @@ class Gateway {
   static constexpr uint32_t kConsecutiveApplyFailureLimit = 3;
   static constexpr uint64_t kRestoreInitialBackoffUs = 250000;
   static constexpr uint64_t kRestoreMaxBackoffUs = 2000000;
+  // A rotor-feedback motor's valid position steps between samples by at most
+  // this rotor speed over their interval plus kPositionJumpSlackUs; a larger
+  // step is a reset (PollResets). Twice the fastest TalonFX motor's free
+  // speed (Kraken X44, about 125 rps at 12 V), leaving room for a charged
+  // battery and a backdriven rotor.
+  static constexpr double kMaxRotorRps = 250;
+  // Frame timestamp error, CAN queueing and tick jitter.
+  static constexpr uint64_t kPositionJumpSlackUs = 20000;
+  // Phoenix 6 reports Position as fixed point in [-16384, 16384) of its own
+  // units, so a long spin can wrap it; steps are compared modulo this span.
+  static constexpr double kPositionSpanRot = 32768;
+  // The clock Tick's `now` comes from. Read again after Backend::Read, it
+  // ends the position-jump window when the feedback was read rather than when
+  // the tick began, so a loop preempted in between does not see more motion
+  // than its window allows. Without one (explicit simulated time) the window
+  // ends at `now`.
+  void SetClock(uint64_t (*clock)()) { clock_ = clock; }
   Gateway(Config config, Backend& backend, uint64_t boot_id);
   Gateway(Backend& backend, uint64_t boot_id);
   // Replaces the active hardware configuration. Safe-reconfiguration rules:
@@ -130,6 +151,7 @@ class Gateway {
  private:
   void Invalidate();
   void PollResets();
+  void FindPositionJumps(std::vector<uint16_t>& reset_ids);
   bool DeviceUnavailable(uint16_t id) const;
   void MaskUnavailable();
   void NeutralUnavailable();
@@ -151,6 +173,16 @@ class Gateway {
   std::vector<uint16_t> restoring_ids_;
   std::array<MotorRequest, kMaxMotors> last_requests_{};
   std::array<uint64_t, kMaxMotors> motor_reset_at_{};
+  // A rotor-feedback motor's last valid position since the gateway last
+  // masked it, and the earliest time that sample can have been taken.
+  struct PositionReference {
+    bool valid{false};
+    double position_rot{};
+    uint64_t earliest_us{};
+  };
+  std::array<PositionReference, kMaxMotors> position_reference_{};
+  uint64_t (*clock_)() = nullptr;
+  uint64_t read_us_{};  // When this tick's Backend::Read returned.
   uint64_t restore_backoff_us_{kRestoreInitialBackoffUs};
   uint32_t restore_attempt_count_{};
   uint32_t consecutive_apply_failures_{};

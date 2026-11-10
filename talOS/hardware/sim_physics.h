@@ -60,6 +60,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -257,6 +258,7 @@ class PhysicsSimBackend final : public Backend {
     powered_.fill(false);
     frozen_.fill(false);
     held_.fill(MotorSample{});
+    held_at_us_.fill(0);
     motor_connected_.fill(true);
     sensor_connected_.fill(true);
     motor_to_sensor_.fill(-1);
@@ -323,7 +325,13 @@ class PhysicsSimBackend final : public Backend {
       }
       healthy = true;
       if (frozen_[i]) {
+        // Stale, as a Phoenix signal that stops updating: its age grows.
         out = held_[i];
+        const uint64_t age_us =
+            std::min<uint64_t>(state.sample_time_us - held_at_us_[i],
+                               std::numeric_limits<uint32_t>::max() - 1);
+        out.position_age_us = static_cast<uint32_t>(age_us);
+        out.velocity_age_us = static_cast<uint32_t>(age_us);
         continue;
       }
       const double gear = Gear(i);
@@ -344,6 +352,7 @@ class PhysicsSimBackend final : public Backend {
       out.fault_flags = HardLimitFlags(i);
       EnforceSoftLimits(m, out, i);
       held_[i] = out;
+      held_at_us_[i] = state.sample_time_us;
     }
     for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
       const auto& s = config_.sensors[i];
@@ -944,6 +953,7 @@ class PhysicsSimBackend final : public Backend {
   std::array<bool, kMaxMotors> powered_{};
   std::array<bool, kMaxMotors> frozen_{};
   std::array<MotorSample, kMaxMotors> held_{};
+  std::array<uint64_t, kMaxMotors> held_at_us_{};
   std::array<bool, kMaxMotors> motor_connected_{};
   std::array<bool, kMaxMotors> forward_pressed_{};
   std::array<bool, kMaxMotors> reverse_pressed_{};

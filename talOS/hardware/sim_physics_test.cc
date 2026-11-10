@@ -658,6 +658,9 @@ TEST(SimBelievability, FrozenFeedbackHoldsStaleSamples) {
   StepBackend(backend, s, now_us, 5000, 100);
   EXPECT_DOUBLE_EQ(s.motors[0].position_rot, held_pos);
   EXPECT_TRUE(s.motors[0].valid);  // Frozen is stale, not disconnected.
+  // Its age says so, so the gateway's reset check widens its bound by the
+  // freeze instead of reading the unfreeze as a reset.
+  EXPECT_EQ(s.motors[0].position_age_us, 500000u);
   backend.UnfreezeFeedback(1);
   StepBackend(backend, s, now_us, 5000, 100);
   EXPECT_GT(s.motors[0].position_rot, held_pos);
