@@ -9,7 +9,7 @@ critical = false
 period_us = 20000
 # "kalman" (wpimath SwerveDrive4PoseEstimator) or "factor_graph" (GTSAM
 # fixed-lag smoother); [kalman] / [factor_graph] below tune each.
-backend = "kalman"
+backend = "factor_graph"
 # C++ camera nodes: geometry.PoseObservation on /<name>/state, status on
 # /<name>/status. Each camera's subsystem file holds its calibration/device.
 # Under --sim they use /sim/state from sim_gateway --physics, never this estimator.

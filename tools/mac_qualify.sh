@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Deployment-host qualification in one run: the evidence TODO.md MAC-1, INC-3
-# and POSE-1 ask for from the Mac mini. Also runs on Linux.
+# Deployment-host qualification in one run: the evidence TODO.md MAC-1 and INC-3
+# ask for from the Mac mini. Also runs on Linux.
 #
 #   tools/mac_qualify.sh [--log FILE]
 #

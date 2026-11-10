@@ -37,7 +37,7 @@ native, and Python runs only per arriving frame.
 
 `backend` in `configuration/subsystems/pose_estimator.toml` selects the
 implementation (an unknown value fails at startup). The robot config selects
-`"kalman"`.
+`"factor_graph"`.
 
 - `kalman`: Python `wpimath.estimator.SwerveDrive4PoseEstimator`, a steady-state
   Kalman gain with latency compensation by odometry replay. Tuned by `[kalman]
