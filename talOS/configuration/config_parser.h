@@ -734,10 +734,13 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
     s.webroot = detail::ReadNonEmpty(*studio, "webroot", s.webroot, "[studio]");
     s.http_port =
         detail::ReadPort(*studio, "http_port", s.http_port, "[studio]");
-    s.max_clients =
-        detail::ReadPort(*studio, "max_clients", s.max_clients, "[studio]");
-    if (s.max_clients > 64) {
-      throw std::invalid_argument("[studio] max_clients must be in [1, 64]");
+    if (studio->contains("max_clients")) {
+      const auto clients = (*studio)["max_clients"].value<int64_t>();
+      if (!clients || *clients < 1 || *clients > 64) {
+        throw std::invalid_argument(
+            "[studio] field 'max_clients' must be an integer in [1, 64]");
+      }
+      s.max_clients = static_cast<uint16_t>(*clients);
     }
     if (studio->contains("topic")) {
       s.topic = detail::ReadNonEmpty(*studio, "topic", "", "[studio]");

@@ -11,6 +11,9 @@
 #   ./sim.sh --no-rio        use an existing controller (no WPILib, no gateway)
 #   ./sim.sh --sim-gateway   lightweight physics simulator instead of WPILib
 #   ./sim.sh --no-studio     robot only, no bridge and no browser
+#   ./sim.sh --no-open       Studio without opening a browser
+#   ./sim.sh --sim-gateway --gateway-arg ARG
+#                            forward ARG to the lightweight simulator
 #   ./sim.sh --duration-s 30 stop the node graph after 30 seconds
 #
 set -uo pipefail
@@ -226,7 +229,7 @@ say "  declared graph: $GRAPH"
 # Nothing to spawn: the launcher owns the bridge (see section 2). Wait for
 # its HTTP endpoint, then offer the browser. A viewer that never comes up is
 # a warning, not a fatal error: the launcher supervises the bridge and the
-# robot session runs regardless (bridge log: $OUT_DIR/studio_bridge.log).
+# robot session runs regardless (bridge log: $SESSION_DIR/studio_bridge.log).
 if [ "$WANT_STUDIO" = "1" ]; then
   URL="http://localhost:${HTTP_PORT}"
   STUDIO_UP=0
