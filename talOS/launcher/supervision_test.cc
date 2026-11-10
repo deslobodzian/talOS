@@ -498,11 +498,15 @@ TEST(Supervision, SessionsAreIsolatedAndCleanOnlyOwnedDirs) {
 }
 
 // A persistent fault is quarantined at the rolling limit, not retried in a
-// tight loop. Stopping the session cancels its one pending retry.
+// tight loop. Stopping the session cancels its one pending retry. The session
+// stops once alpha has stayed quarantined for 500 ms, not at a deadline: a
+// launcher stalled in its manifest fsyncs (seconds on a host busy writing to
+// the same disk) can reach any deadline before alpha's third run. The stubs
+// never register, so their startup grace outlasts the 20 s give-up.
 TEST(Supervision, CrashingNodeQuarantinesUntilTheSessionStops) {
   LauncherOptions options = BaseOptions("restart_out", "max_restarts = 2\n");
   MakeAlphaNonCritical(options);
-  options.duration_s = 1;
+  options.heartbeat_startup_grace_ms = 60'000;
   const std::string alpha_runs = TempPath("restart_alpha_runs");
   const std::string beta_runs = TempPath("restart_beta_runs");
   ::remove(alpha_runs.c_str());
@@ -512,7 +516,30 @@ TEST(Supervision, CrashingNodeQuarantinesUntilTheSessionStops) {
   options.binary_overrides["//example/beta:node"] =
       WriteStub("restart_beta", RecordLogArgThen(beta_runs, kRunUntilStopped));
 
+  // RunSession rewrites options.output_dir on return; don't read it
+  // concurrently.
+  const auto live_manifest = options.output_dir + "/" +
+                             std::to_string(options.session_id) +
+                             "/manifest.json";
+  bool quarantined = false;
+  std::jthread stopper{[&](const std::stop_token& stop) {
+    const auto give_up = std::chrono::steady_clock::now() + 20s;
+    while (!stop.stop_requested() &&
+           std::chrono::steady_clock::now() < give_up) {
+      if (ManifestEntry(ReadFile(live_manifest), "alpha")
+              .find("\"quarantined\": true") != std::string::npos) {
+        quarantined = true;
+        break;
+      }
+      std::this_thread::sleep_for(2ms);
+    }
+    if (quarantined) std::this_thread::sleep_for(500ms);
+    if (!stop.stop_requested()) ::kill(::getpid(), SIGTERM);
+  }};
   EXPECT_NE(RunSession(options), 0);
+  stopper.request_stop();
+  stopper.join();
+  EXPECT_TRUE(quarantined);
 
   const std::string dir = options.output_dir;
   const std::vector<std::string> expected_logs{dir + "/alpha.tlog",
