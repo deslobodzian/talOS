@@ -23,6 +23,8 @@ This is JSON-RPC 2.0, not MCP. POST requests to
 `http://127.0.0.1:5804/rpc`, or send them over
 `ws://127.0.0.1:5804/rpc`. Batches and notifications are supported; HTTP
 notifications receive 204 and WebSocket notifications receive no reply.
+A batch holds at most 16 requests (`MAX_BATCH` in [`server.ts`](server.ts));
+a larger one is rejected whole with a single `-32600` error.
 Requests are limited to 64 KiB. Requests with an Origin header or a Host other
 than `127.0.0.1` or `localhost` (optionally with a port) are rejected.
 
@@ -39,11 +41,11 @@ samples without interpolation.
 
 | Method | Parameters | Result |
 |---|---|---|
-| `get_latest` | `{}` | Latest snapshot, also under `snapshot`, plus `age_ms` and `age_ns` since timeline arrival |
+| `get_latest` | `{}` | Latest snapshot, also under `snapshot`, plus `age_ms` and `age_ns` since timeline arrival; both are null when the latest sample is the bridge's cached dictionary frame sent on connect, whose values may be arbitrarily old |
 | `get_schema_tree` | `{}` | Observed leaf paths and JavaScript types, direct channel aliases, retained bounds, frame count and timestamp encoding |
 | `query_state_at` | `timestamp_ns`, optional `topics`, optional `mode` | Snapshot, or timestamped topic map; mode defaults to `exact`, with `at_or_before` selecting the preceding sample |
 | `scan_channel_events` | `topic`, `condition`, optional inclusive `start_ns` / `end_ns` | Contiguous matching retained-sample ranges with inclusive endpoints and sample counts |
-| `get_system_graph` | `{}` | Last received live graph, source event rates and topic-health summary |
+| `get_system_graph` | `{}` | Last received live graph, source event rates and topic-health summary, plus `age_ms` since it arrived and `stale` |
 | `describe_topic` | `topic` | One graph topic, its health and named endpoints with counters and rates |
 | `get_declared_graph` | `{}` | Declared nodes and diagnostics, summary and comparison against the live graph; comparison is null until a live graph arrives |
 
@@ -59,7 +61,10 @@ retained sample even when it is before `start_ns`. Missing packets are not
 inferred to match. No arbitrary expression evaluation is accepted.
 
 Source rates are null until a rate can be measured. Graph queries return the
-last received graph, not a guarantee that its liveness information is current.
+last received graph. `get_system_graph` marks it `stale` once it is
+`GRAPH_STALE_AFTER_MS` (1 s, [`freshness.ts`](../src/data/freshness.ts)) old;
+a stale graph's `alive` flags are last-known, not current. The agent drops the
+graph when the bridge connection closes.
 For graph endpoints, health semantics and optional declared files, see the
 [bridge reference](../bridge/README.md#http-and-websocket-views).
 
@@ -68,7 +73,7 @@ For graph endpoints, health semantics and optional declared files, see the
 | Code | Meaning |
 |---|---|
 | `-32700` | JSON parse error |
-| `-32600` | Invalid request or empty batch |
+| `-32600` | Invalid request, empty batch or oversized batch |
 | `-32601` | Unknown method |
 | `-32602` | Invalid params, including unknown requested topics |
 | `-32603` | Internal error |

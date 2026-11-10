@@ -17,6 +17,7 @@ import {
   TOPIC_HEALTH,
   topicHealthOf,
 } from '../src/system';
+import {graphStale} from '../src/data/freshness';
 
 export class RpcFault extends Error {
   constructor(public code: number, message: string) {
@@ -47,6 +48,14 @@ export type RpcContext = {
   // only way to tell a node that died on the way up from one that was never
   // asked for.
   declared?: DeclaredGraph|null;
+
+  // performance.now() when `system` arrived, and whether the connection that
+  // delivered it is still open. A hung bridge sends nothing, so only the
+  // graph's age says that its nodes' `alive` is no longer about now. Absent
+  // arrival means the caller does not know it: age and staleness are null.
+  // Absent `connected` judges by age alone.
+  systemArrivalMs?: number|null;
+  connected?: boolean;
 };
 
 // Rates come from the window when the caller keeps one, and from the single
@@ -270,6 +279,8 @@ export function dispatch(
   // one node chose to publish, not the shape of the system that produced it.
   if (method === 'get_system_graph') {
     const system = requireSystem(context);
+    const arrival = context.systemArrivalMs ?? null;
+    const now = performance.now();
     const rates = ratesFor(context, system);
     const health = topicHealthOf(system);
     // One tally per state, so an agent does not have to know which of them are
@@ -286,6 +297,11 @@ export function dispatch(
       // graph that says so.
       version: system.version,
       wall_ns: system.wall_ns,
+      // Whether this graph still says what is running now; when it is stale,
+      // every node's `alive` is last-known evidence, not a claim about now.
+      stale: arrival === null ? null :
+                                graphStale(arrival, now, context.connected ?? true),
+      age_ms: arrival === null ? null : Math.max(0, now - arrival),
       registry: system.registry,
       bridge: system.bridge,
       nodes: system.nodes.map(node => ({

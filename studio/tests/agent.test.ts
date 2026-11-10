@@ -13,8 +13,9 @@ import {
   type RpcContext,
   RpcFault,
 } from '../agent/rpc';
-import {startAgent} from '../agent/server';
+import {MAX_BATCH, startAgent} from '../agent/server';
 import {TelemetryDecoder, Timeline} from '../src/core';
+import {GRAPH_STALE_AFTER_MS} from '../src/data/freshness';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from '../src/demo';
 import {
   type DeclaredGraph,
@@ -385,6 +386,18 @@ test('get_latest returns the newest sample with its dictionary and age', () => {
   assert.ok(latest.age_ms >= 0);
 });
 
+test('get_system_graph says when the graph no longer describes now', () => {
+  const system = demoGraph();
+  const at = (systemArrivalMs: number) =>
+      dispatch({...systemContext(system), systemArrivalMs, connected: true},
+               'get_system_graph', {}) as {stale: boolean|null; age_ms: number|null};
+  // A hung bridge sends nothing; a graph past the threshold is last-known.
+  const old = at(performance.now() - GRAPH_STALE_AFTER_MS - 1);
+  assert.equal(old.stale, true);
+  assert.ok(old.age_ms! > GRAPH_STALE_AFTER_MS);
+  assert.equal(at(performance.now()).stale, false);
+});
+
 test('every advertised method exists, and nothing else does', () => {
   // RPC_METHODS is what the Agent tab and the README list, so a name in it that
   // dispatch does not answer is a picker entry that fails on click.
@@ -414,7 +427,9 @@ test('every advertised method exists, and nothing else does', () => {
 // a real socket: a wrong path or an unhandled 404 would leave every declared
 // view permanently empty and nothing would say why.
 
-async function fakeBridge(declared: string|null) {
+// `greeting` is sent as a binary message on every open, as the bridge sends
+// its cached dictionary frame.
+async function fakeBridge(declared: string|null, greeting?: Uint8Array) {
   const server = createServer((request, response) => {
     if (request.url === '/declared.json' && declared !== null) {
       response.setHeader('Content-Type', 'application/json');
@@ -425,6 +440,8 @@ async function fakeBridge(declared: string|null) {
     response.writeHead(404).end();
   });
   const sockets = new WebSocketServer({server, path: '/telemetry'});
+  if (greeting)
+    sockets.on('connection', client => client.send(greeting, {binary: true}));
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const {port} = server.address() as AddressInfo;
@@ -535,6 +552,48 @@ test('losing the bridge drops the live graph instead of reporting it alive',
          bridge.close();
        }
      });
+
+test('the cached frame sent on open has unknown age', async () => {
+  const bridge = await fakeBridge(null, demoPacket(0n));
+  const agent = startAgent(0, bridge.url);
+  try {
+    await settle(() => agent.timeline.frames.length === 1,
+                 'the cached frame never reached the timeline');
+    // It names the channels, but its values may predate this connection by
+    // any amount: an age of ~0 would call a dead robot live.
+    const latest = dispatch(agent.context(), 'get_latest', {}) as
+        {sequence_id: string; age_ms: number|null; age_ns: string|null};
+    assert.equal(latest.sequence_id, '0');
+    assert.equal(latest.age_ms, null);
+    assert.equal(latest.age_ns, null);
+  } finally {
+    agent.close();
+    bridge.close();
+  }
+});
+
+test('an oversized JSON-RPC batch is rejected whole', async () => {
+  const bridge = await fakeBridge(null);
+  const agent = startAgent(0, bridge.url);
+  try {
+    await settle(() => !!agent.server.address(), 'agent did not listen');
+    const {port} = agent.server.address() as AddressInfo;
+    const post = async (requests: number): Promise<unknown> =>
+        (await fetch(`http://127.0.0.1:${port}/rpc`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(Array.from(
+              {length: requests},
+              (_, id) => ({jsonrpc: '2.0', id, method: 'get_schema_tree'})))
+        })).json();
+    assert.equal((await post(MAX_BATCH) as unknown[]).length, MAX_BATCH);
+    const rejected = await post(MAX_BATCH + 1) as {error: {code: number}};
+    assert.equal(rejected.error.code, -32600);
+  } finally {
+    agent.close();
+    bridge.close();
+  }
+});
 
 test('oversized RPC WebSocket payloads close only the offending client', async () => {
   const bridge = await fakeBridge(null);

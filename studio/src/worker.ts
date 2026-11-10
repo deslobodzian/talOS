@@ -56,8 +56,10 @@ let nextDemoSystem = 0;
 // machine's, so its age is measured from local arrival.
 let systemArrival: number|null = null;
 let postedSystemStale = true;
+// A held graph is only current while the source that sent it is.
+const graphConnected = () => connection === 'live' || connection === 'demo';
 function systemStale(now: number) {
-  return graphStale(systemArrival, now, connection === 'live' || connection === 'demo');
+  return graphStale(systemArrival, now, graphConnected());
 }
 
 // The declared graph, fetched over HTTP rather than pushed: the launcher writes
@@ -434,7 +436,8 @@ ctx.onmessage = ({data}) => {
         try {
           response = handleRpc(
               {timeline: coordinator.timeline, system, previousSystem, declared,
-               rateWindow},
+               rateWindow, systemArrivalMs: systemArrival,
+               connected: graphConnected()},
               data.request);
         } catch (e) {
           response = {
@@ -563,12 +566,15 @@ setInterval(() => {
     }
   }
   for (const f of jitter.flush(now)) {
-    if (!coordinator.timeline.append(f)) {
+    // An arrival of 0 is Timeline's "no known arrival", so the Agent tab's
+    // get_latest reports the cached dictionary's age as null too.
+    const unknown = unknownAge.delete(f.sequence_id);
+    if (!coordinator.timeline.append(f, unknown ? 0 : Date.now())) {
       jitter.stats.invalid++;
       continue;
     }
     pendingFrames.push(f);
-    sampleArrival = unknownAge.delete(f.sequence_id) ? null : now;
+    sampleArrival = unknown ? null : now;
     const raw = pendingBytes.get(f.sequence_id);
     if (raw) packets.set(f.sequence_id, raw);
     pendingBytes.delete(f.sequence_id);

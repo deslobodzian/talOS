@@ -17,6 +17,11 @@ import {
 
 import {handleRpc, type RpcContext} from './rpc';
 
+// The most requests one JSON-RPC batch may carry. 64 KiB of text holds
+// hundreds of scan_channel_events requests, each a pass over the whole
+// retained timeline on the one thread that also ingests telemetry.
+export const MAX_BATCH = 16;
+
 export function startAgent(
     port = Number(process.env.AGENT_PORT ?? 5804),
     upstream = process.env.TELEMETRY_URL ?? 'ws://127.0.0.1:5800/telemetry') {
@@ -27,6 +32,12 @@ export function startAgent(
   let jitter = new JitterBuffer(10);
   const decoder = new TelemetryDecoder();
   let streamId: string|null = null;
+  // Sequence ids whose age is unknown, as in the Studio worker: the bridge's
+  // cached dictionary frame, sent as the first binary message on every open,
+  // carries values from whenever the producer last wrote it -- possibly long
+  // before this connection, if telemetry has stopped.
+  const unknownAge = new Set<string>();
+  let firstBinary = false;
 
   // `previousSystem` is the sample just before this one: what changed since
   // the last refresh. Rates need a wider baseline than that -- one refresh
@@ -35,6 +46,9 @@ export function startAgent(
   let previousSystem: SystemGraph|null = null;
   const rateWindow = new RateWindow();
   const graphs = {received: 0, invalid: 0};
+  // performance.now() when `system` arrived: a hung bridge sends nothing, and
+  // only the graph's age can say so.
+  let systemArrivalMs: number|null = null;
 
   // What the launcher declared before it spawned anything. Fetched over HTTP
   // from the same origin as the telemetry socket rather than pushed: the
@@ -43,8 +57,15 @@ export function startAgent(
   let declared: DeclaredGraph|null = null;
   let declaredError = '';
 
-  const context = (): RpcContext =>
-      ({timeline, system, previousSystem, rateWindow, declared});
+  const context = (): RpcContext => ({
+    timeline,
+    system,
+    previousSystem,
+    rateWindow,
+    declared,
+    systemArrivalMs,
+    connected: socket?.readyState === WebSocket.OPEN
+  });
 
   // A malformed document is reported and dropped, keeping the last good graph:
   // the same rule the live graph follows, for the same reason.
@@ -94,6 +115,7 @@ export function startAgent(
       const parsed = parseSystemGraph(text);
       previousSystem = system;
       system = parsed;
+      systemArrivalMs = performance.now();
       rateWindow.push(parsed);
       graphs.received++;
     } catch {
@@ -113,6 +135,15 @@ export function startAgent(
             jsonrpc: '2.0',
             id: null,
             error: {code: -32600, message: 'Empty batch'}
+          };
+        if (input.length > MAX_BATCH)
+          return {
+            jsonrpc: '2.0',
+            id: null,
+            error: {
+              code: -32600,
+              message: `Batch exceeds ${MAX_BATCH} requests`
+            }
           };
         // One context for the whole batch, so every request in it sees the
         // same system state.
@@ -228,6 +259,8 @@ export function startAgent(
         ingestSystemGraph(raw.toString());
         return;
       }
+      const unknown = firstBinary;
+      firstBinary = false;
       try {
         const bytes = Array.isArray(raw) ? Buffer.concat(raw) :
             raw instanceof ArrayBuffer   ? new Uint8Array(raw) :
@@ -240,6 +273,7 @@ export function startAgent(
             jitter = new JitterBuffer(10);
           }
           streamId = frame.stream_id;
+          if (unknown) unknownAge.add(frame.sequence_id);
           jitter.push(frame, performance.now());
         }
       } catch {
@@ -247,6 +281,10 @@ export function startAgent(
       }
     });
     socket.on('open', () => {
+      // The bridge answers an open with its graph and then, when it has one,
+      // its cached dictionary frame: the first binary message on a socket.
+      firstBinary = true;
+      unknownAge.clear();
       // Asked for on every open: the bridge may have started after this
       // process did, and the first attempt would have had nothing to answer it.
       void fetchDeclaredGraph();
@@ -257,11 +295,15 @@ export function startAgent(
       // get_system_graph answers "no graph" until the bridge sends a new one.
       system = null;
       previousSystem = null;
+      systemArrivalMs = null;
       if (!stopped) retry = setTimeout(connect, 1000);
     });
   }
   const tick = setInterval(() => {
-    for (const frame of jitter.flush(performance.now())) timeline.append(frame);
+    // An arrival of 0 is Timeline's "no known arrival": get_latest then
+    // reports the age as null rather than as the age of the connection.
+    for (const frame of jitter.flush(performance.now()))
+      timeline.append(frame, unknownAge.delete(frame.sequence_id) ? 0 : Date.now());
   }, 5);
   server.listen(
       port, '127.0.0.1',
