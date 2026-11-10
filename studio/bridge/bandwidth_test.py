@@ -16,7 +16,7 @@ import unittest
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from integration_test import BINARY, frame, receive
+from integration_test import BINARY, bound_port, frame, receive
 
 
 def connect(port, stalled=False):
@@ -57,9 +57,6 @@ def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4)
                           "# Placeholder CAN id; this probe never opens hardware.\n"
                           "[subsystems.alpha.motors.m1]\n"
                           "type = \"TalonFX\"\nbus = \"rio\"\ncan_id = 1\n")
-        with socket.socket() as reservation:
-            reservation.bind(("127.0.0.1", 0))
-            port = reservation.getsockname()[1]
         try:
             mock = subprocess.Popen([str(binaries / "studio_mock"), topic, "64"],
                                     stdout=subprocess.PIPE, text=True)
@@ -67,9 +64,11 @@ def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4)
             assert mock.stdout.readline().strip() == "ready"
             started = time.monotonic()
             bridge = subprocess.Popen([str(binaries / "studio_bridge"),
-                                       topic, str(port), root,
-                                       "--config", str(config)])
+                                       topic, "0", root,
+                                       "--config", str(config)],
+                                      stdout=subprocess.PIPE, text=True)
             processes.append(bridge)
+            port = bound_port(bridge)
             deadline = time.monotonic() + 10
             while True:
                 try:

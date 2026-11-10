@@ -492,9 +492,11 @@ int main(int argc, char** argv) try {
                 << "; /declared.json will report it absent\n";
     }
   }
+  // Port 0 asks the OS for a free port; the bound port is reported on stdout
+  // once listening, so a test never hands the bridge a port it closed first.
   auto port = [](const char* s) {
     auto p = std::stoul(s);
-    if (p == 0 || p > 65535) throw std::runtime_error("invalid port");
+    if (p > 65535) throw std::runtime_error("invalid port");
     return static_cast<std::uint16_t>(p);
   };
   const auto root = fs::canonical(count > 3 ? at(3) : "studio/dist");
@@ -652,6 +654,10 @@ int main(int argc, char** argv) try {
     bridge.listener = token;
   });
   if (!listening) throw std::runtime_error("HTTP listen failed");
+  std::cout << "listening "
+            << us_socket_local_port(
+                   0, reinterpret_cast<us_socket_t*>(bridge.listener))
+            << std::endl;
   auto* timer = us_create_timer(reinterpret_cast<us_loop_t*>(uWS::Loop::get()),
                                 0, sizeof(Bridge*));
   if (!timer) throw std::runtime_error("poll timer allocation failed");

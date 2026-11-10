@@ -71,6 +71,18 @@ def frame_of(sock, opcode, limit=20):
     raise AssertionError(f"no frame with opcode {opcode:#x} in {limit} frames")
 
 
+def bound_port(bridge):
+    """The port a bridge started with port 0 reports once it is listening.
+
+    The OS picks the port at bind time, so no other process can take it
+    between choosing and listening, as it could a port reserved and closed by
+    the test first.
+    """
+    line = bridge.stdout.readline()
+    assert line.startswith("listening "), f"bridge exited before listening: {line!r}"
+    return int(line.split()[1])
+
+
 class BridgeIntegration(unittest.TestCase):
     def test_transports(self):
         workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
@@ -113,25 +125,23 @@ class BridgeIntegration(unittest.TestCase):
                               b'"nodes":[{"name":"drivetrain","restart_count":0,'
                               b'"exit_code":0}]}')
             manifest.write_bytes(manifest_bytes)
-            with socket.socket() as reservation:
-                reservation.bind(("127.0.0.1", 0))
-                http_port = reservation.getsockname()[1]
-            with socket.socket() as reservation:
-                reservation.bind(("127.0.0.1", 0))
-                bare_port = reservation.getsockname()[1]
             try:
                 # The bridges start before the publisher: each serves HTTP and
                 # waits for the telemetry segment, then attaches to it.
                 bridge = subprocess.Popen([str(binaries / "studio_bridge"), topic,
-                                           str(http_port), webroot, "--declared", str(declared),
-                                           "--manifest", str(manifest)])
+                                           "0", webroot, "--declared", str(declared),
+                                           "--manifest", str(manifest)],
+                                          stdout=subprocess.PIPE, text=True)
                 processes.append(bridge)
                 # The same bridge with no declared graph, to pin down what
                 # /declared.json does then. Started here so both are up while
                 # the deadline loop below waits.
                 bare = subprocess.Popen([str(binaries / "studio_bridge"), topic,
-                                         str(bare_port), webroot])
+                                         "0", webroot],
+                                        stdout=subprocess.PIPE, text=True)
                 processes.append(bare)
+                http_port = bound_port(bridge)
+                bare_port = bound_port(bare)
                 # Wait until both bridges listen. A bridge signalled before it
                 # is listening has not installed its SIGTERM handler yet and
                 # dies with -15 instead of exiting 0.
@@ -320,6 +330,8 @@ class BridgeIntegration(unittest.TestCase):
                         except subprocess.TimeoutExpired:
                             process.kill()
                             process.wait()
+                    if process.stdout:
+                        process.stdout.close()
                 for process in processes:
                     self.assertEqual(process.returncode, 0)
 

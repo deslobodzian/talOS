@@ -19,7 +19,10 @@ bazel-bin/studio/bridge/studio_bridge /talos/telemetry 5800 studio/dist
 ## Arguments
 
 The optional positions are topic (default `/talos/telemetry`), HTTP/WebSocket
-port (5800), and static web directory (`studio/dist`).
+port (5800), and static web directory (`studio/dist`). Once listening, the
+bridge prints `listening <port>` on stdout; port 0 asks the OS for a free port,
+which that line reports (how the bridge tests avoid racing other processes for
+a port).
 
 These named options are removed before positional parsing:
 
