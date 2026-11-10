@@ -36,9 +36,9 @@
 // character in /dev/shm, and the mapping preserves length so the 30-character
 // cap keeps meaning the same thing on both sides.
 //
-// Public because anything that opens a segment directly -- RTMS's stale-segment
-// reclaim, a test, a tool listing /dev/shm -- needs this name and not the
-// topic.
+// Public because anything that opens a segment directly -- RTMS's unlink of a
+// closing segment, a test, a tool listing /dev/shm -- needs this name and not
+// the topic.
 inline std::string ShmObjectName(std::string_view topic, std::string_view ns) {
   if (topic.starts_with("/~")) return std::string{topic};
   std::string_view stripped = topic;

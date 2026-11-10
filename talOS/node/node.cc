@@ -727,8 +727,7 @@ namespace {
 // A byte topic on RTMS (schema talos.Bytes), opened, and its writer claimed,
 // as the node registers it, the way the realtime loop opens its typed topics:
 // a topic another live process writes fails the node's construction, not a
-// send in the middle of a run. This node is its only producer and owns its
-// layout, so it reclaims a stale segment no live process holds.
+// send in the middle of a run.
 class SharedByteTopic final : public ByteTopic {
  public:
   SharedByteTopic(std::string_view topic, std::size_t max_bytes,

@@ -32,7 +32,10 @@ Without the launcher (tests, CLI tools), the first queue to open a name creates
 the segment and the last one to close unlinks it. Dead readers are reclaimed.
 If that last queue's process dies after marking the segment closing but before
 unlinking it, the next queue to open the name waits briefly for the unlink and
-then, when no live process holds the segment, unlinks it itself.
+then, when no live process holds the segment, unlinks it itself. A segment
+whose last holder was killed otherwise stays and is reused; every attach,
+publisher or reader, refuses one of another version, layout or schema, which a
+launcher session replaces or `shm_unlink` removes.
 
 Publishers (`RTMSOptions::publisher`) atomically claim the header's writer when
 opening. A second live publisher, including another publisher in the same
@@ -57,9 +60,9 @@ lint rejects declared reader counts above this limit before launch; standalone
 
 A queue keeps the state word it claimed each reader slot with. Once the slot
 holds another word -- another process judged this one dead and freed the slot,
-which a process may since have claimed -- `read_next()` reports `INACTIVE` and
-`read()` fails rather than share a claimant's cursor, and `release_reader()`
-leaves the slot alone. The [realtime event loop](../events/README.md) then
+which a process may since have claimed -- `read_next()` reports `INACTIVE`
+rather than share a claimant's cursor, and `release_reader()` leaves the slot
+alone. The [realtime event loop](../events/README.md) then
 claims a slot again. All claims of one process carry the same word, so a slot
 freed and claimed again by another queue of the same process before this one
 reads goes unnoticed.

@@ -9,7 +9,6 @@
 
 #include <array>
 #include <atomic>
-#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -121,14 +120,9 @@ struct RTMSOptions {
   OverflowPolicy overflow_policy{OverflowPolicy::OVERWRITE_OLDEST};
   ReadMode read_mode{ReadMode::LATEST};
 
-  // This end writes the topic. A publisher records itself in the segment
-  // and owns the topic's layout outside a session: a segment it cannot use
-  // -- one from an older build, or of another schema -- that is not
-  // session-owned and that no live process holds (no live writer, no live
-  // reader) is unlinked and recreated rather than failing every process that
-  // follows until someone removes it by hand. Readers leave it false: a
-  // reader disagreeing with a segment is a version skew that must be
-  // reported, not papered over.
+  // This end writes the topic: it claims the segment's writer on open, and a
+  // second live writer is refused. Like any attach, it fails on a segment of
+  // another version, layout or schema rather than replace it.
   bool publisher{false};
 
   // This queue creates the segment for a session and is the only one that
@@ -200,9 +194,6 @@ struct RTMSHeader {
 
 static_assert(sizeof(RTMSHeader) == 832);
 
-template <typename F, class T = const std::byte>
-concept TakesSpan = std::invocable<F, std::span<T>>;
-
 // Ring buffer queue over one named shared-memory segment.
 //
 // Schema identity. The creator writes its schema name and hash into the
@@ -217,8 +208,8 @@ concept TakesSpan = std::invocable<F, std::span<T>>;
 // (a node run directly, Sim-less tools such as send_target or monitor,
 // tests) the first queue to open a name creates the segment and the last
 // one to close it unlinks it; a segment whose last holder was killed stays
-// until a publisher reclaims it, a launcher session replaces it, or the
-// machine restarts, and is reused meanwhile. A last holder killed between
+// until a launcher session replaces it, someone unlinks it, or the machine
+// restarts, and is reused meanwhile. A last holder killed between
 // marking the segment closing and unlinking it never unlinks it: the next
 // queue to open the name waits out that unlink and then, when no live
 // process holds the segment, unlinks it itself.
@@ -240,8 +231,7 @@ class RTMSQueue {
   // Claims a reader slot for this process. When none is free, slots held by
   // processes that no longer exist are freed first. The queue keeps the
   // state word it claimed the slot with: once the slot holds another,
-  // read_next() reports INACTIVE and read() fails, rather than share another
-  // claimant's cursor.
+  // read_next() reports INACTIVE rather than share another claimant's cursor.
   std::optional<std::size_t> register_reader();
   // Frees reader slot `id` if this queue claimed it and still holds it.
   void release_reader(std::size_t id);
@@ -257,10 +247,10 @@ class RTMSQueue {
   // Copies the next message for `reader_id` into `destination` and reports
   // its sequence, publication time, and how many messages were skipped.
   //
-  // Unlike read(), this is safe against a writer that laps the reader: the
-  // slot is copied first and the copy is only accepted if the writer did not
-  // reach it during the copy (a seqlock, using the writer sequence that the
-  // frozen shared-memory layout already provides).
+  // Safe against a writer that laps the reader: the slot is copied first and
+  // the copy is only accepted if the writer did not reach it during the copy
+  // (a seqlock, using the writer sequence that the frozen shared-memory
+  // layout already provides).
   // Payload and publication time are accepted under the same validity check.
   ReadResult read_next(std::uint64_t reader_id,
                        std::span<std::byte> destination, MessageInfo& info);
@@ -274,54 +264,6 @@ class RTMSQueue {
   }
 
   std::uint64_t slots() const { return slots_; }
-  // We want the option to have copy free interactions, as such we pass a
-  // functor you are able to copy the data with the functor if you want or just
-  // do a quick operation and leave. e.i schedule an action based on the results
-  // of the message. Zero-copy read. The callback is handed a view directly into
-  // shared memory, so with OverflowPolicy::OVERWRITE_OLDEST the writer may lap
-  // the reader while the callback runs. The overwrite is detected afterwards
-  // and the callback is retried, so:
-  //
-  //   the callback MUST NOT commit side effects; only data copied out of a
-  //   read() that returned true is valid.
-  //
-  // read_next() has no such caveat and reports dropped messages, so prefer
-  // it unless the copy genuinely matters.
-  template <TakesSpan Callback>
-  bool read(std::uint64_t reader_id, Callback&& callback) {
-    if (reader_id >= MAX_READERS) {
-      return false;
-    }
-
-    if (!holds_reader(reader_id)) {
-      return false;
-    }
-
-    auto& reader = header_->readers[reader_id];
-
-    for (int attempt = 0; attempt < MAX_READ_ATTEMPTS; ++attempt) {
-      MessageInfo info{};
-
-      if (!select_sequence(reader, info)) {
-        return false;
-      }
-
-      callback(std::span<const std::byte>{slot_address(info.sequence),
-                                          header_->message_bytes});
-
-      if (!slot_still_valid(info.sequence)) {
-        continue;
-      }
-
-      // The cursor always points to the next sequence to consume.
-      reader.sequence.store(info.sequence + 1, std::memory_order_release);
-
-      return true;
-    }
-
-    return false;
-  }
-
   size_t message_size() const { return message_size_; }
   std::string_view path() const { return path_; }
   // The schema the segment's creator recorded.

@@ -85,8 +85,8 @@ struct Bridge {
   // The telemetry topic, once its publisher's segment exists. The bridge
   // serves HTTP and the system graph without it, waits for the segment
   // rather than refusing to start, and re-attaches when the name comes to
-  // hold a different segment (a new launcher session, or a publisher that
-  // recreated an incompatible one).
+  // hold a different segment (a new launcher session, or one created after
+  // the last holder of the old one closed it).
   std::string segment;
   std::optional<RTMSQueue> queue;
   std::size_t reader = 0;
@@ -107,8 +107,8 @@ struct Bridge {
   // Frames the publisher overwrote before this bridge read them: it never
   // waits for the bridge, so a stalled bridge is lapped instead.
   std::uint64_t lapped = 0;
-  // read_next() copies each frame here first: forwarding commits side effects
-  // (client sends, counters), which a zero-copy read() callback must not.
+  // read_next() copies each frame here and validates the copy before
+  // forwarding commits side effects (client sends, counters).
   std::vector<std::byte> frame =
       std::vector<std::byte>(talos::telemetry_wire::slot_bytes);
   std::size_t max_clients = 4;

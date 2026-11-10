@@ -28,6 +28,13 @@
 
 namespace {
 
+// How an operator clears a segment that a killed standalone process left in
+// an older format: no attach replaces it.
+std::string Remedy(const std::string& path) {
+  return " (stop the processes using it, then shm_unlink " +
+         ShmObjectName(path) + ", start a launcher session, or reboot)";
+}
+
 // Bounded like SharedMemoryPtr's size wait: a creator initializes a header
 // within microseconds, so 50 ms separates "still being created" from "never
 // will be" without masking either.
@@ -112,7 +119,6 @@ class HeaderView {
       }
       ::usleep(kInitRetryUs);
     }
-    exists_ = true;
     if (sized) {
       void* mapped =
           ::mmap(nullptr, sizeof(RTMSHeader), PROT_READ, MAP_SHARED, fd, 0);
@@ -130,18 +136,17 @@ class HeaderView {
   HeaderView(const HeaderView&) = delete;
   HeaderView& operator=(const HeaderView&) = delete;
 
-  bool exists() const { return exists_; }
   // Null when the segment is too small to be an RTMS segment.
   const RTMSHeader* header() const { return header_; }
 
  private:
-  bool exists_{false};
   const RTMSHeader* header_{nullptr};
 };
 
 // Unlinks `path` only while it still names the segment `segment_id`: a
-// publisher may have reclaimed the name, or a session replaced it, since
-// this process mapped it, and that newer segment is not ours to remove.
+// session may have replaced it, or an opener recovered it from a killed
+// closer, since this process mapped it, and that newer segment is not ours
+// to remove.
 void UnlinkIfSame(const std::string& path, std::uint64_t segment_id) {
   bool same = false;
   {
@@ -231,35 +236,6 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
   }
 
   for (int attempt = 0; attempt <= kOpenAttempts; ++attempt) {
-    if (options_.publisher && !options_.session_owner) {
-      // Reclaims a segment this publisher cannot use, when nothing could be
-      // harmed by removing it: not session-owned and held by no live process.
-      // Unlinking does not disturb a process that still has the old segment
-      // mapped; it only removes the name.
-      bool reclaim = false;
-      {
-        const HeaderView view{path_};
-        if (view.exists()) {
-          const RTMSHeader* header = view.header();
-          if (header == nullptr || !WaitInitialized(*header) ||
-              header->version != kRtmsVersion) {
-            reclaim = true;  // another build's format, or never initialized
-          } else if (!layout_matches(*header) || !schema_matches(*header)) {
-            reclaim = (header->lifetime.load(std::memory_order_acquire) &
-                       kLifetimeSessionOwned) == 0 &&
-                      !HeldByLiveProcess(*header);
-          }
-        }
-      }
-      if (reclaim) {
-        std::fprintf(stderr,
-                     "rtms: reclaiming stale shared memory %s, which this "
-                     "build cannot use and no live process holds\n",
-                     path_.c_str());
-        ::shm_unlink(ShmObjectName(path_).c_str());
-      }
-    }
-
     SharedMemoryPtr ptr{path_, total_bytes_};
     auto* header = static_cast<RTMSHeader*>(ptr.ptr());
 
@@ -310,7 +286,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
       throw std::runtime_error("RTMS shared-memory version mismatch on " +
                                path_ + ": segment version " +
                                std::to_string(header->version) + ", expected " +
-                               std::to_string(kRtmsVersion));
+                               std::to_string(kRtmsVersion) + Remedy(path_));
     }
     if (!layout_matches(*header)) {
       throw std::runtime_error(
@@ -320,13 +296,13 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
           std::to_string(header->message_bytes) + " bytes, " +
           std::to_string(header->slots) + " slots, here " +
           std::to_string(message_size_) + " bytes, " + std::to_string(slots_) +
-          " slots)");
+          " slots)" + Remedy(path_));
     }
     if (!schema_matches(*header)) {
       throw std::runtime_error("RTMS schema mismatch on " + path_ +
                                ": the segment carries " + SchemaOf(*header) +
                                ", this process uses " +
-                               talos::schema::Describe(schema));
+                               talos::schema::Describe(schema) + Remedy(path_));
     }
 
     bool closing = false;

@@ -215,9 +215,9 @@ Linux `CLOCK_MONOTONIC`), shared with `node.now()`; simulation uses its virtual
 clock. Payload and timestamp are copied before the same slot-validity check.
 For published position P and slot sequence s, readers require P − s < slots,
 except that equality is accepted when the reliable-publication marker equals P.
-Overwriting writers invalidate this marker before modifying slot bytes. A
-standalone publisher reclaims incompatible unheld segments; attaching readers
-reject version mismatches. A new session owner replaces any prior segment.
+Overwriting writers invalidate this marker before modifying slot bytes. Every
+attach, publisher or reader, rejects a segment of another version, layout or
+schema. A new session owner replaces any prior segment.
 Writer and reader claims in the header record the pid plus the process start
 time (`kProcessPidBits` in `talOS/rtms/process_liveness.h`), so a reused pid holds no claim.
 

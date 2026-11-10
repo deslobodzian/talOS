@@ -29,10 +29,9 @@ Typed single-producer / multi-consumer pub/sub on top of
   gone, or by a later one while none is free (`registered()` is false
   meanwhile); messages published while the subscriber had no slot count in
   the next `Received::dropped`.
-- The publisher owns the topic layout outside a launcher session: it
-  passes `RTMSOptions::publisher`, so it reclaims a segment of another
-  build or schema that no live process holds. A live publisher exclusively
-  owns the topic; another publisher throws with the topic and both pids.
+- The publisher passes `RTMSOptions::publisher`: a live publisher
+  exclusively owns the topic; another publisher throws with the topic and
+  both pids.
   Each move-only `Subscriber` owns and releases a reader slot; construction
   throws if reader slots are exhausted. Transport ownership, reader capacity
   and segment lifetime are documented in [RTMS](../rtms/README.md).

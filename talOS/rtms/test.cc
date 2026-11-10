@@ -172,8 +172,7 @@ TEST(ReaderOwnership, ASlotAnotherProcessFreedAndClaimedIsInactive) {
   EXPECT_EQ(queue.read_next(id, std::as_writable_bytes(std::span{&received, 1}),
                             info),
             ReadResult::INACTIVE);
-  EXPECT_FALSE(queue.read(id, [](std::span<const std::byte>) {}));
-  // Neither read moved the slot's cursor, which is now the claimant's.
+  // The read did not move the slot's cursor, which is now the claimant's.
   EXPECT_EQ(header->readers[id].sequence.load(), 0u);
 }
 
@@ -247,49 +246,6 @@ TEST(WriterOwnership, ReclaimsCrashedWriterWithoutLosingReaders) {
             WriteResult::SUCCESS);
   EXPECT_EQ(session.writer_sequence(), 2u);
   session.release_reader(*reader);
-}
-
-TEST(WrapTest, RTMSSequenceWrapsSlots) {
-  const std::string path = make_test_path("wrap");
-
-  constexpr std::size_t slots = 64;
-  constexpr int iterations = 4 * static_cast<int>(slots);
-
-  RTMSQueue queue{
-      path,
-      sizeof(Message::TestMessage),
-      alignof(Message::TestMessage),
-      kSchema,
-      slots,
-      sequence_options(),
-  };
-
-  const auto reader_id = queue.register_reader();
-  ASSERT_TRUE(reader_id.has_value());
-  const std::size_t id = reader_id.value_or(std::size_t{0});
-
-  for (int i = 0; i < iterations; ++i) {
-    const Message::TestMessage expected{
-        i,
-        static_cast<float>(i),
-    };
-
-    const auto rtms_message = BytesOf(expected);
-
-    ASSERT_EQ(queue.write(rtms_message), WriteResult::SUCCESS);
-
-    Message::TestMessage received{};
-
-    ASSERT_TRUE(queue.read(id, [&received](std::span<const std::byte> bytes) {
-      std::memcpy(&received, bytes.data(), sizeof(received));
-    }));
-
-    EXPECT_EQ(received, expected);
-  }
-
-  EXPECT_FALSE(queue.read(id, [](std::span<const std::byte>) {}));
-
-  queue.release_reader(id);
 }
 
 TEST(PublishTime, ExplicitTimestampsSurviveSequenceAndLatestReads) {
@@ -875,10 +831,11 @@ void ReadThread(const std::string& path, int iterations,
     while (received_count < iterations && !failed.load()) {
       Message::TestMessage received{};
 
+      MessageInfo info{};
       const bool did_read =
-          queue.read(*reader_id, [&received](std::span<const std::byte> bytes) {
-            std::memcpy(&received, bytes.data(), sizeof(received));
-          });
+          queue.read_next(*reader_id,
+                          std::as_writable_bytes(std::span{&received, 1}),
+                          info) == ReadResult::OK;
 
       if (did_read) {
         const int expected_sequence = received_count;
@@ -898,17 +855,16 @@ void ReadThread(const std::string& path, int iterations,
         break;
       }
 
-      // read() returning false only means this reader is currently
-      // caught up. The writer may publish another message afterward.
+      // An unsuccessful read only means this reader is currently caught
+      // up. The writer may publish another message afterward.
       if (writer_done.load() && received_count < iterations) {
         // Give the final writer release-store one more opportunity
         // to become visible before declaring failure.
         std::this_thread::yield();
 
-        if (!queue.read(
-                *reader_id, [&received](std::span<const std::byte> bytes) {
-                  std::memcpy(&received, bytes.data(), sizeof(received));
-                })) {
+        if (queue.read_next(*reader_id,
+                            std::as_writable_bytes(std::span{&received, 1}),
+                            info) != ReadResult::OK) {
           failed.store(true);
           break;
         }
@@ -1232,26 +1188,12 @@ TEST(RTMSQueue, RejectsTopicNamesLongerThan30CharsAfterLeadingSlash) {
   });
 }
 
-// A process killed before it could unlink leaves its segment behind. When the
-// next build changes a message's size, that leftover has the wrong shape and
-// nothing can attach to it, so the publisher -- which owns the topic's layout
-// -- clears it instead of every node failing to start until someone unlinks it
-// by hand.
 namespace {
 
 RTMSOptions publisher_options() {
   RTMSOptions options = sequence_options();
   options.publisher = true;
   return options;
-}
-
-// Leaves a segment of `bytes` behind at `path` with no live owner, the way a
-// SIGKILLed process does.
-void leak_segment(const std::string& path, std::size_t bytes) {
-  const int fd = shm_open(ShmObjectName(path).c_str(), O_CREAT | O_RDWR, 0666);
-  ASSERT_NE(fd, -1);
-  ASSERT_EQ(ftruncate(fd, static_cast<off_t>(bytes)), 0);
-  ASSERT_EQ(close(fd), 0);
 }
 
 bool SegmentExists(const std::string& path) {
@@ -1262,70 +1204,6 @@ bool SegmentExists(const std::string& path) {
 }
 
 }  // namespace
-
-// The publisher reclaims the leftover; a reader that disagrees with it is a
-// version skew against a possibly live publisher, so it must refuse rather
-// than delete the topic out from under that publisher.
-TEST(RTMSStaleSegment, PublisherReclaimsALeftoverOfTheWrongShapeReaderDoesNot) {
-  const std::string path = make_test_path("stale_reclaim");
-  shm_unlink(ShmObjectName(path).c_str());
-  leak_segment(path, 4096);
-
-  EXPECT_THROW(
-      RTMSQueue(path, sizeof(Message::TestMessage),
-                alignof(Message::TestMessage), kSchema, 64, sequence_options()),
-      std::runtime_error);
-  // The segment is still there for the owner to deal with.
-  EXPECT_TRUE(SegmentExists(path));
-
-  RTMSQueue queue{path,
-                  sizeof(Message::TestMessage),
-                  alignof(Message::TestMessage),
-                  kSchema,
-                  64,
-                  publisher_options()};
-  const Message::TestMessage message{7, 1.5F};
-  EXPECT_EQ(WriteResult(queue.write(BytesOf(message))), WriteResult::SUCCESS);
-  shm_unlink(ShmObjectName(path).c_str());
-}
-
-TEST(RTMSStaleSegment, PublisherLeavesAHealthySegmentAloneUnderALiveReader) {
-  const std::string path = make_test_path("stale_healthy");
-  shm_unlink(ShmObjectName(path).c_str());
-
-  // A reader gets there first and takes a slot. The publisher that follows
-  // has an identical layout, so there is nothing to reclaim -- and unlinking
-  // here would strand this reader on memory no one else can reach. The shm
-  // object is page-rounded, so its measured size is larger than the layout
-  // asked for: only the recorded header can decide whether it matches.
-  RTMSQueue reader{path,
-                   sizeof(Message::TestMessage),
-                   alignof(Message::TestMessage),
-                   kSchema,
-                   64,
-                   sequence_options()};
-  const auto reader_id = reader.register_reader();
-  ASSERT_TRUE(reader_id.has_value());
-  const std::size_t id = reader_id.value_or(std::size_t{0});
-
-  RTMSQueue writer{path,
-                   sizeof(Message::TestMessage),
-                   alignof(Message::TestMessage),
-                   kSchema,
-                   64,
-                   publisher_options()};
-  const Message::TestMessage sent{42, 3.25F};
-  ASSERT_EQ(WriteResult(writer.write(BytesOf(sent))), WriteResult::SUCCESS);
-
-  Message::TestMessage received{};
-  MessageInfo info{};
-  ASSERT_EQ(reader.read_next(
-                id, {reinterpret_cast<std::byte*>(&received), sizeof(received)},
-                info),
-            ReadResult::OK);
-  EXPECT_EQ(received.id(), sent.id());
-  shm_unlink(ShmObjectName(path).c_str());
-}
 
 // --- schema identity
 // ----------------------------------------------------------
@@ -1370,10 +1248,6 @@ TEST(RTMSSchema, AChangedFieldTypeOfTheSameSizeIsRejectedAtAttach) {
   constexpr std::size_t kBytes = 8;  // float or int, then two bytes, padded
   RTMSQueue publisher{path, kBytes, 4, before, 16, publisher_options()};
   EXPECT_THROW((RTMSQueue{path, kBytes, 4, after, 16, sequence_options()}),
-               std::runtime_error);
-  // The live publisher holds the segment, so a second publisher of the new
-  // schema is refused as well rather than reclaiming it.
-  EXPECT_THROW(RTMSQueue(path, kBytes, 4, after, 16, publisher_options()),
                std::runtime_error);
   // The same schema attaches.
   RTMSQueue same{path, kBytes, 4, before, 16, sequence_options()};
@@ -1631,30 +1505,6 @@ TEST(RTMSDeadReader, SlotsOfKilledReadersAreReclaimedWhenNoneAreFree) {
   // A live reader is never reclaimed.
   EXPECT_EQ(publisher.reclaim_dead_readers(), 0u);
   publisher.release_reader(reader_id);
-}
-
-// A publisher reclaims a segment of another schema that only dead processes
-// held, rather than every later run failing until someone unlinks it.
-TEST(RTMSDeadReader,
-     APublisherReclaimsAnotherSchemasSegmentNoLiveProcessHolds) {
-  const std::string path = make_test_path("dead_schema");
-  shm_unlink(ShmObjectName(path).c_str());
-  RunInChildThenKill([&path] {
-    auto* queue = new RTMSQueue{path,
-                                sizeof(Message::TestMessage),
-                                alignof(Message::TestMessage),
-                                {"Message.Old", 7},
-                                16,
-                                publisher_options()};
-    if (!queue->register_reader()) _exit(1);
-  });
-  RTMSQueue publisher{path,
-                      sizeof(Message::TestMessage),
-                      alignof(Message::TestMessage),
-                      kSchema,
-                      16,
-                      publisher_options()};
-  EXPECT_EQ(publisher.schema_name(), "Message.TestMessage");
 }
 
 // --- process identity

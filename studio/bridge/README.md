@@ -140,7 +140,7 @@ name is unlinked between that check and the attach, the attach creates an
 empty segment for an instant, sees the id change, closes it (removing it, as
 its only holder) and retries at the next check. Once attached it
 checks every 1000 ticks whether the name now holds a different segment (a new
-launcher session, or a publisher that recreated an incompatible one) and
+launcher session, or one created after the old one's last holder closed it) and
 re-attaches. A segment whose name was unlinked is kept until a new one appears.
 Each wait, attachment and replacement is logged once to stderr.
 Graceful SIGINT/SIGTERM releases the reader slot. Static files are read
