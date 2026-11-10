@@ -288,14 +288,22 @@ test('event ids are unique', () => {
   assert.equal(new Set(ids).size, ids.length);
 });
 
-test('trim drops events outside the retained bounds', () => {
+test('trim drops events outside the retained bounds; readers see immutable snapshots', () => {
   const engine = new EventEngine();
   engine.pushFrame(frame(1, 1000n, {'hw/status/brownout': 0}));
   engine.pushFrame(frame(2, 2000n, {'hw/status/brownout': 1}));
   engine.pushFrame(frame(3, 3000n, {'hw/status/brownout': 0}));
-  assert.equal(engine.events.length, 2);
-  engine.trim('2000');
-  assert.deepEqual(engine.events.map(e => e.t_ns), ['2000', '3000']);
+  const before = engine.events;
+  assert.equal(before.length, 2);
+  // Nothing to drop: the same array, so a subscribed view does not re-render.
+  engine.trim('1500');
+  assert.equal(engine.events, before);
+  engine.trim('2500');
+  assert.deepEqual(engine.events.map(e => e.t_ns), ['3000']);
+  // An event after the trim is a new array; earlier snapshots never change.
+  engine.pushFrame(frame(4, 4000n, {'hw/status/brownout': 1}));
+  assert.deepEqual(engine.events.map(e => e.t_ns), ['3000', '4000']);
+  assert.deepEqual(before.map(e => e.t_ns), ['2000', '3000']);
 });
 
 

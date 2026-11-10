@@ -25,7 +25,14 @@ export class EventEngine {
   private seq = new Map<string, number>();
   private lastValues = new Map<string, number>();
   private lastLabels = new Map<string, string[]>();
-  private _events: RobotEvent[] = [];
+  // Retained events in ascending t_ns order live in `buffer[start..]`; trim
+  // advances `start` and compacts only once half the buffer is dead, so append
+  // and trim are amortized O(1). `view` is the immutable array handed to
+  // readers, rebuilt on first read after a change, so React sees a new
+  // identity exactly when the events changed.
+  private buffer: RobotEvent[] = [];
+  private start = 0;
+  private view: RobotEvent[]|null = null;
 
   constructor(frameDetectors: readonly FrameDetector[] = createFrameDetectors(),
               systemDetectors: readonly SystemDetector[] = SYSTEM_DETECTORS) {
@@ -34,7 +41,8 @@ export class EventEngine {
   }
 
   get events(): RobotEvent[] {
-    return this._events;
+    if (this.view === null) this.view = this.buffer.slice(this.start);
+    return this.view;
   }
 
   pushFrame(frame: Snapshot) {
@@ -137,7 +145,7 @@ export class EventEngine {
     this.lastLabels.clear();
     for (const detector of this.frameDetectors)
       (detector as StatefulFrameDetector).reset?.();
-    this._events = [];
+    this.replace([]);
     this.seq.clear();
   }
 
@@ -146,19 +154,35 @@ export class EventEngine {
   }
 
   // Replace the retained events wholesale (used by createStaticStudio to
-  // inject a prepared event list without replaying the frames).
+  // inject a prepared event list without replaying the frames). The list is
+  // expected in ascending t_ns order, as the engine itself keeps it.
   setEvents(events: RobotEvent[]) {
-    this._events = [...events];
+    this.replace([...events]);
   }
 
   // Drop events whose time is no longer within the retained bounds.
   trim(start_ns: string|null) {
     if (start_ns === null) {
-      this._events = [];
+      this.replace([]);
       return;
     }
     const bound = BigInt(start_ns);
-    this._events = this._events.filter(e => BigInt(e.t_ns) >= bound);
+    const from = this.start;
+    while (this.start < this.buffer.length &&
+           BigInt(this.buffer[this.start].t_ns) < bound)
+      this.start++;
+    if (this.start === from) return;
+    if (this.start * 2 >= this.buffer.length) {
+      this.buffer.splice(0, this.start);
+      this.start = 0;
+    }
+    this.view = null;
+  }
+
+  private replace(events: RobotEvent[]) {
+    this.buffer = events;
+    this.start = 0;
+    this.view = null;
   }
 
   private emit(detector: string, t_ns: string, draft: EventDraft) {
@@ -175,22 +199,21 @@ export class EventEngine {
     if (draft.channel !== undefined) event.channel = draft.channel;
 
     const key = BigInt(t_ns);
-    const last = this._events.at(-1);
-    if (!last || BigInt(last.t_ns) <= key) {
-      this._events = [...this._events, event];
+    const end = this.buffer.length;
+    this.view = null;
+    if (end === this.start || BigInt(this.buffer[end - 1].t_ns) <= key) {
+      this.buffer.push(event);
       return;
     }
     // Late insert (a deferred start carries the run's true start time, which
     // predates events emitted while it was being classified). Keep ascending
     // t_ns order; equal timestamps append after existing ones.
-    let lo = 0, hi = this._events.length;
+    let lo = this.start, hi = end;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if (BigInt(this._events[mid].t_ns) <= key) lo = mid + 1;
+      if (BigInt(this.buffer[mid].t_ns) <= key) lo = mid + 1;
       else hi = mid;
     }
-    const next = this._events.slice();
-    next.splice(lo, 0, event);
-    this._events = next;
+    this.buffer.splice(lo, 0, event);
   }
 }
