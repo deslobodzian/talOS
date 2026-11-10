@@ -12,11 +12,12 @@
  * array of slots; a node claims one at startup, writes its event-loop manifest
  * into it -- every timer, watcher, fetcher and sender, by name and message size
  * -- and then, while it runs, keeps current a heartbeat, a set of counters,
- * the lane each of its Targets selected and whether its event log stopped
- * early. Studio and any agent map the segment read-only and get the whole
- * system: which processes exist, which topics each one publishes and
- * subscribes to, how much traffic has actually moved, who drives each
- * subsystem, and which recordings are incomplete.
+ * the lane each of its Targets selected, whether its event log stopped
+ * early, and the realtime scheduling its loop got. Studio and any agent map
+ * the segment read-only and get the whole system: which processes exist,
+ * which topics each one publishes and subscribes to, how much traffic has
+ * actually moved, who drives each subsystem, which recordings are incomplete
+ * and which loops run without their realtime grant.
  *
  * The layout is frozen and the version is part of the segment name, so a node
  * from an older build cannot be misread by a newer reader: it lands in a
@@ -66,6 +67,7 @@
 #include "talOS/introspection/lock_file.h"
 #include "talOS/introspection/names.h"
 #include "talOS/memory/shared_memory_ptr.h"
+#include "talOS/process/realtime_outcome.h"
 #include "talOS/rtms/process_liveness.h"
 
 namespace talos::introspect {
@@ -111,6 +113,13 @@ namespace talos::introspect {
 // Nor did naming::kSourceFlagLatestOnly: a bit of SourceRecord::flags that
 // every earlier writer left clear, which reads as "every drop is a loss" --
 // what an earlier reader assumed of every source.
+//
+// Nor did the realtime outcome (kFlagRealtimeMask): bits of `flags` that
+// every earlier writer left clear, which reads as "not reported" -- all an
+// earlier build could have said -- and every earlier reader ignores.
+//
+// Nor did counting a timer's missed periods in SourceRecord::dropped: a
+// timer's `dropped` was always 0, which still reads as "no overrun".
 inline constexpr std::uint32_t kRegistryVersion = 5;
 inline constexpr const char* kRegistryPath = "/talos_registry.5";
 // The segment's mode, whatever the creator's umask: every node registers,
@@ -158,6 +167,41 @@ inline constexpr std::chrono::seconds kConstructionTimeout{30};
 inline constexpr std::uint32_t kFlagRecorderFailed = 1u << 3;
 inline constexpr std::uint32_t kFlagLogCapped = 1u << 4;
 
+// The loop's realtime scheduling (process::ConfigureRealtime's outcome), as
+// bits 5 to 12 of `flags`: the tier plus one in the low two (0: not reported
+// yet, or a writer that predates them), whether the steps were requested,
+// then the process::kStep* bits the OS refused. Written once per claim
+// (NodeRegistration::set_realtime), after the node has asked; RealtimeOf
+// decodes it.
+inline constexpr std::uint32_t kFlagRealtimeShift = 5;
+inline constexpr std::uint32_t kFlagRealtimeMask = 0xFFu << kFlagRealtimeShift;
+
+inline constexpr std::uint32_t RealtimeFlags(
+    const process::RealtimeOutcome& outcome) {
+  const std::uint32_t tier = static_cast<std::uint32_t>(outcome.tier) + 1u;
+  const std::uint32_t requested = outcome.requested ? 1u : 0u;
+  const auto refused =
+      static_cast<std::uint32_t>(outcome.refused & process::kAllSteps);
+  return (tier | requested << 2 | refused << 3) << kFlagRealtimeShift;
+}
+
+// The outcome a row's `flags` carry, or nullopt while none is reported.
+inline constexpr std::optional<process::RealtimeOutcome> RealtimeOf(
+    std::uint32_t flags) {
+  const std::uint32_t bits = (flags & kFlagRealtimeMask) >> kFlagRealtimeShift;
+  if ((bits & 3u) == 0) return std::nullopt;
+  return process::RealtimeOutcome{
+      .tier = static_cast<process::LoopTier>((bits & 3u) - 1u),
+      .requested = (bits & 4u) != 0,
+      .refused = static_cast<std::uint8_t>(bits >> 3)};
+}
+
+static_assert(process::kAllSteps < (1u << 5),
+              "the refused steps must fit the five bits kFlagRealtimeMask "
+              "leaves them");
+static_assert(static_cast<std::uint32_t>(process::LoopTier::kBridge) + 1u < 4u,
+              "the tier plus one must fit two bits");
+
 // One event source, as the owning node registered it. The descriptive fields
 // are written once, before the slot goes ACTIVE; the counters keep moving.
 struct SourceRecord {
@@ -185,7 +229,8 @@ struct SourceRecord {
 
   // Messages the transport lapped before this source could read them, messages
   // a latest-only watcher (kSourceFlagLatestOnly) skipped by design, publishes
-  // the transport refused, or reads it failed (SourceCounters).
+  // the transport refused, or reads it failed; for a timer, the periods it
+  // missed because the loop overran (SourceCounters).
   std::atomic<std::uint64_t> dropped;
 
   // Transport sequence last observed, which is what makes a subscriber's lag
@@ -846,6 +891,15 @@ class NodeRegistration {
     if (flags != 0) record_->flags.fetch_or(flags, std::memory_order_relaxed);
   }
 
+  // Publishes the loop's realtime outcome (kFlagRealtimeMask). Call once,
+  // from the thread that asked, right after process::ConfigureRealtime, or
+  // with requested false when the node did not ask. The bits are clear
+  // until then: a claim starts without them.
+  void set_realtime(const process::RealtimeOutcome& outcome) {
+    if (!owns_slot()) return;
+    record_->flags.fetch_or(RealtimeFlags(outcome), std::memory_order_release);
+  }
+
   void activate() {
     if (owns_slot()) {
       record_->flags.fetch_and(~kFlagConstructing, std::memory_order_release);
@@ -1146,6 +1200,10 @@ struct NodeSnapshot {
   std::uint32_t flags{0};
   std::uint32_t declared_source_count{0};
   bool alive{false};
+  // The loop's realtime outcome, once the node reported it.
+  std::optional<process::RealtimeOutcome> realtime() const {
+    return RealtimeOf(flags);
+  }
   std::vector<SourceSnapshot> sources;
   std::uint32_t declared_selection_count{0};
   std::vector<SelectionSnapshot> selections;

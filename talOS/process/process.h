@@ -10,6 +10,8 @@
 #include <chrono>
 #include <cstdint>
 
+#include "talOS/process/realtime_outcome.h"
+
 namespace talos::process {
 
 // Defined once, in process.cc. An inline variable is defined in every shared
@@ -37,19 +39,6 @@ inline void InstallStopHandlers() {
   sigaction(SIGINT, &action, nullptr);
   sigaction(SIGTERM, &action, nullptr);
 }
-
-// Which loop wins when loops compete for a CPU, lowest first. A process
-// decides its own tier from what it already knows: the hardware bridge is
-// kBridge; a node on the actuation path is kControl: its own subsystem config
-// owns an actuator (hardware::Devices::owns_actuators: a motor, digital
-// output or PWM output) or it writes a target lane (`/<sub>/target/<source>`:
-// driver, teleop, auto); every other node (telemetry, cameras, the pose
-// estimator) is kObserver.
-enum class LoopTier : std::uint8_t {
-  kObserver,
-  kControl,
-  kBridge,
-};
 
 struct RealtimeOptions {
   std::chrono::nanoseconds period{};  // loop period (Mach time-constraint)
@@ -118,13 +107,19 @@ bool RealtimeRequested(bool simulation) noexcept;
 // Threads created afterwards inherit the policy on Linux, so call it last,
 // from the thread that runs the loop.
 //
-// Returns true when every step took effect. Returns false without touching
-// anything when the environment sets TALOS_REALTIME=0. Returns false and
-// prints one line to stderr when the OS refuses a step (no privilege,
-// RLIMIT_MEMLOCK or the wired-memory limit, a refused Mach policy or QoS); the
-// steps it could take stay in effect, and a refused lock still leaves the
-// rings and stack prefaulted. Never throws, never aborts.
-bool ConfigureRealtime(const RealtimeOptions& options) noexcept;
+// Returns what it asked for and what it got (realtime_outcome.h): `tier`
+// from options, `requested` false without touching anything when the
+// environment sets TALOS_REALTIME=0, and otherwise the kStep* bits the OS
+// refused (no privilege, RLIMIT_MEMLOCK or the wired-memory limit, a refused
+// Mach policy or QoS), after printing them with their reasons as one line to
+// stderr. The steps it could take stay in effect, and a refused lock still
+// leaves the rings and stack prefaulted. A ring mapped later whose lock is
+// refused is reported by talOS/memory, not here. The caller publishes the
+// outcome (the node's registry row, introspect::NodeRegistration::
+// set_realtime), where the launcher and session_report look for it. Never
+// throws, never aborts.
+[[nodiscard]] RealtimeOutcome ConfigureRealtime(
+    const RealtimeOptions& options) noexcept;
 
 // The nice value ConfigureBackgroundThread gives a thread on Linux.
 inline constexpr int kBackgroundNice = 10;

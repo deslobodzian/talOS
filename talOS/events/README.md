@@ -277,7 +277,10 @@ while the loop runs. A watcher's drop count is the sum of its `context.dropped`
 values plus reads the writer tore and reads that found the reader slot freed,
 so a latest-only watcher's count grows with every intentional skip;
 `latest_only(id)` says which watchers those are, and the reporter publishes it
-so Studio does not call those skips loss.
+so Studio does not call those skips loss. A periodic timer's drop count is the
+periods it missed, `context.sequence - 1` summed over its dispatches, and its
+max latency the worst dispatch lateness, so an overrunning loop shows in the
+registry while its dispatch count still moves.
 
 Message conventions live in [ARCHITECTURE.md](../../ARCHITECTURE.md).
 

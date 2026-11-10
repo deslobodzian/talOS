@@ -167,6 +167,36 @@ class SessionReportTest(unittest.TestCase):
             self.assertEqual(len(session_report.strict_failures(
                 session_report.analyze(manifest, session))), failures, manifest)
 
+    def test_strict_rejects_an_actuation_loop_without_its_realtime_grant(self):
+        # The registry row's outcome, as the launcher records it.
+        def node(name, tier, grant, refused=""):
+            return {"name": name, "log_path": f"/s/{name}.tlog", "loop_tier": tier,
+                    "realtime": grant, "realtime_refused": refused}
+        def failing(manifest):
+            # The nodes whose realtime issue --strict rejects the session for.
+            report = session_report.analyze({"end_wall_ns": 1, **manifest}, [])
+            failures = session_report.strict_failures(report)
+            return {issue.split(":", 1)[0] for issue in report["realtime_issues"]
+                    if issue in failures}
+        robot = [node("hardware_node", "bridge", "full"),
+                 node("shooter", "control", "refused", "policy"),
+                 node("intake", "control", "partial", "ring mlock"),
+                 # An observer, a node that never reached its loop, or one in
+                 # a manifest that predates the outcome is reported but not
+                 # judged.
+                 node("telemetry", "observer", "refused", "policy"),
+                 node("camera", "", ""),
+                 {"name": "old", "log_path": "/s/old.tlog"}]
+        self.assertEqual(failing({"simulation": False, "nodes": robot}), {"shooter", "intake"})
+        # On the robot, not asking (TALOS_REALTIME=0) is no excuse.
+        self.assertEqual(failing({"simulation": False, "nodes": [
+            node("shooter", "control", "not_requested")]}), {"shooter"})
+        # Under --sim a loop asks only with TALOS_REALTIME=1; one that asked
+        # and was refused still fails.
+        self.assertEqual(failing({"simulation": True, "nodes": [
+            node("shooter", "control", "not_requested"),
+            node("hardware_node", "bridge", "refused", "policy")]}), {"hardware_node"})
+
     def test_missing_log_dump_is_an_input_error(self):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(session_report.runfiles, "Create", return_value=None), \

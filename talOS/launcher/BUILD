@@ -27,6 +27,7 @@ cc_library(
         "//talOS/introspection:registry",
         "//talOS/memory:shared_memory",
         "//talOS/process:durable_sync",
+        "//talOS/process:realtime_outcome",
         "//talOS/rtms",
         "//talOS/schema:identity",
         "//talOS/schema:unit_suffix",

@@ -35,11 +35,12 @@ std::atomic<bool> stop_requested{false};
 
 namespace {
 
-// The refusals so far, as one line. Fixed storage: this runs where an
-// allocation failure must not turn into an exception.
+// The refusals so far, as kStep* bits and as one line. Fixed storage: this
+// runs where an allocation failure must not turn into an exception.
 class Problems {
  public:
-  void add(const char* step, const char* reason) {
+  void add(std::uint8_t step_bit, const char* step, const char* reason) {
+    refused_ = static_cast<std::uint8_t>(refused_ | step_bit);
     if (used_ >= sizeof text_) return;
     const int written =
         std::snprintf(text_ + used_, sizeof text_ - used_, "%s%s (%s)",
@@ -50,8 +51,10 @@ class Problems {
   }
   bool empty() const { return used_ == 0; }
   const char* text() const { return text_; }
+  std::uint8_t refused() const { return refused_; }
 
  private:
+  std::uint8_t refused_ = 0;
   char text_[256]{};
   std::size_t used_ = 0;
 };
@@ -89,13 +92,13 @@ bool StackBounds(char*& low, char*& high) {
   char* low = nullptr;
   char* high = nullptr;
   if (!StackBounds(low, high)) {
-    problems.add("stack lock", "stack bounds unknown");
+    problems.add(kStepStackLock, "stack lock", "stack bounds unknown");
     return;
   }
   char* const here = static_cast<char*>(__builtin_frame_address(0));
   if (here <= low || here > high ||
       static_cast<std::size_t>(here - low) <= kStackSpare) {
-    problems.add("stack lock", "no stack to spare");
+    problems.add(kStepStackLock, "stack lock", "no stack to spare");
     return;
   }
   const std::size_t bytes = std::min(
@@ -109,7 +112,7 @@ bool StackBounds(char*& low, char*& high) {
   char* const start = const_cast<char*>(window) -
                       reinterpret_cast<std::uintptr_t>(window) % page;
   if (::mlock(start, static_cast<std::size_t>(high - start)) != 0) {
-    problems.add("stack mlock", std::strerror(errno));
+    problems.add(kStepStackLock, "stack mlock", std::strerror(errno));
   }
 }
 
@@ -125,7 +128,7 @@ void PrefaultText(Problems& problems) {
   Dl_info info{};
   if (::dladdr(reinterpret_cast<const void*>(&ConfigureRealtime), &info) == 0 ||
       info.dli_fbase == nullptr) {
-    problems.add("text prefault", "image unknown");
+    problems.add(kStepTextPrefault, "text prefault", "image unknown");
     return;
   }
   const auto* header = static_cast<const mach_header_64*>(info.dli_fbase);
@@ -149,7 +152,7 @@ void PrefaultText(Problems& problems) {
     command = reinterpret_cast<const load_command*>(
         reinterpret_cast<const char*>(command) + command->cmdsize);
   }
-  problems.add("text prefault", "no __TEXT segment");
+  problems.add(kStepTextPrefault, "text prefault", "no __TEXT segment");
 }
 
 #endif
@@ -168,7 +171,7 @@ void LockMemory(Problems& problems) {
   PrefaultText(problems);
 #else
   if (::mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-    problems.add("mlockall", std::strerror(errno));
+    problems.add(kStepMlockall, "mlockall", std::strerror(errno));
   }
 #endif
   const memory::Residency rings = memory::KeepMappingsResident();
@@ -176,7 +179,7 @@ void LockMemory(Problems& problems) {
     char reason[96];
     std::snprintf(reason, sizeof reason, "%zu of %zu: %s", rings.failed,
                   rings.ranges, std::strerror(rings.first_error));
-    problems.add("ring mlock", reason);
+    problems.add(kStepRingLock, "ring mlock", reason);
   }
   LockStack(problems);
 }
@@ -190,13 +193,14 @@ void SetThreadPolicy(const LoopPolicy& loop, Problems& problems) {
     const int result =
         ::pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     if (result != 0) {
-      problems.add("QOS_CLASS_USER_INTERACTIVE", std::strerror(result));
+      problems.add(kStepPolicy, "QOS_CLASS_USER_INTERACTIVE",
+                   std::strerror(result));
     }
     return;
   }
   mach_timebase_info_data_t timebase{};
   if (::mach_timebase_info(&timebase) != KERN_SUCCESS || timebase.numer == 0) {
-    problems.add("time constraint", "no mach timebase");
+    problems.add(kStepPolicy, "time constraint", "no mach timebase");
     return;
   }
   const auto to_abs = [&](std::chrono::nanoseconds duration) {
@@ -214,7 +218,7 @@ void SetThreadPolicy(const LoopPolicy& loop, Problems& problems) {
       reinterpret_cast<thread_policy_t>(&policy),
       THREAD_TIME_CONSTRAINT_POLICY_COUNT);
   if (result != KERN_SUCCESS) {
-    problems.add("time constraint", ::mach_error_string(result));
+    problems.add(kStepPolicy, "time constraint", ::mach_error_string(result));
   }
 }
 
@@ -228,7 +232,7 @@ void SetThreadPolicy(const LoopPolicy& loop, Problems& problems) {
   const int result =
       ::pthread_setschedparam(::pthread_self(), SCHED_FIFO, &param);
   if (result != 0) {
-    problems.add("SCHED_FIFO", std::strerror(result));
+    problems.add(kStepPolicy, "SCHED_FIFO", std::strerror(result));
   }
 }
 
@@ -249,7 +253,7 @@ bool HasTimeConstraint() {
 void SetBackground(Problems& problems) {
   const int result = ::pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
   if (result == 0) return;
-  problems.add("QOS_CLASS_UTILITY", std::strerror(result));
+  problems.add(kStepPolicy, "QOS_CLASS_UTILITY", std::strerror(result));
   // The kernel refuses a QoS for a thread under an explicit Mach policy;
   // leaving the time-constraint policy at least stops it preempting loops.
   if (!HasTimeConstraint()) return;
@@ -259,7 +263,7 @@ void SetBackground(Problems& problems) {
       reinterpret_cast<thread_policy_t>(&standard),
       THREAD_STANDARD_POLICY_COUNT);
   if (dropped != KERN_SUCCESS) {
-    problems.add("standard policy", ::mach_error_string(dropped));
+    problems.add(kStepPolicy, "standard policy", ::mach_error_string(dropped));
   }
 }
 
@@ -277,7 +281,8 @@ void SetBackground(Problems& problems) {
     param = sched_param{};
     const int result =
         ::pthread_setschedparam(::pthread_self(), SCHED_OTHER, &param);
-    if (result != 0) problems.add("SCHED_OTHER", std::strerror(result));
+    if (result != 0)
+      problems.add(kStepPolicy, "SCHED_OTHER", std::strerror(result));
   }
   // Linux keeps a nice value per thread; PRIO_PROCESS with a thread id sets
   // only that thread's. Never lowered: that would need privilege.
@@ -286,7 +291,7 @@ void SetBackground(Problems& problems) {
   const int nice = ::getpriority(PRIO_PROCESS, tid);
   if (errno == 0 && nice >= kBackgroundNice) return;
   if (::setpriority(PRIO_PROCESS, tid, kBackgroundNice) != 0) {
-    problems.add("nice", std::strerror(errno));
+    problems.add(kStepPolicy, "nice", std::strerror(errno));
   }
 }
 
@@ -321,17 +326,24 @@ LoopPolicy PolicyFor(const RealtimeOptions& options) noexcept {
   return policy;
 }
 
-bool ConfigureRealtime(const RealtimeOptions& options) noexcept {
+RealtimeOutcome ConfigureRealtime(const RealtimeOptions& options) noexcept {
+  RealtimeOutcome outcome{.tier = options.tier};
   const char* setting = std::getenv("TALOS_REALTIME");
-  if (setting != nullptr && std::strcmp(setting, "0") == 0) return false;
+  if (setting != nullptr && std::strcmp(setting, "0") == 0) return outcome;
 
+  outcome.requested = true;
   Problems problems;
   LockMemory(problems);
   SetThreadPolicy(PolicyFor(options), problems);
-  if (problems.empty()) return true;
-  std::fprintf(stderr, "talos: realtime scheduling incomplete: %s\n",
+  outcome.refused = problems.refused();
+  if (problems.empty()) return outcome;
+  // Tests and docs look for this prefix (startup_test, BRINGUP.md).
+  std::fprintf(stderr,
+               "talos: realtime scheduling incomplete (%s tier, grant %s): "
+               "%s\n",
+               TierName(options.tier), GrantName(outcome.grant()),
                problems.text());
-  return false;
+  return outcome;
 }
 
 bool ConfigureBackgroundThread() noexcept {

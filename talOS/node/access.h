@@ -32,7 +32,7 @@ namespace introspect {
 struct Description;
 }  // namespace introspect
 namespace process {
-enum class LoopTier : std::uint8_t;  // talOS/process/process.h
+enum class LoopTier : std::uint8_t;  // talOS/process/realtime_outcome.h
 }  // namespace process
 }  // namespace talos
 

@@ -195,6 +195,14 @@ class Reporter {
   Reporter(const Reporter&) = delete;
   Reporter& operator=(const Reporter&) = delete;
 
+  // Publishes the loop's realtime outcome in the row
+  // (NodeRegistration::set_realtime): call once, from the loop thread, right
+  // after process::ConfigureRealtime, or with requested false when the node
+  // did not ask. Safe while the reporting thread runs.
+  void set_realtime(const process::RealtimeOutcome& outcome) {
+    if (registration_) registration_->set_realtime(outcome);
+  }
+
   // True once the slot has been claimed and the topology written. Tests wait
   // on this rather than sleeping.
   bool published() const { return published_.load(std::memory_order_acquire); }

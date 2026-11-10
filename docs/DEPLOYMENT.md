@@ -179,7 +179,9 @@ macOS LaunchDaemon sends stderr to `/Library/Logs/talos/launchd.stderr.log`
 and stdout (progress lines, already in the manifest, and the uncapped echo
 of node output, already in each `<name>.log`) to `/dev/null`. Node output,
 including a node's `realtime scheduling incomplete` line, is in its
-`<session>/<name>.log`, not this file. launchd appends to it across
+`<session>/<name>.log`, not this file; the launcher's own warning for a
+bridge or control loop without its realtime grant is here, and the outcome is
+in the [session manifest](../talOS/launcher/README.md#session-manifest). launchd appends to it across
 launches without marking where one starts. newsyslog, which macOS runs
 hourly as root, renames it once it passes 1024 KiB and keeps four older
 copies (`launchd.stderr.log.0` to `.3`), adding no line of its own, so a

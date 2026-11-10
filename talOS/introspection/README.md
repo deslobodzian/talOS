@@ -117,6 +117,27 @@ clear, and an older reader ignores them. Once set they stay set until the slot
 is claimed again. The launcher records them in the session manifest while the
 node runs ([launcher supervision](../launcher/README.md#restarts)).
 
+## Realtime scheduling
+
+A node's loop asks for realtime scheduling once, just before it runs
+(`process::ConfigureRealtime`; [realtime scheduling](../../docs/NODE_DEVELOPMENT_GUIDE.md#realtime-scheduling)),
+and the OS can refuse any step of it. The node then stores the outcome in its
+row with `NodeRegistration::set_realtime` (`Reporter::set_realtime` for an
+event-loop node; the hardware bridge calls it on its own registration),
+whether or not it asked. It is bits 5 to 12 of `flags` (`kFlagRealtimeMask`):
+the loop tier plus one (0 until the node reports, which a reader sees as
+unreported, never as a grant), whether it asked, and the `process::kStep*`
+steps the OS refused. `RealtimeOf(flags)` and `NodeSnapshot::realtime()`
+decode it to a `process::RealtimeOutcome`, whose `grant()` is `full`,
+`partial` (only a memory step refused), `refused` (the scheduling policy
+refused: the loop runs at timeshare) or `not_requested`. Like the event log
+flags, these are bits every earlier writer left clear and every earlier reader
+ignores, so the layout and version are unchanged. A ring whose lock is
+refused after the loop starts is not in the row (stderr only).
+
+How late the loop runs is in its timer sources: a periodic timer's worst
+dispatch lateness and the periods it missed ([the counters](#the-counters)),
+so an overrunning loop is visible even while its dispatch count keeps moving.
 
 ## Claiming a slot, and liveness
 
@@ -207,8 +228,9 @@ dispatch latency and the worst latency seen.
 
 "Events" means whatever that source doing its job looks like: dispatches for a
 timer or a watcher, and messages accepted by the transport for a sender.
-A sender's dropped count is the publishes the transport refused; what a
-watcher's dropped count includes, intentional latest-only skips among it, is in
+A sender's dropped count is the publishes the transport refused, and a
+periodic timer's is the periods it missed; what a watcher's dropped count
+includes, intentional latest-only skips among it, is in
 [the event system's Lateness section](../events/README.md#lateness). A source
 flagged `kSourceFlagLatestOnly` has those skips in its count.
 

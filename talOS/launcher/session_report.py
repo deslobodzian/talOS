@@ -67,6 +67,35 @@ TARGET_AGE_LIMIT_MS = 25
 DAMAGED_LOG = re.compile(r"^warning: (damaged log .*)$", re.MULTILINE)
 
 
+# The loops on the actuation path (talOS/process LoopTier): a gap in one is a
+# gap in a hardware request (ARCHITECTURE.md "The tick").
+ACTUATION_TIERS = ("control", "bridge")
+
+
+def realtime_summary(node):
+    """A node's realtime outcome as the launcher recorded it from its registry
+    row: the grant, then any refused steps; NOT RECORDED in a manifest that
+    predates it, NOT REPORTED for a node that never reported one."""
+    if "realtime" not in node:
+        return "NOT RECORDED"
+    grant = node["realtime"] or "NOT REPORTED"
+    refused = node.get("realtime_refused", "")
+    return f"{grant} ({refused})" if refused else grant
+
+
+def realtime_issue(node, simulation):
+    """Why a node's loop ran without its realtime grant, or None. Only the
+    actuation path counts, and under --sim only a node that asked
+    (TALOS_REALTIME=1) and was refused part of it."""
+    tier, grant = node.get("loop_tier", ""), node.get("realtime", "")
+    if tier not in ACTUATION_TIERS or grant in ("", "full"):
+        return None
+    if simulation and grant == "not_requested":
+        return None
+    return (f"{node.get('name')}: {tier} loop ran without its realtime grant: "
+            + realtime_summary(node))
+
+
 def analyze(manifest, records, log_damage=()):
     source, states = stream(records, "/hw/state")
     _, ds = stream(records, "/hw/state/driver_station")
@@ -170,6 +199,13 @@ def analyze(manifest, records, log_damage=()):
                for flag in ("quarantined", "recorder_failed", "log_capped") if n.get(flag)]
     # A record the reader skipped is missing from every measurement above.
     issues += list(log_damage)
+    simulation = bool(manifest.get("simulation"))
+    realtime_issues = [issue for issue in (realtime_issue(n, simulation)
+                                           for n in manifest["nodes"]) if issue]
+    # Bridge and control loops --sim excuses: they never asked for realtime.
+    realtime_exempt = [n.get("name") for n in manifest["nodes"] if simulation
+                       and n.get("loop_tier") in ACTUATION_TIERS
+                       and n.get("realtime") == "not_requested"]
     return {"session_id": manifest.get("session_id"),
             "config_sha256": manifest.get("config_sha256") or "NOT RECORDED (non-bundle launch)",
             # A --config=release bundle's source revision; older manifests lack it.
@@ -178,7 +214,10 @@ def analyze(manifest, records, log_damage=()):
             # exit_signal is 0 unless a signal killed the node; older manifests lack it.
             "nodes": [{**{k: n.get(k) for k in ("name", "restart_count", "exit_code")},
                        "exit_signal": n.get("exit_signal", 0),
-                       **{k: n.get(k) for k in ("quarantined", "recorder_failed", "log_capped")}}
+                       **{k: n.get(k) for k in ("quarantined", "recorder_failed", "log_capped")},
+                       # Older manifests lack both (NOT RECORDED).
+                       "loop_tier": n.get("loop_tier") or "—",
+                       "realtime": realtime_summary(n)}
                       for n in manifest["nodes"]],
             # Every run and why it ended (launcher README "Session manifest");
             # absent in manifests written before the launcher recorded runs.
@@ -187,6 +226,8 @@ def analyze(manifest, records, log_damage=()):
                                      "runs_dropped": n.get("runs_dropped", 0)}
                      for n in manifest["nodes"]},
             "session_issues": issues,
+            "realtime_issues": realtime_issues,
+            "realtime_exempt": realtime_exempt,
             "state_stream": source, "state_overall": stats(overall),
             "state_enabled": stats(enabled), "enabled_gaps_ge_100_ms": gaps,
             "target_receipt_age": {k: stats(v) for k, v in sorted(targets.items())},
@@ -202,15 +243,17 @@ def analyze(manifest, records, log_damage=()):
 def strict_failures(report):
     """Reasons a --strict run rejects the session; empty means acceptance."""
     return [f"{v['measurement']}: {v['verdict']}" for v in report["verdicts"]
-            if v["required"] and v["verdict"] != "PASS"] + report["session_issues"]
+            if v["required"] and v["verdict"] != "PASS"] + report["session_issues"] \
+        + report["realtime_issues"]
 
 
 def markdown(report):
     lines = ["# Session report", f"Session: {report['session_id']}",
              f"Config SHA-256: {report['config_sha256']}",
              f"Source revision: {report['git_revision']}", "", "## Nodes",
-             "| Node | Restarts | Exit code | Exit signal | quarantined | recorder_failed | log_capped |",
-             "|---|---:|---:|---:|---|---|---|"]
+             "| Node | Restarts | Exit code | Exit signal | quarantined | recorder_failed | log_capped "
+             "| Loop tier | Realtime |",
+             "|---|---:|---:|---:|---|---|---|---|---|"]
     for n in report["nodes"]:
         lines.append("| " + " | ".join(str(n[k]) for k in n) + " |")
     lines += ["", "## Runs", "| Node | Binary SHA-256 | Run | PID | Seconds | Exit code | Exit signal | Reason |",
@@ -228,6 +271,14 @@ def markdown(report):
             lines.append(f"| {name} | | | | | | | {node['runs_dropped']} runs after the first dropped |")
     lines += ["", "## Session completeness"] + (
         ["- " + s for s in report["session_issues"]] or ["- complete"])
+    judged = ("- no bridge or control loop that reported an outcome ran without its full grant"
+              if not report["realtime_exempt"] else
+              "- no other bridge or control loop that reported an outcome ran without its full grant")
+    lines += ["", "## Realtime scheduling"] + (
+        ["- " + s for s in report["realtime_issues"]] or [judged])
+    if report["realtime_exempt"]:
+        lines.append("- not judged (--sim, realtime never requested): "
+                     + ", ".join(report["realtime_exempt"]))
     lines += ["", "## Timing (ms)", f"State stream: {report['state_stream'] or 'NOT MEASURED'}",
               "| Measurement | Count | Median | p99 | Max |", "|---|---:|---:|---:|---:|"]
     entries = {"/hw/state overall": report["state_overall"],

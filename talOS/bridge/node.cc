@@ -681,14 +681,17 @@ int HardwareNode::Run(int duration_s) {
   // time-constraint threads, so there the bridge shares that band with the
   // control nodes and is ahead only of the observers (talOS/process
   // LoopPolicy). Best
-  // effort: a refusal is reported once and the bridge runs unprivileged.
-  // Simulation stays an ordinary process unless TALOS_REALTIME=1 asks
-  // otherwise.
+  // effort: a refusal is reported once, on stderr and in the registry row,
+  // and the bridge runs unprivileged. Simulation stays an ordinary process
+  // unless TALOS_REALTIME=1 asks otherwise.
+  talos::process::RealtimeOutcome realtime{
+      .tier = talos::process::LoopTier::kBridge};
   if (talos::process::RealtimeRequested(simulation_)) {
-    talos::process::ConfigureRealtime(
+    realtime = talos::process::ConfigureRealtime(
         {.period = std::chrono::microseconds{kTickPeriodUs},
-         .tier = talos::process::LoopTier::kBridge});
+         .tier = realtime.tier});
   }
+  if (registration_) registration_->set_realtime(realtime);
   const auto end =
       std::chrono::steady_clock::now() + std::chrono::seconds{duration_s};
 

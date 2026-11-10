@@ -106,9 +106,18 @@ take a page fault:
   keeps the rings and stack locked even when `mlockall` is refused.
 
 When the OS refuses a step (no privilege, `RLIMIT_MEMLOCK` or the wired-memory
-limit) the node prints one line to stderr and runs anyway, with whatever it
-could take; a ring or stack it could not lock stays prefaulted. A ring mapped
-after that line whose lock is refused is reported once more per process.
+limit) the node prints one line to stderr (`talos: realtime scheduling
+incomplete`, naming its tier, grant and the refused steps) and runs anyway,
+with whatever it could take; a ring or stack it could not lock stays
+prefaulted. A ring mapped after that line whose lock is refused is reported
+once more per process, on stderr only. `ConfigureRealtime` returns the outcome
+(`talOS/process` `realtime_outcome.h`: the tier, whether it asked, the refused
+steps, and from them the grant: `full`, `partial` when only a memory step was
+refused, `refused` when the scheduling policy was, or `not_requested`), and
+the node publishes it in its registry row ([live registry](../talOS/introspection/README.md#realtime-scheduling)),
+where the launcher warns about a bridge or control loop without its full grant
+and `session_report --strict` fails the session
+([session measurements](../talOS/launcher/README.md#session-measurements)).
 `TALOS_REALTIME=0` in the environment turns all of this off;
 `TALOS_REALTIME=1` turns it on under `--sim` as well, so a host without a
 RoboRIO runs the actuated control path, its nodes and bridge under the

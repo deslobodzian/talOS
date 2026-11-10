@@ -53,7 +53,9 @@ struct SourceCounters {
   // Messages the transport lapped before this source read them, messages a
   // latest-only watcher skipped by design, publishes the transport refused,
   // and reads it failed: torn by the writer, or finding the reader slot freed
-  // under this watcher.
+  // under this watcher. For a periodic timer, the periods it missed: a
+  // dispatch `cycles` periods after the previous one (the loop overran, or
+  // was stopped) counts cycles - 1.
   std::atomic<std::uint64_t> dropped{0};
 
   // Last transport sequence this source observed, which is what makes a
@@ -393,6 +395,9 @@ class EventLoopBase {
     context.now = now;
     context.sequence = cycles;
 
+    // Counters only: the log already holds `cycles` as the firing's
+    // sequence, from which replay counts the same missed periods.
+    if (cycles > 1) count_dropped(id, cycles - 1);
     invoke(context, std::span<const std::byte>{});
   }
 
@@ -414,8 +419,8 @@ class EventLoopBase {
     invoke(context, payload);
   }
 
-  // Counts a loss the transport reported outside any dispatch against a
-  // source: the realtime loop's failed reads.
+  // Counts a loss against a source outside its dispatch's own `dropped`:
+  // the realtime loop's failed reads, and a periodic timer's missed periods.
   void count_dropped(std::uint16_t id, std::uint64_t count) {
     if (SourceCounters* counters = counter(id)) {
       counters->dropped.fetch_add(count, std::memory_order_relaxed);

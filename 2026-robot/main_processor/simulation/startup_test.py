@@ -232,10 +232,24 @@ def launcher_env(**extra):
     return env
 
 
-def assert_realtime(test, launcher_output):
-    """Fail a macOS run whose nodes silently fell back to timeshare."""
-    if sys.platform == "darwin":
-        test.assertNotIn("talos: realtime scheduling incomplete", launcher_output)
+def assert_realtime(test, launcher_output, manifest=None):
+    """Fail a macOS run whose nodes silently fell back to timeshare.
+
+    With the session manifest, also require every bridge and control loop's
+    registry row to have reported a full grant (launcher README "Session
+    manifest"): a node that stopped reporting its outcome reads as unreported,
+    which this catches and the log line alone cannot.
+    """
+    if sys.platform != "darwin":
+        return
+    test.assertNotIn("talos: realtime scheduling incomplete", launcher_output)
+    if manifest is None:
+        return
+    actuation = {node["name"]: node.get("realtime") for node in manifest["nodes"]
+                 if node.get("loop_tier") in ("control", "bridge")}
+    test.assertIn("hardware_node", actuation, launcher_output)
+    test.assertEqual({name: grant for name, grant in actuation.items() if grant != "full"},
+                     {}, launcher_output)
 
 
 def restart_timeline(path, topic):
@@ -388,11 +402,11 @@ class FullStackSimulation(unittest.TestCase):
                 launcher_log.seek(0)
                 diagnostics = launcher_log.read()
             self.assertEqual(launcher.returncode, 0, diagnostics)
-            assert_realtime(self, diagnostics)
             manifests = list(output.glob("*/manifest.json"))
             self.assertEqual(len(manifests), 1, diagnostics)
             session = manifests[0].parent
             manifest = json.loads(manifests[0].read_text())
+            assert_realtime(self, diagnostics, manifest)
             nodes = {node["name"]: node for node in manifest["nodes"]}
             for name, node in nodes.items():
                 self.assertEqual(node["exit_code"], 0, f"{name}: {diagnostics}")

@@ -60,6 +60,7 @@
 #include "talOS/launcher/session_lock.h"
 #include "talOS/launcher/session_retention.h"
 #include "talOS/process/durable_sync.h"
+#include "talOS/process/realtime_outcome.h"
 #include "talOS/rtms/rtms.h"
 #include "talOS/schema/identity.h"
 #include "talOS/schema/unit_suffix.h"
@@ -382,6 +383,19 @@ struct NodeProcessInfo {
   // from what its --describe probe declared (EndpointMismatch): that run ran
   // under a graph the lint never checked. Never cleared by a later run.
   bool endpoint_mismatch{false};
+  // The worst realtime outcome any run's registry row reported
+  // (introspect::RealtimeOf; process::RealtimeGrant order); empty until one
+  // did.
+  std::optional<process::RealtimeOutcome> realtime;
+
+  // Keeps `outcome` when it is worse than the one recorded; returns whether
+  // it was.
+  bool RecordRealtime(const process::RealtimeOutcome& outcome) {
+    if (realtime && realtime->grant() >= outcome.grant()) return false;
+    realtime = outcome;
+    return true;
+  }
+
   // Every run, first first, capped at kMaxRecordedRuns: the first run and
   // the newest; `runs_dropped` counts the ones between that were dropped.
   std::vector<NodeRun> runs;
@@ -416,6 +430,27 @@ struct NodeProcessInfo {
     run.reason = kRunSpawnFailed;
   }
 };
+
+// The launcher's warning line for a run whose loop reported `outcome`, or ""
+// when it needs none. A bridge or control loop needs one without its full
+// grant: the policy or a memory step refused, or, off --sim, never requested.
+inline std::string RealtimeWarning(std::string_view name, pid_t pid,
+                                   const process::RealtimeOutcome& outcome,
+                                   bool simulation) {
+  const process::RealtimeGrant grant = outcome.grant();
+  if (!outcome.actuation_path() || grant == process::RealtimeGrant::kFull ||
+      (simulation && grant == process::RealtimeGrant::kNotRequested)) {
+    return "";
+  }
+  std::string line =
+      "[launcher] warning: " + std::string{name} + " (pid " +
+      std::to_string(pid) + ") " + process::TierName(outcome.tier) +
+      " loop runs without its realtime grant: " + process::GrantName(grant);
+  if (outcome.refused != 0) {
+    line += " (" + process::RefusedStepNames(outcome.refused) + ")";
+  }
+  return line + "; the reasons are in its log\n";
+}
 
 struct SessionManifest {
   uint64_t session_id{0};
@@ -477,6 +512,16 @@ struct SessionManifest {
          << ",\n";
       ss << "      \"endpoint_mismatch\": "
          << (n.endpoint_mismatch ? "true" : "false") << ",\n";
+      ss << "      \"loop_tier\": "
+         << Quoted(n.realtime ? process::TierName(n.realtime->tier) : "")
+         << ",\n";
+      ss << "      \"realtime\": "
+         << Quoted(n.realtime ? process::GrantName(n.realtime->grant()) : "")
+         << ",\n";
+      ss << "      \"realtime_refused\": "
+         << Quoted(n.realtime ? process::RefusedStepNames(n.realtime->refused)
+                              : "")
+         << ",\n";
       ss << "      \"record_count\": " << n.record_count << ",\n";
       ss << "      \"runs_dropped\": " << n.runs_dropped << ",\n";
       // Last: a run is the only nested object in a node's entry.
@@ -3574,6 +3619,8 @@ class Launcher {
     uint64_t last_dispatch{0};
     // Event log flags of its registry rows already reported (NoteRecording).
     uint32_t recording_reported{0};
+    // This run's realtime outcome was seen in its row (NoteRealtime).
+    bool realtime_reported{false};
     // The member answered --describe: its runs' live endpoints are compared
     // with `declared` (CheckEndpoints), once per run, after the run's row
     // has published them; `endpoints_checked` says this run's was.
@@ -3830,6 +3877,26 @@ class Launcher {
     launch.last_dispatch = 0;
     launch.heartbeat_killed = false;
     launch.endpoints_checked = false;
+    launch.realtime_reported = false;
+  }
+
+  // A run's registry row reports its loop's realtime outcome once the node
+  // asked for it, or decided not to (introspect::RealtimeOf; introspection
+  // README "Realtime scheduling"). Warned about once per run
+  // (RealtimeWarning); the member keeps the worst outcome any run reported,
+  // in the live manifest and so in the final one, which session_report
+  // --strict judges. Returns whether `proc` changed.
+  bool NoteRealtime(NodeProcessInfo& proc, NodeLaunch& launch,
+                    uint32_t flags) const {
+    if (launch.realtime_reported) return false;
+    const std::optional<process::RealtimeOutcome> outcome =
+        introspect::RealtimeOf(flags);
+    if (!outcome) return false;
+    launch.realtime_reported = true;
+    const std::string warning =
+        RealtimeWarning(proc.name, proc.pid, *outcome, options_.simulation);
+    if (!warning.empty()) std::cerr << warning;
+    return proc.RecordRealtime(*outcome);
   }
 
   // A run's registry row says its event log stopped early
@@ -4078,6 +4145,7 @@ class Launcher {
             }
           }
           if (NoteRecording(proc, launch, recording)) manifest_changed = true;
+          if (NoteRealtime(proc, launch, recording)) manifest_changed = true;
           if (live) {
             launch.endpoints_checked = true;
             if (CheckEndpoints(proc, launch, *live, live_complete))

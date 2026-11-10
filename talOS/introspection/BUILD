@@ -38,6 +38,7 @@ cc_library(
         ":names",
         "//talOS/events:events_core",
         "//talOS/memory:shared_memory",
+        "//talOS/process:realtime_outcome",
         "//talOS/rtms:process_liveness",
     ],
 )

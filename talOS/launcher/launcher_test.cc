@@ -741,6 +741,44 @@ TEST(LauncherTest, ShouldRestartNodePredicate) {
   EXPECT_FALSE(ShouldRestartNode(true, true, 5, true));
 }
 
+// A control loop the OS kept at timeshare is warned about and recorded in the
+// manifest session_report --strict judges. A later run that got its grant
+// does not clear it: the session still ran that loop without one. Only the
+// actuation path is warned about, and --sim excuses a loop that never asked.
+TEST(LauncherTest, ARefusedRealtimeGrantIsWarnedAndOutlivesALaterFullRun) {
+  using process::LoopTier;
+  const process::RealtimeOutcome refused{.tier = LoopTier::kControl,
+                                         .requested = true,
+                                         .refused = process::kStepPolicy};
+  const process::RealtimeOutcome full{.tier = LoopTier::kControl,
+                                      .requested = true};
+  const process::RealtimeOutcome unasked{.tier = LoopTier::kControl};
+
+  EXPECT_NE(RealtimeWarning("shooter", 42, refused, true).find("shooter"),
+            std::string::npos);
+  EXPECT_FALSE(RealtimeWarning("shooter", 42, unasked, false).empty());
+  EXPECT_TRUE(RealtimeWarning("shooter", 42, unasked, true).empty());
+  EXPECT_TRUE(RealtimeWarning("shooter", 42, full, false).empty());
+  EXPECT_TRUE(RealtimeWarning("telemetry", 42,
+                              {.tier = LoopTier::kObserver,
+                               .requested = true,
+                               .refused = process::kStepPolicy},
+                              false)
+                  .empty());
+
+  NodeProcessInfo shooter;
+  shooter.name = "shooter";
+  EXPECT_TRUE(shooter.RecordRealtime(refused));
+  EXPECT_FALSE(shooter.RecordRealtime(full));
+  SessionManifest manifest;
+  manifest.nodes.push_back(shooter);
+  const std::string json = manifest.ToJson();
+  EXPECT_NE(json.find("\"loop_tier\": \"control\""), std::string::npos) << json;
+  EXPECT_NE(json.find("\"realtime\": \"refused\""), std::string::npos) << json;
+  EXPECT_NE(json.find("\"realtime_refused\": \"policy\""), std::string::npos)
+      << json;
+}
+
 TEST(LauncherTest, MaxRestartsComesFromFlagThenConfigThenDefault) {
   const auto with_robot_keys = [](std::string_view keys) {
     std::string toml{kFixtureToml};

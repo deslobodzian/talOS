@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <random>
 #include <string>
@@ -118,6 +119,27 @@ TEST(RealtimeEventLoop, SetupBeforeTheRunIsNotReportedAsLateness) {
   ASSERT_EQ(ticks.size(), 3u);
   EXPECT_GE(ticks.front().event_time, run_start + 5ms);
   EXPECT_LT(loop.source_counters()[id].max_latency_ns.load(), ran.count());
+}
+
+// A tick that overruns its period coalesces the periods it missed into one
+// late dispatch; the timer's live `dropped` counts them, so the registry
+// shows an overrunning control loop while its dispatch count still moves.
+TEST(RealtimeEventLoop, OverrunPeriodsCountAsTheTimersDrops) {
+  RealtimeEventLoop<> loop;
+  std::vector<Context> ticks;
+  auto handler = [&](const Context& context) {
+    ticks.push_back(context);
+    if (ticks.size() == 1) std::this_thread::sleep_for(22ms);
+    if (ticks.size() == 3) loop.exit();
+  };
+  const auto id = loop.register_timer("tick", make_thunk(&handler));
+  loop.arm_timer(id, loop.monotonic_now() + 5ms, 5ms);
+  loop.run_for(5s);  // Bound only; exits after three ticks.
+  ASSERT_EQ(ticks.size(), 3u);
+  std::uint64_t missed = 0;
+  for (const Context& tick : ticks) missed += tick.sequence - 1;
+  EXPECT_GE(missed, 3u);  // 22 ms of a 5 ms period, at least
+  EXPECT_EQ(loop.source_counters()[id].dropped.load(), missed);
 }
 
 TEST(RealtimeEventLoop, LatestBacklogDispatchesNewestWithPublicationAge) {

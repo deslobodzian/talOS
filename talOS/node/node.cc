@@ -1294,12 +1294,16 @@ int RunMain(int argc, char** argv, const char* node_name,
       }
     }};
     // Last, from this thread: the reporter and the stopper above are
-    // bookkeeping and must not inherit the loop's realtime policy.
+    // bookkeeping and must not inherit the loop's realtime policy. The row
+    // carries the outcome, where the launcher and session_report look for a
+    // loop that runs without its grant.
+    process::RealtimeOutcome realtime{.tier =
+                                          NodeAccess::loop_tier(*hosted->node)};
     if (process::RealtimeRequested(flags.simulation)) {
-      process::ConfigureRealtime(
-          {.period = hosted->node->period(),
-           .tier = NodeAccess::loop_tier(*hosted->node)});
+      realtime = process::ConfigureRealtime(
+          {.period = hosted->node->period(), .tier = realtime.tier});
     }
+    reporter.set_realtime(realtime);
     if (flags.duration_s) {
       loop.run_for(std::chrono::seconds{flags.duration_s});
     } else {

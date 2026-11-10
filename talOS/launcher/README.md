@@ -352,6 +352,16 @@ marks a truncated, damaged or unreadable log `recorder_failed` and a capped one
 (`<log>.capped`) `log_capped`; a log whose capture stopped at a record
 boundary looks complete there, so only the live row reports it.
 
+A run reports in its registry row the realtime scheduling its loop asked for
+and got ([realtime scheduling](../introspection/README.md#realtime-scheduling)).
+For a bridge or control loop without its full grant (the policy or a memory
+step refused, or, outside `--sim`, never requested) the launcher prints one
+warning per run, naming the member, its tier, its grant and the refused steps
+(the reasons are in the node's `<name>.log`), and the live manifest records
+the worst outcome any of the member's runs reported (`loop_tier`, `realtime`,
+`realtime_refused`; [session manifest](#session-manifest)). It does not stop
+or restart the node.
+
 A registered node is killed as stalled when its registry row shows no progress
 for its heartbeat timeout. Once running, progress is the row's dispatch count,
 which an event-loop node's loop thread stores at every dispatch (and the
@@ -510,6 +520,11 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
 - per node, `binary_sha256`: the SHA-256 of `binary_path` as the session
   starts, empty if it cannot be read. It covers that file only: not the
   shared libraries a C++ node loads, nor a Python node's runfiles.
+- per node, `loop_tier` (`observer`, `control` or `bridge`), `realtime` (the
+  worst grant any run reported: `full`, `partial`, `not_requested` or
+  `refused`) and `realtime_refused` (that run's refused steps, comma
+  separated); all empty until a run reports
+  ([realtime scheduling](../introspection/README.md#realtime-scheduling)).
 - per node, `runs`: one entry per run, spawn failures included: `pid` (-1
   when the spawn failed), `start_wall_ns`, `end_wall_ns` (0 while it runs),
   `exit_code`, `exit_signal` (as for the node's last run, above) and `reason`.
@@ -789,7 +804,8 @@ bazel run //talOS/launcher:session_report -- --json /tmp/logs/session
 The offline Python tool reuses `log_dump` and its events reader/embedded
 descriptor decoder, without robot-specific schemas. It reports manifest config
 identity and source revision, node exits/restarts/quarantine/recorder
-failures/caps, each node's binary digest and runs with the reason each ended
+failures/caps, each node's loop tier and realtime outcome, each node's binary
+digest and runs with the reason each ended
 ([session manifest](#session-manifest)), an unfinished
 session, state inter-arrival median/nearest-rank p99/max,
 enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
@@ -808,8 +824,13 @@ must be below 10 ms. `--strict` exits 2 unless every required verdict is PASS
 and the manifest shows a finished session (`end_wall_ns` nonzero) with no
 recording node (non-empty `log_path`) `quarantined`, `recorder_failed` or
 `log_capped`; host processes without an event log (`studio_bridge`,
-`sim_gateway`) are not acceptance evidence and are exempt, and with no log
-`log_dump` reports damaged (above), each named with its file and byte offsets.
+`sim_gateway`) are not acceptance evidence and are exempt, with no log
+`log_dump` reports damaged (above), each named with its file and byte offsets,
+and with every bridge and control loop holding its full realtime grant. Off
+`--sim` a `partial`, `refused` or `not_requested` outcome fails; under `--sim`
+only a loop that asked (`TALOS_REALTIME=1`) and was refused a step does.
+Observers, nodes that never reported, and manifests that predate the fields
+(*NOT RECORDED*) are listed but not judged.
 It names each reason on stderr. It exits 1 for input/reader errors (including a missing `log_dump`
 runfile) and 0 otherwise. NOT MEASURED is never a pass; only the timer
 lateness row is informational and not required.

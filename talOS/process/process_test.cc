@@ -109,7 +109,7 @@ bool ThreadHasTierPolicy(LoopTier tier) {
 // its scheduling, and reports what it returned and whether that thread ended
 // up under the tier's policy.
 struct Outcome {
-  bool returned = false;
+  RealtimeOutcome returned;
   bool applied = false;
 };
 Outcome ConfigureOnFreshThread(LoopTier tier) {
@@ -132,8 +132,10 @@ TEST(ProcessTest, RealtimeDisabledByEnvironmentChangesNothing) {
       {
         ::setenv("TALOS_REALTIME", "0", 1);
         const Outcome outcome = ConfigureOnFreshThread(LoopTier::kControl);
-        const bool unchanged = !outcome.returned && !outcome.applied &&
-                               !memory::MappingsKeptResident();
+        const bool unchanged =
+            outcome.returned.grant() == RealtimeGrant::kNotRequested &&
+            outcome.returned.refused == 0 && !outcome.applied &&
+            !memory::MappingsKeptResident();
         std::_Exit(unchanged ? 0 : 1);
       },
       ::testing::ExitedWithCode(0), "");
@@ -154,18 +156,26 @@ TEST(ProcessTest, RealtimeRequestFollowsSimulationUnlessTheEnvironmentSays) {
   ::unsetenv("TALOS_REALTIME");
 }
 
-// Report success only when the OS actually applied the tier's policy, and
-// never fail on the memory steps where the OS allows them: a host that grants
-// the policy here also grants the stack lock (no rings are mapped), so a
-// memory step that always failed would break the equality.
-TEST(ProcessTest, RealtimeIsBestEffortForEveryTier) {
+// Report a full grant only when the OS actually applied the tier's policy,
+// and name the policy as refused exactly when it was not applied: that is
+// what the node's registry row and session_report judge a run by. Never fail
+// on the memory steps where the OS allows them: a host that grants the policy
+// here also grants the stack lock (no rings are mapped), so a memory step
+// that always failed would break the first equality. An unprivileged Linux
+// host refuses SCHED_FIFO, which exercises the refusal.
+TEST(ProcessTest, RealtimeReportsWhatTheOsGrantedForEveryTier) {
   ::unsetenv("TALOS_REALTIME");
   static_assert(noexcept(ConfigureRealtime(RealtimeOptions{})));
   for (const LoopTier tier :
        {LoopTier::kObserver, LoopTier::kControl, LoopTier::kBridge}) {
     const Outcome outcome = ConfigureOnFreshThread(tier);
-    EXPECT_EQ(outcome.returned, outcome.applied)
-        << "tier " << static_cast<int>(tier);
+    const RealtimeOutcome& returned = outcome.returned;
+    EXPECT_EQ(returned.tier, tier);
+    EXPECT_TRUE(returned.requested);
+    EXPECT_EQ(returned.grant() == RealtimeGrant::kFull, outcome.applied)
+        << TierName(tier) << ": " << RefusedStepNames(returned.refused);
+    EXPECT_EQ(returned.grant() == RealtimeGrant::kRefused, !outcome.applied)
+        << TierName(tier) << ": " << RefusedStepNames(returned.refused);
   }
   EXPECT_TRUE(memory::MappingsKeptResident());
 }
@@ -202,7 +212,7 @@ TEST(ProcessTest, BackgroundThreadLeavesAnInheritedRealtimePolicy) {
   bool grandchild_realtime = true;
   bool grandchild_background = false;
   std::thread parent{[&] {
-    ConfigureRealtime({.period = 10ms, .tier = LoopTier::kControl});
+    (void)ConfigureRealtime({.period = 10ms, .tier = LoopTier::kControl});
     parent_realtime = ThreadIsRealtime();
     if (!parent_realtime) return;
     std::thread child{[&] {

@@ -801,6 +801,39 @@ TEST_F(Registry, LoopStoresItsProgressWhileTheReporterIsBlocked) {
   EXPECT_EQ(after, loop_count);
 }
 
+// A control loop the OS kept at timeshare must be visible to the launcher and
+// session_report, which read only the row: the tier, that it asked, and which
+// step the OS refused, beside the event log flags. A row whose node has not
+// asked yet reads as unreported, never as a full grant.
+TEST_F(Registry, ARefusedRealtimeGrantIsVisibleInTheRow) {
+  NodeRegistration registration{{.name = "lift", .flags = kFlagSimulation},
+                                path_};
+  registration.publish(sample_manifest());
+  registration.set_recording(/*failed=*/false, /*capped=*/true);
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto row = [&reader] {
+    const auto nodes = reader->nodes();
+    EXPECT_EQ(nodes.size(), 1u);
+    return nodes.front();
+  };
+  EXPECT_EQ(row().realtime(), std::nullopt);
+
+  registration.set_realtime(
+      {.tier = process::LoopTier::kControl,
+       .requested = true,
+       .refused = process::kStepPolicy | process::kStepRingLock});
+  const NodeSnapshot node = row();
+  ASSERT_TRUE(node.realtime().has_value());
+  EXPECT_EQ(node.realtime()->tier, process::LoopTier::kControl);
+  EXPECT_EQ(node.realtime()->grant(), process::RealtimeGrant::kRefused);
+  EXPECT_EQ(process::RefusedStepNames(node.realtime()->refused),
+            "policy, ring mlock");
+  EXPECT_NE(node.flags & kFlagSimulation, 0u);
+  EXPECT_NE(node.flags & kFlagLogCapped, 0u);
+  EXPECT_EQ(node.flags & kFlagRecorderFailed, 0u);
+}
+
 TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
   const std::string topic = "/probe/state/p" + std::to_string(::getpid());
   const std::string feed = "/probe/telemetry/p" + std::to_string(::getpid());
