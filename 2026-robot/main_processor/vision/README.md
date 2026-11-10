@@ -27,7 +27,7 @@ Shared configuration defaults and code fallbacks (overridable per camera):
 | `camera.latency_offset_us` | `0` | Subtracted only from live delivery/PTS timestamps, and from simulated timestamps. Never applied again to SOE/EOF or known midpoint stamps. |
 | `camera.sim_timestamp_lag_us` | `0` | Sim only: stamp the rendered truth instant this many microseconds later, modeling a timestamp taken after exposure. Ignored live, but validated in both modes. |
 | `camera.readout_us` | `0` | Known sensor readout duration subtracted from live EOF timestamps (unknown readout is zero). |
-| `camera.frame_timeout_us` | `500000` | Live silence deadline; positive, at most 10,000,000 µs. Reopens a connected but silent camera on the worker. |
+| `camera.frame_timeout_us` | `500000` | Live silence deadline; positive, at most 10,000,000 µs. Reopens a connected but silent camera on the worker, and is the maximum live stamp age (see timestamps below). |
 | `camera.exposure_ms` | `5.0` | Shared manual exposure duration; also controls simulated exposure blur. Zero leaves duration unspecified. |
 | `camera.gain` | `0` | Backend-native manual gain; zero leaves gain unspecified. |
 | `camera.auto_exposure`, `camera.auto_gain` | `false`, `true` | Fallbacks are true only when duration/gain is zero; the shared exposure is positive and gain is zero. |
@@ -53,7 +53,9 @@ AVFoundation without a synchronized sample clock does likewise. Backends retain
 the source kind rather than claiming these are all exposure timestamps.
 Measure delivery/PTS bias per camera; do not subtract processing/transport delay
 already excluded by a hardware source timestamp. Underflow or future stamps
-publish invalid observations, never an unsigned-wrapped future timestamp.
+publish invalid observations, never an unsigned-wrapped future timestamp. So
+does a live stamp older than `frame_timeout_us` when published; one diagnostic
+names the camera when its stamps turn stale and one when they recover.
 
 V4L2 applies automatic/manual exposure mode, manual exposure in 100 µs units,
 and requested gain controls before streaming. macOS AVFoundation supports
@@ -253,7 +255,8 @@ mean frame periods and node-clock corrected-stamp-to-publication latency in
 integer microseconds (`last_latency_us`). Simulated latency is elapsed node time
 since the corrected truth stamp, not necessarily zero; it includes delivery lag
 when that bias is corrected. Invalid underflow/future timestamps report zero
-latency and never publish a valid pose. Simulation replay uses
+latency, stale live stamps report their age, and neither publishes a valid
+pose. Simulation replay uses
 `--sim --replay <log>`; no wall clock enters its outputs.
 
 See [DATA_FLOW](../../../docs/DATA_FLOW.md) for telemetry transport and budgets.

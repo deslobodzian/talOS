@@ -680,14 +680,38 @@ class Vision {
                       : 0,
                   readout_ns_, latency_offset_ns_);
     const bool timestamp_valid = stamp && *stamp <= now_ns;
+    const std::uint64_t age_ns = timestamp_valid ? now_ns - *stamp : 0;
+    // A live stamp older than the frame timeout describes an instant the
+    // camera would already count as silent: publish it invalid, still
+    // reporting its age as latency, with one diagnostic per transition.
+    const bool stale =
+        !simulated_ && age_ns > static_cast<std::uint64_t>(frame_timeout_ns_);
+    if (stale != stale_stamps_) {
+      stale_stamps_ = stale;
+      if (stale) {
+        std::fprintf(stderr,
+                     "%.*s: capture stamp %.3f s old exceeds "
+                     "camera.frame_timeout_us = %lld; observations invalid\n",
+                     static_cast<int>(node_.name().size()), node_.name().data(),
+                     static_cast<double>(age_ns) / 1e9,
+                     static_cast<long long>(frame_timeout_ns_ / 1000));
+      } else {
+        std::fprintf(stderr,
+                     "%.*s: capture stamps within camera.frame_timeout_us "
+                     "again\n",
+                     static_cast<int>(node_.name().size()),
+                     node_.name().data());
+      }
+    }
     const auto& observation = completed.observation;
-    last_latency_us_ = timestamp_valid ? (now_ns - *stamp) / 1000 : 0;
+    last_latency_us_ = age_ns / 1000;
     visible_ = completed.visible;
     healthy_ = completed.success;
     state_.send(geometry::PoseObservation{
         stamp.value_or(0), observation.pose(), observation.x_std_m(),
         observation.y_std_m(), observation.yaw_std_rad(),
-        observation.tag_count(), observation.valid() && timestamp_valid});
+        observation.tag_count(),
+        observation.valid() && timestamp_valid && !stale});
   }
 
   // Only the worker owns camera lifecycle calls. Retry timing comes from the
@@ -870,7 +894,7 @@ class Vision {
   std::condition_variable wake_;
   std::optional<talos::vision::Frame> pending_;
   std::optional<Completed> completed_;
-  bool healthy_ = false;
+  bool healthy_ = false, stale_stamps_ = false;
   std::atomic<bool> stopping_{false}, connected_{false};
   std::atomic<std::int64_t> worker_now_ns_{-1};
   std::uint64_t received_ = 0, worker_processed_ = 0, worker_dropped_ = 0;

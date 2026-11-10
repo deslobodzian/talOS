@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numbers>
 #include <sstream>
@@ -1060,13 +1061,19 @@ struct FakeCameraDevice {
   talos::vision::CameraSourceConfig config;
   std::atomic<int> starts{0}, stops{0};
   std::atomic<bool> allow_start{true}, apply_controls{true};
+  // Gray8 image emitted at the configured size; blank when unset.
+  std::shared_ptr<const std::vector<std::uint8_t>> pixels;
 
   void Emit(std::int64_t stamp, talos::vision::TimestampKind kind) {
     std::lock_guard lock(mutex);
     if (!callback) return;
-    talos::vision::Frame frame(config.camera_id, 1, 0,
-                               talos::Time::from_nanos(stamp), config.width,
-                               config.height);
+    const auto time = talos::Time::from_nanos(stamp);
+    talos::vision::Frame frame =
+        pixels ? talos::vision::Frame(
+                     config.camera_id, 1, 0, time, config.width, config.height,
+                     config.width, talos::vision::PixelFormat::kGray8, pixels)
+               : talos::vision::Frame(config.camera_id, 1, 0, time,
+                                      config.width, config.height);
     frame.set_timestamp_kind(kind);
     callback(frame);
   }
@@ -1278,6 +1285,86 @@ TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
   EXPECT_EQ(status->stall_count(), 0);
   EXPECT_EQ(status->reconnect_count(), 0);
   EXPECT_EQ(device->starts, 1);
+}
+
+// The configured camera's noiseless view from `pose`, so a live fake frame
+// carries real tags through detection and localization.
+std::shared_ptr<const std::vector<std::uint8_t>> RenderCameraView(
+    const talos::Node& node, const geometry::Pose2d& pose) {
+  namespace fs = talos::vision::field_sim;
+  auto number = [&](const char* key) {
+    return node.param(std::string("camera.") + key, 0.0);
+  };
+  fs::SimCameraView view;
+  view.intrinsics.fx = number("fx");
+  view.intrinsics.fy = number("fy");
+  view.intrinsics.cx = number("cx");
+  view.intrinsics.cy = number("cy");
+  view.intrinsics.image_width =
+      static_cast<std::uint32_t>(node.param<int>("camera.width", 1280));
+  view.intrinsics.image_height =
+      static_cast<std::uint32_t>(node.param<int>("camera.height", 720));
+  view.mounting = talos::vision::CameraMounting::FromExtrinsics(
+      number("x_m"), number("y_m"), number("z_m"), number("roll_rad"),
+      number("pitch_rad"), number("yaw_rad"));
+  const double tag_size = node.param("tag_size_m", 0.1651);
+  fs::FieldLayoutData layout;
+  std::map<int, fs::TagPattern> patterns;
+  auto pixels = std::make_shared<std::vector<std::uint8_t>>();
+  EXPECT_TRUE(fs::LoadFieldLayoutFromJson(kFieldLayoutJson, tag_size, &layout));
+  EXPECT_TRUE(fs::LoadTag36h11Patterns(&patterns));
+  EXPECT_GT(fs::RenderFieldView(
+                layout.layout, patterns, view,
+                fs::RobotPoseOnField(pose.x_m(), pose.y_m(), pose.yaw_rad()),
+                tag_size, {}, pixels.get()),
+            0);
+  return pixels;
+}
+
+TEST(VisionTest, LiveStampOlderThanFrameTimeoutPublishesInvalid) {
+  auto device = std::make_shared<FakeCameraDevice>();
+  LiveTestVision::device = device;
+  // The maximum 10 s timeout keeps a slow host from reading as a stall.
+  auto sim =
+      MakeSim(false, true, "device = \"fake\"\nframe_timeout_us = 10000000\n",
+              "period_us = 1000\n");
+  sim.add<LiveTestVision>("rear_right_camera");
+  // The pose CheckPose localizes from (blue-wall tags 29/30).
+  device->pixels = RenderCameraView(sim.node("rear_right_camera"),
+                                    geometry::Pose2d{2, 2, 0});
+  // Hold the node, and so the worker's clock, until a stamp older than the
+  // timeout exists: the camera opens on its first tick after the pause.
+  sim.pause("rear_right_camera", 11s);
+  sim.step(11s);
+  ASSERT_TRUE(AdvanceLiveUntil(sim, [&] { return device->starts == 1; }));
+  ::testing::internal::CaptureStderr();
+  std::vector<bool> valid;
+  std::uint64_t processed = 0;
+  for (const auto age : {10500ms, 10500ms, 10ms}) {
+    device->Emit(sim.now().nanos() - std::chrono::nanoseconds(age).count(),
+                 talos::vision::TimestampKind::kExposure);
+    if (!AdvanceLiveUntil(
+            sim,
+            [&] {
+              const auto status =
+                  sim.latest<VisionStatus>("/rear_right_camera/status");
+              return status &&
+                     status->frames_processed_count() == processed + 1;
+            },
+            9500)) {
+      break;
+    }
+    ++processed;
+    const auto observation =
+        sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
+    valid.push_back(observation && observation->valid());
+  }
+  const auto diagnostics = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(valid, (std::vector<bool>{false, false, true})) << diagnostics;
+  // One diagnostic when stamps turn stale and one when they recover, not one
+  // per stale frame.
+  EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(), '\n'), 2)
+      << diagnostics;
 }
 }  // namespace
 }  // namespace vision
