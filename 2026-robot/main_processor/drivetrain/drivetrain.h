@@ -48,6 +48,9 @@ class Drivetrain {
       drive_[i] = talos::Motor{node, geometry_.modules[i].drive};
       steer_[i] = talos::Motor{node, geometry_.modules[i].steer};
       encoder_[i] = talos::CANcoder{node, geometry_.modules[i].encoder};
+      // A wheel step faster than four times its drive limit is a restarted
+      // count, never travel.
+      drive_anchor_[i].max_rate = 4.0 * geometry_.modules[i].max_drive_rps;
     }
   }
 
@@ -57,9 +60,6 @@ class Drivetrain {
     // gate.
     const auto now = node_.now();
     MeasurementTimes module_times{now};
-    const bool reset =
-        status_.fresh() &&
-        status_.value().gateway_device_reset_count() != reset_count_;
     if (status_.fresh())
       reset_count_ = status_.value().gateway_device_reset_count();
     unsigned live_mask = 0;
@@ -69,19 +69,13 @@ class Drivetrain {
     for (std::size_t i = 0; i < kModuleCount; ++i) {
       const bool drive_valid = drive_[i].connected();
       if (drive_valid) {
-        const double raw = drive_[i].position();
-        // A reset can precede its slower status counter. A physically
-        // impossible wheel step is also a new encoder frame, never travel.
-        const double candidate = raw + drive_offset_[i];
-        const double limit = geometry_.modules[i].max_drive_rps * period_s * 4;
-        if (drive_seen_[i] &&
-            (reset || !drive_valid_[i] ||
-             std::abs(candidate - drive_position_[i]) > limit))
-          drive_offset_[i] = drive_position_[i] - raw;
-        drive_position_[i] = raw + drive_offset_[i];
-        drive_seen_[i] = true;
+        // Without an acquisition time (before the clock mapping converges),
+        // gaps count in tick time.
+        const auto time = drive_[i].position_time();
+        drive_position_[i] = drive_anchor_[i].Publish(
+            drive_[i].position(), drive_position_[i],
+            time ? time->nanos() : now.nanos(), reset_count_, period_s);
       }
-      drive_valid_[i] = drive_valid;
       if (!drive_valid || !steer_[i].connected() || !encoder_[i].connected())
         continue;
       live_mask |= 1U << i;
@@ -130,10 +124,13 @@ class Drivetrain {
         commanded_speeds_.omega_radps += domega;
         const auto setpoints = kinematics_.ToModuleStates(
             commanded_speeds_, measured, dt_s, live_mask);
-        for (std::size_t i = 0; setpoints && i < kModuleCount; ++i) {
-          if ((live_mask & (1U << i)) == 0) continue;
-          drive_[i].set_velocity((*setpoints)[i].drive_rps);
-          steer_[i].set_position((*setpoints)[i].steer_rot);
+        if (setpoints) {
+          const auto& states = *setpoints;
+          for (std::size_t i = 0; i < kModuleCount; ++i) {
+            if ((live_mask & (1U << i)) == 0) continue;
+            drive_[i].set_velocity(states[i].drive_rps);
+            steer_[i].set_position(states[i].steer_rot);
+          }
         }
       }
     }  // anything not set goes out neutral
@@ -179,19 +176,13 @@ class Drivetrain {
                 kMaxMeasurementSkewNs;
       }
       if (valid) {
-        const double raw = ToRadians(gyro_.yaw());
-        if (gyro_seen_ &&
-            (reset || !gyro_valid_ ||
-             std::abs(std::remainder(raw + yaw_offset_rad_ - yaw_rad_,
-                                     kTwoPi)) > 25.0 * period_s))
-          yaw_offset_rad_ = yaw_rad_ - raw;
-        yaw_rad_ = raw + yaw_offset_rad_;
-        gyro_seen_ = true;
+        yaw_rad_ =
+            yaw_anchor_.Publish(ToRadians(gyro_.yaw()), yaw_rad_,
+                                yaw_times.oldest_ns, reset_count_, period_s);
         yaw_valid = true;
         if (!modules_valid || yaw_times.oldest_ns < module_times.oldest_ns)
           module_times.oldest_ns = yaw_times.oldest_ns;
       }
-      gyro_valid_ = valid;
     }
 
     const auto sample_ns =
@@ -209,6 +200,12 @@ class Drivetrain {
   // bound the error from publishing asynchronous values without extrapolation.
   static constexpr std::int64_t kMaxMeasurementAgeNs = 50'000'000;
   static constexpr std::int64_t kMaxMeasurementSkewNs = 20'000'000;
+  // A faster yaw step is a restarted Pigeon count, never rotation.
+  static constexpr double kMaxYawRateRadps = 25.0;
+  // A step across a longer feedback gap re-anchors: the device may have
+  // restarted its count meanwhile, and its reset can reach /hw/status after
+  // its first new sample.
+  static constexpr std::int64_t kMaxBridgedGapNs = 100'000'000;
 
   struct MeasurementTimes {
     explicit MeasurementTimes(talos::Time now)
@@ -235,6 +232,37 @@ class Drivetrain {
     bool known{true};
   };
 
+  // Publishes a device count as one continuous value. A sample's step from
+  // the last published value is motion, across feedback gaps too, unless the
+  // count may have restarted: a device reset reported since the previous
+  // sample, more than kMaxBridgedGapNs of acquisition time since it, or a
+  // step faster than max_rate per second over that time plus margin_s. Such
+  // a sample re-anchors the count to the last published value instead.
+  struct Anchor {
+    double Publish(double raw, double last, std::int64_t sample_ns,
+                   std::uint32_t reset_count, double margin_s) {
+      double step = raw + offset - last;
+      if (wrapped) step = std::remainder(step, kTwoPi);
+      const std::int64_t gap_ns = sample_ns - previous_ns;
+      const double gap_s =
+          static_cast<double>(std::max<std::int64_t>(gap_ns, 0)) * 1e-9;
+      if (seen && (reset_count != resets || gap_ns > kMaxBridgedGapNs ||
+                   std::abs(step) > max_rate * (gap_s + margin_s)))
+        offset = last - raw;
+      seen = true;
+      previous_ns = sample_ns;
+      resets = reset_count;
+      return raw + offset;
+    }
+
+    double max_rate{0};   // count units per second
+    bool wrapped{false};  // radians: steps are judged modulo a turn
+    double offset{0};
+    std::int64_t previous_ns{0};
+    std::uint32_t resets{0};
+    bool seen{false};
+  };
+
   talos::Node& node_;
   talos::HardwareLink& link_;
   SwerveGeometry geometry_;
@@ -242,11 +270,10 @@ class Drivetrain {
   std::array<talos::Motor, kModuleCount> drive_;
   std::array<talos::Motor, kModuleCount> steer_;
   std::array<talos::CANcoder, kModuleCount> encoder_;
-  std::array<double, kModuleCount> drive_position_{}, drive_offset_{};
-  std::array<bool, kModuleCount> drive_seen_{}, drive_valid_{};
+  std::array<double, kModuleCount> drive_position_{};
+  std::array<Anchor, kModuleCount> drive_anchor_{};
   std::uint32_t reset_count_{0};
-  bool gyro_seen_{false}, gyro_valid_{false};
-  double yaw_offset_rad_{0};
+  Anchor yaw_anchor_{.max_rate = kMaxYawRateRadps, .wrapped = true};
   talos::Gyro gyro_;
   bool integrate_heading_;
   double max_linear_accel_mps2_;

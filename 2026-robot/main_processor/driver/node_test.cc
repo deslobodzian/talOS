@@ -502,8 +502,8 @@ class TeleopChain : public ::testing::Test {
 };
 
 TEST_F(TeleopChain, JoystickDeflectionReachesTheSwerveModulesAsVelocity) {
-  // 4 m/s over a 0.0508 m wheel, below the 20 rps drive ceiling, so the
-  // request is not desaturated.
+  // 4 m/s over a 0.0508 m wheel (12.5 rps), below the robot's 14.5 rps drive
+  // limit, so the request is not desaturated.
   const double expected_rps = 4.0 / (2 * std::numbers::pi * 0.0508);
   Push(ForwardStick());
   // drivetrain.toml's chassis slew limit ramps the step instead of applying

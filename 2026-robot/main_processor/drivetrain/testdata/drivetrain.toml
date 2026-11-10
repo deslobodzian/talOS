@@ -7,7 +7,7 @@ period_us = 5000
 type = "TalonFX"
 bus = "test"
 can_id = 1
-max_velocity_rps = 20.0
+max_velocity_rps = 14.5
 
 [motors.back_left_steer]
 type = "TalonFX"
@@ -27,7 +27,7 @@ can_id = 21
 type = "TalonFX"
 bus = "test"
 can_id = 3
-max_velocity_rps = 20.0
+max_velocity_rps = 14.5
 
 [motors.back_right_steer]
 type = "TalonFX"
@@ -47,7 +47,7 @@ can_id = 22
 type = "TalonFX"
 bus = "test"
 can_id = 5
-max_velocity_rps = 20.0
+max_velocity_rps = 14.5
 
 [motors.front_left_steer]
 type = "TalonFX"
@@ -67,7 +67,7 @@ can_id = 23
 type = "TalonFX"
 bus = "test"
 can_id = 7
-max_velocity_rps = 20.0
+max_velocity_rps = 14.5
 
 [motors.front_right_steer]
 type = "TalonFX"

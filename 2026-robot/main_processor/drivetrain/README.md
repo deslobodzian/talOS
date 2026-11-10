@@ -61,10 +61,16 @@ the hardware says:
   times for each drive position, drive velocity and steer position.
   Partial odometry is deliberately not offered to four-module consumers;
   missing module positions hold their last values while live ones update.
-  Wheel distance and gyro yaw retain their frame across device reset counters
-  and invalid-to-valid recovery. Impossible wheel steps (four times configured
-  wheel free speed) and yaw steps (25 rad/s) are re-anchored, not integrated.
-  Movement during invalid feedback is unknowable and discarded.
+  Wheel distance and Pigeon yaw stay continuous. A sample's step from the
+  last published value is motion, including motion made while feedback was
+  invalid, unless the device's count may have restarted: a
+  `gateway_device_reset_count` change on `/hw/status` since the previous
+  sample, more than 100 ms of acquisition time since it (a reset can reach
+  `/hw/status` after the device's first new sample), or a step faster than
+  four times the drive's `max_velocity_rps` (wheels) or 25 rad/s (yaw) over
+  that time plus one control period. Such a sample re-anchors instead of
+  moving the value. A wheel sample without an acquisition time (before the
+  clock mapping converges) counts tick time.
 - `yaw_rad` is the Pigeon's yaw converted from rotations, and `yaw_valid`
   requires usable yaw acquisition timing (including the skew check below).
   Otherwise `yaw_rad` holds the last valid heading (0 before the first).

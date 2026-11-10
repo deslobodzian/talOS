@@ -141,7 +141,9 @@ TEST(Swerve, RotationDesaturationAndInvalidInput) {
   if (!fast.has_value()) {
     FAIL() << "ToModuleStates returned nullopt";
   }
-  for (const ModuleState& m : *fast) EXPECT_NEAR(m.drive_rps, 20, 1e-12);
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    EXPECT_NEAR((*fast)[i].drive_rps, geometry.modules[i].max_drive_rps, 1e-12);
+  }
 
   EXPECT_FALSE(kinematics.ToModuleStates(
       {std::numeric_limits<double>::quiet_NaN(), 0, 0}, {}));
@@ -409,6 +411,42 @@ TEST_F(DrivetrainTest, DrivesEveryModuleToAFreshTarget) {
     EXPECT_NEAR(Request(module.steer).demand, 0.0, 1e-9) << module.name;
   }
   EXPECT_TRUE(State().enabled());
+}
+
+TEST_F(DrivetrainTest, DesaturationSlowsEveryWheelByOneFactorToTheDriveLimit) {
+  // Translating while turning asks the wheels on the outside of the turn for
+  // more than max_velocity_rps. All four slow by one factor, so the chassis
+  // keeps the commanded shape of motion.
+  const ChassisSpeeds request{4.0, 0.0, 6.0};
+  Teleop();
+  hw.ideal_motors();  // the modules settle on their headings
+  Hold(ChassisTarget{request.vx_mps, request.vy_mps, request.omega_radps},
+       40ms);
+  std::array<ModuleState, kModuleCount> settled{};
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    settled[i].steer_rot = Request(geometry.modules[i].steer).demand;
+  }
+  SwerveGeometry unlimited = geometry;
+  for (SwerveModule& module : unlimited.modules) {
+    module.max_drive_rps = std::numeric_limits<double>::infinity();
+  }
+  SwerveKinematics kinematics{unlimited};
+  const auto wanted = kinematics.ToModuleStates(request, settled, 0.005);
+  ASSERT_TRUE(wanted.has_value());
+  double excess = 0.0;
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    excess = std::max(excess, std::abs((*wanted)[i].drive_rps) /
+                                  geometry.modules[i].max_drive_rps);
+  }
+  ASSERT_GT(excess, 1.0);
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    const auto drive = Request(geometry.modules[i].drive);
+    EXPECT_EQ(drive.mode, Mode::kVelocity) << geometry.modules[i].name;
+    EXPECT_LE(std::abs(drive.demand), geometry.modules[i].max_drive_rps + 1e-9)
+        << geometry.modules[i].name;
+    EXPECT_NEAR(drive.demand, (*wanted)[i].drive_rps / excess, 1e-9)
+        << geometry.modules[i].name;
+  }
 }
 
 class DrivetrainSlewTest : public DrivetrainTest {
@@ -781,24 +819,32 @@ TEST_F(DrivetrainTest, DegradedDriveStillHonorsDisableAndStaleTargets) {
   ExpectNeutral();
 }
 
-TEST_F(DrivetrainTest, DriveResetAndRecoveryPreservePublishedDistance) {
+TEST_F(DrivetrainTest, DriveDistanceKeepsTravelAcrossAGapButNotARestart) {
   hw.set_motor("drivetrain", "front_left_drive", 100.0, 0.0);
   sim.step(kConverged);
   const double before = State().module2().distance_m();
+  const double travel = WheelTravel(0.1, geometry.modules[2].wheel_radius_m);
+  // A count restarted at zero is not 100 rotations of travel.
   hw.set_motor("drivetrain", "front_left_drive", 0.0, 0.0);
   sim.step(20ms);
   EXPECT_NEAR(State().module2().distance_m(), before, 1e-9);
+  // Travel made while the feedback was invalid for 20 ms is still travel.
   hw.set_connected("drivetrain", "front_left_drive", false);
   sim.step(20ms);
   hw.set_motor("drivetrain", "front_left_drive", 0.1, 0.0);
   hw.set_connected("drivetrain", "front_left_drive", true);
   sim.step(20ms);
-  EXPECT_NEAR(State().module2().distance_m(), before, 1e-9);
-  hw.set_motor("drivetrain", "front_left_drive", 0.2, 0.0);
+  EXPECT_NEAR(State().module2().distance_m(), before + travel, 1e-9);
+  // After a longer silence the count may have restarted unreported.
+  hw.set_connected("drivetrain", "front_left_drive", false);
+  sim.step(200ms);
+  hw.set_motor("drivetrain", "front_left_drive", 0.0, 0.0);
+  hw.set_connected("drivetrain", "front_left_drive", true);
   sim.step(20ms);
-  EXPECT_NEAR(State().module2().distance_m(),
-              before + WheelTravel(0.1, geometry.modules[2].wheel_radius_m),
-              1e-9);
+  EXPECT_NEAR(State().module2().distance_m(), before + travel, 1e-9);
+  hw.set_motor("drivetrain", "front_left_drive", 0.1, 0.0);
+  sim.step(20ms);
+  EXPECT_NEAR(State().module2().distance_m(), before + 2 * travel, 1e-9);
 }
 
 TEST_F(DrivetrainTest, DrivePositionResetWhileDrivingPreservesTravel) {
@@ -918,7 +964,7 @@ TEST_F(DrivetrainOnImuTest, InvalidYawTimingHoldsHeadingAndKeepsModulesUsable) {
     EXPECT_EQ(Request(geometry.modules[0].drive).mode, Mode::kVelocity);
   }
   // A good yaw remains independently usable when a module time is unknown.
-  hw.set_gyro("drivetrain", "drivetrain_imu", 0.25, 0, 7'000, 0);
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0, 7'000, 0);
   hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0,
                std::numeric_limits<std::uint32_t>::max(), 0);
   sim.step(20ms);
@@ -949,20 +995,41 @@ TEST_F(DrivetrainOnImuTest, ADisconnectedGyroIsInvalidAndHoldsTheLastHeading) {
   EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
 }
 
-TEST_F(DrivetrainOnImuTest, GyroResetRecoveryKeepsHeadingContinuous) {
-  hw.set_gyro("drivetrain", "drivetrain_imu", 0.25, 0.0);
+TEST_F(DrivetrainOnImuTest, YawKeepsRotationAcrossAGapButNotAcrossAReboot) {
+  // Spinning at 5 rad/s, the Pigeon advancing every 5 ms tick.
+  constexpr double kRadps = 5.0;
+  double yaw_rad = 0.0;
+  const auto spin = [&](std::chrono::milliseconds duration) {
+    for (auto t = 0ms; t < duration; t += 5ms) {
+      yaw_rad += kRadps * 0.005;
+      hw.set_gyro("drivetrain", "drivetrain_imu", yaw_rad / kTau,
+                  kRadps / kTau);
+      sim.step(5ms);
+    }
+  };
   sim.step(kConverged);
-  const double before = State().yaw_rad();
+  spin(20ms);
+  // No usable yaw for 55 ms while the robot keeps turning.
   hw.set_connected("drivetrain", "drivetrain_imu", false);
-  sim.step(20ms);
+  spin(55ms);
+  EXPECT_FALSE(State().yaw_valid());
+  hw.set_connected("drivetrain", "drivetrain_imu", true);
+  spin(20ms);
+  sim.step(10ms);  // the last yaw reaches the state
+  EXPECT_TRUE(State().yaw_valid());
+  EXPECT_NEAR(State().yaw_rad(), yaw_rad, 1e-9);
+  // A reboot: silent for longer, then counting from zero again.
+  const double heading = State().yaw_rad();
+  hw.set_connected("drivetrain", "drivetrain_imu", false);
+  sim.step(200ms);
   hw.set_gyro("drivetrain", "drivetrain_imu", 0.0, 0.0);
   hw.set_connected("drivetrain", "drivetrain_imu", true);
   sim.step(20ms);
   EXPECT_TRUE(State().yaw_valid());
-  EXPECT_NEAR(State().yaw_rad(), before, 1e-9);
+  EXPECT_NEAR(State().yaw_rad(), heading, 1e-9);
   hw.set_gyro("drivetrain", "drivetrain_imu", 0.01, 0.0);
   sim.step(20ms);
-  EXPECT_NEAR(State().yaw_rad(), before + ToRadians(0.01), 1e-9);
+  EXPECT_NEAR(State().yaw_rad(), heading + ToRadians(0.01), 1e-9);
 }
 
 TEST_F(DrivetrainOnImuTest, UnannouncedPigeonResetDoesNotJumpHeading) {
