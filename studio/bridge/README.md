@@ -117,7 +117,8 @@ python studio/bridge/bandwidth_test.py --measure bazel-bin/studio/bridge --secon
 ```
 
 [`bandwidth_test.py`](bandwidth_test.py) checks client admission, the shared
-egress budget and continued delivery to readers alongside a stalled client.
+egress budget, continued delivery to readers alongside a stalled client, and
+that no reader gets less than half the best-served reader's frames.
 
 ## Publisher and serving constraints
 

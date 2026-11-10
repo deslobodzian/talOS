@@ -34,11 +34,18 @@ def connect(port, stalled=False):
     return sock, headers
 
 
-def timestamp(payload):
+# Vtable offsets of Frame's sequence_id and timestamp_ns (talOS/telemetry/telemetry.fbs).
+SEQUENCE, TIMESTAMP = 6, 8
+
+
+def field(payload, voffset):
     table = 4 + struct.unpack_from("<I", payload, 4)[0]
     vtable = table - struct.unpack_from("<i", payload, table)[0]
-    offset = struct.unpack_from("<H", payload, vtable + 8)[0]
-    return struct.unpack_from("<Q", payload, table + offset)[0]
+    # FlatBuffers omits a scalar equal to its default (0) from the table.
+    if voffset >= struct.unpack_from("<H", payload, vtable)[0]:
+        return 0
+    offset = struct.unpack_from("<H", payload, vtable + voffset)[0]
+    return struct.unpack_from("<Q", payload, table + offset)[0] if offset else 0
 
 
 def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4):
@@ -92,21 +99,23 @@ def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4)
 
             def consume(index):
                 sock = sockets[int(stalled) + index]
-                count, total, ages = 0, 0, []
+                count, total, ages, sequences = 0, 0, [], []
                 while not stop.is_set() and time.monotonic() < end:
                     opcode, payload = frame(sock)
                     total += len(payload) + (4 if len(payload) >= 126 else 2)
                     if opcode == BINARY:
                         # First binary is the cached dictionary, deliberately old.
                         if count:
-                            ages.append((time.monotonic_ns() - timestamp(payload)) / 1e6)
+                            ages.append((time.monotonic_ns() - field(payload, TIMESTAMP)) / 1e6)
+                            sequences.append(field(payload, SEQUENCE))
                         count += 1
                         if count >= 16:
                             ready[index].set()
                 ages.sort()
                 return {"bytes": total, "frames": count,
                         "age_p99_ms": round(ages[int(len(ages) * .99)], 2) if ages else None,
-                        "age_max_ms": round(max(ages), 2) if ages else None}
+                        "age_max_ms": round(max(ages), 2) if ages else None,
+                        "sequences": sequences}
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=active) as pool:
                 readers = [pool.submit(consume, index) for index in range(active)]
@@ -130,8 +139,16 @@ def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4)
                     stop.set()
                 results = [reader.result() for reader in readers]
             elapsed = time.monotonic() - started
-            for result in results:
+            # Each reader's share of the frames forwarded while every reader
+            # was being served, counted by producer sequence so that when a
+            # reader thread got around to reading cannot move it.
+            sequences = [result.pop("sequences") for result in results]
+            if all(sequences):
+                low, high = max(s[0] for s in sequences), min(s[-1] for s in sequences)
+            for result, received in zip(results, sequences):
                 result["bytes_s"] = round(result["bytes"] / elapsed)
+                result["shared_frames"] = (sum(low <= s <= high for s in received)
+                                           if all(sequences) else None)
             rss = None
             status = Path(f"/proc/{bridge.pid}/status")
             if status.exists():
@@ -163,6 +180,10 @@ class BandwidthTest(unittest.TestCase):
                              160000 * result["elapsed_s"] + 64000)
         for reader in result["readers"]:
             self.assertGreaterEqual(reader["frames"], 16)
+        # The shared bucket is served in turn: no healthy reader gets less
+        # than half of the best-served one's frames.
+        shares = [reader["shared_frames"] for reader in result["readers"]]
+        self.assertGreaterEqual(2 * min(shares), max(shares), shares)
 
     def test_configured_client_limit(self):
         workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")

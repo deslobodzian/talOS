@@ -11,7 +11,6 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
-#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -64,7 +63,13 @@ struct Bridge {
   RTMSQueue& queue;
   std::size_t reader;
   std::string topic;
-  std::set<Socket*> clients;
+  std::vector<Socket*> clients;
+  // Where the next fan-out starts. The shared bucket goes to whichever client
+  // asks first, and every client's own burst equals the shared one, so in a
+  // fixed order the clients ahead of the last would spend the shared bucket
+  // and starve it for seconds; starting one place later each time gives every
+  // client first claim in turn.
+  std::size_t first_client = 0;
   us_listen_socket_t* listener = nullptr;
   std::uint64_t invalid = 0, ws_drops = 0, telemetry_ws_drops = 0,
                 forwarded = 0;
@@ -97,6 +102,16 @@ struct Bridge {
     budget.tokens -= static_cast<double>(size);
     egress_bytes += size;
     return true;
+  }
+
+  template <typename Send>
+  void for_each_client(Send&& send_to) {
+    const std::size_t count = clients.size();
+    if (count == 0) return;
+    const std::size_t first = first_client++ % count;
+    for (std::size_t i = 0; i < count; ++i) {
+      send_to(clients[(first + i) % count]);
+    }
   }
 
   // The decoded v2 feed: latest dictionary and latest aligned frame,
@@ -167,9 +182,9 @@ struct Bridge {
 
     // Text on the WebSocket, so a client tells the two message families apart
     // by frame type and needs no sniffing.
-    for (auto* client : clients) {
+    for_each_client([this](Socket* client) {
       send(client, system_json, uWS::OpCode::TEXT);
-    }
+    });
   }
 
   // This process as the registry would have described it, had it a slot.
@@ -233,7 +248,7 @@ struct Bridge {
           decoded->values()->size() == telemetry_state.dictionary.size();
       if (!aligned) continue;
       ++forwarded;
-      for (auto* client : clients) {
+      for_each_client([this, bytes](Socket* client) {
         const auto& state = *client->getUserData();
         if (!state.has_dictionary ||
             state.stream_id != telemetry_state.stream_id ||
@@ -241,10 +256,10 @@ struct Bridge {
           // A budget drop must not strand a viewer without its dictionary.
           // Withhold values so its bucket can refill enough to retry.
           send_dictionary(client);
-          continue;
+          return;
         }
         send(client, bytes, uWS::OpCode::BINARY);
-      }
+      });
     }
   }
 };
@@ -441,7 +456,7 @@ int main(int argc, char** argv) try {
         request->getHeader("sec-websocket-extensions"), context);
   };
   behavior.open = [&](auto* ws) {
-    bridge.clients.insert(ws);
+    bridge.clients.push_back(ws);
     // Send the current graph immediately: a client that has to wait for the
     // next refresh opens on an empty system view.
     bridge.send(ws, bridge.system_json, uWS::OpCode::TEXT);
@@ -455,7 +470,7 @@ int main(int argc, char** argv) try {
     }
   };
   behavior.close = [&](auto* ws, int, std::string_view) {
-    bridge.clients.erase(ws);
+    std::erase(bridge.clients, ws);
   };
   app.ws<Client>("/telemetry", std::move(behavior));
   app.get("/telemetry.json", [&](auto* res, auto*) {
