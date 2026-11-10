@@ -73,6 +73,9 @@ distance no greater than the threshold, as well as passing geometric validity
 checks. Failed decode-quality checks mark the detection
 invalid, excluding it from both visibility counts and localization before range
 filtering or pose solving. A high margin alone does not guarantee a valid pose.
+A tag id decoded more than once in one frame enters localization once, as the
+detection with the higher decision margin (then the lower per-tag reprojection
+error).
 
 ## Frame recording
 
@@ -119,7 +122,7 @@ directly.
 
 | Key | Default | Units and meaning |
 | --- | --- | --- |
-| `pixel_std_px` | `0.33` | Corner-coordinate standard deviation in pixels; real cameras should use their calibration RMS. Independent of direct projection's `camera.pixel_noise_std`. |
+| `pixel_std_px` | `0.33` | Nominal corner-coordinate standard deviation in pixels, the lower bound of the residual scaling below; real cameras should use their calibration RMS. Independent of direct projection's `camera.pixel_noise_std`. |
 | `floor_z_std_m` | `0.05` | Robot-height prior standard deviation in metres about the field floor. |
 | `floor_tilt_std_rad` | `0.05` | Robot roll/pitch prior standard deviation in radians about level. |
 | `huber_delta_px` | `2.0` | Huber robust-loss transition in pixels for corner residuals. |
@@ -138,8 +141,16 @@ The test requires the measured standard deviation to stay within ±30% of
 This is a simulator calibration, not a claim about physical camera noise:
 set each real camera's `pixel_std_px` from its measured calibration RMS.
 
-The solver returns field-frame x/y/yaw standard deviations after applying
-the configured uncertainty floors and mount-calibration uncertainty.
+The solver's information matrix assumes `pixel_std_px` corner noise. It scales
+the resulting covariance by the fit's a-posteriori variance factor
+`s² = χ² / (m − 6)`, where `χ²` sums the squared Huber-weighted whitened
+residuals over its `m` rows (two per corner plus three floor rows), clamped to
+`[1, max_reprojection_error_px² / (2 · pixel_std_px²)]`: a fit worse than the
+nominal noise publishes proportionally larger uncertainty, never less than
+nominal and at most the per-coordinate variance ratio of a fit at the 3.5 px
+joint reprojection reject threshold (about 56, a 7.5× standard deviation, at
+the defaults). It then returns field-frame x/y/yaw standard deviations after
+applying the configured uncertainty floors and mount-calibration uncertainty.
 Non-finite or non-positive-definite covariance invalidates the observation.
 Single-tag ambiguity rejection and floor-prior disambiguation are implemented
 in [localization.h](../../../talOS/vision/localization.h).

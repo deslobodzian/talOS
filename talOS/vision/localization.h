@@ -521,7 +521,8 @@ inline bool SetCovarianceStdDevs(const PoseNormalMatrix& normal,
 
 // All observations, including single tags, share this right-increment SE(3)
 // LM solve. Pixel rows and floor rows are whitened before Huber IRLS; the
-// undamped final information matrix supplies measurement covariance.
+// undamped final information matrix, scaled by the fit's residual variance
+// factor below, supplies measurement covariance.
 inline RobotPoseEstimate SolveMultiTagRobotPose(
     const std::vector<TagDetection3D>& observations, uint32_t camera_id,
     const CameraMounting& mounting, const FieldLayout& layout,
@@ -549,19 +550,29 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
       noise.mount_translation_std_m < 0)
     return reject(PoseInvalidReason::kInvalidCovariance,
                   "Invalid solver noise");
-  double distance_sum = 0;
   for (const auto& t : observations) {
     const double d = t.T_camera_tag.translation().norm();
     if (!t.valid || !layout.HasTag(t.tag_id) || !std::isfinite(d) ||
         d < options.min_distance_m || d > options.max_distance_m ||
         t.T_camera_tag.translation().z() <= options.min_z_m)
       continue;
-    if (std::any_of(tags.begin(), tags.end(),
-                    [&](const auto* q) { return q->tag_id == t.tag_id; }))
-      continue;
-    tags.push_back(&t);
-    distance_sum += d;
+    // Layout ids are unique, so a repeated id is at most one real tag: keep
+    // the stronger decode (higher decision margin, then lower per-tag
+    // reprojection error) wherever the detector listed it.
+    const auto same =
+        std::find_if(tags.begin(), tags.end(),
+                     [&](const auto* q) { return q->tag_id == t.tag_id; });
+    if (same == tags.end()) {
+      tags.push_back(&t);
+    } else if (t.decision_margin > (*same)->decision_margin ||
+               (t.decision_margin == (*same)->decision_margin &&
+                t.reprojection_error < (*same)->reprojection_error)) {
+      *same = &t;
+    }
   }
+  double distance_sum = 0;
+  for (const auto* t : tags)
+    distance_sum += t->T_camera_tag.translation().norm();
   if (tags.empty() || !intrinsics.IsValid())
     return reject(PoseInvalidReason::kDegenerateHomography,
                   "No usable PnP seed");
@@ -700,7 +711,23 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
         noise.pixel_std_px * std::sqrt(residual.head(pixel_rows).squaredNorm() /
                                        static_cast<double>(points.size()));
     est.ambiguity = 0;
-    if (!detail::SetCovarianceStdDevs(normal, noise, &est)) return est;
+    // The information matrix assumes pixel_std_px corner noise. A worse fit
+    // scales the covariance by the a-posteriori variance factor
+    // s^2 = chi^2 / (rows - 6) of the Huber-weighted whitened residual (pixel
+    // and floor rows), clamped to [1, max_reprojection_error_px^2 /
+    // (2 pixel_std_px^2)]: never below nominal, and at most the per-coordinate
+    // variance ratio of a fit at the reprojection reject threshold.
+    const int dof = rows - 6;
+    const double threshold_ratio =
+        options.max_reprojection_error_px / noise.pixel_std_px;
+    const double variance_scale =
+        dof > 0
+            ? std::max(1.0, std::min(weighted_residual.squaredNorm() /
+                                         static_cast<double>(dof),
+                                     0.5 * threshold_ratio * threshold_ratio))
+            : 1.0;
+    const detail::PoseNormalMatrix information = normal / variance_scale;
+    if (!detail::SetCovarianceStdDevs(information, noise, &est)) return est;
     if (est.reprojection_error_px > options.max_reprojection_error_px) {
       est.validity = {false, PoseInvalidReason::kHighReprojectionError,
                       "Joint PnP residual too high"};

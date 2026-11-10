@@ -195,6 +195,30 @@ TEST(LocalizationTest, SolverCovarianceShrinksWithTagsAndGrowsWithDistance) {
   }
 }
 
+TEST(LocalizationTest, FitResidualInflatesPublishedCovariance) {
+  PoseSolverOptions noise;
+  noise.min_xy_std_m = 0;
+  noise.min_yaw_std_rad = 0;
+  noise.mount_angle_std_rad = 0;
+  noise.mount_translation_std_m = 0;
+  JointFixture fixture(3, 6);
+  const auto clean = fixture.Solve(noise);
+  // Shear every tag by 1.2 px per coordinate: under the 2 px Huber transition
+  // and the 3.5 px reject threshold, yet about 3.6 nominal sigma. Accepting
+  // that fit must not also publish the clean fit's uncertainty.
+  for (auto& tag : fixture.tags) {
+    for (size_t i = 0; i < tag.corners.size(); ++i) {
+      tag.corners[i] += (i / 2) % 2 == 0 ? 1.2f : -1.2f;
+    }
+  }
+  const auto noisy = fixture.Solve(noise);
+  ASSERT_TRUE(clean.validity.valid);
+  ASSERT_TRUE(noisy.validity.valid) << noisy.validity.message;
+  EXPECT_GT(noisy.std_devs.x_std_m, 2 * clean.std_devs.x_std_m);
+  EXPECT_GT(noisy.std_devs.y_std_m, 2 * clean.std_devs.y_std_m);
+  EXPECT_GT(noisy.std_devs.yaw_std_rad, 2 * clean.std_devs.yaw_std_rad);
+}
+
 TEST(LocalizationTest, HuberSuppressesTwentyPixelTagOutlier) {
   JointFixture fixture(3, 9);
   for (size_t i = 0; i < 4; ++i) {
@@ -630,6 +654,22 @@ TEST(LocalizationTest, InvalidDetectionCannotEnterJointSolve) {
       mixed.T_field_robot.matrix().isApprox(single.T_field_robot.matrix()));
   EXPECT_DOUBLE_EQ(mixed.average_distance_m, single.average_distance_m);
   EXPECT_DOUBLE_EQ(mixed.std_devs.x_std_m, single.std_devs.x_std_m);
+}
+
+TEST(LocalizationTest, RepeatedTagIdKeepsTheStrongerDecode) {
+  // A weaker false decode repeating a real tag's id, listed first, must not
+  // stand in for that tag's corners in the joint solve.
+  JointFixture fixture(3, 2);
+  for (auto& tag : fixture.tags) tag.decision_margin = 80;
+  auto decoy = fixture.tags.front();
+  decoy.decision_margin = 40;
+  for (auto& coordinate : decoy.corners) coordinate += 40;
+  fixture.tags.insert(fixture.tags.begin(), decoy);
+  const auto result = fixture.Solve();
+  ASSERT_TRUE(result.validity.valid) << result.validity.message;
+  EXPECT_EQ(result.tag_count, 2);
+  EXPECT_TRUE(
+      result.T_field_robot.matrix().isApprox(fixture.robot.matrix(), 1e-4));
 }
 
 void ExpectReplayedSingleTagRejected(const std::array<float, 8>& corners,
