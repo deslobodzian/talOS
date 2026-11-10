@@ -11,15 +11,27 @@ disabled. Telemetry draws it through `[subsystems.telemetry] pose_topic`.
 | Topic | Type | |
 |---|---|---|
 | `/drivetrain/state` | `drivetrain.DrivetrainState` | `sample_time_ns`, `modules_valid`, `yaw_valid`, `yaw_rad`, `module0`..`module3` (distance, angle), chassis velocity |
-| `/<camera>/state`, per name in `cameras` | `geometry.PoseObservation` | optional subscriptions: a listed camera that is not running is no graph error |
+| `/<camera>/state`, per name in `cameras` | `geometry.PoseObservation` | optional callback subscriptions, delivered in sequence: a listed camera that is not running is no graph error |
 | `/pose_estimator/state` | `geometry.PoseEstimate` | pose at the newest integrated `sample_time_ns`, the drivetrain's chassis velocity, `valid`, `localized`, accepted/rejected observation counts |
 
 Camera calibration and capture behavior are documented in
 [vision](../vision/README.md).
 
-The estimator also reads the Driver Station through `talos.DriverStation`.
-Only a fresh, attached packet can classify startup; an absent, stale or
-detached Driver Station is not evidence of a normal disabled boot.
+The estimator also reads the Driver Station through `talos.DriverStation`,
+in `update()` (no packet listener). Only a fresh, attached packet can
+classify startup; an absent, stale or detached Driver Station is not evidence
+of a normal disabled boot.
+
+Every camera observation is delivered: each camera subscription has a
+callback, so the framework delivers its messages in sequence, and the
+callback queues each valid, tagged frame (at most 64 per camera; on overflow
+the oldest is dropped and counted in `observation_rejected_count`). The next
+`update()` fuses the whole queue in capture-time order. A latest-value read
+would lose all but each camera's newest frame per 20 ms tick (cameras publish
+every frame, up to 60 fps) and let an invalid frame hide a valid one. The
+callbacks make the node's loop drain every 1 ms instead of only before
+`update()` (see [the tick](../../../ARCHITECTURE.md#the-tick)); each drain is
+native, and Python runs only per arriving frame.
 
 ## Backends
 
@@ -56,10 +68,21 @@ implementation (an unknown value fails at startup). The robot config selects
 - Both backends seed the first integrated sample with `initial_x_m`,
   `initial_y_m`, and `initial_yaw_rad` (finite, default zero), independently
   of the gyro's initial reading; subsequent gyro deltas change that heading.
-  The first fresh, attached Driver Station observation decides whether that
-  seed is trusted: disabled trusts the seed; enabled leaves it untrusted.
-  Localization becomes true once both a trusted startup decision and an
-  integrated sample exist. A later disable never changes the startup decision.
+  That seed is the blue-origin pose. The Driver Station decides whether it is
+  trusted: a fresh, attached, disabled view naming the blue or red alliance
+  trusts that alliance's seed, and a disabled view with no known alliance
+  decides nothing. On red the seed is field-flipped the way autonomous flips
+  its blue-origin targets, a rotation by π about the field centre:
+  (`field_length_m` − x, `field_width_m` − y, yaw + π). Trusting a seed
+  restarts the backend at it, moved by all odometry integrated since startup
+  (so a robot pushed while disabled keeps that motion, mirrored on red);
+  observations fused before it are discarded with the old estimate. Until the
+  first enabled view, an alliance change re-seeds, unless cameras have
+  confirmed a pose. The first fresh, attached enabled view closes the
+  decision: a seed trusted before it stays, an enabled-first restart never
+  trusts one, and a later disable changes neither.
+  Localization becomes true once both a trusted seed and an integrated sample
+  exist.
 - Field dimensions `field_length_m` and `field_width_m` (set in
   [`pose_estimator.toml`](../configuration/subsystems/pose_estimator.toml)
   from the field layout `config_golden_test` checks them against)
@@ -80,7 +103,11 @@ implementation (an unknown value fails at startup). The robot config selects
   moved by odometry to the newest sample: wpimath's `resetPosition` there,
   or the factor-graph restart above at that pose plus the measurement's own
   prior. Evidence for the old pose, up to a full lag window of factor-graph
-  priors, cannot outvote it.
+  priors, cannot outvote it. After a Kalman reset (a relocalization, a
+  trusted seed, a rejected odometry step) wpimath's pose buffer starts at the
+  newest sample, so an observation taken earlier is moved by the odometry
+  since its time and fused there, as the factor graph attaches it to its
+  restart sample.
   Invalid or no-tag camera states are skipped without incrementing either
   counter; `observation_rejected_count` counts offered measurements refused.
 - A drivetrain sample is integrated once, when `sample_time_ns` increased,
@@ -98,13 +125,14 @@ implementation (an unknown value fails at startup). The robot config selects
   (`drivetrain_timeout_us`) and usable, and its sample no older than that
   timeout. Otherwise the pose is held and the velocity reads zero.
 - `localized` = the integrated estimate has a trusted field frame, either
-  from the disabled-first startup decision or the camera confirmation above.
+  from a trusted alliance seed or the camera confirmation above.
   It is false before the first integrated sample. Once true, it stays true
   for the process lifetime, including enable/disable transitions, Driver
   Station loss and stale or invalid odometry. It is not a freshness flag:
   field-pose consumers must require both `valid` and `localized`.
-- An observation is read once (`updated`). Invalid or no-tag camera states
-  are skipped; offered measurements are rejected (counted) when a value is
+- Each observation is fused once, in the `update()` after it arrives.
+  Invalid or no-tag camera states are skipped; offered measurements are
+  rejected (counted) when their camera's queue overflowed, a value is
   non-finite, a std dev is below 1e-4 m (x, y) or 1e-4 rad (yaw), finer
   than any camera resolves (in the factor graph such a sigma only
   ill-conditions the system), no odometry has been integrated, it
@@ -135,22 +163,24 @@ workload, with a fixed seed, lasts `--seconds` simulated seconds per backend
   noise (2–8 cm, 0.01–0.03 rad) that it reports as its std devs, arriving
   20–35 ms after capture, 15 % of frames a further 20–100 ms late (after
   newer frames, so they attach to past keys);
-- a disabled-first Driver Station, so the estimate is localized from the
-  first sample and every observation is fused.
+- a disabled Driver Station on the blue alliance, so the estimate is
+  localized from the first sample and every observation is fused.
 
-As in production, a tick sees only each camera's newest observation, so it
-fuses at most four. The report gives the host (platform, CPU model, Python,
-CPU count) and package versions, then per backend: ticks, p50, p99, p99.9
-and max `update()` duration, the fraction of ticks longer than the period
-(`>period`), observations fused per tick (mean, and the fraction of ticks
-that fused four), the maximum during the first lag window (warm-up,
-excluded from the other statistics) and the final position error. It
+As in production, a tick fuses every observation that arrived since the
+previous one (about five with four 60 fps cameras at 20 ms). The report
+gives the host (platform, CPU model, Python, CPU count) and package
+versions, then per backend: ticks, p50, p99, p99.9 and max `update()`
+duration, the fraction of ticks longer than the period (`>period`),
+observations fused per tick (mean, and the fraction of ticks that fused at
+least four), the maximum during the first lag window (warm-up, excluded from
+the other statistics) and the final position error. It
 exits non-zero when an observation or odometry step was rejected or the
 final estimate is not valid and localized, i.e. the workload was not the
 one described; it never judges timing. `update_benchmark_test` runs it for
 3 s per backend.
 
-It measures `update()` alone in one process. Like `talos.run`, it freezes the
+It measures `update()` alone in one process, not the camera callbacks that
+queue observations. Like `talos.run`, it freezes the
 garbage collector's heap once the estimator is built (see
 [Node API: Python garbage collection](../../../docs/NODE_DEVELOPMENT_GUIDE.md#python-garbage-collection)).
 It does not measure the node loop's dispatch or lateness, real-time
@@ -168,8 +198,12 @@ each rejection case leaving the pose alone; yaw acceptance, rejection and ±π
 wrapping, including multi-tag outlier rejection, sustained (multi-camera)
 relocalization, relocalization against a full 1.5 s window of observations
 of the old pose, inconsistent/expired/replayed evidence, motion compensation,
-and skipped non-measurements; disabled-first seed trust, enabled-first restart
-recovery without seed innovation gating, cross-camera startup confirmation,
+and skipped non-measurements; every observation arriving between two ticks
+fused, past a trailing invalid frame; the alliance seed (untrusted before an
+alliance is known, red field-flipped, re-seeded on an alliance change while
+disabled with odometry since startup kept, fixed once enabled),
+enabled-first restart recovery without seed innovation gating, cross-camera
+startup confirmation,
 missing/detached DS startup and process-lifetime localization latching;
 estimation while disabled; stale, frozen and invalid drivetrain input; repeated samples; `cameras`
 wiring; startup errors naming the bad key; `--describe` and a logged sim run

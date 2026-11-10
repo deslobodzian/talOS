@@ -214,9 +214,11 @@ def _run(sim, settings, drivetrain_period_us, seconds, backend,
     talos._freeze_construction()  # what talos.run does once the node is built
     hw = SimHardware(sim)
     hw.enable(False)
-    # Disabled-first Driver Station: the configured seed is trusted, so every
-    # observation is fused against a localized estimate.
-    hw.set_driver_station(enabled=False, teleop=True, attached=True)
+    # Disabled Driver Station on the blue alliance: the configured
+    # (blue-origin) seed is trusted, so every observation is fused against a
+    # localized estimate.
+    hw.set_driver_station(enabled=False, teleop=True, attached=True,
+                          alliance=talos.Alliance.BLUE)
     rng = random.Random(SEED)
     path = Path(settings.get("initial_x_m", 0.0), settings.get("initial_y_m", 0.0),
                 settings.get("initial_yaw_rad", 0.0), settings["field_length_m"],
@@ -327,7 +329,7 @@ def main(argv=None):
     budget_ns = workload["period_s"] * 1e9
     print(f"{'backend':<13}{'ticks':>7}{'p50 ms':>9}{'p99 ms':>9}"
           f"{'p99.9 ms':>10}{'max ms':>9}{'>period':>9}{'obs/tick':>10}"
-          f"{'4-obs':>8}{'warm-up max ms':>16}{'error m':>9}")
+          f"{'>=4 obs':>8}{'warm-up max ms':>16}{'error m':>9}")
     for backend, ticks, warmup, workload in rows:
         durations = sorted(t[1] for t in ticks)
         over = sum(d > budget_ns for d in durations)

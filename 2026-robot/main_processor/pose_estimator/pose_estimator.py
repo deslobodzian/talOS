@@ -1,10 +1,24 @@
 """Pose estimator: swerve odometry fused with camera pose observations.
 
 Every tick the estimator folds the newest drivetrain sample (module positions
-and gyro yaw, taken at sample_time_ns) into its estimate, adds each newly
-arrived camera observation that passes the checks below, and publishes the
-field pose on /pose_estimator/state. It owns no actuators and runs whether
-the robot is enabled or not.
+and gyro yaw, taken at sample_time_ns) into its estimate, adds every camera
+observation that arrived since the previous tick and passes the checks below,
+in capture-time order, and publishes the field pose on /pose_estimator/state.
+It owns no actuators and runs whether the robot is enabled or not.
+
+Camera observations arrive through callback subscriptions, which deliver every
+message in sequence (a latest-value read would lose all but the newest frame
+per tick, and an invalid frame could hide a valid one). The callback only
+queues valid, tagged frames, at most MAX_PENDING_OBSERVATIONS per camera;
+update() fuses the queue.
+
+The configured initial_* pose is the startup seed in the blue-origin field
+frame. It is trusted (localized) only once a fresh, attached, disabled Driver
+Station view reports a known alliance; on red the seed is the field-flipped
+pose (the rotation by pi about the field centre that autonomous applies to its
+blue-origin targets). While the robot has not been enabled and cameras have
+not confirmed a pose, an alliance change re-seeds. The first enabled view
+fixes the decision; an enabled-first restart never trusts the seed.
 
 Two backends share this shell, its checks and its tests; `backend` picks one:
 
@@ -19,10 +33,11 @@ Two backends share this shell, its checks and its tests; `backend` picks one:
   update failed is rejected.
 
 Invalid/no-tag camera states carry no measurement and are skipped. A measurement
-is rejected (and counted) when it carries a non-finite value or a standard
-deviation below MIN_OBSERVATION_STD_M / MIN_OBSERVATION_STD_RAD, arrives before
-any odometry, was taken before the first odometry sample, is too old or too far
-in the future, or is outside the field.
+is rejected (and counted) when its camera's queue overflowed before update()
+ran, or when it carries a non-finite value or a standard deviation below
+MIN_OBSERVATION_STD_M / MIN_OBSERVATION_STD_RAD, arrives before any odometry,
+was taken before the first odometry sample, is too old or too far in the
+future, or is outside the field.
 Once localized, measurements pass position and wrapped-yaw innovation gates
 against the estimate at their sample time. An untrusted startup seed does not
 gate measurements. Localization (and large innovations once localized) requires
@@ -72,6 +87,12 @@ _FAILURE_REPORT_INTERVAL_S = 5.0
 _NS = 1e9
 _US = 1e6
 _SAMPLE_TIME = operator.attrgetter("time_s")
+# Observations queued per camera between two update()s: over a second of a
+# 60 fps camera, and the framework's per-topic, per-drain delivery cap. A
+# longer stall drops (and counts as rejected) the oldest, which the age limit
+# would mostly reject anyway; it also bounds the work of one update().
+MAX_PENDING_OBSERVATIONS = 64
+_KNOWN_ALLIANCES = (talos.Alliance.BLUE, talos.Alliance.RED)
 
 
 def _positive(node, key, default):
@@ -157,6 +178,7 @@ class KalmanBackend:
         self.samples = collections.deque()
         self.yaw = Rotation2d()
         self.positions = None
+        self.reset_s = -math.inf  # sample time of the last reset
 
     def start(self, time_s, yaw, positions):
         self.estimator = SwerveDrive4PoseEstimator(
@@ -178,16 +200,27 @@ class KalmanBackend:
         self.yaw, self.positions = yaw, positions
 
     def add_observation(self, time_s, pose, std_devs):
+        if time_s < self.reset_s:
+            # wpimath's buffer starts at the reset: an older observation is
+            # moved by the odometry since its time and fused at the reset
+            # sample, as the factor graph attaches it to its restart sample.
+            pose = pose.transformBy(Transform2d(
+                _odometry_at(self.samples, time_s),
+                _odometry_at(self.samples, self.reset_s)))
+            time_s = self.reset_s
         self.estimator.addVisionMeasurement(pose, time_s, std_devs)
         return True
 
     def reset(self, yaw, positions, pose=None):
         """Adopts (yaw, positions) as the odometry baseline without
         integrating the step to them; with `pose`, the estimate continues
-        from there. wpimath clears its pose buffer either way, so an
-        observation added before the next odometry sample is dropped."""
+        from there. wpimath clears its pose buffer, so the newest sample's
+        time is recorded at the reset pose again: an observation fused
+        after the reset (in the same tick or later) is not dropped."""
         self.estimator.resetPosition(
             yaw, positions, self.pose() if pose is None else pose)
+        self.reset_s = self.samples[-1].time_s
+        self.estimator.updateWithTime(self.reset_s, yaw, positions)
         self.yaw, self.positions = yaw, positions
 
     def pose(self):
@@ -195,7 +228,7 @@ class KalmanBackend:
 
     def pose_at(self, time_s):
         sample_at = getattr(self.estimator, "sampleAt", None)
-        if sample_at is not None:
+        if sample_at is not None and time_s >= self.reset_s:
             sampled = sample_at(time_s)
             if isinstance(sampled, Pose2d):
                 return sampled
@@ -436,10 +469,13 @@ class PoseEstimator:
             raise ValueError(f"pose_estimator: cameras must list camera node "
                              f"names, got {cameras!r}")
         self.relocalization_camera_count = min(2, len(set(cameras)))
-        self.cameras = [
-            (camera, node.subscribe(
-                PoseObservation, f"/{camera}/state", optional=True))
-            for camera in cameras]
+        # One sequence-delivering subscription and queue per distinct camera.
+        self.pending = {}
+        for camera in dict.fromkeys(cameras):
+            queue = self.pending[camera] = collections.deque()
+            node.subscribe(
+                PoseObservation, f"/{camera}/state", optional=True,
+                callback=lambda o, queue=queue: self.enqueue(queue, o))
         self.state = node.publish(PoseEstimate, topics.STATE)
         self.first_ns = None  # first integrated sample; None before it
         self.latest_ns = 0
@@ -449,17 +485,45 @@ class PoseEstimator:
         self.checked_ns = 0
         self.relocalization_candidates = []
         self.localized = False
-        self.seed_trusted = None  # first fresh, attached DS observation only
-        self.ds = talos.DriverStation(node, on_packet=self.observe_driver_station)
+        # The startup seed: open to the Driver Station until its first
+        # enabled view; trusted for seed_alliance once a disabled view
+        # names one; applied to the backend for seeded_alliance.
+        self.seed_open = True
+        self.seed_alliance = None
+        self.seeded_alliance = None
+        self.vision_localized = False  # cameras confirmed a field pose
+        # No packet listener: update() reads the Driver Station each tick,
+        # and the DS topic is drained before every update().
+        self.ds = talos.DriverStation(node)
+
+    def enqueue(self, queue, o):
+        """Camera callback, every arrival in sequence: queue a measurement
+        for the next update()."""
+        if not o.valid or o.tag_count < 1:
+            return  # no measurement: neither fused nor counted
+        if len(queue) >= MAX_PENDING_OBSERVATIONS:
+            queue.popleft()
+            self.rejected += 1
+        queue.append(o)
 
     def update(self):
         self.observe_driver_station()
         drive = self.integrate()
-        if self.first_ns is not None and self.seed_trusted:
+        if self.first_ns is not None and self.seed_alliance is not None:
+            if (self.seed_alliance != self.seeded_alliance
+                    and not self.vision_localized):
+                self.apply_seed()
             self.localized = True
-        for name, camera in self.cameras:
-            if camera.updated:
-                self.observe(camera.value, name)
+        # Every queued observation, oldest capture first (stable: ties keep
+        # camera, then arrival order).
+        batch = sorted(
+            ((o.sample_time_ns, camera, o)
+             for camera, queue in self.pending.items() for o in queue),
+            key=operator.itemgetter(0))
+        for queue in self.pending.values():
+            queue.clear()
+        for _, camera, o in batch:
+            self.observe(o, camera)
         pose = self.backend.pose() if self.first_ns is not None else Pose2d()
         self.state.send(
             sample_time_ns=self.latest_ns,
@@ -474,11 +538,35 @@ class PoseEstimator:
             observation_rejected_count=self.rejected)
 
     def observe_driver_station(self):
-        # Missing/stale/detached DS data reads disabled, but cannot authorize
-        # the configured seed. A later disable cannot trust an enabled-first
-        # restart's seed, nor can a mode change revoke established localization.
-        if self.seed_trusted is None and self.ds.connected:
-            self.seed_trusted = not self.ds.enabled
+        """Decides the startup seed. Missing/stale/detached DS data reads
+        disabled, but cannot authorize it, nor can a disabled view without a
+        known alliance. The first enabled view closes the decision: a later
+        disable cannot trust an enabled-first restart's seed, and nothing
+        revokes established localization."""
+        if not self.seed_open or not self.ds.connected:
+            return
+        if self.ds.enabled:
+            self.seed_open = False
+            return
+        alliance = self.ds.alliance
+        if alliance in _KNOWN_ALLIANCES:
+            self.seed_alliance = alliance
+
+    def apply_seed(self):
+        """Restarts the backend at seed_alliance's seed moved by all odometry
+        integrated since startup. Both backends dead-reckon their samples
+        from the configured (blue-origin) seed, so the blue estimate is the
+        newest sample's odometry; red is that pose rotated by pi about the
+        field centre, which carries the seed and the motion since alike.
+        Observations fused before the seed was trusted are discarded with
+        the previous estimate."""
+        pose = self.backend.samples[-1].odometry
+        if self.seed_alliance == talos.Alliance.RED:
+            pose = Pose2d(self.field_length_m - pose.X(),
+                          self.field_width_m - pose.Y(),
+                          pose.rotation() + Rotation2d(math.pi))
+        self.backend.reset(self.backend.yaw, self.backend.positions, pose)
+        self.seeded_alliance = self.seed_alliance
 
     def integrate(self):
         """Folds in a new drivetrain sample; returns the drivetrain state
@@ -522,8 +610,6 @@ class PoseEstimator:
         return d
 
     def observe(self, o, camera):
-        if not o.valid or o.tag_count < 1:
-            return
         if self.acceptable(o, camera) and self.backend.add_observation(
                 o.sample_time_ns / _NS,
                 Pose2d(o.pose_x_m, o.pose_y_m, Rotation2d(o.pose_yaw_rad)),
@@ -559,7 +645,7 @@ class PoseEstimator:
         pose = Pose2d(o.pose_x_m, o.pose_y_m, Rotation2d(o.pose_yaw_rad))
         if not self.localized:
             if self.relocalizes(o.sample_time_ns, reference_time, pose, camera):
-                self.localized = True
+                self.localized = self.vision_localized = True
             return True  # never gate a field observation against an untrusted seed
         reference = self.backend.pose_at(reference_time)
         if self.poses_agree(pose, reference):
@@ -567,6 +653,7 @@ class PoseEstimator:
             return True
         if not self.relocalizes(o.sample_time_ns, reference_time, pose, camera):
             return False
+        self.vision_localized = True
         # A confirmed new pose: the backend restarts there (moved by the
         # odometry since, to the newest sample), so the evidence for the old
         # pose cannot outvote it.

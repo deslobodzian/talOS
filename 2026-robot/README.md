@@ -50,7 +50,7 @@ whereas positive collection stops when a piece breaks the beam. It then stops
 the shooter and drives toward the configured waypoint with bounded field-frame
 position/heading feedback rotated into robot coordinates. The waypoint is in
 blue-origin coordinates; Red rotates both translation and heading by pi about
-the field centre (configure the estimator's starting pose consistently). Invalid,
+the field centre, as the estimator does with its blue-origin starting pose. Invalid,
 unlocalized or stale pose stops drive and collection immediately; stale intake
 feedback inhibits collection. Reaching the waypoint releases all lanes until mode
 exit. Feed counts only commanded feeding time and continuously requires matching

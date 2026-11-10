@@ -256,7 +256,10 @@ virtual-clock timer schedule and recorded inputs, so backend rows of one run
 compare identical inputs:
 
 - **odometry-only** and **fused** replay the baseline session. Only
-  **odometry-only** disables camera subscriptions.
+  **odometry-only** withholds camera observations: it keeps the estimator's
+  camera subscriptions (whose callbacks set its 1 ms drain, and so which
+  drivetrain sample each `update()` sees) but remaps them to unrecorded
+  topics.
 - **fused-live** is the original live baseline session, including the
   mount-error preset. It runs the backend configured in
   `subsystems/pose_estimator.toml` and has only that backend's row.
@@ -285,8 +288,8 @@ Live and replay configs flatten `robot_physics_sim.toml` onto `robot.toml`,
 preserving all non-include override tables with `tomllib`. Live overlays add
 mount errors and timing settings; each fused replay reuses its session's live
 overlay plus `[subsystems.pose_estimator] backend`, while odometry replay sets
-`[subsystems.pose_estimator] cameras = []` and `backend` with no camera-error
-overlay. Mount/timing errors cannot affect odometry-only replay.
+`backend` and `[subsystems.pose_estimator.remap]` `/<camera>/state` to
+`/<camera>/state/none`, with no camera-error overlay. Mount/timing errors cannot affect odometry-only replay.
 Physics overrides have one source and no whole robot/subsystem files are copied.
 Replay reuses the session ID solely so the log merger aligns records with
 the original camera/drivetrain logs; output logs stay in separate `*-replay`

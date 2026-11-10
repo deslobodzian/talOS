@@ -28,6 +28,9 @@ estimator = talos.load(os.path.join(HERE, "pose_estimator.py"))
 
 BACKENDS = ("kalman", "factor_graph")
 DT = 0.02
+# The estimator's field-size defaults (the 2026 tag layout).
+FIELD_LENGTH_M = 16.541
+FIELD_WIDTH_M = 8.069
 # 2026 robot layout, in [subsystems.drivetrain.geometry].modules order.
 MODULES = ((-0.30, 0.30), (-0.30, -0.30), (0.30, 0.30), (0.30, -0.30))
 
@@ -127,14 +130,15 @@ class Chassis:
 
 class EstimatorTest(unittest.TestCase):
     def start(self, backend, *, enabled=False, driver_station=True,
-              attached=True, **config):
+              attached=True, alliance=talos.Alliance.BLUE, **config):
         self.sim = Sim.from_toml(robot_toml(backend, **config))
         self.node = self.sim.add(estimator.PoseEstimator, "pose_estimator")
         self.hw = SimHardware(self.sim)
         self.hw.enable(enabled)
         if driver_station:
             self.hw.set_driver_station(
-                enabled=enabled, teleop=True, attached=attached)
+                enabled=enabled, teleop=True, attached=attached,
+                alliance=alliance)
         self.chassis = Chassis(self.sim)
         self.sim.step(DT)  # sample time 0 means "unknown"
         self.chassis.publish()
@@ -144,6 +148,13 @@ class EstimatorTest(unittest.TestCase):
     def assertPoseHeld(self, held):
         for value, expected in zip(self.pose(), held):
             self.assertAlmostEqual(value, expected, delta=1e-9)
+
+    def assertPose(self, expected, delta=1e-4):
+        x, y, yaw = self.pose()
+        self.assertAlmostEqual(x, expected[0], delta=delta)
+        self.assertAlmostEqual(y, expected[1], delta=delta)
+        self.assertAlmostEqual(math.remainder(yaw - expected[2], 2 * math.pi),
+                               0.0, delta=delta)
 
     def estimate(self):
         return self.sim.latest(PoseEstimate, topics.STATE)
@@ -242,7 +253,8 @@ class EstimatorTest(unittest.TestCase):
         for backend in BACKENDS:
             with self.subTest(backend=backend):
                 chassis = self.start(backend, enabled=True)
-                self.hw.set_driver_station(enabled=False, teleop=True)
+                self.hw.set_driver_station(enabled=False, teleop=True,
+                                           alliance=talos.Alliance.BLUE)
                 for index in range(5):
                     self.observe(x=6.0, std=(0.001, 0.001, 0.001))
                     chassis.hold(DT)
@@ -314,7 +326,8 @@ class EstimatorTest(unittest.TestCase):
                     self.hw.set_driver_station(enabled=True, teleop=True)
                     chassis.hold(DT)
                     self.assertFalse(self.estimate().localized)
-                    self.hw.set_driver_station(enabled=False, teleop=True)
+                    self.hw.set_driver_station(enabled=False, teleop=True,
+                                               alliance=talos.Alliance.BLUE)
                     chassis.hold(DT)
                     self.assertFalse(self.estimate().localized)
 
@@ -323,11 +336,55 @@ class EstimatorTest(unittest.TestCase):
             with self.subTest(backend=backend):
                 chassis = self.start(backend, driver_station=False)
                 self.assertFalse(self.estimate().localized)
-                self.hw.set_driver_station(enabled=False, teleop=True)
+                self.hw.set_driver_station(enabled=False, teleop=True,
+                                           alliance=talos.Alliance.BLUE)
                 # A DS packet published on a tick boundary can be polled just
                 # after that update; allow the following update to publish it.
                 chassis.hold(2 * DT)
                 self.assertTrue(self.estimate().localized)
+
+    def test_seed_follows_the_alliance_until_enabled(self):
+        """The configured seed is the blue-origin pose: untrusted until a
+        disabled Driver Station names an alliance, field-flipped on red (as
+        autonomous flips its targets), re-decided by an alliance change while
+        disabled, and fixed from the first enabled view."""
+        seed = (2.0, 3.0, 0.5)
+        red = (FIELD_LENGTH_M - seed[0], FIELD_WIDTH_M - seed[1],
+               seed[2] + math.pi)
+        push = 0.2  # metres pushed forward while disabled, robot frame
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(
+                    backend, alliance=talos.Alliance.UNKNOWN,
+                    extra=f"initial_x_m = {seed[0]}\ninitial_y_m = {seed[1]}\n"
+                          f"initial_yaw_rad = {seed[2]}")
+                chassis.hold(2 * DT)
+                self.assertTrue(self.estimate().valid)
+                self.assertFalse(self.estimate().localized)
+                self.hw.set_driver_station(enabled=False, teleop=True,
+                                           alliance=talos.Alliance.RED)
+                chassis.hold(2 * DT)
+                self.assertTrue(self.estimate().localized)
+                self.assertPose(red)
+                self.assertEqual(self.counts(), (0, 0))
+                # Motion since startup is kept, mirrored with the seed.
+                chassis.drive(1.0, 0.0, 0.0, push)
+                self.assertPose((red[0] + push * math.cos(red[2]),
+                                 red[1] + push * math.sin(red[2]), red[2]))
+                self.hw.set_driver_station(enabled=False, teleop=True,
+                                           alliance=talos.Alliance.BLUE)
+                chassis.hold(2 * DT)
+                blue = (seed[0] + push * math.cos(seed[2]),
+                        seed[1] + push * math.sin(seed[2]), seed[2])
+                self.assertPose(blue)
+                self.hw.set_driver_station(enabled=True, teleop=True,
+                                           alliance=talos.Alliance.BLUE)
+                chassis.hold(2 * DT)
+                self.hw.set_driver_station(enabled=False, teleop=True,
+                                           alliance=talos.Alliance.RED)
+                chassis.hold(2 * DT)
+                self.assertTrue(self.estimate().localized)
+                self.assertPose(blue)
 
     def test_localization_survives_enable_disable_ds_loss_and_stale_odometry(self):
         for backend in BACKENDS:
@@ -527,6 +584,27 @@ class EstimatorTest(unittest.TestCase):
                 x, y, yaw = self.pose()
                 self.assertLess(math.hypot(x - new[0], y - new[1]), 0.1)
                 self.assertAlmostEqual(yaw, new[2], delta=0.02)
+
+    def test_every_observation_between_ticks_is_fused(self):
+        """Frames arriving faster than update() runs are all fused; an
+        invalid frame after them hides none."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(backend)
+                chassis.drive(1.0, 0.0, 0.0, 0.2, slip=0.9)
+                truth = chassis.x
+                drift = truth - self.pose()[0]
+                self.assertGreater(drift, 0.01)
+                # One camera, three frames before the next update(): the
+                # newer valid one published first, then the older, then an
+                # invalid frame.
+                for age_s in (0.0, DT):
+                    self.observe(age_s=age_s, x=truth - 1.0 * age_s, y=0.0,
+                                 yaw=0.0, std=(0.01, 0.01, 0.01))
+                self.observe(valid=False)
+                chassis.drive(1.0, 0.0, 0.0, DT, slip=0.9)
+                self.assertEqual(self.counts(), (2, 0))
+                self.assertLess(chassis.x - self.pose()[0], 0.5 * drift)
 
     def test_invalid_and_no_tag_camera_states_are_not_measurements(self):
         for backend in BACKENDS:
@@ -914,9 +992,9 @@ class BinaryTest(unittest.TestCase):
                     self.assertGreater(estimates[-1]["pose_yaw_rad"], 0.4)
 
                     # (c) Delayed vision shifts the estimate toward observation.
-                    # The DS listener uses POLL delivery: a publication on an
-                    # update boundary may be observed on the next update.
-                    # Locate the acceptance transition, not a fixed tick index.
+                    # A camera callback queues an observation published on an
+                    # update boundary for the next update(): locate the
+                    # acceptance transition, not a fixed tick index.
                     accepted_index = next(
                         (index for index, estimate in enumerate(estimates)
                          if estimate["observation_accepted_count"] > 0), None)

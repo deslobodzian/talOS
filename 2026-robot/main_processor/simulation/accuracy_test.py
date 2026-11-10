@@ -194,9 +194,11 @@ class AccuracyScenarioTest(unittest.TestCase):
                 with self.subTest(backend=backend):
                     fused = metrics[("fused", backend)]
                     odometry = metrics[("odometry-only", backend)]
-                    # These rows share virtual timer firings as well as
-                    # recorded input payloads. The live source is separately
-                    # subject to host scheduling.
+                    # These rows share virtual timer firings, recorded input
+                    # payloads and delivery (the odometry-only replay keeps
+                    # the camera subscriptions, remapped to unrecorded
+                    # topics). The live source is separately subject to host
+                    # scheduling.
                     self.assertEqual(fused.samples, odometry.samples, table)
                     improvement = odometry.position_rms_m - fused.position_rms_m
                     print(f"{backend} paired fusion position RMS improvement: "

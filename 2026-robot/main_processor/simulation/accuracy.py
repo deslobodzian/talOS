@@ -461,9 +461,16 @@ def configured_backend(physics_config):
 
 
 def replay_config(physics_config, backend):
-    # The replay has no camera consumers and receives no mounting-error overlay.
-    return overlay_config(physics_config, {
-        "pose_estimator": {"cameras": [], "backend": backend}})
+    """Odometry-only replay: the fused replays' estimator, cameras and all,
+    with each camera topic remapped to one no session records, so no
+    observation arrives. Dropping the cameras instead would drop their
+    callback subscriptions and with them the 1 ms drain that decides which
+    drivetrain sample each update() sees: the pair would no longer share
+    inputs. No mounting-error overlay; nothing reads a camera's mount."""
+    return overlay_config(physics_config, {"pose_estimator": {
+        "backend": backend,
+        "remap": {f"/{camera}/state": f"/{camera}/state/none"
+                  for camera in CAMERAS}}})
 
 
 def scenario_config(physics_config, min_yaw_std_rad=None,
