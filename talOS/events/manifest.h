@@ -46,7 +46,7 @@ struct Registration {
   std::uint32_t alignment{0};
   std::int64_t period_ns{0};
   std::int64_t offset_ns{0};
-  bool armed{false};  // offset_ns is the initial absolute monotonic deadline.
+  bool armed{false};  // offset_ns: the first deadline minus the loop's origin.
   // The topic's schema (talOS/schema/identity.h); empty for a timer. Its
   // name and hash take part in ==, its bfbs bytes do not.
   schema::Identity schema;

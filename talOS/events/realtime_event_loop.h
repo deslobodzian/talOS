@@ -112,6 +112,13 @@ class RealtimeEventLoop
     this->begin_run();
 
     MonotonicTime now = Poller::now();
+    // The schedule set up before the run counts from here rather than from
+    // the origin: what ran between construction and run() (a node's config,
+    // imports and device setup) is not lateness, and would otherwise be
+    // reported as the first dispatch's latency and missed periods. Firings
+    // are recorded at the deadlines used and replay takes them from the log,
+    // so the manifest's origin-relative offsets and replay are unchanged.
+    scheduler_.shift(now - this->start_time());
     const bool poll = options_.delivery == Delivery::POLL;
     if (poll) {
       scheduler_.schedule(INTERNAL_POLL_TIMER_ID, now + options_.tick_period,

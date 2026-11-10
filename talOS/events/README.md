@@ -134,6 +134,14 @@ fact about when the machine booted, and recording one would force every replay
 to be handed the original run's numbers by hand. Missing setup, or a changed
 period or phase, is rejected before any dispatch.
 
+The realtime loop runs that schedule from the moment `run()` starts: a timer
+armed for the origin plus 1 ms first comes due 1 ms into the run. Whatever ran
+between construction and `run()` (a node's config parsing, imports, device
+setup) is therefore not reported as the first dispatch's `latency()`, missed
+periods or `SourceCounters::max_latency_ns`. The log records each firing at
+the deadline the loop used, and replay takes firings from the log, so replay is
+unaffected.
+
 After `run()` starts, `monotonic_now()` outside a dispatch returns the loop's
 current time instead, so a harness stepping a simulation sees time where it left
 it. Inside a dispatch it is always the frozen recorded `now`, which is the only

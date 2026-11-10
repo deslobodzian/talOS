@@ -49,7 +49,7 @@ struct FileHeader {
   std::uint32_t version;
   std::uint32_t header_bytes;  // sizeof(FileHeader), for forward compat
   std::uint64_t session_id;
-  std::int64_t start_monotonic_ns;  // loop start on the recording timeline
+  std::int64_t start_monotonic_ns;  // the loop's origin, recording timeline
   std::int64_t start_wall_ns;       // informational only, ignored by replay
   std::uint32_t manifest_count;
   std::uint32_t crc32;  // over the manifest block, then the schema block

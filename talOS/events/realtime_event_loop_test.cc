@@ -99,6 +99,27 @@ TEST(RealtimeEventLoop, ResamplesClockAfterEachDueTimerCallback) {
   EXPECT_GE(second_observed, first_finished);
 }
 
+// A node builds its loop, then spends a while in setup (config, imports,
+// devices) before run(). Its schedule counts from the run's start, so the
+// worst lateness the loop reports is the run's own, not that setup.
+TEST(RealtimeEventLoop, SetupBeforeTheRunIsNotReportedAsLateness) {
+  RealtimeEventLoop<> loop;
+  std::vector<Context> ticks;
+  auto handler = [&](const Context& context) {
+    ticks.push_back(context);
+    if (ticks.size() == 3) loop.exit();
+  };
+  const auto id = loop.register_timer("tick", make_thunk(&handler));
+  loop.arm_timer(id, loop.monotonic_now() + 5ms, 5ms);
+  std::this_thread::sleep_for(100ms);
+  const MonotonicTime run_start = Poller::now();
+  loop.run_for(5s);  // Bound only; exits after three ticks.
+  const Duration ran = Poller::now() - run_start;
+  ASSERT_EQ(ticks.size(), 3u);
+  EXPECT_GE(ticks.front().event_time, run_start + 5ms);
+  EXPECT_LT(loop.source_counters()[id].max_latency_ns.load(), ran.count());
+}
+
 TEST(RealtimeEventLoop, LatestBacklogDispatchesNewestWithPublicationAge) {
   const std::string topic = "/latest_" + std::to_string(::getpid());
   RealtimeEventLoop<> loop;
