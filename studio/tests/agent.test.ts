@@ -151,6 +151,21 @@ test('RPC answers NaN and infinities as readings and integers as numbers when ex
                    [[at(0), at(0)], [at(3), at(3)], [at(5), at(5)]]);
   assert.deepEqual(ranges({op: 'lte', value: 0}), [[at(4), at(4)]]);
   assert.deepEqual(ranges({op: 'changed'}), [[at(1), at(1)], [at(3), at(5)]]);
+  // A scan accepts the spellings an answer used: eq "NaN" finds the NaN
+  // readings rather than comparing them to a string.
+  assert.deepEqual(ranges({op: 'eq', value: 'NaN'}), [[at(1), at(2)]]);
+  assert.deepEqual(ranges({op: 'ne', value: 'NaN'}),
+                   [[at(0), at(0)], [at(3), at(5)]]);
+  assert.deepEqual(ranges({op: 'eq', value: '-Infinity'}), [[at(4), at(4)]]);
+  assert.deepEqual(ranges({op: 'ne', value: '-Infinity'}),
+                   [[at(0), at(3)], [at(5), at(5)]]);
+
+  // The schema tree labels channels by kind and lists no decoder internals.
+  const tree = (dispatch(ctx(timeline), 'get_schema_tree') as any).topics;
+  assert.equal(tree['test/state/x'], 'double');
+  assert.equal(tree['test/state/count'], 'uint');
+  assert.ok(!Object.keys(tree).some(
+      name => name.startsWith('exact.') || name.startsWith('kinds.')));
 });
 test('RPC exposes the same derived pose-error series stored in history', () => {
   const timeline = history();

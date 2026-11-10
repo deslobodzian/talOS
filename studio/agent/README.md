@@ -43,7 +43,7 @@ samples without interpolation.
 | Method | Parameters | Result |
 |---|---|---|
 | `get_latest` | `{}` | Latest snapshot, also under `snapshot`, plus `age_ms` and `age_ns` since timeline arrival; both are null when the latest sample is the keyframe the bridge sends on connect, whose values may be arbitrarily old |
-| `get_schema_tree` | `{}` | Observed leaf paths and JavaScript types, direct channel aliases, retained bounds, frame count and timestamp encoding |
+| `get_schema_tree` | `{}` | Observed leaf paths and JavaScript types, direct channel aliases labelled with their kind (`double`, `int`, `uint`, `bool`; values as a snapshot spells them), retained bounds, frame count and timestamp encoding |
 | `query_state_at` | `timestamp_ns`, optional `topics`, optional `mode` | Snapshot, or timestamped topic map; mode defaults to `exact`, with `at_or_before` selecting the preceding sample |
 | `scan_channel_events` | `topic`, `condition`, optional inclusive `start_ns` / `end_ns` | Contiguous matching retained-sample ranges with inclusive endpoints and sample counts |
 | `get_system_graph` | `{}` | Last received live graph, source event rates and topic-health summary, plus `age_ms` since the bridge last spoke about it and `stale` |
@@ -62,7 +62,9 @@ fields use dot paths such as `chassis.x`.
 
 Scan conditions have `op` and, for comparisons, `value`. Supported operators:
 `gt`, `gte`, `lt`, `lte`, `eq`, `ne`, `changed`, `rising`, `falling`. Integer
-channels compare exactly against an integer `value`. NaN matches no ordering
+channels compare exactly against an integer `value`. For `eq` and `ne`, a
+`value` of `"NaN"`, `"Infinity"` or `"-Infinity"` names that reading, as
+answers spell it, and `eq "NaN"` matches NaN. NaN matches no ordering
 comparison, and NaN following NaN is not `changed`. Rising and
 falling compare truthiness, not numeric slope. Edge comparisons use the preceding
 retained sample even when it is before `start_ns`. Missing packets are not

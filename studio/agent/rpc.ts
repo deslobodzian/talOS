@@ -141,9 +141,23 @@ function compare(value: unknown, limit: number): number|null {
   return value < limit ? -1 : value > limit ? 1 : 0;
 }
 
+// The readings an answer spells as strings (see `answer`), as an equality
+// limit names them.
+const SPELLED: Record<string, number> = {
+  NaN: NaN,
+  Infinity: Infinity,
+  '-Infinity': -Infinity
+};
+
 // Equality with an exact integer string accepts the same integer as a
-// number or as its decimal string.
+// number or as its decimal string; a limit spelled as `answer` spells NaN or
+// an infinity names that reading, and NaN equals NaN.
 function same(value: unknown, limit: unknown): boolean {
+  if (typeof limit === 'string' && Object.hasOwn(SPELLED, limit)) {
+    const special = SPELLED[limit];
+    return typeof value === 'number' &&
+        (Number.isNaN(special) ? Number.isNaN(value) : value === special);
+  }
   if (typeof value === 'string' && typeof limit === 'number' &&
       Number.isInteger(limit) && /^-?\d+$/.test(value))
     return BigInt(value) === BigInt(limit);
@@ -214,6 +228,10 @@ export function dispatch(
     };
   }
 
+  // A channel is labelled with its kind, which says what its answers hold:
+  // `double` is a number or "NaN", "Infinity", "-Infinity"; `int` and `uint`
+  // a number, or a decimal string beyond 2^53. The frame's `exact` and
+  // `kinds` maps are how the decoder carries that, not topics.
   if (method === 'get_schema_tree') {
     const topics: Record<string, string> = {};
     function walk(value: unknown, prefix: string) {
@@ -224,8 +242,12 @@ export function dispatch(
         topics[prefix] = typeof value;
     }
     for (const frame of timeline.frames) {
-      walk(frame, '');
-      for (const name of Object.keys(frame.channels)) topics[name] = 'number';
+      const {exact: _exact, kinds, ...rest} = frame;
+      walk(rest, '');
+      for (const name of Object.keys(frame.channels))
+        topics[name] = kinds && Object.hasOwn(kinds, name) ?
+            KIND_NAMES[kinds[name]] ?? 'unknown' :
+            'double';
     }
     return {
       topics,
