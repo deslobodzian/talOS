@@ -91,24 +91,8 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
       tracker.period_us = static_cast<uint32_t>(
           (*tbl)["period_us"].value_or(config_.period_us));
     }
-    // Owner timeout. Upper side: the merged command carries the oldest
-    // observation of any live owner, and the gateway invalidates every
-    // output (a new epoch) once that is command_timeout_us old, so a silent
-    // owner must leave the merge before then. That holds while its last
-    // request's observation was younger than command_timeout_us minus this
-    // timeout when accepted. The configuration refuses an actuator owner
-    // whose period exceeds a quarter of the timeout, so 2 x period_us never
-    // exceeds half of it and every validated owner's timeout is exactly half
-    // the timeout: a silent owner whose last observation was younger than
-    // that leaves the merge in time; one with an older observation stops
-    // every output, the cost of tolerating request gaps up to half the
-    // timeout (INC-6). Lower side: one late or missed tick must not brake the
-    // subsystem, so never less than two of its periods; with the clamp to
-    // the whole timeout, that bound only matters for an unvalidated config.
-    const uint64_t timeout_us = config_.command_timeout_us;
-    const uint64_t floor_us =
-        std::max(2 * static_cast<uint64_t>(tracker.period_us), timeout_us / 2);
-    tracker.timeout_us = std::min(floor_us, timeout_us);
+    tracker.merge.timeout_us =
+        OwnerTimeoutUs(tracker.period_us, config_.command_timeout_us);
     subsystems_[name] = std::move(tracker);
   }
   IndexActuators();
@@ -509,17 +493,13 @@ void HardwareNode::Tick(uint64_t now_us) {
           full_cmd_.config_id = partial.config_id;
           full_cmd_.boot_id = partial.boot_id;
           full_cmd_.epoch = partial.epoch;
-          tracker.last_seen_us = now_us;
-          tracker.last_observed_time_us = partial.observed_time_us;
-          tracker.timed_out = false;
+          tracker.merge.Accept(now_us, partial.observed_time_us);
         }
       }
     }
 
     // Owner timeout, on the bridge clock since the last accepted request.
-    if (tracker.last_seen_us == 0 ||
-        (now_us - tracker.last_seen_us > tracker.timeout_us)) {
-      tracker.timed_out = true;
+    if (tracker.merge.Expire(now_us)) {
       // Neutralize actuators owned by this subsystem
       for (auto j : tracker.motor_slots) {
         full_cmd_.motors[j].mode = Mode::kNeutral;
@@ -542,19 +522,11 @@ void HardwareNode::Tick(uint64_t now_us) {
   // subsystem must not make a quiet one's cached demand look current, and a
   // timed-out subsystem stops pinning the merge once neutralized.
   {
-    bool have_active_observed = false;
-    uint64_t min_observed_us = 0;
-    for (const auto& [name, tracker] : subsystems_) {
-      if (!tracker.timed_out) {
-        if (!have_active_observed ||
-            tracker.last_observed_time_us < min_observed_us) {
-          min_observed_us = tracker.last_observed_time_us;
-          have_active_observed = true;
-        }
-      }
-    }
-    if (have_active_observed) {
-      full_cmd_.observed_time_us = min_observed_us;
+    if (const auto merged = MergedObservationUs(
+            subsystems_, [](const auto& entry) -> const MergeOwner& {
+              return entry.second.merge;
+            })) {
+      full_cmd_.observed_time_us = *merged;
     }
     if (!any_subsystem_active && last_sent_had_active_subsystem_) {
       full_cmd_.observed_time_us = latest_state_.sample_time_us;
@@ -605,7 +577,9 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
   uint32_t bit = 0;
   // subsystems_ is a std::map, so this walks the names in sorted order.
   for (const auto& [name, tracker] : subsystems_) {
-    if (bit < 32 && tracker.timed_out) timed_out_mask |= uint32_t{1} << bit;
+    if (bit < 32 && tracker.merge.timed_out) {
+      timed_out_mask |= uint32_t{1} << bit;
+    }
     ++bit;
   }
   uint32_t motor_fault_mask = 0;
@@ -751,7 +725,7 @@ int HardwareNode::Run(int duration_s) {
   for (const auto& [name, tracker] : subsystems_) {
     std::printf("hardware_node: sub=%s requests=%llu timed_out=%d\n",
                 name.c_str(), static_cast<unsigned long long>(tracker.requests),
-                tracker.timed_out ? 1 : 0);
+                tracker.merge.timed_out ? 1 : 0);
   }
   // A log that failed exits 1, as RunMain does for event-loop nodes.
   bool log_failed = false;
@@ -769,21 +743,8 @@ bool HardwareNode::HasRequestIdentity(const SubsystemTracker& tracker,
       partial.epoch != last_epoch_) {
     return false;
   }
-  // Gateway-clock age bound: both stamps are gateway clock, never
-  // differenced against bridge now_us. A
-  // request computed from sample N stays acceptable while newer samples
-  // arrive, until its age reaches the command timeout. The gateway
-  // re-enforces the same bound against its own now, so it stays the safety
-  // backstop.
-  if (partial.observed_time_us > last_sample_time_us_) return false;
-  if (last_sample_time_us_ - partial.observed_time_us >=
-      config_.command_timeout_us) {
-    return false;
-  }
-  // Per-subsystem monotonic acceptance: old demands cannot replay, even
-  // within the age bound. Equal re-publishes from the same sample are fine.
-  if (partial.observed_time_us < tracker.last_observed_time_us) return false;
-  return true;
+  return tracker.merge.Admits(partial.observed_time_us, last_sample_time_us_,
+                              config_.command_timeout_us);
 }
 
 bool HardwareNode::OwnsRequestDevices(const SubsystemTracker& tracker,
@@ -824,9 +785,7 @@ void HardwareNode::NeutralizeAll() {
 void HardwareNode::InvalidateRequests() {
   NeutralizeAll();
   for (auto& [name, tracker] : subsystems_) {
-    tracker.last_seen_us = 0;
-    tracker.last_observed_time_us = 0;
-    tracker.timed_out = true;
+    tracker.merge.Reset();
   }
   // Force the next merged command onto the wire even if its demands happen
   // to equal the pre-transition ones: the identity headers differ, but the

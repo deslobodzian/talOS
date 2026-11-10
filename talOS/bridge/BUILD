@@ -30,6 +30,15 @@ cc_library(
     deps = [":boot_history"],
 )
 
+# The request merge rules (owner timeout, admission, merged observation),
+# also run by talos::testing::SimHardware when it plays the bridge.
+cc_library(
+    name = "merge",
+    srcs = ["merge.cc"],
+    hdrs = ["merge.h"],
+    visibility = ["//visibility:public"],
+)
+
 cc_library(
     name = "node_lib",
     srcs = ["node.cc"],
@@ -37,6 +46,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":clock_offset",
+        ":merge",
         ":messages",
         "//talOS/configuration",
         "//talOS/driver_station",

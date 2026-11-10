@@ -112,10 +112,12 @@ class SimHardwareTest : public ::testing::Test {
   SimHardware hw{sim};
 };
 
-TEST_F(SimHardwareTest, SilenceExpiresAllAppliedOutputsAtConfiguredDeadline) {
+// The bridge's owner timeout here is max(2 x 5 ms, 50 ms / 2) = 25 ms: a
+// silent node is held while its last request is at most that old.
+TEST_F(SimHardwareTest, SilenceExpiresAllAppliedOutputsAtTheOwnerTimeout) {
   hw.ideal_motors();
   Send("mech", Drive());
-  sim.step(49ms);
+  sim.step(25ms);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
   EXPECT_TRUE(hw.applied_digital_output("mech", "led"));
   EXPECT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.75);
@@ -127,6 +129,7 @@ TEST_F(SimHardwareTest, SilenceExpiresAllAppliedOutputsAtConfiguredDeadline) {
   EXPECT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kNeutral);
   EXPECT_FALSE(hw.applied_digital_output("mech", "led"));
   EXPECT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.0);
+  sim.step(4ms);  // the first hardware tick after the deadline
   EXPECT_NEAR(Motor("braked").velocity_rps, 40.0 * (1.0 - 0.005 / 0.05), 1e-12);
   EXPECT_NEAR(Motor("coasting").velocity_rps, 40.0 * (1.0 - 0.005 / 1.0),
               1e-12);
@@ -147,7 +150,7 @@ TEST_F(SimHardwareTest, OneNodesPublicationsCannotRefreshAnotherNodesRequest) {
   Send("mech", Drive());
   sim.step(20ms);
   Send("other", Drive("other"));
-  sim.step(30ms);
+  sim.step(6ms);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
   EXPECT_EQ(hw.applied_motor("other", "motor").mode, Mode::kVelocity);
   EXPECT_TRUE(hw.applied_digital_output("other", "other_led"));
@@ -164,9 +167,9 @@ TEST_F(SimHardwareTest, OneNodesPublicationsCannotRefreshAnotherNodesRequest) {
 TEST_F(SimHardwareTest, IdenticalPublicationRenewsOnlyItsOwnDeadline) {
   const auto command = Drive();
   Send("mech", command);
-  sim.step(25ms);
+  sim.step(10ms);
   Send("mech", command);
-  sim.step(49ms);
+  sim.step(25ms);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
   EXPECT_TRUE(hw.applied_digital_output("mech", "led"));
   EXPECT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.75);
@@ -181,16 +184,64 @@ TEST_F(SimHardwareTest,
   sim.step(
       1ms);  // Publish between hardware ticks; first collection is at 5 ms.
   Send("mech", Drive());
-  sim.step(48ms);
+  sim.step(24ms);
   EXPECT_EQ(hw.motor_request("mech", "braked").mode, Mode::kVelocity);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
   sim.step(1ms);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
   sim.step(1ms);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
-  sim.step(4ms);  // First hardware tick after the deadline also sees neutral.
+  sim.step(3ms);  // First hardware tick after the deadline also sees neutral.
   EXPECT_FALSE(State().digital_outputs[0].value);
   EXPECT_DOUBLE_EQ(State().pwm_outputs[0].output, 0.0);
+}
+
+// The merged command carries the oldest observation of any node still merged,
+// so a silent node whose last request observed an old State stops every
+// output once that observation is command_timeout_us old, as the gateway
+// does; only requests built from a State of the new epoch drive again.
+TEST_F(SimHardwareTest, SilentOwnerWithAnOldObservationStopsEveryOutput) {
+  const auto old = Drive();  // observed at 0 ms
+  sim.step(30ms);
+  Send("mech", old);  // admitted: 30 ms old, merged until 55 ms
+  for (int tick = 0; tick < 3; ++tick) {
+    Send("other", Drive("other"));
+    sim.step(5ms);
+  }
+  ASSERT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
+  ASSERT_EQ(hw.applied_motor("other", "motor").mode, Mode::kVelocity);
+  const auto before = Drive("other");
+  Send("other", before);
+  sim.step(5ms);  // 50 ms: the merged observation is 50 ms old
+  EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
+  EXPECT_EQ(hw.applied_motor("other", "motor").mode, Mode::kNeutral);
+  EXPECT_FALSE(hw.applied_digital_output("other", "other_led"));
+  EXPECT_DOUBLE_EQ(hw.applied_pwm("other", "other_servo"), 0.0);
+
+  Send("other", before);
+  EXPECT_EQ(hw.applied_motor("other", "motor").mode, Mode::kNeutral);
+  Send("other", Drive("other"));
+  EXPECT_EQ(hw.applied_motor("other", "motor").mode, Mode::kVelocity);
+  EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
+}
+
+// The merged-observation check is the gateway's, on its tick: an inspection
+// at the instant a merged observation turns command_timeout_us old, between
+// ticks, stops nothing when that owner has left the merge by the next tick.
+TEST_F(SimHardwareTest, InspectionBetweenTicksNeverInvalidates) {
+  sim.step(5ms);
+  hw.set_gateway_clock(0ms, 3ms);  // States sampled 3 ms before each tick
+  sim.step(5ms);
+  const auto old = Drive();  // observed at gateway 7 ms
+  sim.step(22ms);
+  Send("mech", old);  // 32 ms: merged through 57 ms, when 7 ms is 50 ms old
+  sim.step(25ms);
+  Send("other", Drive("other"));
+  EXPECT_EQ(hw.applied_motor("other", "motor").mode, Mode::kVelocity);
+  sim.step(3ms);  // 60 ms: the tick finds mech already out of the merge
+  EXPECT_EQ(State().epoch, 1u);
+  EXPECT_EQ(hw.applied_motor("other", "motor").mode, Mode::kVelocity);
+  EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
 }
 
 TEST_F(SimHardwareTest, LatestRequestNeutralizesOmittedOutputsButPreservesRaw) {
@@ -326,7 +377,8 @@ TEST_F(SimHardwareTest, ResetAndRebootRefuseRequestsAsTheGatewayDoes) {
   // A request built from the previous boot's State is ignored.
   hardware::Command old_boot = Drive();
   old_boot.motors[0].demand = 10.0;
-  hw.reboot();
+  hw.reboot();  // the rebooted gateway starts neutral
+  EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
   sim.step(5ms);
   Send("mech", old_boot);
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "braked").demand, 40.0);

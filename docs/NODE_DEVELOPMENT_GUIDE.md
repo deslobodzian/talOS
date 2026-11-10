@@ -362,16 +362,19 @@ false)` (the device reports disconnected), `reset_device(node, device)` (the
 gateway reports that motor, CANcoder or gyro reset and masks it, with its
 followers and remote-sensor consumers, for two States; any other name throws),
 `lose_states(count)` (the next gateway ticks publish nothing), `reboot()` (a
-new gateway boot id),
+new gateway boot id; every output neutral until a request built from it),
 `digital_output`, `pwm`.
 `LatestTarget<M>(sim, sub, source)` reads a lane a node under test wrote.
 
 `motor_request`, `digital_output`, and `pwm` retain each device's last
 explicitly requested value. Use `applied_motor`, `applied_digital_output`, and
-`applied_pwm` to inspect effective outputs: requests expire after
-`[robot] command_timeout_us` without publication, omitted outputs are neutral,
-and disabled hardware applies neutral outputs. As on the gateway, a request
-built from another boot's State is ignored, and a motor masked by
+`applied_pwm` to inspect effective outputs: requests merge by the bridge's
+rules (`//talOS/bridge:merge`), so a node's outputs go neutral at its
+[owner timeout](../ARCHITECTURE.md#the-tick) and every output stops, as the
+gateway's do, once the oldest observation of any node still merged is
+`command_timeout_us` old; omitted outputs are neutral, and disabled hardware
+applies neutral outputs. As on the bridge and gateway, a request built from
+another boot's or epoch's State is ignored, and a motor masked by
 `reset_device` applies neutral (so does a later request observed before the
 State that masked it); a motor disconnected with `set_connected` still
 applies its request. Inspection never refreshes

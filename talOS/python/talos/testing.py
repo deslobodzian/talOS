@@ -186,9 +186,13 @@ class SimHardware:
     retaining the 8-State convergence gate. hardware_sample_time_ns(node) is None
     until then, and subsequently gives the true simulated sample instant.
     In-process clock uncertainty and RTT are zero (no transport estimation).
-    Applied outputs expire after command_timeout_us without a publication;
-    omitted outputs and disabled hardware are neutral. Raw inspection
-    retains the last explicitly requested value for each device."""
+    Applied outputs merge by the bridge's rules: a node's outputs expire
+    once its last request is older than the bridge's owner timeout
+    (ARCHITECTURE.md, "The tick"), and every output stops at a gateway tick
+    that finds the oldest observation of any node still merged
+    command_timeout_us old; omitted outputs and disabled hardware are
+    neutral. Raw inspection retains the last explicitly requested value for
+    each device."""
 
     def __init__(self, sim):
         self._sim = sim  # outlives this
@@ -270,9 +274,10 @@ class SimHardware:
         _abi.ok(lib.talos_sim_hardware_lose_states(self._handle, int(count)))
 
     def reboot(self):
-        """A new gateway boot id from the next state on; the tick sequence,
-        the device reset count and the Driver Station mode generation start
-        over."""
+        """A new gateway boot id from the next state on; every applied output
+        is neutral until a request built from the new boot's state, and the
+        tick sequence, the device reset count and the Driver Station mode
+        generation start over."""
         _abi.ok(lib.talos_sim_hardware_reboot(self._handle))
 
     def set_driver_station(self, *, enabled=False, autonomous=False,

@@ -41,6 +41,7 @@ cc_library(
     deps = [
         ":devices",
         "//talOS/bridge:clock_offset",
+        "//talOS/bridge:merge",
         "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/driver_station",

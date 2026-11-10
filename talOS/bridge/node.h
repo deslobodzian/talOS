@@ -11,6 +11,7 @@
 
 #include "bridge/bridge_status_generated.h"
 #include "talOS/bridge/clock_offset.h"
+#include "talOS/bridge/merge.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/hardware/config.h"
@@ -35,17 +36,10 @@ struct SubsystemTracker {
   std::string name;
   Devices devices;
   uint32_t period_us{5000};
-  // How long the bridge keeps merging this subsystem's last request after it
-  // goes quiet: max(2 x period_us, command_timeout_us / 2), never more than
-  // command_timeout_us (HardwareNode's constructor explains the bound).
-  uint64_t timeout_us{0};
-  uint64_t last_seen_us{0};
-  bool timed_out{true};
-  // Last accepted Command::observed_time_us for this subsystem (gateway
-  // clock). Monotonic per subsystem: a request older than this is a replay
-  // and is rejected even when it is still within the age bound. Reset to 0
-  // on every controller transition alongside last_seen_us.
-  uint64_t last_observed_time_us{0};
+  // Its standing in the merge (merge.h): the owner timeout
+  // (OwnerTimeoutUs), last accepted request on the bridge clock and its
+  // observation on the gateway clock, reset on every controller transition.
+  MergeOwner merge;
   std::unique_ptr<ipc::Subscriber<talos::hardware::Packet>> subscriber;
 
   // Requests actually decoded off this subsystem's topic, and where that topic
@@ -85,7 +79,7 @@ class HardwareNode {
   }
   bool is_subsystem_timed_out(const std::string& name) const {
     auto it = subsystems_.find(name);
-    return it != subsystems_.end() && it->second.timed_out;
+    return it != subsystems_.end() && it->second.merge.timed_out;
   }
   const Command& current_command() const { return full_cmd_; }
   uint64_t identity_rejected() const { return identity_rejected_; }
@@ -136,12 +130,10 @@ class HardwareNode {
   static const std::vector<introspect::EndpointAttribute>& EndpointAttributes();
 
   // Whether a subsystem request may merge: same configuration, boot, and
-  // epoch as last observed (exact match), plus a bounded-age freshness check
-  // on the gateway clock: last_sample_time_us_ - observed_time_us must be
-  // below command_timeout_us (future observations rejected). Monotonic per
-  // subsystem: observed_time_us below the tracker's last accepted value is a
-  // replay and is rejected. The gateway re-enforces the age bound, so it
-  // remains the safety backstop.
+  // epoch as last observed (exact match), and an observation its MergeOwner
+  // admits against last_sample_time_us_ (MergeOwner::Admits: bounded age,
+  // never future, monotonic per subsystem). The gateway re-enforces the age
+  // bound, so it remains the safety backstop.
   bool HasRequestIdentity(const SubsystemTracker& tracker,
                           const Command& partial) const;
   // Whether every actuator a request addresses belongs to the subsystem that

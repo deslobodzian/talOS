@@ -21,14 +21,20 @@
 // it before the first step to have a state at time 0; later, the first state
 // goes out at that moment. Devices are keyed by (node, device) exactly as the
 // node names them.
-// Requests expire after [robot] command_timeout_us without a publication.
-// Each node's latest request replaces its whole applied output: omitted
-// devices are neutral, and disabled hardware applies only neutral outputs.
-// As on the gateway, a request built from another boot's State is ignored,
-// and a motor masked by reset_device() applies neutral, as does any later
-// request observed before the State that last masked it. Unlike the gateway,
-// a motor disconnected with set_connected() still applies its request, and
-// requests are not checked against the config id, epoch, motor limits or
+// Requests merge by the bridge's rules (talOS/bridge/merge.h): a node's
+// outputs go neutral once its last admitted request is older than the
+// bridge's owner timeout (ARCHITECTURE.md, "The tick"), and, as on the
+// gateway, every output goes neutral (a new epoch) at a gateway tick that
+// finds the oldest observation of any node still merged command_timeout_us
+// old. Each node's latest request replaces its whole
+// applied output: omitted devices are neutral, and disabled hardware applies
+// only neutral outputs. As on the bridge and gateway, a request built from
+// another boot's or epoch's State, or observed command_timeout_us before the
+// latest State, is ignored, and a motor masked by reset_device() applies
+// neutral, as does any later request observed before the State that last
+// masked it. Unlike the gateway, a motor disconnected with set_connected()
+// still applies its request, enabling or disabling does not start a new
+// epoch, and requests are not checked against the config id, motor limits or
 // soft limits.
 //
 // Each period it also publishes the bridge's /hw/status: the states and
@@ -120,10 +126,11 @@ class SimHardware {
   // but their States, Driver Station packets and /hw/status go nowhere, as
   // over a link outage.
   void lose_states(int count);
-  // A RoboRIO reboot: later states and Driver Station packets carry a new
-  // boot id, the tick sequence and device reset count start over, and the
-  // Driver Station mode generation restarts. Feedback and the gateway clock
-  // carry on.
+  // A RoboRIO reboot: every output goes neutral until a node sends a request
+  // built from a State of the new boot, later states and Driver Station
+  // packets carry a new boot id, the tick sequence and device reset count
+  // start over, and the Driver Station mode generation restarts. Feedback and
+  // the gateway clock carry on.
   void reboot();
 
   // The Driver Station packet to forward from now on, stamped with the sim
@@ -142,8 +149,9 @@ class SimHardware {
   bool digital_output(std::string_view node, std::string_view device) const;
   double pwm(std::string_view node, std::string_view device) const;
 
-  // Applied outputs after per-node expiry, omitted-output neutralization
-  // and the enabled gate. Inspecting outputs never refreshes a request.
+  // Applied outputs after per-node expiry, the gateway's merged-observation
+  // check, omitted-output neutralization and the enabled gate. Inspecting
+  // outputs never refreshes a request.
   hardware::MotorRequest applied_motor(std::string_view node,
                                        std::string_view device) const;
   bool applied_digital_output(std::string_view node,

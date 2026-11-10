@@ -16,6 +16,7 @@
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
 #include "talOS/bridge/clock_offset.h"
+#include "talOS/bridge/merge.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
 #include "talOS/hardware/packet.h"
@@ -50,6 +51,10 @@ constexpr double kNeutralStandstillRps = 0.01;
 // CANcoders and gyros share the sensors table, and so its ids.
 Kind TableOf(Kind kind) { return kind == Kind::kGyro ? Kind::kCANcoder : kind; }
 
+std::uint64_t Micros(Time time) {
+  return static_cast<std::uint64_t>(time.nanos() / 1000);
+}
+
 template <class Map>
 auto ValueOr(const Map& map, std::uint16_t id,
              typename Map::mapped_type fallback) {
@@ -79,10 +84,12 @@ struct SimHardware::Impl {
   std::map<std::uint16_t, double> pwm_outputs;
   std::map<std::uint16_t, bool> applied_digital_outputs;
   std::map<std::uint16_t, double> applied_pwm_outputs;
+  // One per actuator-owning subsystem, merged by the bridge's rules
+  // (talOS/bridge/merge.h) on sim-time microseconds.
   struct RequestTracker {
     std::string topic;
     std::uint64_t cursor = 0;
-    std::optional<Time> last_seen;
+    hardware::MergeOwner owner;
   };
   std::map<std::string, RequestTracker> requests;
   std::set<std::pair<Kind, std::uint16_t>> disconnected;
@@ -97,7 +104,13 @@ struct SimHardware::Impl {
   std::map<std::uint16_t, std::uint64_t> motor_reset_at;
   std::uint32_t device_reset_count = 0;
   std::uint64_t sequence = 0;  // gateway ticks this boot
-  int lost_states = 0;         // ticks whose State goes nowhere
+  // The gateway's epoch: Invalidate() moves it on, and a request built from
+  // a State of another epoch never merges.
+  std::uint64_t epoch = 1;
+  // Sample time of the latest State the bridge accepted this boot, against
+  // which a request's observation is admitted.
+  std::uint64_t latest_sample_us = 0;
+  int lost_states = 0;  // ticks whose State goes nowhere
   std::optional<driver_station::DriverStationData> ds_packet;
   driver_station::ModeTracker ds_mode;
   Duration gateway_offset{};
@@ -159,10 +172,13 @@ struct SimHardware::Impl {
     }
   }
 
-  // Every request each subsystem flushed since the last look, in order.
+  // Every request each subsystem flushed since the last look, in order,
+  // merged as the bridge merges them. Inspection calls this too, so it
+  // changes nothing the bridge would not on its own 1 ms tick.
   void Collect() {
-    for (const auto& [subsystem, devices] : config.subsystems) {
-      auto& tracker = requests.at(subsystem);
+    const std::uint64_t timeout_us = config.hardware.command_timeout_us;
+    for (auto& [subsystem, tracker] : requests) {
+      const hardware::Devices& devices = config.subsystems.at(subsystem);
       const std::uint64_t count =
           SimAccess::message_count(sim, tracker.topic, sizeof(Packet));
       for (; tracker.cursor < count; ++tracker.cursor) {
@@ -171,10 +187,18 @@ struct SimHardware::Impl {
                             &packet);
         hardware::Command command{};
         if (!hardware::Decode(packet.bytes(), command)) continue;
-        // The gateway rejects a request built from another boot's State.
-        if (command.boot_id != boot_id) continue;
-        tracker.last_seen = SimAccess::publish_time(
-            sim, tracker.topic, sizeof packet, tracker.cursor);
+        // Like the bridge, a request built from another boot's or epoch's
+        // State, or with an observation its owner does not admit, never
+        // merges and does not keep its owner merged.
+        if (command.boot_id != boot_id || command.epoch != epoch ||
+            !tracker.owner.Admits(command.observed_time_us, latest_sample_us,
+                                  timeout_us)) {
+          continue;
+        }
+        tracker.owner.Accept(
+            Micros(SimAccess::publish_time(sim, tracker.topic, sizeof packet,
+                                           tracker.cursor)),
+            command.observed_time_us);
         // Like the bridge, each request replaces this node's entire output.
         // Raw inspection still retains the last explicitly requested values.
         Neutralize(devices);
@@ -203,11 +227,37 @@ struct SimHardware::Impl {
               command.pwm_outputs[i].output;
         }
       }
-      if (!enabled || !tracker.last_seen ||
-          sim.now() - *tracker.last_seen >=
-              std::chrono::microseconds{config.hardware.command_timeout_us}) {
+      if (tracker.owner.Expire(Micros(sim.now())) || !enabled) {
         Neutralize(devices);
       }
+    }
+  }
+
+  // The gateway's tick: the merged command carries the oldest observation of
+  // any owner still merged, and the gateway invalidates every output once
+  // that is command_timeout_us old (or from its future). Only Publish() runs
+  // it, so inspecting outputs between ticks never invalidates.
+  void CheckMergedObservation() {
+    if (!enabled) return;
+    const auto merged = hardware::MergedObservationUs(
+        requests, [](const auto& entry) -> const hardware::MergeOwner& {
+          return entry.second.owner;
+        });
+    const std::uint64_t now_us = GatewayUs();
+    if (merged && (*merged > now_us ||
+                   now_us - *merged >= config.hardware.command_timeout_us)) {
+      Invalidate();
+    }
+  }
+
+  // The gateway's Invalidate, and the bridge's answer to its new epoch:
+  // every output neutral, every owner out of the merge until it sends a
+  // request built from a State of the new epoch.
+  void Invalidate() {
+    ++epoch;
+    for (auto& [subsystem, tracker] : requests) {
+      tracker.owner.Reset();
+      Neutralize(config.subsystems.at(subsystem));
     }
   }
 
@@ -263,6 +313,7 @@ struct SimHardware::Impl {
 
   void Publish() {
     Collect();
+    CheckMergedObservation();
     if (ideal) ApplyIdealMotors();
     MaskResets();
     const auto& hw = config.hardware;
@@ -271,7 +322,7 @@ struct SimHardware::Impl {
     state.boot_id = boot_id;
     state.sequence = ++sequence;
     state.counters.device_reset_count = device_reset_count;
-    state.epoch = 1;
+    state.epoch = epoch;
     state.sample_time_us = GatewayUs(latency);
     // The gateway neutralizes a motor in the tick that masks it.
     for (const auto& [kind, id] : masked) {
@@ -375,8 +426,9 @@ struct SimHardware::Impl {
 
     // In-process SimHardware knows the exact clock relation. Keep the normal
     // convergence gate, but publish truth rather than a one-way delay guess.
-    clock.Observe(state.boot_id, state.sample_time_us,
-                  static_cast<std::uint64_t>(sim.now().nanos() / 1000));
+    if (clock.Observe(state.boot_id, state.sample_time_us, Micros(sim.now()))) {
+      latest_sample_us = state.sample_time_us;
+    }
     ::bridge::BridgeStatus status{
         states_sent,
         0,
@@ -433,9 +485,16 @@ SimHardware::SimHardware(Sim& sim) : impl_{std::make_shared<Impl>(sim)} {
   impl.config_id = hardware::ConfigurationId(impl.config.hardware);
   impl.period = std::chrono::microseconds{impl.config.hardware.period_us};
   for (const auto& [name, devices] : impl.config.subsystems) {
-    impl.requests.emplace(
-        name, Impl::RequestTracker{.topic = hardware::RequestTopic(name),
-                                   .last_seen = std::nullopt});
+    if (!devices.owns_actuators()) continue;
+    std::uint32_t period_us = impl.config.hardware.period_us;
+    if (const auto* table = impl.config.GetSubsystemTable(name)) {
+      period_us =
+          static_cast<std::uint32_t>((*table)["period_us"].value_or(period_us));
+    }
+    Impl::RequestTracker tracker{.topic = hardware::RequestTopic(name)};
+    tracker.owner.timeout_us = hardware::OwnerTimeoutUs(
+        period_us, impl.config.hardware.command_timeout_us);
+    impl.requests.emplace(name, std::move(tracker));
     impl.Neutralize(devices);
   }
   SimAccess::every(sim, impl.period, [weak = std::weak_ptr<Impl>{impl_}] {
@@ -546,6 +605,11 @@ void SimHardware::lose_states(int count) {
 }
 
 void SimHardware::reboot() {
+  // The bridge drops every merged request on a new boot, and the rebooted
+  // gateway starts neutral at epoch 1.
+  impl_->Invalidate();
+  impl_->epoch = 1;
+  impl_->latest_sample_us = 0;
   ++impl_->boot_id;
   impl_->device_reset_count = 0;
   impl_->sequence = 0;
