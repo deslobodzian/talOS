@@ -9,6 +9,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "geometry/geometry_generated.h"
@@ -679,31 +680,41 @@ exclude = ["budget/state/*/offset_m"]
   EXPECT_THROW(oversized.add<Telemetry>("telemetry"), std::runtime_error);
 }
 
-// A single scalar keeps the value frame small while its metadata exceeds a
-// dictionary slot. BFBS permits long field names even with short topic names.
-class LargeDictionaryNode {
+// `/budget/state` as a struct of `field_count` doubles, each named
+// `name_bytes` long; the schema is built by hand so a test sets any length.
+class LongNamesNode {
  public:
-  explicit LargeDictionaryNode(talos::Node& node) {
+  explicit LongNamesNode(talos::Node& node) {
+    const auto count =
+        static_cast<std::size_t>(node.param<std::int64_t>("field_count", 1));
+    const auto name_bytes =
+        static_cast<std::size_t>(node.param<std::int64_t>("name_bytes", 1));
     flatbuffers::FlatBufferBuilder builder;
-    const auto field_name =
-        builder.CreateString(std::string(telemetry_wire::slot_bytes, 'x'));
+    std::vector<flatbuffers::Offset<reflection::Field>> fields;
+    for (std::size_t i = 0; i < count; ++i) {
+      std::string name = std::to_string(i);
+      name.resize(name_bytes, 'x');
+      const auto field_name = builder.CreateString(name);
+      reflection::TypeBuilder type_builder{builder};
+      type_builder.add_base_type(reflection::BaseType::Double);
+      type_builder.add_index(-1);
+      const auto type = type_builder.Finish();
+      reflection::FieldBuilder field_builder{builder};
+      field_builder.add_name(field_name);
+      field_builder.add_type(type);
+      field_builder.add_id(static_cast<std::uint16_t>(i));
+      field_builder.add_offset(static_cast<std::uint16_t>(i * sizeof(double)));
+      fields.push_back(field_builder.Finish());
+    }
     const auto object_name = builder.CreateString("budget.State");
-    reflection::TypeBuilder type_builder{builder};
-    type_builder.add_base_type(reflection::BaseType::Double);
-    type_builder.add_index(-1);
-    const auto type = type_builder.Finish();
-    reflection::FieldBuilder field_builder{builder};
-    field_builder.add_name(field_name);
-    field_builder.add_type(type);
-    const auto field = field_builder.Finish();
-    const auto fields = builder.CreateVector(
-        std::vector<flatbuffers::Offset<reflection::Field>>{field});
+    const auto field_vector = builder.CreateVector(fields);
     reflection::ObjectBuilder object_builder{builder};
     object_builder.add_name(object_name);
-    object_builder.add_fields(fields);
+    object_builder.add_fields(field_vector);
     object_builder.add_is_struct(true);
     object_builder.add_minalign(8);
-    object_builder.add_bytesize(8);
+    object_builder.add_bytesize(
+        static_cast<std::int32_t>(count * sizeof(double)));
     const auto object = object_builder.Finish();
     const auto objects = builder.CreateVector(
         std::vector<flatbuffers::Offset<reflection::Object>>{object});
@@ -716,13 +727,43 @@ class LargeDictionaryNode {
     schema_.assign(reinterpret_cast<const char*>(builder.GetBufferPointer()),
                    builder.GetSize());
     talos::detail::NodeAccess::add_publisher(
-        node, "/budget/state", 8, 8,
+        node, "/budget/state", count * sizeof(double), 8,
         talos::schema::Identity{"budget.State", 12345, schema_});
   }
 
  private:
   std::string schema_;
 };
+
+// LongNamesNode's channels are this prefix plus the field name, so this is
+// the longest field name whose channel Studio still decodes.
+constexpr std::string_view kLongNamesPrefix = "budget/state/";
+constexpr std::size_t kLongestFieldName =
+    telemetry_wire::kMaxDictionaryStringBytes - kLongNamesPrefix.size();
+
+// The channel LongNamesNode's first field produces.
+std::string LongChannelName(std::size_t name_bytes) {
+  std::string field = "0";
+  field.resize(name_bytes, 'x');
+  return std::string{kLongNamesPrefix} + field;
+}
+
+std::string LongNamesConfig(std::size_t field_count, std::size_t name_bytes,
+                            std::string_view telemetry_keys = "") {
+  return R"(
+[robot]
+period_us = 10000
+[subsystems.budget]
+node = "//budget:node"
+field_count = )" +
+         std::to_string(field_count) +
+         "\nname_bytes = " + std::to_string(name_bytes) + R"(
+[subsystems.budget.motors.m]
+can_id = 1
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)" + std::string{telemetry_keys};
+}
 
 TEST(TelemetryTest, DictionaryFrameMustFitSharedMemorySlot) {
   const std::vector<ChannelDef> small{{"pose/valid", "", {}}};
@@ -733,18 +774,71 @@ TEST(TelemetryTest, DictionaryFrameMustFitSharedMemorySlot) {
             telemetry_wire::kMaxValueFrameBytes);
   EXPECT_GT(MeasureDictionaryFrameBytes(large), telemetry_wire::slot_bytes);
 
-  Sim sim = Sim::FromToml(R"(
+  // 64 channels of the longest name Studio decodes: a small value frame, but
+  // a dictionary frame over the slot. The refusal names the largest channels.
+  Sim sim = Sim::FromToml(LongNamesConfig(64, kLongestFieldName));
+  sim.add<LongNamesNode>("budget");
+  try {
+    sim.add<Telemetry>("telemetry");
+    ADD_FAILURE() << "an over-slot dictionary was accepted";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(
+        std::string{error.what()}.find(LongChannelName(kLongestFieldName)),
+        std::string::npos)
+        << error.what();
+  }
+}
+
+// Owns a topic whose channels fall under Studio's derived/ prefix.
+class DerivedOwnerNode {
+ public:
+  explicit DerivedOwnerNode(talos::Node& node)
+      : state_{node.publish<schema_test::Inner>("/derived/state")} {}
+
+  talos::Publisher<schema_test::Inner> state_;
+};
+
+// Studio refuses a whole dictionary over one channel it cannot decode, which
+// blanks the stream; construction refuses that channel instead, by name.
+TEST(TelemetryTest, ChannelStudioCannotDecodeIsRefusedByName) {
+  const auto refusal = [](Sim& sim) -> std::string {
+    try {
+      sim.add<Telemetry>("telemetry");
+    } catch (const std::invalid_argument& error) {
+      return error.what();
+    }
+    return "";
+  };
+  Sim at_limit = Sim::FromToml(LongNamesConfig(1, kLongestFieldName));
+  at_limit.add<LongNamesNode>("budget");
+  EXPECT_EQ(refusal(at_limit), "");
+
+  const std::string over_limit = LongChannelName(kLongestFieldName + 1);
+  Sim over = Sim::FromToml(LongNamesConfig(1, kLongestFieldName + 1));
+  over.add<LongNamesNode>("budget");
+  const std::string message = refusal(over);
+  EXPECT_NE(message.find("'" + over_limit + "'"), std::string::npos) << message;
+
+  // The remedy the refusal points at: excluding the channel.
+  Sim excluded = Sim::FromToml(LongNamesConfig(
+      1, kLongestFieldName + 1, "exclude = [\"" + over_limit + "\"]\n"));
+  excluded.add<LongNamesNode>("budget");
+  EXPECT_EQ(refusal(excluded), "");
+
+  Sim derived = Sim::FromToml(R"(
 [robot]
 period_us = 10000
-[subsystems.budget]
-node = "//budget:node"
-[subsystems.budget.motors.m]
+[subsystems.derived]
+node = "//derived:node"
+[subsystems.derived.motors.m]
 can_id = 1
 [subsystems.telemetry]
 node = "//talOS/telemetry:node"
 )");
-  sim.add<LargeDictionaryNode>("budget");
-  EXPECT_THROW(sim.add<Telemetry>("telemetry"), std::runtime_error);
+  derived.add<DerivedOwnerNode>("derived");
+  const std::string reserved = refusal(derived);
+  EXPECT_NE(reserved.find("'derived/state/mode'"), std::string::npos)
+      << reserved;
 }
 
 TEST(TelemetryTest, PoseTopicMissingErrors) {

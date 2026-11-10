@@ -33,6 +33,17 @@ static_assert(kMaxValueFrameBytes == 1200,
 inline constexpr std::size_t slot_bytes = 16384;
 inline constexpr std::size_t slot_count = 64;
 
+// Dictionary limits: each channel name, unit and enum label is at most
+// kMaxDictionaryStringBytes, and an enum channel carries at most
+// kMaxEnumLabels labels. Studio's decoder (studio/src/core.ts) accepts
+// exactly these, and the producer (node.h) never emits past them: one
+// channel past them would blank the whole stream.
+inline constexpr std::size_t kMaxDictionaryStringBytes = 256;
+inline constexpr std::size_t kMaxEnumLabels = 1024;
+static_assert(kMaxDictionaryStringBytes == 256 && kMaxEnumLabels == 1024,
+              "telemetry dictionary limits changed; update docs/DATA_FLOW.md "
+              "and studio/src/core.ts");
+
 // Validates the slot header: a 4-byte little-endian FlatBuffers size
 // prefix, a minimum FlatBuffer size (root offset + "TLM2" identifier),
 // a size that fits the slot, and the TLM2 identifier itself. Full

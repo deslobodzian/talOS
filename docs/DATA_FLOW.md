@@ -293,8 +293,13 @@ Telemetry emits size-prefixed FlatBuffers `Frame`s: a **4-byte** little-endian
 length followed by a `TLM2` buffer. Value-only frames are dynamically sized by
 channel count but limited to **1200 B including the prefix**; the producer builds
 a worst-case frame at startup and refuses an over-budget dictionary. Dictionary
-frames are larger/variable, bounded by the **16384 B** slot. First/every-100th-frame
-dictionaries allow late join/recovery in about a second at 100 Hz.
+frames are larger/variable, bounded by the **16384 B** slot. Each dictionary
+name, unit and enum label is at most **256 B**, and an enum channel carries at
+most **1024** labels (`wire.h`); Studio's decoder accepts exactly these limits,
+and the producer never emits past them
+([telemetry README](../talOS/telemetry/README.md#transport-budget)).
+First/every-100th-frame dictionaries allow late join/recovery in about a second
+at 100 Hz.
 
 The 2026 configuration excludes cumulative camera counters, the 64-bit
 `hw/status/clock_boot_id` (a double cannot carry it exactly),

@@ -5,7 +5,8 @@ observes state and status topics in the declared graph and publishes
 size-prefixed FlatBuffer `Frame`s on the byte topic configured by `[studio] topic`
 (default `/talos/telemetry`); the Studio bridge (`//studio/bridge`)
 forwards them to browsers and agents. This package owns the framework node,
-`telemetry.fbs` (the frame schema), and `wire.h` (slot geometry and header validation).
+`telemetry.fbs` (the frame schema), and `wire.h` (slot geometry, frame and
+dictionary limits, header validation).
 
 ## Frame format
 
@@ -36,6 +37,8 @@ buffer with the slot's padding stripped.
 A non-empty `labels` makes the channel an *enum channel*: its value is an
 integral index and `labels[value]` names it (for example `intake/inhibit`
 carries the `intake::Inhibit` names). Out-of-range values have no label.
+Every string is written once, never shared between offsets: Studio refuses a
+dictionary whose strings, counted per reference, outgrow the frame.
 
 ## Dictionary protocol
 
@@ -52,10 +55,15 @@ answers `503` on `/telemetry.json`).
 
 ## Transport budget
 
-Frame caps, shared-memory geometry, dictionary cadence and configured rates
-live in [DATA_FLOW.md](../../docs/DATA_FLOW.md). Construction measures both
-worst-case value frames and dictionary frames and throws if either exceeds its
-budget. A WebSocket message boundary does not guarantee a TCP/IP packet boundary.
+Frame caps, dictionary limits, shared-memory geometry, dictionary cadence and
+configured rates live in [DATA_FLOW.md](../../docs/DATA_FLOW.md). Construction
+measures both worst-case value frames and dictionary frames and throws if either
+exceeds its budget, naming the largest sources or dictionary channels. Studio
+refuses a whole dictionary over one channel it cannot decode, so construction
+also refuses, by name, a channel whose name, unit or label exceeds the
+dictionary string limit, or whose name starts with `derived/` (Studio's own
+computed channels); exclude it (below) or rename the field. A WebSocket message
+boundary does not guarantee a TCP/IP packet boundary.
 
 ## Automatic channels and units
 
@@ -67,7 +75,9 @@ Channels are discovered automatically from the graph descriptors:
    suffixes (via `talOS/schema/unit_suffix.h`), such as `_mps` (`m/s`),
    `_rad` (`rad`), `_s` (`s`). Fields without recognized unit suffixes have empty units.
 3. **Enum labels**: Enum fields extract string labels automatically from FlatBuffers
-   schema reflection (`reflection::Schema`).
+   schema reflection (`reflection::Schema`). An enum whose values would need
+   more labels than the dictionary label limit, or that has no non-negative
+   value, carries no labels and reads as a plain number.
 4. **Include/exclude globs**: In `telemetry.toml`, `include` selects whole
    topics only (default `["*"]`). `exclude` takes precedence and matches both
    whole topics and individual dictionary channel names: excluding a topic

@@ -7,6 +7,7 @@ import {
   channelDisplay,
   Coordinator,
   JitterBuffer,
+  MAX_ENUM_LABELS,
   MAX_FRAME_BYTES,
   poseError,
   simTruthPose,
@@ -27,18 +28,23 @@ const frame = (i: number) => {
 };
 
 // A bare value frame (no dictionary) for `dictionaryId`, built the way a
-// producer builds every later frame. Options also support custom dictionaries
-// and chassis headings for decoder-level derived-channel tests.
+// producer builds every later frame. Options also support custom dictionaries,
+// one label vector every dictionary entry shares, and chassis headings for
+// decoder-level tests.
 function valueFrame(sequence: bigint, dictionaryId: number,
                     values: number[], streamId = 42n,
-                    options: {dictionary?: string[]; yaw?: number;
+                    options: {dictionary?: string[]; labels?: string[]; yaw?: number;
                               missingChassis?: boolean} = {}): Uint8Array {
   const b = new Builder(256);
+  const labels = options.labels &&
+      ChannelInfo.createLabelsVector(
+          b, options.labels.map(label => b.createString(label)));
   const dictionary = options.dictionary ?
       Frame.createDictionaryVector(b, options.dictionary.map(name => {
         const text = b.createString(name);
         ChannelInfo.startChannelInfo(b);
         ChannelInfo.addName(b, text);
+        if (labels !== undefined) ChannelInfo.addLabels(b, labels);
         return ChannelInfo.endChannelInfo(b);
       })) :
       undefined;
@@ -118,6 +124,21 @@ test('NaN samples are omitted and oversize frames are refused', () => {
   assert.equal(MAX_FRAME_BYTES, 16384);
   assert.throws(() => decoder.decode(new Uint8Array(16385)));
 });
+
+test('every dictionary the producer may emit decodes; one past its limits does not', () => {
+  const decode = (values: number[], options: {dictionary: string[]; labels: string[]}) =>
+      new TelemetryDecoder().decode(valueFrame(0n, 7, values, 42n, options));
+  // Base-36 indices keep the producer's largest enum inside one frame.
+  const labels = Array.from({length: MAX_ENUM_LABELS}, (_, i) => i.toString(36));
+  const state = decode([MAX_ENUM_LABELS - 1], {dictionary: ['fault'], labels})!;
+  assert.equal(channelDisplay(state, 'fault'), labels.at(-1));
+  assert.throws(() => decode([0], {dictionary: ['fault'], labels: [...labels, 'z']}),
+                /Too many labels/);
+  // The producer writes each string once: offsets shared to multiply a frame's
+  // text past the frame itself are a decode bomb, not a dictionary.
+  assert.throws(() => decode([], {dictionary: ['a', 'b', 'c', 'd', 'e', 'f'], labels}),
+                /exceeds its frame/);
+});
 test('a new stream invalidates the old dictionary', () => {
   const decoder = new TelemetryDecoder();
   decoder.decode(demoPacket(0n));
@@ -168,6 +189,15 @@ test('a malformed held frame cannot abort dictionary recovery', () => {
       valueFrame(3n, 9, [4], 42n, {dictionary: ['value']}));
   assert.deepEqual(recovered.map(s => s.sequence_id), ['2', '3']);
   assert.equal(decoder.heldCount, 0);
+});
+
+test('a value frame past the hold limit is refused, not silently dropped', () => {
+  const decoder = new TelemetryDecoder();
+  const waiting = valueFrame(1n, 9, [1]);
+  for (let i = 0; i < 4096; i++) assert.equal(decoder.decode(waiting), null);
+  // Refused, so the worker counts it as invalid instead of losing it unseen.
+  assert.throws(() => decoder.decode(waiting), /awaiting a dictionary/);
+  assert.equal(decoder.heldCount, 4096);
 });
 test('jitter sorts, deduplicates, counts gaps and rejects late packets', () => {
   const j = new JitterBuffer(10);
@@ -377,6 +407,19 @@ test('derived pose-error readings are absent, not zero, when truth or a valid es
          }
        }
      });
+
+test('snapshots share their dictionary\'s frozen units and labels', () => {
+  const decoder = new TelemetryDecoder();
+  decoder.decode(demoPacket(0n));
+  const [a, b] = [1n, 2n].map(n => decoder.decode(demoPacket(n))!);
+  assert.equal(a.units, b.units);
+  assert.equal(a.labels, b.labels);
+  assert.ok(Object.isFrozen(a.units) && Object.isFrozen(a.labels));
+  // Derived units ride their own shared copy, never the dictionary's units.
+  const plain = decoder.decode(valueFrame(3n, 1, [1, 0, 12, 2, 0, 0, 0, 1]))!;
+  assert.equal(a.units['derived/pose_error_m'], 'm');
+  assert.equal('derived/pose_error_m' in plain.units, false);
+});
 
 test('derived heading series wraps both directions across 180 degrees', () => {
   for (const [estimate, truth, expected] of [[-179, 179, 2], [179, -179, -2]]) {

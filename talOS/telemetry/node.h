@@ -172,6 +172,8 @@ inline double ReadScalarAsDouble(reflection::BaseType base,
   }
 }
 
+// Labels index by value, so an enum whose largest value is negative or not
+// below kMaxEnumLabels (wide bit flags, sparse codes) carries none.
 inline std::vector<std::string> ExtractEnumLabels(
     const reflection::Schema& schema, std::int32_t enum_index) {
   std::vector<std::string> labels;
@@ -182,7 +184,8 @@ inline std::vector<std::string> ExtractEnumLabels(
     for (const auto* val : *enum_def->values()) {
       if (val->value() > max_val) max_val = val->value();
     }
-    if (max_val >= 0 && max_val < 1024) {
+    if (max_val >= 0 &&
+        max_val < static_cast<std::int64_t>(telemetry_wire::kMaxEnumLabels)) {
       labels.resize(max_val + 1);
       for (const auto* val : *enum_def->values()) {
         if (val->value() >= 0) {
@@ -456,6 +459,28 @@ class Telemetry {
                                     "'");
       }
     }
+    // Studio refuses a whole dictionary over one channel it cannot decode,
+    // blanking the stream; refuse that channel here instead, by name, so it
+    // can be excluded. ExtractEnumLabels keeps label counts within the limit.
+    if (name.starts_with("derived/")) {
+      throw std::invalid_argument(
+          "telemetry: channel '" + name +
+          "' is in Studio's reserved derived/ namespace (see "
+          "talOS/telemetry/README.md)");
+    }
+    const auto check_length = [&name](std::string_view what,
+                                      std::string_view text) {
+      if (text.size() > telemetry_wire::kMaxDictionaryStringBytes) {
+        throw std::invalid_argument(
+            "telemetry: channel '" + name + "' " + std::string{what} + " is " +
+            std::to_string(text.size()) + " bytes, over the " +
+            std::to_string(telemetry_wire::kMaxDictionaryStringBytes) +
+            "-byte dictionary string limit (see talOS/telemetry/README.md)");
+      }
+    };
+    check_length("name", name);
+    check_length("unit", unit);
+    for (const std::string& label : labels) check_length("label", label);
     dictionary_.push_back(
         ChannelDef{std::move(name), std::move(unit), std::move(labels)});
     return dictionary_.size() - 1;
@@ -502,10 +527,29 @@ class Telemetry {
     const std::size_t dictionary_bytes =
         MeasureDictionaryFrameBytes(dictionary_);
     if (dictionary_bytes > telemetry_wire::slot_bytes) {
-      throw std::runtime_error(
+      // A channel's share: the frame it would make alone, less an empty one.
+      const std::size_t empty = MeasureDictionaryFrameBytes({});
+      std::vector<std::pair<std::size_t, std::string_view>> shares;
+      shares.reserve(dictionary_.size());
+      for (const ChannelDef& channel : dictionary_) {
+        shares.emplace_back(MeasureDictionaryFrameBytes({channel}) - empty,
+                            channel.name);
+      }
+      std::stable_sort(
+          shares.begin(), shares.end(),
+          [](const auto& a, const auto& b) { return a.first > b.first; });
+      std::string err =
           "telemetry: dictionary frame is " + std::to_string(dictionary_bytes) +
           " bytes, over the " + std::to_string(telemetry_wire::slot_bytes) +
-          "-byte shared-memory slot budget");
+          "-byte shared-memory slot budget (see talOS/telemetry/README.md). "
+          "Largest channels: ";
+      for (std::size_t i = 0; i < std::min<std::size_t>(shares.size(), 3);
+           ++i) {
+        if (i > 0) err += ", ";
+        err += std::string{shares[i].second} + " (" +
+               std::to_string(shares[i].first) + " B)";
+      }
+      throw std::runtime_error(err);
     }
     if (!report) return;
     std::size_t spare_channels = 0;

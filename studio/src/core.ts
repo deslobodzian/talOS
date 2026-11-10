@@ -49,6 +49,11 @@ export function poseError(estimate: PlanarPose, truth: PlanarPose):
 }
 export type Mode = 'PAUSED'|'LIVE_STREAMING'|'REPLAY_PLAYING';
 export const MAX_FRAME_BYTES = 16384;
+// The dictionary limits of talOS/telemetry/wire.h (docs/DATA_FLOW.md): the
+// producer never emits past them and Studio decodes up to exactly them, so no
+// dictionary the producer emits blanks the stream.
+export const MAX_DICTIONARY_STRING_BYTES = 256;
+export const MAX_ENUM_LABELS = 1024;
 
 // The display string for a channel value: the enum label when the channel
 // declared labels and the value is a valid index, else the number itself.
@@ -103,30 +108,34 @@ function verify(bytes: Uint8Array) {
       return p + o;
     });
   };
+  // The producer writes every dictionary string once, so their text fits in
+  // the frame; offsets shared to multiply it past that (a decode bomb) are
+  // refused. Value and entry counts need no cap: each one takes frame bytes.
+  let text = bytes.length;
   const string = (p: number) => {
     if (!p) throw Error('Missing name');
     const q = ref(p), n = u32(q);
-    if (n > 256) throw Error('Name too long');
+    if (n > MAX_DICTIONARY_STRING_BYTES) throw Error('Name too long');
     check(q + 4, n + 1);
     if (v.getUint8(q + 4 + n) !== 0) throw Error('Invalid string');
+    text -= n + 1;
+    if (text < 0) throw Error('Dictionary text exceeds its frame');
   };
   const stringVector = (p: number) => {
     if (!p) return;
     const q = ref(p), n = u32(q);
-    if (n > 64) throw Error('Too many labels');
+    if (n > MAX_ENUM_LABELS) throw Error('Too many labels');
     check(q + 4, n * 4);
     for (let i = 0; i < n; i++) string(q + 4 + i * 4);
   };
   const f = table(ref(4), [8, 8, 8, 4, 48, 4, 4]);
   if (!f[4]) throw Error('Missing chassis');
   if (f[5]) {
-    const q = ref(f[5]), n = u32(q);
-    if (n > 4096) throw Error('Too many values');
-    check(q + 4, n * 8);
+    const q = ref(f[5]);
+    check(q + 4, u32(q) * 8);
   }
   if (f[6]) {
     const q = ref(f[6]), n = u32(q);
-    if (n > 1024) throw Error('Too many channels');
     check(q + 4, n * 4);
     for (let i = 0; i < n; i++) {
       const entry = table(ref(q + 4 + i * 4), [4, 4, 4]);
@@ -152,14 +161,26 @@ const pose = (p: WirePose|null): Pose => {
   };
 };
 
-type Dictionary = {name: string; unit: string; labels: string[]}[];
+// A decoded dictionary: channel names index-aligned with every frame's
+// values, and units and labels frozen and shared by every snapshot decoded
+// against it, so a long timeline holds one copy per dictionary frame rather
+// than one per sample. `derivedUnits` adds the units of Studio's derived/
+// channels, for the snapshots that carry them.
+type Dictionary = {
+  names: string[];
+  units: Readonly<Record<string, string>>;
+  labels: Readonly<Record<string, string[]>>;
+  derivedUnits?: Readonly<Record<string, string>>;
+};
 
 // Stateful v2 decoder. The wire carries a channel dictionary once (keyed by
 // dictionary_id) and bare value vectors after that, so a value frame whose
-// dictionary has not arrived yet cannot be named: it is held, not dropped and
-// not fatal, and resolves when the dictionary frame lands. Dictionaries are
-// per-stream; a new stream_id invalidates every dictionary and held frame
-// from the old one, since ids are only unique within a stream.
+// dictionary has not arrived yet cannot be named: it is held, not fatal, and
+// resolves when the dictionary frame lands. At most 4096 are held; past that
+// a frame is refused rather than silently dropped, so the caller counts the
+// loss. Dictionaries are per-stream; a new stream_id invalidates every
+// dictionary and held frame from the old one, since ids are only unique
+// within a stream.
 export class TelemetryDecoder {
   private dictionaries = new Map<number, Dictionary>();
   private held: Uint8Array[] = [];
@@ -221,7 +242,9 @@ export class TelemetryDecoder {
     let dictionary: Dictionary|undefined =
         newStream ? undefined : this.dictionaries.get(dictionaryId);
     if (hasDictionary) {
-      const parsed: Dictionary = [];
+      const names: string[] = [];
+      const units: Record<string, string> = Object.create(null),
+            labels: Record<string, string[]> = Object.create(null);
       const seen = new Set<string>();
       for (let i = 0; i < f.dictionaryLength(); i++) {
         const info = f.dictionary(i)!;
@@ -231,14 +254,19 @@ export class TelemetryDecoder {
         if (name.startsWith('derived/'))
           throw Error('Reserved derived/ channel namespace');
         seen.add(name);
-        const labels: string[] = [];
-        for (let j = 0; j < info.labelsLength(); j++)
-          labels.push(info.labels(j) as string);
-        parsed.push({name, unit: info.unit() ?? '', labels});
+        names.push(name);
+        units[name] = info.unit() ?? '';
+        if (info.labelsLength()) {
+          const channelLabels: string[] = [];
+          for (let j = 0; j < info.labelsLength(); j++)
+            channelLabels.push(info.labels(j) as string);
+          Object.freeze(channelLabels);
+          labels[name] = channelLabels;
+        }
       }
-      dictionary = parsed;
+      dictionary = {names, units: Object.freeze(units), labels: Object.freeze(labels)};
     }
-    if (dictionary && f.valuesLength() > dictionary.length)
+    if (dictionary && f.valuesLength() > dictionary.names.length)
       throw Error('More values than dictionary channels');
     // Validate even unknown-dictionary packets before they can change streams.
     const chassis = pose(f.chassis());
@@ -255,23 +283,19 @@ export class TelemetryDecoder {
     if (hasDictionary) this.dictionaries.set(dictionaryId, dictionary!);
     this.heldCount = this.held.length;
     if (!dictionary) {
-      if (this.held.length < 4096) this.held.push(bytes.slice());
+      if (this.held.length >= 4096)
+        throw Error('Too many frames awaiting a dictionary');
+      this.held.push(bytes.slice());
       this.heldCount = this.held.length;
       return null;
     }
-    const channels: Record<string, number> = Object.create(null),
-          units: Record<string, string> = Object.create(null),
-          labels: Record<string, string[]> = Object.create(null);
-    for (let i = 0; i < dictionary.length; i++) {
-      const entry = dictionary[i];
-      units[entry.name] = entry.unit;
-      if (entry.labels.length) labels[entry.name] = entry.labels;
-      if (i >= f.valuesLength()) continue;
+    const channels: Record<string, number> = Object.create(null);
+    for (let i = 0, count = f.valuesLength(); i < count; i++) {
       const value = f.values(i)!;
       // A NaN sample is a channel with no reading this tick, not a poisoned
       // frame: omit it so plots and agents see absence, not a fake zero.
       if (Number.isNaN(value)) continue;
-      channels[entry.name] = finite(value);
+      channels[dictionary.names[i]] = finite(value);
     }
     const snapshot: Snapshot = {
       stream_id: streamId,
@@ -280,8 +304,8 @@ export class TelemetryDecoder {
       dictionary_id: dictionaryId,
       chassis,
       channels,
-      units,
-      labels
+      units: dictionary.units,
+      labels: dictionary.labels
     };
     // Derive once, before history/UI/RPC consume the snapshot. Missing inputs
     // leave no reading (or unit) rather than inventing a zero-error sample.
@@ -289,9 +313,10 @@ export class TelemetryDecoder {
     if (truth && poseValid(snapshot)) {
       const error = poseError(snapshot.chassis, truth);
       channels['derived/pose_error_m'] = error.position_m;
-      units['derived/pose_error_m'] = 'm';
       channels['derived/heading_error_deg'] = error.heading_deg;
-      units['derived/heading_error_deg'] = 'deg';
+      snapshot.units = dictionary.derivedUnits ??= Object.freeze(Object.assign(
+          Object.create(null), dictionary.units,
+          {'derived/pose_error_m': 'm', 'derived/heading_error_deg': 'deg'}));
     }
     return snapshot;
   }
