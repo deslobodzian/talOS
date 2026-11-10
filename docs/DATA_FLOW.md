@@ -77,8 +77,9 @@ Phoenix 26.3.0 `CoreTalonFX.hpp` / `SpnValue.hpp` identify stator current,
 supply current and device temperature as `PRO_SupplyAndTemp` SPNs 1779–1783.
 [CTRE's shared-frame rule](https://v6.docs.ctr-electronics.com/en/stable/docs/api-reference/api-usage/status-signals.html)
 applies the highest requested rate to a shared frame. The Phoenix desktop
-rate test checks the effective rates: the new reads reuse the already-active
-200 Hz frame, adding no requested status-frame traffic. This is not a measured
+rate test checks the effective rates: the current and temperature reads share
+a frame already requested at 200 Hz, adding no requested status-frame traffic.
+This is not a measured
 whole-bus utilization percentage: use `/hw/status` CAN utilization during
 physical bring-up, including all other devices and control traffic.
 Temperature older than 500 ms and supply current older than 50 ms read as zero
@@ -296,8 +297,9 @@ frames are larger/variable, bounded by the **16384 B** slot. First/every-100th-f
 dictionaries allow late join/recovery in about a second at 100 Hz.
 
 The 2026 configuration excludes cumulative camera counters, the 64-bit
-`hw/status/clock_boot_id` (a double cannot carry it exactly), the two new
-clock uncertainty/minimum-RTT fields, and the simulator's timestamp/velocity at
+`hw/status/clock_boot_id` (a double cannot carry it exactly),
+`hw/status/clock_offset_uncertainty_us`, `hw/status/clock_min_round_trip_us`,
+and the simulator's timestamp/velocity at
 channel level (`subsystems/telemetry.toml`), retaining
 camera health, timing, dropped-frame and visible-tag diagnostics. Excludes match
 topics or individual dictionary channels; only retained channels count.

@@ -49,9 +49,10 @@ struct SourceCounters {
   // this source did its job.
   std::atomic<std::uint64_t> events{0};
 
-  // Messages the transport lapped before this source read them, publishes it
-  // refused, and reads it failed: torn by the writer, or finding the reader
-  // slot freed under this watcher.
+  // Messages the transport lapped before this source read them, messages a
+  // latest-only watcher skipped by design, publishes the transport refused,
+  // and reads it failed: torn by the writer, or finding the reader slot freed
+  // under this watcher.
   std::atomic<std::uint64_t> dropped{0};
 
   // Last transport sequence this source observed, which is what makes a

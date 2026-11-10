@@ -166,9 +166,9 @@ dispatch latency and the worst latency seen.
 
 "Events" means whatever that source doing its job looks like: dispatches for a
 timer or a watcher, and messages accepted by the transport for a sender.
-Publishes the transport refused count as dropped, alongside messages a writer
-lapped before a subscriber read them and the realtime loop's failed reads (a
-read the writer tore, or one that found the subscriber's reader slot freed).
+A sender's dropped count is the publishes the transport refused; what a
+watcher's dropped count includes, intentional latest-only skips among it, is in
+[the event system's Lateness section](../events/README.md#lateness).
 
 These are atomics so another thread can read them mid-run without a data race.
 

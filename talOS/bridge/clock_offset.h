@@ -1,13 +1,13 @@
 #pragma once
 
 // Gateway-to-node clock mapping. Production uses bounded_offset_us() from a
-// causal two-way exchange; offset_us()/spread_us() retain the legacy one-way
-// diagnostic below and MUST NOT be treated as an accuracy bound.
+// causal two-way exchange; offset_us()/spread_us() are the one-way diagnostic
+// below and MUST NOT be treated as an accuracy bound.
 // accuracy_valid() expires after one second of sample progress. Its error
 // bound assumes nonnegative delay and <=1000 ppm relative oscillator drift.
 // No fusion accuracy threshold has been specified.
 //
-// Legacy one-way diagnostic (not the production mapping):
+// One-way diagnostic (not the production mapping):
 //
 // Each gateway state the bridge receives gives one one-way delay
 //

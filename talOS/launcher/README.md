@@ -356,7 +356,7 @@ descriptor decoder, without robot-specific schemas. It reports manifest config
 identity, node exits/restarts/quarantine/recorder failures/caps, an unfinished
 session, state inter-arrival median/nearest-rank p99/max,
 enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
-lateness, and every scalar `/hw/status` field (including new clock fields).
+lateness, and every scalar `/hw/status` field.
 Counter deltas sum nonnegative increments and separately count resets.
 `clock_offset_valid` includes its observed valid fraction. JSONL `log_dump`
 exports additionally include `ds_enabled` for successfully decoded Driver Station
@@ -396,6 +396,6 @@ language can check the other. `studio/tests/launcher_graph.json` and
 with only `session_id` pinned, and `//studio:declared_test` parses both. So a
 change to the envelope here fails there rather than reaching a viewer as a
 silently empty panel. Regenerate the fixtures and fix the parser in the same
-commit; the faults fixture is the same robot with the historical
-`/hw/req/drive` misspelling put back, which is where the diagnostic wording is
-pinned.
+commit; the faults fixture is the same robot with `drivetrain` publishing the
+misspelled `/hw/req/drive` instead of `/hw/request/drivetrain`, which is where
+the diagnostic wording is pinned.

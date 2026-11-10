@@ -135,17 +135,18 @@ struct TopicRow {
 //
 // BRIDGED and UNCONNECTED exist so this list can be honest. `/hw/command` is
 // consumed by the RoboRIO over UDP and will never have a shared-memory
-// subscriber; `/drivetrain/target/auto` has no publisher because autonomous is
-// not written yet. Both used to land in ORPHANED/UNREAD beside real faults, and
-// reporting a designed dead-end as a fault trains people to ignore the report
-// -- which is worse than not having one. The five original names still mean
-// exactly what they meant, so a viewer's existing filters keep working.
+// subscriber, and an optional end may be absent by design. Reporting a designed
+// dead-end as a fault trains people to ignore the report -- which is worse than
+// not having one.
 enum class TopicHealth {
   OK,
   ORPHANED,     // Subscribed, and nothing in this system publishes it.
   UNREAD,       // Published, and nothing in this system reads it.
   BRIDGED,      // The absent end is outside talOS; there is nothing to find.
   UNCONNECTED,  // The absent end is declared optional; absence is the design.
+  // Some end recorded drops. Includes a latest-only reader's intentional skips:
+  // the registry neither marks latest-only sources nor separates skips from
+  // lost reads (talOS/events/README.md, Lateness).
   LOSSY,
   IDLE,
 };

@@ -60,11 +60,13 @@ implementation (an unknown value fails at startup). The robot config selects
   seed is trusted: disabled trusts the seed; enabled leaves it untrusted.
   Localization becomes true once both a trusted startup decision and an
   integrated sample exist. A later disable never changes the startup decision.
-- Field dimensions `field_length_m` (16.541) and `field_width_m` (8.069)
+- Field dimensions `field_length_m` and `field_width_m` (set in
+  [`pose_estimator.toml`](../configuration/subsystems/pose_estimator.toml)
+  from the field layout `config_golden_test` checks them against)
   must be finite and positive. Observations outside the inclusive field
   rectangle are rejected. Once localized, measurements use the position
-  (`max_innovation_m`, 3.0 m) and wrapped-yaw (`max_yaw_innovation_rad`,
-  0.2618 rad) innovation gates against the estimate at their sample time;
+  (`max_innovation_m`) and wrapped-yaw (`max_yaw_innovation_rad`) innovation
+  gates from the same file against the estimate at their sample time;
   both limits must be finite and positive. Before localization, these gates
   never compare observations against the untrusted seed: otherwise usable
   observations are accepted and fused immediately, but do not authorize

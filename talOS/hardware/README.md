@@ -195,7 +195,8 @@ minimum-RTT interval estimates
 offset without assuming symmetric delay. `clock_offset_uncertainty_us` includes
 half RTT, timestamp quantization and <=1000 ppm relative clock drift; exchanges
 expire after one second. Eight ordered States and a live exchange are required.
-The old one-way spread remains diagnostic, not an accuracy bound. No fusion
+`clock_offset_spread_us`, the one-way delay spread over the sample window, is
+diagnostic, not an accuracy bound. No fusion
 accuracy threshold is specified: measure uncertainty against fusion requirements
 on the bench. New boots reset the mapping; reordered/retired States are dropped.
 

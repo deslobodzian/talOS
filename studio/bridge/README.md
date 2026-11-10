@@ -82,8 +82,13 @@ counts each attempt in `ws_drops`, and still serves it at `/system.json`. It
 opens the registry lazily. Topic health is
 computed in [`system.h`](system.h): missing ends are `bridged` when external,
 otherwise `unconnected` when optional, otherwise `orphaned` or `unread`;
-connected topics are `lossy` when drops are recorded, `idle` before publication,
-and `ok` otherwise. Observer endpoints are listed separately from subscribers.
+connected topics are `lossy` when any end recorded drops, `idle` before
+publication, and `ok` otherwise. The registry records one drop count per
+source and does not mark latest-only watchers, so `lossy` also covers a
+latest-only reader's intentional skips (a 50 Hz reader of a 200 Hz topic is
+always `lossy`); which drops are faults is in the
+[event system's Lateness section](../../talOS/events/README.md#lateness).
+Observer endpoints are listed separately from subscribers.
 
 ## WebSocket operating limits
 

@@ -164,8 +164,9 @@ struct SourceRecord {
   // its job.
   std::atomic<std::uint64_t> events;
 
-  // Messages the transport lapped before this source could read them,
-  // publishes the transport refused, or reads it failed (SourceCounters).
+  // Messages the transport lapped before this source could read them, messages
+  // a latest-only watcher skipped by design, publishes the transport refused,
+  // or reads it failed (SourceCounters).
   std::atomic<std::uint64_t> dropped;
 
   // Transport sequence last observed, which is what makes a subscriber's lag
@@ -265,11 +266,10 @@ static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
 static_assert(std::atomic<std::int32_t>::is_always_lock_free);
 static_assert(std::is_standard_layout_v<RegistryHeader>);
 
-// The claim that let kRegistryVersion stay at 1 when endpoint attributes
-// arrived: `flags` occupies the word `reserved` held, immediately after
-// `alignment`, so no field after it moved. A future edit that inserts something
-// here instead of reusing a reserved word has changed the layout and must bump
-// the version.
+// Why endpoint attributes needed no kRegistryVersion bump: `flags` occupies
+// the word `reserved` held, immediately after `alignment`, so no field after it
+// moved. A future edit that inserts something here instead of reusing a
+// reserved word has changed the layout and must bump the version.
 static_assert(std::is_standard_layout_v<SourceRecord>);
 static_assert(offsetof(SourceRecord, flags) ==
               offsetof(SourceRecord, alignment) + sizeof(std::uint32_t));

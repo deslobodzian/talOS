@@ -55,7 +55,7 @@ Beside the stack:
 | `talOS/protocol` | frame and UDP wire format |
 | `talOS/bridge` | `:hardware_node`; publishes link health, RoboRIO power/CAN health and gateway counters, and the gateway-to-node clock mapping (`:clock_offset`, read by `HardwareLink::sample_time()`) on `/hw/status` (`bridge::BridgeStatus`); `--log` records every command sent and state received |
 | `talOS/driver_station` | Driver Station codec |
-| `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed or stalled nodes, at most `[robot] max_restarts` per restart window); writes each session to `<output-dir>/<session_id>/` with a manifest kept current and old sessions pruned; `--describe-only` lints the graph |
+| `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed or stalled nodes per its [restart policy](talOS/launcher/README.md#restarts)); writes each session to `<output-dir>/<session_id>/` with a manifest kept current and old sessions pruned; `--describe-only` lints the graph |
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |
 | `talOS/process` | stop handlers and `ConfigureRealtime` for node binaries |
 | `talOS/msgs` | shared geometry and control message structs (field and chassis angles in radians; `SwerveModulePosition`, `PoseObservation`, `PoseEstimate`) |

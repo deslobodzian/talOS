@@ -237,15 +237,22 @@ still block on disk; do not call `flush()` from a control callback.
 
 A handler can react to its own lateness straight from its context:
 `context.latency()` is how late the dispatch ran, `context.sequence > 1` on a
-timer means periods were missed, and `context.dropped > 0` on a message means
-data was lost rather than merely delayed. Treat both as faults.
+timer means periods were missed, and `context.dropped` on a message counts
+messages this subscription skipped without observing. On a sequence watcher
+(not `latest_only`) a non-zero `dropped` means data was lost rather than merely
+delayed: the writer lapped the reader, or the reader slot was freed and claimed
+again. A latest-only watcher skips all but the newest message by design and
+counts those skips as dropped too, so its `dropped` is not a fault signal.
+Treat missed timer periods and a sequence watcher's drops as faults.
 
 The poll tick controls drain frequency under `Delivery::POLL`, not a hard
 end-to-end latency bound: callback execution and host scheduling can delay it.
 
 Each source also keeps lock-free `SourceCounters` (events, drops, last
 sequence, last and max latency) that the introspection reporter publishes
-while the loop runs.
+while the loop runs. A watcher's drop count is the sum of its `context.dropped`
+values plus reads the writer tore and reads that found the reader slot freed,
+so a latest-only watcher's count grows with every intentional skip.
 
 Message conventions live in [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
@@ -254,8 +261,7 @@ Message conventions live in [ARCHITECTURE.md](../../ARCHITECTURE.md).
 Publishers default to `OVERWRITE_OLDEST`, so a subscriber that stops reading
 gets lapped rather than stalling the publisher. A stuck logging process must
 never be able to freeze a control loop. Readers find out through
-`Context::dropped`, which counts messages that were skipped, not merely
-delayed. Treat a non-zero value as a fault.
+`Context::dropped`; [Lateness](#lateness) says which drops are faults.
 
 At the RTMS layer, `DROP_NEWEST` refuses a write with `BUFFER_FULL` when a reader
 falls behind; it does not block or retry. The application must handle that
