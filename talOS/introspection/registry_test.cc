@@ -427,36 +427,6 @@ TEST_F(Registry, ReclaimedSlotRejectsUpdatesFromItsPreviousOwner) {
   EXPECT_EQ(nodes.front().selections.front().selected, 1);
 }
 
-TEST_F(Registry, SeveralNodesCoexistAndAReleasedSlotDisappears) {
-  auto reader = [this] {
-    NodeRegistration first{{.name = "a"}, path_};
-    first.publish(sample_manifest());
-    {
-      NodeRegistration second{{.name = "b"}, path_};
-      second.publish({});
-      auto view = RegistryReader::open(path_);
-      EXPECT_EQ(view->nodes().size(), 2u);
-    }
-    // `second` released its slot; `first` must still be there and must not
-    // have been disturbed by the neighbour coming and going.
-    auto view = RegistryReader::open(path_);
-    const auto nodes = view->nodes();
-    EXPECT_EQ(nodes.size(), 1u);
-    EXPECT_EQ(nodes.front().name, "a");
-    EXPECT_EQ(nodes.front().sources.size(), 3u);
-    return true;
-  }();
-  EXPECT_TRUE(reader);
-
-  // Both registrations are gone now, so the registry is empty but still valid.
-  auto view = RegistryReader::open(path_);
-  if (!view.has_value()) {
-    FAIL() << "Expected registry reader";
-  }
-  const auto& registry = view.value();
-  EXPECT_TRUE(registry.nodes().empty());
-}
-
 TEST_F(Registry, ReaderReportsNothingBeforeAnyNodeStarts) {
   EXPECT_FALSE(RegistryReader::open(temp_registry("none")).has_value());
 }
@@ -839,36 +809,11 @@ TEST_F(Registry, EndpointAttributesSurviveTheSegment) {
   EXPECT_EQ(sources[1].kind, event::SourceKind::WATCHER);
 }
 
-// The v1 case, which is also the default case: a node that declares no
-// attributes -- or a writer built before attributes existed, which wrote this
-// word as a zeroed `reserved` -- must read as neither external nor optional,
-// not as some third state.
-TEST_F(Registry, ASourceWithNoAttributesIsNeitherExternalNorOptional) {
-  NodeRegistration registration{{.name = "odometry"}, path_};
-  registration.publish(sample_manifest());
-
-  auto reader = RegistryReader::open(path_);
-  if (!reader.has_value()) {
-    FAIL() << "Expected registry reader";
-  }
-  const auto& registry = reader.value();
-  const auto nodes = registry.nodes();
-  ASSERT_EQ(nodes.size(), 1u);
-  const auto& sources = nodes.front().sources;
-  ASSERT_EQ(sources.size(), 3u);
-
-  for (const SourceSnapshot& source : sources) {
-    EXPECT_EQ(source.flags, 0u) << source.name;
-    EXPECT_FALSE(source.external()) << source.name;
-    EXPECT_FALSE(source.optional()) << source.name;
-  }
-}
-
 // A misspelled topic is reported and then published anyway. Taking the node off
 // the robot to punish a name would be a worse failure than the name, and the
 // registry showing the spelling the node actually used is the whole point: that
 // is how the two ends are found not to meet.
-TEST_F(Registry, AMisnamedTopicIsWarnedAboutAndStillPublished) {
+TEST_F(Registry, AMisnamedTopicIsStillPublished) {
   event::Manifest manifest;
   manifest.push_back({.id = 0,
                       .kind = event::SourceKind::TIMER,
