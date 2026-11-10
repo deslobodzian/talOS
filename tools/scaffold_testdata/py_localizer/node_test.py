@@ -79,6 +79,16 @@ class PyLocalizerTest(unittest.TestCase):
         self.assertFalse(self.state().valid)
         self.assertEqual(self.state().observation_accepted_count, 0)
 
+    def test_counts_every_observation_between_ticks(self):
+        self.sim.step(0.02)
+        self.observe("front_camera", 1.0, 2.0)
+        self.observe("front_camera", 1.0, 2.0, valid=False)
+        self.observe("front_camera", 1.5, 2.0)
+        self.sim.step(0.04)
+        state = self.state()
+        self.assertEqual((state.observation_accepted_count,
+                          state.observation_rejected_count), (2, 1))
+
 
 class BinaryTest(unittest.TestCase):
     def run_binary(self, *argv):

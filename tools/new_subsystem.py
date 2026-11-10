@@ -989,9 +989,13 @@ talos_messages(
 ESTIMATOR_DOC = """\
 Reads geometry.PoseObservation from each camera node listed in `cameras`
 (/<camera>/state) and publishes geometry.PoseEstimate on its own state
-topic every tick. As generated it follows the newest usable observation
-(the most certain one when several arrive in one tick) and is valid while
-one arrived within observation_timeout_us; fuse odometry here (see
+topic every tick. Each camera is read through a callback subscription,
+which delivers every observation in sequence (a latest-value read would lose
+all but the newest per tick); the callback queues at most 64 per camera (the
+oldest is dropped and counted as rejected) and update() checks every queued
+one. As generated it follows the most certain usable observation of the tick
+and is valid while one arrived within observation_timeout_us; fuse odometry
+here (see
 2026-robot/main_processor/pose_estimator, which runs wpimath's
 SwerveDrive4PoseEstimator or a GTSAM smoother). It drives nothing, so it
 runs whether the robot is enabled or not."""
@@ -1000,7 +1004,9 @@ CC_ESTIMATOR_HEADER = """\
 #pragma once
 
 #include <chrono>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -1016,35 +1022,50 @@ class @PASCAL@ {
  public:
   using State = geometry::PoseEstimate;
   using Observation = geometry::PoseObservation;
+  // Observations queued per camera between two update()s: the framework's
+  // per-topic, per-drain delivery cap, over a second of a 60 fps camera.
+  static constexpr std::size_t kMaxPendingObservations = 64;
+
+  // The camera callbacks capture `this`: the node stays where it was built.
+  @PASCAL@(const @PASCAL@&) = delete;
+  @PASCAL@& operator=(const @PASCAL@&) = delete;
+  @PASCAL@(@PASCAL@&&) = delete;
+  @PASCAL@& operator=(@PASCAL@&&) = delete;
 
   explicit @PASCAL@(talos::Node& node)
       : node_{node},
         timeout_{std::chrono::microseconds{
             node.param<std::int64_t>("observation_timeout_us", 500'000)}},
         state_{node.publish<State>(topics::kState)} {
-    for (const std::string& camera :
-         node.param<std::vector<std::string>>("cameras")) {
-      cameras_.push_back(node.subscribe<Observation>("/" + camera + "/state",
-                                                     {.optional = true}));
+    const auto names = node.param<std::vector<std::string>>("cameras");
+    pending_.resize(names.size());
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      // A callback sees every observation in sequence; update() reads them.
+      cameras_.push_back(node.subscribe<Observation>(
+          "/" + names[i] + "/state",
+          [this, i](const Observation& o) { pending_[i].Push(o, rejected_); },
+          {.optional = true}));
     }
   }
 
   void update() {
-    const Observation* best = nullptr;
-    for (const auto& camera : cameras_) {
-      if (!camera.updated()) continue;  // each observation counts once
-      const Observation& o = camera.value();
-      if (!Usable(o)) {
-        ++rejected_;
-        continue;
+    std::optional<Observation> best;
+    for (Pending& queue : pending_) {
+      for (std::size_t k = 0; k < queue.count; ++k) {  // each counts once
+        const Observation& o = queue.At(k);
+        if (!Usable(o)) {
+          ++rejected_;
+          continue;
+        }
+        ++accepted_;
+        if (!best.has_value() ||
+            o.x_std_m() + o.y_std_m() < best->x_std_m() + best->y_std_m()) {
+          best = o;
+        }
       }
-      ++accepted_;
-      if (best == nullptr ||
-          o.x_std_m() + o.y_std_m() < best->x_std_m() + best->y_std_m()) {
-        best = &o;
-      }
+      queue.count = 0;
     }
-    if (best != nullptr) {
+    if (best.has_value()) {
       pose_ = best->pose();
       sample_time_ns_ = best->sample_time_ns();
       last_accepted_ = node_.now();
@@ -1056,6 +1077,27 @@ class @PASCAL@ {
   }
 
  private:
+  // A fixed ring of the newest observations, oldest first: no allocation
+  // after construction.
+  struct Pending {
+    std::array<Observation, kMaxPendingObservations> slots{};
+    std::size_t head = 0;  // index of the oldest
+    std::size_t count = 0;
+
+    const Observation& At(std::size_t k) const {
+      return slots[(head + k) % kMaxPendingObservations];
+    }
+    void Push(const Observation& o, std::uint32_t& rejected) {
+      if (count == kMaxPendingObservations) {  // drop the oldest
+        head = (head + 1) % kMaxPendingObservations;
+        --count;
+        ++rejected;
+      }
+      slots[(head + count) % kMaxPendingObservations] = o;
+      ++count;
+    }
+  };
+
   static bool Usable(const Observation& o) {
     for (const double v : {o.pose().x_m(), o.pose().y_m(), o.pose().yaw_rad(),
                            o.x_std_m(), o.y_std_m(), o.yaw_std_rad()}) {
@@ -1068,6 +1110,7 @@ class @PASCAL@ {
   talos::Node& node_;
   talos::Duration timeout_;
   std::vector<talos::Subscription<Observation>> cameras_;
+  std::vector<Pending> pending_;  // per camera, in sequence
   talos::Publisher<State> state_;
   geometry::Pose2d pose_{};  // held while no usable observation arrives
   std::uint64_t sample_time_ns_{0};
@@ -1190,6 +1233,17 @@ TEST_F(@PASCAL@Test, ReadsOnlyTheListedCameras) {
   EXPECT_EQ(Latest().observation_accepted_count(), 0u);
 }
 
+TEST_F(@PASCAL@Test, CountsEveryObservationBetweenTicks) {
+  sim.step(20ms);
+  Observe("front_camera", 1.0, 2.0);
+  Observe("front_camera", 1.0, 2.0, /*valid=*/false);
+  Observe("front_camera", 1.5, 2.0);
+  sim.step(40ms);
+  const State state = Latest();
+  EXPECT_EQ(state.observation_accepted_count(), 2u);
+  EXPECT_EQ(state.observation_rejected_count(), 1u);
+}
+
 struct Result {
   int status;
   std::string output;
@@ -1233,6 +1287,7 @@ PY_ESTIMATOR_NODE = '''\
 @DOC@
 """
 
+import collections
 import math
 
 from @NAME@ import topics
@@ -1248,6 +1303,11 @@ def usable(o):
             and min(o.x_std_m, o.y_std_m, o.yaw_std_rad) > 0)
 
 
+# Observations queued per camera between two update()s: the framework's
+# per-topic, per-drain delivery cap, over a second of a 60 fps camera.
+MAX_PENDING_OBSERVATIONS = 64
+
+
 class @PASCAL@:
     def __init__(self, node):
         self.node = node
@@ -1256,9 +1316,12 @@ class @PASCAL@:
                 or not all(isinstance(c, str) and c for c in cameras)):
             raise ValueError(f"@NAME@: cameras must list camera node names, "
                              f"got {cameras!r}")
-        self.cameras = [
-            node.subscribe(PoseObservation, f"/{camera}/state", optional=True)
-            for camera in cameras]
+        # A callback sees every observation in sequence; update() reads them.
+        self.pending = [collections.deque() for _ in cameras]
+        for camera, queue in zip(cameras, self.pending):
+            node.subscribe(PoseObservation, f"/{camera}/state",
+                           callback=lambda o, q=queue: self.queue(q, o),
+                           optional=True)
         self.timeout_s = node.param("observation_timeout_us", 500_000) / 1e6
         self.state = node.publish(PoseEstimate, topics.STATE)
         self.pose = (0.0, 0.0, 0.0)  # held while no usable observation arrives
@@ -1266,19 +1329,24 @@ class @PASCAL@:
         self.last_accepted_s = None
         self.accepted = self.rejected = 0
 
+    def queue(self, pending, observation):
+        if len(pending) >= MAX_PENDING_OBSERVATIONS:
+            pending.popleft()
+            self.rejected += 1
+        pending.append(observation)
+
     def update(self):
         best = None
-        for camera in self.cameras:
-            if not camera.updated:  # each observation counts once
-                continue
-            o = camera.value
-            if not usable(o):
-                self.rejected += 1
-                continue
-            self.accepted += 1
-            if best is None or (o.x_std_m + o.y_std_m
-                                < best.x_std_m + best.y_std_m):
-                best = o
+        for pending in self.pending:
+            for o in pending:  # each observation counts once
+                if not usable(o):
+                    self.rejected += 1
+                    continue
+                self.accepted += 1
+                if best is None or (o.x_std_m + o.y_std_m
+                                    < best.x_std_m + best.y_std_m):
+                    best = o
+            pending.clear()
         if best is not None:
             self.pose = (best.pose_x_m, best.pose_y_m, best.pose_yaw_rad)
             self.sample_time_ns = best.sample_time_ns
@@ -1371,6 +1439,16 @@ class @PASCAL@Test(unittest.TestCase):
         self.sim.step(0.04)
         self.assertFalse(self.state().valid)
         self.assertEqual(self.state().observation_accepted_count, 0)
+
+    def test_counts_every_observation_between_ticks(self):
+        self.sim.step(0.02)
+        self.observe("front_camera", 1.0, 2.0)
+        self.observe("front_camera", 1.0, 2.0, valid=False)
+        self.observe("front_camera", 1.5, 2.0)
+        self.sim.step(0.04)
+        state = self.state()
+        self.assertEqual((state.observation_accepted_count,
+                          state.observation_rejected_count), (2, 1))
 
 
 class BinaryTest(unittest.TestCase):

@@ -294,8 +294,11 @@ writes the package (topics-only `talos_messages`, the node, a Sim test of the
 disabled and stale cases), `subsystems/localizer.toml` with `cameras = []`,
 the `[[subsystems]]` entry and the manifests. The generated node subscribes
 to `/<camera>/state` for each name in `cameras` with `optional = true`, so a
-robot without that camera still passes the graph lint, and reads each
-observation once (`updated`). Rules every estimator keeps:
+robot without that camera still passes the graph lint, with a callback that
+queues every observation in sequence (at most 64 per camera; the oldest is
+dropped and counted as rejected) for `update()` to read once. A latest-value
+read (`updated`) would lose every observation but the newest between ticks.
+Rules every estimator keeps:
 
 - Never gate on `robot_enabled`: it writes no actuator, and the pose must be
   right before the match is enabled.

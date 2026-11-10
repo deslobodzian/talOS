@@ -111,6 +111,17 @@ TEST_F(LocalizerTest, ReadsOnlyTheListedCameras) {
   EXPECT_EQ(Latest().observation_accepted_count(), 0u);
 }
 
+TEST_F(LocalizerTest, CountsEveryObservationBetweenTicks) {
+  sim.step(20ms);
+  Observe("front_camera", 1.0, 2.0);
+  Observe("front_camera", 1.0, 2.0, /*valid=*/false);
+  Observe("front_camera", 1.5, 2.0);
+  sim.step(40ms);
+  const State state = Latest();
+  EXPECT_EQ(state.observation_accepted_count(), 2u);
+  EXPECT_EQ(state.observation_rejected_count(), 1u);
+}
+
 struct Result {
   int status;
   std::string output;
