@@ -1,8 +1,9 @@
 // The 3D spatial viewport: the chassis pose in three dimensions, with an
 // optional user-loaded field model. The old Spatial view, reading its pose
-// from useSnapshot(). The WebGL canvas only renders in a browser; under
-// react-dom/server it renders a placeholder, so the registry test can render
-// every panel without a WebGL context.
+// from useSnapshot(); a pose whose frame is no longer current is drawn
+// translucent and marked STALE. The WebGL canvas only renders in a browser;
+// under react-dom/server it renders a placeholder, so the registry test can
+// render every panel without a WebGL context.
 
 import {useEffect, useRef, useState} from 'react';
 import {Canvas, useThree} from '@react-three/fiber';
@@ -10,8 +11,9 @@ import * as THREE from 'three';
 import {OrbitControls} from 'three/examples/jsm/controls/OrbitControls.js';
 import {GLTFLoader} from 'three/examples/jsm/loaders/GLTFLoader.js';
 
-import {poseValid} from '../../core';
-import {useSnapshot} from '../../data/hooks';
+import {chassisReading} from '../../data/freshness';
+import {usePlayback, useSnapshot} from '../../data/hooks';
+import {FIELD_HEIGHT_M, FIELD_WIDTH_M} from '../field/geometry';
 import type {PanelDefinition} from '../types';
 import './pose3d.css';
 
@@ -62,7 +64,7 @@ function disposeModel(model: THREE.Group) {
 
 function Pose3dPanel() {
   const s = useSnapshot();
-  const valid = poseValid(s);
+  const reading = chassisReading(s, usePlayback());
   const [model, setModel] = useState<THREE.Group|null>(null);
   const [error, setError] = useState('');
   const isBrowser = typeof window !== 'undefined';
@@ -88,20 +90,22 @@ function Pose3dPanel() {
              <OrbitNavigation/>
              <ambientLight intensity={1.5}/>
              <directionalLight position={[4, 2, 12]} intensity={2}/>
-             <mesh position={[8.25, 4.1, -.04]}>
-               <boxGeometry args={[16.5, 8.2, .08]}/>
+             <mesh position={[FIELD_WIDTH_M / 2, FIELD_HEIGHT_M / 2, -.04]}>
+               <boxGeometry args={[FIELD_WIDTH_M, FIELD_HEIGHT_M, .08]}/>
                <meshStandardMaterial color="#182d3c"/>
              </mesh>
              <gridHelper args={[18, 18, '#486676', '#29424e']}
-                         rotation={[Math.PI / 2, 0, 0]} position={[8.25, 4.1, 0]}/>
+                         rotation={[Math.PI / 2, 0, 0]}
+                         position={[FIELD_WIDTH_M / 2, FIELD_HEIGHT_M / 2, 0]}/>
              {model && <primitive object={model}/>}
-             {s && <group visible={valid}
-                          position={[s.chassis.x, s.chassis.y, s.chassis.z + .2]}
-                          rotation={[s.chassis.roll, s.chassis.pitch, s.chassis.yaw,
-                                     'ZYX']}>
+             {reading && <group
+                 position={[reading.pose.x, reading.pose.y, reading.pose.z + .2]}
+                 rotation={[reading.pose.roll, reading.pose.pitch, reading.pose.yaw,
+                            'ZYX']}>
                <mesh>
                  <boxGeometry args={[.8, .7, .4]}/>
-                 <meshStandardMaterial color="#48e1cf"/>
+                 <meshStandardMaterial color="#48e1cf" transparent
+                                       opacity={reading.stale ? .35 : 1}/>
                </mesh>
              </group>}
            </Canvas> :
@@ -111,7 +115,8 @@ function Pose3dPanel() {
     </div>
     <div className="panel-footer">
       Z UP · METERS
-      {!valid && <span role="status">Pose unavailable</span>}
+      {!reading && <span role="status">Pose unavailable</span>}
+      {reading?.stale && <span className="text-warn" role="status">Pose STALE</span>}
       {isBrowser && <label className="file">
         Load field GLB
         <input

@@ -9,6 +9,7 @@ import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 
 import type {Snapshot} from '../src/core';
+import {chassisReading} from '../src/data/freshness';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
 import {fieldPanel} from '../src/panels/field';
 import {
@@ -143,6 +144,21 @@ function frame(seq: number): Snapshot {
     labels: {}
   };
 }
+
+test('the drawn chassis pose is stale once its frame is a second behind the clock', () => {
+  const last = frame(3);
+  const at = (clock_ns: string|null) =>
+      chassisReading(last, {cursor_ns: last.timestamp_ns, clock_ns});
+  const after = (ns: bigint) => (BigInt(last.timestamp_ns) + ns).toString();
+  assert.deepEqual(at(after(999_999_999n)), {pose: last.chassis, stale: false});
+  // Telemetry stopped: the cursor holds the last frame while the clock runs on.
+  assert.deepEqual(at(after(1_000_000_000n)), {pose: last.chassis, stale: true});
+  // No current time known: the last pose is not current either.
+  assert.equal(at(null)?.stale, true);
+  // A frame without a valid pose draws no chassis at all.
+  const invalid = {...last, channels: {...last.channels, 'pose/valid': 0}};
+  assert.equal(chassisReading(invalid, {cursor_ns: last.timestamp_ns}), null);
+});
 
 function renderField(studio: Studio): string {
   return renderToStaticMarkup(

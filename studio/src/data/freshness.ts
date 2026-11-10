@@ -1,3 +1,4 @@
+import {poseValid, type Pose, type Snapshot} from '../core';
 import type {SystemNode} from '../system';
 import type {PlaybackState, SystemState} from './types';
 
@@ -16,6 +17,20 @@ export function sampleStale(sample_ns: string|null, clock_ns: string|null) {
 export function readingClock(
     playback: Pick<PlaybackState, 'clock_ns'|'cursor_ns'>): string|null {
   return playback.clock_ns === undefined ? playback.cursor_ns : playback.clock_ns;
+}
+
+// The chassis pose the field and 3D views draw. Null without a frame or when
+// the frame carries no valid pose. The pose is frame-level, so it is as old as
+// its frame: telemetry that stopped leaves the last pose on screen, `stale`.
+export function chassisReading(
+    snapshot: Snapshot|null,
+    playback: Pick<PlaybackState, 'clock_ns'|'cursor_ns'>):
+    {pose: Pose; stale: boolean}|null {
+  if (!snapshot || !poseValid(snapshot)) return null;
+  return {
+    pose: snapshot.chassis,
+    stale: sampleStale(snapshot.timestamp_ns, readingClock(playback))
+  };
 }
 
 // The bridge refreshes the system graph every 250 ms. Four missed refreshes
