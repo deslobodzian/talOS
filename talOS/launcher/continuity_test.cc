@@ -9,7 +9,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -151,8 +153,14 @@ can_id = 2
                                << "    cat <<'TALOS_DESCRIBE'\n"
                                << introspect::DescribeToJson(hardware)
                                << "TALOS_DESCRIBE\n"
+                               << "    exit 0\n"
                                << "  fi\n"
-                               << "done\nexit 0\n";
+                               << "done\n"
+                               // Alive until the session stops it: an exited
+                               // stub restarts, and a stop that lands before
+                               // its exec makes the session status nonzero.
+                               << "trap 'exit 0' INT TERM\n"
+                               << "while :; do sleep 0.05; done\n";
   std::filesystem::permissions(hardware_stub,
                                std::filesystem::perms::owner_all);
 
@@ -161,7 +169,9 @@ can_id = 2
   options.output_dir = out_dir;
   options.session_id = 1;
   options.simulation = true;
-  options.duration_s = 4;
+  // A ceiling only: the test stops the session once it has checked it, so no
+  // step depends on how fast this build starts a node (sanitizers are slow).
+  options.duration_s = 60;
   options.describe_timeout_ms = 4000;
   options.binary_overrides["//talOS/bridge:hardware_node"] = hardware_stub;
   options.binary_overrides["//talOS/launcher:continuity_source"] =
@@ -170,14 +180,16 @@ can_id = 2
       Runfile("TALOS_SINK_NODE");
 
   int status = -1;
-  std::jthread session{[&] { status = Launcher{options}.Run(); }};
+  std::atomic<bool> ended{false};
+  std::jthread session{[&] {
+    status = Launcher{options}.Run();
+    ended = true;
+  }};
 
   // The restart's clean exit: its log is complete.
   const std::string restart_log =
       out_dir + "/1/continuity_source.restart1.tlog";
-  const auto give_up = std::chrono::steady_clock::now() + 3s;
-  while (!LogFinished(restart_log) &&
-         std::chrono::steady_clock::now() < give_up) {
+  while (!LogFinished(restart_log) && !ended) {
     std::this_thread::sleep_for(20ms);
   }
   if (!LogFinished(restart_log)) {
@@ -192,7 +204,7 @@ can_id = 2
   SharedMemoryPtr segment{kTopic, sizeof(RTMSHeader)};
   const auto* header = static_cast<const RTMSHeader*>(segment.ptr());
   while (header->writer.owner_pid.load(std::memory_order_acquire) != 0 &&
-         std::chrono::steady_clock::now() < give_up) {
+         !ended) {
     std::this_thread::sleep_for(1ms);
   }
   ASSERT_EQ(header->writer.owner_pid.load(std::memory_order_acquire), 0u)
@@ -216,6 +228,9 @@ can_id = 2
       std::this_thread::sleep_for(20ms);
     }
   }
+  // The launcher's stop handler ends the session (and the sink) cleanly.
+  ASSERT_FALSE(ended) << "the session ended before the test stopped it";
+  ::kill(::getpid(), SIGTERM);
   session.join();
 
   EXPECT_EQ(status, 0);

@@ -130,8 +130,14 @@ can_id = 1
                         << "    cat <<'TALOS_DESCRIBE'\n"
                         << introspect::DescribeToJson(hardware)
                         << "TALOS_DESCRIBE\n"
+                        << "    exit 0\n"
                         << "  fi\n"
-                        << "done\nexit 0\n";
+                        << "done\n"
+                        // Alive until the session ends: an exited stub
+                        // restarts, and the end's SIGINT landing before the
+                        // restart's exec makes the session status nonzero.
+                        << "trap 'exit 0' INT TERM\n"
+                        << "while :; do sleep 0.05; done\n";
     std::filesystem::permissions(stub, std::filesystem::perms::owner_all);
   }
 
