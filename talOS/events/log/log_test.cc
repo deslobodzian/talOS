@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -1024,6 +1025,56 @@ TEST(LogSummary, MatchesTheReaderAndRejectsTheSameCorruption) {
   WriteFixture(path, LogWriter::kDefaultBufferBytes);
   FlipByte(path, 0);
   EXPECT_THROW(SummarizeLog(path), std::runtime_error);
+  ::unlink(path.c_str());
+}
+
+// VisitLog hands over exactly the records LogReader returns, payloads
+// zero-filled alike, past a damaged one; a manifest callback returning false
+// skips the records, and a record callback returning false stops the walk.
+TEST(LogSummary, VisitorSeesWhatTheReaderReturns) {
+  const std::string path = TempPath("visit");
+  const std::vector<ExpectedRecord> expected =
+      WriteFixture(path, LogWriter::kDefaultBufferBytes);
+  FlipByte(path, FixtureRecordOffset(expected, expected.size() / 2) + 8);
+
+  std::vector<std::pair<RecordHeader, std::vector<std::byte>>> visited;
+  std::size_t entries = 0;
+  LogSummary summary =
+      VisitLog(path, {.manifest =
+                          [&](std::span<const ManifestEntry> manifest) {
+                            entries = manifest.size();
+                            return true;
+                          },
+                      .record =
+                          [&](const LogReader::Record& record) {
+                            visited.emplace_back(
+                                record.header,
+                                std::vector<std::byte>(record.payload.begin(),
+                                                       record.payload.end()));
+                            return true;
+                          }});
+  LogReader reader{path};
+  EXPECT_EQ(entries, reader.manifest().size());
+  LogReader::Record record;
+  std::size_t i = 0;
+  while (reader.next(record)) {
+    SCOPED_TRACE(i);
+    ASSERT_LT(i, visited.size());
+    EXPECT_EQ(
+        std::memcmp(&visited[i].first, &record.header, sizeof(RecordHeader)),
+        0);
+    EXPECT_TRUE(std::ranges::equal(visited[i].second, record.payload));
+    ++i;
+  }
+  EXPECT_EQ(i, visited.size());
+  EXPECT_EQ(summary.damage.spans, 1u);
+
+  summary = VisitLog(path, {.manifest = [](auto) { return false; },
+                            .record = [](const auto&) { return true; }});
+  EXPECT_EQ(summary.record_count, 0u);
+  summary = VisitLog(
+      path, {.record = [](const LogReader::Record&) { return false; }});
+  EXPECT_EQ(summary.record_count, 1u);
   ::unlink(path.c_str());
 }
 

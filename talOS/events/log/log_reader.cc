@@ -454,7 +454,9 @@ bool LogReader::next(Record& out) {
   return true;
 }
 
-LogSummary SummarizeLog(std::string_view path) {
+LogSummary SummarizeLog(std::string_view path) { return VisitLog(path, {}); }
+
+LogSummary VisitLog(std::string_view path, const LogVisitor& visitor) {
   LogStream stream{path};
   constexpr std::size_t kVersionEnd = offsetof(FileHeader, header_bytes);
   FileHeader header{};
@@ -475,11 +477,13 @@ LogSummary SummarizeLog(std::string_view path) {
   std::uint64_t schemas = 0;
   std::optional<std::uint32_t> overrun;
   std::uint64_t scan_payload_bytes = kMinScanPayloadBytes;
+  std::vector<ManifestEntry> entries;
   for (std::uint32_t i = 0; i < header.manifest_count; ++i) {
     ManifestEntry entry{};
     if (stream.read(entry) < sizeof(entry)) {
       throw IncompleteLogHeader("LogReader: file too short for its manifest");
     }
+    if (visitor.manifest) entries.push_back(entry);
     crc = crc32(
         std::span<const std::byte>{reinterpret_cast<const std::byte*>(&entry),
                                    sizeof(entry)},
@@ -504,6 +508,9 @@ LogSummary SummarizeLog(std::string_view path) {
         "LogReader: schema block longer than its manifest's schemas");
   }
 
+  LogSummary summary;
+  if (visitor.manifest && !visitor.manifest(entries)) return summary;
+
   // The records, through a fixed window that a resynchronising scan can
   // also move back over.
   FileSource source{stream.fd()};
@@ -511,12 +518,25 @@ LogSummary SummarizeLog(std::string_view path) {
       std::uint64_t{header.header_bytes} +
       std::uint64_t{header.manifest_count} * sizeof(ManifestEntry) +
       header.schema_bytes;
-  LogSummary summary;
   std::optional<RecordHeader> last;
+  std::vector<std::byte> payload;
   while (const std::optional<RecordHeader> record =
              locate(source, cursor, scan_payload_bytes, summary.damage, last)) {
-    cursor += sizeof(RecordHeader) + record->stored_bytes;
+    const std::uint64_t body = cursor + sizeof(RecordHeader);
+    cursor = body + record->stored_bytes;
     ++summary.record_count;
+    if (!visitor.record) continue;
+    // locate() checked that the stored bytes are within the file.
+    payload.assign(record->payload_bytes, std::byte{0});
+    for (std::size_t at = 0; at < record->stored_bytes;) {
+      const std::span<const std::byte> bytes = source.view(
+          body + at,
+          std::min<std::size_t>(record->stored_bytes - at, FileSource::kChunk));
+      if (bytes.empty()) break;
+      std::memcpy(payload.data() + at, bytes.data(), bytes.size());
+      at += bytes.size();
+    }
+    if (!visitor.record(LogReader::Record{*record, payload})) break;
   }
   summary.truncated = summary.damage.tail_bytes != 0;
   return summary;

@@ -102,7 +102,9 @@ struct RobotConfig {
   uint16_t local_port{5803};
 
   // Launcher log retention: sessions kept under the log root (the new one
-  // included) and the root's byte budget. Both positive integers.
+  // included; the newest matches and unclassifiable sessions may exceed it)
+  // and the root's byte budget.
+  // Both positive integers. See talOS/launcher/README.md.
   int64_t log_keep_sessions{50};
   int64_t log_max_bytes{int64_t{2} * 1024 * 1024 * 1024};
 

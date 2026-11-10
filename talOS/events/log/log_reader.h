@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -127,6 +128,20 @@ struct LogSummary {
   LogDamage damage;
 };
 LogSummary SummarizeLog(std::string_view path);
+
+// What SummarizeLog walks, handed to a caller as it goes, through the same
+// fixed window: the manifest block once its checksum validates, then each
+// intact record (resynchronised past damage exactly as LogReader::next is).
+struct LogVisitor {
+  // The manifest's entries, before any record; false skips the records.
+  std::function<bool(std::span<const ManifestEntry>)> manifest;
+  // One record, its payload zero-filled to payload_bytes as LogReader's;
+  // valid only during the call. False stops the walk.
+  std::function<bool(const LogReader::Record&)> record;
+};
+// Throws what SummarizeLog throws. The summary counts the records walked:
+// fewer than the log holds when a callback stopped the walk.
+LogSummary VisitLog(std::string_view path, const LogVisitor& visitor);
 
 // A session directory's event logs: every `*.tlog` in it (the launcher
 // writes one per node run, restarts included), sorted by path. A path that is

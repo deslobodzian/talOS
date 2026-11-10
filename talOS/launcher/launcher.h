@@ -53,6 +53,7 @@
 #include "talOS/launcher/file_digest.h"
 #include "talOS/launcher/service_notifier.h"
 #include "talOS/launcher/session_lock.h"
+#include "talOS/launcher/session_retention.h"
 #include "talOS/process/durable_sync.h"
 #include "talOS/rtms/rtms.h"
 #include "talOS/schema/identity.h"
@@ -2938,7 +2939,7 @@ class Launcher {
   enum class Retained {
     kNo,         // Not a session: left alone.
     kSession,    // A recording: counted against log_keep_sessions and the
-                 // byte budget, oldest removed first.
+                 // byte budget, removed in ApplyRetention's order.
     kAbandoned,  // A launch that started no node and recorded nothing:
                  // never counted, removed once another session directory
                  // is newer.
@@ -3036,16 +3037,29 @@ class Launcher {
     return bytes;
   }
 
-  // Removes the oldest sessions (Classify) until at most `log_keep_sessions`
-  // remain (the new one included) and they hold at most the half of
-  // `log_max_bytes` the new session does not get, and every abandoned launch
-  // older than another session directory. Returns the new session's log
-  // budget: the other half, which its event writers are capped to.
+  // Removes sessions (Classify) until at most `log_keep_sessions` remain (the
+  // new one included) and they hold at most the half of `log_max_bytes` the
+  // new session does not get, and every abandoned launch older than another
+  // session directory. Returns the new session's log budget: the other half,
+  // which its event writers are capped to.
+  // The newest kProtectedMatches of the sessions that ran a match or that
+  // this build cannot classify (InspectSession) are protected. Sessions go in
+  // order, each group oldest first by the start time its manifest records
+  // (the directory's modification time without one): those that ran no
+  // match and unprotected unclassifiable ones, then unprotected matches,
+  // then the protected, which are never removed for the count, only while
+  // the byte budget is still exceeded once nothing else is left. Removing a
+  // match or an unclassifiable session is reported as a warning.
   // Graph/manifest metadata and non-event captures require separate headroom.
   // A session that cannot be read or removed (another user's, unreadable,
   // removed meanwhile) is reported and passed over, never counted against
-  // the others: retention never stops a launch. The session --replay-inputs
-  // reads is passed over too: this launch is about to read it.
+  // the others: retention never stops a launch.
+  // Only a launch holding the session lock removes anything: that proves no
+  // other launch in this shared-memory namespace is recording, so a manifest
+  // without an end_wall_ns is one whose launcher died (a power loss), not a
+  // live one.
+  // --describe-only and --replay-inputs run beside a live session and only
+  // get the budget.
   uint64_t ApplyRetention(const config::RobotConfig& config) {
     namespace fs = std::filesystem;
     // Config load refuses a wrong type or a nonpositive value.
@@ -3054,6 +3068,7 @@ class Launcher {
     const auto session_budget = static_cast<uint64_t>(budget) / 2;
     const uint64_t retained_budget =
         static_cast<uint64_t>(budget) - session_budget;
+    if (session_lock_ == nullptr) return session_budget;
     const auto report = [](std::string_view what, const fs::path& path,
                            const std::error_code& error) {
       std::cerr << "[launcher] retention " << what << " " << path.string()
@@ -3063,7 +3078,19 @@ class Launcher {
       fs::path path;
       fs::file_time_type time;
       uintmax_t bytes;
+      int64_t start_ns{0};  // The age key: wall clock nanoseconds.
+      MatchVerdict verdict{MatchVerdict::kOther};
+      bool protected_match{false};
     };
+    // A directory's modification time on the wall clock, for a session whose
+    // manifest records no start time.
+    const auto wall_ns =
+        [file_now = fs::file_time_type::clock::now(),
+         wall_now = std::chrono::system_clock::now()](fs::file_time_type time) {
+          return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     (time - file_now) + wall_now.time_since_epoch())
+              .count();
+        };
     std::vector<Session> sessions;
     std::vector<Session> abandoned;
     // The newest session directory other than the new one. A launch still
@@ -3079,10 +3106,6 @@ class Launcher {
     for (fs::directory_iterator entry{current.parent_path(), error};
          !error && entry != fs::directory_iterator{}; entry.increment(error)) {
       if (entry->path() == current) continue;  // Counted below.
-      std::error_code ignored;  // An input that is gone is the replay's error.
-      if (!options_.replay_inputs.empty() &&
-          fs::equivalent(entry->path(), options_.replay_inputs, ignored))
-        continue;
       std::error_code unreadable;
       const Retained kind = Classify(*entry, unreadable);
       if (kind == Retained::kNo) {
@@ -3090,6 +3113,10 @@ class Launcher {
         continue;
       }
       const auto time = entry->last_write_time(unreadable);
+      // Before TreeBytes: it may leave its verdict in the directory.
+      const SessionFacts facts = unreadable || kind == Retained::kAbandoned
+                                     ? SessionFacts{}
+                                     : InspectSession(entry->path());
       const uintmax_t bytes = unreadable || kind == Retained::kAbandoned
                                   ? 0
                                   : TreeBytes(entry->path(), unreadable);
@@ -3103,7 +3130,10 @@ class Launcher {
         continue;
       }
       total += bytes;
-      sessions.push_back({entry->path(), time, bytes});
+      sessions.push_back(
+          {entry->path(), time, bytes,
+           facts.start_wall_ns > 0 ? facts.start_wall_ns : wall_ns(time),
+           facts.verdict});
     }
     if (error) {
       // A partial listing could remove a session newer than one it missed.
@@ -3116,14 +3146,55 @@ class Launcher {
       fs::remove_all(launch.path, removal);
       if (removal) report("cannot remove", launch.path, removal);
     }
-    std::sort(
-        sessions.begin(), sessions.end(),
-        [](const Session& a, const Session& b) { return a.time < b.time; });
+    std::sort(sessions.begin(), sessions.end(),
+              [](const Session& a, const Session& b) {
+                return std::tie(a.start_ns, a.path) <
+                       std::tie(b.start_ns, b.path);
+              });
+    int protected_left = kProtectedMatches;
+    for (auto session = sessions.rbegin(); session != sessions.rend();
+         ++session) {
+      if (session->verdict != MatchVerdict::kOther && protected_left > 0) {
+        session->protected_match = true;
+        --protected_left;
+      }
+    }
+    // Removal order, each group oldest first: no match or unclassifiable, an
+    // older match, one of the protected.
+    std::stable_sort(sessions.begin(), sessions.end(),
+                     [](const Session& a, const Session& b) {
+                       const auto group = [](const Session& session) {
+                         return session.protected_match                   ? 2
+                                : session.verdict == MatchVerdict::kMatch ? 1
+                                                                          : 0;
+                       };
+                       return group(a) < group(b);
+                     });
     // The new session counts too, before it holds anything.
     std::size_t count = sessions.size() + 1;
     for (const auto& session : sessions) {
-      if (count <= static_cast<uint64_t>(cap) && total <= retained_budget)
-        break;
+      const bool over_bytes = total > retained_budget;
+      if (count <= static_cast<uint64_t>(cap) && !over_bytes) break;
+      // A protected match yields only to the byte budget, the disk's floor.
+      if (session.protected_match && !over_bytes) break;
+      if (session.verdict != MatchVerdict::kOther) {
+        std::cerr << "[launcher] WARNING: retention removes "
+                  << (session.verdict == MatchVerdict::kMatch
+                          ? "match session "
+                          : "session (match or not, unreadable by this "
+                            "build) ")
+                  << session.path.string() << " (" << session.bytes
+                  << " bytes): "
+                  << (over_bytes ? "older sessions exceed half of "
+                                   "[robot] log_max_bytes"
+                                 : "more than [robot] log_keep_sessions")
+                  << (session.protected_match
+                          ? ", although it is one of the newest " +
+                                std::to_string(kProtectedMatches) +
+                                " matches or unclassifiable sessions"
+                          : std::string{})
+                  << "\n";
+      }
       std::error_code removal;
       fs::remove_all(session.path, removal);
       // One left in place is passed over like an unreadable one, rather than

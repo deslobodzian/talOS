@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -18,8 +19,10 @@
 #include <thread>
 #include <vector>
 
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/events/input_replay.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/hardware/packet.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/launcher/file_digest.h"
@@ -1612,8 +1615,9 @@ TEST(LauncherSessions, RetentionPassesOverLockedSessions) {
 // (graph.json too: --describe-only, a refused graph), is an abandoned launch:
 // never counted, and removed once another session directory is newer, so the
 // newest stays. Another session's log or any other file leaves a directory
-// alone, only session directories decide the newest, and the session a
-// replay reads is never removed under it.
+// alone, and only session directories decide the newest. Only a launch that
+// holds the session lock removes anything: a replay (or --describe-only) runs
+// beside a live session that may look like any of these.
 TEST(LauncherSessions, RetentionPrunesReplayOutputAndAbandonedLaunchesOnly) {
   auto options = SessionFixture("leftovers");
   const std::string root = options.output_dir;
@@ -1649,16 +1653,215 @@ TEST(LauncherSessions, RetentionPrunesReplayOutputAndAbandonedLaunchesOnly) {
   options.replay_inputs = dir(7);
   options.only = "alpha";
   ASSERT_EQ(Launcher{options}.Run(), 0);
-  // 14 and 10 fill log_keep_sessions = 2 beside the replayed 7, so the replay
-  // output 6 goes; the abandoned 8, 9 and 13 count for nothing and are older
-  // than 11.
-  for (const int id : {6, 8, 9, 13}) {
+  for (const int id : {6, 7, 8, 9, 10, 11, 12, 13}) {
+    EXPECT_TRUE(std::filesystem::exists(dir(id))) << id;
+  }
+  options.session_id = 15;
+  options.replay_inputs.clear();
+  options.only.clear();
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  // 15 and 10 fill log_keep_sessions = 2, so the older 6 and 7 go; the
+  // abandoned 8, 9, 11 and 13 count for nothing and are older than the
+  // replay's directory 14.
+  for (const int id : {6, 7, 8, 9, 11, 13}) {
     EXPECT_FALSE(std::filesystem::exists(dir(id))) << id;
   }
-  for (const int id : {7, 10, 11, 12, 14}) {
+  for (const int id : {10, 12, 14, 15}) {
     EXPECT_TRUE(std::filesystem::exists(dir(id))) << id;
   }
   EXPECT_EQ(ReadFile(dir(2026) + "/photo.jpg"), "not a session");
+  std::filesystem::remove_all(root);
+}
+
+// The manifest a launch at `start_s` on the wall clock leaves in `dir`.
+void WriteSessionManifest(const std::string& dir, uint64_t id,
+                          int64_t start_s) {
+  std::filesystem::create_directories(dir);
+  SessionManifest manifest;
+  manifest.session_id = id;
+  manifest.output_dir = dir;
+  manifest.start_wall_ns = start_s * 1'000'000'000;
+  std::ofstream{dir + "/manifest.json"} << manifest.ToJson();
+}
+
+// `node`'s event log in `dir`: one received Driver Station packet per entry
+// of `fms`, FMS attached or not, and `pad_bytes` of other recording.
+void WriteDriverStationLog(const std::string& dir, const std::string& node,
+                           uint64_t id, const std::vector<bool>& fms,
+                           std::size_t pad_bytes = 0) {
+  using D = talos::Descriptor<hardware::Packet>;
+  event::Registration source;
+  source.id = 1;
+  source.kind = event::SourceKind::WATCHER;
+  source.name = hardware::kDriverStationTopic;
+  source.message_bytes = sizeof(hardware::Packet);
+  source.schema = {std::string{D::kName}, D::kHash, {}};
+  event::Registration timer;
+  timer.id = 2;
+  timer.kind = event::SourceKind::TIMER;
+  timer.name = "pad";
+  timer.message_bytes = 64;
+  timer.period_ns = 1'000'000;
+  event::log::LogWriter writer{
+      dir + "/" + node + ".tlog", node,
+      event::log::LogWriterOptions{8192, 1, /*background=*/false}, id};
+  writer.start({source, timer},
+               event::MonotonicTime::from_nanos(1'000'000'000));
+  uint64_t index = 0;
+  for (const bool attached : fms) {
+    driver_station::DriverStationData ds;
+    ds.sample_time_us = index + 1;
+    ds.mode_since_us = 1;
+    ds.fms.flags = driver_station::kDsAttached | driver_station::kEnabled |
+                   driver_station::kTeleop |
+                   (attached ? driver_station::kFmsAttached : 0u);
+    hardware::Packet packet{};
+    packet.size =
+        static_cast<uint32_t>(driver_station::Encode(ds, packet.data));
+    event::Context ctx{};
+    ctx.kind = event::EventKind::MESSAGE;
+    ctx.source_id = 1;
+    ctx.dispatch_index = ++index;
+    ctx.event_time =
+        event::MonotonicTime::from_nanos(1'000'000'000 + int64_t(index));
+    ctx.now = ctx.event_time;
+    writer.dispatch(ctx, std::as_bytes(std::span{&packet, 1}));
+  }
+  // Timer records stand in for the rest of the recording.
+  const std::vector<uint8_t> pad(64, 0xA5);
+  for (std::size_t bytes = 0; bytes < pad_bytes; bytes += 128) {
+    event::Context ctx{};
+    ctx.kind = event::EventKind::TIMER;
+    ctx.source_id = 2;
+    ctx.dispatch_index = ++index;
+    ctx.event_time =
+        event::MonotonicTime::from_nanos(1'000'000'000 + int64_t(index));
+    ctx.now = ctx.event_time;
+    writer.dispatch(ctx, std::as_bytes(std::span{pad}));
+  }
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
+}
+
+// A session whose FMS-attached Driver Station packet sits in a log of a
+// format version this build rejects.
+void WriteOldFormatSession(const std::string& dir, uint64_t id,
+                           int64_t start_s) {
+  WriteSessionManifest(dir, id, start_s);
+  WriteDriverStationLog(dir, "late", id, {true});
+  std::fstream log{dir + "/late.tlog",
+                   std::ios::binary | std::ios::in | std::ios::out};
+  const uint32_t old_version = event::log::FORMAT_VERSION - 1;
+  log.seekp(offsetof(event::log::FileHeader, version));
+  log.write(reinterpret_cast<const char*>(&old_version), sizeof old_version);
+}
+
+// OBS-1: sessions that ran no match are removed before older ones that did,
+// or that this build cannot classify, oldest first by the start time their
+// manifests record, whatever the directories' modification times say (a
+// tool reading or touching one moves them).
+TEST(LauncherSessions, RetentionRemovesPitSessionsBeforeAnOlderMatch) {
+  auto options = SessionFixture("match_first");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  std::string configuration{kFixtureToml};
+  configuration.insert(configuration.find("period_us"),
+                       "log_keep_sessions = 4\n");
+  std::ofstream{options.config_path} << configuration;
+  const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
+  // 1, a match: the node that received the fewest bytes died before the
+  // field link and saw only an unattached Driver Station.
+  WriteSessionManifest(dir(1), 1, 1001);
+  WriteDriverStationLog(dir(1), "early", 1, {false});
+  WriteDriverStationLog(dir(1), "late", 1, {false, true}, 4096);
+  // 2, unclassifiable: its log is of a format version this build rejects.
+  WriteOldFormatSession(dir(2), 2, 1002);
+  for (const int id : {3, 4, 5}) {
+    WriteSessionManifest(dir(id), id, 1000 + id);
+    WriteDriverStationLog(dir(id), "late", id, {false});
+  }
+  // Modification times disagree with the start times: 3 was touched last.
+  const auto now = std::filesystem::file_time_type::clock::now();
+  for (const auto& [id, age] :
+       {std::pair{5, 5}, std::pair{1, 4}, std::pair{2, 3}, std::pair{4, 2},
+        std::pair{3, 1}}) {
+    std::filesystem::last_write_time(dir(id), now - std::chrono::hours{age});
+  }
+  options.session_id = 6;
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  // log_keep_sessions = 4 keeps the new 6 and three others: the match 1,
+  // the unclassifiable 2 and the newest pit session 5.
+  for (const int id : {3, 4}) {
+    EXPECT_FALSE(std::filesystem::exists(dir(id))) << id;
+  }
+  for (const int id : {1, 2, 5, 6}) {
+    EXPECT_TRUE(std::filesystem::exists(dir(id) + "/manifest.json")) << id;
+  }
+  std::filesystem::remove_all(root);
+}
+
+// Only the newest kProtectedMatches unclassifiable sessions are protected:
+// after a log format change makes every older session unclassifiable, the
+// rest go oldest first with the pit sessions, not the newest pit session.
+TEST(LauncherSessions, RetentionProtectsOnlyTheNewestUnclassifiableSessions) {
+  auto options = SessionFixture("unknown_floor");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  const int unknown = kProtectedMatches + 1;
+  std::string configuration{kFixtureToml};
+  configuration.insert(
+      configuration.find("period_us"),
+      "log_keep_sessions = " + std::to_string(unknown + 1) + "\n");
+  std::ofstream{options.config_path} << configuration;
+  const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
+  for (int id = 1; id <= unknown; ++id) {
+    WriteOldFormatSession(dir(id), id, 1000 + id);
+  }
+  const int pit = unknown + 1;
+  WriteSessionManifest(dir(pit), pit, 1000 + pit);
+  WriteDriverStationLog(dir(pit), "late", pit, {false});
+  options.session_id = pit + 1;
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  EXPECT_FALSE(std::filesystem::exists(dir(1)));
+  for (const int id : {2, unknown, pit, pit + 1}) {
+    EXPECT_TRUE(std::filesystem::exists(dir(id) + "/manifest.json")) << id;
+  }
+  std::filesystem::remove_all(root);
+}
+
+// The newest matches outlast log_keep_sessions, and yield, oldest first, only
+// to the byte budget older sessions get (half of log_max_bytes).
+TEST(LauncherSessions, RetentionRemovesAMatchOnlyForTheByteBudget) {
+  auto options = SessionFixture("match_floor");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  const auto configure = [&options](std::string_view keys) {
+    std::string configuration{kFixtureToml};
+    configuration.insert(configuration.find("period_us"), keys);
+    std::ofstream{options.config_path} << configuration;
+  };
+  const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
+  for (const int id : {1, 2}) {
+    WriteSessionManifest(dir(id), id, 1000 + id);
+    WriteDriverStationLog(dir(id), "late", id, {true}, 1'000'000);
+  }
+  WriteSessionManifest(dir(3), 3, 1003);
+  WriteDriverStationLog(dir(3), "late", 3, {false});
+
+  configure("log_keep_sessions = 1\n");
+  options.session_id = 4;
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  EXPECT_FALSE(std::filesystem::exists(dir(3)));
+  EXPECT_TRUE(std::filesystem::exists(dir(1)));
+  EXPECT_TRUE(std::filesystem::exists(dir(2)));
+
+  // 1.5 MB for older sessions: the two matches' 2 MB no longer fit.
+  configure("log_keep_sessions = 1\nlog_max_bytes = 3000000\n");
+  options.session_id = 5;
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  EXPECT_FALSE(std::filesystem::exists(dir(1)));
+  EXPECT_FALSE(std::filesystem::exists(dir(4)));
+  EXPECT_TRUE(std::filesystem::exists(dir(2) + "/manifest.json"));
   std::filesystem::remove_all(root);
 }
 

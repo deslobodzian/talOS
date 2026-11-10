@@ -544,7 +544,7 @@ capped log's rotation also syncs the finished segment and the next one's
 header with `DurableSync`, then the directory, so a power loss leaves whole
 segments (`LogWriter`).
 
-At startup, retention removes the oldest sessions: directories holding a
+At startup, retention removes older sessions: directories holding a
 `manifest.json`, or, named by a session id, an event log whose header carries
 that id (what `--replay-inputs` leaves). `[robot] log_keep_sessions` defaults
 to 50, including the new session; `log_max_bytes` defaults to 2 GiB. Both must
@@ -555,7 +555,44 @@ member's expected record rate (one record per declared source per
 `SplitLogBudget`). Restarts share their member's remaining budget, but never
 get less than half of its share: to make that room the launcher deletes the
 earlier runs' oldest log files (never the newest file of the run that just
-ended) and marks those runs `log_capped`. Older sessions are retained within the other half. A directory named
+ended) and marks those runs `log_capped`. Older sessions are retained within the other half.
+
+Only a launch that starts the roster, and so holds the session lock,
+removes anything; `--describe-only` and `--replay-inputs` launches, which run
+beside a live session, remove nothing. Holding the lock is what tells a
+session whose manifest has no `end_wall_ns` (its launcher lost power) from a
+live one in the same shared-memory namespace (`TALOS_SHM_NAMESPACE`); a
+launcher in another namespace must not share the log root. The newest 16
+sessions (`kProtectedMatches`, `session_retention.h`) that ran a match or
+that this build cannot classify are protected. Sessions are removed in this
+order, each group oldest first by the `start_wall_ns` its manifest records
+(the directory's modification time when it has none, as for
+`--replay-inputs` output), never by the modification time of a session that
+has one: sessions that ran no match, together with unprotected
+unclassifiable ones; then unprotected matches; then the protected. The
+protected are kept even beyond `log_keep_sessions`; one is removed only while
+the older sessions still exceed their half of `log_max_bytes` once nothing
+else is left, so that half stays the hard bound on retained event logs.
+Removing a match or an unclassifiable session prints a `WARNING` to the
+launcher's stderr naming it, its size and the limit it exceeded. Start times
+are the main processor's wall clock, so a coprocessor without a real-time
+clock or time sync orders sessions only as well as its clock survives a
+reboot.
+
+A session is a match when it has a launch manifest (so not `--replay-inputs`
+output, even of a match), its launch was not `--sim`, and any node's event
+log holds a received `/hw/state/driver_station` packet with the FMS
+attached; nodes are read smallest first, each log streamed with
+`event::log::VisitLog`, until one does. A session none of whose logs does,
+but with a log of another format version or a packet this build cannot
+decode, cannot be classified. The verdict is cached in the session's
+`session_class` file and read before any log is opened: `match` for good,
+`other` until the session's event log bytes change, `unknown` until they
+change or this build's log format, `Packet` size or Driver Station codec
+differs. A session's logs are therefore read once while that file can be
+written.
+
+A directory named
 by a session id that holds nothing, or only what a launch writes before it
 starts its nodes (`graph.json`, `declared_graph.json`, the `.tmp` of an
 interrupted write, and the empty `.tlog` a node leaves when it dies between
@@ -568,10 +605,9 @@ once another session directory is newer: one newer than every other (a
 the next launch, and a crash loop, refused graphs included, leaves one such
 directory instead of evicting recorded sessions. Symlinks, other directories
 (including one named by a session id that holds another session's log or any
-other file), the current session and the session `--replay-inputs` reads are
-not deleted. A session retention cannot read or remove (another user's,
-unreadable, removed meanwhile) is reported and passed over; it never stops a
-launch. Graph/manifest metadata, non-event captures and the members' output
+other file) and the current session are not deleted. A session retention
+cannot read or remove (another user's, unreadable, removed meanwhile) is
+reported and passed over; it never stops a launch. Graph/manifest metadata, non-event captures and the members' output
 logs (`<name>.log`, [node output](#node-output)) are outside the event-writer
 caps: each member's output log can reach 64 MiB per session, so reserve
 64 MiB per roster member per retained session beside `log_max_bytes`.

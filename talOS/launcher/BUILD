@@ -6,17 +6,21 @@ load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
 
 cc_library(
     name = "launcher_lib",
+    srcs = ["session_retention.cc"],
     hdrs = [
         "file_digest.h",
         "launcher.h",
         "service_notifier.h",
         "session_lock.h",
+        "session_retention.h",
     ],
     visibility = ["//visibility:public"],
     deps = [
         "//talOS/configuration",
+        "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/hardware",
         "//talOS/introspection:describe",
         "//talOS/introspection:lock_file",
         "//talOS/introspection:names",
@@ -172,8 +176,10 @@ cc_test(
     srcs = ["launcher_test.cc"],
     deps = [
         ":launcher_lib",
+        "//talOS/driver_station",
         "//talOS/events:events_log",
         "//talOS/events:input_replay",
+        "//talOS/hardware",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "@googletest//:gtest_main",
