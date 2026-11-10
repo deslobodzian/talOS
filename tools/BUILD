@@ -61,5 +61,10 @@ py_test(
     srcs = ["sync_manifest_test.py"],
     data = ["//talOS/configuration:resolution_cases"],
     legacy_create_init = False,
+    # Runs the resolver binary once per case (about 65 runs); under macOS
+    # TSan each start costs about a second, past the small timeout. The
+    # resolver starts no threads, so TSan finds nothing here; ASan still
+    # runs it.
+    tags = ["no_tsan"],
     deps = [":sync_manifest_lib"],
 )
