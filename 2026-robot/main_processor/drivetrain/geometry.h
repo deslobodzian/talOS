@@ -147,12 +147,18 @@ inline SwerveGeometry BuildSwerveGeometry(
     if (!steer.continuous_wrap)
       throw std::invalid_argument(where +
                                   ": steer motor needs continuous_wrap = true");
-    // The steer motor closes its position loop on the module's own encoder.
-    if (steer.feedback == talos::hardware::Feedback::kRemoteCANcoder &&
-        steer.feedback_sensor_id != cancoder.id)
+    // The steer motor closes its position loop on the module's own encoder,
+    // so its position is the absolute azimuth. Rotor feedback would make
+    // every steer angle relative to wherever the rotor booted.
+    if (steer.feedback != talos::hardware::Feedback::kRemoteCANcoder)
       throw std::invalid_argument(
-          where +
-          ": steer motor's feedback sensor is not this module's encoder");
+          where + ": steer motor '" + module.steer +
+          "' needs feedback = \"RemoteCANcoder\" with feedback_sensor = \"" +
+          encoder + "\"");
+    if (steer.feedback_sensor_id != cancoder.id)
+      throw std::invalid_argument(
+          where + ": steer motor '" + module.steer +
+          "' feedback sensor is not this module's encoder '" + encoder + "'");
   }
   return out;
 }

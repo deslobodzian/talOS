@@ -10,6 +10,9 @@ selection_pov_index = 0
 # Eighth-turn directions clockwise from up: right = 2, left = 6.
 selection_next_direction_index = 2
 selection_previous_direction_index = 6
+# Feedback at these tolerances must exceed the drivetrain's wheel hold speed
+# (drivetrain/swerve.h), or a residual error stalls a drive phase
+# (config_golden_test checks it).
 position_tolerance_m = 0.10
 yaw_tolerance_rad = 0.05
 max_linear_mps = 2.0

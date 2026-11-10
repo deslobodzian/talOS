@@ -125,6 +125,43 @@ TEST(Swerve, SteersFromTheCurrentAzimuthAndAStoppedWheelHolds) {
   }
 }
 
+TEST(Swerve, SubThresholdRotationHoldsModuleAngles) {
+  // Heading-hold noise after the driver lets go: a rotation whose wheel
+  // speeds stay under kHoldFraction of each module's top speed must not
+  // re-steer.
+  const SwerveGeometry geometry = Geometry();
+  SwerveKinematics kinematics{geometry};
+  std::array<ModuleState, kModuleCount> current{};
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    current[i].steer_rot = 0.05 * static_cast<double>(i);
+  }
+  double radius_m = 0.0;
+  double max_mps = std::numeric_limits<double>::infinity();
+  for (const SwerveModule& module : geometry.modules) {
+    radius_m = std::max(radius_m, std::hypot(module.x_m, module.y_m));
+    max_mps = std::min(max_mps,
+                       WheelSpeed(module.max_drive_rps, module.wheel_radius_m));
+  }
+  constexpr double kFraction = SwerveKinematics::kHoldFraction;
+  const double below = 0.9 * kFraction * max_mps / radius_m;
+  for (const double omega : {1e-4, below, -below}) {
+    SCOPED_TRACE(omega);
+    const auto held = kinematics.ToModuleStates({0, 0, omega}, current, 0.005);
+    ASSERT_TRUE(held.has_value());
+    for (std::size_t i = 0; i < kModuleCount; ++i) {
+      EXPECT_EQ((*held)[i].drive_rps, 0) << geometry.modules[i].name;
+      EXPECT_NEAR((*held)[i].steer_rot, current[i].steer_rot, 1e-12)
+          << geometry.modules[i].name;
+    }
+  }
+  // Just above the threshold every wheel steers to its rotation angle.
+  const double above = 1.1 * kFraction * max_mps / radius_m;
+  const auto turning = kinematics.ToModuleStates({0, 0, above}, {}, 0.005);
+  ASSERT_TRUE(turning.has_value());
+  EXPECT_NEAR((*turning)[0].steer_rot, 0.125, 1e-9);  // back_left
+  EXPECT_NE((*turning)[0].drive_rps, 0);
+}
+
 TEST(Swerve, RotationDesaturationAndInvalidInput) {
   const SwerveGeometry geometry = Geometry();
   SwerveKinematics kinematics{geometry};
@@ -300,6 +337,22 @@ TEST(SwerveGeometry, RejectsUnknownAndCrossedDeviceReferences) {
   EXPECT_THROW(BuildSwerveGeometry(config, "drivetrain", mutated),
                std::invalid_argument);
 
+  // A steer motor on its own rotor: azimuth would be relative to boot.
+  auto rotor = config;
+  for (auto& motor : rotor.hardware.motors) {
+    if (motor.name == "front_left_steer") {
+      motor.feedback = talos::hardware::Feedback::kRotor;
+    }
+  }
+  try {
+    BuildSwerveGeometry(rotor, "drivetrain", *geometry);
+    ADD_FAILURE() << "Rotor steer feedback was accepted";
+  } catch (const std::invalid_argument& error) {
+    EXPECT_NE(std::string{error.what()}.find("RemoteCANcoder"),
+              std::string::npos)
+        << error.what();
+  }
+
   // A drive motor used as a steer motor (no continuous wrap).
   mutated = *geometry;
   mutated["modules"].as_array()->get(0)->as_table()->insert_or_assign(
@@ -452,8 +505,8 @@ TEST_F(DrivetrainTest, DesaturationSlowsEveryWheelByOneFactorToTheDriveLimit) {
 class DrivetrainSlewTest : public DrivetrainTest {
  protected:
   DrivetrainSlewTest()
-      : DrivetrainTest{ConfigWith("max_linear_accel_mps2 = 2.0\n"
-                                  "max_angular_accel_radps2 = 4.0")} {}
+      : DrivetrainTest{ConfigWith("max_linear_accel_mps2 = 20.0\n"
+                                  "max_angular_accel_radps2 = 40.0")} {}
 
   void ExpectCommand(ChassisSpeeds speeds) {
     SwerveKinematics kinematics{geometry};
@@ -474,14 +527,14 @@ class DrivetrainSlewTest : public DrivetrainTest {
 
 TEST_F(DrivetrainSlewTest, TranslationUsesVectorAccelerationAndConverges) {
   Teleop();
-  // A 3-4-5 diagonal: each 5 ms tick adds 0.01 m/s in magnitude,
-  // not 0.01 m/s independently on each axis.
+  // A 3-4-5 diagonal: each 5 ms tick adds 0.1 m/s in magnitude,
+  // not 0.1 m/s independently on each axis.
   for (int tick = 1; tick <= 7; ++tick) {
     talos::testing::PublishTarget(sim, "drivetrain", "teleop",
-                                  ChassisTarget{0.03, 0.04, 0.0});
+                                  ChassisTarget{0.3, 0.4, 0.0});
     sim.step(5ms);
     const double fraction = std::min(tick / 5.0, 1.0);
-    ExpectCommand({0.03 * fraction, 0.04 * fraction, 0.0});
+    ExpectCommand({0.3 * fraction, 0.4 * fraction, 0.0});
   }
 }
 
@@ -490,15 +543,15 @@ TEST_F(DrivetrainSlewTest,
   Teleop();
   for (int tick = 1; tick <= 7; ++tick) {
     talos::testing::PublishTarget(sim, "drivetrain", "teleop",
-                                  ChassisTarget{0.0, 0.0, 0.1});
+                                  ChassisTarget{0.0, 0.0, 1.0});
     sim.step(5ms);
-    ExpectCommand({0.0, 0.0, std::min(tick * 0.02, 0.1)});
+    ExpectCommand({0.0, 0.0, std::min(tick * 0.2, 1.0)});
   }
   for (int tick = 1; tick <= 12; ++tick) {
     talos::testing::PublishTarget(sim, "drivetrain", "teleop",
-                                  ChassisTarget{0.0, 0.0, -0.1});
+                                  ChassisTarget{0.0, 0.0, -1.0});
     sim.step(5ms);
-    ExpectCommand({0.0, 0.0, std::max(0.1 - tick * 0.02, -0.1)});
+    ExpectCommand({0.0, 0.0, std::max(1.0 - tick * 0.2, -1.0)});
   }
 }
 
@@ -507,8 +560,8 @@ class DrivetrainSlewResetTest : public DrivetrainSlewTest,
 
 TEST_P(DrivetrainSlewResetTest, UnsafeInputNeutralizesAndRestartsFromZero) {
   Teleop();
-  Hold(ChassisTarget{1.0, 0.0, 1.0}, 40ms);
-  ExpectCommand({0.08, 0.0, 0.16});
+  Hold(ChassisTarget{1.0, 0.0, 2.0}, 40ms);
+  ExpectCommand({0.8, 0.0, 1.6});
   switch (GetParam()) {
     case 0:
       talos::testing::ReleaseTarget<ChassisTarget>(sim, "drivetrain", "teleop");
@@ -540,13 +593,50 @@ TEST_P(DrivetrainSlewResetTest, UnsafeInputNeutralizesAndRestartsFromZero) {
   for (const auto& module : geometry.modules)
     hw.set_connected("drivetrain", module.steer, true);
   talos::testing::PublishTarget(sim, "drivetrain", "teleop",
-                                ChassisTarget{1.0, 0.0, 1.0});
+                                ChassisTarget{1.0, 0.0, 2.0});
   sim.step(visibility);
-  ExpectCommand({0.01, 0.0, 0.02});
+  ExpectCommand({0.1, 0.0, 0.2});
 }
 
 INSTANTIATE_TEST_SUITE_P(SafetyGates, DrivetrainSlewResetTest,
                          ::testing::Values(0, 1, 2, 3, 4));
+
+class DrivetrainFieldSlewTest : public DrivetrainTest {
+ protected:
+  DrivetrainFieldSlewTest()
+      : DrivetrainTest{ConfigWith("max_linear_accel_mps2 = 4.0")} {}
+};
+
+TEST_F(DrivetrainFieldSlewTest, ConstantFieldVelocityWhileRotatingIsReached) {
+  // 2 m/s along the field x axis while spinning at 5 rad/s: in the robot
+  // frame the target turns at 5 rad/s, which a robot-frame limit chases at
+  // v * omega = 10 m/s^2 > 4 m/s^2 and settles near 4 / 5 = 0.8 m/s. Limited
+  // in the field frame the target is constant and is reached in 0.5 s.
+  constexpr double kSpeedMps = 2.0;
+  constexpr double kOmegaRadps = 5.0;
+  Teleop();
+  hw.ideal_motors();  // the modules do what they are asked; heading follows
+  for (auto t = 0ms; t < 1000ms; t += 5ms) {
+    const double yaw = State().yaw_rad();
+    talos::testing::PublishTarget(
+        sim, "drivetrain", "teleop",
+        ChassisTarget{kSpeedMps * std::cos(yaw), -kSpeedMps * std::sin(yaw),
+                      kOmegaRadps});
+    sim.step(5ms);
+  }
+  const DrivetrainState state = State();
+  ASSERT_TRUE(state.yaw_valid());
+  EXPECT_NEAR(state.omega_radps(), kOmegaRadps, 0.02 * kOmegaRadps);
+  EXPECT_GT(state.yaw_rad(), 2.0);  // it really turned
+  const double c = std::cos(state.yaw_rad());
+  const double s = std::sin(state.yaw_rad());
+  const double field_vx = c * state.vx_mps() - s * state.vy_mps();
+  const double field_vy = s * state.vx_mps() + c * state.vy_mps();
+  // The measured robot-frame velocity lags the field target by a tick of
+  // rotation (and SE2 discretization skew): a few hundredths of a radian.
+  EXPECT_NEAR(std::hypot(field_vx, field_vy), kSpeedMps, 0.02 * kSpeedMps);
+  EXPECT_NEAR(std::atan2(field_vy, field_vx), 0.0, 0.1);
+}
 
 TEST_F(DrivetrainTest, NeverSentStaysNeutralButStillReportsState) {
   Teleop();

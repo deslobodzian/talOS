@@ -12,15 +12,24 @@ ChassisTarget publisher -> drivetrain node -> hardware bridge -> RoboRIO
 The drivetrain discretizes chassis velocity by taking the SE2 logarithm of
 the desired finite-period translation and rotation, compensating motion skew.
 It selects the shorter steering path, cosine-scales drive speed by azimuth
-error, and desaturates wheel speeds. At zero requested speed it
-holds the measured steering angle. Drive requests
+error, and desaturates wheel speeds. A wheel asked for less than 0.25% of
+its own top speed (its drive `max_velocity_rps` at its wheel radius; 0.0116
+m/s on the robot) holds the measured steering angle at zero drive, so
+heading-hold noise does not re-steer the modules. That is a dead band for any
+pose controller: autonomous's feedback at its `yaw_tolerance_rad` and
+`position_tolerance_m` must exceed it, which
+`configuration/config_golden_test.cc` checks. Drive requests
 use TalonFX velocity control; steering uses position control with continuous
 wrapping. Pose estimation and vision run as separate nodes.
 
 Optional `[subsystem]` parameters `max_linear_accel_mps2` and
 `max_angular_accel_radps2` limit commanded chassis acceleration before
-discretization. Translation uses a vector-magnitude limit, preserving the
-direction of the velocity change; rotation is limited independently. Each
+discretization. Translation uses a vector-magnitude limit in the field frame,
+preserving the direction of the velocity change, so a constant field velocity
+held while rotating is reached rather than chased in the turning robot frame;
+the previous command is rotated by the heading change since the last tick
+(robot-frame limiting while the heading is invalid on either tick). Rotation is
+limited independently. Each
 defaults to `0.0`; non-positive or non-finite values leave that limit disabled.
 The period is the configured node update period, not elapsed wall time.
 Disabled, stale/released or non-finite targets and fewer than two live modules
@@ -40,7 +49,10 @@ ramp rather than resuming the previous command.
   desaturated together against each module's wheel radius and drive maximum.
 - `geometry.h`: the geometry, read from `[subsystems.drivetrain.geometry]`;
   each module names its drive, steer and encoder devices, checked against
-  this subsystem's devices at startup.
+  this subsystem's devices at startup. A steer motor must have
+  `continuous_wrap = true` and `feedback = "RemoteCANcoder"` with
+  `feedback_sensor` naming its own module's encoder; anything else is
+  refused.
 - `drive_message.fbs` and the `topics` in `BUILD`: `drivetrain::ChassisTarget`,
   `drivetrain::DrivetrainState` and `drivetrain::topics::k*`,
   `//2026-robot/main_processor/drivetrain:messages`.

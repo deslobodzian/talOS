@@ -92,8 +92,27 @@ class SwerveKinematics {
     return live_mask < usable_.size() && usable_[live_mask];
   }
 
+  // A wheel asked for less than this fraction of its own top speed holds its
+  // azimuth and is not driven: heading-hold corrections would otherwise
+  // re-steer every module toward a direction that carries no meaningful
+  // motion. It is also a dead band every pose controller must get through:
+  // autonomous's feedback at its yaw and position tolerances must ask for more
+  // than this (configuration/config_golden_test.cc checks the robot configs).
+  static constexpr double kHoldFraction = 0.0025;
+  // Floor for a module without a finite drive limit.
+  static constexpr double kMinHoldSpeedMps = 1e-6;
+
+  // Wheel speed (m/s) below which `module` holds its azimuth.
+  static double HoldSpeed(const SwerveModule& module) {
+    const double max_mps =
+        WheelSpeed(module.max_drive_rps, module.wheel_radius_m);
+    if (!std::isfinite(max_mps)) return kMinHoldSpeedMps;
+    return std::max(kMinHoldSpeedMps, kHoldFraction * std::abs(max_mps));
+  }
+
   // Shortest-path steering, cosine compensation, and one common speed scale
-  // respecting each module's individual drive limit. Stopped wheels hold angle.
+  // respecting each module's individual drive limit. A wheel below its
+  // HoldSpeed holds its angle at zero drive.
   std::optional<std::array<ModuleState, kModuleCount>> ToModuleStates(
       const ChassisSpeeds& speeds,
       const std::array<ModuleState, kModuleCount>& current, double dt_s = 0.0,
@@ -120,7 +139,7 @@ class SwerveKinematics {
       const double wheel_vy = vy + omega * module.x_m;
       double speed = std::hypot(wheel_vx, wheel_vy);
       out[i].steer_rot = current[i].steer_rot;
-      if (speed <= 1e-6) continue;
+      if (speed < HoldSpeed(module)) continue;
       using Rotation = talos::geometry::SO2<double>;
       double delta = (Rotation(ToRadians(current[i].steer_rot)).inverse() *
                       Rotation(std::atan2(wheel_vy, wheel_vx)))

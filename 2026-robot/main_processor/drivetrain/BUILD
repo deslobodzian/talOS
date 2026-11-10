@@ -26,7 +26,9 @@ cc_library(
     ],
     include_prefix = "drivetrain",
     strip_include_prefix = ".",
-    visibility = ["//visibility:private"],
+    # The config golden test checks autonomous's tolerances against the
+    # swerve hold speed.
+    visibility = ["//2026-robot/main_processor/configuration:__pkg__"],
     deps = [
         "//talOS/configuration",
         "//talOS/devices",

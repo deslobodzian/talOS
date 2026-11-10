@@ -101,48 +101,7 @@ class Drivetrain {
     const bool modules_valid = connected && module_times.valid();
 
     ChassisSpeeds speeds{};
-    const ChassisTarget* target = target_.get();
-    const bool valid_target =
-        can_drive && target != nullptr && std::isfinite(target->vx_mps()) &&
-        std::isfinite(target->vy_mps()) && std::isfinite(target->omega_radps());
-    if (!valid_target) commanded_speeds_ = {0.0, 0.0, 0.0};
-    if (can_drive) {
-      speeds = kinematics_.ToChassisSpeeds(measured, live_mask);
-      if (valid_target) {
-        const double dt_s =
-            std::chrono::duration<double>{node_.period()}.count();
-        double dx = target->vx_mps() - commanded_speeds_.vx_mps;
-        double dy = target->vy_mps() - commanded_speeds_.vy_mps;
-        if (std::isfinite(max_linear_accel_mps2_) &&
-            max_linear_accel_mps2_ > 0.0 && dt_s > 0.0) {
-          const double delta = std::hypot(dx, dy);
-          const double limit = max_linear_accel_mps2_ * dt_s;
-          if (delta > limit) {
-            dx *= limit / delta;
-            dy *= limit / delta;
-          }
-        }
-        double domega = target->omega_radps() - commanded_speeds_.omega_radps;
-        if (std::isfinite(max_angular_accel_radps2_) &&
-            max_angular_accel_radps2_ > 0.0 && dt_s > 0.0) {
-          const double limit = max_angular_accel_radps2_ * dt_s;
-          domega = std::clamp(domega, -limit, limit);
-        }
-        commanded_speeds_.vx_mps += dx;
-        commanded_speeds_.vy_mps += dy;
-        commanded_speeds_.omega_radps += domega;
-        const auto setpoints = kinematics_.ToModuleStates(
-            commanded_speeds_, measured, dt_s, live_mask);
-        if (setpoints) {
-          const auto& states = *setpoints;
-          for (std::size_t i = 0; i < kModuleCount; ++i) {
-            if ((live_mask & (1U << i)) == 0) continue;
-            drive_[i].set_velocity(states[i].drive_rps);
-            steer_[i].set_position(states[i].steer_rot);
-          }
-        }
-      }
-    }  // anything not set goes out neutral
+    if (can_drive) speeds = kinematics_.ToChassisSpeeds(measured, live_mask);
 
     // yaw_rad_ keeps the last valid heading while the source is missing.
     bool yaw_valid = false;
@@ -193,6 +152,62 @@ class Drivetrain {
           module_times.oldest_ns = yaw_times.oldest_ns;
       }
     }
+
+    const ChassisTarget* target = target_.get();
+    const bool valid_target =
+        can_drive && target != nullptr && std::isfinite(target->vx_mps()) &&
+        std::isfinite(target->vy_mps()) && std::isfinite(target->omega_radps());
+    if (!valid_target) commanded_speeds_ = {0.0, 0.0, 0.0};
+    // The linear limit applies in the field frame: a constant field velocity
+    // while rotating is a robot-frame vector turning at omega, which a
+    // robot-frame limit would chase at v * omega and so collapse. The last
+    // command is re-expressed in this tick's robot frame by the heading change
+    // since the previous tick; limiting the difference there equals limiting
+    // it in the field frame. Without a valid heading on both ticks the change
+    // is taken as zero: the limit falls back to the robot frame (translation
+    // lags while rotating) rather than trusting a held or jumping heading.
+    const double heading_change_rad =
+        yaw_valid && previous_yaw_valid_ ? yaw_rad_ - previous_yaw_rad_ : 0.0;
+    previous_yaw_valid_ = yaw_valid;
+    previous_yaw_rad_ = yaw_rad_;
+    if (valid_target) {
+      const double cos_change = std::cos(heading_change_rad);
+      const double sin_change = std::sin(heading_change_rad);
+      const double vx = commanded_speeds_.vx_mps;
+      const double vy = commanded_speeds_.vy_mps;
+      commanded_speeds_.vx_mps = cos_change * vx + sin_change * vy;
+      commanded_speeds_.vy_mps = -sin_change * vx + cos_change * vy;
+      double dx = target->vx_mps() - commanded_speeds_.vx_mps;
+      double dy = target->vy_mps() - commanded_speeds_.vy_mps;
+      if (std::isfinite(max_linear_accel_mps2_) &&
+          max_linear_accel_mps2_ > 0.0 && period_s > 0.0) {
+        const double delta = std::hypot(dx, dy);
+        const double limit = max_linear_accel_mps2_ * period_s;
+        if (delta > limit) {
+          dx *= limit / delta;
+          dy *= limit / delta;
+        }
+      }
+      double domega = target->omega_radps() - commanded_speeds_.omega_radps;
+      if (std::isfinite(max_angular_accel_radps2_) &&
+          max_angular_accel_radps2_ > 0.0 && period_s > 0.0) {
+        const double limit = max_angular_accel_radps2_ * period_s;
+        domega = std::clamp(domega, -limit, limit);
+      }
+      commanded_speeds_.vx_mps += dx;
+      commanded_speeds_.vy_mps += dy;
+      commanded_speeds_.omega_radps += domega;
+      const auto setpoints = kinematics_.ToModuleStates(
+          commanded_speeds_, measured, period_s, live_mask);
+      if (setpoints) {
+        const auto& states = *setpoints;
+        for (std::size_t i = 0; i < kModuleCount; ++i) {
+          if ((live_mask & (1U << i)) == 0) continue;
+          drive_[i].set_velocity(states[i].drive_rps);
+          steer_[i].set_position(states[i].steer_rot);
+        }
+      }
+    }  // anything not set goes out neutral
 
     const auto sample_ns =
         modules_valid || yaw_valid
@@ -288,8 +303,12 @@ class Drivetrain {
   double max_linear_accel_mps2_;
   double max_angular_accel_radps2_;
   talos::Subscription<bridge::BridgeStatus> status_;
+  // Robot-frame chassis command after the acceleration limits.
   ChassisSpeeds commanded_speeds_{0.0, 0.0, 0.0};
   double yaw_rad_ = 0;
+  // Heading of the previous tick, for re-expressing commanded_speeds_.
+  double previous_yaw_rad_ = 0;
+  bool previous_yaw_valid_{false};
   std::uint64_t last_integrated_sample_ns_{0};
   std::array<geometry::SwerveModulePosition, kModuleCount> modules_{};
   talos::Target<ChassisTarget> target_;

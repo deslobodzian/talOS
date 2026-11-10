@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstddef>
 #include <string>
 
+#include "drivetrain/geometry.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/vision/field_sim/field_layout_loader.h"
 #include "vision/data/field_layout_2026.h"
@@ -102,6 +104,37 @@ TEST(ConfigTest, FieldDimensionsMatchTheTagLayout) {
       ASSERT_TRUE(width.has_value());
       EXPECT_DOUBLE_EQ(*length, layout.dims.length_m);
       EXPECT_DOUBLE_EQ(*width, layout.dims.width_m);
+    }
+  }
+}
+
+// The drivetrain holds a wheel's azimuth at zero drive below a hold speed
+// (swerve.h). Autonomous ends a drive phase only inside its position and yaw
+// tolerances, so its feedback just outside them must ask every wheel for more
+// than that, with margin; otherwise a residual error the drivetrain will not
+// act on stalls the routine until its drive timeout aborts it.
+TEST(ConfigTest, AutonomousToleranceFeedbackClearsTheSwerveHoldSpeed) {
+  constexpr double kMargin = 1.5;
+  for (const char* path : kDeployments) {
+    SCOPED_TRACE(path);
+    const auto config = ParseRobotConfig(path);
+    const toml::table* autonomous = config.GetSubsystemTable("autonomous");
+    ASSERT_NE(autonomous, nullptr);
+    // The same defaults autonomous.h reads.
+    const double position_tolerance_m =
+        (*autonomous)["position_tolerance_m"].value_or(0.10);
+    const double yaw_tolerance_rad =
+        (*autonomous)["yaw_tolerance_rad"].value_or(0.05);
+    const double kp_xy = (*autonomous)["xy_feedback_per_m_mps"].value_or(1.0);
+    const double kp_yaw =
+        (*autonomous)["yaw_feedback_per_rad_radps"].value_or(1.0);
+    const auto geometry = drivetrain::BuildSwerveGeometry(config, "drivetrain");
+    for (const auto& module : geometry.modules) {
+      SCOPED_TRACE(module.name);
+      const double hold_mps = drivetrain::SwerveKinematics::HoldSpeed(module);
+      EXPECT_GT(kp_xy * position_tolerance_m, kMargin * hold_mps);
+      EXPECT_GT(kp_yaw * yaw_tolerance_rad * std::hypot(module.x_m, module.y_m),
+                kMargin * hold_mps);
     }
   }
 }
