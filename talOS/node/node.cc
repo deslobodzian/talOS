@@ -108,6 +108,10 @@ struct Node::Impl {
   bool immediate_delivery = false;
   bool in_update = false;
   std::uint64_t ticks = 0;
+  // The thread that built the node, which also runs its loop: talos::Run,
+  // testing::Sim and the C ABI do both on one thread. require_loop_thread
+  // accepts sends, and the devices layer's commands, from it alone.
+  std::thread::id loop_thread = std::this_thread::get_id();
 
   const SubscriptionSlot& SubscriptionAt(std::size_t index) const {
     if (index >= subscriptions.size()) {
@@ -333,6 +337,13 @@ void NodeAccess::start(Node& node) {
   const std::uint16_t id = impl.loop->register_timer(
       impl.name, event::Thunk{&impl, &Node::Impl::OnTick});
   impl.loop->arm_timer(id, node.now() + impl.period, impl.period);
+}
+
+void NodeAccess::require_loop_thread(const Node& node, std::string_view what) {
+  const Node::Impl& impl = *node.impl_;
+  if (std::this_thread::get_id() == impl.loop_thread) return;
+  throw std::logic_error(impl.name + ": " + std::string{what} +
+                         " must run on the node's loop thread");
 }
 
 void NodeAccess::require_immediate_delivery(Node& node) {
@@ -680,6 +691,7 @@ std::size_t NodeAccess::add_publisher(Node& node, std::string_view topic,
 
 bool NodeAccess::publisher_send(Node& node, std::size_t index, const void* data,
                                 std::size_t bytes) {
+  require_loop_thread(node, "Publisher::send");
   Node::Impl& impl = *node.impl_;
   if (index >= impl.publishers.size()) {
     throw std::out_of_range(impl.name + ": no publisher at index " +
@@ -700,35 +712,32 @@ bool NodeAccess::publisher_send(Node& node, std::size_t index, const void* data,
 
 namespace {
 
-// A byte topic on RTMS (schema talos.Bytes). This node is its only producer
-// and owns its layout, so it reclaims a stale segment no live process holds.
+// A byte topic on RTMS (schema talos.Bytes), opened, and its writer claimed,
+// as the node registers it, the way the realtime loop opens its typed topics:
+// a topic another live process writes fails the node's construction, not a
+// send in the middle of a run. This node is its only producer and owns its
+// layout, so it reclaims a stale segment no live process holds.
 class SharedByteTopic final : public ByteTopic {
  public:
   SharedByteTopic(std::string_view topic, std::size_t max_bytes,
                   std::size_t slots, bool drop_newest)
-      : topic_{topic},
-        max_bytes_{max_bytes},
-        slots_{slots},
-        policy_{drop_newest ? OverflowPolicy::DROP_NEWEST
-                            : OverflowPolicy::OVERWRITE_OLDEST} {}
+      : queue_{topic,
+               max_bytes,
+               kMessageAlignment,
+               schema::Bytes(),
+               slots,
+               RTMSOptions{.overflow_policy =
+                               drop_newest ? OverflowPolicy::DROP_NEWEST
+                                           : OverflowPolicy::OVERWRITE_OLDEST,
+                           .read_mode = ReadMode::SEQUENCE,
+                           .publisher = true}} {}
 
   bool write(std::span<const std::byte> message) override {
-    if (!queue_) {
-      queue_.emplace(topic_, max_bytes_, kMessageAlignment, schema::Bytes(),
-                     slots_,
-                     RTMSOptions{.overflow_policy = policy_,
-                                 .read_mode = ReadMode::SEQUENCE,
-                                 .publisher = true});
-    }
-    return queue_->write(message) == WriteResult::SUCCESS;
+    return queue_.write(message) == WriteResult::SUCCESS;
   }
 
  private:
-  std::string topic_;
-  std::size_t max_bytes_;
-  std::size_t slots_;
-  OverflowPolicy policy_;
-  std::optional<RTMSQueue> queue_;
+  RTMSQueue queue_;
 };
 
 }  // namespace
@@ -764,6 +773,7 @@ std::size_t NodeAccess::add_byte_publisher(Node& node, std::string_view topic,
 
 bool NodeAccess::byte_publisher_send(Node& node, std::size_t index,
                                      std::span<const std::byte> message) {
+  require_loop_thread(node, "BytePublisher::send");
   Node::Impl::BytePublisherSlot& slot = node.impl_->ByteAt(index);
   if (message.size() > slot.max_bytes || !slot.sink->write(message)) {
     slot.dropped.fetch_add(1, std::memory_order_relaxed);
@@ -964,17 +974,18 @@ Hosted Host(Loop& loop, const char* node_name, const Flags& flags,
               make);
 }
 
-// A byte topic that goes nowhere. The loop never logged byte topics, so
-// replay cannot verify them, and a node replayed offline must not attach to
-// or write into the shared memory of a robot that may be running on this
-// machine.
+// A byte topic that goes nowhere, for runs that must leave a robot that may
+// be running on this machine alone: --describe (the launcher's probe) must
+// not claim its writers, and a node replayed offline must not attach to or
+// write into its shared memory. The loop never logged byte topics, so replay
+// cannot verify them anyway.
 class DiscardedByteTopic final : public ByteTopic {
  public:
   bool write(std::span<const std::byte>) override { return true; }
 };
 
-// The loop port under --replay and --replay-inputs: the loop, with byte
-// topics discarded.
+// The loop port under --describe, --replay and --replay-inputs: the loop,
+// with byte topics discarded.
 template <class Loop>
 class OfflinePort final : public LoopPortFor<Loop> {
  public:
@@ -1111,13 +1122,15 @@ int RunMain(int argc, char** argv, const char* node_name,
     const Flags flags = ParseFlags(argc, argv, node_name);
     // --describe builds the node for real and prints what its constructor
     // registered. The loop is the only difference: a simulated loop's
-    // channels live in this process, so no shared memory, no hardware and no
-    // network is touched, and the launcher can ask what a node is without
-    // starting a robot.
+    // channels live in this process and its byte topics are discarded, so no
+    // shared memory, no hardware and no network is touched, and the launcher
+    // can ask what a node is without starting a robot, or while one runs.
     if (flags.describe) {
       event::SimulationEnvironment environment;
       event::SimulatedEventLoop<> loop{environment};
-      const Hosted hosted = Host(loop, node_name, flags, make);
+      const Hosted hosted =
+          Host(std::make_unique<OfflinePort<event::SimulatedEventLoop<>>>(loop),
+               node_name, flags, make);
       std::printf("%s",
                   introspect::DescribeToJson(
                       DescribeNode(*hosted.node, node_target, loop.manifest()))

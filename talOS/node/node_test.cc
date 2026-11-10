@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -836,10 +837,11 @@ TEST(Binary, AGraphReaderDescribesWhatTheGraphItWasGivenHolds) {
   EXPECT_NE(run.status, 0);
 }
 
-// Exact replay is offline: a robot (here a sentinel publisher) may own the
-// node's byte topic on this machine, and replay neither attaches to it nor
-// fails because of it. Byte topics are not logged, so replay does not verify
-// them; typed sends still are, and a changed parameter diverges.
+// Describing and exact replay are offline: a robot (here a sentinel
+// publisher) may own the node's byte topic on this machine, and neither the
+// launcher's --describe probe nor replay attaches to it or fails because of
+// it. Byte topics are not logged, so replay does not verify them; typed sends
+// still are, and a changed parameter diverges.
 TEST(Binary, LoggedSimRunReplaysOfflineWithoutDivergence) {
   const std::string log = TempFile("talos_node_test.tlog");
   // Isolate the sentinel and child replay from live publishers, restoring
@@ -874,6 +876,8 @@ TEST(Binary, LoggedSimRunReplaysOfflineWithoutDivergence) {
                     .read_mode = ReadMode::SEQUENCE,
                     .publisher = true}};
     const std::uint64_t written = sentinel.writer_sequence();
+    const Result describe = RunBinary("--describe " + ConfigFlag());
+    EXPECT_EQ(describe.status, 0) << describe.output;
     const Result replay = RunBinary("--replay '" + log + "' " + ConfigFlag());
     EXPECT_EQ(replay.status, 0) << replay.output;
     EXPECT_EQ(sentinel.writer_sequence(), written);
@@ -934,28 +938,59 @@ TEST(Node, SimHandsAGraphReaderTheNodesAddedBeforeIt) {
   EXPECT_FALSE(detail::NodeAccess::reads_graph(sim.node("talker")));
 }
 
-// Outside the Sim a byte topic is an RTMS queue, opened by the first send:
-// building the node (as --describe does) leaves no segment behind.
-TEST(BytePublisher, OpensRtmsOnFirstSendAndDropsNewestWhenFull) {
+// A node's sends belong to the thread that runs its loop: the loop's dispatch
+// context, its log and the transport are single-threaded. A send from another
+// thread (a node's worker; a Python thread, whose C calls release the GIL)
+// throws instead of racing them, and publishes nothing.
+TEST(Node, SendsOnlyFromTheThreadThatBuiltIt) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& talker = sim.add<CountPublisher>("talker");
+  bool refused = false;
+  std::thread worker{[&] {
+    try {
+      (void)talker.out.send(Count{1, 0});
+    } catch (const std::logic_error&) {
+      refused = true;
+    }
+  }};
+  worker.join();
+  EXPECT_TRUE(refused);
+  EXPECT_FALSE(sim.latest<Count>("/talker/state").has_value());
+  EXPECT_TRUE(talker.out.send(Count{2, 0}));
+  ASSERT_TRUE(sim.latest<Count>("/talker/state").has_value());
+  EXPECT_EQ(sim.latest<Count>("/talker/state")->tick_count(), 2);
+}
+
+// Outside the Sim a byte topic is an RTMS queue, opened as the node registers
+// it, like the realtime loop's typed topics: a second writer is refused while
+// it is being built, not at its first send in the middle of a run.
+TEST(BytePublisher, ClaimsItsRtmsTopicWhenRegisteredAndDropsNewestWhenFull) {
   const std::string topic = "/test/node_bytes/p" + std::to_string(::getpid());
   const std::string config_path = Runfile("TALOS_TEST_CONFIG");
+  const auto robot_config = std::make_shared<const config::RobotConfig>(
+      config::ParseRobotConfig(config_path));
   event::RealtimeEventLoop<> loop;
   detail::LoopPortFor<event::RealtimeEventLoop<>> port{loop};
-  const auto node = detail::NodeAccess::create(detail::NodeSetup{
-      .name = "test_node",
-      .config_path = config_path,
-      .config = std::make_shared<const config::RobotConfig>(
-          config::ParseRobotConfig(config_path)),
-      .loop = &port,
-  });
-  BytePublisher out = node->publish_bytes(
-      topic, 64, {.slots = 4, .drop_newest = true, .external = true});
+  const auto build = [&] {
+    return detail::NodeAccess::create(detail::NodeSetup{
+        .name = "test_node",
+        .config_path = config_path,
+        .config = robot_config,
+        .loop = &port,
+    });
+  };
+  const BytePublishOptions options{
+      .slots = 4, .drop_newest = true, .external = true};
+  const auto node = build();
+  BytePublisher out = node->publish_bytes(topic, 64, options);
+  EXPECT_TRUE(ShmSegmentExists(topic));
+  const auto rival = build();
+  EXPECT_THROW((void)rival->publish_bytes(topic, 64, options),
+               std::runtime_error);
   detail::NodeAccess::start(*node);
-  EXPECT_FALSE(ShmSegmentExists(topic));
 
   const std::vector<std::byte> first(5, std::byte{1});
   EXPECT_TRUE(out.send(first));
-  ASSERT_TRUE(ShmSegmentExists(topic));
 
   RTMSQueue reader_queue{
       topic,

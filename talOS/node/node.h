@@ -25,6 +25,13 @@
 // hardware layer (talOS/devices) is built exactly that way. Build a node with
 // talos_cc_node in //talOS/build:contract.bzl, which supplies its name and
 // target.
+//
+// A node belongs to the thread that builds it, which also runs its loop
+// (talos::Run, testing::Sim and the C ABI do both on one thread). Its sends,
+// and the commands of layers built on it (motors, target lanes), are taken
+// only from that thread: the constructor, update(), every() and message
+// callbacks. From any other thread they throw std::logic_error; a worker
+// thread hands its results to update() instead.
 
 #include <chrono>
 #include <concepts>
@@ -151,8 +158,9 @@ class Node {
   // A topic of variable-length messages, each at most max_bytes, for a feed
   // no fixed-size Message can carry. It bypasses the loop: not logged, not
   // replayed. A slot does not record the message's length, so the message
-  // must carry its own (a size-prefixed flatbuffer does). Nothing is opened
-  // until the first send(), so building the node touches no shared memory.
+  // must carry its own (a size-prefixed flatbuffer does). The topic is opened
+  // here, so a topic another live process writes throws now, not at a
+  // send(); --describe and replay open nothing.
   using BytePublishOptions = talos::BytePublishOptions;
   BytePublisher publish_bytes(std::string_view topic, std::size_t max_bytes,
                               BytePublishOptions options = {});

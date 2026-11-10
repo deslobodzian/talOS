@@ -238,6 +238,7 @@ std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
 
 bool TargetAccess::lane_send(Node& node, std::size_t lane, const void* message,
                              std::size_t bytes) {
+  NodeAccess::require_loop_thread(node, "TargetLane::send");
   LaneState& state = LaneAt(node, lane);
   if (message == nullptr || bytes != state.bytes) {
     throw std::invalid_argument(
@@ -253,6 +254,7 @@ bool TargetAccess::lane_send(Node& node, std::size_t lane, const void* message,
 }
 
 bool TargetAccess::lane_release(Node& node, std::size_t lane) {
+  NodeAccess::require_loop_thread(node, "TargetLane::release");
   LaneState& state = LaneAt(node, lane);
   EncodeTargetEnvelope(DriverStationAccess::generation(state.ds), false,
                        nullptr, state.bytes, state.alignment, state.envelope);

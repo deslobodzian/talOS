@@ -27,6 +27,18 @@ the constructor; `update()` runs every period.
 Message, schema identity, relative topic and remapping contracts are in
 [Architecture: Topics and messages](../ARCHITECTURE.md#topics-and-messages)
 and [Configuration](../ARCHITECTURE.md#configuration).
+
+### Threads
+
+A node belongs to the thread that builds it, which also runs its loop (a
+`Sim` builds and steps its nodes on the calling thread). Sends (`send` on a
+publisher, byte topic or `TargetLane`, and `release`) and device commands
+(`Motor` setters, `stop` and `rezero`, `Gyro.rezero`, `DigitalOutput.set`,
+`PwmOutput.set`) are accepted only there: in the constructor, `update()`,
+`every()` and message callbacks. From any other thread they throw
+`std::logic_error` (`TalosError` in Python, whose C calls release the GIL), so
+a worker thread hands its results to `update()` instead.
+
 ### When messages arrive
 
 See [Architecture: Targets](../ARCHITECTURE.md#targets) for drain scheduling

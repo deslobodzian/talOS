@@ -365,6 +365,7 @@ std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
 void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
                                hardware::Mode mode, double demand,
                                double ff_volts, int slot) {
+  detail::NodeAccess::require_loop_thread(link.impl_->node, "a motor command");
   HardwareLink::Impl::Device& device = link.impl_->At(index, Kind::kMotor);
   if (slot < 0 || slot > 2) {
     throw std::invalid_argument(std::string{link.impl_->node.name()} +
@@ -428,6 +429,7 @@ std::uint64_t HardwareAccess::motor_clamped_count(const HardwareLink& link,
 
 void HardwareAccess::motor_rezero(HardwareLink& link, std::size_t index,
                                   double position_rot) {
+  detail::NodeAccess::require_loop_thread(link.impl_->node, "Motor::rezero");
   auto& device = link.impl_->At(index, Kind::kMotor);
   const auto& impl = *link.impl_;
   const auto sample = FindSample(impl.state.motors, impl.state.motor_count,
@@ -441,6 +443,7 @@ void HardwareAccess::motor_rezero(HardwareLink& link, std::size_t index,
 
 void HardwareAccess::gyro_rezero(HardwareLink& link, std::size_t index,
                                  double yaw_rot) {
+  detail::NodeAccess::require_loop_thread(link.impl_->node, "Gyro::rezero");
   auto& device = link.impl_->At(index, Kind::kGyro);
   const auto& impl = *link.impl_;
   const auto sample = FindSample(impl.state.sensors, impl.state.sensor_count,
@@ -532,6 +535,8 @@ hardware::EncoderSample HardwareAccess::encoder_sample(const HardwareLink& link,
 
 void HardwareAccess::digital_output_set(HardwareLink& link, std::size_t index,
                                         bool value) {
+  detail::NodeAccess::require_loop_thread(link.impl_->node,
+                                          "DigitalOutput::set");
   auto& device = link.impl_->At(index, Kind::kDigitalOutput);
   device.digital = value;
   device.set = true;
@@ -539,6 +544,7 @@ void HardwareAccess::digital_output_set(HardwareLink& link, std::size_t index,
 
 void HardwareAccess::pwm_set(HardwareLink& link, std::size_t index,
                              double output) {
+  detail::NodeAccess::require_loop_thread(link.impl_->node, "PwmOutput::set");
   auto& device = link.impl_->At(index, Kind::kPwm);
   device.pwm = std::isfinite(output) ? std::clamp(output, -1.0, 1.0) : 0.0;
   device.set = true;

@@ -47,7 +47,8 @@ class Sim {
   Sim& operator=(Sim&&) noexcept;
 
   // Constructs a Node named `node_name` and T on it; returns the user
-  // object. Add every node before the first step().
+  // object. Add every node before the first step(). The thread that adds a
+  // node is its loop thread (node.h): step the Sim from it, too.
   template <class T>
   T& add(std::string_view node_name) {
     return *static_cast<T*>(detail::SimAccess::add_instance(

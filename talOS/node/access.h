@@ -86,6 +86,12 @@ struct NodeAccess {
   // require_immediate_delivery. Called once, after the user's object is
   // built.
   static void start(Node& node);
+  // Throws std::logic_error, naming the node and `what`, unless called on
+  // the thread that built `node`, which runs its loop. A send or a device
+  // command touches state only that thread may (the loop's dispatch context
+  // and log, the transport, a device's pending request): publisher_send,
+  // byte_publisher_send and the devices layer's commands call it first.
+  static void require_loop_thread(const Node& node, std::string_view what);
   // Some handler must see each message as it arrives (a subscribe callback,
   // a Driver Station listener), so the loop drains every tick. Without it,
   // a node with a timer (update(), an after_update hook or every()) drains
