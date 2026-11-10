@@ -395,15 +395,49 @@ def run_launcher(binary, args, cwd, env, diagnostic, timeout):
                 raise RuntimeError(f"launcher failed ({proc.returncode}):\n{log.read()}")
 
 
-def session_directory(root):
+def tail(path, lines):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        return f"<unreadable: {error}>"
+    return "\n".join(text.splitlines()[-lines:])
+
+
+def log_damage(dumper, node, env):
+    """What log_dump says is damaged in a node's logs; the launcher marks a
+    damaged log recorder_failed at shutdown without printing why."""
+    logs = [path for path in node.get("log_paths", []) if Path(path).exists()]
+    if not logs:
+        return "<no log files>"
+    try:
+        proc = subprocess.run([str(dumper), "--format", "jsonl", *logs], env=env,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"<log_dump failed: {error}>"
+    return proc.stderr.strip() or f"<log_dump exit {proc.returncode}, no warnings>"
+
+
+def session_directory(root, diagnostic, dumper, env):
     manifests = list(root.glob("*/manifest.json"))
     if len(manifests) != 1:
-        raise RuntimeError(f"expected one session under {root}, got {len(manifests)}")
+        raise RuntimeError(f"expected one session under {root}, got {len(manifests)}\n"
+                           f"launcher output tail:\n{tail(diagnostic, 80)}")
+    session = manifests[0].parent
     manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    output = Path(manifest.get("output_dir", session))
     for node in manifest["nodes"]:
         if node["exit_code"] != 0 or node["recorder_failed"] or node["restart_count"]:
-            raise RuntimeError(f"unclean session node: {node}")
-    return manifests[0].parent
+            # The entry alone does not say why (a failed spawn, a log the node
+            # could not create, or damage found at shutdown), so carry what
+            # does: the node's output, log_dump's damage report, and the
+            # launcher's output.
+            raise RuntimeError(
+                f"unclean session node: {node}\n"
+                f"{node['name']} output tail:\n{tail(output / (node['name'] + '.log'), 40)}\n"
+                f"{node['name']} log damage:\n{log_damage(dumper, node, env)}\n"
+                f"launcher output tail:\n{tail(diagnostic, 80)}")
+    return session
 
 
 def dump_records(binary, cameras, drivetrain, estimator, env):
@@ -552,7 +586,8 @@ def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
                              destination / f"{name}.txt", seconds + 90)
             finally:
                 autonomous_progress.remove(env["TALOS_SHM_NAMESPACE"])
-            session = session_directory(destination / name)
+            session = session_directory(destination / name,
+                                        destination / f"{name}.txt", dumper, env)
             cameras = [session / f"{camera}.tlog" for camera in CAMERAS]
             drivetrain = session / "drivetrain.tlog"
             records = dump_records(dumper, cameras, drivetrain,
