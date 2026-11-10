@@ -1,6 +1,7 @@
 namespace motor;
 enum ControlMode : ubyte { NEUTRAL, VOLTAGE, VELOCITY }
 enum TargetSource : ubyte { NONE, TELEOP }
+
 struct MotorTarget {
   mode:ControlMode;
   voltage_v:double;
@@ -8,6 +9,7 @@ struct MotorTarget {
   // Normalized teleop axis, scaled by max_bench_voltage_v in the node.
   voltage_frac:double;
 }
+
 struct MotorState {
   sample_time_ns:uint64;
   position_rot:double;
