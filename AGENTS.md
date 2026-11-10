@@ -45,18 +45,36 @@ bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configurat
 
 ## Agent roles
 
-- Muse (`muse-code/muse-spark-1.3-contributor`) is the main session model and
-  implements: it plans slices, writes the code, runs the checks. Generic `task`
-  subagents run on `openai-codex/gpt-6.1-sol:low`, with
-  `google/gemini-3.8-flash` fallback (`task.agentModelOverrides`).
-- Claude Architect (Opus) and Gemini Product (Gemini) are advisors on the main
-  session (`~/.omp/agent/WATCHDOG.yml`): design, architecture, features and code
-  review. They advise; they do not implement. Act on their notes or say why not.
-- Repo-specific review priorities are in `WATCHDOG.md`; the `reviewer` agent
-  uses them for a final pass.
-- The user config's retry chain can move a session or worker to a fallback;
+All models are Anthropic; routing lives in `~/.omp/agent/config.yml`
+(`modelRoles`, `task.agentModelOverrides`, `retry.fallbackChains`).
+
+|Who|Model:effort|Use for|
+|---|---|---|
+|main session (`default`)|`claude-opus-5-5:high`|plan slices, dispatch, integrate, run checks, commit|
+|`task`|`claude-opus-5-5:medium`|one implementation slice: code + its test + its docs|
+|`scout`|`claude-sonnet-5-5:low`|read-only mapping of unknown code|
+|`sonic`|`claude-haiku-5-5:low`|mechanical edits, renames, data collection|
+|`reviewer`, `security-reviewer`|`claude-mythos-5-2:high`|final review pass before commit|
+|`slow`, `plan`|`claude-mythos-5-2:high`|hard design or root-cause analysis, plan mode|
+
+Dispatch by default; the main session coordinates instead of doing every step itself:
+
+- Unknown code: spawn `scout`s in parallel (one per package or question)
+  before opening files.
+- Multi-file or multi-package work: split into independent slices with their
+  file sets and shared interfaces (messages, topics, C ABI signatures) fixed in
+  `context`, and spawn all of them in one `task` batch. A node-API feature or
+  device type (see `.omp/RULES.md`) is one slice per layer only when
+  the interface is fixed first; otherwise one `task` owns it.
+- Effort hint: `lo` for mechanical or fully specified slices, `med` for a
+  normal slice, `hi` for safety paths (actuation gating, `Target`, mode
+  generations, wire formats, shared-memory layout) or an open root cause.
+- Subagents do not run `bazel build`/`bazel test`; the main session runs them
+  once after integrating.
+- Before committing a non-trivial change, run `reviewer`. Repo-specific review
+  priorities are in `WATCHDOG.md`.
+- A retry chain can move a session or worker to an Anthropic fallback;
   `resolvedModelIsFallback` in the session log shows it.
-- Muse session worktrees live under `.muse/` (ignored by `.bazelignore`).
 
 ## Implementation rules
 
