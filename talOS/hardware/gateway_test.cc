@@ -365,6 +365,33 @@ TEST(Gateway, RequiresEnableCommissioningAndMatchingManifest) {
   uncommissioned.Tick(2000, true);
   EXPECT_FALSE(uncommissioned.Accept(Request(uncommissioned), 1, 2000));
 }
+// While the robot cannot drive, every node flushes neutral and the bridge
+// keeps forwarding the merge. Counting those refusals would bury every real
+// rejection under a steady climb; a command that asks for output or carries
+// another identity still counts.
+TEST(Gateway, NeutralRefusedWhileUnableToDriveIsNotARejection) {
+  for (const bool commissioned : {true, false}) {
+    SCOPED_TRACE(commissioned ? "disabled" : "enabled, uncommissioned");
+    FakeBackend backend;
+    Gateway g{SwerveConfig(commissioned), backend, 1};
+    g.Tick(1000, !commissioned);
+    auto neutral = Request(g);
+    for (std::size_t i = 0; i < neutral.count; ++i) {
+      neutral.motors[i] = {neutral.motors[i].id};
+    }
+    for (uint64_t sequence = 1; sequence <= 3; ++sequence) {
+      EXPECT_FALSE(g.Accept(neutral, sequence, 1000));
+    }
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
+    auto misidentified = neutral;
+    ++misidentified.config_id;
+    EXPECT_FALSE(g.Accept(misidentified, 4, 1000));
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
+    EXPECT_FALSE(g.Accept(Request(g), 5, 1000));
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count, 2u);
+    EXPECT_EQ(backend.applied, 0);
+  }
+}
 TEST(Gateway, RejectsOldBootEpochSequenceAndDelayedCommands) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};

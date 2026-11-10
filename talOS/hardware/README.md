@@ -171,8 +171,11 @@ using only the gateway clock, so it does not assume synchronized host clocks.
 Duplicate/reordered command sequences, old sessions, expired observations, and
 structural errors reject the whole command. Non-finite or out-of-range motor
 demands/feedforward neutralize only that motor. Per-boot counters report refused
-commands, neutralized motors, apply failures, and device resets. Each command
-supplies every configured motor in manifest order.
+commands, neutralized motors, apply failures, and device resets. The refused
+count omits a current, all-neutral command while the gateway is disabled,
+uncommissioned or unconfigured: the bridge keeps forwarding those while the
+robot cannot drive. Each command supplies every configured motor in manifest
+order.
 The bridge neutralizes omitted subsystem actuators. `/hw/status` exposes the
 latest accepted health sample, motor fault mask, and gateway counters.
 `hardware_node --log PATH` records merged `/hw/command` and decoded `/hw/state`

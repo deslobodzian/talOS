@@ -67,8 +67,11 @@ const COUNTERS: CounterSpec[] = [
   {
     name: 'gateway_rejected_command_count',
     label: 'Gateway rejected',
-    note: 'Commands the gateway refused — structural or stale, or while the ' +
-        'robot is not enabled, configured, commissioned or healthy.'
+    note: 'Commands the gateway refused: structural or stale, sent while ' +
+        'it is faulted or unhealthy, or asking for output while the robot ' +
+        'is not enabled, configured or commissioned. Current neutral ' +
+        'commands are not counted while the robot is not enabled, ' +
+        'configured or commissioned.'
   },
   {
     name: 'gateway_neutralized_motor_count',

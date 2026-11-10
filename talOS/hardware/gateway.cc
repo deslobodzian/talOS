@@ -8,6 +8,40 @@
 #include "config_wire.h"
 
 namespace talos::hardware {
+namespace {
+// Whether `c` addresses exactly the configured outputs, in manifest order, and
+// drives none of them: motors neutral with zero demand and feedforward, digital
+// outputs off, PWM outputs zero. The bridge forwards this merge while every
+// node's devices layer flushes neutral.
+bool DrivesNothing(const Command& c, const Config& config) {
+  if (c.count != config.motors.size() ||
+      c.digital_output_count != config.digital_outputs.size() ||
+      c.pwm_output_count != config.pwm_outputs.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < c.count; ++i) {
+    const auto& r = c.motors[i];
+    if (r.id != config.motors[i].id || r.mode != Mode::kNeutral || r.slot > 2 ||
+        r.demand != 0 || r.feedforward_v != 0) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < c.digital_output_count; ++i) {
+    if (c.digital_outputs[i].id != config.digital_outputs[i].id ||
+        c.digital_outputs[i].value) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < c.pwm_output_count; ++i) {
+    if (c.pwm_outputs[i].id != config.pwm_outputs[i].id ||
+        c.pwm_outputs[i].output != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
+
 Gateway::Gateway(Config config, Backend& backend, uint64_t boot_id)
     : config_{std::move(config)}, backend_{backend} {
   state_.config_id = ConfigurationId(config_);
@@ -340,13 +374,26 @@ void Gateway::Tick(uint64_t now, bool enabled) {
 }
 
 bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
-  if (!configured_ || !config_.commissioned || !enabled_ || fault_ ||
-      configuring_ || !healthy_ || c.config_id != state_.config_id ||
-      c.boot_id != state_.boot_id || c.epoch != state_.epoch ||
-      c.observed_time_us > state_.sample_time_us || c.observed_time_us > now ||
+  // Wrong whether or not the gateway takes commands now: another identity, an
+  // expired or future observation, a replayed sequence or another manifest
+  // size.
+  const bool mismatched =
+      c.config_id != state_.config_id || c.boot_id != state_.boot_id ||
+      c.epoch != state_.epoch || c.observed_time_us > state_.sample_time_us ||
+      c.observed_time_us > now ||
       now - c.observed_time_us >= config_.command_timeout_us ||
       (have_sequence_ && sequence <= state_.last_command_sequence) ||
-      c.count != config_.motors.size()) {
+      c.count != config_.motors.size();
+  if (!configured_ || !config_.commissioned || !enabled_) {
+    // While the robot cannot drive, every node flushes neutral and the bridge
+    // keeps forwarding the merge. Refusing that is this gate working, not a
+    // rejection: counting it would bury the real ones.
+    if (mismatched || !DrivesNothing(c, config_)) {
+      ++state_.counters.rejected_command_count;
+    }
+    return false;
+  }
+  if (fault_ || configuring_ || !healthy_ || mismatched) {
     ++state_.counters.rejected_command_count;
     return false;
   }
