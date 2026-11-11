@@ -326,38 +326,21 @@ struct SimHardware::Impl {
     std::erase_if(resetting, [](auto& entry) { return --entry.second <= 0; });
   }
 
-  // Gateway::FeedbackValid: motor i's own sample, and its remote CANcoder's.
-  bool FeedbackValid(const hardware::State& state, std::size_t i) const {
-    const hardware::MotorConfig& m = config.hardware.motors[i];
-    if (!state.motors[i].valid) return false;
-    if (m.feedback != hardware::Feedback::kRemoteCANcoder) return true;
-    for (std::size_t j = 0; j < state.sensor_count; ++j) {
-      if (state.sensors[j].id == m.feedback_sensor_id) {
-        return state.sensors[j].valid;
+  // The gateway's tick (MaskUnavailable, NeutralUnavailable): a follower's
+  // sample is invalid while its master's is; a motor that cannot drive in
+  // this State (hardware::MotorMayDrive) applies neutral now, not at the
+  // next request, and only a request observing a later State drives it
+  // again. Other motors and the epoch are untouched.
+  void MaskUnable(hardware::State& state) {
+    const auto& motors = config.hardware.motors;
+    for (std::size_t i = 0; i < state.motor_count; ++i) {
+      if (hardware::MasterSampleInvalid(motors, state, i)) {
+        state.motors[i].valid = false;
       }
     }
-    return false;
-  }
-  // Gateway::MayDrive: FeedbackValid, and for a follower its master's.
-  bool MayDrive(const hardware::State& state, std::size_t i) const {
-    if (!FeedbackValid(state, i)) return false;
-    const std::uint16_t master_id = config.hardware.motors[i].master_id;
-    if (master_id == 0) return true;
-    for (std::size_t j = 0; j < config.hardware.motors.size(); ++j) {
-      if (config.hardware.motors[j].id == master_id) {
-        return FeedbackValid(state, j);
-      }
-    }
-    return false;
-  }
-  // The gateway's tick (MaskUnavailable, NeutralUnavailable): a motor that
-  // cannot drive in this State applies neutral now, not at the next
-  // request, and only a request observing a later State drives it again.
-  // Other motors and the epoch are untouched.
-  void MaskUnable(const hardware::State& state) {
     unable.clear();
     for (std::size_t i = 0; i < state.motor_count; ++i) {
-      if (MayDrive(state, i)) continue;
+      if (hardware::MotorMayDrive(motors, state, i)) continue;
       const std::uint16_t id = state.motors[i].id;
       unable.insert(id);
       motor_drives_from[id] = state.sample_time_us + 1;

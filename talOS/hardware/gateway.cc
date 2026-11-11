@@ -212,24 +212,24 @@ void Gateway::MaskUnavailable() {
     if (DeviceUnavailable(config_.sensors[i].id))
       state_.sensors[i].valid = false;
   }
-  for (std::size_t pass = 0; pass < config_.motors.size(); ++pass) {
-    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-      const auto& motor = config_.motors[i];
-      bool unavailable = DeviceUnavailable(motor.id) ||
-                         (motor.feedback == Feedback::kRemoteCANcoder &&
-                          DeviceUnavailable(motor.feedback_sensor_id));
-      for (std::size_t j = 0; j < config_.motors.size(); ++j) {
-        if (motor.master_id != 0 && motor.master_id == config_.motors[j].id &&
-            !state_.motors[j].valid)
-          unavailable = true;
-      }
-      if (unavailable) {
-        state_.motors[i].valid = false;
-        // Its frame may restart before it returns: the first sample after
-        // that is a new reference, not a jump from this one.
-        position_reference_[i].valid = false;
-      }
+  const auto mask = [this](std::size_t i) {
+    state_.motors[i].valid = false;
+    // Its frame may restart before it returns: the first sample after that
+    // is a new reference, not a jump from this one.
+    position_reference_[i].valid = false;
+  };
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    const auto& motor = config_.motors[i];
+    if (DeviceUnavailable(motor.id) ||
+        (motor.feedback == Feedback::kRemoteCANcoder &&
+         DeviceUnavailable(motor.feedback_sensor_id))) {
+      mask(i);
     }
+  }
+  // After every master is masked: config refuses follower chains, so a
+  // master is never a follower.
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    if (MasterSampleInvalid(config_.motors, state_, i)) mask(i);
   }
   // A command observed no later than a State in which a motor could not
   // drive never drives it, whatever its feedback shows when it arrives.
@@ -238,26 +238,8 @@ void Gateway::MaskUnavailable() {
   }
 }
 
-bool Gateway::FeedbackValid(std::size_t i) const {
-  const auto& motor = config_.motors[i];
-  if (!state_.motors[i].valid) return false;
-  if (motor.feedback != Feedback::kRemoteCANcoder) return true;
-  for (std::size_t j = 0; j < state_.sensor_count; ++j) {
-    if (state_.sensors[j].id == motor.feedback_sensor_id)
-      return state_.sensors[j].valid;
-  }
-  return false;
-}
-
 bool Gateway::MayDrive(std::size_t i) const {
-  if (!FeedbackValid(i)) return false;
-  const auto master_id = config_.motors[i].master_id;
-  if (master_id == 0) return true;
-  // Config refuses follower chains, so a master is never a follower.
-  for (std::size_t j = 0; j < config_.motors.size(); ++j) {
-    if (config_.motors[j].id == master_id) return FeedbackValid(j);
-  }
-  return false;
+  return MotorMayDrive(config_.motors, state_, i);
 }
 
 bool Gateway::ApplyMotors(std::span<const MotorRequest> requests) {
@@ -531,8 +513,8 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
       return false;
     }
     requests[i] = r;
-    const bool feedback_valid =
-        FeedbackValid(i) && c.observed_time_us >= motor_drives_from_[i];
+    const bool feedback_valid = MotorFeedbackValid(config_.motors, state_, i) &&
+                                c.observed_time_us >= motor_drives_from_[i];
     const bool invalid =
         (r.mode != Mode::kNeutral && !feedback_valid) ||
         !std::isfinite(r.demand) || !std::isfinite(r.feedforward_v) ||
@@ -555,8 +537,8 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   for (std::size_t i = 0; i < c.count; ++i) {
     const auto master_id = config_.motors[i].master_id;
     if (master_id == 0) continue;
-    const bool valid =
-        FeedbackValid(i) && c.observed_time_us >= motor_drives_from_[i];
+    const bool valid = MotorFeedbackValid(config_.motors, state_, i) &&
+                       c.observed_time_us >= motor_drives_from_[i];
     for (std::size_t j = 0; j < c.count; ++j) {
       if (config_.motors[j].id != master_id) continue;
       // Backends follow the master's output only for a non-neutral follower

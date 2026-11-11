@@ -166,10 +166,7 @@ class Gateway {
   void FindPositionJumps(std::vector<uint16_t>& reset_ids);
   bool DeviceUnavailable(uint16_t id) const;
   void MaskUnavailable();
-  // Whether motor i's own feedback, and its remote CANcoder's, is valid in
-  // this tick's State.
-  bool FeedbackValid(std::size_t i) const;
-  // FeedbackValid for the motor and, for a follower, for its master.
+  // MotorMayDrive (gate.h) in this tick's State.
   bool MayDrive(std::size_t i) const;
   void NeutralUnavailable();
   bool ApplyMotors(std::span<const MotorRequest> requests);
@@ -190,8 +187,7 @@ class Gateway {
   std::vector<uint16_t> restoring_ids_;
   std::array<MotorRequest, kMaxMotors> last_requests_{};
   // Per motor, the earliest observation time a command may drive it on: one
-  // past the last State in which it could not drive (MayDrive false: invalid
-  // or masked feedback, or a follower's master's).
+  // past the last State in which it could not drive (MayDrive false).
   std::array<uint64_t, kMaxMotors> motor_drives_from_{};
   // A rotor-feedback motor's last valid position since the gateway last
   // masked it, and the earliest time that sample can have been taken.

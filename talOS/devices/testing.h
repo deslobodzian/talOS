@@ -34,7 +34,8 @@
 // a State (its feedback invalid: disconnected, too old, or masked by
 // reset_device(); its remote CANcoder's; or a follower's master's) applies
 // neutral from that tick, other motors and the epoch untouched, and only a
-// request observed after the last such State drives it again. Unlike the
+// request observed after the last such State drives it again; a follower's
+// sample reads invalid while its master's does. Unlike the
 // gateway, losing every motor's and CAN sensor's feedback raises no
 // hardware fault and starts no new epoch, enabling or disabling does not
 // start a new epoch, and requests are not checked against the config id,
