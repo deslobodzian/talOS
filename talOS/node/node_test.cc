@@ -1033,10 +1033,29 @@ TEST(Binary, StopDuringConstructionExitsCleanlyOnceConstructed) {
   while (printed.find("constructing\n") == std::string::npos && read_some()) {
   }
   const bool blocked = printed.find("constructing\n") != std::string::npos;
+  bool stop_landed = false;
   if (blocked) {
     EXPECT_EQ(::kill(child, SIGINT), 0);
-    // Let the signal land while the constructor is still blocked.
-    std::this_thread::sleep_for(100ms);
+    // Each byte wakes the constructor's read, which answers with one line
+    // saying whether the stop has landed. The signal may reach another of
+    // the node's threads first, so ask until it has. A child whose read was
+    // interrupted exits instead, and the answer never comes (nor a SIGPIPE
+    // for the write that finds it gone).
+    struct sigaction ignore {};
+    struct sigaction previous {};
+    ignore.sa_handler = SIG_IGN;
+    ::sigaction(SIGPIPE, &ignore, &previous);
+    while (!stop_landed) {
+      const char byte = 0;
+      if (::write(input[1], &byte, 1) != 1) break;
+      const std::size_t answered = printed.size();
+      while (printed.find('\n', answered) == std::string::npos && read_some()) {
+      }
+      if (printed.find('\n', answered) == std::string::npos) break;
+      stop_landed =
+          printed.find("stop requested\n", answered) != std::string::npos;
+    }
+    ::sigaction(SIGPIPE, &previous, nullptr);
   }
   ::close(input[1]);  // the constructor's read returns
   while (read_some()) {
@@ -1045,6 +1064,7 @@ TEST(Binary, StopDuringConstructionExitsCleanlyOnceConstructed) {
   int status = 0;
   ASSERT_EQ(::waitpid(child, &status, 0), child);
   ASSERT_TRUE(blocked) << printed;
+  EXPECT_TRUE(stop_landed) << printed;
   ASSERT_TRUE(WIFEXITED(status))
       << "killed by signal " << (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
   EXPECT_EQ(WEXITSTATUS(status), 0) << printed;

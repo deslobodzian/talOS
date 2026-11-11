@@ -121,6 +121,7 @@ talos_cc_node(
     srcs = ["testdata/blocked_node.cc"],
     node_name = "blocked_node",
     visibility = ["//visibility:private"],
+    deps = ["//talOS/process"],
 )
 
 cc_test(
