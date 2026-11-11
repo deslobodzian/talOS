@@ -214,11 +214,12 @@ class SimHardware:
 
     def set_motor(self, node, device, position, velocity,
                   position_age_us=0, velocity_age_us=0,
-                  temperature_c=0, supply_current_a=0):
-        """Inject feedback, including controller Celsius and supply amps."""
+                  temperature_c=0, supply_current_a=0, stator_current_a=0):
+        """Inject feedback, including controller Celsius, supply amps and
+        stator amps (Motor.current)."""
         self._set(lib.talos_sim_hardware_set_motor, node, device, position,
                   velocity, position_age_us, velocity_age_us,
-                  temperature_c, supply_current_a)
+                  temperature_c, supply_current_a, stator_current_a)
 
     def set_limit_switches(self, node, device, forward=False, reverse=False):
         """The motor's TalonFX limit switches, asserted or not, from the next

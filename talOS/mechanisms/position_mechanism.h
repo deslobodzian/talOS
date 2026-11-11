@@ -33,14 +33,18 @@
 // the zero sends the mechanism back to homing.
 //
 // Safety is the framework's: set_goal(), hold() and stop() are this tick's
-// request and are consumed by update(); a tick without set_goal() or hold()
-// drives nothing, so the devices layer sends the motor neutral. Call
-// set_goal() only with a live talos::Target (non-null get()). The library
-// adds a latched fault on top: once faulted it drives nothing until
-// clear_fault() or a Driver Station disable.
+// request, accepted only inside the node's update() (std::logic_error
+// otherwise, as a Motor setter throws) and consumed by this tick's update();
+// a tick without set_goal() or hold() drives nothing, so the devices layer
+// sends the motor neutral, and a request whose tick ended without update()
+// is dropped. Call set_goal() only with a live talos::Target (non-null
+// get()). The library adds a latched fault on top: once faulted it drives
+// nothing until clear_fault() or a Driver Station disable.
 
 #include <cstdint>
+#include <limits>
 #include <optional>
+#include <string>
 #include <string_view>
 
 #include "control/control_generated.h"
@@ -53,6 +57,7 @@ namespace talos::mechanisms {
 // What the mechanism is doing, as of the last update().
 enum class PositionPhase : std::uint8_t {
   kUnhomed,  // no position frame yet, and not driving home this tick
+             // (no goal, or hold(): only set_goal() starts homing)
   kHoming,   // driving homing_v toward home this tick
   kReady,    // homed, no goal this tick (neutral)
   kMoving,   // driving to a goal, not yet at it
@@ -94,15 +99,16 @@ class PositionMechanism {
   void set_goal(double position_rot, double feedforward_v = 0);
   // The same goal in configured units (position_rot * units_per_rot).
   void set_goal_units(double position_units, double feedforward_v = 0);
-  // Drive to the position held when this run of hold() calls began.
+  // Drive to the position held when this run of hold() calls began. On an
+  // unhomed mechanism it is neutral and never starts homing.
   void hold(double feedforward_v = 0);
   // Drive nothing: neutral. The same as not calling set_goal()/hold().
   void stop();
 
   // Applies this tick's request. Call once from the owning node's update().
   void update();
-  // Leaves kFaulted. A Driver Station disable does the same and also
-  // restarts the homing clock.
+  // Leaves kFaulted (inside update(), like a request). A Driver Station
+  // disable does the same and also restarts the homing run.
   void clear_fault();
 
   PositionPhase phase() const { return phase_; }
@@ -131,6 +137,15 @@ class PositionMechanism {
  private:
   enum class Request : std::uint8_t { kStop, kGoal, kHold };
 
+  static constexpr double kInfiniteRot =
+      std::numeric_limits<double>::infinity();
+  // |homing_v| is at most this fraction of the motor's max_voltage.
+  static constexpr double kMaxHomingFraction = 0.5;
+
+  void request(Request kind, double position_rot, double feedforward_v);
+  void reset_fault();
+  bool home(Time now);
+  void reset_homing_run();
   void fault(PositionFault reason);
   void idle(PositionPhase phase);
   void drive_goal(Request request, double request_rot, double request_ff_v,
@@ -142,6 +157,7 @@ class PositionMechanism {
   }
 
   Node* node_;
+  std::string label_;  // "PositionMechanism '<name>'", for errors
   Motor motor_;
   DriverStation ds_;
   std::optional<DigitalInput> limit_switch_;
@@ -164,6 +180,8 @@ class PositionMechanism {
   Duration homing_timeout_{};
   double homing_stall_rps_{0};
   Duration homing_stall_time_{};
+  double homing_stall_current_a_{0};
+  Duration homing_min_push_{};
   bool switch_closed_reads_{false};
   int home_samples_{1};
   double home_margin_rot_{0};
@@ -178,6 +196,7 @@ class PositionMechanism {
   Request request_{Request::kStop};
   double request_rot_{0};
   double request_ff_v_{0};
+  std::uint64_t request_tick_{0};  // node.tick() of the update() it came from
 
   // State.
   PositionPhase phase_{PositionPhase::kUnhomed};
@@ -190,7 +209,9 @@ class PositionMechanism {
   double gravity_ff_v_{0};
   int home_count_{0};  // consecutive closed switch readings while unzeroed
   std::optional<Time> homing_since_;  // first push since a zero or disable
+  std::optional<Time> push_since_;    // start of the current, unbroken push
   std::optional<Time> homing_still_since_;
+  bool homing_moved_{false};  // this homing run has seen the mechanism move
   std::optional<double> held_rot_;
   std::optional<double> goal_anchor_rot_;  // move timer restarts past it
   Time goal_since_{};

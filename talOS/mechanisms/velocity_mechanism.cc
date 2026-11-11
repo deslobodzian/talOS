@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <string>
 
 namespace talos::mechanisms {
 
 VelocityMechanism::VelocityMechanism(Node& node, std::string_view name)
     : node_{&node},
+      label_{"VelocityMechanism '" + std::string{name} + "'"},
       motor_{node, name},
       max_rps_{MotorConfigOf(node, name).max_velocity_rps} {
   const Params params{node, name};
@@ -25,15 +27,22 @@ VelocityMechanism::VelocityMechanism(Node& node, std::string_view name)
 }
 
 void VelocityMechanism::set_goal(double velocity_rps, double feedforward_v) {
+  RequireInUpdate(*node_, label_);
   requested_ = true;
   request_rps_ = velocity_rps;
   request_ff_v_ = feedforward_v;
+  request_tick_ = node_->tick();
 }
 
-void VelocityMechanism::stop() { requested_ = false; }
+void VelocityMechanism::stop() {
+  RequireInUpdate(*node_, label_);
+  requested_ = false;
+}
 
 void VelocityMechanism::update() {
-  const bool requested = requested_;
+  RequireInUpdate(*node_, label_);
+  // A request lasts the update() it was made in (see set_goal()).
+  const bool requested = requested_ && request_tick_ == node_->tick();
   requested_ = false;
   const Time now = node_->now();
   connected_ = motor_.connected();

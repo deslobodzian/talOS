@@ -2,14 +2,12 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
+#include <cstddef>
 #include <numbers>
 #include <string>
 
 namespace talos::mechanisms {
 namespace {
-
-constexpr double kInfinity = std::numeric_limits<double>::infinity();
 
 Homing ParseHoming(const Params& params) {
   const std::string value = params.get<std::string>("homing", "none");
@@ -35,15 +33,24 @@ bool ParseMotionMagic(const Params& params) {
   params.fail("control", "must be \"motion_magic\" or \"position\"");
 }
 
+Duration PositiveMicros(const Params& params, std::string_view key) {
+  const Duration value = params.micros(key);
+  if (value <= Duration::zero()) params.fail(key, "must be > 0");
+  return value;
+}
+
 }  // namespace
 
 PositionMechanism::PositionMechanism(Node& node, std::string_view name)
-    : node_{&node}, motor_{node, name}, ds_{node} {
+    : node_{&node},
+      label_{"PositionMechanism '" + std::string{name} + "'"},
+      motor_{node, name},
+      ds_{node} {
   const Params params{node, name};
   tolerance_rot_ = params.positive("tolerance_rot");
   at_goal_debounce_ = params.micros("at_goal_debounce_us", 0);
-  min_rot_ = params.limit("min_rot", -kInfinity);
-  max_rot_ = params.limit("max_rot", kInfinity);
+  min_rot_ = params.limit("min_rot", -kInfiniteRot);
+  max_rot_ = params.limit("max_rot", kInfiniteRot);
   if (!(min_rot_ < max_rot_)) params.fail("max_rot", "must be > min_rot");
   units_per_rot_ = params.positive("units_per_rot", 1.0);
   wrap_rot_ = params.number("wrap_rot", 0.0);
@@ -57,6 +64,16 @@ PositionMechanism::PositionMechanism(Node& node, std::string_view name)
   if (slot_ < 0 || slot_ > 2) params.fail("slot", "must be 0, 1 or 2");
 
   homing_ = ParseHoming(params);
+  // A wrapped goal or a homed frame needs a bounded travel: wrap would
+  // follow a target round and round (a turret winding its cables), and a
+  // homed mechanism must know where the far end is.
+  if (wrap_rot_ > 0 || homing_ != Homing::kNone) {
+    const char* why = wrap_rot_ > 0 ? "must be finite when wrap_rot > 0"
+                                    : "must be finite when the mechanism homes";
+    if (!std::isfinite(min_rot_)) params.fail("min_rot", why);
+    if (!std::isfinite(max_rot_)) params.fail("max_rot", why);
+  }
+
   const hardware::MotorConfig& motor = MotorConfigOf(node, name);
   // One gravity source: the controller's slot g (with its gravity_type) or
   // gravity_v here, never both, or the mechanism gets twice the feedforward.
@@ -95,29 +112,37 @@ PositionMechanism::PositionMechanism(Node& node, std::string_view name)
                   "must be nonzero and point at home_rot, the end of travel "
                   "(min_rot for a negative homing_v, max_rot for a positive)");
     }
-    homing_timeout_ = params.micros("homing_timeout_us");
-    if (homing_timeout_ <= Duration::zero()) {
-      params.fail("homing_timeout_us", "must be > 0");
+    // Homing is a slow push into a stop or a switch, never full power.
+    if (std::abs(homing_v_) > kMaxHomingFraction * motor.max_voltage) {
+      params.fail("homing_v", "must be at most half the motor's max_voltage (" +
+                                  std::to_string(motor.max_voltage) + " V)");
     }
+    homing_timeout_ = PositiveMicros(params, "homing_timeout_us");
     homing_stall_rps_ = params.positive("homing_stall_rps");
-    homing_stall_time_ = params.micros("homing_stall_us");
-    if (homing_stall_time_ <= Duration::zero()) {
-      params.fail("homing_stall_us", "must be > 0");
-    }
+    homing_stall_time_ = PositiveMicros(params, "homing_stall_us");
+  }
+  if (homing_ == Homing::kStall) {
+    homing_stall_current_a_ = params.positive("homing_stall_current_a");
+    homing_min_push_ = PositiveMicros(params, "homing_min_push_us");
   }
   if (homing_ == Homing::kAbsolute) {
     absolute_.emplace(node, params.get<std::string>("absolute_sensor"));
     absolute_rot_per_sensor_rot_ =
         params.number("absolute_rot_per_sensor_rot", 1.0);
-    if (absolute_rot_per_sensor_rot_ == 0) {
-      params.fail("absolute_rot_per_sensor_rot", "must be nonzero");
+    // One sensor rotation must cover the travel, or the boot reading names
+    // more than one position.
+    if (max_rot_ - min_rot_ > std::abs(absolute_rot_per_sensor_rot_)) {
+      params.fail("absolute_rot_per_sensor_rot",
+                  "must be at least max_rot - min_rot in magnitude: one "
+                  "sensor rotation has to cover the travel");
     }
     absolute_offset_rot_ = params.number("absolute_offset_rot", 0.0);
   }
 
   stall_velocity_rps_ = params.number("stall_velocity_rps", 0.05);
-  if (stall_velocity_rps_ < 0)
+  if (stall_velocity_rps_ < 0) {
     params.fail("stall_velocity_rps", "must be >= 0");
+  }
   stall_current_a_ = params.number("stall_current_a", 0.0);
   if (stall_current_a_ < 0) params.fail("stall_current_a", "must be >= 0");
   stall_time_ = params.micros("stall_time_us", 0);
@@ -132,34 +157,47 @@ bool PositionMechanism::homed() const {
   return homing_ == Homing::kNone || motor_.zeroed();
 }
 
-void PositionMechanism::set_goal(double position_rot, double feedforward_v) {
-  request_ = Request::kGoal;
+void PositionMechanism::request(Request kind, double position_rot,
+                                double feedforward_v) {
+  RequireInUpdate(*node_, label_);
+  request_ = kind;
   request_rot_ = position_rot;
   request_ff_v_ = feedforward_v;
+  request_tick_ = node_->tick();
+}
+
+void PositionMechanism::set_goal(double position_rot, double feedforward_v) {
+  request(Request::kGoal, position_rot, feedforward_v);
 }
 
 void PositionMechanism::set_goal_units(double position_units,
                                        double feedforward_v) {
-  set_goal(position_units / units_per_rot_, feedforward_v);
+  request(Request::kGoal, position_units / units_per_rot_, feedforward_v);
 }
 
 void PositionMechanism::hold(double feedforward_v) {
-  request_ = Request::kHold;
-  request_rot_ = 0;
-  request_ff_v_ = feedforward_v;
+  request(Request::kHold, 0, feedforward_v);
 }
 
-void PositionMechanism::stop() { request_ = Request::kStop; }
+void PositionMechanism::stop() { request(Request::kStop, 0, 0); }
 
 void PositionMechanism::clear_fault() {
+  RequireInUpdate(*node_, label_);
+  reset_fault();
+}
+
+void PositionMechanism::reset_fault() {
   if (phase_ != PositionPhase::kFaulted) return;
   fault_ = PositionFault::kNone;
   phase_ = homed() ? PositionPhase::kReady : PositionPhase::kUnhomed;
 }
 
 void PositionMechanism::update() {
-  // Consume this tick's request: the next tick starts at stop().
-  const Request request = request_;
+  RequireInUpdate(*node_, label_);
+  // A request lasts the update() it was made in: one left from a tick whose
+  // update() did not reach this call is dropped, so it never drives late.
+  const Request request =
+      request_tick_ == node_->tick() ? request_ : Request::kStop;
   const double request_rot = request_rot_;
   const double request_ff_v = request_ff_v_;
   request_ = Request::kStop;
@@ -171,11 +209,10 @@ void PositionMechanism::update() {
   gravity_ff_v_ = 0;
 
   // The operator's reset: a Driver Station that reports disabled (not a
-  // stale link) clears a fault and restarts the homing clock.
+  // stale link) clears a fault and restarts the homing run.
   if (ds_.connected() && !ds_.enabled()) {
-    clear_fault();
-    homing_since_.reset();
-    homing_still_since_.reset();
+    reset_fault();
+    reset_homing_run();
   }
 
   // The frame. A switch zeroes only after home_samples consecutive closed
@@ -194,10 +231,7 @@ void PositionMechanism::update() {
   }
   position_rot_ = motor_.position();
   velocity_rps_ = motor_.velocity();
-  if (drives_home() && motor_.zeroed()) {
-    homing_since_.reset();
-    homing_still_since_.reset();
-  }
+  if (drives_home() && motor_.zeroed()) reset_homing_run();
   // A switch closed with the homed mechanism more than home_margin_rot into
   // its travel (away from home) is stuck or miswired.
   const double into_travel_rot =
@@ -212,43 +246,74 @@ void PositionMechanism::update() {
                     request != Request::kStop && std::isfinite(request_rot) &&
                     std::isfinite(request_ff_v);
   if (!homed()) {
-    if (!drives_home() || !live) {
-      // Losing the target pauses homing's motion, not its clock.
+    // Only a goal homes: hold() has no position to hold in an unknown
+    // frame, so it is neutral, and so is losing the goal (which pauses the
+    // push but not the homing timeout).
+    if (!drives_home() || !live || request != Request::kGoal) {
+      push_since_.reset();
       homing_still_since_.reset();
       idle(PositionPhase::kUnhomed);
       return;
     }
-    if (!homing_since_) homing_since_ = now;
-    if (std::abs(velocity_rps_) >= homing_stall_rps_) {
-      homing_still_since_.reset();
-    } else if (!homing_still_since_) {
-      homing_still_since_ = now;
-    }
-    const bool still = homing_still_since_.has_value() &&
-                       now - *homing_still_since_ >= homing_stall_time_;
-    if (homing_ == Homing::kStall && still) {
-      motor_.rezero(home_rot_);  // at the hard stop: that is home
-      position_rot_ = motor_.position();
-      homing_since_.reset();
-      homing_still_since_.reset();
-    } else if (now - *homing_since_ >= homing_timeout_) {
-      fault(PositionFault::kHomingTimeout);
-      return;
-    } else if (still) {
-      fault(PositionFault::kHomingStall);
-      return;
-    } else {
-      motor_.set_voltage(homing_v_);
-      driving_ = true;
-      idle(PositionPhase::kHoming);
-      return;
-    }
+    if (home(now)) return;  // still homing, or faulted
   }
   if (!live) {
     idle(PositionPhase::kReady);
     return;
   }
   drive_goal(request, request_rot, request_ff_v, now);
+}
+
+// One tick of a live homing push. Returns false once this tick has set the
+// frame (stall homing found its stop), true while homing continues or has
+// faulted.
+bool PositionMechanism::home(Time now) {
+  if (!homing_since_) homing_since_ = now;
+  if (!push_since_) push_since_ = now;
+  // The timeout faults, and never homes, whatever else this tick shows.
+  if (now - *homing_since_ >= homing_timeout_) {
+    fault(PositionFault::kHomingTimeout);
+    return true;
+  }
+  const bool slow = std::abs(velocity_rps_) < homing_stall_rps_;
+  if (!slow) homing_moved_ = true;
+  bool still_counts = slow;
+  if (homing_ == Homing::kStall) {
+    // A stop is stillness under load, after the push has had the chance to
+    // move the mechanism: it moved, or it has pushed for homing_min_push_us
+    // (a mechanism that starts slowly is not yet at its stop).
+    still_counts = slow &&
+                   std::abs(motor_.current()) >= homing_stall_current_a_ &&
+                   (homing_moved_ || now - *push_since_ >= homing_min_push_);
+  }
+  if (!still_counts) {
+    homing_still_since_.reset();
+  } else if (!homing_still_since_) {
+    homing_still_since_ = now;
+  }
+  const bool still = homing_still_since_.has_value() &&
+                     now - *homing_still_since_ >= homing_stall_time_;
+  if (homing_ == Homing::kStall && still) {
+    motor_.rezero(home_rot_);  // pushed still against the stop: home
+    position_rot_ = motor_.position();
+    reset_homing_run();
+    return false;
+  }
+  if (still) {  // limit-switch homing pushing a mechanism that does not move
+    fault(PositionFault::kHomingStall);
+    return true;
+  }
+  motor_.set_voltage(homing_v_);
+  driving_ = true;
+  idle(PositionPhase::kHoming);
+  return true;
+}
+
+void PositionMechanism::reset_homing_run() {
+  homing_since_.reset();
+  push_since_.reset();
+  homing_still_since_.reset();
+  homing_moved_ = false;
 }
 
 void PositionMechanism::drive_goal(Request request, double request_rot,

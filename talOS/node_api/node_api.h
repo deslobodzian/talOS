@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 26u
+#define TALOS_NODE_ABI_VERSION 27u
 
 enum {
   TALOS_OK = 0,
@@ -410,12 +410,10 @@ void talos_sim_hardware_destroy(TalosSimHardware* hw);
 int32_t talos_sim_hardware_enable(TalosSimHardware* hw, int32_t on);
 int32_t talos_sim_hardware_ideal_motors(TalosSimHardware* hw, int32_t on);
 // Feedback for (node, device), by the names the node uses.
-int32_t talos_sim_hardware_set_motor(TalosSimHardware* hw, const char* node,
-                                     const char* device, double position,
-                                     double velocity, uint32_t position_age_us,
-                                     uint32_t velocity_age_us,
-                                     double temperature_c,
-                                     double supply_current_a);
+int32_t talos_sim_hardware_set_motor(
+    TalosSimHardware* hw, const char* node, const char* device, double position,
+    double velocity, uint32_t position_age_us, uint32_t velocity_age_us,
+    double temperature_c, double supply_current_a, double stator_current_a);
 // SimHardware::set_limit_switches: the motor's forward and reverse TalonFX
 // limit switches, asserted (nonzero) or not, from the next state on.
 int32_t talos_sim_hardware_set_limit_switches(TalosSimHardware* hw,

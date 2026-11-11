@@ -214,7 +214,10 @@ at-speed bands, spin-down) and `RollerWithSensor` (intake, indexer: intake,
 hold, eject and feed with a beam break). Each is a member of the node,
 configured by a `[<name>]` table in the subsystem file, given this tick's
 goal (`set_goal`) only while the node's `Target` is live, and stepped with
-`update()`. C++ only for now; a Python node uses one through a C++ node
+`update()`. Like a `Motor` setter, a request is accepted only inside the
+node's `update()` (`talos::RequireInUpdate(node, what)` in `devices.h` is
+that check, for any layer that holds a request for the flush) and lasts only
+that tick. C++ only for now; a Python node uses one through a C++ node
 exported with `TALOS_EXPORT_NODE`.
 
 Motor `temperature_c` is device temperature in Celsius; `supply_current_a`
@@ -222,8 +225,9 @@ is supply-side current, not `current` (stator current). All three use 0.1-unit
 wire resolution. They are observations, not automatic thermal derating.
 Check `connected`/link freshness before using readings; numeric getters latch
 the last received sample when the hardware link is stale. SimHardware
-`set_motor(..., temperature_c=..., supply_current_a=...)` injects diagnostics
-through the same wire codec (C++ takes these optional arguments after ages).
+`set_motor(..., temperature_c=..., supply_current_a=..., stator_current_a=...)`
+injects diagnostics and the stator current `current()` reads through the same
+wire codec (C++ takes these optional arguments after ages, in that order).
 
 `forward_limit()` / `reverse_limit()` (properties in Python) are true while an
 enabled switch on the TalonFX's own forward or reverse limit input

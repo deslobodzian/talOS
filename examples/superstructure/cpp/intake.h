@@ -15,9 +15,11 @@ namespace demo {
 // asked, on its target lane (/intake/target/<source>, see [targets] in
 // intake.toml).
 //
-// With no target (robot disabled, lane stale, released or never sent) it
-// behaves as asked for IDLE and drives nothing: the roller is neutral, while
-// the state machine still tracks the beam break and finishes a timed eject.
+// With no target (lane stale, released or never sent) it behaves as asked
+// for IDLE and drives nothing: the roller is neutral, while the state
+// machine still tracks the beam break and finishes a timed eject. Losing
+// enable (robot disabled, stale link) also cancels an eject or intake in
+// progress; a held piece stays HOLDING.
 class Intake {
  public:
   explicit Intake(talos::Node& node)

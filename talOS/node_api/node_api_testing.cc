@@ -234,16 +234,15 @@ int32_t talos_sim_hardware_ideal_motors(TalosSimHardware* hw, int32_t on) {
   });
 }
 
-int32_t talos_sim_hardware_set_motor(TalosSimHardware* hw, const char* node,
-                                     const char* device, double position,
-                                     double velocity, uint32_t position_age_us,
-                                     uint32_t velocity_age_us,
-                                     double temperature_c,
-                                     double supply_current_a) {
+int32_t talos_sim_hardware_set_motor(
+    TalosSimHardware* hw, const char* node, const char* device, double position,
+    double velocity, uint32_t position_age_us, uint32_t velocity_age_us,
+    double temperature_c, double supply_current_a, double stator_current_a) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     AsHardware(hw).set_motor(NonNull(node, "node"), NonNull(device, "device"),
                              position, velocity, position_age_us,
-                             velocity_age_us, temperature_c, supply_current_a);
+                             velocity_age_us, temperature_c, supply_current_a,
+                             stator_current_a);
     return TALOS_OK;
   });
 }

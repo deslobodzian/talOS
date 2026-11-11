@@ -17,8 +17,10 @@
 //
 //   phase      roller    leaves on
 //   kIdle      neutral   kIntake -> kIntaking; with idle_runs, a newly asked
-//                        kEject or kFeed -> kEjecting / kFeeding (holding
-//                        the command runs it once)
+//                        kEject or kFeed -> kEjecting / kFeeding: one that
+//                        differs from the last live request, so holding the
+//                        command, or asking it again after a stale spell,
+//                        release or disable, runs it once
 //   kIntaking  intake_v  piece -> kHolding; kIdle -> kIdle; kEject, kFeed
 //   kHolding   hold_v    kEject, kFeed; piece gone -> kIdle
 //   kEjecting  eject_v   after eject_us -> kIdle
@@ -27,13 +29,20 @@
 // The motor is [motors.<name>]; the parameters, including the sensor's
 // device name, are the [<name>] table (talOS/mechanisms/README.md).
 //
-// set_goal() and stop() are this tick's request, consumed by update(). With
-// none (stop(): no live target, robot disabled) the roller is neutral and the
-// state machine runs as if asked for kIdle: it still tracks the sensor and
-// finishes a timed run, without driving.
+// set_goal() and stop() are this tick's request, accepted only inside the
+// node's update() (std::logic_error otherwise) and consumed by this tick's
+// update(); a request whose tick ended without update() is dropped. With no
+// live request (stop(), a stale or released lane) the roller is neutral and
+// the state machine runs as if asked for kIdle: it still tracks the sensor
+// and finishes a timed run, without driving. Losing enable (robot_enabled
+// false: a Driver Station disable, a stale link) also cancels intaking and
+// any timed run, back to kIdle; a held piece stays kHolding. The roller
+// reads no motor feedback: a motor whose feedback is invalid is
+// neutralized by the gateway, not here.
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 
 #include "talOS/devices/devices.h"
@@ -78,6 +87,7 @@ class RollerWithSensor {
 
  private:
   Node* node_;
+  std::string label_;  // "RollerWithSensor '<name>'", for errors
   Motor motor_;
   DigitalInput sensor_;
 
@@ -93,6 +103,7 @@ class RollerWithSensor {
 
   bool requested_{false};
   RollerCommand request_{RollerCommand::kIdle};
+  std::uint64_t request_tick_{0};  // node.tick() of the update() it came from
   RollerCommand last_command_{RollerCommand::kIdle};
 
   RollerPhase phase_{RollerPhase::kIdle};

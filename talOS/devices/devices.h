@@ -91,6 +91,13 @@ class HardwareLink {
 // constructor.
 bool robot_enabled(Node& node);
 
+// Throws std::logic_error naming `what` unless called on `node`'s loop thread
+// inside its update(), the rule every output setter enforces. For a layer
+// above that holds a request for this tick's flush (talOS/mechanisms), so a
+// request from the constructor, every() or a message callback is refused as
+// a direct device command would be.
+void RequireInUpdate(const Node& node, std::string_view what);
+
 // Hardware handles: cheap copyable values. Output setters (Motor's set_* and
 // stop(), DigitalOutput::set, PwmOutput::set) are taken only inside the
 // node's update() and apply to the flush right after it; anything not set in

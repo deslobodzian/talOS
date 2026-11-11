@@ -80,7 +80,7 @@ class SimHardware {
                  double position, double velocity,
                  std::uint32_t position_age_us = 0,
                  std::uint32_t velocity_age_us = 0, double temperature_c = 0,
-                 double supply_current_a = 0);
+                 double supply_current_a = 0, double stator_current_a = 0);
   // The motor's TalonFX limit switches, asserted or not, reported from the
   // next state on as its ForwardHardLimit/ReverseHardLimit fault bits
   // (Motor::forward_limit, reverse_limit) while it is connected. Reported

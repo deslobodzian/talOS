@@ -39,6 +39,7 @@ struct Axis {
 struct MotorAxis : Axis {
   double temperature_c = 0;
   double supply_current_a = 0;
+  double stator_current_a = 0;
 };
 
 // Neutral decay, the same first-order rotor model and constants as the
@@ -351,6 +352,7 @@ struct SimHardware::Impl {
           .valid = true,
           .position_rot = axis.position,
           .velocity_rps = axis.velocity,
+          .stator_current_a = axis.stator_current_a,
           .position_age_us = axis.position_age_us,
           .velocity_age_us = axis.velocity_age_us,
           .fault_flags = ValueOr(motor_limit_flags, c.id, 0u),
@@ -522,11 +524,12 @@ void SimHardware::set_motor(std::string_view node, std::string_view device,
                             double position, double velocity,
                             std::uint32_t position_age_us,
                             std::uint32_t velocity_age_us, double temperature_c,
-                            double supply_current_a) {
+                            double supply_current_a, double stator_current_a) {
   impl_->motors[impl_->Id(node, Kind::kMotor, device)] = {
       {position, velocity, position_age_us, velocity_age_us},
       temperature_c,
-      supply_current_a};
+      supply_current_a,
+      stator_current_a};
 }
 
 void SimHardware::set_limit_switches(std::string_view node,
