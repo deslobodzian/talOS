@@ -35,7 +35,17 @@ enum DsFlags : uint32_t {
 // data, FMS attachment and joysticks do not.
 inline constexpr uint32_t kModeFlags =
     kDsAttached | kEnabled | kAutonomous | kTeleop | kTest | kEStop;
-constexpr uint32_t ModeKey(uint32_t flags) { return flags & kModeFlags; }
+
+// A mode bit names a mode only while a Driver Station is attached: with
+// none, WPILib's HAL reports teleop as its default control word. The flags a
+// sampler publishes, and its generations, drop them while detached.
+constexpr uint32_t ShownFlags(uint32_t flags) {
+  return (flags & kDsAttached) != 0 ? flags
+                                    : flags & ~(kAutonomous | kTeleop | kTest);
+}
+constexpr uint32_t ModeKey(uint32_t flags) {
+  return ShownFlags(flags) & kModeFlags;
+}
 
 constexpr std::size_t kMaxJoysticks = 6;
 constexpr std::size_t kMaxAxes = 12;
@@ -113,7 +123,8 @@ struct DriverStationData {
 
 // Tracks mode generations independently of packet publication. Every hardware
 // tick must Observe the same flags used to enable the gateway, even when no
-// Driver Station packet is due. Stamp also observes its sample, so samplers
+// Driver Station packet is due. Stamp clears a detached sample's mode bits
+// (ShownFlags) and also observes it, so samplers
 // without a faster hardware tick can simply stamp each packet before encoding.
 //
 //   tracker.Observe(flags, now_us);

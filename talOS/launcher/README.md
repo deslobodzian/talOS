@@ -847,8 +847,8 @@ object in JSONL, its text in CSV and the text dump, absent (JSONL) or empty
   an active current limit),
   `forward_limit` and `reverse_limit` (hard limit switches); every other
   device's samples, health and gateway counters.
-- `driver_station`: `mode` (`teleop`, `autonomous`, `test`, `none`),
-  `enabled`, `estop`, attachment, alliance, station and match fields, and each
+- `driver_station`: `mode` (`teleop`, `autonomous`, `test`, `none`; `none`
+  while no Driver Station is attached), `enabled`, `estop`, attachment, alliance, station and match fields, and each
   connected joystick's `port`, `name`, `axes`, `buttons` (bit i is button
   i + 1) and `povs`.
 
