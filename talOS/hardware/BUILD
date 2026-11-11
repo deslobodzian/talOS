@@ -53,10 +53,9 @@ cc_test(
     name = "gateway_test",
     size = "small",
     srcs = ["gateway_test.cc"],
-    tags = ["exclusive"],
     deps = [
         ":hardware",
-        "//talOS/protocol:udp_test_helpers",
+        "//talOS/protocol",
         "@googletest//:gtest_main",
     ],
 )

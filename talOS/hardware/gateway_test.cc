@@ -1,14 +1,19 @@
 #include "gateway.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <optional>
@@ -21,7 +26,6 @@
 #include "endpoint.h"
 #include "sim_backend.h"
 #include "sim_physics.h"
-#include "talOS/protocol/udp_test_helpers.h"
 
 namespace talos::hardware {
 namespace {
@@ -1087,42 +1091,195 @@ TEST(Gateway, StartsUnconfiguredAndRefusesEnableUntilReconfigured) {
   EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
 }
 
+// Polls `done` until it holds. The deadline only bounds a hang
+// (docs/TESTING.md §6.3); no test asserts how long a wait took.
+template <typename Done>
+[[nodiscard]] bool Eventually(Done done) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  while (!done()) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return true;
+}
+
+// The bridge's side of an Endpoint's link, on a raw loopback socket.
+// Connect() binds an ephemeral port, opens the endpoint toward it from an
+// ephemeral port of its own, and learns that port from a frame the endpoint
+// sends, so no test binds a fixed port (docs/TESTING.md §6.4). A raw socket,
+// since a RuntimeUdpPeer must know its peer's port before it binds, and sends
+// only this build's protocol version.
+class Companion {
+ public:
+  Companion() = default;
+  ~Companion() {
+    if (fd_ >= 0) ::close(fd_);
+  }
+  Companion(const Companion&) = delete;
+  Companion& operator=(const Companion&) = delete;
+
+  ::testing::AssertionResult Connect(Endpoint& endpoint) {
+    fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd_ < 0) return Failed("socket");
+    // As a RuntimeUdpPeer's: room for the States a tick loop piles up.
+    const int buffer_bytes = 256 * 1024;
+    if (::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &buffer_bytes,
+                     sizeof(buffer_bytes)) != 0 ||
+        ::fcntl(fd_, F_SETFL, O_NONBLOCK) != 0)
+      return Failed("configure socket");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t length = sizeof(address);
+    if (::bind(fd_, reinterpret_cast<const sockaddr*>(&address),
+               sizeof(address)) != 0 ||
+        ::getsockname(fd_, reinterpret_cast<sockaddr*>(&address), &length) != 0)
+      return Failed("bind port 0");
+    const auto port = ntohs(address.sin_port);
+    if (endpoint.Open("127.0.0.1", 0, "127.0.0.1", port) !=
+        protocol::UdpStatus::kOk)
+      return ::testing::AssertionFailure()
+             << "Endpoint::Open toward port " << port;
+    // The passthrough sends without ticking the gateway.
+    const std::array<uint8_t, 1> hello{};
+    if (endpoint.SendFrame(protocol::FrameType::kDriverStation, 0, hello.data(),
+                           hello.size()) != protocol::UdpStatus::kOk)
+      return ::testing::AssertionFailure() << "the endpoint did not send";
+    sockaddr_in from{};
+    socklen_t from_length = 0;
+    const bool heard = Eventually([&] {
+      from_length = sizeof(from);
+      const auto got =
+          ::recvfrom(fd_, rx_.data(), rx_.size(), 0,
+                     reinterpret_cast<sockaddr*>(&from), &from_length);
+      protocol::DecodedFrame frame;
+      return got > 0 &&
+             protocol::DecodeFrame(rx_.data(), static_cast<std::size_t>(got),
+                                   &frame) == protocol::DecodeStatus::kOk &&
+             frame.header.type == protocol::FrameType::kDriverStation;
+    });
+    if (!heard)
+      return ::testing::AssertionFailure() << "no frame from the endpoint";
+    if (::connect(fd_, reinterpret_cast<const sockaddr*>(&from), from_length) !=
+        0)
+      return Failed("connect");
+    return ::testing::AssertionSuccess();
+  }
+
+  // Frames carry this companion's own sequence, from 1, like a
+  // RuntimeUdpPeer's; `version` stamps another protocol version.
+  protocol::UdpStatus SendFrame(protocol::FrameType type, uint16_t flags,
+                                uint64_t monotonic_time_us, const void* payload,
+                                std::size_t payload_size,
+                                uint16_t version = protocol::kProtocolVersion) {
+    std::array<uint8_t, protocol::kMaxFrameSize> frame{};
+    const auto size = protocol::EncodeFrame(
+        type, flags, next_send_sequence_, monotonic_time_us, payload,
+        payload_size, frame.data(), frame.size());
+    if (size == 0) return protocol::UdpStatus::kInvalidArgument;
+    frame[8] = static_cast<uint8_t>(version);  // The header's version field.
+    frame[9] = static_cast<uint8_t>(version >> 8);
+    if (::send(fd_, frame.data(), size, 0) != static_cast<ssize_t>(size))
+      return protocol::UdpStatus::kSocketError;
+    ++next_send_sequence_;
+    return protocol::UdpStatus::kOk;
+  }
+
+  protocol::UdpStatus TryReceive(protocol::DecodedFrame* out) {
+    const auto got = ::recv(fd_, rx_.data(), rx_.size(), 0);
+    if (got < 0)
+      return errno == EAGAIN || errno == EWOULDBLOCK
+                 ? protocol::UdpStatus::kWouldBlock
+                 : protocol::UdpStatus::kSocketError;
+    return protocol::DecodeFrame(rx_.data(), static_cast<std::size_t>(got),
+                                 out) == protocol::DecodeStatus::kOk
+               ? protocol::UdpStatus::kOk
+               : protocol::UdpStatus::kDecodeError;
+  }
+
+  // Waits for the next frame: a sent datagram need not be readable at once,
+  // even on loopback.
+  protocol::UdpStatus Receive(protocol::DecodedFrame* out) {
+    auto status = protocol::UdpStatus::kWouldBlock;
+    (void)Eventually([&] {
+      status = TryReceive(out);
+      return status != protocol::UdpStatus::kWouldBlock;
+    });
+    return status;
+  }
+
+  // Waits for the next frame of `type`, skipping the others (the State every
+  // tick sends).
+  bool Receive(protocol::FrameType type, protocol::DecodedFrame* out) {
+    while (Receive(out) == protocol::UdpStatus::kOk) {
+      if (out->header.type == type) return true;
+    }
+    return false;
+  }
+
+  uint64_t next_send_sequence() const { return next_send_sequence_; }
+
+ private:
+  static ::testing::AssertionResult Failed(const char* step) {
+    return ::testing::AssertionFailure()
+           << step << ": " << std::strerror(errno);
+  }
+
+  int fd_{-1};
+  uint64_t next_send_sequence_{1};
+  std::array<uint8_t, protocol::kMaxFrameSize> rx_{};
+};
+
+// Ticks the endpoint and returns the State that tick sent, skipping the
+// frames sent before it.
+std::optional<State> TickForState(Endpoint& endpoint, Companion& companion,
+                                  uint64_t now_us, bool enabled) {
+  if (endpoint.Tick(now_us, enabled) != protocol::UdpStatus::kOk)
+    return std::nullopt;
+  protocol::DecodedFrame frame;
+  while (companion.Receive(protocol::FrameType::kHardwareState, &frame)) {
+    State state;
+    if (!Decode({frame.payload, frame.payload_size}, state))
+      return std::nullopt;
+    if (state.sample_time_us == now_us) return state;
+  }
+  return std::nullopt;
+}
+
 TEST(Endpoint, ClockProbeEchoUsesLaterSampleWhileDisabledAndUnconfigured) {
   SimBackend backend;
   Gateway gateway{backend, 2003};
   Endpoint endpoint{gateway};
-  ASSERT_EQ(endpoint.Open("127.0.0.1", 15814, "127.0.0.1", 15815),
-            protocol::UdpStatus::kOk);
-  protocol::RuntimeUdpPeer companion;
-  ASSERT_EQ(companion.Open("127.0.0.1", 15815, "127.0.0.1", 15814),
-            protocol::UdpStatus::kOk);
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
   ASSERT_EQ(companion.SendFrame(protocol::FrameType::kClockProbe, 0, 9000,
                                 nullptr, 0),
             protocol::UdpStatus::kOk);
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  for (uint64_t tick : {1000u, 6000u}) {
-    ASSERT_EQ(endpoint.Tick(tick, false), protocol::UdpStatus::kOk);
-    protocol::DecodedFrame frame;
-    ASSERT_EQ(protocol::testing::ReceiveFrame(companion, &frame),
-              protocol::UdpStatus::kOk);
-    State state;
-    ASSERT_TRUE(Decode({frame.payload, frame.payload_size}, state));
-    EXPECT_EQ(state.clock_probe_time_us, tick == 1000 ? 0u : 9000u);
-    EXPECT_EQ(state.sample_time_us, tick);
-    EXPECT_FALSE(state.flags & (kEnabled | kCommandActive));
-    EXPECT_EQ(state.counters.rejected_command_count, 0u);
-  }
+  // The State of the tick that receives the probe cannot echo it yet: that
+  // tick's sample was taken before its receive.
+  const auto expect_state = [&](uint64_t tick, uint64_t echo_us) {
+    const auto state = TickForState(endpoint, companion, tick, false);
+    ASSERT_TRUE(state.has_value()) << "tick " << tick;
+    EXPECT_EQ(state->clock_probe_time_us, echo_us) << "tick " << tick;
+    EXPECT_FALSE(state->flags & (kEnabled | kCommandActive));
+    EXPECT_EQ(state->counters.rejected_command_count, 0u);
+  };
+  uint64_t tick = 1000;
+  ASSERT_TRUE(Eventually([&] {
+    expect_state(tick++, 0);
+    return HasFailure() || endpoint.peer_contact().frame_us != 0;
+  }));
+  ASSERT_FALSE(HasFailure());
+  expect_state(6000, 9000);
 }
 
 TEST(Endpoint, OutboundBlackoutPreservesReceiveAndSafetyTicks) {
   SimBackend backend;
   Gateway gateway{backend, 2002};
   Endpoint endpoint{gateway};
-  ASSERT_EQ(endpoint.Open("127.0.0.1", 15812, "127.0.0.1", 15813),
-            protocol::UdpStatus::kOk);
-  protocol::RuntimeUdpPeer companion;
-  ASSERT_EQ(companion.Open("127.0.0.1", 15813, "127.0.0.1", 15812),
-            protocol::UdpStatus::kOk);
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
 
   endpoint.SetSendEnabled(false);
   const auto cfg = SwerveConfig(true);
@@ -1132,9 +1289,11 @@ TEST(Endpoint, OutboundBlackoutPreservesReceiveAndSafetyTicks) {
                                   1000, chunks[i].data(), chunks[i].size()),
               protocol::UdpStatus::kOk);
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  ASSERT_EQ(endpoint.Tick(2000, false), protocol::UdpStatus::kOk);
-  EXPECT_TRUE(gateway.configured());  // Receives config, but drops its ACK.
+  // Receives config, but drops its ACK.
+  ASSERT_TRUE(Eventually([&] {
+    EXPECT_EQ(endpoint.Tick(2000, false), protocol::UdpStatus::kOk);
+    return gateway.configured();
+  }));
   ASSERT_EQ(endpoint.Tick(3000, true), protocol::UdpStatus::kOk);
   EXPECT_TRUE(gateway.snapshot().flags & kEnabled);
   Command command = Request(gateway);
@@ -1145,8 +1304,10 @@ TEST(Endpoint, OutboundBlackoutPreservesReceiveAndSafetyTicks) {
   ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareCommand, 100,
                                 3000, command_bytes.data(), command_size),
             protocol::UdpStatus::kOk);
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  ASSERT_EQ(endpoint.Tick(4000, true), protocol::UdpStatus::kOk);
+  ASSERT_TRUE(Eventually([&] {
+    EXPECT_EQ(endpoint.Tick(4000, true), protocol::UdpStatus::kOk);
+    return (gateway.snapshot().flags & kCommandActive) != 0;
+  }));
   ASSERT_EQ(endpoint.Tick(5000, true), protocol::UdpStatus::kOk);
   EXPECT_TRUE(gateway.snapshot().flags & kCommandActive);
   EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].velocity_rps, 5.0);
@@ -1158,27 +1319,26 @@ TEST(Endpoint, OutboundBlackoutPreservesReceiveAndSafetyTicks) {
   ASSERT_EQ(endpoint.SendFrame(protocol::FrameType::kDriverStation, 3000,
                                ds_payload.data(), ds_payload.size()),
             protocol::UdpStatus::kOk);
-  protocol::DecodedFrame frame;
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  EXPECT_EQ(companion.TryReceive(&frame), protocol::UdpStatus::kWouldBlock);
 
+  // One sender to one receiver on loopback keeps its order, so the first
+  // frame after the blackout shows that the ACK, every State and the Driver
+  // Station frame of the blackout were dropped, not queued.
   endpoint.SetSendEnabled(true);
   const uint64_t resumed_at = 6000 + cfg.command_timeout_us;
   ASSERT_EQ(endpoint.Tick(resumed_at, false), protocol::UdpStatus::kOk);
   ASSERT_EQ(endpoint.SendFrame(protocol::FrameType::kDriverStation, resumed_at,
                                ds_payload.data(), ds_payload.size()),
             protocol::UdpStatus::kOk);
-  ASSERT_EQ(protocol::testing::ReceiveFrame(companion, &frame),
-            protocol::UdpStatus::kOk);
+  protocol::DecodedFrame frame;
+  ASSERT_EQ(companion.Receive(&frame), protocol::UdpStatus::kOk);
   EXPECT_EQ(frame.header.type, protocol::FrameType::kHardwareState);
   State state;
   ASSERT_TRUE(Decode({frame.payload, frame.payload_size}, state));
   EXPECT_EQ(state.sample_time_us, resumed_at);
   EXPECT_FALSE(state.flags & kEnabled);
-  ASSERT_EQ(protocol::testing::ReceiveFrame(companion, &frame),
-            protocol::UdpStatus::kOk);
+  ASSERT_EQ(companion.Receive(&frame), protocol::UdpStatus::kOk);
   EXPECT_EQ(frame.header.type, protocol::FrameType::kDriverStation);
-  EXPECT_EQ(companion.TryReceive(&frame), protocol::UdpStatus::kWouldBlock);
+  EXPECT_EQ(frame.header.monotonic_time_us, resumed_at);
 }
 
 // The RoboRIO program reports to the drive team whether its companion is
@@ -1189,82 +1349,56 @@ TEST(Endpoint, PeerContactRecordsProbesCommandsAndForeignProtocolVersions) {
   SimBackend backend;
   Gateway gateway{backend, 2004};
   Endpoint endpoint{gateway};
-  ASSERT_EQ(endpoint.Open("127.0.0.1", 15818, "127.0.0.1", 15819),
-            protocol::UdpStatus::kOk);
-  // A raw socket, since RuntimeUdpPeer only sends this build's version.
-  const int companion = ::socket(AF_INET, SOCK_DGRAM, 0);
-  ASSERT_GE(companion, 0);
-  sockaddr_in address{};
-  address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  address.sin_port = htons(15819);
-  ASSERT_EQ(
-      ::bind(companion, reinterpret_cast<sockaddr*>(&address), sizeof(address)),
-      0);
-  address.sin_port = htons(15818);
-  const auto send = [&](protocol::FrameType type, uint16_t version,
-                        std::span<const uint8_t> payload) {
-    std::array<uint8_t, protocol::kMaxFrameSize> frame{};
-    const auto size =
-        protocol::EncodeFrame(type, protocol::kFlagNone, 1, 0, payload.data(),
-                              payload.size(), frame.data(), frame.size());
-    frame[8] = static_cast<uint8_t>(version);
-    frame[9] = static_cast<uint8_t>(version >> 8);
-    return ::sendto(companion, frame.data(), size, 0,
-                    reinterpret_cast<const sockaddr*>(&address),
-                    sizeof(address)) == static_cast<ssize_t>(size);
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+  // Ticks at `now_us` until the endpoint has received what was sent.
+  const auto tick_until = [&](uint64_t now_us, const uint64_t& heard_us) {
+    return Eventually([&] {
+      endpoint.Tick(now_us, false);
+      return heard_us != 0;
+    });
   };
+  const auto& contact = endpoint.peer_contact();
 
-  ASSERT_TRUE(
-      send(protocol::FrameType::kClockProbe, protocol::kProtocolVersion, {}));
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  ASSERT_EQ(endpoint.Tick(1000, false), protocol::UdpStatus::kOk);
-  EXPECT_EQ(endpoint.peer_contact().frame_us, 1000u);
-  EXPECT_EQ(endpoint.peer_contact().command_us, 0u);
+  ASSERT_EQ(
+      companion.SendFrame(protocol::FrameType::kClockProbe, 0, 0, nullptr, 0),
+      protocol::UdpStatus::kOk);
+  ASSERT_TRUE(tick_until(1000, contact.frame_us));
+  EXPECT_EQ(contact.frame_us, 1000u);
+  EXPECT_EQ(contact.command_us, 0u);
 
   std::array<uint8_t, kMaxCommandSize> command{};
   const auto command_size = Encode(Command{}, command);
   ASSERT_GT(command_size, 0u);
-  ASSERT_TRUE(send(protocol::FrameType::kHardwareCommand,
-                   protocol::kProtocolVersion,
-                   std::span{command}.first(command_size)));
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  ASSERT_EQ(endpoint.Tick(2000, false), protocol::UdpStatus::kOk);
-  EXPECT_EQ(endpoint.peer_contact().command_us, 2000u);
-  EXPECT_EQ(endpoint.peer_contact().version_mismatch_us, 0u);
+  ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareCommand, 0, 0,
+                                command.data(), command_size),
+            protocol::UdpStatus::kOk);
+  ASSERT_TRUE(tick_until(2000, contact.command_us));
+  EXPECT_EQ(contact.command_us, 2000u);
+  EXPECT_EQ(contact.version_mismatch_us, 0u);
 
   const auto foreign = static_cast<uint16_t>(protocol::kProtocolVersion + 1);
-  ASSERT_TRUE(send(protocol::FrameType::kClockProbe, foreign, {}));
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  ASSERT_EQ(endpoint.Tick(3000, false), protocol::UdpStatus::kOk);
-  EXPECT_EQ(endpoint.peer_contact().version_mismatch_us, 3000u);
-  EXPECT_EQ(endpoint.peer_contact().mismatched_version, foreign);
-  EXPECT_EQ(endpoint.peer_contact().frame_us, 2000u);
-  ::close(companion);
+  ASSERT_EQ(companion.SendFrame(protocol::FrameType::kClockProbe, 0, 0, nullptr,
+                                0, foreign),
+            protocol::UdpStatus::kOk);
+  ASSERT_TRUE(tick_until(3000, contact.version_mismatch_us));
+  EXPECT_EQ(contact.version_mismatch_us, 3000u);
+  EXPECT_EQ(contact.mismatched_version, foreign);
+  EXPECT_EQ(contact.frame_us, 2000u);
 }
 
 TEST(Endpoint, PushesConfigOverUdpAndAcknowledgesIt) {
   SimBackend backend;
   Gateway gateway{backend, 2002};
   Endpoint endpoint{gateway};
-  ASSERT_EQ(endpoint.Open("127.0.0.1", 15802, "127.0.0.1", 15803),
-            protocol::UdpStatus::kOk);
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
 
-  protocol::RuntimeUdpPeer companion;
-  ASSERT_EQ(companion.Open("127.0.0.1", 15803, "127.0.0.1", 15802),
-            protocol::UdpStatus::kOk);
-
-  // 1. Companion ticks and sees state with config_id = 0
-  endpoint.Tick(1000, true);
-
-  protocol::DecodedFrame frame;
-  ASSERT_EQ(protocol::testing::ReceiveFrame(companion, &frame),
-            protocol::UdpStatus::kOk);
-  EXPECT_EQ(frame.header.type, protocol::FrameType::kHardwareState);
-  State state;
-  ASSERT_TRUE(Decode({frame.payload, frame.payload_size}, state));
-  EXPECT_EQ(state.config_id, 0u);
-  EXPECT_EQ(state.boot_id, 2002u);
+  // 1. Companion sees state with config_id = 0
+  auto state = TickForState(endpoint, companion, 1000, true);
+  ASSERT_TRUE(state.has_value());
+  EXPECT_EQ(state->config_id, 0u);
+  EXPECT_EQ(state->boot_id, 2002u);
 
   // 2. Companion pushes config chunks
   auto cfg = SwerveConfig(true);
@@ -1277,15 +1411,15 @@ TEST(Endpoint, PushesConfigOverUdpAndAcknowledgesIt) {
 
   // 3. Endpoint ticks, processes chunks, sends ACK. Hardware configuration
   // requires disabled operation, so the config push is serviced disabled.
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  endpoint.Tick(2000, false);
-  EXPECT_TRUE(gateway.configured());
+  ASSERT_TRUE(Eventually([&] {
+    endpoint.Tick(2000, false);
+    return gateway.configured();
+  }));
 
   // 4. Companion receives ACK
   protocol::DecodedFrame ack_frame;
-  ASSERT_EQ(protocol::testing::ReceiveFrame(companion, &ack_frame),
-            protocol::UdpStatus::kOk);
-  EXPECT_EQ(ack_frame.header.type, protocol::FrameType::kHardwareConfigAck);
+  ASSERT_TRUE(
+      companion.Receive(protocol::FrameType::kHardwareConfigAck, &ack_frame));
   ConfigAckPayload ack{};
   ASSERT_TRUE(
       DecodeConfigAck({ack_frame.payload, ack_frame.payload_size}, ack));
@@ -1293,14 +1427,10 @@ TEST(Endpoint, PushesConfigOverUdpAndAcknowledgesIt) {
   EXPECT_EQ(ack.config_id, ConfigurationId(cfg));
 
   // 5. Subsequent state from endpoint has config_id set and kConfigured set
-  endpoint.Tick(3000, true);
-  protocol::DecodedFrame state_frame;
-  ASSERT_EQ(protocol::testing::ReceiveFrame(companion, &state_frame),
-            protocol::UdpStatus::kOk);
-  EXPECT_EQ(state_frame.header.type, protocol::FrameType::kHardwareState);
-  ASSERT_TRUE(Decode({state_frame.payload, state_frame.payload_size}, state));
-  EXPECT_EQ(state.config_id, ConfigurationId(cfg));
-  EXPECT_TRUE(state.flags & kConfigured);
+  state = TickForState(endpoint, companion, 3000, true);
+  ASSERT_TRUE(state.has_value());
+  EXPECT_EQ(state->config_id, ConfigurationId(cfg));
+  EXPECT_TRUE(state->flags & kConfigured);
 }
 
 TEST(SimBackend, NeutralTurnsOffEveryOutputOnDisableTimeoutAndFailure) {
@@ -1825,30 +1955,33 @@ TEST(Gateway, RemoteSensorResetIsolatesItsMotorAndFollower) {
   EXPECT_FALSE(g.Accept(command, 4, 200000));
 }
 
-std::optional<ConfigAckPayload> PushConfigAndAwaitAck(
-    Endpoint& endpoint, protocol::RuntimeUdpPeer& companion, const Config& cfg,
-    bool enabled = false) {
-  auto chunks = CreateConfigChunks(cfg);
-  for (std::size_t i = 0; i < chunks.size(); ++i) {
+// Pushes `cfg` and ticks until the endpoint acknowledges it or begins a
+// backend configure that has not finished (whose ACK comes later): nullopt.
+std::optional<ConfigAckPayload> PushConfig(Endpoint& endpoint,
+                                           const Gateway& gateway,
+                                           Companion& companion,
+                                           const Config& cfg,
+                                           bool enabled = false) {
+  for (const auto& chunk : CreateConfigChunks(cfg)) {
     EXPECT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig,
-                                  protocol::kFlagNone, 1000, chunks[i].data(),
-                                  chunks[i].size()),
+                                  protocol::kFlagNone, 1000, chunk.data(),
+                                  chunk.size()),
               protocol::UdpStatus::kOk);
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  endpoint.Tick(2000, enabled);
-  for (int i = 0; i < 100; ++i) {
+  std::optional<ConfigAckPayload> ack;
+  const bool answered = Eventually([&] {
+    endpoint.Tick(2000, enabled);
     protocol::DecodedFrame frame;
-    if (companion.TryReceive(&frame) != protocol::UdpStatus::kOk) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      continue;
+    while (!ack && companion.TryReceive(&frame) == protocol::UdpStatus::kOk) {
+      if (frame.header.type != protocol::FrameType::kHardwareConfigAck)
+        continue;
+      ack.emplace();
+      EXPECT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, *ack));
     }
-    if (frame.header.type != protocol::FrameType::kHardwareConfigAck) continue;
-    ConfigAckPayload ack{};
-    EXPECT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, ack));
-    return ack;
-  }
-  return std::nullopt;
+    return ack.has_value() || gateway.configuring();
+  });
+  EXPECT_TRUE(answered) << "no ACK, and no configure begun";
+  return ack;
 }
 
 TEST(Endpoint, FailedConfigurationAcknowledgementBoundsReason) {
@@ -1864,13 +1997,9 @@ TEST(Endpoint, FailedConfigurationAcknowledgementBoundsReason) {
   backend.config_error = err;
   Gateway gateway{backend, 3003};
   Endpoint endpoint{gateway};
-  ASSERT_EQ(endpoint.Open("127.0.0.1", 15804, "127.0.0.1", 15805),
-            protocol::UdpStatus::kOk);
-  protocol::RuntimeUdpPeer companion;
-  ASSERT_EQ(companion.Open("127.0.0.1", 15805, "127.0.0.1", 15804),
-            protocol::UdpStatus::kOk);
-  const auto ack =
-      PushConfigAndAwaitAck(endpoint, companion, SwerveConfig(true));
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+  const auto ack = PushConfig(endpoint, gateway, companion, SwerveConfig(true));
   if (!ack.has_value()) {
     FAIL() << "no config ack";
   }
@@ -1886,11 +2015,8 @@ TEST(Endpoint, ConfigAckFlagsIgnoreIncomingSequence) {
   FakeBackend backend;
   Gateway gateway{backend, 3005};
   Endpoint endpoint{gateway};
-  ASSERT_EQ(endpoint.Open("127.0.0.1", 15814, "127.0.0.1", 15815),
-            protocol::UdpStatus::kOk);
-  protocol::RuntimeUdpPeer companion;
-  ASSERT_EQ(companion.Open("127.0.0.1", 15815, "127.0.0.1", 15814),
-            protocol::UdpStatus::kOk);
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
   // Advance the companion's sequence so its low bits are nonzero flag bits if
   // the incoming sequence leaked into the ACK header.
   const std::array<uint8_t, 1> junk{};
@@ -1909,17 +2035,17 @@ TEST(Endpoint, ConfigAckFlagsIgnoreIncomingSequence) {
   }
   ASSERT_GT(companion.next_send_sequence(), 0xffu);
   std::optional<uint16_t> ack_flags;
-  for (int tick = 0; tick < 100 && !ack_flags; ++tick) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    endpoint.Tick(2000 + tick, false);
+  uint64_t tick = 2000;
+  ASSERT_TRUE(Eventually([&] {
+    endpoint.Tick(tick++, false);
     protocol::DecodedFrame frame;
     while (companion.TryReceive(&frame) == protocol::UdpStatus::kOk) {
       EXPECT_EQ(frame.header.flags, protocol::kFlagNone);
       if (frame.header.type == protocol::FrameType::kHardwareConfigAck)
         ack_flags = frame.header.flags;
     }
-  }
-  ASSERT_TRUE(ack_flags.has_value());
+    return ack_flags.has_value();
+  }));
   EXPECT_EQ(*ack_flags, protocol::kFlagNone);
 }
 
@@ -2009,12 +2135,9 @@ TEST(Endpoint, RestoredGatewayAcknowledgesIdenticalConfigWhileEnabled) {
   gateway.Tick(1000, true);
   const auto configure_calls = backend.configure_calls;
   Endpoint endpoint{gateway};
-  ASSERT_EQ(endpoint.Open("127.0.0.1", 15810, "127.0.0.1", 15811),
-            protocol::UdpStatus::kOk);
-  protocol::RuntimeUdpPeer companion;
-  ASSERT_EQ(companion.Open("127.0.0.1", 15811, "127.0.0.1", 15810),
-            protocol::UdpStatus::kOk);
-  const auto ack = PushConfigAndAwaitAck(endpoint, companion, restored, true);
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+  const auto ack = PushConfig(endpoint, gateway, companion, restored, true);
   if (!ack.has_value()) {
     FAIL() << "Expected configuration acknowledgement";
   }
@@ -2037,12 +2160,9 @@ TEST(Endpoint, PendingDegradedConfigureDoesNotBlockTicksAndRecoversDevice) {
   backend.unavailable = {config.motors[0].id};
   Gateway gateway{backend, 3011};
   Endpoint endpoint{gateway};
-  ASSERT_EQ(endpoint.Open("127.0.0.1", 15812, "127.0.0.1", 15813),
-            protocol::UdpStatus::kOk);
-  protocol::RuntimeUdpPeer companion;
-  ASSERT_EQ(companion.Open("127.0.0.1", 15813, "127.0.0.1", 15812),
-            protocol::UdpStatus::kOk);
-  EXPECT_FALSE(PushConfigAndAwaitAck(endpoint, companion, config).has_value());
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+  EXPECT_FALSE(PushConfig(endpoint, gateway, companion, config).has_value());
   EXPECT_TRUE(backend.started);
   EXPECT_EQ(backend.configure_calls, 0);
   EXPECT_TRUE(gateway.configuring());
@@ -2053,21 +2173,13 @@ TEST(Endpoint, PendingDegradedConfigureDoesNotBlockTicksAndRecoversDevice) {
   endpoint.Tick(12000, true);
   EXPECT_TRUE(gateway.configured());
   EXPECT_FALSE(gateway.snapshot().motors[0].valid);
-  ConfigAckPayload ack{};
-  bool received = false;
+  // The first ACK is the completed configure's: none went out while it was
+  // pending.
   protocol::DecodedFrame frame;
-  // Loopback delivery is not immediate (notably under sanitizers): wait for
-  // the ack, skipping the state frames sent before it.
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds{200};
-  while (!received &&
-         protocol::testing::ReceiveFrame(companion, &frame, deadline) ==
-             protocol::UdpStatus::kOk) {
-    if (frame.header.type != protocol::FrameType::kHardwareConfigAck) continue;
-    ASSERT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, ack));
-    received = true;
-  }
-  ASSERT_TRUE(received);
+  ASSERT_TRUE(
+      companion.Receive(protocol::FrameType::kHardwareConfigAck, &frame));
+  ConfigAckPayload ack{};
+  ASSERT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, ack));
   EXPECT_EQ(ack.status, ConfigAckStatus::kOk);
   auto command = Request(gateway);
   for (std::size_t i = 0; i < command.count; ++i)
@@ -2091,30 +2203,46 @@ TEST(Endpoint, AppliesOnlyTheNewestQueuedCommand) {
   ASSERT_TRUE(gateway.Reconfigure(SwerveConfig(true)));
   gateway.Tick(1000, true);
   Endpoint endpoint{gateway};
-  ASSERT_EQ(endpoint.Open("127.0.0.1", 15816, "127.0.0.1", 15817),
-            protocol::UdpStatus::kOk);
-  protocol::RuntimeUdpPeer companion;
-  ASSERT_EQ(companion.Open("127.0.0.1", 15817, "127.0.0.1", 15816),
-            protocol::UdpStatus::kOk);
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
   auto command = Request(gateway);
-  for (int demand = 1; demand <= 5; ++demand) {
-    command.motors[0].demand = demand;
-    std::array<uint8_t, kMaxCommandSize> bytes{};
-    const auto size = Encode(command, bytes);
-    ASSERT_GT(size, 0u);
-    ASSERT_EQ(
-        companion.SendFrame(protocol::FrameType::kHardwareCommand,
-                            protocol::kFlagNone, 1000, bytes.data(), size),
-        protocol::UdpStatus::kOk);
-  }
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  const int applied_before = backend.applied;
-  ASSERT_EQ(endpoint.Tick(2000, true), protocol::UdpStatus::kOk);
-  EXPECT_EQ(backend.applied - applied_before, 1);
-  ASSERT_FALSE(backend.last_requests.empty());
-  EXPECT_DOUBLE_EQ(backend.last_requests[0].demand, 5.0);
-  EXPECT_EQ(gateway.snapshot().last_command_sequence,
-            companion.next_send_sequence() - 1);
+  // Each command's demand is its sequence, so the applied demand names the
+  // command it came from.
+  const auto send_backlog = [&] {
+    for (int i = 0; i < 5; ++i) {
+      command.motors[0].demand =
+          static_cast<double>(companion.next_send_sequence());
+      std::array<uint8_t, kMaxCommandSize> bytes{};
+      const auto size = Encode(command, bytes);
+      ASSERT_GT(size, 0u);
+      ASSERT_EQ(
+          companion.SendFrame(protocol::FrameType::kHardwareCommand,
+                              protocol::kFlagNone, 1000, bytes.data(), size),
+          protocol::UdpStatus::kOk);
+    }
+  };
+  send_backlog();
+  // Tick until one tick drains at least two queued commands: datagrams may
+  // become readable one at a time, and a tick that drains a single command
+  // proves nothing here. Should they all trickle in, queue another backlog.
+  ASSERT_TRUE(Eventually([&] {
+    const auto sequence_before = gateway.snapshot().last_command_sequence;
+    const int applied_before = backend.applied;
+    EXPECT_EQ(endpoint.Tick(2000, true), protocol::UdpStatus::kOk);
+    const auto sequence = gateway.snapshot().last_command_sequence;
+    if (sequence - sequence_before >= 2) {
+      EXPECT_EQ(backend.applied - applied_before, 1)
+          << "commands " << sequence_before + 1 << " to " << sequence
+          << " were drained by one tick";
+      EXPECT_FALSE(backend.last_requests.empty());
+      if (!backend.last_requests.empty())
+        EXPECT_DOUBLE_EQ(backend.last_requests[0].demand,
+                         static_cast<double>(sequence));
+      return true;
+    }
+    if (sequence == companion.next_send_sequence() - 1) send_backlog();
+    return HasFailure();
+  }));
   EXPECT_EQ(gateway.snapshot().counters.rejected_command_count, 0u);
 }
 
