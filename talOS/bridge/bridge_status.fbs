@@ -19,7 +19,10 @@ enum GatewayProgram : ubyte {
 // dropped ones included. timed_out_mask has bit i set when the i-th
 // actuator-owning subsystem, in sorted name order, has timed out; only the
 // first 32 fit. subsystem_count is the number of those subsystems.
-// configured is whether the RoboRIO acknowledged this bridge's configuration.
+// configured is whether the current gateway boot acknowledged this bridge's
+// configuration: a State from a new boot, or naming another configuration,
+// clears it until the next acknowledgement. Display only; actuation is gated
+// on the State's flags (robot_enabled).
 //
 // clock_offset_us maps gateway sample time to node time. Valid only after
 // eight ordered States and a causal two-way probe exchange of this boot.

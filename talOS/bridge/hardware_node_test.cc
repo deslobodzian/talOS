@@ -1067,6 +1067,64 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   EXPECT_TRUE(later.configured());
 }
 
+// REQ-OPS-20: /hw/status.configured is the current gateway boot's
+// acknowledgement of this bridge's configuration. A RoboRIO program restart
+// (a new boot id) sends States carrying config id 0 until the bridge's push is
+// acknowledged (measured on a RoboRIO: 19 States, 94 ms); an
+// acknowledgement from the retired boot must not report the new one
+// configured, and neither may a State naming our config id, which a gateway
+// reports even when applying it failed.
+TEST(HardwareNodeTest, ConfiguredDropsOnGatewayRebootUntilAcknowledged) {
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
+  const uint64_t config_id = NodeConfigId(cfg);
+  ConfigAckPayload ack{};
+  ack.config_id = config_id;
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, 128> ack_bytes{};
+  const auto ack_size = EncodeConfigAck(ack, ack_bytes);
+  const auto acknowledge = [&](uint64_t now_us) {
+    if (gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 0, now_us,
+                          ack_bytes.data(),
+                          ack_size) != protocol::UdpStatus::kOk) {
+      return false;
+    }
+    for (int i = 0; i < 200 && !node.is_configured(); ++i) {
+      node.Tick(now_us);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return node.is_configured();
+  };
+
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 1000), 1000000));
+  ASSERT_TRUE(acknowledge(1000500));
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 11, 1, 2000), 1001000));
+  ASSERT_TRUE(node.Status(1001000).configured());
+
+  // The RoboRIO program restarts: boot 12 has no configuration yet.
+  State unconfigured = TrustState(0, 12, 1, 500);
+  unconfigured.flags = 0;
+  ASSERT_TRUE(InjectState(node, gateway, unconfigured, 1050000));
+  EXPECT_FALSE(node.Status(1050000).configured());
+  unconfigured.sample_time_us = 5500;
+  ASSERT_TRUE(InjectState(node, gateway, unconfigured, 1055000));
+  EXPECT_FALSE(node.Status(1055000).configured());
+  // It applies the push; its State names our config before its ack arrives.
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 12, 1, 10500), 1060000));
+  EXPECT_FALSE(node.Status(1060000).configured());
+
+  ASSERT_TRUE(acknowledge(1060500));
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 12, 1, 11500), 1061000));
+  EXPECT_TRUE(node.Status(1061000).configured());
+}
+
 // REQ-RT-20
 TEST(HardwareNodeTest, TwoWayClockBoundNeedsNoActiveRequests) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);

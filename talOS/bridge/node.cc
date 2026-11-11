@@ -412,6 +412,15 @@ void HardwareNode::Tick(uint64_t now_us) {
         last_ds_sample_time_us_ = 0;
         ReportGatewayBuild(state);
       }
+      // Configured means the current gateway boot acknowledged our config.
+      // A new boot (not the first State this bridge sees, which an earlier
+      // ack may precede) or a State naming another config voids it until the
+      // next kOk ack; a State naming ours does not restore it, since the
+      // gateway reports that id even when applying the config failed.
+      if ((last_boot_id_ != 0 && state.boot_id != last_boot_id_) ||
+          state.config_id != config_id_) {
+        is_configured_ = false;
+      }
       if (state.boot_id != last_boot_id_ || state.config_id != config_id_ ||
           !is_configured_) {
         if (now_us - last_push_time_us_ >= config_push_backoff_us_ ||
