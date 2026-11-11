@@ -116,6 +116,7 @@ cc_library(
         ":events_os",
         "//talOS/ipc",
         "//talOS/rtms",
+        "//talOS/rtms:wake",
         "@flatbuffers",
     ],
 )

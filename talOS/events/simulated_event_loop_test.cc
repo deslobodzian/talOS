@@ -236,13 +236,15 @@ TEST(SimulatedEventLoop, PausedClockCoalescesMissedTimersOnOriginalPhase) {
   EXPECT_EQ(ticks.back().sequence, 1u);
 }
 
-// Under either delivery a message injected before a timer's deadline reaches
-// the handler that timer runs, even when a POLL tick is due at the same
-// instant (the tick loses the tie to the timer). BEFORE_TIMERS
-// drains only there; POLL also drains on every 1 ms tick.
+// Under every delivery a message injected before a timer's deadline reaches
+// the handler that timer runs, even when a poll tick is due at the same
+// instant (the tick loses the tie to the timer). BEFORE_TIMERS drains only
+// there; POLL also drains on every 1 ms tick, and so does ON_PUBLISH, which
+// the simulation models as POLL: the realtime loop's upper bound.
 TEST(SimulatedEventLoop, EveryDeliveryDrainsRightBeforeEachTimer) {
-  for (const auto delivery : {Delivery::BEFORE_TIMERS, Delivery::POLL}) {
-    SCOPED_TRACE(delivery == Delivery::POLL ? "POLL" : "BEFORE_TIMERS");
+  for (const auto delivery :
+       {Delivery::BEFORE_TIMERS, Delivery::POLL, Delivery::ON_PUBLISH}) {
+    SCOPED_TRACE(static_cast<int>(delivery));
     SimulationEnvironment environment;
     SimulatedEventLoop<> loop{environment};
     loop.set_delivery(delivery);
@@ -256,7 +258,8 @@ TEST(SimulatedEventLoop, EveryDeliveryDrainsRightBeforeEachTimer) {
                 EventsTest::SetpointMessage{2, 7.0F});
     loop.run_for(15ms);
     ASSERT_EQ(robot.control_count(), 3u);
-    EXPECT_EQ(loop.drains(), delivery == Delivery::POLL ? 25u + 3u : 3u);
+    EXPECT_EQ(loop.drains(),
+              delivery == Delivery::BEFORE_TIMERS ? 3u : 25u + 3u);
     EXPECT_FLOAT_EQ(robot.efforts()[0], 5.0F);
     EXPECT_FLOAT_EQ(robot.efforts()[1], 7.0F);
   }

@@ -29,9 +29,10 @@ the oldest is dropped and counted in `observation_rejected_count`). The next
 `update()` fuses the whole queue in capture-time order. A latest-value read
 would lose all but each camera's newest frame per 20 ms tick (cameras publish
 every frame, up to 60 fps) and let an invalid frame hide a valid one. The
-callbacks make the node's loop also drain every 1 ms, not only before
-`update()` (see [the tick](../../../ARCHITECTURE.md#the-tick)); each drain is
-native, and Python runs only per arriving frame.
+callbacks make each camera publication wake the node's loop to drain, not
+only the drain before `update()` (see
+[targets](../../../ARCHITECTURE.md#targets)); each drain is native, and Python
+runs only per arriving frame.
 
 ## Backends
 

@@ -130,7 +130,10 @@ class SimulatedEventLoop
   struct Options {
     Duration tick_period{std::chrono::milliseconds{1}};
     std::size_t max_messages_per_tick{64};
-    // As on the realtime loop, so a simulation delivers when the robot would.
+    // As on the realtime loop, so a simulation delivers when the robot would,
+    // except that Delivery::ON_PUBLISH drains on the poll tick, as POLL
+    // does: an upper bound on when the realtime loop, woken by the
+    // publication itself, delivers.
     Delivery delivery{Delivery::POLL};
     // The clock's origin: where it starts and what the manifest's timer
     // offsets count from. Input replay (input_replay.h) starts at the
@@ -228,7 +231,7 @@ class SimulatedEventLoop
     if (!started_) {
       scheduler_.reserve(this->manifest().size() + 1);
       this->begin_run();
-      if (options_.delivery == Delivery::POLL) {
+      if (options_.delivery != Delivery::BEFORE_TIMERS) {
         scheduler_.schedule(INTERNAL_POLL_TIMER_ID,
                             options_.start + options_.tick_period,
                             options_.tick_period);

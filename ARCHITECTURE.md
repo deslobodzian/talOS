@@ -195,9 +195,13 @@ job.
 
 Messages reach a node when its loop drains its topics. Every node drains right
 before each of its own timers (`update()`, `every()`), so a timer sees what was
-published by its deadline whether or not the node has callbacks. A node
-without message callbacks otherwise sleeps; a node with a `subscribe` callback
-or a Driver Station listener, or with no timer, also drains every 1 ms.
+published by its deadline whether or not the node has callbacks, and otherwise
+sleeps. A `subscribe` callback, or a Driver Station listener, makes that topic
+wake the node: its publisher notifies the sleeping loop, which drains every
+subscription at once. In a node with no timer every subscription wakes it.
+While it waits on such a topic the loop also drains at least once a second, in
+case a publisher died before notifying. `testing::Sim` models a wake as a 1 ms
+drain.
 Off-simulation the loop thread runs realtime, best effort, in one of three
 tiers the process picks itself: the bridge above control nodes (a node whose
 own subsystem owns a motor, digital or PWM output, or that writes a target

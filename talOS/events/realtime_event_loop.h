@@ -1,9 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "talOS/events/event_loop_base.h"
@@ -13,20 +15,24 @@
 #include "talOS/events/scheduler.h"
 #include "talOS/events/time.h"
 #include "talOS/rtms/rtms.h"
+#include "talOS/rtms/wake.h"
 
 namespace talos::event {
 
 // The loop that runs on the robot.
 //
-// Timers come from the OS clock through the poller; messages are drained
-// rather than woken by the transport, because RTMS carries no notification
-// channel and adding one would change the shared-memory layout. A drain runs
-// right before each timer dispatch, so a timer handler sees what was published
-// by its deadline whatever the delivery. Delivery::POLL also drains on a fixed
-// tick, which bounds message latency; under Delivery::BEFORE_TIMERS nothing
-// else drains, so a periodic program wakes once per period instead of once per
-// tick. Either way every drained message is timestamped with the drain that
-// observed it, which is exactly what replay needs to reproduce.
+// Timers come from the OS clock through the poller. A drain runs right before
+// each timer dispatch, so a timer handler sees what was published by its
+// deadline whatever the delivery. Delivery::POLL also drains on a fixed tick;
+// under Delivery::BEFORE_TIMERS nothing else drains, so a periodic program
+// wakes once per period instead of once per tick. Under Delivery::ON_PUBLISH
+// the loop owns a WakeReceiver that each prompt watcher's reader slot names
+// (RTMSQueue::set_reader_wake): before blocking it arms every prompt watcher
+// (RTMSQueue::arm_wake), and a publication on any of them makes the
+// receiver's fd readable and the poller return, so an idle loop sleeps until
+// its next timer or the next prompt publication. Every drained message is
+// timestamped with the drain that observed it, which is exactly what replay
+// needs to reproduce, whatever woke the loop.
 template <RecorderPolicy Recorder = NullRecorder>
 class RealtimeEventLoop
     : public EventLoopBase<RealtimeEventLoop<Recorder>, Recorder> {
@@ -48,6 +54,13 @@ class RealtimeEventLoop
     std::size_t slots{MAX_SLOTS};
 
     Delivery delivery{Delivery::POLL};
+
+    // Under Delivery::ON_PUBLISH, the longest the loop blocks without
+    // draining while it has prompt watchers. A liveness backstop, not a
+    // delivery mechanism: a publisher that dies between publishing and
+    // notifying leaves its message unannounced, and this bounds how long it
+    // waits. A loop whose next timer is nearer never pays for it.
+    Duration wake_backstop{std::chrono::seconds{1}};
   };
 
   // How often the loop has done each thing so far, for measuring what a
@@ -55,6 +68,11 @@ class RealtimeEventLoop
   struct Activity {
     std::uint64_t wakeups{0};  // returns from the poller's wait
     std::uint64_t drains{0};   // passes over the watched topics
+    // Under Delivery::ON_PUBLISH, prompt watchers whose failed arms stopped
+    // holding the loop awake: kMaxStalledArms drains in a row, each run
+    // because the watcher's arm reported something to read, delivered
+    // nothing from it. Should stay 0; see wait_for_publication.
+    std::uint64_t stalled_arms{0};
   };
 
   // The origin is fixed here rather than in run(), so that a program can build
@@ -109,9 +127,15 @@ class RealtimeEventLoop
     if (options_.tick_period <= Duration::zero()) {
       throw std::invalid_argument("tick period must be positive");
     }
+    if (options_.wake_backstop <= Duration::zero()) {
+      throw std::invalid_argument("wake backstop must be positive");
+    }
     scheduler_.reserve(this->manifest().size() + 1);
     typename Base::RunScope in_run{*this};
     this->begin_run();
+    if (options_.delivery == Delivery::ON_PUBLISH) {
+      start_wakeups();
+    }
 
     MonotonicTime now = Poller::now();
     // The schedule set up before the run counts from here rather than from
@@ -157,8 +181,15 @@ class RealtimeEventLoop
 
       const MonotonicTime deadline = std::min(scheduler_.next_deadline(), end);
 
-      poller_.wait_until(deadline);
-      ++activity_.wakeups;
+      if (!wake_) {
+        poller_.wait_until(deadline);
+        ++activity_.wakeups;
+        continue;
+      }
+
+      if (const auto drain = wait_for_publication(deadline)) {
+        drain_messages(*drain, Poller::now());
+      }
     }
 
     this->end_run(Poller::now());
@@ -173,7 +204,11 @@ class RealtimeEventLoop
         : queue{std::move(other.queue)},
           reader_id{std::exchange(other.reader_id, std::nullopt)},
           next_sequence{other.next_sequence},
-          lost{other.lost} {}
+          lost{other.lost},
+          prompt{other.prompt},
+          progress{other.progress},
+          stall_progress{other.stall_progress},
+          stalls{other.stalls} {}
     Transport& operator=(Transport&& other) noexcept {
       if (this != &other) {
         release();
@@ -181,6 +216,10 @@ class RealtimeEventLoop
         reader_id = std::exchange(other.reader_id, std::nullopt);
         next_sequence = other.next_sequence;
         lost = other.lost;
+        prompt = other.prompt;
+        progress = other.progress;
+        stall_progress = other.stall_progress;
+        stalls = other.stalls;
       }
       return *this;
     }
@@ -195,7 +234,95 @@ class RealtimeEventLoop
     // while it had no reader slot, owed to its next delivery's dropped count.
     std::uint64_t next_sequence{0};
     std::uint64_t lost{0};
+    // Its reader slot names the loop's WakeReceiver (ON_PUBLISH only).
+    bool prompt{false};
+    // Drains that delivered from it or found its slot freed, and, for the
+    // stall guard in wait_for_publication: the progress at its last failed
+    // arm, and how many failed arms in a row have drained since it moved.
+    std::uint64_t progress{0};
+    std::uint64_t stall_progress{0};
+    std::uint32_t stalls{0};
   };
+
+  // Failed arms of one prompt watcher that may each drain in place of a
+  // wait while nothing is delivered from it (see wait_for_publication).
+  static constexpr std::uint32_t kMaxStalledArms = 3;
+
+  // Delivery::ON_PUBLISH, at the start of the run: one receiver for the
+  // loop, named by every prompt watcher's reader slot. Without a prompt
+  // watcher nothing could wake the loop, so it runs as BEFORE_TIMERS and
+  // holds no receiver.
+  void start_wakeups() {
+    for (const std::uint16_t id : watchers_) {
+      transports_[id].prompt = this->source(id).prompt;
+      if (transports_[id].prompt) prompt_watchers_.push_back(id);
+    }
+    if (prompt_watchers_.empty()) return;
+    wake_.emplace();
+    poller_.add_fd(wake_->fd());
+    for (const std::uint16_t id : prompt_watchers_) {
+      Transport& transport = transports_[id];
+      if (transport.queue && transport.reader_id) {
+        transport.queue->set_reader_wake(*transport.reader_id, wake_->id());
+      }
+    }
+  }
+
+  // Delivery::ON_PUBLISH's wait. Arms every prompt watcher and blocks until
+  // `deadline`, a prompt publication or the backstop, only once every arm
+  // reported its watcher caught up: a publication after a successful arm
+  // makes the receiver readable, and one before it fails the arm. Returns
+  // the time to stamp a drain with (when the loop saw the publication, or
+  // the backstop's deadline, as a poll tick's), or nullopt when the poller
+  // returned for a timer, the end or exit(), which the timer pass handles.
+  //
+  // Stall guard: a failed arm drains instead of waiting, but if
+  // kMaxStalledArms such drains in a row deliver nothing from that watcher
+  // (no message dispatched, no freed slot found), its failed arm stops
+  // keeping the loop awake, counted once in Activity::stalled_arms, until a
+  // drain delivers from it again. The loop then waits as if it were armed:
+  // a failed arm still requested a notification, and the backstop bounds
+  // the wait. Without it, a transport that kept reporting unread data the
+  // read never returns (a read the writer keeps tearing) would spin.
+  std::optional<MonotonicTime> wait_for_publication(MonotonicTime deadline) {
+    for (const std::uint16_t id : prompt_watchers_) {
+      Transport& transport = transports_[id];
+      // A watcher without a slot cannot be armed; each drain retries its
+      // rejoin, and the backstop bounds the wait for the next one.
+      if (!transport.queue || !transport.reader_id) continue;
+      if (transport.queue->arm_wake(*transport.reader_id)) {
+        transport.stalls = 0;
+        continue;
+      }
+      if (transport.progress != transport.stall_progress) {
+        transport.stall_progress = transport.progress;
+        transport.stalls = 0;
+      }
+      if (transport.stalls < kMaxStalledArms) {
+        ++transport.stalls;
+        return Poller::now();
+      }
+      if (transport.stalls == kMaxStalledArms) {
+        ++transport.stalls;
+        ++activity_.stalled_arms;
+      }
+    }
+    const MonotonicTime now = Poller::now();
+    const MonotonicTime backstop =
+        options_.wake_backstop < MonotonicTime::max() - now
+            ? now + options_.wake_backstop
+            : MonotonicTime::max();
+    const auto reason = poller_.wait_until(std::min(deadline, backstop));
+    ++activity_.wakeups;
+    if (reason == Poller::WakeReason::READABLE) {
+      wake_->drain();
+      return Poller::now();
+    }
+    if (reason == Poller::WakeReason::DEADLINE && backstop < deadline) {
+      return backstop;
+    }
+    return std::nullopt;
+  }
 
   void on_register(const Registration& registration) {
     transports_.resize(registration.id + 1);
@@ -295,6 +422,7 @@ class RealtimeEventLoop
             this->count_dropped(id, 1);
           }
           if (result == ReadResult::INACTIVE) {
+            ++transport.progress;
             transport.reader_id.reset();
             rejoin(queue, transport);
           }
@@ -302,6 +430,7 @@ class RealtimeEventLoop
         }
 
         transport.next_sequence = info.sequence + 1;
+        ++transport.progress;
         now = Poller::now();
         this->dispatch_message(
             static_cast<std::uint16_t>(id), tick_deadline, now, info.sequence,
@@ -318,11 +447,15 @@ class RealtimeEventLoop
 
   // Claims a reader slot again for a watcher whose slot was freed under it.
   // The new slot starts at the writer, so what was published since the last
-  // delivery is owed to the next one's dropped count.
-  static void rejoin(RTMSQueue& queue, Transport& transport) {
+  // delivery is owed to the next one's dropped count. A prompt watcher's new
+  // slot names the receiver again, and the next arm covers it.
+  void rejoin(RTMSQueue& queue, Transport& transport) {
     transport.reader_id = queue.register_reader();
     if (!transport.reader_id) {
       return;
+    }
+    if (transport.prompt && wake_) {
+      queue.set_reader_wake(*transport.reader_id, wake_->id());
     }
     const std::uint64_t start = queue.reader_sequence(*transport.reader_id);
     if (start > transport.next_sequence) {
@@ -334,8 +467,14 @@ class RealtimeEventLoop
   Options options_;
   Poller poller_;
   Scheduler scheduler_;
+  // Delivery::ON_PUBLISH with a prompt watcher: the receiver their
+  // publications wake. Declared before the transports so that their reader
+  // slots, which name it, are released first.
+  std::optional<WakeReceiver> wake_;
   std::vector<Transport> transports_;
   std::vector<std::uint16_t> watchers_;
+  // The prompt watchers, in registration order (ON_PUBLISH only).
+  std::vector<std::uint16_t> prompt_watchers_;
   Activity activity_;
 };
 

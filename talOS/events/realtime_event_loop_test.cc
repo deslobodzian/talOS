@@ -5,14 +5,19 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
+#include <iterator>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "events_test/events_test_message_generated.h"
+#include "talOS/events/log/format.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/replay_event_loop.h"
@@ -41,11 +46,53 @@ std::string temp_path(std::string_view name) {
 using RecordingLoop = RealtimeEventLoop<log::LogWriter>;
 
 std::uint16_t register_sensor_watcher(RealtimeEventLoop<>& loop,
-                                      const std::string& topic) {
+                                      const std::string& topic,
+                                      Thunk callback = Thunk{}) {
   return loop.register_watcher(topic, sizeof(EventsTest::SensorMessage),
                                alignof(EventsTest::SensorMessage),
                                talos::schema::Of<EventsTest::SensorMessage>(),
-                               Thunk{});
+                               callback);
+}
+
+// A loop that sleeps until a publication on a prompt watcher wakes it. The
+// backstop is far beyond every test's bound, so a delivery that waited for
+// it fails the test instead of passing late.
+RealtimeEventLoop<>::Options on_publish() {
+  RealtimeEventLoop<>::Options options;
+  options.delivery = Delivery::ON_PUBLISH;
+  options.wake_backstop = 30s;
+  return options;
+}
+
+// The writer end of a sensor topic, for tests that publish from outside the
+// loop.
+class SensorWriter {
+ public:
+  explicit SensorWriter(const std::string& topic)
+      : queue_{topic, sizeof(EventsTest::SensorMessage),
+               alignof(EventsTest::SensorMessage),
+               talos::schema::Of<EventsTest::SensorMessage>()} {}
+  bool publish(int value) {
+    const EventsTest::SensorMessage message{value, 0.0F, 0.0F};
+    return queue_.write(std::span<const std::byte>{
+               reinterpret_cast<const std::byte*>(&message),
+               sizeof(message)}) == WriteResult::SUCCESS;
+  }
+
+ private:
+  RTMSQueue queue_;
+};
+
+// Spins (yielding) until `ready`, for at most five seconds; false on giving
+// up, so a loop that never gets there fails its test instead of hanging it.
+template <typename Ready>
+bool await(Ready ready) {
+  const auto give_up = std::chrono::steady_clock::now() + 5s;
+  while (!ready()) {
+    if (std::chrono::steady_clock::now() > give_up) return false;
+    std::this_thread::yield();
+  }
+  return true;
 }
 
 TEST(RealtimeEventLoop, PeriodicTimerRunsAtRate) {
@@ -179,32 +226,39 @@ TEST(RealtimeEventLoop, LatestBacklogDispatchesNewestWithPublicationAge) {
   EXPECT_EQ(loop.source_counters()[watcher].dropped.load(), 129u);
 }
 
+// Under POLL the loop sleeps between poll ticks; under ON_PUBLISH it sleeps
+// with its prompt watcher armed, on a topic nobody publishes.
 TEST(RealtimeEventLoop, ExitFromAnotherThreadReturnsPromptly) {
-  RealtimeEventLoop<> loop;
+  for (const auto delivery : {Delivery::POLL, Delivery::ON_PUBLISH}) {
+    SCOPED_TRACE(static_cast<int>(delivery));
+    RealtimeEventLoop<> loop{on_publish()};
+    loop.set_delivery(delivery);
+    loop.set_prompt(register_sensor_watcher(
+        loop, "/texit_" + std::to_string(::getpid()) + "_" +
+                  std::to_string(static_cast<int>(delivery))));
 
-  // Nothing but the internal poll timer is armed, so the loop is asleep in the
-  // poller almost all of the time.
-  std::atomic<bool> started{false};
-  auto handler = [&started](const Context&) { started.store(true); };
+    std::atomic<bool> started{false};
+    auto handler = [&started](const Context&) { started.store(true); };
 
-  const std::uint16_t id = loop.register_timer("tick", make_thunk(&handler));
-  Timer<RealtimeEventLoop<>> timer{&loop, id};
-  timer.setup_periodic(Poller::now() + 1ms, 50ms);
+    const std::uint16_t id = loop.register_timer("tick", make_thunk(&handler));
+    Timer<RealtimeEventLoop<>> timer{&loop, id};
+    timer.setup_periodic(Poller::now() + 1ms, 50ms);
 
-  std::thread stopper{[&loop, &started] {
-    while (!started.load()) {
-      std::this_thread::yield();
-    }
-    loop.exit();
-  }};
+    std::thread stopper{[&loop, &started] {
+      while (!started.load()) {
+        std::this_thread::yield();
+      }
+      loop.exit();
+    }};
 
-  const MonotonicTime start = Poller::now();
-  loop.run_for(10s);
-  const Duration elapsed = Poller::now() - start;
+    const MonotonicTime start = Poller::now();
+    loop.run_for(10s);
+    const Duration elapsed = Poller::now() - start;
 
-  stopper.join();
+    stopper.join();
 
-  EXPECT_LT(elapsed, Duration{std::chrono::seconds{5}});
+    EXPECT_LT(elapsed, Duration{std::chrono::seconds{5}});
+  }
 }
 
 TEST(RealtimeEventLoop, RejectsTimerChangesFromAnotherThread) {
@@ -307,12 +361,22 @@ TEST(RealtimeEventLoop, AWatcherWhoseSlotIsFreedClaimsOneAgain) {
   EXPECT_EQ(loop.source_counters()[watcher].dropped.load(), 3u);
 }
 
+std::vector<char> read_file(const std::string& path) {
+  std::ifstream file{path, std::ios::binary};
+  return std::vector<char>{std::istreambuf_iterator<char>{file},
+                           std::istreambuf_iterator<char>{}};
+}
+
 // The point of the whole design: the realtime run is full of jitter, dropped
 // messages and scheduling noise, and replaying its log still reproduces every
-// output exactly, whichever way the run delivered its messages.
+// output exactly, whichever way the run delivered its messages. Recording the
+// replay gives the same log again, byte for byte: a drain is recorded only as
+// the messages it dispatched, whether a poll tick, a timer or a publication
+// woke the loop, so replay needs nothing more.
 void ExpectRealtimeRunReplays(Delivery delivery) {
   const Topics topics = realtime_topics();
   const std::string path = temp_path("run");
+  const std::string replayed_path = temp_path("rerun");
 
   std::vector<float> recorded;
   std::uint64_t sensor_count = 0;
@@ -322,6 +386,11 @@ void ExpectRealtimeRunReplays(Delivery delivery) {
     RecordingLoop loop{log::LogWriter{path, "realtime_robot"}};
     loop.set_delivery(delivery);
     TestRobot<RecordingLoop> robot{loop, topics, 3.0F};
+    // Both watchers, so that under ON_PUBLISH each publication wakes the
+    // loop; the other policies ignore it.
+    for (const Registration& source : loop.manifest()) {
+      if (source.kind == SourceKind::WATCHER) loop.set_prompt(source.id);
+    }
 
     // Derived from the loop's clock, not the OS clock, which is what lets the
     // replay below set up identically without being handed this number.
@@ -367,30 +436,50 @@ void ExpectRealtimeRunReplays(Delivery delivery) {
   ASSERT_FALSE(recorded.empty());
   EXPECT_GT(sensor_count, 0u);
 
-  log::LogReader reader{path};
-  ReplayEventLoop<> replay{reader};
-  TestRobot<ReplayEventLoop<>> replayed_robot{replay, topics, 3.0F};
+  {
+    log::LogReader reader{path};
+    using Replay = ReplayEventLoop<log::LogWriter>;
+    Replay replay{reader, log::LogWriter{replayed_path, "realtime_robot"}};
+    TestRobot<Replay> replayed_robot{replay, topics, 3.0F};
 
-  // The identical setup line, with no knowledge of the recording run: the
-  // replay loop's clock already reads the recorded origin.
-  replayed_robot.control_timer().setup_periodic(replay.monotonic_now() + 1ms,
-                                                2ms);
+    // The identical setup line, with no knowledge of the recording run: the
+    // replay loop's clock already reads the recorded origin.
+    replayed_robot.control_timer().setup_periodic(replay.monotonic_now() + 1ms,
+                                                  2ms);
 
-  replay.run();
+    replay.run();
 
-  EXPECT_FALSE(replay.diverged());
-  EXPECT_TRUE(replay.reached_exit());
-  EXPECT_EQ(replayed_robot.efforts(), recorded);
-  EXPECT_EQ(replayed_robot.sensor_count(), sensor_count);
+    EXPECT_FALSE(replay.diverged());
+    EXPECT_TRUE(replay.reached_exit());
+    EXPECT_EQ(replayed_robot.efforts(), recorded);
+    EXPECT_EQ(replayed_robot.sensor_count(), sensor_count);
 
-  // Drop counts are an input the handlers can act on, so they replay too.
-  EXPECT_EQ(replayed_robot.dropped_sensors(), dropped);
+    // Drop counts are an input the handlers can act on, so they replay too.
+    EXPECT_EQ(replayed_robot.dropped_sensors(), dropped);
+    ASSERT_FALSE(replay.recorder().failed()) << replay.recorder().error();
+  }
+
+  std::vector<char> original = read_file(path);
+  std::vector<char> replayed = read_file(replayed_path);
+  ASSERT_FALSE(original.empty());
+  ASSERT_EQ(original.size(), replayed.size());
+  // Wall time is informational, and the replay ran later.
+  const std::size_t wall = offsetof(log::FileHeader, start_wall_ns);
+  for (std::size_t i = 0; i < sizeof(log::FileHeader::start_wall_ns); ++i) {
+    original[wall + i] = 0;
+    replayed[wall + i] = 0;
+  }
+  EXPECT_EQ(original, replayed);
 
   std::remove(path.c_str());
+  std::remove(replayed_path.c_str());
 }
 
-TEST(RealtimeEventLoop, RealtimeRunReplaysForBothDeliveryPolicies) {
-  for (const auto delivery : {Delivery::POLL, Delivery::BEFORE_TIMERS}) {
+// REQ-RT-02
+TEST(RealtimeEventLoop, RealtimeRunReplaysForEveryDeliveryPolicy) {
+  for (const auto delivery :
+       {Delivery::POLL, Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
+    SCOPED_TRACE(static_cast<int>(delivery));
     ExpectRealtimeRunReplays(delivery);
   }
 }
@@ -400,11 +489,12 @@ struct Wakeups {
   RealtimeEventLoop<>::Activity activity{};
 };
 
-// A 100 Hz program with one watched topic, run for 200 ms.
+// A 100 Hz program with one watched topic, prompt, that nobody publishes on,
+// run for 200 ms.
 Wakeups RunPeriodicProgram(Delivery delivery, const std::string& topic) {
   RealtimeEventLoop<> loop;
   loop.set_delivery(delivery);
-  register_sensor_watcher(loop, topic);
+  loop.set_prompt(register_sensor_watcher(loop, topic));
   Wakeups result;
   auto handler = [&result](const Context&) { ++result.fired; };
   const std::uint16_t id = loop.register_timer("tick", make_thunk(&handler));
@@ -415,31 +505,186 @@ Wakeups RunPeriodicProgram(Delivery delivery, const std::string& topic) {
   return result;
 }
 
-// What the delivery policy is for: a periodic program that only reads its
-// topics at its own tick sleeps between ticks instead of waking every
-// millisecond to drain.
-TEST(RealtimeEventLoop, BeforeTimersWakesOnlyForTimers) {
+// What the delivery policy is for: a periodic program sleeps
+// between its ticks instead of waking every millisecond to drain, both when
+// it only reads its topics at its tick and when it sleeps armed for a
+// publication that does not come; its timer still fires on time.
+// REQ-RT-02
+TEST(RealtimeEventLoop, OnlyPollWakesBetweenTimersForAQuietTopic) {
   const std::string pid = std::to_string(::getpid());
   const Wakeups poll = RunPeriodicProgram(Delivery::POLL, "/twp_" + pid);
-  const Wakeups before =
-      RunPeriodicProgram(Delivery::BEFORE_TIMERS, "/twb_" + pid);
-  std::printf(
-      "100 Hz program over 200 ms: POLL %llu wakeups, %llu drains; "
-      "BEFORE_TIMERS %llu wakeups, %llu drains, %llu timer firings\n",
-      static_cast<unsigned long long>(poll.activity.wakeups),
-      static_cast<unsigned long long>(poll.activity.drains),
-      static_cast<unsigned long long>(before.activity.wakeups),
-      static_cast<unsigned long long>(before.activity.drains),
-      static_cast<unsigned long long>(before.fired));
+  for (const auto delivery : {Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
+    const Wakeups quiet = RunPeriodicProgram(
+        delivery,
+        "/tw" + std::to_string(static_cast<int>(delivery)) + "_" + pid);
+    std::printf(
+        "100 Hz program over 200 ms: POLL %llu wakeups, %llu drains; "
+        "delivery %d %llu wakeups, %llu drains, %llu timer firings\n",
+        static_cast<unsigned long long>(poll.activity.wakeups),
+        static_cast<unsigned long long>(poll.activity.drains),
+        static_cast<int>(delivery),
+        static_cast<unsigned long long>(quiet.activity.wakeups),
+        static_cast<unsigned long long>(quiet.activity.drains),
+        static_cast<unsigned long long>(quiet.fired));
 
-  // Loaded CI steals time, so these bound shapes rather than exact counts.
+    // Loaded CI steals time, so these bound shapes rather than exact counts.
+    EXPECT_GT(quiet.fired, 5u);
+    EXPECT_EQ(quiet.activity.drains, quiet.fired);  // one per timer dispatch
+    EXPECT_LE(quiet.activity.wakeups, 2 * quiet.fired + 2);
+    EXPECT_LT(quiet.activity.wakeups, 50u);
+  }
   EXPECT_GT(poll.activity.drains, 50u);
   EXPECT_GT(poll.activity.wakeups, 50u);
+}
 
-  EXPECT_GT(before.fired, 0u);
-  EXPECT_EQ(before.activity.drains, before.fired);  // one per timer dispatch
-  EXPECT_LE(before.activity.wakeups, 2 * before.fired + 2);
-  EXPECT_LT(before.activity.wakeups, 50u);
+// With nothing but a prompt watcher and nobody publishing, the
+// loop sleeps for the whole run: a 1 ms poll would wake about 200 times.
+// REQ-RT-02
+TEST(RealtimeEventLoop, OnPublishSleepsWhileNothingIsPublished) {
+  RealtimeEventLoop<> loop{on_publish()};
+  loop.set_prompt(
+      register_sensor_watcher(loop, "/tidle_" + std::to_string(::getpid())));
+  loop.run_for(200ms);
+  EXPECT_LE(loop.activity().wakeups, 2u);
+  EXPECT_LE(loop.activity().drains, 1u);
+}
+
+// A loop with no timer is woken by each publication on its prompt
+// watcher, and delivers every message in order without a drop: one at a time
+// while it sleeps, then a burst past the per-drain cap. The 30 s backstop and
+// 5 s bound mean no delivery may wait for anything but the publication.
+// REQ-RT-02
+TEST(RealtimeEventLoop, OnPublishDeliversEveryPublicationInOrder) {
+  constexpr int kOneByOne = 20;
+  constexpr int kBurst = 200;  // over max_messages_per_tick, under the ring
+  const std::string topic = "/tord_" + std::to_string(::getpid());
+  RealtimeEventLoop<> loop{on_publish()};
+  std::vector<Context> delivered;
+  std::atomic<int> count{0};
+  auto on_message = [&](const Context& context) {
+    delivered.push_back(context);
+    if (count.fetch_add(1) + 1 == kOneByOne + kBurst) loop.exit();
+  };
+  loop.set_prompt(
+      register_sensor_watcher(loop, topic, make_thunk(&on_message)));
+  SensorWriter writer{topic};
+
+  std::thread publisher{[&] {
+    for (int i = 0; i < kOneByOne; ++i) {
+      // Each after the previous one arrived, so the loop is asleep for it.
+      if (!await([&] { return count.load() == i; })) return;
+      EXPECT_TRUE(writer.publish(i));
+    }
+    if (!await([&] { return count.load() == kOneByOne; })) return;
+    for (int i = kOneByOne; i < kOneByOne + kBurst; ++i) {
+      EXPECT_TRUE(writer.publish(i));
+    }
+  }};
+  loop.run_for(5s);
+  publisher.join();
+
+  ASSERT_EQ(delivered.size(), static_cast<std::size_t>(kOneByOne + kBurst));
+  for (std::size_t i = 0; i < delivered.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(delivered[i].sequence, i);
+    EXPECT_EQ(delivered[i].dropped, 0u);
+    // A wake drain is stamped with when the loop saw the publication.
+    EXPECT_GE(delivered[i].event_time, delivered[i].publish_time);
+    EXPECT_GE(delivered[i].now, delivered[i].event_time);
+  }
+  // Every failed arm here was a real backlog, which the drain delivered.
+  EXPECT_EQ(loop.activity().stalled_arms, 0u);
+}
+
+// A publication on a watcher that is not prompt does not wake the
+// loop, and still reaches the next timer: it is drained right before it.
+// REQ-RT-01
+TEST(RealtimeEventLoop, OnPublishDrainsAQuietWatcherOnlyBeforeTimers) {
+  const std::string pid = std::to_string(::getpid());
+  const std::string latched = "/tlat_" + pid;
+  RealtimeEventLoop<> loop{on_publish()};
+  loop.set_prompt(register_sensor_watcher(loop, "/tprm_" + pid));
+  std::vector<Context> delivered;
+  auto on_latched = [&](const Context& context) {
+    delivered.push_back(context);
+  };
+  register_sensor_watcher(loop, latched, make_thunk(&on_latched));
+  SensorWriter writer{latched};
+  auto publish = [&](const Context&) { EXPECT_TRUE(writer.publish(1)); };
+  MonotonicTime read_at{};
+  auto read = [&](const Context& context) {
+    read_at = context.event_time;
+    loop.exit();
+  };
+  const auto first = loop.register_timer("publish", make_thunk(&publish));
+  const auto second = loop.register_timer("read", make_thunk(&read));
+  loop.arm_timer(first, loop.monotonic_now() + 10ms, {});
+  loop.arm_timer(second, loop.monotonic_now() + 60ms, {});
+  loop.run_for(5s);  // Bound only; the second timer exits.
+
+  ASSERT_EQ(delivered.size(), 1u);
+  EXPECT_EQ(delivered[0].event_time, read_at);  // the second timer's drain
+  EXPECT_EQ(loop.activity().drains, 2u);        // one per timer, no more
+}
+
+// Another process can free a prompt watcher's reader slot. The slot it
+// claims again must wake the loop too, or every later message would wait
+// for the backstop. The publisher starts once the new slot names the loop's
+// receiver, then goes one message at a time, each while the loop sleeps.
+// REQ-RT-02
+TEST(RealtimeEventLoop, APromptWatcherWhoseSlotIsFreedIsWokenOnItsNewSlot) {
+  constexpr int kAfter = 10;
+  const std::string topic = "/trej_" + std::to_string(::getpid());
+  RealtimeEventLoop<> loop{on_publish()};
+  std::optional<SensorWriter> writer;  // opened once the watcher has the topic
+  RTMSHeader* header = nullptr;
+  std::vector<Context> delivered;
+  std::atomic<int> count{0};
+  std::atomic<bool> freed{false};
+  auto on_message = [&](const Context& context) {
+    delivered.push_back(context);
+    if (delivered.size() == 1) {
+      for (auto& reader : header->readers) reader.state.store(0);
+      EXPECT_TRUE(writer->publish(1));  // while it holds no slot
+      freed.store(true);
+    }
+    if (count.fetch_add(1) + 1 == 1 + kAfter) loop.exit();
+  };
+  loop.set_prompt(
+      register_sensor_watcher(loop, topic, make_thunk(&on_message)));
+  writer.emplace(topic);
+  SharedMemoryPtr mapping{topic, sizeof(RTMSHeader)};
+  header = static_cast<RTMSHeader*>(mapping.ptr());
+  ASSERT_NE(header, nullptr);
+  ASSERT_TRUE(writer->publish(0));
+
+  const auto rearmed = [header] {
+    for (const auto& reader : header->readers) {
+      if ((reader.state.load() & 3) ==
+              static_cast<std::uint64_t>(ReaderState::ACTIVE) &&
+          reader.wake_id.load() != 0) {
+        return true;
+      }
+    }
+    return false;
+  };
+  std::thread publisher{[&] {
+    if (!await([&] { return freed.load() && rearmed(); })) return;
+    for (int i = 0; i < kAfter; ++i) {
+      if (!await([&] { return count.load() == 1 + i; })) return;
+      EXPECT_TRUE(writer->publish(2 + i));
+    }
+  }};
+  loop.run_for(5s);
+  publisher.join();
+
+  ASSERT_EQ(delivered.size(), static_cast<std::size_t>(1 + kAfter));
+  EXPECT_EQ(delivered[1].sequence, 2u);
+  EXPECT_EQ(delivered[1].dropped, 1u);  // published while it had no slot
+  for (std::size_t i = 2; i < delivered.size(); ++i) {
+    EXPECT_EQ(delivered[i].sequence, i + 1);
+    EXPECT_EQ(delivered[i].dropped, 0u);
+  }
 }
 
 // Under POLL a poll tick due at a timer's deadline loses the tie to the timer

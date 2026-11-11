@@ -62,13 +62,11 @@ context for a realtime thread, where a timerfd's expiry waits in `ktimers/N`
 at `SCHED_FIFO` 1 behind any loop on that CPU. A kernel before 5.11
 (`ENOSYS`) or a seccomp filter refusing the call (`EPERM`) falls back to
 epoll plus an absolute-deadline timerfd, with the same deadlines, and the
-poller says so once on stderr (`epoll_pwait2 unavailable`). Messages are
-drained rather than woken by the transport: RTMS carries no notification
-channel and adding one would change its shared-memory layout.
+poller says so once on stderr (`epoll_pwait2 unavailable`).
 Every loop drains immediately before each timer dispatch, so a timer handler
-sees what was published by its deadline under either delivery.
-`Options::delivery` (or `set_delivery()` before the run) picks whether it also
-drains between timers:
+sees what was published by its deadline under every delivery.
+`Options::delivery` (or `set_delivery()` before the run) picks whether, and
+when, it also drains between timers:
 
 - `Delivery::POLL` (the default) also drains on a fixed tick, 1 ms by default,
   so the tick bounds message latency. A tick due at a timer's deadline adds
@@ -76,7 +74,33 @@ drains between timers:
 - `Delivery::BEFORE_TIMERS` arms no poll timer, so a loop with only periodic
   work wakes once per period. `activity()` counts wakeups and drains; at
   100 Hz that is about 20 of each over 200 ms against about 200 wakeups and
-  220 drains under `POLL` (`RealtimeEventLoop.BeforeTimersWakesOnlyForTimers`).
+  220 drains under `POLL`
+  (`RealtimeEventLoop.OnlyPollWakesBetweenTimersForAQuietTopic`).
+- `Delivery::ON_PUBLISH` also drains when a publication on a *prompt* watcher
+  (`set_prompt(id)` before the run) wakes the loop, and at no other time. The
+  loop owns one `WakeReceiver` (`talOS/rtms/wake.h`, the transport's [wake
+  channel](../rtms/README.md#wake-channel)) whose id each prompt watcher's
+  reader slot carries (`RTMSQueue::set_reader_wake`, again on a slot claimed
+  after another process freed the old one). Before it blocks the loop arms
+  every prompt watcher (`RTMSQueue::arm_wake`) and blocks only when all of
+  them are caught up; otherwise it drains and arms again. A publication after
+  a successful arm makes the receiver's fd readable, and the poller returns.
+  A wake drains every watcher, prompt or not, in registration order, as a
+  poll tick does, so a callback that reads a latest-value subscription sees
+  current data. An idle loop sleeps until its next timer: a prompt watcher
+  nobody publishes on costs no wakeups
+  (`RealtimeEventLoop.OnPublishSleepsWhileNothingIsPublished`), and a
+  publication on a watcher that is not prompt waits for the next timer's
+  drain. A notification is only a hint, and a publisher that dies between
+  publishing and notifying sends none, so while it has prompt watchers the
+  loop never blocks longer than `Options::wake_backstop` (1 s) without
+  draining; a loop whose next timer is nearer never reaches it. If three
+  drains in a row, each run because one watcher's arm reported something to
+  read, deliver nothing from it, that watcher's failed arm stops keeping the
+  loop awake until a drain delivers from it again (counted once in
+  `activity().stalled_arms`), so a transport that misreports unread data
+  cannot make the loop spin. With no prompt watcher it runs as
+  `BEFORE_TIMERS` and holds no receiver.
 
 The macOS wait also passes `kevent()` that coalesced relative timeout, as a
 backstop: XNU delivers every `EVFILT_TIMER` through one shared kernel worker
@@ -104,9 +128,17 @@ is free; messages published while it had no slot count in the next delivery's
 in the source's `SourceCounters::dropped`.
 
 The log records dispatch and publication times and the resulting order, so
-replay reproduces both delivery policies and ages. `SimulatedEventLoop` takes
-the same options and stamps messages at simulated send time. The node layer
-chooses delivery timing: see `NodeAccess::require_immediate_delivery` in
+replay reproduces every delivery policy and ages. A drain leaves no record of
+its own, only the messages it dispatched: each carries the drain's time as
+`event_time` (a poll tick's or timer's deadline, the moment a woken loop saw
+the publication, or the backstop's deadline) and its own `now`, so a wake
+drain needs no new record kind and a replay re-records the log byte for byte
+(`RealtimeEventLoop.RealtimeRunReplaysForEveryDeliveryPolicy`).
+`SimulatedEventLoop` takes the same options and stamps messages at simulated
+send time; it has no wake channel, so under `ON_PUBLISH` it drains on its
+1 ms poll tick exactly as under `POLL`, an upper bound on when the realtime
+loop delivers. The node layer chooses delivery timing and which watchers are
+prompt: see `NodeAccess::require_immediate_delivery` in
 `talOS/node/access.h`.
 
 
@@ -281,8 +313,9 @@ again. A latest-only watcher skips all but the newest message by design and
 counts those skips as dropped too, so its `dropped` is not a fault signal.
 Treat missed timer periods and a sequence watcher's drops as faults.
 
-The poll tick controls drain frequency under `Delivery::POLL`, not a hard
-end-to-end latency bound: callback execution and host scheduling can delay it.
+The poll tick controls drain frequency under `Delivery::POLL`, and a wake
+starts a drain under `Delivery::ON_PUBLISH`; neither is a hard end-to-end
+latency bound: callback execution and host scheduling can delay it.
 
 Each source also keeps lock-free `SourceCounters` (events, drops, last
 sequence, last and max latency) that the introspection reporter publishes
