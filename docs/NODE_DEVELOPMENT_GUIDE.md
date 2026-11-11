@@ -84,8 +84,10 @@ sees:
   wakes nothing: the messages wait for the node's next drain, right before
   its next timer or on another topic's wake. Use it when the node needs every
   message (an invalid one between valid ones must not hide them) but acts on
-  them only at its tick or next packet. More than 64 between two drains fall
-  behind. The `driver` takes `/drivetrain/state` headings this way: the
+  them only at its tick or next packet. A backlog over the 64-per-drain cap
+  is drained in further batches at once, as for a waking callback; only more
+  than 1023 unread between two drains are lost (counted as dropped). The
+  `driver` takes `/drivetrain/state` headings this way: the
   drivetrain's 5 ms ticks never wake it, and an invalid state cannot hide the
   valid one before it. The pose estimator queues its camera frames this way
   for `update()` to fuse.

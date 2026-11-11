@@ -14,6 +14,7 @@
 #include <iterator>
 #include <optional>
 #include <random>
+#include <span>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -495,10 +496,8 @@ std::vector<char> read_file(const std::string& path) {
 // output exactly, whichever way the run delivered its messages. Recording the
 // replay gives the same log again, byte for byte: a drain is recorded only as
 // the messages it dispatched, whether a poll tick, a timer or a publication
-// woke the loop, so replay needs nothing more. Without `sensor_prompt` only
-// the setpoint watcher is prompt and the sensor's sequence watcher waits for
-// the next drain, as a node's Wake::kAtDrain callback does.
-void ExpectRealtimeRunReplays(Delivery delivery, bool sensor_prompt = true) {
+// woke the loop, so replay needs nothing more.
+void ExpectRealtimeRunReplays(Delivery delivery) {
   const Topics topics = realtime_topics();
   const std::string path = temp_path("run");
   const std::string replayed_path = temp_path("rerun");
@@ -511,13 +510,10 @@ void ExpectRealtimeRunReplays(Delivery delivery, bool sensor_prompt = true) {
     RecordingLoop loop{log::LogWriter{path, "realtime_robot"}};
     loop.set_delivery(delivery);
     TestRobot<RecordingLoop> robot{loop, topics, 3.0F};
-    // The watchers, so that under ON_PUBLISH their publications wake the
+    // Both watchers, so that under ON_PUBLISH each publication wakes the
     // loop; the other policies ignore it.
     for (const Registration& source : loop.manifest()) {
-      if (source.kind == SourceKind::WATCHER &&
-          (sensor_prompt || source.name != topics.sensor)) {
-        loop.set_prompt(source.id);
-      }
+      if (source.kind == SourceKind::WATCHER) loop.set_prompt(source.id);
     }
 
     // Derived from the loop's clock, not the OS clock, which is what lets the
@@ -610,8 +606,6 @@ TEST(RealtimeEventLoop, RealtimeRunReplaysForEveryDeliveryPolicy) {
     SCOPED_TRACE(static_cast<int>(delivery));
     ExpectRealtimeRunReplays(delivery);
   }
-  SCOPED_TRACE("ON_PUBLISH, the sensor waiting for the next drain");
-  ExpectRealtimeRunReplays(Delivery::ON_PUBLISH, /*sensor_prompt=*/false);
 }
 
 struct Wakeups {
@@ -799,6 +793,52 @@ TEST(RealtimeEventLoop, AWakeStampsOnlyPromptMessagesWithTheirPublication) {
   EXPECT_GE(waited->event_time, woke->publish_time);  // the drain's time
   EXPECT_GE(waited->now, waited->event_time);
   EXPECT_EQ(loop.activity().drains, 1u);
+}
+
+// A drain that stops at the per-drain cap on a sequence watcher that is not
+// prompt (a node's Wake::kAtDrain callback) is followed at once by another,
+// without waiting for a wake or a timer: 100 waiting messages, woken by one
+// on a prompt topic, arrive 64 in that drain and 36 in the next, in order,
+// with no return from the poller in between. Left for the next timer or
+// wake instead, a topic faster than 64 per drain would fall further behind
+// at every drain until the ring overwrote it.
+// REQ-RT-02
+TEST(RealtimeEventLoop, ADrainCappedOnAQuietWatcherDrainsAgainAtOnce) {
+  constexpr int kWaiting = 100;  // over max_messages_per_tick, under the ring
+  const std::string pid = std::to_string(::getpid());
+  const std::string prompt = "/tcp_" + pid;
+  const std::string quiet = "/tcq_" + pid;
+  RealtimeEventLoop<> loop{on_publish()};
+  struct Heard {
+    std::int32_t value;
+    std::uint64_t drains;
+    std::uint64_t wakeups;
+  };
+  std::vector<Heard> heard;
+  auto on_quiet = [&](const Context&, std::span<const std::byte> bytes) {
+    const auto* message =
+        reinterpret_cast<const EventsTest::SensorMessage*>(bytes.data());
+    heard.push_back({message->sensor_id(), loop.activity().drains,
+                     loop.activity().wakeups});
+    if (heard.size() == static_cast<std::size_t>(kWaiting)) loop.exit();
+  };
+  loop.set_prompt(register_sensor_watcher(loop, prompt));
+  register_sensor_watcher(loop, quiet, make_thunk(&on_quiet));
+  SensorWriter quiet_writer{quiet};
+  SensorWriter prompt_writer{prompt};
+  for (int i = 0; i < kWaiting; ++i) ASSERT_TRUE(quiet_writer.publish(i));
+  ASSERT_TRUE(prompt_writer.publish(0));  // its failed arm drains the loop
+
+  loop.run_for(5s);  // Bound only; the quiet handler exits.
+
+  ASSERT_EQ(heard.size(), static_cast<std::size_t>(kWaiting))
+      << "the rest waited for a wake or a timer";
+  for (std::size_t i = 0; i < heard.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(heard[i].value, static_cast<std::int32_t>(i));
+    EXPECT_EQ(heard[i].drains, i < 64 ? 1u : 2u);
+    EXPECT_EQ(heard[i].wakeups, 0u);
+  }
 }
 
 // A message no notification announces (a publisher that died between

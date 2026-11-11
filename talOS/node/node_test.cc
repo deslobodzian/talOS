@@ -1006,8 +1006,9 @@ TEST(Node, OnlyASubscriptionWhoseHandlerMustRunAtOnceWakesTheNode) {
 
 // A Wake::kAtDrain callback hears every message, in order, but only at the
 // node's next drain, here its 5 ms update(): publications between ticks wake
-// nothing. A drain delivers at most 64 of them; the rest wait for the next
-// drain, not for a wake at the same instant.
+// nothing. A drain delivers at most 64 of them, and one that stops there is
+// followed at once by another, so a backlog over the cap is heard whole at
+// that instant, as a waking callback's is, not one batch per tick.
 // REQ-RT-02
 TEST(Node, AnAtDrainCallbackHearsEveryMessageInOrderAtTheNextDrain) {
   using Heard = std::vector<std::pair<std::int64_t, Duration>>;
@@ -1027,14 +1028,14 @@ TEST(Node, AnAtDrainCallbackHearsEveryMessageInOrderAtTheNextDrain) {
   for (std::int64_t i = 0; i < 70; ++i) {
     sim.publish("/feed/state", Count{i, 0});
   }
-  sim.step(5ms);
-  EXPECT_EQ(collector.heard.size(), 64u) << "the 15 ms drain";
-  sim.step(5ms);
-  ASSERT_EQ(collector.heard.size(), 70u) << "the 20 ms drain";
+  sim.step(4ms);
+  EXPECT_EQ(collector.heard, Heard{}) << "published at 10 ms, after its drain";
+  sim.step(1ms);
+  ASSERT_EQ(collector.heard.size(), 70u) << "the rest waited past 15 ms";
   for (std::size_t i = 0; i < collector.heard.size(); ++i) {
     SCOPED_TRACE(i);
     EXPECT_EQ(collector.heard[i].first, static_cast<std::int64_t>(i));
-    EXPECT_EQ(collector.heard[i].second, i < 64 ? 15ms : 20ms);
+    EXPECT_EQ(collector.heard[i].second, 15ms);
   }
 }
 

@@ -227,9 +227,10 @@ Messages become visible when the consumer drains its topics, but `age()` and
 message cannot revive it. Subscriptions without per-message callbacks dispatch
 only the newest available message, counting skipped messages as dropped;
 callback subscriptions retain sequence delivery, capped at 64 messages per
-topic per drain (a waking topic's rest drains again at once; a `kAtDrain`
-callback's rest waits for the next drain). Each realtime timer dispatch samples
-its own clock. Simulation and replay preserve publication-age semantics.
+topic per drain; a drain that stops at the cap is followed at once by another,
+for a waking topic and a `kAtDrain` callback alike, with due timers between.
+Each realtime timer dispatch samples its own clock. Simulation and replay
+preserve publication-age semantics.
 Simulated topics retain RTMS's
 1024-slot overwrite window (1023 guaranteed readable messages), with identical
 latest-value skips and sequence-drop accounting. `testing::Sim::pause(name,

@@ -144,8 +144,18 @@ design and keeps the drain's time
 Subscriptions without a per-message callback skip directly to the newest
 available value once per drain, counting skipped messages as dropped. Callback
 subscriptions retain sequence delivery with `max_messages_per_tick` (64 by
-default) bounding each drain. The node's internal storage callback does not
-turn a plain latest-value subscription into sequence delivery.
+default) bounding each drain. A drain that stops at that cap is followed at
+once by another, never by a wait: a prompt watcher's failed arm drains again
+under `ON_PUBLISH`, and under `BEFORE_TIMERS` and `ON_PUBLISH` a sequence
+watcher that is not prompt makes the loop drain again before it waits
+(`POLL`'s next tick drains it anyway). Each drain stays capped and due timers
+run between them, so a burst costs one drain per 64 messages per watcher, and
+a watcher fed faster than 64 per drain never falls behind by a batch per
+timer (`RealtimeEventLoop.ADrainCappedOnAQuietWatcherDrainsAgainAtOnce`).
+`SimulatedEventLoop` makes the loop due again at that instant
+(`next_deadline()`); such drains count toward `kMaxWokenDrainsPerInstant`.
+The node's internal storage callback does not turn a plain latest-value
+subscription into sequence delivery.
 
 A watcher whose reader slot another process frees (having judged this one dead)
 claims one again when a drain finds it gone, and at each later drain while none
@@ -187,10 +197,7 @@ chooses delivery timing and which watchers are prompt: see
 `NodeAccess::require_immediate_delivery` in `talOS/node/access.h`. A
 `Node::subscribe` callback opened with `talos::Wake::kAtDrain` is a sequence
 watcher that is not prompt: its messages wait for a timer's drain or another
-watcher's wake, and a drain that reaches the 64-message cap leaves the rest
-for the next drain rather than draining again
-(`RealtimeEventLoop.RealtimeRunReplaysForEveryDeliveryPolicy` replays such a
-mix byte for byte).
+watcher's wake, and a backlog over the cap drains again at once, as above.
 
 
 ## Recording and replaying
