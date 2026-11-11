@@ -94,31 +94,125 @@ inline std::string DescribeV4L2Mode(const V4L2Mode& mode) {
   return text + size;
 }
 
-// Injectable control writer keeps device units and failure handling testable.
-template <class WriteControl>
-bool ApplyV4L2Controls(const CameraControls& controls, WriteControl write) {
-  bool applied =
-      write(V4L2_CID_EXPOSURE_AUTO,
-            controls.auto_exposure ? V4L2_EXPOSURE_AUTO : V4L2_EXPOSURE_MANUAL);
+// A device's controls as the source reaches them (VIDIOC_QUERYCTRL,
+// _QUERYMENU, _S_CTRL, _G_CTRL); tests fake it.
+class V4L2ControlDevice {
+ public:
+  struct Range {
+    int32_t minimum{0};
+    int32_t maximum{0};
+  };
+  virtual ~V4L2ControlDevice() = default;
+  // The control's range, or nullopt when the device has no such control (or
+  // it is disabled).
+  virtual std::optional<Range> Query(uint32_t id) = 0;
+  // Whether menu control `id` offers item `value`.
+  virtual bool MenuHas(uint32_t id, int32_t value) = 0;
+  virtual bool Set(uint32_t id, int32_t value) = 0;
+  virtual std::optional<int32_t> Get(uint32_t id) = 0;
+};
+
+// Applies `controls` and reads every written control back. Returns "" when
+// the device holds them all, else why not, naming the control (its V4L2
+// name, as v4l2-ctl prints it). Nothing falls back:
+// - auto exposure sets auto_exposure to auto, else to aperture priority (the
+//   automatic mode UVC cameras offer); a device with neither fails;
+// - manual exposure sets auto_exposure to manual (when the device has the
+//   control) and, for exposure_ms > 0, exposure_time_absolute in 100 us
+//   units, which must lie in the device's range;
+// - exposure_dynamic_framerate, which lets the device lengthen the frame
+//   period for exposure, is turned off whenever the device has it;
+// - auto gain needs gain_automatic; gain > 0 turns gain_automatic off (when
+//   present) and sets gain, which must exist and lie in the device's range.
+// Zero exposure or gain without the automatic flag leaves the device's value.
+inline std::string ApplyV4L2Controls(const CameraControls& controls,
+                                     V4L2ControlDevice& device) {
+  const auto set = [&](uint32_t id, const char* name,
+                       int32_t value) -> std::string {
+    if (!device.Set(id, value)) {
+      return std::string(name) + ": device refused " + std::to_string(value);
+    }
+    const auto held = device.Get(id);
+    if (held != value) {
+      return std::string(name) + ": set " + std::to_string(value) +
+             ", device holds " + (held ? std::to_string(*held) : "nothing");
+    }
+    return {};
+  };
+  const auto in_range = [&](uint32_t id, const char* name, double value,
+                            int32_t& device_value) -> std::string {
+    const auto range = device.Query(id);
+    if (!range) return std::string(name) + ": device has no such control";
+    if (!std::isfinite(value) || std::lround(value) < range->minimum ||
+        std::lround(value) > range->maximum) {
+      return std::string(name) + ": " + std::to_string(value) +
+             " outside the device's range " + std::to_string(range->minimum) +
+             ".." + std::to_string(range->maximum);
+    }
+    device_value = static_cast<int32_t>(std::lround(value));
+    return {};
+  };
+  std::string error;
+  const bool has_mode = device.Query(V4L2_CID_EXPOSURE_AUTO).has_value();
+  if (controls.auto_exposure) {
+    int32_t mode = -1;
+    for (const int32_t candidate :
+         {static_cast<int32_t>(V4L2_EXPOSURE_AUTO),
+          static_cast<int32_t>(V4L2_EXPOSURE_APERTURE_PRIORITY)}) {
+      if (has_mode && device.MenuHas(V4L2_CID_EXPOSURE_AUTO, candidate)) {
+        mode = candidate;
+        break;
+      }
+    }
+    if (mode < 0) return "auto_exposure: device offers no automatic mode";
+    if (!(error = set(V4L2_CID_EXPOSURE_AUTO, "auto_exposure", mode)).empty()) {
+      return error;
+    }
+  } else if (has_mode) {
+    if (!(error = set(V4L2_CID_EXPOSURE_AUTO, "auto_exposure",
+                      V4L2_EXPOSURE_MANUAL))
+             .empty()) {
+      return error;
+    }
+  }
+  if (device.Query(V4L2_CID_EXPOSURE_AUTO_PRIORITY) &&
+      !(error = set(V4L2_CID_EXPOSURE_AUTO_PRIORITY,
+                    "exposure_dynamic_framerate", 0))
+           .empty()) {
+    return error;
+  }
   if (!controls.auto_exposure && controls.exposure_ms > 0) {
-    const bool valid =
-        std::isfinite(controls.exposure_ms) && controls.exposure_ms < 214748364;
-    applied =
-        (valid &&
-         write(V4L2_CID_EXPOSURE_ABSOLUTE,
-               static_cast<int32_t>(std::lround(controls.exposure_ms * 10)))) &&
-        applied;
+    int32_t units = 0;
+    if (!(error = in_range(V4L2_CID_EXPOSURE_ABSOLUTE, "exposure_time_absolute",
+                           controls.exposure_ms * 10, units))
+             .empty() ||
+        !(error =
+              set(V4L2_CID_EXPOSURE_ABSOLUTE, "exposure_time_absolute", units))
+             .empty()) {
+      return error;
+    }
   }
+  const bool has_auto_gain = device.Query(V4L2_CID_AUTOGAIN).has_value();
   if (controls.auto_gain) {
-    applied = write(V4L2_CID_AUTOGAIN, 1) && applied;
-  } else if (controls.gain > 0) {
-    applied = write(V4L2_CID_AUTOGAIN, 0) && applied;
-    applied = (std::isfinite(controls.gain) && controls.gain < 2147483647 &&
-               write(V4L2_CID_GAIN,
-                     static_cast<int32_t>(std::lround(controls.gain)))) &&
-              applied;
+    if (!has_auto_gain) {
+      return "gain_automatic: device has no automatic gain; set camera.gain "
+             "or camera.auto_gain = false";
+    }
+    return set(V4L2_CID_AUTOGAIN, "gain_automatic", 1);
   }
-  return applied;
+  if (controls.gain > 0) {
+    if (has_auto_gain &&
+        !(error = set(V4L2_CID_AUTOGAIN, "gain_automatic", 0)).empty()) {
+      return error;
+    }
+    int32_t value = 0;
+    if (!(error = in_range(V4L2_CID_GAIN, "gain", controls.gain, value))
+             .empty()) {
+      return error;
+    }
+    return set(V4L2_CID_GAIN, "gain", value);
+  }
+  return {};
 }
 
 // uvcvideo labels its buffers SOE, but unless the module's hwtimestamps

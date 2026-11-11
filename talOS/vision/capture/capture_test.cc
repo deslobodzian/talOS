@@ -1,9 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <map>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -125,30 +129,114 @@ TEST(Capture, LinuxMjpegFramesDecodeToGrayOrAreRefused) {
   EXPECT_FALSE(DecodeMjpegGray(jpeg.data(), jpeg.size(), 64, 80, other_size));
 }
 
-TEST(Capture, LinuxExposureUsesDeviceUnitsAndReportsFailures) {
-  std::vector<std::pair<uint32_t, int32_t>> writes;
-  CameraControls controls;
-  controls.exposure_ms = 4.5;
-  controls.gain = 0;
-  const auto write = [&](uint32_t id, int32_t value) {
-    writes.emplace_back(id, value);
-    return true;
+// An Arducam OV9281's controls as uvcvideo reports them: auto_exposure menu
+// {1 manual, 3 aperture priority}, exposure_time_absolute 1..5000 (100 us),
+// exposure_dynamic_framerate, gain 0..100, no gain_automatic.
+class FakeControls final : public V4L2ControlDevice {
+ public:
+  struct Control {
+    Range range;
+    std::vector<int32_t> menu;
+    int32_t value{0};
+    bool refuse{false};
+    int32_t holds_instead{-1};  // A device that keeps another value.
   };
-  EXPECT_TRUE(ApplyV4L2Controls(controls, write));
-  ASSERT_EQ(writes.size(), 2);
-  EXPECT_EQ(writes[0], (std::pair<uint32_t, int32_t>{V4L2_CID_EXPOSURE_AUTO,
-                                                     V4L2_EXPOSURE_MANUAL}));
-  EXPECT_EQ(writes[1],
-            (std::pair<uint32_t, int32_t>{V4L2_CID_EXPOSURE_ABSOLUTE, 45}));
-  for (uint32_t failed : {V4L2_CID_EXPOSURE_AUTO, V4L2_CID_EXPOSURE_ABSOLUTE}) {
-    EXPECT_FALSE(ApplyV4L2Controls(
-        controls, [failed](uint32_t id, int32_t) { return id != failed; }));
+  std::map<uint32_t, Control> controls{
+      {V4L2_CID_EXPOSURE_AUTO, {{0, 3}, {1, 3}, 3}},
+      {V4L2_CID_EXPOSURE_ABSOLUTE, {{1, 5000}, {}, 157}},
+      {V4L2_CID_EXPOSURE_AUTO_PRIORITY, {{0, 1}, {}, 1}},
+      {V4L2_CID_GAIN, {{0, 100}, {}, 0}},
+  };
+  std::optional<Range> Query(uint32_t id) override {
+    const auto it = controls.find(id);
+    if (it == controls.end()) return std::nullopt;
+    return it->second.range;
   }
-  controls.auto_exposure = true;
-  writes.clear();
-  EXPECT_TRUE(ApplyV4L2Controls(controls, write));
-  ASSERT_EQ(writes.size(), 1);
-  EXPECT_EQ(writes[0].second, V4L2_EXPOSURE_AUTO);
+  bool MenuHas(uint32_t id, int32_t value) override {
+    const auto& menu = controls.at(id).menu;
+    return std::find(menu.begin(), menu.end(), value) != menu.end();
+  }
+  bool Set(uint32_t id, int32_t value) override {
+    auto& control = controls.at(id);
+    if (control.refuse) return false;
+    control.value = control.holds_instead >= 0 ? control.holds_instead : value;
+    return true;
+  }
+  std::optional<int32_t> Get(uint32_t id) override {
+    return controls.at(id).value;
+  }
+};
+
+// FIELD-4 / PLATFORM-1: the configured exposure and gain reach the device in
+// its units and are read back, or the open fails naming the control.
+// Scenario: on an OV9281 the old writer requested auto exposure as mode 0
+// (the camera offers only 1 and 3) and auto gain through a control it does
+// not have, and a camera holding another value than the one set went
+// unnoticed; capture continued with controls_applied false.
+TEST(Capture, LinuxControlsReachTheDeviceOrNameTheOneRefused) {
+  {
+    FakeControls device;
+    CameraControls manual{.exposure_ms = 4.5, .gain = 12};
+    EXPECT_EQ(ApplyV4L2Controls(manual, device), "");
+    EXPECT_EQ(device.controls[V4L2_CID_EXPOSURE_AUTO].value,
+              V4L2_EXPOSURE_MANUAL);
+    EXPECT_EQ(device.controls[V4L2_CID_EXPOSURE_ABSOLUTE].value, 45);
+    EXPECT_EQ(device.controls[V4L2_CID_EXPOSURE_AUTO_PRIORITY].value, 0);
+    EXPECT_EQ(device.controls[V4L2_CID_GAIN].value, 12);
+  }
+  {
+    FakeControls device;
+    CameraControls automatic{.exposure_ms = 4.5, .auto_exposure = true};
+    EXPECT_EQ(ApplyV4L2Controls(automatic, device), "");
+    EXPECT_EQ(device.controls[V4L2_CID_EXPOSURE_AUTO].value,
+              V4L2_EXPOSURE_APERTURE_PRIORITY);
+    EXPECT_EQ(device.controls[V4L2_CID_EXPOSURE_ABSOLUTE].value, 157);
+    EXPECT_EQ(device.controls[V4L2_CID_EXPOSURE_AUTO_PRIORITY].value, 0);
+  }
+  const struct {
+    const char* name;
+    CameraControls controls;
+    void (*setup)(FakeControls&);
+    const char* control;
+  } failures[] = {
+      {"auto gain without gain_automatic",
+       {.exposure_ms = 4.5, .gain = 0, .auto_gain = true},
+       [](FakeControls&) {},
+       "gain_automatic"},
+      {"exposure beyond the range",
+       {.exposure_ms = 600, .gain = 0},
+       [](FakeControls&) {},
+       "exposure_time_absolute"},
+      {"gain beyond the range",
+       {.exposure_ms = 4.5, .gain = 150},
+       [](FakeControls&) {},
+       "gain"},
+      {"mode refused",
+       {.exposure_ms = 4.5, .gain = 0},
+       [](FakeControls& d) {
+         d.controls[V4L2_CID_EXPOSURE_AUTO].refuse = true;
+       },
+       "auto_exposure"},
+      {"exposure held at another value",
+       {.exposure_ms = 4.5, .gain = 0},
+       [](FakeControls& d) {
+         d.controls[V4L2_CID_EXPOSURE_ABSOLUTE].holds_instead = 50;
+       },
+       "exposure_time_absolute"},
+      {"no automatic exposure mode",
+       {.exposure_ms = 0, .gain = 0, .auto_exposure = true},
+       [](FakeControls& d) {
+         d.controls[V4L2_CID_EXPOSURE_AUTO].menu = {V4L2_EXPOSURE_MANUAL};
+       },
+       "auto_exposure"},
+  };
+  for (const auto& failure : failures) {
+    SCOPED_TRACE(failure.name);
+    FakeControls device;
+    failure.setup(device);
+    const auto error = ApplyV4L2Controls(failure.controls, device);
+    EXPECT_EQ(error.rfind(failure.control, 0), 0u) << error;
+  }
 }
 #endif
 TEST(Capture, FrameDurationIsOneTheRangeAccepts) {

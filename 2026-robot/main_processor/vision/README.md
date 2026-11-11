@@ -80,13 +80,24 @@ MJPG frames (an OV9281 offers 1280 × 800 above 20 fps only as MJPG) are
 decoded to 8-bit gray on the capture thread, luma only, with OpenCV's JPEG
 decoder (libjpeg-turbo); a frame without its end-of-image marker (cut short
 on the bus) or that does not decode to the mode's size is dropped and counted.
-V4L2 applies automatic/manual exposure mode, manual exposure in 100 µs units,
-and requested gain controls before streaming. macOS AVFoundation supports
-automatic exposure mode, but not custom duration/ISO; manual requests remain
-visible as failed rather than silently ignored. Capture continues on failure:
-`controls_applied` is false and `control_failure_count` increments per open
-whose requested controls could not be applied. Check these before commissioning
-timing. The exposure correction is omitted after a control failure.
+V4L2 sets the controls before streaming and reads each one back
+(`ApplyV4L2Controls`): auto exposure is the device's `auto_exposure` auto
+mode, else aperture priority (what UVC cameras offer); manual exposure sets
+manual mode and `exposure_time_absolute` in 100 µs units (`exposure_ms × 10`,
+rounded; an OV9281 takes 1..5000, 0.1–500 ms); `exposure_dynamic_framerate`,
+which would let the camera stretch its frame period, is turned off whenever
+the device has it; auto gain needs `gain_automatic`, and a positive `gain`
+turns it off and sets `gain` (OV9281: 0..100). A control the device lacks,
+refuses, holds at another value, or whose range excludes the request fails
+the open naming the control, and the worker retries as for any failed open;
+nothing falls back. So with the shared defaults (`gain` unset, hence
+`auto_gain`), a camera without automatic gain, such as the OV9281, does not
+open until its file sets `gain` or `auto_gain = false`.
+macOS AVFoundation supports automatic exposure mode, but not custom
+duration/ISO; there manual requests remain visible as failed rather than
+silently ignored and capture continues: `controls_applied` is false and
+`control_failure_count` increments per open whose requested controls could
+not be applied. The exposure correction is omitted after a control failure.
 
 
 The typed pipeline configuration carries `apriltag::DetectorOptions` and the

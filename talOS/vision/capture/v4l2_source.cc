@@ -37,6 +37,42 @@ int Ioctl(int fd, unsigned long request, void* arg) {
   } while (result < 0 && errno == EINTR);
   return result;
 }
+// V4L2ControlDevice over an open device.
+class DeviceControls final : public V4L2ControlDevice {
+ public:
+  explicit DeviceControls(int fd) : fd_(fd) {}
+  std::optional<Range> Query(uint32_t id) override {
+    v4l2_queryctrl query{};
+    query.id = id;
+    if (Ioctl(fd_, VIDIOC_QUERYCTRL, &query) < 0 ||
+        (query.flags & V4L2_CTRL_FLAG_DISABLED)) {
+      return std::nullopt;
+    }
+    return Range{query.minimum, query.maximum};
+  }
+  bool MenuHas(uint32_t id, int32_t value) override {
+    v4l2_querymenu menu{};
+    menu.id = id;
+    menu.index = static_cast<uint32_t>(value);
+    return value >= 0 && Ioctl(fd_, VIDIOC_QUERYMENU, &menu) == 0;
+  }
+  bool Set(uint32_t id, int32_t value) override {
+    v4l2_control control{};
+    control.id = id;
+    control.value = value;
+    return Ioctl(fd_, VIDIOC_S_CTRL, &control) == 0;
+  }
+  std::optional<int32_t> Get(uint32_t id) override {
+    v4l2_control control{};
+    control.id = id;
+    if (Ioctl(fd_, VIDIOC_G_CTRL, &control) < 0) return std::nullopt;
+    return control.value;
+  }
+
+ private:
+  int fd_;
+};
+
 // The pixel format a frame is delivered in for a V4L2 pixel format.
 PixelFormat DeliveredFormat(uint32_t pixel_format) {
   return pixel_format == V4L2_PIX_FMT_YUYV ? PixelFormat::kYuyv
@@ -262,13 +298,11 @@ class Source final : public CameraSource {
         mjpeg_ ? 1 : static_cast<size_t>(stride_) * mode_.height;
     decoded_.assign(mjpeg_ ? static_cast<size_t>(stride_) * mode_.height : 0,
                     0);
-    controls_applied_ =
-        ApplyV4L2Controls(controls_, [this](uint32_t id, int32_t value) {
-          v4l2_control control{};
-          control.id = id;
-          control.value = value;
-          return Ioctl(fd_, VIDIOC_S_CTRL, &control) == 0;
-        });
+    DeviceControls device(fd_);
+    if (const auto error = ApplyV4L2Controls(controls_, device);
+        !error.empty()) {
+      return Fail(("control " + error).c_str(), 0);
+    }
     v4l2_requestbuffers request{};
     request.count = 4;
     request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
