@@ -1,5 +1,6 @@
 #include "talOS/rtms/wake.h"
 
+#include <dirent.h>
 #include <gtest/gtest.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -8,6 +9,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
@@ -143,57 +145,131 @@ bool Exists(const std::string& path) {
   return ::lstat(path.c_str(), &status) == 0;
 }
 
+// The inode change time of `path`, the clock the reclaim's age guard reads;
+// -1 when it does not exist.
+std::int64_t ChangedAt(const std::string& path) {
+  struct stat status {};
+  if (::lstat(path.c_str(), &status) != 0) return -1;
+  return static_cast<std::int64_t>(status.st_ctime);
+}
+
+// A private directory, short enough for sun_path on every OS, holding the
+// socket file of a receiver-named socket whose process was SIGKILLed: it
+// refuses every connect. Removed with its contents on destruction.
+struct DeadReceiverFile {
+  std::string directory = "/tmp/talos-wake-test-XXXXXX";
+  std::string dead;
+  bool made = false;
+
+  DeadReceiverFile() {
+    if (::mkdtemp(directory.data()) == nullptr) return;
+    dead = directory + "/talos-wake-00000000000000d1";
+    int ready[2];
+    if (::pipe(ready) != 0) return;
+    const pid_t child = ::fork();
+    if (child == 0) {
+      ::close(ready[0]);
+      const char bound = BindAt(dead) >= 0 ? 1 : 0;
+      (void)::write(ready[1], &bound, 1);
+      ::pause();
+      ::_exit(0);
+    }
+    ::close(ready[1]);
+    char bound = 0;
+    const bool read = ::read(ready[0], &bound, 1) == 1;
+    ::close(ready[0]);
+    if (child > 0) {
+      ::kill(child, SIGKILL);
+      int status = 0;
+      ::waitpid(child, &status, 0);
+    }
+    made = read && bound == 1 && Exists(dead);
+  }
+  ~DeadReceiverFile() {
+    if (DIR* entries = ::opendir(directory.c_str())) {
+      while (const dirent* entry = ::readdir(entries)) {
+        ::unlink((directory + "/" + entry->d_name).c_str());
+      }
+      ::closedir(entries);
+    }
+    ::rmdir(directory.c_str());
+  }
+  DeadReceiverFile(const DeadReceiverFile&) = delete;
+  DeadReceiverFile& operator=(const DeadReceiverFile&) = delete;
+};
+
 // A process killed with SIGKILL never runs its receiver's destructor, so on
 // macOS its socket file stays; a restarted node would add one per crash.
-// The reclaim the next receiver runs removes the file nothing is bound to
-// and keeps a live receiver's.
+// Once the file is older than the age guard, the reclaim removes it, and
+// keeps a live receiver's.
 // REQ-RT-19
-TEST(Wake, ADeadReceiversSocketFileIsReclaimedAndALiveOnesKept) {
-  // A directory of its own, short enough for sun_path on every OS, so the
-  // reclaim sees only this test's files.
-  std::string directory = "/tmp/talos-wake-test-XXXXXX";
-  ASSERT_NE(::mkdtemp(directory.data()), nullptr) << std::strerror(errno);
-  const std::string dead = directory + "/talos-wake-00000000000000d1";
-  const std::string live = directory + "/talos-wake-00000000000000a1";
-
-  int ready[2];
-  ASSERT_EQ(::pipe(ready), 0);
-  const pid_t child = ::fork();
-  ASSERT_GE(child, 0);
-  if (child == 0) {
-    ::close(ready[0]);
-    const char bound = BindAt(dead) >= 0 ? 1 : 0;
-    (void)::write(ready[1], &bound, 1);
-    ::pause();
-    ::_exit(0);
-  }
-  ::close(ready[1]);
-  char bound = 0;
-  ASSERT_EQ(::read(ready[0], &bound, 1), 1);
-  ::close(ready[0]);
-  ::kill(child, SIGKILL);
-  int status = 0;
-  ASSERT_EQ(::waitpid(child, &status, 0), child);
-  ASSERT_EQ(bound, 1) << "the child could not bind " << dead;
-  ASSERT_TRUE(Exists(dead)) << "SIGKILL removed the file itself";
+TEST(Wake, AnOldDeadReceiversSocketFileIsReclaimedAndALiveOnesKept) {
+  const DeadReceiverFile files;
+  ASSERT_TRUE(files.made) << "could not leave a dead socket at " << files.dead;
+  const std::string live = files.directory + "/talos-wake-00000000000000a1";
   const int holder = BindAt(live);
   ASSERT_GE(holder, 0) << live;
 
-  EXPECT_EQ(talos::ReclaimDeadWakeFiles(directory.c_str()), 1u);
-  EXPECT_FALSE(Exists(dead)) << dead << " outlived its killed receiver";
+  // Both files as old as the guard asks, on the clock it reads.
+  const std::int64_t now = std::max(ChangedAt(files.dead), ChangedAt(live)) +
+                           talos::kWakeFileReclaimAgeS;
+  EXPECT_EQ(talos::ReclaimDeadWakeFiles(files.directory.c_str(), now), 1u);
+  EXPECT_FALSE(Exists(files.dead))
+      << files.dead << " outlived its killed receiver";
   EXPECT_TRUE(Exists(live)) << live << " was removed while bound";
-
   ::close(holder);
-  ::unlink(live.c_str());
-  ::unlink(dead.c_str());
-  ::rmdir(directory.c_str());
+}
+
+// On macOS bind() creates the socket file before it attaches the socket, and
+// a connect in between is refused: a refused connect does not prove a young
+// file dead. The reclaim leaves any file younger than the guard, so it
+// cannot take a receiver's file in the middle of its bind.
+// REQ-RT-19
+TEST(Wake, ASocketFileYoungerThanTheGuardIsKeptThoughItRefuses) {
+  const DeadReceiverFile files;
+  ASSERT_TRUE(files.made) << "could not leave a dead socket at " << files.dead;
+  const std::int64_t created = ChangedAt(files.dead);
+  EXPECT_EQ(
+      talos::ReclaimDeadWakeFiles(files.directory.c_str(),
+                                  created + talos::kWakeFileReclaimAgeS - 1),
+      0u);
+  EXPECT_TRUE(Exists(files.dead))
+      << files.dead << " removed " << talos::kWakeFileReclaimAgeS - 1
+      << " s after its creation, inside the " << talos::kWakeFileReclaimAgeS
+      << " s guard";
+}
+
+// Should a file still vanish while its receiver binds (a reclaim that
+// passed the age guard against a receiver stalled in bind), the receiver
+// notices and binds afresh, so senders always reach it. The seam removes
+// the file between the bind and the receiver's check of it. On Linux
+// receivers bind no file and the seam never runs; the reachability
+// assertions hold there too, and the seam's call count is checked on macOS
+// only.
+// REQ-RT-19
+int g_removed_after_bind = 0;
+TEST(Wake, AReceiverWhoseFileVanishesAfterBindEndsUpReachable) {
+  g_removed_after_bind = 0;
+  talos::detail::after_wake_bind_for_testing = [](const char* path) {
+    if (g_removed_after_bind++ == 0) ::unlink(path);
+  };
+  talos::WakeReceiver receiver;
+  talos::detail::after_wake_bind_for_testing = nullptr;
+#if !defined(__linux__)
+  EXPECT_GE(g_removed_after_bind, 1) << "the seam never ran";
+#endif
+  talos::WakeSender sender;
+  EXPECT_TRUE(sender.notify(receiver.id())) << "the receiver has no address";
+  EXPECT_EQ(Readable(receiver, kHangBoundMs), 1);
 }
 
 // End to end on the address receivers really use: after a receiver's process
-// is killed, no file of it remains once the next receiver opens (on Linux
-// there never was one).
+// is killed, its file is gone once the reclaim runs past the age guard (on
+// Linux there never was one). "Now" is the dead file's own creation plus the
+// guard, so no file younger than it, such as another test's receiver mid-bind,
+// is judged.
 // REQ-RT-19
-TEST(Wake, AReceiverKilledWithSigkillLeavesNoFileOnceTheNextOpens) {
+TEST(Wake, AReceiverKilledWithSigkillLeavesNoFileOnceReclaimed) {
   int id_pipe[2];
   ASSERT_EQ(::pipe(id_pipe), 0);
   const pid_t child = ::fork();
@@ -221,7 +297,14 @@ TEST(Wake, AReceiverKilledWithSigkillLeavesNoFileOnceTheNextOpens) {
   char name[64];
   std::snprintf(name, sizeof(name), "/tmp/talos-wake-%016llx",
                 static_cast<unsigned long long>(id));
-  talos::WakeReceiver next;
+  const std::int64_t created = ChangedAt(name);
+#if !defined(__linux__)
+  ASSERT_GE(created, 0) << name << " was never made";
+#endif
+  if (created >= 0) {
+    (void)talos::ReclaimDeadWakeFiles("/tmp",
+                                      created + talos::kWakeFileReclaimAgeS);
+  }
   EXPECT_FALSE(Exists(name)) << name << " outlived its killed receiver";
 }
 
