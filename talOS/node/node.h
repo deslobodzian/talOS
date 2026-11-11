@@ -131,8 +131,11 @@ class Node {
   Duration period() const;     // [subsystem] period_us, else [robot] period_us
   const std::string& config_path() const;  // the robot config (--config)
   // The session output directory the launcher started this node under: the
-  // parent directory of --log. nullopt without --log (tests, --describe and
-  // --replay). Frame recorders write under <session_dir>/frames/<name>/.
+  // parent directory of --log. nullopt without --log (tests) and in every
+  // offline run, --log or not (--describe, --replay, --replay-inputs), so
+  // state a node keeps per session or across restarts, gated on it, is never
+  // read or written by a replay. Frame recorders write under
+  // <session_dir>/frames/<name>/.
   std::optional<std::filesystem::path> session_dir() const;
 
   // Custom keys of this subsystem's TOML table. Dotted keys reach nested

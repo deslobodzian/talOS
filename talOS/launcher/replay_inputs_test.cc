@@ -1,7 +1,9 @@
 // launcher --replay-inputs: a session recorded by the launcher with real
 // node processes on real shared memory, then replayed into a node that was
-// not in it (testdata/replay_consumer.cc), twice, and into one that reads the
-// recorded topic as another type (testdata/replay_impostor.cc).
+// not in it (testdata/replay_consumer.cc), twice, into one that reads the
+// recorded topic as another type (testdata/replay_impostor.cc), and into one
+// that reads the declared graph and keeps a record under its session
+// directory (testdata/replay_graph_reader.cc).
 
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -106,8 +108,11 @@ node = "//talOS/launcher:replay_consumer"
 
 [subsystems.replay_impostor]
 node = "//talOS/launcher:replay_impostor"
+
+[subsystems.replay_graph_reader]
+node = "//talOS/launcher:replay_graph_reader"
 )";
-    // The recorded session runs the source alone.
+    // The recorded session runs the source and the graph reader.
     std::ofstream{record_config_} << R"([robot]
 name = "replay_inputs"
 period_us = 5000
@@ -119,6 +124,9 @@ node = "//talOS/launcher:replay_source"
 type = "TalonFX"
 bus = "rio"
 can_id = 1
+
+[subsystems.replay_graph_reader]
+node = "//talOS/launcher:replay_graph_reader"
 )";
     introspect::Description hardware;
     hardware.name = "hardware_node";
@@ -161,6 +169,8 @@ can_id = 1
         Runfile("TALOS_CONSUMER_NODE");
     options.binary_overrides["//talOS/launcher:replay_impostor"] =
         Runfile("TALOS_IMPOSTOR_NODE");
+    options.binary_overrides["//talOS/launcher:replay_graph_reader"] =
+        Runfile("TALOS_GRAPH_READER_NODE");
     return options;
   }
 
@@ -236,6 +246,45 @@ TEST_F(ReplayInputsTest, AReaderOfAnotherSchemaIsRefused) {
   const std::string out = TempPath("impostor");
   std::filesystem::remove_all(out);
   EXPECT_NE(Replay("replay_impostor", out), 0);
+
+  std::filesystem::remove_all(out);
+}
+
+// REQ-OPS-14: a node whose endpoints come from the declared graph (teleop,
+// telemetry) replays on the graph its session was launched with, read from
+// the replayed session's declared_graph.json: here one state topic besides
+// its own, the source's. A session without that file is refused, not
+// replayed on an empty graph.
+TEST_F(ReplayInputsTest, AGraphReaderReplaysOnTheSessionsDeclaredGraph) {
+  Record();
+  const std::string out = TempPath("graph_reader");
+  std::filesystem::remove_all(out);
+  ASSERT_EQ(Replay("replay_graph_reader", out), 0);
+  const std::vector<Sent> summaries =
+      Sends(out + "/1/replay_graph_reader.tlog", "/replay_graph_reader/state");
+  ASSERT_FALSE(summaries.empty());
+  EXPECT_EQ(As<Summary>(summaries.back()).reading_count(), 1u);
+
+  std::filesystem::remove_all(out);
+  ASSERT_TRUE(std::filesystem::remove(session_dir_ + "/declared_graph.json"));
+  EXPECT_NE(Replay("replay_graph_reader", out), 0);
+
+  std::filesystem::remove_all(out);
+}
+
+// REQ-OPS-14: a replayed node has no session directory, although the launcher
+// passes it --log, so state a node keeps per session (the 2026 autonomous
+// node's routine selection, and its progress object, which outlives the
+// session in shared memory) is neither read nor written by a replay. The
+// recording shows the same node keeps its record under a live session.
+TEST_F(ReplayInputsTest, AReplayedNodeKeepsNoSessionState) {
+  Record();
+  ASSERT_TRUE(
+      std::filesystem::exists(session_dir_ + "/replay_graph_reader.record"));
+  const std::string out = TempPath("session_state");
+  std::filesystem::remove_all(out);
+  ASSERT_EQ(Replay("replay_graph_reader", out), 0);
+  EXPECT_FALSE(std::filesystem::exists(out + "/1/replay_graph_reader.record"));
 
   std::filesystem::remove_all(out);
 }

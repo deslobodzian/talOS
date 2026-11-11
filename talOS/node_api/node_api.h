@@ -83,8 +83,9 @@ uint64_t talos_node_next_update(const TalosNode* node);
 int64_t talos_node_period_ns(const TalosNode* node);
 const char* talos_node_config_path(const TalosNode* node);
 // The session output directory (the parent of --log), or NULL when there is
-// none (no --log: tests, --describe, --replay). The pointer is valid until
-// the next talos_node_session_dir call on this thread.
+// none: without --log (tests), and under --describe, --replay and
+// --replay-inputs with or without it. The pointer is valid until the next
+// talos_node_session_dir call on this thread.
 const char* talos_node_session_dir(const TalosNode* node);
 
 // Parameter kinds. ANY takes the key's own type; LIST takes an array of
