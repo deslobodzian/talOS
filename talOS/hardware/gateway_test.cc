@@ -732,6 +732,30 @@ TEST(Gateway, EveryDeviceAtTheTimeoutIsTotalLoss) {
   EXPECT_TRUE(g.Accept(Request(g), 3, 11000));
 }
 
+// Total feedback loss advances the epoch whether or not a command is in
+// force. Enabled with none in force (just enabled, or idle past the timeout),
+// a request built from the State before the loss and arriving once the
+// feedback returns, still inside command_timeout_us, must not drive on that
+// pre-loss observation.
+// REQ-SAFE-18
+TEST(Gateway, TotalLossWhileInactiveAdvancesTheEpoch) {
+  FakeBackend backend;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, true);
+  ASSERT_FALSE(g.snapshot().flags & kCommandActive);
+  const auto before = Request(g);
+  backend.healthy = false;
+  g.Tick(6000, true);
+  ASSERT_TRUE(g.snapshot().flags & kHardwareFault);
+  EXPECT_NE(g.snapshot().epoch, before.epoch);
+  backend.healthy = true;
+  g.Tick(11000, true);
+  ASSERT_FALSE(g.snapshot().flags & kHardwareFault);
+  EXPECT_FALSE(g.Accept(before, 1, 11000));
+  EXPECT_EQ(backend.applied, 0);
+  EXPECT_TRUE(g.Accept(Request(g), 2, 11000));
+}
+
 TEST(Gateway, RejectsWholeTransactionBeforeApplyingAnyMotor) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
