@@ -408,6 +408,7 @@ TEST_F(ManifestTest, RefusesASingularSectionNamingTheKeyAndFile) {
 
 // A [trajectories] entry a node could not open on the robot fails config load
 // instead, naming the file that sets it and the key (REQ-CONTRACT-10).
+// REQ-CONTRACT-31
 TEST_F(ManifestTest, RefusesABadTrajectoryEntryNamingTheFileAndKey) {
   Write("robot.toml",
         "[[subsystems]]\nname = \"auto\"\npath = \"subsystems/auto.toml\"\n");
@@ -467,6 +468,7 @@ TEST_F(ManifestTest, RefusesABadTrajectoryEntryNamingTheFileAndKey) {
 // Paths resolve against the subsystem file, not robot.toml, so the node opens
 // the same file the manifest lists; an undeclared name throws naming it
 // (REQ-CONTRACT-19).
+// REQ-CONTRACT-31
 TEST_F(ManifestTest, TrajectoryPathResolvesAgainstTheSubsystemFile) {
   std::filesystem::create_directories(dir_ / "trajectories");
   Write("trajectories/two_piece.traj", "{}\n");
