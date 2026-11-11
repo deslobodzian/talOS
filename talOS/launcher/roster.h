@@ -20,6 +20,7 @@
 #include "talOS/launcher/session.h"
 #include "talOS/launcher/session_lock.h"
 #include "talOS/launcher/session_retention.h"
+#include "talOS/launcher/supervision_policy.h"
 #include "talOS/process/durable_sync.h"
 
 namespace talos::launcher {
@@ -76,6 +77,11 @@ struct LauncherOptions {
   // probe of the named roster member fail as the guardian fork does under
   // EAGAIN (ProbeDescribe). Production leaves it empty.
   std::map<std::string, int> probe_spawn_failures;
+  // Internal supervision seam: every time the session's supervision reads
+  // (each pass, a run's spawn, the session deadline); steady_clock in
+  // production.
+  SupervisionClock supervision_clock{
+      [] { return std::chrono::steady_clock::now(); }};
   // Internal supervision seam: syncs an open session file or directory to
   // disk; process::DurableSync in production. The supervision loop never
   // calls it: the manifest writer's thread syncs the versions the loop

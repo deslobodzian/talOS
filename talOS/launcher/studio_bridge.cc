@@ -60,7 +60,7 @@ StudioBridge::StudioBridge(std::size_t index, const NodeSpec& spec,
   proc.log_path.clear();
 }
 
-void StudioBridge::Start(NodeProcessInfo& proc) {
+void StudioBridge::Start(NodeProcessInfo& proc, const SupervisionClock& clock) {
   const std::string& binary = args_.front();
   if (binary.empty() || ::access(binary.c_str(), X_OK) != 0) {
     std::cerr << "[launcher] studio_bridge not executable at '"
@@ -81,7 +81,7 @@ void StudioBridge::Start(NodeProcessInfo& proc) {
     proc.RecordSpawnFailure();
     return;
   }
-  const auto now = Clock::now();
+  const auto now = clock();
   proc.pid = pid;
   proc.BeginRun(pid);
   attempts_ = 1;

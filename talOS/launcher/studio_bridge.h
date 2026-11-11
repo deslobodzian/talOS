@@ -13,6 +13,7 @@
 #include "talOS/launcher/describe_graph.h"
 #include "talOS/launcher/roster.h"
 #include "talOS/launcher/session.h"
+#include "talOS/launcher/supervision_policy.h"
 
 namespace talos::launcher {
 
@@ -67,8 +68,9 @@ class StudioBridge {
     return index == index_ && active_ && !stable_;
   }
 
-  // The first attempt, spawned alongside every other node without waiting.
-  void Start(NodeProcessInfo& proc);
+  // The first attempt, spawned alongside every other node without waiting,
+  // at the time `clock` reads after the spawn.
+  void Start(NodeProcessInfo& proc, const SupervisionClock& clock);
 
   // One supervision tick, after the loop has reaped exits: stabilize a
   // survivor, respawn a startup failure, or give up when budget runs out.

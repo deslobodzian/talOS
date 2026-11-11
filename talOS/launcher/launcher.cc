@@ -508,7 +508,7 @@ int Launcher::Run() {
   // The deadline starts with the session, so a bridge that never comes up
   // cannot push the session's end out.
   const auto deadline = options_.duration_s > 0
-                            ? std::chrono::steady_clock::now() +
+                            ? options_.supervision_clock() +
                                   std::chrono::seconds(options_.duration_s)
                             : std::chrono::steady_clock::time_point::max();
 
@@ -530,8 +530,7 @@ int Launcher::Run() {
     std::string spawn_error;
     const pid_t pid = SpawnNode(proc, launches[i], spawn_error);
     if (pid < 0) {
-      SpawnFailed(proc, launches[i], std::chrono::steady_clock::now(),
-                  spawn_error);
+      SpawnFailed(proc, launches[i], options_.supervision_clock(), spawn_error);
       continue;
     }
     proc.pid = pid;
@@ -540,7 +539,7 @@ int Launcher::Run() {
     std::cout << "[launcher] Started " << proc.name << " (pid " << pid
               << ", target " << proc.target << ")\n";
   }
-  if (studio) studio->Start(procs[studio->index()]);
+  if (studio) studio->Start(procs[studio->index()], options_.supervision_clock);
   PersistManifest(procs);
 
   Supervise(procs, launches, studio, deadline);
@@ -855,7 +854,7 @@ void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
   proc.exit_code = -1;
   proc.exit_signal = 0;
   proc.BeginRun(pid);
-  launch.NewRun(std::chrono::steady_clock::now());
+  launch.NewRun(options_.supervision_clock());
 }
 
 bool Launcher::NoteRealtime(NodeProcessInfo& proc, NodeLaunch& launch,
@@ -1012,7 +1011,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
   auto shutdown_deadline = std::chrono::steady_clock::time_point::max();
   std::optional<introspect::RegistryMapping> registry;
   // Every first run's liveness counts from here, not its spawn.
-  const auto started = std::chrono::steady_clock::now();
+  const auto started = options_.supervision_clock();
   for (auto& launch : launches) launch.NewRun(started);
   ServiceNotifier notifier;
   const ChildExitWakeup exits;  // A pass starts as soon as a child exits.
@@ -1021,7 +1020,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
   bool lock_lost_reported = false;
   for (;;) {
     notifier.Send("WATCHDOG=1");
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = options_.supervision_clock();
     const bool past_deadline = now >= deadline;
     const bool stopping = stop_requested_ != 0 || stop_sent || past_deadline;
     // A stop signal can land after `stopping` was sampled: systemctl stop

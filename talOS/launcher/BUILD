@@ -53,6 +53,7 @@ cc_library(
     hdrs = ["roster.h"],
     deps = [
         ":session",
+        ":supervision_policy",
         "//talOS/configuration",
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
